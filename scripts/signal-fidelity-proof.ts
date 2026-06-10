@@ -188,9 +188,9 @@ const codexTracesEnvelope = {
               traceId: "abcdef0123456789abcdef0123456789",
               spanId: "abcdef0123456789",
               startTimeUnixNano: "1781400005000000000",
+              // Live-verified codex 0.137 shape: usage spans carry tokens only —
+              // no conversation.id, no model (those ride sibling signals; see issue 0014).
               attributes: [
-                otelAttr("conversation.id", CODEX_SESSION),
-                otelAttr("gen_ai.request.model", "gpt-5.5"),
                 otelAttr("gen_ai.usage.input_tokens", 2400),
                 otelAttr("gen_ai.usage.output_tokens", 510),
                 otelAttr("gen_ai.usage.cache_read.input_tokens", 1800),
@@ -329,8 +329,7 @@ async function main() {
         codexSpan.payload.inputTokens === 2400 &&
         codexSpan.payload.outputTokens === 510 &&
         codexSpan.payload.cacheReadTokens === 1800 &&
-        codexSpan.payload.sessionId === CODEX_SESSION &&
-        codexSpan.payload.model === "gpt-5.5",
+        codexSpan.payload.sessionId === undefined,
     ),
     codexSpan ? JSON.stringify({ in: codexSpan.payload.inputTokens, out: codexSpan.payload.outputTokens, session: codexSpan.payload.sessionId }) : "codex usage span missing",
   );
