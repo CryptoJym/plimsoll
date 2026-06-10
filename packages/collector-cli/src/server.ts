@@ -7,7 +7,8 @@ import type { CollectorConfig } from "./config";
 import type { ToolSource } from "../../shared/src/index";
 import { appendForwardedHook } from "./forwarder";
 import { explodeOtlpPayload } from "./otlp";
-import { estimateCostUsd } from "../../shared/src/index";
+import { estimateCostUsd, remoteLinkageHash, normalizeGitRemote } from "../../shared/src/index";
+import { saveCollectorConfig } from "./config";
 import {
   dashboardAccounts,
   dashboardRepoDetail,
@@ -78,6 +79,20 @@ function sourceFromHeaders(request: http.IncomingMessage): ToolSource | undefine
   return undefined;
 }
 
+/**
+ * Cross-origin defense for localhost write endpoints: browsers attach an
+ * Origin header to cross-site requests and cannot remove it. We accept writes
+ * only when the request provably came from our own dashboard (same-origin
+ * Origin) or a non-browser client (no Origin), and require a custom header
+ * that cross-origin pages cannot set without a CORS preflight we never grant.
+ */
+function isTrustedLocalWrite(request: http.IncomingMessage) {
+  const origin = firstHeader(request.headers.origin);
+  const originOk =
+    !origin || /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin);
+  return originOk && firstHeader(request.headers["x-plimsoll-local"]) === "1";
+}
+
 export function createCollectorServer(config: CollectorConfig, buffer: LocalEventBuffer) {
   return http.createServer(async (request, response) => {
     try {
@@ -100,6 +115,19 @@ export function createCollectorServer(config: CollectorConfig, buffer: LocalEven
       if (request.method === "GET" && request.url?.startsWith("/api/")) {
         const url = new URL(request.url, "http://127.0.0.1");
         const days = Number(url.searchParams.get("days") ?? 30) || 30;
+        if (url.pathname === "/api/settings") {
+          const accounts = buffer.database
+            .prepare(
+              `select account_hash as accountHash, label, auto_seeded as autoSeeded from account_labels order by first_seen`,
+            )
+            .all();
+          sendJson(response, {
+            accounts,
+            priorityRepos: buffer.listPriorityRepos(),
+            subscriptions: config.subscriptions,
+          });
+          return;
+        }
         if (url.pathname === "/api/summary") {
           sendJson(response, dashboardSummary(buffer.database, days));
           return;
@@ -136,6 +164,75 @@ export function createCollectorServer(config: CollectorConfig, buffer: LocalEven
           sendJson(response, detail);
           return;
         }
+        sendJson(response, { error: "not_found" }, 404);
+        return;
+      }
+
+      if (request.method === "POST" && request.url?.startsWith("/api/settings/")) {
+        if (!isTrustedLocalWrite(request)) {
+          sendJson(response, { error: "untrusted_write_origin" }, 403);
+          return;
+        }
+        const body = decodeRequestBody(request, await readRequestBody(request));
+        let parsed: Record<string, unknown>;
+        try {
+          parsed = JSON.parse(body.text || "{}") as Record<string, unknown>;
+        } catch {
+          sendJson(response, { error: "invalid_json" }, 400);
+          return;
+        }
+
+        if (request.url === "/api/settings/account-label") {
+          const accountHash = typeof parsed.accountHash === "string" ? parsed.accountHash : "";
+          const label = typeof parsed.label === "string" ? parsed.label.trim().slice(0, 80) : "";
+          if (!accountHash.startsWith("sha256:") || !label) {
+            sendJson(response, { error: "expected accountHash (sha256:...) and label" }, 400);
+            return;
+          }
+          buffer.setAccountLabel(accountHash, label);
+          sendJson(response, { ok: true, accountHash, label });
+          return;
+        }
+
+        if (request.url === "/api/settings/priority") {
+          const action = parsed.action === "remove" ? "remove" : "add";
+          const urlValue = typeof parsed.url === "string" ? parsed.url : "";
+          const repoHash = remoteLinkageHash(urlValue);
+          if (!repoHash) {
+            sendJson(response, { error: "could not parse a git repo from that URL" }, 400);
+            return;
+          }
+          if (action === "add") {
+            buffer.setPriorityRepo(repoHash, normalizeGitRemote(urlValue) ?? urlValue);
+          } else {
+            buffer.removePriorityRepo(repoHash);
+          }
+          sendJson(response, { ok: true, action, repoHash, repos: buffer.listPriorityRepos() });
+          return;
+        }
+
+        if (request.url === "/api/settings/subscriptions") {
+          if (!Array.isArray(parsed.subscriptions)) {
+            sendJson(response, { error: "expected subscriptions array" }, 400);
+            return;
+          }
+          try {
+            const updated = saveCollectorConfig({
+              ...config,
+              subscriptions: parsed.subscriptions as CollectorConfig["subscriptions"],
+            });
+            config.subscriptions = updated.subscriptions;
+            sendJson(response, { ok: true, subscriptions: updated.subscriptions });
+          } catch (error) {
+            sendJson(
+              response,
+              { error: error instanceof Error ? error.message : "invalid subscriptions" },
+              400,
+            );
+          }
+          return;
+        }
+
         sendJson(response, { error: "not_found" }, 404);
         return;
       }

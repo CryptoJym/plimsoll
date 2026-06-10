@@ -33,6 +33,7 @@ export const collectorConfigSchema = z.object({
 export type CollectorConfig = z.infer<typeof collectorConfigSchema>;
 
 export function collectorHome(homeDir = os.homedir()) {
+  if (process.env.PLIMSOLL_HOME) return process.env.PLIMSOLL_HOME;
   return path.join(homeDir, "Library", "Application Support", "Plimsoll");
 }
 
@@ -52,6 +53,15 @@ export function ensureCollectorHome(homeDir = os.homedir()) {
   const directory = collectorHome(homeDir);
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   return directory;
+}
+
+export function saveCollectorConfig(config: CollectorConfig, homeDir = os.homedir()) {
+  ensureCollectorHome(homeDir);
+  const validated = collectorConfigSchema.parse(config);
+  fs.writeFileSync(collectorConfigPath(homeDir), `${JSON.stringify(validated, null, 2)}\n`, {
+    mode: 0o600,
+  });
+  return validated;
 }
 
 export function loadCollectorConfig(homeDir = os.homedir()): CollectorConfig {
