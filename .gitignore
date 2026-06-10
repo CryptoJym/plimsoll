@@ -5,3 +5,5 @@ evidence/
 *.sqlite
 *.sqlite-shm
 *.sqlite-wal
+dist/
+*.tgz

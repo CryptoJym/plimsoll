@@ -27,6 +27,9 @@
  *      first-writer-wins dedupe, and zero content persistence (issue 0022).
  *  12. Account aliases (local-only) merge split identities at read time,
  *      reversibly, via settings endpoint and dashboard queries (issue 0023).
+ *  13. Config apply mode merges telemetry settings surgically (user keys
+ *      preserved, backups written, idempotent, foreign [otel] never
+ *      clobbered) — the five-minute promise's first step (issue 0003).
  *
  * Run: pnpm plimsoll:signal-fidelity-proof
  */
@@ -60,6 +63,12 @@ import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { MODEL_PRICING } from "../packages/shared/src/pricing";
 import { readLocalIdentities } from "../packages/collector-cli/src/local-identity";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
+import {
+  applyClaudeSettings,
+  applyCodexConfig,
+  generateClaudeCodeSettings,
+  generateCodexConfigToml,
+} from "../packages/collector-config/src/index";
 
 type Check = { name: string; passed: boolean; detail: string };
 
@@ -1239,6 +1248,53 @@ async function main() {
     "rollout message/instruction content absent from all persisted codex rows",
   );
   fs.rmSync(rolloutDir, { recursive: true, force: true });
+
+  // 13. Config apply mode (issue 0003): surgical, backed-up, idempotent.
+  const setupDir = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-setup-"));
+  const claudeSettingsPath = path.join(setupDir, "settings.json");
+  fs.writeFileSync(
+    claudeSettingsPath,
+    JSON.stringify({ env: { USER_KEY: "keep-me" }, theme: "dark" }, null, 2),
+  );
+  const codexConfigPath = path.join(setupDir, "config.toml");
+  fs.writeFileSync(codexConfigPath, 'model = "gpt-5.5"\n');
+  const applyOptions = { repoRoot: tempDir, port: 49999, dataMode: "metadata" as const };
+  const generatedClaude = generateClaudeCodeSettings(applyOptions);
+  const generatedToml = generateCodexConfigToml(applyOptions);
+  const firstApply = applyClaudeSettings(claudeSettingsPath, generatedClaude);
+  const firstCodexApply = applyCodexConfig(codexConfigPath, generatedToml);
+  const appliedSettings = JSON.parse(fs.readFileSync(claudeSettingsPath, "utf8")) as {
+    env: Record<string, string>;
+    theme?: string;
+  };
+  const secondApply = applyClaudeSettings(claudeSettingsPath, generatedClaude);
+  const secondCodexApply = applyCodexConfig(codexConfigPath, generatedToml);
+  const codexApplied = fs.readFileSync(codexConfigPath, "utf8");
+  check(
+    "setup_apply_is_surgical_and_idempotent",
+    firstApply.changed &&
+      firstCodexApply.changed &&
+      appliedSettings.env.USER_KEY === "keep-me" &&
+      appliedSettings.theme === "dark" &&
+      appliedSettings.env.OTEL_EXPORTER_OTLP_ENDPOINT === "http://127.0.0.1:49999" &&
+      codexApplied.includes('model = "gpt-5.5"') &&
+      codexApplied.includes("49999") &&
+      Boolean(firstApply.backupPath && fs.existsSync(firstApply.backupPath)) &&
+      !secondApply.changed &&
+      !secondCodexApply.changed,
+    JSON.stringify({ firstChanges: firstApply.changes.length, secondChanged: secondApply.changed }),
+  );
+  const foreignPath = path.join(setupDir, "foreign.toml");
+  fs.writeFileSync(foreignPath, '[otel]\nexporter = "elsewhere"\n');
+  const conflicted = applyCodexConfig(foreignPath, generatedToml);
+  check(
+    "setup_never_clobbers_foreign_otel",
+    !conflicted.changed &&
+      Boolean(conflicted.conflict) &&
+      fs.readFileSync(foreignPath, "utf8") === '[otel]\nexporter = "elsewhere"\n',
+    JSON.stringify({ conflict: Boolean(conflicted.conflict) }),
+  );
+  fs.rmSync(setupDir, { recursive: true, force: true });
 
   // 7. Upload watermark drains oldest-first against a stub ingest endpoint.
   const received: number[] = [];
