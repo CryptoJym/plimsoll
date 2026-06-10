@@ -22,6 +22,9 @@
  *  10. Capture health judges the ledger against local tool activity: idle is
  *      green, a broken pipe is red within minutes, uncaptured/partial codex
  *      coverage is red/amber. Silence must scream (G7, issue 0021).
+ *  11. Codex rollout tailer ingests token_count lines exactly (telescoped
+ *      cumulative totals), idempotently, with repo linkage from cwd, OTLP
+ *      first-writer-wins dedupe, and zero content persistence (issue 0022).
  *
  * Run: pnpm plimsoll:signal-fidelity-proof
  */
@@ -51,6 +54,7 @@ import {
   dashboardSummary,
 } from "../packages/collector-cli/src/dashboard-api";
 import { computeCaptureHealth } from "../packages/collector-cli/src/health";
+import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 
 type Check = { name: string; passed: boolean; detail: string };
 
@@ -805,6 +809,151 @@ async function main() {
   gapBuffer.close();
   silentBuffer.close();
   fs.rmSync(healthDir, { recursive: true, force: true });
+
+  // 11. Codex rollout tailer (issue 0022). Fixtures mirror live codex 0.137
+  // rollout shapes. Deltas telescope from cumulative totals; ids are
+  // deterministic; sessions already covered by OTLP usage are skipped; no
+  // message content is parsed or persisted.
+  const ROLLOUT_SESSION = "019e1111-2222-7333-8444-555555555555";
+  const ROLLOUT_SENTINEL = "ROLLOUT_PROMPT_SENTINEL do not persist";
+  const rolloutDir = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-rollouts-"));
+  const rolloutDay = path.join(rolloutDir, "2026", "06", "10");
+  fs.mkdirSync(rolloutDay, { recursive: true });
+  const rolloutLine = (timestamp: string, type: string, payload: Record<string, unknown>) =>
+    JSON.stringify({ timestamp, type, payload });
+  const tokenCountLine = (timestamp: string, totals: Record<string, number>) =>
+    rolloutLine(timestamp, "event_msg", {
+      type: "token_count",
+      info: { total_token_usage: totals, last_token_usage: totals, model_context_window: 258400 },
+      rate_limits: { limit_id: "codex", plan_type: "pro" },
+    });
+  fs.writeFileSync(
+    path.join(rolloutDay, `rollout-2026-06-10T10-00-00-${ROLLOUT_SESSION}.jsonl`),
+    [
+      rolloutLine("2026-06-10T10:00:00.000Z", "session_meta", {
+        id: ROLLOUT_SESSION,
+        cwd: proofRepo.repoDir,
+        originator: "codex_exec",
+        cli_version: "0.137.0",
+        source: "exec",
+      }),
+      rolloutLine("2026-06-10T10:00:01.000Z", "turn_context", {
+        turn_id: "t-1",
+        cwd: proofRepo.repoDir,
+        model: "gpt-5.5",
+        approval_policy: "never",
+      }),
+      rolloutLine("2026-06-10T10:00:02.000Z", "event_msg", {
+        type: "user_message",
+        message: ROLLOUT_SENTINEL,
+      }),
+      tokenCountLine("2026-06-10T10:00:10.000Z", {
+        input_tokens: 1000,
+        cached_input_tokens: 200,
+        output_tokens: 50,
+        reasoning_output_tokens: 10,
+        total_tokens: 1050,
+      }),
+      rolloutLine("2026-06-10T10:00:11.000Z", "event_msg", {
+        type: "agent_message",
+        message: ROLLOUT_SENTINEL,
+      }),
+      tokenCountLine("2026-06-10T10:00:20.000Z", {
+        input_tokens: 3000,
+        cached_input_tokens: 600,
+        output_tokens: 130,
+        reasoning_output_tokens: 30,
+        total_tokens: 3130,
+      }),
+    ].join("\n") + "\n",
+  );
+  // Second fixture: a session that already has OTLP-delivered usage (the
+  // stitched codex span from section 4) — first-writer-wins, tailer skips it.
+  fs.writeFileSync(
+    path.join(rolloutDay, `rollout-2026-06-10T11-00-00-${CODEX_SESSION}.jsonl`),
+    [
+      rolloutLine("2026-06-10T11:00:00.000Z", "session_meta", { id: CODEX_SESSION, cwd: proofRepo.repoDir }),
+      tokenCountLine("2026-06-10T11:00:10.000Z", {
+        input_tokens: 999999,
+        cached_input_tokens: 0,
+        output_tokens: 999,
+        reasoning_output_tokens: 0,
+        total_tokens: 1000998,
+      }),
+    ].join("\n") + "\n",
+  );
+
+  const tailer = new RolloutTailer(buffer, rolloutDir);
+  const firstScan = tailer.scan();
+  const rolloutRows = buffer.database
+    .prepare(
+      `select session_id as sessionId, model, input_tokens as inputTokens,
+         cache_read_tokens as cacheReadTokens, output_tokens as outputTokens,
+         cost_usd as costUsd, repo_hash as repoHash, payload_json as payloadJson
+       from buffered_events where event_type = 'usage_rollout' order by observed_at`,
+    )
+    .all() as Array<Record<string, unknown>>;
+  const rolloutSums = rolloutRows
+    .filter((row) => row.sessionId === ROLLOUT_SESSION)
+    .reduce<{ input: number; cached: number; output: number; cost: number }>(
+      (sum, row) => ({
+        input: sum.input + Number(row.inputTokens ?? 0),
+        cached: sum.cached + Number(row.cacheReadTokens ?? 0),
+        output: sum.output + Number(row.outputTokens ?? 0),
+        cost: sum.cost + Number(row.costUsd ?? 0),
+      }),
+      { input: 0, cached: 0, output: 0, cost: 0 },
+    );
+  check(
+    "rollout_usage_ingested_exact",
+    rolloutRows.filter((row) => row.sessionId === ROLLOUT_SESSION).length === 2 &&
+      rolloutSums.input === 3000 &&
+      rolloutSums.cached === 600 &&
+      rolloutSums.output === 130 &&
+      rolloutRows.every((row) => row.sessionId !== ROLLOUT_SESSION || row.model === "gpt-5.5") &&
+      rolloutSums.cost > 0 &&
+      rolloutRows.every(
+        (row) => row.sessionId !== ROLLOUT_SESSION || String(row.payloadJson).includes('"costEstimated":true'),
+      ),
+    JSON.stringify({ events: firstScan.eventsAppended, ...rolloutSums }),
+  );
+  check(
+    "rollout_repo_linkage_from_cwd",
+    rolloutRows
+      .filter((row) => row.sessionId === ROLLOUT_SESSION)
+      .every((row) => row.repoHash === expectedRemoteHash),
+    JSON.stringify({ repoHash: rolloutRows[0]?.repoHash, expected: expectedRemoteHash }),
+  );
+  check(
+    "rollout_otlp_covered_session_skipped",
+    firstScan.sessionsSkippedOtlpCovered >= 1 &&
+      rolloutRows.every((row) => row.sessionId !== CODEX_SESSION),
+    JSON.stringify({ skipped: firstScan.sessionsSkippedOtlpCovered }),
+  );
+  // Clearing the persistent scan state forces a true re-parse — which must
+  // not change counts or sums (deterministic ids + insert-or-replace).
+  buffer.database.prepare(`delete from rollout_scan_state`).run();
+  const rescan = new RolloutTailer(buffer, rolloutDir).scan();
+  const afterRescan = buffer.database
+    .prepare(
+      `select count(*) as n, coalesce(sum(input_tokens),0) as input from buffered_events
+       where event_type = 'usage_rollout'`,
+    )
+    .get() as { n: number; input: number };
+  check(
+    "rollout_rescan_idempotent",
+    afterRescan.n === 2 && afterRescan.input === 3000 && rescan.sessionsSkippedOtlpCovered >= 1,
+    JSON.stringify({ rows: afterRescan.n, input: afterRescan.input }),
+  );
+  const codexPersisted = JSON.stringify(
+    buffer.database.prepare(`select payload_json from buffered_events where source = 'codex'`).all(),
+  );
+  check(
+    "rollout_content_never_persisted",
+    !codexPersisted.includes(ROLLOUT_SENTINEL) && !codexPersisted.includes("base_instructions"),
+    "rollout message/instruction content absent from all persisted codex rows",
+  );
+  fs.rmSync(rolloutDir, { recursive: true, force: true });
 
   // 7. Upload watermark drains oldest-first against a stub ingest endpoint.
   const received: number[] = [];

@@ -22,6 +22,7 @@ import {
   uninstallLaunchAgent,
 } from "./launch-agent";
 import { computeCaptureHealth } from "./health";
+import { RolloutTailer } from "./rollout-tailer";
 import { createCollectorServer } from "./server";
 import {
   generateClaudeCodeSettings,
@@ -54,6 +55,7 @@ Commands:
   self-test-hook SOURCE Emit one synthetic hook event into the local buffer
   generate-config TOOL  Print Claude Code or Codex config for metadata collection
   upload                Drain un-uploaded events to the tenant ingest API (marks rows, keeps local copies)
+  scan-rollouts         Read codex rollout files into the ledger once (full history walk)
   install-launch-agent  Write the user LaunchAgent plist
   load-launch-agent     Load an installed user LaunchAgent plist
   unload-launch-agent   Unload the user LaunchAgent without removing the plist
@@ -366,7 +368,28 @@ async function main() {
       }
     };
 
+    // Codex usage truth rides rollout files (issue 0022): full walk on boot
+    // (backfills any uncaptured history, idempotent), then a recent-days tail.
+    const rolloutTailer = new RolloutTailer(buffer);
+    const runRolloutScan = (recentOnly: boolean) => {
+      try {
+        const scanned = rolloutTailer.scan({ recentOnly });
+        if (scanned.eventsAppended > 0 || scanned.parseErrors > 0) {
+          console.log(JSON.stringify({ status: "rollout_scan", recentOnly, ...scanned }));
+        }
+      } catch (error) {
+        console.warn(
+          JSON.stringify({
+            warning: "rollout_scan_failed",
+            message: error instanceof Error ? error.message : String(error),
+          }),
+        );
+      }
+    };
+
     runPrune();
+    runRolloutScan(false);
+    timers.push(setInterval(() => runRolloutScan(true), 60 * 1000));
     timers.push(setInterval(runPrune, 6 * 60 * 60 * 1000));
     if (config.uploadUrl) {
       timers.push(setInterval(() => void runSync(), config.syncIntervalSeconds * 1000));
@@ -464,6 +487,14 @@ async function main() {
         2,
       ),
     );
+    buffer.close();
+    return;
+  }
+
+  if (command === "scan-rollouts") {
+    const buffer = openBuffer();
+    const result = new RolloutTailer(buffer).scan({ recentOnly: false });
+    console.log(JSON.stringify(result, null, 2));
     buffer.close();
     return;
   }
