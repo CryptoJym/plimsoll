@@ -590,7 +590,7 @@ async function refresh(){
       <td class="num">${usd(a.priorityUsd)}</td><td class="num">${usd(a.otherUsd)}</td>
       <td class="num">${usd(a.unlinkedUsd)}</td><td class="num brass">${usd(a.totalUsd)}</td>
       <td>${a.subscription?a.subscription.plan+" $"+a.subscription.usdPerMonth+"/mo":"<span class='hash'>direct API</span>"}</td>
-      <td class="num">${a.subscription?.leverage?`<b style="color:${a.subscription.leverage>=1?"var(--signal-green)":"var(--signal-amber)"}">${a.subscription.leverage}×</b>`:"·"}</td></tr>`);
+      <td class="num">${a.subscription?.leverage?`<b style="color:${a.subscription.leverage>=1?"var(--signal-green)":"var(--signal-amber)"}" title="${(a.subscription.byVendor||[]).map(v=>`${v.plans}: ${usd(v.spendUsd)} vs ${usd(v.planCostWindow)} = ${v.leverage??"·"}\u00d7`).join(" \u00b7 ")}">${a.subscription.leverage}×</b>`:"·"}</td></tr>`);
     rows("#t-sessions","#e-sessions",Array.isArray(sess)?sess:[],x=>`<tr class="row" tabindex="0" onkeydown="rk(event)" onclick="openSession('${x.sessionId}')">
       <td>${(x.startedAt||"").slice(0,16).replace("T"," ")}</td>
       <td><span class="flag ${x.source==="claude_code"?"cc":"cx"}">${x.source==="claude_code"?"CC":"CX"}</span></td>
@@ -631,7 +631,8 @@ async function loadSettings(){
   $("#s-prio-list").innerHTML=settingsCache.priorityRepos.map(p=>`<div class="srow">
     <span style="flex:1;color:var(--foam)">${p.url}</span>
     <button class="btn" onclick="removePrio('${p.url}')">remove</button></div>`).join("")||'<div class="empty">no priority projects yet</div>';
-  $("#s-sub-account").innerHTML=settingsCache.accounts.map(a=>`<option value="${(a.label||a.accountHash).replace(/"/g,"&quot;")}">${a.label||short(a.accountHash)}</option>`).join("");
+  const subKeys=[...new Set(settingsCache.accounts.flatMap(a=>[a.label,a.email].filter(Boolean)))];
+  $("#s-sub-account").innerHTML=(subKeys.length?subKeys:settingsCache.accounts.map(a=>a.accountHash)).map(k=>`<option value="${String(k).replace(/"/g,"&quot;")}">${k}</option>`).join("");
   $("#s-subs").innerHTML=settingsCache.subscriptions.map((x,i)=>`<div class="srow">
     <span style="flex:1">${x.account} · ${x.plan} · $${x.usdPerMonth}/mo</span>
     <button class="btn" onclick="removeSub(${i})">remove</button></div>`).join("")||'<div class="empty">none — add one to see plan leverage</div>';

@@ -614,6 +614,21 @@ async function main() {
       accounts.buckets.unlinkedUsd === 0,
     JSON.stringify(accounts.buckets),
   );
+  const multiPlan = dashboardAccounts(buffer.database, [
+    { account: storedAccount?.accountHash ?? "none", plan: "Max", usdPerMonth: 200, vendor: "anthropic" },
+    { account: storedAccount?.accountHash ?? "none", plan: "Pro", usdPerMonth: 100, vendor: "openai" },
+  ]);
+  const multiRow = multiPlan.accounts.find((row) => row.accountHash === storedAccount?.accountHash);
+  check(
+    "multi_subscription_leverage_sums_plans",
+    Boolean(
+      multiRow?.subscription &&
+        multiRow.subscription.plan === "Max + Pro" &&
+        Math.abs((multiRow.subscription.planCostWindow ?? 0) - 300 * (30 / 30.44)) < 0.5 &&
+        (multiRow.subscription as { byVendor?: Array<{ vendor: string }> }).byVendor?.length === 2,
+    ),
+    JSON.stringify(multiRow?.subscription ?? null),
+  );
   check(
     "plan_leverage_computed",
     Boolean(
