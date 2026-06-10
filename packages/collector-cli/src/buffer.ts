@@ -588,6 +588,70 @@ export class LocalEventBuffer {
       .all(since);
   }
 
+  /**
+   * Per-event repo attribution (issue 0008). Token/usage events arrive with
+   * no repo columns (api_request and codex spans carry no cwd); hook events
+   * do. A token event's repo is the session's repo AT THAT MOMENT: the
+   * nearest repo-bearing event in the same session at-or-before it, falling
+   * back to the nearest after within 10 minutes (session-start race).
+   * Columns only — payload stays the captured truth; metadata.repoStitched
+   * marks the enrichment in receipts. Idempotent; runs on an interval and
+   * sweeps history on first run.
+   */
+  enrichEventRepos(limit = 50_000) {
+    const result = this.db
+      .prepare(
+        `update buffered_events set
+           repo_hash = stitched.repoHash,
+           branch_hash = stitched.branchHash,
+           payload_json = json_set(payload_json, '$.metadata.repoStitched', json('true'))
+         from (
+           select e.id as id,
+             (select r.repo_hash from buffered_events r
+               where r.session_id = e.session_id and r.repo_hash is not null
+                 and r.observed_at <= e.observed_at
+               order by r.observed_at desc limit 1) as repoHash,
+             (select r.branch_hash from buffered_events r
+               where r.session_id = e.session_id and r.repo_hash is not null
+                 and r.observed_at <= e.observed_at
+               order by r.observed_at desc limit 1) as branchHash
+           from buffered_events e
+           where e.repo_hash is null and e.session_id is not null
+             and (e.input_tokens is not null or e.output_tokens is not null or e.cost_usd is not null)
+           limit @limit
+         ) as stitched
+         where buffered_events.id = stitched.id and stitched.repoHash is not null`,
+      )
+      .run({ limit });
+    const forward = this.db
+      .prepare(
+        `update buffered_events set
+           repo_hash = stitched.repoHash,
+           branch_hash = stitched.branchHash,
+           payload_json = json_set(payload_json, '$.metadata.repoStitched', json('true'))
+         from (
+           select e.id as id,
+             (select r.repo_hash from buffered_events r
+               where r.session_id = e.session_id and r.repo_hash is not null
+                 and r.observed_at > e.observed_at
+                 and (strftime('%s', r.observed_at) - strftime('%s', e.observed_at)) <= 600
+               order by r.observed_at asc limit 1) as repoHash,
+             (select r.branch_hash from buffered_events r
+               where r.session_id = e.session_id and r.repo_hash is not null
+                 and r.observed_at > e.observed_at
+                 and (strftime('%s', r.observed_at) - strftime('%s', e.observed_at)) <= 600
+               order by r.observed_at asc limit 1) as branchHash
+           from buffered_events e
+           where e.repo_hash is null and e.session_id is not null
+             and (e.input_tokens is not null or e.output_tokens is not null or e.cost_usd is not null)
+           limit @limit
+         ) as stitched
+         where buffered_events.id = stitched.id and stitched.repoHash is not null`,
+      )
+      .run({ limit });
+    return { backward: result.changes, forward: forward.changes };
+  }
+
   /** Read access for dashboard queries; do not write through this. */
   get database() {
     return this.db;

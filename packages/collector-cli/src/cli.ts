@@ -377,6 +377,12 @@ async function main() {
         if (scanned.eventsAppended > 0 || scanned.parseErrors > 0) {
           console.log(JSON.stringify({ status: "rollout_scan", recentOnly, ...scanned }));
         }
+        // Per-event repo attribution (issue 0008): stitch repo onto token
+        // events from their session's timeline; idempotent, history-sweeping.
+        const stitched = buffer.enrichEventRepos();
+        if (stitched.backward > 0 || stitched.forward > 0) {
+          console.log(JSON.stringify({ status: "repo_stitch", ...stitched }));
+        }
       } catch (error) {
         console.warn(
           JSON.stringify({

@@ -154,28 +154,31 @@ export function dashboardSessions(db: Database.Database, days = 30, limit = 60) 
 
 export function dashboardRepos(db: Database.Database, days = 30) {
   const since = sinceIso(days);
-  // Tokens ride api_request events (no repo columns); repos ride hook events.
-  // Attribution is session-level: a session's repo is its dominant repo_hash
-  // by linked-event count (see dominantRepoSql), never lexicographic max().
+  // Event-grain attribution (issue 0008): token events carry repo columns
+  // (stitched from their session timeline, or native on rollout events), so a
+  // multi-repo session's cost splits per repo instead of lumping onto its
+  // dominant one. Events still missing a repo fall back to their session's
+  // dominant repo; sessions with no repo at all land on the unlinked row.
   return db
     .prepare(
       `with dominant as (${dominantRepoSql}),
-      sessions as (
-        select e.session_id, d.repo_hash as repoHash,
-          count(distinct e.branch_hash) as branches,
-          coalesce(sum(e.input_tokens), 0) as inputTokens,
-          coalesce(sum(e.output_tokens), 0) as outputTokens,
-          coalesce(sum(e.cost_usd), 0) as costUsd
+      attributed as (
+        select coalesce(e.repo_hash, d.repo_hash) as repoHash,
+          e.session_id as sessionId, e.branch_hash as branchHash,
+          coalesce(e.input_tokens, 0) as inputTokens,
+          coalesce(e.output_tokens, 0) as outputTokens,
+          coalesce(e.cost_usd, 0) as costUsd
         from buffered_events e
         left join dominant d on d.session_id = e.session_id
         where e.session_id is not null and e.observed_at >= ?
-        group by e.session_id
       )
-      select s.repoHash, l.label, count(*) as sessions, sum(s.branches) as branchRefs,
-        sum(s.inputTokens) as inputTokens, sum(s.outputTokens) as outputTokens,
-        sum(s.costUsd) as costUsd
-      from sessions s left join repo_labels l on l.repo_hash = s.repoHash
-      group by s.repoHash
+      select a.repoHash, l.label,
+        count(distinct a.sessionId) as sessions,
+        count(distinct a.branchHash) as branchRefs,
+        sum(a.inputTokens) as inputTokens, sum(a.outputTokens) as outputTokens,
+        sum(a.costUsd) as costUsd
+      from attributed a left join repo_labels l on l.repo_hash = a.repoHash
+      group by a.repoHash
       order by costUsd desc
       limit 12`,
     )
@@ -360,30 +363,24 @@ export function dashboardRepoDetail(db: Database.Database, repoHash: string, day
   const label = (db.prepare(`select label from repo_labels where repo_hash = ?`).get(repoHash) as
     | { label: string }
     | undefined)?.label;
-  const sessionIds = db
-    .prepare(
-      `select distinct session_id as id from buffered_events
-       where repo_hash = ? and session_id is not null and observed_at >= ?`,
-    )
-    .all(repoHash, since) as Array<{ id: string }>;
-  if (sessionIds.length === 0 && !label) return null;
-  const ids = sessionIds.map((row) => row.id);
-  const marks = ids.map(() => "?").join(",") || "''";
+  // Event-grain (issue 0008): everything filters on the event's own repo —
+  // no session-id parameter explosion, exact splits for multi-repo sessions.
   const totals = db
     .prepare(
       `select count(distinct session_id) as sessions, count(*) as events,
          coalesce(sum(input_tokens),0) as inputTokens, coalesce(sum(output_tokens),0) as outputTokens,
          coalesce(sum(cost_usd),0) as costUsd
-       from buffered_events where session_id in (${marks}) and observed_at >= ?`,
+       from buffered_events where repo_hash = ? and observed_at >= ?`,
     )
-    .get(...ids, since);
+    .get(repoHash, since) as { sessions: number; events: number } & Record<string, number>;
+  if ((totals?.events ?? 0) === 0 && !label) return null;
   const daily = db
     .prepare(
       `select substr(observed_at,1,10) as day, coalesce(sum(cost_usd),0) as costUsd
-       from buffered_events where session_id in (${marks}) and observed_at >= ?
+       from buffered_events where repo_hash = ? and observed_at >= ?
        group by day order by day asc`,
     )
-    .all(...ids, since);
+    .all(repoHash, since);
   const branches = db
     .prepare(
       `select branch_hash as branchHash, count(*) as events, count(distinct session_id) as sessions
@@ -394,18 +391,18 @@ export function dashboardRepoDetail(db: Database.Database, repoHash: string, day
   const actionMix = db
     .prepare(
       `select action_class as actionClass, count(*) as n from buffered_events
-       where session_id in (${marks}) and event_type in ('tool_use','tool_result') and observed_at >= ?
+       where repo_hash = ? and event_type in ('tool_use','tool_result') and observed_at >= ?
        group by action_class order by n desc`,
     )
-    .all(...ids, since);
+    .all(repoHash, since);
   const models = db
     .prepare(
       `select model, coalesce(sum(input_tokens),0) as inputTokens,
          coalesce(sum(output_tokens),0) as outputTokens, coalesce(sum(cost_usd),0) as costUsd
-       from buffered_events where session_id in (${marks}) and model is not null and observed_at >= ?
+       from buffered_events where repo_hash = ? and model is not null and observed_at >= ?
        group by model order by costUsd desc limit 8`,
     )
-    .all(...ids, since);
+    .all(repoHash, since);
   return { repoHash, label: label ?? null, days, totals, daily, branches, actionMix, models };
 }
 
