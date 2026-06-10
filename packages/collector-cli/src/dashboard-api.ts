@@ -265,6 +265,7 @@ export function dashboardAccounts(
       domrepo as (${dominantRepoSql}),
       sessions as (
         select e.session_id, a.account_hash as accountHash, r.repo_hash as repoHash,
+          max(e.source) as source,
           group_concat(distinct e.machine) as machines,
           coalesce(sum(e.cost_usd), 0) as costUsd,
           coalesce(sum(e.input_tokens), 0) as inputTokens,
@@ -284,6 +285,8 @@ export function dashboardAccounts(
         sum(case when p.repo_hash is null and s.repoHash is not null then s.costUsd else 0 end) as otherUsd,
         sum(case when s.repoHash is null then s.costUsd else 0 end) as unlinkedUsd,
         sum(s.costUsd) as totalUsd,
+        sum(case when s.source = 'claude_code' then s.costUsd else 0 end) as claudeUsd,
+        sum(case when s.source = 'codex' then s.costUsd else 0 end) as codexUsd,
         sum(s.inputTokens) as inputTokens, sum(s.outputTokens) as outputTokens
       from sessions s left join priority_repos p on p.repo_hash = s.repoHash
       group by s.accountHash
@@ -293,24 +296,51 @@ export function dashboardAccounts(
 
   const windowMonths = days / 30.44;
   const accounts = rows.map((row) => {
-    const subscription = subscriptions.find(
-      (sub) => sub.account === row.accountHash || (row.label && sub.account === row.label),
+    const rowEmail = (row as Record<string, unknown>).email;
+    // A person can carry several plans (e.g. Claude Max + ChatGPT Pro) — sum
+    // every subscription matched by hash, label, or email; find-first was
+    // silently dropping all but one plan (issue 0029).
+    const matching = subscriptions.filter(
+      (sub) =>
+        sub.account === row.accountHash ||
+        (row.label && sub.account === row.label) ||
+        (typeof rowEmail === "string" && rowEmail && sub.account === rowEmail),
     );
-    const planCostWindow = subscription
-      ? Number((subscription.usdPerMonth * windowMonths).toFixed(2))
-      : null;
+    const monthlyUsd = matching.reduce((sum, sub) => sum + sub.usdPerMonth, 0);
+    const planCostWindow = matching.length ? Number((monthlyUsd * windowMonths).toFixed(2)) : null;
+    const vendorSpend: Record<string, number> = {
+      anthropic: Number((row as Record<string, unknown>).claudeUsd ?? 0),
+      openai: Number((row as Record<string, unknown>).codexUsd ?? 0),
+    };
+    const byVendor = (["anthropic", "openai"] as const)
+      .map((vendor) => {
+        const vendorSubs = matching.filter((sub) => sub.vendor === vendor);
+        if (vendorSubs.length === 0) return null;
+        const window = Number(
+          (vendorSubs.reduce((sum, sub) => sum + sub.usdPerMonth, 0) * windowMonths).toFixed(2),
+        );
+        return {
+          vendor,
+          plans: vendorSubs.map((sub) => sub.plan).join(" + "),
+          planCostWindow: window,
+          spendUsd: Number(vendorSpend[vendor].toFixed(2)),
+          leverage: window > 0 ? Number((vendorSpend[vendor] / window).toFixed(2)) : null,
+        };
+      })
+      .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
     return {
       ...row,
       machines: typeof row.machines === "string" ? [...new Set(row.machines.split(","))] : [],
-      subscription: subscription
+      subscription: matching.length
         ? {
-            plan: subscription.plan,
-            usdPerMonth: subscription.usdPerMonth,
+            plan: matching.map((sub) => sub.plan).join(" + "),
+            usdPerMonth: monthlyUsd,
             planCostWindow,
             leverage:
               planCostWindow && planCostWindow > 0
                 ? Number((Number(row.totalUsd) / planCostWindow).toFixed(4))
                 : null,
+            byVendor,
           }
         : null,
     };
