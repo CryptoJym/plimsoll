@@ -1,0 +1,7 @@
+node_modules/
+evidence/
+*.log
+.DS_Store
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

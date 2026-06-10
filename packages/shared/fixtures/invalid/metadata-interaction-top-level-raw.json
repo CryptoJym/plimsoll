@@ -1,0 +1,13 @@
+{
+  "id": "invalid_top_level_raw",
+  "source": "codex",
+  "dataMode": "metadata",
+  "eventType": "user_prompt_submit",
+  "observedAt": "2026-05-17T15:00:00.000Z",
+  "model": "gpt-5.5-codex",
+  "actionClass": "other",
+  "prompt": "top-level raw prompt must be rejected by strict schema",
+  "metadata": {
+    "sourceCoverage": "negative_fixture"
+  }
+}

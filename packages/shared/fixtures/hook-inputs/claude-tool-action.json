@@ -1,0 +1,11 @@
+{
+  "id": "fixture_claude_tool_action",
+  "source": "claude_code",
+  "hook_event_name": "PostToolUse",
+  "session_id": "fixture-session-tool",
+  "project": "ai-work-intelligence",
+  "tool_name": "Edit",
+  "action_class": "edit",
+  "tool_input": "RAW_TOOL_INPUT_SENTINEL_CLAUDE_TOOL",
+  "tool_response": "RAW_TOOL_RESPONSE_SENTINEL_CLAUDE_TOOL"
+}

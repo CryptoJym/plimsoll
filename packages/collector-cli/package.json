@@ -1,0 +1,13 @@
+{
+  "name": "@plimsoll/collector",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "cfo-one-collector": "./src/cli.ts"
+  },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "license": "Apache-2.0"
+}

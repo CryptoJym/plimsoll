@@ -1,0 +1,19 @@
+{
+  "id": "00000000-0000-4000-8000-000000000602",
+  "tenantId": "00000000-0000-4000-8000-000000000001",
+  "dataMode": "evidence",
+  "version": "2026-05-17.evidence-v1",
+  "benchmarkContribution": "disabled",
+  "employeeSelfViewEnabled": true,
+  "managerDrilldownEnabled": false,
+  "minimumCohortSize": 5,
+  "evidence": {
+    "enabled": true,
+    "noticeVersion": "employee-notice-v1",
+    "noticeText": "Employees have been notified that evidence-mode capture is exception-only.",
+    "retentionDays": 7,
+    "allowedCategories": ["prompt"],
+    "rbacScopes": []
+  },
+  "updatedAt": "2026-05-17T00:00:00.000Z"
+}

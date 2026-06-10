@@ -1,0 +1,8 @@
+{
+  "id": "fixture_codex_unknown",
+  "source": "codex",
+  "event_type": "UnexpectedFutureHook",
+  "session_id": "fixture-session-unknown",
+  "project": "ai-work-intelligence",
+  "metadata_note": "unknown event fixture should normalize safely"
+}

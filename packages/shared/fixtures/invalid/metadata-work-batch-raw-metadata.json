@@ -1,0 +1,23 @@
+{
+  "tenantId": "00000000-0000-4000-8000-000000000001",
+  "installKey": "demo-mac-install-2026-05-17",
+  "appVersion": "0.1.0-demo",
+  "events": [
+    {
+      "event": {
+        "id": "invalid_raw_metadata",
+        "source": "claude_code",
+        "dataMode": "metadata",
+        "eventType": "user_prompt_submit",
+        "observedAt": "2026-05-17T15:00:00.000Z",
+        "model": "claude-opus-4.5",
+        "actionClass": "other",
+        "metadata": {
+          "prompt_body": "nested raw prompt must be rejected by storage gate",
+          "sourceCoverage": "negative_fixture"
+        }
+      },
+      "suppressedFields": []
+    }
+  ]
+}

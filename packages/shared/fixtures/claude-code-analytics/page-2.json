@@ -1,0 +1,62 @@
+{
+  "data": [
+    {
+      "date": "2026-05-17T00:00:00Z",
+      "actor": {
+        "type": "api_actor",
+        "api_key_name": "prod-claude-code-key"
+      },
+      "organization_id": "dc9f6c26-b22c-4831-8d01-0446bada88f1",
+      "customer_type": "subscription",
+      "terminal_type": "vscode",
+      "core_metrics": {
+        "num_sessions": 2,
+        "lines_of_code": {
+          "added": 210,
+          "removed": 84
+        },
+        "commits_by_claude_code": 0,
+        "pull_requests_by_claude_code": 0
+      },
+      "tool_actions": {
+        "edit_tool": {
+          "accepted": 3,
+          "rejected": 3
+        }
+      },
+      "model_breakdown": [
+        {
+          "model": "claude-sonnet-4-5",
+          "tokens": {
+            "input": 24000,
+            "output": 9000,
+            "cache_read": 2000,
+            "cache_creation": 1000
+          },
+          "estimated_cost": {
+            "currency": "USD",
+            "amount": 315
+          }
+        }
+      ]
+    },
+    {
+      "date": "2026-05-17T00:00:00Z",
+      "actor": {
+        "type": "user_actor",
+        "email_address": "missing-metrics@example.com"
+      },
+      "organization_id": "dc9f6c26-b22c-4831-8d01-0446bada88f1",
+      "customer_type": "api",
+      "terminal_type": "tmux",
+      "core_metrics": {
+        "num_sessions": 1,
+        "lines_of_code": {}
+      },
+      "tool_actions": {},
+      "model_breakdown": []
+    }
+  ],
+  "has_more": false,
+  "next_page": null
+}

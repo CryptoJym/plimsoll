@@ -1,0 +1,22 @@
+{
+  "id": "fixture_otel_claude_stop",
+  "event_type": "otel_span",
+  "name": "session.stop",
+  "resourceLogs": [
+    {
+      "scopeLogs": [
+        {
+          "logRecords": [
+            {
+              "attributes": [
+                { "key": "session.id", "value": { "stringValue": "otel-session-claude" } },
+                { "key": "cfo_one.workflow", "value": { "stringValue": "implementation" } },
+                { "key": "assistant_message", "value": { "stringValue": "RAW_OTEL_ASSISTANT_SENTINEL_STOP" } }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

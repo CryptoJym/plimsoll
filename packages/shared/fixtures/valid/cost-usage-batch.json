@@ -1,0 +1,38 @@
+{
+  "tenantId": "00000000-0000-4000-8000-000000000001",
+  "records": [
+    {
+      "id": "00000000-0000-4000-8000-000000000511",
+      "tenantId": "00000000-0000-4000-8000-000000000001",
+      "source": "openai_usage",
+      "periodStart": "2026-05-17T00:00:00.000Z",
+      "periodEnd": "2026-05-18T00:00:00.000Z",
+      "sourceRecordKey": "openai:project:ai-work-intelligence:2026-05-17:demo",
+      "model": "gpt-5.5-codex",
+      "projectKey": "ai-work-intelligence",
+      "inputTokens": 4000,
+      "outputTokens": 1600,
+      "actualCostUsd": 84.21,
+      "metadata": {
+        "billingSurface": "openai_cost_api_fixture"
+      }
+    }
+  ],
+  "allocations": [
+    {
+      "id": "00000000-0000-4000-8000-000000000521",
+      "tenantId": "00000000-0000-4000-8000-000000000001",
+      "sourceCostRecordId": "00000000-0000-4000-8000-000000000511",
+      "allocationType": "direct",
+      "amountUsd": 84.21,
+      "actorId": "00000000-0000-4000-8000-000000000201",
+      "teamId": "00000000-0000-4000-8000-000000000301",
+      "projectKey": "ai-work-intelligence",
+      "customerKey": "internal",
+      "workflowKey": "engineering",
+      "confidence": "high",
+      "basis": "Project key from schema fixture",
+      "metadata": {}
+    }
+  ]
+}

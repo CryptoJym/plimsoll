@@ -1,0 +1,57 @@
+{
+  "tenantId": "00000000-0000-4000-8000-000000000001",
+  "installKey": "demo-mac-install-2026-05-17",
+  "appVersion": "0.1.0-demo",
+  "events": [
+    {
+      "event": {
+        "id": "00000000-0000-4000-8000-000000000111",
+        "tenantId": "00000000-0000-4000-8000-000000000001",
+        "actorId": "00000000-0000-4000-8000-000000000201",
+        "sessionId": "00000000-0000-4000-8000-000000000101",
+        "source": "codex",
+        "dataMode": "metadata",
+        "eventType": "user_prompt_submit",
+        "observedAt": "2026-05-17T15:00:00.000Z",
+        "model": "gpt-5.5-codex",
+        "projectKey": "ai-work-intelligence",
+        "customerKey": "internal",
+        "workflowKey": "engineering",
+        "intent": "project",
+        "actionClass": "other",
+        "inputTokens": 1800,
+        "outputTokens": 620,
+        "costUsd": 0.42,
+        "metadata": {
+          "sourceCoverage": "schema_fixture"
+        }
+      },
+      "suppressedFields": ["prompt"]
+    },
+    {
+      "event": {
+        "id": "00000000-0000-4000-8000-000000000113",
+        "tenantId": "00000000-0000-4000-8000-000000000001",
+        "actorId": "00000000-0000-4000-8000-000000000202",
+        "source": "claude_code",
+        "dataMode": "metadata",
+        "eventType": "tool_use",
+        "observedAt": "2026-05-17T15:14:00.000Z",
+        "model": "claude-opus-4.5",
+        "projectKey": "customer-ledger",
+        "customerKey": "acme",
+        "workflowKey": "delivery",
+        "intent": "customer",
+        "actionClass": "validate",
+        "inputTokens": 900,
+        "outputTokens": 280,
+        "costUsd": 0.19,
+        "metadata": {
+          "validationKind": "test_and_diff_review",
+          "sourceCoverage": "schema_fixture"
+        }
+      },
+      "suppressedFields": []
+    }
+  ]
+}

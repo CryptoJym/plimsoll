@@ -1,0 +1,27 @@
+{
+  "id": "fixture_otel_claude_llm",
+  "event_type": "otel_span",
+  "name": "gen_ai.chat.completion",
+  "resourceLogs": [
+    {
+      "scopeLogs": [
+        {
+          "logRecords": [
+            {
+              "attributes": [
+                { "key": "session.id", "value": { "stringValue": "otel-session-claude" } },
+                { "key": "gen_ai.request.model", "value": { "stringValue": "claude-sonnet-fixture" } },
+                { "key": "gen_ai.usage.input_tokens", "value": { "intValue": 1200 } },
+                { "key": "gen_ai.usage.output_tokens", "value": { "intValue": 340 } },
+                { "key": "gen_ai.usage.cache_read_tokens", "value": { "intValue": 80 } },
+                { "key": "gen_ai.usage.cost_usd", "value": { "doubleValue": 0.42 } },
+                { "key": "cfo_one.project", "value": { "stringValue": "project-otel" } },
+                { "key": "prompt", "value": { "stringValue": "RAW_OTEL_PROMPT_SENTINEL_CLAUDE" } }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

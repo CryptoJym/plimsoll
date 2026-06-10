@@ -1,0 +1,10 @@
+{
+  "id": "fixture_claude_user_prompt",
+  "source": "claude_code",
+  "event_type": "UserPromptSubmit",
+  "session_id": "fixture-session-claude",
+  "project": "ai-work-intelligence",
+  "workflow": "implementation",
+  "model": "claude-code-fixture",
+  "prompt": "RAW_PROMPT_SENTINEL_CLAUDE_USER_PROMPT"
+}

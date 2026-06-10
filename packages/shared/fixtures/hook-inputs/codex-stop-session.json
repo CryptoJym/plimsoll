@@ -1,0 +1,9 @@
+{
+  "id": "fixture_codex_stop",
+  "source": "codex",
+  "event_type": "Stop",
+  "session_id": "fixture-session-codex",
+  "project": "ai-work-intelligence",
+  "assistant_message": "RAW_ASSISTANT_SENTINEL_CODEX_STOP",
+  "output": "RAW_OUTPUT_SENTINEL_CODEX_STOP"
+}

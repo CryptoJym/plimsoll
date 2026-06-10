@@ -1,0 +1,47 @@
+{
+  "id": "fixture_otel_codex_trace_span",
+  "resourceSpans": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name", "value": { "stringValue": "codex" } }
+        ]
+      },
+      "scopeSpans": [
+        {
+          "scope": {
+            "name": "codex-cli"
+          },
+          "spans": [
+            {
+              "traceId": "0123456789abcdef0123456789abcdef",
+              "spanId": "0123456789abcdef",
+              "name": "codex.tool.call",
+              "kind": 1,
+              "startTimeUnixNano": "1779026400000000000",
+              "attributes": [
+                { "key": "session.id", "value": { "stringValue": "otel-session-codex-trace" } },
+                { "key": "gen_ai.request.model", "value": { "stringValue": "codex-trace-fixture-model" } },
+                { "key": "tool.name", "value": { "stringValue": "shell" } },
+                { "key": "cfo_one.action_class", "value": { "stringValue": "validate" } },
+                { "key": "gen_ai.usage.input_tokens", "value": { "intValue": "321" } },
+                { "key": "gen_ai.usage.output_tokens", "value": { "intValue": "45" } },
+                { "key": "cfo_one.project", "value": { "stringValue": "project-trace" } },
+                { "key": "tool_input", "value": { "stringValue": "RAW_OTEL_TRACE_TOOL_INPUT_SENTINEL" } }
+              ],
+              "events": [
+                {
+                  "name": "codex.validation.complete",
+                  "timeUnixNano": "1779026405000000000",
+                  "attributes": [
+                    { "key": "cfo_one.workflow", "value": { "stringValue": "validation" } }
+                  ]
+                }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

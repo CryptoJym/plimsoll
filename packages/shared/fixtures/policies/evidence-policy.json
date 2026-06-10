@@ -1,0 +1,19 @@
+{
+  "id": "policy-fixture-evidence",
+  "tenantId": "00000000-0000-4000-8000-000000000001",
+  "dataMode": "evidence",
+  "version": "2026-05-18.evidence-fixture-v1",
+  "benchmarkContribution": "disabled",
+  "employeeSelfViewEnabled": true,
+  "managerDrilldownEnabled": false,
+  "minimumCohortSize": 5,
+  "evidence": {
+    "enabled": true,
+    "noticeVersion": "employee-notice-fixture-v1",
+    "noticeText": "Employees have been notified that evidence-mode capture is exception-only, role-gated, and retained briefly.",
+    "retentionDays": 14,
+    "allowedCategories": ["prompt", "output"],
+    "rbacScopes": ["evidence.viewer", "privacy.admin"]
+  },
+  "updatedAt": "2026-05-18T00:00:00.000Z"
+}

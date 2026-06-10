@@ -1,0 +1,16 @@
+{
+  "id": "policy-fixture-metadata",
+  "tenantId": "00000000-0000-4000-8000-000000000001",
+  "dataMode": "metadata",
+  "version": "2026-05-18.metadata-fixture-v1",
+  "benchmarkContribution": "disabled",
+  "employeeSelfViewEnabled": true,
+  "managerDrilldownEnabled": false,
+  "minimumCohortSize": 5,
+  "evidence": {
+    "enabled": false,
+    "allowedCategories": [],
+    "rbacScopes": []
+  },
+  "updatedAt": "2026-05-18T00:00:00.000Z"
+}

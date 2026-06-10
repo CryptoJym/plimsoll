@@ -1,0 +1,13 @@
+{
+  "id": "hook_raw_1",
+  "source": "claude_code",
+  "eventType": "UserPromptSubmit",
+  "timestamp": "2026-05-17T15:30:00.000Z",
+  "model": "claude-opus-4.5",
+  "prompt": "raw prompt text that must be suppressed before the shared ingest schema persists it",
+  "output": "raw output text that must be suppressed before the shared ingest schema persists it",
+  "tool_response": "raw tool result text that must be suppressed before the shared ingest schema persists it",
+  "input_tokens": 120,
+  "output_tokens": 55,
+  "project": "ai-work-intelligence"
+}

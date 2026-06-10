@@ -1,0 +1,36 @@
+{
+  "tenantId": "00000000-0000-4000-8000-000000000001",
+  "repository": {
+    "provider": "github",
+    "owner": "CryptoJym",
+    "name": "ai-costs-review",
+    "remoteUrlHash": "sha256:demo-repo-url"
+  },
+  "artifacts": [
+    {
+      "id": "00000000-0000-4000-8000-000000000411",
+      "tenantId": "00000000-0000-4000-8000-000000000001",
+      "actorId": "00000000-0000-4000-8000-000000000201",
+      "artifactType": "pull_request",
+      "externalId": "CryptoJym/ai-costs-review#demo-1",
+      "observedAt": "2026-05-17T15:20:00.000Z",
+      "status": "merged",
+      "metadata": {
+        "branch": "codex/ai-costs-review-standalone",
+        "sourceCoverage": "schema_fixture"
+      }
+    }
+  ],
+  "outcomes": [
+    {
+      "id": "00000000-0000-4000-8000-000000000421",
+      "workArtifactId": "00000000-0000-4000-8000-000000000411",
+      "reviewerActorId": "00000000-0000-4000-8000-000000000202",
+      "outcome": "approved",
+      "observedAt": "2026-05-17T15:25:00.000Z",
+      "metadata": {
+        "reviewerRole": "human"
+      }
+    }
+  ]
+}

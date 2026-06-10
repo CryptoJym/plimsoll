@@ -1,0 +1,1 @@
+{"id":"fixture_malformed","event_type":"UserPromptSubmit","prompt":

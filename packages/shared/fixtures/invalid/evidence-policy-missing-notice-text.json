@@ -1,0 +1,18 @@
+{
+  "id": "policy-fixture-evidence-missing-notice-text",
+  "tenantId": "00000000-0000-4000-8000-000000000001",
+  "dataMode": "evidence",
+  "version": "2026-05-18.evidence-missing-notice-text-v1",
+  "benchmarkContribution": "disabled",
+  "employeeSelfViewEnabled": true,
+  "managerDrilldownEnabled": false,
+  "minimumCohortSize": 5,
+  "evidence": {
+    "enabled": true,
+    "noticeVersion": "employee-notice-fixture-v1",
+    "retentionDays": 14,
+    "allowedCategories": ["prompt"],
+    "rbacScopes": ["evidence.viewer"]
+  },
+  "updatedAt": "2026-05-18T00:00:00.000Z"
+}

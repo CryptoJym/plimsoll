@@ -1,0 +1,307 @@
+{
+  "tenant": {
+    "id": "00000000-0000-4000-8000-000000000001",
+    "name": "Local AI Work Intelligence",
+    "plan": "free_local",
+    "benchmarkContribution": "disabled",
+    "createdAt": "2026-05-17T00:00:00.000Z"
+  },
+  "actor": {
+    "id": "00000000-0000-4000-8000-000000000201",
+    "tenantId": "00000000-0000-4000-8000-000000000001",
+    "emailHash": "sha256:actor-demo",
+    "displayName": "Demo Developer",
+    "teamId": "00000000-0000-4000-8000-000000000301",
+    "role": "employee"
+  },
+  "deviceInstall": {
+    "id": "00000000-0000-4000-8000-000000000102",
+    "tenantId": "00000000-0000-4000-8000-000000000001",
+    "actorId": "00000000-0000-4000-8000-000000000201",
+    "installKey": "demo-mac-install-2026-05-17",
+    "platform": "macos",
+    "appVersion": "0.1.0-demo",
+    "dataMode": "metadata",
+    "createdAt": "2026-05-17T00:00:00.000Z"
+  },
+  "toolIntegration": {
+    "id": "00000000-0000-4000-8000-000000000901",
+    "tenantId": "00000000-0000-4000-8000-000000000001",
+    "source": "codex",
+    "mode": "hook",
+    "status": "active",
+    "lastSeenAt": "2026-05-17T15:00:00.000Z"
+  },
+  "repository": {
+    "id": "00000000-0000-4000-8000-000000000401",
+    "tenantId": "00000000-0000-4000-8000-000000000001",
+    "provider": "github",
+    "owner": "CryptoJym",
+    "name": "ai-costs-review",
+    "remoteUrlHash": "sha256:demo-repo-url"
+  },
+  "projectMap": {
+    "id": "00000000-0000-4000-8000-000000000902",
+    "tenantId": "00000000-0000-4000-8000-000000000001",
+    "repositoryId": "00000000-0000-4000-8000-000000000401",
+    "projectKey": "ai-work-intelligence",
+    "projectName": "AI Work Intelligence MVP",
+    "customerKey": "internal",
+    "workflowKey": "engineering"
+  },
+  "customerMap": {
+    "id": "00000000-0000-4000-8000-000000000903",
+    "tenantId": "00000000-0000-4000-8000-000000000001",
+    "customerKey": "internal",
+    "customerName": "Internal",
+    "serviceLine": "product"
+  },
+  "session": {
+    "id": "00000000-0000-4000-8000-000000000101",
+    "tenantId": "00000000-0000-4000-8000-000000000001",
+    "actorId": "00000000-0000-4000-8000-000000000201",
+    "deviceInstallId": "00000000-0000-4000-8000-000000000102",
+    "source": "codex",
+    "dataMode": "metadata",
+    "startedAt": "2026-05-17T15:00:00.000Z",
+    "endedAt": "2026-05-17T15:10:00.000Z",
+    "repositoryId": "00000000-0000-4000-8000-000000000401",
+    "repoPathHash": "sha256:repo-path-demo",
+    "branch": "codex/ai-costs-review-standalone",
+    "projectKey": "ai-work-intelligence",
+    "customerKey": "internal",
+    "workflowKey": "engineering",
+    "intent": "project",
+    "metadata": {
+      "sourceCoverage": "schema_fixture"
+    }
+  },
+  "codexInteractionEvent": {
+    "id": "00000000-0000-4000-8000-000000000111",
+    "tenantId": "00000000-0000-4000-8000-000000000001",
+    "actorId": "00000000-0000-4000-8000-000000000201",
+    "sessionId": "00000000-0000-4000-8000-000000000101",
+    "source": "codex",
+    "dataMode": "metadata",
+    "eventType": "user_prompt_submit",
+    "observedAt": "2026-05-17T15:00:00.000Z",
+    "model": "gpt-5.5-codex",
+    "projectKey": "ai-work-intelligence",
+    "customerKey": "internal",
+    "workflowKey": "engineering",
+    "intent": "project",
+    "actionClass": "other",
+    "inputTokens": 1800,
+    "outputTokens": 620,
+    "costUsd": 0.42,
+    "metadata": {
+      "sourceCoverage": "schema_fixture"
+    }
+  },
+  "claudeInteractionEvent": {
+    "id": "00000000-0000-4000-8000-000000000113",
+    "tenantId": "00000000-0000-4000-8000-000000000001",
+    "actorId": "00000000-0000-4000-8000-000000000202",
+    "source": "claude_code",
+    "dataMode": "metadata",
+    "eventType": "tool_use",
+    "observedAt": "2026-05-17T15:14:00.000Z",
+    "model": "claude-opus-4.5",
+    "projectKey": "customer-ledger",
+    "customerKey": "acme",
+    "workflowKey": "delivery",
+    "intent": "customer",
+    "actionClass": "validate",
+    "inputTokens": 900,
+    "outputTokens": 280,
+    "costUsd": 0.19,
+    "metadata": {
+      "validationKind": "test_and_diff_review",
+      "sourceCoverage": "schema_fixture"
+    }
+  },
+  "toolActionEvent": {
+    "id": "00000000-0000-4000-8000-000000000904",
+    "sessionId": "00000000-0000-4000-8000-000000000101",
+    "interactionEventId": "00000000-0000-4000-8000-000000000113",
+    "source": "claude_code",
+    "dataMode": "metadata",
+    "observedAt": "2026-05-17T15:15:00.000Z",
+    "toolName": "test",
+    "actionClass": "validate",
+    "allowed": true,
+    "durationMs": 1200,
+    "resultStatus": "success",
+    "metadata": {
+      "sourceCoverage": "schema_fixture"
+    }
+  },
+  "workArtifact": {
+    "id": "00000000-0000-4000-8000-000000000411",
+    "tenantId": "00000000-0000-4000-8000-000000000001",
+    "actorId": "00000000-0000-4000-8000-000000000201",
+    "repositoryId": "00000000-0000-4000-8000-000000000401",
+    "sessionId": "00000000-0000-4000-8000-000000000101",
+    "artifactType": "pull_request",
+    "externalId": "CryptoJym/ai-costs-review#demo-1",
+    "observedAt": "2026-05-17T15:20:00.000Z",
+    "status": "merged",
+    "metadata": {
+      "sourceCoverage": "schema_fixture"
+    }
+  },
+  "reviewOutcome": {
+    "id": "00000000-0000-4000-8000-000000000421",
+    "workArtifactId": "00000000-0000-4000-8000-000000000411",
+    "reviewerActorId": "00000000-0000-4000-8000-000000000202",
+    "outcome": "approved",
+    "observedAt": "2026-05-17T15:25:00.000Z",
+    "metadata": {
+      "reviewerRole": "human"
+    }
+  },
+  "intervention": {
+    "id": "00000000-0000-4000-8000-000000000701",
+    "tenantId": "00000000-0000-4000-8000-000000000001",
+    "targetActorId": "00000000-0000-4000-8000-000000000201",
+    "createdByActorId": "00000000-0000-4000-8000-000000000202",
+    "interventionType": "skill",
+    "status": "assigned",
+    "createdAt": "2026-05-17T16:00:00.000Z",
+    "metadata": {
+      "metric": "validation_rate"
+    }
+  },
+  "skillRecommendation": {
+    "id": "00000000-0000-4000-8000-000000000702",
+    "tenantId": "00000000-0000-4000-8000-000000000001",
+    "interventionId": "00000000-0000-4000-8000-000000000701",
+    "title": "Review diffs before continuing",
+    "rationale": "Validation should happen before repeated continue actions.",
+    "status": "approved",
+    "createdAt": "2026-05-17T16:01:00.000Z"
+  },
+  "behaviorDelta": {
+    "id": "00000000-0000-4000-8000-000000000703",
+    "interventionId": "00000000-0000-4000-8000-000000000701",
+    "metricName": "validation_rate",
+    "beforeValue": 0.3,
+    "afterValue": 0.6,
+    "confidence": "medium",
+    "measuredAt": "2026-05-18T16:00:00.000Z"
+  },
+  "costUsageRecord": {
+    "id": "00000000-0000-4000-8000-000000000511",
+    "tenantId": "00000000-0000-4000-8000-000000000001",
+    "source": "openai_usage",
+    "periodStart": "2026-05-17T00:00:00.000Z",
+    "periodEnd": "2026-05-18T00:00:00.000Z",
+    "sourceRecordKey": "openai:project:ai-work-intelligence:2026-05-17:demo",
+    "model": "gpt-5.5-codex",
+    "projectKey": "ai-work-intelligence",
+    "inputTokens": 4000,
+    "outputTokens": 1600,
+    "actualCostUsd": 84.21,
+    "metadata": {
+      "billingSurface": "openai_cost_api_fixture"
+    }
+  },
+  "costAllocation": {
+    "id": "00000000-0000-4000-8000-000000000521",
+    "tenantId": "00000000-0000-4000-8000-000000000001",
+    "sourceCostRecordId": "00000000-0000-4000-8000-000000000511",
+    "allocationType": "direct",
+    "amountUsd": 84.21,
+    "actorId": "00000000-0000-4000-8000-000000000201",
+    "teamId": "00000000-0000-4000-8000-000000000301",
+    "projectKey": "ai-work-intelligence",
+    "customerKey": "internal",
+    "workflowKey": "engineering",
+    "confidence": "high",
+    "basis": "Project key from schema fixture",
+    "metadata": {}
+  },
+  "metadataPolicy": {
+    "id": "00000000-0000-4000-8000-000000000601",
+    "tenantId": "00000000-0000-4000-8000-000000000001",
+    "dataMode": "metadata",
+    "version": "2026-05-17.metadata-v1",
+    "benchmarkContribution": "disabled",
+    "employeeSelfViewEnabled": true,
+    "managerDrilldownEnabled": false,
+    "minimumCohortSize": 5,
+    "evidence": {
+      "enabled": false,
+      "allowedCategories": [],
+      "rbacScopes": []
+    },
+    "updatedAt": "2026-05-17T00:00:00.000Z"
+  },
+  "evidencePolicy": {
+    "id": "00000000-0000-4000-8000-000000000602",
+    "tenantId": "00000000-0000-4000-8000-000000000001",
+    "dataMode": "evidence",
+    "version": "2026-05-17.evidence-v1",
+    "benchmarkContribution": "disabled",
+    "employeeSelfViewEnabled": true,
+    "managerDrilldownEnabled": false,
+    "minimumCohortSize": 5,
+    "evidence": {
+      "enabled": true,
+      "noticeVersion": "employee-notice-v1",
+      "noticeText": "Employees have been notified that evidence-mode capture is exception-only and separate from routine analytics.",
+      "retentionDays": 7,
+      "allowedCategories": ["prompt"],
+      "rbacScopes": ["evidence.viewer"]
+    },
+    "updatedAt": "2026-05-17T00:00:00.000Z"
+  },
+  "evidenceVaultRecord": {
+    "id": "00000000-0000-4000-8000-000000000905",
+    "tenantId": "00000000-0000-4000-8000-000000000001",
+    "sessionId": "00000000-0000-4000-8000-000000000101",
+    "interactionEventId": "00000000-0000-4000-8000-000000000111",
+    "category": "prompt",
+    "policyVersion": "2026-05-17.evidence-v1",
+    "noticeVersion": "employee-notice-v1",
+    "expiresAt": "2026-05-24T00:00:00.000Z",
+    "encryptedPayloadRef": "vault://tenant/local/session/record.enc",
+    "createdAt": "2026-05-17T00:00:00.000Z"
+  },
+  "evidenceVaultIngest": {
+    "tenantId": "00000000-0000-4000-8000-000000000001",
+    "sessionId": "00000000-0000-4000-8000-000000000101",
+    "interactionEventId": "00000000-0000-4000-8000-000000000111",
+    "category": "prompt",
+    "noticeVersion": "employee-notice-v1",
+    "encryptedPayloadRef": "vault://tenant/local/session/record.enc",
+    "metadata": {
+      "case": "schema_fixture"
+    }
+  },
+  "benchmarkContribution": {
+    "id": "00000000-0000-4000-8000-000000000906",
+    "cohortKey": "industry:software:team-size:10-50",
+    "metricName": "validation_rate",
+    "metricValue": 0.72,
+    "aggregationWindowStart": "2026-05-01T00:00:00.000Z",
+    "aggregationWindowEnd": "2026-06-01T00:00:00.000Z",
+    "cohortSize": 12,
+    "minimumThresholdMet": true,
+    "excludedFields": ["employee_name", "repo_name", "prompt", "output"],
+    "contributionTermsVersion": "benchmark-terms-v1",
+    "createdAt": "2026-05-17T00:00:00.000Z"
+  },
+  "benchmarkExportRow": {
+    "cohortKey": "industry:software:team-size:10-50",
+    "metricName": "validation_rate",
+    "metricValue": 0.72,
+    "aggregationWindowStart": "2026-05-01T00:00:00.000Z",
+    "aggregationWindowEnd": "2026-06-01T00:00:00.000Z",
+    "cohortSize": 12,
+    "contributionTermsVersion": "benchmark-terms-v1",
+    "metadata": {
+      "aggregationOnly": true
+    }
+  }
+}
