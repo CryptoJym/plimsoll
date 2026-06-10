@@ -428,6 +428,6 @@ export function dashboardRepoDetail(db: Database.Database, repoHash: string, day
 }
 
 function sinceIso(days: number) {
-  const clamped = Math.max(1, Math.min(days, 365));
+  const clamped = Math.max(1, Math.min(days, 1825));
   return new Date(Date.now() - clamped * 24 * 60 * 60 * 1000).toISOString();
 }

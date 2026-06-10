@@ -24,6 +24,19 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   // gpt-5.2-2025-12-11), fetched 2026-06-10. The rollout backfill surfaced
   // 12.5M unpriced tokens on it (issue 0025 / GH #32).
   "gpt-5.2": { input: 1.75, cachedInput: 0.175, output: 14.0, vendor: "openai", asOf: "2026-06-10" },
+  // Anthropic rates (platform.claude.com/docs pricing, fetched 2026-06-10).
+  // cachedInput = cache HIT rate (0.1x input). Anthropic semantics differ
+  // from OpenAI: usage.input_tokens EXCLUDES cache reads. Cache WRITES bill
+  // 1.25x input but have no column yet (issue 0024) — estimates exclude
+  // them and are therefore a floor. Long-context (1m) tiers bill standard.
+  "claude-fable-5": { input: 10.0, cachedInput: 1.0, output: 50.0, vendor: "anthropic", asOf: "2026-06-10" },
+  "claude-opus-4-8": { input: 5.0, cachedInput: 0.5, output: 25.0, vendor: "anthropic", asOf: "2026-06-10" },
+  "claude-opus-4-7": { input: 5.0, cachedInput: 0.5, output: 25.0, vendor: "anthropic", asOf: "2026-06-10" },
+  "claude-opus-4-6": { input: 5.0, cachedInput: 0.5, output: 25.0, vendor: "anthropic", asOf: "2026-06-10" },
+  "claude-opus-4-5": { input: 5.0, cachedInput: 0.5, output: 25.0, vendor: "anthropic", asOf: "2026-06-10" },
+  "claude-sonnet-4-6": { input: 3.0, cachedInput: 0.3, output: 15.0, vendor: "anthropic", asOf: "2026-06-10" },
+  "claude-sonnet-4-5": { input: 3.0, cachedInput: 0.3, output: 15.0, vendor: "anthropic", asOf: "2026-06-10" },
+  "claude-haiku-4-5": { input: 1.0, cachedInput: 0.1, output: 5.0, vendor: "anthropic", asOf: "2026-06-10" },
 };
 
 export function priceForModel(model: string | undefined): ModelPrice | undefined {
@@ -49,9 +62,14 @@ export function estimateCostUsd(options: {
   const price = priceForModel(options.model);
   if (!price) return undefined;
   const input = options.inputTokens ?? 0;
-  const cached = Math.min(options.cacheReadTokens ?? 0, input);
+  // OpenAI reports cached as a subset of input; Anthropic reports input
+  // EXCLUSIVE of cache reads (reads can be 1000x input — never clamp them).
+  const cached =
+    price.vendor === "openai"
+      ? Math.min(options.cacheReadTokens ?? 0, input)
+      : options.cacheReadTokens ?? 0;
   const output = options.outputTokens ?? 0;
-  if (input === 0 && output === 0) return undefined;
+  if (input === 0 && output === 0 && cached === 0) return undefined;
   const billableInput = price.vendor === "openai" ? input - cached : input;
   const costUsd =
     (billableInput * price.input + cached * price.cachedInput + output * price.output) / 1_000_000;

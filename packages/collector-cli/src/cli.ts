@@ -25,6 +25,7 @@ import {
 } from "./launch-agent";
 import { computeCaptureHealth } from "./health";
 import { RolloutTailer } from "./rollout-tailer";
+import { TranscriptTailer } from "./transcript-tailer";
 import { createCollectorServer } from "./server";
 import {
   applyClaudeSettings,
@@ -61,6 +62,7 @@ Commands:
   setup                 APPLY the Claude Code + Codex telemetry config (idempotent; --yes, --dry-run)
   upload                Drain un-uploaded events to the tenant ingest API (marks rows, keeps local copies)
   scan-rollouts         Read codex rollout files into the ledger once (full history walk)
+  scan-transcripts      Read Claude Code transcript usage into the ledger once (full history walk)
   install-launch-agent  Write the user LaunchAgent plist
   load-launch-agent     Load an installed user LaunchAgent plist
   unload-launch-agent   Unload the user LaunchAgent without removing the plist
@@ -376,11 +378,16 @@ async function main() {
     // Codex usage truth rides rollout files (issue 0022): full walk on boot
     // (backfills any uncaptured history, idempotent), then a recent-days tail.
     const rolloutTailer = new RolloutTailer(buffer);
+    const transcriptTailer = new TranscriptTailer(buffer);
     const runRolloutScan = async (recentOnly: boolean) => {
       try {
         const scanned = await rolloutTailer.scan({ recentOnly });
         if (scanned.eventsAppended > 0 || scanned.parseErrors > 0) {
           console.log(JSON.stringify({ status: "rollout_scan", recentOnly, ...scanned }));
+        }
+        const transcripts = await transcriptTailer.scan({ recentOnly });
+        if (transcripts.eventsAppended > 0 || transcripts.parseErrors > 0) {
+          console.log(JSON.stringify({ status: "transcript_scan", recentOnly, ...transcripts }));
         }
         // Per-event repo attribution (issue 0008): stitch repo onto token
         // events from their session's timeline; idempotent, history-sweeping.
@@ -578,6 +585,14 @@ async function main() {
   if (command === "scan-rollouts") {
     const buffer = openBuffer();
     const result = await new RolloutTailer(buffer).scan({ recentOnly: false });
+    console.log(JSON.stringify(result, null, 2));
+    buffer.close();
+    return;
+  }
+
+  if (command === "scan-transcripts") {
+    const buffer = openBuffer();
+    const result = await new TranscriptTailer(buffer).scan({ recentOnly: false });
     console.log(JSON.stringify(result, null, 2));
     buffer.close();
     return;

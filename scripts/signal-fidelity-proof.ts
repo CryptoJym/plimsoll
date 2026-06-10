@@ -30,6 +30,9 @@
  *  13. Config apply mode merges telemetry settings surgically (user keys
  *      preserved, backups written, idempotent, foreign [otel] never
  *      clobbered) — the five-minute promise's first step (issue 0003).
+ *  14. Claude transcript tailer recovers per-message usage history exactly
+ *      (dedupe by message id, sourced Anthropic estimates, repo linkage,
+ *      live-covered sessions skipped, content never persisted).
  *
  * Run: pnpm plimsoll:signal-fidelity-proof
  */
@@ -60,6 +63,7 @@ import {
 } from "../packages/collector-cli/src/dashboard-api";
 import { computeCaptureHealth } from "../packages/collector-cli/src/health";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
+import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 import { MODEL_PRICING } from "../packages/shared/src/pricing";
 import { readLocalIdentities } from "../packages/collector-cli/src/local-identity";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
@@ -1296,6 +1300,71 @@ async function main() {
   );
   fs.rmSync(setupDir, { recursive: true, force: true });
 
+  // 14. Claude transcript tailer (history reach). Fixtures mirror live
+  // transcript shapes; the duplicated message id proves stream/retry dedupe.
+  const TRANSCRIPT_SESSION = "44445555-6666-4777-8888-99990000aaaa";
+  const TRANSCRIPT_SENTINEL = "TRANSCRIPT_CONTENT_SENTINEL never persist";
+  const projectsDir = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-transcripts-"));
+  const projDir = path.join(projectsDir, "-tmp-proof-project");
+  fs.mkdirSync(projDir, { recursive: true });
+  const tline = (obj: Record<string, unknown>) => JSON.stringify(obj);
+  fs.writeFileSync(
+    path.join(projDir, `${TRANSCRIPT_SESSION}.jsonl`),
+    [
+      tline({ type: "user", sessionId: TRANSCRIPT_SESSION, cwd: proofRepo.repoDir, timestamp: "2026-04-10T10:00:00.000Z", message: { role: "user", content: TRANSCRIPT_SENTINEL } }),
+      tline({ type: "assistant", sessionId: TRANSCRIPT_SESSION, cwd: proofRepo.repoDir, timestamp: "2026-04-10T10:00:05.000Z", message: { id: "msg_proof_1", model: "claude-fable-5", content: [{ type: "text", text: TRANSCRIPT_SENTINEL }], usage: { input_tokens: 400, cache_read_input_tokens: 50000, cache_creation_input_tokens: 1200, output_tokens: 100 } } }),
+      tline({ type: "assistant", sessionId: TRANSCRIPT_SESSION, cwd: proofRepo.repoDir, timestamp: "2026-04-10T10:00:06.000Z", message: { id: "msg_proof_1", model: "claude-fable-5", content: [{ type: "text", text: TRANSCRIPT_SENTINEL }], usage: { input_tokens: 1000, cache_read_input_tokens: 200000, cache_creation_input_tokens: 1500, output_tokens: 500 } } }),
+      tline({ type: "assistant", sessionId: TRANSCRIPT_SESSION, cwd: proofRepo.repoDir, timestamp: "2026-04-10T10:01:00.000Z", message: { id: "msg_proof_2", model: "claude-fable-5", content: [], usage: { input_tokens: 200, cache_read_input_tokens: 0, cache_creation_input_tokens: 0, output_tokens: 50 } } }),
+    ].join("\n") + "\n",
+  );
+  // Live-covered session: SESSION already has OTLP token events → skipped.
+  fs.writeFileSync(
+    path.join(projDir, `${SESSION}.jsonl`),
+    tline({ type: "assistant", sessionId: SESSION, timestamp: "2026-06-10T10:00:00.000Z", message: { id: "msg_skip_1", model: "claude-fable-5", usage: { input_tokens: 999, output_tokens: 999 } } }) + "\n",
+  );
+  const transcriptScan = await new TranscriptTailer(buffer, projectsDir).scan();
+  const transcriptRows = buffer.database
+    .prepare(
+      `select session_id as sid, model, input_tokens as i, cache_read_tokens as c, output_tokens as o,
+         cost_usd as cost, repo_hash as repo, payload_json as payload
+       from buffered_events where event_type = 'usage_transcript' order by observed_at`,
+    )
+    .all() as Array<Record<string, unknown>>;
+  const tRows = transcriptRows.filter((row) => row.sid === TRANSCRIPT_SESSION);
+  const tSum = tRows.reduce<{ i: number; c: number; o: number; cost: number }>(
+    (sum, row) => ({ i: sum.i + Number(row.i), c: sum.c + Number(row.c), o: sum.o + Number(row.o), cost: sum.cost + Number(row.cost ?? 0) }),
+    { i: 0, c: 0, o: 0, cost: 0 },
+  );
+  // fable rates (sourced 2026-06-10): msg1(last write wins)=1000in+200k reads+500out
+  // → (1000*10 + 200000*1 + 500*50)/1e6 = 0.235; msg2 = (200*10+50*50)/1e6 = 0.0045
+  check(
+    "transcript_usage_ingested_exact_and_deduped",
+    tRows.length === 2 &&
+      tSum.i === 1200 &&
+      tSum.c === 200000 &&
+      tSum.o === 550 &&
+      Math.abs(tSum.cost - 0.2395) < 1e-6 &&
+      tRows.every((row) => row.repo === expectedRemoteHash) &&
+      tRows.every((row) => String(row.payload).includes('"costEstimated":true')),
+    JSON.stringify({ rows: tRows.length, ...tSum }),
+  );
+  check(
+    "transcript_live_covered_session_skipped",
+    transcriptScan.sessionsSkippedLiveCovered >= 1 &&
+      !transcriptRows.some((row) => row.sid === SESSION),
+    JSON.stringify({ skipped: transcriptScan.sessionsSkippedLiveCovered }),
+  );
+  const transcriptRescan = await new TranscriptTailer(buffer, projectsDir).scan();
+  const transcriptPersisted = JSON.stringify(
+    buffer.database.prepare(`select payload_json from buffered_events where source = 'claude_code'`).all(),
+  );
+  check(
+    "transcript_rescan_idempotent_and_content_free",
+    transcriptRescan.eventsAppended === 0 && !transcriptPersisted.includes("TRANSCRIPT_CONTENT_SENTINEL"),
+    JSON.stringify({ rescanAppended: transcriptRescan.eventsAppended }),
+  );
+  fs.rmSync(projectsDir, { recursive: true, force: true });
+
   // 7. Upload watermark drains oldest-first against a stub ingest endpoint.
   const received: number[] = [];
   const uploadBodies: string[] = [];
@@ -1345,13 +1414,32 @@ async function main() {
     "raw account email absent from all upload bodies (lives in account_labels only)",
   );
 
-  // 8. Retention prune.
+  // 8. Retention prune: uploaded rows age out; local history NEVER does.
   await new Promise((resolve) => setTimeout(resolve, 5));
+  buffer.append(
+    aiInteractionEventSchema.parse({
+      id: "prune-survivor-0000",
+      tenantId: "local",
+      source: "claude_code",
+      dataMode: "metadata",
+      eventType: "usage_transcript",
+      observedAt: "2020-01-01T00:00:00.000Z",
+      sessionId: "99990000-1111-4222-8333-444455556666",
+      actionClass: "other",
+      inputTokens: 1,
+      outputTokens: 1,
+      metadata: { usageSource: "transcript" },
+    }),
+    [],
+  );
   const pruned = buffer.prune(0);
+  const survivor = buffer.database
+    .prepare(`select count(*) as n from buffered_events where uploaded_at is null`)
+    .get() as { n: number };
   check(
-    "retention_prune_deletes_aged_rows",
-    pruned.events > 0 && buffer.stats().count === 0,
-    JSON.stringify(pruned),
+    "retention_prune_spares_unuploaded_history",
+    pruned.events > 0 && survivor.n === 1 && buffer.stats().count === 1,
+    JSON.stringify({ pruned: pruned.events, unuploadedSurvivors: survivor.n }),
   );
 
   buffer.close();
