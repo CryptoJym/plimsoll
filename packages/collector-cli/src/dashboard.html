@@ -212,6 +212,7 @@ input:focus,select:focus{outline:none;border-color:var(--waterline)}
   font-family:var(--mono);font-size:11px;padding:6px 12px;cursor:pointer;letter-spacing:.08em}
 .btn:hover{border-color:var(--brass);color:var(--brass)}
 .srow{display:flex;gap:8px;align-items:center;font-size:11px}
+.srow select{background:#0a1016;border:1px solid var(--line-bright);color:var(--foam);font-family:var(--mono);font-size:10px;padding:4px;max-width:150px}
 .srow .hash{flex:none}
 .empty{padding:30px 0; text-align:center; color:var(--foam-faint); font-size:12px; letter-spacing:.06em}
 .empty b{color:var(--foam-dim)}
@@ -564,10 +565,19 @@ const post=(route,body)=>fetch(route,{method:"POST",headers:{"content-type":"app
 let settingsCache={accounts:[],priorityRepos:[],subscriptions:[]};
 async function loadSettings(){
   settingsCache=await fetch("/api/settings").then(r=>r.json());
-  $("#s-accounts").innerHTML=settingsCache.accounts.map(a=>`<div class="srow">
+  const aliasMap=Object.fromEntries((settingsCache.accountAliases||[]).map(x=>[x.aliasHash,x.canonicalHash]));
+  const acctLabel=h=>{const m=settingsCache.accounts.find(x=>x.accountHash===h);return (m&&m.label)||short(h)};
+  const canonicals=settingsCache.accounts.filter(a=>!aliasMap[a.accountHash]);
+  $("#s-accounts").innerHTML=settingsCache.accounts.map(a=>{
+    const mergedInto=aliasMap[a.accountHash];
+    return `<div class="srow">
     <span class="hash">${short(a.accountHash)}</span>
     <input value="${(a.label||"").replace(/"/g,"&quot;")}" data-hash="${a.accountHash}" style="flex:1">
-    <button class="btn" onclick="saveLabel(this)">save</button></div>`).join("")||'<div class="empty">accounts appear after their first session</div>';
+    <button class="btn" onclick="saveLabel(this)">save</button>
+    ${mergedInto
+      ?`<span class="hash" title="events under this identity display as ${acctLabel(mergedInto)}">→ ${acctLabel(mergedInto)}</span><button class="btn" onclick="unmergeAccount('${a.accountHash}')">unmerge</button>`
+      :`<select onchange="mergeAccount('${a.accountHash}',this.value)"><option value="">same person as…</option>${canonicals.filter(c=>c.accountHash!==a.accountHash).map(c=>`<option value="${c.accountHash}">${acctLabel(c.accountHash)}</option>`).join("")}</select>`}
+    </div>`}).join("")||'<div class="empty">accounts appear after their first session</div>';
   $("#s-prio-list").innerHTML=settingsCache.priorityRepos.map(p=>`<div class="srow">
     <span style="flex:1;color:var(--foam)">${p.url}</span>
     <button class="btn" onclick="removePrio('${p.url}')">remove</button></div>`).join("")||'<div class="empty">no priority projects yet</div>';
@@ -578,6 +588,8 @@ async function loadSettings(){
 }
 async function saveLabel(btn){const input=btn.previousElementSibling;
   try{await post("/api/settings/account-label",{accountHash:input.dataset.hash,label:input.value});$("#s-msg").textContent="saved ✓";refresh();}catch(e){$("#s-msg").textContent=e.message}}
+async function mergeAccount(aliasHash,canonicalHash){if(!canonicalHash)return;try{await post("/api/settings/account-merge",{aliasHash,canonicalHash});$("#s-msg").textContent="identities merged \u2713";loadSettings();refresh();}catch(e){$("#s-msg").textContent=e.message}}
+async function unmergeAccount(aliasHash){try{await post("/api/settings/account-merge",{aliasHash,action:"remove"});$("#s-msg").textContent="unmerged \u2713";loadSettings();refresh();}catch(e){$("#s-msg").textContent=e.message}}
 async function removePrio(url){await post("/api/settings/priority",{action:"remove",url});loadSettings();refresh();}
 $("#s-prio-add").onclick=async()=>{try{await post("/api/settings/priority",{url:$("#s-prio-url").value});$("#s-prio-url").value="";$("#s-msg").textContent="priority added ✓";loadSettings();refresh();}catch(e){$("#s-msg").textContent=e.message}};
 async function removeSub(i){const subs=settingsCache.subscriptions.filter((_,j)=>j!==i);await post("/api/settings/subscriptions",{subscriptions:subs});loadSettings();refresh();}

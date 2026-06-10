@@ -30,16 +30,22 @@ const dominantRepoSql = `
     group by session_id, repo_hash
   ) where rn = 1`;
 
+// Aliases (local account_aliases table, issue 0023) apply before dominance:
+// once two hash forms are declared the same person, a session that straddles
+// them has one candidate and merges at the root rather than in display code.
 const dominantAccountSql = `
   select session_id, account_hash from (
-    select session_id, account_hash,
+    select e.session_id,
+      coalesce(al.canonical_hash, e.account_hash) as account_hash,
       row_number() over (
-        partition by session_id
-        order by sum(coalesce(cost_usd, 0)) desc, count(*) desc, account_hash
+        partition by e.session_id
+        order by sum(coalesce(e.cost_usd, 0)) desc, count(*) desc,
+          coalesce(al.canonical_hash, e.account_hash)
       ) as rn
-    from buffered_events
-    where session_id is not null and account_hash is not null and observed_at >= ?
-    group by session_id, account_hash
+    from buffered_events e
+    left join account_aliases al on al.alias_hash = e.account_hash
+    where e.session_id is not null and e.account_hash is not null and e.observed_at >= ?
+    group by e.session_id, coalesce(al.canonical_hash, e.account_hash)
   ) where rn = 1`;
 
 export function dashboardSummary(db: Database.Database, days = 30) {

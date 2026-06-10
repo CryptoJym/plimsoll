@@ -1,5 +1,11 @@
 # 0023 — Account continuity across the v1→v2 hash boundary
 
+Closed: path (b) shipped — local `account_aliases` table applied at read time inside
+the dominance CTE, settings drawer "same person as…"/unmerge, proof checks
+`account_merge_settings_roundtrip` / `account_alias_merges_identities_at_read_time` /
+`account_alias_removal_restores_split` (47 total). Path (a) (computed unification from
+the v1 archive) remains optional future work — manual merge fully covers this machine.
+
 ## TL;DR
 - One human currently renders as 4 account hashes + a NULL row. The v1→v2 swap re-hashed the
   same wire identity through different sanitizer chains: `d007d307…` = v2-rehash(v1-sanitized
