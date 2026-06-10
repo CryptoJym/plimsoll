@@ -83,10 +83,13 @@ export function dashboardSummary(db: Database.Database, days = 30) {
     )
     .all(since);
 
+  // unpricedCalls > 0 with costUsd 0 means "no vendor rate on file", which the
+  // dashboard must render as unpriced — never as $0.00 (issue 0025).
   const byModel = db
     .prepare(
       `select model,
         count(*) as calls,
+        sum(case when cost_usd is null then 1 else 0 end) as unpricedCalls,
         coalesce(sum(input_tokens), 0) as inputTokens,
         coalesce(sum(output_tokens), 0) as outputTokens,
         coalesce(sum(cache_read_tokens), 0) as cacheReadTokens,

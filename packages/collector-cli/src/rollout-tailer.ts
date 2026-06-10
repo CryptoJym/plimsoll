@@ -43,6 +43,7 @@ export type RolloutScanResult = {
   eventsAppended: number;
   tokensAppended: { input: number; cachedInput: number; output: number };
   parseErrors: number;
+  repriced: number;
 };
 
 type TokenTotals = { input: number; cachedInput: number; output: number; reasoningOutput: number };
@@ -117,6 +118,49 @@ export class RolloutTailer {
       .run(file, size, new Date().toISOString());
   }
 
+  /**
+   * Rate-table updates land after events exist (gpt-5.2 carried 12.5M
+   * unpriced tokens before its rate was sourced — issue 0025). Reprice
+   * usage_rollout rows whose cost is still null whenever their model becomes
+   * priceable. Only null-cost rows are touched: vendor-reported and
+   * previously estimated costs are never rewritten.
+   */
+  private repriceUnpriced(): number {
+    const rows = this.buffer.database
+      .prepare(
+        `select id, model, input_tokens as inputTokens, output_tokens as outputTokens,
+           cache_read_tokens as cacheReadTokens
+         from buffered_events
+         where event_type = 'usage_rollout' and cost_usd is null and model is not null`,
+      )
+      .all() as Array<{
+      id: string;
+      model: string;
+      inputTokens: number | null;
+      outputTokens: number | null;
+      cacheReadTokens: number | null;
+    }>;
+    if (rows.length === 0) return 0;
+    const apply = this.buffer.database.prepare(
+      `update buffered_events set cost_usd = @costUsd,
+         payload_json = json_set(payload_json, '$.costUsd', @costUsd, '$.metadata.costEstimated', json('true'))
+       where id = @id`,
+    );
+    let repriced = 0;
+    for (const row of rows) {
+      const priced = estimateCostUsd({
+        model: row.model,
+        inputTokens: row.inputTokens ?? 0,
+        outputTokens: row.outputTokens ?? 0,
+        cacheReadTokens: row.cacheReadTokens ?? 0,
+      });
+      if (!priced) continue;
+      apply.run({ id: row.id, costUsd: priced.costUsd });
+      repriced += 1;
+    }
+    return repriced;
+  }
+
   /** recentOnly limits discovery to today+yesterday (UTC) day directories. */
   scan(options: { recentOnly?: boolean; now?: Date } = {}): RolloutScanResult {
     const result: RolloutScanResult = {
@@ -126,6 +170,7 @@ export class RolloutTailer {
       eventsAppended: 0,
       tokensAppended: { input: 0, cachedInput: 0, output: 0 },
       parseErrors: 0,
+      repriced: this.repriceUnpriced(),
     };
     for (const file of this.discover(options)) {
       result.filesSeen += 1;
