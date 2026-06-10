@@ -135,7 +135,7 @@ export class RolloutTailer {
         `select id, model, input_tokens as inputTokens, output_tokens as outputTokens,
            cache_read_tokens as cacheReadTokens
          from buffered_events
-         where event_type = 'usage_rollout' and cost_usd is null and model is not null`,
+         where event_type in ('usage_rollout','usage_transcript') and cost_usd is null and model is not null`,
       )
       .all() as Array<{
       id: string;

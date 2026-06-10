@@ -528,8 +528,12 @@ export class LocalEventBuffer {
 
   prune(retentionDays = 90) {
     const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
+    // Retention is UPLOAD-SPOOL hygiene, not history deletion: the local
+    // ledger IS the product's memory (the 2026-06 backfills were all created
+    // the same day — a created_at-only prune would have erased months of
+    // history in one sweep 90 days later). Rows never uploaded never age out.
     const events = this.db
-      .prepare(`delete from buffered_events where created_at < ?`)
+      .prepare(`delete from buffered_events where created_at < ? and uploaded_at is not null`)
       .run(cutoff).changes;
     const metricSamples = this.db
       .prepare(`delete from metric_samples where created_at < ?`)

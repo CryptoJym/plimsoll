@@ -262,6 +262,7 @@ export const aiInteractionEventSchema = z
       "tool_result",
       "otel_span",
       "usage_rollout",
+      "usage_transcript",
       "unknown",
     ]),
     observedAt: timestampSchema,
