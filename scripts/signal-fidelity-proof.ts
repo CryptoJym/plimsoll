@@ -25,6 +25,8 @@
  *  11. Codex rollout tailer ingests token_count lines exactly (telescoped
  *      cumulative totals), idempotently, with repo linkage from cwd, OTLP
  *      first-writer-wins dedupe, and zero content persistence (issue 0022).
+ *  12. Account aliases (local-only) merge split identities at read time,
+ *      reversibly, via settings endpoint and dashboard queries (issue 0023).
  *
  * Run: pnpm plimsoll:signal-fidelity-proof
  */
@@ -365,6 +367,30 @@ async function main() {
     settingsState.priorityRepos.some((row) => row.url === "github.com/proof-owner/other-repo") &&
       settingsState.subscriptions.some((row) => row.plan === "Max"),
     JSON.stringify({ prio: settingsState.priorityRepos.length, subs: settingsState.subscriptions.length }),
+  );
+
+  await fetch(`http://127.0.0.1:${port}/api/settings/account-merge`, {
+    method: "POST",
+    headers: localHeaders,
+    body: JSON.stringify({ aliasHash: "sha256:proofalias0001", canonicalHash: "sha256:proofcanon0001" }),
+  });
+  const aliasState = (await fetch(`http://127.0.0.1:${port}/api/settings`).then((r) => r.json())) as {
+    accountAliases: Array<{ aliasHash: string; canonicalHash: string }>;
+  };
+  await fetch(`http://127.0.0.1:${port}/api/settings/account-merge`, {
+    method: "POST",
+    headers: localHeaders,
+    body: JSON.stringify({ aliasHash: "sha256:proofalias0001", action: "remove" }),
+  });
+  const aliasCleared = (await fetch(`http://127.0.0.1:${port}/api/settings`).then((r) => r.json())) as {
+    accountAliases: Array<{ aliasHash: string }>;
+  };
+  check(
+    "account_merge_settings_roundtrip",
+    aliasState.accountAliases.some(
+      (row) => row.aliasHash === "sha256:proofalias0001" && row.canonicalHash === "sha256:proofcanon0001",
+    ) && !aliasCleared.accountAliases.some((row) => row.aliasHash === "sha256:proofalias0001"),
+    JSON.stringify({ during: aliasState.accountAliases.length, after: aliasCleared.accountAliases.length }),
   );
 
   // Dashboard: the display surface reads the same ledger it serves.
@@ -720,6 +746,30 @@ async function main() {
     "unpriced_model_distinguished_from_free",
     Boolean(unpricedRow && Number(unpricedRow.unpricedCalls) >= 1 && Number(unpricedRow.costUsd) === 0),
     JSON.stringify(unpricedRow ?? { missing: true }),
+  );
+
+  // Aliases merge identities at the root (issue 0023): declare the straddle
+  // session's two hashes the same person, canonical = the lexicographic-max
+  // account, so the merge visibly moves attribution away from cost-dominance.
+  buffer.setAccountAlias(dominantByCost.hash, lexicographicMax.hash);
+  const mergedAccounts = dashboardAccounts(buffer.database, []);
+  const mergedRow = mergedAccounts.accounts.find((row) => row.accountHash === lexicographicMax.hash);
+  const aliasRowGone = !mergedAccounts.accounts.some((row) => row.accountHash === dominantByCost.hash);
+  check(
+    "account_alias_merges_identities_at_read_time",
+    Boolean(mergedRow && aliasRowGone && Math.abs(Number(mergedRow.totalUsd) - sessionCost) < 1e-3),
+    JSON.stringify({ mergedTotal: mergedRow?.totalUsd ?? null, aliasRowGone }),
+  );
+  buffer.removeAccountAlias(dominantByCost.hash);
+  const unmergedAccounts = dashboardAccounts(buffer.database, []);
+  check(
+    "account_alias_removal_restores_split",
+    Boolean(
+      unmergedAccounts.accounts.find(
+        (row) => row.accountHash === dominantByCost.hash && Math.abs(Number(row.totalUsd) - sessionCost) < 1e-3,
+      ),
+    ),
+    "unmerge restored cost-dominant attribution",
   );
   check(
     "cross_view_costs_reconcile",

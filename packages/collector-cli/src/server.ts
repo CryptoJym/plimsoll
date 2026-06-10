@@ -131,6 +131,7 @@ export function createCollectorServer(config: CollectorConfig, buffer: LocalEven
             .all();
           sendJson(response, {
             accounts,
+            accountAliases: buffer.listAccountAliases(),
             priorityRepos: buffer.listPriorityRepos(),
             subscriptions: config.subscriptions,
           });
@@ -199,6 +200,32 @@ export function createCollectorServer(config: CollectorConfig, buffer: LocalEven
           }
           buffer.setAccountLabel(accountHash, label);
           sendJson(response, { ok: true, accountHash, label });
+          return;
+        }
+
+        if (request.url === "/api/settings/account-merge") {
+          const aliasHash = typeof parsed.aliasHash === "string" ? parsed.aliasHash : "";
+          if (!aliasHash.startsWith("sha256:")) {
+            sendJson(response, { error: "expected aliasHash (sha256:...)" }, 400);
+            return;
+          }
+          if (parsed.action === "remove") {
+            buffer.removeAccountAlias(aliasHash);
+            sendJson(response, { ok: true, removed: aliasHash, aliases: buffer.listAccountAliases() });
+            return;
+          }
+          const canonicalHash = typeof parsed.canonicalHash === "string" ? parsed.canonicalHash : "";
+          if (!canonicalHash.startsWith("sha256:")) {
+            sendJson(response, { error: "expected canonicalHash (sha256:...)" }, 400);
+            return;
+          }
+          try {
+            buffer.setAccountAlias(aliasHash, canonicalHash);
+          } catch (error) {
+            sendJson(response, { error: error instanceof Error ? error.message : String(error) }, 400);
+            return;
+          }
+          sendJson(response, { ok: true, aliases: buffer.listAccountAliases() });
           return;
         }
 

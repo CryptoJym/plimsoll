@@ -82,6 +82,11 @@ export class LocalEventBuffer {
         auto_seeded integer not null default 1,
         first_seen text not null
       );
+      create table if not exists account_aliases (
+        alias_hash text primary key,
+        canonical_hash text not null,
+        created_at text not null
+      );
       create table if not exists repo_labels (
         repo_hash text primary key,
         label text not null,
@@ -231,6 +236,52 @@ export class LocalEventBuffer {
          on conflict(account_hash) do update set label = @label, auto_seeded = 0`,
       )
       .run({ accountHash, label, now: new Date().toISOString() });
+  }
+
+  /**
+   * Local-only identity merge: events under alias_hash display as
+   * canonical_hash (issue 0023 — the v1→v2 sanitizer chain split one human
+   * into several hash forms). Read-time only: event rows are immutable
+   * history and are never rewritten; the table never enters upload batches.
+   * Structure stays flat — a canonical cannot itself be an alias, and
+   * aliases pointing at the new alias are repointed to its canonical.
+   */
+  setAccountAlias(aliasHash: string, canonicalHash: string) {
+    if (aliasHash === canonicalHash) {
+      throw new Error("alias and canonical must differ");
+    }
+    const canonicalIsAlias = this.db
+      .prepare(`select canonical_hash as c from account_aliases where alias_hash = ?`)
+      .get(canonicalHash) as { c: string } | undefined;
+    const target = canonicalIsAlias ? canonicalIsAlias.c : canonicalHash;
+    if (target === aliasHash) {
+      throw new Error("merge would create a cycle");
+    }
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `insert into account_aliases (alias_hash, canonical_hash, created_at)
+         values (@aliasHash, @target, @now)
+         on conflict(alias_hash) do update set canonical_hash = @target, created_at = @now`,
+      )
+      .run({ aliasHash, target, now });
+    // Flatten: anything that pointed at the new alias follows it to target.
+    this.db
+      .prepare(`update account_aliases set canonical_hash = ? where canonical_hash = ?`)
+      .run(target, aliasHash);
+  }
+
+  removeAccountAlias(aliasHash: string) {
+    this.db.prepare(`delete from account_aliases where alias_hash = ?`).run(aliasHash);
+  }
+
+  listAccountAliases() {
+    return this.db
+      .prepare(
+        `select alias_hash as aliasHash, canonical_hash as canonicalHash, created_at as createdAt
+         from account_aliases order by created_at`,
+      )
+      .all() as Array<{ aliasHash: string; canonicalHash: string; createdAt: string }>;
   }
 
   /** Local-only display mapping; never included in upload batches. */
