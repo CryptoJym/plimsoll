@@ -1,3 +1,5 @@
+import os from "node:os";
+
 import Database from "better-sqlite3";
 
 import type { AiInteractionEvent } from "../../shared/src/index";
@@ -27,6 +29,8 @@ export type BufferStats = {
   totalCostUsd: number;
 };
 
+const MACHINE = os.hostname();
+
 function gitField(event: AiInteractionEvent, key: string): string | null {
   const git = (event.metadata as Record<string, unknown> | undefined)?.git;
   const value =
@@ -46,6 +50,8 @@ const EVENT_COLUMNS = [
   "repo_hash text",
   "branch_hash text",
   "head_sha text",
+  "machine text",
+  "account_hash text",
 ] as const;
 
 export class LocalEventBuffer {
@@ -64,6 +70,17 @@ export class LocalEventBuffer {
         payload_json text not null,
         suppressed_fields_json text not null default '[]',
         created_at text not null
+      );
+      create table if not exists priority_repos (
+        repo_hash text primary key,
+        url text not null,
+        added_at text not null
+      );
+      create table if not exists account_labels (
+        account_hash text primary key,
+        label text not null,
+        auto_seeded integer not null default 1,
+        first_seen text not null
       );
       create table if not exists repo_labels (
         repo_hash text primary key,
@@ -90,6 +107,7 @@ export class LocalEventBuffer {
       create index if not exists idx_events_session on buffered_events (session_id, observed_at);
       create index if not exists idx_events_observed on buffered_events (observed_at);
       create index if not exists idx_events_repo on buffered_events (repo_hash, branch_hash);
+      create index if not exists idx_events_account on buffered_events (account_hash, observed_at);
       create index if not exists idx_metrics_name on metric_samples (metric_name, observed_at);
       create index if not exists idx_metrics_session on metric_samples (session_id);
     `);
@@ -115,11 +133,13 @@ export class LocalEventBuffer {
         `insert or replace into buffered_events
           (id, source, event_type, data_mode, observed_at, payload_json, suppressed_fields_json,
            created_at, session_id, action_class, model, input_tokens, output_tokens,
-           cache_read_tokens, cost_usd, uploaded_at, repo_hash, branch_hash, head_sha)
+           cache_read_tokens, cost_usd, uploaded_at, repo_hash, branch_hash, head_sha,
+           machine, account_hash)
         values
           (@id, @source, @eventType, @dataMode, @observedAt, @payloadJson, @suppressedFieldsJson,
            @createdAt, @sessionId, @actionClass, @model, @inputTokens, @outputTokens,
-           @cacheReadTokens, @costUsd, null, @repoHash, @branchHash, @headSha)`,
+           @cacheReadTokens, @costUsd, null, @repoHash, @branchHash, @headSha,
+           @machine, @accountHash)`,
       )
       .run({
         id: event.id,
@@ -140,7 +160,10 @@ export class LocalEventBuffer {
         repoHash: gitField(event, "remoteUrlHash"),
         branchHash: gitField(event, "branchHash"),
         headSha: gitField(event, "headSha"),
+        machine: MACHINE,
+        accountHash: event.actorId ?? null,
       });
+    if (event.actorId) this.seedAccountLabel(event.actorId);
   }
 
   appendMany(
@@ -156,6 +179,58 @@ export class LocalEventBuffer {
       }
     });
     run();
+  }
+
+  private seededAccounts = new Set<string>();
+
+  /** Auto-seed a friendly label the first time an account hash is seen. */
+  private seedAccountLabel(accountHash: string) {
+    if (this.seededAccounts.has(accountHash)) return;
+    this.seededAccounts.add(accountHash);
+    const exists = this.db
+      .prepare(`select 1 from account_labels where account_hash = ?`)
+      .get(accountHash);
+    if (exists) return;
+    const base = `${os.userInfo().username}@${MACHINE}`;
+    const taken = this.db
+      .prepare(`select count(*) as n from account_labels where label like ?`)
+      .get(`${base}%`) as { n: number };
+    const label = taken.n === 0 ? base : `${base} ·${accountHash.replace("sha256:", "").slice(0, 6)}`;
+    this.db
+      .prepare(
+        `insert or ignore into account_labels (account_hash, label, auto_seeded, first_seen)
+         values (?, ?, 1, ?)`,
+      )
+      .run(accountHash, label, new Date().toISOString());
+  }
+
+  setPriorityRepo(repoHash: string, url: string) {
+    this.db
+      .prepare(
+        `insert or replace into priority_repos (repo_hash, url, added_at) values (?, ?, ?)`,
+      )
+      .run(repoHash, url, new Date().toISOString());
+  }
+
+  removePriorityRepo(repoHash: string) {
+    return this.db.prepare(`delete from priority_repos where repo_hash = ?`).run(repoHash).changes;
+  }
+
+  listPriorityRepos() {
+    return this.db
+      .prepare(`select repo_hash as repoHash, url, added_at as addedAt from priority_repos order by added_at`)
+      .all() as Array<{ repoHash: string; url: string; addedAt: string }>;
+  }
+
+  /** Local-only display mapping; never included in upload batches. */
+  setAccountLabel(accountHash: string, label: string) {
+    this.db
+      .prepare(
+        `insert into account_labels (account_hash, label, auto_seeded, first_seen)
+         values (@accountHash, @label, 0, @now)
+         on conflict(account_hash) do update set label = @label, auto_seeded = 0`,
+      )
+      .run({ accountHash, label, now: new Date().toISOString() });
   }
 
   /** Local-only display mapping; never included in upload batches. */

@@ -238,7 +238,19 @@ const COST_KEYS = [
   "plimsoll.estimated_cost_usd", "cfo_one.estimated_cost_usd",
 ];
 
+const ACTOR_ID_KEYS = [
+  "actorId",
+  "actor_id",
+  "user.id",
+  "user.account_id",
+  "user.account_uuid",
+  "user_id",
+  "userId",
+  "user.email",
+];
+
 export const usageFieldKeys = {
+  actorId: ACTOR_ID_KEYS,
   cacheReadTokens: CACHE_READ_TOKEN_KEYS,
   costUsd: COST_KEYS,
   inputTokens: INPUT_TOKEN_KEYS,
@@ -360,7 +372,7 @@ export function normalizeHookPayload(
     id: eventId,
     sessionId: stringFromRecords(sourceRecords, SESSION_ID_KEYS),
     tenantId: stringFromRecords(sourceRecords, ["tenantId", "tenant_id"]) ?? policy.tenantId,
-    actorId: stringFromRecords(sourceRecords, ["actorId", "actor_id", "user_id", "userId"]),
+    actorId: stringFromRecords(sourceRecords, ACTOR_ID_KEYS),
     source: inferSource(safe, options.source),
     dataMode: policy.dataMode,
     eventType,

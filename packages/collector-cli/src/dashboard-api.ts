@@ -185,6 +185,80 @@ export function dashboardSessionDetail(db: Database.Database, sessionId: string)
   return { rollup, receipts };
 }
 
+export type SubscriptionConfig = {
+  account: string;
+  plan: string;
+  usdPerMonth: number;
+  vendor: "anthropic" | "openai" | "other";
+};
+
+export function dashboardAccounts(
+  db: Database.Database,
+  subscriptions: SubscriptionConfig[],
+  days = 30,
+) {
+  const since = sinceIso(days);
+  const rows = db
+    .prepare(
+      `with sessions as (
+        select session_id, max(account_hash) as accountHash, max(repo_hash) as repoHash,
+          group_concat(distinct machine) as machines,
+          coalesce(sum(cost_usd), 0) as costUsd,
+          coalesce(sum(input_tokens), 0) as inputTokens,
+          coalesce(sum(output_tokens), 0) as outputTokens
+        from buffered_events
+        where session_id is not null and observed_at >= ?
+        group by session_id
+      )
+      select s.accountHash,
+        (select label from account_labels where account_hash = s.accountHash) as label,
+        group_concat(distinct s.machines) as machines,
+        count(*) as sessions,
+        sum(case when p.repo_hash is not null then s.costUsd else 0 end) as priorityUsd,
+        sum(case when p.repo_hash is null and s.repoHash is not null then s.costUsd else 0 end) as otherUsd,
+        sum(case when s.repoHash is null then s.costUsd else 0 end) as unlinkedUsd,
+        sum(s.costUsd) as totalUsd,
+        sum(s.inputTokens) as inputTokens, sum(s.outputTokens) as outputTokens
+      from sessions s left join priority_repos p on p.repo_hash = s.repoHash
+      group by s.accountHash
+      order by totalUsd desc`,
+    )
+    .all(since) as Array<Record<string, unknown> & { accountHash: string | null; label: string | null; totalUsd: number }>;
+
+  const windowMonths = days / 30.44;
+  const accounts = rows.map((row) => {
+    const subscription = subscriptions.find(
+      (sub) => sub.account === row.accountHash || (row.label && sub.account === row.label),
+    );
+    const planCostWindow = subscription
+      ? Number((subscription.usdPerMonth * windowMonths).toFixed(2))
+      : null;
+    return {
+      ...row,
+      machines: typeof row.machines === "string" ? [...new Set(row.machines.split(","))] : [],
+      subscription: subscription
+        ? {
+            plan: subscription.plan,
+            usdPerMonth: subscription.usdPerMonth,
+            planCostWindow,
+            leverage:
+              planCostWindow && planCostWindow > 0
+                ? Number((Number(row.totalUsd) / planCostWindow).toFixed(4))
+                : null,
+          }
+        : null,
+    };
+  });
+
+  const buckets = {
+    priorityUsd: Number(rows.reduce((a, r) => a + Number(r.priorityUsd ?? 0), 0).toFixed(4)),
+    otherUsd: Number(rows.reduce((a, r) => a + Number(r.otherUsd ?? 0), 0).toFixed(4)),
+    unlinkedUsd: Number(rows.reduce((a, r) => a + Number(r.unlinkedUsd ?? 0), 0).toFixed(4)),
+  };
+
+  return { days, buckets, accounts, priorityRepoCount: (db.prepare(`select count(*) as n from priority_repos`).get() as {n:number}).n };
+}
+
 export function dashboardRepoDetail(db: Database.Database, repoHash: string, days = 30) {
   const since = sinceIso(days);
   const label = (db.prepare(`select label from repo_labels where repo_hash = ?`).get(repoHash) as
