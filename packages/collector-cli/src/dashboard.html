@@ -655,7 +655,6 @@ async function saveAccountRow(hash){
     await post("/api/settings/account-email",{accountHash:hash,email});
     $("#s-msg").textContent="saved \u2713";loadSettings();refresh();
   }catch(e){$("#s-msg").textContent=e.message}}
-  try{await post("/api/settings/account-label",{accountHash:input.dataset.hash,label:input.value});$("#s-msg").textContent="saved ✓";refresh();}catch(e){$("#s-msg").textContent=e.message}}
 async function mergeAccount(aliasHash,canonicalHash){if(!canonicalHash)return;try{await post("/api/settings/account-merge",{aliasHash,canonicalHash});$("#s-msg").textContent="identities merged \u2713";loadSettings();refresh();}catch(e){$("#s-msg").textContent=e.message}}
 async function unmergeAccount(aliasHash){try{await post("/api/settings/account-merge",{aliasHash,action:"remove"});$("#s-msg").textContent="unmerged \u2713";loadSettings();refresh();}catch(e){$("#s-msg").textContent=e.message}}
 async function removePrio(url){await post("/api/settings/priority",{action:"remove",url});loadSettings();refresh();}
