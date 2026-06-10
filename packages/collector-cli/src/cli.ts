@@ -388,7 +388,11 @@ async function main() {
     };
 
     runPrune();
-    runRolloutScan(false);
+    // Boot backfill is deferred so the OTLP receiver binds first — the
+    // first-ever walk reads every historical rollout (2,669 files at first
+    // deploy) and must not delay ingest. Later boots skip unchanged files
+    // via rollout_scan_state, so the deferred walk is cheap from then on.
+    timers.push(setTimeout(() => runRolloutScan(false), 5_000));
     timers.push(setInterval(() => runRolloutScan(true), 60 * 1000));
     timers.push(setInterval(runPrune, 6 * 60 * 60 * 1000));
     if (config.uploadUrl) {
