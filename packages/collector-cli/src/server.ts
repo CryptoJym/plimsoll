@@ -10,6 +10,7 @@ import { explodeOtlpPayload } from "./otlp";
 import { estimateCostUsd, remoteLinkageHash, normalizeGitRemote } from "../../shared/src/index";
 import { saveCollectorConfig } from "./config";
 import { computeCaptureHealth, type CaptureHealth } from "./health";
+import { readLocalIdentities } from "./local-identity";
 import {
   dashboardAccounts,
   dashboardRepoDetail,
@@ -126,14 +127,29 @@ export function createCollectorServer(config: CollectorConfig, buffer: LocalEven
         if (url.pathname === "/api/settings") {
           const accounts = buffer.database
             .prepare(
-              `select account_hash as accountHash, label, auto_seeded as autoSeeded from account_labels order by first_seen`,
+              `select account_hash as accountHash, label, email, auto_seeded as autoSeeded from account_labels order by first_seen`,
             )
             .all();
+          // Detected local identities (emails/plans from each tool's own
+          // config). Served to the loopback page only — nothing leaves the
+          // machine from here; attachment to an account row is the human's call.
+          let detectedIdentities: Array<Record<string, unknown>> = [];
+          try {
+            detectedIdentities = readLocalIdentities().map((entry) => ({
+              source: entry.source,
+              email: entry.email ?? null,
+              planType: entry.planType ?? null,
+              actorHash: entry.actorHash ?? null,
+            }));
+          } catch {
+            detectedIdentities = [];
+          }
           sendJson(response, {
             accounts,
             accountAliases: buffer.listAccountAliases(),
             priorityRepos: buffer.listPriorityRepos(),
             subscriptions: config.subscriptions,
+            detectedIdentities,
           });
           return;
         }
@@ -200,6 +216,22 @@ export function createCollectorServer(config: CollectorConfig, buffer: LocalEven
           }
           buffer.setAccountLabel(accountHash, label);
           sendJson(response, { ok: true, accountHash, label });
+          return;
+        }
+
+        if (request.url === "/api/settings/account-email") {
+          const accountHash = typeof parsed.accountHash === "string" ? parsed.accountHash : "";
+          const email = typeof parsed.email === "string" ? parsed.email.trim() : "";
+          if (!accountHash.startsWith("sha256:")) {
+            sendJson(response, { error: "expected accountHash (sha256:...)" }, 400);
+            return;
+          }
+          if (email && (!email.includes("@") || email.length > 120)) {
+            sendJson(response, { error: "that does not look like an email" }, 400);
+            return;
+          }
+          buffer.setAccountEmail(accountHash, email);
+          sendJson(response, { ok: true, accountHash, email: email || null });
           return;
         }
 

@@ -58,6 +58,7 @@ import {
 import { computeCaptureHealth } from "../packages/collector-cli/src/health";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { MODEL_PRICING } from "../packages/shared/src/pricing";
+import { readLocalIdentities } from "../packages/collector-cli/src/local-identity";
 
 type Check = { name: string; passed: boolean; detail: string };
 
@@ -70,6 +71,7 @@ const RAW_CMD_SENTINEL = "RAW_CMD_SENTINEL rg -n secret";
 const RAW_PATH_SENTINEL = "/Users/sentinel-user/secret-project";
 const SESSION = "11111111-2222-4333-8444-555555555555";
 const CODEX_SESSION = "019e0000-aaaa-7bbb-8ccc-dddddddddddd";
+const PROOF_EMAIL = "sentinel-mailbox@example.com";
 
 function otelAttr(key: string, value: string | number | boolean) {
   if (typeof value === "number" && Number.isInteger(value)) {
@@ -385,6 +387,23 @@ async function main() {
   const aliasCleared = (await fetch(`http://127.0.0.1:${port}/api/settings`).then((r) => r.json())) as {
     accountAliases: Array<{ aliasHash: string }>;
   };
+  await fetch(`http://127.0.0.1:${port}/api/settings/account-email`, {
+    method: "POST",
+    headers: localHeaders,
+    body: JSON.stringify({ accountHash: "sha256:proofemail0001", email: "roundtrip@example.com" }),
+  });
+  const emailState = (await fetch(`http://127.0.0.1:${port}/api/settings`).then((r) => r.json())) as {
+    accounts: Array<{ accountHash: string; email: string | null }>;
+    detectedIdentities: unknown;
+  };
+  check(
+    "account_email_settings_roundtrip",
+    emailState.accounts.some(
+      (row) => row.accountHash === "sha256:proofemail0001" && row.email === "roundtrip@example.com",
+    ) && Array.isArray(emailState.detectedIdentities),
+    JSON.stringify({ stored: emailState.accounts.filter((row) => row.email).length >= 1 }),
+  );
+
   check(
     "account_merge_settings_roundtrip",
     aliasState.accountAliases.some(
@@ -954,7 +973,45 @@ async function main() {
     ].join("\n") + "\n",
   );
 
-  const tailer = new RolloutTailer(buffer, rolloutDir);
+  // Local identity fixtures (issue 0028): emails and the codex account id are
+  // read from each tool's own config files; nothing is guessed from telemetry.
+  const PROOF_CHATGPT_ACCOUNT = "11112222-3333-4444-8555-999900001111";
+  const identityDir = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-identity-"));
+  fs.writeFileSync(
+    path.join(identityDir, "claude.json"),
+    JSON.stringify({ oauthAccount: { emailAddress: PROOF_EMAIL, accountUuid: "cafe0000-1111-4222-8333-444455556666" } }),
+  );
+  const proofJwt = [
+    Buffer.from(JSON.stringify({ alg: "none" })).toString("base64url"),
+    Buffer.from(
+      JSON.stringify({ "https://api.openai.com/auth": { chatgpt_account_id: PROOF_CHATGPT_ACCOUNT, chatgpt_plan_type: "pro" } }),
+    ).toString("base64url"),
+    "sig",
+  ].join(".");
+  fs.writeFileSync(
+    path.join(identityDir, "auth.json"),
+    JSON.stringify({ email: PROOF_EMAIL, last_refresh: "2026-06-10T11:00:00.000Z", tokens: { id_token: proofJwt } }),
+  );
+  const proofIdentities = () =>
+    readLocalIdentities({
+      claudeConfigPath: path.join(identityDir, "claude.json"),
+      codexAuthPath: path.join(identityDir, "auth.json"),
+    });
+  const detectedIdentities = proofIdentities();
+  const codexIdentity = detectedIdentities.find((entry) => entry.source === "codex");
+  check(
+    "local_identities_read_from_tool_configs",
+    detectedIdentities.some((entry) => entry.source === "claude_code" && entry.email === PROOF_EMAIL) &&
+      Boolean(
+        codexIdentity?.actorHash?.startsWith("sha256:") &&
+          codexIdentity.email === PROOF_EMAIL &&
+          codexIdentity.planType === "pro" &&
+          codexIdentity.validFrom === "2026-06-10T11:00:00.000Z",
+      ),
+    JSON.stringify({ sources: detectedIdentities.map((entry) => entry.source), actor: codexIdentity?.actorHash }),
+  );
+
+  const tailer = new RolloutTailer(buffer, rolloutDir, proofIdentities);
   const firstScan = await tailer.scan();
   const rolloutRows = buffer.database
     .prepare(
@@ -1004,7 +1061,7 @@ async function main() {
   // Clearing the persistent scan state forces a true re-parse — which must
   // not change counts or sums (deterministic ids + insert-or-replace).
   buffer.database.prepare(`delete from rollout_scan_state`).run();
-  const rescan = await new RolloutTailer(buffer, rolloutDir).scan();
+  const rescan = await new RolloutTailer(buffer, rolloutDir, proofIdentities).scan();
   const afterRescan = buffer.database
     .prepare(
       `select count(*) as n, coalesce(sum(input_tokens),0) as input from buffered_events
@@ -1034,7 +1091,7 @@ async function main() {
       }),
     ].join("\n") + "\n",
   );
-  const unpricedScan = await new RolloutTailer(buffer, rolloutDir).scan();
+  const unpricedScan = await new RolloutTailer(buffer, rolloutDir, proofIdentities).scan();
   const unpricedBefore = buffer.database
     .prepare(`select cost_usd as cost from buffered_events where session_id = ? and event_type = 'usage_rollout'`)
     .get(UNPRICED_SESSION) as { cost: number | null } | undefined;
@@ -1045,7 +1102,7 @@ async function main() {
     vendor: "openai",
     asOf: "proof",
   };
-  const repriceScan = await new RolloutTailer(buffer, rolloutDir).scan();
+  const repriceScan = await new RolloutTailer(buffer, rolloutDir, proofIdentities).scan();
   delete MODEL_PRICING["proof-unpriceable-model"];
   const unpricedAfter = buffer.database
     .prepare(
@@ -1069,6 +1126,31 @@ async function main() {
       after: unpricedAfter?.cost ?? null,
     }),
   );
+
+  const actorRows = buffer.database
+    .prepare(
+      `select session_id as sid, account_hash as actor from buffered_events where event_type = 'usage_rollout'`,
+    )
+    .all() as Array<{ sid: string; actor: string | null }>;
+  check(
+    "codex_identity_stamped_within_honest_window",
+    actorRows.filter((row) => row.sid === UNPRICED_SESSION).every((row) => row.actor === codexIdentity?.actorHash) &&
+      actorRows.filter((row) => row.sid === UNPRICED_SESSION).length >= 1 &&
+      actorRows.filter((row) => row.sid === ROLLOUT_SESSION).every((row) => row.actor === null),
+    JSON.stringify({
+      stamped: actorRows.filter((row) => row.actor !== null).length,
+      preWindowUnstamped: actorRows.filter((row) => row.sid === ROLLOUT_SESSION).every((row) => row.actor === null),
+    }),
+  );
+  const emailRow = buffer.database
+    .prepare(`select email from account_labels where account_hash = ?`)
+    .get(codexIdentity?.actorHash ?? "") as { email: string | null } | undefined;
+  check(
+    "codex_identity_email_recorded_locally",
+    emailRow?.email === PROOF_EMAIL,
+    JSON.stringify({ recorded: Boolean(emailRow?.email) }),
+  );
+  fs.rmSync(identityDir, { recursive: true, force: true });
 
   const codexPersisted = JSON.stringify(
     buffer.database.prepare(`select payload_json from buffered_events where source = 'codex'`).all(),
@@ -1122,6 +1204,11 @@ async function main() {
       (body) => !body.includes(os.hostname()) && !body.includes(os.userInfo().username),
     ),
     "hostname/username absent from all upload bodies",
+  );
+  check(
+    "account_email_never_uploaded",
+    uploadBodies.length > 0 && uploadBodies.every((body) => !body.includes(PROOF_EMAIL)),
+    "raw account email absent from all upload bodies (lives in account_labels only)",
   );
 
   // 8. Retention prune.
