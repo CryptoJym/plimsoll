@@ -9,6 +9,7 @@ import { appendForwardedHook } from "./forwarder";
 import { explodeOtlpPayload } from "./otlp";
 import { estimateCostUsd } from "../../shared/src/index";
 import {
+  dashboardAccounts,
   dashboardRepoDetail,
   dashboardRepos,
   dashboardSessionDetail,
@@ -109,6 +110,10 @@ export function createCollectorServer(config: CollectorConfig, buffer: LocalEven
         }
         if (url.pathname === "/api/repos") {
           sendJson(response, dashboardRepos(buffer.database, days));
+          return;
+        }
+        if (url.pathname === "/api/accounts") {
+          sendJson(response, dashboardAccounts(buffer.database, config.subscriptions, days));
           return;
         }
         if (url.pathname === "/api/repo") {

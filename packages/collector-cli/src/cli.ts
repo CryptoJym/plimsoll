@@ -57,6 +57,9 @@ Commands:
   load-launch-agent     Load an installed user LaunchAgent plist
   unload-launch-agent   Unload the user LaunchAgent without removing the plist
   uninstall-launch-agent Remove the user LaunchAgent plist
+  label account HASH NAME    Set a local-only display label for a hashed account
+  priority add|remove URL    Manage the priority-repo list (hashed; URL kept locally)
+  priority list              Show priority repos
   purge-local-data      Dry-run or explicitly purge local buffered event data
   stop                  Stop the foreground daemon using the local PID file
 
@@ -766,6 +769,50 @@ async function main() {
       ),
     );
     return;
+  }
+
+  if (command === "label") {
+    const kind = process.argv[3];
+    const hash = process.argv[4];
+    const name = process.argv.slice(5).join(" ").trim();
+    if (kind !== "account" || !hash || !name) {
+      throw new Error('Usage: label account <sha256:hash> "<display name>"');
+    }
+    const buffer = openBuffer();
+    buffer.setAccountLabel(hash, name);
+    console.log(JSON.stringify({ labeled: true, accountHash: hash, label: name }, null, 2));
+    buffer.close();
+    return;
+  }
+
+  if (command === "priority") {
+    const action = process.argv[3];
+    const buffer = openBuffer();
+    try {
+      if (action === "list") {
+        console.log(JSON.stringify({ priorityRepos: buffer.listPriorityRepos() }, null, 2));
+        return;
+      }
+      const url = process.argv[4];
+      const { remoteLinkageHash, normalizeGitRemote } = await import("../../shared/src/index");
+      const repoHash = remoteLinkageHash(url);
+      if (!url || !repoHash) {
+        throw new Error("Usage: priority add|remove <git-repo-url> (e.g. https://github.com/org/repo)");
+      }
+      if (action === "add") {
+        buffer.setPriorityRepo(repoHash, normalizeGitRemote(url) ?? url);
+        console.log(JSON.stringify({ added: true, repoHash, url: normalizeGitRemote(url) }, null, 2));
+        return;
+      }
+      if (action === "remove") {
+        const removed = buffer.removePriorityRepo(repoHash);
+        console.log(JSON.stringify({ removed: removed > 0, repoHash }, null, 2));
+        return;
+      }
+      throw new Error("Expected priority add|remove|list");
+    } finally {
+      buffer.close();
+    }
   }
 
   if (command === "purge-local-data") {

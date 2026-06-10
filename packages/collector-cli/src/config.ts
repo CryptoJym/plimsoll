@@ -16,6 +16,16 @@ export const collectorConfigSchema = z.object({
   tenantId: z.string().trim().min(1).default(LOCAL_TENANT_ID),
   installKey: z.string().trim().min(1).default("local-dev"),
   retentionDays: z.number().int().min(1).max(3650).default(90),
+  subscriptions: z
+    .array(
+      z.object({
+        account: z.string().trim().min(1), // account label OR sha256: hash
+        plan: z.string().trim().min(1),
+        usdPerMonth: z.number().nonnegative(),
+        vendor: z.enum(["anthropic", "openai", "other"]).default("other"),
+      }),
+    )
+    .default([]),
   syncIntervalSeconds: z.number().int().min(30).max(86400).default(300),
   policy: policyConfigSchema.default(DEFAULT_POLICY),
 });

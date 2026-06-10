@@ -71,6 +71,11 @@ export class LocalEventBuffer {
         suppressed_fields_json text not null default '[]',
         created_at text not null
       );
+      create table if not exists priority_repos (
+        repo_hash text primary key,
+        url text not null,
+        added_at text not null
+      );
       create table if not exists account_labels (
         account_hash text primary key,
         label text not null,
@@ -197,6 +202,24 @@ export class LocalEventBuffer {
          values (?, ?, 1, ?)`,
       )
       .run(accountHash, label, new Date().toISOString());
+  }
+
+  setPriorityRepo(repoHash: string, url: string) {
+    this.db
+      .prepare(
+        `insert or replace into priority_repos (repo_hash, url, added_at) values (?, ?, ?)`,
+      )
+      .run(repoHash, url, new Date().toISOString());
+  }
+
+  removePriorityRepo(repoHash: string) {
+    return this.db.prepare(`delete from priority_repos where repo_hash = ?`).run(repoHash).changes;
+  }
+
+  listPriorityRepos() {
+    return this.db
+      .prepare(`select repo_hash as repoHash, url, added_at as addedAt from priority_repos order by added_at`)
+      .all() as Array<{ repoHash: string; url: string; addedAt: string }>;
   }
 
   /** Local-only display mapping; never included in upload batches. */
