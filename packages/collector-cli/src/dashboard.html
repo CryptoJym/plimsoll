@@ -18,10 +18,10 @@
   --line:#1d2a35;         /* etched hairline */
   --line-bright:#2e4356;
   --foam:#c8d6dd;         /* primary ink */
-  --foam-dim:#73848f;     /* secondary ink */
-  --foam-faint:#3e4e5a;   /* tertiary / labels */
+  --foam-dim:#8b9aa4;     /* secondary ink (AA on plates) */
+  --foam-faint:#73848f;   /* tertiary / labels (AA on plates) */
   --brass:#e8b34b;        /* instrument numerals */
-  --brass-dim:#8a6c2f;
+  --brass-dim:#a07f3a;
   --signal-green:#3ddc97;
   --signal-amber:#e8b34b;
   --signal-red:#ff5d5d;
@@ -207,7 +207,7 @@ tr.row:hover td:first-child{color:var(--foam)}
 .keel b{color:var(--foam-dim); font-weight:400}
 input,select{background:var(--sea-0);border:1px solid var(--line-bright);color:var(--foam);
   font-family:var(--mono);font-size:12px;padding:6px 8px;border-radius:2px;min-width:0}
-input:focus,select:focus{outline:none;border-color:var(--waterline)}
+input:focus-visible,select:focus-visible{border-color:var(--waterline)}
 .btn{background:var(--sea-2);border:1px solid var(--line-bright);color:var(--foam);
   font-family:var(--mono);font-size:11px;padding:6px 12px;cursor:pointer;letter-spacing:.08em}
 .btn:hover{border-color:var(--brass);color:var(--brass)}
@@ -217,6 +217,12 @@ input:focus,select:focus{outline:none;border-color:var(--waterline)}
 .empty{padding:30px 0; text-align:center; color:var(--foam-faint); font-size:12px; letter-spacing:.06em}
 .empty b{color:var(--foam-dim)}
 a{color:var(--waterline)}
+:focus-visible{outline:2px solid var(--waterline);outline-offset:2px}
+tr.row:focus-visible{background:rgba(35,137,167,.12)}
+.linkish{background:none;border:0;color:inherit;font:inherit;cursor:pointer;padding:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left}
+@media (prefers-reduced-motion:reduce){
+  *,*::before,*::after{animation:none!important;transition:none!important}
+}
 </style>
 </head>
 <body>
@@ -234,10 +240,10 @@ a{color:var(--waterline)}
 
 <main>
   <header class="mast">
-    <div class="wordmark">Plims<em>o</em>ll</div>
+    <h1 class="wordmark">Plims<em>o</em>ll</h1>
     <div class="sub">local ledger · metadata mode</div>
-    <div class="lamp" id="lamp"><i></i><span id="lamp-text">sounding…</span></div>
-  <button id="open-settings" style="background:none;border:1px solid var(--line-bright);color:var(--foam-dim);font-family:var(--mono);font-size:10px;letter-spacing:.14em;padding:4px 12px;cursor:pointer;text-transform:uppercase">⚙ settings</button>
+    <div class="lamp" id="lamp"><i aria-hidden="true"></i><span id="lamp-text" role="status">sounding…</span></div>
+  <button id="open-settings" aria-haspopup="dialog" aria-controls="settings" style="background:none;border:1px solid var(--line-bright);color:var(--foam-dim);font-family:var(--mono);font-size:10px;letter-spacing:.14em;padding:4px 12px;cursor:pointer;text-transform:uppercase">⚙ settings</button>
   </header>
   <div class="crumbs" id="crumbs">127.0.0.1 · <b>nothing leaves this machine from this page</b></div>
 
@@ -259,7 +265,7 @@ a{color:var(--waterline)}
     <section class="plate span7">
       <h2>Coverage · the load line</h2>
       <div class="loadline">
-        <svg id="gauge" width="120" height="150" viewBox="0 0 120 150">
+        <svg id="gauge" width="120" height="150" viewBox="0 0 120 150" aria-hidden="true">
           <defs>
             <clipPath id="hullclip"><rect x="22" y="10" width="76" height="130" rx="3"/></clipPath>
           </defs>
@@ -294,16 +300,16 @@ a{color:var(--waterline)}
 
     <section class="plate span6">
       <h2>By model</h2>
-      <table id="t-models"><thead><tr>
-        <th>model</th><th class="num">calls</th><th class="num">in</th><th class="num">out</th><th class="num">usd</th>
+      <table id="t-models" aria-label="Spend by model"><thead><tr>
+        <th scope="col">model</th><th class="num" scope="col">calls</th><th class="num" scope="col">in</th><th class="num" scope="col">out</th><th class="num" scope="col">usd</th>
       </tr></thead><tbody></tbody></table>
       <div class="empty" id="e-models" hidden>no token-bearing calls in window</div>
     </section>
 
     <section class="plate span6">
       <h2>By repository <span style="letter-spacing:0;text-transform:none;color:var(--foam-faint)">(names local-only, never uploaded) · click for detail</span></h2>
-      <table id="t-repos"><thead><tr>
-        <th>repo (hash)</th><th class="num">sessions</th><th class="num">tokens</th><th class="num">usd</th>
+      <table id="t-repos" aria-label="Spend by repository — rows open detail"><thead><tr>
+        <th scope="col">repo (hash)</th><th class="num" scope="col">sessions</th><th class="num" scope="col">tokens</th><th class="num" scope="col">usd</th>
       </tr></thead><tbody></tbody></table>
       <div class="empty" id="e-repos" hidden>no linked sessions yet — work inside a git repo and the line appears</div>
     </section>
@@ -312,10 +318,10 @@ a{color:var(--waterline)}
       <h2>Accounts · who, where, and on what
         <span style="letter-spacing:.05em;text-transform:none;color:var(--foam-faint);margin-left:auto">priority list: <span id="prio-count">0</span> repos · plimsoll priority add &lt;url&gt;</span>
       </h2>
-      <table id="t-accounts"><thead><tr>
-        <th>account</th><th>machines</th><th class="num">sessions</th>
-        <th class="num">priority $</th><th class="num">other $</th><th class="num">unlinked $</th>
-        <th class="num">total $</th><th>plan</th><th class="num">leverage</th>
+      <table id="t-accounts" aria-label="Accounts"><thead><tr>
+        <th scope="col">account</th><th scope="col">machines</th><th class="num" scope="col">sessions</th>
+        <th class="num" scope="col">priority $</th><th class="num" scope="col">other $</th><th class="num" scope="col">unlinked $</th>
+        <th class="num" scope="col">total $</th><th scope="col">plan</th><th class="num" scope="col">leverage</th>
       </tr></thead><tbody></tbody></table>
       <div class="empty" id="e-accounts" hidden>no account-attributed sessions yet — new sessions carry account identity automatically</div>
     </section>
@@ -325,9 +331,9 @@ a{color:var(--waterline)}
         <span style="letter-spacing:.05em;text-transform:none;color:var(--foam-faint);margin-left:auto">
           <span class="flag cc">CC</span> Claude Code &nbsp; <span class="flag cx">CX</span> Codex &nbsp; ~ computed cost</span>
       </h2>
-      <table id="t-sessions"><thead><tr>
-        <th>start</th><th>src</th><th>session</th><th class="num">events</th>
-        <th class="num">in</th><th class="num">out</th><th class="num">usd</th><th>repository</th>
+      <table id="t-sessions" aria-label="Sessions — rows open receipts"><thead><tr>
+        <th scope="col">start</th><th scope="col">src</th><th scope="col">session</th><th class="num" scope="col">events</th>
+        <th class="num" scope="col">in</th><th class="num" scope="col">out</th><th class="num" scope="col">usd</th><th scope="col">repository</th>
       </tr></thead><tbody></tbody></table>
       <div class="empty" id="e-sessions" hidden><b>no soundings yet.</b> run a Claude Code or Codex session, then refresh.</div>
     </section>
@@ -335,8 +341,8 @@ a{color:var(--waterline)}
   </div>
 </main>
 
-<div class="veil" id="veil"></div>
-<aside class="drawer" id="drawer" aria-label="session receipts">
+<div class="veil" id="veil" aria-hidden="true"></div>
+<aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-label="session receipts">
   <button class="close" id="drawer-close">close ✕</button>
   <h2 style="font-size:10px;letter-spacing:.24em;color:var(--foam-faint);text-transform:uppercase">Receipts</h2>
   <div class="sid" id="d-sid"></div>
@@ -344,7 +350,7 @@ a{color:var(--waterline)}
   <div class="stamp">every figure traceable · plimsoll local ledger</div>
 </aside>
 
-<aside class="drawer" id="settings" aria-label="settings">
+<aside class="drawer" id="settings" role="dialog" aria-modal="true" aria-label="settings">
   <button class="close" id="settings-close">close ✕</button>
   <h2 style="font-size:10px;letter-spacing:.24em;color:var(--foam-faint);text-transform:uppercase">Settings</h2>
   <div class="sid">stored on this machine only — labels and lists never upload</div>
@@ -354,7 +360,7 @@ a{color:var(--waterline)}
 
   <h3>Priority projects</h3>
   <div style="display:flex;gap:8px;margin-bottom:10px">
-    <input id="s-prio-url" placeholder="paste a repo URL — https://github.com/org/repo" style="flex:1">
+    <input id="s-prio-url" aria-label="repository URL to prioritize" placeholder="paste a repo URL — https://github.com/org/repo" style="flex:1">
     <button class="btn" id="s-prio-add">add</button>
   </div>
   <div id="s-prio-list" style="display:grid;gap:6px"></div>
@@ -362,12 +368,12 @@ a{color:var(--waterline)}
   <h3>Subscriptions (for plan leverage)</h3>
   <div id="s-subs" style="display:grid;gap:8px"></div>
   <div style="display:grid;grid-template-columns:1fr 90px 70px auto;gap:8px;margin-top:10px">
-    <select id="s-sub-account"></select>
-    <input id="s-sub-plan" placeholder="plan name" value="Max">
-    <input id="s-sub-usd" placeholder="$/mo" type="number" min="0" value="200">
+    <select id="s-sub-account" aria-label="subscription account"></select>
+    <input id="s-sub-plan" aria-label="plan name" placeholder="plan name" value="Max">
+    <input id="s-sub-usd" aria-label="dollars per month" placeholder="$/mo" type="number" min="0" value="200">
     <button class="btn" id="s-sub-add">add</button>
   </div>
-  <div id="s-msg" style="margin-top:14px;font-size:11px;color:var(--signal-amber)"></div>
+  <div id="s-msg" role="status" style="margin-top:14px;font-size:11px;color:var(--signal-amber)"></div>
 </aside>
 
 <footer class="keel">
@@ -399,6 +405,8 @@ function railTicks(){
 
 function drawSpark(daily){
   const svg=$("#spark"); const W=svg.clientWidth||1000, H=120, pad=18;
+  svg.setAttribute("role","img");
+  svg.setAttribute("aria-label", daily.length?`Daily spend, ${daily[0].day} to ${daily[daily.length-1].day}, peak ${usd(Math.max(...daily.map(d=>d.costUsd),0.01))} per day`:"No spend recorded in window");
   svg.setAttribute("viewBox",`0 0 ${W} ${H}`); svg.innerHTML="";
   if(!daily.length){svg.innerHTML=`<text x="${W/2}" y="${H/2}" text-anchor="middle">no spend recorded in window</text>`;return}
   const max=Math.max(...daily.map(d=>d.costUsd),0.01);
@@ -427,10 +435,42 @@ function rows(tbodySel,emptySel,arr,render){
   $(emptySel).hidden=arr.length>0; $(tbodySel).style.display=arr.length?"table":"none";
 }
 
+let lastFocus=null;
+function openDrawer(el){
+  lastFocus=document.activeElement;
+  el.classList.add("open");$("#veil").classList.add("show");
+  const c=el.querySelector(".close");if(c)c.focus();
+}
+function closeDrawers(){
+  let closed=false;
+  for(const el of [$("#drawer"),$("#settings")]) if(el.classList.contains("open")){el.classList.remove("open");closed=true}
+  $("#veil").classList.remove("show");
+  if(closed&&lastFocus&&document.contains(lastFocus)){lastFocus.focus();lastFocus=null}
+}
+document.addEventListener("keydown",e=>{
+  if(e.key==="Escape"){closeDrawers();return}
+  if(e.key!=="Tab")return;
+  const open=[$("#drawer"),$("#settings")].find(el=>el.classList.contains("open"));
+  if(!open)return;
+  const f=[...open.querySelectorAll('button,[href],input,select,textarea,[tabindex]:not([tabindex=\'-1\'])')].filter(x=>!x.disabled&&x.offsetParent!==null);
+  if(!f.length)return;
+  const first=f[0],last=f[f.length-1];
+  if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus()}
+  else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus()}
+});
+function rk(e){if(e.key==="Enter"||e.key===" "){e.preventDefault();e.currentTarget.click()}}
+function drawerError(what,e){$("#d-body").innerHTML=`<div class="empty">couldn\u2019t load ${what} \u2014 ${String((e&&e.message)||e)}</div>`}
+
 async function openSession(id){
-  const r=await fetch("/api/session?id="+encodeURIComponent(id)); if(!r.ok)return;
-  const d=await r.json();
+  openDrawer($("#drawer"));
   $("#d-sid").textContent=id;
+  $("#d-body").innerHTML='<div class="empty">sounding\u2026</div>';
+  let d;
+  try{
+    const r=await fetch("/api/session?id="+encodeURIComponent(id));
+    d=await r.json();
+    if(!r.ok||d.error)throw new Error((d&&(d.message||d.error))||("HTTP "+r.status));
+  }catch(e){drawerError("receipts",e);return}
   const mix=(d.receipts.actionMix||[]); const tot=mix.reduce((s,m)=>s+m.n,0)||1;
   const colors={shell:"#2389a7",edit:"#e8b34b",write:"#e8b34b",read:"#3ddc97",mcp:"#bda7e8",browser:"#7fc3e8",other:"#3e4e5a"};
   $("#d-body").innerHTML=`
@@ -445,7 +485,7 @@ async function openSession(id){
       <dt>cost</dt><dd><b>${usd(d.rollup.costUsd)}</b></dd>
     </dl>
     <h3>Join keys</h3>
-    ${d.receipts.linkage.length?`<table><thead><tr><th>repo</th><th>branch</th><th>head sha</th><th class="num">ev</th></tr></thead><tbody>${
+    ${d.receipts.linkage.length?`<table><thead><tr><th scope="col">repo</th><th scope="col">branch</th><th scope="col">head sha</th><th class="num" scope="col">ev</th></tr></thead><tbody>${
       d.receipts.linkage.map(l=>`<tr><td class="hash">${short(l.repoHash)}</td><td class="hash">${short(l.branchHash)}</td><td class="hash">${(l.headSha||"·").slice(0,8)}</td><td class="num">${l.events}</td></tr>`).join("")
     }</tbody></table>`:`<div class="empty">no git linkage captured for this session</div>`}
     <h3>Action mix</h3>
@@ -457,11 +497,17 @@ async function openSession(id){
     ${d.receipts.models.length?`<dl class="kv">${d.receipts.models.map(m=>`<dt>${m.model}</dt><dd>${fmt(m.inputTokens)}/${fmt(m.outputTokens)} · <b>${usd(m.costUsd)}</b></dd>`).join("")}</dl>`:`<div class="empty">no model-attributed events</div>`}
     <h3>Privacy</h3>
     <dl class="kv"><dt>events with suppressed raw fields</dt><dd>${fmt(d.receipts.suppression?.suppressedEvents)}</dd></dl>`;
-  $("#drawer").classList.add("open"); $("#veil").classList.add("show");
 }
 async function openRepo(hash){
-  const r=await fetch("/api/repo?hash="+encodeURIComponent(hash)); if(!r.ok)return;
-  const d=await r.json();
+  openDrawer($("#drawer"));
+  $("#d-sid").textContent=short(hash);
+  $("#d-body").innerHTML='<div class="empty">sounding\u2026</div>';
+  let d;
+  try{
+    const r=await fetch("/api/repo?hash="+encodeURIComponent(hash));
+    d=await r.json();
+    if(!r.ok||d.error)throw new Error((d&&(d.message||d.error))||("HTTP "+r.status));
+  }catch(e){drawerError("repository detail",e);return}
   $("#d-sid").textContent=d.label||short(hash);
   const mix=(d.actionMix||[]); const tot=mix.reduce((s,m)=>s+m.n,0)||1;
   const colors={shell:"#2389a7",edit:"#e8b34b",write:"#e8b34b",read:"#3ddc97",mcp:"#bda7e8",browser:"#7fc3e8",other:"#3e4e5a"};
@@ -487,10 +533,9 @@ async function openRepo(hash){
     ${(d.models||[]).length?`<dl class="kv">${d.models.map(m=>`<dt>${m.model}</dt><dd>${fmt(m.inputTokens)}/${fmt(m.outputTokens)} · <b>${usd(m.costUsd)}</b></dd>`).join("")}</dl>`:`<div class="empty">no model-attributed events</div>`}
     <h3>Branches (hashed)</h3>
     <dl class="kv">${(d.branches||[]).map(b=>`<dt class="hash">${short(b.branchHash)}</dt><dd>${fmt(b.sessions)} sess · ${fmt(b.events)} ev</dd>`).join("")||"<dt>none</dt><dd>·</dd>"}</dl>`;
-  $("#drawer").classList.add("open"); $("#veil").classList.add("show");
 }
-$("#drawer-close").onclick=()=>{$("#drawer").classList.remove("open");$("#veil").classList.remove("show")};
-$("#veil").onclick=$("#drawer-close").onclick;
+$("#drawer-close").onclick=closeDrawers;
+$("#veil").onclick=closeDrawers;
 
 async function refresh(){
   try{
@@ -506,7 +551,8 @@ async function refresh(){
     const lampState=faults.length&&health.overall==="green"?"amber":health.overall;
     $("#lamp").classList.toggle("ok",lampState==="green"&&!faults.length);
     $("#lamp").classList.toggle("warn",lampState==="amber");
-    $("#lamp-text").textContent=lampState==="green"?(faults.length?"panel fault":"collecting"):"capture "+(lampState==="amber"?"degraded":"failure")+" — see capture watch";
+    const lampMsg=lampState==="green"?(faults.length?"panel fault":"collecting"):"capture "+(lampState==="amber"?"degraded":"failure")+" — see capture watch";
+    if($("#lamp-text").textContent!==lampMsg)$("#lamp-text").textContent=lampMsg;
     const sigvar=st=>st==="green"?"var(--signal-green)":st==="amber"?"var(--signal-amber)":"var(--signal-red)";
     const dot=st=>`<i style="background:${sigvar(st)};box-shadow:0 0 6px ${sigvar(st)}"></i>`;
     const ago=t=>{if(!t)return"never";const m=Math.round((Date.now()-Date.parse(t))/60000);return m<1?"just now":m<60?m+"m ago":Math.round(m/60*10)/10+"h ago"};
@@ -529,7 +575,7 @@ async function refresh(){
       const [name,tilde]=vendors[v.source]||[v.source,""];
       return `<dt>${name}</dt><dd><b>${tilde}${usd(v.costUsd)}</b> · ${fmt(v.sessions)} sess</dd>`;
     }).join("")||"";
-    rows("#t-repos","#e-repos",(Array.isArray(repos)?repos:[]).filter(r=>r.repoHash),r=>`<tr class="row" onclick="openRepo('${r.repoHash}')"><td class="wide" title="${r.label||short(r.repoHash)}">${r.label?`<span style="color:var(--foam)">${r.label}</span>`:`<span class="hash">${short(r.repoHash)}</span>`}</td><td class="num">${fmt(r.sessions)}</td><td class="num">${fmt(r.inputTokens+r.outputTokens)}</td><td class="num brass">${usd(r.costUsd)}</td></tr>`);
+    rows("#t-repos","#e-repos",(Array.isArray(repos)?repos:[]).filter(r=>r.repoHash),r=>`<tr class="row" tabindex="0" onkeydown="rk(event)" onclick="openRepo('${r.repoHash}')"><td class="wide" title="${r.label||short(r.repoHash)}">${r.label?`<span style="color:var(--foam)">${r.label}</span>`:`<span class="hash">${short(r.repoHash)}</span>`}</td><td class="num">${fmt(r.sessions)}</td><td class="num">${fmt(r.inputTokens+r.outputTokens)}</td><td class="num brass">${usd(r.costUsd)}</td></tr>`);
     $("#prio-count").textContent=acct.priorityRepoCount??0;
     const b=acct.buckets||{};
     if((b.priorityUsd+b.otherUsd+b.unlinkedUsd)>0){
@@ -537,14 +583,14 @@ async function refresh(){
         <dt>other repos</dt><dd>${usd(b.otherUsd)}</dd><dt>unlinked</dt><dd>${usd(b.unlinkedUsd)}</dd>`;
     }
     rows("#t-accounts","#e-accounts",(acct.accounts||[]).filter(a=>a.accountHash),a=>`<tr>
-      <td class="wide" style="cursor:pointer" title="${(a.label??short(a.accountHash))} — click to relabel" onclick="openSettingsDrawer()">${a.label??`<span class="hash">${short(a.accountHash)}</span>`} <span class="hash">✎</span></td>
+      <td class="wide"><button class="linkish" onclick="openSettingsDrawer()" title="click to relabel" aria-label="relabel accounts — opens settings">${a.label??`<span class="hash">${short(a.accountHash)}</span>`} <span class="hash" aria-hidden="true">✎</span></button></td>
       <td class="hash">${(a.machines||[]).join(", ")||"·"}</td>
       <td class="num">${fmt(a.sessions)}</td>
       <td class="num">${usd(a.priorityUsd)}</td><td class="num">${usd(a.otherUsd)}</td>
       <td class="num">${usd(a.unlinkedUsd)}</td><td class="num brass">${usd(a.totalUsd)}</td>
       <td>${a.subscription?a.subscription.plan+" $"+a.subscription.usdPerMonth+"/mo":"<span class='hash'>direct API</span>"}</td>
       <td class="num">${a.subscription?.leverage?`<b style="color:${a.subscription.leverage>=1?"var(--signal-green)":"var(--signal-amber)"}">${a.subscription.leverage}×</b>`:"·"}</td></tr>`);
-    rows("#t-sessions","#e-sessions",Array.isArray(sess)?sess:[],x=>`<tr class="row" onclick="openSession('${x.sessionId}')">
+    rows("#t-sessions","#e-sessions",Array.isArray(sess)?sess:[],x=>`<tr class="row" tabindex="0" onkeydown="rk(event)" onclick="openSession('${x.sessionId}')">
       <td>${(x.startedAt||"").slice(0,16).replace("T"," ")}</td>
       <td><span class="flag ${x.source==="claude_code"?"cc":"cx"}">${x.source==="claude_code"?"CC":"CX"}</span></td>
       <td class="hash">${x.sessionId.slice(0,8)}…</td>
@@ -572,11 +618,11 @@ async function loadSettings(){
     const mergedInto=aliasMap[a.accountHash];
     return `<div class="srow">
     <span class="hash">${short(a.accountHash)}</span>
-    <input value="${(a.label||"").replace(/"/g,"&quot;")}" data-hash="${a.accountHash}" style="flex:1">
+    <input aria-label="display name for account ${short(a.accountHash)}" value="${(a.label||"").replace(/"/g,"&quot;")}" data-hash="${a.accountHash}" style="flex:1">
     <button class="btn" onclick="saveLabel(this)">save</button>
     ${mergedInto
       ?`<span class="hash" title="events under this identity display as ${acctLabel(mergedInto)}">→ ${acctLabel(mergedInto)}</span><button class="btn" onclick="unmergeAccount('${a.accountHash}')">unmerge</button>`
-      :`<select onchange="mergeAccount('${a.accountHash}',this.value)"><option value="">same person as…</option>${canonicals.filter(c=>c.accountHash!==a.accountHash).map(c=>`<option value="${c.accountHash}">${acctLabel(c.accountHash)}</option>`).join("")}</select>`}
+      :`<select aria-label="merge account ${short(a.accountHash)} into" onchange="mergeAccount('${a.accountHash}',this.value)"><option value="">same person as…</option>${canonicals.filter(c=>c.accountHash!==a.accountHash).map(c=>`<option value="${c.accountHash}">${acctLabel(c.accountHash)}</option>`).join("")}</select>`}
     </div>`}).join("")||'<div class="empty">accounts appear after their first session</div>';
   $("#s-prio-list").innerHTML=settingsCache.priorityRepos.map(p=>`<div class="srow">
     <span style="flex:1;color:var(--foam)">${p.url}</span>
@@ -597,10 +643,10 @@ $("#s-sub-add").onclick=async()=>{try{
   const subs=[...settingsCache.subscriptions,{account:$("#s-sub-account").value,plan:$("#s-sub-plan").value||"Plan",usdPerMonth:Number($("#s-sub-usd").value||0),vendor:"other"}];
   await post("/api/settings/subscriptions",{subscriptions:subs});$("#s-msg").textContent="subscription saved ✓";loadSettings();refresh();
 }catch(e){$("#s-msg").textContent=e.message}};
-function openSettingsDrawer(){loadSettings();$("#settings").classList.add("open");$("#veil").classList.add("show")}
+function openSettingsDrawer(){loadSettings();openDrawer($("#settings"))}
 $("#open-settings").onclick=openSettingsDrawer;
-$("#settings-close").onclick=()=>{$("#settings").classList.remove("open");$("#veil").classList.remove("show")};
-const veilClose=$("#veil").onclick;$("#veil").onclick=()=>{veilClose&&veilClose();$("#settings").classList.remove("open")};
+$("#settings-close").onclick=closeDrawers;
+
 
 railTicks(); refresh(); setInterval(refresh, 30000);
 window.addEventListener("resize",()=>refresh());
