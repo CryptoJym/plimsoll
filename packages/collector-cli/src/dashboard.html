@@ -92,7 +92,7 @@ header.mast{
   grid-column:span 12;
   background:linear-gradient(180deg, var(--sea-2), var(--sea-1));
   border:1px solid var(--line); border-radius:3px;
-  padding:16px 18px 18px; position:relative; overflow:hidden;
+  padding:16px 18px 18px; position:relative; overflow:hidden; min-width:0;
   animation:surface .5s cubic-bezier(.2,.8,.2,1) both;
 }
 .plate::before{ /* rivet corners */
@@ -151,7 +151,8 @@ th{font-size:9px; font-weight:400; letter-spacing:.18em; text-transform:uppercas
   color:var(--foam-faint); text-align:left; padding:0 10px 8px 0; border-bottom:1px solid var(--line)}
 td{padding:7px 10px 7px 0; border-bottom:1px solid rgba(29,42,53,.5);
   color:var(--foam-dim); font-variant-numeric:tabular-nums; white-space:nowrap}
-td.num,th.num{text-align:right}
+td.num,th.num{text-align:right; white-space:nowrap}
+td.wide{max-width:0; width:100%; overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
 td .hash{color:var(--foam-faint); font-size:11px}
 td .brass{color:var(--brass)}
 tr.row{cursor:pointer; transition:background .12s}
@@ -521,13 +522,13 @@ async function refresh(){
     gauge(pct);
     $("#cov-note").textContent=`${fmt(t.sessionsWithTokens)} of ${fmt(t.sessions)} sessions carry token telemetry`;
     drawSpark(s.daily);
-    rows("#t-models","#e-models",s.byModel,m=>`<tr><td>${m.model}</td><td class="num">${fmt(m.calls)}</td><td class="num">${fmt(m.inputTokens)}</td><td class="num">${fmt(m.outputTokens)}</td><td class="num brass">${usd(m.costUsd)}</td></tr>`);
+    rows("#t-models","#e-models",s.byModel,m=>`<tr><td class="wide" title="${m.model}">${m.model}</td><td class="num">${fmt(m.calls)}</td><td class="num">${fmt(m.inputTokens)}</td><td class="num">${fmt(m.outputTokens)}</td><td class="num brass">${usd(m.costUsd)}</td></tr>`);
     const vendors={claude_code:["Anthropic · Claude Code",""],codex:["OpenAI · Codex"," ~"]};
     $("#kv-vendors").innerHTML=(s.bySource||[]).filter(v=>v.costUsd>0||v.events>0).map(v=>{
       const [name,tilde]=vendors[v.source]||[v.source,""];
       return `<dt>${name}</dt><dd><b>${tilde}${usd(v.costUsd)}</b> · ${fmt(v.sessions)} sess</dd>`;
     }).join("")||"";
-    rows("#t-repos","#e-repos",(Array.isArray(repos)?repos:[]).filter(r=>r.repoHash),r=>`<tr class="row" onclick="openRepo('${r.repoHash}')"><td>${r.label?`<span style="color:var(--foam)">${r.label}</span>`:`<span class="hash">${short(r.repoHash)}</span>`}</td><td class="num">${fmt(r.sessions)}</td><td class="num">${fmt(r.inputTokens+r.outputTokens)}</td><td class="num brass">${usd(r.costUsd)}</td></tr>`);
+    rows("#t-repos","#e-repos",(Array.isArray(repos)?repos:[]).filter(r=>r.repoHash),r=>`<tr class="row" onclick="openRepo('${r.repoHash}')"><td class="wide" title="${r.label||short(r.repoHash)}">${r.label?`<span style="color:var(--foam)">${r.label}</span>`:`<span class="hash">${short(r.repoHash)}</span>`}</td><td class="num">${fmt(r.sessions)}</td><td class="num">${fmt(r.inputTokens+r.outputTokens)}</td><td class="num brass">${usd(r.costUsd)}</td></tr>`);
     $("#prio-count").textContent=acct.priorityRepoCount??0;
     const b=acct.buckets||{};
     if((b.priorityUsd+b.otherUsd+b.unlinkedUsd)>0){
@@ -535,7 +536,7 @@ async function refresh(){
         <dt>other repos</dt><dd>${usd(b.otherUsd)}</dd><dt>unlinked</dt><dd>${usd(b.unlinkedUsd)}</dd>`;
     }
     rows("#t-accounts","#e-accounts",(acct.accounts||[]).filter(a=>a.accountHash),a=>`<tr>
-      <td>${a.label??`<span class="hash">${short(a.accountHash)}</span>`}</td>
+      <td class="wide" style="cursor:pointer" title="${(a.label??short(a.accountHash))} — click to relabel" onclick="openSettingsDrawer()">${a.label??`<span class="hash">${short(a.accountHash)}</span>`} <span class="hash">✎</span></td>
       <td class="hash">${(a.machines||[]).join(", ")||"·"}</td>
       <td class="num">${fmt(a.sessions)}</td>
       <td class="num">${usd(a.priorityUsd)}</td><td class="num">${usd(a.otherUsd)}</td>
@@ -548,7 +549,7 @@ async function refresh(){
       <td class="hash">${x.sessionId.slice(0,8)}…</td>
       <td class="num">${fmt(x.events)}</td><td class="num">${fmt(x.inputTokens)}</td>
       <td class="num">${fmt(x.outputTokens)}</td><td class="num brass">${usd(x.costUsd)}</td>
-      <td>${x.repoLabel?`<span style="color:var(--foam-dim)">${x.repoLabel}</span>`:`<span class="hash">${short(x.repoHash)}</span>`}${x.repoCount>1?` <span class="hash">+${x.repoCount-1}</span>`:""}</td></tr>`);
+      <td class="wide" title="${x.repoLabel||short(x.repoHash)}">${x.repoLabel?`<span style="color:var(--foam-dim)">${x.repoLabel}</span>`:`<span class="hash">${short(x.repoHash)}</span>`}${x.repoCount>1?` <span class="hash">+${x.repoCount-1}</span>`:""}</td></tr>`);
     $("#f-ledger").textContent=status.stats?fmt(status.stats.count)+" rows":"·";
     $("#f-events").textContent=fmt(t.events)+" in window";
     $("#f-retention").textContent=(status.retentionDays??90)+"d";
@@ -584,7 +585,8 @@ $("#s-sub-add").onclick=async()=>{try{
   const subs=[...settingsCache.subscriptions,{account:$("#s-sub-account").value,plan:$("#s-sub-plan").value||"Plan",usdPerMonth:Number($("#s-sub-usd").value||0),vendor:"other"}];
   await post("/api/settings/subscriptions",{subscriptions:subs});$("#s-msg").textContent="subscription saved ✓";loadSettings();refresh();
 }catch(e){$("#s-msg").textContent=e.message}};
-$("#open-settings").onclick=()=>{loadSettings();$("#settings").classList.add("open");$("#veil").classList.add("show")};
+function openSettingsDrawer(){loadSettings();$("#settings").classList.add("open");$("#veil").classList.add("show")}
+$("#open-settings").onclick=openSettingsDrawer;
 $("#settings-close").onclick=()=>{$("#settings").classList.remove("open");$("#veil").classList.remove("show")};
 const veilClose=$("#veil").onclick;$("#veil").onclick=()=>{veilClose&&veilClose();$("#settings").classList.remove("open")};
 
