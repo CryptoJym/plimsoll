@@ -15,6 +15,10 @@
  *   6. Hook tool_name maps to actionClass (Bash→shell, Edit→edit, mcp__*→mcp).
  *   7. Upload drains oldest-first and advances the uploaded_at watermark.
  *   8. Retention prune deletes aged rows.
+ *   9. Every dashboard query executes against a real ledger, the views
+ *      reconcile to one total, and session attribution follows dominant
+ *      cost — not lexicographic max(hash). (/api/sessions shipped a query
+ *      SQLite rejects at run time; proof was green because nothing ran it.)
  *
  * Run: pnpm plimsoll:signal-fidelity-proof
  */
@@ -35,7 +39,14 @@ import {
   branchLinkageHash,
   remoteLinkageHash,
 } from "../packages/shared/src/linkage";
-import { dashboardAccounts } from "../packages/collector-cli/src/dashboard-api";
+import {
+  dashboardAccounts,
+  dashboardRepoDetail,
+  dashboardRepos,
+  dashboardSessionDetail,
+  dashboardSessions,
+  dashboardSummary,
+} from "../packages/collector-cli/src/dashboard-api";
 
 type Check = { name: string; passed: boolean; detail: string };
 
@@ -558,6 +569,136 @@ async function main() {
         Math.abs((proofAccount.subscription.planCostWindow ?? 0) - 200 * (30 / 30.44)) < 0.5,
     ),
     JSON.stringify(proofAccount?.subscription),
+  );
+
+  // 9. Dashboard query soundness. A short-lived second server (same buffer,
+  // real ingest path) lands a straddle fixture on SESSION: a second account
+  // whose cost dominates but whose STORED hash sorts below the existing proof
+  // account's. The sanitizer re-hash is unsalted sha256 (policy.ts), so the
+  // stored values are stable: proofaccount-dominant → sha256:25ee3b6c…,
+  // proofaccount0001 → sha256:a3f10975…. Lexicographic max() and
+  // cost-dominance therefore pick different owners on every run — the
+  // attribution check fails on any max(hash) shape. Posted after sections
+  // 1-6 so their exact-value assertions stay untouched.
+  const straddleAccount = "sha256:proofaccount-dominant";
+  const straddleServer = createCollectorServer(config, buffer);
+  await new Promise<void>((resolve) => straddleServer.listen(0, "127.0.0.1", () => resolve()));
+  const straddlePort = (straddleServer.address() as AddressInfo).port;
+  await postJson(
+    straddlePort,
+    "/v1/logs",
+    {
+      resourceLogs: [
+        {
+          resource: { attributes: [otelAttr("service.name", "claude-code")] },
+          scopeLogs: [
+            {
+              scope: { name: "com.anthropic.claude_code.events" },
+              logRecords: [
+                {
+                  timeUnixNano: "1781400007000000000",
+                  body: { stringValue: "claude_code.api_request" },
+                  attributes: [
+                    otelAttr("event.name", "api_request"),
+                    otelAttr("user.id", straddleAccount),
+                    otelAttr("session.id", SESSION),
+                    otelAttr("model", "claude-fable-5"),
+                    otelAttr("input_tokens", 90000),
+                    otelAttr("output_tokens", 12000),
+                    otelAttr("cost_usd", 5.1),
+                    otelAttr("request_id", "req_proof_straddle"),
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+    { "x-plimsoll-source": "claude_code" },
+  );
+  await new Promise<void>((resolve) => straddleServer.close(() => resolve()));
+
+  const straddleHashes = buffer.database
+    .prepare(
+      `select account_hash as hash, sum(coalesce(cost_usd, 0)) as cost from buffered_events
+       where session_id = ? and account_hash is not null group by account_hash`,
+    )
+    .all(SESSION) as Array<{ hash: string; cost: number }>;
+  const dominantByCost = [...straddleHashes].sort((a, b) => b.cost - a.cost)[0];
+  const lexicographicMax = [...straddleHashes].sort((a, b) => (a.hash < b.hash ? 1 : -1))[0];
+  check(
+    "straddle_fixture_separates_dominant_from_max",
+    straddleHashes.length === 2 && dominantByCost.hash !== lexicographicMax.hash,
+    JSON.stringify(straddleHashes),
+  );
+
+  const accountsAfterStraddle = dashboardAccounts(buffer.database, []);
+  const sessionCost = (
+    buffer.database
+      .prepare(`select coalesce(sum(cost_usd), 0) as c from buffered_events where session_id = ?`)
+      .get(SESSION) as { c: number }
+  ).c;
+  const dominantRow = accountsAfterStraddle.accounts.find((row) => row.accountHash === dominantByCost.hash);
+  check(
+    "session_attribution_follows_dominant_cost",
+    Boolean(dominantRow && Math.abs(Number(dominantRow.totalUsd) - sessionCost) < 1e-3),
+    JSON.stringify({
+      expectedOwner: dominantByCost.hash,
+      sessionCost,
+      rows: accountsAfterStraddle.accounts.map((row) => ({ hash: row.accountHash, usd: row.totalUsd })),
+    }),
+  );
+
+  let sessionsRows: Array<Record<string, unknown>> = [];
+  let sessionsError: string | null = null;
+  try {
+    sessionsRows = dashboardSessions(buffer.database) as Array<Record<string, unknown>>;
+  } catch (error) {
+    sessionsError = String(error);
+  }
+  check(
+    "dashboard_sessions_query_executes",
+    sessionsError === null && sessionsRows.length >= 2,
+    sessionsError ?? `rows: ${sessionsRows.length}`,
+  );
+  const sessionRow = sessionsRows.find((row) => row.sessionId === SESSION);
+  check(
+    "session_list_resolves_dominant_repo",
+    Boolean(sessionRow && sessionRow.repoHash === expectedRemoteHash),
+    JSON.stringify({ repoHash: sessionRow?.repoHash, repoLabel: sessionRow?.repoLabel ?? null }),
+  );
+
+  const summaryView = dashboardSummary(buffer.database);
+  const reposView = dashboardRepos(buffer.database) as Array<{ costUsd: number }>;
+  const sessionDetail = dashboardSessionDetail(buffer.database, SESSION);
+  const repoDetail = dashboardRepoDetail(buffer.database, expectedRemoteHash!);
+  check(
+    "dashboard_detail_queries_execute",
+    Boolean(sessionDetail && repoDetail),
+    JSON.stringify({ sessionDetail: Boolean(sessionDetail), repoDetail: Boolean(repoDetail) }),
+  );
+
+  const totalsCost = Number((summaryView.totals as Record<string, unknown>).costUsd);
+  const bySourceCost = (summaryView.bySource as Array<{ costUsd: number }>).reduce((sum, row) => sum + row.costUsd, 0);
+  const sessionedCost = (
+    buffer.database
+      .prepare(`select coalesce(sum(cost_usd), 0) as c from buffered_events where session_id is not null`)
+      .get() as { c: number }
+  ).c;
+  const reposCost = reposView.reduce((sum, row) => sum + row.costUsd, 0);
+  const accountsCost = accountsAfterStraddle.accounts.reduce((sum, row) => sum + Number(row.totalUsd ?? 0), 0);
+  const bucketsCost =
+    accountsAfterStraddle.buckets.priorityUsd +
+    accountsAfterStraddle.buckets.otherUsd +
+    accountsAfterStraddle.buckets.unlinkedUsd;
+  check(
+    "cross_view_costs_reconcile",
+    Math.abs(bySourceCost - totalsCost) < 1e-3 &&
+      Math.abs(reposCost - sessionedCost) < 1e-3 &&
+      Math.abs(accountsCost - sessionedCost) < 1e-3 &&
+      Math.abs(bucketsCost - sessionedCost) < 1e-3,
+    JSON.stringify({ totalsCost, bySourceCost, sessionedCost, reposCost, accountsCost, bucketsCost }),
   );
 
   // 7. Upload watermark drains oldest-first against a stub ingest endpoint.

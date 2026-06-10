@@ -7,6 +7,41 @@ import type Database from "better-sqlite3";
  * lineage ("receipts") that a displayed figure can be traced to its rows.
  */
 
+/**
+ * Session-grain attribution fragments. A session can touch several repos and
+ * (rarely) several account hashes — the 2026-06-10 v1→v2 collector swap split
+ * one human across two hash forms mid-session. Display attribution must follow
+ * the dominant weight, never `max(hash)` (a lexicographic accident):
+ *  - repo: most linked events wins. Cost rides api_request rows, which carry
+ *    no repo columns, so event count is the only honest session-grain weight.
+ *  - account: most attributed cost wins (cost rows carry the account); event
+ *    count breaks ties for cost-free sessions.
+ * Both expect one `?` bind: the window's since-ISO.
+ */
+const dominantRepoSql = `
+  select session_id, repo_hash from (
+    select session_id, repo_hash,
+      row_number() over (
+        partition by session_id
+        order by count(*) desc, count(distinct branch_hash) desc, repo_hash
+      ) as rn
+    from buffered_events
+    where session_id is not null and repo_hash is not null and observed_at >= ?
+    group by session_id, repo_hash
+  ) where rn = 1`;
+
+const dominantAccountSql = `
+  select session_id, account_hash from (
+    select session_id, account_hash,
+      row_number() over (
+        partition by session_id
+        order by sum(coalesce(cost_usd, 0)) desc, count(*) desc, account_hash
+      ) as rn
+    from buffered_events
+    where session_id is not null and account_hash is not null and observed_at >= ?
+    group by session_id, account_hash
+  ) where rn = 1`;
+
 export function dashboardSummary(db: Database.Database, days = 30) {
   const since = sinceIso(days);
   const totals = db
@@ -77,42 +112,55 @@ export function dashboardSummary(db: Database.Database, days = 30) {
 
 export function dashboardSessions(db: Database.Database, days = 30, limit = 60) {
   const since = sinceIso(days);
+  // Aggregate first, then join labels from the outer row. The previous shape
+  // called max() inside a correlated subquery's WHERE, which SQLite rejects at
+  // run time ("misuse of aggregate function") — /api/sessions 500'd on every
+  // request while proof stayed green because no check executed this query.
   return db
     .prepare(
-      `select session_id as sessionId, source,
-        min(observed_at) as startedAt, max(observed_at) as endedAt,
-        count(*) as events,
-        coalesce(sum(input_tokens), 0) as inputTokens,
-        coalesce(sum(output_tokens), 0) as outputTokens,
-        coalesce(sum(cache_read_tokens), 0) as cacheReadTokens,
-        coalesce(sum(cost_usd), 0) as costUsd,
-        max(repo_hash) as repoHash, max(branch_hash) as branchHash,
-        count(distinct repo_hash) as repoCount,
-        (select label from repo_labels where repo_hash = max(buffered_events.repo_hash)) as repoLabel
-      from buffered_events
-      where session_id is not null and observed_at >= ?
-      group by session_id, source
-      order by costUsd desc, events desc
+      `with rollup as (
+        select session_id as sessionId, source,
+          min(observed_at) as startedAt, max(observed_at) as endedAt,
+          count(*) as events,
+          coalesce(sum(input_tokens), 0) as inputTokens,
+          coalesce(sum(output_tokens), 0) as outputTokens,
+          coalesce(sum(cache_read_tokens), 0) as cacheReadTokens,
+          coalesce(sum(cost_usd), 0) as costUsd,
+          max(branch_hash) as branchHash,
+          count(distinct repo_hash) as repoCount
+        from buffered_events
+        where session_id is not null and observed_at >= ?
+        group by session_id, source
+      ),
+      dominant as (${dominantRepoSql})
+      select r.*, d.repo_hash as repoHash,
+        (select label from repo_labels where repo_hash = d.repo_hash) as repoLabel
+      from rollup r
+      left join dominant d on d.session_id = r.sessionId
+      order by r.costUsd desc, r.events desc
       limit ?`,
     )
-    .all(since, Math.min(limit, 200));
+    .all(since, since, Math.min(limit, 200));
 }
 
 export function dashboardRepos(db: Database.Database, days = 30) {
   const since = sinceIso(days);
   // Tokens ride api_request events (no repo columns); repos ride hook events.
-  // Attribution is session-level: a session's repo is its dominant repo_hash.
+  // Attribution is session-level: a session's repo is its dominant repo_hash
+  // by linked-event count (see dominantRepoSql), never lexicographic max().
   return db
     .prepare(
-      `with sessions as (
-        select session_id, max(repo_hash) as repoHash,
-          count(distinct branch_hash) as branches,
-          coalesce(sum(input_tokens), 0) as inputTokens,
-          coalesce(sum(output_tokens), 0) as outputTokens,
-          coalesce(sum(cost_usd), 0) as costUsd
-        from buffered_events
-        where session_id is not null and observed_at >= ?
-        group by session_id
+      `with dominant as (${dominantRepoSql}),
+      sessions as (
+        select e.session_id, d.repo_hash as repoHash,
+          count(distinct e.branch_hash) as branches,
+          coalesce(sum(e.input_tokens), 0) as inputTokens,
+          coalesce(sum(e.output_tokens), 0) as outputTokens,
+          coalesce(sum(e.cost_usd), 0) as costUsd
+        from buffered_events e
+        left join dominant d on d.session_id = e.session_id
+        where e.session_id is not null and e.observed_at >= ?
+        group by e.session_id
       )
       select s.repoHash, l.label, count(*) as sessions, sum(s.branches) as branchRefs,
         sum(s.inputTokens) as inputTokens, sum(s.outputTokens) as outputTokens,
@@ -122,7 +170,7 @@ export function dashboardRepos(db: Database.Database, days = 30) {
       order by costUsd desc
       limit 12`,
     )
-    .all(since);
+    .all(since, since);
 }
 
 export function dashboardSessionDetail(db: Database.Database, sessionId: string) {
@@ -198,17 +246,25 @@ export function dashboardAccounts(
   days = 30,
 ) {
   const since = sinceIso(days);
+  // A session's whole cost is attributed to its cost-dominant account hash
+  // and event-dominant repo hash. max(hash) attributed straddle sessions to
+  // whichever hash happened to sort higher — on 2026-06-10 that moved ~$486
+  // of real spend onto a retired v1-era hash form.
   const rows = db
     .prepare(
-      `with sessions as (
-        select session_id, max(account_hash) as accountHash, max(repo_hash) as repoHash,
-          group_concat(distinct machine) as machines,
-          coalesce(sum(cost_usd), 0) as costUsd,
-          coalesce(sum(input_tokens), 0) as inputTokens,
-          coalesce(sum(output_tokens), 0) as outputTokens
-        from buffered_events
-        where session_id is not null and observed_at >= ?
-        group by session_id
+      `with domaccount as (${dominantAccountSql}),
+      domrepo as (${dominantRepoSql}),
+      sessions as (
+        select e.session_id, a.account_hash as accountHash, r.repo_hash as repoHash,
+          group_concat(distinct e.machine) as machines,
+          coalesce(sum(e.cost_usd), 0) as costUsd,
+          coalesce(sum(e.input_tokens), 0) as inputTokens,
+          coalesce(sum(e.output_tokens), 0) as outputTokens
+        from buffered_events e
+        left join domaccount a on a.session_id = e.session_id
+        left join domrepo r on r.session_id = e.session_id
+        where e.session_id is not null and e.observed_at >= ?
+        group by e.session_id
       )
       select s.accountHash,
         (select label from account_labels where account_hash = s.accountHash) as label,
@@ -223,7 +279,7 @@ export function dashboardAccounts(
       group by s.accountHash
       order by totalUsd desc`,
     )
-    .all(since) as Array<Record<string, unknown> & { accountHash: string | null; label: string | null; totalUsd: number }>;
+    .all(since, since, since) as Array<Record<string, unknown> & { accountHash: string | null; label: string | null; totalUsd: number }>;
 
   const windowMonths = days / 30.44;
   const accounts = rows.map((row) => {
