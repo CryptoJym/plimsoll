@@ -9,6 +9,7 @@ import { appendForwardedHook } from "./forwarder";
 import { explodeOtlpPayload } from "./otlp";
 import { estimateCostUsd, remoteLinkageHash, normalizeGitRemote } from "../../shared/src/index";
 import { saveCollectorConfig } from "./config";
+import { computeCaptureHealth, type CaptureHealth } from "./health";
 import {
   dashboardAccounts,
   dashboardRepoDetail,
@@ -94,14 +95,21 @@ function isTrustedLocalWrite(request: http.IncomingMessage) {
 }
 
 export function createCollectorServer(config: CollectorConfig, buffer: LocalEventBuffer) {
+  // Capture health walks local transcript/rollout dirs — memoize per minute so
+  // the 30s dashboard refresh doesn't re-scan the filesystem every tick.
+  let healthCache: { at: number; value: CaptureHealth } | null = null;
   return http.createServer(async (request, response) => {
     try {
       if (request.method === "GET" && request.url === "/status") {
+        if (!healthCache || Date.now() - healthCache.at > 60_000) {
+          healthCache = { at: Date.now(), value: computeCaptureHealth(buffer.database) };
+        }
         sendJson(response, {
           ok: true,
           dataMode: config.policy.dataMode,
           retentionDays: config.retentionDays,
           stats: buffer.stats(),
+          health: healthCache.value,
         });
         return;
       }

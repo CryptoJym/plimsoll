@@ -21,6 +21,7 @@ import {
   launchctlBootstrapCommand,
   uninstallLaunchAgent,
 } from "./launch-agent";
+import { computeCaptureHealth } from "./health";
 import { createCollectorServer } from "./server";
 import {
   generateClaudeCodeSettings,
@@ -457,6 +458,7 @@ async function main() {
           syncConfigured: Boolean(config.uploadUrl),
           stats: buffer.stats(),
           tokenCoverageLast7d: buffer.tokenCoverage(7),
+          captureHealth: computeCaptureHealth(buffer.database),
         },
         null,
         2,

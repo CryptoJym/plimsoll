@@ -82,6 +82,7 @@ header.mast{
 .lamp i{width:8px; height:8px; border-radius:50%; background:var(--signal-red);
   box-shadow:0 0 8px var(--signal-red)}
 .lamp.ok i{background:var(--signal-green); box-shadow:0 0 8px var(--signal-green)}
+.lamp.warn i{background:var(--signal-amber); box-shadow:0 0 8px var(--signal-amber)}
 .crumbs{font-size:10px; color:var(--foam-faint); letter-spacing:.1em; margin:6px 0 26px}
 .crumbs b{color:var(--foam-dim); font-weight:400}
 
@@ -275,6 +276,13 @@ a{color:var(--waterline)}
           </div>
         </div>
       </div>
+    </section>
+
+    <section class="plate span12" id="watch-plate">
+      <h2>Capture watch · silence must scream
+        <span style="letter-spacing:.05em;text-transform:none;color:var(--foam-faint);margin-left:auto" id="watch-stamp"></span>
+      </h2>
+      <div id="watch-rows" class="legend" style="display:flex;flex-direction:column;gap:6px"><span style="color:var(--foam-faint)">sounding…</span></div>
     </section>
 
     <section class="plate span12">
@@ -491,7 +499,20 @@ async function refresh(){
       fetch("/status").then(r=>r.json()),
       fetch("/api/accounts").then(r=>r.json()),
     ]);
-    $("#lamp").classList.add("ok"); $("#lamp-text").textContent="collecting";
+    const health=status.health||{overall:"green",sources:[]};
+    const faults=[["sessions",sess],["repos",repos],["accounts",acct]].filter(([,p])=>p&&!Array.isArray(p)&&p.error);
+    const lampState=faults.length&&health.overall==="green"?"amber":health.overall;
+    $("#lamp").classList.toggle("ok",lampState==="green"&&!faults.length);
+    $("#lamp").classList.toggle("warn",lampState==="amber");
+    $("#lamp-text").textContent=lampState==="green"?(faults.length?"panel fault":"collecting"):"capture "+(lampState==="amber"?"degraded":"failure")+" — see capture watch";
+    const sigvar=st=>st==="green"?"var(--signal-green)":st==="amber"?"var(--signal-amber)":"var(--signal-red)";
+    const dot=st=>`<i style="background:${sigvar(st)};box-shadow:0 0 6px ${sigvar(st)}"></i>`;
+    const ago=t=>{if(!t)return"never";const m=Math.round((Date.now()-Date.parse(t))/60000);return m<1?"just now":m<60?m+"m ago":Math.round(m/60*10)/10+"h ago"};
+    $("#watch-rows").innerHTML=(health.sources||[]).map(h=>{
+      const name=h.source==="claude_code"?"Claude Code":"Codex";
+      return `<span>${dot(h.status)}<b style="color:var(--foam)">${name}</b>&nbsp;— ${h.reason} · last captured ${ago(h.lastEventAt)} · local activity ${ago(h.localLastActivityAt)}</span>`;
+    }).join("")+faults.map(([n,p])=>`<span>${dot("amber")}<b style="color:var(--foam)">${n} panel</b>&nbsp;— api error: ${p.error}${p.message?" · "+p.message:""}</span>`).join("")||`<span style="color:var(--foam-faint)">no health data</span>`;
+    $("#watch-stamp").textContent=health.generatedAt?"sounded "+ago(health.generatedAt):"";
     const t=s.totals;
     $("#fig-cost").innerHTML=usd(t.costUsd).replace(/^\$/, "<small>$</small>");
     $("#kv-in").textContent=fmt(t.inputTokens); $("#kv-out").textContent=fmt(t.outputTokens);
@@ -506,7 +527,7 @@ async function refresh(){
       const [name,tilde]=vendors[v.source]||[v.source,""];
       return `<dt>${name}</dt><dd><b>${tilde}${usd(v.costUsd)}</b> · ${fmt(v.sessions)} sess</dd>`;
     }).join("")||"";
-    rows("#t-repos","#e-repos",repos.filter(r=>r.repoHash),r=>`<tr class="row" onclick="openRepo('${r.repoHash}')"><td>${r.label?`<span style="color:var(--foam)">${r.label}</span>`:`<span class="hash">${short(r.repoHash)}</span>`}</td><td class="num">${fmt(r.sessions)}</td><td class="num">${fmt(r.inputTokens+r.outputTokens)}</td><td class="num brass">${usd(r.costUsd)}</td></tr>`);
+    rows("#t-repos","#e-repos",(Array.isArray(repos)?repos:[]).filter(r=>r.repoHash),r=>`<tr class="row" onclick="openRepo('${r.repoHash}')"><td>${r.label?`<span style="color:var(--foam)">${r.label}</span>`:`<span class="hash">${short(r.repoHash)}</span>`}</td><td class="num">${fmt(r.sessions)}</td><td class="num">${fmt(r.inputTokens+r.outputTokens)}</td><td class="num brass">${usd(r.costUsd)}</td></tr>`);
     $("#prio-count").textContent=acct.priorityRepoCount??0;
     const b=acct.buckets||{};
     if((b.priorityUsd+b.otherUsd+b.unlinkedUsd)>0){
@@ -521,7 +542,7 @@ async function refresh(){
       <td class="num">${usd(a.unlinkedUsd)}</td><td class="num brass">${usd(a.totalUsd)}</td>
       <td>${a.subscription?a.subscription.plan+" $"+a.subscription.usdPerMonth+"/mo":"<span class='hash'>direct API</span>"}</td>
       <td class="num">${a.subscription?.leverage?`<b style="color:${a.subscription.leverage>=1?"var(--signal-green)":"var(--signal-amber)"}">${a.subscription.leverage}×</b>`:"·"}</td></tr>`);
-    rows("#t-sessions","#e-sessions",sess,x=>`<tr class="row" onclick="openSession('${x.sessionId}')">
+    rows("#t-sessions","#e-sessions",Array.isArray(sess)?sess:[],x=>`<tr class="row" onclick="openSession('${x.sessionId}')">
       <td>${(x.startedAt||"").slice(0,16).replace("T"," ")}</td>
       <td><span class="flag ${x.source==="claude_code"?"cc":"cx"}">${x.source==="claude_code"?"CC":"CX"}</span></td>
       <td class="hash">${x.sessionId.slice(0,8)}…</td>
@@ -534,7 +555,7 @@ async function refresh(){
     $("#f-time").textContent=new Date().toLocaleTimeString();
     $("#crumbs").innerHTML=`127.0.0.1 · window ${s.days}d · <b>nothing leaves this machine from this page</b>`;
   }catch(e){
-    $("#lamp").classList.remove("ok"); $("#lamp-text").textContent="collector unreachable";
+    $("#lamp").classList.remove("ok","warn"); $("#lamp-text").textContent="collector unreachable";
   }
 }
 // ——— settings ———
