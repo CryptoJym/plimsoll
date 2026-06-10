@@ -318,6 +318,11 @@ export class LocalEventBuffer {
       .all(since);
   }
 
+  /** Read access for dashboard queries; do not write through this. */
+  get database() {
+    return this.db;
+  }
+
   close() {
     this.db.close();
   }

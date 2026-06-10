@@ -299,6 +299,30 @@ async function main() {
   );
   await postJson(port, "/v1/logs", codexLinkageEnvelope, { "x-plimsoll-source": "codex" });
 
+  // Dashboard: the display surface reads the same ledger it serves.
+  const dashHtml = await fetch(`http://127.0.0.1:${port}/`).then((r) => r.text());
+  const dashSummary = (await fetch(`http://127.0.0.1:${port}/api/summary`).then((r) => r.json())) as {
+    totals: Record<string, number>;
+  };
+  const dashSession = (await fetch(
+    `http://127.0.0.1:${port}/api/session?id=${SESSION}`,
+  ).then((r) => r.json())) as { rollup: Record<string, unknown>; receipts: { linkage: unknown[] } };
+  check(
+    "dashboard_served_locally",
+    dashHtml.includes("Plimsoll") && dashHtml.includes("Receipts"),
+    "GET / returns the instrument panel",
+  );
+  check(
+    "dashboard_summary_reads_ledger",
+    dashSummary.totals.inputTokens >= 1200 && dashSummary.totals.sessionsWithTokens >= 1,
+    JSON.stringify(dashSummary.totals),
+  );
+  check(
+    "dashboard_session_receipts_traceable",
+    Boolean(dashSession.rollup) && dashSession.receipts.linkage.length >= 1,
+    `linkage rows: ${dashSession.receipts?.linkage?.length}`,
+  );
+
   await new Promise<void>((resolve) => server.close(() => resolve()));
 
   const rows = buffer.list(1000);

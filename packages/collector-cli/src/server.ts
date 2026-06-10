@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import http from "node:http";
 import zlib from "node:zlib";
 
@@ -6,6 +7,23 @@ import type { CollectorConfig } from "./config";
 import type { ToolSource } from "../../shared/src/index";
 import { appendForwardedHook } from "./forwarder";
 import { explodeOtlpPayload } from "./otlp";
+import {
+  dashboardRepos,
+  dashboardSessionDetail,
+  dashboardSessions,
+  dashboardSummary,
+} from "./dashboard-api";
+
+let dashboardHtml: string | undefined;
+function loadDashboardHtml() {
+  dashboardHtml ??= fs.readFileSync(new URL("./dashboard.html", import.meta.url), "utf8");
+  return dashboardHtml;
+}
+
+function sendJson(response: http.ServerResponse, body: unknown, status = 200) {
+  response.writeHead(status, { "content-type": "application/json" });
+  response.end(JSON.stringify(body));
+}
 
 function readRequestBody(request: http.IncomingMessage) {
   return new Promise<Buffer>((resolve, reject) => {
@@ -48,7 +66,7 @@ function sourceFromPath(url = ""): ToolSource {
 }
 
 function sourceFromHeaders(request: http.IncomingMessage): ToolSource | undefined {
-  const value = request.headers["x-plimsoll-source"];
+  const value = request.headers["x-plimsoll-source"] ?? request.headers["x-cfo-one-source"];
   const source = Array.isArray(value) ? value[0] : value;
   if (source === "claude_code" || source === "codex") {
     return source;
@@ -61,14 +79,47 @@ export function createCollectorServer(config: CollectorConfig, buffer: LocalEven
   return http.createServer(async (request, response) => {
     try {
       if (request.method === "GET" && request.url === "/status") {
-        response.writeHead(200, { "content-type": "application/json" });
-        response.end(
-          JSON.stringify({
-            ok: true,
-            dataMode: config.policy.dataMode,
-            stats: buffer.stats(),
-          }),
-        );
+        sendJson(response, {
+          ok: true,
+          dataMode: config.policy.dataMode,
+          retentionDays: config.retentionDays,
+          stats: buffer.stats(),
+        });
+        return;
+      }
+
+      if (request.method === "GET" && (request.url === "/" || request.url === "/index.html")) {
+        response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        response.end(loadDashboardHtml());
+        return;
+      }
+
+      if (request.method === "GET" && request.url?.startsWith("/api/")) {
+        const url = new URL(request.url, "http://127.0.0.1");
+        const days = Number(url.searchParams.get("days") ?? 30) || 30;
+        if (url.pathname === "/api/summary") {
+          sendJson(response, dashboardSummary(buffer.database, days));
+          return;
+        }
+        if (url.pathname === "/api/sessions") {
+          sendJson(response, dashboardSessions(buffer.database, days));
+          return;
+        }
+        if (url.pathname === "/api/repos") {
+          sendJson(response, dashboardRepos(buffer.database, days));
+          return;
+        }
+        if (url.pathname === "/api/session") {
+          const id = url.searchParams.get("id");
+          const detail = id ? dashboardSessionDetail(buffer.database, id) : null;
+          if (!detail) {
+            sendJson(response, { error: "session_not_found" }, 404);
+            return;
+          }
+          sendJson(response, detail);
+          return;
+        }
+        sendJson(response, { error: "not_found" }, 404);
         return;
       }
 
