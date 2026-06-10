@@ -131,7 +131,7 @@ async function main() {
   }>;
 
   let pendingEvents: Array<{ event: AiInteractionEvent; suppressedFields: string[] }> = [];
-  let pendingMetrics: Parameters<LocalEventBuffer["appendMany"]>[1] = [];
+  let pendingMetrics: NonNullable<Parameters<LocalEventBuffer["appendMany"]>[1]> = [];
   const flush = () => {
     if (!target) {
       pendingEvents = [];
