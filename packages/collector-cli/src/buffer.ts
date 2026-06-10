@@ -65,6 +65,12 @@ export class LocalEventBuffer {
         suppressed_fields_json text not null default '[]',
         created_at text not null
       );
+      create table if not exists repo_labels (
+        repo_hash text primary key,
+        label text not null,
+        first_seen text not null,
+        last_seen text not null
+      );
       create table if not exists metric_samples (
         id text primary key,
         source text not null,
@@ -150,6 +156,117 @@ export class LocalEventBuffer {
       }
     });
     run();
+  }
+
+  /** Local-only display mapping; never included in upload batches. */
+  recordRepoLabel(repoHash: string, label: string) {
+    const now = new Date().toISOString();
+    this.db
+      .prepare(
+        `insert into repo_labels (repo_hash, label, first_seen, last_seen)
+         values (@repoHash, @label, @now, @now)
+         on conflict(repo_hash) do update set label = @label, last_seen = @now`,
+      )
+      .run({ repoHash, label, now });
+  }
+
+  /**
+   * Codex usage spans arrive sessionless and modelless (live 0.137 shape).
+   * Adopt session/model from the nearest codex row that has them (±10 min,
+   * single-machine serialization makes this reliable), then price the usage.
+   * Updates promoted columns AND payload_json so uploads carry the fix.
+   * Stitch provenance lands in metadata.stitched / metadata.costEstimated.
+   */
+  reconcileCodexUsage(estimate: (input: {
+    model?: string;
+    inputTokens?: number;
+    outputTokens?: number;
+    cacheReadTokens?: number;
+  }) => { costUsd: number } | undefined) {
+    const candidates = this.db
+      .prepare(
+        `select id, observed_at as observedAt, session_id as sessionId, model,
+           input_tokens as inputTokens, output_tokens as outputTokens,
+           cache_read_tokens as cacheReadTokens, cost_usd as costUsd
+         from buffered_events
+         where source = 'codex' and event_type = 'assistant_response'
+           and (session_id is null or model is null or cost_usd is null)
+           and (input_tokens is not null or output_tokens is not null)`,
+      )
+      .all() as Array<{
+      id: string;
+      observedAt: string;
+      sessionId: string | null;
+      model: string | null;
+      inputTokens: number | null;
+      outputTokens: number | null;
+      cacheReadTokens: number | null;
+      costUsd: number | null;
+    }>;
+    if (candidates.length === 0) return { examined: 0, stitched: 0, priced: 0 };
+
+    const nearest = this.db.prepare(
+      `select session_id as sessionId, model from buffered_events
+       where source = 'codex' and id != ?
+         and (session_id is not null or model is not null)
+         and abs(strftime('%s', observed_at) - strftime('%s', ?)) <= 600
+       order by abs(strftime('%s', observed_at) - strftime('%s', ?)) asc
+       limit 12`,
+    );
+    const apply = this.db.prepare(
+      `update buffered_events set
+         session_id = coalesce(@sessionId, session_id),
+         model = coalesce(@model, model),
+         cost_usd = coalesce(@costUsd, cost_usd),
+         payload_json = json_set(payload_json,
+           '$.sessionId', coalesce(@sessionId, json_extract(payload_json, '$.sessionId')),
+           '$.model', coalesce(@model, json_extract(payload_json, '$.model')),
+           '$.costUsd', coalesce(@costUsd, json_extract(payload_json, '$.costUsd')),
+           '$.metadata.stitched', @stitched,
+           '$.metadata.costEstimated', json(@costEstimated))
+       where id = @id`,
+    );
+
+    let stitched = 0;
+    let priced = 0;
+    const run = this.db.transaction(() => {
+      for (const row of candidates) {
+        const neighbors = nearest.all(row.id, row.observedAt, row.observedAt) as Array<{
+          sessionId: string | null;
+          model: string | null;
+        }>;
+        const sessionId = row.sessionId ?? neighbors.find((n) => n.sessionId)?.sessionId ?? null;
+        const model = row.model ?? neighbors.find((n) => n.model)?.model ?? null;
+        let costUsd: number | null = row.costUsd;
+        let costEstimated = false;
+        if (costUsd === null && model) {
+          const estimated = estimate({
+            model,
+            inputTokens: row.inputTokens ?? undefined,
+            outputTokens: row.outputTokens ?? undefined,
+            cacheReadTokens: row.cacheReadTokens ?? undefined,
+          });
+          if (estimated) {
+            costUsd = estimated.costUsd;
+            costEstimated = true;
+          }
+        }
+        if (sessionId !== row.sessionId || model !== row.model || costUsd !== row.costUsd) {
+          apply.run({
+            id: row.id,
+            sessionId,
+            model,
+            costUsd,
+            stitched: sessionId !== row.sessionId ? "time_window" : null,
+            costEstimated: costEstimated ? "true" : "false",
+          });
+          if (sessionId !== row.sessionId) stitched += 1;
+          if (costEstimated) priced += 1;
+        }
+      }
+    });
+    run();
+    return { examined: candidates.length, stitched, priced };
   }
 
   appendMetricSample(sample: MetricSample) {

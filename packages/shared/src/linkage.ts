@@ -58,4 +58,10 @@ export type GitLinkageContext = {
   branchHash?: string;
   headSha?: string;
   isWorktree?: boolean;
+  /**
+   * Human label (normalized remote, e.g. "github.com/owner/repo"). LOCAL
+   * DISPLAY ONLY: callers must strip this before it enters event metadata —
+   * it is persisted solely in the local repo_labels table and never uploaded.
+   */
+  remoteLabel?: string;
 };

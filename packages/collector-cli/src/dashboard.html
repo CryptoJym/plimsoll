@@ -235,6 +235,7 @@ a{color:var(--waterline)}
       <h2>Attributed spend · <span id="window-label">30 days</span></h2>
       <div class="figure" id="fig-cost">—</div>
       <div class="unit">USD, summed from per-request telemetry</div>
+      <dl class="kv" id="kv-vendors" style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--line)"></dl>
       <dl class="kv">
         <dt>input tokens</dt><dd id="kv-in">—</dd>
         <dt>output tokens</dt><dd id="kv-out">—</dd>
@@ -281,7 +282,7 @@ a{color:var(--waterline)}
     </section>
 
     <section class="plate span6">
-      <h2>By repository <span style="letter-spacing:0;text-transform:none;color:var(--foam-faint)">(hashed — names never stored)</span></h2>
+      <h2>By repository <span style="letter-spacing:0;text-transform:none;color:var(--foam-faint)">(names local-only, never uploaded) · click for detail</span></h2>
       <table id="t-repos"><thead><tr>
         <th>repo (hash)</th><th class="num">sessions</th><th class="num">tokens</th><th class="num">usd</th>
       </tr></thead><tbody></tbody></table>
@@ -289,10 +290,13 @@ a{color:var(--waterline)}
     </section>
 
     <section class="plate span12">
-      <h2>Sessions · click a row for its receipts</h2>
+      <h2>Sessions · click a row for its receipts
+        <span style="letter-spacing:.05em;text-transform:none;color:var(--foam-faint);margin-left:auto">
+          <span class="flag cc">CC</span> Claude Code &nbsp; <span class="flag cx">CX</span> Codex &nbsp; ~ computed cost</span>
+      </h2>
       <table id="t-sessions"><thead><tr>
         <th>start</th><th>src</th><th>session</th><th class="num">events</th>
-        <th class="num">in</th><th class="num">out</th><th class="num">usd</th><th>repo</th>
+        <th class="num">in</th><th class="num">out</th><th class="num">usd</th><th>repository</th>
       </tr></thead><tbody></tbody></table>
       <div class="empty" id="e-sessions" hidden><b>no soundings yet.</b> run a Claude Code or Codex session, then refresh.</div>
     </section>
@@ -398,6 +402,36 @@ async function openSession(id){
     <dl class="kv"><dt>events with suppressed raw fields</dt><dd>${fmt(d.receipts.suppression?.suppressedEvents)}</dd></dl>`;
   $("#drawer").classList.add("open"); $("#veil").classList.add("show");
 }
+async function openRepo(hash){
+  const r=await fetch("/api/repo?hash="+encodeURIComponent(hash)); if(!r.ok)return;
+  const d=await r.json();
+  $("#d-sid").textContent=d.label||short(hash);
+  const mix=(d.actionMix||[]); const tot=mix.reduce((s,m)=>s+m.n,0)||1;
+  const colors={shell:"#2389a7",edit:"#e8b34b",write:"#e8b34b",read:"#3ddc97",mcp:"#bda7e8",browser:"#7fc3e8",other:"#3e4e5a"};
+  const dmax=Math.max(...(d.daily||[]).map(x=>x.costUsd),0.01);
+  $("#d-body").innerHTML=`
+    <h3>Repository reading · ${d.days}d</h3>
+    <dl class="kv">
+      <dt>sessions</dt><dd>${fmt(d.totals.sessions)}</dd>
+      <dt>events</dt><dd>${fmt(d.totals.events)}</dd>
+      <dt>tokens in / out</dt><dd>${fmt(d.totals.inputTokens)} / ${fmt(d.totals.outputTokens)}</dd>
+      <dt>spend</dt><dd><b>${usd(d.totals.costUsd)}</b></dd>
+      <dt>repo hash</dt><dd class="hash">${short(d.repoHash)}</dd>
+    </dl>
+    <h3>Daily spend</h3>
+    <svg width="100%" height="60" viewBox="0 0 420 60" preserveAspectRatio="none">${(d.daily||[]).map((x,i,a)=>{
+      const w=Math.max(2,420/a.length-2), h=Math.max(1,x.costUsd/dmax*48);
+      return `<rect x="${i*(420/a.length)}" y="${58-h}" width="${w}" height="${h}" fill="var(--waterline)" opacity=".8"><title>${x.day} ${usd(x.costUsd)}</title></rect>`;
+    }).join("")}</svg>
+    <h3>Action mix</h3>
+    <div class="bar-mix">${mix.map(m=>`<i title="${m.actionClass} ${m.n}" style="width:${m.n/tot*100}%;background:${colors[m.actionClass]||colors.other}"></i>`).join("")||"<i style='width:100%;background:var(--line)'></i>"}</div>
+    <div style="font-size:10px;color:var(--foam-faint);margin-top:6px">${mix.map(m=>`${m.actionClass} ${m.n}`).join(" · ")||"no tool events"}</div>
+    <h3>Models</h3>
+    ${(d.models||[]).length?`<dl class="kv">${d.models.map(m=>`<dt>${m.model}</dt><dd>${fmt(m.inputTokens)}/${fmt(m.outputTokens)} · <b>${usd(m.costUsd)}</b></dd>`).join("")}</dl>`:`<div class="empty">no model-attributed events</div>`}
+    <h3>Branches (hashed)</h3>
+    <dl class="kv">${(d.branches||[]).map(b=>`<dt class="hash">${short(b.branchHash)}</dt><dd>${fmt(b.sessions)} sess · ${fmt(b.events)} ev</dd>`).join("")||"<dt>none</dt><dd>·</dd>"}</dl>`;
+  $("#drawer").classList.add("open"); $("#veil").classList.add("show");
+}
 $("#drawer-close").onclick=()=>{$("#drawer").classList.remove("open");$("#veil").classList.remove("show")};
 $("#veil").onclick=$("#drawer-close").onclick;
 
@@ -419,14 +453,19 @@ async function refresh(){
     $("#cov-note").textContent=`${fmt(t.sessionsWithTokens)} of ${fmt(t.sessions)} sessions carry token telemetry`;
     drawSpark(s.daily);
     rows("#t-models","#e-models",s.byModel,m=>`<tr><td>${m.model}</td><td class="num">${fmt(m.calls)}</td><td class="num">${fmt(m.inputTokens)}</td><td class="num">${fmt(m.outputTokens)}</td><td class="num brass">${usd(m.costUsd)}</td></tr>`);
-    rows("#t-repos","#e-repos",repos.filter(r=>r.repoHash),r=>`<tr><td class="hash">${short(r.repoHash)}</td><td class="num">${fmt(r.sessions)}</td><td class="num">${fmt(r.inputTokens+r.outputTokens)}</td><td class="num brass">${usd(r.costUsd)}</td></tr>`);
+    const vendors={claude_code:["Anthropic · Claude Code",""],codex:["OpenAI · Codex"," ~"]};
+    $("#kv-vendors").innerHTML=(s.bySource||[]).filter(v=>v.costUsd>0||v.events>0).map(v=>{
+      const [name,tilde]=vendors[v.source]||[v.source,""];
+      return `<dt>${name}</dt><dd><b>${tilde}${usd(v.costUsd)}</b> · ${fmt(v.sessions)} sess</dd>`;
+    }).join("")||"";
+    rows("#t-repos","#e-repos",repos.filter(r=>r.repoHash),r=>`<tr class="row" onclick="openRepo('${r.repoHash}')"><td>${r.label?`<span style="color:var(--foam)">${r.label}</span>`:`<span class="hash">${short(r.repoHash)}</span>`}</td><td class="num">${fmt(r.sessions)}</td><td class="num">${fmt(r.inputTokens+r.outputTokens)}</td><td class="num brass">${usd(r.costUsd)}</td></tr>`);
     rows("#t-sessions","#e-sessions",sess,x=>`<tr class="row" onclick="openSession('${x.sessionId}')">
       <td>${(x.startedAt||"").slice(0,16).replace("T"," ")}</td>
       <td><span class="flag ${x.source==="claude_code"?"cc":"cx"}">${x.source==="claude_code"?"CC":"CX"}</span></td>
       <td class="hash">${x.sessionId.slice(0,8)}…</td>
       <td class="num">${fmt(x.events)}</td><td class="num">${fmt(x.inputTokens)}</td>
       <td class="num">${fmt(x.outputTokens)}</td><td class="num brass">${usd(x.costUsd)}</td>
-      <td class="hash">${short(x.repoHash)}${x.repoCount>1?" +"+(x.repoCount-1):""}</td></tr>`);
+      <td>${x.repoLabel?`<span style="color:var(--foam-dim)">${x.repoLabel}</span>`:`<span class="hash">${short(x.repoHash)}</span>`}${x.repoCount>1?` <span class="hash">+${x.repoCount-1}</span>`:""}</td></tr>`);
     $("#f-ledger").textContent=status.stats?fmt(status.stats.count)+" rows":"·";
     $("#f-events").textContent=fmt(t.events)+" in window";
     $("#f-retention").textContent=(status.retentionDays??90)+"d";

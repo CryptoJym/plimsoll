@@ -317,6 +317,15 @@ async function main() {
     dashSummary.totals.inputTokens >= 1200 && dashSummary.totals.sessionsWithTokens >= 1,
     JSON.stringify(dashSummary.totals),
   );
+  const dashRepos = (await fetch(`http://127.0.0.1:${port}/api/repos`).then((r) => r.json())) as Array<{
+    repoHash?: string;
+    label?: string;
+  }>;
+  check(
+    "repo_label_displayed_locally",
+    dashRepos.some((row) => row.label === "github.com/proof-owner/proof-repo"),
+    JSON.stringify(dashRepos.map((row) => row.label)),
+  );
   check(
     "dashboard_session_receipts_traceable",
     Boolean(dashSession.rollup) && dashSession.receipts.linkage.length >= 1,
@@ -352,10 +361,21 @@ async function main() {
       codexSpan &&
         codexSpan.payload.inputTokens === 2400 &&
         codexSpan.payload.outputTokens === 510 &&
-        codexSpan.payload.cacheReadTokens === 1800 &&
-        codexSpan.payload.sessionId === undefined,
+        codexSpan.payload.cacheReadTokens === 1800,
     ),
-    codexSpan ? JSON.stringify({ in: codexSpan.payload.inputTokens, out: codexSpan.payload.outputTokens, session: codexSpan.payload.sessionId }) : "codex usage span missing",
+    codexSpan ? JSON.stringify({ in: codexSpan.payload.inputTokens, out: codexSpan.payload.outputTokens }) : "codex usage span missing",
+  );
+  // Reconciler adopts session + model from nearest codex rows, then prices:
+  // (2400-1800)*$5 + 1800*$0.50 + 510*$30 per 1M = $0.0192 (gpt-5.5, 2026-06-10).
+  check(
+    "codex_usage_stitched_and_priced",
+    Boolean(
+      codexSpan &&
+        codexSpan.payload.sessionId === CODEX_SESSION &&
+        codexSpan.payload.model === "gpt-5.5" &&
+        Math.abs((codexSpan.payload.costUsd ?? 0) - 0.0192) < 0.0001,
+    ),
+    codexSpan ? JSON.stringify({ session: codexSpan.payload.sessionId, model: codexSpan.payload.model, cost: codexSpan.payload.costUsd }) : "missing",
   );
 
   const codexTool = rows.find(
@@ -452,10 +472,12 @@ async function main() {
 
   // 7. Upload watermark drains oldest-first against a stub ingest endpoint.
   const received: number[] = [];
+  const uploadBodies: string[] = [];
   const stub = http.createServer((request, response) => {
     let body = "";
     request.on("data", (chunk) => (body += chunk));
     request.on("end", () => {
+      uploadBodies.push(body);
       received.push((JSON.parse(body).events as unknown[]).length);
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify({ accepted: true }));
@@ -477,6 +499,12 @@ async function main() {
       second.remainingUnuploaded === 0 &&
       buffer.stats().unuploadedCount === 0,
     JSON.stringify({ before, firstMarked: first.markedUploaded, after: buffer.stats().unuploadedCount, batches: received }),
+  );
+
+  check(
+    "repo_label_never_uploaded",
+    uploadBodies.length > 0 && uploadBodies.every((body) => !body.includes("proof-owner/proof-repo")),
+    `checked ${uploadBodies.length} upload bodies for the local-only label`,
   );
 
   // 8. Retention prune.

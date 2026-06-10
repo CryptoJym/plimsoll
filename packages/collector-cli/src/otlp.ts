@@ -1,6 +1,7 @@
 import {
   DEFAULT_POLICY,
   aiInteractionEventSchema,
+  estimateCostUsd,
   sanitizeForPolicy,
   type AiInteractionEvent,
   type PolicyConfig,
@@ -51,6 +52,8 @@ type ExplodeOptions = {
    * would attribute today's HEAD to historical sessions.
    */
   resolveGit?: boolean;
+  /** Receives (repoHash, label) for local-only repo_labels recording. */
+  onRepoLabel?: (repoHash: string, label: string) => void;
 };
 
 function flattenOtelAttributes(attributes: unknown): Record<string, unknown> {
@@ -131,10 +134,17 @@ function buildLogEvent(
     serviceName?: string;
     serviceVersion?: string;
     resolveGit?: boolean;
+    onRepoLabel?: (repoHash: string, label: string) => void;
   },
 ): { event: AiInteractionEvent; suppressedFields: string[] } {
-  const gitContext = context.resolveGit
+  const resolvedGit = context.resolveGit
     ? resolveGitContext(workdirFromRawRecord(record))
+    : undefined;
+  if (resolvedGit?.remoteUrlHash && resolvedGit.remoteLabel) {
+    context.onRepoLabel?.(resolvedGit.remoteUrlHash, resolvedGit.remoteLabel);
+  }
+  const gitContext = resolvedGit
+    ? (({ remoteLabel: _l, ...rest }) => rest)(resolvedGit)
     : undefined;
   const sanitized = sanitizeForPolicy(record, context.policy);
   const safeRecord = asRecord(sanitized.value);
@@ -146,7 +156,20 @@ function buildLogEvent(
   const inputTokens = intTokens(numberField(attrs, [...usageFieldKeys.inputTokens]));
   const outputTokens = intTokens(numberField(attrs, [...usageFieldKeys.outputTokens]));
   const cacheReadTokens = intTokens(numberField(attrs, [...usageFieldKeys.cacheReadTokens]));
-  const costUsd = numberField(attrs, [...usageFieldKeys.costUsd]);
+  let costUsd = numberField(attrs, [...usageFieldKeys.costUsd]);
+  let costEstimated = false;
+  if (costUsd === undefined) {
+    const estimate = estimateCostUsd({
+      model: stringField(attrs, [...usageFieldKeys.model]),
+      inputTokens,
+      outputTokens,
+      cacheReadTokens,
+    });
+    if (estimate) {
+      costUsd = estimate.costUsd;
+      costEstimated = true;
+    }
+  }
   const hasUsage =
     inputTokens !== undefined || outputTokens !== undefined || costUsd !== undefined;
 
@@ -201,6 +224,7 @@ function buildLogEvent(
       ...(context.serviceName ? { serviceName: context.serviceName } : {}),
       ...(context.serviceVersion ? { serviceVersion: context.serviceVersion } : {}),
       ...(gitContext ? { git: gitContext } : {}),
+      ...(costEstimated ? { costEstimated: true } : {}),
     },
   });
 
@@ -225,7 +249,21 @@ function buildSpanEvent(
   const sessionId = stringField(attrs, [...usageFieldKeys.sessionId]);
   const inputTokens = intTokens(numberField(attrs, [...usageFieldKeys.inputTokens]));
   const outputTokens = intTokens(numberField(attrs, [...usageFieldKeys.outputTokens]));
-  const costUsd = numberField(attrs, [...usageFieldKeys.costUsd]);
+  const cacheReadTokensSpan = intTokens(numberField(attrs, [...usageFieldKeys.cacheReadTokens]));
+  let costUsd = numberField(attrs, [...usageFieldKeys.costUsd]);
+  let costEstimated = false;
+  if (costUsd === undefined) {
+    const estimate = estimateCostUsd({
+      model: stringField(attrs, [...usageFieldKeys.model]),
+      inputTokens,
+      outputTokens,
+      cacheReadTokens: cacheReadTokensSpan,
+    });
+    if (estimate) {
+      costUsd = estimate.costUsd;
+      costEstimated = true;
+    }
+  }
 
   const event = aiInteractionEventSchema.parse({
     id: deterministicEventId([
@@ -249,10 +287,11 @@ function buildSpanEvent(
     actionClass: "other",
     inputTokens,
     outputTokens,
-    cacheReadTokens: intTokens(numberField(attrs, [...usageFieldKeys.cacheReadTokens])),
+    cacheReadTokens: cacheReadTokensSpan,
     costUsd: costUsd !== undefined && costUsd >= 0 ? costUsd : undefined,
     metadata: {
       ...attrs,
+      ...(costEstimated ? { costEstimated: true } : {}),
       ...(spanName ? { otelEventName: spanName } : {}),
       ...(typeof safeSpan.traceId === "string" ? { traceId: safeSpan.traceId } : {}),
       ...(typeof safeSpan.spanId === "string" ? { spanId: safeSpan.spanId } : {}),
@@ -355,6 +394,7 @@ export function explodeOtlpPayload(
               serviceName: resource.serviceName,
               serviceVersion: resource.serviceVersion,
               resolveGit: options.resolveGit ?? true,
+              onRepoLabel: options.onRepoLabel,
             }),
           );
         } catch {

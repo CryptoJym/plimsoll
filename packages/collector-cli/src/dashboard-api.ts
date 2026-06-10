@@ -87,7 +87,8 @@ export function dashboardSessions(db: Database.Database, days = 30, limit = 60) 
         coalesce(sum(cache_read_tokens), 0) as cacheReadTokens,
         coalesce(sum(cost_usd), 0) as costUsd,
         max(repo_hash) as repoHash, max(branch_hash) as branchHash,
-        count(distinct repo_hash) as repoCount
+        count(distinct repo_hash) as repoCount,
+        (select label from repo_labels where repo_hash = max(buffered_events.repo_hash)) as repoLabel
       from buffered_events
       where session_id is not null and observed_at >= ?
       group by session_id, source
@@ -113,11 +114,11 @@ export function dashboardRepos(db: Database.Database, days = 30) {
         where session_id is not null and observed_at >= ?
         group by session_id
       )
-      select repoHash, count(*) as sessions, sum(branches) as branchRefs,
-        sum(inputTokens) as inputTokens, sum(outputTokens) as outputTokens,
-        sum(costUsd) as costUsd
-      from sessions
-      group by repoHash
+      select s.repoHash, l.label, count(*) as sessions, sum(s.branches) as branchRefs,
+        sum(s.inputTokens) as inputTokens, sum(s.outputTokens) as outputTokens,
+        sum(s.costUsd) as costUsd
+      from sessions s left join repo_labels l on l.repo_hash = s.repoHash
+      group by s.repoHash
       order by costUsd desc
       limit 12`,
     )
@@ -182,6 +183,60 @@ export function dashboardSessionDetail(db: Database.Database, sessionId: string)
   };
 
   return { rollup, receipts };
+}
+
+export function dashboardRepoDetail(db: Database.Database, repoHash: string, days = 30) {
+  const since = sinceIso(days);
+  const label = (db.prepare(`select label from repo_labels where repo_hash = ?`).get(repoHash) as
+    | { label: string }
+    | undefined)?.label;
+  const sessionIds = db
+    .prepare(
+      `select distinct session_id as id from buffered_events
+       where repo_hash = ? and session_id is not null and observed_at >= ?`,
+    )
+    .all(repoHash, since) as Array<{ id: string }>;
+  if (sessionIds.length === 0 && !label) return null;
+  const ids = sessionIds.map((row) => row.id);
+  const marks = ids.map(() => "?").join(",") || "''";
+  const totals = db
+    .prepare(
+      `select count(distinct session_id) as sessions, count(*) as events,
+         coalesce(sum(input_tokens),0) as inputTokens, coalesce(sum(output_tokens),0) as outputTokens,
+         coalesce(sum(cost_usd),0) as costUsd
+       from buffered_events where session_id in (${marks}) and observed_at >= ?`,
+    )
+    .get(...ids, since);
+  const daily = db
+    .prepare(
+      `select substr(observed_at,1,10) as day, coalesce(sum(cost_usd),0) as costUsd
+       from buffered_events where session_id in (${marks}) and observed_at >= ?
+       group by day order by day asc`,
+    )
+    .all(...ids, since);
+  const branches = db
+    .prepare(
+      `select branch_hash as branchHash, count(*) as events, count(distinct session_id) as sessions
+       from buffered_events where repo_hash = ? and branch_hash is not null and observed_at >= ?
+       group by branch_hash order by events desc limit 15`,
+    )
+    .all(repoHash, since);
+  const actionMix = db
+    .prepare(
+      `select action_class as actionClass, count(*) as n from buffered_events
+       where session_id in (${marks}) and event_type in ('tool_use','tool_result') and observed_at >= ?
+       group by action_class order by n desc`,
+    )
+    .all(...ids, since);
+  const models = db
+    .prepare(
+      `select model, coalesce(sum(input_tokens),0) as inputTokens,
+         coalesce(sum(output_tokens),0) as outputTokens, coalesce(sum(cost_usd),0) as costUsd
+       from buffered_events where session_id in (${marks}) and model is not null and observed_at >= ?
+       group by model order by costUsd desc limit 8`,
+    )
+    .all(...ids, since);
+  return { repoHash, label: label ?? null, days, totals, daily, branches, actionMix, models };
 }
 
 function sinceIso(days: number) {

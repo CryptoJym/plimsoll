@@ -14,12 +14,16 @@ export function appendForwardedHook(
 ) {
   // Resolve git linkage keys from the hook's cwd before sanitization hashes it.
   const cwd = stringField(asRecord(payload), ["cwd", "current_working_directory", "workdir"]);
-  const gitContext = resolveGitContext(cwd);
+  const resolved = resolveGitContext(cwd);
+  if (resolved?.remoteUrlHash && resolved.remoteLabel) {
+    options.buffer.recordRepoLabel(resolved.remoteUrlHash, resolved.remoteLabel);
+  }
+  const { remoteLabel: _localOnly, ...gitContext } = resolved ?? {};
 
   const normalized = normalizeHookPayload(payload, {
     policy: options.config.policy,
     source: options.source,
-    gitContext,
+    gitContext: resolved ? gitContext : undefined,
   });
 
   options.buffer.append(normalized.event, normalized.suppressedFields);

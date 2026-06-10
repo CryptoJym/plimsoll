@@ -7,7 +7,9 @@ import type { CollectorConfig } from "./config";
 import type { ToolSource } from "../../shared/src/index";
 import { appendForwardedHook } from "./forwarder";
 import { explodeOtlpPayload } from "./otlp";
+import { estimateCostUsd } from "../../shared/src/index";
 import {
+  dashboardRepoDetail,
   dashboardRepos,
   dashboardSessionDetail,
   dashboardSessions,
@@ -109,6 +111,16 @@ export function createCollectorServer(config: CollectorConfig, buffer: LocalEven
           sendJson(response, dashboardRepos(buffer.database, days));
           return;
         }
+        if (url.pathname === "/api/repo") {
+          const hash = url.searchParams.get("hash");
+          const detail = hash ? dashboardRepoDetail(buffer.database, hash, days) : null;
+          if (!detail) {
+            sendJson(response, { error: "repo_not_found" }, 404);
+            return;
+          }
+          sendJson(response, detail);
+          return;
+        }
         if (url.pathname === "/api/session") {
           const id = url.searchParams.get("id");
           const detail = id ? dashboardSessionDetail(buffer.database, id) : null;
@@ -161,10 +173,14 @@ export function createCollectorServer(config: CollectorConfig, buffer: LocalEven
             policy: config.policy,
             source,
             transportPath: request.url,
+            onRepoLabel: (hash, label) => buffer.recordRepoLabel(hash, label),
           });
 
           if (exploded.events.length > 0 || exploded.metricSamples.length > 0) {
             buffer.appendMany(exploded.events, exploded.metricSamples);
+            if (source === "codex") {
+              buffer.reconcileCodexUsage(estimateCostUsd);
+            }
             response.writeHead(202, { "content-type": "application/json" });
             response.end(
               JSON.stringify({

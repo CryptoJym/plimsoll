@@ -3,6 +3,7 @@ import path from "node:path";
 
 import {
   branchLinkageHash,
+  normalizeGitRemote,
   remoteLinkageHash,
   type GitLinkageContext,
 } from "../../shared/src/index";
@@ -128,8 +129,10 @@ export function resolveGitContext(cwd: string | undefined): GitLinkageContext | 
     const located = findGitDir(cwd);
     if (located) {
       const { ref, headSha } = resolveHead(located.gitDir, located.commonDir);
+      const remoteUrl = resolveRemoteUrl(located.commonDir);
       context = {
-        remoteUrlHash: remoteLinkageHash(resolveRemoteUrl(located.commonDir)),
+        remoteUrlHash: remoteLinkageHash(remoteUrl),
+        remoteLabel: normalizeGitRemote(remoteUrl),
         branchHash: branchLinkageHash(ref),
         headSha,
         ...(located.isWorktree ? { isWorktree: true } : {}),
