@@ -203,6 +203,14 @@ tr.row:hover td:first-child{color:var(--foam)}
   opacity:.5; animation:drift 14s linear infinite}
 @keyframes drift{to{transform:translateX(-76px)}}
 .keel b{color:var(--foam-dim); font-weight:400}
+input,select{background:var(--sea-0);border:1px solid var(--line-bright);color:var(--foam);
+  font-family:var(--mono);font-size:12px;padding:6px 8px;border-radius:2px;min-width:0}
+input:focus,select:focus{outline:none;border-color:var(--waterline)}
+.btn{background:var(--sea-2);border:1px solid var(--line-bright);color:var(--foam);
+  font-family:var(--mono);font-size:11px;padding:6px 12px;cursor:pointer;letter-spacing:.08em}
+.btn:hover{border-color:var(--brass);color:var(--brass)}
+.srow{display:flex;gap:8px;align-items:center;font-size:11px}
+.srow .hash{flex:none}
 .empty{padding:30px 0; text-align:center; color:var(--foam-faint); font-size:12px; letter-spacing:.06em}
 .empty b{color:var(--foam-dim)}
 a{color:var(--waterline)}
@@ -226,6 +234,7 @@ a{color:var(--waterline)}
     <div class="wordmark">Plims<em>o</em>ll</div>
     <div class="sub">local ledger · metadata mode</div>
     <div class="lamp" id="lamp"><i></i><span id="lamp-text">sounding…</span></div>
+  <button id="open-settings" style="background:none;border:1px solid var(--line-bright);color:var(--foam-dim);font-family:var(--mono);font-size:10px;letter-spacing:.14em;padding:4px 12px;cursor:pointer;text-transform:uppercase">⚙ settings</button>
   </header>
   <div class="crumbs" id="crumbs">127.0.0.1 · <b>nothing leaves this machine from this page</b></div>
 
@@ -323,6 +332,32 @@ a{color:var(--waterline)}
   <div class="sid" id="d-sid"></div>
   <div id="d-body"></div>
   <div class="stamp">every figure traceable · plimsoll local ledger</div>
+</aside>
+
+<aside class="drawer" id="settings" aria-label="settings">
+  <button class="close" id="settings-close">close ✕</button>
+  <h2 style="font-size:10px;letter-spacing:.24em;color:var(--foam-faint);text-transform:uppercase">Settings</h2>
+  <div class="sid">stored on this machine only — labels and lists never upload</div>
+
+  <h3>Account names</h3>
+  <div id="s-accounts" style="display:grid;gap:8px"></div>
+
+  <h3>Priority projects</h3>
+  <div style="display:flex;gap:8px;margin-bottom:10px">
+    <input id="s-prio-url" placeholder="paste a repo URL — https://github.com/org/repo" style="flex:1">
+    <button class="btn" id="s-prio-add">add</button>
+  </div>
+  <div id="s-prio-list" style="display:grid;gap:6px"></div>
+
+  <h3>Subscriptions (for plan leverage)</h3>
+  <div id="s-subs" style="display:grid;gap:8px"></div>
+  <div style="display:grid;grid-template-columns:1fr 90px 70px auto;gap:8px;margin-top:10px">
+    <select id="s-sub-account"></select>
+    <input id="s-sub-plan" placeholder="plan name" value="Max">
+    <input id="s-sub-usd" placeholder="$/mo" type="number" min="0" value="200">
+    <button class="btn" id="s-sub-add">add</button>
+  </div>
+  <div id="s-msg" style="margin-top:14px;font-size:11px;color:var(--signal-amber)"></div>
 </aside>
 
 <footer class="keel">
@@ -502,6 +537,36 @@ async function refresh(){
     $("#lamp").classList.remove("ok"); $("#lamp-text").textContent="collector unreachable";
   }
 }
+// ——— settings ———
+const post=(route,body)=>fetch(route,{method:"POST",headers:{"content-type":"application/json","x-plimsoll-local":"1"},body:JSON.stringify(body)}).then(async r=>{const d=await r.json();if(!r.ok)throw new Error(d.error||r.status);return d});
+let settingsCache={accounts:[],priorityRepos:[],subscriptions:[]};
+async function loadSettings(){
+  settingsCache=await fetch("/api/settings").then(r=>r.json());
+  $("#s-accounts").innerHTML=settingsCache.accounts.map(a=>`<div class="srow">
+    <span class="hash">${short(a.accountHash)}</span>
+    <input value="${(a.label||"").replace(/"/g,"&quot;")}" data-hash="${a.accountHash}" style="flex:1">
+    <button class="btn" onclick="saveLabel(this)">save</button></div>`).join("")||'<div class="empty">accounts appear after their first session</div>';
+  $("#s-prio-list").innerHTML=settingsCache.priorityRepos.map(p=>`<div class="srow">
+    <span style="flex:1;color:var(--foam)">${p.url}</span>
+    <button class="btn" onclick="removePrio('${p.url}')">remove</button></div>`).join("")||'<div class="empty">no priority projects yet</div>';
+  $("#s-sub-account").innerHTML=settingsCache.accounts.map(a=>`<option value="${(a.label||a.accountHash).replace(/"/g,"&quot;")}">${a.label||short(a.accountHash)}</option>`).join("");
+  $("#s-subs").innerHTML=settingsCache.subscriptions.map((x,i)=>`<div class="srow">
+    <span style="flex:1">${x.account} · ${x.plan} · $${x.usdPerMonth}/mo</span>
+    <button class="btn" onclick="removeSub(${i})">remove</button></div>`).join("")||'<div class="empty">none — add one to see plan leverage</div>';
+}
+async function saveLabel(btn){const input=btn.previousElementSibling;
+  try{await post("/api/settings/account-label",{accountHash:input.dataset.hash,label:input.value});$("#s-msg").textContent="saved ✓";refresh();}catch(e){$("#s-msg").textContent=e.message}}
+async function removePrio(url){await post("/api/settings/priority",{action:"remove",url});loadSettings();refresh();}
+$("#s-prio-add").onclick=async()=>{try{await post("/api/settings/priority",{url:$("#s-prio-url").value});$("#s-prio-url").value="";$("#s-msg").textContent="priority added ✓";loadSettings();refresh();}catch(e){$("#s-msg").textContent=e.message}};
+async function removeSub(i){const subs=settingsCache.subscriptions.filter((_,j)=>j!==i);await post("/api/settings/subscriptions",{subscriptions:subs});loadSettings();refresh();}
+$("#s-sub-add").onclick=async()=>{try{
+  const subs=[...settingsCache.subscriptions,{account:$("#s-sub-account").value,plan:$("#s-sub-plan").value||"Plan",usdPerMonth:Number($("#s-sub-usd").value||0),vendor:"other"}];
+  await post("/api/settings/subscriptions",{subscriptions:subs});$("#s-msg").textContent="subscription saved ✓";loadSettings();refresh();
+}catch(e){$("#s-msg").textContent=e.message}};
+$("#open-settings").onclick=()=>{loadSettings();$("#settings").classList.add("open");$("#veil").classList.add("show")};
+$("#settings-close").onclick=()=>{$("#settings").classList.remove("open");$("#veil").classList.remove("show")};
+const veilClose=$("#veil").onclick;$("#veil").onclick=()=>{veilClose&&veilClose();$("#settings").classList.remove("open")};
+
 railTicks(); refresh(); setInterval(refresh, 30000);
 window.addEventListener("resize",()=>refresh());
 </script>

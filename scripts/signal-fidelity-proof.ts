@@ -239,6 +239,7 @@ function createTempGitRepo(baseDir: string) {
 
 async function main() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "wi-signal-fidelity-"));
+  process.env.PLIMSOLL_HOME = tempDir; // keep config writes off the real machine
   const bufferPath = path.join(tempDir, "work-ledger.sqlite");
   const buffer = new LocalEventBuffer(bufferPath);
   const config = collectorConfigSchema.parse({});
@@ -301,6 +302,51 @@ async function main() {
   );
   await postJson(port, "/v1/logs", codexLinkageEnvelope, { "x-plimsoll-source": "codex" });
 
+  // Settings writes: CSRF-guarded, then a full non-technical roundtrip.
+  const noHeader = await fetch(`http://127.0.0.1:${port}/api/settings/priority`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ url: "https://github.com/evil/evil" }),
+  });
+  const evilOrigin = await fetch(`http://127.0.0.1:${port}/api/settings/priority`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "x-plimsoll-local": "1",
+      origin: "https://evil.example",
+    },
+    body: JSON.stringify({ url: "https://github.com/evil/evil" }),
+  });
+  check(
+    "settings_writes_csrf_guarded",
+    noHeader.status === 403 && evilOrigin.status === 403,
+    `no-header=${noHeader.status} evil-origin=${evilOrigin.status}`,
+  );
+
+  const localHeaders = { "content-type": "application/json", "x-plimsoll-local": "1" };
+  await fetch(`http://127.0.0.1:${port}/api/settings/priority`, {
+    method: "POST",
+    headers: localHeaders,
+    body: JSON.stringify({ url: "https://github.com/Proof-Owner/Other-Repo" }),
+  });
+  await fetch(`http://127.0.0.1:${port}/api/settings/subscriptions`, {
+    method: "POST",
+    headers: localHeaders,
+    body: JSON.stringify({
+      subscriptions: [{ account: "Proof Person", plan: "Max", usdPerMonth: 200, vendor: "anthropic" }],
+    }),
+  });
+  const settingsState = (await fetch(`http://127.0.0.1:${port}/api/settings`).then((r) => r.json())) as {
+    priorityRepos: Array<{ url: string }>;
+    subscriptions: Array<{ plan: string }>;
+  };
+  check(
+    "settings_roundtrip_no_cli",
+    settingsState.priorityRepos.some((row) => row.url === "github.com/proof-owner/other-repo") &&
+      settingsState.subscriptions.some((row) => row.plan === "Max"),
+    JSON.stringify({ prio: settingsState.priorityRepos.length, subs: settingsState.subscriptions.length }),
+  );
+
   // Dashboard: the display surface reads the same ledger it serves.
   const dashHtml = await fetch(`http://127.0.0.1:${port}/`).then((r) => r.text());
   const dashSummary = (await fetch(`http://127.0.0.1:${port}/api/summary`).then((r) => r.json())) as {
@@ -311,7 +357,7 @@ async function main() {
   ).then((r) => r.json())) as { rollup: Record<string, unknown>; receipts: { linkage: unknown[] } };
   check(
     "dashboard_served_locally",
-    dashHtml.includes("Plimsoll") && dashHtml.includes("Receipts"),
+    dashHtml.includes("Plimsoll") && dashHtml.includes("Receipts") && dashHtml.includes("settings"),
     "GET / returns the instrument panel",
   );
   check(
