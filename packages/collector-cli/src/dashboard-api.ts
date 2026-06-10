@@ -277,6 +277,7 @@ export function dashboardAccounts(
       )
       select s.accountHash,
         (select label from account_labels where account_hash = s.accountHash) as label,
+        (select email from account_labels where account_hash = s.accountHash) as email,
         group_concat(distinct s.machines) as machines,
         count(*) as sessions,
         sum(case when p.repo_hash is not null then s.costUsd else 0 end) as priorityUsd,

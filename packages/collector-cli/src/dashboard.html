@@ -355,8 +355,9 @@ tr.row:focus-visible{background:rgba(35,137,167,.12)}
   <h2 style="font-size:10px;letter-spacing:.24em;color:var(--foam-faint);text-transform:uppercase">Settings</h2>
   <div class="sid">stored on this machine only — labels and lists never upload</div>
 
-  <h3>Account names</h3>
+  <h3>Account names &amp; emails</h3>
   <div id="s-accounts" style="display:grid;gap:8px"></div>
+  <div id="s-detected" class="hash" style="margin-top:8px;font-size:10px"></div>
 
   <h3>Priority projects</h3>
   <div style="display:flex;gap:8px;margin-bottom:10px">
@@ -583,7 +584,7 @@ async function refresh(){
         <dt>other repos</dt><dd>${usd(b.otherUsd)}</dd><dt>unlinked</dt><dd>${usd(b.unlinkedUsd)}</dd>`;
     }
     rows("#t-accounts","#e-accounts",(acct.accounts||[]).filter(a=>a.accountHash),a=>`<tr>
-      <td class="wide"><button class="linkish" onclick="openSettingsDrawer()" title="click to relabel" aria-label="relabel accounts — opens settings">${a.label??`<span class="hash">${short(a.accountHash)}</span>`} <span class="hash" aria-hidden="true">✎</span></button></td>
+      <td class="wide"><button class="linkish" onclick="openSettingsDrawer()" title="click to relabel" aria-label="relabel accounts — opens settings">${a.label??`<span class="hash">${short(a.accountHash)}</span>`}${a.email?` <span class="hash">· ${a.email}</span>`:""} <span class="hash" aria-hidden="true">✎</span></button></td>
       <td class="hash">${(a.machines||[]).join(", ")||"·"}</td>
       <td class="num">${fmt(a.sessions)}</td>
       <td class="num">${usd(a.priorityUsd)}</td><td class="num">${usd(a.otherUsd)}</td>
@@ -616,14 +617,17 @@ async function loadSettings(){
   const canonicals=settingsCache.accounts.filter(a=>!aliasMap[a.accountHash]);
   $("#s-accounts").innerHTML=settingsCache.accounts.map(a=>{
     const mergedInto=aliasMap[a.accountHash];
-    return `<div class="srow">
+    return `<div class="srow" style="flex-wrap:wrap">
     <span class="hash">${short(a.accountHash)}</span>
-    <input aria-label="display name for account ${short(a.accountHash)}" value="${(a.label||"").replace(/"/g,"&quot;")}" data-hash="${a.accountHash}" style="flex:1">
-    <button class="btn" onclick="saveLabel(this)">save</button>
+    <input aria-label="display name for account ${short(a.accountHash)}" value="${(a.label||"").replace(/"/g,"&quot;")}" data-hash="${a.accountHash}" data-field="label" style="flex:1;min-width:120px">
+    <input aria-label="email tied to account ${short(a.accountHash)} (stored on this machine only)" type="email" placeholder="email (local-only)" value="${(a.email||"").replace(/"/g,"&quot;")}" data-hash="${a.accountHash}" data-field="email" style="flex:1;min-width:150px">
+    <button class="btn" onclick="saveAccountRow('${a.accountHash}')">save</button>
     ${mergedInto
       ?`<span class="hash" title="events under this identity display as ${acctLabel(mergedInto)}">→ ${acctLabel(mergedInto)}</span><button class="btn" onclick="unmergeAccount('${a.accountHash}')">unmerge</button>`
       :`<select aria-label="merge account ${short(a.accountHash)} into" onchange="mergeAccount('${a.accountHash}',this.value)"><option value="">same person as…</option>${canonicals.filter(c=>c.accountHash!==a.accountHash).map(c=>`<option value="${c.accountHash}">${acctLabel(c.accountHash)}</option>`).join("")}</select>`}
     </div>`}).join("")||'<div class="empty">accounts appear after their first session</div>';
+  const det=(settingsCache.detectedIdentities||[]).filter(d=>d.email);
+  $("#s-detected").innerHTML=det.length?`detected on this machine: ${det.map(d=>`<b style="color:var(--foam-dim)">${d.email}</b> (${d.source==="claude_code"?"Claude Code":"Codex"}${d.planType?` · ${d.planType}`:""})`).join(" · ")} — paste into the matching row`:"";
   $("#s-prio-list").innerHTML=settingsCache.priorityRepos.map(p=>`<div class="srow">
     <span style="flex:1;color:var(--foam)">${p.url}</span>
     <button class="btn" onclick="removePrio('${p.url}')">remove</button></div>`).join("")||'<div class="empty">no priority projects yet</div>';
@@ -632,7 +636,14 @@ async function loadSettings(){
     <span style="flex:1">${x.account} · ${x.plan} · $${x.usdPerMonth}/mo</span>
     <button class="btn" onclick="removeSub(${i})">remove</button></div>`).join("")||'<div class="empty">none — add one to see plan leverage</div>';
 }
-async function saveLabel(btn){const input=btn.previousElementSibling;
+async function saveAccountRow(hash){
+  const label=document.querySelector(`input[data-hash="${hash}"][data-field="label"]`).value;
+  const email=document.querySelector(`input[data-hash="${hash}"][data-field="email"]`).value;
+  try{
+    if(label)await post("/api/settings/account-label",{accountHash:hash,label});
+    await post("/api/settings/account-email",{accountHash:hash,email});
+    $("#s-msg").textContent="saved \u2713";loadSettings();refresh();
+  }catch(e){$("#s-msg").textContent=e.message}}
   try{await post("/api/settings/account-label",{accountHash:input.dataset.hash,label:input.value});$("#s-msg").textContent="saved ✓";refresh();}catch(e){$("#s-msg").textContent=e.message}}
 async function mergeAccount(aliasHash,canonicalHash){if(!canonicalHash)return;try{await post("/api/settings/account-merge",{aliasHash,canonicalHash});$("#s-msg").textContent="identities merged \u2713";loadSettings();refresh();}catch(e){$("#s-msg").textContent=e.message}}
 async function unmergeAccount(aliasHash){try{await post("/api/settings/account-merge",{aliasHash,action:"remove"});$("#s-msg").textContent="unmerged \u2713";loadSettings();refresh();}catch(e){$("#s-msg").textContent=e.message}}

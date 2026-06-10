@@ -83,7 +83,7 @@ export function isProtectedMetadataFieldName(field: string) {
   return protectedMetadataFields.has(normalizeFieldName(field));
 }
 
-function hashProtectedValue(value: unknown) {
+export function hashProtectedValue(value: unknown) {
   const serialized =
     typeof value === "string" || typeof value === "number" || typeof value === "boolean"
       ? String(value)

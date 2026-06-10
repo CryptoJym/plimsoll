@@ -130,6 +130,16 @@ export class LocalEventBuffer {
         this.db.exec(`alter table buffered_events add column ${definition}`);
       }
     }
+    // Accounts are tied to emails (issue 0028). LOCAL-ONLY like labels:
+    // structurally excluded from uploads, proof-enforced.
+    const labelColumns = new Set(
+      (this.db.pragma("table_info(account_labels)") as Array<{ name: string }>).map(
+        (column) => column.name,
+      ),
+    );
+    if (!labelColumns.has("email")) {
+      this.db.exec(`alter table account_labels add column email text`);
+    }
   }
 
   append(event: AiInteractionEvent, suppressedFields: string[] = []) {
@@ -225,6 +235,23 @@ export class LocalEventBuffer {
     return this.db
       .prepare(`select repo_hash as repoHash, url, added_at as addedAt from priority_repos order by added_at`)
       .all() as Array<{ repoHash: string; url: string; addedAt: string }>;
+  }
+
+  /**
+   * Local-only: the email an account is tied to. Never included in upload
+   * batches (same boundary as labels). Empty string clears it. Inserts a
+   * label row if the account has never been seen, so an email can be staged
+   * before its first event.
+   */
+  setAccountEmail(accountHash: string, email: string) {
+    const trimmed = email.trim().slice(0, 120);
+    this.db
+      .prepare(
+        `insert into account_labels (account_hash, label, auto_seeded, first_seen, email)
+         values (@accountHash, @accountHash, 1, @now, @email)
+         on conflict(account_hash) do update set email = @email`,
+      )
+      .run({ accountHash, email: trimmed || null, now: new Date().toISOString() });
   }
 
   /** Local-only display mapping; never included in upload batches. */

@@ -4,6 +4,7 @@ import path from "node:path";
 
 import type { LocalEventBuffer } from "./buffer";
 import { resolveGitContext } from "./git-context";
+import { readLocalIdentities, type LocalIdentity, type LocalIdentityPaths } from "./local-identity";
 import { deterministicEventId } from "./normalizer";
 import {
   aiInteractionEventSchema,
@@ -87,6 +88,7 @@ export class RolloutTailer {
   constructor(
     private readonly buffer: LocalEventBuffer,
     private readonly sessionsDir = path.join(os.homedir(), ".codex", "sessions"),
+    private readonly identityProvider: () => LocalIdentity[] = readLocalIdentities,
   ) {
     // Scan state persists in the ledger: 2,669 historical files (March–June
     // 2026) existed at first deploy, and re-reading gigabytes on every daemon
@@ -101,6 +103,8 @@ export class RolloutTailer {
       )`,
     );
   }
+
+  private codexIdentity: LocalIdentity | undefined;
 
   private parsedSize(file: string): number | undefined {
     const row = this.buffer.database
@@ -178,6 +182,14 @@ export class RolloutTailer {
       parseErrors: 0,
       repriced: this.repriceUnpriced(),
     };
+    try {
+      this.codexIdentity = this.identityProvider().find((entry) => entry.source === "codex");
+    } catch {
+      this.codexIdentity = undefined;
+    }
+    if (this.codexIdentity?.actorHash && this.codexIdentity.email) {
+      this.buffer.setAccountEmail(this.codexIdentity.actorHash, this.codexIdentity.email);
+    }
     for (const file of this.discover(options)) {
       result.filesSeen += 1;
       let size: number;
@@ -250,6 +262,7 @@ export class RolloutTailer {
       return;
     }
     let cwd: string | undefined;
+    let sessionStartedAt: string | undefined;
     let originator: string | undefined;
     let cliVersion: string | undefined;
     let model: string | undefined;
@@ -282,6 +295,8 @@ export class RolloutTailer {
         if (typeof payload.id === "string" && UUID_RE.test(payload.id)) {
           conversationId = payload.id.toLowerCase();
         }
+        if (typeof parsed.timestamp === "string") sessionStartedAt = parsed.timestamp;
+        else if (typeof payload.timestamp === "string") sessionStartedAt = payload.timestamp as string;
         if (typeof payload.cwd === "string") cwd = payload.cwd;
         if (typeof payload.originator === "string") originator = payload.originator;
         if (typeof payload.cli_version === "string") cliVersion = payload.cli_version;
@@ -318,6 +333,17 @@ export class RolloutTailer {
     if (git?.remoteUrlHash && git.remoteLabel) {
       this.buffer.recordRepoLabel(git.remoteUrlHash, git.remoteLabel); // local-only table
     }
+    // Identity window: only sessions that started at/after the current
+    // login's last_refresh provably ran under this account. History stays
+    // unattributed rather than guessed (issue 0028).
+    const identity = this.codexIdentity;
+    const actorId =
+      identity?.actorHash &&
+      identity.validFrom &&
+      sessionStartedAt &&
+      Date.parse(sessionStartedAt) >= Date.parse(identity.validFrom)
+        ? identity.actorHash
+        : undefined;
     const fallbackObservedAt = (() => {
       try {
         return fs.statSync(file).mtime.toISOString();
@@ -360,6 +386,7 @@ export class RolloutTailer {
         dataMode: "metadata",
         eventType: "usage_rollout",
         observedAt: entry.observedAt ?? fallbackObservedAt,
+        actorId,
         sessionId: conversationId,
         model: entry.model,
         actionClass: "other",
