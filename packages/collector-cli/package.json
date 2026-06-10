@@ -1,13 +1,30 @@
 {
-  "name": "@plimsoll/collector",
+  "name": "@plimsoll/cli",
   "version": "0.1.0",
-  "private": true,
+  "description": "Plimsoll \u2014 the load line for your AI spend. Local-first telemetry collector + dashboard for Claude Code & Codex.",
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/CryptoJym/plimsoll.git",
+    "directory": "packages/collector-cli"
+  },
   "type": "module",
   "bin": {
-    "cfo-one-collector": "./src/cli.ts"
+    "plimsoll": "./dist/cli.mjs"
   },
-  "exports": {
-    ".": "./src/index.ts"
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
   },
-  "license": "Apache-2.0"
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "build": "esbuild src/cli.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/cli.mjs --external:better-sqlite3 && cp src/dashboard.html dist/dashboard.html && chmod +x dist/cli.mjs"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.10.0"
+  }
 }

@@ -1,7 +1,9 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+import readline from "node:readline/promises";
 
 import { LocalEventBuffer } from "./buffer";
 import {
@@ -25,6 +27,8 @@ import { computeCaptureHealth } from "./health";
 import { RolloutTailer } from "./rollout-tailer";
 import { createCollectorServer } from "./server";
 import {
+  applyClaudeSettings,
+  applyCodexConfig,
   generateClaudeCodeSettings,
   generateCodexConfigToml,
   generateSetupInstructions,
@@ -54,6 +58,7 @@ Commands:
   forward-hook SOURCE   Read hook JSON from stdin and append it without requiring the receiver
   self-test-hook SOURCE Emit one synthetic hook event into the local buffer
   generate-config TOOL  Print Claude Code or Codex config for metadata collection
+  setup                 APPLY the Claude Code + Codex telemetry config (idempotent; --yes, --dry-run)
   upload                Drain un-uploaded events to the tenant ingest API (marks rows, keeps local copies)
   scan-rollouts         Read codex rollout files into the ledger once (full history walk)
   install-launch-agent  Write the user LaunchAgent plist
@@ -501,6 +506,75 @@ async function main() {
     return;
   }
 
+  if (command === "setup") {
+    // Config apply mode (issue 0003): the no-terminal path still exists via
+    // the dashboard; this is the one command an installer runs. Surgical
+    // merges with backups; second run reports no-op.
+    const argValue = (name: string) => {
+      const index = process.argv.indexOf(name);
+      return index === -1 ? undefined : process.argv[index + 1];
+    };
+    const yes = process.argv.includes("--yes");
+    const dryRun = process.argv.includes("--dry-run");
+    const claudeFile = argValue("--claude-settings") ?? path.join(os.homedir(), ".claude", "settings.json");
+    const codexFile = argValue("--codex-config") ?? path.join(os.homedir(), ".codex", "config.toml");
+    const toolOptions = {
+      repoRoot: process.cwd(),
+      port: config.port,
+      dataMode: config.policy.dataMode,
+    };
+    const claudeGenerated = generateClaudeCodeSettings(toolOptions);
+    const codexToml = generateCodexConfigToml(toolOptions);
+
+    const planClaude = applyClaudeSettings(claudeFile, claudeGenerated, { dryRun: true });
+    const planCodex = applyCodexConfig(codexFile, codexToml, { dryRun: true });
+    for (const plan of [planClaude, planCodex]) {
+      for (const change of plan.changes) console.log(`${plan.path}: ${change}`);
+      if (plan.conflict) console.warn(`${plan.path}: ${plan.conflict}`);
+    }
+    if (!planClaude.changed && !planCodex.changed) {
+      console.log(JSON.stringify({ status: "setup_noop", claude: claudeFile, codex: codexFile, conflict: planCodex.conflict ?? null }));
+      return;
+    }
+    if (dryRun) {
+      console.log(JSON.stringify({ status: "setup_dry_run", wouldChange: [planClaude, planCodex].filter((plan) => plan.changed).map((plan) => plan.path) }));
+      return;
+    }
+    if (!yes) {
+      if (!process.stdin.isTTY) {
+        console.error("Refusing to write config without confirmation. Re-run with --yes (or --dry-run to preview).");
+        process.exitCode = 1;
+        return;
+      }
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      const answer = (await rl.question("Apply these changes? Backups are written first. [y/N] ")).trim().toLowerCase();
+      rl.close();
+      if (answer !== "y" && answer !== "yes") {
+        console.log("Nothing written.");
+        return;
+      }
+    }
+    const resultClaude = applyClaudeSettings(claudeFile, claudeGenerated);
+    const resultCodex = applyCodexConfig(codexFile, codexToml);
+    console.log(
+      JSON.stringify(
+        {
+          status: "setup_applied",
+          claude: { path: resultClaude.path, changed: resultClaude.changed, backup: resultClaude.backupPath ?? null },
+          codex: { path: resultCodex.path, changed: resultCodex.changed, backup: resultCodex.backupPath ?? null, conflict: resultCodex.conflict ?? null },
+          nextSteps: [
+            "plimsoll install-launch-agent && plimsoll load-launch-agent",
+            "open http://127.0.0.1:" + config.port + "/",
+            "restart any running Claude Code / Codex sessions so they pick up telemetry",
+          ],
+        },
+        null,
+        2,
+      ),
+    );
+    return;
+  }
+
   if (command === "scan-rollouts") {
     const buffer = openBuffer();
     const result = await new RolloutTailer(buffer).scan({ recentOnly: false });
@@ -724,9 +798,14 @@ async function main() {
   }
 
   if (command === "install-launch-agent") {
+    // Packaged installs (bundled dist/cli.mjs) exec node+script directly; the
+    // dev working tree keeps the pnpm form.
+    const runningScript = process.argv[1] ?? "";
+    const packaged = /\.(mjs|cjs|js)$/.test(runningScript);
     const plistPath = installLaunchAgent({
       repoRoot: optionValue("--repo-root") ?? process.cwd(),
       pnpmPath: optionValue("--pnpm") ?? "pnpm",
+      programArguments: packaged ? [process.execPath, runningScript, "start"] : undefined,
     });
     console.log(
       JSON.stringify(

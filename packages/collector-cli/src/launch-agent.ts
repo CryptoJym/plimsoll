@@ -11,6 +11,9 @@ export type LaunchAgentOptions = {
   repoRoot: string;
   pnpmPath?: string;
   label?: string;
+  /** Packaged installs (npx/npm -g) exec the bundled cli directly instead of
+   * pnpm-in-a-working-tree. */
+  programArguments?: string[];
 };
 
 function escapeXml(value: string) {
@@ -39,7 +42,7 @@ export function renderLaunchAgentPlist(options: LaunchAgentOptions) {
   const label = options.label ?? LAUNCH_AGENT_LABEL;
   const pnpmPath = options.pnpmPath ?? "pnpm";
   const logDirectory = collectorHome(homeDir);
-  const programArguments = [pnpmPath, "--dir", options.repoRoot, "collector", "start"];
+  const programArguments = options.programArguments ?? [pnpmPath, "--dir", options.repoRoot, "collector", "start"];
   const inheritedPathEntries = (process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
   const pathEntries = [
     ...inheritedPathEntries,
