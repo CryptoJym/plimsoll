@@ -190,6 +190,7 @@ function buildLogEvent(
   const sessionId = stringField(attrs, [...usageFieldKeys.sessionId]);
 
   const event = aiInteractionEventSchema.parse({
+    actorId: stringField(attrs, [...usageFieldKeys.actorId]),
     id: deterministicEventId([
       context.source,
       otelEventName,
@@ -266,6 +267,7 @@ function buildSpanEvent(
   }
 
   const event = aiInteractionEventSchema.parse({
+    actorId: stringField(attrs, [...usageFieldKeys.actorId]),
     id: deterministicEventId([
       context.source,
       "span",
