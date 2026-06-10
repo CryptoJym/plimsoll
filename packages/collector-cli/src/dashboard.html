@@ -576,7 +576,9 @@ async function refresh(){
       const [name,tilde]=vendors[v.source]||[v.source,""];
       return `<dt>${name}</dt><dd><b>${tilde}${usd(v.costUsd)}</b> · ${fmt(v.sessions)} sess</dd>`;
     }).join("")||"";
-    rows("#t-repos","#e-repos",(Array.isArray(repos)?repos:[]).filter(r=>r.repoHash),r=>`<tr class="row" tabindex="0" onkeydown="rk(event)" onclick="openRepo('${r.repoHash}')"><td class="wide" title="${r.label||short(r.repoHash)}">${r.label?`<span style="color:var(--foam)">${r.label}</span>`:`<span class="hash">${short(r.repoHash)}</span>`}</td><td class="num">${fmt(r.sessions)}</td><td class="num">${fmt(r.inputTokens+r.outputTokens)}</td><td class="num brass">${usd(r.costUsd)}</td></tr>`);
+    rows("#t-repos","#e-repos",(Array.isArray(repos)?repos:[]).filter(r=>r.repoHash),r=>r.repoHash==="__tail__"
+      ?`<tr><td class="wide hash" title="${r.label}">${r.label}</td><td class="num">${fmt(r.sessions)}</td><td class="num">${fmt(r.inputTokens+r.outputTokens)}</td><td class="num brass">${usd(r.costUsd)}</td></tr>`
+      :`<tr class="row" tabindex="0" onkeydown="rk(event)" onclick="openRepo('${r.repoHash}')"><td class="wide" title="${r.label||short(r.repoHash)}">${r.label?`<span style="color:var(--foam)">${r.label}</span>`:`<span class="hash">${short(r.repoHash)}</span>`}</td><td class="num">${fmt(r.sessions)}</td><td class="num">${fmt(r.inputTokens+r.outputTokens)}</td><td class="num brass">${usd(r.costUsd)}</td></tr>`);
     $("#prio-count").textContent=acct.priorityRepoCount??0;
     const b=acct.buckets||{};
     if((b.priorityUsd+b.otherUsd+b.unlinkedUsd)>0){
