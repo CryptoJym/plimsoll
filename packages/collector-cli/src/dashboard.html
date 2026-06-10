@@ -522,7 +522,7 @@ async function refresh(){
     gauge(pct);
     $("#cov-note").textContent=`${fmt(t.sessionsWithTokens)} of ${fmt(t.sessions)} sessions carry token telemetry`;
     drawSpark(s.daily);
-    rows("#t-models","#e-models",s.byModel,m=>`<tr><td class="wide" title="${m.model}">${m.model}</td><td class="num">${fmt(m.calls)}</td><td class="num">${fmt(m.inputTokens)}</td><td class="num">${fmt(m.outputTokens)}</td><td class="num brass">${usd(m.costUsd)}</td></tr>`);
+    rows("#t-models","#e-models",s.byModel,m=>`<tr><td class="wide" title="${m.model}">${m.model}</td><td class="num">${fmt(m.calls)}</td><td class="num">${fmt(m.inputTokens)}</td><td class="num">${fmt(m.outputTokens)}</td><td class="num brass">${m.unpricedCalls>0&&!m.costUsd?'<span class="hash" title="no vendor rate on file — tokens counted, cost unknown">unpriced</span>':usd(m.costUsd)+(m.unpricedCalls>0?'<span class="hash" title="some calls have no vendor rate — shown cost is a floor">+</span>':"")}</td></tr>`);
     const vendors={claude_code:["Anthropic · Claude Code",""],codex:["OpenAI · Codex"," ~"]};
     $("#kv-vendors").innerHTML=(s.bySource||[]).filter(v=>v.costUsd>0||v.events>0).map(v=>{
       const [name,tilde]=vendors[v.source]||[v.source,""];

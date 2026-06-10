@@ -55,6 +55,7 @@ import {
 } from "../packages/collector-cli/src/dashboard-api";
 import { computeCaptureHealth } from "../packages/collector-cli/src/health";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
+import { MODEL_PRICING } from "../packages/shared/src/pricing";
 
 type Check = { name: string; passed: boolean; detail: string };
 
@@ -617,6 +618,18 @@ async function main() {
                     otelAttr("request_id", "req_proof_straddle"),
                   ],
                 },
+                {
+                  timeUnixNano: "1781400008000000000",
+                  body: { stringValue: "claude_code.api_request" },
+                  attributes: [
+                    otelAttr("event.name", "api_request"),
+                    otelAttr("session.id", "99999999-8888-4777-8666-555555555555"),
+                    otelAttr("model", "proof-unknown-model"),
+                    otelAttr("input_tokens", 5000),
+                    otelAttr("output_tokens", 700),
+                    otelAttr("request_id", "req_proof_unpriced"),
+                  ],
+                },
               ],
             },
           ],
@@ -700,6 +713,14 @@ async function main() {
     accountsAfterStraddle.buckets.priorityUsd +
     accountsAfterStraddle.buckets.otherUsd +
     accountsAfterStraddle.buckets.unlinkedUsd;
+  const unpricedRow = (summaryView.byModel as Array<Record<string, unknown>>).find(
+    (row) => row.model === "proof-unknown-model",
+  );
+  check(
+    "unpriced_model_distinguished_from_free",
+    Boolean(unpricedRow && Number(unpricedRow.unpricedCalls) >= 1 && Number(unpricedRow.costUsd) === 0),
+    JSON.stringify(unpricedRow ?? { missing: true }),
+  );
   check(
     "cross_view_costs_reconcile",
     Math.abs(bySourceCost - totalsCost) < 1e-3 &&
@@ -945,6 +966,60 @@ async function main() {
     afterRescan.n === 2 && afterRescan.input === 3000 && rescan.sessionsSkippedOtlpCovered >= 1,
     JSON.stringify({ rows: afterRescan.n, input: afterRescan.input }),
   );
+  // Rate-table updates must heal existing rows: a model unpriced at ingest
+  // gains cost the moment its rate lands (issue 0025 / GH #32). Only
+  // null-cost rows are touched.
+  const UNPRICED_SESSION = "019e2222-3333-7444-8555-666666666666";
+  fs.writeFileSync(
+    path.join(rolloutDay, `rollout-2026-06-10T12-00-00-${UNPRICED_SESSION}.jsonl`),
+    [
+      rolloutLine("2026-06-10T12:00:00.000Z", "session_meta", { id: UNPRICED_SESSION, cwd: proofRepo.repoDir }),
+      rolloutLine("2026-06-10T12:00:01.000Z", "turn_context", { turn_id: "t-u", model: "proof-unpriceable-model" }),
+      tokenCountLine("2026-06-10T12:00:10.000Z", {
+        input_tokens: 800,
+        cached_input_tokens: 0,
+        output_tokens: 90,
+        reasoning_output_tokens: 0,
+        total_tokens: 890,
+      }),
+    ].join("\n") + "\n",
+  );
+  const unpricedScan = new RolloutTailer(buffer, rolloutDir).scan();
+  const unpricedBefore = buffer.database
+    .prepare(`select cost_usd as cost from buffered_events where session_id = ? and event_type = 'usage_rollout'`)
+    .get(UNPRICED_SESSION) as { cost: number | null } | undefined;
+  MODEL_PRICING["proof-unpriceable-model"] = {
+    input: 1.0,
+    cachedInput: 0.1,
+    output: 10.0,
+    vendor: "openai",
+    asOf: "proof",
+  };
+  const repriceScan = new RolloutTailer(buffer, rolloutDir).scan();
+  delete MODEL_PRICING["proof-unpriceable-model"];
+  const unpricedAfter = buffer.database
+    .prepare(
+      `select cost_usd as cost, payload_json as payload from buffered_events
+       where session_id = ? and event_type = 'usage_rollout'`,
+    )
+    .get(UNPRICED_SESSION) as { cost: number | null; payload: string } | undefined;
+  check(
+    "rate_table_update_reprices_null_cost_rows",
+    Boolean(
+      unpricedScan.eventsAppended >= 1 &&
+        unpricedBefore?.cost == null &&
+        repriceScan.repriced >= 1 &&
+        unpricedAfter?.cost != null &&
+        unpricedAfter.cost > 0 &&
+        unpricedAfter.payload.includes('"costEstimated":true'),
+    ),
+    JSON.stringify({
+      before: unpricedBefore?.cost ?? null,
+      repriced: repriceScan.repriced,
+      after: unpricedAfter?.cost ?? null,
+    }),
+  );
+
   const codexPersisted = JSON.stringify(
     buffer.database.prepare(`select payload_json from buffered_events where source = 'codex'`).all(),
   );

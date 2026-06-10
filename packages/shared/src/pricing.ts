@@ -20,6 +20,10 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   "gpt-5.5": { input: 5.0, cachedInput: 0.5, output: 30.0, vendor: "openai", asOf: "2026-06-10" },
   "gpt-5.4": { input: 2.5, cachedInput: 0.25, output: 15.0, vendor: "openai", asOf: "2026-06-10" },
   "gpt-5.3-codex": { input: 1.75, cachedInput: 0.175, output: 14.0, vendor: "openai", asOf: "2026-06-10" },
+  // Superseded frontier model; rate from its own model page (snapshot
+  // gpt-5.2-2025-12-11), fetched 2026-06-10. The rollout backfill surfaced
+  // 12.5M unpriced tokens on it (issue 0025 / GH #32).
+  "gpt-5.2": { input: 1.75, cachedInput: 0.175, output: 14.0, vendor: "openai", asOf: "2026-06-10" },
 };
 
 export function priceForModel(model: string | undefined): ModelPrice | undefined {
