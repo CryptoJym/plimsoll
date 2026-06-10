@@ -428,6 +428,21 @@ async function main() {
 
   // Dashboard: the display surface reads the same ledger it serves.
   const dashHtml = await fetch(`http://127.0.0.1:${port}/`).then((r) => r.text());
+  // The inline script must PARSE: a stray top-level await once killed every
+  // fresh page load while all API-level checks stayed green. new Function
+  // rejects top-level await exactly like a classic <script> does.
+  const inlineScript = dashHtml.split("<script>")[1]?.split("</" + "script>")[0] ?? "";
+  let scriptParseError: string | null = null;
+  try {
+    new Function(inlineScript);
+  } catch (error) {
+    scriptParseError = String(error);
+  }
+  check(
+    "dashboard_inline_script_parses",
+    inlineScript.length > 1000 && scriptParseError === null,
+    scriptParseError ?? `script length ${inlineScript.length}`,
+  );
   const dashSummary = (await fetch(`http://127.0.0.1:${port}/api/summary`).then((r) => r.json())) as {
     totals: Record<string, number>;
   };
