@@ -179,10 +179,31 @@ export function dashboardRepos(db: Database.Database, days = 30) {
         sum(a.costUsd) as costUsd
       from attributed a left join repo_labels l on l.repo_hash = a.repoHash
       group by a.repoHash
-      order by costUsd desc
-      limit 12`,
+      order by costUsd desc`,
     )
-    .all(since, since);
+    .all(since, since) as Array<Record<string, unknown> & { costUsd: number; sessions: number }>;
+}
+
+/**
+ * Top rows plus an aggregate tail — a money surface never silently truncates
+ * (caught live by the 0027 close-out gate: $380 of small repos vanished
+ * behind LIMIT 12).
+ */
+export function dashboardReposWithTail(db: Database.Database, days = 30, top = 12) {
+  const rows = dashboardRepos(db, days) as Array<Record<string, unknown> & { costUsd: number; sessions: number }>;
+  if (rows.length <= top) return rows;
+  const head = rows.slice(0, top - 1);
+  const tail = rows.slice(top - 1);
+  head.push({
+    repoHash: "__tail__",
+    label: `(${tail.length} more repositories)`,
+    sessions: tail.reduce((sum, row) => sum + Number(row.sessions ?? 0), 0),
+    branchRefs: 0,
+    inputTokens: tail.reduce((sum, row) => sum + Number(row.inputTokens ?? 0), 0),
+    outputTokens: tail.reduce((sum, row) => sum + Number(row.outputTokens ?? 0), 0),
+    costUsd: Number(tail.reduce((sum, row) => sum + Number(row.costUsd ?? 0), 0).toFixed(4)),
+  });
+  return head;
 }
 
 export function dashboardSessionDetail(db: Database.Database, sessionId: string) {

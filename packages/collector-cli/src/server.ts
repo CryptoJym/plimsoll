@@ -15,6 +15,7 @@ import {
   dashboardAccounts,
   dashboardRepoDetail,
   dashboardRepos,
+  dashboardReposWithTail,
   dashboardSessionDetail,
   dashboardSessions,
   dashboardSummary,
@@ -162,7 +163,7 @@ export function createCollectorServer(config: CollectorConfig, buffer: LocalEven
           return;
         }
         if (url.pathname === "/api/repos") {
-          sendJson(response, dashboardRepos(buffer.database, days));
+          sendJson(response, dashboardReposWithTail(buffer.database, days));
           return;
         }
         if (url.pathname === "/api/accounts") {
