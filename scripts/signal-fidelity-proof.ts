@@ -19,6 +19,9 @@
  *      reconcile to one total, and session attribution follows dominant
  *      cost — not lexicographic max(hash). (/api/sessions shipped a query
  *      SQLite rejects at run time; proof was green because nothing ran it.)
+ *  10. Capture health judges the ledger against local tool activity: idle is
+ *      green, a broken pipe is red within minutes, uncaptured/partial codex
+ *      coverage is red/amber. Silence must scream (G7, issue 0021).
  *
  * Run: pnpm plimsoll:signal-fidelity-proof
  */
@@ -47,6 +50,7 @@ import {
   dashboardSessions,
   dashboardSummary,
 } from "../packages/collector-cli/src/dashboard-api";
+import { computeCaptureHealth } from "../packages/collector-cli/src/health";
 
 type Check = { name: string; passed: boolean; detail: string };
 
@@ -700,6 +704,107 @@ async function main() {
       Math.abs(bucketsCost - sessionedCost) < 1e-3,
     JSON.stringify({ totalsCost, bySourceCost, sessionedCost, reposCost, accountsCost, bucketsCost }),
   );
+
+  // 10. Capture health: silence must scream (issue 0021). The baseline for
+  // "telemetry should be arriving" is LOCAL TOOL ACTIVITY (transcript and
+  // rollout files), so an idle machine stays green and a broken pipe goes red
+  // the moment the tools demonstrably run without the ledger hearing it.
+  const healthDir = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-health-"));
+  const healthNow = new Date("2026-06-10T12:00:00.000Z");
+  const minutesAgo = (m: number) => new Date(healthNow.getTime() - m * 60_000);
+  const touch = (file: string, when: Date) => {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, "{}\n");
+    fs.utimesSync(file, when, when);
+  };
+  const seedEvent = (
+    target: LocalEventBuffer,
+    id: string,
+    source: string,
+    observedAt: Date,
+    sessionId: string,
+    inputTokens: number | null,
+  ) =>
+    target.database
+      .prepare(
+        `insert into buffered_events (id, source, event_type, data_mode, observed_at,
+           payload_json, suppressed_fields_json, created_at, session_id, input_tokens)
+         values (?, ?, 'assistant_response', 'metadata', ?, '{}', '[]', ?, ?, ?)`,
+      )
+      .run(id, source, observedAt.toISOString(), healthNow.toISOString(), sessionId, inputTokens);
+  const healthOptsFor = (scenario: string) => ({
+    claudeProjectsDir: path.join(healthDir, scenario, "claude-projects"),
+    codexSessionsDir: path.join(healthDir, scenario, "codex-sessions"),
+    now: healthNow,
+  });
+
+  // Idle: no local activity, empty ledger → green ("quiet is expected").
+  const idleBuffer = new LocalEventBuffer(path.join(healthDir, "idle.sqlite"));
+  const idleHealth = computeCaptureHealth(idleBuffer.database, healthOptsFor("idle"));
+  check(
+    "capture_health_idle_is_green",
+    idleHealth.overall === "green",
+    JSON.stringify(idleHealth.sources.map((row) => [row.source, row.status])),
+  );
+
+  // Fresh: local activity minutes old, token-bearing events right behind it.
+  const freshOpts = healthOptsFor("fresh");
+  touch(path.join(freshOpts.claudeProjectsDir, "proj", "session-a.jsonl"), minutesAgo(4));
+  touch(path.join(freshOpts.codexSessionsDir, "2026/06/10", "rollout-a.jsonl"), minutesAgo(4));
+  const freshBuffer = new LocalEventBuffer(path.join(healthDir, "fresh.sqlite"));
+  seedEvent(freshBuffer, "h-claude-1", "claude_code", minutesAgo(2), "h-claude-sess", 100);
+  seedEvent(freshBuffer, "h-codex-1", "codex", minutesAgo(2), "h-codex-sess", 100);
+  const freshHealth = computeCaptureHealth(freshBuffer.database, freshOpts);
+  check(
+    "capture_health_fresh_is_green",
+    freshHealth.overall === "green" && freshHealth.sources.every((row) => row.status === "green"),
+    JSON.stringify(freshHealth.sources.map((row) => [row.source, row.status, row.reason])),
+  );
+
+  // Broken pipe: claude transcript touched 1 minute ago, ledger last heard 40
+  // minutes ago → red. Codex side: 3 rollouts today but only 1 token session
+  // → amber (the 2026-06-10 1-of-11 failure mode, issue 0022).
+  const gapOpts = healthOptsFor("gap");
+  touch(path.join(gapOpts.claudeProjectsDir, "proj", "session-b.jsonl"), minutesAgo(1));
+  for (const name of ["rollout-a", "rollout-b", "rollout-c"]) {
+    touch(path.join(gapOpts.codexSessionsDir, "2026/06/10", `${name}.jsonl`), minutesAgo(95));
+  }
+  const gapBuffer = new LocalEventBuffer(path.join(healthDir, "gap.sqlite"));
+  seedEvent(gapBuffer, "g-claude-1", "claude_code", minutesAgo(40), "g-claude-sess", 100);
+  seedEvent(gapBuffer, "g-codex-1", "codex", minutesAgo(95), "g-codex-sess", 100);
+  const gapHealth = computeCaptureHealth(gapBuffer.database, gapOpts);
+  const gapClaude = gapHealth.sources.find((row) => row.source === "claude_code");
+  const gapCodex = gapHealth.sources.find((row) => row.source === "codex");
+  check(
+    "capture_health_pipe_break_is_red",
+    gapHealth.overall === "red" &&
+      gapClaude?.status === "red" &&
+      gapClaude.reason.includes("not reaching"),
+    JSON.stringify({ claude: gapClaude?.reason }),
+  );
+  check(
+    "capture_health_partial_codex_coverage_is_amber",
+    gapCodex?.status === "amber" && gapCodex.reason.includes("only 1"),
+    JSON.stringify({ codex: gapCodex?.reason }),
+  );
+
+  // Total silence with activity: rollouts ran today, ledger heard nothing → red.
+  const silentOpts = healthOptsFor("silent");
+  touch(path.join(silentOpts.codexSessionsDir, "2026/06/10", "rollout-z.jsonl"), minutesAgo(90));
+  const silentBuffer = new LocalEventBuffer(path.join(healthDir, "silent.sqlite"));
+  const silentHealth = computeCaptureHealth(silentBuffer.database, silentOpts);
+  const silentCodex = silentHealth.sources.find((row) => row.source === "codex");
+  check(
+    "capture_health_uncaptured_sessions_are_red",
+    silentHealth.overall === "red" && silentCodex?.status === "red",
+    JSON.stringify({ codex: silentCodex?.reason }),
+  );
+
+  idleBuffer.close();
+  freshBuffer.close();
+  gapBuffer.close();
+  silentBuffer.close();
+  fs.rmSync(healthDir, { recursive: true, force: true });
 
   // 7. Upload watermark drains oldest-first against a stub ingest endpoint.
   const received: number[] = [];
