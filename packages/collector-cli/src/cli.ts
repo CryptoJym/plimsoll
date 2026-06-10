@@ -371,9 +371,9 @@ async function main() {
     // Codex usage truth rides rollout files (issue 0022): full walk on boot
     // (backfills any uncaptured history, idempotent), then a recent-days tail.
     const rolloutTailer = new RolloutTailer(buffer);
-    const runRolloutScan = (recentOnly: boolean) => {
+    const runRolloutScan = async (recentOnly: boolean) => {
       try {
-        const scanned = rolloutTailer.scan({ recentOnly });
+        const scanned = await rolloutTailer.scan({ recentOnly });
         if (scanned.eventsAppended > 0 || scanned.parseErrors > 0) {
           console.log(JSON.stringify({ status: "rollout_scan", recentOnly, ...scanned }));
         }
@@ -392,8 +392,8 @@ async function main() {
     // first-ever walk reads every historical rollout (2,669 files at first
     // deploy) and must not delay ingest. Later boots skip unchanged files
     // via rollout_scan_state, so the deferred walk is cheap from then on.
-    timers.push(setTimeout(() => runRolloutScan(false), 5_000));
-    timers.push(setInterval(() => runRolloutScan(true), 60 * 1000));
+    timers.push(setTimeout(() => void runRolloutScan(false), 5_000));
+    timers.push(setInterval(() => void runRolloutScan(true), 60 * 1000));
     timers.push(setInterval(runPrune, 6 * 60 * 60 * 1000));
     if (config.uploadUrl) {
       timers.push(setInterval(() => void runSync(), config.syncIntervalSeconds * 1000));
@@ -497,7 +497,7 @@ async function main() {
 
   if (command === "scan-rollouts") {
     const buffer = openBuffer();
-    const result = new RolloutTailer(buffer).scan({ recentOnly: false });
+    const result = await new RolloutTailer(buffer).scan({ recentOnly: false });
     console.log(JSON.stringify(result, null, 2));
     buffer.close();
     return;

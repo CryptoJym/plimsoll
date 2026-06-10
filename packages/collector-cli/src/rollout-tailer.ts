@@ -161,8 +161,14 @@ export class RolloutTailer {
     return repriced;
   }
 
-  /** recentOnly limits discovery to today+yesterday (UTC) day directories. */
-  scan(options: { recentOnly?: boolean; now?: Date } = {}): RolloutScanResult {
+  /**
+   * recentOnly limits discovery to today+yesterday (UTC) day directories.
+   * Async on purpose: the collector serves HTTP on the same event loop, and
+   * the first full-history walk reads thousands of files — yielding between
+   * files keeps the dashboard responsive while a scan runs (owner-reported
+   * freeze, sounding 0026).
+   */
+  async scan(options: { recentOnly?: boolean; now?: Date } = {}): Promise<RolloutScanResult> {
     const result: RolloutScanResult = {
       filesSeen: 0,
       filesParsed: 0,
@@ -183,6 +189,7 @@ export class RolloutTailer {
       if (this.parsedSize(file) === size) continue;
       this.ingestFile(file, result);
       this.rememberSize(file, size);
+      await new Promise((resolve) => setImmediate(resolve));
     }
     return result;
   }

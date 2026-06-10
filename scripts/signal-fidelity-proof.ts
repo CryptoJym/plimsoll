@@ -955,7 +955,7 @@ async function main() {
   );
 
   const tailer = new RolloutTailer(buffer, rolloutDir);
-  const firstScan = tailer.scan();
+  const firstScan = await tailer.scan();
   const rolloutRows = buffer.database
     .prepare(
       `select session_id as sessionId, model, input_tokens as inputTokens,
@@ -1004,7 +1004,7 @@ async function main() {
   // Clearing the persistent scan state forces a true re-parse — which must
   // not change counts or sums (deterministic ids + insert-or-replace).
   buffer.database.prepare(`delete from rollout_scan_state`).run();
-  const rescan = new RolloutTailer(buffer, rolloutDir).scan();
+  const rescan = await new RolloutTailer(buffer, rolloutDir).scan();
   const afterRescan = buffer.database
     .prepare(
       `select count(*) as n, coalesce(sum(input_tokens),0) as input from buffered_events
@@ -1034,7 +1034,7 @@ async function main() {
       }),
     ].join("\n") + "\n",
   );
-  const unpricedScan = new RolloutTailer(buffer, rolloutDir).scan();
+  const unpricedScan = await new RolloutTailer(buffer, rolloutDir).scan();
   const unpricedBefore = buffer.database
     .prepare(`select cost_usd as cost from buffered_events where session_id = ? and event_type = 'usage_rollout'`)
     .get(UNPRICED_SESSION) as { cost: number | null } | undefined;
@@ -1045,7 +1045,7 @@ async function main() {
     vendor: "openai",
     asOf: "proof",
   };
-  const repriceScan = new RolloutTailer(buffer, rolloutDir).scan();
+  const repriceScan = await new RolloutTailer(buffer, rolloutDir).scan();
   delete MODEL_PRICING["proof-unpriceable-model"];
   const unpricedAfter = buffer.database
     .prepare(
