@@ -31,8 +31,6 @@ import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
-import os from "node:os";
-
 import {
   branchLinkageHash,
   remoteLinkageHash,
