@@ -243,7 +243,7 @@ export function dashboardAccounts(
             planCostWindow,
             leverage:
               planCostWindow && planCostWindow > 0
-                ? Number((Number(row.totalUsd) / planCostWindow).toFixed(2))
+                ? Number((Number(row.totalUsd) / planCostWindow).toFixed(4))
                 : null,
           }
         : null,

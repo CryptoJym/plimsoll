@@ -290,6 +290,18 @@ a{color:var(--waterline)}
     </section>
 
     <section class="plate span12">
+      <h2>Accounts · who, where, and on what
+        <span style="letter-spacing:.05em;text-transform:none;color:var(--foam-faint);margin-left:auto">priority list: <span id="prio-count">0</span> repos · plimsoll priority add &lt;url&gt;</span>
+      </h2>
+      <table id="t-accounts"><thead><tr>
+        <th>account</th><th>machines</th><th class="num">sessions</th>
+        <th class="num">priority $</th><th class="num">other $</th><th class="num">unlinked $</th>
+        <th class="num">total $</th><th>plan</th><th class="num">leverage</th>
+      </tr></thead><tbody></tbody></table>
+      <div class="empty" id="e-accounts" hidden>no account-attributed sessions yet — new sessions carry account identity automatically</div>
+    </section>
+
+    <section class="plate span12">
       <h2>Sessions · click a row for its receipts
         <span style="letter-spacing:.05em;text-transform:none;color:var(--foam-faint);margin-left:auto">
           <span class="flag cc">CC</span> Claude Code &nbsp; <span class="flag cx">CX</span> Codex &nbsp; ~ computed cost</span>
@@ -437,11 +449,12 @@ $("#veil").onclick=$("#drawer-close").onclick;
 
 async function refresh(){
   try{
-    const [s,sess,repos,status]=await Promise.all([
+    const [s,sess,repos,status,acct]=await Promise.all([
       fetch("/api/summary").then(r=>r.json()),
       fetch("/api/sessions").then(r=>r.json()),
       fetch("/api/repos").then(r=>r.json()),
       fetch("/status").then(r=>r.json()),
+      fetch("/api/accounts").then(r=>r.json()),
     ]);
     $("#lamp").classList.add("ok"); $("#lamp-text").textContent="collecting";
     const t=s.totals;
@@ -459,6 +472,20 @@ async function refresh(){
       return `<dt>${name}</dt><dd><b>${tilde}${usd(v.costUsd)}</b> · ${fmt(v.sessions)} sess</dd>`;
     }).join("")||"";
     rows("#t-repos","#e-repos",repos.filter(r=>r.repoHash),r=>`<tr class="row" onclick="openRepo('${r.repoHash}')"><td>${r.label?`<span style="color:var(--foam)">${r.label}</span>`:`<span class="hash">${short(r.repoHash)}</span>`}</td><td class="num">${fmt(r.sessions)}</td><td class="num">${fmt(r.inputTokens+r.outputTokens)}</td><td class="num brass">${usd(r.costUsd)}</td></tr>`);
+    $("#prio-count").textContent=acct.priorityRepoCount??0;
+    const b=acct.buckets||{};
+    if((b.priorityUsd+b.otherUsd+b.unlinkedUsd)>0){
+      $("#kv-vendors").innerHTML+=`<dt style="padding-top:6px">priority work</dt><dd style="padding-top:6px"><b>${usd(b.priorityUsd)}</b></dd>
+        <dt>other repos</dt><dd>${usd(b.otherUsd)}</dd><dt>unlinked</dt><dd>${usd(b.unlinkedUsd)}</dd>`;
+    }
+    rows("#t-accounts","#e-accounts",(acct.accounts||[]).filter(a=>a.accountHash),a=>`<tr>
+      <td>${a.label??`<span class="hash">${short(a.accountHash)}</span>`}</td>
+      <td class="hash">${(a.machines||[]).join(", ")||"·"}</td>
+      <td class="num">${fmt(a.sessions)}</td>
+      <td class="num">${usd(a.priorityUsd)}</td><td class="num">${usd(a.otherUsd)}</td>
+      <td class="num">${usd(a.unlinkedUsd)}</td><td class="num brass">${usd(a.totalUsd)}</td>
+      <td>${a.subscription?a.subscription.plan+" $"+a.subscription.usdPerMonth+"/mo":"<span class='hash'>direct API</span>"}</td>
+      <td class="num">${a.subscription?.leverage?`<b style="color:${a.subscription.leverage>=1?"var(--signal-green)":"var(--signal-amber)"}">${a.subscription.leverage}×</b>`:"·"}</td></tr>`);
     rows("#t-sessions","#e-sessions",sess,x=>`<tr class="row" onclick="openSession('${x.sessionId}')">
       <td>${(x.startedAt||"").slice(0,16).replace("T"," ")}</td>
       <td><span class="flag ${x.source==="claude_code"?"cc":"cx"}">${x.source==="claude_code"?"CC":"CX"}</span></td>

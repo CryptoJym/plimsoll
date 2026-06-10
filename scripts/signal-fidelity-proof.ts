@@ -31,16 +31,19 @@ import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
+import os from "node:os";
+
 import {
   branchLinkageHash,
   remoteLinkageHash,
 } from "../packages/shared/src/linkage";
+import { dashboardAccounts } from "../packages/collector-cli/src/dashboard-api";
 
 type Check = { name: string; passed: boolean; detail: string };
 
 const checks: Check[] = [];
-function check(name: string, passed: boolean, detail: string) {
-  checks.push({ name, passed, detail });
+function check(name: string, passed: boolean, detail: string | undefined) {
+  checks.push({ name, passed, detail: detail ?? "(no detail)" });
 }
 
 const RAW_CMD_SENTINEL = "RAW_CMD_SENTINEL rg -n secret";
@@ -84,6 +87,7 @@ const claudeLogsEnvelope = {
               body: { stringValue: "claude_code.api_request" },
               attributes: [
                 otelAttr("event.name", "api_request"),
+                otelAttr("user.id", "sha256:proofaccount0001"),
                 otelAttr("session.id", SESSION),
                 otelAttr("model", "claude-fable-5"),
                 otelAttr("input_tokens", 1200),
@@ -470,6 +474,48 @@ async function main() {
     `rows with repo/branch/sha columns: ${linkageColumns.n}`,
   );
 
+  // Attribution: hashed account promoted (sanitizer re-hashes protected ids,
+  // so read the stored value back), machine stamped, label local-only.
+  const storedAccount = new Database(bufferPath, { readonly: true })
+    .prepare(
+      `select account_hash as accountHash, count(*) as n from buffered_events
+       where session_id = ? and account_hash is not null and machine = ?
+       group by account_hash`,
+    )
+    .get(SESSION, os.hostname()) as { accountHash: string; n: number } | undefined;
+  check(
+    "account_and_machine_attributed",
+    Boolean(storedAccount && storedAccount.n >= 1 && storedAccount.accountHash.startsWith("sha256:")),
+    JSON.stringify({ account: storedAccount?.accountHash, machine: os.hostname(), rows: storedAccount?.n }),
+  );
+
+  // Buckets + leverage: proof repo is priority; codex stitched session is unlinked.
+  buffer.setPriorityRepo(expectedRemoteHash!, "github.com/proof-owner/proof-repo");
+  const accounts = dashboardAccounts(buffer.database, [
+    { account: storedAccount?.accountHash ?? "none", plan: "Max", usdPerMonth: 200, vendor: "anthropic" },
+  ]);
+  const proofAccount = accounts.accounts.find((a) => a.accountHash === storedAccount?.accountHash);
+  // Both the claude api_request session and the stitched codex session link to
+  // the proof repo, so the full $0.0613 lands in priority — nothing leaks to
+  // other/unlinked. Fully-accounted buckets are the strongest assertion.
+  check(
+    "priority_buckets_computed",
+    Math.abs(accounts.buckets.priorityUsd - 0.0613) < 0.001 &&
+      accounts.buckets.otherUsd === 0 &&
+      accounts.buckets.unlinkedUsd === 0,
+    JSON.stringify(accounts.buckets),
+  );
+  check(
+    "plan_leverage_computed",
+    Boolean(
+      proofAccount?.subscription &&
+        proofAccount.subscription.leverage !== null &&
+        proofAccount.subscription.leverage > 0 &&
+        Math.abs((proofAccount.subscription.planCostWindow ?? 0) - 200 * (30 / 30.44)) < 0.5,
+    ),
+    JSON.stringify(proofAccount?.subscription),
+  );
+
   // 7. Upload watermark drains oldest-first against a stub ingest endpoint.
   const received: number[] = [];
   const uploadBodies: string[] = [];
@@ -505,6 +551,13 @@ async function main() {
     "repo_label_never_uploaded",
     uploadBodies.length > 0 && uploadBodies.every((body) => !body.includes("proof-owner/proof-repo")),
     `checked ${uploadBodies.length} upload bodies for the local-only label`,
+  );
+  check(
+    "machine_and_account_label_never_uploaded",
+    uploadBodies.every(
+      (body) => !body.includes(os.hostname()) && !body.includes(os.userInfo().username),
+    ),
+    "hostname/username absent from all upload bodies",
   );
 
   // 8. Retention prune.
