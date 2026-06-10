@@ -59,6 +59,7 @@ import { computeCaptureHealth } from "../packages/collector-cli/src/health";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { MODEL_PRICING } from "../packages/shared/src/pricing";
 import { readLocalIdentities } from "../packages/collector-cli/src/local-identity";
+import { aiInteractionEventSchema } from "../packages/shared/src/index";
 
 type Check = { name: string; passed: boolean; detail: string };
 
@@ -804,6 +805,68 @@ async function main() {
       ),
     ),
     "unmerge restored cost-dominant attribution",
+  );
+
+  // 9b. Per-event repo attribution (issue 0008): a session that moves between
+  // repos must split its cost by WHERE EACH CALL HAPPENED, not lump onto the
+  // dominant repo. Token events carry no repo at capture; enrichEventRepos
+  // stitches each one to the session's repo at that moment.
+  const MR_SESSION = "33334444-5555-4666-8777-888899990000";
+  const OTHER_REPO_HASH = remoteLinkageHash("git@github.com:Proof-Owner/Other-Repo.git")!;
+  const mrEvent = (id: string, eventType: string, observedAt: string, extra: Record<string, unknown>) =>
+    buffer.append(
+      aiInteractionEventSchema.parse({
+        id,
+        tenantId: "local",
+        source: "claude_code",
+        dataMode: "metadata",
+        eventType,
+        observedAt,
+        sessionId: MR_SESSION,
+        actionClass: "other",
+        metadata: {},
+        ...extra,
+      }),
+      [],
+    );
+  mrEvent("mr-hook-a", "tool_use", "2026-06-10T13:00:00.000Z", {
+    actionClass: "shell",
+    metadata: { git: { remoteUrlHash: expectedRemoteHash, branchHash: expectedBranchHash } },
+  });
+  mrEvent("mr-cost-a", "assistant_response", "2026-06-10T13:01:00.000Z", {
+    model: "claude-fable-5",
+    inputTokens: 1000,
+    outputTokens: 100,
+    costUsd: 1.0,
+  });
+  mrEvent("mr-hook-b", "tool_use", "2026-06-10T13:02:00.000Z", {
+    actionClass: "shell",
+    metadata: { git: { remoteUrlHash: OTHER_REPO_HASH, branchHash: expectedBranchHash } },
+  });
+  mrEvent("mr-cost-b", "assistant_response", "2026-06-10T13:03:00.000Z", {
+    model: "claude-fable-5",
+    inputTokens: 2000,
+    outputTokens: 200,
+    costUsd: 2.0,
+  });
+  const stitchResult = buffer.enrichEventRepos();
+  const stitchedRepoRows = buffer.database
+    .prepare(`select id, repo_hash as repo from buffered_events where session_id = ? order by observed_at`)
+    .all(MR_SESSION) as Array<{ id: string; repo: string | null }>;
+  const stitchMap = Object.fromEntries(stitchedRepoRows.map((row) => [row.id, row.repo]));
+  check(
+    "token_events_stitched_to_session_repo_at_that_moment",
+    stitchResult.backward >= 2 &&
+      stitchMap["mr-cost-a"] === expectedRemoteHash &&
+      stitchMap["mr-cost-b"] === OTHER_REPO_HASH,
+    JSON.stringify({ backward: stitchResult.backward, a: stitchMap["mr-cost-a"] === expectedRemoteHash, b: stitchMap["mr-cost-b"] === OTHER_REPO_HASH }),
+  );
+  const reposSplit = dashboardRepos(buffer.database) as Array<{ repoHash: string | null; costUsd: number; sessions: number }>;
+  const otherRepoRow = reposSplit.find((row) => row.repoHash === OTHER_REPO_HASH);
+  check(
+    "multi_repo_session_cost_splits_per_repo",
+    Boolean(otherRepoRow && Math.abs(otherRepoRow.costUsd - 2.0) < 1e-9 && otherRepoRow.sessions === 1),
+    JSON.stringify({ otherRepoUsd: otherRepoRow?.costUsd ?? null }),
   );
   check(
     "cross_view_costs_reconcile",
