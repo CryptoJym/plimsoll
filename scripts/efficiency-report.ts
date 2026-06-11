@@ -14,7 +14,8 @@
  *
  * Usage:
  *   GITHUB_TOKEN=... tsx scripts/efficiency-report.ts \
- *     --repository owner/repo [--since-days 30] [--ledger /path/to/work-ledger.sqlite]
+ *     --repository owner/repo [--since-days 30] [--yield-window-days 14] \
+ *     [--ledger /path/to/work-ledger.sqlite]
  *
  *   # descriptive, local-only, no GitHub needed (issue 0010):
  *   tsx scripts/efficiency-report.ts --patterns [--since-days 90] [--ledger ...]
@@ -52,13 +53,46 @@ type SessionRow = {
 type PullSummary = {
   number: number;
   state: string;
+  title: string;
   merged: boolean;
+  mergedAt?: string;
   branchHash?: string;
   headSha?: string;
   mergeCommitSha?: string;
   updatedAt: string;
   checks: "passed" | "failed" | "none" | "unknown";
 };
+
+/** Short-horizon rework against a merged PR: a revert on the default branch or
+ *  a reopen event landing inside the stability window (issue 0009 / #9). */
+type ReworkSignal = { pull: number; kind: "revert" | "reopen"; evidence: string; at: string };
+
+/**
+ * Validated Delivery Yield v2 = v1 numerator MINUS any merged+passing PR that
+ * drew short-horizon rework (revert/reopen) within `windowDays` of its merge.
+ * Pure over fetched data so the proof can feed a known-reverted PR and watch it
+ * drop. Excluded PRs are named with the reason and evidence.
+ */
+export function validatedDeliveryYieldV2(
+  eligible: Array<{ pull: number; mergedAt?: string }>,
+  signals: ReworkSignal[],
+  windowDays: number,
+): { numerator: number; excluded: Array<{ pull: number; reason: string; evidence: string }> } {
+  const windowMs = windowDays * 24 * 60 * 60 * 1000;
+  const excluded: Array<{ pull: number; reason: string; evidence: string }> = [];
+  for (const row of eligible) {
+    const mergeMs = row.mergedAt ? Date.parse(row.mergedAt) : NaN;
+    const hit = signals.find((s) => {
+      if (s.pull !== row.pull) return false;
+      if (Number.isNaN(mergeMs)) return true; // unknown merge time → count any signal
+      const at = Date.parse(s.at);
+      return !Number.isNaN(at) && at >= mergeMs && at <= mergeMs + windowMs;
+    });
+    if (hit) excluded.push({ pull: row.pull, reason: hit.kind, evidence: hit.evidence });
+  }
+  const excludedPulls = new Set(excluded.map((e) => e.pull));
+  return { numerator: eligible.filter((r) => !excludedPulls.has(r.pull)).length, excluded };
+}
 
 function optionValue(name: string) {
   const index = process.argv.indexOf(name);
@@ -199,6 +233,7 @@ async function main() {
   }
   const [owner, repo] = repository.split("/");
   const sinceDays = Number(optionValue("--since-days") ?? 30);
+  const yieldWindowDays = Number(optionValue("--yield-window-days") ?? 14);
   const since = new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000).toISOString();
   const ledgerPath = optionValue("--ledger") ?? collectorBufferPath();
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
@@ -239,7 +274,9 @@ async function main() {
       return {
         number: Number(pull.number),
         state: String(pull.state),
+        title: typeof pull.title === "string" ? pull.title : "",
         merged: Boolean(pull.merged_at),
+        mergedAt: typeof pull.merged_at === "string" ? pull.merged_at : undefined,
         branchHash: branchLinkageHash(head?.ref),
         headSha: head?.sha,
         mergeCommitSha: typeof pull.merge_commit_sha === "string" ? pull.merge_commit_sha : undefined,
@@ -316,7 +353,77 @@ async function main() {
   const mergedRows = pullRows.filter((row) => row.merged);
   const joinedSessionIds = new Set(joins.map((entry) => entry.session.sessionId));
   const yieldEligible = pullRows.length;
-  const yieldNumerator = pullRows.filter((row) => row.merged && row.checks !== "failed").length;
+  const v1NumeratorRows = pullRows.filter((row) => row.merged && row.checks !== "failed");
+  const yieldNumerator = v1NumeratorRows.length;
+
+  // v2: gather short-horizon rework signals against the v1 numerator PRs.
+  // Reverts come from default-branch commits ("This reverts commit <sha>" or
+  // `Revert "<title>"`); reopens from each PR's issue events. Both are capped
+  // to keep GitHub calls bounded.
+  const eligibleSummaries = v1NumeratorRows
+    .map((row) => pulls.find((p) => p.number === row.pull))
+    .filter((p): p is PullSummary => Boolean(p));
+  const reworkSignals: ReworkSignal[] = [];
+  const earliestMerge = eligibleSummaries
+    .map((p) => p.mergedAt)
+    .filter((d): d is string => Boolean(d))
+    .sort()[0];
+  if (earliestMerge) {
+    try {
+      const revertCommits: Array<{ sha: string; commit: { message: string } }> = [];
+      for (let page = 1; page <= 3; page += 1) {
+        const batch = (await githubJson(
+          `https://api.github.com/repos/${owner}/${repo}/commits?since=${encodeURIComponent(earliestMerge)}&per_page=100&page=${page}`,
+          token,
+        )) as Array<{ sha: string; commit: { message: string } }>;
+        revertCommits.push(...batch);
+        if (batch.length < 100) break;
+      }
+      for (const pull of eligibleSummaries) {
+        const revert = revertCommits.find((c) => {
+          const msg = c.commit?.message ?? "";
+          const bySha = Boolean(pull.mergeCommitSha) && msg.includes(pull.mergeCommitSha!.slice(0, 7));
+          const byTitle = pull.title.length > 0 && msg.split("\n")[0] === `Revert "${pull.title}"`;
+          return bySha || byTitle;
+        });
+        if (revert) {
+          reworkSignals.push({
+            pull: pull.number,
+            kind: "revert",
+            evidence: `revert ${revert.sha.slice(0, 9)}`,
+            at: pull.mergedAt ?? earliestMerge,
+          });
+        }
+      }
+    } catch {
+      // Revert scan is best-effort; absence of signal must not inflate yield
+      // silently — the report notes when the scan could not run.
+    }
+    for (const pull of eligibleSummaries.slice(0, 20)) {
+      try {
+        const events = (await githubJson(
+          `https://api.github.com/repos/${owner}/${repo}/issues/${pull.number}/events?per_page=100`,
+          token,
+        )) as Array<{ event: string; created_at: string }>;
+        const reopen = events.find((e) => e.event === "reopened");
+        if (reopen) {
+          reworkSignals.push({
+            pull: pull.number,
+            kind: "reopen",
+            evidence: `reopened ${reopen.created_at} (github.com/${owner}/${repo}/pull/${pull.number})`,
+            at: reopen.created_at,
+          });
+        }
+      } catch {
+        // per-PR event fetch best-effort
+      }
+    }
+  }
+  const yieldV2 = validatedDeliveryYieldV2(
+    eligibleSummaries.map((p) => ({ pull: p.number, mergedAt: p.mergedAt })),
+    reworkSignals,
+    yieldWindowDays,
+  );
 
   const summary = {
     proof: "plimsoll-efficiency-report",
@@ -354,8 +461,17 @@ async function main() {
       validatedDeliveryYieldV1: yieldEligible
         ? Number((yieldNumerator / yieldEligible).toFixed(3))
         : null,
+      validatedDeliveryYieldV2: yieldEligible
+        ? Number((yieldV2.numerator / yieldEligible).toFixed(3))
+        : null,
+      yieldV2Delta: yieldEligible
+        ? Number(((yieldV2.numerator - yieldNumerator) / yieldEligible).toFixed(3))
+        : null,
+      yieldWindowDays,
+      yieldV2Excluded: yieldV2.excluded,
       yieldDefinition:
-        "v1: joined PRs merged with non-failing checks / joined PRs (rework window + review friction land in P2)",
+        "v1: joined PRs merged with non-failing checks / joined PRs. " +
+        `v2: same, minus PRs with short-horizon rework (revert/reopen) within ${yieldWindowDays}d of merge.`,
     },
     pullRows,
   };
@@ -379,6 +495,14 @@ async function main() {
       `- Tokens per merged PR: ${summary.efficiency.tokensPerMergedPR ?? "n/a"}`,
       `- Cost per merged PR: ${summary.efficiency.costPerMergedPRUsd ?? "n/a"} USD`,
       `- Validated Delivery Yield v1: ${summary.efficiency.validatedDeliveryYieldV1 ?? "n/a"}`,
+      `- Validated Delivery Yield v2 (${yieldWindowDays}d rework window): ${summary.efficiency.validatedDeliveryYieldV2 ?? "n/a"} (delta ${summary.efficiency.yieldV2Delta ?? "n/a"})`,
+      ...(yieldV2.excluded.length
+        ? [
+            "",
+            `Excluded from v2 (short-horizon rework within ${yieldWindowDays}d):`,
+            ...yieldV2.excluded.map((e) => `- #${e.pull}: ${e.reason} — ${e.evidence}`),
+          ]
+        : [`- v2 exclusions: none within the ${yieldWindowDays}d window`]),
       "",
       "| PR | merged | checks | sessions | in tok | out tok | cost USD | via |",
       "|---|---|---|---|---|---|---|---|",

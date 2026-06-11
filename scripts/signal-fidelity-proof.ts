@@ -65,7 +65,7 @@ import { computeCaptureHealth } from "../packages/collector-cli/src/health";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 import { MODEL_PRICING } from "../packages/shared/src/pricing";
-import { buildPatternsReport } from "./efficiency-report";
+import { buildPatternsReport, validatedDeliveryYieldV2 } from "./efficiency-report";
 import { readLocalIdentities } from "../packages/collector-cli/src/local-identity";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import {
@@ -1428,6 +1428,32 @@ async function main() {
       blocks: requiredBlocks.filter((b) => patterns.includes(b)).length,
       adviceLanguage: adviceHit ? adviceHit[0] : "none",
     }),
+  );
+
+  // Validated Delivery Yield v2 (issue 0009 / #9): a known-reverted PR inside
+  // the stability window drops from the numerator and is named; a clean PR and
+  // a revert landing AFTER the window both survive.
+  const v2MergeAt = "2026-05-01T00:00:00.000Z";
+  const v2 = validatedDeliveryYieldV2(
+    [
+      { pull: 101, mergedAt: v2MergeAt }, // reverted 2 days later → drops
+      { pull: 102, mergedAt: v2MergeAt }, // clean → survives
+      { pull: 103, mergedAt: v2MergeAt }, // reverted 40 days later → outside window, survives
+    ],
+    [
+      { pull: 101, kind: "revert", evidence: "revert deadbeef0", at: "2026-05-03T00:00:00.000Z" },
+      { pull: 103, kind: "revert", evidence: "revert cafef00d0", at: "2026-06-10T00:00:00.000Z" },
+    ],
+    14,
+  );
+  check(
+    "validated_delivery_yield_v2_drops_reverted_pr",
+    v2.numerator === 2 &&
+      v2.excluded.length === 1 &&
+      v2.excluded[0].pull === 101 &&
+      v2.excluded[0].reason === "revert" &&
+      v2.excluded[0].evidence.includes("deadbeef0"),
+    JSON.stringify(v2),
   );
 
   // 7. Upload watermark drains oldest-first against a stub ingest endpoint.
