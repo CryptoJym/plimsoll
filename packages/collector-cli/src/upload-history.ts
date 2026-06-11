@@ -7,10 +7,12 @@ import type { CollectorConfig } from "./config";
 import { collectorBufferPath, collectorLogPath } from "./config";
 import { deterministicEventId } from "./normalizer";
 import {
+  aiWorkAttributionRepairBatchSchema,
   aiWorkIngestBatchSchema,
   aiInteractionEventSchema,
   findForbiddenRawContentFields,
   type AiInteractionEvent,
+  type AiWorkAttributionRepairRow,
 } from "../../shared/src/index";
 
 /**
@@ -66,6 +68,10 @@ export type LedgerHistoryRow = {
   createdAt: string;
   payloadJson: string;
   suppressedFieldsJson: string;
+  /** Per-event repo linkage columns (issue 0008 stitching) — forwarded as
+   * event.projectKey / metadata.branchHash (issue 0036). */
+  repoHash?: string | null;
+  branchHash?: string | null;
 };
 
 export type HistorySkipReason = "payload_unparseable" | "schema_invalid" | "forbidden_content";
@@ -92,6 +98,8 @@ export type NormalizedHistoryEvent =
 export function normalizeHistoryEvent(row: {
   payloadJson: string;
   suppressedFieldsJson: string;
+  repoHash?: string | null;
+  branchHash?: string | null;
 }): NormalizedHistoryEvent {
   let payload: unknown;
   try {
@@ -124,6 +132,20 @@ export function normalizeHistoryEvent(row: {
           : {};
       candidate.metadata = { ...metadata, externalEventId: candidate.id };
       candidate.id = ensured.id;
+    }
+  }
+
+  // Project attribution parity (issue 0036): forward the ledger's repo
+  // linkage as projectKey, exactly like the live sync path (upload.ts
+  // attachRepoLinkage). Never overwrites a payload-supplied projectKey.
+  if (row.repoHash && !candidate.projectKey) {
+    candidate.projectKey = row.repoHash;
+    if (row.branchHash) {
+      const metadata =
+        candidate.metadata && typeof candidate.metadata === "object" && !Array.isArray(candidate.metadata)
+          ? (candidate.metadata as Record<string, unknown>)
+          : {};
+      candidate.metadata = { ...metadata, branchHash: row.branchHash };
     }
   }
 
@@ -496,7 +518,13 @@ async function postHistoryBatch(input: {
   sleep: (ms: number) => Promise<void>;
   maxAttempts: number;
   log: (line: string) => void;
-}): Promise<{ accepted: number; inserted: number | null; attempts: number }> {
+}): Promise<{
+  accepted: number;
+  inserted: number | null;
+  matched: number | null;
+  updated: number | null;
+  attempts: number;
+}> {
   let lastError = "";
   for (let attempt = 1; attempt <= input.maxAttempts; attempt += 1) {
     const headers: Record<string, string> = {
@@ -522,12 +550,20 @@ async function postHistoryBatch(input: {
     }
 
     if (response?.ok) {
-      const body = (await response.json().catch(() => ({}))) as { accepted?: unknown; inserted?: unknown };
+      const body = (await response.json().catch(() => ({}))) as {
+        accepted?: unknown;
+        inserted?: unknown;
+        matched?: unknown;
+        updated?: unknown;
+      };
       const accepted = typeof body.accepted === "number" ? body.accepted : 0;
       // Additive field from the cloud's bulk-ingest fast lane (cloud PR #19):
       // how many rows were genuinely new. Older servers omit it.
       const inserted = typeof body.inserted === "number" ? body.inserted : null;
-      return { accepted, inserted, attempts: attempt };
+      // Attribution-repair lane responses (issue 0036).
+      const matched = typeof body.matched === "number" ? body.matched : null;
+      const updated = typeof body.updated === "number" ? body.updated : null;
+      return { accepted, inserted, matched, updated, attempts: attempt };
     }
 
     if (response && response.status !== 429 && response.status < 500) {
@@ -668,7 +704,8 @@ export async function runWorkspaceHistoryUpload(
 
   const page = ledger.prepare(
     `select rowid as rowid, id, created_at as createdAt, payload_json as payloadJson,
-       suppressed_fields_json as suppressedFieldsJson
+       suppressed_fields_json as suppressedFieldsJson,
+       repo_hash as repoHash, branch_hash as branchHash
      from buffered_events
      where rowid > ? and created_at <= ?
      order by rowid asc
@@ -958,6 +995,261 @@ export async function runWorkspaceHistoryUpload(
   );
   log("");
   log(auditTable);
+
+  return result;
+}
+
+/**
+ * Attribution repair (issue 0036) — pure mapper from ledger linkage rows to
+ * the wire shape. Ids go through the SAME deterministic UUID mapping as
+ * uploads, so the pair targets exactly the row the upload created.
+ */
+export function buildAttributionRepairRows(
+  rows: Array<{ id: string; repoHash: string | null }>,
+): AiWorkAttributionRepairRow[] {
+  const out: AiWorkAttributionRepairRow[] = [];
+  for (const row of rows) {
+    const repoHash = row.repoHash?.trim();
+    if (!repoHash || !row.id?.trim()) continue;
+    out.push({ id: ensureUuidEventId(row.id.trim()).id, projectKey: repoHash });
+  }
+  return out;
+}
+
+export type AttributionRepairResult = {
+  ok: boolean;
+  reason: string | null;
+  until: string;
+  rowsWithRepoHash: number;
+  distinctRepos: number;
+  sentRows: number;
+  matchedRows: number;
+  updatedRows: number;
+  batches: number;
+  durationMs: number;
+  dryRun: boolean;
+};
+
+/**
+ * Fill projectKey on ALREADY-UPLOADED workspace rows. The bulk ingest lane is
+ * first-writer-wins (createMany skipDuplicates), so re-sending events can
+ * never back-fill attribution — this lane sends bare {id, projectKey} pairs
+ * and the cloud applies ONE set-based, tenant-scoped, FILL-ONLY update per
+ * batch. Fill-only twice over: rows with a differing non-null projectKey are
+ * left alone, and re-running reports updated: 0 — that is the proof it
+ * settled. Walks every ledger row with repo_hash (uploaded or not — unknown
+ * ids simply match nothing), read-only, no resume state needed: the whole
+ * walk is cheap and idempotent.
+ */
+export async function runAttributionRepair(
+  config: CollectorConfig,
+  options: {
+    until?: string;
+    batchSize?: number;
+    concurrency?: number;
+    delayMs?: number;
+    dryRun?: boolean;
+    url?: string;
+    appVersion?: string;
+    ledgerPath?: string;
+    fetchImpl?: typeof fetch;
+    sleep?: (ms: number) => Promise<void>;
+    log?: (line: string) => void;
+    maxAttemptsPerBatch?: number;
+    pageSize?: number;
+  } = {},
+): Promise<AttributionRepairResult> {
+  const log = options.log ?? ((line: string) => console.log(line));
+  const sleep = options.sleep ?? defaultSleep;
+  const fetchImpl = options.fetchImpl ?? fetch;
+
+  const url = options.url ?? config.uploadUrl;
+  if (!url) {
+    throw new Error(
+      "This machine has not joined a workspace (no uploadUrl in collector.config.json). " +
+        'Run: plimsoll join "<join-url>#<token>" — then retry upload-history --repair-attribution.',
+    );
+  }
+  if ((!config.installKey || config.installKey === "local-dev") && !config.ingestKey) {
+    throw new Error(
+      "No workspace install credentials found (installKey is missing/local-dev and there is no ingestKey). " +
+        'Run: plimsoll join "<join-url>#<token>" — then retry upload-history --repair-attribution.',
+    );
+  }
+
+  const ledgerPath = options.ledgerPath ?? collectorBufferPath();
+  let ledger: Database.Database;
+  try {
+    ledger = new Database(ledgerPath, { readonly: true, fileMustExist: true });
+  } catch (error) {
+    throw new Error(
+      `No readable local ledger at ${ledgerPath} (${error instanceof Error ? error.message : String(error)}) — nothing to repair.`,
+    );
+  }
+
+  const startedAt = Date.now();
+  const until = options.until ?? new Date().toISOString();
+  if (Number.isNaN(Date.parse(until))) {
+    ledger.close();
+    throw new Error(`--until must be an ISO timestamp, got: ${until}`);
+  }
+  const batchSize = Math.max(1, Math.min(options.batchSize ?? HISTORY_MAX_BATCH_EVENTS, HISTORY_MAX_BATCH_EVENTS));
+  const concurrency = Math.max(1, Math.min(options.concurrency ?? 2, 8));
+  const delayMs = Math.max(0, options.delayMs ?? 100);
+  const pageSize = Math.max(batchSize, Math.min(options.pageSize ?? 10_000, 50_000));
+  const maxAttempts = Math.max(1, Math.min(options.maxAttemptsPerBatch ?? 5, 10));
+  const appVersion = options.appVersion ?? "0.1.0";
+
+  const overview = ledger
+    .prepare(
+      `select count(*) as n, count(distinct repo_hash) as repos
+       from buffered_events where repo_hash is not null and created_at <= ?`,
+    )
+    .get(until) as { n: number; repos: number };
+
+  log(
+    JSON.stringify({
+      status: "attribution_repair_start",
+      until,
+      rowsWithRepoHash: overview.n,
+      distinctRepos: overview.repos,
+      batchSize,
+      concurrency,
+      dryRun: Boolean(options.dryRun),
+      ledgerPath,
+    }),
+  );
+
+  const page = ledger.prepare(
+    `select rowid as rowid, id, repo_hash as repoHash
+     from buffered_events
+     where repo_hash is not null and created_at <= ? and rowid > ?
+     order by rowid asc
+     limit ?`,
+  );
+
+  let cursorRowid = 0;
+  let sentRows = 0;
+  let matchedRows = 0;
+  let updatedRows = 0;
+  let batches = 0;
+  let abortReason: string | null = null;
+  const totalBatchesEstimate = Math.max(1, Math.ceil(overview.n / batchSize));
+
+  const inFlight = new Set<Promise<void>>();
+  const dispatch = async (rows: AiWorkAttributionRepairRow[]) => {
+    const body = JSON.stringify(
+      aiWorkAttributionRepairBatchSchema.parse({
+        kind: "attribution_repair",
+        tenantId: config.tenantId,
+        installKey: config.installKey,
+        appVersion,
+        rows,
+      }),
+    );
+    const task = (async () => {
+      try {
+        const result = await postHistoryBatch({
+          url,
+          body,
+          installKey: config.installKey,
+          ingestKey: config.ingestKey,
+          signingSecret: config.uploadSigningSecret,
+          fetchImpl,
+          sleep,
+          maxAttempts,
+          log,
+        });
+        batches += 1;
+        sentRows += rows.length;
+        matchedRows += result.matched ?? 0;
+        updatedRows += result.updated ?? 0;
+        log(
+          JSON.stringify({
+            status: "attribution_repair_progress",
+            batches: `${batches}/${totalBatchesEstimate}`,
+            sentRows,
+            matchedRows,
+            updatedRows,
+          }),
+        );
+      } catch (error) {
+        abortReason = abortReason ?? (error instanceof Error ? error.message : String(error));
+      }
+    })();
+    const tracked: Promise<void> = task.finally(() => {
+      inFlight.delete(tracked);
+    });
+    inFlight.add(tracked);
+    if (inFlight.size >= concurrency) {
+      await Promise.race([...inFlight]);
+    }
+    if (delayMs > 0) await sleep(delayMs);
+  };
+
+  let carry: AiWorkAttributionRepairRow[] = [];
+  pageLoop: while (abortReason === null) {
+    const rows = page.all(until, cursorRowid, pageSize) as Array<{
+      rowid: number;
+      id: string;
+      repoHash: string;
+    }>;
+    if (rows.length === 0 && carry.length === 0) break;
+    if (rows.length > 0) cursorRowid = rows[rows.length - 1].rowid;
+    const lastPage = rows.length < pageSize;
+
+    carry = carry.concat(buildAttributionRepairRows(rows));
+    while (carry.length >= batchSize || (lastPage && carry.length > 0)) {
+      const chunk = carry.slice(0, batchSize);
+      carry = carry.slice(batchSize);
+      if (options.dryRun) {
+        batches += 1;
+        sentRows += chunk.length;
+        continue;
+      }
+      await dispatch(chunk);
+      if (abortReason !== null) break pageLoop;
+    }
+    if (lastPage) break;
+  }
+
+  await Promise.allSettled([...inFlight]);
+  ledger.close();
+
+  const durationMs = Date.now() - startedAt;
+  const result: AttributionRepairResult = {
+    ok: abortReason === null,
+    reason: abortReason,
+    until,
+    rowsWithRepoHash: overview.n,
+    distinctRepos: overview.repos,
+    sentRows,
+    matchedRows,
+    updatedRows,
+    batches,
+    durationMs,
+    dryRun: Boolean(options.dryRun),
+  };
+
+  log(
+    JSON.stringify({
+      status: abortReason ? "attribution_repair_failed" : "attribution_repair_done",
+      ...result,
+    }),
+  );
+  log("");
+  log(
+    [
+      `ledger rows with repo linkage (<= until): ${overview.n} across ${overview.repos} repos`,
+      `pairs sent: ${sentRows}${options.dryRun ? " (dry-run: nothing crossed the wire)" : ""}`,
+      `matched in workspace: ${options.dryRun ? "n/a" : matchedRows}`,
+      `newly filled: ${options.dryRun ? "n/a" : updatedRows}${
+        !options.dryRun && updatedRows === 0 && sentRows > 0
+          ? " (already attributed — fill-only repair settled)"
+          : ""
+      }`,
+    ].join("\n"),
+  );
 
   return result;
 }

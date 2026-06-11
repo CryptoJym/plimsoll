@@ -299,6 +299,79 @@ export const aiWorkIngestBatchSchema = z
   })
   .strict();
 export type AiWorkIngestBatch = z.infer<typeof aiWorkIngestBatchSchema>;
+/**
+ * Attribution repair (issue 0036): the bulk ingest lane is first-writer-wins
+ * (createMany skipDuplicates — cloud PR #19), so events uploaded before the
+ * collector learned to send projectKey can never be back-filled by re-sending
+ * them. This batch shape carries ONLY {id, projectKey} pairs; the cloud
+ * applies one set-based, tenant-scoped, FILL-ONLY update per batch (a row
+ * with a differing non-null projectKey is left alone — first-writer-wins
+ * extended to attribution).
+ *
+ * `kind` discriminates it from a normal event batch on the shared ingest
+ * route. projectKey is the repo linkage hash (sha256:…) — the privacy-
+ * preserving key DESIGNED to cross boundaries; raw URLs/branches never do.
+ */
+const uuidShapedIdSchema = z
+  .string()
+  .trim()
+  .regex(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i,
+    "Expected a UUID-shaped event id.",
+  );
+
+export const aiWorkAttributionRepairRowSchema = z
+  .object({
+    id: uuidShapedIdSchema,
+    projectKey: keySchema,
+  })
+  .strict();
+export type AiWorkAttributionRepairRow = z.infer<typeof aiWorkAttributionRepairRowSchema>;
+
+export const aiWorkAttributionRepairBatchSchema = z
+  .object({
+    kind: z.literal("attribution_repair"),
+    tenantId: idSchema.default(LOCAL_TENANT_ID),
+    installKey: keySchema,
+    appVersion: z.string().trim().min(1).default("0.1.0"),
+    rows: z.array(aiWorkAttributionRepairRowSchema).min(1).max(500),
+  })
+  .strict();
+export type AiWorkAttributionRepairBatch = z.infer<typeof aiWorkAttributionRepairBatchSchema>;
+
+/**
+ * Repo label disclosure (issue 0036): repo display names are deliberate,
+ * owner-run disclosures (push-repo-labels previews the exact payload first).
+ * Only derived slugs cross the wire — a value containing "://" is refused so
+ * raw remote URLs can never ride along by accident.
+ */
+const repoDisplaySlugSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(200)
+  .refine((value) => !value.includes("://"), "Raw URLs never cross the wire — send the derived slug.");
+
+export const workRepoLabelSchema = z
+  .object({
+    remoteUrlHash: keySchema,
+    name: repoDisplaySlugSchema,
+    owner: repoDisplaySlugSchema.optional(),
+    provider: z.enum(["github", "gitlab", "local_git", "unknown"]).default("github"),
+  })
+  .strict();
+export type WorkRepoLabel = z.infer<typeof workRepoLabelSchema>;
+
+export const workRepoLabelsBatchSchema = z
+  .object({
+    tenantId: idSchema.default(LOCAL_TENANT_ID),
+    installKey: keySchema,
+    appVersion: z.string().trim().min(1).default("0.1.0"),
+    repositories: z.array(workRepoLabelSchema).min(1).max(200),
+  })
+  .strict();
+export type WorkRepoLabelsBatch = z.infer<typeof workRepoLabelsBatchSchema>;
+
 
 export const toolActionEventSchema = z
   .object({
