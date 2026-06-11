@@ -62,8 +62,13 @@ body{
   position:absolute; right:36px; top:-7px; font-size:9px; letter-spacing:.08em;
   color:var(--foam-faint);
 }
-.rail .wl{position:absolute; right:0; left:0; height:2px; background:var(--waterline);
-  box-shadow:0 0 12px rgba(35,137,167,.8); transition:top 1.2s cubic-bezier(.2,.8,.2,1)}
+.rail .wl{position:absolute; right:0; left:0; height:2px; background:var(--brass);
+  box-shadow:0 0 12px rgba(232,179,75,.7); transition:top 1.2s cubic-bezier(.2,.8,.2,1)}
+.rail .draft{position:absolute; right:0; left:0; bottom:0;
+  background:linear-gradient(180deg, rgba(35,137,167,.36), rgba(35,137,167,.08));
+  border-top:1px solid rgba(127,195,232,.75);
+  transition:height 1.2s cubic-bezier(.2,.8,.2,1)}
+.rail .cap{font-size:8px; letter-spacing:.26em; color:var(--foam-faint); margin:-14px 0 10px}
 
 /* ——— shell ——— */
 main{margin-left:64px; padding:26px 30px 80px; max-width:1180px}
@@ -227,14 +232,15 @@ tr.row:focus-visible{background:rgba(35,137,167,.12)}
 </head>
 <body>
 
-<nav class="rail" aria-hidden="true">
-  <div class="mark">
+<nav class="rail" id="rail" role="img" aria-label="Draught rail — loading">
+  <div class="mark" aria-hidden="true">
     <!-- the load-line mark -->
     <svg width="34" height="34" viewBox="0 0 34 34" fill="none">
       <circle cx="17" cy="17" r="12" stroke="#c8d6dd" stroke-width="2"/>
       <line x1="1" y1="17" x2="33" y2="17" stroke="#e8b34b" stroke-width="2"/>
     </svg>
   </div>
+  <div class="cap" aria-hidden="true">DRAUGHT $</div>
   <div class="ticks" id="rail-ticks"></div>
 </nav>
 
@@ -396,17 +402,37 @@ const fmt=(n)=>n==null?"—":Number(n).toLocaleString("en-US");
 const usd=(n)=>n==null?"—":"$"+Number(n).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
 const short=(h)=>h?h.replace("sha256:","").slice(0,8):"·";
 
-function railTicks(){
-  const box=$("#rail-ticks"); const H=box.clientHeight;
-  for(let i=0;i<=20;i++){
-    const t=document.createElement("div");
-    t.className="tick"+(i%5===0?" major":"");
-    t.style.top=(i/20*H)+"px";
-    if(i%5===0){const s=document.createElement("span");s.textContent=String(20-i);t.appendChild(s);}
-    box.appendChild(t);
+/* The draught rail is the namesake instrument (#51): water = spend draft
+   in the window, brass waterline = plan cost, scale auto-ranges so the
+   yardstick re-indexes as the numbers grow. Coverage lives on its own
+   gauge, not here — one instrument, one truth. */
+const compactUsd=(n)=>n>=99500?"$"+Math.round(n/1000)+"k":n>=1000?"$"+(Math.round(n/100)/10)+"k":n>=10?"$"+Math.round(n):"$"+(Math.round(n*10)/10);
+function niceCeil(x){const p=Math.pow(10,Math.floor(Math.log10(x||1)));for(const m of[1,2,2.5,5,10]){if(m*p>=x)return m*p}return 10*p}
+const railState={top:0,H:0};
+function renderRail(spendUsd,planUsd,windowLabel){
+  const box=$("#rail-ticks"); if(!box)return; const H=box.clientHeight||1;
+  const top=niceCeil(Math.max(spendUsd,(planUsd||0)*1.2,10));
+  const draftH=Math.max(spendUsd>0?2:0, H*Math.min(spendUsd/top,1));
+  if(top!==railState.top||H!==railState.H){
+    railState.top=top; railState.H=H; box.innerHTML="";
+    const water=document.createElement("div"); water.className="draft"; water.id="rail-draft";
+    box.appendChild(water);
+    for(let i=0;i<=20;i++){
+      const t=document.createElement("div");
+      t.className="tick"+(i%5===0?" major":"");
+      t.style.top=(i/20*H)+"px";
+      if(i%5===0){const sp=document.createElement("span");sp.textContent=compactUsd(top*(20-i)/20);t.appendChild(sp);}
+      box.appendChild(t);
+    }
+    const wl=document.createElement("div"); wl.className="wl"; wl.id="rail-wl";
+    box.appendChild(wl);
   }
-  const wl=document.createElement("div"); wl.className="wl"; wl.id="rail-wl"; wl.style.top=H+"px";
-  box.appendChild(wl);
+  const water=$("#rail-draft"), wl=$("#rail-wl");
+  water.style.height=draftH+"px";
+  water.title="spend draft "+usd(spendUsd)+" on a "+compactUsd(top)+" scale";
+  wl.style.display=planUsd>0?"":"none";
+  if(planUsd>0){wl.style.top=(H*(1-Math.min(planUsd/top,1)))+"px"; wl.title="plan waterline "+usd(planUsd)+" this window";}
+  $("#rail").setAttribute("aria-label","Draught rail: spend draft "+usd(spendUsd)+(planUsd>0?" against plan waterline "+usd(planUsd):"")+" in "+windowLabel+". Scale 0 to "+compactUsd(top)+".");
 }
 
 /* A day with spend must never look like a day without (0031):
@@ -448,7 +474,6 @@ function gauge(pct){
   line.setAttribute("y1",String(ly)); line.setAttribute("y2",String(ly));
   num.textContent=Math.round(pct*100)+"%";
   num.className="cov-num"+(pct<.5?" bad":pct<.8?" warn":"");
-  const wl=$("#rail-wl"); if(wl){const box=$("#rail-ticks"); wl.style.top=(box.clientHeight*(1-pct))+"px";}
 }
 
 function rows(tbodySel,emptySel,arr,render){
@@ -594,6 +619,8 @@ async function refresh(){
     gauge(pct);
     $("#cov-note").textContent=`${fmt(t.sessionsWithTokens)} of ${fmt(t.sessions)} sessions carry token telemetry`;
     drawSpark(s.daily);
+    const planUsd=(acct.accounts||[]).reduce((sum,a)=>sum+(a.subscription?(a.subscription.planCostWindow||0):0),0);
+    renderRail(t.costUsd||0, planUsd, $("#window-label").textContent);
     rows("#t-models","#e-models",s.byModel,m=>`<tr><td class="wide" title="${m.model}">${m.model}</td><td class="num">${fmt(m.calls)}</td><td class="num">${fmt(m.inputTokens)}</td><td class="num">${fmt(m.outputTokens)}</td><td class="num brass">${m.unpricedCalls>0&&!m.costUsd?'<span class="hash" title="no vendor rate on file — tokens counted, cost unknown">unpriced</span>':usd(m.costUsd)+(m.unpricedCalls>0?'<span class="hash" title="some calls have no vendor rate — shown cost is a floor">+</span>':"")}</td></tr>`);
     const vendors={claude_code:["Anthropic · Claude Code",""],codex:["OpenAI · Codex"," ~"]};
     $("#kv-vendors").innerHTML=(s.bySource||[]).filter(v=>v.costUsd>0||v.events>0).map(v=>{
@@ -688,7 +715,7 @@ $("#settings-close").onclick=closeDrawers;
 const winSel=$("#window-select");
 winSel.value=localStorage.getItem("plimsoll-window")||"30";
 winSel.onchange=()=>{localStorage.setItem("plimsoll-window",winSel.value);refresh()};
-railTicks(); refresh(); setInterval(refresh, 30000);
+refresh(); setInterval(refresh, 30000);
 window.addEventListener("resize",()=>refresh());
 </script>
 </body>
