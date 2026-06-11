@@ -409,16 +409,31 @@ function railTicks(){
   box.appendChild(wl);
 }
 
+/* A day with spend must never look like a day without (0031):
+   gap days are real calendar width with NO bar; nonzero days get a
+   visible minimum. Present-but-small ≠ absent. */
+function fillDays(daily){
+  if(daily.length<2) return daily;
+  const byDay=new Map(daily.map(d=>[d.day,d])); const out=[];
+  const start=Date.parse(daily[0].day+"T00:00:00Z"), end=Date.parse(daily[daily.length-1].day+"T00:00:00Z");
+  for(let t=start;t<=end;t+=86400000){
+    const day=new Date(t).toISOString().slice(0,10);
+    out.push(byDay.get(day)||{day,costUsd:0,tokens:0});
+  }
+  return out;
+}
 function drawSpark(daily){
   const svg=$("#spark"); const W=svg.clientWidth||1000, H=120, pad=18;
   svg.setAttribute("role","img");
   svg.setAttribute("aria-label", daily.length?`Daily spend, ${daily[0].day} to ${daily[daily.length-1].day}, peak ${usd(Math.max(...daily.map(d=>d.costUsd),0.01))} per day`:"No spend recorded in window");
   svg.setAttribute("viewBox",`0 0 ${W} ${H}`); svg.innerHTML="";
   if(!daily.length){svg.innerHTML=`<text x="${W/2}" y="${H/2}" text-anchor="middle">no spend recorded in window</text>`;return}
+  daily=fillDays(daily);
   const max=Math.max(...daily.map(d=>d.costUsd),0.01);
-  const bw=Math.max(3,(W-pad*2)/daily.length-3);
+  const bw=Math.max(2,(W-pad*2)/daily.length-3);
   svg.innerHTML=`<line x1="0" y1="${H-14}" x2="${W}" y2="${H-14}"/>`+daily.map((d,i)=>{
-    const h=Math.max(1,(d.costUsd/max)*(H-34));
+    if(!(d.costUsd>0)) return "";
+    const h=Math.max(2.5,(d.costUsd/max)*(H-34));
     const x=pad+i*((W-pad*2)/daily.length);
     return `<g class="bar-g"><rect class="bar" x="${x}" y="${H-14-h}" width="${bw}" height="${h}"><title>${d.day} · ${usd(d.costUsd)} · ${fmt(d.tokens)} tok</title></rect></g>`;
   }).join("")+`<text x="${pad}" y="${H-3}">${daily[0].day}</text><text x="${W-pad}" y="${H-3}" text-anchor="end">${daily[daily.length-1].day}</text><text x="${W-pad}" y="12" text-anchor="end">peak ${usd(max)}/day</text>`;
@@ -528,8 +543,9 @@ async function openRepo(hash){
       <dt>repo hash</dt><dd class="hash">${short(d.repoHash)}</dd>
     </dl>
     <h3>Daily spend</h3>
-    <svg width="100%" height="60" viewBox="0 0 420 60" preserveAspectRatio="none">${(d.daily||[]).map((x,i,a)=>{
-      const w=Math.max(2,420/a.length-2), h=Math.max(1,x.costUsd/dmax*48);
+    <svg width="100%" height="60" viewBox="0 0 420 60" preserveAspectRatio="none">${fillDays(d.daily||[]).map((x,i,a)=>{
+      if(!(x.costUsd>0)) return "";
+      const w=Math.max(1.5,420/a.length-2), h=Math.max(2,x.costUsd/dmax*48);
       return `<rect x="${i*(420/a.length)}" y="${58-h}" width="${w}" height="${h}" fill="var(--waterline)" opacity=".8"><title>${x.day} ${usd(x.costUsd)}</title></rect>`;
     }).join("")}</svg>
     <h3>Action mix</h3>
