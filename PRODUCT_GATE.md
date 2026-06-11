@@ -13,13 +13,13 @@ its issue.
 
 | # | Promise | Gate | Status |
 |---|---|---|---|
-| G1 | Capture is truthful (per-record tokens, classes, privacy) | proof: 14 core checks | ✅ |
-| G2 | Codex tokens captured & reconciled to vendor-reported count | live session evidence (issue #4) | ✅ exact (30,677) |
-| G3 | See it: local dashboard on the live ledger, offline | proof: dashboard_served/summary/receipts | ✅ |
+| G1 | Capture is truthful (per-record tokens, classes, privacy) | proof: capture core within the 61-check suite | ✅ |
+| G2 | Codex tokens captured & reconciled to vendor-reported count | live session evidence (#4); rollout tailer 10/10 sessions (#22) | ✅ exact (30,677) |
+| G3 | See it: local dashboard on the live ledger, offline | proof: dashboard_served/summary/receipts + inline-script parse | ✅ |
 | G4 | Traceability: number → receipts (join keys, events, coverage) | proof: dashboard_session_receipts_traceable | ✅ session-level |
-| G5 | Easy link-up: fresh Mac → numbers < 5 min, no hand-editing | scripted fresh-Mac walkthrough (issues #3, #11) | 🔴 |
+| G5 | Easy link-up: fresh Mac → numbers < 5 min, no hand-editing | fresh-env walkthrough evidence on #1 (tarball install; real npx lands with #11) | ✅ 6s total |
 | G6 | Fleet: teammate Mac joins a workspace with one command | join flow (issue #16) | 🔴 |
-| G7 | Self-honesty: capture-health alarm when telemetry stops | health check + alert (issue TBD) | 🔴 |
+| G7 | Self-honesty: capture-health alarm when telemetry stops | capture watch vs local file activity; dashboard lamps (sounding 0021 / #23) | ✅ |
 | G8 | Reconciliation: local sums vs vendor bill as displayed coverage | vendor import + gauge (private cloud) | 🔴 |
-| G9 | Codex economics session-complete | issue #14 stitching | 🔴 |
+| G9 | Codex economics session-complete | rollout tailer (#22) + span stitching (#14): telescoped deltas, first-writer-wins dedupe | ✅ 10/10 reconcile |
 | G10 | CI guards all of the above on every PR | GitHub Actions proof | ✅ |
