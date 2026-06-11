@@ -16,7 +16,10 @@ the capture path honest and the privacy promises inspectable.
 3. **Features never migrate from open to paid.** If you're unsure whether
    something belongs in this repo or the hosted product: descriptive analytics
    about the user's own data → here. Comparative/prescriptive across users or
-   orgs → hosted.
+   orgs → hosted. Concretely: `pnpm report -- --patterns` describes your own
+   ledger (counts, ratios, distributions) and contains **no** recommendation,
+   score, or benchmark — the proof check `patterns_report_descriptive_only`
+   enforces that line in CI. Cohorts, comparisons, and advice are hosted-only.
 
 ## High-leverage contributions
 

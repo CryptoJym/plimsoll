@@ -65,6 +65,7 @@ import { computeCaptureHealth } from "../packages/collector-cli/src/health";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 import { MODEL_PRICING } from "../packages/shared/src/pricing";
+import { buildPatternsReport } from "./efficiency-report";
 import { readLocalIdentities } from "../packages/collector-cli/src/local-identity";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import {
@@ -1406,6 +1407,28 @@ async function main() {
     JSON.stringify({ rescanAppended: transcriptRescan.eventsAppended }),
   );
   fs.rmSync(projectsDir, { recursive: true, force: true });
+
+  // Descriptive patterns report (issue 0010 / #10): the four required blocks
+  // render over the seeded ledger, and the output carries ZERO advice language
+  // — the open/paid boundary is that this tier describes, never prescribes.
+  const patterns = buildPatternsReport(buffer.database, 3650);
+  const requiredBlocks = [
+    "## Tokens & cost by model",
+    "## Cache-read ratio by model",
+    "## Action-class distribution",
+    "## Top sessions by cost",
+  ];
+  const adviceWords =
+    /\b(should|recommend|recommended|consider|suggest|optimi[sz]e|improve|reduce|increase|better|best practice|you (?:could|might|can)|try to)\b/i;
+  const adviceHit = adviceWords.exec(patterns);
+  check(
+    "patterns_report_descriptive_only",
+    requiredBlocks.every((b) => patterns.includes(b)) && !adviceHit,
+    JSON.stringify({
+      blocks: requiredBlocks.filter((b) => patterns.includes(b)).length,
+      adviceLanguage: adviceHit ? adviceHit[0] : "none",
+    }),
+  );
 
   // 7. Upload watermark drains oldest-first against a stub ingest endpoint.
   const received: number[] = [];

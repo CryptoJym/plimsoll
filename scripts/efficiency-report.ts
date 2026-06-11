@@ -13,11 +13,15 @@
  * cloud ingest required. Evidence lands in evidence/.
  *
  * Usage:
- *   GITHUB_TOKEN=... tsx scripts/capture-plimsoll-efficiency-report.ts \
+ *   GITHUB_TOKEN=... tsx scripts/efficiency-report.ts \
  *     --repository owner/repo [--since-days 30] [--ledger /path/to/work-ledger.sqlite]
+ *
+ *   # descriptive, local-only, no GitHub needed (issue 0010):
+ *   tsx scripts/efficiency-report.ts --patterns [--since-days 90] [--ledger ...]
  */
 import fs from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import Database from "better-sqlite3";
 
@@ -76,7 +80,119 @@ async function githubJson(url: string, token: string | undefined) {
   return (await response.json()) as unknown;
 }
 
+/**
+ * Descriptive pattern summary over the user's OWN ledger (issue 0010 / #10).
+ * Open-tier by definition: it reports what happened — model mix, cache-read
+ * ratio, action-class distribution, the costliest sessions — and offers no
+ * comparison, benchmark, score, or advice. Pure SQL over promoted columns
+ * (no payload_json parsing) so it stays well under the 5s budget.
+ */
+export function buildPatternsReport(db: Database.Database, sinceDays: number): string {
+  const since = new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000).toISOString();
+  const num = (n: unknown) => Number(n ?? 0).toLocaleString("en-US");
+  const usd = (n: unknown) =>
+    "$" + Number(n ?? 0).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  const pct = (n: number) => (Number.isFinite(n) ? (n * 100).toFixed(1) + "%" : "—");
+
+  const byModel = db
+    .prepare(
+      `select model,
+         count(*) as calls,
+         coalesce(sum(input_tokens), 0) as inputTokens,
+         coalesce(sum(output_tokens), 0) as outputTokens,
+         coalesce(sum(cache_read_tokens), 0) as cacheReadTokens,
+         coalesce(sum(cache_creation_tokens), 0) as cacheCreationTokens,
+         coalesce(sum(cost_usd), 0) as costUsd
+       from buffered_events
+       where observed_at >= ? and model is not null
+       group by model order by costUsd desc, inputTokens desc`,
+    )
+    .all(since) as Array<Record<string, number | string>>;
+
+  const actionMix = db
+    .prepare(
+      `select action_class as actionClass, count(*) as n
+       from buffered_events
+       where observed_at >= ? and event_type in ('tool_use','tool_result')
+       group by action_class order by n desc`,
+    )
+    .all(since) as Array<{ actionClass: string | null; n: number }>;
+  const actionTotal = actionMix.reduce((s, r) => s + r.n, 0) || 1;
+
+  const topSessions = db
+    .prepare(
+      `select session_id as sessionId,
+         coalesce(sum(cost_usd), 0) as costUsd,
+         coalesce(sum(input_tokens), 0) + coalesce(sum(output_tokens), 0) as tokens
+       from buffered_events
+       where observed_at >= ? and session_id is not null
+       group by session_id order by costUsd desc limit 10`,
+    )
+    .all(since) as Array<{ sessionId: string; costUsd: number; tokens: number }>;
+  const sessionMix = db.prepare(
+    `select action_class as actionClass, count(*) as n
+     from buffered_events
+     where session_id = ? and event_type in ('tool_use','tool_result')
+     group by action_class order by n desc`,
+  );
+
+  const out: string[] = [];
+  out.push(`# Plimsoll patterns — your own ledger, last ${sinceDays}d`);
+  out.push(`Descriptive only: counts and ratios over your data. No comparisons, scores, or advice.`);
+  out.push("");
+  out.push(`## Tokens & cost by model`);
+  out.push(`| model | calls | input | output | cache read | cache write | cost |`);
+  out.push(`|---|--:|--:|--:|--:|--:|--:|`);
+  for (const m of byModel) {
+    out.push(
+      `| ${m.model} | ${num(m.calls)} | ${num(m.inputTokens)} | ${num(m.outputTokens)} | ${num(m.cacheReadTokens)} | ${num(m.cacheCreationTokens)} | ${usd(m.costUsd)} |`,
+    );
+  }
+  out.push("");
+  out.push(`## Cache-read ratio by model`);
+  out.push(`Definition: cache_read / (input + cache_read). Higher = more context served from cache.`);
+  out.push(`| model | ratio |`);
+  out.push(`|---|--:|`);
+  for (const m of byModel) {
+    const input = Number(m.inputTokens);
+    const cacheRead = Number(m.cacheReadTokens);
+    const denom = input + cacheRead;
+    out.push(`| ${m.model} | ${denom > 0 ? pct(cacheRead / denom) : "—"} |`);
+  }
+  out.push("");
+  out.push(`## Action-class distribution (tool events)`);
+  out.push(`| action class | events | share |`);
+  out.push(`|---|--:|--:|`);
+  for (const a of actionMix) {
+    out.push(`| ${a.actionClass ?? "—"} | ${num(a.n)} | ${pct(a.n / actionTotal)} |`);
+  }
+  out.push("");
+  out.push(`## Top sessions by cost (with action mix)`);
+  out.push(`| session | cost | tokens | action mix |`);
+  out.push(`|---|--:|--:|---|`);
+  for (const s of topSessions) {
+    const mix = (sessionMix.all(s.sessionId) as Array<{ actionClass: string | null; n: number }>)
+      .map((r) => `${r.actionClass ?? "—"} ${r.n}`)
+      .join(" · ");
+    out.push(`| ${s.sessionId.slice(0, 8)} | ${usd(s.costUsd)} | ${num(s.tokens)} | ${mix || "no tool events"} |`);
+  }
+  return out.join("\n");
+}
+
+function runPatterns(ledgerPath: string, sinceDays: number) {
+  const db = new Database(ledgerPath, { readonly: true });
+  const report = buildPatternsReport(db, sinceDays);
+  db.close();
+  console.log(report);
+}
+
 async function main() {
+  if (process.argv.includes("--patterns")) {
+    const sinceDays = Number(optionValue("--since-days") ?? 90);
+    const ledgerPath = optionValue("--ledger") ?? collectorBufferPath();
+    runPatterns(ledgerPath, sinceDays);
+    return;
+  }
   const repository = optionValue("--repository") ?? process.env.GITHUB_REPOSITORY;
   if (!repository?.includes("/")) {
     throw new Error("Pass --repository owner/repo or set GITHUB_REPOSITORY.");
@@ -277,7 +393,13 @@ async function main() {
   console.log(JSON.stringify(summary, null, 2));
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+// Only run when invoked directly, not when imported (e.g. the proof imports
+// buildPatternsReport). tsx sets process.argv[1] to this script's path.
+const invokedDirectly =
+  !!process.argv[1] && fileURLToPath(import.meta.url) === path.resolve(process.argv[1]);
+if (invokedDirectly) {
+  main().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}
