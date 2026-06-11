@@ -35,6 +35,7 @@ type SessionRow = {
   inputTokens: number | null;
   outputTokens: number | null;
   cacheReadTokens: number | null;
+  cacheCreationTokens: number | null;
   costUsd: number | null;
   events: number;
   editEvents: number;
@@ -93,7 +94,8 @@ async function main() {
       `select session_id as sessionId, source,
         min(observed_at) as startedAt, max(observed_at) as endedAt,
         sum(input_tokens) as inputTokens, sum(output_tokens) as outputTokens,
-        sum(cache_read_tokens) as cacheReadTokens, sum(cost_usd) as costUsd,
+        sum(cache_read_tokens) as cacheReadTokens,
+        sum(cache_creation_tokens) as cacheCreationTokens, sum(cost_usd) as costUsd,
         count(*) as events,
         sum(case when action_class in ('edit','write') then 1 else 0 end) as editEvents,
         sum(case when action_class = 'shell' then 1 else 0 end) as shellEvents,
@@ -191,6 +193,7 @@ async function main() {
     inputTokens: bucket.sessions.reduce((sum, row) => sum + (row.inputTokens ?? 0), 0),
     outputTokens: bucket.sessions.reduce((sum, row) => sum + (row.outputTokens ?? 0), 0),
     cacheReadTokens: bucket.sessions.reduce((sum, row) => sum + (row.cacheReadTokens ?? 0), 0),
+    cacheCreationTokens: bucket.sessions.reduce((sum, row) => sum + (row.cacheCreationTokens ?? 0), 0),
     costUsd: Number(bucket.sessions.reduce((sum, row) => sum + (row.costUsd ?? 0), 0).toFixed(4)),
   }));
 

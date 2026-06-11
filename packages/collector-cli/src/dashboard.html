@@ -269,6 +269,7 @@ tr.row:focus-visible{background:rgba(35,137,167,.12)}
         <dt>input tokens</dt><dd id="kv-in">—</dd>
         <dt>output tokens</dt><dd id="kv-out">—</dd>
         <dt>cache reads</dt><dd id="kv-cache">—</dd>
+        <dt>cache writes</dt><dd id="kv-cachew">—</dd>
         <dt>sessions</dt><dd id="kv-sessions">—</dd>
       </dl>
     </section>
@@ -528,6 +529,7 @@ async function openSession(id){
       <dt>token events</dt><dd>${fmt(d.rollup.tokenEvents)}</dd>
       <dt>tokens in / out</dt><dd>${fmt(d.rollup.inputTokens)} / ${fmt(d.rollup.outputTokens)}</dd>
       <dt>cache reads</dt><dd>${fmt(d.rollup.cacheReadTokens)}</dd>
+      ${d.rollup.cacheCreationTokens>0?`<dt>cache writes</dt><dd>${fmt(d.rollup.cacheCreationTokens)}</dd>`:""}
       <dt>cost</dt><dd><b>${usd(d.rollup.costUsd)}</b></dd>
     </dl>
     <h3>Join keys</h3>
@@ -614,7 +616,9 @@ async function refresh(){
     const t=s.totals;
     $("#fig-cost").innerHTML=usd(t.costUsd).replace(/^\$/, "<small>$</small>");
     $("#kv-in").textContent=fmt(t.inputTokens); $("#kv-out").textContent=fmt(t.outputTokens);
-    $("#kv-cache").textContent=fmt(t.cacheReadTokens); $("#kv-sessions").textContent=fmt(t.sessions);
+    $("#kv-cache").textContent=fmt(t.cacheReadTokens);
+    $("#kv-cachew").textContent=t.cacheCreationTokens>0?fmt(t.cacheCreationTokens):"—";
+    $("#kv-sessions").textContent=fmt(t.sessions);
     const pct=t.sessions?t.sessionsWithTokens/t.sessions:0;
     gauge(pct);
     $("#cov-note").textContent=`${fmt(t.sessionsWithTokens)} of ${fmt(t.sessions)} sessions carry token telemetry`;

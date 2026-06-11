@@ -12,6 +12,9 @@ export type ModelPrice = {
   input: number;
   cachedInput: number;
   output: number;
+  /** Cache-WRITE rate (USD per 1M). Anthropic bills writes ~1.25x input;
+   *  OpenAI does not bill writes separately, so it is omitted there. */
+  cacheWrite?: number;
   vendor: "openai" | "anthropic";
   asOf: string;
 };
@@ -26,17 +29,18 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   "gpt-5.2": { input: 1.75, cachedInput: 0.175, output: 14.0, vendor: "openai", asOf: "2026-06-10" },
   // Anthropic rates (platform.claude.com/docs pricing, fetched 2026-06-10).
   // cachedInput = cache HIT rate (0.1x input). Anthropic semantics differ
-  // from OpenAI: usage.input_tokens EXCLUDES cache reads. Cache WRITES bill
-  // 1.25x input but have no column yet (issue 0024) — estimates exclude
-  // them and are therefore a floor. Long-context (1m) tiers bill standard.
-  "claude-fable-5": { input: 10.0, cachedInput: 1.0, output: 50.0, vendor: "anthropic", asOf: "2026-06-10" },
-  "claude-opus-4-8": { input: 5.0, cachedInput: 0.5, output: 25.0, vendor: "anthropic", asOf: "2026-06-10" },
-  "claude-opus-4-7": { input: 5.0, cachedInput: 0.5, output: 25.0, vendor: "anthropic", asOf: "2026-06-10" },
-  "claude-opus-4-6": { input: 5.0, cachedInput: 0.5, output: 25.0, vendor: "anthropic", asOf: "2026-06-10" },
-  "claude-opus-4-5": { input: 5.0, cachedInput: 0.5, output: 25.0, vendor: "anthropic", asOf: "2026-06-10" },
-  "claude-sonnet-4-6": { input: 3.0, cachedInput: 0.3, output: 15.0, vendor: "anthropic", asOf: "2026-06-10" },
-  "claude-sonnet-4-5": { input: 3.0, cachedInput: 0.3, output: 15.0, vendor: "anthropic", asOf: "2026-06-10" },
-  "claude-haiku-4-5": { input: 1.0, cachedInput: 0.1, output: 5.0, vendor: "anthropic", asOf: "2026-06-10" },
+  // from OpenAI: usage.input_tokens EXCLUDES cache reads. cacheWrite = 1.25x
+  // input (5m TTL write); captured as a column since issue 0024 (#26), so
+  // estimates now include it instead of flooring. Long-context (1m) tiers
+  // bill standard.
+  "claude-fable-5": { input: 10.0, cachedInput: 1.0, output: 50.0, cacheWrite: 12.5, vendor: "anthropic", asOf: "2026-06-10" },
+  "claude-opus-4-8": { input: 5.0, cachedInput: 0.5, output: 25.0, cacheWrite: 6.25, vendor: "anthropic", asOf: "2026-06-10" },
+  "claude-opus-4-7": { input: 5.0, cachedInput: 0.5, output: 25.0, cacheWrite: 6.25, vendor: "anthropic", asOf: "2026-06-10" },
+  "claude-opus-4-6": { input: 5.0, cachedInput: 0.5, output: 25.0, cacheWrite: 6.25, vendor: "anthropic", asOf: "2026-06-10" },
+  "claude-opus-4-5": { input: 5.0, cachedInput: 0.5, output: 25.0, cacheWrite: 6.25, vendor: "anthropic", asOf: "2026-06-10" },
+  "claude-sonnet-4-6": { input: 3.0, cachedInput: 0.3, output: 15.0, cacheWrite: 3.75, vendor: "anthropic", asOf: "2026-06-10" },
+  "claude-sonnet-4-5": { input: 3.0, cachedInput: 0.3, output: 15.0, cacheWrite: 3.75, vendor: "anthropic", asOf: "2026-06-10" },
+  "claude-haiku-4-5": { input: 1.0, cachedInput: 0.1, output: 5.0, cacheWrite: 1.25, vendor: "anthropic", asOf: "2026-06-10" },
 };
 
 export function priceForModel(model: string | undefined): ModelPrice | undefined {
@@ -58,6 +62,7 @@ export function estimateCostUsd(options: {
   inputTokens?: number;
   outputTokens?: number;
   cacheReadTokens?: number;
+  cacheCreationTokens?: number;
 }): { costUsd: number; model: string; estimated: true } | undefined {
   const price = priceForModel(options.model);
   if (!price) return undefined;
@@ -69,9 +74,16 @@ export function estimateCostUsd(options: {
       ? Math.min(options.cacheReadTokens ?? 0, input)
       : options.cacheReadTokens ?? 0;
   const output = options.outputTokens ?? 0;
-  if (input === 0 && output === 0 && cached === 0) return undefined;
+  // Cache WRITES bill separately on Anthropic (1.25x input); OpenAI has no
+  // write surcharge so cacheWrite is unset there and this term is zero.
+  const cacheWrite = price.cacheWrite ? options.cacheCreationTokens ?? 0 : 0;
+  if (input === 0 && output === 0 && cached === 0 && cacheWrite === 0) return undefined;
   const billableInput = price.vendor === "openai" ? input - cached : input;
   const costUsd =
-    (billableInput * price.input + cached * price.cachedInput + output * price.output) / 1_000_000;
+    (billableInput * price.input +
+      cached * price.cachedInput +
+      cacheWrite * (price.cacheWrite ?? 0) +
+      output * price.output) /
+    1_000_000;
   return { costUsd: Number(costUsd.toFixed(6)), model: options.model as string, estimated: true };
 }

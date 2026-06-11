@@ -45,6 +45,7 @@ const EVENT_COLUMNS = [
   "input_tokens integer",
   "output_tokens integer",
   "cache_read_tokens integer",
+  "cache_creation_tokens integer",
   "cost_usd real",
   "uploaded_at text",
   "repo_hash text",
@@ -148,12 +149,12 @@ export class LocalEventBuffer {
         `insert or replace into buffered_events
           (id, source, event_type, data_mode, observed_at, payload_json, suppressed_fields_json,
            created_at, session_id, action_class, model, input_tokens, output_tokens,
-           cache_read_tokens, cost_usd, uploaded_at, repo_hash, branch_hash, head_sha,
+           cache_read_tokens, cache_creation_tokens, cost_usd, uploaded_at, repo_hash, branch_hash, head_sha,
            machine, account_hash)
         values
           (@id, @source, @eventType, @dataMode, @observedAt, @payloadJson, @suppressedFieldsJson,
            @createdAt, @sessionId, @actionClass, @model, @inputTokens, @outputTokens,
-           @cacheReadTokens, @costUsd, null, @repoHash, @branchHash, @headSha,
+           @cacheReadTokens, @cacheCreationTokens, @costUsd, null, @repoHash, @branchHash, @headSha,
            @machine, @accountHash)`,
       )
       .run({
@@ -171,6 +172,7 @@ export class LocalEventBuffer {
         inputTokens: event.inputTokens ?? null,
         outputTokens: event.outputTokens ?? null,
         cacheReadTokens: event.cacheReadTokens ?? null,
+        cacheCreationTokens: event.cacheCreationTokens ?? null,
         costUsd: event.costUsd ?? null,
         repoHash: gitField(event, "remoteUrlHash"),
         branchHash: gitField(event, "branchHash"),

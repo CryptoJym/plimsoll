@@ -212,12 +212,12 @@ export class TranscriptTailer {
         inputTokens: entry.input,
         outputTokens: entry.output,
         cacheReadTokens: entry.cacheRead,
+        cacheCreationTokens: entry.cacheCreation,
       });
       const metadata: Record<string, unknown> = {
         usageSource: "transcript",
         transcriptFile: path.basename(file),
       };
-      if (entry.cacheCreation > 0) metadata.cacheCreationTokens = entry.cacheCreation;
       if (priced) metadata.costEstimated = true;
       if (git) {
         metadata.git = {
@@ -239,6 +239,7 @@ export class TranscriptTailer {
         inputTokens: entry.input,
         outputTokens: entry.output,
         cacheReadTokens: entry.cacheRead,
+        cacheCreationTokens: entry.cacheCreation > 0 ? entry.cacheCreation : undefined,
         costUsd: priced?.costUsd,
         metadata,
       });

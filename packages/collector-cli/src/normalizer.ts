@@ -230,6 +230,15 @@ const CACHE_READ_TOKEN_KEYS = [
   "gen_ai.usage.cached_tokens",
 ];
 
+const CACHE_CREATION_TOKEN_KEYS = [
+  "cacheCreationTokens",
+  "cache_creation_tokens",
+  "cache_creation_input_tokens",
+  "cache_creation.input_tokens",
+  "gen_ai.usage.cache_creation_input_tokens",
+  "gen_ai.usage.cache_creation.input_tokens",
+];
+
 const COST_KEYS = [
   "costUsd",
   "cost_usd",
@@ -252,6 +261,7 @@ const ACTOR_ID_KEYS = [
 export const usageFieldKeys = {
   actorId: ACTOR_ID_KEYS,
   cacheReadTokens: CACHE_READ_TOKEN_KEYS,
+  cacheCreationTokens: CACHE_CREATION_TOKEN_KEYS,
   costUsd: COST_KEYS,
   inputTokens: INPUT_TOKEN_KEYS,
   model: MODEL_KEYS,
@@ -388,6 +398,7 @@ export function normalizeHookPayload(
     inputTokens: numberFromRecords(sourceRecords, INPUT_TOKEN_KEYS),
     outputTokens: numberFromRecords(sourceRecords, OUTPUT_TOKEN_KEYS),
     cacheReadTokens: numberFromRecords(sourceRecords, CACHE_READ_TOKEN_KEYS),
+    cacheCreationTokens: numberFromRecords(sourceRecords, CACHE_CREATION_TOKEN_KEYS),
     costUsd: numberFromRecords(sourceRecords, COST_KEYS),
     metadata,
   });
