@@ -26,9 +26,9 @@ A history-upload command in collector-cli (sibling of `upload`): full-history wa
 
 ## Acceptance Criteria
 - [x] `upload-history --dry-run` audits with zero network (proofed via loopback fetch counter on the unjoined path + dry-run mode).
-- [ ] Live run completes; audit table per source × month with honest cost (unpriced never $0.00), skips itemized.
-- [ ] Server-side verification (read-only Prisma): per-source counts match accepted; `count(distinct id) = count(*)`; observedAt span covers the ledger's history.
-- [ ] Second full run over the same `--until`: same accepted totals, cloud row count UNCHANGED (delta 0).
+- [x] Live run completed 2026-06-11 (T1 scope = 2026-06-11T20:18:04Z): 832,886/832,886 accepted, 0 skipped, audit per source × month with honest cost (unpriced never $0.00); evidence on the GitHub issue.
+- [x] Server-side verification (read-only Prisma): every source × month cell matches the audit EXACTLY (codex 04: 2,930 / claude 05: 1,009 / codex 05: 213,294 / claude 06: 98,061 / codex 06: 517,592); `count(distinct id) = count(*)` in every cell; observedAt span 2026-04-23T23:57:38Z → 2026-06-11T20:17:47Z.
+- [x] Second full run over the same `--until`: identical audit, accepted 832,886, server-reported `inserted: 0` across all 1,666 batches, cloud count delta EXACTLY 0 (832,886 before and after; 0 rows created in the run-2 window).
 - [x] `pnpm proof` green: 66 → 76 checks; `history_batches_obey_ingest_contract` demonstrably fails when the ≤500 cap is removed.
 
 ## Operational Boundaries
@@ -39,8 +39,8 @@ A history-upload command in collector-cli (sibling of `upload`): full-history wa
 ## Notes For Future Agents
 - The ingest response echoes `installKey` — anything that prints a response must redact.
 - Cloud DB growth: ~820k rows ≈ 700 MB+ table+index growth. The daemon's drain was already heading there; plan headroom is a deploy-owner call.
-- Per-event ~300 ms is the cloud's sequential upsert loop; a server-side batched upsert would remove it (private repo).
+- The ~300 ms/event sequential-upsert bottleneck was fixed mid-rollout by the cloud's bulk fast lane (plimsoll-cloud PR #19); observed live throughput went ~15 → ~525 → ~1,560 evt/s. First-writer-wins: re-sends no longer refresh enriched payloads on existing rows.
+- The resume watermark proved itself live twice: the run-1 process was killed mid-flight (54,500 events in) and resumed exactly, zero loss, zero double-count.
 
 ## Open Questions
 - Should `buildIngestBatch` get the same null-strip normalization so the daemon can't wedge on stitch artifacts (follow-up sounding)?
-- Cloud-side batch upsert to cut ~300 ms/event — private-repo issue?
