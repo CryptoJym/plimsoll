@@ -1,6 +1,6 @@
 {
   "name": "@plimsoll/cli",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Plimsoll \u2014 the load line for your AI spend. Local-first telemetry collector + dashboard for Claude Code & Codex.",
   "license": "Apache-2.0",
   "repository": {
