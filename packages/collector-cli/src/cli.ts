@@ -37,6 +37,7 @@ import {
 } from "../../collector-config/src/index";
 import type { ToolSource } from "../../shared/src/index";
 import { uploadBufferedEvents } from "./upload";
+import { runWorkspaceHistoryUpload } from "./upload-history";
 
 const command = process.argv[2] ?? "help";
 
@@ -64,6 +65,11 @@ Commands:
   generate-config TOOL  Print Claude Code or Codex config for metadata collection
   setup                 APPLY the Claude Code + Codex telemetry config (idempotent; --yes, --dry-run)
   upload                Drain un-uploaded events to the tenant ingest API (marks rows, keeps local copies)
+  upload-history        Workspace backfill: push the FULL ledger history to the joined
+                        workspace, idempotently, then print a reconciliation audit.
+                        Ledger is opened read-only; rows are never marked uploaded.
+                        Safe alongside the live 5-minute sync: the cloud upserts by
+                        event id, so overlap deduplicates instead of duplicating.
   scan-rollouts         Read codex rollout files into the ledger once (full history walk)
   scan-transcripts      Read Claude Code transcript usage into the ledger once (full history walk)
   install-launch-agent  Write the user LaunchAgent plist
@@ -80,6 +86,12 @@ Config tools:
   join "<join-url>#<token>" | join <token> --url <cloud-base-url>   (env: PLIMSOLL_CLOUD_URL)
   generate-config claude-code|codex|all [--evidence --confirm-evidence]
   upload [--url URL --limit 500] [--ingest-key KEY] [--signing-secret SECRET] [--no-mark] [--max-batches 20]
+  upload-history [--dry-run] [--full] [--until ISO] [--limit N] [--batch-size 500] [--concurrency 1..8] [--delay-ms 250] [--url URL]
+      Default resumes from the local watermark (workspace-backfill-state.json) and scopes
+      to rows created at-or-before the run start. --full re-walks everything (re-runs are
+      safe: identical event ids upsert in place — run twice, nothing duplicates). --dry-run
+      audits eligibility with zero network. Skipped rows are itemized with reasons; unpriced
+      events stay unpriced in the audit.
   install-launch-agent [--repo-root PATH] [--pnpm PATH] [--load]
   load-launch-agent
   unload-launch-agent
@@ -772,6 +784,32 @@ async function main() {
       ),
     );
     buffer.close();
+    return;
+  }
+
+  if (command === "upload-history") {
+    // Workspace backfill (issue 0035): the full ledger history, read-only,
+    // idempotent by event id. Progress and the final reconciliation audit go
+    // to stdout; the server response is never echoed (it can contain the
+    // install key).
+    const numberOption = (name: string) => {
+      const raw = optionValue(name);
+      if (raw === undefined) return undefined;
+      const value = Number(raw);
+      if (!Number.isFinite(value)) throw new Error(`${name} expects a number, got: ${raw}`);
+      return value;
+    };
+    const result = await runWorkspaceHistoryUpload(config, {
+      until: optionValue("--until"),
+      batchSize: numberOption("--batch-size"),
+      concurrency: numberOption("--concurrency"),
+      delayMs: numberOption("--delay-ms"),
+      limit: numberOption("--limit"),
+      full: flag("--full"),
+      dryRun: flag("--dry-run"),
+      url: optionValue("--url"),
+    });
+    if (!result.ok) process.exitCode = 1;
     return;
   }
 

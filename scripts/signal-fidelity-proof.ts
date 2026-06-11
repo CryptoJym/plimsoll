@@ -37,10 +37,19 @@
  *      collector.config.json only when the server accepts the token, the
  *      handshake upload rides the real signed sync path, and a refused
  *      token leaves the config byte-identical with a clear reason.
+ *  16. Workspace backfill (issue 0035): `upload-history` pushes the FULL
+ *      ledger history read-only through the signed ingest path — stitch-null
+ *      payloads are repaired, non-UUID ids derive deterministically, batches
+ *      obey the ≤500/byte contract, the reconciliation audit's math is honest
+ *      (unpriced never renders as $0.00), forbidden metadata never crosses the
+ *      wire, a second full run grows the workspace by exactly zero rows, an
+ *      interrupted run resumes from the watermark without double-counting,
+ *      and an unjoined machine is refused before any network.
  *
  * Run: pnpm plimsoll:signal-fidelity-proof
  */
 import { spawnSync } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -52,8 +61,21 @@ import Database from "better-sqlite3";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigPath, collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { performJoin } from "../packages/collector-cli/src/join";
+import { deterministicEventId } from "../packages/collector-cli/src/normalizer";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
+import {
+  chunkHistoryEnvelopes,
+  createHistoryAudit,
+  ensureUuidEventId,
+  historyAuditTotals,
+  normalizeHistoryEvent,
+  readBackfillState,
+  recordHistoryEligible,
+  recordHistorySkip,
+  renderHistoryAudit,
+  runWorkspaceHistoryUpload,
+} from "../packages/collector-cli/src/upload-history";
 import {
   branchLinkageHash,
   remoteLinkageHash,
@@ -72,7 +94,12 @@ import { TranscriptTailer } from "../packages/collector-cli/src/transcript-taile
 import { MODEL_PRICING } from "../packages/shared/src/pricing";
 import { buildPatternsReport, validatedDeliveryYieldV2 } from "./efficiency-report";
 import { readLocalIdentities } from "../packages/collector-cli/src/local-identity";
-import { aiInteractionEventSchema } from "../packages/shared/src/index";
+import {
+  aiInteractionEventSchema,
+  aiWorkIngestBatchSchema,
+  findForbiddenRawContentFields,
+  type AiInteractionEvent,
+} from "../packages/shared/src/index";
 import {
   applyClaudeSettings,
   applyCodexConfig,
@@ -1636,6 +1663,479 @@ async function main() {
     } else {
       process.env.PLIMSOLL_HOME = previousPlimsollHome;
     }
+  }
+
+  // 16. Workspace backfill (issue 0035): upload-history pushes the FULL
+  // ledger history, read-only, idempotent by event id, with an honest
+  // reconciliation audit. Pure pieces first, then a loopback end-to-end
+  // against a stub workspace that verifies signatures exactly like the cloud.
+  {
+    // 16a. Row → envelope normalization: the reconcileCodexUsage stitch
+    // artifact (json_set writes `sessionId: null`) must repair into a
+    // schema-valid envelope without inventing values; a null REQUIRED field
+    // stays a skip with a reason.
+    const stitchArtifact = JSON.stringify({
+      id: "9c1c1111-2222-5333-9444-555555555555",
+      sessionId: null,
+      model: null,
+      costUsd: null,
+      source: "codex",
+      dataMode: "metadata",
+      eventType: "assistant_response",
+      observedAt: "2026-03-01T00:00:00.000Z",
+      intent: "unknown",
+      actionClass: "other",
+      inputTokens: 120,
+      outputTokens: 34,
+      metadata: { stitched: null },
+    });
+    const repaired = normalizeHistoryEvent({ payloadJson: stitchArtifact, suppressedFieldsJson: '["arguments"]' });
+    const nullRequired = normalizeHistoryEvent({
+      payloadJson: JSON.stringify({ id: "11111111-2222-5333-9444-555555555555", source: "codex", eventType: "assistant_response", observedAt: null }),
+      suppressedFieldsJson: "[]",
+    });
+    const unparseable = normalizeHistoryEvent({ payloadJson: "{not json", suppressedFieldsJson: "[]" });
+    check(
+      "history_normalize_repairs_stitch_nulls_honestly",
+      repaired.ok &&
+        !("sessionId" in repaired.envelope.event) &&
+        !("model" in repaired.envelope.event) &&
+        repaired.envelope.event.costUsd === undefined &&
+        repaired.envelope.event.inputTokens === 120 &&
+        repaired.envelope.event.outputTokens === 34 &&
+        repaired.envelope.suppressedFields.includes("arguments") &&
+        aiInteractionEventSchema.safeParse(repaired.envelope.event).success &&
+        !nullRequired.ok &&
+        nullRequired.reason === "schema_invalid" &&
+        !unparseable.ok &&
+        unparseable.reason === "payload_unparseable",
+      JSON.stringify({
+        repairedKeysDropped: repaired.ok ? ["sessionId", "model", "costUsd"].filter((key) => !(key in repaired.envelope.event)) : [],
+        nullRequired: nullRequired.ok ? null : nullRequired.reason,
+        unparseable: unparseable.ok ? null : unparseable.reason,
+      }),
+    );
+
+    // 16b. Event-id rule: anything Postgres' uuid column accepts passes
+    // through VERBATIM (the daemon uploads ledger ids as-is — re-deriving
+    // those would split one row into two cloud rows); anything else derives
+    // the SAME uuid on every run and keeps the original in metadata.
+    const v4 = "2b866c49-6f64-4ac1-9d6b-d9ce0aa64166";
+    const v7 = "019e0000-aaaa-7bbb-8ccc-dddddddddddd";
+    const derivedOnce = ensureUuidEventId("self_test_1749670000000");
+    const derivedTwice = ensureUuidEventId("self_test_1749670000000");
+    const derivedOther = ensureUuidEventId("self_test_1749670000001");
+    const uuidShape = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+    const legacyNormalized = normalizeHistoryEvent({
+      payloadJson: JSON.stringify({
+        id: "self_test_1749670000000",
+        source: "claude_code",
+        eventType: "user_prompt_submit",
+        observedAt: "2026-03-02T00:00:00.000Z",
+      }),
+      suppressedFieldsJson: "[]",
+    });
+    check(
+      "history_event_ids_idempotent_uuid_mapping",
+      ensureUuidEventId(v4).id === v4 &&
+        !ensureUuidEventId(v4).derived &&
+        ensureUuidEventId(v7).id === v7 &&
+        !ensureUuidEventId(v7).derived &&
+        derivedOnce.derived &&
+        derivedOnce.id === derivedTwice.id &&
+        derivedOnce.id !== derivedOther.id &&
+        uuidShape.test(derivedOnce.id) &&
+        legacyNormalized.ok &&
+        legacyNormalized.envelope.event.id === derivedOnce.id &&
+        legacyNormalized.envelope.event.metadata.externalEventId === "self_test_1749670000000",
+      JSON.stringify({ derived: derivedOnce.id, stable: derivedOnce.id === derivedTwice.id, v7Passthrough: ensureUuidEventId(v7).id === v7 }),
+    );
+
+    // 16c. Chunking obeys the ingest contract: ≤500 events, byte budget
+    // splits but never drops, order preserved, every batch parses against
+    // aiWorkIngestBatchSchema.
+    const syntheticItems = Array.from({ length: 1234 }, (_, index) => ({ bytes: 100, index }));
+    const chunked = chunkHistoryEnvelopes(syntheticItems, {});
+    const flat = chunked.flat().map((item) => item.index);
+    const byteItems = [{ bytes: 500, index: 0 }, { bytes: 400, index: 1 }, { bytes: 2_000_000, index: 2 }, { bytes: 10, index: 3 }];
+    const byteChunked = chunkHistoryEnvelopes(byteItems, { maxEvents: 500, maxBytes: 1000 });
+    const contractBatch = aiWorkIngestBatchSchema.safeParse({
+      installKey: "pli_history_contract",
+      events: Array.from({ length: 500 }, (_, index) => ({
+        event: {
+          id: deterministicEventId(["history-contract", index]),
+          source: "codex",
+          eventType: "assistant_response",
+          observedAt: "2026-03-01T00:00:00.000Z",
+        },
+        suppressedFields: [],
+      })),
+    });
+    check(
+      "history_batches_obey_ingest_contract",
+      chunked.length === Math.ceil(1234 / 500) &&
+        chunked.every((batch) => batch.length <= 500) &&
+        flat.length === 1234 &&
+        flat.every((value, index) => value === index) &&
+        byteChunked.length === 3 &&
+        byteChunked[0].length === 2 &&
+        byteChunked[1].length === 1 &&
+        byteChunked[2].length === 1 &&
+        contractBatch.success,
+      JSON.stringify({ batches: chunked.map((batch) => batch.length), byteBatches: byteChunked.map((batch) => batch.length) }),
+    );
+
+    // 16d. Audit math stays honest: exact counts and token sums per
+    // source×month, unpriced cells render as "unpriced" — never a fabricated
+    // $0.00 — and skips are itemized.
+    const audit = createHistoryAudit();
+    const auditEvent = (overrides: Partial<AiInteractionEvent>): AiInteractionEvent =>
+      aiInteractionEventSchema.parse({
+        id: deterministicEventId(["history-audit", JSON.stringify(overrides)]),
+        source: "codex",
+        eventType: "assistant_response",
+        observedAt: "2026-01-10T00:00:00.000Z",
+        ...overrides,
+      });
+    for (let index = 0; index < 3; index += 1) {
+      recordHistoryEligible(audit, auditEvent({ inputTokens: 10, outputTokens: 5, costUsd: 0.5, observedAt: "2026-01-10T00:00:00.000Z" }));
+    }
+    recordHistoryEligible(audit, auditEvent({ source: "claude_code", inputTokens: 7, observedAt: "2026-02-01T00:00:00.000Z" }));
+    recordHistorySkip(audit, "forbidden_content");
+    recordHistorySkip(audit, "schema_invalid", 2);
+    const totals = historyAuditTotals(audit);
+    const table = renderHistoryAudit(audit);
+    check(
+      "history_audit_math_is_honest",
+      audit.cells["codex|2026-01"]?.localEvents === 3 &&
+        audit.cells["codex|2026-01"]?.inputTokens === 30 &&
+        audit.cells["codex|2026-01"]?.costUsd === 1.5 &&
+        audit.cells["codex|2026-01"]?.pricedEvents === 3 &&
+        audit.cells["claude_code|2026-02"]?.localEvents === 1 &&
+        audit.cells["claude_code|2026-02"]?.pricedEvents === 0 &&
+        totals.localEvents === 4 &&
+        totals.inputTokens === 37 &&
+        /claude_code\s+2026-02\s+1\s+7\s+0\s+unpriced/.test(table) &&
+        !table.includes("$0.00") &&
+        /forbidden_content: 1/.test(table) &&
+        /schema_invalid: 2/.test(table),
+      JSON.stringify({ totals: { localEvents: totals.localEvents, inputTokens: totals.inputTokens }, unpricedRendered: /unpriced/.test(table) }),
+    );
+
+    // 16e–16i. Loopback end-to-end: a seeded ledger (incl. one live-shape
+    // stitch artifact via the same json_set SQL, one forbidden-metadata row,
+    // one unparseable row, one bogus event type) pushed to a stub workspace
+    // that verifies HMAC signatures exactly like the cloud and upserts by id.
+    const historyHome = path.join(tempDir, "history-home");
+    fs.mkdirSync(historyHome, { recursive: true });
+    const historyLedgerPath = path.join(historyHome, "history-ledger.sqlite");
+    const HISTORY_RAW_SENTINEL = "RAW_PROMPT_SENTINEL_HISTORY rm -rf /tmp/secret";
+    const seedBuffer = new LocalEventBuffer(historyLedgerPath);
+    const seededIds: string[] = [];
+    const seedEvent = (index: number): AiInteractionEvent =>
+      aiInteractionEventSchema.parse({
+        id: deterministicEventId(["history-e2e", index]),
+        sessionId: SESSION,
+        source: index % 2 === 0 ? "codex" : "claude_code",
+        dataMode: "metadata",
+        eventType: "assistant_response",
+        observedAt: new Date(Date.UTC(2026, index < 600 ? 0 : 1, 1) + index * 1000).toISOString(),
+        model: "proof-model",
+        inputTokens: 10,
+        outputTokens: 5,
+        ...(index < 100 ? { costUsd: 0.01 } : {}),
+      });
+    for (let index = 0; index < 250; index += 1) {
+      const event = seedEvent(index);
+      seededIds.push(event.id);
+      seedBuffer.append(event, ["tool_input"]);
+    }
+    // Live-shape stitch artifact: the exact json_set the daemon runs.
+    const stitchId = deterministicEventId(["history-e2e-stitch", 1]);
+    seedBuffer.append(
+      aiInteractionEventSchema.parse({
+        id: stitchId,
+        source: "codex",
+        eventType: "assistant_response",
+        observedAt: "2026-02-10T00:00:00.000Z",
+        inputTokens: 11,
+        outputTokens: 3,
+      }),
+      [],
+    );
+    seededIds.push(stitchId);
+    seedBuffer.database
+      .prepare(`update buffered_events set payload_json = json_set(payload_json, '$.sessionId', null, '$.model', null) where id = ?`)
+      .run(stitchId);
+    // Forbidden metadata row (must be skipped client-side, never uploaded).
+    seedBuffer.append(
+      aiInteractionEventSchema.parse({
+        id: deterministicEventId(["history-e2e-forbidden", 1]),
+        source: "claude_code",
+        eventType: "user_prompt_submit",
+        observedAt: "2026-02-11T00:00:00.000Z",
+        metadata: { prompt: HISTORY_RAW_SENTINEL },
+      }),
+      [],
+    );
+    // Unparseable payload + bogus event type (skip reasons must be itemized).
+    seedBuffer.database
+      .prepare(
+        `insert into buffered_events (id, source, event_type, data_mode, observed_at, payload_json, suppressed_fields_json, created_at)
+         values ('history-broken-json', 'codex', 'unknown', 'metadata', '2026-02-12T00:00:00.000Z', '{not json', '[]', '2026-02-12T00:00:00.000Z')`,
+      )
+      .run();
+    seedBuffer.append(
+      {
+        ...seedEvent(9_999),
+        id: deterministicEventId(["history-e2e-bogus", 1]),
+        eventType: "totally_bogus" as AiInteractionEvent["eventType"],
+      },
+      [],
+    );
+    for (let index = 250; index < 1_120; index += 1) {
+      const event = seedEvent(index);
+      seededIds.push(event.id);
+      seedBuffer.append(event, ["tool_input"]);
+    }
+    seedBuffer.close();
+    const expectedEligible = 1_121; // 1,120 normal + repaired stitch artifact
+
+    const HISTORY_INSTALL_KEY = "pli_historyproofkey00000000000001";
+    const HISTORY_SECRET = "history-proof-signing-secret-0123456789";
+    const historyStore = new Map<string, unknown>();
+    let historyRequests = 0;
+    let historySignatureFailures = 0;
+    let historyMaxBatch = 0;
+    let historyForbiddenHits = 0;
+    const historyBodies: string[] = [];
+    const historyServer = http.createServer((request, response) => {
+      let body = "";
+      request.on("data", (chunk) => (body += chunk));
+      request.on("end", () => {
+        historyRequests += 1;
+        historyBodies.push(body);
+        const timestamp = String(request.headers["x-plimsoll-upload-timestamp"] ?? "");
+        const signature = String(request.headers["x-plimsoll-upload-signature"] ?? "");
+        const expected = `sha256=${crypto.createHmac("sha256", HISTORY_SECRET).update(`${timestamp}.${body}`).digest("hex")}`;
+        if (!timestamp || signature !== expected) {
+          historySignatureFailures += 1;
+          response.writeHead(401, { "content-type": "application/json" });
+          response.end(JSON.stringify({ error: "bad_upload_signature" }));
+          return;
+        }
+        const batch = aiWorkIngestBatchSchema.parse(JSON.parse(body));
+        historyMaxBatch = Math.max(historyMaxBatch, batch.events.length);
+        for (const entry of batch.events) {
+          if (findForbiddenRawContentFields(entry.event.metadata).length > 0) {
+            historyForbiddenHits += 1;
+          }
+          historyStore.set(entry.event.id, entry.event);
+        }
+        response.writeHead(200, { "content-type": "application/json" });
+        // Mirrors production: the response echoes the install key — the CLI
+        // must never print it.
+        response.end(JSON.stringify({ ok: true, accepted: batch.events.length, installKey: HISTORY_INSTALL_KEY }));
+      });
+    });
+    await new Promise<void>((resolve) => historyServer.listen(0, "127.0.0.1", () => resolve()));
+    const historyPort = (historyServer.address() as AddressInfo).port;
+    const historyConfig = collectorConfigSchema.parse({
+      uploadUrl: `http://127.0.0.1:${historyPort}/api/work-intelligence/ingest`,
+      installKey: HISTORY_INSTALL_KEY,
+      uploadSigningSecret: HISTORY_SECRET,
+      tenantId: "44444444-5555-4666-8777-888888888888",
+    });
+
+    const historyLogs: string[] = [];
+    const historyStatePath = path.join(historyHome, "workspace-backfill-state.json");
+    const run1 = await runWorkspaceHistoryUpload(historyConfig, {
+      ledgerPath: historyLedgerPath,
+      statePath: historyStatePath,
+      batchSize: 200,
+      pageSize: 500,
+      concurrency: 3,
+      delayMs: 0,
+      maxAttemptsPerBatch: 2,
+      log: (line) => historyLogs.push(line),
+    });
+    const state1 = readBackfillState(historyStatePath);
+    check(
+      "history_e2e_full_ledger_reaches_workspace",
+      run1.ok &&
+        run1.completed &&
+        run1.eligibleEvents === expectedEligible &&
+        run1.acceptedEvents === expectedEligible &&
+        run1.sentEvents === expectedEligible &&
+        historyStore.size === expectedEligible &&
+        seededIds.every((id) => historyStore.has(id)) &&
+        run1.skippedEvents === 3 &&
+        run1.audit.skipped.forbidden_content === 1 &&
+        run1.audit.skipped.payload_unparseable === 1 &&
+        run1.audit.skipped.schema_invalid === 1 &&
+        historyMaxBatch <= 200 &&
+        historySignatureFailures === 0 &&
+        historyAuditTotals(run1.audit).localEvents === expectedEligible &&
+        historyAuditTotals(run1.audit).inputTokens === expectedEligible * 10 + 1 &&
+        state1?.completedAt !== null &&
+        state1?.watermark !== null,
+      JSON.stringify({
+        accepted: run1.acceptedEvents,
+        storeSize: historyStore.size,
+        skipped: run1.audit.skipped,
+        batches: run1.batchesSent,
+        maxBatch: historyMaxBatch,
+      }),
+    );
+
+    check(
+      "history_upload_bodies_stay_metadata_only",
+      historyBodies.length > 0 &&
+        historyBodies.every((requestBody) => !requestBody.includes(HISTORY_RAW_SENTINEL)) &&
+        historyBodies.every((requestBody) => !requestBody.includes(os.hostname())) &&
+        historyLogs.every((line) => !line.includes(HISTORY_INSTALL_KEY)) &&
+        run1.auditTable.length > 0 &&
+        !run1.auditTable.includes(HISTORY_INSTALL_KEY),
+      JSON.stringify({ bodies: historyBodies.length, sentinelLeaked: historyBodies.some((requestBody) => requestBody.includes(HISTORY_RAW_SENTINEL)) }),
+    );
+
+    // 16f. Idempotency: a second FULL run over the same scope re-upserts the
+    // same ids — the workspace grows by exactly zero rows.
+    const storeSizeBeforeRun2 = historyStore.size;
+    const idsBeforeRun2 = [...historyStore.keys()].sort().join(",");
+    const run2 = await runWorkspaceHistoryUpload(historyConfig, {
+      ledgerPath: historyLedgerPath,
+      statePath: historyStatePath,
+      until: run1.until,
+      full: true,
+      batchSize: 200,
+      pageSize: 500,
+      concurrency: 3,
+      delayMs: 0,
+      maxAttemptsPerBatch: 2,
+      log: (line) => historyLogs.push(line),
+    });
+    check(
+      "history_second_run_grows_workspace_by_zero",
+      run2.ok &&
+        run2.completed &&
+        run2.acceptedEvents === expectedEligible &&
+        historyStore.size === storeSizeBeforeRun2 &&
+        [...historyStore.keys()].sort().join(",") === idsBeforeRun2 &&
+        run2.skippedEvents === 3,
+      JSON.stringify({ before: storeSizeBeforeRun2, after: historyStore.size, accepted: run2.acceptedEvents }),
+    );
+
+    // 16g. Resume: an interrupted run continues from the watermark, the union
+    // covers everything, and the cumulative audit never double-counts.
+    const resumeStatePath = path.join(historyHome, "workspace-backfill-state-resume.json");
+    const resumeStore = new Map<string, unknown>();
+    const resumeFetch: typeof fetch = async (input, init) => {
+      const body = String(init?.body ?? "");
+      const batch = aiWorkIngestBatchSchema.parse(JSON.parse(body));
+      for (const entry of batch.events) resumeStore.set(entry.event.id, entry.event);
+      void input;
+      return new Response(JSON.stringify({ ok: true, accepted: batch.events.length }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const resumeA = await runWorkspaceHistoryUpload(historyConfig, {
+      ledgerPath: historyLedgerPath,
+      statePath: resumeStatePath,
+      limit: 200,
+      batchSize: 200,
+      pageSize: 500,
+      concurrency: 1,
+      delayMs: 0,
+      fetchImpl: resumeFetch,
+      log: (line) => historyLogs.push(line),
+    });
+    const resumeStateMid = readBackfillState(resumeStatePath);
+    const resumeB = await runWorkspaceHistoryUpload(historyConfig, {
+      ledgerPath: historyLedgerPath,
+      statePath: resumeStatePath,
+      batchSize: 200,
+      pageSize: 500,
+      concurrency: 1,
+      delayMs: 0,
+      fetchImpl: resumeFetch,
+      log: (line) => historyLogs.push(line),
+    });
+    check(
+      "history_resume_covers_everything_without_double_count",
+      resumeA.ok &&
+        !resumeA.completed &&
+        resumeA.sentEvents === 200 &&
+        resumeStateMid?.completedAt === null &&
+        resumeStateMid?.watermark !== null &&
+        resumeB.ok &&
+        resumeB.completed &&
+        resumeB.resumedFromRowid !== null &&
+        resumeStore.size === expectedEligible &&
+        seededIds.every((id) => resumeStore.has(id)) &&
+        historyAuditTotals(resumeB.audit).localEvents === expectedEligible &&
+        historyAuditTotals(resumeB.audit).sentEvents === expectedEligible &&
+        resumeB.skippedEvents === 3,
+      JSON.stringify({
+        firstRunSent: resumeA.sentEvents,
+        resumedFromRowid: resumeB.resumedFromRowid,
+        unionSize: resumeStore.size,
+        cumulativeLocal: historyAuditTotals(resumeB.audit).localEvents,
+      }),
+    );
+
+    // 16h. Unjoined machines are refused before any network happens.
+    let unjoinedFetches = 0;
+    const unjoinedFetch: typeof fetch = async () => {
+      unjoinedFetches += 1;
+      throw new Error("must not be called");
+    };
+    let unjoinedError = "";
+    try {
+      await runWorkspaceHistoryUpload(collectorConfigSchema.parse({}), {
+        ledgerPath: historyLedgerPath,
+        statePath: path.join(historyHome, "unjoined-state.json"),
+        fetchImpl: unjoinedFetch,
+        log: () => undefined,
+      });
+    } catch (error) {
+      unjoinedError = error instanceof Error ? error.message : String(error);
+    }
+    check(
+      "history_upload_requires_join",
+      /join/.test(unjoinedError) && /uploadUrl|workspace/.test(unjoinedError) && unjoinedFetches === 0,
+      JSON.stringify({ error: unjoinedError.slice(0, 120), fetches: unjoinedFetches }),
+    );
+
+    // 16i. Auth/signature failures FAIL CLOSED: no retry storm, watermark
+    // intact, clear guidance.
+    const badSecretConfig = collectorConfigSchema.parse({
+      ...historyConfig,
+      uploadSigningSecret: "wrong-secret-wrong-secret-000000",
+    });
+    const failClosedLogs: string[] = [];
+    const failClosed = await runWorkspaceHistoryUpload(badSecretConfig, {
+      ledgerPath: historyLedgerPath,
+      statePath: path.join(historyHome, "fail-closed-state.json"),
+      batchSize: 200,
+      pageSize: 500,
+      concurrency: 1,
+      delayMs: 0,
+      maxAttemptsPerBatch: 5,
+      log: (line) => failClosedLogs.push(line),
+    });
+    check(
+      "history_auth_failure_fails_closed",
+      !failClosed.ok &&
+        failClosed.acceptedEvents === 0 &&
+        /401/.test(failClosed.reason ?? "") &&
+        /signature|credentials/i.test(failClosed.reason ?? "") &&
+        !failClosedLogs.some((line) => line.includes("workspace_backfill_retry")),
+      JSON.stringify({ reason: (failClosed.reason ?? "").slice(0, 140), accepted: failClosed.acceptedEvents }),
+    );
+
+    await new Promise<void>((resolve) => historyServer.close(() => resolve()));
   }
 
   fs.rmSync(tempDir, { recursive: true, force: true });
