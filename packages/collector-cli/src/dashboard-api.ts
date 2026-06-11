@@ -58,6 +58,7 @@ export function dashboardSummary(db: Database.Database, days = 30) {
         coalesce(sum(input_tokens), 0) as inputTokens,
         coalesce(sum(output_tokens), 0) as outputTokens,
         coalesce(sum(cache_read_tokens), 0) as cacheReadTokens,
+        coalesce(sum(cache_creation_tokens), 0) as cacheCreationTokens,
         coalesce(sum(cost_usd), 0) as costUsd,
         count(distinct session_id) as sessions,
         count(distinct case when input_tokens is not null then session_id end) as sessionsWithTokens,
@@ -99,6 +100,7 @@ export function dashboardSummary(db: Database.Database, days = 30) {
         coalesce(sum(input_tokens), 0) as inputTokens,
         coalesce(sum(output_tokens), 0) as outputTokens,
         coalesce(sum(cache_read_tokens), 0) as cacheReadTokens,
+        coalesce(sum(cache_creation_tokens), 0) as cacheCreationTokens,
         coalesce(sum(cost_usd), 0) as costUsd
       from buffered_events
       where observed_at >= ? and model is not null
@@ -215,6 +217,7 @@ export function dashboardSessionDetail(db: Database.Database, sessionId: string)
         coalesce(sum(input_tokens), 0) as inputTokens,
         coalesce(sum(output_tokens), 0) as outputTokens,
         coalesce(sum(cache_read_tokens), 0) as cacheReadTokens,
+        coalesce(sum(cache_creation_tokens), 0) as cacheCreationTokens,
         coalesce(sum(cost_usd), 0) as costUsd,
         sum(case when input_tokens is not null then 1 else 0 end) as tokenEvents
       from buffered_events where session_id = ? group by session_id, source`,
@@ -250,6 +253,8 @@ export function dashboardSessionDetail(db: Database.Database, sessionId: string)
         `select model, count(*) as calls,
           coalesce(sum(input_tokens), 0) as inputTokens,
           coalesce(sum(output_tokens), 0) as outputTokens,
+          coalesce(sum(cache_read_tokens), 0) as cacheReadTokens,
+          coalesce(sum(cache_creation_tokens), 0) as cacheCreationTokens,
           coalesce(sum(cost_usd), 0) as costUsd
         from buffered_events where session_id = ? and model is not null
         group by model order by costUsd desc`,

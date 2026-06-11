@@ -156,6 +156,7 @@ function buildLogEvent(
   const inputTokens = intTokens(numberField(attrs, [...usageFieldKeys.inputTokens]));
   const outputTokens = intTokens(numberField(attrs, [...usageFieldKeys.outputTokens]));
   const cacheReadTokens = intTokens(numberField(attrs, [...usageFieldKeys.cacheReadTokens]));
+  const cacheCreationTokens = intTokens(numberField(attrs, [...usageFieldKeys.cacheCreationTokens]));
   let costUsd = numberField(attrs, [...usageFieldKeys.costUsd]);
   let costEstimated = false;
   if (costUsd === undefined) {
@@ -164,6 +165,7 @@ function buildLogEvent(
       inputTokens,
       outputTokens,
       cacheReadTokens,
+      cacheCreationTokens,
     });
     if (estimate) {
       costUsd = estimate.costUsd;
@@ -215,6 +217,7 @@ function buildLogEvent(
     inputTokens,
     outputTokens,
     cacheReadTokens,
+    cacheCreationTokens,
     costUsd: costUsd !== undefined && costUsd >= 0 ? costUsd : undefined,
     metadata: {
       ...attrs,
@@ -251,6 +254,7 @@ function buildSpanEvent(
   const inputTokens = intTokens(numberField(attrs, [...usageFieldKeys.inputTokens]));
   const outputTokens = intTokens(numberField(attrs, [...usageFieldKeys.outputTokens]));
   const cacheReadTokensSpan = intTokens(numberField(attrs, [...usageFieldKeys.cacheReadTokens]));
+  const cacheCreationTokensSpan = intTokens(numberField(attrs, [...usageFieldKeys.cacheCreationTokens]));
   let costUsd = numberField(attrs, [...usageFieldKeys.costUsd]);
   let costEstimated = false;
   if (costUsd === undefined) {
@@ -259,6 +263,7 @@ function buildSpanEvent(
       inputTokens,
       outputTokens,
       cacheReadTokens: cacheReadTokensSpan,
+      cacheCreationTokens: cacheCreationTokensSpan,
     });
     if (estimate) {
       costUsd = estimate.costUsd;
@@ -290,6 +295,7 @@ function buildSpanEvent(
     inputTokens,
     outputTokens,
     cacheReadTokens: cacheReadTokensSpan,
+    cacheCreationTokens: cacheCreationTokensSpan,
     costUsd: costUsd !== undefined && costUsd >= 0 ? costUsd : undefined,
     metadata: {
       ...attrs,

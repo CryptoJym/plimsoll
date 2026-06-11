@@ -275,6 +275,7 @@ export const aiInteractionEventSchema = z
     inputTokens: z.number().int().nonnegative().optional(),
     outputTokens: z.number().int().nonnegative().optional(),
     cacheReadTokens: z.number().int().nonnegative().optional(),
+    cacheCreationTokens: z.number().int().nonnegative().optional(),
     costUsd: z.number().nonnegative().optional(),
     metadata: metadataSchema,
   })

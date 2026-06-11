@@ -129,6 +129,7 @@ const claudeLogsEnvelope = {
                 otelAttr("input_tokens", 1200),
                 otelAttr("output_tokens", 350),
                 otelAttr("cache_read_tokens", 9000),
+                otelAttr("cache_creation_input_tokens", 4096),
                 otelAttr("cost_usd", 0.0421),
                 otelAttr("duration_ms", 1800),
                 otelAttr("request_id", "req_proof_001"),
@@ -789,6 +790,30 @@ async function main() {
     JSON.stringify({ sessionDetail: Boolean(sessionDetail), repoDetail: Boolean(repoDetail) }),
   );
 
+  // Cache-WRITE tokens are a first-class column (issue 0024 / #26): the
+  // api_request fixture carries 4096 cache_creation_input_tokens, which must
+  // land in the column, in the per-event payload, and in session-detail
+  // receipts — the priciest input class can no longer go unrecorded.
+  const cacheWriteColumn = (
+    buffer.database
+      .prepare(
+        `select coalesce(sum(cache_creation_tokens), 0) as c from buffered_events where session_id = ?`,
+      )
+      .get(SESSION) as { c: number }
+  ).c;
+  const sessionRollup = sessionDetail?.rollup as { cacheCreationTokens?: number } | undefined;
+  check(
+    "claude_cache_write_first_class",
+    cacheWriteColumn === 4096 &&
+      apiRequest?.payload.cacheCreationTokens === 4096 &&
+      sessionRollup?.cacheCreationTokens === 4096,
+    JSON.stringify({
+      column: cacheWriteColumn,
+      payload: apiRequest?.payload.cacheCreationTokens ?? null,
+      receipt: sessionRollup?.cacheCreationTokens ?? null,
+    }),
+  );
+
   const totalsCost = Number((summaryView.totals as Record<string, unknown>).costUsd);
   const bySourceCost = (summaryView.bySource as Array<{ costUsd: number }>).reduce((sum, row) => sum + row.costUsd, 0);
   const sessionedCost = (
@@ -1350,15 +1375,17 @@ async function main() {
     (sum, row) => ({ i: sum.i + Number(row.i), c: sum.c + Number(row.c), o: sum.o + Number(row.o), cost: sum.cost + Number(row.cost ?? 0) }),
     { i: 0, c: 0, o: 0, cost: 0 },
   );
-  // fable rates (sourced 2026-06-10): msg1(last write wins)=1000in+200k reads+500out
-  // → (1000*10 + 200000*1 + 500*50)/1e6 = 0.235; msg2 = (200*10+50*50)/1e6 = 0.0045
+  // fable rates (sourced 2026-06-10), now INCLUDING cache writes (issue 0024 /
+  // #26 retired the floor): msg1(last write wins)=1000in + 200k reads + 1500
+  // cache-writes + 500out → (1000*10 + 200000*1 + 1500*12.5 + 500*50)/1e6 =
+  // 0.25375; msg2 = (200*10 + 50*50)/1e6 = 0.0045; total 0.25825.
   check(
     "transcript_usage_ingested_exact_and_deduped",
     tRows.length === 2 &&
       tSum.i === 1200 &&
       tSum.c === 200000 &&
       tSum.o === 550 &&
-      Math.abs(tSum.cost - 0.2395) < 1e-6 &&
+      Math.abs(tSum.cost - 0.25825) < 1e-6 &&
       tRows.every((row) => row.repo === expectedRemoteHash) &&
       tRows.every((row) => String(row.payload).includes('"costEstimated":true')),
     JSON.stringify({ rows: tRows.length, ...tSum }),
