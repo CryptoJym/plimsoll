@@ -33,6 +33,10 @@
  *  14. Claude transcript tailer recovers per-message usage history exactly
  *      (dedupe by message id, sourced Anthropic estimates, repo linkage,
  *      live-covered sessions skipped, content never persisted).
+ *  15. Fleet join (issue 0016): `plimsoll join` writes sync credentials into
+ *      collector.config.json only when the server accepts the token, the
+ *      handshake upload rides the real signed sync path, and a refused
+ *      token leaves the config byte-identical with a clear reason.
  *
  * Run: pnpm plimsoll:signal-fidelity-proof
  */
@@ -46,7 +50,8 @@ import type { AddressInfo } from "node:net";
 import Database from "better-sqlite3";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
-import { collectorConfigSchema } from "../packages/collector-cli/src/config";
+import { collectorConfigPath, collectorConfigSchema } from "../packages/collector-cli/src/config";
+import { performJoin } from "../packages/collector-cli/src/join";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import {
@@ -1534,6 +1539,105 @@ async function main() {
   );
 
   buffer.close();
+
+  // 15. Fleet join (issue 0016): credentials land in collector.config.json
+  // only on acceptance; the handshake rides the REAL signed sync path; a
+  // refused token leaves the config byte-identical with a clear reason.
+  const joinHome = path.join(tempDir, "join-home");
+  fs.mkdirSync(joinHome, { recursive: true });
+  const previousPlimsollHome = process.env.PLIMSOLL_HOME;
+  process.env.PLIMSOLL_HOME = joinHome; // collectorHome() prefers the env var — keep the real config out of reach
+  try {
+    const JOIN_TENANT = "33333333-4444-4555-8666-777777777777";
+    const JOIN_INSTALL_KEY = "pli_proofproofproofproofproofproo";
+    const JOIN_SECRET = "proof-join-signing-secret-0123456789";
+    let joinPort = 0;
+    const joinRequests: Array<{ url: string; body: string }> = [];
+    const handshakeHeaders: Array<NodeJS.Dict<string | string[]>> = [];
+    const handshakeBodies: string[] = [];
+    const joinServer = http.createServer((request, response) => {
+      let body = "";
+      request.on("data", (chunk) => (body += chunk));
+      request.on("end", () => {
+        joinRequests.push({ url: request.url ?? "", body });
+        if (request.url?.startsWith("/api/work-intelligence/join")) {
+          const token = (JSON.parse(body) as { token?: string }).token ?? "";
+          if (token.endsWith("expired-fixture")) {
+            response.writeHead(410, { "content-type": "application/json" });
+            response.end(JSON.stringify({ error: "join_refused", reason: "expired" }));
+            return;
+          }
+          response.writeHead(201, { "content-type": "application/json" });
+          response.end(
+            JSON.stringify({
+              ok: true,
+              tenantId: JOIN_TENANT,
+              installKey: JOIN_INSTALL_KEY,
+              uploadUrl: `http://127.0.0.1:${joinPort}/api/work-intelligence/ingest`,
+              uploadSigningSecret: JOIN_SECRET,
+            }),
+          );
+          return;
+        }
+        handshakeHeaders.push(request.headers);
+        handshakeBodies.push(body);
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ ok: true, accepted: (JSON.parse(body).events as unknown[]).length }));
+      });
+    });
+    await new Promise<void>((resolve) => joinServer.listen(0, "127.0.0.1", () => resolve()));
+    joinPort = (joinServer.address() as AddressInfo).port;
+
+    const joined = await performJoin({ target: `http://127.0.0.1:${joinPort}#pljt_proofproofproofproofproofproofpr` });
+    const writtenConfig = JSON.parse(fs.readFileSync(collectorConfigPath(), "utf8")) as Record<string, unknown>;
+    const handshakeBatch = handshakeBodies[0] ? (JSON.parse(handshakeBodies[0]) as Record<string, unknown>) : {};
+    check(
+      "join_writes_config_and_handshake_syncs",
+      joined.joined === true &&
+        writtenConfig.uploadUrl === `http://127.0.0.1:${joinPort}/api/work-intelligence/ingest` &&
+        writtenConfig.installKey === JOIN_INSTALL_KEY &&
+        writtenConfig.tenantId === JOIN_TENANT &&
+        writtenConfig.uploadSigningSecret === JOIN_SECRET &&
+        handshakeBatch.installKey === JOIN_INSTALL_KEY &&
+        handshakeBatch.tenantId === JOIN_TENANT &&
+        (handshakeBatch.events as unknown[]).length > 0 &&
+        handshakeHeaders[0]?.["x-plimsoll-install-key"] === JOIN_INSTALL_KEY &&
+        String(handshakeHeaders[0]?.["x-plimsoll-upload-signature"] ?? "").startsWith("sha256=") &&
+        joined.handshake.signedUpload === true &&
+        joined.handshake.uploadedEvents > 0,
+      JSON.stringify({
+        configFields: ["uploadUrl", "installKey", "tenantId", "uploadSigningSecret"].filter((f) => f in writtenConfig),
+        handshakeEvents: joined.joined ? joined.handshake.uploadedEvents : 0,
+        signed: joined.joined ? joined.handshake.signedUpload : false,
+      }),
+    );
+
+    const configSnapshot = fs.readFileSync(collectorConfigPath(), "utf8");
+    const refused = await performJoin({ target: `http://127.0.0.1:${joinPort}#pljt_expired-fixture` });
+    const configAfterRefusal = fs.readFileSync(collectorConfigPath(), "utf8");
+    check(
+      "join_refused_token_clear_error_config_untouched",
+      refused.joined === false &&
+        refused.reason === "expired" &&
+        refused.httpStatus === 410 &&
+        /expired/.test(refused.message) &&
+        /admin/.test(refused.message) &&
+        configAfterRefusal === configSnapshot,
+      JSON.stringify({
+        reason: refused.joined === false ? refused.reason : null,
+        configByteIdentical: configAfterRefusal === configSnapshot,
+      }),
+    );
+
+    await new Promise<void>((resolve) => joinServer.close(() => resolve()));
+  } finally {
+    if (previousPlimsollHome === undefined) {
+      delete process.env.PLIMSOLL_HOME;
+    } else {
+      process.env.PLIMSOLL_HOME = previousPlimsollHome;
+    }
+  }
+
   fs.rmSync(tempDir, { recursive: true, force: true });
 
   const passed = checks.every((entry) => entry.passed);
