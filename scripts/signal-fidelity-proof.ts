@@ -1926,16 +1926,20 @@ async function main() {
         }
         const batch = aiWorkIngestBatchSchema.parse(JSON.parse(body));
         historyMaxBatch = Math.max(historyMaxBatch, batch.events.length);
+        // Fast-lane semantics (cloud PR #19): createMany(skipDuplicates) —
+        // already-present ids are accepted but insert nothing.
+        let inserted = 0;
         for (const entry of batch.events) {
           if (findForbiddenRawContentFields(entry.event.metadata).length > 0) {
             historyForbiddenHits += 1;
           }
+          if (!historyStore.has(entry.event.id)) inserted += 1;
           historyStore.set(entry.event.id, entry.event);
         }
         response.writeHead(200, { "content-type": "application/json" });
         // Mirrors production: the response echoes the install key — the CLI
         // must never print it.
-        response.end(JSON.stringify({ ok: true, accepted: batch.events.length, installKey: HISTORY_INSTALL_KEY }));
+        response.end(JSON.stringify({ ok: true, accepted: batch.events.length, inserted, installKey: HISTORY_INSTALL_KEY }));
       });
     });
     await new Promise<void>((resolve) => historyServer.listen(0, "127.0.0.1", () => resolve()));
@@ -1977,10 +1981,12 @@ async function main() {
         historySignatureFailures === 0 &&
         historyAuditTotals(run1.audit).localEvents === expectedEligible &&
         historyAuditTotals(run1.audit).inputTokens === expectedEligible * 10 + 1 &&
+        run1.insertedEvents === expectedEligible &&
         state1?.completedAt !== null &&
         state1?.watermark !== null,
       JSON.stringify({
         accepted: run1.acceptedEvents,
+        inserted: run1.insertedEvents,
         storeSize: historyStore.size,
         skipped: run1.audit.skipped,
         batches: run1.batchesSent,
@@ -1999,8 +2005,9 @@ async function main() {
       JSON.stringify({ bodies: historyBodies.length, sentinelLeaked: historyBodies.some((requestBody) => requestBody.includes(HISTORY_RAW_SENTINEL)) }),
     );
 
-    // 16f. Idempotency: a second FULL run over the same scope re-upserts the
-    // same ids — the workspace grows by exactly zero rows.
+    // 16f. Idempotency: a second FULL run over the same scope re-sends the
+    // same ids — the workspace grows by exactly zero rows, and the server's
+    // additive `inserted` field reports 0 throughout.
     const storeSizeBeforeRun2 = historyStore.size;
     const idsBeforeRun2 = [...historyStore.keys()].sort().join(",");
     const run2 = await runWorkspaceHistoryUpload(historyConfig, {
@@ -2020,10 +2027,17 @@ async function main() {
       run2.ok &&
         run2.completed &&
         run2.acceptedEvents === expectedEligible &&
+        run2.insertedEvents === 0 &&
         historyStore.size === storeSizeBeforeRun2 &&
         [...historyStore.keys()].sort().join(",") === idsBeforeRun2 &&
-        run2.skippedEvents === 3,
-      JSON.stringify({ before: storeSizeBeforeRun2, after: historyStore.size, accepted: run2.acceptedEvents }),
+        run2.skippedEvents === 3 &&
+        /server-reported NEW rows this backfill: 0/.test(run2.auditTable),
+      JSON.stringify({
+        before: storeSizeBeforeRun2,
+        after: historyStore.size,
+        accepted: run2.acceptedEvents,
+        inserted: run2.insertedEvents,
+      }),
     );
 
     // 16g. Resume: an interrupted run continues from the watermark, the union
@@ -2033,9 +2047,13 @@ async function main() {
     const resumeFetch: typeof fetch = async (input, init) => {
       const body = String(init?.body ?? "");
       const batch = aiWorkIngestBatchSchema.parse(JSON.parse(body));
-      for (const entry of batch.events) resumeStore.set(entry.event.id, entry.event);
+      let inserted = 0;
+      for (const entry of batch.events) {
+        if (!resumeStore.has(entry.event.id)) inserted += 1;
+        resumeStore.set(entry.event.id, entry.event);
+      }
       void input;
-      return new Response(JSON.stringify({ ok: true, accepted: batch.events.length }), {
+      return new Response(JSON.stringify({ ok: true, accepted: batch.events.length, inserted }), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -2076,12 +2094,14 @@ async function main() {
         seededIds.every((id) => resumeStore.has(id)) &&
         historyAuditTotals(resumeB.audit).localEvents === expectedEligible &&
         historyAuditTotals(resumeB.audit).sentEvents === expectedEligible &&
+        resumeB.insertedEvents === expectedEligible &&
         resumeB.skippedEvents === 3,
       JSON.stringify({
         firstRunSent: resumeA.sentEvents,
         resumedFromRowid: resumeB.resumedFromRowid,
         unionSize: resumeStore.size,
         cumulativeLocal: historyAuditTotals(resumeB.audit).localEvents,
+        cumulativeInserted: resumeB.insertedEvents,
       }),
     );
 

@@ -26,10 +26,11 @@ import {
  * - The ledger is opened strictly READ-ONLY. The live daemon keeps writing it
  *   (WAL) and keeps draining its own 5-minute sync; nothing here marks rows
  *   uploaded or touches collector.config.json.
- * - Idempotency comes from event ids, not from local state: the cloud upserts
- *   by id, so re-sending the same history can only re-write the same rows.
- *   The resume watermark is a fast-forward optimization, never a correctness
- *   mechanism.
+ * - Idempotency comes from event ids, not from local state: the cloud dedupes
+ *   by id (bulk createMany(skipDuplicates) since cloud PR #19; per-event
+ *   upserts before that), so re-sending the same history can never create new
+ *   rows. The resume watermark is a fast-forward optimization, never a
+ *   correctness mechanism.
  * - Privacy parity: the wire envelope is exactly the recent-buffer upload
  *   shape (upload.ts) — payload + suppressedFields — re-validated against the
  *   strict event schema and the forbidden-raw-content gate before send.
@@ -48,7 +49,7 @@ const POSTGRES_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 /**
  * Deterministic UUID for ledger ids the cloud's uuid column would reject
  * (e.g. pre-normalizer hook ids). Same ledger id → same UUID on every run, so
- * the cloud upsert dedupes re-sends; the original id is preserved in
+ * the cloud ingest dedupes re-sends; the original id is preserved in
  * metadata.externalEventId. Reuses the repo's deterministicEventId (sha256 →
  * version-5/variant-9 shape) with a fixed namespace part.
  */
@@ -206,6 +207,13 @@ export type HistoryAudit = {
   cells: Record<string, HistoryAuditCell>;
   skipped: Record<string, number>;
   derivedIds: number;
+  /** Sum of the server's additive `inserted` field (cloud PR #19 fast lane):
+   * rows that were genuinely NEW server-side. Re-sends of already-present ids
+   * report 0 — the run-2 idempotency proof reads `inserted: 0` here. */
+  insertedEvents?: number;
+  /** Completed batches that actually reported `inserted` — distinguishes a
+   * real zero from a server that predates the field. */
+  insertedBatchesReported?: number;
 };
 
 export function createHistoryAudit(): HistoryAudit {
@@ -365,6 +373,12 @@ export function renderHistoryAudit(audit: HistoryAudit): string {
   if (audit.derivedIds > 0) {
     lines.push(`ids deterministically re-derived to UUID: ${audit.derivedIds}`);
   }
+  if ((audit.insertedBatchesReported ?? 0) > 0) {
+    lines.push(
+      `server-reported NEW rows this backfill: ${audit.insertedEvents ?? 0} ` +
+        `(accepted-but-already-present re-sends insert nothing — that is the idempotency working)`,
+    );
+  }
   return lines.join("\n");
 }
 
@@ -439,6 +453,8 @@ export type WorkspaceHistoryUploadResult = {
   skippedEvents: number;
   sentEvents: number;
   acceptedEvents: number;
+  /** Server-reported genuinely-new rows (null when the server never reported the field). */
+  insertedEvents: number | null;
   batchesSent: number;
   derivedIds: number;
   durationMs: number;
@@ -480,7 +496,7 @@ async function postHistoryBatch(input: {
   sleep: (ms: number) => Promise<void>;
   maxAttempts: number;
   log: (line: string) => void;
-}): Promise<{ accepted: number; attempts: number }> {
+}): Promise<{ accepted: number; inserted: number | null; attempts: number }> {
   let lastError = "";
   for (let attempt = 1; attempt <= input.maxAttempts; attempt += 1) {
     const headers: Record<string, string> = {
@@ -506,9 +522,12 @@ async function postHistoryBatch(input: {
     }
 
     if (response?.ok) {
-      const body = (await response.json().catch(() => ({}))) as { accepted?: unknown };
+      const body = (await response.json().catch(() => ({}))) as { accepted?: unknown; inserted?: unknown };
       const accepted = typeof body.accepted === "number" ? body.accepted : 0;
-      return { accepted, attempts: attempt };
+      // Additive field from the cloud's bulk-ingest fast lane (cloud PR #19):
+      // how many rows were genuinely new. Older servers omit it.
+      const inserted = typeof body.inserted === "number" ? body.inserted : null;
+      return { accepted, inserted, attempts: attempt };
     }
 
     if (response && response.status !== 429 && response.status < 500) {
@@ -552,7 +571,7 @@ async function postHistoryBatch(input: {
  * frontier — so a resumed run never double-counts.
  *
  * Interaction with the live 5-minute sync: both push the same event ids; the
- * cloud upserts by id, so overlap is harmless. The daemon keeps draining its
+ * cloud dedupes by id, so overlap is harmless. The daemon keeps draining its
  * own queue and live events keep flowing while (and after) this runs.
  */
 export async function runWorkspaceHistoryUpload(
@@ -671,6 +690,8 @@ export async function runWorkspaceHistoryUpload(
     events: Array<Pick<AiInteractionEvent, "source" | "observedAt">>;
     /** This batch's slice of the audit (eligible rows + skips scanned just before it). Folded in only when the frontier passes it. */
     auditDelta: HistoryAudit;
+    /** Server-reported newly-inserted count; set on completion, folded at the frontier. */
+    inserted: number | null;
     maxRowid: number;
     maxRowidId: string;
     maxRowidCreatedAt: string;
@@ -722,6 +743,10 @@ export async function runWorkspaceHistoryUpload(
       completedBatches.delete(frontierBatchIndex);
       mergeHistoryAudit(audit, batch.auditDelta);
       recordHistoryOutcome(audit, batch.events, true);
+      if (batch.inserted !== null) {
+        audit.insertedEvents = (audit.insertedEvents ?? 0) + batch.inserted;
+        audit.insertedBatchesReported = (audit.insertedBatchesReported ?? 0) + 1;
+      }
       watermark = { rowid: batch.maxRowid, id: batch.maxRowidId, createdAt: batch.maxRowidCreatedAt };
       frontierBatchIndex += 1;
     }
@@ -738,6 +763,7 @@ export async function runWorkspaceHistoryUpload(
         batches: `${batchesSent}/${totalBatchesEstimate}`,
         sentEvents,
         acceptedEvents,
+        insertedEvents: audit.insertedEvents ?? null,
         eventsPerSecond: Math.round(rate * 10) / 10,
         etaMinutes: rate > 0 ? Math.round(remaining / rate / 60) : null,
       }),
@@ -762,6 +788,7 @@ export async function runWorkspaceHistoryUpload(
         batchesSent += 1;
         sentEvents += batch.events.length;
         acceptedEvents += result.accepted;
+        batch.inserted = result.inserted;
         completedBatches.set(batch.index, batch);
         advanceFrontier();
         persistState(false);
@@ -851,6 +878,7 @@ export async function runWorkspaceHistoryUpload(
           observedAt: item.envelope.event.observedAt,
         })),
         auditDelta,
+        inserted: null,
         maxRowid: chunk[chunk.length - 1].rowid,
         maxRowidId: chunk[chunk.length - 1].id,
         maxRowidCreatedAt: chunk[chunk.length - 1].createdAt,
@@ -897,6 +925,7 @@ export async function runWorkspaceHistoryUpload(
     skippedEvents: historySkippedTotal(audit),
     sentEvents,
     acceptedEvents,
+    insertedEvents: (audit.insertedBatchesReported ?? 0) > 0 ? audit.insertedEvents ?? 0 : null,
     batchesSent,
     derivedIds: audit.derivedIds,
     durationMs,
@@ -920,6 +949,7 @@ export async function runWorkspaceHistoryUpload(
       skippedEvents: result.skippedEvents,
       sentEvents,
       acceptedEvents,
+      insertedEvents: result.insertedEvents,
       batchesSent,
       completed,
       durationMs,

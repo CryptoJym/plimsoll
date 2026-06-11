@@ -68,7 +68,7 @@ Commands:
   upload-history        Workspace backfill: push the FULL ledger history to the joined
                         workspace, idempotently, then print a reconciliation audit.
                         Ledger is opened read-only; rows are never marked uploaded.
-                        Safe alongside the live 5-minute sync: the cloud upserts by
+                        Safe alongside the live 5-minute sync: the cloud dedupes by
                         event id, so overlap deduplicates instead of duplicating.
   scan-rollouts         Read codex rollout files into the ledger once (full history walk)
   scan-transcripts      Read Claude Code transcript usage into the ledger once (full history walk)
