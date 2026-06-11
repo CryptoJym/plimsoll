@@ -57,27 +57,41 @@ The outcome join uses **linkage keys**: both Plimsoll and the GitHub side hash t
 
 ## Quickstart
 
-Requirements: macOS, Node 20+, pnpm, git.
+Requirements: macOS, Node 20+.
+
+```bash
+# wire Claude Code + Codex telemetry (idempotent, takes backups; --dry-run to preview)
+npx -y @plimsoll/cli setup
+
+# run the collector + dashboard → http://127.0.0.1:48271
+npx -y @plimsoll/cli start
+
+# sanity-check the whole capture path
+npx -y @plimsoll/cli doctor
+```
+
+Cold start measured at ~7.5s from an empty npm cache to a full `doctor`
+report (evidence on #11). Background LaunchAgent mode for npm installs is
+still being fitted — until then `start` runs in a terminal.
+
+**Contributors / running from source** (adds pnpm + git):
 
 ```bash
 git clone https://github.com/CryptoJym/plimsoll.git
 cd plimsoll
 pnpm install
 
-# generate tool configs (Claude Code settings + Codex config.toml snippets)
-pnpm collector generate-config all
-
-# install + start the background collector
-pnpm collector install-launch-agent --load
-
-# sanity-check the whole capture path
+pnpm collector generate-config all           # print configs instead of applying
+pnpm collector install-launch-agent --load   # background collector (source checkout)
 pnpm collector doctor
-
-# after a few sessions: the economics
-pnpm report -- --repository your-org/your-repo
+pnpm report -- --repository your-org/your-repo   # after a few sessions: the economics
 ```
 
-`generate-config` prints exactly what to add to `~/.claude/settings.json` and `~/.codex/config.toml` — hooks plus OTLP exporters pointed at `127.0.0.1:48271`. Nothing is configured behind your back.
+`setup` applies the tool configs for you (idempotent, takes backups,
+`--dry-run` to preview); `generate-config` prints exactly what to add to
+`~/.claude/settings.json` and `~/.codex/config.toml` if you'd rather paste
+by hand — hooks plus OTLP exporters pointed at `127.0.0.1:48271`. Nothing
+is configured behind your back.
 
 > **Codex note:** Codex records token usage on *trace spans* (`gen_ai.usage.*`), not log events. The generated config enables logs, traces, and metrics — if you disable the trace exporter, codex token attribution silently drops to zero. We learned this the hard way (see "The audit story" below).
 
