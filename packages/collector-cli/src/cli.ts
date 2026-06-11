@@ -24,6 +24,7 @@ import {
   uninstallLaunchAgent,
 } from "./launch-agent";
 import { computeCaptureHealth } from "./health";
+import { performJoin } from "./join";
 import { RolloutTailer } from "./rollout-tailer";
 import { TranscriptTailer } from "./transcript-tailer";
 import { createCollectorServer } from "./server";
@@ -54,6 +55,8 @@ function printHelp() {
 Commands:
   start                 Start the local hook/OTLP receiver in the foreground
   status                Print local buffer and policy status
+  join TOKEN|URL        Join a hosted workspace: redeem the admin's single-use
+                        token, write sync credentials, verify with a handshake
   doctor                Verify paths, SQLite buffer, LaunchAgent, data mode, and privacy posture
   export                Print buffered events as JSON
   forward-hook SOURCE   Read hook JSON from stdin and append it without requiring the receiver
@@ -74,6 +77,7 @@ Commands:
   stop                  Stop the foreground daemon using the local PID file
 
 Config tools:
+  join "<join-url>#<token>" | join <token> --url <cloud-base-url>   (env: PLIMSOLL_CLOUD_URL)
   generate-config claude-code|codex|all [--evidence --confirm-evidence]
   upload [--url URL --limit 500] [--ingest-key KEY] [--signing-secret SECRET] [--no-mark] [--max-batches 20]
   install-launch-agent [--repo-root PATH] [--pnpm PATH] [--load]
@@ -510,6 +514,61 @@ async function main() {
       ),
     );
     buffer.close();
+    return;
+  }
+
+  if (command === "join") {
+    // Fleet join (issue 0016): one command from installed to syncing. The
+    // config is only written when the server accepts the token; refusals
+    // leave it untouched and say exactly why.
+    const target = process.argv[3];
+    if (!target || target.startsWith("--")) {
+      throw new Error(
+        'Usage: plimsoll join "<join-url>#<token>"  |  plimsoll join <token> --url <cloud-base-url>',
+      );
+    }
+    const result = await performJoin({
+      target,
+      baseUrl: optionValue("--url") ?? process.env.PLIMSOLL_CLOUD_URL,
+    });
+    if (!result.joined) {
+      console.error(
+        JSON.stringify(
+          {
+            status: "join_refused",
+            reason: result.reason,
+            httpStatus: result.httpStatus,
+            message: result.message,
+            configTouched: result.configTouched,
+          },
+          null,
+          2,
+        ),
+      );
+      process.exitCode = 1;
+      return;
+    }
+    console.log(
+      JSON.stringify(
+        {
+          status: "joined",
+          configPath: result.configPath,
+          tenantId: result.tenantId,
+          // The full key lives only in collector.config.json (mode 0600).
+          installKey: `${result.installKey.slice(0, 8)}…`,
+          uploadUrl: result.uploadUrl,
+          uploadSigningConfigured: result.uploadSigningConfigured,
+          syncConfigured: true,
+          handshake: result.handshake,
+          nextSteps: [
+            "plimsoll status   # syncConfigured: true, with the handshake already drained",
+            "restart a running collector (or: plimsoll install-launch-agent && plimsoll load-launch-agent) so the daemon picks up sync",
+          ],
+        },
+        null,
+        2,
+      ),
+    );
     return;
   }
 
