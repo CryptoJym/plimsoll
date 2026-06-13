@@ -4,8 +4,34 @@ import type { BufferedEventRow, LocalEventBuffer } from "./buffer";
 import type { CollectorConfig } from "./config";
 import {
   aiWorkIngestBatchSchema,
+  type AiInteractionEvent,
   type AiWorkIngestBatch,
 } from "../../shared/src/index";
+
+/**
+ * Project attribution parity (issue 0036): the ledger's per-event repo
+ * linkage lives in COLUMNS (repo_hash/branch_hash — issue 0008 stitching),
+ * not in the payload, so uploads historically dropped it and the workspace
+ * could not map events to projects. This forwards the linkage as
+ * event.projectKey — the privacy-preserving hash DESIGNED to cross
+ * boundaries (raw URLs/branches never leave the machine). branchHash rides
+ * in metadata for later use. A projectKey already present in the payload is
+ * never overwritten.
+ */
+export function attachRepoLinkage(
+  payload: AiInteractionEvent,
+  repoHash: string | null | undefined,
+  branchHash?: string | null,
+): AiInteractionEvent {
+  if (!repoHash || payload.projectKey) return payload;
+  return {
+    ...payload,
+    projectKey: repoHash,
+    ...(branchHash
+      ? { metadata: { ...payload.metadata, branchHash } }
+      : {}),
+  };
+}
 
 export function buildIngestBatch(
   config: CollectorConfig,
@@ -26,7 +52,7 @@ export function buildIngestBatch(
     installKey: config.installKey,
     appVersion: options.appVersion ?? "0.1.0",
     events: rows.map((row) => ({
-      event: row.payload,
+      event: attachRepoLinkage(row.payload, row.repoHash, row.branchHash),
       suppressedFields: row.suppressedFields,
     })),
   });

@@ -65,6 +65,14 @@ import { deterministicEventId } from "../packages/collector-cli/src/normalizer";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import {
+  buildRepoLabelCandidates,
+  parseRepoSlug,
+  pushRepoLabels,
+  renderRepoLabelPreview,
+} from "../packages/collector-cli/src/repo-labels";
+import { attachRepoLinkage } from "../packages/collector-cli/src/upload";
+import {
+  buildAttributionRepairRows,
   chunkHistoryEnvelopes,
   createHistoryAudit,
   ensureUuidEventId,
@@ -74,6 +82,7 @@ import {
   recordHistoryEligible,
   recordHistorySkip,
   renderHistoryAudit,
+  runAttributionRepair,
   runWorkspaceHistoryUpload,
 } from "../packages/collector-cli/src/upload-history";
 import {
@@ -1830,6 +1839,8 @@ async function main() {
     fs.mkdirSync(historyHome, { recursive: true });
     const historyLedgerPath = path.join(historyHome, "history-ledger.sqlite");
     const HISTORY_RAW_SENTINEL = "RAW_PROMPT_SENTINEL_HISTORY rm -rf /tmp/secret";
+    const HISTORY_REPO_HASH = "sha256:proofrepoaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const HISTORY_BRANCH_HASH = "sha256:proofbranchbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
     const seedBuffer = new LocalEventBuffer(historyLedgerPath);
     const seededIds: string[] = [];
     const seedEvent = (index: number): AiInteractionEvent =>
@@ -1844,6 +1855,11 @@ async function main() {
         inputTokens: 10,
         outputTokens: 5,
         ...(index < 100 ? { costUsd: 0.01 } : {}),
+        // Repo linkage (issue 0036): metadata.git drives the ledger's
+        // repo_hash/branch_hash columns at append, exactly like live capture.
+        ...(index < 100
+          ? { metadata: { git: { remoteUrlHash: HISTORY_REPO_HASH, branchHash: HISTORY_BRANCH_HASH } } }
+          : {}),
       });
     for (let index = 0; index < 250; index += 1) {
       const event = seedEvent(index);
@@ -2153,6 +2169,197 @@ async function main() {
         /signature|credentials/i.test(failClosed.reason ?? "") &&
         !failClosedLogs.some((line) => line.includes("workspace_backfill_retry")),
       JSON.stringify({ reason: (failClosed.reason ?? "").slice(0, 140), accepted: failClosed.acceptedEvents }),
+    );
+
+
+    // 16j. Project attribution parity (issue 0036). Forward path: the
+    // ledger's repo columns become event.projectKey on the wire — pure
+    // mapper first, then the loopback bodies of the runs above.
+    const linkageBase = aiInteractionEventSchema.parse({
+      id: deterministicEventId(["linkage-proof", 1]),
+      source: "codex",
+      eventType: "assistant_response",
+      observedAt: "2026-03-01T00:00:00.000Z",
+    });
+    const linked = attachRepoLinkage(linkageBase, "sha256:repoX", "sha256:branchY");
+    const preLabeled = attachRepoLinkage(
+      { ...linkageBase, projectKey: "sha256:already" },
+      "sha256:repoX",
+      "sha256:branchY",
+    );
+    const linkedIds = new Set<string>();
+    for (const body of historyBodies) {
+      try {
+        const parsed = JSON.parse(body) as { events?: Array<{ event: { id: string; projectKey?: string; metadata?: Record<string, unknown> } }> };
+        for (const entry of parsed.events ?? []) {
+          if (entry.event.projectKey === HISTORY_REPO_HASH && entry.event.metadata?.branchHash === HISTORY_BRANCH_HASH) {
+            linkedIds.add(entry.event.id);
+          }
+        }
+      } catch {
+        // bad-signature fixtures and repair bodies parse differently; skip
+      }
+    }
+    check(
+      "forward_path_sends_repo_linkage_as_project_key",
+      linked.projectKey === "sha256:repoX" &&
+        linked.metadata.branchHash === "sha256:branchY" &&
+        aiInteractionEventSchema.safeParse(linked).success &&
+        preLabeled.projectKey === "sha256:already" &&
+        attachRepoLinkage(linkageBase, null).projectKey === undefined &&
+        linkedIds.size === 100,
+      JSON.stringify({ linkedEventIdsOnWire: linkedIds.size, neverOverwrites: preLabeled.projectKey }),
+    );
+
+    // 16k. Repair rows ride the SAME deterministic id mapping as uploads.
+    const repairRows = buildAttributionRepairRows([
+      { id: "2b866c49-6f64-4ac1-9d6b-d9ce0aa64166", repoHash: "sha256:r1" },
+      { id: "self_test_1749670000000", repoHash: "sha256:r2" },
+      { id: "ignored", repoHash: null },
+      { id: "", repoHash: "sha256:r3" },
+    ]);
+    check(
+      "attribution_repair_rows_share_upload_id_mapping",
+      repairRows.length === 2 &&
+        repairRows[0].id === "2b866c49-6f64-4ac1-9d6b-d9ce0aa64166" &&
+        repairRows[1].id === ensureUuidEventId("self_test_1749670000000").id &&
+        repairRows[1].projectKey === "sha256:r2",
+      JSON.stringify(repairRows),
+    );
+
+    // 16l. Repair e2e: a stub workspace whose rows are projectKey-null (the
+    // production state this lane exists for) — run fills exactly the linked
+    // rows; a second run reports updated 0. Fill-only is enforced stub-side
+    // the same way the cloud does it.
+    const repairStore = new Map<string, { projectKey: string | null }>();
+    for (let index = 0; index < 100; index += 1) {
+      repairStore.set(deterministicEventId(["history-e2e", index]), { projectKey: null });
+    }
+    let repairSignatureFailures = 0;
+    const repairServer = http.createServer((request, response) => {
+      let body = "";
+      request.on("data", (chunk) => (body += chunk));
+      request.on("end", () => {
+        const timestamp = String(request.headers["x-plimsoll-upload-timestamp"] ?? "");
+        const signature = String(request.headers["x-plimsoll-upload-signature"] ?? "");
+        const expected = `sha256=${crypto.createHmac("sha256", HISTORY_SECRET).update(`${timestamp}.${body}`).digest("hex")}`;
+        if (!timestamp || signature !== expected) {
+          repairSignatureFailures += 1;
+          response.writeHead(401, { "content-type": "application/json" });
+          response.end(JSON.stringify({ error: "bad_upload_signature" }));
+          return;
+        }
+        const batch = JSON.parse(body) as { kind?: string; rows: Array<{ id: string; projectKey: string }> };
+        let matched = 0;
+        let updated = 0;
+        for (const row of batch.rows) {
+          const existing = repairStore.get(row.id);
+          if (!existing) continue;
+          matched += 1;
+          if (existing.projectKey === null) {
+            existing.projectKey = row.projectKey;
+            updated += 1;
+          }
+        }
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ ok: true, accepted: 0, matched, updated, kind: batch.kind }));
+      });
+    });
+    await new Promise<void>((resolve) => repairServer.listen(0, "127.0.0.1", () => resolve()));
+    const repairPort = (repairServer.address() as AddressInfo).port;
+    const repairConfig = collectorConfigSchema.parse({
+      ...historyConfig,
+      uploadUrl: `http://127.0.0.1:${repairPort}/api/work-intelligence/ingest`,
+    });
+    const repairLogs: string[] = [];
+    const repair1 = await runAttributionRepair(repairConfig, {
+      ledgerPath: historyLedgerPath,
+      batchSize: 40,
+      concurrency: 2,
+      delayMs: 0,
+      maxAttemptsPerBatch: 2,
+      log: (line) => repairLogs.push(line),
+    });
+    const repair2 = await runAttributionRepair(repairConfig, {
+      ledgerPath: historyLedgerPath,
+      batchSize: 40,
+      concurrency: 2,
+      delayMs: 0,
+      maxAttemptsPerBatch: 2,
+      log: (line) => repairLogs.push(line),
+    });
+    const filledCount = [...repairStore.values()].filter((row) => row.projectKey === HISTORY_REPO_HASH).length;
+    check(
+      "attribution_repair_fills_once_then_settles",
+      repair1.ok &&
+        repair1.rowsWithRepoHash === 100 &&
+        repair1.sentRows === 100 &&
+        repair1.matchedRows === 100 &&
+        repair1.updatedRows === 100 &&
+        repair2.ok &&
+        repair2.sentRows === 100 &&
+        repair2.matchedRows === 100 &&
+        repair2.updatedRows === 0 &&
+        filledCount === 100 &&
+        repairSignatureFailures === 0 &&
+        repairLogs.every((line) => !line.includes(HISTORY_INSTALL_KEY)),
+      JSON.stringify({
+        run1: { matched: repair1.matchedRows, updated: repair1.updatedRows },
+        run2: { matched: repair2.matchedRows, updated: repair2.updatedRows },
+        filled: filledCount,
+      }),
+    );
+    await new Promise<void>((resolve) => repairServer.close(() => resolve()));
+
+    // 16m. Repo labels: slug parsing, label-over-priority precedence, raw
+    // URLs never on the wire, and the loopback push.
+    const slugCases =
+      JSON.stringify(parseRepoSlug("github.com/cryptojym/plimsoll")) ===
+        JSON.stringify({ provider: "github", owner: "cryptojym", name: "plimsoll" }) &&
+      JSON.stringify(parseRepoSlug("https://github.com/CryptoJym/Plimsoll.git")) ===
+        JSON.stringify({ provider: "github", owner: "cryptojym", name: "plimsoll" }) &&
+      JSON.stringify(parseRepoSlug("git@github.com:o/n.git")) ===
+        JSON.stringify({ provider: "github", owner: "o", name: "n" }) &&
+      parseRepoSlug("gitlab.com/team/repo")?.provider === "gitlab" &&
+      parseRepoSlug("just-a-name")?.provider === "local_git" &&
+      parseRepoSlug("") === null;
+    const labelCandidates = buildRepoLabelCandidates(
+      [{ repoHash: "sha256:hash1", label: "github.com/cryptojym/plimsoll" }],
+      [
+        { repoHash: "sha256:hash1", url: "https://github.com/wrong/should-lose" },
+        { repoHash: "sha256:hash2", url: "https://github.com/cryptojym/derived-only" },
+      ],
+    );
+    const labelPreview = renderRepoLabelPreview(labelCandidates.candidates, 0);
+    const labelBodies: string[] = [];
+    let labelPath = "";
+    const labelFetch: typeof fetch = async (input, init) => {
+      labelPath = new URL(String(input)).pathname;
+      labelBodies.push(String(init?.body ?? ""));
+      return new Response(JSON.stringify({ ok: true, created: 2, updated: 0 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+    const pushedLabels = await pushRepoLabels(historyConfig, labelCandidates.candidates, {
+      fetchImpl: labelFetch,
+      log: () => undefined,
+    });
+    check(
+      "repo_labels_disclose_slugs_never_urls",
+      slugCases &&
+        labelCandidates.candidates.length === 2 &&
+        labelCandidates.candidates.find((c) => c.remoteUrlHash === "sha256:hash1")?.name === "plimsoll" &&
+        labelCandidates.candidates.find((c) => c.remoteUrlHash === "sha256:hash1")?.source === "repo_label" &&
+        labelCandidates.candidates.find((c) => c.remoteUrlHash === "sha256:hash2")?.source ===
+          "derived_from_priority_url" &&
+        labelPreview.includes("derived from priority URL") &&
+        labelPreview.includes("Never sent: raw URLs") &&
+        labelPath === "/api/work-intelligence/repo-labels" &&
+        pushedLabels.pushed === 2 &&
+        labelBodies.every((body) => !body.includes("://")) &&
+        labelBodies.every((body) => !body.includes("should-lose")),
+      JSON.stringify({ candidates: labelCandidates.candidates.length, path: labelPath, urlLeak: labelBodies.some((b) => b.includes("://")) }),
     );
 
     await new Promise<void>((resolve) => historyServer.close(() => resolve()));

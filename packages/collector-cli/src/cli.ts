@@ -36,8 +36,9 @@ import {
   generateSetupInstructions,
 } from "../../collector-config/src/index";
 import type { ToolSource } from "../../shared/src/index";
+import { prepareRepoLabelsPush, pushRepoLabels } from "./repo-labels";
 import { uploadBufferedEvents } from "./upload";
-import { runWorkspaceHistoryUpload } from "./upload-history";
+import { runAttributionRepair, runWorkspaceHistoryUpload } from "./upload-history";
 
 const command = process.argv[2] ?? "help";
 
@@ -70,6 +71,9 @@ Commands:
                         Ledger is opened read-only; rows are never marked uploaded.
                         Safe alongside the live 5-minute sync: the cloud dedupes by
                         event id, so overlap deduplicates instead of duplicating.
+  push-repo-labels      Disclose repo display names to the joined workspace so dashboards
+                        show github.com/owner/name instead of sha256 hashes. Previews the
+                        exact payload first; --dry-run to only preview.
   scan-rollouts         Read codex rollout files into the ledger once (full history walk)
   scan-transcripts      Read Claude Code transcript usage into the ledger once (full history walk)
   install-launch-agent  Write the user LaunchAgent plist
@@ -92,6 +96,11 @@ Config tools:
       safe: identical event ids upsert in place — run twice, nothing duplicates). --dry-run
       audits eligibility with zero network. Skipped rows are itemized with reasons; unpriced
       events stay unpriced in the audit.
+  upload-history --repair-attribution [--until ISO] [--batch-size 500] [--concurrency 1..8] [--delay-ms 100] [--dry-run] [--url URL]
+      Fill projectKey on already-uploaded workspace rows from the ledger's repo_hash
+      column (the bulk ingest lane is first-writer-wins, so re-uploading cannot).
+      Set-based and fill-only server-side; re-running reports updated: 0.
+  push-repo-labels [--dry-run] [--yes] [--url URL]
   install-launch-agent [--repo-root PATH] [--pnpm PATH] [--load]
   load-launch-agent
   unload-launch-agent
@@ -799,6 +808,18 @@ async function main() {
       if (!Number.isFinite(value)) throw new Error(`${name} expects a number, got: ${raw}`);
       return value;
     };
+    if (flag("--repair-attribution")) {
+      const repair = await runAttributionRepair(config, {
+        until: optionValue("--until"),
+        batchSize: numberOption("--batch-size"),
+        concurrency: numberOption("--concurrency"),
+        delayMs: numberOption("--delay-ms"),
+        dryRun: flag("--dry-run"),
+        url: optionValue("--url"),
+      });
+      if (!repair.ok) process.exitCode = 1;
+      return;
+    }
     const result = await runWorkspaceHistoryUpload(config, {
       until: optionValue("--until"),
       batchSize: numberOption("--batch-size"),
@@ -810,6 +831,53 @@ async function main() {
       url: optionValue("--url"),
     });
     if (!result.ok) process.exitCode = 1;
+    return;
+  }
+
+  if (command === "push-repo-labels") {
+    // Repo labels are deliberate owner disclosures (issue 0036): show the
+    // exact payload, then require explicit consent before anything is sent.
+    const prepared = prepareRepoLabelsPush();
+    console.log(prepared.preview);
+    if (prepared.candidates.length === 0) {
+      console.log(JSON.stringify({ status: "repo_labels_noop", reason: "no labels recorded locally" }));
+      return;
+    }
+    if (flag("--dry-run")) {
+      console.log(JSON.stringify({ status: "repo_labels_dry_run", wouldPush: prepared.candidates.length }));
+      return;
+    }
+    if (!flag("--yes")) {
+      if (!process.stdin.isTTY) {
+        console.error("Refusing to push labels without confirmation. Re-run with --yes (or --dry-run to preview).");
+        process.exitCode = 1;
+        return;
+      }
+      const rl = readline.createInterface({ input: process.stdin, output: process.stdout });
+      const answer = (await rl.question("Push these labels to the workspace? [y/N] ")).trim().toLowerCase();
+      rl.close();
+      if (answer !== "y" && answer !== "yes") {
+        console.log("Nothing sent.");
+        return;
+      }
+    }
+    const pushed = await pushRepoLabels(config, prepared.candidates, {
+      url: optionValue("--url"),
+    });
+    console.log(
+      JSON.stringify(
+        {
+          status: "repo_labels_pushed",
+          pushed: pushed.pushed,
+          created: pushed.created,
+          updated: pushed.updated,
+          batches: pushed.batches,
+          skippedUnparseable: prepared.skippedUnparseable,
+        },
+        null,
+        2,
+      ),
+    );
     return;
   }
 

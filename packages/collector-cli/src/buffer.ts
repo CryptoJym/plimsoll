@@ -15,6 +15,10 @@ export type BufferedEventRow = {
   suppressedFields: string[];
   createdAt: string;
   uploadedAt: string | null;
+  /** Per-event repo linkage (issue 0008 stitching) — the privacy-preserving
+   * key the upload paths forward as event.projectKey (issue 0036). */
+  repoHash: string | null;
+  branchHash: string | null;
 };
 
 export type BufferStats = {
@@ -456,6 +460,8 @@ export class LocalEventBuffer {
     suppressedFieldsJson: string;
     createdAt: string;
     uploadedAt: string | null;
+    repoHash: string | null;
+    branchHash: string | null;
   }): BufferedEventRow {
     return {
       id: row.id,
@@ -467,6 +473,8 @@ export class LocalEventBuffer {
       suppressedFields: JSON.parse(row.suppressedFieldsJson) as string[],
       createdAt: row.createdAt,
       uploadedAt: row.uploadedAt ?? null,
+      repoHash: row.repoHash ?? null,
+      branchHash: row.branchHash ?? null,
     };
   }
 
@@ -476,7 +484,7 @@ export class LocalEventBuffer {
         `select id, source, event_type as eventType, data_mode as dataMode,
           observed_at as observedAt, payload_json as payloadJson,
           suppressed_fields_json as suppressedFieldsJson, created_at as createdAt,
-          uploaded_at as uploadedAt
+          uploaded_at as uploadedAt, repo_hash as repoHash, branch_hash as branchHash
         from buffered_events
         order by created_at desc
         limit ?`,
@@ -494,7 +502,8 @@ export class LocalEventBuffer {
         `select id, source, event_type as eventType, data_mode as dataMode,
           observed_at as observedAt, payload_json as payloadJson,
           suppressed_fields_json as suppressedFieldsJson, created_at as createdAt,
-          uploaded_at as uploadedAt, length(payload_json) as payloadBytes
+          uploaded_at as uploadedAt, repo_hash as repoHash, branch_hash as branchHash,
+          length(payload_json) as payloadBytes
         from buffered_events
         where uploaded_at is null
         order by created_at asc
