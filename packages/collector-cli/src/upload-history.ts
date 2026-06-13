@@ -507,8 +507,10 @@ function defaultSleep(ms: number): Promise<void> {
  * skew window). 429/5xx/network retry with exponential backoff honoring
  * Retry-After; signature/auth/payload errors (400/401/403) FAIL CLOSED — they
  * mean credentials or schema drift, and retrying cannot fix either.
+ * Exported for the session-sync lane (issue 0037), which shares the exact
+ * transport semantics.
  */
-async function postHistoryBatch(input: {
+export async function postHistoryBatch(input: {
   url: string;
   body: string;
   installKey: string;

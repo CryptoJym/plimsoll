@@ -340,6 +340,68 @@ export const aiWorkAttributionRepairBatchSchema = z
 export type AiWorkAttributionRepairBatch = z.infer<typeof aiWorkAttributionRepairBatchSchema>;
 
 /**
+ * Session sync (issue 0037 / cloud Phase D1): the local ledger stitches
+ * sessions from events (session_id on every row); hosted AiWorkSession held
+ * 0 rows. This lane carries full SNAPSHOTS of one session's aggregate state,
+ * recomputed from the ledger on every send — sessions GROW over time (endedAt
+ * advances, totals climb), so unlike immutable events the cloud applies a
+ * grow-only last-writer-wins upsert.
+ *
+ * Id rule (the join contract): a ledger session id that Postgres' uuid column
+ * accepts passes through VERBATIM (lowercased) — that exact value is what the
+ * event lane already stored on event rows, in the session_id uuid column
+ * (claude v4 ids) or in metadata.externalSessionId (codex v7 ids on pre-D1
+ * rows) — so session rows JOIN to their events. Non-uuid ledger ids derive
+ * the same UUID on every run (collector-cli session-sync.ts) and keep the
+ * original in session.metadata.externalSessionId (their events carry the
+ * same raw value there).
+ *
+ * `kind` discriminates it from event batches on the shared ingest route (the
+ * attribution_repair pattern). Totals are typed — not loose metadata — so the
+ * cloud and proofs can reconcile them against event rows; costUsd sums PRICED
+ * events only and pricedEvents says how many (honest-numbers doctrine: an
+ * unpriced session is never a fabricated $0.00).
+ */
+export const aiWorkSessionTotalsSchema = z
+  .object({
+    events: z.number().int().positive(),
+    inputTokens: z.number().int().nonnegative().default(0),
+    outputTokens: z.number().int().nonnegative().default(0),
+    cacheReadTokens: z.number().int().nonnegative().default(0),
+    cacheCreationTokens: z.number().int().nonnegative().default(0),
+    pricedEvents: z.number().int().nonnegative().default(0),
+    costUsd: z.number().nonnegative().default(0),
+  })
+  .strict();
+export type AiWorkSessionTotals = z.infer<typeof aiWorkSessionTotalsSchema>;
+
+export const aiWorkSessionSyncRowSchema = z
+  .object({
+    session: aiWorkSessionSchema.extend({
+      id: uuidShapedIdSchema,
+      endedAt: timestampSchema,
+    }),
+    totals: aiWorkSessionTotalsSchema,
+  })
+  .strict()
+  .refine(
+    (row) => Date.parse(row.session.endedAt) >= Date.parse(row.session.startedAt),
+    "Session endedAt must not precede startedAt.",
+  );
+export type AiWorkSessionSyncRow = z.infer<typeof aiWorkSessionSyncRowSchema>;
+
+export const aiWorkSessionSyncBatchSchema = z
+  .object({
+    kind: z.literal("session_sync"),
+    tenantId: idSchema.default(LOCAL_TENANT_ID),
+    installKey: keySchema,
+    appVersion: z.string().trim().min(1).default("0.1.0"),
+    sessions: z.array(aiWorkSessionSyncRowSchema).min(1).max(500),
+  })
+  .strict();
+export type AiWorkSessionSyncBatch = z.infer<typeof aiWorkSessionSyncBatchSchema>;
+
+/**
  * Repo label disclosure (issue 0036): repo display names are deliberate,
  * owner-run disclosures (push-repo-labels previews the exact payload first).
  * Only derived slugs cross the wire — a value containing "://" is refused so

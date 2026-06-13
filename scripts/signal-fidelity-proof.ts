@@ -86,6 +86,13 @@ import {
   runWorkspaceHistoryUpload,
 } from "../packages/collector-cli/src/upload-history";
 import {
+  buildSessionSyncRow,
+  collectSessionSnapshots,
+  ensureUuidSessionId,
+  runSessionSync,
+  sessionIdsFromBatches,
+} from "../packages/collector-cli/src/session-sync";
+import {
   branchLinkageHash,
   remoteLinkageHash,
 } from "../packages/shared/src/linkage";
@@ -106,8 +113,10 @@ import { readLocalIdentities } from "../packages/collector-cli/src/local-identit
 import {
   aiInteractionEventSchema,
   aiWorkIngestBatchSchema,
+  aiWorkSessionSyncBatchSchema,
   findForbiddenRawContentFields,
   type AiInteractionEvent,
+  type AiWorkSessionSyncRow,
 } from "../packages/shared/src/index";
 import {
   applyClaudeSettings,
@@ -2363,6 +2372,420 @@ async function main() {
     );
 
     await new Promise<void>((resolve) => historyServer.close(() => resolve()));
+  }
+
+  // 17. Session sync (issue 0038 / cloud Phase D1): the ledger's stitched
+  // sessions become REAL hosted rows — deterministic join-able ids, snapshot
+  // totals that reconcile to the ledger, the grow-only idempotent push, and
+  // the daemon's touched-sessions refresh.
+  {
+    // 17a. Session-id rule: anything Postgres' uuid column accepts passes
+    // through verbatim-lowercased — claude v4 ids live in events.session_id
+    // and codex v7 ids in metadata.externalSessionId, so the session row id
+    // must equal those exact values for the join to work. Non-uuid ids derive
+    // the SAME uuid every run, in a namespace distinct from event ids.
+    const v4Session = "2B866C49-6F64-4AC1-9D6B-D9CE0AA64166";
+    const v7Session = "019dbcc6-d26c-7c82-84cb-a211da747e46";
+    const junkOnce = ensureUuidSessionId("session-junk-0042");
+    const junkTwice = ensureUuidSessionId("session-junk-0042");
+    check(
+      "session_ids_idempotent_uuid_mapping_joins_event_forms",
+      ensureUuidSessionId(v4Session).id === v4Session.toLowerCase() &&
+        !ensureUuidSessionId(v4Session).derived &&
+        ensureUuidSessionId(v7Session).id === v7Session &&
+        !ensureUuidSessionId(v7Session).derived &&
+        junkOnce.derived &&
+        junkOnce.id === junkTwice.id &&
+        junkOnce.id !== ensureUuidEventId("session-junk-0042").id &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(junkOnce.id),
+      JSON.stringify({
+        v7Passthrough: ensureUuidSessionId(v7Session).id === v7Session,
+        derivedStable: junkOnce.id === junkTwice.id,
+        eventNamespaceDistinct: junkOnce.id !== ensureUuidEventId("session-junk-0042").id,
+      }),
+    );
+
+    // Fixture ledger: three healthy sessions (codex v7 with two repos —
+    // dominant pair must win; claude v4; junk-id), two poisoned sessions
+    // (unknown source, timezone-less timestamp) that must SKIP with reasons,
+    // and sessionless events that must not invent sessions.
+    const sessionHome = path.join(tempDir, "session-home");
+    fs.mkdirSync(sessionHome, { recursive: true });
+    const sessionLedgerPath = path.join(sessionHome, "session-ledger.sqlite");
+    const SESSION_REPO_A = "sha256:sessrepoaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SESSION_REPO_B = "sha256:sessrepobbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const SESSION_BRANCH_B = "sha256:sessbranchbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const sessionSeed = new LocalEventBuffer(sessionLedgerPath);
+    const seedSessionEvent = (input: {
+      index: number;
+      sessionId?: string;
+      source?: "codex" | "claude_code";
+      observedAt: string;
+      costUsd?: number;
+      repoHash?: string;
+      branchHash?: string;
+    }) =>
+      sessionSeed.append(
+        aiInteractionEventSchema.parse({
+          id: deterministicEventId(["session-proof", input.index]),
+          ...(input.sessionId ? { sessionId: input.sessionId } : {}),
+          actorId: "sha256:sessionproofaccount0000000000000000000001",
+          source: input.source ?? "codex",
+          eventType: "assistant_response",
+          observedAt: input.observedAt,
+          model: "proof-model",
+          inputTokens: 10,
+          outputTokens: 5,
+          cacheReadTokens: 100,
+          cacheCreationTokens: 7,
+          ...(input.costUsd !== undefined ? { costUsd: input.costUsd } : {}),
+          ...(input.repoHash
+            ? { metadata: { git: { remoteUrlHash: input.repoHash, branchHash: input.branchHash } } }
+            : {}),
+        }),
+        [],
+      );
+    const junkSessionRaw = "session-junk-0042";
+    let seedIndex = 0;
+    // v7 codex session: 10 events on repo A, 20 on repo B (B must dominate),
+    // 5 priced.
+    for (let i = 0; i < 30; i += 1) {
+      seedSessionEvent({
+        index: (seedIndex += 1),
+        sessionId: v7Session,
+        observedAt: new Date(Date.UTC(2026, 4, 1, 0, 0, i)).toISOString(),
+        ...(i < 5 ? { costUsd: 0.02 } : {}),
+        ...(i < 10
+          ? { repoHash: SESSION_REPO_A }
+          : { repoHash: SESSION_REPO_B, branchHash: SESSION_BRANCH_B }),
+      });
+    }
+    // v4 claude session: 4 events, unpriced, no repo linkage.
+    for (let i = 0; i < 4; i += 1) {
+      seedSessionEvent({
+        index: (seedIndex += 1),
+        sessionId: v4Session.toLowerCase(),
+        source: "claude_code",
+        observedAt: new Date(Date.UTC(2026, 4, 2, 0, 0, i)).toISOString(),
+      });
+    }
+    // junk-id session: 2 events.
+    for (let i = 0; i < 2; i += 1) {
+      seedSessionEvent({
+        index: (seedIndex += 1),
+        sessionId: junkSessionRaw,
+        observedAt: new Date(Date.UTC(2026, 4, 3, 0, 0, i)).toISOString(),
+      });
+    }
+    // Sessionless events: never become sessions.
+    for (let i = 0; i < 3; i += 1) {
+      seedSessionEvent({
+        index: (seedIndex += 1),
+        observedAt: new Date(Date.UTC(2026, 4, 4, 0, 0, i)).toISOString(),
+      });
+    }
+    // Poisoned rows the strict wire schema must refuse, itemized by reason.
+    sessionSeed.database
+      .prepare(
+        `insert into buffered_events (id, source, event_type, data_mode, observed_at, payload_json, suppressed_fields_json, created_at, session_id)
+         values ('session-bad-source', 'mystery_tool', 'assistant_response', 'metadata', '2026-05-05T00:00:00.000Z', '{}', '[]', datetime('now'), 'mystery-session-1')`,
+      )
+      .run();
+    sessionSeed.database
+      .prepare(
+        `insert into buffered_events (id, source, event_type, data_mode, observed_at, payload_json, suppressed_fields_json, created_at, session_id)
+         values ('session-bad-time', 'codex', 'assistant_response', 'metadata', '2026-05-05 00:00:00', '{}', '[]', datetime('now'), 'badtime-session-1')`,
+      )
+      .run();
+
+    // 17b. Snapshots reconcile to the ledger exactly; --until scoping is the
+    // idempotency horizon; dominant (repo, branch) pair wins attribution.
+    const untilT1 = new Date(Date.now() + 1000).toISOString();
+    const snapshotsT1 = collectSessionSnapshots(sessionSeed.database, { until: untilT1 });
+    const v7Snap = snapshotsT1.find((row) => row.sessionId === v7Session);
+    const v4Snap = snapshotsT1.find((row) => row.sessionId === v4Session.toLowerCase());
+    const junkSnap = snapshotsT1.find((row) => row.sessionId === junkSessionRaw);
+    check(
+      "session_snapshots_reconcile_to_ledger",
+      snapshotsT1.length === 5 &&
+        v7Snap?.events === 30 &&
+        v7Snap.inputTokens === 300 &&
+        v7Snap.outputTokens === 150 &&
+        v7Snap.cacheReadTokens === 3000 &&
+        v7Snap.cacheCreationTokens === 210 &&
+        v7Snap.pricedEvents === 5 &&
+        Math.abs(v7Snap.costUsd - 0.1) < 1e-9 &&
+        v7Snap.repoHash === SESSION_REPO_B &&
+        v7Snap.branchHash === SESSION_BRANCH_B &&
+        v7Snap.startedAt === "2026-05-01T00:00:00.000Z" &&
+        v7Snap.endedAt === "2026-05-01T00:00:29.000Z" &&
+        v7Snap.accountHash === "sha256:sessionproofaccount0000000000000000000001" &&
+        v4Snap?.events === 4 &&
+        v4Snap.pricedEvents === 0 &&
+        v4Snap.repoHash === null &&
+        junkSnap?.events === 2 &&
+        !snapshotsT1.some((row) => row.sessionId === null),
+      JSON.stringify({
+        sessions: snapshotsT1.map((row) => `${row.sessionId}:${row.events}`),
+        v7Dominant: `${v7Snap?.repoHash}@${v7Snap?.branchHash}`,
+      }),
+    );
+
+    // 17c. Wire rows obey the strict contract; poisoned sessions skip with
+    // reasons; honest totals (unpriced stays unpriced); junk ids carry their
+    // raw value in metadata.externalSessionId so events still join.
+    const wireRows = snapshotsT1.map((snapshot) => buildSessionSyncRow(snapshot));
+    const okRows = wireRows.flatMap((row) => (row.ok ? [row] : []));
+    const skipReasons = wireRows
+      .flatMap((row) => (row.ok ? [] : [row.reason]))
+      .sort()
+      .join(",");
+    const junkWire = okRows.find((row) => row.row.session.metadata.externalSessionId === junkSessionRaw);
+    const wireBatchParses = aiWorkSessionSyncBatchSchema.safeParse({
+      kind: "session_sync",
+      installKey: "pli_sessionproofkey0000000000000001",
+      sessions: okRows.map((row) => row.row),
+    }).success;
+    const v7Wire = okRows.find((row) => row.row.session.id === v7Session);
+    check(
+      "session_rows_obey_contract_and_skip_with_reasons",
+      okRows.length === 3 &&
+        skipReasons === "schema_invalid,source_invalid" &&
+        wireBatchParses &&
+        v7Wire?.row.session.projectKey === SESSION_REPO_B &&
+        v7Wire.row.session.metadata.branchHash === SESSION_BRANCH_B &&
+        v7Wire.row.session.metadata.externalActorId ===
+          "sha256:sessionproofaccount0000000000000000000001" &&
+        v7Wire.row.session.metadata.externalSessionId === undefined &&
+        v7Wire.row.totals.costUsd > 0 &&
+        junkWire !== undefined &&
+        junkWire.idDerived &&
+        okRows.find((row) => row.row.session.id === v4Session.toLowerCase())?.row.totals
+          .pricedEvents === 0,
+      JSON.stringify({ eligible: okRows.length, skipped: skipReasons, batchParses: wireBatchParses }),
+    );
+
+    // 17d. End-to-end against a stub workspace implementing the cloud's
+    // grow-only upsert (insert / update / skippedStale with the
+    // ended_at + totals.events guard): full push inserts, identical re-run
+    // inserts nothing and changes nothing, growth updates in place, a STALE
+    // replay can never regress the held row, and the daemon-path subset only
+    // touches its sessions. Signatures verified exactly like the cloud.
+    const SESSION_INSTALL_KEY = "pli_sessionproofkey0000000000000001";
+    const SESSION_SECRET = "session-proof-signing-secret-0123456789";
+    const sessionStore = new Map<string, AiWorkSessionSyncRow>();
+    let sessionSignatureFailures = 0;
+    let sessionMaxBatch = 0;
+    const sessionServer = http.createServer((request, response) => {
+      let body = "";
+      request.on("data", (chunk) => (body += chunk));
+      request.on("end", () => {
+        const timestamp = String(request.headers["x-plimsoll-upload-timestamp"] ?? "");
+        const signature = String(request.headers["x-plimsoll-upload-signature"] ?? "");
+        const expected = `sha256=${crypto.createHmac("sha256", SESSION_SECRET).update(`${timestamp}.${body}`).digest("hex")}`;
+        if (!timestamp || signature !== expected) {
+          sessionSignatureFailures += 1;
+          response.writeHead(401, { "content-type": "application/json" });
+          response.end(JSON.stringify({ error: "bad_upload_signature" }));
+          return;
+        }
+        const batch = aiWorkSessionSyncBatchSchema.parse(JSON.parse(body));
+        sessionMaxBatch = Math.max(sessionMaxBatch, batch.sessions.length);
+        let inserted = 0;
+        let updated = 0;
+        for (const row of batch.sessions) {
+          const held = sessionStore.get(row.session.id);
+          if (!held) {
+            sessionStore.set(row.session.id, row);
+            inserted += 1;
+            continue;
+          }
+          const heldEnd = Date.parse(held.session.endedAt);
+          const incomingEnd = Date.parse(row.session.endedAt);
+          const grows =
+            incomingEnd > heldEnd ||
+            (incomingEnd === heldEnd && row.totals.events >= held.totals.events);
+          if (grows) {
+            sessionStore.set(row.session.id, row);
+            updated += 1;
+          }
+        }
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(
+          JSON.stringify({
+            ok: true,
+            accepted: batch.sessions.length,
+            inserted,
+            updated,
+            installKey: SESSION_INSTALL_KEY,
+          }),
+        );
+      });
+    });
+    await new Promise<void>((resolve) => sessionServer.listen(0, "127.0.0.1", () => resolve()));
+    const sessionPort = (sessionServer.address() as AddressInfo).port;
+    const sessionConfig = collectorConfigSchema.parse({
+      uploadUrl: `http://127.0.0.1:${sessionPort}/api/work-intelligence/ingest`,
+      installKey: SESSION_INSTALL_KEY,
+      uploadSigningSecret: SESSION_SECRET,
+      tenantId: "44444444-5555-4666-8777-888888888888",
+    });
+    const sessionLogs: string[] = [];
+    const sessionLog = (line: string) => sessionLogs.push(line);
+
+    const sessionRun1 = await runSessionSync(sessionConfig, {
+      until: untilT1,
+      ledgerPath: sessionLedgerPath,
+      batchSize: 2, // forces multiple batches over 3 sessions
+      delayMs: 0,
+      maxAttemptsPerBatch: 2,
+      log: sessionLog,
+    });
+    const storeAfterRun1 = JSON.stringify([...sessionStore.entries()].sort());
+    const sessionRun2 = await runSessionSync(sessionConfig, {
+      until: untilT1,
+      ledgerPath: sessionLedgerPath,
+      batchSize: 2,
+      delayMs: 0,
+      maxAttemptsPerBatch: 2,
+      log: sessionLog,
+    });
+    const storeAfterRun2 = JSON.stringify([...sessionStore.entries()].sort());
+    // batchSize: 2 over 3 sessions must have split batches (chunking under
+    // the contract); later runs use the default size, so snapshot the max now.
+    const maxBatchThroughRun2 = sessionMaxBatch;
+
+    // Growth: one more v7 event lands after T1; the refreshed snapshot must
+    // update in place (events 31, later endedAt).
+    seedSessionEvent({
+      index: (seedIndex += 1),
+      sessionId: v7Session,
+      observedAt: "2026-05-01T00:01:00.000Z",
+    });
+    const untilT2 = new Date(Date.now() + 1000).toISOString();
+    const sessionRun3 = await runSessionSync(sessionConfig, {
+      until: untilT2,
+      ledgerPath: sessionLedgerPath,
+      delayMs: 0,
+      maxAttemptsPerBatch: 2,
+      log: sessionLog,
+    });
+    const v7AfterGrowth = sessionStore.get(v7Session);
+
+    // Stale replay: re-running over the OLD horizon recomputes the 30-event
+    // snapshot — the stub (like the cloud) must refuse the regression.
+    const sessionRun4 = await runSessionSync(sessionConfig, {
+      until: untilT1,
+      ledgerPath: sessionLedgerPath,
+      delayMs: 0,
+      maxAttemptsPerBatch: 2,
+      log: sessionLog,
+    });
+    const v7AfterStaleReplay = sessionStore.get(v7Session);
+
+    // Daemon path: only the touched session crosses, read through the LIVE
+    // buffer handle (no second file open).
+    const requestsBeforeSubset = sessionLogs.length;
+    const sessionRunSubset = await runSessionSync(sessionConfig, {
+      sessionIds: [v4Session.toLowerCase()],
+      ledgerDb: sessionSeed.database,
+      delayMs: 0,
+      maxAttemptsPerBatch: 2,
+      log: sessionLog,
+    });
+    void requestsBeforeSubset;
+
+    // Dry run: zero network, zero store movement.
+    const storeBeforeDry = JSON.stringify([...sessionStore.entries()].sort());
+    const sessionDry = await runSessionSync(sessionConfig, {
+      until: untilT1,
+      ledgerPath: sessionLedgerPath,
+      dryRun: true,
+      delayMs: 0,
+      log: sessionLog,
+    });
+    const storeAfterDry = JSON.stringify([...sessionStore.entries()].sort());
+    sessionSeed.close();
+    await new Promise<void>((resolve) => sessionServer.close(() => resolve()));
+
+    check(
+      "session_sync_e2e_grow_only_idempotent",
+      sessionRun1.ok &&
+        sessionRun1.ledgerSessions === 5 &&
+        sessionRun1.eligibleSessions === 3 &&
+        sessionRun1.skippedSessions === 2 &&
+        sessionRun1.acceptedSessions === 3 &&
+        sessionRun1.insertedSessions === 3 &&
+        sessionRun1.derivedIds === 1 &&
+        maxBatchThroughRun2 <= 2 &&
+        sessionStore.size === 3 &&
+        sessionRun2.ok &&
+        sessionRun2.insertedSessions === 0 &&
+        storeAfterRun1 === storeAfterRun2 &&
+        sessionRun3.ok &&
+        sessionRun3.insertedSessions === 0 &&
+        (sessionRun3.updatedSessions ?? 0) >= 1 &&
+        v7AfterGrowth?.totals.events === 31 &&
+        v7AfterGrowth.session.endedAt === "2026-05-01T00:01:00.000Z" &&
+        sessionRun4.ok &&
+        v7AfterStaleReplay?.totals.events === 31 &&
+        v7AfterStaleReplay.session.endedAt === "2026-05-01T00:01:00.000Z" &&
+        sessionRunSubset.ok &&
+        sessionRunSubset.ledgerSessions === 1 &&
+        sessionRunSubset.sentSessions === 1 &&
+        sessionDry.ok &&
+        sessionDry.dryRun &&
+        storeBeforeDry === storeAfterDry &&
+        sessionSignatureFailures === 0 &&
+        sessionLogs.every((line) => !line.includes(SESSION_INSTALL_KEY)),
+      JSON.stringify({
+        run1: { inserted: sessionRun1.insertedSessions, skipped: sessionRun1.skippedSessions },
+        run2Inserted: sessionRun2.insertedSessions,
+        growth: { events: v7AfterGrowth?.totals.events, endedAt: v7AfterGrowth?.session.endedAt },
+        staleReplayHeld: v7AfterStaleReplay?.totals.events === 31,
+        subsetSent: sessionRunSubset.sentSessions,
+      }),
+    );
+
+    // 17e. The daemon refreshes touched sessions after each event sync —
+    // pure id extraction, and the wiring stays isolated from the event
+    // backoff (a session-push failure must never look like a sync failure).
+    const touchedIds = sessionIdsFromBatches([
+      {
+        tenantId: "t",
+        installKey: "k",
+        appVersion: "0.1.0",
+        events: [
+          { event: aiInteractionEventSchema.parse({ id: deterministicEventId(["touch", 1]), sessionId: v7Session, source: "codex", eventType: "assistant_response", observedAt: "2026-05-01T00:00:00.000Z" }), suppressedFields: [] },
+          { event: aiInteractionEventSchema.parse({ id: deterministicEventId(["touch", 2]), source: "codex", eventType: "assistant_response", observedAt: "2026-05-01T00:00:01.000Z" }), suppressedFields: [] },
+        ],
+      },
+      null,
+      {
+        tenantId: "t",
+        installKey: "k",
+        appVersion: "0.1.0",
+        events: [
+          { event: aiInteractionEventSchema.parse({ id: deterministicEventId(["touch", 3]), sessionId: v7Session, source: "codex", eventType: "assistant_response", observedAt: "2026-05-01T00:00:02.000Z" }), suppressedFields: [] },
+          { event: aiInteractionEventSchema.parse({ id: deterministicEventId(["touch", 4]), sessionId: junkSessionRaw, source: "claude_code", eventType: "assistant_response", observedAt: "2026-05-01T00:00:03.000Z" }), suppressedFields: [] },
+        ],
+      },
+    ]);
+    const cliSource = fs.readFileSync(
+      path.join(process.cwd(), "packages/collector-cli/src/cli.ts"),
+      "utf8",
+    );
+    check(
+      "daemon_sync_refreshes_touched_sessions_isolated",
+      JSON.stringify(touchedIds) === JSON.stringify([v7Session, junkSessionRaw]) &&
+        sessionIdsFromBatches([null]).length === 0 &&
+        cliSource.includes("sessionIdsFromBatches(uploadedBatches)") &&
+        cliSource.includes("ledgerDb: buffer.database") &&
+        cliSource.includes("pendingSessionIds") &&
+        /catch[\s\S]{0,200}session_sync_failed/.test(cliSource) &&
+        cliSource.includes('flag("--sessions")'),
+      JSON.stringify({ touchedIds, cliWired: cliSource.includes("ledgerDb: buffer.database") }),
+    );
   }
 
   fs.rmSync(tempDir, { recursive: true, force: true });
