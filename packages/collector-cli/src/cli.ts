@@ -36,6 +36,7 @@ import {
   generateSetupInstructions,
 } from "../../collector-config/src/index";
 import type { ToolSource } from "../../shared/src/index";
+import { runOutcomesSync } from "./outcomes-sync";
 import { prepareRepoLabelsPush, pushRepoLabels } from "./repo-labels";
 import { runSessionSync, sessionIdsFromBatches } from "./session-sync";
 import { uploadBufferedEvents } from "./upload";
@@ -75,6 +76,11 @@ Commands:
   push-repo-labels      Disclose repo display names to the joined workspace so dashboards
                         show github.com/owner/name instead of sha256 hashes. Previews the
                         exact payload first; --dry-run to only preview.
+  sync-outcomes         Push the locally-computed session↔PR outcome join (issue 0038)
+                        for ONE named repository to the joined workspace: merge status,
+                        check results, and short-horizon rework, keyed by the same
+                        linkage hashes sessions and events carry. Idempotent by
+                        deterministic id; re-running converges instead of duplicating.
   scan-rollouts         Read codex rollout files into the ledger once (full history walk)
   scan-transcripts      Read Claude Code transcript usage into the ledger once (full history walk)
   install-launch-agent  Write the user LaunchAgent plist
@@ -108,6 +114,12 @@ Config tools:
       changes nothing. The daemon refreshes touched sessions after each 5-minute
       sync; this command is the full backfill and the post-restart recovery tool.
   push-repo-labels [--dry-run] [--yes] [--url URL]
+  sync-outcomes --repository owner/repo [--since-days 30] [--rework-window-days 14] [--until ISO] [--dry-run] [--url URL]
+      Same fetch surface as the local efficiency report (pull list, check-runs and
+      rework scan for joined PRs only — bounded; GITHUB_TOKEN/GH_TOKEN honored, optional
+      for public repos). Naming the repo is the same deliberate disclosure as
+      push-repo-labels: owner/name + remoteUrlHash cross; titles/diffs/paths never do.
+      --dry-run computes the join and prints the audit without pushing.
   install-launch-agent [--repo-root PATH] [--pnpm PATH] [--load]
   load-launch-agent
   unload-launch-agent
@@ -961,6 +973,35 @@ async function main() {
         2,
       ),
     );
+    return;
+  }
+
+  if (command === "sync-outcomes") {
+    // Outcomes feed (issue 0038 / cloud Phase D2): push the local session↔PR
+    // join for one named repo. The audit table and honest sent/accepted
+    // counters go to stdout; the server response is never echoed raw.
+    const repository = optionValue("--repository");
+    if (!repository) {
+      console.error("sync-outcomes requires --repository owner/repo (the explicit disclosure that scopes the run).");
+      process.exitCode = 1;
+      return;
+    }
+    const numberOption = (name: string) => {
+      const raw = optionValue(name);
+      if (raw === undefined) return undefined;
+      const value = Number(raw);
+      if (!Number.isFinite(value)) throw new Error(`${name} expects a number, got: ${raw}`);
+      return value;
+    };
+    const outcomes = await runOutcomesSync(config, {
+      repository,
+      sinceDays: numberOption("--since-days"),
+      reworkWindowDays: numberOption("--rework-window-days"),
+      until: optionValue("--until"),
+      dryRun: flag("--dry-run"),
+      url: optionValue("--url"),
+    });
+    if (!outcomes.ok) process.exitCode = 1;
     return;
   }
 

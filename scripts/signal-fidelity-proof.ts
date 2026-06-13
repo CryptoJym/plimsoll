@@ -93,6 +93,14 @@ import {
   sessionIdsFromBatches,
 } from "../packages/collector-cli/src/session-sync";
 import {
+  buildOutcomePush,
+  collectSessionLinks,
+  joinSessionsToPulls,
+  reworkSignalsInWindow,
+  runOutcomesSync,
+  type PullOutcome,
+} from "../packages/collector-cli/src/outcomes-sync";
+import {
   branchLinkageHash,
   remoteLinkageHash,
 } from "../packages/shared/src/linkage";
@@ -2785,6 +2793,318 @@ async function main() {
         /catch[\s\S]{0,200}session_sync_failed/.test(cliSource) &&
         cliSource.includes('flag("--sessions")'),
       JSON.stringify({ touchedIds, cliWired: cliSource.includes("ledgerDb: buffer.database") }),
+    );
+  }
+
+  // 18. Outcomes sync (issue 0038 / cloud Phase D2): the locally-computed
+  // session↔PR join crosses to the workspace's github-outcomes route with
+  // deterministic ids, the report's exact join + rework-window semantics,
+  // and nothing beyond what the local join already derives.
+  {
+    const d2Until = "2026-05-20T00:00:00.000Z";
+    const d2Owner = "Acme";
+    const d2Repo = "Widgets";
+    const d2RepoHash = remoteLinkageHash(`https://github.com/${d2Owner}/${d2Repo}.git`)!;
+    const otherRepoHash = remoteLinkageHash("https://github.com/acme/other.git")!;
+    const loginBranchHash = branchLinkageHash("feature/login")!;
+
+    const d2SessionA = "a1b2c3d4-0000-4000-8000-000000000001";
+    const d2SessionB = "codex-session-raw"; // non-uuid → deterministic derive
+    const d2SessionC = "c3c3c3c3-0000-4000-8000-000000000003";
+    const d2SessionD = "d4d4d4d4-0000-4000-8000-000000000004";
+    const d2SessionE = "e5e5e5e5-0000-4000-8000-000000000005";
+
+    const d2Ledger = new Database(":memory:");
+    d2Ledger.exec(
+      `create table buffered_events (
+         session_id text, observed_at text, created_at text,
+         repo_hash text, branch_hash text, head_sha text
+       )`,
+    );
+    const d2Insert = d2Ledger.prepare(
+      "insert into buffered_events values (@sessionId, @observedAt, @createdAt, @repoHash, @branchHash, @headSha)",
+    );
+    const d2Row = (sessionId: string, fields: Partial<Record<"repoHash" | "branchHash" | "headSha", string>>, createdAt = "2026-05-10T00:00:00.000Z") =>
+      d2Insert.run({
+        sessionId,
+        observedAt: "2026-05-10T00:00:00.000Z",
+        createdAt,
+        repoHash: null,
+        branchHash: null,
+        headSha: null,
+        ...fields,
+      });
+    // A: 3 events, repo + login branch (joins #7 and #9 via branch_hash).
+    d2Row(d2SessionA, { repoHash: d2RepoHash, branchHash: loginBranchHash });
+    d2Row(d2SessionA, { repoHash: d2RepoHash, branchHash: loginBranchHash });
+    d2Row(d2SessionA, { repoHash: d2RepoHash });
+    // B: 5 events, head shas hitting #8 (head_sha) and #10 (merge_sha).
+    for (let i = 0; i < 3; i += 1) d2Row(d2SessionB, { repoHash: d2RepoHash, headSha: "ffff7770000000000000" });
+    d2Row(d2SessionB, { repoHash: d2RepoHash, headSha: "99887766aabb00000000" });
+    d2Row(d2SessionB, { repoHash: d2RepoHash });
+    // C: same branch hash but ANOTHER repo — the repo scope must exclude it.
+    d2Row(d2SessionC, { repoHash: otherRepoHash, branchHash: loginBranchHash });
+    // D: no linkage at all. E: only event lands after the watermark.
+    d2Row(d2SessionD, {});
+    d2Row(d2SessionE, { repoHash: d2RepoHash, branchHash: loginBranchHash }, "2026-05-21T00:00:00.000Z");
+
+    const d2Pulls = [
+      { number: 7, state: "open", merged_at: null, head: { ref: "feature/login", sha: "aaaa1110000000000000" }, merge_commit_sha: null, updated_at: "2026-05-15T00:00:00.000Z" },
+      { number: 8, state: "closed", merged_at: "2026-05-10T00:00:00.000Z", head: { ref: "fix/payments", sha: "ffff7770000000000000" }, merge_commit_sha: "1234567890ab00000000", updated_at: "2026-05-10T00:00:00.000Z" },
+      { number: 9, state: "closed", merged_at: "2026-05-08T00:00:00.000Z", head: { ref: "feature/login", sha: "bbbb2220000000000000" }, merge_commit_sha: "55556666777700000000", updated_at: "2026-05-12T00:00:00.000Z" },
+      { number: 10, state: "closed", merged_at: "2026-05-01T00:00:00.000Z", head: { ref: "chore/deps", sha: "cccc3330000000000000" }, merge_commit_sha: "99887766aabb00000000", updated_at: "2026-05-18T00:00:00.000Z" },
+      { number: 11, state: "closed", merged_at: "2026-03-01T00:00:00.000Z", head: { ref: "old/stale", sha: "dddd4440000000000000" }, merge_commit_sha: "eeee5550000000000000", updated_at: "2026-04-01T00:00:00.000Z" },
+    ];
+    const d2CheckRuns: Record<string, unknown> = {
+      aaaa1110000000000000: { total_count: 0, check_runs: [] },
+      ffff7770000000000000: { total_count: 2, check_runs: [{ status: "completed", conclusion: "success" }, { status: "completed", conclusion: "success" }] },
+      bbbb2220000000000000: { total_count: 2, check_runs: [{ status: "completed", conclusion: "failure" }, { status: "completed", conclusion: "success" }] },
+      cccc3330000000000000: { total_count: 1, check_runs: [{ status: "completed", conclusion: "success" }] },
+    };
+    // Revert names #8's merge sha; reopen on #9 is inside the 14d window,
+    // reopen on #10 (merged 05-01, reopened 05-18) is outside it.
+    const d2Commits = [
+      { sha: "deadbeefcafe00000000", commit: { message: "Revert payment change\n\nThis reverts commit 1234567." } },
+    ];
+    const d2IssueEvents: Record<string, unknown> = {
+      "8": [],
+      "9": [{ event: "reopened", created_at: "2026-05-12T00:00:00.000Z" }],
+      "10": [{ event: "reopened", created_at: "2026-05-18T00:00:00.000Z" }],
+    };
+
+    const D2_SECRET = "d2-proof-signing-secret-0123456789";
+    const D2_INSTALL_KEY = "d2-proof-install-key";
+    const d2PostedBodies: string[] = [];
+    let d2SignatureFailures = 0;
+    const d2Fetch: typeof fetch = async (input, init) => {
+      const url = String(input);
+      const json = (payload: unknown) =>
+        new Response(JSON.stringify(payload), { status: 200, headers: { "content-type": "application/json" } });
+      if (url.includes("api.github.com")) {
+        if (url.includes("/pulls?")) return json(d2Pulls);
+        const checkMatch = url.match(/commits\/([0-9a-f]+)\/check-runs/);
+        if (checkMatch) return json(d2CheckRuns[checkMatch[1]] ?? { total_count: 0, check_runs: [] });
+        if (url.includes("/commits?since=")) return json(d2Commits);
+        const eventsMatch = url.match(/issues\/(\d+)\/events/);
+        if (eventsMatch) return json(d2IssueEvents[eventsMatch[1]] ?? []);
+        return json([]);
+      }
+      // The workspace route: verify the HMAC like the cloud does, then echo
+      // honest counters parsed from the actual body.
+      const body = String(init?.body ?? "");
+      const headers = new Headers(init?.headers as HeadersInit);
+      const timestamp = headers.get("x-plimsoll-upload-timestamp") ?? "";
+      const expected = `sha256=${crypto.createHmac("sha256", D2_SECRET).update(`${timestamp}.${body}`).digest("hex")}`;
+      if (headers.get("x-plimsoll-upload-signature") !== expected || headers.get("x-plimsoll-install-key") !== D2_INSTALL_KEY) {
+        d2SignatureFailures += 1;
+        return new Response(JSON.stringify({ error: "bad_upload_signature" }), { status: 401 });
+      }
+      d2PostedBodies.push(body);
+      const parsed = JSON.parse(body) as { artifacts: unknown[]; outcomes: unknown[] };
+      return json({
+        ok: true,
+        acceptedArtifacts: parsed.artifacts.length,
+        acceptedOutcomes: parsed.outcomes.length,
+        detachedActorRefs: 0,
+        detachedSessionRefs: 0,
+      });
+    };
+
+    const d2Config = collectorConfigSchema.parse({
+      uploadUrl: "https://workspace.example/api/work-intelligence/ingest",
+      installKey: D2_INSTALL_KEY,
+      uploadSigningSecret: D2_SECRET,
+      tenantId: "44444444-5555-4666-8777-888888888888",
+    });
+    const d2Logs: string[] = [];
+    const d2Log = (line: string) => d2Logs.push(line);
+
+    // 18a. Join parity + watermark + repo scope (pure halves).
+    const d2Since = new Date(Date.parse(d2Until) - 30 * 24 * 60 * 60 * 1000).toISOString();
+    const d2Sessions = collectSessionLinks(d2Ledger, { since: d2Since, until: d2Until });
+    const d2PullSummaries: PullOutcome[] = d2Pulls
+      .filter((pull) => pull.updated_at >= d2Since)
+      .map((pull) => ({
+        number: pull.number,
+        state: pull.state,
+        merged: Boolean(pull.merged_at),
+        mergedAt: pull.merged_at ?? undefined,
+        branchHash: branchLinkageHash(pull.head.ref),
+        headSha: pull.head.sha,
+        mergeCommitSha: pull.merge_commit_sha ?? undefined,
+        updatedAt: pull.updated_at,
+        checks: "unknown",
+        checksFetched: false,
+      }));
+    const d2Joins = joinSessionsToPulls(d2Sessions, d2PullSummaries, d2RepoHash);
+    const joinKey = (join: { pull: number; sessionId: string; via: string }) => `${join.pull}:${join.sessionId}:${join.via}`;
+    const d2JoinSet = new Set(d2Joins.map(joinKey));
+    check(
+      "outcomes_join_parity_watermark_and_repo_scope",
+      d2Sessions.length === 4 &&
+        !d2Sessions.some((row) => row.sessionId === d2SessionE) &&
+        d2JoinSet.size === 4 &&
+        d2JoinSet.has(`7:${d2SessionA}:branch_hash`) &&
+        d2JoinSet.has(`9:${d2SessionA}:branch_hash`) &&
+        d2JoinSet.has(`8:${d2SessionB}:head_sha`) &&
+        d2JoinSet.has(`10:${d2SessionB}:merge_sha`) &&
+        !d2Joins.some((join) => join.sessionId === d2SessionC || join.sessionId === d2SessionD),
+      JSON.stringify({ sessions: d2Sessions.length, joins: [...d2JoinSet].sort() }),
+    );
+
+    // 18b. Rework-window parity with the report's own yield-v2 exclusions.
+    const d2Signals = [
+      { pull: 8, kind: "revert" as const, evidence: "revert deadbeefc", at: "2026-05-10T00:00:00.000Z" },
+      { pull: 9, kind: "reopen" as const, evidence: "reopened 2026-05-12", at: "2026-05-12T00:00:00.000Z" },
+      { pull: 10, kind: "reopen" as const, evidence: "reopened 2026-05-18", at: "2026-05-18T00:00:00.000Z" },
+    ];
+    const d2Eligible = [
+      { pull: 8, mergedAt: "2026-05-10T00:00:00.000Z" },
+      { pull: 9, mergedAt: "2026-05-08T00:00:00.000Z" },
+      { pull: 10, mergedAt: "2026-05-01T00:00:00.000Z" },
+    ];
+    const windowed = reworkSignalsInWindow(d2Eligible, d2Signals, 14);
+    const v2 = validatedDeliveryYieldV2(d2Eligible, d2Signals, 14);
+    check(
+      "outcomes_rework_window_parity_with_yield_v2",
+      JSON.stringify([...windowed.keys()].sort()) === JSON.stringify(v2.excluded.map((entry) => entry.pull).sort()) &&
+        windowed.has(8) &&
+        windowed.has(9) &&
+        !windowed.has(10) &&
+        v2.numerator === 1,
+      JSON.stringify({ windowedPulls: [...windowed.keys()].sort(), v2Excluded: v2.excluded }),
+    );
+
+    // 18c. Deterministic ids, schema shape, session linkage, privacy gate.
+    const d2BuildInput = {
+      tenantId: d2Config.tenantId,
+      owner: d2Owner,
+      repo: d2Repo,
+      pulls: d2PullSummaries,
+      joins: d2Joins,
+      signals: d2Signals,
+      reworkWindowDays: 14,
+    };
+    const push1 = buildOutcomePush(d2BuildInput);
+    const push2 = buildOutcomePush(d2BuildInput);
+    const artifact8 = push1.batch?.artifacts.find((artifact) => artifact.externalId.endsWith("/pull/8"));
+    const artifact7 = push1.batch?.artifacts.find((artifact) => artifact.externalId.endsWith("/pull/7"));
+    const derivedB = ensureUuidSessionId(d2SessionB);
+    check(
+      "outcomes_push_deterministic_ids_shape_and_linkage",
+      push1.batch !== null &&
+        JSON.stringify(push1.batch) === JSON.stringify(push2.batch) &&
+        push1.batch.repository.remoteUrlHash === d2RepoHash &&
+        push1.batch.repository.owner === "acme" &&
+        push1.batch.repository.name === "widgets" &&
+        artifact7?.id === "artifact:github.com/acme/widgets/pull/7" &&
+        artifact7.sessionId === d2SessionA &&
+        artifact8?.sessionId === derivedB.id &&
+        derivedB.derived &&
+        (artifact8.metadata as { branchHash?: string }).branchHash === branchLinkageHash("fix/payments") &&
+        push1.batch.artifacts.every(
+          (artifact) => findForbiddenRawContentFields(artifact.metadata ?? {}).length === 0,
+        ) &&
+        push1.batch.outcomes.every(
+          (outcome) => findForbiddenRawContentFields(outcome.metadata ?? {}).length === 0,
+        ) &&
+        push1.batch.outcomes.some((outcome) => outcome.id === "outcome:github.com/acme/widgets/pull/8:reverted"),
+      JSON.stringify({
+        deterministic: JSON.stringify(push1.batch) === JSON.stringify(push2.batch),
+        artifacts: push1.artifacts,
+        outcomes: push1.outcomes,
+        artifact8Session: artifact8?.sessionId,
+      }),
+    );
+
+    // 18d. End-to-end: signed push, honest counters, statuses/outcomes per
+    // PR, dry-run sends nothing, and a re-run posts a byte-identical batch.
+    const d2Run1 = await runOutcomesSync(d2Config, {
+      repository: `${d2Owner}/${d2Repo}`,
+      until: d2Until,
+      ledgerDb: d2Ledger,
+      fetchImpl: d2Fetch,
+      log: d2Log,
+    });
+    const d2Run2 = await runOutcomesSync(d2Config, {
+      repository: `${d2Owner}/${d2Repo}`,
+      until: d2Until,
+      ledgerDb: d2Ledger,
+      fetchImpl: d2Fetch,
+      log: d2Log,
+    });
+    const postsBeforeDry = d2PostedBodies.length;
+    const d2Dry = await runOutcomesSync(d2Config, {
+      repository: `${d2Owner}/${d2Repo}`,
+      until: d2Until,
+      ledgerDb: d2Ledger,
+      fetchImpl: d2Fetch,
+      dryRun: true,
+      log: d2Log,
+    });
+    const run1Batch = JSON.parse(d2PostedBodies[0] ?? "{}") as {
+      artifacts: Array<{ externalId: string; status: string }>;
+      outcomes: Array<{ id: string }>;
+    };
+    const statusByPull = new Map(
+      run1Batch.artifacts.map((artifact) => [artifact.externalId.split("/pull/")[1], artifact.status]),
+    );
+    check(
+      "outcomes_sync_e2e_signed_idempotent_dry_run",
+      d2Run1.ok &&
+        d2Run1.pullsExamined === 4 &&
+        d2Run1.pullsJoined === 4 &&
+        d2Run1.artifactsSent === 4 &&
+        d2Run1.artifactsAccepted === 4 &&
+        d2Run1.outcomesSent === 9 &&
+        d2Run1.outcomesAccepted === 9 &&
+        d2Run1.detachedSessionRefs === 0 &&
+        statusByPull.get("7") === "created" &&
+        statusByPull.get("8") === "reverted" &&
+        statusByPull.get("9") === "reopened" &&
+        statusByPull.get("10") === "merged" &&
+        d2Run2.ok &&
+        d2PostedBodies.length === 2 &&
+        d2PostedBodies[0] === d2PostedBodies[1] &&
+        d2Dry.ok &&
+        d2Dry.dryRun &&
+        d2PostedBodies.length === postsBeforeDry &&
+        d2Dry.artifactsAccepted === null &&
+        d2SignatureFailures === 0 &&
+        d2Logs.every((line) => !line.includes(D2_INSTALL_KEY)) &&
+        d2Run1.auditTable.includes("#8"),
+      JSON.stringify({
+        run1: {
+          artifactsAccepted: d2Run1.artifactsAccepted,
+          outcomesAccepted: d2Run1.outcomesAccepted,
+          statuses: [...statusByPull.entries()].sort(),
+        },
+        idempotent: d2PostedBodies[0] === d2PostedBodies[1],
+      }),
+    );
+    d2Ledger.close();
+
+    // 18e. CLI + disclosure wiring: the command exists, requires the
+    // explicit repo disclosure, and the module never ships raw PR titles —
+    // the only rework evidence is sha/url shaped.
+    const outcomesSource = fs.readFileSync(
+      path.join(process.cwd(), "packages/collector-cli/src/outcomes-sync.ts"),
+      "utf8",
+    );
+    const cliSourceD2 = fs.readFileSync(
+      path.join(process.cwd(), "packages/collector-cli/src/cli.ts"),
+      "utf8",
+    );
+    check(
+      "outcomes_cli_disclosure_and_no_raw_content_wired",
+      cliSourceD2.includes('command === "sync-outcomes"') &&
+        cliSourceD2.includes("runOutcomesSync(config") &&
+        /sync-outcomes requires --repository/.test(cliSourceD2) &&
+        outcomesSource.includes('"/api/work-intelligence/github-outcomes"') &&
+        outcomesSource.includes("findForbiddenRawContentFields") &&
+        !/pull\.title|\btitle\b\s*:/.test(outcomesSource) &&
+        outcomesSource.includes("ensureUuidSessionId"),
+      "sync-outcomes command wired with required --repository; outcomes module derives the C8 route path, runs the forbidden-content gate, links sessions via the D1 id mapping, and never holds PR titles",
     );
   }
 
