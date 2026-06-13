@@ -37,6 +37,7 @@ import {
 } from "../../collector-config/src/index";
 import type { ToolSource } from "../../shared/src/index";
 import { prepareRepoLabelsPush, pushRepoLabels } from "./repo-labels";
+import { runSessionSync, sessionIdsFromBatches } from "./session-sync";
 import { uploadBufferedEvents } from "./upload";
 import { runAttributionRepair, runWorkspaceHistoryUpload } from "./upload-history";
 
@@ -100,6 +101,12 @@ Config tools:
       Fill projectKey on already-uploaded workspace rows from the ledger's repo_hash
       column (the bulk ingest lane is first-writer-wins, so re-uploading cannot).
       Set-based and fill-only server-side; re-running reports updated: 0.
+  upload-history --sessions [--until ISO] [--batch-size 500] [--concurrency 1..8] [--delay-ms 100] [--dry-run] [--url URL]
+      Push one snapshot per stitched ledger session (issue 0037) so the workspace
+      holds REAL session rows that join to their events. The cloud upserts
+      grow-only by deterministic session id — re-running over the same --until
+      changes nothing. The daemon refreshes touched sessions after each 5-minute
+      sync; this command is the full backfill and the post-restart recovery tool.
   push-repo-labels [--dry-run] [--yes] [--url URL]
   install-launch-agent [--repo-root PATH] [--pnpm PATH] [--load]
   load-launch-agent
@@ -354,17 +361,29 @@ async function main() {
     };
 
     let syncSkipUntil = 0;
+    // Sessions whose snapshot push failed (or was interrupted) carry over to
+    // the next cycle in memory. A daemon restart drops the set — the
+    // `upload-history --sessions` backfill is the stateless recovery tool,
+    // exactly as the event side's recovery is upload-history itself.
+    let pendingSessionIds: string[] = [];
 
     const runSync = async () => {
       if (!config.uploadUrl || syncInFlight || shuttingDown) return;
       if (Date.now() < syncSkipUntil) return;
       syncInFlight = true;
+      const uploadedBatches: Array<Awaited<ReturnType<typeof uploadBufferedEvents>>["batch"]> = [];
+      const carrySessions = () => {
+        pendingSessionIds = [
+          ...new Set([...pendingSessionIds, ...sessionIdsFromBatches(uploadedBatches)]),
+        ];
+      };
       try {
         let batches = 0;
         let uploaded = 0;
         while (batches < 5) {
           const result = await uploadBufferedEvents(config, buffer, {});
           if (result.uploadedEvents === 0) break;
+          uploadedBatches.push(result.batch);
           uploaded += result.uploadedEvents;
           batches += 1;
           if (result.remainingUnuploaded === 0) break;
@@ -380,7 +399,56 @@ async function main() {
         }
         syncFailureStreak = 0;
         syncSkipUntil = 0;
+
+        // Session sync (issue 0037): the sessions whose events just crossed
+        // get their snapshots refreshed — recomputed over the FULL ledger,
+        // pushed as a kind:"session_sync" batch the cloud upserts grow-only.
+        // Isolated failure domain: events are already marked uploaded, so a
+        // session-push error must never look like a sync failure or trigger
+        // the event backoff; the ids simply carry to the next cycle.
+        const touchedSessionIds = [
+          ...new Set([...pendingSessionIds, ...sessionIdsFromBatches(uploadedBatches)]),
+        ];
+        if (touchedSessionIds.length > 0) {
+          try {
+            const sessionResult = await runSessionSync(config, {
+              sessionIds: touchedSessionIds,
+              ledgerDb: buffer.database,
+              log: () => undefined,
+            });
+            pendingSessionIds = sessionResult.ok ? [] : touchedSessionIds;
+            if (sessionResult.ok && sessionResult.sentSessions > 0) {
+              console.log(
+                JSON.stringify({
+                  status: "session_sync",
+                  sessions: sessionResult.sentSessions,
+                  inserted: sessionResult.insertedSessions,
+                  updated: sessionResult.updatedSessions,
+                  skippedStale:
+                    sessionResult.insertedSessions === null || sessionResult.updatedSessions === null
+                      ? null
+                      : sessionResult.acceptedSessions -
+                        sessionResult.insertedSessions -
+                        sessionResult.updatedSessions,
+                }),
+              );
+            } else if (!sessionResult.ok) {
+              console.warn(
+                JSON.stringify({ warning: "session_sync_failed", message: sessionResult.reason }),
+              );
+            }
+          } catch (error) {
+            pendingSessionIds = touchedSessionIds;
+            console.warn(
+              JSON.stringify({
+                warning: "session_sync_failed",
+                message: error instanceof Error ? error.message : String(error),
+              }),
+            );
+          }
+        }
       } catch (error) {
+        carrySessions();
         syncFailureStreak += 1;
         const backoffMs = Math.min(
           config.syncIntervalSeconds * 1000 * 2 ** Math.min(syncFailureStreak, 4),
@@ -818,6 +886,21 @@ async function main() {
         url: optionValue("--url"),
       });
       if (!repair.ok) process.exitCode = 1;
+      return;
+    }
+    if (flag("--sessions")) {
+      // Session backfill (issue 0037): push one snapshot per stitched ledger
+      // session; the cloud upserts grow-only by deterministic session id, so
+      // re-running over the same --until changes nothing.
+      const sessions = await runSessionSync(config, {
+        until: optionValue("--until"),
+        batchSize: numberOption("--batch-size"),
+        concurrency: numberOption("--concurrency"),
+        delayMs: numberOption("--delay-ms"),
+        dryRun: flag("--dry-run"),
+        url: optionValue("--url"),
+      });
+      if (!sessions.ok) process.exitCode = 1;
       return;
     }
     const result = await runWorkspaceHistoryUpload(config, {
