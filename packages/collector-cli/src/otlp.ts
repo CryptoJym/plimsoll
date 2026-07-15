@@ -3,6 +3,7 @@ import {
   aiInteractionEventSchema,
   estimateCostUsd,
   sanitizeForPolicy,
+  type ActionClass,
   type AiInteractionEvent,
   type PolicyConfig,
   type ToolSource,
@@ -20,6 +21,11 @@ import {
   unixNanoToIso,
   usageFieldKeys,
 } from "./normalizer";
+import {
+  addOtlpAdmissionDrop,
+  decideOtlpSpanAdmission,
+  type OtlpAdmissionDrop,
+} from "./otlp-admission";
 
 export type MetricSample = {
   id: string;
@@ -36,6 +42,8 @@ export type MetricSample = {
 export type ExplodedOtlp = {
   events: Array<{ event: AiInteractionEvent; suppressedFields: string[] }>;
   metricSamples: MetricSample[];
+  admissionDrops: OtlpAdmissionDrop[];
+  droppedEventCount: number;
   recordCount: number;
   datapointCount: number;
   parseFailures: number;
@@ -72,9 +80,12 @@ function flattenOtelAttributes(attributes: unknown): Record<string, unknown> {
 function resourceSummary(resource: unknown) {
   const attrs = flattenOtelAttributes(asRecord(resource).attributes);
   return {
-    serviceName: typeof attrs["service.name"] === "string" ? attrs["service.name"] : undefined,
+    serviceName: boundedSignalName(attrs["service.name"]),
     serviceVersion:
-      typeof attrs["service.version"] === "string" ? attrs["service.version"] : undefined,
+      typeof attrs["service.version"] === "string" &&
+      /^[a-zA-Z0-9_.+-]{1,80}$/.test(attrs["service.version"].trim())
+        ? attrs["service.version"].trim()
+        : undefined,
   };
 }
 
@@ -125,6 +136,199 @@ function workdirFromRawRecord(record: Record<string, unknown>): string | undefin
   return undefined;
 }
 
+const SAFE_STRING_ATTRIBUTE_KEYS = new Set(
+  [
+    ...usageFieldKeys.actorId,
+    ...usageFieldKeys.cacheReadTokens,
+    ...usageFieldKeys.cacheCreationTokens,
+    ...usageFieldKeys.costUsd,
+    ...usageFieldKeys.inputTokens,
+    ...usageFieldKeys.model,
+    ...usageFieldKeys.outputTokens,
+    ...usageFieldKeys.sessionId,
+    "event.name",
+    "event.timestamp",
+    "timestamp",
+    "tool_name",
+    "toolName",
+    "tool",
+    "gen_ai.tool.name",
+    "plimsoll.action_class",
+    "cfo_one.action_class",
+    "action_class",
+    "mcp_server",
+    "request_id",
+    "call_id",
+    "gen_ai.response.id",
+    "plimsoll.project",
+    "cfo_one.project",
+    "project_key",
+    "project",
+    "plimsoll.customer",
+    "cfo_one.customer",
+    "customer_key",
+    "customer",
+    "plimsoll.workflow",
+    "cfo_one.workflow",
+    "workflow_key",
+    "workflow",
+    "decision",
+    "type",
+    "error.type",
+    "exception.type",
+    "duration_ms",
+    "success",
+    "failed",
+    "error",
+    "status.code",
+    "event.sequence",
+    "http.request.method",
+    "http.response.status_code",
+    "rpc.system",
+    "rpc.service",
+    "rpc.method",
+    "db.system",
+    "db.operation.name",
+  ].map((key) => key.toLowerCase()),
+);
+
+const SENSITIVE_SEMANTIC_KEY_PARTS = new Set([
+  "args",
+  "arguments",
+  "body",
+  "command",
+  "content",
+  "cwd",
+  "directory",
+  "file",
+  "filepath",
+  "filename",
+  "fullpath",
+  "message",
+  "output",
+  "patch",
+  "path",
+  "prompt",
+  "query",
+  "sql",
+  "stack",
+  "stacktrace",
+  "statement",
+  "uri",
+  "url",
+  "workdir",
+]);
+
+function looksLikePathOrUrl(value: string) {
+  const candidate = value.trim();
+  return (
+    /^(?:\/|~\/|file:\/\/|https?:\/\/|[a-zA-Z]:[\\/])/.test(candidate) ||
+    candidate.includes("\\")
+  );
+}
+
+function boundedSignalName(value: unknown) {
+  if (typeof value !== "string") return undefined;
+  const candidate = value.trim();
+  return /^[a-zA-Z0-9_./:+-]{1,160}$/.test(candidate) && !looksLikePathOrUrl(candidate)
+    ? candidate
+    : undefined;
+}
+
+function isSensitiveSemanticKey(key: string) {
+  const parts = key.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  return parts.some((part) => SENSITIVE_SEMANTIC_KEY_PARTS.has(part));
+}
+
+function isSafeAnalyticalAttribute(key: string, value: unknown) {
+  const allowlisted = SAFE_STRING_ATTRIBUTE_KEYS.has(key.toLowerCase());
+  if (isSensitiveSemanticKey(key) && !allowlisted) return false;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value === "boolean") return true;
+  if (typeof value !== "string") return false;
+  return allowlisted && Boolean(boundedSignalName(value));
+}
+
+function metadataSafeOtlpAttributes(
+  attrs: Record<string, unknown>,
+  dataMode: PolicyConfig["dataMode"],
+) {
+  if (dataMode === "evidence") return { attrs, suppressedFields: [] as string[] };
+  const safe: Record<string, unknown> = {};
+  const suppressedFields: string[] = [];
+  for (const [key, value] of Object.entries(attrs)) {
+    if (isSafeAnalyticalAttribute(key, value)) {
+      safe[key] = value;
+    } else {
+      suppressedFields.push(`attributes.${key}`);
+    }
+  }
+  return { attrs: safe, suppressedFields };
+}
+
+function eventNameFromAttributes(attrs: Record<string, unknown>) {
+  return boundedSignalName(stringField(attrs, ["event.name"]));
+}
+
+const ACTION_CLASSES = new Set<ActionClass>([
+  "continue",
+  "validate",
+  "test",
+  "edit",
+  "read",
+  "write",
+  "shell",
+  "mcp",
+  "browser",
+  "review",
+  "other",
+]);
+
+function explicitActionFrom(attrs: Record<string, unknown>) {
+  const raw = stringField(attrs, [
+    "plimsoll.action_class",
+    "cfo_one.action_class",
+    "action_class",
+  ]);
+  if (!raw) return { present: false as const };
+  const normalized = raw.toLowerCase();
+  if (ACTION_CLASSES.has(normalized as ActionClass)) {
+    return { present: true as const, actionClass: normalized as ActionClass };
+  }
+  return {
+    present: true as const,
+    actionClass: "other" as const,
+    originalActionClass: boundedSignalName(raw),
+  };
+}
+
+function statusCode(record: Record<string, unknown>) {
+  const value = asRecord(record.status).code;
+  return typeof value === "number" || typeof value === "string" ? value : undefined;
+}
+
+function isErrorStatus(value: string | number | undefined) {
+  if (value === 2) return true;
+  return typeof value === "string" && (value === "2" || value.toUpperCase().includes("ERROR"));
+}
+
+function spanHasExceptionEvent(span: Record<string, unknown>) {
+  if (!Array.isArray(span.events)) return false;
+  return span.events.some((candidate) => {
+    const name = boundedSignalName(asRecord(candidate).name);
+    return name?.toLowerCase().includes("exception") ?? false;
+  });
+}
+
+function attributesHaveError(attrs: Record<string, unknown>) {
+  return Boolean(
+    stringField(attrs, ["error.type", "exception.type"]) ||
+      attrs.error === true ||
+      attrs.failed === true ||
+      attrs.success === false,
+  );
+}
+
 function buildLogEvent(
   record: Record<string, unknown>,
   context: {
@@ -149,9 +353,8 @@ function buildLogEvent(
   const sanitized = sanitizeForPolicy(record, context.policy);
   const safeRecord = asRecord(sanitized.value);
   const attrs = flattenOtelAttributes(safeRecord.attributes);
-  const body = otelScalar(asRecord(safeRecord.body));
-  const bodyText = typeof body === "string" ? body : undefined;
-  const otelEventName = stringField(attrs, ["event.name"]) ?? bodyText;
+  const metadataAttrs = metadataSafeOtlpAttributes(attrs, context.policy.dataMode);
+  const otelEventName = eventNameFromAttributes(attrs);
 
   const inputTokens = intTokens(numberField(attrs, [...usageFieldKeys.inputTokens]));
   const outputTokens = intTokens(numberField(attrs, [...usageFieldKeys.outputTokens]));
@@ -173,16 +376,21 @@ function buildLogEvent(
     }
   }
   const hasUsage =
-    inputTokens !== undefined || outputTokens !== undefined || costUsd !== undefined;
+    inputTokens !== undefined ||
+    outputTokens !== undefined ||
+    cacheReadTokens !== undefined ||
+    cacheCreationTokens !== undefined ||
+    costUsd !== undefined;
 
-  const toolName = stringField(attrs, ["tool_name", "toolName", "tool"]);
-  const explicitActionClass = stringField(attrs, ["plimsoll.action_class", "cfo_one.action_class", "action_class"]);
-  const derived = explicitActionClass ? undefined : deriveActionClass(toolName);
+  const toolName = boundedSignalName(stringField(attrs, ["tool_name", "toolName", "tool"]));
+  const explicitAction = explicitActionFrom(attrs);
+  const derived = explicitAction.present ? undefined : deriveActionClass(toolName);
   const mcpServer = stringField(attrs, ["mcp_server"]);
   const actionClass =
-    explicitActionClass ??
-    (derived?.actionClass === "other" && mcpServer ? "mcp" : derived?.actionClass) ??
-    "other";
+    explicitAction.present
+      ? explicitAction.actionClass
+      : (derived?.actionClass === "other" && mcpServer ? "mcp" : derived?.actionClass) ??
+        "other";
 
   const eventType = hasUsage
     ? "assistant_response"
@@ -220,10 +428,14 @@ function buildLogEvent(
     cacheCreationTokens,
     costUsd: costUsd !== undefined && costUsd >= 0 ? costUsd : undefined,
     metadata: {
-      ...attrs,
+      ...metadataAttrs.attrs,
       ...(otelEventName ? { otelEventName } : {}),
       ...(toolName ? { toolName } : {}),
       ...(derived?.detail ? { toolClassDetail: derived.detail } : {}),
+      ...(explicitAction.present ? { otelExplicitAction: true } : {}),
+      ...(explicitAction.present && explicitAction.originalActionClass
+        ? { otelOriginalActionClass: explicitAction.originalActionClass }
+        : {}),
       ...(context.transportPath ? { transport_path: context.transportPath } : {}),
       ...(context.serviceName ? { serviceName: context.serviceName } : {}),
       ...(context.serviceVersion ? { serviceVersion: context.serviceVersion } : {}),
@@ -232,7 +444,14 @@ function buildLogEvent(
     },
   });
 
-  return { event, suppressedFields: sanitized.evaluation.suppressedFields };
+  return {
+    event,
+    suppressedFields: [
+      ...sanitized.evaluation.suppressedFields,
+      ...metadataAttrs.suppressedFields,
+      ...(context.policy.dataMode !== "evidence" && "body" in safeRecord ? ["body"] : []),
+    ],
+  };
 }
 
 function buildSpanEvent(
@@ -248,7 +467,9 @@ function buildSpanEvent(
   const sanitized = sanitizeForPolicy(span, context.policy);
   const safeSpan = asRecord(sanitized.value);
   const attrs = flattenOtelAttributes(safeSpan.attributes);
-  const spanName = typeof safeSpan.name === "string" ? safeSpan.name : undefined;
+  const metadataAttrs = metadataSafeOtlpAttributes(attrs, context.policy.dataMode);
+  const rawSpanName = typeof safeSpan.name === "string" ? safeSpan.name : undefined;
+  const spanName = boundedSignalName(rawSpanName);
   const observedAt = recordTimestamp(safeSpan, attrs);
   const sessionId = stringField(attrs, [...usageFieldKeys.sessionId]);
   const inputTokens = intTokens(numberField(attrs, [...usageFieldKeys.inputTokens]));
@@ -271,6 +492,38 @@ function buildSpanEvent(
     }
   }
 
+  const hasUsage =
+    inputTokens !== undefined ||
+    outputTokens !== undefined ||
+    cacheReadTokensSpan !== undefined ||
+    cacheCreationTokensSpan !== undefined ||
+    costUsd !== undefined;
+  const toolName = boundedSignalName(
+    stringField(attrs, ["tool_name", "toolName", "tool", "gen_ai.tool.name"]),
+  );
+  const explicitAction = explicitActionFrom(attrs);
+  const derived = explicitAction.present ? undefined : deriveActionClass(toolName);
+  const classifiedType = classifyEventType(spanName);
+  const lifecycleType =
+    classifiedType === "session_start" ||
+    classifiedType === "session_stop" ||
+    classifiedType === "user_prompt_submit"
+      ? classifiedType
+      : undefined;
+  const eventType = hasUsage
+    ? "assistant_response"
+    : toolName || explicitAction.present
+      ? classifiedType === "tool_result"
+        ? "tool_result"
+        : "tool_use"
+      : lifecycleType
+        ? lifecycleType
+        : "otel_span";
+  const otelStatusCode = statusCode(safeSpan);
+  const otelHasException = spanHasExceptionEvent(safeSpan);
+  const otelHasError =
+    isErrorStatus(otelStatusCode) || otelHasException || attributesHaveError(attrs);
+
   const event = aiInteractionEventSchema.parse({
     actorId: stringField(attrs, [...usageFieldKeys.actorId]),
     id: deterministicEventId([
@@ -286,21 +539,31 @@ function buildSpanEvent(
     tenantId: context.policy.tenantId,
     source: eventSourceFor(attrs, context.source, context.serviceName),
     dataMode: context.policy.dataMode,
-    eventType: inputTokens !== undefined || outputTokens !== undefined || costUsd !== undefined
-      ? "assistant_response"
-      : "otel_span",
+    eventType,
     observedAt,
     model: stringField(attrs, [...usageFieldKeys.model]),
-    actionClass: "other",
+    projectKey: stringField(attrs, ["plimsoll.project", "cfo_one.project", "project_key", "project"]),
+    customerKey: stringField(attrs, ["plimsoll.customer", "cfo_one.customer", "customer_key", "customer"]),
+    workflowKey: stringField(attrs, ["plimsoll.workflow", "cfo_one.workflow", "workflow_key", "workflow"]),
+    actionClass: explicitAction.present ? explicitAction.actionClass : derived?.actionClass ?? "other",
     inputTokens,
     outputTokens,
     cacheReadTokens: cacheReadTokensSpan,
     cacheCreationTokens: cacheCreationTokensSpan,
     costUsd: costUsd !== undefined && costUsd >= 0 ? costUsd : undefined,
     metadata: {
-      ...attrs,
+      ...metadataAttrs.attrs,
       ...(costEstimated ? { costEstimated: true } : {}),
       ...(spanName ? { otelEventName: spanName } : {}),
+      ...(toolName ? { toolName } : {}),
+      ...(derived?.detail ? { toolClassDetail: derived.detail } : {}),
+      ...(explicitAction.present ? { otelExplicitAction: true } : {}),
+      ...(explicitAction.present && explicitAction.originalActionClass
+        ? { otelOriginalActionClass: explicitAction.originalActionClass }
+        : {}),
+      ...(otelStatusCode !== undefined ? { otelStatusCode } : {}),
+      ...(otelHasException ? { otelHasException: true } : {}),
+      ...(otelHasError ? { otelHasError: true } : {}),
       ...(typeof safeSpan.traceId === "string" ? { traceId: safeSpan.traceId } : {}),
       ...(typeof safeSpan.spanId === "string" ? { spanId: safeSpan.spanId } : {}),
       ...(context.transportPath ? { transport_path: context.transportPath } : {}),
@@ -308,7 +571,14 @@ function buildSpanEvent(
     },
   });
 
-  return { event, suppressedFields: sanitized.evaluation.suppressedFields };
+  return {
+    event,
+    suppressedFields: [
+      ...sanitized.evaluation.suppressedFields,
+      ...metadataAttrs.suppressedFields,
+      ...(rawSpanName && !spanName ? ["span.name"] : []),
+    ],
+  };
 }
 
 function buildMetricSamples(
@@ -319,7 +589,7 @@ function buildMetricSamples(
     serviceName?: string;
   },
 ): MetricSample[] {
-  const metricName = typeof metric.name === "string" ? metric.name : "unknown_metric";
+  const metricName = boundedSignalName(metric.name) ?? "unknown_metric";
   const samples: MetricSample[] = [];
   const shapes: Array<{ kind: string; dataPoints: unknown }> = [
     { kind: "sum", dataPoints: asRecord(metric.sum).dataPoints },
@@ -333,6 +603,7 @@ function buildMetricSamples(
       const sanitized = sanitizeForPolicy(dataPointRaw, context.policy);
       const dataPoint = asRecord(sanitized.value);
       const attrs = flattenOtelAttributes(dataPoint.attributes);
+      const metadataAttrs = metadataSafeOtlpAttributes(attrs, context.policy.dataMode);
       const value =
         shape.kind === "histogram"
           ? numberField(dataPoint, ["sum", "count"])
@@ -361,7 +632,7 @@ function buildMetricSamples(
         model,
         sampleType,
         value,
-        attrs,
+        attrs: metadataAttrs.attrs,
       });
     }
   }
@@ -379,6 +650,8 @@ export function explodeOtlpPayload(
   const result: ExplodedOtlp = {
     events: [],
     metricSamples: [],
+    admissionDrops: [],
+    droppedEventCount: 0,
     recordCount: 0,
     datapointCount: 0,
     parseFailures: 0,
@@ -422,15 +695,20 @@ export function explodeOtlpPayload(
         : []) {
         result.recordCount += 1;
         try {
-          result.events.push(
-            buildSpanEvent(asRecord(span), {
+          const entry = buildSpanEvent(asRecord(span), {
               policy,
               source,
               transportPath: options.transportPath,
               serviceName: resource.serviceName,
               serviceVersion: resource.serviceVersion,
-            }),
-          );
+            });
+          const decision = decideOtlpSpanAdmission(entry.event);
+          if (decision.admitted) {
+            result.events.push(entry);
+          } else {
+            result.droppedEventCount += 1;
+            addOtlpAdmissionDrop(result.admissionDrops, entry.event.source, decision.reason);
+          }
         } catch {
           result.parseFailures += 1;
         }
