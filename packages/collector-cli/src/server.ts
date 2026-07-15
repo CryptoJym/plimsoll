@@ -124,6 +124,7 @@ export function createCollectorServer(
             counterLifetime: "durable",
             dropped: buffer.otlpAdmissionCounters(),
           },
+          delivery: buffer.delivery.status(),
           maintenance: options.maintenanceStatus?.() ?? null,
           health: healthCache.value,
         });

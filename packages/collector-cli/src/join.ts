@@ -155,7 +155,9 @@ export async function performJoin(options: {
   // Handshake: prove the issued credentials round-trip through the REAL sync
   // path. Drain whatever is buffered; on a box with nothing captured yet,
   // emit one self-test event (the self-test-hook shape) so the upload is real.
-  const buffer = new LocalEventBuffer(collectorBufferPath(homeDir));
+  const buffer = new LocalEventBuffer(collectorBufferPath(homeDir), {
+    delivery: { enabled: true, limits: config.delivery },
+  });
   let selfTestEventId: string | null = null;
   try {
     if (buffer.stats().unuploadedCount === 0) {
@@ -164,7 +166,6 @@ export async function performJoin(options: {
           id: `join_handshake_${Date.now()}`,
           source: "claude_code",
           event_type: "UserPromptSubmit",
-          project: "plimsoll-join-handshake",
         },
         { config, buffer, source: "claude_code" },
       );

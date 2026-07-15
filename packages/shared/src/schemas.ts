@@ -66,6 +66,15 @@ const idSchema = z.string().trim().min(1);
 const keySchema = z.string().trim().min(1);
 const metadataSchema = z.record(z.string(), z.unknown()).default({});
 
+/** Canonical privacy-preserving linkage used on every outbound boundary.
+ * Uppercase hexadecimal input is accepted for legacy compatibility and
+ * normalized to the exact lowercase wire representation. */
+export const canonicalLinkageSchema = z
+  .string()
+  .trim()
+  .regex(/^sha256:[a-f0-9]{64}$/i, "Expected sha256: followed by exactly 64 hexadecimal characters.")
+  .transform((value) => value.toLowerCase());
+
 export const forbiddenRawContentFieldNames = [
   "api_request_body",
   "api_response_body",
@@ -350,11 +359,10 @@ export type AiWorkAttributionRepairBatch = z.infer<typeof aiWorkAttributionRepai
  * Id rule (the join contract): a ledger session id that Postgres' uuid column
  * accepts passes through VERBATIM (lowercased) — that exact value is what the
  * event lane already stored on event rows, in the session_id uuid column
- * (claude v4 ids) or in metadata.externalSessionId (codex v7 ids on pre-D1
- * rows) — so session rows JOIN to their events. Non-uuid ledger ids derive
- * the same UUID on every run (collector-cli session-sync.ts) and keep the
- * original in session.metadata.externalSessionId (their events carry the
- * same raw value there).
+ * (claude v4 ids and codex v7 ids) — so session rows JOIN to their events.
+ * Non-uuid ledger ids derive the same UUID on every run
+ * (collector-cli/session-sync.ts); the raw local identifier never crosses the
+ * session-sync outbound boundary.
  *
  * `kind` discriminates it from event batches on the shared ingest route (the
  * attribution_repair pattern). Totals are typed — not loose metadata — so the
@@ -404,19 +412,48 @@ export type AiWorkSessionSyncBatch = z.infer<typeof aiWorkSessionSyncBatchSchema
 /**
  * Repo label disclosure (issue 0036): repo display names are deliberate,
  * owner-run disclosures (push-repo-labels previews the exact payload first).
- * Only derived slugs cross the wire — a value containing "://" is refused so
- * raw remote URLs can never ride along by accident.
+ * Only bounded printable ASCII slugs cross the wire. URL/path/email,
+ * multibyte, auth, credential, secret-prefix, JWT, and private-key shapes are
+ * refused so deliberate display-name disclosure cannot become a value bypass.
  */
+const REPO_DISPLAY_SLUG = /^[a-zA-Z0-9._-]{1,200}$/;
+const REPO_SECRET_PREFIX = /(?:^|[._-])(?:sk_live|sk_test|sk-|ghp[a-z0-9_-]*|github_pat[a-z0-9_-]*|xox[a-z0-9_-]*)/i;
+const REPO_AUTH_SCHEME = /^(?:bearer|basic)(?:[._-]|$)/i;
+const REPO_JWT = /^eyj[a-z0-9_-]*\.[a-z0-9_-]+\.[a-z0-9_-]+$/i;
+const REPO_CREDENTIAL_WORD = /^(?:auth|credential|credentials|password|secret|secrets|token|tokens)$/i;
+const REPO_CREDENTIAL_COMPOUND = /(?:access|api|client|private|signing|ssh)(?:key|secret|token)/i;
+
+function isSafeRepoDisplaySlug(value: string) {
+  if (
+    !/^[\x20-\x7e]+$/.test(value) ||
+    !REPO_DISPLAY_SLUG.test(value) ||
+    value === "." ||
+    value === ".." ||
+    REPO_SECRET_PREFIX.test(value) ||
+    REPO_AUTH_SCHEME.test(value) ||
+    REPO_JWT.test(value)
+  ) {
+    return false;
+  }
+  const words = value.split(/[._-]+/).filter(Boolean);
+  const collapsed = words.join("");
+  return !words.some((word) => REPO_CREDENTIAL_WORD.test(word)) &&
+    !REPO_CREDENTIAL_COMPOUND.test(collapsed);
+}
+
 const repoDisplaySlugSchema = z
   .string()
   .trim()
   .min(1)
   .max(200)
-  .refine((value) => !value.includes("://"), "Raw URLs never cross the wire — send the derived slug.");
+  .refine(
+    isSafeRepoDisplaySlug,
+    "Expected a bounded printable ASCII repo slug without URL, path, email, credential, or secret shapes.",
+  );
 
 export const workRepoLabelSchema = z
   .object({
-    remoteUrlHash: keySchema,
+    remoteUrlHash: canonicalLinkageSchema,
     name: repoDisplaySlugSchema,
     owner: repoDisplaySlugSchema.optional(),
     provider: z.enum(["github", "gitlab", "local_git", "unknown"]).default("github"),

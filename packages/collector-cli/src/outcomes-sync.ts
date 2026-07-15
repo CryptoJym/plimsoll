@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 
 import type { CollectorConfig } from "./config";
 import { collectorBufferPath } from "./config";
+import { canonicalCommitSha, canonicalLinkage } from "./outbound-envelope";
 import { ensureUuidSessionId } from "./session-sync";
 import {
   findForbiddenRawContentFields,
@@ -268,9 +269,12 @@ export function buildOutcomePush(input: {
       checksFetched: pull.checksFetched,
       reworkWindowDays: input.reworkWindowDays,
     };
-    if (pull.branchHash) metadata.branchHash = pull.branchHash;
-    if (pull.headSha) metadata.headSha = pull.headSha;
-    if (pull.mergeCommitSha) metadata.mergeCommitSha = pull.mergeCommitSha;
+    const branchHash = canonicalLinkage(pull.branchHash);
+    const headSha = canonicalCommitSha(pull.headSha);
+    const mergeCommitSha = canonicalCommitSha(pull.mergeCommitSha);
+    if (branchHash) metadata.branchHash = branchHash;
+    if (headSha) metadata.headSha = headSha;
+    if (mergeCommitSha) metadata.mergeCommitSha = mergeCommitSha;
 
     artifacts.push({
       id: artifactId,

@@ -6,13 +6,13 @@ import Database from "better-sqlite3";
 import type { CollectorConfig } from "./config";
 import { collectorBufferPath, collectorLogPath } from "./config";
 import { deterministicEventId } from "./normalizer";
+import { canonicalLinkage, hasUnsafeOutboundString, sealOutboundEnvelope } from "./outbound-envelope";
 import {
   aiWorkAttributionRepairBatchSchema,
   aiWorkIngestBatchSchema,
-  aiInteractionEventSchema,
-  findForbiddenRawContentFields,
   type AiInteractionEvent,
   type AiWorkAttributionRepairRow,
+  type AiWorkIngestEvent,
 } from "../../shared/src/index";
 
 /**
@@ -34,8 +34,9 @@ import {
  *   rows. The resume watermark is a fast-forward optimization, never a
  *   correctness mechanism.
  * - Privacy parity: the wire envelope is exactly the recent-buffer upload
- *   shape (upload.ts) — payload + suppressedFields — re-validated against the
- *   strict event schema and the forbidden-raw-content gate before send.
+ *   shape (upload.ts) — payload + suppressedFields — reduced by the shared
+ *   typed allowlist before send. Unknown/local/raw values are omitted; exact
+ *   approved fields fail closed when their values violate the contract.
  * - Honest numbers: unpriced events stay unpriced in the audit; cost is only
  *   summed over events that carry a real costUsd.
  */
@@ -51,9 +52,9 @@ const POSTGRES_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 /**
  * Deterministic UUID for ledger ids the cloud's uuid column would reject
  * (e.g. pre-normalizer hook ids). Same ledger id → same UUID on every run, so
- * the cloud ingest dedupes re-sends; the original id is preserved in
- * metadata.externalEventId. Reuses the repo's deterministicEventId (sha256 →
- * version-5/variant-9 shape) with a fixed namespace part.
+ * the cloud ingest dedupes re-sends; the raw local id is never exported.
+ * Reuses the repo's deterministicEventId (sha256 → version-5/variant-9 shape)
+ * with a fixed namespace part.
  */
 export function ensureUuidEventId(rawId: string): { id: string; derived: boolean } {
   if (POSTGRES_UUID_RE.test(rawId)) {
@@ -77,8 +78,8 @@ export type LedgerHistoryRow = {
 export type HistorySkipReason = "payload_unparseable" | "schema_invalid" | "forbidden_content";
 
 export type HistoryEnvelope = {
-  event: AiInteractionEvent;
-  suppressedFields: string[];
+  event: AiWorkIngestEvent["event"];
+  suppressedFields: AiWorkIngestEvent["suppressedFields"];
 };
 
 export type NormalizedHistoryEvent =
@@ -86,14 +87,15 @@ export type NormalizedHistoryEvent =
   | { ok: false; reason: HistorySkipReason; detail: string };
 
 /**
- * Row → wire envelope. The payload is the captured truth and crosses the wire
- * unchanged, with two repairs the strict schema demands:
+ * Row → wire envelope. The payload is local captured truth; the wire copy is
+ * reduced by the shared outbound sealer after two schema repairs:
  * - top-level nulls are dropped (reconcileCodexUsage's json_set writes
  *   `sessionId: null` when no stitch neighbor exists; the schema wants the
  *   key absent — these rows otherwise wedge any oldest-first drain);
  * - non-UUID ids are deterministically re-derived (see ensureUuidEventId).
- * Everything else that fails the schema or carries forbidden raw-content
- * metadata is skipped with a reason — never silently.
+ * Everything else that fails the schema, canonical linkage, or approved-value
+ * contract is skipped with a reason. Unknown/local/raw metadata values are
+ * omitted and bounded safe field names remain in suppression receipts.
  */
 export function normalizeHistoryEvent(row: {
   payloadJson: string;
@@ -123,14 +125,12 @@ export function normalizeHistoryEvent(row: {
 
   let idDerived = false;
   if (typeof candidate.id === "string" && candidate.id.trim()) {
+    if (hasUnsafeOutboundString(candidate.id)) {
+      return { ok: false, reason: "forbidden_content", detail: "unsafe event id" };
+    }
     const ensured = ensureUuidEventId(candidate.id.trim());
     if (ensured.derived) {
       idDerived = true;
-      const metadata =
-        candidate.metadata && typeof candidate.metadata === "object" && !Array.isArray(candidate.metadata)
-          ? (candidate.metadata as Record<string, unknown>)
-          : {};
-      candidate.metadata = { ...metadata, externalEventId: candidate.id };
       candidate.id = ensured.id;
     }
   }
@@ -149,23 +149,6 @@ export function normalizeHistoryEvent(row: {
     }
   }
 
-  const parsed = aiInteractionEventSchema.safeParse(candidate);
-  if (!parsed.success) {
-    const issue = parsed.error.issues[0];
-    return {
-      ok: false,
-      reason: "schema_invalid",
-      detail: issue ? `${issue.path.join(".") || "(root)"}: ${issue.code}` : "unknown issue",
-    };
-  }
-
-  // Defense in depth before anything crosses the wire: the cloud rejects the
-  // whole batch on forbidden fields; skip the row locally instead.
-  const forbidden = findForbiddenRawContentFields(parsed.data.metadata);
-  if (forbidden.length > 0) {
-    return { ok: false, reason: "forbidden_content", detail: forbidden.join(",") };
-  }
-
   let suppressedFields: string[] = [];
   try {
     const parsedSuppressed = JSON.parse(row.suppressedFieldsJson) as unknown;
@@ -178,8 +161,20 @@ export function normalizeHistoryEvent(row: {
     suppressedFields = [];
   }
 
-  const envelope: HistoryEnvelope = { event: parsed.data, suppressedFields };
-  return { ok: true, envelope, bytes: JSON.stringify(envelope).length, idDerived };
+  // History is not a privileged route around the durable outbox. Finish at
+  // the exact shared sealer so approved keys, value-level credential gates,
+  // canonical linkage and suppression filtering are identical on every event
+  // path before a request body can be constructed.
+  const sealed = sealOutboundEnvelope({ event: candidate, suppressedFields });
+  if (!sealed.ok) {
+    return {
+      ok: false,
+      reason: sealed.reason === "privacy" ? "forbidden_content" : "schema_invalid",
+      detail: `shared outbound sealer: ${sealed.reason}`,
+    };
+  }
+  const envelope: HistoryEnvelope = sealed.envelope;
+  return { ok: true, envelope, bytes: Buffer.byteLength(JSON.stringify(envelope)), idDerived };
 }
 
 export const HISTORY_MAX_BATCH_EVENTS = 500;
@@ -903,11 +898,19 @@ export async function runWorkspaceHistoryUpload(
         continue;
       }
 
+      // Re-seal at the batch construction boundary as defense against any
+      // future caller adding a carry item without normalizeHistoryEvent.
+      const sealedChunk = chunk.map((item) => sealOutboundEnvelope(item.envelope));
+      if (sealedChunk.some((item) => !item.ok)) {
+        abortReason = "History batch failed the shared outbound sealer.";
+        break pageLoop;
+      }
+      const sealedEvents = sealedChunk.flatMap((item) => item.ok ? [item.envelope] : []);
       const batchPayload = aiWorkIngestBatchSchema.parse({
         tenantId: config.tenantId,
         installKey: config.installKey,
         appVersion,
-        events: chunk.map((item) => item.envelope),
+        events: sealedEvents,
       });
       const prepared: PreparedBatch = {
         index: nextBatchIndex,
@@ -1011,7 +1014,7 @@ export function buildAttributionRepairRows(
 ): AiWorkAttributionRepairRow[] {
   const out: AiWorkAttributionRepairRow[] = [];
   for (const row of rows) {
-    const repoHash = row.repoHash?.trim();
+    const repoHash = canonicalLinkage(row.repoHash);
     if (!repoHash || !row.id?.trim()) continue;
     out.push({ id: ensureUuidEventId(row.id.trim()).id, projectKey: repoHash });
   }

@@ -13,6 +13,7 @@ import {
   collectorLogPath,
   ensureCollectorHome,
   loadCollectorConfig,
+  type CollectorConfig,
 } from "./config";
 import { appendForwardedHook } from "./forwarder";
 import {
@@ -135,9 +136,14 @@ Config tools:
 `);
 }
 
-function openBuffer() {
+function openBuffer(config: CollectorConfig, deliveryOverride = false) {
   ensureCollectorHome();
-  return new LocalEventBuffer(collectorBufferPath());
+  return new LocalEventBuffer(collectorBufferPath(), {
+    delivery: {
+      enabled: Boolean(config.uploadUrl) || deliveryOverride,
+      limits: config.delivery,
+    },
+  });
 }
 
 function flag(name: string) {
@@ -249,7 +255,7 @@ async function main() {
       return;
     }
 
-    const buffer = openBuffer();
+    const buffer = openBuffer(config);
     let scheduler: CoalescingMaintenanceScheduler | undefined;
     const server = createCollectorServer(config, buffer, {
       runtimeIdentity,
@@ -297,13 +303,13 @@ async function main() {
       try {
         let batches = 0;
         let uploaded = 0;
-        while (batches < 5) {
+        while (batches < config.delivery.maxBatchesPerCycle) {
           const result = await uploadBufferedEvents(config, buffer, {});
           if (result.uploadedEvents === 0) break;
           uploadedBatches.push(result.batch);
           uploaded += result.uploadedEvents;
           batches += 1;
-          if (result.remainingUnuploaded === 0) break;
+          if (result.remainingDelivery === 0) break;
         }
         if (uploaded > 0) {
           console.log(
@@ -311,6 +317,7 @@ async function main() {
               status: "synced",
               uploadedEvents: uploaded,
               remainingUnuploaded: buffer.stats().unuploadedCount,
+              remainingDelivery: buffer.delivery.status().remainingDelivery,
             }),
           );
         }
@@ -536,7 +543,7 @@ async function main() {
   }
 
   if (command === "status") {
-    const buffer = openBuffer();
+    const buffer = openBuffer(config);
     const bufferPath = collectorBufferPath();
     console.log(
       JSON.stringify(
@@ -550,6 +557,7 @@ async function main() {
           retentionDays: config.retentionDays,
           syncConfigured: Boolean(config.uploadUrl),
           stats: buffer.stats(),
+          delivery: buffer.delivery.status(),
           tokenCoverageLast7d: buffer.tokenCoverage(7),
           captureHealth: computeCaptureHealth(buffer.database),
         },
@@ -686,7 +694,7 @@ async function main() {
   }
 
   if (command === "scan-rollouts") {
-    const buffer = openBuffer();
+    const buffer = openBuffer(config);
     const result = await new RolloutTailer(buffer).scan({ recentOnly: false });
     console.log(JSON.stringify(result, null, 2));
     buffer.close();
@@ -694,7 +702,7 @@ async function main() {
   }
 
   if (command === "scan-transcripts") {
-    const buffer = openBuffer();
+    const buffer = openBuffer(config);
     const result = await new TranscriptTailer(buffer).scan({ recentOnly: false });
     console.log(JSON.stringify(result, null, 2));
     buffer.close();
@@ -702,7 +710,7 @@ async function main() {
   }
 
   if (command === "doctor") {
-    const buffer = openBuffer();
+    const buffer = openBuffer(config);
     const plistPath = launchAgentPlistPath();
     const connectivity = await checkCollectorConnectivity(config.port);
     console.log(
@@ -742,6 +750,7 @@ async function main() {
           syncConfigured: Boolean(config.uploadUrl),
           uploadSigningConfigured: Boolean(config.uploadSigningSecret),
           sqlite: buffer.stats(),
+          delivery: buffer.delivery.status(),
           tokenCoverageLast7d: buffer.tokenCoverage(7),
           invasivePermissionsRequested: {
             screenRecording: false,
@@ -759,7 +768,7 @@ async function main() {
   }
 
   if (command === "export") {
-    const buffer = openBuffer();
+    const buffer = openBuffer(config);
     const requestedLimit = optionValue("--limit") ? Number(optionValue("--limit")) : 5;
     const limit = Number.isFinite(requestedLimit)
       ? Math.max(1, Math.min(Math.trunc(requestedLimit), 1_000))
@@ -779,7 +788,7 @@ async function main() {
   }
 
   if (command === "upload") {
-    const buffer = openBuffer();
+    const buffer = openBuffer(config, Boolean(optionValue("--url")));
     const markUploaded = !flag("--no-mark");
     const maxBatches = optionValue("--max-batches") ? Number(optionValue("--max-batches")) : 20;
     let uploadedEvents = 0;
@@ -796,7 +805,7 @@ async function main() {
       lastResult = result;
       uploadedEvents += result.uploadedEvents;
       batches += 1;
-      if (result.uploadedEvents === 0 || !markUploaded || result.remainingUnuploaded === 0) {
+      if (result.uploadedEvents === 0 || !markUploaded || result.remainingDelivery === 0) {
         break;
       }
     }
@@ -807,6 +816,8 @@ async function main() {
           batches,
           markedUploaded: markUploaded,
           remainingUnuploaded: lastResult?.remainingUnuploaded ?? buffer.stats().unuploadedCount,
+          remainingDelivery:
+            lastResult?.remainingDelivery ?? buffer.delivery.status().remainingDelivery,
           signedUpload: lastResult?.signedUpload ?? false,
           response: lastResult?.response ?? null,
           localBufferRetained: true,
@@ -910,7 +921,7 @@ async function main() {
           created: pushed.created,
           updated: pushed.updated,
           batches: pushed.batches,
-          skippedUnparseable: prepared.skippedUnparseable,
+          skippedInvalid: prepared.skippedInvalid,
         },
         null,
         2,
@@ -962,7 +973,7 @@ async function main() {
         body_parse_error: "invalid_json",
       };
     }
-    const buffer = openBuffer();
+    const buffer = openBuffer(config);
     try {
       appendForwardedHook(payload, { config, buffer, source });
     } catch (error) {
@@ -980,7 +991,7 @@ async function main() {
 
   if (command === "self-test-hook") {
     const source = collectorSourceFromArg(process.argv[3]);
-    const buffer = openBuffer();
+    const buffer = openBuffer(config);
     const normalized = appendForwardedHook(
       {
         id: `self_test_${Date.now()}`,
@@ -1163,7 +1174,7 @@ async function main() {
     if (kind !== "account" || !hash || !name) {
       throw new Error('Usage: label account <sha256:hash> "<display name>"');
     }
-    const buffer = openBuffer();
+    const buffer = openBuffer(config);
     buffer.setAccountLabel(hash, name);
     console.log(JSON.stringify({ labeled: true, accountHash: hash, label: name }, null, 2));
     buffer.close();
@@ -1172,7 +1183,7 @@ async function main() {
 
   if (command === "priority") {
     const action = process.argv[3];
-    const buffer = openBuffer();
+    const buffer = openBuffer(config);
     try {
       if (action === "list") {
         console.log(JSON.stringify({ priorityRepos: buffer.listPriorityRepos() }, null, 2));

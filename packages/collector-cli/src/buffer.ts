@@ -5,6 +5,7 @@ import Database from "better-sqlite3";
 import type { AiInteractionEvent } from "../../shared/src/index";
 import type { MetricSample } from "./otlp";
 import type { OtlpAdmissionDrop, OtlpDropReason } from "./otlp-admission";
+import { DeliveryOutbox, type DeliveryLimits } from "./outbox";
 
 export type BufferedEventRow = {
   id: string;
@@ -70,8 +71,14 @@ const EVENT_COLUMNS = [
 
 export class LocalEventBuffer {
   private readonly db: Database.Database;
+  readonly delivery: DeliveryOutbox;
 
-  constructor(path: string) {
+  constructor(
+    path: string,
+    options: {
+      delivery?: { enabled?: boolean; limits?: Partial<DeliveryLimits> };
+    } = {},
+  ) {
     this.db = new Database(path);
     this.db.pragma("journal_mode = WAL");
     this.db.exec(`
@@ -144,6 +151,7 @@ export class LocalEventBuffer {
       );
     `);
     this.migrateEventColumns();
+    this.delivery = new DeliveryOutbox(this.db, options.delivery);
     this.db.exec(`
       create index if not exists idx_events_upload on buffered_events (uploaded_at, created_at);
       create index if not exists idx_events_session on buffered_events (session_id, observed_at);
@@ -218,6 +226,40 @@ export class LocalEventBuffer {
           cursor_rowid = 0,
           updated_at = excluded.updated_at;
       end;
+
+      -- Repo enrichment may discover linkage after capture. The delivery
+      -- copy accepts fill-only hashes until its first seal; retries never
+      -- change the bytes already attempted.
+      drop trigger if exists trg_events_outbox_linkage_update;
+      create trigger if not exists trg_events_outbox_linkage_update_v2
+      after update of repo_hash, branch_hash on buffered_events
+      when (
+        length(trim(new.repo_hash)) = 71 and
+        lower(substr(trim(new.repo_hash), 1, 7)) = 'sha256:' and
+        lower(substr(trim(new.repo_hash), 8)) not glob '*[^0-9a-f]*'
+      ) or (
+        length(trim(new.branch_hash)) = 71 and
+        lower(substr(trim(new.branch_hash), 1, 7)) = 'sha256:' and
+        lower(substr(trim(new.branch_hash), 8)) not glob '*[^0-9a-f]*'
+      )
+      begin
+        update upload_outbox set
+          repo_hash = coalesce(repo_hash,
+            case when
+              length(trim(new.repo_hash)) = 71 and
+              lower(substr(trim(new.repo_hash), 1, 7)) = 'sha256:' and
+              lower(substr(trim(new.repo_hash), 8)) not glob '*[^0-9a-f]*'
+            then lower(trim(new.repo_hash)) end),
+          branch_hash = coalesce(branch_hash,
+            case when
+              length(trim(new.branch_hash)) = 71 and
+              lower(substr(trim(new.branch_hash), 1, 7)) = 'sha256:' and
+              lower(substr(trim(new.branch_hash), 8)) not glob '*[^0-9a-f]*'
+            then lower(trim(new.branch_hash)) end),
+          updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        where raw_rowid = new.rowid
+          and sealed_envelope_json is null and attempt_count = 0;
+      end;
     `);
   }
 
@@ -245,10 +287,11 @@ export class LocalEventBuffer {
     }
   }
 
-  append(event: AiInteractionEvent, suppressedFields: string[] = []) {
-    this.db
+  private appendInCurrentTransaction(event: AiInteractionEvent, suppressedFields: string[] = []) {
+    const createdAt = new Date().toISOString();
+    const result = this.db
       .prepare(
-        `insert or replace into buffered_events
+        `insert or ignore into buffered_events
           (id, source, event_type, data_mode, observed_at, payload_json, suppressed_fields_json,
            created_at, session_id, action_class, model, input_tokens, output_tokens,
            cache_read_tokens, cache_creation_tokens, cost_usd, uploaded_at, repo_hash, branch_hash, head_sha,
@@ -267,7 +310,7 @@ export class LocalEventBuffer {
         observedAt: event.observedAt,
         payloadJson: JSON.stringify(event),
         suppressedFieldsJson: JSON.stringify(suppressedFields),
-        createdAt: new Date().toISOString(),
+        createdAt,
         sessionId: event.sessionId ?? null,
         actionClass: event.actionClass ?? null,
         model: event.model ?? null,
@@ -282,7 +325,30 @@ export class LocalEventBuffer {
         machine: MACHINE,
         accountHash: event.actorId ?? null,
       });
-    if (event.actorId) this.seedAccountLabel(event.actorId);
+    if (result.changes > 0) {
+      this.delivery.noteRawAppend(Number(result.lastInsertRowid));
+      this.delivery.enqueueRaw({
+        rawRowid: Number(result.lastInsertRowid),
+        rawId: event.id,
+        createdAt,
+        uploadedAt: null,
+        payloadJson: JSON.stringify(event),
+        suppressedFieldsJson: JSON.stringify(suppressedFields),
+        repoHash: gitField(event, "remoteUrlHash"),
+        branchHash: gitField(event, "branchHash"),
+      });
+      if (event.actorId) this.seedAccountLabel(event.actorId);
+      return true;
+    }
+    // Deterministic replay never rewrites the evidence row or resets its
+    // upload marker. It may repair an absent delivery projection from the
+    // already-committed raw truth.
+    this.delivery.repairRawById(event.id);
+    return false;
+  }
+
+  append(event: AiInteractionEvent, suppressedFields: string[] = []) {
+    return this.db.transaction(() => this.appendInCurrentTransaction(event, suppressedFields))();
   }
 
   appendMany(
@@ -292,7 +358,7 @@ export class LocalEventBuffer {
   ) {
     const run = this.db.transaction(() => {
       for (const entry of entries) {
-        this.append(entry.event, entry.suppressedFields);
+        this.appendInCurrentTransaction(entry.event, entry.suppressedFields);
       }
       for (const sample of metricSamples) {
         this.appendMetricSample(sample);
@@ -631,7 +697,7 @@ export class LocalEventBuffer {
           observed_at as observedAt, payload_json as payloadJson,
           suppressed_fields_json as suppressedFieldsJson, created_at as createdAt,
           uploaded_at as uploadedAt, repo_hash as repoHash, branch_hash as branchHash,
-          length(payload_json) as payloadBytes
+          length(cast(payload_json as blob)) as payloadBytes
         from buffered_events
         where uploaded_at is null
         order by created_at asc
@@ -667,10 +733,11 @@ export class LocalEventBuffer {
 
   prune(retentionDays = 90) {
     const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
-    // Retention is UPLOAD-SPOOL hygiene, not history deletion: the local
-    // ledger IS the product's memory (the 2026-06 backfills were all created
-    // the same day — a created_at-only prune would have erased months of
-    // history in one sweep 90 days later). Rows never uploaded never age out.
+    // Compatibility gate until #80 proves projection parity: uploaded raw
+    // rows retain the historical cleanup behavior, while pending/dead raw
+    // evidence never expires independently. `/status.delivery.retention`
+    // names this honestly as compatibility_uploaded_only rather than claiming
+    // a raw TTL the current analytics path cannot yet tolerate.
     const events = this.db
       .prepare(`delete from buffered_events where created_at < ? and uploaded_at is not null`)
       .run(cutoff).changes;

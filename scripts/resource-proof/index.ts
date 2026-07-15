@@ -16,6 +16,7 @@ import {
   runNoChangeConstantWorkContract,
   runPortReservationContract,
   runDuplicateStartSingleOwnerContract,
+  runPoisonContinuationContract,
 } from "./scenarios";
 import {
   RESOURCE_PROOF_SCHEMA,
@@ -45,8 +46,8 @@ Options:
   --require-integrated   Exit non-zero while any required scenario is fail/not_wired/skipped.
   --help                 Show this help.
 
-The default harness is truthful but not a release pass: #76 duplicate ownership
-and #77 no-change maintenance are wired; four #79/#80/integrated/privacy
+The default harness is truthful but not a release pass: #76 duplicate ownership,
+#77 no-change maintenance, and #79 poison continuation are wired; three #80/integrated/privacy
 scenarios remain not_wired.`);
 }
 
@@ -101,9 +102,14 @@ async function main() {
     scenarios.push(runExistingSignalFidelityProof(sandbox, runExistingProof));
     scenarios.push(await runNoChangeConstantWorkContract(sandbox));
     scenarios.push(await runDuplicateStartSingleOwnerContract(sandbox));
+    scenarios.push(await runPoisonContinuationContract(sandbox));
     scenarios.push(
       ...loadUnwiredIntegrationScenarios(
-        new Set(["no_change_constant_work", "duplicate_start_single_owner"]),
+        new Set([
+          "no_change_constant_work",
+          "duplicate_start_single_owner",
+          "poison_continuation",
+        ]),
       ),
     );
 

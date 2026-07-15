@@ -27,6 +27,33 @@ export const collectorConfigSchema = z.object({
     )
     .default([]),
   syncIntervalSeconds: z.number().int().min(30).max(86400).default(300),
+  delivery: z
+    .object({
+      maxActiveRows: z.number().int().min(1).max(10_000_000).default(50_000),
+      maxActiveBytes: z.number().int().min(1).max(100 * 1024 * 1024 * 1024).default(512 * 1024 * 1024),
+      maxOldestAgeDays: z.number().int().min(1).max(3650).default(90),
+      maxItemBytes: z.number().int().min(1_024).max(1_500_000).default(256 * 1024),
+      migrationBatchRows: z.number().int().min(1).max(5_000).default(5_000),
+      migrationBatchBytes: z.number().int().min(1_024).max(128 * 1024 * 1024).default(32 * 1024 * 1024),
+      maxBatchesPerCycle: z.number().int().min(1).max(100).default(20),
+      leaseSeconds: z.number().int().min(10).max(3600).default(120),
+      requestTimeoutSeconds: z.number().int().min(1).max(300).default(30),
+      maxBackoffSeconds: z.number().int().min(30).max(86_400).default(3600),
+      maxProbesPerCycle: z.number().int().min(1).max(255).default(31),
+    })
+    .default({
+      maxActiveRows: 50_000,
+      maxActiveBytes: 512 * 1024 * 1024,
+      maxOldestAgeDays: 90,
+      maxItemBytes: 256 * 1024,
+      migrationBatchRows: 5_000,
+      migrationBatchBytes: 32 * 1024 * 1024,
+      maxBatchesPerCycle: 20,
+      leaseSeconds: 120,
+      requestTimeoutSeconds: 30,
+      maxBackoffSeconds: 3600,
+      maxProbesPerCycle: 31,
+    }),
   policy: policyConfigSchema.default(DEFAULT_POLICY),
 });
 

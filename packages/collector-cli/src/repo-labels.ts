@@ -4,7 +4,10 @@ import Database from "better-sqlite3";
 
 import { collectorBufferPath } from "./config";
 import type { CollectorConfig } from "./config";
+import { canonicalLinkage } from "./outbound-envelope";
 import {
+  normalizeGitRemote,
+  workRepoLabelSchema,
   workRepoLabelsBatchSchema,
   type WorkRepoLabel,
 } from "../../shared/src/index";
@@ -15,8 +18,8 @@ import {
  * telemetry (hashes only), a repo display name is meaning the owner chooses
  * to share. So the command:
  *   - previews EXACTLY what will cross the wire before sending (doctor-style),
- *   - sends only derived slugs (owner/name) — the schema refuses anything
- *     containing "://", so raw remote URLs cannot ride along by accident,
+ *   - sends only bounded ASCII slugs (owner/name); URL, path, email,
+ *     multibyte, auth, credential, secret, JWT, and private-key shapes fail,
  *   - never sends branch names, paths, or credentials.
  *
  * Sources: repo_labels (collector-recorded `github.com/owner/name` slugs) is
@@ -62,40 +65,88 @@ export type RepoLabelCandidate = WorkRepoLabel & {
   source: "repo_label" | "derived_from_priority_url";
 };
 
+function safeRecordedRepoLabel(raw: string) {
+  const value = raw.trim();
+  if (
+    !/^[\x20-\x7e]+$/.test(value) ||
+    value.includes("://") ||
+    value.includes("\\") ||
+    value.includes("@") ||
+    value.startsWith("/") ||
+    /(?:^|\/)\.\.(?:\/|$)/.test(value)
+  ) {
+    return null;
+  }
+  const segments = value.replace(/\.git\/?$/i, "").replace(/\/+$/, "").split("/").filter(Boolean);
+  if (segments.length !== 3 || !segments[0].includes(".")) return null;
+  return normalizeGitRemote(value) ?? null;
+}
+
+function safePriorityRepoLabel(raw: string) {
+  const value = raw.trim();
+  if (
+    !/^[\x20-\x7e]+$/.test(value) ||
+    value.includes("\\") ||
+    value.startsWith("/") ||
+    /(?:^|\/)\.\.(?:\/|$)/.test(value)
+  ) {
+    return null;
+  }
+  return normalizeGitRemote(value) ?? null;
+}
+
 /** Pure: ledger label/priority rows → wire rows, labels winning per hash. */
 export function buildRepoLabelCandidates(
   labels: Array<{ repoHash: string; label: string }>,
   priorities: Array<{ repoHash: string; url: string }>,
-): { candidates: RepoLabelCandidate[]; skippedUnparseable: number } {
+): { candidates: RepoLabelCandidate[]; skippedInvalid: number } {
   const byHash = new Map<string, RepoLabelCandidate>();
-  let skippedUnparseable = 0;
+  let skippedInvalid = 0;
 
   for (const priority of priorities) {
-    const parts = parseRepoSlug(priority.url);
-    if (!parts) {
-      skippedUnparseable += 1;
+    const remoteUrlHash = canonicalLinkage(priority.repoHash);
+    const safeLabel = safePriorityRepoLabel(priority.url);
+    const parts = safeLabel ? parseRepoSlug(safeLabel) : null;
+    if (!remoteUrlHash || !parts) {
+      skippedInvalid += 1;
       continue;
     }
-    byHash.set(priority.repoHash, {
-      remoteUrlHash: priority.repoHash,
+    const candidate = workRepoLabelSchema.safeParse({
+      remoteUrlHash,
       name: parts.name,
       ...(parts.owner ? { owner: parts.owner } : {}),
       provider: parts.provider,
+    });
+    if (!candidate.success) {
+      skippedInvalid += 1;
+      continue;
+    }
+    byHash.set(candidate.data.remoteUrlHash, {
+      ...candidate.data,
       source: "derived_from_priority_url",
     });
   }
 
   for (const label of labels) {
-    const parts = parseRepoSlug(label.label);
-    if (!parts) {
-      skippedUnparseable += 1;
+    const remoteUrlHash = canonicalLinkage(label.repoHash);
+    const safeLabel = safeRecordedRepoLabel(label.label);
+    const parts = safeLabel ? parseRepoSlug(safeLabel) : null;
+    if (!remoteUrlHash || !parts) {
+      skippedInvalid += 1;
       continue;
     }
-    byHash.set(label.repoHash, {
-      remoteUrlHash: label.repoHash,
+    const candidate = workRepoLabelSchema.safeParse({
+      remoteUrlHash,
       name: parts.name,
       ...(parts.owner ? { owner: parts.owner } : {}),
       provider: parts.provider,
+    });
+    if (!candidate.success) {
+      skippedInvalid += 1;
+      continue;
+    }
+    byHash.set(candidate.data.remoteUrlHash, {
+      ...candidate.data,
       source: "repo_label",
     });
   }
@@ -104,17 +155,19 @@ export function buildRepoLabelCandidates(
     candidates: [...byHash.values()].sort((a, b) =>
       `${a.owner ?? ""}/${a.name}`.localeCompare(`${b.owner ?? ""}/${b.name}`),
     ),
-    skippedUnparseable,
+    skippedInvalid,
   };
 }
 
 export function renderRepoLabelPreview(
   candidates: RepoLabelCandidate[],
-  skippedUnparseable: number,
+  skippedInvalid: number,
 ): string {
   const lines = [
     `This will disclose ${candidates.length} repo display name(s) to the workspace.`,
     "Exactly these fields cross the wire per repo: remoteUrlHash (already in your telemetry), provider, owner, name.",
+    "Owner/name must be 1-200 character ASCII slugs using only letters, numbers, dot, underscore, or hyphen.",
+    "Rejected: URL, path, email, multibyte, auth, credential, secret-prefix, JWT, and private-key shapes.",
     "Never sent: raw URLs, branch names, file paths, credentials.",
     "",
   ];
@@ -134,9 +187,9 @@ export function renderRepoLabelPreview(
   lines.push(renderRow(header));
   lines.push(widths.map((width) => "-".repeat(width)).join("  "));
   for (const row of rows) lines.push(renderRow(row));
-  if (skippedUnparseable > 0) {
+  if (skippedInvalid > 0) {
     lines.push("");
-    lines.push(`skipped (could not parse a slug): ${skippedUnparseable}`);
+    lines.push(`skipped (invalid hash or slug): ${skippedInvalid}`);
   }
   return lines.join("\n");
 }
@@ -144,7 +197,7 @@ export function renderRepoLabelPreview(
 /** Read the ledger's label tables (read-only) and build the preview. */
 export function prepareRepoLabelsPush(options: { ledgerPath?: string } = {}): {
   candidates: RepoLabelCandidate[];
-  skippedUnparseable: number;
+  skippedInvalid: number;
   preview: string;
 } {
   const ledgerPath = options.ledgerPath ?? collectorBufferPath();
@@ -163,11 +216,11 @@ export function prepareRepoLabelsPush(options: { ledgerPath?: string } = {}): {
     const priorities = ledger
       .prepare(`select repo_hash as repoHash, url from priority_repos order by repo_hash`)
       .all() as Array<{ repoHash: string; url: string }>;
-    const { candidates, skippedUnparseable } = buildRepoLabelCandidates(labels, priorities);
+    const { candidates, skippedInvalid } = buildRepoLabelCandidates(labels, priorities);
     return {
       candidates,
-      skippedUnparseable,
-      preview: renderRepoLabelPreview(candidates, skippedUnparseable),
+      skippedInvalid,
+      preview: renderRepoLabelPreview(candidates, skippedInvalid),
     };
   } finally {
     ledger.close();
@@ -212,6 +265,13 @@ export async function pushRepoLabels(
     return { pushed: 0, created: 0, updated: 0, batches: 0 };
   }
 
+  // Validate and canonicalize the complete caller-supplied set before the
+  // first request. A malformed row after a valid 200-item slice must not
+  // permit a partial disclosure before the later slice fails.
+  const wireCandidates = candidates.map(({ source: _source, ...wire }) =>
+    workRepoLabelSchema.parse(wire),
+  );
+
   // The labels route lives next to the ingest route; derive it so a custom
   // --url pointing at the ingest endpoint still lands on the right path.
   const url = new URL(baseUrl);
@@ -221,14 +281,14 @@ export async function pushRepoLabels(
   let created = 0;
   let updated = 0;
   let batches = 0;
-  for (let start = 0; start < candidates.length; start += MAX_LABELS_PER_BATCH) {
-    const slice = candidates.slice(start, start + MAX_LABELS_PER_BATCH);
+  for (let start = 0; start < wireCandidates.length; start += MAX_LABELS_PER_BATCH) {
+    const slice = wireCandidates.slice(start, start + MAX_LABELS_PER_BATCH);
     const body = JSON.stringify(
       workRepoLabelsBatchSchema.parse({
         tenantId: config.tenantId,
         installKey: config.installKey,
         appVersion: options.appVersion ?? "0.1.0",
-        repositories: slice.map(({ source: _source, ...wire }) => wire),
+        repositories: slice,
       }),
     );
     const headers: Record<string, string> = {
