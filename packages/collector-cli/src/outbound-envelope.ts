@@ -1,15 +1,24 @@
 import {
   aiWorkIngestEventSchema,
+  aiWorkSessionSyncRowSchema,
   findForbiddenRawContentFields,
   type AiInteractionEvent,
   type AiWorkIngestEvent,
+  type AiWorkSessionSyncRow,
 } from "../../shared/src/index";
 
 const CANONICAL_LINKAGE = /^sha256:([a-f0-9]{64})$/i;
 const COMMIT_SHA = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i;
 const SAFE_SUPPRESSED_FIELD = /^[a-zA-Z0-9_.:-]{1,96}$/;
-const SAFE_LOW_CARDINALITY = /^[a-zA-Z0-9_.:+-]{1,160}$/;
+const SAFE_IDENTIFIER = /^[a-zA-Z0-9][a-zA-Z0-9_.:+-]{0,159}$/;
+const SAFE_COMPONENT_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.:+-]{0,199}$/;
+const SAFE_CLASSIFICATION = /^[a-zA-Z0-9][a-zA-Z0-9_.:+-]{0,95}$/;
+const SAFE_VERSION = /^[a-zA-Z0-9][a-zA-Z0-9_.+-]{0,63}$/;
 const EMAIL = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
+const SECRET_PREFIX = /(?:^|[^a-z0-9])(?:sk_live|sk_test|sk-|ghp[a-z0-9_-]*|github_pat[a-z0-9_-]*|xox[a-z0-9_-]*)/i;
+const AUTH_SCHEME = /(?:^|[^a-z0-9])(?:bearer|basic)(?:\s|:|$)/i;
+const JWT = /(?:^|[^a-z0-9_-])eyJ[a-z0-9_-]{6,}\.[a-z0-9_-]{6,}\.[a-z0-9_-]{6,}(?:$|[^a-z0-9_-])/i;
+const PEM_PRIVATE_KEY = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/i;
 const APPROVED_SLASH_SIGNAL_NAMES = new Set([
   "persist/rollout/items",
   "remotecontrol/enable",
@@ -20,46 +29,56 @@ const APPROVED_SLASH_SIGNAL_NAMES = new Set([
 ]);
 const SLASH_SIGNAL_KEYS = new Set(["event.name", "otelEventName"]);
 
-const SAFE_STRING_KEYS = new Set([
-  "action_class",
-  "call_id",
-  "cfo_one.action_class",
-  "cliVersion",
+const SIGNAL_STRING_KEYS = new Set([
+  "event.name",
+  "otelEventName",
+]);
+
+const MODEL_STRING_KEYS = new Set([
+  "gen_ai.request.model",
+  "model",
+]);
+
+const COMPONENT_STRING_KEYS = new Set([
   "db.operation.name",
   "db.system",
-  "decision",
   "error.type",
-  "event.name",
   "exception.type",
-  "gen_ai.request.model",
-  "gen_ai.response.id",
   "gen_ai.system",
   "gen_ai.tool.name",
-  "http.request.method",
   "mcp_server",
-  "model",
-  "originator",
-  "otelEventName",
-  "otelOriginalActionClass",
-  "planType",
-  "plimsoll.action_class",
-  "request_id",
   "rpc.method",
   "rpc.service",
   "rpc.system",
   "serviceName",
-  "serviceVersion",
-  "spanId",
-  "status.code",
-  "stitched",
   "tool",
   "toolClassDetail",
   "toolName",
   "tool_name",
-  "traceId",
+]);
+
+const OPAQUE_ID_STRING_KEYS = new Set([
+  "call_id",
+  "gen_ai.response.id",
+  "request_id",
+]);
+
+const CLASSIFICATION_STRING_KEYS = new Set([
+  "action_class",
+  "cfo_one.action_class",
+  "decision",
+  "originator",
+  "otelOriginalActionClass",
+  "planType",
+  "plimsoll.action_class",
+  "status.code",
+  "stitched",
   "type",
   "usageSource",
 ]);
+
+const VERSION_STRING_KEYS = new Set(["cliVersion", "serviceVersion"]);
+const TRACE_STRING_KEYS = new Set(["spanId", "traceId"]);
 
 const SAFE_BOOLEAN_KEYS = new Set([
   "costEstimated",
@@ -96,6 +115,10 @@ type MetadataOutcome =
 
 export type OutboundEnvelopeOutcome =
   | { ok: true; envelope: AiWorkIngestEvent }
+  | { ok: false; reason: "schema" | "privacy" };
+
+export type OutboundSessionRowOutcome =
+  | { ok: true; row: AiWorkSessionSyncRow }
   | { ok: false; reason: "schema" | "privacy" };
 
 export function canonicalLinkage(value: string | null | undefined) {
@@ -152,26 +175,101 @@ function hasSensitiveConcept(key: string) {
   return keyWords(key).some((word) => SENSITIVE_WORD.test(word));
 }
 
-function safeLowCardinality(value: unknown) {
-  if (typeof value !== "string") return null;
+function hasSecretValueConcept(value: string) {
+  const words = keyWords(value);
+  if (words.some((word) => ["credential", "credentials", "secret", "secrets", "password", "token", "tokens"].includes(word))) {
+    return true;
+  }
+  const collapsed = words.join("");
+  return collapsed.includes("apikey") || collapsed.includes("privatekey");
+}
+
+/**
+ * Content-independent outbound value gate. Keys are not enough: a credential
+ * can be placed under an otherwise approved field such as serviceName. This
+ * check therefore runs before every field-specific string validator.
+ */
+export function hasUnsafeOutboundString(value: unknown, options: { allowSlash?: boolean } = {}) {
+  if (typeof value !== "string") return true;
   const candidate = value.trim();
   if (
-    !SAFE_LOW_CARDINALITY.test(candidate) ||
+    candidate.length === 0 ||
+    !/^[\x20-\x7e]+$/.test(candidate) ||
     EMAIL.test(candidate) ||
-    /^(?:\/|~\/|\.{1,2}\/|file:\/\/|https?:\/\/|[a-zA-Z]:[\\/]|\\\\)/.test(candidate) ||
-    candidate.includes("\\")
+    SECRET_PREFIX.test(candidate) ||
+    AUTH_SCHEME.test(candidate) ||
+    JWT.test(candidate) ||
+    PEM_PRIVATE_KEY.test(candidate) ||
+    hasSecretValueConcept(candidate) ||
+    /(?:^|[/.])\.\.(?:[/.]|$)/.test(candidate) ||
+    /%(?:2e|2f|5c)/i.test(candidate) ||
+    /(?:file|https?):\/\//i.test(candidate) ||
+    /^www\./i.test(candidate) ||
+    candidate.includes("\\") ||
+    (!options.allowSlash && candidate.includes("/"))
   ) {
-    return null;
+    return true;
   }
+  return false;
+}
+
+function safeByPattern(value: unknown, pattern: RegExp, maxLength: number) {
+  if (typeof value !== "string") return null;
+  const candidate = value.trim();
+  if (candidate.length > maxLength || hasUnsafeOutboundString(candidate) || !pattern.test(candidate)) return null;
   return candidate;
 }
 
+export function safeOutboundIdentifier(value: unknown) {
+  return safeByPattern(value, SAFE_IDENTIFIER, 160);
+}
+
+function safeComponentName(value: unknown) {
+  return safeByPattern(value, SAFE_COMPONENT_NAME, 200);
+}
+
+function safeClassification(value: unknown) {
+  return safeByPattern(value, SAFE_CLASSIFICATION, 96);
+}
+
+function safeVersion(value: unknown) {
+  return safeByPattern(value, SAFE_VERSION, 64);
+}
+
+export function canonicalCommitSha(value: unknown) {
+  if (typeof value !== "string" || hasUnsafeOutboundString(value)) return null;
+  const candidate = value.trim();
+  return COMMIT_SHA.test(candidate) ? candidate.toLowerCase() : null;
+}
+
 function safeSignalName(key: string, value: unknown) {
-  const lowCardinality = safeLowCardinality(value);
+  const lowCardinality = safeByPattern(value, SAFE_COMPONENT_NAME, 160);
   if (lowCardinality) return lowCardinality;
   if (typeof value !== "string" || !SLASH_SIGNAL_KEYS.has(key)) return null;
   const candidate = value.trim();
-  return APPROVED_SLASH_SIGNAL_NAMES.has(candidate) ? candidate : null;
+  return !hasUnsafeOutboundString(candidate, { allowSlash: true }) && APPROVED_SLASH_SIGNAL_NAMES.has(candidate)
+    ? candidate
+    : null;
+}
+
+function safeMetadataString(key: string, value: unknown) {
+  if (SIGNAL_STRING_KEYS.has(key)) return safeSignalName(key, value);
+  if (MODEL_STRING_KEYS.has(key)) return safeComponentName(value);
+  if (COMPONENT_STRING_KEYS.has(key)) return safeComponentName(value);
+  if (OPAQUE_ID_STRING_KEYS.has(key)) return safeOutboundIdentifier(value);
+  if (CLASSIFICATION_STRING_KEYS.has(key)) return safeClassification(value);
+  if (VERSION_STRING_KEYS.has(key)) return safeVersion(value);
+  if (TRACE_STRING_KEYS.has(key)) {
+    if (typeof value !== "string" || hasUnsafeOutboundString(value)) return null;
+    const candidate = value.trim();
+    return /^(?:[a-f0-9]{16}|[a-f0-9]{32})$/i.test(candidate) ? candidate.toLowerCase() : null;
+  }
+  if (key === "http.request.method") {
+    if (typeof value !== "string" || hasUnsafeOutboundString(value)) return null;
+    const candidate = value.trim().toUpperCase();
+    return /^[A-Z]{3,12}$/.test(candidate) ? candidate : null;
+  }
+  return null;
 }
 
 function sanitizeMetadata(input: Record<string, unknown>): MetadataOutcome {
@@ -199,10 +297,9 @@ function sanitizeMetadata(input: Record<string, unknown>): MetadataOutcome {
         git[linkageKey] = canonical;
       }
       if (source.headSha !== undefined) {
-        if (typeof source.headSha !== "string" || !COMMIT_SHA.test(source.headSha.trim())) {
-          return { ok: false };
-        }
-        git.headSha = source.headSha.trim().toLowerCase();
+        const headSha = canonicalCommitSha(source.headSha);
+        if (!headSha) return { ok: false };
+        git.headSha = headSha;
       }
       if (Object.keys(git).length > 0) metadata.git = git;
       continue;
@@ -215,8 +312,9 @@ function sanitizeMetadata(input: Record<string, unknown>): MetadataOutcome {
       continue;
     }
     if (key === "headSha") {
-      if (typeof value !== "string" || !COMMIT_SHA.test(value.trim())) return { ok: false };
-      metadata[key] = value.trim().toLowerCase();
+      const headSha = canonicalCommitSha(value);
+      if (!headSha) return { ok: false };
+      metadata[key] = headSha;
       continue;
     }
     if (key === "transport_path") {
@@ -240,8 +338,17 @@ function sanitizeMetadata(input: Record<string, unknown>): MetadataOutcome {
       metadata[key] = value;
       continue;
     }
-    if (SAFE_STRING_KEYS.has(key)) {
-      const safe = safeSignalName(key, value);
+    if (
+      SIGNAL_STRING_KEYS.has(key) ||
+      MODEL_STRING_KEYS.has(key) ||
+      COMPONENT_STRING_KEYS.has(key) ||
+      OPAQUE_ID_STRING_KEYS.has(key) ||
+      CLASSIFICATION_STRING_KEYS.has(key) ||
+      VERSION_STRING_KEYS.has(key) ||
+      TRACE_STRING_KEYS.has(key) ||
+      key === "http.request.method"
+    ) {
+      const safe = safeMetadataString(key, value);
       if (!safe) return { ok: false };
       metadata[key] = safe;
       continue;
@@ -279,31 +386,39 @@ function sanitizeMetadata(input: Record<string, unknown>): MetadataOutcome {
   return { ok: true, metadata };
 }
 
-function safeTopLevelKey(value: string | undefined, linkage = false) {
+function safeTopLevelIdentifier(value: string | undefined) {
   if (value === undefined) return { ok: true as const, value: undefined };
-  if (linkage && value.trim().toLowerCase().startsWith("sha256:")) {
-    const canonical = canonicalLinkage(value);
-    return canonical ? { ok: true as const, value: canonical } : { ok: false as const };
-  }
-  const safe = safeLowCardinality(value);
+  const safe = safeOutboundIdentifier(value);
+  return safe ? { ok: true as const, value: safe } : { ok: false as const };
+}
+
+function safeTopLevelProjectKey(value: string | undefined) {
+  if (value === undefined) return { ok: true as const, value: undefined };
+  const safe = canonicalLinkage(value);
+  return safe ? { ok: true as const, value: safe } : { ok: false as const };
+}
+
+function safeTopLevelModel(value: string | undefined) {
+  if (value === undefined) return { ok: true as const, value: undefined };
+  const safe = safeComponentName(value);
   return safe ? { ok: true as const, value: safe } : { ok: false as const };
 }
 
 export function sealOutboundEvent(event: AiInteractionEvent) {
   const metadata = sanitizeMetadata(event.metadata);
   if (!metadata.ok) return { ok: false as const, reason: "privacy" as const };
-  const id = safeTopLevelKey(event.id);
-  const sessionId = safeTopLevelKey(event.sessionId);
-  const tenantId = safeTopLevelKey(event.tenantId);
+  const id = safeTopLevelIdentifier(event.id);
+  const sessionId = safeTopLevelIdentifier(event.sessionId);
+  const tenantId = safeTopLevelIdentifier(event.tenantId);
   // Actor identifiers are privacy-preserving local aliases today, including
   // legacy truncated `sha256:` aliases. They are identifiers, not repo
   // linkage, so require the bounded character contract without silently
   // upgrading them to the 256-bit linkage namespace.
-  const actorId = safeTopLevelKey(event.actorId);
-  const projectKey = safeTopLevelKey(event.projectKey, true);
-  const customerKey = safeTopLevelKey(event.customerKey);
-  const workflowKey = safeTopLevelKey(event.workflowKey);
-  const model = safeTopLevelKey(event.model);
+  const actorId = safeTopLevelIdentifier(event.actorId);
+  const projectKey = safeTopLevelProjectKey(event.projectKey);
+  const customerKey = safeTopLevelIdentifier(event.customerKey);
+  const workflowKey = safeTopLevelIdentifier(event.workflowKey);
+  const model = safeTopLevelModel(event.model);
   if (
     !id.ok ||
     !sessionId.ok ||
@@ -343,10 +458,82 @@ export function sealOutboundEnvelope(input: unknown): OutboundEnvelopeOutcome {
     suppressedFields: [...new Set(
       parsed.data.suppressedFields
         .map((field) => field.trim())
-        .filter((field) => SAFE_SUPPRESSED_FIELD.test(field)),
+        .filter((field) => SAFE_SUPPRESSED_FIELD.test(field) && !hasSecretValueConcept(field)),
     )],
   });
   return envelope.success
     ? { ok: true, envelope: envelope.data }
+    : { ok: false, reason: "schema" };
+}
+
+/** Session snapshots use the same outbound boundary as events. Only typed
+ * counters plus canonical linkage and a privacy-safe actor alias may cross. */
+export function sealOutboundSessionRow(input: unknown): OutboundSessionRowOutcome {
+  const parsed = aiWorkSessionSyncRowSchema.safeParse(input);
+  if (!parsed.success) return { ok: false, reason: "schema" };
+  const { session } = parsed.data;
+  const id = safeOutboundIdentifier(session.id);
+  const tenantId = session.tenantId === undefined ? undefined : safeOutboundIdentifier(session.tenantId);
+  const actorId = session.actorId === undefined ? undefined : safeOutboundIdentifier(session.actorId);
+  const deviceInstallId = session.deviceInstallId === undefined
+    ? undefined
+    : safeOutboundIdentifier(session.deviceInstallId);
+  const projectKey = session.projectKey === undefined ? undefined : canonicalLinkage(session.projectKey);
+  const customerKey = session.customerKey === undefined ? undefined : safeOutboundIdentifier(session.customerKey);
+  const workflowKey = session.workflowKey === undefined ? undefined : safeOutboundIdentifier(session.workflowKey);
+  const repositoryId = session.repositoryId === undefined ? undefined : canonicalLinkage(session.repositoryId);
+  const repoPathHash = session.repoPathHash === undefined ? undefined : canonicalLinkage(session.repoPathHash);
+  if (
+    !id ||
+    (session.tenantId !== undefined && !tenantId) ||
+    (session.actorId !== undefined && !actorId) ||
+    (session.deviceInstallId !== undefined && !deviceInstallId) ||
+    (session.projectKey !== undefined && !projectKey) ||
+    (session.customerKey !== undefined && !customerKey) ||
+    (session.workflowKey !== undefined && !workflowKey) ||
+    (session.repositoryId !== undefined && !repositoryId) ||
+    (session.repoPathHash !== undefined && !repoPathHash) ||
+    session.branch !== undefined
+  ) {
+    return { ok: false, reason: "privacy" };
+  }
+
+  const metadataSource = session.metadata as Record<string, unknown>;
+  if (findForbiddenRawContentFields(metadataSource).length > 0) return { ok: false, reason: "privacy" };
+  if (Object.keys(metadataSource).some((key) => !["branchHash", "externalActorId"].includes(key))) {
+    return { ok: false, reason: "privacy" };
+  }
+  const metadata: Record<string, string> = {};
+  if (metadataSource.branchHash !== undefined) {
+    const branchHash = typeof metadataSource.branchHash === "string"
+      ? canonicalLinkage(metadataSource.branchHash)
+      : null;
+    if (!branchHash) return { ok: false, reason: "privacy" };
+    metadata.branchHash = branchHash;
+  }
+  if (metadataSource.externalActorId !== undefined) {
+    const externalActorId = safeOutboundIdentifier(metadataSource.externalActorId);
+    if (!externalActorId) return { ok: false, reason: "privacy" };
+    metadata.externalActorId = externalActorId;
+  }
+
+  const sealed = aiWorkSessionSyncRowSchema.safeParse({
+    ...parsed.data,
+    session: {
+      ...session,
+      id,
+      ...(tenantId === undefined ? {} : { tenantId }),
+      ...(actorId === undefined ? {} : { actorId }),
+      ...(deviceInstallId === undefined ? {} : { deviceInstallId }),
+      ...(repositoryId === undefined ? {} : { repositoryId }),
+      ...(repoPathHash === undefined ? {} : { repoPathHash }),
+      ...(projectKey === undefined ? {} : { projectKey }),
+      ...(customerKey === undefined ? {} : { customerKey }),
+      ...(workflowKey === undefined ? {} : { workflowKey }),
+      metadata,
+    },
+  });
+  return sealed.success
+    ? { ok: true, row: sealed.data }
     : { ok: false, reason: "schema" };
 }

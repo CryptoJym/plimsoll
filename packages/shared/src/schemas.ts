@@ -350,11 +350,10 @@ export type AiWorkAttributionRepairBatch = z.infer<typeof aiWorkAttributionRepai
  * Id rule (the join contract): a ledger session id that Postgres' uuid column
  * accepts passes through VERBATIM (lowercased) — that exact value is what the
  * event lane already stored on event rows, in the session_id uuid column
- * (claude v4 ids) or in metadata.externalSessionId (codex v7 ids on pre-D1
- * rows) — so session rows JOIN to their events. Non-uuid ledger ids derive
- * the same UUID on every run (collector-cli session-sync.ts) and keep the
- * original in session.metadata.externalSessionId (their events carry the
- * same raw value there).
+ * (claude v4 ids and codex v7 ids) — so session rows JOIN to their events.
+ * Non-uuid ledger ids derive the same UUID on every run
+ * (collector-cli/session-sync.ts); the raw local identifier never crosses the
+ * session-sync outbound boundary.
  *
  * `kind` discriminates it from event batches on the shared ingest route (the
  * attribution_repair pattern). Totals are typed — not loose metadata — so the

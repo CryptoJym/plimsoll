@@ -3,11 +3,10 @@ import Database from "better-sqlite3";
 import type { CollectorConfig } from "./config";
 import { collectorBufferPath } from "./config";
 import { deterministicEventId } from "./normalizer";
+import { hasUnsafeOutboundString, sealOutboundSessionRow } from "./outbound-envelope";
 import { chunkHistoryEnvelopes, postHistoryBatch } from "./upload-history";
 import {
   aiWorkSessionSyncBatchSchema,
-  aiWorkSessionSyncRowSchema,
-  findForbiddenRawContentFields,
   type AiWorkIngestBatch,
   type AiWorkSessionSyncRow,
 } from "../../shared/src/index";
@@ -31,10 +30,10 @@ import {
  *   the same --until, nothing changes (the cloud reports what it did:
  *   inserted/updated/skippedStale). No resume watermark: the whole walk is
  *   cheap (thousands of sessions, not hundreds of thousands of events).
- * - Privacy parity: only linkage hashes and counters cross — repo/branch
- *   hashes, account hashes, token sums. Raw session ids that are not UUIDs
- *   ride in metadata.externalSessionId exactly like the event lane. The
- *   forbidden-raw-content gate runs client-side before send.
+ * - Privacy parity: only canonical linkage hashes, privacy-safe actor aliases
+ *   and typed counters cross. Raw non-UUID session ids are deterministically
+ *   replaced and never leave the machine. The shared outbound sealer runs
+ *   both while rows are built and immediately before batch construction.
  * - Honest numbers: costUsd sums PRICED events only; pricedEvents says how
  *   many. An unpriced session renders "unpriced" in the audit, never $0.00.
  */
@@ -44,8 +43,8 @@ import {
  * version bits (the upload-history event-id rule). Session ids must follow
  * the SAME passthrough or the session row id stops matching what the event
  * lane stored: claude session ids (UUIDv4) live in events.session_id, codex
- * session ids (UUIDv7) live in metadata.externalSessionId on pre-D1 rows —
- * both verbatim. Lowercased because Postgres normalizes uuid text output to
+ * session ids (UUIDv7) live as their UUID value — both pass through verbatim.
+ * Lowercased because Postgres normalizes uuid text output to
  * lowercase, keeping text-level joins exact.
  */
 const POSTGRES_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -53,8 +52,8 @@ const POSTGRES_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 /**
  * Deterministic UUID for ledger session ids the cloud's uuid column would
  * reject. Same ledger id → same UUID on every run, so cloud upserts dedupe
- * re-sends; the original id is preserved in metadata.externalSessionId. The
- * namespace part ("session-sync") is deliberately distinct from the event
+ * re-sends without exporting the original. The namespace part
+ * ("session-sync") is deliberately distinct from the event
  * lane's "workspace-backfill", so a session id that happens to equal some
  * event's raw id can never collide into the same derived UUID.
  */
@@ -183,16 +182,13 @@ export type NormalizedSessionRow =
 /** Snapshot → wire row. Anything that fails the strict schema or carries a
  * forbidden metadata field is skipped with a reason — never silently. */
 export function buildSessionSyncRow(snapshot: SessionSnapshot): NormalizedSessionRow {
+  if (hasUnsafeOutboundString(snapshot.sessionId)) {
+    return { ok: false, reason: "forbidden_content", detail: "unsafe session id" };
+  }
   const ensured = ensureUuidSessionId(snapshot.sessionId);
   const metadata: Record<string, unknown> = {};
   if (snapshot.branchHash) metadata.branchHash = snapshot.branchHash;
   if (snapshot.accountHash) metadata.externalActorId = snapshot.accountHash;
-  if (ensured.derived) metadata.externalSessionId = snapshot.sessionId;
-
-  const forbidden = findForbiddenRawContentFields(metadata);
-  if (forbidden.length > 0) {
-    return { ok: false, reason: "forbidden_content", detail: forbidden.join(",") };
-  }
 
   const candidate = {
     session: {
@@ -219,18 +215,24 @@ export function buildSessionSyncRow(snapshot: SessionSnapshot): NormalizedSessio
     },
   };
 
-  const parsed = aiWorkSessionSyncRowSchema.safeParse(candidate);
-  if (!parsed.success) {
-    const issue = parsed.error.issues[0];
-    const path = issue ? issue.path.join(".") || "(root)" : "unknown";
-    const reason: SessionSkipReason = path.includes("source") ? "source_invalid" : "schema_invalid";
-    return { ok: false, reason, detail: issue ? `${path}: ${issue.code}` : "unknown issue" };
+  const sealed = sealOutboundSessionRow(candidate);
+  if (!sealed.ok) {
+    const sourceValid = [
+      "anthropic_admin", "anthropic_usage", "claude_code", "codex",
+      "github", "openai_usage", "manual", "unknown",
+    ].includes(snapshot.source);
+    const reason: SessionSkipReason = !sourceValid
+      ? "source_invalid"
+      : sealed.reason === "privacy"
+        ? "forbidden_content"
+        : "schema_invalid";
+    return { ok: false, reason, detail: `shared outbound sealer: ${sealed.reason}` };
   }
 
   return {
     ok: true,
-    row: parsed.data,
-    bytes: Buffer.byteLength(JSON.stringify(parsed.data)),
+    row: sealed.row,
+    bytes: Buffer.byteLength(JSON.stringify(sealed.row)),
     idDerived: ensured.derived,
   };
 }
@@ -550,7 +552,14 @@ export async function runSessionSync(
 
   const inFlight = new Set<Promise<void>>();
   const dispatch = async (chunk: Array<{ row: AiWorkSessionSyncRow }>) => {
-    const rows = chunk.map((item) => item.row);
+    // Batch-level reseal prevents a future alternate caller from bypassing
+    // buildSessionSyncRow and placing raw identifiers into a signed request.
+    const sealedRows = chunk.map((item) => sealOutboundSessionRow(item.row));
+    if (sealedRows.some((item) => !item.ok)) {
+      abortReason = abortReason ?? "Session batch failed the shared outbound sealer.";
+      return;
+    }
+    const rows = sealedRows.flatMap((item) => item.ok ? [item.row] : []);
     const body = JSON.stringify(
       aiWorkSessionSyncBatchSchema.parse({
         kind: "session_sync",

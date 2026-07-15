@@ -343,6 +343,8 @@ export class DeliveryOutbox {
         on upload_outbox (raw_rowid);
       create index if not exists idx_upload_receipts_state
         on upload_receipts (terminal_state);
+      create index if not exists idx_upload_validation_candidates_contract_failure
+        on upload_validation_candidates (contract_hash, failed_at, delivery_id);
 
       create trigger if not exists trg_upload_outbox_gauge_insert
       after insert on upload_outbox
@@ -707,7 +709,14 @@ export class DeliveryOutbox {
              attempt_count as attemptCount
            from upload_outbox
            where state in ('pending','retry') and next_attempt_at <= ?
-           order by case when last_failure_class in ('remote_validation', 'local_request_budget') then 1 else 0 end,
+           order by case
+               when exists (
+                 select 1 from upload_validation_candidates c
+                 where c.delivery_id = upload_outbox.delivery_id
+               ) then 2
+               when last_failure_class in ('remote_validation', 'local_request_budget') then 1
+               else 0
+             end,
              next_attempt_at, created_at, delivery_id
            limit ?`,
         )
@@ -927,9 +936,7 @@ export class DeliveryOutbox {
         `insert into upload_validation_candidates (delivery_id, contract_hash, failed_at)
          select delivery_id, @contractHash, @failedAt from upload_outbox
          where delivery_id = @deliveryId and state = 'in_flight' and lease_id = @leaseId
-         on conflict(delivery_id) do update set
-           contract_hash = excluded.contract_hash,
-           failed_at = excluded.failed_at`,
+         on conflict(delivery_id) do nothing`,
       )
       .run({
         deliveryId,
@@ -937,6 +944,32 @@ export class DeliveryOutbox {
         contractHash: canonicalContract,
         failedAt: at.toISOString(),
       }).changes;
+  }
+
+  /** A candidate rejected after the last known-good acknowledgement needs one
+   * bounded witness re-probe. This is an O(1) durable decision and never
+   * exposes or leases the candidate itself. */
+  validationWitnessReprobe(contractHash: string): DeliveryValidationWitness | null {
+    const witness = this.validationWitness(contractHash);
+    if (!witness) return null;
+    const due = this.db
+      .prepare(
+        `select 1 as due
+         from upload_validation_candidates c
+         join upload_outbox o on o.delivery_id = c.delivery_id
+         where c.contract_hash = ? and c.failed_at >= ?
+         limit 1`,
+      )
+      .get(witness.contractHash, witness.acknowledgedAt) as { due: number } | undefined;
+    return due ? witness : null;
+  }
+
+  refreshValidationWitness(
+    contractHash: string,
+    item: LeasedDeliveryItem,
+    acknowledgedAt = new Date(),
+  ) {
+    return this.writeValidationWitness(contractHash, item, acknowledgedAt.toISOString());
   }
 
   settleProvenValidationCandidates(
@@ -951,7 +984,7 @@ export class DeliveryOutbox {
         `select c.delivery_id as deliveryId
          from upload_validation_candidates c
          join upload_outbox o on o.delivery_id = c.delivery_id
-         where c.contract_hash = ? and c.failed_at <= ?
+         where c.contract_hash = ? and c.failed_at < ?
          order by c.failed_at, c.delivery_id
          limit ?`,
       )

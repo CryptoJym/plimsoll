@@ -327,11 +327,72 @@ export async function uploadBufferedEvents(
       500,
     ),
   );
+  const maxProbes = Math.max(
+    1,
+    Math.min(options.maxProbes ?? config.delivery.maxProbesPerCycle, config.delivery.maxProbesPerCycle),
+  );
   const provenDead = buffer.delivery.settleProvenValidationCandidates(contractHash, {
     maxRows: outputLimit,
     now: nowFn(),
   });
   const maxRequestBytes = Math.max(1, Math.trunc(options.maxBytes ?? 1_500_000));
+
+  // A poison item can be the final due row. With maxProbes=1 there is then no
+  // sibling left to prove the contract, so reserve this cycle's single probe
+  // for the durable sanitized witness. A 2xx refreshes its acknowledgement
+  // and makes first-failure evidence settleable; a validation rejection of
+  // the known-good witness is global contract evidence and dead-letters zero.
+  const statusAtStart = buffer.delivery.status(nowFn());
+  const witnessReprobe = statusAtStart.circuit.kind === "none"
+    ? buffer.delivery.validationWitnessReprobe(contractHash)
+    : null;
+  if (witnessReprobe) {
+    const witnessResult = await postItems({
+      config,
+      items: [witnessReprobe.item],
+      appVersion,
+      url,
+      ingestKey: options.ingestKey ?? config.ingestKey,
+      signingSecret: options.signingSecret ?? config.uploadSigningSecret,
+      fetchImpl: options.fetchImpl ?? fetch,
+      timeoutSeconds: config.delivery.requestTimeoutSeconds,
+      now: nowFn,
+      maxBytes: maxRequestBytes,
+    });
+    options.afterRemote?.();
+    if (witnessResult.ok) {
+      buffer.delivery.refreshValidationWitness(contractHash, witnessReprobe.item, nowFn());
+      const newlyDead = buffer.delivery.settleProvenValidationCandidates(contractHash, {
+        maxRows: outputLimit,
+        now: nowFn(),
+      });
+      buffer.delivery.clearCircuit(nowFn());
+      const status = buffer.delivery.status(nowFn());
+      return {
+        batch: null,
+        markedUploaded: 0,
+        remainingUnuploaded: buffer.stats().unuploadedCount,
+        remainingDelivery: status.remainingDelivery,
+        response: witnessResult.summary,
+        signedUpload: Boolean(options.signingSecret ?? config.uploadSigningSecret),
+        uploadedEvents: 0,
+        delivery: {
+          mode: "durable_outbox" as const,
+          attempts: 1,
+          deadLetters: provenDead + newlyDead,
+          circuit: status.circuit.kind,
+          rootLeaseEvents: 0,
+        },
+      };
+    }
+    const witnessFailure = witnessResult.status === 400 || witnessResult.status === 422
+      ? "remote_contract" as const
+      : failureForProbe(witnessResult);
+    if (witnessFailure === "remote_auth") buffer.delivery.openCircuit("auth_blocked", nowFn());
+    if (witnessFailure === "remote_contract") buffer.delivery.openCircuit("contract_blocked", nowFn());
+    throw new DeliveryUploadError(witnessFailure, witnessResult.statusClass);
+  }
+
   const lease = buffer.delivery.lease({
     maxRows: buffer.delivery.validationLeaseRows(outputLimit),
     maxBytes: options.maxBytes,
@@ -360,10 +421,6 @@ export async function uploadBufferedEvents(
     };
   }
 
-  const maxProbes = Math.max(
-    1,
-    Math.min(options.maxProbes ?? config.delivery.maxProbesPerCycle, config.delivery.maxProbesPerCycle),
-  );
   let probes = 0;
   let lastSummary: SafeResponseSummary = {};
   const succeeded = new Map<string, LeasedDeliveryItem>();

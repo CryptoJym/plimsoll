@@ -128,6 +128,7 @@ import {
   aiWorkSessionSyncBatchSchema,
   findForbiddenRawContentFields,
   type AiInteractionEvent,
+  type AiWorkIngestBatch,
   type AiWorkSessionSyncRow,
 } from "../packages/shared/src/index";
 import {
@@ -1989,7 +1990,7 @@ async function main() {
     // 16b. Event-id rule: anything Postgres' uuid column accepts passes
     // through VERBATIM (the daemon uploads ledger ids as-is — re-deriving
     // those would split one row into two cloud rows); anything else derives
-    // the SAME uuid on every run and keeps the original in metadata.
+    // the SAME uuid on every run without exporting the original identifier.
     const v4 = "2b866c49-6f64-4ac1-9d6b-d9ce0aa64166";
     const v7 = "019e0000-aaaa-7bbb-8ccc-dddddddddddd";
     const derivedOnce = ensureUuidEventId("self_test_1749670000000");
@@ -2017,7 +2018,7 @@ async function main() {
         uuidShape.test(derivedOnce.id) &&
         legacyNormalized.ok &&
         legacyNormalized.envelope.event.id === derivedOnce.id &&
-        legacyNormalized.envelope.event.metadata.externalEventId === "self_test_1749670000000",
+        legacyNormalized.envelope.event.metadata.externalEventId === undefined,
       JSON.stringify({ derived: derivedOnce.id, stable: derivedOnce.id === derivedTwice.id, v7Passthrough: ensureUuidEventId(v7).id === v7 }),
     );
 
@@ -2100,8 +2101,20 @@ async function main() {
     fs.mkdirSync(historyHome, { recursive: true });
     const historyLedgerPath = path.join(historyHome, "history-ledger.sqlite");
     const HISTORY_RAW_SENTINEL = "RAW_PROMPT_SENTINEL_HISTORY rm -rf /tmp/secret";
-    const HISTORY_REPO_HASH = "sha256:proofrepoaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const HISTORY_BRANCH_HASH = "sha256:proofbranchbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const HISTORY_SERVICE_SECRET = "sk_live_HISTORY_SERVICE_SENTINEL";
+    const HISTORY_MODEL_PATH = "/Users/private/HISTORY_MODEL_PATH_SENTINEL";
+    const HISTORY_UNICODE_VALUE = "HISTORY_UNICODE_UNKNOWN_SENTINEL";
+    const HISTORY_UNKNOWN_LABEL = "HISTORY_UNKNOWN_LABEL_SENTINEL";
+    const HISTORY_SUPPRESSED_CREDENTIAL = "CREDENTIAL_HISTORY_SUPPRESSED_SENTINEL";
+    const historyAdversarialSentinels = [
+      HISTORY_SERVICE_SECRET,
+      HISTORY_MODEL_PATH,
+      HISTORY_UNICODE_VALUE,
+      HISTORY_UNKNOWN_LABEL,
+      HISTORY_SUPPRESSED_CREDENTIAL,
+    ];
+    const HISTORY_REPO_HASH = `sha256:${"a1".repeat(32)}`;
+    const HISTORY_BRANCH_HASH = `sha256:${"b2".repeat(32)}`;
     const seedBuffer = new LocalEventBuffer(historyLedgerPath);
     const seededIds: string[] = [];
     const seedEvent = (index: number): AiInteractionEvent =>
@@ -2140,6 +2153,50 @@ async function main() {
       }),
       [],
     );
+    // Allowed-key credential and top-level path values must be rejected by
+    // the exact shared sealer. Unknown Unicode/label keys and credential-like
+    // suppression names may remain eligible only after their values are
+    // omitted, proving the history route cannot bypass the live boundary.
+    seedBuffer.append(
+      aiInteractionEventSchema.parse({
+        ...seedEvent(10_001),
+        id: deterministicEventId(["history-e2e-secret-value", 1]),
+        metadata: { serviceName: HISTORY_SERVICE_SECRET },
+      }),
+      [],
+    );
+    seedBuffer.append(
+      aiInteractionEventSchema.parse({
+        ...seedEvent(10_002),
+        id: deterministicEventId(["history-e2e-model-path", 1]),
+        model: HISTORY_MODEL_PATH,
+        metadata: {},
+      }),
+      [],
+    );
+    const historyUnknownId = deterministicEventId(["history-e2e-unknown-keys", 1]);
+    seedBuffer.append(
+      aiInteractionEventSchema.parse({
+        ...seedEvent(10_003),
+        id: historyUnknownId,
+        metadata: {
+          "密钥": HISTORY_UNICODE_VALUE,
+          unknownLabel: HISTORY_UNKNOWN_LABEL,
+        },
+      }),
+      [],
+    );
+    seededIds.push(historyUnknownId);
+    const historySuppressedId = deterministicEventId(["history-e2e-suppressed-credential", 1]);
+    seedBuffer.append(
+      aiInteractionEventSchema.parse({
+        ...seedEvent(10_004),
+        id: historySuppressedId,
+        metadata: {},
+      }),
+      [HISTORY_SUPPRESSED_CREDENTIAL],
+    );
+    seededIds.push(historySuppressedId);
     seededIds.push(stitchId);
     seedBuffer.database
       .prepare(`update buffered_events set payload_json = json_set(payload_json, '$.sessionId', null, '$.model', null) where id = ?`)
@@ -2175,8 +2232,18 @@ async function main() {
       seededIds.push(event.id);
       seedBuffer.append(event, ["tool_input"]);
     }
+    const historyLocalDeliverySurfaces = (seedBuffer.database
+      .prepare(
+        `select coalesce(group_concat(text_value, '|'), '') as text from (
+           select base_envelope_json as text_value from upload_outbox
+           union all select coalesce(sealed_envelope_json, '') from upload_outbox
+           union all select envelope_json from upload_validation_witness
+           union all select delivery_id || ':' || reason || ':' || status_class from upload_receipts
+         )`,
+      )
+      .get() as { text: string }).text;
     seedBuffer.close();
-    const expectedEligible = 1_121; // 1,120 normal + repaired stitch artifact
+    const expectedEligible = 1_123; // 1,120 normal + stitch + 2 sanitized adversarial rows
 
     const HISTORY_INSTALL_KEY = "pli_historyproofkey00000000000001";
     const HISTORY_SECRET = "history-proof-signing-secret-0123456789";
@@ -2250,8 +2317,8 @@ async function main() {
         run1.sentEvents === expectedEligible &&
         historyStore.size === expectedEligible &&
         seededIds.every((id) => historyStore.has(id)) &&
-        run1.skippedEvents === 3 &&
-        run1.audit.skipped.forbidden_content === 1 &&
+        run1.skippedEvents === 5 &&
+        run1.audit.skipped.forbidden_content === 3 &&
         run1.audit.skipped.payload_unparseable === 1 &&
         run1.audit.skipped.schema_invalid === 1 &&
         historyMaxBatch <= 200 &&
@@ -2274,12 +2341,39 @@ async function main() {
     check(
       "history_upload_bodies_stay_metadata_only",
       historyBodies.length > 0 &&
-        historyBodies.every((requestBody) => !requestBody.includes(HISTORY_RAW_SENTINEL)) &&
+        [HISTORY_RAW_SENTINEL, ...historyAdversarialSentinels].every((sentinel) =>
+          historyBodies.every((requestBody) => !requestBody.includes(sentinel)) &&
+          historyLogs.every((line) => !line.includes(sentinel)) &&
+          !historyLocalDeliverySurfaces.includes(sentinel)
+        ) &&
         historyBodies.every((requestBody) => !requestBody.includes(os.hostname())) &&
         historyLogs.every((line) => !line.includes(HISTORY_INSTALL_KEY)) &&
         run1.auditTable.length > 0 &&
         !run1.auditTable.includes(HISTORY_INSTALL_KEY),
-      JSON.stringify({ bodies: historyBodies.length, sentinelLeaked: historyBodies.some((requestBody) => requestBody.includes(HISTORY_RAW_SENTINEL)) }),
+      JSON.stringify({
+        bodies: historyBodies.length,
+        sentinelLeaked: [HISTORY_RAW_SENTINEL, ...historyAdversarialSentinels].some((sentinel) =>
+          historyBodies.some((requestBody) => requestBody.includes(sentinel)) ||
+          historyLogs.some((line) => line.includes(sentinel)) ||
+          historyLocalDeliverySurfaces.includes(sentinel)
+        ),
+      }),
+    );
+    const unknownHistoryEvent = historyStore.get(historyUnknownId) as AiInteractionEvent | undefined;
+    const suppressedHistoryEnvelope = historyBodies
+      .flatMap((body) => (JSON.parse(body) as AiWorkIngestBatch).events)
+      .find((entry) => entry.event.id === historySuppressedId);
+    check(
+      "history_shared_sealer_blocks_value_bypass_and_omits_unknowns",
+      unknownHistoryEvent !== undefined &&
+        !("密钥" in unknownHistoryEvent.metadata) &&
+        !("unknownLabel" in unknownHistoryEvent.metadata) &&
+        suppressedHistoryEnvelope !== undefined &&
+        !suppressedHistoryEnvelope.suppressedFields.includes(HISTORY_SUPPRESSED_CREDENTIAL),
+      JSON.stringify({
+        unknownMetadataKeys: Object.keys(unknownHistoryEvent?.metadata ?? {}),
+        suppressedFields: suppressedHistoryEnvelope?.suppressedFields ?? [],
+      }),
     );
 
     // 16f. Idempotency: a second FULL run over the same scope re-sends the
@@ -2307,7 +2401,7 @@ async function main() {
         run2.insertedEvents === 0 &&
         historyStore.size === storeSizeBeforeRun2 &&
         [...historyStore.keys()].sort().join(",") === idsBeforeRun2 &&
-        run2.skippedEvents === 3 &&
+        run2.skippedEvents === 5 &&
         /server-reported NEW rows this backfill: 0/.test(run2.auditTable),
       JSON.stringify({
         before: storeSizeBeforeRun2,
@@ -2372,7 +2466,7 @@ async function main() {
         historyAuditTotals(resumeB.audit).localEvents === expectedEligible &&
         historyAuditTotals(resumeB.audit).sentEvents === expectedEligible &&
         resumeB.insertedEvents === expectedEligible &&
-        resumeB.skippedEvents === 3,
+        resumeB.skippedEvents === 5,
       JSON.stringify({
         firstRunSent: resumeA.sentEvents,
         resumedFromRowid: resumeB.resumedFromRowid,
@@ -2442,11 +2536,14 @@ async function main() {
       eventType: "assistant_response",
       observedAt: "2026-03-01T00:00:00.000Z",
     });
-    const linked = attachRepoLinkage(linkageBase, "sha256:repoX", "sha256:branchY");
+    const LINKAGE_REPO = `sha256:${"c3".repeat(32)}`;
+    const LINKAGE_BRANCH = `sha256:${"d4".repeat(32)}`;
+    const PRELABELED_REPO = `sha256:${"e5".repeat(32)}`;
+    const linked = attachRepoLinkage(linkageBase, LINKAGE_REPO, LINKAGE_BRANCH);
     const preLabeled = attachRepoLinkage(
-      { ...linkageBase, projectKey: "sha256:already" },
-      "sha256:repoX",
-      "sha256:branchY",
+      { ...linkageBase, projectKey: PRELABELED_REPO },
+      LINKAGE_REPO,
+      LINKAGE_BRANCH,
     );
     const linkedIds = new Set<string>();
     for (const body of historyBodies) {
@@ -2463,10 +2560,10 @@ async function main() {
     }
     check(
       "forward_path_sends_repo_linkage_as_project_key",
-      linked.projectKey === "sha256:repoX" &&
-        linked.metadata.branchHash === "sha256:branchY" &&
+      linked.projectKey === LINKAGE_REPO &&
+        linked.metadata.branchHash === LINKAGE_BRANCH &&
         aiInteractionEventSchema.safeParse(linked).success &&
-        preLabeled.projectKey === "sha256:already" &&
+        preLabeled.projectKey === PRELABELED_REPO &&
         attachRepoLinkage(linkageBase, null).projectKey === undefined &&
         linkedIds.size === 100,
       JSON.stringify({ linkedEventIdsOnWire: linkedIds.size, neverOverwrites: preLabeled.projectKey }),
@@ -2474,17 +2571,18 @@ async function main() {
 
     // 16k. Repair rows ride the SAME deterministic id mapping as uploads.
     const repairRows = buildAttributionRepairRows([
-      { id: "2b866c49-6f64-4ac1-9d6b-d9ce0aa64166", repoHash: "sha256:r1" },
-      { id: "self_test_1749670000000", repoHash: "sha256:r2" },
+      { id: "2b866c49-6f64-4ac1-9d6b-d9ce0aa64166", repoHash: `sha256:${"11".repeat(32)}` },
+      { id: "self_test_1749670000000", repoHash: `sha256:${"22".repeat(32)}` },
       { id: "ignored", repoHash: null },
-      { id: "", repoHash: "sha256:r3" },
+      { id: "", repoHash: `sha256:${"33".repeat(32)}` },
+      { id: "noncanonical", repoHash: "bare-linkage" },
     ]);
     check(
       "attribution_repair_rows_share_upload_id_mapping",
       repairRows.length === 2 &&
         repairRows[0].id === "2b866c49-6f64-4ac1-9d6b-d9ce0aa64166" &&
         repairRows[1].id === ensureUuidEventId("self_test_1749670000000").id &&
-        repairRows[1].projectKey === "sha256:r2",
+        repairRows[1].projectKey === `sha256:${"22".repeat(32)}`,
       JSON.stringify(repairRows),
     );
 
@@ -2633,8 +2731,8 @@ async function main() {
   {
     // 17a. Session-id rule: anything Postgres' uuid column accepts passes
     // through verbatim-lowercased — claude v4 ids live in events.session_id
-    // and codex v7 ids in metadata.externalSessionId, so the session row id
-    // must equal those exact values for the join to work. Non-uuid ids derive
+    // and codex v7 ids remain UUIDs, so the session row id must equal those
+    // exact values for the join to work. Non-uuid ids derive
     // the SAME uuid every run, in a namespace distinct from event ids.
     const v4Session = "2B866C49-6F64-4AC1-9D6B-D9CE0AA64166";
     const v7Session = "019dbcc6-d26c-7c82-84cb-a211da747e46";
@@ -2664,9 +2762,9 @@ async function main() {
     const sessionHome = path.join(tempDir, "session-home");
     fs.mkdirSync(sessionHome, { recursive: true });
     const sessionLedgerPath = path.join(sessionHome, "session-ledger.sqlite");
-    const SESSION_REPO_A = "sha256:sessrepoaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
-    const SESSION_REPO_B = "sha256:sessrepobbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
-    const SESSION_BRANCH_B = "sha256:sessbranchbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+    const SESSION_REPO_A = `sha256:${"4a".repeat(32)}`;
+    const SESSION_REPO_B = `sha256:${"5b".repeat(32)}`;
+    const SESSION_BRANCH_B = `sha256:${"6c".repeat(32)}`;
     const sessionSeed = new LocalEventBuffer(sessionLedgerPath);
     const seedSessionEvent = (input: {
       index: number;
@@ -2784,15 +2882,15 @@ async function main() {
     );
 
     // 17c. Wire rows obey the strict contract; poisoned sessions skip with
-    // reasons; honest totals (unpriced stays unpriced); junk ids carry their
-    // raw value in metadata.externalSessionId so events still join.
+    // reasons; honest totals (unpriced stays unpriced); junk ids use only the
+    // deterministic UUID and never export their raw local value.
     const wireRows = snapshotsT1.map((snapshot) => buildSessionSyncRow(snapshot));
     const okRows = wireRows.flatMap((row) => (row.ok ? [row] : []));
     const skipReasons = wireRows
       .flatMap((row) => (row.ok ? [] : [row.reason]))
       .sort()
       .join(",");
-    const junkWire = okRows.find((row) => row.row.session.metadata.externalSessionId === junkSessionRaw);
+    const junkWire = okRows.find((row) => row.row.session.id === junkOnce.id);
     const wireBatchParses = aiWorkSessionSyncBatchSchema.safeParse({
       kind: "session_sync",
       installKey: "pli_sessionproofkey0000000000000001",
@@ -2812,6 +2910,7 @@ async function main() {
         v7Wire.row.totals.costUsd > 0 &&
         junkWire !== undefined &&
         junkWire.idDerived &&
+        !JSON.stringify(junkWire.row).includes(junkSessionRaw) &&
         okRows.find((row) => row.row.session.id === v4Session.toLowerCase())?.row.totals
           .pricedEvents === 0,
       JSON.stringify({ eligible: okRows.length, skipped: skipReasons, batchParses: wireBatchParses }),
@@ -2826,12 +2925,14 @@ async function main() {
     const SESSION_INSTALL_KEY = "pli_sessionproofkey0000000000000001";
     const SESSION_SECRET = "session-proof-signing-secret-0123456789";
     const sessionStore = new Map<string, AiWorkSessionSyncRow>();
+    const sessionBodies: string[] = [];
     let sessionSignatureFailures = 0;
     let sessionMaxBatch = 0;
     const sessionServer = http.createServer((request, response) => {
       let body = "";
       request.on("data", (chunk) => (body += chunk));
       request.on("end", () => {
+        sessionBodies.push(body);
         const timestamp = String(request.headers["x-plimsoll-upload-timestamp"] ?? "");
         const signature = String(request.headers["x-plimsoll-upload-signature"] ?? "");
         const expected = `sha256=${crypto.createHmac("sha256", SESSION_SECRET).update(`${timestamp}.${body}`).digest("hex")}`;
@@ -2957,6 +3058,57 @@ async function main() {
       log: sessionLog,
     });
     const storeAfterDry = JSON.stringify([...sessionStore.entries()].sort());
+
+    // Adversarial session lane: unsafe raw ids and otherwise-approved fields
+    // must be rejected before deterministic derivation or signed batch build.
+    const unsafeSessionSentinels = [
+      "sk_live_SESSION_ID_SENTINEL",
+      "relative/path/SESSION_ID_SENTINEL",
+      "private.session@example.invalid",
+      "multibyte-密-SESSION_ID_SENTINEL",
+      "Bearer SESSION_ACTOR_SENTINEL",
+      "a".repeat(40),
+      "relative/path/SESSION_BRANCH_SENTINEL",
+    ];
+    for (const [index, unsafeSessionId] of unsafeSessionSentinels.slice(0, 4).entries()) {
+      seedSessionEvent({
+        index: (seedIndex += 1),
+        sessionId: unsafeSessionId,
+        observedAt: new Date(Date.UTC(2026, 4, 4, 0, 0, index)).toISOString(),
+      });
+    }
+    const unsafeActorSession = "unsafe-actor-session";
+    seedSessionEvent({
+      index: (seedIndex += 1),
+      sessionId: unsafeActorSession,
+      observedAt: "2026-05-04T00:01:00.000Z",
+    });
+    sessionSeed.database
+      .prepare(`update buffered_events set account_hash = ? where session_id = ?`)
+      .run(unsafeSessionSentinels[4], unsafeActorSession);
+    const unsafeLinkageSession = "unsafe-linkage-session";
+    seedSessionEvent({
+      index: (seedIndex += 1),
+      sessionId: unsafeLinkageSession,
+      observedAt: "2026-05-04T00:02:00.000Z",
+    });
+    sessionSeed.database
+      .prepare(`update buffered_events set repo_hash = ?, branch_hash = ? where session_id = ?`)
+      .run(unsafeSessionSentinels[5], unsafeSessionSentinels[6], unsafeLinkageSession);
+    const unsafeBodiesStart = sessionBodies.length;
+    const unsafeLogsStart = sessionLogs.length;
+    const sessionRunUnsafe = await runSessionSync(sessionConfig, {
+      until: new Date(Date.now() + 2_000).toISOString(),
+      ledgerDb: sessionSeed.database,
+      delayMs: 0,
+      maxAttemptsPerBatch: 2,
+      log: sessionLog,
+    });
+    const unsafeSessionBodies = sessionBodies.slice(unsafeBodiesStart);
+    const unsafeSessionLogs = sessionLogs.slice(unsafeLogsStart);
+    const sessionWireRows = unsafeSessionBodies.flatMap((body) =>
+      aiWorkSessionSyncBatchSchema.parse(JSON.parse(body)).sessions
+    );
     sessionSeed.close();
     await new Promise<void>((resolve) => sessionServer.close(() => resolve()));
 
@@ -2996,6 +3148,33 @@ async function main() {
         growth: { events: v7AfterGrowth?.totals.events, endedAt: v7AfterGrowth?.session.endedAt },
         staleReplayHeld: v7AfterStaleReplay?.totals.events === 31,
         subsetSent: sessionRunSubset.sentSessions,
+      }),
+    );
+    check(
+      "session_sync_shared_boundary_blocks_raw_ids_values_and_linkage",
+      sessionRunUnsafe.ok &&
+        sessionRunUnsafe.ledgerSessions === 11 &&
+        sessionRunUnsafe.eligibleSessions === 3 &&
+        sessionRunUnsafe.skippedSessions === 8 &&
+        sessionRunUnsafe.sentSessions === 3 &&
+        unsafeSessionSentinels.every((sentinel) =>
+          unsafeSessionBodies.every((body) => !body.includes(sentinel)) &&
+          unsafeSessionLogs.every((line) => !line.includes(sentinel))
+        ) &&
+        unsafeSessionBodies.every((body) => !body.includes(junkSessionRaw)) &&
+        sessionWireRows.every((row) => row.session.metadata.externalSessionId === undefined) &&
+        sessionWireRows.some((row) => row.session.id === v4Session.toLowerCase()) &&
+        sessionWireRows.some((row) => row.session.id === v7Session),
+      JSON.stringify({
+        ledger: sessionRunUnsafe.ledgerSessions,
+        eligible: sessionRunUnsafe.eligibleSessions,
+        skipped: sessionRunUnsafe.skippedSessions,
+        sent: sessionRunUnsafe.sentSessions,
+        signedBodies: unsafeSessionBodies.length,
+        leaked: unsafeSessionSentinels.filter((sentinel) =>
+          unsafeSessionBodies.some((body) => body.includes(sentinel)) ||
+          unsafeSessionLogs.some((line) => line.includes(sentinel))
+        ),
       }),
     );
 
@@ -3259,6 +3438,56 @@ async function main() {
         outcomes: push1.outcomes,
         artifact8Session: artifact8?.sessionId,
       }),
+    );
+    const outcomeBoundaryPush = buildOutcomePush({
+      tenantId: d2Config.tenantId,
+      owner: d2Owner,
+      repo: d2Repo,
+      pulls: [
+        {
+          number: 98,
+          state: "open",
+          merged: false,
+          updatedAt: d2Until,
+          branchHash: "relative/path/OUTCOME_BRANCH_SENTINEL",
+          headSha: "sk_live_OUTCOME_HEAD_SENTINEL",
+          mergeCommitSha: "not-a-commit-sha",
+          checks: "unknown",
+          checksFetched: false,
+        },
+        {
+          number: 99,
+          state: "open",
+          merged: false,
+          updatedAt: d2Until,
+          branchHash: `SHA256:${"AB".repeat(32)}`,
+          headSha: "C".repeat(40),
+          mergeCommitSha: "D".repeat(64),
+          checks: "unknown",
+          checksFetched: false,
+        },
+      ],
+      joins: [
+        { pull: 98, sessionId: d2SessionA, via: "branch_hash", events: 1 },
+        { pull: 99, sessionId: d2SessionA, via: "branch_hash", events: 1 },
+      ],
+      signals: [],
+      reworkWindowDays: 14,
+    });
+    const invalidOutcomeMetadata = outcomeBoundaryPush.batch?.artifacts
+      .find((artifact) => artifact.externalId.endsWith("/pull/98"))?.metadata as Record<string, unknown> | undefined;
+    const validOutcomeMetadata = outcomeBoundaryPush.batch?.artifacts
+      .find((artifact) => artifact.externalId.endsWith("/pull/99"))?.metadata as Record<string, unknown> | undefined;
+    check(
+      "outcomes_linkage_boundary_omits_invalid_and_normalizes_exact_hashes",
+      invalidOutcomeMetadata !== undefined &&
+        invalidOutcomeMetadata.branchHash === undefined &&
+        invalidOutcomeMetadata.headSha === undefined &&
+        invalidOutcomeMetadata.mergeCommitSha === undefined &&
+        validOutcomeMetadata?.branchHash === `sha256:${"ab".repeat(32)}` &&
+        validOutcomeMetadata.headSha === "c".repeat(40) &&
+        validOutcomeMetadata.mergeCommitSha === "d".repeat(64),
+      JSON.stringify({ invalid: invalidOutcomeMetadata, valid: validOutcomeMetadata }),
     );
 
     // 18d. End-to-end: signed push, honest counters, statuses/outcomes per

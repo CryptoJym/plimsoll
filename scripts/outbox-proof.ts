@@ -479,7 +479,7 @@ async function remotePoisonPositionProof() {
 async function limitOnePoisonFairnessProof() {
   for (const poisonPosition of [0, 1, 2]) {
     const base = 300 + poisonPosition * 10;
-    const cfg = config({ maxBackoffSeconds: 30, maxProbesPerCycle: 2 });
+    const cfg = config({ maxBackoffSeconds: 30, maxProbesPerCycle: 1 });
     const buffer = new LocalEventBuffer(ledger(), {
       delivery: { enabled: true, limits: cfg.delivery },
     });
@@ -491,21 +491,27 @@ async function limitOnePoisonFairnessProof() {
       .all() as Array<{ id: string; payload: string }>;
     const requestGroups: string[][] = [];
     const uploadedPerCall: number[] = [];
-    for (let cycle = 0; cycle < 5; cycle += 1) {
+    const failures: string[] = [];
+    for (let cycle = 0; cycle < 12; cycle += 1) {
       if (buffer.delivery.status(instant(2_000 + cycle * 31)).remainingDelivery === 0) break;
-      const result = await uploadBufferedEvents(cfg, buffer, {
-        limit: 1,
-        maxProbes: 2,
-        fetchImpl: async (_input, init) => {
-          const ids = requestIds(init);
-          requestGroups.push(ids);
-          return ids.includes(poisonId)
-            ? response(422, { privateProviderBody: "never-persist-limit-one" })
-            : response(200, { accepted: ids.length });
-        },
-        now: () => instant(2_000 + cycle * 31),
-      });
-      uploadedPerCall.push(result.uploadedEvents);
+      try {
+        const result = await uploadBufferedEvents(cfg, buffer, {
+          limit: 1,
+          maxProbes: 1,
+          fetchImpl: async (_input, init) => {
+            const ids = requestIds(init);
+            requestGroups.push(ids);
+            return ids.includes(poisonId)
+              ? response(422, { privateProviderBody: "never-persist-limit-one" })
+              : response(200, { accepted: ids.length });
+          },
+          now: () => instant(2_000 + cycle * 31),
+        });
+        uploadedPerCall.push(result.uploadedEvents);
+      } catch (error) {
+        if (!(error instanceof DeliveryUploadError)) throw error;
+        failures.push(error.failureClass);
+      }
     }
     const status = buffer.delivery.status(instant(2_200));
     const receipts = buffer.database
@@ -527,6 +533,7 @@ async function limitOnePoisonFairnessProof() {
         rawAfter.find((row) => row.id === poisonId)?.uploadedAt === null,
       {
         uploadedPerCall,
+        failures,
         requestGroups,
         remaining: status.remainingDelivery,
         acknowledged: status.receipts.acknowledged,
@@ -538,7 +545,7 @@ async function limitOnePoisonFairnessProof() {
   }
 
   {
-    const cfg = config({ maxBackoffSeconds: 30, maxProbesPerCycle: 2 });
+    const cfg = config({ maxBackoffSeconds: 30, maxProbesPerCycle: 1 });
     const buffer = new LocalEventBuffer(ledger(), {
       delivery: { enabled: true, limits: cfg.delivery },
     });
@@ -552,19 +559,26 @@ async function limitOnePoisonFairnessProof() {
     const contractRows = [event(341)];
     for (const item of contractRows) buffer.append(item);
     let probes = 0;
-    const failed = await expectDeliveryError(
-      () => uploadBufferedEvents(cfg, buffer, {
-        limit: 1,
-        maxProbes: 2,
-        fetchImpl: async () => {
-          probes += 1;
-          return response(422, { globalPrivateBody: "never-persist-global" });
-        },
-        now: () => instant(2_331),
-      }),
-      "remote_contract",
-    );
-    const status = buffer.delivery.status(instant(2_331));
+    const failures: string[] = [];
+    for (let cycle = 0; cycle < 12; cycle += 1) {
+      try {
+        await uploadBufferedEvents(cfg, buffer, {
+          limit: 1,
+          maxProbes: 1,
+          fetchImpl: async () => {
+            probes += 1;
+            return response(422, { globalPrivateBody: "never-persist-global" });
+          },
+          now: () => instant(2_331 + cycle * 31),
+        });
+      } catch (error) {
+        if (!(error instanceof DeliveryUploadError)) throw error;
+        failures.push(error.failureClass);
+        if (error.failureClass === "remote_contract") break;
+      }
+    }
+    const failed = failures.includes("remote_contract");
+    const status = buffer.delivery.status(instant(2_400));
     record(
       "limit_one_global_422_with_prior_witness_quarantines_zero",
       failed &&
@@ -575,6 +589,7 @@ async function limitOnePoisonFairnessProof() {
         status.circuit.kind === "contract_blocked",
       {
         failed,
+        failures,
         probes,
         dead: status.receipts.dead,
         acknowledged: status.receipts.acknowledged,
@@ -653,7 +668,7 @@ async function crashBetweenSiblingAckAndQuarantineProof() {
       durableWitness === 1 &&
       replay.uploadedEvents === 0 &&
       replay.delivery.deadLetters === 1 &&
-      replayRequests.length === 0 &&
+      JSON.stringify(replayRequests) === JSON.stringify([[valid.id]]) &&
       final.remainingDelivery === 0 &&
       final.receipts.acknowledged === 1 &&
       final.receipts.dead === 1 &&
@@ -829,7 +844,8 @@ async function linkageAndRetentionProof() {
     { uploaded: linked.uploadedEvents, projectKeyFilled: sent.events[0].event.projectKey === repoHash },
   );
 
-  buffer.append(event(131, { projectKey: "owner-supplied-project" }));
+  const ownerSuppliedProject = `sha256:${"9a".repeat(32)}`;
+  buffer.append(event(131, { projectKey: ownerSuppliedProject }));
   buffer.database.prepare(`update buffered_events set repo_hash = ? where id = ?`).run(repoHash, uuid(131));
   const lease = buffer.delivery.lease({ now: instant(610), leaseId: "proof-seal" });
   const sealedBefore = lease.items[0].envelopeJson;
@@ -837,7 +853,7 @@ async function linkageAndRetentionProof() {
   const sealedAfter = (buffer.database.prepare(`select sealed_envelope_json as sealed from upload_outbox where delivery_id = ?`).get(uuid(131)) as { sealed: string }).sealed;
   record(
     "linkage_after_seal_cannot_mutate_or_overwrite_project_key",
-    sealedBefore === sealedAfter && (JSON.parse(sealedAfter) as { event: { projectKey: string } }).event.projectKey === "owner-supplied-project",
+    sealedBefore === sealedAfter && (JSON.parse(sealedAfter) as { event: { projectKey: string } }).event.projectKey === ownerSuppliedProject,
     { identicalSeal: sealedBefore === sealedAfter },
   );
   buffer.delivery.retry(lease.leaseId, lease.items, "remote_transient", instant(610));
@@ -1090,17 +1106,65 @@ async function hostilePrivacyAndLinkageProof() {
     "serviceVersion", "spanId", "status.code", "stitched", "tool",
     "toolClassDetail", "toolName", "tool_name", "traceId", "type", "usageSource",
   ];
+  const credentialShapes = [
+    "sk_live_OUTBOX_VALUE_SENTINEL",
+    "sk_test_OUTBOX_VALUE_SENTINEL",
+    "sk-OUTBOX_VALUE_SENTINEL",
+    "ghp_OUTBOX_VALUE_SENTINEL",
+    "github_pat_OUTBOX_VALUE_SENTINEL",
+    "xoxb-OUTBOX-VALUE-SENTINEL",
+    "eyJproofheader.payloadproof.signatureproof",
+    "Bearer OUTBOX_VALUE_SENTINEL",
+    "Basic T1VUQk9YX1ZBTFVFX1NFTlRJTkVM",
+    "-----BEGIN PRIVATE KEY----- OUTBOX_VALUE_SENTINEL",
+    "credential_OUTBOX_VALUE_SENTINEL",
+    "secret_OUTBOX_VALUE_SENTINEL",
+    "password_OUTBOX_VALUE_SENTINEL",
+    "token_OUTBOX_VALUE_SENTINEL",
+    "apiKeyOUTBOXValueSentinel",
+    "privateKeyOUTBOXValueSentinel",
+  ];
   for (const key of allowedStringKeys) {
+    const keyIndex = allowedStringKeys.indexOf(key);
     for (const sentinel of [
       `relative/path/${key}`,
       `relative%2Fpath-${key}`,
       `relative\\path-${key}`,
+      `https://private.invalid/${key}`,
+      `private.${keyIndex}@example.invalid`,
+      `multibyte-密-${keyIndex}`,
+      `${credentialShapes[keyIndex % credentialShapes.length]}_${keyIndex}`,
     ]) {
       rejected.push({ metadata: { [key]: sentinel }, sentinel });
     }
   }
   rejected.forEach((entry, index) => {
     buffer.append(event(3_000 + index, { metadata: entry.metadata }));
+  });
+
+  const topLevelRejected: Array<{ field: string; sentinel: string }> = [];
+  const topLevelFields = [
+    "id", "sessionId", "tenantId", "actorId", "projectKey",
+    "customerKey", "workflowKey", "model",
+  ];
+  for (const [fieldIndex, field] of topLevelFields.entries()) {
+    for (const sentinel of [
+      `${credentialShapes[fieldIndex]}_TOP_${fieldIndex}`,
+      `relative/path/top-${fieldIndex}`,
+      `https://private.invalid/top-${fieldIndex}`,
+      `top.${fieldIndex}@example.invalid`,
+      `relative\\top-${fieldIndex}`,
+      `multibyte-密-top-${fieldIndex}`,
+    ]) {
+      topLevelRejected.push({ field, sentinel });
+    }
+  }
+  topLevelRejected.push(
+    { field: "projectKey", sentinel: "arbitrary-project-key" },
+    { field: "projectKey", sentinel: "a".repeat(40) },
+  );
+  topLevelRejected.forEach((entry, index) => {
+    buffer.append(event(3_700 + index, { [entry.field]: entry.sentinel }));
   });
 
   const omitted = [
@@ -1209,7 +1273,12 @@ async function hostilePrivacyAndLinkageProof() {
   const statusJson = JSON.stringify(buffer.delivery.status(instant(3_001)));
   const rejectedSentinels = rejected.map((entry) => entry.sentinel);
   const omittedSentinels = omitted.map(([, sentinel]) => sentinel);
-  const forbidden = [...rejectedSentinels, ...omittedSentinels, malformedLinkage];
+  const forbidden = [
+    ...rejectedSentinels,
+    ...topLevelRejected.map((entry) => entry.sentinel),
+    ...omittedSentinels,
+    malformedLinkage,
+  ];
   const absentEverywhere = forbidden.every((sentinel) =>
     !beforeRows.some((row) => `${row.base}|${row.sealed}|${row.repoHash ?? ""}`.includes(sentinel)) &&
     !requestBody.includes(sentinel) &&
@@ -1226,7 +1295,7 @@ async function hostilePrivacyAndLinkageProof() {
   });
   record(
     "normalized_sensitive_keys_and_noncanonical_linkage_never_enter_delivery_surfaces",
-    deadBefore.length === rejected.length &&
+    deadBefore.length === rejected.length + topLevelRejected.length &&
       deadBefore.every((row) => row.reason === "local_privacy_violation") &&
       beforeRows.length === omitted.length + 3 &&
       beforeRows.find((row) => row.id === invalidLinkageId)?.repoHash === null &&
@@ -1258,6 +1327,8 @@ async function hostilePrivacyAndLinkageProof() {
       JSON.stringify(metadataLinkageSent?.metadata.otelSignalNames) === JSON.stringify(["thread/read", "safe_signal"]),
     {
       hostileDead: deadBefore.length,
+      metadataValueCases: rejected.length,
+      topLevelValueCases: topLevelRejected.length,
       activeBefore: beforeRows.length,
       uploaded: uploaded.uploadedEvents,
       absentEverywhere,
@@ -1277,6 +1348,20 @@ async function hostilePrivacyAndLinkageProof() {
         reasoningOutput: invalidSent?.metadata.reasoningOutputTokens,
         namespacedInputString: invalidSent?.metadata["gen_ai.usage.input_tokens"],
       },
+    },
+  );
+  record(
+    "allowed_metadata_and_top_level_string_value_matrix_fails_closed",
+    allowedStringKeys.every((key) => rejected.filter((entry) => key in entry.metadata).length >= 7) &&
+      topLevelFields.every((field) => topLevelRejected.filter((entry) => entry.field === field).length >= 6) &&
+      credentialShapes.every((shape) => rejected.some((entry) => entry.sentinel.includes(shape))) &&
+      absentEverywhere,
+    {
+      metadataKeys: allowedStringKeys.length,
+      metadataCases: rejected.length,
+      topLevelFields: topLevelFields.length,
+      topLevelCases: topLevelRejected.length,
+      credentialShapes: credentialShapes.length,
     },
   );
   buffer.close();
@@ -1510,6 +1595,14 @@ function pressureAgeByteOversizeAndStatusProof() {
          where raw_rowid = ? and sealed_envelope_json is null and attempt_count = 0`,
       )
       .all(`sha256:${"ab".repeat(32)}`, 1) as Array<{ detail: string }>;
+    const witnessCandidatePlan = buffer.database
+      .prepare(
+        `explain query plan
+         select 1 from upload_validation_candidates c
+         join upload_outbox o on o.delivery_id = c.delivery_id
+         where c.contract_hash = ? and c.failed_at >= ? limit 1`,
+      )
+      .all(`sha256:${"cd".repeat(32)}`, instant(1_100).toISOString()) as Array<{ detail: string }>;
     record(
       "status_uses_singleton_gauges_not_history_aggregates",
       status.remainingDelivery === 100 && status.work.controlRowsRead === 1 && status.work.activeRowsScanned === 0 && status.work.receiptRowsScanned === 0 && status.work.rawRowsScanned === 0 && plan.some((row) => /primary key|integer primary key/i.test(row.detail)),
@@ -1521,6 +1614,13 @@ function pressureAgeByteOversizeAndStatusProof() {
         /search upload_outbox using index idx_upload_outbox_raw_rowid/i.test(row.detail),
       ),
       { plan: rawLinkagePlan.map((row) => row.detail).join(" | ") },
+    );
+    record(
+      "validation_witness_reprobe_uses_contract_failure_index",
+      witnessCandidatePlan.some((row) =>
+        /idx_upload_validation_candidates_contract_failure/i.test(row.detail),
+      ),
+      { plan: witnessCandidatePlan.map((row) => row.detail).join(" | ") },
     );
     buffer.close();
   }

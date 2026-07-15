@@ -166,7 +166,6 @@ export async function performJoin(options: {
           id: `join_handshake_${Date.now()}`,
           source: "claude_code",
           event_type: "UserPromptSubmit",
-          project: "plimsoll-join-handshake",
         },
         { config, buffer, source: "claude_code" },
       );
