@@ -46,9 +46,10 @@ export type ResourceProofReceipt = {
   gateReady: boolean;
   requireIntegrated: boolean;
   environment: {
-    isolation: "temporary-home-db-session-roots-and-loopback-port";
+    isolation: "temporary-home-db-and-session-roots";
+    loopbackPort: "held-and-challenged" | "unverified";
     providerNetwork: "not-configured";
-    credentials: "scrubbed";
+    credentials: "scrubbed-by-allowlist" | "unverified";
     liveStateTouched: false;
     node: string;
     platform: NodeJS.Platform;

@@ -4,7 +4,7 @@ This document turns ADR-0001 into release evidence. The primary assertions are d
 
 ## Measurement contract
 
-Every integrated run uses a fresh temporary `HOME`, `PLIMSOLL_HOME`, SQLite database, synthetic session trees, and an operating-system-assigned loopback port. It must not read or write the operator's collector directory, call a hosted provider, use credentials, or control the installed LaunchAgent.
+Every integrated run uses a fresh temporary `HOME`, `PLIMSOLL_HOME`, SQLite database, synthetic session trees, and an operating-system-assigned loopback port held by a live reservation socket until explicit handoff/cleanup. A challenger bind must receive `EADDRINUSE` before the receipt calls the port held. Child processes receive a fixed minimal environment allowlist; copying and subtracting from `process.env` is forbidden. Sentinel fixtures must prove credential-like names and values do not cross that boundary. The run must not read or write the operator's collector directory, call a hosted provider, use credentials, or control the installed LaunchAgent.
 
 The resource receipt has four scenario states:
 
@@ -19,6 +19,8 @@ The resource receipt has four scenario states:
 
 | Surface / phase | Primary deterministic gate | Secondary observation | Why this budget exists |
 |---|---|---|---|
+| Harness environment boundary | child env keys are an exact allowlisted subset; credential-like names `0`; secret sentinel values `0` | not applicable | Subtractive scrubbing misses unknown credentials and injected variables. |
+| Harness loopback reservation | reservation listener held `1`; assigned port matches listener; challenger bind result `EADDRINUSE` | reservation setup <= 1 s | Reading an ephemeral port and immediately closing it does not reserve it. |
 | Idle/no-change interval | `fullHistoryFileReads=0`; `rawEventWrites=0`; `repriceRowsVisited=0`; `enrichmentRowsVisited=0`; `overlappingJobs=0` | Five-minute CPU <= 1 CPU-second on the controlled fixture | Current minute loops replay growing files and run history work even when nothing changes. |
 | One complete appended JSONL line | `filesOpened<=1`; `fileBytesRead<=newSuffixBytes+4096`; `rawEventWrites=1`; committed offset equals the complete-line boundary | Capture visible <= 500 ms | A file's age must not determine the cost of its next append. |
 | Partial line plus restart | first phase `rawEventWrites=0`; second phase adds exactly one deterministic event; duplicate inserts `0` | Completion visible <= 500 ms | Crash-safe framing must neither lose nor double count usage. |
@@ -66,6 +68,8 @@ Counters are per scenario and reset before each action phase. Production lanes m
 10. **Scale-shape fixture:** multiply raw history cardinality while holding projection cardinality constant. Dashboard work counters remain constant.
 11. **Privacy sentinels:** seed prompt, response, tool arguments, absolute path, repository URL, email, token, and cookie sentinels. None may appear in DB rows, upload bodies, logs, or receipts in metadata mode.
 12. **Clock drift:** run the proof at dates far beyond fixture timestamps. Window-sensitive assertions must use an injected fixture clock rather than the wall clock (#82).
+13. **Environment inheritance:** seed the parent environment with credential-like names and unique value sentinels. The constructed child environment contains neither, and its key set is a subset of the fixed allowlist.
+14. **Port theft:** hold the port-0 listener, verify its assigned port, and challenge the exact address. The challenger must fail with `EADDRINUSE` before any receipt claims a reservation.
 
 ## Gate sequence
 
@@ -79,6 +83,6 @@ Counters are per scenario and reset before each action phase. Production lanes m
 
 ## Current scaffold boundary
 
-The initial issue #81 lane validates the architecture artifact, creates an isolated temporary ledger and loopback-port environment, and can invoke the existing signal-fidelity proof. It intentionally reports the integrated capture/projection/outbox, no-change, duplicate-start, poison-continuation, and dashboard-budget scenarios as `not_wired` until #76–#80 expose their instrumentation/test seams.
+The initial issue #81 lane validates the proposed architecture artifact, creates an isolated temporary ledger and a held/challenged loopback reservation, proves a minimal child-environment allowlist against credential sentinels, and can invoke the existing signal-fidelity proof. It intentionally reports the integrated capture/projection/outbox, no-change, duplicate-start, poison-continuation, and dashboard-budget scenarios as `not_wired` until #76–#80 expose their instrumentation/test seams.
 
 The original `origin/main@9fc0af4` baseline failed `pnpm proof` because fixed May fixtures aged outside 30-day windows. #82 delivered the injected fixture clock on `origin/main@196d35f`; the rebased issue #81 lane now verifies the full proof green. This history remains documented because wall-clock-dependent fixtures are a release-gate failure mode, not a reason to weaken assertions.

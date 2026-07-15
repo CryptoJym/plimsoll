@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-- Establish the accepted architecture for a resource-bounded local collector and a machine-readable integration gate.
+- Propose an owner-pending architecture for a resource-bounded local collector and establish a machine-readable integration gate.
 - Use deterministic work counters as the primary proof; wall-clock observations are secondary.
 - The scaffold runs only against temporary resources and reports sibling-dependent integration scenarios as `not_wired`, not passed.
 - Parent: [#75](https://github.com/CryptoJym/plimsoll/issues/75). Tracker: [#81](https://github.com/CryptoJym/plimsoll/issues/81).
@@ -24,7 +24,7 @@ sources -> privacy + value admission -> short-retention raw evidence
                                                            -> dead letter
 ```
 
-The deployment remains a single local process and SQLite database with logical failure boundaries. ADR-0001 documents why microservices, a second database, and an external event stream are not the 80/20 answer.
+The proposed deployment remains a single local process and SQLite database with logical failure boundaries. ADR-0001 documents why microservices, a second database, and an external event stream are not the 80/20 answer. Its status remains `Proposed — pending owner acceptance` until James decides.
 
 ## Problem / Task
 
@@ -54,9 +54,9 @@ origin/main@196d35f; the rebased lane verifies the full proof green.
 
 ## Acceptance Criteria
 
-- [x] Accepted-style ADR documents requirements, target flow, failure modes, security/privacy, alternatives, and 80/20 migration order.
+- [x] Proposed ADR documents requirements, target flow, failure modes, security/privacy, alternatives, and 80/20 migration order without claiming owner acceptance.
 - [x] NFR budget matrix defines deterministic counters plus secondary latency observations.
-- [x] Harness creates only temporary local resources and emits a schema-versioned JSON receipt.
+- [x] Harness creates only temporary local resources, holds/challenges its loopback reservation, proves a minimal child-environment allowlist, and emits a schema-versioned JSON receipt.
 - [x] Current architecture/isolation/empty-ledger checks run; optional existing proof execution is captured without credentials or provider calls.
 - [x] Integration-only scenarios are represented as required `not_wired` checks until sibling lanes provide seams.
 - [ ] E2E covers capture -> durable evidence -> projections -> dashboard -> outbox on integrated #76–#80 heads.
@@ -75,6 +75,9 @@ No real home, live database, installed service, provider network, credential, or
 - Run optional baseline proof inside the receipt: add `--run-existing-proof`.
 - Enforce integration readiness: add `--require-integrated`; expected to fail while required scenarios are `not_wired`.
 - Counter names and meanings are a versioned contract. Additive fields are safe within v1; semantic changes require v2.
+- The child environment is constructed from an allowlist; never replace this with `...process.env` plus deletions.
+- A port is not reserved merely because port `0` returned a number. Keep the listener held until handoff/cleanup and prove a challenger receives `EADDRINUSE`.
+- Outbox rows are bounded copies of sanitized ingest envelopes. Raw-evidence TTL is independent of acknowledgement state.
 - Do not make `not_wired` exit green under `--require-integrated`.
 - #82 delivered fixture-clock repair; this lane does not edit the monolithic proof.
 

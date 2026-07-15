@@ -25,6 +25,14 @@ type IntegrationFixture = {
   }>;
 };
 
+type EnvironmentSentinelFixture = {
+  schemaVersion: number;
+  credentialNamePattern: string;
+  parentSentinels: Record<string, string>;
+  requiredChildNames: string[];
+  optionalPassThroughNames: string[];
+};
+
 export type ResourceSandbox = {
   root: string;
   home: string;
@@ -33,6 +41,7 @@ export type ResourceSandbox = {
   claudeProjects: string;
   codexSessions: string;
   port: number;
+  portReservation: net.Server;
 };
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
@@ -42,8 +51,8 @@ function within(parent: string, candidate: string) {
   return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
 }
 
-async function reserveLoopbackPort() {
-  return new Promise<number>((resolve, reject) => {
+async function holdLoopbackPort() {
+  return new Promise<{ port: number; server: net.Server }>((resolve, reject) => {
     const server = net.createServer();
     server.unref();
     server.once("error", reject);
@@ -54,8 +63,8 @@ async function reserveLoopbackPort() {
         reject(new Error("loopback port reservation returned no numeric address"));
         return;
       }
-      const port = address.port;
-      server.close((error) => (error ? reject(error) : resolve(port)));
+      server.removeListener("error", reject);
+      resolve({ port: address.port, server });
     });
   });
 }
@@ -69,18 +78,28 @@ export async function createResourceSandbox(): Promise<ResourceSandbox> {
   for (const directory of [home, plimsollHome, claudeProjects, codexSessions]) {
     fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   }
-  return {
-    root,
-    home,
-    plimsollHome,
-    ledger: path.join(plimsollHome, "work-ledger.sqlite"),
-    claudeProjects,
-    codexSessions,
-    port: await reserveLoopbackPort(),
-  };
+  try {
+    const reservation = await holdLoopbackPort();
+    return {
+      root,
+      home,
+      plimsollHome,
+      ledger: path.join(plimsollHome, "work-ledger.sqlite"),
+      claudeProjects,
+      codexSessions,
+      port: reservation.port,
+      portReservation: reservation.server,
+    };
+  } catch (error) {
+    fs.rmSync(root, { recursive: true, force: true });
+    throw error;
+  }
 }
 
-export function removeResourceSandbox(sandbox: ResourceSandbox) {
+export async function removeResourceSandbox(sandbox: ResourceSandbox) {
+  if (sandbox.portReservation.listening) {
+    await new Promise<void>((resolve) => sandbox.portReservation.close(() => resolve()));
+  }
   fs.rmSync(sandbox.root, { recursive: true, force: true });
 }
 
@@ -119,7 +138,48 @@ export function runIsolationContract(
           .join(", ")}`,
     durationMs: Math.round((performance.now() - started) * 100) / 100,
     counters: emptyWorkCounters(),
-    measurements: { ...checks, loopbackPortReserved: true },
+    measurements: checks,
+  };
+}
+
+export async function runPortReservationContract(
+  sandbox: ResourceSandbox,
+): Promise<ScenarioReceipt> {
+  const started = performance.now();
+  const address = sandbox.portReservation.address();
+  const reservationHeld = Boolean(
+    sandbox.portReservation.listening &&
+      address &&
+      typeof address !== "string" &&
+      address.address === "127.0.0.1" &&
+      address.port === sandbox.port,
+  );
+
+  const challengerResult = await new Promise<string>((resolve) => {
+    const challenger = net.createServer();
+    challenger.unref();
+    challenger.once("error", (error: NodeJS.ErrnoException) => resolve(error.code ?? "ERROR"));
+    challenger.listen(sandbox.port, "127.0.0.1", () => {
+      challenger.close(() => resolve("BOUND"));
+    });
+  });
+  const competingBindRejected = challengerResult === "EADDRINUSE";
+  const passed = reservationHeld && competingBindRejected;
+  return {
+    id: "loopback_port_reservation_truth",
+    required: true,
+    status: passed ? "pass" : "fail",
+    detail: passed
+      ? "A live port-0 listener remains held and a challenger bind to the assigned loopback port is rejected with EADDRINUSE."
+      : `Port reservation contract failed (held=${reservationHeld}, challenger=${challengerResult}).`,
+    durationMs: Math.round((performance.now() - started) * 100) / 100,
+    counters: emptyWorkCounters(),
+    measurements: {
+      reservationListenerHeld: reservationHeld,
+      assignedPortMatchesListener: reservationHeld,
+      competingBindRejected,
+      challengerResult,
+    },
   };
 }
 
@@ -136,8 +196,9 @@ export function runArchitectureContract(): ScenarioReceipt {
   const budget = fs.readFileSync(budgetPath, "utf8");
   const requiredAdrSections = [
     "## Status",
-    "\nAccepted\n",
-    "Accepted for incremental delivery",
+    "Proposed — pending owner acceptance",
+    "The outbox stores a copy, not a foreign-key-only reference",
+    "raw evidence expires under the configured raw age/byte policy",
     "## Requirements",
     "## Decision",
     "## Consequences",
@@ -163,7 +224,7 @@ export function runArchitectureContract(): ScenarioReceipt {
     status: missing.length === 0 ? "pass" : "fail",
     detail:
       missing.length === 0
-        ? "Accepted ADR, NFR budgets, failure modes, alternatives, privacy analysis, migration order, and adversarial gates are present."
+        ? "Proposed owner-pending ADR, explicit envelope-copy retention semantics, NFR budgets, failure modes, alternatives, privacy analysis, migration order, and adversarial gates are present."
         : `Architecture contract is missing: ${missing.join(", ")}`,
     durationMs: Math.round((performance.now() - started) * 100) / 100,
     counters: emptyWorkCounters(),
@@ -226,22 +287,108 @@ export function runEmptyLedgerContract(sandbox: ResourceSandbox): ScenarioReceip
   }
 }
 
-function scrubbedEnvironment(sandbox: ResourceSandbox) {
-  const env = { ...process.env };
-  for (const name of [
-    "GITHUB_TOKEN",
-    "GH_TOKEN",
-    "PLIMSOLL_CLOUD_URL",
-    "PLIMSOLL_INGEST_KEY",
-    "PLIMSOLL_UPLOAD_SIGNING_SECRET",
-  ]) {
-    delete env[name];
-  }
-  return {
-    ...env,
+export function buildAllowlistedChildEnvironment(
+  sandbox: ResourceSandbox,
+  parentEnvironment: NodeJS.ProcessEnv = process.env,
+) {
+  const env: NodeJS.ProcessEnv = {
     HOME: sandbox.home,
+    USERPROFILE: sandbox.home,
     PLIMSOLL_HOME: sandbox.plimsollHome,
     TMPDIR: sandbox.root,
+    TMP: sandbox.root,
+    TEMP: sandbox.root,
+    TZ: "UTC",
+    LANG: "C",
+    LC_ALL: "C",
+  };
+  for (const name of ["PATH", "SystemRoot", "WINDIR", "ComSpec", "PATHEXT"]) {
+    const value = parentEnvironment[name];
+    if (value !== undefined) env[name] = value;
+  }
+  return env;
+}
+
+export function runChildEnvironmentContract(sandbox: ResourceSandbox): ScenarioReceipt {
+  const started = performance.now();
+  const fixturePath = path.join(
+    repoRoot,
+    "scripts",
+    "resource-proof",
+    "fixtures",
+    "environment-sentinels.json",
+  );
+  const fixture = JSON.parse(fs.readFileSync(fixturePath, "utf8")) as EnvironmentSentinelFixture;
+  if (fixture.schemaVersion !== 1) {
+    throw new Error("resource-proof environment fixture must use schemaVersion 1");
+  }
+  const credentialName = new RegExp(fixture.credentialNamePattern, "i");
+  // Construct a deliberately hostile parent from only the system variables the
+  // allowlist may pass plus credential sentinels. Actual credential values are
+  // never copied into this fixture object or compared in the receipt.
+  const adversarialParent: NodeJS.ProcessEnv = {};
+  for (const name of fixture.optionalPassThroughNames) {
+    const value = process.env[name];
+    if (value !== undefined) adversarialParent[name] = value;
+  }
+  Object.assign(adversarialParent, fixture.parentSentinels);
+  const adversarialChildEnvironment = buildAllowlistedChildEnvironment(
+    sandbox,
+    adversarialParent,
+  );
+  const actualChildEnvironment = buildAllowlistedChildEnvironment(sandbox);
+  const childNames = Object.keys(actualChildEnvironment);
+  const allowedNames = new Set([
+    ...fixture.requiredChildNames,
+    ...fixture.optionalPassThroughNames,
+  ]);
+  const adversarialChildValues = Object.values(adversarialChildEnvironment).filter(
+    (value): value is string => typeof value === "string",
+  );
+  const sentinelNames = Object.keys(fixture.parentSentinels);
+  const sentinelValues = Object.values(fixture.parentSentinels);
+  const checks = {
+    requiredNamesPresent: fixture.requiredChildNames.every(
+      (name) => name in actualChildEnvironment,
+    ),
+    unexpectedNamesAbsent: childNames.every((name) => allowedNames.has(name)),
+    credentialLikeNamesAbsent: childNames.every((name) => !credentialName.test(name)),
+    sentinelNamesAbsent: sentinelNames.every(
+      (name) => !(name in adversarialChildEnvironment),
+    ),
+    sentinelValuesAbsent: sentinelValues.every(
+      (sentinel) => !adversarialChildValues.some((value) => value.includes(sentinel)),
+    ),
+    isolatedHomeValues:
+      actualChildEnvironment.HOME === sandbox.home &&
+      actualChildEnvironment.USERPROFILE === sandbox.home &&
+      actualChildEnvironment.PLIMSOLL_HOME === sandbox.plimsollHome,
+    isolatedTempValues: ["TMPDIR", "TMP", "TEMP"].every(
+      (name) => actualChildEnvironment[name] === sandbox.root,
+    ),
+  };
+  const passed = Object.values(checks).every(Boolean);
+  return {
+    id: "child_environment_allowlist",
+    required: true,
+    status: passed ? "pass" : "fail",
+    detail: passed
+      ? "Child processes receive only the fixed system/path and isolated-home allowlist; credential-name and value sentinels are absent."
+      : `Child environment contract failed: ${Object.entries(checks)
+          .filter(([, ok]) => !ok)
+          .map(([name]) => name)
+          .join(", ")}`,
+    durationMs: Math.round((performance.now() - started) * 100) / 100,
+    counters: emptyWorkCounters(),
+    measurements: {
+      ...checks,
+      childEnvironmentKeyCount: childNames.length,
+      allowedEnvironmentNameCount: allowedNames.size,
+      parentCredentialLikeNameCount: Object.keys(process.env).filter((name) =>
+        credentialName.test(name),
+      ).length,
+      fixtureCredentialSentinelCount: sentinelNames.length,
+    },
   };
 }
 
@@ -264,7 +411,7 @@ export function runExistingSignalFidelityProof(
   const proof = path.join(repoRoot, "scripts", "signal-fidelity-proof.ts");
   const result = spawnSync(process.execPath, [tsxCli, proof], {
     cwd: repoRoot,
-    env: scrubbedEnvironment(sandbox),
+    env: buildAllowlistedChildEnvironment(sandbox),
     encoding: "utf8",
     timeout: 300_000,
     maxBuffer: 16 * 1024 * 1024,
@@ -281,7 +428,7 @@ export function runExistingSignalFidelityProof(
     required: false,
     status: passed ? "pass" : "fail",
     detail: passed
-      ? "Existing signal-fidelity proof exited 0 under scrubbed credentials and a temporary HOME."
+      ? "Existing signal-fidelity proof exited 0 under the verified minimal child-environment allowlist and a temporary HOME."
       : `Existing signal-fidelity proof failed: ${failureDetail}`,
     durationMs: Math.round((performance.now() - started) * 100) / 100,
     counters: emptyWorkCounters(),

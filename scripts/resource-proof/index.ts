@@ -9,9 +9,11 @@ import {
   loadUnwiredIntegrationScenarios,
   removeResourceSandbox,
   runArchitectureContract,
+  runChildEnvironmentContract,
   runEmptyLedgerContract,
   runExistingSignalFidelityProof,
   runIsolationContract,
+  runPortReservationContract,
 } from "./scenarios";
 import {
   RESOURCE_PROOF_SCHEMA,
@@ -87,6 +89,10 @@ async function main() {
 
   try {
     scenarios.push(runIsolationContract(sandbox, operatorHome));
+    const portScenario = await runPortReservationContract(sandbox);
+    scenarios.push(portScenario);
+    const environmentScenario = runChildEnvironmentContract(sandbox);
+    scenarios.push(environmentScenario);
     scenarios.push(runArchitectureContract());
     scenarios.push(runEmptyLedgerContract(sandbox));
     scenarios.push(runExistingSignalFidelityProof(sandbox, runExistingProof));
@@ -102,9 +108,12 @@ async function main() {
       gateReady,
       requireIntegrated,
       environment: {
-        isolation: "temporary-home-db-session-roots-and-loopback-port",
+        isolation: "temporary-home-db-and-session-roots",
+        loopbackPort:
+          portScenario.status === "pass" ? "held-and-challenged" : "unverified",
         providerNetwork: "not-configured",
-        credentials: "scrubbed",
+        credentials:
+          environmentScenario.status === "pass" ? "scrubbed-by-allowlist" : "unverified",
         liveStateTouched: false,
         node: process.version,
         platform: process.platform,
@@ -122,12 +131,14 @@ async function main() {
 
     if (anyFailure || (requireIntegrated && !gateReady)) process.exitCode = 1;
   } finally {
-    removeResourceSandbox(sandbox);
+    await removeResourceSandbox(sandbox);
   }
 }
 
 main().catch((error) => {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${JSON.stringify({ schema: RESOURCE_PROOF_SCHEMA, overall: "fail", error: message })}\n`);
+  const errorClass = error instanceof Error ? error.name : "UnknownError";
+  process.stderr.write(
+    `${JSON.stringify({ schema: RESOURCE_PROOF_SCHEMA, overall: "fail", error: errorClass })}\n`,
+  );
   process.exitCode = 1;
 });

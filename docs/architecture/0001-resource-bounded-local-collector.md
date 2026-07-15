@@ -2,9 +2,9 @@
 
 ## Status
 
-Accepted
+Proposed — pending owner acceptance
 
-Accepted for incremental delivery under [Plimsoll issue #75](https://github.com/CryptoJym/plimsoll/issues/75). The target is accepted; individual migration gates remain incomplete until their linked issues merge and the integrated resource proof passes.
+This ADR records the implementation candidate under [Plimsoll issue #75](https://github.com/CryptoJym/plimsoll/issues/75). James has not explicitly accepted this exact architecture, so agents must preserve `proposed` status until he makes that decision. Individual migration gates also remain incomplete until their linked issues merge and the integrated resource proof passes.
 
 ## Date
 
@@ -12,7 +12,7 @@ Accepted for incremental delivery under [Plimsoll issue #75](https://github.com/
 
 ## Decision owners
 
-James is the product and release decision-maker. Contributors may implement and verify the target in independently reviewable lanes, but they do not deploy, activate the installed LaunchAgent, mutate the live ledger, or close owner decisions.
+James is the product, architecture, and release decision-maker. Contributors may propose, implement reversible foundations, and verify the target in independently reviewable lanes, but they do not accept the ADR for him, deploy, activate the installed LaunchAgent, mutate the live ledger, or close owner decisions.
 
 ## Context
 
@@ -39,7 +39,7 @@ These are scaling-shape failures, not a reason to distribute the system. The exp
 2. Sanitize first, then admit events through a documented value predicate and deterministic dedupe key.
 3. Preserve useful local evidence for the configured retention window.
 4. Maintain exact, incremental projections for status, health, sessions, repositories, accounts, cost, and upload work.
-5. Deliver accepted events through a durable outbox with bounded retries and deterministic poison quarantine.
+5. Copy each accepted event's bounded, sanitized delivery envelope into a durable outbox with bounded retries and deterministic poison quarantine.
 6. Serve a coherent loopback dashboard snapshot without scanning raw history or the session filesystem on refresh.
 7. Expose freshness, drops, backlog pressure, dead letters, and degraded states honestly.
 8. Recover after crash or file rotation without event loss or duplicate accounting.
@@ -49,7 +49,7 @@ These are scaling-shape failures, not a reason to distribute the system. The exp
 - **Privacy:** metadata mode persists and transmits no prompt, response, tool arguments, absolute paths, repository URLs, emails, tokens, or credentials. Hashes and explicitly approved linkage fields retain their existing boundary.
 - **Resource use:** unchanged inputs cause zero raw-event writes, zero full-history file reads, and zero overlapping maintenance jobs. Dashboard work scales with projection size, not raw-ledger size.
 - **Reliability:** exactly one collector owns a configured port/ledger. Upload failure does not block capture, dashboard reads, or later valid delivery.
-- **Durability:** offsets, projection watermarks, outbox state, and acknowledgements commit transactionally with the corresponding local change or replay safely through deterministic identifiers.
+- **Durability:** offsets, projection watermarks, sanitized outbox-envelope copies, and acknowledgements commit transactionally with the corresponding local change or replay safely through deterministic identifiers. Raw-evidence TTL is independent of delivery state.
 - **Operability:** every bounded queue or maintenance lane reports its watermark, backlog, work counters, last success, and explicit degraded reason.
 - **Compatibility:** existing local rows and configuration remain readable throughout an additive migration. No live-ledger rewrite is required for the first-value path.
 - **Testability:** release gates use temporary homes, databases, session trees, and loopback ports. Deterministic work counters are primary; wall-clock observations are secondary.
@@ -77,7 +77,7 @@ hooks / OTLP / rollout tail / transcript tail
           |                   +------> coherent dashboard/status snapshot
           |
           v
- durable outbox -- retry/backoff --> hosted ingest acknowledgement
+ durable sanitized envelope-copy outbox -- retry/backoff --> hosted ingest acknowledgement
           |
           +--> dead letter (redacted deterministic reason)
 ```
@@ -89,7 +89,7 @@ SQLite remains the transaction boundary. Logical tables separate ownership:
 | Admission | sanitized value predicate, deterministic ID, bounded drop counters | write rejected payloads |
 | Raw ledger | retained privacy-safe evidence | act as a retry state machine or dashboard query engine |
 | Projections | incremental, exact read models and activity facts | parse raw content or trigger filesystem scans on read |
-| Outbox | immutable delivery envelope reference/copy, attempts, next-attempt, acknowledgement | rewrite raw evidence during retry |
+| Outbox | immutable, bounded copy of the sanitized delivery envelope; attempts, next-attempt, acknowledgement | depend on the raw row remaining after its TTL or rewrite raw evidence during retry |
 | Dead letter | one quarantined record plus bounded/redacted classification | retain provider response bodies, secrets, or raw content |
 | Scheduler | one in-flight job per named lane, dirty-work queues, backoff | launch overlapping interval work |
 
@@ -100,7 +100,7 @@ Each internal lane has its own state and error boundary:
 - Admission failures reject/count the single input; they do not stop the server.
 - Tailer failures retain the last committed byte offset and retry that file without replaying all history.
 - Projection failures mark projections stale and queue bounded repair; raw capture continues.
-- Upload failures advance retry state only. Deterministic poison is quarantined once; later valid outbox items remain eligible.
+- Upload failures advance retry state on the envelope copy only. Deterministic poison is quarantined once; later valid outbox items remain eligible.
 - Dashboard reads return the last coherent snapshot with freshness/degraded metadata; they never repair projections synchronously.
 - Scheduler lanes use an in-flight guard and coalesce triggers into one subsequent run.
 
@@ -112,9 +112,24 @@ For a newly admitted event, one SQLite transaction should:
 
 1. insert the raw evidence row if its deterministic ID is new;
 2. apply the projection delta or record a projection-repair watermark; and
-3. enqueue the outbox item when cloud delivery is configured.
+3. enqueue a bounded copy of the already-sanitized delivery envelope when cloud delivery is configured.
 
 Crash before commit changes nothing. Crash after commit leaves all three recoverable. Tail offsets advance only after every complete line represented by that offset has committed. Partial JSONL framing remains outside the committed offset until the line completes.
+
+### Outbox envelope-copy and retention semantics
+
+The outbox stores a copy, not a foreign-key-only reference to raw evidence. Its immutable delivery body is the exact event shape already accepted by the outbound ingest schema after the privacy gate, plus the existing bounded `suppressedFields` names and privacy-safe linkage fields. It does not contain collector credentials, provider response bodies, local labels/emails, raw paths, prompts, responses, or tool arguments. Each item also has a stable idempotency/event ID, creation time, attempt count, next-attempt time, acknowledgement time, and enumerated terminal reason.
+
+The delivery body has an explicit per-item byte ceiling below the upload batch limit. An oversized item is classified deterministically and never grows the retry queue unboundedly. Batch construction reads these copies and enforces both row and byte caps.
+
+Atomic enqueue means a configured cloud delivery cannot observe an event without a durable local outbox copy, and replay of the deterministic event ID cannot duplicate that copy. After commit, the raw evidence row and the outbox item have independent lifecycle policies:
+
+- raw evidence expires under the configured raw age/byte policy whether the delivery item is pending, acknowledged, or dead-lettered;
+- the sanitized envelope copy survives raw expiry until acknowledgement, deterministic quarantine, or the separately documented outbox age/byte policy applies;
+- acknowledgement deletes or tombstones the envelope copy without rewriting raw evidence; and
+- deterministic quarantine stores the stable item/event ID and a bounded redacted classification, never a provider response body.
+
+This bounded duplication is deliberate: it isolates upload availability from raw-retention truth. During migration, legacy unuploaded rows are copied into the outbox in bounded, idempotent batches before legacy retention protection is removed; status exposes the remaining migration watermark.
 
 Large pre-existing ledgers are migrated additively:
 
@@ -139,6 +154,7 @@ Large pre-existing ledgers are migrated additively:
 - Projection and outbox schemas add migration, reconciliation, and repair code.
 - Read models create temporary dual-path complexity until raw-query parity is proven.
 - A single process still shares an event loop; synchronous SQLite work must be bounded and scheduled away from request handling.
+- Pending delivery temporarily duplicates a bounded sanitized envelope until acknowledgement or quarantine.
 - Dead-letter and budget policies need operator-facing semantics; silent deletion is not acceptable.
 
 ### Neutral
@@ -177,7 +193,7 @@ Deferred. Worker processes could isolate synchronous database CPU, but they add 
 
 - Admission runs **after** existing privacy sanitization. Rejected-event telemetry is low-cardinality source/reason counts only; rejected payloads are never retained.
 - Projections operate on promoted, sanitized columns and approved hashes. They do not rehydrate raw request bodies.
-- Outbox rows carry only fields already allowed by the ingest schema. Credentials remain in the existing local config boundary and never enter the ledger, receipt, dead letter, or logs.
+- Outbox rows copy only explicitly allowlisted fields already accepted by the ingest schema, with per-item byte limits. Credentials remain in the existing local config boundary and never enter the ledger, receipt, dead letter, or logs.
 - Dead-letter reasons are enumerated classifications plus bounded identifiers. Provider response bodies and validation payloads are not stored verbatim.
 - Dashboard remains loopback-only and keeps the existing same-origin/custom-header protection for writes.
 - Resource-proof receipts contain counts, statuses, versions, and durations only. They omit absolute user paths, event payloads, account identifiers, and credentials.
@@ -193,7 +209,7 @@ Deferred. Worker processes could isolate synchronous database CPU, but they add 
 | Projection update fails | snapshot `stale`, repair backlog > 0 | retain raw evidence; bounded repair from watermark |
 | Transient upload failure | retryable backlog/next-attempt visible | bounded exponential backoff with jitter; capture continues |
 | Deterministic invalid upload | one dead letter with redacted reason | quarantine once and continue later valid items |
-| Outbox/raw byte budget exceeded | collector health degraded, exact pressure visible | preserve newest useful signal according to documented policy; never call it healthy or silently extend retention |
+| Outbox/raw byte budget exceeded | collector health degraded, exact pressure visible for each independent budget | apply each documented age/byte policy independently; never call it healthy, silently extend raw TTL, or retain a raw row merely because delivery is pending |
 | SQLite busy/corrupt | explicit local-storage failure | short transactions/busy timeout; stop writes on integrity failure and preserve the file for operator recovery |
 | Proof clock drifts past fixed fixture windows | deterministic-proof failure | inject a fixture clock; delivered by #82, never widen assertions until they pass by accident |
 
@@ -218,7 +234,7 @@ This order attacks the measured CPU/storage/restart drivers first while keeping 
 
 ## Review gate
 
-Architecture acceptance does not equal release completion. Integrated release requires the machine-readable resource receipt to report `gateReady: true`, no failed or unwired required scenarios, existing proof green with the deterministic-clock repair delivered in #82, collector build green, and a source-of-truth readback from merged `main`.
+Completing this proposal does not accept it or complete the release. Owner acceptance remains separate. Integrated release also requires the machine-readable resource receipt to report `gateReady: true`, no failed or unwired required scenarios, existing proof green with the deterministic-clock repair delivered in #82, collector build green, and a source-of-truth readback from merged `main`.
 
 ## References
 
