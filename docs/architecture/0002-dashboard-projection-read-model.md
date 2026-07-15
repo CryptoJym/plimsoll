@@ -58,6 +58,38 @@ segments, no more than 128 logical projection bytes per raw event, and no more
 than 32 bytes/event of actual SQLite file growth (including table and index
 pages). The measured fixture is materially below both bounds.
 
+The measured fixture produces 100 segments, 5.65 logical projection bytes per
+raw event, and 7.91 bytes/event of actual SQLite file growth.
+
+Active generic-span capture does not compress one event at a time. The raw
+transaction leaves its trigger-authored repair receipt durable and returns;
+maintenance drains at most 250 repairs, groups them by day, and coalesces each
+day into tail segments capped at 1,000 events. Publication stays on the prior
+coherent generation while any repair is pending. In the 5,000-row active
+fixture this produces five segments across 20 maintenance slices, with at most
+one segment write per slice and no garbage-collection work during intake.
+
+Compact corrections and deletes have a separate physical garbage-collection
+state machine. Each affected day has one fair-scheduled job with a revision,
+frozen processing revision, segment high-water mark, and durable cursor. A
+slice visits one whole segment and at most 1,000 items, then atomically rewrites
+or removes its payload, settles matching cancellations, and advances per-source
+scratch summaries. New segments and cancellations increment the day revision
+without moving the in-flight cursor; the frozen pass reaches its high-water
+before one restart. Garbage collection waits until compact mutation and repair
+admission queues drain, so a bulk delete does not repeatedly rescan unstable
+days. Snapshot publication remains blocked until the garbage-collection queue
+settles.
+
+Day/source count and min/max summaries are updated in the same transactions as
+segment insert, rewrite, deletion, and final garbage-collection settlement.
+Lifetime and source-latest bounds therefore use indexed summaries rather than
+decompressing history; a moving window may decode only the single day that
+straddles its cutoff. The 20,000-row delete fixture removes all 20 segments,
+payload items, cancellations, day jobs, and day/source summaries in 99 bounded
+maintenance slices. Freed SQLite pages appear on the freelist; file truncation
+is deliberately not promised without a separate vacuum policy.
+
 Session repair is also row-bounded, not merely session-bounded. Each
 session/window job persists a fact cursor, append high-water mark, restart
 revision, and normalized repo/branch/account/source/machine accumulators.
@@ -95,7 +127,7 @@ Tailers persist path-free activity aggregates. Snapshot/status health joins thos
 
 - Additive tables and migration temporarily increase database size.
 - Window expiry and historical corrections require explicit bounded repair state.
-- Compressed segments remain lifetime evidence after window expiry; rare cancellation rows are retained so later bounds and deletes stay exact.
+- Compressed segments remain lifetime evidence after window expiry. Correction/delete cancellations remain only until bounded garbage collection proves and atomically settles their physical removal.
 - Presentation is composed after reading the durable snapshot, so the ETag includes a small settings/activity version as well as projection generation.
 - Session drill-down identifiers become safe projection hashes rather than raw producer IDs.
 
@@ -128,6 +160,8 @@ Rejected. Distinct sessions/branches and dominant repo/account can change when o
 |---|---|
 | Projection delta fails | Raw capture commits; repair row and degraded reason persist. |
 | Raw row is deleted | The raw transaction persists a safe compact old-contribution receipt or a fact tombstone; bounded maintenance subtracts before publishing. |
+| Compact garbage collection crashes after payload rewrite | The enclosing SQLite transaction rolls back payload, receipts, summaries, and cursor together; the same frozen segment replays after reopen. |
+| Compact day changes during garbage collection | The frozen pass reaches its segment high-water, then restarts once against the newer revision; fair day scheduling prevents another day from starving. |
 | Giant session repair crashes | Durable cursor and normalized accumulators resume; the prior snapshot remains stale/coherent until atomic finalize. |
 | Legacy backfill crashes | Rowid cursor resumes; deterministic fact IDs make replay a no-op. |
 | Snapshot assembly fails | Prior generation remains; request reports stale/degraded and never runs a raw fallback. |

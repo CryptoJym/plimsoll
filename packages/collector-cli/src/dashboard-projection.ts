@@ -11,6 +11,7 @@ const INTERNAL_WINDOWS = [7, ...DASHBOARD_WINDOWS] as const;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const BACKFILL_ROWS = 1_000;
 const REPAIR_ROWS = 250;
+const COMPACT_GC_ITEMS = 1_000;
 const SESSION_REPAIR_ROWS = 1_000;
 const SESSION_REPAIR_BUDGET_MS = 50;
 const CANONICAL_SHA256 = /^sha256:[0-9a-f]{64}$/;
@@ -104,6 +105,15 @@ type ProjectionControl = {
   dirtySessionBacklog: number;
   accountInvalidationBacklog: number;
   compactMutationBacklog: number;
+  compactGcBacklog: number;
+  compactGcSchedule: number;
+  compactSegmentsWritten: number;
+  compactGcItemsVisited: number;
+  compactGcItemsRemoved: number;
+  compactGcSegmentsRewritten: number;
+  compactGcSegmentsDeleted: number;
+  compactGcDaysCompleted: number;
+  compactGcRestarts: number;
 };
 
 export type ProjectionMaintenanceReceipt = {
@@ -114,10 +124,18 @@ export type ProjectionMaintenanceReceipt = {
   sessionRepairRowsVisited: number;
   metricRowsVisited: number;
   expiryFacts: number;
+  compactSegmentsWritten: number;
+  compactGcItemsVisited: number;
+  compactGcItemsRemoved: number;
+  compactGcSegmentsRewritten: number;
+  compactGcSegmentsDeleted: number;
+  compactGcDaysCompleted: number;
+  compactGcRestarts: number;
+  compactGcDurationMs: number;
   snapshotBuilds: number;
   ready: boolean;
   degraded: boolean;
-  backlog: { repairs: number; compactMutations: number; dirtySessions: number; accountInvalidations: number; expiryWindows: number };
+  backlog: { repairs: number; compactMutations: number; compactGcDays: number; dirtySessions: number; accountInvalidations: number; expiryWindows: number };
 };
 
 export type CaptureActivityReceipt = {
@@ -273,6 +291,7 @@ function json<T>(value: string): T {
 
 export class DashboardProjectionStore {
   private failNextApply = false;
+  private failNextCompactGcAfterRewrite = false;
 
   constructor(
     private readonly db: Database.Database,
@@ -318,6 +337,15 @@ export class DashboardProjectionStore {
         dirty_session_backlog integer not null default 0,
         account_invalidation_backlog integer not null default 0,
         compact_mutation_backlog integer not null default 0,
+        compact_gc_backlog integer not null default 0,
+        compact_gc_schedule integer not null default 0,
+        compact_segments_written integer not null default 0,
+        compact_gc_items_visited integer not null default 0,
+        compact_gc_items_removed integer not null default 0,
+        compact_gc_segments_rewritten integer not null default 0,
+        compact_gc_segments_deleted integer not null default 0,
+        compact_gc_days_completed integer not null default 0,
+        compact_gc_restarts integer not null default 0,
         settings_version integer not null default 0
       );
       create table if not exists dashboard_window_control (
@@ -380,6 +408,8 @@ export class DashboardProjectionStore {
       );
       create index if not exists idx_dashboard_compact_expiry
         on dashboard_compact_segments (min_observed_at,max_observed_at,segment_id);
+      create index if not exists idx_dashboard_compact_day_segment
+        on dashboard_compact_segments (bucket_day,segment_id);
       create table if not exists dashboard_compact_mutations (
         raw_rowid integer primary key,
         observed_at text not null,
@@ -390,11 +420,47 @@ export class DashboardProjectionStore {
       );
       create table if not exists dashboard_compact_cancellations (
         raw_rowid integer not null,
+        bucket_day text not null,
         observed_at text not null,
         source text not null,
         event_type text not null,
         action_key text not null,
         primary key (raw_rowid,observed_at,source,event_type,action_key)
+      );
+      create table if not exists dashboard_compact_day_source (
+        bucket_day text not null,
+        source text not null,
+        event_count integer not null,
+        min_observed_at text not null,
+        max_observed_at text not null,
+        primary key (bucket_day,source)
+      );
+      create index if not exists idx_dashboard_compact_day_source_min
+        on dashboard_compact_day_source (min_observed_at,bucket_day,source);
+      create index if not exists idx_dashboard_compact_day_source_max
+        on dashboard_compact_day_source (max_observed_at desc,bucket_day,source);
+      create index if not exists idx_dashboard_compact_source_latest
+        on dashboard_compact_day_source (source,max_observed_at desc,bucket_day);
+      create table if not exists dashboard_compact_gc_days (
+        bucket_day text primary key,
+        revision integer not null default 1,
+        processing_revision integer not null default 0,
+        high_water_segment integer,
+        cursor_segment integer not null default 0,
+        last_schedule integer not null default 0,
+        queued_at text not null,
+        updated_at text not null
+      );
+      create index if not exists idx_dashboard_compact_gc_fair
+        on dashboard_compact_gc_days (last_schedule,queued_at,bucket_day);
+      create table if not exists dashboard_compact_gc_source_scratch (
+        bucket_day text not null,
+        processing_revision integer not null,
+        source text not null,
+        event_count integer not null,
+        min_observed_at text not null,
+        max_observed_at text not null,
+        primary key (bucket_day,processing_revision,source)
       );
       create table if not exists dashboard_dirty_sessions (
         days integer not null,
@@ -595,6 +661,7 @@ export class DashboardProjectionStore {
         truncated integer not null default 0
       );
     `);
+    this.ensureProjectionSchemaColumns();
     this.db.prepare(`insert or ignore into dashboard_lifetime_totals (singleton) values (1)`).run();
 
     this.db.prepare(
@@ -753,7 +820,63 @@ export class DashboardProjectionStore {
       after delete on dashboard_compact_mutations begin
         update dashboard_projection_control set compact_mutation_backlog=max(0,compact_mutation_backlog-1) where singleton=1;
       end;
+      create trigger if not exists trg_dashboard_compact_cancellation_gc_day
+      after insert on dashboard_compact_cancellations begin
+        insert into dashboard_compact_gc_days
+          (bucket_day,revision,processing_revision,high_water_segment,cursor_segment,
+           last_schedule,queued_at,updated_at)
+        values (new.bucket_day,1,0,null,0,0,strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+          strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        on conflict(bucket_day) do update set
+          revision=revision+1,updated_at=excluded.updated_at;
+      end;
+      create trigger if not exists trg_dashboard_compact_segment_during_gc
+      after insert on dashboard_compact_segments
+      when exists (select 1 from dashboard_compact_gc_days where bucket_day=new.bucket_day)
+      begin
+        update dashboard_compact_gc_days set revision=revision+1,
+          updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') where bucket_day=new.bucket_day;
+      end;
+      create trigger if not exists trg_dashboard_compact_gc_backlog_insert
+      after insert on dashboard_compact_gc_days begin
+        update dashboard_projection_control set compact_gc_backlog=compact_gc_backlog+1
+          where singleton=1;
+      end;
+      create trigger if not exists trg_dashboard_compact_gc_backlog_delete
+      after delete on dashboard_compact_gc_days begin
+        update dashboard_projection_control set compact_gc_backlog=max(0,compact_gc_backlog-1)
+          where singleton=1;
+      end;
     `);
+    this.db.prepare(
+      `update dashboard_projection_control set compact_gc_backlog=(select count(*) from dashboard_compact_gc_days)
+       where singleton=1`,
+    ).run();
+  }
+
+  private ensureProjectionSchemaColumns() {
+    const controlColumns=new Set((this.db.pragma("table_info(dashboard_projection_control)") as Array<{name:string}>).map((row)=>row.name));
+    for(const definition of [
+      "compact_gc_backlog integer not null default 0",
+      "compact_gc_schedule integer not null default 0",
+      "compact_segments_written integer not null default 0",
+      "compact_gc_items_visited integer not null default 0",
+      "compact_gc_items_removed integer not null default 0",
+      "compact_gc_segments_rewritten integer not null default 0",
+      "compact_gc_segments_deleted integer not null default 0",
+      "compact_gc_days_completed integer not null default 0",
+      "compact_gc_restarts integer not null default 0",
+    ]){
+      const name=definition.split(" ")[0]!;
+      if(!controlColumns.has(name))this.db.exec(`alter table dashboard_projection_control add column ${definition}`);
+    }
+    const cancellationColumns=new Set((this.db.pragma("table_info(dashboard_compact_cancellations)") as Array<{name:string}>).map((row)=>row.name));
+    if(!cancellationColumns.has("bucket_day")){
+      this.db.exec(`alter table dashboard_compact_cancellations add column bucket_day text`);
+      this.db.exec(`update dashboard_compact_cancellations set bucket_day=substr(observed_at,1,10) where bucket_day is null`);
+    }
+    this.db.exec(`create index if not exists idx_dashboard_compact_cancellation_day
+      on dashboard_compact_cancellations (bucket_day,raw_rowid)`);
   }
 
   private control(): ProjectionControl {
@@ -778,8 +901,17 @@ export class DashboardProjectionStore {
         metric_sample_count as metricSampleCount,
         repair_backlog as repairBacklog,
         dirty_session_backlog as dirtySessionBacklog,
-        account_invalidation_backlog as accountInvalidationBacklog
-        ,compact_mutation_backlog as compactMutationBacklog
+        account_invalidation_backlog as accountInvalidationBacklog,
+        compact_mutation_backlog as compactMutationBacklog,
+        compact_gc_backlog as compactGcBacklog,
+        compact_gc_schedule as compactGcSchedule,
+        compact_segments_written as compactSegmentsWritten,
+        compact_gc_items_visited as compactGcItemsVisited,
+        compact_gc_items_removed as compactGcItemsRemoved,
+        compact_gc_segments_rewritten as compactGcSegmentsRewritten,
+        compact_gc_segments_deleted as compactGcSegmentsDeleted,
+        compact_gc_days_completed as compactGcDaysCompleted,
+        compact_gc_restarts as compactGcRestarts
        from dashboard_projection_control where singleton = 1`,
     ).get() as ProjectionControl;
   }
@@ -835,6 +967,10 @@ export class DashboardProjectionStore {
         }
         const row = this.rawRow(rawRowid);
         if (!row) return;
+        // Generic active rows keep the trigger-authored durable repair receipt.
+        // Maintenance drains them as one day-grouped batch; capture never pays
+        // one gzip segment per event and the published generation stays stale.
+        if (compactable(row)) return;
         this.applyProjectionRows([row], now);
         this.db.prepare(`delete from dashboard_projection_repairs where raw_rowid = ?`).run(rawRowid);
       })();
@@ -857,6 +993,11 @@ export class DashboardProjectionStore {
   /** Test seam for the transaction/repair boundary; never enabled by production flow. */
   failNextApplyForProof() {
     this.failNextApply = true;
+  }
+
+  /** Test seam: the enclosing SQLite transaction must roll back both payload and receipts. */
+  failNextCompactGcAfterRewriteForProof() {
+    this.failNextCompactGcAfterRewrite = true;
   }
 
   private applyProjectionRows(rows: RawProjectionRow[], now: Date) {
@@ -901,11 +1042,31 @@ export class DashboardProjectionStore {
     const sourceLatest=new Map<string,string>();
     for(const item of items)if(!sourceLatest.has(item.source)||item.observedAt>sourceLatest.get(item.source)!)sourceLatest.set(item.source,item.observedAt);
     for(const [source,observedAt] of sourceLatest)this.touchSourceLatest(source,observedAt,false);
+    this.addCompactDaySummaries(items);
     const buckets = new Map<string,CompactProjectionItem[]>();
     for (const item of items){const bucket=day(item.observedAt),values=buckets.get(bucket)??[];values.push(item);buckets.set(bucket,values);}
     let segments=0;
     for (const [bucket, bucketItems] of buckets) {
-      for (let offset=0;offset<bucketItems.length;offset+=BACKFILL_ROWS) {
+      let offset=0;
+      const gcActive=this.db.prepare(`select 1 from dashboard_compact_gc_days where bucket_day=?`).get(bucket);
+      const tail=!gcActive?this.db.prepare(
+        `select segment_id as segmentId,event_count as eventCount,payload_gzip as payload
+         from dashboard_compact_segments where bucket_day=? order by segment_id desc limit 1`,
+      ).get(bucket) as {segmentId:number;eventCount:number;payload:Buffer}|undefined:undefined;
+      if(tail&&tail.eventCount<BACKFILL_ROWS){
+        const added=bucketItems.slice(0,BACKFILL_ROWS-tail.eventCount);
+        if(added.length){
+          const combined=[...decodeCompact(tail.payload),...added];
+          const observed=combined.map((item)=>item.observedAt).sort();
+          this.db.prepare(
+            `update dashboard_compact_segments set min_observed_at=?,max_observed_at=?,
+              event_count=?,payload_gzip=? where segment_id=?`,
+          ).run(observed[0],observed.at(-1),combined.length,encodeCompact(combined),tail.segmentId);
+          offset=added.length;
+          segments++;
+        }
+      }
+      for (;offset<bucketItems.length;offset+=BACKFILL_ROWS) {
         const chunk=bucketItems.slice(offset,offset+BACKFILL_ROWS);
         const observed=chunk.map((item)=>item.observedAt).sort();
         this.db.prepare(
@@ -919,8 +1080,32 @@ export class DashboardProjectionStore {
     this.db.prepare(
       `update dashboard_projection_control set dirty=1,
         projection_rows_visited=projection_rows_visited+?,
-        projection_rows_written=projection_rows_written+? where singleton=1`,
-    ).run(items.length,segments);
+        projection_rows_written=projection_rows_written+?,
+        compact_segments_written=compact_segments_written+? where singleton=1`,
+    ).run(items.length,segments,segments);
+  }
+
+  private addCompactDaySummaries(items:CompactProjectionItem[]) {
+    const groups=new Map<string,{bucketDay:string;source:string;count:number;min:string;max:string}>();
+    for(const item of items){
+      const bucketDay=day(item.observedAt),key=`${bucketDay}\u0000${item.source}`;
+      const current=groups.get(key);
+      if(current){
+        current.count++;
+        if(item.observedAt<current.min)current.min=item.observedAt;
+        if(item.observedAt>current.max)current.max=item.observedAt;
+      }else groups.set(key,{bucketDay,source:item.source,count:1,min:item.observedAt,max:item.observedAt});
+    }
+    const upsert=this.db.prepare(
+      `insert into dashboard_compact_day_source
+       (bucket_day,source,event_count,min_observed_at,max_observed_at)
+       values (@bucketDay,@source,@count,@min,@max)
+       on conflict(bucket_day,source) do update set
+        event_count=event_count+excluded.event_count,
+        min_observed_at=min(min_observed_at,excluded.min_observed_at),
+        max_observed_at=max(max_observed_at,excluded.max_observed_at)`,
+    );
+    for(const group of groups.values())upsert.run(group);
   }
 
   private applyCompactReference(item:CompactProjectionItem,sign:1|-1,
@@ -1558,77 +1743,228 @@ export class DashboardProjectionStore {
        from dashboard_compact_mutations order by queued_at,raw_rowid limit ?`,
     ).all(limit) as Array<Omit<CompactProjectionItem,"windowMask">>;
     if(!rows.length)return 0;
-    const bounds=this.db.prepare(
-      `select oldest_observed_at as oldest,newest_observed_at as newest
-       from dashboard_lifetime_totals where singleton=1`,
-    ).get() as {oldest:string|null;newest:string|null};
-    let refreshBounds=false;
-    const refreshSources=new Set<string>();
     const windows=this.compactWindowCutoffs();
-    const items=rows.map((row):CompactProjectionItem=>{
-      if(row.observedAt===bounds.oldest||row.observedAt===bounds.newest)refreshBounds=true;
-      const latest=this.db.prepare(`select last_event_at as lastEventAt from dashboard_source_lifetime where source=?`).get(row.source) as {lastEventAt:string|null}|undefined;
-      if(latest?.lastEventAt===row.observedAt)refreshSources.add(row.source);
-      return {...row,windowMask:this.compactMask(row.observedAt,windows)};
-    });
+    const items=rows.map((row):CompactProjectionItem=>({rawRowid:row.rawRowid,
+      observedAt:row.observedAt,
+      source:safeClassification(row.source,SAFE_SOURCES,"unknown"),
+      eventType:safeClassification(row.eventType,SAFE_EVENT_TYPES,"unknown"),
+      actionClass:safeClassification(row.actionClass,SAFE_ACTIONS,"other"),
+      windowMask:this.compactMask(row.observedAt,windows)}));
     this.applyCompactAggregates(items,-1);
     const reference=this.control();
     for(const item of items)this.applyCompactReference(item,-1,reference);
     const cancel=this.db.prepare(
       `insert or ignore into dashboard_compact_cancellations
-       (raw_rowid,observed_at,source,event_type,action_key) values (?,?,?,?,?)`,
+       (raw_rowid,bucket_day,observed_at,source,event_type,action_key) values (?,?,?,?,?,?)`,
     );
     const remove=this.db.prepare(`delete from dashboard_compact_mutations where raw_rowid=?`);
-    for(const item of items){cancel.run(item.rawRowid,item.observedAt,item.source,item.eventType,item.actionClass??"");remove.run(item.rawRowid);}
-    if(refreshBounds)this.refreshLifetimeBounds();
-    for(const source of refreshSources)this.refreshSourceLatest(source);
+    for(const item of items){
+      cancel.run(item.rawRowid,day(item.observedAt),item.observedAt,item.source,item.eventType,item.actionClass??"");
+      remove.run(item.rawRowid);
+    }
     this.db.prepare(`update dashboard_projection_control set dirty=1,
       projection_rows_visited=projection_rows_visited+?,projection_rows_written=projection_rows_written+?
       where singleton=1`).run(items.length,items.length);
     return items.length;
   }
 
-  private compactBoundary(direction:"oldest"|"newest"){
-    const ascending=direction==="oldest";
-    const column=ascending?"min_observed_at":"max_observed_at";
-    const order=ascending?"asc":"desc";
-    const cancelled=this.db.prepare(
-      `select 1 from dashboard_compact_cancellations where raw_rowid=? and observed_at=?
-        and source=? and event_type=? and action_key=?`,
-    );
-    let best:string|null=null;
-    const segments=this.db.prepare(
-      `select ${column} as boundary,payload_gzip as payload from dashboard_compact_segments
-       order by ${column} ${order},segment_id ${order}`,
-    ).iterate() as Iterable<{boundary:string;payload:Buffer}>;
-    for(const segment of segments){
-      if(best&&(ascending?segment.boundary>=best:segment.boundary<=best))break;
-      for(const item of decodeCompact(segment.payload)){
-        if(cancelled.get(item.rawRowid,item.observedAt,item.source,item.eventType,item.actionClass??""))continue;
-        if(best===null||(ascending?item.observedAt<best:item.observedAt>best))best=item.observedAt;
+  private runCompactGcSlice(now:Date){
+    const started=performance.now();
+    const empty={itemsVisited:0,itemsRemoved:0,segmentsRewritten:0,segmentsDeleted:0,
+      daysCompleted:0,restarts:0,durationMs:0};
+    const control=this.control();
+    let job=this.db.prepare(
+      `select bucket_day as bucketDay,revision,processing_revision as processingRevision,
+        high_water_segment as highWater,cursor_segment as cursorSegment,last_schedule as lastSchedule
+       from dashboard_compact_gc_days
+       order by last_schedule,queued_at,bucket_day limit 1`,
+    ).get() as {bucketDay:string;revision:number;processingRevision:number;
+      highWater:number|null;cursorSegment:number;lastSchedule:number}|undefined;
+    if(!job)return empty;
+    const schedule=control.compactGcSchedule+1;
+    this.db.prepare(`update dashboard_projection_control set compact_gc_schedule=? where singleton=1`).run(schedule);
+    this.db.prepare(
+      `update dashboard_compact_gc_days set last_schedule=?,updated_at=? where bucket_day=?`,
+    ).run(schedule,now.toISOString(),job.bucketDay);
+    if(job.processingRevision===0||job.highWater===null){
+      const high=(this.db.prepare(
+        `select coalesce(max(segment_id),0) as n from dashboard_compact_segments where bucket_day=?`,
+      ).get(job.bucketDay) as {n:number}).n;
+      this.db.prepare(`delete from dashboard_compact_gc_source_scratch where bucket_day=?`).run(job.bucketDay);
+      this.db.prepare(
+        `update dashboard_compact_gc_days set processing_revision=revision,
+          high_water_segment=?,cursor_segment=0,updated_at=? where bucket_day=?`,
+      ).run(high,now.toISOString(),job.bucketDay);
+      job=this.db.prepare(
+        `select bucket_day as bucketDay,revision,processing_revision as processingRevision,
+          high_water_segment as highWater,cursor_segment as cursorSegment,last_schedule as lastSchedule
+         from dashboard_compact_gc_days where bucket_day=?`,
+      ).get(job.bucketDay) as typeof job;
+    }
+    if(!job)return empty;
+    let itemsVisited=0,itemsRemoved=0,segmentsRewritten=0,segmentsDeleted=0;
+    const segment=this.db.prepare(
+      `select segment_id as segmentId,payload_gzip as payload
+       from dashboard_compact_segments where bucket_day=? and segment_id>? and segment_id<=?
+       order by segment_id limit 1`,
+    ).get(job.bucketDay,job.cursorSegment,job.highWater??0) as {segmentId:number;payload:Buffer}|undefined;
+    let cursor=job.cursorSegment;
+    if(segment){
+      const items=decodeCompact(segment.payload);
+      if(items.length>COMPACT_GC_ITEMS)throw new Error("compact_gc_segment_exceeds_item_bound");
+      const cancelled=this.db.prepare(
+        `select 1 from dashboard_compact_cancellations where raw_rowid=? and observed_at=?
+          and source=? and event_type=? and action_key=?`,
+      );
+      const kept:CompactProjectionItem[]=[];
+      const removed:CompactProjectionItem[]=[];
+      for(const item of items)(cancelled.get(item.rawRowid,item.observedAt,item.source,
+        item.eventType,item.actionClass??"")?removed:kept).push(item);
+      if(removed.length&&kept.length){
+        const observed=kept.map((item)=>item.observedAt).sort();
+        this.db.prepare(
+          `update dashboard_compact_segments set min_observed_at=?,max_observed_at=?,
+            event_count=?,payload_gzip=? where segment_id=?`,
+        ).run(observed[0],observed.at(-1),kept.length,encodeCompact(kept),segment.segmentId);
+        segmentsRewritten=1;
+      }else if(removed.length){
+        this.db.prepare(`delete from dashboard_compact_segments where segment_id=?`).run(segment.segmentId);
+        segmentsDeleted=1;
+      }
+      if(this.failNextCompactGcAfterRewrite&&removed.length){
+        this.failNextCompactGcAfterRewrite=false;
+        throw new Error("injected_compact_gc_failure");
+      }
+      const scratch=new Map<string,{source:string;count:number;min:string;max:string}>();
+      for(const item of kept){
+        const value=scratch.get(item.source);
+        if(value){
+          value.count++;
+          if(item.observedAt<value.min)value.min=item.observedAt;
+          if(item.observedAt>value.max)value.max=item.observedAt;
+        }else scratch.set(item.source,{source:item.source,count:1,min:item.observedAt,max:item.observedAt});
+      }
+      const upsertScratch=this.db.prepare(
+        `insert into dashboard_compact_gc_source_scratch
+         (bucket_day,processing_revision,source,event_count,min_observed_at,max_observed_at)
+         values (@bucketDay,@processingRevision,@source,@count,@min,@max)
+         on conflict(bucket_day,processing_revision,source) do update set
+          event_count=event_count+excluded.event_count,
+          min_observed_at=min(min_observed_at,excluded.min_observed_at),
+          max_observed_at=max(max_observed_at,excluded.max_observed_at)`,
+      );
+      for(const value of scratch.values())upsertScratch.run({bucketDay:job.bucketDay,
+        processingRevision:job.processingRevision,...value});
+      const settleCancellation=this.db.prepare(
+        `delete from dashboard_compact_cancellations where raw_rowid=? and observed_at=?
+          and source=? and event_type=? and action_key=?`,
+      );
+      for(const item of removed)settleCancellation.run(item.rawRowid,item.observedAt,item.source,
+        item.eventType,item.actionClass??"");
+      cursor=segment.segmentId;
+      this.db.prepare(
+        `update dashboard_compact_gc_days set cursor_segment=?,updated_at=? where bucket_day=?`,
+      ).run(cursor,now.toISOString(),job.bucketDay);
+      itemsVisited=items.length;
+      itemsRemoved=removed.length;
+    }
+    const next=this.db.prepare(
+      `select 1 from dashboard_compact_segments where bucket_day=? and segment_id>? and segment_id<=? limit 1`,
+    ).get(job.bucketDay,cursor,job.highWater??0);
+    let daysCompleted=0,restarts=0;
+    if(!next){
+      const latest=this.db.prepare(
+        `select revision,processing_revision as processingRevision from dashboard_compact_gc_days
+         where bucket_day=?`,
+      ).get(job.bucketDay) as {revision:number;processingRevision:number};
+      if(latest.revision!==latest.processingRevision){
+        this.db.prepare(
+          `update dashboard_compact_gc_days set processing_revision=0,high_water_segment=null,
+            cursor_segment=0,updated_at=? where bucket_day=?`,
+        ).run(now.toISOString(),job.bucketDay);
+        restarts=1;
+      }else{
+        const affectedSources=new Set<string>();
+        for(const row of this.db.prepare(
+          `select source from dashboard_compact_day_source where bucket_day=?
+           union select source from dashboard_compact_gc_source_scratch
+            where bucket_day=? and processing_revision=?`,
+        ).all(job.bucketDay,job.bucketDay,job.processingRevision) as Array<{source:string}>)affectedSources.add(row.source);
+        this.db.prepare(`delete from dashboard_compact_day_source where bucket_day=?`).run(job.bucketDay);
+        this.db.prepare(
+          `insert into dashboard_compact_day_source
+           (bucket_day,source,event_count,min_observed_at,max_observed_at)
+           select bucket_day,source,event_count,min_observed_at,max_observed_at
+           from dashboard_compact_gc_source_scratch
+           where bucket_day=? and processing_revision=? and event_count>0`,
+        ).run(job.bucketDay,job.processingRevision);
+        // A complete fixed-high-water scan proves unmatched receipts absent.
+        this.db.prepare(`delete from dashboard_compact_cancellations where bucket_day=?`).run(job.bucketDay);
+        this.db.prepare(`delete from dashboard_compact_gc_source_scratch where bucket_day=?`).run(job.bucketDay);
+        this.db.prepare(`delete from dashboard_compact_gc_days where bucket_day=?`).run(job.bucketDay);
+        this.refreshLifetimeBounds();
+        for(const source of affectedSources)this.refreshSourceLatest(source);
+        daysCompleted=1;
       }
     }
-    return best;
+    const durationMs=performance.now()-started;
+    this.db.prepare(
+      `update dashboard_projection_control set
+        compact_gc_items_visited=compact_gc_items_visited+?,
+        compact_gc_items_removed=compact_gc_items_removed+?,
+        compact_gc_segments_rewritten=compact_gc_segments_rewritten+?,
+        compact_gc_segments_deleted=compact_gc_segments_deleted+?,
+        compact_gc_days_completed=compact_gc_days_completed+?,
+        compact_gc_restarts=compact_gc_restarts+? where singleton=1`,
+    ).run(itemsVisited,itemsRemoved,segmentsRewritten,segmentsDeleted,daysCompleted,restarts);
+    return {itemsVisited,itemsRemoved,segmentsRewritten,segmentsDeleted,daysCompleted,restarts,
+      durationMs:Number(durationMs.toFixed(3))};
+  }
+
+  private compactBoundary(direction:"oldest"|"newest"){
+    const column=direction==="oldest"?"min_observed_at":"max_observed_at";
+    const order=direction==="oldest"?"asc":"desc";
+    const row=this.db.prepare(
+      `select ${column} as boundary from dashboard_compact_day_source
+       where event_count>0 order by ${column} ${order},bucket_day ${order},source ${order} limit 1`,
+    ).get() as {boundary:string}|undefined;
+    return row?.boundary??null;
   }
 
   private compactWindowBoundary(days:number,cutoff:string,direction:"oldest"|"newest"){
-    const ascending=direction==="oldest",column=ascending?"min_observed_at":"max_observed_at",order=ascending?"asc":"desc";
     const bit=INTERNAL_WINDOWS.indexOf(days as typeof INTERNAL_WINDOWS[number]);
     if(bit<0)return null;
+    if(direction==="newest"){
+      const row=this.db.prepare(
+        `select max_observed_at as boundary from dashboard_compact_day_source
+         where event_count>0 and max_observed_at>=?
+         order by max_observed_at desc,bucket_day desc,source limit 1`,
+      ).get(cutoff) as {boundary:string}|undefined;
+      return row?.boundary??null;
+    }
+    const candidate=this.db.prepare(
+      `select bucket_day as bucketDay,min(min_observed_at) as boundary
+       from dashboard_compact_day_source where event_count>0 and max_observed_at>=?
+       group by bucket_day order by bucket_day limit 1`,
+    ).get(cutoff) as {bucketDay:string;boundary:string}|undefined;
+    if(!candidate)return null;
+    if(candidate.bucketDay>day(cutoff))return candidate.boundary;
+    // Only the straddling cutoff day needs item-level precision. All later
+    // days are answered by the compact day/source summary indexes above.
     const cancelled=this.db.prepare(
       `select 1 from dashboard_compact_cancellations where raw_rowid=? and observed_at=?
         and source=? and event_type=? and action_key=?`,
     );
     let best:string|null=null;
     const segments=this.db.prepare(
-      `select ${column} as boundary,payload_gzip as payload from dashboard_compact_segments
-       where max_observed_at>=? order by ${column} ${order},segment_id ${order}`,
-    ).iterate(cutoff) as Iterable<{boundary:string;payload:Buffer}>;
+      `select min_observed_at as boundary,payload_gzip as payload from dashboard_compact_segments
+       where bucket_day=? and max_observed_at>=? order by min_observed_at,segment_id`,
+    ).iterate(candidate.bucketDay,cutoff) as Iterable<{boundary:string;payload:Buffer}>;
     for(const segment of segments){
-      if(best&&(ascending?segment.boundary>=best:segment.boundary<=best))break;
+      if(best&&segment.boundary>=best)break;
       for(const item of decodeCompact(segment.payload)){
         if(!(item.windowMask&(1<<bit))||item.observedAt<cutoff||cancelled.get(item.rawRowid,item.observedAt,item.source,item.eventType,item.actionClass??""))continue;
-        if(best===null||(ascending?item.observedAt<best:item.observedAt>best))best=item.observedAt;
+        if(best===null||item.observedAt<best)best=item.observedAt;
       }
     }
     return best;
@@ -1646,22 +1982,11 @@ export class DashboardProjectionStore {
   }
 
   private compactSourceLatest(source:string){
-    const cancelled=this.db.prepare(
-      `select 1 from dashboard_compact_cancellations where raw_rowid=? and observed_at=?
-        and source=? and event_type=? and action_key=?`,
-    );
-    let best:string|null=null;
-    const segments=this.db.prepare(
-      `select max_observed_at as boundary,payload_gzip as payload from dashboard_compact_segments
-       order by max_observed_at desc,segment_id desc`,
-    ).iterate() as Iterable<{boundary:string;payload:Buffer}>;
-    for(const segment of segments){
-      if(best&&segment.boundary<=best)break;
-      for(const item of decodeCompact(segment.payload))if(item.source===source&&
-        !cancelled.get(item.rawRowid,item.observedAt,item.source,item.eventType,item.actionClass??"")&&
-        (best===null||item.observedAt>best))best=item.observedAt;
-    }
-    return best;
+    const row=this.db.prepare(
+      `select max_observed_at as boundary from dashboard_compact_day_source
+       where source=? and event_count>0 order by max_observed_at desc,bucket_day desc limit 1`,
+    ).get(source) as {boundary:string}|undefined;
+    return row?.boundary??null;
   }
 
   private refreshSourceLatest(source:string){
@@ -1700,7 +2025,10 @@ export class DashboardProjectionStore {
     let sessionRepairRowsVisited = 0;
     let metricRowsVisited = 0;
     let expiryFacts = 0;
-    const buildsBefore = this.control().snapshotBuilds;
+    let compactGc={itemsVisited:0,itemsRemoved:0,segmentsRewritten:0,segmentsDeleted:0,
+      daysCompleted:0,restarts:0,durationMs:0};
+    const countersBefore = this.control();
+    const buildsBefore = countersBefore.snapshotBuilds;
     this.db.transaction(() => {
       const current = this.control();
       if (current.backfillHighWater === null) {
@@ -1762,21 +2090,44 @@ export class DashboardProjectionStore {
 
       this.drainCompactMutations();
       const repairs = this.db.prepare(
-        `select raw_rowid as rawRowid from dashboard_projection_repairs order by raw_rowid limit ?`,
-      ).all(REPAIR_ROWS) as Array<{ rawRowid: number }>;
+        `select r.raw_rowid as repairRawRowid,r.reason,
+          b.rowid as rawRowid,b.id,b.source,b.event_type as eventType,b.observed_at as observedAt,
+          b.session_id as sessionId,b.action_class as actionClass,b.model,
+          b.input_tokens as inputTokens,b.output_tokens as outputTokens,
+          b.cache_read_tokens as cacheReadTokens,b.cache_creation_tokens as cacheCreationTokens,
+          b.cost_usd as costUsd,b.repo_hash as repoHash,b.branch_hash as branchHash,
+          b.head_sha as headSha,b.machine,b.account_hash as accountHash,
+          b.suppressed_fields_json as suppressedFieldsJson
+         from dashboard_projection_repairs r left join buffered_events b on b.rowid=r.raw_rowid
+         order by r.raw_rowid limit ?`,
+      ).all(REPAIR_ROWS) as Array<RawProjectionRow&{repairRawRowid:number;reason:string;id:string|null}>;
+      const rowsToApply:RawProjectionRow[]=[];
       for (const repair of repairs) {
-        const row = this.rawRow(repair.rawRowid);
-        if (row) this.applyProjectionRows([row], now);
-        else {
-          const stored=this.storedFactByRawRowid(repair.rawRowid);
+        if(repair.id!==null){
+          const row=repair as RawProjectionRow;
+          const compactNoOpUpdate=compactable(row)&&repair.reason==="raw_update"&&
+            !this.storedFact(sha256(`event:${row.id}`))&&
+            !this.db.prepare(`select 1 from dashboard_compact_cancellations where raw_rowid=?`).get(repair.repairRawRowid);
+          if(!compactNoOpUpdate)rowsToApply.push(row);
+        }else{
+          const stored=this.storedFactByRawRowid(repair.repairRawRowid);
           if(stored)this.removeStoredFact(stored,now);
         }
-        this.db.prepare(`delete from dashboard_projection_repairs where raw_rowid = ?`).run(repair.rawRowid);
       }
+      this.applyProjectionRows(rowsToApply,now);
+      const removeRepair=this.db.prepare(`delete from dashboard_projection_repairs where raw_rowid = ?`);
+      for(const repair of repairs)removeRepair.run(repair.repairRawRowid);
       repairRowsVisited = repairs.length;
       this.db.prepare(
         `update dashboard_projection_control set repair_facts=repair_facts+? where singleton=1`,
       ).run(repairs.length);
+      const preGc=this.control();
+      // Finish mutation/repair admission first. This freezes the useful GC
+      // revision once per burst instead of repeatedly rescanning a hot day
+      // while thousands of cancellation receipts are still arriving.
+      if(preGc.compactMutationBacklog===0&&preGc.repairBacklog===0){
+        compactGc=this.runCompactGcSlice(now);
+      }
       parityRowsVisited = backfillRowsVisited === 0 ? this.runParitySlice() : 0;
       this.drainAccountInvalidations(now);
       expiryFacts = this.advanceExpiry(now);
@@ -1799,7 +2150,7 @@ export class DashboardProjectionStore {
       const backlog = this.backlog();
       const settled = this.control();
       const complete = Boolean(settled.backfillComplete && settled.parityComplete&&settled.metricBackfillComplete);
-      if (complete && backlog.repairs === 0 && backlog.compactMutations===0 && backlog.dirtySessions === 0 &&
+      if (complete && backlog.repairs === 0 && backlog.compactMutations===0 && backlog.compactGcDays===0 && backlog.dirtySessions === 0 &&
         backlog.accountInvalidations === 0 && backlog.expiryWindows === 0 &&
         settled.degradedReason !== "projection_clock_rollback") {
         if (settled.dirty || !settled.ready) this.publishSnapshots(now);
@@ -1823,6 +2174,14 @@ export class DashboardProjectionStore {
       sessionRepairRowsVisited,
       metricRowsVisited,
       expiryFacts,
+      compactSegmentsWritten:control.compactSegmentsWritten-countersBefore.compactSegmentsWritten,
+      compactGcItemsVisited:compactGc.itemsVisited,
+      compactGcItemsRemoved:compactGc.itemsRemoved,
+      compactGcSegmentsRewritten:compactGc.segmentsRewritten,
+      compactGcSegmentsDeleted:compactGc.segmentsDeleted,
+      compactGcDaysCompleted:compactGc.daysCompleted,
+      compactGcRestarts:compactGc.restarts,
+      compactGcDurationMs:compactGc.durationMs,
       snapshotBuilds: control.snapshotBuilds - buildsBefore,
       ready: Boolean(control.ready),
       degraded: Boolean(control.degradedReason),
@@ -2018,6 +2377,7 @@ export class DashboardProjectionStore {
     return {
       repairs: control.repairBacklog,
       compactMutations:control.compactMutationBacklog,
+      compactGcDays:control.compactGcBacklog,
       dirtySessions:control.dirtySessionBacklog,
       accountInvalidations:control.accountInvalidationBacklog,
       expiryWindows: (this.db.prepare(`select count(*) as n from dashboard_window_control where target_cutoff_at is not null`).get() as {n:number}).n,
@@ -2028,7 +2388,7 @@ export class DashboardProjectionStore {
     const control = this.control();
     if (!control.backfillComplete||!control.metricBackfillComplete) return false;
     const backlog = this.backlog();
-    if (backlog.repairs || backlog.compactMutations||backlog.dirtySessions || backlog.accountInvalidations) return false;
+    if (backlog.repairs || backlog.compactMutations||backlog.compactGcDays||backlog.dirtySessions || backlog.accountInvalidations) return false;
     const generation = control.generation + 1;
     let rowsVisited = 0;
     for (const days of DASHBOARD_WINDOWS) {
@@ -2257,7 +2617,14 @@ export class DashboardProjectionStore {
       snapshotRowsVisited:c.snapshotRowsVisited,snapshotBuilds:c.snapshotBuilds,
       snapshotCacheHits:c.snapshotCacheHits,repairFacts:c.repairFacts,backfillFacts:c.backfillFacts,
       expiryFacts:c.expiryFacts,rawRowsScannedByDashboard:c.rawRowsScannedByDashboard,
-      filesystemEntriesScannedByDashboard:c.filesystemEntriesScannedByDashboard};
+      filesystemEntriesScannedByDashboard:c.filesystemEntriesScannedByDashboard,
+      compactSegmentsWritten:c.compactSegmentsWritten,
+      compactGcItemsVisited:c.compactGcItemsVisited,
+      compactGcItemsRemoved:c.compactGcItemsRemoved,
+      compactGcSegmentsRewritten:c.compactGcSegmentsRewritten,
+      compactGcSegmentsDeleted:c.compactGcSegmentsDeleted,
+      compactGcDaysCompleted:c.compactGcDaysCompleted,
+      compactGcRestarts:c.compactGcRestarts};
   }
 
   status() {

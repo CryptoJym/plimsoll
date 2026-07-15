@@ -298,6 +298,9 @@ async function main() {
       projectionTableText(buffer.database, "dashboard_snapshots"),
       projectionTableText(buffer.database, "dashboard_source_lifetime"),
       projectionTableText(buffer.database, "dashboard_projection_repairs"),
+      projectionTableText(buffer.database, "dashboard_compact_day_source"),
+      projectionTableText(buffer.database, "dashboard_compact_gc_days"),
+      projectionTableText(buffer.database, "dashboard_compact_gc_source_scratch"),
     ].join("\n");
     check("projection_facts_and_snapshots_are_privacy_safe",
       forbiddenColumns.length === 0 &&
@@ -568,6 +571,154 @@ async function main() {
         bytesPerRaw:Number((projectionBytes/100_000).toFixed(2)),
         fileDeltaBytesPerRaw:Number((compactFileDeltaBytes/100_000).toFixed(2)),slices:compactReceipts.length});
 
+    const activePath=path.join(root,"active-compact.sqlite");
+    const active=new LocalEventBuffer(activePath);
+    const activeAppendStarted=performance.now();
+    for(let index=0;index<5_000;index++)active.append(event({
+      source:"codex",eventType:"assistant_response",actionClass:"other",
+      observedAt:new Date(NOW.getTime()-DAY_MS+index).toISOString(),
+    }));
+    const activeAppendMs=performance.now()-activeAppendStarted;
+    const activeBefore=active.projection.status();
+    const activeSegmentsBefore=(active.database.prepare(
+      `select count(*) as n from dashboard_compact_segments`,
+    ).get() as {n:number}).n;
+    const activeStale=active.projection.readSnapshot(30);
+    check("active_compactable_append_defers_compression_to_durable_repair_batch",
+      activeBefore.backlog.repairs===5_000&&activeSegmentsBefore===0&&activeBefore.dirty&&
+      activeStale.kind==="ready"&&activeStale.snapshot.projection.status==="stale",
+      {appendRows:5_000,appendMs:Number(activeAppendMs.toFixed(2)),segmentsBefore:activeSegmentsBefore,
+        backlog:activeBefore.backlog});
+    const activeReceipts=settle(active,NOW,40);
+    const activeSegments=(active.database.prepare(
+      `select count(*) as n from dashboard_compact_segments`,
+    ).get() as {n:number}).n;
+    const activeProjected=readySnapshot(active,30);
+    check("active_5k_compactable_rows_use_repair_day_bounded_segments",
+      activeSegments<=25&&activeReceipts.every((receipt)=>receipt.repairRowsVisited<=250&&
+        receipt.compactSegmentsWritten<=1&&receipt.compactGcItemsVisited<=1_000)&&
+      Number((activeProjected.summary.totals as Record<string,number>).events)===5_000,
+      {rows:5_000,segments:activeSegments,slices:activeReceipts.length,
+        maxRepairRows:Math.max(0,...activeReceipts.map((receipt)=>receipt.repairRowsVisited)),
+        maxSegmentsWritten:Math.max(0,...activeReceipts.map((receipt)=>receipt.compactSegmentsWritten)),
+        maxGcItems:Math.max(0,...activeReceipts.map((receipt)=>receipt.compactGcItemsVisited))});
+    active.close();
+
+    const gcPath=path.join(root,"compact-gc.sqlite");
+    const gcSeed=new LocalEventBuffer(gcPath);
+    gcSeed.close();
+    const gcDb=new Database(gcPath);
+    dropProjectionState(gcDb);
+    const gcInsert=gcDb.prepare(
+      `insert into buffered_events
+       (id,source,event_type,data_mode,observed_at,payload_json,suppressed_fields_json,created_at,action_class)
+       values (?,?,?,?,?,?,?,?,?)`,
+    );
+    gcDb.transaction(()=>{
+      for(let index=0;index<20_000;index++){
+        const dayOffset=index<10_000?3:2;
+        gcInsert.run(`gc-${index}`,"codex","otel_span","metadata",
+          new Date(NOW.getTime()-dayOffset*DAY_MS+(index%10_000)).toISOString(),"{}","[]",
+          NOW.toISOString(),index%25===0?"read":null);
+      }
+    })();
+    gcDb.close();
+    let gc=new LocalEventBuffer(gcPath);
+    settle(gc,NOW,80);
+    gc.database.pragma("wal_checkpoint(TRUNCATE)");
+    const physicalBefore={
+      pages:Number(gc.database.pragma("page_count",{simple:true})),
+      freelist:Number(gc.database.pragma("freelist_count",{simple:true})),
+      fileBytes:fs.statSync(gcPath).size,
+      segments:(gc.database.prepare(`select count(*) as n from dashboard_compact_segments`).get() as {n:number}).n,
+    };
+
+    gc.database.prepare(`delete from buffered_events where rowid in (1,10001)`).run();
+    const segmentBeforeCrash=(gc.database.prepare(
+      `select payload_gzip as payload from dashboard_compact_segments order by segment_id limit 1`,
+    ).get() as {payload:Buffer}).payload;
+    gc.projection.failNextCompactGcAfterRewriteForProof();
+    assert.throws(()=>gc.projection.runMaintenance(NOW),/injected_compact_gc_failure/);
+    const segmentAfterCrash=(gc.database.prepare(
+      `select payload_gzip as payload from dashboard_compact_segments order by segment_id limit 1`,
+    ).get() as {payload:Buffer}).payload;
+    check("compact_gc_segment_rewrite_and_cancellation_settlement_are_atomic",
+      segmentBeforeCrash.equals(segmentAfterCrash)&&
+      (gc.database.prepare(`select count(*) as n from dashboard_compact_cancellations`).get() as {n:number}).n===0&&
+      (gc.database.prepare(`select count(*) as n from dashboard_compact_mutations`).get() as {n:number}).n===2,
+      {payloadBytes:segmentBeforeCrash.length});
+
+    const firstGc=gc.projection.runMaintenance(NOW);
+    const jobsAfterFirst=gc.database.prepare(
+      `select bucket_day as bucketDay,cursor_segment as cursorSegment,last_schedule as lastSchedule,
+        revision,processing_revision as processingRevision from dashboard_compact_gc_days
+       order by bucket_day`,
+    ).all() as Array<{bucketDay:string;cursorSegment:number;lastSchedule:number;revision:number;processingRevision:number}>;
+    const firstServed=jobsAfterFirst.find((job)=>job.cursorSegment>0);
+    assert.ok(firstServed);
+    const alreadyScannedRaw=(gc.database.prepare(
+      `select rowid as rawRowid from buffered_events where substr(observed_at,1,10)=?
+       order by rowid limit 1`,
+    ).get(firstServed.bucketDay) as {rawRowid:number}).rawRowid;
+    gc.database.prepare(`delete from buffered_events where rowid=?`).run(alreadyScannedRaw);
+    const secondGc=gc.projection.runMaintenance(NOW);
+    const jobsAfterSecond=gc.database.prepare(
+      `select bucket_day as bucketDay,cursor_segment as cursorSegment,last_schedule as lastSchedule,
+        revision,processing_revision as processingRevision from dashboard_compact_gc_days
+       order by bucket_day`,
+    ).all() as Array<{bucketDay:string;cursorSegment:number;lastSchedule:number;revision:number;processingRevision:number}>;
+    const otherDay=jobsAfterSecond.find((job)=>job.bucketDay!==firstServed.bucketDay);
+    const revisedDay=jobsAfterSecond.find((job)=>job.bucketDay===firstServed.bucketDay);
+    check("compact_gc_round_robin_and_frozen_revision_prevent_midpass_loss_or_starvation",
+      Boolean(otherDay&&otherDay.cursorSegment>0&&revisedDay&&
+        revisedDay.cursorSegment===firstServed.cursorSegment&&
+        revisedDay.revision>revisedDay.processingRevision&&
+        secondGc.compactGcItemsVisited<=1_000),
+      {first:jobsAfterFirst,second:jobsAfterSecond});
+    gc.close();
+    gc=new LocalEventBuffer(gcPath);
+    const reopenedJobs=(gc.database.prepare(
+      `select count(*) as n from dashboard_compact_gc_days where cursor_segment>0`,
+    ).get() as {n:number}).n;
+    gc.database.prepare(`delete from buffered_events`).run();
+    const queuedAfterBulkDelete={
+      mutations:(gc.database.prepare(`select count(*) as n from dashboard_compact_mutations`).get() as {n:number}).n,
+      repairs:(gc.database.prepare(`select count(*) as n from dashboard_projection_repairs`).get() as {n:number}).n,
+    };
+    const gcReceipts=settle(gc,NOW,260);
+    gc.database.pragma("wal_checkpoint(TRUNCATE)");
+    const physicalAfter={
+      pages:Number(gc.database.pragma("page_count",{simple:true})),
+      freelist:Number(gc.database.pragma("freelist_count",{simple:true})),
+      fileBytes:fs.statSync(gcPath).size,
+      segments:(gc.database.prepare(`select count(*) as n from dashboard_compact_segments`).get() as {n:number}).n,
+      payloadItems:(gc.database.prepare(`select coalesce(sum(event_count),0) as n from dashboard_compact_segments`).get() as {n:number}).n,
+      cancellations:(gc.database.prepare(`select count(*) as n from dashboard_compact_cancellations`).get() as {n:number}).n,
+      gcDays:(gc.database.prepare(`select count(*) as n from dashboard_compact_gc_days`).get() as {n:number}).n,
+      daySources:(gc.database.prepare(`select count(*) as n from dashboard_compact_day_source`).get() as {n:number}).n,
+    };
+    const gcSnapshot=readySnapshot(gc,30);
+    const gcBuildsBefore=gc.projection.workCounters().snapshotBuilds;
+    for(let request=0;request<25;request++)readySnapshot(gc,30);
+    const gcCounters=gc.projection.workCounters();
+    check("compact_gc_physically_removes_20k_deleted_history_in_bounded_restart_safe_slices",
+      reopenedJobs>0&&physicalAfter.segments===0&&physicalAfter.payloadItems===0&&
+      physicalAfter.cancellations===0&&physicalAfter.gcDays===0&&physicalAfter.daySources===0&&
+      physicalAfter.freelist>physicalBefore.freelist&&
+      Number((gcSnapshot.summary.totals as Record<string,number>).events)===0&&
+      gcReceipts.every((receipt)=>receipt.compactGcItemsVisited<=1_000&&
+        receipt.repairRowsVisited<=250)&&gcCounters.snapshotBuilds===gcBuildsBefore&&
+      gcCounters.rawRowsScannedByDashboard===0&&gcCounters.filesystemEntriesScannedByDashboard===0,
+      {rowsDeleted:20_000,before:physicalBefore,after:physicalAfter,slices:gcReceipts.length,
+        queuedAfterBulkDelete,
+        gc:{itemsVisited:gcReceipts.reduce((sum,row)=>sum+row.compactGcItemsVisited,0),
+          itemsRemoved:gcReceipts.reduce((sum,row)=>sum+row.compactGcItemsRemoved,0),
+          segmentsRewritten:gcReceipts.reduce((sum,row)=>sum+row.compactGcSegmentsRewritten,0),
+          segmentsDeleted:gcReceipts.reduce((sum,row)=>sum+row.compactGcSegmentsDeleted,0),
+          restarts:gc.projection.status().counters.compactGcRestarts},
+        sqliteFileTruncationPromised:false});
+    gc.close();
+
     compact.database.prepare(
       `update buffered_events set session_id=?,model=?,input_tokens=?,output_tokens=?,cost_usd=? where rowid=1`,
     ).run("compact-promoted-session","promoted-model",5,1,0.000001);
@@ -575,7 +726,7 @@ async function main() {
     const mutationBeforeCrash=compact.projection.status();
     compact.close();
     compact=new LocalEventBuffer(compactPath);
-    const compactMutationReceipts=settle(compact,NOW,30);
+    const compactMutationReceipts=settle(compact,NOW,260);
     const compactRaw=dashboardSummary(compact.database,30);
     const compactAfter=readySnapshot(compact,30);
     const compactProjectedTotals=compactAfter.summary.totals as Record<string,number>;
@@ -588,7 +739,8 @@ async function main() {
       compactProjectedTotals.outputTokens===compactRawTotals.outputTokens&&
       compactProjectedTotals.sessions===compactRawTotals.sessions&&
       Math.abs(compactProjectedTotals.costUsd-compactRawTotals.costUsd)<=1e-9&&
-      compactMutationReceipts.every((receipt)=>receipt.repairRowsVisited<=250),
+      compactMutationReceipts.every((receipt)=>receipt.repairRowsVisited<=250&&
+        receipt.compactGcItemsVisited<=1_000),
       {beforeCrash:mutationBeforeCrash.backlog,events:compactProjectedTotals.events,
         facts:(compact.database.prepare(`select count(*) as n from dashboard_event_facts`).get() as {n:number}).n});
     compact.database.prepare(`delete from buffered_events where rowid=1`).run();
@@ -753,6 +905,8 @@ async function main() {
       names: checks.map((entry) => entry.name),
       evidence:{
         compactStorage:checks.find((entry)=>entry.name==="generic_zero_value_spans_use_bounded_compressed_projection_storage")?.detail,
+        activeBatch:checks.find((entry)=>entry.name==="active_5k_compactable_rows_use_repair_day_bounded_segments")?.detail,
+        compactGc:checks.find((entry)=>entry.name==="compact_gc_physically_removes_20k_deleted_history_in_bounded_restart_safe_slices")?.detail,
         giantSession:checks.find((entry)=>entry.name==="giant_session_crash_resume_finalizes_exact_dominance_and_totals")?.detail,
         compactExpiry:checks.find((entry)=>entry.name==="compact_expiry_is_bounded_and_serves_prior_generation_until_complete")?.detail,
       },
