@@ -4,7 +4,7 @@ This document turns ADR-0001 into release evidence. The primary assertions are d
 
 ## Measurement contract
 
-Every integrated run uses a fresh temporary `HOME`, `PLIMSOLL_HOME`, SQLite database, synthetic session trees, and an operating-system-assigned loopback port held by a live reservation socket until explicit handoff/cleanup. A challenger bind must receive `EADDRINUSE` before the receipt calls the port held. Child processes receive a fixed minimal environment allowlist; copying and subtracting from `process.env` is forbidden. Sentinel fixtures must prove credential-like names and values do not cross that boundary. The run must not read or write the operator's collector directory, call a hosted provider, use credentials, or control the installed LaunchAgent.
+Every integrated run uses a fresh temporary `HOME`, `PLIMSOLL_HOME`, SQLite database, synthetic session trees, and an operating-system-assigned loopback port held by a live reservation socket until explicit handoff/cleanup. A challenger bind must receive `EADDRINUSE` before the receipt calls the port held. The duplicate-start scenario uses a second operating-system-assigned loopback port whose reservation is explicitly handed off immediately before the two real CLI candidates race; the harness reservation remains held independently. Child processes receive a fixed minimal environment allowlist; copying and subtracting from `process.env` is forbidden. Sentinel fixtures must prove credential-like names and values do not cross that boundary. The run must not read or write the operator's collector directory, call a hosted provider, use credentials, or control the installed LaunchAgent.
 
 The resource receipt has four scenario states:
 
@@ -81,8 +81,13 @@ Counters are per scenario and reset before each action phase. Production lanes m
 6. Review the receipt adversarially: no `not_wired`, no skipped required checks, no work-counter omission, and no wall-clock-only pass.
 7. Merge serially and re-run from current `main`. Deployment or LaunchAgent activation remains a separate owner-approved action.
 
-## Current scaffold boundary
+## Current partial-wiring boundary
 
-The initial issue #81 lane validates the proposed architecture artifact, creates an isolated temporary ledger and a held/challenged loopback reservation, proves a minimal child-environment allowlist against credential sentinels, and can invoke the existing signal-fidelity proof. It intentionally reports the integrated capture/projection/outbox, no-change, duplicate-start, poison-continuation, and dashboard-budget scenarios as `not_wired` until #76–#80 expose their instrumentation/test seams.
+The issue #81 harness validates the proposed architecture artifact, creates an isolated temporary ledger and a held/challenged loopback reservation, proves a minimal child-environment allowlist against credential sentinels, and can invoke the existing signal-fidelity proof. It now also executes two production paths:
+
+- **#77 no-change maintenance:** real rollout/transcript fixtures run through `LocalEventBuffer`, both incremental tailers, `CollectorMaintenance`, and `CoalescingMaintenanceScheduler`. One bounded first migration is allowed; a coalesced full run and a third unchanged run must both report zero file bytes/opens, raw-event mutations, repricing/enrichment visits, and overlap.
+- **#76 duplicate ownership:** two real Node 22 CLI processes race against one temporary home and port. Exactly one active owner and one successful `already_running` candidate must agree on the same versioned runtime identity; the PID record remains byte-identical until the real CLI stop path terminates only that owner.
+
+The integrated capture/projection/outbox, poison-continuation, dashboard-projection budget, and integrated metadata-privacy scenarios remain explicitly `not_wired` on #79/#80 integration. The receipt therefore remains `gateReady: false`, and `--require-integrated` remains a required non-zero result.
 
 The original `origin/main@9fc0af4` baseline failed `pnpm proof` because fixed May fixtures aged outside 30-day windows. #82 delivered the injected fixture clock on `origin/main@196d35f`; the rebased issue #81 lane now verifies the full proof green. This history remains documented because wall-clock-dependent fixtures are a release-gate failure mode, not a reason to weaken assertions.
