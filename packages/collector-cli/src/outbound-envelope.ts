@@ -1,10 +1,13 @@
 import {
   aiWorkIngestEventSchema,
   aiWorkSessionSyncRowSchema,
+  approvedAnalyticalScalarKind,
   canonicalSuppressionReceipt,
   canonicalizeSuppressionReceipts,
   hasSensitiveSuppressionConcept,
+  isApprovedAnalyticalScalarAttribute,
   isForbiddenRawContentFieldName,
+  isSensitiveMetadataSemanticKey,
   type AiInteractionEvent,
   type AiWorkIngestEvent,
   type AiWorkSessionSyncRow,
@@ -82,25 +85,6 @@ const CLASSIFICATION_STRING_KEYS = new Set([
 const VERSION_STRING_KEYS = new Set(["cliVersion", "serviceVersion"]);
 const TRACE_STRING_KEYS = new Set(["spanId", "traceId"]);
 
-const SAFE_BOOLEAN_KEYS = new Set([
-  "costEstimated",
-  "error",
-  "failed",
-  "otelExplicitAction",
-  "otelHasError",
-  "otelHasException",
-  "repoStitched",
-  "success",
-]);
-
-const SAFE_NUMBER_KEYS = new Set([
-  "duration_ms",
-  "event.sequence",
-  "http.response.status_code",
-  "otelStatusCode",
-  "turnIndex",
-]);
-
 const OMIT_LOCAL_ONLY_KEYS = new Set([
   "externalEventId",
   "external_event_id",
@@ -108,8 +92,6 @@ const OMIT_LOCAL_ONLY_KEYS = new Set([
   "rolloutFile",
   "transcriptFile",
 ]);
-
-const SENSITIVE_WORD = /^(?:access|api|args|argument|arguments|auth|authentication|authorization|bearer|body|command|content|cookie|cookies|credential|credentials|cwd|directory|dir|email|file|filename|folder|home|key|message|oauth|output|password|path|private|prompt|pwd|query|response|secret|signing|sql|ssh|stack|statement|token|tokens|uri|url|workdir|working|worktree)$/;
 
 type MetadataOutcome =
   | { ok: true; metadata: Record<string, unknown>; omittedFields: string[] }
@@ -127,50 +109,6 @@ export function canonicalLinkage(value: string | null | undefined) {
   if (!value) return null;
   const match = value.trim().match(CANONICAL_LINKAGE);
   return match ? `sha256:${match[1].toLowerCase()}` : null;
-}
-
-function keyWords(key: string) {
-  return key
-    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
-    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter(Boolean);
-}
-
-function safeInteger(value: unknown) {
-  const numeric =
-    typeof value === "number"
-      ? value
-      : typeof value === "string" && /^(?:0|[1-9][0-9]*)$/.test(value)
-        ? Number(value)
-        : Number.NaN;
-  return Number.isSafeInteger(numeric) && numeric >= 0;
-}
-
-function safeFiniteNumber(value: unknown) {
-  if (typeof value === "number") return Number.isFinite(value) && value >= 0;
-  return typeof value === "string" &&
-    /^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.test(value) &&
-    Number.isFinite(Number(value));
-}
-
-function safeBoolean(value: unknown) {
-  return typeof value === "boolean" || value === "true" || value === "false";
-}
-
-function safeNumericTokenCounter(key: string, value: unknown) {
-  const words = keyWords(key);
-  if (!safeInteger(value) || !words.some((word) => /^tokens?$/.test(word))) return false;
-  if (words.some((word) => SENSITIVE_WORD.test(word) && !/^(?:output|tokens?)$/.test(word))) {
-    return false;
-  }
-  const collapsed = words.join("");
-  return (
-    /(?:input|output)tokens?$/.test(collapsed) ||
-    /cache[a-z0-9]*tokens?$/.test(collapsed) ||
-    /reasoning[a-z0-9]*tokens?$/.test(collapsed)
-  );
 }
 
 /**
@@ -332,17 +270,8 @@ function sanitizeMetadata(input: Record<string, unknown>): MetadataOutcome {
       metadata[key] = value;
       continue;
     }
-    if (safeNumericTokenCounter(key, value)) {
-      metadata[key] = value;
-      continue;
-    }
-    if (SAFE_NUMBER_KEYS.has(key)) {
-      if (!safeFiniteNumber(value)) return { ok: false };
-      metadata[key] = value;
-      continue;
-    }
-    if (SAFE_BOOLEAN_KEYS.has(key)) {
-      if (!safeBoolean(value)) return { ok: false };
+    if (approvedAnalyticalScalarKind(key)) {
+      if (!isApprovedAnalyticalScalarAttribute(key, value)) return { ok: false };
       metadata[key] = value;
       continue;
     }
@@ -359,6 +288,10 @@ function sanitizeMetadata(input: Record<string, unknown>): MetadataOutcome {
       const safe = safeMetadataString(key, value);
       if (!safe) return { ok: false };
       metadata[key] = safe;
+      continue;
+    }
+    if (isSensitiveMetadataSemanticKey(key)) {
+      recordOmission(key);
       continue;
     }
     if (key === "otelSignalNames") {

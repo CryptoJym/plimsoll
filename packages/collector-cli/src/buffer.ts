@@ -133,6 +133,7 @@ export class LocalEventBuffer {
         sample_type text,
         value real not null,
         attrs_json text not null default '{}',
+        suppressed_fields_json text not null default '[]',
         created_at text not null
       );
       create table if not exists otlp_admission_counters (
@@ -295,6 +296,16 @@ export class LocalEventBuffer {
     );
     if (!labelColumns.has("email")) {
       this.db.exec(`alter table account_labels add column email text`);
+    }
+    const metricColumns = new Set(
+      (this.db.pragma("table_info(metric_samples)") as Array<{ name: string }>).map(
+        (column) => column.name,
+      ),
+    );
+    if (!metricColumns.has("suppressed_fields_json")) {
+      this.db.exec(
+        `alter table metric_samples add column suppressed_fields_json text not null default '[]'`,
+      );
     }
   }
 
@@ -556,12 +567,15 @@ export class LocalEventBuffer {
     this.db
       .prepare(
         `insert into metric_samples
-          (id, source, metric_name, observed_at, session_id, model, sample_type, value, attrs_json, created_at)
+          (id, source, metric_name, observed_at, session_id, model, sample_type, value, attrs_json,
+           suppressed_fields_json, created_at)
         values
-          (@id, @source, @metricName, @observedAt, @sessionId, @model, @sampleType, @value, @attrsJson, @createdAt)
+          (@id, @source, @metricName, @observedAt, @sessionId, @model, @sampleType, @value, @attrsJson,
+           @suppressedFieldsJson, @createdAt)
         on conflict(id) do update set source=excluded.source,metric_name=excluded.metric_name,
           observed_at=excluded.observed_at,session_id=excluded.session_id,model=excluded.model,
           sample_type=excluded.sample_type,value=excluded.value,attrs_json=excluded.attrs_json,
+          suppressed_fields_json=excluded.suppressed_fields_json,
           created_at=excluded.created_at`,
       )
       .run({
@@ -574,6 +588,9 @@ export class LocalEventBuffer {
         sampleType: sample.sampleType ?? null,
         value: sample.value,
         attrsJson: JSON.stringify(sample.attrs ?? {}),
+        suppressedFieldsJson: JSON.stringify(
+          canonicalizeSuppressionReceipts(sample.suppressedFields ?? []),
+        ),
         createdAt: new Date().toISOString(),
       });
   }

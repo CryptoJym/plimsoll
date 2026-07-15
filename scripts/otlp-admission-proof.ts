@@ -13,7 +13,13 @@ import type { AddressInfo } from "node:net";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
+import { metadataSafeOtlpAttributes } from "../packages/collector-cli/src/otlp";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
+import {
+  DEFAULT_POLICY,
+  GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
+  isCanonicalSuppressionReceipt,
+} from "../packages/shared/src/index";
 
 type Check = { name: string; passed: boolean; detail: string };
 const checks: Check[] = [];
@@ -218,6 +224,89 @@ const metricEnvelope = {
   ],
 };
 
+const HOSTILE_SCALAR_ENTRIES: Array<readonly [string, number | boolean]> = [
+  ["api_token", 94_001.5],
+  ["API-TOKEN2", true],
+  ["authorization", 94_002.5],
+  ["Authorization2", false],
+  ["cookie", 94_003.5],
+  ["cookie_2", true],
+  ["password", 94_004.5],
+  ["password.2", false],
+  ["secret", 94_005.5],
+  ["Secret2", true],
+  ["user.email", 94_006.5],
+  ["USER-EMAIL2", false],
+  ["file.path", 94_007.5],
+  ["filePath2", true],
+  ["analytics.count", 94_008.5],
+  ["analytics-count2", false],
+  ["apі_token", 94_009.5],
+  ["ａｐｉ_token", true],
+];
+
+const POSITIVE_SCALAR_ENTRIES: Array<readonly [string, string | number | boolean]> = [
+  ["gen_ai.usage.input_tokens", 401],
+  ["llm.usage.prompt_tokens", 402],
+  ["gen_ai.usage.cost_usd", 0.25],
+  ["duration_ms", 12.5],
+  ["http.response.status_code", 202],
+  ["success", true],
+];
+
+const scalarPrivacyLogEnvelope = {
+  resourceLogs: [
+    {
+      resource: { attributes: [attr("service.name", "claude-code")] },
+      scopeLogs: [
+        {
+          logRecords: [
+            {
+              timeUnixNano: "1781400012000000000",
+              attributes: [
+                attr("event.name", "scalar.privacy.log"),
+                attr("call_id", "scalar_privacy_log"),
+                ...POSITIVE_SCALAR_ENTRIES.map(([key, value]) => attr(key, value)),
+                ...HOSTILE_SCALAR_ENTRIES.map(([key, value]) => attr(key, value)),
+              ],
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
+const scalarPrivacyMetricEnvelope = {
+  resourceMetrics: [
+    {
+      resource: { attributes: [attr("service.name", "claude-code")] },
+      scopeMetrics: [
+        {
+          metrics: [
+            {
+              name: "scalar.privacy.metric",
+              gauge: {
+                dataPoints: [
+                  {
+                    timeUnixNano: "1781400013000000000",
+                    asDouble: 5.5,
+                    attributes: [
+                      attr("type", "input"),
+                      ...POSITIVE_SCALAR_ENTRIES.map(([key, value]) => attr(key, value)),
+                      ...HOSTILE_SCALAR_ENTRIES.map(([key, value]) => attr(key, value)),
+                    ],
+                  },
+                ],
+              },
+            },
+          ],
+        },
+      ],
+    },
+  ],
+};
+
 async function post(port: number, route: string, payload: unknown, source: string) {
   const response = await fetch(`http://127.0.0.1:${port}${route}`, {
     method: "POST",
@@ -236,6 +325,27 @@ async function main() {
   process.env.PLIMSOLL_HOME = tempHome;
   const ledgerPath = path.join(tempHome, "work-ledger.sqlite");
   let buffer: LocalEventBuffer | undefined;
+
+  const directInput = Object.fromEntries([
+    ...POSITIVE_SCALAR_ENTRIES,
+    ...HOSTILE_SCALAR_ENTRIES,
+  ]);
+  const direct = metadataSafeOtlpAttributes(directInput, DEFAULT_POLICY.dataMode);
+  check(
+    "key_first_scalar_classifier_direct_matrix",
+    POSITIVE_SCALAR_ENTRIES.every(([key, value]) => direct.attrs[key] === value) &&
+      HOSTILE_SCALAR_ENTRIES.every(([key]) => !(key in direct.attrs)) &&
+      direct.suppressedFields.length === 1 &&
+      direct.suppressedFields[0] === GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT &&
+      direct.suppressedFields.every(isCanonicalSuppressionReceipt),
+    {
+      positiveRetained: POSITIVE_SCALAR_ENTRIES.filter(
+        ([key, value]) => direct.attrs[key] === value,
+      ).length,
+      hostileOmitted: HOSTILE_SCALAR_ENTRIES.filter(([key]) => !(key in direct.attrs)).length,
+      receipts: direct.suppressedFields,
+    },
+  );
 
   try {
     buffer = new LocalEventBuffer(ledgerPath);
@@ -266,11 +376,92 @@ async function main() {
 
     const logs = await post(port, "/v1/logs", logEnvelope, "claude_code");
     const metrics = await post(port, "/v1/metrics", metricEnvelope, "claude_code");
+    const scalarLogs = await post(
+      port,
+      "/v1/logs",
+      scalarPrivacyLogEnvelope,
+      "claude_code",
+    );
+    const scalarMetrics = await post(
+      port,
+      "/v1/metrics",
+      scalarPrivacyMetricEnvelope,
+      "claude_code",
+    );
     check("existing_log_compatibility", logs.status === 202 && logs.body.events === 2, logs);
     check(
       "existing_metric_compatibility",
       metrics.status === 202 && metrics.body.metricSamples === 1,
       metrics,
+    );
+
+    const scalarLogRow = buffer
+      .list(200)
+      .find((row) => (row.payload.metadata as Record<string, unknown>).call_id === "scalar_privacy_log");
+    const scalarMetricRow = buffer.database
+      .prepare(
+        `select attrs_json as attrs, suppressed_fields_json as suppressed
+         from metric_samples where metric_name = ?`,
+      )
+      .get("scalar.privacy.metric") as { attrs: string; suppressed: string } | undefined;
+    const scalarLogMetadata = scalarLogRow?.payload.metadata as Record<string, unknown> | undefined;
+    const scalarMetricAttrs = JSON.parse(scalarMetricRow?.attrs ?? "{}") as Record<string, unknown>;
+    const scalarMetricReceipts = JSON.parse(scalarMetricRow?.suppressed ?? "[]") as string[];
+    const scalarLogResponseReceipts = Array.isArray(scalarLogs.body.suppressedFields)
+      ? (scalarLogs.body.suppressedFields as string[])
+      : [];
+    const scalarMetricResponseReceipts = Array.isArray(scalarMetrics.body.suppressedFields)
+      ? (scalarMetrics.body.suppressedFields as string[])
+      : [];
+    const positiveMetadataExact = (metadata: Record<string, unknown> | undefined) =>
+      Boolean(
+        metadata &&
+          POSITIVE_SCALAR_ENTRIES.every(([key, value]) => {
+            const expected = Number.isInteger(value as number) && typeof value === "number"
+              ? String(value)
+              : value;
+            return metadata[key] === expected;
+          }),
+      );
+    check(
+      "production_log_scalar_privacy_and_response_raw_parity",
+      scalarLogs.status === 202 &&
+        scalarLogs.body.events === 1 &&
+        scalarLogRow?.payload.inputTokens === 401 &&
+        scalarLogRow.payload.costUsd === 0.25 &&
+        positiveMetadataExact(scalarLogMetadata) &&
+        HOSTILE_SCALAR_ENTRIES.every(([key]) => !(key in (scalarLogMetadata ?? {}))) &&
+        JSON.stringify(scalarLogResponseReceipts) ===
+          JSON.stringify(scalarLogRow.suppressedFields) &&
+        scalarLogResponseReceipts.length === 1 &&
+        scalarLogResponseReceipts[0] === GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT &&
+        scalarLogResponseReceipts.every(isCanonicalSuppressionReceipt),
+      {
+        status: scalarLogs.status,
+        promotedInput: scalarLogRow?.payload.inputTokens,
+        promotedCost: scalarLogRow?.payload.costUsd,
+        hostileOmitted: HOSTILE_SCALAR_ENTRIES.filter(
+          ([key]) => !(key in (scalarLogMetadata ?? {})),
+        ).length,
+        parity: JSON.stringify(scalarLogResponseReceipts) ===
+          JSON.stringify(scalarLogRow?.suppressedFields ?? []),
+      },
+    );
+    check(
+      "production_metric_datapoint_scalar_privacy_receipts_and_promotion",
+      scalarMetrics.status === 202 &&
+        scalarMetrics.body.metricSamples === 1 &&
+        positiveMetadataExact(scalarMetricAttrs) &&
+        HOSTILE_SCALAR_ENTRIES.every(([key]) => !(key in scalarMetricAttrs)) &&
+        JSON.stringify(scalarMetricResponseReceipts) === JSON.stringify(scalarMetricReceipts) &&
+        scalarMetricReceipts.length === 1 &&
+        scalarMetricReceipts[0] === GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT &&
+        scalarMetricReceipts.every(isCanonicalSuppressionReceipt),
+      {
+        status: scalarMetrics.status,
+        hostileOmitted: HOSTILE_SCALAR_ENTRIES.filter(([key]) => !(key in scalarMetricAttrs)).length,
+        parity: JSON.stringify(scalarMetricResponseReceipts) === JSON.stringify(scalarMetricReceipts),
+      },
     );
 
     const rows = buffer.list(100);
@@ -395,7 +586,7 @@ async function main() {
 
     const persisted = JSON.stringify({
       events: buffer.database.prepare("select payload_json, suppressed_fields_json from buffered_events").all(),
-      metrics: buffer.database.prepare("select attrs_json from metric_samples").all(),
+      metrics: buffer.database.prepare("select attrs_json, suppressed_fields_json from metric_samples").all(),
     });
     check(
       "raw_content_privacy",
@@ -408,14 +599,9 @@ async function main() {
         exception?.id &&
           rows
             .find((row) => row.id === exception.id)
-            ?.suppressedFields.some((field) => field.includes("exception.message")) &&
+            ?.suppressedFields.includes(GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT) &&
           privacyRow &&
-          [
-            "attributes.http.request.body",
-            "attributes.http.response.body",
-            "attributes.db.statement",
-            "attributes.url.full",
-          ].every((field) => privacyRow.suppressedFields.includes(field)) &&
+          privacyRow.suppressedFields.includes(GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT) &&
           pathNameRow?.suppressedFields.includes("span.name") &&
           bodyOnlyLog?.suppressedFields.includes("body") &&
           !("otelEventName" in (bodyOnlyLog.payload.metadata as Record<string, unknown>)) &&
@@ -446,8 +632,37 @@ async function main() {
       status.otlpAdmission,
     );
 
+    const openArtifactCopies = [ledgerPath, `${ledgerPath}-wal`, `${ledgerPath}-shm`]
+      .filter((candidate) => fs.existsSync(candidate))
+      .map((candidate) => fs.readFileSync(candidate));
     await new Promise<void>((resolve) => server.close(() => resolve()));
     buffer.close();
+    const closedArtifacts = [
+      ...openArtifactCopies,
+      ...[ledgerPath, `${ledgerPath}-wal`, `${ledgerPath}-shm`]
+        .filter((candidate) => fs.existsSync(candidate))
+        .map((candidate) => fs.readFileSync(candidate)),
+    ];
+    // Boolean literals are intentionally not byte-scanned: `true`/`false`
+    // legitimately occur throughout SQLite control state. Their association
+    // is disproved by the key-absence and parsed-metadata assertions above.
+    const hostileTerms = HOSTILE_SCALAR_ENTRIES.flatMap(([key, value]) => [
+      key,
+      ...(typeof value === "number" ? [String(value)] : []),
+    ]);
+    check(
+      "scalar_hostile_keys_and_values_absent_from_open_copies_and_closed_ledger",
+      hostileTerms.every((term) =>
+        closedArtifacts.every((artifact) => !artifact.includes(Buffer.from(term))),
+      ),
+      {
+        artifacts: closedArtifacts.length,
+        privateTerms: hostileTerms.length,
+        leaks: hostileTerms.filter((term) =>
+          closedArtifacts.some((artifact) => artifact.includes(Buffer.from(term))),
+        ).length,
+      },
+    );
     buffer = new LocalEventBuffer(ledgerPath);
     check(
       "drop_counter_survives_restart",

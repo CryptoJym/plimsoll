@@ -1,3 +1,8 @@
+import {
+  hasPrivateMetadataKeyConcept,
+  isSensitiveMetadataSemanticKey,
+} from "./analytical-metadata";
+
 /**
  * Canonical privacy-safe suppression receipts shared by capture, durable
  * storage, and outbound sealing. Receipts contain field names only: values
@@ -25,29 +30,9 @@ export function isSafeSuppressionSourceKey(value: unknown): value is string {
   );
 }
 
-function keyWords(value: string) {
-  return value
-    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
-    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter(Boolean);
-}
-
 /** Credential-like names are themselves sensitive and never enter receipts. */
 export function hasSensitiveSuppressionConcept(value: string) {
-  const words = keyWords(value);
-  if (
-    words.some((word) =>
-      ["credential", "credentials", "secret", "secrets", "password", "token", "tokens"].includes(
-        word,
-      ),
-    )
-  ) {
-    return true;
-  }
-  const collapsed = words.join("");
-  return collapsed.includes("apikey") || collapsed.includes("privatekey");
+  return hasPrivateMetadataKeyConcept(value);
 }
 
 function isSafeReceipt(value: string) {
@@ -87,7 +72,8 @@ export function suppressionReceiptForAttributeKey(key: unknown) {
     key.length < 1 ||
     key.length > SUPPRESSION_ATTRIBUTE_KEY_MAX_LENGTH ||
     !SAFE_RECEIPT_CHARACTERS.test(key) ||
-    hasSensitiveSuppressionConcept(key)
+    hasSensitiveSuppressionConcept(key) ||
+    isSensitiveMetadataSemanticKey(key)
   ) {
     return GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT;
   }

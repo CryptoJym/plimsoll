@@ -4,6 +4,7 @@ import {
   DEFAULT_POLICY,
   aiInteractionEventSchema,
   sanitizeForPolicy,
+  usageFieldKeys,
   type ActionClass,
   type AiInteractionEvent,
   type PolicyConfig,
@@ -28,7 +29,7 @@ export function asRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
-export function stringField(record: Record<string, unknown>, keys: string[]) {
+export function stringField(record: Record<string, unknown>, keys: readonly string[]) {
   for (const key of keys) {
     const value = record[key];
     if (typeof value === "string" && value.trim()) {
@@ -39,7 +40,7 @@ export function stringField(record: Record<string, unknown>, keys: string[]) {
   return undefined;
 }
 
-export function numberField(record: Record<string, unknown>, keys: string[]) {
+export function numberField(record: Record<string, unknown>, keys: readonly string[]) {
   for (const key of keys) {
     const value = record[key];
     if (typeof value === "number" && Number.isFinite(value)) {
@@ -132,7 +133,7 @@ function extractOtelSignals(payload: Record<string, unknown>): OTelSignals {
   };
 }
 
-export function stringFromRecords(records: Record<string, unknown>[], keys: string[]) {
+export function stringFromRecords(records: Record<string, unknown>[], keys: readonly string[]) {
   for (const record of records) {
     const value = stringField(record, keys);
     if (value) return value;
@@ -141,7 +142,7 @@ export function stringFromRecords(records: Record<string, unknown>[], keys: stri
   return undefined;
 }
 
-export function numberFromRecords(records: Record<string, unknown>[], keys: string[]) {
+export function numberFromRecords(records: Record<string, unknown>[], keys: readonly string[]) {
   for (const record of records) {
     const value = numberField(record, keys);
     if (value !== undefined) return value;
@@ -196,78 +197,7 @@ export function inferSource(payload: Record<string, unknown>, fallback?: ToolSou
   return fallback ?? "unknown";
 }
 
-const SESSION_ID_KEYS = [
-  "sessionId",
-  "session_id",
-  "conversation.id",
-  "conversation_id",
-  "thread_id",
-  "session.id",
-  "gen_ai.session.id",
-];
-
-const MODEL_KEYS = ["model", "slug", "gen_ai.request.model", "gen_ai.response.model"];
-
-const INPUT_TOKEN_KEYS = [
-  "inputTokens",
-  "input_tokens",
-  "gen_ai.usage.input_tokens",
-  "llm.usage.prompt_tokens",
-];
-
-const OUTPUT_TOKEN_KEYS = [
-  "outputTokens",
-  "output_tokens",
-  "gen_ai.usage.output_tokens",
-  "llm.usage.completion_tokens",
-];
-
-const CACHE_READ_TOKEN_KEYS = [
-  "cacheReadTokens",
-  "cache_read_tokens",
-  "gen_ai.usage.cache_read_tokens",
-  "gen_ai.usage.cache_read.input_tokens",
-  "gen_ai.usage.cached_tokens",
-];
-
-const CACHE_CREATION_TOKEN_KEYS = [
-  "cacheCreationTokens",
-  "cache_creation_tokens",
-  "cache_creation_input_tokens",
-  "cache_creation.input_tokens",
-  "gen_ai.usage.cache_creation_input_tokens",
-  "gen_ai.usage.cache_creation.input_tokens",
-];
-
-const COST_KEYS = [
-  "costUsd",
-  "cost_usd",
-  "estimated_cost_usd",
-  "gen_ai.usage.cost_usd",
-  "plimsoll.estimated_cost_usd", "cfo_one.estimated_cost_usd",
-];
-
-const ACTOR_ID_KEYS = [
-  "actorId",
-  "actor_id",
-  "user.id",
-  "user.account_id",
-  "user.account_uuid",
-  "user_id",
-  "userId",
-  "user.email",
-];
-
-export const usageFieldKeys = {
-  actorId: ACTOR_ID_KEYS,
-  cacheReadTokens: CACHE_READ_TOKEN_KEYS,
-  cacheCreationTokens: CACHE_CREATION_TOKEN_KEYS,
-  costUsd: COST_KEYS,
-  inputTokens: INPUT_TOKEN_KEYS,
-  model: MODEL_KEYS,
-  outputTokens: OUTPUT_TOKEN_KEYS,
-  sessionId: SESSION_ID_KEYS,
-} as const;
+export { usageFieldKeys } from "../../shared/src/index";
 
 const TOOL_NAME_KEYS = ["tool_name", "toolName", "tool", "name"];
 
@@ -380,9 +310,9 @@ export function normalizeHookPayload(
 
   const event = aiInteractionEventSchema.parse({
     id: eventId,
-    sessionId: stringFromRecords(sourceRecords, SESSION_ID_KEYS),
+    sessionId: stringFromRecords(sourceRecords, usageFieldKeys.sessionId),
     tenantId: stringFromRecords(sourceRecords, ["tenantId", "tenant_id"]) ?? policy.tenantId,
-    actorId: stringFromRecords(sourceRecords, ACTOR_ID_KEYS),
+    actorId: stringFromRecords(sourceRecords, usageFieldKeys.actorId),
     source: inferSource(safe, options.source),
     dataMode: policy.dataMode,
     eventType,
@@ -390,16 +320,16 @@ export function normalizeHookPayload(
       stringField(safe, ["observedAt", "observed_at", "timestamp", "time"]) ??
       otelSignals.timestamps[0] ??
       new Date().toISOString(),
-    model: stringFromRecords(sourceRecords, MODEL_KEYS),
+    model: stringFromRecords(sourceRecords, usageFieldKeys.model),
     projectKey: stringFromRecords(sourceRecords, ["projectKey", "project_key", "project", "plimsoll.project", "cfo_one.project"]),
     customerKey: stringFromRecords(sourceRecords, ["customerKey", "customer_key", "customer", "plimsoll.customer", "cfo_one.customer"]),
     workflowKey: stringFromRecords(sourceRecords, ["workflowKey", "workflow_key", "workflow", "plimsoll.workflow", "cfo_one.workflow"]),
     actionClass: explicitActionClass ?? derived?.actionClass ?? "other",
-    inputTokens: numberFromRecords(sourceRecords, INPUT_TOKEN_KEYS),
-    outputTokens: numberFromRecords(sourceRecords, OUTPUT_TOKEN_KEYS),
-    cacheReadTokens: numberFromRecords(sourceRecords, CACHE_READ_TOKEN_KEYS),
-    cacheCreationTokens: numberFromRecords(sourceRecords, CACHE_CREATION_TOKEN_KEYS),
-    costUsd: numberFromRecords(sourceRecords, COST_KEYS),
+    inputTokens: numberFromRecords(sourceRecords, usageFieldKeys.inputTokens),
+    outputTokens: numberFromRecords(sourceRecords, usageFieldKeys.outputTokens),
+    cacheReadTokens: numberFromRecords(sourceRecords, usageFieldKeys.cacheReadTokens),
+    cacheCreationTokens: numberFromRecords(sourceRecords, usageFieldKeys.cacheCreationTokens),
+    costUsd: numberFromRecords(sourceRecords, usageFieldKeys.costUsd),
     metadata,
   });
 

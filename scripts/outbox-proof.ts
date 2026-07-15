@@ -1450,6 +1450,305 @@ async function policyResponseAndLegacyReadbackProof() {
   );
 }
 
+async function semanticScalarSpanParityProof() {
+  const file = ledger();
+  const cfg = config();
+  const otelAttr = (key: string, value: string | number | boolean) => {
+    if (typeof value === "number" && Number.isInteger(value)) {
+      return { key, value: { intValue: String(value) } };
+    }
+    if (typeof value === "number") return { key, value: { doubleValue: value } };
+    if (typeof value === "boolean") return { key, value: { boolValue: value } };
+    return { key, value: { stringValue: value } };
+  };
+  const hostileEntries: Array<readonly [string, number | boolean]> = [
+    ["api_token", 94_101.5],
+    ["API-TOKEN2", true],
+    ["authorization", 94_102.5],
+    ["Authorization2", false],
+    ["cookie", 94_103.5],
+    ["cookie_2", true],
+    ["password", 94_104.5],
+    ["password.2", false],
+    ["secret", 94_105.5],
+    ["Secret2", true],
+    ["user.email", 94_106.5],
+    ["USER-EMAIL2", false],
+    ["file.path", 94_107.5],
+    ["filePath2", true],
+    ["analytics.count", 94_108.5],
+    ["analytics-count2", false],
+    ["apі_token", 94_109.5],
+    ["ａｐｉ_token", true],
+  ];
+  const positiveEntries: Array<readonly [string, string | number | boolean]> = [
+    ["gen_ai.usage.input_tokens", 501],
+    ["llm.usage.prompt_tokens", 502],
+    ["gen_ai.usage.output_tokens", 51],
+    ["llm.usage.completion_tokens", 52],
+    ["gen_ai.usage.cost_usd", 0.33],
+    ["duration_ms", 13.5],
+    ["http.response.status_code", 202],
+    ["success", true],
+  ];
+  const payload = {
+    resourceSpans: [
+      {
+        resource: {
+          attributes: [otelAttr("service.name", "codex_exec")],
+        },
+        scopeSpans: [
+          {
+            spans: [
+              {
+                name: "scalar.privacy.span",
+                traceId: "94".padStart(32, "0"),
+                spanId: "94".padStart(16, "0"),
+                startTimeUnixNano: "1781400014000000000",
+                attributes: [
+                  otelAttr("call_id", "scalar_privacy_span"),
+                  ...positiveEntries.map(([key, value]) => otelAttr(key, value)),
+                  ...hostileEntries.map(([key, value]) => otelAttr(key, value)),
+                ],
+              },
+            ],
+          },
+        ],
+      },
+    ],
+  };
+
+  let buffer: LocalEventBuffer | undefined = new LocalEventBuffer(file, {
+    delivery: { enabled: true, limits: cfg.delivery },
+  });
+  let server: ReturnType<typeof createCollectorServer> | undefined;
+  let wire = "";
+  let openArtifactCopies: Buffer[] = [];
+  let capturedId = "";
+  try {
+    server = createCollectorServer(cfg, buffer);
+    const port = await listenLoopback(server);
+    const capture = await postJson(port, "/v1/traces", payload);
+    const responseReceipts = Array.isArray(capture.body.suppressedFields)
+      ? (capture.body.suppressedFields as string[])
+      : [];
+    const captured = buffer
+      .list(20)
+      .find(
+        (row) =>
+          (row.payload.metadata as Record<string, unknown>).call_id === "scalar_privacy_span",
+      );
+    capturedId = captured?.id ?? "";
+    const before = buffer.database
+      .prepare(
+        `select payload_json as payload, suppressed_fields_json as suppressed,
+           (select base_envelope_json from upload_outbox where delivery_id = buffered_events.id) as base
+         from buffered_events where id = ?`,
+      )
+      .get(capturedId) as { payload: string; suppressed: string; base: string } | undefined;
+    const listBefore = captured?.suppressedFields ?? [];
+    openArtifactCopies = [file, `${file}-wal`, `${file}-shm`]
+      .filter((candidate) => fs.existsSync(candidate))
+      .map((candidate) => fs.readFileSync(candidate));
+    await closeLoopback(server);
+    server = undefined;
+    buffer.close();
+    buffer = new LocalEventBuffer(file, {
+      delivery: { enabled: true, limits: cfg.delivery },
+    });
+    const reopened = buffer.list(20).find((row) => row.id === capturedId);
+    const uploaded = await uploadBufferedEvents(cfg, buffer, {
+      fetchImpl: async (_input, init) => {
+        wire = String(init?.body ?? "");
+        return response(200, { accepted: requestIds(init).length });
+      },
+      now: () => instant(2_990),
+    });
+    const witness = buffer.database
+      .prepare(`select envelope_json as envelope from upload_validation_witness where singleton = 1`)
+      .get() as { envelope: string } | undefined;
+    const expected = [GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT];
+    const envelopeReceipts = (serialized: string) =>
+      ((JSON.parse(serialized || "{}") as { suppressedFields?: string[] }).suppressedFields ?? []);
+    const wireEnvelope = (
+      JSON.parse(wire || "{}") as {
+        events?: Array<{ event?: { id?: string }; suppressedFields?: string[] }>;
+      }
+    ).events?.find((entry) => entry.event?.id === capturedId);
+    const receiptSets = [
+      responseReceipts,
+      JSON.parse(before?.suppressed ?? "[]") as string[],
+      listBefore,
+      envelopeReceipts(before?.base ?? "{}"),
+      reopened?.suppressedFields ?? [],
+      wireEnvelope?.suppressedFields ?? [],
+      envelopeReceipts(witness?.envelope ?? "{}"),
+    ];
+    const exactParity = receiptSets.every(
+      (receipts) => JSON.stringify(receipts) === JSON.stringify(expected),
+    );
+    record(
+      "production_span_response_raw_list_reopen_outbox_wire_witness_scalar_receipts_match",
+      capture.status === 202 &&
+        capture.body.events === 1 &&
+        uploaded.uploadedEvents === 1 &&
+        exactParity &&
+        receiptSets.flat().every(isCanonicalSuppressionReceipt),
+      {
+        status: capture.status,
+        uploaded: uploaded.uploadedEvents,
+        receiptSurfaces: receiptSets.length,
+        exactParity,
+        canonicalReceipts: expected.length,
+      },
+    );
+
+    const localEvent = reopened?.payload;
+    const localMetadata = localEvent?.metadata as Record<string, unknown> | undefined;
+    const wireEvent = wireEnvelope?.event as
+      | { inputTokens?: number; outputTokens?: number; costUsd?: number; metadata?: Record<string, unknown> }
+      | undefined;
+    const positiveMetadataExact = positiveEntries.every(([key, value]) => {
+      const expectedValue = typeof value === "number" && Number.isInteger(value)
+        ? String(value)
+        : value;
+      return localMetadata?.[key] === expectedValue && wireEvent?.metadata?.[key] === expectedValue;
+    });
+    record(
+      "production_span_positive_scalar_controls_promote_and_round_trip_exactly",
+      localEvent?.inputTokens === 501 &&
+        localEvent.outputTokens === 51 &&
+        localEvent.costUsd === 0.33 &&
+        wireEvent?.inputTokens === 501 &&
+        wireEvent.outputTokens === 51 &&
+        wireEvent.costUsd === 0.33 &&
+        positiveMetadataExact &&
+        hostileEntries.every(([key]) =>
+          !(key in (localMetadata ?? {})) && !(key in (wireEvent?.metadata ?? {})),
+        ),
+      {
+        promotedInput: localEvent?.inputTokens ?? null,
+        promotedOutput: localEvent?.outputTokens ?? null,
+        promotedCost: localEvent?.costUsd ?? null,
+        positiveMetadataExact,
+        hostileKeysOmitted: hostileEntries.filter(([key]) =>
+          !(key in (localMetadata ?? {})) && !(key in (wireEvent?.metadata ?? {})),
+        ).length,
+      },
+    );
+
+    buffer.close();
+    buffer = undefined;
+    const closedArtifacts = [
+      ...openArtifactCopies,
+      ...[file, `${file}-wal`, `${file}-shm`]
+        .filter((candidate) => fs.existsSync(candidate))
+        .map((candidate) => fs.readFileSync(candidate)),
+    ];
+    const privateTerms = hostileEntries.flatMap(([key, value]) => [
+      key,
+      ...(typeof value === "number" ? [String(value)] : []),
+    ]);
+    record(
+      "production_span_hostile_scalar_keys_and_numeric_values_absent_from_ledger_artifacts",
+      privateTerms.every((term) =>
+        closedArtifacts.every((artifact) => !artifact.includes(Buffer.from(term))),
+      ),
+      {
+        artifacts: closedArtifacts.length,
+        privateTerms: privateTerms.length,
+        leaks: privateTerms.filter((term) =>
+          closedArtifacts.some((artifact) => artifact.includes(Buffer.from(term))),
+        ).length,
+      },
+    );
+  } finally {
+    await closeLoopback(server);
+    buffer?.close();
+  }
+}
+
+function metricSuppressionMigrationProof() {
+  const file = ledger();
+  let buffer = new LocalEventBuffer(file);
+  buffer.database.exec(`alter table metric_samples drop column suppressed_fields_json`);
+  buffer.close();
+
+  buffer = new LocalEventBuffer(file);
+  const columns = new Set(
+    (
+      buffer.database.pragma("table_info(metric_samples)") as Array<{ name: string }>
+    ).map((column) => column.name),
+  );
+  const exploded = explodeOtlpPayload(
+    {
+      resourceMetrics: [
+        {
+          resource: {
+            attributes: [{ key: "service.name", value: { stringValue: "codex_exec" } }],
+          },
+          scopeMetrics: [
+            {
+              metrics: [
+                {
+                  name: "metric.migration.proof",
+                  gauge: {
+                    dataPoints: [
+                      {
+                        timeUnixNano: "1781400015000000000",
+                        asDouble: 7.5,
+                        attributes: [
+                          { key: "type", value: { stringValue: "input" } },
+                          { key: "api_token", value: { doubleValue: 94_201.5 } },
+                        ],
+                      },
+                    ],
+                  },
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+    { policy: DEFAULT_POLICY, source: "codex", transportPath: "/v1/metrics" },
+  );
+  buffer.appendMany(exploded.events, exploded.metricSamples, exploded.admissionDrops);
+  const before = buffer.database
+    .prepare(
+      `select attrs_json as attrs, suppressed_fields_json as suppressed
+       from metric_samples where metric_name = ?`,
+    )
+    .get("metric.migration.proof") as { attrs: string; suppressed: string } | undefined;
+  buffer.close();
+  buffer = new LocalEventBuffer(file);
+  const reopened = buffer.database
+    .prepare(
+      `select attrs_json as attrs, suppressed_fields_json as suppressed
+       from metric_samples where metric_name = ?`,
+    )
+    .get("metric.migration.proof") as { attrs: string; suppressed: string } | undefined;
+  buffer.close();
+  const expected = JSON.stringify([GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT]);
+  record(
+    "legacy_metric_schema_adds_canonical_suppression_receipts_and_reopens",
+    columns.has("suppressed_fields_json") &&
+      exploded.metricSamples.length === 1 &&
+      before?.suppressed === expected &&
+      reopened?.suppressed === expected &&
+      !String(before?.attrs ?? "").includes("api_token") &&
+      !String(before?.attrs ?? "").includes("94201.5") &&
+      before?.attrs === reopened?.attrs,
+    {
+      migratedColumn: columns.has("suppressed_fields_json"),
+      samples: exploded.metricSamples.length,
+      receiptParity: before?.suppressed === reopened?.suppressed,
+      hostileKeyAbsent: !String(before?.attrs ?? "").includes("api_token"),
+      hostileValueAbsent: !String(before?.attrs ?? "").includes("94201.5"),
+    },
+  );
+}
+
 function suppressionReceiptContractProof() {
   const prefix = "attributes.";
   const exactBoundaryKey = "b".repeat(SUPPRESSION_ATTRIBUTE_KEY_MAX_LENGTH);
@@ -1988,10 +2287,13 @@ async function hostilePrivacyAndLinkageProof() {
   const omissionsAudited = auditedOmissionFields.every((key) =>
     sent.events.some((entry) => entry.suppressedFields.includes(key)),
   );
+  const privateNamedLocalFields = new Set(["user.email", "auth_mode"]);
   const normalizedLocalFieldsOmitted = Object.keys(normalizedLocalSentinels).every((key) =>
     normalizedTypedSent !== undefined &&
       !(key in normalizedTypedSent.metadata) &&
-      normalizedTypedEnvelope?.suppressedFields.includes(key),
+      normalizedTypedEnvelope?.suppressedFields.includes(
+        privateNamedLocalFields.has(key) ? GENERIC_SUPPRESSION_RECEIPT : key,
+      ),
   );
   record(
     "normalized_sensitive_keys_and_noncanonical_linkage_never_enter_delivery_surfaces",
@@ -2012,9 +2314,12 @@ async function hostilePrivacyAndLinkageProof() {
       invalidSent?.outputTokens === 1 &&
       invalidSent?.metadata.cacheReadTokens === 3 &&
       invalidSent?.metadata.cache_creation_tokens === 4 &&
-      invalidSent?.metadata.cacheWhateverTokens === 5 &&
+      invalidSent !== undefined && !("cacheWhateverTokens" in invalidSent.metadata) &&
       invalidSent?.metadata["gen_ai.usage.output_tokens"] === 6 &&
-      invalidSent?.metadata.reasoningOutputTokens === 7 &&
+      !("reasoningOutputTokens" in invalidSent.metadata) &&
+      sent.events
+        .find((entry) => entry.event.id === invalidLinkageId)
+        ?.suppressedFields.includes(GENERIC_SUPPRESSION_RECEIPT) === true &&
       invalidSent?.metadata["gen_ai.usage.input_tokens"] === "8" &&
       metadataLinkageSent?.projectKey === lowerCanonical &&
       metadataGit?.remoteUrlHash === lowerCanonical &&
@@ -2102,7 +2407,13 @@ async function hostilePrivacyAndLinkageProof() {
     if (!sealed.ok) continue;
     syntheticAccepted += 1;
     if (sealed.envelope.event.metadata.originator === "local_shell_v1") syntheticNormalized += 1;
-    if (sealed.envelope.suppressedFields.includes(localKey)) syntheticAudited += 1;
+    if (
+      sealed.envelope.suppressedFields.includes(
+        privateNamedLocalFields.has(localKey) ? GENERIC_SUPPRESSION_RECEIPT : localKey,
+      )
+    ) {
+      syntheticAudited += 1;
+    }
     if (JSON.stringify(sealed.envelope).includes(localValue)) syntheticValueLeaks += 1;
   }
   const approvedFieldAdversarial = [
@@ -2395,6 +2706,8 @@ function pressureAgeByteOversizeAndStatusProof() {
 async function main() {
   try {
     await policyResponseAndLegacyReadbackProof();
+    await semanticScalarSpanParityProof();
+    metricSuppressionMigrationProof();
     suppressionReceiptContractProof();
     await suppressionReceiptProductionParityProof();
     await atomicAndDuplicateProof();

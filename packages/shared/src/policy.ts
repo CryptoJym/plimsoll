@@ -5,7 +5,6 @@ import {
   type DataMode,
   type PolicyConfig,
   findForbiddenRawContentFields,
-  isForbiddenRawContentFieldName,
   policyConfigSchema,
 } from "./schemas";
 import {
@@ -13,6 +12,7 @@ import {
   isSafeSuppressionSourceKey,
   suppressionReceiptForAttributeKey,
 } from "./suppression-receipt";
+import { isSensitiveMetadataSemanticKey } from "./analytical-metadata";
 
 export const DEFAULT_POLICY: PolicyConfig = policyConfigSchema.parse({
   id: "default-policy",
@@ -133,7 +133,7 @@ function sanitizeRoutineMetadata(
       suppressed.push(suppressionReceiptForAttributeKey(semanticKey));
       return REMOVE_FIELD;
     }
-    if (isForbiddenRawContentFieldName(semanticKey)) {
+    if (isSensitiveMetadataSemanticKey(semanticKey)) {
       suppressed.push(suppressionReceiptForAttributeKey(semanticKey));
       return REMOVE_FIELD;
     }
@@ -154,7 +154,7 @@ function sanitizeRoutineMetadata(
       suppressed.push(currentPath);
       continue;
     }
-    if (isForbiddenRawContentFieldName(key)) {
+    if (isSensitiveMetadataSemanticKey(key)) {
       suppressed.push(currentPath);
       continue;
     }

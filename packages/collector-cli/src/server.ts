@@ -4,10 +4,14 @@ import zlib from "node:zlib";
 
 import { LocalEventBuffer } from "./buffer";
 import type { CollectorConfig } from "./config";
-import type { ToolSource } from "../../shared/src/index";
+import {
+  canonicalizeSuppressionReceipts,
+  normalizeGitRemote,
+  remoteLinkageHash,
+  type ToolSource,
+} from "../../shared/src/index";
 import { appendForwardedHook } from "./forwarder";
 import { explodeOtlpPayload } from "./otlp";
-import { remoteLinkageHash, normalizeGitRemote } from "../../shared/src/index";
 import { saveCollectorConfig } from "./config";
 import { readLocalIdentities } from "./local-identity";
 import type { CollectorRuntimeIdentity } from "./runtime-ownership";
@@ -489,6 +493,10 @@ export function createCollectorServer(
                 parseFailures: exploded.parseFailures,
                 droppedEvents: exploded.droppedEventCount,
                 droppedByReason: exploded.admissionDrops,
+                suppressedFields: canonicalizeSuppressionReceipts([
+                  ...exploded.events.flatMap((entry) => entry.suppressedFields),
+                  ...exploded.metricSamples.flatMap((sample) => sample.suppressedFields),
+                ]),
               }),
             );
             return;

@@ -1,10 +1,14 @@
 import {
   DEFAULT_POLICY,
+  GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
+  approvedAnalyticalScalarKind,
   aiInteractionEventSchema,
   canonicalizeSuppressionReceipts,
   estimateCostUsd,
+  isApprovedAnalyticalScalarAttribute,
   sanitizeForPolicy,
   suppressionReceiptForAttributeKey,
+  usageFieldKeys,
   type ActionClass,
   type AiInteractionEvent,
   type PolicyConfig,
@@ -21,7 +25,6 @@ import {
   otelScalar,
   stringField,
   unixNanoToIso,
-  usageFieldKeys,
 } from "./normalizer";
 import {
   addOtlpAdmissionDrop,
@@ -39,6 +42,7 @@ export type MetricSample = {
   sampleType?: string;
   value: number;
   attrs: Record<string, unknown>;
+  suppressedFields: string[];
 };
 
 export type ExplodedOtlp = {
@@ -140,7 +144,7 @@ function workdirFromRawRecord(record: Record<string, unknown>): string | undefin
 
 const SAFE_STRING_ATTRIBUTE_KEYS = new Set(
   [
-    ...usageFieldKeys.actorId,
+    ...usageFieldKeys.actorId.filter((key) => key !== "user.email"),
     ...usageFieldKeys.cacheReadTokens,
     ...usageFieldKeys.cacheCreationTokens,
     ...usageFieldKeys.costUsd,
@@ -194,33 +198,6 @@ const SAFE_STRING_ATTRIBUTE_KEYS = new Set(
   ].map((key) => key.toLowerCase()),
 );
 
-const SENSITIVE_SEMANTIC_KEY_PARTS = new Set([
-  "args",
-  "arguments",
-  "body",
-  "command",
-  "content",
-  "cwd",
-  "directory",
-  "file",
-  "filepath",
-  "filename",
-  "fullpath",
-  "message",
-  "output",
-  "patch",
-  "path",
-  "prompt",
-  "query",
-  "sql",
-  "stack",
-  "stacktrace",
-  "statement",
-  "uri",
-  "url",
-  "workdir",
-]);
-
 function looksLikePathOrUrl(value: string) {
   const candidate = value.trim();
   return (
@@ -237,32 +214,27 @@ function boundedSignalName(value: unknown) {
     : undefined;
 }
 
-function isSensitiveSemanticKey(key: string) {
-  const parts = key.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-  return parts.some((part) => SENSITIVE_SEMANTIC_KEY_PARTS.has(part));
-}
-
-function isSafeAnalyticalAttribute(key: string, value: unknown) {
-  const allowlisted = SAFE_STRING_ATTRIBUTE_KEYS.has(key.toLowerCase());
-  if (isSensitiveSemanticKey(key) && !allowlisted) return false;
-  if (typeof value === "number") return Number.isFinite(value);
-  if (typeof value === "boolean") return true;
-  if (typeof value !== "string") return false;
-  return allowlisted && Boolean(boundedSignalName(value));
-}
-
-function metadataSafeOtlpAttributes(
+export function metadataSafeOtlpAttributes(
   attrs: Record<string, unknown>,
-  dataMode: PolicyConfig["dataMode"],
+  _dataMode: PolicyConfig["dataMode"],
 ) {
-  if (dataMode === "evidence") return { attrs, suppressedFields: [] as string[] };
   const safe: Record<string, unknown> = {};
   const suppressedFields: string[] = [];
   for (const [key, value] of Object.entries(attrs)) {
-    if (isSafeAnalyticalAttribute(key, value)) {
+    const scalarKind = approvedAnalyticalScalarKind(key);
+    const accepted = scalarKind
+      ? isApprovedAnalyticalScalarAttribute(key, value)
+      : typeof value === "string" &&
+        SAFE_STRING_ATTRIBUTE_KEYS.has(key.toLowerCase()) &&
+        Boolean(boundedSignalName(value));
+    if (accepted) {
       safe[key] = value;
     } else {
-      suppressedFields.push(suppressionReceiptForAttributeKey(key));
+      suppressedFields.push(
+        typeof value === "number" || typeof value === "boolean"
+          ? GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT
+          : suppressionReceiptForAttributeKey(key),
+      );
     }
   }
   return { attrs: safe, suppressedFields: canonicalizeSuppressionReceipts(suppressedFields) };
@@ -635,6 +607,10 @@ function buildMetricSamples(
         sampleType,
         value,
         attrs: metadataAttrs.attrs,
+        suppressedFields: canonicalizeSuppressionReceipts([
+          ...sanitized.evaluation.suppressedFields,
+          ...metadataAttrs.suppressedFields,
+        ]),
       });
     }
   }
