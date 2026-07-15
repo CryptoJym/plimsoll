@@ -152,6 +152,26 @@ function contextEvent(id: string, observedAt: string) {
   });
 }
 
+function tieContextEvent(
+  id: string,
+  observedAt: string,
+  sessionId: string,
+  model: string,
+) {
+  return aiInteractionEventSchema.parse({
+    id,
+    tenantId: "local",
+    source: "codex",
+    dataMode: "metadata",
+    eventType: "tool_use",
+    observedAt,
+    sessionId,
+    model,
+    actionClass: "shell",
+    metadata: {},
+  });
+}
+
 function windowState(buffer: LocalEventBuffer) {
   return buffer.database
     .prepare(
@@ -253,13 +273,18 @@ function proveRawContextLookupPlan(buffer: LocalEventBuffer) {
            where source = 'codex' and ${column} is not null and id != @eventId
              and observed_at >= @start
              and observed_at <= ${before ? "@observedAt" : "@end"}
-           order by observed_at ${before ? "desc" : "asc"}
+           order by observed_at ${before ? "desc" : "asc"}, id ${
+             before ? "desc" : "asc"
+           }
            limit 1`,
         )
         .all(bindings)
         .map((row) => (row as { detail: string }).detail);
     }),
   );
+  const boundedTieSorts = plans
+    .flat()
+    .filter((detail) => /USE TEMP B-TREE FOR (RIGHT PART|LAST TERM) OF ORDER BY/.test(detail));
   check(
     "nearest_context_uses_bounded_raw_observed_index",
     plans.length === 4 &&
@@ -272,7 +297,125 @@ function proveRawContextLookupPlan(buffer: LocalEventBuffer) {
         ),
       ) &&
       plans.every((plan) => plan.every((detail) => !detail.includes("SCAN buffered_events"))),
-    { plans },
+    {
+      plans,
+      boundedTieSorts: boundedTieSorts.length,
+      tieSortScope: "only rows sharing an observed_at value inside the bounded time range",
+    },
+  );
+}
+
+function proveDeterministicNearestContextTies(root: string) {
+  const contexts = [
+    tieContextEvent(
+      "tie-before-a",
+      "2026-07-15T11:59:59.000Z",
+      "019e9100-0000-7000-8000-000000000011",
+      "unpriced-before-a",
+    ),
+    tieContextEvent(
+      "tie-before-z",
+      "2026-07-15T11:59:59.000Z",
+      "019e9100-0000-7000-8000-000000000012",
+      "unpriced-before-z",
+    ),
+    tieContextEvent(
+      "tie-after-a",
+      "2026-07-15T12:00:01.000Z",
+      "019e9100-0000-7000-8000-000000000013",
+      "gpt-5.5",
+    ),
+    tieContextEvent(
+      "tie-after-z",
+      "2026-07-15T12:00:01.000Z",
+      "019e9100-0000-7000-8000-000000000014",
+      "unpriced-after-z",
+    ),
+  ];
+  const usage = usageEvent("tie-usage", "2026-07-15T12:00:00.000Z");
+  const runOrder = (label: string, orderedContexts: typeof contexts) => {
+    const ledger = path.join(root, `nearest-tie-${label}.sqlite`);
+    let buffer = new LocalEventBuffer(ledger);
+    try {
+      assert.equal(buffer.append(usage), true);
+      for (const context of orderedContexts) assert.equal(buffer.append(context), true);
+      const firstDuplicateResults = [
+        buffer.append(usage),
+        ...orderedContexts.map((context) => buffer.append(context)),
+      ];
+      runCodexReconciliationMaintenance(buffer.database, { timeLimitMs: 1_000 });
+      const promoted = buffer.database
+        .prepare(
+          `select session_id as sessionId, model, cost_usd as costUsd
+           from buffered_events where id = 'tie-usage'`,
+        )
+        .get() as { sessionId: string | null; model: string | null; costUsd: number | null };
+      const replayAfterPromotion = [
+        buffer.append(usage),
+        ...orderedContexts.map((context) => buffer.append(context)),
+      ];
+      const afterReplay = buffer.database
+        .prepare(
+          `select session_id as sessionId, model, cost_usd as costUsd
+           from buffered_events where id = 'tie-usage'`,
+        )
+        .get() as typeof promoted;
+      buffer.close();
+      buffer = new LocalEventBuffer(ledger);
+      const reopened = buffer.database
+        .prepare(
+          `select session_id as sessionId, model, cost_usd as costUsd
+           from buffered_events where id = 'tie-usage'`,
+        )
+        .get() as typeof promoted;
+      const idle = runCodexReconciliationMaintenance(buffer.database, { timeLimitMs: 1_000 });
+      const afterIdle = buffer.database
+        .prepare(
+          `select session_id as sessionId, model, cost_usd as costUsd
+           from buffered_events where id = 'tie-usage'`,
+        )
+        .get() as typeof promoted;
+      return {
+        promoted,
+        afterReplay,
+        reopened,
+        afterIdle,
+        duplicateNoOps: [...firstDuplicateResults, ...replayAfterPromotion].every(
+          (result) => result === false,
+        ),
+        idleRowsVisited: idle.rowsVisited,
+      };
+    } finally {
+      buffer.close();
+    }
+  };
+
+  const forward = runOrder("forward", contexts);
+  const reverse = runOrder("reverse", [...contexts].reverse());
+  const expected = {
+    sessionId: "019e9100-0000-7000-8000-000000000013",
+    model: "gpt-5.5",
+  };
+  const stable = (result: typeof forward) =>
+    result.promoted.sessionId === expected.sessionId &&
+    result.promoted.model === expected.model &&
+    result.promoted.costUsd !== null &&
+    JSON.stringify(result.promoted) === JSON.stringify(result.afterReplay) &&
+    JSON.stringify(result.promoted) === JSON.stringify(result.reopened) &&
+    JSON.stringify(result.promoted) === JSON.stringify(result.afterIdle) &&
+    result.duplicateNoOps &&
+    result.idleRowsVisited === 0;
+  check(
+    "equal_distance_context_ties_are_insertion_order_independent",
+    stable(forward) &&
+      stable(reverse) &&
+      JSON.stringify(forward.promoted) === JSON.stringify(reverse.promoted),
+    {
+      tieRule:
+        "before chooses observed_at desc/id desc; after chooses observed_at asc/id asc; equal-distance winners choose the lexicographically smaller event id",
+      forward,
+      reverse,
+    },
   );
 }
 
@@ -827,6 +970,7 @@ async function main() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-codex-reconciliation-proof-"));
   try {
     await proveRequestPathIsBounded(root);
+    proveDeterministicNearestContextTies(root);
     proveLegacyCadence(root, "sparse");
     proveLegacyCadence(root, "dense-context");
     proveAdversarialMixedBackfill(root);

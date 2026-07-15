@@ -138,7 +138,7 @@ function nearestStatements(
        from buffered_events indexed by idx_events_observed
        where source = 'codex' and ${predicate} and id != @eventId
          and observed_at >= @start and observed_at <= @observedAt
-       order by observed_at desc
+       order by observed_at desc, id desc
        limit 1`,
     ),
     after: database.prepare(
@@ -146,7 +146,7 @@ function nearestStatements(
        from buffered_events indexed by idx_events_observed
        where source = 'codex' and ${predicate} and id != @eventId
          and observed_at >= @observedAt and observed_at <= @end
-       order by observed_at asc
+       order by observed_at asc, id asc
        limit 1`,
     ),
   };

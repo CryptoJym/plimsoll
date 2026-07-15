@@ -75,7 +75,7 @@ Counters are per scenario and reset before each action phase. Production lanes m
 13. **Clock drift:** run the proof at dates far beyond fixture timestamps. Window-sensitive assertions must use an injected fixture clock rather than the wall clock (#82).
 14. **Environment inheritance:** seed the parent environment with credential-like names and unique value sentinels. The constructed child environment contains neither, and its key set is a subset of the fixed allowlist.
 15. **Port theft:** hold the port-0 listener, verify its assigned port, and challenge the exact address. The challenger must fail with `EADDRINUSE` before any receipt claims a reservation.
-16. **Codex context revision:** create more unresolved candidates than one slice, advance a context-window cursor, then add repeated same-bucket context before reopen. The current revision must finish to its high-water before one new pass starts; tail rows cannot starve and each promoted event changes once.
+16. **Codex context revision and ties:** create more unresolved candidates than one slice, advance a context-window cursor, then add repeated same-bucket context before reopen. The current revision must finish to its high-water before one new pass starts; tail rows cannot starve and each promoted event changes once. Separately insert equal-time/equal-distance context forward and in exact reverse order; explicit observed-time/event-ID ordering must converge to identical promoted values across duplicate replay and reopen.
 
 ## Gate sequence
 

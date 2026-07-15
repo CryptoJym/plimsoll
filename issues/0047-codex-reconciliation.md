@@ -82,7 +82,13 @@ The temporary-database proof verifies:
   context indexes existed;
 - all four nearest-context `EXPLAIN QUERY PLAN` variants report `SEARCH
   buffered_events USING INDEX idx_events_observed (observed_at>? AND
-  observed_at<?)` and no raw-table scan;
+  observed_at<?)` and no raw-table scan. SQLite uses a bounded temporary sort
+  for the event-ID tie term inside that time range;
+- four equal-distance context rows inserted forward and in exact reverse order
+  converge to identical session/model/cost after duplicate replay and reopen.
+  Before-time ties use `observed_at desc, id desc`; after-time ties use
+  `observed_at asc, id asc`; equal-distance side winners use the smaller event
+  ID;
 - backlog greater than one slice, later context, same-bucket repeated context,
   duplicate append, transaction rollback, reopen, scheduler overlap, and
   unchanged rerun;
