@@ -14,6 +14,8 @@ export type LaunchAgentOptions = {
   /** Packaged installs (npx/npm -g) exec the bundled cli directly instead of
    * pnpm-in-a-working-tree. */
   programArguments?: string[];
+  restartThrottleSeconds?: number;
+  workingDirectory?: string;
 };
 
 function escapeXml(value: string) {
@@ -41,8 +43,10 @@ export function renderLaunchAgentPlist(options: LaunchAgentOptions) {
   const homeDir = options.homeDir ?? os.homedir();
   const label = options.label ?? LAUNCH_AGENT_LABEL;
   const pnpmPath = options.pnpmPath ?? "pnpm";
+  const restartThrottleSeconds = options.restartThrottleSeconds ?? 30;
   const logDirectory = collectorHome(homeDir);
   const programArguments = options.programArguments ?? [pnpmPath, "--dir", options.repoRoot, "collector", "start"];
+  const workingDirectory = options.workingDirectory ?? options.repoRoot;
   const inheritedPathEntries = (process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
   const pathEntries = [
     ...inheritedPathEntries,
@@ -67,11 +71,16 @@ export function renderLaunchAgentPlist(options: LaunchAgentOptions) {
 ${programArguments.map(stringElement).join("\n")}
   </array>
   <key>WorkingDirectory</key>
-  <string>${escapeXml(options.repoRoot)}</string>
+  <string>${escapeXml(workingDirectory)}</string>
   <key>RunAtLoad</key>
   <true/>
   <key>KeepAlive</key>
-  <true/>
+  <dict>
+    <key>SuccessfulExit</key>
+    <false/>
+  </dict>
+  <key>ThrottleInterval</key>
+  <integer>${restartThrottleSeconds}</integer>
   <key>StandardOutPath</key>
   <string>${escapeXml(path.join(logDirectory, "collector.out.log"))}</string>
   <key>StandardErrorPath</key>
