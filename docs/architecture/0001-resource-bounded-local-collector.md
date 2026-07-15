@@ -221,10 +221,11 @@ Deferred. Worker processes could isolate synchronous database CPU, but they add 
 
 1. **Stop restart storms (#76).** Establish one owner and a stable packaged executable before measuring idle cost.
 2. **Stop repeated work (#77).** Commit byte offsets, serialize lanes, and replace unconditional sweeps with dirty work.
-3. **Stop low-value storage (#78).** Apply the sanitized admission predicate and expose drop counters.
-4. **Isolate delivery (#79).** Add outbox/dead-letter state and honest budgets without rewriting live history.
-5. **Bound reads (#80).** Build/reconcile projections, switch dashboard/status, and remove read-triggered filesystem walks.
-6. **Enforce the contract (#81).** Wire the integrated temporary-environment resource proof and only then make it a mandatory CI/release gate.
+3. **Bound Codex reconciliation (#91).** Remove full reconciliation from the OTLP request; drain durable candidate and context-window revisions in fixed row/time slices, with a bounded legacy rowid high-water migration.
+4. **Stop low-value storage (#78).** Apply the sanitized admission predicate and expose drop counters.
+5. **Isolate delivery (#79).** Add outbox/dead-letter state and honest budgets without rewriting live history.
+6. **Bound reads (#80).** Build/reconcile projections, switch dashboard/status, and remove read-triggered filesystem walks.
+7. **Enforce the contract (#81).** Wire the integrated temporary-environment resource proof and only then make it a mandatory CI/release gate.
 
 This order attacks the measured CPU/storage/restart drivers first while keeping every PR independently reviewable. Cloud D3/D4 work is outside this ADR.
 

@@ -23,7 +23,8 @@ The resource receipt has four scenario states:
 |---|---|---|---|
 | Harness environment boundary | child env keys are an exact allowlisted subset; credential-like names `0`; secret sentinel values `0` | not applicable | Subtractive scrubbing misses unknown credentials and injected variables. |
 | Harness loopback reservation | reservation listener held `1`; assigned port matches listener; challenger bind result `EADDRINUSE` | reservation setup <= 1 s | Reading an ephemeral port and immediately closing it does not reserve it. |
-| Idle/no-change interval | `fullHistoryFileReads=0`; `rawEventWrites=0`; `repriceRowsVisited=0`; `enrichmentRowsVisited=0`; `overlappingJobs=0` | Five-minute CPU <= 1 CPU-second on the controlled fixture | Current minute loops replay growing files and run history work even when nothing changes. |
+| Idle/no-change interval | `fullHistoryFileReads=0`; `rawEventWrites=0`; `reconciliationRowsVisited=0`; `repriceRowsVisited=0`; `enrichmentRowsVisited=0`; `overlappingJobs=0` | Five-minute CPU <= 1 CPU-second on the controlled fixture | Current minute loops replay growing files and run history work even when nothing changes. |
+| Codex usage plus later context | OTLP request `reconciliationRowsVisited=0`; each maintenance slice stays within configured row/time caps; repaired event rewrites `1`; unchanged follow-up visits `0` | 4.81M-row legacy high-water projected <= 120 one-minute cycles on the controlled fixture | Inline reconciliation counted just 60 candidates in 18.44 seconds on the surveyed ledger and could not repair prior rows safely without another full sweep. |
 | One complete appended JSONL line | `filesOpened<=1`; `fileBytesRead<=newSuffixBytes+4096`; `rawEventWrites=1`; committed offset equals the complete-line boundary | Capture visible <= 500 ms | A file's age must not determine the cost of its next append. |
 | Partial line plus restart | first phase `rawEventWrites=0`; second phase adds exactly one deterministic event; duplicate inserts `0` | Completion visible <= 500 ms | Crash-safe framing must neither lose nor double count usage. |
 | Duplicate collector start | `listenersCreated=1`; candidate `restartRequests=0`; owner PID mutation `0` | candidate exits <= 1 s | 16,079 port conflicts must not become a supervisor storm. |
@@ -49,7 +50,7 @@ rawEventWrites, rawEventRewrites, rawRowsScanned
 filesOpened, fileBytesRead, fullHistoryFileReads
 projectionRowsVisited, projectionRowsWritten
 outboxRowsEnqueued, outboxAttempts, deadLettersWritten
-repriceRowsVisited, enrichmentRowsVisited
+repriceRowsVisited, reconciliationRowsVisited, enrichmentRowsVisited
 maintenanceRuns, overlappingJobs
 listenersCreated, restartRequests
 filesystemEntriesScanned
@@ -74,6 +75,7 @@ Counters are per scenario and reset before each action phase. Production lanes m
 13. **Clock drift:** run the proof at dates far beyond fixture timestamps. Window-sensitive assertions must use an injected fixture clock rather than the wall clock (#82).
 14. **Environment inheritance:** seed the parent environment with credential-like names and unique value sentinels. The constructed child environment contains neither, and its key set is a subset of the fixed allowlist.
 15. **Port theft:** hold the port-0 listener, verify its assigned port, and challenge the exact address. The challenger must fail with `EADDRINUSE` before any receipt claims a reservation.
+16. **Codex context revision:** create more unresolved candidates than one slice, advance a context-window cursor, then add repeated same-bucket context before reopen. The current revision must finish to its high-water before one new pass starts; tail rows cannot starve and each promoted event changes once.
 
 ## Gate sequence
 
@@ -87,10 +89,11 @@ Counters are per scenario and reset before each action phase. Production lanes m
 
 ## Current partial-wiring boundary
 
-The issue #81 harness validates the proposed architecture artifact, creates an isolated temporary ledger and a held/challenged loopback reservation, proves a minimal child-environment allowlist against credential sentinels, and can invoke the existing signal-fidelity proof. It now also executes two production paths:
+The issue #81 harness validates the proposed architecture artifact, creates an isolated temporary ledger and a held/challenged loopback reservation, proves a minimal child-environment allowlist against credential sentinels, and can invoke the existing signal-fidelity proof. It now also executes three production paths:
 
 - **#77 no-change maintenance:** real rollout/transcript fixtures run through `LocalEventBuffer`, both incremental tailers, `CollectorMaintenance`, and `CoalescingMaintenanceScheduler`. One bounded first migration is allowed; a coalesced full run and a third unchanged run must both report zero file bytes/opens, raw-event mutations, repricing/enrichment visits, and overlap. Filesystem enumeration is not claimed as zero: the receipt exposes the observed directory-entry count.
 - **#76 duplicate ownership:** two real packaged Node 22 CLI processes race against one temporary home and port. Exactly one active owner and one successful `already_running` candidate must agree on the same versioned runtime identity; the PID record remains byte-identical until the same packaged CLI stop path terminates only that owner.
+- **#91 bounded Codex reconciliation:** OTLP writes only durable compact dirty work. A rowid high-water legacy walk, revisioned context-window cursors, and candidate repairs run inside the serialized maintenance scheduler. The focused proof projects the surveyed 4,810,030-row ledger to 49 one-minute slices from a 300,000-row fixture, proves rollback/reopen and same-bucket invalidation, and finishes with zero unchanged row visits.
 
 Poison continuation now runs through the production delivery seam. The integrated capture/projection/outbox, dashboard-projection budget, and integrated metadata-privacy scenarios remain explicitly `not_wired` on #79/#80 integration. The receipt therefore remains `gateReady: false`, and `--require-integrated` remains a required non-zero result.
 

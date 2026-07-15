@@ -63,6 +63,10 @@ import { collectorConfigPath, collectorConfigSchema } from "../packages/collecto
 import { performJoin } from "../packages/collector-cli/src/join";
 import { deterministicEventId } from "../packages/collector-cli/src/normalizer";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
+import {
+  codexReconciliationStatus,
+  runCodexReconciliationMaintenance,
+} from "../packages/collector-cli/src/codex-reconciliation";
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import {
   buildRepoLabelCandidates,
@@ -609,6 +613,25 @@ async function main() {
         : attribute,
   );
   await postJson(port, "/v1/logs", codexLinkageEnvelope, { "x-plimsoll-source": "codex" });
+
+  // Reconciliation is intentionally outside the OTLP request. Model the
+  // production maintenance lane before asserting stitched dashboard truth.
+  for (let iteration = 0; iteration < 20; iteration += 1) {
+    runCodexReconciliationMaintenance(buffer.database, {
+      legacyRowLimit: 10_000,
+      contextRowLimit: 10_000,
+      candidateLimit: 5_000,
+      timeLimitMs: 1_000,
+    });
+    const status = codexReconciliationStatus(buffer.database);
+    if (
+      status.legacyComplete &&
+      status.candidateBacklog === 0 &&
+      status.contextWindowBacklog === 0
+    ) {
+      break;
+    }
+  }
 
   // Settings writes: CSRF-guarded, then a full non-technical roundtrip.
   const noHeader = await fetch(`http://127.0.0.1:${port}/api/settings/priority`, {
@@ -1464,7 +1487,7 @@ async function main() {
     JSON.stringify({ skipped: firstScan.sessionsSkippedOtlpCovered }),
   );
   // Clearing the persistent scan state forces a true re-parse — which must
-  // not change counts or sums (deterministic ids + insert-or-replace).
+  // not change counts or sums (deterministic ids + conflict-ignore inserts).
   buffer.database.prepare(`delete from rollout_scan_state`).run();
   const rescan = await new RolloutTailer(buffer, rolloutDir, proofIdentities).scan();
   const afterRescan = buffer.database
@@ -1943,7 +1966,7 @@ async function main() {
   // reconciliation audit. Pure pieces first, then a loopback end-to-end
   // against a stub workspace that verifies signatures exactly like the cloud.
   {
-    // 16a. Row → envelope normalization: the reconcileCodexUsage stitch
+    // 16a. Row → envelope normalization: the bounded Codex stitch
     // artifact (json_set writes `sessionId: null`) must repair into a
     // schema-valid envelope without inventing values; a null REQUIRED field
     // stays a skip with a reason.

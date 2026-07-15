@@ -8,6 +8,10 @@ import { fileURLToPath } from "node:url";
 
 import { LocalEventBuffer } from "../../packages/collector-cli/src/buffer";
 import {
+  codexReconciliationStatus,
+  runCodexReconciliationMaintenance,
+} from "../../packages/collector-cli/src/codex-reconciliation";
+import {
   collectorBufferPath,
   collectorConfigSchema,
   collectorHome,
@@ -581,6 +585,7 @@ function unchangedMaintenanceResult(result: CollectorMaintenanceRunResult) {
     result.transcript.filesRead === 0 &&
     result.transcript.bytesRead === 0 &&
     result.rawEventWrites === 0 &&
+    result.reconciliation.rowsVisited === 0 &&
     result.repricing.rowsVisited === 0 &&
     result.enrichment.rowsVisited === 0
   );
@@ -871,6 +876,8 @@ export async function runNoChangeConstantWorkContract(
       thirdMutations.deleted;
     const repriceRowsVisited =
       secondRun.repricing.rowsVisited + thirdRun.repricing.rowsVisited;
+    const reconciliationRowsVisited =
+      secondRun.reconciliation.rowsVisited + thirdRun.reconciliation.rowsVisited;
     const enrichmentRowsVisited =
       secondRun.enrichment.rowsVisited + thirdRun.enrichment.rowsVisited;
 
@@ -884,6 +891,7 @@ export async function runNoChangeConstantWorkContract(
     counters.rawEventWrites = rawEventWrites;
     counters.rawEventRewrites = rawEventRewrites;
     counters.repriceRowsVisited = repriceRowsVisited;
+    counters.reconciliationRowsVisited = reconciliationRowsVisited;
     counters.enrichmentRowsVisited = enrichmentRowsVisited;
     counters.maintenanceRuns = finalStatus.runCount;
     counters.overlappingJobs = finalStatus.overlappingJobs;
@@ -893,6 +901,7 @@ export async function runNoChangeConstantWorkContract(
       firstRun.rollout.filesRead === 1 &&
       firstRun.transcript.filesRead === 1 &&
       firstRun.rawEventWrites === 2 &&
+      firstRun.reconciliation.backfillComplete &&
       firstRun.repricing.backfillComplete &&
       firstRun.enrichment.backfillComplete;
     const deterministicIdleCounters =
@@ -931,6 +940,7 @@ export async function runNoChangeConstantWorkContract(
       rawEventWrites === 0 &&
       rawEventRewrites === 0 &&
       repriceRowsVisited === 0 &&
+      reconciliationRowsVisited === 0 &&
       enrichmentRowsVisited === 0;
 
     return {
@@ -938,7 +948,7 @@ export async function runNoChangeConstantWorkContract(
       required: true,
       status: passed ? "pass" : "fail",
       detail: passed
-        ? "Real rollout/transcript maintenance completed one bounded migration, then two unchanged cycles performed no history reads, event mutations, repricing/enrichment visits, or overlapping work."
+        ? "Real rollout/transcript maintenance completed one bounded migration, then two unchanged cycles performed no history reads, event mutations, Codex reconciliation/repricing/enrichment visits, or overlapping work."
         : "No-change production contract failed one or more deterministic work assertions.",
       durationMs: Math.round((performance.now() - started) * 100) / 100,
       counters,
@@ -987,6 +997,142 @@ export async function runNoChangeConstantWorkContract(
   } finally {
     directoryObserver?.unregister();
     buffer?.close();
+  }
+}
+
+/** Production #91 compact queues, later-context invalidation, and idle bound. */
+export function runBoundedCodexReconciliationContract(
+  sandbox: ResourceSandbox,
+): ScenarioReceipt {
+  const started = performance.now();
+  const counters = emptyWorkCounters();
+  const ledger = path.join(sandbox.plimsollHome, "codex-reconciliation-proof.sqlite");
+  const buffer = new LocalEventBuffer(ledger);
+  try {
+    const sessionId = "019e9100-0000-7000-8000-000000000091";
+    for (let index = 0; index < 4; index += 1) {
+      buffer.append(
+        aiInteractionEventSchema.parse({
+          id: `resource-reconciliation-candidate-${index}`,
+          tenantId: "local",
+          source: "codex",
+          dataMode: "metadata",
+          eventType: "assistant_response",
+          observedAt: `2026-07-15T12:0${index}:00.000Z`,
+          actionClass: "other",
+          inputTokens: 100 + index,
+          outputTokens: 10,
+          metadata: {},
+        }),
+        [],
+      );
+    }
+    const waiting = runCodexReconciliationMaintenance(buffer.database, {
+      legacyRowLimit: 100,
+      contextRowLimit: 2,
+      candidateLimit: 2,
+      timeLimitMs: 1_000,
+    });
+    counters.reconciliationRowsVisited += waiting.rowsVisited;
+    counters.rawEventRewrites += waiting.rowsChanged;
+    buffer.append(
+      aiInteractionEventSchema.parse({
+        id: "resource-reconciliation-context",
+        tenantId: "local",
+        source: "codex",
+        dataMode: "metadata",
+        eventType: "tool_use",
+        observedAt: "2026-07-15T12:05:00.000Z",
+        sessionId,
+        model: "gpt-5.5",
+        actionClass: "shell",
+        metadata: {},
+      }),
+      [],
+    );
+    const slices = [];
+    for (let iteration = 0; iteration < 20; iteration += 1) {
+      const result = runCodexReconciliationMaintenance(buffer.database, {
+        legacyRowLimit: 2,
+        contextWindowLimit: 1,
+        contextRowLimit: 2,
+        candidateLimit: 1,
+        timeLimitMs: 1_000,
+      });
+      slices.push(result);
+      counters.reconciliationRowsVisited += result.rowsVisited;
+      counters.rawEventRewrites += result.rowsChanged;
+      if (
+        codexReconciliationStatus(buffer.database).candidateBacklog === 0 &&
+        codexReconciliationStatus(buffer.database).contextWindowBacklog === 0
+      ) {
+        break;
+      }
+    }
+    const rows = buffer.database
+      .prepare(
+        `select session_id as sessionId, model, cost_usd as costUsd
+         from buffered_events where id like 'resource-reconciliation-candidate-%'`,
+      )
+      .all() as Array<{
+      sessionId: string | null;
+      model: string | null;
+      costUsd: number | null;
+    }>;
+    const idle = runCodexReconciliationMaintenance(buffer.database, { timeLimitMs: 1_000 });
+    counters.reconciliationRowsVisited += idle.rowsVisited;
+    counters.rawEventRewrites += idle.rowsChanged;
+    const status = codexReconciliationStatus(buffer.database);
+    const bounded = slices.every(
+      (result) => result.contextRowsVisited <= 2 && result.candidateRowsVisited <= 1,
+    );
+    const passed =
+      rows.length === 4 &&
+      rows.every(
+        (row) => row.sessionId === sessionId && row.model === "gpt-5.5" && row.costUsd !== null,
+      ) &&
+      bounded &&
+      idle.rowsVisited === 0 &&
+      idle.rowsChanged === 0 &&
+      status.candidateBacklog === 0 &&
+      status.contextWindowBacklog === 0 &&
+      counters.rawEventRewrites === 4;
+    return {
+      id: "bounded_codex_reconciliation",
+      required: true,
+      status: passed ? "pass" : "fail",
+      detail: passed
+        ? "Four prior unresolved Codex usage rows were repaired exactly once by later context through fixed durable slices; the next run visited zero rows."
+        : "Bounded Codex reconciliation failed one or more queue, slice, parity, or idle assertions.",
+      durationMs: Math.round((performance.now() - started) * 100) / 100,
+      counters,
+      measurements: {
+        candidateRows: rows.length,
+        maintenanceSlices: slices.length,
+        maxContextRowsVisited: Math.max(0, ...slices.map((result) => result.contextRowsVisited)),
+        maxCandidateRowsVisited: Math.max(
+          0,
+          ...slices.map((result) => result.candidateRowsVisited),
+        ),
+        changedRows: counters.rawEventRewrites,
+        idleRowsVisited: idle.rowsVisited,
+        candidateBacklog: status.candidateBacklog,
+        contextWindowBacklog: status.contextWindowBacklog,
+      },
+    };
+  } catch (error) {
+    return {
+      id: "bounded_codex_reconciliation",
+      required: true,
+      status: "fail",
+      detail: `Bounded Codex reconciliation raised ${
+        error instanceof Error ? error.name : "UnknownError"
+      }; error text is omitted from the receipt.`,
+      durationMs: Math.round((performance.now() - started) * 100) / 100,
+      counters,
+    };
+  } finally {
+    buffer.close();
   }
 }
 

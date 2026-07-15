@@ -16,6 +16,7 @@ export const WORK_COUNTER_NAMES = [
   "outboxAttempts",
   "deadLettersWritten",
   "repriceRowsVisited",
+  "reconciliationRowsVisited",
   "enrichmentRowsVisited",
   "maintenanceRuns",
   "overlappingJobs",

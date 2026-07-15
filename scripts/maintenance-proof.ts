@@ -7,6 +7,10 @@ import path from "node:path";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import {
+  codexReconciliationStatus,
+  runCodexReconciliationMaintenance,
+} from "../packages/collector-cli/src/codex-reconciliation";
+import {
   CoalescingMaintenanceScheduler,
   CollectorMaintenance,
   runRepoEnrichmentMaintenance,
@@ -72,6 +76,17 @@ function fakeRun(recentOnly: boolean): CollectorMaintenanceRunResult {
     recentOnly,
     rollout,
     transcript,
+    reconciliation: {
+      backfillComplete: true,
+      legacyRowsVisited: 0,
+      contextRowsVisited: 0,
+      candidateRowsVisited: 6 * multiplier,
+      rowsVisited: 6 * multiplier,
+      rowsChanged: 0,
+      stitched: 0,
+      priced: 0,
+      timeBudgetExhausted: false,
+    },
     repricing: {
       catalogFingerprint: "proof",
       catalogChanged: false,
@@ -147,6 +162,7 @@ async function proveCoalescing() {
       finalStatus.transcriptFilesRead === 22 &&
       finalStatus.rawEventWrites === 33 &&
       finalStatus.repriceRowsVisited === 44 &&
+      finalStatus.reconciliationRowsVisited === 66 &&
       finalStatus.enrichmentRowsVisited === 55 &&
       !finalStatus.inFlight &&
       !finalStatus.pending,
@@ -417,6 +433,17 @@ async function proveIntegratedIdle(
   rolloutRoot: string,
   transcriptRoot: string,
 ) {
+  for (let iteration = 0; iteration < 100; iteration += 1) {
+    runCodexReconciliationMaintenance(buffer.database, { timeLimitMs: 1_000 });
+    const status = codexReconciliationStatus(buffer.database);
+    if (
+      status.legacyComplete &&
+      status.candidateBacklog === 0 &&
+      status.contextWindowBacklog === 0
+    ) {
+      break;
+    }
+  }
   // Drain any receipts created by the final proof linkage row.
   while (dirtyCount(buffer, "repo_enrichment_dirty") > 0) {
     runRepoEnrichmentMaintenance(buffer.database, {
@@ -442,6 +469,7 @@ async function proveIntegratedIdle(
     idle.rollout.filesRead === 0 &&
       idle.transcript.filesRead === 0 &&
       idle.rawEventWrites === 0 &&
+      idle.reconciliation.rowsVisited === 0 &&
       idle.repricing.rowsVisited === 0 &&
       idle.enrichment.rowsVisited === 0,
     idle,
