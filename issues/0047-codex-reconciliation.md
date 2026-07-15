@@ -70,13 +70,14 @@ The temporary-database proof verifies:
 
 - a real loopback Codex OTLP request over 50,000 irrelevant legacy rows visits
   zero reconciliation rows and only appends/enqueues;
-- separate 300,000-row scan shapes: sparse history completed in four productive
-  cycles and projected the surveyed 4,810,030-row ledger to 65 cycles; dense
+- separate 300,000-row scan shapes: sparse history completed in four to five
+  productive cycles across corrected runs and projected the surveyed
+  4,810,030-row ledger to 65–81 cycles; dense
   context with only 33 genuine candidates completed in three cycles and
   projected to 49. These projections are shape-specific, not universal;
 - the verifier-equivalent mixed fixture contains 200,000 context-bearing rows
   and 200,000 genuine candidates. Its five observed default slices were
-  bounded by 63.41 ms in the latest checkpoint run (61.94–63.41 ms maximum
+  bounded by 63.60 ms in the latest checkpoint run (61.94–63.60 ms maximum
   across corrected repeats). Fresh usage first failed closed without context,
   then resolved in the first cycle after later context while the legacy
   high-water remained incomplete. Because this
