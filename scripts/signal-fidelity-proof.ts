@@ -140,6 +140,53 @@ function check(name: string, passed: boolean, detail: string | undefined) {
   checks.push({ name, passed, detail: detail ?? "(no detail)" });
 }
 
+const SYSTEM_DATE_NOW = Date.now.bind(Date);
+const DAY_MS = 24 * 60 * 60 * 1000;
+const DEFAULT_PROOF_NOW = "2026-06-15T12:00:00.000Z";
+
+class ProofClock {
+  private currentMs: number;
+
+  constructor(nowIso: string) {
+    this.currentMs = ProofClock.parse(nowIso);
+  }
+
+  private static parse(nowIso: string) {
+    if (!/(?:Z|[+-]\d{2}:\d{2})$/.test(nowIso)) {
+      throw new Error(`PLIMSOLL_PROOF_NOW must include an explicit timezone: ${nowIso}`);
+    }
+    const parsed = Date.parse(nowIso);
+    if (!Number.isFinite(parsed)) throw new Error(`Invalid PLIMSOLL_PROOF_NOW: ${nowIso}`);
+    return parsed;
+  }
+
+  nowMs() {
+    return this.currentMs;
+  }
+
+  iso(offsetMs = 0) {
+    return new Date(this.currentMs + offsetMs).toISOString();
+  }
+
+  unixNanos(offsetMs = 0) {
+    return String(BigInt(this.currentMs + offsetMs) * 1_000_000n);
+  }
+}
+
+// The proof owns its clock. Production modules are unmodified; only this test
+// process receives a scoped Date.now() while window-sensitive checks run, so
+// dashboard fixtures cannot drift while retention/sync keep real semantics.
+const proofClock = new ProofClock(process.env.PLIMSOLL_PROOF_NOW ?? DEFAULT_PROOF_NOW);
+const SIGNAL_BASE_OFFSET_MS = -DAY_MS;
+
+function installProofDateNow() {
+  const previous = Date.now;
+  Date.now = () => proofClock.nowMs();
+  return () => {
+    Date.now = previous;
+  };
+}
+
 const RAW_CMD_SENTINEL = "RAW_CMD_SENTINEL rg -n secret";
 const RAW_PATH_SENTINEL = "/Users/sentinel-user/secret-project";
 const SESSION = "11111111-2222-4333-8444-555555555555";
@@ -170,7 +217,7 @@ const claudeLogsEnvelope = {
           scope: { name: "com.anthropic.claude_code.events", version: "2.1.150" },
           logRecords: [
             {
-              timeUnixNano: "1781400000000000000",
+              timeUnixNano: proofClock.unixNanos(SIGNAL_BASE_OFFSET_MS),
               body: { stringValue: "claude_code.hook_registered" },
               attributes: [
                 otelAttr("event.name", "hook_registered"),
@@ -178,7 +225,7 @@ const claudeLogsEnvelope = {
               ],
             },
             {
-              timeUnixNano: "1781400001000000000",
+              timeUnixNano: proofClock.unixNanos(SIGNAL_BASE_OFFSET_MS + 1_000),
               body: { stringValue: "claude_code.api_request" },
               attributes: [
                 otelAttr("event.name", "api_request"),
@@ -195,7 +242,7 @@ const claudeLogsEnvelope = {
               ],
             },
             {
-              timeUnixNano: "1781400002000000000",
+              timeUnixNano: proofClock.unixNanos(SIGNAL_BASE_OFFSET_MS + 2_000),
               body: { stringValue: "claude_code.tool_decision" },
               attributes: [
                 otelAttr("event.name", "tool_decision"),
@@ -229,7 +276,7 @@ const claudeMetricsEnvelope = {
                     otelAttr("model", "claude-fable-5"),
                     otelAttr("type", type),
                   ],
-                  timeUnixNano: "1781400003000000000",
+                  timeUnixNano: proofClock.unixNanos(SIGNAL_BASE_OFFSET_MS + 3_000),
                   asDouble: [1200, 350, 9000][index],
                 })),
               },
@@ -252,7 +299,7 @@ const codexLogsEnvelope = {
           scope: { name: "codex_otel.log_only" },
           logRecords: [
             {
-              observedTimeUnixNano: "1781400004000000000",
+              observedTimeUnixNano: proofClock.unixNanos(SIGNAL_BASE_OFFSET_MS + 4_000),
               attributes: [
                 otelAttr("event.name", "codex.tool_result"),
                 otelAttr("tool_name", "exec_command"),
@@ -287,7 +334,7 @@ const codexTracesEnvelope = {
               name: "handle_responses",
               traceId: "abcdef0123456789abcdef0123456789",
               spanId: "abcdef0123456789",
-              startTimeUnixNano: "1781400005000000000",
+              startTimeUnixNano: proofClock.unixNanos(SIGNAL_BASE_OFFSET_MS + 5_000),
               // Live-verified codex 0.137 shape: usage spans carry tokens only —
               // no conversation.id, no model (those ride sibling signals; see issue 0014).
               attributes: [
@@ -304,11 +351,164 @@ const codexTracesEnvelope = {
 };
 
 const hookFixtures = [
-  { body: { hook_event_name: "PostToolUse", session_id: SESSION, tool_name: "Bash", tool_input: { command: RAW_CMD_SENTINEL } }, expectClass: "shell" },
-  { body: { hook_event_name: "PostToolUse", session_id: SESSION, tool_name: "Edit" }, expectClass: "edit" },
-  { body: { hook_event_name: "PostToolUse", session_id: SESSION, tool_name: "mcp__github__create_issue" }, expectClass: "mcp" },
-  { body: { hook_event_name: "UserPromptSubmit", session_id: SESSION, prompt: "RAW_PROMPT_SENTINEL" }, expectClass: "other" },
+  {
+    body: {
+      hook_event_name: "PostToolUse",
+      session_id: SESSION,
+      timestamp: proofClock.iso(SIGNAL_BASE_OFFSET_MS + 10_000),
+      tool_name: "Bash",
+      tool_input: { command: RAW_CMD_SENTINEL },
+    },
+    expectClass: "shell",
+  },
+  {
+    body: {
+      hook_event_name: "PostToolUse",
+      session_id: SESSION,
+      timestamp: proofClock.iso(SIGNAL_BASE_OFFSET_MS + 11_000),
+      tool_name: "Edit",
+    },
+    expectClass: "edit",
+  },
+  {
+    body: {
+      hook_event_name: "PostToolUse",
+      session_id: SESSION,
+      timestamp: proofClock.iso(SIGNAL_BASE_OFFSET_MS + 12_000),
+      tool_name: "mcp__github__create_issue",
+    },
+    expectClass: "mcp",
+  },
+  {
+    body: {
+      hook_event_name: "UserPromptSubmit",
+      session_id: SESSION,
+      timestamp: proofClock.iso(SIGNAL_BASE_OFFSET_MS + 13_000),
+      prompt: "RAW_PROMPT_SENTINEL",
+    },
+    expectClass: "other",
+  },
 ];
+
+type ProofClockWindowResult = {
+  passed: boolean;
+  signature: {
+    events: number;
+    inputTokens: number;
+    sessions: number;
+    sessionRows: number;
+    repoCostUsd: number;
+    priorityUsd: number;
+  };
+};
+
+function proofClockWindowFixture(): ProofClockWindowResult {
+  const buffer = new LocalEventBuffer(":memory:");
+  const sessionId = "88888888-7777-4666-8555-444444444444";
+  const repoHash = remoteLinkageHash("git@github.com:Proof-Owner/Clock-Regression.git")!;
+  try {
+    buffer.append(
+      aiInteractionEventSchema.parse({
+        id: "77777777-6666-4555-8444-333333333333",
+        tenantId: "local",
+        source: "codex",
+        dataMode: "metadata",
+        eventType: "assistant_response",
+        observedAt: proofClock.iso(-5 * DAY_MS),
+        sessionId,
+        actorId: "sha256:proof-clock-account",
+        actionClass: "other",
+        model: "gpt-5.5",
+        inputTokens: 1234,
+        outputTokens: 56,
+        costUsd: 1.25,
+        metadata: { git: { remoteUrlHash: repoHash } },
+      }),
+      [],
+    );
+    buffer.setPriorityRepo(repoHash, "github.com/proof-owner/clock-regression");
+
+    const summary = dashboardSummary(buffer.database);
+    const sessions = dashboardSessions(buffer.database);
+    const repos = dashboardRepos(buffer.database);
+    const accounts = dashboardAccounts(buffer.database, []);
+    const repo = repos.find((row) => row.repoHash === repoHash);
+    const signature = {
+      events: Number(summary.totals.events),
+      inputTokens: Number(summary.totals.inputTokens),
+      sessions: Number(summary.totals.sessions),
+      sessionRows: sessions.length,
+      repoCostUsd: Number(repo?.costUsd ?? 0),
+      priorityUsd: accounts.buckets.priorityUsd,
+    };
+    return {
+      passed:
+        signature.events === 1 &&
+        signature.inputTokens === 1234 &&
+        signature.sessions === 1 &&
+        signature.sessionRows === 1 &&
+        Math.abs(signature.repoCostUsd - 1.25) < 1e-9 &&
+        Math.abs(signature.priorityUsd - 1.25) < 1e-9,
+      signature,
+    };
+  } finally {
+    buffer.close();
+  }
+}
+
+function proofClockMatrix() {
+  const script = process.argv[1];
+  const tsx = path.join(process.cwd(), "node_modules", ".bin", "tsx");
+  const cases = [
+    { now: "2026-06-15T12:00:00.000Z", tz: "UTC" },
+    { now: "2028-06-15T12:00:00.000Z", tz: "UTC" },
+    { now: "2026-06-15T12:00:00.000Z", tz: "America/Denver" },
+    { now: "2028-06-15T12:00:00.000Z", tz: "America/Denver" },
+  ];
+  const results = cases.map((entry) => {
+    const child = spawnSync(tsx, [script], {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        TZ: entry.tz,
+        PLIMSOLL_PROOF_NOW: entry.now,
+        PLIMSOLL_PROOF_CLOCK_CASE: "1",
+      },
+    });
+    let result: ProofClockWindowResult | null = null;
+    try {
+      result = JSON.parse(child.stdout.trim()) as ProofClockWindowResult;
+    } catch {
+      // The caller reports the stderr/stdout below; malformed output is a failure.
+    }
+    return {
+      ...entry,
+      status: child.status,
+      result,
+      stderr: child.stderr.trim(),
+      stdout: child.stdout.trim(),
+    };
+  });
+  const signatures = results.map((entry) => JSON.stringify(entry.result?.signature ?? null));
+  check(
+    "proof_clock_window_stable_across_years",
+    results.slice(0, 2).every((entry) => entry.status === 0 && entry.result?.passed) &&
+      signatures[0] === signatures[1],
+    JSON.stringify(
+      results
+        .slice(0, 2)
+        .map(({ now, tz, status, result, stderr }) => ({ now, tz, status, result, stderr })),
+    ),
+  );
+  check(
+    "proof_clock_window_timezone_invariant",
+    results.every((entry) => entry.status === 0 && entry.result?.passed) &&
+      new Set(signatures).size === 1,
+    JSON.stringify(
+      results.map(({ now, tz, status, result, stderr }) => ({ now, tz, status, result, stderr })),
+    ),
+  );
+}
 
 async function postJson(port: number, route: string, body: unknown, headers: Record<string, string> = {}) {
   const response = await fetch(`http://127.0.0.1:${port}${route}`, {
@@ -336,6 +536,8 @@ function createTempGitRepo(baseDir: string) {
 }
 
 async function main() {
+  proofClockMatrix();
+  const restoreProofDateNow = installProofDateNow();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "wi-signal-fidelity-"));
   process.env.PLIMSOLL_HOME = tempDir; // keep config writes off the real machine
   const bufferPath = path.join(tempDir, "work-ledger.sqlite");
@@ -387,6 +589,7 @@ async function main() {
   await postJson(port, "/hooks/claude-code", {
     hook_event_name: "SessionStart",
     session_id: SESSION,
+    timestamp: proofClock.iso(SIGNAL_BASE_OFFSET_MS + 14_000),
     cwd: proofRepo.repoDir,
   });
   const codexLinkageEnvelope = JSON.parse(JSON.stringify(codexLogsEnvelope)) as typeof codexLogsEnvelope;
@@ -754,7 +957,7 @@ async function main() {
               scope: { name: "com.anthropic.claude_code.events" },
               logRecords: [
                 {
-                  timeUnixNano: "1781400007000000000",
+                  timeUnixNano: proofClock.unixNanos(SIGNAL_BASE_OFFSET_MS + 7_000),
                   body: { stringValue: "claude_code.api_request" },
                   attributes: [
                     otelAttr("event.name", "api_request"),
@@ -768,7 +971,7 @@ async function main() {
                   ],
                 },
                 {
-                  timeUnixNano: "1781400008000000000",
+                  timeUnixNano: proofClock.unixNanos(SIGNAL_BASE_OFFSET_MS + 8_000),
                   body: { stringValue: "claude_code.api_request" },
                   attributes: [
                     otelAttr("event.name", "api_request"),
@@ -941,21 +1144,21 @@ async function main() {
       }),
       [],
     );
-  mrEvent("mr-hook-a", "tool_use", "2026-06-10T13:00:00.000Z", {
+  mrEvent("mr-hook-a", "tool_use", proofClock.iso(SIGNAL_BASE_OFFSET_MS + 60 * 60_000), {
     actionClass: "shell",
     metadata: { git: { remoteUrlHash: expectedRemoteHash, branchHash: expectedBranchHash } },
   });
-  mrEvent("mr-cost-a", "assistant_response", "2026-06-10T13:01:00.000Z", {
+  mrEvent("mr-cost-a", "assistant_response", proofClock.iso(SIGNAL_BASE_OFFSET_MS + 61 * 60_000), {
     model: "claude-fable-5",
     inputTokens: 1000,
     outputTokens: 100,
     costUsd: 1.0,
   });
-  mrEvent("mr-hook-b", "tool_use", "2026-06-10T13:02:00.000Z", {
+  mrEvent("mr-hook-b", "tool_use", proofClock.iso(SIGNAL_BASE_OFFSET_MS + 62 * 60_000), {
     actionClass: "shell",
     metadata: { git: { remoteUrlHash: OTHER_REPO_HASH, branchHash: expectedBranchHash } },
   });
-  mrEvent("mr-cost-b", "assistant_response", "2026-06-10T13:03:00.000Z", {
+  mrEvent("mr-cost-b", "assistant_response", proofClock.iso(SIGNAL_BASE_OFFSET_MS + 63 * 60_000), {
     model: "claude-fable-5",
     inputTokens: 2000,
     outputTokens: 200,
@@ -988,13 +1191,14 @@ async function main() {
       Math.abs(bucketsCost - sessionedCost) < 1e-3,
     JSON.stringify({ totalsCost, bySourceCost, sessionedCost, reposCost, accountsCost, bucketsCost }),
   );
+  restoreProofDateNow();
 
   // 10. Capture health: silence must scream (issue 0021). The baseline for
   // "telemetry should be arriving" is LOCAL TOOL ACTIVITY (transcript and
   // rollout files), so an idle machine stays green and a broken pipe goes red
   // the moment the tools demonstrably run without the ledger hearing it.
   const healthDir = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-health-"));
-  const healthNow = new Date("2026-06-10T12:00:00.000Z");
+  const healthNow = new Date(proofClock.nowMs());
   const minutesAgo = (m: number) => new Date(healthNow.getTime() - m * 60_000);
   const touch = (file: string, when: Date) => {
     fs.mkdirSync(path.dirname(file), { recursive: true });
@@ -3111,7 +3315,7 @@ async function main() {
   fs.rmSync(tempDir, { recursive: true, force: true });
 
   const passed = checks.every((entry) => entry.passed);
-  const generatedAt = new Date().toISOString();
+  const generatedAt = new Date(SYSTEM_DATE_NOW()).toISOString();
   const stamp = generatedAt.replace(/[:.]/g, "-");
   const evidenceDir = path.join(process.cwd(), "evidence");
   fs.mkdirSync(evidenceDir, { recursive: true });
@@ -3148,7 +3352,16 @@ async function main() {
   if (!passed) process.exitCode = 1;
 }
 
-main().catch((error) => {
-  console.error(error);
-  process.exitCode = 1;
-});
+if (process.env.PLIMSOLL_PROOF_CLOCK_CASE === "1") {
+  const restoreProofDateNow = installProofDateNow();
+  try {
+    console.log(JSON.stringify(proofClockWindowFixture()));
+  } finally {
+    restoreProofDateNow();
+  }
+} else {
+  main().catch((error) => {
+    console.error(error);
+    process.exitCode = 1;
+  });
+}
