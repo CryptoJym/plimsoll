@@ -20,6 +20,11 @@ import {
   unixNanoToIso,
   usageFieldKeys,
 } from "./normalizer";
+import {
+  addOtlpAdmissionDrop,
+  decideOtlpSpanAdmission,
+  type OtlpAdmissionDrop,
+} from "./otlp-admission";
 
 export type MetricSample = {
   id: string;
@@ -36,6 +41,8 @@ export type MetricSample = {
 export type ExplodedOtlp = {
   events: Array<{ event: AiInteractionEvent; suppressedFields: string[] }>;
   metricSamples: MetricSample[];
+  admissionDrops: OtlpAdmissionDrop[];
+  droppedEventCount: number;
   recordCount: number;
   datapointCount: number;
   parseFailures: number;
@@ -72,9 +79,12 @@ function flattenOtelAttributes(attributes: unknown): Record<string, unknown> {
 function resourceSummary(resource: unknown) {
   const attrs = flattenOtelAttributes(asRecord(resource).attributes);
   return {
-    serviceName: typeof attrs["service.name"] === "string" ? attrs["service.name"] : undefined,
+    serviceName: boundedSignalName(attrs["service.name"]),
     serviceVersion:
-      typeof attrs["service.version"] === "string" ? attrs["service.version"] : undefined,
+      typeof attrs["service.version"] === "string" &&
+      /^[a-zA-Z0-9_.+-]{1,80}$/.test(attrs["service.version"].trim())
+        ? attrs["service.version"].trim()
+        : undefined,
   };
 }
 
@@ -125,6 +135,71 @@ function workdirFromRawRecord(record: Record<string, unknown>): string | undefin
   return undefined;
 }
 
+const RAW_ERROR_DETAIL_KEYS = new Set([
+  "error.message",
+  "error.stack",
+  "exception.message",
+  "exception.stacktrace",
+  "status.message",
+]);
+
+function metadataSafeOtlpAttributes(attrs: Record<string, unknown>) {
+  const safe: Record<string, unknown> = {};
+  const suppressedFields: string[] = [];
+  for (const [key, value] of Object.entries(attrs)) {
+    const normalizedKey = key.toLowerCase();
+    const invalidSignalIdentifier =
+      ["event.name", "error.type", "exception.type"].includes(normalizedKey) &&
+      typeof value === "string" &&
+      !boundedSignalName(value);
+    if (RAW_ERROR_DETAIL_KEYS.has(normalizedKey) || invalidSignalIdentifier) {
+      suppressedFields.push(`attributes.${key}`);
+    } else {
+      safe[key] = value;
+    }
+  }
+  return { attrs: safe, suppressedFields };
+}
+
+function boundedSignalName(value: unknown) {
+  return typeof value === "string" && /^[a-zA-Z0-9_./:-]{1,160}$/.test(value.trim())
+    ? value.trim()
+    : undefined;
+}
+
+function eventNameFromRecord(record: Record<string, unknown>, attrs: Record<string, unknown>) {
+  const explicit = boundedSignalName(stringField(attrs, ["event.name"]));
+  if (explicit) return explicit;
+  return boundedSignalName(otelScalar(asRecord(record.body)));
+}
+
+function statusCode(record: Record<string, unknown>) {
+  const value = asRecord(record.status).code;
+  return typeof value === "number" || typeof value === "string" ? value : undefined;
+}
+
+function isErrorStatus(value: string | number | undefined) {
+  if (value === 2) return true;
+  return typeof value === "string" && (value === "2" || value.toUpperCase().includes("ERROR"));
+}
+
+function spanHasExceptionEvent(span: Record<string, unknown>) {
+  if (!Array.isArray(span.events)) return false;
+  return span.events.some((candidate) => {
+    const name = boundedSignalName(asRecord(candidate).name);
+    return name?.toLowerCase().includes("exception") ?? false;
+  });
+}
+
+function attributesHaveError(attrs: Record<string, unknown>) {
+  return Boolean(
+    stringField(attrs, ["error.type", "exception.type"]) ||
+      attrs.error === true ||
+      attrs.failed === true ||
+      attrs.success === false,
+  );
+}
+
 function buildLogEvent(
   record: Record<string, unknown>,
   context: {
@@ -148,10 +223,10 @@ function buildLogEvent(
     : undefined;
   const sanitized = sanitizeForPolicy(record, context.policy);
   const safeRecord = asRecord(sanitized.value);
-  const attrs = flattenOtelAttributes(safeRecord.attributes);
-  const body = otelScalar(asRecord(safeRecord.body));
-  const bodyText = typeof body === "string" ? body : undefined;
-  const otelEventName = stringField(attrs, ["event.name"]) ?? bodyText;
+  const flattenedAttrs = flattenOtelAttributes(safeRecord.attributes);
+  const metadataAttrs = metadataSafeOtlpAttributes(flattenedAttrs);
+  const attrs = metadataAttrs.attrs;
+  const otelEventName = eventNameFromRecord(safeRecord, attrs);
 
   const inputTokens = intTokens(numberField(attrs, [...usageFieldKeys.inputTokens]));
   const outputTokens = intTokens(numberField(attrs, [...usageFieldKeys.outputTokens]));
@@ -173,9 +248,13 @@ function buildLogEvent(
     }
   }
   const hasUsage =
-    inputTokens !== undefined || outputTokens !== undefined || costUsd !== undefined;
+    inputTokens !== undefined ||
+    outputTokens !== undefined ||
+    cacheReadTokens !== undefined ||
+    cacheCreationTokens !== undefined ||
+    costUsd !== undefined;
 
-  const toolName = stringField(attrs, ["tool_name", "toolName", "tool"]);
+  const toolName = boundedSignalName(stringField(attrs, ["tool_name", "toolName", "tool"]));
   const explicitActionClass = stringField(attrs, ["plimsoll.action_class", "cfo_one.action_class", "action_class"]);
   const derived = explicitActionClass ? undefined : deriveActionClass(toolName);
   const mcpServer = stringField(attrs, ["mcp_server"]);
@@ -232,7 +311,13 @@ function buildLogEvent(
     },
   });
 
-  return { event, suppressedFields: sanitized.evaluation.suppressedFields };
+  return {
+    event,
+    suppressedFields: [
+      ...sanitized.evaluation.suppressedFields,
+      ...metadataAttrs.suppressedFields,
+    ],
+  };
 }
 
 function buildSpanEvent(
@@ -247,8 +332,11 @@ function buildSpanEvent(
 ): { event: AiInteractionEvent; suppressedFields: string[] } {
   const sanitized = sanitizeForPolicy(span, context.policy);
   const safeSpan = asRecord(sanitized.value);
-  const attrs = flattenOtelAttributes(safeSpan.attributes);
-  const spanName = typeof safeSpan.name === "string" ? safeSpan.name : undefined;
+  const flattenedAttrs = flattenOtelAttributes(safeSpan.attributes);
+  const metadataAttrs = metadataSafeOtlpAttributes(flattenedAttrs);
+  const attrs = metadataAttrs.attrs;
+  const rawSpanName = typeof safeSpan.name === "string" ? safeSpan.name : undefined;
+  const spanName = boundedSignalName(rawSpanName);
   const observedAt = recordTimestamp(safeSpan, attrs);
   const sessionId = stringField(attrs, [...usageFieldKeys.sessionId]);
   const inputTokens = intTokens(numberField(attrs, [...usageFieldKeys.inputTokens]));
@@ -271,6 +359,42 @@ function buildSpanEvent(
     }
   }
 
+  const hasUsage =
+    inputTokens !== undefined ||
+    outputTokens !== undefined ||
+    cacheReadTokensSpan !== undefined ||
+    cacheCreationTokensSpan !== undefined ||
+    costUsd !== undefined;
+  const toolName = boundedSignalName(
+    stringField(attrs, ["tool_name", "toolName", "tool", "gen_ai.tool.name"]),
+  );
+  const explicitActionClass = stringField(attrs, [
+    "plimsoll.action_class",
+    "cfo_one.action_class",
+    "action_class",
+  ]);
+  const derived = explicitActionClass ? undefined : deriveActionClass(toolName);
+  const classifiedType = classifyEventType(spanName);
+  const lifecycleType =
+    classifiedType === "session_start" ||
+    classifiedType === "session_stop" ||
+    classifiedType === "user_prompt_submit"
+      ? classifiedType
+      : undefined;
+  const eventType = hasUsage
+    ? "assistant_response"
+    : toolName || explicitActionClass
+      ? classifiedType === "tool_result"
+        ? "tool_result"
+        : "tool_use"
+      : lifecycleType
+        ? lifecycleType
+        : "otel_span";
+  const otelStatusCode = statusCode(safeSpan);
+  const otelHasException = spanHasExceptionEvent(safeSpan);
+  const otelHasError =
+    isErrorStatus(otelStatusCode) || otelHasException || attributesHaveError(attrs);
+
   const event = aiInteractionEventSchema.parse({
     actorId: stringField(attrs, [...usageFieldKeys.actorId]),
     id: deterministicEventId([
@@ -286,12 +410,13 @@ function buildSpanEvent(
     tenantId: context.policy.tenantId,
     source: eventSourceFor(attrs, context.source, context.serviceName),
     dataMode: context.policy.dataMode,
-    eventType: inputTokens !== undefined || outputTokens !== undefined || costUsd !== undefined
-      ? "assistant_response"
-      : "otel_span",
+    eventType,
     observedAt,
     model: stringField(attrs, [...usageFieldKeys.model]),
-    actionClass: "other",
+    projectKey: stringField(attrs, ["plimsoll.project", "cfo_one.project", "project_key", "project"]),
+    customerKey: stringField(attrs, ["plimsoll.customer", "cfo_one.customer", "customer_key", "customer"]),
+    workflowKey: stringField(attrs, ["plimsoll.workflow", "cfo_one.workflow", "workflow_key", "workflow"]),
+    actionClass: explicitActionClass ?? derived?.actionClass ?? "other",
     inputTokens,
     outputTokens,
     cacheReadTokens: cacheReadTokensSpan,
@@ -301,6 +426,12 @@ function buildSpanEvent(
       ...attrs,
       ...(costEstimated ? { costEstimated: true } : {}),
       ...(spanName ? { otelEventName: spanName } : {}),
+      ...(toolName ? { toolName } : {}),
+      ...(derived?.detail ? { toolClassDetail: derived.detail } : {}),
+      ...(explicitActionClass ? { otelExplicitAction: true } : {}),
+      ...(otelStatusCode !== undefined ? { otelStatusCode } : {}),
+      ...(otelHasException ? { otelHasException: true } : {}),
+      ...(otelHasError ? { otelHasError: true } : {}),
       ...(typeof safeSpan.traceId === "string" ? { traceId: safeSpan.traceId } : {}),
       ...(typeof safeSpan.spanId === "string" ? { spanId: safeSpan.spanId } : {}),
       ...(context.transportPath ? { transport_path: context.transportPath } : {}),
@@ -308,7 +439,14 @@ function buildSpanEvent(
     },
   });
 
-  return { event, suppressedFields: sanitized.evaluation.suppressedFields };
+  return {
+    event,
+    suppressedFields: [
+      ...sanitized.evaluation.suppressedFields,
+      ...metadataAttrs.suppressedFields,
+      ...(rawSpanName && !spanName ? ["span.name"] : []),
+    ],
+  };
 }
 
 function buildMetricSamples(
@@ -379,6 +517,8 @@ export function explodeOtlpPayload(
   const result: ExplodedOtlp = {
     events: [],
     metricSamples: [],
+    admissionDrops: [],
+    droppedEventCount: 0,
     recordCount: 0,
     datapointCount: 0,
     parseFailures: 0,
@@ -422,15 +562,20 @@ export function explodeOtlpPayload(
         : []) {
         result.recordCount += 1;
         try {
-          result.events.push(
-            buildSpanEvent(asRecord(span), {
+          const entry = buildSpanEvent(asRecord(span), {
               policy,
               source,
               transportPath: options.transportPath,
               serviceName: resource.serviceName,
               serviceVersion: resource.serviceVersion,
-            }),
-          );
+            });
+          const decision = decideOtlpSpanAdmission(entry.event);
+          if (decision.admitted) {
+            result.events.push(entry);
+          } else {
+            result.droppedEventCount += 1;
+            addOtlpAdmissionDrop(result.admissionDrops, entry.event.source, decision.reason);
+          }
         } catch {
           result.parseFailures += 1;
         }

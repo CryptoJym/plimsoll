@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 
 import type { AiInteractionEvent } from "../../shared/src/index";
 import type { MetricSample } from "./otlp";
+import type { OtlpAdmissionDrop, OtlpDropReason } from "./otlp-admission";
 
 export type BufferedEventRow = {
   id: string;
@@ -31,6 +32,14 @@ export type BufferStats = {
   totalInputTokens: number;
   totalOutputTokens: number;
   totalCostUsd: number;
+};
+
+export type OtlpAdmissionCounter = {
+  source: string;
+  reason: OtlpDropReason;
+  droppedCount: number;
+  firstDroppedAt: string;
+  lastDroppedAt: string;
 };
 
 const MACHINE = os.hostname();
@@ -109,6 +118,14 @@ export class LocalEventBuffer {
         value real not null,
         attrs_json text not null default '{}',
         created_at text not null
+      );
+      create table if not exists otlp_admission_counters (
+        source text not null,
+        reason text not null,
+        dropped_count integer not null default 0,
+        first_dropped_at text not null,
+        last_dropped_at text not null,
+        primary key (source, reason)
       );
     `);
     this.migrateEventColumns();
@@ -190,6 +207,7 @@ export class LocalEventBuffer {
   appendMany(
     entries: Array<{ event: AiInteractionEvent; suppressedFields: string[] }>,
     metricSamples: MetricSample[] = [],
+    admissionDrops: OtlpAdmissionDrop[] = [],
   ) {
     const run = this.db.transaction(() => {
       for (const entry of entries) {
@@ -198,8 +216,37 @@ export class LocalEventBuffer {
       for (const sample of metricSamples) {
         this.appendMetricSample(sample);
       }
+      const now = new Date().toISOString();
+      for (const drop of admissionDrops) {
+        this.recordOtlpAdmissionDrop(drop, now);
+      }
     });
     run();
+  }
+
+  private recordOtlpAdmissionDrop(drop: OtlpAdmissionDrop, now: string) {
+    if (!Number.isSafeInteger(drop.count) || drop.count <= 0) return;
+    this.db
+      .prepare(
+        `insert into otlp_admission_counters
+          (source, reason, dropped_count, first_dropped_at, last_dropped_at)
+         values (@source, @reason, @count, @now, @now)
+         on conflict(source, reason) do update set
+           dropped_count = dropped_count + excluded.dropped_count,
+           last_dropped_at = excluded.last_dropped_at`,
+      )
+      .run({ ...drop, now });
+  }
+
+  otlpAdmissionCounters(): OtlpAdmissionCounter[] {
+    return this.db
+      .prepare(
+        `select source, reason, dropped_count as droppedCount,
+           first_dropped_at as firstDroppedAt, last_dropped_at as lastDroppedAt
+         from otlp_admission_counters
+         order by source, reason`,
+      )
+      .all() as OtlpAdmissionCounter[];
   }
 
   private seededAccounts = new Set<string>();

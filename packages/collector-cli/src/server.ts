@@ -111,6 +111,10 @@ export function createCollectorServer(config: CollectorConfig, buffer: LocalEven
           dataMode: config.policy.dataMode,
           retentionDays: config.retentionDays,
           stats: buffer.stats(),
+          otlpAdmission: {
+            counterLifetime: "durable",
+            dropped: buffer.otlpAdmissionCounters(),
+          },
           health: healthCache.value,
         });
         return;
@@ -346,9 +350,17 @@ export function createCollectorServer(config: CollectorConfig, buffer: LocalEven
             onRepoLabel: (hash, label) => buffer.recordRepoLabel(hash, label),
           });
 
-          if (exploded.events.length > 0 || exploded.metricSamples.length > 0) {
-            buffer.appendMany(exploded.events, exploded.metricSamples);
-            if (source === "codex") {
+          if (
+            exploded.events.length > 0 ||
+            exploded.metricSamples.length > 0 ||
+            exploded.droppedEventCount > 0
+          ) {
+            buffer.appendMany(
+              exploded.events,
+              exploded.metricSamples,
+              exploded.admissionDrops,
+            );
+            if (source === "codex" && exploded.events.length > 0) {
               buffer.reconcileCodexUsage(estimateCostUsd);
             }
             response.writeHead(202, { "content-type": "application/json" });
@@ -360,6 +372,8 @@ export function createCollectorServer(config: CollectorConfig, buffer: LocalEven
                 recordCount: exploded.recordCount,
                 datapointCount: exploded.datapointCount,
                 parseFailures: exploded.parseFailures,
+                droppedEvents: exploded.droppedEventCount,
+                droppedByReason: exploded.admissionDrops,
               }),
             );
             return;
