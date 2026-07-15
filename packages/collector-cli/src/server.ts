@@ -79,6 +79,45 @@ function sourceFromHeaders(request: http.IncomingMessage): ToolSource | undefine
   return undefined;
 }
 
+const REQUEST_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]);
+
+function sanitizedRequestMethod(method: string | undefined) {
+  const candidate = method?.toUpperCase() ?? "";
+  return REQUEST_METHODS.has(candidate) ? candidate : "OTHER";
+}
+
+/**
+ * Request failures are observability metadata, not an echo surface. Keep the
+ * route useful while ensuring an arbitrary URL/query can never enter logs or
+ * responses.
+ */
+function sanitizedRequestPath(rawUrl: string | undefined) {
+  let pathname: string;
+  try {
+    pathname = new URL(rawUrl ?? "", "http://127.0.0.1").pathname;
+  } catch {
+    return "/invalid";
+  }
+  if (pathname.startsWith("/hooks/")) return "/hooks/:source";
+  if (pathname.startsWith("/api/settings/")) return "/api/settings/:action";
+  if (pathname.startsWith("/api/")) return "/api/:route";
+  if (pathname === "/v1/logs" || pathname === "/v1/traces" || pathname === "/v1/metrics") {
+    return pathname;
+  }
+  if (pathname === "/" || pathname === "/index.html" || pathname === "/status") {
+    return pathname;
+  }
+  return "/other";
+}
+
+function allowlistedErrorClass(error: unknown) {
+  if (error instanceof SyntaxError) return "SyntaxError";
+  if (error instanceof TypeError) return "TypeError";
+  if (error instanceof RangeError) return "RangeError";
+  if (error instanceof Error) return "Error";
+  return "UnknownError";
+}
+
 /**
  * Cross-origin defense for localhost write endpoints: browsers attach an
  * Origin header to cross-site requests and cannot remove it. We accept writes
@@ -340,8 +379,8 @@ export function createCollectorServer(
           }
           try {
             buffer.setAccountAlias(aliasHash, canonicalHash);
-          } catch (error) {
-            sendJson(response, { error: error instanceof Error ? error.message : String(error) }, 400);
+          } catch {
+            sendJson(response, { error: "invalid_account_alias" }, 400);
             return;
           }
           sendJson(response, { ok: true, aliases: buffer.listAccountAliases() });
@@ -378,12 +417,8 @@ export function createCollectorServer(
             config.subscriptions = updated.subscriptions;
             buffer.projection.invalidatePresentation();
             sendJson(response, { ok: true, subscriptions: updated.subscriptions });
-          } catch (error) {
-            sendJson(
-              response,
-              { error: error instanceof Error ? error.message : "invalid subscriptions" },
-              400,
-            );
+          } catch {
+            sendJson(response, { error: "invalid_subscriptions" }, 400);
           }
           return;
         }
@@ -493,21 +528,15 @@ export function createCollectorServer(
       response.writeHead(404, { "content-type": "application/json" });
       response.end(JSON.stringify({ error: "not_found" }));
     } catch (error) {
-      console.warn(
-        JSON.stringify({
-          warning: "collector_request_rejected",
-          method: request.method,
-          path: request.url,
-          message: error instanceof Error ? error.message : String(error),
-        }),
-      );
+      const rejection = {
+        error: "collector_request_rejected",
+        errorClass: allowlistedErrorClass(error),
+        method: sanitizedRequestMethod(request.method),
+        path: sanitizedRequestPath(request.url),
+      };
+      console.warn(JSON.stringify(rejection));
       response.writeHead(400, { "content-type": "application/json" });
-      response.end(
-        JSON.stringify({
-          error: "collector_error",
-          message: error instanceof Error ? error.message : String(error),
-        }),
-      );
+      response.end(JSON.stringify(rejection));
     }
   });
 }

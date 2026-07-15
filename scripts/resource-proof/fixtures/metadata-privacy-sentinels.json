@@ -1,0 +1,15 @@
+{
+  "schemaVersion": 1,
+  "prefixLength": 14,
+  "sentinels": {
+    "prompt": "PRMPT81_Q7vK2_unique_private_prompt",
+    "response": "RSPNS81_N4xT9_unique_private_response",
+    "toolArguments": "TLARG81_B6mP3_unique_tool_arguments",
+    "absolutePath": "/private/PLPATH81_H8rW5/operator/client.txt",
+    "repositoryUrl": "https://example.invalid/PLURL81_C2jF7/private-repository.git",
+    "email": "PLEML81_V5qD8@example.invalid",
+    "credential": "Bearer PLCRED81_M3sL6_unique_token",
+    "cookie": "session=PLCOOK81_A9nR4_unique_cookie",
+    "multibyte": "PLUTF81_K2zG7_private_\u79d8\u5bc6_\ud83d\udd10"
+  }
+}

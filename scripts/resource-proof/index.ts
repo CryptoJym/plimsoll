@@ -19,6 +19,9 @@ import {
   runDuplicateStartSingleOwnerContract,
   runPoisonContinuationContract,
   runDashboardProjectionBudgetContract,
+  runIntegratedCaptureProjectionOutboxContract,
+  runMetadataPrivacySentinelsContract,
+  resourceReceiptPrivacyLeakCount,
 } from "./scenarios";
 import {
   RESOURCE_PROOF_SCHEMA,
@@ -48,10 +51,9 @@ Options:
   --require-integrated   Exit non-zero while any required scenario is fail/not_wired/skipped.
   --help                 Show this help.
 
-The default harness is truthful but not a release pass: #76 duplicate ownership,
-#77 no-change maintenance, #79 poison continuation, and #91 bounded Codex
-reconciliation, plus #80 dashboard projection, are wired; two #81 integrated
-capture/privacy scenarios remain not_wired.`);
+The default harness runs every required architecture, isolation, ownership,
+maintenance, reconciliation, projection, delivery, integrated capture, and
+metadata-privacy scenario. Pass --require-integrated for the release gate.`);
 }
 
 function summarize(scenarios: ScenarioReceipt[]) {
@@ -108,6 +110,8 @@ async function main() {
     scenarios.push(await runDuplicateStartSingleOwnerContract(sandbox));
     scenarios.push(await runPoisonContinuationContract(sandbox));
     scenarios.push(await runDashboardProjectionBudgetContract(sandbox));
+    scenarios.push(runIntegratedCaptureProjectionOutboxContract(sandbox, operatorHome));
+    scenarios.push(runMetadataPrivacySentinelsContract(sandbox, operatorHome));
     scenarios.push(
       ...loadUnwiredIntegrationScenarios(
         new Set([
@@ -116,6 +120,8 @@ async function main() {
           "poison_continuation",
           "bounded_codex_reconciliation",
           "dashboard_projection_budget",
+          "integrated_capture_projection_outbox",
+          "metadata_privacy_sentinels",
         ]),
       ),
     );
@@ -143,7 +149,29 @@ async function main() {
       summary,
       scenarios,
     };
-    const serialized = `${JSON.stringify(receipt, null, 2)}\n`;
+    let serialized = `${JSON.stringify(receipt, null, 2)}\n`;
+    const receiptPrivacyLeaks = resourceReceiptPrivacyLeakCount(serialized, operatorHome);
+    const privacyScenario = scenarios.find(
+      (scenario) => scenario.id === "metadata_privacy_sentinels",
+    );
+    if (!privacyScenario) throw new Error("MetadataPrivacyScenarioMissing");
+    privacyScenario.measurements = {
+      ...privacyScenario.measurements,
+      finalReceiptPrivacyLeaks: receiptPrivacyLeaks,
+      finalReceiptPrivacyScanPassed: receiptPrivacyLeaks === 0,
+    };
+    if (receiptPrivacyLeaks > 0) {
+      privacyScenario.status = "fail";
+      privacyScenario.detail =
+        "The final resource receipt contained a private-term leak; receipt content is omitted.";
+    }
+    receipt.summary = summarize(scenarios);
+    receipt.gateReady = receipt.summary.failed === 0 && receipt.summary.requiredIncomplete === 0;
+    receipt.overall = receipt.summary.failed > 0 ? "fail" : receipt.gateReady ? "pass" : "scaffold_ready";
+    serialized = `${JSON.stringify(receipt, null, 2)}\n`;
+    if (resourceReceiptPrivacyLeakCount(serialized, operatorHome) > 0) {
+      throw new Error("ResourceReceiptPrivacyViolation");
+    }
     if (receiptPath) {
       const resolved = path.resolve(receiptPath);
       fs.mkdirSync(path.dirname(resolved), { recursive: true });

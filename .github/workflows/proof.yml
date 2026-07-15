@@ -28,6 +28,9 @@ jobs:
       - name: Run signal-fidelity proof
         run: pnpm proof
 
+      - name: Run strict isolated resource proof
+        run: pnpm proof:resource --require-integrated --receipt evidence/resource-proof.json
+
       - name: Upload evidence artifact
         if: always()
         uses: actions/upload-artifact@v4
