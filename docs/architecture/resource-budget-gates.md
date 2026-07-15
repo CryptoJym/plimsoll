@@ -81,6 +81,7 @@ Counters are per scenario and reset before each action phase. Production lanes m
 15. **Port theft:** hold the port-0 listener, verify its assigned port, and challenge the exact address. The challenger must fail with `EADDRINUSE` before any receipt claims a reservation.
 16. **Codex context revision and ties:** create more unresolved candidates than one slice, advance a context-window cursor, then add repeated same-bucket context before reopen. The current revision must finish to its high-water before one new pass starts; tail rows cannot starve and each promoted event changes once. Separately insert equal-time/equal-distance context forward and in exact reverse order; explicit observed-time/event-ID ordering must converge to identical promoted values across duplicate replay and reopen.
 17. **Compact-GC failure, revision, and fairness:** inject failure after a segment rewrite and prove payload plus cancellation settlement rolls back together. Mutate an already-scanned day, keep a second day queued, reopen mid-pass, and prove round-robin scheduling plus a frozen high-water eventually removes every payload and receipt without scanning raw history from a request.
+18. **Pre-drain compact lifecycle:** append a compactable row and update, promote, or delete it before initial repair. Reopen between each boundary. Never-projected state must apply the latest raw value once or settle to zero; projected irrelevant updates must not duplicate; projected meaningful updates/deletes must retain exactly one old-state cancellation through GC.
 
 ## Gate sequence
 

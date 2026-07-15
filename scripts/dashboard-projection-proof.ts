@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { gunzipSync } from "node:zlib";
 
 import Database from "better-sqlite3";
 
@@ -151,6 +152,23 @@ function p95(values: number[]) {
 function projectionTableText(db: Database.Database, table: string) {
   const rows = db.prepare(`select * from ${table}`).all();
   return JSON.stringify(rows);
+}
+
+type ProofCompactItem = {
+  rawRowid: number;
+  observedAt: string;
+  source: string;
+  eventType: string;
+  actionClass: string | null;
+  windowMask: number;
+};
+
+function compactItems(db: Database.Database) {
+  const segments = db.prepare(
+    `select payload_gzip as payload from dashboard_compact_segments order by segment_id`,
+  ).all() as Array<{ payload: Buffer }>;
+  return segments.flatMap((segment) =>
+    JSON.parse(gunzipSync(segment.payload).toString("utf8")) as ProofCompactItem[]);
 }
 
 function dropProjectionState(db:Database.Database){
@@ -603,6 +621,240 @@ async function main() {
         maxSegmentsWritten:Math.max(0,...activeReceipts.map((receipt)=>receipt.compactSegmentsWritten)),
         maxGcItems:Math.max(0,...activeReceipts.map((receipt)=>receipt.compactGcItemsVisited))});
     active.close();
+
+    const pendingPath=path.join(root,"pending-compact-lifecycle.sqlite");
+    let pending=new LocalEventBuffer(pendingPath);
+    const pendingEvent=event({source:"codex",eventType:"assistant_response",actionClass:"other",
+      observedAt:new Date(NOW.getTime()-DAY_MS).toISOString()});
+    pending.append(pendingEvent);
+    const pendingRawRowid=(pending.database.prepare(
+      `select rowid as rawRowid from buffered_events where id=?`,
+    ).get(pendingEvent.id) as {rawRowid:number}).rawRowid;
+    const pendingInsertReason=(pending.database.prepare(
+      `select reason from dashboard_projection_repairs where raw_rowid=?`,
+    ).get(pendingRawRowid) as {reason:string}).reason;
+    pending.close();
+    pending=new LocalEventBuffer(pendingPath);
+    pending.database.prepare(
+      `update buffered_events set source='claude_code',event_type='tool_use',
+        action_class='read',observed_at=? where rowid=?`,
+    ).run(new Date(NOW.getTime()-2*DAY_MS).toISOString(),pendingRawRowid);
+    pending.close();
+    pending=new LocalEventBuffer(pendingPath);
+    const pendingFinalObservedAt=new Date(NOW.getTime()-3*DAY_MS).toISOString();
+    pending.database.prepare(
+      `update buffered_events set action_class='edit',observed_at=? where rowid=?`,
+    ).run(pendingFinalObservedAt,pendingRawRowid);
+    const pendingReasonBeforeDrain=(pending.database.prepare(
+      `select reason from dashboard_projection_repairs where raw_rowid=?`,
+    ).get(pendingRawRowid) as {reason:string}).reason;
+    const pendingBacklogBeforeDrain=pending.projection.status().backlog;
+    pending.close();
+    pending=new LocalEventBuffer(pendingPath);
+    const pendingReceipts=settle(pending,NOW,20);
+    const pendingProjected=readySnapshot(pending,30).summary.totals as Record<string,number>;
+    const pendingPayload=compactItems(pending.database);
+    const pendingRemaining={
+      repairs:(pending.database.prepare(`select count(*) as n from dashboard_projection_repairs`).get() as {n:number}).n,
+      mutations:(pending.database.prepare(`select count(*) as n from dashboard_compact_mutations`).get() as {n:number}).n,
+      cancellations:(pending.database.prepare(`select count(*) as n from dashboard_compact_cancellations`).get() as {n:number}).n,
+    };
+    pending.close();
+    pending=new LocalEventBuffer(pendingPath);
+    const pendingReplay=settle(pending,NOW,5);
+    check("pending_compact_insert_updates_preserve_never_projected_receipt_and_apply_latest_once",
+      pendingInsertReason==="raw_insert"&&pendingReasonBeforeDrain==="raw_insert"&&
+      pendingBacklogBeforeDrain.repairs===1&&pendingBacklogBeforeDrain.compactMutations===0&&
+      pendingReceipts.reduce((sum,row)=>sum+row.repairRowsVisited,0)===1&&
+      pendingProjected.events===1&&pendingPayload.length===1&&
+      pendingPayload[0]?.rawRowid===pendingRawRowid&&
+      pendingPayload[0]?.source==="claude_code"&&pendingPayload[0]?.eventType==="tool_use"&&
+      pendingPayload[0]?.actionClass==="edit"&&pendingPayload[0]?.observedAt===pendingFinalObservedAt&&
+      Object.values(pendingRemaining).every((value)=>value===0)&&pendingReplay.length===0,
+      {pendingInsertReason,pendingReasonBeforeDrain,pendingBacklogBeforeDrain,
+        receipts:pendingReceipts.length,projectedEvents:pendingProjected.events,
+        payload:pendingPayload,remaining:pendingRemaining,replaySlices:pendingReplay.length});
+    pending.close();
+
+    const promotePath=path.join(root,"pending-compact-promote.sqlite");
+    let promote=new LocalEventBuffer(promotePath);
+    const promoteEvent=event({source:"codex",eventType:"assistant_response",actionClass:"other"});
+    promote.append(promoteEvent);
+    const promoteRawRowid=(promote.database.prepare(
+      `select rowid as rawRowid from buffered_events where id=?`,
+    ).get(promoteEvent.id) as {rawRowid:number}).rawRowid;
+    promote.close();
+    promote=new LocalEventBuffer(promotePath);
+    promote.database.prepare(
+      `update buffered_events set session_id='pending-promote-session',model='promoted-model',
+        input_tokens=7,output_tokens=2,cost_usd=0.000009 where rowid=?`,
+    ).run(promoteRawRowid);
+    const promoteReason=(promote.database.prepare(
+      `select reason from dashboard_projection_repairs where raw_rowid=?`,
+    ).get(promoteRawRowid) as {reason:string}).reason;
+    promote.close();
+    promote=new LocalEventBuffer(promotePath);
+    settle(promote,NOW,20);
+    const promoteTotals=readySnapshot(promote,30).summary.totals as Record<string,number>;
+    const promoteState={
+      facts:(promote.database.prepare(`select count(*) as n from dashboard_event_facts`).get() as {n:number}).n,
+      compactItems:compactItems(promote.database).length,
+      repairs:(promote.database.prepare(`select count(*) as n from dashboard_projection_repairs`).get() as {n:number}).n,
+      mutations:(promote.database.prepare(`select count(*) as n from dashboard_compact_mutations`).get() as {n:number}).n,
+    };
+    promote.close();
+    promote=new LocalEventBuffer(promotePath);
+    const promoteReplay=settle(promote,NOW,5);
+    check("pending_compact_insert_promote_applies_one_full_fact_after_reopen",
+      promoteReason==="raw_insert"&&promoteState.facts===1&&promoteState.compactItems===0&&
+      promoteState.repairs===0&&promoteState.mutations===0&&promoteTotals.events===1&&
+      promoteTotals.tokenEvents===1&&promoteTotals.inputTokens===7&&promoteTotals.outputTokens===2&&
+      promoteReplay.length===0,
+      {promoteReason,promoteState,promoteTotals,replaySlices:promoteReplay.length});
+    promote.close();
+
+    const pendingDeletePath=path.join(root,"pending-compact-delete.sqlite");
+    let pendingDelete=new LocalEventBuffer(pendingDeletePath);
+    const pendingDeleteEvent=event({source:"codex",eventType:"assistant_response",actionClass:"other"});
+    pendingDelete.append(pendingDeleteEvent);
+    const pendingDeleteRawRowid=(pendingDelete.database.prepare(
+      `select rowid as rawRowid from buffered_events where id=?`,
+    ).get(pendingDeleteEvent.id) as {rawRowid:number}).rawRowid;
+    pendingDelete.close();
+    pendingDelete=new LocalEventBuffer(pendingDeletePath);
+    pendingDelete.database.prepare(`delete from buffered_events where rowid=?`).run(pendingDeleteRawRowid);
+    pendingDelete.close();
+    pendingDelete=new LocalEventBuffer(pendingDeletePath);
+    settle(pendingDelete,NOW,20);
+    const pendingDeleteTotals=readySnapshot(pendingDelete,30).summary.totals as Record<string,number>;
+    const pendingDeleteState={
+      raw:(pendingDelete.database.prepare(`select count(*) as n from buffered_events`).get() as {n:number}).n,
+      facts:(pendingDelete.database.prepare(`select count(*) as n from dashboard_event_facts`).get() as {n:number}).n,
+      segments:(pendingDelete.database.prepare(`select count(*) as n from dashboard_compact_segments`).get() as {n:number}).n,
+      repairs:(pendingDelete.database.prepare(`select count(*) as n from dashboard_projection_repairs`).get() as {n:number}).n,
+      mutations:(pendingDelete.database.prepare(`select count(*) as n from dashboard_compact_mutations`).get() as {n:number}).n,
+      cancellations:(pendingDelete.database.prepare(`select count(*) as n from dashboard_compact_cancellations`).get() as {n:number}).n,
+    };
+    check("pending_compact_insert_delete_settles_to_physical_zero_after_reopen",
+      pendingDeleteTotals.events===0&&Object.values(pendingDeleteState).every((value)=>value===0),
+      {pendingDeleteTotals,pendingDeleteState});
+    pendingDelete.close();
+
+    const failedPendingPath=path.join(root,"failed-pending-compact.sqlite");
+    let failedPending=new LocalEventBuffer(failedPendingPath);
+    failedPending.projection.failNextApplyForProof();
+    const failedPendingEvent=event({source:"codex",eventType:"assistant_response",actionClass:"other"});
+    failedPending.append(failedPendingEvent);
+    const failedPendingRawRowid=(failedPending.database.prepare(
+      `select rowid as rawRowid from buffered_events where id=?`,
+    ).get(failedPendingEvent.id) as {rawRowid:number}).rawRowid;
+    const failedPendingInitialReason=(failedPending.database.prepare(
+      `select reason from dashboard_projection_repairs where raw_rowid=?`,
+    ).get(failedPendingRawRowid) as {reason:string}).reason;
+    failedPending.close();
+    failedPending=new LocalEventBuffer(failedPendingPath);
+    failedPending.database.prepare(
+      `update buffered_events set source='claude_code',event_type='tool_use',action_class='read' where rowid=?`,
+    ).run(failedPendingRawRowid);
+    const failedPendingUpdatedReason=(failedPending.database.prepare(
+      `select reason from dashboard_projection_repairs where raw_rowid=?`,
+    ).get(failedPendingRawRowid) as {reason:string}).reason;
+    failedPending.close();
+    failedPending=new LocalEventBuffer(failedPendingPath);
+    settle(failedPending,NOW,20);
+    const failedPendingPayload=compactItems(failedPending.database);
+    check("failed_initial_compact_apply_update_preserves_never_projected_state_across_reopen",
+      failedPendingInitialReason==="projection_apply_failed"&&
+      failedPendingUpdatedReason==="projection_apply_failed"&&failedPendingPayload.length===1&&
+      failedPendingPayload[0]?.source==="claude_code"&&failedPendingPayload[0]?.eventType==="tool_use"&&
+      failedPendingPayload[0]?.actionClass==="read",
+      {failedPendingInitialReason,failedPendingUpdatedReason,payload:failedPendingPayload});
+
+    failedPending.database.prepare(
+      `update buffered_events set suppressed_fields_json='["privacy"]' where rowid=?`,
+    ).run(failedPendingRawRowid);
+    const irrelevantBacklog=failedPending.projection.status().backlog;
+    failedPending.close();
+    failedPending=new LocalEventBuffer(failedPendingPath);
+    settle(failedPending,NOW,20);
+    const irrelevantPayload=compactItems(failedPending.database);
+    const irrelevantTotals=readySnapshot(failedPending,30).summary.totals as Record<string,number>;
+    check("already_projected_compact_irrelevant_update_is_noop_not_duplicate",
+      irrelevantBacklog.repairs===1&&irrelevantBacklog.compactMutations===0&&
+      irrelevantPayload.length===1&&irrelevantTotals.events===1,
+      {irrelevantBacklog,payload:irrelevantPayload});
+
+    const meaningfulObservedAt=new Date(NOW.getTime()-4*DAY_MS).toISOString();
+    failedPending.database.prepare(
+      `update buffered_events set source='codex',event_type='tool_use',action_class='shell',
+        observed_at=? where rowid=?`,
+    ).run(meaningfulObservedAt,failedPendingRawRowid);
+    const meaningfulBacklog=failedPending.projection.status().backlog;
+    failedPending.close();
+    failedPending=new LocalEventBuffer(failedPendingPath);
+    settle(failedPending,NOW,20);
+    const meaningfulPayload=compactItems(failedPending.database);
+    const meaningfulRemaining={
+      repairs:(failedPending.database.prepare(`select count(*) as n from dashboard_projection_repairs`).get() as {n:number}).n,
+      mutations:(failedPending.database.prepare(`select count(*) as n from dashboard_compact_mutations`).get() as {n:number}).n,
+      cancellations:(failedPending.database.prepare(`select count(*) as n from dashboard_compact_cancellations`).get() as {n:number}).n,
+      gcDays:(failedPending.database.prepare(`select count(*) as n from dashboard_compact_gc_days`).get() as {n:number}).n,
+    };
+    const meaningfulSources=failedPending.database.prepare(
+      `select source,events from dashboard_source_window where days=30 and events!=0 order by source`,
+    ).all();
+    const meaningfulTotals=readySnapshot(failedPending,30).summary.totals as Record<string,number>;
+    check("already_projected_compact_meaningful_update_old_minus_new_plus_is_exact",
+      meaningfulBacklog.repairs===1&&meaningfulBacklog.compactMutations===1&&
+      meaningfulPayload.length===1&&meaningfulPayload[0]?.source==="codex"&&
+      meaningfulPayload[0]?.eventType==="tool_use"&&meaningfulPayload[0]?.actionClass==="shell"&&
+      meaningfulPayload[0]?.observedAt===meaningfulObservedAt&&
+      Object.values(meaningfulRemaining).every((value)=>value===0)&&
+      JSON.stringify(meaningfulSources)===JSON.stringify([{source:"codex",events:1}])&&
+      meaningfulTotals.events===1,
+      {meaningfulBacklog,payload:meaningfulPayload,remaining:meaningfulRemaining,
+        meaningfulSources});
+
+    failedPending.database.prepare(
+      `update buffered_events set suppressed_fields_json='["privacy","coalesced"]' where rowid=?`,
+    ).run(failedPendingRawRowid);
+    const coalescedObservedAt=new Date(NOW.getTime()-5*DAY_MS).toISOString();
+    failedPending.database.prepare(
+      `update buffered_events set source='claude_code',action_class='edit',observed_at=? where rowid=?`,
+    ).run(coalescedObservedAt,failedPendingRawRowid);
+    const coalescedBacklog=failedPending.projection.status().backlog;
+    failedPending.close();
+    failedPending=new LocalEventBuffer(failedPendingPath);
+    settle(failedPending,NOW,20);
+    const coalescedPayload=compactItems(failedPending.database);
+    check("projected_irrelevant_then_meaningful_update_coalesces_one_old_state_mutation",
+      coalescedBacklog.repairs===1&&coalescedBacklog.compactMutations===1&&
+      coalescedPayload.length===1&&coalescedPayload[0]?.source==="claude_code"&&
+      coalescedPayload[0]?.actionClass==="edit"&&
+      coalescedPayload[0]?.observedAt===coalescedObservedAt,
+      {coalescedBacklog,payload:coalescedPayload});
+
+    failedPending.database.prepare(
+      `update buffered_events set suppressed_fields_json='["privacy","delete"]' where rowid=?`,
+    ).run(failedPendingRawRowid);
+    failedPending.database.prepare(`delete from buffered_events where rowid=?`).run(failedPendingRawRowid);
+    const projectedDeleteBacklog=failedPending.projection.status().backlog;
+    failedPending.close();
+    failedPending=new LocalEventBuffer(failedPendingPath);
+    settle(failedPending,NOW,20);
+    const projectedDeleteState={
+      raw:(failedPending.database.prepare(`select count(*) as n from buffered_events`).get() as {n:number}).n,
+      facts:(failedPending.database.prepare(`select count(*) as n from dashboard_event_facts`).get() as {n:number}).n,
+      compactItems:compactItems(failedPending.database).length,
+      repairs:(failedPending.database.prepare(`select count(*) as n from dashboard_projection_repairs`).get() as {n:number}).n,
+      mutations:(failedPending.database.prepare(`select count(*) as n from dashboard_compact_mutations`).get() as {n:number}).n,
+      cancellations:(failedPending.database.prepare(`select count(*) as n from dashboard_compact_cancellations`).get() as {n:number}).n,
+    };
+    check("projected_irrelevant_update_then_delete_still_cancels_old_compact_state",
+      projectedDeleteBacklog.repairs===1&&projectedDeleteBacklog.compactMutations===1&&
+      Object.values(projectedDeleteState).every((value)=>value===0),
+      {projectedDeleteBacklog,projectedDeleteState});
+    failedPending.close();
 
     const gcPath=path.join(root,"compact-gc.sqlite");
     const gcSeed=new LocalEventBuffer(gcPath);

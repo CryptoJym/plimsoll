@@ -69,6 +69,23 @@ coherent generation while any repair is pending. In the 5,000-row active
 fixture this produces five segments across 20 maintenance slices, with at most
 one segment write per slice and no garbage-collection work during intake.
 
+Repair reasons also encode whether a row has ever entered the projection.
+
+- `raw_insert` and `projection_apply_failed` are never-projected states. Later
+  updates preserve that state and maintenance applies only the latest current
+  raw value once; a delete may discard it without a cancellation.
+- `raw_update` is an already-projected state. An irrelevant compact update may
+  drain as a no-op, but the first later meaningful update or delete records one
+  old compact contribution before the repair coalesces further changes.
+- `raw_delete` settles the previously projected fact or compact contribution
+  to zero.
+
+This ordering prevents both the missing-row failure from overwriting a pending
+insert and the inverse failure where blindly replaying every compact update
+duplicates an already-projected item. The update/delete triggers are recreated
+on open so databases created by an earlier draft receive the corrected state
+transition rules without a ledger rewrite.
+
 Compact corrections and deletes have a separate physical garbage-collection
 state machine. Each affected day has one fair-scheduled job with a revision,
 frozen processing revision, segment high-water mark, and durable cursor. A
@@ -160,6 +177,7 @@ Rejected. Distinct sessions/branches and dominant repo/account can change when o
 |---|---|
 | Projection delta fails | Raw capture commits; repair row and degraded reason persist. |
 | Raw row is deleted | The raw transaction persists a safe compact old-contribution receipt or a fact tombstone; bounded maintenance subtracts before publishing. |
+| Compact insert changes before its first repair | The never-projected receipt survives every update; maintenance reads current raw state and applies it exactly once, or settles a pending delete to zero. |
 | Compact garbage collection crashes after payload rewrite | The enclosing SQLite transaction rolls back payload, receipts, summaries, and cursor together; the same frozen segment replays after reopen. |
 | Compact day changes during garbage collection | The frozen pass reaches its segment high-water, then restarts once against the newer revision; fair day scheduling prevents another day from starving. |
 | Giant session repair crashes | Durable cursor and normalized accumulators resume; the prior snapshot remains stale/coherent until atomic finalize. |

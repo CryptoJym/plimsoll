@@ -707,7 +707,8 @@ export class DashboardProjectionStore {
           degraded_reason=case when generation>0 then 'projection_repair_backlog' else degraded_reason end
         where singleton=1;
       end;
-      create trigger if not exists trg_dashboard_raw_update
+      drop trigger if exists trg_dashboard_raw_update;
+      create trigger trg_dashboard_raw_update
       after update of source, event_type, observed_at, session_id, action_class, model,
         input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd,
         repo_hash, branch_hash, head_sha, machine, account_hash, suppressed_fields_json
@@ -725,7 +726,9 @@ export class DashboardProjectionStore {
           and old.cache_read_tokens is null and old.cache_creation_tokens is null
           and old.cost_usd is null and old.repo_hash is null and old.branch_hash is null
           and old.head_sha is null and old.account_hash is null
-          and not exists (select 1 from dashboard_projection_repairs where raw_rowid=old.rowid)
+          and not exists (select 1 from dashboard_compact_mutations where raw_rowid=old.rowid)
+          and not exists (select 1 from dashboard_projection_repairs
+            where raw_rowid=old.rowid and reason in ('raw_insert','projection_apply_failed'))
           and exists (select 1 from dashboard_projection_control
             where singleton=1 and backfill_high_water is not null
               and (old.rowid>backfill_high_water or old.rowid<=backfill_cursor))
@@ -739,12 +742,18 @@ export class DashboardProjectionStore {
         on conflict(raw_rowid) do nothing;
         insert into dashboard_projection_repairs (raw_rowid, reason, queued_at)
         values (new.rowid, 'raw_update', strftime('%Y-%m-%dT%H:%M:%fZ','now'))
-        on conflict(raw_rowid) do update set reason = excluded.reason, queued_at = excluded.queued_at;
+        on conflict(raw_rowid) do update set
+          reason=case
+            when dashboard_projection_repairs.reason in ('raw_insert','projection_apply_failed')
+              then dashboard_projection_repairs.reason
+            else excluded.reason end,
+          queued_at=excluded.queued_at;
         update dashboard_projection_control set dirty=1,
           degraded_reason=case when generation>0 then 'projection_repair_backlog' else degraded_reason end
         where singleton=1;
       end;
-      create trigger if not exists trg_dashboard_raw_delete
+      drop trigger if exists trg_dashboard_raw_delete;
+      create trigger trg_dashboard_raw_delete
       after delete on buffered_events
       begin
         insert into dashboard_compact_mutations
@@ -759,7 +768,9 @@ export class DashboardProjectionStore {
           and old.cache_read_tokens is null and old.cache_creation_tokens is null
           and old.cost_usd is null and old.repo_hash is null and old.branch_hash is null
           and old.head_sha is null and old.account_hash is null
-          and not exists (select 1 from dashboard_projection_repairs where raw_rowid=old.rowid)
+          and not exists (select 1 from dashboard_compact_mutations where raw_rowid=old.rowid)
+          and not exists (select 1 from dashboard_projection_repairs
+            where raw_rowid=old.rowid and reason in ('raw_insert','projection_apply_failed'))
           and exists (select 1 from dashboard_projection_control
             where singleton=1 and backfill_high_water is not null
               and (old.rowid>backfill_high_water or old.rowid<=backfill_cursor))
