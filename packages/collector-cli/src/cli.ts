@@ -921,7 +921,7 @@ async function main() {
           created: pushed.created,
           updated: pushed.updated,
           batches: pushed.batches,
-          skippedUnparseable: prepared.skippedUnparseable,
+          skippedInvalid: prepared.skippedInvalid,
         },
         null,
         2,

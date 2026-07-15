@@ -66,6 +66,15 @@ const idSchema = z.string().trim().min(1);
 const keySchema = z.string().trim().min(1);
 const metadataSchema = z.record(z.string(), z.unknown()).default({});
 
+/** Canonical privacy-preserving linkage used on every outbound boundary.
+ * Uppercase hexadecimal input is accepted for legacy compatibility and
+ * normalized to the exact lowercase wire representation. */
+export const canonicalLinkageSchema = z
+  .string()
+  .trim()
+  .regex(/^sha256:[a-f0-9]{64}$/i, "Expected sha256: followed by exactly 64 hexadecimal characters.")
+  .transform((value) => value.toLowerCase());
+
 export const forbiddenRawContentFieldNames = [
   "api_request_body",
   "api_response_body",
@@ -415,7 +424,7 @@ const repoDisplaySlugSchema = z
 
 export const workRepoLabelSchema = z
   .object({
-    remoteUrlHash: keySchema,
+    remoteUrlHash: canonicalLinkageSchema,
     name: repoDisplaySlugSchema,
     owner: repoDisplaySlugSchema.optional(),
     provider: z.enum(["github", "gitlab", "local_git", "unknown"]).default("github"),

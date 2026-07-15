@@ -127,6 +127,8 @@ import {
   aiWorkIngestBatchSchema,
   aiWorkSessionSyncBatchSchema,
   findForbiddenRawContentFields,
+  workRepoLabelSchema,
+  workRepoLabelsBatchSchema,
   type AiInteractionEvent,
   type AiWorkIngestBatch,
   type AiWorkSessionSyncRow,
@@ -2681,8 +2683,9 @@ async function main() {
     );
     await new Promise<void>((resolve) => repairServer.close(() => resolve()));
 
-    // 16m. Repo labels: slug parsing, label-over-priority precedence, raw
-    // URLs never on the wire, and the loopback push.
+    // 16m. Repo labels: canonical linkage, slug parsing, label-over-priority
+    // precedence, explicit preview, raw URLs never on the wire, and signed
+    // loopback push. Invalid direct callers fail before the first request.
     const slugCases =
       JSON.stringify(parseRepoSlug("github.com/cryptojym/plimsoll")) ===
         JSON.stringify({ provider: "github", owner: "cryptojym", name: "plimsoll" }) &&
@@ -2693,20 +2696,59 @@ async function main() {
       parseRepoSlug("gitlab.com/team/repo")?.provider === "gitlab" &&
       parseRepoSlug("just-a-name")?.provider === "local_git" &&
       parseRepoSlug("") === null;
+    const canonicalLabelHash = `sha256:${"a1".repeat(32)}`;
+    const uppercaseLabelHash = canonicalLabelHash.toUpperCase();
+    const canonicalDerivedHash = `sha256:${"b2".repeat(32)}`;
+    const bareLabelHash = "c3".repeat(32);
+    const shortLabelHash = "sha256:short";
+    const credentialLabelHash = "Bearer REPO_LABEL_CREDENTIAL_SENTINEL";
+    const schemaHashCases = [
+      workRepoLabelSchema.safeParse({ remoteUrlHash: canonicalLabelHash, provider: "github", owner: "cryptojym", name: "plimsoll" }),
+      workRepoLabelSchema.safeParse({ remoteUrlHash: uppercaseLabelHash, provider: "github", owner: "cryptojym", name: "plimsoll" }),
+      workRepoLabelSchema.safeParse({ remoteUrlHash: shortLabelHash, provider: "github", name: "short" }),
+      workRepoLabelSchema.safeParse({ remoteUrlHash: bareLabelHash, provider: "github", name: "bare" }),
+      workRepoLabelSchema.safeParse({ remoteUrlHash: credentialLabelHash, provider: "github", name: "credential" }),
+    ];
+    check(
+      "repo_label_shared_schema_requires_canonical_linkage",
+      schemaHashCases[0].success &&
+        schemaHashCases[0].data.remoteUrlHash === canonicalLabelHash &&
+        schemaHashCases[1].success &&
+        schemaHashCases[1].data.remoteUrlHash === canonicalLabelHash &&
+        schemaHashCases.slice(2).every((outcome) => !outcome.success),
+      JSON.stringify({ accepted: schemaHashCases.filter((outcome) => outcome.success).length, rejected: schemaHashCases.filter((outcome) => !outcome.success).length }),
+    );
     const labelCandidates = buildRepoLabelCandidates(
-      [{ repoHash: "sha256:hash1", label: "github.com/cryptojym/plimsoll" }],
       [
-        { repoHash: "sha256:hash1", url: "https://github.com/wrong/should-lose" },
-        { repoHash: "sha256:hash2", url: "https://github.com/cryptojym/derived-only" },
+        { repoHash: uppercaseLabelHash, label: "github.com/cryptojym/plimsoll" },
+        { repoHash: shortLabelHash, label: "github.com/invalid/short" },
+        { repoHash: `sha256:${"d4".repeat(32)}`, label: "" },
+      ],
+      [
+        { repoHash: canonicalLabelHash, url: "https://github.com/wrong/should-lose" },
+        { repoHash: canonicalDerivedHash, url: "https://github.com/cryptojym/derived-only" },
+        { repoHash: bareLabelHash, url: "https://github.com/invalid/bare" },
+        { repoHash: credentialLabelHash, url: "https://github.com/invalid/credential" },
       ],
     );
-    const labelPreview = renderRepoLabelPreview(labelCandidates.candidates, 0);
+    const labelPreview = renderRepoLabelPreview(labelCandidates.candidates, labelCandidates.skippedInvalid);
     const labelBodies: string[] = [];
     let labelPath = "";
+    let labelSignatureFailures = 0;
     const labelFetch: typeof fetch = async (input, init) => {
       labelPath = new URL(String(input)).pathname;
-      labelBodies.push(String(init?.body ?? ""));
-      return new Response(JSON.stringify({ ok: true, created: 2, updated: 0 }), {
+      const body = String(init?.body ?? "");
+      labelBodies.push(body);
+      const headers = new Headers(init?.headers);
+      const timestamp = String(headers.get("x-plimsoll-upload-timestamp") ?? "");
+      const signature = String(headers.get("x-plimsoll-upload-signature") ?? "");
+      const expected = `sha256=${crypto.createHmac("sha256", HISTORY_SECRET).update(`${timestamp}.${body}`).digest("hex")}`;
+      const parsed = workRepoLabelsBatchSchema.safeParse(JSON.parse(body));
+      if (!timestamp || signature !== expected || !parsed.success) {
+        labelSignatureFailures += 1;
+        return new Response(JSON.stringify({ error: "invalid_signed_batch" }), { status: 401 });
+      }
+      return new Response(JSON.stringify({ ok: true, created: parsed.data.repositories.length, updated: 0 }), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -2715,21 +2757,75 @@ async function main() {
       fetchImpl: labelFetch,
       log: () => undefined,
     });
+    const directUppercasePush = await pushRepoLabels(
+      historyConfig,
+      [{
+        remoteUrlHash: uppercaseLabelHash,
+        provider: "github",
+        owner: "cryptojym",
+        name: "plimsoll",
+        source: "repo_label",
+      }],
+      { fetchImpl: labelFetch, log: () => undefined },
+    );
+    let invalidDirectRejects = 0;
+    let invalidDirectFetches = 0;
+    const validDirectPrefix = Array.from({ length: 200 }, (_, index) => ({
+      remoteUrlHash: `sha256:${index.toString(16).padStart(64, "0")}`,
+      provider: "github" as const,
+      owner: "proof",
+      name: `repo-${index}`,
+      source: "repo_label" as const,
+    }));
+    for (const [index, remoteUrlHash] of [shortLabelHash, bareLabelHash, credentialLabelHash].entries()) {
+      try {
+        await pushRepoLabels(
+          historyConfig,
+          [
+            ...(index === 0 ? validDirectPrefix : []),
+            { remoteUrlHash, provider: "github", name: "invalid", source: "repo_label" },
+          ],
+          {
+            fetchImpl: async () => {
+              invalidDirectFetches += 1;
+              return new Response(JSON.stringify({ ok: true }), { status: 200 });
+            },
+            log: () => undefined,
+          },
+        );
+      } catch {
+        invalidDirectRejects += 1;
+      }
+    }
+    const parsedLabelBodies = labelBodies.map((body) => workRepoLabelsBatchSchema.parse(JSON.parse(body)));
     check(
       "repo_labels_disclose_slugs_never_urls",
       slugCases &&
         labelCandidates.candidates.length === 2 &&
-        labelCandidates.candidates.find((c) => c.remoteUrlHash === "sha256:hash1")?.name === "plimsoll" &&
-        labelCandidates.candidates.find((c) => c.remoteUrlHash === "sha256:hash1")?.source === "repo_label" &&
-        labelCandidates.candidates.find((c) => c.remoteUrlHash === "sha256:hash2")?.source ===
+        labelCandidates.skippedInvalid === 4 &&
+        labelCandidates.candidates.find((c) => c.remoteUrlHash === canonicalLabelHash)?.name === "plimsoll" &&
+        labelCandidates.candidates.find((c) => c.remoteUrlHash === canonicalLabelHash)?.source === "repo_label" &&
+        labelCandidates.candidates.find((c) => c.remoteUrlHash === canonicalDerivedHash)?.source ===
           "derived_from_priority_url" &&
         labelPreview.includes("derived from priority URL") &&
         labelPreview.includes("Never sent: raw URLs") &&
+        labelPreview.includes("skipped (invalid hash or slug): 4") &&
         labelPath === "/api/work-intelligence/repo-labels" &&
         pushedLabels.pushed === 2 &&
+        directUppercasePush.pushed === 1 &&
+        labelSignatureFailures === 0 &&
+        parsedLabelBodies.every((batch) =>
+          batch.repositories.every((repo) => /^sha256:[a-f0-9]{64}$/.test(repo.remoteUrlHash)),
+        ) &&
         labelBodies.every((body) => !body.includes("://")) &&
-        labelBodies.every((body) => !body.includes("should-lose")),
-      JSON.stringify({ candidates: labelCandidates.candidates.length, path: labelPath, urlLeak: labelBodies.some((b) => b.includes("://")) }),
+        labelBodies.every((body) => !body.includes("should-lose")) &&
+        labelBodies.every((body) => !body.includes(credentialLabelHash)),
+      JSON.stringify({ candidates: labelCandidates.candidates.length, skipped: labelCandidates.skippedInvalid, path: labelPath, signed: labelSignatureFailures === 0, urlLeak: labelBodies.some((b) => b.includes("://")) }),
+    );
+    check(
+      "repo_label_push_rejects_entire_direct_batch_before_http",
+      invalidDirectRejects === 3 && invalidDirectFetches === 0,
+      JSON.stringify({ rejected: invalidDirectRejects, fetches: invalidDirectFetches, validPrefixBeforeMalformed: validDirectPrefix.length }),
     );
 
     await new Promise<void>((resolve) => historyServer.close(() => resolve()));
