@@ -127,12 +127,11 @@ async function main() {
     );
 
     const summary = summarize(scenarios);
-    const anyFailure = summary.failed > 0;
-    const gateReady = !anyFailure && summary.requiredIncomplete === 0;
+    const gateReady = summary.failed === 0 && summary.requiredIncomplete === 0;
     const receipt: ResourceProofReceipt = {
       schema: RESOURCE_PROOF_SCHEMA,
       generatedAt: new Date().toISOString(),
-      overall: anyFailure ? "fail" : gateReady ? "pass" : "scaffold_ready",
+      overall: summary.failed > 0 ? "fail" : gateReady ? "pass" : "scaffold_ready",
       gateReady,
       requireIntegrated,
       environment: {
@@ -150,7 +149,14 @@ async function main() {
       scenarios,
     };
     let serialized = `${JSON.stringify(receipt, null, 2)}\n`;
-    const receiptPrivacyLeaks = resourceReceiptPrivacyLeakCount(serialized, operatorHome);
+    // Test-only seam: append one already-classified private term to the local
+    // scan input, never to the receipt, so finalized exit state can be proved
+    // without emitting the term.
+    const privacyScanInput =
+      process.env.PLIMSOLL_RESOURCE_PROOF_TEST_FINAL_PRIVACY_FAILURE === "1"
+        ? `${serialized}${operatorHome}`
+        : serialized;
+    const receiptPrivacyLeaks = resourceReceiptPrivacyLeakCount(privacyScanInput, operatorHome);
     const privacyScenario = scenarios.find(
       (scenario) => scenario.id === "metadata_privacy_sentinels",
     );
@@ -180,7 +186,9 @@ async function main() {
     }
     process.stdout.write(serialized);
 
-    if (anyFailure || (requireIntegrated && !gateReady)) process.exitCode = 1;
+    if (receipt.summary.failed > 0 || (requireIntegrated && !receipt.gateReady)) {
+      process.exitCode = 1;
+    }
   } finally {
     await removeResourceSandbox(sandbox);
   }

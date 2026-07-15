@@ -130,6 +130,16 @@ function otlpEnvelope(mode: WorkerMode, fixture: PrivacyFixture) {
           attr("authorization", fixture.sentinels.credential!),
           attr("http.request.header.cookie", fixture.sentinels.cookie!),
           attr("message", fixture.sentinels.multibyte!),
+          attr("file.path", fixture.sentinels.relativePath!),
+          attr("http.target", fixture.sentinels.percentEncodedPath!),
+          attr("working_directory", fixture.sentinels.windowsPath!),
+          attr("unicode.normalized.nfc", fixture.sentinels.unicodeNormalizationNfc!),
+          attr("unicode.normalized.nfd", fixture.sentinels.unicodeNormalizationNfd!),
+          attr(
+            fixture.sentinels.cyrillicHomoglyphKey!,
+            fixture.sentinels.cyrillicHomoglyphValue!,
+          ),
+          attr(fixture.sentinels.fullWidthKey!, fixture.sentinels.fullWidthValue!),
         ]
       : [];
   const span = (name: string, sequence: number, attributes: ReturnType<typeof attr>[]) => ({
@@ -230,10 +240,11 @@ function fileSurfaces(ledger: string) {
 }
 
 function copyOpenLedgerArtifacts(ledger: string, root: string) {
-  const copies: Array<{ kind: "database" | "wal"; path: string }> = [];
+  const copies: Array<{ kind: "database" | "wal" | "shm"; path: string }> = [];
   for (const [kind, suffix] of [
     ["database", ""],
     ["wal", "-wal"],
+    ["shm", "-shm"],
   ] as const) {
     const source = `${ledger}${suffix}`;
     if (!fs.existsSync(source)) continue;
@@ -298,7 +309,7 @@ async function run(mode: WorkerMode, root: string, operatorHome: string): Promis
   const malformedResponses: string[] = [];
   const uploadBodies: string[] = [];
   let fakeUploadCalls = 0;
-  let providerNetworkAvoided = true;
+  let uploadTransportLoopbackOnly = true;
   let projectionSlices = 0;
   let server: http.Server | undefined;
   let buffer: LocalEventBuffer | undefined;
@@ -405,7 +416,7 @@ async function run(mode: WorkerMode, root: string, operatorHome: string): Promis
             : input instanceof URL
               ? input.href
               : input.url;
-        providerNetworkAvoided &&= target.startsWith("http://127.0.0.1/");
+        uploadTransportLoopbackOnly &&= target === "http://127.0.0.1/fake-ingest";
         uploadBodies.push(String(init?.body ?? ""));
         return new Response(JSON.stringify({ accepted: 1 }), {
           status: 200,
@@ -419,8 +430,10 @@ async function run(mode: WorkerMode, root: string, operatorHome: string): Promis
       const parsed = JSON.parse(body) as { events?: unknown[] };
       return total + (Array.isArray(parsed.events) ? parsed.events.length : 0);
     }, 0);
+    checks.uploadTransportLoopbackOnly =
+      uploadTransportLoopbackOnly && fakeUploadCalls === 1;
     checks.fakeUploadAcknowledged =
-      providerNetworkAvoided &&
+      checks.uploadTransportLoopbackOnly &&
       fakeUploadCalls === 1 &&
       uploadedEnvelopeCount === 1 &&
       upload.uploadedEvents === 1 &&
@@ -436,11 +449,18 @@ async function run(mode: WorkerMode, root: string, operatorHome: string): Promis
         fixture.sentinels.credential!,
         fixture.sentinels.absolutePath!,
         fixture.sentinels.multibyte!,
+        fixture.sentinels.relativePath!,
+        fixture.sentinels.percentEncodedPath!,
+        fixture.sentinels.windowsPath!,
+        fixture.sentinels.unicodeNormalizationNfc!,
+        fixture.sentinels.unicodeNormalizationNfd!,
+        fixture.sentinels.cyrillicHomoglyphValue!,
+        fixture.sentinels.fullWidthValue!,
       ];
       for (const value of malformed) {
         const response = await postJson(
           reopenedPort,
-          `/hooks/codex?probe=${encodeURIComponent(fixture.sentinels.repositoryUrl!)}`,
+          `/hooks/codex?probe=${encodeURIComponent(fixture.sentinels.query!)}&path=${fixture.sentinels.percentEncodedPath!}`,
           `{"probe":${JSON.stringify(value)}`,
         );
         malformedResponses.push(response.text);
@@ -483,9 +503,10 @@ async function run(mode: WorkerMode, root: string, operatorHome: string): Promis
       stringLeakCount(stringSurfaces, privateTerms) +
       byteLeakCount(closedFileSurfaces, privateTerms);
     checks.privacySurfacesClean = privacyLeaks === 0;
-    checks.closedDatabaseAndWalScanned =
+    checks.openDatabaseWalAndShmCopiesScanned =
       copiedLedgerArtifacts.some((artifact) => artifact.kind === "database") &&
-      copiedLedgerArtifacts.some((artifact) => artifact.kind === "wal");
+      copiedLedgerArtifacts.some((artifact) => artifact.kind === "wal") &&
+      copiedLedgerArtifacts.some((artifact) => artifact.kind === "shm");
 
     const result: WorkerResult = {
       schema: WORKER_SCHEMA,
@@ -509,9 +530,10 @@ async function run(mode: WorkerMode, root: string, operatorHome: string): Promis
         privacyPrefixCount: sentinelPrefixes.length,
         privacySurfacesScanned: stringSurfaces.length + closedFileSurfaces.length,
         privacyLeaks,
-        providerNetworkAvoided,
+        uploadTransportLoopbackOnly,
         closedLedgerFilesScanned: closedFileSurfaces.length,
-        closedDatabaseAndWalScanned: checks.closedDatabaseAndWalScanned,
+        openLedgerArtifactCopiesScanned: copiedLedgerArtifacts.length,
+        openDatabaseWalAndShmCopiesScanned: checks.openDatabaseWalAndShmCopiesScanned,
       },
     };
     result.passed = Object.values(checks).every(Boolean);

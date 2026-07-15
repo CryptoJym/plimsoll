@@ -240,6 +240,12 @@ function isSensitiveSemanticKey(key: string) {
   return parts.some((part) => SENSITIVE_SEMANTIC_KEY_PARTS.has(part));
 }
 
+function suppressedAttributeReceipt(key: string) {
+  return /^[a-zA-Z0-9_.:+-]{1,160}$/.test(key)
+    ? `attributes.${key}`
+    : "attributes.[non_ascii_or_unbounded_key]";
+}
+
 function isSafeAnalyticalAttribute(key: string, value: unknown) {
   const allowlisted = SAFE_STRING_ATTRIBUTE_KEYS.has(key.toLowerCase());
   if (isSensitiveSemanticKey(key) && !allowlisted) return false;
@@ -260,7 +266,7 @@ function metadataSafeOtlpAttributes(
     if (isSafeAnalyticalAttribute(key, value)) {
       safe[key] = value;
     } else {
-      suppressedFields.push(`attributes.${key}`);
+      suppressedFields.push(suppressedAttributeReceipt(key));
     }
   }
   return { attrs: safe, suppressedFields };

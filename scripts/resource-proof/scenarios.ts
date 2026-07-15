@@ -1374,7 +1374,7 @@ export function runIntegratedCaptureProjectionOutboxContract(
     required: true,
     status: execution.passed ? "pass" : "fail",
     detail: execution.passed
-      ? "A minimal Node 22 child proved loopback OTLP admission, atomic raw/projection/outbox capture, coherent snapshot, reopen, duplicate and rollback safety, and one fake-transport acknowledgement."
+      ? "A minimal Node 22 child proved loopback OTLP admission, atomic raw/projection/outbox capture, coherent snapshot, reopen, duplicate and rollback safety, and one acknowledgement through an injected upload transport with an exact loopback target."
       : "The isolated capture/projection/outbox worker failed one or more required production-boundary assertions; child content is omitted.",
     durationMs: Math.round((performance.now() - execution.started) * 100) / 100,
     counters,
@@ -1406,7 +1406,7 @@ export function runMetadataPrivacySentinelsContract(
     required: true,
     status: execution.passed ? "pass" : "fail",
     detail: execution.passed
-      ? "Full and prefix sentinels plus the operator-home path were absent from live and closed SQLite surfaces, upload bytes, request logs/responses, child output, and the worker receipt."
+      ? "Full and prefix sentinels plus the operator-home path were absent from live SQLite text, open database/WAL/SHM byte copies scanned after close, surviving closed artifacts, upload bytes, request logs/responses, child output, and the worker receipt."
       : "The isolated metadata privacy worker failed a required boundary or detected a private-term leak; child content is omitted.",
     durationMs: Math.round((performance.now() - execution.started) * 100) / 100,
     counters,
