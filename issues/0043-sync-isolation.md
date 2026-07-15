@@ -19,6 +19,7 @@ Implementation branch: `agent/plimsoll-79-outbox`, originally stacked on the #77
 - `pnpm proof:outbox`: 27 deterministic checks pass using temporary SQLite files and fake `fetch`; provider network and live state are not touched.
 - `pnpm proof`: existing signal-fidelity suite passes, including upload watermark, privacy, join handshake, upload-history, session sync, and outcome sync.
 - `pnpm proof:maintenance`: 13/13 checks pass on the merged #77 scheduler/data path.
+- `pnpm exec tsx scripts/resource-proof/index.ts --receipt /tmp/plimsoll-79-resource.json`: the production `poison_continuation` scenario passes with exact counters (`outboxAttempts=3`, `deadLettersWritten=1`, `rawEventRewrites=0`), two valid acknowledgements, three bounded probes, and zero remaining delivery work. The aggregate resource harness remains truthfully `scaffold_ready` / `gateReady=false` because five unrelated required scenarios are still `not_wired`.
 - `pnpm exec tsc --noEmit -p tsconfig.json`: passes under Node 22.
 - `pnpm --dir packages/collector-cli build`: passes under Node 22.
 - `git diff --check`: passes.

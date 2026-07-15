@@ -7,7 +7,11 @@ import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import { LocalEventBuffer } from "../../packages/collector-cli/src/buffer";
-import { collectorBufferPath, collectorHome } from "../../packages/collector-cli/src/config";
+import {
+  collectorBufferPath,
+  collectorConfigSchema,
+  collectorHome,
+} from "../../packages/collector-cli/src/config";
 import { LAUNCH_AGENT_LABEL } from "../../packages/collector-cli/src/launch-agent";
 import {
   CoalescingMaintenanceScheduler,
@@ -21,6 +25,8 @@ import {
   type CollectorRuntimeIdentity,
 } from "../../packages/collector-cli/src/runtime-ownership";
 import { TranscriptTailer } from "../../packages/collector-cli/src/transcript-tailer";
+import { uploadBufferedEvents } from "../../packages/collector-cli/src/upload";
+import { aiInteractionEventSchema } from "../../packages/shared/src/index";
 import {
   WORK_COUNTER_NAMES,
   emptyWorkCounters,
@@ -668,6 +674,102 @@ function observeDirectoryEnumeration(root: string) {
       restored: record.unregistered && record.restorationVerified,
     }),
   };
+}
+
+/**
+ * Production #79 path: one deterministic remote-validation item cannot block
+ * later valid rows or cause raw evidence rewrites.
+ */
+export async function runPoisonContinuationContract(
+  sandbox: ResourceSandbox,
+): Promise<ScenarioReceipt> {
+  const started = performance.now();
+  const config = collectorConfigSchema.parse({
+    uploadUrl: "http://127.0.0.1:1/fake-ingest",
+    installKey: "resource-proof-install",
+    delivery: { maxOldestAgeDays: 3650, requestTimeoutSeconds: 1 },
+  });
+  const buffer = new LocalEventBuffer(path.join(sandbox.plimsollHome, "poison-continuation.sqlite"), {
+    delivery: { enabled: true, limits: config.delivery },
+  });
+  const eventId = (n: number) =>
+    `00000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
+  const poisonId = eventId(1);
+  const events = [1, 2, 3].map((n) =>
+    aiInteractionEventSchema.parse({
+      id: eventId(n),
+      sessionId: eventId(100 + n),
+      source: "codex",
+      dataMode: "metadata",
+      eventType: "assistant_response",
+      observedAt: new Date(Date.now() + n * 1_000).toISOString(),
+      actionClass: "other",
+      inputTokens: n,
+      outputTokens: 1,
+      metadata: { resourceProof: true },
+    }),
+  );
+  try {
+    for (const event of events) buffer.append(event);
+    const before = buffer.delivery.status();
+    const payloadsBefore = buffer.database
+      .prepare(`select id, payload_json as payload from buffered_events order by id`)
+      .all() as Array<{ id: string; payload: string }>;
+    let probes = 0;
+    const result = await uploadBufferedEvents(config, buffer, {
+      fetchImpl: async (_input, init) => {
+        probes += 1;
+        const body = JSON.parse(String(init?.body ?? "{}")) as {
+          events: Array<{ event: { id: string } }>;
+        };
+        const ids = body.events.map((entry) => entry.event.id);
+        return new Response(JSON.stringify({ accepted: ids.length }), {
+          status: ids.includes(poisonId) ? 422 : 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+      maxProbes: 15,
+    });
+    const after = buffer.delivery.status();
+    const payloadsAfter = buffer.database
+      .prepare(`select id, payload_json as payload from buffered_events order by id`)
+      .all() as Array<{ id: string; payload: string }>;
+    const acknowledgedIds = result.batch?.events.map((entry) => entry.event.id) ?? [];
+    const counters = emptyWorkCounters();
+    counters.outboxAttempts = after.counters.outboxAttempts - before.counters.outboxAttempts;
+    counters.deadLettersWritten =
+      after.counters.deadLettersWritten - before.counters.deadLettersWritten;
+    counters.rawEventRewrites =
+      JSON.stringify(payloadsBefore) === JSON.stringify(payloadsAfter) ? 0 : 1;
+    const passed =
+      result.uploadedEvents === 2 &&
+      result.delivery.deadLetters === 1 &&
+      after.remainingDelivery === 0 &&
+      counters.outboxAttempts === 3 &&
+      counters.deadLettersWritten === 1 &&
+      counters.rawEventRewrites === 0 &&
+      acknowledgedIds.length === 2 &&
+      !acknowledgedIds.includes(poisonId) &&
+      probes <= 7;
+    return {
+      id: "poison_continuation",
+      required: true,
+      status: passed ? "pass" : "fail",
+      detail: passed
+        ? "One remote-validation poison item was quarantined once; both later valid items were acknowledged with zero raw payload rewrites."
+        : "Poison continuation counters or acknowledged-only batch semantics did not match the production delivery seam.",
+      durationMs: Math.round((performance.now() - started) * 100) / 100,
+      counters,
+      measurements: {
+        probes,
+        acknowledgedEvents: result.uploadedEvents,
+        remainingDelivery: after.remainingDelivery,
+        acknowledgedBatchEvents: acknowledgedIds.length,
+      },
+    };
+  } finally {
+    buffer.close();
+  }
 }
 
 /**
