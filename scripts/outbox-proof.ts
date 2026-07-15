@@ -50,6 +50,15 @@ function event(n: number, input: Record<string, unknown> = {}) {
   });
 }
 
+function bulkyAllowedMetadata(count = 16) {
+  return {
+    otelSignalNames: Array.from(
+      { length: count },
+      (_, index) => `signal_${String(index).padStart(2, "0")}_${"x".repeat(145)}`,
+    ),
+  };
+}
+
 function enabledBuffer(file = ledger(), overrides: Record<string, number> = {}) {
   const cfg = config(overrides);
   return {
@@ -249,6 +258,70 @@ function migrationProof() {
     },
   );
   sliceBoundBuffer.close();
+
+  const utf8File = ledger();
+  const utf8Seed = new LocalEventBuffer(utf8File);
+  utf8Seed.append(event(23, { metadata: { note: "😀".repeat(300) } }));
+  const utf8Lengths = utf8Seed.database
+    .prepare(
+      `select length(payload_json) as characters,
+         length(cast(payload_json as blob)) as bytes
+       from buffered_events where id = ?`,
+    )
+    .get(uuid(23)) as { characters: number; bytes: number };
+  utf8Seed.close();
+  const utf8Config = config({
+    maxItemBytes: 8_192,
+    migrationBatchRows: 10,
+    migrationBatchBytes: 1_024,
+  });
+  const utf8Buffer = new LocalEventBuffer(utf8File, {
+    delivery: { enabled: true, limits: utf8Config.delivery },
+  });
+  const utf8Paused = utf8Buffer.delivery.migrateLegacy({
+    maxRows: 10,
+    maxBytes: 1_024,
+    now: instant(33),
+  }) as {
+    paused: "pressure" | "slice_budget_too_small" | null;
+    visited: number;
+    bytes: number;
+  };
+  const utf8ActiveWhilePaused = (utf8Buffer.database
+    .prepare(`select count(*) as n from upload_outbox`)
+    .get() as { n: number }).n;
+  const utf8Resumed = utf8Buffer.delivery.migrateLegacy({
+    maxRows: 10,
+    maxBytes: 8_192,
+    now: instant(34),
+  });
+  const utf8Active = utf8Buffer.database
+    .prepare(
+      `select base_bytes as baseBytes,
+         length(cast(base_envelope_json as blob)) as actualBytes
+       from upload_outbox`,
+    )
+    .get() as { baseBytes: number; actualBytes: number };
+  record(
+    "utf8_byte_caps_use_blob_and_buffer_bytes_not_characters",
+    utf8Lengths.bytes > 1_024 &&
+      utf8Lengths.characters < utf8Lengths.bytes &&
+      utf8Paused.paused === "slice_budget_too_small" &&
+      utf8Paused.visited === 0 &&
+      utf8Paused.bytes === 0 &&
+      utf8ActiveWhilePaused === 0 &&
+      utf8Resumed.enqueued === 1 &&
+      utf8Active.baseBytes === utf8Active.actualBytes,
+    {
+      rawCharacters: utf8Lengths.characters,
+      rawBytes: utf8Lengths.bytes,
+      paused: utf8Paused.paused,
+      activeWhilePaused: utf8ActiveWhilePaused,
+      resumed: utf8Resumed,
+      activeBytes: utf8Active,
+    },
+  );
+  utf8Buffer.close();
 }
 
 async function migrationReopenProof() {
@@ -806,6 +879,106 @@ async function noMarkPressureAndPrivacyProof() {
     buffer.close();
   }
   {
+    const file = ledger();
+    const buffer = new LocalEventBuffer(file);
+    const tokenSentinel = "STATELESS_ACCESS_TOKEN_SENTINEL";
+    const malformedLinkage = "sha256:not-a-canonical-linkage";
+    buffer.append(event(141, { metadata: { accessToken: tokenSentinel } }));
+    buffer.append(event(142, { projectKey: malformedLinkage }));
+    const before = buffer.database
+      .prepare(`select count(*) as raw, sum(uploaded_at is not null) as uploaded from buffered_events`)
+      .get() as { raw: number; uploaded: number };
+    let calls = 0;
+    const rejectedOnly = await uploadBufferedEvents(config(), buffer, {
+      markUploaded: false,
+      fetchImpl: async () => {
+        calls += 1;
+        return response(200, { accepted: 1 });
+      },
+      now: () => instant(710),
+    });
+    const validId = uuid(143);
+    buffer.append(event(143, { metadata: { serviceName: "collector-proof" } }));
+    let requestBody = "";
+    const withValid = await uploadBufferedEvents(config(), buffer, {
+      markUploaded: false,
+      fetchImpl: async (_input, init) => {
+        calls += 1;
+        requestBody = String(init?.body ?? "");
+        return response(200, { accepted: requestIds(init).length });
+      },
+      now: () => instant(711),
+    });
+    const after = buffer.database
+      .prepare(`select count(*) as raw, sum(uploaded_at is not null) as uploaded from buffered_events`)
+      .get() as { raw: number; uploaded: number };
+    record(
+      "no_mark_uses_same_sealed_envelope_privacy_boundary",
+      rejectedOnly.uploadedEvents === 0 &&
+        calls === 1 &&
+        withValid.uploadedEvents === 1 &&
+        requestIds({ body: requestBody }).join(",") === validId &&
+        !requestBody.includes(tokenSentinel) &&
+        !requestBody.includes(malformedLinkage) &&
+        before.raw === 2 &&
+        before.uploaded === 0 &&
+        after.raw === 3 &&
+        after.uploaded === 0,
+      {
+        calls,
+        rejectedUploaded: rejectedOnly.uploadedEvents,
+        validUploaded: withValid.uploadedEvents,
+        requestIds: requestIds({ body: requestBody }),
+        stateBefore: before,
+        stateAfter: after,
+      },
+    );
+    buffer.close();
+  }
+  {
+    const buffer = new LocalEventBuffer(ledger());
+    const oversizedId = uuid(144);
+    const laterId = uuid(145);
+    buffer.append(event(144, { metadata: bulkyAllowedMetadata(64) }));
+    buffer.append(aiInteractionEventSchema.parse({
+      id: laterId,
+      source: "codex",
+      eventType: "unknown",
+      observedAt: instant(712).toISOString(),
+      metadata: {},
+    }));
+    const bodies: string[] = [];
+    const result = await uploadBufferedEvents(config(), buffer, {
+      markUploaded: false,
+      maxBytes: 512,
+      fetchImpl: async (_input, init) => {
+        bodies.push(String(init?.body ?? ""));
+        return response(200, { accepted: requestIds(init).length });
+      },
+      now: () => instant(713),
+    });
+    const state = buffer.database
+      .prepare(`select count(*) as raw, sum(uploaded_at is not null) as uploaded from buffered_events`)
+      .get() as { raw: number; uploaded: number };
+    record(
+      "no_mark_exact_request_cap_skips_local_oversize_for_later_eligible",
+      bodies.length === 1 &&
+        Buffer.byteLength(bodies[0]) <= 512 &&
+        requestIds({ body: bodies[0] }).join(",") === laterId &&
+        !bodies[0].includes(oversizedId) &&
+        result.uploadedEvents === 1 &&
+        state.raw === 2 &&
+        state.uploaded === 0,
+      {
+        requestBytes: bodies.map((body) => Buffer.byteLength(body)),
+        requestIds: requestIds({ body: bodies[0] }),
+        uploadedEvents: result.uploadedEvents,
+        state,
+      },
+    );
+    buffer.close();
+  }
+  {
     const { buffer } = enabledBuffer(undefined, { maxActiveRows: 2, maxActiveBytes: 10_000_000 });
     for (const n of [150, 151, 152]) buffer.append(event(n));
     const pressure = buffer.delivery.status(instant(800));
@@ -867,7 +1040,7 @@ async function noMarkPressureAndPrivacyProof() {
 
 async function hostilePrivacyAndLinkageProof() {
   const { buffer, cfg } = enabledBuffer();
-  const hostile = [
+  const rejected: Array<{ metadata: Record<string, unknown>; sentinel: string }> = [
     ["accessToken", "CAMEL_CREDENTIAL_SENTINEL_7a9f"],
     ["AccessToken", "PASCAL_CREDENTIAL_SENTINEL_7b9f"],
     ["refresh_token", "SNAKE_CREDENTIAL_SENTINEL_7c9f"],
@@ -883,15 +1056,70 @@ async function hostilePrivacyAndLinkageProof() {
     ["requestURL", "URL_CREDENTIAL_SENTINEL_869f"],
     ["branchHash", "sha256:branch-digest-short-879f"],
     ["repoHash", "sha256:repo-digest-short-889f"],
-    ["remoteHash", "sha256:remote-digest-short-899f"],
     ["remoteUrlHash", "sha256:remote-url-digest-short-8a9f"],
-  ] as const;
-  hostile.forEach(([key, sentinel], index) => {
-    buffer.append(event(700 + index, { metadata: { [key]: sentinel } }));
+    ["apiKey", "API_KEY_SENTINEL"],
+    ["API.Key", "API_DOT_KEY_SENTINEL"],
+    ["privateKey", "PRIVATE_KEY_SENTINEL"],
+    ["private-key", "PRIVATE_DASH_KEY_SENTINEL"],
+    ["signingKey", "SIGNING_KEY_SENTINEL"],
+    ["SIGNING_key", "SIGNING_SNAKE_KEY_SENTINEL"],
+    ["sshKey", "SSH_KEY_SENTINEL"],
+    ["homeDirectory", "HOME_DIRECTORY_SENTINEL"],
+    ["home.directory", "HOME_DOT_DIRECTORY_SENTINEL"],
+    ["working-directory", "WORKING_DIRECTORY_SENTINEL"],
+    ["fileName", "FILE_NAME_SENTINEL"],
+    ["file_name", "FILE_SNAKE_NAME_SENTINEL"],
+    ["apiKeyHash", `sha256:${"10".repeat(32)}`],
+    ["privateKeyHash", `sha256:${"20".repeat(32)}`],
+    ["passwordRepoHash", `sha256:${"30".repeat(32)}`],
+    ["authRemoteHash", `sha256:${"40".repeat(32)}`],
+    ["credentialPathHash", `sha256:${"50".repeat(32)}`],
+    ["secretRepoHash", `sha256:${"60".repeat(32)}`],
+  ].map(([key, sentinel]) => ({ metadata: { [key]: sentinel }, sentinel }));
+  rejected.push({
+    metadata: { git: { passwordRepoHash: `sha256:${"70".repeat(32)}` } },
+    sentinel: `sha256:${"70".repeat(32)}`,
+  });
+  const allowedStringKeys = [
+    "action_class", "call_id", "cfo_one.action_class", "cliVersion",
+    "db.operation.name", "db.system", "decision", "error.type", "event.name",
+    "exception.type", "gen_ai.request.model", "gen_ai.response.id", "gen_ai.system",
+    "gen_ai.tool.name", "http.request.method", "mcp_server", "model", "originator",
+    "otelEventName", "otelOriginalActionClass", "planType", "plimsoll.action_class",
+    "request_id", "rpc.method", "rpc.service", "rpc.system", "serviceName",
+    "serviceVersion", "spanId", "status.code", "stitched", "tool",
+    "toolClassDetail", "toolName", "tool_name", "traceId", "type", "usageSource",
+  ];
+  for (const key of allowedStringKeys) {
+    for (const sentinel of [
+      `relative/path/${key}`,
+      `relative%2Fpath-${key}`,
+      `relative\\path-${key}`,
+    ]) {
+      rejected.push({ metadata: { [key]: sentinel }, sentinel });
+    }
+  }
+  rejected.forEach((entry, index) => {
+    buffer.append(event(3_000 + index, { metadata: entry.metadata }));
   });
 
-  const invalidLinkageId = uuid(720);
-  buffer.append(event(720, {
+  const omitted = [
+    ["remoteHash", "UNKNOWN_REMOTE_HASH_SENTINEL"],
+    ["cwd", "CWD_SENTINEL"],
+    ["sеcret", "CYRILLIC_SECRET_SENTINEL"],
+    ["passwоrd", "CYRILLIC_PASSWORD_SENTINEL"],
+    ["api🔑Key", "EMOJI_KEY_SENTINEL"],
+    ["密钥", "CJK_KEY_SENTINEL"],
+  ] as const;
+  const omittedIds = new Map<string, string>();
+  omitted.forEach(([key, sentinel], index) => {
+    const id = uuid(4_000 + index);
+    omittedIds.set(id, key);
+    buffer.append(event(4_000 + index, { metadata: { [key]: sentinel } }));
+  });
+
+  const invalidLinkageId = uuid(4_100);
+  buffer.append(event(4_100, {
     metadata: {
       transport_path: "/v1/traces",
       cacheReadTokens: 3,
@@ -908,8 +1136,8 @@ async function hostilePrivacyAndLinkageProof() {
   const malformedLinkage = "sha256:LINKAGE_SECRET_SENTINEL_8b4e";
   buffer.delivery.fillLinkageForRawRow(invalidRowid, malformedLinkage, null);
 
-  const canonicalLinkageId = uuid(721);
-  buffer.append(event(721, { metadata: { transport_path: "/v1/metrics" } }));
+  const canonicalLinkageId = uuid(4_101);
+  buffer.append(event(4_101, { metadata: { transport_path: "/v1/metrics" } }));
   const canonicalRowid = (buffer.database
     .prepare(`select rowid as rowid from buffered_events where id = ?`)
     .get(canonicalLinkageId) as { rowid: number }).rowid;
@@ -917,12 +1145,19 @@ async function hostilePrivacyAndLinkageProof() {
   const lowerCanonical = `sha256:${"ab".repeat(32)}`;
   buffer.delivery.fillLinkageForRawRow(canonicalRowid, upperCanonical, null);
 
-  const metadataLinkageId = uuid(722);
+  const metadataLinkageId = uuid(4_102);
   const branchCanonical = `sha256:${"cd".repeat(32)}`;
   const headSha = "e".repeat(40);
-  buffer.append(event(722, {
+  buffer.append(event(4_102, {
     metadata: {
       transport_path: "/v1/logs",
+      serviceName: "collector-proof",
+      toolName: "codex",
+      originator: "local_cli",
+      "gen_ai.response.id": "resp_proof_001",
+      otelEventName: "thread/resume",
+      "event.name": "persist/rollout/items",
+      otelSignalNames: ["thread/read", "safe_signal"],
       git: {
         remoteUrlHash: lowerCanonical,
         branchHash: branchCanonical,
@@ -972,8 +1207,9 @@ async function hostilePrivacyAndLinkageProof() {
     )
     .get() as { text: string };
   const statusJson = JSON.stringify(buffer.delivery.status(instant(3_001)));
-  const hostileSentinels = hostile.map(([, sentinel]) => sentinel);
-  const forbidden = [...hostileSentinels, malformedLinkage];
+  const rejectedSentinels = rejected.map((entry) => entry.sentinel);
+  const omittedSentinels = omitted.map(([, sentinel]) => sentinel);
+  const forbidden = [...rejectedSentinels, ...omittedSentinels, malformedLinkage];
   const absentEverywhere = forbidden.every((sentinel) =>
     !beforeRows.some((row) => `${row.base}|${row.sealed}|${row.repoHash ?? ""}`.includes(sentinel)) &&
     !requestBody.includes(sentinel) &&
@@ -984,19 +1220,24 @@ async function hostilePrivacyAndLinkageProof() {
   const canonicalSent = sent.events.find((entry) => entry.event.id === canonicalLinkageId)?.event;
   const metadataLinkageSent = sent.events.find((entry) => entry.event.id === metadataLinkageId)?.event;
   const metadataGit = metadataLinkageSent?.metadata.git as Record<string, unknown> | undefined;
+  const unknownKeysOmitted = [...omittedIds.entries()].every(([id, key]) => {
+    const delivered = sent.events.find((entry) => entry.event.id === id)?.event;
+    return delivered !== undefined && !(key in delivered.metadata);
+  });
   record(
     "normalized_sensitive_keys_and_noncanonical_linkage_never_enter_delivery_surfaces",
-    deadBefore.length === hostile.length &&
+    deadBefore.length === rejected.length &&
       deadBefore.every((row) => row.reason === "local_privacy_violation") &&
-      beforeRows.length === 3 &&
+      beforeRows.length === omitted.length + 3 &&
       beforeRows.find((row) => row.id === invalidLinkageId)?.repoHash === null &&
       beforeRows.find((row) => row.id === canonicalLinkageId)?.repoHash === lowerCanonical &&
-      uploaded.uploadedEvents === 3 &&
+      uploaded.uploadedEvents === omitted.length + 3 &&
       absentEverywhere &&
+      unknownKeysOmitted &&
       invalidSent?.projectKey === undefined &&
       canonicalSent?.projectKey === lowerCanonical &&
       invalidSent?.metadata.transport_path === "/v1/traces" &&
-      invalidSent?.inputTokens === 721 &&
+      invalidSent?.inputTokens === 4_101 &&
       invalidSent?.outputTokens === 1 &&
       invalidSent?.metadata.cacheReadTokens === 3 &&
       invalidSent?.metadata.cache_creation_tokens === 4 &&
@@ -1007,12 +1248,20 @@ async function hostilePrivacyAndLinkageProof() {
       metadataLinkageSent?.projectKey === lowerCanonical &&
       metadataGit?.remoteUrlHash === lowerCanonical &&
       metadataGit?.branchHash === branchCanonical &&
-      metadataGit?.headSha === headSha,
+      metadataGit?.headSha === headSha &&
+      metadataLinkageSent?.metadata.serviceName === "collector-proof" &&
+      metadataLinkageSent?.metadata.toolName === "codex" &&
+      metadataLinkageSent?.metadata.originator === "local_cli" &&
+      metadataLinkageSent?.metadata["gen_ai.response.id"] === "resp_proof_001" &&
+      metadataLinkageSent?.metadata.otelEventName === "thread/resume" &&
+      metadataLinkageSent?.metadata["event.name"] === "persist/rollout/items" &&
+      JSON.stringify(metadataLinkageSent?.metadata.otelSignalNames) === JSON.stringify(["thread/read", "safe_signal"]),
     {
       hostileDead: deadBefore.length,
       activeBefore: beforeRows.length,
       uploaded: uploaded.uploadedEvents,
       absentEverywhere,
+      unknownKeysOmitted,
       invalidProjectKey: invalidSent?.projectKey ?? null,
       canonicalProjectKey: canonicalSent?.projectKey ?? null,
       metadataProjectKey: metadataLinkageSent?.projectKey ?? null,
@@ -1033,6 +1282,191 @@ async function hostilePrivacyAndLinkageProof() {
   buffer.close();
 }
 
+async function requestBudgetAndResumableValidationProof() {
+  {
+    const { buffer, cfg } = enabledBuffer(undefined, {
+      maxItemBytes: 20_000,
+      maxProbesPerCycle: 8,
+    });
+    const oversizedId = uuid(2_300);
+    const laterId = uuid(2_301);
+    buffer.append(event(2_300, { metadata: bulkyAllowedMetadata(64) }));
+    buffer.append(aiInteractionEventSchema.parse({
+      id: laterId,
+      source: "codex",
+      dataMode: "metadata",
+      eventType: "unknown",
+      observedAt: instant(4_000).toISOString(),
+      metadata: {},
+    }));
+    const requestBodies: string[] = [];
+    const partial = await uploadBufferedEvents(cfg, buffer, {
+      limit: 2,
+      maxBytes: 512,
+      fetchImpl: async (_input, init) => {
+        requestBodies.push(String(init?.body ?? ""));
+        return response(200, { accepted: requestIds(init).length });
+      },
+      now: () => instant(4_001),
+    });
+    const deferred = buffer.database
+      .prepare(
+        `select state, last_failure_class as failure
+         from upload_outbox where delivery_id = ?`,
+      )
+      .get(oversizedId) as { state: string; failure: string };
+    const firstState = buffer.database
+      .prepare(
+        `select id, uploaded_at as uploadedAt from buffered_events
+         where id in (?, ?) order by id`,
+      )
+      .all(oversizedId, laterId) as Array<{ id: string; uploadedAt: string | null }>;
+    const deadBeforeRaise = (buffer.database
+      .prepare(`select count(*) as n from upload_receipts where terminal_state = 'dead'`)
+      .get() as { n: number }).n;
+    const firstRequestBytes = requestBodies.map((body) => Buffer.byteLength(body));
+    const raised = await uploadBufferedEvents(cfg, buffer, {
+      limit: 2,
+      maxBytes: 20_000,
+      fetchImpl: async (_input, init) => {
+        requestBodies.push(String(init?.body ?? ""));
+        return response(200, { accepted: requestIds(init).length });
+      },
+      now: () => instant(4_100),
+    });
+    const finalStatus = buffer.delivery.status(instant(4_100));
+    record(
+      "serialized_request_cap_defers_oversize_without_starving_later_work",
+      partial.uploadedEvents === 1 &&
+        firstRequestBytes.length === 1 &&
+        firstRequestBytes.every((bytes) => bytes <= 512) &&
+        requestIds({ body: requestBodies[0] }).join(",") === laterId &&
+        deferred.state === "retry" &&
+        deferred.failure === "local_request_budget" &&
+        firstState.find((row) => row.id === oversizedId)?.uploadedAt === null &&
+        firstState.find((row) => row.id === laterId)?.uploadedAt !== null &&
+        deadBeforeRaise === 0 &&
+        raised.uploadedEvents === 1 &&
+        requestIds({ body: requestBodies[1] }).join(",") === oversizedId &&
+        finalStatus.remainingDelivery === 0 &&
+        finalStatus.circuit.kind === "none",
+      {
+        firstRequestBytes,
+        firstRequestIds: requestIds({ body: requestBodies[0] }),
+        deferred,
+        firstState,
+        deadBeforeRaise,
+        raisedUploaded: raised.uploadedEvents,
+        finalRemaining: finalStatus.remainingDelivery,
+      },
+    );
+    buffer.close();
+  }
+
+  {
+    const { buffer, cfg } = enabledBuffer(undefined, {
+      maxProbesPerCycle: 1,
+      maxBackoffSeconds: 30,
+    });
+    const firstId = uuid(2_400);
+    const poisonId = uuid(2_401);
+    const laterId = uuid(2_402);
+    buffer.append(event(2_400, { metadata: { serviceName: "valid-first" } }));
+    buffer.append(event(2_401, { metadata: { serviceName: "poison" } }));
+    buffer.append(event(2_402, { metadata: { serviceName: "valid-later" } }));
+    const groups: string[][] = [];
+    const rootLeaseSizes: number[] = [];
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      const ids = requestIds(init);
+      groups.push(ids);
+      return ids.includes(poisonId)
+        ? response(422, { error: "proof poison" })
+        : response(200, { accepted: ids.length });
+    };
+    await expectDeliveryError(
+      () => uploadBufferedEvents(cfg, buffer, {
+        limit: 12,
+        maxProbes: 1,
+        fetchImpl,
+        now: () => instant(4_200),
+      }),
+      "remote_validation",
+    );
+    const capAfterSplit = (buffer.database
+      .prepare(`select validation_probe_rows as n from upload_control where singleton = 1`)
+      .get() as { n: number }).n;
+
+    const backlogIds: string[] = [];
+    for (let n = 2_410; n < 2_422; n += 1) {
+      backlogIds.push(uuid(n));
+      buffer.append(event(n, { metadata: { serviceName: `valid-backlog-${n}` } }));
+    }
+    const observedCaps: number[] = [];
+    for (let cycle = 0; cycle < 12; cycle += 1) {
+      try {
+        const result = await uploadBufferedEvents(cfg, buffer, {
+          limit: 12,
+          maxProbes: 1,
+          fetchImpl,
+          now: () => instant(4_300 + cycle * 40),
+        });
+        rootLeaseSizes.push(
+          "rootLeaseEvents" in result.delivery
+            ? result.delivery.rootLeaseEvents
+            : 0,
+        );
+      } catch (error) {
+        if (!(error instanceof DeliveryUploadError)) throw error;
+      }
+      observedCaps.push((buffer.database
+        .prepare(`select validation_probe_rows as n from upload_control where singleton = 1`)
+        .get() as { n: number }).n);
+      const uploadedValid = (buffer.database
+        .prepare(
+          `select count(*) as n from buffered_events
+           where id <> ? and uploaded_at is not null`,
+        )
+        .get(poisonId) as { n: number }).n;
+      if (uploadedValid === backlogIds.length + 2) break;
+    }
+    const validState = buffer.database
+      .prepare(
+        `select id, uploaded_at as uploadedAt from buffered_events
+         where id <> ?`,
+      )
+      .all(poisonId) as Array<{ id: string; uploadedAt: string | null }>;
+    const poisonReceipts = buffer.database
+      .prepare(`select reason from upload_receipts where delivery_id = ?`)
+      .all(poisonId) as Array<{ reason: string }>;
+    const finalStatus = buffer.delivery.status(instant(4_500));
+    const initialGroupRepeats = groups.filter((ids) => ids.join(",") === [firstId, poisonId, laterId].join(",")).length;
+    record(
+      "max_probe_one_resumes_isolation_and_adaptively_recovers_throughput",
+      capAfterSplit === 1 &&
+        rootLeaseSizes.slice(0, 3).join(",") === "1,2,4" &&
+        observedCaps.includes(2) &&
+        observedCaps.includes(4) &&
+        validState.every((row) => row.uploadedAt !== null) &&
+        initialGroupRepeats <= 2 &&
+        groups.slice(1, 4).every((ids) => !ids.includes(poisonId)) &&
+        poisonReceipts.every((row) => row.reason === "remote_validation_rejected") &&
+        finalStatus.circuit.kind === "none",
+      {
+        capAfterSplit,
+        rootLeaseSizes,
+        observedCaps,
+        groupSizes: groups.map((ids) => ids.length),
+        initialGroupRepeats,
+        uploadedValid: validState.filter((row) => row.uploadedAt !== null).length,
+        expectedValid: backlogIds.length + 2,
+        poisonReceipts,
+        circuit: finalStatus.circuit.kind,
+      },
+    );
+    buffer.close();
+  }
+}
+
 function pressureAgeByteOversizeAndStatusProof() {
   {
     const file = ledger();
@@ -1049,14 +1483,14 @@ function pressureAgeByteOversizeAndStatusProof() {
   }
   {
     const { buffer } = enabledBuffer(undefined, { maxActiveBytes: 200, maxItemBytes: 10_000 });
-    buffer.append(event(171, { metadata: { bounded: "x".repeat(500) } }));
+    buffer.append(event(171, { metadata: bulkyAllowedMetadata(8) }));
     const status = buffer.delivery.status(instant(1001));
     record("active_byte_pressure_exact", status.active.bytes > 200 && status.pressure.reasons.includes("byte_budget"), { activeBytes: status.active.bytes, budget: status.pressure.budgets.bytes });
     buffer.close();
   }
   {
     const { buffer } = enabledBuffer(undefined, { maxItemBytes: 1_024 });
-    buffer.append(event(172, { metadata: { bounded: "x".repeat(2_000) } }));
+    buffer.append(event(172, { metadata: bulkyAllowedMetadata(16) }));
     const status = buffer.delivery.status(instant(1002));
     const receipt = buffer.database.prepare(`select reason from upload_receipts`).get() as { reason: string };
     record("oversize_dead_before_http_or_active_queue", status.remainingDelivery === 0 && receipt.reason === "local_item_oversize" && status.receipts.dead === 1, { remaining: status.remainingDelivery, reason: receipt.reason });
@@ -1069,10 +1503,24 @@ function pressureAgeByteOversizeAndStatusProof() {
     const plan = buffer.database
       .prepare(`explain query plan select * from upload_control where singleton = 1`)
       .all() as Array<{ detail: string }>;
+    const rawLinkagePlan = buffer.database
+      .prepare(
+        `explain query plan
+         update upload_outbox set repo_hash = coalesce(repo_hash, ?)
+         where raw_rowid = ? and sealed_envelope_json is null and attempt_count = 0`,
+      )
+      .all(`sha256:${"ab".repeat(32)}`, 1) as Array<{ detail: string }>;
     record(
       "status_uses_singleton_gauges_not_history_aggregates",
       status.remainingDelivery === 100 && status.work.controlRowsRead === 1 && status.work.activeRowsScanned === 0 && status.work.receiptRowsScanned === 0 && status.work.rawRowsScanned === 0 && plan.some((row) => /primary key|integer primary key/i.test(row.detail)),
       { remaining: status.remainingDelivery, work: status.work, plan: plan.map((row) => row.detail).join(" | ") },
+    );
+    record(
+      "raw_rowid_fill_linkage_uses_dedicated_index",
+      rawLinkagePlan.some((row) =>
+        /search upload_outbox using index idx_upload_outbox_raw_rowid/i.test(row.detail),
+      ),
+      { plan: rawLinkagePlan.map((row) => row.detail).join(" | ") },
     );
     buffer.close();
   }
@@ -1092,6 +1540,7 @@ async function main() {
     await linkageAndRetentionProof();
     await noMarkPressureAndPrivacyProof();
     await hostilePrivacyAndLinkageProof();
+    await requestBudgetAndResumableValidationProof();
     pressureAgeByteOversizeAndStatusProof();
     const failed = checks.filter((check) => !check.passed);
     console.log(

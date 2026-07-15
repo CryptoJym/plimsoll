@@ -697,7 +697,7 @@ export class LocalEventBuffer {
           observed_at as observedAt, payload_json as payloadJson,
           suppressed_fields_json as suppressedFieldsJson, created_at as createdAt,
           uploaded_at as uploadedAt, repo_hash as repoHash, branch_hash as branchHash,
-          length(payload_json) as payloadBytes
+          length(cast(payload_json as blob)) as payloadBytes
         from buffered_events
         where uploaded_at is null
         order by created_at asc

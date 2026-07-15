@@ -4,10 +4,9 @@ import type Database from "better-sqlite3";
 
 import {
   aiWorkIngestEventSchema,
-  findForbiddenRawContentFields,
-  type AiInteractionEvent,
   type AiWorkIngestEvent,
 } from "../../shared/src/index";
+import { canonicalLinkage, sealOutboundEnvelope } from "./outbound-envelope";
 import { ensureUuidEventId, normalizeHistoryEvent } from "./upload-history";
 
 export const DEFAULT_DELIVERY_LIMITS = {
@@ -34,6 +33,7 @@ export type DeliveryFailureClass =
   | "local_schema_invalid"
   | "local_privacy_violation"
   | "local_item_oversize"
+  | "local_request_budget"
   | "remote_validation"
   | "remote_auth"
   | "remote_transient"
@@ -169,95 +169,6 @@ type PreparedDelivery =
     }
   | { ok: false; deliveryId: string; reason: DeliveryReceiptReason };
 
-const SAFE_HASH = /^sha256:([a-f0-9]{64})$/i;
-const SAFE_SUPPRESSED_FIELD = /^[a-zA-Z0-9_.:-]{1,96}$/;
-const SENSITIVE_STRING =
-  /(?:https?:\/\/|\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b|(?:^|[\s"'])\/(?:Users|home|private|var\/folders)\/|\b[A-Za-z]:\\)/i;
-
-function safeLinkage(value: string | null | undefined) {
-  if (!value) return null;
-  const match = value.trim().match(SAFE_HASH);
-  return match ? `sha256:${match[1].toLowerCase()}` : null;
-}
-
-function keyWords(key: string) {
-  return key
-    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
-    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter(Boolean);
-}
-
-function safeNumericTokenCounter(words: string[], value: unknown) {
-  const numeric =
-    typeof value === "number"
-      ? value
-      : typeof value === "string" && /^(?:0|[1-9][0-9]*)$/.test(value)
-        ? Number(value)
-        : Number.NaN;
-  if (!Number.isSafeInteger(numeric) || numeric < 0) return false;
-  if (words.some((word) => /^(?:access|refresh|auth|authentication|authorization|api|bearer|oauth|credential|credentials|cookie|cookies|password|secret)$/.test(word))) {
-    return false;
-  }
-  const collapsed = words.join("");
-  return /(?:input|output)tokens?$/.test(collapsed) || /cache[a-z0-9]*tokens?$/.test(collapsed);
-}
-
-function sensitiveKey(key: string, value: unknown) {
-  const words = keyWords(key);
-  if (words.length === 0) return false;
-  const collapsed = words.join("");
-  const hashNamed = words.at(-1) === "hash";
-  const linkageHashNamed = hashNamed && words.some((word) =>
-    /^(?:branch|repo|repository|remote|url|path)$/.test(word),
-  );
-  if (linkageHashNamed) {
-    return !(typeof value === "string" && safeLinkage(value) !== null);
-  }
-  const hasToken = words.some((word) => /^tokens?$/.test(word)) || /(?:access|refresh|api|bearer|oauth)tokens?$/.test(collapsed);
-  if (hasToken && !safeNumericTokenCounter(words, value)) return true;
-
-  const sensitiveConcept = words.some((word) =>
-    /^(?:auth|authentication|authorization|cookie|cookies|credential|credentials|email|password|path|prompt|response|secret|url)$/.test(word),
-  ) || /(?:accesstoken|refreshtoken)$/.test(collapsed);
-  if (!sensitiveConcept) return false;
-
-  // Repo/path linkage may retain its descriptive key only when the value is a
-  // canonical 256-bit digest. Raw or pseudo-hashed URL/path values still fail.
-  const onlyHashableConcept = words.every((word) =>
-    !/^(?:auth|authentication|authorization|cookie|cookies|credential|credentials|email|password|prompt|response|secret)$/.test(word),
-  );
-  return !(hashNamed && onlyHashableConcept && typeof value === "string" && safeLinkage(value) !== null);
-}
-
-function privacyViolation(value: unknown, key = ""): boolean {
-  if (
-    key === "transport_path" &&
-    typeof value === "string" &&
-    ["/v1/logs", "/v1/traces", "/v1/metrics"].includes(value)
-  ) {
-    return false;
-  }
-  if (key && sensitiveKey(key, value)) return true;
-  if (typeof value === "string") return SENSITIVE_STRING.test(value);
-  if (Array.isArray(value)) return value.some((entry) => privacyViolation(entry));
-  if (!value || typeof value !== "object") return false;
-  return Object.entries(value as Record<string, unknown>).some(([nestedKey, nested]) =>
-    privacyViolation(nested, nestedKey),
-  );
-}
-
-function sanitizeSuppressedFields(fields: string[]) {
-  return [...new Set(fields.map((field) => field.trim()).filter((field) => SAFE_SUPPRESSED_FIELD.test(field)))];
-}
-
-function withoutExternalEventId(event: AiInteractionEvent): AiInteractionEvent {
-  if (!("externalEventId" in event.metadata)) return event;
-  const { externalEventId: _localId, ...metadata } = event.metadata;
-  return { ...event, metadata };
-}
-
 function prepareDelivery(row: RawDeliveryRow, maxItemBytes: number): PreparedDelivery {
   const fallbackId = ensureUuidEventId(row.rawId).id;
   const normalized = normalizeHistoryEvent({
@@ -274,22 +185,16 @@ function prepareDelivery(row: RawDeliveryRow, maxItemBytes: number): PreparedDel
     return { ok: false, deliveryId: fallbackId, reason };
   }
 
-  const event = withoutExternalEventId(normalized.envelope.event);
-  const envelope = aiWorkIngestEventSchema.safeParse({
-    event,
-    suppressedFields: sanitizeSuppressedFields(normalized.envelope.suppressedFields),
-  });
-  const deliveryId = event.id;
-  if (!envelope.success) {
-    return { ok: false, deliveryId, reason: "local_schema_invalid" };
+  const deliveryId = normalized.envelope.event.id;
+  const envelope = sealOutboundEnvelope(normalized.envelope);
+  if (!envelope.ok) {
+    return {
+      ok: false,
+      deliveryId,
+      reason: envelope.reason === "schema" ? "local_schema_invalid" : "local_privacy_violation",
+    };
   }
-  if (
-    findForbiddenRawContentFields(envelope.data.event.metadata).length > 0 ||
-    privacyViolation(envelope.data)
-  ) {
-    return { ok: false, deliveryId, reason: "local_privacy_violation" };
-  }
-  const baseEnvelopeJson = JSON.stringify(envelope.data);
+  const baseEnvelopeJson = JSON.stringify(envelope.envelope);
   const baseBytes = Buffer.byteLength(baseEnvelopeJson);
   if (baseBytes > maxItemBytes) {
     return { ok: false, deliveryId, reason: "local_item_oversize" };
@@ -299,8 +204,8 @@ function prepareDelivery(row: RawDeliveryRow, maxItemBytes: number): PreparedDel
     deliveryId,
     baseEnvelopeJson,
     baseBytes,
-    repoHash: safeLinkage(row.repoHash),
-    branchHash: safeLinkage(row.branchHash),
+    repoHash: canonicalLinkage(row.repoHash),
+    branchHash: canonicalLinkage(row.branchHash),
   };
 }
 
@@ -423,6 +328,7 @@ export class DeliveryOutbox {
         migration_last_dead integer not null default 0,
         migration_last_skipped_uploaded integer not null default 0,
         migration_last_at text,
+        validation_probe_rows integer not null default 0,
         updated_at text not null
       );
       insert or ignore into upload_control (singleton, updated_at)
@@ -433,6 +339,8 @@ export class DeliveryOutbox {
         on upload_outbox (state, lease_expires_at);
       create index if not exists idx_upload_outbox_created
         on upload_outbox (created_at, delivery_id);
+      create index if not exists idx_upload_outbox_raw_rowid
+        on upload_outbox (raw_rowid);
       create index if not exists idx_upload_receipts_state
         on upload_receipts (terminal_state);
 
@@ -504,6 +412,15 @@ export class DeliveryOutbox {
         where singleton = 1;
       end;
     `);
+    const controlColumns = this.db
+      .prepare(`pragma table_info(upload_control)`)
+      .all() as Array<{ name: string }>;
+    if (!controlColumns.some((column) => column.name === "validation_probe_rows")) {
+      this.db.exec(
+        `alter table upload_control
+         add column validation_probe_rows integer not null default 0`,
+      );
+    }
   }
 
   /**
@@ -613,8 +530,8 @@ export class DeliveryOutbox {
       )
       .run({
         rawRowid,
-        repoHash: safeLinkage(repoHash),
-        branchHash: safeLinkage(branchHash),
+        repoHash: canonicalLinkage(repoHash),
+        branchHash: canonicalLinkage(branchHash),
         now: new Date().toISOString(),
       }).changes;
   }
@@ -649,7 +566,8 @@ export class DeliveryOutbox {
       .prepare(
         `select rowid as rawRowid, id as rawId, created_at as createdAt,
            uploaded_at as uploadedAt,
-           length(payload_json) + length(suppressed_fields_json) as rowBytes
+           length(cast(payload_json as blob)) +
+             length(cast(suppressed_fields_json as blob)) as rowBytes
          from buffered_events
          where rowid > ?
          order by rowid asc
@@ -789,8 +707,8 @@ export class DeliveryOutbox {
              attempt_count as attemptCount
            from upload_outbox
            where state in ('pending','retry') and next_attempt_at <= ?
-           order by case when last_failure_class = 'remote_validation' then 1 else 0 end,
-             created_at, delivery_id
+           order by case when last_failure_class in ('remote_validation', 'local_request_budget') then 1 else 0 end,
+             next_attempt_at, created_at, delivery_id
            limit ?`,
         )
         .all(nowIso, maxRows) as ActiveDeliveryRow[];
@@ -805,14 +723,22 @@ export class DeliveryOutbox {
             locallyDead += this.deadActive(row.deliveryId, "local_schema_invalid", nowIso);
             continue;
           }
-          const sealed = aiWorkIngestEventSchema.safeParse(
-            attachFillOnlyLinkage(parsed, safeLinkage(row.repoHash), safeLinkage(row.branchHash)),
+          const sealed = sealOutboundEnvelope(
+            attachFillOnlyLinkage(
+              parsed,
+              canonicalLinkage(row.repoHash),
+              canonicalLinkage(row.branchHash),
+            ),
           );
-          if (!sealed.success || findForbiddenRawContentFields(sealed.success ? sealed.data.event.metadata : {}).length > 0 || (sealed.success && privacyViolation(sealed.data))) {
-            locallyDead += this.deadActive(row.deliveryId, "local_privacy_violation", nowIso);
+          if (!sealed.ok) {
+            locallyDead += this.deadActive(
+              row.deliveryId,
+              sealed.reason === "schema" ? "local_schema_invalid" : "local_privacy_violation",
+              nowIso,
+            );
             continue;
           }
-          envelopeJson = JSON.stringify(sealed.data);
+          envelopeJson = JSON.stringify(sealed.envelope);
           const envelopeBytes = Buffer.byteLength(envelopeJson);
           if (envelopeBytes > this.limits.maxItemBytes) {
             locallyDead += this.deadActive(row.deliveryId, "local_item_oversize", nowIso);
@@ -827,14 +753,15 @@ export class DeliveryOutbox {
             .run({ deliveryId: row.deliveryId, envelopeJson, envelopeBytes, now: nowIso });
         }
         const envelopeBytes = Buffer.byteLength(envelopeJson);
-        if (items.length > 0 && selectedBytes + envelopeBytes > maxBytes) break;
-        selectedBytes += envelopeBytes;
+        const addedBytes = envelopeBytes + (items.length > 0 ? 1 : 0);
+        if (items.length > 0 && selectedBytes + addedBytes > maxBytes) break;
+        selectedBytes += addedBytes;
         const attemptCount = row.attemptCount + 1;
         this.db
           .prepare(
             `update upload_outbox set state = 'in_flight', attempt_count = @attemptCount,
                lease_id = @leaseId, lease_expires_at = @leaseExpiresAt,
-               last_failure_class = 'none', updated_at = @now
+               updated_at = @now
              where delivery_id = @deliveryId and state in ('pending','retry')`,
           )
           .run({
@@ -855,6 +782,44 @@ export class DeliveryOutbox {
     });
     run();
     return { leaseId, items, locallyDead, blockedBy: "none" };
+  }
+
+  validationLeaseRows(requestedRows: number) {
+    const requested = Math.max(1, Math.min(Math.trunc(requestedRows), 500));
+    const row = this.db
+      .prepare(
+        `select validation_probe_rows as probeRows
+         from upload_control where singleton = 1`,
+      )
+      .get() as { probeRows: number };
+    return row.probeRows > 0 ? Math.min(requested, row.probeRows) : requested;
+  }
+
+  boundValidationLeaseRows(rows: number, at = new Date()) {
+    const bounded = Math.max(1, Math.min(Math.trunc(rows), 500));
+    return this.db
+      .prepare(
+        `update upload_control set
+           validation_probe_rows = case
+             when validation_probe_rows = 0 then @bounded
+             else min(validation_probe_rows, @bounded)
+           end,
+           updated_at = @now
+         where singleton = 1`,
+      )
+      .run({ bounded, now: at.toISOString() }).changes;
+  }
+
+  growValidationLeaseRows(requestedRows: number, at = new Date()) {
+    const requested = Math.max(1, Math.min(Math.trunc(requestedRows), 500));
+    return this.db
+      .prepare(
+        `update upload_control set
+           validation_probe_rows = min(@requested, validation_probe_rows * 2),
+           updated_at = @now
+         where singleton = 1 and validation_probe_rows > 0`,
+      )
+      .run({ requested, now: at.toISOString() }).changes;
   }
 
   acknowledge(
@@ -894,13 +859,14 @@ export class DeliveryOutbox {
       if (validationWitness && ids.includes(validationWitness.item.deliveryId)) {
         this.writeValidationWitness(validationWitness.contractHash, validationWitness.item, terminalAt);
       }
+      this.clearValidationProbeIfEmpty(terminalAt);
       return { acknowledged, markedUploaded };
     });
     return run();
   }
 
   validationWitness(contractHash: string): DeliveryValidationWitness | null {
-    const canonicalContract = safeLinkage(contractHash);
+    const canonicalContract = canonicalLinkage(contractHash);
     if (!canonicalContract) return null;
     const row = this.db
       .prepare(
@@ -927,12 +893,11 @@ export class DeliveryOutbox {
     } catch {
       return null;
     }
-    const parsed = aiWorkIngestEventSchema.safeParse(decoded);
+    const parsed = sealOutboundEnvelope(decoded);
     if (
-      !parsed.success ||
-      parsed.data.event.id !== row.deliveryId ||
-      findForbiddenRawContentFields(parsed.data.event.metadata).length > 0 ||
-      privacyViolation(parsed.data)
+      !parsed.ok ||
+      parsed.envelope.event.id !== row.deliveryId ||
+      JSON.stringify(parsed.envelope) !== row.envelopeJson
     ) {
       return null;
     }
@@ -943,7 +908,7 @@ export class DeliveryOutbox {
         deliveryId: row.deliveryId,
         rawRowid: null,
         envelopeJson: row.envelopeJson,
-        envelope: parsed.data,
+        envelope: parsed.envelope,
         attemptCount: 0,
       },
     };
@@ -955,7 +920,7 @@ export class DeliveryOutbox {
     contractHash: string,
     at = new Date(),
   ) {
-    const canonicalContract = safeLinkage(contractHash);
+    const canonicalContract = canonicalLinkage(contractHash);
     if (!canonicalContract) return 0;
     return this.db
       .prepare(
@@ -1023,6 +988,7 @@ export class DeliveryOutbox {
         });
         remove.run(id, leaseId);
       }
+      this.clearValidationProbeIfEmpty(terminalAt);
       return dead;
     });
     return run();
@@ -1218,7 +1184,18 @@ export class DeliveryOutbox {
       terminalAt,
     });
     this.db.prepare(`delete from upload_outbox where delivery_id = ?`).run(deliveryId);
+    this.clearValidationProbeIfEmpty(terminalAt);
     return written;
+  }
+
+  private clearValidationProbeIfEmpty(nowIso: string) {
+    this.db
+      .prepare(
+        `update upload_control set validation_probe_rows = 0, updated_at = @now
+         where singleton = 1 and validation_probe_rows <> 0
+           and not exists (select 1 from upload_outbox)`,
+      )
+      .run({ now: nowIso });
   }
 
   private writeReceipt(input: {
@@ -1243,7 +1220,7 @@ export class DeliveryOutbox {
     item: LeasedDeliveryItem,
     acknowledgedAt: string,
   ) {
-    const canonicalContract = safeLinkage(contractHash);
+    const canonicalContract = canonicalLinkage(contractHash);
     if (!canonicalContract) return 0;
     let decoded: unknown;
     try {
@@ -1251,14 +1228,13 @@ export class DeliveryOutbox {
     } catch {
       return 0;
     }
-    const envelope = aiWorkIngestEventSchema.safeParse(decoded);
+    const envelope = sealOutboundEnvelope(decoded);
     const envelopeBytes = Buffer.byteLength(item.envelopeJson);
     if (
-      !envelope.success ||
-      envelope.data.event.id !== item.deliveryId ||
+      !envelope.ok ||
+      envelope.envelope.event.id !== item.deliveryId ||
       envelopeBytes > this.limits.maxItemBytes ||
-      findForbiddenRawContentFields(envelope.data.event.metadata).length > 0 ||
-      privacyViolation(envelope.data)
+      JSON.stringify(envelope.envelope) !== item.envelopeJson
     ) {
       return 0;
     }

@@ -179,7 +179,7 @@ export function normalizeHistoryEvent(row: {
   }
 
   const envelope: HistoryEnvelope = { event: parsed.data, suppressedFields };
-  return { ok: true, envelope, bytes: JSON.stringify(envelope).length, idDerived };
+  return { ok: true, envelope, bytes: Buffer.byteLength(JSON.stringify(envelope)), idDerived };
 }
 
 export const HISTORY_MAX_BATCH_EVENTS = 500;

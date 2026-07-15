@@ -8,6 +8,7 @@ import {
   type AiInteractionEvent,
   type AiWorkIngestBatch,
 } from "../../shared/src/index";
+import { sealOutboundEnvelope } from "./outbound-envelope";
 
 /**
  * Project attribution parity (issue 0036): the ledger's per-event repo
@@ -35,20 +36,28 @@ export function buildIngestBatch(
   buffer: LocalEventBuffer,
   options: { limit?: number; maxBytes?: number; appVersion?: string } = {},
 ): { batch: AiWorkIngestBatch | null; rows: BufferedEventRow[] } {
-  const rows = buffer.listUnuploaded({
+  const candidateRows = buffer.listUnuploaded({
     maxRows: options.limit ?? 500,
     maxBytes: options.maxBytes,
   });
 
+  const rows: BufferedEventRow[] = [];
+  const events = [];
+  for (const row of candidateRows) {
+    const sealed = sealOutboundEnvelope({
+      event: attachRepoLinkage(row.payload, row.repoHash, row.branchHash),
+      suppressedFields: row.suppressedFields,
+    });
+    if (!sealed.ok) continue;
+    rows.push(row);
+    events.push(sealed.envelope);
+  }
   if (rows.length === 0) return { batch: null, rows };
   const batch = aiWorkIngestBatchSchema.parse({
     tenantId: config.tenantId,
     installKey: config.installKey,
     appVersion: options.appVersion ?? "0.1.0",
-    events: rows.map((row) => ({
-      event: attachRepoLinkage(row.payload, row.repoHash, row.branchHash),
-      suppressedFields: row.suppressedFields,
-    })),
+    events,
   });
   return { batch, rows };
 }
@@ -75,6 +84,7 @@ type ProbeResult = {
   status: number;
   statusClass: string;
   summary: SafeResponseSummary;
+  requestBytes: number;
 };
 
 function safeResponseSummary(value: unknown): SafeResponseSummary {
@@ -120,7 +130,7 @@ function bodyForItems(
     `"appVersion":${JSON.stringify(appVersion)},` +
     `"events":[${items.map((item) => item.envelopeJson).join(",")}]}`;
   const batch = aiWorkIngestBatchSchema.parse(JSON.parse(body));
-  return { body, batch };
+  return { body, batch, bytes: Buffer.byteLength(body) };
 }
 
 async function postItems(input: {
@@ -133,8 +143,18 @@ async function postItems(input: {
   fetchImpl: typeof fetch;
   timeoutSeconds: number;
   now: () => Date;
+  maxBytes: number;
 }): Promise<ProbeResult> {
-  const { body } = bodyForItems(input.config, input.items, input.appVersion);
+  const { body, bytes } = bodyForItems(input.config, input.items, input.appVersion);
+  if (bytes > input.maxBytes) {
+    return {
+      ok: false,
+      status: -1,
+      statusClass: "local_request_budget",
+      summary: {},
+      requestBytes: bytes,
+    };
+  }
   const headers: Record<string, string> = {
     "content-type": "application/json",
     "x-plimsoll-install-key": input.config.installKey,
@@ -167,6 +187,7 @@ async function postItems(input: {
         status: response.status,
         statusClass: statusClass(response.status),
         summary: {},
+        requestBytes: bytes,
       };
     }
     const parsed = await response.json().catch(() => ({}));
@@ -175,15 +196,17 @@ async function postItems(input: {
       status: response.status,
       statusClass: statusClass(response.status),
       summary: response.ok ? safeResponseSummary(parsed) : {},
+      requestBytes: bytes,
     };
   } catch {
-    return { ok: false, status: 0, statusClass: "network", summary: {} };
+    return { ok: false, status: 0, statusClass: "network", summary: {}, requestBytes: bytes };
   } finally {
     clearTimeout(timeout);
   }
 }
 
 function failureForProbe(result: ProbeResult): Exclude<DeliveryFailureClass, "none"> {
+  if (result.statusClass === "local_request_budget") return "local_request_budget";
   if (result.statusClass === "remote_auth") return "remote_auth";
   if (result.statusClass === "remote_transient" || result.statusClass === "network") {
     return "remote_transient";
@@ -199,7 +222,14 @@ async function uploadStateless(
 ) {
   const url = options.url ?? config.uploadUrl;
   if (!url) throw new Error("No upload URL configured. Pass --url or set uploadUrl in collector.config.json.");
-  const { batch, rows } = buildIngestBatch(config, buffer, options);
+  // Examine a bounded snapshot independently of the transient request cap so
+  // one locally oversized row cannot hide a later eligible row in no-mark
+  // mode. This mode intentionally mutates no retry or upload state.
+  const { batch } = buildIngestBatch(config, buffer, {
+    ...options,
+    limit: 500,
+    maxBytes: 1_500_000,
+  });
   if (!batch) {
     return {
       batch: null,
@@ -212,13 +242,27 @@ async function uploadStateless(
       delivery: { mode: "stateless_no_mark" as const, attempts: 0, deadLetters: 0 },
     };
   }
-  const items = batch.events.map((envelope) => ({
+  const candidateItems = batch.events.map((envelope) => ({
     deliveryId: envelope.event.id,
     rawRowid: null,
     envelope,
     envelopeJson: JSON.stringify(envelope),
     attemptCount: 0,
   }));
+  const maxRequestBytes = Math.max(1, Math.trunc(options.maxBytes ?? 1_500_000));
+  const outputLimit = Math.max(1, Math.min(Math.trunc(options.limit ?? 500), 500));
+  const items: LeasedDeliveryItem[] = [];
+  for (const item of candidateItems) {
+    if (items.length >= outputLimit) break;
+    const candidate = [...items, item];
+    if (bodyForItems(config, candidate, options.appVersion ?? "0.1.0").bytes <= maxRequestBytes) {
+      items.push(item);
+    }
+  }
+  if (items.length === 0) {
+    throw new DeliveryUploadError("local_request_budget", "local_request_budget");
+  }
+  const sentBatch = bodyForItems(config, items, options.appVersion ?? "0.1.0").batch;
   const result = await postItems({
     config,
     items,
@@ -229,16 +273,17 @@ async function uploadStateless(
     fetchImpl: options.fetchImpl ?? fetch,
     timeoutSeconds: config.delivery.requestTimeoutSeconds,
     now: options.now ?? (() => new Date()),
+    maxBytes: maxRequestBytes,
   });
   if (!result.ok) throw new DeliveryUploadError(failureForProbe(result), result.statusClass);
   return {
-    batch,
+    batch: sentBatch,
     markedUploaded: 0,
     remainingUnuploaded: buffer.stats().unuploadedCount,
     remainingDelivery: buffer.delivery.status().remainingDelivery,
     response: result.summary,
     signedUpload: Boolean(options.signingSecret ?? config.uploadSigningSecret),
-    uploadedEvents: rows.length,
+    uploadedEvents: items.length,
     delivery: { mode: "stateless_no_mark" as const, attempts: 0, deadLetters: 0 },
   };
 }
@@ -286,8 +331,9 @@ export async function uploadBufferedEvents(
     maxRows: outputLimit,
     now: nowFn(),
   });
+  const maxRequestBytes = Math.max(1, Math.trunc(options.maxBytes ?? 1_500_000));
   const lease = buffer.delivery.lease({
-    maxRows: outputLimit,
+    maxRows: buffer.delivery.validationLeaseRows(outputLimit),
     maxBytes: options.maxBytes,
     now: nowFn(),
     leaseId: options.leaseId,
@@ -322,11 +368,13 @@ export async function uploadBufferedEvents(
   let lastSummary: SafeResponseSummary = {};
   const succeeded = new Map<string, LeasedDeliveryItem>();
   const validationSingletons = new Map<string, LeasedDeliveryItem>();
+  const requestBudgetItems = new Map<string, LeasedDeliveryItem>();
   const unresolved = new Map<string, LeasedDeliveryItem>();
   const attemptedActive = new Set<string>();
   let fatal: ProbeResult | null = null;
   let validationWitnessProven = false;
   let validationWitnessRejected = false;
+  let sawValidationFailure = false;
   let locallyDead = provenDead + lease.locallyDead;
   const queue: LeasedDeliveryItem[][] = [lease.items];
 
@@ -344,13 +392,38 @@ export async function uploadBufferedEvents(
       fetchImpl: options.fetchImpl ?? fetch,
       timeoutSeconds: config.delivery.requestTimeoutSeconds,
       now: nowFn,
+      maxBytes: maxRequestBytes,
     });
     if (result.ok) {
       lastSummary = result.summary;
       for (const item of group) succeeded.set(item.deliveryId, item);
       continue;
     }
+    if (result.statusClass === "local_request_budget") {
+      // Exact serialized RequestInit.body bytes are the hard boundary. Local
+      // preflight failures consume no remote probe and never open a circuit.
+      probes -= 1;
+      if (group.length > 1) {
+        const midpoint = Math.floor(group.length / 2);
+        queue.unshift(group.slice(midpoint));
+        queue.unshift(group.slice(0, midpoint));
+      } else {
+        requestBudgetItems.set(group[0].deliveryId, group[0]);
+        if (queue.length === 0 && succeeded.size < outputLimit) {
+          const lookahead = buffer.delivery.lease({
+            maxRows: Math.max(1, outputLimit - succeeded.size),
+            maxBytes: options.maxBytes,
+            now: nowFn(),
+            leaseId: lease.leaseId,
+          });
+          locallyDead += lookahead.locallyDead;
+          if (lookahead.items.length > 0) queue.push(lookahead.items);
+        }
+      }
+      continue;
+    }
     if (result.status === 400 || result.status === 422) {
+      sawValidationFailure = true;
       if (group.length === 1) {
         validationSingletons.set(group[0].deliveryId, group[0]);
         buffer.delivery.markValidationCandidate(
@@ -388,13 +461,20 @@ export async function uploadBufferedEvents(
                 fetchImpl: options.fetchImpl ?? fetch,
                 timeoutSeconds: config.delivery.requestTimeoutSeconds,
                 now: nowFn,
+                maxBytes: maxRequestBytes,
               });
               if (witnessResult.ok) {
                 validationWitnessProven = true;
               } else if (witnessResult.status === 400 || witnessResult.status === 422) {
                 validationWitnessRejected = true;
-              } else if (witnessResult.status !== 400 && witnessResult.status !== 422) {
+              } else if (
+                witnessResult.statusClass !== "local_request_budget" &&
+                witnessResult.status !== 400 &&
+                witnessResult.status !== 422
+              ) {
                 fatal = witnessResult;
+              } else if (witnessResult.statusClass === "local_request_budget") {
+                probes -= 1;
               }
             }
           }
@@ -408,8 +488,18 @@ export async function uploadBufferedEvents(
     fatal = result;
     for (const item of group) unresolved.set(item.deliveryId, item);
   }
+  const validationIsolationIncomplete = !fatal && sawValidationFailure && queue.length > 0;
+  if (validationIsolationIncomplete) {
+    buffer.delivery.boundValidationLeaseRows(
+      Math.max(1, Math.min(...queue.map((group) => group.length))),
+      nowFn(),
+    );
+  }
   for (const group of queue) {
-    for (const item of group) unresolved.set(item.deliveryId, item);
+    for (const item of group) {
+      if (sawValidationFailure) unresolved.set(item.deliveryId, item);
+      else requestBudgetItems.set(item.deliveryId, item);
+    }
   }
 
   options.afterRemote?.();
@@ -440,7 +530,8 @@ export async function uploadBufferedEvents(
   if (fatal) {
     failure = failureForProbe(fatal);
   } else if (succeeded.size === 0 && unresolved.size > 0) {
-    failure = validationSingletons.size > 0 && attemptedActive.size < 2 && !validationWitnessRejected
+    failure = validationIsolationIncomplete ||
+      (validationSingletons.size > 0 && attemptedActive.size < 2 && !validationWitnessRejected)
       ? "remote_validation"
       : "remote_contract";
   } else if (unresolved.size > 0) {
@@ -454,6 +545,25 @@ export async function uploadBufferedEvents(
   } else if (succeeded.size > 0) {
     buffer.delivery.clearCircuit(nowFn());
   }
+  if (requestBudgetItems.size > 0) {
+    buffer.delivery.retry(
+      lease.leaseId,
+      [...requestBudgetItems.values()],
+      "local_request_budget",
+      nowFn(),
+    );
+  }
+  if (
+    succeeded.size > 0 &&
+    failure === null &&
+    requestBudgetItems.size === 0 &&
+    !sawValidationFailure
+  ) {
+    buffer.delivery.growValidationLeaseRows(outputLimit, nowFn());
+  }
+
+  const effectiveFailure = failure ??
+    (requestBudgetItems.size > 0 ? "local_request_budget" as const : null);
 
   const deliveryStatus = buffer.delivery.status(nowFn());
   const acknowledgedBatch =
@@ -468,9 +578,9 @@ export async function uploadBufferedEvents(
     remainingUnuploaded: buffer.stats().unuploadedCount,
     remainingDelivery: deliveryStatus.remainingDelivery,
     response:
-      failure === null
+      effectiveFailure === null
         ? lastSummary
-        : { status: succeeded.size > 0 ? "partial" : "deferred", failureClass: failure },
+        : { status: succeeded.size > 0 ? "partial" : "deferred", failureClass: effectiveFailure },
     signedUpload: Boolean(options.signingSecret ?? config.uploadSigningSecret),
     uploadedEvents: succeeded.size,
     delivery: {
@@ -481,8 +591,11 @@ export async function uploadBufferedEvents(
       rootLeaseEvents: lease.items.length,
     },
   };
-  if (failure && succeeded.size === 0) {
-    throw new DeliveryUploadError(failure, fatal?.statusClass ?? "remote_validation");
+  if (effectiveFailure && succeeded.size === 0) {
+    throw new DeliveryUploadError(
+      effectiveFailure,
+      fatal?.statusClass ?? effectiveFailure,
+    );
   }
   return result;
 }

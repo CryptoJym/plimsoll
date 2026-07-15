@@ -230,7 +230,7 @@ export function buildSessionSyncRow(snapshot: SessionSnapshot): NormalizedSessio
   return {
     ok: true,
     row: parsed.data,
-    bytes: JSON.stringify(parsed.data).length,
+    bytes: Buffer.byteLength(JSON.stringify(parsed.data)),
     idDerived: ensured.derived,
   };
 }
