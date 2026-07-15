@@ -24,17 +24,15 @@ type CandidateRow = LegacyRow & {
   payloadJson: string;
 };
 
-type ContextRow = {
+type NearestContextRow = {
   eventId: string;
   observedAt: string;
   value: string;
 };
 
 type LegacySeedStatements = {
-  upsertContext: Database.Statement;
   upsertPending: Database.Statement;
   enqueueCandidate: Database.Statement;
-  enqueueWindow: Database.Statement;
 };
 
 type NearestStatements = {
@@ -51,6 +49,7 @@ export type CodexReconciliationResult = {
   rowsChanged: number;
   stitched: number;
   priced: number;
+  sliceDurationMs: number;
   timeBudgetExhausted: boolean;
 };
 
@@ -64,6 +63,9 @@ export type CodexReconciliationStatus = {
   rowsChanged: number;
   lastRowsVisited: number;
   lastRowsChanged: number;
+  lastSliceDurationMs: number;
+  maxSliceDurationMs: number;
+  lastTimeBudgetExhausted: boolean;
   lastSuccessAt: string | null;
   degradedReason: "maintenance_failed" | null;
 };
@@ -90,33 +92,14 @@ function validObservedAt(value: string) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function windowBucket(observedAt: string) {
-  const parsed = validObservedAt(observedAt);
-  return parsed === null ? null : Math.floor(parsed / 1000 / WINDOW_SECONDS) * WINDOW_SECONDS;
-}
-
 function isoAt(seconds: number) {
   return new Date(seconds * 1000).toISOString();
 }
 
-function enqueueWindow(
-  statement: Database.Statement,
-  observedAt: string,
-  now: string,
-) {
-  const bucket = windowBucket(observedAt);
-  if (bucket === null) return;
-  statement.run(bucket, now, now);
-}
-
 function seedLegacyRow(statements: LegacySeedStatements, row: LegacyRow, now: string) {
-  if (row.source === "codex" && (row.sessionId !== null || row.model !== null)) {
-    statements.upsertContext.run(row.id, row.observedAt, row.sessionId, row.model);
-    enqueueWindow(statements.enqueueWindow, row.observedAt, now);
-  }
   if (!isCandidate(row)) return;
   statements.upsertPending.run(row.id, row.observedAt);
-  statements.enqueueCandidate.run(row.id, now);
+  statements.enqueueCandidate.run(row.id, now, 1);
 }
 
 function nearestValue(
@@ -131,10 +114,10 @@ function nearestValue(
     start: new Date(observedMs - WINDOW_SECONDS * 1000).toISOString(),
     end: new Date(observedMs + WINDOW_SECONDS * 1000).toISOString(),
   };
-  const before = statements.before.get(base) as ContextRow | undefined;
-  const after = statements.after.get(base) as ContextRow | undefined;
+  const before = statements.before.get(base) as NearestContextRow | undefined;
+  const after = statements.after.get(base) as NearestContextRow | undefined;
   const nearest = [before, after]
-    .filter((candidate): candidate is ContextRow => Boolean(candidate))
+    .filter((candidate): candidate is NearestContextRow => Boolean(candidate))
     .sort((left, right) => {
       const distance =
         Math.abs(Date.parse(left.observedAt) - observedMs) -
@@ -149,25 +132,21 @@ function nearestStatements(
   column: "session_id" | "model",
 ): NearestStatements {
   const predicate = column === "session_id" ? "session_id is not null" : "model is not null";
-  const index =
-    column === "session_id"
-      ? "idx_codex_reconciliation_context_session"
-      : "idx_codex_reconciliation_context_model";
   return {
     before: database.prepare(
-      `select event_id as eventId, observed_at as observedAt, ${column} as value
-       from codex_reconciliation_context indexed by ${index}
-       where ${predicate} and event_id != @eventId
+      `select id as eventId, observed_at as observedAt, ${column} as value
+       from buffered_events indexed by idx_events_observed
+       where source = 'codex' and ${predicate} and id != @eventId
          and observed_at >= @start and observed_at <= @observedAt
-       order by observed_at desc, event_id desc
+       order by observed_at desc
        limit 1`,
     ),
     after: database.prepare(
-      `select event_id as eventId, observed_at as observedAt, ${column} as value
-       from codex_reconciliation_context indexed by ${index}
-       where ${predicate} and event_id != @eventId
+      `select id as eventId, observed_at as observedAt, ${column} as value
+       from buffered_events indexed by idx_events_observed
+       where source = 'codex' and ${predicate} and id != @eventId
          and observed_at >= @observedAt and observed_at <= @end
-       order by observed_at asc, event_id asc
+       order by observed_at asc
        limit 1`,
     ),
   };
@@ -211,9 +190,66 @@ function reconciledPayload(
 /**
  * Additive, local-only schema. The raw ledger is never indexed or walked here:
  * legacy discovery advances by rowid in maintenance, while new writes maintain
- * compact candidate/context indexes transactionally through triggers.
+ * compact candidate/window indexes transactionally through triggers.
  */
 export function ensureCodexReconciliationSchema(database: Database.Database) {
+  // The first draft mirrored every context row. Migrate that draft state away
+  // before rebuilding the raw-event triggers: pending usage is the only
+  // historical side state that reconciliation needs.
+  database.exec(`
+    drop trigger if exists trg_codex_reconciliation_insert;
+    drop trigger if exists trg_codex_reconciliation_update;
+    drop trigger if exists trg_codex_reconciliation_delete;
+    drop index if exists idx_codex_reconciliation_candidates_queue;
+    drop index if exists idx_codex_reconciliation_windows_queue;
+    drop table if exists codex_reconciliation_context;
+
+    create table if not exists codex_reconciliation_candidates (
+      event_id text primary key,
+      queued_at text not null,
+      priority integer not null default 0
+    );
+
+    create table if not exists codex_reconciliation_windows (
+      window_start_seconds integer primary key,
+      revision integer not null default 1,
+      processing_revision integer not null default 0,
+      cursor_observed_at text not null default '',
+      cursor_event_id text not null default '',
+      target_observed_at text not null default '',
+      target_event_id text not null default '',
+      queued_at text not null,
+      updated_at text not null,
+      priority integer not null default 1
+    );
+  `);
+  const candidateColumns = new Set(
+    (
+      database.pragma("table_info(codex_reconciliation_candidates)") as Array<{
+        name: string;
+      }>
+    ).map((column) => column.name),
+  );
+  if (!candidateColumns.has("priority")) {
+    database.exec(
+      `alter table codex_reconciliation_candidates
+       add column priority integer not null default 0`,
+    );
+  }
+  const windowColumns = new Set(
+    (
+      database.pragma("table_info(codex_reconciliation_windows)") as Array<{
+        name: string;
+      }>
+    ).map((column) => column.name),
+  );
+  if (!windowColumns.has("priority")) {
+    database.exec(
+      `alter table codex_reconciliation_windows
+       add column priority integer not null default 1`,
+    );
+  }
+
   database.exec(`
     create table if not exists codex_reconciliation_control (
       singleton integer primary key check (singleton = 1),
@@ -226,6 +262,9 @@ export function ensureCodexReconciliationSchema(database: Database.Database) {
       rows_changed integer not null default 0,
       last_rows_visited integer not null default 0,
       last_rows_changed integer not null default 0,
+      last_slice_duration_ms real not null default 0,
+      max_slice_duration_ms real not null default 0,
+      last_time_budget_exhausted integer not null default 0,
       last_success_at text,
       degraded_reason text,
       updated_at text not null
@@ -243,23 +282,11 @@ export function ensureCodexReconciliationSchema(database: Database.Database) {
 
     create table if not exists codex_reconciliation_candidates (
       event_id text primary key,
-      queued_at text not null
+      queued_at text not null,
+      priority integer not null default 0
     );
     create index if not exists idx_codex_reconciliation_candidates_queue
-      on codex_reconciliation_candidates (queued_at, event_id);
-
-    create table if not exists codex_reconciliation_context (
-      event_id text primary key,
-      observed_at text not null,
-      session_id text,
-      model text
-    );
-    create index if not exists idx_codex_reconciliation_context_session
-      on codex_reconciliation_context (observed_at, event_id)
-      where session_id is not null;
-    create index if not exists idx_codex_reconciliation_context_model
-      on codex_reconciliation_context (observed_at, event_id)
-      where model is not null;
+      on codex_reconciliation_candidates (priority, queued_at, event_id);
 
     create table if not exists codex_reconciliation_windows (
       window_start_seconds integer primary key,
@@ -270,10 +297,11 @@ export function ensureCodexReconciliationSchema(database: Database.Database) {
       target_observed_at text not null default '',
       target_event_id text not null default '',
       queued_at text not null,
-      updated_at text not null
+      updated_at text not null,
+      priority integer not null default 1
     );
     create index if not exists idx_codex_reconciliation_windows_queue
-      on codex_reconciliation_windows (queued_at, window_start_seconds);
+      on codex_reconciliation_windows (priority, queued_at, window_start_seconds);
 
     create trigger if not exists trg_codex_candidate_backlog_insert
     after insert on codex_reconciliation_candidates
@@ -311,25 +339,24 @@ export function ensureCodexReconciliationSchema(database: Database.Database) {
     create trigger if not exists trg_codex_reconciliation_insert
     after insert on buffered_events
     begin
-      insert into codex_reconciliation_context (event_id, observed_at, session_id, model)
-      select new.id, new.observed_at, new.session_id, new.model
-      where new.source = 'codex' and (new.session_id is not null or new.model is not null)
-      on conflict(event_id) do update set
-        observed_at = excluded.observed_at,
-        session_id = excluded.session_id,
-        model = excluded.model;
-
       insert into codex_reconciliation_windows
         (window_start_seconds, revision, processing_revision,
-         cursor_observed_at, cursor_event_id, queued_at, updated_at)
+         cursor_observed_at, cursor_event_id, queued_at, updated_at, priority)
       select
         (cast(strftime('%s', new.observed_at) as integer) / 600) * 600,
-        1, 0, '', '', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        1, 0, '', '', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+        case when new.rowid <= (
+          select legacy_target_rowid from codex_reconciliation_control where singleton = 1
+        ) and (
+          select legacy_complete from codex_reconciliation_control where singleton = 1
+        ) = 0 then 1 else 0 end
       where new.source = 'codex'
         and (new.session_id is not null or new.model is not null)
         and strftime('%s', new.observed_at) is not null
       on conflict(window_start_seconds) do update set
-        revision = revision + 1, updated_at = excluded.updated_at;
+        revision = revision + 1,
+        priority = min(codex_reconciliation_windows.priority, excluded.priority),
+        updated_at = excluded.updated_at;
 
       insert into codex_reconciliation_pending (event_id, observed_at)
       select new.id, new.observed_at
@@ -338,36 +365,39 @@ export function ensureCodexReconciliationSchema(database: Database.Database) {
         and (new.session_id is null or new.model is null or new.cost_usd is null)
       on conflict(event_id) do update set observed_at = excluded.observed_at;
 
-      insert into codex_reconciliation_candidates (event_id, queued_at)
-      select new.id, strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      insert into codex_reconciliation_candidates (event_id, queued_at, priority)
+      select new.id, strftime('%Y-%m-%dT%H:%M:%fZ','now'), 0
       where new.source = 'codex' and new.event_type = 'assistant_response'
         and (new.input_tokens is not null or new.output_tokens is not null)
         and (new.session_id is null or new.model is null or new.cost_usd is null)
-      on conflict(event_id) do nothing;
+      on conflict(event_id) do update set
+        priority = min(codex_reconciliation_candidates.priority, excluded.priority);
     end;
 
     create trigger if not exists trg_codex_reconciliation_update
     after update of source, event_type, observed_at, session_id, model,
       input_tokens, output_tokens, cost_usd on buffered_events
     begin
-      delete from codex_reconciliation_context where event_id = new.id;
-      insert into codex_reconciliation_context (event_id, observed_at, session_id, model)
-      select new.id, new.observed_at, new.session_id, new.model
-      where new.source = 'codex' and (new.session_id is not null or new.model is not null);
-
       insert into codex_reconciliation_windows
         (window_start_seconds, revision, processing_revision,
-         cursor_observed_at, cursor_event_id, queued_at, updated_at)
+         cursor_observed_at, cursor_event_id, queued_at, updated_at, priority)
       select
         (cast(strftime('%s', new.observed_at) as integer) / 600) * 600,
-        1, 0, '', '', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        1, 0, '', '', strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'),
+        case when new.rowid <= (
+          select legacy_target_rowid from codex_reconciliation_control where singleton = 1
+        ) and (
+          select legacy_complete from codex_reconciliation_control where singleton = 1
+        ) = 0 then 1 else 0 end
       where new.source = 'codex'
         and (new.session_id is not null or new.model is not null)
         and strftime('%s', new.observed_at) is not null
         and (old.source is not new.source or old.observed_at is not new.observed_at
           or old.session_id is not new.session_id or old.model is not new.model)
       on conflict(window_start_seconds) do update set
-        revision = revision + 1, updated_at = excluded.updated_at;
+        revision = revision + 1,
+        priority = min(codex_reconciliation_windows.priority, excluded.priority),
+        updated_at = excluded.updated_at;
 
       delete from codex_reconciliation_pending where event_id = new.id;
       insert into codex_reconciliation_pending (event_id, observed_at)
@@ -376,12 +406,13 @@ export function ensureCodexReconciliationSchema(database: Database.Database) {
         and (new.input_tokens is not null or new.output_tokens is not null)
         and (new.session_id is null or new.model is null or new.cost_usd is null);
 
-      insert into codex_reconciliation_candidates (event_id, queued_at)
-      select new.id, strftime('%Y-%m-%dT%H:%M:%fZ','now')
+      insert into codex_reconciliation_candidates (event_id, queued_at, priority)
+      select new.id, strftime('%Y-%m-%dT%H:%M:%fZ','now'), 0
       where new.source = 'codex' and new.event_type = 'assistant_response'
         and (new.input_tokens is not null or new.output_tokens is not null)
         and (new.session_id is null or new.model is null or new.cost_usd is null)
-      on conflict(event_id) do nothing;
+      on conflict(event_id) do update set
+        priority = min(codex_reconciliation_candidates.priority, excluded.priority);
     end;
 
     create trigger if not exists trg_codex_reconciliation_delete
@@ -389,9 +420,42 @@ export function ensureCodexReconciliationSchema(database: Database.Database) {
     begin
       delete from codex_reconciliation_pending where event_id = old.id;
       delete from codex_reconciliation_candidates where event_id = old.id;
-      delete from codex_reconciliation_context where event_id = old.id;
     end;
+
+    -- Snapshot the pre-existing ledger at constructor time. Rows appended
+    -- after this point are already trigger-maintained and must not be seeded a
+    -- second time by the legacy walker.
+    update codex_reconciliation_control set
+      legacy_target_rowid = (select coalesce(max(rowid), 0) from buffered_events),
+      legacy_complete = case
+        when (select coalesce(max(rowid), 0) from buffered_events) = 0 then 1
+        else 0
+      end,
+      updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+    where singleton = 1
+      and legacy_cursor_rowid = 0
+      and legacy_target_rowid = 0
+      and legacy_complete = 0;
   `);
+
+  const controlColumns = new Set(
+    (
+      database.pragma("table_info(codex_reconciliation_control)") as Array<{
+        name: string;
+      }>
+    ).map((column) => column.name),
+  );
+  const controlMigrations = [
+    "last_slice_duration_ms real not null default 0",
+    "max_slice_duration_ms real not null default 0",
+    "last_time_budget_exhausted integer not null default 0",
+  ];
+  for (const definition of controlMigrations) {
+    const name = definition.split(" ")[0]!;
+    if (!controlColumns.has(name)) {
+      database.exec(`alter table codex_reconciliation_control add column ${definition}`);
+    }
+  }
 }
 
 export function codexReconciliationStatus(
@@ -408,14 +472,25 @@ export function codexReconciliationStatus(
          rows_changed as rowsChanged,
          last_rows_visited as lastRowsVisited,
          last_rows_changed as lastRowsChanged,
+         last_slice_duration_ms as lastSliceDurationMs,
+         max_slice_duration_ms as maxSliceDurationMs,
+         last_time_budget_exhausted as lastTimeBudgetExhausted,
          last_success_at as lastSuccessAt,
          degraded_reason as degradedReason
        from codex_reconciliation_control where singleton = ?`,
     )
-    .get(CONTROL_ROW) as Omit<CodexReconciliationStatus, "legacyComplete"> & {
+    .get(CONTROL_ROW) as Omit<
+    CodexReconciliationStatus,
+    "legacyComplete" | "lastTimeBudgetExhausted"
+  > & {
     legacyComplete: number;
+    lastTimeBudgetExhausted: number;
   };
-  return { ...row, legacyComplete: row.legacyComplete === 1 };
+  return {
+    ...row,
+    legacyComplete: row.legacyComplete === 1,
+    lastTimeBudgetExhausted: row.lastTimeBudgetExhausted === 1,
+  };
 }
 
 /**
@@ -431,6 +506,7 @@ export function runCodexReconciliationMaintenance(
     contextWindowLimit?: number;
     contextRowLimit?: number;
     candidateLimit?: number;
+    freshCandidateLimit?: number;
     timeLimitMs?: number;
   } = {},
 ): CodexReconciliationResult {
@@ -440,7 +516,7 @@ export function runCodexReconciliationMaintenance(
   );
   const legacyChunkLimit = Math.max(
     1,
-    Math.min(options.legacyChunkLimit ?? 2_000, 10_000),
+    Math.min(options.legacyChunkLimit ?? 500, 10_000),
   );
   const contextWindowLimit = Math.max(
     1,
@@ -448,8 +524,13 @@ export function runCodexReconciliationMaintenance(
   );
   const contextRowLimit = Math.max(1, Math.min(options.contextRowLimit ?? 1_000, 10_000));
   const candidateLimit = Math.max(1, Math.min(options.candidateLimit ?? 500, 5_000));
+  const freshCandidateLimit = Math.max(
+    1,
+    Math.min(options.freshCandidateLimit ?? 64, candidateLimit),
+  );
   const timeLimitMs = Math.max(1, Math.min(options.timeLimitMs ?? 50, 1_000));
-  const deadline = performance.now() + timeLimitMs;
+  const sliceStarted = performance.now();
+  const deadline = sliceStarted + timeLimitMs;
 
   try {
     return database.transaction(() => {
@@ -485,70 +566,100 @@ export function runCodexReconciliationMaintenance(
         };
       }
 
-      let legacyRowsVisited = 0;
-      if (control.legacyComplete !== 1 && performance.now() < deadline) {
-        const legacySeedStatements: LegacySeedStatements = {
-          upsertContext: database.prepare(
-            `insert into codex_reconciliation_context
-               (event_id, observed_at, session_id, model)
-             values (?, ?, ?, ?)
-             on conflict(event_id) do update set
-               observed_at = excluded.observed_at,
-               session_id = excluded.session_id,
-               model = excluded.model`,
-          ),
-          upsertPending: database.prepare(
-            `insert into codex_reconciliation_pending (event_id, observed_at)
-             values (?, ?)
-             on conflict(event_id) do update set observed_at = excluded.observed_at`,
-          ),
-          enqueueCandidate: database.prepare(
-            `insert into codex_reconciliation_candidates (event_id, queued_at)
-             values (?, ?)
-             on conflict(event_id) do nothing`,
-          ),
-          enqueueWindow: database.prepare(
-            `insert into codex_reconciliation_windows
-               (window_start_seconds, revision, processing_revision,
-                cursor_observed_at, cursor_event_id, queued_at, updated_at)
-             values (?, 1, 0, '', '', ?, ?)
-             on conflict(window_start_seconds) do update set
-               revision = revision + 1, updated_at = excluded.updated_at`,
-          ),
-        };
-        const selectLegacy = database.prepare(
-          `select rowid, id, source, event_type as eventType, observed_at as observedAt,
-             session_id as sessionId, model, input_tokens as inputTokens,
-             output_tokens as outputTokens, cost_usd as costUsd
-           from buffered_events
-           where rowid > @cursor and rowid <= @target
-           order by rowid
-           limit @limit`,
-        );
-        let cursor = control.legacyCursorRowid;
-        let complete = false;
-        while (legacyRowsVisited < legacyRowLimit && performance.now() < deadline) {
-          const limit = Math.min(legacyChunkLimit, legacyRowLimit - legacyRowsVisited);
-          const rows = selectLegacy.all({
-            cursor,
-            target: control.legacyTargetRowid,
-            limit,
-          }) as LegacyRow[];
-          legacyRowsVisited += rows.length;
-          for (const row of rows) seedLegacyRow(legacySeedStatements, row, now);
-          cursor = rows.at(-1)?.rowid ?? cursor;
-          complete = rows.length < limit || cursor >= control.legacyTargetRowid;
-          if (complete || rows.length === 0) break;
+      const removeCandidate = database.prepare(
+        `delete from codex_reconciliation_candidates where event_id = ?`,
+      );
+      const apply = database.prepare(
+        `update buffered_events set
+           session_id = @sessionId,
+           model = @model,
+           cost_usd = @costUsd,
+           payload_json = @payloadJson
+         where id = @id`,
+      );
+      const sessionContext = nearestStatements(database, "session_id");
+      const modelContext = nearestStatements(database, "model");
+      const selectFreshCandidates = database.prepare(
+        `select e.rowid, e.id, e.source, e.event_type as eventType,
+           e.observed_at as observedAt, e.session_id as sessionId, e.model,
+           e.input_tokens as inputTokens, e.output_tokens as outputTokens,
+           e.cache_read_tokens as cacheReadTokens,
+           e.cache_creation_tokens as cacheCreationTokens,
+           e.cost_usd as costUsd, e.payload_json as payloadJson
+         from codex_reconciliation_candidates q
+         join buffered_events e on e.id = q.event_id
+         where q.priority = 0
+         order by q.queued_at, q.event_id
+         limit ?`,
+      );
+      const selectCandidates = database.prepare(
+        `select e.rowid, e.id, e.source, e.event_type as eventType,
+           e.observed_at as observedAt, e.session_id as sessionId, e.model,
+           e.input_tokens as inputTokens, e.output_tokens as outputTokens,
+           e.cache_read_tokens as cacheReadTokens,
+           e.cache_creation_tokens as cacheCreationTokens,
+           e.cost_usd as costUsd, e.payload_json as payloadJson
+         from codex_reconciliation_candidates q
+         join buffered_events e on e.id = q.event_id
+         order by q.priority, q.queued_at, q.event_id
+         limit ?`,
+      );
+      let candidateRowsVisited = 0;
+      let rowsChanged = 0;
+      let stitched = 0;
+      let priced = 0;
+      const processCandidates = (freshOnly: boolean, limit: number) => {
+        if (limit <= 0 || performance.now() >= deadline) return;
+        const rows = (freshOnly ? selectFreshCandidates : selectCandidates).all(
+          limit,
+        ) as CandidateRow[];
+        for (const row of rows) {
+          if (performance.now() >= deadline) break;
+          candidateRowsVisited += 1;
+          if (!row.id || !isCandidate(row)) {
+            removeCandidate.run(row.id);
+            continue;
+          }
+          const sessionId = row.sessionId ?? nearestValue(row, sessionContext);
+          const model = row.model ?? nearestValue(row, modelContext);
+          let costUsd = row.costUsd;
+          if (costUsd === null && model) {
+            costUsd =
+              estimateCostUsd({
+                model,
+                inputTokens: row.inputTokens ?? 0,
+                outputTokens: row.outputTokens ?? 0,
+                cacheReadTokens: row.cacheReadTokens ?? 0,
+                cacheCreationTokens: row.cacheCreationTokens ?? 0,
+              })?.costUsd ?? null;
+          }
+          const sessionChanged = sessionId !== row.sessionId;
+          const modelChanged = model !== row.model;
+          const costChanged = costUsd !== row.costUsd;
+          if (sessionChanged || modelChanged || costChanged) {
+            const payloadJson = reconciledPayload(row.payloadJson, {
+              sessionId,
+              model,
+              costUsd,
+              sessionChanged,
+              modelChanged,
+              costChanged,
+            });
+            rowsChanged += apply.run({ id: row.id, sessionId, model, costUsd, payloadJson })
+              .changes;
+            if (sessionChanged) stitched += 1;
+            if (costChanged) priced += 1;
+          }
+          // Unresolved rows leave the active queue instead of spinning. They
+          // remain in `pending`; a later context-window invalidation requeues.
+          removeCandidate.run(row.id);
         }
-        database
-          .prepare(
-            `update codex_reconciliation_control
-             set legacy_cursor_rowid = ?, legacy_complete = ?, updated_at = ?
-             where singleton = ?`,
-          )
-          .run(cursor, complete ? 1 : 0, now, CONTROL_ROW);
-        control = { ...control, legacyCursorRowid: cursor, legacyComplete: complete ? 1 : 0 };
-      }
+      };
+
+      // New writes are priority zero and always receive service before any
+      // legacy scan. This reservation keeps current work useful even while a
+      // dense historical high-water is still advancing.
+      processCandidates(true, freshCandidateLimit);
 
       let contextRowsVisited = 0;
       const windows = (performance.now() < deadline
@@ -559,9 +670,9 @@ export function runCodexReconciliationMaintenance(
                  cursor_observed_at as cursorObservedAt,
                  cursor_event_id as cursorEventId,
                  target_observed_at as targetObservedAt,
-                 target_event_id as targetEventId
+                 target_event_id as targetEventId, priority
                from codex_reconciliation_windows
-               order by queued_at, window_start_seconds
+               order by priority, queued_at, window_start_seconds
                limit ?`,
             )
             .all(contextWindowLimit)
@@ -573,11 +684,13 @@ export function runCodexReconciliationMaintenance(
         cursorEventId: string;
         targetObservedAt: string;
         targetEventId: string;
+        priority: number;
       }>;
       const enqueueCandidate = database.prepare(
-        `insert into codex_reconciliation_candidates (event_id, queued_at)
-         values (?, ?)
-         on conflict(event_id) do nothing`,
+        `insert into codex_reconciliation_candidates (event_id, queued_at, priority)
+         values (?, ?, ?)
+         on conflict(event_id) do update set
+           priority = min(codex_reconciliation_candidates.priority, excluded.priority)`,
       );
       const deleteWindow = database.prepare(
         `delete from codex_reconciliation_windows where window_start_seconds = ?`,
@@ -651,7 +764,7 @@ export function runCodexReconciliationMaintenance(
             limit: remaining,
           }) as Array<{ eventId: string; observedAt: string }>;
         contextRowsVisited += rows.length;
-        for (const row of rows) enqueueCandidate.run(row.eventId, now);
+        for (const row of rows) enqueueCandidate.run(row.eventId, now, window.priority);
         const last = rows.at(-1);
         const passComplete =
           rows.length < remaining ||
@@ -694,81 +807,63 @@ export function runCodexReconciliationMaintenance(
         }
       }
 
-      const candidateRows = (performance.now() < deadline
-        ? database
-            .prepare(
-              `select e.rowid, e.id, e.source, e.event_type as eventType,
-                 e.observed_at as observedAt, e.session_id as sessionId, e.model,
-                 e.input_tokens as inputTokens, e.output_tokens as outputTokens,
-                 e.cache_read_tokens as cacheReadTokens,
-                 e.cache_creation_tokens as cacheCreationTokens,
-                 e.cost_usd as costUsd, e.payload_json as payloadJson
-               from codex_reconciliation_candidates q
-               join buffered_events e on e.id = q.event_id
-               order by q.queued_at, q.event_id
-               limit ?`,
-            )
-            .all(candidateLimit)
-        : []) as CandidateRow[];
-      const removeCandidate = database.prepare(
-        `delete from codex_reconciliation_candidates where event_id = ?`,
-      );
-      const apply = database.prepare(
-        `update buffered_events set
-           session_id = @sessionId,
-           model = @model,
-           cost_usd = @costUsd,
-           payload_json = @payloadJson
-         where id = @id`,
-      );
-      const sessionContext = nearestStatements(database, "session_id");
-      const modelContext = nearestStatements(database, "model");
-      let candidateRowsVisited = 0;
-      let rowsChanged = 0;
-      let stitched = 0;
-      let priced = 0;
-      for (const row of candidateRows) {
-        if (performance.now() >= deadline) break;
-        candidateRowsVisited += 1;
-        if (!row.id || !isCandidate(row)) {
-          removeCandidate.run(row.id);
-          continue;
+      // Window invalidation may have promoted old pending work to priority
+      // zero. Drain it before giving the remainder of the slice to history.
+      processCandidates(false, candidateLimit - candidateRowsVisited);
+
+      let legacyRowsVisited = 0;
+      if (control.legacyComplete !== 1 && performance.now() < deadline) {
+        const legacySeedStatements: LegacySeedStatements = {
+          upsertPending: database.prepare(
+            `insert into codex_reconciliation_pending (event_id, observed_at)
+             values (?, ?)
+             on conflict(event_id) do update set observed_at = excluded.observed_at`,
+          ),
+          enqueueCandidate: database.prepare(
+            `insert into codex_reconciliation_candidates (event_id, queued_at, priority)
+             values (?, ?, ?)
+             on conflict(event_id) do nothing`,
+          ),
+        };
+        const selectLegacy = database.prepare(
+          `select rowid, id, source, event_type as eventType, observed_at as observedAt,
+             session_id as sessionId, model, input_tokens as inputTokens,
+             output_tokens as outputTokens, cost_usd as costUsd
+           from buffered_events
+           where rowid > @cursor and rowid <= @target
+           order by rowid
+           limit @limit`,
+        );
+        let cursor = control.legacyCursorRowid;
+        let complete = false;
+        while (legacyRowsVisited < legacyRowLimit && performance.now() < deadline) {
+          const limit = Math.min(legacyChunkLimit, legacyRowLimit - legacyRowsVisited);
+          const rows = selectLegacy.all({
+            cursor,
+            target: control.legacyTargetRowid,
+            limit,
+          }) as LegacyRow[];
+          legacyRowsVisited += rows.length;
+          // A query/chunk is the hard unit. Complete the at-most-500-row
+          // chunk before advancing its cursor, even if the soft clock expires.
+          for (const row of rows) seedLegacyRow(legacySeedStatements, row, now);
+          cursor = rows.at(-1)?.rowid ?? cursor;
+          complete = rows.length < limit || cursor >= control.legacyTargetRowid;
+          if (complete || rows.length === 0) break;
         }
-        const sessionId = row.sessionId ?? nearestValue(row, sessionContext);
-        const model = row.model ?? nearestValue(row, modelContext);
-        let costUsd = row.costUsd;
-        if (costUsd === null && model) {
-          costUsd =
-            estimateCostUsd({
-              model,
-              inputTokens: row.inputTokens ?? 0,
-              outputTokens: row.outputTokens ?? 0,
-              cacheReadTokens: row.cacheReadTokens ?? 0,
-              cacheCreationTokens: row.cacheCreationTokens ?? 0,
-            })?.costUsd ?? null;
-        }
-        const sessionChanged = sessionId !== row.sessionId;
-        const modelChanged = model !== row.model;
-        const costChanged = costUsd !== row.costUsd;
-        if (sessionChanged || modelChanged || costChanged) {
-          const payloadJson = reconciledPayload(row.payloadJson, {
-            sessionId,
-            model,
-            costUsd,
-            sessionChanged,
-            modelChanged,
-            costChanged,
-          });
-          rowsChanged += apply.run({ id: row.id, sessionId, model, costUsd, payloadJson }).changes;
-          if (sessionChanged) stitched += 1;
-          if (costChanged) priced += 1;
-        }
-        // Unresolved rows leave the active queue instead of spinning. They
-        // remain in `pending`; a later context-window invalidation requeues.
-        removeCandidate.run(row.id);
+        database
+          .prepare(
+            `update codex_reconciliation_control
+             set legacy_cursor_rowid = ?, legacy_complete = ?, updated_at = ?
+             where singleton = ?`,
+          )
+          .run(cursor, complete ? 1 : 0, now, CONTROL_ROW);
+        control = { ...control, legacyCursorRowid: cursor, legacyComplete: complete ? 1 : 0 };
       }
 
       const rowsVisited = legacyRowsVisited + contextRowsVisited + candidateRowsVisited;
+      const sliceDurationMs = performance.now() - sliceStarted;
+      const timeBudgetExhausted = performance.now() >= deadline;
       database
         .prepare(
           `update codex_reconciliation_control set
@@ -776,12 +871,21 @@ export function runCodexReconciliationMaintenance(
              rows_changed = rows_changed + @rowsChanged,
              last_rows_visited = @rowsVisited,
              last_rows_changed = @rowsChanged,
+             last_slice_duration_ms = @sliceDurationMs,
+             max_slice_duration_ms = max(max_slice_duration_ms, @sliceDurationMs),
+             last_time_budget_exhausted = @timeBudgetExhausted,
              last_success_at = @now,
              degraded_reason = null,
              updated_at = @now
            where singleton = 1`,
         )
-        .run({ rowsVisited, rowsChanged, now });
+        .run({
+          rowsVisited,
+          rowsChanged,
+          sliceDurationMs,
+          timeBudgetExhausted: timeBudgetExhausted ? 1 : 0,
+          now,
+        });
       return {
         backfillComplete: control.legacyComplete === 1,
         legacyRowsVisited,
@@ -791,7 +895,8 @@ export function runCodexReconciliationMaintenance(
         rowsChanged,
         stitched,
         priced,
-        timeBudgetExhausted: performance.now() >= deadline,
+        sliceDurationMs,
+        timeBudgetExhausted,
       };
     })();
   } catch (error) {

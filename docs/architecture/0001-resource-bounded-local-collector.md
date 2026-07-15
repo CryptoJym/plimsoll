@@ -221,7 +221,7 @@ Deferred. Worker processes could isolate synchronous database CPU, but they add 
 
 1. **Stop restart storms (#76).** Establish one owner and a stable packaged executable before measuring idle cost.
 2. **Stop repeated work (#77).** Commit byte offsets, serialize lanes, and replace unconditional sweeps with dirty work.
-3. **Bound Codex reconciliation (#91).** Remove full reconciliation from the OTLP request; drain durable candidate and context-window revisions in fixed row/time slices, with a bounded legacy rowid high-water migration.
+3. **Bound Codex reconciliation (#91).** Remove full reconciliation from the OTLP request; store only unresolved usage, prioritized candidates, revisioned pending windows, and a singleton control receipt. Resolve context through bounded raw `idx_events_observed` searches, reserve service for post-high-water work, and advance the legacy rowid high-water through hard 500-row chunks under an honestly reported soft deadline.
 4. **Stop low-value storage (#78).** Apply the sanitized admission predicate and expose drop counters.
 5. **Isolate delivery (#79).** Add outbox/dead-letter state and honest budgets without rewriting live history.
 6. **Bound reads (#80).** Build/reconcile projections, switch dashboard/status, and remove read-triggered filesystem walks.

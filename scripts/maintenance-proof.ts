@@ -85,6 +85,7 @@ function fakeRun(recentOnly: boolean): CollectorMaintenanceRunResult {
       rowsChanged: 0,
       stitched: 0,
       priced: 0,
+      sliceDurationMs: 0,
       timeBudgetExhausted: false,
     },
     repricing: {
