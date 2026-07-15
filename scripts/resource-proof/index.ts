@@ -9,6 +9,7 @@ import {
   loadUnwiredIntegrationScenarios,
   removeResourceSandbox,
   runArchitectureContract,
+  runBoundedCodexReconciliationContract,
   runChildEnvironmentContract,
   runEmptyLedgerContract,
   runExistingSignalFidelityProof,
@@ -47,8 +48,8 @@ Options:
   --help                 Show this help.
 
 The default harness is truthful but not a release pass: #76 duplicate ownership,
-#77 no-change maintenance, and #79 poison continuation are wired; three #80/integrated/privacy
-scenarios remain not_wired.`);
+#77 no-change maintenance, #79 poison continuation, and #91 bounded Codex
+reconciliation are wired; three #80/integrated/privacy scenarios remain not_wired.`);
 }
 
 function summarize(scenarios: ScenarioReceipt[]) {
@@ -101,6 +102,7 @@ async function main() {
     scenarios.push(runEmptyLedgerContract(sandbox));
     scenarios.push(runExistingSignalFidelityProof(sandbox, runExistingProof));
     scenarios.push(await runNoChangeConstantWorkContract(sandbox));
+    scenarios.push(runBoundedCodexReconciliationContract(sandbox));
     scenarios.push(await runDuplicateStartSingleOwnerContract(sandbox));
     scenarios.push(await runPoisonContinuationContract(sandbox));
     scenarios.push(
@@ -109,6 +111,7 @@ async function main() {
           "no_change_constant_work",
           "duplicate_start_single_owner",
           "poison_continuation",
+          "bounded_codex_reconciliation",
         ]),
       ),
     );

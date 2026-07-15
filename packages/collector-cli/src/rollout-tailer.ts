@@ -33,7 +33,7 @@ import {
  *    retries/parallel requests double-count in `last`). Sum of deltas equals
  *    the final total by construction.
  *  - Event ids are deterministic over (conversation id, token_count index),
- *    and writes are insert-or-replace, so rescans are idempotent.
+ *    and deterministic duplicate ids are ignored, so rescans are idempotent.
  *  - Privacy: only `session_meta` / `turn_context` / `token_count` lines are
  *    even JSON-parsed; message/reasoning lines are skipped by prefilter and
  *    no content field is ever read or persisted.

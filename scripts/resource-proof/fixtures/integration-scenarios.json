@@ -35,6 +35,13 @@
       "requiredCounters": ["listenersCreated", "restartRequests"]
     },
     {
+      "id": "bounded_codex_reconciliation",
+      "issue": 91,
+      "blockedBy": [91],
+      "detail": "Prove Codex OTLP capture only enqueues compact dirty work, later context repairs prior usage in fixed crash-resumable slices, and unchanged reruns visit zero rows.",
+      "requiredCounters": ["reconciliationRowsVisited", "rawEventRewrites", "overlappingJobs"]
+    },
+    {
       "id": "poison_continuation",
       "issue": 79,
       "blockedBy": [79],

@@ -89,7 +89,7 @@ export type NormalizedHistoryEvent =
 /**
  * Row → wire envelope. The payload is local captured truth; the wire copy is
  * reduced by the shared outbound sealer after two schema repairs:
- * - top-level nulls are dropped (reconcileCodexUsage's json_set writes
+ * - top-level nulls are dropped (bounded Codex reconciliation writes
  *   `sessionId: null` when no stitch neighbor exists; the schema wants the
  *   key absent — these rows otherwise wedge any oldest-first drain);
  * - non-UUID ids are deterministically re-derived (see ensureUuidEventId).
