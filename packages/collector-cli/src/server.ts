@@ -20,6 +20,7 @@ import {
   dashboardSessions,
   dashboardSummary,
 } from "./dashboard-api";
+import type { CollectorRuntimeIdentity } from "./runtime-ownership";
 
 let dashboardHtml: string | undefined;
 function loadDashboardHtml() {
@@ -96,7 +97,11 @@ function isTrustedLocalWrite(request: http.IncomingMessage) {
   return originOk && firstHeader(request.headers["x-plimsoll-local"]) === "1";
 }
 
-export function createCollectorServer(config: CollectorConfig, buffer: LocalEventBuffer) {
+export function createCollectorServer(
+  config: CollectorConfig,
+  buffer: LocalEventBuffer,
+  options: { runtimeIdentity?: CollectorRuntimeIdentity } = {},
+) {
   // Capture health walks local transcript/rollout dirs — memoize per minute so
   // the 30s dashboard refresh doesn't re-scan the filesystem every tick.
   let healthCache: { at: number; value: CaptureHealth } | null = null;
@@ -108,6 +113,7 @@ export function createCollectorServer(config: CollectorConfig, buffer: LocalEven
         }
         sendJson(response, {
           ok: true,
+          runtimeIdentity: options.runtimeIdentity ?? null,
           dataMode: config.policy.dataMode,
           retentionDays: config.retentionDays,
           stats: buffer.stats(),

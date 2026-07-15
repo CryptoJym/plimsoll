@@ -43,8 +43,14 @@ import { uploadBufferedEvents } from "./upload";
 import { runAttributionRepair, runWorkspaceHistoryUpload } from "./upload-history";
 import {
   acquireCollectorStartOwnership,
+  createCollectorRuntimeIdentity,
+  processIdentityIsLive,
+  readCollectorPidFile,
+  readProcessStartFingerprint,
   removeCollectorPidFileIfOwned,
+  verifyCollectorRuntimeIdentity,
   type CollectorPidRecord,
+  type CollectorRuntimeIdentity,
 } from "./runtime-ownership";
 
 const command = process.argv[2] ?? "help";
@@ -190,148 +196,16 @@ async function checkCollectorConnectivity(port: number) {
   }
 }
 
-function collectorPidRecord(): CollectorPidRecord {
+function collectorPidRecord(runtimeIdentity: CollectorRuntimeIdentity): CollectorPidRecord {
   return {
     command: process.argv.slice(1),
     cwd: process.cwd(),
+    instanceId: runtimeIdentity.instanceId,
     label: LAUNCH_AGENT_LABEL,
-    pid: process.pid,
+    pid: runtimeIdentity.pid,
+    processStartFingerprint: runtimeIdentity.processStartFingerprint,
     startedAt: new Date().toISOString(),
-    version: 1,
-  };
-}
-
-function removePidFile(pidPath = collectorLogPath("collector.pid")) {
-  if (fs.existsSync(pidPath)) {
-    fs.unlinkSync(pidPath);
-  }
-}
-
-function readPidFile(pidPath: string):
-  | { ok: true; legacy: boolean; record: CollectorPidRecord }
-  | { ok: false; reason: "invalid_pid_file" | "pid_file_missing"; raw?: string } {
-  if (!fs.existsSync(pidPath)) {
-    return { ok: false, reason: "pid_file_missing" };
-  }
-
-  const raw = fs.readFileSync(pidPath, "utf8").trim();
-  const legacyPid = Number(raw);
-  if (Number.isInteger(legacyPid) && legacyPid > 0) {
-    return {
-      ok: true,
-      legacy: true,
-      record: {
-        command: [],
-        cwd: "",
-        label: LAUNCH_AGENT_LABEL,
-        pid: legacyPid,
-        startedAt: "legacy",
-        version: 1,
-      },
-    };
-  }
-
-  try {
-    const parsed = JSON.parse(raw) as Partial<CollectorPidRecord>;
-    if (
-      parsed.version === 1 &&
-      parsed.label === LAUNCH_AGENT_LABEL &&
-      Number.isInteger(parsed.pid) &&
-      (parsed.pid ?? 0) > 0 &&
-      Array.isArray(parsed.command) &&
-      typeof parsed.cwd === "string" &&
-      typeof parsed.startedAt === "string"
-    ) {
-      return { ok: true, legacy: false, record: parsed as CollectorPidRecord };
-    }
-  } catch {
-    // Fall through to invalid file handling.
-  }
-
-  return { ok: false, reason: "invalid_pid_file", raw };
-}
-
-function processCommandForPid(pid: number) {
-  const result = spawnSync("ps", ["-p", String(pid), "-o", "command="], {
-    encoding: "utf8",
-    stdio: ["ignore", "pipe", "pipe"],
-  });
-
-  if (result.status !== 0) return null;
-  return result.stdout.trim();
-}
-
-function looksLikeCollectorStartCommand(commandLine: string | null) {
-  if (!commandLine) return false;
-  const normalized = commandLine.toLowerCase();
-  return (
-    normalized.includes("start") &&
-    (normalized.includes("collector-cli") ||
-      normalized.includes("packages/collector-cli") ||
-      normalized.includes("@plimsoll/cli") ||
-      normalized.includes("/plimsoll") ||
-      normalized.includes("pnpm") ||
-      normalized.includes("tsx"))
-  );
-}
-
-function pidRecordMatchesCommand(record: CollectorPidRecord, commandLine: string | null) {
-  if (!commandLine || record.command.length === 0 || !record.command.includes("start")) {
-    return false;
-  }
-  const runningScript = record.command[0];
-  return Boolean(runningScript && commandLine.includes(runningScript));
-}
-
-function validatePidFileForStop(pidPath: string) {
-  const read = readPidFile(pidPath);
-  if (!read.ok) {
-    removePidFile(pidPath);
-    return {
-      ok: false,
-      pid: null,
-      reason: read.reason,
-      removedPidFile: true,
-    };
-  }
-
-  const { record } = read;
-  try {
-    process.kill(record.pid, 0);
-  } catch {
-    removePidFile(pidPath);
-    return {
-      ok: false,
-      pid: record.pid,
-      reason: "process_not_running",
-      removedPidFile: true,
-    };
-  }
-
-  const commandLine = processCommandForPid(record.pid);
-  const commandLooksSafe = looksLikeCollectorStartCommand(commandLine);
-  const recordMatches = read.legacy || pidRecordMatchesCommand(record, commandLine);
-  if (!commandLooksSafe || !recordMatches) {
-    removePidFile(pidPath);
-    return {
-      commandLine,
-      cwd: record.cwd,
-      legacyPidFile: read.legacy,
-      ok: false,
-      pid: record.pid,
-      reason: "pid_guard_rejected",
-      removedPidFile: true,
-    };
-  }
-
-  return {
-    commandLine,
-    cwd: record.cwd,
-    legacyPidFile: read.legacy,
-    ok: true,
-    pid: record.pid,
-    reason: null,
-    removedPidFile: false,
+    version: 2,
   };
 }
 
@@ -347,7 +221,9 @@ async function main() {
 
   if (command === "start") {
     const pidPath = collectorLogPath("collector.pid");
+    const runtimeIdentity = createCollectorRuntimeIdentity();
     const ownership = await acquireCollectorStartOwnership({
+      candidateIdentity: runtimeIdentity,
       label: LAUNCH_AGENT_LABEL,
       pidPath,
       port: config.port,
@@ -357,9 +233,10 @@ async function main() {
         JSON.stringify(
           {
             status: "already_running",
-            pid: ownership.ownerPid,
+            pid: ownership.runtimeIdentity.pid,
             pidPath: ownership.pidPath,
             port: ownership.port,
+            runtimeIdentity: ownership.runtimeIdentity,
           },
           null,
           2,
@@ -369,7 +246,7 @@ async function main() {
     }
 
     const buffer = openBuffer();
-    const server = createCollectorServer(config, buffer);
+    const server = createCollectorServer(config, buffer, { runtimeIdentity });
     let ownsPidFile = false;
     let shuttingDown = false;
     const timers: NodeJS.Timeout[] = [];
@@ -551,7 +428,7 @@ async function main() {
       server.close(() => {
         buffer.close();
         if (ownsPidFile) {
-          removeCollectorPidFileIfOwned(pidPath, process.pid, LAUNCH_AGENT_LABEL);
+          removeCollectorPidFileIfOwned(pidPath, runtimeIdentity, LAUNCH_AGENT_LABEL);
         }
         console.log(
           JSON.stringify({
@@ -571,7 +448,7 @@ async function main() {
       ownership.release();
       buffer.close();
       if (ownsPidFile) {
-        removeCollectorPidFileIfOwned(pidPath, process.pid, LAUNCH_AGENT_LABEL);
+        removeCollectorPidFileIfOwned(pidPath, runtimeIdentity, LAUNCH_AGENT_LABEL);
       }
       console.error(
         JSON.stringify(
@@ -589,7 +466,7 @@ async function main() {
     });
     server.listen(config.port, "127.0.0.1", () => {
       try {
-        ownership.writePidFile(collectorPidRecord());
+        ownership.writePidFile(collectorPidRecord(runtimeIdentity));
         ownsPidFile = true;
       } catch (error) {
         ownership.release();
@@ -619,6 +496,7 @@ async function main() {
           port: config.port,
           pid: process.pid,
           pidPath,
+          runtimeIdentity,
           hookEndpoints: {
             claudeCode: `http://127.0.0.1:${config.port}/hooks/claude-code`,
             codex: `http://127.0.0.1:${config.port}/hooks/codex`,
@@ -1369,23 +1247,23 @@ async function main() {
   if (command === "stop") {
     const pidPath = collectorLogPath("collector.pid");
     const launchAgentStopCommand = launchctlBootoutCommand().join(" ");
-
-    const pidGuard = validatePidFileForStop(pidPath);
-    if (!pidGuard.ok) {
+    const pidRead = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);
+    if (pidRead.kind !== "current") {
+      const pid = pidRead.kind === "legacy" ? pidRead.pid : null;
       console.log(
         JSON.stringify(
           {
             stopped: false,
-            reason: pidGuard.reason,
-            pid: pidGuard.pid,
+            reason:
+              pidRead.kind === "legacy"
+                ? "legacy_pid_file_blocked"
+                : pidRead.kind === "invalid"
+                  ? "invalid_pid_file"
+                  : "pid_file_missing",
+            pid,
             pidPath,
             launchAgentStopCommand,
-            removedPidFile: pidGuard.removedPidFile,
-            pidGuard: {
-              commandLine: "commandLine" in pidGuard ? pidGuard.commandLine : null,
-              cwd: "cwd" in pidGuard ? pidGuard.cwd : null,
-              legacyPidFile: "legacyPidFile" in pidGuard ? pidGuard.legacyPidFile : false,
-            },
+            removedPidFile: false,
           },
           null,
           2,
@@ -1394,17 +1272,52 @@ async function main() {
       return;
     }
 
-    const pid = pidGuard.pid;
-    if (pid === null) {
+    const runtimeIdentity: CollectorRuntimeIdentity = {
+      instanceId: pidRead.record.instanceId,
+      pid: pidRead.record.pid,
+      processStartFingerprint: pidRead.record.processStartFingerprint,
+    };
+    if (!processIdentityIsLive(runtimeIdentity)) {
+      const removedPidFile = removeCollectorPidFileIfOwned(
+        pidPath,
+        runtimeIdentity,
+        LAUNCH_AGENT_LABEL,
+      );
       console.log(
         JSON.stringify(
           {
             stopped: false,
-            reason: "invalid_pid_file",
-            pid,
+            reason: "process_not_running_or_reused",
+            pid: runtimeIdentity.pid,
             pidPath,
             launchAgentStopCommand,
-            removedPidFile: true,
+            removedPidFile,
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+
+    const identityVerified = await verifyCollectorRuntimeIdentity(config.port, runtimeIdentity, {
+      probeCount: 2,
+    });
+    if (
+      !identityVerified ||
+      readProcessStartFingerprint(runtimeIdentity.pid) !==
+        runtimeIdentity.processStartFingerprint
+    ) {
+      console.log(
+        JSON.stringify(
+          {
+            stopped: false,
+            reason: "runtime_identity_unverified",
+            pid: runtimeIdentity.pid,
+            pidPath,
+            launchAgentStopCommand,
+            removedPidFile: false,
+            runtimeIdentity,
           },
           null,
           2,
@@ -1414,35 +1327,37 @@ async function main() {
     }
 
     try {
-      process.kill(pid, "SIGTERM");
+      process.kill(runtimeIdentity.pid, "SIGTERM");
       console.log(
         JSON.stringify(
           {
             stopped: true,
-            pid,
+            pid: runtimeIdentity.pid,
             pidPath,
             launchAgentStopCommand,
-            pidGuard: {
-              commandLine: pidGuard.commandLine,
-              cwd: pidGuard.cwd,
-              legacyPidFile: pidGuard.legacyPidFile,
-            },
+            runtimeIdentity,
           },
           null,
           2,
         ),
       );
     } catch (error) {
-      removePidFile(pidPath);
+      const removedPidFile = removeCollectorPidFileIfOwned(
+        pidPath,
+        runtimeIdentity,
+        LAUNCH_AGENT_LABEL,
+      );
       console.log(
         JSON.stringify(
           {
             stopped: false,
             reason: "kill_failed",
             message: error instanceof Error ? error.message : String(error),
-            pid,
+            pid: runtimeIdentity.pid,
             pidPath,
             launchAgentStopCommand,
+            removedPidFile,
+            runtimeIdentity,
           },
           null,
           2,

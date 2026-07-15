@@ -1,4 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import net from "node:net";
@@ -10,6 +11,13 @@ import {
   LAUNCH_AGENT_LABEL,
   renderLaunchAgentPlist,
 } from "../packages/collector-cli/src/launch-agent";
+import {
+  readProcessStartFingerprint,
+  runtimeIdentityMatches,
+  START_LOCK_LEASE_MS,
+  type CollectorPidRecord,
+  type CollectorRuntimeIdentity,
+} from "../packages/collector-cli/src/runtime-ownership";
 
 type Receipt = Record<string, unknown>;
 
@@ -131,6 +139,93 @@ function writeConfig(home: string, port: number) {
   );
 }
 
+function runtimeIdentity(pid: number, instanceId = randomUUID()): CollectorRuntimeIdentity {
+  const processStartFingerprint = readProcessStartFingerprint(pid);
+  check(processStartFingerprint, "Could not fingerprint proof process " + pid + ".");
+  return { instanceId, pid, processStartFingerprint };
+}
+
+function writePidRecord(
+  home: string,
+  identity: CollectorRuntimeIdentity,
+  root: string,
+) {
+  const record: CollectorPidRecord = {
+    ...identity,
+    command: ["proof-owner"],
+    cwd: root,
+    label: LAUNCH_AGENT_LABEL,
+    startedAt: new Date().toISOString(),
+    version: 2,
+  };
+  fs.writeFileSync(
+    path.join(home, "collector.pid"),
+    JSON.stringify(record, null, 2) + "\n",
+    { mode: 0o600 },
+  );
+  return record;
+}
+
+function writeStartLock(
+  home: string,
+  identity: CollectorRuntimeIdentity,
+  createdAt: string,
+) {
+  fs.writeFileSync(
+    path.join(home, "collector.pid.start.lock"),
+    JSON.stringify(
+      {
+        ...identity,
+        createdAt,
+        label: LAUNCH_AGENT_LABEL,
+        version: 2,
+      },
+      null,
+      2,
+    ) + "\n",
+    { mode: 0o600 },
+  );
+}
+
+async function startOneShotIdentityOwner(port: number) {
+  const script = [
+    'const http = require("node:http");',
+    'process.on("message", ({ port, runtimeIdentity }) => {',
+    '  let served = false;',
+    '  const server = http.createServer((_request, response) => {',
+    '    response.writeHead(200, { "content-type": "application/json" });',
+    '    response.end(JSON.stringify({',
+    '      ok: true, dataMode: "metadata", retentionDays: 90, stats: {}, health: {}, runtimeIdentity',
+    '    }));',
+    '    if (!served) {',
+    '      served = true;',
+    '      setTimeout(() => server.close(() => process.exit(0)), 10);',
+    '    }',
+    '  });',
+    '  server.listen(port, "127.0.0.1", () => process.send({ ready: true }));',
+    '});',
+  ].join("\n");
+  const watched = watch(
+    spawn(process.execPath, ["-e", script], {
+      stdio: ["ignore", "pipe", "pipe", "ipc"],
+    }),
+  );
+  check(watched.child.pid, "Could not spawn the one-shot owner.");
+  const identity = runtimeIdentity(watched.child.pid);
+  const ready = new Promise<void>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("One-shot owner did not bind.")), 5_000);
+    watched.child.on("message", (message) => {
+      if ((message as { ready?: unknown }).ready === true) {
+        clearTimeout(timer);
+        resolve();
+      }
+    });
+  });
+  watched.child.send?.({ port, runtimeIdentity: identity });
+  await ready;
+  return { identity, watched };
+}
+
 function startCollector(cliPath: string, home: string) {
   return watch(
     spawn(process.execPath, [cliPath, "start"], {
@@ -169,6 +264,7 @@ async function main() {
 
   const tempRoot = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-supervision-"));
   const children: WatchedChild[] = [];
+  const auxiliaryChildren: ChildProcess[] = [];
   let sentinel: ChildProcess | null = null;
   let foreignServer: http.Server | null = null;
 
@@ -207,13 +303,34 @@ async function main() {
     check(active, "No active receipt was emitted.");
     check(alreadyRunning, "No already_running receipt was emitted.");
     check(active.pid === alreadyRunning.pid, "Follower did not identify the owner PID.");
+    check(
+      runtimeIdentityMatches(
+        active.runtimeIdentity as CollectorRuntimeIdentity,
+        alreadyRunning.runtimeIdentity as CollectorRuntimeIdentity,
+      ),
+      "Concurrent follower did not confirm the exact owner runtime identity.",
+    );
     const pidPath = path.join(concurrentHome, "collector.pid");
-    const pidRecord = JSON.parse(fs.readFileSync(pidPath, "utf8")) as { pid: number };
+    const pidRecord = JSON.parse(fs.readFileSync(pidPath, "utf8")) as CollectorPidRecord;
     check(pidRecord.pid === active.pid, "Concurrent follower replaced the owner PID file.");
+    check(
+      runtimeIdentityMatches(
+        pidRecord,
+        active.runtimeIdentity as CollectorRuntimeIdentity,
+      ),
+      "PID record and active status do not share one runtime identity.",
+    );
     const followerExit = await waitForExit(follower.child);
     check(followerExit.code === 0, "already_running must be a successful exit.");
     const response = await fetch("http://127.0.0.1:" + concurrentPort + "/status");
     check(response.ok, "Exactly one collector listener was not healthy.");
+    const status = (await response.json()) as {
+      runtimeIdentity?: CollectorRuntimeIdentity;
+    };
+    check(
+      runtimeIdentityMatches(status.runtimeIdentity, pidRecord),
+      "/status did not return the exact PID-record runtime identity.",
+    );
     const stopper = stopCollector(cliPath, concurrentHome, root);
     children.push(stopper);
     await waitFor(
@@ -232,23 +349,10 @@ async function main() {
       stdio: "ignore",
     });
     check(sentinel.pid, "Could not create unrelated sentinel process.");
+    auxiliaryChildren.push(sentinel);
     const stalePidPath = path.join(staleHome, "collector.pid");
-    fs.writeFileSync(
-      stalePidPath,
-      JSON.stringify(
-        {
-          command: ["stale-collector"],
-          cwd: root,
-          label: LAUNCH_AGENT_LABEL,
-          pid: sentinel.pid,
-          startedAt: "2026-01-01T00:00:00.000Z",
-          version: 1,
-        },
-        null,
-        2,
-      ) + "\n",
-      { mode: 0o600 },
-    );
+    const staleIdentity = runtimeIdentity(sentinel.pid);
+    writePidRecord(staleHome, staleIdentity, root);
 
     const recovered = startCollector(cliPath, staleHome);
     children.push(recovered);
@@ -262,45 +366,67 @@ async function main() {
     );
     process.kill(sentinel.pid, 0);
     const recoveredReceipt = statusReceipt(recovered, "active");
-    const recoveredPid = JSON.parse(fs.readFileSync(stalePidPath, "utf8")) as { pid: number };
+    const recoveredPid = JSON.parse(fs.readFileSync(stalePidPath, "utf8")) as CollectorPidRecord;
     check(recoveredPid.pid === recoveredReceipt?.pid, "Recovered owner PID was not recorded.");
     check(recoveredPid.pid !== sentinel.pid, "Stale unrelated PID remained authoritative.");
     await stopOwner(recovered);
 
+    const ownerDeathHome = path.join(tempRoot, "owner-death");
+    const ownerDeathPort = await availablePort();
+    writeConfig(ownerDeathHome, ownerDeathPort);
+    const transientOwner = await startOneShotIdentityOwner(ownerDeathPort);
+    children.push(transientOwner.watched);
+    writePidRecord(ownerDeathHome, transientOwner.identity, root);
+    const replacement = startCollector(cliPath, ownerDeathHome);
+    children.push(replacement);
+    await waitFor(
+      () => Boolean(statusReceipt(replacement, "active")),
+      "Candidate did not recover after the owner died following its first valid status: " +
+        JSON.stringify(replacement.receipts) +
+        " errors=" +
+        JSON.stringify(replacement.errors),
+      20_000,
+    );
+    check(
+      !statusReceipt(replacement, "already_running"),
+      "Candidate returned already_running after the confirmed owner died.",
+    );
+    await waitForExit(transientOwner.watched.child);
+    await stopOwner(replacement);
+
     const foreignHome = path.join(tempRoot, "foreign-listener");
     const foreignPort = await availablePort();
     writeConfig(foreignHome, foreignPort);
+    const foreignPidIdentity = runtimeIdentity(process.pid);
+    const foreignStatusIdentity = {
+      ...foreignPidIdentity,
+      instanceId: randomUUID(),
+    };
     foreignServer = http.createServer((_request, response) => {
       response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ ok: true, service: "not-plimsoll" }));
+      response.end(
+        JSON.stringify({
+          ok: true,
+          dataMode: "metadata",
+          retentionDays: 90,
+          stats: {},
+          health: {},
+          runtimeIdentity: foreignStatusIdentity,
+        }),
+      );
     });
     await new Promise<void>((resolve, reject) => {
       foreignServer?.once("error", reject);
       foreignServer?.listen(foreignPort, "127.0.0.1", resolve);
     });
-    fs.writeFileSync(
-      path.join(foreignHome, "collector.pid"),
-      JSON.stringify(
-        {
-          command: ["stale-collector"],
-          cwd: root,
-          label: LAUNCH_AGENT_LABEL,
-          pid: process.pid,
-          startedAt: "2026-01-01T00:00:00.000Z",
-          version: 1,
-        },
-        null,
-        2,
-      ) + "\n",
-      { mode: 0o600 },
-    );
+    writePidRecord(foreignHome, foreignPidIdentity, root);
     const occupied = startCollector(cliPath, foreignHome);
     children.push(occupied);
     const occupiedExit = await waitForExit(occupied.child);
     check(occupiedExit.code === 1, "Foreign listener should cause a failed bind.");
     check(
       !statusReceipt(occupied, "already_running"),
-      "Foreign /status payload was misreported as a running Plimsoll collector.",
+      "Foreign exact-shape /status payload was misreported as the PID-record owner.",
     );
     check(
       occupied.errors.join("").includes('"code": "port_in_use"'),
@@ -311,6 +437,86 @@ async function main() {
       foreignServer?.close((error) => (error ? reject(error) : resolve()));
     });
     foreignServer = null;
+
+    const inertHome = path.join(tempRoot, "inert-argv");
+    const inertPort = await availablePort();
+    writeConfig(inertHome, inertPort);
+    const inert = spawn(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000)", cliPath, "start"],
+      { stdio: "ignore" },
+    );
+    check(inert.pid, "Could not create inert CLI-shaped process.");
+    auxiliaryChildren.push(inert);
+    const inertIdentity = runtimeIdentity(inert.pid);
+    writePidRecord(inertHome, inertIdentity, root);
+    const deniedStop = stopCollector(cliPath, inertHome, root);
+    children.push(deniedStop);
+    await waitFor(
+      () => deniedStop.receipts.some((receipt) => receipt.stopped === false),
+      "Stop did not return a blocked receipt for the inert CLI-shaped process.",
+    );
+    check(
+      deniedStop.receipts.some(
+        (receipt) => receipt.reason === "runtime_identity_unverified",
+      ),
+      "Inert CLI-shaped process was not blocked by exact runtime identity.",
+    );
+    await waitForExit(deniedStop.child);
+    process.kill(inert.pid, 0);
+
+    fs.writeFileSync(path.join(inertHome, "collector.pid"), String(inert.pid) + "\n", {
+      mode: 0o600,
+    });
+    const legacyStop = stopCollector(cliPath, inertHome, root);
+    children.push(legacyStop);
+    await waitFor(
+      () =>
+        legacyStop.receipts.some(
+          (receipt) => receipt.reason === "legacy_pid_file_blocked",
+        ),
+      "Legacy PID record was not safely blocked.",
+    );
+    await waitForExit(legacyStop.child);
+    process.kill(inert.pid, 0);
+
+    const reusedPidHome = path.join(tempRoot, "reused-pid-lock");
+    const reusedPidPort = await availablePort();
+    writeConfig(reusedPidHome, reusedPidPort);
+    writeStartLock(
+      reusedPidHome,
+      {
+        ...inertIdentity,
+        instanceId: randomUUID(),
+        processStartFingerprint: "sha256:" + "0".repeat(64),
+      },
+      new Date().toISOString(),
+    );
+    const reusedPidRecovery = startCollector(cliPath, reusedPidHome);
+    children.push(reusedPidRecovery);
+    await waitFor(
+      () => Boolean(statusReceipt(reusedPidRecovery, "active")),
+      "A live reused PID with the wrong fingerprint pinned the stale start lock.",
+    );
+    process.kill(inert.pid, 0);
+    await stopOwner(reusedPidRecovery);
+
+    const expiredLeaseHome = path.join(tempRoot, "expired-lock-lease");
+    const expiredLeasePort = await availablePort();
+    writeConfig(expiredLeaseHome, expiredLeasePort);
+    writeStartLock(
+      expiredLeaseHome,
+      { ...inertIdentity, instanceId: randomUUID() },
+      new Date(Date.now() - START_LOCK_LEASE_MS - 1_000).toISOString(),
+    );
+    const expiredLeaseRecovery = startCollector(cliPath, expiredLeaseHome);
+    children.push(expiredLeaseRecovery);
+    await waitFor(
+      () => Boolean(statusReceipt(expiredLeaseRecovery, "active")),
+      "An expired start-lock lease remained authoritative.",
+    );
+    process.kill(inert.pid, 0);
+    await stopOwner(expiredLeaseRecovery);
 
     const packagedPlist = renderLaunchAgentPlist({
       homeDir: tempRoot,
@@ -358,7 +564,10 @@ async function main() {
             "concurrent starts converge without PID replacement",
             "packaged stop validates the recorded CLI path across working directories",
             "stale PID recovers without signaling unrelated process",
-            "foreign status payload is not accepted as collector ownership",
+            "owner death after first valid status cannot yield already_running",
+            "foreign exact-shape status cannot spoof collector ownership",
+            "inert CLI-shaped and legacy processes cannot pass stop authorization",
+            "reused PID fingerprint and expired lock lease both recover",
             "crash-only restart is throttled",
             "rendered plist passes plutil on macOS",
             "packaged and explicit development arguments are separated",
@@ -376,6 +585,9 @@ async function main() {
     }
     if (sentinel && sentinel.exitCode === null && sentinel.signalCode === null) {
       sentinel.kill("SIGTERM");
+    }
+    for (const child of auxiliaryChildren) {
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGTERM");
     }
     foreignServer?.closeAllConnections();
     foreignServer?.close();
