@@ -115,6 +115,10 @@ import {
 import { computeCaptureHealth } from "../packages/collector-cli/src/health";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
+import {
+  runRepoEnrichmentMaintenance,
+  runRepricingMaintenance,
+} from "../packages/collector-cli/src/maintenance";
 import { MODEL_PRICING } from "../packages/shared/src/pricing";
 import { buildPatternsReport, validatedDeliveryYieldV2 } from "./efficiency-report";
 import { readLocalIdentities } from "../packages/collector-cli/src/local-identity";
@@ -1124,7 +1128,7 @@ async function main() {
 
   // 9b. Per-event repo attribution (issue 0008): a session that moves between
   // repos must split its cost by WHERE EACH CALL HAPPENED, not lump onto the
-  // dominant repo. Token events carry no repo at capture; enrichEventRepos
+  // dominant repo. Token events carry no repo at capture; dirty enrichment
   // stitches each one to the session's repo at that moment.
   const MR_SESSION = "33334444-5555-4666-8777-888899990000";
   const OTHER_REPO_HASH = remoteLinkageHash("git@github.com:Proof-Owner/Other-Repo.git")!;
@@ -1164,7 +1168,11 @@ async function main() {
     outputTokens: 200,
     costUsd: 2.0,
   });
-  const stitchResult = buffer.enrichEventRepos();
+  const stitchResult = runRepoEnrichmentMaintenance(buffer.database, {
+    legacyBackfillLimit: 25_000,
+    sessionLimit: 500,
+    eventLimit: 25_000,
+  });
   const stitchedRepoRows = buffer.database
     .prepare(`select id, repo_hash as repo from buffered_events where session_id = ? order by observed_at`)
     .all(MR_SESSION) as Array<{ id: string; repo: string | null }>;
@@ -1486,6 +1494,10 @@ async function main() {
     ].join("\n") + "\n",
   );
   const unpricedScan = await new RolloutTailer(buffer, rolloutDir, proofIdentities).scan();
+  runRepricingMaintenance(buffer.database, {
+    backfillLimit: 25_000,
+    candidateLimit: 25_000,
+  });
   const unpricedBefore = buffer.database
     .prepare(`select cost_usd as cost from buffered_events where session_id = ? and event_type = 'usage_rollout'`)
     .get(UNPRICED_SESSION) as { cost: number | null } | undefined;
@@ -1496,7 +1508,10 @@ async function main() {
     vendor: "openai",
     asOf: "proof",
   };
-  const repriceScan = await new RolloutTailer(buffer, rolloutDir, proofIdentities).scan();
+  const repriceResult = runRepricingMaintenance(buffer.database, {
+    backfillLimit: 25_000,
+    candidateLimit: 25_000,
+  });
   delete MODEL_PRICING["proof-unpriceable-model"];
   const unpricedAfter = buffer.database
     .prepare(
@@ -1509,14 +1524,14 @@ async function main() {
     Boolean(
       unpricedScan.eventsAppended >= 1 &&
         unpricedBefore?.cost == null &&
-        repriceScan.repriced >= 1 &&
+        repriceResult.repriced >= 1 &&
         unpricedAfter?.cost != null &&
         unpricedAfter.cost > 0 &&
         unpricedAfter.payload.includes('"costEstimated":true'),
     ),
     JSON.stringify({
       before: unpricedBefore?.cost ?? null,
-      repriced: repriceScan.repriced,
+      repriced: repriceResult.repriced,
       after: unpricedAfter?.cost ?? null,
     }),
   );
