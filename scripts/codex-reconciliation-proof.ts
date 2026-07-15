@@ -121,6 +121,138 @@ function seedLegacyLedger(
   database.close();
 }
 
+function seedPriorDraftLedger(file: string, rows: number) {
+  const database = new Database(file);
+  database.pragma("journal_mode = WAL");
+  database.exec(`
+    create table buffered_events (
+      id text primary key,
+      source text not null,
+      event_type text not null,
+      data_mode text not null,
+      observed_at text not null,
+      payload_json text not null,
+      suppressed_fields_json text not null default '[]',
+      created_at text not null,
+      session_id text,
+      action_class text,
+      model text,
+      input_tokens integer,
+      output_tokens integer,
+      cache_read_tokens integer,
+      cache_creation_tokens integer,
+      cost_usd real,
+      uploaded_at text,
+      repo_hash text,
+      branch_hash text,
+      head_sha text,
+      machine text,
+      account_hash text
+    );
+    create table codex_reconciliation_control (
+      singleton integer primary key check (singleton = 1),
+      candidate_backlog integer not null default 0,
+      context_window_backlog integer not null default 0,
+      legacy_cursor_rowid integer not null default 0,
+      legacy_target_rowid integer not null default 0,
+      legacy_complete integer not null default 0,
+      rows_visited integer not null default 0,
+      rows_changed integer not null default 0,
+      last_rows_visited integer not null default 0,
+      last_rows_changed integer not null default 0,
+      last_success_at text,
+      degraded_reason text,
+      updated_at text not null
+    );
+    create table codex_reconciliation_pending (
+      event_id text primary key,
+      observed_at text not null
+    );
+    create index idx_codex_reconciliation_pending_observed
+      on codex_reconciliation_pending (observed_at, event_id);
+    create table codex_reconciliation_candidates (
+      event_id text primary key,
+      queued_at text not null
+    );
+    create index idx_codex_reconciliation_candidates_queue
+      on codex_reconciliation_candidates (queued_at, event_id);
+    create table codex_reconciliation_context (
+      event_id text primary key,
+      observed_at text not null,
+      session_id text,
+      model text
+    );
+    create index idx_codex_reconciliation_context_session
+      on codex_reconciliation_context (observed_at, event_id)
+      where session_id is not null;
+    create index idx_codex_reconciliation_context_model
+      on codex_reconciliation_context (observed_at, event_id)
+      where model is not null;
+    create table codex_reconciliation_windows (
+      window_start_seconds integer primary key,
+      revision integer not null default 1,
+      processing_revision integer not null default 0,
+      cursor_observed_at text not null default '',
+      cursor_event_id text not null default '',
+      target_observed_at text not null default '',
+      target_event_id text not null default '',
+      queued_at text not null,
+      updated_at text not null
+    );
+    create index idx_codex_reconciliation_windows_queue
+      on codex_reconciliation_windows (queued_at, window_start_seconds);
+  `);
+  database
+    .prepare(
+      `with recursive sequence(n) as (
+         select 1
+         union all select n + 1 from sequence where n < @rows
+       )
+       insert into buffered_events
+         (id, source, event_type, data_mode, observed_at, payload_json,
+          suppressed_fields_json, created_at, session_id, model,
+          input_tokens, output_tokens)
+       select printf('prior-draft-%05d', n), 'codex', 'assistant_response', 'metadata',
+         strftime('%Y-%m-%dT%H:%M:%fZ', '2026-01-01', printf('+%d seconds', n % 3600)),
+         '{"eventType":"assistant_response"}', '[]',
+         '2026-01-01T00:00:00.000Z',
+         case when n <= 100 then '019e9100-0000-7000-8000-000000000091' end,
+         case when n <= 100 then 'gpt-5.5' end,
+         100, 10
+       from sequence`,
+    )
+    .run({ rows });
+  database.exec(`
+    insert into codex_reconciliation_pending (event_id, observed_at)
+    select id, observed_at from buffered_events;
+    insert into codex_reconciliation_candidates (event_id, queued_at)
+    select id, '2026-01-01T00:00:00.000Z' from buffered_events;
+    insert into codex_reconciliation_context (event_id, observed_at, session_id, model)
+    select id, observed_at, session_id, model from buffered_events where session_id is not null;
+    insert into codex_reconciliation_windows
+      (window_start_seconds, revision, processing_revision, cursor_observed_at,
+       cursor_event_id, target_observed_at, target_event_id, queued_at, updated_at)
+    values (
+      cast(strftime('%s', '2026-01-01T00:00:00.000Z') as integer),
+      2, 1, '2026-01-01T00:01:00.000Z', 'prior-draft-00060',
+      '2026-01-01T00:10:00.000Z', 'prior-draft-00600',
+      '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z'
+    );
+  `);
+  database
+    .prepare(
+      `insert into codex_reconciliation_control
+         (singleton, candidate_backlog, context_window_backlog,
+          legacy_cursor_rowid, legacy_target_rowid, legacy_complete,
+          rows_visited, rows_changed, last_rows_visited, last_rows_changed,
+          updated_at)
+       values (1, @rows, 1, 100, @rows, 0, 100, 0, 100, 0,
+         '2026-01-01T00:00:00.000Z')`,
+    )
+    .run({ rows });
+  database.close();
+}
+
 function usageEvent(id: string, observedAt: string) {
   return aiInteractionEventSchema.parse({
     id,
@@ -417,6 +549,127 @@ function proveDeterministicNearestContextTies(root: string) {
       reverse,
     },
   );
+}
+
+function provePriorDraftCandidatePriorityMigration(root: string) {
+  const ledger = path.join(root, "prior-draft-priority-migration.sqlite");
+  seedPriorDraftLedger(ledger, 10_000);
+  let buffer = new LocalEventBuffer(ledger);
+  try {
+    const migratedLegacy = buffer.database
+      .prepare(
+        `select count(*) as total,
+           sum(case when priority = 1 then 1 else 0 end) as legacy,
+           sum(case when priority = 0 then 1 else 0 end) as fresh
+         from codex_reconciliation_candidates`,
+      )
+      .get() as { total: number; legacy: number; fresh: number };
+    const migratedWindow = buffer.database
+      .prepare(`select priority from codex_reconciliation_windows`)
+      .get() as { priority: number };
+    const removedContextObjects = (
+      buffer.database
+        .prepare(
+          `select count(*) as n from sqlite_master
+           where name like '%codex_reconciliation_context%'`,
+        )
+        .get() as { n: number }
+    ).n;
+    assert.deepEqual(migratedLegacy, { total: 10_000, legacy: 10_000, fresh: 0 });
+    assert.equal(migratedWindow.priority, 1);
+    assert.equal(removedContextObjects, 0);
+
+    const freshUsage = usageEvent("migration-fresh", "2026-07-15T12:02:00.000Z");
+    assert.equal(buffer.append(freshUsage), true);
+    const freshPriorityBeforeReopen = (
+      buffer.database
+        .prepare(
+           `select priority from codex_reconciliation_candidates
+           where event_id = 'migration-fresh'`,
+        )
+        .get() as { priority: number }
+    ).priority;
+    const statusBeforeReopen = codexReconciliationStatus(buffer.database);
+    buffer.close();
+    buffer = new LocalEventBuffer(ledger);
+    const statusAfterReopen = codexReconciliationStatus(buffer.database);
+    const freshPriorityAfterReopen = (
+      buffer.database
+        .prepare(
+           `select priority from codex_reconciliation_candidates
+           where event_id = 'migration-fresh'`,
+        )
+        .get() as { priority: number }
+    ).priority;
+    const legacyPrioritiesAfterReopen = buffer.database
+      .prepare(
+        `select count(*) as total,
+           sum(case when priority = 1 then 1 else 0 end) as legacy
+         from codex_reconciliation_candidates where event_id like 'prior-draft-%'`,
+      )
+      .get() as { total: number; legacy: number };
+
+    buffer.append(contextEvent("migration-fresh-context", "2026-07-15T12:02:30.000Z"));
+    let resolutionCycle: number | null = null;
+    const slices: ReturnType<typeof runCodexReconciliationMaintenance>[] = [];
+    for (let cycle = 1; cycle <= 2; cycle += 1) {
+      slices.push(runCodexReconciliationMaintenance(buffer.database));
+      const row = buffer.database
+        .prepare(
+           `select session_id as sessionId, model, cost_usd as costUsd
+           from buffered_events where id = 'migration-fresh'`,
+        )
+        .get() as { sessionId: string | null; model: string | null; costUsd: number | null };
+      if (row.sessionId && row.model && row.costUsd !== null) {
+        resolutionCycle = cycle;
+        break;
+      }
+    }
+    const finalStatus = codexReconciliationStatus(buffer.database);
+    const actualCandidateBacklog = (
+      buffer.database
+        .prepare(`select count(*) as n from codex_reconciliation_candidates`)
+        .get() as { n: number }
+    ).n;
+    const actualWindowBacklog = (
+      buffer.database
+        .prepare(`select count(*) as n from codex_reconciliation_windows`)
+        .get() as { n: number }
+    ).n;
+    const integrity = buffer.database.pragma("integrity_check", { simple: true });
+    check(
+      "prior_draft_candidates_migrate_to_legacy_without_reclassifying_fresh_rows",
+      freshPriorityBeforeReopen === 0 &&
+        freshPriorityAfterReopen === 0 &&
+        legacyPrioritiesAfterReopen.total === 10_000 &&
+        legacyPrioritiesAfterReopen.legacy === 10_000 &&
+        JSON.stringify(statusBeforeReopen) === JSON.stringify(statusAfterReopen) &&
+        resolutionCycle !== null &&
+        resolutionCycle <= 2 &&
+        finalStatus.legacyComplete === false &&
+        finalStatus.legacyCursorRowid >= 100 &&
+        finalStatus.legacyCursorRowid <= finalStatus.legacyTargetRowid &&
+        finalStatus.candidateBacklog === actualCandidateBacklog &&
+        finalStatus.contextWindowBacklog === actualWindowBacklog &&
+        integrity === "ok",
+      {
+        migratedLegacy,
+        migratedWindowPriority: migratedWindow.priority,
+        removedContextObjects,
+        freshPriorityBeforeReopen,
+        freshPriorityAfterReopen,
+        reopenStatusStable: JSON.stringify(statusBeforeReopen) === JSON.stringify(statusAfterReopen),
+        resolutionCycle,
+        slices,
+        finalStatus,
+        actualCandidateBacklog,
+        actualWindowBacklog,
+        integrity,
+      },
+    );
+  } finally {
+    buffer.close();
+  }
 }
 
 function proveLegacyCadence(root: string, shape: "sparse" | "dense-context") {
@@ -971,6 +1224,7 @@ async function main() {
   try {
     await proveRequestPathIsBounded(root);
     proveDeterministicNearestContextTies(root);
+    provePriorDraftCandidatePriorityMigration(root);
     proveLegacyCadence(root, "sparse");
     proveLegacyCadence(root, "dense-context");
     proveAdversarialMixedBackfill(root);

@@ -231,10 +231,13 @@ export function ensureCodexReconciliationSchema(database: Database.Database) {
     ).map((column) => column.name),
   );
   if (!candidateColumns.has("priority")) {
-    database.exec(
-      `alter table codex_reconciliation_candidates
-       add column priority integer not null default 0`,
-    );
+    database.transaction(() => {
+      database.exec(
+        `alter table codex_reconciliation_candidates
+         add column priority integer not null default 0;
+         update codex_reconciliation_candidates set priority = 1`,
+      );
+    })();
   }
   const windowColumns = new Set(
     (

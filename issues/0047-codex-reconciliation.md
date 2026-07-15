@@ -54,6 +54,12 @@ high-water enter priority-zero queues through triggers. Legacy discoveries and
 repair-generated windows are priority one, so a large historical backlog cannot
 delay current usage plus later context.
 
+Upgrade from the prior draft schema is also priority-safe. When the candidate
+table first gains its `priority` column, rows that already existed are marked
+legacy (`1`) in that same one-time schema transaction. Rows appended after migration
+retain fresh priority (`0`) across reopen; normal startups never blanket-rewrite
+priority-zero work.
+
 ## Evidence
 
 Focused proof:
@@ -89,6 +95,12 @@ The temporary-database proof verifies:
   Before-time ties use `observed_at desc, id desc`; after-time ties use
   `observed_at asc, id asc`; equal-distance side winners use the smaller event
   ID;
+- a prior-draft-shaped ledger with 10,000 queued candidates and no candidate
+  priority column migrates all 10,000 existing rows to legacy priority. A newly
+  appended priority-zero usage row remains priority zero after reopen and
+  resolves in the first default maintenance cycle after context arrives, while
+  the legacy cursor remains truthfully incomplete and reported candidate/window
+  backlogs match their tables with `integrity_check=ok`;
 - backlog greater than one slice, later context, same-bucket repeated context,
   duplicate append, transaction rollback, reopen, scheduler overlap, and
   unchanged rerun;
