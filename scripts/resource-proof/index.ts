@@ -13,7 +13,9 @@ import {
   runEmptyLedgerContract,
   runExistingSignalFidelityProof,
   runIsolationContract,
+  runNoChangeConstantWorkContract,
   runPortReservationContract,
+  runDuplicateStartSingleOwnerContract,
 } from "./scenarios";
 import {
   RESOURCE_PROOF_SCHEMA,
@@ -43,8 +45,9 @@ Options:
   --require-integrated   Exit non-zero while any required scenario is fail/not_wired/skipped.
   --help                 Show this help.
 
-The default scaffold is truthful but not a release pass: required integration
-scenarios remain not_wired until issues #76-#80 expose their test seams.`);
+The default harness is truthful but not a release pass: #76 duplicate ownership
+and #77 no-change maintenance are wired; four #79/#80/integrated/privacy
+scenarios remain not_wired.`);
 }
 
 function summarize(scenarios: ScenarioReceipt[]) {
@@ -96,7 +99,13 @@ async function main() {
     scenarios.push(runArchitectureContract());
     scenarios.push(runEmptyLedgerContract(sandbox));
     scenarios.push(runExistingSignalFidelityProof(sandbox, runExistingProof));
-    scenarios.push(...loadUnwiredIntegrationScenarios());
+    scenarios.push(await runNoChangeConstantWorkContract(sandbox));
+    scenarios.push(await runDuplicateStartSingleOwnerContract(sandbox));
+    scenarios.push(
+      ...loadUnwiredIntegrationScenarios(
+        new Set(["no_change_constant_work", "duplicate_start_single_owner"]),
+      ),
+    );
 
     const summary = summarize(scenarios);
     const anyFailure = summary.failed > 0;
@@ -126,6 +135,7 @@ async function main() {
       const resolved = path.resolve(receiptPath);
       fs.mkdirSync(path.dirname(resolved), { recursive: true });
       fs.writeFileSync(resolved, serialized, { mode: 0o600 });
+      fs.chmodSync(resolved, 0o600);
     }
     process.stdout.write(serialized);
 

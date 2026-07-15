@@ -16,6 +16,7 @@
     "collector": "tsx packages/collector-cli/src/cli.ts",
     "proof": "tsx scripts/signal-fidelity-proof.ts",
     "proof:maintenance": "tsx scripts/maintenance-proof.ts",
+    "proof:resource-concurrency": "tsx scripts/resource-proof/concurrency-proof.ts",
     "report": "tsx scripts/efficiency-report.ts",
     "backfill": "tsx scripts/backfill-v1-archive.ts"
   },
