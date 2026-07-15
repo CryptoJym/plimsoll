@@ -49,6 +49,7 @@ export type RolloutScanResult = {
   filesParsed: number;
   filesReset: number;
   legacyRebuilds: number;
+  checkpointRebuilds: number;
   bytesRead: number;
   bytesDeferred: number;
   sessionsSkippedOtlpCovered: number;
@@ -67,6 +68,8 @@ type PersistedGitContext = {
 };
 
 type RolloutParserState = {
+  parserKind: "codex-rollout-v2";
+  checkpointVersion: 2;
   conversationId?: string;
   sessionStartedAt?: string;
   originator?: string;
@@ -78,7 +81,8 @@ type RolloutParserState = {
   git?: PersistedGitContext;
 };
 
-const PARSER_KIND = "codex-rollout-v1";
+const PARSER_KIND = "codex-rollout-v2";
+const CHECKPOINT_VERSION = 2;
 
 const ZERO: TokenTotals = { input: 0, cachedInput: 0, output: 0, reasoningOutput: 0 };
 
@@ -107,7 +111,103 @@ function diff(current: TokenTotals, previous: TokenTotals): TokenTotals {
   };
 }
 
+function validateRolloutParserState(value: unknown): RolloutParserState | undefined {
+  if (!isRecord(value)) return undefined;
+  if (
+    !hasOnlyKeys(value, [
+      "parserKind",
+      "checkpointVersion",
+      "conversationId",
+      "sessionStartedAt",
+      "originator",
+      "cliVersion",
+      "model",
+      "planType",
+      "previous",
+      "tokenCountIndex",
+      "git",
+    ])
+  ) {
+    return undefined;
+  }
+  if (value.parserKind !== PARSER_KIND || value.checkpointVersion !== CHECKPOINT_VERSION) {
+    return undefined;
+  }
+  if (!isTokenTotals(value.previous)) return undefined;
+  if (
+    typeof value.tokenCountIndex !== "number" ||
+    !Number.isSafeInteger(value.tokenCountIndex) ||
+    value.tokenCountIndex < -1
+  ) {
+    return undefined;
+  }
+  const conversationId = optionalString(value.conversationId);
+  const sessionStartedAt = optionalString(value.sessionStartedAt);
+  const originator = optionalString(value.originator);
+  const cliVersion = optionalString(value.cliVersion);
+  const model = optionalString(value.model);
+  const planType = optionalString(value.planType);
+  if ([conversationId, sessionStartedAt, originator, cliVersion, model, planType].includes(null)) {
+    return undefined;
+  }
+  if (conversationId && !UUID_EXACT_RE.test(conversationId)) return undefined;
+  const git = validatePersistedGit(value.git);
+  if (value.git !== undefined && !git) return undefined;
+
+  return {
+    parserKind: PARSER_KIND,
+    checkpointVersion: CHECKPOINT_VERSION,
+    previous: { ...value.previous },
+    tokenCountIndex: value.tokenCountIndex,
+    ...(conversationId ? { conversationId: conversationId.toLowerCase() } : {}),
+    ...(sessionStartedAt ? { sessionStartedAt } : {}),
+    ...(originator ? { originator } : {}),
+    ...(cliVersion ? { cliVersion } : {}),
+    ...(model ? { model } : {}),
+    ...(planType ? { planType } : {}),
+    ...(git ? { git } : {}),
+  };
+}
+
+function optionalString(value: unknown): string | undefined | null {
+  if (value === undefined) return undefined;
+  return typeof value === "string" ? value : null;
+}
+
+function isTokenTotals(value: unknown): value is TokenTotals {
+  if (!isRecord(value)) return false;
+  if (!hasOnlyKeys(value, ["input", "cachedInput", "output", "reasoningOutput"])) return false;
+  return ["input", "cachedInput", "output", "reasoningOutput"].every((key) => {
+    const total = value[key];
+    return typeof total === "number" && Number.isSafeInteger(total) && total >= 0;
+  });
+}
+
+function validatePersistedGit(value: unknown): PersistedGitContext | undefined {
+  if (!isRecord(value)) return undefined;
+  if (!hasOnlyKeys(value, ["remoteUrlHash", "branchHash", "headSha"])) return undefined;
+  for (const key of ["remoteUrlHash", "branchHash", "headSha"] as const) {
+    if (value[key] !== undefined && typeof value[key] !== "string") return undefined;
+  }
+  const git = {
+    ...(typeof value.remoteUrlHash === "string" ? { remoteUrlHash: value.remoteUrlHash } : {}),
+    ...(typeof value.branchHash === "string" ? { branchHash: value.branchHash } : {}),
+    ...(typeof value.headSha === "string" ? { headSha: value.headSha } : {}),
+  };
+  return git.remoteUrlHash || git.branchHash || git.headSha ? git : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]) {
+  const names = new Set(allowed);
+  return Object.keys(value).every((key) => names.has(key));
+}
+
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_EXACT_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function conversationIdFromFilename(file: string) {
   const base = path.basename(file).replace(/\.jsonl$/, "");
@@ -183,6 +283,7 @@ export class RolloutTailer {
       filesParsed: 0,
       filesReset: 0,
       legacyRebuilds: 0,
+      checkpointRebuilds: 0,
       bytesRead: 0,
       bytesDeferred: 0,
       sessionsSkippedOtlpCovered: 0,
@@ -207,7 +308,13 @@ export class RolloutTailer {
       } catch {
         continue;
       }
-      const cursor = loadJsonlScanCursor<RolloutParserState>(this.buffer.database, file, PARSER_KIND);
+      const cursor = loadJsonlScanCursor<RolloutParserState>(
+        this.buffer.database,
+        file,
+        PARSER_KIND,
+        CHECKPOINT_VERSION,
+        validateRolloutParserState,
+      );
       let read: ReturnType<typeof readJsonlTail>;
       try {
         read = readJsonlTail(file, stat, cursor);
@@ -225,13 +332,21 @@ export class RolloutTailer {
       result.bytesDeferred += read.deferredBytes;
       if (read.reset) result.filesReset += 1;
       if (read.legacyRebuild) result.legacyRebuilds += 1;
+      if (read.checkpointRebuild) result.checkpointRebuilds += 1;
 
       const initialState = read.reset || !cursor?.parserState
         ? this.initialParserState(file)
         : cursor.parserState;
       const commit = this.buffer.database.transaction(() => {
         const parserState = this.ingestLines(file, read.lines, result, initialState);
-        rememberJsonlScanCursor(this.buffer.database, file, PARSER_KIND, read, parserState);
+        rememberJsonlScanCursor(
+          this.buffer.database,
+          file,
+          PARSER_KIND,
+          CHECKPOINT_VERSION,
+          read,
+          parserState,
+        );
       });
       commit();
       await new Promise((resolve) => setImmediate(resolve));
@@ -288,6 +403,8 @@ export class RolloutTailer {
 
   private initialParserState(file: string): RolloutParserState {
     return {
+      parserKind: PARSER_KIND,
+      checkpointVersion: CHECKPOINT_VERSION,
       conversationId: conversationIdFromFilename(file),
       previous: { ...ZERO },
       tokenCountIndex: -1,

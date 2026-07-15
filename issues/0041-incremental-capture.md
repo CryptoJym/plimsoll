@@ -1,7 +1,7 @@
 Status: In progress
 
 ## TL;DR
-- Growing rollout and transcript JSONL files now have a crash-safe byte cursor; completed scans read only the suffix plus a 512-byte rewrite probe.
+- Growing rollout and transcript JSONL files now have a crash-safe byte cursor; completed scans read only the suffix plus two bounded 512-byte continuity probes.
 - Partial final lines remain in the source file until newline completion. No raw carry, content, or cwd path is copied into SQLite.
 - This sounding remains open for serialized scheduling and dirty-only repricing/repo enrichment.
 
@@ -13,7 +13,7 @@ change OTLP capture, upload behavior, retention, or the live collector service.
 ## Context
 GitHub: https://github.com/CryptoJym/plimsoll/issues/77
 
-Parent: #75. Implementation baseline: `origin/main@9fc0af4`. Shared trace:
+Parent: #75. Verification baseline: `origin/main@196d35f`. Shared trace:
 `46be3ad1-514a-42d2-9f14-2212fdab14dc`.
 
 Legacy `rollout_scan_state` rows contain only the last observed size. Unchanged
@@ -34,23 +34,26 @@ The proof uses temporary session trees and SQLite only. It pins:
 
 - partial final line: zero events and zero parse errors until completion;
 - restart with unchanged input: `filesRead=0`, `bytesRead=0`, `eventsAppended=0`;
-- append: exact telescoped rollout delta and suffix plus at most 512-byte probe;
-- truncation: `filesReset=1` and the replacement session is ingested;
+- append: exact telescoped rollout delta and suffix plus at most 1,024 bounded probe bytes;
+- invalid `{}`, `null`, malformed, wrong-type, and wrong-version parser checkpoints force a deterministic rebuild for both tailers;
+- same-inode truncate/regrow with an unchanged 512-byte head is caught by the committed-boundary continuity fingerprint;
+- ordinary truncation: `filesReset=1` and the replacement session is ingested;
 - legacy growth: `legacyRebuilds=1`, followed by incremental checkpoints;
 - deterministic replay and metadata-only content/path persistence.
 
 ## Acceptance Criteria
-- [x] Appending one JSONL line reads only the new suffix within a 512-byte framing probe.
+- [x] Appending one JSONL line reads only the new suffix within two bounded 512-byte framing probes.
 - [x] A partial final line is not committed until completed; restart neither loses nor duplicates it.
-- [x] Truncation/rotation is detected by size, file identity, and a bounded head fingerprint.
+- [x] Truncation/rotation is detected by size, file identity, bounded head fingerprint, and bounded committed-boundary continuity fingerprint.
+- [x] Persisted parser state is runtime-validated against explicit parser-kind and checkpoint-version schemas; invalid state rebuilds safely.
 - [ ] Two scan triggers cannot overlap.
 - [ ] An unchanged-input scan reports zero repricing/enrichment row visits.
 - [x] Tailer capture parity and deterministic ids stay green inside the focused proof and `pnpm proof`.
 - [x] Metadata mode persists neither raw content nor raw cwd paths in parser checkpoints.
 
 ## Operational Boundaries
-- `pnpm proof` stays the parity gate. Its time-window baseline failure on
-  `origin/main@9fc0af4` is tracked separately in #82 and is not changed here.
+- `pnpm proof` stays the parity gate; #82 made its clock deterministic before
+  this slice's final verification.
 - Tests use temporary session trees and databases only; never scan or mutate
   the live ledger or real `~/.codex` / `~/.claude` trees.
 - The byte checkpoint and event writes share one SQLite transaction. A crash
@@ -62,6 +65,8 @@ The proof uses temporary session trees and SQLite only. It pins:
   old ledgers.
 - `deferred_bytes` is an integer only. Persisting a partial-line carry would
   copy potentially sensitive content into the ledger.
+- Parser-state shape changes bump both the parser kind and
+  `checkpoint_version`; never cast persisted JSON into a new runtime shape.
 - Remaining owner lane: add an in-flight scan guard, move repricing and repo
   enrichment to indexed dirty work, and make no-work counters visible from the
   scheduler without restoring noisy per-minute history scans.

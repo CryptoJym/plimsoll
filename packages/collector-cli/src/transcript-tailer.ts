@@ -46,6 +46,7 @@ export type TranscriptScanResult = {
   filesParsed: number;
   filesReset: number;
   legacyRebuilds: number;
+  checkpointRebuilds: number;
   bytesRead: number;
   bytesDeferred: number;
   sessionsSkippedLiveCovered: number;
@@ -55,6 +56,7 @@ export type TranscriptScanResult = {
 };
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+const UUID_EXACT_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 type PersistedGitContext = {
   remoteUrlHash?: string;
@@ -63,11 +65,58 @@ type PersistedGitContext = {
 };
 
 type TranscriptParserState = {
+  parserKind: "claude-transcript-v2";
+  checkpointVersion: 2;
   sessionId?: string;
   git?: PersistedGitContext;
 };
 
-const PARSER_KIND = "claude-transcript-v1";
+const PARSER_KIND = "claude-transcript-v2";
+const CHECKPOINT_VERSION = 2;
+
+function validateTranscriptParserState(value: unknown): TranscriptParserState | undefined {
+  if (!isRecord(value)) return undefined;
+  if (!hasOnlyKeys(value, ["parserKind", "checkpointVersion", "sessionId", "git"])) {
+    return undefined;
+  }
+  if (value.parserKind !== PARSER_KIND || value.checkpointVersion !== CHECKPOINT_VERSION) {
+    return undefined;
+  }
+  if (value.sessionId !== undefined) {
+    if (typeof value.sessionId !== "string" || !UUID_EXACT_RE.test(value.sessionId)) return undefined;
+  }
+  const git = validatePersistedGit(value.git);
+  if (value.git !== undefined && !git) return undefined;
+  return {
+    parserKind: PARSER_KIND,
+    checkpointVersion: CHECKPOINT_VERSION,
+    ...(value.sessionId ? { sessionId: value.sessionId.toLowerCase() } : {}),
+    ...(git ? { git } : {}),
+  };
+}
+
+function validatePersistedGit(value: unknown): PersistedGitContext | undefined {
+  if (!isRecord(value)) return undefined;
+  if (!hasOnlyKeys(value, ["remoteUrlHash", "branchHash", "headSha"])) return undefined;
+  for (const key of ["remoteUrlHash", "branchHash", "headSha"] as const) {
+    if (value[key] !== undefined && typeof value[key] !== "string") return undefined;
+  }
+  const git = {
+    ...(typeof value.remoteUrlHash === "string" ? { remoteUrlHash: value.remoteUrlHash } : {}),
+    ...(typeof value.branchHash === "string" ? { branchHash: value.branchHash } : {}),
+    ...(typeof value.headSha === "string" ? { headSha: value.headSha } : {}),
+  };
+  return git.remoteUrlHash || git.branchHash || git.headSha ? git : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]) {
+  const names = new Set(allowed);
+  return Object.keys(value).every((key) => names.has(key));
+}
 
 export class TranscriptTailer {
   constructor(
@@ -97,6 +146,7 @@ export class TranscriptTailer {
       filesParsed: 0,
       filesReset: 0,
       legacyRebuilds: 0,
+      checkpointRebuilds: 0,
       bytesRead: 0,
       bytesDeferred: 0,
       sessionsSkippedLiveCovered: 0,
@@ -115,7 +165,13 @@ export class TranscriptTailer {
         continue;
       }
       if (options.recentOnly && stat.mtime.getTime() < recentCutoff) continue;
-      const cursor = loadJsonlScanCursor<TranscriptParserState>(this.buffer.database, file, PARSER_KIND);
+      const cursor = loadJsonlScanCursor<TranscriptParserState>(
+        this.buffer.database,
+        file,
+        PARSER_KIND,
+        CHECKPOINT_VERSION,
+        validateTranscriptParserState,
+      );
       let read: ReturnType<typeof readJsonlTail>;
       try {
         read = readJsonlTail(file, stat, cursor);
@@ -133,13 +189,21 @@ export class TranscriptTailer {
       result.bytesDeferred += read.deferredBytes;
       if (read.reset) result.filesReset += 1;
       if (read.legacyRebuild) result.legacyRebuilds += 1;
+      if (read.checkpointRebuild) result.checkpointRebuilds += 1;
 
       const initialState = read.reset || !cursor?.parserState
         ? this.initialParserState(file)
         : cursor.parserState;
       const commit = this.buffer.database.transaction(() => {
         const parserState = this.ingestLines(file, read.lines, result, initialState);
-        rememberJsonlScanCursor(this.buffer.database, file, PARSER_KIND, read, parserState);
+        rememberJsonlScanCursor(
+          this.buffer.database,
+          file,
+          PARSER_KIND,
+          CHECKPOINT_VERSION,
+          read,
+          parserState,
+        );
       });
       commit();
       await new Promise((resolve) => setImmediate(resolve));
@@ -171,6 +235,8 @@ export class TranscriptTailer {
 
   private initialParserState(file: string): TranscriptParserState {
     return {
+      parserKind: PARSER_KIND,
+      checkpointVersion: CHECKPOINT_VERSION,
       sessionId: path.basename(file).replace(/\.jsonl$/, "").match(UUID_RE)?.[0]?.toLowerCase(),
     };
   }
