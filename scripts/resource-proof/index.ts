@@ -18,6 +18,7 @@ import {
   runPortReservationContract,
   runDuplicateStartSingleOwnerContract,
   runPoisonContinuationContract,
+  runDashboardProjectionBudgetContract,
 } from "./scenarios";
 import {
   RESOURCE_PROOF_SCHEMA,
@@ -49,7 +50,8 @@ Options:
 
 The default harness is truthful but not a release pass: #76 duplicate ownership,
 #77 no-change maintenance, #79 poison continuation, and #91 bounded Codex
-reconciliation are wired; three #80/integrated/privacy scenarios remain not_wired.`);
+reconciliation, plus #80 dashboard projection, are wired; two #81 integrated
+capture/privacy scenarios remain not_wired.`);
 }
 
 function summarize(scenarios: ScenarioReceipt[]) {
@@ -105,6 +107,7 @@ async function main() {
     scenarios.push(runBoundedCodexReconciliationContract(sandbox));
     scenarios.push(await runDuplicateStartSingleOwnerContract(sandbox));
     scenarios.push(await runPoisonContinuationContract(sandbox));
+    scenarios.push(await runDashboardProjectionBudgetContract(sandbox));
     scenarios.push(
       ...loadUnwiredIntegrationScenarios(
         new Set([
@@ -112,6 +115,7 @@ async function main() {
           "duplicate_start_single_owner",
           "poison_continuation",
           "bounded_codex_reconciliation",
+          "dashboard_projection_budget",
         ]),
       ),
     );

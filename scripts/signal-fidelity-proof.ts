@@ -719,7 +719,16 @@ async function main() {
     JSON.stringify({ during: aliasState.accountAliases.length, after: aliasCleared.accountAliases.length }),
   );
 
-  // Dashboard: the display surface reads the same ledger it serves.
+  // Dashboard projections are maintained off the request path. Drain the
+  // bounded test ledger before exercising the compatibility and snapshot
+  // routes; production does this from the coalesced maintenance lane.
+  for (let slice = 0; slice < 20; slice += 1) {
+    const state = buffer.projection.status();
+    if (state.ready && !state.dirty && state.backlog.repairs === 0 && state.backlog.dirtySessions === 0) break;
+    buffer.projection.runMaintenance(new Date(Date.now()));
+  }
+
+  // Dashboard: the display surface reads one coherent projected generation.
   const dashHtml = await fetch(`http://127.0.0.1:${port}/`).then((r) => r.text());
   // The inline script must PARSE: a stray top-level await once killed every
   // fresh page load while all API-level checks stayed green. new Function
@@ -739,8 +748,19 @@ async function main() {
   const dashSummary = (await fetch(`http://127.0.0.1:${port}/api/summary`).then((r) => r.json())) as {
     totals: Record<string, number>;
   };
+  const dashboardSnapshot = (await fetch(
+    `http://127.0.0.1:${port}/api/snapshot?days=30`,
+  ).then((r) => r.json())) as {
+    generation?: number;
+    projection?: { status?: string; freshnessAt?: string; degraded?: boolean };
+  };
+  const projectedSessions = (await fetch(`http://127.0.0.1:${port}/api/sessions`).then((r) => r.json())) as Array<{
+    sessionId: string;
+    repoHash: string | null;
+  }>;
+  const projectedSessionId = projectedSessions.find((row) => row.repoHash)?.sessionId;
   const dashSession = (await fetch(
-    `http://127.0.0.1:${port}/api/session?id=${SESSION}`,
+    `http://127.0.0.1:${port}/api/session?id=${encodeURIComponent(projectedSessionId ?? "")}`,
   ).then((r) => r.json())) as { rollup: Record<string, unknown>; receipts: { linkage: unknown[] } };
   check(
     "dashboard_served_locally",
@@ -751,6 +771,18 @@ async function main() {
     "dashboard_summary_reads_ledger",
     dashSummary.totals.inputTokens >= 1200 && dashSummary.totals.sessionsWithTokens >= 1,
     JSON.stringify(dashSummary.totals),
+  );
+  check(
+    "dashboard_snapshot_exposes_projection_freshness",
+    Number(dashboardSnapshot.generation) > 0 &&
+      dashboardSnapshot.projection?.status === "ready" &&
+      Number.isFinite(Date.parse(dashboardSnapshot.projection.freshnessAt ?? "")) &&
+      dashboardSnapshot.projection.degraded === false &&
+      dashHtml.includes("projection.freshnessAt"),
+    JSON.stringify({
+      generation: dashboardSnapshot.generation,
+      projection: dashboardSnapshot.projection,
+    }),
   );
   const dashRepos = (await fetch(`http://127.0.0.1:${port}/api/repos`).then((r) => r.json())) as Array<{
     repoHash?: string;

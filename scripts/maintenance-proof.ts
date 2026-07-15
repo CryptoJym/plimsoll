@@ -13,6 +13,7 @@ import {
 import {
   CoalescingMaintenanceScheduler,
   CollectorMaintenance,
+  drainProjectionMigration,
   runRepoEnrichmentMaintenance,
   runRepricingMaintenance,
   type CollectorMaintenanceRunResult,
@@ -46,6 +47,13 @@ function emptyRollout(): RolloutScanResult {
     eventsAppended: 0,
     tokensAppended: { input: 0, cachedInput: 0, output: 0 },
     parseErrors: 0,
+    activity: {
+      lastActivityAt: null,
+      filesToday: 0,
+      discoveryEntries: 0,
+      lastScanAt: "2026-07-15T00:00:00.000Z",
+      truncated: false,
+    },
   };
 }
 
@@ -63,6 +71,13 @@ function emptyTranscript(): TranscriptScanResult {
     eventsAppended: 0,
     tokensAppended: { input: 0, cacheRead: 0, output: 0 },
     parseErrors: 0,
+    activity: {
+      lastActivityAt: null,
+      filesToday: 0,
+      discoveryEntries: 0,
+      lastScanAt: "2026-07-15T00:00:00.000Z",
+      truncated: false,
+    },
   };
 }
 
@@ -169,6 +184,28 @@ async function proveCoalescing() {
       !finalStatus.pending,
     { calls, maxActive, ...finalStatus },
   );
+}
+
+async function proveProjectionDutyCycle(){
+  let cursor=0,parityCursor=0;
+  const highWater=100_000;
+  const fake={
+    runMaintenance(){
+      if(cursor<highWater)cursor=Math.min(highWater,cursor+1_000);
+      else parityCursor=Math.min(highWater,parityCursor+1_000);
+      return {backfillRowsVisited:cursor<highWater||cursor===1_000?1_000:0,
+        parityRowsVisited:cursor>=highWater&&parityCursor>0?1_000:0,metricRowsVisited:0};
+    },
+    status(){return {backfill:{highWater,cursor,complete:cursor>=highWater,parityCursor,
+      parityComplete:parityCursor>=highWater,metricHighWater:0,metricCursor:0,metricComplete:true}};},
+  };
+  const result=await drainProjectionMigration(fake as unknown as LocalEventBuffer["projection"],
+    {maxSlices:4,maxActiveMs:5_000,cadenceSeconds:60});
+  check("projection_migration_duty_cycle_is_bounded_yielding_and_reports_eta",
+    result.drain.slices===4&&result.drain.yields===3&&result.drain.migrationRowsVisited===4_000&&
+    result.drain.remainingRowidUpperBound===196_000&&result.drain.estimatedMinutesUpperBound===49&&
+    result.drain.stillMigrating,
+    result.drain as unknown as Record<string,unknown>);
 }
 
 function event(options: {
@@ -479,6 +516,7 @@ async function proveIntegratedIdle(
 
 async function main() {
   await proveCoalescing();
+  await proveProjectionDutyCycle();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-maintenance-proof-"));
   const ledger = path.join(root, "ledger.sqlite");
   const rolloutRoot = path.join(root, "rollouts");

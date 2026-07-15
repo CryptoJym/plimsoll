@@ -30,6 +30,7 @@ import {
 } from "../../packages/collector-cli/src/runtime-ownership";
 import { TranscriptTailer } from "../../packages/collector-cli/src/transcript-tailer";
 import { uploadBufferedEvents } from "../../packages/collector-cli/src/upload";
+import { createCollectorServer } from "../../packages/collector-cli/src/server";
 import { aiInteractionEventSchema } from "../../packages/shared/src/index";
 import {
   WORK_COUNTER_NAMES,
@@ -1132,6 +1133,109 @@ export function runBoundedCodexReconciliationContract(
       counters,
     };
   } finally {
+    buffer.close();
+  }
+}
+
+export async function runDashboardProjectionBudgetContract(
+  sandbox: ResourceSandbox,
+): Promise<ScenarioReceipt> {
+  const started = performance.now();
+  const buffer = new LocalEventBuffer(sandbox.ledger);
+  const config = collectorConfigSchema.parse({});
+  const eventId = `00000000-0000-4000-8000-000000008080`;
+  const event = aiInteractionEventSchema.parse({
+    id: eventId,
+    tenantId: "local",
+    source: "codex",
+    dataMode: "metadata",
+    eventType: "assistant_response",
+    observedAt: new Date(Date.now() - 60_000).toISOString(),
+    sessionId: "resource-dashboard-session",
+    actionClass: "other",
+    model: "resource-proof-model",
+    inputTokens: 80,
+    outputTokens: 8,
+    costUsd: 0.08,
+    metadata: { resourceProof: true },
+  });
+  const server = createCollectorServer(config, buffer);
+  try {
+    buffer.append(event);
+    for (let slice = 0; slice < 10; slice += 1) {
+      const status = buffer.projection.status();
+      if (status.ready && !status.dirty && Object.values(status.backlog).every((n) => n === 0)) break;
+      buffer.projection.runMaintenance(new Date(Date.now()));
+    }
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", () => resolve());
+    });
+    const address = server.address();
+    if (!address || typeof address === "string") throw new Error("dashboard proof server has no port");
+    const base = `http://127.0.0.1:${address.port}`;
+    const before = buffer.projection.workCounters();
+    const buildsBefore = before.snapshotBuilds;
+    const durations: number[] = [];
+    let generation: number | null = null;
+    let coherent = true;
+    for (let index = 0; index < 25; index += 1) {
+      const requestStarted = performance.now();
+      const response = await fetch(`${base}/api/snapshot?days=30`);
+      const body = await response.json() as {
+        generation?: number;
+        summary?: { totals?: { events?: number } };
+        sessions?: unknown[];
+        repos?: unknown[];
+        accounts?: { accounts?: unknown[] };
+        status?: unknown;
+      };
+      if (!response.ok || !body.summary || !body.sessions || !body.repos || !body.accounts || !body.status) {
+        coherent = false;
+      }
+      if (generation === null) generation = body.generation ?? null;
+      else if (generation !== body.generation) coherent = false;
+      if (index >= 5) durations.push(performance.now() - requestStarted);
+    }
+    const after = buffer.projection.workCounters();
+    const ordered = [...durations].sort((a, b) => a - b);
+    const warmP95 = ordered[Math.ceil(ordered.length * 0.95) - 1] ?? Number.POSITIVE_INFINITY;
+    const counters = emptyWorkCounters();
+    counters.rawRowsScanned =
+      after.rawRowsScannedByDashboard - before.rawRowsScannedByDashboard;
+    counters.projectionRowsVisited =
+      after.snapshotRowsVisited - before.snapshotRowsVisited;
+    counters.filesystemEntriesScanned =
+      after.filesystemEntriesScannedByDashboard - before.filesystemEntriesScannedByDashboard;
+    const passed =
+      coherent &&
+      generation !== null &&
+      counters.rawRowsScanned === 0 &&
+      counters.filesystemEntriesScanned === 0 &&
+      after.snapshotBuilds === buildsBefore &&
+      warmP95 <= 500;
+    return {
+      id: "dashboard_projection_budget",
+      required: true,
+      status: passed ? "pass" : "fail",
+      detail: passed
+        ? "One coherent production snapshot served all five dashboard surfaces; twenty warm refreshes performed zero raw/filesystem scans and no snapshot rebuild."
+        : "Dashboard snapshot coherence, deterministic no-scan counters, unchanged-refresh build count, or warm p95 exceeded the production gate.",
+      durationMs: Math.round((performance.now() - started) * 100) / 100,
+      counters,
+      measurements: {
+        generation: generation ?? -1,
+        coherent,
+        warmRequests: durations.length,
+        warmP95Ms: Math.round(warmP95 * 100) / 100,
+        snapshotBuildsDuringRefresh: after.snapshotBuilds - buildsBefore,
+        snapshotCacheHits: after.snapshotCacheHits - before.snapshotCacheHits,
+      },
+    };
+  } finally {
+    if (server.listening) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
     buffer.close();
   }
 }

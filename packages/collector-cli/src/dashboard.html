@@ -552,7 +552,8 @@ async function openRepo(hash){
   $("#d-body").innerHTML='<div class="empty">sounding\u2026</div>';
   let d;
   try{
-    const r=await fetch("/api/repo?hash="+encodeURIComponent(hash));
+    const days=Number(localStorage.getItem("plimsoll-window")||"30");
+    const r=await fetch("/api/repo?hash="+encodeURIComponent(hash)+"&days="+days);
     d=await r.json();
     if(!r.ok||d.error)throw new Error((d&&(d.message||d.error))||("HTTP "+r.status));
   }catch(e){drawerError("repository detail",e);return}
@@ -586,24 +587,31 @@ async function openRepo(hash){
 $("#drawer-close").onclick=closeDrawers;
 $("#veil").onclick=closeDrawers;
 
-async function refresh(){
+let dashboardCache=null;
+let dashboardEtag=null;
+async function refresh(redrawOnly=false){
   try{
     const days=Number(localStorage.getItem("plimsoll-window")||"30");
     const q="?days="+days;
-    const [s,sess,repos,status,acct]=await Promise.all([
-      fetch("/api/summary"+q).then(r=>r.json()),
-      fetch("/api/sessions"+q).then(r=>r.json()),
-      fetch("/api/repos"+q).then(r=>r.json()),
-      fetch("/status").then(r=>r.json()),
-      fetch("/api/accounts"+q).then(r=>r.json()),
-    ]);
+    if(!redrawOnly||!dashboardCache||dashboardCache.window?.days!==days){
+      const headers=dashboardEtag?{"if-none-match":dashboardEtag}:{};
+      const r=await fetch("/api/snapshot"+q,{headers});
+      if(r.status!==304){
+        const payload=await r.json();
+        if(!r.ok)throw new Error(payload.error||("HTTP "+r.status));
+        dashboardCache=payload;
+        dashboardEtag=r.headers.get("etag");
+      }
+    }
+    if(!dashboardCache)throw new Error("projection_backfilling");
+    const d=dashboardCache,s=d.summary,sess=d.sessions,repos=d.repos,status=d.status,acct=d.accounts;
     $("#window-label").textContent=days>=1825?"all history":days>=365?"1 year":days>=182?"6 months":days+" days";
     const health=status.health||{overall:"green",sources:[]};
-    const faults=[["sessions",sess],["repos",repos],["accounts",acct]].filter(([,p])=>p&&!Array.isArray(p)&&p.error);
-    const lampState=faults.length&&health.overall==="green"?"amber":health.overall;
-    $("#lamp").classList.toggle("ok",lampState==="green"&&!faults.length);
+    const projection=d.projection||{status:"stale",degraded:true};
+    const lampState=projection.degraded&&health.overall==="green"?"amber":health.overall;
+    $("#lamp").classList.toggle("ok",lampState==="green"&&!projection.degraded);
     $("#lamp").classList.toggle("warn",lampState==="amber");
-    const lampMsg=lampState==="green"?(faults.length?"panel fault":"collecting"):"capture "+(lampState==="amber"?"degraded":"failure")+" — see capture watch";
+    const lampMsg=projection.status==="stale"?"projection stale — serving last coherent sounding":lampState==="green"?"collecting":"capture "+(lampState==="amber"?"degraded":"failure")+" — see capture watch";
     if($("#lamp-text").textContent!==lampMsg)$("#lamp-text").textContent=lampMsg;
     const sigvar=st=>st==="green"?"var(--signal-green)":st==="amber"?"var(--signal-amber)":"var(--signal-red)";
     const dot=st=>`<i style="background:${sigvar(st)};box-shadow:0 0 6px ${sigvar(st)}"></i>`;
@@ -611,8 +619,8 @@ async function refresh(){
     $("#watch-rows").innerHTML=(health.sources||[]).map(h=>{
       const name=h.source==="claude_code"?"Claude Code":"Codex";
       return `<span>${dot(h.status)}<b style="color:var(--foam)">${name}</b>&nbsp;— ${h.reason} · last captured ${ago(h.lastEventAt)} · local activity ${ago(h.localLastActivityAt)}</span>`;
-    }).join("")+faults.map(([n,p])=>`<span>${dot("amber")}<b style="color:var(--foam)">${n} panel</b>&nbsp;— api error: ${p.error}${p.message?" · "+p.message:""}</span>`).join("")||`<span style="color:var(--foam-faint)">no health data</span>`;
-    $("#watch-stamp").textContent=health.generatedAt?"sounded "+ago(health.generatedAt):"";
+    }).join("")+(projection.degraded?`<span>${dot("amber")}<b style="color:var(--foam)">projection</b>&nbsp;— ${projection.degradedReason||"pending repair"}; last coherent generation ${d.generation}</span>`:"")||`<span style="color:var(--foam-faint)">no health data</span>`;
+    $("#watch-stamp").textContent=projection.freshnessAt?"projected "+ago(projection.freshnessAt):"";
     const t=s.totals;
     $("#fig-cost").innerHTML=usd(t.costUsd).replace(/^\$/, "<small>$</small>");
     $("#kv-in").textContent=fmt(t.inputTokens); $("#kv-out").textContent=fmt(t.outputTokens);
@@ -658,10 +666,11 @@ async function refresh(){
     $("#f-ledger").textContent=status.stats?fmt(status.stats.count)+" rows":"·";
     $("#f-events").textContent=fmt(t.events)+" in window";
     $("#f-retention").textContent=(status.retentionDays??90)+"d";
-    $("#f-time").textContent=new Date().toLocaleTimeString();
-    $("#crumbs").innerHTML=`127.0.0.1 · window ${s.days}d · <b>nothing leaves this machine from this page</b>`;
+    $("#f-time").textContent=projection.freshnessAt?new Date(projection.freshnessAt).toLocaleTimeString():"·";
+    $("#crumbs").innerHTML=`127.0.0.1 · window ${s.days}d · generation ${d.generation} · <b>nothing leaves this machine from this page</b>`;
   }catch(e){
-    $("#lamp").classList.remove("ok","warn"); $("#lamp-text").textContent="collector unreachable";
+    $("#lamp").classList.remove("ok"); $("#lamp").classList.add("warn");
+    $("#lamp-text").textContent=String(e&&e.message)==="projection_backfilling"?"projection backfilling":"collector unreachable";
   }
 }
 // ——— settings ———
@@ -720,7 +729,7 @@ const winSel=$("#window-select");
 winSel.value=localStorage.getItem("plimsoll-window")||"30";
 winSel.onchange=()=>{localStorage.setItem("plimsoll-window",winSel.value);refresh()};
 refresh(); setInterval(refresh, 30000);
-window.addEventListener("resize",()=>refresh());
+window.addEventListener("resize",()=>refresh(true));
 </script>
 </body>
 </html>
