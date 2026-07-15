@@ -591,6 +591,12 @@ export class LocalEventBuffer {
     repoHash: string | null;
     branchHash: string | null;
   }): BufferedEventRow {
+    let storedSuppressedFields: unknown;
+    try {
+      storedSuppressedFields = JSON.parse(row.suppressedFieldsJson) as unknown;
+    } catch {
+      storedSuppressedFields = [undefined];
+    }
     return {
       id: row.id,
       source: row.source,
@@ -598,7 +604,9 @@ export class LocalEventBuffer {
       dataMode: row.dataMode,
       observedAt: row.observedAt,
       payload: JSON.parse(row.payloadJson) as AiInteractionEvent,
-      suppressedFields: JSON.parse(row.suppressedFieldsJson) as string[],
+      suppressedFields: canonicalizeSuppressionReceipts(
+        Array.isArray(storedSuppressedFields) ? storedSuppressedFields : [undefined],
+      ),
       createdAt: row.createdAt,
       uploadedAt: row.uploadedAt ?? null,
       repoHash: row.repoHash ?? null,

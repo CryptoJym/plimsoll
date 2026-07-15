@@ -8,6 +8,11 @@ import {
   isForbiddenRawContentFieldName,
   policyConfigSchema,
 } from "./schemas";
+import {
+  canonicalizeSuppressionReceipts,
+  isSafeSuppressionSourceKey,
+  suppressionReceiptForAttributeKey,
+} from "./suppression-receipt";
 
 export const DEFAULT_POLICY: PolicyConfig = policyConfigSchema.parse({
   id: "default-policy",
@@ -124,13 +129,17 @@ function sanitizeRoutineMetadata(
   const semanticKey = otelAttributeKey(value as Record<string, unknown>);
   if (semanticKey) {
     const currentPath = path ? `${path}.${semanticKey}` : semanticKey;
+    if (!isSafeSuppressionSourceKey(semanticKey)) {
+      suppressed.push(suppressionReceiptForAttributeKey(semanticKey));
+      return REMOVE_FIELD;
+    }
     if (isForbiddenRawContentFieldName(semanticKey)) {
-      suppressed.push(currentPath);
+      suppressed.push(suppressionReceiptForAttributeKey(semanticKey));
       return REMOVE_FIELD;
     }
 
     if (isProtectedMetadataFieldName(semanticKey)) {
-      suppressed.push(currentPath);
+      suppressed.push(suppressionReceiptForAttributeKey(semanticKey));
       return {
         ...(value as Record<string, unknown>),
         value: protectedOtelValue((value as Record<string, unknown>).value),
@@ -141,6 +150,10 @@ function sanitizeRoutineMetadata(
   const next: Record<string, unknown> = {};
   for (const [key, nestedValue] of Object.entries(value)) {
     const currentPath = path ? `${path}.${key}` : key;
+    if (!isSafeSuppressionSourceKey(key)) {
+      suppressed.push(currentPath);
+      continue;
+    }
     if (isForbiddenRawContentFieldName(key)) {
       suppressed.push(currentPath);
       continue;
@@ -165,12 +178,13 @@ export function evaluatePolicyInput(
   input: unknown,
   policy: PolicyConfig = DEFAULT_POLICY,
 ): PolicyEvaluation {
-  const suppressedFields = findForbiddenRawContentFields(input);
+  const detectedSuppressedFields = findForbiddenRawContentFields(input);
+  const suppressedFields = canonicalizeSuppressionReceipts(detectedSuppressedFields);
   const reasons: string[] = [];
 
-  if (policy.dataMode !== "evidence" && suppressedFields.length > 0) {
+  if (policy.dataMode !== "evidence" && detectedSuppressedFields.length > 0) {
     reasons.push(
-      `Suppressed ${suppressedFields.length} raw-content field(s) because ${policy.dataMode} mode forbids raw prompt/output/tool content.`,
+      `Suppressed ${detectedSuppressedFields.length} raw-content field(s) because ${policy.dataMode} mode forbids raw prompt/output/tool content.`,
     );
   }
 
@@ -211,7 +225,7 @@ export function sanitizeForPolicy<T>(
   return {
     evaluation: {
       ...evaluation,
-      suppressedFields,
+      suppressedFields: canonicalizeSuppressionReceipts(suppressedFields),
     },
     value,
   };

@@ -1,12 +1,14 @@
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { spawnSync } from "node:child_process";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { normalizeHookPayload } from "../packages/collector-cli/src/normalizer";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { sealOutboundEnvelope } from "../packages/collector-cli/src/outbound-envelope";
+import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { DeliveryUploadError, uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import {
   GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
@@ -20,6 +22,7 @@ import {
   DEFAULT_POLICY,
   isCanonicalSuppressionReceipt,
   remoteLinkageHash,
+  sanitizeForPolicy,
   suppressionReceiptForAttributeKey,
 } from "../packages/shared/src/index";
 
@@ -94,6 +97,33 @@ function requestIds(init?: RequestInit) {
     events?: Array<{ event?: { id?: string } }>;
   };
   return (parsed.events ?? []).map((entry) => entry.event?.id ?? "");
+}
+
+async function listenLoopback(server: ReturnType<typeof createCollectorServer>) {
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", resolve);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") throw new Error("ProofLoopbackUnavailable");
+  return address.port;
+}
+
+async function closeLoopback(server: ReturnType<typeof createCollectorServer> | undefined) {
+  if (!server?.listening) return;
+  await new Promise<void>((resolve) => server.close(() => resolve()));
+}
+
+async function postJson(port: number, route: string, body: unknown) {
+  const response = await fetch(`http://127.0.0.1:${port}${route}`, {
+    method: "POST",
+    headers: { "content-type": "application/json", "x-plimsoll-source": "codex" },
+    body: JSON.stringify(body),
+  });
+  return {
+    status: response.status,
+    body: (await response.json()) as Record<string, unknown>,
+  };
 }
 
 async function expectDeliveryError(run: () => Promise<unknown>, expected: string) {
@@ -1070,6 +1100,356 @@ async function noMarkPressureAndPrivacyProof() {
   }
 }
 
+async function policyResponseAndLegacyReadbackProof() {
+  const hostileKeys = [
+    "../PRIVATE_KEY_SENTINEL_94",
+    "/Users/privacy94/PRIVATE_ABSOLUTE_KEY",
+    "C:\\privacy94\\PRIVATE_WINDOWS_KEY",
+    "https://privacy94.invalid/PRIVATE_URL_KEY",
+    "privacy94.owner@example.invalid",
+    "prіvate94_confusable_key",
+    "ｐｒｉｖａｔｅ94_fullwidth_key",
+    "control\u0000PRIVATE_KEY_94",
+    `${"o".repeat(SUPPRESSION_RECEIPT_MAX_LENGTH + 1)}_PRIVATE_OVERSIZED_KEY_94`,
+  ];
+  const privateValues: string[] = [];
+  const hostilePayload = Object.fromEntries(
+    hostileKeys.map((key, index) => {
+      const nested = {
+        prompt: `PRIVATE_PROMPT_VALUE_94_${index}`,
+        response: `PRIVATE_RESPONSE_VALUE_94_${index}`,
+        arguments: `PRIVATE_ARGUMENT_VALUE_94_${index}`,
+      };
+      privateValues.push(...Object.values(nested));
+      return [key, nested];
+    }),
+  );
+  const privateTerms = [...new Set([
+    ...hostileKeys,
+    ...privateValues,
+    ...hostileKeys.map((value) => value.slice(0, Math.min(18, value.length))),
+    ...privateValues.map((value) => value.slice(0, 18)),
+  ].filter((value) => value.length >= 8))];
+  const clean = (surfaces: string[]) =>
+    privateTerms.every((term) => surfaces.every((surface) => !surface.includes(term)));
+  const asReceipts = (value: unknown) =>
+    Array.isArray(value) ? value.filter((entry): entry is string => typeof entry === "string") : [];
+  const envelopeReceipts = (value: string) =>
+    asReceipts((JSON.parse(value) as { suppressedFields?: unknown }).suppressedFields);
+  const requestEnvelope = (body: string, id: string) =>
+    ((JSON.parse(body) as {
+      events?: Array<{ event?: { id?: string }; suppressedFields?: unknown }>;
+    }).events ?? []).find((entry) => entry.event?.id === id);
+  const exactParity = (expected: string[], receipts: string[][]) =>
+    receipts.every((candidate) => JSON.stringify(candidate) === JSON.stringify(expected));
+
+  const evaluated = sanitizeForPolicy(hostilePayload, DEFAULT_POLICY);
+  const normalized = normalizeHookPayload(hostilePayload, {
+    policy: DEFAULT_POLICY,
+    source: "codex",
+  });
+  const directExpected = [GENERIC_SUPPRESSION_RECEIPT];
+  const detectedRawFieldCount = hostileKeys.length * 3;
+  const directSurfaces = [JSON.stringify(evaluated), JSON.stringify(normalized)];
+  record(
+    "shared_policy_and_normalizer_canonicalize_before_public_consumers",
+    JSON.stringify(evaluated.evaluation.suppressedFields) === JSON.stringify(directExpected) &&
+      JSON.stringify(normalized.suppressedFields) === JSON.stringify(directExpected) &&
+      evaluated.evaluation.reasons.some((reason) =>
+        reason.includes(`Suppressed ${detectedRawFieldCount} raw-content field(s)`),
+      ) &&
+      clean(directSurfaces) &&
+      normalized.suppressedFields.every(isCanonicalSuppressionReceipt),
+    {
+      hostileKeys: hostileKeys.length,
+      detectedRawFields: detectedRawFieldCount,
+      canonicalReceipts: normalized.suppressedFields.length,
+      counterPreserved: evaluated.evaluation.reasons.some((reason) =>
+        reason.includes(`Suppressed ${detectedRawFieldCount} raw-content field(s)`),
+      ),
+      privateTerms: privateTerms.length,
+      leaks: privateTerms.filter((term) => directSurfaces.some((surface) => surface.includes(term))).length,
+    },
+  );
+
+  const file = ledger();
+  const cfg = config();
+  let buffer: LocalEventBuffer | undefined = new LocalEventBuffer(file, {
+    delivery: { enabled: true, limits: cfg.delivery },
+  });
+  let server: ReturnType<typeof createCollectorServer> | undefined;
+  let hookWire = "";
+  let fallbackWire = "";
+  try {
+    server = createCollectorServer(cfg, buffer);
+    let port = await listenLoopback(server);
+    const hookResponse = await postJson(port, "/hooks/codex", hostilePayload);
+    const hookId = String(hookResponse.body.eventId ?? "");
+    const hookResponseReceipts = asReceipts(hookResponse.body.suppressedFields);
+    const hookBefore = buffer.database
+      .prepare(
+        `select payload_json as payload, suppressed_fields_json as suppressed,
+           (select base_envelope_json from upload_outbox where delivery_id = buffered_events.id) as base
+         from buffered_events where id = ?`,
+      )
+      .get(hookId) as { payload: string; suppressed: string; base: string } | undefined;
+    const hookListBefore = buffer.list(10).find((row) => row.id === hookId)?.suppressedFields ?? [];
+    await closeLoopback(server);
+    server = undefined;
+    buffer.close();
+    buffer = new LocalEventBuffer(file, {
+      delivery: { enabled: true, limits: cfg.delivery },
+    });
+    const hookListReopened = buffer.list(10).find((row) => row.id === hookId)?.suppressedFields ?? [];
+    const hookUpload = await uploadBufferedEvents(cfg, buffer, {
+      fetchImpl: async (_input, init) => {
+        hookWire = String(init?.body ?? "");
+        return response(200, { accepted: requestIds(init).length });
+      },
+      now: () => instant(2_900),
+    });
+    const hookWitness = buffer.database
+      .prepare(`select envelope_json as envelope from upload_validation_witness where singleton = 1`)
+      .get() as { envelope: string } | undefined;
+    const hookWireReceipts = asReceipts(requestEnvelope(hookWire, hookId)?.suppressedFields);
+    const hookReceiptSets = [
+      hookResponseReceipts,
+      JSON.parse(hookBefore?.suppressed ?? "[]") as string[],
+      envelopeReceipts(hookBefore?.base ?? "{}"),
+      hookListBefore,
+      hookListReopened,
+      hookWireReceipts,
+      envelopeReceipts(hookWitness?.envelope ?? "{}"),
+    ];
+    const hookSurfaces = [
+      JSON.stringify(hookResponse.body),
+      hookBefore?.payload ?? "",
+      hookBefore?.suppressed ?? "",
+      hookBefore?.base ?? "",
+      JSON.stringify(hookListBefore),
+      JSON.stringify(hookListReopened),
+      hookWire,
+      hookWitness?.envelope ?? "",
+    ];
+    record(
+      "successful_hook_response_local_reopen_outbox_and_wire_receipts_match",
+      hookResponse.status === 202 &&
+        hookUpload.uploadedEvents === 1 &&
+        JSON.stringify(hookResponseReceipts) === JSON.stringify(directExpected) &&
+        exactParity(directExpected, hookReceiptSets) &&
+        hookReceiptSets.flat().every(isCanonicalSuppressionReceipt) &&
+        clean(hookSurfaces),
+      {
+        status: hookResponse.status,
+        uploaded: hookUpload.uploadedEvents,
+        surfaces: hookReceiptSets.length,
+        canonicalReceipts: hookResponseReceipts.length,
+        exactParity: exactParity(directExpected, hookReceiptSets),
+        privateTerms: privateTerms.length,
+        leaks: privateTerms.filter((term) => hookSurfaces.some((surface) => surface.includes(term))).length,
+      },
+    );
+
+    server = createCollectorServer(cfg, buffer);
+    port = await listenLoopback(server);
+    const fallbackResponse = await postJson(port, "/v1/traces", {
+      unsupported_envelope: hostilePayload,
+    });
+    const fallbackId = String(fallbackResponse.body.eventId ?? "");
+    const fallbackResponseReceipts = asReceipts(fallbackResponse.body.suppressedFields);
+    const fallbackBefore = buffer.database
+      .prepare(
+        `select payload_json as payload, suppressed_fields_json as suppressed,
+           (select base_envelope_json from upload_outbox where delivery_id = buffered_events.id) as base
+         from buffered_events where id = ?`,
+      )
+      .get(fallbackId) as { payload: string; suppressed: string; base: string } | undefined;
+    const fallbackListBefore =
+      buffer.list(10).find((row) => row.id === fallbackId)?.suppressedFields ?? [];
+    await closeLoopback(server);
+    server = undefined;
+    buffer.close();
+    buffer = new LocalEventBuffer(file, {
+      delivery: { enabled: true, limits: cfg.delivery },
+    });
+    const fallbackListReopened =
+      buffer.list(10).find((row) => row.id === fallbackId)?.suppressedFields ?? [];
+    const fallbackUpload = await uploadBufferedEvents(cfg, buffer, {
+      fetchImpl: async (_input, init) => {
+        fallbackWire = String(init?.body ?? "");
+        return response(200, { accepted: requestIds(init).length });
+      },
+      now: () => instant(2_901),
+    });
+    const fallbackWitness = buffer.database
+      .prepare(`select envelope_json as envelope from upload_validation_witness where singleton = 1`)
+      .get() as { envelope: string } | undefined;
+    const fallbackWireReceipts = asReceipts(
+      requestEnvelope(fallbackWire, fallbackId)?.suppressedFields,
+    );
+    const fallbackReceiptSets = [
+      fallbackResponseReceipts,
+      JSON.parse(fallbackBefore?.suppressed ?? "[]") as string[],
+      envelopeReceipts(fallbackBefore?.base ?? "{}"),
+      fallbackListBefore,
+      fallbackListReopened,
+      fallbackWireReceipts,
+      envelopeReceipts(fallbackWitness?.envelope ?? "{}"),
+    ];
+    const fallbackSurfaces = [
+      JSON.stringify(fallbackResponse.body),
+      fallbackBefore?.payload ?? "",
+      fallbackBefore?.suppressed ?? "",
+      fallbackBefore?.base ?? "",
+      JSON.stringify(fallbackListBefore),
+      JSON.stringify(fallbackListReopened),
+      fallbackWire,
+      fallbackWitness?.envelope ?? "",
+    ];
+    record(
+      "explicit_otlp_fallback_response_local_reopen_outbox_and_wire_receipts_match",
+      fallbackResponse.status === 202 &&
+        fallbackUpload.uploadedEvents === 1 &&
+        fallbackResponseReceipts.length > 0 &&
+        exactParity(fallbackResponseReceipts, fallbackReceiptSets) &&
+        fallbackReceiptSets.flat().every(isCanonicalSuppressionReceipt) &&
+        clean(fallbackSurfaces),
+      {
+        status: fallbackResponse.status,
+        uploaded: fallbackUpload.uploadedEvents,
+        surfaces: fallbackReceiptSets.length,
+        canonicalReceipts: fallbackResponseReceipts.length,
+        exactParity: exactParity(fallbackResponseReceipts, fallbackReceiptSets),
+        privateTerms: privateTerms.length,
+        leaks: privateTerms.filter((term) => fallbackSurfaces.some((surface) => surface.includes(term))).length,
+      },
+    );
+    buffer.close();
+    buffer = undefined;
+
+    const closedArtifacts = [file, `${file}-wal`, `${file}-shm`]
+      .filter((candidate) => fs.existsSync(candidate))
+      .map((candidate) => fs.readFileSync(candidate));
+    record(
+      "hook_and_fallback_private_keys_values_and_prefixes_absent_from_closed_ledger",
+      privateTerms.every((term) =>
+        closedArtifacts.every((artifact) => !artifact.includes(Buffer.from(term))),
+      ),
+      {
+        artifacts: closedArtifacts.length,
+        privateTerms: privateTerms.length,
+        leaks: privateTerms.filter((term) =>
+          closedArtifacts.some((artifact) => artifact.includes(Buffer.from(term))),
+        ).length,
+      },
+    );
+  } finally {
+    await closeLoopback(server);
+    buffer?.close();
+  }
+
+  const legacyFile = ledger();
+  let legacyBuffer = new LocalEventBuffer(legacyFile);
+  const legacyEvent = event(2_950);
+  legacyBuffer.append(legacyEvent, ["prompt"]);
+  const legacyStored = JSON.stringify([hostileKeys[0], hostileKeys[3], "prompt"]);
+  legacyBuffer.database
+    .prepare(`update buffered_events set suppressed_fields_json = ? where id = ?`)
+    .run(legacyStored, legacyEvent.id);
+  const legacyExpected = [GENERIC_SUPPRESSION_RECEIPT, "prompt"];
+  const legacyList = legacyBuffer.list(10).find((row) => row.id === legacyEvent.id)?.suppressedFields ?? [];
+  const legacyUnuploaded =
+    legacyBuffer.listUnuploaded({ maxRows: 10 }).find((row) => row.id === legacyEvent.id)
+      ?.suppressedFields ?? [];
+  legacyBuffer.close();
+  legacyBuffer = new LocalEventBuffer(legacyFile);
+  const legacyReopened =
+    legacyBuffer.list(10).find((row) => row.id === legacyEvent.id)?.suppressedFields ?? [];
+  const legacyStoredAfter = (
+    legacyBuffer.database
+      .prepare(`select suppressed_fields_json as value from buffered_events where id = ?`)
+      .get(legacyEvent.id) as { value: string }
+  ).value;
+  legacyBuffer.close();
+  const legacyPublic = [JSON.stringify(legacyList), JSON.stringify(legacyUnuploaded), JSON.stringify(legacyReopened)];
+  record(
+    "legacy_buffer_readbacks_canonicalize_without_rewriting_stored_rows",
+    [legacyList, legacyUnuploaded, legacyReopened].every(
+      (receipts) => JSON.stringify(receipts) === JSON.stringify(legacyExpected),
+    ) &&
+      legacyStoredAfter === legacyStored &&
+      [hostileKeys[0], hostileKeys[3]].every((key) =>
+        key !== undefined && legacyPublic.every((surface) => !surface.includes(key)),
+      ),
+    {
+      readbackSurfaces: legacyPublic.length,
+      canonicalReceipts: legacyList.length,
+      storedRowUnchanged: legacyStoredAfter === legacyStored,
+    },
+  );
+
+  const cliHome = path.join(root, "cli-self-test-policy-boundary");
+  fs.mkdirSync(cliHome, { recursive: true, mode: 0o700 });
+  const cliRun = spawnSync(
+    process.execPath,
+    [
+      path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs"),
+      path.join(process.cwd(), "packages", "collector-cli", "src", "cli.ts"),
+      "self-test-hook",
+      "codex",
+    ],
+    {
+      cwd: process.cwd(),
+      env: {
+        HOME: cliHome,
+        USERPROFILE: cliHome,
+        TMPDIR: cliHome,
+        TMP: cliHome,
+        TEMP: cliHome,
+        PLIMSOLL_HOME: cliHome,
+        PATH: process.env.PATH,
+        TZ: "UTC",
+        LANG: "C",
+        LC_ALL: "C",
+      },
+      encoding: "utf8",
+      timeout: 30_000,
+      maxBuffer: 4 * 1024 * 1024,
+    },
+  );
+  const cliOutput = JSON.parse(cliRun.stdout || "{}") as {
+    accepted?: boolean;
+    eventId?: string;
+    suppressedFields?: unknown;
+  };
+  const cliReceipts = asReceipts(cliOutput.suppressedFields);
+  const cliBuffer = new LocalEventBuffer(path.join(cliHome, "work-ledger.sqlite"));
+  const cliRow = cliBuffer.list(10).find((row) => row.id === cliOutput.eventId);
+  const cliStored = cliBuffer.database
+    .prepare(`select payload_json as payload from buffered_events where id = ?`)
+    .get(cliOutput.eventId) as { payload: string } | undefined;
+  cliBuffer.close();
+  const selfTestRaw = "self-test raw prompt should be suppressed in metadata mode";
+  record(
+    "cli_self_test_print_and_readback_share_canonical_receipts",
+    cliRun.status === 0 &&
+      cliRun.stderr.length === 0 &&
+      cliOutput.accepted === true &&
+      cliReceipts.length > 0 &&
+      cliReceipts.every(isCanonicalSuppressionReceipt) &&
+      JSON.stringify(cliReceipts) === JSON.stringify(cliRow?.suppressedFields ?? []) &&
+      !cliRun.stdout.includes(selfTestRaw) &&
+      !(cliStored?.payload ?? "").includes(selfTestRaw),
+    {
+      exitCode: cliRun.status,
+      stderrEmpty: cliRun.stderr.length === 0,
+      canonicalReceipts: cliReceipts.length,
+      readbackParity: JSON.stringify(cliReceipts) === JSON.stringify(cliRow?.suppressedFields ?? []),
+      rawPromptAbsent: !cliRun.stdout.includes(selfTestRaw) && !(cliStored?.payload ?? "").includes(selfTestRaw),
+    },
+  );
+}
+
 function suppressionReceiptContractProof() {
   const prefix = "attributes.";
   const exactBoundaryKey = "b".repeat(SUPPRESSION_ATTRIBUTE_KEY_MAX_LENGTH);
@@ -1225,8 +1605,8 @@ async function suppressionReceiptProductionParityProof() {
     },
   );
   const expected = [
-    ...safeKeys.map((key) => `${prefix}${key}`),
     GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
+    ...safeKeys.map((key) => `${prefix}${key}`),
   ];
   let buffer = new LocalEventBuffer(file, {
     delivery: { enabled: true, limits: cfg.delivery },
@@ -2014,6 +2394,7 @@ function pressureAgeByteOversizeAndStatusProof() {
 
 async function main() {
   try {
+    await policyResponseAndLegacyReadbackProof();
     suppressionReceiptContractProof();
     await suppressionReceiptProductionParityProof();
     await atomicAndDuplicateProof();

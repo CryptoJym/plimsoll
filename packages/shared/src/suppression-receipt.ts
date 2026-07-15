@@ -15,6 +15,16 @@ export const SUPPRESSION_ATTRIBUTE_KEY_MAX_LENGTH =
   SUPPRESSION_RECEIPT_MAX_LENGTH - ATTRIBUTE_PREFIX.length;
 const SAFE_RECEIPT_CHARACTERS = /^[a-zA-Z0-9_.:+-]+$/;
 
+/** Syntactic key safety used before an attacker-controlled key is retained. */
+export function isSafeSuppressionSourceKey(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    value.length >= 1 &&
+    value.length <= SUPPRESSION_RECEIPT_MAX_LENGTH &&
+    SAFE_RECEIPT_CHARACTERS.test(value)
+  );
+}
+
 function keyWords(value: string) {
   return value
     .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
