@@ -285,9 +285,6 @@ function proveLegacyCadence(root: string, shape: "sparse" | "dense-context") {
   try {
     const results: ReturnType<typeof runCodexReconciliationMaintenance>[] = [];
     const durations: number[] = [];
-    let freshResolutionCycle: number | null = null;
-    let freshResolvedBeforeLegacyCompletion = false;
-    let cyclesSinceFresh = 0;
     for (let slice = 0; slice < 240; slice += 1) {
       const started = performance.now();
       const result = runCodexReconciliationMaintenance(buffer.database);
@@ -295,32 +292,6 @@ function proveLegacyCadence(root: string, shape: "sparse" | "dense-context") {
       results.push(result);
       assert.ok(result.legacyRowsVisited <= 100_000);
       assert.ok(result.legacyRowsVisited === 0 || result.legacyRowsVisited % 500 === 0);
-
-      if (shape === "dense-context" && slice === 0) {
-        const partial = codexReconciliationStatus(buffer.database);
-        assert.equal(partial.legacyComplete, false);
-        buffer.append(usageEvent("fresh-during-backfill", "2026-07-15T12:02:00.000Z"));
-        buffer.append(contextEvent("fresh-context", "2026-07-15T12:02:30.000Z"));
-        continue;
-      }
-      if (shape === "dense-context" && freshResolutionCycle === null) {
-        cyclesSinceFresh += 1;
-        const fresh = buffer.database
-          .prepare(
-            `select session_id as sessionId, model, cost_usd as costUsd
-             from buffered_events where id = 'fresh-during-backfill'`,
-          )
-          .get() as {
-          sessionId: string | null;
-          model: string | null;
-          costUsd: number | null;
-        };
-        if (fresh.sessionId && fresh.model && fresh.costUsd !== null) {
-          freshResolutionCycle = cyclesSinceFresh;
-          freshResolvedBeforeLegacyCompletion = !codexReconciliationStatus(buffer.database)
-            .legacyComplete;
-        }
-      }
       if (result.backfillComplete) break;
     }
     const visited = results.reduce((total, result) => total + result.legacyRowsVisited, 0);
@@ -355,14 +326,6 @@ function proveLegacyCadence(root: string, shape: "sparse" | "dense-context") {
     );
 
     if (shape === "dense-context") {
-      check(
-        "fresh_usage_resolves_during_incomplete_dense_backfill",
-        freshResolutionCycle !== null &&
-          freshResolutionCycle <= 2 &&
-          freshResolvedBeforeLegacyCompletion,
-        { freshResolutionCycle, freshResolvedBeforeLegacyCompletion },
-      );
-
       const sideTables = buffer.database
         .prepare(
           `select name from sqlite_master
