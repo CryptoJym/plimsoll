@@ -4,6 +4,12 @@ import path from "node:path";
 
 import type { LocalEventBuffer } from "./buffer";
 import { resolveGitContext } from "./git-context";
+import {
+  ensureJsonlScanState,
+  loadJsonlScanCursor,
+  readJsonlTail,
+  rememberJsonlScanCursor,
+} from "./jsonl-byte-tailer";
 import { readLocalIdentities, type LocalIdentity, type LocalIdentityPaths } from "./local-identity";
 import { deterministicEventId } from "./normalizer";
 import {
@@ -39,7 +45,13 @@ import {
 
 export type RolloutScanResult = {
   filesSeen: number;
+  filesRead: number;
   filesParsed: number;
+  filesReset: number;
+  legacyRebuilds: number;
+  checkpointRebuilds: number;
+  bytesRead: number;
+  bytesDeferred: number;
   sessionsSkippedOtlpCovered: number;
   eventsAppended: number;
   tokensAppended: { input: number; cachedInput: number; output: number };
@@ -48,6 +60,29 @@ export type RolloutScanResult = {
 };
 
 type TokenTotals = { input: number; cachedInput: number; output: number; reasoningOutput: number };
+
+type PersistedGitContext = {
+  remoteUrlHash?: string;
+  branchHash?: string;
+  headSha?: string;
+};
+
+type RolloutParserState = {
+  parserKind: "codex-rollout-v2";
+  checkpointVersion: 2;
+  conversationId?: string;
+  sessionStartedAt?: string;
+  originator?: string;
+  cliVersion?: string;
+  model?: string;
+  planType?: string;
+  previous: TokenTotals;
+  tokenCountIndex: number;
+  git?: PersistedGitContext;
+};
+
+const PARSER_KIND = "codex-rollout-v2";
+const CHECKPOINT_VERSION = 2;
 
 const ZERO: TokenTotals = { input: 0, cachedInput: 0, output: 0, reasoningOutput: 0 };
 
@@ -76,7 +111,103 @@ function diff(current: TokenTotals, previous: TokenTotals): TokenTotals {
   };
 }
 
+function validateRolloutParserState(value: unknown): RolloutParserState | undefined {
+  if (!isRecord(value)) return undefined;
+  if (
+    !hasOnlyKeys(value, [
+      "parserKind",
+      "checkpointVersion",
+      "conversationId",
+      "sessionStartedAt",
+      "originator",
+      "cliVersion",
+      "model",
+      "planType",
+      "previous",
+      "tokenCountIndex",
+      "git",
+    ])
+  ) {
+    return undefined;
+  }
+  if (value.parserKind !== PARSER_KIND || value.checkpointVersion !== CHECKPOINT_VERSION) {
+    return undefined;
+  }
+  if (!isTokenTotals(value.previous)) return undefined;
+  if (
+    typeof value.tokenCountIndex !== "number" ||
+    !Number.isSafeInteger(value.tokenCountIndex) ||
+    value.tokenCountIndex < -1
+  ) {
+    return undefined;
+  }
+  const conversationId = optionalString(value.conversationId);
+  const sessionStartedAt = optionalString(value.sessionStartedAt);
+  const originator = optionalString(value.originator);
+  const cliVersion = optionalString(value.cliVersion);
+  const model = optionalString(value.model);
+  const planType = optionalString(value.planType);
+  if ([conversationId, sessionStartedAt, originator, cliVersion, model, planType].includes(null)) {
+    return undefined;
+  }
+  if (conversationId && !UUID_EXACT_RE.test(conversationId)) return undefined;
+  const git = validatePersistedGit(value.git);
+  if (value.git !== undefined && !git) return undefined;
+
+  return {
+    parserKind: PARSER_KIND,
+    checkpointVersion: CHECKPOINT_VERSION,
+    previous: { ...value.previous },
+    tokenCountIndex: value.tokenCountIndex,
+    ...(conversationId ? { conversationId: conversationId.toLowerCase() } : {}),
+    ...(sessionStartedAt ? { sessionStartedAt } : {}),
+    ...(originator ? { originator } : {}),
+    ...(cliVersion ? { cliVersion } : {}),
+    ...(model ? { model } : {}),
+    ...(planType ? { planType } : {}),
+    ...(git ? { git } : {}),
+  };
+}
+
+function optionalString(value: unknown): string | undefined | null {
+  if (value === undefined) return undefined;
+  return typeof value === "string" ? value : null;
+}
+
+function isTokenTotals(value: unknown): value is TokenTotals {
+  if (!isRecord(value)) return false;
+  if (!hasOnlyKeys(value, ["input", "cachedInput", "output", "reasoningOutput"])) return false;
+  return ["input", "cachedInput", "output", "reasoningOutput"].every((key) => {
+    const total = value[key];
+    return typeof total === "number" && Number.isSafeInteger(total) && total >= 0;
+  });
+}
+
+function validatePersistedGit(value: unknown): PersistedGitContext | undefined {
+  if (!isRecord(value)) return undefined;
+  if (!hasOnlyKeys(value, ["remoteUrlHash", "branchHash", "headSha"])) return undefined;
+  for (const key of ["remoteUrlHash", "branchHash", "headSha"] as const) {
+    if (value[key] !== undefined && typeof value[key] !== "string") return undefined;
+  }
+  const git = {
+    ...(typeof value.remoteUrlHash === "string" ? { remoteUrlHash: value.remoteUrlHash } : {}),
+    ...(typeof value.branchHash === "string" ? { branchHash: value.branchHash } : {}),
+    ...(typeof value.headSha === "string" ? { headSha: value.headSha } : {}),
+  };
+  return git.remoteUrlHash || git.branchHash || git.headSha ? git : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]) {
+  const names = new Set(allowed);
+  return Object.keys(value).every((key) => names.has(key));
+}
+
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const UUID_EXACT_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 function conversationIdFromFilename(file: string) {
   const base = path.basename(file).replace(/\.jsonl$/, "");
@@ -90,37 +221,10 @@ export class RolloutTailer {
     private readonly sessionsDir = path.join(os.homedir(), ".codex", "sessions"),
     private readonly identityProvider: () => LocalIdentity[] = readLocalIdentities,
   ) {
-    // Scan state persists in the ledger: 2,669 historical files (March–June
-    // 2026) existed at first deploy, and re-reading gigabytes on every daemon
-    // restart is not acceptable. file → byte size at last successful parse;
-    // unchanged files skip, grown files re-parse (idempotent ids make that
-    // safe even after a crash mid-file).
-    this.buffer.database.exec(
-      `create table if not exists rollout_scan_state (
-        file text primary key,
-        size integer not null,
-        scanned_at text not null
-      )`,
-    );
+    ensureJsonlScanState(this.buffer.database);
   }
 
   private codexIdentity: LocalIdentity | undefined;
-
-  private parsedSize(file: string): number | undefined {
-    const row = this.buffer.database
-      .prepare(`select size from rollout_scan_state where file = ?`)
-      .get(file) as { size: number } | undefined;
-    return row?.size;
-  }
-
-  private rememberSize(file: string, size: number) {
-    this.buffer.database
-      .prepare(
-        `insert into rollout_scan_state (file, size, scanned_at) values (?, ?, ?)
-         on conflict(file) do update set size = excluded.size, scanned_at = excluded.scanned_at`,
-      )
-      .run(file, size, new Date().toISOString());
-  }
 
   /**
    * Rate-table updates land after events exist (gpt-5.2 carried 12.5M
@@ -175,7 +279,13 @@ export class RolloutTailer {
   async scan(options: { recentOnly?: boolean; now?: Date } = {}): Promise<RolloutScanResult> {
     const result: RolloutScanResult = {
       filesSeen: 0,
+      filesRead: 0,
       filesParsed: 0,
+      filesReset: 0,
+      legacyRebuilds: 0,
+      checkpointRebuilds: 0,
+      bytesRead: 0,
+      bytesDeferred: 0,
       sessionsSkippedOtlpCovered: 0,
       eventsAppended: 0,
       tokensAppended: { input: 0, cachedInput: 0, output: 0 },
@@ -192,15 +302,53 @@ export class RolloutTailer {
     }
     for (const file of this.discover(options)) {
       result.filesSeen += 1;
-      let size: number;
+      let stat: fs.Stats;
       try {
-        size = fs.statSync(file).size;
+        stat = fs.statSync(file);
       } catch {
         continue;
       }
-      if (this.parsedSize(file) === size) continue;
-      this.ingestFile(file, result);
-      this.rememberSize(file, size);
+      const cursor = loadJsonlScanCursor<RolloutParserState>(
+        this.buffer.database,
+        file,
+        PARSER_KIND,
+        CHECKPOINT_VERSION,
+        validateRolloutParserState,
+      );
+      let read: ReturnType<typeof readJsonlTail>;
+      try {
+        read = readJsonlTail(file, stat, cursor);
+      } catch {
+        // Rotation may remove a file between stat and open. One vanished file
+        // must not abort the rest of the discovery set.
+        continue;
+      }
+      if (!read) {
+        result.bytesDeferred += cursor?.deferredBytes ?? 0;
+        continue;
+      }
+      result.filesRead += 1;
+      result.bytesRead += read.bytesRead;
+      result.bytesDeferred += read.deferredBytes;
+      if (read.reset) result.filesReset += 1;
+      if (read.legacyRebuild) result.legacyRebuilds += 1;
+      if (read.checkpointRebuild) result.checkpointRebuilds += 1;
+
+      const initialState = read.reset || !cursor?.parserState
+        ? this.initialParserState(file)
+        : cursor.parserState;
+      const commit = this.buffer.database.transaction(() => {
+        const parserState = this.ingestLines(file, read.lines, result, initialState);
+        rememberJsonlScanCursor(
+          this.buffer.database,
+          file,
+          PARSER_KIND,
+          CHECKPOINT_VERSION,
+          read,
+          parserState,
+        );
+      });
+      commit();
       await new Promise((resolve) => setImmediate(resolve));
     }
     return result;
@@ -253,22 +401,36 @@ export class RolloutTailer {
     return Boolean(row);
   }
 
-  private ingestFile(file: string, result: RolloutScanResult) {
-    let conversationId = conversationIdFromFilename(file);
-    let raw: string;
-    try {
-      raw = fs.readFileSync(file, "utf8");
-    } catch {
-      return;
+  private initialParserState(file: string): RolloutParserState {
+    return {
+      parserKind: PARSER_KIND,
+      checkpointVersion: CHECKPOINT_VERSION,
+      conversationId: conversationIdFromFilename(file),
+      previous: { ...ZERO },
+      tokenCountIndex: -1,
+    };
+  }
+
+  private safeGitContext(cwd: string): PersistedGitContext | undefined {
+    const git = resolveGitContext(cwd);
+    if (git?.remoteUrlHash && git.remoteLabel) {
+      this.buffer.recordRepoLabel(git.remoteUrlHash, git.remoteLabel);
     }
-    let cwd: string | undefined;
-    let sessionStartedAt: string | undefined;
-    let originator: string | undefined;
-    let cliVersion: string | undefined;
-    let model: string | undefined;
-    let planType: string | undefined;
-    let previous = ZERO;
-    let tokenCountIndex = -1;
+    if (!git) return undefined;
+    const safe = {
+      remoteUrlHash: git.remoteUrlHash,
+      branchHash: git.branchHash,
+      headSha: git.headSha,
+    };
+    return safe.remoteUrlHash || safe.branchHash || safe.headSha ? safe : undefined;
+  }
+
+  private ingestLines(
+    file: string,
+    lines: string[],
+    result: RolloutScanResult,
+    state: RolloutParserState,
+  ) {
     const pending: Array<{
       index: number;
       observedAt: string | undefined;
@@ -276,7 +438,7 @@ export class RolloutTailer {
       model: string | undefined;
     }> = [];
 
-    for (const line of raw.split("\n")) {
+    for (const line of lines) {
       // Privacy prefilter: message/reasoning lines are never JSON-parsed.
       const isMeta = line.includes('"session_meta"');
       const isTurn = line.includes('"turn_context"');
@@ -293,46 +455,42 @@ export class RolloutTailer {
       const payload = (parsed.payload ?? {}) as Record<string, unknown>;
       if (type === "session_meta") {
         if (typeof payload.id === "string" && UUID_RE.test(payload.id)) {
-          conversationId = payload.id.toLowerCase();
+          state.conversationId = payload.id.toLowerCase();
         }
-        if (typeof parsed.timestamp === "string") sessionStartedAt = parsed.timestamp;
-        else if (typeof payload.timestamp === "string") sessionStartedAt = payload.timestamp as string;
-        if (typeof payload.cwd === "string") cwd = payload.cwd;
-        if (typeof payload.originator === "string") originator = payload.originator;
-        if (typeof payload.cli_version === "string") cliVersion = payload.cli_version;
+        if (typeof parsed.timestamp === "string") state.sessionStartedAt = parsed.timestamp;
+        else if (typeof payload.timestamp === "string") state.sessionStartedAt = payload.timestamp as string;
+        if (typeof payload.cwd === "string") state.git = this.safeGitContext(payload.cwd);
+        if (typeof payload.originator === "string") state.originator = payload.originator;
+        if (typeof payload.cli_version === "string") state.cliVersion = payload.cli_version;
       } else if (type === "turn_context") {
-        if (typeof payload.model === "string" && payload.model) model = payload.model;
-        if (typeof payload.cwd === "string") cwd = payload.cwd;
+        if (typeof payload.model === "string" && payload.model) state.model = payload.model;
+        if (typeof payload.cwd === "string") state.git = this.safeGitContext(payload.cwd);
       } else if (type === "event_msg" && payload.type === "token_count") {
-        tokenCountIndex += 1;
+        state.tokenCountIndex += 1;
         const info = (payload.info ?? {}) as Record<string, unknown>;
         const totals = totalsFrom(info.total_token_usage as Record<string, unknown> | undefined);
         if (!totals) continue;
         const rateLimits = (payload.rate_limits ?? {}) as Record<string, unknown>;
-        if (typeof rateLimits.plan_type === "string") planType = rateLimits.plan_type;
-        const delta = diff(totals, previous);
-        previous = totals;
+        if (typeof rateLimits.plan_type === "string") state.planType = rateLimits.plan_type;
+        const delta = diff(totals, state.previous);
+        state.previous = totals;
         if (delta.input === 0 && delta.output === 0) continue; // periodic no-op emission
         pending.push({
-          index: tokenCountIndex,
+          index: state.tokenCountIndex,
           observedAt: typeof parsed.timestamp === "string" ? parsed.timestamp : undefined,
           delta,
-          model,
+          model: state.model,
         });
       }
     }
 
-    if (!conversationId || pending.length === 0) return;
-    if (this.sessionHasNonRolloutTokens(conversationId)) {
+    if (!state.conversationId || pending.length === 0) return state;
+    if (this.sessionHasNonRolloutTokens(state.conversationId)) {
       result.sessionsSkippedOtlpCovered += 1;
-      return;
+      return state;
     }
     result.filesParsed += 1;
 
-    const git = cwd ? resolveGitContext(cwd) : undefined;
-    if (git?.remoteUrlHash && git.remoteLabel) {
-      this.buffer.recordRepoLabel(git.remoteUrlHash, git.remoteLabel); // local-only table
-    }
     // Identity window: only sessions that started at/after the current
     // login's last_refresh provably ran under this account. History stays
     // unattributed rather than guessed (issue 0028).
@@ -340,8 +498,8 @@ export class RolloutTailer {
     const actorId =
       identity?.actorHash &&
       identity.validFrom &&
-      sessionStartedAt &&
-      Date.parse(sessionStartedAt) >= Date.parse(identity.validFrom)
+      state.sessionStartedAt &&
+      Date.parse(state.sessionStartedAt) >= Date.parse(identity.validFrom)
         ? identity.actorHash
         : undefined;
     const fallbackObservedAt = (() => {
@@ -364,30 +522,30 @@ export class RolloutTailer {
         rolloutFile: path.basename(file),
         turnIndex: entry.index,
       };
-      if (originator) metadata.originator = originator;
-      if (cliVersion) metadata.cliVersion = cliVersion;
-      if (planType) metadata.planType = planType;
+      if (state.originator) metadata.originator = state.originator;
+      if (state.cliVersion) metadata.cliVersion = state.cliVersion;
+      if (state.planType) metadata.planType = state.planType;
       if (entry.delta.reasoningOutput > 0) metadata.reasoningOutputTokens = entry.delta.reasoningOutput;
       if (priced) metadata.costEstimated = true;
       // Hashed linkage keys ONLY — GitLinkageContext.remoteLabel is local
       // display data and must never enter event metadata (upload-proofed).
-      if (git) {
+      if (state.git) {
         metadata.git = {
-          remoteUrlHash: git.remoteUrlHash,
-          branchHash: git.branchHash,
-          headSha: git.headSha,
+          remoteUrlHash: state.git.remoteUrlHash,
+          branchHash: state.git.branchHash,
+          headSha: state.git.headSha,
         };
       }
 
       const event: AiInteractionEvent = aiInteractionEventSchema.parse({
-        id: deterministicEventId(["codex-rollout", conversationId, String(entry.index)]),
+        id: deterministicEventId(["codex-rollout", state.conversationId, String(entry.index)]),
         tenantId: "local",
         source: "codex",
         dataMode: "metadata",
         eventType: "usage_rollout",
         observedAt: entry.observedAt ?? fallbackObservedAt,
         actorId,
-        sessionId: conversationId,
+        sessionId: state.conversationId,
         model: entry.model,
         actionClass: "other",
         inputTokens: entry.delta.input,
@@ -402,6 +560,7 @@ export class RolloutTailer {
       result.tokensAppended.cachedInput += entry.delta.cachedInput;
       result.tokensAppended.output += entry.delta.output;
     }
+    return state;
   }
 }
 

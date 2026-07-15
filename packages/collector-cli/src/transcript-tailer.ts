@@ -4,6 +4,12 @@ import path from "node:path";
 
 import type { LocalEventBuffer } from "./buffer";
 import { resolveGitContext } from "./git-context";
+import {
+  ensureJsonlScanState,
+  loadJsonlScanCursor,
+  readJsonlTail,
+  rememberJsonlScanCursor,
+} from "./jsonl-byte-tailer";
 import { deterministicEventId } from "./normalizer";
 import {
   aiInteractionEventSchema,
@@ -36,7 +42,13 @@ import {
 
 export type TranscriptScanResult = {
   filesSeen: number;
+  filesRead: number;
   filesParsed: number;
+  filesReset: number;
+  legacyRebuilds: number;
+  checkpointRebuilds: number;
+  bytesRead: number;
+  bytesDeferred: number;
   sessionsSkippedLiveCovered: number;
   eventsAppended: number;
   tokensAppended: { input: number; cacheRead: number; output: number };
@@ -44,35 +56,74 @@ export type TranscriptScanResult = {
 };
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+const UUID_EXACT_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+type PersistedGitContext = {
+  remoteUrlHash?: string;
+  branchHash?: string;
+  headSha?: string;
+};
+
+type TranscriptParserState = {
+  parserKind: "claude-transcript-v2";
+  checkpointVersion: 2;
+  sessionId?: string;
+  git?: PersistedGitContext;
+};
+
+const PARSER_KIND = "claude-transcript-v2";
+const CHECKPOINT_VERSION = 2;
+
+function validateTranscriptParserState(value: unknown): TranscriptParserState | undefined {
+  if (!isRecord(value)) return undefined;
+  if (!hasOnlyKeys(value, ["parserKind", "checkpointVersion", "sessionId", "git"])) {
+    return undefined;
+  }
+  if (value.parserKind !== PARSER_KIND || value.checkpointVersion !== CHECKPOINT_VERSION) {
+    return undefined;
+  }
+  if (value.sessionId !== undefined) {
+    if (typeof value.sessionId !== "string" || !UUID_EXACT_RE.test(value.sessionId)) return undefined;
+  }
+  const git = validatePersistedGit(value.git);
+  if (value.git !== undefined && !git) return undefined;
+  return {
+    parserKind: PARSER_KIND,
+    checkpointVersion: CHECKPOINT_VERSION,
+    ...(value.sessionId ? { sessionId: value.sessionId.toLowerCase() } : {}),
+    ...(git ? { git } : {}),
+  };
+}
+
+function validatePersistedGit(value: unknown): PersistedGitContext | undefined {
+  if (!isRecord(value)) return undefined;
+  if (!hasOnlyKeys(value, ["remoteUrlHash", "branchHash", "headSha"])) return undefined;
+  for (const key of ["remoteUrlHash", "branchHash", "headSha"] as const) {
+    if (value[key] !== undefined && typeof value[key] !== "string") return undefined;
+  }
+  const git = {
+    ...(typeof value.remoteUrlHash === "string" ? { remoteUrlHash: value.remoteUrlHash } : {}),
+    ...(typeof value.branchHash === "string" ? { branchHash: value.branchHash } : {}),
+    ...(typeof value.headSha === "string" ? { headSha: value.headSha } : {}),
+  };
+  return git.remoteUrlHash || git.branchHash || git.headSha ? git : undefined;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function hasOnlyKeys(value: Record<string, unknown>, allowed: readonly string[]) {
+  const names = new Set(allowed);
+  return Object.keys(value).every((key) => names.has(key));
+}
 
 export class TranscriptTailer {
   constructor(
     private readonly buffer: LocalEventBuffer,
     private readonly projectsDir = path.join(os.homedir(), ".claude", "projects"),
   ) {
-    this.buffer.database.exec(
-      `create table if not exists rollout_scan_state (
-        file text primary key,
-        size integer not null,
-        scanned_at text not null
-      )`,
-    );
-  }
-
-  private parsedSize(file: string): number | undefined {
-    const row = this.buffer.database
-      .prepare(`select size from rollout_scan_state where file = ?`)
-      .get(file) as { size: number } | undefined;
-    return row?.size;
-  }
-
-  private rememberSize(file: string, size: number) {
-    this.buffer.database
-      .prepare(
-        `insert into rollout_scan_state (file, size, scanned_at) values (?, ?, ?)
-         on conflict(file) do update set size = excluded.size, scanned_at = excluded.scanned_at`,
-      )
-      .run(file, size, new Date().toISOString());
+    ensureJsonlScanState(this.buffer.database);
   }
 
   private sessionHasLiveTokens(sessionId: string) {
@@ -91,7 +142,13 @@ export class TranscriptTailer {
   async scan(options: { recentOnly?: boolean; now?: Date } = {}): Promise<TranscriptScanResult> {
     const result: TranscriptScanResult = {
       filesSeen: 0,
+      filesRead: 0,
       filesParsed: 0,
+      filesReset: 0,
+      legacyRebuilds: 0,
+      checkpointRebuilds: 0,
+      bytesRead: 0,
+      bytesDeferred: 0,
       sessionsSkippedLiveCovered: 0,
       eventsAppended: 0,
       tokensAppended: { input: 0, cacheRead: 0, output: 0 },
@@ -108,9 +165,47 @@ export class TranscriptTailer {
         continue;
       }
       if (options.recentOnly && stat.mtime.getTime() < recentCutoff) continue;
-      if (this.parsedSize(file) === stat.size) continue;
-      this.ingestFile(file, result);
-      this.rememberSize(file, stat.size);
+      const cursor = loadJsonlScanCursor<TranscriptParserState>(
+        this.buffer.database,
+        file,
+        PARSER_KIND,
+        CHECKPOINT_VERSION,
+        validateTranscriptParserState,
+      );
+      let read: ReturnType<typeof readJsonlTail>;
+      try {
+        read = readJsonlTail(file, stat, cursor);
+      } catch {
+        // Rotation may remove a file between stat and open. One vanished file
+        // must not abort the rest of the discovery set.
+        continue;
+      }
+      if (!read) {
+        result.bytesDeferred += cursor?.deferredBytes ?? 0;
+        continue;
+      }
+      result.filesRead += 1;
+      result.bytesRead += read.bytesRead;
+      result.bytesDeferred += read.deferredBytes;
+      if (read.reset) result.filesReset += 1;
+      if (read.legacyRebuild) result.legacyRebuilds += 1;
+      if (read.checkpointRebuild) result.checkpointRebuilds += 1;
+
+      const initialState = read.reset || !cursor?.parserState
+        ? this.initialParserState(file)
+        : cursor.parserState;
+      const commit = this.buffer.database.transaction(() => {
+        const parserState = this.ingestLines(file, read.lines, result, initialState);
+        rememberJsonlScanCursor(
+          this.buffer.database,
+          file,
+          PARSER_KIND,
+          CHECKPOINT_VERSION,
+          read,
+          parserState,
+        );
+      });
+      commit();
       await new Promise((resolve) => setImmediate(resolve));
     }
     return result;
@@ -138,22 +233,41 @@ export class TranscriptTailer {
     return files.sort();
   }
 
-  private ingestFile(file: string, result: TranscriptScanResult) {
-    let raw: string;
-    try {
-      raw = fs.readFileSync(file, "utf8");
-    } catch {
-      return;
+  private initialParserState(file: string): TranscriptParserState {
+    return {
+      parserKind: PARSER_KIND,
+      checkpointVersion: CHECKPOINT_VERSION,
+      sessionId: path.basename(file).replace(/\.jsonl$/, "").match(UUID_RE)?.[0]?.toLowerCase(),
+    };
+  }
+
+  private safeGitContext(cwd: string): PersistedGitContext | undefined {
+    const git = resolveGitContext(cwd);
+    if (git?.remoteUrlHash && git.remoteLabel) {
+      this.buffer.recordRepoLabel(git.remoteUrlHash, git.remoteLabel);
     }
-    let sessionId = path.basename(file).replace(/\.jsonl$/, "").match(UUID_RE)?.[0]?.toLowerCase();
-    let cwd: string | undefined;
+    if (!git) return undefined;
+    const safe = {
+      remoteUrlHash: git.remoteUrlHash,
+      branchHash: git.branchHash,
+      headSha: git.headSha,
+    };
+    return safe.remoteUrlHash || safe.branchHash || safe.headSha ? safe : undefined;
+  }
+
+  private ingestLines(
+    file: string,
+    lines: string[],
+    result: TranscriptScanResult,
+    state: TranscriptParserState,
+  ) {
     // message id → usage snapshot (last wins: streamed/retried entries repeat ids)
     const usageById = new Map<
       string,
       { observedAt?: string; model?: string; input: number; cacheRead: number; cacheCreation: number; output: number }
     >();
 
-    for (const line of raw.split("\n")) {
+    for (const line of lines) {
       // Prefilter: only assistant entries with usage are ever parsed.
       if (!line.includes('"assistant"') || !line.includes('"usage"')) continue;
       let parsed: Record<string, unknown>;
@@ -164,10 +278,10 @@ export class TranscriptTailer {
         continue;
       }
       if (parsed.type !== "assistant") continue;
-      if (!sessionId && typeof parsed.sessionId === "string") {
-        sessionId = parsed.sessionId.match(UUID_RE)?.[0]?.toLowerCase();
+      if (!state.sessionId && typeof parsed.sessionId === "string") {
+        state.sessionId = parsed.sessionId.match(UUID_RE)?.[0]?.toLowerCase();
       }
-      if (!cwd && typeof parsed.cwd === "string") cwd = parsed.cwd;
+      if (typeof parsed.cwd === "string") state.git = this.safeGitContext(parsed.cwd);
       const message = (parsed.message ?? {}) as Record<string, unknown>;
       const usage = (message.usage ?? {}) as Record<string, unknown>;
       const messageId = typeof message.id === "string" ? message.id : undefined;
@@ -186,17 +300,13 @@ export class TranscriptTailer {
       });
     }
 
-    if (!sessionId || usageById.size === 0) return;
-    if (this.sessionHasLiveTokens(sessionId)) {
+    if (!state.sessionId || usageById.size === 0) return state;
+    if (this.sessionHasLiveTokens(state.sessionId)) {
       result.sessionsSkippedLiveCovered += 1;
-      return;
+      return state;
     }
     result.filesParsed += 1;
 
-    const git = cwd ? resolveGitContext(cwd) : undefined;
-    if (git?.remoteUrlHash && git.remoteLabel) {
-      this.buffer.recordRepoLabel(git.remoteUrlHash, git.remoteLabel); // local-only
-    }
     const fallbackObservedAt = (() => {
       try {
         return fs.statSync(file).mtime.toISOString();
@@ -219,21 +329,21 @@ export class TranscriptTailer {
         transcriptFile: path.basename(file),
       };
       if (priced) metadata.costEstimated = true;
-      if (git) {
+      if (state.git) {
         metadata.git = {
-          remoteUrlHash: git.remoteUrlHash,
-          branchHash: git.branchHash,
-          headSha: git.headSha,
+          remoteUrlHash: state.git.remoteUrlHash,
+          branchHash: state.git.branchHash,
+          headSha: state.git.headSha,
         };
       }
       const event: AiInteractionEvent = aiInteractionEventSchema.parse({
-        id: deterministicEventId(["claude-transcript", sessionId, messageId]),
+        id: deterministicEventId(["claude-transcript", state.sessionId, messageId]),
         tenantId: "local",
         source: "claude_code",
         dataMode: "metadata",
         eventType: "usage_transcript",
         observedAt: entry.observedAt ?? fallbackObservedAt,
-        sessionId,
+        sessionId: state.sessionId,
         model: entry.model,
         actionClass: "other",
         inputTokens: entry.input,
@@ -249,5 +359,6 @@ export class TranscriptTailer {
       result.tokensAppended.cacheRead += entry.cacheRead;
       result.tokensAppended.output += entry.output;
     }
+    return state;
   }
 }
