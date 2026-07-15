@@ -56,6 +56,13 @@ export type RolloutScanResult = {
   eventsAppended: number;
   tokensAppended: { input: number; cachedInput: number; output: number };
   parseErrors: number;
+  activity: {
+    lastActivityAt: string | null;
+    filesToday: number;
+    discoveryEntries: number;
+    lastScanAt: string;
+    truncated: boolean;
+  };
 };
 
 type TokenTotals = { input: number; cachedInput: number; output: number; reasoningOutput: number };
@@ -233,6 +240,8 @@ export class RolloutTailer {
    * freeze, sounding 0026).
    */
   async scan(options: { recentOnly?: boolean; now?: Date } = {}): Promise<RolloutScanResult> {
+    const scanNow = options.now ?? new Date();
+    const today = scanNow.toISOString().slice(0, 10);
     const result: RolloutScanResult = {
       filesSeen: 0,
       filesRead: 0,
@@ -246,6 +255,13 @@ export class RolloutTailer {
       eventsAppended: 0,
       tokensAppended: { input: 0, cachedInput: 0, output: 0 },
       parseErrors: 0,
+      activity: {
+        lastActivityAt: null,
+        filesToday: 0,
+        discoveryEntries: 0,
+        lastScanAt: scanNow.toISOString(),
+        truncated: false,
+      },
     };
     try {
       this.codexIdentity = this.identityProvider().find((entry) => entry.source === "codex");
@@ -257,12 +273,18 @@ export class RolloutTailer {
     }
     for (const file of this.discover(options)) {
       result.filesSeen += 1;
+      result.activity.discoveryEntries += 1;
       let stat: fs.Stats;
       try {
         stat = fs.statSync(file);
       } catch {
         continue;
       }
+      const mtime = stat.mtime.toISOString();
+      if (!result.activity.lastActivityAt || mtime > result.activity.lastActivityAt) {
+        result.activity.lastActivityAt = mtime;
+      }
+      if (mtime.slice(0, 10) === today) result.activity.filesToday += 1;
       const cursor = loadJsonlScanCursor<RolloutParserState>(
         this.buffer.database,
         file,

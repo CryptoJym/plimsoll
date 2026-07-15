@@ -24,7 +24,6 @@ import {
   launchctlBootstrapCommand,
   uninstallLaunchAgent,
 } from "./launch-agent";
-import { computeCaptureHealth } from "./health";
 import { performJoin } from "./join";
 import { RolloutTailer } from "./rollout-tailer";
 import { TranscriptTailer } from "./transcript-tailer";
@@ -317,7 +316,7 @@ async function main() {
             JSON.stringify({
               status: "synced",
               uploadedEvents: uploaded,
-              remainingUnuploaded: buffer.stats().unuploadedCount,
+              remainingUnuploaded: buffer.delivery.status().remainingDelivery,
               remainingDelivery: buffer.delivery.status().remainingDelivery,
             }),
           );
@@ -549,6 +548,8 @@ async function main() {
   if (command === "status") {
     const buffer = openBuffer(config);
     const bufferPath = collectorBufferPath();
+    const projected = buffer.projection.readSnapshot(30, config.subscriptions);
+    const projectedStatus = projected.kind === "ready" ? projected.snapshot.status : null;
     console.log(
       JSON.stringify(
         {
@@ -561,10 +562,15 @@ async function main() {
           retentionDays: config.retentionDays,
           syncConfigured: Boolean(config.uploadUrl),
           reconciliation: codexReconciliationStatus(buffer.database),
-          stats: buffer.stats(),
+          stats: projectedStatus?.stats ?? null,
           delivery: buffer.delivery.status(),
-          tokenCoverageLast7d: buffer.tokenCoverage(7),
-          captureHealth: computeCaptureHealth(buffer.database),
+          projection: buffer.projection.status(),
+          captureHealth: projectedStatus?.health ?? {
+            generatedAt: new Date().toISOString(),
+            overall: "amber",
+            sources: [],
+            reason: "projection backfill has not published a coherent health snapshot",
+          },
         },
         null,
         2,
@@ -754,9 +760,12 @@ async function main() {
           retentionDays: config.retentionDays,
           syncConfigured: Boolean(config.uploadUrl),
           uploadSigningConfigured: Boolean(config.uploadSigningSecret),
-          sqlite: buffer.stats(),
+          sqlite: (() => {
+            const projected = buffer.projection.readSnapshot(30, config.subscriptions);
+            return projected.kind === "ready" ? projected.snapshot.status.stats : null;
+          })(),
           delivery: buffer.delivery.status(),
-          tokenCoverageLast7d: buffer.tokenCoverage(7),
+          projection: buffer.projection.status(),
           invasivePermissionsRequested: {
             screenRecording: false,
             accessibilityKeyboard: false,
@@ -820,7 +829,8 @@ async function main() {
           uploadedEvents,
           batches,
           markedUploaded: markUploaded,
-          remainingUnuploaded: lastResult?.remainingUnuploaded ?? buffer.stats().unuploadedCount,
+          remainingUnuploaded:
+            lastResult?.remainingUnuploaded ?? buffer.delivery.status().remainingDelivery,
           remainingDelivery:
             lastResult?.remainingDelivery ?? buffer.delivery.status().remainingDelivery,
           signedUpload: lastResult?.signedUpload ?? false,

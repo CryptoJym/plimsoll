@@ -9,17 +9,7 @@ import { appendForwardedHook } from "./forwarder";
 import { explodeOtlpPayload } from "./otlp";
 import { remoteLinkageHash, normalizeGitRemote } from "../../shared/src/index";
 import { saveCollectorConfig } from "./config";
-import { computeCaptureHealth, type CaptureHealth } from "./health";
 import { readLocalIdentities } from "./local-identity";
-import {
-  dashboardAccounts,
-  dashboardRepoDetail,
-  dashboardRepos,
-  dashboardReposWithTail,
-  dashboardSessionDetail,
-  dashboardSessions,
-  dashboardSummary,
-} from "./dashboard-api";
 import type { CollectorRuntimeIdentity } from "./runtime-ownership";
 import { codexReconciliationStatus } from "./codex-reconciliation";
 
@@ -29,8 +19,13 @@ function loadDashboardHtml() {
   return dashboardHtml;
 }
 
-function sendJson(response: http.ServerResponse, body: unknown, status = 200) {
-  response.writeHead(status, { "content-type": "application/json" });
+function sendJson(
+  response: http.ServerResponse,
+  body: unknown,
+  status = 200,
+  headers: Record<string, string> = {},
+) {
+  response.writeHead(status, { "content-type": "application/json", ...headers });
   response.end(JSON.stringify(body));
 }
 
@@ -106,30 +101,69 @@ export function createCollectorServer(
     maintenanceStatus?: () => unknown;
   } = {},
 ) {
-  // Capture health walks local transcript/rollout dirs — memoize per minute so
-  // the 30s dashboard refresh doesn't re-scan the filesystem every tick.
-  let healthCache: { at: number; value: CaptureHealth } | null = null;
+  const snapshotResponse = (days: number) => {
+    const read = buffer.projection.readSnapshot(days, config.subscriptions);
+    if (read.kind !== "ready") return read;
+    const delivery = buffer.delivery.status();
+    const maintenance = options.maintenanceStatus?.() ?? null;
+    const status = read.snapshot.status as Record<string, unknown>;
+    const stats = (status.stats ?? {}) as Record<string, unknown>;
+    stats.unuploadedCount = delivery.remainingDelivery;
+    Object.assign(status, {
+      ok: true,
+      runtimeIdentity: options.runtimeIdentity ?? null,
+      dataMode: config.policy.dataMode,
+      retentionDays: config.retentionDays,
+      stats,
+      otlpAdmission: {
+        counterLifetime: "durable",
+        dropped: buffer.otlpAdmissionCounters(),
+      },
+      delivery,
+      reconciliation: codexReconciliationStatus(buffer.database),
+      maintenance,
+    });
+    const maintenanceRun =
+      maintenance && typeof maintenance === "object" && "runCount" in maintenance
+        ? Number((maintenance as { runCount?: number }).runCount ?? 0)
+        : 0;
+    return {
+      ...read,
+      etagSeed: `${days}-${read.etagSeed}-${delivery.remainingDelivery}-${delivery.receipts.dead}-${maintenanceRun}`,
+    };
+  };
+
   return http.createServer(async (request, response) => {
     try {
       if (request.method === "GET" && request.url === "/status") {
-        if (!healthCache || Date.now() - healthCache.at > 60_000) {
-          healthCache = { at: Date.now(), value: computeCaptureHealth(buffer.database) };
+        const read = snapshotResponse(30);
+        if (read.kind === "ready") {
+          sendJson(response, read.snapshot.status, 200, {
+            "x-plimsoll-projection-generation": String(read.snapshot.generation),
+          });
+        } else {
+          sendJson(response, {
+            ok: true,
+            runtimeIdentity: options.runtimeIdentity ?? null,
+            dataMode: config.policy.dataMode,
+            retentionDays: config.retentionDays,
+            stats: null,
+            delivery: buffer.delivery.status(),
+            reconciliation: codexReconciliationStatus(buffer.database),
+            maintenance: options.maintenanceStatus?.() ?? null,
+            projection: read.kind === "backfilling" ? read.status : {
+              ready: false,
+              degraded: true,
+              degradedReason: "unsupported_projection_window",
+            },
+            health: {
+              generatedAt: new Date().toISOString(),
+              overall: "amber",
+              sources: [],
+              reason: "projection backfill has not published a coherent health snapshot",
+            },
+          });
         }
-        sendJson(response, {
-          ok: true,
-          runtimeIdentity: options.runtimeIdentity ?? null,
-          dataMode: config.policy.dataMode,
-          retentionDays: config.retentionDays,
-          stats: buffer.stats(),
-          otlpAdmission: {
-            counterLifetime: "durable",
-            dropped: buffer.otlpAdmissionCounters(),
-          },
-          delivery: buffer.delivery.status(),
-          reconciliation: codexReconciliationStatus(buffer.database),
-          maintenance: options.maintenanceStatus?.() ?? null,
-          health: healthCache.value,
-        });
         return;
       }
 
@@ -171,25 +205,60 @@ export function createCollectorServer(
           });
           return;
         }
+        if (url.pathname === "/api/snapshot") {
+          const read = snapshotResponse(days);
+          if (read.kind === "unsupported") {
+            sendJson(response, { error: "unsupported_projection_window", supportedDays: read.supportedDays }, 400);
+            return;
+          }
+          if (read.kind === "backfilling") {
+            sendJson(response, { error: "projection_backfilling", projection: read.status }, 202);
+            return;
+          }
+          const etag = `W/\"plimsoll-${read.etagSeed}\"`;
+          if (request.headers["if-none-match"] === etag) {
+            response.writeHead(304, { etag });
+            response.end();
+            return;
+          }
+          sendJson(response, read.snapshot, 200, {
+            etag,
+            "cache-control": "private, no-cache",
+            "x-plimsoll-projection-generation": String(read.snapshot.generation),
+          });
+          return;
+        }
+        const compatible = snapshotResponse(days);
+        if (compatible.kind === "unsupported") {
+          sendJson(response, { error: "unsupported_projection_window", supportedDays: compatible.supportedDays }, 400);
+          return;
+        }
+        if (compatible.kind === "backfilling") {
+          sendJson(response, { error: "projection_backfilling", projection: compatible.status }, 202);
+          return;
+        }
+        const generationHeader = {
+          "x-plimsoll-projection-generation": String(compatible.snapshot.generation),
+        };
         if (url.pathname === "/api/summary") {
-          sendJson(response, dashboardSummary(buffer.database, days));
+          sendJson(response, compatible.snapshot.summary, 200, generationHeader);
           return;
         }
         if (url.pathname === "/api/sessions") {
-          sendJson(response, dashboardSessions(buffer.database, days));
+          sendJson(response, compatible.snapshot.sessions, 200, generationHeader);
           return;
         }
         if (url.pathname === "/api/repos") {
-          sendJson(response, dashboardReposWithTail(buffer.database, days));
+          sendJson(response, compatible.snapshot.repos, 200, generationHeader);
           return;
         }
         if (url.pathname === "/api/accounts") {
-          sendJson(response, dashboardAccounts(buffer.database, config.subscriptions, days));
+          sendJson(response, compatible.snapshot.accounts, 200, generationHeader);
           return;
         }
         if (url.pathname === "/api/repo") {
           const hash = url.searchParams.get("hash");
-          const detail = hash ? dashboardRepoDetail(buffer.database, hash, days) : null;
+          const detail = hash ? buffer.projection.repoDetail(hash, days) : null;
           if (!detail) {
             sendJson(response, { error: "repo_not_found" }, 404);
             return;
@@ -199,7 +268,7 @@ export function createCollectorServer(
         }
         if (url.pathname === "/api/session") {
           const id = url.searchParams.get("id");
-          const detail = id ? dashboardSessionDetail(buffer.database, id) : null;
+          const detail = id ? buffer.projection.sessionDetail(id) : null;
           if (!detail) {
             sendJson(response, { error: "session_not_found" }, 404);
             return;
@@ -307,6 +376,7 @@ export function createCollectorServer(
               subscriptions: parsed.subscriptions as CollectorConfig["subscriptions"],
             });
             config.subscriptions = updated.subscriptions;
+            buffer.projection.invalidatePresentation();
             sendJson(response, { ok: true, subscriptions: updated.subscriptions });
           } catch (error) {
             sendJson(

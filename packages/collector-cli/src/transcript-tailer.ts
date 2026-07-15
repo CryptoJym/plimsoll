@@ -53,6 +53,13 @@ export type TranscriptScanResult = {
   eventsAppended: number;
   tokensAppended: { input: number; cacheRead: number; output: number };
   parseErrors: number;
+  activity: {
+    lastActivityAt: string | null;
+    filesToday: number;
+    discoveryEntries: number;
+    lastScanAt: string;
+    truncated: boolean;
+  };
 };
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
@@ -140,6 +147,8 @@ export class TranscriptTailer {
   }
 
   async scan(options: { recentOnly?: boolean; now?: Date } = {}): Promise<TranscriptScanResult> {
+    const scanNow = options.now ?? new Date();
+    const today = scanNow.toISOString().slice(0, 10);
     const result: TranscriptScanResult = {
       filesSeen: 0,
       filesRead: 0,
@@ -153,17 +162,30 @@ export class TranscriptTailer {
       eventsAppended: 0,
       tokensAppended: { input: 0, cacheRead: 0, output: 0 },
       parseErrors: 0,
+      activity: {
+        lastActivityAt: null,
+        filesToday: 0,
+        discoveryEntries: 0,
+        lastScanAt: scanNow.toISOString(),
+        truncated: false,
+      },
     };
-    const now = options.now ?? new Date();
+    const now = scanNow;
     const recentCutoff = now.getTime() - 48 * 60 * 60 * 1000;
     for (const file of this.discover()) {
       result.filesSeen += 1;
+      result.activity.discoveryEntries += 1;
       let stat: fs.Stats;
       try {
         stat = fs.statSync(file);
       } catch {
         continue;
       }
+      const mtime = stat.mtime.toISOString();
+      if (!result.activity.lastActivityAt || mtime > result.activity.lastActivityAt) {
+        result.activity.lastActivityAt = mtime;
+      }
+      if (mtime.slice(0, 10) === today) result.activity.filesToday += 1;
       if (options.recentOnly && stat.mtime.getTime() < recentCutoff) continue;
       const cursor = loadJsonlScanCursor<TranscriptParserState>(
         this.buffer.database,

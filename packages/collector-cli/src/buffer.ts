@@ -7,6 +7,7 @@ import type { MetricSample } from "./otlp";
 import type { OtlpAdmissionDrop, OtlpDropReason } from "./otlp-admission";
 import { ensureCodexReconciliationSchema } from "./codex-reconciliation";
 import { DeliveryOutbox, type DeliveryLimits } from "./outbox";
+import { DashboardProjectionStore } from "./dashboard-projection";
 
 export type BufferedEventRow = {
   id: string;
@@ -73,6 +74,7 @@ const EVENT_COLUMNS = [
 export class LocalEventBuffer {
   private readonly db: Database.Database;
   readonly delivery: DeliveryOutbox;
+  readonly projection: DashboardProjectionStore;
 
   constructor(
     path: string,
@@ -82,6 +84,9 @@ export class LocalEventBuffer {
   ) {
     this.db = new Database(path);
     this.db.pragma("journal_mode = WAL");
+    const newLedger = !this.db
+      .prepare(`select 1 from sqlite_master where type='table' and name='buffered_events'`)
+      .get();
     this.db.exec(`
       create table if not exists buffered_events (
         id text primary key,
@@ -263,6 +268,7 @@ export class LocalEventBuffer {
       end;
     `);
     ensureCodexReconciliationSchema(this.db);
+    this.projection = new DashboardProjectionStore(this.db, { newLedger });
   }
 
   private migrateEventColumns() {
@@ -340,6 +346,10 @@ export class LocalEventBuffer {
         branchHash: gitField(event, "branchHash"),
       });
       if (event.actorId) this.seedAccountLabel(event.actorId);
+      // The raw row, privacy-safe fact delta, and delivery envelope share the
+      // caller's SQLite transaction. Projection failure is contained as a
+      // durable repair receipt so capture remains available.
+      this.projection.tryApplyRawRow(Number(result.lastInsertRowid));
       return true;
     }
     // Deterministic replay never rewrites the evidence row or resets its
@@ -427,10 +437,13 @@ export class LocalEventBuffer {
         `insert or replace into priority_repos (repo_hash, url, added_at) values (?, ?, ?)`,
       )
       .run(repoHash, url, new Date().toISOString());
+    this.projection.markSnapshotDirty();
   }
 
   removePriorityRepo(repoHash: string) {
-    return this.db.prepare(`delete from priority_repos where repo_hash = ?`).run(repoHash).changes;
+    const changes = this.db.prepare(`delete from priority_repos where repo_hash = ?`).run(repoHash).changes;
+    if (changes) this.projection.markSnapshotDirty();
+    return changes;
   }
 
   listPriorityRepos() {
@@ -454,6 +467,7 @@ export class LocalEventBuffer {
          on conflict(account_hash) do update set email = @email`,
       )
       .run({ accountHash, email: trimmed || null, now: new Date().toISOString() });
+    this.projection.invalidatePresentation();
   }
 
   /** Local-only display mapping; never included in upload batches. */
@@ -465,6 +479,7 @@ export class LocalEventBuffer {
          on conflict(account_hash) do update set label = @label, auto_seeded = 0`,
       )
       .run({ accountHash, label, now: new Date().toISOString() });
+    this.projection.invalidatePresentation();
   }
 
   /**
@@ -498,10 +513,17 @@ export class LocalEventBuffer {
     this.db
       .prepare(`update account_aliases set canonical_hash = ? where canonical_hash = ?`)
       .run(target, aliasHash);
+    this.projection.queueAccountInvalidation(aliasHash);
+    this.projection.queueAccountInvalidation(target);
   }
 
   removeAccountAlias(aliasHash: string) {
+    const previous = this.db
+      .prepare(`select canonical_hash as canonicalHash from account_aliases where alias_hash = ?`)
+      .get(aliasHash) as { canonicalHash: string } | undefined;
     this.db.prepare(`delete from account_aliases where alias_hash = ?`).run(aliasHash);
+    this.projection.queueAccountInvalidation(aliasHash);
+    if (previous) this.projection.queueAccountInvalidation(previous.canonicalHash);
   }
 
   listAccountAliases() {
@@ -523,15 +545,20 @@ export class LocalEventBuffer {
          on conflict(repo_hash) do update set label = @label, last_seen = @now`,
       )
       .run({ repoHash, label, now });
+    this.projection.invalidatePresentation();
   }
 
   appendMetricSample(sample: MetricSample) {
     this.db
       .prepare(
-        `insert or replace into metric_samples
+        `insert into metric_samples
           (id, source, metric_name, observed_at, session_id, model, sample_type, value, attrs_json, created_at)
         values
-          (@id, @source, @metricName, @observedAt, @sessionId, @model, @sampleType, @value, @attrsJson, @createdAt)`,
+          (@id, @source, @metricName, @observedAt, @sessionId, @model, @sampleType, @value, @attrsJson, @createdAt)
+        on conflict(id) do update set source=excluded.source,metric_name=excluded.metric_name,
+          observed_at=excluded.observed_at,session_id=excluded.session_id,model=excluded.model,
+          sample_type=excluded.sample_type,value=excluded.value,attrs_json=excluded.attrs_json,
+          created_at=excluded.created_at`,
       )
       .run({
         id: sample.id,
@@ -641,9 +668,14 @@ export class LocalEventBuffer {
     // evidence never expires independently. `/status.delivery.retention`
     // names this honestly as compatibility_uploaded_only rather than claiming
     // a raw TTL the current analytics path cannot yet tolerate.
-    const events = this.db
-      .prepare(`delete from buffered_events where created_at < ? and uploaded_at is not null`)
-      .run(cutoff).changes;
+    // An upgrade must not delete the history its initial projection/parity
+    // passes have not consumed. This preserves the existing uploaded-only
+    // compatibility cleanup without silently activating an independent raw TTL.
+    const events = this.projection.status().parityReady
+      ? this.db
+        .prepare(`delete from buffered_events where created_at < ? and uploaded_at is not null`)
+        .run(cutoff).changes
+      : 0;
     const metricSamples = this.db
       .prepare(`delete from metric_samples where created_at < ?`)
       .run(cutoff).changes;

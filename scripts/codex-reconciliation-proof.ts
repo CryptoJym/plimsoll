@@ -1165,12 +1165,20 @@ async function proveContextRevisionCrashRollbackAndOverlap(root: string) {
           checkpointRebuilds: 0, bytesRead: 0, bytesDeferred: 0,
           sessionsSkippedOtlpCovered: 0, eventsAppended: 0,
           tokensAppended: { input: 0, cachedInput: 0, output: 0 }, parseErrors: 0,
+          activity: {
+            lastActivityAt: null, filesToday: 0, discoveryEntries: 0,
+            lastScanAt: new Date(0).toISOString(), truncated: false,
+          },
         },
         transcript: {
           filesSeen: 0, filesRead: 0, filesParsed: 0, filesReset: 0, legacyRebuilds: 0,
           checkpointRebuilds: 0, bytesRead: 0, bytesDeferred: 0,
           sessionsSkippedLiveCovered: 0, eventsAppended: 0,
           tokensAppended: { input: 0, cacheRead: 0, output: 0 }, parseErrors: 0,
+          activity: {
+            lastActivityAt: null, filesToday: 0, discoveryEntries: 0,
+            lastScanAt: new Date(0).toISOString(), truncated: false,
+          },
         },
         reconciliation,
         repricing: {

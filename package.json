@@ -18,6 +18,7 @@
     "proof:maintenance": "tsx scripts/maintenance-proof.ts",
     "proof:codex-reconciliation": "tsx scripts/codex-reconciliation-proof.ts",
     "proof:resource-concurrency": "tsx scripts/resource-proof/concurrency-proof.ts",
+    "proof:dashboard": "tsx scripts/dashboard-projection-proof.ts",
     "proof:outbox": "tsx scripts/outbox-proof.ts",
     "report": "tsx scripts/efficiency-report.ts",
     "backfill": "tsx scripts/backfill-v1-archive.ts"

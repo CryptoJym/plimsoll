@@ -372,8 +372,68 @@ export type CollectorMaintenanceRunResult = {
   reconciliation: CodexReconciliationResult;
   repricing: RepricingMaintenanceResult;
   enrichment: RepoEnrichmentMaintenanceResult;
+  projection?: ReturnType<LocalEventBuffer["projection"]["runMaintenance"]>;
+  projectionDrain?: ProjectionDrainResult;
   rawEventWrites: number;
 };
+
+export type ProjectionDrainResult = {
+  slices: number;
+  yields: number;
+  migrationRowsVisited: number;
+  activeMs: number;
+  maxSlices: number;
+  maxActiveMs: number;
+  cadenceSeconds: number;
+  remainingRowidUpperBound: number;
+  estimatedMinutesUpperBound: number;
+  stillMigrating: boolean;
+};
+
+const PROJECTION_DRAIN_MAX_SLICES=40;
+const PROJECTION_DRAIN_MAX_ACTIVE_MS=2_000;
+const PROJECTION_CADENCE_SECONDS=60;
+
+function projectionMigrationRemaining(status:ReturnType<LocalEventBuffer["projection"]["status"]>){
+  const high=status.backfill.highWater??0;
+  const metricHigh=status.backfill.metricHighWater??0;
+  return Math.max(0,high-status.backfill.cursor)+
+    Math.max(0,high-status.backfill.parityCursor)+
+    Math.max(0,metricHigh-status.backfill.metricCursor);
+}
+
+/**
+ * Cooperative migration acceleration. Every synchronous transaction retains
+ * the projection's 1,000-row bound; setImmediate gives capture/server work a
+ * turn between slices, and the active-time cap prevents a boot-time CPU loop.
+ */
+export async function drainProjectionMigration(
+  projection:LocalEventBuffer["projection"],
+  options:{maxSlices?:number;maxActiveMs?:number;cadenceSeconds?:number}={},
+){
+  const maxSlices=Math.max(1,Math.min(options.maxSlices??PROJECTION_DRAIN_MAX_SLICES,100));
+  const maxActiveMs=Math.max(1,Math.min(options.maxActiveMs??PROJECTION_DRAIN_MAX_ACTIVE_MS,5_000));
+  const cadenceSeconds=Math.max(1,options.cadenceSeconds??PROJECTION_CADENCE_SECONDS);
+  let slices=0,yields=0,migrationRowsVisited=0,activeMs=0;
+  let receipt:ReturnType<LocalEventBuffer["projection"]["runMaintenance"]>|undefined;
+  while(slices<maxSlices){
+    if(slices>0){await new Promise<void>((resolve)=>setImmediate(resolve));yields++;}
+    const started=performance.now();
+    receipt=projection.runMaintenance();
+    activeMs+=performance.now()-started;
+    slices++;
+    migrationRowsVisited+=receipt.backfillRowsVisited+receipt.parityRowsVisited+receipt.metricRowsVisited;
+    const status=projection.status();
+    const stillMigrating=!status.backfill.complete||!status.backfill.parityComplete||!status.backfill.metricComplete;
+    if(!stillMigrating||activeMs>=maxActiveMs)break;
+  }
+  const status=projection.status(),remainingRowidUpperBound=projectionMigrationRemaining(status);
+  const capacityPerCadence=1_000*maxSlices;
+  return {receipt:receipt!,drain:{slices,yields,migrationRowsVisited,
+    activeMs:Number(activeMs.toFixed(3)),maxSlices,maxActiveMs,cadenceSeconds,remainingRowidUpperBound,
+    estimatedMinutesUpperBound:Math.ceil(remainingRowidUpperBound/capacityPerCadence*cadenceSeconds/60),
+    stillMigrating:!status.backfill.complete||!status.backfill.parityComplete||!status.backfill.metricComplete} satisfies ProjectionDrainResult};
+}
 
 export class CollectorMaintenance {
   constructor(
@@ -388,6 +448,13 @@ export class CollectorMaintenance {
     const reconciliation = runCodexReconciliationMaintenance(this.buffer.database);
     const repricing = runRepricingMaintenance(this.buffer.database);
     const enrichment = runRepoEnrichmentMaintenance(this.buffer.database);
+    if (rollout.activity) {
+      this.buffer.projection.recordCaptureActivity({ source: "codex", ...rollout.activity });
+    }
+    if (transcript.activity) {
+      this.buffer.projection.recordCaptureActivity({ source: "claude_code", ...transcript.activity });
+    }
+    const drained=await drainProjectionMigration(this.buffer.projection);
     return {
       recentOnly,
       rollout,
@@ -395,6 +462,8 @@ export class CollectorMaintenance {
       reconciliation,
       repricing,
       enrichment,
+      projection:drained.receipt,
+      projectionDrain:drained.drain,
       rawEventWrites: rollout.eventsAppended + transcript.eventsAppended,
     };
   }
