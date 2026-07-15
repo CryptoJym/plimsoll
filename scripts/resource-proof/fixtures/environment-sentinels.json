@@ -1,0 +1,28 @@
+{
+  "schemaVersion": 1,
+  "credentialNamePattern": "(?:TOKEN|SECRET|PASSWORD|PASSWD|API_KEY|ACCESS_KEY|AUTH|COOKIE|CREDENTIAL)",
+  "parentSentinels": {
+    "GITHUB_TOKEN": "plimsoll-resource-proof-secret-sentinel-1",
+    "AWS_SECRET_ACCESS_KEY": "plimsoll-resource-proof-secret-sentinel-2",
+    "CUSTOM_API_PASSWORD": "plimsoll-resource-proof-secret-sentinel-3",
+    "SESSION_COOKIE": "plimsoll-resource-proof-secret-sentinel-4"
+  },
+  "requiredChildNames": [
+    "HOME",
+    "USERPROFILE",
+    "PLIMSOLL_HOME",
+    "TMPDIR",
+    "TMP",
+    "TEMP",
+    "TZ",
+    "LANG",
+    "LC_ALL"
+  ],
+  "optionalPassThroughNames": [
+    "PATH",
+    "SystemRoot",
+    "WINDIR",
+    "ComSpec",
+    "PATHEXT"
+  ]
+}

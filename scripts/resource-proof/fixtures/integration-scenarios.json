@@ -1,0 +1,67 @@
+{
+  "schemaVersion": 1,
+  "scenarios": [
+    {
+      "id": "integrated_capture_projection_outbox",
+      "issue": 81,
+      "blockedBy": [77, 78, 79, 80],
+      "detail": "Capture one sanitized valuable fixture and prove one durable event, exact projection delta, and one outbox enqueue in the same recoverable boundary.",
+      "requiredCounters": [
+        "eventsObserved",
+        "eventsAdmitted",
+        "rawEventWrites",
+        "projectionRowsWritten",
+        "outboxRowsEnqueued"
+      ]
+    },
+    {
+      "id": "no_change_constant_work",
+      "issue": 77,
+      "blockedBy": [77],
+      "detail": "Run an unchanged interval and prove zero history reads, event rewrites, repricing/enrichment visits, and overlapping jobs.",
+      "requiredCounters": [
+        "fullHistoryFileReads",
+        "rawEventRewrites",
+        "repriceRowsVisited",
+        "enrichmentRowsVisited",
+        "overlappingJobs"
+      ]
+    },
+    {
+      "id": "duplicate_start_single_owner",
+      "issue": 76,
+      "blockedBy": [76],
+      "detail": "Race two collector starts and prove one listener, no candidate restart request, and an unchanged owner record.",
+      "requiredCounters": ["listenersCreated", "restartRequests"]
+    },
+    {
+      "id": "poison_continuation",
+      "issue": 79,
+      "blockedBy": [79],
+      "detail": "Place deterministic poison before valid rows and prove one quarantine, no evidence rewrites, and later valid acknowledgement.",
+      "requiredCounters": [
+        "outboxAttempts",
+        "deadLettersWritten",
+        "rawEventRewrites"
+      ]
+    },
+    {
+      "id": "dashboard_projection_budget",
+      "issue": 80,
+      "blockedBy": [80],
+      "detail": "Read one coherent five-surface snapshot from projections with no raw-history or filesystem scan and warm p95 at or below 500ms.",
+      "requiredCounters": [
+        "rawRowsScanned",
+        "projectionRowsVisited",
+        "filesystemEntriesScanned"
+      ]
+    },
+    {
+      "id": "metadata_privacy_sentinels",
+      "issue": 81,
+      "blockedBy": [77, 78, 79, 80],
+      "detail": "Search database, upload body, logs, and receipt for raw-content sentinels after the integrated path runs.",
+      "requiredCounters": ["eventsObserved", "eventsAdmitted", "eventsDropped"]
+    }
+  ]
+}
