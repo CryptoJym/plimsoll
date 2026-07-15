@@ -180,6 +180,43 @@ function dropProjectionState(db:Database.Database){
   for(const object of objects.filter((row)=>row.type==="table"))db.exec(`drop table if exists ${object.name}`);
 }
 
+function downgradeCompactProjectionToC0(db:Database.Database){
+  const triggers=db.prepare(
+    `select name from sqlite_master where type='trigger' and name like 'trg_dashboard_%'`,
+  ).all() as Array<{name:string}>;
+  for(const trigger of triggers)db.exec(`drop trigger if exists ${trigger.name}`);
+  db.exec(`
+    drop index if exists idx_dashboard_compact_day_segment;
+    drop index if exists idx_dashboard_compact_cancellation_day;
+    drop table if exists dashboard_compact_day_source;
+    drop table if exists dashboard_compact_gc_source_scratch;
+    drop table if exists dashboard_compact_gc_days;
+  `);
+  const cancellationColumns=new Set((db.pragma(
+    "table_info(dashboard_compact_cancellations)",
+  ) as Array<{name:string}>).map((row)=>row.name));
+  if(cancellationColumns.has("bucket_day")){
+    db.exec(`alter table dashboard_compact_cancellations drop column bucket_day`);
+  }
+  const controlColumns=new Set((db.pragma(
+    "table_info(dashboard_projection_control)",
+  ) as Array<{name:string}>).map((row)=>row.name));
+  for(const column of [
+    "compact_summary_migration_complete",
+    "compact_gc_backlog",
+    "compact_gc_schedule",
+    "compact_segments_written",
+    "compact_gc_items_visited",
+    "compact_gc_items_removed",
+    "compact_gc_segments_rewritten",
+    "compact_gc_segments_deleted",
+    "compact_gc_days_completed",
+    "compact_gc_restarts",
+  ])if(controlColumns.has(column))db.exec(
+    `alter table dashboard_projection_control drop column ${column}`,
+  );
+}
+
 async function main() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-projection-proof-"));
   const dbPath = path.join(root, "ledger.sqlite");
@@ -855,6 +892,154 @@ async function main() {
       Object.values(projectedDeleteState).every((value)=>value===0),
       {projectedDeleteBacklog,projectedDeleteState});
     failedPending.close();
+
+    const c0UpgradePath=path.join(root,"c0-compact-summary-upgrade.sqlite");
+    let c0Upgrade=new LocalEventBuffer(c0UpgradePath);
+    for(let index=0;index<100;index++)c0Upgrade.append(event({
+      source:index<50?"codex":"claude_code",
+      eventType:"assistant_response",
+      actionClass:"other",
+      observedAt:new Date(NOW.getTime()-(index<50?2:1)*DAY_MS+index).toISOString(),
+    }));
+    settle(c0Upgrade,NOW,20);
+    const cancelledRows=c0Upgrade.database.prepare(
+      `select rowid as rawRowid from buffered_events where source='codex' order by rowid limit 10`,
+    ).all() as Array<{rawRowid:number}>;
+    const removeRaw=c0Upgrade.database.prepare(`delete from buffered_events where rowid=?`);
+    c0Upgrade.database.transaction(()=>{
+      for(const row of cancelledRows)removeRaw.run(row.rawRowid);
+      const hold=c0Upgrade.database.prepare(
+        `insert into dashboard_projection_repairs (raw_rowid,reason,queued_at) values (?, ?, ?)`,
+      );
+      for(let index=0;index<300;index++)hold.run(1_000_000+index,"upgrade-proof-hold",NOW.toISOString());
+    })();
+    const c0DrainReceipt=c0Upgrade.projection.runMaintenance(NOW);
+    c0Upgrade.database.prepare(
+      `delete from dashboard_projection_repairs where raw_rowid>=1000000`,
+    ).run();
+    c0Upgrade.database.prepare(`delete from dashboard_compact_gc_days`).run();
+    c0Upgrade.database.prepare(`delete from dashboard_compact_gc_source_scratch`).run();
+    c0Upgrade.projection.runMaintenance(NOW);
+    const c0Ready=readySnapshot(c0Upgrade,30);
+    const c0PhysicalState={
+      raw:(c0Upgrade.database.prepare(`select count(*) as n from buffered_events`).get() as {n:number}).n,
+      segments:(c0Upgrade.database.prepare(`select count(*) as n from dashboard_compact_segments`).get() as {n:number}).n,
+      items:(c0Upgrade.database.prepare(
+        `select coalesce(sum(event_count),0) as n from dashboard_compact_segments`,
+      ).get() as {n:number}).n,
+      cancellations:(c0Upgrade.database.prepare(
+        `select count(*) as n from dashboard_compact_cancellations`,
+      ).get() as {n:number}).n,
+      projectedEvents:Number((c0Ready.summary.totals as Record<string,number>).events),
+      generation:c0Ready.generation,
+    };
+    assert.deepEqual(c0PhysicalState,{raw:90,segments:2,items:100,cancellations:10,
+      projectedEvents:90,generation:c0Ready.generation});
+    c0Upgrade.close();
+    const c0Shape=new Database(c0UpgradePath);
+    downgradeCompactProjectionToC0(c0Shape);
+    c0Shape.close();
+
+    c0Upgrade=new LocalEventBuffer(c0UpgradePath);
+    const migrationColumns=new Set((c0Upgrade.database.pragma(
+      "table_info(dashboard_projection_control)",
+    ) as Array<{name:string}>).map((row)=>row.name));
+    const migrationMarker=migrationColumns.has("compact_summary_migration_complete")?
+      (c0Upgrade.database.prepare(
+        `select compact_summary_migration_complete as complete
+         from dashboard_projection_control where singleton=1`,
+      ).get() as {complete:number}).complete:-1;
+    const migrationJobsBeforeReopen=c0Upgrade.database.prepare(
+      `select bucket_day as bucketDay,revision,processing_revision as processingRevision,
+        high_water_segment as highWater,cursor_segment as cursorSegment,queued_at as queuedAt
+       from dashboard_compact_gc_days order by bucket_day`,
+    ).all();
+    const migrationNullBuckets=(c0Upgrade.database.prepare(
+      `select count(*) as n from dashboard_compact_cancellations where bucket_day is null`,
+    ).get() as {n:number}).n;
+    const migrationStale=c0Upgrade.projection.readSnapshot(30);
+    const migrationStatus=c0Upgrade.projection.status();
+    check("c0_compact_summary_upgrade_seeds_every_segment_day_and_marks_prior_snapshot_stale",
+      migrationMarker===1&&migrationJobsBeforeReopen.length===2&&migrationNullBuckets===0&&
+      migrationStatus.dirty&&migrationStatus.degraded&&migrationStatus.backlog.compactGcDays===2&&
+      migrationStale.kind==="ready"&&migrationStale.snapshot.generation===c0PhysicalState.generation&&
+      migrationStale.snapshot.projection.status==="stale"&&
+      Number((migrationStale.snapshot.summary.totals as Record<string,number>).events)===90,
+      {c0DrainReceipt,c0PhysicalState,migrationMarker,migrationJobsBeforeReopen,
+        migrationNullBuckets,migrationStatus,migrationStale});
+    c0Upgrade.close();
+    c0Upgrade=new LocalEventBuffer(c0UpgradePath);
+    const migrationJobsAfterReopen=c0Upgrade.database.prepare(
+      `select bucket_day as bucketDay,revision,processing_revision as processingRevision,
+        high_water_segment as highWater,cursor_segment as cursorSegment,queued_at as queuedAt
+       from dashboard_compact_gc_days order by bucket_day`,
+    ).all();
+    check("c0_compact_summary_upgrade_jobs_and_marker_resume_without_reseed",
+      JSON.stringify(migrationJobsAfterReopen)===JSON.stringify(migrationJobsBeforeReopen)&&
+      (c0Upgrade.database.prepare(
+        `select compact_summary_migration_complete as n from dashboard_projection_control`,
+      ).get() as {n:number}).n===1,
+      {before:migrationJobsBeforeReopen,after:migrationJobsAfterReopen});
+    const c0MigrationReceipts=settle(c0Upgrade,NOW,20);
+    const migrationRaw=dashboardSummary(c0Upgrade.database,30).totals as Record<string,number>;
+    const migrationProjected=readySnapshot(c0Upgrade,30).summary.totals as Record<string,number>;
+    const migrationDaySources=c0Upgrade.database.prepare(
+      `select bucket_day as bucketDay,source,event_count as eventCount,
+        min_observed_at as minObservedAt,max_observed_at as maxObservedAt
+       from dashboard_compact_day_source order by bucket_day,source`,
+    ).all();
+    const migrationRawBounds=c0Upgrade.database.prepare(
+      `select min(observed_at) as oldest,max(observed_at) as newest from buffered_events`,
+    ).get() as {oldest:string;newest:string};
+    const migrationProjectedBounds=c0Upgrade.database.prepare(
+      `select oldest_observed_at as oldest,newest_observed_at as newest
+       from dashboard_lifetime_totals where singleton=1`,
+    ).get() as {oldest:string;newest:string};
+    const migrationRawSources=c0Upgrade.database.prepare(
+      `select source,max(observed_at) as lastEventAt from buffered_events group by source order by source`,
+    ).all();
+    const migrationProjectedSources=c0Upgrade.database.prepare(
+      `select source,last_event_at as lastEventAt from dashboard_source_lifetime order by source`,
+    ).all();
+    const migrationFinalState={
+      raw:(c0Upgrade.database.prepare(`select count(*) as n from buffered_events`).get() as {n:number}).n,
+      items:compactItems(c0Upgrade.database).length,
+      cancellations:(c0Upgrade.database.prepare(`select count(*) as n from dashboard_compact_cancellations`).get() as {n:number}).n,
+      jobs:(c0Upgrade.database.prepare(`select count(*) as n from dashboard_compact_gc_days`).get() as {n:number}).n,
+      scratch:(c0Upgrade.database.prepare(`select count(*) as n from dashboard_compact_gc_source_scratch`).get() as {n:number}).n,
+      marker:(c0Upgrade.database.prepare(
+        `select compact_summary_migration_complete as n from dashboard_projection_control`,
+      ).get() as {n:number}).n,
+    };
+    check("c0_compact_summary_upgrade_rebuilds_unaffected_days_and_settles_exactly",
+      c0MigrationReceipts.every((receipt)=>receipt.compactGcItemsVisited<=1_000&&
+        receipt.repairRowsVisited<=250)&&
+      c0MigrationReceipts.reduce((sum,receipt)=>sum+receipt.compactGcSegmentsRewritten,0)===1&&
+      c0MigrationReceipts.reduce((sum,receipt)=>sum+receipt.compactGcSegmentsDeleted,0)===0&&
+      migrationRaw.events===90&&migrationProjected.events===90&&
+      migrationDaySources.length===2&&
+      (migrationDaySources as Array<{source:string;eventCount:number}>).some((row)=>
+        row.source==="codex"&&row.eventCount===40)&&
+      (migrationDaySources as Array<{source:string;eventCount:number}>).some((row)=>
+        row.source==="claude_code"&&row.eventCount===50)&&
+      JSON.stringify(migrationProjectedBounds)===JSON.stringify(migrationRawBounds)&&
+      JSON.stringify(migrationProjectedSources)===JSON.stringify(migrationRawSources)&&
+      JSON.stringify(migrationFinalState)===JSON.stringify({raw:90,items:90,cancellations:0,
+        jobs:0,scratch:0,marker:1}),
+      {receipts:c0MigrationReceipts.length,migrationRaw,migrationProjected,migrationDaySources,
+        migrationRawBounds,migrationProjectedBounds,migrationRawSources,
+        migrationProjectedSources,migrationFinalState});
+    c0Upgrade.close();
+    c0Upgrade=new LocalEventBuffer(c0UpgradePath);
+    const migrationIdleReceipts=settle(c0Upgrade,NOW,5);
+    check("c0_compact_summary_upgrade_marker_prevents_second_reopen_reseed",
+      migrationIdleReceipts.length===0&&
+      (c0Upgrade.database.prepare(`select count(*) as n from dashboard_compact_gc_days`).get() as {n:number}).n===0&&
+      (c0Upgrade.database.prepare(
+        `select compact_summary_migration_complete as n from dashboard_projection_control`,
+      ).get() as {n:number}).n===1,
+      {idleSlices:migrationIdleReceipts.length,status:c0Upgrade.projection.status()});
+    c0Upgrade.close();
 
     const gcPath=path.join(root,"compact-gc.sqlite");
     const gcSeed=new LocalEventBuffer(gcPath);

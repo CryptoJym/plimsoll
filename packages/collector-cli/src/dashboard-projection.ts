@@ -105,6 +105,7 @@ type ProjectionControl = {
   dirtySessionBacklog: number;
   accountInvalidationBacklog: number;
   compactMutationBacklog: number;
+  compactSummaryMigrationComplete: number;
   compactGcBacklog: number;
   compactGcSchedule: number;
   compactSegmentsWritten: number;
@@ -337,6 +338,7 @@ export class DashboardProjectionStore {
         dirty_session_backlog integer not null default 0,
         account_invalidation_backlog integer not null default 0,
         compact_mutation_backlog integer not null default 0,
+        compact_summary_migration_complete integer not null default 0,
         compact_gc_backlog integer not null default 0,
         compact_gc_schedule integer not null default 0,
         compact_segments_written integer not null default 0,
@@ -859,15 +861,13 @@ export class DashboardProjectionStore {
           where singleton=1;
       end;
     `);
-    this.db.prepare(
-      `update dashboard_projection_control set compact_gc_backlog=(select count(*) from dashboard_compact_gc_days)
-       where singleton=1`,
-    ).run();
+    this.ensureCompactSummaryMigration(now);
   }
 
   private ensureProjectionSchemaColumns() {
     const controlColumns=new Set((this.db.pragma("table_info(dashboard_projection_control)") as Array<{name:string}>).map((row)=>row.name));
     for(const definition of [
+      "compact_summary_migration_complete integer not null default 0",
       "compact_gc_backlog integer not null default 0",
       "compact_gc_schedule integer not null default 0",
       "compact_segments_written integer not null default 0",
@@ -888,6 +888,47 @@ export class DashboardProjectionStore {
     }
     this.db.exec(`create index if not exists idx_dashboard_compact_cancellation_day
       on dashboard_compact_cancellations (bucket_day,raw_rowid)`);
+  }
+
+  private ensureCompactSummaryMigration(now:Date){
+    this.db.transaction(()=>{
+      const control=this.db.prepare(
+        `select compact_summary_migration_complete as complete
+         from dashboard_projection_control where singleton=1`,
+      ).get() as {complete:number};
+      if(!control.complete){
+        const timestamp=now.toISOString();
+        this.db.prepare(
+          `insert or ignore into dashboard_compact_gc_days
+           (bucket_day,revision,processing_revision,high_water_segment,cursor_segment,
+            last_schedule,queued_at,updated_at)
+           select bucket_day,1,0,null,0,0,?,? from (
+             select bucket_day from dashboard_compact_segments
+              where bucket_day is not null group by bucket_day
+             union
+             select bucket_day from dashboard_compact_cancellations
+              where bucket_day is not null group by bucket_day
+           )`,
+        ).run(timestamp,timestamp);
+        const backlog=(this.db.prepare(
+          `select count(*) as n from dashboard_compact_gc_days`,
+        ).get() as {n:number}).n;
+        this.db.prepare(
+          `update dashboard_projection_control set
+            compact_summary_migration_complete=1,compact_gc_backlog=?,
+            dirty=case when ?>0 then 1 else dirty end,
+            degraded_reason=case when ?>0 then 'projection_repair_backlog'
+              else degraded_reason end
+           where singleton=1`,
+        ).run(backlog,backlog,backlog);
+      }else{
+        this.db.prepare(
+          `update dashboard_projection_control set
+            compact_gc_backlog=(select count(*) from dashboard_compact_gc_days)
+           where singleton=1`,
+        ).run();
+      }
+    })();
   }
 
   private control(): ProjectionControl {
@@ -914,6 +955,7 @@ export class DashboardProjectionStore {
         dirty_session_backlog as dirtySessionBacklog,
         account_invalidation_backlog as accountInvalidationBacklog,
         compact_mutation_backlog as compactMutationBacklog,
+        compact_summary_migration_complete as compactSummaryMigrationComplete,
         compact_gc_backlog as compactGcBacklog,
         compact_gc_schedule as compactGcSchedule,
         compact_segments_written as compactSegmentsWritten,

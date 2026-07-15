@@ -107,6 +107,18 @@ payload items, cancellations, day jobs, and day/source summaries in 99 bounded
 maintenance slices. Freed SQLite pages appear on the freelist; file truncation
 is deliberately not promised without a separate vacuum policy.
 
+The compact summary schema has its own one-time additive migration marker.
+When that marker is absent or false, one transaction inserts one day job for
+every distinct indexed day in the union of compact segments and cancellations,
+marks the prior coherent generation stale, recomputes the job backlog, and
+commits the marker with those jobs. This includes unaffected segment days:
+rebuilding only cancellation days would leave lifetime, source-latest, and
+window-bound summaries incomplete. A crash before commit retains neither the
+marker nor partial jobs; a crash after commit resumes the durable day cursors.
+The marker remains set after completion, so later opens do not rescan or reseed.
+An unchanged migration segment is decoded into summary scratch but is not
+rewritten or recompressed.
+
 Session repair is also row-bounded, not merely session-bounded. Each
 session/window job persists a fact cursor, append high-water mark, restart
 revision, and normalized repo/branch/account/source/machine accumulators.
@@ -178,6 +190,7 @@ Rejected. Distinct sessions/branches and dominant repo/account can change when o
 | Projection delta fails | Raw capture commits; repair row and degraded reason persist. |
 | Raw row is deleted | The raw transaction persists a safe compact old-contribution receipt or a fact tombstone; bounded maintenance subtracts before publishing. |
 | Compact insert changes before its first repair | The never-projected receipt survives every update; maintenance reads current raw state and applies it exactly once, or settles a pending delete to zero. |
+| Upgrade predates compact day summaries and GC triggers | One atomic indexed day-union migration seeds bounded rebuild jobs for all segment/cancellation days, keeps the prior generation stale, and resumes after reopen without reseeding. |
 | Compact garbage collection crashes after payload rewrite | The enclosing SQLite transaction rolls back payload, receipts, summaries, and cursor together; the same frozen segment replays after reopen. |
 | Compact day changes during garbage collection | The frozen pass reaches its segment high-water, then restarts once against the newer revision; fair day scheduling prevents another day from starving. |
 | Giant session repair crashes | Durable cursor and normalized accumulators resume; the prior snapshot remains stale/coherent until atomic finalize. |
