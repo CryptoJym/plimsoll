@@ -21,29 +21,27 @@ export type OtlpAdmissionDecision =
  * below is present.
  */
 const KNOWN_GENERIC_SPAN_NAMES = new Set([
-  "app_server_serialized_request_queue",
-  "codex_websocket_event",
-  "thread_resume",
-  "thread_read",
-  "thread_list",
-  "thread_goal_get",
+  "app_server.serialized_request_queue",
+  "codex.websocket_event",
+  "thread/resume",
+  "thread/read",
+  "thread/list",
+  "thread/goal/get",
   "handle_responses",
   "receiving",
   "resume_running_thread",
   "auth",
   "append_items",
-  "remotecontrol_enable",
-  "codex_sse_event",
-  "codex_websocket_request",
+  "remotecontrol/enable",
+  "codex.sse_event",
+  "codex.websocket_request",
   "list_tools_for_server",
   "persist_rollout_items",
 ]);
 
-function normalizedSpanName(event: AiInteractionEvent) {
+function canonicalSpanName(event: AiInteractionEvent) {
   const value = (event.metadata as Record<string, unknown>).otelEventName;
-  return typeof value === "string"
-    ? value.trim().replace(/[^a-zA-Z0-9]+/g, "_").replace(/^_+|_+$/g, "").toLowerCase()
-    : undefined;
+  return typeof value === "string" ? value.trim().toLowerCase() : undefined;
 }
 
 function hasUsage(event: AiInteractionEvent) {
@@ -91,7 +89,7 @@ export function decideOtlpSpanAdmission(event: AiInteractionEvent): OtlpAdmissio
     return { admitted: true };
   }
 
-  const name = normalizedSpanName(event);
+  const name = canonicalSpanName(event);
   if (event.source === "codex" && name && KNOWN_GENERIC_SPAN_NAMES.has(name)) {
     return { admitted: false, reason: "generic_zero_value_span" };
   }

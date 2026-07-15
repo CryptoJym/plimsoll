@@ -37,6 +37,12 @@ const RAW_SENTINELS = [
   "RAW_PROMPT_SENTINEL",
   "RAW_LOG_BODY_SENTINEL",
   "RAW_METRIC_PROMPT_SENTINEL",
+  "RAW_HTTP_REQUEST_BODY_SENTINEL",
+  "RAW_HTTP_RESPONSE_BODY_SENTINEL",
+  "RAW_DB_STATEMENT_SENTINEL",
+  "https://customer.example/RAW_URL_FULL_SENTINEL",
+  "CUSTOMER_SECRET_123",
+  "/Users/james/Client/secret.ts",
 ];
 const LINKED_SESSION = "11111111-2222-4333-8444-555555555555";
 const GENERIC_CONTROL_SPANS = [
@@ -56,6 +62,13 @@ const GENERIC_CONTROL_SPANS = [
   "codex.websocket_request",
   "list_tools_for_server",
   "persist_rollout_items",
+] as const;
+const PUNCTUATION_COLLISION_VARIANTS = [
+  "thread:resume",
+  "thread--read",
+  "auth---",
+  "codex-sse-event",
+  "persist/rollout/items",
 ] as const;
 
 function span(
@@ -86,6 +99,7 @@ const spanMatrix = {
             ...GENERIC_CONTROL_SPANS.map((name, index) => span(name, index + 1)),
             // Unknown vendor signals fail open; a new integration is not noise by default.
             span("vendor.custom_work", 20),
+            ...PUNCTUATION_COLLISION_VARIANTS.map((name, index) => span(name, 31 + index)),
             // Error status and exception events remain even when the wrapper name is generic.
             span("handle_responses", 21, [], { status: { code: 2, message: "do not persist" } }),
             span(
@@ -113,6 +127,17 @@ const spanMatrix = {
             span("handle_responses", 26, [
               attr("conversation.id", LINKED_SESSION),
               attr("call_id", "call_linkage_only"),
+            ]),
+            span(RAW_SENTINELS[10], 40),
+            span("vendor.privacy_probe", 41, [
+              attr("call_id", "privacy_probe"),
+              attr("http.request.body", RAW_SENTINELS[5]),
+              attr("http.response.body", RAW_SENTINELS[6]),
+              attr("db.statement", RAW_SENTINELS[7]),
+              attr("url.full", RAW_SENTINELS[8]),
+            ]),
+            span("handle_responses", 42, [
+              attr("action_class", "new_vendor_action"),
             ]),
           ],
         },
@@ -146,6 +171,14 @@ const logEnvelope = {
                 attr("session.id", LINKED_SESSION),
                 attr("input_tokens", 100),
                 attr("output_tokens", 20),
+              ],
+            },
+            {
+              timeUnixNano: "1781400010500000000",
+              body: { stringValue: RAW_SENTINELS[9] },
+              attributes: [
+                attr("call_id", "body_only_log"),
+                attr("session.id", LINKED_SESSION),
               ],
             },
           ],
@@ -214,8 +247,8 @@ async function main() {
     check(
       "adversarial_span_matrix",
       traces.status === 202 &&
-        traces.body.recordCount === 24 &&
-        traces.body.events === 8 &&
+        traces.body.recordCount === 32 &&
+        traces.body.events === 16 &&
         traces.body.droppedEvents === GENERIC_CONTROL_SPANS.length,
       traces,
     );
@@ -233,7 +266,7 @@ async function main() {
 
     const logs = await post(port, "/v1/logs", logEnvelope, "claude_code");
     const metrics = await post(port, "/v1/metrics", metricEnvelope, "claude_code");
-    check("existing_log_compatibility", logs.status === 202 && logs.body.events === 1, logs);
+    check("existing_log_compatibility", logs.status === 202 && logs.body.events === 2, logs);
     check(
       "existing_metric_compatibility",
       metrics.status === 202 && metrics.body.metricSamples === 1,
@@ -254,12 +287,26 @@ async function main() {
       (event) =>
         (event.metadata as Record<string, unknown>).otelHasError === true && event !== exception,
     );
-    const tool = payloads.find((event) => event.eventType === "tool_use");
+    const tool = payloads.find(
+      (event) => event.eventType === "tool_use" && event.actionClass === "shell",
+    );
     const lifecycle = payloads.find((event) => event.eventType === "session_start");
     const linked = payloads.find((event) => event.sessionId === LINKED_SESSION && event.source === "codex");
     const token = payloads.find(
       (event) => event.source === "codex" && event.inputTokens === 2400,
     );
+    const unknownAction = payloads.find(
+      (event) =>
+        (event.metadata as Record<string, unknown>).otelOriginalActionClass ===
+        "new_vendor_action",
+    );
+    const privacyRow = rows.find(
+      (row) => (row.payload.metadata as Record<string, unknown>).call_id === "privacy_probe",
+    );
+    const bodyOnlyLog = rows.find(
+      (row) => (row.payload.metadata as Record<string, unknown>).call_id === "body_only_log",
+    );
+    const pathNameRow = rows.find((row) => row.suppressedFields.includes("span.name"));
 
     check(
       "retained_error_and_exception",
@@ -292,6 +339,23 @@ async function main() {
       metadata("vendor.custom_work") ?? "missing",
     );
     check(
+      "punctuation_collision_variants_fail_open",
+      PUNCTUATION_COLLISION_VARIANTS.every((name) =>
+        payloads.some(
+          (event) =>
+            event.source === "codex" &&
+            (event.metadata as Record<string, unknown>).otelEventName === name,
+        ),
+      ),
+      payloads
+        .map((event) => (event.metadata as Record<string, unknown>).otelEventName)
+        .filter(
+          (name): name is (typeof PUNCTUATION_COLLISION_VARIANTS)[number] =>
+            typeof name === "string" &&
+            (PUNCTUATION_COLLISION_VARIANTS as readonly string[]).includes(name),
+        ),
+    );
+    check(
       "generic_name_is_source_scoped",
       payloads.some(
         (event) =>
@@ -309,8 +373,24 @@ async function main() {
         (event) =>
           event.source === "codex" &&
           (event.metadata as Record<string, unknown>).otelEventName === "handle_responses",
-      ).length === 4,
+      ).length === 5,
       payloads.map((event) => (event.metadata as Record<string, unknown>).otelEventName),
+    );
+    check(
+      "unknown_explicit_action_degrades_safely",
+      Boolean(
+        unknownAction?.actionClass === "other" &&
+          (unknownAction.metadata as Record<string, unknown>).otelExplicitAction === true &&
+          (unknownAction.metadata as Record<string, unknown>).otelOriginalActionClass ===
+            "new_vendor_action",
+      ),
+      unknownAction
+        ? {
+            actionClass: unknownAction.actionClass,
+            original: (unknownAction.metadata as Record<string, unknown>)
+              .otelOriginalActionClass,
+          }
+        : "missing",
     );
 
     const persisted = JSON.stringify({
@@ -320,17 +400,33 @@ async function main() {
     check(
       "raw_content_privacy",
       RAW_SENTINELS.every((sentinel) => !persisted.includes(sentinel)),
-      "no raw error, prompt, log body, or metric prompt sentinel persisted",
+      "no raw body, SQL, URL, path, error, prompt, or metric sentinel persisted",
     );
     check(
-      "privacy_suppression_receipt",
+      "semantic_privacy_suppression_receipts",
       Boolean(
         exception?.id &&
           rows
             .find((row) => row.id === exception.id)
-            ?.suppressedFields.some((field) => field.includes("exception.message")),
+            ?.suppressedFields.some((field) => field.includes("exception.message")) &&
+          privacyRow &&
+          [
+            "attributes.http.request.body",
+            "attributes.http.response.body",
+            "attributes.db.statement",
+            "attributes.url.full",
+          ].every((field) => privacyRow.suppressedFields.includes(field)) &&
+          pathNameRow?.suppressedFields.includes("span.name") &&
+          bodyOnlyLog?.suppressedFields.includes("body") &&
+          !("otelEventName" in (bodyOnlyLog.payload.metadata as Record<string, unknown>)) &&
+          Boolean(metadata("claude_code.api_request")),
       ),
-      rows.find((row) => row.id === exception?.id)?.suppressedFields ?? [],
+      {
+        exception: rows.find((row) => row.id === exception?.id)?.suppressedFields ?? [],
+        privacy: privacyRow?.suppressedFields ?? [],
+        path: pathNameRow?.suppressedFields ?? [],
+        body: bodyOnlyLog?.suppressedFields ?? [],
+      },
     );
 
     const statusResponse = await fetch(`http://127.0.0.1:${port}/status`);

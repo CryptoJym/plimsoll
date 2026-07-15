@@ -2,7 +2,7 @@
 
 ## TL;DR
 
-- Admit OTLP records only after privacy sanitization and normalized signal classification.
+- Admit OTLP records only after privacy sanitization and conservative signal classification.
 - Drop only the measured generic wrapper/control-plane name set when a span has no usage, error, action, lifecycle, or analytical linkage.
 - Unknown vendor spans fail open; every drop increments a durable, bounded `(source, reason)` counter exposed by `/status`.
 
@@ -17,7 +17,7 @@ OTLP span admission, durable discard counters, status readback, and a synthetic 
 - Baseline: `origin/main@9fc0af4cb59b01245f7a1862ba1647a152c8b537`
 - Trace: `46be3ad1-514a-42d2-9f14-2212fdab14dc`
 
-The gate is deliberately conservative. Technical trace/span IDs alone do not make a known Codex wrapper analytically valuable, but a session, actor, work key, git linkage, request/call identifier, usage value, error/exception, tool/action, or lifecycle classification does. An unfamiliar span name is retained until evidence establishes a safe bounded rule.
+The gate is deliberately conservative. Technical trace/span IDs alone do not make a known Codex wrapper analytically valuable, but a session, actor, work key, git linkage, request/call identifier, usage value, error/exception, tool/action, or lifecycle classification does. An unfamiliar span name is retained until evidence establishes a safe bounded rule. Deny matching trims and lowercases only; it does not normalize punctuation because separator variants can belong to new integrations.
 
 ## Evidence
 
@@ -37,6 +37,9 @@ A follow-up read-only `rowid % 1000` sample found that `handle_responses` alone 
 - [x] A signal-free known generic wrapper produces no `buffered_events` row.
 - [x] Unknown spans and every retained dimension above remain persisted.
 - [x] Error messages, stack traces, prompts, and arbitrary log bodies do not persist in metadata mode.
+- [x] Semantic raw-content fields (`http.*.body`, `db.statement`, `url.full`) and path-like span names are suppressed with receipts; explicit safe `event.name` values remain compatible.
+- [x] Punctuation-collision variants of measured names fail open rather than inheriting a deny through normalization.
+- [x] Unknown explicit action classes degrade to `other` and preserve only a bounded original marker instead of failing record parsing.
 - [x] `/status` exposes durable dropped counts by bounded source and reason without scanning `buffered_events`.
 - [x] Counter state survives a buffer reopen.
 - [x] `pnpm exec tsx scripts/otlp-admission-proof.ts` and the CLI build pass.
@@ -47,5 +50,9 @@ A follow-up read-only `rowid % 1000` sample found that `handle_responses` alone 
 No existing live rows are deleted. No installed service, live ledger, telemetry source, environment variable, or provider is changed. The proof uses a temporary HOME, database, and port. The metadata privacy invariant remains mandatory.
 
 ## Notes For Future Agents
+
+The first adversarial verifier pass found three real gaps: punctuation-normalized deny collisions, metadata-mode persistence of semantically raw attributes/path-like names/log bodies, and schema rejection of an unknown explicit action class. The implementation and focused proof now cover those exact cases. This is repair evidence for an independent verifier rerun, not a claim that proposer and verifier are the same gate.
+
+Metadata and event-detail modes persist analytical attributes through a bounded allowlist plus semantic raw-content classifier. Evidence mode retains the existing evidence behavior. Arbitrary log bodies never become event names outside evidence handling; known explicit `event.name` values remain supported.
 
 Do not broaden the generic-name set from intuition. Add a name only with measured volume/value evidence and an adversarial fixture proving error/action/linkage variants remain admitted. The counters are cumulative collector-lifetime telemetry stored in their own constant-cardinality table; they are not derived by scanning event history.

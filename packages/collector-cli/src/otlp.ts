@@ -3,6 +3,7 @@ import {
   aiInteractionEventSchema,
   estimateCostUsd,
   sanitizeForPolicy,
+  type ActionClass,
   type AiInteractionEvent,
   type PolicyConfig,
   type ToolSource,
@@ -135,42 +136,170 @@ function workdirFromRawRecord(record: Record<string, unknown>): string | undefin
   return undefined;
 }
 
-const RAW_ERROR_DETAIL_KEYS = new Set([
-  "error.message",
-  "error.stack",
-  "exception.message",
-  "exception.stacktrace",
-  "status.message",
+const SAFE_STRING_ATTRIBUTE_KEYS = new Set(
+  [
+    ...usageFieldKeys.actorId,
+    ...usageFieldKeys.cacheReadTokens,
+    ...usageFieldKeys.cacheCreationTokens,
+    ...usageFieldKeys.costUsd,
+    ...usageFieldKeys.inputTokens,
+    ...usageFieldKeys.model,
+    ...usageFieldKeys.outputTokens,
+    ...usageFieldKeys.sessionId,
+    "event.name",
+    "event.timestamp",
+    "timestamp",
+    "tool_name",
+    "toolName",
+    "tool",
+    "gen_ai.tool.name",
+    "plimsoll.action_class",
+    "cfo_one.action_class",
+    "action_class",
+    "mcp_server",
+    "request_id",
+    "call_id",
+    "gen_ai.response.id",
+    "plimsoll.project",
+    "cfo_one.project",
+    "project_key",
+    "project",
+    "plimsoll.customer",
+    "cfo_one.customer",
+    "customer_key",
+    "customer",
+    "plimsoll.workflow",
+    "cfo_one.workflow",
+    "workflow_key",
+    "workflow",
+    "decision",
+    "type",
+    "error.type",
+    "exception.type",
+    "duration_ms",
+    "success",
+    "failed",
+    "error",
+    "status.code",
+    "event.sequence",
+    "http.request.method",
+    "http.response.status_code",
+    "rpc.system",
+    "rpc.service",
+    "rpc.method",
+    "db.system",
+    "db.operation.name",
+  ].map((key) => key.toLowerCase()),
+);
+
+const SENSITIVE_SEMANTIC_KEY_PARTS = new Set([
+  "args",
+  "arguments",
+  "body",
+  "command",
+  "content",
+  "cwd",
+  "directory",
+  "file",
+  "filepath",
+  "filename",
+  "fullpath",
+  "message",
+  "output",
+  "patch",
+  "path",
+  "prompt",
+  "query",
+  "sql",
+  "stack",
+  "stacktrace",
+  "statement",
+  "uri",
+  "url",
+  "workdir",
 ]);
 
-function metadataSafeOtlpAttributes(attrs: Record<string, unknown>) {
+function looksLikePathOrUrl(value: string) {
+  const candidate = value.trim();
+  return (
+    /^(?:\/|~\/|file:\/\/|https?:\/\/|[a-zA-Z]:[\\/])/.test(candidate) ||
+    candidate.includes("\\")
+  );
+}
+
+function boundedSignalName(value: unknown) {
+  if (typeof value !== "string") return undefined;
+  const candidate = value.trim();
+  return /^[a-zA-Z0-9_./:+-]{1,160}$/.test(candidate) && !looksLikePathOrUrl(candidate)
+    ? candidate
+    : undefined;
+}
+
+function isSensitiveSemanticKey(key: string) {
+  const parts = key.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
+  return parts.some((part) => SENSITIVE_SEMANTIC_KEY_PARTS.has(part));
+}
+
+function isSafeAnalyticalAttribute(key: string, value: unknown) {
+  const allowlisted = SAFE_STRING_ATTRIBUTE_KEYS.has(key.toLowerCase());
+  if (isSensitiveSemanticKey(key) && !allowlisted) return false;
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value === "boolean") return true;
+  if (typeof value !== "string") return false;
+  return allowlisted && Boolean(boundedSignalName(value));
+}
+
+function metadataSafeOtlpAttributes(
+  attrs: Record<string, unknown>,
+  dataMode: PolicyConfig["dataMode"],
+) {
+  if (dataMode === "evidence") return { attrs, suppressedFields: [] as string[] };
   const safe: Record<string, unknown> = {};
   const suppressedFields: string[] = [];
   for (const [key, value] of Object.entries(attrs)) {
-    const normalizedKey = key.toLowerCase();
-    const invalidSignalIdentifier =
-      ["event.name", "error.type", "exception.type"].includes(normalizedKey) &&
-      typeof value === "string" &&
-      !boundedSignalName(value);
-    if (RAW_ERROR_DETAIL_KEYS.has(normalizedKey) || invalidSignalIdentifier) {
-      suppressedFields.push(`attributes.${key}`);
-    } else {
+    if (isSafeAnalyticalAttribute(key, value)) {
       safe[key] = value;
+    } else {
+      suppressedFields.push(`attributes.${key}`);
     }
   }
   return { attrs: safe, suppressedFields };
 }
 
-function boundedSignalName(value: unknown) {
-  return typeof value === "string" && /^[a-zA-Z0-9_./:-]{1,160}$/.test(value.trim())
-    ? value.trim()
-    : undefined;
+function eventNameFromAttributes(attrs: Record<string, unknown>) {
+  return boundedSignalName(stringField(attrs, ["event.name"]));
 }
 
-function eventNameFromRecord(record: Record<string, unknown>, attrs: Record<string, unknown>) {
-  const explicit = boundedSignalName(stringField(attrs, ["event.name"]));
-  if (explicit) return explicit;
-  return boundedSignalName(otelScalar(asRecord(record.body)));
+const ACTION_CLASSES = new Set<ActionClass>([
+  "continue",
+  "validate",
+  "test",
+  "edit",
+  "read",
+  "write",
+  "shell",
+  "mcp",
+  "browser",
+  "review",
+  "other",
+]);
+
+function explicitActionFrom(attrs: Record<string, unknown>) {
+  const raw = stringField(attrs, [
+    "plimsoll.action_class",
+    "cfo_one.action_class",
+    "action_class",
+  ]);
+  if (!raw) return { present: false as const };
+  const normalized = raw.toLowerCase();
+  if (ACTION_CLASSES.has(normalized as ActionClass)) {
+    return { present: true as const, actionClass: normalized as ActionClass };
+  }
+  return {
+    present: true as const,
+    actionClass: "other" as const,
+    originalActionClass: boundedSignalName(raw),
+  };
 }
 
 function statusCode(record: Record<string, unknown>) {
@@ -223,10 +352,9 @@ function buildLogEvent(
     : undefined;
   const sanitized = sanitizeForPolicy(record, context.policy);
   const safeRecord = asRecord(sanitized.value);
-  const flattenedAttrs = flattenOtelAttributes(safeRecord.attributes);
-  const metadataAttrs = metadataSafeOtlpAttributes(flattenedAttrs);
-  const attrs = metadataAttrs.attrs;
-  const otelEventName = eventNameFromRecord(safeRecord, attrs);
+  const attrs = flattenOtelAttributes(safeRecord.attributes);
+  const metadataAttrs = metadataSafeOtlpAttributes(attrs, context.policy.dataMode);
+  const otelEventName = eventNameFromAttributes(attrs);
 
   const inputTokens = intTokens(numberField(attrs, [...usageFieldKeys.inputTokens]));
   const outputTokens = intTokens(numberField(attrs, [...usageFieldKeys.outputTokens]));
@@ -255,13 +383,14 @@ function buildLogEvent(
     costUsd !== undefined;
 
   const toolName = boundedSignalName(stringField(attrs, ["tool_name", "toolName", "tool"]));
-  const explicitActionClass = stringField(attrs, ["plimsoll.action_class", "cfo_one.action_class", "action_class"]);
-  const derived = explicitActionClass ? undefined : deriveActionClass(toolName);
+  const explicitAction = explicitActionFrom(attrs);
+  const derived = explicitAction.present ? undefined : deriveActionClass(toolName);
   const mcpServer = stringField(attrs, ["mcp_server"]);
   const actionClass =
-    explicitActionClass ??
-    (derived?.actionClass === "other" && mcpServer ? "mcp" : derived?.actionClass) ??
-    "other";
+    explicitAction.present
+      ? explicitAction.actionClass
+      : (derived?.actionClass === "other" && mcpServer ? "mcp" : derived?.actionClass) ??
+        "other";
 
   const eventType = hasUsage
     ? "assistant_response"
@@ -299,10 +428,14 @@ function buildLogEvent(
     cacheCreationTokens,
     costUsd: costUsd !== undefined && costUsd >= 0 ? costUsd : undefined,
     metadata: {
-      ...attrs,
+      ...metadataAttrs.attrs,
       ...(otelEventName ? { otelEventName } : {}),
       ...(toolName ? { toolName } : {}),
       ...(derived?.detail ? { toolClassDetail: derived.detail } : {}),
+      ...(explicitAction.present ? { otelExplicitAction: true } : {}),
+      ...(explicitAction.present && explicitAction.originalActionClass
+        ? { otelOriginalActionClass: explicitAction.originalActionClass }
+        : {}),
       ...(context.transportPath ? { transport_path: context.transportPath } : {}),
       ...(context.serviceName ? { serviceName: context.serviceName } : {}),
       ...(context.serviceVersion ? { serviceVersion: context.serviceVersion } : {}),
@@ -316,6 +449,7 @@ function buildLogEvent(
     suppressedFields: [
       ...sanitized.evaluation.suppressedFields,
       ...metadataAttrs.suppressedFields,
+      ...(context.policy.dataMode !== "evidence" && "body" in safeRecord ? ["body"] : []),
     ],
   };
 }
@@ -332,9 +466,8 @@ function buildSpanEvent(
 ): { event: AiInteractionEvent; suppressedFields: string[] } {
   const sanitized = sanitizeForPolicy(span, context.policy);
   const safeSpan = asRecord(sanitized.value);
-  const flattenedAttrs = flattenOtelAttributes(safeSpan.attributes);
-  const metadataAttrs = metadataSafeOtlpAttributes(flattenedAttrs);
-  const attrs = metadataAttrs.attrs;
+  const attrs = flattenOtelAttributes(safeSpan.attributes);
+  const metadataAttrs = metadataSafeOtlpAttributes(attrs, context.policy.dataMode);
   const rawSpanName = typeof safeSpan.name === "string" ? safeSpan.name : undefined;
   const spanName = boundedSignalName(rawSpanName);
   const observedAt = recordTimestamp(safeSpan, attrs);
@@ -368,12 +501,8 @@ function buildSpanEvent(
   const toolName = boundedSignalName(
     stringField(attrs, ["tool_name", "toolName", "tool", "gen_ai.tool.name"]),
   );
-  const explicitActionClass = stringField(attrs, [
-    "plimsoll.action_class",
-    "cfo_one.action_class",
-    "action_class",
-  ]);
-  const derived = explicitActionClass ? undefined : deriveActionClass(toolName);
+  const explicitAction = explicitActionFrom(attrs);
+  const derived = explicitAction.present ? undefined : deriveActionClass(toolName);
   const classifiedType = classifyEventType(spanName);
   const lifecycleType =
     classifiedType === "session_start" ||
@@ -383,7 +512,7 @@ function buildSpanEvent(
       : undefined;
   const eventType = hasUsage
     ? "assistant_response"
-    : toolName || explicitActionClass
+    : toolName || explicitAction.present
       ? classifiedType === "tool_result"
         ? "tool_result"
         : "tool_use"
@@ -416,19 +545,22 @@ function buildSpanEvent(
     projectKey: stringField(attrs, ["plimsoll.project", "cfo_one.project", "project_key", "project"]),
     customerKey: stringField(attrs, ["plimsoll.customer", "cfo_one.customer", "customer_key", "customer"]),
     workflowKey: stringField(attrs, ["plimsoll.workflow", "cfo_one.workflow", "workflow_key", "workflow"]),
-    actionClass: explicitActionClass ?? derived?.actionClass ?? "other",
+    actionClass: explicitAction.present ? explicitAction.actionClass : derived?.actionClass ?? "other",
     inputTokens,
     outputTokens,
     cacheReadTokens: cacheReadTokensSpan,
     cacheCreationTokens: cacheCreationTokensSpan,
     costUsd: costUsd !== undefined && costUsd >= 0 ? costUsd : undefined,
     metadata: {
-      ...attrs,
+      ...metadataAttrs.attrs,
       ...(costEstimated ? { costEstimated: true } : {}),
       ...(spanName ? { otelEventName: spanName } : {}),
       ...(toolName ? { toolName } : {}),
       ...(derived?.detail ? { toolClassDetail: derived.detail } : {}),
-      ...(explicitActionClass ? { otelExplicitAction: true } : {}),
+      ...(explicitAction.present ? { otelExplicitAction: true } : {}),
+      ...(explicitAction.present && explicitAction.originalActionClass
+        ? { otelOriginalActionClass: explicitAction.originalActionClass }
+        : {}),
       ...(otelStatusCode !== undefined ? { otelStatusCode } : {}),
       ...(otelHasException ? { otelHasException: true } : {}),
       ...(otelHasError ? { otelHasError: true } : {}),
@@ -457,7 +589,7 @@ function buildMetricSamples(
     serviceName?: string;
   },
 ): MetricSample[] {
-  const metricName = typeof metric.name === "string" ? metric.name : "unknown_metric";
+  const metricName = boundedSignalName(metric.name) ?? "unknown_metric";
   const samples: MetricSample[] = [];
   const shapes: Array<{ kind: string; dataPoints: unknown }> = [
     { kind: "sum", dataPoints: asRecord(metric.sum).dataPoints },
@@ -471,6 +603,7 @@ function buildMetricSamples(
       const sanitized = sanitizeForPolicy(dataPointRaw, context.policy);
       const dataPoint = asRecord(sanitized.value);
       const attrs = flattenOtelAttributes(dataPoint.attributes);
+      const metadataAttrs = metadataSafeOtlpAttributes(attrs, context.policy.dataMode);
       const value =
         shape.kind === "histogram"
           ? numberField(dataPoint, ["sum", "count"])
@@ -499,7 +632,7 @@ function buildMetricSamples(
         model,
         sampleType,
         value,
-        attrs,
+        attrs: metadataAttrs.attrs,
       });
     }
   }
