@@ -2,7 +2,10 @@ import os from "node:os";
 
 import Database from "better-sqlite3";
 
-import type { AiInteractionEvent } from "../../shared/src/index";
+import {
+  canonicalizeSuppressionReceipts,
+  type AiInteractionEvent,
+} from "../../shared/src/index";
 import type { MetricSample } from "./otlp";
 import type { OtlpAdmissionDrop, OtlpDropReason } from "./otlp-admission";
 import { ensureCodexReconciliationSchema } from "./codex-reconciliation";
@@ -297,6 +300,7 @@ export class LocalEventBuffer {
 
   private appendInCurrentTransaction(event: AiInteractionEvent, suppressedFields: string[] = []) {
     const createdAt = new Date().toISOString();
+    const canonicalSuppressedFields = canonicalizeSuppressionReceipts(suppressedFields);
     const result = this.db
       .prepare(
         `insert or ignore into buffered_events
@@ -317,7 +321,7 @@ export class LocalEventBuffer {
         dataMode: event.dataMode,
         observedAt: event.observedAt,
         payloadJson: JSON.stringify(event),
-        suppressedFieldsJson: JSON.stringify(suppressedFields),
+        suppressedFieldsJson: JSON.stringify(canonicalSuppressedFields),
         createdAt,
         sessionId: event.sessionId ?? null,
         actionClass: event.actionClass ?? null,
@@ -341,7 +345,7 @@ export class LocalEventBuffer {
         createdAt,
         uploadedAt: null,
         payloadJson: JSON.stringify(event),
-        suppressedFieldsJson: JSON.stringify(suppressedFields),
+        suppressedFieldsJson: JSON.stringify(canonicalSuppressedFields),
         repoHash: gitField(event, "remoteUrlHash"),
         branchHash: gitField(event, "branchHash"),
       });

@@ -1,6 +1,9 @@
 import {
   aiWorkIngestEventSchema,
   aiWorkSessionSyncRowSchema,
+  canonicalSuppressionReceipt,
+  canonicalizeSuppressionReceipts,
+  hasSensitiveSuppressionConcept,
   isForbiddenRawContentFieldName,
   type AiInteractionEvent,
   type AiWorkIngestEvent,
@@ -9,7 +12,6 @@ import {
 
 const CANONICAL_LINKAGE = /^sha256:([a-f0-9]{64})$/i;
 const COMMIT_SHA = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i;
-const SAFE_SUPPRESSED_FIELD = /^[a-zA-Z0-9_.:-]{1,96}$/;
 const SAFE_IDENTIFIER = /^[a-zA-Z0-9][a-zA-Z0-9_.:+-]{0,159}$/;
 const SAFE_COMPONENT_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.:+-]{0,199}$/;
 const SAFE_CLASSIFICATION = /^[a-zA-Z0-9][a-zA-Z0-9_.:+-]{0,95}$/;
@@ -171,15 +173,6 @@ function safeNumericTokenCounter(key: string, value: unknown) {
   );
 }
 
-function hasSecretValueConcept(value: string) {
-  const words = keyWords(value);
-  if (words.some((word) => ["credential", "credentials", "secret", "secrets", "password", "token", "tokens"].includes(word))) {
-    return true;
-  }
-  const collapsed = words.join("");
-  return collapsed.includes("apikey") || collapsed.includes("privatekey");
-}
-
 /**
  * Content-independent outbound value gate. Keys are not enough: a credential
  * can be placed under an otherwise approved field such as serviceName. This
@@ -196,7 +189,7 @@ export function hasUnsafeOutboundString(value: unknown, options: { allowSlash?: 
     AUTH_SCHEME.test(candidate) ||
     JWT.test(candidate) ||
     PEM_PRIVATE_KEY.test(candidate) ||
-    hasSecretValueConcept(candidate) ||
+    hasSensitiveSuppressionConcept(candidate) ||
     /(?:^|[/.])\.\.(?:[/.]|$)/.test(candidate) ||
     /%(?:2e|2f|5c)/i.test(candidate) ||
     /(?:file|https?):\/\//i.test(candidate) ||
@@ -282,7 +275,7 @@ function sanitizeMetadata(input: Record<string, unknown>): MetadataOutcome {
   const metadata: Record<string, unknown> = {};
   const omittedFields: string[] = [];
   const recordOmission = (key: string) => {
-    if (SAFE_SUPPRESSED_FIELD.test(key) && !hasSecretValueConcept(key)) omittedFields.push(key);
+    omittedFields.push(canonicalSuppressionReceipt(key));
   };
 
   for (const [key, value] of Object.entries(input)) {
@@ -290,7 +283,10 @@ function sanitizeMetadata(input: Record<string, unknown>): MetadataOutcome {
       recordOmission(key);
       continue;
     }
-    if (!/^[\x20-\x7e]+$/.test(key)) continue;
+    if (!/^[\x20-\x7e]+$/.test(key)) {
+      recordOmission(key);
+      continue;
+    }
     if (value === null || value === undefined) continue;
 
     if (key === "git") {
@@ -397,7 +393,7 @@ function sanitizeMetadata(input: Record<string, unknown>): MetadataOutcome {
     recordOmission(key);
   }
 
-  return { ok: true, metadata, omittedFields: [...new Set(omittedFields)] };
+  return { ok: true, metadata, omittedFields: canonicalizeSuppressionReceipts(omittedFields) };
 }
 
 function safeTopLevelIdentifier(value: string | undefined) {
@@ -470,11 +466,10 @@ export function sealOutboundEnvelope(input: unknown): OutboundEnvelopeOutcome {
   if (!sealed.ok) return sealed;
   const envelope = aiWorkIngestEventSchema.safeParse({
     event: sealed.event,
-    suppressedFields: [...new Set(
-      [...parsed.data.suppressedFields, ...sealed.omittedFields]
-        .map((field) => field.trim())
-        .filter((field) => SAFE_SUPPRESSED_FIELD.test(field) && !hasSecretValueConcept(field)),
-    )],
+    suppressedFields: canonicalizeSuppressionReceipts([
+      ...parsed.data.suppressedFields,
+      ...sealed.omittedFields,
+    ]),
   });
   return envelope.success
     ? { ok: true, envelope: envelope.data }

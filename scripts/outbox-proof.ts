@@ -5,9 +5,23 @@ import path from "node:path";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { normalizeHookPayload } from "../packages/collector-cli/src/normalizer";
+import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { sealOutboundEnvelope } from "../packages/collector-cli/src/outbound-envelope";
 import { DeliveryUploadError, uploadBufferedEvents } from "../packages/collector-cli/src/upload";
-import { aiInteractionEventSchema, DEFAULT_POLICY, remoteLinkageHash } from "../packages/shared/src/index";
+import {
+  GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
+  GENERIC_SUPPRESSION_RECEIPT,
+  SUPPRESSION_ATTRIBUTE_KEY_MAX_LENGTH,
+  SUPPRESSION_RECEIPT_MAX_COUNT,
+  SUPPRESSION_RECEIPT_MAX_LENGTH,
+  SUPPRESSION_RECEIPT_OVERFLOW,
+  aiInteractionEventSchema,
+  canonicalizeSuppressionReceipts,
+  DEFAULT_POLICY,
+  isCanonicalSuppressionReceipt,
+  remoteLinkageHash,
+  suppressionReceiptForAttributeKey,
+} from "../packages/shared/src/index";
 
 type Check = { name: string; passed: boolean; detail: Record<string, unknown> };
 const checks: Check[] = [];
@@ -1056,6 +1070,274 @@ async function noMarkPressureAndPrivacyProof() {
   }
 }
 
+function suppressionReceiptContractProof() {
+  const prefix = "attributes.";
+  const exactBoundaryKey = "b".repeat(SUPPRESSION_ATTRIBUTE_KEY_MAX_LENGTH);
+  const boundaryPlusOneKey = `${exactBoundaryKey}b`;
+  const punctuationKeys = [
+    "punct_under_score",
+    "punct.dot",
+    "punct:colon",
+    "punct+plus",
+    "punct-minus",
+    "Az_9.:+-",
+  ];
+  const safeKeys = ["a", exactBoundaryKey, ...punctuationKeys];
+  const hostileKeys = [
+    boundaryPlusOneKey,
+    "/Users/private/suppression-key",
+    "relative/private/suppression-key",
+    "C:\\private\\suppression-key",
+    "https://private.invalid/suppression-key",
+    "owner@example.invalid",
+    "line\nbreak",
+    "résumé",
+    "re\u0301sume\u0301",
+    "sеcret",
+    "ｋｅｙ",
+    "private%2Fpath?query=SUPPRESSION_KEY_SENTINEL",
+  ];
+  const formatted = [...safeKeys, ...hostileKeys].map(suppressionReceiptForAttributeKey);
+  const canonical = canonicalizeSuppressionReceipts(formatted);
+  const expected = [
+    ...safeKeys.map((key) => `${prefix}${key}`),
+    GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
+  ];
+  const legacy = canonicalizeSuppressionReceipts([
+    " prompt ",
+    "/Users/private/LEGACY_KEY_SENTINEL",
+    "attributes.[non_ascii_or_unbounded_key]",
+    "attributes.Az_9.:+-",
+  ]);
+  const bounded = canonicalizeSuppressionReceipts(
+    Array.from({ length: SUPPRESSION_RECEIPT_MAX_COUNT + 72 }, (_, index) =>
+      `receipt.${String(index).padStart(3, "0")}`,
+    ),
+  );
+  record(
+    "suppression_receipt_shared_contract_boundaries_punctuation_and_legacy",
+    safeKeys.every((key, index) => formatted[index] === `${prefix}${key}`) &&
+      formatted[safeKeys.length] === GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT &&
+      formatted.slice(safeKeys.length).every((receipt) => receipt === GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT) &&
+      JSON.stringify(canonical) === JSON.stringify(expected) &&
+      expected[1]?.length === SUPPRESSION_RECEIPT_MAX_LENGTH &&
+      legacy.join(",") === [
+        "prompt",
+        GENERIC_SUPPRESSION_RECEIPT,
+        "attributes.Az_9.:+-",
+      ].join(",") &&
+      canonical.every(isCanonicalSuppressionReceipt),
+    {
+      safe: safeKeys.length,
+      hostile: hostileKeys.length,
+      canonical: canonical.length,
+      genericCollisions: formatted.filter(
+        (receipt) => receipt === GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
+      ).length,
+      exactTotalLength: expected[1]?.length ?? 0,
+      boundaryPlusOneGeneric: formatted[safeKeys.length] === GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
+      legacyCompatibility: legacy,
+    },
+  );
+  record(
+    "suppression_receipt_cardinality_is_bounded_with_explicit_overflow",
+    bounded.length === SUPPRESSION_RECEIPT_MAX_COUNT &&
+      bounded.at(-1) === SUPPRESSION_RECEIPT_OVERFLOW &&
+      new Set(bounded).size === bounded.length &&
+      bounded.every(isCanonicalSuppressionReceipt),
+    {
+      inputs: SUPPRESSION_RECEIPT_MAX_COUNT + 72,
+      outputs: bounded.length,
+      unique: new Set(bounded).size,
+      overflow: bounded.at(-1) ?? null,
+    },
+  );
+}
+
+async function suppressionReceiptProductionParityProof() {
+  const file = ledger();
+  const cfg = config();
+  const prefix = "attributes.";
+  const exactBoundaryKey = "b".repeat(SUPPRESSION_ATTRIBUTE_KEY_MAX_LENGTH);
+  const safeKeys = [
+    "a",
+    exactBoundaryKey,
+    "punct_under_score",
+    "punct.dot",
+    "punct:colon",
+    "punct+plus",
+    "punct-minus",
+    "Az_9.:+-",
+  ];
+  const hostileKeys = [
+    `${exactBoundaryKey}b`,
+    "/Users/private/suppression-key",
+    "relative/private/suppression-key",
+    "C:\\private\\suppression-key",
+    "https://private.invalid/suppression-key",
+    "owner@example.invalid",
+    "line\nbreak",
+    "résumé",
+    "re\u0301sume\u0301",
+    "sеcret",
+    "ｋｅｙ",
+    "private%2Fpath?query=SUPPRESSION_KEY_SENTINEL",
+  ];
+  const privateValues = [...safeKeys, ...hostileKeys].map(
+    (_, index) => `SUPPRESSION_PRIVATE_VALUE_${String(index).padStart(2, "0")}`,
+  );
+  const attributes = [
+    { key: "gen_ai.usage.input_tokens", value: { intValue: "81" } },
+    { key: "gen_ai.usage.output_tokens", value: { intValue: "8" } },
+    ...[...safeKeys, ...hostileKeys].map((key, index) => ({
+      key,
+      value: { stringValue: privateValues[index] },
+    })),
+  ];
+  const exploded = explodeOtlpPayload(
+    {
+      resourceSpans: [
+        {
+          resource: {
+            attributes: [{ key: "service.name", value: { stringValue: "codex_exec" } }],
+          },
+          scopeSpans: [
+            {
+              spans: [
+                {
+                  name: "handle_responses",
+                  traceId: "81".padStart(32, "0"),
+                  spanId: "81".padStart(16, "0"),
+                  startTimeUnixNano: "1781400000000000000",
+                  attributes,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    },
+    {
+      policy: DEFAULT_POLICY,
+      source: "codex",
+      transportPath: "/v1/traces",
+      resolveGit: false,
+    },
+  );
+  const expected = [
+    ...safeKeys.map((key) => `${prefix}${key}`),
+    GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
+  ];
+  let buffer = new LocalEventBuffer(file, {
+    delivery: { enabled: true, limits: cfg.delivery },
+  });
+  buffer.appendMany(exploded.events, exploded.metricSamples, exploded.admissionDrops);
+  const capturedId = exploded.events[0]?.event.id;
+  const beforeClose = buffer.database
+    .prepare(
+      `select payload_json as payload, suppressed_fields_json as suppressed,
+         (select base_envelope_json from upload_outbox where delivery_id = buffered_events.id) as base
+       from buffered_events where id = ?`,
+    )
+    .get(capturedId) as { payload: string; suppressed: string; base: string } | undefined;
+  buffer.close();
+
+  buffer = new LocalEventBuffer(file, {
+    delivery: { enabled: true, limits: cfg.delivery },
+  });
+  const reopened = buffer.database
+    .prepare(
+      `select suppressed_fields_json as suppressed,
+         (select base_envelope_json from upload_outbox where delivery_id = buffered_events.id) as base
+       from buffered_events where id = ?`,
+    )
+    .get(capturedId) as { suppressed: string; base: string } | undefined;
+  let requestBody = "";
+  const uploaded = await uploadBufferedEvents(cfg, buffer, {
+    fetchImpl: async (_input, init) => {
+      requestBody = String(init?.body ?? "");
+      return response(200, { accepted: requestIds(init).length });
+    },
+    now: () => instant(2_810),
+  });
+  const witness = buffer.database
+    .prepare(`select envelope_json as envelope from upload_validation_witness where singleton = 1`)
+    .get() as { envelope: string } | undefined;
+  const receipt = buffer.database
+    .prepare(`select reason from upload_receipts where delivery_id = ?`)
+    .get(capturedId) as { reason: string } | undefined;
+  const localReceipts = JSON.parse(reopened?.suppressed ?? "[]") as string[];
+  const baseReceipts = (JSON.parse(reopened?.base ?? "{}") as { suppressedFields?: string[] })
+    .suppressedFields ?? [];
+  const wireEnvelope = (JSON.parse(requestBody) as {
+    events?: Array<{ suppressedFields?: string[] }>;
+  }).events?.[0];
+  const wireReceipts = wireEnvelope?.suppressedFields ?? [];
+  const witnessReceipts = (
+    JSON.parse(witness?.envelope ?? "{}") as { suppressedFields?: string[] }
+  ).suppressedFields ?? [];
+  const durableText = [
+    beforeClose?.payload ?? "",
+    beforeClose?.suppressed ?? "",
+    beforeClose?.base ?? "",
+    reopened?.suppressed ?? "",
+    reopened?.base ?? "",
+    witness?.envelope ?? "",
+    requestBody,
+  ].join("\n");
+  const privateTerms = [...privateValues, ...hostileKeys];
+  const noPrivateTerms = privateTerms.every((term) => !durableText.includes(term));
+  const exactParity = [
+    exploded.events[0]?.suppressedFields ?? [],
+    localReceipts,
+    baseReceipts,
+    wireReceipts,
+    witnessReceipts,
+  ].every((receipts) => JSON.stringify(receipts) === JSON.stringify(expected));
+  const genericCount = wireReceipts.filter(
+    (receiptName) => receiptName === GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
+  ).length;
+  record(
+    "suppression_receipts_survive_capture_reopen_seal_and_upload_with_exact_parity",
+    exploded.recordCount === 1 &&
+      exploded.events.length === 1 &&
+      exploded.droppedEventCount === 0 &&
+      exploded.parseFailures === 0 &&
+      uploaded.uploadedEvents === 1 &&
+      receipt?.reason === "remote_acknowledged" &&
+      exactParity &&
+      genericCount === 1 &&
+      expected.length === safeKeys.length + 1 &&
+      noPrivateTerms,
+    {
+      observed: exploded.recordCount,
+      admitted: exploded.events.length,
+      dropped: exploded.droppedEventCount,
+      safeReceipts: safeKeys.length,
+      hostileKeys: hostileKeys.length,
+      canonicalReceipts: wireReceipts.length,
+      genericCount,
+      exactParity,
+      noPrivateTerms,
+      privateTerms: privateTerms.length,
+      receipt: receipt?.reason ?? null,
+    },
+  );
+  buffer.close();
+  const closedSurfaces = [file, `${file}-wal`, `${file}-shm`]
+    .filter((candidate) => fs.existsSync(candidate))
+    .map((candidate) => fs.readFileSync(candidate).toString("utf8"));
+  record(
+    "suppression_receipt_private_values_absent_from_closed_ledger_artifacts",
+    privateTerms.every((term) => closedSurfaces.every((surface) => !surface.includes(term))),
+    {
+      artifacts: closedSurfaces.length,
+      privateTerms: privateTerms.length,
+      leaks: privateTerms.filter((term) => closedSurfaces.some((surface) => surface.includes(term))).length,
+    },
+  );
+}
+
 async function hostilePrivacyAndLinkageProof() {
   const { buffer, cfg } = enabledBuffer();
   // Legacy/local metadata is not part of the outbound contract. Its values
@@ -1732,6 +2014,8 @@ function pressureAgeByteOversizeAndStatusProof() {
 
 async function main() {
   try {
+    suppressionReceiptContractProof();
+    await suppressionReceiptProductionParityProof();
     await atomicAndDuplicateProof();
     migrationProof();
     await migrationReopenProof();

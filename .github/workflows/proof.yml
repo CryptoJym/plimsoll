@@ -28,6 +28,9 @@ jobs:
       - name: Run signal-fidelity proof
         run: pnpm proof
 
+      - name: Prove suppression receipt capture-to-upload parity
+        run: pnpm proof:outbox
+
       - name: Run strict isolated resource proof
         run: pnpm proof:resource --require-integrated --receipt evidence/resource-proof.json
 
