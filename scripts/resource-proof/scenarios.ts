@@ -580,26 +580,93 @@ function unchangedMaintenanceResult(result: CollectorMaintenanceRunResult) {
   );
 }
 
-function observeDirectoryEnumeration() {
-  const original = fs.readdirSync;
-  let calls = 0;
-  let entries = 0;
-  let restored = false;
-  const observed = ((...args: Parameters<typeof fs.readdirSync>) => {
+type DirectoryEnumerationRecord = {
+  root: string;
+  calls: number;
+  entries: number;
+  unregistered: boolean;
+  restorationVerified: boolean;
+};
+
+const directoryEnumerationObservers = new Map<string, DirectoryEnumerationRecord>();
+let directoryEnumerationOriginal: typeof fs.readdirSync | undefined;
+let directoryEnumerationWrapper: typeof fs.readdirSync | undefined;
+
+function readdirPath(value: Parameters<typeof fs.readdirSync>[0]) {
+  if (typeof value === "string") return value;
+  if (Buffer.isBuffer(value)) return value.toString();
+  if (value instanceof URL && value.protocol === "file:") return fileURLToPath(value);
+  return null;
+}
+
+function installDirectoryEnumerationWrapper() {
+  if (directoryEnumerationWrapper) {
+    if (fs.readdirSync !== directoryEnumerationWrapper) {
+      throw new Error("DirectoryObserverIntegrityLost");
+    }
+    return;
+  }
+  directoryEnumerationOriginal = fs.readdirSync;
+  const original = directoryEnumerationOriginal;
+  directoryEnumerationWrapper = ((...args: Parameters<typeof fs.readdirSync>) => {
     const result = original(...args);
-    calls += 1;
-    entries += result.length;
+    const directory = readdirPath(args[0]);
+    if (directory) {
+      for (const observer of directoryEnumerationObservers.values()) {
+        if (!observer.unregistered && within(observer.root, directory)) {
+          observer.calls += 1;
+          observer.entries += result.length;
+        }
+      }
+    }
     return result;
   }) as typeof fs.readdirSync;
-  fs.readdirSync = observed;
+  fs.readdirSync = directoryEnumerationWrapper;
+}
+
+function observeDirectoryEnumeration(root: string) {
+  const resolvedRoot = path.resolve(root);
+  if (directoryEnumerationObservers.has(resolvedRoot)) {
+    throw new Error("DirectoryObserverAlreadyRegistered");
+  }
+  installDirectoryEnumerationWrapper();
+  const record: DirectoryEnumerationRecord = {
+    root: resolvedRoot,
+    calls: 0,
+    entries: 0,
+    unregistered: false,
+    restorationVerified: false,
+  };
+  directoryEnumerationObservers.set(resolvedRoot, record);
   return {
-    snapshot: () => ({ calls, entries }),
-    restore: () => {
-      const observerWasInstalled = fs.readdirSync === observed;
-      if (observerWasInstalled) fs.readdirSync = original;
-      restored = observerWasInstalled && fs.readdirSync === original;
+    snapshot: () => ({ calls: record.calls, entries: record.entries }),
+    unregister: () => {
+      if (record.unregistered) return;
+      if (directoryEnumerationObservers.get(resolvedRoot) !== record) {
+        record.unregistered = true;
+        record.restorationVerified = false;
+        return;
+      }
+      directoryEnumerationObservers.delete(resolvedRoot);
+      record.unregistered = true;
+      if (directoryEnumerationObservers.size === 0) {
+        const original = directoryEnumerationOriginal;
+        const wrapper = directoryEnumerationWrapper;
+        if (original && wrapper && fs.readdirSync === wrapper) {
+          fs.readdirSync = original;
+        }
+        record.restorationVerified = Boolean(original && fs.readdirSync === original);
+        directoryEnumerationOriginal = undefined;
+        directoryEnumerationWrapper = undefined;
+      } else {
+        record.restorationVerified = fs.readdirSync === directoryEnumerationWrapper;
+      }
     },
-    status: () => ({ calls, entries, restored }),
+    status: () => ({
+      calls: record.calls,
+      entries: record.entries,
+      restored: record.unregistered && record.restorationVerified,
+    }),
   };
 }
 
@@ -611,10 +678,12 @@ function observeDirectoryEnumeration() {
  */
 export async function runNoChangeConstantWorkContract(
   sandbox: ResourceSandbox,
+  options: { injectFailureAfterObserverRegistration?: boolean } = {},
 ): Promise<ScenarioReceipt> {
   const started = performance.now();
   const counters = emptyWorkCounters();
   let buffer: LocalEventBuffer | undefined;
+  let directoryObserver: ReturnType<typeof observeDirectoryEnumeration> | undefined;
   try {
     writeNoChangeFixtures(sandbox);
     buffer = new LocalEventBuffer(sandbox.ledger);
@@ -636,6 +705,8 @@ export async function runNoChangeConstantWorkContract(
     const runModes: boolean[] = [];
     const mutationDeltas: EventMutationCounts[] = [];
     const directoryEntryDeltas: number[] = [];
+    const activeDirectoryObserver = observeDirectoryEnumeration(sandbox.root);
+    directoryObserver = activeDirectoryObserver;
     const scheduler = new CoalescingMaintenanceScheduler(async (recentOnly) => {
       const invocation = runModes.push(recentOnly);
       if (invocation === 1) {
@@ -643,21 +714,23 @@ export async function runNoChangeConstantWorkContract(
         await firstReleaseSignal;
       }
       const before = eventMutationCounts(buffer!);
-      const directoryBefore = directoryObserver.snapshot();
+      const directoryBefore = activeDirectoryObserver.snapshot();
       const result = await maintenance.run(recentOnly);
       mutationDeltas.push(eventMutationDelta(before, eventMutationCounts(buffer!)));
       directoryEntryDeltas.push(
-        directoryObserver.snapshot().entries - directoryBefore.entries,
+        activeDirectoryObserver.snapshot().entries - directoryBefore.entries,
       );
       return result;
     });
 
-    const directoryObserver = observeDirectoryEnumeration();
     let initialDrain: CollectorMaintenanceRunResult[] = [];
     let thirdDrain: CollectorMaintenanceRunResult[] = [];
     let queuedStatus = scheduler.status();
     let finalStatus = scheduler.status();
     try {
+      if (options.injectFailureAfterObserverRegistration) {
+        throw new Error("InjectedDirectoryObserverFailure");
+      }
       const initial = scheduler.trigger(true);
       await firstStartedSignal;
       const concurrentRecent = scheduler.trigger(true);
@@ -668,9 +741,9 @@ export async function runNoChangeConstantWorkContract(
       thirdDrain = await scheduler.trigger(true);
       finalStatus = scheduler.status();
     } finally {
-      directoryObserver.restore();
+      activeDirectoryObserver.unregister();
     }
-    const directoryObservation = directoryObserver.status();
+    const directoryObservation = activeDirectoryObserver.status();
 
     const firstRun = initialDrain[0];
     const secondRun = initialDrain[1];
@@ -789,6 +862,11 @@ export async function runNoChangeConstantWorkContract(
       },
     };
   } catch (error) {
+    directoryObserver?.unregister();
+    const directoryObservation = directoryObserver?.status();
+    if (directoryObservation) {
+      counters.filesystemEntriesScanned = directoryObservation.entries;
+    }
     return {
       id: "no_change_constant_work",
       required: true,
@@ -798,9 +876,14 @@ export async function runNoChangeConstantWorkContract(
       }; error text is omitted from the receipt.`,
       durationMs: Math.round((performance.now() - started) * 100) / 100,
       counters,
-      measurements: { deterministicIdleCounters: false },
+      measurements: {
+        deterministicIdleCounters: false,
+        filesystemObserverRestored: directoryObservation?.restored ?? false,
+        counterProvenanceProved: directoryObservation?.restored ?? false,
+      },
     };
   } finally {
+    directoryObserver?.unregister();
     buffer?.close();
   }
 }
