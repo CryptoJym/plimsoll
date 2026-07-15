@@ -580,6 +580,29 @@ function unchangedMaintenanceResult(result: CollectorMaintenanceRunResult) {
   );
 }
 
+function observeDirectoryEnumeration() {
+  const original = fs.readdirSync;
+  let calls = 0;
+  let entries = 0;
+  let restored = false;
+  const observed = ((...args: Parameters<typeof fs.readdirSync>) => {
+    const result = original(...args);
+    calls += 1;
+    entries += result.length;
+    return result;
+  }) as typeof fs.readdirSync;
+  fs.readdirSync = observed;
+  return {
+    snapshot: () => ({ calls, entries }),
+    restore: () => {
+      const observerWasInstalled = fs.readdirSync === observed;
+      if (observerWasInstalled) fs.readdirSync = original;
+      restored = observerWasInstalled && fs.readdirSync === original;
+    },
+    status: () => ({ calls, entries, restored }),
+  };
+}
+
 /**
  * Production #77 path: both real JSONL tailers, the real maintenance worker,
  * and its real coalescing scheduler. A promise handshake holds the first job
@@ -612,6 +635,7 @@ export async function runNoChangeConstantWorkContract(
     });
     const runModes: boolean[] = [];
     const mutationDeltas: EventMutationCounts[] = [];
+    const directoryEntryDeltas: number[] = [];
     const scheduler = new CoalescingMaintenanceScheduler(async (recentOnly) => {
       const invocation = runModes.push(recentOnly);
       if (invocation === 1) {
@@ -619,20 +643,34 @@ export async function runNoChangeConstantWorkContract(
         await firstReleaseSignal;
       }
       const before = eventMutationCounts(buffer!);
+      const directoryBefore = directoryObserver.snapshot();
       const result = await maintenance.run(recentOnly);
       mutationDeltas.push(eventMutationDelta(before, eventMutationCounts(buffer!)));
+      directoryEntryDeltas.push(
+        directoryObserver.snapshot().entries - directoryBefore.entries,
+      );
       return result;
     });
 
-    const initial = scheduler.trigger(true);
-    await firstStartedSignal;
-    const concurrentRecent = scheduler.trigger(true);
-    const concurrentFull = scheduler.trigger(false);
-    const queuedStatus = scheduler.status();
-    releaseFirst();
-    const [initialDrain] = await Promise.all([initial, concurrentRecent, concurrentFull]);
-    const thirdDrain = await scheduler.trigger(true);
-    const finalStatus = scheduler.status();
+    const directoryObserver = observeDirectoryEnumeration();
+    let initialDrain: CollectorMaintenanceRunResult[] = [];
+    let thirdDrain: CollectorMaintenanceRunResult[] = [];
+    let queuedStatus = scheduler.status();
+    let finalStatus = scheduler.status();
+    try {
+      const initial = scheduler.trigger(true);
+      await firstStartedSignal;
+      const concurrentRecent = scheduler.trigger(true);
+      const concurrentFull = scheduler.trigger(false);
+      queuedStatus = scheduler.status();
+      releaseFirst();
+      [initialDrain] = await Promise.all([initial, concurrentRecent, concurrentFull]);
+      thirdDrain = await scheduler.trigger(true);
+      finalStatus = scheduler.status();
+    } finally {
+      directoryObserver.restore();
+    }
+    const directoryObservation = directoryObserver.status();
 
     const firstRun = initialDrain[0];
     const secondRun = initialDrain[1];
@@ -672,8 +710,9 @@ export async function runNoChangeConstantWorkContract(
     counters.rawEventRewrites = rawEventRewrites;
     counters.repriceRowsVisited = repriceRowsVisited;
     counters.enrichmentRowsVisited = enrichmentRowsVisited;
-    counters.maintenanceRuns = 2;
+    counters.maintenanceRuns = finalStatus.runCount;
     counters.overlappingJobs = finalStatus.overlappingJobs;
+    counters.filesystemEntriesScanned = directoryObservation.entries;
 
     const firstRunBounded =
       firstRun.rollout.filesRead === 1 &&
@@ -701,10 +740,17 @@ export async function runNoChangeConstantWorkContract(
       finalStatus.maxConcurrentJobs === 1 &&
       finalStatus.overlappingJobs === 0 &&
       finalStatus.failedRuns === 0;
+    const counterProvenanceProved =
+      directoryObservation.restored &&
+      directoryEntryDeltas.length === finalStatus.runCount &&
+      directoryEntryDeltas.reduce((total, count) => total + count, 0) ===
+        counters.filesystemEntriesScanned &&
+      counters.maintenanceRuns === finalStatus.runCount;
     const passed =
       firstRunBounded &&
       deterministicIdleCounters &&
       coalescingProved &&
+      counterProvenanceProved &&
       fullHistoryFileReads === 0 &&
       fileBytesRead === 0 &&
       rawEventWrites === 0 &&
@@ -732,6 +778,14 @@ export async function runNoChangeConstantWorkContract(
         coalescedTriggerCount: finalStatus.coalescedTriggerCount,
         schedulerRunCount: finalStatus.runCount,
         maxConcurrentJobs: finalStatus.maxConcurrentJobs,
+        filesystemEnumerationCalls: directoryObservation.calls,
+        setupFilesystemEntriesScanned: directoryEntryDeltas[0] ?? 0,
+        unchangedFilesystemEntriesScanned:
+          (directoryEntryDeltas[1] ?? 0) + (directoryEntryDeltas[2] ?? 0),
+        filesystemObserverRestored: directoryObservation.restored,
+        counterProvenanceProved,
+        filesystemCounterSource: "observed fs.readdirSync returned entries",
+        maintenanceRunCounterSource: "scheduler runCount",
       },
     };
   } catch (error) {
@@ -781,14 +835,39 @@ async function assignLoopbackPort() {
   return port;
 }
 
+function buildPackagedCollectorCli(sandbox: ResourceSandbox) {
+  const packageDirectory = path.join(repoRoot, "packages", "collector-cli");
+  const cliPath = path.join(packageDirectory, "dist", "cli.mjs");
+  const build = spawnSync("pnpm", ["--dir", packageDirectory, "build"], {
+    cwd: repoRoot,
+    env: buildAllowlistedChildEnvironment(sandbox),
+    encoding: "utf8",
+    timeout: 120_000,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  if (build.status !== 0 || build.error || !fs.existsSync(cliPath)) {
+    throw new Error("PackagedCollectorBuildFailed");
+  }
+  const exactPackagePath =
+    path.resolve(cliPath) ===
+      path.resolve(repoRoot, "packages", "collector-cli", "dist", "cli.mjs") &&
+    fs.realpathSync(cliPath) === path.resolve(cliPath);
+  const executable = (fs.statSync(cliPath).mode & 0o111) !== 0;
+  if (!exactPackagePath || !executable) throw new Error("PackagedCollectorPathInvalid");
+  return {
+    cliPath,
+    buildExitCode: build.status,
+    exactPackagePath,
+    executable,
+  };
+}
+
 function spawnCollectorCli(
   sandbox: ResourceSandbox,
+  packagedCliPath: string,
   command: "start" | "stop",
 ): CapturedChild {
-  const collectorCli = path.join(repoRoot, "packages", "collector-cli", "src", "cli.ts");
-  // Node's tsx import hook executes the CLI in this exact child process. That
-  // makes the OS child PID the production runtime PID rather than a wrapper's.
-  const child = spawn(process.execPath, ["--import", "tsx", collectorCli, command], {
+  const child = spawn(process.execPath, [packagedCliPath, command], {
     cwd: repoRoot,
     env: buildAllowlistedChildEnvironment(sandbox),
     stdio: ["ignore", "pipe", "pipe"],
@@ -887,6 +966,7 @@ export async function runDuplicateStartSingleOwnerContract(
   const counters = emptyWorkCounters();
   const children: CapturedChild[] = [];
   try {
+    const packagedCli = buildPackagedCollectorCli(sandbox);
     const port = await assignLoopbackPort();
     fs.writeFileSync(
       path.join(sandbox.plimsollHome, "collector.config.json"),
@@ -895,10 +975,16 @@ export async function runDuplicateStartSingleOwnerContract(
     );
     const pidPath = path.join(sandbox.plimsollHome, "collector.pid");
     const candidates = [
-      spawnCollectorCli(sandbox, "start"),
-      spawnCollectorCli(sandbox, "start"),
+      spawnCollectorCli(sandbox, packagedCli.cliPath, "start"),
+      spawnCollectorCli(sandbox, packagedCli.cliPath, "start"),
     ];
     children.push(...candidates);
+    const candidatesUseExactPackagePath = candidates.every(
+      (candidate) =>
+        candidate.child.spawnfile === process.execPath &&
+        candidate.child.spawnargs[1] === packagedCli.cliPath &&
+        candidate.child.spawnargs[2] === "start",
+    );
     const ownerChoice = await withDeadline(
       chooseActiveCandidate(candidates),
       20_000,
@@ -956,9 +1042,35 @@ export async function runDuplicateStartSingleOwnerContract(
       loserExit.signal === null &&
       loserReceipt.status === "already_running";
     const startLockReleased = !fs.existsSync(`${pidPath}.start.lock`);
+    const startOutcomes = [
+      {
+        accepted:
+          ownerChoice.body.status === "active" &&
+          activeIdentityMatches &&
+          statusIdentityMatches &&
+          ownerProcessLive,
+        status: ownerChoice.body.status,
+      },
+      {
+        accepted: loserHonest && loserIdentityMatches,
+        status: loserReceipt.status,
+      },
+    ];
+    counters.listenersCreated = startOutcomes.filter(
+      (outcome) => outcome.status === "active",
+    ).length;
+    counters.restartRequests = startOutcomes.filter((outcome) => !outcome.accepted).length;
+    const counterProvenanceProved =
+      startOutcomes.length === 2 &&
+      counters.listenersCreated === 1 &&
+      counters.restartRequests === 0;
 
-    const stopper = spawnCollectorCli(sandbox, "stop");
+    const stopper = spawnCollectorCli(sandbox, packagedCli.cliPath, "stop");
     children.push(stopper);
+    const stopperUsesExactPackagePath =
+      stopper.child.spawnfile === process.execPath &&
+      stopper.child.spawnargs[1] === packagedCli.cliPath &&
+      stopper.child.spawnargs[2] === "stop";
     const stopperExit = await withDeadline(stopper.exit, 20_000, "StopCommandTimeout");
     const stopperReceipt = parseCapturedJson(stopper.output.stdout);
     const ownerExit = await withDeadline(owner.exit, 20_000, "OwnerShutdownTimeout");
@@ -971,13 +1083,17 @@ export async function runDuplicateStartSingleOwnerContract(
     const pidRecordRemoved =
       readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL).kind === "missing";
 
-    counters.listenersCreated = 1;
-    counters.restartRequests = 0;
     const passed =
+      packagedCli.buildExitCode === 0 &&
+      packagedCli.exactPackagePath &&
+      packagedCli.executable &&
+      candidatesUseExactPackagePath &&
+      stopperUsesExactPackagePath &&
       identityProved &&
       ownerPidRecordUnchanged &&
       loserHonest &&
       startLockReleased &&
+      counterProvenanceProved &&
       stoppedThroughCli &&
       pidRecordRemoved;
     return {
@@ -985,14 +1101,21 @@ export async function runDuplicateStartSingleOwnerContract(
       required: true,
       status: passed ? "pass" : "fail",
       detail: passed
-        ? "Two real CLI starts raced against one temporary home/port: one owner listened, one exited already_running, the owner record stayed unchanged, and the real stop path cleaned up that owner."
+        ? "Two real packaged CLI starts raced against one temporary home/port: one owner listened, one exited already_running, the owner record stayed unchanged, and the packaged stop path cleaned up that owner."
         : "Duplicate-start production contract failed one or more ownership assertions.",
       durationMs: Math.round((performance.now() - started) * 100) / 100,
       counters,
       measurements: {
         candidatesRaced: 2,
-        activeOwners: identityProved ? 1 : 0,
-        alreadyRunningCandidates: loserHonest ? 1 : 0,
+        activeOwners: counters.listenersCreated,
+        alreadyRunningCandidates: startOutcomes.filter(
+          (outcome) => outcome.status === "already_running",
+        ).length,
+        packagedCliBuildExitCode: packagedCli.buildExitCode,
+        packagedCliExactPath: packagedCli.exactPackagePath,
+        packagedCliExecutable: packagedCli.executable,
+        startCandidatesUsePackagedCli: candidatesUseExactPackagePath,
+        stopperUsesPackagedCli: stopperUsesExactPackagePath,
         ownerIdentityProved: identityProved,
         activeIdentityMatches,
         loserIdentityMatches,
@@ -1003,7 +1126,10 @@ export async function runDuplicateStartSingleOwnerContract(
         startLockReleased,
         stoppedThroughCli,
         pidRecordRemoved,
-        candidateRestartRequests: 0,
+        candidateRestartRequests: counters.restartRequests,
+        counterProvenanceProved,
+        listenerCounterSource: "packaged CLI active start outputs",
+        restartCounterSource: "unaccepted packaged CLI start outcomes",
       },
     };
   } catch (error) {
