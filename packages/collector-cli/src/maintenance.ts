@@ -4,6 +4,10 @@ import type Database from "better-sqlite3";
 
 import { MODEL_PRICING, estimateCostUsd } from "../../shared/src/index";
 import type { LocalEventBuffer } from "./buffer";
+import {
+  runCodexReconciliationMaintenance,
+  type CodexReconciliationResult,
+} from "./codex-reconciliation";
 import { RolloutTailer, type RolloutScanResult } from "./rollout-tailer";
 import { TranscriptTailer, type TranscriptScanResult } from "./transcript-tailer";
 
@@ -365,6 +369,7 @@ export type CollectorMaintenanceRunResult = {
   recentOnly: boolean;
   rollout: RolloutScanResult;
   transcript: TranscriptScanResult;
+  reconciliation: CodexReconciliationResult;
   repricing: RepricingMaintenanceResult;
   enrichment: RepoEnrichmentMaintenanceResult;
   rawEventWrites: number;
@@ -380,12 +385,14 @@ export class CollectorMaintenance {
   async run(recentOnly: boolean): Promise<CollectorMaintenanceRunResult> {
     const rollout = await this.rolloutTailer.scan({ recentOnly });
     const transcript = await this.transcriptTailer.scan({ recentOnly });
+    const reconciliation = runCodexReconciliationMaintenance(this.buffer.database);
     const repricing = runRepricingMaintenance(this.buffer.database);
     const enrichment = runRepoEnrichmentMaintenance(this.buffer.database);
     return {
       recentOnly,
       rollout,
       transcript,
+      reconciliation,
       repricing,
       enrichment,
       rawEventWrites: rollout.eventsAppended + transcript.eventsAppended,
@@ -406,6 +413,7 @@ export type MaintenanceSchedulerStatus = {
   transcriptFilesRead: number;
   rawEventWrites: number;
   repriceRowsVisited: number;
+  reconciliationRowsVisited: number;
   enrichmentRowsVisited: number;
   lastStartedAt: string | null;
   lastCompletedAt: string | null;
@@ -437,6 +445,7 @@ export class CoalescingMaintenanceScheduler {
   private transcriptFilesRead = 0;
   private rawEventWrites = 0;
   private repriceRowsVisited = 0;
+  private reconciliationRowsVisited = 0;
   private enrichmentRowsVisited = 0;
   private lastStartedAt: string | null = null;
   private lastCompletedAt: string | null = null;
@@ -478,6 +487,7 @@ export class CoalescingMaintenanceScheduler {
       transcriptFilesRead: this.transcriptFilesRead,
       rawEventWrites: this.rawEventWrites,
       repriceRowsVisited: this.repriceRowsVisited,
+      reconciliationRowsVisited: this.reconciliationRowsVisited,
       enrichmentRowsVisited: this.enrichmentRowsVisited,
       lastStartedAt: this.lastStartedAt,
       lastCompletedAt: this.lastCompletedAt,
@@ -503,6 +513,7 @@ export class CoalescingMaintenanceScheduler {
         this.transcriptFilesRead += result.transcript.filesRead;
         this.rawEventWrites += result.rawEventWrites;
         this.repriceRowsVisited += result.repricing.rowsVisited;
+        this.reconciliationRowsVisited += result.reconciliation.rowsVisited;
         this.enrichmentRowsVisited += result.enrichment.rowsVisited;
         results.push(result);
       } catch (error) {

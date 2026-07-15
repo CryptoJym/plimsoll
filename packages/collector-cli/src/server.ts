@@ -7,7 +7,7 @@ import type { CollectorConfig } from "./config";
 import type { ToolSource } from "../../shared/src/index";
 import { appendForwardedHook } from "./forwarder";
 import { explodeOtlpPayload } from "./otlp";
-import { estimateCostUsd, remoteLinkageHash, normalizeGitRemote } from "../../shared/src/index";
+import { remoteLinkageHash, normalizeGitRemote } from "../../shared/src/index";
 import { saveCollectorConfig } from "./config";
 import { computeCaptureHealth, type CaptureHealth } from "./health";
 import { readLocalIdentities } from "./local-identity";
@@ -21,6 +21,7 @@ import {
   dashboardSummary,
 } from "./dashboard-api";
 import type { CollectorRuntimeIdentity } from "./runtime-ownership";
+import { codexReconciliationStatus } from "./codex-reconciliation";
 
 let dashboardHtml: string | undefined;
 function loadDashboardHtml() {
@@ -125,6 +126,7 @@ export function createCollectorServer(
             dropped: buffer.otlpAdmissionCounters(),
           },
           delivery: buffer.delivery.status(),
+          reconciliation: codexReconciliationStatus(buffer.database),
           maintenance: options.maintenanceStatus?.() ?? null,
           health: healthCache.value,
         });
@@ -371,9 +373,6 @@ export function createCollectorServer(
               exploded.metricSamples,
               exploded.admissionDrops,
             );
-            if (source === "codex" && exploded.events.length > 0) {
-              buffer.reconcileCodexUsage(estimateCostUsd);
-            }
             response.writeHead(202, { "content-type": "application/json" });
             response.end(
               JSON.stringify({

@@ -32,6 +32,7 @@ import {
   CoalescingMaintenanceScheduler,
   CollectorMaintenance,
 } from "./maintenance";
+import { codexReconciliationStatus } from "./codex-reconciliation";
 import { createCollectorServer } from "./server";
 import {
   applyClaudeSettings,
@@ -401,12 +402,15 @@ async function main() {
     );
     scheduler = new CoalescingMaintenanceScheduler(async (recentOnly) => {
       const result = await maintenance.run(recentOnly);
-      const { rollout, transcript, repricing, enrichment } = result;
+      const { rollout, transcript, reconciliation, repricing, enrichment } = result;
       if (rollout.eventsAppended > 0 || rollout.parseErrors > 0) {
         console.log(JSON.stringify({ status: "rollout_scan", recentOnly, ...rollout }));
       }
       if (transcript.eventsAppended > 0 || transcript.parseErrors > 0) {
         console.log(JSON.stringify({ status: "transcript_scan", recentOnly, ...transcript }));
+      }
+      if (reconciliation.rowsChanged > 0) {
+        console.log(JSON.stringify({ status: "codex_reconciliation", ...reconciliation }));
       }
       if (repricing.repriced > 0) {
         console.log(JSON.stringify({ status: "repriced", ...repricing }));
@@ -556,6 +560,7 @@ async function main() {
           dataMode: config.policy.dataMode,
           retentionDays: config.retentionDays,
           syncConfigured: Boolean(config.uploadUrl),
+          reconciliation: codexReconciliationStatus(buffer.database),
           stats: buffer.stats(),
           delivery: buffer.delivery.status(),
           tokenCoverageLast7d: buffer.tokenCoverage(7),
