@@ -5,6 +5,7 @@ import path from "node:path";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { normalizeHookPayload } from "../packages/collector-cli/src/normalizer";
+import { sealOutboundEnvelope } from "../packages/collector-cli/src/outbound-envelope";
 import { DeliveryUploadError, uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import { aiInteractionEventSchema, DEFAULT_POLICY, remoteLinkageHash } from "../packages/shared/src/index";
 
@@ -930,12 +931,13 @@ async function noMarkPressureAndPrivacyProof() {
       .get() as { raw: number; uploaded: number };
     record(
       "no_mark_uses_same_sealed_envelope_privacy_boundary",
-      rejectedOnly.uploadedEvents === 0 &&
-        calls === 1 &&
-        withValid.uploadedEvents === 1 &&
-        requestIds({ body: requestBody }).join(",") === validId &&
+      rejectedOnly.uploadedEvents === 1 &&
+        calls === 2 &&
+        withValid.uploadedEvents === 2 &&
+        requestIds({ body: requestBody }).join(",") === [uuid(141), validId].join(",") &&
         !requestBody.includes(tokenSentinel) &&
         !requestBody.includes(malformedLinkage) &&
+        !requestBody.includes("accessToken") &&
         before.raw === 2 &&
         before.uploaded === 0 &&
         after.raw === 3 &&
@@ -1056,7 +1058,10 @@ async function noMarkPressureAndPrivacyProof() {
 
 async function hostilePrivacyAndLinkageProof() {
   const { buffer, cfg } = enabledBuffer();
-  const rejected: Array<{ metadata: Record<string, unknown>; sentinel: string }> = [
+  // Legacy/local metadata is not part of the outbound contract. Its values
+  // are omitted, while safe field names remain auditable in suppression
+  // receipts. Exact approved fields below still fail closed on unsafe values.
+  const unknownLocalOnly = [
     ["accessToken", "CAMEL_CREDENTIAL_SENTINEL_7a9f"],
     ["AccessToken", "PASCAL_CREDENTIAL_SENTINEL_7b9f"],
     ["refresh_token", "SNAKE_CREDENTIAL_SENTINEL_7c9f"],
@@ -1070,9 +1075,6 @@ async function hostilePrivacyAndLinkageProof() {
     ["providerResponse", "RESPONSE_CREDENTIAL_SENTINEL_849f"],
     ["clientSecret", "SECRET_CREDENTIAL_SENTINEL_859f"],
     ["requestURL", "URL_CREDENTIAL_SENTINEL_869f"],
-    ["branchHash", "sha256:branch-digest-short-879f"],
-    ["repoHash", "sha256:repo-digest-short-889f"],
-    ["remoteUrlHash", "sha256:remote-url-digest-short-8a9f"],
     ["apiKey", "API_KEY_SENTINEL"],
     ["API.Key", "API_DOT_KEY_SENTINEL"],
     ["privateKey", "PRIVATE_KEY_SENTINEL"],
@@ -1091,6 +1093,11 @@ async function hostilePrivacyAndLinkageProof() {
     ["authRemoteHash", `sha256:${"40".repeat(32)}`],
     ["credentialPathHash", `sha256:${"50".repeat(32)}`],
     ["secretRepoHash", `sha256:${"60".repeat(32)}`],
+  ] as const;
+  const rejected: Array<{ metadata: Record<string, unknown>; sentinel: string }> = [
+    ["branchHash", "sha256:branch-digest-short-879f"],
+    ["repoHash", "sha256:repo-digest-short-889f"],
+    ["remoteUrlHash", "sha256:remote-url-digest-short-8a9f"],
   ].map(([key, sentinel]) => ({ metadata: { [key]: sentinel }, sentinel }));
   rejected.push({
     metadata: { git: { passwordRepoHash: `sha256:${"70".repeat(32)}` } },
@@ -1167,14 +1174,15 @@ async function hostilePrivacyAndLinkageProof() {
     buffer.append(event(3_700 + index, { [entry.field]: entry.sentinel }));
   });
 
-  const omitted = [
+  const omitted: ReadonlyArray<readonly [string, string]> = [
+    ...unknownLocalOnly,
     ["remoteHash", "UNKNOWN_REMOTE_HASH_SENTINEL"],
     ["cwd", "CWD_SENTINEL"],
     ["sеcret", "CYRILLIC_SECRET_SENTINEL"],
     ["passwоrd", "CYRILLIC_PASSWORD_SENTINEL"],
     ["api🔑Key", "EMOJI_KEY_SENTINEL"],
     ["密钥", "CJK_KEY_SENTINEL"],
-  ] as const;
+  ];
   const omittedIds = new Map<string, string>();
   omitted.forEach(([key, sentinel], index) => {
     const id = uuid(4_000 + index);
@@ -1230,6 +1238,24 @@ async function hostilePrivacyAndLinkageProof() {
     },
   }));
 
+  const normalizedTypedId = uuid(4_103);
+  const normalizedLocalSentinels = {
+    "code.file.path": "/Users/private/OUTBOX_CODE_PATH_SENTINEL",
+    "user.email": "outbox-proof@example.invalid",
+    auth_mode: "OUTBOX_AUTH_MODE_SENTINEL",
+    "prompt.id": "OUTBOX_PROMPT_ID_SENTINEL",
+    prompt: "OUTBOX_RAW_PROMPT_SENTINEL",
+  };
+  buffer.append(event(4_103, {
+    metadata: {
+      originator: "local shell v1",
+      serviceName: "codex exec",
+      toolClassDetail: "file read",
+      "event.name": "tool decision",
+      ...normalizedLocalSentinels,
+    },
+  }));
+
   const beforeRows = buffer.database
     .prepare(
       `select delivery_id as id, base_envelope_json as base,
@@ -1250,6 +1276,7 @@ async function hostilePrivacyAndLinkageProof() {
   });
   const sent = JSON.parse(requestBody) as {
     events: Array<{
+      suppressedFields: string[];
       event: {
         id: string;
         projectKey?: string;
@@ -1288,21 +1315,34 @@ async function hostilePrivacyAndLinkageProof() {
   const invalidSent = sent.events.find((entry) => entry.event.id === invalidLinkageId)?.event;
   const canonicalSent = sent.events.find((entry) => entry.event.id === canonicalLinkageId)?.event;
   const metadataLinkageSent = sent.events.find((entry) => entry.event.id === metadataLinkageId)?.event;
+  const normalizedTypedEnvelope = sent.events.find((entry) => entry.event.id === normalizedTypedId);
+  const normalizedTypedSent = normalizedTypedEnvelope?.event;
   const metadataGit = metadataLinkageSent?.metadata.git as Record<string, unknown> | undefined;
   const unknownKeysOmitted = [...omittedIds.entries()].every(([id, key]) => {
     const delivered = sent.events.find((entry) => entry.event.id === id)?.event;
     return delivered !== undefined && !(key in delivered.metadata);
   });
+  const auditedOmissionFields = ["rawPrompt", "providerResponse", "requestURL", "remoteHash", "cwd"];
+  const omissionsAudited = auditedOmissionFields.every((key) =>
+    sent.events.some((entry) => entry.suppressedFields.includes(key)),
+  );
+  const normalizedLocalFieldsOmitted = Object.keys(normalizedLocalSentinels).every((key) =>
+    normalizedTypedSent !== undefined &&
+      !(key in normalizedTypedSent.metadata) &&
+      normalizedTypedEnvelope?.suppressedFields.includes(key),
+  );
   record(
     "normalized_sensitive_keys_and_noncanonical_linkage_never_enter_delivery_surfaces",
     deadBefore.length === rejected.length + topLevelRejected.length &&
       deadBefore.every((row) => row.reason === "local_privacy_violation") &&
-      beforeRows.length === omitted.length + 3 &&
+      beforeRows.length === omitted.length + 4 &&
       beforeRows.find((row) => row.id === invalidLinkageId)?.repoHash === null &&
       beforeRows.find((row) => row.id === canonicalLinkageId)?.repoHash === lowerCanonical &&
-      uploaded.uploadedEvents === omitted.length + 3 &&
+      uploaded.uploadedEvents === omitted.length + 4 &&
       absentEverywhere &&
       unknownKeysOmitted &&
+      omissionsAudited &&
+      normalizedLocalFieldsOmitted &&
       invalidSent?.projectKey === undefined &&
       canonicalSent?.projectKey === lowerCanonical &&
       invalidSent?.metadata.transport_path === "/v1/traces" &&
@@ -1333,6 +1373,8 @@ async function hostilePrivacyAndLinkageProof() {
       uploaded: uploaded.uploadedEvents,
       absentEverywhere,
       unknownKeysOmitted,
+      omissionsAudited,
+      normalizedLocalFieldsOmitted,
       invalidProjectKey: invalidSent?.projectKey ?? null,
       canonicalProjectKey: canonicalSent?.projectKey ?? null,
       metadataProjectKey: metadataLinkageSent?.projectKey ?? null,
@@ -1362,6 +1404,68 @@ async function hostilePrivacyAndLinkageProof() {
       topLevelFields: topLevelFields.length,
       topLevelCases: topLevelRejected.length,
       credentialShapes: credentialShapes.length,
+    },
+  );
+
+  record(
+    "typed_ascii_spaces_normalize_without_weakening_privacy",
+    normalizedTypedSent?.metadata.originator === "local_shell_v1" &&
+      normalizedTypedSent?.metadata.serviceName === "codex_exec" &&
+      normalizedTypedSent?.metadata.toolClassDetail === "file_read" &&
+      normalizedTypedSent?.metadata["event.name"] === "tool_decision" &&
+      Object.values(normalizedLocalSentinels).every((sentinel) =>
+        !requestBody.includes(sentinel) && !persisted.text.includes(sentinel),
+      ),
+    {
+      originator: normalizedTypedSent?.metadata.originator ?? null,
+      serviceName: normalizedTypedSent?.metadata.serviceName ?? null,
+      omittedFieldCount: normalizedTypedEnvelope?.suppressedFields.length ?? 0,
+    },
+  );
+
+  const syntheticLocalKeys = ["code.file.path", "user.email", "auth_mode", "prompt.id"] as const;
+  let syntheticAccepted = 0;
+  let syntheticNormalized = 0;
+  let syntheticAudited = 0;
+  let syntheticValueLeaks = 0;
+  for (let index = 0; index < 1_000; index += 1) {
+    const localKey = syntheticLocalKeys[index % syntheticLocalKeys.length];
+    const localValue = `SYNTHETIC_LOCAL_VALUE_${index}@example.invalid`;
+    const sealed = sealOutboundEnvelope({
+      event: event(5_000 + index, {
+        metadata: { originator: "local shell v1", [localKey]: localValue },
+      }),
+      suppressedFields: [],
+    });
+    if (!sealed.ok) continue;
+    syntheticAccepted += 1;
+    if (sealed.envelope.event.metadata.originator === "local_shell_v1") syntheticNormalized += 1;
+    if (sealed.envelope.suppressedFields.includes(localKey)) syntheticAudited += 1;
+    if (JSON.stringify(sealed.envelope).includes(localValue)) syntheticValueLeaks += 1;
+  }
+  const approvedFieldAdversarial = [
+    { metadata: { originator: "Bearer SYNTHETIC_SECRET" } },
+    { metadata: { serviceName: "/Users/private/synthetic" } },
+    { metadata: { mcp_server: "multibyte-密" } },
+    { model: "proof@example.invalid", metadata: {} },
+  ].map((override, index) => sealOutboundEnvelope({
+    event: event(6_100 + index, override),
+    suppressedFields: [],
+  }));
+  record(
+    "synthetic_safe_shape_acceptance_floor_and_adversarial_matrix",
+    syntheticAccepted >= 990 &&
+      syntheticNormalized === syntheticAccepted &&
+      syntheticAudited === syntheticAccepted &&
+      syntheticValueLeaks === 0 &&
+      approvedFieldAdversarial.every((outcome) => !outcome.ok && outcome.reason === "privacy"),
+    {
+      cases: 1_000,
+      accepted: syntheticAccepted,
+      normalized: syntheticNormalized,
+      audited: syntheticAudited,
+      valueLeaks: syntheticValueLeaks,
+      approvedFieldRejected: approvedFieldAdversarial.filter((outcome) => !outcome.ok).length,
     },
   );
   buffer.close();

@@ -1,7 +1,7 @@
 import {
   aiWorkIngestEventSchema,
   aiWorkSessionSyncRowSchema,
-  findForbiddenRawContentFields,
+  isForbiddenRawContentFieldName,
   type AiInteractionEvent,
   type AiWorkIngestEvent,
   type AiWorkSessionSyncRow,
@@ -110,7 +110,7 @@ const OMIT_LOCAL_ONLY_KEYS = new Set([
 const SENSITIVE_WORD = /^(?:access|api|args|argument|arguments|auth|authentication|authorization|bearer|body|command|content|cookie|cookies|credential|credentials|cwd|directory|dir|email|file|filename|folder|home|key|message|oauth|output|password|path|private|prompt|pwd|query|response|secret|signing|sql|ssh|stack|statement|token|tokens|uri|url|workdir|working|worktree)$/;
 
 type MetadataOutcome =
-  | { ok: true; metadata: Record<string, unknown> }
+  | { ok: true; metadata: Record<string, unknown>; omittedFields: string[] }
   | { ok: false };
 
 export type OutboundEnvelopeOutcome =
@@ -171,10 +171,6 @@ function safeNumericTokenCounter(key: string, value: unknown) {
   );
 }
 
-function hasSensitiveConcept(key: string) {
-  return keyWords(key).some((word) => SENSITIVE_WORD.test(word));
-}
-
 function hasSecretValueConcept(value: string) {
   const words = keyWords(value);
   if (words.some((word) => ["credential", "credentials", "secret", "secrets", "password", "token", "tokens"].includes(word))) {
@@ -213,11 +209,21 @@ export function hasUnsafeOutboundString(value: unknown, options: { allowSlash?: 
   return false;
 }
 
-function safeByPattern(value: unknown, pattern: RegExp, maxLength: number) {
+function safeByPattern(
+  value: unknown,
+  pattern: RegExp,
+  maxLength: number,
+  options: { normalizeSpaces?: boolean } = {},
+) {
   if (typeof value !== "string") return null;
   const candidate = value.trim();
-  if (candidate.length > maxLength || hasUnsafeOutboundString(candidate) || !pattern.test(candidate)) return null;
-  return candidate;
+  if (candidate.length > maxLength || hasUnsafeOutboundString(candidate)) return null;
+  // A space is legitimate in bounded, typed low-cardinality telemetry (for
+  // example an originator label). Normalize only literal ASCII spaces after
+  // the unsafe-value gate; field-specific alphabets still reject all other
+  // punctuation and high-cardinality material.
+  const normalized = options.normalizeSpaces ? candidate.replace(/ +/g, "_") : candidate;
+  return pattern.test(normalized) ? normalized : null;
 }
 
 export function safeOutboundIdentifier(value: unknown) {
@@ -225,11 +231,11 @@ export function safeOutboundIdentifier(value: unknown) {
 }
 
 function safeComponentName(value: unknown) {
-  return safeByPattern(value, SAFE_COMPONENT_NAME, 200);
+  return safeByPattern(value, SAFE_COMPONENT_NAME, 200, { normalizeSpaces: true });
 }
 
 function safeClassification(value: unknown) {
-  return safeByPattern(value, SAFE_CLASSIFICATION, 96);
+  return safeByPattern(value, SAFE_CLASSIFICATION, 96, { normalizeSpaces: true });
 }
 
 function safeVersion(value: unknown) {
@@ -243,7 +249,7 @@ export function canonicalCommitSha(value: unknown) {
 }
 
 function safeSignalName(key: string, value: unknown) {
-  const lowCardinality = safeByPattern(value, SAFE_COMPONENT_NAME, 160);
+  const lowCardinality = safeByPattern(value, SAFE_COMPONENT_NAME, 160, { normalizeSpaces: true });
   if (lowCardinality) return lowCardinality;
   if (typeof value !== "string" || !SLASH_SIGNAL_KEYS.has(key)) return null;
   const candidate = value.trim();
@@ -273,11 +279,17 @@ function safeMetadataString(key: string, value: unknown) {
 }
 
 function sanitizeMetadata(input: Record<string, unknown>): MetadataOutcome {
-  if (findForbiddenRawContentFields(input).length > 0) return { ok: false };
   const metadata: Record<string, unknown> = {};
+  const omittedFields: string[] = [];
+  const recordOmission = (key: string) => {
+    if (SAFE_SUPPRESSED_FIELD.test(key) && !hasSecretValueConcept(key)) omittedFields.push(key);
+  };
 
   for (const [key, value] of Object.entries(input)) {
-    if (OMIT_LOCAL_ONLY_KEYS.has(key)) continue;
+    if (OMIT_LOCAL_ONLY_KEYS.has(key) || isForbiddenRawContentFieldName(key)) {
+      recordOmission(key);
+      continue;
+    }
     if (!/^[\x20-\x7e]+$/.test(key)) continue;
     if (value === null || value === undefined) continue;
 
@@ -376,14 +388,16 @@ function sanitizeMetadata(input: Record<string, unknown>): MetadataOutcome {
       const nested = sanitizeMetadata(value as Record<string, unknown>);
       if (!nested.ok) return nested;
       if (Object.keys(nested.metadata).length > 0) metadata[key] = nested.metadata;
+      omittedFields.push(...nested.omittedFields);
       continue;
     }
-    if (hasSensitiveConcept(key)) return { ok: false };
-    // Unknown metadata is local-only by default. This also defeats Unicode
-    // homoglyphs without pretending they normalize to a trusted concept.
+    // Unknown metadata is local-only by default, including legacy raw fields
+    // and sensitive-looking keys. Values never cross; bounded ASCII field
+    // names remain in suppression receipts for auditability.
+    recordOmission(key);
   }
 
-  return { ok: true, metadata };
+  return { ok: true, metadata, omittedFields: [...new Set(omittedFields)] };
 }
 
 function safeTopLevelIdentifier(value: string | undefined) {
@@ -445,6 +459,7 @@ export function sealOutboundEvent(event: AiInteractionEvent) {
       ...(model.value === undefined ? {} : { model: model.value }),
       metadata: metadata.metadata,
     },
+    omittedFields: metadata.omittedFields,
   };
 }
 
@@ -456,7 +471,7 @@ export function sealOutboundEnvelope(input: unknown): OutboundEnvelopeOutcome {
   const envelope = aiWorkIngestEventSchema.safeParse({
     event: sealed.event,
     suppressedFields: [...new Set(
-      parsed.data.suppressedFields
+      [...parsed.data.suppressedFields, ...sealed.omittedFields]
         .map((field) => field.trim())
         .filter((field) => SAFE_SUPPRESSED_FIELD.test(field) && !hasSecretValueConcept(field)),
     )],
@@ -499,10 +514,6 @@ export function sealOutboundSessionRow(input: unknown): OutboundSessionRowOutcom
   }
 
   const metadataSource = session.metadata as Record<string, unknown>;
-  if (findForbiddenRawContentFields(metadataSource).length > 0) return { ok: false, reason: "privacy" };
-  if (Object.keys(metadataSource).some((key) => !["branchHash", "externalActorId"].includes(key))) {
-    return { ok: false, reason: "privacy" };
-  }
   const metadata: Record<string, string> = {};
   if (metadataSource.branchHash !== undefined) {
     const branchHash = typeof metadataSource.branchHash === "string"

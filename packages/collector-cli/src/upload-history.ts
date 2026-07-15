@@ -34,8 +34,9 @@ import {
  *   rows. The resume watermark is a fast-forward optimization, never a
  *   correctness mechanism.
  * - Privacy parity: the wire envelope is exactly the recent-buffer upload
- *   shape (upload.ts) — payload + suppressedFields — re-validated against the
- *   strict event schema and the forbidden-raw-content gate before send.
+ *   shape (upload.ts) — payload + suppressedFields — reduced by the shared
+ *   typed allowlist before send. Unknown/local/raw values are omitted; exact
+ *   approved fields fail closed when their values violate the contract.
  * - Honest numbers: unpriced events stay unpriced in the audit; cost is only
  *   summed over events that carry a real costUsd.
  */
@@ -92,8 +93,9 @@ export type NormalizedHistoryEvent =
  *   `sessionId: null` when no stitch neighbor exists; the schema wants the
  *   key absent — these rows otherwise wedge any oldest-first drain);
  * - non-UUID ids are deterministically re-derived (see ensureUuidEventId).
- * Everything else that fails the schema, canonical linkage, approved-value
- * contract, or raw-content gate is skipped with a reason — never silently.
+ * Everything else that fails the schema, canonical linkage, or approved-value
+ * contract is skipped with a reason. Unknown/local/raw metadata values are
+ * omitted and bounded safe field names remain in suppression receipts.
  */
 export function normalizeHistoryEvent(row: {
   payloadJson: string;

@@ -2094,7 +2094,7 @@ async function main() {
     );
 
     // 16e–16i. Loopback end-to-end: a seeded ledger (incl. one live-shape
-    // stitch artifact via the same json_set SQL, one forbidden-metadata row,
+    // stitch artifact via the same json_set SQL, one legacy raw-metadata row,
     // one unparseable row, one bogus event type) pushed to a stub workspace
     // that verifies HMAC signatures exactly like the cloud and upserts by id.
     const historyHome = path.join(tempDir, "history-home");
@@ -2201,10 +2201,12 @@ async function main() {
     seedBuffer.database
       .prepare(`update buffered_events set payload_json = json_set(payload_json, '$.sessionId', null, '$.model', null) where id = ?`)
       .run(stitchId);
-    // Forbidden metadata row (must be skipped client-side, never uploaded).
+    // Legacy raw metadata is omitted by the shared sealer. The safe field
+    // name remains in suppression receipts, but the value never uploads.
+    const historyRawId = deterministicEventId(["history-e2e-forbidden", 1]);
     seedBuffer.append(
       aiInteractionEventSchema.parse({
-        id: deterministicEventId(["history-e2e-forbidden", 1]),
+        id: historyRawId,
         source: "claude_code",
         eventType: "user_prompt_submit",
         observedAt: "2026-02-11T00:00:00.000Z",
@@ -2212,6 +2214,7 @@ async function main() {
       }),
       [],
     );
+    seededIds.push(historyRawId);
     // Unparseable payload + bogus event type (skip reasons must be itemized).
     seedBuffer.database
       .prepare(
@@ -2243,7 +2246,8 @@ async function main() {
       )
       .get() as { text: string }).text;
     seedBuffer.close();
-    const expectedEligible = 1_123; // 1,120 normal + stitch + 2 sanitized adversarial rows
+    const expectedEligible = 1_124; // 1,120 normal + stitch + 3 sanitized legacy/adversarial rows
+    const expectedInputTokens = (expectedEligible - 1) * 10 + 1; // raw legacy row has no counters; stitch has 11
 
     const HISTORY_INSTALL_KEY = "pli_historyproofkey00000000000001";
     const HISTORY_SECRET = "history-proof-signing-secret-0123456789";
@@ -2317,14 +2321,14 @@ async function main() {
         run1.sentEvents === expectedEligible &&
         historyStore.size === expectedEligible &&
         seededIds.every((id) => historyStore.has(id)) &&
-        run1.skippedEvents === 5 &&
-        run1.audit.skipped.forbidden_content === 3 &&
+        run1.skippedEvents === 4 &&
+        run1.audit.skipped.forbidden_content === 2 &&
         run1.audit.skipped.payload_unparseable === 1 &&
         run1.audit.skipped.schema_invalid === 1 &&
         historyMaxBatch <= 200 &&
         historySignatureFailures === 0 &&
         historyAuditTotals(run1.audit).localEvents === expectedEligible &&
-        historyAuditTotals(run1.audit).inputTokens === expectedEligible * 10 + 1 &&
+        historyAuditTotals(run1.audit).inputTokens === expectedInputTokens &&
         run1.insertedEvents === expectedEligible &&
         state1?.completedAt !== null &&
         state1?.watermark !== null,
@@ -2363,16 +2367,23 @@ async function main() {
     const suppressedHistoryEnvelope = historyBodies
       .flatMap((body) => (JSON.parse(body) as AiWorkIngestBatch).events)
       .find((entry) => entry.event.id === historySuppressedId);
+    const rawHistoryEnvelope = historyBodies
+      .flatMap((body) => (JSON.parse(body) as AiWorkIngestBatch).events)
+      .find((entry) => entry.event.id === historyRawId);
     check(
       "history_shared_sealer_blocks_value_bypass_and_omits_unknowns",
       unknownHistoryEvent !== undefined &&
         !("密钥" in unknownHistoryEvent.metadata) &&
         !("unknownLabel" in unknownHistoryEvent.metadata) &&
         suppressedHistoryEnvelope !== undefined &&
-        !suppressedHistoryEnvelope.suppressedFields.includes(HISTORY_SUPPRESSED_CREDENTIAL),
+        !suppressedHistoryEnvelope.suppressedFields.includes(HISTORY_SUPPRESSED_CREDENTIAL) &&
+        rawHistoryEnvelope !== undefined &&
+        !("prompt" in rawHistoryEnvelope.event.metadata) &&
+        rawHistoryEnvelope.suppressedFields.includes("prompt"),
       JSON.stringify({
         unknownMetadataKeys: Object.keys(unknownHistoryEvent?.metadata ?? {}),
         suppressedFields: suppressedHistoryEnvelope?.suppressedFields ?? [],
+        rawSuppressedFields: rawHistoryEnvelope?.suppressedFields ?? [],
       }),
     );
 
@@ -2401,7 +2412,7 @@ async function main() {
         run2.insertedEvents === 0 &&
         historyStore.size === storeSizeBeforeRun2 &&
         [...historyStore.keys()].sort().join(",") === idsBeforeRun2 &&
-        run2.skippedEvents === 5 &&
+        run2.skippedEvents === 4 &&
         /server-reported NEW rows this backfill: 0/.test(run2.auditTable),
       JSON.stringify({
         before: storeSizeBeforeRun2,
@@ -2466,7 +2477,7 @@ async function main() {
         historyAuditTotals(resumeB.audit).localEvents === expectedEligible &&
         historyAuditTotals(resumeB.audit).sentEvents === expectedEligible &&
         resumeB.insertedEvents === expectedEligible &&
-        resumeB.skippedEvents === 5,
+        resumeB.skippedEvents === 4,
       JSON.stringify({
         firstRunSent: resumeA.sentEvents,
         resumedFromRowid: resumeB.resumedFromRowid,
