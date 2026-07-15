@@ -412,15 +412,44 @@ export type AiWorkSessionSyncBatch = z.infer<typeof aiWorkSessionSyncBatchSchema
 /**
  * Repo label disclosure (issue 0036): repo display names are deliberate,
  * owner-run disclosures (push-repo-labels previews the exact payload first).
- * Only derived slugs cross the wire — a value containing "://" is refused so
- * raw remote URLs can never ride along by accident.
+ * Only bounded printable ASCII slugs cross the wire. URL/path/email,
+ * multibyte, auth, credential, secret-prefix, JWT, and private-key shapes are
+ * refused so deliberate display-name disclosure cannot become a value bypass.
  */
+const REPO_DISPLAY_SLUG = /^[a-zA-Z0-9._-]{1,200}$/;
+const REPO_SECRET_PREFIX = /(?:^|[._-])(?:sk_live|sk_test|sk-|ghp[a-z0-9_-]*|github_pat[a-z0-9_-]*|xox[a-z0-9_-]*)/i;
+const REPO_AUTH_SCHEME = /^(?:bearer|basic)(?:[._-]|$)/i;
+const REPO_JWT = /^eyj[a-z0-9_-]*\.[a-z0-9_-]+\.[a-z0-9_-]+$/i;
+const REPO_CREDENTIAL_WORD = /^(?:auth|credential|credentials|password|secret|secrets|token|tokens)$/i;
+const REPO_CREDENTIAL_COMPOUND = /(?:access|api|client|private|signing|ssh)(?:key|secret|token)/i;
+
+function isSafeRepoDisplaySlug(value: string) {
+  if (
+    !/^[\x20-\x7e]+$/.test(value) ||
+    !REPO_DISPLAY_SLUG.test(value) ||
+    value === "." ||
+    value === ".." ||
+    REPO_SECRET_PREFIX.test(value) ||
+    REPO_AUTH_SCHEME.test(value) ||
+    REPO_JWT.test(value)
+  ) {
+    return false;
+  }
+  const words = value.split(/[._-]+/).filter(Boolean);
+  const collapsed = words.join("");
+  return !words.some((word) => REPO_CREDENTIAL_WORD.test(word)) &&
+    !REPO_CREDENTIAL_COMPOUND.test(collapsed);
+}
+
 const repoDisplaySlugSchema = z
   .string()
   .trim()
   .min(1)
   .max(200)
-  .refine((value) => !value.includes("://"), "Raw URLs never cross the wire — send the derived slug.");
+  .refine(
+    isSafeRepoDisplaySlug,
+    "Expected a bounded printable ASCII repo slug without URL, path, email, credential, or secret shapes.",
+  );
 
 export const workRepoLabelSchema = z
   .object({

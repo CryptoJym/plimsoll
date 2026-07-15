@@ -2702,6 +2702,25 @@ async function main() {
     const bareLabelHash = "c3".repeat(32);
     const shortLabelHash = "sha256:short";
     const credentialLabelHash = "Bearer REPO_LABEL_CREDENTIAL_SENTINEL";
+    const unsafeRepoSlugs = [
+      "Bearer synthetic",
+      "Bearer-synthetic",
+      "sk_live_synthetic",
+      "sk-synthetic",
+      "ghp_synthetic",
+      "github_pat_synthetic",
+      "xoxb-synthetic",
+      "eyJproofheader.payloadproof.signatureproof",
+      "/Users/private/repo",
+      "relative/path",
+      "relative\\path",
+      "https://private.invalid/repo",
+      "owner@example.invalid",
+      "multibyte-密",
+      "../repo",
+      "-----BEGIN-PRIVATE-KEY-----",
+      "credential-synthetic",
+    ];
     const schemaHashCases = [
       workRepoLabelSchema.safeParse({ remoteUrlHash: canonicalLabelHash, provider: "github", owner: "cryptojym", name: "plimsoll" }),
       workRepoLabelSchema.safeParse({ remoteUrlHash: uppercaseLabelHash, provider: "github", owner: "cryptojym", name: "plimsoll" }),
@@ -2718,11 +2737,53 @@ async function main() {
         schemaHashCases.slice(2).every((outcome) => !outcome.success),
       JSON.stringify({ accepted: schemaHashCases.filter((outcome) => outcome.success).length, rejected: schemaHashCases.filter((outcome) => !outcome.success).length }),
     );
+    const legitimateSlugCases = [
+      { remoteUrlHash: canonicalLabelHash, provider: "github", owner: "cryptojym", name: "plimsoll" },
+      { remoteUrlHash: canonicalDerivedHash, provider: "gitlab", owner: "team_1", name: "repo.name-1" },
+      { remoteUrlHash: `sha256:${"e5".repeat(32)}`, provider: "local_git", name: ".local_repo-1" },
+    ].map((candidate) => workRepoLabelSchema.safeParse(candidate));
+    const unsafeSlugCases = unsafeRepoSlugs.flatMap((value) => [
+      workRepoLabelSchema.safeParse({ remoteUrlHash: canonicalLabelHash, provider: "github", owner: "proof", name: value }),
+      workRepoLabelSchema.safeParse({ remoteUrlHash: canonicalLabelHash, provider: "github", owner: value, name: "repo" }),
+    ]);
+    check(
+      "repo_label_shared_schema_restricts_owner_and_name_values",
+      legitimateSlugCases.every((outcome) => outcome.success) &&
+        unsafeSlugCases.every((outcome) => !outcome.success),
+      JSON.stringify({ legitimateAccepted: legitimateSlugCases.filter((outcome) => outcome.success).length, unsafeRejected: unsafeSlugCases.filter((outcome) => !outcome.success).length }),
+    );
+    const unsafeRecordedLabels = [
+      "github.com/proof/Bearer-synthetic",
+      "github.com/proof/sk_live_synthetic",
+      "github.com/proof/sk-synthetic",
+      "github.com/proof/ghp_synthetic",
+      "github.com/proof/github_pat_synthetic",
+      "github.com/proof/xoxb-synthetic",
+      "github.com/proof/eyJproofheader.payloadproof.signatureproof",
+      "/Users/private/repo",
+      "relative/path",
+      "relative\\path",
+      "https://private.invalid/proof/repo",
+      "github.com/proof/owner@example.invalid",
+      "github.com/proof/multibyte-密",
+      "github.com/proof/..",
+      "github.com/proof/-----BEGIN-PRIVATE-KEY-----",
+      "github.com/proof/credential-synthetic",
+      "github.com/Bearer-owner/repo",
+      "github.com/sk_live_owner/repo",
+      "github.com/owner@example.invalid/repo",
+      "github.com/multibyte-密/repo",
+      "github.com/credential-owner/repo",
+    ];
     const labelCandidates = buildRepoLabelCandidates(
       [
         { repoHash: uppercaseLabelHash, label: "github.com/cryptojym/plimsoll" },
         { repoHash: shortLabelHash, label: "github.com/invalid/short" },
         { repoHash: `sha256:${"d4".repeat(32)}`, label: "" },
+        ...unsafeRecordedLabels.map((label, index) => ({
+          repoHash: `sha256:${(0xe000 + index).toString(16).padStart(64, "0")}`,
+          label,
+        })),
       ],
       [
         { repoHash: canonicalLabelHash, url: "https://github.com/wrong/should-lose" },
@@ -2777,13 +2838,34 @@ async function main() {
       name: `repo-${index}`,
       source: "repo_label" as const,
     }));
-    for (const [index, remoteUrlHash] of [shortLabelHash, bareLabelHash, credentialLabelHash].entries()) {
+    for (const remoteUrlHash of [shortLabelHash, bareLabelHash, credentialLabelHash]) {
+      try {
+        await pushRepoLabels(
+          historyConfig,
+          [{ remoteUrlHash, provider: "github", name: "invalid", source: "repo_label" }],
+          {
+            fetchImpl: async () => {
+              invalidDirectFetches += 1;
+              return new Response(JSON.stringify({ ok: true }), { status: 200 });
+            },
+            log: () => undefined,
+          },
+        );
+      } catch {
+        invalidDirectRejects += 1;
+      }
+    }
+    const unsafeDirectCandidates = unsafeRepoSlugs.flatMap((value) => [
+      { remoteUrlHash: canonicalLabelHash, provider: "github" as const, owner: "proof", name: value, source: "repo_label" as const },
+      { remoteUrlHash: canonicalLabelHash, provider: "github" as const, owner: value, name: "repo", source: "repo_label" as const },
+    ]);
+    for (const [index, unsafeCandidate] of unsafeDirectCandidates.entries()) {
       try {
         await pushRepoLabels(
           historyConfig,
           [
             ...(index === 0 ? validDirectPrefix : []),
-            { remoteUrlHash, provider: "github", name: "invalid", source: "repo_label" },
+            unsafeCandidate,
           ],
           {
             fetchImpl: async () => {
@@ -2802,14 +2884,16 @@ async function main() {
       "repo_labels_disclose_slugs_never_urls",
       slugCases &&
         labelCandidates.candidates.length === 2 &&
-        labelCandidates.skippedInvalid === 4 &&
+        labelCandidates.skippedInvalid === 4 + unsafeRecordedLabels.length &&
         labelCandidates.candidates.find((c) => c.remoteUrlHash === canonicalLabelHash)?.name === "plimsoll" &&
         labelCandidates.candidates.find((c) => c.remoteUrlHash === canonicalLabelHash)?.source === "repo_label" &&
         labelCandidates.candidates.find((c) => c.remoteUrlHash === canonicalDerivedHash)?.source ===
           "derived_from_priority_url" &&
         labelPreview.includes("derived from priority URL") &&
+        labelPreview.includes("Owner/name must be 1-200 character ASCII slugs") &&
+        labelPreview.includes("Rejected: URL, path, email, multibyte, auth, credential") &&
         labelPreview.includes("Never sent: raw URLs") &&
-        labelPreview.includes("skipped (invalid hash or slug): 4") &&
+        labelPreview.includes(`skipped (invalid hash or slug): ${4 + unsafeRecordedLabels.length}`) &&
         labelPath === "/api/work-intelligence/repo-labels" &&
         pushedLabels.pushed === 2 &&
         directUppercasePush.pushed === 1 &&
@@ -2819,12 +2903,13 @@ async function main() {
         ) &&
         labelBodies.every((body) => !body.includes("://")) &&
         labelBodies.every((body) => !body.includes("should-lose")) &&
-        labelBodies.every((body) => !body.includes(credentialLabelHash)),
+        labelBodies.every((body) => !body.includes(credentialLabelHash)) &&
+        unsafeRepoSlugs.every((value) => labelBodies.every((body) => !body.includes(value))),
       JSON.stringify({ candidates: labelCandidates.candidates.length, skipped: labelCandidates.skippedInvalid, path: labelPath, signed: labelSignatureFailures === 0, urlLeak: labelBodies.some((b) => b.includes("://")) }),
     );
     check(
       "repo_label_push_rejects_entire_direct_batch_before_http",
-      invalidDirectRejects === 3 && invalidDirectFetches === 0,
+      invalidDirectRejects === 3 + unsafeDirectCandidates.length && invalidDirectFetches === 0,
       JSON.stringify({ rejected: invalidDirectRejects, fetches: invalidDirectFetches, validPrefixBeforeMalformed: validDirectPrefix.length }),
     );
 

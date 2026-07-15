@@ -6,6 +6,7 @@ import { collectorBufferPath } from "./config";
 import type { CollectorConfig } from "./config";
 import { canonicalLinkage } from "./outbound-envelope";
 import {
+  normalizeGitRemote,
   workRepoLabelSchema,
   workRepoLabelsBatchSchema,
   type WorkRepoLabel,
@@ -17,8 +18,8 @@ import {
  * telemetry (hashes only), a repo display name is meaning the owner chooses
  * to share. So the command:
  *   - previews EXACTLY what will cross the wire before sending (doctor-style),
- *   - sends only derived slugs (owner/name) — the schema refuses anything
- *     containing "://", so raw remote URLs cannot ride along by accident,
+ *   - sends only bounded ASCII slugs (owner/name); URL, path, email,
+ *     multibyte, auth, credential, secret, JWT, and private-key shapes fail,
  *   - never sends branch names, paths, or credentials.
  *
  * Sources: repo_labels (collector-recorded `github.com/owner/name` slugs) is
@@ -64,6 +65,36 @@ export type RepoLabelCandidate = WorkRepoLabel & {
   source: "repo_label" | "derived_from_priority_url";
 };
 
+function safeRecordedRepoLabel(raw: string) {
+  const value = raw.trim();
+  if (
+    !/^[\x20-\x7e]+$/.test(value) ||
+    value.includes("://") ||
+    value.includes("\\") ||
+    value.includes("@") ||
+    value.startsWith("/") ||
+    /(?:^|\/)\.\.(?:\/|$)/.test(value)
+  ) {
+    return null;
+  }
+  const segments = value.replace(/\.git\/?$/i, "").replace(/\/+$/, "").split("/").filter(Boolean);
+  if (segments.length !== 3 || !segments[0].includes(".")) return null;
+  return normalizeGitRemote(value) ?? null;
+}
+
+function safePriorityRepoLabel(raw: string) {
+  const value = raw.trim();
+  if (
+    !/^[\x20-\x7e]+$/.test(value) ||
+    value.includes("\\") ||
+    value.startsWith("/") ||
+    /(?:^|\/)\.\.(?:\/|$)/.test(value)
+  ) {
+    return null;
+  }
+  return normalizeGitRemote(value) ?? null;
+}
+
 /** Pure: ledger label/priority rows → wire rows, labels winning per hash. */
 export function buildRepoLabelCandidates(
   labels: Array<{ repoHash: string; label: string }>,
@@ -74,32 +105,48 @@ export function buildRepoLabelCandidates(
 
   for (const priority of priorities) {
     const remoteUrlHash = canonicalLinkage(priority.repoHash);
-    const parts = parseRepoSlug(priority.url);
+    const safeLabel = safePriorityRepoLabel(priority.url);
+    const parts = safeLabel ? parseRepoSlug(safeLabel) : null;
     if (!remoteUrlHash || !parts) {
       skippedInvalid += 1;
       continue;
     }
-    byHash.set(remoteUrlHash, {
+    const candidate = workRepoLabelSchema.safeParse({
       remoteUrlHash,
       name: parts.name,
       ...(parts.owner ? { owner: parts.owner } : {}),
       provider: parts.provider,
+    });
+    if (!candidate.success) {
+      skippedInvalid += 1;
+      continue;
+    }
+    byHash.set(candidate.data.remoteUrlHash, {
+      ...candidate.data,
       source: "derived_from_priority_url",
     });
   }
 
   for (const label of labels) {
     const remoteUrlHash = canonicalLinkage(label.repoHash);
-    const parts = parseRepoSlug(label.label);
+    const safeLabel = safeRecordedRepoLabel(label.label);
+    const parts = safeLabel ? parseRepoSlug(safeLabel) : null;
     if (!remoteUrlHash || !parts) {
       skippedInvalid += 1;
       continue;
     }
-    byHash.set(remoteUrlHash, {
+    const candidate = workRepoLabelSchema.safeParse({
       remoteUrlHash,
       name: parts.name,
       ...(parts.owner ? { owner: parts.owner } : {}),
       provider: parts.provider,
+    });
+    if (!candidate.success) {
+      skippedInvalid += 1;
+      continue;
+    }
+    byHash.set(candidate.data.remoteUrlHash, {
+      ...candidate.data,
       source: "repo_label",
     });
   }
@@ -119,6 +166,8 @@ export function renderRepoLabelPreview(
   const lines = [
     `This will disclose ${candidates.length} repo display name(s) to the workspace.`,
     "Exactly these fields cross the wire per repo: remoteUrlHash (already in your telemetry), provider, owner, name.",
+    "Owner/name must be 1-200 character ASCII slugs using only letters, numbers, dot, underscore, or hyphen.",
+    "Rejected: URL, path, email, multibyte, auth, credential, secret-prefix, JWT, and private-key shapes.",
     "Never sent: raw URLs, branch names, file paths, credentials.",
     "",
   ];
