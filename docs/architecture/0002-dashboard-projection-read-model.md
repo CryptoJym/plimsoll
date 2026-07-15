@@ -59,7 +59,7 @@ than 32 bytes/event of actual SQLite file growth (including table and index
 pages). The measured fixture is materially below both bounds.
 
 The measured fixture produces 100 segments, 5.65 logical projection bytes per
-raw event, and 7.91 bytes/event of actual SQLite file growth.
+raw event, and 7.95 bytes/event of actual SQLite file growth.
 
 Active generic-span capture does not compress one event at a time. The raw
 transaction leaves its trigger-authored repair receipt durable and returns;
@@ -79,6 +79,16 @@ Repair reasons also encode whether a row has ever entered the projection.
   old compact contribution before the repair coalesces further changes.
 - `raw_delete` settles the previously projected fact or compact contribution
   to zero.
+
+The mutation and repair queues have an explicit dependency rule. Maintenance
+must not consume or delete an already-projected `raw_update` repair while a
+compact mutation for the same raw row still exists. The mutation drains first,
+materializes its old-state cancellation, and thereby makes the repair eligible
+to add the current row exactly once. Eligibility is filtered before the
+250-row limit, and eligible repairs are read through the `(queued_at,
+raw_rowid)` index while the dependency check uses the mutation table's integer
+primary key. A blocked low rowid therefore cannot hide independent eligible
+work or turn the bounded query into a queue scan.
 
 This ordering prevents both the missing-row failure from overwriting a pending
 insert and the inverse failure where blindly replaying every compact update
@@ -190,6 +200,7 @@ Rejected. Distinct sessions/branches and dominant repo/account can change when o
 | Projection delta fails | Raw capture commits; repair row and degraded reason persist. |
 | Raw row is deleted | The raw transaction persists a safe compact old-contribution receipt or a fact tombstone; bounded maintenance subtracts before publishing. |
 | Compact insert changes before its first repair | The never-projected receipt survives every update; maintenance reads current raw state and applies it exactly once, or settles a pending delete to zero. |
+| Compact update repair is queued with its old-state mutation | The repair remains blocked by raw rowid until the mutation drains and creates its cancellation; the current value is then added exactly once, including after reopen. |
 | Upgrade predates compact day summaries and GC triggers | One atomic indexed day-union migration seeds bounded rebuild jobs for all segment/cancellation days, keeps the prior generation stale, and resumes after reopen without reseeding. |
 | Compact garbage collection crashes after payload rewrite | The enclosing SQLite transaction rolls back payload, receipts, summaries, and cursor together; the same frozen segment replays after reopen. |
 | Compact day changes during garbage collection | The frozen pass reaches its segment high-water, then restarts once against the newer revision; fair day scheduling prevents another day from starving. |

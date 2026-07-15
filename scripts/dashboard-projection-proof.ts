@@ -217,6 +217,88 @@ function downgradeCompactProjectionToC0(db:Database.Database){
   );
 }
 
+function compactMutationRepairDependencyFixture(root:string,label:string,reopenAfterFirst:boolean){
+  const fixturePath=path.join(root,`compact-mutation-repair-${label}.sqlite`);
+  let fixture=new LocalEventBuffer(fixturePath);
+  for(let index=0;index<4_000;index++)fixture.append(event({
+    source:"codex",eventType:"assistant_response",actionClass:"other",
+    observedAt:new Date(NOW.getTime()-DAY_MS+index).toISOString(),
+  }));
+  settle(fixture,NOW,30);
+  fixture.database.prepare(`delete from buffered_events where rowid between 3001 and 3250`).run();
+  fixture.database.prepare(
+    `update dashboard_compact_mutations set queued_at='2026-07-15T00:00:00.000Z'
+     where raw_rowid between 3001 and 3250`,
+  ).run();
+  fixture.database.prepare(
+    `update dashboard_projection_repairs set queued_at='2026-07-15T00:00:00.000Z'
+     where raw_rowid between 3001 and 3250`,
+  ).run();
+  const updatedObservedAt=new Date(NOW.getTime()-2*DAY_MS).toISOString();
+  fixture.database.prepare(
+    `update buffered_events set source='claude_code',event_type='tool_use',
+      action_class='edit',observed_at=? where rowid between 501 and 600`,
+  ).run(updatedObservedAt);
+  fixture.database.prepare(
+    `update dashboard_compact_mutations set queued_at='2026-07-15T00:00:01.000Z'
+     where raw_rowid between 501 and 600`,
+  ).run();
+  fixture.database.prepare(
+    `update dashboard_projection_repairs set queued_at='2026-07-15T00:00:01.000Z'
+     where raw_rowid between 501 and 600`,
+  ).run();
+  const repairSelectionPlan=(fixture.database.prepare(
+    `explain query plan select r.raw_rowid
+     from dashboard_projection_repairs r
+     left join buffered_events b on b.rowid=r.raw_rowid
+     where r.reason!='raw_update' or not exists (
+       select 1 from dashboard_compact_mutations m where m.raw_rowid=r.raw_rowid
+     )
+     order by r.queued_at,r.raw_rowid limit 250`,
+  ).all() as Array<{detail:string}>).map((row)=>row.detail);
+  const queued=fixture.projection.status().backlog;
+  const firstReceipt=fixture.projection.runMaintenance(NOW);
+  const afterFirst={
+    blockedLowUpdateRepairs:(fixture.database.prepare(
+      `select count(*) as n from dashboard_projection_repairs r
+       join dashboard_compact_mutations m on m.raw_rowid=r.raw_rowid
+       where r.reason='raw_update' and r.raw_rowid between 501 and 600`,
+    ).get() as {n:number}).n,
+    eligibleHighDeleteRepairs:(fixture.database.prepare(
+      `select count(*) as n from dashboard_projection_repairs
+       where raw_rowid between 3001 and 3250`,
+    ).get() as {n:number}).n,
+    mutations:(fixture.database.prepare(
+      `select count(*) as n from dashboard_compact_mutations`,
+    ).get() as {n:number}).n,
+    cancellations:(fixture.database.prepare(
+      `select count(*) as n from dashboard_compact_cancellations`,
+    ).get() as {n:number}).n,
+  };
+  if(reopenAfterFirst){
+    fixture.close();
+    fixture=new LocalEventBuffer(fixturePath);
+  }
+  const receipts=settle(fixture,NOW,30);
+  const payload=compactItems(fixture.database);
+  const updatedPayload=payload.filter((item)=>item.rawRowid>=501&&item.rawRowid<=600);
+  const sources=fixture.database.prepare(
+    `select source,events from dashboard_source_window where days=30 and events!=0 order by source`,
+  ).all();
+  const finalState={
+    raw:(fixture.database.prepare(`select count(*) as n from buffered_events`).get() as {n:number}).n,
+    projected:Number((readySnapshot(fixture,30).summary.totals as Record<string,number>).events),
+    payloadItems:payload.length,
+    repairs:(fixture.database.prepare(`select count(*) as n from dashboard_projection_repairs`).get() as {n:number}).n,
+    mutations:(fixture.database.prepare(`select count(*) as n from dashboard_compact_mutations`).get() as {n:number}).n,
+    cancellations:(fixture.database.prepare(`select count(*) as n from dashboard_compact_cancellations`).get() as {n:number}).n,
+    jobs:(fixture.database.prepare(`select count(*) as n from dashboard_compact_gc_days`).get() as {n:number}).n,
+  };
+  fixture.close();
+  return {queued,repairSelectionPlan,firstReceipt,afterFirst,receipts,updatedObservedAt,
+    updatedPayload,sources,finalState};
+}
+
 async function main() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-projection-proof-"));
   const dbPath = path.join(root, "ledger.sqlite");
@@ -658,6 +740,44 @@ async function main() {
         maxSegmentsWritten:Math.max(0,...activeReceipts.map((receipt)=>receipt.compactSegmentsWritten)),
         maxGcItems:Math.max(0,...activeReceipts.map((receipt)=>receipt.compactGcItemsVisited))});
     active.close();
+
+    const mutationDependency=compactMutationRepairDependencyFixture(root,"ordered",false);
+    check("compact_mutation_dependency_blocks_low_updates_without_starving_high_deletes",
+      mutationDependency.queued.compactMutations===350&&mutationDependency.queued.repairs===350&&
+      mutationDependency.firstReceipt.repairRowsVisited===250&&
+      mutationDependency.repairSelectionPlan.some((row)=>
+        row.includes("idx_dashboard_projection_repairs_queued"))&&
+      mutationDependency.repairSelectionPlan.some((row)=>
+        row.includes("SEARCH m USING INTEGER PRIMARY KEY"))&&
+      mutationDependency.afterFirst.blockedLowUpdateRepairs===100&&
+      mutationDependency.afterFirst.eligibleHighDeleteRepairs===0&&
+      mutationDependency.afterFirst.mutations===100&&
+      mutationDependency.afterFirst.cancellations===250&&
+      JSON.stringify(mutationDependency.finalState)===JSON.stringify({raw:3750,projected:3750,
+        payloadItems:3750,repairs:0,mutations:0,cancellations:0,jobs:0})&&
+      mutationDependency.updatedPayload.length===100&&
+      mutationDependency.updatedPayload.every((item)=>item.source==="claude_code"&&
+        item.eventType==="tool_use"&&item.actionClass==="edit"&&
+        item.observedAt===mutationDependency.updatedObservedAt)&&
+      JSON.stringify(mutationDependency.sources)===JSON.stringify([
+        {source:"codex",events:3650},{source:"claude_code",events:100},
+      ].sort((a,b)=>a.source.localeCompare(b.source)))&&
+      mutationDependency.receipts.every((receipt)=>receipt.repairRowsVisited<=250&&
+        receipt.compactGcItemsVisited<=1_000),
+      mutationDependency);
+
+    const mutationDependencyReopen=compactMutationRepairDependencyFixture(root,"reopen",true);
+    check("compact_mutation_dependency_reopen_readds_every_current_update_once",
+      mutationDependencyReopen.afterFirst.blockedLowUpdateRepairs===100&&
+      mutationDependencyReopen.afterFirst.eligibleHighDeleteRepairs===0&&
+      JSON.stringify(mutationDependencyReopen.finalState)===JSON.stringify({raw:3750,projected:3750,
+        payloadItems:3750,repairs:0,mutations:0,cancellations:0,jobs:0})&&
+      mutationDependencyReopen.updatedPayload.length===100&&
+      mutationDependencyReopen.updatedPayload.every((item)=>item.source==="claude_code"&&
+        item.eventType==="tool_use"&&item.actionClass==="edit")&&
+      mutationDependencyReopen.receipts.every((receipt)=>receipt.repairRowsVisited<=250&&
+        receipt.compactGcItemsVisited<=1_000),
+      mutationDependencyReopen);
 
     const pendingPath=path.join(root,"pending-compact-lifecycle.sqlite");
     let pending=new LocalEventBuffer(pendingPath);

@@ -400,6 +400,8 @@ export class DashboardProjectionStore {
         reason text not null,
         queued_at text not null
       );
+      create index if not exists idx_dashboard_projection_repairs_queued
+        on dashboard_projection_repairs (queued_at,raw_rowid);
       create table if not exists dashboard_compact_segments (
         segment_id integer primary key autoincrement,
         bucket_day text not null,
@@ -2152,7 +2154,10 @@ export class DashboardProjectionStore {
           b.head_sha as headSha,b.machine,b.account_hash as accountHash,
           b.suppressed_fields_json as suppressedFieldsJson
          from dashboard_projection_repairs r left join buffered_events b on b.rowid=r.raw_rowid
-         order by r.raw_rowid limit ?`,
+         where r.reason!='raw_update' or not exists (
+           select 1 from dashboard_compact_mutations m where m.raw_rowid=r.raw_rowid
+         )
+         order by r.queued_at,r.raw_rowid limit ?`,
       ).all(REPAIR_ROWS) as Array<RawProjectionRow&{repairRawRowid:number;reason:string;id:string|null}>;
       const rowsToApply:RawProjectionRow[]=[];
       for (const repair of repairs) {
