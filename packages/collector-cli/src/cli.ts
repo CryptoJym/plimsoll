@@ -41,17 +41,13 @@ import { prepareRepoLabelsPush, pushRepoLabels } from "./repo-labels";
 import { runSessionSync, sessionIdsFromBatches } from "./session-sync";
 import { uploadBufferedEvents } from "./upload";
 import { runAttributionRepair, runWorkspaceHistoryUpload } from "./upload-history";
+import {
+  acquireCollectorStartOwnership,
+  removeCollectorPidFileIfOwned,
+  type CollectorPidRecord,
+} from "./runtime-ownership";
 
 const command = process.argv[2] ?? "help";
-
-type CollectorPidFile = {
-  command: string[];
-  cwd: string;
-  label: typeof LAUNCH_AGENT_LABEL;
-  pid: number;
-  startedAt: string;
-  version: 1;
-};
 
 function printHelp() {
   console.log(`Plimsoll Collector
@@ -120,7 +116,8 @@ Config tools:
       for public repos). Naming the repo is the same deliberate disclosure as
       push-repo-labels: owner/name + remoteUrlHash cross; titles/diffs/paths never do.
       --dry-run computes the join and prints the audit without pushing.
-  install-launch-agent [--repo-root PATH] [--pnpm PATH] [--load]
+  install-launch-agent [--load]
+  install-launch-agent --dev [--repo-root PATH] [--pnpm PATH] [--load]
   load-launch-agent
   unload-launch-agent
   uninstall-launch-agent [--unload]
@@ -193,9 +190,8 @@ async function checkCollectorConnectivity(port: number) {
   }
 }
 
-function writePidFile() {
-  const pidPath = collectorLogPath("collector.pid");
-  const pidFile: CollectorPidFile = {
+function collectorPidRecord(): CollectorPidRecord {
+  return {
     command: process.argv.slice(1),
     cwd: process.cwd(),
     label: LAUNCH_AGENT_LABEL,
@@ -203,8 +199,6 @@ function writePidFile() {
     startedAt: new Date().toISOString(),
     version: 1,
   };
-  fs.writeFileSync(pidPath, `${JSON.stringify(pidFile, null, 2)}\n`, { mode: 0o600 });
-  return pidPath;
 }
 
 function removePidFile(pidPath = collectorLogPath("collector.pid")) {
@@ -214,7 +208,7 @@ function removePidFile(pidPath = collectorLogPath("collector.pid")) {
 }
 
 function readPidFile(pidPath: string):
-  | { ok: true; legacy: boolean; record: CollectorPidFile }
+  | { ok: true; legacy: boolean; record: CollectorPidRecord }
   | { ok: false; reason: "invalid_pid_file" | "pid_file_missing"; raw?: string } {
   if (!fs.existsSync(pidPath)) {
     return { ok: false, reason: "pid_file_missing" };
@@ -238,7 +232,7 @@ function readPidFile(pidPath: string):
   }
 
   try {
-    const parsed = JSON.parse(raw) as Partial<CollectorPidFile>;
+    const parsed = JSON.parse(raw) as Partial<CollectorPidRecord>;
     if (
       parsed.version === 1 &&
       parsed.label === LAUNCH_AGENT_LABEL &&
@@ -248,7 +242,7 @@ function readPidFile(pidPath: string):
       typeof parsed.cwd === "string" &&
       typeof parsed.startedAt === "string"
     ) {
-      return { ok: true, legacy: false, record: parsed as CollectorPidFile };
+      return { ok: true, legacy: false, record: parsed as CollectorPidRecord };
     }
   } catch {
     // Fall through to invalid file handling.
@@ -271,18 +265,22 @@ function looksLikeCollectorStartCommand(commandLine: string | null) {
   if (!commandLine) return false;
   const normalized = commandLine.toLowerCase();
   return (
-    normalized.includes("collector") &&
     normalized.includes("start") &&
     (normalized.includes("collector-cli") ||
       normalized.includes("packages/collector-cli") ||
+      normalized.includes("@plimsoll/cli") ||
+      normalized.includes("/plimsoll") ||
       normalized.includes("pnpm") ||
       normalized.includes("tsx"))
   );
 }
 
-function pathLooksCurrentRepo(value: string) {
-  if (!value) return false;
-  return path.resolve(value) === process.cwd();
+function pidRecordMatchesCommand(record: CollectorPidRecord, commandLine: string | null) {
+  if (!commandLine || record.command.length === 0 || !record.command.includes("start")) {
+    return false;
+  }
+  const runningScript = record.command[0];
+  return Boolean(runningScript && commandLine.includes(runningScript));
 }
 
 function validatePidFileForStop(pidPath: string) {
@@ -312,8 +310,8 @@ function validatePidFileForStop(pidPath: string) {
 
   const commandLine = processCommandForPid(record.pid);
   const commandLooksSafe = looksLikeCollectorStartCommand(commandLine);
-  const cwdLooksSafe = read.legacy || pathLooksCurrentRepo(record.cwd);
-  if (!commandLooksSafe || !cwdLooksSafe) {
+  const recordMatches = read.legacy || pidRecordMatchesCommand(record, commandLine);
+  if (!commandLooksSafe || !recordMatches) {
     removePidFile(pidPath);
     return {
       commandLine,
@@ -348,9 +346,31 @@ async function main() {
   const config = loadCollectorConfig();
 
   if (command === "start") {
+    const pidPath = collectorLogPath("collector.pid");
+    const ownership = await acquireCollectorStartOwnership({
+      label: LAUNCH_AGENT_LABEL,
+      pidPath,
+      port: config.port,
+    });
+    if (ownership.kind === "already_running") {
+      console.log(
+        JSON.stringify(
+          {
+            status: "already_running",
+            pid: ownership.ownerPid,
+            pidPath: ownership.pidPath,
+            port: ownership.port,
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+
     const buffer = openBuffer();
     const server = createCollectorServer(config, buffer);
-    const pidPath = writePidFile();
+    let ownsPidFile = false;
     let shuttingDown = false;
     const timers: NodeJS.Timeout[] = [];
     let syncFailureStreak = 0;
@@ -527,9 +547,12 @@ async function main() {
       if (shuttingDown) return;
       shuttingDown = true;
       for (const timer of timers) clearInterval(timer);
+      ownership.release();
       server.close(() => {
         buffer.close();
-        removePidFile(pidPath);
+        if (ownsPidFile) {
+          removeCollectorPidFileIfOwned(pidPath, process.pid, LAUNCH_AGENT_LABEL);
+        }
         console.log(
           JSON.stringify({
             status: "stopped",
@@ -545,8 +568,11 @@ async function main() {
     process.once("SIGINT", () => shutdown("SIGINT"));
     process.once("SIGTERM", () => shutdown("SIGTERM"));
     server.on("error", (error: NodeJS.ErrnoException) => {
+      ownership.release();
       buffer.close();
-      removePidFile(pidPath);
+      if (ownsPidFile) {
+        removeCollectorPidFileIfOwned(pidPath, process.pid, LAUNCH_AGENT_LABEL);
+      }
       console.error(
         JSON.stringify(
           {
@@ -562,6 +588,30 @@ async function main() {
       process.exit(1);
     });
     server.listen(config.port, "127.0.0.1", () => {
+      try {
+        ownership.writePidFile(collectorPidRecord());
+        ownsPidFile = true;
+      } catch (error) {
+        ownership.release();
+        server.close();
+        buffer.close();
+        console.error(
+          JSON.stringify(
+            {
+              status: "error",
+              code: "ownership_failed",
+              pidPath,
+              port: config.port,
+              message: error instanceof Error ? error.message : String(error),
+            },
+            null,
+            2,
+          ),
+        );
+        process.exit(1);
+        return;
+      }
+      ownership.release();
       console.log(
         JSON.stringify({
           status: "active",
@@ -1102,19 +1152,35 @@ async function main() {
   }
 
   if (command === "install-launch-agent") {
-    // Packaged installs (bundled dist/cli.mjs) exec node+script directly; the
-    // dev working tree keeps the pnpm form.
     const runningScript = process.argv[1] ?? "";
-    const packaged = /\.(mjs|cjs|js)$/.test(runningScript);
+    const development = flag("--dev");
+    const packaged = /\.(mjs|cjs|js)$/.test(runningScript) && fs.existsSync(runningScript);
+    if (!development && !packaged) {
+      throw new Error(
+        "Source-tree LaunchAgent installs require --dev. Packaged installs run the stable plimsoll executable directly.",
+      );
+    }
+    if (!development && (optionValue("--repo-root") || optionValue("--pnpm"))) {
+      throw new Error("--repo-root and --pnpm are development-only options; add --dev.");
+    }
+
+    const stableCliPath = packaged ? fs.realpathSync(runningScript) : null;
+    const repoRoot = development
+      ? optionValue("--repo-root") ?? process.cwd()
+      : path.dirname(stableCliPath ?? process.cwd());
     const plistPath = installLaunchAgent({
-      repoRoot: optionValue("--repo-root") ?? process.cwd(),
+      repoRoot,
       pnpmPath: optionValue("--pnpm") ?? "pnpm",
-      programArguments: packaged ? [process.execPath, runningScript, "start"] : undefined,
+      programArguments: development
+        ? undefined
+        : [process.execPath, stableCliPath ?? runningScript, "start"],
+      workingDirectory: development ? repoRoot : path.dirname(stableCliPath ?? runningScript),
     });
     console.log(
       JSON.stringify(
         {
           installed: true,
+          runtime: development ? "development" : "packaged",
           plistPath,
           label: LAUNCH_AGENT_LABEL,
           loadCommand: launchctlBootstrapCommand(plistPath).join(" "),
