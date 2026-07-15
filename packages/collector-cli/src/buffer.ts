@@ -127,6 +127,21 @@ export class LocalEventBuffer {
         last_dropped_at text not null,
         primary key (source, reason)
       );
+      create table if not exists maintenance_state (
+        key text primary key,
+        value text not null,
+        updated_at text not null
+      );
+      create table if not exists reprice_dirty_events (
+        event_id text primary key,
+        queued_at text not null
+      );
+      create table if not exists repo_enrichment_dirty (
+        session_id text primary key,
+        cursor_rowid integer not null default 0,
+        queued_at text not null,
+        updated_at text not null
+      );
     `);
     this.migrateEventColumns();
     this.db.exec(`
@@ -137,6 +152,72 @@ export class LocalEventBuffer {
       create index if not exists idx_events_account on buffered_events (account_hash, observed_at);
       create index if not exists idx_metrics_name on metric_samples (metric_name, observed_at);
       create index if not exists idx_metrics_session on metric_samples (session_id);
+      create index if not exists idx_events_unpriced_usage
+        on buffered_events (id)
+        where event_type in ('usage_rollout','usage_transcript')
+          and cost_usd is null and model is not null;
+      create index if not exists idx_events_repo_enrichment_seed
+        on buffered_events (id)
+        where session_id is not null and (
+          repo_hash is not null or input_tokens is not null or
+          output_tokens is not null or cost_usd is not null
+        );
+
+      -- Dirty-work receipts are written in the same SQLite transaction as
+      -- the event mutation. A crash can therefore replay work, but cannot
+      -- leave a newly appended token/linkage row invisible to maintenance.
+      create trigger if not exists trg_events_reprice_dirty_insert
+      after insert on buffered_events
+      when new.event_type in ('usage_rollout','usage_transcript')
+        and new.cost_usd is null and new.model is not null
+      begin
+        insert into reprice_dirty_events (event_id, queued_at)
+        values (new.id, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        on conflict(event_id) do update set queued_at = excluded.queued_at;
+      end;
+
+      create trigger if not exists trg_events_reprice_dirty_update
+      after update of event_type, cost_usd, model on buffered_events
+      when new.event_type in ('usage_rollout','usage_transcript')
+        and new.cost_usd is null and new.model is not null
+      begin
+        insert into reprice_dirty_events (event_id, queued_at)
+        values (new.id, strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        on conflict(event_id) do update set queued_at = excluded.queued_at;
+      end;
+
+      create trigger if not exists trg_events_repo_dirty_insert
+      after insert on buffered_events
+      when new.session_id is not null and (
+        new.repo_hash is not null or new.input_tokens is not null or
+        new.output_tokens is not null or new.cost_usd is not null
+      )
+      begin
+        insert into repo_enrichment_dirty
+          (session_id, cursor_rowid, queued_at, updated_at)
+        values
+          (new.session_id, 0, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        on conflict(session_id) do update set
+          cursor_rowid = 0,
+          updated_at = excluded.updated_at;
+      end;
+
+      create trigger if not exists trg_events_repo_dirty_update
+      after update of session_id, repo_hash, branch_hash, input_tokens, output_tokens, cost_usd
+      on buffered_events
+      when new.session_id is not null and (
+        new.repo_hash is not null or new.input_tokens is not null or
+        new.output_tokens is not null or new.cost_usd is not null
+      )
+      begin
+        insert into repo_enrichment_dirty
+          (session_id, cursor_rowid, queued_at, updated_at)
+        values
+          (new.session_id, 0, strftime('%Y-%m-%dT%H:%M:%fZ','now'), strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        on conflict(session_id) do update set
+          cursor_rowid = 0,
+          updated_at = excluded.updated_at;
+      end;
     `);
   }
 
@@ -648,70 +729,6 @@ export class LocalEventBuffer {
         group by source`,
       )
       .all(since);
-  }
-
-  /**
-   * Per-event repo attribution (issue 0008). Token/usage events arrive with
-   * no repo columns (api_request and codex spans carry no cwd); hook events
-   * do. A token event's repo is the session's repo AT THAT MOMENT: the
-   * nearest repo-bearing event in the same session at-or-before it, falling
-   * back to the nearest after within 10 minutes (session-start race).
-   * Columns only — payload stays the captured truth; metadata.repoStitched
-   * marks the enrichment in receipts. Idempotent; runs on an interval and
-   * sweeps history on first run.
-   */
-  enrichEventRepos(limit = 50_000) {
-    const result = this.db
-      .prepare(
-        `update buffered_events set
-           repo_hash = stitched.repoHash,
-           branch_hash = stitched.branchHash,
-           payload_json = json_set(payload_json, '$.metadata.repoStitched', json('true'))
-         from (
-           select e.id as id,
-             (select r.repo_hash from buffered_events r
-               where r.session_id = e.session_id and r.repo_hash is not null
-                 and r.observed_at <= e.observed_at
-               order by r.observed_at desc limit 1) as repoHash,
-             (select r.branch_hash from buffered_events r
-               where r.session_id = e.session_id and r.repo_hash is not null
-                 and r.observed_at <= e.observed_at
-               order by r.observed_at desc limit 1) as branchHash
-           from buffered_events e
-           where e.repo_hash is null and e.session_id is not null
-             and (e.input_tokens is not null or e.output_tokens is not null or e.cost_usd is not null)
-           limit @limit
-         ) as stitched
-         where buffered_events.id = stitched.id and stitched.repoHash is not null`,
-      )
-      .run({ limit });
-    const forward = this.db
-      .prepare(
-        `update buffered_events set
-           repo_hash = stitched.repoHash,
-           branch_hash = stitched.branchHash,
-           payload_json = json_set(payload_json, '$.metadata.repoStitched', json('true'))
-         from (
-           select e.id as id,
-             (select r.repo_hash from buffered_events r
-               where r.session_id = e.session_id and r.repo_hash is not null
-                 and r.observed_at > e.observed_at
-                 and (strftime('%s', r.observed_at) - strftime('%s', e.observed_at)) <= 600
-               order by r.observed_at asc limit 1) as repoHash,
-             (select r.branch_hash from buffered_events r
-               where r.session_id = e.session_id and r.repo_hash is not null
-                 and r.observed_at > e.observed_at
-                 and (strftime('%s', r.observed_at) - strftime('%s', e.observed_at)) <= 600
-               order by r.observed_at asc limit 1) as branchHash
-           from buffered_events e
-           where e.repo_hash is null and e.session_id is not null
-             and (e.input_tokens is not null or e.output_tokens is not null or e.cost_usd is not null)
-           limit @limit
-         ) as stitched
-         where buffered_events.id = stitched.id and stitched.repoHash is not null`,
-      )
-      .run({ limit });
-    return { backward: result.changes, forward: forward.changes };
   }
 
   /** Read access for dashboard queries; do not write through this. */

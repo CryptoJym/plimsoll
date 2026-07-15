@@ -27,6 +27,10 @@ import { computeCaptureHealth } from "./health";
 import { performJoin } from "./join";
 import { RolloutTailer } from "./rollout-tailer";
 import { TranscriptTailer } from "./transcript-tailer";
+import {
+  CoalescingMaintenanceScheduler,
+  CollectorMaintenance,
+} from "./maintenance";
 import { createCollectorServer } from "./server";
 import {
   applyClaudeSettings,
@@ -246,7 +250,11 @@ async function main() {
     }
 
     const buffer = openBuffer();
-    const server = createCollectorServer(config, buffer, { runtimeIdentity });
+    let scheduler: CoalescingMaintenanceScheduler | undefined;
+    const server = createCollectorServer(config, buffer, {
+      runtimeIdentity,
+      maintenanceStatus: () => scheduler?.status() ?? null,
+    });
     let ownsPidFile = false;
     let shuttingDown = false;
     const timers: NodeJS.Timeout[] = [];
@@ -379,28 +387,35 @@ async function main() {
 
     // Codex usage truth rides rollout files (issue 0022): full walk on boot
     // (backfills any uncaptured history, idempotent), then a recent-days tail.
-    const rolloutTailer = new RolloutTailer(buffer);
-    const transcriptTailer = new TranscriptTailer(buffer);
+    const maintenance = new CollectorMaintenance(
+      buffer,
+      new RolloutTailer(buffer),
+      new TranscriptTailer(buffer),
+    );
+    scheduler = new CoalescingMaintenanceScheduler(async (recentOnly) => {
+      const result = await maintenance.run(recentOnly);
+      const { rollout, transcript, repricing, enrichment } = result;
+      if (rollout.eventsAppended > 0 || rollout.parseErrors > 0) {
+        console.log(JSON.stringify({ status: "rollout_scan", recentOnly, ...rollout }));
+      }
+      if (transcript.eventsAppended > 0 || transcript.parseErrors > 0) {
+        console.log(JSON.stringify({ status: "transcript_scan", recentOnly, ...transcript }));
+      }
+      if (repricing.repriced > 0) {
+        console.log(JSON.stringify({ status: "repriced", ...repricing }));
+      }
+      if (enrichment.backward > 0 || enrichment.forward > 0) {
+        console.log(JSON.stringify({ status: "repo_stitch", ...enrichment }));
+      }
+      return result;
+    });
     const runRolloutScan = async (recentOnly: boolean) => {
       try {
-        const scanned = await rolloutTailer.scan({ recentOnly });
-        if (scanned.eventsAppended > 0 || scanned.parseErrors > 0) {
-          console.log(JSON.stringify({ status: "rollout_scan", recentOnly, ...scanned }));
-        }
-        const transcripts = await transcriptTailer.scan({ recentOnly });
-        if (transcripts.eventsAppended > 0 || transcripts.parseErrors > 0) {
-          console.log(JSON.stringify({ status: "transcript_scan", recentOnly, ...transcripts }));
-        }
-        // Per-event repo attribution (issue 0008): stitch repo onto token
-        // events from their session's timeline; idempotent, history-sweeping.
-        const stitched = buffer.enrichEventRepos();
-        if (stitched.backward > 0 || stitched.forward > 0) {
-          console.log(JSON.stringify({ status: "repo_stitch", ...stitched }));
-        }
+        await scheduler.trigger(recentOnly);
       } catch (error) {
         console.warn(
           JSON.stringify({
-            warning: "rollout_scan_failed",
+            warning: "maintenance_failed",
             message: error instanceof Error ? error.message : String(error),
           }),
         );

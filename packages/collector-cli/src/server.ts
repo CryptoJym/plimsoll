@@ -100,7 +100,10 @@ function isTrustedLocalWrite(request: http.IncomingMessage) {
 export function createCollectorServer(
   config: CollectorConfig,
   buffer: LocalEventBuffer,
-  options: { runtimeIdentity?: CollectorRuntimeIdentity } = {},
+  options: {
+    runtimeIdentity?: CollectorRuntimeIdentity;
+    maintenanceStatus?: () => unknown;
+  } = {},
 ) {
   // Capture health walks local transcript/rollout dirs — memoize per minute so
   // the 30s dashboard refresh doesn't re-scan the filesystem every tick.
@@ -121,6 +124,7 @@ export function createCollectorServer(
             counterLifetime: "durable",
             dropped: buffer.otlpAdmissionCounters(),
           },
+          maintenance: options.maintenanceStatus?.() ?? null,
           health: healthCache.value,
         });
         return;
