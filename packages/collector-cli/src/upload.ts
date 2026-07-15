@@ -100,6 +100,13 @@ function statusClass(status: number) {
   return "remote_contract";
 }
 
+function uploadContractHash(config: CollectorConfig, url: string, appVersion: string) {
+  return `sha256:${crypto
+    .createHash("sha256")
+    .update(JSON.stringify([url, config.tenantId, config.installKey, appVersion]))
+    .digest("hex")}`;
+}
+
 function bodyForItems(
   config: CollectorConfig,
   items: LeasedDeliveryItem[],
@@ -250,6 +257,8 @@ export type UploadOptions = {
   maxProbes?: number;
   /** Test-only crash seam after HTTP effects but before local acknowledgement. */
   afterRemote?: () => void;
+  /** Test-only crash seam after a sibling acknowledgement is durable but before poison settlement. */
+  afterSiblingAcknowledgement?: () => void;
 };
 
 export async function uploadBufferedEvents(
@@ -264,8 +273,21 @@ export async function uploadBufferedEvents(
   buffer.delivery.configure({ enabled: true, limits: config.delivery });
   const nowFn = options.now ?? (() => new Date());
   buffer.delivery.migrateLegacy({ now: nowFn() });
+  const appVersion = options.appVersion ?? "0.1.0";
+  const contractHash = uploadContractHash(config, url, appVersion);
+  const outputLimit = Math.max(
+    1,
+    Math.min(
+      Number.isFinite(options.limit) ? Math.trunc(options.limit!) : 500,
+      500,
+    ),
+  );
+  const provenDead = buffer.delivery.settleProvenValidationCandidates(contractHash, {
+    maxRows: outputLimit,
+    now: nowFn(),
+  });
   const lease = buffer.delivery.lease({
-    maxRows: options.limit,
+    maxRows: outputLimit,
     maxBytes: options.maxBytes,
     now: nowFn(),
     leaseId: options.leaseId,
@@ -286,13 +308,12 @@ export async function uploadBufferedEvents(
       delivery: {
         mode: "durable_outbox" as const,
         attempts: 0,
-        deadLetters: lease.locallyDead,
+        deadLetters: provenDead + lease.locallyDead,
         circuit: lease.blockedBy,
       },
     };
   }
 
-  const appVersion = options.appVersion ?? "0.1.0";
   const maxProbes = Math.max(
     1,
     Math.min(options.maxProbes ?? config.delivery.maxProbesPerCycle, config.delivery.maxProbesPerCycle),
@@ -302,12 +323,17 @@ export async function uploadBufferedEvents(
   const succeeded = new Map<string, LeasedDeliveryItem>();
   const validationSingletons = new Map<string, LeasedDeliveryItem>();
   const unresolved = new Map<string, LeasedDeliveryItem>();
+  const attemptedActive = new Set<string>();
   let fatal: ProbeResult | null = null;
+  let validationWitnessProven = false;
+  let validationWitnessRejected = false;
+  let locallyDead = provenDead + lease.locallyDead;
   const queue: LeasedDeliveryItem[][] = [lease.items];
 
   while (queue.length > 0 && probes < maxProbes && !fatal) {
     const group = queue.shift()!;
     probes += 1;
+    for (const item of group) attemptedActive.add(item.deliveryId);
     const result = await postItems({
       config,
       items: group,
@@ -327,6 +353,52 @@ export async function uploadBufferedEvents(
     if (result.status === 400 || result.status === 422) {
       if (group.length === 1) {
         validationSingletons.set(group[0].deliveryId, group[0]);
+        buffer.delivery.markValidationCandidate(
+          lease.leaseId,
+          group[0].deliveryId,
+          contractHash,
+          nowFn(),
+        );
+        // A singleton validation response is ambiguous until a sibling proves
+        // the endpoint contract. When the caller's output limit is one, lease
+        // one bounded lookahead under the same lease and probe it without ever
+        // acknowledging more than that limit. If there is no active lookahead,
+        // re-probe the one durable sanitized witness from the same contract.
+        if (queue.length === 0 && succeeded.size === 0 && probes < maxProbes) {
+          const lookahead = buffer.delivery.lease({
+            maxRows: Math.max(1, outputLimit - succeeded.size),
+            maxBytes: options.maxBytes,
+            now: nowFn(),
+            leaseId: lease.leaseId,
+          });
+          locallyDead += lookahead.locallyDead;
+          if (lookahead.items.length > 0) {
+            queue.push(lookahead.items);
+          } else {
+            const witness = buffer.delivery.validationWitness(contractHash);
+            if (witness && probes < maxProbes) {
+              probes += 1;
+              const witnessResult = await postItems({
+                config,
+                items: [witness.item],
+                appVersion,
+                url,
+                ingestKey: options.ingestKey ?? config.ingestKey,
+                signingSecret: options.signingSecret ?? config.uploadSigningSecret,
+                fetchImpl: options.fetchImpl ?? fetch,
+                timeoutSeconds: config.delivery.requestTimeoutSeconds,
+                now: nowFn,
+              });
+              if (witnessResult.ok) {
+                validationWitnessProven = true;
+              } else if (witnessResult.status === 400 || witnessResult.status === 422) {
+                validationWitnessRejected = true;
+              } else if (witnessResult.status !== 400 && witnessResult.status !== 422) {
+                fatal = witnessResult;
+              }
+            }
+          }
+        }
       } else {
         const midpoint = Math.floor(group.length / 2);
         queue.push(group.slice(0, midpoint), group.slice(midpoint));
@@ -346,9 +418,15 @@ export async function uploadBufferedEvents(
     lease.leaseId,
     [...succeeded.keys()],
     nowFn(),
+    succeeded.size > 0
+      ? { contractHash, item: [...succeeded.values()][0] }
+      : undefined,
   );
-  let deadLetters = lease.locallyDead;
-  if (succeeded.size > 0 && validationSingletons.size > 0) {
+  if (acknowledged.acknowledged > 0 && validationSingletons.size > 0) {
+    options.afterSiblingAcknowledgement?.();
+  }
+  let deadLetters = locallyDead;
+  if ((succeeded.size > 0 || validationWitnessProven) && validationSingletons.size > 0) {
     deadLetters += buffer.delivery.deadLetterRemote(
       lease.leaseId,
       [...validationSingletons.keys()],
@@ -362,7 +440,9 @@ export async function uploadBufferedEvents(
   if (fatal) {
     failure = failureForProbe(fatal);
   } else if (succeeded.size === 0 && unresolved.size > 0) {
-    failure = "remote_contract";
+    failure = validationSingletons.size > 0 && attemptedActive.size < 2 && !validationWitnessRejected
+      ? "remote_validation"
+      : "remote_contract";
   } else if (unresolved.size > 0) {
     failure = "remote_validation";
   }

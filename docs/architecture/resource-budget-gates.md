@@ -65,7 +65,7 @@ Counters are per scenario and reset before each action phase. Production lanes m
 5. **Trigger storm:** fire timer, append, and manual triggers together while the lane is deliberately paused. Concurrency remains one and one coalesced follow-up runs.
 6. **Admission bypass attempts:** unknown spans with large nested attributes, error markers, linkage only, usage only, and tool arguments prove value classification occurs after sanitization.
 7. **Projection crash boundary:** fail after raw insert, during projection delta, and before commit. Transactional replay reaches one exact state.
-8. **Poison positions:** invalid row first, middle, and last; repeated sync never duplicates the dead letter and later valid rows deliver.
+8. **Poison positions:** invalid row first, middle, and last, including output limit one and a two-probe cycle; repeated sync never duplicates the dead letter, later valid rows deliver, a global 400/422 quarantines zero, and a crash after sibling acknowledgement replays settlement idempotently.
 9. **Retry storm:** repeated 429/500/timeouts prove bounded backoff, one in-flight request, and no raw-event rewrite.
 10. **Scale-shape fixture:** multiply raw history cardinality while holding projection cardinality constant. Dashboard work counters remain constant.
 11. **Privacy sentinels:** seed prompt, response, tool arguments, absolute path, repository URL, email, token, and cookie sentinels. None may appear in DB rows, upload bodies, logs, or receipts in metadata mode.

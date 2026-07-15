@@ -230,15 +230,32 @@ export class LocalEventBuffer {
       -- Repo enrichment may discover linkage after capture. The delivery
       -- copy accepts fill-only hashes until its first seal; retries never
       -- change the bytes already attempted.
-      create trigger if not exists trg_events_outbox_linkage_update
+      drop trigger if exists trg_events_outbox_linkage_update;
+      create trigger if not exists trg_events_outbox_linkage_update_v2
       after update of repo_hash, branch_hash on buffered_events
-      when new.repo_hash glob 'sha256:*' or new.branch_hash glob 'sha256:*'
+      when (
+        length(trim(new.repo_hash)) = 71 and
+        lower(substr(trim(new.repo_hash), 1, 7)) = 'sha256:' and
+        lower(substr(trim(new.repo_hash), 8)) not glob '*[^0-9a-f]*'
+      ) or (
+        length(trim(new.branch_hash)) = 71 and
+        lower(substr(trim(new.branch_hash), 1, 7)) = 'sha256:' and
+        lower(substr(trim(new.branch_hash), 8)) not glob '*[^0-9a-f]*'
+      )
       begin
         update upload_outbox set
           repo_hash = coalesce(repo_hash,
-            case when new.repo_hash glob 'sha256:*' then new.repo_hash end),
+            case when
+              length(trim(new.repo_hash)) = 71 and
+              lower(substr(trim(new.repo_hash), 1, 7)) = 'sha256:' and
+              lower(substr(trim(new.repo_hash), 8)) not glob '*[^0-9a-f]*'
+            then lower(trim(new.repo_hash)) end),
           branch_hash = coalesce(branch_hash,
-            case when new.branch_hash glob 'sha256:*' then new.branch_hash end),
+            case when
+              length(trim(new.branch_hash)) = 71 and
+              lower(substr(trim(new.branch_hash), 1, 7)) = 'sha256:' and
+              lower(substr(trim(new.branch_hash), 8)) not glob '*[^0-9a-f]*'
+            then lower(trim(new.branch_hash)) end),
           updated_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
         where raw_rowid = new.rowid
           and sealed_envelope_json is null and attempt_count = 0;
@@ -309,6 +326,7 @@ export class LocalEventBuffer {
         accountHash: event.actorId ?? null,
       });
     if (result.changes > 0) {
+      this.delivery.noteRawAppend(Number(result.lastInsertRowid));
       this.delivery.enqueueRaw({
         rawRowid: Number(result.lastInsertRowid),
         rawId: event.id,

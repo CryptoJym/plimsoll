@@ -173,6 +173,161 @@ function migrationProof() {
     { visited: giantSlice.visited, loadedBytes: giantSlice.bytes, dead: giantSlice.dead, reason: giantReason.reason },
   );
   giantBuffer.close();
+
+  const sliceBoundFile = ledger();
+  const sliceBoundSeed = new LocalEventBuffer(sliceBoundFile);
+  sliceBoundSeed.append(event(19, { metadata: { bounded: "x".repeat(1_800) } }));
+  sliceBoundSeed.close();
+  const sliceBoundConfig = config({
+    maxItemBytes: 10_000,
+    migrationBatchRows: 10,
+    migrationBatchBytes: 1_024,
+  });
+  const sliceBoundBuffer = new LocalEventBuffer(sliceBoundFile, {
+    delivery: { enabled: true, limits: sliceBoundConfig.delivery },
+  });
+  const sliceBound = sliceBoundBuffer.delivery.migrateLegacy({
+    maxRows: 10,
+    maxBytes: 1_024,
+    now: instant(31),
+  });
+  const pausedStatus = sliceBoundBuffer.delivery.status(instant(31));
+  const sliceBoundOutbox = (sliceBoundBuffer.database
+    .prepare(`select count(*) as n from upload_outbox`)
+    .get() as { n: number }).n;
+  const sliceBoundReceipts = (sliceBoundBuffer.database
+    .prepare(`select count(*) as n from upload_receipts`)
+    .get() as { n: number }).n;
+  const pendingRawBeforeResume = (sliceBoundBuffer.database
+    .prepare(`select count(*) as n from buffered_events where uploaded_at is null`)
+    .get() as { n: number }).n;
+  sliceBoundBuffer.delivery.configure({
+    enabled: true,
+    limits: { ...sliceBoundConfig.delivery, migrationBatchBytes: 4_096 },
+  });
+  const resumed = sliceBoundBuffer.delivery.migrateLegacy({
+    maxRows: 10,
+    maxBytes: 4_096,
+    now: instant(32),
+  });
+  const resumedStatus = sliceBoundBuffer.delivery.status(instant(32));
+  record(
+    "legacy_item_above_slice_cap_pauses_without_loss_then_resumes",
+    sliceBound.visited === 0 &&
+      sliceBound.bytes === 0 &&
+      sliceBound.dead === 0 &&
+      !sliceBound.complete &&
+      sliceBound.paused === "slice_budget_too_small" &&
+      sliceBoundOutbox === 0 &&
+      sliceBoundReceipts === 0 &&
+      pendingRawBeforeResume === 1 &&
+      pausedStatus.degraded &&
+      pausedStatus.degradedReasons.includes("migration_slice_budget") &&
+      pausedStatus.migration.cursorRowid === 0 &&
+      resumed.visited === 1 &&
+      resumed.enqueued === 1 &&
+      resumed.dead === 0 &&
+      resumed.complete &&
+      resumedStatus.remainingDelivery === 1 &&
+      !resumedStatus.degradedReasons.includes("migration_slice_budget"),
+    {
+      visited: sliceBound.visited,
+      loadedBytes: sliceBound.bytes,
+      dead: sliceBound.dead,
+      complete: sliceBound.complete,
+      paused: sliceBound.paused,
+      active: sliceBoundOutbox,
+      receipts: sliceBoundReceipts,
+      pendingRawBeforeResume,
+      pausedStatus: {
+        degraded: pausedStatus.degraded,
+        reasons: pausedStatus.degradedReasons,
+        cursor: pausedStatus.migration.cursorRowid,
+      },
+      resumed,
+      resumedRemaining: resumedStatus.remainingDelivery,
+    },
+  );
+  sliceBoundBuffer.close();
+}
+
+async function migrationReopenProof() {
+  const file = ledger();
+  const cfg = config({ migrationBatchRows: 1, migrationBatchBytes: 1_000_000 });
+  let buffer = new LocalEventBuffer(file, {
+    delivery: { enabled: true, limits: cfg.delivery },
+  });
+  buffer.append(event(20));
+  await uploadBufferedEvents(cfg, buffer, {
+    limit: 1,
+    fetchImpl: async () => response(200, { accepted: 1 }),
+    now: () => instant(35),
+  });
+  buffer.delivery.migrateLegacy({ maxRows: 1, now: instant(36) });
+  const completed = buffer.delivery.status(instant(36)).migration;
+  buffer.close();
+
+  buffer = new LocalEventBuffer(file);
+  buffer.append(event(21));
+  const invalidatedInAppend = buffer.delivery.status(instant(37)).migration;
+  // Simulate a rollback-compatible producer that writes raw truth without the
+  // current append helper. Re-enable must still compare the O(1) rowid high-water.
+  insertLegacyPoison(buffer, 22, JSON.stringify(event(22)));
+  buffer.close();
+
+  buffer = new LocalEventBuffer(file, {
+    delivery: { enabled: true, limits: cfg.delivery },
+  });
+  const reopened = buffer.delivery.status(instant(38)).migration;
+  const sent: string[][] = [];
+  const uploadOne = (seconds: number) =>
+    uploadBufferedEvents(cfg, buffer, {
+      limit: 1,
+      fetchImpl: async (_input, init) => {
+        sent.push(requestIds(init));
+        return response(200, { accepted: 1 });
+      },
+      now: () => instant(seconds),
+    });
+  const second = await uploadOne(39);
+  const mid = buffer.delivery.status(instant(40)).migration;
+  const third = await uploadOne(41);
+  buffer.delivery.migrateLegacy({ maxRows: 1, now: instant(42) });
+  const final = buffer.delivery.status(instant(42));
+  const raw = buffer.database
+    .prepare(`select id, uploaded_at as uploadedAt from buffered_events order by rowid`)
+    .all() as Array<{ id: string; uploadedAt: string | null }>;
+  const receipts = buffer.database
+    .prepare(`select delivery_id as id, terminal_state as state from upload_receipts order by created_at`)
+    .all() as Array<{ id: string; state: string }>;
+  record(
+    "completed_migration_reopens_after_disabled_and_direct_raw_appends",
+    completed.complete &&
+      completed.cursorRowid === 1 &&
+      !invalidatedInAppend.complete &&
+      invalidatedInAppend.cursorRowid === 1 &&
+      !reopened.complete &&
+      second.uploadedEvents === 1 &&
+      !mid.complete &&
+      third.uploadedEvents === 1 &&
+      final.migration.complete &&
+      final.migration.cursorRowid === 3 &&
+      sent.flat().join(",") === [uuid(21), uuid(22)].join(",") &&
+      raw.every((row) => row.uploadedAt !== null) &&
+      receipts.length === 3 &&
+      new Set(receipts.map((row) => row.id)).size === 3,
+    {
+      completed,
+      invalidatedInAppend,
+      reopened,
+      mid,
+      final: final.migration,
+      sent: sent.flat(),
+      rawUploaded: raw.map((row) => Boolean(row.uploadedAt)),
+      receipts,
+    },
+  );
+  buffer.close();
 }
 
 function insertLegacyPoison(buffer: LocalEventBuffer, n: number, payloadJson: string) {
@@ -246,6 +401,201 @@ async function remotePoisonPositionProof() {
     );
     buffer.close();
   }
+}
+
+async function limitOnePoisonFairnessProof() {
+  for (const poisonPosition of [0, 1, 2]) {
+    const base = 300 + poisonPosition * 10;
+    const cfg = config({ maxBackoffSeconds: 30, maxProbesPerCycle: 2 });
+    const buffer = new LocalEventBuffer(ledger(), {
+      delivery: { enabled: true, limits: cfg.delivery },
+    });
+    const items = [event(base), event(base + 1), event(base + 2)];
+    for (const item of items) buffer.append(item);
+    const poisonId = items[poisonPosition].id;
+    const rawBefore = buffer.database
+      .prepare(`select id, payload_json as payload from buffered_events order by rowid`)
+      .all() as Array<{ id: string; payload: string }>;
+    const requestGroups: string[][] = [];
+    const uploadedPerCall: number[] = [];
+    for (let cycle = 0; cycle < 5; cycle += 1) {
+      if (buffer.delivery.status(instant(2_000 + cycle * 31)).remainingDelivery === 0) break;
+      const result = await uploadBufferedEvents(cfg, buffer, {
+        limit: 1,
+        maxProbes: 2,
+        fetchImpl: async (_input, init) => {
+          const ids = requestIds(init);
+          requestGroups.push(ids);
+          return ids.includes(poisonId)
+            ? response(422, { privateProviderBody: "never-persist-limit-one" })
+            : response(200, { accepted: ids.length });
+        },
+        now: () => instant(2_000 + cycle * 31),
+      });
+      uploadedPerCall.push(result.uploadedEvents);
+    }
+    const status = buffer.delivery.status(instant(2_200));
+    const receipts = buffer.database
+      .prepare(`select delivery_id as id, terminal_state as state, reason from upload_receipts order by delivery_id`)
+      .all() as Array<{ id: string; state: string; reason: string }>;
+    const rawAfter = buffer.database
+      .prepare(`select id, payload_json as payload, uploaded_at as uploadedAt from buffered_events order by rowid`)
+      .all() as Array<{ id: string; payload: string; uploadedAt: string | null }>;
+    record(
+      `limit_one_poison_position_${poisonPosition}_bounded_fairness`,
+      uploadedPerCall.every((count) => count <= 1) &&
+        requestGroups.every((ids) => ids.length === 1) &&
+        status.remainingDelivery === 0 &&
+        status.receipts.acknowledged === 2 &&
+        status.receipts.dead === 1 &&
+        receipts.filter((row) => row.id === poisonId && row.state === "dead").length === 1 &&
+        rawBefore.every((before, index) => before.payload === rawAfter[index].payload) &&
+        rawAfter.filter((row) => row.id !== poisonId).every((row) => row.uploadedAt !== null) &&
+        rawAfter.find((row) => row.id === poisonId)?.uploadedAt === null,
+      {
+        uploadedPerCall,
+        requestGroups,
+        remaining: status.remainingDelivery,
+        acknowledged: status.receipts.acknowledged,
+        dead: status.receipts.dead,
+        poisonReceipts: receipts.filter((row) => row.id === poisonId),
+      },
+    );
+    buffer.close();
+  }
+
+  {
+    const cfg = config({ maxBackoffSeconds: 30, maxProbesPerCycle: 2 });
+    const buffer = new LocalEventBuffer(ledger(), {
+      delivery: { enabled: true, limits: cfg.delivery },
+    });
+    const knownGood = event(340);
+    buffer.append(knownGood);
+    await uploadBufferedEvents(cfg, buffer, {
+      limit: 1,
+      fetchImpl: async () => response(200, { accepted: 1 }),
+      now: () => instant(2_300),
+    });
+    const contractRows = [event(341)];
+    for (const item of contractRows) buffer.append(item);
+    let probes = 0;
+    const failed = await expectDeliveryError(
+      () => uploadBufferedEvents(cfg, buffer, {
+        limit: 1,
+        maxProbes: 2,
+        fetchImpl: async () => {
+          probes += 1;
+          return response(422, { globalPrivateBody: "never-persist-global" });
+        },
+        now: () => instant(2_331),
+      }),
+      "remote_contract",
+    );
+    const status = buffer.delivery.status(instant(2_331));
+    record(
+      "limit_one_global_422_with_prior_witness_quarantines_zero",
+      failed &&
+        probes === 2 &&
+        status.receipts.dead === 0 &&
+        status.receipts.acknowledged === 1 &&
+        status.remainingDelivery === 1 &&
+        status.circuit.kind === "contract_blocked",
+      {
+        failed,
+        probes,
+        dead: status.receipts.dead,
+        acknowledged: status.receipts.acknowledged,
+        remaining: status.remainingDelivery,
+        circuit: status.circuit.kind,
+      },
+    );
+    buffer.close();
+  }
+}
+
+async function crashBetweenSiblingAckAndQuarantineProof() {
+  const file = ledger();
+  const cfg = config({ maxBackoffSeconds: 30, maxProbesPerCycle: 2, leaseSeconds: 120 });
+  const poison = event(350);
+  const valid = event(351);
+  let buffer = new LocalEventBuffer(file, {
+    delivery: { enabled: true, limits: cfg.delivery },
+  });
+  buffer.append(poison);
+  buffer.append(valid);
+  let crashed = false;
+  try {
+    await uploadBufferedEvents(cfg, buffer, {
+      limit: 1,
+      maxProbes: 2,
+      fetchImpl: async (_input, init) =>
+        requestIds(init).includes(poison.id)
+          ? response(422, { privateProviderBody: "never-persist-crash" })
+          : response(200, { accepted: 1 }),
+      now: () => instant(2_400),
+      afterSiblingAcknowledgement: () => {
+        throw new Error("simulated_crash_after_sibling_ack_before_quarantine");
+      },
+    });
+  } catch (error) {
+    crashed = error instanceof Error && error.message.includes("simulated_crash");
+  }
+  const partial = buffer.delivery.status(instant(2_400));
+  const durableWitness = (buffer.database
+    .prepare(`select count(*) as n from upload_validation_witness`)
+    .get() as { n: number }).n;
+  buffer.close();
+
+  buffer = new LocalEventBuffer(file, {
+    delivery: { enabled: true, limits: cfg.delivery },
+  });
+  const replayRequests: string[][] = [];
+  const replay = await uploadBufferedEvents(cfg, buffer, {
+    limit: 1,
+    maxProbes: 2,
+    fetchImpl: async (_input, init) => {
+      const ids = requestIds(init);
+      replayRequests.push(ids);
+      return ids.includes(poison.id)
+        ? response(422, { privateProviderBody: "never-persist-replay" })
+        : response(200, { accepted: ids.length });
+    },
+    now: () => instant(2_521),
+  });
+  await uploadBufferedEvents(cfg, buffer, {
+    limit: 1,
+    fetchImpl: async () => response(200, { accepted: 0 }),
+    now: () => instant(2_522),
+  });
+  const final = buffer.delivery.status(instant(2_522));
+  const receipts = buffer.database
+    .prepare(`select delivery_id as id, terminal_state as state from upload_receipts order by delivery_id`)
+    .all() as Array<{ id: string; state: string }>;
+  record(
+    "crash_after_sibling_ack_replays_quarantine_once_from_durable_witness",
+    crashed &&
+      partial.active.inFlight === 1 &&
+      partial.receipts.acknowledged === 1 &&
+      partial.receipts.dead === 0 &&
+      durableWitness === 1 &&
+      replay.uploadedEvents === 0 &&
+      replay.delivery.deadLetters === 1 &&
+      replayRequests.length === 0 &&
+      final.remainingDelivery === 0 &&
+      final.receipts.acknowledged === 1 &&
+      final.receipts.dead === 1 &&
+      receipts.filter((row) => row.id === poison.id && row.state === "dead").length === 1,
+    {
+      crashed,
+      partial: { active: partial.active, receipts: partial.receipts },
+      durableWitness,
+      replay: { uploaded: replay.uploadedEvents, dead: replay.delivery.deadLetters },
+      replayRequests,
+      final: { remaining: final.remainingDelivery, receipts: final.receipts },
+      receipts,
+    },
+  );
+  buffer.close();
 }
 
 async function globalContractAndAuthProof() {
@@ -515,6 +865,174 @@ async function noMarkPressureAndPrivacyProof() {
   }
 }
 
+async function hostilePrivacyAndLinkageProof() {
+  const { buffer, cfg } = enabledBuffer();
+  const hostile = [
+    ["accessToken", "CAMEL_CREDENTIAL_SENTINEL_7a9f"],
+    ["AccessToken", "PASCAL_CREDENTIAL_SENTINEL_7b9f"],
+    ["refresh_token", "SNAKE_CREDENTIAL_SENTINEL_7c9f"],
+    ["auth", "AUTH_CREDENTIAL_SENTINEL_7d9f"],
+    ["cookie-value", "COOKIE_CREDENTIAL_SENTINEL_7e9f"],
+    ["client.credential", "DOT_CREDENTIAL_SENTINEL_7f9f"],
+    ["ownerEmail", "EMAIL_CREDENTIAL_SENTINEL_809f"],
+    ["db-password", "PASSWORD_CREDENTIAL_SENTINEL_819f"],
+    ["localPath", "PATH_CREDENTIAL_SENTINEL_829f"],
+    ["rawPrompt", "PROMPT_CREDENTIAL_SENTINEL_839f"],
+    ["providerResponse", "RESPONSE_CREDENTIAL_SENTINEL_849f"],
+    ["clientSecret", "SECRET_CREDENTIAL_SENTINEL_859f"],
+    ["requestURL", "URL_CREDENTIAL_SENTINEL_869f"],
+    ["branchHash", "sha256:branch-digest-short-879f"],
+    ["repoHash", "sha256:repo-digest-short-889f"],
+    ["remoteHash", "sha256:remote-digest-short-899f"],
+    ["remoteUrlHash", "sha256:remote-url-digest-short-8a9f"],
+  ] as const;
+  hostile.forEach(([key, sentinel], index) => {
+    buffer.append(event(700 + index, { metadata: { [key]: sentinel } }));
+  });
+
+  const invalidLinkageId = uuid(720);
+  buffer.append(event(720, {
+    metadata: {
+      transport_path: "/v1/traces",
+      cacheReadTokens: 3,
+      cache_creation_tokens: 4,
+      cacheWhateverTokens: 5,
+      "gen_ai.usage.output_tokens": 6,
+      reasoningOutputTokens: 7,
+      "gen_ai.usage.input_tokens": "8",
+    },
+  }));
+  const invalidRowid = (buffer.database
+    .prepare(`select rowid as rowid from buffered_events where id = ?`)
+    .get(invalidLinkageId) as { rowid: number }).rowid;
+  const malformedLinkage = "sha256:LINKAGE_SECRET_SENTINEL_8b4e";
+  buffer.delivery.fillLinkageForRawRow(invalidRowid, malformedLinkage, null);
+
+  const canonicalLinkageId = uuid(721);
+  buffer.append(event(721, { metadata: { transport_path: "/v1/metrics" } }));
+  const canonicalRowid = (buffer.database
+    .prepare(`select rowid as rowid from buffered_events where id = ?`)
+    .get(canonicalLinkageId) as { rowid: number }).rowid;
+  const upperCanonical = `SHA256:${"AB".repeat(32)}`;
+  const lowerCanonical = `sha256:${"ab".repeat(32)}`;
+  buffer.delivery.fillLinkageForRawRow(canonicalRowid, upperCanonical, null);
+
+  const metadataLinkageId = uuid(722);
+  const branchCanonical = `sha256:${"cd".repeat(32)}`;
+  const headSha = "e".repeat(40);
+  buffer.append(event(722, {
+    metadata: {
+      transport_path: "/v1/logs",
+      git: {
+        remoteUrlHash: lowerCanonical,
+        branchHash: branchCanonical,
+        headSha,
+      },
+    },
+  }));
+
+  const beforeRows = buffer.database
+    .prepare(
+      `select delivery_id as id, base_envelope_json as base,
+         coalesce(sealed_envelope_json, '') as sealed, repo_hash as repoHash
+       from upload_outbox order by delivery_id`,
+    )
+    .all() as Array<{ id: string; base: string; sealed: string; repoHash: string | null }>;
+  const deadBefore = buffer.database
+    .prepare(`select delivery_id as id, reason from upload_receipts where terminal_state = 'dead' order by id`)
+    .all() as Array<{ id: string; reason: string }>;
+  let requestBody = "";
+  const uploaded = await uploadBufferedEvents(cfg, buffer, {
+    fetchImpl: async (_input, init) => {
+      requestBody = String(init?.body ?? "");
+      return response(200, { accepted: requestIds(init).length });
+    },
+    now: () => instant(3_000),
+  });
+  const sent = JSON.parse(requestBody) as {
+    events: Array<{
+      event: {
+        id: string;
+        projectKey?: string;
+        inputTokens?: number;
+        outputTokens?: number;
+        metadata: Record<string, unknown>;
+      };
+    }>;
+  };
+  const persisted = buffer.database
+    .prepare(
+      `select coalesce(group_concat(text_value, '|'), '') as text from (
+         select base_envelope_json as text_value from upload_outbox
+         union all select coalesce(sealed_envelope_json, '') from upload_outbox
+         union all select coalesce(repo_hash, '') || ':' || coalesce(branch_hash, '') from upload_outbox
+         union all select envelope_json from upload_validation_witness
+         union all select delivery_id || ':' || reason || ':' || status_class from upload_receipts
+       )`,
+    )
+    .get() as { text: string };
+  const statusJson = JSON.stringify(buffer.delivery.status(instant(3_001)));
+  const hostileSentinels = hostile.map(([, sentinel]) => sentinel);
+  const forbidden = [...hostileSentinels, malformedLinkage];
+  const absentEverywhere = forbidden.every((sentinel) =>
+    !beforeRows.some((row) => `${row.base}|${row.sealed}|${row.repoHash ?? ""}`.includes(sentinel)) &&
+    !requestBody.includes(sentinel) &&
+    !persisted.text.includes(sentinel) &&
+    !statusJson.includes(sentinel),
+  );
+  const invalidSent = sent.events.find((entry) => entry.event.id === invalidLinkageId)?.event;
+  const canonicalSent = sent.events.find((entry) => entry.event.id === canonicalLinkageId)?.event;
+  const metadataLinkageSent = sent.events.find((entry) => entry.event.id === metadataLinkageId)?.event;
+  const metadataGit = metadataLinkageSent?.metadata.git as Record<string, unknown> | undefined;
+  record(
+    "normalized_sensitive_keys_and_noncanonical_linkage_never_enter_delivery_surfaces",
+    deadBefore.length === hostile.length &&
+      deadBefore.every((row) => row.reason === "local_privacy_violation") &&
+      beforeRows.length === 3 &&
+      beforeRows.find((row) => row.id === invalidLinkageId)?.repoHash === null &&
+      beforeRows.find((row) => row.id === canonicalLinkageId)?.repoHash === lowerCanonical &&
+      uploaded.uploadedEvents === 3 &&
+      absentEverywhere &&
+      invalidSent?.projectKey === undefined &&
+      canonicalSent?.projectKey === lowerCanonical &&
+      invalidSent?.metadata.transport_path === "/v1/traces" &&
+      invalidSent?.inputTokens === 721 &&
+      invalidSent?.outputTokens === 1 &&
+      invalidSent?.metadata.cacheReadTokens === 3 &&
+      invalidSent?.metadata.cache_creation_tokens === 4 &&
+      invalidSent?.metadata.cacheWhateverTokens === 5 &&
+      invalidSent?.metadata["gen_ai.usage.output_tokens"] === 6 &&
+      invalidSent?.metadata.reasoningOutputTokens === 7 &&
+      invalidSent?.metadata["gen_ai.usage.input_tokens"] === "8" &&
+      metadataLinkageSent?.projectKey === lowerCanonical &&
+      metadataGit?.remoteUrlHash === lowerCanonical &&
+      metadataGit?.branchHash === branchCanonical &&
+      metadataGit?.headSha === headSha,
+    {
+      hostileDead: deadBefore.length,
+      activeBefore: beforeRows.length,
+      uploaded: uploaded.uploadedEvents,
+      absentEverywhere,
+      invalidProjectKey: invalidSent?.projectKey ?? null,
+      canonicalProjectKey: canonicalSent?.projectKey ?? null,
+      metadataProjectKey: metadataLinkageSent?.projectKey ?? null,
+      metadataGit: metadataGit ?? null,
+      transportPath: invalidSent?.metadata.transport_path,
+      numericTokens: {
+        input: invalidSent?.inputTokens,
+        output: invalidSent?.outputTokens,
+        cacheRead: invalidSent?.metadata.cacheReadTokens,
+        cacheCreation: invalidSent?.metadata.cache_creation_tokens,
+        cacheOther: invalidSent?.metadata.cacheWhateverTokens,
+        namespacedOutput: invalidSent?.metadata["gen_ai.usage.output_tokens"],
+        reasoningOutput: invalidSent?.metadata.reasoningOutputTokens,
+        namespacedInputString: invalidSent?.metadata["gen_ai.usage.input_tokens"],
+      },
+    },
+  );
+  buffer.close();
+}
+
 function pressureAgeByteOversizeAndStatusProof() {
   {
     const file = ledger();
@@ -564,12 +1082,16 @@ async function main() {
   try {
     await atomicAndDuplicateProof();
     migrationProof();
+    await migrationReopenProof();
     await localPoisonProof();
     await remotePoisonPositionProof();
+    await limitOnePoisonFairnessProof();
+    await crashBetweenSiblingAckAndQuarantineProof();
     await globalContractAndAuthProof();
     await retryAndCrashProof();
     await linkageAndRetentionProof();
     await noMarkPressureAndPrivacyProof();
+    await hostilePrivacyAndLinkageProof();
     pressureAgeByteOversizeAndStatusProof();
     const failed = checks.filter((check) => !check.passed);
     console.log(

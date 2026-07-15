@@ -55,6 +55,7 @@ export type DeliveryStatus = {
     | "pressure_row_budget"
     | "pressure_byte_budget"
     | "pressure_age_budget"
+    | "migration_slice_budget"
     | "auth_circuit"
     | "contract_circuit"
   >;
@@ -81,7 +82,7 @@ export type DeliveryStatus = {
   migration: {
     cursorRowid: number;
     complete: boolean;
-    pausedReason: "pressure" | null;
+    pausedReason: "pressure" | "slice_budget_too_small" | null;
     progressMode: "bounded_rowid_watermark_no_exact_remaining";
     sliceBudget: { rows: number; bytes: number; uploadBatchesPerCycle: number };
     lastSlice: {
@@ -125,6 +126,12 @@ export type DeliveryLease = {
   blockedBy: DeliveryCircuit | "none";
 };
 
+export type DeliveryValidationWitness = {
+  contractHash: string;
+  acknowledgedAt: string;
+  item: LeasedDeliveryItem;
+};
+
 type RawDeliveryRow = {
   rawRowid: number;
   rawId: string;
@@ -162,14 +169,66 @@ type PreparedDelivery =
     }
   | { ok: false; deliveryId: string; reason: DeliveryReceiptReason };
 
-const SAFE_HASH = /^sha256:[a-zA-Z0-9._:-]{8,160}$/;
+const SAFE_HASH = /^sha256:([a-f0-9]{64})$/i;
 const SAFE_SUPPRESSED_FIELD = /^[a-zA-Z0-9_.:-]{1,96}$/;
-const SENSITIVE_KEY = /(?:^|_)(?:authorization|cookie|credential|email|password|path|prompt|response|secret|token|url)(?:$|_)/i;
 const SENSITIVE_STRING =
   /(?:https?:\/\/|\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b|(?:^|[\s"'])\/(?:Users|home|private|var\/folders)\/|\b[A-Za-z]:\\)/i;
 
 function safeLinkage(value: string | null | undefined) {
-  return value && SAFE_HASH.test(value) ? value : null;
+  if (!value) return null;
+  const match = value.trim().match(SAFE_HASH);
+  return match ? `sha256:${match[1].toLowerCase()}` : null;
+}
+
+function keyWords(key: string) {
+  return key
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1_$2")
+    .replace(/([a-z0-9])([A-Z])/g, "$1_$2")
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean);
+}
+
+function safeNumericTokenCounter(words: string[], value: unknown) {
+  const numeric =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && /^(?:0|[1-9][0-9]*)$/.test(value)
+        ? Number(value)
+        : Number.NaN;
+  if (!Number.isSafeInteger(numeric) || numeric < 0) return false;
+  if (words.some((word) => /^(?:access|refresh|auth|authentication|authorization|api|bearer|oauth|credential|credentials|cookie|cookies|password|secret)$/.test(word))) {
+    return false;
+  }
+  const collapsed = words.join("");
+  return /(?:input|output)tokens?$/.test(collapsed) || /cache[a-z0-9]*tokens?$/.test(collapsed);
+}
+
+function sensitiveKey(key: string, value: unknown) {
+  const words = keyWords(key);
+  if (words.length === 0) return false;
+  const collapsed = words.join("");
+  const hashNamed = words.at(-1) === "hash";
+  const linkageHashNamed = hashNamed && words.some((word) =>
+    /^(?:branch|repo|repository|remote|url|path)$/.test(word),
+  );
+  if (linkageHashNamed) {
+    return !(typeof value === "string" && safeLinkage(value) !== null);
+  }
+  const hasToken = words.some((word) => /^tokens?$/.test(word)) || /(?:access|refresh|api|bearer|oauth)tokens?$/.test(collapsed);
+  if (hasToken && !safeNumericTokenCounter(words, value)) return true;
+
+  const sensitiveConcept = words.some((word) =>
+    /^(?:auth|authentication|authorization|cookie|cookies|credential|credentials|email|password|path|prompt|response|secret|url)$/.test(word),
+  ) || /(?:accesstoken|refreshtoken)$/.test(collapsed);
+  if (!sensitiveConcept) return false;
+
+  // Repo/path linkage may retain its descriptive key only when the value is a
+  // canonical 256-bit digest. Raw or pseudo-hashed URL/path values still fail.
+  const onlyHashableConcept = words.every((word) =>
+    !/^(?:auth|authentication|authorization|cookie|cookies|credential|credentials|email|password|prompt|response|secret)$/.test(word),
+  );
+  return !(hashNamed && onlyHashableConcept && typeof value === "string" && safeLinkage(value) !== null);
 }
 
 function privacyViolation(value: unknown, key = ""): boolean {
@@ -180,7 +239,7 @@ function privacyViolation(value: unknown, key = ""): boolean {
   ) {
     return false;
   }
-  if (key && SENSITIVE_KEY.test(key)) return true;
+  if (key && sensitiveKey(key, value)) return true;
   if (typeof value === "string") return SENSITIVE_STRING.test(value);
   if (Array.isArray(value)) return value.some((entry) => privacyViolation(entry));
   if (!value || typeof value !== "object") return false;
@@ -284,11 +343,13 @@ export class DeliveryOutbox {
     this.enabled = options.enabled ?? false;
     this.limits = asLimits(options.limits);
     this.initializeSchema();
+    if (this.enabled) this.reopenMigrationPastWatermark();
   }
 
   configure(options: { enabled: boolean; limits?: Partial<DeliveryLimits> }) {
     this.enabled = options.enabled;
     this.limits = asLimits(options.limits);
+    if (this.enabled) this.reopenMigrationPastWatermark();
   }
 
   isEnabled() {
@@ -325,6 +386,19 @@ export class DeliveryOutbox {
         attempt_count integer not null,
         created_at text not null,
         terminal_at text not null
+      );
+      create table if not exists upload_validation_witness (
+        singleton integer primary key check (singleton = 1),
+        contract_hash text not null,
+        delivery_id text not null,
+        envelope_json text not null,
+        envelope_bytes integer not null,
+        acknowledged_at text not null
+      );
+      create table if not exists upload_validation_candidates (
+        delivery_id text primary key,
+        contract_hash text not null,
+        failed_at text not null
       );
       create table if not exists upload_control (
         singleton integer primary key check (singleton = 1),
@@ -392,6 +466,12 @@ export class DeliveryOutbox {
         where singleton = 1;
       end;
 
+      create trigger if not exists trg_upload_validation_candidate_cleanup
+      after delete on upload_outbox
+      begin
+        delete from upload_validation_candidates where delivery_id = old.delivery_id;
+      end;
+
       create trigger if not exists trg_upload_outbox_gauge_update
       after update of state, sealed_bytes, attempt_count on upload_outbox
       begin
@@ -424,6 +504,49 @@ export class DeliveryOutbox {
         where singleton = 1;
       end;
     `);
+  }
+
+  /**
+   * Keep the completed legacy watermark truthful without scanning history.
+   * `max(rowid)` uses SQLite's integer-primary-key fast path. Buffer appends
+   * call noteRawAppend in their own transaction; this reconciliation also
+   * catches rollback-compatible/direct raw inserts made while delivery was off.
+   */
+  private reopenMigrationPastWatermark() {
+    this.db
+      .prepare(
+        `update upload_control set migration_complete = 0,
+           migration_paused_reason = null, updated_at = @now
+         where singleton = 1 and migration_complete = 1
+           and migration_cursor_rowid <
+             (select coalesce(max(rowid), 0) from buffered_events)`,
+      )
+      .run({ now: new Date().toISOString() });
+  }
+
+  noteRawAppend(rawRowid: number) {
+    if (!Number.isSafeInteger(rawRowid) || rawRowid <= 0) return;
+    const now = new Date().toISOString();
+    if (this.enabled) {
+      // A configured append is projected in the same transaction immediately
+      // after this call, so an already-complete high-water can advance in O(1).
+      this.db
+        .prepare(
+          `update upload_control set migration_cursor_rowid = max(migration_cursor_rowid, @rawRowid),
+             updated_at = @now
+           where singleton = 1 and migration_complete = 1`,
+        )
+        .run({ rawRowid, now });
+      return;
+    }
+    this.db
+      .prepare(
+        `update upload_control set migration_complete = 0,
+           migration_paused_reason = null, updated_at = @now
+         where singleton = 1 and migration_complete = 1
+           and migration_cursor_rowid < @rawRowid`,
+      )
+      .run({ rawRowid, now });
   }
 
   enqueueRaw(row: RawDeliveryRow) {
@@ -540,6 +663,7 @@ export class DeliveryOutbox {
     let dead = 0;
     let skippedUploaded = 0;
     let cursor = control.cursorRowid;
+    let paused: "slice_budget_too_small" | null = null;
     const readRaw = this.db.prepare(
       `select rowid as rawRowid, id as rawId, created_at as createdAt,
          uploaded_at as uploadedAt, payload_json as payloadJson,
@@ -570,6 +694,16 @@ export class DeliveryOutbox {
           });
           continue;
         }
+        // A maintenance budget is not an item-validity boundary. Preserve an
+        // otherwise deliverable row, expose an actionable degraded pause, and
+        // resume once the operator raises the slice budget. The header-only
+        // length check keeps repeated paused cycles bounded and never loads it.
+        if (rowBytes > maxBytes) {
+          visited -= 1;
+          cursor = Math.max(control.cursorRowid, candidate.rawRowid - 1);
+          paused = "slice_budget_too_small";
+          break;
+        }
         if (bytes > 0 && bytes + rowBytes > maxBytes) {
           visited -= 1;
           cursor = candidate.rawRowid - 1;
@@ -582,13 +716,13 @@ export class DeliveryOutbox {
         enqueued += result.enqueued;
         dead += result.dead;
       }
-      const complete = rows.length < maxRows && visited === rows.length;
+      const complete = paused === null && rows.length < maxRows && visited === rows.length;
       this.db
         .prepare(
           `update upload_control set
              migration_cursor_rowid = @cursor,
              migration_complete = @complete,
-             migration_paused_reason = null,
+             migration_paused_reason = @paused,
              migration_last_visited = @visited,
              migration_last_bytes = @bytes,
              migration_last_enqueued = @enqueued,
@@ -606,12 +740,13 @@ export class DeliveryOutbox {
           enqueued,
           dead,
           skippedUploaded,
+          paused,
           now: now.toISOString(),
         });
       return complete;
     });
     const complete = run();
-    return { visited, bytes, enqueued, dead, skippedUploaded, complete, paused: null };
+    return { visited, bytes, enqueued, dead, skippedUploaded, complete, paused };
   }
 
   lease(options: { maxRows?: number; maxBytes?: number; now?: Date; leaseId?: string } = {}): DeliveryLease {
@@ -654,7 +789,8 @@ export class DeliveryOutbox {
              attempt_count as attemptCount
            from upload_outbox
            where state in ('pending','retry') and next_attempt_at <= ?
-           order by created_at, delivery_id
+           order by case when last_failure_class = 'remote_validation' then 1 else 0 end,
+             created_at, delivery_id
            limit ?`,
         )
         .all(nowIso, maxRows) as ActiveDeliveryRow[];
@@ -721,7 +857,12 @@ export class DeliveryOutbox {
     return { leaseId, items, locallyDead, blockedBy: "none" };
   }
 
-  acknowledge(leaseId: string, ids: string[], at = new Date()) {
+  acknowledge(
+    leaseId: string,
+    ids: string[],
+    at = new Date(),
+    validationWitness?: { contractHash: string; item: LeasedDeliveryItem },
+  ) {
     const terminalAt = at.toISOString();
     const get = this.db.prepare(
       `select raw_rowid as rawRowid, attempt_count as attemptCount, created_at as createdAt
@@ -750,9 +891,114 @@ export class DeliveryOutbox {
         if (row.rawRowid !== null) markedUploaded += markRaw.run(terminalAt, row.rawRowid).changes;
         remove.run(id, leaseId);
       }
+      if (validationWitness && ids.includes(validationWitness.item.deliveryId)) {
+        this.writeValidationWitness(validationWitness.contractHash, validationWitness.item, terminalAt);
+      }
       return { acknowledged, markedUploaded };
     });
     return run();
+  }
+
+  validationWitness(contractHash: string): DeliveryValidationWitness | null {
+    const canonicalContract = safeLinkage(contractHash);
+    if (!canonicalContract) return null;
+    const row = this.db
+      .prepare(
+        `select contract_hash as contractHash, delivery_id as deliveryId,
+           envelope_json as envelopeJson, envelope_bytes as envelopeBytes,
+           acknowledged_at as acknowledgedAt
+         from upload_validation_witness where singleton = 1 and contract_hash = ?`,
+      )
+      .get(canonicalContract) as
+      | {
+          contractHash: string;
+          deliveryId: string;
+          envelopeJson: string;
+          envelopeBytes: number;
+          acknowledgedAt: string;
+        }
+      | undefined;
+    if (!row || row.envelopeBytes > this.limits.maxItemBytes || Buffer.byteLength(row.envelopeJson) !== row.envelopeBytes) {
+      return null;
+    }
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(row.envelopeJson);
+    } catch {
+      return null;
+    }
+    const parsed = aiWorkIngestEventSchema.safeParse(decoded);
+    if (
+      !parsed.success ||
+      parsed.data.event.id !== row.deliveryId ||
+      findForbiddenRawContentFields(parsed.data.event.metadata).length > 0 ||
+      privacyViolation(parsed.data)
+    ) {
+      return null;
+    }
+    return {
+      contractHash: row.contractHash,
+      acknowledgedAt: row.acknowledgedAt,
+      item: {
+        deliveryId: row.deliveryId,
+        rawRowid: null,
+        envelopeJson: row.envelopeJson,
+        envelope: parsed.data,
+        attemptCount: 0,
+      },
+    };
+  }
+
+  markValidationCandidate(
+    leaseId: string,
+    deliveryId: string,
+    contractHash: string,
+    at = new Date(),
+  ) {
+    const canonicalContract = safeLinkage(contractHash);
+    if (!canonicalContract) return 0;
+    return this.db
+      .prepare(
+        `insert into upload_validation_candidates (delivery_id, contract_hash, failed_at)
+         select delivery_id, @contractHash, @failedAt from upload_outbox
+         where delivery_id = @deliveryId and state = 'in_flight' and lease_id = @leaseId
+         on conflict(delivery_id) do update set
+           contract_hash = excluded.contract_hash,
+           failed_at = excluded.failed_at`,
+      )
+      .run({
+        deliveryId,
+        leaseId,
+        contractHash: canonicalContract,
+        failedAt: at.toISOString(),
+      }).changes;
+  }
+
+  settleProvenValidationCandidates(
+    contractHash: string,
+    options: { maxRows?: number; now?: Date } = {},
+  ) {
+    const witness = this.validationWitness(contractHash);
+    if (!witness) return 0;
+    const maxRows = Math.max(1, Math.min(Math.trunc(options.maxRows ?? 500), 500));
+    const rows = this.db
+      .prepare(
+        `select c.delivery_id as deliveryId
+         from upload_validation_candidates c
+         join upload_outbox o on o.delivery_id = c.delivery_id
+         where c.contract_hash = ? and c.failed_at <= ?
+         order by c.failed_at, c.delivery_id
+         limit ?`,
+      )
+      .all(witness.contractHash, witness.acknowledgedAt, maxRows) as Array<{ deliveryId: string }>;
+    const terminalAt = (options.now ?? new Date()).toISOString();
+    return this.db.transaction(() => {
+      let dead = 0;
+      for (const row of rows) {
+        dead += this.deadActive(row.deliveryId, "remote_validation_rejected", terminalAt);
+      }
+      return dead;
+    })();
   }
 
   deadLetterRemote(leaseId: string, ids: string[], at = new Date()) {
@@ -848,7 +1094,7 @@ export class DeliveryOutbox {
       .get() as {
       cursorRowid: number;
       complete: number;
-      pausedReason: "pressure" | null;
+      pausedReason: "pressure" | "slice_budget_too_small" | null;
       circuitKind: DeliveryCircuit;
       circuitOpenedAt: string | null;
       circuitUntil: string | null;
@@ -894,6 +1140,9 @@ export class DeliveryOutbox {
     );
     if (control.circuitKind === "auth_blocked") degradedReasons.push("auth_circuit");
     if (control.circuitKind === "contract_blocked") degradedReasons.push("contract_circuit");
+    if (control.pausedReason === "slice_budget_too_small") {
+      degradedReasons.push("migration_slice_budget");
+    }
     return {
       enabled: this.enabled,
       degraded: degradedReasons.length > 0,
@@ -987,6 +1236,51 @@ export class DeliveryOutbox {
          values (@deliveryId, @state, @reason, @statusClass, @attemptCount, @createdAt, @terminalAt)`,
       )
       .run({ ...input, statusClass: terminalStatusClass(input.reason) }).changes;
+  }
+
+  private writeValidationWitness(
+    contractHash: string,
+    item: LeasedDeliveryItem,
+    acknowledgedAt: string,
+  ) {
+    const canonicalContract = safeLinkage(contractHash);
+    if (!canonicalContract) return 0;
+    let decoded: unknown;
+    try {
+      decoded = JSON.parse(item.envelopeJson);
+    } catch {
+      return 0;
+    }
+    const envelope = aiWorkIngestEventSchema.safeParse(decoded);
+    const envelopeBytes = Buffer.byteLength(item.envelopeJson);
+    if (
+      !envelope.success ||
+      envelope.data.event.id !== item.deliveryId ||
+      envelopeBytes > this.limits.maxItemBytes ||
+      findForbiddenRawContentFields(envelope.data.event.metadata).length > 0 ||
+      privacyViolation(envelope.data)
+    ) {
+      return 0;
+    }
+    return this.db
+      .prepare(
+        `insert into upload_validation_witness
+          (singleton, contract_hash, delivery_id, envelope_json, envelope_bytes, acknowledged_at)
+         values (1, @contractHash, @deliveryId, @envelopeJson, @envelopeBytes, @acknowledgedAt)
+         on conflict(singleton) do update set
+           contract_hash = excluded.contract_hash,
+           delivery_id = excluded.delivery_id,
+           envelope_json = excluded.envelope_json,
+           envelope_bytes = excluded.envelope_bytes,
+           acknowledged_at = excluded.acknowledged_at`,
+      )
+      .run({
+        contractHash: canonicalContract,
+        deliveryId: item.deliveryId,
+        envelopeJson: item.envelopeJson,
+        envelopeBytes,
+        acknowledgedAt,
+      }).changes;
   }
 
   private nextAttemptAt(deliveryId: string, attemptCount: number, now: Date) {

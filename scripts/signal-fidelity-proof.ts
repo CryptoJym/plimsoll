@@ -1754,14 +1754,39 @@ async function main() {
   const before = buffer.stats().unuploadedCount;
   const first = await uploadBufferedEvents(uploadConfig, buffer, { limit: 4 });
   const second = await uploadBufferedEvents(uploadConfig, buffer, { limit: 500 });
+  const deliveryAfterUpload = buffer.delivery.status();
+  const deliveryReceiptReasons = buffer.database
+    .prepare(`select terminal_state as state, reason, count(*) as n from upload_receipts group by terminal_state, reason order by state, reason`)
+    .all() as Array<{ state: string; reason: string; n: number }>;
+  const unuploadedKinds = buffer.database
+    .prepare(`select event_type as eventType, count(*) as n from buffered_events where uploaded_at is null group by event_type order by event_type`)
+    .all() as Array<{ eventType: string; n: number }>;
+  const unuploadedMetadataKeys = (buffer.database
+    .prepare(`select id, payload_json as payload from buffered_events where uploaded_at is null order by id`)
+    .all() as Array<{ id: string; payload: string }>).map((row) => {
+      const payload = JSON.parse(row.payload) as { metadata?: Record<string, unknown> };
+      return { id: row.id, keys: Object.keys(payload.metadata ?? {}).sort() };
+    });
   await new Promise<void>((resolve) => stub.close(() => resolve()));
   check(
     "upload_watermark_drains",
     before > 0 &&
       first.markedUploaded === 4 &&
       second.remainingUnuploaded === 0 &&
+      second.remainingDelivery === 0 &&
+      deliveryAfterUpload.remainingDelivery === 0 &&
+      deliveryAfterUpload.receipts.dead === 0 &&
       buffer.stats().unuploadedCount === 0,
-    JSON.stringify({ before, firstMarked: first.markedUploaded, after: buffer.stats().unuploadedCount, batches: received }),
+    JSON.stringify({
+      before,
+      firstMarked: first.markedUploaded,
+      after: buffer.stats().unuploadedCount,
+      remainingDelivery: deliveryAfterUpload.remainingDelivery,
+      receipts: deliveryReceiptReasons,
+      unuploadedKinds,
+      unuploadedMetadataKeys,
+      batches: received,
+    }),
   );
 
   check(

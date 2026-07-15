@@ -120,16 +120,18 @@ Crash before commit changes nothing. Crash after commit leaves all three recover
 
 The outbox stores a copy, not a foreign-key-only reference to raw evidence. Its immutable delivery body is the exact event shape already accepted by the outbound ingest schema after the privacy gate, plus the existing bounded `suppressedFields` names and privacy-safe linkage fields. It does not contain collector credentials, provider response bodies, local labels/emails, raw paths, prompts, responses, or tool arguments. Each item also has a stable idempotency/event ID, creation time, attempt count, next-attempt time, acknowledgement time, and enumerated terminal reason.
 
-The delivery body has an explicit per-item byte ceiling below the upload batch limit. An oversized item is classified deterministically and never grows the retry queue unboundedly. Batch construction reads these copies and enforces both row and byte caps.
+The delivery body has an explicit per-item byte ceiling below the upload batch limit. An oversized item is classified deterministically and never grows the retry queue unboundedly. Batch construction reads these copies and enforces both row and byte caps. A legacy raw row that fits the item ceiling but exceeds the configured migration-slice budget is preserved and reported as `slice_budget_too_small`; raising that maintenance budget resumes the same watermark. A maintenance tuning value never turns otherwise deliverable evidence into a dead letter.
 
 Atomic enqueue means a configured cloud delivery cannot observe an event without a durable local outbox copy, and replay of the deterministic event ID cannot duplicate that copy. After commit, the raw evidence row and the outbox item have independent lifecycle policies:
 
 - raw evidence expires under the configured raw age/byte policy whether the delivery item is pending, acknowledged, or dead-lettered;
 - the sanitized envelope copy survives raw expiry until acknowledgement, deterministic quarantine, or the separately documented outbox age/byte policy applies;
-- acknowledgement deletes or tombstones the envelope copy without rewriting raw evidence; and
+- acknowledgement deletes or tombstones the active envelope copy without rewriting raw evidence. One most-recent acknowledged, sanitized envelope may remain in a singleton validation-witness slot, scoped by a SHA-256 hash of the upload contract; it is bounded by the same item ceiling and exists only to distinguish an item-specific 400/422 from a globally broken contract; and
 - deterministic quarantine stores the stable item/event ID and a bounded redacted classification, never a provider response body.
 
 This bounded duplication is deliberate: it isolates upload availability from raw-retention truth. During migration, legacy unuploaded rows are copied into the outbox in bounded, idempotent batches before legacy retention protection is removed; status exposes the remaining migration watermark.
+
+Delivery privacy checks split camelCase, PascalCase, snake_case, kebab-case, and dotted key names before comparing sensitive concepts. Numeric input/output/cache token counters and the three explicit OTLP transport paths remain valid; credential, cookie, email, password, prompt/response, secret, raw path/URL, and token-bearing keys do not. Repo and branch linkage enter delivery only as a canonical `sha256:` prefix plus exactly 64 hexadecimal characters.
 
 Large pre-existing ledgers are migrated additively:
 
