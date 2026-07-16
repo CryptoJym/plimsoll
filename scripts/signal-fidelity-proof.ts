@@ -864,18 +864,28 @@ async function main() {
     "no raw cmd/workdir/prompt sentinel or real repo path present in persisted rows",
   );
 
-  const hookClasses = rows
+  const toolHookObservedAt = new Set(
+    [10_000, 11_000, 12_000].map((offset) =>
+      proofClock.iso(SIGNAL_BASE_OFFSET_MS + offset),
+    ),
+  );
+  const toolHookRows = rows
     .filter(
       (row) =>
         row.payload.eventType === "tool_use" &&
         row.source === "claude_code" &&
-        typeof (row.payload.metadata as Record<string, unknown>).hook_event_name === "string",
-    )
+        row.payload.sessionId === SESSION &&
+        toolHookObservedAt.has(row.payload.observedAt),
+    );
+  const hookClasses = toolHookRows
     .map((row) => row.payload.actionClass)
     .sort();
   check(
     "hook_action_class_mapping",
-    JSON.stringify(hookClasses) === JSON.stringify(["edit", "mcp", "shell"]),
+    JSON.stringify(hookClasses) === JSON.stringify(["edit", "mcp", "shell"]) &&
+      toolHookRows.every(
+        (row) => !("hook_event_name" in (row.payload.metadata as Record<string, unknown>)),
+      ),
     `tool_use classes: ${JSON.stringify(hookClasses)}`,
   );
 

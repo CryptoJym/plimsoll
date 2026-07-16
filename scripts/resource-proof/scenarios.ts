@@ -58,6 +58,28 @@ type EnvironmentSentinelFixture = {
   optionalPassThroughNames: string[];
 };
 
+type MetadataPrivacyFixture = {
+  schemaVersion: number;
+  prefixLength: number;
+  sentinels: Record<string, string>;
+};
+
+type IntegratedWorkerResult = {
+  schema: "plimsoll.resource-proof.integrated-worker.v1";
+  scenario: "integrated" | "privacy";
+  passed: boolean;
+  checks: Record<string, boolean>;
+  counters: {
+    eventsObserved: number;
+    eventsAdmitted: number;
+    eventsDropped: number;
+    rawEventWrites: number;
+    projectionRowsWritten: number;
+    outboxRowsEnqueued: number;
+  };
+  measurements: Record<string, number | boolean>;
+};
+
 export type ResourceSandbox = {
   root: string;
   home: string;
@@ -70,6 +92,37 @@ export type ResourceSandbox = {
 };
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+
+function metadataPrivacyFixture() {
+  const fixture = JSON.parse(
+    fs.readFileSync(
+      path.join(
+        repoRoot,
+        "scripts",
+        "resource-proof",
+        "fixtures",
+        "metadata-privacy-sentinels.json",
+      ),
+      "utf8",
+    ),
+  ) as MetadataPrivacyFixture;
+  if (fixture.schemaVersion !== 1 || fixture.prefixLength < 8) {
+    throw new Error("resource-proof metadata privacy fixture must use schemaVersion 1");
+  }
+  return fixture;
+}
+
+function metadataPrivacyTerms(operatorHome: string) {
+  const fixture = metadataPrivacyFixture();
+  const values = Object.values(fixture.sentinels);
+  return [...values, ...values.map((value) => value.slice(0, fixture.prefixLength)), operatorHome];
+}
+
+export function resourceReceiptPrivacyLeakCount(serialized: string, operatorHome: string) {
+  return metadataPrivacyTerms(operatorHome).filter(
+    (term) => term && serialized.includes(term),
+  ).length;
+}
 
 function within(parent: string, candidate: string) {
   const relative = path.relative(path.resolve(parent), path.resolve(candidate));
@@ -1238,6 +1291,134 @@ export async function runDashboardProjectionBudgetContract(
     }
     buffer.close();
   }
+}
+
+function runIntegratedWorker(
+  sandbox: ResourceSandbox,
+  mode: "integrated" | "privacy",
+  operatorHome: string,
+) {
+  const started = performance.now();
+  const tsxCli = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
+  const worker = path.join(repoRoot, "scripts", "resource-proof", "integrated-worker.ts");
+  const workerRoot = path.join(sandbox.root, `worker-${mode}`);
+  fs.mkdirSync(workerRoot, { recursive: true, mode: 0o700 });
+  const result = spawnSync(
+    process.execPath,
+    [
+      tsxCli,
+      worker,
+      "--scenario",
+      mode,
+      "--root",
+      workerRoot,
+      "--operator-home",
+      operatorHome,
+    ],
+    {
+      cwd: repoRoot,
+      env: buildAllowlistedChildEnvironment(sandbox),
+      encoding: "utf8",
+      timeout: 120_000,
+      maxBuffer: 4 * 1024 * 1024,
+    },
+  );
+  const stdout = result.stdout ?? "";
+  const stderr = result.stderr ?? "";
+  const childLeakCount = metadataPrivacyTerms(operatorHome).filter(
+    (term) => term && (stdout.includes(term) || stderr.includes(term)),
+  ).length;
+  let parsed: IntegratedWorkerResult | undefined;
+  try {
+    parsed = JSON.parse(stdout.trim()) as IntegratedWorkerResult;
+  } catch {
+    parsed = undefined;
+  }
+  const workerShapeValid = Boolean(
+    parsed &&
+      parsed.schema === "plimsoll.resource-proof.integrated-worker.v1" &&
+      parsed.scenario === mode &&
+      typeof parsed.checks === "object" &&
+      typeof parsed.counters === "object" &&
+      typeof parsed.measurements === "object",
+  );
+  const childNode22 = parsed?.measurements.nodeMajor === 22;
+  const passed = Boolean(
+    result.status === 0 &&
+      !result.error &&
+      childLeakCount === 0 &&
+      workerShapeValid &&
+      childNode22 &&
+      parsed?.passed,
+  );
+  return { started, result, parsed, childLeakCount, workerShapeValid, childNode22, passed };
+}
+
+export function runIntegratedCaptureProjectionOutboxContract(
+  sandbox: ResourceSandbox,
+  operatorHome: string,
+): ScenarioReceipt {
+  const execution = runIntegratedWorker(sandbox, "integrated", operatorHome);
+  const counters = emptyWorkCounters();
+  const observed = execution.parsed?.counters;
+  if (observed) {
+    counters.eventsObserved = observed.eventsObserved;
+    counters.eventsAdmitted = observed.eventsAdmitted;
+    counters.eventsDropped = observed.eventsDropped;
+    counters.rawEventWrites = observed.rawEventWrites;
+    counters.projectionRowsWritten = observed.projectionRowsWritten;
+    counters.outboxRowsEnqueued = observed.outboxRowsEnqueued;
+  }
+  return {
+    id: "integrated_capture_projection_outbox",
+    required: true,
+    status: execution.passed ? "pass" : "fail",
+    detail: execution.passed
+      ? "A minimal Node 22 child proved loopback OTLP admission, atomic raw/projection/outbox capture, coherent snapshot, reopen, duplicate and rollback safety, and one acknowledgement through an injected upload transport with an exact loopback target."
+      : "The isolated capture/projection/outbox worker failed one or more required production-boundary assertions; child content is omitted.",
+    durationMs: Math.round((performance.now() - execution.started) * 100) / 100,
+    counters,
+    measurements: {
+      childExitCode: execution.result.status,
+      childTimedOut: execution.result.signal === "SIGTERM" && Boolean(execution.result.error),
+      childOutputPrivacyLeaks: execution.childLeakCount,
+      workerShapeValid: execution.workerShapeValid,
+      childNode22: execution.childNode22,
+      ...(execution.parsed?.measurements ?? {}),
+    },
+  };
+}
+
+export function runMetadataPrivacySentinelsContract(
+  sandbox: ResourceSandbox,
+  operatorHome: string,
+): ScenarioReceipt {
+  const execution = runIntegratedWorker(sandbox, "privacy", operatorHome);
+  const counters = emptyWorkCounters();
+  const observed = execution.parsed?.counters;
+  if (observed) {
+    counters.eventsObserved = observed.eventsObserved;
+    counters.eventsAdmitted = observed.eventsAdmitted;
+    counters.eventsDropped = observed.eventsDropped;
+  }
+  return {
+    id: "metadata_privacy_sentinels",
+    required: true,
+    status: execution.passed ? "pass" : "fail",
+    detail: execution.passed
+      ? "Full and prefix sentinels plus the operator-home path were absent from live SQLite text, open database/WAL/SHM byte copies scanned after close, surviving closed artifacts, upload bytes, request logs/responses, child output, and the worker receipt."
+      : "The isolated metadata privacy worker failed a required boundary or detected a private-term leak; child content is omitted.",
+    durationMs: Math.round((performance.now() - execution.started) * 100) / 100,
+    counters,
+    measurements: {
+      childExitCode: execution.result.status,
+      childTimedOut: execution.result.signal === "SIGTERM" && Boolean(execution.result.error),
+      childOutputPrivacyLeaks: execution.childLeakCount,
+      workerShapeValid: execution.workerShapeValid,
+      childNode22: execution.childNode22,
+      ...(execution.parsed?.measurements ?? {}),
+    },
+  };
 }
 
 type CapturedChild = {

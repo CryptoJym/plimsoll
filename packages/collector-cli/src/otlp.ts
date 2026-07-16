@@ -1,10 +1,17 @@
 import {
   DEFAULT_POLICY,
+  GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
+  admittedMetadataAttributes,
   aiInteractionEventSchema,
+  canonicalizeSuppressionReceipts,
   estimateCostUsd,
   sanitizeForPolicy,
+  suppressionReceiptForAttributeKey,
+  usageFieldKeys,
+  validatedMetadataAttribute,
   type ActionClass,
   type AiInteractionEvent,
+  type OtlpAttributeSurface,
   type PolicyConfig,
   type ToolSource,
 } from "../../shared/src/index";
@@ -19,7 +26,6 @@ import {
   otelScalar,
   stringField,
   unixNanoToIso,
-  usageFieldKeys,
 } from "./normalizer";
 import {
   addOtlpAdmissionDrop,
@@ -37,6 +43,7 @@ export type MetricSample = {
   sampleType?: string;
   value: number;
   attrs: Record<string, unknown>;
+  suppressedFields: string[];
 };
 
 export type ExplodedOtlp = {
@@ -77,16 +84,19 @@ function flattenOtelAttributes(attributes: unknown): Record<string, unknown> {
   return flat;
 }
 
-function resourceSummary(resource: unknown) {
+function resourceSummary(resource: unknown, dataMode: PolicyConfig["dataMode"]) {
   const attrs = flattenOtelAttributes(asRecord(resource).attributes);
+  const admitted = metadataSafeOtlpAttributes(attrs, dataMode, "resource");
   return {
-    serviceName: boundedSignalName(attrs["service.name"]),
-    serviceVersion:
-      typeof attrs["service.version"] === "string" &&
-      /^[a-zA-Z0-9_.+-]{1,80}$/.test(attrs["service.version"].trim())
-        ? attrs["service.version"].trim()
-        : undefined,
+    serviceName: admitted.attrs["service.name"] as string | undefined,
+    serviceVersion: admitted.attrs["service.version"] as string | undefined,
+    suppressedFields: admitted.suppressedFields,
   };
+}
+
+function scopeSuppressedFields(scope: unknown, dataMode: PolicyConfig["dataMode"]) {
+  const attrs = flattenOtelAttributes(asRecord(scope).attributes);
+  return metadataSafeOtlpAttributes(attrs, dataMode, "scope").suppressedFields;
 }
 
 function recordTimestamp(record: Record<string, unknown>, attrs: Record<string, unknown>) {
@@ -136,89 +146,6 @@ function workdirFromRawRecord(record: Record<string, unknown>): string | undefin
   return undefined;
 }
 
-const SAFE_STRING_ATTRIBUTE_KEYS = new Set(
-  [
-    ...usageFieldKeys.actorId,
-    ...usageFieldKeys.cacheReadTokens,
-    ...usageFieldKeys.cacheCreationTokens,
-    ...usageFieldKeys.costUsd,
-    ...usageFieldKeys.inputTokens,
-    ...usageFieldKeys.model,
-    ...usageFieldKeys.outputTokens,
-    ...usageFieldKeys.sessionId,
-    "event.name",
-    "event.timestamp",
-    "timestamp",
-    "tool_name",
-    "toolName",
-    "tool",
-    "gen_ai.tool.name",
-    "plimsoll.action_class",
-    "cfo_one.action_class",
-    "action_class",
-    "mcp_server",
-    "request_id",
-    "call_id",
-    "gen_ai.response.id",
-    "plimsoll.project",
-    "cfo_one.project",
-    "project_key",
-    "project",
-    "plimsoll.customer",
-    "cfo_one.customer",
-    "customer_key",
-    "customer",
-    "plimsoll.workflow",
-    "cfo_one.workflow",
-    "workflow_key",
-    "workflow",
-    "decision",
-    "type",
-    "error.type",
-    "exception.type",
-    "duration_ms",
-    "success",
-    "failed",
-    "error",
-    "status.code",
-    "event.sequence",
-    "http.request.method",
-    "http.response.status_code",
-    "rpc.system",
-    "rpc.service",
-    "rpc.method",
-    "db.system",
-    "db.operation.name",
-  ].map((key) => key.toLowerCase()),
-);
-
-const SENSITIVE_SEMANTIC_KEY_PARTS = new Set([
-  "args",
-  "arguments",
-  "body",
-  "command",
-  "content",
-  "cwd",
-  "directory",
-  "file",
-  "filepath",
-  "filename",
-  "fullpath",
-  "message",
-  "output",
-  "patch",
-  "path",
-  "prompt",
-  "query",
-  "sql",
-  "stack",
-  "stacktrace",
-  "statement",
-  "uri",
-  "url",
-  "workdir",
-]);
-
 function looksLikePathOrUrl(value: string) {
   const candidate = value.trim();
   return (
@@ -235,35 +162,22 @@ function boundedSignalName(value: unknown) {
     : undefined;
 }
 
-function isSensitiveSemanticKey(key: string) {
-  const parts = key.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean);
-  return parts.some((part) => SENSITIVE_SEMANTIC_KEY_PARTS.has(part));
-}
-
-function isSafeAnalyticalAttribute(key: string, value: unknown) {
-  const allowlisted = SAFE_STRING_ATTRIBUTE_KEYS.has(key.toLowerCase());
-  if (isSensitiveSemanticKey(key) && !allowlisted) return false;
-  if (typeof value === "number") return Number.isFinite(value);
-  if (typeof value === "boolean") return true;
-  if (typeof value !== "string") return false;
-  return allowlisted && Boolean(boundedSignalName(value));
-}
-
-function metadataSafeOtlpAttributes(
+export function metadataSafeOtlpAttributes(
   attrs: Record<string, unknown>,
-  dataMode: PolicyConfig["dataMode"],
+  _dataMode: PolicyConfig["dataMode"],
+  surface: OtlpAttributeSurface = "record",
 ) {
-  if (dataMode === "evidence") return { attrs, suppressedFields: [] as string[] };
-  const safe: Record<string, unknown> = {};
-  const suppressedFields: string[] = [];
-  for (const [key, value] of Object.entries(attrs)) {
-    if (isSafeAnalyticalAttribute(key, value)) {
-      safe[key] = value;
-    } else {
-      suppressedFields.push(`attributes.${key}`);
-    }
-  }
-  return { attrs: safe, suppressedFields };
+  const admitted = admittedMetadataAttributes(attrs, surface);
+  const suppressedFields = admitted.rejectedKeys.map((key) => {
+    const value = attrs[key];
+    return typeof value === "number" || typeof value === "boolean"
+      ? GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT
+      : suppressionReceiptForAttributeKey(key);
+  });
+  return {
+    attrs: admitted.attributes,
+    suppressedFields: canonicalizeSuppressionReceipts(suppressedFields),
+  };
 }
 
 function eventNameFromAttributes(attrs: Record<string, unknown>) {
@@ -337,6 +251,7 @@ function buildLogEvent(
     transportPath?: string;
     serviceName?: string;
     serviceVersion?: string;
+    containerSuppressedFields?: string[];
     resolveGit?: boolean;
     onRepoLabel?: (repoHash: string, label: string) => void;
   },
@@ -352,8 +267,9 @@ function buildLogEvent(
     : undefined;
   const sanitized = sanitizeForPolicy(record, context.policy);
   const safeRecord = asRecord(sanitized.value);
-  const attrs = flattenOtelAttributes(safeRecord.attributes);
-  const metadataAttrs = metadataSafeOtlpAttributes(attrs, context.policy.dataMode);
+  const rawAttrs = flattenOtelAttributes(safeRecord.attributes);
+  const metadataAttrs = metadataSafeOtlpAttributes(rawAttrs, context.policy.dataMode);
+  const attrs = metadataAttrs.attrs;
   const otelEventName = eventNameFromAttributes(attrs);
 
   const inputTokens = intTokens(numberField(attrs, [...usageFieldKeys.inputTokens]));
@@ -446,11 +362,12 @@ function buildLogEvent(
 
   return {
     event,
-    suppressedFields: [
+    suppressedFields: canonicalizeSuppressionReceipts([
       ...sanitized.evaluation.suppressedFields,
+      ...(context.containerSuppressedFields ?? []),
       ...metadataAttrs.suppressedFields,
       ...(context.policy.dataMode !== "evidence" && "body" in safeRecord ? ["body"] : []),
-    ],
+    ]),
   };
 }
 
@@ -462,14 +379,19 @@ function buildSpanEvent(
     transportPath?: string;
     serviceName?: string;
     serviceVersion?: string;
+    containerSuppressedFields?: string[];
   },
 ): { event: AiInteractionEvent; suppressedFields: string[] } {
   const sanitized = sanitizeForPolicy(span, context.policy);
   const safeSpan = asRecord(sanitized.value);
-  const attrs = flattenOtelAttributes(safeSpan.attributes);
-  const metadataAttrs = metadataSafeOtlpAttributes(attrs, context.policy.dataMode);
+  const rawAttrs = flattenOtelAttributes(safeSpan.attributes);
+  const metadataAttrs = metadataSafeOtlpAttributes(rawAttrs, context.policy.dataMode);
+  const attrs = metadataAttrs.attrs;
   const rawSpanName = typeof safeSpan.name === "string" ? safeSpan.name : undefined;
-  const spanName = boundedSignalName(rawSpanName);
+  const validatedSpanName = validatedMetadataAttribute("otelEventName", rawSpanName);
+  const spanName = validatedSpanName.accepted && typeof validatedSpanName.value === "string"
+    ? validatedSpanName.value
+    : undefined;
   const observedAt = recordTimestamp(safeSpan, attrs);
   const sessionId = stringField(attrs, [...usageFieldKeys.sessionId]);
   const inputTokens = intTokens(numberField(attrs, [...usageFieldKeys.inputTokens]));
@@ -519,7 +441,20 @@ function buildSpanEvent(
       : lifecycleType
         ? lifecycleType
         : "otel_span";
-  const otelStatusCode = statusCode(safeSpan);
+  const rawOtelStatusCode = statusCode(safeSpan);
+  const validatedStatusCode = validatedMetadataAttribute("otelStatusCode", rawOtelStatusCode);
+  const otelStatusCode = validatedStatusCode.accepted &&
+    (typeof validatedStatusCode.value === "number" || typeof validatedStatusCode.value === "string")
+    ? validatedStatusCode.value
+    : undefined;
+  const validatedTraceId = validatedMetadataAttribute("traceId", safeSpan.traceId);
+  const traceId = validatedTraceId.accepted && typeof validatedTraceId.value === "string"
+    ? validatedTraceId.value
+    : undefined;
+  const validatedSpanId = validatedMetadataAttribute("spanId", safeSpan.spanId);
+  const spanId = validatedSpanId.accepted && typeof validatedSpanId.value === "string"
+    ? validatedSpanId.value
+    : undefined;
   const otelHasException = spanHasExceptionEvent(safeSpan);
   const otelHasError =
     isErrorStatus(otelStatusCode) || otelHasException || attributesHaveError(attrs);
@@ -532,8 +467,8 @@ function buildSpanEvent(
       spanName,
       sessionId,
       observedAt,
-      String(safeSpan.spanId ?? ""),
-      String(safeSpan.traceId ?? ""),
+      spanId,
+      traceId,
     ]),
     sessionId,
     tenantId: context.policy.tenantId,
@@ -564,8 +499,8 @@ function buildSpanEvent(
       ...(otelStatusCode !== undefined ? { otelStatusCode } : {}),
       ...(otelHasException ? { otelHasException: true } : {}),
       ...(otelHasError ? { otelHasError: true } : {}),
-      ...(typeof safeSpan.traceId === "string" ? { traceId: safeSpan.traceId } : {}),
-      ...(typeof safeSpan.spanId === "string" ? { spanId: safeSpan.spanId } : {}),
+      ...(traceId ? { traceId } : {}),
+      ...(spanId ? { spanId } : {}),
       ...(context.transportPath ? { transport_path: context.transportPath } : {}),
       ...(context.serviceName ? { serviceName: context.serviceName } : {}),
     },
@@ -573,11 +508,15 @@ function buildSpanEvent(
 
   return {
     event,
-    suppressedFields: [
+    suppressedFields: canonicalizeSuppressionReceipts([
       ...sanitized.evaluation.suppressedFields,
+      ...(context.containerSuppressedFields ?? []),
       ...metadataAttrs.suppressedFields,
       ...(rawSpanName && !spanName ? ["span.name"] : []),
-    ],
+      ...(rawOtelStatusCode !== undefined && otelStatusCode === undefined ? ["status.code"] : []),
+      ...(safeSpan.traceId !== undefined && traceId === undefined ? ["traceId"] : []),
+      ...(safeSpan.spanId !== undefined && spanId === undefined ? ["spanId"] : []),
+    ]),
   };
 }
 
@@ -587,9 +526,14 @@ function buildMetricSamples(
     policy: PolicyConfig;
     source: ToolSource;
     serviceName?: string;
+    containerSuppressedFields?: string[];
   },
 ): MetricSample[] {
-  const metricName = boundedSignalName(metric.name) ?? "unknown_metric";
+  const validatedMetricName = validatedMetadataAttribute("otelEventName", metric.name);
+  const metricName = validatedMetricName.accepted && typeof validatedMetricName.value === "string"
+    ? validatedMetricName.value
+    : "unknown_metric";
+  const metricNameSuppressed = metric.name !== undefined && !validatedMetricName.accepted;
   const samples: MetricSample[] = [];
   const shapes: Array<{ kind: string; dataPoints: unknown }> = [
     { kind: "sum", dataPoints: asRecord(metric.sum).dataPoints },
@@ -602,8 +546,9 @@ function buildMetricSamples(
     for (const dataPointRaw of shape.dataPoints) {
       const sanitized = sanitizeForPolicy(dataPointRaw, context.policy);
       const dataPoint = asRecord(sanitized.value);
-      const attrs = flattenOtelAttributes(dataPoint.attributes);
-      const metadataAttrs = metadataSafeOtlpAttributes(attrs, context.policy.dataMode);
+      const rawAttrs = flattenOtelAttributes(dataPoint.attributes);
+      const metadataAttrs = metadataSafeOtlpAttributes(rawAttrs, context.policy.dataMode);
+      const attrs = metadataAttrs.attrs;
       const value =
         shape.kind === "histogram"
           ? numberField(dataPoint, ["sum", "count"])
@@ -633,6 +578,12 @@ function buildMetricSamples(
         sampleType,
         value,
         attrs: metadataAttrs.attrs,
+        suppressedFields: canonicalizeSuppressionReceipts([
+          ...sanitized.evaluation.suppressedFields,
+          ...(context.containerSuppressedFields ?? []),
+          ...metadataAttrs.suppressedFields,
+          ...(metricNameSuppressed ? ["metric.name"] : []),
+        ]),
       });
     }
   }
@@ -658,10 +609,11 @@ export function explodeOtlpPayload(
   };
 
   for (const resourceLog of Array.isArray(root.resourceLogs) ? root.resourceLogs : []) {
-    const resource = resourceSummary(asRecord(resourceLog).resource);
+    const resource = resourceSummary(asRecord(resourceLog).resource, policy.dataMode);
     for (const scopeLog of Array.isArray(asRecord(resourceLog).scopeLogs)
       ? (asRecord(resourceLog).scopeLogs as unknown[])
       : []) {
+      const scopeReceipts = scopeSuppressedFields(asRecord(scopeLog).scope, policy.dataMode);
       for (const record of Array.isArray(asRecord(scopeLog).logRecords)
         ? (asRecord(scopeLog).logRecords as unknown[])
         : []) {
@@ -674,6 +626,10 @@ export function explodeOtlpPayload(
               transportPath: options.transportPath,
               serviceName: resource.serviceName,
               serviceVersion: resource.serviceVersion,
+              containerSuppressedFields: [
+                ...resource.suppressedFields,
+                ...scopeReceipts,
+              ],
               resolveGit: options.resolveGit ?? true,
               onRepoLabel: options.onRepoLabel,
             }),
@@ -686,10 +642,11 @@ export function explodeOtlpPayload(
   }
 
   for (const resourceSpan of Array.isArray(root.resourceSpans) ? root.resourceSpans : []) {
-    const resource = resourceSummary(asRecord(resourceSpan).resource);
+    const resource = resourceSummary(asRecord(resourceSpan).resource, policy.dataMode);
     for (const scopeSpan of Array.isArray(asRecord(resourceSpan).scopeSpans)
       ? (asRecord(resourceSpan).scopeSpans as unknown[])
       : []) {
+      const scopeReceipts = scopeSuppressedFields(asRecord(scopeSpan).scope, policy.dataMode);
       for (const span of Array.isArray(asRecord(scopeSpan).spans)
         ? (asRecord(scopeSpan).spans as unknown[])
         : []) {
@@ -701,6 +658,10 @@ export function explodeOtlpPayload(
               transportPath: options.transportPath,
               serviceName: resource.serviceName,
               serviceVersion: resource.serviceVersion,
+              containerSuppressedFields: [
+                ...resource.suppressedFields,
+                ...scopeReceipts,
+              ],
             });
           const decision = decideOtlpSpanAdmission(entry.event);
           if (decision.admitted) {
@@ -717,10 +678,11 @@ export function explodeOtlpPayload(
   }
 
   for (const resourceMetric of Array.isArray(root.resourceMetrics) ? root.resourceMetrics : []) {
-    const resource = resourceSummary(asRecord(resourceMetric).resource);
+    const resource = resourceSummary(asRecord(resourceMetric).resource, policy.dataMode);
     for (const scopeMetric of Array.isArray(asRecord(resourceMetric).scopeMetrics)
       ? (asRecord(resourceMetric).scopeMetrics as unknown[])
       : []) {
+      const scopeReceipts = scopeSuppressedFields(asRecord(scopeMetric).scope, policy.dataMode);
       for (const metric of Array.isArray(asRecord(scopeMetric).metrics)
         ? (asRecord(scopeMetric).metrics as unknown[])
         : []) {
@@ -728,6 +690,7 @@ export function explodeOtlpPayload(
           policy,
           source,
           serviceName: resource.serviceName,
+          containerSuppressedFields: [...resource.suppressedFields, ...scopeReceipts],
         });
         result.datapointCount += samples.length;
         result.metricSamples.push(...samples);

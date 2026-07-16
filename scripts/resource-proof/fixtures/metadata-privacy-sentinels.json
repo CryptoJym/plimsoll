@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "prefixLength": 14,
+  "sentinels": {
+    "prompt": "PRMPT81_Q7vK2_unique_private_prompt",
+    "response": "RSPNS81_N4xT9_unique_private_response",
+    "toolArguments": "TLARG81_B6mP3_unique_tool_arguments",
+    "absolutePath": "/private/PLPATH81_H8rW5/operator/client.txt",
+    "repositoryUrl": "https://example.invalid/PLURL81_C2jF7/private-repository.git",
+    "email": "PLEML81_V5qD8@example.invalid",
+    "credential": "Bearer PLCRED81_M3sL6_unique_token",
+    "cookie": "session=PLCOOK81_A9nR4_unique_cookie",
+    "multibyte": "PLUTF81_K2zG7_private_\u79d8\u5bc6_\ud83d\udd10",
+    "relativePath": "../PLREL81_T4bN6/private/client.txt",
+    "percentEncodedPath": "PLPCT81_F8mQ3_%2e%2e%2fprivate%2fclient.txt",
+    "windowsPath": "C:\\PLWIN81_R6cJ9\\private\\client.txt",
+    "unicodeNormalizationNfc": "PLNFC81_D3wH7_caf\u00e9_\u79d8\u5bc6",
+    "unicodeNormalizationNfd": "PLNFD81_P9kS4_cafe\u0301_\u79d8\u5bc6",
+    "cyrillicHomoglyphKey": "pr\u043empt_PLCYRKEY81_W2vL5",
+    "cyrillicHomoglyphValue": "PLCYRVAL81_G7nB4_p\u0430ssw\u043erd",
+    "fullWidthKey": "\uff54\uff4f\uff4b\uff45\uff4e\uff3f\uff30\uff2c\uff26\uff37\uff2b\uff25\uff39\uff18\uff11",
+    "fullWidthValue": "\uff30\uff2c\uff26\uff37\uff36\uff21\uff2c\uff18\uff11\uff3f\u79d8\u5bc6",
+    "query": "PLQRY81_L5vR2/private query"
+  }
+}

@@ -2,7 +2,10 @@ import os from "node:os";
 
 import Database from "better-sqlite3";
 
-import type { AiInteractionEvent } from "../../shared/src/index";
+import {
+  canonicalizeSuppressionReceipts,
+  type AiInteractionEvent,
+} from "../../shared/src/index";
 import type { MetricSample } from "./otlp";
 import type { OtlpAdmissionDrop, OtlpDropReason } from "./otlp-admission";
 import { ensureCodexReconciliationSchema } from "./codex-reconciliation";
@@ -130,6 +133,7 @@ export class LocalEventBuffer {
         sample_type text,
         value real not null,
         attrs_json text not null default '{}',
+        suppressed_fields_json text not null default '[]',
         created_at text not null
       );
       create table if not exists otlp_admission_counters (
@@ -293,10 +297,21 @@ export class LocalEventBuffer {
     if (!labelColumns.has("email")) {
       this.db.exec(`alter table account_labels add column email text`);
     }
+    const metricColumns = new Set(
+      (this.db.pragma("table_info(metric_samples)") as Array<{ name: string }>).map(
+        (column) => column.name,
+      ),
+    );
+    if (!metricColumns.has("suppressed_fields_json")) {
+      this.db.exec(
+        `alter table metric_samples add column suppressed_fields_json text not null default '[]'`,
+      );
+    }
   }
 
   private appendInCurrentTransaction(event: AiInteractionEvent, suppressedFields: string[] = []) {
     const createdAt = new Date().toISOString();
+    const canonicalSuppressedFields = canonicalizeSuppressionReceipts(suppressedFields);
     const result = this.db
       .prepare(
         `insert or ignore into buffered_events
@@ -317,7 +332,7 @@ export class LocalEventBuffer {
         dataMode: event.dataMode,
         observedAt: event.observedAt,
         payloadJson: JSON.stringify(event),
-        suppressedFieldsJson: JSON.stringify(suppressedFields),
+        suppressedFieldsJson: JSON.stringify(canonicalSuppressedFields),
         createdAt,
         sessionId: event.sessionId ?? null,
         actionClass: event.actionClass ?? null,
@@ -341,7 +356,7 @@ export class LocalEventBuffer {
         createdAt,
         uploadedAt: null,
         payloadJson: JSON.stringify(event),
-        suppressedFieldsJson: JSON.stringify(suppressedFields),
+        suppressedFieldsJson: JSON.stringify(canonicalSuppressedFields),
         repoHash: gitField(event, "remoteUrlHash"),
         branchHash: gitField(event, "branchHash"),
       });
@@ -552,12 +567,15 @@ export class LocalEventBuffer {
     this.db
       .prepare(
         `insert into metric_samples
-          (id, source, metric_name, observed_at, session_id, model, sample_type, value, attrs_json, created_at)
+          (id, source, metric_name, observed_at, session_id, model, sample_type, value, attrs_json,
+           suppressed_fields_json, created_at)
         values
-          (@id, @source, @metricName, @observedAt, @sessionId, @model, @sampleType, @value, @attrsJson, @createdAt)
+          (@id, @source, @metricName, @observedAt, @sessionId, @model, @sampleType, @value, @attrsJson,
+           @suppressedFieldsJson, @createdAt)
         on conflict(id) do update set source=excluded.source,metric_name=excluded.metric_name,
           observed_at=excluded.observed_at,session_id=excluded.session_id,model=excluded.model,
           sample_type=excluded.sample_type,value=excluded.value,attrs_json=excluded.attrs_json,
+          suppressed_fields_json=excluded.suppressed_fields_json,
           created_at=excluded.created_at`,
       )
       .run({
@@ -570,6 +588,9 @@ export class LocalEventBuffer {
         sampleType: sample.sampleType ?? null,
         value: sample.value,
         attrsJson: JSON.stringify(sample.attrs ?? {}),
+        suppressedFieldsJson: JSON.stringify(
+          canonicalizeSuppressionReceipts(sample.suppressedFields ?? []),
+        ),
         createdAt: new Date().toISOString(),
       });
   }
@@ -587,6 +608,12 @@ export class LocalEventBuffer {
     repoHash: string | null;
     branchHash: string | null;
   }): BufferedEventRow {
+    let storedSuppressedFields: unknown;
+    try {
+      storedSuppressedFields = JSON.parse(row.suppressedFieldsJson) as unknown;
+    } catch {
+      storedSuppressedFields = [undefined];
+    }
     return {
       id: row.id,
       source: row.source,
@@ -594,7 +621,9 @@ export class LocalEventBuffer {
       dataMode: row.dataMode,
       observedAt: row.observedAt,
       payload: JSON.parse(row.payloadJson) as AiInteractionEvent,
-      suppressedFields: JSON.parse(row.suppressedFieldsJson) as string[],
+      suppressedFields: canonicalizeSuppressionReceipts(
+        Array.isArray(storedSuppressedFields) ? storedSuppressedFields : [undefined],
+      ),
       createdAt: row.createdAt,
       uploadedAt: row.uploadedAt ?? null,
       repoHash: row.repoHash ?? null,

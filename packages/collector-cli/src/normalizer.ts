@@ -2,18 +2,33 @@ import crypto from "node:crypto";
 
 import {
   DEFAULT_POLICY,
+  GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
+  admittedMetadataAttributes,
+  actionClassSchema,
   aiInteractionEventSchema,
+  canonicalizeSuppressionReceipts,
+  metadataKeyDisposition,
   sanitizeForPolicy,
+  suppressionReceiptForAttributeKey,
+  usageFieldKeys,
+  validatedMetadataAttribute,
   type ActionClass,
   type AiInteractionEvent,
   type PolicyConfig,
   type ToolSource,
 } from "../../shared/src/index";
+import {
+  hookAuthorityReceipt,
+  ignoredHookAuthorityReceipt,
+  partitionHookAuthority,
+  selectValidatedHookAuthority,
+} from "./hook-authority";
 
 type NormalizeOptions = {
   policy?: PolicyConfig;
   source?: ToolSource;
   gitContext?: import("../../shared/src/index").GitLinkageContext;
+  transportPath?: string;
 };
 
 type OTelSignals = {
@@ -28,7 +43,7 @@ export function asRecord(value: unknown): Record<string, unknown> {
     : {};
 }
 
-export function stringField(record: Record<string, unknown>, keys: string[]) {
+export function stringField(record: Record<string, unknown>, keys: readonly string[]) {
   for (const key of keys) {
     const value = record[key];
     if (typeof value === "string" && value.trim()) {
@@ -39,7 +54,7 @@ export function stringField(record: Record<string, unknown>, keys: string[]) {
   return undefined;
 }
 
-export function numberField(record: Record<string, unknown>, keys: string[]) {
+export function numberField(record: Record<string, unknown>, keys: readonly string[]) {
   for (const key of keys) {
     const value = record[key];
     if (typeof value === "number" && Number.isFinite(value)) {
@@ -132,7 +147,33 @@ function extractOtelSignals(payload: Record<string, unknown>): OTelSignals {
   };
 }
 
-export function stringFromRecords(records: Record<string, unknown>[], keys: string[]) {
+function rejectedAttributeReceipts(
+  input: Record<string, unknown>,
+  rejectedKeys: readonly string[],
+) {
+  return rejectedKeys.map((key) => {
+    const value = input[key];
+    return typeof value === "number" || typeof value === "boolean"
+      ? GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT
+      : suppressionReceiptForAttributeKey(key);
+  });
+}
+
+function safeSignalNames(names: readonly string[]) {
+  const accepted: string[] = [];
+  const rejected: string[] = [];
+  for (const name of names) {
+    const result = validatedMetadataAttribute("otelEventName", name);
+    if (result.accepted && typeof result.value === "string") {
+      accepted.push(result.value);
+    } else {
+      rejected.push("span.name");
+    }
+  }
+  return { accepted: [...new Set(accepted)], rejected };
+}
+
+export function stringFromRecords(records: Record<string, unknown>[], keys: readonly string[]) {
   for (const record of records) {
     const value = stringField(record, keys);
     if (value) return value;
@@ -141,7 +182,7 @@ export function stringFromRecords(records: Record<string, unknown>[], keys: stri
   return undefined;
 }
 
-export function numberFromRecords(records: Record<string, unknown>[], keys: string[]) {
+export function numberFromRecords(records: Record<string, unknown>[], keys: readonly string[]) {
   for (const record of records) {
     const value = numberField(record, keys);
     if (value !== undefined) return value;
@@ -196,78 +237,7 @@ export function inferSource(payload: Record<string, unknown>, fallback?: ToolSou
   return fallback ?? "unknown";
 }
 
-const SESSION_ID_KEYS = [
-  "sessionId",
-  "session_id",
-  "conversation.id",
-  "conversation_id",
-  "thread_id",
-  "session.id",
-  "gen_ai.session.id",
-];
-
-const MODEL_KEYS = ["model", "slug", "gen_ai.request.model", "gen_ai.response.model"];
-
-const INPUT_TOKEN_KEYS = [
-  "inputTokens",
-  "input_tokens",
-  "gen_ai.usage.input_tokens",
-  "llm.usage.prompt_tokens",
-];
-
-const OUTPUT_TOKEN_KEYS = [
-  "outputTokens",
-  "output_tokens",
-  "gen_ai.usage.output_tokens",
-  "llm.usage.completion_tokens",
-];
-
-const CACHE_READ_TOKEN_KEYS = [
-  "cacheReadTokens",
-  "cache_read_tokens",
-  "gen_ai.usage.cache_read_tokens",
-  "gen_ai.usage.cache_read.input_tokens",
-  "gen_ai.usage.cached_tokens",
-];
-
-const CACHE_CREATION_TOKEN_KEYS = [
-  "cacheCreationTokens",
-  "cache_creation_tokens",
-  "cache_creation_input_tokens",
-  "cache_creation.input_tokens",
-  "gen_ai.usage.cache_creation_input_tokens",
-  "gen_ai.usage.cache_creation.input_tokens",
-];
-
-const COST_KEYS = [
-  "costUsd",
-  "cost_usd",
-  "estimated_cost_usd",
-  "gen_ai.usage.cost_usd",
-  "plimsoll.estimated_cost_usd", "cfo_one.estimated_cost_usd",
-];
-
-const ACTOR_ID_KEYS = [
-  "actorId",
-  "actor_id",
-  "user.id",
-  "user.account_id",
-  "user.account_uuid",
-  "user_id",
-  "userId",
-  "user.email",
-];
-
-export const usageFieldKeys = {
-  actorId: ACTOR_ID_KEYS,
-  cacheReadTokens: CACHE_READ_TOKEN_KEYS,
-  cacheCreationTokens: CACHE_CREATION_TOKEN_KEYS,
-  costUsd: COST_KEYS,
-  inputTokens: INPUT_TOKEN_KEYS,
-  model: MODEL_KEYS,
-  outputTokens: OUTPUT_TOKEN_KEYS,
-  sessionId: SESSION_ID_KEYS,
-} as const;
+export { usageFieldKeys } from "../../shared/src/index";
 
 const TOOL_NAME_KEYS = ["tool_name", "toolName", "tool", "name"];
 
@@ -349,62 +319,139 @@ export function normalizeHookPayload(
 } {
   const raw = asRecord(payload);
   const policy = options.policy ?? DEFAULT_POLICY;
+  // Classify authority claims before the general sanitizer can collapse or
+  // discard lookalike keys. Values remain in-memory only and can cross into an
+  // event solely through the exact-alias validators below.
+  const rawOtelSignals = extractOtelSignals(raw);
+  const rawTopLevelAuthority = partitionHookAuthority(raw);
+  const rawOtelAuthority = partitionHookAuthority(rawOtelSignals.attributes);
+  const authorityPartitions = [rawTopLevelAuthority, rawOtelAuthority];
   const sanitized = sanitizeForPolicy(raw, policy);
   const safe = asRecord(sanitized.value);
   const otelSignals = extractOtelSignals(safe);
-  const otelAttributes = otelSignals.attributes;
-  const sourceRecords = [safe, otelAttributes];
-  const suppliedId = stringField(safe, ["id", "event_id"]);
-  const eventId = isUuid(suppliedId) ? suppliedId : crypto.randomUUID();
-  const eventType = inferEventType(safe, otelSignals.names);
+  const topLevelAuthority = partitionHookAuthority(safe);
+  const otelAuthority = partitionHookAuthority(otelSignals.attributes);
+  const admittedTopLevel = admittedMetadataAttributes(topLevelAuthority.metadata, "record");
+  const admittedOtel = admittedMetadataAttributes(otelAuthority.metadata, "record");
+  const admittedNames = safeSignalNames(otelSignals.names);
+  const sourceRecords = [admittedTopLevel.attributes, admittedOtel.attributes];
+  const eventIdSelection = selectValidatedHookAuthority(
+    authorityPartitions,
+    "eventId",
+    (value) => typeof value === "string" && isUuid(value.trim()) ? value.trim() : undefined,
+  );
+  const eventId = eventIdSelection.value ?? crypto.randomUUID();
+  const eventTypeSelection = selectValidatedHookAuthority(
+    authorityPartitions,
+    "eventType",
+    (value) => typeof value === "string" ? classifyEventType(value) : undefined,
+  );
+  const eventType =
+    eventTypeSelection.value ??
+    inferEventType(admittedTopLevel.attributes, admittedNames.accepted);
   const toolName =
     eventType === "tool_use" || eventType === "tool_result"
       ? stringFromRecords(sourceRecords, TOOL_NAME_KEYS)
       : undefined;
-  const explicitActionClass = stringFromRecords(sourceRecords, [
-    "actionClass",
-    "action_class",
-    "plimsoll.action_class", "cfo_one.action_class",
-  ]);
+  const actionSelection = selectValidatedHookAuthority(
+    authorityPartitions,
+    "action",
+    (value) => {
+      const parsed = actionClassSchema.safeParse(value);
+      return parsed.success ? parsed.data : undefined;
+    },
+  );
+  const explicitActionClass = actionSelection.value;
+  const observedAtSelection = selectValidatedHookAuthority(
+    authorityPartitions,
+    "observedAt",
+    (value, key) => {
+      const validated = validatedMetadataAttribute(key, value);
+      return validated.accepted && typeof validated.value === "string"
+        ? new Date(validated.value).toISOString()
+        : undefined;
+    },
+  );
+  const validatedTransportPath = options.transportPath === undefined
+    ? undefined
+    : validatedMetadataAttribute("transport_path", options.transportPath);
+  if (validatedTransportPath && !validatedTransportPath.accepted) {
+    throw new Error("InvalidHookTransportPath");
+  }
+  const transportPath = validatedTransportPath?.accepted &&
+    typeof validatedTransportPath.value === "string"
+    ? validatedTransportPath.value
+    : undefined;
   const derived = explicitActionClass ? undefined : deriveActionClass(toolName);
+  // Authority-like aliases were partitioned before this copy. This routine
+  // view can contain analytical metadata, never caller claims for transport,
+  // tenant, data mode, resolver linkage, event identity/time/type or action.
+  const metadataBase: Record<string, unknown> = { ...topLevelAuthority.metadata };
+  for (const key of Object.keys(metadataBase)) {
+    if (metadataKeyDisposition(key)) delete metadataBase[key];
+  }
+  delete metadataBase.attributes;
+  delete metadataBase.otelAttributes;
+  Object.assign(metadataBase, admittedTopLevel.attributes);
+
   const metadata = {
-    ...safe,
-    otelAttributes,
-    ...(otelSignals.names.length ? { otelSignalNames: otelSignals.names } : {}),
+    ...metadataBase,
+    otelAttributes: admittedOtel.attributes,
+    ...(admittedNames.accepted.length ? { otelSignalNames: admittedNames.accepted } : {}),
     ...(otelSignals.timestamps.length ? { otelSignalTimestamps: otelSignals.timestamps } : {}),
-    ...(suppliedId && !isUuid(suppliedId) ? { external_event_id: suppliedId } : {}),
     ...(toolName ? { toolName } : {}),
     ...(derived?.detail ? { toolClassDetail: derived.detail } : {}),
+    ...(transportPath ? { transport_path: transportPath } : {}),
     ...(options.gitContext ? { git: options.gitContext } : {}),
   };
 
   const event = aiInteractionEventSchema.parse({
     id: eventId,
-    sessionId: stringFromRecords(sourceRecords, SESSION_ID_KEYS),
-    tenantId: stringFromRecords(sourceRecords, ["tenantId", "tenant_id"]) ?? policy.tenantId,
-    actorId: stringFromRecords(sourceRecords, ACTOR_ID_KEYS),
-    source: inferSource(safe, options.source),
+    sessionId: stringFromRecords(sourceRecords, usageFieldKeys.sessionId),
+    // Capture transport identity is authoritative; hook payloads cannot select
+    // or spoof an upload tenant.
+    tenantId: policy.tenantId,
+    actorId: stringFromRecords(sourceRecords, usageFieldKeys.actorId),
+    source: options.source ?? "unknown",
     dataMode: policy.dataMode,
     eventType,
     observedAt:
-      stringField(safe, ["observedAt", "observed_at", "timestamp", "time"]) ??
+      observedAtSelection.value ??
       otelSignals.timestamps[0] ??
       new Date().toISOString(),
-    model: stringFromRecords(sourceRecords, MODEL_KEYS),
+    model: stringFromRecords(sourceRecords, usageFieldKeys.model),
     projectKey: stringFromRecords(sourceRecords, ["projectKey", "project_key", "project", "plimsoll.project", "cfo_one.project"]),
     customerKey: stringFromRecords(sourceRecords, ["customerKey", "customer_key", "customer", "plimsoll.customer", "cfo_one.customer"]),
     workflowKey: stringFromRecords(sourceRecords, ["workflowKey", "workflow_key", "workflow", "plimsoll.workflow", "cfo_one.workflow"]),
     actionClass: explicitActionClass ?? derived?.actionClass ?? "other",
-    inputTokens: numberFromRecords(sourceRecords, INPUT_TOKEN_KEYS),
-    outputTokens: numberFromRecords(sourceRecords, OUTPUT_TOKEN_KEYS),
-    cacheReadTokens: numberFromRecords(sourceRecords, CACHE_READ_TOKEN_KEYS),
-    cacheCreationTokens: numberFromRecords(sourceRecords, CACHE_CREATION_TOKEN_KEYS),
-    costUsd: numberFromRecords(sourceRecords, COST_KEYS),
+    inputTokens: numberFromRecords(sourceRecords, usageFieldKeys.inputTokens),
+    outputTokens: numberFromRecords(sourceRecords, usageFieldKeys.outputTokens),
+    cacheReadTokens: numberFromRecords(sourceRecords, usageFieldKeys.cacheReadTokens),
+    cacheCreationTokens: numberFromRecords(sourceRecords, usageFieldKeys.cacheCreationTokens),
+    costUsd: numberFromRecords(sourceRecords, usageFieldKeys.costUsd),
     metadata,
   });
 
   return {
     event,
-    suppressedFields: sanitized.evaluation.suppressedFields,
+    suppressedFields: canonicalizeSuppressionReceipts([
+      ...sanitized.evaluation.suppressedFields,
+      ...rejectedAttributeReceipts(
+        safe,
+        admittedTopLevel.rejectedKeys.filter((key) => metadataKeyDisposition(key) !== undefined),
+      ),
+      ...rejectedAttributeReceipts(otelSignals.attributes, admittedOtel.rejectedKeys),
+      ...admittedNames.rejected,
+      ...(["source", "tenant", "dataMode", "transport", "gitLinkage"] as const).flatMap(
+        (field) => {
+          const receipt = ignoredHookAuthorityReceipt(authorityPartitions, field);
+          return receipt ? [receipt] : [];
+        },
+      ),
+      ...(actionSelection.receiptRequired ? [hookAuthorityReceipt("action")] : []),
+      ...(eventIdSelection.receiptRequired ? [hookAuthorityReceipt("eventId")] : []),
+      ...(eventTypeSelection.receiptRequired ? [hookAuthorityReceipt("eventType")] : []),
+      ...(observedAtSelection.receiptRequired ? [hookAuthorityReceipt("observedAt")] : []),
+    ]),
   };
 }
