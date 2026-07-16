@@ -1461,7 +1461,7 @@ async function semanticScalarSpanParityProof() {
     if (typeof value === "boolean") return { key, value: { boolValue: value } };
     return { key, value: { stringValue: value } };
   };
-  const hostileEntries: Array<readonly [string, number | boolean]> = [
+  const hostileEntries: Array<readonly [string, string | number | boolean]> = [
     ["api_token", 94_101.5],
     ["API-TOKEN2", true],
     ["authorization", 94_102.5],
@@ -1480,6 +1480,32 @@ async function semanticScalarSpanParityProof() {
     ["analytics-count2", false],
     ["apі_token", 94_109.5],
     ["ａｐｉ_token", true],
+    ["DURATION_MS", "PRIVATE_SCALAR_VALUE_94_SPAN_DURATION"],
+    ["Duration_Ms", 94_401],
+    ["duration-ms", 94_402.5],
+    ["DURATION.MS", true],
+    ["SUCCESS", "PRIVATE_SCALAR_VALUE_94_SPAN_SUCCESS"],
+    ["Success2", 94_403],
+    ["success-", 94_404.5],
+    ["SUCCESS.", false],
+    ["HTTP.RESPONSE.STATUS_CODE", "PRIVATE_SCALAR_VALUE_94_SPAN_HTTP"],
+    ["httpResponseStatusCode", 94_405],
+    ["http_response_status_code", 94_406.5],
+    ["HTTP-RESPONSE-STATUS-CODE", true],
+    ["GEN_AI.USAGE.INPUT_TOKENS", "PRIVATE_SCALAR_VALUE_94_SPAN_TOKEN"],
+    ["genAiUsageInputTokens", 94_407],
+    ["gen-ai-usage-input-tokens", 94_408.5],
+    ["gen_ai_usage_input_tokens", false],
+    ["EVENT.SEQUENCE", "PRIVATE_SCALAR_VALUE_94_SPAN_SEQUENCE"],
+    ["eventSequence", 94_409],
+    ["event-sequence", 94_410.5],
+    ["EVENT_SEQUENCE", true],
+  ];
+  const hostileContainerEntries: Array<readonly [string, string | number | boolean]> = [
+    ["SERVICE.NAME", "PRIVATE_SCALAR_VALUE_94_SPAN_RESOURCE"],
+    ["Service-Version", 94_411.5],
+    ["MODEL", "PRIVATE_SCALAR_VALUE_94_SPAN_SCOPE"],
+    ["CALL-ID", 94_412],
   ];
   const positiveEntries: Array<readonly [string, string | number | boolean]> = [
     ["gen_ai.usage.input_tokens", 501],
@@ -1490,15 +1516,31 @@ async function semanticScalarSpanParityProof() {
     ["duration_ms", 13.5],
     ["http.response.status_code", 202],
     ["success", true],
+    ["gen_ai.request.model", "gpt-5.5"],
+    ["session.id", "11111111-2222-4333-8444-555555555555"],
+    ["http.request.method", "POST"],
+    ["status.code", "ERROR"],
   ];
   const payload = {
     resourceSpans: [
       {
         resource: {
-          attributes: [otelAttr("service.name", "codex_exec")],
+          attributes: [
+            otelAttr("service.name", "codex_exec"),
+            otelAttr("service.version", "0.137.0"),
+            ...hostileContainerEntries.slice(0, 2).map(([key, value]) =>
+              otelAttr(key, value),
+            ),
+          ],
         },
         scopeSpans: [
           {
+            scope: {
+              name: "scalar-span-proof",
+              attributes: hostileContainerEntries.slice(2).map(([key, value]) =>
+                otelAttr(key, value),
+              ),
+            },
             spans: [
               {
                 name: "scalar.privacy.span",
@@ -1588,7 +1630,7 @@ async function semanticScalarSpanParityProof() {
       (receipts) => JSON.stringify(receipts) === JSON.stringify(expected),
     );
     record(
-      "production_span_response_raw_list_reopen_outbox_wire_witness_scalar_receipts_match",
+      "production_span_response_raw_list_reopen_outbox_wire_witness_exact_key_receipts_match",
       capture.status === 202 &&
         capture.body.events === 1 &&
         uploaded.uploadedEvents === 1 &&
@@ -1606,7 +1648,14 @@ async function semanticScalarSpanParityProof() {
     const localEvent = reopened?.payload;
     const localMetadata = localEvent?.metadata as Record<string, unknown> | undefined;
     const wireEvent = wireEnvelope?.event as
-      | { inputTokens?: number; outputTokens?: number; costUsd?: number; metadata?: Record<string, unknown> }
+      | {
+          inputTokens?: number;
+          outputTokens?: number;
+          costUsd?: number;
+          sessionId?: string;
+          model?: string;
+          metadata?: Record<string, unknown>;
+        }
       | undefined;
     const positiveMetadataExact = positiveEntries.every(([key, value]) => {
       const expectedValue = typeof value === "number" && Number.isInteger(value)
@@ -1615,24 +1664,34 @@ async function semanticScalarSpanParityProof() {
       return localMetadata?.[key] === expectedValue && wireEvent?.metadata?.[key] === expectedValue;
     });
     record(
-      "production_span_positive_scalar_controls_promote_and_round_trip_exactly",
+      "production_span_positive_string_and_scalar_controls_promote_and_round_trip_exactly",
       localEvent?.inputTokens === 501 &&
         localEvent.outputTokens === 51 &&
         localEvent.costUsd === 0.33 &&
+        localEvent.sessionId === "11111111-2222-4333-8444-555555555555" &&
+        localEvent.model === "gpt-5.5" &&
         wireEvent?.inputTokens === 501 &&
         wireEvent.outputTokens === 51 &&
         wireEvent.costUsd === 0.33 &&
+        wireEvent.sessionId === "11111111-2222-4333-8444-555555555555" &&
+        wireEvent.model === "gpt-5.5" &&
         positiveMetadataExact &&
         hostileEntries.every(([key]) =>
+          !(key in (localMetadata ?? {})) && !(key in (wireEvent?.metadata ?? {})),
+        ) &&
+        hostileContainerEntries.every(([key]) =>
           !(key in (localMetadata ?? {})) && !(key in (wireEvent?.metadata ?? {})),
         ),
       {
         promotedInput: localEvent?.inputTokens ?? null,
         promotedOutput: localEvent?.outputTokens ?? null,
         promotedCost: localEvent?.costUsd ?? null,
+        promotedSession: localEvent?.sessionId ?? null,
+        promotedModel: localEvent?.model ?? null,
         positiveMetadataExact,
-        hostileKeysOmitted: hostileEntries.filter(([key]) =>
-          !(key in (localMetadata ?? {})) && !(key in (wireEvent?.metadata ?? {})),
+        hostileKeysOmitted: [...hostileEntries, ...hostileContainerEntries].filter(
+          ([key]) =>
+            !(key in (localMetadata ?? {})) && !(key in (wireEvent?.metadata ?? {})),
         ).length,
       },
     );
@@ -1645,12 +1704,14 @@ async function semanticScalarSpanParityProof() {
         .filter((candidate) => fs.existsSync(candidate))
         .map((candidate) => fs.readFileSync(candidate)),
     ];
-    const privateTerms = hostileEntries.flatMap(([key, value]) => [
-      key,
-      ...(typeof value === "number" ? [String(value)] : []),
-    ]);
+    const privateTerms = [...hostileEntries, ...hostileContainerEntries].flatMap(
+      ([key, value]) => [
+        key,
+        ...(typeof value === "number" || typeof value === "string" ? [String(value)] : []),
+      ],
+    );
     record(
-      "production_span_hostile_scalar_keys_and_numeric_values_absent_from_ledger_artifacts",
+      "production_span_case_variant_keys_and_values_absent_from_ledger_artifacts",
       privateTerms.every((term) =>
         closedArtifacts.every((artifact) => !artifact.includes(Buffer.from(term))),
       ),

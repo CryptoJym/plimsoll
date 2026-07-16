@@ -245,6 +245,41 @@ const HOSTILE_SCALAR_ENTRIES: Array<readonly [string, number | boolean]> = [
   ["ａｐｉ_token", true],
 ];
 
+const HOSTILE_CASE_VARIANT_ENTRIES: Array<readonly [string, string | number | boolean]> = [
+  ["DURATION_MS", "PRIVATE_SCALAR_VALUE_94_DURATION_STRING"],
+  ["Duration_Ms", 94_301],
+  ["duration-ms", 94_302.5],
+  ["DURATION.MS", true],
+  ["SUCCESS", "PRIVATE_SCALAR_VALUE_94_SUCCESS_STRING"],
+  ["Success2", 94_303],
+  ["success-", 94_304.5],
+  ["SUCCESS.", false],
+  ["HTTP.RESPONSE.STATUS_CODE", "PRIVATE_SCALAR_VALUE_94_HTTP_STRING"],
+  ["httpResponseStatusCode", 94_305],
+  ["http_response_status_code", 94_306.5],
+  ["HTTP-RESPONSE-STATUS-CODE", true],
+  ["GEN_AI.USAGE.INPUT_TOKENS", "PRIVATE_SCALAR_VALUE_94_TOKEN_STRING"],
+  ["genAiUsageInputTokens", 94_307],
+  ["gen-ai-usage-input-tokens", 94_308.5],
+  ["gen_ai_usage_input_tokens", false],
+  ["EVENT.SEQUENCE", "PRIVATE_SCALAR_VALUE_94_SEQUENCE_STRING"],
+  ["eventSequence", 94_309],
+  ["event-sequence", 94_310.5],
+  ["EVENT_SEQUENCE", true],
+];
+
+const HOSTILE_CONTAINER_ENTRIES: Array<readonly [string, string | number | boolean]> = [
+  ["SERVICE.NAME", "PRIVATE_SCALAR_VALUE_94_RESOURCE_SERVICE"],
+  ["Service-Version", 94_311.5],
+  ["MODEL", "PRIVATE_SCALAR_VALUE_94_SCOPE_MODEL"],
+  ["CALL-ID", 94_312],
+];
+
+const ALL_HOSTILE_ENTRIES = [
+  ...HOSTILE_SCALAR_ENTRIES,
+  ...HOSTILE_CASE_VARIANT_ENTRIES,
+] as const;
+
 const POSITIVE_SCALAR_ENTRIES: Array<readonly [string, string | number | boolean]> = [
   ["gen_ai.usage.input_tokens", 401],
   ["llm.usage.prompt_tokens", 402],
@@ -252,14 +287,28 @@ const POSITIVE_SCALAR_ENTRIES: Array<readonly [string, string | number | boolean
   ["duration_ms", 12.5],
   ["http.response.status_code", 202],
   ["success", true],
+  ["gen_ai.request.model", "gpt-5.5"],
+  ["session.id", LINKED_SESSION],
+  ["http.request.method", "POST"],
+  ["status.code", "ERROR"],
 ];
 
 const scalarPrivacyLogEnvelope = {
   resourceLogs: [
     {
-      resource: { attributes: [attr("service.name", "claude-code")] },
+      resource: {
+        attributes: [
+          attr("service.name", "claude-code"),
+          attr("service.version", "2.1.150"),
+          ...HOSTILE_CONTAINER_ENTRIES.slice(0, 2).map(([key, value]) => attr(key, value)),
+        ],
+      },
       scopeLogs: [
         {
+          scope: {
+            name: "scalar-log-proof",
+            attributes: HOSTILE_CONTAINER_ENTRIES.slice(2).map(([key, value]) => attr(key, value)),
+          },
           logRecords: [
             {
               timeUnixNano: "1781400012000000000",
@@ -267,7 +316,7 @@ const scalarPrivacyLogEnvelope = {
                 attr("event.name", "scalar.privacy.log"),
                 attr("call_id", "scalar_privacy_log"),
                 ...POSITIVE_SCALAR_ENTRIES.map(([key, value]) => attr(key, value)),
-                ...HOSTILE_SCALAR_ENTRIES.map(([key, value]) => attr(key, value)),
+                ...ALL_HOSTILE_ENTRIES.map(([key, value]) => attr(key, value)),
               ],
             },
           ],
@@ -280,9 +329,19 @@ const scalarPrivacyLogEnvelope = {
 const scalarPrivacyMetricEnvelope = {
   resourceMetrics: [
     {
-      resource: { attributes: [attr("service.name", "claude-code")] },
+      resource: {
+        attributes: [
+          attr("service.name", "claude-code"),
+          attr("service.version", "2.1.150"),
+          ...HOSTILE_CONTAINER_ENTRIES.slice(0, 2).map(([key, value]) => attr(key, value)),
+        ],
+      },
       scopeMetrics: [
         {
+          scope: {
+            name: "scalar-metric-proof",
+            attributes: HOSTILE_CONTAINER_ENTRIES.slice(2).map(([key, value]) => attr(key, value)),
+          },
           metrics: [
             {
               name: "scalar.privacy.metric",
@@ -294,7 +353,7 @@ const scalarPrivacyMetricEnvelope = {
                     attributes: [
                       attr("type", "input"),
                       ...POSITIVE_SCALAR_ENTRIES.map(([key, value]) => attr(key, value)),
-                      ...HOSTILE_SCALAR_ENTRIES.map(([key, value]) => attr(key, value)),
+                      ...ALL_HOSTILE_ENTRIES.map(([key, value]) => attr(key, value)),
                     ],
                   },
                 ],
@@ -328,13 +387,16 @@ async function main() {
 
   const directInput = Object.fromEntries([
     ...POSITIVE_SCALAR_ENTRIES,
-    ...HOSTILE_SCALAR_ENTRIES,
+    ...ALL_HOSTILE_ENTRIES,
+    ...HOSTILE_CONTAINER_ENTRIES,
   ]);
   const direct = metadataSafeOtlpAttributes(directInput, DEFAULT_POLICY.dataMode);
   check(
-    "key_first_scalar_classifier_direct_matrix",
+    "exact_key_disposition_direct_string_int_double_bool_matrix",
     POSITIVE_SCALAR_ENTRIES.every(([key, value]) => direct.attrs[key] === value) &&
-      HOSTILE_SCALAR_ENTRIES.every(([key]) => !(key in direct.attrs)) &&
+      [...ALL_HOSTILE_ENTRIES, ...HOSTILE_CONTAINER_ENTRIES].every(
+        ([key]) => !(key in direct.attrs),
+      ) &&
       direct.suppressedFields.length === 1 &&
       direct.suppressedFields[0] === GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT &&
       direct.suppressedFields.every(isCanonicalSuppressionReceipt),
@@ -342,8 +404,48 @@ async function main() {
       positiveRetained: POSITIVE_SCALAR_ENTRIES.filter(
         ([key, value]) => direct.attrs[key] === value,
       ).length,
-      hostileOmitted: HOSTILE_SCALAR_ENTRIES.filter(([key]) => !(key in direct.attrs)).length,
+      hostileOmitted: [...ALL_HOSTILE_ENTRIES, ...HOSTILE_CONTAINER_ENTRIES].filter(
+        ([key]) => !(key in direct.attrs),
+      ).length,
       receipts: direct.suppressedFields,
+    },
+  );
+
+  const resourceDirect = metadataSafeOtlpAttributes(
+    {
+      "service.name": "codex_exec",
+      "service.version": "0.137.0",
+      duration_ms: 1.5,
+      "SERVICE.NAME": "PRIVATE_SCALAR_VALUE_94_RESOURCE_DIRECT",
+    },
+    DEFAULT_POLICY.dataMode,
+    "resource",
+  );
+  const scopeDirect = metadataSafeOtlpAttributes(
+    {
+      model: "gpt-5.5",
+      "CALL-ID": "PRIVATE_SCALAR_VALUE_94_SCOPE_DIRECT",
+    },
+    DEFAULT_POLICY.dataMode,
+    "scope",
+  );
+  check(
+    "resource_and_scope_surfaces_use_exact_shared_dispositions",
+    resourceDirect.attrs["service.name"] === "codex_exec" &&
+      resourceDirect.attrs["service.version"] === "0.137.0" &&
+      !("duration_ms" in resourceDirect.attrs) &&
+      !("SERVICE.NAME" in resourceDirect.attrs) &&
+      Object.keys(scopeDirect.attrs).length === 0 &&
+      resourceDirect.suppressedFields.includes(GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT) &&
+      scopeDirect.suppressedFields.includes(GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT) &&
+      [...resourceDirect.suppressedFields, ...scopeDirect.suppressedFields].every(
+        isCanonicalSuppressionReceipt,
+      ),
+    {
+      resourceExact: Object.keys(resourceDirect.attrs).length,
+      resourceReceipts: resourceDirect.suppressedFields.length,
+      scopeExact: Object.keys(scopeDirect.attrs).length,
+      scopeReceipts: scopeDirect.suppressedFields.length,
     },
   );
 
@@ -424,13 +526,15 @@ async function main() {
           }),
       );
     check(
-      "production_log_scalar_privacy_and_response_raw_parity",
+      "production_log_exact_key_privacy_and_response_raw_parity",
       scalarLogs.status === 202 &&
         scalarLogs.body.events === 1 &&
         scalarLogRow?.payload.inputTokens === 401 &&
         scalarLogRow.payload.costUsd === 0.25 &&
         positiveMetadataExact(scalarLogMetadata) &&
-        HOSTILE_SCALAR_ENTRIES.every(([key]) => !(key in (scalarLogMetadata ?? {}))) &&
+        [...ALL_HOSTILE_ENTRIES, ...HOSTILE_CONTAINER_ENTRIES].every(
+          ([key]) => !(key in (scalarLogMetadata ?? {})),
+        ) &&
         JSON.stringify(scalarLogResponseReceipts) ===
           JSON.stringify(scalarLogRow.suppressedFields) &&
         scalarLogResponseReceipts.length === 1 &&
@@ -440,7 +544,7 @@ async function main() {
         status: scalarLogs.status,
         promotedInput: scalarLogRow?.payload.inputTokens,
         promotedCost: scalarLogRow?.payload.costUsd,
-        hostileOmitted: HOSTILE_SCALAR_ENTRIES.filter(
+        hostileOmitted: [...ALL_HOSTILE_ENTRIES, ...HOSTILE_CONTAINER_ENTRIES].filter(
           ([key]) => !(key in (scalarLogMetadata ?? {})),
         ).length,
         parity: JSON.stringify(scalarLogResponseReceipts) ===
@@ -448,18 +552,22 @@ async function main() {
       },
     );
     check(
-      "production_metric_datapoint_scalar_privacy_receipts_and_promotion",
+      "production_metric_datapoint_exact_key_privacy_receipts_and_promotion",
       scalarMetrics.status === 202 &&
         scalarMetrics.body.metricSamples === 1 &&
         positiveMetadataExact(scalarMetricAttrs) &&
-        HOSTILE_SCALAR_ENTRIES.every(([key]) => !(key in scalarMetricAttrs)) &&
+        [...ALL_HOSTILE_ENTRIES, ...HOSTILE_CONTAINER_ENTRIES].every(
+          ([key]) => !(key in scalarMetricAttrs),
+        ) &&
         JSON.stringify(scalarMetricResponseReceipts) === JSON.stringify(scalarMetricReceipts) &&
         scalarMetricReceipts.length === 1 &&
         scalarMetricReceipts[0] === GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT &&
         scalarMetricReceipts.every(isCanonicalSuppressionReceipt),
       {
         status: scalarMetrics.status,
-        hostileOmitted: HOSTILE_SCALAR_ENTRIES.filter(([key]) => !(key in scalarMetricAttrs)).length,
+        hostileOmitted: [...ALL_HOSTILE_ENTRIES, ...HOSTILE_CONTAINER_ENTRIES].filter(
+          ([key]) => !(key in scalarMetricAttrs),
+        ).length,
         parity: JSON.stringify(scalarMetricResponseReceipts) === JSON.stringify(scalarMetricReceipts),
       },
     );
@@ -646,12 +754,14 @@ async function main() {
     // Boolean literals are intentionally not byte-scanned: `true`/`false`
     // legitimately occur throughout SQLite control state. Their association
     // is disproved by the key-absence and parsed-metadata assertions above.
-    const hostileTerms = HOSTILE_SCALAR_ENTRIES.flatMap(([key, value]) => [
+    const hostileTerms = [...ALL_HOSTILE_ENTRIES, ...HOSTILE_CONTAINER_ENTRIES].flatMap(
+      ([key, value]) => [
       key,
-      ...(typeof value === "number" ? [String(value)] : []),
-    ]);
+        ...(typeof value === "number" || typeof value === "string" ? [String(value)] : []),
+      ],
+    );
     check(
-      "scalar_hostile_keys_and_values_absent_from_open_copies_and_closed_ledger",
+      "case_variant_keys_and_values_absent_from_open_copies_and_closed_ledger",
       hostileTerms.every((term) =>
         closedArtifacts.every((artifact) => !artifact.includes(Buffer.from(term))),
       ),

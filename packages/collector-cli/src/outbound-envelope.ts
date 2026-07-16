@@ -1,13 +1,14 @@
 import {
   aiWorkIngestEventSchema,
   aiWorkSessionSyncRowSchema,
-  approvedAnalyticalScalarKind,
   canonicalSuppressionReceipt,
   canonicalizeSuppressionReceipts,
-  hasSensitiveSuppressionConcept,
+  hasUnsafeMetadataString,
   isApprovedAnalyticalScalarAttribute,
   isForbiddenRawContentFieldName,
   isSensitiveMetadataSemanticKey,
+  metadataKeyDisposition,
+  safeMetadataStringAttribute,
   type AiInteractionEvent,
   type AiWorkIngestEvent,
   type AiWorkSessionSyncRow,
@@ -15,75 +16,6 @@ import {
 
 const CANONICAL_LINKAGE = /^sha256:([a-f0-9]{64})$/i;
 const COMMIT_SHA = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i;
-const SAFE_IDENTIFIER = /^[a-zA-Z0-9][a-zA-Z0-9_.:+-]{0,159}$/;
-const SAFE_COMPONENT_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.:+-]{0,199}$/;
-const SAFE_CLASSIFICATION = /^[a-zA-Z0-9][a-zA-Z0-9_.:+-]{0,95}$/;
-const SAFE_VERSION = /^[a-zA-Z0-9][a-zA-Z0-9_.+-]{0,63}$/;
-const EMAIL = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
-const SECRET_PREFIX = /(?:^|[^a-z0-9])(?:sk_live|sk_test|sk-|ghp[a-z0-9_-]*|github_pat[a-z0-9_-]*|xox[a-z0-9_-]*)/i;
-const AUTH_SCHEME = /(?:^|[^a-z0-9])(?:bearer|basic)(?:\s|:|$)/i;
-const JWT = /(?:^|[^a-z0-9_-])eyJ[a-z0-9_-]{6,}\.[a-z0-9_-]{6,}\.[a-z0-9_-]{6,}(?:$|[^a-z0-9_-])/i;
-const PEM_PRIVATE_KEY = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/i;
-const APPROVED_SLASH_SIGNAL_NAMES = new Set([
-  "persist/rollout/items",
-  "remotecontrol/enable",
-  "thread/goal/get",
-  "thread/list",
-  "thread/read",
-  "thread/resume",
-]);
-const SLASH_SIGNAL_KEYS = new Set(["event.name", "otelEventName"]);
-
-const SIGNAL_STRING_KEYS = new Set([
-  "event.name",
-  "otelEventName",
-]);
-
-const MODEL_STRING_KEYS = new Set([
-  "gen_ai.request.model",
-  "model",
-]);
-
-const COMPONENT_STRING_KEYS = new Set([
-  "db.operation.name",
-  "db.system",
-  "error.type",
-  "exception.type",
-  "gen_ai.system",
-  "gen_ai.tool.name",
-  "mcp_server",
-  "rpc.method",
-  "rpc.service",
-  "rpc.system",
-  "serviceName",
-  "tool",
-  "toolClassDetail",
-  "toolName",
-  "tool_name",
-]);
-
-const OPAQUE_ID_STRING_KEYS = new Set([
-  "call_id",
-  "gen_ai.response.id",
-  "request_id",
-]);
-
-const CLASSIFICATION_STRING_KEYS = new Set([
-  "action_class",
-  "cfo_one.action_class",
-  "decision",
-  "originator",
-  "otelOriginalActionClass",
-  "planType",
-  "plimsoll.action_class",
-  "status.code",
-  "stitched",
-  "type",
-  "usageSource",
-]);
-
-const VERSION_STRING_KEYS = new Set(["cliVersion", "serviceVersion"]);
-const TRACE_STRING_KEYS = new Set(["spanId", "traceId"]);
 
 const OMIT_LOCAL_ONLY_KEYS = new Set([
   "externalEventId",
@@ -117,60 +49,15 @@ export function canonicalLinkage(value: string | null | undefined) {
  * check therefore runs before every field-specific string validator.
  */
 export function hasUnsafeOutboundString(value: unknown, options: { allowSlash?: boolean } = {}) {
-  if (typeof value !== "string") return true;
-  const candidate = value.trim();
-  if (
-    candidate.length === 0 ||
-    !/^[\x20-\x7e]+$/.test(candidate) ||
-    EMAIL.test(candidate) ||
-    SECRET_PREFIX.test(candidate) ||
-    AUTH_SCHEME.test(candidate) ||
-    JWT.test(candidate) ||
-    PEM_PRIVATE_KEY.test(candidate) ||
-    hasSensitiveSuppressionConcept(candidate) ||
-    /(?:^|[/.])\.\.(?:[/.]|$)/.test(candidate) ||
-    /%(?:2e|2f|5c)/i.test(candidate) ||
-    /(?:file|https?):\/\//i.test(candidate) ||
-    /^www\./i.test(candidate) ||
-    candidate.includes("\\") ||
-    (!options.allowSlash && candidate.includes("/"))
-  ) {
-    return true;
-  }
-  return false;
-}
-
-function safeByPattern(
-  value: unknown,
-  pattern: RegExp,
-  maxLength: number,
-  options: { normalizeSpaces?: boolean } = {},
-) {
-  if (typeof value !== "string") return null;
-  const candidate = value.trim();
-  if (candidate.length > maxLength || hasUnsafeOutboundString(candidate)) return null;
-  // A space is legitimate in bounded, typed low-cardinality telemetry (for
-  // example an originator label). Normalize only literal ASCII spaces after
-  // the unsafe-value gate; field-specific alphabets still reject all other
-  // punctuation and high-cardinality material.
-  const normalized = options.normalizeSpaces ? candidate.replace(/ +/g, "_") : candidate;
-  return pattern.test(normalized) ? normalized : null;
+  return hasUnsafeMetadataString(value, options);
 }
 
 export function safeOutboundIdentifier(value: unknown) {
-  return safeByPattern(value, SAFE_IDENTIFIER, 160);
+  return safeMetadataStringAttribute("request_id", value);
 }
 
 function safeComponentName(value: unknown) {
-  return safeByPattern(value, SAFE_COMPONENT_NAME, 200, { normalizeSpaces: true });
-}
-
-function safeClassification(value: unknown) {
-  return safeByPattern(value, SAFE_CLASSIFICATION, 96, { normalizeSpaces: true });
-}
-
-function safeVersion(value: unknown) {
-  return safeByPattern(value, SAFE_VERSION, 64);
+  return safeMetadataStringAttribute("serviceName", value);
 }
 
 export function canonicalCommitSha(value: unknown) {
@@ -180,33 +67,7 @@ export function canonicalCommitSha(value: unknown) {
 }
 
 function safeSignalName(key: string, value: unknown) {
-  const lowCardinality = safeByPattern(value, SAFE_COMPONENT_NAME, 160, { normalizeSpaces: true });
-  if (lowCardinality) return lowCardinality;
-  if (typeof value !== "string" || !SLASH_SIGNAL_KEYS.has(key)) return null;
-  const candidate = value.trim();
-  return !hasUnsafeOutboundString(candidate, { allowSlash: true }) && APPROVED_SLASH_SIGNAL_NAMES.has(candidate)
-    ? candidate
-    : null;
-}
-
-function safeMetadataString(key: string, value: unknown) {
-  if (SIGNAL_STRING_KEYS.has(key)) return safeSignalName(key, value);
-  if (MODEL_STRING_KEYS.has(key)) return safeComponentName(value);
-  if (COMPONENT_STRING_KEYS.has(key)) return safeComponentName(value);
-  if (OPAQUE_ID_STRING_KEYS.has(key)) return safeOutboundIdentifier(value);
-  if (CLASSIFICATION_STRING_KEYS.has(key)) return safeClassification(value);
-  if (VERSION_STRING_KEYS.has(key)) return safeVersion(value);
-  if (TRACE_STRING_KEYS.has(key)) {
-    if (typeof value !== "string" || hasUnsafeOutboundString(value)) return null;
-    const candidate = value.trim();
-    return /^(?:[a-f0-9]{16}|[a-f0-9]{32})$/i.test(candidate) ? candidate.toLowerCase() : null;
-  }
-  if (key === "http.request.method") {
-    if (typeof value !== "string" || hasUnsafeOutboundString(value)) return null;
-    const candidate = value.trim().toUpperCase();
-    return /^[A-Z]{3,12}$/.test(candidate) ? candidate : null;
-  }
-  return null;
+  return safeMetadataStringAttribute(key, value);
 }
 
 function sanitizeMetadata(input: Record<string, unknown>): MetadataOutcome {
@@ -270,22 +131,14 @@ function sanitizeMetadata(input: Record<string, unknown>): MetadataOutcome {
       metadata[key] = value;
       continue;
     }
-    if (approvedAnalyticalScalarKind(key)) {
+    const disposition = metadataKeyDisposition(key);
+    if (disposition?.valueKind === "analytical_scalar" && disposition.outbound) {
       if (!isApprovedAnalyticalScalarAttribute(key, value)) return { ok: false };
       metadata[key] = value;
       continue;
     }
-    if (
-      SIGNAL_STRING_KEYS.has(key) ||
-      MODEL_STRING_KEYS.has(key) ||
-      COMPONENT_STRING_KEYS.has(key) ||
-      OPAQUE_ID_STRING_KEYS.has(key) ||
-      CLASSIFICATION_STRING_KEYS.has(key) ||
-      VERSION_STRING_KEYS.has(key) ||
-      TRACE_STRING_KEYS.has(key) ||
-      key === "http.request.method"
-    ) {
-      const safe = safeMetadataString(key, value);
+    if (disposition?.valueKind === "string" && disposition.outbound) {
+      const safe = safeMetadataStringAttribute(key, value);
       if (!safe) return { ok: false };
       metadata[key] = safe;
       continue;

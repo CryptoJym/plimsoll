@@ -74,9 +74,44 @@ export const usageFieldKeys = {
   sessionId: SESSION_ID_KEYS,
 } as const;
 
-export type AnalyticalScalarKind = "token_count" | "nonnegative_number" | "status_code" | "boolean";
+export type AnalyticalScalarKind =
+  | "token_count"
+  | "nonnegative_number"
+  | "status_code"
+  | "boolean";
 
-const APPROVED_ANALYTICAL_SCALARS = new Map<string, AnalyticalScalarKind>([
+export type MetadataStringKind =
+  | "signal"
+  | "model"
+  | "component"
+  | "identifier"
+  | "classification"
+  | "version"
+  | "trace"
+  | "http_method"
+  | "timestamp";
+
+export type OtlpAttributeSurface = "record" | "resource" | "scope";
+
+export type MetadataKeyDisposition =
+  | {
+      valueKind: "analytical_scalar";
+      scalarKind: AnalyticalScalarKind;
+      otlpSurfaces: readonly OtlpAttributeSurface[];
+      outbound: true;
+    }
+  | {
+      valueKind: "string";
+      stringKind: MetadataStringKind;
+      otlpSurfaces: readonly OtlpAttributeSurface[];
+      outbound: true;
+    };
+
+const RECORD_SURFACE = ["record"] as const;
+const RESOURCE_SURFACE = ["resource"] as const;
+const NO_OTLP_SURFACE = [] as const;
+
+const RECORD_ANALYTICAL_SCALARS = new Map<string, AnalyticalScalarKind>([
   ...[
     ...INPUT_TOKEN_KEYS,
     ...OUTPUT_TOKEN_KEYS,
@@ -87,17 +122,117 @@ const APPROVED_ANALYTICAL_SCALARS = new Map<string, AnalyticalScalarKind>([
   ["duration_ms", "nonnegative_number"],
   ["event.sequence", "token_count"],
   ["http.response.status_code", "status_code"],
-  ["otelStatusCode", "status_code"],
   ["status.code", "status_code"],
-  ["turnIndex", "token_count"],
-  ["costEstimated", "boolean"],
   ["error", "boolean"],
   ["failed", "boolean"],
+  ["success", "boolean"],
+]);
+
+const GENERATED_ANALYTICAL_SCALARS = new Map<string, AnalyticalScalarKind>([
+  ["otelStatusCode", "status_code"],
+  ["turnIndex", "token_count"],
+  ["costEstimated", "boolean"],
   ["otelExplicitAction", "boolean"],
   ["otelHasError", "boolean"],
   ["otelHasException", "boolean"],
   ["repoStitched", "boolean"],
-  ["success", "boolean"],
+]);
+
+// OTLP semantic-convention keys use their documented lowercase spelling.
+// Camel-case entries below are explicit legacy producer aliases, not a
+// case-insensitive contract: only the literal map key receives admission.
+const RECORD_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
+  ...ACTOR_ID_KEYS.filter((key) => key !== "user.email").map(
+    (key) => [key, "identifier"] as const,
+  ),
+  ...MODEL_KEYS.map((key) => [key, "model"] as const),
+  ...SESSION_ID_KEYS.map((key) => [key, "identifier"] as const),
+  ["event.name", "signal"],
+  ["event.timestamp", "timestamp"],
+  ["timestamp", "timestamp"],
+  ["tool_name", "component"],
+  ["toolName", "component"],
+  ["tool", "component"],
+  ["gen_ai.tool.name", "component"],
+  ["plimsoll.action_class", "classification"],
+  ["cfo_one.action_class", "classification"],
+  ["action_class", "classification"],
+  ["mcp_server", "component"],
+  ["request_id", "identifier"],
+  ["call_id", "identifier"],
+  ["gen_ai.response.id", "identifier"],
+  ["plimsoll.project", "identifier"],
+  ["cfo_one.project", "identifier"],
+  ["project_key", "identifier"],
+  ["project", "identifier"],
+  ["plimsoll.customer", "identifier"],
+  ["cfo_one.customer", "identifier"],
+  ["customer_key", "identifier"],
+  ["customer", "identifier"],
+  ["plimsoll.workflow", "identifier"],
+  ["cfo_one.workflow", "identifier"],
+  ["workflow_key", "identifier"],
+  ["workflow", "identifier"],
+  ["decision", "classification"],
+  ["type", "classification"],
+  ["error.type", "component"],
+  ["exception.type", "component"],
+  ["http.request.method", "http_method"],
+  ["rpc.system", "component"],
+  ["rpc.service", "component"],
+  ["rpc.method", "component"],
+  ["db.system", "component"],
+  ["db.operation.name", "component"],
+];
+
+const RESOURCE_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
+  ["service.name", "component"],
+  ["service.version", "version"],
+];
+
+const GENERATED_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
+  ["otelEventName", "signal"],
+  ["gen_ai.system", "component"],
+  ["serviceName", "component"],
+  ["toolClassDetail", "component"],
+  ["originator", "classification"],
+  ["otelOriginalActionClass", "classification"],
+  ["planType", "classification"],
+  ["stitched", "classification"],
+  ["usageSource", "classification"],
+  ["cliVersion", "version"],
+  ["serviceVersion", "version"],
+  ["spanId", "trace"],
+  ["traceId", "trace"],
+];
+
+const METADATA_KEY_DISPOSITIONS = new Map<string, MetadataKeyDisposition>([
+  ...[...RECORD_ANALYTICAL_SCALARS].map(
+    ([key, scalarKind]) =>
+      [
+        key,
+        { valueKind: "analytical_scalar", scalarKind, otlpSurfaces: RECORD_SURFACE, outbound: true },
+      ] as const,
+  ),
+  ...[...GENERATED_ANALYTICAL_SCALARS].map(
+    ([key, scalarKind]) =>
+      [
+        key,
+        { valueKind: "analytical_scalar", scalarKind, otlpSurfaces: NO_OTLP_SURFACE, outbound: true },
+      ] as const,
+  ),
+  ...RECORD_STRING_KEYS.map(
+    ([key, stringKind]) =>
+      [key, { valueKind: "string", stringKind, otlpSurfaces: RECORD_SURFACE, outbound: true }] as const,
+  ),
+  ...RESOURCE_STRING_KEYS.map(
+    ([key, stringKind]) =>
+      [key, { valueKind: "string", stringKind, otlpSurfaces: RESOURCE_SURFACE, outbound: true }] as const,
+  ),
+  ...GENERATED_STRING_KEYS.map(
+    ([key, stringKind]) =>
+      [key, { valueKind: "string", stringKind, otlpSurfaces: NO_OTLP_SURFACE, outbound: true }] as const,
+  ),
 ]);
 
 function keyWords(value: string) {
@@ -182,8 +317,28 @@ export function hasPrivateMetadataKeyConcept(key: string) {
   ].some((concept) => collapsed.includes(concept));
 }
 
+const APPROVED_KEY_FINGERPRINTS = new Set(
+  [...METADATA_KEY_DISPOSITIONS.keys()].map((key) => keyWords(key).join("")),
+);
+
+export function metadataKeyDisposition(key: string) {
+  return METADATA_KEY_DISPOSITIONS.get(key);
+}
+
+export function isMetadataKeyVariantOfApprovedKey(key: string) {
+  return !metadataKeyDisposition(key) && APPROVED_KEY_FINGERPRINTS.has(keyWords(key).join(""));
+}
+
+export function isDispositionAllowedOnOtlpSurface(
+  disposition: MetadataKeyDisposition,
+  surface: OtlpAttributeSurface,
+) {
+  return disposition.otlpSurfaces.includes(surface);
+}
+
 export function approvedAnalyticalScalarKind(key: string) {
-  return APPROVED_ANALYTICAL_SCALARS.get(key);
+  const disposition = metadataKeyDisposition(key);
+  return disposition?.valueKind === "analytical_scalar" ? disposition.scalarKind : undefined;
 }
 
 /**
@@ -192,9 +347,112 @@ export function approvedAnalyticalScalarKind(key: string) {
  * sensitive, including camel-case, separator, case, and numeric-suffix forms.
  */
 export function isSensitiveMetadataSemanticKey(key: string) {
-  if (approvedAnalyticalScalarKind(key)) return false;
+  if (metadataKeyDisposition(key)) return false;
+  if (isMetadataKeyVariantOfApprovedKey(key)) return true;
   if (isForbiddenRawContentFieldName(key) || hasPrivateMetadataKeyConcept(key)) return true;
   return keyWords(key).some((word) => RAW_OR_PATH_SEMANTIC_WORDS.has(word));
+}
+
+const SAFE_IDENTIFIER = /^[a-zA-Z0-9][a-zA-Z0-9_.:+-]{0,159}$/;
+const SAFE_COMPONENT_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.:+-]{0,199}$/;
+const SAFE_CLASSIFICATION = /^[a-zA-Z0-9][a-zA-Z0-9_.:+-]{0,95}$/;
+const SAFE_VERSION = /^[a-zA-Z0-9][a-zA-Z0-9_.+-]{0,63}$/;
+const EMAIL = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
+const SECRET_PREFIX =
+  /(?:^|[^a-z0-9])(?:sk_live|sk_test|sk-|ghp[a-z0-9_-]*|github_pat[a-z0-9_-]*|xox[a-z0-9_-]*)/i;
+const AUTH_SCHEME = /(?:^|[^a-z0-9])(?:bearer|basic)(?:\s|:|$)/i;
+const JWT =
+  /(?:^|[^a-z0-9_-])eyJ[a-z0-9_-]{6,}\.[a-z0-9_-]{6,}\.[a-z0-9_-]{6,}(?:$|[^a-z0-9_-])/i;
+const PEM_PRIVATE_KEY = /-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/i;
+const APPROVED_SLASH_SIGNAL_NAMES = new Set([
+  "persist/rollout/items",
+  "remotecontrol/enable",
+  "thread/goal/get",
+  "thread/list",
+  "thread/read",
+  "thread/resume",
+]);
+
+export function hasUnsafeMetadataString(
+  value: unknown,
+  options: { allowSlash?: boolean } = {},
+) {
+  if (typeof value !== "string") return true;
+  const candidate = value.trim();
+  return (
+    candidate.length === 0 ||
+    !/^[\x20-\x7e]+$/.test(candidate) ||
+    EMAIL.test(candidate) ||
+    SECRET_PREFIX.test(candidate) ||
+    AUTH_SCHEME.test(candidate) ||
+    JWT.test(candidate) ||
+    PEM_PRIVATE_KEY.test(candidate) ||
+    hasPrivateMetadataKeyConcept(candidate) ||
+    /(?:^|[/.])\.\.(?:[/.]|$)/.test(candidate) ||
+    /%(?:2e|2f|5c)/i.test(candidate) ||
+    /(?:file|https?):\/\//i.test(candidate) ||
+    /^www\./i.test(candidate) ||
+    candidate.includes("\\") ||
+    (!options.allowSlash && candidate.includes("/"))
+  );
+}
+
+function safeStringByPattern(
+  value: unknown,
+  pattern: RegExp,
+  maxLength: number,
+  options: { normalizeSpaces?: boolean } = {},
+) {
+  if (typeof value !== "string") return null;
+  const candidate = value.trim();
+  if (candidate.length > maxLength || hasUnsafeMetadataString(candidate)) return null;
+  const normalized = options.normalizeSpaces ? candidate.replace(/ +/g, "_") : candidate;
+  return pattern.test(normalized) ? normalized : null;
+}
+
+/** Exact-key string validation shared by OTLP capture and outbound sealing. */
+export function safeMetadataStringAttribute(key: string, value: unknown) {
+  const disposition = metadataKeyDisposition(key);
+  if (!disposition || disposition.valueKind !== "string") return null;
+  const kind = disposition.stringKind;
+  if (kind === "signal") {
+    const lowCardinality = safeStringByPattern(value, SAFE_COMPONENT_NAME, 160, {
+      normalizeSpaces: true,
+    });
+    if (lowCardinality) return lowCardinality;
+    if (typeof value !== "string") return null;
+    const candidate = value.trim();
+    return !hasUnsafeMetadataString(candidate, { allowSlash: true }) &&
+      APPROVED_SLASH_SIGNAL_NAMES.has(candidate)
+      ? candidate
+      : null;
+  }
+  if (kind === "model" || kind === "component") {
+    return safeStringByPattern(value, SAFE_COMPONENT_NAME, 200, { normalizeSpaces: true });
+  }
+  if (kind === "identifier") return safeStringByPattern(value, SAFE_IDENTIFIER, 160);
+  if (kind === "classification") {
+    return safeStringByPattern(value, SAFE_CLASSIFICATION, 96, { normalizeSpaces: true });
+  }
+  if (kind === "version") return safeStringByPattern(value, SAFE_VERSION, 64);
+  if (kind === "trace") {
+    if (typeof value !== "string" || hasUnsafeMetadataString(value)) return null;
+    const candidate = value.trim();
+    return /^(?:[a-f0-9]{16}|[a-f0-9]{32})$/i.test(candidate)
+      ? candidate.toLowerCase()
+      : null;
+  }
+  if (kind === "http_method") {
+    if (typeof value !== "string" || hasUnsafeMetadataString(value)) return null;
+    const candidate = value.trim().toUpperCase();
+    return /^[A-Z]{3,12}$/.test(candidate) ? candidate : null;
+  }
+  if (kind === "timestamp") {
+    if (typeof value !== "string" || hasUnsafeMetadataString(value)) return null;
+    const candidate = value.trim();
+    return candidate.length <= 80 && !Number.isNaN(Date.parse(candidate)) ? candidate : null;
+  }
+  return null;
 }
 
 function finiteNonnegative(value: unknown) {
