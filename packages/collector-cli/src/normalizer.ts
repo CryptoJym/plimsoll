@@ -17,11 +17,18 @@ import {
   type PolicyConfig,
   type ToolSource,
 } from "../../shared/src/index";
+import {
+  hookAuthorityReceipt,
+  ignoredHookAuthorityReceipt,
+  partitionHookAuthority,
+  selectValidatedHookAuthority,
+} from "./hook-authority";
 
 type NormalizeOptions = {
   policy?: PolicyConfig;
   source?: ToolSource;
   gitContext?: import("../../shared/src/index").GitLinkageContext;
+  transportPath?: string;
 };
 
 type OTelSignals = {
@@ -312,53 +319,79 @@ export function normalizeHookPayload(
 } {
   const raw = asRecord(payload);
   const policy = options.policy ?? DEFAULT_POLICY;
+  // Classify authority claims before the general sanitizer can collapse or
+  // discard lookalike keys. Values remain in-memory only and can cross into an
+  // event solely through the exact-alias validators below.
+  const rawOtelSignals = extractOtelSignals(raw);
+  const rawTopLevelAuthority = partitionHookAuthority(raw);
+  const rawOtelAuthority = partitionHookAuthority(rawOtelSignals.attributes);
+  const authorityPartitions = [rawTopLevelAuthority, rawOtelAuthority];
   const sanitized = sanitizeForPolicy(raw, policy);
   const safe = asRecord(sanitized.value);
   const otelSignals = extractOtelSignals(safe);
-  const admittedTopLevel = admittedMetadataAttributes(safe, "record");
-  const admittedOtel = admittedMetadataAttributes(otelSignals.attributes, "record");
+  const topLevelAuthority = partitionHookAuthority(safe);
+  const otelAuthority = partitionHookAuthority(otelSignals.attributes);
+  const admittedTopLevel = admittedMetadataAttributes(topLevelAuthority.metadata, "record");
+  const admittedOtel = admittedMetadataAttributes(otelAuthority.metadata, "record");
   const admittedNames = safeSignalNames(otelSignals.names);
-  const suppliedTenantKeys = ["tenantId", "tenant_id"].filter((key) => key in safe);
-  for (const key of suppliedTenantKeys) delete admittedTopLevel.attributes[key];
   const sourceRecords = [admittedTopLevel.attributes, admittedOtel.attributes];
-  const rawSource = stringField(safe, ["source", "provider"]);
-  const validatedSource = validatedMetadataAttribute("originator", rawSource);
-  const admittedSource = validatedSource.accepted && typeof validatedSource.value === "string"
-    ? validatedSource.value
-    : undefined;
-  const rawSuppliedId = stringField(safe, ["id", "event_id"]);
-  const validatedSuppliedId = validatedMetadataAttribute("sessionId", rawSuppliedId);
-  const suppliedId = validatedSuppliedId.accepted && typeof validatedSuppliedId.value === "string"
-    ? validatedSuppliedId.value
-    : undefined;
-  const eventId = isUuid(suppliedId) ? suppliedId : crypto.randomUUID();
-  const eventType = inferEventType(admittedTopLevel.attributes, admittedNames.accepted);
+  const eventIdSelection = selectValidatedHookAuthority(
+    authorityPartitions,
+    "eventId",
+    (value) => typeof value === "string" && isUuid(value.trim()) ? value.trim() : undefined,
+  );
+  const eventId = eventIdSelection.value ?? crypto.randomUUID();
+  const eventTypeSelection = selectValidatedHookAuthority(
+    authorityPartitions,
+    "eventType",
+    (value) => typeof value === "string" ? classifyEventType(value) : undefined,
+  );
+  const eventType =
+    eventTypeSelection.value ??
+    inferEventType(admittedTopLevel.attributes, admittedNames.accepted);
   const toolName =
     eventType === "tool_use" || eventType === "tool_result"
       ? stringFromRecords(sourceRecords, TOOL_NAME_KEYS)
       : undefined;
-  const explicitActionCandidate = stringFromRecords(sourceRecords, [
-    "actionClass",
-    "action_class",
-    "plimsoll.action_class", "cfo_one.action_class",
-  ]);
-  const parsedActionClass = actionClassSchema.safeParse(explicitActionCandidate);
-  const explicitActionClass = parsedActionClass.success ? parsedActionClass.data : undefined;
+  const actionSelection = selectValidatedHookAuthority(
+    authorityPartitions,
+    "action",
+    (value) => {
+      const parsed = actionClassSchema.safeParse(value);
+      return parsed.success ? parsed.data : undefined;
+    },
+  );
+  const explicitActionClass = actionSelection.value;
+  const observedAtSelection = selectValidatedHookAuthority(
+    authorityPartitions,
+    "observedAt",
+    (value, key) => {
+      const validated = validatedMetadataAttribute(key, value);
+      return validated.accepted && typeof validated.value === "string"
+        ? new Date(validated.value).toISOString()
+        : undefined;
+    },
+  );
+  const validatedTransportPath = options.transportPath === undefined
+    ? undefined
+    : validatedMetadataAttribute("transport_path", options.transportPath);
+  if (validatedTransportPath && !validatedTransportPath.accepted) {
+    throw new Error("InvalidHookTransportPath");
+  }
+  const transportPath = validatedTransportPath?.accepted &&
+    typeof validatedTransportPath.value === "string"
+    ? validatedTransportPath.value
+    : undefined;
   const derived = explicitActionClass ? undefined : deriveActionClass(toolName);
-  // Exact promotion keys and nested OTLP attributes cross the shared admission
-  // boundary before persistence or top-level promotion. Caller-provided git is
-  // discarded; only resolver-owned options.gitContext may enter the event.
-  const metadataBase: Record<string, unknown> = { ...safe };
+  // Authority-like aliases were partitioned before this copy. This routine
+  // view can contain analytical metadata, never caller claims for transport,
+  // tenant, data mode, resolver linkage, event identity/time/type or action.
+  const metadataBase: Record<string, unknown> = { ...topLevelAuthority.metadata };
   for (const key of Object.keys(metadataBase)) {
     if (metadataKeyDisposition(key)) delete metadataBase[key];
   }
   delete metadataBase.attributes;
   delete metadataBase.otelAttributes;
-  delete metadataBase.git;
-  delete metadataBase.id;
-  delete metadataBase.event_id;
-  delete metadataBase.source;
-  delete metadataBase.provider;
   Object.assign(metadataBase, admittedTopLevel.attributes);
 
   const metadata = {
@@ -366,9 +399,9 @@ export function normalizeHookPayload(
     otelAttributes: admittedOtel.attributes,
     ...(admittedNames.accepted.length ? { otelSignalNames: admittedNames.accepted } : {}),
     ...(otelSignals.timestamps.length ? { otelSignalTimestamps: otelSignals.timestamps } : {}),
-    ...(suppliedId && !isUuid(suppliedId) ? { external_event_id: suppliedId } : {}),
     ...(toolName ? { toolName } : {}),
     ...(derived?.detail ? { toolClassDetail: derived.detail } : {}),
+    ...(transportPath ? { transport_path: transportPath } : {}),
     ...(options.gitContext ? { git: options.gitContext } : {}),
   };
 
@@ -379,17 +412,11 @@ export function normalizeHookPayload(
     // or spoof an upload tenant.
     tenantId: policy.tenantId,
     actorId: stringFromRecords(sourceRecords, usageFieldKeys.actorId),
-    source:
-      options.source ??
-      inferSource(
-        admittedSource
-          ? { source: admittedSource }
-          : { tool: stringFromRecords(sourceRecords, ["tool"]) },
-      ),
+    source: options.source ?? "unknown",
     dataMode: policy.dataMode,
     eventType,
     observedAt:
-      stringFromRecords(sourceRecords, ["observedAt", "observed_at", "timestamp", "time"]) ??
+      observedAtSelection.value ??
       otelSignals.timestamps[0] ??
       new Date().toISOString(),
     model: stringFromRecords(sourceRecords, usageFieldKeys.model),
@@ -415,10 +442,16 @@ export function normalizeHookPayload(
       ),
       ...rejectedAttributeReceipts(otelSignals.attributes, admittedOtel.rejectedKeys),
       ...admittedNames.rejected,
-      ...suppliedTenantKeys.map((key) => suppressionReceiptForAttributeKey(key)),
-      ...(rawSource && !admittedSource ? [suppressionReceiptForAttributeKey("source")] : []),
-      ...(rawSuppliedId && !suppliedId ? ["event_id"] : []),
-      ...(safe.git !== undefined ? ["metadata.git"] : []),
+      ...(["source", "tenant", "dataMode", "transport", "gitLinkage"] as const).flatMap(
+        (field) => {
+          const receipt = ignoredHookAuthorityReceipt(authorityPartitions, field);
+          return receipt ? [receipt] : [];
+        },
+      ),
+      ...(actionSelection.receiptRequired ? [hookAuthorityReceipt("action")] : []),
+      ...(eventIdSelection.receiptRequired ? [hookAuthorityReceipt("eventId")] : []),
+      ...(eventTypeSelection.receiptRequired ? [hookAuthorityReceipt("eventType")] : []),
+      ...(observedAtSelection.receiptRequired ? [hookAuthorityReceipt("observedAt")] : []),
     ]),
   };
 }

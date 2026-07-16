@@ -505,10 +505,8 @@ export function createCollectorServer(
 
         // Unknown or non-JSON OTLP shape: keep a metadata-only transport row, never the body.
         const fallbackPayload = {
-          id: `${request.url.slice(1).replace(/\//g, "_")}_${Date.now()}`,
           event_type: "otel_span",
           content_type: request.headers["content-type"] ?? "unknown",
-          transport_path: request.url,
           body_bytes: body.bodyBytes,
           body_decoded_bytes: body.decodedBytes,
           body_parse_error:
@@ -521,6 +519,7 @@ export function createCollectorServer(
           config,
           buffer,
           source,
+          transportPath: request.url,
         });
         response.writeHead(202, { "content-type": "application/json" });
         response.end(

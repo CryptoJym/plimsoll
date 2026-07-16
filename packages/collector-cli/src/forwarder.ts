@@ -14,6 +14,7 @@ export function appendForwardedHook(
     config: CollectorConfig;
     buffer: LocalEventBuffer;
     source: ToolSource;
+    transportPath?: string;
   },
 ) {
   // Resolve git linkage keys from the hook's cwd before sanitization hashes it.
@@ -28,6 +29,7 @@ export function appendForwardedHook(
     policy: options.config.policy,
     source: options.source,
     gitContext: resolved ? gitContext : undefined,
+    transportPath: options.transportPath,
   });
   // Successful hook/fallback responses are public proof surfaces before the
   // durable outbox runs. Include the same deterministic local-only omissions

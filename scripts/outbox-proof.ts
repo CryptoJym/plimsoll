@@ -18,6 +18,7 @@ import {
   SUPPRESSION_RECEIPT_MAX_LENGTH,
   SUPPRESSION_RECEIPT_OVERFLOW,
   aiInteractionEventSchema,
+  branchLinkageHash,
   canonicalizeSuppressionReceipts,
   DEFAULT_POLICY,
   isCanonicalSuppressionReceipt,
@@ -1125,11 +1126,27 @@ async function policyResponseAndLegacyReadbackProof() {
       return [key, nested];
     }),
   );
+  const fallbackAuthoritySpoofs = {
+    source: "anthropic_usage",
+    tenant: "safe_fallback_spoof_tenant_81",
+    dataMode: "event_detail",
+    transport: "/v1/metrics",
+    remoteUrlHash: `sha256:${"a1".repeat(32)}`,
+    branchHash: `sha256:${"a2".repeat(32)}`,
+    repoHash: `sha256:${"a3".repeat(32)}`,
+    headSha: "e".repeat(40),
+    action: "browser",
+    eventType: "assistant_response",
+    observedAt: "2026-07-14T00:00:00.000Z",
+    eventId: "83838383-8383-4383-8383-838383838383",
+  };
   const privateTerms = [...new Set([
     ...hostileKeys,
     ...privateValues,
+    ...Object.values(fallbackAuthoritySpoofs),
     ...hostileKeys.map((value) => value.slice(0, Math.min(18, value.length))),
     ...privateValues.map((value) => value.slice(0, 18)),
+    ...Object.values(fallbackAuthoritySpoofs).map((value) => value.slice(0, 18)),
   ].filter((value) => value.length >= 8))];
   const clean = (surfaces: string[]) =>
     privateTerms.every((term) => surfaces.every((surface) => !surface.includes(term)));
@@ -1139,7 +1156,7 @@ async function policyResponseAndLegacyReadbackProof() {
     asReceipts((JSON.parse(value) as { suppressedFields?: unknown }).suppressedFields);
   const requestEnvelope = (body: string, id: string) =>
     ((JSON.parse(body) as {
-      events?: Array<{ event?: { id?: string }; suppressedFields?: unknown }>;
+      events?: Array<{ event?: AiInteractionEvent; suppressedFields?: unknown }>;
     }).events ?? []).find((entry) => entry.event?.id === id);
   const exactParity = (expected: string[], receipts: string[][]) =>
     receipts.every((candidate) => JSON.stringify(candidate) === JSON.stringify(expected));
@@ -1254,17 +1271,39 @@ async function policyResponseAndLegacyReadbackProof() {
     server = createCollectorServer(cfg, buffer);
     port = await listenLoopback(server);
     const fallbackResponse = await postJson(port, "/v1/traces", {
-      unsupported_envelope: hostilePayload,
+      unsupported_envelope: {
+        ...hostilePayload,
+        id: fallbackAuthoritySpoofs.eventId,
+        source: fallbackAuthoritySpoofs.source,
+        tenantId: fallbackAuthoritySpoofs.tenant,
+        dataMode: fallbackAuthoritySpoofs.dataMode,
+        event_type: fallbackAuthoritySpoofs.eventType,
+        timestamp: fallbackAuthoritySpoofs.observedAt,
+        actionClass: fallbackAuthoritySpoofs.action,
+        transport_path: fallbackAuthoritySpoofs.transport,
+        remoteUrlHash: fallbackAuthoritySpoofs.remoteUrlHash,
+        branchHash: fallbackAuthoritySpoofs.branchHash,
+        repoHash: fallbackAuthoritySpoofs.repoHash,
+        headSha: fallbackAuthoritySpoofs.headSha,
+        git: {
+          remoteUrlHash: fallbackAuthoritySpoofs.remoteUrlHash,
+          branchHash: fallbackAuthoritySpoofs.branchHash,
+          headSha: fallbackAuthoritySpoofs.headSha,
+        },
+      },
     });
     const fallbackId = String(fallbackResponse.body.eventId ?? "");
     const fallbackResponseReceipts = asReceipts(fallbackResponse.body.suppressedFields);
     const fallbackBefore = buffer.database
       .prepare(
         `select payload_json as payload, suppressed_fields_json as suppressed,
-           (select base_envelope_json from upload_outbox where delivery_id = buffered_events.id) as base
+           (select base_envelope_json from upload_outbox where delivery_id = buffered_events.id) as base,
+           (select count(*) from upload_outbox where delivery_id = buffered_events.id) as outbox
          from buffered_events where id = ?`,
       )
-      .get(fallbackId) as { payload: string; suppressed: string; base: string } | undefined;
+      .get(fallbackId) as
+      | { payload: string; suppressed: string; base: string; outbox: number }
+      | undefined;
     const fallbackListBefore =
       buffer.list(10).find((row) => row.id === fallbackId)?.suppressedFields ?? [];
     await closeLoopback(server);
@@ -1288,6 +1327,24 @@ async function policyResponseAndLegacyReadbackProof() {
     const fallbackWireReceipts = asReceipts(
       requestEnvelope(fallbackWire, fallbackId)?.suppressedFields,
     );
+    const fallbackLocalEvent = fallbackBefore?.payload
+      ? (JSON.parse(fallbackBefore.payload) as AiInteractionEvent)
+      : undefined;
+    const fallbackWireEvent = requestEnvelope(fallbackWire, fallbackId)?.event;
+    const fallbackPositiveControls =
+      fallbackLocalEvent?.source === "codex" &&
+      fallbackLocalEvent.tenantId === cfg.tenantId &&
+      fallbackLocalEvent.dataMode === "metadata" &&
+      fallbackLocalEvent.eventType === "otel_span" &&
+      fallbackLocalEvent.metadata.transport_path === "/v1/traces" &&
+      fallbackWireEvent?.source === fallbackLocalEvent.source &&
+      fallbackWireEvent.tenantId === fallbackLocalEvent.tenantId &&
+      fallbackWireEvent.dataMode === fallbackLocalEvent.dataMode &&
+      fallbackWireEvent.eventType === fallbackLocalEvent.eventType &&
+      fallbackWireEvent.metadata.transport_path === "/v1/traces";
+    const fixedTransportNoCallerReceipt = !fallbackResponseReceipts.includes(
+      "hook.authority.transport",
+    );
     const fallbackReceiptSets = [
       fallbackResponseReceipts,
       JSON.parse(fallbackBefore?.suppressed ?? "[]") as string[],
@@ -1310,17 +1367,23 @@ async function policyResponseAndLegacyReadbackProof() {
     record(
       "explicit_otlp_fallback_response_local_reopen_outbox_and_wire_receipts_match",
       fallbackResponse.status === 202 &&
+        fallbackBefore?.outbox === 1 &&
         fallbackUpload.uploadedEvents === 1 &&
         fallbackResponseReceipts.length > 0 &&
         exactParity(fallbackResponseReceipts, fallbackReceiptSets) &&
         fallbackReceiptSets.flat().every(isCanonicalSuppressionReceipt) &&
+        fixedTransportNoCallerReceipt &&
+        fallbackPositiveControls &&
         clean(fallbackSurfaces),
       {
         status: fallbackResponse.status,
+        outboxAtomic: fallbackBefore?.outbox === 1,
         uploaded: fallbackUpload.uploadedEvents,
         surfaces: fallbackReceiptSets.length,
         canonicalReceipts: fallbackResponseReceipts.length,
         exactParity: exactParity(fallbackResponseReceipts, fallbackReceiptSets),
+        fixedTransportNoCallerReceipt,
+        fallbackPositiveControls,
         privateTerms: privateTerms.length,
         leaks: privateTerms.filter((term) => fallbackSurfaces.some((surface) => surface.includes(term))).length,
       },
@@ -1331,15 +1394,22 @@ async function policyResponseAndLegacyReadbackProof() {
     const closedArtifacts = [file, `${file}-wal`, `${file}-shm`]
       .filter((candidate) => fs.existsSync(candidate))
       .map((candidate) => fs.readFileSync(candidate));
+    // These two recognized enum literals are embedded in the SQLite schema and
+    // projection SQL. Their request-value absence is proved across every
+    // serialized event surface above; artifact byte scans cover the remaining
+    // distinctive spoof/private values and prefixes.
+    const artifactPrivateTerms = privateTerms.filter(
+      (term) => !["anthropic_usage", "assistant_response"].includes(term),
+    );
     record(
       "hook_and_fallback_private_keys_values_and_prefixes_absent_from_closed_ledger",
-      privateTerms.every((term) =>
+      artifactPrivateTerms.every((term) =>
         closedArtifacts.every((artifact) => !artifact.includes(Buffer.from(term))),
       ),
       {
         artifacts: closedArtifacts.length,
-        privateTerms: privateTerms.length,
-        leaks: privateTerms.filter((term) =>
+        privateTerms: artifactPrivateTerms.length,
+        leaks: artifactPrivateTerms.filter((term) =>
           closedArtifacts.some((artifact) => artifact.includes(Buffer.from(term))),
         ).length,
       },
@@ -2130,69 +2200,123 @@ async function hookPromotionAdmissionProof() {
   const file = ledger();
   const cfg = config();
   const projectHash = `sha256:${"91".repeat(32)}`;
-  const remoteUrlHash = `sha256:${"92".repeat(32)}`;
-  const branchHash = `sha256:${"93".repeat(32)}`;
-  const repoHash = `sha256:${"94".repeat(32)}`;
-  const headSha = "b".repeat(40);
-  const unsafeValues = [
-    "sk_live_PRIVATE_HOOK_MODEL_VALUE_81",
-    "/Users/private/hook-session-value-81",
-    "https://private.invalid/hook-project-value-81",
-    "private.hook.customer81@example.invalid",
-    "private\u0000hook-workflow-value-81",
-    "Bearer PRIVATE_HOOK_TOOL_VALUE_81",
-    "PRIVATE_HOOK_ACTION_VALUE_81",
-    "PRIVATE_HOOK_INPUT_VALUE_81",
-    "private.hook.actor81@example.invalid",
-    "file:///Users/private/hook-id-value-81",
-    "https://private.invalid/hook-transport-value-81",
-    "https://private.invalid/hook-nested-repo-value-81",
-    "/Users/private/hook-nested-branch-value-81",
-    "PRIVATE_HOOK_NESTED_HEAD_VALUE_81",
-    "sk_live_PRIVATE_HOOK_SERVICE_VALUE_81",
-    "spoof_tenant_value_81",
-    "file:///Users/private/hook-source-value-81",
-  ];
+  const spoofRemoteUrlHash = `sha256:${"92".repeat(32)}`;
+  const spoofBranchHash = `sha256:${"93".repeat(32)}`;
+  const spoofRepoHash = `sha256:${"94".repeat(32)}`;
+  const spoofHeadSha = "b".repeat(40);
+  const hookRepo = path.join(root, "hook-authority-repo");
+  const remoteUrl = "https://github.com/proof-owner/hook-authority-proof.git";
+  fs.mkdirSync(hookRepo, { recursive: true });
+  const git = (...args: string[]) =>
+    spawnSync("git", ["-C", hookRepo, ...args], { encoding: "utf8" });
+  const init = spawnSync("git", ["init", "-b", "main", hookRepo], { encoding: "utf8" });
+  if (init.status !== 0) throw new Error(`HookAuthorityGitInit:${init.stderr}`);
+  if (git("config", "user.email", "proof@example.invalid").status !== 0) {
+    throw new Error("HookAuthorityGitEmail");
+  }
+  if (git("config", "user.name", "Plimsoll Proof").status !== 0) {
+    throw new Error("HookAuthorityGitName");
+  }
+  fs.writeFileSync(path.join(hookRepo, "proof.txt"), "hook authority proof\n", "utf8");
+  if (git("add", "proof.txt").status !== 0 || git("commit", "-m", "proof").status !== 0) {
+    throw new Error("HookAuthorityGitCommit");
+  }
+  if (git("remote", "add", "origin", remoteUrl).status !== 0) {
+    throw new Error("HookAuthorityGitRemote");
+  }
+  const resolverRemoteUrlHash = remoteLinkageHash(remoteUrl)!;
+  const resolverBranchHash = branchLinkageHash("main")!;
+  const resolverHeadSha = git("rev-parse", "HEAD").stdout.trim();
+  const selectedEventId = "81818181-8181-4181-8181-818181818181";
+  const selectedObservedAt = instant(2_996).toISOString();
+  const unsafeValues = {
+    model: "sk_live_PRIVATE_HOOK_MODEL_VALUE_81",
+    session: "/Users/private/hook-session-value-81",
+    project: "https://private.invalid/hook-project-value-81",
+    customer: "private.hook.customer81@example.invalid",
+    workflow: "private\u0000hook-workflow-value-81",
+    tool: "Bearer PRIVATE_HOOK_TOOL_VALUE_81",
+    inputTokens: "PRIVATE_HOOK_INPUT_VALUE_81",
+    actor: "private.hook.actor81@example.invalid",
+    service: "sk_live_PRIVATE_HOOK_SERVICE_VALUE_81",
+  };
+  const authoritySpoofs = {
+    source: "openai_usage",
+    sourceVariant: "anthropic_usage",
+    tenant: "safe_spoof_tenant_81",
+    tenantVariant: "safe_variant_tenant_81",
+    dataMode: "evidence",
+    dataModeVariant: "event_detail",
+    transport: "/v1/traces",
+    transportVariant: "/v1/metrics",
+    remoteUrlHash: spoofRemoteUrlHash,
+    remoteUrlHashVariant: `sha256:${"95".repeat(32)}`,
+    branchHash: spoofBranchHash,
+    repoHash: spoofRepoHash,
+    headSha: spoofHeadSha,
+    nestedRemoteUrlHash: `sha256:${"96".repeat(32)}`,
+    nestedBranchHash: `sha256:${"97".repeat(32)}`,
+    nestedHeadSha: "c".repeat(40),
+    otelRemoteUrlHash: `sha256:${"98".repeat(32)}`,
+    otelBranchHash: `sha256:${"99".repeat(32)}`,
+    otelHeadSha: "d".repeat(40),
+    otelProvider: "manual",
+    invalidAction: "analysis_mode",
+    eventTypeVariant: "assistant_response",
+    observedAtVariant: "2026-07-15T00:00:00.000Z",
+    eventIdVariant: "82828282-8282-4282-8282-828282828282",
+  };
   const payload = {
-    id: unsafeValues[9],
-    source: unsafeValues[16],
-    event_type: "assistant_response",
-    timestamp: instant(2_996).toISOString(),
-    model: unsafeValues[0],
+    id: selectedEventId,
+    "Event-Id": authoritySpoofs.eventIdVariant,
+    source: authoritySpoofs.source,
+    SOURCE: authoritySpoofs.sourceVariant,
+    tenantId: authoritySpoofs.tenant,
+    "Tenant-Id": authoritySpoofs.tenantVariant,
+    dataMode: authoritySpoofs.dataMode,
+    "Data.Mode": authoritySpoofs.dataModeVariant,
+    event_type: "PreToolUse",
+    "EVENT-TYPE": authoritySpoofs.eventTypeVariant,
+    timestamp: selectedObservedAt,
+    "Observed-At": authoritySpoofs.observedAtVariant,
+    model: unsafeValues.model,
     "gen_ai.request.model": "gpt-5.5",
-    sessionId: unsafeValues[1],
+    sessionId: unsafeValues.session,
     "session.id": "safe_hook_session_81",
-    projectKey: unsafeValues[2],
+    projectKey: unsafeValues.project,
     project: projectHash,
-    customerKey: unsafeValues[3],
+    customerKey: unsafeValues.customer,
     customer: "safe_hook_customer_81",
-    workflowKey: unsafeValues[4],
+    workflowKey: unsafeValues.workflow,
     workflow: "safe_hook_workflow_81",
-    tool_name: unsafeValues[5],
+    tool_name: unsafeValues.tool,
     toolName: "exec_command",
-    actionClass: unsafeValues[6],
+    actionClass: authoritySpoofs.invalidAction,
     action_class: "shell",
-    inputTokens: unsafeValues[7],
+    inputTokens: unsafeValues.inputTokens,
     "gen_ai.usage.input_tokens": 711,
     "gen_ai.usage.output_tokens": 71,
     "gen_ai.usage.cost_usd": 0.71,
-    actorId: unsafeValues[8],
-    transport_path: unsafeValues[10],
-    remoteUrlHash,
-    branchHash,
-    repoHash,
-    headSha,
-    serviceName: unsafeValues[14],
-    tenantId: unsafeValues[15],
+    actorId: unsafeValues.actor,
+    transport_path: authoritySpoofs.transport,
+    "Transport.Path": authoritySpoofs.transportVariant,
+    remoteUrlHash: authoritySpoofs.remoteUrlHash,
+    branchHash: authoritySpoofs.branchHash,
+    repoHash: authoritySpoofs.repoHash,
+    headSha: authoritySpoofs.headSha,
+    REMOTE_URL_HASH: authoritySpoofs.remoteUrlHashVariant,
+    serviceName: unsafeValues.service,
+    cwd: hookRepo,
     git: {
-      remoteUrlHash: unsafeValues[11],
-      branchHash: unsafeValues[12],
-      headSha: unsafeValues[13],
+      remoteUrlHash: authoritySpoofs.nestedRemoteUrlHash,
+      branchHash: authoritySpoofs.nestedBranchHash,
+      headSha: authoritySpoofs.nestedHeadSha,
     },
     attributes: [
-      { key: "remoteUrlHash", value: { stringValue: unsafeValues[11] } },
-      { key: "branchHash", value: { stringValue: unsafeValues[12] } },
-      { key: "headSha", value: { stringValue: unsafeValues[13] } },
+      { key: "remote_url_hash", value: { stringValue: authoritySpoofs.otelRemoteUrlHash } },
+      { key: "BRANCH-HASH", value: { stringValue: authoritySpoofs.otelBranchHash } },
+      { key: "commit_sha", value: { stringValue: authoritySpoofs.otelHeadSha } },
+      { key: "provider", value: { stringValue: authoritySpoofs.otelProvider } },
     ],
   };
 
@@ -2264,15 +2388,56 @@ async function hookPromotionAdmissionProof() {
     const localMetadata = (localEvent?.metadata ?? {}) as Record<string, unknown>;
     const wireEvent = wireEnvelope?.event;
     const wireMetadata = (wireEvent?.metadata ?? {}) as Record<string, unknown>;
-    const safeMetadataControls: Array<readonly [string, string]> = [
-      ["remoteUrlHash", remoteUrlHash],
-      ["branchHash", branchHash],
-      ["repoHash", repoHash],
-      ["headSha", headSha],
+    const expectedGit = {
+      remoteUrlHash: resolverRemoteUrlHash,
+      branchHash: resolverBranchHash,
+      headSha: resolverHeadSha,
+    };
+    const callerAuthorityMetadataKeys = [
+      "source",
+      "SOURCE",
+      "tenantId",
+      "Tenant-Id",
+      "dataMode",
+      "Data.Mode",
+      "transport_path",
+      "Transport.Path",
+      "remoteUrlHash",
+      "branchHash",
+      "repoHash",
+      "headSha",
+      "REMOTE_URL_HASH",
+      "actionClass",
+      "action_class",
+      "event_type",
+      "EVENT-TYPE",
+      "timestamp",
+      "Observed-At",
+      "id",
+      "Event-Id",
     ];
+    const expectedAuthorityReceipts = [
+      "hook.authority.source",
+      "hook.authority.tenant",
+      "hook.authority.data_mode",
+      "hook.authority.transport",
+      "hook.authority.git_linkage",
+      "hook.authority.action",
+      "hook.authority.event_id",
+      "hook.authority.event_type",
+      "hook.authority.observed_at",
+    ];
+    const authorityReceiptContract = expectedAuthorityReceipts.every(
+      (receipt) => responseReceipts.filter((candidate) => candidate === receipt).length === 1,
+    );
     const positiveControls =
-      localEvent?.eventType === "assistant_response" &&
+      capturedId === selectedEventId &&
+      localEvent?.id === selectedEventId &&
+      localEvent.source === "codex" &&
       localEvent.tenantId === cfg.tenantId &&
+      localEvent.dataMode === "metadata" &&
+      localEvent.eventType === "tool_use" &&
+      localEvent.observedAt === selectedObservedAt &&
       localEvent.model === "gpt-5.5" &&
       localEvent.sessionId === "safe_hook_session_81" &&
       localEvent.projectKey === projectHash &&
@@ -2284,8 +2449,13 @@ async function hookPromotionAdmissionProof() {
       localEvent.costUsd === 0.71 &&
       typeof localEvent.actorId === "string" &&
       localEvent.actorId.startsWith("sha256:") &&
+      wireEvent?.id === localEvent.id &&
+      wireEvent.source === localEvent.source &&
       wireEvent?.model === localEvent.model &&
       wireEvent.tenantId === cfg.tenantId &&
+      wireEvent.dataMode === localEvent.dataMode &&
+      wireEvent.eventType === localEvent.eventType &&
+      wireEvent.observedAt === localEvent.observedAt &&
       wireEvent.sessionId === localEvent.sessionId &&
       wireEvent.projectKey === localEvent.projectKey &&
       wireEvent.customerKey === localEvent.customerKey &&
@@ -2295,23 +2465,25 @@ async function hookPromotionAdmissionProof() {
       wireEvent.outputTokens === localEvent.outputTokens &&
       wireEvent.costUsd === localEvent.costUsd &&
       wireEvent.actorId === localEvent.actorId &&
-      safeMetadataControls.every(
-        ([key, value]) => localMetadata[key] === value && wireMetadata[key] === value,
+      JSON.stringify(localMetadata.git) === JSON.stringify(expectedGit) &&
+      JSON.stringify(wireMetadata.git) === JSON.stringify(expectedGit) &&
+      callerAuthorityMetadataKeys.every(
+        (key) => !(key in localMetadata) && !(key in wireMetadata),
       ) &&
-      !("git" in localMetadata) &&
-      !("git" in wireMetadata) &&
-      !("tenantId" in localMetadata) &&
-      !("tenantId" in wireMetadata) &&
       JSON.stringify(localMetadata.otelAttributes) === "{}" &&
       wireMetadata.otelAttributes === undefined;
     const valueTerms = [...new Set(
-      unsafeValues
+      [
+        ...Object.values(unsafeValues),
+        ...Object.values(authoritySpoofs),
+        hookRepo,
+      ]
         .flatMap((value) => [
           value,
           JSON.stringify(value).slice(1, -1),
           value.slice(0, Math.min(18, value.length)),
         ])
-        .filter((value) => value.length >= 8),
+        .filter((value) => value.length >= 6),
     )];
     const surfaces = [
       JSON.stringify(capture.body),
@@ -2334,6 +2506,7 @@ async function hookPromotionAdmissionProof() {
         responseReceipts.length > 0 &&
         exactParity &&
         receiptSets.flat().every(isCanonicalSuppressionReceipt) &&
+        authorityReceiptContract &&
         positiveControls &&
         noLeaks,
       {
@@ -2342,6 +2515,8 @@ async function hookPromotionAdmissionProof() {
         uploaded: uploaded.uploadedEvents,
         receiptSurfaces: receiptSets.length,
         exactParity,
+        authorityReceiptContract,
+        authorityReceipts: responseReceipts.filter((receipt) => receipt.startsWith("hook.authority.")),
         positiveControls,
         leaks: valueTerms.filter((term) => surfaces.some((surface) => surface.includes(term))).length,
       },
@@ -2355,15 +2530,21 @@ async function hookPromotionAdmissionProof() {
         .filter((candidate) => fs.existsSync(candidate))
         .map((candidate) => fs.readFileSync(candidate)),
     ];
+    // Recognized source/event literals are embedded in SQLite schema and
+    // projection SQL. Their supplied-value absence is already covered across
+    // all eight serialized surfaces; byte scans cover every distinctive term.
+    const artifactValueTerms = valueTerms.filter(
+      (term) => !["openai_usage", "anthropic_usage", "manual", "assistant_response"].includes(term),
+    );
     record(
-      "production_hook_exact_private_values_and_prefixes_absent_from_ledger_artifacts",
-      valueTerms.every((term) =>
+      "production_hook_private_and_spoofed_authority_values_absent_from_ledger_artifacts",
+      artifactValueTerms.every((term) =>
         artifacts.every((artifact) => !artifact.includes(Buffer.from(term))),
       ),
       {
         artifacts: artifacts.length,
-        privateTerms: valueTerms.length,
-        leaks: valueTerms.filter((term) =>
+        privateTerms: artifactValueTerms.length,
+        leaks: artifactValueTerms.filter((term) =>
           artifacts.some((artifact) => artifact.includes(Buffer.from(term))),
         ).length,
       },
