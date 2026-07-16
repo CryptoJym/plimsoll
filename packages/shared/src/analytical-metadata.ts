@@ -88,6 +88,9 @@ export type MetadataStringKind =
   | "classification"
   | "version"
   | "trace"
+  | "linkage"
+  | "commit_sha"
+  | "transport_path"
   | "http_method"
   | "timestamp";
 
@@ -153,6 +156,7 @@ const RECORD_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
   ["tool_name", "component"],
   ["toolName", "component"],
   ["tool", "component"],
+  ["name", "component"],
   ["gen_ai.tool.name", "component"],
   ["plimsoll.action_class", "classification"],
   ["cfo_one.action_class", "classification"],
@@ -161,19 +165,31 @@ const RECORD_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
   ["request_id", "identifier"],
   ["call_id", "identifier"],
   ["gen_ai.response.id", "identifier"],
-  ["plimsoll.project", "identifier"],
-  ["cfo_one.project", "identifier"],
-  ["project_key", "identifier"],
-  ["project", "identifier"],
+  ["plimsoll.project", "linkage"],
+  ["cfo_one.project", "linkage"],
+  ["project_key", "linkage"],
+  ["project", "linkage"],
+  ["projectKey", "linkage"],
   ["plimsoll.customer", "identifier"],
   ["cfo_one.customer", "identifier"],
   ["customer_key", "identifier"],
   ["customer", "identifier"],
+  ["customerKey", "identifier"],
   ["plimsoll.workflow", "identifier"],
   ["cfo_one.workflow", "identifier"],
   ["workflow_key", "identifier"],
   ["workflow", "identifier"],
+  ["workflowKey", "identifier"],
+  ["tenantId", "identifier"],
+  ["tenant_id", "identifier"],
+  ["observedAt", "timestamp"],
+  ["observed_at", "timestamp"],
+  ["time", "timestamp"],
+  ["actionClass", "classification"],
   ["decision", "classification"],
+  ["eventType", "classification"],
+  ["event_type", "classification"],
+  ["hook_event_name", "classification"],
   ["type", "classification"],
   ["error.type", "component"],
   ["exception.type", "component"],
@@ -183,6 +199,11 @@ const RECORD_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
   ["rpc.method", "component"],
   ["db.system", "component"],
   ["db.operation.name", "component"],
+  ["remoteUrlHash", "linkage"],
+  ["branchHash", "linkage"],
+  ["repoHash", "linkage"],
+  ["headSha", "commit_sha"],
+  ["transport_path", "transport_path"],
 ];
 
 const RESOURCE_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
@@ -357,6 +378,8 @@ const SAFE_IDENTIFIER = /^[a-zA-Z0-9][a-zA-Z0-9_.:+-]{0,159}$/;
 const SAFE_COMPONENT_NAME = /^[a-zA-Z0-9][a-zA-Z0-9_.:+-]{0,199}$/;
 const SAFE_CLASSIFICATION = /^[a-zA-Z0-9][a-zA-Z0-9_.:+-]{0,95}$/;
 const SAFE_VERSION = /^[a-zA-Z0-9][a-zA-Z0-9_.+-]{0,63}$/;
+const CANONICAL_LINKAGE = /^sha256:([a-f0-9]{64})$/i;
+const COMMIT_SHA = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i;
 const EMAIL = /\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b/i;
 const SECRET_PREFIX =
   /(?:^|[^a-z0-9])(?:sk_live|sk_test|sk-|ghp[a-z0-9_-]*|github_pat[a-z0-9_-]*|xox[a-z0-9_-]*)/i;
@@ -375,7 +398,7 @@ const APPROVED_SLASH_SIGNAL_NAMES = new Set([
 
 export function hasUnsafeMetadataString(
   value: unknown,
-  options: { allowSlash?: boolean } = {},
+  options: { allowSlash?: boolean; allowSemanticLabel?: boolean } = {},
 ) {
   if (typeof value !== "string") return true;
   const candidate = value.trim();
@@ -387,7 +410,22 @@ export function hasUnsafeMetadataString(
     AUTH_SCHEME.test(candidate) ||
     JWT.test(candidate) ||
     PEM_PRIVATE_KEY.test(candidate) ||
-    hasPrivateMetadataKeyConcept(candidate) ||
+    (options.allowSemanticLabel
+      ? keyWords(candidate).some((word) =>
+          [
+            "bearer",
+            "cookie",
+            "credential",
+            "email",
+            "oauth",
+            "password",
+            "private",
+            "secret",
+            "signing",
+            "ssh",
+          ].includes(word),
+        )
+      : hasPrivateMetadataKeyConcept(candidate)) ||
     /(?:^|[/.])\.\.(?:[/.]|$)/.test(candidate) ||
     /%(?:2e|2f|5c)/i.test(candidate) ||
     /(?:file|https?):\/\//i.test(candidate) ||
@@ -401,11 +439,16 @@ function safeStringByPattern(
   value: unknown,
   pattern: RegExp,
   maxLength: number,
-  options: { normalizeSpaces?: boolean } = {},
+  options: { normalizeSpaces?: boolean; allowSemanticLabel?: boolean } = {},
 ) {
   if (typeof value !== "string") return null;
   const candidate = value.trim();
-  if (candidate.length > maxLength || hasUnsafeMetadataString(candidate)) return null;
+  if (
+    candidate.length > maxLength ||
+    hasUnsafeMetadataString(candidate, { allowSemanticLabel: options.allowSemanticLabel })
+  ) {
+    return null;
+  }
   const normalized = options.normalizeSpaces ? candidate.replace(/ +/g, "_") : candidate;
   return pattern.test(normalized) ? normalized : null;
 }
@@ -418,13 +461,15 @@ export function safeMetadataStringAttribute(key: string, value: unknown) {
   if (kind === "signal") {
     const lowCardinality = safeStringByPattern(value, SAFE_COMPONENT_NAME, 160, {
       normalizeSpaces: true,
+      allowSemanticLabel: true,
     });
     if (lowCardinality) return lowCardinality;
     if (typeof value !== "string") return null;
     const candidate = value.trim();
-    return !hasUnsafeMetadataString(candidate, { allowSlash: true }) &&
-      APPROVED_SLASH_SIGNAL_NAMES.has(candidate)
-      ? candidate
+    const canonicalSignal = candidate.toLowerCase();
+    return !hasUnsafeMetadataString(candidate, { allowSlash: true, allowSemanticLabel: true }) &&
+      APPROVED_SLASH_SIGNAL_NAMES.has(canonicalSignal)
+      ? canonicalSignal
       : null;
   }
   if (kind === "model" || kind === "component") {
@@ -435,6 +480,21 @@ export function safeMetadataStringAttribute(key: string, value: unknown) {
     return safeStringByPattern(value, SAFE_CLASSIFICATION, 96, { normalizeSpaces: true });
   }
   if (kind === "version") return safeStringByPattern(value, SAFE_VERSION, 64);
+  if (kind === "linkage") {
+    if (typeof value !== "string" || hasUnsafeMetadataString(value)) return null;
+    const match = value.trim().match(CANONICAL_LINKAGE);
+    return match ? `sha256:${match[1].toLowerCase()}` : null;
+  }
+  if (kind === "commit_sha") {
+    if (typeof value !== "string" || hasUnsafeMetadataString(value)) return null;
+    const candidate = value.trim();
+    return COMMIT_SHA.test(candidate) ? candidate.toLowerCase() : null;
+  }
+  if (kind === "transport_path") {
+    return typeof value === "string" && ["/v1/logs", "/v1/traces", "/v1/metrics"].includes(value)
+      ? value
+      : null;
+  }
   if (kind === "trace") {
     if (typeof value !== "string" || hasUnsafeMetadataString(value)) return null;
     const candidate = value.trim();
@@ -482,4 +542,40 @@ export function isApprovedAnalyticalScalarAttribute(key: string, value: unknown)
     return nonnegativeSafeInteger(value) && Number(value) <= 999;
   }
   return finiteNonnegative(value);
+}
+
+export function validatedMetadataAttribute(key: string, value: unknown) {
+  const disposition = metadataKeyDisposition(key);
+  if (!disposition) return { accepted: false as const };
+  if (disposition.valueKind === "analytical_scalar") {
+    return isApprovedAnalyticalScalarAttribute(key, value)
+      ? { accepted: true as const, value }
+      : { accepted: false as const };
+  }
+  const stringValue = safeMetadataStringAttribute(key, value);
+  return stringValue === null
+    ? { accepted: false as const }
+    : { accepted: true as const, value: stringValue };
+}
+
+export function admittedMetadataAttributes(
+  input: Record<string, unknown>,
+  surface: OtlpAttributeSurface = "record",
+) {
+  const attributes: Record<string, unknown> = {};
+  const rejectedKeys: string[] = [];
+  for (const [key, value] of Object.entries(input)) {
+    const disposition = metadataKeyDisposition(key);
+    if (!disposition || !isDispositionAllowedOnOtlpSurface(disposition, surface)) {
+      rejectedKeys.push(key);
+      continue;
+    }
+    const validated = validatedMetadataAttribute(key, value);
+    if (!validated.accepted) {
+      rejectedKeys.push(key);
+    } else {
+      attributes[key] = validated.value;
+    }
+  }
+  return { attributes, rejectedKeys };
 }

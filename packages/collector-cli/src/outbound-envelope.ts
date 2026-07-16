@@ -4,18 +4,15 @@ import {
   canonicalSuppressionReceipt,
   canonicalizeSuppressionReceipts,
   hasUnsafeMetadataString,
-  isApprovedAnalyticalScalarAttribute,
   isForbiddenRawContentFieldName,
   isSensitiveMetadataSemanticKey,
   metadataKeyDisposition,
   safeMetadataStringAttribute,
+  validatedMetadataAttribute,
   type AiInteractionEvent,
   type AiWorkIngestEvent,
   type AiWorkSessionSyncRow,
 } from "../../shared/src/index";
-
-const CANONICAL_LINKAGE = /^sha256:([a-f0-9]{64})$/i;
-const COMMIT_SHA = /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/i;
 
 const OMIT_LOCAL_ONLY_KEYS = new Set([
   "externalEventId",
@@ -39,8 +36,8 @@ export type OutboundSessionRowOutcome =
 
 export function canonicalLinkage(value: string | null | undefined) {
   if (!value) return null;
-  const match = value.trim().match(CANONICAL_LINKAGE);
-  return match ? `sha256:${match[1].toLowerCase()}` : null;
+  const validated = validatedMetadataAttribute("projectKey", value);
+  return validated.accepted && typeof validated.value === "string" ? validated.value : null;
 }
 
 /**
@@ -61,9 +58,8 @@ function safeComponentName(value: unknown) {
 }
 
 export function canonicalCommitSha(value: unknown) {
-  if (typeof value !== "string" || hasUnsafeOutboundString(value)) return null;
-  const candidate = value.trim();
-  return COMMIT_SHA.test(candidate) ? candidate.toLowerCase() : null;
+  const validated = validatedMetadataAttribute("headSha", value);
+  return validated.accepted && typeof validated.value === "string" ? validated.value : null;
 }
 
 function safeSignalName(key: string, value: unknown) {
@@ -125,22 +121,16 @@ function sanitizeMetadata(input: Record<string, unknown>): MetadataOutcome {
       continue;
     }
     if (key === "transport_path") {
-      if (typeof value !== "string" || !["/v1/logs", "/v1/traces", "/v1/metrics"].includes(value)) {
-        return { ok: false };
-      }
-      metadata[key] = value;
+      const validated = validatedMetadataAttribute(key, value);
+      if (!validated.accepted) return { ok: false };
+      metadata[key] = validated.value;
       continue;
     }
     const disposition = metadataKeyDisposition(key);
-    if (disposition?.valueKind === "analytical_scalar" && disposition.outbound) {
-      if (!isApprovedAnalyticalScalarAttribute(key, value)) return { ok: false };
-      metadata[key] = value;
-      continue;
-    }
-    if (disposition?.valueKind === "string" && disposition.outbound) {
-      const safe = safeMetadataStringAttribute(key, value);
-      if (!safe) return { ok: false };
-      metadata[key] = safe;
+    if (disposition?.outbound) {
+      const validated = validatedMetadataAttribute(key, value);
+      if (!validated.accepted) return { ok: false };
+      metadata[key] = validated.value;
       continue;
     }
     if (isSensitiveMetadataSemanticKey(key)) {

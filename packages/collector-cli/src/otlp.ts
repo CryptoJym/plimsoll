@@ -1,16 +1,14 @@
 import {
   DEFAULT_POLICY,
   GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
+  admittedMetadataAttributes,
   aiInteractionEventSchema,
   canonicalizeSuppressionReceipts,
   estimateCostUsd,
-  isApprovedAnalyticalScalarAttribute,
-  isDispositionAllowedOnOtlpSurface,
-  metadataKeyDisposition,
-  safeMetadataStringAttribute,
   sanitizeForPolicy,
   suppressionReceiptForAttributeKey,
   usageFieldKeys,
+  validatedMetadataAttribute,
   type ActionClass,
   type AiInteractionEvent,
   type OtlpAttributeSurface,
@@ -169,33 +167,17 @@ export function metadataSafeOtlpAttributes(
   _dataMode: PolicyConfig["dataMode"],
   surface: OtlpAttributeSurface = "record",
 ) {
-  const safe: Record<string, unknown> = {};
-  const suppressedFields: string[] = [];
-  for (const [key, value] of Object.entries(attrs)) {
-    const disposition = metadataKeyDisposition(key);
-    const allowed = disposition && isDispositionAllowedOnOtlpSurface(disposition, surface);
-    if (
-      allowed &&
-      disposition.valueKind === "analytical_scalar" &&
-      isApprovedAnalyticalScalarAttribute(key, value)
-    ) {
-      safe[key] = value;
-    } else if (allowed && disposition.valueKind === "string") {
-      const stringValue = safeMetadataStringAttribute(key, value);
-      if (stringValue !== null) {
-        safe[key] = stringValue;
-      } else {
-        suppressedFields.push(suppressionReceiptForAttributeKey(key));
-      }
-    } else {
-      suppressedFields.push(
-        typeof value === "number" || typeof value === "boolean"
-          ? GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT
-          : suppressionReceiptForAttributeKey(key),
-      );
-    }
-  }
-  return { attrs: safe, suppressedFields: canonicalizeSuppressionReceipts(suppressedFields) };
+  const admitted = admittedMetadataAttributes(attrs, surface);
+  const suppressedFields = admitted.rejectedKeys.map((key) => {
+    const value = attrs[key];
+    return typeof value === "number" || typeof value === "boolean"
+      ? GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT
+      : suppressionReceiptForAttributeKey(key);
+  });
+  return {
+    attrs: admitted.attributes,
+    suppressedFields: canonicalizeSuppressionReceipts(suppressedFields),
+  };
 }
 
 function eventNameFromAttributes(attrs: Record<string, unknown>) {
@@ -285,8 +267,9 @@ function buildLogEvent(
     : undefined;
   const sanitized = sanitizeForPolicy(record, context.policy);
   const safeRecord = asRecord(sanitized.value);
-  const attrs = flattenOtelAttributes(safeRecord.attributes);
-  const metadataAttrs = metadataSafeOtlpAttributes(attrs, context.policy.dataMode);
+  const rawAttrs = flattenOtelAttributes(safeRecord.attributes);
+  const metadataAttrs = metadataSafeOtlpAttributes(rawAttrs, context.policy.dataMode);
+  const attrs = metadataAttrs.attrs;
   const otelEventName = eventNameFromAttributes(attrs);
 
   const inputTokens = intTokens(numberField(attrs, [...usageFieldKeys.inputTokens]));
@@ -401,10 +384,14 @@ function buildSpanEvent(
 ): { event: AiInteractionEvent; suppressedFields: string[] } {
   const sanitized = sanitizeForPolicy(span, context.policy);
   const safeSpan = asRecord(sanitized.value);
-  const attrs = flattenOtelAttributes(safeSpan.attributes);
-  const metadataAttrs = metadataSafeOtlpAttributes(attrs, context.policy.dataMode);
+  const rawAttrs = flattenOtelAttributes(safeSpan.attributes);
+  const metadataAttrs = metadataSafeOtlpAttributes(rawAttrs, context.policy.dataMode);
+  const attrs = metadataAttrs.attrs;
   const rawSpanName = typeof safeSpan.name === "string" ? safeSpan.name : undefined;
-  const spanName = boundedSignalName(rawSpanName);
+  const validatedSpanName = validatedMetadataAttribute("otelEventName", rawSpanName);
+  const spanName = validatedSpanName.accepted && typeof validatedSpanName.value === "string"
+    ? validatedSpanName.value
+    : undefined;
   const observedAt = recordTimestamp(safeSpan, attrs);
   const sessionId = stringField(attrs, [...usageFieldKeys.sessionId]);
   const inputTokens = intTokens(numberField(attrs, [...usageFieldKeys.inputTokens]));
@@ -454,7 +441,20 @@ function buildSpanEvent(
       : lifecycleType
         ? lifecycleType
         : "otel_span";
-  const otelStatusCode = statusCode(safeSpan);
+  const rawOtelStatusCode = statusCode(safeSpan);
+  const validatedStatusCode = validatedMetadataAttribute("otelStatusCode", rawOtelStatusCode);
+  const otelStatusCode = validatedStatusCode.accepted &&
+    (typeof validatedStatusCode.value === "number" || typeof validatedStatusCode.value === "string")
+    ? validatedStatusCode.value
+    : undefined;
+  const validatedTraceId = validatedMetadataAttribute("traceId", safeSpan.traceId);
+  const traceId = validatedTraceId.accepted && typeof validatedTraceId.value === "string"
+    ? validatedTraceId.value
+    : undefined;
+  const validatedSpanId = validatedMetadataAttribute("spanId", safeSpan.spanId);
+  const spanId = validatedSpanId.accepted && typeof validatedSpanId.value === "string"
+    ? validatedSpanId.value
+    : undefined;
   const otelHasException = spanHasExceptionEvent(safeSpan);
   const otelHasError =
     isErrorStatus(otelStatusCode) || otelHasException || attributesHaveError(attrs);
@@ -467,8 +467,8 @@ function buildSpanEvent(
       spanName,
       sessionId,
       observedAt,
-      String(safeSpan.spanId ?? ""),
-      String(safeSpan.traceId ?? ""),
+      spanId,
+      traceId,
     ]),
     sessionId,
     tenantId: context.policy.tenantId,
@@ -499,8 +499,8 @@ function buildSpanEvent(
       ...(otelStatusCode !== undefined ? { otelStatusCode } : {}),
       ...(otelHasException ? { otelHasException: true } : {}),
       ...(otelHasError ? { otelHasError: true } : {}),
-      ...(typeof safeSpan.traceId === "string" ? { traceId: safeSpan.traceId } : {}),
-      ...(typeof safeSpan.spanId === "string" ? { spanId: safeSpan.spanId } : {}),
+      ...(traceId ? { traceId } : {}),
+      ...(spanId ? { spanId } : {}),
       ...(context.transportPath ? { transport_path: context.transportPath } : {}),
       ...(context.serviceName ? { serviceName: context.serviceName } : {}),
     },
@@ -513,6 +513,9 @@ function buildSpanEvent(
       ...(context.containerSuppressedFields ?? []),
       ...metadataAttrs.suppressedFields,
       ...(rawSpanName && !spanName ? ["span.name"] : []),
+      ...(rawOtelStatusCode !== undefined && otelStatusCode === undefined ? ["status.code"] : []),
+      ...(safeSpan.traceId !== undefined && traceId === undefined ? ["traceId"] : []),
+      ...(safeSpan.spanId !== undefined && spanId === undefined ? ["spanId"] : []),
     ]),
   };
 }
@@ -526,7 +529,11 @@ function buildMetricSamples(
     containerSuppressedFields?: string[];
   },
 ): MetricSample[] {
-  const metricName = boundedSignalName(metric.name) ?? "unknown_metric";
+  const validatedMetricName = validatedMetadataAttribute("otelEventName", metric.name);
+  const metricName = validatedMetricName.accepted && typeof validatedMetricName.value === "string"
+    ? validatedMetricName.value
+    : "unknown_metric";
+  const metricNameSuppressed = metric.name !== undefined && !validatedMetricName.accepted;
   const samples: MetricSample[] = [];
   const shapes: Array<{ kind: string; dataPoints: unknown }> = [
     { kind: "sum", dataPoints: asRecord(metric.sum).dataPoints },
@@ -539,8 +546,9 @@ function buildMetricSamples(
     for (const dataPointRaw of shape.dataPoints) {
       const sanitized = sanitizeForPolicy(dataPointRaw, context.policy);
       const dataPoint = asRecord(sanitized.value);
-      const attrs = flattenOtelAttributes(dataPoint.attributes);
-      const metadataAttrs = metadataSafeOtlpAttributes(attrs, context.policy.dataMode);
+      const rawAttrs = flattenOtelAttributes(dataPoint.attributes);
+      const metadataAttrs = metadataSafeOtlpAttributes(rawAttrs, context.policy.dataMode);
+      const attrs = metadataAttrs.attrs;
       const value =
         shape.kind === "histogram"
           ? numberField(dataPoint, ["sum", "count"])
@@ -574,6 +582,7 @@ function buildMetricSamples(
           ...sanitized.evaluation.suppressedFields,
           ...(context.containerSuppressedFields ?? []),
           ...metadataAttrs.suppressedFields,
+          ...(metricNameSuppressed ? ["metric.name"] : []),
         ]),
       });
     }

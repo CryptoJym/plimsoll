@@ -2,9 +2,16 @@ import crypto from "node:crypto";
 
 import {
   DEFAULT_POLICY,
+  GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
+  admittedMetadataAttributes,
+  actionClassSchema,
   aiInteractionEventSchema,
+  canonicalizeSuppressionReceipts,
+  metadataKeyDisposition,
   sanitizeForPolicy,
+  suppressionReceiptForAttributeKey,
   usageFieldKeys,
+  validatedMetadataAttribute,
   type ActionClass,
   type AiInteractionEvent,
   type PolicyConfig,
@@ -131,6 +138,32 @@ function extractOtelSignals(payload: Record<string, unknown>): OTelSignals {
     names: [...new Set(signals.names)],
     timestamps: [...new Set(signals.timestamps)],
   };
+}
+
+function rejectedAttributeReceipts(
+  input: Record<string, unknown>,
+  rejectedKeys: readonly string[],
+) {
+  return rejectedKeys.map((key) => {
+    const value = input[key];
+    return typeof value === "number" || typeof value === "boolean"
+      ? GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT
+      : suppressionReceiptForAttributeKey(key);
+  });
+}
+
+function safeSignalNames(names: readonly string[]) {
+  const accepted: string[] = [];
+  const rejected: string[] = [];
+  for (const name of names) {
+    const result = validatedMetadataAttribute("otelEventName", name);
+    if (result.accepted && typeof result.value === "string") {
+      accepted.push(result.value);
+    } else {
+      rejected.push("span.name");
+    }
+  }
+  return { accepted: [...new Set(accepted)], rejected };
 }
 
 export function stringFromRecords(records: Record<string, unknown>[], keys: readonly string[]) {
@@ -282,25 +315,56 @@ export function normalizeHookPayload(
   const sanitized = sanitizeForPolicy(raw, policy);
   const safe = asRecord(sanitized.value);
   const otelSignals = extractOtelSignals(safe);
-  const otelAttributes = otelSignals.attributes;
-  const sourceRecords = [safe, otelAttributes];
-  const suppliedId = stringField(safe, ["id", "event_id"]);
+  const admittedTopLevel = admittedMetadataAttributes(safe, "record");
+  const admittedOtel = admittedMetadataAttributes(otelSignals.attributes, "record");
+  const admittedNames = safeSignalNames(otelSignals.names);
+  const suppliedTenantKeys = ["tenantId", "tenant_id"].filter((key) => key in safe);
+  for (const key of suppliedTenantKeys) delete admittedTopLevel.attributes[key];
+  const sourceRecords = [admittedTopLevel.attributes, admittedOtel.attributes];
+  const rawSource = stringField(safe, ["source", "provider"]);
+  const validatedSource = validatedMetadataAttribute("originator", rawSource);
+  const admittedSource = validatedSource.accepted && typeof validatedSource.value === "string"
+    ? validatedSource.value
+    : undefined;
+  const rawSuppliedId = stringField(safe, ["id", "event_id"]);
+  const validatedSuppliedId = validatedMetadataAttribute("sessionId", rawSuppliedId);
+  const suppliedId = validatedSuppliedId.accepted && typeof validatedSuppliedId.value === "string"
+    ? validatedSuppliedId.value
+    : undefined;
   const eventId = isUuid(suppliedId) ? suppliedId : crypto.randomUUID();
-  const eventType = inferEventType(safe, otelSignals.names);
+  const eventType = inferEventType(admittedTopLevel.attributes, admittedNames.accepted);
   const toolName =
     eventType === "tool_use" || eventType === "tool_result"
       ? stringFromRecords(sourceRecords, TOOL_NAME_KEYS)
       : undefined;
-  const explicitActionClass = stringFromRecords(sourceRecords, [
+  const explicitActionCandidate = stringFromRecords(sourceRecords, [
     "actionClass",
     "action_class",
     "plimsoll.action_class", "cfo_one.action_class",
   ]);
+  const parsedActionClass = actionClassSchema.safeParse(explicitActionCandidate);
+  const explicitActionClass = parsedActionClass.success ? parsedActionClass.data : undefined;
   const derived = explicitActionClass ? undefined : deriveActionClass(toolName);
+  // Exact promotion keys and nested OTLP attributes cross the shared admission
+  // boundary before persistence or top-level promotion. Caller-provided git is
+  // discarded; only resolver-owned options.gitContext may enter the event.
+  const metadataBase: Record<string, unknown> = { ...safe };
+  for (const key of Object.keys(metadataBase)) {
+    if (metadataKeyDisposition(key)) delete metadataBase[key];
+  }
+  delete metadataBase.attributes;
+  delete metadataBase.otelAttributes;
+  delete metadataBase.git;
+  delete metadataBase.id;
+  delete metadataBase.event_id;
+  delete metadataBase.source;
+  delete metadataBase.provider;
+  Object.assign(metadataBase, admittedTopLevel.attributes);
+
   const metadata = {
-    ...safe,
-    otelAttributes,
-    ...(otelSignals.names.length ? { otelSignalNames: otelSignals.names } : {}),
+    ...metadataBase,
+    otelAttributes: admittedOtel.attributes,
+    ...(admittedNames.accepted.length ? { otelSignalNames: admittedNames.accepted } : {}),
     ...(otelSignals.timestamps.length ? { otelSignalTimestamps: otelSignals.timestamps } : {}),
     ...(suppliedId && !isUuid(suppliedId) ? { external_event_id: suppliedId } : {}),
     ...(toolName ? { toolName } : {}),
@@ -311,13 +375,21 @@ export function normalizeHookPayload(
   const event = aiInteractionEventSchema.parse({
     id: eventId,
     sessionId: stringFromRecords(sourceRecords, usageFieldKeys.sessionId),
-    tenantId: stringFromRecords(sourceRecords, ["tenantId", "tenant_id"]) ?? policy.tenantId,
+    // Capture transport identity is authoritative; hook payloads cannot select
+    // or spoof an upload tenant.
+    tenantId: policy.tenantId,
     actorId: stringFromRecords(sourceRecords, usageFieldKeys.actorId),
-    source: inferSource(safe, options.source),
+    source:
+      options.source ??
+      inferSource(
+        admittedSource
+          ? { source: admittedSource }
+          : { tool: stringFromRecords(sourceRecords, ["tool"]) },
+      ),
     dataMode: policy.dataMode,
     eventType,
     observedAt:
-      stringField(safe, ["observedAt", "observed_at", "timestamp", "time"]) ??
+      stringFromRecords(sourceRecords, ["observedAt", "observed_at", "timestamp", "time"]) ??
       otelSignals.timestamps[0] ??
       new Date().toISOString(),
     model: stringFromRecords(sourceRecords, usageFieldKeys.model),
@@ -335,6 +407,18 @@ export function normalizeHookPayload(
 
   return {
     event,
-    suppressedFields: sanitized.evaluation.suppressedFields,
+    suppressedFields: canonicalizeSuppressionReceipts([
+      ...sanitized.evaluation.suppressedFields,
+      ...rejectedAttributeReceipts(
+        safe,
+        admittedTopLevel.rejectedKeys.filter((key) => metadataKeyDisposition(key) !== undefined),
+      ),
+      ...rejectedAttributeReceipts(otelSignals.attributes, admittedOtel.rejectedKeys),
+      ...admittedNames.rejected,
+      ...suppliedTenantKeys.map((key) => suppressionReceiptForAttributeKey(key)),
+      ...(rawSource && !admittedSource ? [suppressionReceiptForAttributeKey("source")] : []),
+      ...(rawSuppliedId && !suppliedId ? ["event_id"] : []),
+      ...(safe.git !== undefined ? ["metadata.git"] : []),
+    ]),
   };
 }
