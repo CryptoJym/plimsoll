@@ -34,6 +34,9 @@ jobs:
       - name: Run signal-fidelity proof
         run: pnpm proof
 
+      - name: Prove versioned learning-metric truth
+        run: pnpm proof:metric-truth
+
       - name: Prove suppression receipt capture-to-upload parity
         run: pnpm proof:outbox
 
