@@ -40,6 +40,7 @@ const root = path.resolve(import.meta.dirname, "..");
 const cli = path.join(root, "packages", "collector-cli", "src", "cli.ts");
 const tsx = path.join(root, "node_modules", "tsx", "dist", "cli.mjs");
 const installScript = path.join(root, "install.sh");
+const proofWorkflow = path.join(root, ".github", "workflows", "proof.yml");
 const checks: Check[] = [];
 
 function check(name: string, condition: unknown, detail: unknown) {
@@ -106,6 +107,30 @@ async function main() {
     version: process.versions.node,
   });
   check("tsx_entrypoint_exists", fs.existsSync(tsx), tsx);
+  const workflow = fs.readFileSync(proofWorkflow, "utf8");
+  const workflowCommands = [...workflow.matchAll(/^\s+run:\s*(.+?)\s*$/gm)]
+    .map((match) => match[1]);
+  const requiredStandaloneGates = [
+    "pnpm proof:allocation",
+    "pnpm proof:install-doctor",
+    "pnpm proof:http-boundary",
+    "pnpm proof:dashboard",
+    "pnpm proof:dashboard-security",
+    "pnpm proof",
+    "pnpm proof:metric-truth",
+    "pnpm proof:outbox",
+    "pnpm proof:resource --require-integrated --receipt evidence/resource-proof.json",
+    "pnpm proof:resource-finalization",
+  ];
+  const gateCounts = Object.fromEntries(requiredStandaloneGates.map((gate) => [
+    gate,
+    workflowCommands.filter((command) => command === gate).length,
+  ]));
+  check(
+    "ci_workflow_runs_every_required_standalone_gate_once",
+    Object.values(gateCounts).every((count) => count === 1),
+    { workflow: proofWorkflow, gateCounts },
+  );
 
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-install-doctor-proof-"));
   const packagedCli = path.join(root, "packages", "collector-cli", "dist", "install-doctor-proof-cli.mjs");

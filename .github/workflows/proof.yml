@@ -31,6 +31,15 @@ jobs:
       - name: Prove source installer and read-only doctor
         run: pnpm proof:install-doctor
 
+      - name: Prove local HTTP trust boundary
+        run: pnpm proof:http-boundary
+
+      - name: Prove shipped dashboard projection truth
+        run: pnpm proof:dashboard
+
+      - name: Prove shipped dashboard browser security
+        run: pnpm proof:dashboard-security
+
       - name: Run signal-fidelity proof
         run: pnpm proof
 

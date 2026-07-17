@@ -14,6 +14,8 @@ import { createCollectorServer } from "../packages/collector-cli/src/server";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const dashboardPath = path.join(repoRoot, "packages/collector-cli/src/dashboard.html");
 const chromePath = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome";
+const BROWSER_PROTOCOL_CLOSE_MS = 1_000;
+const BROWSER_SIGNAL_GRACE_MS = 1_500;
 
 const payloads = {
   html: `HTML:<img src="https://exfil.invalid/html" onerror="fetch('https://exfil.invalid/html-event')">`,
@@ -288,11 +290,113 @@ class CdpClient {
   }
 }
 
+function childHasExited(child: ChildProcess) {
+  return child.exitCode !== null || child.signalCode !== null;
+}
+
+async function waitForChildExit(child: ChildProcess, timeoutMs: number) {
+  if (childHasExited(child)) return true;
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (exited: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeout);
+      child.off("exit", onExit);
+      resolve(exited);
+    };
+    const onExit = () => finish(true);
+    const timeout = setTimeout(() => finish(childHasExited(child)), timeoutMs);
+    child.once("exit", onExit);
+    if (childHasExited(child)) finish(true);
+  });
+}
+
+async function boundedResult<T>(promise: Promise<T>, timeoutMs: number) {
+  let timeout: NodeJS.Timeout | undefined;
+  const result = await Promise.race([
+    promise.then((value) => ({ status: "settled" as const, value })),
+    new Promise<{ status: "timed_out" }>((resolve) => {
+      timeout = setTimeout(() => resolve({ status: "timed_out" }), timeoutMs);
+    }),
+  ]);
+  if (timeout) clearTimeout(timeout);
+  return result;
+}
+
+async function shutdownBrowser(
+  cdp: CdpClient | undefined,
+  chrome: ChildProcess,
+  timing = {
+    protocolCloseMs: BROWSER_PROTOCOL_CLOSE_MS,
+    signalGraceMs: BROWSER_SIGNAL_GRACE_MS,
+  },
+) {
+  const startedAt = Date.now();
+  let protocolClose: "not_connected" | "acknowledged" | "rejected" | "timed_out" = "not_connected";
+  if (cdp && !childHasExited(chrome)) {
+    const request = cdp.send("Browser.close")
+      .then(() => "acknowledged" as const)
+      .catch(() => "rejected" as const);
+    const result = await boundedResult(request, timing.protocolCloseMs);
+    protocolClose = result.status === "settled" ? result.value : "timed_out";
+  }
+  cdp?.close();
+
+  if (await waitForChildExit(chrome, timing.protocolCloseMs)) {
+    return { exited: true, protocolClose, escalatedTo: "none" as const, durationMs: Date.now() - startedAt };
+  }
+
+  chrome.kill("SIGTERM");
+  if (await waitForChildExit(chrome, timing.signalGraceMs)) {
+    return { exited: true, protocolClose, escalatedTo: "SIGTERM" as const, durationMs: Date.now() - startedAt };
+  }
+
+  chrome.kill("SIGKILL");
+  const exited = await waitForChildExit(chrome, timing.signalGraceMs);
+  if (!exited) throw new Error(`Chrome did not exit after bounded SIGKILL teardown (pid ${chrome.pid ?? "unknown"})`);
+  return { exited: true, protocolClose, escalatedTo: "SIGKILL" as const, durationMs: Date.now() - startedAt };
+}
+
+async function proveBoundedSignalEscalation() {
+  const child = spawn(process.execPath, [
+    "-e",
+    "process.on('SIGTERM',()=>{});process.stdout.write('ready\\n');setInterval(()=>{},1000)",
+  ], {
+    env: { PATH: process.env.PATH ?? "/usr/bin:/bin" },
+    stdio: ["ignore", "pipe", "ignore"],
+  });
+  try {
+    await boundedResult(new Promise<void>((resolve, reject) => {
+      child.once("error", reject);
+      child.stdout?.once("data", () => resolve());
+    }), 1_000).then((result) => {
+      if (result.status !== "settled") throw new Error("SIGTERM-resistant child did not become ready");
+    });
+    const receipt = await shutdownBrowser(undefined, child, {
+      protocolCloseMs: 25,
+      signalGraceMs: 100,
+    });
+    check(
+      "browser_teardown_escalates_after_sigterm_resistance",
+      receipt.exited && receipt.escalatedTo === "SIGKILL" && receipt.durationMs <= 500,
+      JSON.stringify(receipt),
+    );
+  } finally {
+    if (!childHasExited(child)) {
+      child.kill("SIGKILL");
+      await waitForChildExit(child, 500);
+    }
+  }
+}
+
 async function waitForFile(file: string, process: ChildProcess) {
   const deadline = Date.now() + 10_000;
   while (Date.now() < deadline) {
     if (fs.existsSync(file)) return;
-    if (process.exitCode !== null) throw new Error(`Chrome exited ${process.exitCode} before debugger startup`);
+    if (childHasExited(process)) {
+      throw new Error(`Chrome exited before debugger startup (code=${process.exitCode}, signal=${process.signalCode})`);
+    }
     await new Promise((resolve) => setTimeout(resolve, 25));
   }
   throw new Error("Chrome debugger startup timed out");
@@ -372,6 +476,7 @@ async function browserProof(html: string) {
     "about:blank",
   ], { stdio: "ignore" });
   let cdp: CdpClient | undefined;
+  let shutdownReceipt: Awaited<ReturnType<typeof shutdownBrowser>> | undefined;
   try {
     const activePort = path.join(profile, "DevToolsActivePort");
     await waitForFile(activePort, chrome);
@@ -457,12 +562,19 @@ async function browserProof(html: string) {
     );
     check("browser_zero_page_console_errors", pageErrors.length === 0 && consoleErrors.length === 0, JSON.stringify({ pageErrors, consoleErrors }));
   } finally {
-    cdp?.close();
-    chrome.kill("SIGTERM");
-    await new Promise<void>((resolve) => { if (chrome.exitCode !== null) resolve(); else chrome.once("exit", () => resolve()) });
-    if (fixtureServer.listening) await new Promise<void>((resolve) => fixtureServer.close(() => resolve()));
-    fs.rmSync(profile, { recursive: true, force: true });
+    try {
+      shutdownReceipt = await shutdownBrowser(cdp, chrome);
+    } finally {
+      if (fixtureServer.listening) await new Promise<void>((resolve) => fixtureServer.close(() => resolve()));
+      fs.rmSync(profile, { recursive: true, force: true });
+    }
   }
+  check(
+    "browser_process_bounded_teardown",
+    shutdownReceipt?.exited === true &&
+      shutdownReceipt.durationMs <= BROWSER_PROTOCOL_CLOSE_MS * 2 + BROWSER_SIGNAL_GRACE_MS * 2 + 500,
+    JSON.stringify(shutdownReceipt),
+  );
 }
 
 async function main() {
@@ -483,6 +595,7 @@ async function main() {
     html.includes("textContent") && html.includes("createElement") && html.includes("createElementNS") && html.includes("addEventListener") && html.includes("replaceChildren"),
     "textContent/createElement/createElementNS/addEventListener/replaceChildren",
   );
+  await proveBoundedSignalEscalation();
   await actualServerHeaderProof();
   await browserProof(html);
   const failed = checks.filter((receipt) => !receipt.passed);
