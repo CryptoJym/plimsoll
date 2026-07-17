@@ -1421,6 +1421,94 @@ export function runMetadataPrivacySentinelsContract(
   };
 }
 
+type LearningFactsProofResult = {
+  schema: "plimsoll.learning-facts-proof.v1";
+  passed: boolean;
+  checks: number;
+  measurements: {
+    learningFactRowsWritten: number;
+    privacyLeaks: number;
+    uploadedFactRows: number;
+    nodeMajor: number;
+  };
+  liveStateTouched: false;
+  providerNetworkCalled: false;
+  backgroundScansStarted: false;
+  llmCalled: false;
+};
+
+export function runLearningFactPrivacyAndResourceContract(
+  sandbox: ResourceSandbox,
+  operatorHome: string,
+): ScenarioReceipt {
+  const started = performance.now();
+  const tsxCli = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
+  const proof = path.join(repoRoot, "scripts", "learning-facts-proof.ts");
+  const result = spawnSync(process.execPath, [tsxCli, proof], {
+    cwd: repoRoot,
+    env: buildAllowlistedChildEnvironment(sandbox),
+    encoding: "utf8",
+    timeout: 120_000,
+    maxBuffer: 2 * 1024 * 1024,
+  });
+  const stdout = result.stdout ?? "";
+  const stderr = result.stderr ?? "";
+  const outputPrivacyLeaks = metadataPrivacyTerms(operatorHome).filter(
+    (term) => term && (stdout.includes(term) || stderr.includes(term)),
+  ).length;
+  let parsed: LearningFactsProofResult | undefined;
+  try {
+    parsed = JSON.parse(stdout.trim()) as LearningFactsProofResult;
+  } catch {
+    parsed = undefined;
+  }
+  const shapeValid = Boolean(
+    parsed &&
+      parsed.schema === "plimsoll.learning-facts-proof.v1" &&
+      typeof parsed.checks === "number" &&
+      typeof parsed.measurements?.learningFactRowsWritten === "number",
+  );
+  const passed = Boolean(
+    result.status === 0 &&
+      !result.error &&
+      outputPrivacyLeaks === 0 &&
+      shapeValid &&
+      parsed?.passed &&
+      parsed.measurements.nodeMajor === 22 &&
+      parsed.measurements.learningFactRowsWritten > 0 &&
+      parsed.measurements.privacyLeaks === 0 &&
+      parsed.measurements.uploadedFactRows === 0 &&
+      parsed.liveStateTouched === false &&
+      parsed.providerNetworkCalled === false &&
+      parsed.backgroundScansStarted === false &&
+      parsed.llmCalled === false,
+  );
+  const counters = emptyWorkCounters();
+  counters.learningFactRowsWritten = parsed?.measurements.learningFactRowsWritten ?? 0;
+  return {
+    id: "learning_fact_privacy_and_resource_bounds",
+    required: true,
+    status: passed ? "pass" : "fail",
+    detail: passed
+      ? "A Node 22 child proved bounded indexed attempt/episode/exposure facts, paired retry semantics, explicit-only technique exposure, zero private sentinel persistence/upload, and no background scan or LLM path."
+      : "The isolated learning-fact contract failed; child content is omitted.",
+    durationMs: Math.round((performance.now() - started) * 100) / 100,
+    counters,
+    measurements: {
+      childExitCode: result.status,
+      childTimedOut: result.signal === "SIGTERM" && Boolean(result.error),
+      childOutputPrivacyLeaks: outputPrivacyLeaks,
+      proofShapeValid: shapeValid,
+      proofChecks: parsed?.checks ?? 0,
+      privacyLeaks: parsed?.measurements.privacyLeaks ?? -1,
+      uploadedFactRows: parsed?.measurements.uploadedFactRows ?? -1,
+      nodeMajor: parsed?.measurements.nodeMajor ?? -1,
+      backgroundScansStarted: parsed?.backgroundScansStarted ?? true,
+      llmCalled: parsed?.llmCalled ?? true,
+    },
+  };
+}
+
 type CapturedChild = {
   child: ChildProcessByStdio<null, Readable, Readable>;
   output: { stdout: string; stderr: string };

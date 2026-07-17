@@ -23,6 +23,7 @@ export const WORK_COUNTER_NAMES = [
   "listenersCreated",
   "restartRequests",
   "filesystemEntriesScanned",
+  "learningFactRowsWritten",
 ] as const;
 
 export type WorkCounterName = (typeof WORK_COUNTER_NAMES)[number];
