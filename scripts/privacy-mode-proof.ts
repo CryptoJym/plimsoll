@@ -21,6 +21,7 @@ import {
 import { appendForwardedHook } from "../packages/collector-cli/src/forwarder";
 import { performJoin } from "../packages/collector-cli/src/join";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
+import { sealOutboundEnvelope } from "../packages/collector-cli/src/outbound-envelope";
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import { runWorkspaceHistoryUpload } from "../packages/collector-cli/src/upload-history";
 import {
@@ -383,7 +384,7 @@ async function main() {
     actionClass: "other",
     metadata: { prompt: fixture.sentinels.prompt },
   };
-  legacyBuffer.database
+  const evidenceInsert = legacyBuffer.database
     .prepare(
       `insert into buffered_events
        (id,source,event_type,data_mode,observed_at,payload_json,suppressed_fields_json,created_at)
@@ -399,6 +400,7 @@ async function main() {
       "[]",
       evidenceEvent.observedAt,
     );
+  const evidenceRawRowid = Number(evidenceInsert.lastInsertRowid);
   const safeEvent = aiInteractionEventSchema.parse({
     id: "11711711-1111-4111-8111-111111111119",
     source: "codex",
@@ -415,25 +417,97 @@ async function main() {
   legacyBuffer = new LocalEventBuffer(legacyLedger, {
     delivery: { enabled: true, limits: metadataConfig.delivery },
   });
-  const sealedEvidenceId = "11711711-1111-4111-8111-111111111120";
-  const sealedEvidenceEnvelope = JSON.stringify({
-    event: { ...evidenceEvent, id: sealedEvidenceId },
-    suppressedFields: [],
+  const outboxInsert = legacyBuffer.database.prepare(
+    `insert into upload_outbox
+     (delivery_id,raw_rowid,base_envelope_json,base_bytes,sealed_envelope_json,sealed_bytes,
+      state,attempt_count,next_attempt_at,last_failure_class,created_at,updated_at)
+     values (@id,@rawRowid,@envelope,@bytes,@envelope,@bytes,
+      'pending',0,@at,'none',@at,@at)`,
+  );
+  const canonicalMetadataEnvelope = (id: string, observedAt: string) => {
+    const sealed = sealOutboundEnvelope({
+      event: { ...safeEvent, id, observedAt, metadata: {} },
+      suppressedFields: [],
+    });
+    if (!sealed.ok) throw new Error(`Could not construct canonical metadata envelope: ${sealed.reason}`);
+    return JSON.stringify(sealed.envelope);
+  };
+  const staleEnvelopeIds = [
+    "11711711-1111-4111-8111-111111111120",
+    "11711711-1111-4111-8111-111111111121",
+  ];
+  for (const [index, id] of staleEnvelopeIds.entries()) {
+    const envelope = canonicalMetadataEnvelope(id, `2026-07-17T12:00:0${index + 2}.000Z`);
+    outboxInsert.run({
+      id,
+      rawRowid: evidenceRawRowid,
+      envelope,
+      bytes: Buffer.byteLength(envelope),
+      at: `2026-07-17T12:00:00.${index + 5}00Z`,
+    });
+  }
+
+  const nullRawId = "11711711-1111-4111-8111-111111111122";
+  const nullRawEnvelope = canonicalMetadataEnvelope(nullRawId, "2026-07-17T12:00:04.000Z");
+  outboxInsert.run({
+    id: nullRawId,
+    rawRowid: null,
+    envelope: nullRawEnvelope,
+    bytes: Buffer.byteLength(nullRawEnvelope),
+    at: "2026-07-17T12:00:04.000Z",
+  });
+
+  const deletedRawId = "11711711-1111-4111-8111-111111111123";
+  const deletedRaw = legacyBuffer.database
+    .prepare(
+      `insert into buffered_events
+       (id,source,event_type,data_mode,observed_at,payload_json,suppressed_fields_json,created_at)
+       values (@id,'codex','assistant_response','metadata',@at,@payload,'[]',@at)`,
+    )
+    .run({
+      id: deletedRawId,
+      at: "2026-07-17T12:00:05.000Z",
+      payload: canonicalMetadataEnvelope(deletedRawId, "2026-07-17T12:00:05.000Z"),
+    });
+  const deletedRawEnvelope = canonicalMetadataEnvelope(deletedRawId, "2026-07-17T12:00:05.000Z");
+  outboxInsert.run({
+    id: deletedRawId,
+    rawRowid: Number(deletedRaw.lastInsertRowid),
+    envelope: deletedRawEnvelope,
+    bytes: Buffer.byteLength(deletedRawEnvelope),
+    at: "2026-07-17T12:00:05.000Z",
+  });
+  legacyBuffer.database
+    .prepare(`delete from buffered_events where rowid = ?`)
+    .run(Number(deletedRaw.lastInsertRowid));
+
+  const terminalRawId = "11711711-1111-4111-8111-111111111124";
+  const terminalRaw = legacyBuffer.database
+    .prepare(
+      `insert into buffered_events
+       (id,source,event_type,data_mode,observed_at,payload_json,suppressed_fields_json,created_at)
+       values (@id,'codex','assistant_response','metadata',@at,@payload,'[]',@at)`,
+    )
+    .run({
+      id: terminalRawId,
+      at: "2026-07-17T12:00:06.000Z",
+      payload: JSON.stringify({ ...safeEvent, id: terminalRawId, observedAt: "2026-07-17T12:00:06.000Z" }),
+    });
+  const terminalEnvelope = canonicalMetadataEnvelope(terminalRawId, "2026-07-17T12:00:06.000Z");
+  outboxInsert.run({
+    id: terminalRawId,
+    rawRowid: Number(terminalRaw.lastInsertRowid),
+    envelope: terminalEnvelope,
+    bytes: Buffer.byteLength(terminalEnvelope),
+    at: "2026-07-17T12:00:06.000Z",
   });
   legacyBuffer.database
     .prepare(
-      `insert into upload_outbox
-       (delivery_id,raw_rowid,base_envelope_json,base_bytes,sealed_envelope_json,sealed_bytes,
-        state,attempt_count,next_attempt_at,last_failure_class,created_at,updated_at)
-       values (@id,null,@envelope,@bytes,@envelope,@bytes,
-        'pending',0,@at,'none',@at,@at)`,
+      `insert into upload_receipts
+       (delivery_id,terminal_state,reason,status_class,attempt_count,created_at,terminal_at)
+       values (?,'dead','local_evidence_quarantined','local_validation',0,?,?)`,
     )
-    .run({
-      id: sealedEvidenceId,
-      envelope: sealedEvidenceEnvelope,
-      bytes: Buffer.byteLength(sealedEvidenceEnvelope),
-      at: "2026-07-17T12:00:00.500Z",
-    });
+    .run(terminalRawId, "2026-07-17T12:00:06.000Z", "2026-07-17T12:00:06.500Z");
   const migration = legacyBuffer.delivery.migrateLegacy();
   const legacyUploadBodies: string[] = [];
   const legacyUpload = await uploadBufferedEvents(metadataConfig, legacyBuffer, {
@@ -451,10 +525,51 @@ async function main() {
   const quarantineReceipt = legacyBuffer.database
     .prepare(`select reason from upload_receipts where delivery_id = ?`)
     .get(evidenceEvent.id) as { reason: string } | undefined;
-  const sealedQuarantineReceipt = legacyBuffer.database
-    .prepare(`select reason from upload_receipts where delivery_id = ?`)
-    .get(sealedEvidenceId) as { reason: string } | undefined;
+  const staleReceipts = staleEnvelopeIds.map(
+    (id) => legacyBuffer.database
+      .prepare(`select reason from upload_receipts where delivery_id = ?`)
+      .get(id) as { reason: string } | undefined,
+  );
+  const lineageReceipts = [nullRawId, deletedRawId, terminalRawId].map(
+    (id) => legacyBuffer.database
+      .prepare(`select reason from upload_receipts where delivery_id = ?`)
+      .get(id) as { reason: string } | undefined,
+  );
+  const activeInvalidRows = (
+    legacyBuffer.database.prepare(
+      `select count(*) as n from upload_outbox where delivery_id in (${[
+        ...staleEnvelopeIds,
+        nullRawId,
+        deletedRawId,
+        terminalRawId,
+      ].map(() => "?").join(",")})`,
+    ).get(...staleEnvelopeIds, nullRawId, deletedRawId, terminalRawId) as { n: number }
+  ).n;
   const deliveryStatus = legacyBuffer.delivery.status();
+  legacyBuffer.close();
+  legacyBuffer = new LocalEventBuffer(legacyLedger, {
+    delivery: { enabled: true, limits: metadataConfig.delivery },
+  });
+  const reopenUploadBodies: string[] = [];
+  const reopenUpload = await uploadBufferedEvents(metadataConfig, legacyBuffer, {
+    fetchImpl: async (_input, init) => {
+      reopenUploadBodies.push(String(init?.body ?? ""));
+      return new Response(JSON.stringify({ accepted: 1 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  const reopenedInvalidRows = (
+    legacyBuffer.database.prepare(
+      `select count(*) as n from upload_outbox where delivery_id in (${[
+        ...staleEnvelopeIds,
+        nullRawId,
+        deletedRawId,
+        terminalRawId,
+      ].map(() => "?").join(",")})`,
+    ).get(...staleEnvelopeIds, nullRawId, deletedRawId, terminalRawId) as { n: number }
+  ).n;
   legacyBuffer.close();
 
   const historyBodies: string[] = [];
@@ -482,8 +597,15 @@ async function main() {
       legacyUpload.uploadedEvents === 1 &&
       evidenceRow.uploadedAt === null &&
       quarantineReceipt?.reason === "local_evidence_quarantined" &&
-      sealedQuarantineReceipt?.reason === "local_evidence_quarantined" &&
-      history.audit.skipped.local_evidence_quarantine_migration_required === 1 &&
+      staleReceipts.every((receipt) => receipt?.reason === "local_evidence_quarantined") &&
+      lineageReceipts[0]?.reason === "local_privacy_violation" &&
+      lineageReceipts[1]?.reason === "local_privacy_violation" &&
+      lineageReceipts[2]?.reason === "local_evidence_quarantined" &&
+      activeInvalidRows === 0 &&
+      reopenUpload.uploadedEvents === 0 &&
+      reopenUploadBodies.length === 0 &&
+      reopenedInvalidRows === 0 &&
+      history.audit.skipped.local_evidence_quarantine_migration_required === 2 &&
       history.sentEvents === 1 &&
       legacyOutboundSurfaces.every((surface) => !hasPrivateTerm(surface)) &&
       deliveryStatus.privacy.legacyEvidenceDisposition ===
@@ -491,9 +613,136 @@ async function main() {
       deliveryStatus.work.rawRowsScanned === 0,
     {
       quarantined: migration.quarantinedEvidence,
+      staleEnvelopeReceipts: staleReceipts.map((receipt) => receipt?.reason ?? null),
+      lineageReceipts: lineageReceipts.map((receipt) => receipt?.reason ?? null),
+      activeInvalidRows,
+      reopenedInvalidRows,
+      reopenUploadCalls: reopenUploadBodies.length,
       uploadedMetadataRows: legacyUpload.uploadedEvents,
       historySkipped: history.audit.skipped.local_evidence_quarantine_migration_required ?? 0,
       readinessRawScans: deliveryStatus.work.rawRowsScanned,
+    },
+  );
+
+  const raceHome = path.join(root, "race-home");
+  fs.mkdirSync(raceHome, { recursive: true, mode: 0o700 });
+  const raceLedger = path.join(raceHome, "work-ledger.sqlite");
+  let raceBuffer = new LocalEventBuffer(raceLedger, {
+    delivery: { enabled: true, limits: metadataConfig.delivery },
+  });
+  const beforeRemoteRace = aiInteractionEventSchema.parse({
+    ...safeEvent,
+    id: "11711711-1111-4111-8111-111111111125",
+    observedAt: "2026-07-17T12:00:07.000Z",
+    metadata: { admission: "before-remote-race" },
+  });
+  raceBuffer.append(beforeRemoteRace);
+  let beforeRemoteMutated = false;
+  const beforeRemoteBodies: string[] = [];
+  const beforeRemoteUpload = await uploadBufferedEvents(metadataConfig, raceBuffer, {
+    beforeRemote: () => {
+      if (beforeRemoteMutated) return;
+      beforeRemoteMutated = true;
+      raceBuffer.database
+        .prepare(`update buffered_events set data_mode = 'evidence', payload_json = ? where id = ?`)
+        .run(
+          JSON.stringify({
+            ...beforeRemoteRace,
+            dataMode: "evidence",
+            metadata: { prompt: fixture.sentinels.prompt },
+          }),
+          beforeRemoteRace.id,
+        );
+    },
+    fetchImpl: async (_input, init) => {
+      beforeRemoteBodies.push(String(init?.body ?? ""));
+      return new Response(JSON.stringify({ accepted: 1 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+
+  const afterRemoteRace = aiInteractionEventSchema.parse({
+    ...safeEvent,
+    id: "11711711-1111-4111-8111-111111111126",
+    observedAt: "2026-07-17T12:00:08.000Z",
+    metadata: { admission: "after-remote-race" },
+  });
+  raceBuffer.append(afterRemoteRace);
+  let afterRemoteMutated = false;
+  const afterRemoteBodies: string[] = [];
+  const afterRemoteUpload = await uploadBufferedEvents(metadataConfig, raceBuffer, {
+    afterRemote: () => {
+      if (afterRemoteMutated) return;
+      afterRemoteMutated = true;
+      raceBuffer.database
+        .prepare(`update buffered_events set data_mode = 'evidence', payload_json = ? where id = ?`)
+        .run(
+          JSON.stringify({
+            ...afterRemoteRace,
+            dataMode: "evidence",
+            metadata: { prompt: fixture.sentinels.response },
+          }),
+          afterRemoteRace.id,
+        );
+    },
+    fetchImpl: async (_input, init) => {
+      afterRemoteBodies.push(String(init?.body ?? ""));
+      return new Response(JSON.stringify({ accepted: 1 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  const raceRows = raceBuffer.database
+    .prepare(`select id, uploaded_at as uploadedAt from buffered_events order by id`)
+    .all() as Array<{ id: string; uploadedAt: string | null }>;
+  const raceReceipts = raceBuffer.database
+    .prepare(`select delivery_id as deliveryId, reason from upload_receipts order by delivery_id`)
+    .all() as Array<{ deliveryId: string; reason: string }>;
+  raceBuffer.close();
+  raceBuffer = new LocalEventBuffer(raceLedger, {
+    delivery: { enabled: true, limits: metadataConfig.delivery },
+  });
+  const raceReopenBodies: string[] = [];
+  const raceReopenUpload = await uploadBufferedEvents(metadataConfig, raceBuffer, {
+    fetchImpl: async (_input, init) => {
+      raceReopenBodies.push(String(init?.body ?? ""));
+      return new Response(JSON.stringify({ accepted: 1 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  const raceActive = (
+    raceBuffer.database.prepare(`select count(*) as n from upload_outbox`).get() as { n: number }
+  ).n;
+  raceBuffer.close();
+  record(
+    "lease_export_ack_races_and_reopen_remain_terminal_and_local",
+    beforeRemoteMutated &&
+      beforeRemoteBodies.length === 0 &&
+      beforeRemoteUpload.uploadedEvents === 0 &&
+      afterRemoteMutated &&
+      afterRemoteBodies.length === 1 &&
+      afterRemoteBodies.every((body) => !hasPrivateTerm(body)) &&
+      afterRemoteUpload.uploadedEvents === 0 &&
+      afterRemoteUpload.markedUploaded === 0 &&
+      raceRows.every((row) => row.uploadedAt === null) &&
+      raceReceipts.length === 2 &&
+      raceReceipts.every((receipt) => receipt.reason === "local_evidence_quarantined") &&
+      !hasPrivateTerm(JSON.stringify(raceReceipts)) &&
+      raceReopenUpload.uploadedEvents === 0 &&
+      raceReopenBodies.length === 0 &&
+      raceActive === 0,
+    {
+      beforeRemoteCalls: beforeRemoteBodies.length,
+      afterRemoteCalls: afterRemoteBodies.length,
+      reopenedCalls: raceReopenBodies.length,
+      uploadedMarkers: raceRows.filter((row) => row.uploadedAt !== null).length,
+      terminalReceipts: raceReceipts.length,
+      activeAfterReopen: raceActive,
     },
   );
 
@@ -520,7 +769,7 @@ async function main() {
     node: process.version,
     passed: checks.every((check) => check.passed),
     checks,
-    measurements: { durationMs, tempBytes, tempHomes: 8 },
+    measurements: { durationMs, tempBytes, tempHomes: 9 },
   };
   fs.mkdirSync(path.dirname(receiptPath), { recursive: true });
   fs.writeFileSync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`);

@@ -36,6 +36,7 @@ export function buildIngestBatch(
   buffer: LocalEventBuffer,
   options: { limit?: number; maxBytes?: number; appVersion?: string } = {},
 ): { batch: AiWorkIngestBatch | null; rows: BufferedEventRow[] } {
+  buffer.useWorkspace(config.tenantId);
   const candidateRows = buffer.listUnuploaded({
     maxRows: options.limit ?? 500,
     maxBytes: options.maxBytes,
@@ -300,6 +301,8 @@ export type UploadOptions = {
   now?: () => Date;
   leaseId?: string;
   maxProbes?: number;
+  /** Test-only race seam before authoritative lease revalidation and HTTP. */
+  beforeRemote?: () => void;
   /** Test-only crash seam after HTTP effects but before local acknowledgement. */
   afterRemote?: () => void;
   /** Test-only crash seam after a sibling acknowledgement is durable but before poison settlement. */
@@ -312,6 +315,7 @@ export async function uploadBufferedEvents(
   options: UploadOptions = {},
 ) {
   assertCollectorPrivacyMode(config, "upload");
+  buffer.useWorkspace(config.tenantId);
   if (options.markUploaded === false) return uploadStateless(config, buffer, options);
   const url = options.url ?? config.uploadUrl;
   if (!url) throw new Error("No upload URL configured. Pass --url or set uploadUrl in collector.config.json.");
@@ -437,7 +441,16 @@ export async function uploadBufferedEvents(
   const queue: LeasedDeliveryItem[][] = [lease.items];
 
   while (queue.length > 0 && probes < maxProbes && !fatal) {
-    const group = queue.shift()!;
+    const leasedGroup = queue.shift()!;
+    options.beforeRemote?.();
+    const revalidated = buffer.delivery.revalidateLeaseItems(
+      lease.leaseId,
+      leasedGroup,
+      nowFn(),
+    );
+    locallyDead += revalidated.locallyDead;
+    if (revalidated.items.length === 0) continue;
+    const group = revalidated.items;
     probes += 1;
     for (const item of group) attemptedActive.add(item.deliveryId);
     const result = await postItems({
@@ -570,6 +583,11 @@ export async function uploadBufferedEvents(
       ? { contractHash, item: [...succeeded.values()][0] }
       : undefined,
   );
+  locallyDead += acknowledged.locallyDead;
+  const acknowledgedIds = new Set(acknowledged.acknowledgedIds);
+  for (const id of succeeded.keys()) {
+    if (!acknowledgedIds.has(id)) succeeded.delete(id);
+  }
   if (acknowledged.acknowledged > 0 && validationSingletons.size > 0) {
     options.afterSiblingAcknowledgement?.();
   }

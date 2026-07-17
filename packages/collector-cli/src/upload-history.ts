@@ -736,6 +736,20 @@ export async function runWorkspaceHistoryUpload(
      order by rowid asc
      limit ?`,
   );
+  const hasUploadReceipts = Boolean(
+    ledger.prepare(
+      `select 1 as present from sqlite_master
+       where type = 'table' and name = 'upload_receipts' limit 1`,
+    ).get(),
+  );
+  const evidenceQuarantineReceipt = hasUploadReceipts
+    ? ledger.prepare(
+        `select 1 as quarantined
+         from upload_receipts
+         where delivery_id = ? and reason = 'local_evidence_quarantined'
+         limit 1`,
+      )
+    : null;
 
   type CarryItem = {
     envelope: HistoryEnvelope;
@@ -885,6 +899,13 @@ export async function runWorkspaceHistoryUpload(
 
     for (const row of rows) {
       scannedRows += 1;
+      if (evidenceQuarantineReceipt?.get(ensureUuidEventId(row.id).id)) {
+        skipQueue.push({
+          rowid: row.rowid,
+          reason: "local_evidence_quarantine_migration_required",
+        });
+        continue;
+      }
       const normalized = normalizeHistoryEvent(row);
       if (!normalized.ok) {
         skipQueue.push({ rowid: row.rowid, reason: normalized.reason });
