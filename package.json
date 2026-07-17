@@ -21,6 +21,7 @@
     "proof:resource": "tsx scripts/resource-proof/index.ts",
     "proof:resource-finalization": "tsx scripts/resource-proof/finalization-proof.ts",
     "proof:dashboard": "tsx scripts/dashboard-projection-proof.ts",
+    "proof:join-isolation": "tsx scripts/join-isolation-proof.ts",
     "proof:outbox": "tsx scripts/outbox-proof.ts",
     "report": "tsx scripts/efficiency-report.ts",
     "backfill": "tsx scripts/backfill-v1-archive.ts"

@@ -101,7 +101,9 @@ Commands:
   stop                  Stop the foreground daemon using the local PID file
 
 Config tools:
-  join "<join-url>#<token>" | join <token> --url <cloud-base-url>   (env: PLIMSOLL_CLOUD_URL)
+  join "<join-url>#<token>" | join --token-stdin --url <cloud-base-url>
+      Prefer --token-stdin (or join -) so the single-use secret never enters
+      shell history or process arguments. Workspace URL env: PLIMSOLL_CLOUD_URL.
   generate-config claude-code|codex|all [--evidence --confirm-evidence]
   upload [--url URL --limit 500] [--ingest-key KEY] [--signing-secret SECRET] [--no-mark] [--max-batches 20]
   upload-history [--dry-run] [--full] [--until ISO] [--limit N] [--batch-size 500] [--concurrency 1..8] [--delay-ms 250] [--url URL]
@@ -222,6 +224,70 @@ function collectorPidRecord(runtimeIdentity: CollectorRuntimeIdentity): Collecto
 async function main() {
   if (command === "help" || command === "--help" || command === "-h") {
     printHelp();
+    return;
+  }
+
+  if (command === "join") {
+    // Join runs before ordinary config loading because loadCollectorConfig()
+    // creates a default file. A refused/failed join must leave even a missing
+    // active config untouched.
+    const targetArgument = process.argv[3];
+    const tokenFromStdin = flag("--token-stdin") || targetArgument === "-";
+    if (
+      tokenFromStdin &&
+      targetArgument &&
+      !targetArgument.startsWith("--") &&
+      targetArgument !== "-"
+    ) {
+      throw new Error("Choose either a positional join token/URL or --token-stdin, not both.");
+    }
+    const target = tokenFromStdin ? (await readStdin()).trim() : targetArgument;
+    if (!target || (!tokenFromStdin && target.startsWith("--"))) {
+      throw new Error(
+        'Usage: plimsoll join --token-stdin --url <cloud-base-url>  |  plimsoll join "<join-url>#<token>"',
+      );
+    }
+    const result = await performJoin({
+      target,
+      baseUrl: optionValue("--url") ?? process.env.PLIMSOLL_CLOUD_URL,
+    });
+    if (!result.joined) {
+      console.error(
+        JSON.stringify(
+          {
+            status: "join_refused",
+            reason: result.reason,
+            httpStatus: result.httpStatus,
+            message: result.message,
+            configTouched: result.configTouched,
+          },
+          null,
+          2,
+        ),
+      );
+      process.exitCode = 1;
+      return;
+    }
+    console.log(
+      JSON.stringify(
+        {
+          status: "joined",
+          configPath: result.configPath,
+          tenantId: result.tenantId,
+          installCredentialsConfigured: true,
+          uploadUrl: result.uploadUrl,
+          uploadSigningConfigured: result.uploadSigningConfigured,
+          syncConfigured: true,
+          handshake: result.handshake,
+          nextSteps: [
+            "plimsoll status   # syncConfigured: true; existing history was not part of the handshake",
+            "restart a running collector (or: plimsoll install-launch-agent && plimsoll load-launch-agent) so the daemon picks up sync",
+          ],
+        },
+        null,
+        2,
+      ),
+    );
     return;
   }
 
@@ -577,61 +643,6 @@ async function main() {
       ),
     );
     buffer.close();
-    return;
-  }
-
-  if (command === "join") {
-    // Fleet join (issue 0016): one command from installed to syncing. The
-    // config is only written when the server accepts the token; refusals
-    // leave it untouched and say exactly why.
-    const target = process.argv[3];
-    if (!target || target.startsWith("--")) {
-      throw new Error(
-        'Usage: plimsoll join "<join-url>#<token>"  |  plimsoll join <token> --url <cloud-base-url>',
-      );
-    }
-    const result = await performJoin({
-      target,
-      baseUrl: optionValue("--url") ?? process.env.PLIMSOLL_CLOUD_URL,
-    });
-    if (!result.joined) {
-      console.error(
-        JSON.stringify(
-          {
-            status: "join_refused",
-            reason: result.reason,
-            httpStatus: result.httpStatus,
-            message: result.message,
-            configTouched: result.configTouched,
-          },
-          null,
-          2,
-        ),
-      );
-      process.exitCode = 1;
-      return;
-    }
-    console.log(
-      JSON.stringify(
-        {
-          status: "joined",
-          configPath: result.configPath,
-          tenantId: result.tenantId,
-          // The full key lives only in collector.config.json (mode 0600).
-          installKey: `${result.installKey.slice(0, 8)}…`,
-          uploadUrl: result.uploadUrl,
-          uploadSigningConfigured: result.uploadSigningConfigured,
-          syncConfigured: true,
-          handshake: result.handshake,
-          nextSteps: [
-            "plimsoll status   # syncConfigured: true, with the handshake already drained",
-            "restart a running collector (or: plimsoll install-launch-agent && plimsoll load-launch-agent) so the daemon picks up sync",
-          ],
-        },
-        null,
-        2,
-      ),
-    );
     return;
   }
 
