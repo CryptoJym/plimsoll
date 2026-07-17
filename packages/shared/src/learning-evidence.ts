@@ -402,6 +402,24 @@ export function computeLearningSourceFingerprint(manifest: LearningEvidenceManif
 
 function validateLearningEvidenceHeader(manifest: LearningEvidenceManifest): void {
   assertObject(manifest, "manifest");
+  assertExactKeys(
+    manifest,
+    [
+      "schemaVersion",
+      "analysisVersion",
+      "analysisId",
+      "source",
+      "metricVersions",
+      "window",
+      "asOf",
+      "techniqueId",
+      "hypothesisFamily",
+      "gates",
+      "declaredConfounders",
+      "pairs",
+    ],
+    "manifest",
+  );
   if (manifest.schemaVersion !== LEARNING_EVIDENCE_SCHEMA_VERSION) {
     throw new Error(`Unsupported learning evidence schema version: ${String(manifest.schemaVersion)}`);
   }
@@ -410,6 +428,11 @@ function validateLearningEvidenceHeader(manifest: LearningEvidenceManifest): voi
   }
   assertCanonicalIdentity(manifest.analysisId, "analysisId");
   assertObject(manifest.source, "source");
+  assertExactKeys(
+    manifest.source,
+    ["snapshotId", "queryHash", "rowDigest", "declaredPairCount", "sourceKind"],
+    "source",
+  );
   assertCanonicalIdentity(manifest.source.snapshotId, "source.snapshotId");
   assertHash(manifest.source.queryHash, "source.queryHash");
   assertHash(manifest.source.rowDigest, "source.rowDigest");
@@ -429,6 +452,7 @@ function validateLearningEvidenceHeader(manifest: LearningEvidenceManifest): voi
   assertVersion(manifest.metricVersions.projectAllocation, "metricVersions.projectAllocation");
 
   assertObject(manifest.window, "window");
+  assertExactKeys(manifest.window, ["startInclusive", "endExclusive"], "window");
   const startMs = parseInstant(manifest.window.startInclusive, "window.startInclusive");
   const endMs = parseInstant(manifest.window.endExclusive, "window.endExclusive");
   const asOfMs = parseInstant(manifest.asOf, "asOf");
@@ -437,6 +461,19 @@ function validateLearningEvidenceHeader(manifest: LearningEvidenceManifest): voi
   assertCanonicalIdentity(manifest.techniqueId, "techniqueId");
 
   assertObject(manifest.hypothesisFamily, "hypothesisFamily");
+  assertExactKeys(
+    manifest.hypothesisFamily,
+    [
+      "familyId",
+      "hypothesisIndex",
+      "hypothesesTested",
+      "selectionPolicy",
+      "correction",
+      "familyWiseAlpha",
+      "registeredAt",
+    ],
+    "hypothesisFamily",
+  );
   assertCanonicalIdentity(manifest.hypothesisFamily.familyId, "hypothesisFamily.familyId");
   assertSafeIntegerInRange(manifest.hypothesisFamily.hypothesesTested, 1, 10_000, "hypothesisFamily.hypothesesTested");
   assertSafeIntegerInRange(
@@ -497,6 +534,11 @@ function validateExposure(
   field: string,
 ): void {
   assertObject(observation.exposure, `${field}.exposure`);
+  assertExactKeys(
+    observation.exposure,
+    ["state", "techniqueId", "evidenceSource", "contentOrigin", "recordedAt"],
+    `${field}.exposure`,
+  );
   assertOneOf(observation.exposure.state, ["exposed", "control"] as const, `${field}.exposure.state`);
   if (observation.exposure.state !== expectedState) {
     throw new Error(`${field} must carry an explicit ${expectedState} exposure record`);
@@ -534,6 +576,11 @@ function validateObservation(
   observationIds: Set<string>,
 ): void {
   assertObject(observation, field);
+  assertExactKeys(
+    observation,
+    ["observationId", "workStartedAt", "outcomeObservedAt", "cohort", "exposure", "outcome", "attribution"],
+    field,
+  );
   assertCanonicalIdentity(observation.observationId, `${field}.observationId`);
   if (observationIds.has(observation.observationId)) {
     throw new Error(`duplicate observation id: ${observation.observationId}`);
@@ -557,6 +604,11 @@ function validateObservation(
   for (const key of COHORT_KEYS) assertCanonicalIdentity(observation.cohort[key], `${field}.cohort.${key}`);
 
   assertObject(observation.outcome, `${field}.outcome`);
+  assertExactKeys(
+    observation.outcome,
+    ["metricId", "metricVersion", "unit", "direction", "value"],
+    `${field}.outcome`,
+  );
   assertCanonicalIdentity(observation.outcome.metricId, `${field}.outcome.metricId`);
   assertVersion(observation.outcome.metricVersion, `${field}.outcome.metricVersion`);
   if (observation.outcome.metricVersion !== manifest.metricVersions.outcomeMetric) {
@@ -571,6 +623,11 @@ function validateObservation(
   }
 
   assertObject(observation.attribution, `${field}.attribution`);
+  assertExactKeys(
+    observation.attribution,
+    ["method", "projectAllocation", "coverage"],
+    `${field}.attribution`,
+  );
   assertOneOf(
     observation.attribution.method,
     ["direct", "deterministic_linkage", "inferred", "none"] as const,
@@ -621,6 +678,7 @@ export function validateLearningEvidenceManifest(manifest: LearningEvidenceManif
   for (const [index, pair] of manifest.pairs.entries()) {
     const field = `pairs[${index}]`;
     assertObject(pair, field);
+    assertExactKeys(pair, ["pairId", "exposed", "control"], field);
     assertCanonicalIdentity(pair.pairId, `${field}.pairId`);
     if (pairIds.has(pair.pairId)) throw new Error(`duplicate pair id: ${pair.pairId}`);
     pairIds.add(pair.pairId);

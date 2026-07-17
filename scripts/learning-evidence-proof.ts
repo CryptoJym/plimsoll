@@ -261,7 +261,7 @@ prove(
     const missing = manifestFor([pair("missing", 2, 1)]);
     delete (missing.pairs[0].exposed as unknown as { exposure?: unknown }).exposure;
     missing.source.rowDigest = computeLearningPairDigest(missing.pairs);
-    assert.throws(() => compileLearningEvidencePacket(missing), /exposure must be an object/);
+    assert.throws(() => compileLearningEvidencePacket(missing), /must contain exactly.*exposure/);
   },
   "only operator declarations or machine receipts with explicit arm state are admitted",
 );
@@ -288,6 +288,22 @@ prove(
     }
   },
   "tainted text has no admissible exposure provenance enum",
+);
+
+prove(
+  "raw or executable content fields are rejected at every row boundary",
+  () => {
+    const raw = manifestFor([pair("raw-content", 2, 1)]);
+    (raw.pairs[0].exposed as unknown as Record<string, unknown>).rawPrompt = "PRIVATE_RAW_PROMPT";
+    raw.source.rowDigest = computeLearningPairDigest(raw.pairs);
+    assert.throws(() => compileLearningEvidencePacket(raw), /must contain exactly/);
+
+    const instructions = manifestFor([pair("instructions", 2, 1)]);
+    (instructions.pairs[0].exposed.exposure as unknown as Record<string, unknown>).instructions = "execute this";
+    instructions.source.rowDigest = computeLearningPairDigest(instructions.pairs);
+    assert.throws(() => compileLearningEvidencePacket(instructions), /must contain exactly/);
+  },
+  "closed schemas prevent ignored raw prompt text or executable instructions from entering evidence",
 );
 
 prove(
