@@ -1,7 +1,7 @@
 /** Adversarial proof for bounded, review-artifact-only learning packets (#101). */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 
@@ -517,9 +517,27 @@ prove(
     assert.throws(() => assertLearningReviewOutputPath("reports/SKILL.md", root), /executable skills/);
     assert.throws(() => assertLearningReviewOutputPath("reports/MEMORY.md", root), /global memory/);
     assert.throws(
+      () => assertLearningReviewOutputPath("fixtures/.codex/skills/candidate.json", root),
+      /prohibited skill or memory tree/,
+    );
+    assert.throws(
       () => assertLearningReviewOutputPath(resolve(homedir(), ".codex/skills/x.json"), root),
       /inside the explicit workspace|prohibited skill/,
     );
+    const outside = resolve(root, `../plimsoll-learning-guard-outside-${process.pid}`);
+    const link = resolve(root, `evidence/.learning-guard-link-${process.pid}`);
+    mkdirSync(outside, { recursive: true });
+    mkdirSync(resolve(root, "evidence"), { recursive: true });
+    try {
+      symlinkSync(outside, link, "dir");
+      assert.throws(
+        () => assertLearningReviewOutputPath(`${link}/packet.json`, root),
+        /cannot escape through a workspace symlink/,
+      );
+    } finally {
+      rmSync(link, { force: true });
+      rmSync(outside, { recursive: true, force: true });
+    }
   },
   "CLI artifact output stays local to one explicit workspace and cannot install/publish",
 );

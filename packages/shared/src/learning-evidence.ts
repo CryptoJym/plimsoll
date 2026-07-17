@@ -6,8 +6,9 @@
  * model, rank people, recommend a technique, or write/install a skill.
  */
 import { createHash } from "node:crypto";
+import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
-import { isAbsolute, relative, resolve, sep } from "node:path";
+import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 export const LEARNING_EVIDENCE_SCHEMA_VERSION = "1.0.0" as const;
 export const LEARNING_ANALYSIS_VERSION = "1.0.0" as const;
@@ -964,7 +965,7 @@ export function compileLearningEvidencePacket(
 export function assertLearningReviewOutputPath(outputPath: string, workspaceRoot = process.cwd()): string {
   if (!outputPath || outputPath.includes("\0")) throw new Error("output path must be a non-empty local path");
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(outputPath)) throw new Error("network/URL output targets are forbidden");
-  const root = resolve(workspaceRoot);
+  const root = realpathSync(resolve(workspaceRoot));
   const resolved = resolve(root, outputPath);
   const relativePath = relative(root, resolved);
   if (relativePath === "" || relativePath === ".." || relativePath.startsWith(`..${sep}`) || isAbsolute(relativePath)) {
@@ -973,6 +974,36 @@ export function assertLearningReviewOutputPath(outputPath: string, workspaceRoot
   const base = resolved.split(sep).at(-1)?.toLowerCase();
   if (base === "skill.md" || base === "memory.md") {
     throw new Error("learning evidence output cannot target executable skills or global memory");
+  }
+  const lowerResolved = resolved.toLowerCase();
+  const forbiddenSegments = [
+    `${sep}.codex${sep}skills${sep}`,
+    `${sep}.claude${sep}skills${sep}`,
+    `${sep}.agents${sep}skills${sep}`,
+    `${sep}.codex${sep}memories${sep}`,
+    `${sep}.claude${sep}memory${sep}`,
+  ];
+  if (forbiddenSegments.some((segment) => `${lowerResolved}${sep}`.includes(segment))) {
+    throw new Error("learning evidence output targets a prohibited skill or memory tree");
+  }
+
+  // Resolve the nearest existing parent so a workspace-local directory
+  // symlink cannot redirect the artifact into a skill, memory, mount, or
+  // other path outside the explicit workspace.
+  let existingParent = dirname(resolved);
+  while (!existsSync(existingParent)) {
+    const parent = dirname(existingParent);
+    if (parent === existingParent) throw new Error("learning evidence output has no existing local ancestor");
+    existingParent = parent;
+  }
+  const realParent = realpathSync(existingParent);
+  const realParentRelative = relative(root, realParent);
+  if (
+    realParentRelative === ".." ||
+    realParentRelative.startsWith(`..${sep}`) ||
+    isAbsolute(realParentRelative)
+  ) {
+    throw new Error("learning evidence output cannot escape through a workspace symlink");
   }
   const home = resolve(homedir());
   const prohibited = [
