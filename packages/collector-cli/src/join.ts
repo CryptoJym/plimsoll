@@ -1,11 +1,14 @@
+import fs from "node:fs";
 import os from "node:os";
 
 import { z } from "zod";
 
 import { LocalEventBuffer } from "./buffer";
 import {
+  assertCollectorPrivacyMode,
   collectorBufferPath,
   collectorConfigPath,
+  collectorConfigSchema,
   loadCollectorConfig,
   saveCollectorConfig,
 } from "./config";
@@ -111,6 +114,14 @@ export async function performJoin(options: {
   const homeDir = options.homeDir ?? os.homedir();
   const appVersion = options.appVersion ?? "0.1.0";
 
+  // Fail before token redemption or config writes. A join turns this install
+  // into a managed/upload-enabled collector, so only metadata mode is valid.
+  const configPath = collectorConfigPath(homeDir);
+  const currentConfig = fs.existsSync(configPath)
+    ? collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")))
+    : collectorConfigSchema.parse({});
+  assertCollectorPrivacyMode(currentConfig, "join", { willEnableUpload: true });
+
   const response = await fetchImpl(new URL(CLOUD_JOIN_PATH, baseUrl), {
     method: "POST",
     headers: { "content-type": "application/json" },
@@ -145,6 +156,7 @@ export async function performJoin(options: {
     {
       ...loadCollectorConfig(homeDir),
       installKey: grant.installKey,
+      managed: true,
       tenantId: grant.tenantId,
       uploadUrl: grant.uploadUrl,
       ...(grant.uploadSigningSecret ? { uploadSigningSecret: grant.uploadSigningSecret } : {}),

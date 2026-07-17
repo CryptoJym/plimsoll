@@ -7,10 +7,12 @@ import readline from "node:readline/promises";
 
 import { LocalEventBuffer } from "./buffer";
 import {
+  assertCollectorPrivacyMode,
   collectorHome,
   collectorBufferPath,
   collectorConfigPath,
   collectorLogPath,
+  collectorPrivacyReadiness,
   ensureCollectorHome,
   loadCollectorConfig,
   type CollectorConfig,
@@ -102,7 +104,7 @@ Commands:
 
 Config tools:
   join "<join-url>#<token>" | join <token> --url <cloud-base-url>   (env: PLIMSOLL_CLOUD_URL)
-  generate-config claude-code|codex|all [--evidence --confirm-evidence]
+  generate-config claude-code|codex|all   (metadata-only; encrypted evidence vault not implemented)
   upload [--url URL --limit 500] [--ingest-key KEY] [--signing-secret SECRET] [--no-mark] [--max-batches 20]
   upload-history [--dry-run] [--full] [--until ISO] [--limit N] [--batch-size 500] [--concurrency 1..8] [--delay-ms 250] [--url URL]
       Default resumes from the local watermark (workspace-backfill-state.json) and scopes
@@ -228,6 +230,9 @@ async function main() {
   const configPath = collectorConfigPath();
   const configExistedBeforeLoad = fs.existsSync(configPath);
   const config = loadCollectorConfig();
+  assertCollectorPrivacyMode(config, command, {
+    willEnableUpload: command === "join" || Boolean(optionValue("--url")),
+  });
 
   if (command === "start") {
     const pidPath = collectorLogPath("collector.pid");
@@ -517,7 +522,8 @@ async function main() {
       console.log(
         JSON.stringify({
           status: "active",
-          mode: config.policy.dataMode,
+          mode: "metadata_only",
+          dataMode: config.policy.dataMode,
           port: config.port,
           pid: process.pid,
           pidPath,
@@ -532,6 +538,7 @@ async function main() {
             metrics: `http://127.0.0.1:${config.port}/v1/metrics`,
           },
           privacy: {
+            ...collectorPrivacyReadiness(config),
             screenshots: false,
             keystrokes: false,
             clipboardBody: false,
@@ -559,6 +566,8 @@ async function main() {
           pidPath: collectorLogPath("collector.pid"),
           port: config.port,
           dataMode: config.policy.dataMode,
+          privacyMode: "metadata_only",
+          privacy: collectorPrivacyReadiness(config),
           retentionDays: config.retentionDays,
           syncConfigured: Boolean(config.uploadUrl),
           reconciliation: codexReconciliationStatus(buffer.database),
@@ -622,6 +631,7 @@ async function main() {
           uploadUrl: result.uploadUrl,
           uploadSigningConfigured: result.uploadSigningConfigured,
           syncConfigured: true,
+          privacyMode: "metadata_only",
           handshake: result.handshake,
           nextSteps: [
             "plimsoll status   # syncConfigured: true, with the handshake already drained",
@@ -689,6 +699,7 @@ async function main() {
       JSON.stringify(
         {
           status: "setup_applied",
+          privacyMode: "metadata_only",
           claude: { path: resultClaude.path, changed: resultClaude.changed, backup: resultClaude.backupPath ?? null },
           codex: { path: resultCodex.path, changed: resultCodex.changed, backup: resultCodex.backupPath ?? null, conflict: resultCodex.conflict ?? null },
           nextSteps: [
@@ -757,6 +768,8 @@ async function main() {
             },
           },
           dataMode: config.policy.dataMode,
+          privacyMode: "metadata_only",
+          privacy: collectorPrivacyReadiness(config),
           retentionDays: config.retentionDays,
           syncConfigured: Boolean(config.uploadUrl),
           uploadSigningConfigured: Boolean(config.uploadSigningSecret),

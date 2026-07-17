@@ -48,6 +48,14 @@ hashed at capture; human-readable labels (repo names, account emails) live
 in local-only tables and are **structurally excluded from uploads** — a rule
 enforced by the proof suite that runs on every PR.
 
+Managed or upload-enabled collectors support `metadata_only` mode. Raw
+evidence mode is rejected before setup, join, config write, or collector
+start; it is never silently downgraded. Legacy `evidence` rows are held in a
+local quarantine and never uploaded. They require an explicit future
+migration; the collector does not inspect, migrate, or delete them
+automatically. The separately reviewed encrypted evidence vault is not
+implemented.
+
 The full privacy posture, capture format, and proof checks are open and
 inspectable: **https://github.com/CryptoJym/plimsoll**
 

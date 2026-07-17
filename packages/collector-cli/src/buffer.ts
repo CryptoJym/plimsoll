@@ -310,6 +310,11 @@ export class LocalEventBuffer {
   }
 
   private appendInCurrentTransaction(event: AiInteractionEvent, suppressedFields: string[] = []) {
+    if (event.dataMode === "evidence") {
+      throw new Error(
+        "Raw evidence rows cannot be appended to the ordinary ledger; the encrypted evidence vault is not implemented.",
+      );
+    }
     const createdAt = new Date().toISOString();
     const canonicalSuppressedFields = canonicalizeSuppressionReceipts(suppressedFields);
     const result = this.db
@@ -353,6 +358,7 @@ export class LocalEventBuffer {
       this.delivery.enqueueRaw({
         rawRowid: Number(result.lastInsertRowid),
         rawId: event.id,
+        dataMode: event.dataMode,
         createdAt,
         uploadedAt: null,
         payloadJson: JSON.stringify(event),
@@ -639,6 +645,7 @@ export class LocalEventBuffer {
           suppressed_fields_json as suppressedFieldsJson, created_at as createdAt,
           uploaded_at as uploadedAt, repo_hash as repoHash, branch_hash as branchHash
         from buffered_events
+        where data_mode <> 'evidence'
         order by created_at desc
         limit ?`,
       )
@@ -658,7 +665,7 @@ export class LocalEventBuffer {
           uploaded_at as uploadedAt, repo_hash as repoHash, branch_hash as branchHash,
           length(cast(payload_json as blob)) as payloadBytes
         from buffered_events
-        where uploaded_at is null
+        where uploaded_at is null and data_mode <> 'evidence'
         order by created_at asc
         limit ?`,
       )

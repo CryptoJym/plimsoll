@@ -24,6 +24,7 @@
     "proof:dashboard": "tsx scripts/dashboard-projection-proof.ts",
     "proof:outbox": "tsx scripts/outbox-proof.ts",
     "proof:http-boundary": "tsx scripts/local-http-boundary-proof.ts",
+    "proof:privacy-mode": "tsx scripts/privacy-mode-proof.ts",
     "report": "tsx scripts/efficiency-report.ts",
     "backfill": "tsx scripts/backfill-v1-archive.ts"
   },

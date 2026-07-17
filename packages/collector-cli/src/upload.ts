@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 
 import type { BufferedEventRow, LocalEventBuffer } from "./buffer";
-import type { CollectorConfig } from "./config";
+import { assertCollectorPrivacyMode, type CollectorConfig } from "./config";
 import type { LeasedDeliveryItem, DeliveryFailureClass } from "./outbox";
 import {
   aiWorkIngestBatchSchema,
@@ -311,6 +311,7 @@ export async function uploadBufferedEvents(
   buffer: LocalEventBuffer,
   options: UploadOptions = {},
 ) {
+  assertCollectorPrivacyMode(config, "upload");
   if (options.markUploaded === false) return uploadStateless(config, buffer, options);
   const url = options.url ?? config.uploadUrl;
   if (!url) throw new Error("No upload URL configured. Pass --url or set uploadUrl in collector.config.json.");

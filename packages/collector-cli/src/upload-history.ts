@@ -4,7 +4,11 @@ import fs from "node:fs";
 import Database from "better-sqlite3";
 
 import type { CollectorConfig } from "./config";
-import { collectorBufferPath, collectorLogPath } from "./config";
+import {
+  assertCollectorPrivacyMode,
+  collectorBufferPath,
+  collectorLogPath,
+} from "./config";
 import { deterministicEventId } from "./normalizer";
 import { canonicalLinkage, hasUnsafeOutboundString, sealOutboundEnvelope } from "./outbound-envelope";
 import {
@@ -67,6 +71,7 @@ export type LedgerHistoryRow = {
   rowid: number;
   id: string;
   createdAt: string;
+  dataMode?: string;
   payloadJson: string;
   suppressedFieldsJson: string;
   /** Per-event repo linkage columns (issue 0008 stitching) — forwarded as
@@ -75,7 +80,11 @@ export type LedgerHistoryRow = {
   branchHash?: string | null;
 };
 
-export type HistorySkipReason = "payload_unparseable" | "schema_invalid" | "forbidden_content";
+export type HistorySkipReason =
+  | "payload_unparseable"
+  | "schema_invalid"
+  | "forbidden_content"
+  | "local_evidence_quarantine_migration_required";
 
 export type HistoryEnvelope = {
   event: AiWorkIngestEvent["event"];
@@ -100,9 +109,17 @@ export type NormalizedHistoryEvent =
 export function normalizeHistoryEvent(row: {
   payloadJson: string;
   suppressedFieldsJson: string;
+  dataMode?: string;
   repoHash?: string | null;
   branchHash?: string | null;
 }): NormalizedHistoryEvent {
+  if (row.dataMode === "evidence") {
+    return {
+      ok: false,
+      reason: "local_evidence_quarantine_migration_required",
+      detail: "evidence-marked row excluded without reading its payload",
+    };
+  }
   let payload: unknown;
   try {
     payload = JSON.parse(row.payloadJson);
@@ -119,6 +136,13 @@ export function normalizeHistoryEvent(row: {
   }
 
   const candidate: Record<string, unknown> = { ...(payload as Record<string, unknown>) };
+  if (candidate.dataMode === "evidence") {
+    return {
+      ok: false,
+      reason: "local_evidence_quarantine_migration_required",
+      detail: "evidence-marked row excluded from the ordinary upload path",
+    };
+  }
   for (const key of Object.keys(candidate)) {
     if (candidate[key] === null) delete candidate[key];
   }
@@ -611,6 +635,9 @@ export async function runWorkspaceHistoryUpload(
   config: CollectorConfig,
   options: WorkspaceHistoryUploadOptions = {},
 ): Promise<WorkspaceHistoryUploadResult> {
+  assertCollectorPrivacyMode(config, "upload-history", {
+    willEnableUpload: Boolean(options.url),
+  });
   const log = options.log ?? ((line: string) => console.log(line));
   const sleep = options.sleep ?? defaultSleep;
   const fetchImpl = options.fetchImpl ?? fetch;
@@ -700,7 +727,8 @@ export async function runWorkspaceHistoryUpload(
   );
 
   const page = ledger.prepare(
-    `select rowid as rowid, id, created_at as createdAt, payload_json as payloadJson,
+    `select rowid as rowid, id, created_at as createdAt, data_mode as dataMode,
+       payload_json as payloadJson,
        suppressed_fields_json as suppressedFieldsJson,
        repo_hash as repoHash, branch_hash as branchHash
      from buffered_events
@@ -1064,6 +1092,9 @@ export async function runAttributionRepair(
     pageSize?: number;
   } = {},
 ): Promise<AttributionRepairResult> {
+  assertCollectorPrivacyMode(config, "attribution repair", {
+    willEnableUpload: Boolean(options.url),
+  });
   const log = options.log ?? ((line: string) => console.log(line));
   const sleep = options.sleep ?? defaultSleep;
   const fetchImpl = options.fetchImpl ?? fetch;
@@ -1108,7 +1139,8 @@ export async function runAttributionRepair(
   const overview = ledger
     .prepare(
       `select count(*) as n, count(distinct repo_hash) as repos
-       from buffered_events where repo_hash is not null and created_at <= ?`,
+       from buffered_events
+       where repo_hash is not null and data_mode <> 'evidence' and created_at <= ?`,
     )
     .get(until) as { n: number; repos: number };
 
@@ -1128,7 +1160,8 @@ export async function runAttributionRepair(
   const page = ledger.prepare(
     `select rowid as rowid, id, repo_hash as repoHash
      from buffered_events
-     where repo_hash is not null and created_at <= ? and rowid > ?
+     where repo_hash is not null and data_mode <> 'evidence'
+       and created_at <= ? and rowid > ?
      order by rowid asc
      limit ?`,
   );
