@@ -119,6 +119,7 @@ async function main() {
     "pnpm proof",
     "pnpm proof:metric-truth",
     "pnpm proof:outbox",
+    "pnpm proof:join-isolation",
     "pnpm proof:resource --require-integrated --receipt evidence/resource-proof.json",
     "pnpm proof:resource-finalization",
   ];
@@ -222,6 +223,15 @@ exit 0
     { dryHome, dryPlimsoll, dryTarget },
   );
   check("source_installer_dry_run_invokes_no_external_commands", !fs.existsSync(commandLog), commandLog);
+  check(
+    "source_installer_node_22_dry_run_is_zero_mutation",
+    dryRun.code === 0 &&
+      !fs.existsSync(dryHome) &&
+      !fs.existsSync(dryPlimsoll) &&
+      !fs.existsSync(dryTarget) &&
+      !fs.existsSync(commandLog),
+    { code: dryRun.code, dryHome, dryPlimsoll, dryTarget, commandLog },
+  );
 
   const installHome = path.join(sandbox, "install-home");
   const installPlimsoll = path.join(sandbox, "install-plimsoll");
@@ -248,34 +258,47 @@ exit 0
     installCommands,
   );
 
-  const unsupportedBin = path.join(sandbox, "unsupported-bin");
-  fs.mkdirSync(unsupportedBin);
-  writeExecutable(
-    path.join(unsupportedBin, "node"),
-    `#!/bin/sh
+  for (const major of [19, 25]) {
+    const unsupportedBin = path.join(sandbox, `unsupported-bin-${major}`);
+    const unsupportedHome = path.join(sandbox, `unsupported-home-${major}`);
+    const unsupportedPlimsoll = path.join(sandbox, `unsupported-plimsoll-${major}`);
+    const unsupportedTarget = path.join(sandbox, `unsupported-target-${major}`);
+    const unsupportedCommandLog = path.join(sandbox, `unsupported-commands-${major}.log`);
+    fs.mkdirSync(unsupportedBin);
+    writeExecutable(
+      path.join(unsupportedBin, "node"),
+      `#!/bin/sh
 case "$2" in
-  *Number*) echo 25 ;;
-  *) echo 25.0.0 ;;
+  *Number*) echo ${major} ;;
+  *) echo ${major}.0.0 ;;
 esac
 `,
-  );
-  fs.symlinkSync(path.join(stubBin, "git"), path.join(unsupportedBin, "git"));
-  fs.symlinkSync(path.join(stubBin, "pnpm"), path.join(unsupportedBin, "pnpm"));
-  const unsupported = await command("/bin/bash", [installScript, "--dry-run"], {
-    cwd: neutralCwd,
-    env: {
-      ...commonEnv,
-      HOME: path.join(sandbox, "unsupported-home"),
-      PATH: `${unsupportedBin}:/usr/bin:/bin`,
-      PLIMSOLL_HOME: path.join(sandbox, "unsupported-plimsoll"),
-      PLIMSOLL_DIR: path.join(sandbox, "unsupported-target"),
-    },
-  });
-  check(
-    "source_installer_rejects_node_25",
-    unsupported.code !== 0 && unsupported.stderr.includes("requires >=20 <25"),
-    unsupported,
-  );
+    );
+    fs.symlinkSync(path.join(stubBin, "git"), path.join(unsupportedBin, "git"));
+    fs.symlinkSync(path.join(stubBin, "pnpm"), path.join(unsupportedBin, "pnpm"));
+    const unsupported = await command("/bin/bash", [installScript, "--dry-run"], {
+      cwd: neutralCwd,
+      env: {
+        ...commonEnv,
+        HOME: unsupportedHome,
+        PATH: `${unsupportedBin}:/usr/bin:/bin`,
+        PLIMSOLL_COMMAND_LOG: unsupportedCommandLog,
+        PLIMSOLL_HOME: unsupportedPlimsoll,
+        PLIMSOLL_DIR: unsupportedTarget,
+      },
+    });
+    check(
+      `source_installer_rejects_node_${major}_without_mutation`,
+      unsupported.code !== 0 &&
+        unsupported.stderr.includes(`Unsupported Node ${major}.0.0`) &&
+        unsupported.stderr.includes("requires >=20 <25") &&
+        !fs.existsSync(unsupportedHome) &&
+        !fs.existsSync(unsupportedPlimsoll) &&
+        !fs.existsSync(unsupportedTarget) &&
+        !fs.existsSync(unsupportedCommandLog),
+      { ...unsupported, unsupportedHome, unsupportedPlimsoll, unsupportedTarget, unsupportedCommandLog },
+    );
+  }
 
   const blankHome = path.join(sandbox, "blank-home");
   const blankPlimsoll = path.join(sandbox, "blank-plimsoll");
