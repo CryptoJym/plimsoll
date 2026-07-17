@@ -48,7 +48,7 @@ Evidence states are `verified`, `partial`, `inferred`, `blocked`, and `excluded`
 
 ## Fail-closed rules
 
-- Identity strings are accepted only in canonical trimmed NFC form. Analysis, delivery, project, attempt, revision, supersession, technique, and event-kind identifiers with leading/trailing whitespace or Unicode aliases are rejected before grouping, uniqueness checks, or lineage comparisons.
+- Identity strings are accepted only when they are already equal to their trimmed NFKC form and match the bounded ASCII grammar `^[A-Za-z0-9](?:[A-Za-z0-9._:@/-]{0,126}[A-Za-z0-9])?$` (1–128 characters). Analysis, delivery, metric, project, attempt, revision, supersession, technique, and event-kind identifiers reject whitespace, NFC/NFD non-ASCII text, fullwidth forms, ligatures, circled forms, and other compatibility aliases before grouping, uniqueness checks, or lineage comparisons. Inputs are never silently folded into a different external identity.
 - Check attempts require canonical attempt and revision ids, unique attempt ids and sequences, an increasing sequence, and a linear `supersedesAttemptId` chain. This is the deterministic check lineage; repeated canonical revision ids remain visible and do not close a correction.
 - Check success requires `checks.evidenceState = verified`, an explicit `passed` observation, and unambiguous lineage. `none`, `unknown`, or conflicting states at the same timestamp make the outcome incomplete. A visible pass on an incomplete page does not count.
 - A correction closes only when the final passing attempt follows the failed attempt through the lineage and carries a different revision id.

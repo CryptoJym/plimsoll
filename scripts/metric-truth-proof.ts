@@ -699,6 +699,36 @@ prove(
 );
 
 prove(
+  "project allocation ids cannot alias through compatibility characters",
+  () => {
+    const compatibilityAllocation = delivery("compatibility-allocation", {
+      project: {
+        id: null,
+        allocation: {
+          kind: "apportioned",
+          shares: [
+            { projectId: "project-a", fraction: 0.5 },
+            { projectId: "ｐｒｏｊｅｃｔ－ａ", fraction: 0.5 },
+          ],
+        },
+        attributionMethod: "deterministic_linkage",
+        evidenceState: "verified",
+      },
+    });
+    assert.throws(
+      () =>
+        validateMetricAnalysisManifest({
+          ...manifest,
+          analysisId: "compatibility-allocation",
+          deliveries: [compatibilityAllocation],
+        }),
+      /projectId must use canonical identity form/,
+    );
+  },
+  "fullwidth project-a is rejected rather than treated as a second allocation identity",
+);
+
+prove(
   "revision ids cannot fake a correction through whitespace",
   () => {
     const aliasedRevision = delivery("aliased-revision", {
@@ -728,6 +758,207 @@ prove(
     );
   },
   "revision-a followed by whitespace-wrapped revision-a is rejected rather than counted as a new revision",
+);
+
+prove(
+  "revision ids cannot fake a correction through compatibility characters",
+  () => {
+    const compatibilityRevision = delivery("compatibility-revision", {
+      checks: {
+        attempts: [
+          attempt("compatibility-attempt-1", "revision-a", 1, "2026-06-01T01:00:00.000Z", "failed"),
+          attempt(
+            "compatibility-attempt-2",
+            "ｒｅｖｉｓｉｏｎ－ａ",
+            2,
+            "2026-06-02T01:00:00.000Z",
+            "passed",
+            "compatibility-attempt-1",
+          ),
+        ],
+        evidenceState: "verified",
+      },
+    });
+    assert.throws(
+      () =>
+        validateMetricAnalysisManifest({
+          ...manifest,
+          analysisId: "compatibility-revision",
+          deliveries: [compatibilityRevision],
+        }),
+      /revisionId must use canonical identity form/,
+    );
+  },
+  "fullwidth revision-a is rejected rather than counted as a changed revision",
+);
+
+prove(
+  "every external identity boundary enforces NFKC and bounded ASCII grammar",
+  () => {
+    const aliases = [
+      { name: "whitespace", value: " id-a " },
+      { name: "nfd", value: "cafe\u0301" },
+      { name: "nfc", value: "caf\u00e9" },
+      { name: "fullwidth", value: "ｉｄ－ａ" },
+      { name: "ligature", value: "proﬁle" },
+      { name: "circled", value: "id①" },
+      { name: "embedded-space", value: "id a" },
+      { name: "overlong", value: "a".repeat(129) },
+    ] as const;
+
+    const manifestFor = (
+      analysisId: string,
+      deliveriesForBoundary: readonly LearningDelivery[],
+      metricIds: readonly MetricId[] = ["first_pass_yield"],
+    ): MetricAnalysisManifest => ({
+      ...manifest,
+      analysisId,
+      metricIds,
+      deliveries: deliveriesForBoundary,
+    });
+
+    const boundaries: readonly { name: string; run: (value: string) => void }[] = [
+      {
+        name: "analysis-id",
+        run: (value) => validateMetricAnalysisManifest(manifestFor(value, [])),
+      },
+      {
+        name: "delivery-id",
+        run: (value) =>
+          validateMetricAnalysisManifest(manifestFor("boundary-delivery", [delivery(value)])),
+      },
+      {
+        name: "singular-project-id",
+        run: (value) =>
+          validateMetricAnalysisManifest(
+            manifestFor("boundary-project-id", [
+              delivery("boundary-project-id", {
+                project: {
+                  ...exactProject("project-boundary"),
+                  id: value,
+                },
+              }),
+            ]),
+          ),
+      },
+      {
+        name: "project-share-id",
+        run: (value) =>
+          validateMetricAnalysisManifest(
+            manifestFor("boundary-project-share", [
+              delivery("boundary-project-share", {
+                project: {
+                  ...exactProject("project-boundary"),
+                  allocation: { kind: "exact", shares: [{ projectId: value, fraction: 1 }] },
+                },
+              }),
+            ]),
+          ),
+      },
+      {
+        name: "attempt-id",
+        run: (value) =>
+          validateMetricAnalysisManifest(
+            manifestFor("boundary-attempt", [
+              delivery("boundary-attempt", {
+                checks: {
+                  attempts: [attempt(value, "revision-boundary", 1, "2026-06-01T01:00:00.000Z", "passed")],
+                  evidenceState: "verified",
+                },
+              }),
+            ]),
+          ),
+      },
+      {
+        name: "revision-id",
+        run: (value) =>
+          validateMetricAnalysisManifest(
+            manifestFor("boundary-revision", [
+              delivery("boundary-revision", {
+                checks: {
+                  attempts: [attempt("attempt-boundary", value, 1, "2026-06-01T01:00:00.000Z", "passed")],
+                  evidenceState: "verified",
+                },
+              }),
+            ]),
+          ),
+      },
+      {
+        name: "supersession-id",
+        run: (value) =>
+          validateMetricAnalysisManifest(
+            manifestFor("boundary-supersession", [
+              delivery("boundary-supersession", {
+                checks: {
+                  attempts: [
+                    attempt("attempt-boundary-1", "revision-boundary-1", 1, "2026-06-01T01:00:00.000Z", "failed"),
+                    attempt("attempt-boundary-2", "revision-boundary-2", 2, "2026-06-02T01:00:00.000Z", "passed", value),
+                  ],
+                  evidenceState: "verified",
+                },
+              }),
+            ]),
+          ),
+      },
+      {
+        name: "technique-id",
+        run: (value) =>
+          validateMetricAnalysisManifest(
+            manifestFor("boundary-technique", [
+              delivery("boundary-technique", {
+                techniques: {
+                  ids: [value],
+                  attributionMethod: "declared_exposure",
+                  evidenceState: "verified",
+                },
+              }),
+            ]),
+          ),
+      },
+      {
+        name: "event-kind",
+        run: (value) =>
+          validateMetricAnalysisManifest(
+            manifestFor("boundary-event", [
+              delivery("boundary-event", {
+                rework: {
+                  events: [{ at: "2026-06-02T00:00:00.000Z", kind: value }],
+                  evidenceState: "verified",
+                },
+              }),
+            ]),
+          ),
+      },
+      {
+        name: "manifest-metric-id",
+        run: (value) =>
+          validateMetricAnalysisManifest(
+            manifestFor("boundary-manifest-metric", [], [value as MetricId]),
+          ),
+      },
+      {
+        name: "persisted-metric-id",
+        run: (value) =>
+          assertComparableMetricResults(results[0], { ...results[0], metricId: value }),
+      },
+      {
+        name: "persisted-definition-version",
+        run: (value) =>
+          assertComparableMetricResults(results[0], { ...results[0], definitionVersion: value }),
+      },
+    ];
+
+    for (const boundary of boundaries) {
+      for (const alias of aliases) {
+        assert.throws(
+          () => boundary.run(alias.value),
+          /canonical identity form|bounded ASCII identity grammar/,
+          `${boundary.name} accepted ${alias.name}`,
+        );
+      }
+    }
+  },
+  "12 boundaries reject whitespace, NFD, NFC non-ASCII, fullwidth, ligature, circled, embedded-space, and overlong identities",
 );
 
 prove(

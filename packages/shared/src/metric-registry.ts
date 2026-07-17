@@ -9,6 +9,12 @@
 export const ANALYSIS_MANIFEST_VERSION = "1.0.0" as const;
 export const METRIC_DEFINITION_VERSION = "1.0.0" as const;
 
+/** Stable external identifier policy: already-NFKC, bounded, and ASCII only. */
+export const METRIC_IDENTITY_MAX_LENGTH = 128 as const;
+export const METRIC_IDENTITY_PATTERN =
+  "^[A-Za-z0-9](?:[A-Za-z0-9._:@/-]{0,126}[A-Za-z0-9])?$" as const;
+const METRIC_IDENTITY_REGEX = new RegExp(METRIC_IDENTITY_PATTERN);
+
 export const EVIDENCE_STATES = [
   "verified",
   "partial",
@@ -431,12 +437,19 @@ function assertAttributionMethod(value: unknown, field: string): asserts value i
   assertOneOf(value, ATTRIBUTION_METHODS, field);
 }
 
-/** Reject identity aliases instead of silently grouping or comparing them. */
+/** Reject identity aliases instead of silently folding, grouping, or comparing them. */
 function assertCanonicalIdentity(value: unknown, field: string): asserts value is string {
   if (typeof value !== "string") throw new Error(`${field} must be a string identity`);
-  const canonical = value.trim().normalize("NFC");
+  const canonical = value.trim().normalize("NFKC");
   if (!canonical) throw new Error(`${field} must not be empty`);
-  if (value !== canonical) throw new Error(`${field} must use canonical identity form`);
+  if (value !== canonical) {
+    throw new Error(`${field} must use canonical identity form (already trimmed NFKC)`);
+  }
+  if (value.length > METRIC_IDENTITY_MAX_LENGTH || !METRIC_IDENTITY_REGEX.test(value)) {
+    throw new Error(
+      `${field} must match the bounded ASCII identity grammar ${METRIC_IDENTITY_PATTERN}`,
+    );
+  }
 }
 
 export function validateMetricAnalysisManifest(manifest: MetricAnalysisManifest): void {
@@ -451,7 +464,8 @@ export function validateMetricAnalysisManifest(manifest: MetricAnalysisManifest)
   if (new Set(manifest.metricIds).size !== manifest.metricIds.length) {
     throw new Error("metricIds must not contain duplicates");
   }
-  for (const metricId of manifest.metricIds) {
+  for (const [index, metricId] of manifest.metricIds.entries()) {
+    assertCanonicalIdentity(metricId, `metricIds[${index}]`);
     if (!METRIC_IDS.includes(metricId)) throw new Error(`Unknown metric id: ${metricId}`);
   }
   const startMs = parseInstant(manifest.window.startInclusive, "window.startInclusive");
@@ -705,6 +719,8 @@ export function assertComparableMetricResults(
   left: PersistedMetricIdentity,
   right: PersistedMetricIdentity,
 ): void {
+  assertCanonicalIdentity(left.metricId, "left.metricId");
+  assertCanonicalIdentity(right.metricId, "right.metricId");
   assertOneOf(left.metricId, METRIC_IDS, "left.metricId");
   assertOneOf(right.metricId, METRIC_IDS, "right.metricId");
   if (left.metricId !== right.metricId) {
