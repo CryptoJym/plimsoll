@@ -26,6 +26,9 @@ export type BufferedEventRow = {
    * key the upload paths forward as event.projectKey (issue 0036). */
   repoHash: string | null;
   branchHash: string | null;
+  /** Durable upload audience. Null means legacy/unassigned and is never
+   * eligible once a ledger has an initialized workspace binding. */
+  workspaceId: string | null;
 };
 
 export type BufferStats = {
@@ -72,10 +75,12 @@ const EVENT_COLUMNS = [
   "head_sha text",
   "machine text",
   "account_hash text",
+  "workspace_id text",
 ] as const;
 
 export class LocalEventBuffer {
   private readonly db: Database.Database;
+  private workspaceId: string | null = null;
   readonly delivery: DeliveryOutbox;
   readonly projection: DashboardProjectionStore;
 
@@ -83,6 +88,7 @@ export class LocalEventBuffer {
     path: string,
     options: {
       delivery?: { enabled?: boolean; limits?: Partial<DeliveryLimits> };
+      workspaceId?: string;
     } = {},
   ) {
     this.db = new Database(path);
@@ -159,11 +165,20 @@ export class LocalEventBuffer {
         queued_at text not null,
         updated_at text not null
       );
+      create table if not exists collector_workspace_binding (
+        singleton integer primary key check (singleton = 1),
+        current_workspace_id text not null,
+        previous_workspace_id text,
+        changed_at text not null
+      );
     `);
     this.migrateEventColumns();
     this.delivery = new DeliveryOutbox(this.db, options.delivery);
+    if (options.workspaceId) this.useWorkspace(options.workspaceId);
     this.db.exec(`
       create index if not exists idx_events_upload on buffered_events (uploaded_at, created_at);
+      create index if not exists idx_events_workspace_upload
+        on buffered_events (workspace_id, uploaded_at, created_at);
       create index if not exists idx_events_session on buffered_events (session_id, observed_at);
       create index if not exists idx_events_observed on buffered_events (observed_at);
       create index if not exists idx_events_repo on buffered_events (repo_hash, branch_hash);
@@ -275,6 +290,129 @@ export class LocalEventBuffer {
     this.projection = new DashboardProjectionStore(this.db, { newLedger });
   }
 
+  /**
+   * Select the ledger's upload audience. The first selection migrates legacy
+   * unassigned rows. A later mismatch fails closed: only join's explicit
+   * transition may change an initialized ledger audience.
+   */
+  useWorkspace(workspaceId: string) {
+    const requested = workspaceId.trim();
+    if (!requested) throw new Error("Workspace binding requires a non-empty workspace id.");
+    const run = this.db.transaction(() => {
+      const binding = this.db
+        .prepare(
+          `select current_workspace_id as currentWorkspaceId,
+             previous_workspace_id as previousWorkspaceId
+           from collector_workspace_binding where singleton = 1`,
+        )
+        .get() as
+        | { currentWorkspaceId: string; previousWorkspaceId: string | null }
+        | undefined;
+      if (binding && binding.currentWorkspaceId !== requested) {
+        throw new Error(
+          `Ledger workspace binding mismatch: active=${binding.currentWorkspaceId}, requested=${requested}. ` +
+            "Use the transactional join/reassign flow; refusing to relabel queued rows.",
+        );
+      }
+      if (!binding) {
+        const now = new Date().toISOString();
+        this.db
+          .prepare(
+            `insert into collector_workspace_binding
+              (singleton, current_workspace_id, previous_workspace_id, changed_at)
+             values (1, @workspaceId, null, @now)`,
+          )
+          .run({ workspaceId: requested, now });
+        this.db
+          .prepare(`update buffered_events set workspace_id = ? where workspace_id is null`)
+          .run(requested);
+        this.delivery.bindUnassignedWorkspace(requested);
+      } else if (binding.previousWorkspaceId === null) {
+        // Pre-reassignment compatibility: direct/older producers in the same
+        // continuous workspace may still append unassigned rows. Once any
+        // transition has occurred, null stays quarantined forever.
+        this.db
+          .prepare(`update buffered_events set workspace_id = ? where workspace_id is null`)
+          .run(requested);
+        this.delivery.bindUnassignedWorkspace(requested);
+      }
+    });
+    run();
+    this.workspaceId = requested;
+    this.delivery.setWorkspace(requested);
+    return requested;
+  }
+
+  /**
+   * Transactional reassignment boundary inside the ledger. Existing and
+   * legacy-unassigned rows stay bound to `fromWorkspaceId`; only subsequent
+   * appends are labeled for `toWorkspaceId`.
+   */
+  transitionWorkspace(fromWorkspaceId: string, toWorkspaceId: string) {
+    const from = fromWorkspaceId.trim();
+    const to = toWorkspaceId.trim();
+    if (!from || !to) throw new Error("Workspace transition requires non-empty ids.");
+    if (from === to) {
+      this.useWorkspace(to);
+      return { fromWorkspaceId: from, toWorkspaceId: to, boundLegacyRows: 0 };
+    }
+    let boundLegacyRows = 0;
+    const run = this.db.transaction(() => {
+      const binding = this.db
+        .prepare(
+          `select current_workspace_id as currentWorkspaceId
+           from collector_workspace_binding where singleton = 1`,
+        )
+        .get() as { currentWorkspaceId: string } | undefined;
+      if (!binding) {
+        this.db
+          .prepare(
+            `insert into collector_workspace_binding
+              (singleton, current_workspace_id, previous_workspace_id, changed_at)
+             values (1, @from, null, @now)`,
+          )
+          .run({ from, now: new Date().toISOString() });
+      } else if (binding.currentWorkspaceId !== from) {
+        throw new Error(
+          `Cannot transition ledger from ${from}: it is bound to ${binding.currentWorkspaceId}.`,
+        );
+      }
+      boundLegacyRows += this.db
+        .prepare(`update buffered_events set workspace_id = ? where workspace_id is null`)
+        .run(from).changes;
+      boundLegacyRows += this.delivery.bindUnassignedWorkspace(from);
+      this.db
+        .prepare(
+          `update collector_workspace_binding set
+             previous_workspace_id = current_workspace_id,
+             current_workspace_id = @to,
+             changed_at = @now
+           where singleton = 1`,
+        )
+        .run({ to, now: new Date().toISOString() });
+      // Auth/contract circuits describe the prior workspace endpoint and must
+      // not block the newly authenticated audience after reassignment.
+      this.delivery.clearCircuit();
+    });
+    run();
+    this.workspaceId = to;
+    this.delivery.setWorkspace(to);
+    return { fromWorkspaceId: from, toWorkspaceId: to, boundLegacyRows };
+  }
+
+  workspaceBinding() {
+    const row = this.db
+      .prepare(
+        `select current_workspace_id as currentWorkspaceId,
+           previous_workspace_id as previousWorkspaceId, changed_at as changedAt
+         from collector_workspace_binding where singleton = 1`,
+      )
+      .get() as
+      | { currentWorkspaceId: string; previousWorkspaceId: string | null; changedAt: string }
+      | undefined;
+    return row ?? null;
+  }
+
   private migrateEventColumns() {
     const existing = new Set(
       (this.db.pragma("table_info(buffered_events)") as Array<{ name: string }>).map(
@@ -318,12 +456,12 @@ export class LocalEventBuffer {
           (id, source, event_type, data_mode, observed_at, payload_json, suppressed_fields_json,
            created_at, session_id, action_class, model, input_tokens, output_tokens,
            cache_read_tokens, cache_creation_tokens, cost_usd, uploaded_at, repo_hash, branch_hash, head_sha,
-           machine, account_hash)
+           machine, account_hash, workspace_id)
         values
           (@id, @source, @eventType, @dataMode, @observedAt, @payloadJson, @suppressedFieldsJson,
            @createdAt, @sessionId, @actionClass, @model, @inputTokens, @outputTokens,
            @cacheReadTokens, @cacheCreationTokens, @costUsd, null, @repoHash, @branchHash, @headSha,
-           @machine, @accountHash)`,
+           @machine, @accountHash, @workspaceId)`,
       )
       .run({
         id: event.id,
@@ -347,6 +485,7 @@ export class LocalEventBuffer {
         headSha: gitField(event, "headSha"),
         machine: MACHINE,
         accountHash: event.actorId ?? null,
+        workspaceId: this.workspaceId,
       });
     if (result.changes > 0) {
       this.delivery.noteRawAppend(Number(result.lastInsertRowid));
@@ -359,6 +498,7 @@ export class LocalEventBuffer {
         suppressedFieldsJson: JSON.stringify(canonicalSuppressedFields),
         repoHash: gitField(event, "remoteUrlHash"),
         branchHash: gitField(event, "branchHash"),
+        workspaceId: this.workspaceId,
       });
       if (event.actorId) this.seedAccountLabel(event.actorId);
       // The raw row, privacy-safe fact delta, and delivery envelope share the
@@ -607,6 +747,7 @@ export class LocalEventBuffer {
     uploadedAt: string | null;
     repoHash: string | null;
     branchHash: string | null;
+    workspaceId: string | null;
   }): BufferedEventRow {
     let storedSuppressedFields: unknown;
     try {
@@ -628,6 +769,7 @@ export class LocalEventBuffer {
       uploadedAt: row.uploadedAt ?? null,
       repoHash: row.repoHash ?? null,
       branchHash: row.branchHash ?? null,
+      workspaceId: row.workspaceId ?? null,
     };
   }
 
@@ -637,7 +779,8 @@ export class LocalEventBuffer {
         `select id, source, event_type as eventType, data_mode as dataMode,
           observed_at as observedAt, payload_json as payloadJson,
           suppressed_fields_json as suppressedFieldsJson, created_at as createdAt,
-          uploaded_at as uploadedAt, repo_hash as repoHash, branch_hash as branchHash
+          uploaded_at as uploadedAt, repo_hash as repoHash, branch_hash as branchHash,
+          workspace_id as workspaceId
         from buffered_events
         order by created_at desc
         limit ?`,
@@ -656,13 +799,15 @@ export class LocalEventBuffer {
           observed_at as observedAt, payload_json as payloadJson,
           suppressed_fields_json as suppressedFieldsJson, created_at as createdAt,
           uploaded_at as uploadedAt, repo_hash as repoHash, branch_hash as branchHash,
+          workspace_id as workspaceId,
           length(cast(payload_json as blob)) as payloadBytes
         from buffered_events
         where uploaded_at is null
+          and (? is null or workspace_id = ?)
         order by created_at asc
         limit ?`,
       )
-      .all(maxRows) as Array<
+      .all(this.workspaceId, this.workspaceId, maxRows) as Array<
       Parameters<LocalEventBuffer["rowToBufferedEvent"]>[0] & { payloadBytes: number }
     >;
 

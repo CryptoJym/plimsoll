@@ -37,6 +37,9 @@ jobs:
       - name: Prove suppression receipt capture-to-upload parity
         run: pnpm proof:outbox
 
+      - name: Prove transactional join and workspace isolation
+        run: pnpm proof:join-isolation
+
       - name: Run strict isolated resource proof
         run: pnpm proof:resource --require-integrated --receipt evidence/resource-proof.json
 
