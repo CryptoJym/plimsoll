@@ -36,6 +36,7 @@ export function buildIngestBatch(
   buffer: LocalEventBuffer,
   options: { limit?: number; maxBytes?: number; appVersion?: string } = {},
 ): { batch: AiWorkIngestBatch | null; rows: BufferedEventRow[] } {
+  buffer.useWorkspace(config.tenantId);
   const candidateRows = buffer.listUnuploaded({
     maxRows: options.limit ?? 500,
     maxBytes: options.maxBytes,
@@ -311,6 +312,7 @@ export async function uploadBufferedEvents(
   buffer: LocalEventBuffer,
   options: UploadOptions = {},
 ) {
+  buffer.useWorkspace(config.tenantId);
   if (options.markUploaded === false) return uploadStateless(config, buffer, options);
   const url = options.url ?? config.uploadUrl;
   if (!url) throw new Error("No upload URL configured. Pass --url or set uploadUrl in collector.config.json.");

@@ -29,7 +29,12 @@ import {
   launchctlBootstrapCommand,
   uninstallLaunchAgent,
 } from "./launch-agent";
-import { performJoin } from "./join";
+import {
+  cleanupStaleJoinHandshakeDirectories,
+  finalizeActivatedPendingJoin,
+  performJoin,
+  resumePendingJoin,
+} from "./join";
 import { RolloutTailer } from "./rollout-tailer";
 import { TranscriptTailer } from "./transcript-tailer";
 import {
@@ -108,7 +113,10 @@ Commands:
   stop                  Stop the foreground daemon using the local PID file
 
 Config tools:
-  join "<join-url>#<token>" | join <token> --url <cloud-base-url>   (env: PLIMSOLL_CLOUD_URL)
+  join "<join-url>#<token>" | join --token-stdin --url <cloud-base-url> | join --resume
+      Prefer --token-stdin (or join -) so the single-use secret never enters
+      shell history or process arguments. Workspace URL env: PLIMSOLL_CLOUD_URL.
+      join --dry-run is unsupported and fails before token, network, or local-state mutation.
   generate-config claude-code|codex|all [--evidence --confirm-evidence]
   upload [--url URL --limit 500] [--ingest-key KEY] [--signing-secret SECRET] [--no-mark] [--max-batches 20]
   upload-history [--dry-run] [--full] [--until ISO] [--limit N] [--batch-size 500] [--concurrency 1..8] [--delay-ms 250] [--url URL]
@@ -146,6 +154,7 @@ Config tools:
 function openBuffer(config: CollectorConfig, deliveryOverride = false) {
   ensureCollectorHome();
   return new LocalEventBuffer(collectorBufferPath(), {
+    workspaceId: config.tenantId,
     delivery: {
       enabled: Boolean(config.uploadUrl) || deliveryOverride,
       limits: config.delivery,
@@ -523,6 +532,109 @@ async function main() {
     return;
   }
 
+  if (command === "join") {
+    // Join runs before ordinary config loading because loadCollectorConfig()
+    // creates a default file. A refused/failed join must leave even a missing
+    // active config untouched.
+    if (flag("--dry-run")) {
+      throw new Error(
+        "join --dry-run is unsupported because redeeming a single-use token is not a preview. " +
+          "No token was read, no request was sent, and no local state was changed.",
+      );
+    }
+    const joinArguments = process.argv.slice(3);
+    const targetArgument = joinArguments[0];
+    const resume = targetArgument === "--resume";
+    if (resume && joinArguments.length !== 1) {
+      throw new Error("join --resume does not accept another token or URL.");
+    }
+    const tokenFromStdin = targetArgument === "--token-stdin" || targetArgument === "-";
+    if (!resume && (!targetArgument || (targetArgument.startsWith("--") && !tokenFromStdin))) {
+      throw new Error(
+        'Usage: plimsoll join --token-stdin --url <cloud-base-url>  |  plimsoll join "<join-url>#<token>"  |  plimsoll join --resume',
+      );
+    }
+    let joinBaseUrl: string | undefined;
+    for (let index = 1; !resume && index < joinArguments.length; index += 1) {
+      const argument = joinArguments[index];
+      if (argument === "--token-stdin") {
+        throw new Error("Choose either a positional join token/URL or --token-stdin, not both.");
+      }
+      if (argument !== "--url") {
+        throw new Error(`Unsupported join option or argument: ${argument}`);
+      }
+      if (joinBaseUrl !== undefined) throw new Error("join --url may be provided only once.");
+      const value = joinArguments[index + 1];
+      if (!value || value.startsWith("--")) {
+        throw new Error("join --url requires a URL value.");
+      }
+      joinBaseUrl = value;
+      index += 1;
+    }
+
+    // Only a fully validated, real join/resume may scavenge stale handshake
+    // state. Unsupported preview/options must be observably read-only.
+    cleanupStaleJoinHandshakeDirectories();
+    const result = resume
+      ? await resumePendingJoin()
+      : await (async () => {
+          const target = tokenFromStdin ? (await readStdin()).trim() : targetArgument;
+          if (!target) {
+            throw new Error(
+              'Usage: plimsoll join --token-stdin --url <cloud-base-url>  |  plimsoll join "<join-url>#<token>"  |  plimsoll join --resume',
+            );
+          }
+          return performJoin({
+            target,
+            baseUrl: joinBaseUrl ?? process.env.PLIMSOLL_CLOUD_URL,
+          });
+        })();
+    if (!result.joined) {
+      console.error(
+        JSON.stringify(
+          {
+            status: "join_refused",
+            reason: result.reason,
+            httpStatus: result.httpStatus,
+            message: result.message,
+            configTouched: result.configTouched,
+          },
+          null,
+          2,
+        ),
+      );
+      process.exitCode = 1;
+      return;
+    }
+    console.log(
+      JSON.stringify(
+        {
+          status: "joined",
+          configPath: result.configPath,
+          tenantId: result.tenantId,
+          installCredentialsConfigured: true,
+          uploadUrl: result.uploadUrl,
+          uploadSigningConfigured: result.uploadSigningConfigured,
+          workspaceBoundary: result.workspaceBoundary,
+          syncConfigured: true,
+          handshake: result.handshake,
+          nextSteps: [
+            "plimsoll status   # syncConfigured: true; existing history was not part of the handshake",
+            "restart a running collector (or: plimsoll install-launch-agent && plimsoll load-launch-agent) so the daemon picks up sync",
+          ],
+        },
+        null,
+        2,
+      ),
+    );
+    return;
+  }
+
+  if (command === "start") {
+    cleanupStaleJoinHandshakeDirectories();
+    finalizeActivatedPendingJoin();
+  }
+
   const configRead = command === "doctor" ? readCollectorConfig() : null;
   const configPath = configRead?.path ?? collectorConfigPath();
   const config = configRead?.config ??
@@ -876,61 +988,6 @@ async function main() {
       ),
     );
     buffer.close();
-    return;
-  }
-
-  if (command === "join") {
-    // Fleet join (issue 0016): one command from installed to syncing. The
-    // config is only written when the server accepts the token; refusals
-    // leave it untouched and say exactly why.
-    const target = process.argv[3];
-    if (!target || target.startsWith("--")) {
-      throw new Error(
-        'Usage: plimsoll join "<join-url>#<token>"  |  plimsoll join <token> --url <cloud-base-url>',
-      );
-    }
-    const result = await performJoin({
-      target,
-      baseUrl: optionValue("--url") ?? process.env.PLIMSOLL_CLOUD_URL,
-    });
-    if (!result.joined) {
-      console.error(
-        JSON.stringify(
-          {
-            status: "join_refused",
-            reason: result.reason,
-            httpStatus: result.httpStatus,
-            message: result.message,
-            configTouched: result.configTouched,
-          },
-          null,
-          2,
-        ),
-      );
-      process.exitCode = 1;
-      return;
-    }
-    console.log(
-      JSON.stringify(
-        {
-          status: "joined",
-          configPath: result.configPath,
-          tenantId: result.tenantId,
-          // The full key lives only in collector.config.json (mode 0600).
-          installKey: `${result.installKey.slice(0, 8)}…`,
-          uploadUrl: result.uploadUrl,
-          uploadSigningConfigured: result.uploadSigningConfigured,
-          syncConfigured: true,
-          handshake: result.handshake,
-          nextSteps: [
-            "plimsoll status   # syncConfigured: true, with the handshake already drained",
-            "restart a running collector (or: plimsoll install-launch-agent && plimsoll load-launch-agent) so the daemon picks up sync",
-          ],
-        },
-        null,
-        2,
-      ),
-    );
     return;
   }
 
