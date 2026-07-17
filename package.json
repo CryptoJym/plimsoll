@@ -28,6 +28,7 @@
     "proof:http-boundary": "tsx scripts/local-http-boundary-proof.ts",
     "proof:learning-evidence": "tsx scripts/learning-evidence-proof.ts",
     "learning:evidence": "tsx scripts/learning-evidence-packet.ts",
+    "proof:outcome-timeline": "tsx scripts/outcome-timeline-proof.ts --receipt evidence/outcome-timeline-proof.json",
     "report": "tsx scripts/efficiency-report.ts",
     "backfill": "tsx scripts/backfill-v1-archive.ts"
   },
