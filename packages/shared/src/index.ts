@@ -5,3 +5,4 @@ export * from "./linkage";
 export * from "./pricing";
 export * from "./suppression-receipt";
 export * from "./metric-registry";
+export * from "./learning-evidence";

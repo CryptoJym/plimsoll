@@ -34,6 +34,9 @@ jobs:
       - name: Prove versioned learning-metric truth
         run: pnpm proof:metric-truth
 
+      - name: Prove bounded learning evidence packets
+        run: pnpm proof:learning-evidence
+
       - name: Prove suppression receipt capture-to-upload parity
         run: pnpm proof:outbox
 
