@@ -9,6 +9,7 @@ import {
   METRIC_IDS,
   METRIC_REGISTRY,
   analyzeLearningMetrics,
+  assertComparableMetricResults,
   sumLikeQuantities,
   validateMetricAnalysisManifest,
   type LearningDelivery,
@@ -25,17 +26,54 @@ function prove(name: string, run: () => void, detail: string): void {
   checks.push({ name, detail });
 }
 
+function exactProject(
+  id: string,
+  attributionMethod: "direct" | "deterministic_linkage" = "direct",
+): LearningDelivery["project"] {
+  return {
+    id,
+    allocation: { kind: "exact", shares: [{ projectId: id, fraction: 1 }] },
+    attributionMethod,
+    evidenceState: "verified",
+  };
+}
+
+function unallocatedProject(): LearningDelivery["project"] {
+  return {
+    id: null,
+    allocation: { kind: "unallocated", shares: [] },
+    attributionMethod: "none",
+    evidenceState: "verified",
+  };
+}
+
+function unknownProject(evidenceState: "partial" | "blocked"): LearningDelivery["project"] {
+  return {
+    id: null,
+    allocation: { kind: "unknown", shares: [] },
+    attributionMethod: "none",
+    evidenceState,
+  };
+}
+
+function attempt(
+  attemptId: string,
+  revisionId: string,
+  sequence: number,
+  at: string,
+  state: "passed" | "failed" | "none" | "unknown",
+  supersedesAttemptId: string | null = null,
+): LearningDelivery["checks"]["attempts"][number] {
+  return { attemptId, revisionId, sequence, supersedesAttemptId, at, state };
+}
+
 function delivery(id: string, overrides: Partial<LearningDelivery> = {}): LearningDelivery {
   return {
     id,
     submittedAt: "2026-06-01T00:00:00.000Z",
     mergedAt: null,
     deliveryAttribution: { method: "direct", evidenceState: "verified" },
-    project: {
-      id: "project-default",
-      attributionMethod: "direct",
-      evidenceState: "verified",
-    },
+    project: exactProject("project-default"),
     checks: { attempts: [], evidenceState: "verified" },
     rework: { events: [], evidenceState: "verified" },
     tokensToFirstGreen: {
@@ -45,7 +83,7 @@ function delivery(id: string, overrides: Partial<LearningDelivery> = {}): Learni
       cacheWriteTokens: null,
       evidenceState: "partial",
     },
-    cost: { usd: null, kind: "missing", evidenceState: "verified" },
+    cost: { usd: null, kind: "missing", evidenceState: "partial" },
     techniques: {
       ids: [],
       attributionMethod: "declared_exposure",
@@ -59,9 +97,9 @@ const deliveries: LearningDelivery[] = [
   delivery("a-stable-first-pass", {
     submittedAt: "2026-06-01T00:00:00.000Z",
     mergedAt: "2026-06-02T00:00:00.000Z",
-    project: { id: "project-a", attributionMethod: "direct", evidenceState: "verified" },
+    project: exactProject("project-a"),
     checks: {
-      attempts: [{ at: "2026-06-01T01:00:00.000Z", state: "passed" }],
+      attempts: [attempt("a1", "a-rev-1", 1, "2026-06-01T01:00:00.000Z", "passed")],
       evidenceState: "verified",
     },
     // This is deliberately after both asOf and the 14-day horizon.
@@ -86,11 +124,11 @@ const deliveries: LearningDelivery[] = [
   delivery("b-corrected-reworked", {
     submittedAt: "2026-06-03T00:00:00.000Z",
     mergedAt: "2026-06-05T00:00:00.000Z",
-    project: { id: null, attributionMethod: "none", evidenceState: "verified" },
+    project: unallocatedProject(),
     checks: {
       attempts: [
-        { at: "2026-06-03T01:00:00.000Z", state: "failed" },
-        { at: "2026-06-04T01:00:00.000Z", state: "passed" },
+        attempt("b1", "b-rev-1", 1, "2026-06-03T01:00:00.000Z", "failed"),
+        attempt("b2", "b-rev-2", 2, "2026-06-04T01:00:00.000Z", "passed", "b1"),
       ],
       evidenceState: "verified",
     },
@@ -109,9 +147,9 @@ const deliveries: LearningDelivery[] = [
   delivery("c-young-first-pass", {
     submittedAt: "2026-06-25T00:00:00.000Z",
     mergedAt: "2026-06-26T00:00:00.000Z",
-    project: { id: "project-c", attributionMethod: "deterministic_linkage", evidenceState: "verified" },
+    project: exactProject("project-c", "deterministic_linkage"),
     checks: {
-      attempts: [{ at: "2026-06-25T02:00:00.000Z", state: "passed" }],
+      attempts: [attempt("c1", "c-rev-1", 1, "2026-06-25T02:00:00.000Z", "passed")],
       evidenceState: "verified",
     },
     tokensToFirstGreen: {
@@ -131,10 +169,10 @@ const deliveries: LearningDelivery[] = [
   delivery("d-missing-check-page", {
     submittedAt: "2026-06-06T00:00:00.000Z",
     mergedAt: "2026-06-07T00:00:00.000Z",
-    project: { id: null, attributionMethod: "none", evidenceState: "partial" },
+    project: unknownProject("partial"),
     // A visible pass on an incomplete page must not validate the delivery.
     checks: {
-      attempts: [{ at: "2026-06-06T01:00:00.000Z", state: "passed" }],
+      attempts: [attempt("d1", "d-rev-1", 1, "2026-06-06T01:00:00.000Z", "passed")],
       evidenceState: "partial",
     },
     techniques: { ids: null, attributionMethod: "none", evidenceState: "partial" },
@@ -142,9 +180,9 @@ const deliveries: LearningDelivery[] = [
   delivery("e-no-required-checks", {
     submittedAt: "2026-06-07T00:00:00.000Z",
     mergedAt: "2026-06-08T00:00:00.000Z",
-    project: { id: "project-e", attributionMethod: "direct", evidenceState: "verified" },
+    project: exactProject("project-e"),
     checks: {
-      attempts: [{ at: "2026-06-07T01:00:00.000Z", state: "none" }],
+      attempts: [attempt("e1", "e-rev-1", 1, "2026-06-07T01:00:00.000Z", "none")],
       evidenceState: "verified",
     },
     // Explicitly reported zero is valid; missing cost is what must not become zero.
@@ -152,11 +190,11 @@ const deliveries: LearningDelivery[] = [
   }),
   delivery("f-future-green", {
     submittedAt: "2026-06-09T00:00:00.000Z",
-    project: { id: "project-f", attributionMethod: "deterministic_linkage", evidenceState: "verified" },
+    project: exactProject("project-f", "deterministic_linkage"),
     checks: {
       attempts: [
-        { at: "2026-06-09T01:00:00.000Z", state: "failed" },
-        { at: "2026-07-01T01:00:00.000Z", state: "passed" },
+        attempt("f1", "f-rev-1", 1, "2026-06-09T01:00:00.000Z", "failed"),
+        attempt("f2", "f-rev-2", 2, "2026-07-01T01:00:00.000Z", "passed", "f1"),
       ],
       evidenceState: "verified",
     },
@@ -173,9 +211,9 @@ const deliveries: LearningDelivery[] = [
   delivery("g-unknown-check", {
     submittedAt: "2026-06-10T00:00:00.000Z",
     mergedAt: "2026-06-11T00:00:00.000Z",
-    project: { id: null, attributionMethod: "none", evidenceState: "blocked" },
+    project: unknownProject("blocked"),
     checks: {
-      attempts: [{ at: "2026-06-10T01:00:00.000Z", state: "unknown" }],
+      attempts: [attempt("g1", "g-rev-1", 1, "2026-06-10T01:00:00.000Z", "unknown")],
       evidenceState: "verified",
     },
     techniques: { ids: null, attributionMethod: "none", evidenceState: "blocked" },
@@ -216,10 +254,19 @@ prove(
   () => {
     assert.deepEqual(Object.keys(METRIC_REGISTRY), METRIC_IDS);
     assert.ok(Object.values(METRIC_REGISTRY).every((definition) => definition.definitionVersion === "1.0.0"));
+    assert.ok(Object.values(METRIC_REGISTRY).every((definition) => definition.lifecycleStatus === "experimental"));
+    assert.ok(
+      Object.values(METRIC_REGISTRY).every(
+        (definition) => definition.validationStatus === "adversarial_fixture_validated",
+      ),
+    );
+    assert.equal(METRIC_REGISTRY.mature_stable_delivery.populationEvent, "merged");
+    assert.equal(METRIC_REGISTRY.post_merge_rework.populationEvent, "merged");
+    assert.equal(METRIC_REGISTRY.first_pass_yield.populationEvent, "submitted");
     assert.deepEqual(EVIDENCE_STATES, ["verified", "partial", "inferred", "blocked", "excluded"]);
     assert.deepEqual(CLAIM_CLASSES, ["observed", "suggestive", "associated", "causal", "not_estimable"]);
   },
-  "8 definitions; 5 evidence states; 5 claim classes",
+  "8 versioned definitions with explicit lifecycle, validation, and population event",
 );
 
 prove(
@@ -228,6 +275,9 @@ prove(
     assert.equal(results.length, 8);
     for (const result of results) {
       assert.equal(result.definitionVersion, METRIC_DEFINITION_VERSION);
+      assert.equal(result.lifecycleStatus, "experimental");
+      assert.equal(result.validationStatus, "adversarial_fixture_validated");
+      assert.ok(result.populationEvent === "submitted" || result.populationEvent === "merged");
       assert.deepEqual(result.window, manifest.window);
       assert.equal(result.asOf, manifest.asOf);
       assert.equal(result.numerator.length, result.measures.length);
@@ -236,6 +286,7 @@ prove(
       assert.ok("ratio" in result.coverage);
       assert.ok("horizonDays" in result.maturity);
       assert.ok("methods" in result.attribution);
+      assert.ok("allocationMix" in result.attribution);
       assert.ok(EVIDENCE_STATES.includes(result.evidenceState));
       assert.ok(CLAIM_CLASSES.includes(result.claimClass));
     }
@@ -252,6 +303,18 @@ prove(
     assert.equal(rate.denominator.value, 7);
     assert.equal(allocation.sample.eligibleCount, 7);
     assert.equal(allocation.evidenceState, "partial");
+    assert.deepEqual(allocation.attribution.allocationMix, {
+      exactCount: 4,
+      apportionedCount: 0,
+      unallocatedCount: 1,
+      unknownCount: 2,
+    });
+    assert.deepEqual(allocation.breakdown, [
+      { key: "exact", count: 4 },
+      { key: "apportioned", count: 0 },
+      { key: "unallocated", count: 1 },
+      { key: "unknown", count: 2 },
+    ]);
   },
   "4 explicitly allocated / 7 eligible; partial and blocked allocation remain visible",
 );
@@ -363,8 +426,26 @@ prove(
       ]),
       { value: 5, unit: "cache_read_token", knowledge: "floor" },
     );
+    for (const value of [-1, Number.NaN, Number.POSITIVE_INFINITY]) {
+      assert.throws(
+        () => sumLikeQuantities([{ value, unit: "input_token", knowledge: "known" }]),
+        /non-negative finite/,
+      );
+    }
+    assert.throws(
+      () => sumLikeQuantities([{ value: null, unit: "usd", knowledge: "known" }]),
+      /null value must have unknown knowledge/,
+    );
+    assert.throws(
+      () =>
+        sumLikeQuantities([
+          { value: Number.MAX_VALUE, unit: "usd", knowledge: "known" },
+          { value: Number.MAX_VALUE, unit: "usd", knowledge: "known" },
+        ]),
+      /must remain finite/,
+    );
   },
-  "mixed USD/input and input/output aggregation rejected; like-dimension floor preserved",
+  "mixed units, negative, NaN, Infinity, and dishonest null knowledge rejected",
 );
 
 prove(
@@ -408,7 +489,7 @@ prove(
           submittedAt: "2026-06-28T00:00:00.000Z",
           mergedAt: "2026-06-29T00:00:00.000Z",
           checks: {
-            attempts: [{ at: "2026-06-28T01:00:00.000Z", state: "passed" }],
+            attempts: [attempt("young1", "young-rev-1", 1, "2026-06-28T01:00:00.000Z", "passed")],
             evidenceState: "verified",
           },
         }),
@@ -419,6 +500,254 @@ prove(
     assert.equal(censored.claimClass, "not_estimable");
   },
   "blocked source and all-young cohort both fail closed as not_estimable",
+);
+
+prove(
+  "merge-window metrics use mergedAt for the full cohort",
+  () => {
+    const crossWindow = delivery("submitted-before-window", {
+      submittedAt: "2026-05-31T00:00:00.000Z",
+      mergedAt: "2026-06-01T00:00:00.000Z",
+      checks: {
+        attempts: [attempt("cross1", "cross-rev-1", 1, "2026-05-31T01:00:00.000Z", "passed")],
+        evidenceState: "verified",
+      },
+    });
+    const mergeResults = analyzeLearningMetrics({
+      ...manifest,
+      analysisId: "merge-event-window",
+      metricIds: ["mature_stable_delivery", "post_merge_rework"],
+      deliveries: [crossWindow],
+    });
+    const stable = metric(mergeResults, "mature_stable_delivery");
+    const rework = metric(mergeResults, "post_merge_rework");
+    assert.equal(stable.populationEvent, "merged");
+    assert.equal(stable.sample.eligibleCount, 1);
+    assert.equal(measure(stable, "mature_stable_delivery").numerator.value, 1);
+    assert.equal(measure(stable, "mature_stable_delivery").denominator.value, 1);
+    assert.equal(measure(rework, "post_merge_rework").denominator.value, 1);
+  },
+  "May-submitted/June-merged delivery remains in both June merge-based denominators",
+);
+
+prove(
+  "unknown-only checks remain incomplete and cannot become stable",
+  () => {
+    const unknownOnly = delivery("unknown-only", {
+      mergedAt: "2026-06-02T00:00:00.000Z",
+      checks: {
+        attempts: [attempt("unknown1", "unknown-rev-1", 1, "2026-06-01T01:00:00.000Z", "unknown")],
+        evidenceState: "verified",
+      },
+    });
+    const unknownResults = analyzeLearningMetrics({
+      ...manifest,
+      analysisId: "unknown-only-check",
+      metricIds: ["first_pass_yield", "mature_stable_delivery"],
+      deliveries: [unknownOnly],
+    });
+    for (const [id, key] of [
+      ["first_pass_yield", "first_pass_yield"],
+      ["mature_stable_delivery", "mature_stable_delivery"],
+    ] as const) {
+      const output = metric(unknownResults, id);
+      assert.equal(measure(output, key).numerator.value, 0);
+      assert.equal(measure(output, key).denominator.value, 1);
+      assert.equal(measure(output, key).value.value, null);
+      assert.equal(measure(output, key).value.knowledge, "unknown");
+      assert.equal(output.evidenceState, "partial");
+      assert.equal(output.claimClass, "not_estimable");
+    }
+  },
+  "unknown source outcome emits null/unknown, partial evidence, and not_estimable",
+);
+
+prove(
+  "same-timestamp conflicting checks are conservatively ambiguous",
+  () => {
+    const ambiguous = delivery("same-time-ambiguous", {
+      mergedAt: "2026-06-02T00:00:00.000Z",
+      checks: {
+        attempts: [
+          attempt("amb1", "amb-rev-1", 1, "2026-06-01T01:00:00.000Z", "unknown"),
+          attempt("amb2", "amb-rev-2", 2, "2026-05-31T19:00:00.000-06:00", "passed", "amb1"),
+        ],
+        evidenceState: "verified",
+      },
+    });
+    const output = analyzeLearningMetrics({
+      ...manifest,
+      analysisId: "same-time-conflict",
+      metricIds: ["mature_stable_delivery"],
+      deliveries: [ambiguous],
+    })[0];
+    assert.equal(measure(output, "mature_stable_delivery").numerator.value, 0);
+    assert.equal(measure(output, "mature_stable_delivery").value.value, null);
+    assert.equal(output.sample.unknownCount, 1);
+    assert.equal(output.claimClass, "not_estimable");
+  },
+  "explicit sequence does not launder conflicting observations at the same instant",
+);
+
+prove(
+  "correction closure requires revision and attempt lineage",
+  () => {
+    const sameRevision = delivery("same-revision-correction", {
+      checks: {
+        attempts: [
+          attempt("corr1", "corr-rev-1", 1, "2026-06-01T01:00:00.000Z", "failed"),
+          attempt("corr2", "corr-rev-1", 2, "2026-06-02T01:00:00.000Z", "passed", "corr1"),
+        ],
+        evidenceState: "verified",
+      },
+    });
+    const correction = analyzeLearningMetrics({
+      ...manifest,
+      analysisId: "same-revision-does-not-close",
+      metricIds: ["correction_loop"],
+      deliveries: [sameRevision],
+    })[0];
+    assert.equal(measure(correction, "correction_loop_closure").numerator.value, 0);
+    assert.equal(measure(correction, "correction_loop_closure").denominator.value, 1);
+
+    const brokenLineage = delivery("broken-lineage", {
+      checks: {
+        attempts: [
+          attempt("broken1", "broken-rev-1", 1, "2026-06-01T01:00:00.000Z", "failed"),
+          attempt("broken2", "broken-rev-2", 2, "2026-06-02T01:00:00.000Z", "passed"),
+        ],
+        evidenceState: "verified",
+      },
+    });
+    assert.throws(
+      () => validateMetricAnalysisManifest({ ...manifest, analysisId: "broken-lineage", deliveries: [brokenLineage] }),
+      /check lineage must supersede/,
+    );
+  },
+  "same revision yields 0/1; missing supersession edge is rejected",
+);
+
+prove(
+  "allocation mix carries exact, apportioned, and unallocated states",
+  () => {
+    const apportioned = delivery("apportioned", {
+      project: {
+        id: null,
+        allocation: {
+          kind: "apportioned",
+          shares: [
+            { projectId: "project-one", fraction: 0.4 },
+            { projectId: "project-two", fraction: 0.6 },
+          ],
+        },
+        attributionMethod: "deterministic_linkage",
+        evidenceState: "verified",
+      },
+    });
+    const output = analyzeLearningMetrics({
+      ...manifest,
+      analysisId: "allocation-mix",
+      metricIds: ["project_allocation_coverage"],
+      deliveries: [apportioned, delivery("exact"), delivery("unallocated", { project: unallocatedProject() })],
+    })[0];
+    assert.deepEqual(output.attribution.allocationMix, {
+      exactCount: 1,
+      apportionedCount: 1,
+      unallocatedCount: 1,
+      unknownCount: 0,
+    });
+    assert.equal(measure(output, "allocation_rate").numerator.value, 2);
+    assert.equal(measure(output, "allocation_rate").denominator.value, 3);
+  },
+  "allocation result reports exact=1, apportioned=1, unallocated=1",
+);
+
+prove(
+  "runtime enum validation rejects malformed plain-JS manifests",
+  () => {
+    const base = delivery("bad-enum");
+    const invalidDeliveries = [
+      { ...base, deliveryAttribution: { ...base.deliveryAttribution, evidenceState: "mystery" } },
+      { ...base, deliveryAttribution: { ...base.deliveryAttribution, method: "mystery" } },
+      {
+        ...base,
+        checks: {
+          evidenceState: "verified",
+          attempts: [{ ...attempt("bad1", "bad-rev-1", 1, "2026-06-01T01:00:00.000Z", "passed"), state: "green" }],
+        },
+      },
+      { ...base, cost: { ...base.cost, kind: "mystery" } },
+      { ...base, project: { ...base.project, allocation: { ...base.project.allocation, kind: "mystery" } } },
+    ];
+    for (const [index, invalid] of invalidDeliveries.entries()) {
+      assert.throws(
+        () =>
+          validateMetricAnalysisManifest({
+            ...manifest,
+            analysisId: `invalid-enum-${index}`,
+            deliveries: [invalid],
+          } as unknown as MetricAnalysisManifest),
+        /unsupported value/,
+      );
+    }
+  },
+  "unknown evidence, attribution, check, cost, and allocation values all fail closed",
+);
+
+prove(
+  "verified evidence cannot carry impossible null measures or ids",
+  () => {
+    const base = delivery("verified-null");
+    const invalidDeliveries = [
+      {
+        ...base,
+        tokensToFirstGreen: { ...base.tokensToFirstGreen, evidenceState: "verified" },
+      },
+      {
+        ...base,
+        cost: { usd: null, kind: "missing", evidenceState: "verified" },
+      },
+      {
+        ...base,
+        techniques: { ids: null, attributionMethod: "none", evidenceState: "verified" },
+      },
+      {
+        ...base,
+        project: {
+          id: null,
+          allocation: { kind: "unknown", shares: [] },
+          attributionMethod: "none",
+          evidenceState: "verified",
+        },
+      },
+    ];
+    for (const [index, invalid] of invalidDeliveries.entries()) {
+      assert.throws(() =>
+        validateMetricAnalysisManifest({
+          ...manifest,
+          analysisId: `verified-null-${index}`,
+          deliveries: [invalid],
+        } as MetricAnalysisManifest),
+      );
+    }
+  },
+  "verified null tokens, cost, techniques, and unknown project allocation are rejected",
+);
+
+prove(
+  "persisted metric comparisons require compatible formula versions",
+  () => {
+    assert.doesNotThrow(() => assertComparableMetricResults(results[0], results[0]));
+    assert.throws(
+      () =>
+        assertComparableMetricResults(results[0], {
+          ...results[0],
+          definitionVersion: "0.9.0",
+        }),
+      /incompatible formula versions/,
+    );
+  },
+  "current/current comparison passes; 1.0.0/0.9.0 comparison fails closed",
 );
 
 prove(

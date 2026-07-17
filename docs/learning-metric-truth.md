@@ -9,16 +9,24 @@
 
 Both versions are required in every input. An unknown version fails closed instead of silently changing a formula.
 
+Every registry entry also carries:
+
+- lifecycle status: `experimental`, `active`, or `deprecated`
+- validation status: `unvalidated`, `adversarial_fixture_validated`, `externally_validated`, or `blocked`
+- the population event used for cohort membership: `submitted` or `merged`
+
+Persisted results must pass `assertComparableMetricResults` before comparison. Different or unsupported formula versions, malformed status values, and blocked/unvalidated results fail closed.
+
 ## Registry
 
 | Metric | Numerator | Denominator / censoring |
 | --- | --- | --- |
-| Project allocation coverage | Deliveries with a named project and attribution | All cohort deliveries; unknown allocation remains in the denominator |
+| Project allocation coverage | Deliveries with an exact or apportioned project allocation and attribution | All submitted-cohort deliveries; explicit unallocated and unknown allocation remain in the denominator |
 | First-pass yield | Verified explicit pass on the first required-check observation | All cohort deliveries; `none`, `unknown`, missing pages, and failed fetches cannot pass |
 | Correction loop | Verified first failures that later become green by `asOf` | All verified first failures |
 | Time/tokens to first green | Separate elapsed-time and input/output/cache-read/cache-write sums | A separate known-observation count for every dimension |
-| Mature stable delivery | Mature, check-passing deliveries with complete rework evidence and no rework in the horizon | Only deliveries whose full stability horizon has elapsed |
-| Post-merge rework | Mature deliveries with observed rework in the horizon | All mature deliveries; incomplete evidence makes the rate a floor |
+| Mature stable delivery | Mature, check-passing deliveries with complete rework evidence and no rework in the horizon | Only deliveries merged in the declared window whose full stability horizon has elapsed |
+| Post-merge rework | Mature deliveries with observed rework in the horizon | All deliveries merged in the declared window and mature; incomplete evidence makes the rate a floor |
 | Known-cost coverage | Deliveries with reported or explicitly estimated cost | All cohort deliveries; missing cost is unknown |
 | Technique exposure | Deliveries with one or more attributed technique ids | All cohort deliveries; exposure is descriptive, not an effect estimate |
 
@@ -27,11 +35,12 @@ Both versions are required in every input. An unknown version fails closed inste
 Every metric result names:
 
 - `definitionVersion`, `window`, and `asOf`
+- lifecycle status, validation status, and population event
 - keyed `numerator`, `denominator`, and calculated `measures`
 - `sample` counts: eligible, sampled, excluded, censored, unknown, and exclusion reasons
 - verified/inferred/partial/blocked/excluded source `coverage`
 - configured horizon and mature/censored counts under `maturity`
-- attribution methods and attribution coverage
+- attribution methods, attribution coverage, and exact/apportioned/unallocated/unknown allocation mix
 - evidence state and analytical claim class
 - limitations and any deterministic breakdown rows
 
@@ -39,11 +48,26 @@ Evidence states are `verified`, `partial`, `inferred`, `blocked`, and `excluded`
 
 ## Fail-closed rules
 
-- Check success requires `checks.evidenceState = verified` and an explicit `passed` observation. A visible pass on an incomplete page does not count.
+- Check attempts require unique attempt and revision ids, an increasing sequence, and a linear `supersedesAttemptId` chain. This is the deterministic check lineage.
+- Check success requires `checks.evidenceState = verified`, an explicit `passed` observation, and unambiguous lineage. `none`, `unknown`, or conflicting states at the same timestamp make the outcome incomplete. A visible pass on an incomplete page does not count.
+- A correction closes only when the final passing attempt follows the failed attempt through the lineage and carries a different revision id.
 - Events after `asOf` are invisible. Stability and rework also ignore events after the configured horizon.
+- Submitted-cohort metrics use `submittedAt`; stability and rework use `mergedAt`. A delivery submitted before the window but merged inside it remains in merge-based populations.
 - Right-censored deliveries remain visible in `eligibleCount` but do not enter stability numerators or denominators until mature.
 - Missing cost yields `null`/`unknown`; a subtotal with incomplete coverage is a `floor`. An explicitly reported `$0` remains distinguishable from missing cost.
 - Input, output, cache-read, cache-write, time, and USD are distinct units. `sumLikeQuantities` rejects unlike units, so token dimensions cannot be collapsed or mixed with dollars.
+- Runtime enum values are validated even for plain JavaScript/JSON callers. Verified evidence cannot carry null token dimensions, missing cost, null technique ids, or an unknown project allocation.
+
+## Project allocation
+
+Each delivery declares one allocation kind:
+
+- `exact`: one project share of `1.0`, matching the legacy singular project id
+- `apportioned`: two or more unique project shares that sum to `1.0`
+- `unallocated`: explicitly no project allocation
+- `unknown`: allocation evidence is incomplete; it cannot be marked verified
+
+The result envelope reports all four counts so exact attribution, apportioned attribution, explicit non-allocation, and missing evidence never collapse into one number.
 
 Run the adversarial golden fixtures with:
 

@@ -27,6 +27,37 @@ export const CLAIM_CLASSES = [
 ] as const;
 export type ClaimClass = (typeof CLAIM_CLASSES)[number];
 
+export const ATTRIBUTION_METHODS = [
+  "direct",
+  "deterministic_linkage",
+  "declared_exposure",
+  "inferred",
+  "none",
+] as const;
+export type AttributionMethod = (typeof ATTRIBUTION_METHODS)[number];
+
+export const CHECK_STATES = ["passed", "failed", "none", "unknown"] as const;
+export type CheckState = (typeof CHECK_STATES)[number];
+
+export const COST_KINDS = ["reported", "estimated", "missing"] as const;
+export type CostKind = (typeof COST_KINDS)[number];
+
+export const PROJECT_ALLOCATION_KINDS = ["exact", "apportioned", "unallocated", "unknown"] as const;
+export type ProjectAllocationKind = (typeof PROJECT_ALLOCATION_KINDS)[number];
+
+export const METRIC_LIFECYCLE_STATUSES = ["experimental", "active", "deprecated"] as const;
+export type MetricLifecycleStatus = (typeof METRIC_LIFECYCLE_STATUSES)[number];
+
+export const METRIC_VALIDATION_STATUSES = [
+  "unvalidated",
+  "adversarial_fixture_validated",
+  "externally_validated",
+  "blocked",
+] as const;
+export type MetricValidationStatus = (typeof METRIC_VALIDATION_STATUSES)[number];
+
+export type MetricPopulationEvent = "submitted" | "merged";
+
 export const METRIC_IDS = [
   "project_allocation_coverage",
   "first_pass_yield",
@@ -39,24 +70,26 @@ export const METRIC_IDS = [
 ] as const;
 export type MetricId = (typeof METRIC_IDS)[number];
 
-export type AttributionMethod =
-  | "direct"
-  | "deterministic_linkage"
-  | "declared_exposure"
-  | "inferred"
-  | "none";
-
-export type CheckState = "passed" | "failed" | "none" | "unknown";
-export type CostKind = "reported" | "estimated" | "missing";
-
 export type AnalysisWindow = {
   startInclusive: string;
   endExclusive: string;
 };
 
 export type CheckAttempt = {
+  attemptId: string;
+  revisionId: string;
+  sequence: number;
+  supersedesAttemptId: string | null;
   at: string;
   state: CheckState;
+};
+
+export type ProjectAllocation = {
+  kind: ProjectAllocationKind;
+  shares: readonly {
+    projectId: string;
+    fraction: number;
+  }[];
 };
 
 export type TokenDimensions = {
@@ -75,7 +108,9 @@ export type LearningDelivery = {
     evidenceState: EvidenceState;
   };
   project: {
+    /** Legacy singular label retained for exact allocations only. */
     id: string | null;
+    allocation: ProjectAllocation;
     attributionMethod: AttributionMethod;
     evidenceState: EvidenceState;
   };
@@ -113,23 +148,26 @@ export type MetricAnalysisManifest = {
   deliveries: readonly LearningDelivery[];
 };
 
-export type MetricUnit =
-  | "delivery"
-  | "ratio"
-  | "millisecond"
-  | "millisecond_per_delivery"
-  | "input_token"
-  | "input_token_per_delivery"
-  | "output_token"
-  | "output_token_per_delivery"
-  | "cache_read_token"
-  | "cache_read_token_per_delivery"
-  | "cache_write_token"
-  | "cache_write_token_per_delivery"
-  | "usd"
-  | "technique_exposure";
+export const METRIC_UNITS = [
+  "delivery",
+  "ratio",
+  "millisecond",
+  "millisecond_per_delivery",
+  "input_token",
+  "input_token_per_delivery",
+  "output_token",
+  "output_token_per_delivery",
+  "cache_read_token",
+  "cache_read_token_per_delivery",
+  "cache_write_token",
+  "cache_write_token_per_delivery",
+  "usd",
+  "technique_exposure",
+] as const;
+export type MetricUnit = (typeof METRIC_UNITS)[number];
 
-export type QuantityKnowledge = "known" | "floor" | "unknown";
+export const QUANTITY_KNOWLEDGE_STATES = ["known", "floor", "unknown"] as const;
+export type QuantityKnowledge = (typeof QUANTITY_KNOWLEDGE_STATES)[number];
 
 export type MetricQuantity = {
   value: number | null;
@@ -179,6 +217,12 @@ export type MetricAttribution = {
   attributedCount: number;
   eligibleCount: number;
   ratio: number | null;
+  allocationMix: {
+    exactCount: number;
+    apportionedCount: number;
+    unallocatedCount: number;
+    unknownCount: number;
+  };
 };
 
 export type MetricBreakdownRow = {
@@ -189,6 +233,9 @@ export type MetricBreakdownRow = {
 export type MetricResult = {
   metricId: MetricId;
   definitionVersion: typeof METRIC_DEFINITION_VERSION;
+  lifecycleStatus: MetricLifecycleStatus;
+  validationStatus: MetricValidationStatus;
+  populationEvent: MetricPopulationEvent;
   window: AnalysisWindow;
   asOf: string;
   numerator: readonly NamedMetricQuantity[];
@@ -209,6 +256,9 @@ export type MetricDefinition = {
   id: MetricId;
   definitionVersion: typeof METRIC_DEFINITION_VERSION;
   label: string;
+  lifecycleStatus: MetricLifecycleStatus;
+  validationStatus: MetricValidationStatus;
+  populationEvent: MetricPopulationEvent;
   eligibility: string;
   numerator: string;
   denominator: string;
@@ -223,9 +273,12 @@ export const METRIC_REGISTRY: Readonly<Record<MetricId, MetricDefinition>> = Obj
     id: "project_allocation_coverage",
     definitionVersion: METRIC_DEFINITION_VERSION,
     label: "Project allocation coverage",
+    lifecycleStatus: "experimental",
+    validationStatus: "adversarial_fixture_validated",
+    populationEvent: "submitted",
     eligibility: "Non-excluded deliveries submitted in the analysis window by as-of time.",
-    numerator: "Eligible deliveries with a non-empty project id and named attribution method.",
-    denominator: "All eligible deliveries; unknown allocation remains in the denominator.",
+    numerator: "Eligible deliveries with an exact or full-sum apportioned project allocation and named attribution method.",
+    denominator: "All eligible deliveries; explicit unallocated and unknown allocation remain in the denominator.",
     window: "submittedAt in [startInclusive, min(endExclusive, asOf)].",
     maturity: "Not applicable.",
     attribution: "Direct, deterministic-linkage, or explicitly labeled inferred allocation.",
@@ -235,9 +288,12 @@ export const METRIC_REGISTRY: Readonly<Record<MetricId, MetricDefinition>> = Obj
     id: "first_pass_yield",
     definitionVersion: METRIC_DEFINITION_VERSION,
     label: "First-pass yield",
+    lifecycleStatus: "experimental",
+    validationStatus: "adversarial_fixture_validated",
+    populationEvent: "submitted",
     eligibility: "Non-excluded deliveries submitted in the analysis window by as-of time.",
-    numerator: "Eligible deliveries whose first chronological required-check observation is explicitly passed with verified check evidence.",
-    denominator: "All eligible deliveries; none, unknown, partial, blocked, and missing checks stay in the denominator and never pass.",
+    numerator: "Eligible deliveries whose first lineage-ordered required-check observation is explicitly passed with verified, unambiguous check evidence.",
+    denominator: "All eligible deliveries; none, unknown, ambiguous, partial, blocked, and missing checks stay in the denominator and never pass.",
     window: "Only check observations at or before asOf are visible.",
     maturity: "Not applicable.",
     attribution: "Delivery attribution is reported separately and never manufactured from a check result.",
@@ -247,8 +303,11 @@ export const METRIC_REGISTRY: Readonly<Record<MetricId, MetricDefinition>> = Obj
     id: "correction_loop",
     definitionVersion: METRIC_DEFINITION_VERSION,
     label: "Correction-loop closure",
+    lifecycleStatus: "experimental",
+    validationStatus: "adversarial_fixture_validated",
+    populationEvent: "submitted",
     eligibility: "Deliveries with a verified first required-check failure in the analysis cohort.",
-    numerator: "Eligible failures with a later explicit passed observation by asOf and verified check evidence.",
+    numerator: "Eligible failures whose final explicit pass is lineage-linked and carries a different revision by asOf.",
     denominator: "All verified first-attempt failures, including failures not yet corrected.",
     window: "No attempt after asOf is visible; later green results cannot leak backward.",
     maturity: "Unresolved loops are visible as not closed, not as exclusions.",
@@ -259,6 +318,9 @@ export const METRIC_REGISTRY: Readonly<Record<MetricId, MetricDefinition>> = Obj
     id: "time_tokens_to_first_green",
     definitionVersion: METRIC_DEFINITION_VERSION,
     label: "Time and tokens to first green",
+    lifecycleStatus: "experimental",
+    validationStatus: "adversarial_fixture_validated",
+    populationEvent: "submitted",
     eligibility: "Non-excluded deliveries submitted in the analysis window by as-of time.",
     numerator: "Separate sums for elapsed milliseconds, input, output, cache-read, and cache-write tokens among observations with a verified first green and known dimension.",
     denominator: "A separate known-observation count for every dimension; unresolved or missing dimensions are never zero-filled.",
@@ -271,8 +333,11 @@ export const METRIC_REGISTRY: Readonly<Record<MetricId, MetricDefinition>> = Obj
     id: "mature_stable_delivery",
     definitionVersion: METRIC_DEFINITION_VERSION,
     label: "Mature stable delivery",
+    lifecycleStatus: "experimental",
+    validationStatus: "adversarial_fixture_validated",
+    populationEvent: "merged",
     eligibility: "Merged cohort deliveries whose mergedAt is in the analysis window by as-of time.",
-    numerator: "Mature deliveries with verified passed checks, complete rework evidence, and no rework inside the configured horizon.",
+    numerator: "Mature deliveries with a verified, unambiguous final passed check, complete rework evidence, and no rework inside the configured horizon.",
     denominator: "Only deliveries whose full stability horizon has elapsed by asOf.",
     window: "Rework is inspected only in [mergedAt, mergedAt + horizon] and never after asOf.",
     maturity: "Right-censored deliveries stay in eligibleCount but are excluded from numerator and denominator until mature.",
@@ -283,6 +348,9 @@ export const METRIC_REGISTRY: Readonly<Record<MetricId, MetricDefinition>> = Obj
     id: "post_merge_rework",
     definitionVersion: METRIC_DEFINITION_VERSION,
     label: "Post-merge rework",
+    lifecycleStatus: "experimental",
+    validationStatus: "adversarial_fixture_validated",
+    populationEvent: "merged",
     eligibility: "Merged cohort deliveries whose full configured rework horizon has elapsed.",
     numerator: "Mature deliveries with an observed rework event inside the configured horizon.",
     denominator: "All mature deliveries; incomplete rework evidence makes the observed rate a floor.",
@@ -295,6 +363,9 @@ export const METRIC_REGISTRY: Readonly<Record<MetricId, MetricDefinition>> = Obj
     id: "known_cost_coverage",
     definitionVersion: METRIC_DEFINITION_VERSION,
     label: "Known-cost coverage",
+    lifecycleStatus: "experimental",
+    validationStatus: "adversarial_fixture_validated",
+    populationEvent: "submitted",
     eligibility: "Non-excluded deliveries submitted in the analysis window by as-of time.",
     numerator: "Eligible deliveries with a reported or explicitly estimated non-negative USD cost.",
     denominator: "All eligible deliveries; missing cost remains unknown.",
@@ -307,6 +378,9 @@ export const METRIC_REGISTRY: Readonly<Record<MetricId, MetricDefinition>> = Obj
     id: "technique_exposure",
     definitionVersion: METRIC_DEFINITION_VERSION,
     label: "Technique exposure",
+    lifecycleStatus: "experimental",
+    validationStatus: "adversarial_fixture_validated",
+    populationEvent: "submitted",
     eligibility: "Non-excluded deliveries submitted in the analysis window by as-of time.",
     numerator: "Eligible deliveries with one or more explicitly attributed technique ids.",
     denominator: "All eligible deliveries; unknown exposure stays in the denominator.",
@@ -331,6 +405,20 @@ function assertNonnegative(value: number | null, field: string): void {
   if (value !== null && (!Number.isFinite(value) || value < 0)) {
     throw new Error(`${field} must be a non-negative finite number or null`);
   }
+}
+
+function assertOneOf<T extends string>(value: unknown, allowed: readonly T[], field: string): asserts value is T {
+  if (typeof value !== "string" || !allowed.includes(value as T)) {
+    throw new Error(`${field} has unsupported value: ${String(value)}`);
+  }
+}
+
+function assertEvidenceState(value: unknown, field: string): asserts value is EvidenceState {
+  assertOneOf(value, EVIDENCE_STATES, field);
+}
+
+function assertAttributionMethod(value: unknown, field: string): asserts value is AttributionMethod {
+  assertOneOf(value, ATTRIBUTION_METHODS, field);
 }
 
 export function validateMetricAnalysisManifest(manifest: MetricAnalysisManifest): void {
@@ -362,14 +450,91 @@ export function validateMetricAnalysisManifest(manifest: MetricAnalysisManifest)
     if (!delivery.id.trim()) throw new Error("delivery id must not be empty");
     if (ids.has(delivery.id)) throw new Error(`duplicate delivery id: ${delivery.id}`);
     ids.add(delivery.id);
+    assertEvidenceState(delivery.deliveryAttribution.evidenceState, `${delivery.id}.deliveryAttribution.evidenceState`);
+    assertAttributionMethod(delivery.deliveryAttribution.method, `${delivery.id}.deliveryAttribution.method`);
+    assertEvidenceState(delivery.project.evidenceState, `${delivery.id}.project.evidenceState`);
+    assertAttributionMethod(delivery.project.attributionMethod, `${delivery.id}.project.attributionMethod`);
+    assertOneOf(delivery.project.allocation.kind, PROJECT_ALLOCATION_KINDS, `${delivery.id}.project.allocation.kind`);
+    assertEvidenceState(delivery.checks.evidenceState, `${delivery.id}.checks.evidenceState`);
+    assertEvidenceState(delivery.rework.evidenceState, `${delivery.id}.rework.evidenceState`);
+    assertEvidenceState(delivery.tokensToFirstGreen.evidenceState, `${delivery.id}.tokensToFirstGreen.evidenceState`);
+    assertEvidenceState(delivery.cost.evidenceState, `${delivery.id}.cost.evidenceState`);
+    assertOneOf(delivery.cost.kind, COST_KINDS, `${delivery.id}.cost.kind`);
+    assertEvidenceState(delivery.techniques.evidenceState, `${delivery.id}.techniques.evidenceState`);
+    assertAttributionMethod(delivery.techniques.attributionMethod, `${delivery.id}.techniques.attributionMethod`);
+
+    const allocationShares = delivery.project.allocation.shares;
+    const allocationIds = new Set<string>();
+    for (const [index, share] of allocationShares.entries()) {
+      if (!share.projectId.trim()) throw new Error(`${delivery.id}.project.allocation.shares[${index}].projectId must not be empty`);
+      if (allocationIds.has(share.projectId)) throw new Error(`${delivery.id} project allocation ids must be unique`);
+      allocationIds.add(share.projectId);
+      if (!Number.isFinite(share.fraction) || share.fraction <= 0 || share.fraction > 1) {
+        throw new Error(`${delivery.id}.project.allocation.shares[${index}].fraction must be in (0, 1]`);
+      }
+    }
+    const allocatedFraction = allocationShares.reduce((sum, share) => sum + share.fraction, 0);
+    if (delivery.project.allocation.kind === "exact") {
+      if (
+        allocationShares.length !== 1 ||
+        Math.abs(allocatedFraction - 1) > 1e-12 ||
+        !delivery.project.id?.trim() ||
+        delivery.project.id !== allocationShares[0]?.projectId ||
+        delivery.project.attributionMethod === "none"
+      ) {
+        throw new Error(`${delivery.id} exact allocation requires one full share, matching project id, and attribution`);
+      }
+    } else if (delivery.project.allocation.kind === "apportioned") {
+      if (
+        allocationShares.length < 2 ||
+        Math.abs(allocatedFraction - 1) > 1e-12 ||
+        delivery.project.id !== null ||
+        delivery.project.attributionMethod === "none"
+      ) {
+        throw new Error(`${delivery.id} apportioned allocation requires two or more full-sum shares and no singular project id`);
+      }
+    } else {
+      if (allocationShares.length !== 0 || delivery.project.id !== null || delivery.project.attributionMethod !== "none") {
+        throw new Error(`${delivery.id} ${delivery.project.allocation.kind} allocation must have no shares, id, or attribution`);
+      }
+      if (delivery.project.allocation.kind === "unknown" && delivery.project.evidenceState === "verified") {
+        throw new Error(`${delivery.id} unknown project allocation cannot have verified evidence`);
+      }
+    }
+
     const submittedMs = parseInstant(delivery.submittedAt, `${delivery.id}.submittedAt`);
     if (delivery.mergedAt !== null) {
       const mergedMs = parseInstant(delivery.mergedAt, `${delivery.id}.mergedAt`);
       if (mergedMs < submittedMs) throw new Error(`${delivery.id}.mergedAt precedes submittedAt`);
     }
+    const attemptIds = new Set<string>();
+    const attemptSequences = new Set<number>();
     for (const [index, attempt] of delivery.checks.attempts.entries()) {
+      assertOneOf(attempt.state, CHECK_STATES, `${delivery.id}.checks.attempts[${index}].state`);
+      if (!attempt.attemptId.trim()) throw new Error(`${delivery.id} check attempt id must not be empty`);
+      if (!attempt.revisionId.trim()) throw new Error(`${delivery.id} check revision id must not be empty`);
+      if (!Number.isInteger(attempt.sequence) || attempt.sequence < 1) {
+        throw new Error(`${delivery.id} check sequence must be a positive integer`);
+      }
+      if (attemptIds.has(attempt.attemptId)) throw new Error(`${delivery.id} check attempt ids must be unique`);
+      if (attemptSequences.has(attempt.sequence)) throw new Error(`${delivery.id} check sequences must be unique`);
+      attemptIds.add(attempt.attemptId);
+      attemptSequences.add(attempt.sequence);
       const attemptMs = parseInstant(attempt.at, `${delivery.id}.checks.attempts[${index}].at`);
       if (attemptMs < submittedMs) throw new Error(`${delivery.id} check attempt precedes submittedAt`);
+    }
+    const orderedAttempts = delivery.checks.attempts.slice().sort((a, b) => a.sequence - b.sequence);
+    for (const [index, attempt] of orderedAttempts.entries()) {
+      const previous = orderedAttempts[index - 1];
+      if (index === 0 && attempt.supersedesAttemptId !== null) {
+        throw new Error(`${delivery.id} first check attempt must not supersede another attempt`);
+      }
+      if (index > 0 && attempt.supersedesAttemptId !== previous.attemptId) {
+        throw new Error(`${delivery.id} check lineage must supersede the immediately previous attempt`);
+      }
+      if (previous && parseInstant(attempt.at, `${delivery.id}.check.at`) < parseInstant(previous.at, `${delivery.id}.check.at`)) {
+        throw new Error(`${delivery.id} check timestamps must not move backward across sequence`);
+      }
     }
     for (const [index, event] of delivery.rework.events.entries()) {
       if (!event.kind.trim()) throw new Error(`${delivery.id} rework kind must not be empty`);
@@ -378,12 +543,27 @@ export function validateMetricAnalysisManifest(manifest: MetricAnalysisManifest)
     for (const [key, value] of Object.entries(delivery.tokensToFirstGreen)) {
       if (key !== "evidenceState") assertNonnegative(value as number | null, `${delivery.id}.${key}`);
     }
+    if (
+      delivery.tokensToFirstGreen.evidenceState === "verified" &&
+      TOKEN_MEASURES.some(([, field]) => delivery.tokensToFirstGreen[field] === null)
+    ) {
+      throw new Error(`${delivery.id} verified token evidence requires every token dimension`);
+    }
     assertNonnegative(delivery.cost.usd, `${delivery.id}.cost.usd`);
     if (delivery.cost.kind === "missing" && delivery.cost.usd !== null) {
       throw new Error(`${delivery.id} missing cost must be null`);
     }
     if (delivery.cost.kind !== "missing" && delivery.cost.usd === null) {
       throw new Error(`${delivery.id} ${delivery.cost.kind} cost must have a value`);
+    }
+    if (delivery.cost.kind === "missing" && delivery.cost.evidenceState === "verified") {
+      throw new Error(`${delivery.id} missing cost cannot have verified evidence`);
+    }
+    if (delivery.cost.kind === "estimated" && delivery.cost.evidenceState === "verified") {
+      throw new Error(`${delivery.id} estimated cost cannot have verified evidence`);
+    }
+    if (delivery.techniques.ids === null && delivery.techniques.evidenceState === "verified") {
+      throw new Error(`${delivery.id} null technique ids cannot have verified evidence`);
     }
     if (delivery.techniques.ids !== null) {
       const normalized = delivery.techniques.ids.map((id) => id.trim());
@@ -402,6 +582,22 @@ export function validateMetricAnalysisManifest(manifest: MetricAnalysisManifest)
  */
 export function sumLikeQuantities(quantities: readonly MetricQuantity[]): MetricQuantity {
   if (quantities.length === 0) throw new Error("cannot sum an empty quantity list");
+  for (const [index, quantity] of quantities.entries()) {
+    assertOneOf(quantity.unit, METRIC_UNITS, `quantities[${index}].unit`);
+    assertOneOf(quantity.knowledge, QUANTITY_KNOWLEDGE_STATES, `quantities[${index}].knowledge`);
+    if (quantity.value === null) {
+      if (quantity.knowledge !== "unknown") {
+        throw new Error(`quantities[${index}] null value must have unknown knowledge`);
+      }
+    } else {
+      if (!Number.isFinite(quantity.value) || quantity.value < 0) {
+        throw new Error(`quantities[${index}] value must be a non-negative finite number or null`);
+      }
+      if (quantity.knowledge === "unknown") {
+        throw new Error(`quantities[${index}] numeric value cannot have unknown knowledge`);
+      }
+    }
+  }
   const unit = quantities[0].unit;
   if (quantities.some((quantity) => quantity.unit !== unit)) {
     throw new Error("cannot combine metric quantities with different units");
@@ -409,11 +605,51 @@ export function sumLikeQuantities(quantities: readonly MetricQuantity[]): Metric
   if (quantities.some((quantity) => quantity.value === null || quantity.knowledge === "unknown")) {
     return { value: null, unit, knowledge: "unknown" };
   }
+  const total = quantities.reduce((sum, quantity) => sum + (quantity.value as number), 0);
+  if (!Number.isFinite(total)) throw new Error("combined metric quantity must remain finite");
   return {
-    value: quantities.reduce((sum, quantity) => sum + (quantity.value as number), 0),
+    value: total,
     unit,
     knowledge: quantities.some((quantity) => quantity.knowledge === "floor") ? "floor" : "known",
   };
+}
+
+export type PersistedMetricIdentity = {
+  metricId: string;
+  definitionVersion: string;
+  lifecycleStatus: string;
+  validationStatus: string;
+};
+
+/** Fail closed before comparing persisted results across formula contracts. */
+export function assertComparableMetricResults(
+  left: PersistedMetricIdentity,
+  right: PersistedMetricIdentity,
+): void {
+  assertOneOf(left.metricId, METRIC_IDS, "left.metricId");
+  assertOneOf(right.metricId, METRIC_IDS, "right.metricId");
+  assertOneOf(left.lifecycleStatus, METRIC_LIFECYCLE_STATUSES, "left.lifecycleStatus");
+  assertOneOf(right.lifecycleStatus, METRIC_LIFECYCLE_STATUSES, "right.lifecycleStatus");
+  assertOneOf(left.validationStatus, METRIC_VALIDATION_STATUSES, "left.validationStatus");
+  assertOneOf(right.validationStatus, METRIC_VALIDATION_STATUSES, "right.validationStatus");
+  if (left.metricId !== right.metricId) {
+    throw new Error(`cannot compare different metrics: ${left.metricId} vs ${right.metricId}`);
+  }
+  if (left.definitionVersion !== right.definitionVersion) {
+    throw new Error(
+      `cannot compare incompatible formula versions: ${left.definitionVersion} vs ${right.definitionVersion}`,
+    );
+  }
+  const currentVersion = METRIC_REGISTRY[left.metricId].definitionVersion;
+  if (left.definitionVersion !== currentVersion) {
+    throw new Error(`unsupported persisted formula version: ${left.definitionVersion}`);
+  }
+  if (left.validationStatus === "blocked" || left.validationStatus === "unvalidated") {
+    throw new Error(`left result validation status is not comparable: ${left.validationStatus}`);
+  }
+  if (right.validationStatus === "blocked" || right.validationStatus === "unvalidated") {
+    throw new Error(`right result validation status is not comparable: ${right.validationStatus}`);
+  }
 }
 
 type EvidenceCounts = Omit<MetricCoverage, "eligibleCount" | "ratio">;
@@ -474,7 +710,10 @@ function ratioMeasure(
     key,
     numerator: known(numerator, "delivery"),
     denominator: known(denominator, "delivery"),
-    value: denominator === 0 ? unknown("ratio") : { value: numerator / denominator, unit: "ratio", knowledge },
+    value:
+      denominator === 0 || knowledge === "unknown"
+        ? unknown("ratio")
+        : { value: numerator / denominator, unit: "ratio", knowledge },
   };
 }
 
@@ -508,11 +747,18 @@ function attributionFor(
 ): MetricAttribution {
   const methods = deliveries.map(select);
   const attributedCount = methods.filter((method) => method !== "none").length;
+  const allocationMix = {
+    exactCount: deliveries.filter((delivery) => delivery.project.allocation.kind === "exact").length,
+    apportionedCount: deliveries.filter((delivery) => delivery.project.allocation.kind === "apportioned").length,
+    unallocatedCount: deliveries.filter((delivery) => delivery.project.allocation.kind === "unallocated").length,
+    unknownCount: deliveries.filter((delivery) => delivery.project.allocation.kind === "unknown").length,
+  };
   return {
     methods: [...new Set(methods)].sort() as AttributionMethod[],
     attributedCount,
     eligibleCount: deliveries.length,
     ratio: deliveries.length === 0 ? null : attributedCount / deliveries.length,
+    allocationMix,
   };
 }
 
@@ -528,11 +774,16 @@ function result(options: {
   breakdown?: readonly MetricBreakdownRow[];
   limitations?: readonly string[];
   evidenceState?: EvidenceState;
+  claimClass?: ClaimClass;
 }): MetricResult {
   const evidenceState = options.evidenceState ?? evidenceFromCoverage(options.coverage);
+  const definition = METRIC_REGISTRY[options.metricId];
   return {
     metricId: options.metricId,
     definitionVersion: METRIC_DEFINITION_VERSION,
+    lifecycleStatus: definition.lifecycleStatus,
+    validationStatus: definition.validationStatus,
+    populationEvent: definition.populationEvent,
     window: { ...options.manifest.window },
     asOf: options.manifest.asOf,
     numerator: options.measures.map((measure) => ({ key: measure.key, ...measure.numerator })),
@@ -544,13 +795,13 @@ function result(options: {
     maturity: options.maturity ?? { horizonDays: null, matureCount: options.sample.sampleCount, censoredCount: 0 },
     attribution: options.attribution,
     evidenceState,
-    claimClass: claimFromEvidence(evidenceState),
+    claimClass: options.claimClass ?? claimFromEvidence(evidenceState),
     breakdown: options.breakdown ?? [],
     limitations: options.limitations ?? [],
   };
 }
 
-function baseDeliveries(manifest: MetricAnalysisManifest): LearningDelivery[] {
+function submittedDeliveries(manifest: MetricAnalysisManifest): LearningDelivery[] {
   const startMs = parseInstant(manifest.window.startInclusive, "window.startInclusive");
   const endMs = parseInstant(manifest.window.endExclusive, "window.endExclusive");
   const asOfMs = parseInstant(manifest.asOf, "asOf");
@@ -568,16 +819,65 @@ function baseDeliveries(manifest: MetricAnalysisManifest): LearningDelivery[] {
     .sort((a, b) => a.id.localeCompare(b.id));
 }
 
+function nonExcludedDeliveries(manifest: MetricAnalysisManifest): LearningDelivery[] {
+  return manifest.deliveries
+    .filter((delivery) => delivery.deliveryAttribution.evidenceState !== "excluded")
+    .slice()
+    .sort((a, b) => a.id.localeCompare(b.id));
+}
+
 function attemptsByAsOf(delivery: LearningDelivery, asOfMs: number): CheckAttempt[] {
   return delivery.checks.attempts
     .filter((attempt) => parseInstant(attempt.at, `${delivery.id}.check.at`) <= asOfMs)
     .slice()
-    .sort((a, b) => parseInstant(a.at, "check.at") - parseInstant(b.at, "check.at") || a.state.localeCompare(b.state));
+    .sort((a, b) => a.sequence - b.sequence);
+}
+
+function hasAmbiguousAttemptTimestamp(attempts: readonly CheckAttempt[]): boolean {
+  const statesByTimestamp = new Map<string, Set<CheckState>>();
+  for (const attempt of attempts) {
+    const timestampKey = String(parseInstant(attempt.at, "check.at"));
+    const states = statesByTimestamp.get(timestampKey) ?? new Set<CheckState>();
+    states.add(attempt.state);
+    statesByTimestamp.set(timestampKey, states);
+  }
+  return [...statesByTimestamp.values()].some((states) => states.size > 1);
+}
+
+function effectiveCheckEvidence(delivery: LearningDelivery, asOfMs: number): EvidenceState {
+  if (delivery.checks.evidenceState !== "verified") return delivery.checks.evidenceState;
+  const attempts = attemptsByAsOf(delivery, asOfMs);
+  if (
+    attempts.length === 0 ||
+    hasAmbiguousAttemptTimestamp(attempts) ||
+    attempts.some((attempt) => attempt.state === "none" || attempt.state === "unknown")
+  ) {
+    return "partial";
+  }
+  return "verified";
 }
 
 function verifiedFirstGreen(delivery: LearningDelivery, asOfMs: number): CheckAttempt | undefined {
-  if (delivery.checks.evidenceState !== "verified") return undefined;
+  if (effectiveCheckEvidence(delivery, asOfMs) !== "verified") return undefined;
   return attemptsByAsOf(delivery, asOfMs).find((attempt) => attempt.state === "passed");
+}
+
+function verifiedFinalGreen(delivery: LearningDelivery, asOfMs: number): CheckAttempt | undefined {
+  if (effectiveCheckEvidence(delivery, asOfMs) !== "verified") return undefined;
+  const attempts = attemptsByAsOf(delivery, asOfMs);
+  const final = attempts.at(-1);
+  return final?.state === "passed" ? final : undefined;
+}
+
+function verifiedCorrectionPass(delivery: LearningDelivery, asOfMs: number): CheckAttempt | undefined {
+  if (effectiveCheckEvidence(delivery, asOfMs) !== "verified") return undefined;
+  const attempts = attemptsByAsOf(delivery, asOfMs);
+  const first = attempts[0];
+  const final = attempts.at(-1);
+  if (first?.state !== "failed" || final?.state !== "passed" || final.revisionId === first.revisionId) {
+    return undefined;
+  }
+  return final;
 }
 
 function standardSample(eligibleCount: number, sampleCount = eligibleCount): MetricSample {
@@ -594,15 +894,15 @@ function standardSample(eligibleCount: number, sampleCount = eligibleCount): Met
 function analyzeProjectAllocation(manifest: MetricAnalysisManifest, deliveries: LearningDelivery[]): MetricResult {
   const allocated = deliveries.filter(
     (delivery) =>
-      delivery.project.id !== null &&
-      delivery.project.id.trim() !== "" &&
+      (delivery.project.allocation.kind === "exact" || delivery.project.allocation.kind === "apportioned") &&
       delivery.project.attributionMethod !== "none" &&
-      delivery.project.evidenceState !== "blocked" &&
-      delivery.project.evidenceState !== "excluded",
+      (delivery.project.evidenceState === "verified" || delivery.project.evidenceState === "inferred"),
   );
   const coverage = countEvidence(deliveries.map((delivery) => delivery.project.evidenceState));
   const unknownCount = deliveries.filter(
-    (delivery) => delivery.project.evidenceState !== "verified" && delivery.project.evidenceState !== "inferred",
+    (delivery) =>
+      delivery.project.allocation.kind === "unknown" ||
+      (delivery.project.evidenceState !== "verified" && delivery.project.evidenceState !== "inferred"),
   ).length;
   return result({
     metricId: "project_allocation_coverage",
@@ -615,21 +915,32 @@ function analyzeProjectAllocation(manifest: MetricAnalysisManifest, deliveries: 
     },
     coverage,
     attribution: attributionFor(deliveries, (delivery) => delivery.project.attributionMethod),
+    breakdown: [
+      { key: "exact", count: deliveries.filter((delivery) => delivery.project.allocation.kind === "exact").length },
+      { key: "apportioned", count: deliveries.filter((delivery) => delivery.project.allocation.kind === "apportioned").length },
+      { key: "unallocated", count: deliveries.filter((delivery) => delivery.project.allocation.kind === "unallocated").length },
+      { key: "unknown", count: deliveries.filter((delivery) => delivery.project.allocation.kind === "unknown").length },
+    ],
     limitations: coverage.ratio === 1 ? [] : ["Unverified project allocation stays in the denominator and cannot inflate coverage."],
   });
 }
 
 function analyzeFirstPass(manifest: MetricAnalysisManifest, deliveries: LearningDelivery[]): MetricResult {
   const asOfMs = parseInstant(manifest.asOf, "asOf");
+  const effectiveStates = deliveries.map((delivery) => effectiveCheckEvidence(delivery, asOfMs));
   const passed = deliveries.filter((delivery) => {
     const first = attemptsByAsOf(delivery, asOfMs)[0];
-    return delivery.checks.evidenceState === "verified" && first?.state === "passed";
+    return effectiveCheckEvidence(delivery, asOfMs) === "verified" && first?.state === "passed";
   });
-  const coverage = countEvidence(deliveries.map((delivery) => delivery.checks.evidenceState));
-  const incomplete = deliveries.filter((delivery) => delivery.checks.evidenceState !== "verified").length;
+  const determinate = deliveries.filter((delivery) => {
+    const first = attemptsByAsOf(delivery, asOfMs)[0];
+    return effectiveCheckEvidence(delivery, asOfMs) === "verified" && (first?.state === "passed" || first?.state === "failed");
+  });
+  const coverage = countEvidence(effectiveStates);
+  const incomplete = effectiveStates.filter((state) => state !== "verified").length;
   const unknownRows = deliveries.filter((delivery) => {
     const first = attemptsByAsOf(delivery, asOfMs)[0];
-    return delivery.checks.evidenceState !== "verified" || !first || first.state === "none" || first.state === "unknown";
+    return effectiveCheckEvidence(delivery, asOfMs) !== "verified" || !first || first.state === "none" || first.state === "unknown";
   });
   const noneOrUnknown = deliveries.filter((delivery) => {
     const first = attemptsByAsOf(delivery, asOfMs)[0];
@@ -638,7 +949,14 @@ function analyzeFirstPass(manifest: MetricAnalysisManifest, deliveries: Learning
   return result({
     metricId: "first_pass_yield",
     manifest,
-    measures: [ratioMeasure("first_pass_yield", passed.length, deliveries.length, incomplete > 0 ? "floor" : "known")],
+    measures: [
+      ratioMeasure(
+        "first_pass_yield",
+        passed.length,
+        deliveries.length,
+        determinate.length === 0 && deliveries.length > 0 ? "unknown" : incomplete > 0 ? "floor" : "known",
+      ),
+    ],
     sample: {
       ...standardSample(deliveries.length),
       unknownCount: unknownRows.length,
@@ -649,7 +967,11 @@ function analyzeFirstPass(manifest: MetricAnalysisManifest, deliveries: Learning
     },
     coverage,
     attribution: attributionFor(deliveries),
-    limitations: incomplete > 0 ? ["Partial, blocked, inferred, or excluded check evidence cannot pass validation."] : [],
+    limitations:
+      incomplete > 0
+        ? ["Unknown, none, ambiguous, partial, blocked, inferred, or excluded check evidence cannot pass validation."]
+        : [],
+    claimClass: determinate.length === 0 && deliveries.length > 0 ? "not_estimable" : undefined,
   });
 }
 
@@ -659,18 +981,30 @@ function analyzeCorrectionLoop(manifest: MetricAnalysisManifest, deliveries: Lea
     const first = attemptsByAsOf(delivery, asOfMs)[0];
     return delivery.checks.evidenceState === "verified" && first?.state === "failed";
   });
-  const corrected = eligible.filter((delivery) =>
-    attemptsByAsOf(delivery, asOfMs).slice(1).some((attempt) => attempt.state === "passed"),
-  );
-  const coverage = countEvidence(eligible.map((delivery) => delivery.checks.evidenceState));
+  const corrected = eligible.filter((delivery) => Boolean(verifiedCorrectionPass(delivery, asOfMs)));
+  const effectiveStates = eligible.map((delivery) => effectiveCheckEvidence(delivery, asOfMs));
+  const coverage = countEvidence(effectiveStates);
+  const evaluable = effectiveStates.filter((state) => state === "verified").length;
+  const incomplete = effectiveStates.length - evaluable;
   return result({
     metricId: "correction_loop",
     manifest,
-    measures: [ratioMeasure("correction_loop_closure", corrected.length, eligible.length)],
+    measures: [
+      ratioMeasure(
+        "correction_loop_closure",
+        corrected.length,
+        eligible.length,
+        evaluable === 0 && eligible.length > 0 ? "unknown" : incomplete > 0 ? "floor" : "known",
+      ),
+    ],
     sample: standardSample(eligible.length),
     coverage,
     attribution: attributionFor(eligible),
-    limitations: eligible.length === 0 ? ["No verified first-attempt failures are eligible for a correction-loop rate."] : [],
+    limitations:
+      eligible.length === 0
+        ? ["No verified first-attempt failures are eligible for a correction-loop rate."]
+        : ["A correction closes only when a later, lineage-linked passing attempt uses a different revision."],
+    claimClass: evaluable === 0 && eligible.length > 0 ? "not_estimable" : undefined,
   });
 }
 
@@ -717,7 +1051,7 @@ function analyzeTimeTokens(manifest: MetricAnalysisManifest, deliveries: Learnin
   }
   const coverage = countEvidence(
     deliveries.map((delivery) =>
-      combineEvidenceStates([delivery.checks.evidenceState, delivery.tokensToFirstGreen.evidenceState]),
+      combineEvidenceStates([effectiveCheckEvidence(delivery, asOfMs), delivery.tokensToFirstGreen.evidenceState]),
     ),
   );
   return result({
@@ -772,8 +1106,8 @@ function hasReworkInHorizon(delivery: LearningDelivery, manifest: MetricAnalysis
   });
 }
 
-function hasVerifiedGreen(delivery: LearningDelivery, asOfMs: number): boolean {
-  return Boolean(verifiedFirstGreen(delivery, asOfMs));
+function hasVerifiedStableCheck(delivery: LearningDelivery, asOfMs: number): boolean {
+  return Boolean(verifiedFinalGreen(delivery, asOfMs));
 }
 
 function analyzeMatureStable(manifest: MetricAnalysisManifest, deliveries: LearningDelivery[]): MetricResult {
@@ -781,35 +1115,35 @@ function analyzeMatureStable(manifest: MetricAnalysisManifest, deliveries: Learn
   const asOfMs = parseInstant(manifest.asOf, "asOf");
   const stable = cohort.mature.filter(
     (delivery) =>
-      hasVerifiedGreen(delivery, asOfMs) &&
+      hasVerifiedStableCheck(delivery, asOfMs) &&
       delivery.rework.evidenceState === "verified" &&
       !hasReworkInHorizon(delivery, manifest),
   );
   const coverage = countEvidence(
     cohort.mature.map((delivery) =>
-      combineEvidenceStates([delivery.checks.evidenceState, delivery.rework.evidenceState]),
+      combineEvidenceStates([effectiveCheckEvidence(delivery, asOfMs), delivery.rework.evidenceState]),
     ),
   );
-  const incomplete = cohort.mature.some(
-    (delivery) => delivery.checks.evidenceState !== "verified" || delivery.rework.evidenceState !== "verified",
-  );
+  const evaluable = cohort.mature.filter(
+    (delivery) => effectiveCheckEvidence(delivery, asOfMs) === "verified" && delivery.rework.evidenceState === "verified",
+  ).length;
+  const incomplete = evaluable < cohort.mature.length;
   const evidenceState =
     cohort.merged.length > 0 && cohort.mature.length === 0
       ? "excluded"
       : evidenceFromCoverage(coverage);
-  const unknownCount = cohort.mature.filter((delivery) => {
-    const first = attemptsByAsOf(delivery, asOfMs)[0];
-    return (
-      delivery.checks.evidenceState !== "verified" ||
-      delivery.rework.evidenceState !== "verified" ||
-      !first ||
-      first.state === "unknown"
-    );
-  }).length;
+  const unknownCount = cohort.mature.length - evaluable;
   return result({
     metricId: "mature_stable_delivery",
     manifest,
-    measures: [ratioMeasure("mature_stable_delivery", stable.length, cohort.mature.length, incomplete ? "floor" : "known")],
+    measures: [
+      ratioMeasure(
+        "mature_stable_delivery",
+        stable.length,
+        cohort.mature.length,
+        evaluable === 0 && cohort.mature.length > 0 ? "unknown" : incomplete ? "floor" : "known",
+      ),
+    ],
     sample: {
       eligibleCount: cohort.merged.length,
       sampleCount: cohort.mature.length,
@@ -827,6 +1161,7 @@ function analyzeMatureStable(manifest: MetricAnalysisManifest, deliveries: Learn
     attribution: attributionFor(cohort.merged),
     limitations: cohort.censored.length === 0 ? [] : ["Right-censored deliveries are excluded from the rate until the full horizon elapses."],
     evidenceState,
+    claimClass: evaluable === 0 && cohort.mature.length > 0 ? "not_estimable" : undefined,
   });
 }
 
@@ -947,17 +1282,18 @@ function analyzeTechniqueExposure(manifest: MetricAnalysisManifest, deliveries: 
 /** Analyze the requested registry entries in canonical registry order. */
 export function analyzeLearningMetrics(manifest: MetricAnalysisManifest): MetricResult[] {
   validateMetricAnalysisManifest(manifest);
-  const deliveries = baseDeliveries(manifest);
+  const submitted = submittedDeliveries(manifest);
+  const allNonExcluded = nonExcludedDeliveries(manifest);
   const requested = new Set(manifest.metricIds);
   const analyzers: Record<MetricId, () => MetricResult> = {
-    project_allocation_coverage: () => analyzeProjectAllocation(manifest, deliveries),
-    first_pass_yield: () => analyzeFirstPass(manifest, deliveries),
-    correction_loop: () => analyzeCorrectionLoop(manifest, deliveries),
-    time_tokens_to_first_green: () => analyzeTimeTokens(manifest, deliveries),
-    mature_stable_delivery: () => analyzeMatureStable(manifest, deliveries),
-    post_merge_rework: () => analyzeRework(manifest, deliveries),
-    known_cost_coverage: () => analyzeKnownCost(manifest, deliveries),
-    technique_exposure: () => analyzeTechniqueExposure(manifest, deliveries),
+    project_allocation_coverage: () => analyzeProjectAllocation(manifest, submitted),
+    first_pass_yield: () => analyzeFirstPass(manifest, submitted),
+    correction_loop: () => analyzeCorrectionLoop(manifest, submitted),
+    time_tokens_to_first_green: () => analyzeTimeTokens(manifest, submitted),
+    mature_stable_delivery: () => analyzeMatureStable(manifest, allNonExcluded),
+    post_merge_rework: () => analyzeRework(manifest, allNonExcluded),
+    known_cost_coverage: () => analyzeKnownCost(manifest, submitted),
+    technique_exposure: () => analyzeTechniqueExposure(manifest, submitted),
   };
   return METRIC_IDS.filter((metricId) => requested.has(metricId)).map((metricId) => analyzers[metricId]());
 }
