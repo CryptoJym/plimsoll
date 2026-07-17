@@ -551,8 +551,17 @@ prove(
     const versionChanged = manifestFor(basePairs);
     versionChanged.metricVersions.projectAllocation = "2.0.0";
     assert.notEqual(computeLearningSourceFingerprint(versionChanged), baseRun.sourceFingerprint);
+
+    const confounderOrderA = manifestFor(basePairs);
+    confounderOrderA.declaredConfounders = ["actor_selection", "calendar_change"];
+    const confounderOrderB = manifestFor(basePairs);
+    confounderOrderB.declaredConfounders = ["calendar_change", "actor_selection"];
+    assert.equal(
+      computeLearningSourceFingerprint(confounderOrderA),
+      computeLearningSourceFingerprint(confounderOrderB),
+    );
   },
-  "gate and metric-version drift invalidates the no-op key",
+  "gate/version drift invalidates the key while set ordering does not",
 );
 
 prove(

@@ -374,9 +374,13 @@ function sha256(value: unknown): string {
   return createHash("sha256").update(canonicalLearningJson(value)).digest("hex");
 }
 
+function compareCanonicalText(left: string, right: string): number {
+  return left < right ? -1 : left > right ? 1 : 0;
+}
+
 /** Upstream bounded queries can use this helper to bind the exact supplied rows. */
 export function computeLearningPairDigest(pairs: readonly LearningOutcomePair[]): string {
-  return sha256([...pairs].sort((left, right) => left.pairId.localeCompare(right.pairId)));
+  return sha256([...pairs].sort((left, right) => compareCanonicalText(left.pairId, right.pairId)));
 }
 
 function sourceFingerprintMaterial(manifest: LearningEvidenceManifest): unknown {
@@ -391,7 +395,7 @@ function sourceFingerprintMaterial(manifest: LearningEvidenceManifest): unknown 
     techniqueId: manifest.techniqueId,
     hypothesisFamily: manifest.hypothesisFamily,
     gates: manifest.gates,
-    declaredConfounders: manifest.declaredConfounders,
+    declaredConfounders: [...manifest.declaredConfounders].sort(compareCanonicalText),
   };
 }
 
@@ -793,7 +797,7 @@ export function compileLearningEvidencePacket(
 
   validateLearningEvidenceManifest(manifest);
   const startedAt = performance.now();
-  const sortedPairs = [...manifest.pairs].sort((left, right) => left.pairId.localeCompare(right.pairId));
+  const sortedPairs = [...manifest.pairs].sort((left, right) => compareCanonicalText(left.pairId, right.pairId));
   const differences: { pairId: string; difference: number; stratum: string }[] = [];
   const methodCounts: Record<LearningAttribution["method"], number> = {
     direct: 0,
@@ -840,7 +844,7 @@ export function compileLearningEvidencePacket(
     strata.set(row.stratum, existing);
   }
   const stratumMeans = [...strata.entries()]
-    .sort(([left], [right]) => left.localeCompare(right))
+    .sort(([left], [right]) => compareCanonicalText(left, right))
     .map(([, values]) => kahanMean(values) as number);
   const equalStratumEstimate = kahanMean(stratumMeans);
   const simpsonReversal = sign(crudeEstimate) !== 0 && sign(equalStratumEstimate) !== 0 && sign(crudeEstimate) !== sign(equalStratumEstimate);
