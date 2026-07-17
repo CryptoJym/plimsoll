@@ -2,9 +2,9 @@
 
 ## Status
 
-Proposed — pending owner acceptance
+Accepted
 
-This ADR records the implementation candidate under [Plimsoll issue #75](https://github.com/CryptoJym/plimsoll/issues/75). James has not explicitly accepted this exact architecture, so agents must preserve `proposed` status until he makes that decision. Individual migration gates also remain incomplete until their linked issues merge and the integrated resource proof passes.
+Accepted by James on 2026-07-17 after the child migration lanes merged and the integrated resource, privacy, rollback, and current-`main` proofs passed. This acceptance adopts the architecture described here. It does not authorize collector activation, live-ledger migration or storage reclamation, provider/cloud mutation, or production rollout; those remain separate operational decisions.
 
 ## Date
 
@@ -12,7 +12,7 @@ This ADR records the implementation candidate under [Plimsoll issue #75](https:/
 
 ## Decision owners
 
-James is the product, architecture, and release decision-maker. Contributors may propose, implement reversible foundations, and verify the target in independently reviewable lanes, but they do not accept the ADR for him, deploy, activate the installed LaunchAgent, mutate the live ledger, or close owner decisions.
+James is the product, architecture, and release decision-maker. James explicitly accepted this ADR on 2026-07-17. Contributors may implement and verify the accepted design in independently reviewable lanes, but they do not infer rollout approval, deploy, activate the installed LaunchAgent, mutate the live ledger, or close later owner decisions.
 
 ## Context
 
@@ -239,7 +239,7 @@ This order attacks the measured CPU/storage/restart drivers first while keeping 
 
 ## Review gate
 
-Completing this proposal does not accept it or complete the release. Owner acceptance remains separate. Integrated release also requires the machine-readable resource receipt to report `gateReady: true`, no failed or unwired required scenarios, existing proof green with the deterministic-clock repair delivered in #82, collector build green, and a source-of-truth readback from merged `main`.
+Owner acceptance is recorded above. The source integration gate also passed: the machine-readable resource receipt reported `gateReady: true` with no failed or unwired required scenarios; existing proof was green with the deterministic-clock repair delivered in #82; the collector build passed; and merged `main` matched the independently verified tree. Live rollout remains a separate authorization and must retain the release and rollback controls in this ADR.
 
 ## References
 
