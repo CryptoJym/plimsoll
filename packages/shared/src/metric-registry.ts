@@ -212,6 +212,15 @@ export type MetricMaturity = {
   censoredCount: number;
 };
 
+/**
+ * Closed set of runtime configuration that changes a metric formula without
+ * changing the registry definition itself. Null means the parameter is not
+ * part of that metric's formula.
+ */
+export type MetricFormulaConfig = {
+  stabilityHorizonDays: number | null;
+};
+
 export type MetricAttribution = {
   methods: readonly AttributionMethod[];
   attributedCount: number;
@@ -236,6 +245,7 @@ export type MetricResult = {
   lifecycleStatus: MetricLifecycleStatus;
   validationStatus: MetricValidationStatus;
   populationEvent: MetricPopulationEvent;
+  formulaConfig: MetricFormulaConfig;
   window: AnalysisWindow;
   asOf: string;
   numerator: readonly NamedMetricQuantity[];
@@ -421,6 +431,14 @@ function assertAttributionMethod(value: unknown, field: string): asserts value i
   assertOneOf(value, ATTRIBUTION_METHODS, field);
 }
 
+/** Reject identity aliases instead of silently grouping or comparing them. */
+function assertCanonicalIdentity(value: unknown, field: string): asserts value is string {
+  if (typeof value !== "string") throw new Error(`${field} must be a string identity`);
+  const canonical = value.trim().normalize("NFC");
+  if (!canonical) throw new Error(`${field} must not be empty`);
+  if (value !== canonical) throw new Error(`${field} must use canonical identity form`);
+}
+
 export function validateMetricAnalysisManifest(manifest: MetricAnalysisManifest): void {
   if (manifest.schemaVersion !== ANALYSIS_MANIFEST_VERSION) {
     throw new Error(`Unsupported analysis manifest version: ${manifest.schemaVersion}`);
@@ -428,7 +446,7 @@ export function validateMetricAnalysisManifest(manifest: MetricAnalysisManifest)
   if (manifest.definitionVersion !== METRIC_DEFINITION_VERSION) {
     throw new Error(`Unsupported metric definition version: ${manifest.definitionVersion}`);
   }
-  if (!manifest.analysisId.trim()) throw new Error("analysisId must not be empty");
+  assertCanonicalIdentity(manifest.analysisId, "analysisId");
   if (manifest.metricIds.length === 0) throw new Error("metricIds must not be empty");
   if (new Set(manifest.metricIds).size !== manifest.metricIds.length) {
     throw new Error("metricIds must not contain duplicates");
@@ -447,7 +465,7 @@ export function validateMetricAnalysisManifest(manifest: MetricAnalysisManifest)
 
   const ids = new Set<string>();
   for (const delivery of manifest.deliveries) {
-    if (!delivery.id.trim()) throw new Error("delivery id must not be empty");
+    assertCanonicalIdentity(delivery.id, "delivery.id");
     if (ids.has(delivery.id)) throw new Error(`duplicate delivery id: ${delivery.id}`);
     ids.add(delivery.id);
     assertEvidenceState(delivery.deliveryAttribution.evidenceState, `${delivery.id}.deliveryAttribution.evidenceState`);
@@ -465,8 +483,14 @@ export function validateMetricAnalysisManifest(manifest: MetricAnalysisManifest)
 
     const allocationShares = delivery.project.allocation.shares;
     const allocationIds = new Set<string>();
+    if (delivery.project.id !== null) {
+      assertCanonicalIdentity(delivery.project.id, `${delivery.id}.project.id`);
+    }
     for (const [index, share] of allocationShares.entries()) {
-      if (!share.projectId.trim()) throw new Error(`${delivery.id}.project.allocation.shares[${index}].projectId must not be empty`);
+      assertCanonicalIdentity(
+        share.projectId,
+        `${delivery.id}.project.allocation.shares[${index}].projectId`,
+      );
       if (allocationIds.has(share.projectId)) throw new Error(`${delivery.id} project allocation ids must be unique`);
       allocationIds.add(share.projectId);
       if (!Number.isFinite(share.fraction) || share.fraction <= 0 || share.fraction > 1) {
@@ -511,8 +535,14 @@ export function validateMetricAnalysisManifest(manifest: MetricAnalysisManifest)
     const attemptSequences = new Set<number>();
     for (const [index, attempt] of delivery.checks.attempts.entries()) {
       assertOneOf(attempt.state, CHECK_STATES, `${delivery.id}.checks.attempts[${index}].state`);
-      if (!attempt.attemptId.trim()) throw new Error(`${delivery.id} check attempt id must not be empty`);
-      if (!attempt.revisionId.trim()) throw new Error(`${delivery.id} check revision id must not be empty`);
+      assertCanonicalIdentity(attempt.attemptId, `${delivery.id}.checks.attempts[${index}].attemptId`);
+      assertCanonicalIdentity(attempt.revisionId, `${delivery.id}.checks.attempts[${index}].revisionId`);
+      if (attempt.supersedesAttemptId !== null) {
+        assertCanonicalIdentity(
+          attempt.supersedesAttemptId,
+          `${delivery.id}.checks.attempts[${index}].supersedesAttemptId`,
+        );
+      }
       if (!Number.isInteger(attempt.sequence) || attempt.sequence < 1) {
         throw new Error(`${delivery.id} check sequence must be a positive integer`);
       }
@@ -537,7 +567,7 @@ export function validateMetricAnalysisManifest(manifest: MetricAnalysisManifest)
       }
     }
     for (const [index, event] of delivery.rework.events.entries()) {
-      if (!event.kind.trim()) throw new Error(`${delivery.id} rework kind must not be empty`);
+      assertCanonicalIdentity(event.kind, `${delivery.id}.rework.events[${index}].kind`);
       parseInstant(event.at, `${delivery.id}.rework.events[${index}].at`);
     }
     for (const [key, value] of Object.entries(delivery.tokensToFirstGreen)) {
@@ -566,9 +596,10 @@ export function validateMetricAnalysisManifest(manifest: MetricAnalysisManifest)
       throw new Error(`${delivery.id} null technique ids cannot have verified evidence`);
     }
     if (delivery.techniques.ids !== null) {
-      const normalized = delivery.techniques.ids.map((id) => id.trim());
-      if (normalized.some((id) => !id)) throw new Error(`${delivery.id} technique ids must not be empty`);
-      if (new Set(normalized).size !== normalized.length) {
+      for (const [index, id] of delivery.techniques.ids.entries()) {
+        assertCanonicalIdentity(id, `${delivery.id}.techniques.ids[${index}]`);
+      }
+      if (new Set(delivery.techniques.ids).size !== delivery.techniques.ids.length) {
         throw new Error(`${delivery.id} technique ids must be unique`);
       }
     }
@@ -619,7 +650,55 @@ export type PersistedMetricIdentity = {
   definitionVersion: string;
   lifecycleStatus: string;
   validationStatus: string;
+  populationEvent: string;
+  formulaConfig: MetricFormulaConfig;
 };
+
+const STABILITY_HORIZON_METRICS: readonly MetricId[] = ["mature_stable_delivery", "post_merge_rework"];
+
+function assertFormulaConfig(
+  identity: PersistedMetricIdentity,
+  side: "left" | "right",
+  metricId: MetricId,
+): void {
+  if (typeof identity.formulaConfig !== "object" || identity.formulaConfig === null) {
+    throw new Error(`${side}.formulaConfig must be an object`);
+  }
+  const keys = Object.keys(identity.formulaConfig).sort();
+  if (keys.length !== 1 || keys[0] !== "stabilityHorizonDays") {
+    throw new Error(`${side}.formulaConfig must contain only stabilityHorizonDays`);
+  }
+  const horizon = identity.formulaConfig.stabilityHorizonDays;
+  if (STABILITY_HORIZON_METRICS.includes(metricId)) {
+    if (!Number.isInteger(horizon) || (horizon as number) <= 0) {
+      throw new Error(`${side}.formulaConfig.stabilityHorizonDays must be a positive integer`);
+    }
+  } else if (horizon !== null) {
+    throw new Error(`${side}.formulaConfig.stabilityHorizonDays must be null for ${metricId}`);
+  }
+}
+
+function assertIdentityMatchesRegistry(
+  identity: PersistedMetricIdentity,
+  side: "left" | "right",
+  metricId: MetricId,
+): void {
+  const definition = METRIC_REGISTRY[metricId];
+  assertCanonicalIdentity(identity.definitionVersion, `${side}.definitionVersion`);
+  assertOneOf(identity.lifecycleStatus, METRIC_LIFECYCLE_STATUSES, `${side}.lifecycleStatus`);
+  assertOneOf(identity.validationStatus, METRIC_VALIDATION_STATUSES, `${side}.validationStatus`);
+  assertOneOf(identity.populationEvent, ["submitted", "merged"] as const, `${side}.populationEvent`);
+  if (identity.lifecycleStatus !== definition.lifecycleStatus) {
+    throw new Error(`${side}.lifecycleStatus does not match the metric registry`);
+  }
+  if (identity.validationStatus !== definition.validationStatus) {
+    throw new Error(`${side}.validationStatus does not match the metric registry`);
+  }
+  if (identity.populationEvent !== definition.populationEvent) {
+    throw new Error(`${side}.populationEvent does not match the metric registry`);
+  }
+  assertFormulaConfig(identity, side, metricId);
+}
 
 /** Fail closed before comparing persisted results across formula contracts. */
 export function assertComparableMetricResults(
@@ -628,13 +707,11 @@ export function assertComparableMetricResults(
 ): void {
   assertOneOf(left.metricId, METRIC_IDS, "left.metricId");
   assertOneOf(right.metricId, METRIC_IDS, "right.metricId");
-  assertOneOf(left.lifecycleStatus, METRIC_LIFECYCLE_STATUSES, "left.lifecycleStatus");
-  assertOneOf(right.lifecycleStatus, METRIC_LIFECYCLE_STATUSES, "right.lifecycleStatus");
-  assertOneOf(left.validationStatus, METRIC_VALIDATION_STATUSES, "left.validationStatus");
-  assertOneOf(right.validationStatus, METRIC_VALIDATION_STATUSES, "right.validationStatus");
   if (left.metricId !== right.metricId) {
     throw new Error(`cannot compare different metrics: ${left.metricId} vs ${right.metricId}`);
   }
+  assertIdentityMatchesRegistry(left, "left", left.metricId);
+  assertIdentityMatchesRegistry(right, "right", right.metricId);
   if (left.definitionVersion !== right.definitionVersion) {
     throw new Error(
       `cannot compare incompatible formula versions: ${left.definitionVersion} vs ${right.definitionVersion}`,
@@ -643,6 +720,11 @@ export function assertComparableMetricResults(
   const currentVersion = METRIC_REGISTRY[left.metricId].definitionVersion;
   if (left.definitionVersion !== currentVersion) {
     throw new Error(`unsupported persisted formula version: ${left.definitionVersion}`);
+  }
+  if (left.formulaConfig.stabilityHorizonDays !== right.formulaConfig.stabilityHorizonDays) {
+    throw new Error(
+      `cannot compare incompatible formula configuration: stabilityHorizonDays ${String(left.formulaConfig.stabilityHorizonDays)} vs ${String(right.formulaConfig.stabilityHorizonDays)}`,
+    );
   }
   if (left.validationStatus === "blocked" || left.validationStatus === "unvalidated") {
     throw new Error(`left result validation status is not comparable: ${left.validationStatus}`);
@@ -778,12 +860,16 @@ function result(options: {
 }): MetricResult {
   const evidenceState = options.evidenceState ?? evidenceFromCoverage(options.coverage);
   const definition = METRIC_REGISTRY[options.metricId];
+  const usesStabilityHorizon = STABILITY_HORIZON_METRICS.includes(options.metricId);
   return {
     metricId: options.metricId,
     definitionVersion: METRIC_DEFINITION_VERSION,
     lifecycleStatus: definition.lifecycleStatus,
     validationStatus: definition.validationStatus,
     populationEvent: definition.populationEvent,
+    formulaConfig: {
+      stabilityHorizonDays: usesStabilityHorizon ? options.manifest.stabilityHorizonDays : null,
+    },
     window: { ...options.manifest.window },
     asOf: options.manifest.asOf,
     numerator: options.measures.map((measure) => ({ key: measure.key, ...measure.numerator })),

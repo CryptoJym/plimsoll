@@ -15,7 +15,7 @@ Every registry entry also carries:
 - validation status: `unvalidated`, `adversarial_fixture_validated`, `externally_validated`, or `blocked`
 - the population event used for cohort membership: `submitted` or `merged`
 
-Persisted results must pass `assertComparableMetricResults` before comparison. Different or unsupported formula versions, malformed status values, and blocked/unvalidated results fail closed.
+Persisted results must pass `assertComparableMetricResults` before comparison. Different or unsupported formula versions, registry-mismatched lifecycle/validation/population claims, incompatible formula configuration, malformed status values, and blocked/unvalidated results fail closed. The result identity includes the closed `formulaConfig` object; stability and rework results therefore carry their exact `stabilityHorizonDays`, while metrics whose formula does not use that parameter carry `null`.
 
 ## Registry
 
@@ -34,7 +34,7 @@ Persisted results must pass `assertComparableMetricResults` before comparison. D
 
 Every metric result names:
 
-- `definitionVersion`, `window`, and `asOf`
+- `definitionVersion`, closed `formulaConfig`, `window`, and `asOf`
 - lifecycle status, validation status, and population event
 - keyed `numerator`, `denominator`, and calculated `measures`
 - `sample` counts: eligible, sampled, excluded, censored, unknown, and exclusion reasons
@@ -48,7 +48,8 @@ Evidence states are `verified`, `partial`, `inferred`, `blocked`, and `excluded`
 
 ## Fail-closed rules
 
-- Check attempts require unique attempt and revision ids, an increasing sequence, and a linear `supersedesAttemptId` chain. This is the deterministic check lineage.
+- Identity strings are accepted only in canonical trimmed NFC form. Analysis, delivery, project, attempt, revision, supersession, technique, and event-kind identifiers with leading/trailing whitespace or Unicode aliases are rejected before grouping, uniqueness checks, or lineage comparisons.
+- Check attempts require canonical attempt and revision ids, unique attempt ids and sequences, an increasing sequence, and a linear `supersedesAttemptId` chain. This is the deterministic check lineage; repeated canonical revision ids remain visible and do not close a correction.
 - Check success requires `checks.evidenceState = verified`, an explicit `passed` observation, and unambiguous lineage. `none`, `unknown`, or conflicting states at the same timestamp make the outcome incomplete. A visible pass on an incomplete page does not count.
 - A correction closes only when the final passing attempt follows the failed attempt through the lineage and carries a different revision id.
 - Events after `asOf` are invisible. Stability and rework also ignore events after the configured horizon.
@@ -57,6 +58,7 @@ Evidence states are `verified`, `partial`, `inferred`, `blocked`, and `excluded`
 - Missing cost yields `null`/`unknown`; a subtotal with incomplete coverage is a `floor`. An explicitly reported `$0` remains distinguishable from missing cost.
 - Input, output, cache-read, cache-write, time, and USD are distinct units. `sumLikeQuantities` rejects unlike units, so token dimensions cannot be collapsed or mixed with dollars.
 - Runtime enum values are validated even for plain JavaScript/JSON callers. Verified evidence cannot carry null token dimensions, missing cost, null technique ids, or an unknown project allocation.
+- Persisted result status and population claims must exactly match the current registry entry. Formula comparison also checks the complete closed runtime configuration, so results calculated with different stability horizons are incompatible even when their definition version matches.
 
 ## Project allocation
 

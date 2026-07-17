@@ -278,6 +278,12 @@ prove(
       assert.equal(result.lifecycleStatus, "experimental");
       assert.equal(result.validationStatus, "adversarial_fixture_validated");
       assert.ok(result.populationEvent === "submitted" || result.populationEvent === "merged");
+      assert.deepEqual(result.formulaConfig, {
+        stabilityHorizonDays:
+          result.metricId === "mature_stable_delivery" || result.metricId === "post_merge_rework"
+            ? manifest.stabilityHorizonDays
+            : null,
+      });
       assert.deepEqual(result.window, manifest.window);
       assert.equal(result.asOf, manifest.asOf);
       assert.equal(result.numerator.length, result.measures.length);
@@ -291,7 +297,7 @@ prove(
       assert.ok(CLAIM_CLASSES.includes(result.claimClass));
     }
   },
-  "version/window/asOf/numerator/denominator/sample/coverage/maturity/attribution/evidence/claim present",
+  "version/formula config/window/asOf/numerator/denominator/sample/coverage/maturity/attribution/evidence/claim present",
 );
 
 prove(
@@ -663,6 +669,68 @@ prove(
 );
 
 prove(
+  "project allocation ids cannot alias through whitespace",
+  () => {
+    const aliasedAllocation = delivery("aliased-allocation", {
+      project: {
+        id: null,
+        allocation: {
+          kind: "apportioned",
+          shares: [
+            { projectId: "project-a", fraction: 0.5 },
+            { projectId: " project-a ", fraction: 0.5 },
+          ],
+        },
+        attributionMethod: "deterministic_linkage",
+        evidenceState: "verified",
+      },
+    });
+    assert.throws(
+      () =>
+        validateMetricAnalysisManifest({
+          ...manifest,
+          analysisId: "aliased-allocation",
+          deliveries: [aliasedAllocation],
+        }),
+      /projectId must use canonical identity form/,
+    );
+  },
+  "project-a plus whitespace-wrapped project-a is rejected before uniqueness or allocation math",
+);
+
+prove(
+  "revision ids cannot fake a correction through whitespace",
+  () => {
+    const aliasedRevision = delivery("aliased-revision", {
+      checks: {
+        attempts: [
+          attempt("revision-attempt-1", "revision-a", 1, "2026-06-01T01:00:00.000Z", "failed"),
+          attempt(
+            "revision-attempt-2",
+            " revision-a ",
+            2,
+            "2026-06-02T01:00:00.000Z",
+            "passed",
+            "revision-attempt-1",
+          ),
+        ],
+        evidenceState: "verified",
+      },
+    });
+    assert.throws(
+      () =>
+        validateMetricAnalysisManifest({
+          ...manifest,
+          analysisId: "aliased-revision",
+          deliveries: [aliasedRevision],
+        }),
+      /revisionId must use canonical identity form/,
+    );
+  },
+  "revision-a followed by whitespace-wrapped revision-a is rejected rather than counted as a new revision",
+);
+
+prove(
   "runtime enum validation rejects malformed plain-JS manifests",
   () => {
     const base = delivery("bad-enum");
@@ -748,6 +816,54 @@ prove(
     );
   },
   "current/current comparison passes; 1.0.0/0.9.0 comparison fails closed",
+);
+
+prove(
+  "persisted lifecycle and validation claims bind to the registry",
+  () => {
+    assert.throws(
+      () =>
+        assertComparableMetricResults(results[0], {
+          ...results[0],
+          lifecycleStatus: "active",
+        }),
+      /lifecycleStatus does not match the metric registry/,
+    );
+    assert.throws(
+      () =>
+        assertComparableMetricResults(results[0], {
+          ...results[0],
+          validationStatus: "externally_validated",
+        }),
+      /validationStatus does not match the metric registry/,
+    );
+  },
+  "allowed enum values still fail when they forge a status the current registry does not declare",
+);
+
+prove(
+  "formula identity includes the configured stability horizon",
+  () => {
+    const stable14 = analyzeLearningMetrics({
+      ...manifest,
+      analysisId: "stable-horizon-14",
+      metricIds: ["mature_stable_delivery"],
+      stabilityHorizonDays: 14,
+    })[0];
+    const stable7 = analyzeLearningMetrics({
+      ...manifest,
+      analysisId: "stable-horizon-7",
+      metricIds: ["mature_stable_delivery"],
+      stabilityHorizonDays: 7,
+    })[0];
+    assert.deepEqual(stable14.formulaConfig, { stabilityHorizonDays: 14 });
+    assert.deepEqual(stable7.formulaConfig, { stabilityHorizonDays: 7 });
+    assert.throws(
+      () => assertComparableMetricResults(stable14, stable7),
+      /incompatible formula configuration: stabilityHorizonDays 14 vs 7/,
+    );
+  },
+  "mature-stability results calculated at 14 and 7 days cannot be silently compared",
 );
 
 prove(
