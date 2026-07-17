@@ -117,6 +117,118 @@ function main() {
     { coverage: multiRepo.coverage },
   );
 
+  const maxSafe = Number.MAX_SAFE_INTEGER;
+  const boundaryCostNanosA = Math.floor(maxSafe / 3);
+  const boundaryCostNanosB = maxSafe - boundaryCostNanosA;
+  const safeBoundary = allocateEvents(
+    [
+      event("safe-boundary-a", {
+        repoHash: repos[0], branchHash: branches[0], headSha: heads[0],
+        inputTokens: maxSafe - 1,
+        outputTokens: maxSafe - 1,
+        cacheReadTokens: maxSafe - 1,
+        cacheWriteTokens: maxSafe - 1,
+        costUsd: boundaryCostNanosA / 1_000_000_000,
+      }),
+      event("safe-boundary-b", {
+        repoHash: repos[0], branchHash: branches[0], headSha: heads[0],
+        inputTokens: 1,
+        outputTokens: 1,
+        cacheReadTokens: 1,
+        cacheWriteTokens: 1,
+        costUsd: boundaryCostNanosB / 1_000_000_000,
+      }),
+    ],
+    [candidates[0]],
+  );
+  check(
+    "aggregate_exactly_at_safe_integer_boundary_serializes_and_reconciles",
+    safeBoundary.coverage.captured.inputTokens === maxSafe &&
+      safeBoundary.coverage.captured.outputTokens === maxSafe &&
+      safeBoundary.coverage.captured.cacheReadTokens === maxSafe &&
+      safeBoundary.coverage.captured.cacheWriteTokens === maxSafe &&
+      safeBoundary.coverage.captured.knownCostNanos === maxSafe &&
+      safeBoundary.pullRows[0].inputTokens === maxSafe &&
+      safeBoundary.pullRows[0].knownCostNanos === maxSafe &&
+      safeBoundary.coverage.reconciliation.exact &&
+      JSON.parse(JSON.stringify(safeBoundary)).coverage.captured.inputTokens === maxSafe,
+    { captured: safeBoundary.coverage.captured },
+  );
+
+  const tokenFields = [
+    "inputTokens",
+    "outputTokens",
+    "cacheReadTokens",
+    "cacheWriteTokens",
+  ] as const;
+  for (const field of tokenFields) {
+    assert.throws(
+      () => allocateEvents(
+        [
+          event(`overflow-${field}-a`, {
+            repoHash: repos[0], branchHash: branches[0], headSha: heads[0],
+            [field]: maxSafe,
+          }),
+          event(`overflow-${field}-b`, {
+            repoHash: repos[0], branchHash: branches[0], headSha: heads[0],
+            [field]: 1,
+          }),
+        ],
+        [candidates[0]],
+      ),
+      (error: unknown) =>
+        error instanceof RangeError &&
+        error.message === `Allocation aggregate exceeds Number.MAX_SAFE_INTEGER for ${field}`,
+    );
+    checks.push({
+      name: `${field}_aggregate_overflow_fails_closed`,
+      detail: { boundary: maxSafe, rejectedIncrement: 1 },
+    });
+  }
+
+  assert.throws(
+    () => allocateEvents(
+      [
+        event("overflow-cost-a", {
+          repoHash: repos[0], branchHash: branches[0], headSha: heads[0],
+          costUsd: maxSafe / 1_000_000_000,
+        }),
+        event("overflow-cost-b", {
+          repoHash: repos[0], branchHash: branches[0], headSha: heads[0],
+          costUsd: 1 / 1_000_000_000,
+        }),
+      ],
+      [candidates[0]],
+    ),
+    (error: unknown) =>
+      error instanceof RangeError &&
+      error.message ===
+        "Allocation aggregate exceeds Number.MAX_SAFE_INTEGER for knownCostNanos",
+  );
+  checks.push({
+    name: "known_cost_nanos_aggregate_overflow_fails_closed",
+    detail: { boundary: maxSafe, rejectedIncrementNanos: 1 },
+  });
+
+  assert.throws(
+    () => allocateEvents(
+      Array.from({ length: 3 }, (_, index) => event(`independent-max-${index}`, {
+        repoHash: repos[0], branchHash: branches[0], headSha: heads[0],
+        inputTokens: maxSafe,
+        costUsd: maxSafe / 1_000_000_000,
+      })),
+      [candidates[0]],
+    ),
+    (error: unknown) =>
+      error instanceof RangeError &&
+      error.message ===
+        "Allocation aggregate exceeds Number.MAX_SAFE_INTEGER for inputTokens",
+  );
+  checks.push({
+    name: "independent_three_max_counterexample_cannot_emit_reconciled_totals",
+    detail: { events: 3, perEventInputTokens: maxSafe, perEventKnownCostNanos: maxSafe },
+  });
+
   const exactRepo = hash("4");
   const branchOne = hash("5");
   const branchTwo = hash("6");

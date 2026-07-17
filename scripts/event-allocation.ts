@@ -272,13 +272,44 @@ function resolveCandidate(
   return { candidate: null, reason: "repo_outside_time_window" };
 }
 
+const MAX_SAFE_INTEGER_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
+
+function addExactAmount(
+  field: keyof AllocationAmounts,
+  left: number,
+  right: number,
+): number {
+  // Inputs are already per-event safe integers. Compare the exact BigInt sum
+  // before converting back to number so IEEE-754 rounding can never turn an
+  // overflowing aggregate into a plausible reconciled value.
+  const sum = BigInt(left) + BigInt(right);
+  if (sum > MAX_SAFE_INTEGER_BIGINT) {
+    throw new RangeError(
+      `Allocation aggregate exceeds Number.MAX_SAFE_INTEGER for ${field}`,
+    );
+  }
+  return Number(sum);
+}
+
 function addAmounts(left: AllocationAmounts, right: AllocationAmounts): AllocationAmounts {
   return {
-    inputTokens: left.inputTokens + right.inputTokens,
-    outputTokens: left.outputTokens + right.outputTokens,
-    cacheReadTokens: left.cacheReadTokens + right.cacheReadTokens,
-    cacheWriteTokens: left.cacheWriteTokens + right.cacheWriteTokens,
-    knownCostNanos: left.knownCostNanos + right.knownCostNanos,
+    inputTokens: addExactAmount("inputTokens", left.inputTokens, right.inputTokens),
+    outputTokens: addExactAmount("outputTokens", left.outputTokens, right.outputTokens),
+    cacheReadTokens: addExactAmount(
+      "cacheReadTokens",
+      left.cacheReadTokens,
+      right.cacheReadTokens,
+    ),
+    cacheWriteTokens: addExactAmount(
+      "cacheWriteTokens",
+      left.cacheWriteTokens,
+      right.cacheWriteTokens,
+    ),
+    knownCostNanos: addExactAmount(
+      "knownCostNanos",
+      left.knownCostNanos,
+      right.knownCostNanos,
+    ),
   };
 }
 
