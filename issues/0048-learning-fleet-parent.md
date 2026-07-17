@@ -28,6 +28,7 @@ Parent program for public collector issues 0049–0057 and paired hosted issues 
 - [ ] 0055 / #103 canonical packaged Mac install/update/rollback/uninstall/doctor
 - [ ] 0056 / #104 authenticated bounded localhost surfaces and safe dashboard rendering
 - [ ] 0057 / #105 bounded learning/resource E2E plus two-member/two-machine release gate
+- [ ] 0058 / #107 installer/doctor regression slice (child of 0055 / #103)
 
 ## Acceptance Criteria
 - [ ] Project/work-unit allocations conserve all token classes and known cost; no event is charged more than once.
