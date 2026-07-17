@@ -172,15 +172,20 @@ try {
   const isolatedHome = home("workspace-a-backlog");
   const { bytes: configABytes, configPath: configAPath } = writeConfig(isolatedHome);
   const ledgerPath = collectorBufferPath(isolatedHome);
-  const activeBuffer = new LocalEventBuffer(ledgerPath);
+  const configA = oldConfig();
+  const activeBuffer = new LocalEventBuffer(ledgerPath, {
+    workspaceId: TENANT_A,
+    delivery: { enabled: true, limits: configA.delivery },
+  });
   const backlog = appendForwardedHook(
     {
       id: "workspace_a_private_backlog_event",
       source: "claude_code",
       event_type: "UserPromptSubmit",
     },
-    { config: oldConfig(), buffer: activeBuffer, source: "claude_code" },
+    { config: configA, buffer: activeBuffer, source: "claude_code" },
   );
+  activeBuffer.delivery.openCircuit("auth_blocked");
   activeBuffer.close();
   const requests: RequestRecord[] = [];
   const temporaryRoot = path.join(root, "successful-temporary-state");
@@ -217,6 +222,7 @@ try {
     postActivationBuffer,
     { fetchImpl: ordinaryFetch },
   );
+  const postJoinCircuit = postActivationBuffer.delivery.status().circuit.kind;
   const preservedARow = postActivationBuffer.database
     .prepare(
       `select workspace_id as workspaceId, uploaded_at as uploadedAt
@@ -252,6 +258,7 @@ try {
       joined.workspaceBoundary.fromWorkspaceId === TENANT_A &&
       joined.workspaceBoundary.toWorkspaceId === TENANT_B &&
       firstOrdinaryUpload.uploadedEvents === 0 &&
+      postJoinCircuit === "none" &&
       preservedARow.workspaceId === TENANT_A &&
       preservedARow.uploadedAt === null &&
       ordinaryBodies.length === 1 &&
@@ -269,6 +276,7 @@ try {
       requests: requests.length,
       handshakeEvents: handshakeEvents.length,
       firstOrdinaryUploaded: firstOrdinaryUpload.uploadedEvents,
+      postJoinCircuit,
       ordinaryRequests: ordinaryBodies.length,
       preservedWorkspaceA: preservedARow,
       appVersion: handshakeBody?.appVersion,

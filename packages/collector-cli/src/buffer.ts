@@ -390,6 +390,9 @@ export class LocalEventBuffer {
            where singleton = 1`,
         )
         .run({ to, now: new Date().toISOString() });
+      // Auth/contract circuits describe the prior workspace endpoint and must
+      // not block the newly authenticated audience after reassignment.
+      this.delivery.clearCircuit();
     });
     run();
     this.workspaceId = to;
