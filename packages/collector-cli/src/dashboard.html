@@ -53,21 +53,12 @@ body{
   padding:18px 0; gap:0; z-index:5;
 }
 .rail .mark{ margin-bottom:22px }
-.rail .ticks{flex:1; width:100%; position:relative}
-.rail .tick{
-  position:absolute; right:0; width:18px; height:1px; background:var(--foam-faint);
-}
-.rail .tick.major{width:30px; background:var(--foam-dim)}
-.rail .tick span{
-  position:absolute; right:36px; top:-7px; font-size:9px; letter-spacing:.08em;
-  color:var(--foam-faint);
-}
-.rail .wl{position:absolute; right:0; left:0; height:2px; background:var(--brass);
-  box-shadow:0 0 12px rgba(232,179,75,.7); transition:top 1.2s cubic-bezier(.2,.8,.2,1)}
-.rail .draft{position:absolute; right:0; left:0; bottom:0;
-  background:linear-gradient(180deg, rgba(35,137,167,.36), rgba(35,137,167,.08));
-  border-top:1px solid rgba(127,195,232,.75);
-  transition:height 1.2s cubic-bezier(.2,.8,.2,1)}
+.rail .ticks{flex:1; width:100%; min-height:1px}
+.rail .tick{stroke:var(--foam-faint);stroke-width:1}
+.rail .tick.major{stroke:var(--foam-dim)}
+.rail .tick-label{fill:var(--foam-faint);font-size:9px;letter-spacing:.08em}
+.rail .wl{stroke:var(--brass);stroke-width:2;filter:drop-shadow(0 0 3px rgba(232,179,75,.8))}
+.rail .draft{fill:rgba(35,137,167,.26);stroke:rgba(127,195,232,.75);stroke-width:1}
 .rail .cap{font-size:8px; letter-spacing:.26em; color:var(--foam-faint); margin:-14px 0 10px}
 
 /* ——— shell ——— */
@@ -225,6 +216,39 @@ a{color:var(--waterline)}
 :focus-visible{outline:2px solid var(--waterline);outline-offset:2px}
 tr.row:focus-visible{background:rgba(35,137,167,.12)}
 .linkish{background:none;border:0;color:inherit;font:inherit;cursor:pointer;padding:0;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;text-align:left}
+.window-select{color:var(--foam-dim);font-size:10px;letter-spacing:.1em;padding:3px 6px}
+.toolbar-btn{background:none;border:1px solid var(--line-bright);color:var(--foam-dim);font-family:var(--mono);font-size:10px;letter-spacing:.14em;padding:4px 12px;cursor:pointer;text-transform:uppercase}
+.vendor-kv{margin-top:10px;padding-top:10px;border-top:1px dashed var(--line)}
+.legend-dot.water{background:var(--waterline)}
+.legend-dot.unseen{background:var(--line-bright)}
+.muted{color:var(--foam-faint)}
+.plate-meta{letter-spacing:.05em;text-transform:none;color:var(--foam-faint);margin-left:auto}
+.plate-meta.plain{letter-spacing:0}
+.watch-rows{display:flex;flex-direction:column;gap:6px}
+.watch-row{display:flex;align-items:center;gap:6px}
+.watch-dot{display:inline-block;width:9px;height:9px;flex:none}
+.watch-dot.green{background:var(--signal-green);box-shadow:0 0 6px var(--signal-green)}
+.watch-dot.amber{background:var(--signal-amber);box-shadow:0 0 6px var(--signal-amber)}
+.watch-dot.red{background:var(--signal-red);box-shadow:0 0 6px var(--signal-red)}
+.foam{color:var(--foam)}
+.foam-dim{color:var(--foam-dim)}
+.drawer-title{font-size:10px;letter-spacing:.24em;color:var(--foam-faint);text-transform:uppercase}
+.settings-grid{display:grid;gap:8px}
+.detected{margin-top:8px;font-size:10px}
+.priority-add{display:flex;gap:8px;margin-bottom:10px}
+.grow{flex:1}
+.sub-add{display:grid;grid-template-columns:1fr 90px 70px auto;gap:8px;margin-top:10px}
+.settings-message{margin-top:14px;font-size:11px;color:var(--signal-amber)}
+.push-right{margin-left:auto}
+.wrap{flex-wrap:wrap}
+.account-input{flex:1;min-width:120px}
+.email-input{flex:1;min-width:150px}
+.mix-chart{width:100%;height:8px;display:block;border:1px solid var(--line)}
+.mix-note{font-size:10px;color:var(--foam-faint);margin-top:6px}
+.vendor-break{padding-top:6px}
+.leverage-good{color:var(--signal-green)}
+.leverage-low{color:var(--signal-amber)}
+[hidden]{display:none!important}
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation:none!important;transition:none!important}
 }
@@ -241,20 +265,20 @@ tr.row:focus-visible{background:rgba(35,137,167,.12)}
     </svg>
   </div>
   <div class="cap" aria-hidden="true">DRAUGHT $</div>
-  <div class="ticks" id="rail-ticks"></div>
+  <svg class="ticks" id="rail-ticks" viewBox="0 0 64 100" preserveAspectRatio="none" aria-hidden="true"></svg>
 </nav>
 
 <main>
   <header class="mast">
     <h1 class="wordmark">Plims<em>o</em>ll</h1>
     <div class="sub">local ledger · metadata mode</div>
-    <select id="window-select" aria-label="dashboard time window" style="background:var(--sea-0);border:1px solid var(--line-bright);color:var(--foam-dim);font-family:var(--mono);font-size:10px;letter-spacing:.1em;padding:3px 6px">
+    <select id="window-select" class="window-select" aria-label="dashboard time window">
       <option value="30">30 days</option><option value="90">90 days</option>
       <option value="182">6 months</option><option value="365">1 year</option>
       <option value="1825">all history</option>
     </select>
     <div class="lamp" id="lamp"><i aria-hidden="true"></i><span id="lamp-text" role="status">sounding…</span></div>
-  <button id="open-settings" aria-haspopup="dialog" aria-controls="settings" style="background:none;border:1px solid var(--line-bright);color:var(--foam-dim);font-family:var(--mono);font-size:10px;letter-spacing:.14em;padding:4px 12px;cursor:pointer;text-transform:uppercase">⚙ settings</button>
+  <button id="open-settings" class="toolbar-btn" aria-haspopup="dialog" aria-controls="settings">⚙ settings</button>
   </header>
   <div class="crumbs" id="crumbs">127.0.0.1 · <b>nothing leaves this machine from this page</b></div>
 
@@ -264,7 +288,7 @@ tr.row:focus-visible{background:rgba(35,137,167,.12)}
       <h2>Attributed spend · <span id="window-label">30 days</span></h2>
       <div class="figure" id="fig-cost">—</div>
       <div class="unit">USD, summed from per-request telemetry</div>
-      <dl class="kv" id="kv-vendors" style="margin-top:10px;padding-top:10px;border-top:1px dashed var(--line)"></dl>
+      <dl class="kv vendor-kv" id="kv-vendors"></dl>
       <dl class="kv">
         <dt>input tokens</dt><dd id="kv-in">—</dd>
         <dt>output tokens</dt><dd id="kv-out">—</dd>
@@ -290,9 +314,9 @@ tr.row:focus-visible{background:rgba(35,137,167,.12)}
         <div>
           <div class="cov-num" id="cov-pct">—%</div>
           <div class="legend" id="cov-legend">
-            <span><i style="background:var(--waterline)"></i>sessions with token attribution</span>
-            <span><i style="background:var(--line-bright)"></i>sessions seen (window)</span>
-            <span id="cov-note" style="color:var(--foam-faint)"></span>
+            <span><i class="legend-dot water"></i>sessions with token attribution</span>
+            <span><i class="legend-dot unseen"></i>sessions seen (window)</span>
+            <span id="cov-note" class="muted"></span>
           </div>
         </div>
       </div>
@@ -300,9 +324,9 @@ tr.row:focus-visible{background:rgba(35,137,167,.12)}
 
     <section class="plate span12" id="watch-plate">
       <h2>Capture watch · silence must scream
-        <span style="letter-spacing:.05em;text-transform:none;color:var(--foam-faint);margin-left:auto" id="watch-stamp"></span>
+        <span class="plate-meta" id="watch-stamp"></span>
       </h2>
-      <div id="watch-rows" class="legend" style="display:flex;flex-direction:column;gap:6px"><span style="color:var(--foam-faint)">sounding…</span></div>
+      <div id="watch-rows" class="legend watch-rows"><span class="muted">sounding…</span></div>
     </section>
 
     <section class="plate span12">
@@ -319,7 +343,7 @@ tr.row:focus-visible{background:rgba(35,137,167,.12)}
     </section>
 
     <section class="plate span6">
-      <h2>By repository <span style="letter-spacing:0;text-transform:none;color:var(--foam-faint)">(names local-only, never uploaded) · click for detail</span></h2>
+      <h2>By repository <span class="plate-meta plain">(names local-only, never uploaded) · click for detail</span></h2>
       <table id="t-repos" aria-label="Spend by repository — rows open detail"><thead><tr>
         <th scope="col">repo (hash)</th><th class="num" scope="col">sessions</th><th class="num" scope="col">tokens</th><th class="num" scope="col">usd</th>
       </tr></thead><tbody></tbody></table>
@@ -328,7 +352,7 @@ tr.row:focus-visible{background:rgba(35,137,167,.12)}
 
     <section class="plate span12">
       <h2>Accounts · who, where, and on what
-        <span style="letter-spacing:.05em;text-transform:none;color:var(--foam-faint);margin-left:auto">priority list: <span id="prio-count">0</span> repos · plimsoll priority add &lt;url&gt;</span>
+        <span class="plate-meta">priority list: <span id="prio-count">0</span> repos · plimsoll priority add &lt;url&gt;</span>
       </h2>
       <table id="t-accounts" aria-label="Accounts"><thead><tr>
         <th scope="col">account</th><th scope="col">machines</th><th class="num" scope="col">sessions</th>
@@ -340,7 +364,7 @@ tr.row:focus-visible{background:rgba(35,137,167,.12)}
 
     <section class="plate span12">
       <h2>Sessions · click a row for its receipts
-        <span style="letter-spacing:.05em;text-transform:none;color:var(--foam-faint);margin-left:auto">
+        <span class="plate-meta">
           <span class="flag cc">CC</span> Claude Code &nbsp; <span class="flag cx">CX</span> Codex &nbsp; ~ computed cost</span>
       </h2>
       <table id="t-sessions" aria-label="Sessions — rows open receipts"><thead><tr>
@@ -356,7 +380,7 @@ tr.row:focus-visible{background:rgba(35,137,167,.12)}
 <div class="veil" id="veil" aria-hidden="true"></div>
 <aside class="drawer" id="drawer" role="dialog" aria-modal="true" aria-label="session receipts">
   <button class="close" id="drawer-close">close ✕</button>
-  <h2 style="font-size:10px;letter-spacing:.24em;color:var(--foam-faint);text-transform:uppercase">Receipts</h2>
+  <h2 class="drawer-title">Receipts</h2>
   <div class="sid" id="d-sid"></div>
   <div id="d-body"></div>
   <div class="stamp">every figure traceable · plimsoll local ledger</div>
@@ -364,29 +388,29 @@ tr.row:focus-visible{background:rgba(35,137,167,.12)}
 
 <aside class="drawer" id="settings" role="dialog" aria-modal="true" aria-label="settings">
   <button class="close" id="settings-close">close ✕</button>
-  <h2 style="font-size:10px;letter-spacing:.24em;color:var(--foam-faint);text-transform:uppercase">Settings</h2>
+  <h2 class="drawer-title">Settings</h2>
   <div class="sid">stored on this machine only — labels and lists never upload</div>
 
   <h3>Account names &amp; emails</h3>
-  <div id="s-accounts" style="display:grid;gap:8px"></div>
-  <div id="s-detected" class="hash" style="margin-top:8px;font-size:10px"></div>
+  <div id="s-accounts" class="settings-grid"></div>
+  <div id="s-detected" class="hash detected"></div>
 
   <h3>Priority projects</h3>
-  <div style="display:flex;gap:8px;margin-bottom:10px">
-    <input id="s-prio-url" aria-label="repository URL to prioritize" placeholder="paste a repo URL — https://github.com/org/repo" style="flex:1">
+  <div class="priority-add">
+    <input id="s-prio-url" class="grow" aria-label="repository URL to prioritize" placeholder="paste a repo URL — https://github.com/org/repo">
     <button class="btn" id="s-prio-add">add</button>
   </div>
-  <div id="s-prio-list" style="display:grid;gap:6px"></div>
+  <div id="s-prio-list" class="settings-grid"></div>
 
   <h3>Subscriptions (for plan leverage)</h3>
-  <div id="s-subs" style="display:grid;gap:8px"></div>
-  <div style="display:grid;grid-template-columns:1fr 90px 70px auto;gap:8px;margin-top:10px">
+  <div id="s-subs" class="settings-grid"></div>
+  <div class="sub-add">
     <select id="s-sub-account" aria-label="subscription account"></select>
     <input id="s-sub-plan" aria-label="plan name" placeholder="plan name" value="Max">
     <input id="s-sub-usd" aria-label="dollars per month" placeholder="$/mo" type="number" min="0" value="200">
     <button class="btn" id="s-sub-add">add</button>
   </div>
-  <div id="s-msg" role="status" style="margin-top:14px;font-size:11px;color:var(--signal-amber)"></div>
+  <div id="s-msg" class="settings-message" role="status"></div>
 </aside>
 
 <footer class="keel">
@@ -394,7 +418,7 @@ tr.row:focus-visible{background:rgba(35,137,167,.12)}
   <span>ledger <b id="f-ledger">…</b></span>
   <span>retention <b id="f-retention">…</b></span>
   <span>events <b id="f-events">…</b></span>
-  <span style="margin-left:auto">refreshed <b id="f-time">—</b></span>
+  <span class="push-right">refreshed <b id="f-time">—</b></span>
 </footer>
 
 <script>
@@ -402,6 +426,59 @@ const $=(s)=>document.querySelector(s);
 const fmt=(n)=>n==null?"—":Number(n).toLocaleString("en-US");
 const usd=(n)=>n==null?"—":"$"+Number(n).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
 const short=(h)=>h?h.replace("sha256:","").slice(0,8):"·";
+const SVG_NS="http://www.w3.org/2000/svg";
+
+function add(parent,...children){
+  for(const child of children.flat(Infinity)){
+    if(child==null)continue;
+    parent.appendChild(child&&typeof child==="object"&&"nodeType" in child?child:document.createTextNode(String(child)));
+  }
+  return parent;
+}
+function node(tag,text=null,className=""){
+  const out=document.createElement(tag);
+  if(className)out.className=className;
+  if(text!=null)out.textContent=String(text);
+  return out;
+}
+function svgNode(tag,attributes={}){
+  const out=document.createElementNS(SVG_NS,tag);
+  for(const [name,value] of Object.entries(attributes))out.setAttribute(name,String(value));
+  return out;
+}
+function clear(element){element.replaceChildren();return element}
+function emptyNode(message){return node("div",message,"empty")}
+function heading(message){return node("h3",message)}
+function cell(content,className=""){return add(node("td",null,className),content)}
+function tableRow(cells,activate){
+  const tr=node("tr");
+  for(const entry of cells)tr.appendChild(cell(entry.content,entry.className||""));
+  if(activate){
+    tr.className="row";
+    tr.tabIndex=0;
+    tr.addEventListener("click",activate);
+    tr.addEventListener("keydown",event=>{
+      if(event.key==="Enter"||event.key===" "){event.preventDefault();activate()}
+    });
+  }
+  return tr;
+}
+function definitionList(pairs){
+  const dl=node("dl",null,"kv");
+  for(const pair of pairs){
+    dl.appendChild(node("dt",pair.label,pair.termClass||""));
+    dl.appendChild(add(node("dd",null,pair.valueClass||""),pair.value));
+  }
+  return dl;
+}
+function detailTable(headers,bodyRows){
+  const table=node("table"),thead=node("thead"),headRow=node("tr"),tbody=node("tbody");
+  for(const header of headers){const th=node("th",header.label,header.className||"");th.scope="col";headRow.appendChild(th)}
+  thead.appendChild(headRow);
+  for(const row of bodyRows)tbody.appendChild(tableRow(row));
+  add(table,thead,tbody);
+  return table;
+}
 
 /* The draught rail is the namesake instrument (#51): water = spend draft
    in the window, brass waterline = plan cost, scale auto-ranges so the
@@ -409,30 +486,27 @@ const short=(h)=>h?h.replace("sha256:","").slice(0,8):"·";
    gauge, not here — one instrument, one truth. */
 const compactUsd=(n)=>n>=99500?"$"+Math.round(n/1000)+"k":n>=1000?"$"+(Math.round(n/100)/10)+"k":n>=10?"$"+Math.round(n):"$"+(Math.round(n*10)/10);
 function niceCeil(x){const p=Math.pow(10,Math.floor(Math.log10(x||1)));for(const m of[1,2,2.5,5,10]){if(m*p>=x)return m*p}return 10*p}
-const railState={top:0,H:0};
 function renderRail(spendUsd,planUsd,windowLabel){
-  const box=$("#rail-ticks"); if(!box)return; const H=box.clientHeight||1;
+  const box=$("#rail-ticks"); if(!box)return;
+  const H=box.clientHeight||100;box.setAttribute("viewBox",`0 0 64 ${H}`);
   const top=niceCeil(Math.max(spendUsd,(planUsd||0)*1.2,10));
-  const draftH=Math.max(spendUsd>0?2:0, H*Math.min(spendUsd/top,1));
-  if(top!==railState.top||H!==railState.H){
-    railState.top=top; railState.H=H; box.innerHTML="";
-    const water=document.createElement("div"); water.className="draft"; water.id="rail-draft";
-    box.appendChild(water);
-    for(let i=0;i<=20;i++){
-      const t=document.createElement("div");
-      t.className="tick"+(i%5===0?" major":"");
-      t.style.top=(i/20*H)+"px";
-      if(i%5===0){const sp=document.createElement("span");sp.textContent=compactUsd(top*(20-i)/20);t.appendChild(sp);}
-      box.appendChild(t);
+  const draftH=Math.max(spendUsd>0?2:0,H*Math.min(spendUsd/top,1));
+  clear(box);
+  const water=svgNode("rect",{class:"draft",x:0,y:H-draftH,width:64,height:draftH});
+  add(water,add(svgNode("title"),"spend draft "+usd(spendUsd)+" on a "+compactUsd(top)+" scale"));
+  box.appendChild(water);
+  for(let i=0;i<=20;i++){
+    const y=i/20*H,major=i%5===0;
+    box.appendChild(svgNode("line",{class:"tick"+(major?" major":""),x1:major?34:46,y1:y,x2:64,y2:y}));
+    if(major){
+      const label=svgNode("text",{class:"tick-label",x:31,y:Math.min(H-2,Math.max(9,y+3)),"text-anchor":"end"});
+      label.textContent=compactUsd(top*(20-i)/20);box.appendChild(label);
     }
-    const wl=document.createElement("div"); wl.className="wl"; wl.id="rail-wl";
-    box.appendChild(wl);
   }
-  const water=$("#rail-draft"), wl=$("#rail-wl");
-  water.style.height=draftH+"px";
-  water.title="spend draft "+usd(spendUsd)+" on a "+compactUsd(top)+" scale";
-  wl.style.display=planUsd>0?"":"none";
-  if(planUsd>0){wl.style.top=(H*(1-Math.min(planUsd/top,1)))+"px"; wl.title="plan waterline "+usd(planUsd)+" this window";}
+  if(planUsd>0){
+    const y=H*(1-Math.min(planUsd/top,1)),wl=svgNode("line",{class:"wl",x1:0,y1:y,x2:64,y2:y});
+    add(wl,add(svgNode("title"),"plan waterline "+usd(planUsd)+" this window"));box.appendChild(wl);
+  }
   $("#rail").setAttribute("aria-label","Draught rail: spend draft "+usd(spendUsd)+(planUsd>0?" against plan waterline "+usd(planUsd):"")+" in "+windowLabel+". Scale 0 to "+compactUsd(top)+".");
 }
 
@@ -453,17 +527,30 @@ function drawSpark(daily){
   const svg=$("#spark"); const W=svg.clientWidth||1000, H=120, pad=18;
   svg.setAttribute("role","img");
   svg.setAttribute("aria-label", daily.length?`Daily spend, ${daily[0].day} to ${daily[daily.length-1].day}, peak ${usd(Math.max(...daily.map(d=>d.costUsd),0.01))} per day`:"No spend recorded in window");
-  svg.setAttribute("viewBox",`0 0 ${W} ${H}`); svg.innerHTML="";
-  if(!daily.length){svg.innerHTML=`<text x="${W/2}" y="${H/2}" text-anchor="middle">no spend recorded in window</text>`;return}
+  svg.setAttribute("viewBox",`0 0 ${W} ${H}`); clear(svg);
+  if(!daily.length){
+    const message=svgNode("text",{x:W/2,y:H/2,"text-anchor":"middle"});
+    message.textContent="no spend recorded in window";svg.appendChild(message);return;
+  }
   daily=fillDays(daily);
   const max=Math.max(...daily.map(d=>d.costUsd),0.01);
   const bw=Math.max(2,(W-pad*2)/daily.length-3);
-  svg.innerHTML=`<line x1="0" y1="${H-14}" x2="${W}" y2="${H-14}"/>`+daily.map((d,i)=>{
-    if(!(d.costUsd>0)) return "";
+  svg.appendChild(svgNode("line",{x1:0,y1:H-14,x2:W,y2:H-14}));
+  daily.forEach((d,i)=>{
+    if(!(d.costUsd>0))return;
     const h=Math.max(2.5,(d.costUsd/max)*(H-34));
     const x=pad+i*((W-pad*2)/daily.length);
-    return `<g class="bar-g"><rect class="bar" x="${x}" y="${H-14-h}" width="${bw}" height="${h}"><title>${d.day} · ${usd(d.costUsd)} · ${fmt(d.tokens)} tok</title></rect></g>`;
-  }).join("")+`<text x="${pad}" y="${H-3}">${daily[0].day}</text><text x="${W-pad}" y="${H-3}" text-anchor="end">${daily[daily.length-1].day}</text><text x="${W-pad}" y="12" text-anchor="end">peak ${usd(max)}/day</text>`;
+    const group=svgNode("g",{class:"bar-g"}),rect=svgNode("rect",{class:"bar",x,y:H-14-h,width:bw,height:h});
+    add(rect,add(svgNode("title"),`${d.day} · ${usd(d.costUsd)} · ${fmt(d.tokens)} tok`));group.appendChild(rect);svg.appendChild(group);
+  });
+  for(const entry of [
+    {x:pad,y:H-3,text:daily[0].day},
+    {x:W-pad,y:H-3,text:daily[daily.length-1].day,anchor:"end"},
+    {x:W-pad,y:12,text:`peak ${usd(max)}/day`,anchor:"end"},
+  ]){
+    const label=svgNode("text",{x:entry.x,y:entry.y,...(entry.anchor?{"text-anchor":entry.anchor}:{})});
+    label.textContent=entry.text;svg.appendChild(label);
+  }
 }
 
 function gauge(pct){
@@ -477,9 +564,10 @@ function gauge(pct){
   num.className="cov-num"+(pct<.5?" bad":pct<.8?" warn":"");
 }
 
-function rows(tbodySel,emptySel,arr,render){
-  const tb=$(tbodySel+" tbody"); tb.innerHTML=arr.map(render).join("");
-  $(emptySel).hidden=arr.length>0; $(tbodySel).style.display=arr.length?"table":"none";
+function rows(tableSel,emptySel,arr,render){
+  const tb=$(tableSel+" tbody");clear(tb);
+  for(const entry of arr)tb.appendChild(render(entry));
+  $(emptySel).hidden=arr.length>0;$(tableSel).hidden=arr.length===0;
 }
 
 let lastFocus=null;
@@ -505,87 +593,183 @@ document.addEventListener("keydown",e=>{
   if(e.shiftKey&&document.activeElement===first){e.preventDefault();last.focus()}
   else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first.focus()}
 });
-function rk(e){if(e.key==="Enter"||e.key===" "){e.preventDefault();e.currentTarget.click()}}
-function drawerError(what,e){$("#d-body").innerHTML=`<div class="empty">couldn\u2019t load ${what} \u2014 ${String((e&&e.message)||e)}</div>`}
+function drawerError(what,e){clear($("#d-body")).appendChild(emptyNode(`couldn’t load ${what} — ${String((e&&e.message)||e)}`))}
+function drawerLoading(){clear($("#d-body")).appendChild(emptyNode("sounding…"))}
+function boldValue(value){return node("b",value)}
 
+const ACTION_COLORS={shell:"#2389a7",edit:"#e8b34b",write:"#e8b34b",read:"#3ddc97",mcp:"#bda7e8",browser:"#7fc3e8",other:"#3e4e5a"};
+function actionMix(mix){
+  const safeMix=Array.isArray(mix)?mix:[],total=safeMix.reduce((sum,item)=>sum+Math.max(0,Number(item.n)||0),0)||1;
+  const chart=svgNode("svg",{class:"mix-chart",viewBox:"0 0 100 8",preserveAspectRatio:"none","aria-label":"Action mix"});chart.setAttribute("role","img");
+  let x=0;
+  if(!safeMix.length)chart.appendChild(svgNode("rect",{x:0,y:0,width:100,height:8,fill:"var(--line)"}));
+  for(const item of safeMix){
+    const width=Math.max(0,Number(item.n)||0)/total*100,fill=ACTION_COLORS[item.actionClass]||ACTION_COLORS.other;
+    const rect=svgNode("rect",{x,y:0,width,height:8,fill});add(rect,add(svgNode("title"),`${item.actionClass} ${fmt(item.n)}`));chart.appendChild(rect);x+=width;
+  }
+  return [chart,node("div",safeMix.map(item=>`${item.actionClass} ${fmt(item.n)}`).join(" · ")||"no tool events","mix-note")];
+}
+function renderSessionDetail(d){
+  const body=clear($("#d-body")),rollup=d.rollup||{},receipts=d.receipts||{};
+  const reading=[
+    {label:"source",value:rollup.source},
+    {label:"window",value:`${String(rollup.startedAt||"").slice(0,16).replace("T"," ")} → ${String(rollup.endedAt||"").slice(11,16)}`},
+    {label:"events",value:fmt(rollup.events)},{label:"token events",value:fmt(rollup.tokenEvents)},
+    {label:"tokens in / out",value:`${fmt(rollup.inputTokens)} / ${fmt(rollup.outputTokens)}`},{label:"cache reads",value:fmt(rollup.cacheReadTokens)},
+  ];
+  if(Number(rollup.cacheCreationTokens)>0)reading.push({label:"cache writes",value:fmt(rollup.cacheCreationTokens)});
+  reading.push({label:"cost",value:boldValue(usd(rollup.costUsd))});
+  add(body,heading("Reading"),definitionList(reading),heading("Join keys"));
+  const linkage=Array.isArray(receipts.linkage)?receipts.linkage:[];
+  if(linkage.length)body.appendChild(detailTable(
+    [{label:"repo"},{label:"branch"},{label:"head sha"},{label:"ev",className:"num"}],
+    linkage.map(item=>[
+      {content:short(item.repoHash),className:"hash"},{content:short(item.branchHash),className:"hash"},
+      {content:String(item.headSha||"·").slice(0,8),className:"hash"},{content:fmt(item.events),className:"num"},
+    ]),
+  ));else body.appendChild(emptyNode("no git linkage captured for this session"));
+  add(body,heading("Action mix"),actionMix(receipts.actionMix),heading("Event types"));
+  body.appendChild(definitionList((receipts.eventTypes||[]).map(item=>({label:item.eventType,value:fmt(item.n)}))));
+  body.appendChild(heading("Models"));
+  if((receipts.models||[]).length)body.appendChild(definitionList(receipts.models.map(item=>{
+    const value=node("span");add(value,`${fmt(item.inputTokens)}/${fmt(item.outputTokens)} · `,boldValue(usd(item.costUsd)));return {label:item.model,value};
+  })));else body.appendChild(emptyNode("no model-attributed events"));
+  add(body,heading("Privacy"),definitionList([{label:"events with suppressed raw fields",value:fmt(receipts.suppression?.suppressedEvents)}]));
+}
 async function openSession(id){
-  openDrawer($("#drawer"));
-  $("#d-sid").textContent=id;
-  $("#d-body").innerHTML='<div class="empty">sounding\u2026</div>';
-  let d;
+  openDrawer($("#drawer"));$("#d-sid").textContent=id;drawerLoading();
   try{
-    const r=await fetch("/api/session?id="+encodeURIComponent(id));
-    d=await r.json();
-    if(!r.ok||d.error)throw new Error((d&&(d.message||d.error))||("HTTP "+r.status));
-  }catch(e){drawerError("receipts",e);return}
-  const mix=(d.receipts.actionMix||[]); const tot=mix.reduce((s,m)=>s+m.n,0)||1;
-  const colors={shell:"#2389a7",edit:"#e8b34b",write:"#e8b34b",read:"#3ddc97",mcp:"#bda7e8",browser:"#7fc3e8",other:"#3e4e5a"};
-  $("#d-body").innerHTML=`
-    <h3>Reading</h3>
-    <dl class="kv">
-      <dt>source</dt><dd>${d.rollup.source}</dd>
-      <dt>window</dt><dd>${d.rollup.startedAt?.slice(0,16).replace("T"," ")} → ${d.rollup.endedAt?.slice(11,16)}</dd>
-      <dt>events</dt><dd>${fmt(d.rollup.events)}</dd>
-      <dt>token events</dt><dd>${fmt(d.rollup.tokenEvents)}</dd>
-      <dt>tokens in / out</dt><dd>${fmt(d.rollup.inputTokens)} / ${fmt(d.rollup.outputTokens)}</dd>
-      <dt>cache reads</dt><dd>${fmt(d.rollup.cacheReadTokens)}</dd>
-      ${d.rollup.cacheCreationTokens>0?`<dt>cache writes</dt><dd>${fmt(d.rollup.cacheCreationTokens)}</dd>`:""}
-      <dt>cost</dt><dd><b>${usd(d.rollup.costUsd)}</b></dd>
-    </dl>
-    <h3>Join keys</h3>
-    ${d.receipts.linkage.length?`<table><thead><tr><th scope="col">repo</th><th scope="col">branch</th><th scope="col">head sha</th><th class="num" scope="col">ev</th></tr></thead><tbody>${
-      d.receipts.linkage.map(l=>`<tr><td class="hash">${short(l.repoHash)}</td><td class="hash">${short(l.branchHash)}</td><td class="hash">${(l.headSha||"·").slice(0,8)}</td><td class="num">${l.events}</td></tr>`).join("")
-    }</tbody></table>`:`<div class="empty">no git linkage captured for this session</div>`}
-    <h3>Action mix</h3>
-    <div class="bar-mix">${mix.map(m=>`<i title="${m.actionClass} ${m.n}" style="width:${m.n/tot*100}%;background:${colors[m.actionClass]||colors.other}"></i>`).join("")||"<i style='width:100%;background:var(--line)'></i>"}</div>
-    <div style="font-size:10px;color:var(--foam-faint);margin-top:6px">${mix.map(m=>`${m.actionClass} ${m.n}`).join(" · ")||"no tool events"}</div>
-    <h3>Event types</h3>
-    <dl class="kv">${d.receipts.eventTypes.map(e=>`<dt>${e.eventType}</dt><dd>${fmt(e.n)}</dd>`).join("")}</dl>
-    <h3>Models</h3>
-    ${d.receipts.models.length?`<dl class="kv">${d.receipts.models.map(m=>`<dt>${m.model}</dt><dd>${fmt(m.inputTokens)}/${fmt(m.outputTokens)} · <b>${usd(m.costUsd)}</b></dd>`).join("")}</dl>`:`<div class="empty">no model-attributed events</div>`}
-    <h3>Privacy</h3>
-    <dl class="kv"><dt>events with suppressed raw fields</dt><dd>${fmt(d.receipts.suppression?.suppressedEvents)}</dd></dl>`;
+    const response=await fetch("/api/session?id="+encodeURIComponent(id)),detail=await response.json();
+    if(!response.ok||detail.error)throw new Error((detail&&(detail.message||detail.error))||("HTTP "+response.status));renderSessionDetail(detail);
+  }catch(e){drawerError("receipts",e)}
+}
+function repoDailyChart(daily){
+  const filled=fillDays(Array.isArray(daily)?daily:[]),chart=svgNode("svg",{width:"100%",height:60,viewBox:"0 0 420 60",preserveAspectRatio:"none"});
+  const max=Math.max(...filled.map(item=>Number(item.costUsd)||0),.01);
+  filled.forEach((item,index,all)=>{
+    if(!(item.costUsd>0))return;
+    const width=Math.max(1.5,420/all.length-2),height=Math.max(2,item.costUsd/max*48);
+    const rect=svgNode("rect",{x:index*(420/all.length),y:58-height,width,height,fill:"var(--waterline)",opacity:.8});
+    add(rect,add(svgNode("title"),`${item.day} ${usd(item.costUsd)}`));chart.appendChild(rect);
+  });return chart;
+}
+function renderRepoDetail(d){
+  const body=clear($("#d-body")),totals=d.totals||{};
+  add(body,heading(`Repository reading · ${fmt(d.days)}d`),definitionList([
+    {label:"sessions",value:fmt(totals.sessions)},{label:"events",value:fmt(totals.events)},
+    {label:"tokens in / out",value:`${fmt(totals.inputTokens)} / ${fmt(totals.outputTokens)}`},{label:"spend",value:boldValue(usd(totals.costUsd))},
+    {label:"repo hash",value:short(d.repoHash),valueClass:"hash"},
+  ]),heading("Daily spend"),repoDailyChart(d.daily),heading("Action mix"),actionMix(d.actionMix),heading("Models"));
+  if((d.models||[]).length)body.appendChild(definitionList(d.models.map(item=>{
+    const value=node("span");add(value,`${fmt(item.inputTokens)}/${fmt(item.outputTokens)} · `,boldValue(usd(item.costUsd)));return {label:item.model,value};
+  })));else body.appendChild(emptyNode("no model-attributed events"));
+  body.appendChild(heading("Branches (hashed)"));
+  body.appendChild(definitionList((d.branches||[]).length
+    ?d.branches.map(item=>({label:short(item.branchHash),termClass:"hash",value:`${fmt(item.sessions)} sess · ${fmt(item.events)} ev`}))
+    :[{label:"none",value:"·"}]));
 }
 async function openRepo(hash){
-  openDrawer($("#drawer"));
-  $("#d-sid").textContent=short(hash);
-  $("#d-body").innerHTML='<div class="empty">sounding\u2026</div>';
-  let d;
+  openDrawer($("#drawer"));$("#d-sid").textContent=short(hash);drawerLoading();
   try{
-    const days=Number(localStorage.getItem("plimsoll-window")||"30");
-    const r=await fetch("/api/repo?hash="+encodeURIComponent(hash)+"&days="+days);
-    d=await r.json();
-    if(!r.ok||d.error)throw new Error((d&&(d.message||d.error))||("HTTP "+r.status));
-  }catch(e){drawerError("repository detail",e);return}
-  $("#d-sid").textContent=d.label||short(hash);
-  const mix=(d.actionMix||[]); const tot=mix.reduce((s,m)=>s+m.n,0)||1;
-  const colors={shell:"#2389a7",edit:"#e8b34b",write:"#e8b34b",read:"#3ddc97",mcp:"#bda7e8",browser:"#7fc3e8",other:"#3e4e5a"};
-  const dmax=Math.max(...(d.daily||[]).map(x=>x.costUsd),0.01);
-  $("#d-body").innerHTML=`
-    <h3>Repository reading · ${d.days}d</h3>
-    <dl class="kv">
-      <dt>sessions</dt><dd>${fmt(d.totals.sessions)}</dd>
-      <dt>events</dt><dd>${fmt(d.totals.events)}</dd>
-      <dt>tokens in / out</dt><dd>${fmt(d.totals.inputTokens)} / ${fmt(d.totals.outputTokens)}</dd>
-      <dt>spend</dt><dd><b>${usd(d.totals.costUsd)}</b></dd>
-      <dt>repo hash</dt><dd class="hash">${short(d.repoHash)}</dd>
-    </dl>
-    <h3>Daily spend</h3>
-    <svg width="100%" height="60" viewBox="0 0 420 60" preserveAspectRatio="none">${fillDays(d.daily||[]).map((x,i,a)=>{
-      if(!(x.costUsd>0)) return "";
-      const w=Math.max(1.5,420/a.length-2), h=Math.max(2,x.costUsd/dmax*48);
-      return `<rect x="${i*(420/a.length)}" y="${58-h}" width="${w}" height="${h}" fill="var(--waterline)" opacity=".8"><title>${x.day} ${usd(x.costUsd)}</title></rect>`;
-    }).join("")}</svg>
-    <h3>Action mix</h3>
-    <div class="bar-mix">${mix.map(m=>`<i title="${m.actionClass} ${m.n}" style="width:${m.n/tot*100}%;background:${colors[m.actionClass]||colors.other}"></i>`).join("")||"<i style='width:100%;background:var(--line)'></i>"}</div>
-    <div style="font-size:10px;color:var(--foam-faint);margin-top:6px">${mix.map(m=>`${m.actionClass} ${m.n}`).join(" · ")||"no tool events"}</div>
-    <h3>Models</h3>
-    ${(d.models||[]).length?`<dl class="kv">${d.models.map(m=>`<dt>${m.model}</dt><dd>${fmt(m.inputTokens)}/${fmt(m.outputTokens)} · <b>${usd(m.costUsd)}</b></dd>`).join("")}</dl>`:`<div class="empty">no model-attributed events</div>`}
-    <h3>Branches (hashed)</h3>
-    <dl class="kv">${(d.branches||[]).map(b=>`<dt class="hash">${short(b.branchHash)}</dt><dd>${fmt(b.sessions)} sess · ${fmt(b.events)} ev</dd>`).join("")||"<dt>none</dt><dd>·</dd>"}</dl>`;
+    const days=Number(localStorage.getItem("plimsoll-window")||"30"),response=await fetch("/api/repo?hash="+encodeURIComponent(hash)+"&days="+days),detail=await response.json();
+    if(!response.ok||detail.error)throw new Error((detail&&(detail.message||detail.error))||("HTTP "+response.status));
+    $("#d-sid").textContent=detail.label||short(hash);renderRepoDetail(detail);
+  }catch(e){drawerError("repository detail",e)}
 }
-$("#drawer-close").onclick=closeDrawers;
-$("#veil").onclick=closeDrawers;
+$("#drawer-close").addEventListener("click",closeDrawers);
+$("#veil").addEventListener("click",closeDrawers);
+
+function renderWatch(health,projection,d){
+  const target=clear($("#watch-rows"));
+  const ago=value=>{if(!value)return"never";const minutes=Math.round((Date.now()-Date.parse(value))/60000);return minutes<1?"just now":minutes<60?minutes+"m ago":Math.round(minutes/60*10)/10+"h ago"};
+  const addWatch=(status,name,reason)=>{
+    const row=node("span",null,"watch-row"),dot=node("i",null,"watch-dot "+(status==="green"?"green":status==="amber"?"amber":"red")),label=node("b",name,"foam");
+    dot.setAttribute("aria-hidden","true");add(row,dot,label," — ",reason);target.appendChild(row);
+  };
+  for(const item of health.sources||[]){
+    const name=item.source==="claude_code"?"Claude Code":"Codex";
+    addWatch(item.status,name,`${item.reason} · last captured ${ago(item.lastEventAt)} · local activity ${ago(item.localLastActivityAt)}`);
+  }
+  if(projection.degraded)addWatch("amber","projection",`${projection.degradedReason||"pending repair"}; last coherent generation ${fmt(d.generation)}`);
+  if(!target.childNodes.length)target.appendChild(node("span","no health data","muted"));
+  $("#watch-stamp").textContent=projection.freshnessAt?"projected "+ago(projection.freshnessAt):"";
+}
+function renderSnapshot(d){
+  const s=d.summary||{totals:{},byModel:[],bySource:[],daily:[]},sess=d.sessions,repos=d.repos,status=d.status||{},acct=d.accounts||{accounts:[]};
+  const days=Number(d.window?.days??s.days??30);
+  $("#window-label").textContent=days>=1825?"all history":days>=365?"1 year":days>=182?"6 months":days+" days";
+  const health=status.health||{overall:"green",sources:[]},projection=d.projection||{status:"stale",degraded:true};
+  const lampState=projection.degraded&&health.overall==="green"?"amber":health.overall;
+  $("#lamp").classList.toggle("ok",lampState==="green"&&!projection.degraded);$("#lamp").classList.toggle("warn",lampState==="amber");
+  const lampMsg=projection.status==="stale"?"projection stale — serving last coherent sounding":lampState==="green"?"collecting":"capture "+(lampState==="amber"?"degraded":"failure")+" — see capture watch";
+  if($("#lamp-text").textContent!==lampMsg)$("#lamp-text").textContent=lampMsg;
+  renderWatch(health,projection,d);
+  const t=s.totals||{},figure=clear($("#fig-cost")),cost=usd(t.costUsd);
+  if(cost.startsWith("$"))add(figure,node("small","$"),cost.slice(1));else figure.textContent=cost;
+  $("#kv-in").textContent=fmt(t.inputTokens);$("#kv-out").textContent=fmt(t.outputTokens);$("#kv-cache").textContent=fmt(t.cacheReadTokens);
+  $("#kv-cachew").textContent=t.cacheCreationTokens>0?fmt(t.cacheCreationTokens):"—";$("#kv-sessions").textContent=fmt(t.sessions);
+  const pct=t.sessions?t.sessionsWithTokens/t.sessions:0;gauge(pct);$("#cov-note").textContent=`${fmt(t.sessionsWithTokens)} of ${fmt(t.sessions)} sessions carry token telemetry`;
+  drawSpark(s.daily||[]);
+  const planUsd=(acct.accounts||[]).reduce((sum,item)=>sum+(item.subscription?(item.subscription.planCostWindow||0):0),0);renderRail(t.costUsd||0,planUsd,$("#window-label").textContent);
+  rows("#t-models","#e-models",s.byModel||[],item=>{
+    const model=node("span",item.model);model.title=String(item.model??"");
+    const costCell=node("span");
+    if(item.unpricedCalls>0&&!item.costUsd){costCell.className="hash";costCell.title="no vendor rate on file — tokens counted, cost unknown";costCell.textContent="unpriced"}
+    else{add(costCell,usd(item.costUsd));if(item.unpricedCalls>0){const plus=node("span","+","hash");plus.title="some calls have no vendor rate — shown cost is a floor";costCell.appendChild(plus)}}
+    return tableRow([
+      {content:model,className:"wide"},{content:fmt(item.calls),className:"num"},{content:fmt(item.inputTokens),className:"num"},
+      {content:fmt(item.outputTokens),className:"num"},{content:costCell,className:"num brass"},
+    ]);
+  });
+  const vendors={claude_code:["Anthropic · Claude Code",""],codex:["OpenAI · Codex"," ~"]},vendorList=clear($("#kv-vendors"));
+  for(const item of (s.bySource||[]).filter(value=>value.costUsd>0||value.events>0)){
+    const [name,tilde]=vendors[item.source]||[item.source,""];vendorList.appendChild(node("dt",name));
+    const value=node("dd"),bold=node("b",tilde+usd(item.costUsd));add(value,bold,` · ${fmt(item.sessions)} sess`);vendorList.appendChild(value);
+  }
+  rows("#t-repos","#e-repos",(Array.isArray(repos)?repos:[]).filter(item=>item.repoHash),item=>{
+    const label=node("span",item.label||short(item.repoHash),item.label?"foam":"hash");label.title=String(item.label||short(item.repoHash));
+    return tableRow([
+      {content:label,className:"wide"},{content:fmt(item.sessions),className:"num"},{content:fmt(item.inputTokens+item.outputTokens),className:"num"},{content:usd(item.costUsd),className:"num brass"},
+    ],item.repoHash==="__tail__"?null:()=>openRepo(item.repoHash));
+  });
+  $("#prio-count").textContent=acct.priorityRepoCount??0;
+  const buckets=acct.buckets||{};
+  if((Number(buckets.priorityUsd)||0)+(Number(buckets.otherUsd)||0)+(Number(buckets.unlinkedUsd)||0)>0){
+    const term=node("dt","priority work","vendor-break"),value=node("dd",null,"vendor-break");value.appendChild(boldValue(usd(buckets.priorityUsd)));
+    add(vendorList,term,value,node("dt","other repos"),node("dd",usd(buckets.otherUsd)),node("dt","unlinked"),node("dd",usd(buckets.unlinkedUsd)));
+  }
+  rows("#t-accounts","#e-accounts",(acct.accounts||[]).filter(item=>item.accountHash),item=>{
+    const account=node("button",null,"linkish");account.type="button";account.title="click to relabel";account.setAttribute("aria-label","relabel accounts — opens settings");account.addEventListener("click",openSettingsDrawer);
+    if(item.label!=null)account.appendChild(document.createTextNode(String(item.label)));else account.appendChild(node("span",short(item.accountHash),"hash"));
+    if(item.email)add(account,node("span",` · ${item.email}`,"hash"));
+    const pencil=node("span"," ✎","hash");pencil.setAttribute("aria-hidden","true");account.appendChild(pencil);
+    const plan=item.subscription?node("span",`${item.subscription.plan} $${item.subscription.usdPerMonth}/mo`):node("span","direct API","hash");
+    let leverage="·";
+    if(item.subscription?.leverage){
+      leverage=node("b",`${item.subscription.leverage}×`,item.subscription.leverage>=1?"leverage-good":"leverage-low");
+      leverage.title=(item.subscription.byVendor||[]).map(value=>`${value.plans}: ${usd(value.spendUsd)} vs ${usd(value.planCostWindow)} = ${value.leverage??"·"}×`).join(" · ");
+    }
+    return tableRow([
+      {content:account,className:"wide"},{content:(item.machines||[]).join(", ")||"·",className:"hash"},{content:fmt(item.sessions),className:"num"},
+      {content:usd(item.priorityUsd),className:"num"},{content:usd(item.otherUsd),className:"num"},{content:usd(item.unlinkedUsd),className:"num"},
+      {content:usd(item.totalUsd),className:"num brass"},{content:plan},{content:leverage,className:"num"},
+    ]);
+  });
+  rows("#t-sessions","#e-sessions",Array.isArray(sess)?sess:[],item=>{
+    const source=node("span",item.source==="claude_code"?"CC":"CX","flag "+(item.source==="claude_code"?"cc":"cx"));
+    const repo=node("span",item.repoLabel||short(item.repoHash),item.repoLabel?"foam-dim":"hash");repo.title=String(item.repoLabel||short(item.repoHash));
+    if(item.repoCount>1)add(repo,node("span",` +${item.repoCount-1}`,"hash"));
+    const sessionId=String(item.sessionId||"");
+    return tableRow([
+      {content:String(item.startedAt||"").slice(0,16).replace("T"," ")},{content:source},{content:sessionId.slice(0,8)+"…",className:"hash"},
+      {content:fmt(item.events),className:"num"},{content:fmt(item.inputTokens),className:"num"},{content:fmt(item.outputTokens),className:"num"},
+      {content:usd(item.costUsd),className:"num brass"},{content:repo,className:"wide"},
+    ],()=>openSession(sessionId));
+  });
+  $("#f-ledger").textContent=status.stats?fmt(status.stats.count)+" rows":"·";$("#f-events").textContent=fmt(t.events)+" in window";
+  $("#f-retention").textContent=(status.retentionDays??90)+"d";$("#f-time").textContent=projection.freshnessAt?new Date(projection.freshnessAt).toLocaleTimeString():"·";
+  const crumbs=clear($("#crumbs"));add(crumbs,`127.0.0.1 · window ${fmt(s.days)}d · generation ${fmt(d.generation)} · `,node("b","nothing leaves this machine from this page"));
+}
 
 let dashboardCache=null;
 let dashboardEtag=null;
@@ -604,70 +788,7 @@ async function refresh(redrawOnly=false){
       }
     }
     if(!dashboardCache)throw new Error("projection_backfilling");
-    const d=dashboardCache,s=d.summary,sess=d.sessions,repos=d.repos,status=d.status,acct=d.accounts;
-    $("#window-label").textContent=days>=1825?"all history":days>=365?"1 year":days>=182?"6 months":days+" days";
-    const health=status.health||{overall:"green",sources:[]};
-    const projection=d.projection||{status:"stale",degraded:true};
-    const lampState=projection.degraded&&health.overall==="green"?"amber":health.overall;
-    $("#lamp").classList.toggle("ok",lampState==="green"&&!projection.degraded);
-    $("#lamp").classList.toggle("warn",lampState==="amber");
-    const lampMsg=projection.status==="stale"?"projection stale — serving last coherent sounding":lampState==="green"?"collecting":"capture "+(lampState==="amber"?"degraded":"failure")+" — see capture watch";
-    if($("#lamp-text").textContent!==lampMsg)$("#lamp-text").textContent=lampMsg;
-    const sigvar=st=>st==="green"?"var(--signal-green)":st==="amber"?"var(--signal-amber)":"var(--signal-red)";
-    const dot=st=>`<i style="background:${sigvar(st)};box-shadow:0 0 6px ${sigvar(st)}"></i>`;
-    const ago=t=>{if(!t)return"never";const m=Math.round((Date.now()-Date.parse(t))/60000);return m<1?"just now":m<60?m+"m ago":Math.round(m/60*10)/10+"h ago"};
-    $("#watch-rows").innerHTML=(health.sources||[]).map(h=>{
-      const name=h.source==="claude_code"?"Claude Code":"Codex";
-      return `<span>${dot(h.status)}<b style="color:var(--foam)">${name}</b>&nbsp;— ${h.reason} · last captured ${ago(h.lastEventAt)} · local activity ${ago(h.localLastActivityAt)}</span>`;
-    }).join("")+(projection.degraded?`<span>${dot("amber")}<b style="color:var(--foam)">projection</b>&nbsp;— ${projection.degradedReason||"pending repair"}; last coherent generation ${d.generation}</span>`:"")||`<span style="color:var(--foam-faint)">no health data</span>`;
-    $("#watch-stamp").textContent=projection.freshnessAt?"projected "+ago(projection.freshnessAt):"";
-    const t=s.totals;
-    $("#fig-cost").innerHTML=usd(t.costUsd).replace(/^\$/, "<small>$</small>");
-    $("#kv-in").textContent=fmt(t.inputTokens); $("#kv-out").textContent=fmt(t.outputTokens);
-    $("#kv-cache").textContent=fmt(t.cacheReadTokens);
-    $("#kv-cachew").textContent=t.cacheCreationTokens>0?fmt(t.cacheCreationTokens):"—";
-    $("#kv-sessions").textContent=fmt(t.sessions);
-    const pct=t.sessions?t.sessionsWithTokens/t.sessions:0;
-    gauge(pct);
-    $("#cov-note").textContent=`${fmt(t.sessionsWithTokens)} of ${fmt(t.sessions)} sessions carry token telemetry`;
-    drawSpark(s.daily);
-    const planUsd=(acct.accounts||[]).reduce((sum,a)=>sum+(a.subscription?(a.subscription.planCostWindow||0):0),0);
-    renderRail(t.costUsd||0, planUsd, $("#window-label").textContent);
-    rows("#t-models","#e-models",s.byModel,m=>`<tr><td class="wide" title="${m.model}">${m.model}</td><td class="num">${fmt(m.calls)}</td><td class="num">${fmt(m.inputTokens)}</td><td class="num">${fmt(m.outputTokens)}</td><td class="num brass">${m.unpricedCalls>0&&!m.costUsd?'<span class="hash" title="no vendor rate on file — tokens counted, cost unknown">unpriced</span>':usd(m.costUsd)+(m.unpricedCalls>0?'<span class="hash" title="some calls have no vendor rate — shown cost is a floor">+</span>':"")}</td></tr>`);
-    const vendors={claude_code:["Anthropic · Claude Code",""],codex:["OpenAI · Codex"," ~"]};
-    $("#kv-vendors").innerHTML=(s.bySource||[]).filter(v=>v.costUsd>0||v.events>0).map(v=>{
-      const [name,tilde]=vendors[v.source]||[v.source,""];
-      return `<dt>${name}</dt><dd><b>${tilde}${usd(v.costUsd)}</b> · ${fmt(v.sessions)} sess</dd>`;
-    }).join("")||"";
-    rows("#t-repos","#e-repos",(Array.isArray(repos)?repos:[]).filter(r=>r.repoHash),r=>r.repoHash==="__tail__"
-      ?`<tr><td class="wide hash" title="${r.label}">${r.label}</td><td class="num">${fmt(r.sessions)}</td><td class="num">${fmt(r.inputTokens+r.outputTokens)}</td><td class="num brass">${usd(r.costUsd)}</td></tr>`
-      :`<tr class="row" tabindex="0" onkeydown="rk(event)" onclick="openRepo('${r.repoHash}')"><td class="wide" title="${r.label||short(r.repoHash)}">${r.label?`<span style="color:var(--foam)">${r.label}</span>`:`<span class="hash">${short(r.repoHash)}</span>`}</td><td class="num">${fmt(r.sessions)}</td><td class="num">${fmt(r.inputTokens+r.outputTokens)}</td><td class="num brass">${usd(r.costUsd)}</td></tr>`);
-    $("#prio-count").textContent=acct.priorityRepoCount??0;
-    const b=acct.buckets||{};
-    if((b.priorityUsd+b.otherUsd+b.unlinkedUsd)>0){
-      $("#kv-vendors").innerHTML+=`<dt style="padding-top:6px">priority work</dt><dd style="padding-top:6px"><b>${usd(b.priorityUsd)}</b></dd>
-        <dt>other repos</dt><dd>${usd(b.otherUsd)}</dd><dt>unlinked</dt><dd>${usd(b.unlinkedUsd)}</dd>`;
-    }
-    rows("#t-accounts","#e-accounts",(acct.accounts||[]).filter(a=>a.accountHash),a=>`<tr>
-      <td class="wide"><button class="linkish" onclick="openSettingsDrawer()" title="click to relabel" aria-label="relabel accounts — opens settings">${a.label??`<span class="hash">${short(a.accountHash)}</span>`}${a.email?` <span class="hash">· ${a.email}</span>`:""} <span class="hash" aria-hidden="true">✎</span></button></td>
-      <td class="hash">${(a.machines||[]).join(", ")||"·"}</td>
-      <td class="num">${fmt(a.sessions)}</td>
-      <td class="num">${usd(a.priorityUsd)}</td><td class="num">${usd(a.otherUsd)}</td>
-      <td class="num">${usd(a.unlinkedUsd)}</td><td class="num brass">${usd(a.totalUsd)}</td>
-      <td>${a.subscription?a.subscription.plan+" $"+a.subscription.usdPerMonth+"/mo":"<span class='hash'>direct API</span>"}</td>
-      <td class="num">${a.subscription?.leverage?`<b style="color:${a.subscription.leverage>=1?"var(--signal-green)":"var(--signal-amber)"}" title="${(a.subscription.byVendor||[]).map(v=>`${v.plans}: ${usd(v.spendUsd)} vs ${usd(v.planCostWindow)} = ${v.leverage??"·"}\u00d7`).join(" \u00b7 ")}">${a.subscription.leverage}×</b>`:"·"}</td></tr>`);
-    rows("#t-sessions","#e-sessions",Array.isArray(sess)?sess:[],x=>`<tr class="row" tabindex="0" onkeydown="rk(event)" onclick="openSession('${x.sessionId}')">
-      <td>${(x.startedAt||"").slice(0,16).replace("T"," ")}</td>
-      <td><span class="flag ${x.source==="claude_code"?"cc":"cx"}">${x.source==="claude_code"?"CC":"CX"}</span></td>
-      <td class="hash">${x.sessionId.slice(0,8)}…</td>
-      <td class="num">${fmt(x.events)}</td><td class="num">${fmt(x.inputTokens)}</td>
-      <td class="num">${fmt(x.outputTokens)}</td><td class="num brass">${usd(x.costUsd)}</td>
-      <td class="wide" title="${x.repoLabel||short(x.repoHash)}">${x.repoLabel?`<span style="color:var(--foam-dim)">${x.repoLabel}</span>`:`<span class="hash">${short(x.repoHash)}</span>`}${x.repoCount>1?` <span class="hash">+${x.repoCount-1}</span>`:""}</td></tr>`);
-    $("#f-ledger").textContent=status.stats?fmt(status.stats.count)+" rows":"·";
-    $("#f-events").textContent=fmt(t.events)+" in window";
-    $("#f-retention").textContent=(status.retentionDays??90)+"d";
-    $("#f-time").textContent=projection.freshnessAt?new Date(projection.freshnessAt).toLocaleTimeString():"·";
-    $("#crumbs").innerHTML=`127.0.0.1 · window ${s.days}d · generation ${d.generation} · <b>nothing leaves this machine from this page</b>`;
+    renderSnapshot(dashboardCache);
   }catch(e){
     $("#lamp").classList.remove("ok"); $("#lamp").classList.add("warn");
     $("#lamp-text").textContent=String(e&&e.message)==="projection_backfilling"?"projection backfilling":"collector unreachable";
@@ -677,57 +798,79 @@ async function refresh(redrawOnly=false){
 const post=(route,body)=>fetch(route,{method:"POST",headers:{"content-type":"application/json","x-plimsoll-local":"1"},body:JSON.stringify(body)}).then(async r=>{const d=await r.json();if(!r.ok)throw new Error(d.error||r.status);return d});
 let settingsCache={accounts:[],priorityRepos:[],subscriptions:[]};
 async function loadSettings(){
-  settingsCache=await fetch("/api/settings").then(r=>r.json());
-  const aliasMap=Object.fromEntries((settingsCache.accountAliases||[]).map(x=>[x.aliasHash,x.canonicalHash]));
-  const acctLabel=h=>{const m=settingsCache.accounts.find(x=>x.accountHash===h);return (m&&m.label)||short(h)};
-  const canonicals=settingsCache.accounts.filter(a=>!aliasMap[a.accountHash]);
-  $("#s-accounts").innerHTML=settingsCache.accounts.map(a=>{
-    const mergedInto=aliasMap[a.accountHash];
-    return `<div class="srow" style="flex-wrap:wrap">
-    <span class="hash">${short(a.accountHash)}</span>
-    <input aria-label="display name for account ${short(a.accountHash)}" value="${(a.label||"").replace(/"/g,"&quot;")}" data-hash="${a.accountHash}" data-field="label" style="flex:1;min-width:120px">
-    <input aria-label="email tied to account ${short(a.accountHash)} (stored on this machine only)" type="email" placeholder="email (local-only)" value="${(a.email||"").replace(/"/g,"&quot;")}" data-hash="${a.accountHash}" data-field="email" style="flex:1;min-width:150px">
-    <button class="btn" onclick="saveAccountRow('${a.accountHash}')">save</button>
-    ${mergedInto
-      ?`<span class="hash" title="events under this identity display as ${acctLabel(mergedInto)}">→ ${acctLabel(mergedInto)}</span><button class="btn" onclick="unmergeAccount('${a.accountHash}')">unmerge</button>`
-      :`<select aria-label="merge account ${short(a.accountHash)} into" onchange="mergeAccount('${a.accountHash}',this.value)"><option value="">same person as…</option>${canonicals.filter(c=>c.accountHash!==a.accountHash).map(c=>`<option value="${c.accountHash}">${acctLabel(c.accountHash)}</option>`).join("")}</select>`}
-    </div>`}).join("")||'<div class="empty">accounts appear after their first session</div>';
-  const det=(settingsCache.detectedIdentities||[]).filter(d=>d.email);
-  $("#s-detected").innerHTML=det.length?`detected on this machine: ${det.map(d=>`<b style="color:var(--foam-dim)">${d.email}</b> (${d.source==="claude_code"?"Claude Code":"Codex"}${d.planType?` · ${d.planType}`:""})`).join(" · ")} — paste into the matching row`:"";
-  $("#s-prio-list").innerHTML=settingsCache.priorityRepos.map(p=>`<div class="srow">
-    <span style="flex:1;color:var(--foam)">${p.url}</span>
-    <button class="btn" onclick="removePrio('${p.url}')">remove</button></div>`).join("")||'<div class="empty">no priority projects yet</div>';
-  const subKeys=[...new Set(settingsCache.accounts.flatMap(a=>[a.label,a.email].filter(Boolean)))];
-  $("#s-sub-account").innerHTML=(subKeys.length?subKeys:settingsCache.accounts.map(a=>a.accountHash)).map(k=>`<option value="${String(k).replace(/"/g,"&quot;")}">${k}</option>`).join("");
-  $("#s-subs").innerHTML=settingsCache.subscriptions.map((x,i)=>`<div class="srow">
-    <span style="flex:1">${x.account} · ${x.plan} · $${x.usdPerMonth}/mo</span>
-    <button class="btn" onclick="removeSub(${i})">remove</button></div>`).join("")||'<div class="empty">none — add one to see plan leverage</div>';
+  const response=await fetch("/api/settings"),payload=await response.json();
+  if(!response.ok)throw new Error(payload.error||("HTTP "+response.status));renderSettings(payload);
 }
-async function saveAccountRow(hash){
-  const label=document.querySelector(`input[data-hash="${hash}"][data-field="label"]`).value;
-  const email=document.querySelector(`input[data-hash="${hash}"][data-field="email"]`).value;
+function renderSettings(payload){
+  settingsCache=payload;
+  const accounts=Array.isArray(settingsCache.accounts)?settingsCache.accounts:[];
+  const aliasMap=new Map((settingsCache.accountAliases||[]).map(item=>[item.aliasHash,item.canonicalHash]));
+  const acctLabel=hash=>{const match=accounts.find(item=>item.accountHash===hash);return (match&&match.label)||short(hash)};
+  const canonicals=accounts.filter(item=>!aliasMap.has(item.accountHash)),accountBox=clear($("#s-accounts"));
+  for(const account of accounts){
+    const mergedInto=aliasMap.get(account.accountHash),row=node("div",null,"srow wrap"),hash=node("span",short(account.accountHash),"hash");
+    const labelInput=node("input");labelInput.className="account-input";labelInput.setAttribute("aria-label",`display name for account ${short(account.accountHash)}`);labelInput.value=String(account.label||"");
+    const emailInput=node("input");emailInput.className="email-input";emailInput.type="email";emailInput.placeholder="email (local-only)";emailInput.setAttribute("aria-label",`email tied to account ${short(account.accountHash)} (stored on this machine only)`);emailInput.value=String(account.email||"");
+    const save=node("button","save","btn");save.type="button";save.addEventListener("click",()=>saveAccountRow(account.accountHash,labelInput,emailInput));add(row,hash,labelInput,emailInput,save);
+    if(mergedInto){
+      const merged=node("span",`→ ${acctLabel(mergedInto)}`,"hash");merged.title=`events under this identity display as ${acctLabel(mergedInto)}`;
+      const undo=node("button","unmerge","btn");undo.type="button";undo.addEventListener("click",()=>unmergeAccount(account.accountHash));add(row,merged,undo);
+    }else{
+      const select=node("select");select.setAttribute("aria-label",`merge account ${short(account.accountHash)} into`);
+      const prompt=node("option","same person as…");prompt.value="";select.appendChild(prompt);
+      for(const canonical of canonicals.filter(item=>item.accountHash!==account.accountHash)){
+        const option=node("option",acctLabel(canonical.accountHash));option.value=String(canonical.accountHash);select.appendChild(option);
+      }
+      select.addEventListener("change",()=>mergeAccount(account.accountHash,select.value));row.appendChild(select);
+    }
+    accountBox.appendChild(row);
+  }
+  if(!accounts.length)accountBox.appendChild(emptyNode("accounts appear after their first session"));
+  const det=(settingsCache.detectedIdentities||[]).filter(d=>d.email);
+  const detected=clear($("#s-detected"));
+  if(det.length){
+    add(detected,"detected on this machine: ");det.forEach((item,index)=>{
+      if(index)add(detected," · ");add(detected,node("b",item.email,"foam-dim"),` (${item.source==="claude_code"?"Claude Code":"Codex"}${item.planType?` · ${item.planType}`:""})`);
+    });add(detected," — paste into the matching row");
+  }
+  const priorityBox=clear($("#s-prio-list"));
+  for(const item of settingsCache.priorityRepos||[]){
+    const row=node("div",null,"srow"),label=node("span",item.url,"grow foam"),button=node("button","remove","btn");button.type="button";button.addEventListener("click",()=>removePrio(item.url));add(row,label,button);priorityBox.appendChild(row);
+  }
+  if(!priorityBox.childNodes.length)priorityBox.appendChild(emptyNode("no priority projects yet"));
+  const subKeys=[...new Set(accounts.flatMap(item=>[item.label,item.email].filter(Boolean)))],subSelect=clear($("#s-sub-account"));
+  for(const key of (subKeys.length?subKeys:accounts.map(item=>item.accountHash))){const option=node("option",key);option.value=String(key);subSelect.appendChild(option)}
+  const subscriptions=Array.isArray(settingsCache.subscriptions)?settingsCache.subscriptions:[],subBox=clear($("#s-subs"));
+  subscriptions.forEach((item,index)=>{
+    const row=node("div",null,"srow"),label=node("span",`${item.account} · ${item.plan} · $${item.usdPerMonth}/mo`,"grow"),button=node("button","remove","btn");button.type="button";button.addEventListener("click",()=>removeSub(index));add(row,label,button);subBox.appendChild(row);
+  });
+  if(!subscriptions.length)subBox.appendChild(emptyNode("none — add one to see plan leverage"));
+}
+async function saveAccountRow(hash,labelInput,emailInput){
+  const label=labelInput.value,email=emailInput.value;
   try{
     if(label)await post("/api/settings/account-label",{accountHash:hash,label});
     await post("/api/settings/account-email",{accountHash:hash,email});
-    $("#s-msg").textContent="saved \u2713";loadSettings();refresh();
+    $("#s-msg").textContent="saved ✓";await loadSettings();await refresh();
   }catch(e){$("#s-msg").textContent=e.message}}
-async function mergeAccount(aliasHash,canonicalHash){if(!canonicalHash)return;try{await post("/api/settings/account-merge",{aliasHash,canonicalHash});$("#s-msg").textContent="identities merged \u2713";loadSettings();refresh();}catch(e){$("#s-msg").textContent=e.message}}
-async function unmergeAccount(aliasHash){try{await post("/api/settings/account-merge",{aliasHash,action:"remove"});$("#s-msg").textContent="unmerged \u2713";loadSettings();refresh();}catch(e){$("#s-msg").textContent=e.message}}
-async function removePrio(url){await post("/api/settings/priority",{action:"remove",url});loadSettings();refresh();}
-$("#s-prio-add").onclick=async()=>{try{await post("/api/settings/priority",{url:$("#s-prio-url").value});$("#s-prio-url").value="";$("#s-msg").textContent="priority added ✓";loadSettings();refresh();}catch(e){$("#s-msg").textContent=e.message}};
-async function removeSub(i){const subs=settingsCache.subscriptions.filter((_,j)=>j!==i);await post("/api/settings/subscriptions",{subscriptions:subs});loadSettings();refresh();}
-$("#s-sub-add").onclick=async()=>{try{
+async function mergeAccount(aliasHash,canonicalHash){if(!canonicalHash)return;try{await post("/api/settings/account-merge",{aliasHash,canonicalHash});$("#s-msg").textContent="identities merged ✓";await loadSettings();await refresh();}catch(e){$("#s-msg").textContent=e.message}}
+async function unmergeAccount(aliasHash){try{await post("/api/settings/account-merge",{aliasHash,action:"remove"});$("#s-msg").textContent="unmerged ✓";await loadSettings();await refresh();}catch(e){$("#s-msg").textContent=e.message}}
+async function removePrio(url){try{await post("/api/settings/priority",{action:"remove",url});await loadSettings();await refresh();}catch(e){$("#s-msg").textContent=e.message}}
+$("#s-prio-add").addEventListener("click",async()=>{try{await post("/api/settings/priority",{url:$("#s-prio-url").value});$("#s-prio-url").value="";$("#s-msg").textContent="priority added ✓";await loadSettings();await refresh();}catch(e){$("#s-msg").textContent=e.message}});
+async function removeSub(i){try{const subs=settingsCache.subscriptions.filter((_,j)=>j!==i);await post("/api/settings/subscriptions",{subscriptions:subs});await loadSettings();await refresh();}catch(e){$("#s-msg").textContent=e.message}}
+$("#s-sub-add").addEventListener("click",async()=>{try{
   const subs=[...settingsCache.subscriptions,{account:$("#s-sub-account").value,plan:$("#s-sub-plan").value||"Plan",usdPerMonth:Number($("#s-sub-usd").value||0),vendor:"other"}];
-  await post("/api/settings/subscriptions",{subscriptions:subs});$("#s-msg").textContent="subscription saved ✓";loadSettings();refresh();
-}catch(e){$("#s-msg").textContent=e.message}};
-function openSettingsDrawer(){loadSettings();openDrawer($("#settings"))}
-$("#open-settings").onclick=openSettingsDrawer;
-$("#settings-close").onclick=closeDrawers;
+  await post("/api/settings/subscriptions",{subscriptions:subs});$("#s-msg").textContent="subscription saved ✓";await loadSettings();await refresh();
+}catch(e){$("#s-msg").textContent=e.message}});
+function openSettingsDrawer(){openDrawer($("#settings"));loadSettings().catch(error=>{$("#s-msg").textContent=String(error&&error.message||error)})}
+$("#open-settings").addEventListener("click",openSettingsDrawer);
+$("#settings-close").addEventListener("click",closeDrawers);
 
 
 const winSel=$("#window-select");
 winSel.value=localStorage.getItem("plimsoll-window")||"30";
-winSel.onchange=()=>{localStorage.setItem("plimsoll-window",winSel.value);refresh()};
+winSel.addEventListener("change",()=>{localStorage.setItem("plimsoll-window",winSel.value);refresh()});
+window.__plimsollDashboardTest=Object.freeze({renderSnapshot,renderSessionDetail,renderRepoDetail,renderSettings,drawerError});
 refresh(); setInterval(refresh, 30000);
 window.addEventListener("resize",()=>refresh(true));
 </script>
