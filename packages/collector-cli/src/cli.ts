@@ -147,7 +147,7 @@ Config tools:
       push-repo-labels: owner/name + remoteUrlHash cross; titles/diffs/paths never do.
       --dry-run computes the join and prints the audit without pushing.
   backfill-outcome-timeline --repository owner/repo [--since ISO] [--until ISO]
-      [--max-prs 25] [--store PATH] [--required-checks POLICY.json]
+      [--max-prs 25] [--rework-window-days 14] [--store PATH] [--required-checks POLICY.json]
       Reads GitHub only. POLICY.json is {"requiredChecks":["check name"]};
       without it required-check coverage and check-derived metrics are UNKNOWN.
       GITHUB_TOKEN/GH_TOKEN stays provider-side and is never persisted or printed.
@@ -1061,6 +1061,11 @@ async function main() {
     const maxPullsRaw = optionValue("--max-prs") ?? "25";
     const maxPulls = Number(maxPullsRaw);
     if (!Number.isInteger(maxPulls)) throw new Error(`--max-prs expects an integer, got: ${maxPullsRaw}`);
+    const reworkWindowDaysRaw = optionValue("--rework-window-days") ?? "14";
+    const reworkWindowDays = Number(reworkWindowDaysRaw);
+    if (!Number.isInteger(reworkWindowDays)) {
+      throw new Error(`--rework-window-days expects an integer, got: ${reworkWindowDaysRaw}`);
+    }
     const databasePath =
       optionValue("--store") ?? path.join(collectorHome(), "outcome-timeline-v1.sqlite");
     const store = new OutcomeTimelineStore(databasePath);
@@ -1071,6 +1076,7 @@ async function main() {
         since,
         until,
         maxPulls,
+        reworkWindowDays,
         store,
         adapter: new GitHubRestOutcomeTimelineAdapter({
           token: process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN,

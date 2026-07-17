@@ -11,12 +11,15 @@ import {
   type GitHubRateReceipt,
   type OutcomeTimelineBackfillState,
   type OutcomeTimelineCoverage,
+  type OutcomeTimelineCoverageObservation,
+  type OutcomeReworkWatch,
   type PullTimelineFact,
   type RequiredCheckPolicy,
 } from "../../shared/src/index";
 import { OutcomeTimelineStore } from "./outcome-timeline-store";
 
-type CoverageObservation = Omit<OutcomeTimelineCoverage, "runId" | "repositoryExternalId" | "pullExternalId">;
+type CoverageObservation = OutcomeTimelineCoverageObservation;
+type ChangedPullCoverage = CoverageObservation & { dimension: "changed_pulls" };
 
 export type ProviderPage<T> = {
   items: T[];
@@ -113,7 +116,7 @@ export async function collectProviderPages<T>(input: {
 }
 
 export type ChangedPullPage = ProviderPage<ChangedPullRef> & {
-  coverage: CoverageObservation;
+  coverage: ChangedPullCoverage;
 };
 
 export type PullCollection = {
@@ -138,6 +141,13 @@ export interface GitHubOutcomeTimelineAdapter {
     repo: string;
     repositoryExternalId: string;
     pull: ChangedPullRef;
+    until: string;
+  }): Promise<PullCollection>;
+  collectRework?(input: {
+    owner: string;
+    repo: string;
+    repositoryExternalId: string;
+    watch: OutcomeReworkWatch;
     until: string;
   }): Promise<PullCollection>;
 }
@@ -458,7 +468,8 @@ export class GitHubRestOutcomeTimelineAdapter implements GitHubOutcomeTimelineAd
     for (const revision of revisions) {
       const checkRows = retain(
         await this.arrayPages({
-          url: (page) => `${base}/commits/${revision.sha}/check-runs?per_page=100&page=${page}`,
+          url: (page) =>
+            `${base}/commits/${revision.sha}/check-runs?filter=all&per_page=100&page=${page}`,
           dimension: "checks",
           itemKey: "check_runs",
         }),
@@ -511,9 +522,10 @@ export class GitHubRestOutcomeTimelineAdapter implements GitHubOutcomeTimelineAd
       const submittedAt = timestamp(row.submitted_at);
       if (!outcome || !submittedAt) continue;
       const reviewExternalId = `github:review:${String(row.node_id ?? row.id)}`;
+      const transitionExternalId = `${reviewExternalId}:state:${outcome}:at:${submittedAt}`;
       facts.push({
         schemaVersion: 1,
-        externalId: reviewExternalId,
+        externalId: transitionExternalId,
         repositoryExternalId: input.repositoryExternalId,
         pullExternalId,
         pullNumber: input.pull.number,
@@ -650,6 +662,77 @@ export class GitHubRestOutcomeTimelineAdapter implements GitHubOutcomeTimelineAd
       retryable,
     };
   }
+
+  async collectRework(input: {
+    owner: string;
+    repo: string;
+    repositoryExternalId: string;
+    watch: OutcomeReworkWatch;
+    until: string;
+  }): Promise<PullCollection> {
+    const base = `https://api.github.com/repos/${encodeURIComponent(input.owner)}/${encodeURIComponent(input.repo)}`;
+    let rateReceipt: GitHubRateReceipt | null = null;
+    let repository: Record<string, unknown>;
+    try {
+      const response = await this.json(base, "reverts");
+      repository = response.value as Record<string, unknown>;
+      rateReceipt = response.rateReceipt;
+    } catch (error) {
+      if (!(error instanceof GitHubTimelineProviderError)) throw error;
+      return {
+        facts: [],
+        coverage: [
+          {
+            dimension: "reverts",
+            status: error.reason === "rate_exhausted" ? "unknown" : "incomplete",
+            reason: error.reason,
+            detail: `GitHub ${error.status || "request"}: ${error.message}`,
+          },
+        ],
+        rateReceipt: error.rateReceipt,
+        retryable: true,
+      };
+    }
+
+    const branch = encodeURIComponent(String(repository.default_branch ?? "main"));
+    const pages = await this.arrayPages({
+      url: (page) =>
+        `${base}/commits?sha=${branch}&since=${encodeURIComponent(input.watch.lastCheckedThrough)}&until=${encodeURIComponent(input.until)}&per_page=100&page=${page}`,
+      dimension: "reverts",
+    });
+    const facts: PullTimelineFact[] = [];
+    for (const row of pages.items) {
+      const revertSha = fullSha(row.sha);
+      const commit = row.commit as Record<string, unknown> | undefined;
+      const message = typeof commit?.message === "string" ? commit.message : "";
+      const committer = commit?.committer as Record<string, unknown> | undefined;
+      const author = commit?.author as Record<string, unknown> | undefined;
+      const revertedAt = timestamp(committer?.date ?? author?.date);
+      if (!revertSha || !revertedAt) continue;
+      for (const match of message.matchAll(/This reverts commit ([0-9a-f]{40})\.?/gi)) {
+        const revertedSha = fullSha(match[1]);
+        if (!revertedSha || revertedSha !== input.watch.mergeSha) continue;
+        facts.push({
+          schemaVersion: 1,
+          externalId: `github:commit:${revertSha}:revert:${revertedSha}`,
+          repositoryExternalId: input.repositoryExternalId,
+          pullExternalId: input.watch.pull.pullExternalId,
+          pullNumber: input.watch.pull.number,
+          kind: "revert",
+          revertSha,
+          revertedSha,
+          revertedAt,
+          evidence: { source: "commit_message_full_sha", matchedFullSha: revertedSha },
+        });
+      }
+    }
+    return {
+      facts,
+      coverage: [pages.coverage],
+      rateReceipt: pages.rateReceipt ?? rateReceipt,
+      retryable: pages.retryable,
+    };
+  }
 }
 
 function repositoryExternalId(owner: string, repo: string): string {
@@ -665,12 +748,22 @@ function statusFromCoverage(
   return windowComplete ? "complete" : "bounded";
 }
 
+function combineChangedPullCoverage(
+  current: ChangedPullCoverage,
+  next: ChangedPullCoverage,
+): ChangedPullCoverage {
+  const rank = { complete: 0, unknown: 1, incomplete: 2 } as const;
+  return rank[next.status] > rank[current.status] ? next : current;
+}
+
 export type OutcomeTimelineBackfillReceipt = {
   schema: "plimsoll.outcome-timeline-backfill.v1";
   runId: string;
   repositoryExternalId: string;
   status: "complete" | "bounded" | "incomplete" | "unknown";
   processedPulls: number;
+  processedReworkWatches: number;
+  reworkWatchRemaining: number;
   insertedFacts: number;
   duplicateFacts: number;
   coverage: { complete: number; incomplete: number; unknown: number };
@@ -690,6 +783,7 @@ export async function runOutcomeTimelineBackfill(input: {
   store: OutcomeTimelineStore;
   adapter: GitHubOutcomeTimelineAdapter;
   requiredChecks?: RequiredCheckPolicy;
+  reworkWindowDays?: number;
   runId?: string;
   now?: () => string;
 }): Promise<OutcomeTimelineBackfillReceipt> {
@@ -698,6 +792,10 @@ export async function runOutcomeTimelineBackfill(input: {
   const repoExternalId = repositoryExternalId(input.owner, input.repo);
   if (!Number.isInteger(input.maxPulls) || input.maxPulls < 1 || input.maxPulls > 100) {
     throw new Error("maxPulls must be an integer from 1 through 100");
+  }
+  const reworkWindowDays = input.reworkWindowDays ?? 14;
+  if (!Number.isInteger(reworkWindowDays) || reworkWindowDays < 1 || reworkWindowDays > 365) {
+    throw new Error("reworkWindowDays must be an integer from 1 through 365");
   }
   if (!Number.isFinite(Date.parse(input.since)) || !Number.isFinite(Date.parse(input.until))) {
     throw new Error("since and until must be ISO timestamps");
@@ -714,6 +812,7 @@ export async function runOutcomeTimelineBackfill(input: {
       lastCursor: null,
       lastEtag: null,
       activeWindow: null,
+      reworkWatch: [],
       lastRateReceipt: null,
     });
   if (!state.activeWindow) {
@@ -727,6 +826,11 @@ export async function runOutcomeTimelineBackfill(input: {
         pageLoaded: false,
         pendingPulls: [],
         etag: null,
+        changedPullCoverage: {
+          dimension: "changed_pulls",
+          status: "complete",
+          reason: "complete",
+        },
       },
     };
     input.store.saveState(state, now());
@@ -734,6 +838,7 @@ export async function runOutcomeTimelineBackfill(input: {
 
   const runCoverage: OutcomeTimelineCoverage[] = [];
   let processedPulls = 0;
+  let processedReworkWatches = 0;
   let insertedFacts = 0;
   let duplicateFacts = 0;
   let stoppedForRetry = false;
@@ -745,9 +850,54 @@ export async function runOutcomeTimelineBackfill(input: {
     ...observation,
   });
 
-  const advanceEmptyPage = () => {
-    const active = state.activeWindow!;
-    if (!active.pageLoaded || active.pendingPulls.length > 0) return false;
+  const updateReworkWatch = (
+    current: OutcomeReworkWatch[],
+    pull: ChangedPullRef,
+    facts: PullTimelineFact[],
+    checkedThrough: string,
+  ): OutcomeReworkWatch[] => {
+    let watches = [...current];
+    for (const merge of facts.filter(
+      (fact): fact is Extract<PullTimelineFact, { kind: "merge" }> => fact.kind === "merge",
+    )) {
+      watches = watches.filter(
+        (watch) => !(watch.pull.pullExternalId === pull.pullExternalId && watch.mergeSha === merge.mergeSha),
+      );
+      const reverted = facts.some(
+        (fact) => fact.kind === "revert" && fact.revertedSha === merge.mergeSha,
+      );
+      const expiresAt = new Date(
+        Date.parse(merge.mergedAt) + reworkWindowDays * 24 * 60 * 60 * 1000,
+      ).toISOString();
+      if (!reverted && checkedThrough < expiresAt) {
+        watches.push({
+          pull,
+          mergeSha: merge.mergeSha,
+          mergedAt: merge.mergedAt,
+          expiresAt,
+          lastCheckedThrough: checkedThrough,
+        });
+      }
+    }
+    return watches.sort(
+      (left, right) =>
+        left.expiresAt.localeCompare(right.expiresAt) ||
+        left.pull.number - right.pull.number ||
+        left.mergeSha.localeCompare(right.mergeSha),
+    );
+  };
+
+  const persistedSourceCoverage = state.activeWindow?.changedPullCoverage;
+  if (persistedSourceCoverage && persistedSourceCoverage.status !== "complete") {
+    const persisted = coverageRow(persistedSourceCoverage);
+    runCoverage.push(persisted);
+    input.store.recordCoverage([persisted], now());
+  }
+
+  const advanceEmptyPage = (): "none" | "advanced" | "blocked" => {
+    const active = state.activeWindow;
+    if (!active) return "none";
+    if (!active.pageLoaded || active.pendingPulls.length > 0) return "none";
     if (active.nextCursor) {
       state = {
         ...state,
@@ -759,6 +909,8 @@ export async function runOutcomeTimelineBackfill(input: {
           etag: null,
         },
       };
+    } else if (active.changedPullCoverage.status !== "complete") {
+      return "blocked";
     } else {
       state = {
         ...state,
@@ -767,11 +919,92 @@ export async function runOutcomeTimelineBackfill(input: {
       };
     }
     input.store.saveState(state, now());
-    return true;
+    return "advanced";
   };
 
+  while (processedPulls < input.maxPulls && !stoppedForRetry) {
+    const activeUntil = state.activeWindow?.until ?? new Date(input.until).toISOString();
+    const watchIndex = state.reworkWatch.findIndex((watch) => {
+      const target = activeUntil < watch.expiresAt ? activeUntil : watch.expiresAt;
+      return watch.lastCheckedThrough < target;
+    });
+    if (watchIndex === -1) break;
+    const watch = state.reworkWatch[watchIndex]!;
+    const watchUntil = activeUntil < watch.expiresAt ? activeUntil : watch.expiresAt;
+    let collection: PullCollection;
+    try {
+      collection = input.adapter.collectRework
+        ? await input.adapter.collectRework({
+            owner: input.owner,
+            repo: input.repo,
+            repositoryExternalId: repoExternalId,
+            watch,
+            until: watchUntil,
+          })
+        : await input.adapter.collectPull({
+            owner: input.owner,
+            repo: input.repo,
+            repositoryExternalId: repoExternalId,
+            pull: watch.pull,
+            until: watchUntil,
+          });
+    } catch (error) {
+      if (!(error instanceof GitHubTimelineProviderError)) throw error;
+      collection = {
+        facts: [],
+        coverage: [
+          {
+            dimension: "reverts",
+            status: error.reason === "rate_exhausted" ? "unknown" : "incomplete",
+            reason: error.reason,
+            detail: `GitHub ${error.status || "request"}: ${error.message}`,
+          },
+        ],
+        rateReceipt: error.rateReceipt,
+        retryable: true,
+      };
+    }
+    const rows = collection.coverage.map((observation) =>
+      coverageRow(observation, watch.pull.pullExternalId),
+    );
+    runCoverage.push(...rows);
+    const revertFound = collection.facts.some(
+      (fact) => fact.kind === "revert" && fact.revertedSha === watch.mergeSha,
+    );
+    const reworkWatch = [...state.reworkWatch];
+    if (!collection.retryable) {
+      if (revertFound || watchUntil >= watch.expiresAt) {
+        reworkWatch.splice(watchIndex, 1);
+      } else {
+        reworkWatch[watchIndex] = { ...watch, lastCheckedThrough: watchUntil };
+      }
+    }
+    const nextState: OutcomeTimelineBackfillState = {
+      ...state,
+      reworkWatch,
+      lastRateReceipt: collection.rateReceipt ?? state.lastRateReceipt,
+    };
+    const appended = input.store.commitPullCollection({
+      facts: collection.facts,
+      coverage: rows,
+      state: nextState,
+      now: now(),
+    });
+    state = nextState;
+    insertedFacts += appended.inserted;
+    duplicateFacts += appended.duplicates;
+    if (collection.retryable) {
+      stoppedForRetry = true;
+    } else {
+      processedPulls += 1;
+      processedReworkWatches += 1;
+    }
+  }
+
   while (processedPulls < input.maxPulls && state.activeWindow && !stoppedForRetry) {
-    if (advanceEmptyPage()) continue;
+    const advancement = advanceEmptyPage();
+    if (advancement === "advanced") continue;
+    if (advancement === "blocked") break;
     const active = state.activeWindow;
     if (!active.pageLoaded) {
       try {
@@ -801,10 +1034,16 @@ export async function runOutcomeTimelineBackfill(input: {
             pendingPulls: page.items,
             nextCursor: page.nextCursor,
             etag: page.etag,
+            changedPullCoverage: combineChangedPullCoverage(
+              active.changedPullCoverage,
+              page.coverage,
+            ),
           },
         };
         input.store.saveState(state, now());
-        if (advanceEmptyPage()) continue;
+        const afterFetch = advanceEmptyPage();
+        if (afterFetch === "advanced") continue;
+        if (afterFetch === "blocked") break;
       } catch (error) {
         if (!(error instanceof GitHubTimelineProviderError)) throw error;
         const row = coverageRow({
@@ -873,6 +1112,14 @@ export async function runOutcomeTimelineBackfill(input: {
     const nextState: OutcomeTimelineBackfillState = {
       ...state,
       lastRateReceipt: collection.rateReceipt ?? state.lastRateReceipt,
+      reworkWatch: collection.retryable
+        ? state.reworkWatch
+        : updateReworkWatch(
+            state.reworkWatch,
+            pull,
+            collection.facts,
+            state.activeWindow.until,
+          ),
       activeWindow: {
         ...state.activeWindow,
         pendingPulls: collection.retryable
@@ -895,7 +1142,7 @@ export async function runOutcomeTimelineBackfill(input: {
       processedPulls += 1;
     }
   }
-  if (!stoppedForRetry) advanceEmptyPage();
+  if (!stoppedForRetry && state.activeWindow) advanceEmptyPage();
 
   const counts = {
     complete: runCoverage.filter((row) => row.status === "complete").length,
@@ -908,6 +1155,8 @@ export async function runOutcomeTimelineBackfill(input: {
     repositoryExternalId: repoExternalId,
     status: statusFromCoverage(runCoverage, state.activeWindow === null),
     processedPulls,
+    processedReworkWatches,
+    reworkWatchRemaining: state.reworkWatch.length,
     insertedFacts,
     duplicateFacts,
     coverage: counts,

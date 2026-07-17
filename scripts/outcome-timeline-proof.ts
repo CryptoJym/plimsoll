@@ -20,6 +20,8 @@ import {
   pullTimelineFactSchema,
   type ChangedPullRef,
   type GitHubRateReceipt,
+  type OutcomeTimelineCoverage,
+  type OutcomeReworkWatch,
   type PullTimelineFact,
 } from "../packages/shared/src/index";
 
@@ -74,12 +76,12 @@ async function main() {
   const pull = (number: number) => derived.find((row) => row.pullNumber === number)!;
   prove(
     "failed_sha_then_same_sha_pass_is_retry_episode",
-    pull(1).retryEpisodes.length === 1 && pull(1).correctionLoops.length === 0,
+    pull(1).retryEpisodes?.length === 1 && pull(1).correctionLoops?.length === 0,
     { retryEpisodes: pull(1).retryEpisodes, correctionLoops: pull(1).correctionLoops },
   );
   prove(
     "failed_sha_then_new_sha_pass_is_correction_loop",
-    pull(2).retryEpisodes.length === 0 && pull(2).correctionLoops.length === 1,
+    pull(2).retryEpisodes?.length === 0 && pull(2).correctionLoops?.length === 1,
     { retryEpisodes: pull(2).retryEpisodes, correctionLoops: pull(2).correctionLoops },
   );
   prove(
@@ -89,10 +91,34 @@ async function main() {
     { reviewCorrections: pull(3).reviewCorrections },
   );
   prove(
+    "stale_approval_on_old_sha_does_not_close_review_correction",
+    pull(7).reviewCorrections.length === 0,
+    { reviewCorrections: pull(7).reviewCorrections },
+  );
+  prove(
+    "multi_revision_review_correction_is_attributed_to_exact_approved_sha",
+    pull(9).reviewCorrections.length === 1 &&
+      pull(9).reviewCorrections[0]?.correctedSha === "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+    { reviewCorrections: pull(9).reviewCorrections },
+  );
+  const reviewLifecycle = immutableStore
+    .facts()
+    .filter(
+      (fact): fact is Extract<PullTimelineFact, { kind: "review_outcome" }> =>
+        fact.kind === "review_outcome" && fact.reviewExternalId === "github:review:PR8-SAME",
+    );
+  prove(
+    "approved_then_dismissed_review_transitions_have_distinct_immutable_ids",
+    reviewLifecycle.length === 2 &&
+      new Set(reviewLifecycle.map((fact) => fact.externalId)).size === 2 &&
+      new Set(reviewLifecycle.map((fact) => fact.outcome)).size === 2,
+    { transitions: reviewLifecycle.map((fact) => ({ externalId: fact.externalId, outcome: fact.outcome })) },
+  );
+  prove(
     "green_multi_commit_is_not_rework",
     pull(4).revisionCount === 2 &&
-      pull(4).greenMultiCommitWithoutRework &&
-      pull(4).correctionLoops.length === 0 &&
+      pull(4).greenMultiCommitWithoutRework === true &&
+      pull(4).correctionLoops?.length === 0 &&
       pull(4).rework.length === 0,
     { pull: pull(4) },
   );
@@ -116,6 +142,59 @@ async function main() {
     "missing_required_check_policy_keeps_check_metrics_unknown",
     unknownDerivation.every((row) => row.coverage === "unknown" && row.firstPassSuccess === null),
     { rows: unknownDerivation.length },
+  );
+  const uncoveredFacts = facts.filter(
+    (fact) =>
+      fact.pullNumber === 7 &&
+      (fact.kind === "pull" ||
+        (fact.kind === "pull_revision" && fact.sha === "9999999999999999999999999999999999999999")),
+  );
+  const incompleteCoverageCases: OutcomeTimelineCoverage[] = [
+    {
+      runId: "derive-provider-500",
+      repositoryExternalId: "github:repository:fixture/repo",
+      pullExternalId: "github:pull:PR7",
+      dimension: "checks",
+      status: "incomplete",
+      reason: "provider_failure",
+    },
+    {
+      runId: "derive-rate",
+      repositoryExternalId: "github:repository:fixture/repo",
+      pullExternalId: "github:pull:PR7",
+      dimension: "checks",
+      status: "unknown",
+      reason: "rate_exhausted",
+    },
+    {
+      runId: "derive-pagination",
+      repositoryExternalId: "github:repository:fixture/repo",
+      pullExternalId: "github:pull:PR7",
+      dimension: "checks",
+      status: "incomplete",
+      reason: "pagination_limit",
+    },
+  ];
+  const incompleteDerivations = incompleteCoverageCases.map((coverage) =>
+    derivePullOutcomeTimeline({
+      facts: uncoveredFacts,
+      coverage: [coverage],
+      requiredChecks: { names: ["ci"] },
+      reworkWindowDays: fixture.reworkWindowDays,
+    })[0]!,
+  );
+  prove(
+    "incomplete_provider_coverage_keeps_missing_check_facts_not_estimable",
+    incompleteDerivations.every(
+      (row) =>
+        row.coverage === "unknown" &&
+        row.firstPassSuccess === null &&
+        row.timeToGreenMs === null &&
+        row.retryEpisodes === null &&
+        row.correctionLoops === null &&
+        row.greenMultiCommitWithoutRework === null,
+    ),
+    { cases: incompleteDerivations },
   );
 
   const strictPrivacy = pullTimelineFactSchema.safeParse({
@@ -189,6 +268,8 @@ async function main() {
 
   const TOKEN_SENTINEL = "github-token-must-never-persist-SENTINEL";
   let tokenObservedOnlyInRequest = false;
+  let checkRunsRequestedAllAttempts = false;
+  let providerReviewState = "APPROVED";
   const mockFetch: typeof fetch = async (request, init) => {
     const url = String(request);
     const headers = new Headers(init?.headers);
@@ -219,6 +300,7 @@ async function main() {
       ]);
     }
     if (/\/check-runs/.test(url)) {
+      checkRunsRequestedAllAttempts ||= new URL(url).searchParams.get("filter") === "all";
       return json({
         check_runs: [
           {
@@ -249,7 +331,7 @@ async function main() {
         {
           id: 702,
           node_id: "REVIEW702",
-          state: "APPROVED",
+          state: providerReviewState,
           commit_id: "7777777777777777777777777777777777777777",
           submitted_at: "2026-07-03T00:00:00.000Z",
         },
@@ -310,6 +392,43 @@ async function main() {
       ),
     { kinds: [...actualKinds].sort(), factCount: actualCollection.facts.length, retryable: actualCollection.retryable },
   );
+  prove("check_collection_explicitly_requests_all_attempts", checkRunsRequestedAllAttempts, {
+    checkRunsRequestedAllAttempts,
+  });
+  providerReviewState = "DISMISSED";
+  const dismissedCollection = await realAdapter.collectPull({
+    owner: "fixture",
+    repo: "repo",
+    repositoryExternalId: "github:repository:fixture/repo",
+    pull: {
+      number: 7,
+      pullExternalId: "github:pull:PR7",
+      updatedAt: "2026-07-09T00:00:00.000Z",
+    },
+    until: "2026-07-30T00:00:00.000Z",
+  });
+  const providerReviewTransitions = [...actualCollection.facts, ...dismissedCollection.facts].filter(
+    (fact): fact is Extract<PullTimelineFact, { kind: "review_outcome" }> =>
+      fact.kind === "review_outcome" && fact.reviewExternalId === "github:review:REVIEW702",
+  );
+  const transitionStore = new OutcomeTimelineStore(path.join(sandbox, "review-transitions.sqlite"));
+  const transitionReplay = transitionStore.appendFacts([...providerReviewTransitions].reverse());
+  prove(
+    "provider_approved_then_dismissed_review_replays_as_distinct_transitions",
+    providerReviewTransitions.length === 2 &&
+      transitionReplay.inserted === 2 &&
+      transitionStore.facts().length === 2 &&
+      new Set(providerReviewTransitions.map((fact) => fact.externalId)).size === 2 &&
+      new Set(providerReviewTransitions.map((fact) => fact.outcome)).size === 2,
+    {
+      transitions: providerReviewTransitions.map((fact) => ({
+        externalId: fact.externalId,
+        outcome: fact.outcome,
+      })),
+      transitionReplay,
+    },
+  );
+  transitionStore.close();
 
   class RecoveryAdapter implements GitHubOutcomeTimelineAdapter {
     readonly cursors: Array<string | null> = [];
@@ -428,6 +547,283 @@ async function main() {
     { etag: state1.activeWindow?.etag, rateReceipt: state1.lastRateReceipt },
   );
   recoveryStore.close();
+
+  class IncompleteChangedPullAdapter implements GitHubOutcomeTimelineAdapter {
+    listCalls = 0;
+
+    async listChangedPullsPage() {
+      this.listCalls += 1;
+      return {
+        items: [30, 31].map((number) => ({
+          number,
+          pullExternalId: `github:pull:INCOMPLETE-${number}`,
+          updatedAt: `2026-07-${number}T00:00:00.000Z`,
+        })),
+        nextCursor: null,
+        etag: '"incomplete-changed-pulls"',
+        rateReceipt: null,
+        coverage: {
+          dimension: "changed_pulls" as const,
+          status: "incomplete" as const,
+          reason: "pagination_limit" as const,
+          detail: "fixture changed-PR search exceeded its provider cap",
+        },
+      };
+    }
+
+    async collectPull(input: {
+      repositoryExternalId: string;
+      pull: ChangedPullRef;
+    }): Promise<PullCollection> {
+      return {
+        facts: [
+          {
+            schemaVersion: 1,
+            externalId: input.pull.pullExternalId,
+            repositoryExternalId: input.repositoryExternalId,
+            pullExternalId: input.pull.pullExternalId,
+            pullNumber: input.pull.number,
+            kind: "pull",
+            createdAt: input.pull.updatedAt,
+          },
+        ],
+        coverage: [{ dimension: "pull", status: "complete", reason: "complete" }],
+        rateReceipt: null,
+        retryable: false,
+      };
+    }
+  }
+
+  const incompleteChangedPullStore = new OutcomeTimelineStore(
+    path.join(sandbox, "incomplete-changed-pulls.sqlite"),
+  );
+  const incompleteChangedPullAdapter = new IncompleteChangedPullAdapter();
+  const incompleteChangedPullCommon = {
+    owner: "fixture",
+    repo: "incomplete-changed-pulls",
+    since: "2026-07-01T00:00:00.000Z",
+    until: "2026-07-31T00:00:00.000Z",
+    maxPulls: 1,
+    store: incompleteChangedPullStore,
+    adapter: incompleteChangedPullAdapter,
+    requiredChecks: { names: ["ci"] },
+    now: () => "2026-07-31T00:00:00.000Z",
+  };
+  const incompleteRun1 = await runOutcomeTimelineBackfill({
+    ...incompleteChangedPullCommon,
+    runId: "incomplete-changed-1",
+  });
+  const incompleteState1 = incompleteChangedPullStore.readState(
+    "github:repository:fixture/incomplete-changed-pulls",
+  )!;
+  const incompleteRun2 = await runOutcomeTimelineBackfill({
+    ...incompleteChangedPullCommon,
+    runId: "incomplete-changed-2",
+  });
+  const incompleteState2 = incompleteChangedPullStore.readState(
+    "github:repository:fixture/incomplete-changed-pulls",
+  )!;
+  const incompleteRun3 = await runOutcomeTimelineBackfill({
+    ...incompleteChangedPullCommon,
+    runId: "incomplete-changed-3",
+  });
+  const incompleteState3 = incompleteChangedPullStore.readState(
+    "github:repository:fixture/incomplete-changed-pulls",
+  )!;
+  prove(
+    "incomplete_changed_pull_page_survives_pending_drain_and_never_advances_completed_through",
+    [incompleteRun1, incompleteRun2, incompleteRun3].every(
+      (receipt) => receipt.status === "incomplete" && receipt.completedThrough === null,
+    ) &&
+      incompleteState1.activeWindow?.pendingPulls.length === 1 &&
+      incompleteState2.activeWindow?.pendingPulls.length === 0 &&
+      incompleteState3.activeWindow?.changedPullCoverage.status === "incomplete" &&
+      incompleteState3.activeWindow?.changedPullCoverage.reason === "pagination_limit" &&
+      incompleteState3.completedThrough === null &&
+      incompleteChangedPullAdapter.listCalls === 1 &&
+      ["incomplete-changed-1", "incomplete-changed-2", "incomplete-changed-3"].every(
+        (runId) =>
+          incompleteChangedPullStore
+            .coverage(runId)
+            .some(
+              (row) =>
+                row.dimension === "changed_pulls" &&
+                row.status === "incomplete" &&
+                row.reason === "pagination_limit",
+            ),
+      ),
+    {
+      statuses: [incompleteRun1.status, incompleteRun2.status, incompleteRun3.status],
+      processed: [
+        incompleteRun1.processedPulls,
+        incompleteRun2.processedPulls,
+        incompleteRun3.processedPulls,
+      ],
+      remaining: [
+        incompleteState1.activeWindow?.pendingPulls.length,
+        incompleteState2.activeWindow?.pendingPulls.length,
+        incompleteState3.activeWindow?.pendingPulls.length,
+      ],
+      coverage: incompleteState3.activeWindow?.changedPullCoverage,
+      completedThrough: incompleteState3.completedThrough,
+      listCalls: incompleteChangedPullAdapter.listCalls,
+    },
+  );
+  incompleteChangedPullStore.close();
+
+  class ReworkWatchAdapter implements GitHubOutcomeTimelineAdapter {
+    listCalls = 0;
+    collectReworkCalls = 0;
+    readonly mergeSha = "1212121212121212121212121212121212121212";
+    readonly revertSha = "1313131313131313131313131313131313131313";
+
+    async listChangedPullsPage() {
+      this.listCalls += 1;
+      return {
+        items:
+          this.listCalls === 1
+            ? [
+                {
+                  number: 40,
+                  pullExternalId: "github:pull:REWORK-WATCH-40",
+                  updatedAt: "2026-07-01T00:00:00.000Z",
+                },
+              ]
+            : [],
+        nextCursor: null,
+        etag: `"rework-watch-${this.listCalls}"`,
+        rateReceipt: null,
+        coverage: {
+          dimension: "changed_pulls" as const,
+          status: "complete" as const,
+          reason: "complete" as const,
+        },
+      };
+    }
+
+    async collectPull(input: {
+      repositoryExternalId: string;
+      pull: ChangedPullRef;
+    }): Promise<PullCollection> {
+      return {
+        facts: [
+          {
+            schemaVersion: 1,
+            externalId: input.pull.pullExternalId,
+            repositoryExternalId: input.repositoryExternalId,
+            pullExternalId: input.pull.pullExternalId,
+            pullNumber: input.pull.number,
+            kind: "pull",
+            createdAt: "2026-06-30T00:00:00.000Z",
+          },
+          {
+            schemaVersion: 1,
+            externalId: `${input.pull.pullExternalId}:merge:${this.mergeSha}`,
+            repositoryExternalId: input.repositoryExternalId,
+            pullExternalId: input.pull.pullExternalId,
+            pullNumber: input.pull.number,
+            kind: "merge",
+            mergeSha: this.mergeSha,
+            mergedAt: "2026-07-01T12:00:00.000Z",
+          },
+        ],
+        coverage: [
+          { dimension: "pull", status: "complete", reason: "complete" },
+          { dimension: "reverts", status: "complete", reason: "complete" },
+        ],
+        rateReceipt: null,
+        retryable: false,
+      };
+    }
+
+    async collectRework(input: {
+      repositoryExternalId: string;
+      watch: OutcomeReworkWatch;
+    }): Promise<PullCollection> {
+      this.collectReworkCalls += 1;
+      return {
+        facts: [
+          {
+            schemaVersion: 1,
+            externalId: `github:commit:${this.revertSha}:revert:${this.mergeSha}`,
+            repositoryExternalId: input.repositoryExternalId,
+            pullExternalId: input.watch.pull.pullExternalId,
+            pullNumber: input.watch.pull.number,
+            kind: "revert",
+            revertSha: this.revertSha,
+            revertedSha: this.mergeSha,
+            revertedAt: "2026-07-04T00:00:00.000Z",
+            evidence: {
+              source: "commit_message_full_sha",
+              matchedFullSha: this.mergeSha,
+            },
+          },
+        ],
+        coverage: [{ dimension: "reverts", status: "complete", reason: "complete" }],
+        rateReceipt: null,
+        retryable: false,
+      };
+    }
+  }
+
+  const reworkWatchStore = new OutcomeTimelineStore(path.join(sandbox, "rework-watch.sqlite"));
+  const reworkWatchAdapter = new ReworkWatchAdapter();
+  const reworkWatchRun1 = await runOutcomeTimelineBackfill({
+    owner: "fixture",
+    repo: "rework-watch",
+    since: "2026-07-01T00:00:00.000Z",
+    until: "2026-07-02T00:00:00.000Z",
+    maxPulls: 1,
+    reworkWindowDays: 14,
+    store: reworkWatchStore,
+    adapter: reworkWatchAdapter,
+    requiredChecks: { names: ["ci"] },
+    runId: "rework-watch-1",
+    now: () => "2026-07-02T00:00:00.000Z",
+  });
+  const reworkState1 = reworkWatchStore.readState("github:repository:fixture/rework-watch")!;
+  const reworkWatchRun2 = await runOutcomeTimelineBackfill({
+    owner: "fixture",
+    repo: "rework-watch",
+    since: "2026-07-01T00:00:00.000Z",
+    until: "2026-07-06T00:00:00.000Z",
+    maxPulls: 1,
+    reworkWindowDays: 14,
+    store: reworkWatchStore,
+    adapter: reworkWatchAdapter,
+    requiredChecks: { names: ["ci"] },
+    runId: "rework-watch-2",
+    now: () => "2026-07-06T00:00:00.000Z",
+  });
+  const reworkState2 = reworkWatchStore.readState("github:repository:fixture/rework-watch")!;
+  const watchedPull = derivePullOutcomeTimeline({
+    facts: reworkWatchStore.facts(),
+    requiredChecks: { names: ["ci"] },
+    reworkWindowDays: 14,
+  })[0]!;
+  prove(
+    "persisted_rework_watch_captures_later_revert_for_unchanged_merged_pull",
+    reworkWatchRun1.reworkWatchRemaining === 1 &&
+      reworkState1.reworkWatch[0]?.lastCheckedThrough === "2026-07-02T00:00:00.000Z" &&
+      reworkWatchRun2.processedReworkWatches === 1 &&
+      reworkWatchRun2.reworkWatchRemaining === 0 &&
+      reworkState2.reworkWatch.length === 0 &&
+      reworkWatchAdapter.listCalls === 1 &&
+      reworkWatchAdapter.collectReworkCalls === 1 &&
+      watchedPull.rework.length === 1 &&
+      watchedPull.rework[0]?.at === "2026-07-04T00:00:00.000Z" &&
+      watchedPull.rework[0]?.inWindow === true,
+    {
+      run1: reworkWatchRun1,
+      run2: reworkWatchRun2,
+      firstWatch: reworkState1.reworkWatch,
+      finalWatch: reworkState2.reworkWatch,
+      listCalls: reworkWatchAdapter.listCalls,
+      collectReworkCalls: reworkWatchAdapter.collectReworkCalls,
+      rework: watchedPull.rework,
+    },
+  );
+  reworkWatchStore.close();
 
   class MissingPolicyAdapter implements GitHubOutcomeTimelineAdapter {
     async listChangedPullsPage() {

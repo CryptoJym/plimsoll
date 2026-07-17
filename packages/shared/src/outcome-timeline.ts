@@ -106,11 +106,8 @@ export type PullTimelineFact = z.infer<typeof pullTimelineFactSchema>;
 export const timelineCoverageStatusSchema = z.enum(["complete", "incomplete", "unknown"]);
 export type TimelineCoverageStatus = z.infer<typeof timelineCoverageStatusSchema>;
 
-export const outcomeTimelineCoverageSchema = z
+export const outcomeTimelineCoverageObservationSchema = z
   .object({
-    runId: externalIdSchema,
-    repositoryExternalId: externalIdSchema,
-    pullExternalId: externalIdSchema.optional(),
     dimension: z.enum([
       "changed_pulls",
       "pull",
@@ -135,6 +132,16 @@ export const outcomeTimelineCoverageSchema = z
     detail: z.string().trim().min(1).max(512).optional(),
   })
   .strict();
+export type OutcomeTimelineCoverageObservation = z.infer<typeof outcomeTimelineCoverageObservationSchema>;
+
+export const outcomeTimelineCoverageSchema = z
+  .object({
+    runId: externalIdSchema,
+    repositoryExternalId: externalIdSchema,
+    pullExternalId: externalIdSchema.optional(),
+    ...outcomeTimelineCoverageObservationSchema.shape,
+  })
+  .strict();
 export type OutcomeTimelineCoverage = z.infer<typeof outcomeTimelineCoverageSchema>;
 
 export const githubRateReceiptSchema = z
@@ -157,6 +164,23 @@ export const changedPullRefSchema = z
   .strict();
 export type ChangedPullRef = z.infer<typeof changedPullRefSchema>;
 
+export const outcomeReworkWatchSchema = z
+  .object({
+    pull: changedPullRefSchema,
+    mergeSha: fullCommitShaSchema,
+    mergedAt: timestampSchema,
+    expiresAt: timestampSchema,
+    lastCheckedThrough: timestampSchema,
+  })
+  .strict();
+export type OutcomeReworkWatch = z.infer<typeof outcomeReworkWatchSchema>;
+
+const completeChangedPullCoverage = {
+  dimension: "changed_pulls" as const,
+  status: "complete" as const,
+  reason: "complete" as const,
+};
+
 const activeBackfillWindowSchema = z
   .object({
     since: timestampSchema,
@@ -166,6 +190,9 @@ const activeBackfillWindowSchema = z
     pageLoaded: z.boolean(),
     pendingPulls: z.array(changedPullRefSchema),
     etag: z.string().trim().min(1).nullable(),
+    changedPullCoverage: outcomeTimelineCoverageObservationSchema
+      .extend({ dimension: z.literal("changed_pulls") })
+      .default(completeChangedPullCoverage),
   })
   .strict();
 
@@ -179,6 +206,7 @@ export const outcomeTimelineBackfillStateSchema = z
     lastCursor: z.string().trim().min(1).nullable(),
     lastEtag: z.string().trim().min(1).nullable(),
     activeWindow: activeBackfillWindowSchema.nullable(),
+    reworkWatch: z.array(outcomeReworkWatchSchema).default([]),
     lastRateReceipt: githubRateReceiptSchema.nullable(),
   })
   .strict();
@@ -222,14 +250,14 @@ export type PullOutcomeDerivation = {
   revisionCount: number;
   firstPassSuccess: boolean | null;
   timeToGreenMs: number | null;
-  retryEpisodes: Array<{ sha: string; failedAt: string; passedAt: string }>;
-  correctionLoops: Array<{ failedSha: string; correctedSha: string; failedAt: string; passedAt: string }>;
+  retryEpisodes: Array<{ sha: string; failedAt: string; passedAt: string }> | null;
+  correctionLoops: Array<{ failedSha: string; correctedSha: string; failedAt: string; passedAt: string }> | null;
   reviewCorrections: Array<{
     changesRequestedReviewId: string;
     correctedSha: string;
     approvalReviewId: string;
   }>;
-  greenMultiCommitWithoutRework: boolean;
+  greenMultiCommitWithoutRework: boolean | null;
   rework: Array<{ kind: "reopen" | "revert"; at: string; externalId: string; inWindow: boolean }>;
 };
 
@@ -240,6 +268,7 @@ export type PullOutcomeDerivation = {
  */
 export function derivePullOutcomeTimeline(input: {
   facts: PullTimelineFact[];
+  coverage?: OutcomeTimelineCoverage[];
   requiredChecks?: RequiredCheckPolicy;
   reworkWindowDays: number;
 }): PullOutcomeDerivation[] {
@@ -263,6 +292,13 @@ export function derivePullOutcomeTimeline(input: {
         (fact): fact is Extract<PullTimelineFact, { kind: "check_attempt" }> => fact.kind === "check_attempt",
       );
       const policy = input.requiredChecks?.names.map((name) => name.trim()).filter(Boolean);
+      const repositoryExternalId = facts[0]!.repositoryExternalId;
+      const relevantCoverage = (input.coverage ?? []).filter(
+        (row) =>
+          row.repositoryExternalId === repositoryExternalId &&
+          (!row.pullExternalId || row.pullExternalId === pullExternalId),
+      );
+      const providerCoverageComplete = relevantCoverage.every((row) => row.status === "complete");
       const checkStates = new Map<string, ReturnType<typeof checkStateForSha>>();
       if (policy?.length) {
         for (const revision of revisions) {
@@ -275,9 +311,14 @@ export function derivePullOutcomeTimeline(input: {
           );
         }
       }
+      const checkMetricsKnown =
+        Boolean(policy?.length) &&
+        providerCoverageComplete &&
+        revisions.length > 0 &&
+        revisions.every((revision) => checkStates.get(revision.sha)?.state !== "unknown");
 
-      const retryEpisodes: PullOutcomeDerivation["retryEpisodes"] = [];
-      if (policy?.length) {
+      const retryEpisodes: NonNullable<PullOutcomeDerivation["retryEpisodes"]> = [];
+      if (checkMetricsKnown && policy?.length) {
         for (const revision of revisions) {
           const revisionChecks = checks
             .filter((check) => check.sha === revision.sha && policy.includes(check.name))
@@ -297,8 +338,8 @@ export function derivePullOutcomeTimeline(input: {
         }
       }
 
-      const correctionLoops: PullOutcomeDerivation["correctionLoops"] = [];
-      if (policy?.length) {
+      const correctionLoops: NonNullable<PullOutcomeDerivation["correctionLoops"]> = [];
+      if (checkMetricsKnown && policy?.length) {
         for (let index = 0; index < revisions.length - 1; index += 1) {
           const failed = revisions[index]!;
           const failedState = checkStates.get(failed.sha);
@@ -329,16 +370,24 @@ export function derivePullOutcomeTimeline(input: {
         .sort((a, b) => a.submittedAt.localeCompare(b.submittedAt) || a.externalId.localeCompare(b.externalId));
       const reviewCorrections: PullOutcomeDerivation["reviewCorrections"] = [];
       for (const requested of reviews.filter((review) => review.outcome === "changes_requested")) {
-        const corrected = revisions.find((revision) => revision.committedAt > requested.submittedAt);
-        if (!corrected) continue;
         const approval = reviews.find(
-          (review) => review.outcome === "approved" && review.submittedAt > corrected.committedAt,
+          (review) =>
+            review.outcome === "approved" &&
+            review.sha !== null &&
+            review.submittedAt > requested.submittedAt &&
+            revisions.some(
+              (revision) =>
+                revision.sha === review.sha &&
+                revision.committedAt > requested.submittedAt &&
+                review.submittedAt > revision.committedAt,
+            ),
         );
         if (approval) {
+          const corrected = revisions.find((revision) => revision.sha === approval.sha)!;
           reviewCorrections.push({
-            changesRequestedReviewId: requested.reviewExternalId,
+            changesRequestedReviewId: requested.externalId,
             correctedSha: corrected.sha,
-            approvalReviewId: approval.reviewExternalId,
+            approvalReviewId: approval.externalId,
           });
         }
       }
@@ -371,22 +420,23 @@ export function derivePullOutcomeTimeline(input: {
         .filter((at): at is string => Boolean(at))
         .sort()[0];
       const timeToGreenMs = pull && firstGreenAt ? Date.parse(firstGreenAt) - Date.parse(pull.createdAt) : null;
-      const allKnownGreen = Boolean(policy?.length) && revisions.length > 1 && revisions.every(
+      const allKnownGreen = checkMetricsKnown && revisions.length > 1 && revisions.every(
         (revision) => checkStates.get(revision.sha)?.greenAt && !checkStates.get(revision.sha)?.failedAt,
       );
 
       return {
         pullExternalId,
         pullNumber,
-        coverage: policy?.length ? "complete" : "unknown",
+        coverage: checkMetricsKnown ? "complete" : "unknown",
         revisionCount: revisions.length,
-        firstPassSuccess: policy?.length ? Boolean(firstState?.greenAt && !firstState.failedAt) : null,
-        timeToGreenMs: policy?.length ? timeToGreenMs : null,
-        retryEpisodes,
-        correctionLoops,
+        firstPassSuccess: checkMetricsKnown ? Boolean(firstState?.greenAt && !firstState.failedAt) : null,
+        timeToGreenMs: checkMetricsKnown ? timeToGreenMs : null,
+        retryEpisodes: checkMetricsKnown ? retryEpisodes : null,
+        correctionLoops: checkMetricsKnown ? correctionLoops : null,
         reviewCorrections,
-        greenMultiCommitWithoutRework:
-          allKnownGreen && correctionLoops.length === 0 && rework.every((signal) => !signal.inWindow),
+        greenMultiCommitWithoutRework: checkMetricsKnown
+          ? allKnownGreen && correctionLoops.length === 0 && rework.every((signal) => !signal.inWindow)
+          : null,
         rework,
       };
     });
