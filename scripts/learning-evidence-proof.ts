@@ -109,6 +109,12 @@ function manifestFor(
       techniqueExposure: "1.0.0",
       projectAllocation: "1.0.0",
     },
+    outcomeContract: {
+      metricId: "first-pass-yield",
+      metricVersion: "1.0.0",
+      unit: "ratio-point",
+      direction: "higher_is_better",
+    },
     window: { startInclusive: START, endExclusive: END },
     asOf: AS_OF,
     techniqueId: "technique-a",
@@ -123,6 +129,8 @@ function manifestFor(
     },
     gates: {
       statisticalMinCompletePairs: 5,
+      statisticalMinActorClusters: 3,
+      statisticalMinRepoClusters: 3,
       privacyMinCompletePairs: 3,
       minimumAttributionCoverage: 0.8,
       maxAbsoluteOutcome: 1_000,
@@ -138,12 +146,12 @@ function manifestFor(
 }
 
 const basePairs = [
-  pair("p1", 11, 10),
-  pair("p2", 12, 10),
-  pair("p3", 13, 10),
-  pair("p4", 14, 10),
-  pair("p5", 15, 10),
-  pair("p6", 9, 10),
+  pair("p1", 11, 10, cohort({ actorClusterId: "actor-1", repoClusterId: "repo-1" })),
+  pair("p2", 12, 10, cohort({ actorClusterId: "actor-2", repoClusterId: "repo-2" })),
+  pair("p3", 13, 10, cohort({ actorClusterId: "actor-3", repoClusterId: "repo-3" })),
+  pair("p4", 14, 10, cohort({ actorClusterId: "actor-4", repoClusterId: "repo-4" })),
+  pair("p5", 15, 10, cohort({ actorClusterId: "actor-5", repoClusterId: "repo-5" })),
+  pair("p6", 9, 10, cohort({ actorClusterId: "actor-6", repoClusterId: "repo-6" })),
 ];
 const baseManifest = manifestFor(basePairs);
 const baseRun = compileLearningEvidencePacket(baseManifest);
@@ -158,6 +166,7 @@ prove(
     assert.equal(baseRun.packet.source.snapshotId, "snapshot-2026-06");
     assert.equal(baseRun.packet.source.queryHash, QUERY_HASH);
     assert.deepEqual(baseRun.packet.metricVersions, baseManifest.metricVersions);
+    assert.deepEqual(baseRun.packet.outcomeContract, baseManifest.outcomeContract);
     assert.deepEqual(baseRun.packet.window, baseManifest.window);
     assert.equal(baseRun.packet.asOf, AS_OF);
     assert.match(baseRun.packet.packetFingerprint, /^[0-9a-f]{64}$/);
@@ -173,6 +182,8 @@ prove(
     assert.equal(baseRun.packet.prescriptiveClaim, false);
     assert.equal(baseRun.packet.effect.rawEstimate, 14 / 6);
     assert.ok((baseRun.packet.effect.standardError ?? 0) > 0);
+    assert.equal(baseRun.packet.effect.standardError, baseRun.packet.effect.actorClusterStandardError);
+    assert.equal(baseRun.packet.effect.standardError, baseRun.packet.effect.repoClusterStandardError);
     assert.ok((baseRun.packet.effect.lowerBound ?? 0) < (baseRun.packet.effect.upperBound ?? 0));
     assert.equal(baseRun.packet.effect.associationDirection, "favors_exposed");
   },
@@ -187,8 +198,15 @@ prove(
       controlCount: 6,
       completePairCount: 6,
       incompletePairCount: 0,
+      actorClusterCount: 6,
+      repoClusterCount: 6,
       statisticalMinimum: 5,
+      statisticalActorClusterMinimum: 3,
+      statisticalRepoClusterMinimum: 3,
       privacyMinimum: 3,
+      statisticalPairMinimumMet: true,
+      statisticalActorClusterMinimumMet: true,
+      statisticalRepoClusterMinimumMet: true,
       statisticalMinimumMet: true,
       privacyMinimumMet: true,
     });
@@ -224,7 +242,35 @@ prove(
       packet: null,
     });
   },
-  "header/row digest identity returns before cohort validation or pair analysis",
+  "canonical rows are revalidated, then unchanged input skips all statistical analysis work",
+);
+
+prove(
+  "no-op cannot trust a stale or forged caller row identity",
+  () => {
+    const staleValue = manifestFor(basePairs.map((item) => structuredClone(item)));
+    staleValue.pairs[0].exposed.outcome.value = 999;
+    assert.throws(
+      () => compileLearningEvidencePacket(staleValue, { previousSourceFingerprint: baseRun.sourceFingerprint }),
+      /rowDigest does not bind/,
+    );
+
+    const forgedId = manifestFor(basePairs.map((item) => structuredClone(item)));
+    forgedId.pairs[0].exposed.observationId = "forged observation id";
+    assert.throws(
+      () => compileLearningEvidencePacket(forgedId, { previousSourceFingerprint: baseRun.sourceFingerprint }),
+      /rowDigest does not bind|bounded ASCII identity/,
+    );
+
+    const futureExposure = manifestFor(basePairs.map((item) => structuredClone(item)));
+    futureExposure.pairs[0].exposed.exposure.recordedAt = "2026-06-10T10:01:00.000Z";
+    futureExposure.source.rowDigest = computeLearningPairDigest(futureExposure.pairs);
+    assert.throws(
+      () => compileLearningEvidencePacket(futureExposure, { previousSourceFingerprint: baseRun.sourceFingerprint }),
+      /exposure is retrospective/,
+    );
+  },
+  "changed value, forged identity, and future exposure never return unchanged",
 );
 
 prove(
@@ -344,6 +390,22 @@ prove(
 );
 
 prove(
+  "one declared outcome contract governs every pair",
+  () => {
+    const keys = ["metricId", "unit", "direction"] as const;
+    for (const key of keys) {
+      const drift = manifestFor(basePairs.map((item) => structuredClone(item)));
+      const replacement = key === "direction" ? "lower_is_better" : key === "unit" ? "usd" : "cost-usd";
+      (drift.pairs[1].exposed.outcome as unknown as Record<string, string>)[key] = replacement;
+      (drift.pairs[1].control.outcome as unknown as Record<string, string>)[key] = replacement;
+      drift.source.rowDigest = computeLearningPairDigest(drift.pairs);
+      assert.throws(() => compileLearningEvidencePacket(drift), /incomparable with manifest.outcomeContract/);
+    }
+  },
+  "internally matched pairs still cannot mix ratios, dollars, or effect direction across the run",
+);
+
+prove(
   "statistical and privacy gates remain separate",
   () => {
     const statisticallySmall = manifestFor([pair("small-1", 2, 1), pair("small-2", 3, 1)]);
@@ -353,7 +415,9 @@ prove(
     if (small.status === "computed") {
       assert.equal(small.packet.sample.statisticalMinimumMet, false);
       assert.equal(small.packet.sample.privacyMinimumMet, true);
-      assert.deepEqual(small.packet.notEstimableReasons, ["insufficient_statistical_sample"]);
+      assert.ok(small.packet.notEstimableReasons.includes("insufficient_statistical_sample"));
+      assert.ok(small.packet.notEstimableReasons.includes("insufficient_actor_clusters"));
+      assert.ok(small.packet.notEstimableReasons.includes("insufficient_repo_clusters"));
     }
 
     const privacySmall = manifestFor(basePairs);
@@ -370,6 +434,36 @@ prove(
     }
   },
   "power and disclosure floors emit distinct not_estimable evidence",
+);
+
+prove(
+  "few actor clusters cannot masquerade as eleven independent pairs",
+  () => {
+    const clusteredPairs = Array.from({ length: 11 }, (_, index) =>
+      pair(
+        `clustered-${index}`,
+        20 + index,
+        20,
+        cohort({
+          actorClusterId: index === 10 ? "actor-b" : "actor-a",
+          repoClusterId: `repo-${index}`,
+        }),
+      ),
+    );
+    const result = compileLearningEvidencePacket(manifestFor(clusteredPairs));
+    assert.equal(result.status, "computed");
+    if (result.status === "computed") {
+      assert.equal(result.packet.sample.completePairCount, 11);
+      assert.equal(result.packet.sample.actorClusterCount, 2);
+      assert.equal(result.packet.sample.repoClusterCount, 11);
+      assert.equal(result.packet.sample.statisticalPairMinimumMet, true);
+      assert.equal(result.packet.sample.statisticalActorClusterMinimumMet, false);
+      assert.equal(result.packet.claimClass, "not_estimable");
+      assert.ok(result.packet.notEstimableReasons.includes("insufficient_actor_clusters"));
+      assert.equal(result.packet.effect.standardError, null);
+    }
+  },
+  "actor and repo cluster floors are explicit and cluster-aware uncertainty is required",
 );
 
 prove(

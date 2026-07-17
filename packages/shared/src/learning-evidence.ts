@@ -41,6 +41,8 @@ export type SkillCandidateLifecycleState = (typeof SKILL_CANDIDATE_LIFECYCLE)[nu
 
 export const LEARNING_NOT_ESTIMABLE_REASONS = [
   "insufficient_statistical_sample",
+  "insufficient_actor_clusters",
+  "insufficient_repo_clusters",
   "privacy_minimum_not_met",
   "incomplete_outcome_pairs",
   "attribution_coverage_below_minimum",
@@ -68,6 +70,13 @@ export type LearningMetricVersions = {
   outcomeMetric: string;
   techniqueExposure: string;
   projectAllocation: string;
+};
+
+export type LearningOutcomeContract = {
+  metricId: string;
+  metricVersion: string;
+  unit: string;
+  direction: "higher_is_better" | "lower_is_better";
 };
 
 export type LearningCohort = {
@@ -134,6 +143,10 @@ export type LearningHypothesisFamily = {
 export type LearningAnalysisGates = {
   /** Analytical power/reliability floor. This is not a privacy threshold. */
   statisticalMinCompletePairs: number;
+  /** Minimum independent actor clusters used by the conservative SE. */
+  statisticalMinActorClusters: number;
+  /** Minimum independent repo clusters used by the conservative SE. */
+  statisticalMinRepoClusters: number;
   /** Disclosure/aggregation floor. This is independent of statistical power. */
   privacyMinCompletePairs: number;
   minimumAttributionCoverage: number;
@@ -149,6 +162,7 @@ export type LearningEvidenceManifest = {
   analysisId: string;
   source: LearningSourceIdentity;
   metricVersions: LearningMetricVersions;
+  outcomeContract: LearningOutcomeContract;
   window: LearningAnalysisWindow;
   asOf: string;
   techniqueId: string;
@@ -160,10 +174,13 @@ export type LearningEvidenceManifest = {
 
 export type LearningEffectEstimate = {
   method: "paired_mean_difference";
-  uncertaintyMethod: "bonferroni_adjusted_normal_approximation";
+  uncertaintyMethod: "bonferroni_adjusted_conservative_cluster_normal_approximation";
   rawEstimate: number | null;
   directionAdjustedEstimate: number | null;
   standardError: number | null;
+  pairStandardError: number | null;
+  actorClusterStandardError: number | null;
+  repoClusterStandardError: number | null;
   lowerBound: number | null;
   upperBound: number | null;
   familyWiseConfidenceLevel: number;
@@ -181,6 +198,7 @@ export type LearningEvidencePacket = {
   analysisId: string;
   source: LearningSourceIdentity;
   metricVersions: LearningMetricVersions;
+  outcomeContract: LearningOutcomeContract;
   window: LearningAnalysisWindow;
   asOf: string;
   techniqueId: string;
@@ -192,8 +210,15 @@ export type LearningEvidencePacket = {
     controlCount: number;
     completePairCount: number;
     incompletePairCount: number;
+    actorClusterCount: number;
+    repoClusterCount: number;
     statisticalMinimum: number;
+    statisticalActorClusterMinimum: number;
+    statisticalRepoClusterMinimum: number;
     privacyMinimum: number;
+    statisticalPairMinimumMet: boolean;
+    statisticalActorClusterMinimumMet: boolean;
+    statisticalRepoClusterMinimumMet: boolean;
     statisticalMinimumMet: boolean;
     privacyMinimumMet: boolean;
   };
@@ -390,6 +415,7 @@ function sourceFingerprintMaterial(manifest: LearningEvidenceManifest): unknown 
     analysisId: manifest.analysisId,
     source: manifest.source,
     metricVersions: manifest.metricVersions,
+    outcomeContract: manifest.outcomeContract,
     window: manifest.window,
     asOf: manifest.asOf,
     techniqueId: manifest.techniqueId,
@@ -415,6 +441,7 @@ function validateLearningEvidenceHeader(manifest: LearningEvidenceManifest): voi
       "analysisId",
       "source",
       "metricVersions",
+      "outcomeContract",
       "window",
       "asOf",
       "techniqueId",
@@ -455,6 +482,24 @@ function validateLearningEvidenceHeader(manifest: LearningEvidenceManifest): voi
   assertVersion(manifest.metricVersions.outcomeMetric, "metricVersions.outcomeMetric");
   assertVersion(manifest.metricVersions.techniqueExposure, "metricVersions.techniqueExposure");
   assertVersion(manifest.metricVersions.projectAllocation, "metricVersions.projectAllocation");
+
+  assertObject(manifest.outcomeContract, "outcomeContract");
+  assertExactKeys(
+    manifest.outcomeContract,
+    ["metricId", "metricVersion", "unit", "direction"],
+    "outcomeContract",
+  );
+  assertCanonicalIdentity(manifest.outcomeContract.metricId, "outcomeContract.metricId");
+  assertVersion(manifest.outcomeContract.metricVersion, "outcomeContract.metricVersion");
+  if (manifest.outcomeContract.metricVersion !== manifest.metricVersions.outcomeMetric) {
+    throw new Error("outcomeContract.metricVersion must equal metricVersions.outcomeMetric");
+  }
+  assertCanonicalIdentity(manifest.outcomeContract.unit, "outcomeContract.unit");
+  assertOneOf(
+    manifest.outcomeContract.direction,
+    ["higher_is_better", "lower_is_better"] as const,
+    "outcomeContract.direction",
+  );
 
   assertObject(manifest.window, "window");
   assertExactKeys(manifest.window, ["startInclusive", "endExclusive"], "window");
@@ -501,6 +546,8 @@ function validateLearningEvidenceHeader(manifest: LearningEvidenceManifest): voi
     manifest.gates,
     [
       "statisticalMinCompletePairs",
+      "statisticalMinActorClusters",
+      "statisticalMinRepoClusters",
       "privacyMinCompletePairs",
       "minimumAttributionCoverage",
       "maxAbsoluteOutcome",
@@ -511,6 +558,8 @@ function validateLearningEvidenceHeader(manifest: LearningEvidenceManifest): voi
     "gates",
   );
   assertSafeIntegerInRange(manifest.gates.statisticalMinCompletePairs, 2, MAX_HARD_PAIRS, "gates.statisticalMinCompletePairs");
+  assertSafeIntegerInRange(manifest.gates.statisticalMinActorClusters, 3, MAX_HARD_PAIRS, "gates.statisticalMinActorClusters");
+  assertSafeIntegerInRange(manifest.gates.statisticalMinRepoClusters, 3, MAX_HARD_PAIRS, "gates.statisticalMinRepoClusters");
   assertSafeIntegerInRange(manifest.gates.privacyMinCompletePairs, 1, MAX_HARD_PAIRS, "gates.privacyMinCompletePairs");
   assertFiniteInRange(manifest.gates.minimumAttributionCoverage, 0, 1, "gates.minimumAttributionCoverage");
   assertFiniteInRange(manifest.gates.maxAbsoluteOutcome, Number.MIN_VALUE, Number.MAX_SAFE_INTEGER, "gates.maxAbsoluteOutcome");
@@ -621,6 +670,11 @@ function validateObservation(
   }
   assertCanonicalIdentity(observation.outcome.unit, `${field}.outcome.unit`);
   assertOneOf(observation.outcome.direction, ["higher_is_better", "lower_is_better"] as const, `${field}.outcome.direction`);
+  for (const key of ["metricId", "metricVersion", "unit", "direction"] as const) {
+    if (observation.outcome[key] !== manifest.outcomeContract[key]) {
+      throw new Error(`${field}.outcome.${key} is incomparable with manifest.outcomeContract`);
+    }
+  }
   if (observation.outcome.value !== null) {
     if (!Number.isFinite(observation.outcome.value) || Math.abs(observation.outcome.value) > manifest.gates.maxAbsoluteOutcome) {
       throw new Error(`${field}.outcome.value must be finite and within maxAbsoluteOutcome`);
@@ -748,10 +802,13 @@ function emptyEffect(family: LearningHypothesisFamily, crude: number | null, str
   const alpha = adjustedAlpha(family);
   return {
     method: "paired_mean_difference",
-    uncertaintyMethod: "bonferroni_adjusted_normal_approximation",
+    uncertaintyMethod: "bonferroni_adjusted_conservative_cluster_normal_approximation",
     rawEstimate: null,
     directionAdjustedEstimate: null,
     standardError: null,
+    pairStandardError: null,
+    actorClusterStandardError: null,
+    repoClusterStandardError: null,
     lowerBound: null,
     upperBound: null,
     familyWiseConfidenceLevel: 1 - family.familyWiseAlpha,
@@ -760,6 +817,34 @@ function emptyEffect(family: LearningHypothesisFamily, crude: number | null, str
     crudePairWeightedEstimate: crude,
     equalStratumEstimate: stratified,
   };
+}
+
+function sampleStandardError(values: readonly number[], mean: number): number | null {
+  if (values.length < 2) return null;
+  const squaredDeviations = values.map((value) => (value - mean) ** 2);
+  const variance = (kahanMean(squaredDeviations) as number) * values.length / (values.length - 1);
+  const standardError = Math.sqrt(variance / values.length);
+  if (!Number.isFinite(standardError)) throw new Error("effect uncertainty is not finite");
+  return standardError;
+}
+
+/** One-way cluster-robust standard error for a mean, with finite-cluster correction. */
+function clusterStandardError(
+  rows: readonly { difference: number; actorClusterId: string; repoClusterId: string }[],
+  mean: number,
+  dimension: "actorClusterId" | "repoClusterId",
+): number | null {
+  const groups = new Map<string, number>();
+  for (const row of rows) {
+    groups.set(row[dimension], (groups.get(row[dimension]) ?? 0) + row.difference - mean);
+  }
+  if (groups.size < 2) return null;
+  const squaredClusterResidualSums = [...groups.values()].map((value) => value ** 2);
+  const residualTotal = squaredClusterResidualSums.reduce((sum, value) => sum + value, 0);
+  const variance = (groups.size / (groups.size - 1)) * residualTotal / (rows.length ** 2);
+  const standardError = Math.sqrt(variance);
+  if (!Number.isFinite(standardError)) throw new Error(`${dimension} uncertainty is not finite`);
+  return standardError;
 }
 
 function createSkillReviewArtifact(): SkillCandidateReviewArtifact {
@@ -787,6 +872,10 @@ export function compileLearningEvidencePacket(
   manifest: LearningEvidenceManifest,
   options: CompileLearningEvidenceOptions = {},
 ): LearningEvidenceRun {
+  // The no-op key is accepted only after the exact canonical row digest and
+  // every closed-schema invariant have been recomputed. This remains zero
+  // statistical analysis work, but never trusts caller-declared row identity.
+  validateLearningEvidenceManifest(manifest);
   const sourceFingerprint = computeLearningSourceFingerprint(manifest);
   if (options.previousSourceFingerprint !== undefined && options.previousSourceFingerprint !== null) {
     assertHash(options.previousSourceFingerprint, "previousSourceFingerprint");
@@ -795,10 +884,15 @@ export function compileLearningEvidencePacket(
     }
   }
 
-  validateLearningEvidenceManifest(manifest);
   const startedAt = performance.now();
   const sortedPairs = [...manifest.pairs].sort((left, right) => compareCanonicalText(left.pairId, right.pairId));
-  const differences: { pairId: string; difference: number; stratum: string }[] = [];
+  const differences: {
+    pairId: string;
+    difference: number;
+    stratum: string;
+    actorClusterId: string;
+    repoClusterId: string;
+  }[] = [];
   const methodCounts: Record<LearningAttribution["method"], number> = {
     direct: 0,
     deterministic_linkage: 0,
@@ -828,7 +922,13 @@ export function compileLearningEvidencePacket(
       if (!Number.isFinite(difference) || Math.abs(difference) > manifest.gates.maxAbsoluteOutcome * 2) {
         throw new Error(`pair ${pair.pairId} produced an unsafe outcome difference`);
       }
-      differences.push({ pairId: pair.pairId, difference, stratum: cohortKey(pair.exposed.cohort) });
+      differences.push({
+        pairId: pair.pairId,
+        difference,
+        stratum: cohortKey(pair.exposed.cohort),
+        actorClusterId: pair.exposed.cohort.actorClusterId,
+        repoClusterId: pair.exposed.cohort.repoClusterId,
+      });
     }
   }
 
@@ -849,10 +949,18 @@ export function compileLearningEvidencePacket(
   const equalStratumEstimate = kahanMean(stratumMeans);
   const simpsonReversal = sign(crudeEstimate) !== 0 && sign(equalStratumEstimate) !== 0 && sign(crudeEstimate) !== sign(equalStratumEstimate);
 
-  const statisticalMinimumMet = differences.length >= manifest.gates.statisticalMinCompletePairs;
+  const actorClusterCount = new Set(differences.map((row) => row.actorClusterId)).size;
+  const repoClusterCount = new Set(differences.map((row) => row.repoClusterId)).size;
+  const statisticalPairMinimumMet = differences.length >= manifest.gates.statisticalMinCompletePairs;
+  const statisticalActorClusterMinimumMet = actorClusterCount >= manifest.gates.statisticalMinActorClusters;
+  const statisticalRepoClusterMinimumMet = repoClusterCount >= manifest.gates.statisticalMinRepoClusters;
+  const statisticalMinimumMet =
+    statisticalPairMinimumMet && statisticalActorClusterMinimumMet && statisticalRepoClusterMinimumMet;
   const privacyMinimumMet = differences.length >= manifest.gates.privacyMinCompletePairs;
   const reasons = new Set<LearningNotEstimableReason>();
-  if (!statisticalMinimumMet) reasons.add("insufficient_statistical_sample");
+  if (!statisticalPairMinimumMet) reasons.add("insufficient_statistical_sample");
+  if (!statisticalActorClusterMinimumMet) reasons.add("insufficient_actor_clusters");
+  if (!statisticalRepoClusterMinimumMet) reasons.add("insufficient_repo_clusters");
   if (!privacyMinimumMet) reasons.add("privacy_minimum_not_met");
   if (differences.length !== sortedPairs.length) reasons.add("incomplete_outcome_pairs");
   if (coverage < manifest.gates.minimumAttributionCoverage) reasons.add("attribution_coverage_below_minimum");
@@ -861,22 +969,29 @@ export function compileLearningEvidencePacket(
 
   let effect = emptyEffect(manifest.hypothesisFamily, crudeEstimate, equalStratumEstimate);
   if (notEstimableReasons.length === 0 && crudeEstimate !== null && differences.length >= 2) {
-    const squaredDeviations = rawDifferences.map((value) => (value - crudeEstimate) ** 2);
-    const variance = (kahanMean(squaredDeviations) as number) * differences.length / (differences.length - 1);
-    const standardError = Math.sqrt(variance / differences.length);
-    if (!Number.isFinite(standardError)) throw new Error("effect uncertainty is not finite");
+    const pairStandardError = sampleStandardError(rawDifferences, crudeEstimate);
+    const actorClusterStandardError = clusterStandardError(differences, crudeEstimate, "actorClusterId");
+    const repoClusterStandardError = clusterStandardError(differences, crudeEstimate, "repoClusterId");
+    const standardError = Math.max(
+      pairStandardError as number,
+      actorClusterStandardError as number,
+      repoClusterStandardError as number,
+    );
     const alpha = adjustedAlpha(manifest.hypothesisFamily);
     const critical = inverseStandardNormal(1 - alpha / 2);
     const lower = crudeEstimate - critical * standardError;
     const upper = crudeEstimate + critical * standardError;
-    const directionMultiplier = sortedPairs[0]?.exposed.outcome.direction === "lower_is_better" ? -1 : 1;
+    const directionMultiplier = manifest.outcomeContract.direction === "lower_is_better" ? -1 : 1;
     const adjusted = crudeEstimate * directionMultiplier;
     effect = {
       method: "paired_mean_difference",
-      uncertaintyMethod: "bonferroni_adjusted_normal_approximation",
+      uncertaintyMethod: "bonferroni_adjusted_conservative_cluster_normal_approximation",
       rawEstimate: crudeEstimate,
       directionAdjustedEstimate: adjusted,
       standardError,
+      pairStandardError,
+      actorClusterStandardError,
+      repoClusterStandardError,
       lowerBound: lower,
       upperBound: upper,
       familyWiseConfidenceLevel: 1 - manifest.hypothesisFamily.familyWiseAlpha,
@@ -887,7 +1002,7 @@ export function compileLearningEvidencePacket(
     };
   }
 
-  const outcomeMultiplier = sortedPairs[0]?.exposed.outcome.direction === "lower_is_better" ? -1 : 1;
+  const outcomeMultiplier = manifest.outcomeContract.direction === "lower_is_better" ? -1 : 1;
   const counterexampleDirection = sign(crudeEstimate === null ? null : crudeEstimate * outcomeMultiplier);
   const counterexampleIds = counterexampleDirection === 0
     ? []
@@ -912,6 +1027,7 @@ export function compileLearningEvidencePacket(
     analysisId: manifest.analysisId,
     source: manifest.source,
     metricVersions: manifest.metricVersions,
+    outcomeContract: manifest.outcomeContract,
     window: manifest.window,
     asOf: manifest.asOf,
     techniqueId: manifest.techniqueId,
@@ -924,8 +1040,15 @@ export function compileLearningEvidencePacket(
       controlCount: sortedPairs.length,
       completePairCount: differences.length,
       incompletePairCount: sortedPairs.length - differences.length,
+      actorClusterCount,
+      repoClusterCount,
       statisticalMinimum: manifest.gates.statisticalMinCompletePairs,
+      statisticalActorClusterMinimum: manifest.gates.statisticalMinActorClusters,
+      statisticalRepoClusterMinimum: manifest.gates.statisticalMinRepoClusters,
       privacyMinimum: manifest.gates.privacyMinCompletePairs,
+      statisticalPairMinimumMet,
+      statisticalActorClusterMinimumMet,
+      statisticalRepoClusterMinimumMet,
       statisticalMinimumMet,
       privacyMinimumMet,
     },

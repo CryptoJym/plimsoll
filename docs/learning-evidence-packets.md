@@ -30,8 +30,14 @@ Every estimable result is labeled `observational_association` with
 `causalClaim: false` and `prescriptiveClaim: false`. The effect is a paired
 mean difference with a family-wise confidence interval. The packet also names
 the source snapshot/query/row hashes, metric versions, window/as-of, exposed
-and control counts, statistical and privacy gates, attribution coverage/mix,
+and control counts, pair/actor-cluster/repo-cluster statistical gates,
+independent privacy gate, attribution coverage/mix, conservative clustered
 uncertainty, confounders, and bounded counterexamples.
+
+One explicit `outcomeContract` (metric id, formula version, unit, and effect
+direction) governs the entire run. A pair that is internally matched still
+fails closed if it drifts from that run-level contract; ratios and dollars,
+or higher-is-better and lower-is-better outcomes, can never be averaged.
 
 ## Versioned schema surface
 
@@ -57,17 +63,26 @@ fingerprint as `previousSourceFingerprint` returns:
 }
 ```
 
-This is the scheduled-job contract: compare one bounded fingerprint, skip all
-cohort/effect work when unchanged, and never run a continuous LLM loop.
+The compiler always recomputes and validates the canonical row digest before
+accepting a no-op. A stale digest, changed outcome, forged identity, or future
+exposure therefore fails closed even if the caller supplies the old source
+fingerprint. `analysisWorkUnits: 0` means zero cohort/effect/inference work,
+not zero bounded input validation. This is the scheduled-job contract: verify
+one bounded source, skip statistical work when unchanged, and never run a
+continuous LLM loop.
 
 ## Statistical and privacy minimums
 
-`statisticalMinCompletePairs` is an analysis-quality floor.
+`statisticalMinCompletePairs`, `statisticalMinActorClusters`, and
+`statisticalMinRepoClusters` are independent analysis-quality floors.
 `privacyMinCompletePairs` is an independent disclosure floor. They are never
 collapsed. A cohort can satisfy one and fail the other, and the packet records
-the exact reason. Local operators may choose a privacy threshold appropriate
-for their own-data artifact, while hosted organization comparisons must apply
-organization policy separately.
+the exact reason. Effect uncertainty uses the maximum of ordinary paired,
+actor-cluster-robust, and repo-cluster-robust standard errors, with the declared
+multiple-hypothesis correction. Eleven pairs from only two actor clusters are
+therefore `not_estimable`, not eleven independent observations. Local operators
+may choose a privacy threshold appropriate for their own-data artifact, while
+hosted organization comparisons must apply organization policy separately.
 
 ## CLI
 
