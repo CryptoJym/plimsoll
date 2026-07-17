@@ -274,7 +274,7 @@ export function runArchitectureContract(): ScenarioReceipt {
   const budget = fs.readFileSync(budgetPath, "utf8");
   const requiredAdrSections = [
     "## Status",
-    "Proposed — pending owner acceptance",
+    "Accepted by James on 2026-07-17",
     "The outbox stores a copy, not a foreign-key-only reference",
     "raw evidence expires under the configured raw age/byte policy",
     "## Requirements",
@@ -302,7 +302,7 @@ export function runArchitectureContract(): ScenarioReceipt {
     status: missing.length === 0 ? "pass" : "fail",
     detail:
       missing.length === 0
-        ? "Proposed owner-pending ADR, explicit envelope-copy retention semantics, NFR budgets, failure modes, alternatives, privacy analysis, migration order, and adversarial gates are present."
+        ? "Owner-accepted ADR, explicit envelope-copy retention semantics, NFR budgets, failure modes, alternatives, privacy analysis, migration order, and adversarial gates are present."
         : `Architecture contract is missing: ${missing.join(", ")}`,
     durationMs: Math.round((performance.now() - started) * 100) / 100,
     counters: emptyWorkCounters(),
