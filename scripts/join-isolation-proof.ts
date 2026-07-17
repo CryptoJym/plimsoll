@@ -18,8 +18,11 @@ import {
 import { appendForwardedHook } from "../packages/collector-cli/src/forwarder";
 import {
   COLLECTOR_APP_VERSION,
+  pendingJoinPath,
   performJoin,
+  resumePendingJoin,
 } from "../packages/collector-cli/src/join";
+import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 
 type Check = { name: string; detail: Record<string, unknown> };
 type RequestRecord = { init?: RequestInit; url: string; body: Record<string, unknown> };
@@ -154,6 +157,14 @@ async function runChild(args: string[], input: string, env: NodeJS.ProcessEnv) {
   return { child, exit, stdout, stderr };
 }
 
+async function waitFor(predicate: () => boolean, message: string, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error(message);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
+}
+
 async function main() {
 try {
   // Workspace A has real unsent history. Joining B may see neither its bytes
@@ -171,7 +182,6 @@ try {
     { config: oldConfig(), buffer: activeBuffer, source: "claude_code" },
   );
   activeBuffer.close();
-  const ledgerHashBefore = hashFile(ledgerPath);
   const requests: RequestRecord[] = [];
   const temporaryRoot = path.join(root, "successful-temporary-state");
   fs.mkdirSync(temporaryRoot);
@@ -192,8 +202,44 @@ try {
     event?: { id?: string };
   }>;
   const activated = JSON.parse(fs.readFileSync(configAPath, "utf8")) as Record<string, unknown>;
+  const activatedConfig = collectorConfigSchema.parse(activated);
+  const postActivationBuffer = new LocalEventBuffer(ledgerPath, {
+    workspaceId: TENANT_B,
+    delivery: { enabled: true, limits: activatedConfig.delivery },
+  });
+  const ordinaryBodies: Array<Record<string, unknown>> = [];
+  const ordinaryFetch = (async (_input, init) => {
+    ordinaryBodies.push(requestBody(init));
+    return responseJson({ ok: true, accepted: 1 }, 200);
+  }) as typeof fetch;
+  const firstOrdinaryUpload = await uploadBufferedEvents(
+    activatedConfig,
+    postActivationBuffer,
+    { fetchImpl: ordinaryFetch },
+  );
+  const preservedARow = postActivationBuffer.database
+    .prepare(
+      `select workspace_id as workspaceId, uploaded_at as uploadedAt
+       from buffered_events where id = ?`,
+    )
+    .get(backlog.event.id) as { workspaceId: string | null; uploadedAt: string | null };
+  const workspaceBEvent = appendForwardedHook(
+    {
+      id: "workspace_b_post_join_event",
+      source: "claude_code",
+      event_type: "UserPromptSubmit",
+    },
+    { config: activatedConfig, buffer: postActivationBuffer, source: "claude_code" },
+  );
+  const secondOrdinaryUpload = await uploadBufferedEvents(
+    activatedConfig,
+    postActivationBuffer,
+    { fetchImpl: ordinaryFetch },
+  );
+  const ordinaryEvents = ordinaryBodies[0]?.events as Array<{ event?: { id?: string } }>;
+  postActivationBuffer.close();
   check(
-    "workspace_backlog_isolated_and_success_activates_after_one_probe",
+    "workspace_backlog_bound_and_post_activation_upload_isolated",
     requests.length === 2 &&
       requests.every((request) => request.init?.redirect === "manual") &&
       handshakeBody?.tenantId === TENANT_B &&
@@ -203,8 +249,18 @@ try {
       handshakeEvents[0]?.event?.id === joined.handshake.selfTestEventId &&
       handshakeEvents[0]?.event?.id !== backlog.event.id &&
       joined.handshake.uploadedEvents === 1 &&
-      hashFile(ledgerPath) === ledgerHashBefore &&
+      joined.workspaceBoundary.fromWorkspaceId === TENANT_A &&
+      joined.workspaceBoundary.toWorkspaceId === TENANT_B &&
+      firstOrdinaryUpload.uploadedEvents === 0 &&
+      preservedARow.workspaceId === TENANT_A &&
+      preservedARow.uploadedAt === null &&
+      ordinaryBodies.length === 1 &&
+      ordinaryEvents.length === 1 &&
+      ordinaryEvents[0]?.event?.id === workspaceBEvent.event.id &&
+      ordinaryEvents[0]?.event?.id !== backlog.event.id &&
+      secondOrdinaryUpload.uploadedEvents === 1 &&
       fs.readdirSync(temporaryRoot).length === 0 &&
+      !fs.existsSync(pendingJoinPath(isolatedHome)) &&
       activated.tenantId === TENANT_B &&
       activated.installKey === INSTALL_B &&
       activated.port === 49123 &&
@@ -212,7 +268,9 @@ try {
     {
       requests: requests.length,
       handshakeEvents: handshakeEvents.length,
-      activeLedgerUnchanged: hashFile(ledgerPath) === ledgerHashBefore,
+      firstOrdinaryUploaded: firstOrdinaryUpload.uploadedEvents,
+      ordinaryRequests: ordinaryBodies.length,
+      preservedWorkspaceA: preservedARow,
       appVersion: handshakeBody?.appVersion,
     },
   );
@@ -261,18 +319,59 @@ try {
     "handshake_failure_preserves_config_and_cleans_temp_state",
     failedCalls === 2 &&
       fs.readFileSync(failedConfigPath, "utf8") === failedBytes &&
-      fs.readdirSync(failedTemp).length === 0,
-    { failedCalls, failedMessage, temporaryEntries: fs.readdirSync(failedTemp) },
+      fs.readdirSync(failedTemp).length === 0 &&
+      fs.existsSync(pendingJoinPath(failedHome)) &&
+      (fs.statSync(pendingJoinPath(failedHome)).mode & 0o777) === 0o600,
+    {
+      failedCalls,
+      failedMessage,
+      temporaryEntries: fs.readdirSync(failedTemp),
+      pendingGrant: fs.existsSync(pendingJoinPath(failedHome)),
+      pendingMode: (fs.statSync(pendingJoinPath(failedHome)).mode & 0o777).toString(8),
+    },
   );
 
+  let resumeCalls = 0;
+  const resumeBodies: Array<Record<string, unknown>> = [];
+  const resumed = await resumePendingJoin({
+    homeDir: failedHome,
+    temporaryRoot: failedTemp,
+    fetchImpl: (async (_input, init) => {
+      resumeCalls += 1;
+      resumeBodies.push(requestBody(init));
+      return responseJson({ ok: true, accepted: 1 }, 200);
+    }) as typeof fetch,
+  });
+  check(
+    "redeemed_grant_resumes_without_second_join_redemption",
+    resumed.joined &&
+      resumeCalls === 1 &&
+      (resumeBodies[0]?.events as unknown[]).length === 1 &&
+      !fs.existsSync(pendingJoinPath(failedHome)) &&
+      collectorConfigSchema.parse(
+        JSON.parse(fs.readFileSync(failedConfigPath, "utf8")),
+      ).tenantId === TENANT_B,
+    {
+      resumeCalls,
+      pendingAfterResume: fs.existsSync(pendingJoinPath(failedHome)),
+    },
+  );
+
+  const zeroAcceptedHome = home("zero-accepted-failure");
+  const {
+    bytes: zeroAcceptedBytes,
+    configPath: zeroAcceptedConfigPath,
+  } = writeConfig(zeroAcceptedHome);
+  const zeroAcceptedTemp = path.join(root, "zero-accepted-temporary-state");
+  fs.mkdirSync(zeroAcceptedTemp);
   let zeroAcceptedCalls = 0;
   const zeroAcceptedMessage = await expectRejected(
     () =>
       performJoin({
         target: TOKEN,
         baseUrl: "https://workspace-b.example",
-        homeDir: failedHome,
-        temporaryRoot: failedTemp,
+        homeDir: zeroAcceptedHome,
+        temporaryRoot: zeroAcceptedTemp,
         fetchImpl: (async (input) => {
           zeroAcceptedCalls += 1;
           if (requestUrl(input).pathname.endsWith("/join")) {
@@ -291,8 +390,9 @@ try {
   check(
     "two_xx_without_probe_acknowledgement_does_not_activate",
     zeroAcceptedCalls === 2 &&
-      fs.readFileSync(failedConfigPath, "utf8") === failedBytes &&
-      fs.readdirSync(failedTemp).length === 0,
+      fs.readFileSync(zeroAcceptedConfigPath, "utf8") === zeroAcceptedBytes &&
+      fs.readdirSync(zeroAcceptedTemp).length === 0 &&
+      fs.existsSync(pendingJoinPath(zeroAcceptedHome)),
     { zeroAcceptedCalls, zeroAcceptedMessage },
   );
 
@@ -406,6 +506,202 @@ try {
     { uploadRedirectCalls, uploadRedirectMessage },
   );
 
+  // Unsupported preview must fail before token consumption or network and a
+  // normal CLI startup scavenges only dead-owner handshake directories.
+  const dryRunHome = path.join(root, "dry-run-home");
+  const dryRunTemp = path.join(root, "dry-run-temp");
+  fs.mkdirSync(dryRunTemp);
+  fs.mkdirSync(path.join(dryRunTemp, "plimsoll-join-handshake-99999999-stale"));
+  let dryRunRequests = 0;
+  const dryRunServer = http.createServer((_request, response) => {
+    dryRunRequests += 1;
+    response.writeHead(500).end();
+  });
+  await new Promise<void>((resolve) => dryRunServer.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = dryRunServer.address();
+    assert.ok(address && typeof address !== "string");
+    const dryRun = await runChild(
+      [
+        "node_modules/tsx/dist/cli.mjs",
+        "packages/collector-cli/src/cli.ts",
+        "join",
+        "--dry-run",
+        "--token-stdin",
+        "--url",
+        `http://127.0.0.1:${address.port}`,
+      ],
+      `${TOKEN}\n`,
+      { ...process.env, PLIMSOLL_HOME: dryRunHome, TMPDIR: dryRunTemp },
+    );
+    check(
+      "join_dry_run_rejected_before_token_network_or_mutation",
+      dryRun.exit.code === 1 &&
+        dryRunRequests === 0 &&
+        !fs.existsSync(path.join(dryRunHome, "collector.config.json")) &&
+        !`${dryRun.stdout}\n${dryRun.stderr}`.includes(TOKEN) &&
+        /dry-run is unsupported/.test(dryRun.stderr) &&
+        !fs.readdirSync(dryRunTemp).some((entry) =>
+          entry.startsWith("plimsoll-join-handshake-"),
+        ),
+      {
+        exit: dryRun.exit,
+        requests: dryRunRequests,
+        configCreated: fs.existsSync(path.join(dryRunHome, "collector.config.json")),
+        handshakeEntries: fs.readdirSync(dryRunTemp).filter((entry) =>
+          entry.startsWith("plimsoll-join-handshake-"),
+        ),
+      },
+    );
+  } finally {
+    await new Promise<void>((resolve, reject) =>
+      dryRunServer.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+
+  // SIGTERM while the upload response is held must synchronously remove the
+  // temporary SQLite directory before honoring the signal. Active config and
+  // ledger are not opened until the probe is acknowledged, so both stay exact.
+  const signalHome = path.join(root, "signal-home");
+  const signalTemp = path.join(root, "signal-temp");
+  fs.mkdirSync(signalHome);
+  fs.mkdirSync(signalTemp);
+  const signalConfig = oldConfig();
+  const signalConfigBytes = `${JSON.stringify(signalConfig, null, 4)}\n\n`;
+  const signalConfigPath = path.join(signalHome, "collector.config.json");
+  fs.writeFileSync(signalConfigPath, signalConfigBytes, { mode: 0o600 });
+  const signalLedgerPath = path.join(signalHome, "work-ledger.sqlite");
+  const signalSeed = new LocalEventBuffer(signalLedgerPath);
+  appendForwardedHook(
+    { id: "signal_workspace_a_row", source: "claude_code", event_type: "UserPromptSubmit" },
+    { config: signalConfig, buffer: signalSeed, source: "claude_code" },
+  );
+  signalSeed.close();
+  const signalLedgerHash = hashFile(signalLedgerPath);
+  let heldHandshake = false;
+  let resumeMode = false;
+  let cliResumeRequests = 0;
+  let heldProbeId = "";
+  let resumedProbeId = "";
+  const heldServer = http.createServer((request, response) => {
+    let body = "";
+    request.setEncoding("utf8");
+    request.on("data", (chunk) => (body += chunk));
+    request.on("end", () => {
+      if (request.url?.endsWith("/join")) {
+        const address = heldServer.address();
+        assert.ok(address && typeof address !== "string");
+        response.writeHead(201, { "content-type": "application/json" });
+        response.end(JSON.stringify({
+          ok: true,
+          tenantId: TENANT_B,
+          installKey: INSTALL_B,
+          uploadUrl: `http://127.0.0.1:${address.port}/api/work-intelligence/ingest`,
+        }));
+        return;
+      }
+      const events = (JSON.parse(body) as { events?: Array<{ event?: { id?: string } }> }).events ?? [];
+      if (resumeMode) {
+        cliResumeRequests += 1;
+        resumedProbeId = events[0]?.event?.id ?? "";
+        response.writeHead(200, { "content-type": "application/json" });
+        response.end(JSON.stringify({ ok: true, accepted: 1 }));
+        return;
+      }
+      heldHandshake = true;
+      heldProbeId = events[0]?.event?.id ?? "";
+      // Intentionally hold the response until SIGTERM closes the connection.
+    });
+  });
+  await new Promise<void>((resolve) => heldServer.listen(0, "127.0.0.1", resolve));
+  try {
+    const address = heldServer.address();
+    assert.ok(address && typeof address !== "string");
+    const child = spawn(
+      process.execPath,
+      [
+        "node_modules/tsx/dist/cli.mjs",
+        "packages/collector-cli/src/cli.ts",
+        "join",
+        "--token-stdin",
+        "--url",
+        `http://127.0.0.1:${address.port}`,
+      ],
+      {
+        cwd: process.cwd(),
+        env: { ...process.env, PLIMSOLL_HOME: signalHome, TMPDIR: signalTemp },
+        stdio: ["pipe", "pipe", "pipe"],
+      },
+    );
+    child.stdin.end(`${TOKEN}\n`);
+    await waitFor(
+      () =>
+        heldHandshake &&
+        fs.readdirSync(signalTemp).some((entry) => entry.startsWith("plimsoll-join-handshake-")),
+      "held handshake did not create temporary state",
+    );
+    child.kill("SIGTERM");
+    const exit = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+      (resolve, reject) => {
+        child.once("error", reject);
+        child.once("exit", (code, signal) => resolve({ code, signal }));
+      },
+    );
+    check(
+      "sigterm_during_handshake_cleans_temp_and_preserves_active_bytes",
+      (exit.signal === "SIGTERM" || exit.code === 143) &&
+        fs.readFileSync(signalConfigPath, "utf8") === signalConfigBytes &&
+        hashFile(signalLedgerPath) === signalLedgerHash &&
+        fs.existsSync(path.join(signalHome, "join.pending.json")) &&
+        !fs.readdirSync(signalTemp).some((entry) =>
+          entry.startsWith("plimsoll-join-handshake-"),
+        ),
+      {
+        exit,
+        configByteIdentical: fs.readFileSync(signalConfigPath, "utf8") === signalConfigBytes,
+        ledgerByteIdentical: hashFile(signalLedgerPath) === signalLedgerHash,
+        pendingGrant: fs.existsSync(path.join(signalHome, "join.pending.json")),
+        temporaryEntries: fs.readdirSync(signalTemp).filter((entry) =>
+          entry.startsWith("plimsoll-join-handshake-"),
+        ),
+      },
+    );
+    resumeMode = true;
+    const cliResume = await runChild(
+      [
+        "node_modules/tsx/dist/cli.mjs",
+        "packages/collector-cli/src/cli.ts",
+        "join",
+        "--resume",
+      ],
+      "",
+      { ...process.env, PLIMSOLL_HOME: signalHome, TMPDIR: signalTemp },
+    );
+    const resumedConfig = collectorConfigSchema.parse(
+      JSON.parse(fs.readFileSync(signalConfigPath, "utf8")),
+    );
+    check(
+      "cli_resume_replays_stable_probe_without_redeeming_token",
+      cliResume.exit.code === 0 &&
+        cliResumeRequests === 1 &&
+        heldProbeId.length > 0 &&
+        resumedProbeId === heldProbeId &&
+        resumedConfig.tenantId === TENANT_B &&
+        !fs.existsSync(path.join(signalHome, "join.pending.json")),
+      {
+        exit: cliResume.exit,
+        resumeRequests: cliResumeRequests,
+        stableProbe: resumedProbeId === heldProbeId,
+        pendingAfterResume: fs.existsSync(path.join(signalHome, "join.pending.json")),
+      },
+    );
+  } finally {
+    heldServer.closeAllConnections();
+    await new Promise<void>((resolve, reject) =>
+      heldServer.close((error) => (error ? reject(error) : resolve())),
+    );
+  }
+
   // The public CLI can keep the token out of argv via stdin. Its success
   // output contains neither token nor install/signing credentials, and the
   // active config remains absent during both network exchanges.
@@ -455,6 +751,13 @@ try {
       { ...process.env, PLIMSOLL_HOME: cliHome },
     );
     const combinedOutput = `${child.stdout}\n${child.stderr}`;
+    if (!fs.existsSync(path.join(cliHome, "collector.config.json"))) {
+      throw new Error(`CLI stdin join did not activate config: ${JSON.stringify({
+        exit: child.exit,
+        stdout: child.stdout,
+        stderr: child.stderr,
+      })}`);
+    }
     const childConfig = JSON.parse(
       fs.readFileSync(path.join(cliHome, "collector.config.json"), "utf8"),
     ) as Record<string, unknown>;

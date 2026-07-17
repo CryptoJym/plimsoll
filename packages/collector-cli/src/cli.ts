@@ -24,7 +24,11 @@ import {
   launchctlBootstrapCommand,
   uninstallLaunchAgent,
 } from "./launch-agent";
-import { performJoin } from "./join";
+import {
+  cleanupStaleJoinHandshakeDirectories,
+  performJoin,
+  resumePendingJoin,
+} from "./join";
 import { RolloutTailer } from "./rollout-tailer";
 import { TranscriptTailer } from "./transcript-tailer";
 import {
@@ -101,9 +105,10 @@ Commands:
   stop                  Stop the foreground daemon using the local PID file
 
 Config tools:
-  join "<join-url>#<token>" | join --token-stdin --url <cloud-base-url>
+  join "<join-url>#<token>" | join --token-stdin --url <cloud-base-url> | join --resume
       Prefer --token-stdin (or join -) so the single-use secret never enters
       shell history or process arguments. Workspace URL env: PLIMSOLL_CLOUD_URL.
+      join --dry-run is unsupported and fails before reading the token or network.
   generate-config claude-code|codex|all [--evidence --confirm-evidence]
   upload [--url URL --limit 500] [--ingest-key KEY] [--signing-secret SECRET] [--no-mark] [--max-batches 20]
   upload-history [--dry-run] [--full] [--until ISO] [--limit N] [--batch-size 500] [--concurrency 1..8] [--delay-ms 250] [--url URL]
@@ -141,6 +146,7 @@ Config tools:
 function openBuffer(config: CollectorConfig, deliveryOverride = false) {
   ensureCollectorHome();
   return new LocalEventBuffer(collectorBufferPath(), {
+    workspaceId: config.tenantId,
     delivery: {
       enabled: Boolean(config.uploadUrl) || deliveryOverride,
       limits: config.delivery,
@@ -222,6 +228,7 @@ function collectorPidRecord(runtimeIdentity: CollectorRuntimeIdentity): Collecto
 }
 
 async function main() {
+  cleanupStaleJoinHandshakeDirectories();
   if (command === "help" || command === "--help" || command === "-h") {
     printHelp();
     return;
@@ -231,8 +238,18 @@ async function main() {
     // Join runs before ordinary config loading because loadCollectorConfig()
     // creates a default file. A refused/failed join must leave even a missing
     // active config untouched.
+    if (flag("--dry-run")) {
+      throw new Error(
+        "join --dry-run is unsupported because redeeming a single-use token is not a preview. " +
+          "No token was read, no request was sent, and no config was changed.",
+      );
+    }
     const targetArgument = process.argv[3];
+    const resume = flag("--resume");
     const tokenFromStdin = flag("--token-stdin") || targetArgument === "-";
+    if (resume && (process.argv.length !== 4 || targetArgument !== "--resume")) {
+      throw new Error("join --resume does not accept another token or URL.");
+    }
     if (
       tokenFromStdin &&
       targetArgument &&
@@ -241,16 +258,20 @@ async function main() {
     ) {
       throw new Error("Choose either a positional join token/URL or --token-stdin, not both.");
     }
-    const target = tokenFromStdin ? (await readStdin()).trim() : targetArgument;
-    if (!target || (!tokenFromStdin && target.startsWith("--"))) {
-      throw new Error(
-        'Usage: plimsoll join --token-stdin --url <cloud-base-url>  |  plimsoll join "<join-url>#<token>"',
-      );
-    }
-    const result = await performJoin({
-      target,
-      baseUrl: optionValue("--url") ?? process.env.PLIMSOLL_CLOUD_URL,
-    });
+    const result = resume
+      ? await resumePendingJoin()
+      : await (async () => {
+          const target = tokenFromStdin ? (await readStdin()).trim() : targetArgument;
+          if (!target || (!tokenFromStdin && target.startsWith("--"))) {
+            throw new Error(
+              'Usage: plimsoll join --token-stdin --url <cloud-base-url>  |  plimsoll join "<join-url>#<token>"  |  plimsoll join --resume',
+            );
+          }
+          return performJoin({
+            target,
+            baseUrl: optionValue("--url") ?? process.env.PLIMSOLL_CLOUD_URL,
+          });
+        })();
     if (!result.joined) {
       console.error(
         JSON.stringify(
@@ -277,6 +298,7 @@ async function main() {
           installCredentialsConfigured: true,
           uploadUrl: result.uploadUrl,
           uploadSigningConfigured: result.uploadSigningConfigured,
+          workspaceBoundary: result.workspaceBoundary,
           syncConfigured: true,
           handshake: result.handshake,
           nextSteps: [
