@@ -166,6 +166,18 @@ export function collectorPrivacyReadiness(config: CollectorConfig) {
   };
 }
 
+export type CollectorConfigReadResult =
+  | {
+      status: "valid";
+      path: string;
+      config: CollectorConfig;
+    }
+  | {
+      status: "missing" | "invalid";
+      path: string;
+      config: null;
+    };
+
 export function collectorHome(homeDir = os.homedir()) {
   if (process.env.PLIMSOLL_HOME) return process.env.PLIMSOLL_HOME;
   return path.join(homeDir, "Library", "Application Support", "Plimsoll");
@@ -197,6 +209,28 @@ export function saveCollectorConfig(config: CollectorConfig, homeDir = os.homedi
     mode: 0o600,
   });
   return validated;
+}
+
+/**
+ * Inspect the collector config without creating the Plimsoll home or a default
+ * config. Diagnostic callers deliberately get a small status instead of parse
+ * errors that could echo values from a malformed file.
+ */
+export function readCollectorConfig(homeDir = os.homedir()): CollectorConfigReadResult {
+  const configPath = collectorConfigPath(homeDir);
+  if (!fs.existsSync(configPath)) {
+    return { status: "missing", path: configPath, config: null };
+  }
+
+  try {
+    return {
+      status: "valid",
+      path: configPath,
+      config: collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8"))),
+    };
+  } catch {
+    return { status: "invalid", path: configPath, config: null };
+  }
 }
 
 export function loadCollectorConfig(homeDir = os.homedir()): CollectorConfig {

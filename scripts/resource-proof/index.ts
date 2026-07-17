@@ -21,6 +21,7 @@ import {
   runDashboardProjectionBudgetContract,
   runIntegratedCaptureProjectionOutboxContract,
   runMetadataPrivacySentinelsContract,
+  runLearningFactPrivacyAndResourceContract,
   resourceReceiptPrivacyLeakCount,
 } from "./scenarios";
 import {
@@ -112,6 +113,7 @@ async function main() {
     scenarios.push(await runDashboardProjectionBudgetContract(sandbox));
     scenarios.push(runIntegratedCaptureProjectionOutboxContract(sandbox, operatorHome));
     scenarios.push(runMetadataPrivacySentinelsContract(sandbox, operatorHome));
+    scenarios.push(runLearningFactPrivacyAndResourceContract(sandbox, operatorHome));
     scenarios.push(
       ...loadUnwiredIntegrationScenarios(
         new Set([
@@ -122,6 +124,7 @@ async function main() {
           "dashboard_projection_budget",
           "integrated_capture_projection_outbox",
           "metadata_privacy_sentinels",
+          "learning_fact_privacy_and_resource_bounds",
         ]),
       ),
     );

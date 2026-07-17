@@ -20,8 +20,14 @@ breakdowns, plan leverage, and capture health.
 Check the rigging any time:
 
 ```sh
-npx @plimsoll/cli doctor    # verify paths, SQLite buffer, data mode, privacy posture
+npx @plimsoll/cli doctor --read-only --json
 ```
+
+Doctor is read-only diagnosis, not installation or capture proof. It creates
+no config, ledger, plist, logs, WAL/SHM, or directories. Readiness advances
+through `not_installed`, `configured`, `service_ready`, and `signal_verified`;
+only the last state has a live matching collector identity plus a real
+token-bearing signal, returns `ok:true`, and exits 0.
 
 ## Commands
 
@@ -30,7 +36,7 @@ npx @plimsoll/cli doctor    # verify paths, SQLite buffer, data mode, privacy po
 | `setup` | Apply Claude Code + Codex telemetry config (idempotent; `--yes`, `--dry-run`) |
 | `start` / `stop` | Run / stop the local hook + OTLP receiver |
 | `status` | Print local buffer and policy status |
-| `doctor` | Verify paths, SQLite buffer, LaunchAgent, data mode, privacy posture |
+| `doctor --read-only --json` | Verify Node, collector/tool config, LaunchAgent, runtime identity, connectivity, and token signal without writing |
 | `scan-rollouts` | One-time full-history walk of Codex rollout files into the ledger |
 | `scan-transcripts` | One-time full-history walk of Claude Code transcripts into the ledger |
 | `label account HASH NAME` | Local-only display label for a hashed account |

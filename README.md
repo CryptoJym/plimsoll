@@ -57,7 +57,7 @@ The outcome join uses **linkage keys**: both Plimsoll and the GitHub side hash t
 
 ## Quickstart
 
-Requirements: macOS, Node 20+.
+Requirements: macOS, Node >=20 <25.
 
 ```bash
 # wire Claude Code + Codex telemetry (idempotent, takes backups; --dry-run to preview)
@@ -66,24 +66,30 @@ npx -y @plimsoll/cli setup
 # run the collector + dashboard → http://127.0.0.1:48271
 npx -y @plimsoll/cli start
 
-# sanity-check the whole capture path
-npx -y @plimsoll/cli doctor
+# inspect readiness without creating config, a ledger, or service files
+npx -y @plimsoll/cli doctor --read-only --json
 ```
 
-Cold start measured at ~7.5s from an empty npm cache to a full `doctor`
-report (evidence on #11). Background LaunchAgent mode for npm installs is
-still being fitted — until then `start` runs in a terminal.
+`doctor` is a diagnostic gate, not an installer and not capture proof by
+itself. Its readiness progresses through `not_installed` → `configured` →
+`service_ready` → `signal_verified`; only `signal_verified` returns `ok:true`
+and exit 0. A cold ledger therefore fails honestly until a real token-bearing
+Claude Code or Codex event reaches the collector. Background LaunchAgent mode
+for npm installs is still being fitted — until then `start` runs in a terminal.
 
 **Contributors / running from source** (adds pnpm + git):
 
 ```bash
 git clone https://github.com/CryptoJym/plimsoll.git
 cd plimsoll
-pnpm install
+./install.sh --dry-run                        # preflight and exact mutation plan only
+./install.sh                                  # setup + development LaunchAgent + strict gate
 
-pnpm collector generate-config all           # print configs instead of applying
-pnpm collector install-launch-agent --load   # background collector (source checkout)
-pnpm collector doctor
+# Equivalent manual source commands:
+pnpm install
+pnpm collector setup --yes                    # idempotent; backs up changed tool configs
+pnpm collector install-launch-agent --dev --repo-root "$PWD" --pnpm "$(command -v pnpm)" --load
+pnpm collector doctor --read-only --json      # exits 0 only after a real token signal
 pnpm report -- --repository your-org/your-repo   # after a few sessions: the economics
 ```
 
@@ -92,6 +98,12 @@ pnpm report -- --repository your-org/your-repo   # after a few sessions: the eco
 `~/.claude/settings.json` and `~/.codex/config.toml` if you'd rather paste
 by hand — hooks plus OTLP exporters pointed at `127.0.0.1:48271`. Nothing
 is configured behind your back.
+
+The source install script's `--dry-run` does not clone, install dependencies,
+write Claude/Codex or Plimsoll files, register a LaunchAgent, or start a
+collector. The real install fails closed if the final doctor gate is below
+`signal_verified`; the JSON report names the incomplete readiness level and
+each missing/conflicted requirement.
 
 > **Codex note:** Codex records token usage on *trace spans* (`gen_ai.usage.*`), not log events. The generated config enables logs, traces, and metrics — if you disable the trace exporter, codex token attribution silently drops to zero. We learned this the hard way (see "The audit story" below).
 
