@@ -23,6 +23,7 @@ import { appendForwardedHook } from "./forwarder";
 import {
   installLaunchAgent,
   LAUNCH_AGENT_LABEL,
+  LAUNCH_AGENT_SYSTEM_PATHS,
   launchAgentPlistPath,
   launchctlBootoutCommand,
   launchctlBootstrapCommand,
@@ -380,6 +381,7 @@ function readLaunchAgentState(plistPath: string) {
       label: LAUNCH_AGENT_LABEL,
       plistPath,
       runtime: null,
+      path: null,
     };
   }
   try {
@@ -401,6 +403,7 @@ function readLaunchAgentState(plistPath: string) {
         label: LAUNCH_AGENT_LABEL,
         plistPath,
         runtime: null,
+        path: null,
       };
     }
     const plist = JSON.parse(parsed.stdout) as Record<string, unknown>;
@@ -438,6 +441,31 @@ function readLaunchAgentState(plistPath: string) {
     const environment = plist.EnvironmentVariables && typeof plist.EnvironmentVariables === "object"
       ? plist.EnvironmentVariables as Record<string, unknown>
       : null;
+    const launchAgentPath = typeof environment?.PATH === "string" ? environment.PATH : "";
+    const launchAgentPathEntries = launchAgentPath.split(path.delimiter);
+    const normalizedPathEntries = launchAgentPathEntries.map((entry) => path.resolve(entry));
+    const requiredPathEntries = [...new Set([
+      path.resolve(path.dirname(process.execPath)),
+      path.resolve(path.dirname(programArguments[0] ?? "")),
+      ...LAUNCH_AGENT_SYSTEM_PATHS.map((entry) => path.resolve(entry)),
+    ])];
+    const pathValidation = {
+      nonempty: launchAgentPath.length > 0 && launchAgentPathEntries.every((entry) => entry.length > 0),
+      absolute: launchAgentPathEntries.every((entry) => path.isAbsolute(entry)),
+      controlFree: launchAgentPathEntries.every(
+        (entry) => !/[\u0000-\u001f\u007f-\u009f]/.test(entry),
+      ),
+      unique: new Set(normalizedPathEntries).size === normalizedPathEntries.length,
+      missingRequiredEntries: requiredPathEntries.filter(
+        (required) => !normalizedPathEntries.includes(required),
+      ),
+    };
+    const pathOk =
+      pathValidation.nonempty &&
+      pathValidation.absolute &&
+      pathValidation.controlFree &&
+      pathValidation.unique &&
+      pathValidation.missingRequiredEntries.length === 0;
     const matchesExpectedRuntime = Boolean(
       plist.Label === LAUNCH_AGENT_LABEL &&
       runtime &&
@@ -449,7 +477,7 @@ function readLaunchAgentState(plistPath: string) {
       plist.StandardOutPath === collectorLogPath("collector.out.log") &&
       plist.StandardErrorPath === collectorLogPath("collector.err.log") &&
       environment?.PLIMSOLL_COLLECTOR_DATA_MODE === "metadata" &&
-      typeof environment?.PATH === "string",
+      pathOk,
     );
     return {
       ok: matchesExpectedRuntime,
@@ -458,6 +486,10 @@ function readLaunchAgentState(plistPath: string) {
       label: LAUNCH_AGENT_LABEL,
       plistPath,
       runtime,
+      path: {
+        ok: pathOk,
+        ...pathValidation,
+      },
     };
   } catch {
     return {
@@ -467,6 +499,7 @@ function readLaunchAgentState(plistPath: string) {
       label: LAUNCH_AGENT_LABEL,
       plistPath,
       runtime: null,
+      path: null,
     };
   }
 }

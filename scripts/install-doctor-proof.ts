@@ -538,6 +538,64 @@ esac
   fs.writeFileSync(codexConfig, fullCodexConfig);
 
   const validPlist = fs.readFileSync(plistPath, "utf8");
+  const pathMatch = validPlist.match(/<key>PATH<\/key>\s*<string>([\s\S]*?)<\/string>/);
+  check("proof_extracts_valid_launch_agent_path", Boolean(pathMatch?.[1]), plistPath);
+  const validLaunchAgentPath = pathMatch![1]!;
+  const replaceLaunchAgentPath = (value: string) => validPlist.replace(
+    /(<key>PATH<\/key>\s*<string>)[\s\S]*?(<\/string>)/,
+    `$1${value}$2`,
+  );
+  const runPathFixture = async (name: string, pathValue: string) => {
+    fs.writeFileSync(plistPath, replaceLaunchAgentPath(pathValue));
+    const beforeDoctor = digestTree(sandbox);
+    const result = await command(
+      process.execPath,
+      [tsx, cli, "doctor", "--read-only", "--json"],
+      { cwd: neutralCwd, env: fixtureEnv },
+    );
+    const receipt = parseJson(result.stdout);
+    check(
+      name,
+      result.code !== 0 &&
+        receipt.ok === false &&
+        receipt.readiness === "configured" &&
+        receipt.launchAgent.status === "conflicted" &&
+        receipt.launchAgent.path.ok === false &&
+        digestTree(sandbox) === beforeDoctor,
+      receipt,
+    );
+  };
+  const validPathEntries = validLaunchAgentPath.split(path.delimiter);
+  await runPathFixture("empty_launch_agent_path_fails_closed_with_live_signal", "");
+  await runPathFixture("relative_launch_agent_path_fails_closed_with_live_signal", "relative/bin");
+  await runPathFixture(
+    "control_character_launch_agent_path_fails_closed_with_live_signal",
+    `${validLaunchAgentPath}${path.delimiter}/control&#10;path`,
+  );
+  await runPathFixture(
+    "normalized_duplicate_launch_agent_path_fails_closed_with_live_signal",
+    `${validLaunchAgentPath}${path.delimiter}${validPathEntries[0]}/`,
+  );
+  await runPathFixture(
+    "missing_node_runtime_path_fails_closed_with_live_signal",
+    validPathEntries
+      .filter((entry) => path.resolve(entry) !== path.resolve(path.dirname(process.execPath)))
+      .join(path.delimiter),
+  );
+  await runPathFixture(
+    "missing_pnpm_runtime_path_fails_closed_with_live_signal",
+    validPathEntries
+      .filter((entry) => path.resolve(entry) !== path.resolve("/neutral/bin"))
+      .join(path.delimiter),
+  );
+  await runPathFixture(
+    "missing_supported_system_path_fails_closed_with_live_signal",
+    validPathEntries
+      .filter((entry) => path.resolve(entry) !== "/usr/bin")
+      .join(path.delimiter),
+  );
+  fs.writeFileSync(plistPath, validPlist);
+
   const malformedPlist = validPlist.replace("</plist>", "<broken>");
   check("proof_builds_malformed_plist_fixture", malformedPlist !== validPlist, plistPath);
   fs.writeFileSync(plistPath, malformedPlist);
@@ -590,7 +648,10 @@ esac
   const signalReceipt = parseJson(signalDoctor.stdout);
   check(
     "doctor_reports_signal_verified_only_with_token_signal",
-    signalDoctor.code === 0 && signalReceipt.ok === true && signalReceipt.readiness === "signal_verified",
+    signalDoctor.code === 0 &&
+      signalReceipt.ok === true &&
+      signalReceipt.readiness === "signal_verified" &&
+      signalReceipt.launchAgent.path.ok === true,
     signalReceipt,
   );
   check(
