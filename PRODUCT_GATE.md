@@ -17,7 +17,7 @@ its issue.
 | G2 | Codex tokens captured & reconciled to vendor-reported count | live session evidence (#4); rollout tailer 10/10 sessions (#22) | ✅ exact (30,677) |
 | G3 | See it: local dashboard on the live ledger, offline | proof: dashboard_served/summary/receipts + inline-script parse | ✅ |
 | G4 | Traceability: number → receipts (join keys, events, coverage) | proof: dashboard_session_receipts_traceable | ✅ session-level |
-| G5 | Easy link-up: fresh Mac → numbers < 5 min, no hand-editing | fresh-env walkthrough on #1 (6s, tarball) + cold `npx @plimsoll/cli doctor` from the public registry (7.5s, #11) | ✅ 6s / 7.5s npx |
+| G5 | Easy link-up: fresh Mac → numbers < 5 min, no hand-editing | source installer dry-run + strict read-only doctor proof (#107); fresh-Mac timing still requires `signal_verified` from a real token event | 🟡 installer safety automated; live capture timing pending |
 | G6 | Fleet: teammate Mac joins a workspace with one command | join flow (issue #16) | 🔴 |
 | G7 | Self-honesty: capture-health alarm when telemetry stops | capture watch vs local file activity; dashboard lamps (sounding 0021 / #23) | ✅ |
 | G8 | Reconciliation: local sums vs vendor bill as displayed coverage | vendor import + gauge (private cloud) | 🔴 |

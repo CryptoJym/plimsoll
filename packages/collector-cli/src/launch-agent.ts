@@ -5,6 +5,14 @@ import path from "node:path";
 import { collectorHome, ensureCollectorHome } from "./config";
 
 export const LAUNCH_AGENT_LABEL = "com.plimsoll.collector";
+export const LAUNCH_AGENT_SYSTEM_PATHS = [
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+  "/usr/bin",
+  "/bin",
+  "/usr/sbin",
+  "/sbin",
+] as const;
 
 export type LaunchAgentOptions = {
   homeDir?: string;
@@ -47,18 +55,26 @@ export function renderLaunchAgentPlist(options: LaunchAgentOptions) {
   const logDirectory = collectorHome(homeDir);
   const programArguments = options.programArguments ?? [pnpmPath, "--dir", options.repoRoot, "collector", "start"];
   const workingDirectory = options.workingDirectory ?? options.repoRoot;
-  const inheritedPathEntries = (process.env.PATH ?? "").split(path.delimiter).filter(Boolean);
-  const pathEntries = [
-    ...inheritedPathEntries,
+  const inheritedPathEntries = (process.env.PATH ?? "").split(path.delimiter);
+  const pathCandidates = [
+    path.dirname(process.execPath),
     path.dirname(pnpmPath),
-    "/opt/homebrew/bin",
-    "/usr/local/bin",
-    "/usr/bin",
-    "/bin",
-    "/usr/sbin",
-    "/sbin",
+    path.dirname(programArguments[0] ?? ""),
+    ...inheritedPathEntries,
+    ...LAUNCH_AGENT_SYSTEM_PATHS,
   ];
-  const launchAgentPath = [...new Set(pathEntries.filter(Boolean))].join(path.delimiter);
+  const pathEntries: string[] = [];
+  const normalizedEntries = new Set<string>();
+  for (const candidate of pathCandidates) {
+    if (!candidate || !path.isAbsolute(candidate) || /[\u0000-\u001f\u007f-\u009f]/.test(candidate)) {
+      continue;
+    }
+    const normalized = path.resolve(candidate);
+    if (normalizedEntries.has(normalized)) continue;
+    normalizedEntries.add(normalized);
+    pathEntries.push(normalized);
+  }
+  const launchAgentPath = pathEntries.join(path.delimiter);
 
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
