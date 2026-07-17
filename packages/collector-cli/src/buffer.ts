@@ -11,6 +11,7 @@ import type { OtlpAdmissionDrop, OtlpDropReason } from "./otlp-admission";
 import { ensureCodexReconciliationSchema } from "./codex-reconciliation";
 import { DeliveryOutbox, type DeliveryLimits } from "./outbox";
 import { DashboardProjectionStore } from "./dashboard-projection";
+import { LearningFactStore, type LearningFactLimits } from "./learning-facts";
 
 export type BufferedEventRow = {
   id: string;
@@ -83,12 +84,14 @@ export class LocalEventBuffer {
   private workspaceId: string | null = null;
   readonly delivery: DeliveryOutbox;
   readonly projection: DashboardProjectionStore;
+  readonly learningFacts: LearningFactStore;
 
   constructor(
     path: string,
     options: {
       delivery?: { enabled?: boolean; limits?: Partial<DeliveryLimits> };
       workspaceId?: string;
+      learningFacts?: { limits?: Partial<LearningFactLimits> };
     } = {},
   ) {
     this.db = new Database(path);
@@ -287,6 +290,10 @@ export class LocalEventBuffer {
       end;
     `);
     ensureCodexReconciliationSchema(this.db);
+    this.learningFacts = new LearningFactStore(
+      this.db,
+      options.learningFacts?.limits,
+    );
     this.projection = new DashboardProjectionStore(this.db, { newLedger });
   }
 
