@@ -8,14 +8,18 @@ install, publish, or edit a skill.
 
 ## Truth boundary
 
-An admissible input contains explicit, prospective exposure and control
-receipts plus matched outcome pairs. Each pair must match exactly on project,
-work type, complexity band, model, tool version, actor cluster, repo cluster,
-and calendar epoch. Outcome metric/version/unit/direction must also match.
+An admissible input contains the canonical, prospective `TechniqueExposureFact`
+records emitted by Plimsoll's bounded learning-fact store plus matched outcome
+pairs. Treatment and control facts name the same technique/intervention and
+explicitly declare their mode; technique absence is never inferred. Each pair
+must match exactly on project, work type, complexity band, model, tool version,
+actor cluster, repo cluster, and calendar epoch. Outcome
+metric/version/unit/direction must also match.
 
 The runtime rejects:
 
-- missing, implicit, inferred, or retrospective technique exposure;
+- missing, implicit, noncanonical, duplicate, or retrospective technique exposure;
+- mixed technique ID/version/content-digest contracts or mismatched intervention assignments;
 - open-web or model-generated content as gating evidence;
 - incomparable cohort, epoch, model, tool, metric, or unit identities;
 - stale row digests, non-finite/unsafe numbers, row/runtime budget overflow;
@@ -39,6 +43,12 @@ direction) governs the entire run. A pair that is internally matched still
 fails closed if it drifts from that run-level contract; ratios and dollars,
 or higher-is-better and lower-is-better outcomes, can never be averaged.
 
+One explicit `techniqueContract` likewise binds the technique ID, version, and
+content digest for the entire run. The packet accepts only the shared strict
+`TechniqueExposureFact` schema and requires its work class and complexity band
+to agree with the matched cohort. This reuses the stored prospective fact
+surface instead of creating a second analytical exposure truth.
+
 ## Versioned schema surface
 
 The public TypeScript/runtime schema exports are:
@@ -52,8 +62,9 @@ The public TypeScript/runtime schema exports are:
 
 `source.rowDigest` binds canonical sorted pair rows. The smaller source
 fingerprint binds that digest, the snapshot/query identity, metric versions,
-hypothesis family, gates, window, and analysis configuration. Passing the same
-fingerprint as `previousSourceFingerprint` returns:
+hypothesis family, technique contract, gates, window, and analysis
+configuration. Passing the same fingerprint as `previousSourceFingerprint`
+returns:
 
 ```json
 {

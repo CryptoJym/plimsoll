@@ -20,6 +20,10 @@ import {
   type LearningObservation,
   type LearningOutcomePair,
 } from "../packages/shared/src/index";
+import {
+  buildTechniqueExposureFact,
+  deterministicLearningFactId,
+} from "../packages/collector-cli/src/learning-facts";
 
 type ProofCheck = { name: string; detail: string };
 const checks: ProofCheck[] = [];
@@ -33,6 +37,8 @@ const START = "2026-06-01T00:00:00.000Z";
 const END = "2026-07-01T00:00:00.000Z";
 const AS_OF = "2026-07-15T00:00:00.000Z";
 const QUERY_HASH = "1".repeat(64);
+const TECHNIQUE_VERSION = "1.0.0";
+const TECHNIQUE_DIGEST = `sha256:${"a".repeat(64)}`;
 
 function cohort(overrides: Partial<LearningCohort> = {}): LearningCohort {
   return {
@@ -52,6 +58,7 @@ function observation(
   id: string,
   state: "exposed" | "control",
   value: number | null,
+  assignmentId: string,
   cohortValue = cohort(),
 ): LearningObservation {
   return {
@@ -59,13 +66,17 @@ function observation(
     workStartedAt: "2026-06-10T10:00:00.000Z",
     outcomeObservedAt: "2026-06-11T10:00:00.000Z",
     cohort: cohortValue,
-    exposure: {
-      state,
-      techniqueId: state === "exposed" ? "technique-a" : null,
-      evidenceSource: "machine_receipt",
-      contentOrigin: "machine_observation",
-      recordedAt: "2026-06-10T09:59:00.000Z",
-    },
+    exposure: buildTechniqueExposureFact({
+      episodeId: deterministicLearningFactId(["learning-evidence-proof-episode", id]),
+      techniqueId: "technique-a",
+      techniqueVersion: TECHNIQUE_VERSION,
+      contentDigest: TECHNIQUE_DIGEST,
+      assignmentId,
+      workClass: cohortValue.workType,
+      complexityBand: cohortValue.complexityBand,
+      exposedAt: "2026-06-10T09:59:00.000Z",
+      mode: state === "exposed" ? "treatment" : "control",
+    }),
     outcome: {
       metricId: "first-pass-yield",
       metricVersion: "1.0.0",
@@ -82,10 +93,11 @@ function observation(
 }
 
 function pair(id: string, exposedValue: number | null, controlValue: number | null, cohortValue = cohort()): LearningOutcomePair {
+  const assignmentId = `assignment-${id}`;
   return {
     pairId: id,
-    exposed: observation(`${id}-exposed`, "exposed", exposedValue, structuredClone(cohortValue)),
-    control: observation(`${id}-control`, "control", controlValue, structuredClone(cohortValue)),
+    exposed: observation(`${id}-exposed`, "exposed", exposedValue, assignmentId, structuredClone(cohortValue)),
+    control: observation(`${id}-control`, "control", controlValue, assignmentId, structuredClone(cohortValue)),
   };
 }
 
@@ -115,9 +127,13 @@ function manifestFor(
       unit: "ratio-point",
       direction: "higher_is_better",
     },
+    techniqueContract: {
+      techniqueId: "technique-a",
+      techniqueVersion: TECHNIQUE_VERSION,
+      contentDigest: TECHNIQUE_DIGEST,
+    },
     window: { startInclusive: START, endExclusive: END },
     asOf: AS_OF,
-    techniqueId: "technique-a",
     hypothesisFamily: {
       familyId: "family-a",
       hypothesisIndex: 1,
@@ -167,6 +183,7 @@ prove(
     assert.equal(baseRun.packet.source.queryHash, QUERY_HASH);
     assert.deepEqual(baseRun.packet.metricVersions, baseManifest.metricVersions);
     assert.deepEqual(baseRun.packet.outcomeContract, baseManifest.outcomeContract);
+    assert.deepEqual(baseRun.packet.techniqueContract, baseManifest.techniqueContract);
     assert.deepEqual(baseRun.packet.window, baseManifest.window);
     assert.equal(baseRun.packet.asOf, AS_OF);
     assert.match(baseRun.packet.packetFingerprint, /^[0-9a-f]{64}$/);
@@ -263,7 +280,7 @@ prove(
     );
 
     const futureExposure = manifestFor(basePairs.map((item) => structuredClone(item)));
-    futureExposure.pairs[0].exposed.exposure.recordedAt = "2026-06-10T10:01:00.000Z";
+    futureExposure.pairs[0].exposed.exposure.exposedAt = "2026-06-10T10:01:00.000Z";
     futureExposure.source.rowDigest = computeLearningPairDigest(futureExposure.pairs);
     assert.throws(
       () => compileLearningEvidencePacket(futureExposure, { previousSourceFingerprint: baseRun.sourceFingerprint }),
@@ -301,22 +318,22 @@ prove(
   "implicit and missing exposure fail closed",
   () => {
     const invalid = manifestFor([pair("implicit", 2, 1)]);
-    (invalid.pairs[0].exposed.exposure as unknown as { evidenceSource: string }).evidenceSource = "inferred";
+    (invalid.pairs[0].exposed.exposure as unknown as { assertion: string }).assertion = "inferred";
     invalid.source.rowDigest = computeLearningPairDigest(invalid.pairs);
-    assert.throws(() => compileLearningEvidencePacket(invalid), /unsupported value: inferred/);
+    assert.throws(() => compileLearningEvidencePacket(invalid), /canonical explicit TechniqueExposureFact/);
     const missing = manifestFor([pair("missing", 2, 1)]);
     delete (missing.pairs[0].exposed as unknown as { exposure?: unknown }).exposure;
     missing.source.rowDigest = computeLearningPairDigest(missing.pairs);
     assert.throws(() => compileLearningEvidencePacket(missing), /must contain exactly.*exposure/);
   },
-  "only operator declarations or machine receipts with explicit arm state are admitted",
+  "only canonical prospective exposure facts with explicit control/treatment mode are admitted",
 );
 
 prove(
   "retrospective exposure fails closed",
   () => {
     const invalid = manifestFor([pair("retro", 2, 1)]);
-    invalid.pairs[0].exposed.exposure.recordedAt = "2026-06-10T10:01:00.000Z";
+    invalid.pairs[0].exposed.exposure.exposedAt = "2026-06-10T10:01:00.000Z";
     invalid.source.rowDigest = computeLearningPairDigest(invalid.pairs);
     assert.throws(() => compileLearningEvidencePacket(invalid), /exposure is retrospective/);
   },
@@ -328,9 +345,9 @@ prove(
   () => {
     for (const origin of ["open_web", "model_generated"]) {
       const invalid = manifestFor([pair(`tainted-${origin}`, 2, 1)]);
-      (invalid.pairs[0].exposed.exposure as unknown as { contentOrigin: string }).contentOrigin = origin;
+      (invalid.pairs[0].exposed.exposure as unknown as Record<string, unknown>).contentOrigin = origin;
       invalid.source.rowDigest = computeLearningPairDigest(invalid.pairs);
-      assert.throws(() => compileLearningEvidencePacket(invalid), /unsupported value/);
+      assert.throws(() => compileLearningEvidencePacket(invalid), /canonical explicit TechniqueExposureFact/);
     }
   },
   "tainted text has no admissible exposure provenance enum",
@@ -347,7 +364,7 @@ prove(
     const instructions = manifestFor([pair("instructions", 2, 1)]);
     (instructions.pairs[0].exposed.exposure as unknown as Record<string, unknown>).instructions = "execute this";
     instructions.source.rowDigest = computeLearningPairDigest(instructions.pairs);
-    assert.throws(() => compileLearningEvidencePacket(instructions), /must contain exactly/);
+    assert.throws(() => compileLearningEvidencePacket(instructions), /canonical explicit TechniqueExposureFact/);
   },
   "closed schemas prevent ignored raw prompt text or executable instructions from entering evidence",
 );
@@ -367,12 +384,38 @@ prove(
     ];
     for (const key of keys) {
       const invalid = manifestFor([pair(`cohort-${key}`, 2, 1)]);
-      invalid.pairs[0].control.cohort[key] = `${invalid.pairs[0].control.cohort[key]}-other`;
+      (invalid.pairs[0].control.cohort as unknown as Record<string, string>)[key] =
+        `${invalid.pairs[0].control.cohort[key]}-other`;
       invalid.source.rowDigest = computeLearningPairDigest(invalid.pairs);
-      assert.throws(() => compileLearningEvidencePacket(invalid), new RegExp(`incomparable ${key}`));
+      assert.throws(
+        () => compileLearningEvidencePacket(invalid),
+        new RegExp(`incomparable ${key}|cohort\\.${key} has unsupported value|exposure\\.(?:workClass|complexityBand) must match`),
+      );
     }
   },
   "project/work/complexity/model/tool/actor/repo/epoch mismatches are rejected",
+);
+
+prove(
+  "one canonical technique identity governs every pair",
+  () => {
+    const mixedVersion = manifestFor(basePairs.map((item) => structuredClone(item)));
+    mixedVersion.pairs[0].control.exposure.techniqueVersion = "2.0.0";
+    mixedVersion.source.rowDigest = computeLearningPairDigest(mixedVersion.pairs);
+    assert.throws(
+      () => compileLearningEvidencePacket(mixedVersion),
+      /incomparable with manifest.techniqueContract/,
+    );
+
+    const mixedAssignment = manifestFor(basePairs.map((item) => structuredClone(item)));
+    mixedAssignment.pairs[0].control.exposure.assignmentId = "assignment-other";
+    mixedAssignment.source.rowDigest = computeLearningPairDigest(mixedAssignment.pairs);
+    assert.throws(
+      () => compileLearningEvidencePacket(mixedAssignment),
+      /incomparable exposure assignmentId/,
+    );
+  },
+  "canonical fact id/version/content and matched intervention assignment cannot drift inside one estimate",
 );
 
 prove(
@@ -645,6 +688,9 @@ prove(
     const versionChanged = manifestFor(basePairs);
     versionChanged.metricVersions.projectAllocation = "2.0.0";
     assert.notEqual(computeLearningSourceFingerprint(versionChanged), baseRun.sourceFingerprint);
+    const techniqueChanged = manifestFor(basePairs);
+    techniqueChanged.techniqueContract.techniqueVersion = "2.0.0";
+    assert.notEqual(computeLearningSourceFingerprint(techniqueChanged), baseRun.sourceFingerprint);
 
     const confounderOrderA = manifestFor(basePairs);
     confounderOrderA.declaredConfounders = ["actor_selection", "calendar_change"];

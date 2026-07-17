@@ -10,6 +10,15 @@ import { existsSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
+import {
+  techniqueExposureFactSchema,
+  workClassSchema,
+  workComplexityBandSchema,
+  type TechniqueExposureFact,
+  type WorkClass,
+  type WorkComplexityBand,
+} from "./schemas";
+
 export const LEARNING_EVIDENCE_SCHEMA_VERSION = "1.0.0" as const;
 export const LEARNING_ANALYSIS_VERSION = "1.0.0" as const;
 
@@ -79,10 +88,16 @@ export type LearningOutcomeContract = {
   direction: "higher_is_better" | "lower_is_better";
 };
 
+export type LearningTechniqueContract = {
+  techniqueId: string;
+  techniqueVersion: string | null;
+  contentDigest: string | null;
+};
+
 export type LearningCohort = {
   projectId: string;
-  workType: string;
-  complexityBand: string;
+  workType: WorkClass;
+  complexityBand: WorkComplexityBand;
   modelId: string;
   toolVersion: string;
   actorClusterId: string;
@@ -90,14 +105,8 @@ export type LearningCohort = {
   epochId: string;
 };
 
-export type LearningExposure = {
-  state: "exposed" | "control";
-  techniqueId: string | null;
-  /** Only explicit operator declarations or machine receipts are admissible. */
-  evidenceSource: "operator_declared" | "machine_receipt";
-  contentOrigin: "operator" | "machine_observation";
-  recordedAt: string;
-};
+/** Canonical prospective fact emitted by the bounded local learning-fact store. */
+export type LearningExposure = TechniqueExposureFact;
 
 export type LearningOutcome = {
   metricId: string;
@@ -163,9 +172,9 @@ export type LearningEvidenceManifest = {
   source: LearningSourceIdentity;
   metricVersions: LearningMetricVersions;
   outcomeContract: LearningOutcomeContract;
+  techniqueContract: LearningTechniqueContract;
   window: LearningAnalysisWindow;
   asOf: string;
-  techniqueId: string;
   hypothesisFamily: LearningHypothesisFamily;
   gates: LearningAnalysisGates;
   declaredConfounders: readonly string[];
@@ -199,9 +208,9 @@ export type LearningEvidencePacket = {
   source: LearningSourceIdentity;
   metricVersions: LearningMetricVersions;
   outcomeContract: LearningOutcomeContract;
+  techniqueContract: LearningTechniqueContract;
   window: LearningAnalysisWindow;
   asOf: string;
-  techniqueId: string;
   hypothesisFamily: LearningHypothesisFamily & {
     adjustedAlpha: number;
   };
@@ -286,6 +295,9 @@ export type CompileLearningEvidenceOptions = {
 };
 
 const IDENTITY_PATTERN = /^[A-Za-z0-9](?:[A-Za-z0-9._:@/-]{0,126}[A-Za-z0-9])?$/;
+const EXPOSURE_DIMENSION_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/;
+const EXPOSURE_VERSION_PATTERN = /^[a-zA-Z0-9][a-zA-Z0-9._+-]*$/;
+const SECRET_SHAPED_EXPOSURE = /^(?:(?:sk_(?:live|test)|sk-|ghp|github_pat|xox)[a-z0-9._:-]*|(?:bearer|basic)[._:-])/i;
 const VERSION_PATTERN = /^[0-9]+\.[0-9]+\.[0-9]+(?:-[A-Za-z0-9.-]+)?$/;
 const HASH_PATTERN = /^[0-9a-f]{64}$/;
 const TIMEZONE_SUFFIX = /(?:Z|[+-]\d{2}:\d{2})$/;
@@ -331,6 +343,18 @@ function assertCanonicalIdentity(value: unknown, field: string): asserts value i
   if (typeof value !== "string") throw new Error(`${field} must be a string identity`);
   if (value !== value.trim().normalize("NFKC") || !IDENTITY_PATTERN.test(value)) {
     throw new Error(`${field} must be an already-trimmed bounded ASCII identity`);
+  }
+}
+
+function assertCanonicalTechniqueDimension(value: unknown, field: string): asserts value is string {
+  if (
+    typeof value !== "string" ||
+    value.length > 96 ||
+    value !== value.trim().normalize("NFKC") ||
+    !EXPOSURE_DIMENSION_PATTERN.test(value) ||
+    SECRET_SHAPED_EXPOSURE.test(value)
+  ) {
+    throw new Error(`${field} must be an already-canonical bounded non-secret metadata identity`);
   }
 }
 
@@ -416,9 +440,9 @@ function sourceFingerprintMaterial(manifest: LearningEvidenceManifest): unknown 
     source: manifest.source,
     metricVersions: manifest.metricVersions,
     outcomeContract: manifest.outcomeContract,
+    techniqueContract: manifest.techniqueContract,
     window: manifest.window,
     asOf: manifest.asOf,
-    techniqueId: manifest.techniqueId,
     hypothesisFamily: manifest.hypothesisFamily,
     gates: manifest.gates,
     declaredConfounders: [...manifest.declaredConfounders].sort(compareCanonicalText),
@@ -442,9 +466,9 @@ function validateLearningEvidenceHeader(manifest: LearningEvidenceManifest): voi
       "source",
       "metricVersions",
       "outcomeContract",
+      "techniqueContract",
       "window",
       "asOf",
-      "techniqueId",
       "hypothesisFamily",
       "gates",
       "declaredConfounders",
@@ -501,6 +525,38 @@ function validateLearningEvidenceHeader(manifest: LearningEvidenceManifest): voi
     "outcomeContract.direction",
   );
 
+  assertObject(manifest.techniqueContract, "techniqueContract");
+  assertExactKeys(
+    manifest.techniqueContract,
+    ["techniqueId", "techniqueVersion", "contentDigest"],
+    "techniqueContract",
+  );
+  assertCanonicalTechniqueDimension(manifest.techniqueContract.techniqueId, "techniqueContract.techniqueId");
+  if (manifest.techniqueContract.techniqueVersion !== null) {
+    if (
+      typeof manifest.techniqueContract.techniqueVersion !== "string" ||
+      manifest.techniqueContract.techniqueVersion.length > 64 ||
+      manifest.techniqueContract.techniqueVersion !==
+        manifest.techniqueContract.techniqueVersion.trim().normalize("NFKC") ||
+      !EXPOSURE_VERSION_PATTERN.test(manifest.techniqueContract.techniqueVersion) ||
+      /^(?:sk_(?:live|test)|sk-|ghp|github_pat|xox)/i.test(manifest.techniqueContract.techniqueVersion)
+    ) {
+      throw new Error("techniqueContract.techniqueVersion must be an already-canonical bounded version");
+    }
+  }
+  if (
+    manifest.techniqueContract.contentDigest !== null &&
+    !/^sha256:[a-f0-9]{64}$/.test(manifest.techniqueContract.contentDigest)
+  ) {
+    throw new Error("techniqueContract.contentDigest must be an already-canonical sha256 digest");
+  }
+  if (
+    manifest.techniqueContract.techniqueVersion === null &&
+    manifest.techniqueContract.contentDigest === null
+  ) {
+    throw new Error("techniqueContract requires a version or content digest");
+  }
+
   assertObject(manifest.window, "window");
   assertExactKeys(manifest.window, ["startInclusive", "endExclusive"], "window");
   const startMs = parseInstant(manifest.window.startInclusive, "window.startInclusive");
@@ -508,7 +564,6 @@ function validateLearningEvidenceHeader(manifest: LearningEvidenceManifest): voi
   const asOfMs = parseInstant(manifest.asOf, "asOf");
   if (startMs >= endMs) throw new Error("analysis window must have positive duration");
   if (asOfMs < startMs) throw new Error("asOf must not precede window.startInclusive");
-  assertCanonicalIdentity(manifest.techniqueId, "techniqueId");
 
   assertObject(manifest.hypothesisFamily, "hypothesisFamily");
   assertExactKeys(
@@ -584,38 +639,41 @@ function validateLearningEvidenceHeader(manifest: LearningEvidenceManifest): voi
 function validateExposure(
   observation: LearningObservation,
   expectedState: "exposed" | "control",
-  techniqueId: string,
+  techniqueContract: LearningTechniqueContract,
   field: string,
+  exposureIds: Set<string>,
 ): void {
   assertObject(observation.exposure, `${field}.exposure`);
-  assertExactKeys(
-    observation.exposure,
-    ["state", "techniqueId", "evidenceSource", "contentOrigin", "recordedAt"],
-    `${field}.exposure`,
-  );
-  assertOneOf(observation.exposure.state, ["exposed", "control"] as const, `${field}.exposure.state`);
-  if (observation.exposure.state !== expectedState) {
-    throw new Error(`${field} must carry an explicit ${expectedState} exposure record`);
+  const parsed = techniqueExposureFactSchema.safeParse(observation.exposure);
+  if (!parsed.success) {
+    throw new Error(`${field}.exposure must be a canonical explicit TechniqueExposureFact`);
   }
-  if (expectedState === "exposed") {
-    assertCanonicalIdentity(observation.exposure.techniqueId, `${field}.exposure.techniqueId`);
-    if (observation.exposure.techniqueId !== techniqueId) {
-      throw new Error(`${field} exposed technique does not match manifest.techniqueId`);
-    }
-  } else if (observation.exposure.techniqueId !== null) {
-    throw new Error(`${field} control must explicitly declare techniqueId null`);
+  if (canonicalLearningJson(parsed.data) !== canonicalLearningJson(observation.exposure)) {
+    throw new Error(`${field}.exposure must already use the canonical stored fact representation`);
   }
-  assertOneOf(
-    observation.exposure.evidenceSource,
-    ["operator_declared", "machine_receipt"] as const,
-    `${field}.exposure.evidenceSource`,
-  );
-  assertOneOf(
-    observation.exposure.contentOrigin,
-    ["operator", "machine_observation"] as const,
-    `${field}.exposure.contentOrigin`,
-  );
-  const recordedMs = parseInstant(observation.exposure.recordedAt, `${field}.exposure.recordedAt`);
+  const exposure = parsed.data;
+  const expectedMode = expectedState === "exposed" ? "treatment" : "control";
+  if (exposure.mode !== expectedMode) {
+    throw new Error(`${field} must carry an explicit ${expectedMode} exposure fact`);
+  }
+  if (exposureIds.has(exposure.exposureId)) {
+    throw new Error(`duplicate technique exposure id: ${exposure.exposureId}`);
+  }
+  exposureIds.add(exposure.exposureId);
+  if (
+    exposure.techniqueId !== techniqueContract.techniqueId ||
+    (exposure.techniqueVersion ?? null) !== techniqueContract.techniqueVersion ||
+    (exposure.contentDigest ?? null) !== techniqueContract.contentDigest
+  ) {
+    throw new Error(`${field}.exposure is incomparable with manifest.techniqueContract`);
+  }
+  if (exposure.workClass !== observation.cohort.workType) {
+    throw new Error(`${field}.exposure.workClass must match cohort.workType`);
+  }
+  if (exposure.complexityBand !== observation.cohort.complexityBand) {
+    throw new Error(`${field}.exposure.complexityBand must match cohort.complexityBand`);
+  }
+  const recordedMs = parseInstant(exposure.exposedAt, `${field}.exposure.exposedAt`);
   const startedMs = parseInstant(observation.workStartedAt, `${field}.workStartedAt`);
   if (recordedMs > startedMs) {
     throw new Error(`${field} exposure is retrospective; exposure must be explicit before work starts`);
@@ -628,6 +686,7 @@ function validateObservation(
   manifest: LearningEvidenceManifest,
   field: string,
   observationIds: Set<string>,
+  exposureIds: Set<string>,
 ): void {
   assertObject(observation, field);
   assertExactKeys(
@@ -651,11 +710,20 @@ function validateObservation(
   if (outcomeMs < startedMs || outcomeMs > asOfMs) {
     throw new Error(`${field}.outcomeObservedAt must be between work start and as-of`);
   }
-  validateExposure(observation, expectedState, manifest.techniqueId, field);
-
   assertObject(observation.cohort, `${field}.cohort`);
   assertExactKeys(observation.cohort, COHORT_KEYS, `${field}.cohort`);
-  for (const key of COHORT_KEYS) assertCanonicalIdentity(observation.cohort[key], `${field}.cohort.${key}`);
+  for (const key of COHORT_KEYS) {
+    if (key !== "workType" && key !== "complexityBand") {
+      assertCanonicalIdentity(observation.cohort[key], `${field}.cohort.${key}`);
+    }
+  }
+  if (!workClassSchema.safeParse(observation.cohort.workType).success) {
+    throw new Error(`${field}.cohort.workType has unsupported value`);
+  }
+  if (!workComplexityBandSchema.safeParse(observation.cohort.complexityBand).success) {
+    throw new Error(`${field}.cohort.complexityBand has unsupported value`);
+  }
+  validateExposure(observation, expectedState, manifest.techniqueContract, field, exposureIds);
 
   assertObject(observation.outcome, `${field}.outcome`);
   assertExactKeys(
@@ -724,9 +792,12 @@ function assertComparablePair(pair: LearningOutcomePair, field: string): void {
       throw new Error(`${field} has incomparable outcome ${key}`);
     }
   }
+  if (pair.exposed.exposure.assignmentId !== pair.control.exposure.assignmentId) {
+    throw new Error(`${field} has incomparable exposure assignmentId`);
+  }
 }
 
-/** Full validation is intentionally skipped on a trusted unchanged fingerprint. */
+/** Full closed-schema and row-identity validation always precedes no-op detection. */
 export function validateLearningEvidenceManifest(manifest: LearningEvidenceManifest): void {
   validateLearningEvidenceHeader(manifest);
   if (computeLearningPairDigest(manifest.pairs) !== manifest.source.rowDigest) {
@@ -734,6 +805,7 @@ export function validateLearningEvidenceManifest(manifest: LearningEvidenceManif
   }
   const pairIds = new Set<string>();
   const observationIds = new Set<string>();
+  const exposureIds = new Set<string>();
   for (const [index, pair] of manifest.pairs.entries()) {
     const field = `pairs[${index}]`;
     assertObject(pair, field);
@@ -741,8 +813,8 @@ export function validateLearningEvidenceManifest(manifest: LearningEvidenceManif
     assertCanonicalIdentity(pair.pairId, `${field}.pairId`);
     if (pairIds.has(pair.pairId)) throw new Error(`duplicate pair id: ${pair.pairId}`);
     pairIds.add(pair.pairId);
-    validateObservation(pair.exposed, "exposed", manifest, `${field}.exposed`, observationIds);
-    validateObservation(pair.control, "control", manifest, `${field}.control`, observationIds);
+    validateObservation(pair.exposed, "exposed", manifest, `${field}.exposed`, observationIds, exposureIds);
+    validateObservation(pair.control, "control", manifest, `${field}.control`, observationIds, exposureIds);
     assertComparablePair(pair, field);
   }
 }
@@ -1028,9 +1100,9 @@ export function compileLearningEvidencePacket(
     source: manifest.source,
     metricVersions: manifest.metricVersions,
     outcomeContract: manifest.outcomeContract,
+    techniqueContract: manifest.techniqueContract,
     window: manifest.window,
     asOf: manifest.asOf,
-    techniqueId: manifest.techniqueId,
     hypothesisFamily: {
       ...manifest.hypothesisFamily,
       adjustedAlpha: adjustedAlpha(manifest.hypothesisFamily),
