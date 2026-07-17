@@ -545,6 +545,17 @@ async function main() {
       ].map(() => "?").join(",")})`,
     ).get(...staleEnvelopeIds, nullRawId, deletedRawId, terminalRawId) as { n: number }
   ).n;
+  const statelessBodies: string[] = [];
+  const statelessUpload = await uploadBufferedEvents(metadataConfig, legacyBuffer, {
+    markUploaded: false,
+    fetchImpl: async (_input, init) => {
+      statelessBodies.push(String(init?.body ?? ""));
+      return new Response(JSON.stringify({ accepted: 1 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
   const deliveryStatus = legacyBuffer.delivery.status();
   legacyBuffer.close();
   legacyBuffer = new LocalEventBuffer(legacyLedger, {
@@ -592,6 +603,20 @@ async function main() {
   });
   const legacyOutboundSurfaces = [...legacyUploadBodies, ...historyBodies, ...historyLogs];
   record(
+    "canonical_presealed_metadata_envelope_cannot_override_linked_evidence_row",
+    staleReceipts.length === 2 &&
+      staleReceipts.every((receipt) => receipt?.reason === "local_evidence_quarantined") &&
+      evidenceRow.uploadedAt === null &&
+      legacyUploadBodies.length === 1 &&
+      legacyUploadBodies.every((body) => !hasPrivateTerm(body)),
+    {
+      duplicateDeliveries: staleReceipts.length,
+      receipts: staleReceipts.map((receipt) => receipt?.reason ?? null),
+      evidenceMarkedUploaded: evidenceRow.uploadedAt !== null,
+      wireCalls: legacyUploadBodies.length,
+    },
+  );
+  record(
     "legacy_evidence_rows_are_quarantined_and_never_uploaded",
     migration.quarantinedEvidence === 1 &&
       legacyUpload.uploadedEvents === 1 &&
@@ -602,6 +627,8 @@ async function main() {
       lineageReceipts[1]?.reason === "local_privacy_violation" &&
       lineageReceipts[2]?.reason === "local_evidence_quarantined" &&
       activeInvalidRows === 0 &&
+      statelessUpload.uploadedEvents === 0 &&
+      statelessBodies.length === 0 &&
       reopenUpload.uploadedEvents === 0 &&
       reopenUploadBodies.length === 0 &&
       reopenedInvalidRows === 0 &&
@@ -616,6 +643,7 @@ async function main() {
       staleEnvelopeReceipts: staleReceipts.map((receipt) => receipt?.reason ?? null),
       lineageReceipts: lineageReceipts.map((receipt) => receipt?.reason ?? null),
       activeInvalidRows,
+      statelessUploadCalls: statelessBodies.length,
       reopenedInvalidRows,
       reopenUploadCalls: reopenUploadBodies.length,
       uploadedMetadataRows: legacyUpload.uploadedEvents,

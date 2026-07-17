@@ -300,6 +300,18 @@ export class DeliveryOutbox {
     return this.enabled;
   }
 
+  isEvidenceQuarantined(rawId: string) {
+    return Boolean(
+      this.db
+        .prepare(
+          `select 1 as quarantined from upload_receipts
+           where delivery_id = ? and reason = 'local_evidence_quarantined'
+           limit 1`,
+        )
+        .get(ensureUuidEventId(rawId).id),
+    );
+  }
+
   private initializeSchema() {
     // Additive only: no query or index is built against the historical raw
     // ledger here. Large-ledger work happens solely in bounded migration slices.
