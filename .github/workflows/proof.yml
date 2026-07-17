@@ -40,6 +40,9 @@ jobs:
       - name: Prove shipped dashboard browser security
         run: pnpm proof:dashboard-security
 
+      - name: Prove paired attempts and explicit technique exposure
+        run: pnpm proof:learning-facts
+
       - name: Run signal-fidelity proof
         run: pnpm proof
 
@@ -51,6 +54,9 @@ jobs:
 
       - name: Prove transactional join and workspace isolation
         run: pnpm proof:join-isolation
+
+      - name: Prove immutable outcome timeline and bounded recovery
+        run: pnpm proof:outcome-timeline
 
       - name: Run strict isolated resource proof
         run: pnpm proof:resource --require-integrated --receipt evidence/resource-proof.json
