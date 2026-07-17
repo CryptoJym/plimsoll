@@ -223,6 +223,7 @@ async function main() {
   prove(
     "pagination_limit_is_explicit_incomplete_coverage",
     paginated.items.length === 2 &&
+      paginated.nextCursor === "page-3" &&
       paginated.coverage.status === "incomplete" &&
       paginated.coverage.reason === "pagination_limit",
     { coverage: paginated.coverage, pages: paginated.pages },
@@ -270,6 +271,7 @@ async function main() {
   let tokenObservedOnlyInRequest = false;
   let checkRunsRequestedAllAttempts = false;
   let providerReviewState = "APPROVED";
+  let forceCappedReworkPage = false;
   const mockFetch: typeof fetch = async (request, init) => {
     const url = String(request);
     const headers = new Headers(init?.headers);
@@ -350,6 +352,17 @@ async function main() {
       ]);
     }
     if (/\/commits\?sha=main/.test(url)) {
+      if (forceCappedReworkPage) {
+        return json(
+          Array.from({ length: 100 }, (_, index) => ({
+            sha: index.toString(16).padStart(40, "0"),
+            commit: {
+              message: `non-revert fixture ${index}`,
+              committer: { date: "2026-07-05T00:00:00.000Z" },
+            },
+          })),
+        );
+      }
       return json([
         {
           sha: "8888888888888888888888888888888888888888",
@@ -429,6 +442,45 @@ async function main() {
     },
   );
   transitionStore.close();
+  forceCappedReworkPage = true;
+  const cappedReworkAdapter = new GitHubRestOutcomeTimelineAdapter({
+    token: TOKEN_SENTINEL,
+    fetchImpl: mockFetch,
+    maxPagesPerEndpoint: 1,
+    now: () => "2026-07-30T00:00:00.000Z",
+  });
+  const cappedReworkCollection = await cappedReworkAdapter.collectRework({
+    owner: "fixture",
+    repo: "repo",
+    repositoryExternalId: "github:repository:fixture/repo",
+    watch: {
+      pull: {
+        number: 7,
+        pullExternalId: "github:pull:PR7",
+        updatedAt: "2026-07-09T00:00:00.000Z",
+      },
+      mergeSha: "6666666666666666666666666666666666666666",
+      mergedAt: "2026-07-04T00:00:00.000Z",
+      expiresAt: "2026-07-18T00:00:00.000Z",
+      lastCheckedThrough: "2026-07-04T00:00:00.000Z",
+      paginationCursor: null,
+    },
+    until: "2026-07-10T00:00:00.000Z",
+  });
+  prove(
+    "real_rework_adapter_marks_pagination_limit_retryable",
+    cappedReworkCollection.retryable &&
+      cappedReworkCollection.continuationCursor === "2" &&
+      cappedReworkCollection.coverage.length === 1 &&
+      cappedReworkCollection.coverage[0]?.status === "incomplete" &&
+      cappedReworkCollection.coverage[0]?.reason === "pagination_limit",
+    {
+      coverage: cappedReworkCollection.coverage,
+      retryable: cappedReworkCollection.retryable,
+      continuationCursor: cappedReworkCollection.continuationCursor,
+    },
+  );
+  forceCappedReworkPage = false;
 
   class RecoveryAdapter implements GitHubOutcomeTimelineAdapter {
     readonly cursors: Array<string | null> = [];
@@ -674,6 +726,11 @@ async function main() {
   class ReworkWatchAdapter implements GitHubOutcomeTimelineAdapter {
     listCalls = 0;
     collectReworkCalls = 0;
+    readonly reworkSpans: Array<{
+      lastCheckedThrough: string;
+      until: string;
+      paginationCursor: string | null;
+    }> = [];
     readonly mergeSha = "1212121212121212121212121212121212121212";
     readonly revertSha = "1313131313131313131313131313131313131313";
 
@@ -739,8 +796,32 @@ async function main() {
     async collectRework(input: {
       repositoryExternalId: string;
       watch: OutcomeReworkWatch;
+      until: string;
     }): Promise<PullCollection> {
       this.collectReworkCalls += 1;
+      this.reworkSpans.push({
+        lastCheckedThrough: input.watch.lastCheckedThrough,
+        until: input.until,
+        paginationCursor: input.watch.paginationCursor,
+      });
+      if (this.collectReworkCalls === 1) {
+        return {
+          facts: [],
+          coverage: [
+            {
+              dimension: "reverts",
+              status: "incomplete",
+              reason: "pagination_limit",
+              detail: "fixture revert is beyond the capped first provider page",
+            },
+          ],
+          rateReceipt: null,
+          // Adversarial injected adapter: the runner must derive retryability
+          // from incomplete coverage even if this boolean is wrong.
+          retryable: false,
+          continuationCursor: "11",
+        };
+      }
       return {
         facts: [
           {
@@ -796,30 +877,62 @@ async function main() {
     now: () => "2026-07-06T00:00:00.000Z",
   });
   const reworkState2 = reworkWatchStore.readState("github:repository:fixture/rework-watch")!;
+  const reworkWatchRun3 = await runOutcomeTimelineBackfill({
+    owner: "fixture",
+    repo: "rework-watch",
+    since: "2026-07-01T00:00:00.000Z",
+    until: "2026-07-06T00:00:00.000Z",
+    maxPulls: 1,
+    reworkWindowDays: 14,
+    store: reworkWatchStore,
+    adapter: reworkWatchAdapter,
+    requiredChecks: { names: ["ci"] },
+    runId: "rework-watch-3",
+    now: () => "2026-07-06T00:01:00.000Z",
+  });
+  const reworkState3 = reworkWatchStore.readState("github:repository:fixture/rework-watch")!;
   const watchedPull = derivePullOutcomeTimeline({
     facts: reworkWatchStore.facts(),
     requiredChecks: { names: ["ci"] },
     reworkWindowDays: 14,
   })[0]!;
   prove(
-    "persisted_rework_watch_captures_later_revert_for_unchanged_merged_pull",
+    "incomplete_rework_scan_retries_same_span_and_captures_revert_beyond_page_cap",
     reworkWatchRun1.reworkWatchRemaining === 1 &&
       reworkState1.reworkWatch[0]?.lastCheckedThrough === "2026-07-02T00:00:00.000Z" &&
-      reworkWatchRun2.processedReworkWatches === 1 &&
-      reworkWatchRun2.reworkWatchRemaining === 0 &&
-      reworkState2.reworkWatch.length === 0 &&
+      reworkWatchRun2.status === "incomplete" &&
+      reworkWatchRun2.processedReworkWatches === 0 &&
+      reworkWatchRun2.reworkWatchRemaining === 1 &&
+      reworkWatchRun2.completedThrough === "2026-07-02T00:00:00.000Z" &&
+      reworkState2.reworkWatch[0]?.lastCheckedThrough === "2026-07-02T00:00:00.000Z" &&
+      reworkState2.reworkWatch[0]?.paginationCursor === "11" &&
+      reworkState2.activeWindow?.until === "2026-07-06T00:00:00.000Z" &&
+      reworkWatchRun3.processedReworkWatches === 1 &&
+      reworkWatchRun3.reworkWatchRemaining === 0 &&
+      reworkWatchRun3.completedThrough === "2026-07-02T00:00:00.000Z" &&
+      reworkState3.reworkWatch.length === 0 &&
       reworkWatchAdapter.listCalls === 1 &&
-      reworkWatchAdapter.collectReworkCalls === 1 &&
+      reworkWatchAdapter.collectReworkCalls === 2 &&
+      reworkWatchAdapter.reworkSpans.length === 2 &&
+      reworkWatchAdapter.reworkSpans[0]?.lastCheckedThrough === "2026-07-02T00:00:00.000Z" &&
+      reworkWatchAdapter.reworkSpans[0]?.until === "2026-07-06T00:00:00.000Z" &&
+      reworkWatchAdapter.reworkSpans[0]?.paginationCursor === null &&
+      reworkWatchAdapter.reworkSpans[1]?.lastCheckedThrough === "2026-07-02T00:00:00.000Z" &&
+      reworkWatchAdapter.reworkSpans[1]?.until === "2026-07-06T00:00:00.000Z" &&
+      reworkWatchAdapter.reworkSpans[1]?.paginationCursor === "11" &&
       watchedPull.rework.length === 1 &&
       watchedPull.rework[0]?.at === "2026-07-04T00:00:00.000Z" &&
       watchedPull.rework[0]?.inWindow === true,
     {
       run1: reworkWatchRun1,
       run2: reworkWatchRun2,
+      run3: reworkWatchRun3,
       firstWatch: reworkState1.reworkWatch,
-      finalWatch: reworkState2.reworkWatch,
+      incompleteWatch: reworkState2.reworkWatch,
+      finalWatch: reworkState3.reworkWatch,
       listCalls: reworkWatchAdapter.listCalls,
       collectReworkCalls: reworkWatchAdapter.collectReworkCalls,
+      reworkSpans: reworkWatchAdapter.reworkSpans,
       rework: watchedPull.rework,
     },
   );

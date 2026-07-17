@@ -171,6 +171,7 @@ export const outcomeReworkWatchSchema = z
     mergedAt: timestampSchema,
     expiresAt: timestampSchema,
     lastCheckedThrough: timestampSchema,
+    paginationCursor: z.string().trim().min(1).nullable().default(null),
   })
   .strict();
 export type OutcomeReworkWatch = z.infer<typeof outcomeReworkWatchSchema>;

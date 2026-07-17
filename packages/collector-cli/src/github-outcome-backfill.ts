@@ -32,6 +32,7 @@ export type ProviderPage<T> = {
 export type CollectedPages<T> = {
   items: T[];
   pages: number;
+  nextCursor: string | null;
   etag: string | null;
   rateReceipt: GitHubRateReceipt | null;
   coverage: CoverageObservation;
@@ -54,10 +55,11 @@ export class GitHubTimelineProviderError extends Error {
 export async function collectProviderPages<T>(input: {
   dimension: CoverageObservation["dimension"];
   maxPages: number;
+  startCursor?: string | null;
   fetchPage: (cursor: string | null) => Promise<ProviderPage<T>>;
 }): Promise<CollectedPages<T>> {
   const items: T[] = [];
-  let cursor: string | null = null;
+  let cursor: string | null = input.startCursor ?? null;
   let etag: string | null = null;
   let rateReceipt: GitHubRateReceipt | null = null;
   let pages = 0;
@@ -72,6 +74,7 @@ export async function collectProviderPages<T>(input: {
         return {
           items,
           pages,
+          nextCursor: null,
           etag,
           rateReceipt,
           coverage: {
@@ -87,6 +90,7 @@ export async function collectProviderPages<T>(input: {
     return {
       items,
       pages,
+      nextCursor: cursor,
       etag,
       rateReceipt,
       coverage: {
@@ -102,6 +106,9 @@ export async function collectProviderPages<T>(input: {
     return {
       items,
       pages,
+      // Retry the page that failed; all earlier pages in this bounded slice
+      // were already retained as immutable facts.
+      nextCursor: cursor,
       etag,
       rateReceipt: error.rateReceipt ?? rateReceipt,
       coverage: {
@@ -124,6 +131,7 @@ export type PullCollection = {
   coverage: CoverageObservation[];
   rateReceipt: GitHubRateReceipt | null;
   retryable: boolean;
+  continuationCursor?: string | null;
 };
 
 export interface GitHubOutcomeTimelineAdapter {
@@ -343,10 +351,12 @@ export class GitHubRestOutcomeTimelineAdapter implements GitHubOutcomeTimelineAd
     url: (page: number) => string;
     dimension: CoverageObservation["dimension"];
     itemKey?: string;
+    startCursor?: string | null;
   }): Promise<CollectedPages<Record<string, unknown>>> {
     return collectProviderPages({
       dimension: input.dimension,
       maxPages: this.maxPagesPerEndpoint,
+      startCursor: input.startCursor,
       fetchPage: async (cursor) => {
         const page = Number(cursor ?? "1");
         const response = await this.json(input.url(page), input.dimension);
@@ -699,6 +709,7 @@ export class GitHubRestOutcomeTimelineAdapter implements GitHubOutcomeTimelineAd
       url: (page) =>
         `${base}/commits?sha=${branch}&since=${encodeURIComponent(input.watch.lastCheckedThrough)}&until=${encodeURIComponent(input.until)}&per_page=100&page=${page}`,
       dimension: "reverts",
+      startCursor: input.watch.paginationCursor,
     });
     const facts: PullTimelineFact[] = [];
     for (const row of pages.items) {
@@ -730,7 +741,10 @@ export class GitHubRestOutcomeTimelineAdapter implements GitHubOutcomeTimelineAd
       facts,
       coverage: [pages.coverage],
       rateReceipt: pages.rateReceipt ?? rateReceipt,
-      retryable: pages.retryable,
+      // A page cap leaves an uncovered suffix in the watched interval. Keep
+      // the durable checkpoint fixed so a later run rescans the same span.
+      retryable: pages.retryable || pages.coverage.status !== "complete",
+      continuationCursor: pages.nextCursor,
     };
   }
 }
@@ -876,6 +890,7 @@ export async function runOutcomeTimelineBackfill(input: {
           mergedAt: merge.mergedAt,
           expiresAt,
           lastCheckedThrough: checkedThrough,
+          paginationCursor: null,
         });
       }
     }
@@ -968,16 +983,30 @@ export async function runOutcomeTimelineBackfill(input: {
       coverageRow(observation, watch.pull.pullExternalId),
     );
     runCoverage.push(...rows);
+    // Enforce retryability at the runner boundary too. Injected adapters and
+    // future providers must not advance a durable watch checkpoint while any
+    // part of the requested rework interval remains uncovered.
+    const reworkRetryable =
+      collection.retryable || collection.coverage.some((observation) => observation.status !== "complete");
     const revertFound = collection.facts.some(
       (fact) => fact.kind === "revert" && fact.revertedSha === watch.mergeSha,
     );
     const reworkWatch = [...state.reworkWatch];
-    if (!collection.retryable) {
+    if (!reworkRetryable) {
       if (revertFound || watchUntil >= watch.expiresAt) {
         reworkWatch.splice(watchIndex, 1);
       } else {
-        reworkWatch[watchIndex] = { ...watch, lastCheckedThrough: watchUntil };
+        reworkWatch[watchIndex] = {
+          ...watch,
+          lastCheckedThrough: watchUntil,
+          paginationCursor: null,
+        };
       }
+    } else if (collection.continuationCursor !== undefined) {
+      reworkWatch[watchIndex] = {
+        ...watch,
+        paginationCursor: collection.continuationCursor,
+      };
     }
     const nextState: OutcomeTimelineBackfillState = {
       ...state,
@@ -993,7 +1022,7 @@ export async function runOutcomeTimelineBackfill(input: {
     state = nextState;
     insertedFacts += appended.inserted;
     duplicateFacts += appended.duplicates;
-    if (collection.retryable) {
+    if (reworkRetryable) {
       stoppedForRetry = true;
     } else {
       processedPulls += 1;
