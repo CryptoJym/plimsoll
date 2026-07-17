@@ -69,6 +69,13 @@
       "blockedBy": [],
       "detail": "Search database, upload body, logs, and receipt for raw-content sentinels after the integrated path runs.",
       "requiredCounters": ["eventsObserved", "eventsAdmitted", "eventsDropped"]
+    },
+    {
+      "id": "learning_fact_privacy_and_resource_bounds",
+      "issue": 100,
+      "blockedBy": [],
+      "detail": "Prove paired attempt facts, explicit-only technique exposure, indexed bounded storage, and zero private sentinel persistence or upload without background scans.",
+      "requiredCounters": ["learningFactRowsWritten"]
     }
   ]
 }

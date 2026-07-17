@@ -490,6 +490,353 @@ export const toolActionEventSchema = z
   .strict();
 export type ToolActionEvent = z.infer<typeof toolActionEventSchema>;
 
+/**
+ * Learning facts are deliberately low-cardinality and metadata-only. Tool
+ * names are canonical categories rather than provider function names, and
+ * error categories never carry messages, stacks, commands, arguments, or
+ * paths. The collector hashes source operation keys before these schemas see
+ * them.
+ */
+const learningFactIdSchema = z
+  .string()
+  .trim()
+  .regex(
+    /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    "Expected a deterministic UUIDv5-shaped fact id.",
+  )
+  .transform((value) => value.toLowerCase());
+
+const learningDimensionIdSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(96)
+  .regex(
+    /^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/,
+    "Expected a bounded metadata identifier without whitespace, path, email, or content characters.",
+  )
+  .refine(
+    (value) =>
+      !/^(?:sk_(?:live|test)|sk-|ghp|github_pat|xox)[a-z0-9._:-]*/i.test(value) &&
+      !/^(?:bearer|basic)[._:-]/i.test(value),
+    "Secret-shaped identifiers are not allowed in learning facts.",
+  );
+
+/**
+ * Exposure identity fields are metric dimensions, so aliases are rejected at
+ * the boundary instead of being silently trimmed, Unicode-normalized, or
+ * case-folded. This keeps one accepted spelling for every hashed identity.
+ */
+const canonicalExposureDimensionIdSchema = z
+  .string()
+  .min(1)
+  .max(96)
+  .refine((value) => value === value.trim().normalize("NFKC"), {
+    message: "Exposure identity must already be trimmed and NFKC-canonical.",
+  })
+  .regex(
+    /^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/,
+    "Expected a bounded canonical metadata identifier.",
+  )
+  .refine(
+    (value) =>
+      !/^(?:sk_(?:live|test)|sk-|ghp|github_pat|xox)[a-z0-9._:-]*/i.test(value) &&
+      !/^(?:bearer|basic)[._:-]/i.test(value),
+    "Secret-shaped identifiers are not allowed in learning facts.",
+  );
+
+const canonicalExposureVersionSchema = z
+  .string()
+  .min(1)
+  .max(64)
+  .refine((value) => value === value.trim().normalize("NFKC"), {
+    message: "Exposure version must already be trimmed and NFKC-canonical.",
+  })
+  .regex(
+    /^[a-zA-Z0-9][a-zA-Z0-9._+-]*$/,
+    "Expected a bounded canonical version identifier.",
+  )
+  .refine(
+    (value) => !/^(?:sk_(?:live|test)|sk-|ghp|github_pat|xox)/i.test(value),
+    "Secret-shaped versions are not allowed in learning facts.",
+  );
+
+const canonicalExposureFactIdSchema = z.string().regex(
+  /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  "Expected an already-canonical lowercase deterministic fact id.",
+);
+
+const canonicalExposureDigestSchema = z.string().regex(
+  /^sha256:[a-f0-9]{64}$/,
+  "Expected an already-canonical lowercase sha256 digest.",
+);
+
+const canonicalExposureTimestampSchema = timestampSchema.transform((value) =>
+  new Date(value).toISOString(),
+);
+
+export const toolFactClassSchema = z.enum([
+  "compute",
+  "local_io",
+  "network",
+  "coordination",
+  "other",
+]);
+export type ToolFactClass = z.infer<typeof toolFactClassSchema>;
+
+export const toolFactNameSchema = z.enum([
+  "continue",
+  "validate",
+  "test",
+  "edit",
+  "read",
+  "write",
+  "shell",
+  "mcp",
+  "browser",
+  "review",
+  "other",
+]);
+export type ToolFactName = z.infer<typeof toolFactNameSchema>;
+
+export const toolAttemptResultStatusSchema = z.enum(["success", "failure", "unknown"]);
+export type ToolAttemptResultStatus = z.infer<typeof toolAttemptResultStatusSchema>;
+
+export const toolAttemptErrorCategorySchema = z.enum([
+  "none",
+  "auth",
+  "rate_limit",
+  "timeout",
+  "network",
+  "validation",
+  "not_found",
+  "conflict",
+  "provider",
+  "tool",
+  "unknown",
+]);
+export type ToolAttemptErrorCategory = z.infer<typeof toolAttemptErrorCategorySchema>;
+
+const toolAttemptIdentitySchema = z.object({
+  operationId: learningFactIdSchema,
+  source: toolSourceSchema,
+  sessionId: learningDimensionIdSchema,
+  episodeId: learningFactIdSchema.optional(),
+  toolClass: toolFactClassSchema,
+  toolName: toolFactNameSchema,
+});
+
+export const toolAttemptStartSignalSchema = toolAttemptIdentitySchema
+  .extend({
+    kind: z.literal("attempt"),
+    startedAt: timestampSchema,
+    retryOf: learningFactIdSchema.optional(),
+  })
+  .strict()
+  .refine((signal) => signal.retryOf !== signal.operationId, {
+    message: "An attempt cannot retry itself.",
+    path: ["retryOf"],
+  });
+export type ToolAttemptStartSignal = z.infer<typeof toolAttemptStartSignalSchema>;
+
+export const toolAttemptResultSignalSchema = z
+  .object({
+    kind: z.literal("result"),
+    operationId: learningFactIdSchema,
+    source: toolSourceSchema,
+    sessionId: learningDimensionIdSchema,
+    endedAt: timestampSchema,
+    resultStatus: toolAttemptResultStatusSchema.default("unknown"),
+    errorCategory: toolAttemptErrorCategorySchema.optional(),
+  })
+  .strict()
+  .superRefine((signal, context) => {
+    if (
+      signal.resultStatus === "success" &&
+      signal.errorCategory &&
+      signal.errorCategory !== "none"
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Successful attempts cannot carry an error category.",
+        path: ["errorCategory"],
+      });
+    }
+    if (signal.resultStatus === "failure" && signal.errorCategory === "none") {
+      context.addIssue({
+        code: "custom",
+        message: "Failed attempts cannot use the none error category.",
+        path: ["errorCategory"],
+      });
+    }
+    if (
+      signal.resultStatus === "unknown" &&
+      signal.errorCategory &&
+      signal.errorCategory !== "unknown"
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Unknown results cannot assert a specific error category.",
+        path: ["errorCategory"],
+      });
+    }
+  });
+export type ToolAttemptResultSignal = z.infer<typeof toolAttemptResultSignalSchema>;
+
+export const toolAttemptSignalSchema = z.union([
+  toolAttemptStartSignalSchema,
+  toolAttemptResultSignalSchema,
+]);
+export type ToolAttemptSignal = z.infer<typeof toolAttemptSignalSchema>;
+
+export const toolAttemptFactSchema = toolAttemptIdentitySchema
+  .extend({
+    startedAt: timestampSchema,
+    endedAt: timestampSchema.optional(),
+    durationMs: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(7 * 24 * 60 * 60 * 1_000)
+      .optional(),
+    resultStatus: toolAttemptResultStatusSchema,
+    errorCategory: toolAttemptErrorCategorySchema,
+    retryOf: learningFactIdSchema.optional(),
+  })
+  .strict()
+  .superRefine((fact, context) => {
+    const startedMs = Date.parse(fact.startedAt);
+    const endedMs = fact.endedAt ? Date.parse(fact.endedAt) : undefined;
+    if (endedMs !== undefined && endedMs < startedMs) {
+      context.addIssue({
+        code: "custom",
+        message: "Attempt endedAt must not precede startedAt.",
+        path: ["endedAt"],
+      });
+    }
+    if ((fact.endedAt === undefined) !== (fact.durationMs === undefined)) {
+      context.addIssue({
+        code: "custom",
+        message: "Attempt endedAt and durationMs must be present together.",
+        path: ["durationMs"],
+      });
+    }
+    if (
+      endedMs !== undefined &&
+      fact.durationMs !== undefined &&
+      fact.durationMs !== endedMs - startedMs
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Attempt durationMs must be derived exactly from its timestamps.",
+        path: ["durationMs"],
+      });
+    }
+    if (fact.resultStatus !== "unknown" && fact.endedAt === undefined) {
+      context.addIssue({
+        code: "custom",
+        message: "Known results require an end timestamp.",
+        path: ["endedAt"],
+      });
+    }
+    if (fact.retryOf === fact.operationId) {
+      context.addIssue({
+        code: "custom",
+        message: "An attempt cannot retry itself.",
+        path: ["retryOf"],
+      });
+    }
+  });
+export type ToolAttemptFact = z.infer<typeof toolAttemptFactSchema>;
+
+export const workClassSchema = z.enum([
+  "implementation",
+  "debugging",
+  "review",
+  "research",
+  "operations",
+  "other",
+]);
+export type WorkClass = z.infer<typeof workClassSchema>;
+
+export const workComplexityBandSchema = z.enum(["low", "medium", "high", "unknown"]);
+export type WorkComplexityBand = z.infer<typeof workComplexityBandSchema>;
+
+export const workEpisodeFactSchema = z
+  .object({
+    episodeId: learningFactIdSchema,
+    source: toolSourceSchema,
+    sessionId: learningDimensionIdSchema,
+    workClass: workClassSchema,
+    complexityBand: workComplexityBandSchema,
+    startedAt: timestampSchema,
+    endedAt: timestampSchema.optional(),
+    durationMs: z
+      .number()
+      .int()
+      .nonnegative()
+      .max(30 * 24 * 60 * 60 * 1_000)
+      .optional(),
+  })
+  .strict()
+  .superRefine((fact, context) => {
+    const startedMs = Date.parse(fact.startedAt);
+    const endedMs = fact.endedAt ? Date.parse(fact.endedAt) : undefined;
+    if (endedMs !== undefined && endedMs < startedMs) {
+      context.addIssue({
+        code: "custom",
+        message: "Episode endedAt must not precede startedAt.",
+        path: ["endedAt"],
+      });
+    }
+    if ((fact.endedAt === undefined) !== (fact.durationMs === undefined)) {
+      context.addIssue({
+        code: "custom",
+        message: "Episode endedAt and durationMs must be present together.",
+        path: ["durationMs"],
+      });
+    }
+    if (
+      endedMs !== undefined &&
+      fact.durationMs !== undefined &&
+      fact.durationMs !== endedMs - startedMs
+    ) {
+      context.addIssue({
+        code: "custom",
+        message: "Episode durationMs must be derived exactly from its timestamps.",
+        path: ["durationMs"],
+      });
+    }
+  });
+export type WorkEpisodeFact = z.infer<typeof workEpisodeFactSchema>;
+
+export const techniqueExposureInputSchema = z
+  .object({
+    episodeId: canonicalExposureFactIdSchema,
+    techniqueId: canonicalExposureDimensionIdSchema,
+    techniqueVersion: canonicalExposureVersionSchema.optional(),
+    contentDigest: canonicalExposureDigestSchema.optional(),
+    assignmentId: canonicalExposureDimensionIdSchema,
+    workClass: workClassSchema,
+    complexityBand: workComplexityBandSchema,
+    exposedAt: canonicalExposureTimestampSchema,
+    mode: z.enum(["control", "treatment"]),
+  })
+  .strict()
+  .refine((fact) => Boolean(fact.techniqueVersion || fact.contentDigest), {
+    message: "Technique exposure requires a version or content digest.",
+    path: ["techniqueVersion"],
+  });
+export type TechniqueExposureInput = z.infer<typeof techniqueExposureInputSchema>;
+
+export const techniqueExposureFactSchema = techniqueExposureInputSchema
+  .safeExtend({
+    exposureId: canonicalExposureFactIdSchema,
+    assertion: z.literal("exposure_only"),
+  })
+  .strict();
+export type TechniqueExposureFact = z.infer<typeof techniqueExposureFactSchema>;
+
 export const workArtifactSchema = z.object({
   id: idSchema,
   tenantId: idSchema.optional(),
