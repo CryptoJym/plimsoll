@@ -5,6 +5,7 @@ import type Database from "better-sqlite3";
 import {
   aiInteractionEventSchema,
   techniqueExposureFactSchema,
+  techniqueExposureInputSchema,
   toolAttemptFactSchema,
   toolAttemptResultSignalSchema,
   toolAttemptStartSignalSchema,
@@ -216,18 +217,19 @@ export function buildTechniqueExposureFact(input: {
   exposedAt: string;
   mode: "control" | "treatment";
 }): TechniqueExposureFact {
+  const canonical = techniqueExposureInputSchema.parse(input);
   const exposureId = deterministicLearningFactId([
     "technique-exposure-v1",
-    input.episodeId,
-    input.techniqueId,
-    input.techniqueVersion ?? "",
-    input.contentDigest ?? "",
-    input.assignmentId,
-    input.exposedAt,
-    input.mode,
+    canonical.episodeId,
+    canonical.techniqueId,
+    canonical.techniqueVersion ?? "",
+    canonical.contentDigest ?? "",
+    canonical.assignmentId,
+    canonical.exposedAt,
+    canonical.mode,
   ]);
   return techniqueExposureFactSchema.parse({
-    ...input,
+    ...canonical,
     exposureId,
     assertion: "exposure_only",
   });
@@ -409,12 +411,28 @@ export class LearningFactStore {
         if (start.episodeId) {
           const episode = this.db
             .prepare(
-              `select source, session_id as sessionId from work_episode_facts where episode_id = ?`,
+              `select source, session_id as sessionId, started_at as startedAt,
+                 ended_at as endedAt
+               from work_episode_facts where episode_id = ?`,
             )
-            .get(start.episodeId) as { source: ToolSource; sessionId: string } | undefined;
+            .get(start.episodeId) as {
+              source: ToolSource;
+              sessionId: string;
+              startedAt: string;
+              endedAt: string | null;
+            } | undefined;
           if (!episode) throw new Error("ToolAttemptEpisodeMissing");
           if (episode.source !== start.source || episode.sessionId !== start.sessionId) {
             throw new Error("ToolAttemptEpisodeIdentityConflict");
+          }
+          if (Date.parse(start.startedAt) < Date.parse(episode.startedAt)) {
+            throw new Error("ToolAttemptPrecedesEpisodeStart");
+          }
+          if (
+            episode.endedAt !== null &&
+            Date.parse(start.startedAt) > Date.parse(episode.endedAt)
+          ) {
+            throw new Error("ToolAttemptStartsAfterEpisodeEnd");
           }
         }
         if (start.retryOf) {
@@ -469,6 +487,7 @@ export class LearningFactStore {
         throw new Error("ToolAttemptResultIdentityConflict");
       }
       const durationMs = Date.parse(result.endedAt) - Date.parse(current.startedAt);
+      if (durationMs < 0) throw new Error("ToolAttemptResultPrecedesStart");
       const resultStatus = result.resultStatus;
       const errorCategory =
         resultStatus === "success"
@@ -476,6 +495,20 @@ export class LearningFactStore {
           : resultStatus === "failure"
             ? result.errorCategory ?? "unknown"
             : "unknown";
+      if (current.episodeId && resultStatus !== "unknown") {
+        const episode = this.db
+          .prepare(
+            `select ended_at as endedAt from work_episode_facts where episode_id = ?`,
+          )
+          .get(current.episodeId) as { endedAt: string | null } | undefined;
+        if (!episode) throw new Error("ToolAttemptEpisodeMissing");
+        if (
+          episode.endedAt !== null &&
+          Date.parse(result.endedAt) > Date.parse(episode.endedAt)
+        ) {
+          throw new Error("ToolAttemptTerminalAfterEpisodeEnd");
+        }
+      }
       const completed = toolAttemptFactSchema.parse({
         ...current,
         endedAt: result.endedAt,

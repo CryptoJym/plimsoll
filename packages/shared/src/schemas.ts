@@ -522,16 +522,54 @@ const learningDimensionIdSchema = z
     "Secret-shaped identifiers are not allowed in learning facts.",
   );
 
-const learningVersionSchema = z
+/**
+ * Exposure identity fields are metric dimensions, so aliases are rejected at
+ * the boundary instead of being silently trimmed, Unicode-normalized, or
+ * case-folded. This keeps one accepted spelling for every hashed identity.
+ */
+const canonicalExposureDimensionIdSchema = z
   .string()
-  .trim()
+  .min(1)
+  .max(96)
+  .refine((value) => value === value.trim().normalize("NFKC"), {
+    message: "Exposure identity must already be trimmed and NFKC-canonical.",
+  })
+  .regex(
+    /^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/,
+    "Expected a bounded canonical metadata identifier.",
+  )
+  .refine(
+    (value) =>
+      !/^(?:sk_(?:live|test)|sk-|ghp|github_pat|xox)[a-z0-9._:-]*/i.test(value) &&
+      !/^(?:bearer|basic)[._:-]/i.test(value),
+    "Secret-shaped identifiers are not allowed in learning facts.",
+  );
+
+const canonicalExposureVersionSchema = z
+  .string()
   .min(1)
   .max(64)
-  .regex(/^[a-zA-Z0-9][a-zA-Z0-9._+-]*$/, "Expected a bounded version identifier.")
+  .refine((value) => value === value.trim().normalize("NFKC"), {
+    message: "Exposure version must already be trimmed and NFKC-canonical.",
+  })
+  .regex(
+    /^[a-zA-Z0-9][a-zA-Z0-9._+-]*$/,
+    "Expected a bounded canonical version identifier.",
+  )
   .refine(
     (value) => !/^(?:sk_(?:live|test)|sk-|ghp|github_pat|xox)/i.test(value),
     "Secret-shaped versions are not allowed in learning facts.",
   );
+
+const canonicalExposureFactIdSchema = z.string().regex(
+  /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+  "Expected an already-canonical lowercase deterministic fact id.",
+);
+
+const canonicalExposureDigestSchema = z.string().regex(
+  /^sha256:[a-f0-9]{64}$/,
+  "Expected an already-canonical lowercase sha256 digest.",
+);
 
 export const toolFactClassSchema = z.enum([
   "compute",
@@ -768,25 +806,31 @@ export const workEpisodeFactSchema = z
   });
 export type WorkEpisodeFact = z.infer<typeof workEpisodeFactSchema>;
 
-export const techniqueExposureFactSchema = z
+export const techniqueExposureInputSchema = z
   .object({
-    exposureId: learningFactIdSchema,
-    episodeId: learningFactIdSchema,
-    techniqueId: learningDimensionIdSchema,
-    techniqueVersion: learningVersionSchema.optional(),
-    contentDigest: canonicalLinkageSchema.optional(),
-    assignmentId: learningDimensionIdSchema,
+    episodeId: canonicalExposureFactIdSchema,
+    techniqueId: canonicalExposureDimensionIdSchema,
+    techniqueVersion: canonicalExposureVersionSchema.optional(),
+    contentDigest: canonicalExposureDigestSchema.optional(),
+    assignmentId: canonicalExposureDimensionIdSchema,
     workClass: workClassSchema,
     complexityBand: workComplexityBandSchema,
     exposedAt: timestampSchema,
     mode: z.enum(["control", "treatment"]),
-    assertion: z.literal("exposure_only"),
   })
   .strict()
   .refine((fact) => Boolean(fact.techniqueVersion || fact.contentDigest), {
     message: "Technique exposure requires a version or content digest.",
     path: ["techniqueVersion"],
   });
+export type TechniqueExposureInput = z.infer<typeof techniqueExposureInputSchema>;
+
+export const techniqueExposureFactSchema = techniqueExposureInputSchema
+  .safeExtend({
+    exposureId: canonicalExposureFactIdSchema,
+    assertion: z.literal("exposure_only"),
+  })
+  .strict();
 export type TechniqueExposureFact = z.infer<typeof techniqueExposureFactSchema>;
 
 export const workArtifactSchema = z.object({

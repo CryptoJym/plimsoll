@@ -284,13 +284,142 @@ async function main() {
       detail: { attemptCountUnchanged: store.attempts().length === 4 },
     });
 
+    proofStage = "episode_time_boundaries";
+    const preEpisodeStart = adaptToolInteractionEvent({
+      event: event({
+        id: "00000000-0000-5000-9000-000000000303",
+        type: "tool_use",
+        observedAt: "2026-07-17T11:59:59.999Z",
+      }),
+      sourceOperationKey: "pre-episode-start",
+      episodeId: episode.episodeId,
+    });
+    assert.throws(
+      () => store.recordToolSignal(preEpisodeStart),
+      /ToolAttemptPrecedesEpisodeStart/,
+    );
+    check(
+      "attempt_cannot_precede_episode_start_and_start_equality_is_allowed",
+      store.attempts().length === 4 && attempts[0].startedAt === episode.startedAt,
+      { rejectedBeforeStart: true, startBoundaryAccepted: true },
+    );
+    const afterEpisodeEnd = adaptToolInteractionEvent({
+      event: event({
+        id: "00000000-0000-5000-9000-000000000310",
+        type: "tool_use",
+        observedAt: "2026-07-17T12:01:00.001Z",
+      }),
+      sourceOperationKey: "start-after-episode-end",
+      episodeId: episode.episodeId,
+    });
+    assert.throws(
+      () => store.recordToolSignal(afterEpisodeEnd),
+      /ToolAttemptStartsAfterEpisodeEnd/,
+    );
+    check(
+      "attempt_cannot_start_after_closed_episode",
+      store.attempts().length === 4,
+      { rejectedAfterEnd: true },
+    );
+
+    const resultBeforeStart = adaptToolInteractionEvent({
+      event: event({
+        id: "00000000-0000-5000-9000-000000000304",
+        type: "tool_use",
+        observedAt: "2026-07-17T12:00:40.000Z",
+      }),
+      sourceOperationKey: "result-before-start",
+      episodeId: episode.episodeId,
+    });
+    store.recordToolSignal(resultBeforeStart);
+    const earlyResult = adaptToolInteractionEvent({
+      event: event({
+        id: "00000000-0000-5000-9000-000000000305",
+        type: "tool_result",
+        observedAt: "2026-07-17T12:00:39.999Z",
+      }),
+      sourceOperationKey: "result-before-start",
+      resultStatus: "failure",
+      errorCategory: "timeout",
+    });
+    assert.throws(
+      () => store.recordToolSignal(earlyResult),
+      /ToolAttemptResultPrecedesStart/,
+    );
+    check(
+      "result_cannot_precede_attempt_start",
+      store.attempts().find((row) => row.operationId === resultBeforeStart.operationId)
+        ?.resultStatus === "unknown",
+      { rejectedBeforeAttemptStart: true },
+    );
+
+    const resultAfterEpisode = adaptToolInteractionEvent({
+      event: event({
+        id: "00000000-0000-5000-9000-000000000306",
+        type: "tool_use",
+        observedAt: "2026-07-17T12:00:50.000Z",
+      }),
+      sourceOperationKey: "terminal-after-episode",
+      episodeId: episode.episodeId,
+    });
+    store.recordToolSignal(resultAfterEpisode);
+    const lateTerminal = adaptToolInteractionEvent({
+      event: event({
+        id: "00000000-0000-5000-9000-000000000307",
+        type: "tool_result",
+        observedAt: "2026-07-17T12:01:00.001Z",
+      }),
+      sourceOperationKey: "terminal-after-episode",
+      resultStatus: "failure",
+      errorCategory: "timeout",
+    });
+    assert.throws(
+      () => store.recordToolSignal(lateTerminal),
+      /ToolAttemptTerminalAfterEpisodeEnd/,
+    );
+    check(
+      "known_terminal_result_cannot_follow_closed_episode",
+      store.attempts().find((row) => row.operationId === resultAfterEpisode.operationId)
+        ?.resultStatus === "unknown",
+      { rejectedAfterEpisodeEnd: true },
+    );
+
+    const exactEndBoundary = adaptToolInteractionEvent({
+      event: event({
+        id: "00000000-0000-5000-9000-000000000308",
+        type: "tool_use",
+        observedAt: episode.endedAt!,
+      }),
+      sourceOperationKey: "exact-end-boundary",
+      episodeId: episode.episodeId,
+    });
+    store.recordToolSignal(exactEndBoundary);
+    const zeroDurationTerminal = adaptToolInteractionEvent({
+      event: event({
+        id: "00000000-0000-5000-9000-000000000309",
+        type: "tool_result",
+        observedAt: episode.endedAt!,
+      }),
+      sourceOperationKey: "exact-end-boundary",
+      resultStatus: "success",
+    });
+    store.recordToolSignal(zeroDurationTerminal);
+    const boundaryFact = store.attempts().find(
+      (row) => row.operationId === exactEndBoundary.operationId,
+    );
+    check(
+      "episode_end_and_attempt_result_equality_are_inclusive",
+      boundaryFact?.resultStatus === "success" && boundaryFact.durationMs === 0,
+      { terminalAtEpisodeEnd: true, zeroDurationAccepted: true },
+    );
+
     check(
       "technique_absence_is_not_inferred_from_attempt_mix",
       store.exposures().length === 0,
       { exposuresBeforeExplicitWrite: store.exposures().length },
     );
     proofStage = "exposure";
-    const exposure = buildTechniqueExposureFact({
+    const canonicalExposureInput = {
       episodeId: episode.episodeId,
       techniqueId: "bounded-retry-playbook",
       techniqueVersion: "1.2.0",
@@ -300,10 +429,22 @@ async function main() {
       complexityBand: "medium",
       exposedAt: "2026-07-17T12:00:02.000Z",
       mode: "treatment",
-    });
+    } as const;
+    const exposure = buildTechniqueExposureFact(canonicalExposureInput);
     store.recordTechniqueExposure(exposure, {
       outcomeObservedAt: "2026-07-17T12:00:20.000Z",
     });
+    const repeatedExposure = buildTechniqueExposureFact(canonicalExposureInput);
+    const repeatedWrite = store.recordTechniqueExposure(repeatedExposure, {
+      outcomeObservedAt: "2026-07-17T12:00:20.000Z",
+    });
+    check(
+      "canonical_exposure_identity_is_deterministic_and_deduplicated",
+      repeatedExposure.exposureId === exposure.exposureId &&
+        repeatedWrite.inserted === false &&
+        store.exposures().length === 1,
+      { exposureRows: store.exposures().length },
+    );
     check(
       "explicit_exposure_asserts_exposure_only",
       store.exposures().length === 1 &&
@@ -311,12 +452,42 @@ async function main() {
         !("effectiveness" in store.exposures()[0]),
       { explicitExposures: store.exposures().length },
     );
+    const exposureInputAliases = [
+      { ...canonicalExposureInput, techniqueId: ` ${exposure.techniqueId}` },
+      { ...canonicalExposureInput, techniqueVersion: `${exposure.techniqueVersion} ` },
+      { ...canonicalExposureInput, assignmentId: `${exposure.assignmentId} ` },
+      { ...canonicalExposureInput, contentDigest: exposure.contentDigest!.toUpperCase() },
+      { ...canonicalExposureInput, contentDigest: ` ${exposure.contentDigest}` },
+    ];
+    for (const alias of exposureInputAliases) {
+      assert.throws(() => buildTechniqueExposureFact(alias));
+    }
+    assert.throws(() =>
+      store.recordTechniqueExposure({
+        ...exposure,
+        contentDigest: exposure.contentDigest!.toUpperCase(),
+      }),
+    );
+    check(
+      "noncanonical_exposure_identity_aliases_are_rejected",
+      store.exposures().length === 1,
+      {
+        rejectedAliases: exposureInputAliases.length + 1,
+        exposureRows: store.exposures().length,
+      },
+    );
 
     proofStage = "retrospective";
     const retrospective = buildTechniqueExposureFact({
-      ...exposure,
+      episodeId: episode.episodeId,
+      techniqueId: exposure.techniqueId,
+      techniqueVersion: exposure.techniqueVersion,
+      contentDigest: exposure.contentDigest,
       assignmentId: "intervention-100-late",
+      workClass: exposure.workClass,
+      complexityBand: exposure.complexityBand,
       exposedAt: "2026-07-17T12:00:40.000Z",
+      mode: exposure.mode,
     });
     assert.throws(
       () => store.recordTechniqueExposure(retrospective, {
@@ -441,6 +612,8 @@ async function main() {
       liveLeaks === 0,
       { sentinels: privateTerms.length, liveLeaks, surfaces: 2 + openFiles.length },
     );
+    const learningFactRowsWritten =
+      store.attempts().length + store.episodes().length + store.exposures().length;
     buffer.close();
     buffer = undefined;
     const closedLeaks = leakCount(uploadBodies, fileSurfaces(ledger));
@@ -462,7 +635,7 @@ async function main() {
       privacySentinels: privateTerms.length,
       privacyLeaks: liveLeaks + closedLeaks,
       uploadedFactRows: 0,
-      learningFactRowsWritten: 6,
+      learningFactRowsWritten,
       nodeMajor: Number(process.versions.node.split(".")[0]),
     };
     process.stdout.write(`${JSON.stringify({
