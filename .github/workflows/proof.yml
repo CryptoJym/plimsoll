@@ -25,6 +25,9 @@ jobs:
       - name: Typecheck
         run: pnpm exec tsc --noEmit
 
+      - name: Prove source installer and read-only doctor
+        run: pnpm proof:install-doctor
+
       - name: Run signal-fidelity proof
         run: pnpm proof
 

@@ -10,7 +10,7 @@
   },
   "packageManager": "pnpm@10.25.0",
   "engines": {
-    "node": ">=20"
+    "node": ">=20 <25"
   },
   "scripts": {
     "collector": "tsx packages/collector-cli/src/cli.ts",
@@ -22,6 +22,7 @@
     "proof:resource-finalization": "tsx scripts/resource-proof/finalization-proof.ts",
     "proof:dashboard": "tsx scripts/dashboard-projection-proof.ts",
     "proof:outbox": "tsx scripts/outbox-proof.ts",
+    "proof:install-doctor": "tsx scripts/install-doctor-proof.ts",
     "report": "tsx scripts/efficiency-report.ts",
     "backfill": "tsx scripts/backfill-v1-archive.ts"
   },

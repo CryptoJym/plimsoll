@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
+import { isDeepStrictEqual } from "node:util";
 
 import { LocalEventBuffer } from "./buffer";
 import {
@@ -11,8 +12,10 @@ import {
   collectorBufferPath,
   collectorConfigPath,
   collectorLogPath,
+  collectorConfigSchema,
   ensureCollectorHome,
   loadCollectorConfig,
+  readCollectorConfig,
   type CollectorConfig,
 } from "./config";
 import { appendForwardedHook } from "./forwarder";
@@ -53,6 +56,7 @@ import {
   readCollectorPidFile,
   readProcessStartFingerprint,
   removeCollectorPidFileIfOwned,
+  runtimeIdentityMatches,
   verifyCollectorRuntimeIdentity,
   type CollectorPidRecord,
   type CollectorRuntimeIdentity,
@@ -68,7 +72,8 @@ Commands:
   status                Print local buffer and policy status
   join TOKEN|URL        Join a hosted workspace: redeem the admin's single-use
                         token, write sync credentials, verify with a handshake
-  doctor                Verify paths, SQLite buffer, LaunchAgent, data mode, and privacy posture
+  doctor --read-only --json
+                        Read-only readiness check; never creates config, ledger, plist, logs, or directories
   export                Print buffered events as JSON
   forward-hook SOURCE   Read hook JSON from stdin and append it without requiring the receiver
   self-test-hook SOURCE Emit one synthetic hook event into the local buffer
@@ -190,19 +195,192 @@ async function checkCollectorConnectivity(port: number) {
     const response = await fetch(`http://127.0.0.1:${port}/status`, {
       signal: controller.signal,
     });
+    let body: Record<string, unknown> | null = null;
+    try {
+      const candidate = await response.json();
+      if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+        body = candidate as Record<string, unknown>;
+      }
+    } catch {
+      // A non-JSON or malformed response is not a Plimsoll-ready service.
+    }
+
+    const runtimeCandidate = body?.runtimeIdentity;
+    const runtimeIdentity =
+      runtimeCandidate &&
+      typeof runtimeCandidate === "object" &&
+      Number.isInteger((runtimeCandidate as Partial<CollectorRuntimeIdentity>).pid) &&
+      typeof (runtimeCandidate as Partial<CollectorRuntimeIdentity>).instanceId === "string" &&
+      (runtimeCandidate as Partial<CollectorRuntimeIdentity>).instanceId!.length >= 32 &&
+      typeof (runtimeCandidate as Partial<CollectorRuntimeIdentity>).processStartFingerprint === "string" &&
+      (runtimeCandidate as Partial<CollectorRuntimeIdentity>).processStartFingerprint!.startsWith("sha256:")
+        ? (runtimeCandidate as CollectorRuntimeIdentity)
+        : null;
+    const health = body?.health && typeof body.health === "object"
+      ? (body.health as { sources?: unknown })
+      : null;
+    const healthSources = Array.isArray(health?.sources) ? health.sources : [];
+    const sources = healthSources.flatMap((candidate) => {
+      if (!candidate || typeof candidate !== "object") return [];
+      const source = (candidate as { source?: unknown }).source;
+      const lastTokenEventAt = (candidate as { lastTokenEventAt?: unknown }).lastTokenEventAt;
+      if (source !== "claude_code" && source !== "codex") return [];
+      return [{
+        source,
+        lastTokenEventAt: typeof lastTokenEventAt === "string" ? lastTokenEventAt : null,
+      }];
+    });
+    const stats = body?.stats && typeof body.stats === "object"
+      ? (body.stats as { tokenAttributedEvents?: unknown })
+      : null;
+    const tokenAttributedEvents = Number(stats?.tokenAttributedEvents ?? 0);
+    const signalVerified =
+      sources.some((source) => source.lastTokenEventAt !== null) ||
+      (Number.isFinite(tokenAttributedEvents) && tokenAttributedEvents > 0);
+
     return {
-      reachable: response.ok,
+      reachable: response.ok && body?.ok === true,
       status: response.status,
       statusUrl: `http://127.0.0.1:${port}/status`,
+      runtimeIdentity,
+      signal: {
+        verified: signalVerified,
+        tokenAttributedEvents:
+          Number.isFinite(tokenAttributedEvents) && tokenAttributedEvents >= 0
+            ? tokenAttributedEvents
+            : null,
+        sources,
+      },
     };
   } catch (error) {
     return {
       reachable: false,
       error: error instanceof Error ? error.name : String(error),
       statusUrl: `http://127.0.0.1:${port}/status`,
+      runtimeIdentity: null,
+      signal: {
+        verified: false,
+        tokenAttributedEvents: null,
+        sources: [],
+      },
     };
   } finally {
     clearTimeout(timeout);
+  }
+}
+
+function readClaudeTelemetryConfig(file: string, expected: ReturnType<typeof generateClaudeCodeSettings>) {
+  if (!fs.existsSync(file)) {
+    return { ok: false, status: "missing" as const, path: file, missing: ["settings file"] };
+  }
+  try {
+    const current = JSON.parse(fs.readFileSync(file, "utf8")) as {
+      env?: Record<string, unknown>;
+      hooks?: Record<string, unknown[]>;
+    };
+    const missing: string[] = [];
+    for (const [key, value] of Object.entries(expected.env)) {
+      if (current.env?.[key] !== value) missing.push(`env.${key}`);
+    }
+    for (const [event, entries] of Object.entries(expected.hooks ?? {})) {
+      const currentEntries = Array.isArray(current.hooks?.[event]) ? current.hooks[event] : [];
+      for (const entry of entries) {
+        if (!currentEntries.some((candidate) => isDeepStrictEqual(candidate, entry))) {
+          missing.push(`hooks.${event}`);
+        }
+      }
+    }
+    return {
+      ok: missing.length === 0,
+      status: missing.length === 0 ? "valid" as const : "incomplete" as const,
+      path: file,
+      missing,
+    };
+  } catch {
+    return { ok: false, status: "invalid" as const, path: file, missing: ["readable JSON"] };
+  }
+}
+
+function readCodexTelemetryConfig(file: string, expectedToml: string) {
+  if (!fs.existsSync(file)) {
+    return { ok: false, status: "missing" as const, path: file, missing: ["config file"] };
+  }
+  try {
+    const sections = (toml: string) => {
+      const parsed = new Map<string, string[][]>();
+      let current: string[] = [];
+      for (const rawLine of toml.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line || line.startsWith("#")) continue;
+        if (/^\[{1,2}[^\]]+\]{1,2}$/.test(line)) {
+          current = [];
+          const occurrences = parsed.get(line) ?? [];
+          occurrences.push(current);
+          parsed.set(line, occurrences);
+        } else {
+          current.push(line);
+        }
+      }
+      return parsed;
+    };
+    const expectedSections = sections(expectedToml);
+    const currentSections = sections(fs.readFileSync(file, "utf8"));
+    const missing: string[] = [];
+    for (const [header, expectedOccurrences] of expectedSections) {
+      const currentOccurrences = currentSections.get(header) ?? [];
+      if (currentOccurrences.length !== expectedOccurrences.length) {
+        missing.push(`${header} occurrence count ${expectedOccurrences.length}`);
+        continue;
+      }
+      for (let index = 0; index < expectedOccurrences.length; index += 1) {
+        const currentLines = new Set(currentOccurrences[index]);
+        for (const line of expectedOccurrences[index] ?? []) {
+          if (!currentLines.has(line)) missing.push(`${header} :: ${line}`);
+        }
+      }
+    }
+    return {
+      ok: missing.length === 0,
+      status: missing.length === 0 ? "valid" as const : "incomplete" as const,
+      path: file,
+      missing,
+    };
+  } catch {
+    return { ok: false, status: "invalid" as const, path: file, missing: ["readable TOML"] };
+  }
+}
+
+function readLaunchAgentState(plistPath: string) {
+  if (!fs.existsSync(plistPath)) {
+    return {
+      ok: false,
+      installed: false,
+      status: "missing" as const,
+      label: LAUNCH_AGENT_LABEL,
+      plistPath,
+    };
+  }
+  try {
+    const plist = fs.readFileSync(plistPath, "utf8");
+    const matchesExpectedRuntime =
+      plist.includes(`<string>${LAUNCH_AGENT_LABEL}</string>`) &&
+      plist.includes("<key>ProgramArguments</key>") &&
+      /<key>ProgramArguments<\/key>\s*<array>[\s\S]*?<string>start<\/string>[\s\S]*?<\/array>/.test(plist);
+    return {
+      ok: matchesExpectedRuntime,
+      installed: true,
+      status: matchesExpectedRuntime ? "valid" as const : "conflicted" as const,
+      label: LAUNCH_AGENT_LABEL,
+      plistPath,
+    };
+  } catch {
+    return {
+      ok: false,
+      installed: true,
+      status: "unreadable" as const,
+      label: LAUNCH_AGENT_LABEL,
+      plistPath,
+    };
   }
 }
 
@@ -225,9 +403,10 @@ async function main() {
     return;
   }
 
-  const configPath = collectorConfigPath();
-  const configExistedBeforeLoad = fs.existsSync(configPath);
-  const config = loadCollectorConfig();
+  const configRead = command === "doctor" ? readCollectorConfig() : null;
+  const configPath = configRead?.path ?? collectorConfigPath();
+  const config = configRead?.config ??
+    (command === "doctor" ? collectorConfigSchema.parse({}) : loadCollectorConfig());
 
   if (command === "start") {
     const pidPath = collectorLogPath("collector.pid");
@@ -721,26 +900,84 @@ async function main() {
   }
 
   if (command === "doctor") {
-    const buffer = openBuffer(config);
     const plistPath = launchAgentPlistPath();
+    const pidPath = collectorLogPath("collector.pid");
+    const claudePath = path.join(os.homedir(), ".claude", "settings.json");
+    const codexPath = path.join(os.homedir(), ".codex", "config.toml");
+    const toolOptions = {
+      repoRoot: process.cwd(),
+      port: config.port,
+      dataMode: config.policy.dataMode,
+    };
+    const claude = readClaudeTelemetryConfig(claudePath, generateClaudeCodeSettings(toolOptions));
+    const codex = readCodexTelemetryConfig(codexPath, generateCodexConfigToml(toolOptions));
+    const launchAgent = readLaunchAgentState(plistPath);
     const connectivity = await checkCollectorConnectivity(config.port);
+    const pidRead = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);
+    const pidRecord = pidRead.kind === "current" ? pidRead.record : null;
+    const runtime = {
+      ok: Boolean(
+        pidRecord &&
+        processIdentityIsLive(pidRecord) &&
+        runtimeIdentityMatches(pidRecord, connectivity.runtimeIdentity),
+      ),
+      pidPath,
+      pidFileStatus: pidRead.kind,
+      ownershipVersion: {
+        expected: 2,
+        actual: pidRecord?.version ?? null,
+      },
+      processLive: pidRecord ? processIdentityIsLive(pidRecord) : false,
+      identityMatchesStatus: pidRecord
+        ? runtimeIdentityMatches(pidRecord, connectivity.runtimeIdentity)
+        : false,
+    };
+    const nodeMajor = Number(process.versions.node.split(".")[0]);
+    const node = {
+      version: process.versions.node,
+      range: ">=20 <25",
+      supported: Number.isInteger(nodeMajor) && nodeMajor >= 20 && nodeMajor < 25,
+    };
+    const configured = Boolean(
+      node.supported &&
+      configRead?.status === "valid" &&
+      claude.ok &&
+      codex.ok,
+    );
+    const serviceReady = configured && launchAgent.ok && connectivity.reachable && runtime.ok;
+    const signalVerified = serviceReady && connectivity.signal.verified;
+    const readiness = signalVerified
+      ? "signal_verified"
+      : serviceReady
+        ? "service_ready"
+        : configured
+          ? "configured"
+          : "not_installed";
+    const ok = readiness === "signal_verified";
+    const bufferPath = collectorBufferPath();
     console.log(
       JSON.stringify(
         {
-          ok: true,
+          ok,
+          readiness,
+          readOnly: true,
+          node,
           configPath,
-          bufferPath: collectorBufferPath(),
-          pidPath: collectorLogPath("collector.pid"),
+          bufferPath,
+          pidPath,
           port: config.port,
           config: {
-            existedBeforeLoad: configExistedBeforeLoad,
-            createdDuringCommand: !configExistedBeforeLoad && fs.existsSync(configPath),
+            status: configRead?.status ?? "invalid",
+            valid: configRead?.status === "valid",
+            createdDuringCommand: false,
           },
-          launchAgent: {
-            label: LAUNCH_AGENT_LABEL,
-            plistPath,
-            installed: fs.existsSync(plistPath),
+          telemetry: {
+            ok: claude.ok && codex.ok,
+            claude,
+            codex,
           },
+          launchAgent,
+          runtime,
           connectivity,
           otelEndpoints: {
             logs: {
@@ -760,12 +997,12 @@ async function main() {
           retentionDays: config.retentionDays,
           syncConfigured: Boolean(config.uploadUrl),
           uploadSigningConfigured: Boolean(config.uploadSigningSecret),
-          sqlite: (() => {
-            const projected = buffer.projection.readSnapshot(30, config.subscriptions);
-            return projected.kind === "ready" ? projected.snapshot.status.stats : null;
-          })(),
-          delivery: buffer.delivery.status(),
-          projection: buffer.projection.status(),
+          sqlite: {
+            exists: fs.existsSync(bufferPath),
+            walExists: fs.existsSync(`${bufferPath}-wal`),
+            shmExists: fs.existsSync(`${bufferPath}-shm`),
+            opened: false,
+          },
           invasivePermissionsRequested: {
             screenRecording: false,
             accessibilityKeyboard: false,
@@ -777,7 +1014,7 @@ async function main() {
         2,
       ),
     );
-    buffer.close();
+    if (!ok) process.exitCode = 1;
     return;
   }
 
