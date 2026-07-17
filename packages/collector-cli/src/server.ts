@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 
@@ -34,6 +35,48 @@ let dashboardHtml: string | undefined;
 function loadDashboardHtml() {
   dashboardHtml ??= fs.readFileSync(new URL("./dashboard.html", import.meta.url), "utf8");
   return dashboardHtml;
+}
+
+let dashboardHeaders: Record<string, string> | undefined;
+function hashInlineDashboardBlock(html: string, tag: "script" | "style") {
+  const opening = `<${tag}>`;
+  const start = html.indexOf(opening);
+  const end = html.indexOf(`</${tag}>`, start + opening.length);
+  if (start < 0 || end < 0) throw new Error(`dashboard_${tag}_missing`);
+  return crypto
+    .createHash("sha256")
+    .update(html.slice(start + opening.length, end))
+    .digest("base64");
+}
+
+function loadDashboardHeaders() {
+  if (dashboardHeaders) return dashboardHeaders;
+  const html = loadDashboardHtml();
+  const scriptHash = hashInlineDashboardBlock(html, "script");
+  const styleHash = hashInlineDashboardBlock(html, "style");
+  dashboardHeaders = {
+    "content-type": "text/html; charset=utf-8",
+    "content-security-policy": [
+      "default-src 'none'",
+      `script-src 'sha256-${scriptHash}'`,
+      "script-src-attr 'none'",
+      `style-src 'sha256-${styleHash}'`,
+      "style-src-attr 'none'",
+      "connect-src 'self'",
+      "base-uri 'none'",
+      "form-action 'none'",
+      "frame-ancestors 'none'",
+      "object-src 'none'",
+    ].join("; "),
+    "x-content-type-options": "nosniff",
+    "x-frame-options": "DENY",
+    "referrer-policy": "no-referrer",
+    "cross-origin-opener-policy": "same-origin",
+    "cross-origin-resource-policy": "same-origin",
+    "permissions-policy": "camera=(), geolocation=(), microphone=()",
+    "cache-control": "no-store",
+  };
+  return dashboardHeaders;
 }
 
 function sendJson(
@@ -153,7 +196,7 @@ export function createCollectorServer(
       }
 
       if (request.method === "GET" && (request.url === "/" || request.url === "/index.html")) {
-        response.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+        response.writeHead(200, loadDashboardHeaders());
         response.end(loadDashboardHtml());
         return;
       }

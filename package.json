@@ -15,6 +15,7 @@
   "scripts": {
     "collector": "tsx packages/collector-cli/src/cli.ts",
     "proof": "tsx scripts/signal-fidelity-proof.ts",
+    "proof:allocation": "tsx scripts/event-allocation-proof.ts",
     "proof:maintenance": "tsx scripts/maintenance-proof.ts",
     "proof:codex-reconciliation": "tsx scripts/codex-reconciliation-proof.ts",
     "proof:resource-concurrency": "tsx scripts/resource-proof/concurrency-proof.ts",
