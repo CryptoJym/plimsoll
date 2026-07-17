@@ -25,6 +25,9 @@ jobs:
       - name: Typecheck
         run: pnpm exec tsc --noEmit
 
+      - name: Prove event allocation conservation
+        run: pnpm proof:allocation
+
       - name: Run signal-fidelity proof
         run: pnpm proof
 

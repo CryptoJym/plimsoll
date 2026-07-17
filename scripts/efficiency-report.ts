@@ -1,11 +1,11 @@
 /**
- * Local efficiency report: joins AI sessions in the work ledger to GitHub
+ * Local efficiency report: allocates AI token/cost events in the work ledger to GitHub
  * pull requests via privacy-safe linkage keys (hashed remote + hashed branch
  * + plain commit shas) and computes the token-use-to-accomplishment metrics
  * the product exists for:
  *
  *   - tokens / cost per merged PR
- *   - join rate (sessions linked to a PR / sessions with linkage keys)
+ *   - join rate (usage/cost sessions linked to a PR / sessions observed in the named repo)
  *   - Validated Delivery Yield v1 = joined PRs that merged with passing
  *     checks / joined PRs (validation evidence dimension = CI checks for now)
  *
@@ -31,24 +31,11 @@ import {
   branchLinkageHash,
   remoteLinkageHash,
 } from "../packages/shared/src/linkage";
-
-type SessionRow = {
-  sessionId: string;
-  source: string;
-  startedAt: string;
-  endedAt: string;
-  inputTokens: number | null;
-  outputTokens: number | null;
-  cacheReadTokens: number | null;
-  cacheCreationTokens: number | null;
-  costUsd: number | null;
-  events: number;
-  editEvents: number;
-  shellEvents: number;
-  repoHash: string | null;
-  branchHash: string | null;
-  headShas: string | null;
-};
+import {
+  allocateEvents,
+  collectAllocationEvents,
+  type PullCandidate,
+} from "./event-allocation";
 
 type PullSummary = {
   number: number;
@@ -59,6 +46,8 @@ type PullSummary = {
   branchHash?: string;
   headSha?: string;
   mergeCommitSha?: string;
+  createdAt: string;
+  closedAt?: string;
   updatedAt: string;
   checks: "passed" | "failed" | "none" | "unknown";
 };
@@ -238,29 +227,11 @@ async function main() {
   const ledgerPath = optionValue("--ledger") ?? collectorBufferPath();
   const token = process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
   const repoHash = remoteLinkageHash(`https://github.com/${owner}/${repo}.git`);
+  if (!repoHash) throw new Error("Could not derive repository linkage hash.");
 
   const db = new Database(ledgerPath, { readonly: true });
-  const sessions = db
-    .prepare(
-      `select session_id as sessionId, source,
-        min(observed_at) as startedAt, max(observed_at) as endedAt,
-        sum(input_tokens) as inputTokens, sum(output_tokens) as outputTokens,
-        sum(cache_read_tokens) as cacheReadTokens,
-        sum(cache_creation_tokens) as cacheCreationTokens, sum(cost_usd) as costUsd,
-        count(*) as events,
-        sum(case when action_class in ('edit','write') then 1 else 0 end) as editEvents,
-        sum(case when action_class = 'shell' then 1 else 0 end) as shellEvents,
-        max(repo_hash) as repoHash, max(branch_hash) as branchHash,
-        group_concat(distinct head_sha) as headShas
-      from buffered_events
-      where session_id is not null and observed_at >= ?
-      group by session_id, source`,
-    )
-    .all(since) as SessionRow[];
+  const events = collectAllocationEvents(db, since);
   db.close();
-
-  const sessionsWithLinkage = sessions.filter((row) => row.repoHash || row.branchHash || row.headShas);
-  const repoSessions = sessionsWithLinkage.filter((row) => !row.repoHash || row.repoHash === repoHash);
 
   const pullsRaw = (await githubJson(
     `https://api.github.com/repos/${owner}/${repo}/pulls?state=all&sort=updated&direction=desc&per_page=100`,
@@ -280,30 +251,62 @@ async function main() {
         branchHash: branchLinkageHash(head?.ref),
         headSha: head?.sha,
         mergeCommitSha: typeof pull.merge_commit_sha === "string" ? pull.merge_commit_sha : undefined,
+        createdAt: String(pull.created_at),
+        closedAt: typeof pull.closed_at === "string" ? pull.closed_at : undefined,
         updatedAt: String(pull.updated_at),
         checks: "unknown" as const,
       };
     });
 
-  // Join sessions to PRs: branch hash match, or session head sha appears as the
-  // PR head/merge sha. Time windows intentionally loose — branch hash is the
-  // primary key; sha endpoints catch detached/renamed cases.
-  const joins: Array<{ session: SessionRow; pull: PullSummary; via: string }> = [];
-  for (const session of repoSessions) {
-    const shas = new Set((session.headShas ?? "").split(",").filter(Boolean));
-    for (const pull of pulls) {
-      if (session.branchHash && pull.branchHash === session.branchHash) {
-        joins.push({ session, pull, via: "branch_hash" });
-      } else if (pull.headSha && shas.has(pull.headSha)) {
-        joins.push({ session, pull, via: "head_sha" });
-      } else if (pull.mergeCommitSha && shas.has(pull.mergeCommitSha)) {
-        joins.push({ session, pull, via: "merge_sha" });
-      }
+  const candidates: PullCandidate[] = pulls.map((pull) => ({
+    pull: pull.number,
+    repoHash,
+    branchHash: pull.branchHash ?? null,
+    headSha: pull.headSha ?? null,
+    mergeCommitSha: pull.mergeCommitSha ?? null,
+    createdAt: pull.createdAt,
+    updatedAt: pull.updatedAt,
+    closedAt: pull.closedAt ?? null,
+    mergedAt: pull.mergedAt ?? null,
+  }));
+  // Upgrade event HEAD evidence from "current PR head only" to commit
+  // membership for lifecycle-relevant candidates. Both dimensions are hard
+  // bounded: at most 20 candidate PRs and 100 commits per PR.
+  const headEvents = events.filter(
+    (event) => event.repoHash === repoHash && event.headSha,
+  );
+  const membershipCandidates = candidates
+    .filter((candidate) => {
+      const created = Date.parse(candidate.createdAt) - 7 * 24 * 60 * 60 * 1_000;
+      const terminal = Date.parse(
+        candidate.mergedAt ?? candidate.closedAt ?? candidate.updatedAt,
+      ) + 7 * 24 * 60 * 60 * 1_000;
+      return headEvents.some((event) => {
+        const observed = Date.parse(event.observedAt);
+        return Number.isFinite(observed) && observed >= created && observed <= terminal;
+      });
+    })
+    .slice(0, 20);
+  for (const candidate of membershipCandidates) {
+    try {
+      const commits = (await githubJson(
+        `https://api.github.com/repos/${owner}/${repo}/pulls/${candidate.pull}/commits?per_page=100`,
+        token,
+      )) as Array<{ sha?: string }>;
+      candidate.commitShas = commits
+        .map((commit) => commit.sha)
+        .filter((sha): sha is string => Boolean(sha));
+    } catch {
+      // Current head + bounded branch fallback remain available. A failed
+      // membership read never becomes fabricated direct evidence.
     }
   }
+  const allocation = allocateEvents(events, candidates);
 
   // Check runs for joined PRs only (cap GitHub calls).
-  const joinedPullNumbers = [...new Set(joins.map((entry) => entry.pull.number))];
+  const joinedPullNumbers = allocation.pullRows
+    .filter((row) => row.repoHash === repoHash)
+    .map((row) => row.pull);
   for (const number of joinedPullNumbers.slice(0, 20)) {
     const pull = pulls.find((entry) => entry.number === number);
     if (!pull?.headSha) continue;
@@ -327,31 +330,37 @@ async function main() {
     }
   }
 
-  const byPull = new Map<number, { pull: PullSummary; sessions: SessionRow[]; via: Set<string> }>();
-  for (const entry of joins) {
-    const bucket = byPull.get(entry.pull.number) ?? { pull: entry.pull, sessions: [], via: new Set<string>() };
-    if (!bucket.sessions.some((row) => row.sessionId === entry.session.sessionId)) {
-      bucket.sessions.push(entry.session);
-    }
-    bucket.via.add(entry.via);
-    byPull.set(entry.pull.number, bucket);
-  }
-
-  const pullRows = [...byPull.values()].map((bucket) => ({
-    pull: bucket.pull.number,
-    merged: bucket.pull.merged,
-    checks: bucket.pull.checks,
-    joinedVia: [...bucket.via],
-    sessions: bucket.sessions.length,
-    inputTokens: bucket.sessions.reduce((sum, row) => sum + (row.inputTokens ?? 0), 0),
-    outputTokens: bucket.sessions.reduce((sum, row) => sum + (row.outputTokens ?? 0), 0),
-    cacheReadTokens: bucket.sessions.reduce((sum, row) => sum + (row.cacheReadTokens ?? 0), 0),
-    cacheCreationTokens: bucket.sessions.reduce((sum, row) => sum + (row.cacheCreationTokens ?? 0), 0),
-    costUsd: Number(bucket.sessions.reduce((sum, row) => sum + (row.costUsd ?? 0), 0).toFixed(4)),
-  }));
+  const pullRows = allocation.pullRows
+    .filter((row) => row.repoHash === repoHash)
+    .map((row) => {
+      const pull = pulls.find((candidate) => candidate.number === row.pull);
+      return {
+        ...row,
+        merged: pull?.merged ?? false,
+        checks: pull?.checks ?? "unknown",
+      };
+    });
 
   const mergedRows = pullRows.filter((row) => row.merged);
-  const joinedSessionIds = new Set(joins.map((entry) => entry.session.sessionId));
+  const sessionIds = new Set(events.map((event) => event.sessionId).filter(Boolean));
+  const sessionsWithLinkage = new Set(
+    events
+      .filter((event) => event.repoHash || event.branchHash || event.headSha)
+      .map((event) => event.sessionId)
+      .filter(Boolean),
+  );
+  const repoSessions = new Set(
+    events
+      .filter((event) => event.repoHash === repoHash)
+      .map((event) => event.sessionId)
+      .filter(Boolean),
+  );
+  const joinedSessionIds = new Set(
+    allocation.receipts
+      .filter((receipt) => receipt.pull !== null && receipt.repoHash === repoHash)
+      .map((receipt) => receipt.sessionId)
+      .filter(Boolean),
+  );
   const yieldEligible = pullRows.length;
   const v1NumeratorRows = pullRows.filter((row) => row.merged && row.checks !== "failed");
   const yieldNumerator = v1NumeratorRows.length;
@@ -425,23 +434,28 @@ async function main() {
     yieldWindowDays,
   );
 
+  const generatedAt = new Date().toISOString();
+  const stamp = generatedAt.replace(/[:.]/g, "-");
+  const receiptFile = `${stamp}-allocation-receipts.ndjson`;
+  const allMergedCostsKnown =
+    mergedRows.length > 0 && mergedRows.every((row) => row.costStatus === "known");
   const summary = {
     proof: "plimsoll-efficiency-report",
-    generatedAt: new Date().toISOString(),
+    generatedAt,
     repository: `${owner}/${repo}`,
     sinceDays,
     ledgerPath,
     sessions: {
-      total: sessions.length,
-      withLinkage: sessionsWithLinkage.length,
-      matchingRepo: repoSessions.length,
+      total: sessionIds.size,
+      withLinkage: sessionsWithLinkage.size,
+      matchingRepo: repoSessions.size,
       joinedToPulls: joinedSessionIds.size,
-      joinRate: sessionsWithLinkage.length
-        ? Number((joinedSessionIds.size / sessionsWithLinkage.length).toFixed(3))
+      joinRate: repoSessions.size
+        ? Number((joinedSessionIds.size / repoSessions.size).toFixed(3))
         : 0,
-      withoutLinkage: sessions.length - sessionsWithLinkage.length,
+      withoutLinkage: sessionIds.size - sessionsWithLinkage.size,
       withoutLinkageNote:
-        "sessions captured before linkage shipped (backfilled history) or outside any git repo",
+        "usage/cost sessions captured before linkage shipped or outside any git repo",
     },
     pulls: {
       examined: pulls.length,
@@ -455,9 +469,27 @@ async function main() {
               mergedRows.length,
           )
         : null,
-      costPerMergedPRUsd: mergedRows.length
-        ? Number((mergedRows.reduce((sum, row) => sum + row.costUsd, 0) / mergedRows.length).toFixed(4))
+      costPerMergedPRUsd: allMergedCostsKnown
+        ? Number(
+            (
+              mergedRows.reduce((sum, row) => sum + (row.costUsd ?? 0), 0) /
+              mergedRows.length
+            ).toFixed(4),
+          )
         : null,
+      knownCostPerMergedPRUsd: mergedRows.length
+        ? Number(
+            (
+              mergedRows.reduce((sum, row) => sum + row.knownCostUsd, 0) /
+              mergedRows.length
+            ).toFixed(4),
+          )
+        : null,
+      costCompleteness: allMergedCostsKnown
+        ? "known"
+        : mergedRows.some((row) => row.costStatus !== "unknown")
+          ? "partial"
+          : "unknown",
       validatedDeliveryYieldV1: yieldEligible
         ? Number((yieldNumerator / yieldEligible).toFixed(3))
         : null,
@@ -473,12 +505,35 @@ async function main() {
         "v1: joined PRs merged with non-failing checks / joined PRs. " +
         `v2: same, minus PRs with short-horizon rework (revert/reopen) within ${yieldWindowDays}d of merge.`,
     },
+    allocation: {
+      hierarchy: [
+        "exact repo + HEAD membership (direct)",
+        "time-bounded repo + branch or unique repo candidate (inferred)",
+        "bounded stable same-session segment (inferred)",
+        "explicit unallocated remainder",
+      ],
+      dominantRepoFallback: "disabled",
+      candidateLimit: 100,
+      candidates: candidates.length,
+      commitMembershipCandidates: membershipCandidates.length,
+      commitMembershipLimit: 20,
+      commitsPerCandidateLimit: 100,
+      receipts: allocation.receipts.length,
+      receiptFile,
+      coverageScope:
+        "all promoted token/cost events in the ledger window; events outside the named repository remain unallocated",
+      coverage: allocation.coverage,
+    },
     pullRows,
   };
 
-  const stamp = summary.generatedAt.replace(/[:.]/g, "-");
   const evidenceDir = path.join(process.cwd(), "evidence");
   fs.mkdirSync(evidenceDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(evidenceDir, receiptFile),
+    allocation.receipts.map((receipt) => JSON.stringify(receipt)).join("\n") +
+      (allocation.receipts.length ? "\n" : ""),
+  );
   fs.writeFileSync(
     path.join(evidenceDir, `${stamp}-efficiency-report.json`),
     `${JSON.stringify(summary, null, 2)}\n`,
@@ -493,7 +548,7 @@ async function main() {
       `- Sessions: ${summary.sessions.total} total, ${summary.sessions.withLinkage} with linkage, ${summary.sessions.joinedToPulls} joined (join rate ${summary.sessions.joinRate})`,
       `- PRs: ${summary.pulls.examined} examined, ${summary.pulls.joined} joined, ${summary.pulls.merged} merged`,
       `- Tokens per merged PR: ${summary.efficiency.tokensPerMergedPR ?? "n/a"}`,
-      `- Cost per merged PR: ${summary.efficiency.costPerMergedPRUsd ?? "n/a"} USD`,
+      `- Cost per merged PR: ${summary.efficiency.costPerMergedPRUsd ?? "unknown"} USD (${summary.efficiency.costCompleteness}; known portion ${summary.efficiency.knownCostPerMergedPRUsd ?? "n/a"} USD)`,
       `- Validated Delivery Yield v1: ${summary.efficiency.validatedDeliveryYieldV1 ?? "n/a"}`,
       `- Validated Delivery Yield v2 (${yieldWindowDays}d rework window): ${summary.efficiency.validatedDeliveryYieldV2 ?? "n/a"} (delta ${summary.efficiency.yieldV2Delta ?? "n/a"})`,
       ...(yieldV2.excluded.length
@@ -504,11 +559,25 @@ async function main() {
           ]
         : [`- v2 exclusions: none within the ${yieldWindowDays}d window`]),
       "",
-      "| PR | merged | checks | sessions | in tok | out tok | cost USD | via |",
-      "|---|---|---|---|---|---|---|---|",
+      "## Allocation coverage",
+      "",
+      "No dominant-repository fallback. Every event has zero or one allocation receipt; exact reconciliation uses integer nanodollars.",
+      "",
+      "| coverage | events | input | output | cache read | cache write | known cost USD | unpriced events |",
+      "|---|---:|---:|---:|---:|---:|---:|---:|",
+      ...(["captured", "direct", "inferred", "unallocated"] as const).map((key) => {
+        const row = summary.allocation.coverage[key];
+        return `| ${key} | ${row.events} | ${row.inputTokens} | ${row.outputTokens} | ${row.cacheReadTokens} | ${row.cacheWriteTokens} | ${row.knownCostUsd} | ${row.unpricedEvents} |`;
+      }),
+      "",
+      `- Exact reconciliation: ${summary.allocation.coverage.reconciliation.exact}`,
+      `- Local allocation receipts: ${receiptFile}`,
+      "",
+      "| PR | merged | checks | sessions | direct | inferred | in tok | out tok | cache read | cache write | cost USD | known cost USD | cost status | via |",
+      "|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---|---|",
       ...pullRows.map(
         (row) =>
-          `| #${row.pull} | ${row.merged} | ${row.checks} | ${row.sessions} | ${row.inputTokens} | ${row.outputTokens} | ${row.costUsd} | ${row.joinedVia.join("+")} |`,
+          `| #${row.pull} | ${row.merged} | ${row.checks} | ${row.sessions} | ${row.directEvents} | ${row.inferredEvents} | ${row.inputTokens} | ${row.outputTokens} | ${row.cacheReadTokens} | ${row.cacheWriteTokens} | ${row.costUsd ?? "unknown"} | ${row.knownCostUsd} | ${row.costStatus} | ${row.joinedVia.join("+")} |`,
       ),
       "",
     ].join("\n"),
