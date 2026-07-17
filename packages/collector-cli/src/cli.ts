@@ -47,6 +47,12 @@ import {
 } from "../../collector-config/src/index";
 import type { ToolSource } from "../../shared/src/index";
 import { runOutcomesSync } from "./outcomes-sync";
+import {
+  GitHubRestOutcomeTimelineAdapter,
+  readRequiredCheckPolicy,
+  runOutcomeTimelineBackfill,
+} from "./github-outcome-backfill";
+import { OutcomeTimelineStore } from "./outcome-timeline-store";
 import { prepareRepoLabelsPush, pushRepoLabels } from "./repo-labels";
 import { runSessionSync, sessionIdsFromBatches } from "./session-sync";
 import { uploadBufferedEvents } from "./upload";
@@ -93,6 +99,11 @@ Commands:
                         check results, and short-horizon rework, keyed by the same
                         linkage hashes sessions and events carry. Idempotent by
                         deterministic id; re-running converges instead of duplicating.
+  backfill-outcome-timeline
+                        Explicit, bounded GitHub recovery for immutable PR revisions,
+                        every completed check attempt, reviews, lifecycle events,
+                        linked issues, and full-SHA reverts. Resumes from local state;
+                        never runs in the collector server/background path.
   scan-rollouts         Read codex rollout files into the ledger once (full history walk)
   scan-transcripts      Read Claude Code transcript usage into the ledger once (full history walk)
   install-launch-agent  Write the user LaunchAgent plist
@@ -135,6 +146,11 @@ Config tools:
       for public repos). Naming the repo is the same deliberate disclosure as
       push-repo-labels: owner/name + remoteUrlHash cross; titles/diffs/paths never do.
       --dry-run computes the join and prints the audit without pushing.
+  backfill-outcome-timeline --repository owner/repo [--since ISO] [--until ISO]
+      [--max-prs 25] [--store PATH] [--required-checks POLICY.json]
+      Reads GitHub only. POLICY.json is {"requiredChecks":["check name"]};
+      without it required-check coverage and check-derived metrics are UNKNOWN.
+      GITHUB_TOKEN/GH_TOKEN stays provider-side and is never persisted or printed.
   install-launch-agent [--load]
   install-launch-agent --dev [--repo-root PATH] [--pnpm PATH] [--load]
   load-launch-agent
@@ -1028,6 +1044,44 @@ async function main() {
       url: optionValue("--url"),
     });
     if (!outcomes.ok) process.exitCode = 1;
+    return;
+  }
+
+  if (command === "backfill-outcome-timeline") {
+    const repository = optionValue("--repository");
+    const match = repository?.match(/^([^/]+)\/([^/]+)$/);
+    if (!match) {
+      console.error("backfill-outcome-timeline requires --repository owner/repo.");
+      process.exitCode = 1;
+      return;
+    }
+    const until = optionValue("--until") ?? new Date().toISOString();
+    const since =
+      optionValue("--since") ?? new Date(Date.parse(until) - 30 * 24 * 60 * 60 * 1000).toISOString();
+    const maxPullsRaw = optionValue("--max-prs") ?? "25";
+    const maxPulls = Number(maxPullsRaw);
+    if (!Number.isInteger(maxPulls)) throw new Error(`--max-prs expects an integer, got: ${maxPullsRaw}`);
+    const databasePath =
+      optionValue("--store") ?? path.join(collectorHome(), "outcome-timeline-v1.sqlite");
+    const store = new OutcomeTimelineStore(databasePath);
+    try {
+      const receipt = await runOutcomeTimelineBackfill({
+        owner: match[1]!,
+        repo: match[2]!,
+        since,
+        until,
+        maxPulls,
+        store,
+        adapter: new GitHubRestOutcomeTimelineAdapter({
+          token: process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN,
+        }),
+        requiredChecks: readRequiredCheckPolicy(optionValue("--required-checks")),
+      });
+      console.log(JSON.stringify(receipt, null, 2));
+      if (receipt.status === "incomplete" || receipt.status === "unknown") process.exitCode = 1;
+    } finally {
+      store.close();
+    }
     return;
   }
 

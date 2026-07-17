@@ -40,6 +40,9 @@ jobs:
       - name: Prove transactional join and workspace isolation
         run: pnpm proof:join-isolation
 
+      - name: Prove immutable outcome timeline and bounded recovery
+        run: pnpm proof:outcome-timeline
+
       - name: Run strict isolated resource proof
         run: pnpm proof:resource --require-integrated --receipt evidence/resource-proof.json
 
