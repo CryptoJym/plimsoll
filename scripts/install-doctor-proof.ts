@@ -116,10 +116,12 @@ async function main() {
     "pnpm proof:http-boundary",
     "pnpm proof:dashboard",
     "pnpm proof:dashboard-security",
+    "pnpm proof:learning-facts",
     "pnpm proof",
     "pnpm proof:metric-truth",
     "pnpm proof:outbox",
     "pnpm proof:join-isolation",
+    "pnpm proof:outcome-timeline",
     "pnpm proof:resource --require-integrated --receipt evidence/resource-proof.json",
     "pnpm proof:resource-finalization",
   ];
