@@ -18,6 +18,8 @@ import {
 import { appendForwardedHook } from "../packages/collector-cli/src/forwarder";
 import {
   COLLECTOR_APP_VERSION,
+  JOIN_HANDSHAKE_DIRECTORY_PREFIX,
+  finalizeActivatedPendingJoin,
   pendingJoinPath,
   performJoin,
   resumePendingJoin,
@@ -135,6 +137,39 @@ function hashFile(file: string) {
   return crypto.createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 }
 
+function snapshotTree(rootPath: string) {
+  const snapshot: Array<{
+    path: string;
+    type: "directory" | "file";
+    mode: number;
+    bytes?: string;
+  }> = [];
+  const visit = (directory: string, relativeDirectory = "") => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true }).sort((a, b) =>
+      a.name.localeCompare(b.name)
+    )) {
+      const relativePath = path.join(relativeDirectory, entry.name);
+      const absolutePath = path.join(directory, entry.name);
+      const stat = fs.lstatSync(absolutePath);
+      if (entry.isDirectory()) {
+        snapshot.push({ path: relativePath, type: "directory", mode: stat.mode & 0o777 });
+        visit(absolutePath, relativePath);
+      } else if (entry.isFile()) {
+        snapshot.push({
+          path: relativePath,
+          type: "file",
+          mode: stat.mode & 0o777,
+          bytes: fs.readFileSync(absolutePath).toString("base64"),
+        });
+      } else {
+        throw new Error(`Unexpected proof fixture entry type: ${relativePath}`);
+      }
+    }
+  };
+  visit(rootPath);
+  return JSON.stringify(snapshot);
+}
+
 async function runChild(args: string[], input: string, env: NodeJS.ProcessEnv) {
   const child = spawn(process.execPath, args, {
     cwd: process.cwd(),
@@ -190,6 +225,12 @@ try {
   const requests: RequestRecord[] = [];
   const temporaryRoot = path.join(root, "successful-temporary-state");
   fs.mkdirSync(temporaryRoot);
+  const successfulStaleDirectory = path.join(
+    temporaryRoot,
+    `${JOIN_HANDSHAKE_DIRECTORY_PREFIX}99999999-stale`,
+  );
+  fs.mkdirSync(successfulStaleDirectory);
+  fs.writeFileSync(path.join(successfulStaleDirectory, "sentinel.bin"), "stale-handshake");
   const joined = await performJoin({
     target: TOKEN,
     baseUrl: "https://workspace-b.example",
@@ -365,6 +406,169 @@ try {
     },
   );
 
+  // A crash after both active surfaces move to B but before journal unlink is
+  // already a successful activation. Resume must finalize locally without a
+  // second handshake or rejecting the intentionally changed fingerprint.
+  const activatedPendingHome = home("activated-pending-resume");
+  const activatedPendingFixture = writeConfig(activatedPendingHome);
+  const activatedPendingRequests: RequestRecord[] = [];
+  const activatedPendingMessage = await expectRejected(
+    () =>
+      performJoin({
+        target: TOKEN,
+        baseUrl: "https://workspace-b.example",
+        homeDir: activatedPendingHome,
+        temporaryRoot: path.join(root, "activated-pending-resume-temp"),
+        fetchImpl: successfulFetch({
+          configPath: activatedPendingFixture.configPath,
+          configBytes: activatedPendingFixture.bytes,
+          requests: activatedPendingRequests,
+        }),
+        afterConfigActivation: () => {
+          throw new Error("simulated interruption before journal unlink");
+        },
+      }),
+    /workspace activation.*simulated interruption/i,
+  );
+  const activatedPendingLedger = new LocalEventBuffer(
+    collectorBufferPath(activatedPendingHome),
+  );
+  const activatedPendingBinding = activatedPendingLedger.workspaceBinding();
+  activatedPendingLedger.close();
+  let alreadyActivatedResumeNetwork = 0;
+  const alreadyActivatedResume = await resumePendingJoin({
+    homeDir: activatedPendingHome,
+    fetchImpl: (async () => {
+      alreadyActivatedResumeNetwork += 1;
+      throw new Error("already-activated resume must not call network");
+    }) as typeof fetch,
+  });
+  check(
+    "already_activated_resume_finalizes_stale_journal_without_network",
+    alreadyActivatedResume.joined &&
+      activatedPendingRequests.length === 2 &&
+      activatedPendingBinding?.currentWorkspaceId === TENANT_B &&
+      collectorConfigSchema.parse(
+        JSON.parse(fs.readFileSync(activatedPendingFixture.configPath, "utf8")),
+      ).tenantId === TENANT_B &&
+      alreadyActivatedResumeNetwork === 0 &&
+      !fs.existsSync(pendingJoinPath(activatedPendingHome)) &&
+      !fs.existsSync(path.join(path.dirname(pendingJoinPath(activatedPendingHome)), "join.lock")),
+    {
+      activatedPendingMessage,
+      joinAndHandshakeRequests: activatedPendingRequests.length,
+      workspaceBinding: activatedPendingBinding,
+      resumeNetworkRequests: alreadyActivatedResumeNetwork,
+      pendingAfterResume: fs.existsSync(pendingJoinPath(activatedPendingHome)),
+    },
+  );
+
+  const activatedStartupHome = home("activated-pending-startup");
+  const activatedStartupFixture = writeConfig(activatedStartupHome);
+  const activatedStartupRequests: RequestRecord[] = [];
+  await expectRejected(
+    () =>
+      performJoin({
+        target: TOKEN,
+        baseUrl: "https://workspace-b.example",
+        homeDir: activatedStartupHome,
+        temporaryRoot: path.join(root, "activated-pending-startup-temp"),
+        fetchImpl: successfulFetch({
+          configPath: activatedStartupFixture.configPath,
+          configBytes: activatedStartupFixture.bytes,
+          requests: activatedStartupRequests,
+        }),
+        afterConfigActivation: () => {
+          throw new Error("simulated startup recovery interruption");
+        },
+      }),
+    /workspace activation.*startup recovery interruption/i,
+  );
+  const startupFinalized = finalizeActivatedPendingJoin({ homeDir: activatedStartupHome });
+  check(
+    "startup_finalizer_removes_only_coherent_activated_journal",
+    startupFinalized &&
+      activatedStartupRequests.length === 2 &&
+      !fs.existsSync(pendingJoinPath(activatedStartupHome)) &&
+      !fs.existsSync(path.join(path.dirname(pendingJoinPath(activatedStartupHome)), "join.lock")),
+    {
+      startupFinalized,
+      joinAndHandshakeRequests: activatedStartupRequests.length,
+      pendingAfterStartup: fs.existsSync(pendingJoinPath(activatedStartupHome)),
+    },
+  );
+
+  // The per-home lock must exist before the first join POST. A concurrent
+  // loser cannot consume its single-use token while the winner is in flight.
+  const concurrentHome = home("concurrent-join-lock");
+  const concurrentFixture = writeConfig(concurrentHome);
+  let firstJoinEntered!: () => void;
+  let releaseFirstJoin!: () => void;
+  const firstJoinEnteredPromise = new Promise<void>((resolve) => (firstJoinEntered = resolve));
+  const firstJoinGate = new Promise<void>((resolve) => (releaseFirstJoin = resolve));
+  let winningRedemptions = 0;
+  let winningHandshakeRequests = 0;
+  const winningJoin = performJoin({
+    target: `${TOKEN}-winner`,
+    baseUrl: "https://workspace-b.example",
+    homeDir: concurrentHome,
+    temporaryRoot: path.join(root, "concurrent-join-temp"),
+    fetchImpl: (async (input) => {
+      const url = requestUrl(input);
+      assert.equal(fs.readFileSync(concurrentFixture.configPath, "utf8"), concurrentFixture.bytes);
+      if (url.pathname.endsWith("/join")) {
+        winningRedemptions += 1;
+        firstJoinEntered();
+        await firstJoinGate;
+        return responseJson({
+          ok: true,
+          tenantId: TENANT_B,
+          installKey: INSTALL_B,
+          uploadUrl: "https://workspace-b.example/api/work-intelligence/ingest",
+        }, 201);
+      }
+      winningHandshakeRequests += 1;
+      return responseJson({ ok: true, accepted: 1 }, 200);
+    }) as typeof fetch,
+  });
+  await firstJoinEnteredPromise;
+  let losingNetworkRequests = 0;
+  const losingJoinMessage = await expectRejected(
+    () =>
+      performJoin({
+        target: `${TOKEN}-loser`,
+        baseUrl: "https://workspace-b.example",
+        homeDir: concurrentHome,
+        fetchImpl: (async () => {
+          losingNetworkRequests += 1;
+          throw new Error("concurrent losing join must not reach network");
+        }) as typeof fetch,
+      }),
+    /another workspace join is already in progress.*no token was redeemed/i,
+  );
+  releaseFirstJoin();
+  const winningJoinResult = await winningJoin;
+  const concurrentLockPath = path.join(
+    path.dirname(pendingJoinPath(concurrentHome)),
+    "join.lock",
+  );
+  check(
+    "concurrent_join_loser_cannot_redeem_before_winner_releases_lock",
+    winningJoinResult.joined &&
+      winningRedemptions === 1 &&
+      winningHandshakeRequests === 1 &&
+      losingNetworkRequests === 0 &&
+      !fs.existsSync(concurrentLockPath) &&
+      !fs.existsSync(pendingJoinPath(concurrentHome)),
+    {
+      winningRedemptions,
+      winningHandshakeRequests,
+      losingNetworkRequests,
+      losingJoinMessage,
+      lockAfterWinner: fs.existsSync(concurrentLockPath),
+    },
+  );
+
   const zeroAcceptedHome = home("zero-accepted-failure");
   const {
     bytes: zeroAcceptedBytes,
@@ -514,12 +718,37 @@ try {
     { uploadRedirectCalls, uploadRedirectMessage },
   );
 
-  // Unsupported preview must fail before token consumption or network and a
-  // normal CLI startup scavenges only dead-owner handshake directories.
+  // Unsupported preview must fail before token consumption, network, or any
+  // filesystem mutation. Real join cleanup is proved by the successful case
+  // above; the stale sentinel here must remain byte-for-byte exact.
   const dryRunHome = path.join(root, "dry-run-home");
   const dryRunTemp = path.join(root, "dry-run-temp");
+  fs.mkdirSync(dryRunHome);
   fs.mkdirSync(dryRunTemp);
-  fs.mkdirSync(path.join(dryRunTemp, "plimsoll-join-handshake-99999999-stale"));
+  // tsx initializes this empty launcher cache directory before application
+  // code runs even with transform caching disabled. Preseed it so the before
+  // snapshot isolates Plimsoll's filesystem behavior.
+  if (typeof process.getuid === "function") {
+    fs.mkdirSync(path.join(dryRunTemp, `tsx-${process.getuid()}`));
+  }
+  const dryRunConfigPath = path.join(dryRunHome, "collector.config.json");
+  const dryRunLedgerPath = path.join(dryRunHome, "work-ledger.sqlite");
+  const dryRunStaleDirectory = path.join(
+    dryRunTemp,
+    `${JOIN_HANDSHAKE_DIRECTORY_PREFIX}99999999-stale`,
+  );
+  fs.writeFileSync(dryRunConfigPath, "dry-run-config-byte-sentinel\n", { mode: 0o600 });
+  fs.writeFileSync(dryRunLedgerPath, Buffer.from([0, 255, 17, 34, 51]), { mode: 0o600 });
+  fs.mkdirSync(dryRunStaleDirectory);
+  fs.writeFileSync(
+    path.join(dryRunStaleDirectory, "sentinel.bin"),
+    Buffer.from([222, 173, 190, 239]),
+    { mode: 0o640 },
+  );
+  const dryRunHomeBefore = snapshotTree(dryRunHome);
+  const dryRunTempBefore = snapshotTree(dryRunTemp);
+  const dryRunConfigHash = hashFile(dryRunConfigPath);
+  const dryRunLedgerHash = hashFile(dryRunLedgerPath);
   let dryRunRequests = 0;
   const dryRunServer = http.createServer((_request, response) => {
     dryRunRequests += 1;
@@ -540,24 +769,57 @@ try {
         `http://127.0.0.1:${address.port}`,
       ],
       `${TOKEN}\n`,
-      { ...process.env, PLIMSOLL_HOME: dryRunHome, TMPDIR: dryRunTemp },
+      {
+        ...process.env,
+        PLIMSOLL_HOME: dryRunHome,
+        TMPDIR: dryRunTemp,
+        TSX_DISABLE_CACHE: "1",
+      },
+    );
+    const unsupportedJoin = await runChild(
+      [
+        "node_modules/tsx/dist/cli.mjs",
+        "packages/collector-cli/src/cli.ts",
+        "join",
+        TOKEN,
+        "--bogus",
+      ],
+      "",
+      {
+        ...process.env,
+        PLIMSOLL_HOME: dryRunHome,
+        TMPDIR: dryRunTemp,
+        TSX_DISABLE_CACHE: "1",
+      },
     );
     check(
       "join_dry_run_rejected_before_token_network_or_mutation",
       dryRun.exit.code === 1 &&
+        unsupportedJoin.exit.code === 1 &&
         dryRunRequests === 0 &&
-        !fs.existsSync(path.join(dryRunHome, "collector.config.json")) &&
+        hashFile(dryRunConfigPath) === dryRunConfigHash &&
+        hashFile(dryRunLedgerPath) === dryRunLedgerHash &&
+        snapshotTree(dryRunHome) === dryRunHomeBefore &&
+        snapshotTree(dryRunTemp) === dryRunTempBefore &&
+        fs.existsSync(path.join(dryRunStaleDirectory, "sentinel.bin")) &&
+        !fs.existsSync(pendingJoinPath(dryRunHome)) &&
         !`${dryRun.stdout}\n${dryRun.stderr}`.includes(TOKEN) &&
+        !`${unsupportedJoin.stdout}\n${unsupportedJoin.stderr}`.includes(TOKEN) &&
         /dry-run is unsupported/.test(dryRun.stderr) &&
-        !fs.readdirSync(dryRunTemp).some((entry) =>
-          entry.startsWith("plimsoll-join-handshake-"),
+        /Unsupported join option or argument: --bogus/.test(unsupportedJoin.stderr) &&
+        fs.readdirSync(dryRunTemp).some((entry) =>
+          entry.startsWith(JOIN_HANDSHAKE_DIRECTORY_PREFIX),
         ),
       {
         exit: dryRun.exit,
+        unsupportedExit: unsupportedJoin.exit,
         requests: dryRunRequests,
-        configCreated: fs.existsSync(path.join(dryRunHome, "collector.config.json")),
+        configByteIdentical: hashFile(dryRunConfigPath) === dryRunConfigHash,
+        ledgerByteIdentical: hashFile(dryRunLedgerPath) === dryRunLedgerHash,
+        homeTreeByteIdentical: snapshotTree(dryRunHome) === dryRunHomeBefore,
+        tempTreeByteIdentical: snapshotTree(dryRunTemp) === dryRunTempBefore,
         handshakeEntries: fs.readdirSync(dryRunTemp).filter((entry) =>
-          entry.startsWith("plimsoll-join-handshake-"),
+          entry.startsWith(JOIN_HANDSHAKE_DIRECTORY_PREFIX),
         ),
       },
     );

@@ -26,6 +26,7 @@ import {
 } from "./launch-agent";
 import {
   cleanupStaleJoinHandshakeDirectories,
+  finalizeActivatedPendingJoin,
   performJoin,
   resumePendingJoin,
 } from "./join";
@@ -108,7 +109,7 @@ Config tools:
   join "<join-url>#<token>" | join --token-stdin --url <cloud-base-url> | join --resume
       Prefer --token-stdin (or join -) so the single-use secret never enters
       shell history or process arguments. Workspace URL env: PLIMSOLL_CLOUD_URL.
-      join --dry-run is unsupported and fails before reading the token or network.
+      join --dry-run is unsupported and fails before token, network, or local-state mutation.
   generate-config claude-code|codex|all [--evidence --confirm-evidence]
   upload [--url URL --limit 500] [--ingest-key KEY] [--signing-secret SECRET] [--no-mark] [--max-batches 20]
   upload-history [--dry-run] [--full] [--until ISO] [--limit N] [--batch-size 500] [--concurrency 1..8] [--delay-ms 250] [--url URL]
@@ -228,7 +229,6 @@ function collectorPidRecord(runtimeIdentity: CollectorRuntimeIdentity): Collecto
 }
 
 async function main() {
-  cleanupStaleJoinHandshakeDirectories();
   if (command === "help" || command === "--help" || command === "-h") {
     printHelp();
     return;
@@ -241,35 +241,54 @@ async function main() {
     if (flag("--dry-run")) {
       throw new Error(
         "join --dry-run is unsupported because redeeming a single-use token is not a preview. " +
-          "No token was read, no request was sent, and no config was changed.",
+          "No token was read, no request was sent, and no local state was changed.",
       );
     }
-    const targetArgument = process.argv[3];
-    const resume = flag("--resume");
-    const tokenFromStdin = flag("--token-stdin") || targetArgument === "-";
-    if (resume && (process.argv.length !== 4 || targetArgument !== "--resume")) {
+    const joinArguments = process.argv.slice(3);
+    const targetArgument = joinArguments[0];
+    const resume = targetArgument === "--resume";
+    if (resume && joinArguments.length !== 1) {
       throw new Error("join --resume does not accept another token or URL.");
     }
-    if (
-      tokenFromStdin &&
-      targetArgument &&
-      !targetArgument.startsWith("--") &&
-      targetArgument !== "-"
-    ) {
-      throw new Error("Choose either a positional join token/URL or --token-stdin, not both.");
+    const tokenFromStdin = targetArgument === "--token-stdin" || targetArgument === "-";
+    if (!resume && (!targetArgument || (targetArgument.startsWith("--") && !tokenFromStdin))) {
+      throw new Error(
+        'Usage: plimsoll join --token-stdin --url <cloud-base-url>  |  plimsoll join "<join-url>#<token>"  |  plimsoll join --resume',
+      );
     }
+    let joinBaseUrl: string | undefined;
+    for (let index = 1; !resume && index < joinArguments.length; index += 1) {
+      const argument = joinArguments[index];
+      if (argument === "--token-stdin") {
+        throw new Error("Choose either a positional join token/URL or --token-stdin, not both.");
+      }
+      if (argument !== "--url") {
+        throw new Error(`Unsupported join option or argument: ${argument}`);
+      }
+      if (joinBaseUrl !== undefined) throw new Error("join --url may be provided only once.");
+      const value = joinArguments[index + 1];
+      if (!value || value.startsWith("--")) {
+        throw new Error("join --url requires a URL value.");
+      }
+      joinBaseUrl = value;
+      index += 1;
+    }
+
+    // Only a fully validated, real join/resume may scavenge stale handshake
+    // state. Unsupported preview/options must be observably read-only.
+    cleanupStaleJoinHandshakeDirectories();
     const result = resume
       ? await resumePendingJoin()
       : await (async () => {
           const target = tokenFromStdin ? (await readStdin()).trim() : targetArgument;
-          if (!target || (!tokenFromStdin && target.startsWith("--"))) {
+          if (!target) {
             throw new Error(
               'Usage: plimsoll join --token-stdin --url <cloud-base-url>  |  plimsoll join "<join-url>#<token>"  |  plimsoll join --resume',
             );
           }
           return performJoin({
             target,
-            baseUrl: optionValue("--url") ?? process.env.PLIMSOLL_CLOUD_URL,
+            baseUrl: joinBaseUrl ?? process.env.PLIMSOLL_CLOUD_URL,
           });
         })();
     if (!result.joined) {
@@ -311,6 +330,11 @@ async function main() {
       ),
     );
     return;
+  }
+
+  if (command === "start") {
+    cleanupStaleJoinHandshakeDirectories();
+    finalizeActivatedPendingJoin();
   }
 
   const configPath = collectorConfigPath();

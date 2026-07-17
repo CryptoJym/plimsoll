@@ -62,6 +62,7 @@ const pendingJoinSchema = z.object({
   joinOrigin: z.string().url(),
   appVersion: z.string().trim().min(1),
   probeSourceId: z.string().trim().min(1),
+  handshakeEventId: z.string().trim().min(1).optional(),
   stagedConfig: collectorConfigSchema,
 });
 type PendingJoin = z.infer<typeof pendingJoinSchema>;
@@ -170,6 +171,19 @@ function writePendingJoin(pending: PendingJoin, file: string) {
   }
 }
 
+function replacePendingJoin(pending: PendingJoin, file: string) {
+  const temporaryPath = `${file}.${process.pid}.${crypto.randomUUID()}.tmp`;
+  try {
+    fs.writeFileSync(temporaryPath, `${JSON.stringify(pending, null, 2)}\n`, {
+      flag: "wx",
+      mode: 0o600,
+    });
+    fs.renameSync(temporaryPath, file);
+  } finally {
+    fs.rmSync(temporaryPath, { force: true });
+  }
+}
+
 function readPendingJoin(file: string) {
   if (!fs.existsSync(file)) {
     throw new Error("No pending join grant exists. Redeem a fresh join token first.");
@@ -233,6 +247,122 @@ function processIsLive(pid: number) {
   }
 }
 
+function acquireJoinLock(homeDir: string) {
+  const directory = path.dirname(collectorConfigPath(homeDir));
+  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const lockFile = path.join(directory, "join.lock");
+  const nonce = crypto.randomUUID();
+  const candidate = `${lockFile}.${process.pid}.${nonce}.tmp`;
+  fs.writeFileSync(
+    candidate,
+    `${JSON.stringify({ version: 1, pid: process.pid, nonce, createdAt: new Date().toISOString() })}\n`,
+    { flag: "wx", mode: 0o600 },
+  );
+  let acquired = false;
+  try {
+    for (let attempt = 0; attempt < 20; attempt += 1) {
+      try {
+        // Atomic no-replace publication: the lock always appears with complete
+        // owner metadata, never as a partially written file.
+        fs.linkSync(candidate, lockFile);
+        acquired = true;
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+
+      let owner: { pid: number; nonce: string };
+      try {
+        const parsed = JSON.parse(fs.readFileSync(lockFile, "utf8")) as Record<string, unknown>;
+        if (!Number.isSafeInteger(parsed.pid) || typeof parsed.nonce !== "string") {
+          throw new Error("invalid lock owner");
+        }
+        owner = { pid: Number(parsed.pid), nonce: parsed.nonce };
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw new Error(
+          "Workspace join is blocked by an unreadable join lock; refusing token redemption.",
+          { cause: error },
+        );
+      }
+      if (processIsLive(owner.pid)) {
+        throw new Error("Another workspace join is already in progress; no token was redeemed.");
+      }
+
+      const staleFile = `${lockFile}.stale.${process.pid}.${crypto.randomUUID()}`;
+      try {
+        fs.renameSync(lockFile, staleFile);
+        fs.rmSync(staleFile, { force: true });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw error;
+      }
+    }
+    if (!acquired) {
+      throw new Error("Could not acquire the workspace join lock; no token was redeemed.");
+    }
+  } finally {
+    fs.rmSync(candidate, { force: true });
+  }
+
+  return () => {
+    try {
+      const owner = JSON.parse(fs.readFileSync(lockFile, "utf8")) as { nonce?: unknown };
+      if (owner.nonce === nonce) fs.rmSync(lockFile, { force: true });
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  };
+}
+
+function configMatchesPending(configPath: string, pending: PendingJoin) {
+  if (!fs.existsSync(configPath)) return false;
+  try {
+    return JSON.stringify(readConfigWithoutCreating(configPath)) === JSON.stringify(pending.stagedConfig);
+  } catch {
+    return false;
+  }
+}
+
+function ledgerMatchesPending(homeDir: string, pending: PendingJoin) {
+  const ledgerPath = collectorBufferPath(homeDir);
+  if (!fs.existsSync(ledgerPath)) return false;
+  const buffer = new LocalEventBuffer(ledgerPath);
+  try {
+    return buffer.workspaceBinding()?.currentWorkspaceId === pending.stagedConfig.tenantId;
+  } finally {
+    buffer.close();
+  }
+}
+
+function activationAlreadyComplete(homeDir: string, pending: PendingJoin) {
+  return (
+    configMatchesPending(collectorConfigPath(homeDir), pending) &&
+    ledgerMatchesPending(homeDir, pending)
+  );
+}
+
+function completedJoinResult(homeDir: string, pending: PendingJoin): JoinResult {
+  return {
+    joined: true,
+    configPath: collectorConfigPath(homeDir),
+    tenantId: pending.stagedConfig.tenantId,
+    uploadUrl: pending.stagedConfig.uploadUrl ?? "",
+    uploadSigningConfigured: Boolean(pending.stagedConfig.uploadSigningSecret),
+    workspaceBoundary: {
+      fromWorkspaceId: pending.fromWorkspaceId,
+      toWorkspaceId: pending.stagedConfig.tenantId,
+      boundLegacyRows: 0,
+    },
+    handshake: {
+      uploadedEvents: 1,
+      selfTestEventId: pending.handshakeEventId ?? pending.probeSourceId,
+      signedUpload: Boolean(pending.stagedConfig.uploadSigningSecret),
+      response: { status: "already_activated" },
+    },
+  };
+}
+
 /** Remove only handshake directories whose owning process is no longer live. */
 export function cleanupStaleJoinHandshakeDirectories(root = os.tmpdir()) {
   if (!fs.existsSync(root)) return 0;
@@ -271,15 +401,22 @@ function installSignalCleanup(cleanup: () => void) {
 }
 
 async function activatePendingJoin(
-  pending: PendingJoin,
+  pendingInput: PendingJoin,
   options: {
     homeDir: string;
     fetchImpl: typeof fetch;
     pendingFile: string;
     temporaryRoot?: string;
+    /** Proof-only interruption seam after config activation, before journal unlink. */
+    afterConfigActivation?: () => void;
   },
 ): Promise<JoinResult> {
+  let pending = pendingInput;
   const activeConfigPath = collectorConfigPath(options.homeDir);
+  if (activationAlreadyComplete(options.homeDir, pending)) {
+    fs.rmSync(options.pendingFile, { force: true });
+    return completedJoinResult(options.homeDir, pending);
+  }
   const currentFingerprint = activeConfigFingerprint(activeConfigPath);
   if (currentFingerprint !== pending.activeConfigFingerprint) {
     throw new Error(
@@ -363,6 +500,8 @@ async function activatePendingJoin(
       throw new Error("Join handshake did not explicitly acknowledge exactly its one synthetic probe.");
     }
     handshakeAcknowledged = true;
+    pending = pendingJoinSchema.parse({ ...pending, handshakeEventId: selfTestEventId });
+    replacePendingJoin(pending, options.pendingFile);
 
     cleanupTemporaryState();
     const activeLedgerPath = collectorBufferPath(options.homeDir);
@@ -388,6 +527,7 @@ async function activatePendingJoin(
     }
 
     activateConfigAtomically(pending.stagedConfig, activeConfigPath);
+    options.afterConfigActivation?.();
     fs.rmSync(options.pendingFile, { force: true });
     return {
       joined: true,
@@ -424,19 +564,41 @@ export async function resumePendingJoin(options: {
   temporaryRoot?: string;
 } = {}): Promise<JoinResult> {
   const homeDir = options.homeDir ?? os.homedir();
-  const pendingFile = pendingJoinPath(homeDir);
-  const pending = readPendingJoin(pendingFile);
-  if (options.appVersion && options.appVersion !== pending.appVersion) {
-    throw new Error(
-      `Pending join was staged by app version ${pending.appVersion}; refusing to resume as ${options.appVersion}.`,
-    );
+  const releaseLock = acquireJoinLock(homeDir);
+  try {
+    const pendingFile = pendingJoinPath(homeDir);
+    const pending = readPendingJoin(pendingFile);
+    if (options.appVersion && options.appVersion !== pending.appVersion) {
+      throw new Error(
+        `Pending join was staged by app version ${pending.appVersion}; refusing to resume as ${options.appVersion}.`,
+      );
+    }
+    return await activatePendingJoin(pending, {
+      homeDir,
+      fetchImpl: options.fetchImpl ?? fetch,
+      pendingFile,
+      temporaryRoot: options.temporaryRoot,
+    });
+  } finally {
+    releaseLock();
   }
-  return activatePendingJoin(pending, {
-    homeDir,
-    fetchImpl: options.fetchImpl ?? fetch,
-    pendingFile,
-    temporaryRoot: options.temporaryRoot,
-  });
+}
+
+/** Startup-only recovery: remove a journal left after coherent B+B activation. */
+export function finalizeActivatedPendingJoin(options: { homeDir?: string } = {}) {
+  const homeDir = options.homeDir ?? os.homedir();
+  const pendingFile = pendingJoinPath(homeDir);
+  if (!fs.existsSync(pendingFile)) return false;
+  const releaseLock = acquireJoinLock(homeDir);
+  try {
+    if (!fs.existsSync(pendingFile)) return false;
+    const pending = readPendingJoin(pendingFile);
+    if (!activationAlreadyComplete(homeDir, pending)) return false;
+    fs.rmSync(pendingFile, { force: true });
+    return true;
+  } finally {
+    releaseLock();
+  }
 }
 
 export async function performJoin(options: {
@@ -447,6 +609,8 @@ export async function performJoin(options: {
   fetchImpl?: typeof fetch;
   /** Test/proof seam only; the temporary ledger is still deleted on every path. */
   temporaryRoot?: string;
+  /** Test/proof seam only; simulates interruption after config activation. */
+  afterConfigActivation?: () => void;
 }): Promise<JoinResult> {
   const { token, baseUrl } = parseJoinTarget(options.target, options.baseUrl);
   if (!token) {
@@ -463,66 +627,71 @@ export async function performJoin(options: {
   const fetchImpl = options.fetchImpl ?? fetch;
   const homeDir = options.homeDir ?? os.homedir();
   const appVersion = options.appVersion ?? COLLECTOR_APP_VERSION;
-  const activeConfigPath = collectorConfigPath(homeDir);
-  const pendingFile = pendingJoinPath(homeDir);
-  if (fs.existsSync(pendingFile)) {
-    throw new Error(
-      "A pending join grant already exists. Run join --resume before redeeming another token.",
-    );
-  }
-  const existingConfig = readConfigWithoutCreating(activeConfigPath);
   const joinBase = validatedTransportUrl(baseUrl, "Workspace join URL");
   const joinUrl = new URL(CLOUD_JOIN_PATH, joinBase.origin);
+  const releaseLock = acquireJoinLock(homeDir);
+  try {
+    const activeConfigPath = collectorConfigPath(homeDir);
+    const pendingFile = pendingJoinPath(homeDir);
+    if (fs.existsSync(pendingFile)) {
+      throw new Error(
+        "A pending join grant already exists. Run join --resume before redeeming another token.",
+      );
+    }
+    const existingConfig = readConfigWithoutCreating(activeConfigPath);
+    const response = await fetchImpl(joinUrl, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        token,
+        platform: process.platform === "darwin" ? "macos" : process.platform,
+        appVersion,
+      }),
+    });
+    assertNoRedirect(response, "Workspace join", joinUrl.origin);
+    const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
 
-  const response = await fetchImpl(joinUrl, {
-    method: "POST",
-    redirect: "manual",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      token,
-      platform: process.platform === "darwin" ? "macos" : process.platform,
+    if (!response.ok) {
+      // Never include an untrusted response body: it may contain token or grant
+      // material. Refusals leave the active config byte-for-byte untouched.
+      const reason = typeof body.reason === "string" ? body.reason : "unknown_error";
+      return {
+        joined: false,
+        reason,
+        message:
+          JOIN_REFUSAL_MESSAGES[reason] ??
+          `Join refused with HTTP ${response.status} (${reason}).`,
+        httpStatus: response.status,
+        configTouched: false,
+      };
+    }
+
+    const grant = joinGrantSchema.parse(body);
+    const uploadUrl = validatedTransportUrl(grant.uploadUrl, "Granted upload URL");
+    if (uploadUrl.origin !== joinUrl.origin) {
+      throw new Error("Granted upload URL must use the same origin as the workspace join URL.");
+    }
+    const stagedConfig = stageGrant(existingConfig, grant);
+    const pending = pendingJoinSchema.parse({
+      version: 1,
+      createdAt: new Date().toISOString(),
+      activeConfigFingerprint: activeConfigFingerprint(activeConfigPath),
+      fromWorkspaceId: existingConfig.tenantId,
+      joinOrigin: joinUrl.origin,
       appVersion,
-    }),
-  });
-  assertNoRedirect(response, "Workspace join", joinUrl.origin);
-  const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
-
-  if (!response.ok) {
-    // Never include an untrusted response body: it may contain token or grant
-    // material. Refusals leave the active config byte-for-byte untouched.
-    const reason = typeof body.reason === "string" ? body.reason : "unknown_error";
-    return {
-      joined: false,
-      reason,
-      message:
-        JOIN_REFUSAL_MESSAGES[reason] ??
-        `Join refused with HTTP ${response.status} (${reason}).`,
-      httpStatus: response.status,
-      configTouched: false,
-    };
+      probeSourceId: crypto.randomUUID(),
+      stagedConfig,
+    });
+    writePendingJoin(pending, pendingFile);
+    return await activatePendingJoin(pending, {
+      homeDir,
+      fetchImpl,
+      pendingFile,
+      temporaryRoot: options.temporaryRoot,
+      afterConfigActivation: options.afterConfigActivation,
+    });
+  } finally {
+    releaseLock();
   }
-
-  const grant = joinGrantSchema.parse(body);
-  const uploadUrl = validatedTransportUrl(grant.uploadUrl, "Granted upload URL");
-  if (uploadUrl.origin !== joinUrl.origin) {
-    throw new Error("Granted upload URL must use the same origin as the workspace join URL.");
-  }
-  const stagedConfig = stageGrant(existingConfig, grant);
-  const pending = pendingJoinSchema.parse({
-    version: 1,
-    createdAt: new Date().toISOString(),
-    activeConfigFingerprint: activeConfigFingerprint(activeConfigPath),
-    fromWorkspaceId: existingConfig.tenantId,
-    joinOrigin: joinUrl.origin,
-    appVersion,
-    probeSourceId: crypto.randomUUID(),
-    stagedConfig,
-  });
-  writePendingJoin(pending, pendingFile);
-  return activatePendingJoin(pending, {
-    homeDir,
-    fetchImpl,
-    pendingFile,
-    temporaryRoot: options.temporaryRoot,
-  });
 }
