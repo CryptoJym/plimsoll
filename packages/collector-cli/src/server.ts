@@ -1,6 +1,5 @@
 import fs from "node:fs";
 import http from "node:http";
-import zlib from "node:zlib";
 
 import { LocalEventBuffer } from "./buffer";
 import type { CollectorConfig } from "./config";
@@ -8,7 +7,6 @@ import {
   canonicalizeSuppressionReceipts,
   normalizeGitRemote,
   remoteLinkageHash,
-  type ToolSource,
 } from "../../shared/src/index";
 import { appendForwardedHook } from "./forwarder";
 import { explodeOtlpPayload } from "./otlp";
@@ -16,6 +14,21 @@ import { saveCollectorConfig } from "./config";
 import { readLocalIdentities } from "./local-identity";
 import type { CollectorRuntimeIdentity } from "./runtime-ownership";
 import { codexReconciliationStatus } from "./codex-reconciliation";
+import {
+  HttpBoundaryRejection,
+  asHttpBoundaryRejection,
+  assertBoundedJsonNodes,
+  assertAllowedHost,
+  assertBoundedOtlpCardinality,
+  assertHookSource,
+  assertNoBrowserOrigin,
+  createRequestBudget,
+  decodeBoundedRequestBody,
+  parseBoundedJson,
+  readBoundedRequestBody,
+  requireOtlpSource,
+  type LocalProducerSource,
+} from "./http-boundary";
 
 let dashboardHtml: string | undefined;
 function loadDashboardHtml() {
@@ -33,93 +46,19 @@ function sendJson(
   response.end(JSON.stringify(body));
 }
 
-function readRequestBody(request: http.IncomingMessage) {
-  return new Promise<Buffer>((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    request.on("data", (chunk) => {
-      chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-    });
-    request.on("end", () => resolve(Buffer.concat(chunks)));
-    request.on("error", reject);
-  });
-}
-
 function firstHeader(value: string | string[] | undefined) {
   return Array.isArray(value) ? value[0] : value;
 }
 
-function decodeRequestBody(request: http.IncomingMessage, body: Buffer) {
-  const contentEncoding = firstHeader(request.headers["content-encoding"])?.toLowerCase() ?? "identity";
-  const decoded =
-    contentEncoding === "gzip"
-      ? zlib.gunzipSync(body)
-      : contentEncoding === "deflate"
-        ? zlib.inflateSync(body)
-        : contentEncoding === "br"
-          ? zlib.brotliDecompressSync(body)
-          : body;
-
-  return {
-    bodyBytes: body.length,
-    contentEncoding,
-    decodedBytes: decoded.length,
-    text: decoded.toString("utf8"),
-  };
-}
-
-function sourceFromPath(url = ""): ToolSource {
-  if (url.includes("claude")) return "claude_code";
-  if (url.includes("codex")) return "codex";
-  return "unknown";
-}
-
-function sourceFromHeaders(request: http.IncomingMessage): ToolSource | undefined {
-  const value = request.headers["x-plimsoll-source"] ?? request.headers["x-cfo-one-source"];
-  const source = Array.isArray(value) ? value[0] : value;
-  if (source === "claude_code" || source === "codex") {
-    return source;
-  }
-
-  return undefined;
-}
-
-const REQUEST_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"]);
-
-function sanitizedRequestMethod(method: string | undefined) {
-  const candidate = method?.toUpperCase() ?? "";
-  return REQUEST_METHODS.has(candidate) ? candidate : "OTHER";
-}
-
-/**
- * Request failures are observability metadata, not an echo surface. Keep the
- * route useful while ensuring an arbitrary URL/query can never enter logs or
- * responses.
- */
-function sanitizedRequestPath(rawUrl: string | undefined) {
-  let pathname: string;
+function hookSourceFromPath(rawUrl: string | undefined): LocalProducerSource | undefined {
   try {
-    pathname = new URL(rawUrl ?? "", "http://127.0.0.1").pathname;
+    const pathname = new URL(rawUrl ?? "", "http://127.0.0.1").pathname;
+    if (pathname === "/hooks/claude-code") return "claude_code";
+    if (pathname === "/hooks/codex") return "codex";
   } catch {
-    return "/invalid";
+    return undefined;
   }
-  if (pathname.startsWith("/hooks/")) return "/hooks/:source";
-  if (pathname.startsWith("/api/settings/")) return "/api/settings/:action";
-  if (pathname.startsWith("/api/")) return "/api/:route";
-  if (pathname === "/v1/logs" || pathname === "/v1/traces" || pathname === "/v1/metrics") {
-    return pathname;
-  }
-  if (pathname === "/" || pathname === "/index.html" || pathname === "/status") {
-    return pathname;
-  }
-  return "/other";
-}
-
-function allowlistedErrorClass(error: unknown) {
-  if (error instanceof SyntaxError) return "SyntaxError";
-  if (error instanceof TypeError) return "TypeError";
-  if (error instanceof RangeError) return "RangeError";
-  if (error instanceof Error) return "Error";
-  return "UnknownError";
+  return undefined;
 }
 
 /**
@@ -177,7 +116,10 @@ export function createCollectorServer(
   };
 
   return http.createServer(async (request, response) => {
+    const budget = createRequestBudget();
     try {
+      assertAllowedHost(request);
+
       if (request.method === "GET" && request.url === "/status") {
         const read = snapshotResponse(30);
         if (read.kind === "ready") {
@@ -328,14 +270,19 @@ export function createCollectorServer(
           sendJson(response, { error: "untrusted_write_origin" }, 403);
           return;
         }
-        const body = decodeRequestBody(request, await readRequestBody(request));
+        const body = decodeBoundedRequestBody(
+          request,
+          await readBoundedRequestBody(request, budget),
+        );
         let parsed: Record<string, unknown>;
         try {
-          parsed = JSON.parse(body.text || "{}") as Record<string, unknown>;
-        } catch {
-          sendJson(response, { error: "invalid_json" }, 400);
-          return;
+          parsed = parseBoundedJson(body.text) as Record<string, unknown>;
+        } catch (error) {
+          if (error instanceof HttpBoundaryRejection) throw error;
+          throw new HttpBoundaryRejection("invalid_json", 400);
         }
+        assertBoundedJsonNodes(parsed);
+        budget.checkpoint();
 
         if (request.url === "/api/settings/account-label") {
           const accountHash = typeof parsed.accountHash === "string" ? parsed.accountHash : "";
@@ -432,12 +379,21 @@ export function createCollectorServer(
       }
 
       if (request.method === "POST" && request.url?.startsWith("/hooks/")) {
-        const body = decodeRequestBody(request, await readRequestBody(request));
-        const payload = JSON.parse(body.text || "{}");
+        assertNoBrowserOrigin(request);
+        const source = hookSourceFromPath(request.url);
+        if (!source) throw new HttpBoundaryRejection("source_not_allowed", 401);
+        assertHookSource(request, source);
+        const body = decodeBoundedRequestBody(
+          request,
+          await readBoundedRequestBody(request, budget),
+        );
+        const payload = parseBoundedJson(body.text);
+        assertBoundedJsonNodes(payload);
+        budget.checkpoint();
         const normalized = appendForwardedHook(payload, {
           config,
           buffer,
-          source: sourceFromPath(request.url),
+          source,
         });
         response.writeHead(202, { "content-type": "application/json" });
         response.end(
@@ -455,66 +411,65 @@ export function createCollectorServer(
         request.method === "POST" &&
         (request.url === "/v1/logs" || request.url === "/v1/traces" || request.url === "/v1/metrics")
       ) {
-        const body = decodeRequestBody(request, await readRequestBody(request));
-        const source = sourceFromHeaders(request) ?? "unknown";
-        let parsedEnvelope: unknown;
-        try {
-          parsedEnvelope = JSON.parse(body.text || "{}");
-        } catch {
-          parsedEnvelope = undefined;
+        assertNoBrowserOrigin(request);
+        const source = requireOtlpSource(request);
+        const body = decodeBoundedRequestBody(
+          request,
+          await readBoundedRequestBody(request, budget),
+        );
+        const parsedEnvelope = parseBoundedJson(body.text);
+        assertBoundedOtlpCardinality(parsedEnvelope);
+
+        const repoLabels: Array<{ hash: string; label: string }> = [];
+        const exploded = explodeOtlpPayload(parsedEnvelope, {
+          policy: config.policy,
+          source,
+          transportPath: request.url,
+          onRepoLabel: (hash, label) => repoLabels.push({ hash, label }),
+        });
+
+        if (
+          exploded.events.length > 0 ||
+          exploded.metricSamples.length > 0 ||
+          exploded.droppedEventCount > 0
+        ) {
+          budget.checkpoint();
+          for (const { hash, label } of repoLabels) buffer.recordRepoLabel(hash, label);
+          buffer.appendMany(
+            exploded.events,
+            exploded.metricSamples,
+            exploded.admissionDrops,
+          );
+          response.writeHead(202, { "content-type": "application/json" });
+          response.end(
+            JSON.stringify({
+              accepted: true,
+              events: exploded.events.length,
+              metricSamples: exploded.metricSamples.length,
+              recordCount: exploded.recordCount,
+              datapointCount: exploded.datapointCount,
+              parseFailures: exploded.parseFailures,
+              droppedEvents: exploded.droppedEventCount,
+              droppedByReason: exploded.admissionDrops,
+              suppressedFields: canonicalizeSuppressionReceipts([
+                ...exploded.events.flatMap((entry) => entry.suppressedFields),
+                ...exploded.metricSamples.flatMap((sample) => sample.suppressedFields),
+              ]),
+            }),
+          );
+          return;
         }
 
-        if (parsedEnvelope !== undefined) {
-          const exploded = explodeOtlpPayload(parsedEnvelope, {
-            policy: config.policy,
-            source,
-            transportPath: request.url,
-            onRepoLabel: (hash, label) => buffer.recordRepoLabel(hash, label),
-          });
-
-          if (
-            exploded.events.length > 0 ||
-            exploded.metricSamples.length > 0 ||
-            exploded.droppedEventCount > 0
-          ) {
-            buffer.appendMany(
-              exploded.events,
-              exploded.metricSamples,
-              exploded.admissionDrops,
-            );
-            response.writeHead(202, { "content-type": "application/json" });
-            response.end(
-              JSON.stringify({
-                accepted: true,
-                events: exploded.events.length,
-                metricSamples: exploded.metricSamples.length,
-                recordCount: exploded.recordCount,
-                datapointCount: exploded.datapointCount,
-                parseFailures: exploded.parseFailures,
-                droppedEvents: exploded.droppedEventCount,
-                droppedByReason: exploded.admissionDrops,
-                suppressedFields: canonicalizeSuppressionReceipts([
-                  ...exploded.events.flatMap((entry) => entry.suppressedFields),
-                  ...exploded.metricSamples.flatMap((sample) => sample.suppressedFields),
-                ]),
-              }),
-            );
-            return;
-          }
-        }
-
-        // Unknown or non-JSON OTLP shape: keep a metadata-only transport row, never the body.
+        // Unknown JSON OTLP shape: keep a metadata-only transport row, never the body.
         const fallbackPayload = {
           event_type: "otel_span",
           content_type: request.headers["content-type"] ?? "unknown",
           body_bytes: body.bodyBytes,
           body_decoded_bytes: body.decodedBytes,
-          body_parse_error:
-            parsedEnvelope === undefined
-              ? "non_json_or_unsupported_otlp_payload"
-              : "unrecognized_otlp_envelope_shape",
+          body_parse_error: "unrecognized_otlp_envelope_shape",
           content_encoding: body.contentEncoding,
         };
+        budget.checkpoint();
         const normalized = appendForwardedHook(fallbackPayload, {
           config,
           buffer,
@@ -535,15 +490,21 @@ export function createCollectorServer(
       response.writeHead(404, { "content-type": "application/json" });
       response.end(JSON.stringify({ error: "not_found" }));
     } catch (error) {
+      const failure = asHttpBoundaryRejection(error);
       const rejection = {
         error: "collector_request_rejected",
-        errorClass: allowlistedErrorClass(error),
-        method: sanitizedRequestMethod(request.method),
-        path: sanitizedRequestPath(request.url),
+        reason: failure.reason,
       };
       console.warn(JSON.stringify(rejection));
-      response.writeHead(400, { "content-type": "application/json" });
-      response.end(JSON.stringify(rejection));
+      if (!response.headersSent) {
+        response.writeHead(failure.status, {
+          connection: "close",
+          "content-type": "application/json",
+        });
+        response.end(JSON.stringify(rejection));
+      } else {
+        response.destroy();
+      }
     }
   });
 }
