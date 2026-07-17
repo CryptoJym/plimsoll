@@ -16,7 +16,10 @@ import zlib from "node:zlib";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
-import { LOCAL_HTTP_LIMITS } from "../packages/collector-cli/src/http-boundary";
+import {
+  LOCAL_HTTP_LIMITS,
+  isAllowedLocalHostValue,
+} from "../packages/collector-cli/src/http-boundary";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 
 type Receipt = { error?: unknown; reason?: unknown; [key: string]: unknown };
@@ -46,6 +49,7 @@ function request(
   route: string,
   body: Buffer | string,
   headers: Record<string, string> = {},
+  method = "POST",
 ) {
   const startedAt = performance.now();
   const bodyBuffer = Buffer.isBuffer(body) ? body : Buffer.from(body);
@@ -55,7 +59,7 @@ function request(
         host: "127.0.0.1",
         port,
         path: route,
-        method: "POST",
+        method,
         headers: {
           connection: "close",
           "content-type": "application/json",
@@ -87,6 +91,50 @@ function request(
     client.setTimeout(5_000, () => client.destroy(new Error("ProofClientTimeout")));
     client.on("error", reject);
     client.end(bodyBuffer);
+  });
+}
+
+function hostMultiplicityRequest(port: number, hosts: string[]) {
+  const startedAt = performance.now();
+  return new Promise<HttpResult>((resolve, reject) => {
+    const rawHeaders = [
+      "Connection",
+      "close",
+      ...hosts.flatMap((host) => ["Host", host]),
+    ];
+    const client = http.request(
+      {
+        host: "127.0.0.1",
+        port,
+        path: "/status",
+        method: "GET",
+        setHost: false,
+        headers: rawHeaders,
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+        response.on("end", () => {
+          const responseBody = Buffer.concat(chunks);
+          let parsed: Receipt = {};
+          try {
+            parsed = JSON.parse(responseBody.toString("utf8")) as Receipt;
+          } catch {
+            parsed = {};
+          }
+          resolve({
+            status: response.statusCode ?? 0,
+            body: parsed,
+            bodyBytes: responseBody.length,
+            elapsedMs: performance.now() - startedAt,
+            headers: response.headers,
+          });
+        });
+      },
+    );
+    client.setTimeout(5_000, () => client.destroy(new Error("ProofClientTimeout")));
+    client.on("error", reject);
+    client.end();
   });
 }
 
@@ -162,14 +210,107 @@ async function main() {
     const rssBefore = process.memoryUsage().rss;
     const cpuBefore = process.cpuUsage();
 
-    const invalidHost = await request(port, "/v1/logs", "{}", {
-      host: SENTINELS[0],
-      "x-plimsoll-source": "codex",
-    });
+    const validHostValues = [
+      "localhost",
+      "LOCALHOST",
+      "LoCaLhOsT:1",
+      "127.0.0.1",
+      "127.0.0.1:65535",
+      "[::1]",
+      "[::1]:48271",
+    ];
+    const invalidHostValues = [
+      SENTINELS[0],
+      "localhost/path",
+      "localhost?x=1",
+      "localhost#frag",
+      "127.0.0.1/path",
+      "[::1]/path",
+      "localhost:",
+      "127.0.0.1:",
+      "[::1]:",
+      "2130706433",
+      "0177.0.0.1",
+      "127.1",
+      "0x7f000001",
+      "017700000001",
+      "user@localhost",
+      "localhost.",
+      "local host",
+      "localhost :48271",
+      "localhost: 48271",
+      "localhost:0",
+      "localhost:00",
+      "localhost:01",
+      "localhost:65536",
+      "localhost:99999",
+      "localhost:+80",
+      "localhost:-1",
+      "localhost:80.0",
+      "localhost:abc",
+      "[0:0:0:0:0:0:0:1]",
+    ];
+    const directInvalidWhitespaceValues = [
+      " localhost",
+      "localhost ",
+      "\tlocalhost",
+      "localhost\t",
+      "localhost:\t48271",
+    ];
     check(
-      "host_allowlist_rejects_non_loopback_before_write",
-      stableRejection(invalidHost, "host_not_allowed", 421),
-      invalidHost,
+      "host_value_grammar_accepts_only_exact_case_insensitive_loopback_forms",
+      validHostValues.every(isAllowedLocalHostValue) &&
+        [...invalidHostValues, ...directInvalidWhitespaceValues].every(
+          (host) => !isAllowedLocalHostValue(host),
+        ),
+      {
+        accepted: validHostValues,
+        rejected: invalidHostValues.length + directInvalidWhitespaceValues.length,
+      },
+    );
+
+    const validHostResponses = await Promise.all(
+      validHostValues.map((host) => request(port, "/not-found", "", { host }, "GET")),
+    );
+    check(
+      "actual_requests_accept_only_the_canonical_loopback_host_matrix",
+      validHostResponses.every((result) => result.status === 404),
+      validHostResponses.map((result, index) => ({
+        host: validHostValues[index],
+        status: result.status,
+      })),
+    );
+
+    const invalidHostResponses = await Promise.all(
+      invalidHostValues.map((host) => request(port, "/status", "", { host }, "GET")),
+    );
+    check(
+      "actual_status_requests_reject_normalization_alias_path_query_fragment_userinfo_whitespace_and_port_edges",
+      invalidHostResponses.every(
+        (result) => stableRejection(result, "host_not_allowed", 421),
+      ) &&
+        invalidHostResponses.every((result, index) =>
+          !JSON.stringify(result.body).includes(invalidHostValues[index]!),
+        ),
+      invalidHostResponses.map((result, index) => ({
+        host: invalidHostValues[index],
+        status: result.status,
+        reason: result.body.reason,
+      })),
+    );
+
+    const duplicateSameHost = await hostMultiplicityRequest(port, ["localhost", "localhost"]);
+    const duplicateDifferentHost = await hostMultiplicityRequest(port, [
+      "localhost",
+      "127.0.0.1",
+    ]);
+    const hostMultiplicityResponses = [duplicateSameHost, duplicateDifferentHost];
+    check(
+      "duplicate_host_headers_reject_before_route_work",
+      hostMultiplicityResponses.every((result) =>
+        stableRejection(result, "host_not_allowed", 421),
+      ),
+      hostMultiplicityResponses,
     );
 
     const hookOrigin = await request(port, "/hooks/codex", "{}", {
@@ -340,13 +481,15 @@ async function main() {
     );
 
     const warningText = warnings.join("\n");
+    const expectedWarningCount = invalidHostValues.length + hostMultiplicityResponses.length + 13;
     check(
       "all_rejection_receipts_are_bounded_and_value_free",
-      warnings.length === 14 &&
+      warnings.length === expectedWarningCount &&
         warnings.every((warning) => Buffer.byteLength(warning) <= 128) &&
         SENTINELS.every((sentinel) => !warningText.includes(sentinel)),
       {
         warningCount: warnings.length,
+        expectedWarningCount,
         maxWarningBytes: Math.max(...warnings.map((warning) => Buffer.byteLength(warning))),
       },
     );

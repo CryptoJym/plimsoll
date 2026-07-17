@@ -59,6 +59,23 @@ function firstHeader(value: string | string[] | undefined) {
   return Array.isArray(value) ? value[0] : value;
 }
 
+const LOCAL_HOST_GRAMMAR = /^(?:localhost|127\.0\.0\.1|\[::1\])(?::([1-9][0-9]{0,4}))?$/i;
+
+/**
+ * Validate the semantic Host field without URL parsing or normalization.
+ * Hostnames are case-insensitive, but every other byte must already be in the
+ * one accepted canonical form. In particular: no numeric/octal aliases,
+ * userinfo, path/query/fragment, whitespace, empty port, leading-zero port,
+ * or out-of-range port can be normalized into the allowlist.
+ */
+export function isAllowedLocalHostValue(host: string) {
+  if (host !== host.trim()) return false;
+  const match = LOCAL_HOST_GRAMMAR.exec(host);
+  if (!match) return false;
+  const port = match[1];
+  return port === undefined || Number(port) <= 65_535;
+}
+
 export function assertAllowedHost(request: http.IncomingMessage) {
   const host = firstHeader(request.headers.host);
   const hostHeaderCount = request.rawHeaders.reduce(
@@ -66,21 +83,7 @@ export function assertAllowedHost(request: http.IncomingMessage) {
       index % 2 === 0 && header.toLowerCase() === "host" ? count + 1 : count,
     0,
   );
-  if (!host || hostHeaderCount !== 1) {
-    throw new HttpBoundaryRejection("host_not_allowed", 421);
-  }
-
-  try {
-    const parsed = new URL(`http://${host}`);
-    if (
-      parsed.username ||
-      parsed.password ||
-      !["127.0.0.1", "localhost", "[::1]"].includes(parsed.hostname.toLowerCase())
-    ) {
-      throw new HttpBoundaryRejection("host_not_allowed", 421);
-    }
-  } catch (error) {
-    if (error instanceof HttpBoundaryRejection) throw error;
+  if (!host || hostHeaderCount !== 1 || !isAllowedLocalHostValue(host)) {
     throw new HttpBoundaryRejection("host_not_allowed", 421);
   }
 }
