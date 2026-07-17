@@ -469,9 +469,8 @@ async function run(mode: WorkerMode, root: string, operatorHome: string): Promis
           (checks.malformedRequestsAreStable ?? true) &&
           response.status === 400 &&
           body.error === "collector_request_rejected" &&
-          body.errorClass === "SyntaxError" &&
-          body.method === "POST" &&
-          body.path === "/hooks/:source" &&
+          body.reason === "invalid_json" &&
+          Object.keys(body).length === 2 &&
           !("message" in body) &&
           !("stack" in body);
       }
