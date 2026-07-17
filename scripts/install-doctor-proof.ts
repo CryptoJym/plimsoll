@@ -390,13 +390,18 @@ esac
 
   const plistPath = launchAgentPlistPath(fixtureHome);
   fs.mkdirSync(path.dirname(plistPath), { recursive: true, mode: 0o700 });
+  const previousPlimsollHome = process.env.PLIMSOLL_HOME;
+  process.env.PLIMSOLL_HOME = fixturePlimsoll;
+  const renderedFixturePlist = renderLaunchAgentPlist({
+    homeDir: fixtureHome,
+    pnpmPath: "/neutral/bin/pnpm",
+    repoRoot: "/neutral/plimsoll/source",
+  });
+  if (previousPlimsollHome === undefined) delete process.env.PLIMSOLL_HOME;
+  else process.env.PLIMSOLL_HOME = previousPlimsollHome;
   fs.writeFileSync(
     plistPath,
-    renderLaunchAgentPlist({
-      homeDir: fixtureHome,
-      pnpmPath: "/neutral/bin/pnpm",
-      repoRoot: "/neutral/plimsoll/source",
-    }),
+    renderedFixturePlist,
     { mode: 0o600 },
   );
   const fingerprint = readProcessStartFingerprint(process.pid);
@@ -479,6 +484,103 @@ esac
   fs.writeFileSync(codexConfig, fullCodexConfig);
 
   tokenSignal = true;
+  fs.writeFileSync(codexConfig, `${fullCodexConfig}\nthis is not valid TOML ???\n`);
+  const beforeMalformedTomlDoctor = digestTree(sandbox);
+  const malformedTomlDoctor = await command(
+    process.execPath,
+    [tsx, cli, "doctor", "--read-only", "--json"],
+    { cwd: neutralCwd, env: fixtureEnv },
+  );
+  const malformedTomlReceipt = parseJson(malformedTomlDoctor.stdout);
+  check(
+    "malformed_codex_toml_fails_closed_with_live_signal",
+    malformedTomlDoctor.code !== 0 &&
+      malformedTomlReceipt.ok === false &&
+      malformedTomlReceipt.readiness === "not_installed" &&
+      malformedTomlReceipt.telemetry.codex.status === "invalid" &&
+      digestTree(sandbox) === beforeMalformedTomlDoctor,
+    malformedTomlReceipt,
+  );
+  fs.writeFileSync(codexConfig, fullCodexConfig);
+
+  fs.writeFileSync(codexConfig, `${fullCodexConfig}\n[otel]\nenvironment = "duplicate"\n`);
+  const duplicateTomlDoctor = await command(
+    process.execPath,
+    [tsx, cli, "doctor", "--read-only", "--json"],
+    { cwd: neutralCwd, env: fixtureEnv },
+  );
+  const duplicateTomlReceipt = parseJson(duplicateTomlDoctor.stdout);
+  check(
+    "duplicate_codex_toml_fails_closed_with_live_signal",
+    duplicateTomlDoctor.code !== 0 &&
+      duplicateTomlReceipt.ok === false &&
+      duplicateTomlReceipt.telemetry.codex.status === "invalid",
+    duplicateTomlReceipt,
+  );
+  fs.writeFileSync(codexConfig, fullCodexConfig);
+
+  const wrongTypeCodexConfig = fullCodexConfig.replace("hooks = true", 'hooks = "true"');
+  check("proof_builds_wrong_type_toml_fixture", wrongTypeCodexConfig !== fullCodexConfig, codexConfig);
+  fs.writeFileSync(codexConfig, wrongTypeCodexConfig);
+  const wrongTypeTomlDoctor = await command(
+    process.execPath,
+    [tsx, cli, "doctor", "--read-only", "--json"],
+    { cwd: neutralCwd, env: fixtureEnv },
+  );
+  const wrongTypeTomlReceipt = parseJson(wrongTypeTomlDoctor.stdout);
+  check(
+    "wrong_type_codex_toml_fails_closed_with_live_signal",
+    wrongTypeTomlDoctor.code !== 0 &&
+      wrongTypeTomlReceipt.ok === false &&
+      wrongTypeTomlReceipt.telemetry.codex.status === "incomplete",
+    wrongTypeTomlReceipt,
+  );
+  fs.writeFileSync(codexConfig, fullCodexConfig);
+
+  const validPlist = fs.readFileSync(plistPath, "utf8");
+  const malformedPlist = validPlist.replace("</plist>", "<broken>");
+  check("proof_builds_malformed_plist_fixture", malformedPlist !== validPlist, plistPath);
+  fs.writeFileSync(plistPath, malformedPlist);
+  const beforeMalformedPlistDoctor = digestTree(sandbox);
+  const malformedPlistDoctor = await command(
+    process.execPath,
+    [tsx, cli, "doctor", "--read-only", "--json"],
+    { cwd: neutralCwd, env: fixtureEnv },
+  );
+  const malformedPlistReceipt = parseJson(malformedPlistDoctor.stdout);
+  check(
+    "malformed_launch_agent_fails_closed_with_live_signal",
+    malformedPlistDoctor.code !== 0 &&
+      malformedPlistReceipt.ok === false &&
+      malformedPlistReceipt.readiness === "configured" &&
+      malformedPlistReceipt.launchAgent.status === "invalid" &&
+      digestTree(sandbox) === beforeMalformedPlistDoctor,
+    malformedPlistReceipt,
+  );
+  fs.writeFileSync(plistPath, validPlist);
+
+  const extraArgumentPlist = validPlist.replace(
+    "  </array>",
+    "    <string>unexpected</string>\n  </array>",
+  );
+  check("proof_builds_semantically_wrong_plist_fixture", extraArgumentPlist !== validPlist, plistPath);
+  fs.writeFileSync(plistPath, extraArgumentPlist);
+  const wrongRuntimePlistDoctor = await command(
+    process.execPath,
+    [tsx, cli, "doctor", "--read-only", "--json"],
+    { cwd: neutralCwd, env: fixtureEnv },
+  );
+  const wrongRuntimePlistReceipt = parseJson(wrongRuntimePlistDoctor.stdout);
+  check(
+    "semantically_wrong_launch_agent_fails_closed_with_live_signal",
+    wrongRuntimePlistDoctor.code !== 0 &&
+      wrongRuntimePlistReceipt.ok === false &&
+      wrongRuntimePlistReceipt.readiness === "configured" &&
+      wrongRuntimePlistReceipt.launchAgent.status === "conflicted",
+    wrongRuntimePlistReceipt,
+  );
+  fs.writeFileSync(plistPath, validPlist);
+
   const beforeSignalDoctor = digestTree(sandbox);
   const signalDoctor = await command(
     process.execPath,

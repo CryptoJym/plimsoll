@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { isDeepStrictEqual } from "node:util";
+import { parse as parseToml } from "smol-toml";
 
 import { LocalEventBuffer } from "./buffer";
 import {
@@ -306,39 +307,59 @@ function readCodexTelemetryConfig(file: string, expectedToml: string) {
     return { ok: false, status: "missing" as const, path: file, missing: ["config file"] };
   }
   try {
-    const sections = (toml: string) => {
-      const parsed = new Map<string, string[][]>();
-      let current: string[] = [];
-      for (const rawLine of toml.split(/\r?\n/)) {
-        const line = rawLine.trim();
-        if (!line || line.startsWith("#")) continue;
-        if (/^\[{1,2}[^\]]+\]{1,2}$/.test(line)) {
-          current = [];
-          const occurrences = parsed.get(line) ?? [];
-          occurrences.push(current);
-          parsed.set(line, occurrences);
-        } else {
-          current.push(line);
-        }
-      }
-      return parsed;
+    const isRecord = (value: unknown): value is Record<string, unknown> => {
+      return Boolean(value && typeof value === "object" && !Array.isArray(value));
     };
-    const expectedSections = sections(expectedToml);
-    const currentSections = sections(fs.readFileSync(file, "utf8"));
+    const containsExpected = (actual: unknown, expected: unknown): boolean => {
+      if (Array.isArray(expected)) {
+        return Array.isArray(actual) &&
+          expected.every((expectedEntry) =>
+            actual.some((actualEntry) => containsExpected(actualEntry, expectedEntry))
+          );
+      }
+      if (isRecord(expected)) {
+        return isRecord(actual) &&
+          Object.entries(expected).every(([key, value]) =>
+            Object.hasOwn(actual, key) && containsExpected(actual[key], value)
+          );
+      }
+      return isDeepStrictEqual(actual, expected);
+    };
+    const expected = parseToml(expectedToml) as Record<string, unknown>;
+    const current = parseToml(fs.readFileSync(file, "utf8")) as Record<string, unknown>;
     const missing: string[] = [];
-    for (const [header, expectedOccurrences] of expectedSections) {
-      const currentOccurrences = currentSections.get(header) ?? [];
-      if (currentOccurrences.length !== expectedOccurrences.length) {
-        missing.push(`${header} occurrence count ${expectedOccurrences.length}`);
-        continue;
-      }
-      for (let index = 0; index < expectedOccurrences.length; index += 1) {
-        const currentLines = new Set(currentOccurrences[index]);
-        for (const line of expectedOccurrences[index] ?? []) {
-          if (!currentLines.has(line)) missing.push(`${header} :: ${line}`);
+    const collectMissing = (actual: unknown, required: unknown, keyPath: string) => {
+      if (containsExpected(actual, required)) return;
+      if (Array.isArray(required)) {
+        if (!Array.isArray(actual)) {
+          missing.push(keyPath);
+          return;
         }
+        for (let index = 0; index < required.length; index += 1) {
+          if (!actual.some((candidate) => containsExpected(candidate, required[index]))) {
+            missing.push(`${keyPath}[${index}]`);
+          }
+        }
+        return;
       }
-    }
+      if (isRecord(required)) {
+        if (!isRecord(actual)) {
+          missing.push(keyPath);
+          return;
+        }
+        for (const [key, value] of Object.entries(required)) {
+          const childPath = keyPath ? `${keyPath}.${key}` : key;
+          if (!Object.hasOwn(actual, key)) {
+            missing.push(childPath);
+          } else {
+            collectMissing(actual[key], value, childPath);
+          }
+        }
+        return;
+      }
+      missing.push(keyPath);
+    };
+    collectMissing(current, expected, "");
     return {
       ok: missing.length === 0,
       status: missing.length === 0 ? "valid" as const : "incomplete" as const,
@@ -346,7 +367,7 @@ function readCodexTelemetryConfig(file: string, expectedToml: string) {
       missing,
     };
   } catch {
-    return { ok: false, status: "invalid" as const, path: file, missing: ["readable TOML"] };
+    return { ok: false, status: "invalid" as const, path: file, missing: ["valid TOML"] };
   }
 }
 
@@ -358,20 +379,85 @@ function readLaunchAgentState(plistPath: string) {
       status: "missing" as const,
       label: LAUNCH_AGENT_LABEL,
       plistPath,
+      runtime: null,
     };
   }
   try {
-    const plist = fs.readFileSync(plistPath, "utf8");
-    const matchesExpectedRuntime =
-      plist.includes(`<string>${LAUNCH_AGENT_LABEL}</string>`) &&
-      plist.includes("<key>ProgramArguments</key>") &&
-      /<key>ProgramArguments<\/key>\s*<array>[\s\S]*?<string>start<\/string>[\s\S]*?<\/array>/.test(plist);
+    const parsed = spawnSync(
+      "/usr/bin/plutil",
+      ["-convert", "json", "-o", "-", "--", plistPath],
+      {
+        encoding: "utf8",
+        env: { LANG: "C", LC_ALL: "C", PATH: "/usr/bin:/bin" },
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 2_000,
+      },
+    );
+    if (parsed.error || parsed.status !== 0 || typeof parsed.stdout !== "string" || !parsed.stdout.trim()) {
+      return {
+        ok: false,
+        installed: true,
+        status: "invalid" as const,
+        label: LAUNCH_AGENT_LABEL,
+        plistPath,
+        runtime: null,
+      };
+    }
+    const plist = JSON.parse(parsed.stdout) as Record<string, unknown>;
+    const programArguments = Array.isArray(plist.ProgramArguments) &&
+      plist.ProgramArguments.every((value) => typeof value === "string")
+      ? plist.ProgramArguments as string[]
+      : [];
+    const workingDirectory = typeof plist.WorkingDirectory === "string"
+      ? plist.WorkingDirectory
+      : null;
+    const developmentRuntime =
+      programArguments.length === 5 &&
+      path.isAbsolute(programArguments[0] ?? "") &&
+      path.basename(programArguments[0] ?? "") === "pnpm" &&
+      programArguments[1] === "--dir" &&
+      path.isAbsolute(programArguments[2] ?? "") &&
+      programArguments[2] === workingDirectory &&
+      programArguments[3] === "collector" &&
+      programArguments[4] === "start";
+    const packagedRuntime =
+      programArguments.length === 3 &&
+      programArguments[0] === process.execPath &&
+      path.isAbsolute(programArguments[1] ?? "") &&
+      /\.(mjs|cjs|js)$/.test(programArguments[1] ?? "") &&
+      programArguments[2] === "start" &&
+      path.dirname(programArguments[1] ?? "") === workingDirectory;
+    const runtime = developmentRuntime
+      ? "development" as const
+      : packagedRuntime
+        ? "packaged" as const
+        : null;
+    const keepAlive = plist.KeepAlive && typeof plist.KeepAlive === "object"
+      ? plist.KeepAlive as Record<string, unknown>
+      : null;
+    const environment = plist.EnvironmentVariables && typeof plist.EnvironmentVariables === "object"
+      ? plist.EnvironmentVariables as Record<string, unknown>
+      : null;
+    const matchesExpectedRuntime = Boolean(
+      plist.Label === LAUNCH_AGENT_LABEL &&
+      runtime &&
+      workingDirectory &&
+      path.isAbsolute(workingDirectory) &&
+      plist.RunAtLoad === true &&
+      keepAlive?.SuccessfulExit === false &&
+      plist.ThrottleInterval === 30 &&
+      plist.StandardOutPath === collectorLogPath("collector.out.log") &&
+      plist.StandardErrorPath === collectorLogPath("collector.err.log") &&
+      environment?.PLIMSOLL_COLLECTOR_DATA_MODE === "metadata" &&
+      typeof environment?.PATH === "string",
+    );
     return {
       ok: matchesExpectedRuntime,
       installed: true,
       status: matchesExpectedRuntime ? "valid" as const : "conflicted" as const,
       label: LAUNCH_AGENT_LABEL,
       plistPath,
+      runtime,
     };
   } catch {
     return {
@@ -380,6 +466,7 @@ function readLaunchAgentState(plistPath: string) {
       status: "unreadable" as const,
       label: LAUNCH_AGENT_LABEL,
       plistPath,
+      runtime: null,
     };
   }
 }
