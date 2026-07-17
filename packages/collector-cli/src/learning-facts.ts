@@ -14,6 +14,7 @@ import {
   type ActionClass,
   type AiInteractionEvent,
   type TechniqueExposureFact,
+  type TechniqueExposureInput,
   type ToolAttemptErrorCategory,
   type ToolAttemptFact,
   type ToolAttemptResultStatus,
@@ -218,7 +219,16 @@ export function buildTechniqueExposureFact(input: {
   mode: "control" | "treatment";
 }): TechniqueExposureFact {
   const canonical = techniqueExposureInputSchema.parse(input);
-  const exposureId = deterministicLearningFactId([
+  const exposureId = derivedTechniqueExposureId(canonical);
+  return techniqueExposureFactSchema.parse({
+    ...canonical,
+    exposureId,
+    assertion: "exposure_only",
+  });
+}
+
+function derivedTechniqueExposureId(canonical: TechniqueExposureInput) {
+  return deterministicLearningFactId([
     "technique-exposure-v1",
     canonical.episodeId,
     canonical.techniqueId,
@@ -228,11 +238,6 @@ export function buildTechniqueExposureFact(input: {
     canonical.exposedAt,
     canonical.mode,
   ]);
-  return techniqueExposureFactSchema.parse({
-    ...canonical,
-    exposureId,
-    assertion: "exposure_only",
-  });
 }
 
 function validateLimits(input: Partial<LearningFactLimits>): LearningFactLimits {
@@ -341,7 +346,8 @@ export class LearningFactStore {
         mode text not null check(mode in ('control','treatment')),
         assertion text not null check(assertion = 'exposure_only'),
         created_at text not null,
-        check(technique_version is not null or content_digest is not null)
+        check(technique_version is not null or content_digest is not null),
+        check(exposed_at = strftime('%Y-%m-%dT%H:%M:%fZ', exposed_at))
       );
       create table if not exists technique_identity_registry (
         technique_key text primary key,
@@ -368,6 +374,16 @@ export class LearningFactStore {
         on technique_exposure_facts(assignment_id);
       create index if not exists idx_exposure_episode
         on technique_exposure_facts(episode_id, exposed_at);
+      create unique index if not exists idx_exposure_semantic_identity
+        on technique_exposure_facts(
+          episode_id,
+          technique_id,
+          coalesce(technique_version, ''),
+          coalesce(content_digest, ''),
+          assignment_id,
+          exposed_at,
+          mode
+        );
     `);
   }
 
@@ -495,7 +511,7 @@ export class LearningFactStore {
           : resultStatus === "failure"
             ? result.errorCategory ?? "unknown"
             : "unknown";
-      if (current.episodeId && resultStatus !== "unknown") {
+      if (current.episodeId) {
         const episode = this.db
           .prepare(
             `select ended_at as endedAt from work_episode_facts where episode_id = ?`,
@@ -506,7 +522,7 @@ export class LearningFactStore {
           episode.endedAt !== null &&
           Date.parse(result.endedAt) > Date.parse(episode.endedAt)
         ) {
-          throw new Error("ToolAttemptTerminalAfterEpisodeEnd");
+          throw new Error("ToolAttemptResultAfterEpisodeEnd");
         }
       }
       const completed = toolAttemptFactSchema.parse({
@@ -588,6 +604,9 @@ export class LearningFactStore {
     options: { outcomeObservedAt?: string } = {},
   ): { inserted: boolean; fact: TechniqueExposureFact } {
     const fact = techniqueExposureFactSchema.parse(input);
+    if (fact.exposureId !== derivedTechniqueExposureId(fact)) {
+      throw new Error("TechniqueExposureDerivedIdMismatch");
+    }
     return this.db.transaction(() => {
       if (options.outcomeObservedAt !== undefined) {
         const outcomeMs = Date.parse(options.outcomeObservedAt);

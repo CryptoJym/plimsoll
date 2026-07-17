@@ -98,15 +98,17 @@ async function main() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-learning-facts-proof-"));
   const ledger = path.join(root, "facts.sqlite");
   let buffer: LocalEventBuffer | undefined;
-  try {
-    proofStage = "buffer_open";
-    buffer = new LocalEventBuffer(ledger, {
+  const openBuffer = () =>
+    new LocalEventBuffer(ledger, {
       delivery: { enabled: true },
       learningFacts: {
         limits: { attempts: 20, episodes: 10, exposures: 10, techniqueIdentities: 4 },
       },
     });
-    const store = buffer.learningFacts;
+  try {
+    proofStage = "buffer_open";
+    buffer = openBuffer();
+    let store = buffer.learningFacts;
 
     proofStage = "episode";
     const episode = buildWorkEpisodeFact({
@@ -363,25 +365,27 @@ async function main() {
       episodeId: episode.episodeId,
     });
     store.recordToolSignal(resultAfterEpisode);
-    const lateTerminal = adaptToolInteractionEvent({
+    const lateUnknownResult = adaptToolInteractionEvent({
       event: event({
         id: "00000000-0000-5000-9000-000000000307",
         type: "tool_result",
         observedAt: "2026-07-17T12:01:00.001Z",
       }),
       sourceOperationKey: "terminal-after-episode",
-      resultStatus: "failure",
-      errorCategory: "timeout",
+      resultStatus: "unknown",
     });
     assert.throws(
-      () => store.recordToolSignal(lateTerminal),
-      /ToolAttemptTerminalAfterEpisodeEnd/,
+      () => store.recordToolSignal(lateUnknownResult),
+      /ToolAttemptResultAfterEpisodeEnd/,
+    );
+    const afterEpisodeFact = store.attempts().find(
+      (row) => row.operationId === resultAfterEpisode.operationId,
     );
     check(
-      "known_terminal_result_cannot_follow_closed_episode",
-      store.attempts().find((row) => row.operationId === resultAfterEpisode.operationId)
-        ?.resultStatus === "unknown",
-      { rejectedAfterEpisodeEnd: true },
+      "every_result_including_explicit_unknown_rejects_after_closed_episode",
+      afterEpisodeFact?.resultStatus === "unknown" &&
+        afterEpisodeFact.endedAt === undefined,
+      { rejectedUnknownAfterEpisodeEnd: true, attemptLeftOpenUnknown: true },
     );
 
     const exactEndBoundary = adaptToolInteractionEvent({
@@ -413,6 +417,43 @@ async function main() {
       { terminalAtEpisodeEnd: true, zeroDurationAccepted: true },
     );
 
+    const openEpisode = buildWorkEpisodeFact({
+      source: "codex",
+      sessionId: "session-proof-100",
+      sourceEpisodeKey: "open-episode",
+      workClass: "debugging",
+      complexityBand: "medium",
+      startedAt: "2026-07-17T13:00:00.000Z",
+    });
+    store.recordWorkEpisode(openEpisode);
+    const openEpisodeAttempt = adaptToolInteractionEvent({
+      event: event({
+        id: "00000000-0000-5000-9000-000000000311",
+        type: "tool_use",
+        observedAt: "2026-07-17T13:00:00.000Z",
+      }),
+      sourceOperationKey: "open-episode-result",
+      episodeId: openEpisode.episodeId,
+    });
+    store.recordToolSignal(openEpisodeAttempt);
+    const openEpisodeResult = adaptToolInteractionEvent({
+      event: event({
+        id: "00000000-0000-5000-9000-000000000312",
+        type: "tool_result",
+        observedAt: "2026-07-17T13:05:00.000Z",
+      }),
+      sourceOperationKey: "open-episode-result",
+      resultStatus: "failure",
+      errorCategory: "timeout",
+    });
+    const openCompleted = store.recordToolSignal(openEpisodeResult).fact;
+    check(
+      "open_episode_accepts_later_result",
+      openCompleted.resultStatus === "failure" &&
+        openCompleted.endedAt === "2026-07-17T13:05:00.000Z",
+      { openEpisode: true, durationMs: openCompleted.durationMs },
+    );
+
     check(
       "technique_absence_is_not_inferred_from_attempt_mix",
       store.exposures().length === 0,
@@ -431,17 +472,41 @@ async function main() {
       mode: "treatment",
     } as const;
     const exposure = buildTechniqueExposureFact(canonicalExposureInput);
-    store.recordTechniqueExposure(exposure, {
+    const offsetExposure = buildTechniqueExposureFact({
+      ...canonicalExposureInput,
+      exposedAt: "2026-07-17T06:00:02.000-06:00",
+    });
+    const noMillisExposure = buildTechniqueExposureFact({
+      ...canonicalExposureInput,
+      exposedAt: "2026-07-17T12:00:02Z",
+    });
+    check(
+      "equivalent_exposure_instants_canonicalize_before_hashing",
+      exposure.exposedAt === "2026-07-17T12:00:02.000Z" &&
+        offsetExposure.exposedAt === exposure.exposedAt &&
+        noMillisExposure.exposedAt === exposure.exposedAt &&
+        offsetExposure.exposureId === exposure.exposureId &&
+        noMillisExposure.exposureId === exposure.exposureId,
+      { canonicalInstant: exposure.exposedAt, distinctIds: 1 },
+    );
+    const firstExposureWrite = store.recordTechniqueExposure(exposure, {
       outcomeObservedAt: "2026-07-17T12:00:20.000Z",
     });
-    const repeatedExposure = buildTechniqueExposureFact(canonicalExposureInput);
-    const repeatedWrite = store.recordTechniqueExposure(repeatedExposure, {
+    const offsetWrite = store.recordTechniqueExposure(
+      {
+        ...offsetExposure,
+        exposedAt: "2026-07-17T06:00:02.000-06:00",
+      },
+      { outcomeObservedAt: "2026-07-17T12:00:20.000Z" },
+    );
+    const noMillisWrite = store.recordTechniqueExposure(noMillisExposure, {
       outcomeObservedAt: "2026-07-17T12:00:20.000Z",
     });
     check(
       "canonical_exposure_identity_is_deterministic_and_deduplicated",
-      repeatedExposure.exposureId === exposure.exposureId &&
-        repeatedWrite.inserted === false &&
+      firstExposureWrite.inserted === true &&
+        offsetWrite.inserted === false &&
+        noMillisWrite.inserted === false &&
         store.exposures().length === 1,
       { exposureRows: store.exposures().length },
     );
@@ -475,6 +540,75 @@ async function main() {
         rejectedAliases: exposureInputAliases.length + 1,
         exposureRows: store.exposures().length,
       },
+    );
+
+    const wrongExposureId = "00000000-0000-5000-9000-000000000998";
+    assert.throws(
+      () => store.recordTechniqueExposure({
+        ...exposure,
+        exposureId: wrongExposureId,
+      }),
+      /TechniqueExposureDerivedIdMismatch/,
+    );
+    check(
+      "store_recomputes_and_rejects_caller_supplied_wrong_exposure_id",
+      store.exposures().length === 1,
+      { rejectedWrongId: true, exposureRows: store.exposures().length },
+    );
+
+    assert.throws(
+      () => buffer!.database.prepare(
+        `insert into technique_exposure_facts
+          (exposure_id, episode_id, technique_id, technique_version, content_digest,
+           assignment_id, work_class, complexity_band, exposed_at, mode, assertion, created_at)
+         select ?, episode_id, technique_id, technique_version, content_digest,
+           assignment_id, work_class, complexity_band, exposed_at, mode, assertion, created_at
+         from technique_exposure_facts where exposure_id = ?`,
+      ).run(wrongExposureId, exposure.exposureId),
+      /UNIQUE constraint failed/,
+    );
+    check(
+      "database_unique_semantic_identity_blocks_duplicate_wrong_id",
+      store.exposures().length === 1,
+      { semanticConstraintRejected: true },
+    );
+    assert.throws(
+      () => buffer!.database.prepare(
+        `insert into technique_exposure_facts
+          (exposure_id, episode_id, technique_id, technique_version, content_digest,
+           assignment_id, work_class, complexity_band, exposed_at, mode, assertion, created_at)
+         select ?, episode_id, technique_id, technique_version, content_digest,
+           assignment_id, work_class, complexity_band, ?, mode, assertion, created_at
+         from technique_exposure_facts where exposure_id = ?`,
+      ).run(
+        "00000000-0000-5000-9000-000000000997",
+        "2026-07-17T06:00:02.000-06:00",
+        exposure.exposureId,
+      ),
+      /CHECK constraint failed/,
+    );
+    check(
+      "database_rejects_noncanonical_exposure_timestamp_bypass",
+      store.exposures().length === 1,
+      { canonicalTimestampConstraintRejected: true },
+    );
+
+    buffer.close();
+    buffer = openBuffer();
+    store = buffer.learningFacts;
+    const reopenedWrite = store.recordTechniqueExposure(
+      {
+        ...noMillisExposure,
+        exposedAt: "2026-07-17T12:00:02Z",
+      },
+      { outcomeObservedAt: "2026-07-17T12:00:20.000Z" },
+    );
+    check(
+      "exposure_identity_remains_idempotent_after_reopen",
+      reopenedWrite.inserted === false &&
+        reopenedWrite.fact.exposureId === exposure.exposureId &&
+        store.exposures().length === 1,
+      { reopened: true, exposureRows: store.exposures().length },
     );
 
     proofStage = "retrospective";
@@ -517,10 +651,15 @@ async function main() {
       `select name from sqlite_master where type='index' and
         (name like 'idx_attempt_%' or name like 'idx_episode_%' or name like 'idx_exposure_%')`,
     ).all() as Array<{ name: string }>;
+    const semanticIndex = (buffer.database.pragma(
+      "index_list(technique_exposure_facts)",
+    ) as Array<{ name: string; unique: number }>).find(
+      (index) => index.name === "idx_exposure_semantic_identity",
+    );
     check(
       "promoted_fact_dimensions_are_indexed",
-      indexes.length === 9,
-      { indexCount: indexes.length },
+      indexes.length === 10 && semanticIndex?.unique === 1,
+      { indexCount: indexes.length, semanticIdentityUnique: semanticIndex?.unique === 1 },
     );
 
     proofStage = "capacity";
@@ -614,6 +753,8 @@ async function main() {
     );
     const learningFactRowsWritten =
       store.attempts().length + store.episodes().length + store.exposures().length;
+    const episodeCount = store.episodes().length;
+    const exposureCount = store.exposures().length;
     buffer.close();
     buffer = undefined;
     const closedLeaks = leakCount(uploadBodies, fileSurfaces(ledger));
@@ -629,8 +770,8 @@ async function main() {
       passedAttempts: attempts.filter((attempt) => attempt.resultStatus === "success").length,
       explicitRetryLinks: attempts.filter((attempt) => attempt.retryOf).length,
       missingResultUnknown: missingResult?.resultStatus === "unknown",
-      episodes: 1,
-      explicitExposures: 1,
+      episodes: episodeCount,
+      explicitExposures: exposureCount,
       indexedDimensions: indexes.length,
       privacySentinels: privateTerms.length,
       privacyLeaks: liveLeaks + closedLeaks,

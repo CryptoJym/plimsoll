@@ -571,6 +571,10 @@ const canonicalExposureDigestSchema = z.string().regex(
   "Expected an already-canonical lowercase sha256 digest.",
 );
 
+const canonicalExposureTimestampSchema = timestampSchema.transform((value) =>
+  new Date(value).toISOString(),
+);
+
 export const toolFactClassSchema = z.enum([
   "compute",
   "local_io",
@@ -815,7 +819,7 @@ export const techniqueExposureInputSchema = z
     assignmentId: canonicalExposureDimensionIdSchema,
     workClass: workClassSchema,
     complexityBand: workComplexityBandSchema,
-    exposedAt: timestampSchema,
+    exposedAt: canonicalExposureTimestampSchema,
     mode: z.enum(["control", "treatment"]),
   })
   .strict()
