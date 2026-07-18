@@ -1,0 +1,230 @@
+{
+  "schema": "plimsoll.system-e2e-tamper-cases.v1",
+  "cases": [
+    {
+      "id": "capture_event_id",
+      "mutations": [{ "pointer": "/flow/sharedFlow/lineage/capture/rows/0/eventId", "replacement": "00000000-0000-4000-8000-000000000999" }],
+      "resign": true,
+      "expectedError": "capture event IDs mismatch"
+    },
+    {
+      "id": "capture_session_id",
+      "mutations": [{ "pointer": "/flow/sharedFlow/lineage/capture/rows/0/sessionId", "replacement": "tampered-session" }],
+      "resign": true,
+      "expectedError": "machine-A capture session mismatch"
+    },
+    {
+      "id": "accepted_outbox_id",
+      "mutations": [{ "pointer": "/flow/sharedFlow/lineage/delivery/acceptedEventIds/0", "replacement": "00000000-0000-4000-8000-000000000201" }],
+      "resign": true,
+      "expectedError": "exactly three valid machine-A IDs"
+    },
+    {
+      "id": "allocation_session_id",
+      "mutations": [{ "pointer": "/flow/sharedFlow/lineage/allocation/receipts/0/sessionId", "replacement": "tampered-session" }],
+      "resign": true,
+      "expectedError": "allocation receipt session mismatch"
+    },
+    {
+      "id": "allocation_remainder",
+      "mutations": [{ "pointer": "/flow/sharedFlow/lineage/allocation/unallocatedPrimaryTokens", "replacement": 9 }],
+      "resign": true,
+      "expectedError": "allocation remainder mismatch"
+    },
+    {
+      "id": "allocation_digest",
+      "mutations": [{ "pointer": "/flow/sharedFlow/lineage/allocation/digest", "replacement": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }],
+      "resign": false,
+      "expectedError": "allocation lineage digest mismatch"
+    },
+    {
+      "id": "outcome_external_id",
+      "mutations": [{ "pointer": "/flow/sharedFlow/lineage/outcome/facts/0/externalId", "replacement": "tampered-check" }],
+      "resign": true,
+      "expectedError": "outcome external IDs mismatch"
+    },
+    {
+      "id": "attempt_operation_id",
+      "mutations": [{ "pointer": "/flow/sharedFlow/lineage/learningFacts/attemptEventBindings/0/operationId", "replacement": "00000000-0000-5000-9000-000000000999" }],
+      "resign": true,
+      "expectedError": "operation ID mismatch"
+    },
+    {
+      "id": "episode_id",
+      "mutations": [{ "pointer": "/flow/sharedFlow/lineage/learningFacts/episodeBindings/0/fact/episodeId", "replacement": "00000000-0000-5000-9000-000000000998" }],
+      "resign": true,
+      "expectedError": "deterministic identity mismatch"
+    },
+    {
+      "id": "exposure_id",
+      "mutations": [{ "pointer": "/flow/sharedFlow/lineage/learningFacts/exposures/0/exposureId", "replacement": "00000000-0000-5000-9000-000000000997" }],
+      "resign": true,
+      "expectedError": "TechniqueExposureDerivedIdMismatch"
+    },
+    {
+      "id": "evidence_source_fingerprint",
+      "mutations": [{ "pointer": "/flow/sharedFlow/lineage/evidence/sourceFingerprint", "replacement": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }],
+      "resign": true,
+      "expectedError": "evidence source fingerprint mismatch"
+    },
+    {
+      "id": "evidence_packet_fingerprint",
+      "mutations": [{ "pointer": "/flow/sharedFlow/lineage/evidence/packetFingerprint", "replacement": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }],
+      "resign": true,
+      "expectedError": "evidence packet fingerprint mismatch"
+    },
+    {
+      "id": "phase_actual_artifact",
+      "mutations": [{ "pointer": "/flow/phaseChain/0/artifact/ok", "replacement": false }],
+      "resign": true,
+      "expectedError": "committed artifact contract mismatch"
+    },
+    {
+      "id": "phase_child_field_missing",
+      "mutations": [{ "pointer": "/flow/phaseChain/0/artifact/ok", "remove": true }],
+      "resign": true,
+      "expectedError": "committed artifact contract mismatch"
+    },
+    {
+      "id": "phase_child_field_unknown",
+      "mutations": [{ "pointer": "/flow/phaseChain/0/artifact/unknownChildField", "replacement": true }],
+      "resign": true,
+      "expectedError": "committed artifact contract mismatch"
+    },
+    {
+      "id": "privacy_child_receipt",
+      "mutations": [{ "pointer": "/flow/phaseChain/2/artifact/receipt/passed", "replacement": false }],
+      "resign": true,
+      "expectedError": "committed artifact contract mismatch"
+    },
+    {
+      "id": "lifecycle_child_receipt",
+      "mutations": [{ "pointer": "/flow/phaseChain/3/artifact/summary/passed", "replacement": 0 }],
+      "resign": true,
+      "expectedError": "committed artifact contract mismatch"
+    },
+    {
+      "id": "resource_child_receipt",
+      "mutations": [{ "pointer": "/flow/phaseChain/4/artifact/overall", "replacement": "fail" }],
+      "resign": true,
+      "expectedError": "committed artifact contract mismatch"
+    },
+    {
+      "id": "phase_receipt_field_missing",
+      "mutations": [{ "pointer": "/flow/phaseChain/0/semanticDigest", "remove": true }],
+      "resign": false,
+      "expectedError": "phase 0 has missing, extra, or unknown fields"
+    },
+    {
+      "id": "phase_artifact_digest",
+      "mutations": [{ "pointer": "/flow/phaseChain/0/artifactDigest", "replacement": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }],
+      "resign": false,
+      "expectedError": "phase 0 artifact digest mismatch"
+    },
+    {
+      "id": "phase_semantic_digest",
+      "mutations": [{ "pointer": "/flow/phaseChain/0/semanticDigest", "replacement": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }],
+      "resign": false,
+      "expectedError": "phase 0 semantic digest mismatch"
+    },
+    {
+      "id": "phase_output_digest",
+      "mutations": [{ "pointer": "/flow/phaseChain/0/outputDigest", "replacement": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }],
+      "resign": false,
+      "expectedError": "phase 0 output digest mismatch"
+    },
+    {
+      "id": "phase_chain_digest",
+      "mutations": [{ "pointer": "/flow/phaseChainDigest", "replacement": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }],
+      "resign": false,
+      "expectedError": "phase-chain digest mismatch"
+    },
+    {
+      "id": "flow_fingerprint",
+      "mutations": [{ "pointer": "/flow/fingerprint", "replacement": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }],
+      "resign": true,
+      "expectedError": "phase 0 flow fingerprint mismatch"
+    },
+    {
+      "id": "shared_output_digest",
+      "mutations": [{ "pointer": "/flow/sharedFlow/outputDigest", "replacement": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }],
+      "resign": false,
+      "expectedError": "shared-flow output digest mismatch"
+    },
+    {
+      "id": "source_commit",
+      "mutations": [{ "pointer": "/sourceCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" }],
+      "resign": true,
+      "expectedError": "phase 0 source commit mismatch"
+    },
+    {
+      "id": "root_guard_digest",
+      "mutations": [{ "pointer": "/isolation/rootGuards/0/beforeDigest", "replacement": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }],
+      "resign": true,
+      "expectedError": "root guard 0 changed"
+    },
+    {
+      "id": "root_guard_mode",
+      "mutations": [{ "pointer": "/isolation/rootGuards/0/writeDenyMode", "replacement": 448 }],
+      "resign": true,
+      "expectedError": "write-deny mode changed"
+    },
+    {
+      "id": "direct_row_budget_501",
+      "mutations": [
+        { "pointer": "/flow/sharedFlow/lineage/rowWork/sqliteWriteChanges", "replacement": 475 },
+        { "pointer": "/flow/sharedFlow/measurements/directRowOperations", "replacement": 501 }
+      ],
+      "resign": true,
+      "expectedError": "direct row budget exceeded"
+    },
+    {
+      "id": "wall_budget",
+      "mutations": [{ "pointer": "/measurements/wallMs", "replacement": 180001 }],
+      "resign": false,
+      "expectedError": "wall budget exceeded"
+    },
+    {
+      "id": "cpu_budget",
+      "mutations": [{ "pointer": "/measurements/cpu/totalMs", "replacement": 180001 }],
+      "resign": false,
+      "expectedError": "CPU budget exceeded"
+    },
+    {
+      "id": "rss_budget",
+      "mutations": [{ "pointer": "/measurements/rss/maxBytes", "replacement": 1500000001 }],
+      "resign": false,
+      "expectedError": "RSS budget exceeded"
+    },
+    {
+      "id": "block_io_budget",
+      "mutations": [{ "pointer": "/measurements/blockIo/totalOperations", "replacement": 500001 }],
+      "resign": false,
+      "expectedError": "block I/O budget exceeded"
+    },
+    {
+      "id": "captured_output_budget",
+      "mutations": [{ "pointer": "/measurements/capturedOutputBytes", "replacement": 25165825 }],
+      "resign": false,
+      "expectedError": "captured output budget exceeded"
+    },
+    {
+      "id": "cpu_margin",
+      "mutations": [{ "pointer": "/measurements/budgetMargins/cpuMs", "replacement": 0 }],
+      "resign": false,
+      "expectedError": "CPU budget margin mismatch"
+    },
+    {
+      "id": "deterministic_digest",
+      "mutations": [{ "pointer": "/deterministicDigest", "replacement": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }],
+      "resign": false,
+      "expectedError": "deterministic digest mismatch"
+    },
+    {
+      "id": "receipt_unknown_field",
+      "mutations": [{ "pointer": "/unknownTopField", "replacement": true }],
+      "resign": false,
+      "expectedError": "system E2E receipt has missing, extra, or unknown fields"
+    }
+  ]
+}

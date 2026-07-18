@@ -25,14 +25,35 @@ unit proofs:
    zero statistical work and cannot publish or install a skill.
 7. Existing adversarial installer/doctor, transactional join, metadata-only
    privacy, lifecycle rollback/uninstall/purge, and resource proofs are bound
-   to the same flow fingerprint. Their raw output is hashed, never copied into
-   the final receipt.
+   to the same flow fingerprint. A strict parser closes each actual child
+   result, normalizes only enumerated volatile measurements, and includes its
+   semantic artifact and digest in the final receipt. Raw stdout is excluded.
+8. Seven synthetic skill, memory, and operator-live-shadow roots are populated,
+   made write-denied, and content-digested before the flow. Their modes, entry
+   counts, and after-digests must remain identical.
 
 The content-free receipt is written to
-`evidence/system-e2e-proof.json`. It records fixed row, wall-time, CPU, RSS,
-block-I/O, and captured-output budgets. It also asserts that unchanged idle
+`evidence/system-e2e-proof.json`. It records actual controller-plus-child CPU,
+controller and child block I/O, maximum resident memory, wall time, captured
+output, SQLite write/read work, supporting resource row work, and exact margins
+against fixed budgets. It also asserts that unchanged idle
 cycles perform zero raw writes, file reads, and overlapping jobs, while warm
 dashboard reads perform zero raw-ledger or filesystem scans.
+
+The direct-row budget is a fixed 500 operations. The deterministic fixture
+currently proves 332 direct operations (including 306 actual SQLite changes),
+leaving 168 operations of explicit headroom; it is not recalculated from the
+observed run. A committed 501-operation adversarial case must fail. Wall, CPU,
+resident-memory, block-I/O, total-row, and captured-output thresholds are also
+fixed constants, and each has an over-budget negative case.
+
+The standalone verifier does not trust the receipt's declared hashes. It
+recomputes every stage, phase, shared-flow, evidence, and final deterministic
+digest; re-derives outcomes and deterministic fact identities; recompiles the
+learning packet; checks exact delivery/allocation sets; and validates the
+resource totals and margins. Thirty-seven committed tamper cases include
+re-signed semantic attacks, ensuring failures are not merely caused by stale
+outer hashes.
 
 ## Honest external gates
 
@@ -47,7 +68,11 @@ Run the source gate with Node 22:
 
 ```sh
 pnpm install --frozen-lockfile
-pnpm proof:system-e2e
+pnpm proof:system-e2e -- --receipt evidence/system-e2e-proof.json
+pnpm proof:system-e2e:verify -- --receipt evidence/system-e2e-proof.json
+pnpm proof:system-e2e -- --receipt evidence/system-e2e-proof-repeat.json \
+  --compare-deterministic-receipt evidence/system-e2e-proof.json
+pnpm proof:system-e2e:tamper -- --receipt evidence/system-e2e-proof-repeat.json
 ```
 
 The proof fails closed if a cross-stage ID is dropped, tokens no longer

@@ -68,7 +68,12 @@ jobs:
         run: pnpm proof:outcome-timeline
 
       - name: Prove source-only integrated learning and fleet flow
-        run: pnpm proof:system-e2e
+        run: |
+          pnpm proof:system-e2e -- --receipt evidence/system-e2e-proof.json
+          pnpm proof:system-e2e:verify -- --receipt evidence/system-e2e-proof.json
+          pnpm proof:system-e2e -- --receipt evidence/system-e2e-proof-repeat.json --compare-deterministic-receipt evidence/system-e2e-proof.json
+          pnpm proof:system-e2e:verify -- --receipt evidence/system-e2e-proof-repeat.json
+          pnpm proof:system-e2e:tamper -- --receipt evidence/system-e2e-proof-repeat.json
 
       - name: Run strict isolated resource proof
         run: pnpm proof:resource --require-integrated --receipt evidence/resource-proof.json

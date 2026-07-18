@@ -11,7 +11,6 @@
  * reachable from this proof.
  */
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -36,19 +35,33 @@ import {
   buildTechniqueExposureFact,
   buildWorkEpisodeFact,
 } from "../packages/collector-cli/src/learning-facts";
+import { OutcomeTimelineStore } from "../packages/collector-cli/src/outcome-timeline-store";
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import {
   allocateEvents,
   collectAllocationEvents,
   type PullCandidate,
 } from "./event-allocation";
+import {
+  SYSTEM_E2E_SCHEMA,
+  SYSTEM_E2E_BUDGETS,
+  digest,
+  loadSupportContract,
+  parseSupportingArtifact,
+  supportContractPath,
+  type SupportingKind,
+} from "./system-e2e/contract";
 
 type PhaseReceipt = {
+  schema: "plimsoll.system-e2e-phase-receipt.v1";
   name: string;
   status: "pass";
-  inputFingerprint: string;
+  expectedFlowFingerprint: string;
+  sourceCommit: string;
+  artifact: unknown;
+  artifactDigest: string;
+  semanticDigest: string;
   outputDigest: string;
-  assertions: string[];
   measurements: {
     wallMs: number;
     cpuMs: number;
@@ -59,7 +72,7 @@ type PhaseReceipt = {
   };
 };
 
-const SCHEMA = "plimsoll.system-e2e-proof.v1" as const;
+const SCHEMA = SYSTEM_E2E_SCHEMA;
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const tsx = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
 const proofRoot = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-system-e2e-"));
@@ -73,15 +86,92 @@ for (const directory of [evidenceRoot, machineAHome, machineBHome, machineATmp, 
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
 }
 
-const BUDGETS = {
-  directRows: 100,
-  learningPairs: 100,
-  wallMs: 180_000,
-  cpuMs: 180_000,
-  maxRssBytes: 1_500_000_000,
-  blockOperations: 500_000,
-  capturedOutputBytes: 24 * 1024 * 1024,
-} as const;
+type RootGuard = {
+  label: string;
+  root: string;
+  beforeDigest: string;
+  beforeEntries: number;
+  mode: number;
+};
+let activeRootGuards: RootGuard[] = [];
+
+function guardedTree(root: string) {
+  const rows: Array<{ relative: string; kind: "file" | "directory"; mode: number; contentDigest?: string }> = [];
+  const visit = (directory: string) => {
+    for (const entry of fs.readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name))) {
+      const absolute = path.join(directory, entry.name);
+      const relative = path.relative(root, absolute);
+      const stat = fs.lstatSync(absolute);
+      assert.ok(!stat.isSymbolicLink(), `guarded root ${root} contains a symlink`);
+      if (entry.isDirectory()) {
+        rows.push({ relative, kind: "directory", mode: stat.mode & 0o777 });
+        visit(absolute);
+      } else {
+        assert.ok(entry.isFile(), `guarded root ${root} contains an unsupported entry`);
+        rows.push({
+          relative,
+          kind: "file",
+          mode: stat.mode & 0o777,
+          contentDigest: digest(fs.readFileSync(absolute).toString("base64")),
+        });
+      }
+    }
+  };
+  visit(root);
+  return { digest: digest(rows), entries: rows.length };
+}
+
+function prepareRootGuards(): RootGuard[] {
+  const definitions = [
+    ["machine_a_codex_skills", path.join(machineAHome, ".codex", "skills")],
+    ["machine_a_codex_memories", path.join(machineAHome, ".codex", "memories")],
+    ["machine_a_claude_skills", path.join(machineAHome, ".claude", "skills")],
+    ["machine_b_codex_skills", path.join(machineBHome, ".codex", "skills")],
+    ["machine_b_codex_memories", path.join(machineBHome, ".codex", "memories")],
+    ["machine_b_claude_skills", path.join(machineBHome, ".claude", "skills")],
+    ["operator_live_shadow", path.join(proofRoot, "forbidden", "operator-live-shadow")],
+  ] as const;
+  activeRootGuards = definitions.map(([label, root]) => {
+    fs.mkdirSync(root, { recursive: true, mode: 0o700 });
+    const sentinel = path.join(root, "write-deny.guard");
+    fs.writeFileSync(sentinel, `${label}:source-only\n`, { mode: 0o400 });
+    fs.chmodSync(sentinel, 0o400);
+    fs.chmodSync(root, 0o500);
+    const before = guardedTree(root);
+    assert.ok(before.entries > 0, `${label} guard is empty`);
+    return { label, root, beforeDigest: before.digest, beforeEntries: before.entries, mode: 0o500 };
+  });
+  return activeRootGuards;
+}
+
+function finalizeRootGuards(guards: RootGuard[]) {
+  return guards.map((guard) => {
+    const after = guardedTree(guard.root);
+    const mode = fs.lstatSync(guard.root).mode & 0o777;
+    assert.equal(mode, guard.mode, `${guard.label} write-deny mode changed`);
+    assert.equal(after.entries, guard.beforeEntries, `${guard.label} entry count changed`);
+    assert.equal(after.digest, guard.beforeDigest, `${guard.label} content changed`);
+    return {
+      label: guard.label,
+      beforeDigest: guard.beforeDigest,
+      afterDigest: after.digest,
+      entriesBefore: guard.beforeEntries,
+      entriesAfter: after.entries,
+      writeDenyMode: mode,
+      unchanged: true,
+    };
+  });
+}
+
+function releaseRootGuards() {
+  for (const guard of activeRootGuards) {
+    if (fs.existsSync(guard.root)) fs.chmodSync(guard.root, 0o700);
+  }
+  activeRootGuards = [];
+}
+
+const BUDGETS = SYSTEM_E2E_BUDGETS;
+const supportContract = loadSupportContract(supportContractPath(repoRoot));
 
 const WORKSPACE_A = "10000000-0000-4000-8000-000000000001";
 const WORKSPACE_B = "20000000-0000-4000-8000-000000000002";
@@ -114,23 +204,6 @@ const FLOW_TIME = {
   attempt2Result: "2026-07-01T10:04:00.000Z",
   end: "2026-07-01T10:30:00.000Z",
 } as const;
-
-function canonical(value: unknown): unknown {
-  if (Array.isArray(value)) return value.map(canonical);
-  if (value && typeof value === "object") {
-    return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>)
-        .sort(([left], [right]) => left.localeCompare(right))
-        .map(([key, child]) => [key, canonical(child)]),
-    );
-  }
-  return value;
-}
-
-function digest(value: unknown) {
-  const bytes = typeof value === "string" ? value : JSON.stringify(canonical(value));
-  return `sha256:${createHash("sha256").update(bytes).digest("hex")}`;
-}
 
 const flowFingerprint = digest({
   schema: SCHEMA,
@@ -169,12 +242,14 @@ function isolatedEnvironment(home: string, temp: string) {
 
 function runSupportingProof(options: {
   name: string;
+  kind: SupportingKind;
   script: string;
   args?: string[];
   home: string;
   temp: string;
   requiredAssertions: string[];
   receipt?: string;
+  sourceCommit: string;
 }): PhaseReceipt {
   const result = spawnSync(
     "/usr/bin/time",
@@ -212,15 +287,37 @@ function runSupportingProof(options: {
     assert.ok(fs.existsSync(options.receipt), `${options.name} did not write its selected receipt`);
   }
 
-  return {
+  const artifact = parseSupportingArtifact(options.kind, result.stdout, options.receipt);
+  const artifactDigest = digest(artifact);
+  const phaseContract = supportContract.phases.find((phase) => phase.name === options.name);
+  assert.ok(phaseContract, `${options.name} has no committed support contract`);
+  assert.equal(phaseContract.kind, options.kind, `${options.name} support kind drifted`);
+  assert.equal(
+    artifactDigest,
+    phaseContract.expectedArtifactDigest,
+    `${options.name} actual artifact digest drifted; actual=${artifactDigest}`,
+  );
+  const semanticDigest = digest({
     name: options.name,
     status: "pass",
-    inputFingerprint: flowFingerprint,
-    // Only the normalized contract enters the content-free receipt. Child
-    // output contains random temp paths and timings and is intentionally not
-    // persisted or hashed into the deterministic release identity.
-    outputDigest: digest({ name: options.name, status: "pass", assertions: options.requiredAssertions }),
-    assertions: options.requiredAssertions,
+    expectedFlowFingerprint: flowFingerprint,
+    sourceCommit: options.sourceCommit,
+    artifactDigest,
+    artifact,
+  });
+  const deterministicPhase = {
+    schema: "plimsoll.system-e2e-phase-receipt.v1" as const,
+    name: options.name,
+    status: "pass" as const,
+    expectedFlowFingerprint: flowFingerprint,
+    sourceCommit: options.sourceCommit,
+    artifact,
+    artifactDigest,
+    semanticDigest,
+  };
+  const phaseReceipt: PhaseReceipt = {
+    ...deterministicPhase,
+    outputDigest: digest(deterministicPhase),
     measurements: {
       wallMs,
       cpuMs,
@@ -230,6 +327,15 @@ function runSupportingProof(options: {
       capturedOutputBytes,
     },
   };
+  const phasePath = path.join(evidenceRoot, "phases", `${options.name}.json`);
+  fs.mkdirSync(path.dirname(phasePath), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(phasePath, `${JSON.stringify(phaseReceipt, null, 2)}\n`, { mode: 0o600 });
+  assert.deepEqual(
+    JSON.parse(fs.readFileSync(phasePath, "utf8")),
+    phaseReceipt,
+    `${options.name} structured phase receipt did not round trip`,
+  );
+  return phaseReceipt;
 }
 
 function gitHead() {
@@ -280,6 +386,7 @@ function requestIds(init?: RequestInit) {
 async function runSharedFlow() {
   const machineALedger = path.join(machineAHome, ".plimsoll", "work-ledger.sqlite");
   const machineBLedger = path.join(machineBHome, ".plimsoll", "work-ledger.sqlite");
+  const timelineLedger = path.join(machineAHome, ".plimsoll", "outcome-timeline.sqlite");
   fs.mkdirSync(path.dirname(machineALedger), { recursive: true, mode: 0o700 });
   fs.mkdirSync(path.dirname(machineBLedger), { recursive: true, mode: 0o700 });
 
@@ -300,6 +407,13 @@ async function runSharedFlow() {
     workspaceId: WORKSPACE_A,
   });
   const bufferB = new LocalEventBuffer(machineBLedger, { workspaceId: WORKSPACE_B });
+  const timelineStore = new OutcomeTimelineStore(timelineLedger);
+  const sqliteChanges = () => {
+    const count = (database: { prepare(sql: string): { get(): unknown } }) =>
+      (database.prepare(`select total_changes() as n`).get() as { n: number }).n;
+    return count(bufferA.database) + count(bufferB.database) + count(timelineStore.database);
+  };
+  const sqliteChangesBefore = sqliteChanges();
 
   try {
     const events = [
@@ -415,6 +529,9 @@ async function runSharedFlow() {
     assert.equal(new Set(accepted).size, 3, "valid rows must be accepted exactly once");
     assert.equal(accepted.length, 3, "no valid row may be replayed during reconnect");
     assert.ok(!accepted.includes(poisonId), "poison row must never be accepted");
+    const expectedAcceptedIds = [EVENT_IDS[0], EVENT_IDS[2], EVENT_IDS[3]].sort();
+    assert.deepEqual([...accepted].sort(), expectedAcceptedIds, "accepted IDs must be exactly the three valid machine-A IDs");
+    assert.ok(!accepted.includes(CONTROL_EVENT_ID), "no machine-B event may cross the machine-A outbox");
 
     const candidates: PullCandidate[] = [
       {
@@ -478,9 +595,16 @@ async function runSharedFlow() {
       { ...base, kind: "merge", externalId: "merge-101", mergeSha: MERGE_SHA, mergedAt: "2026-07-01T10:12:00.000Z" },
       { ...base, kind: "revert", externalId: "revert-101", revertSha: REVERT_SHA, revertedSha: MERGE_SHA, revertedAt: "2026-07-02T10:12:00.000Z", evidence: { source: "commit_message_full_sha", matchedFullSha: MERGE_SHA } },
     ];
+    const coverage = [{ runId: "system-e2e", repositoryExternalId: REPO_A, pullExternalId: "pull-101", dimension: "checks" as const, status: "complete" as const, reason: "complete" as const }];
+    timelineStore.appendFacts(facts, "2026-07-03T12:00:00.000Z");
+    timelineStore.recordCoverage(coverage, "2026-07-03T12:00:00.000Z");
+    const persistedTimelineFacts = timelineStore.facts(REPO_A);
+    const persistedTimelineCoverage = timelineStore.coverage("system-e2e");
+    assert.equal(persistedTimelineFacts.length, facts.length);
+    assert.equal(persistedTimelineCoverage.length, coverage.length);
     const outcome = derivePullOutcomeTimeline({
-      facts,
-      coverage: [{ runId: "system-e2e", repositoryExternalId: REPO_A, pullExternalId: "pull-101", dimension: "checks", status: "complete", reason: "complete" }],
+      facts: persistedTimelineFacts,
+      coverage: persistedTimelineCoverage,
       requiredChecks: { names: ["ci"] },
       reworkWindowDays: 14,
     })[0];
@@ -550,6 +674,20 @@ async function runSharedFlow() {
     assert.equal(attempts[1]?.resultStatus, "success");
     assert.equal(bufferA.learningFacts.exposures()[0]?.episodeId, episodeA.episodeId);
 
+    const persistedEpisodes = [
+      ...bufferA.learningFacts.episodes(),
+      ...bufferB.learningFacts.episodes(),
+    ];
+    const persistedExposures = [
+      ...bufferA.learningFacts.exposures(),
+      ...bufferB.learningFacts.exposures(),
+    ];
+    const persistedEpisodeA = persistedEpisodes.find((row) => row.episodeId === episodeA.episodeId);
+    const persistedEpisodeB = persistedEpisodes.find((row) => row.episodeId === episodeB.episodeId);
+    assert.ok(persistedEpisodeA && persistedEpisodeB, "persisted episode rows are incomplete");
+    const persistedExposureA = persistedExposures.find((row) => row.episodeId === episodeA.episodeId);
+    const persistedExposureB = persistedExposures.find((row) => row.episodeId === episodeB.episodeId);
+    assert.ok(persistedExposureA && persistedExposureB);
     const cohort = {
       projectId: REPO_A,
       workType: "implementation" as const,
@@ -562,7 +700,7 @@ async function runSharedFlow() {
     };
     const observation = (
       id: string,
-      exposure: typeof exposureA,
+      exposure: typeof persistedExposureA,
       value: number,
     ): LearningObservation => ({
       observationId: id,
@@ -581,8 +719,8 @@ async function runSharedFlow() {
     });
     const pairs = [{
       pairId: "system-e2e-pair",
-      exposed: observation("shared-treatment", exposureA, outcome.firstPassSuccess ? 1 : 0),
-      control: observation("shared-control", exposureB, 1),
+      exposed: observation("shared-treatment", persistedExposureA, outcome.firstPassSuccess ? 1 : 0),
+      control: observation("shared-control", persistedExposureB, 1),
     }];
     const manifest: LearningEvidenceManifest = {
       schemaVersion: LEARNING_EVIDENCE_SCHEMA_VERSION,
@@ -607,9 +745,9 @@ async function runSharedFlow() {
         direction: "higher_is_better",
       },
       techniqueContract: {
-        techniqueId: exposureA.techniqueId,
-        techniqueVersion: exposureA.techniqueVersion ?? null,
-        contentDigest: exposureA.contentDigest ?? null,
+        techniqueId: persistedExposureA.techniqueId,
+        techniqueVersion: persistedExposureA.techniqueVersion ?? null,
+        contentDigest: persistedExposureA.contentDigest ?? null,
       },
       window: { startInclusive: "2026-07-01T00:00:00.000Z", endExclusive: "2026-07-03T00:00:00.000Z" },
       asOf: "2026-07-03T12:00:00.000Z",
@@ -654,32 +792,126 @@ async function runSharedFlow() {
       packet: null,
     });
 
-    const capturedRowCount = (
-      bufferA.database.prepare(`select count(*) as n from buffered_events`).get() as { n: number }
-    ).n + (
-      bufferB.database.prepare(`select count(*) as n from buffered_events`).get() as { n: number }
-    ).n;
-    const learningFactRowCount = attempts.length +
-      bufferA.learningFacts.episodes().length + bufferB.learningFacts.episodes().length +
-      bufferA.learningFacts.exposures().length + bufferB.learningFacts.exposures().length;
-    const directRowsVisited = capturedRowCount + learningFactRowCount + pairs.length;
-    assert.ok(directRowsVisited <= BUDGETS.directRows);
+    const captureRows = [
+      ...(bufferA.database.prepare(
+        `select id as eventId, session_id as sessionId, account_hash as machineId,
+           workspace_id as workspaceId, input_tokens as inputTokens,
+           output_tokens as outputTokens, cost_usd as costUsd,
+           repo_hash as repoHash, branch_hash as branchHash, head_sha as headSha
+         from buffered_events order by id`,
+      ).all() as Array<Record<string, unknown>>),
+      ...(bufferB.database.prepare(
+        `select id as eventId, session_id as sessionId, account_hash as machineId,
+           workspace_id as workspaceId, input_tokens as inputTokens,
+           output_tokens as outputTokens, cost_usd as costUsd,
+           repo_hash as repoHash, branch_hash as branchHash, head_sha as headSha
+         from buffered_events order by id`,
+      ).all() as Array<Record<string, unknown>>),
+    ].sort((left, right) => String(left.eventId).localeCompare(String(right.eventId)));
+    const captureMaterial = { rows: captureRows };
+    const capture = { ...captureMaterial, digest: digest(captureMaterial) };
+    const deliveryMaterial = {
+      offlineRequestEventIds: [...firstRequests[0]!].sort(),
+      acceptedEventIds: [...accepted].sort(),
+      poisonEventIds: [poisonId],
+      reconnectRequestEventIds: reconnectRequests.map((ids) => [...ids].sort()),
+      acknowledgedReceipts: deliveryStatus.receipts.acknowledged,
+      deadReceipts: deliveryStatus.receipts.dead,
+    };
+    const delivery = { ...deliveryMaterial, digest: digest(deliveryMaterial) };
+    const allocationMaterial = {
+      receipts: allocation.receipts,
+      pullRows: allocation.pullRows,
+      coverage: allocation.coverage,
+      capturedPrimaryTokens: capturedPrimary,
+      allocatedPrimaryTokens: allocatedPrimary,
+      unallocatedPrimaryTokens:
+        allocation.coverage.unallocated.inputTokens + allocation.coverage.unallocated.outputTokens,
+    };
+    const allocationLineage = { ...allocationMaterial, digest: digest(allocationMaterial) };
+    const outcomeMaterial = {
+      facts: persistedTimelineFacts,
+      coverage: persistedTimelineCoverage,
+      requiredChecks: ["ci"],
+      reworkWindowDays: 14,
+      derived: outcome,
+    };
+    const outcomeLineage = { ...outcomeMaterial, digest: digest(outcomeMaterial) };
+    const learningFactMaterial = {
+      episodeBindings: [
+        { sourceEpisodeKey: "shared-flow-treatment", fact: persistedEpisodeA },
+        { sourceEpisodeKey: "shared-flow-control", fact: persistedEpisodeB },
+      ],
+      attemptEventBindings: [
+        { eventId: EVENT_IDS[0], sourceOperationKey: EVENT_IDS[0], signal: "start", operationId: attempts[0]!.operationId },
+        { eventId: EVENT_IDS[1], sourceOperationKey: EVENT_IDS[0], signal: "result", operationId: attempts[0]!.operationId },
+        { eventId: EVENT_IDS[2], sourceOperationKey: EVENT_IDS[2], signal: "start", operationId: attempts[1]!.operationId },
+        { eventId: EVENT_IDS[3], sourceOperationKey: EVENT_IDS[2], signal: "result", operationId: attempts[1]!.operationId },
+      ],
+      attempts,
+      exposures: persistedExposures,
+    };
+    const learningFacts = { ...learningFactMaterial, digest: digest(learningFactMaterial) };
+    const evidenceMaterial = {
+      manifest,
+      sourceFingerprint: evidence.sourceFingerprint,
+      packetFingerprint: evidence.packet.packetFingerprint,
+      claimClass: evidence.packet.claimClass,
+      causalClaim: evidence.packet.causalClaim,
+      prescriptiveClaim: evidence.packet.prescriptiveClaim,
+      skillPublicationAuthorized: evidence.packet.skillCandidateReview.publicationAuthorized,
+      skillInstallationAuthorized: evidence.packet.skillCandidateReview.installationAuthorized,
+      analysisWorkUnits: evidence.analysisWorkUnits,
+      unchangedAnalysisWorkUnits: unchanged.analysisWorkUnits,
+    };
+    const evidenceLineage = { ...evidenceMaterial, digest: digest(evidenceMaterial) };
+    const sqliteWriteChanges = sqliteChanges() - sqliteChangesBefore;
+    const rowWork = {
+      captureRowsRead: captureRows.length,
+      allocationRowsRead: allocationEvents.length,
+      timelineFactRowsRead: persistedTimelineFacts.length,
+      timelineCoverageRowsRead: persistedTimelineCoverage.length,
+      attemptRowsRead: attempts.length,
+      episodeRowsRead: persistedEpisodes.length,
+      exposureRowsRead: persistedExposures.length,
+      learningPairRowsAnalyzed: evidence.analysisWorkUnits,
+      sqliteWriteChanges,
+    };
+    const directRowOperations = Object.values(rowWork).reduce((sum, value) => sum + value, 0);
+    assert.ok(sqliteWriteChanges > 0, "actual SQLite write work must be nonzero");
+    assert.ok(
+      directRowOperations > 0 && directRowOperations <= BUDGETS.directRows,
+      `direct row operations ${directRowOperations} exceeded budget ${BUDGETS.directRows}`,
+    );
+    const identity = {
+      machines: [MACHINE_A, MACHINE_B],
+      workspaces: [WORKSPACE_A, WORKSPACE_B],
+      sessions: [SESSION_A, SESSION_B],
+      eventIds: [...EVENT_IDS, CONTROL_EVENT_ID],
+      pulls: [`${REPO_A}#101`, `${REPO_B}#102`],
+    };
+    const lineage = {
+      identity,
+      capture,
+      delivery,
+      allocation: allocationLineage,
+      outcome: outcomeLineage,
+      learningFacts,
+      evidence: evidenceLineage,
+      rowWork,
+    };
     return {
       status: "pass" as const,
       inputFingerprint: flowFingerprint,
-      outputDigest: digest({
-        allocationReceipts: allocation.receipts.map((row) => ({ eventId: row.eventId, pull: row.pull, confidence: row.confidence, costKnown: row.costKnown })),
-        outcome: { pull: outcome.pullNumber, firstPassSuccess: outcome.firstPassSuccess, correctionLoops: outcome.correctionLoops?.length, reviewCorrections: outcome.reviewCorrections.length, rework: outcome.rework.length },
-        attempts: attempts.map((row) => ({ operationId: row.operationId, resultStatus: row.resultStatus, retryOf: row.retryOf ?? null })),
-        evidence: { sourceFingerprint: evidence.sourceFingerprint, packetFingerprint: evidence.packet.packetFingerprint, claimClass: evidence.packet.claimClass },
-      }),
+      lineage,
+      outputDigest: digest(lineage),
       measurements: {
         machineRoots: 2,
         workspaceIdentities: 2,
         memberRegistryCoverage: "not_run_requires_hosted_authorization" as const,
-        capturedRows: capturedRowCount,
-        learningFactRows: learningFactRowCount,
-        directRowsVisited,
+        capturedRows: captureRows.length,
+        learningFactRows: attempts.length + persistedEpisodes.length + persistedExposures.length,
+        directRowOperations,
         capturedPrimaryTokens: capturedPrimary,
         allocatedPrimaryTokens: allocatedPrimary,
         unallocatedPrimaryTokens: 10,
@@ -697,14 +929,15 @@ async function runSharedFlow() {
         inWindowRework: outcome.rework.filter((row) => row.inWindow).length,
         attempts: attempts.length,
         retryLinks: attempts.filter((row) => row.retryOf).length,
-        episodes: bufferA.learningFacts.episodes().length + bufferB.learningFacts.episodes().length,
-        exposures: bufferA.learningFacts.exposures().length + bufferB.learningFacts.exposures().length,
+        episodes: persistedEpisodes.length,
+        exposures: persistedExposures.length,
         analysisWorkUnits: evidence.analysisWorkUnits,
         unchangedAnalysisWorkUnits: unchanged.analysisWorkUnits,
         autoSkillWrites: 0,
       },
     };
   } finally {
+    timelineStore.close();
     bufferA.close();
     bufferB.close();
   }
@@ -714,10 +947,13 @@ async function main() {
   assert.equal(process.versions.node.split(".")[0], "22", "system E2E requires exact Node 22");
   const startedAt = Date.now();
   const usageBefore = process.resourceUsage();
+  const sourceCommit = gitHead();
+  const rootGuards = prepareRootGuards();
   const sharedFlow = await runSharedFlow();
 
   const install = runSupportingProof({
     name: "install_doctor",
+    kind: "json_result",
     script: "scripts/install-doctor-proof.ts",
     home: machineAHome,
     temp: machineATmp,
@@ -728,9 +964,11 @@ async function main() {
       "packaged_doctor_reports_signal_verified_read_only",
       "proof_never_invokes_launchctl",
     ],
+    sourceCommit,
   });
   const join = runSupportingProof({
     name: "transactional_join",
+    kind: "json_result",
     script: "scripts/join-isolation-proof.ts",
     home: machineBHome,
     temp: machineBTmp,
@@ -740,10 +978,12 @@ async function main() {
       "join_dry_run_rejected_before_token_network_or_mutation",
       "cli_stdin_keeps_secret_out_of_argv_and_output",
     ],
+    sourceCommit,
   });
   const privacyReceipt = path.join(evidenceRoot, "privacy.json");
   const privacy = runSupportingProof({
     name: "metadata_only_privacy",
+    kind: "line_summary_with_receipt",
     script: "scripts/privacy-mode-proof.ts",
     args: ["--receipt", privacyReceipt],
     receipt: privacyReceipt,
@@ -755,9 +995,11 @@ async function main() {
       "lease_export_ack_races_and_reopen_remain_terminal_and_local",
       "proof_receipt_contains_no_private_sentinel",
     ],
+    sourceCommit,
   });
   const lifecycle = runSupportingProof({
     name: "canonical_lifecycle",
+    kind: "line_summary",
     script: "scripts/lifecycle-proof.ts",
     home: machineBHome,
     temp: machineBTmp,
@@ -769,10 +1011,12 @@ async function main() {
       "uninstall_command_preview_discloses_retained_and_purge_only_snapshots",
       "purge_is_separate_exact_and_deletes_live_plus_snapshot_secret_copies",
     ],
+    sourceCommit,
   });
   const resourceReceiptPath = path.join(evidenceRoot, "resource.json");
   const resource = runSupportingProof({
     name: "idle_dashboard_resources",
+    kind: "json_receipt",
     script: "scripts/resource-proof/index.ts",
     args: ["--require-integrated", "--receipt", resourceReceiptPath],
     receipt: resourceReceiptPath,
@@ -783,6 +1027,7 @@ async function main() {
       '"id": "dashboard_projection_budget"',
       '"overall": "pass"',
     ],
+    sourceCommit,
   });
 
   const resourceReceipt = JSON.parse(fs.readFileSync(resourceReceiptPath, "utf8")) as {
@@ -814,33 +1059,124 @@ async function main() {
   assert.equal(dashboard?.counters.filesystemEntriesScanned, 0);
 
   const phases = [install, join, privacy, lifecycle, resource];
+  assert.equal(phases.length, supportContract.phases.length, "support phase count drifted");
+  const rootGuardReceipts = finalizeRootGuards(rootGuards);
+  assert.ok(rootGuardReceipts.length > 0 && rootGuardReceipts.every((guard) => guard.unchanged));
   const wallMs = Date.now() - startedAt;
   const usageAfter = process.resourceUsage();
   const phaseCpuMs = phases.reduce((sum, phase) => sum + phase.measurements.cpuMs, 0);
+  const controllerCpuMs =
+    (usageAfter.userCPUTime - usageBefore.userCPUTime +
+      usageAfter.systemCPUTime - usageBefore.systemCPUTime) /
+    1_000;
+  const totalCpuMs = phaseCpuMs + controllerCpuMs;
   const phaseOutputBytes = phases.reduce(
     (sum, phase) => sum + phase.measurements.capturedOutputBytes,
     0,
   );
-  const blockOperations = phases.reduce(
-    (sum, phase) =>
-      sum + phase.measurements.blockInputOperations + phase.measurements.blockOutputOperations,
+  const childBlockInputOperations = phases.reduce(
+    (sum, phase) => sum + phase.measurements.blockInputOperations,
     0,
   );
+  const childBlockOutputOperations = phases.reduce(
+    (sum, phase) => sum + phase.measurements.blockOutputOperations,
+    0,
+  );
+  const controllerBlockInputOperations = usageAfter.fsRead - usageBefore.fsRead;
+  const controllerBlockOutputOperations = usageAfter.fsWrite - usageBefore.fsWrite;
+  const blockOperations =
+    childBlockInputOperations + childBlockOutputOperations +
+    controllerBlockInputOperations + controllerBlockOutputOperations;
+  const resourceRowCounterNames = [
+    "eventsObserved",
+    "eventsAdmitted",
+    "eventsDropped",
+    "rawEventWrites",
+    "rawEventRewrites",
+    "rawRowsScanned",
+    "projectionRowsVisited",
+    "projectionRowsWritten",
+    "outboxRowsEnqueued",
+    "outboxAttempts",
+    "deadLettersWritten",
+    "repriceRowsVisited",
+    "reconciliationRowsVisited",
+    "enrichmentRowsVisited",
+    "learningFactRowsWritten",
+  ] as const;
+  const supportRowOperations = resourceReceipt.scenarios.reduce(
+    (total, scenario) =>
+      total + resourceRowCounterNames.reduce((sum, name) => sum + (scenario.counters[name] ?? 0), 0),
+    0,
+  );
+  const directRowOperations = sharedFlow.measurements.directRowOperations;
+  const totalRowOperations = directRowOperations + supportRowOperations;
+  const controllerMaxRssBytes = usageAfter.maxRSS * 1_024;
   const maxRssBytes = Math.max(
-    usageAfter.maxRSS * 1_024,
+    controllerMaxRssBytes,
     ...phases.map((phase) => phase.measurements.maxRssBytes),
   );
+  assert.ok(totalCpuMs > 0, "observed parent plus child CPU must be nonzero");
+  assert.ok(totalRowOperations > 0, "observed row work must be nonzero");
   assert.ok(wallMs <= BUDGETS.wallMs, "system E2E exceeded wall budget");
-  assert.ok(phaseCpuMs <= BUDGETS.cpuMs, "system E2E exceeded CPU budget");
+  assert.ok(totalCpuMs <= BUDGETS.cpuMs, "system E2E exceeded total parent plus child CPU budget");
   assert.ok(maxRssBytes <= BUDGETS.maxRssBytes, "system E2E exceeded RSS budget");
   assert.ok(blockOperations <= BUDGETS.blockOperations, "system E2E exceeded block-I/O budget");
+  assert.ok(totalRowOperations <= BUDGETS.totalRowOperations, "system E2E exceeded row-work budget");
   assert.ok(phaseOutputBytes <= BUDGETS.capturedOutputBytes, "system E2E exceeded output budget");
 
-  const receipt = {
+  const deterministicPhases = phases.map(({ measurements: _volatile, ...phase }) => phase);
+  const phaseChainDigest = digest(deterministicPhases);
+  const measurements = {
+    phases: phases.map((phase) => ({ name: phase.name, ...phase.measurements })),
+    wallMs,
+    cpu: {
+      childMs: phaseCpuMs,
+      controllerMs: controllerCpuMs,
+      totalMs: totalCpuMs,
+    },
+    rss: { controllerMaxBytes: controllerMaxRssBytes, maxBytes: maxRssBytes },
+    blockIo: {
+      childInputOperations: childBlockInputOperations,
+      childOutputOperations: childBlockOutputOperations,
+      controllerInputOperations: controllerBlockInputOperations,
+      controllerOutputOperations: controllerBlockOutputOperations,
+      totalOperations: blockOperations,
+    },
+    rowWork: {
+      directOperations: directRowOperations,
+      supportOperations: supportRowOperations,
+      totalOperations: totalRowOperations,
+    },
+    capturedOutputBytes: phaseOutputBytes,
+    budgetMargins: {
+      wallMs: BUDGETS.wallMs - wallMs,
+      cpuMs: BUDGETS.cpuMs - totalCpuMs,
+      rssBytes: BUDGETS.maxRssBytes - maxRssBytes,
+      blockOperations: BUDGETS.blockOperations - blockOperations,
+      rowOperations: BUDGETS.totalRowOperations - totalRowOperations,
+      capturedOutputBytes: BUDGETS.capturedOutputBytes - phaseOutputBytes,
+    },
+    idle: {
+      rawEventWrites: idle?.counters.rawEventWrites,
+      rawEventRewrites: idle?.counters.rawEventRewrites,
+      filesOpened: idle?.counters.filesOpened,
+      fileBytesRead: idle?.counters.fileBytesRead,
+      fullHistoryFileReads: idle?.counters.fullHistoryFileReads,
+      overlappingJobs: idle?.counters.overlappingJobs,
+    },
+    dashboard: {
+      rawRowsScanned: dashboard?.counters.rawRowsScanned,
+      filesOpened: dashboard?.counters.filesOpened,
+      fileBytesRead: dashboard?.counters.fileBytesRead,
+      filesystemEntriesScanned: dashboard?.counters.filesystemEntriesScanned,
+    },
+  };
+  const deterministicMaterial = {
     schema: SCHEMA,
     status: "pass",
-    sourceCommit: gitHead(),
-    node: process.version,
+    sourceCommit,
+    nodeMajor: 22,
     isolation: {
       temporaryMachineRoots: 2,
       distinctMachineIdentities: 2,
@@ -851,39 +1187,15 @@ async function main() {
       liveLedgersOrConfigsTouched: 0,
       packagePublishes: 0,
       skillOrMemoryWrites: 0,
+      rootGuards: rootGuardReceipts,
     },
     flow: {
       fingerprint: flowFingerprint,
       sharedFlow,
-      phaseChain: phases,
-      phaseChainDigest: digest(phases.map((phase) => ({
-        name: phase.name,
-        inputFingerprint: phase.inputFingerprint,
-        outputDigest: phase.outputDigest,
-      }))),
+      phaseChain: deterministicPhases,
+      phaseChainDigest,
     },
     budgets: BUDGETS,
-    measurements: {
-      wallMs,
-      cpuMs: phaseCpuMs + (usageAfter.userCPUTime - usageBefore.userCPUTime + usageAfter.systemCPUTime - usageBefore.systemCPUTime) / 1_000,
-      maxRssBytes,
-      blockOperations,
-      capturedOutputBytes: phaseOutputBytes,
-      idle: {
-        rawEventWrites: idle?.counters.rawEventWrites,
-        rawEventRewrites: idle?.counters.rawEventRewrites,
-        filesOpened: idle?.counters.filesOpened,
-        fileBytesRead: idle?.counters.fileBytesRead,
-        fullHistoryFileReads: idle?.counters.fullHistoryFileReads,
-        overlappingJobs: idle?.counters.overlappingJobs,
-      },
-      dashboard: {
-        rawRowsScanned: dashboard?.counters.rawRowsScanned,
-        filesOpened: dashboard?.counters.filesOpened,
-        fileBytesRead: dashboard?.counters.fileBytesRead,
-        filesystemEntriesScanned: dashboard?.counters.filesystemEntriesScanned,
-      },
-    },
     externalGates: [
       { gate: "hosted_two_member_registry", status: "not_run_requires_hosted_authorization" },
       { gate: "hosted_device_revocation", status: "not_run_requires_hosted_authorization" },
@@ -900,9 +1212,32 @@ async function main() {
     },
     liveStateTouched: false,
   };
+  const receipt = {
+    ...deterministicMaterial,
+    measurements,
+    volatileFieldsExcludedFromDeterministicDigest: [
+      "measurements",
+    ],
+    deterministicDigest: digest(deterministicMaterial),
+  };
 
   const serialized = `${JSON.stringify(receipt, null, 2)}\n`;
   assert.ok(!/(?:credential-sentinel|api[_-]?key["'=:\s]|bearer\s+[a-z0-9])/i.test(serialized));
+  const compareArg = process.argv.indexOf("--compare-deterministic-receipt");
+  if (compareArg >= 0) {
+    const previousPath = path.resolve(process.argv[compareArg + 1] ?? "");
+    assert.ok(fs.existsSync(previousPath), "comparison receipt is missing");
+    const previous = JSON.parse(fs.readFileSync(previousPath, "utf8")) as {
+      schema?: unknown;
+      deterministicDigest?: unknown;
+    };
+    assert.equal(previous.schema, SCHEMA, "comparison receipt schema drifted");
+    assert.equal(
+      previous.deterministicDigest,
+      receipt.deterministicDigest,
+      "deterministic digest changed across isolated runs",
+    );
+  }
   const receiptArg = process.argv.indexOf("--receipt");
   const receiptPath = path.resolve(
     receiptArg >= 0 && process.argv[receiptArg + 1]
@@ -933,5 +1268,6 @@ main()
     process.exitCode = 1;
   })
   .finally(() => {
+    releaseRootGuards();
     fs.rmSync(proofRoot, { recursive: true, force: true });
   });
