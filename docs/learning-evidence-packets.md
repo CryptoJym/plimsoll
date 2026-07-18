@@ -18,7 +18,8 @@ metric/version/unit/direction must also match.
 
 The runtime rejects:
 
-- missing, implicit, noncanonical, duplicate, or retrospective technique exposure;
+- missing, implicit, noncanonical, duplicate, semantically forged, or retrospective technique exposure;
+- treatment/control reuse of one episode, observation, exposure, or pair identity;
 - mixed technique ID/version/content-digest contracts or mismatched intervention assignments;
 - open-web or model-generated content as gating evidence;
 - incomparable cohort, epoch, model, tool, metric, or unit identities;
@@ -46,8 +47,11 @@ or higher-is-better and lower-is-better outcomes, can never be averaged.
 One explicit `techniqueContract` likewise binds the technique ID, version, and
 content digest for the entire run. The packet accepts only the shared strict
 `TechniqueExposureFact` schema and requires its work class and complexity band
-to agree with the matched cohort. This reuses the stored prospective fact
-surface instead of creating a second analytical exposure truth.
+to agree with the matched cohort. Its deterministic `exposureId` is recomputed
+from every semantic field before analysis, and each episode/work unit can
+appear in only one observation across the packet. This reuses the stored
+prospective fact surface instead of creating a second analytical exposure
+truth.
 
 ## Versioned schema surface
 
@@ -109,8 +113,11 @@ On a later run, the CLI automatically reads the existing output fingerprint
 or accepts `--previous <packet.json>`. An unchanged source does not rewrite the
 output file. Output must be a JSON file inside the current workspace. URL,
 workspace-escape, `SKILL.md`, `MEMORY.md`, installed skill tree, and global
-memory targets fail closed. The CLI has no network, device-management,
-publication, or skill-writing path.
+memory targets fail closed. The path guard resolves the target or nearest
+existing ancestor on every invocation, follows symlink chains, and checks the
+canonical case-insensitive target segments. A benign in-workspace alias cannot
+redirect output into `.codex/skills` or another forbidden tree. The CLI has no
+network, device-management, publication, or skill-writing path.
 
 Run the adversarial fixtures with:
 

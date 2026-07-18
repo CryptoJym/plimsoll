@@ -11,13 +11,13 @@ import { homedir } from "node:os";
 import { dirname, isAbsolute, relative, resolve, sep } from "node:path";
 
 import {
-  techniqueExposureFactSchema,
   workClassSchema,
   workComplexityBandSchema,
   type TechniqueExposureFact,
   type WorkClass,
   type WorkComplexityBand,
 } from "./schemas";
+import { validateTechniqueExposureFactIdentity } from "./learning-fact-identity";
 
 export const LEARNING_EVIDENCE_SCHEMA_VERSION = "1.0.0" as const;
 export const LEARNING_ANALYSIS_VERSION = "1.0.0" as const;
@@ -642,16 +642,21 @@ function validateExposure(
   techniqueContract: LearningTechniqueContract,
   field: string,
   exposureIds: Set<string>,
+  episodeIds: Set<string>,
 ): void {
   assertObject(observation.exposure, `${field}.exposure`);
-  const parsed = techniqueExposureFactSchema.safeParse(observation.exposure);
-  if (!parsed.success) {
+  let exposure: TechniqueExposureFact;
+  try {
+    exposure = validateTechniqueExposureFactIdentity(observation.exposure);
+  } catch (error) {
+    if (error instanceof Error && error.message === "TechniqueExposureDerivedIdMismatch") {
+      throw new Error(`${field}.exposure exposureId does not bind its canonical semantic fields`);
+    }
     throw new Error(`${field}.exposure must be a canonical explicit TechniqueExposureFact`);
   }
-  if (canonicalLearningJson(parsed.data) !== canonicalLearningJson(observation.exposure)) {
+  if (canonicalLearningJson(exposure) !== canonicalLearningJson(observation.exposure)) {
     throw new Error(`${field}.exposure must already use the canonical stored fact representation`);
   }
-  const exposure = parsed.data;
   const expectedMode = expectedState === "exposed" ? "treatment" : "control";
   if (exposure.mode !== expectedMode) {
     throw new Error(`${field} must carry an explicit ${expectedMode} exposure fact`);
@@ -660,6 +665,10 @@ function validateExposure(
     throw new Error(`duplicate technique exposure id: ${exposure.exposureId}`);
   }
   exposureIds.add(exposure.exposureId);
+  if (episodeIds.has(exposure.episodeId)) {
+    throw new Error(`duplicate technique exposure episodeId: ${exposure.episodeId}`);
+  }
+  episodeIds.add(exposure.episodeId);
   if (
     exposure.techniqueId !== techniqueContract.techniqueId ||
     (exposure.techniqueVersion ?? null) !== techniqueContract.techniqueVersion ||
@@ -687,6 +696,7 @@ function validateObservation(
   field: string,
   observationIds: Set<string>,
   exposureIds: Set<string>,
+  episodeIds: Set<string>,
 ): void {
   assertObject(observation, field);
   assertExactKeys(
@@ -723,7 +733,14 @@ function validateObservation(
   if (!workComplexityBandSchema.safeParse(observation.cohort.complexityBand).success) {
     throw new Error(`${field}.cohort.complexityBand has unsupported value`);
   }
-  validateExposure(observation, expectedState, manifest.techniqueContract, field, exposureIds);
+  validateExposure(
+    observation,
+    expectedState,
+    manifest.techniqueContract,
+    field,
+    exposureIds,
+    episodeIds,
+  );
 
   assertObject(observation.outcome, `${field}.outcome`);
   assertExactKeys(
@@ -806,6 +823,7 @@ export function validateLearningEvidenceManifest(manifest: LearningEvidenceManif
   const pairIds = new Set<string>();
   const observationIds = new Set<string>();
   const exposureIds = new Set<string>();
+  const episodeIds = new Set<string>();
   for (const [index, pair] of manifest.pairs.entries()) {
     const field = `pairs[${index}]`;
     assertObject(pair, field);
@@ -813,8 +831,24 @@ export function validateLearningEvidenceManifest(manifest: LearningEvidenceManif
     assertCanonicalIdentity(pair.pairId, `${field}.pairId`);
     if (pairIds.has(pair.pairId)) throw new Error(`duplicate pair id: ${pair.pairId}`);
     pairIds.add(pair.pairId);
-    validateObservation(pair.exposed, "exposed", manifest, `${field}.exposed`, observationIds, exposureIds);
-    validateObservation(pair.control, "control", manifest, `${field}.control`, observationIds, exposureIds);
+    validateObservation(
+      pair.exposed,
+      "exposed",
+      manifest,
+      `${field}.exposed`,
+      observationIds,
+      exposureIds,
+      episodeIds,
+    );
+    validateObservation(
+      pair.control,
+      "control",
+      manifest,
+      `${field}.control`,
+      observationIds,
+      exposureIds,
+      episodeIds,
+    );
     assertComparablePair(pair, field);
   }
 }
@@ -1174,7 +1208,6 @@ export function assertLearningReviewOutputPath(outputPath: string, workspaceRoot
   if (base === "skill.md" || base === "memory.md") {
     throw new Error("learning evidence output cannot target executable skills or global memory");
   }
-  const lowerResolved = resolved.toLowerCase();
   const forbiddenSegments = [
     `${sep}.codex${sep}skills${sep}`,
     `${sep}.claude${sep}skills${sep}`,
@@ -1182,27 +1215,41 @@ export function assertLearningReviewOutputPath(outputPath: string, workspaceRoot
     `${sep}.codex${sep}memories${sep}`,
     `${sep}.claude${sep}memory${sep}`,
   ];
-  if (forbiddenSegments.some((segment) => `${lowerResolved}${sep}`.includes(segment))) {
+  const targetsForbiddenTree = (target: string): boolean => {
+    const lowerTarget = `${target.toLowerCase()}${sep}`;
+    return forbiddenSegments.some((segment) => lowerTarget.includes(segment));
+  };
+  if (targetsForbiddenTree(resolved)) {
     throw new Error("learning evidence output targets a prohibited skill or memory tree");
   }
 
-  // Resolve the nearest existing parent so a workspace-local directory
-  // symlink cannot redirect the artifact into a skill, memory, mount, or
-  // other path outside the explicit workspace.
-  let existingParent = dirname(resolved);
-  while (!existsSync(existingParent)) {
-    const parent = dirname(existingParent);
-    if (parent === existingParent) throw new Error("learning evidence output has no existing local ancestor");
-    existingParent = parent;
+  // Resolve the target itself when it exists, otherwise resolve the nearest
+  // existing ancestor and append only the unresolved suffix. This follows
+  // every symlink in a chain and avoids returning a symlinked write path.
+  let existingAncestor = resolved;
+  while (!existsSync(existingAncestor)) {
+    const parent = dirname(existingAncestor);
+    if (parent === existingAncestor) throw new Error("learning evidence output has no existing local ancestor");
+    existingAncestor = parent;
   }
-  const realParent = realpathSync(existingParent);
-  const realParentRelative = relative(root, realParent);
+  const canonicalTarget = existsSync(resolved)
+    ? realpathSync(resolved)
+    : resolve(realpathSync(existingAncestor), relative(existingAncestor, resolved));
+  const canonicalRelative = relative(root, canonicalTarget);
   if (
-    realParentRelative === ".." ||
-    realParentRelative.startsWith(`..${sep}`) ||
-    isAbsolute(realParentRelative)
+    canonicalRelative === "" ||
+    canonicalRelative === ".." ||
+    canonicalRelative.startsWith(`..${sep}`) ||
+    isAbsolute(canonicalRelative)
   ) {
     throw new Error("learning evidence output cannot escape through a workspace symlink");
+  }
+  const canonicalBase = canonicalTarget.split(sep).at(-1)?.toLowerCase();
+  if (canonicalBase === "skill.md" || canonicalBase === "memory.md") {
+    throw new Error("learning evidence output cannot target executable skills or global memory");
+  }
+  if (targetsForbiddenTree(canonicalTarget)) {
+    throw new Error("learning evidence output resolves into a prohibited skill or memory tree");
   }
   const home = resolve(homedir());
   const prohibited = [
@@ -1212,8 +1259,12 @@ export function assertLearningReviewOutputPath(outputPath: string, workspaceRoot
     resolve(home, ".codex/memories"),
     resolve(home, ".claude/memory"),
   ];
-  if (prohibited.some((target) => resolved === target || resolved.startsWith(`${target}${sep}`))) {
+  const lowerCanonicalTarget = canonicalTarget.toLowerCase();
+  if (prohibited.some((target) => {
+    const lowerTarget = target.toLowerCase();
+    return lowerCanonicalTarget === lowerTarget || lowerCanonicalTarget.startsWith(`${lowerTarget}${sep}`);
+  })) {
     throw new Error("learning evidence output targets a prohibited skill or memory tree");
   }
-  return resolved;
+  return canonicalTarget;
 }

@@ -1,6 +1,7 @@
 export * from "./policy";
 export * from "./analytical-metadata";
 export * from "./schemas";
+export * from "./learning-fact-identity";
 export * from "./linkage";
 export * from "./pricing";
 export * from "./suppression-receipt";

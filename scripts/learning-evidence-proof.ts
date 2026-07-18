@@ -14,6 +14,7 @@ import {
   compileLearningEvidencePacket,
   computeLearningPairDigest,
   computeLearningSourceFingerprint,
+  deterministicLearningFactId,
   validateLearningEvidenceManifest,
   type LearningCohort,
   type LearningEvidenceManifest,
@@ -22,7 +23,6 @@ import {
 } from "../packages/shared/src/index";
 import {
   buildTechniqueExposureFact,
-  deterministicLearningFactId,
 } from "../packages/collector-cli/src/learning-facts";
 
 type ProofCheck = { name: string; detail: string };
@@ -99,6 +99,24 @@ function pair(id: string, exposedValue: number | null, controlValue: number | nu
     exposed: observation(`${id}-exposed`, "exposed", exposedValue, assignmentId, structuredClone(cohortValue)),
     control: observation(`${id}-control`, "control", controlValue, assignmentId, structuredClone(cohortValue)),
   };
+}
+
+function rebuildExposure(
+  exposure: LearningObservation["exposure"],
+  overrides: Partial<Parameters<typeof buildTechniqueExposureFact>[0]>,
+): LearningObservation["exposure"] {
+  return buildTechniqueExposureFact({
+    episodeId: exposure.episodeId,
+    techniqueId: exposure.techniqueId,
+    techniqueVersion: exposure.techniqueVersion,
+    contentDigest: exposure.contentDigest,
+    assignmentId: exposure.assignmentId,
+    workClass: exposure.workClass,
+    complexityBand: exposure.complexityBand,
+    exposedAt: exposure.exposedAt,
+    mode: exposure.mode,
+    ...overrides,
+  });
 }
 
 function manifestFor(
@@ -280,7 +298,10 @@ prove(
     );
 
     const futureExposure = manifestFor(basePairs.map((item) => structuredClone(item)));
-    futureExposure.pairs[0].exposed.exposure.exposedAt = "2026-06-10T10:01:00.000Z";
+    futureExposure.pairs[0].exposed.exposure = rebuildExposure(
+      futureExposure.pairs[0].exposed.exposure,
+      { exposedAt: "2026-06-10T10:01:00.000Z" },
+    );
     futureExposure.source.rowDigest = computeLearningPairDigest(futureExposure.pairs);
     assert.throws(
       () => compileLearningEvidencePacket(futureExposure, { previousSourceFingerprint: baseRun.sourceFingerprint }),
@@ -333,7 +354,9 @@ prove(
   "retrospective exposure fails closed",
   () => {
     const invalid = manifestFor([pair("retro", 2, 1)]);
-    invalid.pairs[0].exposed.exposure.exposedAt = "2026-06-10T10:01:00.000Z";
+    invalid.pairs[0].exposed.exposure = rebuildExposure(invalid.pairs[0].exposed.exposure, {
+      exposedAt: "2026-06-10T10:01:00.000Z",
+    });
     invalid.source.rowDigest = computeLearningPairDigest(invalid.pairs);
     assert.throws(() => compileLearningEvidencePacket(invalid), /exposure is retrospective/);
   },
@@ -400,7 +423,10 @@ prove(
   "one canonical technique identity governs every pair",
   () => {
     const mixedVersion = manifestFor(basePairs.map((item) => structuredClone(item)));
-    mixedVersion.pairs[0].control.exposure.techniqueVersion = "2.0.0";
+    mixedVersion.pairs[0].control.exposure = rebuildExposure(
+      mixedVersion.pairs[0].control.exposure,
+      { techniqueVersion: "2.0.0" },
+    );
     mixedVersion.source.rowDigest = computeLearningPairDigest(mixedVersion.pairs);
     assert.throws(
       () => compileLearningEvidencePacket(mixedVersion),
@@ -408,7 +434,10 @@ prove(
     );
 
     const mixedAssignment = manifestFor(basePairs.map((item) => structuredClone(item)));
-    mixedAssignment.pairs[0].control.exposure.assignmentId = "assignment-other";
+    mixedAssignment.pairs[0].control.exposure = rebuildExposure(
+      mixedAssignment.pairs[0].control.exposure,
+      { assignmentId: "assignment-other" },
+    );
     mixedAssignment.source.rowDigest = computeLearningPairDigest(mixedAssignment.pairs);
     assert.throws(
       () => compileLearningEvidencePacket(mixedAssignment),
@@ -416,6 +445,68 @@ prove(
     );
   },
   "canonical fact id/version/content and matched intervention assignment cannot drift inside one estimate",
+);
+
+prove(
+  "exposure semantic identity and work-unit reuse fail closed",
+  () => {
+    const forged = manifestFor(basePairs.map((item) => structuredClone(item)));
+    forged.pairs[0].exposed.exposure.exposureId = deterministicLearningFactId([
+      "unrelated-valid-exposure-id",
+    ]);
+    forged.source.rowDigest = computeLearningPairDigest(forged.pairs);
+    assert.throws(
+      () => compileLearningEvidencePacket(forged),
+      /exposureId does not bind its canonical semantic fields/,
+    );
+
+    const sameEpisode = manifestFor([pair("same-episode", 2, 1)]);
+    sameEpisode.pairs[0].control.exposure = rebuildExposure(
+      sameEpisode.pairs[0].control.exposure,
+      { episodeId: sameEpisode.pairs[0].exposed.exposure.episodeId },
+    );
+    sameEpisode.source.rowDigest = computeLearningPairDigest(sameEpisode.pairs);
+    assert.throws(
+      () => compileLearningEvidencePacket(sameEpisode),
+      /duplicate technique exposure episodeId/,
+    );
+
+    const reusedEpisode = manifestFor([
+      pair("episode-reuse-a", 2, 1),
+      pair("episode-reuse-b", 3, 1),
+    ]);
+    reusedEpisode.pairs[1].exposed.exposure = rebuildExposure(
+      reusedEpisode.pairs[1].exposed.exposure,
+      { episodeId: reusedEpisode.pairs[0].exposed.exposure.episodeId },
+    );
+    reusedEpisode.source.rowDigest = computeLearningPairDigest(reusedEpisode.pairs);
+    assert.throws(
+      () => compileLearningEvidencePacket(reusedEpisode),
+      /duplicate technique exposure episodeId/,
+    );
+
+    const reusedObservation = manifestFor([
+      pair("observation-reuse-a", 2, 1),
+      pair("observation-reuse-b", 3, 1),
+    ]);
+    reusedObservation.pairs[1].exposed.observationId =
+      reusedObservation.pairs[0].exposed.observationId;
+    reusedObservation.source.rowDigest = computeLearningPairDigest(reusedObservation.pairs);
+    assert.throws(
+      () => compileLearningEvidencePacket(reusedObservation),
+      /duplicate observation id/,
+    );
+
+    const duplicateRows = manifestFor([
+      pair("duplicate-row", 2, 1),
+      pair("duplicate-row", 2, 1),
+    ]);
+    assert.throws(
+      () => compileLearningEvidencePacket(duplicateRows),
+      /duplicate pair id/,
+    );
+  },
+  "a valid UUID shape cannot forge a fact, and one episode/observation cannot enter multiple arms or pairs",
 );
 
 prove(
@@ -663,7 +754,11 @@ prove(
     );
     const outside = resolve(root, `../plimsoll-learning-guard-outside-${process.pid}`);
     const link = resolve(root, `evidence/.learning-guard-link-${process.pid}`);
+    const forbiddenTarget = resolve(root, `evidence/.learning-guard-case-${process.pid}/.CoDeX/SkIlLs`);
+    const skillAlias = resolve(root, `evidence/.learning-skill-alias-${process.pid}`);
+    const chainAlias = resolve(root, `evidence/.learning-skill-chain-${process.pid}`);
     mkdirSync(outside, { recursive: true });
+    mkdirSync(forbiddenTarget, { recursive: true });
     mkdirSync(resolve(root, "evidence"), { recursive: true });
     try {
       symlinkSync(outside, link, "dir");
@@ -671,12 +766,33 @@ prove(
         () => assertLearningReviewOutputPath(`${link}/packet.json`, root),
         /cannot escape through a workspace symlink/,
       );
+      symlinkSync(forbiddenTarget, skillAlias, "dir");
+      symlinkSync(skillAlias, chainAlias, "dir");
+      assert.throws(
+        () => assertLearningReviewOutputPath(`${skillAlias}/candidate.json`, root),
+        /resolves into a prohibited skill or memory tree/,
+      );
+      for (let attempt = 0; attempt < 2; attempt += 1) {
+        assert.throws(
+          () => assertLearningReviewOutputPath(`${chainAlias}/candidate.json`, root),
+          /resolves into a prohibited skill or memory tree/,
+        );
+      }
+      rmSync(chainAlias, { force: true });
+      symlinkSync(skillAlias, chainAlias, "dir");
+      assert.throws(
+        () => assertLearningReviewOutputPath(`${chainAlias}/candidate.json`, root),
+        /resolves into a prohibited skill or memory tree/,
+      );
     } finally {
+      rmSync(chainAlias, { force: true });
+      rmSync(skillAlias, { force: true });
       rmSync(link, { force: true });
       rmSync(outside, { recursive: true, force: true });
+      rmSync(resolve(root, `evidence/.learning-guard-case-${process.pid}`), { recursive: true, force: true });
     }
   },
-  "CLI artifact output stays local to one explicit workspace and cannot install/publish",
+  "CLI output resolves symlink chains on every run and rejects canonical mixed-case skill/memory targets",
 );
 
 prove(
