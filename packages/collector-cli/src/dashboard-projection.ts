@@ -4,6 +4,7 @@ import { gzipSync, gunzipSync } from "node:zlib";
 import type Database from "better-sqlite3";
 
 import type { SubscriptionConfig } from "./dashboard-api";
+import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 
 export const DASHBOARD_SCHEMA_VERSION = 1;
 export const DASHBOARD_WINDOWS = [30, 90, 182, 365, 1825] as const;
@@ -23,6 +24,7 @@ const SAFE_ACTIONS=new Set(["continue","validate","test","edit","read","write","
 
 type RawProjectionRow = {
   rawRowid: number;
+  privacyEligible: number;
   id: string;
   source: string;
   eventType: string;
@@ -711,11 +713,29 @@ export class DashboardProjectionStore {
           degraded_reason=case when generation>0 then 'projection_repair_backlog' else degraded_reason end
         where singleton=1;
       end;
+      drop trigger if exists trg_dashboard_privacy_generation_ready;
+      create trigger trg_dashboard_privacy_generation_ready
+      after update of privacy_generation on buffered_events
+      when old.privacy_generation is null and new.privacy_generation is not null
+      begin
+        insert into dashboard_projection_repairs (raw_rowid, reason, queued_at)
+        values (new.rowid, 'privacy_lineage_ready', strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        on conflict(raw_rowid) do update set
+          reason=case
+            when dashboard_projection_repairs.reason in ('raw_insert','projection_apply_failed')
+              then dashboard_projection_repairs.reason
+            else excluded.reason end,
+          queued_at=excluded.queued_at;
+        update dashboard_projection_control set dirty=1,
+          degraded_reason=case when generation>0 then 'projection_repair_backlog' else degraded_reason end
+        where singleton=1;
+      end;
       drop trigger if exists trg_dashboard_raw_update;
       create trigger trg_dashboard_raw_update
       after update of source, event_type, observed_at, session_id, action_class, model,
         input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd,
-        repo_hash, branch_hash, head_sha, machine, account_hash, suppressed_fields_json
+        repo_hash, branch_hash, head_sha, machine, account_hash, suppressed_fields_json,
+        data_mode, privacy_disposition
       on buffered_events
       begin
         insert into dashboard_compact_mutations
@@ -742,7 +762,8 @@ export class DashboardProjectionStore {
             or new.input_tokens is not null or new.output_tokens is not null
             or new.cache_read_tokens is not null or new.cache_creation_tokens is not null
             or new.cost_usd is not null or new.repo_hash is not null or new.branch_hash is not null
-            or new.head_sha is not null or new.account_hash is not null)
+            or new.head_sha is not null or new.account_hash is not null
+            or new.data_mode is not old.data_mode or new.privacy_disposition is not null)
         on conflict(raw_rowid) do nothing;
         insert into dashboard_projection_repairs (raw_rowid, reason, queued_at)
         values (new.rowid, 'raw_update', strftime('%Y-%m-%dT%H:%M:%fZ','now'))
@@ -972,8 +993,10 @@ export class DashboardProjectionStore {
   }
 
   private rawRow(rawRowid: number) {
+    const privacyEligible = terminalPrivacyEligibilitySql(this.db, "buffered_events");
     return this.db.prepare(
       `select rowid as rawRowid, id, source, event_type as eventType,
+        case when ${privacyEligible} then 1 else 0 end as privacyEligible,
         observed_at as observedAt, session_id as sessionId, action_class as actionClass,
         model, input_tokens as inputTokens, output_tokens as outputTokens,
         cache_read_tokens as cacheReadTokens, cache_creation_tokens as cacheCreationTokens,
@@ -1025,7 +1048,7 @@ export class DashboardProjectionStore {
         // Generic active rows keep the trigger-authored durable repair receipt.
         // Maintenance drains them as one day-grouped batch; capture never pays
         // one gzip segment per event and the published generation stays stale.
-        if (compactable(row)) return;
+        if (compactable(row) && row.privacyEligible) return;
         this.applyProjectionRows([row], now);
         this.db.prepare(`delete from dashboard_projection_repairs where raw_rowid = ?`).run(rawRowid);
       })();
@@ -1058,6 +1081,11 @@ export class DashboardProjectionStore {
   private applyProjectionRows(rows: RawProjectionRow[], now: Date) {
     const compactRows: RawProjectionRow[] = [];
     for (const row of rows) {
+      if (!row.privacyEligible) {
+        const previous = this.storedFactByRawRowid(row.rawRowid);
+        if (previous) this.removeStoredFact(previous, now);
+        continue;
+      }
       if (compactable(row)) {
         const previous = this.storedFact(sha256(`event:${row.id}`));
         if (previous) this.removeStoredFact(previous, now);
@@ -2084,6 +2112,11 @@ export class DashboardProjectionStore {
       daysCompleted:0,restarts:0,durationMs:0};
     const countersBefore = this.control();
     const buildsBefore = countersBefore.snapshotBuilds;
+    const rawPrivacyEligible = terminalPrivacyEligibilitySql(
+      this.db,
+      "buffered_events",
+    );
+    const repairPrivacyEligible = terminalPrivacyEligibilitySql(this.db, "b");
     this.db.transaction(() => {
       const current = this.control();
       if (current.backfillHighWater === null) {
@@ -2107,6 +2140,7 @@ export class DashboardProjectionStore {
       if (!control.backfillComplete) {
         const rows = this.db.prepare(
           `select rowid as rawRowid, id, source, event_type as eventType,
+            case when ${rawPrivacyEligible} then 1 else 0 end as privacyEligible,
             observed_at as observedAt, session_id as sessionId, action_class as actionClass,
             model, input_tokens as inputTokens, output_tokens as outputTokens,
             cache_read_tokens as cacheReadTokens, cache_creation_tokens as cacheCreationTokens,
@@ -2147,6 +2181,7 @@ export class DashboardProjectionStore {
       const repairs = this.db.prepare(
         `select r.raw_rowid as repairRawRowid,r.reason,
           b.rowid as rawRowid,b.id,b.source,b.event_type as eventType,b.observed_at as observedAt,
+          case when ${repairPrivacyEligible} then 1 else 0 end as privacyEligible,
           b.session_id as sessionId,b.action_class as actionClass,b.model,
           b.input_tokens as inputTokens,b.output_tokens as outputTokens,
           b.cache_read_tokens as cacheReadTokens,b.cache_creation_tokens as cacheCreationTokens,
@@ -2250,8 +2285,10 @@ export class DashboardProjectionStore {
   private runParitySlice() {
     const control = this.control();
     if (!control.backfillComplete || control.parityComplete) return 0;
+    const privacyEligible = terminalPrivacyEligibilitySql(this.db, "buffered_events");
     const rows = this.db.prepare(
       `select rowid as rawRowid,id,source,event_type as eventType,observed_at as observedAt,
+        case when ${privacyEligible} then 1 else 0 end as privacyEligible,
         session_id as sessionId,action_class as actionClass,model,input_tokens as inputTokens,
         output_tokens as outputTokens,cache_read_tokens as cacheReadTokens,
         cache_creation_tokens as cacheCreationTokens,cost_usd as costUsd,
@@ -2263,7 +2300,11 @@ export class DashboardProjectionStore {
       `select days,cutoff_at as cutoffAt from dashboard_window_control
        where days in (30,90,182,365,1825)`,
     ).all() as Array<{days:number;cutoffAt:string}>;
-    this.applyReferenceBatch("dashboard_parity_window",windows,rows.map(factFromRaw));
+    this.applyReferenceBatch(
+      "dashboard_parity_window",
+      windows,
+      rows.filter((row) => Boolean(row.privacyEligible)).map(factFromRaw),
+    );
     const exhausted=rows.length<BACKFILL_ROWS;
     const cursor = exhausted?(control.backfillHighWater??0):(rows.at(-1)?.rawRowid ?? control.parityCursor);
     let complete = cursor >= (control.backfillHighWater ?? 0);

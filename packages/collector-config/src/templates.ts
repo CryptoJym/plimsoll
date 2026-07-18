@@ -10,10 +10,10 @@ export type ToolConfigOptions = {
   pnpmCommand?: string;
 };
 
-function assertEvidenceConfirmed(options: ToolConfigOptions) {
-  if (options.dataMode === "evidence" && !options.confirmEvidence) {
+function assertSupportedDataMode(options: ToolConfigOptions) {
+  if (options.dataMode === "evidence") {
     throw new Error(
-      "Evidence-mode config generation requires explicit confirmation because it can collect raw content.",
+      "Raw evidence config generation is disabled: the encrypted evidence vault is not implemented. Use metadata mode.",
     );
   }
 }
@@ -41,7 +41,7 @@ function port(options: ToolConfigOptions) {
 }
 
 export function generateClaudeCodeSettings(options: ToolConfigOptions) {
-  assertEvidenceConfirmed(options);
+  assertSupportedDataMode(options);
 
   const hookUrl = `http://127.0.0.1:${port(options)}/hooks/claude-code`;
 
@@ -100,7 +100,7 @@ export function generateClaudeCodeSettings(options: ToolConfigOptions) {
 }
 
 export function generateCodexConfigToml(options: ToolConfigOptions) {
-  assertEvidenceConfirmed(options);
+  assertSupportedDataMode(options);
 
   const command = hookForwardCommand(options, "codex");
   const basePort = port(options);
@@ -160,7 +160,7 @@ export function generateCodexConfigToml(options: ToolConfigOptions) {
 }
 
 export function generateSetupInstructions(options: ToolConfigOptions) {
-  assertEvidenceConfirmed(options);
+  assertSupportedDataMode(options);
 
   return {
     dataMode: options.dataMode ?? "metadata",

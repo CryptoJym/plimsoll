@@ -8,6 +8,7 @@ import { z } from "zod";
 import collectorPackage from "../package.json";
 import { LocalEventBuffer } from "./buffer";
 import {
+  assertCollectorPrivacyMode,
   collectorBufferPath,
   collectorConfigPath,
   collectorConfigSchema,
@@ -204,6 +205,7 @@ function stageGrant(existing: CollectorConfig, grant: z.infer<typeof joinGrantSc
   } = existing;
   return collectorConfigSchema.parse({
     ...localSettings,
+    managed: true,
     tenantId: grant.tenantId,
     installKey: grant.installKey,
     uploadUrl: grant.uploadUrl,
@@ -412,6 +414,7 @@ async function activatePendingJoin(
   },
 ): Promise<JoinResult> {
   let pending = pendingInput;
+  assertCollectorPrivacyMode(pending.stagedConfig, "join", { willEnableUpload: true });
   const activeConfigPath = collectorConfigPath(options.homeDir);
   if (activationAlreadyComplete(options.homeDir, pending)) {
     fs.rmSync(options.pendingFile, { force: true });
@@ -639,6 +642,9 @@ export async function performJoin(options: {
       );
     }
     const existingConfig = readConfigWithoutCreating(activeConfigPath);
+    // Join activates managed upload. Refuse unsupported evidence mode before
+    // token redemption, network access, or local-state mutation.
+    assertCollectorPrivacyMode(existingConfig, "join", { willEnableUpload: true });
     const response = await fetchImpl(joinUrl, {
       method: "POST",
       redirect: "manual",

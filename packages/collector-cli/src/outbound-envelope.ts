@@ -238,6 +238,12 @@ export function sealOutboundEvent(event: AiInteractionEvent) {
 export function sealOutboundEnvelope(input: unknown): OutboundEnvelopeOutcome {
   const parsed = aiWorkIngestEventSchema.safeParse(input);
   if (!parsed.success) return { ok: false, reason: "schema" };
+  // Evidence-marked rows belong in a separately reviewed encrypted vault.
+  // That vault is not implemented, so no ordinary upload surface may seal
+  // them even when their current typed fields happen to look harmless.
+  if (parsed.data.event.dataMode === "evidence") {
+    return { ok: false, reason: "privacy" };
+  }
   const sealed = sealOutboundEvent(parsed.data.event);
   if (!sealed.ok) return sealed;
   const envelope = aiWorkIngestEventSchema.safeParse({

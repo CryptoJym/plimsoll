@@ -1,9 +1,10 @@
 import Database from "better-sqlite3";
 
 import type { CollectorConfig } from "./config";
-import { collectorBufferPath } from "./config";
+import { assertCollectorPrivacyMode, collectorBufferPath } from "./config";
 import { deterministicEventId } from "./normalizer";
 import { hasUnsafeOutboundString, sealOutboundSessionRow } from "./outbound-envelope";
+import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import { chunkHistoryEnvelopes, postHistoryBatch } from "./upload-history";
 import {
   aiWorkSessionSyncBatchSchema,
@@ -112,7 +113,14 @@ export function collectSessionSnapshots(
     return out;
   }
 
-  const filters: string[] = ["e.session_id is not null", "e.created_at <= @until"];
+  const eventPrivacyEligible = terminalPrivacyEligibilitySql(ledger, "e");
+  const repoPrivacyEligible = terminalPrivacyEligibilitySql(ledger, "r");
+  const accountPrivacyEligible = terminalPrivacyEligibilitySql(ledger, "a");
+  const filters: string[] = [
+    "e.session_id is not null",
+    eventPrivacyEligible,
+    "e.created_at <= @until",
+  ];
   const params: Record<string, unknown> = { until: options.until };
   if (options.sessionIds && options.sessionIds.length > 0) {
     const names = options.sessionIds.map((_, index) => `@sid${index}`);
@@ -139,6 +147,7 @@ export function collectSessionSnapshots(
          (select r.repo_hash || '|' || coalesce(r.branch_hash, '')
             from buffered_events r
             where r.session_id = e.session_id and r.repo_hash is not null
+              and ${repoPrivacyEligible}
               and r.created_at <= @until
             group by r.repo_hash, r.branch_hash
             order by count(*) desc, r.repo_hash asc, r.branch_hash asc
@@ -146,6 +155,7 @@ export function collectSessionSnapshots(
          (select a.account_hash
             from buffered_events a
             where a.session_id = e.session_id and a.account_hash is not null
+              and ${accountPrivacyEligible}
               and a.created_at <= @until
             group by a.account_hash
             order by count(*) desc, a.account_hash asc
@@ -463,6 +473,9 @@ export async function runSessionSync(
   config: CollectorConfig,
   options: SessionSyncOptions = {},
 ): Promise<SessionSyncResult> {
+  assertCollectorPrivacyMode(config, "session sync", {
+    willEnableUpload: Boolean(options.url),
+  });
   const log = options.log ?? ((line: string) => console.log(line));
   const sleep = options.sleep ?? defaultSleep;
   const fetchImpl = options.fetchImpl ?? fetch;

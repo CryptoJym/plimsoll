@@ -1,5 +1,5 @@
 import type { LocalEventBuffer } from "./buffer";
-import type { CollectorConfig } from "./config";
+import { assertCollectorPrivacyMode, type CollectorConfig } from "./config";
 import { resolveGitContext } from "./git-context";
 import { asRecord, normalizeHookPayload, stringField } from "./normalizer";
 import {
@@ -17,6 +17,7 @@ export function appendForwardedHook(
     transportPath?: string;
   },
 ) {
+  assertCollectorPrivacyMode(options.config, "hook capture");
   // Resolve git linkage keys from the hook's cwd before sanitization hashes it.
   const cwd = stringField(asRecord(payload), ["cwd", "current_working_directory", "workdir"]);
   const resolved = resolveGitContext(cwd);

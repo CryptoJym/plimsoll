@@ -3,7 +3,11 @@ import fs from "node:fs";
 import http from "node:http";
 
 import { LocalEventBuffer } from "./buffer";
-import type { CollectorConfig } from "./config";
+import {
+  assertCollectorPrivacyMode,
+  collectorPrivacyReadiness,
+  type CollectorConfig,
+} from "./config";
 import {
   canonicalizeSuppressionReceipts,
   normalizeGitRemote,
@@ -126,6 +130,7 @@ export function createCollectorServer(
     maintenanceStatus?: () => unknown;
   } = {},
 ) {
+  assertCollectorPrivacyMode(config, "collector server");
   const snapshotResponse = (days: number) => {
     const read = buffer.projection.readSnapshot(days, config.subscriptions);
     if (read.kind !== "ready") return read;
@@ -138,6 +143,8 @@ export function createCollectorServer(
       ok: true,
       runtimeIdentity: options.runtimeIdentity ?? null,
       dataMode: config.policy.dataMode,
+      privacyMode: "metadata_only",
+      privacy: collectorPrivacyReadiness(config),
       retentionDays: config.retentionDays,
       stats,
       otlpAdmission: {
@@ -174,6 +181,8 @@ export function createCollectorServer(
             ok: true,
             runtimeIdentity: options.runtimeIdentity ?? null,
             dataMode: config.policy.dataMode,
+            privacyMode: "metadata_only",
+            privacy: collectorPrivacyReadiness(config),
             retentionDays: config.retentionDays,
             stats: null,
             delivery: buffer.delivery.status(),
