@@ -31,7 +31,11 @@ unit proofs:
    artifact and digest in the final receipt. Raw stdout and non-semantic child
    receipt locations are excluded. A separate fixture proves that distinct
    temporary roots produce the same semantic digest and that a declared path
-   outside the owned roots fails closed.
+   outside the owned roots fails closed. The portability gate also executes the
+   actual install/doctor child twice with isolated homes, PATH values, and Node
+   runtime directories at different depths. Both closed-adapter artifacts must
+   be identical, while an injected unknown PATH entry must fail closed; any
+   mismatch report contains only field pointers and normalized value digests.
 8. Seven synthetic skill, memory, and operator-live-shadow roots are populated,
    made write-denied, and content-digested before the flow. Their modes, entry
    counts, and after-digests must remain identical. Both the before and after
