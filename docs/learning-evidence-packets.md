@@ -39,6 +39,19 @@ and control counts, pair/actor-cluster/repo-cluster statistical gates,
 independent privacy gate, attribution coverage/mix, conservative clustered
 uncertainty, confounders, and bounded counterexamples.
 
+Matching and dependence are separate concerns. Project, work type,
+complexity, model, tool version, and epoch define the protected strata used
+for the equal-stratum estimate and Simpson-reversal check. Actor and repository
+cluster IDs must still match within each treatment/control pair, but they are
+used only for independent-cluster minimums and conservative standard errors.
+Unique actor/repository IDs therefore cannot turn every pair into its own
+causal stratum or hide a project-level reversal. The packet reports protected
+stratum count, singleton count, and minimum/maximum pairs per stratum so a
+small project stratum remains visible even when its direction does not reverse
+the aggregate result. It also exposes whether protected-stratum mean
+directions disagree; an actual crude-versus-equal-stratum sign reversal fails
+closed as `simpson_reversal`.
+
 One explicit `outcomeContract` (metric id, formula version, unit, and effect
 direction) governs the entire run. A pair that is internally matched still
 fails closed if it drifts from that run-level contract; ratios and dollars,

@@ -197,6 +197,7 @@ export type LearningEffectEstimate = {
   associationDirection: "favors_exposed" | "favors_control" | "no_observed_difference" | "not_estimable";
   crudePairWeightedEstimate: number | null;
   equalStratumEstimate: number | null;
+  protectedStratumDirectionHeterogeneous: boolean;
 };
 
 export type LearningEvidencePacket = {
@@ -221,6 +222,10 @@ export type LearningEvidencePacket = {
     incompletePairCount: number;
     actorClusterCount: number;
     repoClusterCount: number;
+    protectedStratumCount: number;
+    singletonProtectedStratumCount: number;
+    minimumProtectedStratumPairs: number;
+    maximumProtectedStratumPairs: number;
     statisticalMinimum: number;
     statisticalActorClusterMinimum: number;
     statisticalRepoClusterMinimum: number;
@@ -314,6 +319,19 @@ const COHORT_KEYS = [
   "repoClusterId",
   "epochId",
 ] as const;
+/**
+ * Dimensions that can change the underlying effect and therefore define an
+ * equal-weight protected comparison stratum. Actor/repo IDs are deliberately
+ * absent: they describe dependence for cluster gates/SE, not causal strata.
+ */
+const PROTECTED_STRATIFICATION_KEYS = [
+  "projectId",
+  "workType",
+  "complexityBand",
+  "modelId",
+  "toolVersion",
+  "epochId",
+] as const satisfies readonly (keyof LearningCohort)[];
 
 const PROHIBITED_WRITE_TARGETS = Object.freeze([
   "~/.codex/skills",
@@ -794,8 +812,8 @@ function validateObservation(
   }
 }
 
-function cohortKey(cohort: LearningCohort): string {
-  return COHORT_KEYS.map((key) => cohort[key]).join("\u001f");
+function protectedStratumKey(cohort: LearningCohort): string {
+  return PROTECTED_STRATIFICATION_KEYS.map((key) => cohort[key]).join("\u001f");
 }
 
 function assertComparablePair(pair: LearningOutcomePair, field: string): void {
@@ -904,7 +922,12 @@ function adjustedAlpha(family: LearningHypothesisFamily): number {
     : family.familyWiseAlpha;
 }
 
-function emptyEffect(family: LearningHypothesisFamily, crude: number | null, stratified: number | null): LearningEffectEstimate {
+function emptyEffect(
+  family: LearningHypothesisFamily,
+  crude: number | null,
+  stratified: number | null,
+  protectedStratumDirectionHeterogeneous: boolean,
+): LearningEffectEstimate {
   const alpha = adjustedAlpha(family);
   return {
     method: "paired_mean_difference",
@@ -922,6 +945,7 @@ function emptyEffect(family: LearningHypothesisFamily, crude: number | null, str
     associationDirection: "not_estimable",
     crudePairWeightedEstimate: crude,
     equalStratumEstimate: stratified,
+    protectedStratumDirectionHeterogeneous,
   };
 }
 
@@ -1031,7 +1055,7 @@ export function compileLearningEvidencePacket(
       differences.push({
         pairId: pair.pairId,
         difference,
-        stratum: cohortKey(pair.exposed.cohort),
+        stratum: protectedStratumKey(pair.exposed.cohort),
         actorClusterId: pair.exposed.cohort.actorClusterId,
         repoClusterId: pair.exposed.cohort.repoClusterId,
       });
@@ -1053,6 +1077,17 @@ export function compileLearningEvidencePacket(
     .sort(([left], [right]) => compareCanonicalText(left, right))
     .map(([, values]) => kahanMean(values) as number);
   const equalStratumEstimate = kahanMean(stratumMeans);
+  const protectedStratumDirections = new Set(stratumMeans.map((estimate) => sign(estimate)).filter((value) => value !== 0));
+  const protectedStratumDirectionHeterogeneous = protectedStratumDirections.size > 1;
+  const protectedStratumSizes = [...strata.values()].map((values) => values.length);
+  const protectedStratumCount = protectedStratumSizes.length;
+  const singletonProtectedStratumCount = protectedStratumSizes.filter((size) => size === 1).length;
+  const minimumProtectedStratumPairs = protectedStratumCount === 0
+    ? 0
+    : Math.min(...protectedStratumSizes);
+  const maximumProtectedStratumPairs = protectedStratumCount === 0
+    ? 0
+    : Math.max(...protectedStratumSizes);
   const simpsonReversal = sign(crudeEstimate) !== 0 && sign(equalStratumEstimate) !== 0 && sign(crudeEstimate) !== sign(equalStratumEstimate);
 
   const actorClusterCount = new Set(differences.map((row) => row.actorClusterId)).size;
@@ -1073,7 +1108,12 @@ export function compileLearningEvidencePacket(
   if (simpsonReversal) reasons.add("simpson_reversal");
   const notEstimableReasons = LEARNING_NOT_ESTIMABLE_REASONS.filter((reason) => reasons.has(reason));
 
-  let effect = emptyEffect(manifest.hypothesisFamily, crudeEstimate, equalStratumEstimate);
+  let effect = emptyEffect(
+    manifest.hypothesisFamily,
+    crudeEstimate,
+    equalStratumEstimate,
+    protectedStratumDirectionHeterogeneous,
+  );
   if (notEstimableReasons.length === 0 && crudeEstimate !== null && differences.length >= 2) {
     const pairStandardError = sampleStandardError(rawDifferences, crudeEstimate);
     const actorClusterStandardError = clusterStandardError(differences, crudeEstimate, "actorClusterId");
@@ -1105,6 +1145,7 @@ export function compileLearningEvidencePacket(
       associationDirection: sign(adjusted) > 0 ? "favors_exposed" : sign(adjusted) < 0 ? "favors_control" : "no_observed_difference",
       crudePairWeightedEstimate: crudeEstimate,
       equalStratumEstimate,
+      protectedStratumDirectionHeterogeneous,
     };
   }
 
@@ -1148,6 +1189,10 @@ export function compileLearningEvidencePacket(
       incompletePairCount: sortedPairs.length - differences.length,
       actorClusterCount,
       repoClusterCount,
+      protectedStratumCount,
+      singletonProtectedStratumCount,
+      minimumProtectedStratumPairs,
+      maximumProtectedStratumPairs,
       statisticalMinimum: manifest.gates.statisticalMinCompletePairs,
       statisticalActorClusterMinimum: manifest.gates.statisticalMinActorClusters,
       statisticalRepoClusterMinimum: manifest.gates.statisticalMinRepoClusters,

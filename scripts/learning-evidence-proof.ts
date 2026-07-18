@@ -235,6 +235,10 @@ prove(
       incompletePairCount: 0,
       actorClusterCount: 6,
       repoClusterCount: 6,
+      protectedStratumCount: 1,
+      singletonProtectedStratumCount: 0,
+      minimumProtectedStratumPairs: 6,
+      maximumProtectedStratumPairs: 6,
       statisticalMinimum: 5,
       statisticalActorClusterMinimum: 3,
       statisticalRepoClusterMinimum: 3,
@@ -641,19 +645,120 @@ prove(
   "Simpson reversal fails closed",
   () => {
     const simpsonPairs = [
-      ...Array.from({ length: 5 }, (_, index) => pair(`simpson-a-${index}`, 12, 10, cohort({ projectId: "project-a" }))),
-      pair("simpson-b-0", 4, 10, cohort({ projectId: "project-b" })),
+      ...Array.from({ length: 5 }, (_, index) => pair(
+        `simpson-a-${index}`,
+        12,
+        10,
+        cohort({
+          projectId: "project-a",
+          actorClusterId: `simpson-actor-${index}`,
+          repoClusterId: `simpson-repo-${index}`,
+        }),
+      )),
+      pair(
+        "simpson-b-0",
+        4,
+        10,
+        cohort({
+          projectId: "project-b",
+          actorClusterId: "simpson-actor-5",
+          repoClusterId: "simpson-repo-5",
+        }),
+      ),
     ];
     const result = compileLearningEvidencePacket(manifestFor(simpsonPairs));
     assert.equal(result.status, "computed");
     if (result.status === "computed") {
+      assert.equal(result.packet.sample.actorClusterCount, 6);
+      assert.equal(result.packet.sample.repoClusterCount, 6);
+      assert.equal(result.packet.sample.protectedStratumCount, 2);
+      assert.equal(result.packet.sample.singletonProtectedStratumCount, 1);
+      assert.equal(result.packet.sample.minimumProtectedStratumPairs, 1);
+      assert.equal(result.packet.sample.maximumProtectedStratumPairs, 5);
       assert.ok((result.packet.effect.crudePairWeightedEstimate ?? 0) > 0);
       assert.ok((result.packet.effect.equalStratumEstimate ?? 0) < 0);
+      assert.equal(result.packet.effect.protectedStratumDirectionHeterogeneous, true);
       assert.ok(result.packet.notEstimableReasons.includes("simpson_reversal"));
+      assert.equal(result.packet.claimClass, "not_estimable");
       assert.equal(result.packet.effect.rawEstimate, null);
     }
   },
-  "pair-weighted and equal-stratum sign reversal blocks association",
+  "five +2 project pairs and one -6 project pair reverse under equal-project weighting despite unique clusters",
+);
+
+prove(
+  "balanced and small protected strata do not create false reversals",
+  () => {
+    const balanced = [
+      ...Array.from({ length: 3 }, (_, index) => pair(
+        `balanced-a-${index}`,
+        12,
+        10,
+        cohort({
+          projectId: "project-a",
+          actorClusterId: `balanced-actor-a-${index}`,
+          repoClusterId: `balanced-repo-a-${index}`,
+        }),
+      )),
+      ...Array.from({ length: 3 }, (_, index) => pair(
+        `balanced-b-${index}`,
+        11,
+        10,
+        cohort({
+          projectId: "project-b",
+          actorClusterId: `balanced-actor-b-${index}`,
+          repoClusterId: `balanced-repo-b-${index}`,
+        }),
+      )),
+    ];
+    const balancedResult = compileLearningEvidencePacket(manifestFor(balanced));
+    assert.equal(balancedResult.status, "computed");
+    if (balancedResult.status === "computed") {
+      assert.equal(balancedResult.packet.effect.crudePairWeightedEstimate, 1.5);
+      assert.equal(balancedResult.packet.effect.equalStratumEstimate, 1.5);
+      assert.equal(balancedResult.packet.effect.protectedStratumDirectionHeterogeneous, false);
+      assert.equal(balancedResult.packet.sample.singletonProtectedStratumCount, 0);
+      assert.equal(balancedResult.packet.sample.minimumProtectedStratumPairs, 3);
+      assert.equal(balancedResult.packet.claimClass, "observational_association");
+      assert.ok(!balancedResult.packet.notEstimableReasons.includes("simpson_reversal"));
+    }
+
+    const smallPositiveStratum = [
+      ...Array.from({ length: 5 }, (_, index) => pair(
+        `small-stratum-a-${index}`,
+        12,
+        10,
+        cohort({
+          projectId: "project-a",
+          actorClusterId: `small-actor-${index}`,
+          repoClusterId: `small-repo-${index}`,
+        }),
+      )),
+      pair(
+        "small-stratum-b-0",
+        11,
+        10,
+        cohort({
+          projectId: "project-b",
+          actorClusterId: "small-actor-5",
+          repoClusterId: "small-repo-5",
+        }),
+      ),
+    ];
+    const smallResult = compileLearningEvidencePacket(manifestFor(smallPositiveStratum));
+    assert.equal(smallResult.status, "computed");
+    if (smallResult.status === "computed") {
+      assert.ok((smallResult.packet.effect.crudePairWeightedEstimate ?? 0) > 0);
+      assert.ok((smallResult.packet.effect.equalStratumEstimate ?? 0) > 0);
+      assert.equal(smallResult.packet.effect.protectedStratumDirectionHeterogeneous, false);
+      assert.equal(smallResult.packet.sample.protectedStratumCount, 2);
+      assert.equal(smallResult.packet.sample.singletonProtectedStratumCount, 1);
+      assert.equal(smallResult.packet.sample.minimumProtectedStratumPairs, 1);
+      assert.equal(smallResult.packet.claimClass, "observational_association");
+      assert.ok(!smallResult.packet.notEstimableReasons.includes("simpson_reversal"));
+    }
+  },
+  "balanced projects and a singleton project with the same direction remain association-only controls",
 );
 
 prove(
