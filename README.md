@@ -77,6 +77,13 @@ and exit 0. A cold ledger therefore fails honestly until a real token-bearing
 Claude Code or Codex event reaches the collector. Background LaunchAgent mode
 for npm installs is still being fitted — until then `start` runs in a terminal.
 
+The source tree also contains the adapter-driven update/rollback/uninstall and
+sanitized support-bundle transaction primitive described in
+[docs/local-lifecycle.md](docs/local-lifecycle.md). It is isolated-proofed but
+is **not yet a published `plimsoll lifecycle` command or an authorized live
+rollout**; release signing, npm publication, and real-Mac service integration
+remain under [#103](https://github.com/CryptoJym/plimsoll/issues/103).
+
 **Contributors / running from source** (adds pnpm + git):
 
 ```bash

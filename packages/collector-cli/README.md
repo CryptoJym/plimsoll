@@ -29,6 +29,13 @@ through `not_installed`, `configured`, `service_ready`, and `signal_verified`;
 only the last state has a live matching collector identity plus a real
 token-bearing signal, returns `ok:true`, and exits 0.
 
+The repository's lifecycle transaction core now has isolated source proof for
+staged update, rollback, preview-default uninstall, separate exact-confirmation
+purge, and allowlisted support output. Those primitives are not yet exposed as
+a published CLI command. Do not infer package publication or live service
+activation from their presence; track
+[plimsoll#103](https://github.com/CryptoJym/plimsoll/issues/103).
+
 ## Commands
 
 | Command | What it does |

@@ -29,3 +29,12 @@ macOS arm64/x64, packaged CLI/runtime, release workflow/provenance, LaunchAgent,
 
 ## Operational Boundaries
 - No publish, tag, npm credential change, or LaunchAgent activation without separate release/rollout authorization.
+
+## 2026-07-17 source slice
+- Adapter-driven lifecycle transaction primitives and an isolated proof now
+  cover immutable version paths, staged update/rollback, compatible snapshot
+  adapters, automatic restore, interruption/reopen, preview-default uninstall,
+  separate purge, and sanitized bounded support output.
+- This slice does not expose a published operator command, sign or publish a
+  release, run `launchctl`, validate real arm64/x64 Macs, leave a workspace, or
+  revoke a device. The GitHub issue remains open for those release/fleet gates.
