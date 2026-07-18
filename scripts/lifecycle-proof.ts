@@ -9,6 +9,8 @@ import os from "node:os";
 import path from "node:path";
 
 import {
+  LIFECYCLE_PURGE_ONLY_TARGETS,
+  LIFECYCLE_UNINSTALL_RETAINED_TARGETS,
   LifecycleInterruption,
   LifecycleManager,
   PURGE_CONFIRMATION,
@@ -335,21 +337,51 @@ async function main() {
     const rollback = await manager.rollback({ operationId: "rollback-v1", artifact: v1 });
     check("explicit_rollback_uses_same_transaction_and_returns_to_v1", rollback.operation === "rollback" && rollback.fromVersion === "0.8.0" && happy.runtimeVersion === "0.6.0", rollback);
 
+    const snapshotsRoot = path.join(happy.paths.lifecycleRoot, "snapshots");
+    const secretSnapshot = path.join(snapshotsRoot, "install-v1", "config");
     const previewDigest = createHash("sha256").update(fs.readFileSync(happy.paths.database)).update(fs.readFileSync(happy.paths.history[0]!)).digest("hex");
     const preview = await runLifecycleCommand({
       argv: ["uninstall", "--operation-id", "uninstall-preview"],
       adapter: happy.adapter,
       resolveArtifact: async () => { throw new Error("not used"); },
     });
-    check("uninstall_command_defaults_to_preview", preview.receipt.status === "preview" && fs.existsSync(runtimePath) && fs.existsSync(happy.paths.serviceManifest), preview);
+    const previewRoundTrip = JSON.parse(JSON.stringify(preview.receipt)) as typeof preview.receipt;
+    const previewPersisted = JSON.parse(fs.readFileSync(
+      path.join(receiptsRoot, "uninstall-preview-uninstall.json"),
+      "utf8",
+    )) as typeof preview.receipt;
+    check(
+      "uninstall_command_preview_discloses_retained_and_purge_only_snapshots",
+      preview.receipt.status === "preview" &&
+        fs.existsSync(runtimePath) && fs.existsSync(happy.paths.serviceManifest) && fs.existsSync(secretSnapshot) &&
+        !preview.receipt.ownedTargets.includes("lifecycle_snapshots") &&
+        LIFECYCLE_UNINSTALL_RETAINED_TARGETS.every((target) => preview.receipt.retainedTargets.includes(target)) &&
+        LIFECYCLE_PURGE_ONLY_TARGETS.every((target) => preview.receipt.purgeOnlyTargets.includes(target)) &&
+        JSON.stringify(previewRoundTrip.retainedTargets) === JSON.stringify(previewPersisted.retainedTargets) &&
+        JSON.stringify(previewRoundTrip.purgeOnlyTargets) === JSON.stringify(previewPersisted.purgeOnlyTargets),
+      { command: previewRoundTrip, persisted: previewPersisted },
+    );
 
-    const applied = await manager.uninstall({ operationId: "uninstall-apply", apply: true });
+    const appliedOutput = await runLifecycleCommand({
+      argv: ["uninstall", "--operation-id", "uninstall-apply", "--apply"],
+      adapter: happy.adapter,
+      resolveArtifact: async () => { throw new Error("not used"); },
+    });
+    const applied = appliedOutput.receipt;
     const preservedDigest = createHash("sha256").update(fs.readFileSync(happy.paths.database)).update(fs.readFileSync(happy.paths.history[0]!)).digest("hex");
     check("uninstall_apply_removes_only_owned_runtime_service_fragments", applied.status === "completed" && !fs.existsSync(happy.paths.serviceManifest) && happy.paths.ownedToolFragments.every((file) => !fs.existsSync(file)) && !fs.existsSync(path.join(happy.paths.lifecycleRoot, "current")), applied);
-    check("uninstall_preserves_ledger_history_credentials_and_membership", previewDigest === preservedDigest && fs.readFileSync(happy.paths.collectorConfig, "utf8").includes("credential-sentinel") && applied.preserved.includes("workspace_membership"), applied.preserved);
+    check(
+      "uninstall_apply_receipt_cannot_imply_purge_only_snapshots_were_deleted",
+      previewDigest === preservedDigest &&
+        fs.readFileSync(happy.paths.collectorConfig, "utf8").includes("credential-sentinel") &&
+        fs.existsSync(secretSnapshot) &&
+        !applied.ownedTargets.includes("lifecycle_snapshots") &&
+        LIFECYCLE_UNINSTALL_RETAINED_TARGETS.every((target) => applied.retainedTargets.includes(target)) &&
+        LIFECYCLE_PURGE_ONLY_TARGETS.every((target) => applied.purgeOnlyTargets.includes(target)) &&
+        applied.preserved.includes("workspace_membership"),
+      applied,
+    );
 
-    const snapshotsRoot = path.join(happy.paths.lifecycleRoot, "snapshots");
-    const secretSnapshot = path.join(snapshotsRoot, "install-v1", "config");
     check("lifecycle_snapshot_contains_owned_secret_copy_before_purge", fs.readFileSync(secretSnapshot, "utf8").includes("credential-sentinel"), secretSnapshot);
     const purgePreview = await runLifecycleCommand({
       argv: ["purge", "--operation-id", "purge-preview"],
@@ -359,7 +391,8 @@ async function main() {
     check(
       "purge_defaults_to_preview_and_lists_secret_bearing_snapshots",
       purgePreview.receipt.status === "preview" &&
-        purgePreview.receipt.ownedTargets.includes("lifecycle_snapshots") &&
+        LIFECYCLE_PURGE_ONLY_TARGETS.every((target) => purgePreview.receipt.ownedTargets.includes(target)) &&
+        LIFECYCLE_UNINSTALL_RETAINED_TARGETS.every((target) => purgePreview.receipt.retainedTargets.includes(target)) &&
         fs.existsSync(secretSnapshot) && fs.existsSync(happy.paths.database),
       purgePreview.receipt,
     );
@@ -369,6 +402,8 @@ async function main() {
     check(
       "purge_is_separate_exact_and_deletes_live_plus_snapshot_secret_copies",
       purged.status === "purged" &&
+        LIFECYCLE_PURGE_ONLY_TARGETS.every((target) => purged.ownedTargets.includes(target)) &&
+        purged.retainedTargets.length === 1 && purged.retainedTargets[0] === "workspace_membership" &&
         !fs.existsSync(happy.paths.collectorConfig) &&
         !fs.existsSync(happy.paths.database) &&
         !fs.existsSync(happy.paths.history[0]!) &&
@@ -667,7 +702,7 @@ async function main() {
     const persistedReceipt = fs.readFileSync(receiptPath, "utf8");
     const receiptRoundTrip = JSON.parse(persistedReceipt) as Record<string, unknown>;
     const exactReceiptKeys = Object.keys(receiptRoundTrip).sort().join(",") ===
-      ["fromVersion", "health", "operation", "operationId", "ownedTargets", "preserved", "restoredVersion", "schemaVersion", "status", "toVersion", "toolVersion"].sort().join(",");
+      ["fromVersion", "health", "operation", "operationId", "ownedTargets", "preserved", "purgeOnlyTargets", "restoredVersion", "retainedTargets", "schemaVersion", "status", "toVersion", "toolVersion"].sort().join(",");
     const exactReceiptHealthKeys = Boolean(receiptRoundTrip.health) &&
       Object.keys(receiptRoundTrip.health as object).sort().join(",") ===
         ["configCompatible", "databaseCompatible", "ready", "reason", "runtimeVersion", "serviceReady"].sort().join(",");

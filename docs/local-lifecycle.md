@@ -55,7 +55,12 @@ not be reused.
 Uninstall is a preview unless `--apply` is explicit. Apply removes the owned
 service manifest, exact tool-config fragments, runtime pointer, and versioned
 runtimes. It preserves the collector config, workspace credentials, ledger,
-history, and workspace membership.
+history, lifecycle snapshots, and workspace membership. Both preview and apply
+receipts expose those under typed `retainedTargets`; `lifecycle_snapshots`
+never appears in uninstall `ownedTargets`. The same receipts classify the
+collector config, workspace credentials, ledger, history, and lifecycle
+snapshots under `purgeOnlyTargets`, so an uninstall receipt cannot imply that
+purge-only data was deleted.
 
 Purging data is a different operation. It is a preview by default and lists
 the live collector config, ledger, history, and lifecycle snapshots. Apply
@@ -77,8 +82,10 @@ tokens, signing material, install credentials, and workspace credentials have
 no output field.
 
 Lifecycle receipts are similarly symbolic and bounded to the newest 32 local
-records. They report state transitions and preserved categories, never paths or
-secret values.
+records. `ownedTargets` reports what the operation previews or applies,
+`retainedTargets` reports what remains, and `purgeOnlyTargets` identifies data
+that only the separate purge operation may remove. They report state
+transitions and categories, never paths or secret values.
 
 ## Isolated proof
 

@@ -499,7 +499,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
   }
 
   async purgeOwnedData(input: { apply: boolean; confirmation: string | null }) {
-    const targets = ["collector_config", "ledger", "history", "lifecycle_snapshots"] as const;
+    const targets = ["collector_config", "workspace_credentials", "ledger", "history", "lifecycle_snapshots"] as const;
     if (!input.apply) return targets;
     if (input.confirmation !== PURGE_CONFIRMATION) throw new Error("purge confirmation mismatch");
     for (const candidate of [this.paths.collectorConfig, this.paths.database, ...this.paths.history]) {

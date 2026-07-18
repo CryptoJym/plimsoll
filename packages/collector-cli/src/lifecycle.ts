@@ -17,6 +17,28 @@ export type LifecyclePhase =
   | "rollback_required"
   | "rollback_complete";
 
+export type LifecyclePurgeOnlyTarget =
+  | "collector_config"
+  | "workspace_credentials"
+  | "ledger"
+  | "history"
+  | "lifecycle_snapshots";
+
+export type LifecycleRetainedTarget = LifecyclePurgeOnlyTarget | "workspace_membership";
+
+export const LIFECYCLE_PURGE_ONLY_TARGETS = [
+  "collector_config",
+  "workspace_credentials",
+  "ledger",
+  "history",
+  "lifecycle_snapshots",
+] as const satisfies readonly LifecyclePurgeOnlyTarget[];
+
+export const LIFECYCLE_UNINSTALL_RETAINED_TARGETS = [
+  ...LIFECYCLE_PURGE_ONLY_TARGETS,
+  "workspace_membership",
+] as const satisfies readonly LifecycleRetainedTarget[];
+
 export type RuntimeArtifact = {
   version: string;
   platform: "darwin";
@@ -56,6 +78,8 @@ export type LifecycleReceipt = {
   restoredVersion: string | null;
   health: LifecycleReadiness | null;
   ownedTargets: readonly string[];
+  retainedTargets: readonly LifecycleRetainedTarget[];
+  purgeOnlyTargets: readonly LifecyclePurgeOnlyTarget[];
   preserved: readonly ("ledger" | "history" | "credentials" | "workspace_membership")[];
 };
 
@@ -248,6 +272,8 @@ export class LifecycleManager {
       restoredVersion: status === "rolled_back" ? journal.fromVersion : null,
       health: null,
       ownedTargets: ["runtime", "config", "database", "service_manifest"],
+      retainedTargets: LIFECYCLE_UNINSTALL_RETAINED_TARGETS,
+      purgeOnlyTargets: LIFECYCLE_PURGE_ONLY_TARGETS,
       preserved: ["ledger", "history", "credentials", "workspace_membership"],
     };
   }
@@ -344,6 +370,8 @@ export class LifecycleManager {
         restoredVersion: null,
         health,
         ownedTargets: ["runtime", "service_manifest"],
+        retainedTargets: LIFECYCLE_UNINSTALL_RETAINED_TARGETS,
+        purgeOnlyTargets: LIFECYCLE_PURGE_ONLY_TARGETS,
         preserved: ["ledger", "history", "credentials", "workspace_membership"],
       };
       await this.adapter.persistReceipt(receipt);
@@ -391,6 +419,8 @@ export class LifecycleManager {
         restoredVersion: null,
         health: null,
         ownedTargets,
+        retainedTargets: LIFECYCLE_UNINSTALL_RETAINED_TARGETS,
+        purgeOnlyTargets: LIFECYCLE_PURGE_ONLY_TARGETS,
         preserved: ["ledger", "history", "credentials", "workspace_membership"],
       };
       await this.adapter.persistReceipt(receipt);
@@ -427,6 +457,10 @@ export class LifecycleManager {
         restoredVersion: null,
         health: null,
         ownedTargets: targets,
+        retainedTargets: apply
+          ? ["workspace_membership"]
+          : LIFECYCLE_UNINSTALL_RETAINED_TARGETS,
+        purgeOnlyTargets: LIFECYCLE_PURGE_ONLY_TARGETS,
         preserved: apply
           ? ["workspace_membership"]
           : ["ledger", "history", "credentials", "workspace_membership"],
@@ -458,6 +492,8 @@ export class LifecycleManager {
         restoredVersion: null,
         health: bundle.readiness,
         ownedTargets: ["support_bundle"],
+        retainedTargets: LIFECYCLE_UNINSTALL_RETAINED_TARGETS,
+        purgeOnlyTargets: LIFECYCLE_PURGE_ONLY_TARGETS,
         preserved: ["ledger", "history", "credentials", "workspace_membership"],
       };
       await this.adapter.persistReceipt(receipt);
