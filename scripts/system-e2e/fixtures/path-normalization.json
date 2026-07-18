@@ -19,6 +19,7 @@
             "detail": {
               "configPath": "/fixtures/run-a/proof-root-a/machine/home/.plimsoll/config.json",
               "receipt": "../run-a/proof-root-a/evidence/privacy.json",
+              "missingRequiredEntries": ["/fixtures/node/bin", "/usr/bin"],
               "stdout": "fixture output from a nonsemantic path"
             }
           }
@@ -43,6 +44,7 @@
             "detail": {
               "configPath": "/fixtures/run-b/a-completely-different-proof-root/machine/home/.plimsoll/config.json",
               "receipt": "../run-b/a-completely-different-proof-root/evidence/privacy.json",
+              "missingRequiredEntries": ["/fixtures/node/bin", "/usr/bin"],
               "stdout": "different arbitrary diagnostic text"
             }
           }

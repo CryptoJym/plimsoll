@@ -39,6 +39,8 @@ const normalizedBytes = canonicalBytes(normalized[0]);
 assert.ok(!/run-a|run-b|proof-root-a|different-proof-root/.test(normalizedBytes), "temp-root basename survived normalization");
 assert.ok(normalizedBytes.includes("<path-root:machine-home>"), "declared HOME path was not role-bound");
 assert.ok(normalizedBytes.includes("<path-root:proof>"), "relative receipt path was not proof-root-bound");
+assert.ok(normalizedBytes.includes("<path-root:node-runtime>"), "declared path-list entry was not node-root-bound");
+assert.ok(normalizedBytes.includes("<required-system-path:/usr/bin>"), "stable required system path was not explicit");
 
 exactKeys(fixture.outsideRootTamper, ["configPath", "expectedError"], "outside-root tamper fixture");
 const firstVariant = variants[0];

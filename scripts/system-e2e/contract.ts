@@ -108,6 +108,7 @@ const DECLARED_PATH_KEYS = new Set([
   "execPath",
   "home",
   "ledger",
+  "missingRequiredEntries",
   "packagedCli",
   "path",
   "pidPath",
@@ -120,6 +121,15 @@ const DECLARED_PATH_KEYS = new Set([
   "unsupportedPlimsoll",
   "unsupportedTarget",
   "workflow",
+]);
+const STABLE_SYSTEM_PATHS = new Set([
+  "/neutral/bin",
+  "/opt/homebrew/bin",
+  "/usr/local/bin",
+  "/usr/bin",
+  "/bin",
+  "/usr/sbin",
+  "/sbin",
 ]);
 const DIAGNOSTIC_TEXT_KEYS = new Set(["detail", "stdout", "stderr"]);
 const DECLARED_LOOPBACK_URL_KEYS = new Set(["statusUrl", "url"]);
@@ -144,6 +154,9 @@ export function canonicalizeDeclaredPath(
 ) {
   assert.ok(DECLARED_PATH_KEYS.has(key), `${key} is not a declared path field`);
   assert.ok(isPathLike(value), `${key} is not a path-like declared path value`);
+  if (key === "missingRequiredEntries" && STABLE_SYSTEM_PATHS.has(value)) {
+    return `<required-system-path:${value}>`;
+  }
   const candidate = path.resolve(context.baseDirectory, value);
   const roots = context.roots
     .map((root) => ({ label: root.label, absolutePath: path.resolve(root.absolutePath) }))
