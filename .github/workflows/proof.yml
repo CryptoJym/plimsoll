@@ -31,6 +31,9 @@ jobs:
       - name: Prove source installer and read-only doctor
         run: pnpm proof:install-doctor
 
+      - name: Prove atomic local lifecycle transactions
+        run: pnpm proof:lifecycle
+
       - name: Prove local HTTP trust boundary
         run: pnpm proof:http-boundary
 

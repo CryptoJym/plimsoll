@@ -1,0 +1,86 @@
+# Local lifecycle transaction contract
+
+Status: **source-validated primitive; not a published installer or live fleet
+rollout**. GitHub issue #103 remains open.
+
+The lifecycle core is a transaction coordinator for the canonical packaged
+Mac installer. It deliberately has no filesystem, process, service-manager,
+network, registry, or credential access. The installer supplies explicit
+filesystem, SQLite-backup, service, health, and artifact adapters.
+
+## Update and rollback
+
+`runLifecycleCommand` accepts these exact operations at the injected command
+boundary:
+
+```text
+update --operation-id ID --artifact REF
+rollback --operation-id ID --artifact REF
+uninstall --operation-id ID [--apply]
+purge --operation-id ID --confirm-exact "PURGE PLIMSOLL LOCAL DATA"
+support-bundle --operation-id ID
+```
+
+This is not yet exposed as the installed `plimsoll lifecycle` command. The
+package/release adapter, release signing, trusted npm publication, and real-Mac
+service integration remain work under #103. Until those gates land, these are
+source APIs and isolated proof fixtures, not operator instructions.
+
+An update or rollback:
+
+1. obtains one exclusive lifecycle lock;
+2. opens or resumes the operation journal;
+3. snapshots compatible config, the database through an injected online
+   backup adapter, and the owned service manifest;
+4. copies a digest-verified artifact to an immutable absolute
+   `versions/VERSION/darwin-ARCH/bin/plimsoll` path;
+5. asks the injected service adapter to activate that exact executable and
+   atomically moves the convenience `current` pointer;
+6. accepts success only when runtime version, service, config compatibility,
+   and database compatibility are all verified; and
+7. restores the prior runtime, config, database, and service manifest if any
+   post-snapshot step fails.
+
+The journal is `0600`; private directories and executable runtime files are
+`0700`. Reopening the same interrupted operation is idempotent. A different
+operation cannot cross its lock or journal.
+
+## Uninstall, purge, leave, and revoke
+
+Uninstall is a preview unless `--apply` is explicit. Apply removes the owned
+service manifest, exact tool-config fragments, runtime pointer, and versioned
+runtimes. It preserves the collector config, workspace credentials, ledger,
+history, and workspace membership.
+
+Purging data is a different operation and requires the exact confirmation
+shown above. Leaving a workspace and revoking a device are also distinct:
+neither is simulated or reported complete by local uninstall or purge.
+
+## Support output
+
+The support bundle is reconstructed from an allowlist: package/runtime
+versions, coarse health, four nonnegative counters, and at most 32 aggregate
+log codes. It does not copy log text or unknown adapter fields. Absolute paths,
+prompts/responses/tool content, repository or account identifiers, cookies,
+tokens, signing material, install credentials, and workspace credentials have
+no output field.
+
+Lifecycle receipts are similarly symbolic and bounded to the newest 32 local
+records. They report state transitions and preserved categories, never paths or
+secret values.
+
+## Isolated proof
+
+Run on the repository's supported Node 22 environment:
+
+```sh
+pnpm proof:lifecycle
+```
+
+The proof uses a fresh temporary ownership root and injected service/database
+adapters. It covers arm64/x64 metadata, supported and unsupported Node majors,
+permissions, health and disk-full rollback, interruption/reopen, lock races,
+malformed state, symlink/path attacks, preview/apply/purge separation, and
+support-bundle privacy. It never invokes `launchctl`, a browser, a provider,
+the npm registry, or an installed Plimsoll service and never reads the
+operator's config or ledger.
