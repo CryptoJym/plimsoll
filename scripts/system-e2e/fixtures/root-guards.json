@@ -1,0 +1,12 @@
+{
+  "schema": "plimsoll.system-e2e-root-guards.v1",
+  "guards": [
+    { "label": "machine_a_codex_skills", "expectedSentinelTreeDigest": "sha256:6e574054fdab4d8ac06c87dc3206ccef43b5ab2ac587f78545705f982620460e" },
+    { "label": "machine_a_codex_memories", "expectedSentinelTreeDigest": "sha256:352409529609c4d5e3b07702692b953cdc74a27b207ab5af2f76627c3ff9ed5b" },
+    { "label": "machine_a_claude_skills", "expectedSentinelTreeDigest": "sha256:9dfcb7a7fea2b56d3176cacb7705cb1a25f781372f7463dbe18255579f122df2" },
+    { "label": "machine_b_codex_skills", "expectedSentinelTreeDigest": "sha256:76199b19850bd565361e3604a79c7e3f0b197a7a09da8b242c659b04744c794c" },
+    { "label": "machine_b_codex_memories", "expectedSentinelTreeDigest": "sha256:93c57884b70ecddfe08673fc034b36018866795643c6eac1aa2eba100520fa42" },
+    { "label": "machine_b_claude_skills", "expectedSentinelTreeDigest": "sha256:20f788ba024a3f3fd3adca8117763ae7f70f5f5bc7cb86db8709859e0d4ddef3" },
+    { "label": "operator_live_shadow", "expectedSentinelTreeDigest": "sha256:12cce333e5f79f5f404ea377b06729f214ff9c624229b49f52462eb0d5c4b7e3" }
+  ]
+}

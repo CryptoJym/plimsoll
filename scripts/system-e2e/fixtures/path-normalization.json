@@ -1,0 +1,57 @@
+{
+  "schema": "plimsoll.system-e2e-path-normalization.v1",
+  "variants": [
+    {
+      "baseDirectory": "/fixtures/repository",
+      "roots": [
+        { "label": "repository", "absolutePath": "/fixtures/repository" },
+        { "label": "proof", "absolutePath": "/fixtures/run-a/proof-root-a" },
+        { "label": "machine-home", "absolutePath": "/fixtures/run-a/proof-root-a/machine/home" },
+        { "label": "node-runtime", "absolutePath": "/fixtures/node/bin" }
+      ],
+      "artifact": {
+        "ok": true,
+        "node": { "execPath": "/fixtures/node/bin/node", "version": "22.1.2" },
+        "checks": [
+          {
+            "name": "fixture_child_receipt",
+            "passed": true,
+            "detail": {
+              "configPath": "/fixtures/run-a/proof-root-a/machine/home/.plimsoll/config.json",
+              "receipt": "../run-a/proof-root-a/evidence/privacy.json",
+              "stdout": "fixture output from a nonsemantic path"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "baseDirectory": "/fixtures/repository",
+      "roots": [
+        { "label": "repository", "absolutePath": "/fixtures/repository" },
+        { "label": "proof", "absolutePath": "/fixtures/run-b/a-completely-different-proof-root" },
+        { "label": "machine-home", "absolutePath": "/fixtures/run-b/a-completely-different-proof-root/machine/home" },
+        { "label": "node-runtime", "absolutePath": "/fixtures/node/bin" }
+      ],
+      "artifact": {
+        "ok": true,
+        "node": { "execPath": "/fixtures/node/bin/node", "version": "22.9.9" },
+        "checks": [
+          {
+            "name": "fixture_child_receipt",
+            "passed": true,
+            "detail": {
+              "configPath": "/fixtures/run-b/a-completely-different-proof-root/machine/home/.plimsoll/config.json",
+              "receipt": "../run-b/a-completely-different-proof-root/evidence/privacy.json",
+              "stdout": "different arbitrary diagnostic text"
+            }
+          }
+        ]
+      }
+    }
+  ],
+  "outsideRootTamper": {
+    "configPath": "/outside-owned-roots/tampered-config.json",
+    "expectedError": "DeclaredPathOutsideAllowedRoots:configPath"
+  }
+}

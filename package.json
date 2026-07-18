@@ -31,6 +31,7 @@
     "proof:http-boundary": "tsx scripts/local-http-boundary-proof.ts",
     "proof:privacy-mode": "tsx scripts/privacy-mode-proof.ts",
     "proof:system-e2e": "tsx scripts/system-e2e-proof.ts",
+    "proof:system-e2e:path-normalization": "tsx scripts/system-e2e-path-normalization-proof.ts",
     "proof:system-e2e:verify": "tsx scripts/system-e2e-verifier.ts",
     "proof:system-e2e:tamper": "tsx scripts/system-e2e-tamper-proof.ts",
     "proof:learning-evidence": "tsx scripts/learning-evidence-proof.ts",

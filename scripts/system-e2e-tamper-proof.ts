@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
@@ -71,12 +72,13 @@ function resign(receiptValue: unknown) {
       name: phase.name,
       status: phase.status,
       expectedFlowFingerprint: phase.expectedFlowFingerprint,
-      sourceCommit: phase.sourceCommit,
+      sourceHeadCommit: phase.sourceHeadCommit,
+      testedTreeCommit: phase.testedTreeCommit,
       artifactDigest: phase.artifactDigest,
       artifact: phase.artifact,
     });
     phase.outputDigest = digest(Object.fromEntries(
-      ["schema", "name", "status", "expectedFlowFingerprint", "sourceCommit", "artifact", "artifactDigest", "semanticDigest"]
+      ["schema", "name", "status", "expectedFlowFingerprint", "sourceHeadCommit", "testedTreeCommit", "artifact", "artifactDigest", "semanticDigest"]
         .map((key) => [key, phase[key]]),
     ));
   }
@@ -88,6 +90,16 @@ function resign(receiptValue: unknown) {
 }
 
 const receiptIndex = process.argv.indexOf("--receipt");
+const expectedCommitIndex = process.argv.indexOf("--expected-source-commit");
+const localHead = spawnSync("/usr/bin/git", ["rev-parse", "HEAD"], {
+  cwd: repoRoot,
+  encoding: "utf8",
+});
+assert.equal(localHead.status, 0, "could not derive local expected source commit");
+const expectedSourceHeadCommit = expectedCommitIndex >= 0
+  ? process.argv[expectedCommitIndex + 1]
+  : localHead.stdout.trim();
+assert.ok(expectedSourceHeadCommit, "--expected-source-commit requires a full SHA");
 const receiptPath = path.resolve(
   receiptIndex >= 0 && process.argv[receiptIndex + 1]
     ? process.argv[receiptIndex + 1]!
@@ -95,7 +107,7 @@ const receiptPath = path.resolve(
 );
 assert.ok(fs.existsSync(receiptPath), `system E2E receipt is missing: ${receiptPath}`);
 const baseline = JSON.parse(fs.readFileSync(receiptPath, "utf8")) as unknown;
-const baselineVerification = verifySystemE2EReceipt(baseline, repoRoot);
+const baselineVerification = verifySystemE2EReceipt(baseline, repoRoot, expectedSourceHeadCommit);
 const contract = loadTamperContract(tamperContractPath(repoRoot));
 const results = contract.cases.map((tamperCase) => {
   const candidate = structuredClone(baseline);
@@ -103,7 +115,7 @@ const results = contract.cases.map((tamperCase) => {
   if (tamperCase.resign) resign(candidate);
   let failure = "";
   try {
-    verifySystemE2EReceipt(candidate, repoRoot);
+    verifySystemE2EReceipt(candidate, repoRoot, expectedSourceHeadCommit);
   } catch (error) {
     failure = error instanceof Error ? error.message : String(error);
   }

@@ -153,9 +153,29 @@
     },
     {
       "id": "source_commit",
-      "mutations": [{ "pointer": "/sourceCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" }],
+      "mutations": [
+        { "pointer": "/sourceHeadCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" },
+        { "pointer": "/flow/phaseChain/0/sourceHeadCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" },
+        { "pointer": "/flow/phaseChain/1/sourceHeadCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" },
+        { "pointer": "/flow/phaseChain/2/sourceHeadCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" },
+        { "pointer": "/flow/phaseChain/3/sourceHeadCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" },
+        { "pointer": "/flow/phaseChain/4/sourceHeadCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" }
+      ],
       "resign": true,
-      "expectedError": "phase 0 source commit mismatch"
+      "expectedError": "source head commit does not match out-of-band expected commit"
+    },
+    {
+      "id": "tested_tree_commit",
+      "mutations": [
+        { "pointer": "/testedTreeCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" },
+        { "pointer": "/flow/phaseChain/0/testedTreeCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" },
+        { "pointer": "/flow/phaseChain/1/testedTreeCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" },
+        { "pointer": "/flow/phaseChain/2/testedTreeCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" },
+        { "pointer": "/flow/phaseChain/3/testedTreeCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" },
+        { "pointer": "/flow/phaseChain/4/testedTreeCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" }
+      ],
+      "resign": true,
+      "expectedError": "tested tree commit does not match verifier checkout"
     },
     {
       "id": "root_guard_digest",
@@ -168,6 +188,15 @@
       "mutations": [{ "pointer": "/isolation/rootGuards/0/writeDenyMode", "replacement": 448 }],
       "resign": true,
       "expectedError": "write-deny mode changed"
+    },
+    {
+      "id": "root_guard_symmetric_digest_forgery",
+      "mutations": [
+        { "pointer": "/isolation/rootGuards/0/beforeDigest", "replacement": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" },
+        { "pointer": "/isolation/rootGuards/0/afterDigest", "replacement": "sha256:ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff" }
+      ],
+      "resign": true,
+      "expectedError": "expected sentinel-tree digest mismatch"
     },
     {
       "id": "direct_row_budget_501",

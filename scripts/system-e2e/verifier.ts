@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 
 import {
   compileLearningEvidencePacket,
@@ -19,6 +20,8 @@ import {
   digest,
   exactKeys,
   loadSupportContract,
+  loadRootGuardContract,
+  rootGuardContractPath,
   supportContractPath,
 } from "./contract";
 
@@ -249,7 +252,7 @@ function verifyMeasurements(
   assert.ok(Object.values(dashboard).every((value) => value === 0), "dashboard scan work must remain exactly zero");
 }
 
-function verifyIsolation(receipt: Record<string, unknown>) {
+function verifyIsolation(receipt: Record<string, unknown>, repoRoot: string) {
   const isolation = object(receipt.isolation, "isolation");
   exactKeys(
     isolation,
@@ -282,16 +285,27 @@ function verifyIsolation(receipt: Record<string, unknown>) {
     "isolation invariants changed",
   );
   const guards = array(isolation.rootGuards, "root guards");
+  const guardContract = loadRootGuardContract(rootGuardContractPath(repoRoot));
   assert.equal(guards.length, 7, "all seven forbidden roots must be observed");
   const expectedLabels = [
     "machine_a_codex_skills", "machine_a_codex_memories", "machine_a_claude_skills",
     "machine_b_codex_skills", "machine_b_codex_memories", "machine_b_claude_skills",
     "operator_live_shadow",
   ];
+  assert.deepEqual(
+    guardContract.guards.map((guard) => guard.label),
+    expectedLabels,
+    "committed root guard contract labels or order changed",
+  );
   assert.deepEqual(guards.map((entry) => object(entry, "root guard").label), expectedLabels, "root guard coverage changed");
   for (const [index, entry] of guards.entries()) {
     exactKeys(entry, ["label", "beforeDigest", "afterDigest", "entriesBefore", "entriesAfter", "writeDenyMode", "unchanged"], `root guard ${index}`);
     assert.equal(entry.beforeDigest, entry.afterDigest, `root guard ${index} changed`);
+    assert.equal(
+      entry.beforeDigest,
+      guardContract.guards[index]?.expectedSentinelTreeDigest,
+      `root guard ${index} expected sentinel-tree digest mismatch`,
+    );
     assert.equal(entry.entriesBefore, entry.entriesAfter, `root guard ${index} entry count changed`);
     assert.ok(integer(entry.entriesBefore, `root guard ${index} entries`) > 0, `root guard ${index} is empty`);
     assert.equal(entry.writeDenyMode, 0o500, `root guard ${index} write-deny mode changed`);
@@ -299,14 +313,19 @@ function verifyIsolation(receipt: Record<string, unknown>) {
   }
 }
 
-function verifyPhases(root: string, flow: Record<string, unknown>, sourceCommit: string) {
+function verifyPhases(
+  root: string,
+  flow: Record<string, unknown>,
+  sourceHeadCommit: string,
+  testedTreeCommit: string,
+) {
   const phaseChain = array(flow.phaseChain, "phase chain");
   const supportContract = loadSupportContract(supportContractPath(root));
   assert.equal(phaseChain.length, supportContract.phases.length, "phase chain count mismatch");
   const phases = phaseChain.map((entry, index) => {
     exactKeys(
       entry,
-      ["schema", "name", "status", "expectedFlowFingerprint", "sourceCommit", "artifact", "artifactDigest", "semanticDigest", "outputDigest"],
+      ["schema", "name", "status", "expectedFlowFingerprint", "sourceHeadCommit", "testedTreeCommit", "artifact", "artifactDigest", "semanticDigest", "outputDigest"],
       `phase ${index}`,
     );
     const contract = supportContract.phases[index]!;
@@ -314,20 +333,22 @@ function verifyPhases(root: string, flow: Record<string, unknown>, sourceCommit:
     assert.equal(entry.name, contract.name, `phase ${index} name mismatch`);
     assert.equal(entry.status, "pass", `phase ${index} status mismatch`);
     assert.equal(entry.expectedFlowFingerprint, flow.fingerprint, `phase ${index} flow fingerprint mismatch`);
-    assert.equal(entry.sourceCommit, sourceCommit, `phase ${index} source commit mismatch`);
+    assert.equal(entry.sourceHeadCommit, sourceHeadCommit, `phase ${index} source head commit mismatch`);
+    assert.equal(entry.testedTreeCommit, testedTreeCommit, `phase ${index} tested tree commit mismatch`);
     assert.equal(entry.artifactDigest, digest(entry.artifact), `phase ${index} artifact digest mismatch`);
     assert.equal(entry.artifactDigest, contract.expectedArtifactDigest, `phase ${index} committed artifact contract mismatch`);
     const semanticMaterial = {
       name: entry.name,
       status: entry.status,
       expectedFlowFingerprint: entry.expectedFlowFingerprint,
-      sourceCommit: entry.sourceCommit,
+      sourceHeadCommit: entry.sourceHeadCommit,
+      testedTreeCommit: entry.testedTreeCommit,
       artifactDigest: entry.artifactDigest,
       artifact: entry.artifact,
     };
     assert.equal(entry.semanticDigest, digest(semanticMaterial), `phase ${index} semantic digest mismatch`);
     const outputMaterial = Object.fromEntries(
-      ["schema", "name", "status", "expectedFlowFingerprint", "sourceCommit", "artifact", "artifactDigest", "semanticDigest"]
+      ["schema", "name", "status", "expectedFlowFingerprint", "sourceHeadCommit", "testedTreeCommit", "artifact", "artifactDigest", "semanticDigest"]
         .map((key) => [key, entry[key]]),
     );
     assert.equal(entry.outputDigest, digest(outputMaterial), `phase ${index} output digest mismatch`);
@@ -536,24 +557,55 @@ function verifySharedFlow(flow: Record<string, unknown>) {
   return shared;
 }
 
-export function verifySystemE2EReceipt(receiptValue: unknown, repoRoot: string) {
+function gitHead(repoRoot: string) {
+  const result = spawnSync("/usr/bin/git", ["rev-parse", "HEAD"], { cwd: repoRoot, encoding: "utf8" });
+  assert.equal(result.status, 0, "verifier could not read tested tree commit");
+  return result.stdout.trim();
+}
+
+function commitIsAncestor(repoRoot: string, ancestor: string, descendant: string) {
+  return spawnSync("/usr/bin/git", ["merge-base", "--is-ancestor", ancestor, descendant], {
+    cwd: repoRoot,
+    encoding: "utf8",
+  }).status === 0;
+}
+
+export function verifySystemE2EReceipt(
+  receiptValue: unknown,
+  repoRoot: string,
+  expectedSourceHeadCommit: string,
+) {
+  assert.match(expectedSourceHeadCommit, /^[a-f0-9]{40}$/, "expected source head commit must be a full SHA");
   exactKeys(
     receiptValue,
-    ["schema", "status", "sourceCommit", "nodeMajor", "isolation", "flow", "budgets", "externalGates", "contentPolicy", "liveStateTouched", "measurements", "volatileFieldsExcludedFromDeterministicDigest", "deterministicDigest"],
+    ["schema", "status", "sourceHeadCommit", "testedTreeCommit", "nodeMajor", "isolation", "flow", "budgets", "externalGates", "contentPolicy", "liveStateTouched", "measurements", "volatileFieldsExcludedFromDeterministicDigest", "deterministicDigest"],
     "system E2E receipt",
   );
   const receipt = receiptValue;
   assert.equal(receipt.schema, SYSTEM_E2E_SCHEMA, "system E2E schema mismatch");
   assert.equal(receipt.status, "pass", "system E2E status mismatch");
-  assert.match(String(receipt.sourceCommit), /^[a-f0-9]{40}$/, "source commit is not a full SHA");
+  assert.match(String(receipt.sourceHeadCommit), /^[a-f0-9]{40}$/, "source head commit is not a full SHA");
+  assert.match(String(receipt.testedTreeCommit), /^[a-f0-9]{40}$/, "tested tree commit is not a full SHA");
+  assert.equal(receipt.sourceHeadCommit, expectedSourceHeadCommit, "source head commit does not match out-of-band expected commit");
+  const actualTestedTreeCommit = gitHead(repoRoot);
+  assert.equal(receipt.testedTreeCommit, actualTestedTreeCommit, "tested tree commit does not match verifier checkout");
+  assert.ok(
+    commitIsAncestor(repoRoot, expectedSourceHeadCommit, actualTestedTreeCommit),
+    "expected source head commit is not an ancestor of verifier tested tree commit",
+  );
   assert.equal(receipt.nodeMajor, 22, "system E2E Node major mismatch");
   assert.equal(receipt.liveStateTouched, false, "system E2E touched live state");
   verifyFixedBudgets(receipt);
-  verifyIsolation(receipt);
+  verifyIsolation(receipt, repoRoot);
 
   const flow = object(receipt.flow, "flow");
   exactKeys(flow, ["fingerprint", "sharedFlow", "phaseChain", "phaseChainDigest"], "flow");
-  const phases = verifyPhases(repoRoot, flow, String(receipt.sourceCommit));
+  const phases = verifyPhases(
+    repoRoot,
+    flow,
+    String(receipt.sourceHeadCommit),
+    String(receipt.testedTreeCommit),
+  );
   const sharedFlow = verifySharedFlow(flow);
   verifyMeasurements(receipt, sharedFlow, phases);
 
@@ -572,7 +624,8 @@ export function verifySystemE2EReceipt(receiptValue: unknown, repoRoot: string) 
   assert.equal(receipt.deterministicDigest, digest(deterministicMaterial), "deterministic digest mismatch");
   return {
     schema: receipt.schema,
-    sourceCommit: receipt.sourceCommit,
+    sourceHeadCommit: receipt.sourceHeadCommit,
+    testedTreeCommit: receipt.testedTreeCommit,
     flowFingerprint: flow.fingerprint,
     deterministicDigest: receipt.deterministicDigest,
     phaseCount: phases.length,

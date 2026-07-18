@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const SYSTEM_E2E_SCHEMA = "plimsoll.system-e2e-proof.v2" as const;
-export const SUPPORT_NORMALIZATION_VERSION = 1 as const;
+export const SUPPORT_NORMALIZATION_VERSION = 2 as const;
 /** Fixed release thresholds. These are never derived from an observed run. */
 export const SYSTEM_E2E_BUDGETS = {
   directRows: 500,
@@ -22,6 +22,11 @@ export type SupportingKind =
   | "line_summary"
   | "line_summary_with_receipt"
   | "json_receipt";
+
+export type SupportingNormalizationContext = {
+  baseDirectory: string;
+  roots: Array<{ label: string; absolutePath: string }>;
+};
 
 export type SupportContract = {
   schema: "plimsoll.system-e2e-support-contract.v1";
@@ -49,6 +54,11 @@ export type TamperCase = {
 export type TamperContract = {
   schema: "plimsoll.system-e2e-tamper-cases.v1";
   cases: TamperCase[];
+};
+
+export type RootGuardContract = {
+  schema: "plimsoll.system-e2e-root-guards.v1";
+  guards: Array<{ label: string; expectedSentinelTreeDigest: string }>;
 };
 
 export function canonical(value: unknown): unknown {
@@ -82,11 +92,89 @@ export function exactKeys(
   assert.deepEqual(actual, [...expected].sort(), `${label} has missing, extra, or unknown fields`);
 }
 
-function normalizeString(value: string, key: string): string {
-  if (/^(?:v)?22\.\d+\.\d+$/.test(value) && /(?:node|version)/i.test(key)) {
+const DECLARED_PATH_KEYS = new Set([
+  "blankHome",
+  "blankPlimsoll",
+  "bufferPath",
+  "claudeCredential",
+  "claudeSettings",
+  "codexConfig",
+  "codexCredential",
+  "commandLog",
+  "configPath",
+  "dryHome",
+  "dryPlimsoll",
+  "dryTarget",
+  "execPath",
+  "home",
+  "ledger",
+  "packagedCli",
+  "path",
+  "pidPath",
+  "plistPath",
+  "receipt",
+  "root",
+  "target",
+  "unsupportedCommandLog",
+  "unsupportedHome",
+  "unsupportedPlimsoll",
+  "unsupportedTarget",
+  "workflow",
+]);
+const DIAGNOSTIC_TEXT_KEYS = new Set(["detail", "stdout", "stderr"]);
+const DECLARED_LOOPBACK_URL_KEYS = new Set(["statusUrl", "url"]);
+
+function isPathLike(value: string) {
+  return path.isAbsolute(value) || value.startsWith(".") || value.includes("/");
+}
+
+function within(root: string, candidate: string) {
+  const relative = path.relative(root, candidate);
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+/**
+ * Resolve only schema-declared path fields. The semantic artifact records the
+ * owned root role, never a temp basename or machine-specific absolute path.
+ */
+export function canonicalizeDeclaredPath(
+  value: string,
+  key: string,
+  context: SupportingNormalizationContext,
+) {
+  assert.ok(DECLARED_PATH_KEYS.has(key), `${key} is not a declared path field`);
+  assert.ok(isPathLike(value), `${key} is not a path-like declared path value`);
+  const candidate = path.resolve(context.baseDirectory, value);
+  const roots = context.roots
+    .map((root) => ({ label: root.label, absolutePath: path.resolve(root.absolutePath) }))
+    .sort((left, right) => right.absolutePath.length - left.absolutePath.length);
+  const owner = roots.find((root) => within(root.absolutePath, candidate));
+  assert.ok(owner, `DeclaredPathOutsideAllowedRoots:${key}`);
+  return `<path-root:${owner.label}>`;
+}
+
+function normalizeString(
+  value: string,
+  key: string,
+  context: SupportingNormalizationContext,
+): string {
+  if (DECLARED_PATH_KEYS.has(key) && isPathLike(value)) {
+    return canonicalizeDeclaredPath(value, key, context);
+  }
+  if (DECLARED_LOOPBACK_URL_KEYS.has(key)) {
+    const parsed = new URL(value);
+    assert.equal(parsed.protocol, "http:", `${key} must use the fixture HTTP protocol`);
+    assert.ok(
+      ["127.0.0.1", "localhost", "[::1]"].includes(parsed.hostname),
+      `${key} must remain on the fixture loopback interface`,
+    );
+    assert.match(parsed.port, /^\d+$/, `${key} must include the fixture port`);
+    return `<loopback-http-url>${parsed.pathname}`;
+  }
+  if (/^(?:v)?22\.\d+\.\d+$/.test(value) && /^(?:node|version)$/i.test(key)) {
     return "<node-major-22>";
   }
-  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value)) {
+  if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value) && /(?:At|Time)$/i.test(key)) {
     return "<volatile-iso-time>";
   }
   if (/^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(value) &&
@@ -97,12 +185,8 @@ function normalizeString(value: string, key: string): string {
       /(?:before|after|fingerprint|digest)/i.test(key)) {
     return "<volatile-digest>";
   }
-  if (value.startsWith("/")) return "<volatile-absolute-path>";
-  return value
-    .replace(/\b(?:v)?22\.\d+\.\d+\b/g, "<node-major-22>")
-    .replace(/127\.0\.0\.1:\d+/g, "127.0.0.1:<volatile-port>")
-    .replace(/localhost:\d+/g, "localhost:<volatile-port>")
-    .replace(/\/(?:Users|private|var|tmp)\/[^\s"']+/g, "<volatile-absolute-path>");
+  if (DIAGNOSTIC_TEXT_KEYS.has(key)) return value.length > 0 ? `<nonempty-${key}>` : "";
+  return value;
 }
 
 const VOLATILE_NUMBER_KEYS = /^(?:pid|port|durationMs|elapsedMs|warmP95Ms|tempBytes|maxRssBytes|serializedBytes|receiptBytes|parentCredentialLikeNameCount)$/i;
@@ -112,21 +196,37 @@ const VOLATILE_NUMBER_KEYS = /^(?:pid|port|durationMs|elapsedMs|warmP95Ms|tempBy
  * volatile values. Unknown/missing fields therefore change the committed
  * artifact digest instead of being silently ignored.
  */
-export function normalizeSupportingArtifact(value: unknown, key = "root"): unknown {
+export function normalizeSupportingArtifact(
+  value: unknown,
+  context: SupportingNormalizationContext,
+  key = "root",
+): unknown {
   if (Array.isArray(value)) {
-    return value.map((child) => normalizeSupportingArtifact(child, key));
+    return value.map((child) => normalizeSupportingArtifact(child, context, key));
   }
   if (value && typeof value === "object") {
     return Object.fromEntries(
       Object.entries(value as Record<string, unknown>)
         .sort(([left], [right]) => left.localeCompare(right))
-        .map(([childKey, child]) => [childKey, normalizeSupportingArtifact(child, childKey)]),
+        .map(([childKey, child]) => [childKey, normalizeSupportingArtifact(child, context, childKey)]),
     );
   }
-  if (typeof value === "string") return normalizeString(value, key);
+  if (typeof value === "string") return normalizeString(value, key, context);
   if (typeof value === "number" && VOLATILE_NUMBER_KEYS.test(key)) {
     assert.ok(Number.isFinite(value) && value >= 0, `${key} must be a nonnegative finite measurement`);
     return "<volatile-number>";
+  }
+  return value;
+}
+
+function omitNonSemanticReceiptLocations(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(omitNonSemanticReceiptLocations);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([key, child]) => !(key === "receipt" && typeof child === "string" && isPathLike(child)))
+        .map(([key, child]) => [key, omitNonSemanticReceiptLocations(child)]),
+    );
   }
   return value;
 }
@@ -243,18 +343,19 @@ function assertResourceReceipt(receipt: unknown) {
 export function parseSupportingArtifact(
   kind: SupportingKind,
   stdout: string,
+  context: SupportingNormalizationContext,
   receiptPath?: string,
 ): unknown {
   if (kind === "json_result") {
     const parsed = parsePrettyJsonExactly(stdout, "supporting JSON result");
     if ((parsed as Record<string, unknown>).issue === 107) assertInstallResult(parsed);
     else assertJoinResult(parsed);
-    return normalizeSupportingArtifact(parsed);
+    return normalizeSupportingArtifact(parsed, context);
   }
   if (kind === "line_summary") {
     const parsed = parsePassLinesWithSummary(stdout, "supporting line result");
     assertLifecycleResult(parsed);
-    return normalizeSupportingArtifact(parsed);
+    return normalizeSupportingArtifact(parsed, context);
   }
   assert.ok(receiptPath && fs.existsSync(receiptPath), "supporting receipt is missing");
   const receiptBytes = fs.readFileSync(receiptPath, "utf8");
@@ -262,12 +363,15 @@ export function parseSupportingArtifact(
   if (kind === "line_summary_with_receipt") {
     const parsed = parsePassLinesWithSummary(stdout, "supporting line result");
     assertPrivacyResult(parsed, receipt);
-    return normalizeSupportingArtifact({ ...parsed, receipt });
+    return normalizeSupportingArtifact(
+      omitNonSemanticReceiptLocations({ ...parsed, receipt }),
+      context,
+    );
   }
   const stdoutReceipt = parsePrettyJsonExactly(stdout, "resource stdout receipt");
   assert.deepEqual(stdoutReceipt, receipt, "resource stdout and selected receipt diverged");
   assertResourceReceipt(receipt);
-  return normalizeSupportingArtifact(receipt);
+  return normalizeSupportingArtifact(receipt, context);
 }
 
 export function loadSupportContract(file: string): SupportContract {
@@ -309,10 +413,27 @@ export function loadTamperContract(file: string): TamperContract {
   return value as TamperContract;
 }
 
+export function loadRootGuardContract(file: string): RootGuardContract {
+  const value = JSON.parse(fs.readFileSync(file, "utf8")) as unknown;
+  exactKeys(value, ["schema", "guards"], "root guard contract");
+  assert.equal(value.schema, "plimsoll.system-e2e-root-guards.v1");
+  assert.ok(Array.isArray(value.guards) && value.guards.length > 0);
+  for (const [index, guard] of value.guards.entries()) {
+    exactKeys(guard, ["label", "expectedSentinelTreeDigest"], `root guard contract ${index}`);
+    assert.match(String(guard.label), /^[a-z0-9_]+$/);
+    assert.match(String(guard.expectedSentinelTreeDigest), /^sha256:[a-f0-9]{64}$/);
+  }
+  return value as RootGuardContract;
+}
+
 export function supportContractPath(root: string) {
   return path.join(root, "scripts", "system-e2e", "fixtures", "support-contract.json");
 }
 
 export function tamperContractPath(root: string) {
   return path.join(root, "scripts", "system-e2e", "fixtures", "tamper-cases.json");
+}
+
+export function rootGuardContractPath(root: string) {
+  return path.join(root, "scripts", "system-e2e", "fixtures", "root-guards.json");
 }

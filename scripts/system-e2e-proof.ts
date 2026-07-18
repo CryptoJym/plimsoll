@@ -47,8 +47,10 @@ import {
   SYSTEM_E2E_BUDGETS,
   digest,
   loadSupportContract,
+  loadRootGuardContract,
   parseSupportingArtifact,
   supportContractPath,
+  rootGuardContractPath,
   type SupportingKind,
 } from "./system-e2e/contract";
 
@@ -57,7 +59,8 @@ type PhaseReceipt = {
   name: string;
   status: "pass";
   expectedFlowFingerprint: string;
-  sourceCommit: string;
+  sourceHeadCommit: string;
+  testedTreeCommit: string;
   artifact: unknown;
   artifactDigest: string;
   semanticDigest: string;
@@ -139,6 +142,13 @@ function prepareRootGuards(): RootGuard[] {
     fs.chmodSync(root, 0o500);
     const before = guardedTree(root);
     assert.ok(before.entries > 0, `${label} guard is empty`);
+    const committedGuard = rootGuardContract.guards.find((guard) => guard.label === label);
+    assert.ok(committedGuard, `${label} has no committed sentinel-tree contract`);
+    assert.equal(
+      before.digest,
+      committedGuard.expectedSentinelTreeDigest,
+      `${label} sentinel-tree digest does not match committed contract; actual=${before.digest}`,
+    );
     return { label, root, beforeDigest: before.digest, beforeEntries: before.entries, mode: 0o500 };
   });
   return activeRootGuards;
@@ -172,6 +182,7 @@ function releaseRootGuards() {
 
 const BUDGETS = SYSTEM_E2E_BUDGETS;
 const supportContract = loadSupportContract(supportContractPath(repoRoot));
+const rootGuardContract = loadRootGuardContract(rootGuardContractPath(repoRoot));
 
 const WORKSPACE_A = "10000000-0000-4000-8000-000000000001";
 const WORKSPACE_B = "20000000-0000-4000-8000-000000000002";
@@ -249,7 +260,8 @@ function runSupportingProof(options: {
   temp: string;
   requiredAssertions: string[];
   receipt?: string;
-  sourceCommit: string;
+  sourceHeadCommit: string;
+  testedTreeCommit: string;
 }): PhaseReceipt {
   const result = spawnSync(
     "/usr/bin/time",
@@ -287,7 +299,21 @@ function runSupportingProof(options: {
     assert.ok(fs.existsSync(options.receipt), `${options.name} did not write its selected receipt`);
   }
 
-  const artifact = parseSupportingArtifact(options.kind, result.stdout, options.receipt);
+  const artifact = parseSupportingArtifact(
+    options.kind,
+    result.stdout,
+    {
+      baseDirectory: repoRoot,
+      roots: [
+        { label: "repository", absolutePath: repoRoot },
+        { label: "proof", absolutePath: proofRoot },
+        { label: "machine-home", absolutePath: options.home },
+        { label: "machine-temp", absolutePath: options.temp },
+        { label: "node-runtime", absolutePath: path.dirname(process.execPath) },
+      ],
+    },
+    options.receipt,
+  );
   const artifactDigest = digest(artifact);
   const phaseContract = supportContract.phases.find((phase) => phase.name === options.name);
   assert.ok(phaseContract, `${options.name} has no committed support contract`);
@@ -301,7 +327,8 @@ function runSupportingProof(options: {
     name: options.name,
     status: "pass",
     expectedFlowFingerprint: flowFingerprint,
-    sourceCommit: options.sourceCommit,
+    sourceHeadCommit: options.sourceHeadCommit,
+    testedTreeCommit: options.testedTreeCommit,
     artifactDigest,
     artifact,
   });
@@ -310,7 +337,8 @@ function runSupportingProof(options: {
     name: options.name,
     status: "pass" as const,
     expectedFlowFingerprint: flowFingerprint,
-    sourceCommit: options.sourceCommit,
+    sourceHeadCommit: options.sourceHeadCommit,
+    testedTreeCommit: options.testedTreeCommit,
     artifact,
     artifactDigest,
     semanticDigest,
@@ -346,6 +374,20 @@ function gitHead() {
   });
   assert.equal(result.status, 0, "could not read source commit");
   return result.stdout.trim();
+}
+
+function commitIsAncestor(ancestor: string, descendant: string) {
+  const result = spawnSync("/usr/bin/git", ["merge-base", "--is-ancestor", ancestor, descendant], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    env: isolatedEnvironment(machineAHome, machineATmp),
+  });
+  return result.status === 0;
+}
+
+function optionValue(name: string) {
+  const index = process.argv.indexOf(name);
+  return index >= 0 ? process.argv[index + 1] : undefined;
 }
 
 function event(input: {
@@ -947,7 +989,13 @@ async function main() {
   assert.equal(process.versions.node.split(".")[0], "22", "system E2E requires exact Node 22");
   const startedAt = Date.now();
   const usageBefore = process.resourceUsage();
-  const sourceCommit = gitHead();
+  const testedTreeCommit = gitHead();
+  const sourceHeadCommit = optionValue("--expected-source-commit") ?? testedTreeCommit;
+  assert.match(sourceHeadCommit, /^[a-f0-9]{40}$/, "expected source head commit must be a full SHA");
+  assert.ok(
+    commitIsAncestor(sourceHeadCommit, testedTreeCommit),
+    "expected source head commit is not an ancestor of the tested tree commit",
+  );
   const rootGuards = prepareRootGuards();
   const sharedFlow = await runSharedFlow();
 
@@ -964,7 +1012,8 @@ async function main() {
       "packaged_doctor_reports_signal_verified_read_only",
       "proof_never_invokes_launchctl",
     ],
-    sourceCommit,
+    sourceHeadCommit,
+    testedTreeCommit,
   });
   const join = runSupportingProof({
     name: "transactional_join",
@@ -978,7 +1027,8 @@ async function main() {
       "join_dry_run_rejected_before_token_network_or_mutation",
       "cli_stdin_keeps_secret_out_of_argv_and_output",
     ],
-    sourceCommit,
+    sourceHeadCommit,
+    testedTreeCommit,
   });
   const privacyReceipt = path.join(evidenceRoot, "privacy.json");
   const privacy = runSupportingProof({
@@ -995,7 +1045,8 @@ async function main() {
       "lease_export_ack_races_and_reopen_remain_terminal_and_local",
       "proof_receipt_contains_no_private_sentinel",
     ],
-    sourceCommit,
+    sourceHeadCommit,
+    testedTreeCommit,
   });
   const lifecycle = runSupportingProof({
     name: "canonical_lifecycle",
@@ -1011,7 +1062,8 @@ async function main() {
       "uninstall_command_preview_discloses_retained_and_purge_only_snapshots",
       "purge_is_separate_exact_and_deletes_live_plus_snapshot_secret_copies",
     ],
-    sourceCommit,
+    sourceHeadCommit,
+    testedTreeCommit,
   });
   const resourceReceiptPath = path.join(evidenceRoot, "resource.json");
   const resource = runSupportingProof({
@@ -1027,7 +1079,8 @@ async function main() {
       '"id": "dashboard_projection_budget"',
       '"overall": "pass"',
     ],
-    sourceCommit,
+    sourceHeadCommit,
+    testedTreeCommit,
   });
 
   const resourceReceipt = JSON.parse(fs.readFileSync(resourceReceiptPath, "utf8")) as {
@@ -1175,7 +1228,8 @@ async function main() {
   const deterministicMaterial = {
     schema: SCHEMA,
     status: "pass",
-    sourceCommit,
+    sourceHeadCommit,
+    testedTreeCommit,
     nodeMajor: 22,
     isolation: {
       temporaryMachineRoots: 2,
@@ -1251,7 +1305,8 @@ async function main() {
   console.log(JSON.stringify({
     schema: receipt.schema,
     status: receipt.status,
-    sourceCommit: receipt.sourceCommit,
+    sourceHeadCommit: receipt.sourceHeadCommit,
+    testedTreeCommit: receipt.testedTreeCommit,
     flowFingerprint,
     sharedPrimaryTokens: sharedFlow.measurements.capturedPrimaryTokens,
     phaseCount: phases.length,

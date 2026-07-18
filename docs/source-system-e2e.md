@@ -26,11 +26,17 @@ unit proofs:
 7. Existing adversarial installer/doctor, transactional join, metadata-only
    privacy, lifecycle rollback/uninstall/purge, and resource proofs are bound
    to the same flow fingerprint. A strict parser closes each actual child
-   result, normalizes only enumerated volatile measurements, and includes its
-   semantic artifact and digest in the final receipt. Raw stdout is excluded.
+   result, canonicalizes only schema-declared paths against owned roots,
+   normalizes only enumerated volatile measurements, and includes its semantic
+   artifact and digest in the final receipt. Raw stdout and non-semantic child
+   receipt locations are excluded. A separate fixture proves that distinct
+   temporary roots produce the same semantic digest and that a declared path
+   outside the owned roots fails closed.
 8. Seven synthetic skill, memory, and operator-live-shadow roots are populated,
    made write-denied, and content-digested before the flow. Their modes, entry
-   counts, and after-digests must remain identical.
+   counts, and after-digests must remain identical. Both the before and after
+   digests must also match the committed sentinel-tree contract, so a
+   consistently re-signed replacement tree is rejected.
 
 The content-free receipt is written to
 `evidence/system-e2e-proof.json`. It records actual controller-plus-child CPU,
@@ -51,9 +57,21 @@ The standalone verifier does not trust the receipt's declared hashes. It
 recomputes every stage, phase, shared-flow, evidence, and final deterministic
 digest; re-derives outcomes and deterministic fact identities; recompiles the
 learning packet; checks exact delivery/allocation sets; and validates the
-resource totals and margins. Thirty-seven committed tamper cases include
+resource totals and margins. Thirty-nine committed tamper cases include
 re-signed semantic attacks, ensuring failures are not merely caused by stale
-outer hashes.
+outer hashes, including out-of-band source-head substitution, tested-tree
+substitution, and symmetric before/after root forgery.
+
+Every receipt binds two different Git identities. `sourceHeadCommit` is the
+pull request head supplied out of band by the CI event; it is the source change
+under review. `testedTreeCommit` is `git rev-parse HEAD` in the checkout that
+actually ran the gate. GitHub Actions intentionally keeps its default pull
+request checkout with full ancestry, so this second value may be the synthetic
+merge commit. The proof and standalone verifier require the source head to be
+an ancestor of the tested tree, bind every phase to both values, and bind the
+tested tree to the verifier's current checkout. Locally, omitting
+`--expected-source-commit` derives the source head from the current checkout;
+CI always passes the event head explicitly.
 
 ## Honest external gates
 
@@ -68,11 +86,18 @@ Run the source gate with Node 22:
 
 ```sh
 pnpm install --frozen-lockfile
-pnpm proof:system-e2e -- --receipt evidence/system-e2e-proof.json
-pnpm proof:system-e2e:verify -- --receipt evidence/system-e2e-proof.json
+pnpm proof:system-e2e:path-normalization
+pnpm proof:system-e2e -- --receipt evidence/system-e2e-proof.json \
+  --expected-source-commit "$(git rev-parse HEAD)"
+pnpm proof:system-e2e:verify -- --receipt evidence/system-e2e-proof.json \
+  --expected-source-commit "$(git rev-parse HEAD)"
 pnpm proof:system-e2e -- --receipt evidence/system-e2e-proof-repeat.json \
-  --compare-deterministic-receipt evidence/system-e2e-proof.json
-pnpm proof:system-e2e:tamper -- --receipt evidence/system-e2e-proof-repeat.json
+  --compare-deterministic-receipt evidence/system-e2e-proof.json \
+  --expected-source-commit "$(git rev-parse HEAD)"
+pnpm proof:system-e2e:verify -- --receipt evidence/system-e2e-proof-repeat.json \
+  --expected-source-commit "$(git rev-parse HEAD)"
+pnpm proof:system-e2e:tamper -- --receipt evidence/system-e2e-proof-repeat.json \
+  --expected-source-commit "$(git rev-parse HEAD)"
 ```
 
 The proof fails closed if a cross-stage ID is dropped, tokens no longer
