@@ -317,6 +317,20 @@ esac
     [tsx, cli, "doctor", "--read-only", "--json"],
     { cwd: neutralCwd, env: doctorBaseEnv },
   );
+  if (blankDoctor.stdout.trim().length === 0) {
+    const stderrFrames = [...blankDoctor.stderr.matchAll(/\s+at\s+([A-Za-z0-9_.<>]+)/g)]
+      .slice(0, 8)
+      .map((match) => match[1]);
+    throw new Error(`blank_doctor_empty_json: ${JSON.stringify({
+      code: blankDoctor.code,
+      stdoutBytes: Buffer.byteLength(blankDoctor.stdout),
+      stderrBytes: Buffer.byteLength(blankDoctor.stderr),
+      stderrDigest: createHash("sha256").update(blankDoctor.stderr).digest("hex"),
+      childCommandErrorCode: blankDoctor.stderr.match(/\b(ERR_[A-Z0-9_]+|E[A-Z]{3,})\b/)?.[1] ?? "none",
+      childCommandErrorClass: blankDoctor.stderr.match(/\b([A-Z][A-Za-z]+Error)\b/)?.[1] ?? "none",
+      stderrFrames,
+    })}`);
+  }
   const blankReceipt = parseJson(blankDoctor.stdout);
   check("blank_doctor_fails", blankDoctor.code !== 0 && blankReceipt.ok === false, blankReceipt);
   check("blank_doctor_reports_not_installed", blankReceipt.readiness === "not_installed", blankReceipt);

@@ -11,6 +11,10 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Keep the default PR synthetic-merge checkout, but fetch its ancestry
+          # so the out-of-band source head can be proven to be an ancestor.
+          fetch-depth: 0
 
       - uses: pnpm/action-setup@v4
 
@@ -66,6 +70,15 @@ jobs:
 
       - name: Prove immutable outcome timeline and bounded recovery
         run: pnpm proof:outcome-timeline
+
+      - name: Prove source-only integrated learning and fleet flow
+        run: |
+          pnpm proof:system-e2e:path-normalization
+          pnpm proof:system-e2e -- --receipt evidence/system-e2e-proof.json --expected-source-commit "${{ github.event.pull_request.head.sha || github.sha }}"
+          pnpm proof:system-e2e:verify -- --receipt evidence/system-e2e-proof.json --expected-source-commit "${{ github.event.pull_request.head.sha || github.sha }}"
+          pnpm proof:system-e2e -- --receipt evidence/system-e2e-proof-repeat.json --compare-deterministic-receipt evidence/system-e2e-proof.json --expected-source-commit "${{ github.event.pull_request.head.sha || github.sha }}"
+          pnpm proof:system-e2e:verify -- --receipt evidence/system-e2e-proof-repeat.json --expected-source-commit "${{ github.event.pull_request.head.sha || github.sha }}"
+          pnpm proof:system-e2e:tamper -- --receipt evidence/system-e2e-proof-repeat.json --expected-source-commit "${{ github.event.pull_request.head.sha || github.sha }}"
 
       - name: Run strict isolated resource proof
         run: pnpm proof:resource --require-integrated --receipt evidence/resource-proof.json
