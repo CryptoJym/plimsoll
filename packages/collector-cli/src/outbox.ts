@@ -7,6 +7,11 @@ import {
   type AiWorkIngestEvent,
 } from "../../shared/src/index";
 import { canonicalLinkage, sealOutboundEnvelope } from "./outbound-envelope";
+import {
+  markRawPrivacyDisposition,
+  terminalPrivacyEligibilitySql,
+  type TerminalPrivacyReason,
+} from "./privacy-disposition";
 import { ensureUuidEventId, normalizeHistoryEvent } from "./upload-history";
 
 export const DEFAULT_DELIVERY_LIMITS = {
@@ -42,11 +47,21 @@ export type DeliveryFailureClass =
 export type DeliveryCircuit = "none" | "auth_blocked" | "contract_blocked";
 export type DeliveryReceiptReason =
   | "remote_acknowledged"
+  | "local_evidence_quarantined"
   | "local_payload_unparseable"
   | "local_schema_invalid"
   | "local_privacy_violation"
   | "local_item_oversize"
   | "remote_validation_rejected";
+
+function isTerminalPrivacyReason(
+  reason: DeliveryReceiptReason,
+): reason is TerminalPrivacyReason {
+  return (
+    reason === "local_evidence_quarantined" ||
+    reason === "local_privacy_violation"
+  );
+}
 
 export type DeliveryStatus = {
   enabled: boolean;
@@ -109,6 +124,12 @@ export type DeliveryStatus = {
     receiptRowsScanned: 0;
     rawRowsScanned: 0;
   };
+  privacy: {
+    mode: "metadata_only";
+    evidenceVault: "not_implemented";
+    legacyEvidenceDisposition: "local_quarantine_migration_required";
+    liveLedgerInspection: "not_performed";
+  };
 };
 
 export type LeasedDeliveryItem = {
@@ -135,6 +156,9 @@ export type DeliveryValidationWitness = {
 type RawDeliveryRow = {
   rawRowid: number;
   rawId: string;
+  privacyGeneration: string | null;
+  privacyDisposition: TerminalPrivacyReason | null;
+  dataMode: string;
   createdAt: string;
   uploadedAt: string | null;
   payloadJson: string;
@@ -147,17 +171,34 @@ type RawDeliveryRow = {
 type LegacyCandidateRow = Pick<
   RawDeliveryRow,
   "rawRowid" | "rawId" | "createdAt" | "uploadedAt" | "workspaceId"
-> & { rowBytes: number };
+> & { dataMode: string; rowBytes: number };
 
 type ActiveDeliveryRow = {
   deliveryId: string;
   rawRowid: number | null;
+  rawId: string | null;
+  rawCreatedAt: string | null;
+  rawGeneration: string | null;
   baseEnvelopeJson: string;
   sealedEnvelopeJson: string | null;
   repoHash: string | null;
   branchHash: string | null;
   attemptCount: number;
 };
+
+type RawPrivacyRow = {
+  rawId: string;
+  createdAt: string;
+  privacyGeneration: string | null;
+  privacyDisposition: TerminalPrivacyReason | null;
+  dataMode: string;
+  uploadedAt: string | null;
+};
+
+type RawLineageSnapshot = Pick<
+  ActiveDeliveryRow,
+  "deliveryId" | "rawRowid" | "rawId" | "rawCreatedAt" | "rawGeneration"
+>;
 
 type PreparedDelivery =
   | {
@@ -172,6 +213,9 @@ type PreparedDelivery =
 
 function prepareDelivery(row: RawDeliveryRow, maxItemBytes: number): PreparedDelivery {
   const fallbackId = ensureUuidEventId(row.rawId).id;
+  if (row.dataMode === "evidence") {
+    return { ok: false, deliveryId: fallbackId, reason: "local_evidence_quarantined" };
+  }
   const normalized = normalizeHistoryEvent({
     payloadJson: row.payloadJson,
     suppressedFieldsJson: row.suppressedFieldsJson,
@@ -283,6 +327,18 @@ export class DeliveryOutbox {
     return this.enabled;
   }
 
+  isEvidenceQuarantined(rawId: string) {
+    return Boolean(
+      this.db
+        .prepare(
+          `select 1 as quarantined from upload_receipts
+           where delivery_id = ? and reason = 'local_evidence_quarantined'
+           limit 1`,
+        )
+        .get(ensureUuidEventId(rawId).id),
+    );
+  }
+
   private initializeSchema() {
     // Additive only: no query or index is built against the historical raw
     // ledger here. Large-ledger work happens solely in bounded migration slices.
@@ -290,6 +346,9 @@ export class DeliveryOutbox {
       create table if not exists upload_outbox (
         delivery_id text primary key,
         raw_rowid integer,
+        raw_id text,
+        raw_created_at text,
+        raw_generation text,
         workspace_id text,
         base_envelope_json text not null,
         base_bytes integer not null,
@@ -351,6 +410,7 @@ export class DeliveryOutbox {
         migration_last_dead integer not null default 0,
         migration_last_skipped_uploaded integer not null default 0,
         migration_last_at text,
+        privacy_migration_version integer not null default 0,
         validation_probe_rows integer not null default 0,
         updated_at text not null
       );
@@ -446,16 +506,44 @@ export class DeliveryOutbox {
          add column validation_probe_rows integer not null default 0`,
       );
     }
+    if (!controlColumns.some((column) => column.name === "privacy_migration_version")) {
+      this.db.exec(
+        `alter table upload_control
+         add column privacy_migration_version integer not null default 0`,
+      );
+    }
     const outboxColumns = this.db
       .prepare(`pragma table_info(upload_outbox)`)
       .all() as Array<{ name: string }>;
     if (!outboxColumns.some((column) => column.name === "workspace_id")) {
       this.db.exec(`alter table upload_outbox add column workspace_id text`);
     }
+    for (const column of ["raw_id", "raw_created_at", "raw_generation"]) {
+      if (!outboxColumns.some((existing) => existing.name === column)) {
+        this.db.exec(`alter table upload_outbox add column ${column} text`);
+      }
+    }
     this.db.exec(
       `create index if not exists idx_upload_outbox_workspace_due
-       on upload_outbox (workspace_id, state, next_attempt_at, created_at)`,
+         on upload_outbox (workspace_id, state, next_attempt_at, created_at);
+       create index if not exists idx_upload_outbox_raw_generation
+         on upload_outbox (raw_generation, created_at, delivery_id);
+       create trigger if not exists trg_upload_outbox_lineage_immutable
+       before update of raw_rowid, raw_id, raw_created_at, raw_generation on upload_outbox
+       when new.raw_rowid is not old.raw_rowid
+         or new.raw_id is not old.raw_id
+         or new.raw_created_at is not old.raw_created_at
+         or new.raw_generation is not old.raw_generation
+       begin
+         select raise(abort, 'upload_outbox_lineage_is_immutable');
+       end`,
     );
+    this.db.prepare(
+      `update upload_control set migration_cursor_rowid = 0,
+         migration_complete = 0, migration_paused_reason = null,
+         privacy_migration_version = 1, updated_at = @now
+       where singleton = 1 and privacy_migration_version < 1`,
+    ).run({ now: new Date().toISOString() });
   }
 
   /**
@@ -503,8 +591,28 @@ export class DeliveryOutbox {
 
   enqueueRaw(row: RawDeliveryRow) {
     if (!this.enabled || row.uploadedAt) return { enqueued: 0, dead: 0 };
+    if (row.privacyDisposition) return { enqueued: 0, dead: 0 };
+    const existingReceipt = this.db
+      .prepare(`select reason from upload_receipts where delivery_id = ?`)
+      .get(ensureUuidEventId(row.rawId).id) as { reason: string } | undefined;
+    if (
+      existingReceipt?.reason === "local_evidence_quarantined" ||
+      existingReceipt?.reason === "local_privacy_violation"
+    ) {
+      markRawPrivacyDisposition(
+        this.db,
+        row.rawRowid,
+        existingReceipt.reason,
+        new Date().toISOString(),
+      );
+      return { enqueued: 0, dead: 0 };
+    }
     const prepared = prepareDelivery(row, this.limits.maxItemBytes);
     if (prepared.ok === false) {
+      const terminalAt = new Date().toISOString();
+      if (isTerminalPrivacyReason(prepared.reason)) {
+        markRawPrivacyDisposition(this.db, row.rawRowid, prepared.reason, terminalAt);
+      }
       return {
         enqueued: 0,
         dead: this.writeReceipt({
@@ -513,7 +621,27 @@ export class DeliveryOutbox {
           reason: prepared.reason,
           attemptCount: 0,
           createdAt: row.createdAt,
-          terminalAt: new Date().toISOString(),
+          terminalAt,
+        }),
+      };
+    }
+    if (!row.privacyGeneration) {
+      const terminalAt = new Date().toISOString();
+      markRawPrivacyDisposition(
+        this.db,
+        row.rawRowid,
+        "local_privacy_violation",
+        terminalAt,
+      );
+      return {
+        enqueued: 0,
+        dead: this.writeReceipt({
+          deliveryId: prepared.deliveryId,
+          state: "dead",
+          reason: "local_privacy_violation",
+          attemptCount: 0,
+          createdAt: row.createdAt,
+          terminalAt,
         }),
       };
     }
@@ -521,9 +649,11 @@ export class DeliveryOutbox {
     const inserted = this.db
       .prepare(
         `insert or ignore into upload_outbox
-          (delivery_id, raw_rowid, workspace_id, base_envelope_json, base_bytes, repo_hash, branch_hash,
+          (delivery_id, raw_rowid, raw_id, raw_created_at, raw_generation, workspace_id,
+           base_envelope_json, base_bytes, repo_hash, branch_hash,
            state, attempt_count, next_attempt_at, last_failure_class, created_at, updated_at)
-         select @deliveryId, @rawRowid, @workspaceId, @baseEnvelopeJson, @baseBytes, @repoHash, @branchHash,
+         select @deliveryId, @rawRowid, @rawId, @createdAt, @privacyGeneration, @workspaceId,
+           @baseEnvelopeJson, @baseBytes, @repoHash, @branchHash,
            'pending', 0, @now, 'none', @createdAt, @now
          where not exists (
            select 1 from upload_receipts where delivery_id = @deliveryId
@@ -532,6 +662,8 @@ export class DeliveryOutbox {
       .run({
         ...prepared,
         rawRowid: row.rawRowid,
+        rawId: row.rawId,
+        privacyGeneration: row.privacyGeneration,
         workspaceId: row.workspaceId,
         createdAt: row.createdAt,
         now,
@@ -544,10 +676,13 @@ export class DeliveryOutbox {
     const row = this.db
       .prepare(
         `select rowid as rawRowid, id as rawId, created_at as createdAt,
+           data_mode as dataMode,
            uploaded_at as uploadedAt, payload_json as payloadJson,
            suppressed_fields_json as suppressedFieldsJson,
            repo_hash as repoHash, branch_hash as branchHash,
-           workspace_id as workspaceId
+           workspace_id as workspaceId,
+           privacy_generation as privacyGeneration,
+           privacy_disposition as privacyDisposition
          from buffered_events where id = ?`,
       )
       .get(rawId) as RawDeliveryRow | undefined;
@@ -574,8 +709,13 @@ export class DeliveryOutbox {
   }
 
   migrateLegacy(options: { maxRows?: number; maxBytes?: number; now?: Date } = {}) {
-    if (!this.enabled) return { visited: 0, enqueued: 0, dead: 0, skippedUploaded: 0, complete: false, paused: null };
+    if (!this.enabled) return { visited: 0, enqueued: 0, dead: 0, skippedUploaded: 0, quarantinedEvidence: 0, complete: false, paused: null };
     const now = options.now ?? new Date();
+    const nowIso = now.toISOString();
+    const maxRows = Math.max(1, Math.min(Math.trunc(options.maxRows ?? this.limits.migrationBatchRows), 5_000));
+    const lineageDead = this.db.transaction(() =>
+      this.quarantineUnprovenLineage(Math.min(maxRows, 500), nowIso),
+    )();
     const pressure = this.status(now).pressure;
     if (pressure.degraded) {
       this.db
@@ -583,8 +723,8 @@ export class DeliveryOutbox {
           `update upload_control set migration_paused_reason = 'pressure', updated_at = ?
            where singleton = 1`,
         )
-        .run(now.toISOString());
-      return { visited: 0, enqueued: 0, dead: 0, skippedUploaded: 0, complete: false, paused: "pressure" as const };
+        .run(nowIso);
+      return { visited: 0, enqueued: 0, dead: lineageDead, skippedUploaded: 0, quarantinedEvidence: 0, complete: false, paused: "pressure" as const };
     }
 
     const control = this.db
@@ -594,15 +734,15 @@ export class DeliveryOutbox {
       )
       .get() as { cursorRowid: number; complete: number };
     if (control.complete) {
-      return { visited: 0, enqueued: 0, dead: 0, skippedUploaded: 0, complete: true, paused: null };
+      return { visited: 0, enqueued: 0, dead: lineageDead, skippedUploaded: 0, quarantinedEvidence: 0, complete: true, paused: null };
     }
 
-    const maxRows = Math.max(1, Math.min(Math.trunc(options.maxRows ?? this.limits.migrationBatchRows), 5_000));
     const maxBytes = Math.max(1, Math.trunc(options.maxBytes ?? this.limits.migrationBatchBytes));
     const rows = this.db
       .prepare(
         `select rowid as rawRowid, id as rawId, created_at as createdAt,
-           uploaded_at as uploadedAt, workspace_id as workspaceId,
+           data_mode as dataMode, uploaded_at as uploadedAt,
+           workspace_id as workspaceId,
            length(cast(payload_json as blob)) +
              length(cast(suppressed_fields_json as blob)) as rowBytes
          from buffered_events
@@ -615,41 +755,80 @@ export class DeliveryOutbox {
     let visited = 0;
     let bytes = 0;
     let enqueued = 0;
-    let dead = 0;
+    let dead = lineageDead;
     let skippedUploaded = 0;
+    let quarantinedEvidence = 0;
     let cursor = control.cursorRowid;
     let paused: "slice_budget_too_small" | null = null;
     const readRaw = this.db.prepare(
       `select rowid as rawRowid, id as rawId, created_at as createdAt,
+         data_mode as dataMode,
          uploaded_at as uploadedAt, payload_json as payloadJson,
          suppressed_fields_json as suppressedFieldsJson,
          repo_hash as repoHash, branch_hash as branchHash,
-         workspace_id as workspaceId
+         workspace_id as workspaceId,
+         privacy_generation as privacyGeneration,
+         privacy_disposition as privacyDisposition,
+         length(cast(payload_json as blob)) +
+           length(cast(suppressed_fields_json as blob)) as rowBytes
        from buffered_events where rowid = ?`,
+    );
+    const assignLegacyGeneration = this.db.prepare(
+      `update buffered_events set privacy_generation = @privacyGeneration
+       where rowid = @rawRowid and privacy_generation is null`,
     );
     const run = this.db.transaction(() => {
       for (const candidate of rows) {
-        const rowBytes = candidate.rowBytes ?? 0;
         visited += 1;
         cursor = candidate.rawRowid;
-        if (this.workspaceId !== null && candidate.workspaceId !== this.workspaceId) {
+        assignLegacyGeneration.run({
+          rawRowid: candidate.rawRowid,
+          privacyGeneration: crypto.randomUUID(),
+        });
+        const row = readRaw.get(candidate.rawRowid) as
+          | (RawDeliveryRow & { rowBytes: number })
+          | undefined;
+        if (!row) continue;
+        const rowBytes = row.rowBytes ?? 0;
+        if (this.workspaceId !== null && row.workspaceId !== this.workspaceId) {
           continue;
         }
-        if (candidate.uploadedAt) {
+        if (row.uploadedAt) {
           skippedUploaded += 1;
           continue;
         }
+        if (row.dataMode === "evidence") {
+          quarantinedEvidence += 1;
+          // A stale build may already have cached one or more envelopes for
+          // this row under different delivery ids. Retire a bounded indexed
+          // slice in the same transaction; any remainder is independently
+          // rejected by the lease boundary's raw-row point lookup.
+          dead += this.quarantineLinkedEvidence(
+            row.rawRowid,
+            nowIso,
+          );
+          dead += this.writeReceipt({
+            deliveryId: ensureUuidEventId(row.rawId).id,
+            state: "dead",
+            reason: "local_evidence_quarantined",
+            attemptCount: 0,
+            createdAt: row.createdAt,
+            terminalAt: nowIso,
+          });
+          continue;
+        }
+        if (row.privacyDisposition) continue;
         // A pre-outbox legacy row can be arbitrarily large. Classify a row
         // already above the item ceiling from its SQLite length metadata;
         // never materialize it into the migration process merely to reject it.
         if (rowBytes > this.limits.maxItemBytes) {
           dead += this.writeReceipt({
-            deliveryId: ensureUuidEventId(candidate.rawId).id,
+            deliveryId: ensureUuidEventId(row.rawId).id,
             state: "dead",
             reason: "local_item_oversize",
             attemptCount: 0,
-            createdAt: candidate.createdAt,
-            terminalAt: now.toISOString(),
+            createdAt: row.createdAt,
+            terminalAt: nowIso,
           });
           continue;
         }
@@ -668,8 +847,6 @@ export class DeliveryOutbox {
           cursor = candidate.rawRowid - 1;
           break;
         }
-        const row = readRaw.get(candidate.rawRowid) as RawDeliveryRow | undefined;
-        if (!row) continue;
         bytes += rowBytes;
         const result = this.enqueueRaw(row);
         enqueued += result.enqueued;
@@ -700,12 +877,12 @@ export class DeliveryOutbox {
           dead,
           skippedUploaded,
           paused,
-          now: now.toISOString(),
+          now: nowIso,
         });
       return complete;
     });
     const complete = run();
-    return { visited, bytes, enqueued, dead, skippedUploaded, complete, paused };
+    return { visited, bytes, enqueued, dead, skippedUploaded, quarantinedEvidence, complete, paused };
   }
 
   lease(options: { maxRows?: number; maxBytes?: number; now?: Date; leaseId?: string } = {}): DeliveryLease {
@@ -742,6 +919,8 @@ export class DeliveryOutbox {
       const candidates = this.db
         .prepare(
           `select delivery_id as deliveryId, raw_rowid as rawRowid,
+             raw_id as rawId, raw_created_at as rawCreatedAt,
+             raw_generation as rawGeneration,
              base_envelope_json as baseEnvelopeJson,
              sealed_envelope_json as sealedEnvelopeJson,
              repo_hash as repoHash, branch_hash as branchHash,
@@ -763,6 +942,11 @@ export class DeliveryOutbox {
         .all({ now: nowIso, workspaceId: this.workspaceId, maxRows }) as ActiveDeliveryRow[];
 
       for (const row of candidates) {
+        const authoritativeReason = this.authoritativePrivacyReason(row);
+        if (authoritativeReason) {
+          locallyDead += this.deadActive(row.deliveryId, authoritativeReason, nowIso);
+          continue;
+        }
         let envelopeJson = row.sealedEnvelopeJson;
         if (!envelopeJson) {
           let parsed: AiWorkIngestEvent;
@@ -770,6 +954,14 @@ export class DeliveryOutbox {
             parsed = aiWorkIngestEventSchema.parse(JSON.parse(row.baseEnvelopeJson));
           } catch {
             locallyDead += this.deadActive(row.deliveryId, "local_schema_invalid", nowIso);
+            continue;
+          }
+          if (parsed.event.dataMode === "evidence") {
+            locallyDead += this.deadActive(
+              row.deliveryId,
+              "local_evidence_quarantined",
+              nowIso,
+            );
             continue;
           }
           const sealed = sealOutboundEnvelope(
@@ -801,6 +993,28 @@ export class DeliveryOutbox {
             )
             .run({ deliveryId: row.deliveryId, envelopeJson, envelopeBytes, now: nowIso });
         }
+        // Older builds may already have sealed an evidence-marked item. The
+        // sealed copy is not trusted merely because it predates this gate.
+        let outboundEnvelope: AiWorkIngestEvent;
+        try {
+          outboundEnvelope = aiWorkIngestEventSchema.parse(JSON.parse(envelopeJson));
+        } catch {
+          locallyDead += this.deadActive(row.deliveryId, "local_schema_invalid", nowIso);
+          continue;
+        }
+        if (outboundEnvelope.event.dataMode === "evidence") {
+          locallyDead += this.deadActive(
+            row.deliveryId,
+            "local_evidence_quarantined",
+            nowIso,
+          );
+          continue;
+        }
+        const revalidated = sealOutboundEnvelope(outboundEnvelope);
+        if (!revalidated.ok || JSON.stringify(revalidated.envelope) !== envelopeJson) {
+          locallyDead += this.deadActive(row.deliveryId, "local_privacy_violation", nowIso);
+          continue;
+        }
         const envelopeBytes = Buffer.byteLength(envelopeJson);
         const addedBytes = envelopeBytes + (items.length > 0 ? 1 : 0);
         if (items.length > 0 && selectedBytes + addedBytes > maxBytes) break;
@@ -824,13 +1038,51 @@ export class DeliveryOutbox {
           deliveryId: row.deliveryId,
           rawRowid: row.rawRowid,
           envelopeJson,
-          envelope: JSON.parse(envelopeJson) as AiWorkIngestEvent,
+          envelope: outboundEnvelope,
           attemptCount,
         });
       }
     });
     run();
     return { leaseId, items, locallyDead, blockedBy: "none" };
+  }
+
+  /**
+   * Re-check a bounded leased batch immediately before request serialization.
+   * The raw row and terminal receipt are authoritative over the cached item.
+   * Invalid items are made terminal in the same SQLite transaction and never
+   * returned to the caller.
+   */
+  revalidateLeaseItems(leaseId: string, items: LeasedDeliveryItem[], at = new Date()) {
+    if (items.length > 500) throw new Error("Delivery revalidation is bounded to 500 items.");
+    const terminalAt = at.toISOString();
+    const getActive = this.db.prepare(
+      `select delivery_id as deliveryId, raw_rowid as rawRowid,
+         raw_id as rawId, raw_created_at as rawCreatedAt,
+         raw_generation as rawGeneration
+       from upload_outbox
+       where delivery_id = ? and state = 'in_flight' and lease_id = ?`,
+    );
+    return this.db.transaction(() => {
+      const deliverable: LeasedDeliveryItem[] = [];
+      let locallyDead = 0;
+      for (const item of items) {
+        const active = getActive.get(item.deliveryId, leaseId) as
+          | RawLineageSnapshot
+          | undefined;
+        if (!active) continue;
+        const reason =
+          active.rawRowid !== item.rawRowid
+            ? "local_privacy_violation"
+            : this.authoritativePrivacyReason(active);
+        if (reason) {
+          locallyDead += this.deadActive(item.deliveryId, reason, terminalAt);
+          continue;
+        }
+        deliverable.push(item);
+      }
+      return { items: deliverable, locallyDead };
+    })();
   }
 
   validationLeaseRows(requestedRows: number) {
@@ -878,23 +1130,48 @@ export class DeliveryOutbox {
     validationWitness?: { contractHash: string; item: LeasedDeliveryItem },
   ) {
     const terminalAt = at.toISOString();
+    const privacyEligible = terminalPrivacyEligibilitySql(this.db, "buffered_events");
     const get = this.db.prepare(
-      `select raw_rowid as rawRowid, attempt_count as attemptCount, created_at as createdAt
+      `select delivery_id as deliveryId, raw_rowid as rawRowid,
+         raw_id as rawId, raw_created_at as rawCreatedAt,
+         raw_generation as rawGeneration,
+         attempt_count as attemptCount, created_at as createdAt
        from upload_outbox where delivery_id = ? and state = 'in_flight' and lease_id = ?`,
     );
     const markRaw = this.db.prepare(
-      `update buffered_events set uploaded_at = ? where rowid = ? and uploaded_at is null`,
+      `update buffered_events set uploaded_at = @terminalAt
+       where rowid = @rawRowid and id = @rawId and created_at = @rawCreatedAt
+         and privacy_generation = @rawGeneration and uploaded_at is null
+         and ${privacyEligible}`,
     );
     const remove = this.db.prepare(`delete from upload_outbox where delivery_id = ? and lease_id = ?`);
     const run = this.db.transaction(() => {
       let acknowledged = 0;
       let markedUploaded = 0;
+      let locallyDead = 0;
+      const acknowledgedIds: string[] = [];
       for (const id of ids) {
         const row = get.get(id, leaseId) as
-          | { rawRowid: number | null; attemptCount: number; createdAt: string }
+          | (RawLineageSnapshot & { attemptCount: number; createdAt: string })
           | undefined;
         if (!row) continue;
-        acknowledged += this.writeReceipt({
+        const authoritativeReason = this.authoritativePrivacyReason(row);
+        if (authoritativeReason) {
+          locallyDead += this.deadActive(id, authoritativeReason, terminalAt);
+          continue;
+        }
+        const marked = markRaw.run({
+          terminalAt,
+          rawRowid: row.rawRowid,
+          rawId: row.rawId,
+          rawCreatedAt: row.rawCreatedAt,
+          rawGeneration: row.rawGeneration,
+        }).changes;
+        if (marked !== 1) {
+          locallyDead += this.deadActive(id, "local_privacy_violation", terminalAt);
+          continue;
+        }
+        const written = this.writeReceipt({
           deliveryId: id,
           state: "acknowledged",
           reason: "remote_acknowledged",
@@ -902,14 +1179,16 @@ export class DeliveryOutbox {
           createdAt: row.createdAt,
           terminalAt,
         });
-        if (row.rawRowid !== null) markedUploaded += markRaw.run(terminalAt, row.rawRowid).changes;
+        acknowledged += written;
+        if (written > 0) acknowledgedIds.push(id);
+        markedUploaded += marked;
         remove.run(id, leaseId);
       }
-      if (validationWitness && ids.includes(validationWitness.item.deliveryId)) {
+      if (validationWitness && acknowledgedIds.includes(validationWitness.item.deliveryId)) {
         this.writeValidationWitness(validationWitness.contractHash, validationWitness.item, terminalAt);
       }
       this.clearValidationProbeIfEmpty(terminalAt);
-      return { acknowledged, markedUploaded };
+      return { acknowledged, acknowledgedIds, markedUploaded, locallyDead };
     });
     return run();
   }
@@ -1237,17 +1516,29 @@ export class DeliveryOutbox {
         receiptRowsScanned: 0,
         rawRowsScanned: 0,
       },
+      privacy: {
+        mode: "metadata_only",
+        evidenceVault: "not_implemented",
+        legacyEvidenceDisposition: "local_quarantine_migration_required",
+        liveLedgerInspection: "not_performed",
+      },
     };
   }
 
   private deadActive(deliveryId: string, reason: DeliveryReceiptReason, terminalAt: string) {
     const row = this.db
       .prepare(
-        `select attempt_count as attemptCount, created_at as createdAt
+        `select raw_rowid as rawRowid, attempt_count as attemptCount,
+           created_at as createdAt
          from upload_outbox where delivery_id = ?`,
       )
-      .get(deliveryId) as { attemptCount: number; createdAt: string } | undefined;
+      .get(deliveryId) as
+        | { rawRowid: number | null; attemptCount: number; createdAt: string }
+        | undefined;
     if (!row) return 0;
+    if (row.rawRowid !== null && isTerminalPrivacyReason(reason)) {
+      markRawPrivacyDisposition(this.db, row.rawRowid, reason, terminalAt);
+    }
     const written = this.writeReceipt({
       deliveryId,
       state: "dead",
@@ -1259,6 +1550,96 @@ export class DeliveryOutbox {
     this.db.prepare(`delete from upload_outbox where delivery_id = ?`).run(deliveryId);
     this.clearValidationProbeIfEmpty(terminalAt);
     return written;
+  }
+
+  private authoritativePrivacyReason(
+    lineage: RawLineageSnapshot,
+  ): DeliveryReceiptReason | null {
+    const receipt = this.db
+      .prepare(`select reason from upload_receipts where delivery_id = ?`)
+      .get(lineage.deliveryId) as { reason: string } | undefined;
+    if (receipt) {
+      return receipt.reason === "local_evidence_quarantined"
+        ? "local_evidence_quarantined"
+        : "local_privacy_violation";
+    }
+    if (lineage.rawRowid === null) return "local_privacy_violation";
+    const raw = this.db
+      .prepare(
+        `select id as rawId, created_at as createdAt,
+           privacy_generation as privacyGeneration,
+           privacy_disposition as privacyDisposition,
+           data_mode as dataMode, uploaded_at as uploadedAt
+         from buffered_events where rowid = ?`,
+      )
+      .get(lineage.rawRowid) as RawPrivacyRow | undefined;
+    if (!raw || raw.uploadedAt !== null) return "local_privacy_violation";
+    if (raw.privacyDisposition) return raw.privacyDisposition;
+    if (raw.dataMode === "evidence") return "local_evidence_quarantined";
+    if (raw.dataMode !== "metadata") return "local_privacy_violation";
+    if (
+      lineage.rawId === null ||
+      lineage.rawCreatedAt === null ||
+      lineage.rawGeneration === null
+    ) {
+      return "local_privacy_violation";
+    }
+    if (
+      raw.privacyGeneration === null ||
+      raw.rawId !== lineage.rawId ||
+      raw.createdAt !== lineage.rawCreatedAt ||
+      raw.privacyGeneration !== lineage.rawGeneration ||
+      ensureUuidEventId(raw.rawId).id !== lineage.deliveryId
+    ) {
+      return "local_privacy_violation";
+    }
+    return null;
+  }
+
+  private quarantineLinkedEvidence(rawRowid: number, terminalAt: string) {
+    markRawPrivacyDisposition(
+      this.db,
+      rawRowid,
+      "local_evidence_quarantined",
+      terminalAt,
+    );
+    const rows = this.db
+      .prepare(
+        `select delivery_id as deliveryId
+         from upload_outbox
+         where raw_rowid = ?
+         order by delivery_id
+         limit 500`,
+      )
+      .all(rawRowid) as Array<{ deliveryId: string }>;
+    let dead = 0;
+    for (const row of rows) {
+      dead += this.deadActive(row.deliveryId, "local_evidence_quarantined", terminalAt);
+    }
+    return dead;
+  }
+
+  private quarantineUnprovenLineage(maxRows: number, terminalAt: string) {
+    const rows = this.db
+      .prepare(
+        `select delivery_id as deliveryId, raw_rowid as rawRowid,
+           raw_id as rawId, raw_created_at as rawCreatedAt,
+           raw_generation as rawGeneration
+         from upload_outbox indexed by idx_upload_outbox_raw_generation
+         where raw_generation is null
+         order by raw_generation, created_at, delivery_id
+         limit ?`,
+      )
+      .all(maxRows) as RawLineageSnapshot[];
+    let dead = 0;
+    for (const row of rows) {
+      dead += this.deadActive(
+        row.deliveryId,
+        this.authoritativePrivacyReason(row) ?? "local_privacy_violation",
+        terminalAt,
+      );
+    }
+    return dead;
   }
 
   private clearValidationProbeIfEmpty(nowIso: string) {

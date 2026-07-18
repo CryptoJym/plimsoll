@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 
 import Database from "better-sqlite3";
 
-import { collectorBufferPath } from "./config";
+import { assertCollectorPrivacyMode, collectorBufferPath } from "./config";
 import type { CollectorConfig } from "./config";
 import { canonicalLinkage } from "./outbound-envelope";
 import {
@@ -245,6 +245,9 @@ export async function pushRepoLabels(
     log?: (line: string) => void;
   } = {},
 ): Promise<{ pushed: number; created: number; updated: number; batches: number }> {
+  assertCollectorPrivacyMode(config, "repo label upload", {
+    willEnableUpload: Boolean(options.url),
+  });
   const log = options.log ?? ((line: string) => console.log(line));
   const fetchImpl = options.fetchImpl ?? fetch;
 

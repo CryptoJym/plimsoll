@@ -120,10 +120,21 @@ These are **hashed** before storage: emails, user/account IDs, file paths, worki
 
 These are stored plain: timestamps, event types, tool *names*, action classes, models, token counts, costs, durations, session IDs, commit shas.
 
+Managed or upload-enabled installs are locked to the literal
+`metadata_only` privacy mode. Attempts to enable raw evidence through the
+environment, collector config, CLI config generation, setup, join, or start
+fail before the collector/config write; there is no silent downgrade. Existing
+legacy rows marked `evidence` stay local and are excluded from both ordinary
+sync and `upload-history`, which report
+`local_quarantine_migration_required`. Plimsoll does not scan, migrate, or
+delete those rows automatically. An encrypted evidence vault is **not
+implemented**.
+
 The suppression engine is [`packages/shared/src/policy.ts`](packages/shared/src/policy.ts) and the forbidden-field list is [`packages/shared/src/schemas.ts`](packages/shared/src/schemas.ts). The signal-fidelity proof plants sentinel commands, paths, and prompts and fails if any survive to disk:
 
 ```bash
 pnpm proof   # 14 checks, writes evidence to evidence/
+pnpm proof:privacy-mode # managed-mode, legacy quarantine, temp-home surface proof
 ```
 
 ## The audit story (why this exists in this shape)

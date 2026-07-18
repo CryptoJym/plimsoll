@@ -3,8 +3,9 @@ import crypto from "node:crypto";
 import Database from "better-sqlite3";
 
 import type { CollectorConfig } from "./config";
-import { collectorBufferPath } from "./config";
+import { assertCollectorPrivacyMode, collectorBufferPath } from "./config";
 import { canonicalCommitSha, canonicalLinkage } from "./outbound-envelope";
+import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import { ensureUuidSessionId } from "./session-sync";
 import {
   findForbiddenRawContentFields,
@@ -74,6 +75,7 @@ export function collectSessionLinks(
   ledger: Database.Database,
   options: { since: string; until: string },
 ): LedgerSessionLink[] {
+  const privacyEligible = terminalPrivacyEligibilitySql(ledger, "buffered_events");
   return ledger
     .prepare(
       `select
@@ -84,6 +86,7 @@ export function collectSessionLinks(
          group_concat(distinct head_sha) as headShas
        from buffered_events
        where session_id is not null
+         and ${privacyEligible}
          and observed_at >= @since
          and created_at <= @until
        group by session_id
@@ -606,6 +609,9 @@ export async function runOutcomesSync(
   config: CollectorConfig,
   options: OutcomesSyncOptions,
 ): Promise<OutcomesSyncResult> {
+  assertCollectorPrivacyMode(config, "outcomes sync", {
+    willEnableUpload: Boolean(options.url),
+  });
   const log = options.log ?? ((line: string) => console.log(line));
   const fetchImpl = options.fetchImpl ?? fetch;
   const startedAt = Date.now();

@@ -55,6 +55,9 @@ jobs:
       - name: Prove suppression receipt capture-to-upload parity
         run: pnpm proof:outbox
 
+      - name: Prove managed metadata-only privacy mode
+        run: pnpm proof:privacy-mode --receipt evidence/privacy-mode-proof.json
+
       - name: Prove transactional join and workspace isolation
         run: pnpm proof:join-isolation
 
