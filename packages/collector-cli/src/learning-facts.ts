@@ -1,20 +1,20 @@
-import crypto from "node:crypto";
-
 import type Database from "better-sqlite3";
 
 import {
   aiInteractionEventSchema,
+  deriveTechniqueExposureId,
+  deterministicLearningFactId,
   techniqueExposureFactSchema,
   techniqueExposureInputSchema,
   toolAttemptFactSchema,
   toolAttemptResultSignalSchema,
   toolAttemptStartSignalSchema,
   toolSourceSchema,
+  validateTechniqueExposureFactIdentity,
   workEpisodeFactSchema,
   type ActionClass,
   type AiInteractionEvent,
   type TechniqueExposureFact,
-  type TechniqueExposureInput,
   type ToolAttemptErrorCategory,
   type ToolAttemptFact,
   type ToolAttemptResultStatus,
@@ -26,6 +26,8 @@ import {
   type WorkClass,
   type WorkEpisodeFact,
 } from "../../shared/src/index";
+
+export { deterministicLearningFactId } from "../../shared/src/index";
 
 export type LearningFactLimits = {
   attempts: number;
@@ -42,24 +44,6 @@ export const DEFAULT_LEARNING_FACT_LIMITS: LearningFactLimits = {
 };
 
 const MAX_SOURCE_OPERATION_KEY_BYTES = 1_024;
-
-function uuidV5Shape(digest: string) {
-  return [
-    digest.slice(0, 8),
-    digest.slice(8, 12),
-    `5${digest.slice(13, 16)}`,
-    `9${digest.slice(17, 20)}`,
-    digest.slice(20, 32),
-  ].join("-");
-}
-
-/** Hash length-prefixed parts so raw producer IDs never enter promoted facts. */
-export function deterministicLearningFactId(parts: readonly string[]) {
-  const framed = parts
-    .map((part) => `${Buffer.byteLength(part, "utf8")}:${part}`)
-    .join("|");
-  return uuidV5Shape(crypto.createHash("sha256").update(framed).digest("hex"));
-}
 
 function boundedDimensionId(value: string, name: string) {
   const trimmed = value.trim();
@@ -219,25 +203,12 @@ export function buildTechniqueExposureFact(input: {
   mode: "control" | "treatment";
 }): TechniqueExposureFact {
   const canonical = techniqueExposureInputSchema.parse(input);
-  const exposureId = derivedTechniqueExposureId(canonical);
+  const exposureId = deriveTechniqueExposureId(canonical);
   return techniqueExposureFactSchema.parse({
     ...canonical,
     exposureId,
     assertion: "exposure_only",
   });
-}
-
-function derivedTechniqueExposureId(canonical: TechniqueExposureInput) {
-  return deterministicLearningFactId([
-    "technique-exposure-v1",
-    canonical.episodeId,
-    canonical.techniqueId,
-    canonical.techniqueVersion ?? "",
-    canonical.contentDigest ?? "",
-    canonical.assignmentId,
-    canonical.exposedAt,
-    canonical.mode,
-  ]);
 }
 
 function validateLimits(input: Partial<LearningFactLimits>): LearningFactLimits {
@@ -603,10 +574,7 @@ export class LearningFactStore {
     input: unknown,
     options: { outcomeObservedAt?: string } = {},
   ): { inserted: boolean; fact: TechniqueExposureFact } {
-    const fact = techniqueExposureFactSchema.parse(input);
-    if (fact.exposureId !== derivedTechniqueExposureId(fact)) {
-      throw new Error("TechniqueExposureDerivedIdMismatch");
-    }
+    const fact = validateTechniqueExposureFactIdentity(input);
     return this.db.transaction(() => {
       if (options.outcomeObservedAt !== undefined) {
         const outcomeMs = Date.parse(options.outcomeObservedAt);

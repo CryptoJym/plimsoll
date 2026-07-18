@@ -23,3 +23,12 @@ Open schemas/export for own-data evidence packets plus hosted comparative/prescr
 ## Operational Boundaries
 - Local/open layer stays descriptive about the operator's own data; organization comparisons and prescriptions live in the hosted product.
 - No individual ranking below policy thresholds; no composite developer score.
+
+## Local/open implementation slice
+
+The bounded own-data compiler is documented in
+`docs/learning-evidence-packets.md`. It supplies a versioned runtime schema,
+deterministic fingerprint/no-op behavior, paired observational association
+packet, and review-artifact-only skill lifecycle. It does not satisfy the
+hosted comparison, durable skill proposal, pilot, publication, or monitoring
+scope, so this parent issue remains open.
