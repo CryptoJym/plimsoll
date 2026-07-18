@@ -60,7 +60,10 @@ neither is simulated or reported complete by local uninstall or purge.
 
 The support bundle is reconstructed from an allowlist: package/runtime
 versions, coarse health, four nonnegative counters, and at most 32 aggregate
-log codes. It does not copy log text or unknown adapter fields. Absolute paths,
+log codes. Each returned object and log row is newly constructed from exact own
+scalar data fields; unknown, inherited, accessor, nested, case-alias, and
+Unicode-alias fields are stripped without invoking getters. It does not copy
+log text or adapter objects. Absolute paths,
 prompts/responses/tool content, repository or account identifiers, cookies,
 tokens, signing material, install credentials, and workspace credentials have
 no output field.

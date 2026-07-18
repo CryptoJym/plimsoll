@@ -81,6 +81,7 @@ function fixture(name: string) {
   let migrateOnActivate = false;
   let activations = 0;
   let removals = 0;
+  let supportGetterAccesses = 0;
   const service: LifecycleServiceAdapter = {
     async activate(input) {
       activations += 1;
@@ -110,27 +111,70 @@ function fixture(name: string) {
       } as LifecycleReadiness;
     },
     async supportSnapshot() {
-      return {
+      const acceptedRowWithUnknowns = {
+        source: "lifecycle",
+        severity: "warn",
+        code: "health.retry",
+        count: 2,
+        path: "/Users/row-path-sentinel",
+        nested: { credential: "nested-secret-sentinel" },
+        Content: "case-secret-sentinel",
+        "cοntent": "unicode-secret-sentinel",
+      };
+      Object.defineProperty(acceptedRowWithUnknowns, "content", {
+        enumerable: true,
+        get() {
+          supportGetterAccesses += 1;
+          return "getter-secret-sentinel";
+        },
+      });
+      const inheritedRow = Object.assign(
+        Object.create({ content: "prototype-secret-sentinel" }),
+        { source: "collector_stdout", severity: "info", code: "prototype.row", count: 1 },
+      );
+      const approvedGetterRow = { source: "collector_stdout", severity: "info", count: 1 };
+      Object.defineProperty(approvedGetterRow, "code", {
+        enumerable: true,
+        get() {
+          supportGetterAccesses += 1;
+          return "getter.code";
+        },
+      });
+      const readiness = await this.readiness(runtimeVersion ?? "missing") as LifecycleReadiness & Record<string, unknown>;
+      readiness.content = "readiness-content-sentinel";
+      readiness.nested = { path: "/Users/readiness-path-sentinel" };
+      const snapshot = {
         installedVersion: runtimeVersion,
         runtimeVersion,
         platform: "darwin",
         architecture: "arm64",
         nodeMajor: 22,
-        readiness: await this.readiness(runtimeVersion ?? "missing"),
+        readiness,
         counters: {
           activeDelivery: 7,
           deadDelivery: 2,
           tokenAttributedEvents: 99,
           maintenancePending: 1,
+          content: "counter-content-sentinel",
         },
         boundedLogs: [
-          { source: "lifecycle", severity: "warn", code: "health.retry", count: 2 },
+          acceptedRowWithUnknowns,
+          inheritedRow,
+          approvedGetterRow,
           { source: "collector_stderr", severity: "error", code: "/Users/private/secret", count: 1 },
         ],
         absolutePath: "/Users/private/secret",
         content: "prompt-sentinel",
         credential: "credential-sentinel",
-      } as LifecycleSupportSnapshot;
+      };
+      Object.defineProperty(snapshot, "unknownGetter", {
+        enumerable: true,
+        get() {
+          supportGetterAccesses += 1;
+          return "outer-getter-secret-sentinel";
+        },
+      });
+      return snapshot as unknown as LifecycleSupportSnapshot;
     },
   };
   const database: LifecycleDatabaseAdapter = {
@@ -167,6 +211,7 @@ function fixture(name: string) {
     get runtimeVersion() { return runtimeVersion; },
     get activations() { return activations; },
     get removals() { return removals; },
+    get supportGetterAccesses() { return supportGetterAccesses; },
     cleanup() { fs.rmSync(ownershipRoot, { recursive: true, force: true }); },
   };
 }
@@ -353,11 +398,56 @@ async function main() {
     await manager.update({ operationId: "support-install", artifact: support.artifact("0.6.0") });
     const output = await manager.supportBundle("support-bundle");
     const serialized = JSON.stringify(output);
-    check("support_bundle_is_allowlisted_and_excludes_paths_content_credentials", output.bundle.boundedLogs.length === 1 && !serialized.includes("/Users/") && !serialized.includes("prompt-sentinel") && !serialized.includes("credential-sentinel") && !serialized.includes(support.ownershipRoot), output.bundle);
+    const privateSentinels = [
+      "/Users/", "prompt-sentinel", "credential-sentinel", "row-path-sentinel",
+      "nested-secret-sentinel", "case-secret-sentinel", "unicode-secret-sentinel",
+      "prototype-secret-sentinel", "getter-secret-sentinel", "outer-getter-secret-sentinel",
+      "counter-content-sentinel", "readiness-content-sentinel", support.ownershipRoot,
+    ];
+    const roundTrip = JSON.parse(serialized) as typeof output;
+    const exactBundleKeys = Object.keys(roundTrip.bundle).sort().join(",") ===
+      ["architecture", "boundedLogs", "counters", "installedVersion", "nodeMajor", "platform", "readiness", "runtimeVersion"].sort().join(",");
+    const exactReadinessKeys = Object.keys(roundTrip.bundle.readiness).sort().join(",") ===
+      ["configCompatible", "databaseCompatible", "ready", "reason", "runtimeVersion", "serviceReady"].sort().join(",");
+    const exactCounterKeys = Object.keys(roundTrip.bundle.counters).sort().join(",") ===
+      ["activeDelivery", "deadDelivery", "maintenancePending", "tokenAttributedEvents"].sort().join(",");
+    const exactLogKeys = roundTrip.bundle.boundedLogs.every((row) =>
+      Object.keys(row).sort().join(",") === ["code", "count", "severity", "source"].sort().join(","));
+    const receiptPath = path.join(support.paths.lifecycleRoot, "receipts", "support-bundle-support_bundle.json");
+    const persistedReceipt = fs.readFileSync(receiptPath, "utf8");
+    const receiptRoundTrip = JSON.parse(persistedReceipt) as Record<string, unknown>;
+    const exactReceiptKeys = Object.keys(receiptRoundTrip).sort().join(",") ===
+      ["fromVersion", "health", "operation", "operationId", "ownedTargets", "preserved", "restoredVersion", "schemaVersion", "status", "toVersion", "toolVersion"].sort().join(",");
+    const exactReceiptHealthKeys = Boolean(receiptRoundTrip.health) &&
+      Object.keys(receiptRoundTrip.health as object).sort().join(",") ===
+        ["configCompatible", "databaseCompatible", "ready", "reason", "runtimeVersion", "serviceReady"].sort().join(",");
+    check(
+      "support_bundle_rebuilds_every_object_from_recursive_exact_allowlists",
+      roundTrip.bundle.boundedLogs.length === 1 &&
+        roundTrip.bundle.boundedLogs[0]?.code === "health.retry" &&
+        exactBundleKeys && exactReadinessKeys && exactCounterKeys && exactLogKeys &&
+        support.supportGetterAccesses === 0,
+      { bundle: roundTrip.bundle, getterAccesses: support.supportGetterAccesses },
+    );
+    check(
+      "support_json_roundtrip_and_persisted_receipt_exclude_all_private_aliases",
+      exactReceiptKeys && exactReceiptHealthKeys &&
+        privateSentinels.every((sentinel) => !serialized.includes(sentinel) && !persistedReceipt.includes(sentinel)),
+      { exactReceiptKeys, exactReceiptHealthKeys, serializedBytes: Buffer.byteLength(serialized), receiptBytes: Buffer.byteLength(persistedReceipt) },
+    );
     for (let index = 0; index < 40; index += 1) await manager.supportBundle(`bounded-${String(index).padStart(2, "0")}`);
     check("lifecycle_receipts_are_bounded_to_32", fs.readdirSync(path.join(support.paths.lifecycleRoot, "receipts")).filter((file) => file.endsWith(".json")).length === 32, fs.readdirSync(path.join(support.paths.lifecycleRoot, "receipts")).length);
-    const raw = await support.service.supportSnapshot();
-    const sanitized = sanitizeSupportSnapshot({ ...raw, counters: { ...raw.counters, activeDelivery: -1 }, boundedLogs: [...raw.boundedLogs, { source: "lifecycle", severity: "warn", code: "ok", count: Number.MAX_SAFE_INTEGER }] });
+    check("support_unknown_getters_are_never_invoked_across_repeated_bundles", support.supportGetterAccesses === 0, support.supportGetterAccesses);
+    const sanitized = sanitizeSupportSnapshot({
+      installedVersion: "0.6.0",
+      runtimeVersion: "0.6.0",
+      platform: "darwin",
+      architecture: "arm64",
+      nodeMajor: 22,
+      readiness: { ready: true, runtimeVersion: "0.6.0", serviceReady: true, configCompatible: true, databaseCompatible: true, reason: "ready" },
+      counters: { activeDelivery: -1, deadDelivery: 0, tokenAttributedEvents: 0, maintenancePending: 0 },
+      boundedLogs: [{ source: "lifecycle", severity: "warn", code: "ok", count: Number.MAX_SAFE_INTEGER }],
+    });
     check("support_counts_are_nonnegative_and_bounded", sanitized.counters.activeDelivery === 0 && sanitized.boundedLogs.at(-1)?.count === 1_000_000, sanitized);
   } finally {
     support.cleanup();

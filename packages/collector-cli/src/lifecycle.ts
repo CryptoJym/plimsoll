@@ -130,15 +130,45 @@ const READINESS_REASONS: LifecycleReadiness["reason"][] = [
   "ready", "runtime_mismatch", "service_unready", "config_incompatible", "database_incompatible",
 ];
 
-export function sanitizeLifecycleReadiness(readiness: LifecycleReadiness): LifecycleReadiness {
-  const safeVersion = (value: string | null) => value !== null && !value.includes("..") && /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(value) ? value : null;
+function ownPlainRecord(value: unknown): Record<string, unknown> | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  try {
+    const prototype = Object.getPrototypeOf(value);
+    if (prototype !== Object.prototype && prototype !== null) return null;
+    return value as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function ownDataValue(record: Record<string, unknown> | null, key: string): unknown {
+  if (!record) return undefined;
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(record, key);
+    return descriptor && "value" in descriptor ? descriptor.value : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function safeVersion(value: unknown) {
+  return typeof value === "string" && !value.includes("..") && /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(value)
+    ? value
+    : null;
+}
+
+export function sanitizeLifecycleReadiness(readiness: unknown): LifecycleReadiness {
+  const record = ownPlainRecord(readiness);
+  const reason = ownDataValue(record, "reason");
   return {
-    ready: Boolean(readiness.ready),
-    runtimeVersion: safeVersion(readiness.runtimeVersion),
-    serviceReady: Boolean(readiness.serviceReady),
-    configCompatible: Boolean(readiness.configCompatible),
-    databaseCompatible: Boolean(readiness.databaseCompatible),
-    reason: READINESS_REASONS.includes(readiness.reason) ? readiness.reason : "service_unready",
+    ready: ownDataValue(record, "ready") === true,
+    runtimeVersion: safeVersion(ownDataValue(record, "runtimeVersion")),
+    serviceReady: ownDataValue(record, "serviceReady") === true,
+    configCompatible: ownDataValue(record, "configCompatible") === true,
+    databaseCompatible: ownDataValue(record, "databaseCompatible") === true,
+    reason: READINESS_REASONS.includes(reason as LifecycleReadiness["reason"])
+      ? reason as LifecycleReadiness["reason"]
+      : "service_unready",
   };
 }
 
@@ -341,28 +371,60 @@ export class LifecycleManager {
 
 const SAFE_LOG_CODE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
-export function sanitizeSupportSnapshot(snapshot: LifecycleSupportSnapshot): LifecycleSupportSnapshot {
+export function sanitizeSupportSnapshot(snapshot: unknown): LifecycleSupportSnapshot {
+  const record = ownPlainRecord(snapshot);
   const nonnegative = (value: number) => Number.isSafeInteger(value) && value >= 0 ? value : 0;
-  const boundedLogs = snapshot.boundedLogs.slice(0, 32).flatMap((row) => {
-    if (!SAFE_LOG_CODE.test(row.code)) return [];
-    if (!["collector_stdout", "collector_stderr", "lifecycle"].includes(row.source)) return [];
-    if (!["info", "warn", "error"].includes(row.severity)) return [];
-    return [{ ...row, count: Math.min(nonnegative(row.count), 1_000_000) }];
-  });
-  const safeVersion = (value: string | null) => value !== null && !value.includes("..") && /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/.test(value) ? value : null;
-  const safeReadiness = sanitizeLifecycleReadiness(snapshot.readiness);
+  const logsCandidate = ownDataValue(record, "boundedLogs");
+  const boundedLogs: Array<LifecycleSupportSnapshot["boundedLogs"][number]> = [];
+  let logsArray: unknown[] | null = null;
+  if (Array.isArray(logsCandidate)) {
+    try {
+      logsArray = Object.getPrototypeOf(logsCandidate) === Array.prototype ? logsCandidate : null;
+    } catch {
+      logsArray = null;
+    }
+  }
+  if (logsArray) {
+    const lengthDescriptor = Object.getOwnPropertyDescriptor(logsArray, "length");
+    const rawLength = lengthDescriptor && "value" in lengthDescriptor ? lengthDescriptor.value : 0;
+    const length = Number.isSafeInteger(rawLength) ? Math.min(Math.max(rawLength as number, 0), 32) : 0;
+    for (let index = 0; index < length; index += 1) {
+      const itemDescriptor = Object.getOwnPropertyDescriptor(logsArray, String(index));
+      if (!itemDescriptor || !("value" in itemDescriptor)) continue;
+      const row = ownPlainRecord(itemDescriptor.value);
+      const source = ownDataValue(row, "source");
+      const severity = ownDataValue(row, "severity");
+      const code = ownDataValue(row, "code");
+      const count = ownDataValue(row, "count");
+      if (typeof code !== "string" || !SAFE_LOG_CODE.test(code)) continue;
+      if (source !== "collector_stdout" && source !== "collector_stderr" && source !== "lifecycle") continue;
+      if (severity !== "info" && severity !== "warn" && severity !== "error") continue;
+      // Rebuild from approved scalar fields. Unknown own, prototype,
+      // accessor, nested, case-alias, and Unicode-alias keys have no output.
+      boundedLogs.push({
+        source,
+        severity,
+        code,
+        count: Math.min(nonnegative(typeof count === "number" ? count : 0), 1_000_000),
+      });
+    }
+  }
+  const counters = ownPlainRecord(ownDataValue(record, "counters"));
+  const safeReadiness = sanitizeLifecycleReadiness(ownDataValue(record, "readiness"));
+  const architecture = ownDataValue(record, "architecture");
+  const nodeMajor = ownDataValue(record, "nodeMajor");
   return {
-    installedVersion: safeVersion(snapshot.installedVersion),
-    runtimeVersion: safeVersion(snapshot.runtimeVersion),
-    platform: snapshot.platform === "darwin" ? "darwin" : "unsupported",
-    architecture: snapshot.architecture === "arm64" || snapshot.architecture === "x64" ? snapshot.architecture : "unsupported",
-    nodeMajor: Number.isInteger(snapshot.nodeMajor) ? snapshot.nodeMajor : 0,
+    installedVersion: safeVersion(ownDataValue(record, "installedVersion")),
+    runtimeVersion: safeVersion(ownDataValue(record, "runtimeVersion")),
+    platform: ownDataValue(record, "platform") === "darwin" ? "darwin" : "unsupported",
+    architecture: architecture === "arm64" || architecture === "x64" ? architecture : "unsupported",
+    nodeMajor: typeof nodeMajor === "number" && Number.isInteger(nodeMajor) ? nodeMajor : 0,
     readiness: safeReadiness,
     counters: {
-      activeDelivery: nonnegative(snapshot.counters.activeDelivery),
-      deadDelivery: nonnegative(snapshot.counters.deadDelivery),
-      tokenAttributedEvents: nonnegative(snapshot.counters.tokenAttributedEvents),
-      maintenancePending: nonnegative(snapshot.counters.maintenancePending),
+      activeDelivery: nonnegative(typeof ownDataValue(counters, "activeDelivery") === "number" ? ownDataValue(counters, "activeDelivery") as number : 0),
+      deadDelivery: nonnegative(typeof ownDataValue(counters, "deadDelivery") === "number" ? ownDataValue(counters, "deadDelivery") as number : 0),
+      tokenAttributedEvents: nonnegative(typeof ownDataValue(counters, "tokenAttributedEvents") === "number" ? ownDataValue(counters, "tokenAttributedEvents") as number : 0),
+      maintenancePending: nonnegative(typeof ownDataValue(counters, "maintenancePending") === "number" ? ownDataValue(counters, "maintenancePending") as number : 0),
     },
     boundedLogs,
   };
