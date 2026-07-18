@@ -36,9 +36,10 @@ export async function runLifecycleCommand(input: {
     return { receipt, boundary: lifecycleBoundaryStatement() };
   }
   if (action === "purge") {
+    const apply = input.argv.includes("--apply");
     const confirmation = option(input.argv, "--confirm-exact") ?? "";
-    if (confirmation !== PURGE_CONFIRMATION) throw new Error("purge exact confirmation missing");
-    const receipt = await manager.purge({ operationId, confirmation });
+    if (apply && confirmation !== PURGE_CONFIRMATION) throw new Error("purge exact confirmation missing");
+    const receipt = await manager.purge({ operationId, apply, confirmation });
     return { receipt, boundary: lifecycleBoundaryStatement() };
   }
   if (action === "support-bundle") {

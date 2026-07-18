@@ -8,7 +8,14 @@ export const PURGE_CONFIRMATION = "PURGE PLIMSOLL LOCAL DATA" as const;
 
 export type SupportedArchitecture = "arm64" | "x64";
 export type LifecycleOperationKind = "update" | "rollback";
-export type LifecyclePhase = "prepared" | "snapshotted" | "staged" | "switched" | "verified";
+export type LifecyclePhase =
+  | "prepared"
+  | "snapshotted"
+  | "staged"
+  | "switched"
+  | "verified"
+  | "rollback_required"
+  | "rollback_complete";
 
 export type RuntimeArtifact = {
   version: string;
@@ -43,7 +50,7 @@ export type LifecycleReceipt = {
   toolVersion: string;
   operationId: string;
   operation: LifecycleOperationKind | "uninstall" | "purge" | "support_bundle";
-  status: "completed" | "rolled_back" | "preview" | "purged" | "generated";
+  status: "completed" | "rolled_back" | "rollback_required" | "preview" | "purged" | "generated";
   fromVersion: string | null;
   toVersion: string | null;
   restoredVersion: string | null;
@@ -79,15 +86,16 @@ export type LifecycleAdapter = {
   readJournal(): Promise<LifecycleJournal | null>;
   writeJournal(journal: LifecycleJournal): Promise<void>;
   clearJournal(operationId: string): Promise<void>;
+  operationIdExists(operationId: string): Promise<boolean>;
   installedVersion(): Promise<string | null>;
   snapshot(operationId: string): Promise<string>;
   stage(artifact: RuntimeArtifact): Promise<void>;
   switchTo(artifact: RuntimeArtifact): Promise<void>;
-  readiness(expectedVersion: string): Promise<LifecycleReadiness>;
+  readiness(expectedVersion: string, input: { signal: AbortSignal; deadlineMs: number }): Promise<LifecycleReadiness>;
   restore(snapshotId: string): Promise<void>;
   persistReceipt(receipt: LifecycleReceipt): Promise<void>;
   uninstallOwned(input: { apply: boolean }): Promise<readonly string[]>;
-  purgeOwnedData(input: { confirmation: string }): Promise<readonly string[]>;
+  purgeOwnedData(input: { apply: boolean; confirmation: string | null }): Promise<readonly string[]>;
   supportSnapshot(): Promise<LifecycleSupportSnapshot>;
 };
 
@@ -185,7 +193,85 @@ function assertReadiness(readiness: LifecycleReadiness, version: string) {
  * must inject those boundaries through LifecycleAdapter.
  */
 export class LifecycleManager {
-  constructor(private readonly adapter: LifecycleAdapter) {}
+  private readonly readinessTimeoutMs: number;
+
+  constructor(
+    private readonly adapter: LifecycleAdapter,
+    options: { readinessTimeoutMs?: number } = {},
+  ) {
+    const requested = options.readinessTimeoutMs ?? 10_000;
+    if (!Number.isSafeInteger(requested) || requested < 10 || requested > 60_000) {
+      throw new Error("readiness timeout must be between 10 and 60000 milliseconds");
+    }
+    this.readinessTimeoutMs = requested;
+  }
+
+  private async assertFreshOperation(operationId: string) {
+    if (await this.adapter.operationIdExists(operationId)) {
+      throw new Error("operationId was already completed; use a fresh operationId");
+    }
+  }
+
+  private async boundedReadiness(expectedVersion: string) {
+    const controller = new AbortController();
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new Error("readiness deadline exceeded"));
+      }, this.readinessTimeoutMs);
+    });
+    try {
+      const result = await Promise.race([
+        this.adapter.readiness(expectedVersion, {
+          signal: controller.signal,
+          deadlineMs: this.readinessTimeoutMs,
+        }),
+        deadline,
+      ]);
+      return sanitizeLifecycleReadiness(result);
+    } finally {
+      if (timer) clearTimeout(timer);
+      controller.abort();
+    }
+  }
+
+  private rollbackReceipt(journal: LifecycleJournal, status: "rolled_back" | "rollback_required"): LifecycleReceipt {
+    return {
+      schemaVersion: LIFECYCLE_SCHEMA_VERSION,
+      toolVersion: PLIMSOLL_VERSION,
+      operationId: journal.operationId,
+      operation: journal.kind,
+      status,
+      fromVersion: journal.fromVersion,
+      toVersion: journal.toVersion,
+      restoredVersion: status === "rolled_back" ? journal.fromVersion : null,
+      health: null,
+      ownedTargets: ["runtime", "config", "database", "service_manifest"],
+      preserved: ["ledger", "history", "credentials", "workspace_membership"],
+    };
+  }
+
+  private async finishRequiredRollback(journal: LifecycleJournal) {
+    if (journal.phase === "rollback_required") {
+      try {
+        await this.adapter.restore(journal.snapshotId);
+      } catch {
+        const blocked = this.rollbackReceipt(journal, "rollback_required");
+        await this.adapter.persistReceipt(blocked);
+        throw new Error("rollback required: restore failed; retry the same operationId");
+      }
+      journal.phase = "rollback_complete";
+      await this.adapter.writeJournal(journal);
+    }
+    if (journal.phase !== "rollback_complete") {
+      throw new Error("rollback recovery state is invalid");
+    }
+    const receipt = this.rollbackReceipt(journal, "rolled_back");
+    await this.adapter.persistReceipt(receipt);
+    await this.adapter.clearJournal(journal.operationId);
+    return receipt;
+  }
 
   async update(input: {
     operationId: string;
@@ -210,7 +296,11 @@ export class LifecycleManager {
           throw new Error("a different interrupted lifecycle operation requires recovery");
         }
         journal = existing;
+        if (journal.phase === "rollback_required" || journal.phase === "rollback_complete") {
+          return await this.finishRequiredRollback(journal);
+        }
       } else {
+        await this.assertFreshOperation(operationId);
         journal = {
           schemaVersion: LIFECYCLE_SCHEMA_VERSION,
           operationId,
@@ -238,7 +328,7 @@ export class LifecycleManager {
         journal.phase = "switched";
         await this.adapter.writeJournal(journal);
       }
-      const health = sanitizeLifecycleReadiness(await this.adapter.readiness(artifact.version));
+      const health = await this.boundedReadiness(artifact.version);
       assertReadiness(health, artifact.version);
       journal.phase = "verified";
       await this.adapter.writeJournal(journal);
@@ -261,23 +351,13 @@ export class LifecycleManager {
       return receipt;
     } catch (error) {
       if (error instanceof LifecycleInterruption) throw error;
+      if (journal?.phase === "rollback_required" || journal?.phase === "rollback_complete" || journal?.phase === "verified") {
+        throw error;
+      }
       if (journal && phaseAtLeast(journal.phase, "snapshotted")) {
-        await this.adapter.restore(journal.snapshotId);
-        const receipt: LifecycleReceipt = {
-          schemaVersion: LIFECYCLE_SCHEMA_VERSION,
-          toolVersion: PLIMSOLL_VERSION,
-          operationId,
-          operation: kind,
-          status: "rolled_back",
-          fromVersion: journal.fromVersion,
-          toVersion: artifact.version,
-          restoredVersion: journal.fromVersion,
-          health: null,
-          ownedTargets: ["runtime", "config", "database", "service_manifest"],
-          preserved: ["ledger", "history", "credentials", "workspace_membership"],
-        };
-        await this.adapter.persistReceipt(receipt);
-        await this.adapter.clearJournal(operationId);
+        journal.phase = "rollback_required";
+        await this.adapter.writeJournal(journal);
+        await this.finishRequiredRollback(journal);
       }
       throw error;
     } finally {
@@ -296,6 +376,8 @@ export class LifecycleManager {
       throw new Error("another lifecycle operation owns the lock");
     }
     try {
+      if (await this.adapter.readJournal()) throw new Error("lifecycle recovery is required before uninstall");
+      await this.assertFreshOperation(input.operationId);
       const fromVersion = await this.adapter.installedVersion();
       const ownedTargets = await this.adapter.uninstallOwned({ apply });
       const receipt: LifecycleReceipt = {
@@ -318,28 +400,36 @@ export class LifecycleManager {
     }
   }
 
-  async purge(input: { operationId: string; confirmation: string }): Promise<LifecycleReceipt> {
+  async purge(input: { operationId: string; apply?: boolean; confirmation?: string }): Promise<LifecycleReceipt> {
     assertBoundedIdentifier(input.operationId, "operationId");
-    if (input.confirmation !== PURGE_CONFIRMATION) {
+    const apply = input.apply === true;
+    if (apply && input.confirmation !== PURGE_CONFIRMATION) {
       throw new Error(`purge requires exact confirmation: ${PURGE_CONFIRMATION}`);
     }
     if (!(await this.adapter.acquireLock(input.operationId))) {
       throw new Error("another lifecycle operation owns the lock");
     }
     try {
-      const targets = await this.adapter.purgeOwnedData({ confirmation: input.confirmation });
+      if (await this.adapter.readJournal()) throw new Error("lifecycle recovery is required before purge");
+      await this.assertFreshOperation(input.operationId);
+      const targets = await this.adapter.purgeOwnedData({
+        apply,
+        confirmation: apply ? input.confirmation ?? null : null,
+      });
       const receipt: LifecycleReceipt = {
         schemaVersion: LIFECYCLE_SCHEMA_VERSION,
         toolVersion: PLIMSOLL_VERSION,
         operationId: input.operationId,
         operation: "purge",
-        status: "purged",
+        status: apply ? "purged" : "preview",
         fromVersion: await this.adapter.installedVersion(),
         toVersion: null,
         restoredVersion: null,
         health: null,
         ownedTargets: targets,
-        preserved: ["workspace_membership"],
+        preserved: apply
+          ? ["workspace_membership"]
+          : ["ledger", "history", "credentials", "workspace_membership"],
       };
       await this.adapter.persistReceipt(receipt);
       return receipt;
@@ -350,22 +440,31 @@ export class LifecycleManager {
 
   async supportBundle(operationId: string): Promise<{ receipt: LifecycleReceipt; bundle: LifecycleSupportSnapshot }> {
     assertBoundedIdentifier(operationId, "operationId");
-    const bundle = sanitizeSupportSnapshot(await this.adapter.supportSnapshot());
-    const receipt: LifecycleReceipt = {
-      schemaVersion: LIFECYCLE_SCHEMA_VERSION,
-      toolVersion: PLIMSOLL_VERSION,
-      operationId,
-      operation: "support_bundle",
-      status: "generated",
-      fromVersion: bundle.installedVersion,
-      toVersion: null,
-      restoredVersion: null,
-      health: bundle.readiness,
-      ownedTargets: ["support_bundle"],
-      preserved: ["ledger", "history", "credentials", "workspace_membership"],
-    };
-    await this.adapter.persistReceipt(receipt);
-    return { receipt, bundle };
+    if (!(await this.adapter.acquireLock(operationId))) {
+      throw new Error("another lifecycle operation owns the lock");
+    }
+    try {
+      if (await this.adapter.readJournal()) throw new Error("lifecycle recovery is required before support bundle");
+      await this.assertFreshOperation(operationId);
+      const bundle = sanitizeSupportSnapshot(await this.adapter.supportSnapshot());
+      const receipt: LifecycleReceipt = {
+        schemaVersion: LIFECYCLE_SCHEMA_VERSION,
+        toolVersion: PLIMSOLL_VERSION,
+        operationId,
+        operation: "support_bundle",
+        status: "generated",
+        fromVersion: bundle.installedVersion,
+        toVersion: null,
+        restoredVersion: null,
+        health: bundle.readiness,
+        ownedTargets: ["support_bundle"],
+        preserved: ["ledger", "history", "credentials", "workspace_membership"],
+      };
+      await this.adapter.persistReceipt(receipt);
+      return { receipt, bundle };
+    } finally {
+      await this.adapter.releaseLock(operationId);
+    }
   }
 }
 

@@ -140,7 +140,10 @@ function fixture(name: string) {
           return "getter.code";
         },
       });
-      const readiness = await this.readiness(runtimeVersion ?? "missing") as LifecycleReadiness & Record<string, unknown>;
+      const readiness = await this.readiness(runtimeVersion ?? "missing", {
+        signal: new AbortController().signal,
+        deadlineMs: 1_000,
+      }) as LifecycleReadiness & Record<string, unknown>;
       readiness.content = "readiness-content-sentinel";
       readiness.nested = { path: "/Users/readiness-path-sentinel" };
       const snapshot = {
@@ -271,7 +274,31 @@ async function main() {
     check("private_runtime_permissions_are_0700", mode(happy.paths.lifecycleRoot) === 0o700 && mode(runtimePath) === 0o700, { root: mode(happy.paths.lifecycleRoot), runtime: mode(runtimePath) });
     const statePath = path.join(happy.paths.lifecycleRoot, "state.json");
     const receiptsRoot = path.join(happy.paths.lifecycleRoot, "receipts");
-    check("state_and_receipts_permissions_are_0600", mode(statePath) === 0o600 && fs.readdirSync(receiptsRoot).every((file) => mode(path.join(receiptsRoot, file)) === 0o600), fs.readdirSync(receiptsRoot));
+    const completedRoot = path.join(happy.paths.lifecycleRoot, "completed-operations");
+    check(
+      "state_receipts_and_completed_markers_permissions_are_0600",
+      mode(statePath) === 0o600 &&
+        fs.readdirSync(receiptsRoot).every((file) => mode(path.join(receiptsRoot, file)) === 0o600) &&
+        fs.readdirSync(completedRoot).every((file) => mode(path.join(completedRoot, file)) === 0o600),
+      { receipts: fs.readdirSync(receiptsRoot), completed: fs.readdirSync(completedRoot) },
+    );
+
+    const initialReceiptPath = path.join(receiptsRoot, "install-v1-update.json");
+    const initialReceipt = fs.readFileSync(initialReceiptPath, "utf8");
+    const initialSnapshots = fs.readdirSync(path.join(happy.paths.lifecycleRoot, "snapshots"));
+    const reused = await rejection(() => manager.update({
+      operationId: "install-v1",
+      artifact: happy.artifact("0.6.1"),
+    }));
+    check(
+      "completed_operation_id_reuse_is_rejected_without_snapshot_or_false_restore",
+      reused?.message.includes("already completed") === true &&
+        happy.runtimeVersion === "0.6.0" &&
+        fs.readFileSync(initialReceiptPath, "utf8") === initialReceipt &&
+        (JSON.parse(initialReceipt) as { restoredVersion?: unknown }).restoredVersion === null &&
+        JSON.stringify(fs.readdirSync(path.join(happy.paths.lifecycleRoot, "snapshots"))) === JSON.stringify(initialSnapshots),
+      { message: reused?.message, runtime: happy.runtimeVersion },
+    );
 
     const beforeConfig = fs.readFileSync(happy.paths.collectorConfig, "utf8");
     const beforeDatabase = fs.readFileSync(happy.paths.database, "utf8");
@@ -321,12 +348,141 @@ async function main() {
     check("uninstall_apply_removes_only_owned_runtime_service_fragments", applied.status === "completed" && !fs.existsSync(happy.paths.serviceManifest) && happy.paths.ownedToolFragments.every((file) => !fs.existsSync(file)) && !fs.existsSync(path.join(happy.paths.lifecycleRoot, "current")), applied);
     check("uninstall_preserves_ledger_history_credentials_and_membership", previewDigest === preservedDigest && fs.readFileSync(happy.paths.collectorConfig, "utf8").includes("credential-sentinel") && applied.preserved.includes("workspace_membership"), applied.preserved);
 
-    const badPurge = await rejection(() => manager.purge({ operationId: "purge-bad", confirmation: "yes" }));
+    const snapshotsRoot = path.join(happy.paths.lifecycleRoot, "snapshots");
+    const secretSnapshot = path.join(snapshotsRoot, "install-v1", "config");
+    check("lifecycle_snapshot_contains_owned_secret_copy_before_purge", fs.readFileSync(secretSnapshot, "utf8").includes("credential-sentinel"), secretSnapshot);
+    const purgePreview = await runLifecycleCommand({
+      argv: ["purge", "--operation-id", "purge-preview"],
+      adapter: happy.adapter,
+      resolveArtifact: async () => { throw new Error("not used"); },
+    });
+    check(
+      "purge_defaults_to_preview_and_lists_secret_bearing_snapshots",
+      purgePreview.receipt.status === "preview" &&
+        purgePreview.receipt.ownedTargets.includes("lifecycle_snapshots") &&
+        fs.existsSync(secretSnapshot) && fs.existsSync(happy.paths.database),
+      purgePreview.receipt,
+    );
+    const badPurge = await rejection(() => manager.purge({ operationId: "purge-bad", apply: true, confirmation: "yes" }));
     check("purge_rejects_non_exact_confirmation", badPurge?.message.includes("exact confirmation") === true && fs.existsSync(happy.paths.database), badPurge?.message);
-    const purged = await manager.purge({ operationId: "purge-exact", confirmation: PURGE_CONFIRMATION });
-    check("purge_is_separate_and_exact_then_removes_owned_data", purged.status === "purged" && !fs.existsSync(happy.paths.collectorConfig) && !fs.existsSync(happy.paths.database) && !fs.existsSync(happy.paths.history[0]!), purged);
+    const purged = await manager.purge({ operationId: "purge-exact", apply: true, confirmation: PURGE_CONFIRMATION });
+    check(
+      "purge_is_separate_exact_and_deletes_live_plus_snapshot_secret_copies",
+      purged.status === "purged" &&
+        !fs.existsSync(happy.paths.collectorConfig) &&
+        !fs.existsSync(happy.paths.database) &&
+        !fs.existsSync(happy.paths.history[0]!) &&
+        fs.readdirSync(snapshotsRoot).length === 0,
+      purged,
+    );
   } finally {
     happy.cleanup();
+  }
+
+  const recovery = fixture("rollback-required");
+  try {
+    const manager = new LifecycleManager(recovery.adapter);
+    await manager.update({ operationId: "recovery-install", artifact: recovery.artifact("0.6.0") });
+    const v2 = recovery.artifact("0.7.0");
+    recovery.setMigrateOnActivate(true);
+    recovery.setFailHealth(true);
+    let restoreAttempts = 0;
+    const restoreFailureAdapter = faultingAdapter(recovery.adapter, {
+      async restore(snapshotId) {
+        restoreAttempts += 1;
+        if (restoreAttempts === 1) throw new Error("fixture restore unavailable");
+        await recovery.adapter.restore(snapshotId);
+      },
+    });
+    const blocked = await rejection(() => new LifecycleManager(restoreFailureAdapter).update({
+      operationId: "recovery-update",
+      artifact: v2,
+    }));
+    const blockedJournal = JSON.parse(fs.readFileSync(path.join(recovery.paths.lifecycleRoot, "journal.json"), "utf8")) as LifecycleJournal;
+    const recoveryReceiptPath = path.join(recovery.paths.lifecycleRoot, "receipts", "recovery-update-update.json");
+    const blockedReceipt = JSON.parse(fs.readFileSync(recoveryReceiptPath, "utf8")) as { status: string; restoredVersion: string | null };
+    const lockReleasedAfterFailure = await recovery.adapter.acquireLock("recovery-lock-probe");
+    if (lockReleasedAfterFailure) await recovery.adapter.releaseLock("recovery-lock-probe");
+    check(
+      "restore_failure_persists_rollback_required_and_releases_lock",
+      blocked?.message === "rollback required: restore failed; retry the same operationId" &&
+        blockedJournal.phase === "rollback_required" &&
+        blockedReceipt.status === "rollback_required" &&
+        blockedReceipt.restoredVersion === null &&
+        recovery.runtimeVersion === "0.7.0" && lockReleasedAfterFailure,
+      { message: blocked?.message, journal: blockedJournal, receipt: blockedReceipt, runtime: recovery.runtimeVersion },
+    );
+
+    // Make the target healthy before reopen. A broken implementation could
+    // now accept v2; the journal must instead force the pending rollback.
+    recovery.setFailHealth(false);
+    const recovered = await manager.update({ operationId: "recovery-update", artifact: v2 });
+    check(
+      "reopen_retries_required_rollback_and_never_commits_target",
+      recovered.status === "rolled_back" &&
+        recovered.restoredVersion === "0.6.0" &&
+        recovery.runtimeVersion === "0.6.0" &&
+        !fs.existsSync(path.join(recovery.paths.lifecycleRoot, "journal.json")),
+      recovered,
+    );
+    const completedRaces = await Promise.all([
+      rejection(() => manager.update({ operationId: "recovery-update", artifact: v2 })),
+      rejection(() => manager.update({ operationId: "recovery-update", artifact: v2 })),
+    ]);
+    const finalRecoveryReceipt = JSON.parse(fs.readFileSync(recoveryReceiptPath, "utf8")) as { status: string; restoredVersion: string | null };
+    check(
+      "completed_recovery_is_idempotent_under_reuse_race_without_false_restore",
+      completedRaces.every((error) => error !== null) &&
+        recovery.runtimeVersion === "0.6.0" &&
+        finalRecoveryReceipt.status === "rolled_back" &&
+        finalRecoveryReceipt.restoredVersion === "0.6.0",
+      { messages: completedRaces.map((error) => error?.message), receipt: finalRecoveryReceipt },
+    );
+  } finally {
+    recovery.cleanup();
+  }
+
+  const deadline = fixture("readiness-deadline");
+  try {
+    const manager = new LifecycleManager(deadline.adapter);
+    await manager.update({ operationId: "deadline-install", artifact: deadline.artifact("0.6.0") });
+    const beforeConfig = fs.readFileSync(deadline.paths.collectorConfig, "utf8");
+    const beforeDatabase = fs.readFileSync(deadline.paths.database, "utf8");
+    deadline.setMigrateOnActivate(true);
+    let aborts = 0;
+    const neverReadyAdapter = faultingAdapter(deadline.adapter, {
+      async readiness(_expectedVersion, input) {
+        return new Promise<LifecycleReadiness>(() => {
+          input.signal.addEventListener("abort", () => { aborts += 1; }, { once: true });
+        });
+      },
+    });
+    const startedAt = Date.now();
+    const timeout = await rejection(() => new LifecycleManager(neverReadyAdapter, { readinessTimeoutMs: 20 }).update({
+      operationId: "deadline-update",
+      artifact: deadline.artifact("0.7.0"),
+    }));
+    const elapsedMs = Date.now() - startedAt;
+    const timeoutReceipt = JSON.parse(fs.readFileSync(
+      path.join(deadline.paths.lifecycleRoot, "receipts", "deadline-update-update.json"),
+      "utf8",
+    )) as { status: string; restoredVersion: string | null };
+    const lockReleasedAfterTimeout = await deadline.adapter.acquireLock("deadline-lock-probe");
+    if (lockReleasedAfterTimeout) await deadline.adapter.releaseLock("deadline-lock-probe");
+    check(
+      "readiness_deadline_aborts_rolls_back_and_releases_lock",
+      timeout?.message === "readiness deadline exceeded" &&
+        elapsedMs < 500 && aborts === 1 &&
+        timeoutReceipt.status === "rolled_back" && timeoutReceipt.restoredVersion === "0.6.0" &&
+        deadline.runtimeVersion === "0.6.0" &&
+        fs.readFileSync(deadline.paths.collectorConfig, "utf8") === beforeConfig &&
+        fs.readFileSync(deadline.paths.database, "utf8") === beforeDatabase &&
+        !fs.existsSync(path.join(deadline.paths.lifecycleRoot, "journal.json")) &&
+        lockReleasedAfterTimeout,
+      { message: timeout?.message, elapsedMs, aborts, receipt: timeoutReceipt, runtime: deadline.runtimeVersion },
+    );
+  } finally {
+    deadline.cleanup();
   }
 
   const race = fixture("race");
@@ -353,6 +509,100 @@ async function main() {
     check("incomplete_snapshot_and_stage_reopen_idempotently", receipt.status === "completed" && !fs.existsSync(path.join(incompleteSnapshot, "partial")) && !fs.existsSync(staleStage) && reopen.runtimeVersion === "0.6.0", receipt);
   } finally {
     reopen.cleanup();
+  }
+
+  const lifecycleLink = fixture("lifecycle-root-symlink");
+  try {
+    const outside = path.join(lifecycleLink.ownershipRoot, "outside-lifecycle");
+    fs.mkdirSync(outside, { mode: 0o700 });
+    fs.symlinkSync(outside, lifecycleLink.paths.lifecycleRoot, "dir");
+    const error = await rejection(() => new LifecycleManager(lifecycleLink.adapter).update({
+      operationId: "lifecycle-link",
+      artifact: lifecycleLink.artifact("0.6.0"),
+    }));
+    check(
+      "preexisting_lifecycle_root_symlink_is_rejected_before_managed_write",
+      error?.message.includes("symlink") === true && fs.readdirSync(outside).length === 0 && lifecycleLink.runtimeVersion === null,
+      error?.message,
+    );
+  } finally {
+    lifecycleLink.cleanup();
+  }
+
+  const snapshotsLink = fixture("snapshots-root-symlink");
+  try {
+    const outside = path.join(snapshotsLink.ownershipRoot, "outside-snapshots");
+    fs.mkdirSync(outside, { mode: 0o700 });
+    fs.mkdirSync(snapshotsLink.paths.lifecycleRoot, { recursive: true, mode: 0o700 });
+    fs.symlinkSync(outside, path.join(snapshotsLink.paths.lifecycleRoot, "snapshots"), "dir");
+    const error = await rejection(() => new LifecycleManager(snapshotsLink.adapter).update({
+      operationId: "snapshots-link",
+      artifact: snapshotsLink.artifact("0.6.0"),
+    }));
+    check(
+      "preexisting_snapshots_root_symlink_is_rejected_before_snapshot_write",
+      error?.message.includes("symlink") === true && fs.readdirSync(outside).length === 0 && snapshotsLink.runtimeVersion === null,
+      error?.message,
+    );
+  } finally {
+    snapshotsLink.cleanup();
+  }
+
+  const ancestorSwap = fixture("snapshot-ancestor-swap");
+  try {
+    const snapshotsRoot = path.join(ancestorSwap.paths.lifecycleRoot, "snapshots");
+    const outside = path.join(ancestorSwap.ownershipRoot, "outside-ancestor-swap");
+    fs.mkdirSync(outside, { mode: 0o700 });
+    let swapped = false;
+    const swapAdapter = faultingAdapter(ancestorSwap.adapter, {
+      async writeJournal(journal) {
+        await ancestorSwap.adapter.writeJournal(journal);
+        if (!swapped && journal.phase === "prepared") {
+          swapped = true;
+          fs.rmSync(snapshotsRoot, { recursive: true, force: true });
+          fs.symlinkSync(outside, snapshotsRoot, "dir");
+        }
+      },
+    });
+    const error = await rejection(() => new LifecycleManager(swapAdapter).update({
+      operationId: "ancestor-swap",
+      artifact: ancestorSwap.artifact("0.6.0"),
+    }));
+    check(
+      "snapshot_ancestor_swap_after_prepare_is_rejected_before_snapshot_write",
+      error?.message.includes("symlink") === true && swapped && fs.readdirSync(outside).length === 0 && ancestorSwap.runtimeVersion === null,
+      error?.message,
+    );
+  } finally {
+    ancestorSwap.cleanup();
+  }
+
+  const leafSwap = fixture("snapshot-leaf-swap");
+  try {
+    const snapshotsRoot = path.join(leafSwap.paths.lifecycleRoot, "snapshots");
+    const outside = path.join(leafSwap.ownershipRoot, "outside-leaf-swap");
+    fs.mkdirSync(outside, { mode: 0o700 });
+    let swapped = false;
+    const swapAdapter = faultingAdapter(leafSwap.adapter, {
+      async writeJournal(journal) {
+        await leafSwap.adapter.writeJournal(journal);
+        if (!swapped && journal.phase === "prepared") {
+          swapped = true;
+          fs.symlinkSync(outside, path.join(snapshotsRoot, journal.operationId), "dir");
+        }
+      },
+    });
+    const error = await rejection(() => new LifecycleManager(swapAdapter).update({
+      operationId: "leaf-swap",
+      artifact: leafSwap.artifact("0.6.0"),
+    }));
+    check(
+      "snapshot_leaf_swap_after_prepare_is_rejected_before_snapshot_write",
+      error?.message.includes("symlink") === true && swapped && fs.readdirSync(outside).length === 0 && leafSwap.runtimeVersion === null,
+      error?.message,
+    );
+  } finally {
+    leafSwap.cleanup();
   }
 
   const hostile = fixture("hostile");

@@ -17,7 +17,7 @@ boundary:
 update --operation-id ID --artifact REF
 rollback --operation-id ID --artifact REF
 uninstall --operation-id ID [--apply]
-purge --operation-id ID --confirm-exact "PURGE PLIMSOLL LOCAL DATA"
+purge --operation-id ID [--apply --confirm-exact "PURGE PLIMSOLL LOCAL DATA"]
 support-bundle --operation-id ID
 ```
 
@@ -37,13 +37,18 @@ An update or rollback:
 5. asks the injected service adapter to activate that exact executable and
    atomically moves the convenience `current` pointer;
 6. accepts success only when runtime version, service, config compatibility,
-   and database compatibility are all verified; and
+   and database compatibility are all verified before a bounded readiness
+   deadline; and
 7. restores the prior runtime, config, database, and service manifest if any
    post-snapshot step fails.
 
 The journal is `0600`; private directories and executable runtime files are
-`0700`. Reopening the same interrupted operation is idempotent. A different
-operation cannot cross its lock or journal.
+`0700`. Reopening the same interrupted operation is idempotent. If restore
+itself fails, the durable journal and receipt remain `rollback_required`;
+reopening that same operation retries rollback and cannot advance or verify
+the target version. A different operation cannot cross its lock or journal.
+After a terminal receipt, the operation ID is permanently consumed and must
+not be reused.
 
 ## Uninstall, purge, leave, and revoke
 
@@ -52,9 +57,12 @@ service manifest, exact tool-config fragments, runtime pointer, and versioned
 runtimes. It preserves the collector config, workspace credentials, ledger,
 history, and workspace membership.
 
-Purging data is a different operation and requires the exact confirmation
-shown above. Leaving a workspace and revoking a device are also distinct:
-neither is simulated or reported complete by local uninstall or purge.
+Purging data is a different operation. It is a preview by default and lists
+the live collector config, ledger, history, and lifecycle snapshots. Apply
+requires both `--apply` and the exact confirmation shown above, then deletes
+the live copies and secret-bearing lifecycle snapshot copies. Leaving a
+workspace and revoking a device are also distinct: neither is simulated or
+reported complete by local uninstall or purge.
 
 ## Support output
 
@@ -83,7 +91,8 @@ pnpm proof:lifecycle
 The proof uses a fresh temporary ownership root and injected service/database
 adapters. It covers arm64/x64 metadata, supported and unsupported Node majors,
 permissions, health and disk-full rollback, interruption/reopen, lock races,
-malformed state, symlink/path attacks, preview/apply/purge separation, and
-support-bundle privacy. It never invokes `launchctl`, a browser, a provider,
-the npm registry, or an installed Plimsoll service and never reads the
-operator's config or ledger.
+completed-ID reuse, failed-restore recovery, readiness cancellation/deadline,
+malformed state, lifecycle/snapshot ancestor and leaf symlink swaps,
+preview/apply/purge snapshot deletion, and support-bundle privacy. It never
+invokes `launchctl`, a browser, a provider, the npm registry, or an installed
+Plimsoll service and never reads the operator's config or ledger.
