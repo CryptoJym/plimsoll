@@ -11,6 +11,7 @@ import {
 } from "./config";
 import { deterministicEventId } from "./normalizer";
 import { canonicalLinkage, hasUnsafeOutboundString, sealOutboundEnvelope } from "./outbound-envelope";
+import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import {
   aiWorkAttributionRepairBatchSchema,
   aiWorkIngestBatchSchema,
@@ -72,6 +73,8 @@ export type LedgerHistoryRow = {
   id: string;
   createdAt: string;
   dataMode?: string;
+  privacyEligible?: number;
+  privacyDisposition?: string | null;
   payloadJson: string;
   suppressedFieldsJson: string;
   /** Per-event repo linkage columns (issue 0008 stitching) — forwarded as
@@ -84,6 +87,7 @@ export type HistorySkipReason =
   | "payload_unparseable"
   | "schema_invalid"
   | "forbidden_content"
+  | "local_privacy_terminal"
   | "local_evidence_quarantine_migration_required";
 
 export type HistoryEnvelope = {
@@ -726,8 +730,11 @@ export async function runWorkspaceHistoryUpload(
     }),
   );
 
+  const privacyEligible = terminalPrivacyEligibilitySql(ledger, "buffered_events");
   const page = ledger.prepare(
     `select rowid as rowid, id, created_at as createdAt, data_mode as dataMode,
+       case when ${privacyEligible} then 1 else 0 end as privacyEligible,
+       privacy_disposition as privacyDisposition,
        payload_json as payloadJson,
        suppressed_fields_json as suppressedFieldsJson,
        repo_hash as repoHash, branch_hash as branchHash
@@ -736,21 +743,6 @@ export async function runWorkspaceHistoryUpload(
      order by rowid asc
      limit ?`,
   );
-  const hasUploadReceipts = Boolean(
-    ledger.prepare(
-      `select 1 as present from sqlite_master
-       where type = 'table' and name = 'upload_receipts' limit 1`,
-    ).get(),
-  );
-  const evidenceQuarantineReceipt = hasUploadReceipts
-    ? ledger.prepare(
-        `select 1 as quarantined
-         from upload_receipts
-         where delivery_id = ? and reason = 'local_evidence_quarantined'
-         limit 1`,
-      )
-    : null;
-
   type CarryItem = {
     envelope: HistoryEnvelope;
     bytes: number;
@@ -899,10 +891,14 @@ export async function runWorkspaceHistoryUpload(
 
     for (const row of rows) {
       scannedRows += 1;
-      if (evidenceQuarantineReceipt?.get(ensureUuidEventId(row.id).id)) {
+      if (row.privacyEligible === 0) {
         skipQueue.push({
           rowid: row.rowid,
-          reason: "local_evidence_quarantine_migration_required",
+          reason:
+            row.dataMode === "evidence" ||
+            row.privacyDisposition === "local_evidence_quarantined"
+              ? "local_evidence_quarantine_migration_required"
+              : "local_privacy_terminal",
         });
         continue;
       }
@@ -1157,11 +1153,12 @@ export async function runAttributionRepair(
   const maxAttempts = Math.max(1, Math.min(options.maxAttemptsPerBatch ?? 5, 10));
   const appVersion = options.appVersion ?? "0.1.0";
 
+  const privacyEligible = terminalPrivacyEligibilitySql(ledger, "buffered_events");
   const overview = ledger
     .prepare(
       `select count(*) as n, count(distinct repo_hash) as repos
        from buffered_events
-       where repo_hash is not null and data_mode <> 'evidence' and created_at <= ?`,
+       where repo_hash is not null and ${privacyEligible} and created_at <= ?`,
     )
     .get(until) as { n: number; repos: number };
 
@@ -1181,7 +1178,7 @@ export async function runAttributionRepair(
   const page = ledger.prepare(
     `select rowid as rowid, id, repo_hash as repoHash
      from buffered_events
-     where repo_hash is not null and data_mode <> 'evidence'
+     where repo_hash is not null and ${privacyEligible}
        and created_at <= ? and rowid > ?
      order by rowid asc
      limit ?`,

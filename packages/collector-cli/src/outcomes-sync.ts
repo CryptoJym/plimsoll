@@ -5,6 +5,7 @@ import Database from "better-sqlite3";
 import type { CollectorConfig } from "./config";
 import { assertCollectorPrivacyMode, collectorBufferPath } from "./config";
 import { canonicalCommitSha, canonicalLinkage } from "./outbound-envelope";
+import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import { ensureUuidSessionId } from "./session-sync";
 import {
   findForbiddenRawContentFields,
@@ -74,9 +75,7 @@ export function collectSessionLinks(
   ledger: Database.Database,
   options: { since: string; until: string },
 ): LedgerSessionLink[] {
-  const hasDataMode = (ledger.pragma("table_info(buffered_events)") as Array<{ name: string }>).some(
-    (column) => column.name === "data_mode",
-  );
+  const privacyEligible = terminalPrivacyEligibilitySql(ledger, "buffered_events");
   return ledger
     .prepare(
       `select
@@ -87,7 +86,7 @@ export function collectSessionLinks(
          group_concat(distinct head_sha) as headShas
        from buffered_events
        where session_id is not null
-         ${hasDataMode ? "and data_mode <> 'evidence'" : ""}
+         and ${privacyEligible}
          and observed_at >= @since
          and created_at <= @until
        group by session_id

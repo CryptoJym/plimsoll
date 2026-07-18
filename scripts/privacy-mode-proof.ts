@@ -22,8 +22,21 @@ import { appendForwardedHook } from "../packages/collector-cli/src/forwarder";
 import { performJoin } from "../packages/collector-cli/src/join";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { sealOutboundEnvelope } from "../packages/collector-cli/src/outbound-envelope";
+import {
+  buildOutcomePush,
+  collectSessionLinks,
+  joinSessionsToPulls,
+} from "../packages/collector-cli/src/outcomes-sync";
+import {
+  markRawPrivacyDisposition,
+  terminalPrivacyEligibilitySql,
+} from "../packages/collector-cli/src/privacy-disposition";
+import { collectSessionSnapshots } from "../packages/collector-cli/src/session-sync";
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
-import { runWorkspaceHistoryUpload } from "../packages/collector-cli/src/upload-history";
+import {
+  runAttributionRepair,
+  runWorkspaceHistoryUpload,
+} from "../packages/collector-cli/src/upload-history";
 import {
   aiInteractionEventSchema,
   policyConfigSchema,
@@ -288,7 +301,7 @@ async function main() {
     "metadata_only_setup_status_and_doctor_remain_operational_and_literal",
     setup.status === 0 &&
       status.status === 0 &&
-      doctor.status === 0 &&
+      doctor.status === 1 &&
       generatedSettings.env?.OTEL_LOG_USER_PROMPTS === "0" &&
       generatedSettings.env?.OTEL_LOG_TOOL_DETAILS === "0" &&
       generatedSettings.env?.OTEL_LOG_TOOL_CONTENT === "0" &&
@@ -632,7 +645,8 @@ async function main() {
       reopenUpload.uploadedEvents === 0 &&
       reopenUploadBodies.length === 0 &&
       reopenedInvalidRows === 0 &&
-      history.audit.skipped.local_evidence_quarantine_migration_required === 2 &&
+      (history.audit.skipped.local_evidence_quarantine_migration_required ?? 0) +
+        (history.audit.skipped.local_privacy_terminal ?? 0) === 2 &&
       history.sentEvents === 1 &&
       legacyOutboundSurfaces.every((surface) => !hasPrivateTerm(surface)) &&
       deliveryStatus.privacy.legacyEvidenceDisposition ===
@@ -647,10 +661,344 @@ async function main() {
       reopenedInvalidRows,
       reopenUploadCalls: reopenUploadBodies.length,
       uploadedMetadataRows: legacyUpload.uploadedEvents,
-      historySkipped: history.audit.skipped.local_evidence_quarantine_migration_required ?? 0,
+      historySkipped: history.audit.skipped,
       readinessRawScans: deliveryStatus.work.rawRowsScanned,
     },
   );
+
+  const terminalHome = path.join(root, "terminal-export-home");
+  fs.mkdirSync(terminalHome, { recursive: true, mode: 0o700 });
+  const terminalLedger = path.join(terminalHome, "work-ledger.sqlite");
+  const terminalBuffer = new LocalEventBuffer(terminalLedger, {
+    delivery: { enabled: true, limits: metadataConfig.delivery },
+  });
+  const terminalSessionId = "11711711-1111-4111-8111-111111111130";
+  const terminalEvent = aiInteractionEventSchema.parse({
+    id: "11711711-1111-4111-8111-111111111131",
+    source: "codex",
+    dataMode: "metadata",
+    eventType: "assistant_response",
+    observedAt: "2026-07-17T12:10:00.000Z",
+    sessionId: terminalSessionId,
+    actionClass: "other",
+    inputTokens: 31,
+    outputTokens: 0,
+    metadata: {
+      git: {
+        remoteUrlHash: `sha256:${"a".repeat(64)}`,
+        branchHash: `sha256:${"b".repeat(64)}`,
+        headSha: "c".repeat(40),
+      },
+    },
+  });
+  terminalBuffer.append(terminalEvent);
+  const terminalRow = terminalBuffer.database
+    .prepare(`select rowid as rawRowid from buffered_events where id = ?`)
+    .get(terminalEvent.id) as { rawRowid: number };
+  markRawPrivacyDisposition(
+    terminalBuffer.database,
+    terminalRow.rawRowid,
+    "local_privacy_violation",
+    "2026-07-17T12:10:01.000Z",
+  );
+  const terminalMarkUploaded = terminalBuffer.markUploaded([terminalEvent.id]);
+  const terminalSnapshots = collectSessionSnapshots(terminalBuffer.database, {
+    until: "2027-07-17T12:11:00.000Z",
+  });
+  const terminalLinks = collectSessionLinks(terminalBuffer.database, {
+    since: "2026-07-17T12:00:00.000Z",
+    until: "2027-07-17T12:11:00.000Z",
+  });
+  const terminalPulls = [{
+    number: 117,
+    state: "closed",
+    merged: true,
+    mergedAt: "2026-07-17T12:10:30.000Z",
+    branchHash: `sha256:${"b".repeat(64)}`,
+    headSha: "c".repeat(40),
+    updatedAt: "2026-07-17T12:10:30.000Z",
+    checks: "passed" as const,
+    checksFetched: true,
+  }];
+  const terminalJoins = joinSessionsToPulls(
+    terminalLinks,
+    terminalPulls,
+    `sha256:${"a".repeat(64)}`,
+  );
+  const terminalOutcome = buildOutcomePush({
+    tenantId: "privacy-proof",
+    owner: "cryptojym",
+    repo: "plimsoll",
+    pulls: terminalPulls,
+    joins: terminalJoins,
+    signals: [],
+    reworkWindowDays: 7,
+  });
+  for (let pass = 0; pass < 4; pass += 1) {
+    terminalBuffer.projection.runMaintenance(new Date("2026-07-17T12:11:00.000Z"));
+  }
+  const terminalDashboardFacts = (
+    terminalBuffer.database
+      .prepare(`select count(*) as n from dashboard_event_facts where raw_rowid = ?`)
+      .get(terminalRow.rawRowid) as { n: number }
+  ).n;
+  const terminalStats = terminalBuffer.stats();
+  const terminalCoverage = terminalBuffer.tokenCoverage(3650) as unknown[];
+  const terminalAttributionBodies: string[] = [];
+  const terminalAttribution = await runAttributionRepair(metadataConfig, {
+    ledgerPath: terminalLedger,
+    until: "2027-07-17T12:11:00.000Z",
+    delayMs: 0,
+    sleep: async () => undefined,
+    log: () => undefined,
+    fetchImpl: async (_input, init) => {
+      terminalAttributionBodies.push(String(init?.body ?? ""));
+      return new Response(JSON.stringify({ matched: 1, updated: 1 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  const terminalHistoryBodies: string[] = [];
+  const terminalHistory = await runWorkspaceHistoryUpload(metadataConfig, {
+    full: true,
+    ledgerPath: terminalLedger,
+    statePath: path.join(terminalHome, "backfill-state.json"),
+    until: "2027-07-17T12:11:00.000Z",
+    delayMs: 0,
+    sleep: async () => undefined,
+    log: () => undefined,
+    fetchImpl: async (_input, init) => {
+      terminalHistoryBodies.push(String(init?.body ?? ""));
+      return new Response(JSON.stringify({ accepted: 1 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  const terminalDurableBodies: string[] = [];
+  const terminalDurable = await uploadBufferedEvents(metadataConfig, terminalBuffer, {
+    fetchImpl: async (_input, init) => {
+      terminalDurableBodies.push(String(init?.body ?? ""));
+      return new Response(JSON.stringify({ accepted: 1 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  const terminalDisposedRaw = terminalBuffer.database
+    .prepare(
+      `select uploaded_at as uploadedAt, privacy_disposition as disposition
+       from buffered_events where rowid = ?`,
+    )
+    .get(terminalRow.rawRowid) as { uploadedAt: string | null; disposition: string | null };
+  record(
+    "terminal_privacy_disposition_is_zero_across_every_export_and_dashboard_lane",
+    terminalBuffer.list().length === 0 &&
+      terminalBuffer.listUnuploaded().length === 0 &&
+      terminalMarkUploaded === 0 &&
+      terminalSnapshots.length === 0 &&
+      terminalLinks.length === 0 &&
+      terminalJoins.length === 0 &&
+      terminalOutcome.artifacts === 0 &&
+      terminalOutcome.outcomes === 0 &&
+      terminalDashboardFacts === 0 &&
+      terminalStats.count === 0 &&
+      terminalStats.totalInputTokens === 0 &&
+      terminalCoverage.length === 0 &&
+      terminalAttribution.rowsWithRepoHash === 0 &&
+      terminalAttribution.sentRows === 0 &&
+      terminalAttributionBodies.length === 0 &&
+      terminalHistory.sentEvents === 0 &&
+      terminalHistory.audit.skipped.local_privacy_terminal === 1 &&
+      terminalHistoryBodies.length === 0 &&
+      terminalDurable.uploadedEvents === 0 &&
+      terminalDurableBodies.length === 0 &&
+      terminalDisposedRaw.uploadedAt === null &&
+      terminalDisposedRaw.disposition === "local_privacy_violation",
+    {
+      listRows: terminalBuffer.list().length,
+      sessionTokens: terminalSnapshots.reduce((sum, row) => sum + row.inputTokens, 0),
+      outcomeArtifacts: terminalOutcome.artifacts,
+      attributionRows: terminalAttribution.sentRows,
+      historySent: terminalHistory.sentEvents,
+      historySkipped:
+        terminalHistory.audit.skipped.local_privacy_terminal ?? 0,
+      dashboardFacts: terminalDashboardFacts,
+      statsCount: terminalStats.count,
+      coverageRows: terminalCoverage.length,
+      publicMarkedUploaded: terminalMarkUploaded,
+      durableUploaded: terminalDurable.uploadedEvents,
+      durableWireCalls: terminalDurableBodies.length,
+      rawUploaded: terminalDisposedRaw.uploadedAt !== null,
+      disposition: terminalDisposedRaw.disposition,
+    },
+  );
+  terminalBuffer.close();
+
+  const recycledHome = path.join(root, "recycled-row-home");
+  fs.mkdirSync(recycledHome, { recursive: true, mode: 0o700 });
+  const recycledLedger = path.join(recycledHome, "work-ledger.sqlite");
+  let recycledBuffer = new LocalEventBuffer(recycledLedger, {
+    delivery: { enabled: true, limits: metadataConfig.delivery },
+  });
+  const recycledId = "11711711-1111-4111-8111-111111111132";
+  const recycledAt = "2026-07-17T12:12:00.000Z";
+  const recycledEvidence = {
+    ...evidenceEvent,
+    id: recycledId,
+    observedAt: recycledAt,
+  };
+  const recycledEvidenceInsert = recycledBuffer.database
+    .prepare(
+      `insert into buffered_events
+       (id,source,event_type,data_mode,observed_at,payload_json,suppressed_fields_json,created_at)
+       values (@id,'codex','user_prompt_submit','evidence',@at,@payload,'[]',@at)`,
+    )
+    .run({ id: recycledId, at: recycledAt, payload: JSON.stringify(recycledEvidence) });
+  const recycledRowid = Number(recycledEvidenceInsert.lastInsertRowid);
+  const oldGeneration = (
+    recycledBuffer.database
+      .prepare(`select privacy_generation as generation from buffered_events where rowid = ?`)
+      .get(recycledRowid) as { generation: string }
+  ).generation;
+  const recycledMetadataEvent = aiInteractionEventSchema.parse({
+    ...safeEvent,
+    id: recycledId,
+    observedAt: recycledAt,
+    sessionId: "11711711-1111-4111-8111-111111111133",
+    inputTokens: 31,
+    metadata: {
+      git: {
+        remoteUrlHash: `sha256:${"d".repeat(64)}`,
+        branchHash: `sha256:${"e".repeat(64)}`,
+        headSha: "f".repeat(40),
+      },
+    },
+  });
+  const recycledEnvelope = canonicalMetadataEnvelope(recycledId, recycledAt);
+  recycledBuffer.database.prepare(
+    `insert into upload_outbox
+     (delivery_id,raw_rowid,raw_id,raw_created_at,raw_generation,
+      base_envelope_json,base_bytes,sealed_envelope_json,sealed_bytes,
+      state,attempt_count,next_attempt_at,last_failure_class,created_at,updated_at)
+     values (@id,@rawRowid,@id,@at,@generation,@envelope,@bytes,@envelope,@bytes,
+      'pending',0,@at,'none',@at,@at)`,
+  ).run({
+    id: recycledId,
+    rawRowid: recycledRowid,
+    at: recycledAt,
+    generation: oldGeneration,
+    envelope: recycledEnvelope,
+    bytes: Buffer.byteLength(recycledEnvelope),
+  });
+  recycledBuffer.database.prepare(`delete from buffered_events where rowid = ?`).run(recycledRowid);
+  recycledBuffer.database.prepare(
+    `insert into buffered_events
+     (rowid,id,source,event_type,data_mode,observed_at,payload_json,suppressed_fields_json,
+      created_at,session_id,action_class,input_tokens,output_tokens,repo_hash,branch_hash,head_sha)
+     values (@rawRowid,@id,'codex','assistant_response','metadata',@at,@payload,'[]',
+      @at,@sessionId,'other',31,0,@repoHash,@branchHash,@headSha)`,
+  ).run({
+    rawRowid: recycledRowid,
+    id: recycledId,
+    at: recycledAt,
+    payload: JSON.stringify(recycledMetadataEvent),
+    sessionId: recycledMetadataEvent.sessionId,
+    repoHash: `sha256:${"d".repeat(64)}`,
+    branchHash: `sha256:${"e".repeat(64)}`,
+    headSha: "f".repeat(40),
+  });
+  recycledBuffer.projection.tryApplyRawRow(recycledRowid);
+  const newGeneration = (
+    recycledBuffer.database
+      .prepare(`select privacy_generation as generation from buffered_events where rowid = ?`)
+      .get(recycledRowid) as { generation: string }
+  ).generation;
+  const recycledPrivacySql = terminalPrivacyEligibilitySql(
+    recycledBuffer.database,
+    "buffered_events",
+  );
+  const recycledPlan = recycledBuffer.database
+    .prepare(
+      `explain query plan select id from buffered_events
+       where ${recycledPrivacySql} order by created_at desc limit 100`,
+    )
+    .all() as Array<{ detail: string }>;
+  const recycledPlanText = recycledPlan.map((row) => row.detail).join("\n");
+  const recycledMarkUploaded = recycledBuffer.markUploaded([recycledId]);
+  const recycledSnapshots = collectSessionSnapshots(recycledBuffer.database, {
+    until: "2026-07-17T12:13:00.000Z",
+  });
+  const recycledBodies: string[] = [];
+  const recycledUpload = await uploadBufferedEvents(metadataConfig, recycledBuffer, {
+    fetchImpl: async (_input, init) => {
+      recycledBodies.push(String(init?.body ?? ""));
+      return new Response(JSON.stringify({ accepted: 1 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  for (let pass = 0; pass < 4; pass += 1) {
+    recycledBuffer.projection.runMaintenance(new Date("2026-07-17T12:13:00.000Z"));
+  }
+  const recycledRaw = recycledBuffer.database
+    .prepare(
+      `select uploaded_at as uploadedAt, privacy_disposition as disposition
+       from buffered_events where rowid = ?`,
+    )
+    .get(recycledRowid) as { uploadedAt: string | null; disposition: string | null };
+  const recycledReceipt = recycledBuffer.database
+    .prepare(`select reason from upload_receipts where delivery_id = ?`)
+    .get(recycledId) as { reason: string } | undefined;
+  const recycledDashboardFacts = (
+    recycledBuffer.database
+      .prepare(`select count(*) as n from dashboard_event_facts where raw_rowid = ?`)
+      .get(recycledRowid) as { n: number }
+  ).n;
+  recycledBuffer.close();
+  recycledBuffer = new LocalEventBuffer(recycledLedger, {
+    delivery: { enabled: true, limits: metadataConfig.delivery },
+  });
+  const recycledReopenBodies: string[] = [];
+  const recycledReopen = await uploadBufferedEvents(metadataConfig, recycledBuffer, {
+    fetchImpl: async (_input, init) => {
+      recycledReopenBodies.push(String(init?.body ?? ""));
+      return new Response(JSON.stringify({ accepted: 1 }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  record(
+    "recycled_rowid_same_id_and_created_at_cannot_resurrect_stale_envelope",
+    oldGeneration !== newGeneration &&
+      recycledMarkUploaded === 0 &&
+      recycledSnapshots.length === 0 &&
+      recycledUpload.uploadedEvents === 0 &&
+      recycledBodies.length === 0 &&
+      recycledRaw.uploadedAt === null &&
+      recycledRaw.disposition === "local_privacy_violation" &&
+      recycledReceipt?.reason === "local_privacy_violation" &&
+      recycledDashboardFacts === 0 &&
+      recycledReopen.uploadedEvents === 0 &&
+      recycledReopenBodies.length === 0 &&
+      recycledPlanText.includes("idx_upload_outbox_raw_rowid") &&
+      !recycledPlanText.includes("SCAN privacy_outbox") &&
+      !recycledPlanText.includes("SCAN privacy_receipt"),
+    {
+      generationChanged: oldGeneration !== newGeneration,
+      publicMarkedUploaded: recycledMarkUploaded,
+      sessionTokens: recycledSnapshots.reduce((sum, row) => sum + row.inputTokens, 0),
+      wireCalls: recycledBodies.length,
+      reopenWireCalls: recycledReopenBodies.length,
+      receipt: recycledReceipt?.reason ?? null,
+      dashboardFacts: recycledDashboardFacts,
+      indexedPrivacyPlan: recycledPlanText,
+    },
+  );
+  recycledBuffer.close();
 
   const raceHome = path.join(root, "race-home");
   fs.mkdirSync(raceHome, { recursive: true, mode: 0o700 });

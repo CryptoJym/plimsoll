@@ -45,7 +45,6 @@ export function buildIngestBatch(
   const rows: BufferedEventRow[] = [];
   const events = [];
   for (const row of candidateRows) {
-    if (buffer.delivery.isEvidenceQuarantined(row.id)) continue;
     const sealed = sealOutboundEnvelope({
       event: attachRepoLinkage(row.payload, row.repoHash, row.branchHash),
       suppressedFields: row.suppressedFields,

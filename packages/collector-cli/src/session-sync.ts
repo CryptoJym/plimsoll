@@ -4,6 +4,7 @@ import type { CollectorConfig } from "./config";
 import { assertCollectorPrivacyMode, collectorBufferPath } from "./config";
 import { deterministicEventId } from "./normalizer";
 import { hasUnsafeOutboundString, sealOutboundSessionRow } from "./outbound-envelope";
+import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import { chunkHistoryEnvelopes, postHistoryBatch } from "./upload-history";
 import {
   aiWorkSessionSyncBatchSchema,
@@ -112,9 +113,12 @@ export function collectSessionSnapshots(
     return out;
   }
 
+  const eventPrivacyEligible = terminalPrivacyEligibilitySql(ledger, "e");
+  const repoPrivacyEligible = terminalPrivacyEligibilitySql(ledger, "r");
+  const accountPrivacyEligible = terminalPrivacyEligibilitySql(ledger, "a");
   const filters: string[] = [
     "e.session_id is not null",
-    "e.data_mode <> 'evidence'",
+    eventPrivacyEligible,
     "e.created_at <= @until",
   ];
   const params: Record<string, unknown> = { until: options.until };
@@ -143,7 +147,7 @@ export function collectSessionSnapshots(
          (select r.repo_hash || '|' || coalesce(r.branch_hash, '')
             from buffered_events r
             where r.session_id = e.session_id and r.repo_hash is not null
-              and r.data_mode <> 'evidence'
+              and ${repoPrivacyEligible}
               and r.created_at <= @until
             group by r.repo_hash, r.branch_hash
             order by count(*) desc, r.repo_hash asc, r.branch_hash asc
@@ -151,7 +155,7 @@ export function collectSessionSnapshots(
          (select a.account_hash
             from buffered_events a
             where a.session_id = e.session_id and a.account_hash is not null
-              and a.data_mode <> 'evidence'
+              and ${accountPrivacyEligible}
               and a.created_at <= @until
             group by a.account_hash
             order by count(*) desc, a.account_hash asc

@@ -1,3 +1,4 @@
+import crypto from "node:crypto";
 import os from "node:os";
 
 import Database from "better-sqlite3";
@@ -12,6 +13,7 @@ import { ensureCodexReconciliationSchema } from "./codex-reconciliation";
 import { DeliveryOutbox, type DeliveryLimits } from "./outbox";
 import { DashboardProjectionStore } from "./dashboard-projection";
 import { LearningFactStore, type LearningFactLimits } from "./learning-facts";
+import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 
 export type BufferedEventRow = {
   id: string;
@@ -77,6 +79,9 @@ const EVENT_COLUMNS = [
   "machine text",
   "account_hash text",
   "workspace_id text",
+  "privacy_generation text",
+  "privacy_disposition text",
+  "privacy_disposed_at text",
 ] as const;
 
 export class LocalEventBuffer {
@@ -176,6 +181,32 @@ export class LocalEventBuffer {
       );
     `);
     this.migrateEventColumns();
+    this.db.exec(`
+      create index if not exists idx_events_privacy_disposition
+        on buffered_events (privacy_disposition, data_mode, created_at, id);
+      create trigger if not exists trg_events_privacy_generation_insert
+      after insert on buffered_events
+      when new.privacy_generation is null
+      begin
+        update buffered_events
+        set privacy_generation = lower(hex(randomblob(16)))
+        where rowid = new.rowid and privacy_generation is null;
+      end;
+      create trigger if not exists trg_events_privacy_generation_immutable
+      before update of privacy_generation on buffered_events
+      when old.privacy_generation is not null
+        and new.privacy_generation is not old.privacy_generation
+      begin
+        select raise(abort, 'privacy_generation_is_immutable');
+      end;
+      create trigger if not exists trg_events_privacy_disposition_terminal
+      before update of privacy_disposition on buffered_events
+      when old.privacy_disposition is not null
+        and new.privacy_disposition is not old.privacy_disposition
+      begin
+        select raise(abort, 'privacy_disposition_is_terminal');
+      end;
+    `);
     this.delivery = new DeliveryOutbox(this.db, options.delivery);
     if (options.workspaceId) this.useWorkspace(options.workspaceId);
     this.db.exec(`
@@ -461,6 +492,7 @@ export class LocalEventBuffer {
       );
     }
     const createdAt = new Date().toISOString();
+    const privacyGeneration = crypto.randomUUID();
     const canonicalSuppressedFields = canonicalizeSuppressionReceipts(suppressedFields);
     const result = this.db
       .prepare(
@@ -468,12 +500,12 @@ export class LocalEventBuffer {
           (id, source, event_type, data_mode, observed_at, payload_json, suppressed_fields_json,
            created_at, session_id, action_class, model, input_tokens, output_tokens,
            cache_read_tokens, cache_creation_tokens, cost_usd, uploaded_at, repo_hash, branch_hash, head_sha,
-           machine, account_hash, workspace_id)
+           machine, account_hash, workspace_id, privacy_generation)
         values
           (@id, @source, @eventType, @dataMode, @observedAt, @payloadJson, @suppressedFieldsJson,
            @createdAt, @sessionId, @actionClass, @model, @inputTokens, @outputTokens,
            @cacheReadTokens, @cacheCreationTokens, @costUsd, null, @repoHash, @branchHash, @headSha,
-           @machine, @accountHash, @workspaceId)`,
+           @machine, @accountHash, @workspaceId, @privacyGeneration)`,
       )
       .run({
         id: event.id,
@@ -498,6 +530,7 @@ export class LocalEventBuffer {
         machine: MACHINE,
         accountHash: event.actorId ?? null,
         workspaceId: this.workspaceId,
+        privacyGeneration,
       });
     if (result.changes > 0) {
       this.delivery.noteRawAppend(Number(result.lastInsertRowid));
@@ -512,6 +545,8 @@ export class LocalEventBuffer {
         repoHash: gitField(event, "remoteUrlHash"),
         branchHash: gitField(event, "branchHash"),
         workspaceId: this.workspaceId,
+        privacyGeneration,
+        privacyDisposition: null,
       });
       if (event.actorId) this.seedAccountLabel(event.actorId);
       // The raw row, privacy-safe fact delta, and delivery envelope share the
@@ -787,6 +822,7 @@ export class LocalEventBuffer {
   }
 
   list(limit = 100): BufferedEventRow[] {
+    const privacyEligible = terminalPrivacyEligibilitySql(this.db, "buffered_events");
     const rows = this.db
       .prepare(
         `select id, source, event_type as eventType, data_mode as dataMode,
@@ -795,7 +831,7 @@ export class LocalEventBuffer {
           uploaded_at as uploadedAt, repo_hash as repoHash, branch_hash as branchHash,
           workspace_id as workspaceId
         from buffered_events
-        where data_mode <> 'evidence'
+        where ${privacyEligible}
         order by created_at desc
         limit ?`,
       )
@@ -807,6 +843,7 @@ export class LocalEventBuffer {
   listUnuploaded(options: { maxRows?: number; maxBytes?: number } = {}): BufferedEventRow[] {
     const maxRows = Math.max(1, Math.min(options.maxRows ?? 500, 500));
     const maxBytes = options.maxBytes ?? 1_500_000;
+    const privacyEligible = terminalPrivacyEligibilitySql(this.db, "buffered_events");
     const rows = this.db
       .prepare(
         `select id, source, event_type as eventType, data_mode as dataMode,
@@ -817,7 +854,7 @@ export class LocalEventBuffer {
           length(cast(payload_json as blob)) as payloadBytes
         from buffered_events
         where uploaded_at is null
-          and data_mode <> 'evidence'
+          and ${privacyEligible}
           and (? is null or workspace_id = ?)
         order by created_at asc
         limit ?`,
@@ -839,7 +876,10 @@ export class LocalEventBuffer {
 
   markUploaded(ids: string[], uploadedAt = new Date().toISOString()) {
     if (ids.length === 0) return 0;
-    const mark = this.db.prepare(`update buffered_events set uploaded_at = ? where id = ?`);
+    const privacyEligible = terminalPrivacyEligibilitySql(this.db, "buffered_events");
+    const mark = this.db.prepare(
+      `update buffered_events set uploaded_at = ? where id = ? and ${privacyEligible}`,
+    );
     const run = this.db.transaction((eventIds: string[]) => {
       let updated = 0;
       for (const id of eventIds) {
@@ -872,6 +912,7 @@ export class LocalEventBuffer {
   }
 
   stats(): BufferStats {
+    const privacyEligible = terminalPrivacyEligibilitySql(this.db, "buffered_events");
     const events = this.db
       .prepare(
         `select count(*) as count,
@@ -882,7 +923,8 @@ export class LocalEventBuffer {
           coalesce(sum(input_tokens), 0) as totalInputTokens,
           coalesce(sum(output_tokens), 0) as totalOutputTokens,
           coalesce(sum(cost_usd), 0) as totalCostUsd
-        from buffered_events`,
+        from buffered_events
+        where ${privacyEligible}`,
       )
       .get() as Omit<BufferStats, "metricSampleCount">;
 
@@ -905,6 +947,7 @@ export class LocalEventBuffer {
 
   tokenCoverage(sinceDays = 7) {
     const since = new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000).toISOString();
+    const privacyEligible = terminalPrivacyEligibilitySql(this.db, "buffered_events");
     return this.db
       .prepare(
         `select source,
@@ -916,7 +959,7 @@ export class LocalEventBuffer {
           coalesce(sum(output_tokens), 0) as outputTokens,
           coalesce(sum(cost_usd), 0) as costUsd
         from buffered_events
-        where observed_at >= ? and session_id is not null
+        where observed_at >= ? and session_id is not null and ${privacyEligible}
         group by source`,
       )
       .all(since);
