@@ -67,6 +67,9 @@ jobs:
       - name: Prove immutable outcome timeline and bounded recovery
         run: pnpm proof:outcome-timeline
 
+      - name: Prove source-only integrated learning and fleet flow
+        run: pnpm proof:system-e2e
+
       - name: Run strict isolated resource proof
         run: pnpm proof:resource --require-integrated --receipt evidence/resource-proof.json
 

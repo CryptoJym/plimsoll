@@ -142,7 +142,11 @@ The suppression engine is [`packages/shared/src/policy.ts`](packages/shared/src/
 ```bash
 pnpm proof   # 14 checks, writes evidence to evidence/
 pnpm proof:privacy-mode # managed-mode, legacy quarantine, temp-home surface proof
+pnpm proof:system-e2e   # isolated two-machine, cross-stage source release gate
 ```
+
+See [`docs/source-system-e2e.md`](docs/source-system-e2e.md) for the exact
+source boundary and the hosted/controlled-Mac gates that remain not run.
 
 ## The audit story (why this exists in this shape)
 
