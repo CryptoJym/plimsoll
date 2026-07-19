@@ -268,12 +268,20 @@ function runLaunchctl(args: string[]) {
   return result.status === 0;
 }
 
-function launchctlJobIsLoaded() {
+function launchctlJobState() {
   const args = launchctlPrintCommand();
   const result = spawnSync(args[0] ?? "launchctl", args.slice(1), {
     stdio: "ignore",
   });
-  return !result.error && result.status === 0;
+  return {
+    labelReported: !result.error && result.status === 0,
+    exitCode: result.status,
+    errorCode: (result.error as NodeJS.ErrnoException | undefined)?.code ?? null,
+  };
+}
+
+function launchctlJobIsLoaded() {
+  return launchctlJobState().labelReported;
 }
 
 function loadVisibleLaunchAgent(plistPath: string, manifestChanged = false) {
@@ -287,19 +295,74 @@ function loadVisibleLaunchAgent(plistPath: string, manifestChanged = false) {
         loaded: false,
         status: "loaded_job_requires_explicit_reload" as const,
         manifestDigest: visible.manifestDigest,
+        manifestIdentityDigest: visible.manifestIdentityDigest,
       };
     }
     return {
       loaded: true,
       status: "already_loaded" as const,
       manifestDigest: visible.manifestDigest,
+      manifestIdentityDigest: visible.manifestIdentityDigest,
     };
   }
   const loaded = runLaunchctl(launchctlBootstrapCommand(plistPath));
+  if (!loaded) {
+    return {
+      loaded: false,
+      status: "launchctl_failed" as const,
+      manifestDigest: visible.manifestDigest,
+      manifestIdentityDigest: visible.manifestIdentityDigest,
+    };
+  }
+  let after: ReturnType<typeof inspectLaunchAgentManifest> | null = null;
+  try {
+    after = inspectLaunchAgentManifest();
+  } catch {
+    after = null;
+  }
+  const unchangedAfterBootstrap = Boolean(
+    after?.ok &&
+    after.plistPath === plistPath &&
+    after.manifestDigest === visible.manifestDigest &&
+    after.manifestIdentityDigest === visible.manifestIdentityDigest &&
+    after.mode === visible.mode,
+  );
+  if (!unchangedAfterBootstrap) {
+    const bootoutSucceeded = runLaunchctl(launchctlBootoutCommand());
+    const labelStateAfterBootout = launchctlJobState();
+    return {
+      loaded: false,
+      status: "post_bootstrap_manifest_changed" as const,
+      manifestDigest: visible.manifestDigest,
+      manifestIdentityDigest: visible.manifestIdentityDigest,
+      postBootstrapManifestDigest: after?.ok ? after.manifestDigest : null,
+      postBootstrapManifestIdentityDigest: after?.ok ? after.manifestIdentityDigest : null,
+      cleanup: {
+        bootoutAttempted: true,
+        bootoutSucceeded,
+        labelReportedAfterBootout: labelStateAfterBootout.labelReported,
+        labelQueryExitCode: labelStateAfterBootout.exitCode,
+        labelQueryErrorCode: labelStateAfterBootout.errorCode,
+        labelState: labelStateAfterBootout.labelReported
+          ? "reported" as const
+          : labelStateAfterBootout.errorCode
+            ? "query_failed" as const
+            : "not_reported" as const,
+        status: !bootoutSucceeded
+          ? "bootout_failed" as const
+          : labelStateAfterBootout.labelReported
+            ? "bootout_succeeded_label_still_reported" as const
+            : labelStateAfterBootout.errorCode
+              ? "bootout_succeeded_label_query_failed" as const
+              : "bootout_succeeded_label_not_reported" as const,
+      },
+    };
+  }
   return {
-    loaded,
-    status: loaded ? "bootstrap_succeeded" as const : "launchctl_failed" as const,
+    loaded: true,
+    status: "bootstrap_succeeded" as const,
     manifestDigest: visible.manifestDigest,
+    manifestIdentityDigest: visible.manifestIdentityDigest,
   };
 }
 

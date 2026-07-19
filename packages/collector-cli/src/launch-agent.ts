@@ -18,6 +18,8 @@ export const LAUNCH_AGENT_SYSTEM_PATHS = [
 
 const MANIFEST_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
+const PERMISSION_MODE_MASK = 0o7777;
+const SPECIAL_PERMISSION_MASK = 0o7000;
 const MAX_MANIFEST_BYTES = 128 * 1024;
 const XML_PREAMBLE = `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">`;
@@ -135,6 +137,20 @@ function pathDigest(value: string) {
   return digest(path.resolve(value));
 }
 
+function identityDigest(value: FileIdentity) {
+  return digest(JSON.stringify([
+    value.device,
+    value.inode,
+    value.mode,
+    value.links,
+    value.uid,
+    value.gid,
+    value.size,
+    value.modifiedMs,
+    value.changedMs,
+  ]));
+}
+
 function currentUid() {
   return typeof process.getuid === "function" ? process.getuid() : undefined;
 }
@@ -178,6 +194,18 @@ function sameObject(left: FileIdentity, right: FileIdentity) {
   return left.device === right.device && left.inode === right.inode;
 }
 
+function permissionMode(mode: number) {
+  return mode & PERMISSION_MODE_MASK;
+}
+
+function formatPermissionMode(mode: number) {
+  return permissionMode(mode).toString(8).padStart(4, "0");
+}
+
+function assertExactPrivateMode(file: FileIdentity, code: string) {
+  if (permissionMode(file.mode) !== MANIFEST_MODE) fail(code);
+}
+
 function assertSafeAncestor(stat: fs.Stats, finalParent = false) {
   if (stat.isSymbolicLink()) fail("UNSAFE_ANCESTOR_SYMLINK");
   if (!stat.isDirectory()) fail("UNSAFE_ANCESTOR_TYPE");
@@ -193,7 +221,11 @@ function assertSafeLeaf(stat: fs.Stats) {
   if (stat.isSymbolicLink()) fail("UNSAFE_LEAF_SYMLINK");
   if (!stat.isFile()) fail("UNSAFE_LEAF_TYPE");
   if (stat.nlink !== 1) fail("UNSAFE_LEAF_LINK_COUNT");
-  if ((stat.mode & 0o111) !== 0 || (stat.mode & 0o022) !== 0) fail("UNSAFE_LEAF_MODE");
+  if (
+    (stat.mode & SPECIAL_PERMISSION_MASK) !== 0 ||
+    (stat.mode & 0o111) !== 0 ||
+    (stat.mode & 0o022) !== 0
+  ) fail("UNSAFE_LEAF_MODE");
   const uid = currentUid();
   if (uid !== undefined && stat.uid !== uid) fail("UNSAFE_LEAF_OWNER");
 }
@@ -324,7 +356,7 @@ function ensureParent(initial: PathSnapshot, homeDir: string, hook: (() => void)
       const created = lstat(cursor);
       if (!created || created.isSymbolicLink() || !created.isDirectory()) fail("PARENT_CREATE_RACE");
       const uid = currentUid();
-      if ((created.mode & 0o777) !== DIRECTORY_MODE || (uid !== undefined && created.uid !== uid)) {
+      if (permissionMode(created.mode) !== DIRECTORY_MODE || (uid !== undefined && created.uid !== uid)) {
         fail("UNSAFE_PARENT_MODE");
       }
       fsyncDirectory(parent);
@@ -717,8 +749,11 @@ function prepareFile(snapshot: PathSnapshot, content: Buffer) {
   try {
     if (preparedIdentity.links !== 1) fail("PREPARED_LINK_COUNT");
     fs.fchmodSync(descriptor, MANIFEST_MODE);
+    preparedIdentity = identity(fs.fstatSync(descriptor));
+    assertExactPrivateMode(preparedIdentity, "PREPARED_MODE_INVALID");
     writeDescriptor(descriptor, content);
     preparedIdentity = identity(fs.fstatSync(descriptor));
+    assertExactPrivateMode(preparedIdentity, "PREPARED_MODE_INVALID");
     const reread = readBound(descriptor, preparedIdentity);
     if (!reread.equals(content)) fail("PREPARED_CONTENT_MISMATCH");
     validateOwnedManifest(reread.toString("utf8"));
@@ -746,8 +781,11 @@ function writePrivateFile(file: string, content: Buffer) {
   try {
     if (created.links !== 1) fail("ROLLBACK_LINK_COUNT");
     fs.fchmodSync(descriptor, MANIFEST_MODE);
+    created = identity(fs.fstatSync(descriptor));
+    assertExactPrivateMode(created, "ROLLBACK_MODE_INVALID");
     writeDescriptor(descriptor, content);
     created = identity(fs.fstatSync(descriptor));
+    assertExactPrivateMode(created, "ROLLBACK_MODE_INVALID");
     if (!readBound(descriptor, created).equals(content)) fail("ROLLBACK_CONTENT_MISMATCH");
     return created;
   } catch (error) {
@@ -776,7 +814,7 @@ function createRollback(snapshot: PathSnapshot, content: Buffer, boundDescriptor
       preimageFile: path.basename(preimagePath),
       preimageDigest: digest(content),
       preimageBytes: content.length,
-      preimageMode: (snapshot.leaf.mode & 0o777).toString(8).padStart(4, "0"),
+      preimageMode: formatPermissionMode(snapshot.leaf.mode),
       preimageUid: snapshot.leaf.uid,
       preimageGid: snapshot.leaf.gid,
     }, null, 2)}\n`);
@@ -838,7 +876,7 @@ function installReceipt(
     rollback: rollback && preimage.content && preimage.snapshot.leaf ? {
       available: true,
       preimageDigest: digest(preimage.content),
-      preimageMode: (preimage.snapshot.leaf.mode & 0o777).toString(8).padStart(4, "0"),
+      preimageMode: formatPermissionMode(preimage.snapshot.leaf.mode),
       preimagePathHash: pathDigest(rollback.preimagePath),
       receiptPathHash: pathDigest(rollback.receiptPath),
     } : null,
@@ -858,7 +896,7 @@ export function installLaunchAgent(options: LaunchAgentOptions): LaunchAgentInst
       initial.content &&
       initial.snapshot.leaf &&
       initial.content.equals(desired) &&
-      (initial.snapshot.leaf.mode & 0o777) === MANIFEST_MODE,
+      permissionMode(initial.snapshot.leaf.mode) === MANIFEST_MODE,
     );
     if (options.dryRun) {
       return {
@@ -879,6 +917,7 @@ export function installLaunchAgent(options: LaunchAgentOptions): LaunchAgentInst
     const boundDescriptor = initial.descriptor;
     let prepared: ReturnType<typeof prepareFile> | undefined;
     let committed: ReturnType<typeof prepareFile> | undefined;
+    let published: { path: string; identity: FileIdentity } | undefined;
     let claim: { path: string; identity: FileIdentity } | undefined;
     let rollback: ReturnType<typeof createRollback> | undefined;
     try {
@@ -959,11 +998,13 @@ export function installLaunchAgent(options: LaunchAgentOptions): LaunchAgentInst
       if (!sameObject(publishedIdentity, committed.identity) || publishedIdentity.links !== 1) {
         fail("PUBLISHED_OBJECT_CHANGED");
       }
+      assertExactPrivateMode(publishedIdentity, "VISIBLE_MODE_INVALID");
+      published = { path: snapshot.absolutePath, identity: publishedIdentity };
       committed = undefined;
       runHook(options.transactionHooks?.afterCommit);
       assertVisibleContent(snapshot, publishedIdentity, desired);
       const visible = inspectPath(snapshot.absolutePath);
-      if (!visible.leaf || (visible.leaf.mode & 0o777) !== MANIFEST_MODE) fail("VISIBLE_MODE_INVALID");
+      if (!visible.leaf || permissionMode(visible.leaf.mode) !== MANIFEST_MODE) fail("VISIBLE_MODE_INVALID");
       validateOwnedManifest(desired.toString("utf8"));
       if (rollback) assertRollback(snapshot, rollback, initial.content!);
       fsyncDirectory(path.dirname(snapshot.absolutePath));
@@ -974,6 +1015,7 @@ export function installLaunchAgent(options: LaunchAgentOptions): LaunchAgentInst
         fsyncDirectory(path.dirname(snapshot.absolutePath));
         assertVisibleContent(snapshot, visible.leaf, desired);
       }
+      published = undefined;
       return {
         plistPath,
         receipt: installReceipt("installed", digest(desired), rollback, initial),
@@ -982,6 +1024,7 @@ export function installLaunchAgent(options: LaunchAgentOptions): LaunchAgentInst
     } finally {
       if (prepared) unlinkIfIdentity(prepared.path, prepared.identity);
       if (committed) unlinkIfIdentity(committed.path, committed.identity);
+      if (published) unlinkIfIdentity(published.path, published.identity);
       if (claim) restoreUnexpectedClaim(claim.path, snapshot.absolutePath, claim.identity);
     }
   } finally {
@@ -1004,7 +1047,8 @@ export function inspectLaunchAgentManifest(options: { homeDir?: string } = {}) {
       status: "valid" as const,
       plistPath,
       manifestDigest: digest(preimage.content),
-      mode: (preimage.snapshot.leaf!.mode & 0o777).toString(8).padStart(4, "0"),
+      manifestIdentityDigest: identityDigest(preimage.snapshot.leaf!),
+      mode: formatPermissionMode(preimage.snapshot.leaf!.mode),
     };
   } finally {
     if (preimage.descriptor !== undefined) fs.closeSync(preimage.descriptor);

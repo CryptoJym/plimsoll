@@ -16,6 +16,9 @@ import {
 type Check = { name: string; passed: true; details: Record<string, unknown> };
 
 const checks: Check[] = [];
+const PERMISSION_MODE_MASK = 0o7777;
+const SPECIAL_MANIFEST_MODES = [0o4600, 0o2600, 0o1600] as const;
+let temporaryHomes = 0;
 
 function check(name: string, condition: unknown, details: Record<string, unknown> = {}) {
   if (!condition) throw new Error(`${name} failed: ${JSON.stringify(details)}`);
@@ -24,6 +27,14 @@ function check(name: string, condition: unknown, details: Record<string, unknown
 
 function sha256(value: string | Buffer) {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
+}
+
+function permissionMode(file: string) {
+  return fs.lstatSync(file).mode & PERMISSION_MODE_MASK;
+}
+
+function formatMode(mode: number) {
+  return (mode & PERMISSION_MODE_MASK).toString(8).padStart(4, "0");
 }
 
 function errorCode(action: () => unknown) {
@@ -44,14 +55,14 @@ function treeDigest(root: string) {
       const relative = path.relative(root, file);
       const stat = fs.lstatSync(file);
       if (stat.isSymbolicLink()) {
-        rows.push(`${relative}|link|${stat.mode & 0o777}|${fs.readlinkSync(file)}`);
+        rows.push(`${relative}|link|${stat.mode & PERMISSION_MODE_MASK}|${fs.readlinkSync(file)}`);
       } else if (stat.isDirectory()) {
-        rows.push(`${relative}|dir|${stat.mode & 0o777}`);
+        rows.push(`${relative}|dir|${stat.mode & PERMISSION_MODE_MASK}`);
         visit(file);
       } else if (stat.isFile()) {
-        rows.push(`${relative}|file|${stat.mode & 0o777}|${stat.nlink}|${sha256(fs.readFileSync(file))}`);
+        rows.push(`${relative}|file|${stat.mode & PERMISSION_MODE_MASK}|${stat.nlink}|${sha256(fs.readFileSync(file))}`);
       } else {
-        rows.push(`${relative}|other|${stat.mode & 0o777}`);
+        rows.push(`${relative}|other|${stat.mode & PERMISSION_MODE_MASK}`);
       }
     }
   };
@@ -62,6 +73,7 @@ function treeDigest(root: string) {
 function freshHome(sandbox: string, name: string) {
   const home = path.join(sandbox, name);
   fs.mkdirSync(home, { mode: 0o700 });
+  temporaryHomes += 1;
   return home;
 }
 
@@ -172,10 +184,10 @@ function main() {
     check(
       "fresh_apply_is_private_owned_atomic_and_allowlisted",
       fresh.receipt.status === "installed" &&
-        (plistStat.mode & 0o777) === 0o600 &&
+        (plistStat.mode & PERMISSION_MODE_MASK) === 0o600 &&
         plistStat.nlink === 1 &&
         (typeof process.getuid !== "function" || plistStat.uid === process.getuid()) &&
-        (fs.statSync(path.dirname(fresh.plistPath)).mode & 0o777) === 0o700 &&
+        (fs.statSync(path.dirname(fresh.plistPath)).mode & PERMISSION_MODE_MASK) === 0o700 &&
         plist.includes("<key>PLIMSOLL_COLLECTOR_DATA_MODE</key>") &&
         plist.includes("<string>metadata</string>") &&
         !plist.includes(privateSentinel) &&
@@ -183,7 +195,7 @@ function main() {
         hiddenFiles(path.dirname(fresh.plistPath), "plimsoll-prepared").length === 0 &&
         hiddenFiles(path.dirname(fresh.plistPath), "plimsoll-commit").length === 0 &&
         hiddenFiles(path.dirname(fresh.plistPath), "plimsoll-claim").length === 0,
-      { mode: plistStat.mode & 0o777, links: plistStat.nlink, environmentKeys: fresh.receipt.environmentKeys },
+      { mode: plistStat.mode & PERMISSION_MODE_MASK, links: plistStat.nlink, environmentKeys: fresh.receipt.environmentKeys },
     );
 
     const freshInode = plistStat.ino;
@@ -199,6 +211,104 @@ function main() {
         treeDigest(previewHome) === freshTree &&
         hiddenFiles(path.dirname(fresh.plistPath), "plimsoll-rollback").length === 0,
       { status: repeated.receipt.status, inodePreserved: true, rollbackFiles: 0 },
+    );
+
+    const specialNoopResults = SPECIAL_MANIFEST_MODES.map((specialMode, index) => {
+      const home = freshHome(sandbox, `special-noop-home-${index}`);
+      const installed = installLaunchAgent(options(home, path.join(sandbox, `special-noop-${index}`)));
+      const beforeBytes = fs.readFileSync(installed.plistPath);
+      const beforeInode = fs.lstatSync(installed.plistPath).ino;
+      fs.chmodSync(installed.plistPath, specialMode);
+      const beforeAttempt = treeDigest(home);
+      const error = errorCode(() => installLaunchAgent(
+        options(home, path.join(sandbox, `special-noop-${index}`)),
+      ));
+      return {
+        mode: formatMode(specialMode),
+        error,
+        modePreserved: permissionMode(installed.plistPath) === specialMode,
+        inodePreserved: fs.lstatSync(installed.plistPath).ino === beforeInode,
+        bytesPreserved: fs.readFileSync(installed.plistPath).equals(beforeBytes),
+        treePreserved: treeDigest(home) === beforeAttempt,
+      };
+    });
+    check(
+      "special_permission_bits_never_take_byte_identical_unchanged_path",
+      specialNoopResults.every((entry) =>
+        entry.error === "LAUNCH_AGENT_UNSAFE_LEAF_MODE" &&
+        entry.modePreserved &&
+        entry.inodePreserved &&
+        entry.bytesPreserved &&
+        entry.treePreserved
+      ),
+      { modes: specialNoopResults.map(({ mode, error }) => ({ mode, error })) },
+    );
+
+    const specialPreparedResults = SPECIAL_MANIFEST_MODES.map((specialMode, index) => {
+      const home = freshHome(sandbox, `special-prepared-home-${index}`);
+      const plistPath = launchAgentPlistPath(home);
+      const parent = path.dirname(plistPath);
+      const error = errorCode(() => installLaunchAgent({
+        ...options(home, path.join(sandbox, `special-prepared-${index}`)),
+        transactionHooks: {
+          afterPrepare: () => {
+            const prepared = hiddenFiles(parent, "plimsoll-prepared");
+            if (prepared.length !== 1) throw new Error("prepared fixture missing");
+            fs.chmodSync(path.join(parent, prepared[0]!), specialMode);
+          },
+        },
+      }));
+      return {
+        mode: formatMode(specialMode),
+        error,
+        manifestAbsent: !fs.existsSync(plistPath),
+        preparedCleaned: hiddenFiles(parent, "plimsoll-prepared").length === 0,
+      };
+    });
+    check(
+      "special_permission_bits_on_prepared_object_fail_apply_and_leave_no_manifest",
+      specialPreparedResults.every((entry) =>
+        entry.error === "LAUNCH_AGENT_UNSAFE_LEAF_MODE" &&
+        entry.manifestAbsent &&
+        entry.preparedCleaned
+      ),
+      { modes: specialPreparedResults.map(({ mode, error }) => ({ mode, error })) },
+    );
+
+    const specialPostconditionResults = SPECIAL_MANIFEST_MODES.map((specialMode, index) => {
+      const home = freshHome(sandbox, `special-postcondition-home-${index}`);
+      const original = installLaunchAgent(options(home, path.join(sandbox, `special-postcondition-old-${index}`)));
+      const originalBytes = fs.readFileSync(original.plistPath);
+      const originalInode = fs.lstatSync(original.plistPath).ino;
+      let returned = false;
+      const error = errorCode(() => {
+        const result = installLaunchAgent({
+          ...options(home, path.join(sandbox, `special-postcondition-new-${index}`)),
+          transactionHooks: {
+            afterCommit: () => fs.chmodSync(original.plistPath, specialMode),
+          },
+        });
+        returned = Boolean(result);
+      });
+      return {
+        mode: formatMode(specialMode),
+        error,
+        returned,
+        originalRestored: fs.readFileSync(original.plistPath).equals(originalBytes) &&
+          fs.lstatSync(original.plistPath).ino === originalInode &&
+          permissionMode(original.plistPath) === 0o600,
+        claimsCleaned: hiddenFiles(path.dirname(original.plistPath), "plimsoll-claim").length === 0,
+      };
+    });
+    check(
+      "special_permission_bits_after_publication_fail_postcondition_and_restore_owned_preimage",
+      specialPostconditionResults.every((entry) =>
+        !entry.returned &&
+        entry.error === "LAUNCH_AGENT_UNSAFE_LEAF_MODE" &&
+        entry.originalRestored &&
+        entry.claimsCleaned
+      ),
+      { modes: specialPostconditionResults.map(({ mode, error, returned }) => ({ mode, error, returned })) },
     );
 
     const previewUninstallTree = treeDigest(previewHome);
@@ -264,8 +374,8 @@ function main() {
     check(
       "unsafe_destination_mode_is_rejected_without_repermissioning",
       modeError === "LAUNCH_AGENT_UNSAFE_LEAF_MODE" &&
-        (fs.statSync(launchAgentPlistPath(modeHome)).mode & 0o777) === 0o660,
-      { error: modeError, mode: fs.statSync(launchAgentPlistPath(modeHome)).mode & 0o777 },
+        permissionMode(launchAgentPlistPath(modeHome)) === 0o660,
+      { error: modeError, mode: permissionMode(launchAgentPlistPath(modeHome)) },
     );
 
     const ownerHome = freshHome(sandbox, "unsafe-owner-home");
@@ -369,16 +479,16 @@ function main() {
         replacement.receipt.rollback?.available === true &&
         Boolean(replacement.rollbackFiles) &&
         fs.readFileSync(replacement.rollbackFiles!.preimagePath).equals(preimage) &&
-        (fs.statSync(replacement.rollbackFiles!.preimagePath).mode & 0o777) === 0o600 &&
-        (fs.statSync(replacement.rollbackFiles!.receiptPath).mode & 0o777) === 0o600 &&
+        permissionMode(replacement.rollbackFiles!.preimagePath) === 0o600 &&
+        permissionMode(replacement.rollbackFiles!.receiptPath) === 0o600 &&
         rollbackReceipt?.preimageDigest === sha256(preimage) &&
         rollbackReceipt?.preimageMode === "0644" &&
         fs.statSync(first.plistPath).ino !== preimageInode &&
-        (fs.statSync(first.plistPath).mode & 0o777) === 0o600,
+        permissionMode(first.plistPath) === 0o600,
       {
         preimageExact: true,
         preimageMode: replacement.receipt.rollback?.preimageMode,
-        installedMode: fs.statSync(first.plistPath).mode & 0o777,
+        installedMode: permissionMode(first.plistPath),
       },
     );
 
@@ -575,10 +685,19 @@ function main() {
     fs.writeFileSync(launchctl, `#!/bin/sh
 printf '%s\\n' "$1" >> "$PLIMSOLL_TEST_LAUNCHCTL_LOG"
 case "$1" in
-  print) test -f "$PLIMSOLL_TEST_LAUNCHCTL_STATE" ;;
+  print) test -f "$PLIMSOLL_TEST_LAUNCHCTL_STATE" && ! grep -qx 'booted_out' "$PLIMSOLL_TEST_LAUNCHCTL_STATE" ;;
   bootstrap)
     if [ "\${PLIMSOLL_TEST_LAUNCHCTL_FAIL:-0}" = "1" ]; then exit 42; fi
     : > "$PLIMSOLL_TEST_LAUNCHCTL_STATE"
+    if [ -n "\${PLIMSOLL_TEST_SWAP_MANIFEST:-}" ]; then
+      printf '%s\n' 'operator-bootstrap-window-replacement' > "$PLIMSOLL_TEST_SWAP_MANIFEST"
+      chmod 600 "$PLIMSOLL_TEST_SWAP_MANIFEST"
+    fi
+    exit 0
+    ;;
+  bootout)
+    if [ "\${PLIMSOLL_TEST_BOOTOUT_FAIL:-0}" = "1" ]; then exit 43; fi
+    printf '%s\n' 'booted_out' > "$PLIMSOLL_TEST_LAUNCHCTL_STATE"
     exit 0
     ;;
   *) exit 64 ;;
@@ -637,6 +756,90 @@ esac
       },
     );
 
+    const swapLoadHome = freshHome(sandbox, "load-bootstrap-swap-home");
+    const swapLoadInstall = installLaunchAgent(options(swapLoadHome, path.join(sandbox, "load-bootstrap-swap")));
+    const swapLaunchctlLog = path.join(sandbox, "launchctl-swap.log");
+    const swapLaunchctlState = path.join(sandbox, "launchctl-swap.state");
+    const swapLoad = command(process.execPath, [tsx, cli, "load-launch-agent"], {
+      cwd: root,
+      env: {
+        ...baseEnv,
+        HOME: swapLoadHome,
+        PLIMSOLL_TEST_LAUNCHCTL_LOG: swapLaunchctlLog,
+        PLIMSOLL_TEST_LAUNCHCTL_STATE: swapLaunchctlState,
+        PLIMSOLL_TEST_SWAP_MANIFEST: swapLoadInstall.plistPath,
+      },
+    });
+    const swapLoadReceipt = parseJson(swapLoad.stdout);
+    const swapCleanup = swapLoadReceipt.cleanup as Record<string, unknown>;
+    const swapCalls = fs.readFileSync(swapLaunchctlLog, "utf8").trim().split("\n");
+    check(
+      "bootstrap_window_manifest_swap_fails_and_bootout_cleanup_is_proved",
+      swapLoad.code === 1 &&
+        swapLoadReceipt.loaded === false &&
+        swapLoadReceipt.status === "post_bootstrap_manifest_changed" &&
+        typeof swapLoadReceipt.manifestDigest === "string" &&
+        typeof swapLoadReceipt.manifestIdentityDigest === "string" &&
+        swapLoadReceipt.postBootstrapManifestDigest === null &&
+        swapLoadReceipt.postBootstrapManifestIdentityDigest === null &&
+        swapCleanup.bootoutAttempted === true &&
+        swapCleanup.bootoutSucceeded === true &&
+        swapCleanup.labelReportedAfterBootout === false &&
+        swapCleanup.labelQueryExitCode === 1 &&
+        swapCleanup.labelQueryErrorCode === null &&
+        swapCleanup.labelState === "not_reported" &&
+        swapCleanup.status === "bootout_succeeded_label_not_reported" &&
+        fs.readFileSync(swapLaunchctlState, "utf8").trim() === "booted_out" &&
+        fs.readFileSync(swapLoadInstall.plistPath, "utf8").trim() === "operator-bootstrap-window-replacement" &&
+        swapCalls.join(",") === "print,bootstrap,bootout,print",
+      {
+        exitCode: swapLoad.code,
+        status: swapLoadReceipt.status,
+        cleanupStatus: swapCleanup.status,
+        loadedClaimed: swapLoadReceipt.loaded,
+      },
+    );
+
+    const failedCleanupHome = freshHome(sandbox, "load-bootstrap-swap-cleanup-fail-home");
+    const failedCleanupInstall = installLaunchAgent(
+      options(failedCleanupHome, path.join(sandbox, "load-bootstrap-swap-cleanup-fail")),
+    );
+    const failedCleanupLog = path.join(sandbox, "launchctl-swap-cleanup-fail.log");
+    const failedCleanupState = path.join(sandbox, "launchctl-swap-cleanup-fail.state");
+    const failedCleanupLoad = command(process.execPath, [tsx, cli, "load-launch-agent"], {
+      cwd: root,
+      env: {
+        ...baseEnv,
+        HOME: failedCleanupHome,
+        PLIMSOLL_TEST_LAUNCHCTL_LOG: failedCleanupLog,
+        PLIMSOLL_TEST_LAUNCHCTL_STATE: failedCleanupState,
+        PLIMSOLL_TEST_SWAP_MANIFEST: failedCleanupInstall.plistPath,
+        PLIMSOLL_TEST_BOOTOUT_FAIL: "1",
+      },
+    });
+    const failedCleanupReceipt = parseJson(failedCleanupLoad.stdout);
+    const failedCleanup = failedCleanupReceipt.cleanup as Record<string, unknown>;
+    check(
+      "bootstrap_window_cleanup_failure_preserves_literal_bootout_truth",
+      failedCleanupLoad.code === 43 &&
+        failedCleanupReceipt.loaded === false &&
+        failedCleanupReceipt.status === "post_bootstrap_manifest_changed" &&
+        failedCleanup.bootoutAttempted === true &&
+        failedCleanup.bootoutSucceeded === false &&
+        failedCleanup.labelReportedAfterBootout === true &&
+        failedCleanup.labelQueryExitCode === 0 &&
+        failedCleanup.labelState === "reported" &&
+        failedCleanup.status === "bootout_failed" &&
+        fs.existsSync(failedCleanupState) &&
+        fs.readFileSync(failedCleanupInstall.plistPath, "utf8").trim() === "operator-bootstrap-window-replacement",
+      {
+        exitCode: failedCleanupLoad.code,
+        status: failedCleanupReceipt.status,
+        cleanupStatus: failedCleanup.status,
+        labelReportedAfterBootout: failedCleanup.labelReportedAfterBootout,
+      },
+    );
+
     const uninstallSwapHome = freshHome(sandbox, "uninstall-swap-home");
     const uninstallSwapInstall = installLaunchAgent(options(uninstallSwapHome));
     const uninstallDetached = path.join(path.dirname(uninstallSwapInstall.plistPath), "uninstall-detached");
@@ -683,7 +886,7 @@ esac
       ok: checks.every((entry) => entry.passed),
       node: { major: 22, version: process.versions.node },
       isolation: {
-        temporaryHomes: 21,
+        temporaryHomes,
         realLaunchAgentsTouched: 0,
         realLaunchctlCalls: 0,
         credentialOperations: 0,
