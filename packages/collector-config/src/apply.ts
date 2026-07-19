@@ -1,4 +1,6 @@
 import fs from "node:fs";
+import { isDeepStrictEqual } from "node:util";
+import { parse as parseToml } from "smol-toml";
 
 /**
  * Config APPLY mode (issue 0003): idempotent, surgical merges of Plimsoll's
@@ -72,7 +74,519 @@ export function applyClaudeSettings(
   return { path: file, changed: true, changes, backupPath };
 }
 
-/** Append the [otel] sections to codex config.toml when absent. */
+type TomlRecord = Record<string, unknown>;
+
+type TomlHeader = {
+  index: number;
+  kind: "table" | "array";
+  path: string[];
+};
+
+type TomlAssignment = {
+  index: number;
+  tableKind: "table" | "array" | "root";
+  tablePath: string[];
+  keyPath: string[];
+  valueStart: number;
+  valueEnd: number;
+  valueRaw: string;
+};
+
+type TomlScan = {
+  headers: TomlHeader[];
+  assignments: TomlAssignment[];
+};
+
+type ManagedTable = {
+  path: string[];
+  keys: string[];
+};
+
+const MANAGED_TABLES: ManagedTable[] = [
+  { path: ["otel"], keys: ["environment", "log_user_prompt"] },
+  { path: ["otel", "exporter", "otlp-http"], keys: ["endpoint", "protocol", "headers"] },
+  { path: ["otel", "trace_exporter", "otlp-http"], keys: ["endpoint", "protocol", "headers"] },
+  { path: ["otel", "metrics_exporter", "otlp-http"], keys: ["endpoint", "protocol", "headers"] },
+  { path: ["features"], keys: ["hooks"] },
+];
+
+const HOOK_EVENTS = ["UserPromptSubmit", "PostToolUse", "Stop"] as const;
+const PLIMSOLL_HEADER = "x-plimsoll-source";
+const LEGACY_PLIMSOLL_HEADERS = new Set(["x-cfo-one-source"]);
+
+function isRecord(value: unknown): value is TomlRecord {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function samePath(left: string[], right: string[]) {
+  return left.length === right.length && left.every((part, index) => part === right[index]);
+}
+
+function displayPath(parts: string[]) {
+  return parts.map((part) => (/^[A-Za-z0-9_-]+$/.test(part) ? part : JSON.stringify(part))).join(".");
+}
+
+function getPath(root: unknown, parts: string[]): unknown {
+  let current = root;
+  for (const part of parts) {
+    if (!isRecord(current) || !Object.hasOwn(current, part)) return undefined;
+    current = current[part];
+  }
+  return current;
+}
+
+function containsExpected(actual: unknown, expected: unknown): boolean {
+  if (Array.isArray(expected)) {
+    return Array.isArray(actual) && expected.every((expectedEntry) =>
+      actual.some((actualEntry) => containsExpected(actualEntry, expectedEntry))
+    );
+  }
+  if (isRecord(expected)) {
+    return isRecord(actual) && Object.entries(expected).every(([key, value]) =>
+      Object.hasOwn(actual, key) && containsExpected(actual[key], value)
+    );
+  }
+  return isDeepStrictEqual(actual, expected);
+}
+
+function parseDocument(file: string, source: string, generated = false): TomlRecord {
+  try {
+    const parsed = parseToml(source);
+    if (!isRecord(parsed)) throw new Error("root is not a table");
+    return parsed;
+  } catch {
+    const subject = generated ? "generated Codex TOML" : "existing Codex config.toml";
+    throw new Error(`${file}: ${subject} is invalid; refusing to write or create a backup.`);
+  }
+}
+
+function commentStart(line: string) {
+  let quote: "single" | "double" | null = null;
+  let escaped = false;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    if (quote === "double") {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') quote = null;
+      continue;
+    }
+    if (quote === "single") {
+      if (char === "'") quote = null;
+      continue;
+    }
+    if (char === '"') quote = "double";
+    else if (char === "'") quote = "single";
+    else if (char === "#") return index;
+  }
+  return line.length;
+}
+
+function topLevelEquals(value: string) {
+  let quote: "single" | "double" | null = null;
+  let escaped = false;
+  let braces = 0;
+  let brackets = 0;
+  for (let index = 0; index < value.length; index += 1) {
+    const char = value[index];
+    if (quote === "double") {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') quote = null;
+      continue;
+    }
+    if (quote === "single") {
+      if (char === "'") quote = null;
+      continue;
+    }
+    if (char === '"') quote = "double";
+    else if (char === "'") quote = "single";
+    else if (char === "{") braces += 1;
+    else if (char === "}") braces -= 1;
+    else if (char === "[") brackets += 1;
+    else if (char === "]") brackets -= 1;
+    else if (char === "=" && braces === 0 && brackets === 0) return index;
+  }
+  return -1;
+}
+
+function parseDottedKey(value: string): string[] | null {
+  const parts: string[] = [];
+  let index = 0;
+  const whitespace = () => {
+    while (index < value.length && /\s/.test(value[index]!)) index += 1;
+  };
+  whitespace();
+  while (index < value.length) {
+    let part = "";
+    if (value[index] === '"') {
+      const start = index;
+      index += 1;
+      let escaped = false;
+      while (index < value.length) {
+        const char = value[index++]!;
+        if (escaped) escaped = false;
+        else if (char === "\\") escaped = true;
+        else if (char === '"') break;
+      }
+      if (value[index - 1] !== '"') return null;
+      try {
+        part = JSON.parse(value.slice(start, index)) as string;
+      } catch {
+        return null;
+      }
+    } else if (value[index] === "'") {
+      index += 1;
+      const end = value.indexOf("'", index);
+      if (end === -1) return null;
+      part = value.slice(index, end);
+      index = end + 1;
+    } else {
+      const match = value.slice(index).match(/^[A-Za-z0-9_-]+/);
+      if (!match) return null;
+      part = match[0];
+      index += part.length;
+    }
+    parts.push(part);
+    whitespace();
+    if (index === value.length) return parts;
+    if (value[index] !== ".") return null;
+    index += 1;
+    whitespace();
+  }
+  return parts.length > 0 ? parts : null;
+}
+
+function scanToml(lines: string[]): TomlScan {
+  const headers: TomlHeader[] = [];
+  const assignments: TomlAssignment[] = [];
+  let tableKind: "table" | "array" | "root" = "root";
+  let tablePath: string[] = [];
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    const end = commentStart(line);
+    const content = line.slice(0, end).trim();
+    if (!content) continue;
+    const arrayHeader = content.startsWith("[[") && content.endsWith("]]" );
+    const tableHeader = !arrayHeader && content.startsWith("[") && content.endsWith("]");
+    if (arrayHeader || tableHeader) {
+      const inner = content.slice(arrayHeader ? 2 : 1, arrayHeader ? -2 : -1);
+      const parsed = parseDottedKey(inner);
+      if (parsed) {
+        tableKind = arrayHeader ? "array" : "table";
+        tablePath = parsed;
+        headers.push({ index, kind: tableKind, path: parsed });
+      }
+      continue;
+    }
+    const equals = topLevelEquals(line.slice(0, end));
+    if (equals === -1) continue;
+    const keyPath = parseDottedKey(line.slice(0, equals).trim());
+    if (!keyPath) continue;
+    let valueStart = equals + 1;
+    while (valueStart < end && /\s/.test(line[valueStart]!)) valueStart += 1;
+    let valueEnd = end;
+    while (valueEnd > valueStart && /\s/.test(line[valueEnd - 1]!)) valueEnd -= 1;
+    assignments.push({
+      index,
+      tableKind,
+      tablePath: [...tablePath],
+      keyPath,
+      valueStart,
+      valueEnd,
+      valueRaw: line.slice(valueStart, valueEnd),
+    });
+  }
+  return { headers, assignments };
+}
+
+function detectLineEnding(file: string, source: string) {
+  const withoutCrLf = source.replace(/\r\n/g, "");
+  if (withoutCrLf.includes("\r") || (source.includes("\r\n") && withoutCrLf.includes("\n"))) {
+    throw new Error(`${file}: existing Codex config.toml has mixed or unsupported line endings; refusing to write or create a backup.`);
+  }
+  return source.includes("\r\n") ? "\r\n" : "\n";
+}
+
+function appendBlock(lines: string[], block: string[]) {
+  if (lines.length === 1 && lines[0] === "") {
+    lines.splice(0, 1, ...block, "");
+    return;
+  }
+  if (lines.at(-1) !== "") lines.push("");
+  if (lines.length > 1 && lines.at(-2) !== "") lines.push("");
+  lines.push(...block, "");
+}
+
+function generatedAssignment(
+  file: string,
+  generatedLines: string[],
+  tablePath: string[],
+  key: string,
+) {
+  const matches = scanToml(generatedLines).assignments.filter((entry) =>
+    entry.tableKind === "table" &&
+    samePath(entry.tablePath, tablePath) &&
+    entry.keyPath.length === 1 &&
+    entry.keyPath[0] === key
+  );
+  if (matches.length !== 1) {
+    throw new Error(`${file}: generated Codex TOML has an unsupported ${displayPath([...tablePath, key])} layout.`);
+  }
+  return matches[0]!;
+}
+
+function splitInlineTable(value: string): string[] | null {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return null;
+  const inner = trimmed.slice(1, -1);
+  const entries: string[] = [];
+  let start = 0;
+  let quote: "single" | "double" | null = null;
+  let escaped = false;
+  let braces = 0;
+  let brackets = 0;
+  for (let index = 0; index < inner.length; index += 1) {
+    const char = inner[index];
+    if (quote === "double") {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') quote = null;
+      continue;
+    }
+    if (quote === "single") {
+      if (char === "'") quote = null;
+      continue;
+    }
+    if (char === '"') quote = "double";
+    else if (char === "'") quote = "single";
+    else if (char === "{") braces += 1;
+    else if (char === "}") braces -= 1;
+    else if (char === "[") brackets += 1;
+    else if (char === "]") brackets -= 1;
+    else if (char === "," && braces === 0 && brackets === 0) {
+      entries.push(inner.slice(start, index).trim());
+      start = index + 1;
+    }
+  }
+  const tail = inner.slice(start).trim();
+  if (tail) entries.push(tail);
+  if (entries.some((entry) => !entry || topLevelEquals(entry) === -1)) return null;
+  return entries;
+}
+
+function reconcileHeaders(file: string, raw: string, current: TomlRecord) {
+  const entries = splitInlineTable(raw);
+  if (!entries) {
+    throw new Error(`${file}: managed exporter headers use an unsupported layout; refusing to write or create a backup.`);
+  }
+  const kept: string[] = [];
+  let foundPlimsoll = false;
+  let removedLegacy = false;
+  for (const entry of entries) {
+    const equals = topLevelEquals(entry);
+    const key = equals === -1 ? null : parseDottedKey(entry.slice(0, equals).trim());
+    if (!key || key.length !== 1) {
+      kept.push(entry);
+      continue;
+    }
+    if (LEGACY_PLIMSOLL_HEADERS.has(key[0]!)) {
+      removedLegacy = true;
+      continue;
+    }
+    if (key[0] === PLIMSOLL_HEADER) {
+      foundPlimsoll = true;
+      if (current[PLIMSOLL_HEADER] !== "codex") {
+        kept.push(`"${PLIMSOLL_HEADER}" = "codex"`);
+      } else {
+        kept.push(entry);
+      }
+      continue;
+    }
+    kept.push(entry);
+  }
+  if (!foundPlimsoll) kept.push(`"${PLIMSOLL_HEADER}" = "codex"`);
+  return {
+    value: `{ ${kept.join(", ")} }`,
+    action: removedLegacy
+      ? `replace legacy x-cfo-one-source with ${PLIMSOLL_HEADER}`
+      : foundPlimsoll
+        ? `update ${PLIMSOLL_HEADER}`
+        : `add ${PLIMSOLL_HEADER}`,
+  };
+}
+
+function hasLegacyHeaders(document: TomlRecord) {
+  return MANAGED_TABLES.some((table) => {
+    if (!table.keys.includes("headers")) return false;
+    const headers = getPath(document, [...table.path, "headers"]);
+    return isRecord(headers) && [...LEGACY_PLIMSOLL_HEADERS].some((key) => Object.hasOwn(headers, key));
+  });
+}
+
+function generatedHookBlock(file: string, generatedLines: string[], event: string) {
+  const headers = scanToml(generatedLines).headers;
+  const startHeader = headers.find((entry) =>
+    entry.kind === "array" && samePath(entry.path, ["hooks", event])
+  );
+  if (!startHeader) throw new Error(`${file}: generated Codex TOML is missing hooks.${event}.`);
+  const nextEvent = headers.find((entry) =>
+    entry.index > startHeader.index &&
+    entry.kind === "array" &&
+    entry.path.length === 2 &&
+    entry.path[0] === "hooks"
+  );
+  let end = nextEvent?.index ?? generatedLines.length;
+  while (end > startHeader.index && generatedLines[end - 1]?.trim() === "") end -= 1;
+  return generatedLines.slice(startHeader.index, end);
+}
+
+function reconcileCodexToml(file: string, current: string, generatedToml: string) {
+  const document = parseDocument(file, current);
+  const expected = parseDocument(file, generatedToml, true);
+  if (containsExpected(document, expected) && !hasLegacyHeaders(document)) {
+    return { next: current, changes: [] as string[] };
+  }
+
+  const expectedEndpointPaths = MANAGED_TABLES
+    .filter((table) => table.keys.includes("endpoint"))
+    .map((table) => [...table.path, "endpoint"]);
+  const hasExpectedEndpoint = expectedEndpointPaths.some((parts) =>
+    isDeepStrictEqual(getPath(document, parts), getPath(expected, parts))
+  );
+  if (getPath(document, ["otel"]) !== undefined && !hasExpectedEndpoint) {
+    return {
+      next: current,
+      changes: [] as string[],
+      conflict:
+        "config.toml already has an [otel] configuration without this Plimsoll collector endpoint — not touching it. " +
+        "Remove or repoint it manually, then re-run.",
+    };
+  }
+
+  const lineEnding = detectLineEnding(file, current);
+  const lines = current.split(/\r?\n/);
+  const generatedLines = generatedToml.split("\n");
+  const changes: string[] = [];
+
+  for (const table of MANAGED_TABLES) {
+    const scan = scanToml(lines);
+    const headers = scan.headers.filter((entry) => entry.kind === "table" && samePath(entry.path, table.path));
+    if (headers.length > 1) {
+      throw new Error(`${file}: ${displayPath(table.path)} is declared more than once; refusing to write or create a backup.`);
+    }
+    const desired = table.keys.map((key) => ({
+      key,
+      value: getPath(expected, [...table.path, key]),
+      generated: generatedAssignment(file, generatedLines, table.path, key),
+    }));
+
+    if (headers.length === 0) {
+      const represented = desired.filter(({ key }) => getPath(document, [...table.path, key]) !== undefined);
+      if (represented.length > 0) {
+        throw new Error(
+          `${file}: ${displayPath(table.path)} uses dotted, inline, or implicit managed keys without a writable table; ` +
+          "refusing to write or create a backup.",
+        );
+      }
+      appendBlock(lines, [
+        `[${table.path.map((part) => (/^[A-Za-z0-9_-]+$/.test(part) ? part : JSON.stringify(part))).join(".")}]`,
+        ...desired.map(({ key, generated }) => `${key} = ${generated.valueRaw}`),
+      ]);
+      for (const { key } of desired) changes.push(`${displayPath([...table.path, key])} + generated Plimsoll value`);
+      continue;
+    }
+
+    const header = headers[0]!;
+    const nextHeader = scan.headers.find((entry) => entry.index > header.index);
+    const sectionEnd = nextHeader?.index ?? lines.length;
+    const assignments = scan.assignments.filter((entry) =>
+      entry.index > header.index &&
+      entry.index < sectionEnd &&
+      entry.tableKind === "table" &&
+      samePath(entry.tablePath, table.path) &&
+      entry.keyPath.length === 1
+    );
+    const additions: string[] = [];
+    for (const { key, value, generated } of desired) {
+      const currentValue = getPath(document, [...table.path, key]);
+      const assignment = assignments.find((entry) => entry.keyPath[0] === key);
+      const legacyHeaders = key === "headers" && isRecord(currentValue) &&
+        [...LEGACY_PLIMSOLL_HEADERS].some((legacy) => Object.hasOwn(currentValue, legacy));
+      if (isDeepStrictEqual(currentValue, value) && !legacyHeaders) continue;
+      if (currentValue !== undefined && !assignment) {
+        throw new Error(
+          `${file}: ${displayPath([...table.path, key])} uses an unsupported dotted or inline layout; ` +
+          "refusing to write or create a backup.",
+        );
+      }
+      if (!assignment) {
+        additions.push(`${key} = ${generated.valueRaw}`);
+        changes.push(`${displayPath([...table.path, key])} + generated Plimsoll value`);
+        continue;
+      }
+
+      let nextValue = generated.valueRaw;
+      let action = "replace with generated Plimsoll value";
+      if (key === "headers" && isRecord(currentValue)) {
+        const reconciled = reconcileHeaders(file, assignment.valueRaw, currentValue);
+        nextValue = reconciled.value;
+        action = reconciled.action;
+      }
+      const line = lines[assignment.index]!;
+      lines[assignment.index] = `${line.slice(0, assignment.valueStart)}${nextValue}${line.slice(assignment.valueEnd)}`;
+      changes.push(`${displayPath([...table.path, key])} ${action}`);
+    }
+    if (additions.length > 0) {
+      const insertion = assignments.length > 0
+        ? Math.max(...assignments.map((entry) => entry.index)) + 1
+        : header.index + 1;
+      lines.splice(insertion, 0, ...additions);
+    }
+  }
+
+  const hookBlocks: string[] = [];
+  for (const event of HOOK_EVENTS) {
+    const expectedEntries = getPath(expected, ["hooks", event]);
+    const currentEntries = getPath(document, ["hooks", event]);
+    if (!Array.isArray(expectedEntries) || expectedEntries.length !== 1) {
+      throw new Error(`${file}: generated Codex TOML has an unsupported hooks.${event} layout.`);
+    }
+    if (containsExpected(currentEntries, expectedEntries)) continue;
+    if (Array.isArray(currentEntries) && currentEntries.some((entry) => JSON.stringify(entry).includes("/hooks/codex"))) {
+      throw new Error(
+        `${file}: hooks.${event} already contains a different Plimsoll Codex hook; ` +
+        "refusing to write or create a backup.",
+      );
+    }
+    hookBlocks.push(...generatedHookBlock(file, generatedLines, event), "");
+    changes.push(`hooks.${event} + generated Plimsoll command hook`);
+  }
+  if (hookBlocks.length > 0) {
+    const hasHooksTable = scanToml(lines).headers.some((entry) =>
+      entry.kind === "table" && samePath(entry.path, ["hooks"])
+    );
+    appendBlock(lines, [...(hasHooksTable ? [] : ["[hooks]", ""]), ...hookBlocks].slice(0, -1));
+  }
+
+  const next = lines.join(lineEnding);
+  let reconciled: TomlRecord;
+  try {
+    reconciled = parseToml(next) as TomlRecord;
+  } catch {
+    throw new Error(
+      `${file}: managed Codex fields use an ambiguous layout that cannot be reconciled without duplicate TOML keys or tables; ` +
+      "refusing to write or create a backup.",
+    );
+  }
+  if (!containsExpected(reconciled, expected) || hasLegacyHeaders(reconciled)) {
+    throw new Error(`${file}: Codex reconciliation did not produce the complete generated subset; refusing to write or create a backup.`);
+  }
+  return { next, changes };
+}
+
+/** Reconcile Plimsoll's generated subset into an existing Codex config.toml. */
 export function applyCodexConfig(
   file: string,
   generatedToml: string,
@@ -80,28 +594,16 @@ export function applyCodexConfig(
 ): ApplyResult {
   const exists = fs.existsSync(file);
   const current = exists ? fs.readFileSync(file, "utf8") : "";
-  const endpointMatch = generatedToml.match(/endpoint\s*=\s*"([^"]+)"/);
-  const endpoint = endpointMatch?.[1] ?? "";
-
-  if (endpoint && current.includes(endpoint)) {
-    return { path: file, changed: false, changes: [] };
+  const plan = reconcileCodexToml(file, current, generatedToml);
+  if (plan.conflict) {
+    return { path: file, changed: false, changes: [], conflict: plan.conflict };
   }
-  if (current.includes("[otel")) {
-    return {
-      path: file,
-      changed: false,
-      changes: [],
-      conflict:
-        "config.toml already has an [otel] section pointing elsewhere — not touching it. " +
-        "Remove or repoint it manually, then re-run.",
-    };
-  }
-  const changes = ["+ [otel] exporter sections (logs + traces → local collector)"];
+  const changes = plan.changes;
+  if (changes.length === 0) return { path: file, changed: false, changes: [] };
   if (options.dryRun) {
     return { path: file, changed: true, changes };
   }
   const backupPath = exists ? backup(file) : undefined;
-  const separator = current.length > 0 && !current.endsWith("\n") ? "\n\n" : current.length > 0 ? "\n" : "";
-  fs.writeFileSync(file, `${current}${separator}${generatedToml.trimEnd()}\n`);
+  fs.writeFileSync(file, plan.next);
   return { path: file, changed: true, changes, backupPath };
 }
