@@ -53,6 +53,16 @@ function emptyRollout(): RolloutScanResult {
     eventsAppended: 0,
     tokensAppended: { input: 0, cachedInput: 0, output: 0 },
     parseErrors: 0,
+    unresolvedRecords: 0,
+    recordsParsed: 0,
+    slicesCommitted: 0,
+    cooperativeYields: 0,
+    excludedGenerations: 0,
+    excludedBytes: 0,
+    deferredGenerations: 0,
+    aborted: false,
+    lastYieldAt: null,
+    automaticBudget: null,
     activity: {
       lastActivityAt: null,
       filesToday: 0,
@@ -83,6 +93,16 @@ function emptyTranscript(): TranscriptScanResult {
     eventsAppended: 0,
     tokensAppended: { input: 0, cacheRead: 0, output: 0 },
     parseErrors: 0,
+    unresolvedRecords: 0,
+    recordsParsed: 0,
+    slicesCommitted: 0,
+    cooperativeYields: 0,
+    excludedGenerations: 0,
+    excludedBytes: 0,
+    deferredGenerations: 0,
+    aborted: false,
+    lastYieldAt: null,
+    automaticBudget: null,
     activity: {
       lastActivityAt: null,
       filesToday: 0,
@@ -193,6 +213,33 @@ async function proveCoalescing() {
       !finalStatus.inFlight &&
       !finalStatus.pending,
     { calls, maxActive, ...finalStatus },
+  );
+}
+
+async function proveStoppingCancelsPendingFollowup() {
+  let release!: () => void;
+  let started!: () => void;
+  const startedPromise = new Promise<void>((resolve) => { started = resolve; });
+  const releasePromise = new Promise<void>((resolve) => { release = resolve; });
+  let calls = 0;
+  const scheduler = new CoalescingMaintenanceScheduler(async () => {
+    calls += 1;
+    started();
+    await releasePromise;
+    return fakeRun();
+  });
+  const first = scheduler.trigger();
+  await startedPromise;
+  const coalesced = scheduler.trigger();
+  scheduler.stopAccepting();
+  await assert.rejects(() => scheduler.trigger(), /maintenance_scheduler_stopping/);
+  release();
+  await Promise.all([first, coalesced, scheduler.waitForIdle()]);
+  const status = scheduler.status();
+  check(
+    "shutdown_stops_accepting_and_cancels_pending_followup",
+    calls === 1 && status.runCount === 1 && !status.pending && !status.inFlight && !status.accepting,
+    { calls, ...status },
   );
 }
 
@@ -526,6 +573,7 @@ async function proveIntegratedIdle(
 
 async function main() {
   await proveCoalescing();
+  await proveStoppingCancelsPendingFollowup();
   await proveProjectionDutyCycle();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-maintenance-proof-"));
   const ledger = path.join(root, "ledger.sqlite");

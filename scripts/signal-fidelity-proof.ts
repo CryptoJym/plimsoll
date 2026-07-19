@@ -1528,6 +1528,28 @@ async function main() {
       rolloutRows.every((row) => row.sessionId !== CODEX_SESSION),
     JSON.stringify({ skipped: firstScan.sessionsSkippedOtlpCovered }),
   );
+  const lateLiveAppend = buffer.append(
+    aiInteractionEventSchema.parse({
+      id: deterministicEventId(["late-live-after-rollout-claim", ROLLOUT_SESSION]),
+      source: "codex",
+      eventType: "assistant_response",
+      observedAt: "2026-06-10T10:00:30.000Z",
+      sessionId: ROLLOUT_SESSION,
+      inputTokens: 99_999,
+      outputTokens: 999,
+    }),
+  );
+  check(
+    "rollout_first_slice_claim_blocks_late_live_double_count",
+    lateLiveAppend === false &&
+      buffer.sessionUsageAuthority("codex", ROLLOUT_SESSION) === "tailer" &&
+      (buffer.database
+        .prepare(`select count(*) as n from buffered_events where id = ?`)
+        .get(deterministicEventId(["late-live-after-rollout-claim", ROLLOUT_SESSION])) as {
+          n: number;
+        }).n === 0,
+    JSON.stringify({ lateLiveAppend }),
+  );
   // Clearing the persistent scan state forces a true re-parse — which must
   // not change counts or sums (deterministic ids + conflict-ignore inserts).
   buffer.database.prepare(`delete from rollout_scan_state`).run();
@@ -1687,7 +1709,8 @@ async function main() {
   fs.rmSync(setupDir, { recursive: true, force: true });
 
   // 14. Claude transcript tailer (history reach). Fixtures mirror live
-  // transcript shapes; the duplicated message id proves stream/retry dedupe.
+  // transcript shapes; the duplicated message id with higher cumulative
+  // usage proves monotonic revision deltas without replay overcount.
   const TRANSCRIPT_SESSION = "44445555-6666-4777-8888-99990000aaaa";
   const TRANSCRIPT_SENTINEL = "TRANSCRIPT_CONTENT_SENTINEL never persist";
   const projectsDir = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-transcripts-"));
@@ -1722,12 +1745,12 @@ async function main() {
     { i: 0, c: 0, o: 0, cost: 0 },
   );
   // fable rates (sourced 2026-06-10), now INCLUDING cache writes (issue 0024 /
-  // #26 retired the floor): msg1(last write wins)=1000in + 200k reads + 1500
-  // cache-writes + 500out → (1000*10 + 200000*1 + 1500*12.5 + 500*50)/1e6 =
+  // #26 retired the floor): msg1 revisions telescope to 1000in + 200k reads +
+  // 1500 cache-writes + 500out → (1000*10 + 200000*1 + 1500*12.5 + 500*50)/1e6 =
   // 0.25375; msg2 = (200*10 + 50*50)/1e6 = 0.0045; total 0.25825.
   check(
     "transcript_usage_ingested_exact_and_deduped",
-    tRows.length === 2 &&
+    tRows.length === 3 &&
       tSum.i === 1200 &&
       tSum.c === 200000 &&
       tSum.o === 550 &&

@@ -9,8 +9,20 @@ import {
   ensureJsonlScanState,
   loadJsonlScanCursor,
   rememberJsonlScanCursor,
+  type JsonlScanCursor,
   type JsonlTailerIo,
 } from "./jsonl-byte-tailer";
+import {
+  beginAutomaticCaptureBaseline,
+  captureBaselineStatus,
+  classifyCaptureBaselineFile,
+  completeAutomaticCaptureBaseline,
+  recordAutomaticCaptureBaselineProgress,
+  stageAutomaticCaptureBaselineObservation,
+  type CaptureBaselineFileObservation,
+} from "./capture-baseline";
+import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
+import { IncrementalJsonlDiscovery } from "./incremental-jsonl-discovery";
 import { readLocalIdentities, type LocalIdentity, type LocalIdentityPaths } from "./local-identity";
 import { deterministicEventId } from "./normalizer";
 import {
@@ -62,6 +74,16 @@ export type RolloutScanResult = {
   eventsAppended: number;
   tokensAppended: { input: number; cachedInput: number; output: number };
   parseErrors: number;
+  unresolvedRecords: number;
+  recordsParsed: number;
+  slicesCommitted: number;
+  cooperativeYields: number;
+  excludedGenerations: number;
+  excludedBytes: number;
+  deferredGenerations: number;
+  aborted: boolean;
+  lastYieldAt: string | null;
+  automaticBudget: CaptureBudgetStatus | null;
   activity: {
     lastActivityAt: string | null;
     filesToday: number;
@@ -77,6 +99,11 @@ export type RolloutScanOptions = {
   scope: "recent" | "full";
   now?: Date;
   discoveryLimit?: number;
+  automatic?: {
+    phase: "baseline" | "capture";
+    budget: CaptureWorkBudget;
+  };
+  signal?: AbortSignal;
 };
 
 type PersistedGitContext = {
@@ -233,7 +260,59 @@ function conversationIdFromFilename(file: string) {
   return match ? match[0].toLowerCase() : undefined;
 }
 
+function baselineObservation(
+  file: string,
+  stat: fs.Stats,
+  precise?: fs.BigIntStats,
+): CaptureBaselineFileObservation {
+  const identity = precise ?? fs.lstatSync(file, { bigint: true });
+  return {
+    path: file,
+    device: identity.dev,
+    inode: identity.ino,
+    size: identity.size,
+    birthtimeNs: identity.birthtimeNs,
+  };
+}
+
+function resultMutationSnapshot(result: RolloutScanResult) {
+  return {
+    parseErrors: result.parseErrors,
+    eventsAppended: result.eventsAppended,
+    filesParsed: result.filesParsed,
+    sessionsSkippedOtlpCovered: result.sessionsSkippedOtlpCovered,
+    tokens: { ...result.tokensAppended },
+  };
+}
+
+function restoreResultMutationSnapshot(
+  result: RolloutScanResult,
+  snapshot: ReturnType<typeof resultMutationSnapshot>,
+) {
+  result.parseErrors = snapshot.parseErrors;
+  result.eventsAppended = snapshot.eventsAppended;
+  result.filesParsed = snapshot.filesParsed;
+  result.sessionsSkippedOtlpCovered = snapshot.sessionsSkippedOtlpCovered;
+  result.tokensAppended = { ...snapshot.tokens };
+}
+
 export class RolloutTailer {
+  private baselineAttempt: {
+    discovery: IncrementalJsonlDiscovery;
+    pendingFiles: Array<{ file: string; stat: fs.Stats; precise: fs.BigIntStats }>;
+    runId: string;
+    filesDiscovered: number;
+    filesValidated: number;
+    cutoffMs: number;
+    sweepsCompleted: number;
+    newGenerationsThisSweep: number;
+  } | null = null;
+  private captureAttempt: {
+    discovery: IncrementalJsonlDiscovery;
+    pendingFiles: Array<{ file: string; stat: fs.Stats; precise: fs.BigIntStats }>;
+    discoveryDone: boolean;
+  } | null = null;
+
   constructor(
     private readonly buffer: LocalEventBuffer,
     private readonly sessionsDir = path.join(os.homedir(), ".codex", "sessions"),
@@ -241,6 +320,13 @@ export class RolloutTailer {
     private readonly io: JsonlTailerIo = DEFAULT_JSONL_TAILER_IO,
   ) {
     ensureJsonlScanState(this.buffer.database);
+  }
+
+  close() {
+    this.baselineAttempt?.discovery.close();
+    this.captureAttempt?.discovery.close();
+    this.baselineAttempt = null;
+    this.captureAttempt = null;
   }
 
   private codexIdentity: LocalIdentity | undefined;
@@ -273,6 +359,16 @@ export class RolloutTailer {
       eventsAppended: 0,
       tokensAppended: { input: 0, cachedInput: 0, output: 0 },
       parseErrors: 0,
+      unresolvedRecords: 0,
+      recordsParsed: 0,
+      slicesCommitted: 0,
+      cooperativeYields: 0,
+      excludedGenerations: 0,
+      excludedBytes: 0,
+      deferredGenerations: 0,
+      aborted: false,
+      lastYieldAt: null,
+      automaticBudget: null,
       activity: {
         lastActivityAt: null,
         filesToday: 0,
@@ -289,15 +385,195 @@ export class RolloutTailer {
     if (this.codexIdentity?.actorHash && this.codexIdentity.email) {
       this.buffer.setAccountEmail(this.codexIdentity.actorHash, this.codexIdentity.email);
     }
-    const discovery = this.discover(options);
+    if (options.scope === "recent" && !options.automatic) {
+      throw new Error("recent_rollout_scan_requires_automatic_control");
+    }
+    const automatic = options.scope === "recent" ? options.automatic! : null;
+    const baselineBefore = captureBaselineStatus(this.buffer.database);
+    const codexBaseline = baselineBefore.sources.find((source) => source.source === "codex")!;
+    if (automatic?.phase === "baseline" && codexBaseline.status === "complete") {
+      this.baselineAttempt?.discovery.close();
+      this.baselineAttempt = null;
+      result.excludedGenerations = codexBaseline.excludedGenerations;
+      result.excludedBytes = codexBaseline.currentExcludedBytes;
+      result.exhaustive = true;
+      result.automaticBudget = automatic.budget.status();
+      return result;
+    }
+
+    if (automatic?.phase === "baseline") {
+      if (!this.baselineAttempt) {
+        const began = beginAutomaticCaptureBaseline(this.buffer.database, "codex", {
+          startedAt: scanNow.toISOString(),
+          filesDiscovered: 0,
+        });
+        if (began.status !== "in_progress" || !began.latestRun) {
+          result.exhaustive = false;
+          result.automaticBudget = automatic.budget.status();
+          return result;
+        }
+        this.baselineAttempt = {
+          discovery: this.recentDiscovery(scanNow, options.discoveryLimit),
+          pendingFiles: [],
+          runId: began.latestRun.runId,
+          filesDiscovered: began.latestRun.filesDiscovered,
+          filesValidated: began.latestRun.filesValidated,
+          cutoffMs: Date.parse(began.latestRun.startedAt),
+          sweepsCompleted: 0,
+          newGenerationsThisSweep: 0,
+        };
+      }
+
+      const attempt = this.baselineAttempt;
+      const chunk = await attempt.discovery.collect(automatic.budget, {
+        signal: options.signal,
+      });
+      attempt.pendingFiles.push(...chunk.files);
+      attempt.filesDiscovered += chunk.files.length;
+      result.filesSeen = chunk.files.length;
+      result.activity.discoveryEntries = chunk.entriesVisited;
+      result.cooperativeYields += chunk.yields;
+      result.lastYieldAt = chunk.lastYieldAt;
+      result.discoveryErrors += chunk.errors;
+      while (attempt.pendingFiles.length > 0) {
+        if (options.signal?.aborted || !automatic.budget.canContinue()) break;
+        const discovered = attempt.pendingFiles[0]!;
+        const file = discovered.file;
+        try {
+          const stat = discovered.stat;
+          const cutoffFloor = BigInt(attempt.cutoffMs) * 1_000_000n;
+          if (
+            discovered.precise.birthtimeNs >= cutoffFloor &&
+            discovered.precise.birthtimeNs < cutoffFloor + 1_000_000n
+          ) throw new Error("capture_baseline_cutoff_ambiguous");
+          const mtime = stat.mtime.toISOString();
+          if (!result.activity.lastActivityAt || mtime > result.activity.lastActivityAt) {
+            result.activity.lastActivityAt = mtime;
+          }
+          if (mtime.slice(0, 10) === today) result.activity.filesToday += 1;
+          if (discovered.precise.birthtimeNs < cutoffFloor) {
+            if (stageAutomaticCaptureBaselineObservation(this.buffer.database, "codex", {
+              runId: attempt.runId,
+              observedAt: new Date().toISOString(),
+              observation: baselineObservation(file, stat, discovered.precise),
+              filesDiscovered: attempt.filesDiscovered,
+              filesValidated: attempt.filesValidated + 1,
+            })) attempt.newGenerationsThisSweep += 1;
+          } else {
+            recordAutomaticCaptureBaselineProgress(this.buffer.database, "codex", {
+              runId: attempt.runId,
+              updatedAt: new Date().toISOString(),
+              filesDiscovered: attempt.filesDiscovered,
+              filesValidated: attempt.filesValidated + 1,
+            });
+          }
+          attempt.filesValidated += 1;
+          attempt.pendingFiles.shift();
+        } catch {
+          result.statErrors += 1;
+          recordAutomaticCaptureBaselineProgress(this.buffer.database, "codex", {
+            runId: attempt.runId,
+            updatedAt: new Date().toISOString(),
+            filesDiscovered: attempt.filesDiscovered,
+            filesValidated: attempt.filesValidated,
+            statErrors: result.statErrors,
+          });
+          this.baselineAttempt = null;
+          result.exhaustive = false;
+          result.automaticBudget = automatic.budget.status();
+          return result;
+        }
+      }
+
+      if (chunk.errors > 0 || chunk.limitReached) {
+        recordAutomaticCaptureBaselineProgress(this.buffer.database, "codex", {
+          runId: attempt.runId,
+          updatedAt: new Date().toISOString(),
+          filesDiscovered: attempt.filesDiscovered,
+          filesValidated: attempt.filesValidated,
+          discoveryErrors: result.discoveryErrors || 1,
+        });
+        attempt.discovery.close();
+        this.baselineAttempt = null;
+        result.activity.truncated = true;
+        result.automaticBudget = automatic.budget.status();
+        return result;
+      }
+
+      if (!chunk.done || attempt.pendingFiles.length > 0) {
+        result.aborted = Boolean(options.signal?.aborted);
+        result.activity.truncated = true;
+        result.deferredGenerations = Math.max(1, attempt.pendingFiles.length);
+        recordAutomaticCaptureBaselineProgress(this.buffer.database, "codex", {
+          runId: attempt.runId,
+          updatedAt: new Date().toISOString(),
+          filesDiscovered: attempt.filesDiscovered,
+          filesValidated: attempt.filesValidated,
+        });
+        result.automaticBudget = automatic.budget.status();
+        return result;
+      }
+
+      attempt.sweepsCompleted += 1;
+      if (attempt.sweepsCompleted < 2 || attempt.newGenerationsThisSweep > 0) {
+        attempt.discovery.close();
+        attempt.discovery = this.recentDiscovery(scanNow, options.discoveryLimit);
+        attempt.newGenerationsThisSweep = 0;
+        result.activity.truncated = true;
+        result.deferredGenerations = 1;
+        result.automaticBudget = automatic.budget.status();
+        return result;
+      }
+
+      const completed = completeAutomaticCaptureBaseline(this.buffer.database, "codex", {
+        runId: attempt.runId,
+        completedAt: new Date().toISOString(),
+      });
+      attempt.discovery.close();
+      this.baselineAttempt = null;
+      result.excludedGenerations = completed.excludedGenerations;
+      result.excludedBytes = completed.currentExcludedBytes;
+      result.exhaustive = completed.status === "complete";
+      result.automaticBudget = automatic.budget.status();
+      return result;
+    }
+
+    const automaticDiscovery = automatic
+      ? await this.collectAutomaticCaptureFiles(options, automatic.budget)
+      : null;
+    const explicitDiscovery = automatic ? null : this.discover(options);
+    const discovery = automaticDiscovery ?? explicitDiscovery!;
+    const discoveredFiles: Array<{ file: string; stat?: fs.Stats; precise?: fs.BigIntStats }> = automaticDiscovery
+      ? automaticDiscovery.files
+      : explicitDiscovery!.files.map((file) => ({ file }));
     result.activity.truncated = discovery.truncated;
     result.discoveryErrors = discovery.errors;
-    for (const file of discovery.files) {
-      result.filesSeen += 1;
-      result.activity.discoveryEntries += 1;
+    result.filesSeen = discovery.files.length;
+    result.activity.discoveryEntries = discovery.files.length;
+    const candidates: Array<{
+      file: string;
+      stat: fs.Stats;
+      cursor: JsonlScanCursor<RolloutParserState> | undefined;
+    }> = [];
+    let automaticFilesConsumed = 0;
+
+    for (let index = 0; index < discoveredFiles.length; index += 1) {
+      const discovered = discoveredFiles[index]!;
+      const file = discovered.file;
+      if (options.signal?.aborted) {
+        result.aborted = true;
+        result.activity.truncated = true;
+        break;
+      }
+      if (automatic && !automatic.budget.canContinue()) {
+        result.activity.truncated = true;
+        result.deferredGenerations += discoveredFiles.length - index;
+        break;
+      }
+      if (automatic) automaticFilesConsumed = index + 1;
       let stat: fs.Stats;
       try {
-        stat = this.io.stat(file);
+        stat = discovered.stat ?? this.regularFileStat(file);
       } catch {
         result.statErrors += 1;
         continue;
@@ -307,6 +583,36 @@ export class RolloutTailer {
         result.activity.lastActivityAt = mtime;
       }
       if (mtime.slice(0, 10) === today) result.activity.filesToday += 1;
+      const observation = baselineObservation(file, stat, discovered.precise);
+      if (automatic?.phase === "capture") {
+        const decision = classifyCaptureBaselineFile(
+          this.buffer.database,
+          "codex",
+          observation,
+          { mode: "automatic", observedAt: scanNow.toISOString() },
+        );
+        if (decision.decision === "exclude") {
+          result.excludedGenerations += 1;
+          result.excludedBytes += stat.size;
+          continue;
+        }
+        if (decision.decision === "block") {
+          result.statErrors += 1;
+          continue;
+        }
+      }
+      if (options.scope === "full" && baselineBefore.status === "complete") {
+        const decision = classifyCaptureBaselineFile(
+          this.buffer.database,
+          "codex",
+          observation,
+          { mode: "explicit_full", observedAt: scanNow.toISOString() },
+        );
+        if (decision.decision === "block") {
+          result.statErrors += 1;
+          continue;
+        }
+      }
       const cursor = loadJsonlScanCursor<RolloutParserState>(
         this.buffer.database,
         file,
@@ -314,55 +620,237 @@ export class RolloutTailer {
         CHECKPOINT_VERSION,
         validateRolloutParserState,
       );
-      let read: ReturnType<JsonlTailerIo["readTail"]>;
-      try {
-        read = this.io.readTail(file, stat, cursor);
-      } catch {
-        // Rotation may remove a file between stat and open. One vanished file
-        // must not abort the rest of the discovery set.
-        result.readErrors += 1;
-        continue;
-      }
-      if (!read) {
-        result.bytesDeferred += cursor?.deferredBytes ?? 0;
-        continue;
-      }
-      result.filesRead += 1;
-      result.bytesRead += read.bytesRead;
-      result.bytesDeferred += read.deferredBytes;
-      if (read.reset) result.filesReset += 1;
-      if (read.legacyRebuild) result.legacyRebuilds += 1;
-      if (read.checkpointRebuild) result.checkpointRebuilds += 1;
+      candidates.push({ file, stat, cursor });
+    }
+    if (automatic) this.consumeAutomaticCaptureFiles(automaticFilesConsumed);
 
-      const initialState = read.reset || !cursor?.parserState
-        ? this.initialParserState(file)
-        : cursor.parserState;
-      const commit = this.buffer.database.transaction(() => {
-        const parseErrorsBefore = result.parseErrors;
-        const parserState = this.ingestLines(file, read.lines, result, initialState);
-        // A complete malformed line is unresolved input, not consumed input.
-        // Retain the prior cursor (or no cursor on first read) so unchanged
-        // retries and restarts cannot turn a failed full scan into completion.
-        if (result.parseErrors === parseErrorsBefore) {
-          rememberJsonlScanCursor(
-            this.buffer.database,
-            file,
-            PARSER_KIND,
-            CHECKPOINT_VERSION,
-            read,
-            parserState,
-          );
+    // Resume already-cursored growth first, then newest new generations. A
+    // large older deferred file cannot outrank a currently growing session.
+    const preferNewest = automatic ? this.nextCandidatePreference() === "newest" : false;
+    candidates.sort((left, right) => {
+      const leftCursor = left.cursor?.checkpointStatus === "valid" ? 1 : 0;
+      const rightCursor = right.cursor?.checkpointStatus === "valid" ? 1 : 0;
+      return preferNewest
+        ? right.stat.mtimeMs - left.stat.mtimeMs || rightCursor - leftCursor || left.file.localeCompare(right.file)
+        : rightCursor - leftCursor || right.stat.mtimeMs - left.stat.mtimeMs || left.file.localeCompare(right.file);
+    });
+
+    for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
+      const candidate = candidates[candidateIndex]!;
+      if (options.signal?.aborted) {
+        result.aborted = true;
+        break;
+      }
+      if (automatic && !automatic.budget.canContinue()) break;
+      let cursor = candidate.cursor;
+      let countedFile = false;
+      while (true) {
+        if (options.signal?.aborted) {
+          result.aborted = true;
+          break;
         }
-      });
-      commit();
-      await new Promise((resolve) => setImmediate(resolve));
+        const limits = automatic
+          ? automatic.budget.remainingSlice()
+          : { maxBytes: 128 * 1024, maxRecords: 64 };
+        if (!limits) break;
+        let read: NonNullable<ReturnType<JsonlTailerIo["readTail"]>>;
+        try {
+          const next = this.io.readTail(candidate.file, candidate.stat, cursor, limits);
+          if (!next) break;
+          read = next;
+        } catch {
+          result.readErrors += 1;
+          break;
+        }
+        if (!countedFile) {
+          result.filesRead += 1;
+          countedFile = true;
+        }
+        result.bytesRead += read.bytesRead;
+        result.recordsParsed += read.lines.length;
+        if (read.reset) result.filesReset += 1;
+        if (read.legacyRebuild) result.legacyRebuilds += 1;
+        if (read.checkpointRebuild) result.checkpointRebuilds += 1;
+
+        const before = resultMutationSnapshot(result);
+        let parseFailure = false;
+        let committed = false;
+        try {
+          const initialState = read.reset || !cursor?.parserState
+            ? this.initialParserState(candidate.file)
+            : cursor.parserState;
+          this.buffer.database.transaction(() => {
+            if (read.unresolvedRecord) {
+              read.assertStableForCommit();
+              rememberJsonlScanCursor(
+                this.buffer.database,
+                candidate.file,
+                PARSER_KIND,
+                CHECKPOINT_VERSION,
+                read,
+                initialState,
+              );
+              return;
+            }
+            const parseErrorsBefore = result.parseErrors;
+            const parserState = this.ingestLines(candidate.file, read.lines, result, initialState);
+            if (result.parseErrors !== parseErrorsBefore) {
+              parseFailure = true;
+              throw new Error("rollout_slice_parse_failed");
+            }
+            read.assertStableForCommit();
+            rememberJsonlScanCursor(
+              this.buffer.database,
+              candidate.file,
+              PARSER_KIND,
+              CHECKPOINT_VERSION,
+              read,
+              parserState,
+            );
+          })();
+          committed = true;
+          result.slicesCommitted += 1;
+          if (read.unresolvedRecord) result.unresolvedRecords += 1;
+        } catch {
+          const parseErrors = result.parseErrors - before.parseErrors;
+          restoreResultMutationSnapshot(result, before);
+          if (parseFailure) result.parseErrors += Math.max(1, parseErrors);
+          else result.readErrors += 1;
+        } finally {
+          read.close();
+        }
+        const appended = committed ? result.eventsAppended - before.eventsAppended : 0;
+        automatic?.budget.recordSlice({
+          bytesRead: read.bytesRead,
+          recordsParsed: read.lines.length,
+          eventsAppended: appended,
+        });
+        if (!committed || read.unresolvedRecord || parseFailure || !read.workRemaining) break;
+
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        result.cooperativeYields += 1;
+        result.lastYieldAt = new Date().toISOString();
+        automatic?.budget.recordYield();
+        cursor = loadJsonlScanCursor<RolloutParserState>(
+          this.buffer.database,
+          candidate.file,
+          PARSER_KIND,
+          CHECKPOINT_VERSION,
+          validateRolloutParserState,
+        );
+        if (automatic && !automatic.budget.canContinue()) break;
+      }
+    }
+
+    // Deferred truth is computed once from durable cursors, never summed per
+    // slice. Excluded generations are reported separately and are not fake
+    // cursor backlog.
+    for (const candidate of candidates) {
+      const cursor = loadJsonlScanCursor<RolloutParserState>(
+        this.buffer.database,
+        candidate.file,
+        PARSER_KIND,
+        CHECKPOINT_VERSION,
+        validateRolloutParserState,
+      );
+      const deferred = Math.max(0, candidate.stat.size - (cursor?.committedOffset ?? 0));
+      result.bytesDeferred += deferred;
+      if (deferred > 0) result.deferredGenerations += 1;
     }
     result.exhaustive =
       !result.activity.truncated &&
       result.discoveryErrors === 0 &&
       result.statErrors === 0 &&
-      result.readErrors === 0;
+      result.readErrors === 0 &&
+      result.parseErrors === 0 &&
+      result.unresolvedRecords === 0 &&
+      result.bytesDeferred === 0 &&
+      !result.aborted;
+    result.automaticBudget = automatic?.budget.status() ?? null;
+    if (automatic && discovery.truncated) result.exhaustive = false;
     return result;
+  }
+
+  private recentDiscovery(now: Date, limit?: number) {
+    const roots = [0, 1].map((offset) => {
+      const day = new Date(now.getTime() - offset * 24 * 60 * 60 * 1000);
+      return path.join(this.sessionsDir, ...day.toISOString().slice(0, 10).split("-"));
+    });
+    return new IncrementalJsonlDiscovery(roots, {
+      recursive: false,
+      matches: (name) => name.startsWith("rollout-") && name.endsWith(".jsonl"),
+      maxEntries: Math.max(1, limit ?? 100_000),
+      missingRootsAreEmpty: true,
+    });
+  }
+
+  private async collectAutomaticCaptureFiles(
+    options: RolloutScanOptions,
+    budget: CaptureWorkBudget,
+  ) {
+    if (!this.captureAttempt) {
+      this.captureAttempt = {
+        discovery: this.recentDiscovery(options.now ?? new Date(), options.discoveryLimit),
+        pendingFiles: [],
+        discoveryDone: false,
+      };
+    }
+    const attempt = this.captureAttempt;
+    let entries = 0;
+    let errors = 0;
+    let truncated = false;
+    if (attempt.pendingFiles.length === 0 && !attempt.discoveryDone) {
+      const chunk = await attempt.discovery.collect(budget, {
+        signal: options.signal,
+        maxFiles: 256,
+      });
+      attempt.pendingFiles.push(...chunk.files);
+      attempt.discoveryDone = chunk.done;
+      entries = chunk.entriesVisited;
+      errors = chunk.errors;
+      truncated = !chunk.done || chunk.limitReached;
+      if (chunk.errors > 0 || chunk.limitReached) attempt.discoveryDone = true;
+    }
+    const files = [...attempt.pendingFiles];
+    const done = attempt.discoveryDone;
+    return { files, errors, truncated: truncated || !done, discoveryEntries: entries };
+  }
+
+  private consumeAutomaticCaptureFiles(count: number) {
+    const attempt = this.captureAttempt;
+    if (!attempt) return;
+    attempt.pendingFiles.splice(0, Math.max(0, count));
+    if (attempt.discoveryDone && attempt.pendingFiles.length === 0) {
+      attempt.discovery.close();
+      this.captureAttempt = null;
+    }
+  }
+
+  private regularFileStat(file: string) {
+    const metadata = this.io.lstat(file);
+    if (metadata.isSymbolicLink() || !metadata.isFile()) {
+      throw new Error("capture_non_regular_file");
+    }
+    const compatibility = this.io.stat(file);
+    if (
+      compatibility.dev !== metadata.dev ||
+      compatibility.ino !== metadata.ino ||
+      compatibility.birthtimeMs !== metadata.birthtimeMs
+    ) throw new Error("capture_file_alias_changed");
+    return metadata;
+  }
+
+  private nextCandidatePreference(): "newest" | "cursor" {
+    const key = "capture_candidate_preference_codex";
+    const row = this.buffer.database.prepare(
+      `select value from maintenance_state where key = ?`,
+    ).get(key) as { value: string } | undefined;
+    const current = row?.value === "cursor" ? "cursor" : "newest";
+    this.buffer.database.prepare(
+      `insert into maintenance_state (key, value, updated_at) values (?, ?, ?)
+       on conflict(key) do update set value = excluded.value, updated_at = excluded.updated_at`,
+    ).run(key, current === "newest" ? "cursor" : "newest", new Date().toISOString());
+    return current;
   }
 
   private discover(options: RolloutScanOptions): {
@@ -434,16 +922,7 @@ export class RolloutTailer {
   }
 
   private sessionHasNonRolloutTokens(sessionId: string) {
-    const row = this.buffer.database
-      .prepare(
-        `select 1 from buffered_events
-         where source = 'codex' and session_id = ?
-           and event_type != 'usage_rollout'
-           and (input_tokens is not null or output_tokens is not null)
-         limit 1`,
-      )
-      .get(sessionId);
-    return Boolean(row);
+    return this.buffer.sessionUsageAuthority("codex", sessionId) === "live";
   }
 
   private initialParserState(file: string): RolloutParserState {
@@ -564,7 +1043,6 @@ export class RolloutTailer {
       });
       const metadata: Record<string, unknown> = {
         usageSource: "rollout",
-        rolloutFile: path.basename(file),
         turnIndex: entry.index,
       };
       if (state.originator) metadata.originator = state.originator;

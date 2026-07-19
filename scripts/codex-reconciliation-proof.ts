@@ -1167,6 +1167,10 @@ async function proveContextRevisionCrashRollbackAndOverlap(root: string) {
           checkpointRebuilds: 0, bytesRead: 0, bytesDeferred: 0,
           sessionsSkippedOtlpCovered: 0, eventsAppended: 0,
           tokensAppended: { input: 0, cachedInput: 0, output: 0 }, parseErrors: 0,
+          unresolvedRecords: 0, recordsParsed: 0, slicesCommitted: 0,
+          cooperativeYields: 0, excludedGenerations: 0, excludedBytes: 0,
+          deferredGenerations: 0, aborted: false, lastYieldAt: null,
+          automaticBudget: null,
           activity: {
             lastActivityAt: null, filesToday: 0, discoveryEntries: 0,
             lastScanAt: new Date(0).toISOString(), truncated: false,
@@ -1179,6 +1183,10 @@ async function proveContextRevisionCrashRollbackAndOverlap(root: string) {
           checkpointRebuilds: 0, bytesRead: 0, bytesDeferred: 0,
           sessionsSkippedLiveCovered: 0, filesSkippedOutsideRecentWindow: 0, eventsAppended: 0,
           tokensAppended: { input: 0, cacheRead: 0, output: 0 }, parseErrors: 0,
+          unresolvedRecords: 0, recordsParsed: 0, slicesCommitted: 0,
+          cooperativeYields: 0, excludedGenerations: 0, excludedBytes: 0,
+          deferredGenerations: 0, aborted: false, lastYieldAt: null,
+          automaticBudget: null,
           activity: {
             lastActivityAt: null, filesToday: 0, discoveryEntries: 0,
             lastScanAt: new Date(0).toISOString(), truncated: false,

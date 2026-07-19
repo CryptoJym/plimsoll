@@ -10,12 +10,132 @@ import {
 } from "./codex-reconciliation";
 import { RolloutTailer, type RolloutScanResult } from "./rollout-tailer";
 import { TranscriptTailer, type TranscriptScanResult } from "./transcript-tailer";
+import { captureBaselineStatus } from "./capture-baseline";
+import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
 
 const PRICING_VERSION_KEY = "pricing_catalog_applied";
 const PRICING_TARGET_KEY = "pricing_catalog_backfill_target";
 const PRICING_CURSOR_KEY = "pricing_catalog_backfill_cursor";
 const REPO_BACKFILL_CURSOR_KEY = "repo_enrichment_backfill_cursor";
 const REPO_BACKFILL_COMPLETE_KEY = "repo_enrichment_backfill_complete";
+const AUTOMATIC_CAPTURE_RUNTIME_TABLE = "automatic_capture_runtime_state";
+
+function ensureAutomaticCaptureRuntimeState(database: Database.Database) {
+  database.exec(`
+    create table if not exists ${AUTOMATIC_CAPTURE_RUNTIME_TABLE} (
+      singleton integer primary key check (singleton = 1),
+      generation integer not null,
+      phase text not null check (phase in ('baseline','capture')),
+      status text not null check (status in ('baseline_in_progress','deferred','complete','complete_with_errors','aborted','failed')),
+      completed_at text not null,
+      bytes_read integer not null,
+      records_parsed integer not null,
+      events_appended integer not null,
+      deferred_bytes integer not null,
+      deferred_generations integer not null,
+      excluded_generations integer not null,
+      error_count integer not null,
+      yields integer not null,
+      last_yield_at text,
+      budget_exhausted_by text check (
+        budget_exhausted_by is null or
+        budget_exhausted_by in ('bytes','records','events','wall')
+      )
+    )
+  `);
+}
+
+function recordAutomaticCaptureRuntimeState(
+  database: Database.Database,
+  phase: "baseline" | "capture",
+  status: "baseline_in_progress" | "deferred" | "complete" | "complete_with_errors" | "aborted" | "failed",
+  budget: CaptureBudgetStatus,
+  rollout?: RolloutScanResult,
+  transcript?: TranscriptScanResult,
+) {
+  ensureAutomaticCaptureRuntimeState(database);
+  const results = [rollout, transcript].filter(Boolean) as Array<RolloutScanResult | TranscriptScanResult>;
+  const sum = (read: (result: RolloutScanResult | TranscriptScanResult) => number) =>
+    results.reduce((total, result) => total + read(result), 0);
+  const lastYieldAt = results
+    .map((result) => result.lastYieldAt)
+    .filter((value): value is string => Boolean(value))
+    .sort()
+    .at(-1) ?? null;
+  database.prepare(
+    `insert into ${AUTOMATIC_CAPTURE_RUNTIME_TABLE} (
+       singleton, generation, phase, status, completed_at, bytes_read, records_parsed,
+       events_appended, deferred_bytes, deferred_generations,
+       excluded_generations, error_count, yields, last_yield_at,
+       budget_exhausted_by
+     ) values (1, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+     on conflict(singleton) do update set
+       generation = ${AUTOMATIC_CAPTURE_RUNTIME_TABLE}.generation + 1,
+       phase = excluded.phase,
+       status = excluded.status,
+       completed_at = excluded.completed_at,
+       bytes_read = excluded.bytes_read,
+       records_parsed = excluded.records_parsed,
+       events_appended = excluded.events_appended,
+       deferred_bytes = excluded.deferred_bytes,
+       deferred_generations = excluded.deferred_generations,
+       excluded_generations = excluded.excluded_generations,
+       error_count = excluded.error_count,
+       yields = excluded.yields,
+       last_yield_at = excluded.last_yield_at,
+       budget_exhausted_by = excluded.budget_exhausted_by`,
+  ).run(
+    phase,
+    status,
+    new Date().toISOString(),
+    sum((result) => result.bytesRead),
+    sum((result) => result.recordsParsed),
+    sum((result) => result.eventsAppended),
+    sum((result) => result.bytesDeferred),
+    sum((result) => result.deferredGenerations),
+    sum((result) => result.excludedGenerations),
+    sum((result) => result.discoveryErrors + result.statErrors + result.readErrors + result.parseErrors + result.unresolvedRecords),
+    sum((result) => result.cooperativeYields),
+    lastYieldAt,
+    budget.exhaustedBy,
+  );
+}
+
+export function automaticCaptureRuntimeStatus(database: Database.Database) {
+  const row = database.prepare(
+    `select generation, phase, status, completed_at as completedAt,
+       bytes_read as bytesRead, records_parsed as recordsParsed,
+       events_appended as eventsAppended, deferred_bytes as deferredBytes,
+       deferred_generations as deferredGenerations,
+       excluded_generations as excludedGenerations, error_count as errorCount,
+       yields, last_yield_at as lastYieldAt,
+       budget_exhausted_by as budgetExhaustedBy
+     from ${AUTOMATIC_CAPTURE_RUNTIME_TABLE} where singleton = 1`,
+  ).get() as Record<string, unknown> | undefined;
+  if (!row) return null;
+  const countsValid = [
+    "bytesRead",
+    "recordsParsed",
+    "eventsAppended",
+    "deferredBytes",
+    "deferredGenerations",
+    "excludedGenerations",
+    "errorCount",
+    "yields",
+  ].every((key) => Number.isSafeInteger(row[key]) && Number(row[key]) >= 0);
+  const exhaustedByValid =
+    row.budgetExhaustedBy === null ||
+    ["bytes", "records", "events", "wall"].includes(String(row.budgetExhaustedBy));
+  const timestampsValid =
+    typeof row.completedAt === "string" &&
+    Number.isFinite(Date.parse(row.completedAt)) &&
+    (row.lastYieldAt === null ||
+      (typeof row.lastYieldAt === "string" && Number.isFinite(Date.parse(row.lastYieldAt))));
+  if (!countsValid || !exhaustedByValid || !timestampsValid) {
+    return { status: "invalid", reason: "automatic_capture_runtime_state_invalid" };
+  }
+  return row;
+}
 
 function maintenanceState(database: Database.Database, key: string) {
   return (
@@ -375,6 +495,7 @@ export type CollectorMaintenanceRunResult = {
   projection?: ReturnType<LocalEventBuffer["projection"]["runMaintenance"]>;
   projectionDrain?: ProjectionDrainResult;
   rawEventWrites: number;
+  postCaptureDeferred?: string[];
 };
 
 export type ProjectionDrainResult = {
@@ -409,14 +530,14 @@ function projectionMigrationRemaining(status:ReturnType<LocalEventBuffer["projec
  */
 export async function drainProjectionMigration(
   projection:LocalEventBuffer["projection"],
-  options:{maxSlices?:number;maxActiveMs?:number;cadenceSeconds?:number}={},
+  options:{maxSlices?:number;maxActiveMs?:number;cadenceSeconds?:number;signal?:AbortSignal;budget?:CaptureWorkBudget}={},
 ){
   const maxSlices=Math.max(1,Math.min(options.maxSlices??PROJECTION_DRAIN_MAX_SLICES,100));
   const maxActiveMs=Math.max(1,Math.min(options.maxActiveMs??PROJECTION_DRAIN_MAX_ACTIVE_MS,5_000));
   const cadenceSeconds=Math.max(1,options.cadenceSeconds??PROJECTION_CADENCE_SECONDS);
   let slices=0,yields=0,migrationRowsVisited=0,activeMs=0;
   let receipt:ReturnType<LocalEventBuffer["projection"]["runMaintenance"]>|undefined;
-  while(slices<maxSlices){
+  while(slices<maxSlices && !options.signal?.aborted && (options.budget?.canStart(5) ?? true)){
     if(slices>0){await new Promise<void>((resolve)=>setImmediate(resolve));yields++;}
     const started=performance.now();
     receipt=projection.runMaintenance();
@@ -436,25 +557,163 @@ export async function drainProjectionMigration(
 }
 
 export class CollectorMaintenance {
+  private current: {
+    phase: "baseline" | "capture";
+    source: "codex" | "claude_code";
+    startedAt: string;
+    budget: CaptureWorkBudget;
+  } | null = null;
+  private lastBudget: CaptureBudgetStatus | null = null;
+  private preferClaude = false;
+
   constructor(
     private readonly buffer: LocalEventBuffer,
     private readonly rolloutTailer: RolloutTailer,
     private readonly transcriptTailer: TranscriptTailer,
-  ) {}
+    private readonly signal?: AbortSignal,
+  ) {
+    ensureAutomaticCaptureRuntimeState(this.buffer.database);
+  }
+
+  status() {
+    return {
+      inFlight: this.current !== null,
+      phase: this.current?.phase ?? null,
+      source: this.current?.source ?? null,
+      startedAt: this.current?.startedAt ?? null,
+      budget: this.current?.budget.status() ?? this.lastBudget,
+      baseline: captureBaselineStatus(this.buffer.database),
+      lastCompleted: automaticCaptureRuntimeStatus(this.buffer.database),
+    };
+  }
+
+  close() {
+    this.rolloutTailer.close();
+    this.transcriptTailer.close();
+  }
 
   async runRecent(): Promise<CollectorMaintenanceRunResult> {
-    const rollout = await this.rolloutTailer.scan({ scope: "recent" });
-    const transcript = await this.transcriptTailer.scan({ scope: "recent" });
-    const reconciliation = runCodexReconciliationMaintenance(this.buffer.database);
-    const repricing = runRepricingMaintenance(this.buffer.database);
-    const enrichment = runRepoEnrichmentMaintenance(this.buffer.database);
-    if (rollout.activity) {
+    const budget = new CaptureWorkBudget();
+    const phase = captureBaselineStatus(this.buffer.database).status === "complete"
+      ? "capture" as const
+      : "baseline" as const;
+    const startedAt = new Date().toISOString();
+    let rollout: RolloutScanResult | undefined;
+    let transcript: TranscriptScanResult | undefined;
+    const runRollout = async () => {
+      this.current = { phase, source: "codex", startedAt, budget };
+      return this.rolloutTailer.scan({
+        scope: "recent",
+        now: new Date(startedAt),
+        automatic: { phase, budget },
+        signal: this.signal,
+      });
+    };
+    const runTranscript = async () => {
+      this.current = { phase, source: "claude_code", startedAt, budget };
+      return this.transcriptTailer.scan({
+        scope: "recent",
+        now: new Date(startedAt),
+        automatic: { phase, budget },
+        signal: this.signal,
+      });
+    };
+    try {
+      if (phase === "capture" && this.preferClaude) {
+        transcript = await runTranscript();
+        rollout = await runRollout();
+      } else {
+        rollout = await runRollout();
+        transcript = await runTranscript();
+      }
+      this.preferClaude = !this.preferClaude;
+      this.lastBudget = budget.status();
+      const errorCount =
+        rollout.discoveryErrors + rollout.statErrors + rollout.readErrors + rollout.parseErrors + rollout.unresolvedRecords +
+        transcript.discoveryErrors + transcript.statErrors + transcript.readErrors + transcript.parseErrors + transcript.unresolvedRecords;
+      if (this.signal?.aborted || rollout.aborted || transcript.aborted) {
+        throw new Error("automatic_maintenance_aborted");
+      }
+    } catch (error) {
+      if (!rollout || !transcript) {
+        recordAutomaticCaptureRuntimeState(this.buffer.database, phase, "failed", budget.status());
+      }
+      throw error;
+    } finally {
+      this.lastBudget = budget.status();
+      this.current = null;
+    }
+    if (!rollout || !transcript) throw new Error("automatic_maintenance_result_missing");
+    const postCaptureDeferred: string[] = [];
+    let reconciliation: CodexReconciliationResult = {
+      backfillComplete: false, legacyRowsVisited: 0, contextRowsVisited: 0,
+      candidateRowsVisited: 0, rowsVisited: 0, rowsChanged: 0, stitched: 0,
+      priced: 0, sliceDurationMs: 0, timeBudgetExhausted: true,
+    };
+    if (!this.signal?.aborted && budget.canStart(15)) {
+      reconciliation = runCodexReconciliationMaintenance(this.buffer.database, {
+        legacyRowLimit: 64,
+        legacyChunkLimit: 64,
+        contextWindowLimit: 2,
+        contextRowLimit: 64,
+        candidateLimit: 32,
+        freshCandidateLimit: 16,
+        timeLimitMs: Math.max(1, Math.min(25, Math.floor(budget.remainingWallMs() - 5))),
+      });
+    } else postCaptureDeferred.push("reconciliation");
+    let repricing: RepricingMaintenanceResult = {
+      catalogFingerprint: pricingCatalogFingerprint(), catalogChanged: false,
+      backfillComplete: false, legacyRowsVisited: 0, candidateRowsVisited: 0,
+      rowsVisited: 0, repriced: 0,
+    };
+    if (!this.signal?.aborted && budget.canStart(12)) {
+      repricing = runRepricingMaintenance(this.buffer.database, {
+        backfillLimit: 32,
+        candidateLimit: 32,
+      });
+    } else postCaptureDeferred.push("repricing");
+    let enrichment: RepoEnrichmentMaintenanceResult = {
+      backfillComplete: false, legacyRowsVisited: 0, sessionsVisited: 0,
+      candidateRowsVisited: 0, rowsVisited: 0, backward: 0, forward: 0,
+    };
+    if (!this.signal?.aborted && budget.canStart(12)) {
+      enrichment = runRepoEnrichmentMaintenance(this.buffer.database, {
+        legacyBackfillLimit: 32,
+        sessionLimit: 4,
+        eventLimit: 32,
+      });
+    } else postCaptureDeferred.push("enrichment");
+    if (rollout.activity && !this.signal?.aborted && budget.canStart(3)) {
       this.buffer.projection.recordCaptureActivity({ source: "codex", ...rollout.activity });
-    }
-    if (transcript.activity) {
+    } else postCaptureDeferred.push("codex_activity");
+    if (transcript.activity && !this.signal?.aborted && budget.canStart(3)) {
       this.buffer.projection.recordCaptureActivity({ source: "claude_code", ...transcript.activity });
-    }
-    const drained=await drainProjectionMigration(this.buffer.projection);
+    } else postCaptureDeferred.push("claude_activity");
+    const drained = !this.signal?.aborted && budget.canStart(10)
+      ? await drainProjectionMigration(this.buffer.projection, {
+          maxSlices: 1,
+          maxActiveMs: Math.max(1, Math.min(25, Math.floor(budget.remainingWallMs() - 5))),
+          signal: this.signal,
+          budget,
+        })
+      : null;
+    if (!drained) postCaptureDeferred.push("projection");
+    const errorCount =
+      rollout.discoveryErrors + rollout.statErrors + rollout.readErrors + rollout.parseErrors + rollout.unresolvedRecords +
+      transcript.discoveryErrors + transcript.statErrors + transcript.readErrors + transcript.parseErrors + transcript.unresolvedRecords;
+    const finalBudget = budget.status();
+    const baselineIncomplete = phase === "baseline" && captureBaselineStatus(this.buffer.database).status !== "complete";
+    const deferred = finalBudget.exhausted || postCaptureDeferred.length > 0 ||
+      rollout.deferredGenerations > 0 || transcript.deferredGenerations > 0;
+    recordAutomaticCaptureRuntimeState(
+      this.buffer.database,
+      phase,
+      this.signal?.aborted ? "aborted" : errorCount > 0 ? "complete_with_errors" :
+        baselineIncomplete ? "baseline_in_progress" : deferred ? "deferred" : "complete",
+      finalBudget,
+      rollout,
+      transcript,
+    );
     return {
       recentOnly: true,
       rollout,
@@ -462,14 +721,15 @@ export class CollectorMaintenance {
       reconciliation,
       repricing,
       enrichment,
-      projection:drained.receipt,
-      projectionDrain:drained.drain,
+      ...(drained ? { projection: drained.receipt, projectionDrain: drained.drain } : {}),
       rawEventWrites: rollout.eventsAppended + transcript.eventsAppended,
+      postCaptureDeferred,
     };
   }
 }
 
 export type MaintenanceSchedulerStatus = {
+  accepting: boolean;
   inFlight: boolean;
   pending: boolean;
   triggerCount: number;
@@ -501,6 +761,7 @@ type DrainWaiter = {
  * commands may request full history.
  */
 export class CoalescingMaintenanceScheduler {
+  private accepting = true;
   private running = false;
   private pending = false;
   private waiters: DrainWaiter[] = [];
@@ -520,12 +781,16 @@ export class CoalescingMaintenanceScheduler {
   private lastStartedAt: string | null = null;
   private lastCompletedAt: string | null = null;
   private lastRun: CollectorMaintenanceRunResult | null = null;
+  private idleWaiters: Array<() => void> = [];
 
   constructor(
     private readonly runJob: () => Promise<CollectorMaintenanceRunResult>,
   ) {}
 
   trigger() {
+    if (!this.accepting) {
+      return Promise.reject(new Error("maintenance_scheduler_stopping"));
+    }
     this.triggerCount += 1;
     this.pending = true;
     if (this.running) this.coalescedTriggerCount += 1;
@@ -542,6 +807,7 @@ export class CoalescingMaintenanceScheduler {
 
   status(): MaintenanceSchedulerStatus {
     return {
+      accepting: this.accepting,
       inFlight: this.running,
       pending: this.pending,
       triggerCount: this.triggerCount,
@@ -560,6 +826,16 @@ export class CoalescingMaintenanceScheduler {
       lastCompletedAt: this.lastCompletedAt,
       lastRun: this.lastRun,
     };
+  }
+
+  waitForIdle() {
+    if (!this.running) return Promise.resolve();
+    return new Promise<void>((resolve) => this.idleWaiters.push(resolve));
+  }
+
+  stopAccepting() {
+    this.accepting = false;
+    this.pending = false;
   }
 
   private async drain() {
@@ -592,6 +868,9 @@ export class CoalescingMaintenanceScheduler {
     }
 
     this.running = false;
+    const idleWaiters = this.idleWaiters;
+    this.idleWaiters = [];
+    for (const resolve of idleWaiters) resolve();
     const waiters = this.waiters;
     this.waiters = [];
     for (const waiter of waiters) {

@@ -24,6 +24,7 @@ import {
   runLearningFactPrivacyAndResourceContract,
   resourceReceiptPrivacyLeakCount,
 } from "./scenarios";
+import { runBoundedCaptureContract } from "./bounded-capture";
 import {
   RESOURCE_PROOF_SCHEMA,
   type ResourceProofReceipt,
@@ -107,6 +108,7 @@ async function main() {
     scenarios.push(runEmptyLedgerContract(sandbox));
     scenarios.push(runExistingSignalFidelityProof(sandbox, runExistingProof));
     scenarios.push(await runNoChangeConstantWorkContract(sandbox));
+    scenarios.push(await runBoundedCaptureContract(sandbox));
     scenarios.push(runBoundedCodexReconciliationContract(sandbox));
     scenarios.push(await runDuplicateStartSingleOwnerContract(sandbox));
     scenarios.push(await runPoisonContinuationContract(sandbox));
@@ -118,6 +120,7 @@ async function main() {
       ...loadUnwiredIntegrationScenarios(
         new Set([
           "no_change_constant_work",
+          "bounded_generation_capture",
           "duplicate_start_single_owner",
           "poison_continuation",
           "bounded_codex_reconciliation",

@@ -179,6 +179,13 @@ export class LocalEventBuffer {
         previous_workspace_id text,
         changed_at text not null
       );
+      create table if not exists session_usage_authority (
+        source text not null,
+        session_id text not null,
+        authority text not null check (authority in ('tailer','live')),
+        claimed_at text not null,
+        primary key (source, session_id)
+      );
     `);
     this.migrateEventColumns();
     this.db.exec(`
@@ -492,6 +499,7 @@ export class LocalEventBuffer {
       );
     }
     const createdAt = new Date().toISOString();
+    if (!this.claimSessionUsageAuthority(event, createdAt)) return false;
     const privacyGeneration = crypto.randomUUID();
     const canonicalSuppressedFields = canonicalizeSuppressionReceipts(suppressedFields);
     const result = this.db
@@ -560,6 +568,76 @@ export class LocalEventBuffer {
     // already-committed raw truth.
     this.delivery.repairRawById(event.id);
     return false;
+  }
+
+  /**
+   * Token accounting is first-writer-authoritative for an entire session, not
+   * merely for one maintenance slice. Without this durable claim, a chunked
+   * rollout could commit early deltas, then allow a later OTLP event to make
+   * the tailer skip the remainder of that same cumulative stream.
+   */
+  private claimSessionUsageAuthority(event: AiInteractionEvent, claimedAt: string) {
+    if (
+      !event.sessionId ||
+      (event.inputTokens === undefined && event.outputTokens === undefined) ||
+      (event.source !== "codex" && event.source !== "claude_code")
+    ) {
+      return true;
+    }
+    const tailerEvent =
+      event.eventType === "usage_rollout" || event.eventType === "usage_transcript";
+    const desired = tailerEvent ? "tailer" : "live";
+    const existing = this.db
+      .prepare(
+        `select authority from session_usage_authority
+         where source = ? and session_id = ?`,
+      )
+      .get(event.source, event.sessionId) as { authority: "tailer" | "live" } | undefined;
+    if (existing) return existing.authority === desired;
+
+    // Upgrade old ledgers deterministically before admitting new work. Live
+    // capture wins an already-mixed legacy session; otherwise the existing
+    // source that actually has token rows becomes authoritative.
+    const legacy = this.db
+      .prepare(
+        `select
+           max(case when event_type in ('usage_rollout','usage_transcript') then 1 else 0 end) as tailer,
+           max(case when event_type not in ('usage_rollout','usage_transcript') then 1 else 0 end) as live
+         from buffered_events
+         where source = ? and session_id = ?
+           and (input_tokens is not null or output_tokens is not null)`,
+      )
+      .get(event.source, event.sessionId) as { tailer: number | null; live: number | null };
+    const authority = legacy.live ? "live" : legacy.tailer ? "tailer" : desired;
+    this.db
+      .prepare(
+        `insert into session_usage_authority (source, session_id, authority, claimed_at)
+         values (?, ?, ?, ?)
+         on conflict(source, session_id) do nothing`,
+      )
+      .run(event.source, event.sessionId, authority, claimedAt);
+    return authority === desired;
+  }
+
+  sessionUsageAuthority(source: "codex" | "claude_code", sessionId: string) {
+    const row = this.db
+      .prepare(
+        `select authority from session_usage_authority
+         where source = ? and session_id = ?`,
+      )
+      .get(source, sessionId) as { authority: "tailer" | "live" } | undefined;
+    if (row) return row.authority;
+    const legacy = this.db
+      .prepare(
+        `select
+           max(case when event_type in ('usage_rollout','usage_transcript') then 1 else 0 end) as tailer,
+           max(case when event_type not in ('usage_rollout','usage_transcript') then 1 else 0 end) as live
+         from buffered_events
+         where source = ? and session_id = ?
+           and (input_tokens is not null or output_tokens is not null)`,
+      )
+      .get(source, sessionId) as { tailer: number | null; live: number | null };
+    return legacy.live ? "live" : legacy.tailer ? "tailer" : null;
   }
 
   append(event: AiInteractionEvent, suppressedFields: string[] = []) {
