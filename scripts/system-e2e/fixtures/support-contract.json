@@ -25,7 +25,7 @@
     {
       "name": "idle_dashboard_resources",
       "kind": "json_receipt",
-      "expectedArtifactDigest": "sha256:db1589b4a28d1fcbfbb1c1640805bd77d59a7ff0375b202510dec508c8663537"
+      "expectedArtifactDigest": "sha256:2d8f14e90dff7dc42f687f560d0a5f3ffa1890116970f9f25c05197d6b1dd50c"
     }
   ]
 }

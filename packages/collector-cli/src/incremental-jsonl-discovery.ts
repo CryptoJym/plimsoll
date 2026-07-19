@@ -138,17 +138,19 @@ export class IncrementalJsonlDiscovery {
       this.errors += 1;
       return null;
     }
-    if (entry.isSymbolicLink()) {
-      // Aliases can escape roots or cause one physical generation to be
-      // observed under attacker-controlled names. They are never followed.
-      this.errors += 1;
-      return null;
-    }
     if (entry.isDirectory()) {
       if (this.options.recursive) this.openDirectory(candidate, false);
       return null;
     }
     if (!this.options.matches(entry.name)) return null;
+    if (entry.isSymbolicLink()) {
+      // A candidate alias can escape roots or cause one physical generation
+      // to be observed under an attacker-controlled name. It is never
+      // followed. Irrelevant aliases were rejected by the name predicate
+      // above and do not make an otherwise complete discovery ambiguous.
+      this.errors += 1;
+      return null;
+    }
     if (!entry.isFile()) {
       this.errors += 1;
       return null;
