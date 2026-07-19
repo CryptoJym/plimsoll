@@ -58,7 +58,16 @@ deterministic Node 22, exact-commit, two-phase source runbook in the repository
 [README](../../README.md#team-mac-source-canary-runbook): apply may finish
 truthfully at `service_ready`; only verify after a newly started locally
 authenticated agent may claim `signal_verified`. Credentials never move
-between machines.
+between machines. That source lane remains blocked from real-canary promotion
+until the atomic Claude-config, live source/runtime-attestation, and atomic
+LaunchAgent-manifest contracts, plus the single machine-readable CLI receipt,
+in
+[issues #130](https://github.com/CryptoJym/plimsoll/issues/130),
+[#131](https://github.com/CryptoJym/plimsoll/issues/131), and
+[#132](https://github.com/CryptoJym/plimsoll/issues/132), and
+[#133](https://github.com/CryptoJym/plimsoll/issues/133) merge and the installer
+is rebased; compatibility parsing or an installer receipt from the standalone
+PR is not live proof.
 
 ## What leaves your machine
 

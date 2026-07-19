@@ -52,6 +52,9 @@ function run(
 }
 
 function parseReceipt(result: CommandResult): Record<string, any> {
+  if (!result.stdout.trim()) {
+    throw new Error(`installer emitted no receipt: ${JSON.stringify(result)}`);
+  }
   return JSON.parse(result.stdout.trim()) as Record<string, any>;
 }
 
@@ -86,10 +89,12 @@ async function main() {
 
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-source-installer-proof-"));
   let occupiedServer: http.Server | undefined;
+  let occupiedPort = 0;
+  let occupiedRequests = 0;
   try {
     const neutral = path.join(sandbox, "neutral");
     const home = path.join(sandbox, "home");
-    const plimsollHome = path.join(sandbox, "plimsoll-home");
+    const plimsollHome = path.join(home, "Library", "Application Support", "Plimsoll");
     const checkout = path.join(sandbox, "checkout");
     const adapters = path.join(sandbox, "adapters");
     const externalPnpmDir = path.join(sandbox, "external-pnpm");
@@ -132,7 +137,9 @@ case "$1 $2" in
     cat "$repo/.git/origin"
     ;;
   "status --porcelain")
-    if [ "\${PLIMSOLL_FIXTURE_DIRTY:-0}" = "1" ]; then printf ' M retained\n'; fi
+    if [ "\${PLIMSOLL_FIXTURE_DIRTY:-0}" = "1" ] || [ -f "$PLIMSOLL_FIXTURE_STATE_DIR/dirty-after-install" ]; then
+      printf ' M retained\n'
+    fi
     ;;
   "fetch --no-tags")
     if [ "\${PLIMSOLL_FIXTURE_FETCH_FAIL:-0}" = "1" ]; then exit 42; fi
@@ -161,6 +168,9 @@ printf 'pnpm %s\n' "$*" >> "$PLIMSOLL_FIXTURE_COMMAND_LOG"
 if [ "$1" = "--version" ]; then printf '10.25.0\n'; exit 0; fi
 case " $* " in
   *" install --frozen-lockfile "*)
+    if [ "\${PLIMSOLL_FIXTURE_DIRTY_AFTER_INSTALL:-0}" = "1" ]; then
+      : > "$PLIMSOLL_FIXTURE_STATE_DIR/dirty-after-install"
+    fi
     if [ "\${PLIMSOLL_FIXTURE_INSTALL_FAIL_ONCE:-0}" = "1" ] && [ ! -f "$PLIMSOLL_FIXTURE_STATE_DIR/install-failed" ]; then
       : > "$PLIMSOLL_FIXTURE_STATE_DIR/install-failed"
       exit 75
@@ -168,24 +178,84 @@ case " $* " in
     ;;
   *" collector setup --yes "*)
     if [ -f "$PLIMSOLL_FIXTURE_STATE_DIR/setup-applied" ]; then
-      printf '{"status":"setup_noop"}\n'
+      printf '%s: no changes\n' "$HOME/.claude/settings.json"
+      printf '{"status":"setup_noop","claude":"local","codex":"local","conflict":null}\n'
     else
       : > "$PLIMSOLL_FIXTURE_STATE_DIR/setup-applied"
-      printf '{"status":"setup_applied"}\n'
+      printf '%s: add telemetry\n' "$HOME/.claude/settings.json"
+      printf '{\n  "status": "setup_applied",\n  "privacyMode": "metadata_only",\n  "claude": { "changed": true },\n  "codex": { "changed": true }\n}\n'
     fi
     ;;
-  *" collector unload-launch-agent "*) exit 1 ;;
-  *" collector install-launch-agent --dev "*) printf '{"installed":true}\n' ;;
-  *" collector load-launch-agent "*) printf '{"loading":true}\n' ;;
+  *" collector unload-launch-agent "*)
+    pid_file="$HOME/Library/Application Support/Plimsoll/collector.pid"
+    if [ -f "$pid_file" ]; then rm -f "$pid_file"; exit 0; fi
+    exit 1
+    ;;
+  *" collector install-launch-agent --dev "*)
+    repo=""
+    previous=""
+    for argument in "$@"; do
+      if [ "$previous" = "--repo-root" ]; then repo="$argument"; fi
+      previous="$argument"
+    done
+    plist="$HOME/Library/LaunchAgents/com.plimsoll.collector.plist"
+    mkdir -p "$(dirname "$plist")"
+    node_path="$(command -v node)"
+    node_dir="$(dirname "$node_path")"
+    pnpm_dir="$(dirname "$0")"
+    cat > "$plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>Label</key><string>com.plimsoll.collector</string>
+<key>ProgramArguments</key><array><string>$0</string><string>--dir</string><string>$repo</string><string>collector</string><string>start</string></array>
+<key>WorkingDirectory</key><string>$repo</string>
+<key>RunAtLoad</key><true/>
+<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+<key>ThrottleInterval</key><integer>30</integer>
+<key>StandardOutPath</key><string>$HOME/Library/Application Support/Plimsoll/collector.out.log</string>
+<key>StandardErrorPath</key><string>$HOME/Library/Application Support/Plimsoll/collector.err.log</string>
+<key>EnvironmentVariables</key><dict><key>PLIMSOLL_COLLECTOR_DATA_MODE</key><string>metadata</string><key>PATH</key><string>$node_dir:$pnpm_dir:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+</dict></plist>
+PLIST
+    chmod 600 "$plist"
+    printf '{"installed":true}\n'
+    ;;
+  *" collector load-launch-agent "*)
+    repo=""
+    previous=""
+    for argument in "$@"; do
+      if [ "$previous" = "--dir" ]; then repo="$argument"; fi
+      previous="$argument"
+    done
+    mkdir -p "$HOME/Library/Application Support/Plimsoll"
+    cat > "$HOME/Library/Application Support/Plimsoll/collector.pid" <<PID
+{"version":2,"label":"com.plimsoll.collector","cwd":"$repo","instanceId":"11111111-1111-4111-8111-111111111111","pid":12345,"processStartFingerprint":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","command":["$repo/packages/collector-cli/src/cli.ts","start"]}
+PID
+    chmod 600 "$HOME/Library/Application Support/Plimsoll/collector.pid"
+    printf '{"loading":true}\n'
+    ;;
   *" collector doctor --read-only --json "*)
+    if [ -n "\${PLIMSOLL_FIXTURE_OCCUPIED_PORT:-}" ]; then
+      node -e 'const http=require("node:http"); const request=http.get({host:"127.0.0.1",port:Number(process.argv[1]),path:"/status"},response=>{response.resume();response.on("end",()=>process.exit(0))}); request.setTimeout(1000,()=>request.destroy(new Error("timeout"))); request.on("error",()=>process.exit(1));' "$PLIMSOLL_FIXTURE_OCCUPIED_PORT" || exit 88
+    fi
     case "\${PLIMSOLL_FIXTURE_DOCTOR:-service_ready}" in
-      signal_verified) verified=true; readiness=signal_verified; ok=true; code=0 ;;
-      service_ready) verified=false; readiness=service_ready; ok=false; code=17 ;;
+      signal_verified) verified=true; readiness=signal_verified; ok=true; code=0; tokens=1 ;;
+      old_signal) verified=true; readiness=signal_verified; ok=true; code=0; tokens=5 ;;
+      fresh_after_old) verified=true; readiness=signal_verified; ok=true; code=0; tokens=6 ;;
+      signal_new_runtime) verified=true; readiness=signal_verified; ok=true; code=0; tokens=1; instance=22222222-2222-4222-8222-222222222222 ;;
+      service_ready) verified=false; readiness=service_ready; ok=false; code=17; tokens=0 ;;
       configured) verified=false; readiness=configured; ok=false; code=17 ;;
       contradictory) verified=true; readiness=service_ready; ok=false; code=17 ;;
       *) printf 'not-json\n'; exit 17 ;;
     esac
-    printf '{"ok":%s,"readiness":"%s","readOnly":true,"node":{"version":"${process.versions.node}","range":">=20 <25","supported":true},"config":{"status":"valid","valid":true,"createdDuringCommand":false},"telemetry":{"ok":true,"claude":{"ok":true},"codex":{"ok":true}},"launchAgent":{"ok":true,"path":{"ok":true}},"runtime":{"ok":true,"ownershipVersion":{"expected":2,"actual":2},"processLive":true,"identityMatchesStatus":true},"connectivity":{"reachable":true,"signal":{"verified":%s}},"dataMode":"metadata","privacyMode":"metadata_only","privacy":{"mode":"metadata_only","configuredDataMode":"metadata","rawEvidenceCapture":"disabled"},"syncConfigured":false,"uploadSigningConfigured":false}\n' "$ok" "$readiness" "$verified"
+    tokens="\${tokens:-0}"
+    instance="\${instance:-11111111-1111-4111-8111-111111111111}"
+    sync="\${PLIMSOLL_FIXTURE_SYNC:-false}"
+    if [ "\${PLIMSOLL_FIXTURE_JSON_STYLE:-pretty}" = "compact" ]; then
+      printf '{"ok":%s,"readiness":"%s","readOnly":true,"node":{"version":"${process.versions.node}","range":">=20 <25","supported":true},"config":{"status":"valid","valid":true,"createdDuringCommand":false},"telemetry":{"ok":true,"claude":{"ok":true},"codex":{"ok":true}},"launchAgent":{"ok":true,"path":{"ok":true}},"runtime":{"ok":true,"ownershipVersion":{"expected":2,"actual":2},"processLive":true,"identityMatchesStatus":true},"connectivity":{"reachable":true,"runtimeIdentity":{"instanceId":"%s"},"signal":{"verified":%s,"tokenAttributedEvents":%s}},"dataMode":"metadata","privacyMode":"metadata_only","privacy":{"mode":"metadata_only","configuredDataMode":"metadata","rawEvidenceCapture":"disabled"},"syncConfigured":%s,"uploadSigningConfigured":%s}\n' "$ok" "$readiness" "$instance" "$verified" "$tokens" "$sync" "$sync"
+    else
+      printf '{\n  "ok": %s,\n  "readiness": "%s",\n  "readOnly": true,\n  "node": {"version":"${process.versions.node}","range":">=20 <25","supported":true},\n  "config": {"status":"valid","valid":true,"createdDuringCommand":false},\n  "telemetry": {"ok":true,"claude":{"ok":true},"codex":{"ok":true}},\n  "launchAgent": {"ok":true,"path":{"ok":true}},\n  "runtime": {"ok":true,"ownershipVersion":{"expected":2,"actual":2},"processLive":true,"identityMatchesStatus":true},\n  "connectivity": {"reachable":true,"runtimeIdentity":{"instanceId":"%s"},"signal":{"verified":%s,"tokenAttributedEvents":%s}},\n  "dataMode":"metadata",\n  "privacyMode":"metadata_only",\n  "privacy":{"mode":"metadata_only","configuredDataMode":"metadata","rawEvidenceCapture":"disabled"},\n  "syncConfigured":%s,\n  "uploadSigningConfigured":%s\n}\n' "$ok" "$readiness" "$instance" "$verified" "$tokens" "$sync" "$sync"
+    fi
     exit "$code"
     ;;
 esac
@@ -217,11 +287,15 @@ exit 0
     fs.writeFileSync(stalePlist, "stale-plist-sentinel\n");
     fs.writeFileSync(checkout, "occupied-before-dry-run\n");
 
-    occupiedServer = http.createServer((_request, response) => response.end("occupied"));
+    occupiedServer = http.createServer((_request, response) => {
+      occupiedRequests += 1;
+      response.end("occupied");
+    });
     await new Promise<void>((resolve, reject) => {
       occupiedServer!.once("error", reject);
       occupiedServer!.listen(0, "127.0.0.1", resolve);
     });
+    occupiedPort = (occupiedServer.address() as { port: number }).port;
     const beforeDryRun = digestTree(sandbox);
     for (const architecture of ["arm64", "x86_64"]) {
       const dryRun = await run(["--dry-run", ...sourceArgs], {
@@ -231,7 +305,7 @@ exit 0
       const receipt = parseReceipt(dryRun);
       check(`dry_run_${architecture}_is_truthful_noop`,
         dryRun.code === 0 &&
-          receipt.state === "plan_validated" &&
+          receipt.state === "plan_selected_no_execution" &&
           receipt.runtime.nodeMajor === 22 &&
           receipt.runtime.architecture === architecture &&
           receipt.source.remoteObjectVerified === false &&
@@ -240,6 +314,20 @@ exit 0
         { dryRun, receipt, beforeDryRun, after: digestTree(sandbox) });
     }
     check("dry_run_invokes_no_git_or_pnpm", commandLog(commands) === "", commandLog(commands));
+
+    const customHomeTarget = path.join(sandbox, "custom-home-target");
+    const customHome = await run(["--dry-run", ...sourceArgs], {
+      cwd: neutral,
+      env: {
+        ...baseEnv,
+        PLIMSOLL_HOME: path.join(sandbox, "unsupported-custom-home"),
+        PLIMSOLL_DIR: customHomeTarget,
+      },
+    });
+    check("custom_collector_home_is_refused_before_mutation",
+      customHome.code !== 0 && customHome.stderr.includes("Custom PLIMSOLL_HOME is not supported") &&
+        !fs.existsSync(customHomeTarget) && !fs.existsSync(path.join(sandbox, "unsupported-custom-home")),
+      customHome);
 
     const mutableTarget = path.join(sandbox, "mutable-target");
     const mutable = await run(["--dry-run", "--ref", "main", "--node", process.execPath, "--pnpm", pnpm], {
@@ -267,7 +355,11 @@ exit 0
     fs.symlinkSync(process.execPath, discoveredNode);
     const discovered = await run(["--dry-run", "--ref", expectedSha, "--pnpm", pnpm], {
       cwd: neutral,
-      env: { ...baseEnv, HOME: discoveryHome },
+      env: {
+        ...baseEnv,
+        HOME: discoveryHome,
+        PLIMSOLL_HOME: path.join(discoveryHome, "Library", "Application Support", "Plimsoll"),
+      },
     });
     const discoveredReceipt = parseReceipt(discovered);
     check("node_25_default_yields_to_explicitly_discovered_node_22",
@@ -291,7 +383,7 @@ exit 0
       { wrong, wrongReceipt });
 
     const ownedTarget = path.join(sandbox, "owned-target");
-    const ownedLock = `${ownedTarget}.plimsoll-install.lock`;
+    const ownedLock = path.join(plimsollHome, ".source-install.lock");
     fs.mkdirSync(ownedLock, { recursive: true });
     fs.writeFileSync(path.join(ownedLock, "owner.pid"), `${process.pid}\n`);
     const alreadyOwned = await run(["apply", ...sourceArgs], {
@@ -305,6 +397,86 @@ exit 0
         !fs.existsSync(ownedTarget),
       { alreadyOwned, ownedReceipt });
     fs.rmSync(ownedLock, { recursive: true });
+
+    const syncTarget = path.join(sandbox, "sync-target");
+    const syncState = path.join(sandbox, "sync-state");
+    fs.mkdirSync(syncState);
+    const commandsBeforeSync = commandLog(commands).length;
+    const stalePidBeforeSync = fs.readFileSync(path.join(plimsollHome, "collector.pid"), "utf8");
+    const syncRefused = await run(["apply", ...sourceArgs], {
+      cwd: neutral,
+      env: {
+        ...baseEnv,
+        PLIMSOLL_DIR: syncTarget,
+        PLIMSOLL_FIXTURE_STATE_DIR: syncState,
+        PLIMSOLL_FIXTURE_SYNC: "true",
+      },
+    });
+    const syncReceipt = parseReceipt(syncRefused);
+    const syncCommands = commandLog(commands).slice(commandsBeforeSync);
+    check("hosted_sync_is_refused_before_any_service_mutation",
+      syncRefused.code !== 0 && syncReceipt.errorStage === "local_only_preflight" &&
+        syncReceipt.retainedState.service === "not_started" &&
+        !syncCommands.includes("unload-launch-agent") &&
+        !syncCommands.includes("install-launch-agent") &&
+        !syncCommands.includes("load-launch-agent") &&
+        fs.readFileSync(path.join(plimsollHome, "collector.pid"), "utf8") === stalePidBeforeSync,
+      { syncRefused, syncReceipt, syncCommands });
+
+    const dirtyInstallTarget = path.join(sandbox, "dirty-install-target");
+    const dirtyInstallState = path.join(sandbox, "dirty-install-state");
+    fs.mkdirSync(dirtyInstallState);
+    const commandsBeforeDirtyInstall = commandLog(commands).length;
+    const dirtyInstall = await run(["apply", ...sourceArgs], {
+      cwd: neutral,
+      env: {
+        ...baseEnv,
+        PLIMSOLL_DIR: dirtyInstallTarget,
+        PLIMSOLL_FIXTURE_STATE_DIR: dirtyInstallState,
+        PLIMSOLL_FIXTURE_DIRTY_AFTER_INSTALL: "1",
+      },
+    });
+    const dirtyInstallReceipt = parseReceipt(dirtyInstall);
+    const dirtyInstallCommands = commandLog(commands).slice(commandsBeforeDirtyInstall);
+    check("frozen_install_must_leave_tracked_source_clean_before_config_or_service",
+      dirtyInstall.code !== 0 && dirtyInstallReceipt.errorStage === "frozen_install_changed_source" &&
+        dirtyInstallReceipt.retainedState.checkout === "dirty_retained" &&
+        !dirtyInstallCommands.includes("collector setup") &&
+        !dirtyInstallCommands.includes("unload-launch-agent") &&
+        !dirtyInstallCommands.includes("install-launch-agent"),
+      { dirtyInstall, dirtyInstallReceipt, dirtyInstallCommands });
+
+    const manifestTarget = path.join(sandbox, "manifest-symlink-target");
+    const manifestState = path.join(sandbox, "manifest-symlink-state");
+    const externalManifest = path.join(sandbox, "external-manifest-sentinel");
+    const externalManifestSentinel = "outside-manifest-must-not-change\n";
+    fs.mkdirSync(manifestState);
+    fs.writeFileSync(externalManifest, externalManifestSentinel);
+    fs.unlinkSync(stalePlist);
+    fs.symlinkSync(externalManifest, stalePlist);
+    const commandsBeforeManifest = commandLog(commands).length;
+    const manifestRefused = await run(["apply", ...sourceArgs], {
+      cwd: neutral,
+      env: {
+        ...baseEnv,
+        PLIMSOLL_DIR: manifestTarget,
+        PLIMSOLL_FIXTURE_STATE_DIR: manifestState,
+        PLIMSOLL_FIXTURE_DOCTOR: "service_ready",
+      },
+    });
+    const manifestReceipt = parseReceipt(manifestRefused);
+    const manifestCommands = commandLog(commands).slice(commandsBeforeManifest);
+    check("obvious_launch_agent_symlink_is_refused_before_service_mutation",
+      manifestRefused.code !== 0 && manifestReceipt.errorStage === "service_manifest_destination" &&
+        manifestReceipt.retainedState.service === "manifest_destination_refused_retained" &&
+        fs.readFileSync(externalManifest, "utf8") === externalManifestSentinel &&
+        fs.lstatSync(stalePlist).isSymbolicLink() &&
+        !manifestCommands.includes("unload-launch-agent") &&
+        !manifestCommands.includes("install-launch-agent") &&
+        !manifestCommands.includes("load-launch-agent"),
+      { manifestRefused, manifestReceipt, manifestCommands });
+    fs.unlinkSync(stalePlist);
+    fs.writeFileSync(stalePlist, "stale-plist-sentinel\n");
 
     const localOrigin = path.join(sandbox, "local-origin.git");
     const localClone = spawnSync("/usr/bin/git", ["clone", "--bare", root, localOrigin], {
@@ -328,6 +500,7 @@ exit 0
         PLIMSOLL_DIR: realGitTarget,
         PLIMSOLL_FIXTURE_STATE_DIR: realGitState,
         PLIMSOLL_FIXTURE_DOCTOR: "service_ready",
+        PLIMSOLL_FIXTURE_JSON_STYLE: "compact",
       },
     });
     const realGitReceipt = parseReceipt(realGitApply);
@@ -340,6 +513,17 @@ exit 0
         realGitReceipt.source.localCheckoutMatched === true &&
         realGitHead.status === 0 && realGitHead.stdout.trim() === expectedSha,
       { realGitApply, realGitReceipt, head: realGitHead.stdout.trim(), stderr: realGitHead.stderr });
+    check("single_line_doctor_json_after_command_output_is_parsed",
+      realGitApply.code === 0 && realGitReceipt.readiness === "service_ready",
+      { realGitApply, realGitReceipt });
+    const reconciledPid = JSON.parse(fs.readFileSync(path.join(plimsollHome, "collector.pid"), "utf8"));
+    check("existing_stale_pid_and_plist_are_reconciled_by_one_service_owner",
+      realGitApply.code === 0 &&
+        reconciledPid.cwd === realGitTarget &&
+        !fs.readFileSync(stalePlist, "utf8").includes("stale-plist-sentinel") &&
+        commandLog(commands).includes("collector unload-launch-agent") &&
+        commandLog(commands).includes("collector install-launch-agent --dev"),
+      { reconciledPid, plistMode: fs.statSync(stalePlist).mode & 0o777 });
 
     const applyTarget = path.join(sandbox, "apply-target");
     const applyState = path.join(sandbox, "apply-state");
@@ -363,10 +547,17 @@ exit 0
         applyReceipt.runtime.nodeVersion === process.versions.node &&
         applyReceipt.runtime.pnpmVersion === "10.25.0" &&
         applyReceipt.retainedState.toolConfig === "applied_with_exact_preimage_backups" &&
+        applyReceipt.retainedState.service === "service_ready_pending_fresh_signal" &&
         applyReceipt.runtime.installedIdentityMatched === true &&
         applyReceipt.credentialOperations === 0 &&
         applyReceipt.rollbackClaimed === false,
       { apply, applyReceipt });
+    check("installed_launch_agent_manifest_is_private_regular_file",
+      !fs.lstatSync(stalePlist).isSymbolicLink() &&
+        fs.lstatSync(stalePlist).isFile() &&
+        fs.lstatSync(stalePlist).nlink === 1 &&
+        (fs.statSync(stalePlist).mode & 0o777) === 0o600,
+      { mode: fs.statSync(stalePlist).mode & 0o777, path: stalePlist });
     check("apply_uses_frozen_lockfile_and_absolute_runtime_inputs",
       applyCommands.includes(`pnpm --dir ${applyTarget} install --frozen-lockfile`) &&
         applyCommands.includes(`--pnpm ${pnpm}`) &&
@@ -380,8 +571,42 @@ exit 0
       (fs.statSync(installIdentity).mode & 0o777) === 0o600 &&
         !fs.readFileSync(installIdentity, "utf8").includes(process.execPath) &&
         !fs.readFileSync(installIdentity, "utf8").includes(pnpm) &&
-        JSON.parse(fs.readFileSync(installIdentity, "utf8")).sourceCommit === expectedSha,
+        JSON.parse(fs.readFileSync(installIdentity, "utf8")).sourceCommit === expectedSha &&
+        JSON.parse(fs.readFileSync(installIdentity, "utf8")).baselineTokenAttributedEvents === 0 &&
+        /^sha256:[a-f0-9]{64}$/.test(JSON.parse(fs.readFileSync(installIdentity, "utf8")).runtimeInstanceHash) &&
+        /^sha256:[a-f0-9]{64}$/.test(JSON.parse(fs.readFileSync(installIdentity, "utf8")).sourceRemoteHash),
       fs.readFileSync(installIdentity, "utf8"));
+
+    fs.writeFileSync(path.join(applyTarget, ".git", "origin"), "https://example.invalid/wrong.git\n");
+    const wrongRemoteVerify = await run(["verify", ...sourceArgs], {
+      cwd: neutral,
+      env: {
+        ...baseEnv,
+        PLIMSOLL_DIR: applyTarget,
+        PLIMSOLL_FIXTURE_STATE_DIR: applyState,
+      },
+    });
+    const wrongRemoteReceipt = parseReceipt(wrongRemoteVerify);
+    check("verify_refuses_checkout_from_a_different_remote",
+      wrongRemoteVerify.code !== 0 && wrongRemoteReceipt.errorStage === "checkout_remote" &&
+        wrongRemoteReceipt.retainedState.checkout === "remote_conflict",
+      { wrongRemoteVerify, wrongRemoteReceipt });
+    fs.writeFileSync(path.join(applyTarget, ".git", "origin"), "https://github.com/CryptoJym/plimsoll.git\n");
+
+    const dirtyVerify = await run(["verify", ...sourceArgs], {
+      cwd: neutral,
+      env: {
+        ...baseEnv,
+        PLIMSOLL_DIR: applyTarget,
+        PLIMSOLL_FIXTURE_STATE_DIR: applyState,
+        PLIMSOLL_FIXTURE_DIRTY: "1",
+      },
+    });
+    const dirtyVerifyReceipt = parseReceipt(dirtyVerify);
+    check("verify_refuses_dirty_tracked_source",
+      dirtyVerify.code !== 0 && dirtyVerifyReceipt.errorStage === "checkout_dirty" &&
+        dirtyVerifyReceipt.retainedState.checkout === "dirty_retained",
+      { dirtyVerify, dirtyVerifyReceipt });
 
     const alternateNode = path.join(sandbox, "alternate-node-22");
     fs.symlinkSync(process.execPath, alternateNode);
@@ -421,7 +646,7 @@ exit 0
     const coldVerifyReceipt = parseReceipt(coldVerify);
     check("verify_rejects_cold_service_ready",
       coldVerify.code !== 0 && coldVerifyReceipt.state === "failed" &&
-        coldVerifyReceipt.errorStage === "signal_verification" &&
+        coldVerifyReceipt.errorStage === "fresh_signal_verification" &&
         coldVerifyReceipt.readiness === "service_ready",
       { coldVerify, coldVerifyReceipt });
 
@@ -438,8 +663,23 @@ exit 0
     check("contradictory_doctor_schema_is_rejected",
       contradictory.code !== 0 && contradictoryReceipt.state === "failed" &&
         contradictoryReceipt.readiness === "invalid" &&
-        contradictoryReceipt.errorStage === "signal_verification",
+        contradictoryReceipt.errorStage === "fresh_signal_verification",
       { contradictory, contradictoryReceipt });
+
+    const changedRuntime = await run(["verify", ...sourceArgs], {
+      cwd: neutral,
+      env: {
+        ...baseEnv,
+        PLIMSOLL_DIR: applyTarget,
+        PLIMSOLL_FIXTURE_STATE_DIR: applyState,
+        PLIMSOLL_FIXTURE_DOCTOR: "signal_new_runtime",
+      },
+    });
+    const changedRuntimeReceipt = parseReceipt(changedRuntime);
+    check("verify_refuses_signal_from_a_different_runtime_instance",
+      changedRuntime.code !== 0 && changedRuntimeReceipt.errorStage === "service_identity_binding" &&
+        changedRuntimeReceipt.runtime.installedIdentityMatched === true,
+      { changedRuntime, changedRuntimeReceipt });
 
     const signalVerify = await run(["verify", ...sourceArgs], {
       cwd: neutral,
@@ -456,10 +696,50 @@ exit 0
         signalReceipt.readiness === "signal_verified" && signalReceipt.nextAction === "none",
       { signalVerify, signalReceipt });
 
+    const oldSignalTarget = path.join(sandbox, "old-signal-target");
+    const oldSignalState = path.join(sandbox, "old-signal-state");
+    fs.mkdirSync(oldSignalState);
+    const oldSignalApply = await run(["apply", ...sourceArgs], {
+      cwd: neutral,
+      env: {
+        ...baseEnv,
+        PLIMSOLL_DIR: oldSignalTarget,
+        PLIMSOLL_FIXTURE_STATE_DIR: oldSignalState,
+        PLIMSOLL_FIXTURE_DOCTOR: "old_signal",
+      },
+    });
+    const oldSignalApplyReceipt = parseReceipt(oldSignalApply);
+    const oldSignalVerify = await run(["verify", ...sourceArgs], {
+      cwd: neutral,
+      env: {
+        ...baseEnv,
+        PLIMSOLL_DIR: oldSignalTarget,
+        PLIMSOLL_FIXTURE_STATE_DIR: oldSignalState,
+        PLIMSOLL_FIXTURE_DOCTOR: "old_signal",
+      },
+    });
+    const oldSignalVerifyReceipt = parseReceipt(oldSignalVerify);
+    const freshAfterOld = await run(["verify", ...sourceArgs], {
+      cwd: neutral,
+      env: {
+        ...baseEnv,
+        PLIMSOLL_DIR: oldSignalTarget,
+        PLIMSOLL_FIXTURE_STATE_DIR: oldSignalState,
+        PLIMSOLL_FIXTURE_DOCTOR: "fresh_after_old",
+      },
+    });
+    const freshAfterOldReceipt = parseReceipt(freshAfterOld);
+    check("historical_signal_is_baselined_and_only_strict_growth_verifies",
+      oldSignalApply.code === 0 && oldSignalApplyReceipt.state === "service_ready" &&
+        oldSignalApplyReceipt.readiness === "service_ready" &&
+        oldSignalVerify.code !== 0 && oldSignalVerifyReceipt.errorStage === "fresh_signal_verification" &&
+        freshAfterOld.code === 0 && freshAfterOldReceipt.state === "signal_verified",
+      { oldSignalApply, oldSignalApplyReceipt, oldSignalVerify, oldSignalVerifyReceipt, freshAfterOld, freshAfterOldReceipt });
+
     const retryTarget = path.join(sandbox, "retry-target");
     const retryState = path.join(sandbox, "retry-state");
     fs.mkdirSync(retryState);
-    const staleRetryLock = `${retryTarget}.plimsoll-install.lock`;
+    const staleRetryLock = path.join(plimsollHome, ".source-install.lock");
     fs.mkdirSync(staleRetryLock);
     fs.writeFileSync(path.join(staleRetryLock, "owner.pid"), "999999\n");
     const interrupted = await run(["apply", ...sourceArgs], {
@@ -502,15 +782,18 @@ exit 0
         PLIMSOLL_DIR: staleRuntimeTarget,
         PLIMSOLL_FIXTURE_STATE_DIR: staleRuntimeState,
         PLIMSOLL_FIXTURE_DOCTOR: "configured",
+        PLIMSOLL_FIXTURE_OCCUPIED_PORT: String(occupiedPort),
       },
     });
     const staleRuntimeReceipt = parseReceipt(staleRuntime);
-    check("stale_pid_or_occupied_port_shape_fails_with_service_state_retained",
+    check("occupied_port_readiness_failure_stops_loaded_service_and_retains_state",
       staleRuntime.code !== 0 && staleRuntimeReceipt.errorStage === "service_readiness" &&
         staleRuntimeReceipt.readiness === "invalid" &&
-        staleRuntimeReceipt.retainedState.service === "not_ready_retained" &&
+        ["stopped_state_retained_after_failed_apply", "stop_requested_state_unconfirmed"].includes(staleRuntimeReceipt.retainedState.service) &&
+        !fs.existsSync(path.join(plimsollHome, "collector.pid")) &&
+        occupiedRequests > 0 &&
         staleRuntimeReceipt.rollbackClaimed === false,
-      { staleRuntime, staleRuntimeReceipt });
+      { staleRuntime, staleRuntimeReceipt, occupiedPort, occupiedRequests });
 
     const secondApply = await run(["apply", ...sourceArgs], {
       cwd: neutral,
@@ -530,10 +813,14 @@ exit 0
 
     const allReceipts = [
       apply.stdout,
+      syncRefused.stdout,
       wrongRuntimeVerify.stdout,
       coldVerify.stdout,
       contradictory.stdout,
       signalVerify.stdout,
+      oldSignalApply.stdout,
+      oldSignalVerify.stdout,
+      freshAfterOld.stdout,
       interrupted.stdout,
       resumed.stdout,
       staleRuntime.stdout,

@@ -13,6 +13,9 @@ SOURCE_REF="${PLIMSOLL_SOURCE_REF:-}"
 NODE_REQUEST="${PLIMSOLL_NODE:-}"
 PNPM_REQUEST="${PLIMSOLL_PNPM:-}"
 MODE="apply"
+DEFAULT_COLLECTOR_HOME="$HOME/Library/Application Support/Plimsoll"
+REQUESTED_COLLECTOR_HOME="${PLIMSOLL_HOME:-$DEFAULT_COLLECTOR_HOME}"
+LAUNCH_AGENT_PLIST="$HOME/Library/LaunchAgents/com.plimsoll.collector.plist"
 case "$REPO_URL" in
   https://github.com/CryptoJym/plimsoll.git|git@github.com:CryptoJym/plimsoll.git)
     REPO_PROVENANCE="canonical_public_repository"
@@ -33,10 +36,15 @@ SERVICE_RESULT="not_started"
 READINESS="not_checked"
 ERROR_STAGE="none"
 RECEIPT_EMITTED=0
-INSTALL_LOCK="${PLIMSOLL_DIR}.plimsoll-install.lock"
+INSTALL_LOCK="$DEFAULT_COLLECTOR_HOME/.source-install.lock"
 LOCK_HELD=0
 INSTALL_IDENTITY_PATH="$PLIMSOLL_DIR/.git/plimsoll-source-install.v1.json"
 INSTALLED_IDENTITY_MATCHED="false"
+SERVICE_LOADED_BY_INSTALLER=0
+DOCTOR_TOKEN_EVENTS="unknown"
+DOCTOR_RUNTIME_HASH="unknown"
+BASELINE_TOKEN_EVENTS="unknown"
+BASELINE_RUNTIME_HASH="unknown"
 
 usage() {
   cat <<'EOF'
@@ -46,7 +54,8 @@ Usage:
   ./install.sh verify    --ref <40-character-commit> [--node PATH] [--pnpm PATH]
 
 Modes:
-  --dry-run  Validate the immutable input and runtime plan without writing.
+  --dry-run  Validate immutable-input syntax and select absolute runtime paths
+             without executing pnpm or writing.
   apply      Pin the checkout, frozen-install, reconcile config, and reach
              service_ready (the default mode).
   verify     Read-only gate requiring a real token signal from a newly started,
@@ -183,6 +192,11 @@ select_pnpm() {
 select_node || exit 1
 select_pnpm || exit 1
 
+if [ "$REQUESTED_COLLECTOR_HOME" != "$DEFAULT_COLLECTOR_HOME" ]; then
+  echo "Custom PLIMSOLL_HOME is not supported by the source LaunchAgent installer. Use the default per-user Plimsoll home." >&2
+  exit 1
+fi
+
 case "$PLIMSOLL_DIR" in
   /*) ;;
   *) echo "PLIMSOLL_DIR must be an absolute path." >&2; exit 1 ;;
@@ -234,7 +248,7 @@ emit_receipt() {
         ? "none"
         : env.RECEIPT_MODE === "verify" && env.RECEIPT_READINESS === "service_ready"
           ? "restart_a_locally_authenticated_agent_then_run_verify"
-        : state === "plan_validated"
+        : state === "plan_selected_no_execution"
           ? "run_apply_with_the_same_exact_commit"
           : "inspect_retained_state_then_resume_apply";
     console.log(JSON.stringify({
@@ -276,9 +290,20 @@ emit_receipt() {
   '
 }
 
+stop_loaded_service_after_failure() {
+  if [ "$SERVICE_LOADED_BY_INSTALLER" != "1" ]; then return 0; fi
+  if PATH="$RUNTIME_PATH" "$PNPM_BIN" --silent --dir "$PLIMSOLL_DIR" collector unload-launch-agent >/dev/null 2>&1; then
+    SERVICE_RESULT="stopped_state_retained_after_failed_apply"
+  else
+    SERVICE_RESULT="stop_requested_state_unconfirmed"
+  fi
+  SERVICE_LOADED_BY_INSTALLER=0
+}
+
 fail() {
   ERROR_STAGE="$1"
   code="${2:-1}"
+  stop_loaded_service_after_failure
   echo "Source install stopped at $ERROR_STAGE. Retained state is reported below; no rollback or uninstall is claimed." >&2
   emit_receipt "failed"
   exit "$code"
@@ -286,6 +311,7 @@ fail() {
 
 interrupted() {
   ERROR_STAGE="interrupted"
+  stop_loaded_service_after_failure
   echo "Source install interrupted. Re-run apply with the same exact commit to resume." >&2
   emit_receipt "interrupted"
   exit 130
@@ -293,6 +319,7 @@ interrupted() {
 
 cleanup_lock() {
   if [ "$LOCK_HELD" = "1" ] && [ -d "$INSTALL_LOCK" ] && [ ! -L "$INSTALL_LOCK" ]; then
+    if [ -L "$INSTALL_LOCK/owner.pid" ] || [ ! -f "$INSTALL_LOCK/owner.pid" ]; then return 0; fi
     lock_owner="$(cat "$INSTALL_LOCK/owner.pid" 2>/dev/null || true)"
     if [ "$lock_owner" = "$$" ]; then
       rm -f "$INSTALL_LOCK/owner.pid" 2>/dev/null || true
@@ -302,13 +329,44 @@ cleanup_lock() {
 }
 
 acquire_lock() {
-  mkdir -p "$(dirname "$PLIMSOLL_DIR")" || fail "checkout_parent" $?
+  SECURE_HOME="$HOME" SECURE_TARGET="$DEFAULT_COLLECTOR_HOME" "$NODE_BIN" -e '
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const home = path.resolve(process.env.SECURE_HOME);
+    const target = path.resolve(process.env.SECURE_TARGET);
+    if (target !== path.join(home, "Library", "Application Support", "Plimsoll")) process.exit(1);
+    const ensureDirectory = (directory, mode, create) => {
+      try {
+        const stat = fs.lstatSync(directory);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) process.exit(1);
+      } catch (error) {
+        if (error?.code !== "ENOENT" || !create) process.exit(1);
+        fs.mkdirSync(directory, { mode });
+        const stat = fs.lstatSync(directory);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) process.exit(1);
+      }
+    };
+    ensureDirectory(home, 0o700, false);
+    ensureDirectory(path.join(home, "Library"), 0o700, true);
+    ensureDirectory(path.join(home, "Library", "Application Support"), 0o700, true);
+    ensureDirectory(target, 0o700, true);
+    const descriptor = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      const stat = fs.fstatSync(descriptor);
+      if (!stat.isDirectory()) process.exit(1);
+      fs.fchmodSync(descriptor, 0o700);
+      fs.fsyncSync(descriptor);
+    } finally { fs.closeSync(descriptor); }
+  ' >/dev/null 2>&1 || fail "install_lock_parent" 1
   if mkdir "$INSTALL_LOCK" 2>/dev/null; then
-    printf '%s\n' "$$" > "$INSTALL_LOCK/owner.pid" || fail "install_lock_owner" $?
+    (set -C; umask 077; printf '%s\n' "$$" > "$INSTALL_LOCK/owner.pid") 2>/dev/null || fail "install_lock_owner" $?
     LOCK_HELD=1
     return 0
   fi
   if [ -L "$INSTALL_LOCK" ] || [ ! -d "$INSTALL_LOCK" ]; then
+    fail "install_lock_conflict" 1
+  fi
+  if [ -L "$INSTALL_LOCK/owner.pid" ] || [ ! -f "$INSTALL_LOCK/owner.pid" ]; then
     fail "install_lock_conflict" 1
   fi
   lock_owner="$(cat "$INSTALL_LOCK/owner.pid" 2>/dev/null || true)"
@@ -322,38 +380,93 @@ acquire_lock() {
   esac
   # Only a dead/invalid lock with the one expected regular owner file is
   # reclaimed. Any extra content is retained for operator inspection.
-  if [ -L "$INSTALL_LOCK/owner.pid" ]; then
-    fail "install_lock_conflict" 1
-  fi
   rm -f "$INSTALL_LOCK/owner.pid" 2>/dev/null || fail "install_lock_conflict" $?
   rmdir "$INSTALL_LOCK" 2>/dev/null || fail "install_lock_conflict" $?
   mkdir "$INSTALL_LOCK" 2>/dev/null || fail "install_lock_race" $?
-  printf '%s\n' "$$" > "$INSTALL_LOCK/owner.pid" || fail "install_lock_owner" $?
+  (set -C; umask 077; printf '%s\n' "$$" > "$INSTALL_LOCK/owner.pid") 2>/dev/null || fail "install_lock_owner" $?
   LOCK_HELD=1
+}
+
+prepare_launch_agent_destination() {
+  SECURE_HOME="$HOME" SECURE_PLIST="$LAUNCH_AGENT_PLIST" "$NODE_BIN" -e '
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const home = path.resolve(process.env.SECURE_HOME);
+    const plist = path.resolve(process.env.SECURE_PLIST);
+    const launchAgents = path.join(home, "Library", "LaunchAgents");
+    if (plist !== path.join(launchAgents, "com.plimsoll.collector.plist")) process.exit(1);
+    const ensureDirectory = (directory, mode, create) => {
+      try {
+        const stat = fs.lstatSync(directory);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) process.exit(1);
+      } catch (error) {
+        if (error?.code !== "ENOENT" || !create) process.exit(1);
+        fs.mkdirSync(directory, { mode });
+        const stat = fs.lstatSync(directory);
+        if (!stat.isDirectory() || stat.isSymbolicLink()) process.exit(1);
+      }
+    };
+    ensureDirectory(home, 0o700, false);
+    ensureDirectory(path.join(home, "Library"), 0o700, true);
+    ensureDirectory(launchAgents, 0o700, true);
+    try {
+      const stat = fs.lstatSync(plist);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.nlink !== 1) process.exit(1);
+    } catch (error) {
+      if (error?.code !== "ENOENT") process.exit(1);
+    }
+  ' >/dev/null 2>&1
+}
+
+harden_launch_agent_destination() {
+  SECURE_PLIST="$LAUNCH_AGENT_PLIST" "$NODE_BIN" -e '
+    const fs = require("node:fs");
+    const descriptor = fs.openSync(
+      process.env.SECURE_PLIST,
+      fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW,
+    );
+    try {
+      const stat = fs.fstatSync(descriptor);
+      if (!stat.isFile() || stat.nlink !== 1) process.exit(1);
+      fs.fchmodSync(descriptor, 0o600);
+      fs.fsyncSync(descriptor);
+    } finally { fs.closeSync(descriptor); }
+    const visible = fs.lstatSync(process.env.SECURE_PLIST);
+    if (!visible.isFile() || visible.isSymbolicLink() || visible.nlink !== 1 || (visible.mode & 0o077) !== 0) process.exit(1);
+  ' >/dev/null 2>&1
 }
 
 persist_install_identity() {
   IDENTITY_PATH="$INSTALL_IDENTITY_PATH" \
   IDENTITY_SHA="$SOURCE_REF" \
   IDENTITY_PROVENANCE="$REPO_PROVENANCE" \
+  IDENTITY_REMOTE="$REPO_URL" \
   IDENTITY_NODE_PATH="$NODE_BIN" \
   IDENTITY_NODE_VERSION="$NODE_VERSION" \
   IDENTITY_PNPM_PATH="$PNPM_BIN" \
   IDENTITY_PNPM_VERSION="$PNPM_VERSION" \
+  IDENTITY_BASELINE_TOKENS="$DOCTOR_TOKEN_EVENTS" \
+  IDENTITY_RUNTIME_HASH="$DOCTOR_RUNTIME_HASH" \
   "$NODE_BIN" -e '
     const crypto = require("node:crypto");
     const fs = require("node:fs");
     const path = require("node:path");
     const hash = value => `sha256:${crypto.createHash("sha256").update(value).digest("hex")}`;
     const target = process.env.IDENTITY_PATH;
+    const baselineTokens = Number(process.env.IDENTITY_BASELINE_TOKENS);
+    if (!Number.isSafeInteger(baselineTokens) || baselineTokens < 0 ||
+        !/^sha256:[a-f0-9]{64}$/.test(process.env.IDENTITY_RUNTIME_HASH ?? "")) process.exit(2);
     const payload = `${JSON.stringify({
       schema: "plimsoll.source-install.v1",
       sourceCommit: process.env.IDENTITY_SHA,
       sourceProvenance: process.env.IDENTITY_PROVENANCE,
+      sourceRemoteHash: hash(process.env.IDENTITY_REMOTE),
       nodeVersion: process.env.IDENTITY_NODE_VERSION,
       nodePathHash: hash(process.env.IDENTITY_NODE_PATH),
       pnpmVersion: process.env.IDENTITY_PNPM_VERSION,
       pnpmPathHash: hash(process.env.IDENTITY_PNPM_PATH),
+      baselineTokenAttributedEvents: baselineTokens,
+      runtimeInstanceHash: process.env.IDENTITY_RUNTIME_HASH,
     }, null, 2)}\n`;
     try {
       const stat = fs.lstatSync(target);
@@ -379,14 +492,15 @@ persist_install_identity() {
 }
 
 verify_install_identity() {
-  IDENTITY_PATH="$INSTALL_IDENTITY_PATH" \
-  IDENTITY_SHA="$SOURCE_REF" \
-  IDENTITY_PROVENANCE="$REPO_PROVENANCE" \
-  IDENTITY_NODE_PATH="$NODE_BIN" \
-  IDENTITY_NODE_VERSION="$NODE_VERSION" \
-  IDENTITY_PNPM_PATH="$PNPM_BIN" \
-  IDENTITY_PNPM_VERSION="$PNPM_VERSION" \
-  "$NODE_BIN" -e '
+  identity_baseline="$(IDENTITY_PATH="$INSTALL_IDENTITY_PATH" \
+    IDENTITY_SHA="$SOURCE_REF" \
+    IDENTITY_PROVENANCE="$REPO_PROVENANCE" \
+    IDENTITY_REMOTE="$REPO_URL" \
+    IDENTITY_NODE_PATH="$NODE_BIN" \
+    IDENTITY_NODE_VERSION="$NODE_VERSION" \
+    IDENTITY_PNPM_PATH="$PNPM_BIN" \
+    IDENTITY_PNPM_VERSION="$PNPM_VERSION" \
+    "$NODE_BIN" -e '
     const crypto = require("node:crypto");
     const fs = require("node:fs");
     const hash = value => `sha256:${crypto.createHash("sha256").update(value).digest("hex")}`;
@@ -396,18 +510,67 @@ verify_install_identity() {
       const value = JSON.parse(fs.readFileSync(process.env.IDENTITY_PATH, "utf8"));
       const keys = Object.keys(value).sort().join(",");
       if (
-        keys !== "nodePathHash,nodeVersion,pnpmPathHash,pnpmVersion,schema,sourceCommit,sourceProvenance" ||
+        keys !== "baselineTokenAttributedEvents,nodePathHash,nodeVersion,pnpmPathHash,pnpmVersion,runtimeInstanceHash,schema,sourceCommit,sourceProvenance,sourceRemoteHash" ||
         value.schema !== "plimsoll.source-install.v1" ||
         value.sourceCommit !== process.env.IDENTITY_SHA ||
         value.sourceProvenance !== process.env.IDENTITY_PROVENANCE ||
+        value.sourceRemoteHash !== hash(process.env.IDENTITY_REMOTE) ||
         value.nodeVersion !== process.env.IDENTITY_NODE_VERSION ||
         value.nodePathHash !== hash(process.env.IDENTITY_NODE_PATH) ||
         value.pnpmVersion !== process.env.IDENTITY_PNPM_VERSION ||
-        value.pnpmPathHash !== hash(process.env.IDENTITY_PNPM_PATH)
+        value.pnpmPathHash !== hash(process.env.IDENTITY_PNPM_PATH) ||
+        !Number.isSafeInteger(value.baselineTokenAttributedEvents) || value.baselineTokenAttributedEvents < 0 ||
+        !/^sha256:[a-f0-9]{64}$/.test(value.runtimeInstanceHash)
       ) process.exit(1);
+      process.stdout.write(`${value.baselineTokenAttributedEvents}|${value.runtimeInstanceHash}`);
     } catch { process.exit(1); }
-  ' >/dev/null 2>&1 || return 1
+  ' 2>/dev/null)" || return 1
+  BASELINE_TOKEN_EVENTS="${identity_baseline%%|*}"
+  BASELINE_RUNTIME_HASH="${identity_baseline#*|}"
+  if [ -z "$BASELINE_TOKEN_EVENTS" ] || [ "$BASELINE_RUNTIME_HASH" = "$identity_baseline" ]; then return 1; fi
   INSTALLED_IDENTITY_MATCHED="true"
+}
+
+verify_live_service_binding() {
+  BINDING_PLIST="$LAUNCH_AGENT_PLIST" \
+  BINDING_PID="$DEFAULT_COLLECTOR_HOME/collector.pid" \
+  BINDING_TARGET="$PLIMSOLL_DIR" \
+  BINDING_NODE_DIR="$node_dir" \
+  BINDING_PNPM="$PNPM_BIN" \
+  BINDING_RUNTIME_HASH="$DOCTOR_RUNTIME_HASH" \
+  "$NODE_BIN" -e '
+    const crypto = require("node:crypto");
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const { spawnSync } = require("node:child_process");
+    const hash = value => `sha256:${crypto.createHash("sha256").update(value).digest("hex")}`;
+    try {
+      const plistStat = fs.lstatSync(process.env.BINDING_PLIST);
+      const pidStat = fs.lstatSync(process.env.BINDING_PID);
+      if (!plistStat.isFile() || plistStat.isSymbolicLink() || plistStat.nlink !== 1 || (plistStat.mode & 0o077) !== 0 ||
+          !pidStat.isFile() || pidStat.isSymbolicLink() || pidStat.nlink !== 1 || (pidStat.mode & 0o077) !== 0) process.exit(1);
+      const converted = spawnSync("/usr/bin/plutil", ["-convert", "json", "-o", "-", "--", process.env.BINDING_PLIST], {
+        encoding: "utf8",
+        env: { LANG: "C", LC_ALL: "C", PATH: "/usr/bin:/bin" },
+        stdio: ["ignore", "pipe", "pipe"],
+        timeout: 2000,
+      });
+      if (converted.status !== 0 || !converted.stdout) process.exit(1);
+      const plist = JSON.parse(converted.stdout);
+      const expectedArguments = [process.env.BINDING_PNPM, "--dir", process.env.BINDING_TARGET, "collector", "start"];
+      if (JSON.stringify(plist.ProgramArguments) !== JSON.stringify(expectedArguments) ||
+          plist.WorkingDirectory !== process.env.BINDING_TARGET) process.exit(1);
+      const pathEntries = String(plist.EnvironmentVariables?.PATH ?? "").split(":");
+      if (path.resolve(pathEntries[0] ?? "") !== path.resolve(process.env.BINDING_NODE_DIR) ||
+          !pathEntries.map(entry => path.resolve(entry)).includes(path.resolve(path.dirname(process.env.BINDING_PNPM)))) process.exit(1);
+      const pid = JSON.parse(fs.readFileSync(process.env.BINDING_PID, "utf8"));
+      if (pid.version !== 2 || pid.label !== "com.plimsoll.collector" || pid.cwd !== process.env.BINDING_TARGET ||
+          hash(pid.instanceId) !== process.env.BINDING_RUNTIME_HASH || !Array.isArray(pid.command) ||
+          pid.command.at(-1) !== "start") process.exit(1);
+      const cli = pid.command.find(argument => typeof argument === "string" && argument.endsWith("packages/collector-cli/src/cli.ts"));
+      if (!cli || path.resolve(pid.cwd, cli) !== path.join(process.env.BINDING_TARGET, "packages", "collector-cli", "src", "cli.ts")) process.exit(1);
+    } catch { process.exit(1); }
+  ' >/dev/null 2>&1
 }
 trap interrupted INT TERM HUP
 trap cleanup_lock EXIT
@@ -418,7 +581,8 @@ if [ "$MODE" = "dry-run" ]; then
   CONFIG_RESULT="planned_surgical_reconciliation"
   SERVICE_RESULT="planned_single_launch_agent_reconcile"
   READINESS="not_checked"
-  emit_receipt "plan_validated"
+  PNPM_VERSION="not_executed_in_dry_run"
+  emit_receipt "plan_selected_no_execution"
   exit 0
 fi
 
@@ -437,6 +601,7 @@ case "$PNPM_VERSION" in
   ''|*[!0-9.]*) fail "pnpm_version" 1 ;;
 esac
 
+acquire_lock
 if [ "$MODE" = "verify" ]; then
   if [ ! -d "$PLIMSOLL_DIR/.git" ] || [ -L "$PLIMSOLL_DIR" ] || [ -L "$PLIMSOLL_DIR/.git" ]; then
     CHECKOUT_RESULT="missing"
@@ -447,13 +612,23 @@ if [ "$MODE" = "verify" ]; then
     CHECKOUT_RESULT="different_commit"
     fail "checkout_identity" 1
   fi
+  existing_remote="$(git -C "$PLIMSOLL_DIR" remote get-url origin 2>/dev/null || true)"
+  if [ "$existing_remote" != "$REPO_URL" ]; then
+    CHECKOUT_RESULT="remote_conflict"
+    fail "checkout_remote" 1
+  fi
+  verify_dirty="$(git -C "$PLIMSOLL_DIR" status --porcelain --untracked-files=no 2>/dev/null || true)"
+  if [ -n "$verify_dirty" ]; then
+    CHECKOUT_RESULT="dirty_retained"
+    fail "checkout_dirty" 1
+  fi
   CHECKOUT_RESULT="existing_exact"
   DEPENDENCIES_RESULT="retained_not_reinstalled"
   CONFIG_RESULT="read_only_verification"
   SERVICE_RESULT="read_only_verification"
   verify_install_identity || fail "installed_identity" 1
 else
-  acquire_lock
+  mkdir -p "$(dirname "$PLIMSOLL_DIR")" || fail "checkout_parent" $?
   if [ -L "$PLIMSOLL_DIR" ] || [ -L "$PLIMSOLL_DIR/.git" ]; then
     CHECKOUT_RESULT="symlink_conflict"
     fail "checkout_target" 1
@@ -497,8 +672,13 @@ else
 
   PATH="$RUNTIME_PATH" "$PNPM_BIN" --dir "$PLIMSOLL_DIR" install --frozen-lockfile >/dev/null 2>&1 || fail "frozen_install" $?
   DEPENDENCIES_RESULT="frozen_lockfile_installed"
+  dirty="$(git -C "$PLIMSOLL_DIR" status --porcelain --untracked-files=no 2>/dev/null || true)"
+  if [ -n "$dirty" ]; then
+    CHECKOUT_RESULT="dirty_retained"
+    fail "frozen_install_changed_source" 1
+  fi
 
-  setup_output="$(PATH="$RUNTIME_PATH" "$PNPM_BIN" --dir "$PLIMSOLL_DIR" collector setup --yes 2>/dev/null)"
+  setup_output="$(PATH="$RUNTIME_PATH" "$PNPM_BIN" --silent --dir "$PLIMSOLL_DIR" collector setup --yes 2>/dev/null)"
   setup_status=$?
   if [ "$setup_status" -ne 0 ]; then
     CONFIG_RESULT="failed_retained"
@@ -509,23 +689,75 @@ else
     process.stdin.setEncoding("utf8");
     process.stdin.on("data", chunk => body += chunk);
     process.stdin.on("end", () => {
-      try {
-        const value = JSON.parse(body);
-        process.stdout.write(value.status === "setup_noop" ? "unchanged" : value.status === "setup_applied" ? "applied_with_exact_preimage_backups" : "unknown");
-      } catch { process.stdout.write("unknown"); }
+      const starts = [...body].flatMap((character, index) => character === "{" ? [index] : []);
+      let value;
+      for (let index = starts.length - 1; index >= 0 && !value; index -= 1) {
+        try { value = JSON.parse(body.slice(starts[index]).trim()); } catch {}
+      }
+      const status = value?.status === "setup_noop"
+        ? "unchanged"
+        : value?.status === "setup_applied"
+          ? "applied_with_exact_preimage_backups"
+          : "unknown";
+      process.stdout.write(status);
     });
   ')"
   if [ "$CONFIG_RESULT" = "unknown" ]; then
     fail "config_receipt" 1
   fi
 
+  preflight_output="$(PATH="$RUNTIME_PATH" "$PNPM_BIN" --silent --dir "$PLIMSOLL_DIR" collector doctor --read-only --json 2>/dev/null)"
+  preflight_status=$?
+  printf '%s' "$preflight_output" | PREFLIGHT_STATUS="$preflight_status" SELECTED_NODE_VERSION="$NODE_VERSION" "$NODE_BIN" -e '
+    let body = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", chunk => body += chunk);
+    process.stdin.on("end", () => {
+      const starts = [...body].flatMap((character, index) => character === "{" ? [index] : []);
+      let value;
+      for (let index = starts.length - 1; index >= 0 && !value; index -= 1) {
+        try { value = JSON.parse(body.slice(starts[index]).trim()); } catch {}
+      }
+      try {
+        const ok =
+          value?.readOnly === true &&
+          value.node?.version === process.env.SELECTED_NODE_VERSION &&
+          value.node?.supported === true &&
+          value.config?.status === "valid" && value.config?.valid === true &&
+          value.config?.createdDuringCommand === false &&
+          value.telemetry?.ok === true &&
+          value.telemetry?.claude?.ok === true &&
+          value.telemetry?.codex?.ok === true &&
+          value.dataMode === "metadata" &&
+          value.privacyMode === "metadata_only" &&
+          value.privacy?.mode === "metadata_only" &&
+          value.privacy?.rawEvidenceCapture === "disabled" &&
+          value.syncConfigured === false &&
+          value.uploadSigningConfigured === false;
+        process.exit(ok ? 0 : 1);
+      } catch { process.exit(1); }
+    });
+  ' >/dev/null 2>&1 || fail "local_only_preflight" 1
+
+  dirty="$(git -C "$PLIMSOLL_DIR" status --porcelain --untracked-files=no 2>/dev/null || true)"
+  if [ -n "$dirty" ]; then
+    CHECKOUT_RESULT="dirty_retained"
+    fail "config_step_changed_source" 1
+  fi
+
   # Reconcile one service owner. A failed bootout is the normal absent-job case;
   # the following install/bootstrap postcondition is the authoritative gate.
-  PATH="$RUNTIME_PATH" "$PNPM_BIN" --dir "$PLIMSOLL_DIR" collector unload-launch-agent >/dev/null 2>&1 || true
+  prepare_launch_agent_destination || {
+    SERVICE_RESULT="manifest_destination_refused_retained"
+    fail "service_manifest_destination" 1
+  }
+  PATH="$RUNTIME_PATH" "$PNPM_BIN" --silent --dir "$PLIMSOLL_DIR" collector unload-launch-agent >/dev/null 2>&1 || true
   SERVICE_RESULT="stopped_or_absent"
-  PATH="$RUNTIME_PATH" "$PNPM_BIN" --dir "$PLIMSOLL_DIR" collector install-launch-agent --dev --repo-root "$PLIMSOLL_DIR" --pnpm "$PNPM_BIN" >/dev/null 2>&1 || fail "service_manifest" $?
+  PATH="$RUNTIME_PATH" "$PNPM_BIN" --silent --dir "$PLIMSOLL_DIR" collector install-launch-agent --dev --repo-root "$PLIMSOLL_DIR" --pnpm "$PNPM_BIN" >/dev/null 2>&1 || fail "service_manifest" $?
+  harden_launch_agent_destination || fail "service_manifest_postcondition" 1
   SERVICE_RESULT="manifest_installed"
-  PATH="$RUNTIME_PATH" "$PNPM_BIN" --dir "$PLIMSOLL_DIR" collector load-launch-agent >/dev/null 2>&1 || fail "service_load" $?
+  SERVICE_LOADED_BY_INSTALLER=1
+  PATH="$RUNTIME_PATH" "$PNPM_BIN" --silent --dir "$PLIMSOLL_DIR" collector load-launch-agent >/dev/null 2>&1 || fail "service_load" $?
   SERVICE_RESULT="load_requested"
 fi
 
@@ -535,15 +767,26 @@ case "$doctor_attempts" in ''|*[!0-9]*) doctor_attempts=20 ;; esac
 attempt=1
 doctor_output=""
 while [ "$attempt" -le "$doctor_attempts" ]; do
-  doctor_output="$(PATH="$RUNTIME_PATH" "$PNPM_BIN" --dir "$PLIMSOLL_DIR" collector doctor --read-only --json 2>/dev/null)"
+  doctor_output="$(PATH="$RUNTIME_PATH" "$PNPM_BIN" --silent --dir "$PLIMSOLL_DIR" collector doctor --read-only --json 2>/dev/null)"
   doctor_status=$?
-  READINESS="$(printf '%s' "$doctor_output" | DOCTOR_STATUS="$doctor_status" SELECTED_NODE_VERSION="$NODE_VERSION" "$NODE_BIN" -e '
+  doctor_parsed="$(printf '%s' "$doctor_output" | DOCTOR_STATUS="$doctor_status" SELECTED_NODE_VERSION="$NODE_VERSION" "$NODE_BIN" -e '
+    const crypto = require("node:crypto");
     let body = "";
     process.stdin.setEncoding("utf8");
     process.stdin.on("data", chunk => body += chunk);
     process.stdin.on("end", () => {
       try {
-        const value = JSON.parse(body);
+        const starts = [...body].flatMap((character, index) => character === "{" ? [index] : []);
+        let value;
+        for (let index = starts.length - 1; index >= 0 && !value; index -= 1) {
+          try { value = JSON.parse(body.slice(starts[index]).trim()); } catch {}
+        }
+        if (!value) throw new Error("missing doctor JSON");
+        const tokenEvents = value.connectivity?.signal?.tokenAttributedEvents;
+        const runtimeInstanceId = value.connectivity?.runtimeIdentity?.instanceId;
+        const runtimeHash = typeof runtimeInstanceId === "string"
+          ? `sha256:${crypto.createHash("sha256").update(runtimeInstanceId).digest("hex")}`
+          : "invalid";
         const common =
           value && typeof value === "object" &&
           value.readOnly === true &&
@@ -565,6 +808,8 @@ while [ "$attempt" -le "$doctor_attempts" ]; do
           value.runtime?.processLive === true &&
           value.runtime?.identityMatchesStatus === true &&
           value.connectivity?.reachable === true &&
+          typeof runtimeInstanceId === "string" && runtimeInstanceId.length >= 32 &&
+          Number.isSafeInteger(tokenEvents) && tokenEvents >= 0 &&
           value.dataMode === "metadata" &&
           value.privacyMode === "metadata_only" &&
           value.privacy?.mode === "metadata_only" &&
@@ -580,10 +825,15 @@ while [ "$attempt" -le "$doctor_attempts" ]; do
           common && value.readiness === "signal_verified" && value.ok === true &&
           value.connectivity?.signal?.verified === true &&
           Number(process.env.DOCTOR_STATUS) === 0;
-        process.stdout.write(serviceReady ? "service_ready" : signalVerified ? "signal_verified" : "invalid");
-      } catch { process.stdout.write("invalid"); }
+        const readiness = serviceReady ? "service_ready" : signalVerified ? "signal_verified" : "invalid";
+        process.stdout.write(`${readiness}|${Number.isSafeInteger(tokenEvents) ? tokenEvents : "unknown"}|${runtimeHash}`);
+      } catch { process.stdout.write("invalid|unknown|unknown"); }
     });
   ')"
+  READINESS="${doctor_parsed%%|*}"
+  doctor_remainder="${doctor_parsed#*|}"
+  DOCTOR_TOKEN_EVENTS="${doctor_remainder%%|*}"
+  DOCTOR_RUNTIME_HASH="${doctor_remainder#*|}"
   if [ "$READINESS" = "service_ready" ] || [ "$READINESS" = "signal_verified" ]; then
     break
   fi
@@ -591,26 +841,27 @@ while [ "$attempt" -le "$doctor_attempts" ]; do
   if [ "$attempt" -le "$doctor_attempts" ]; then sleep 0.5; fi
 done
 
+if [ "$READINESS" = "service_ready" ] || [ "$READINESS" = "signal_verified" ]; then
+  verify_live_service_binding || fail "service_identity_binding" 1
+fi
+
 if [ "$MODE" = "verify" ]; then
-  if [ "$READINESS" != "signal_verified" ]; then
+  if [ "$READINESS" != "signal_verified" ] ||
+     [ "$DOCTOR_RUNTIME_HASH" != "$BASELINE_RUNTIME_HASH" ] ||
+     [ "$DOCTOR_TOKEN_EVENTS" -le "$BASELINE_TOKEN_EVENTS" ] 2>/dev/null; then
     SERVICE_RESULT="running_but_signal_unverified"
-    fail "signal_verification" 1
+    fail "fresh_signal_verification" 1
   fi
   SERVICE_RESULT="signal_verified"
   emit_receipt "signal_verified"
   exit 0
 fi
 
-if [ "$READINESS" = "service_ready" ]; then
-  SERVICE_RESULT="service_ready"
+if [ "$READINESS" = "service_ready" ] || [ "$READINESS" = "signal_verified" ]; then
+  READINESS="service_ready"
+  SERVICE_RESULT="service_ready_pending_fresh_signal"
   persist_install_identity || fail "installed_identity_write" 1
   emit_receipt "service_ready"
-  exit 0
-fi
-if [ "$READINESS" = "signal_verified" ]; then
-  SERVICE_RESULT="signal_verified"
-  persist_install_identity || fail "installed_identity_write" 1
-  emit_receipt "signal_verified"
   exit 0
 fi
 

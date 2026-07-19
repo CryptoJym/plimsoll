@@ -199,10 +199,40 @@ esac
 printf 'pnpm %s\\n' "$*" >> "$PLIMSOLL_COMMAND_LOG"
 if [ "$1" = "--version" ]; then printf '10.25.0\\n'; exit 0; fi
 case " $* " in
-  *" collector setup --yes "*) printf '{"status":"setup_applied"}\\n' ;;
-  *" collector unload-launch-agent "*) exit 1 ;;
+  *" collector setup --yes "*) printf 'planned local changes\\n{\\n  "status": "setup_applied"\\n}\\n' ;;
+  *" collector unload-launch-agent "*)
+    pid_file="$HOME/Library/Application Support/Plimsoll/collector.pid"
+    if [ -f "$pid_file" ]; then rm -f "$pid_file"; exit 0; fi
+    exit 1
+    ;;
+  *" collector install-launch-agent --dev "*)
+    repo=""; previous=""
+    for argument in "$@"; do if [ "$previous" = "--repo-root" ]; then repo="$argument"; fi; previous="$argument"; done
+    plist="$HOME/Library/LaunchAgents/com.plimsoll.collector.plist"
+    mkdir -p "$(dirname "$plist")"
+    node_dir="$(dirname "$(command -v node)")"
+    pnpm_dir="$(dirname "$0")"
+    printf '%s\\n' '<?xml version="1.0" encoding="UTF-8"?>' '<plist version="1.0"><dict>' \
+      '<key>Label</key><string>com.plimsoll.collector</string>' \
+      "<key>ProgramArguments</key><array><string>$0</string><string>--dir</string><string>$repo</string><string>collector</string><string>start</string></array>" \
+      "<key>WorkingDirectory</key><string>$repo</string>" \
+      '<key>RunAtLoad</key><true/>' '<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>' \
+      '<key>ThrottleInterval</key><integer>30</integer>' \
+      "<key>StandardOutPath</key><string>$HOME/Library/Application Support/Plimsoll/collector.out.log</string>" \
+      "<key>StandardErrorPath</key><string>$HOME/Library/Application Support/Plimsoll/collector.err.log</string>" \
+      "<key>EnvironmentVariables</key><dict><key>PLIMSOLL_COLLECTOR_DATA_MODE</key><string>metadata</string><key>PATH</key><string>$node_dir:$pnpm_dir:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>" \
+      '</dict></plist>' > "$plist"
+    chmod 600 "$plist"
+    ;;
+  *" collector load-launch-agent "*)
+    repo=""; previous=""
+    for argument in "$@"; do if [ "$previous" = "--dir" ]; then repo="$argument"; fi; previous="$argument"; done
+    mkdir -p "$HOME/Library/Application Support/Plimsoll"
+    printf '{"version":2,"label":"com.plimsoll.collector","cwd":"%s","instanceId":"11111111-1111-4111-8111-111111111111","command":["%s/packages/collector-cli/src/cli.ts","start"]}\\n' "$repo" "$repo" > "$HOME/Library/Application Support/Plimsoll/collector.pid"
+    chmod 600 "$HOME/Library/Application Support/Plimsoll/collector.pid"
+    ;;
   *" collector doctor --read-only --json "*)
-    printf '{"ok":false,"readiness":"service_ready","readOnly":true,"node":{"version":"${process.versions.node}","range":">=20 <25","supported":true},"config":{"status":"valid","valid":true,"createdDuringCommand":false},"telemetry":{"ok":true,"claude":{"ok":true},"codex":{"ok":true}},"launchAgent":{"ok":true,"path":{"ok":true}},"runtime":{"ok":true,"ownershipVersion":{"expected":2,"actual":2},"processLive":true,"identityMatchesStatus":true},"connectivity":{"reachable":true,"signal":{"verified":false}},"dataMode":"metadata","privacyMode":"metadata_only","privacy":{"mode":"metadata_only","configuredDataMode":"metadata","rawEvidenceCapture":"disabled"},"syncConfigured":false,"uploadSigningConfigured":false}\\n'
+    printf '{\\n"ok":false,"readiness":"service_ready","readOnly":true,"node":{"version":"${process.versions.node}","range":">=20 <25","supported":true},"config":{"status":"valid","valid":true,"createdDuringCommand":false},"telemetry":{"ok":true,"claude":{"ok":true},"codex":{"ok":true}},"launchAgent":{"ok":true,"path":{"ok":true}},"runtime":{"ok":true,"ownershipVersion":{"expected":2,"actual":2},"processLive":true,"identityMatchesStatus":true},"connectivity":{"reachable":true,"runtimeIdentity":{"instanceId":"11111111-1111-4111-8111-111111111111"},"signal":{"verified":false,"tokenAttributedEvents":0}},"dataMode":"metadata","privacyMode":"metadata_only","privacy":{"mode":"metadata_only","configuredDataMode":"metadata","rawEvidenceCapture":"disabled"},"syncConfigured":false,"uploadSigningConfigured":false\\n}\\n'
     exit 17
     ;;
 esac
@@ -218,7 +248,7 @@ exit 0
   };
 
   const dryHome = path.join(sandbox, "dry-home");
-  const dryPlimsoll = path.join(sandbox, "dry-plimsoll");
+  const dryPlimsoll = path.join(dryHome, "Library", "Application Support", "Plimsoll");
   const dryTarget = path.join(sandbox, "dry-target");
   const installerArgs = [
     "--ref",
@@ -255,7 +285,7 @@ exit 0
   );
   check(
     "source_installer_dry_run_reports_no_capture_claim",
-    dryReceipt.state === "plan_validated" && dryReceipt.readiness === "not_checked",
+    dryReceipt.state === "plan_selected_no_execution" && dryReceipt.readiness === "not_checked",
     dryReceipt,
   );
   check(
@@ -275,8 +305,9 @@ exit 0
   );
 
   const installHome = path.join(sandbox, "install-home");
-  const installPlimsoll = path.join(sandbox, "install-plimsoll");
+  const installPlimsoll = path.join(installHome, "Library", "Application Support", "Plimsoll");
   const installTarget = path.join(sandbox, "install-target");
+  fs.mkdirSync(installHome, { mode: 0o700 });
   fs.rmSync(commandLog, { force: true });
   const coldInstall = await command("/bin/bash", [installScript, "apply", ...installerArgs], {
     cwd: neutralCwd,
@@ -311,7 +342,7 @@ exit 0
   for (const major of [19, 25]) {
     const unsupportedBin = path.join(sandbox, `unsupported-bin-${major}`);
     const unsupportedHome = path.join(sandbox, `unsupported-home-${major}`);
-    const unsupportedPlimsoll = path.join(sandbox, `unsupported-plimsoll-${major}`);
+    const unsupportedPlimsoll = path.join(unsupportedHome, "Library", "Application Support", "Plimsoll");
     const unsupportedTarget = path.join(sandbox, `unsupported-target-${major}`);
     const unsupportedCommandLog = path.join(sandbox, `unsupported-commands-${major}.log`);
     fs.mkdirSync(unsupportedBin);

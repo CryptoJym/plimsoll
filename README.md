@@ -97,7 +97,11 @@ sanitized JSON receipt on stdout.
 Requirements: macOS arm64 or x86_64, git, one absolute Node 22 executable, one
 absolute pnpm executable, and a bootstrap checkout containing `install.sh`.
 Node 25 may remain the interactive-shell default: pass Node 22 explicitly.
-pnpm does not need to be on a non-interactive shell's `PATH`.
+pnpm does not need to be on a non-interactive shell's `PATH`. The source
+LaunchAgent path uses the default per-user
+`$HOME/Library/Application Support/Plimsoll`; a custom `PLIMSOLL_HOME` is
+refused before mutation because that path is not yet propagated through the
+service contract.
 
 ```bash
 # Values are machine-local except the approved commit; do not share credentials.
@@ -122,11 +126,15 @@ no new backups on a no-op retry. Interrupted apply is resumable with the same
 commit and runtime arguments. A failure receipt names the literal retained
 checkout/dependency/config/service state; it does not claim rollback.
 Apply also stores a private, hash-only source/runtime identity inside the
-checkout's Git metadata. Verify refuses a different commit, Node executable,
-pnpm executable, version, or repository provenance; it does not fetch or
-upgrade anything.
+checkout's Git metadata, including the apply-time token-count baseline and
+runtime-instance hash. Apply never promotes an already-present historical
+signal. Verify requires a strictly larger token count from that same runtime
+instance and refuses a different commit, dirty tracked source, remote, Node
+executable, pnpm executable, or version; it does not fetch or upgrade anything.
 
-`--dry-run` is a byte no-op: it does not fetch, clone, install, write tool or
+`--dry-run` is a byte no-op and plan-selection gate. It validates the immutable
+input syntax and selects executable paths, but deliberately does not execute
+pnpm or claim its version was validated. It does not fetch, clone, install, write tool or
 Plimsoll files/backups, touch the plist/ledger, inspect credentials, bind a
 port, or start/stop a process. Apply defaults to local metadata capture and its
 postcondition rejects hosted sync/signing. Enrollment is a separate,
@@ -148,7 +156,10 @@ PATH="$(dirname "$NODE22"):$(dirname "$PNPM"):$PATH" \
 Do not delete a stale PID or kill an unknown port owner just to make the gate
 green. Inspect ownership first (`lsof -nP -iTCP:48271 -sTCP:LISTEN`), preserve
 the stopped/state-retained boundary, and escalate a conflicting owner. Apply
-reconciles one Plimsoll LaunchAgent; verify is read-only.
+reconciles one Plimsoll LaunchAgent. If a service loaded by the current apply
+fails readiness, the installer requests an unload and reports whether stopped
+state was confirmed. Verify changes no checkout, config, service, plist, or
+ledger data; apply and verify both use one transient machine-global owner lock.
 
 Proof of done is: the apply receipt says `service_ready`, a newly started
 native agent emits a real token signal, the verify receipt says
@@ -158,6 +169,22 @@ not provide signed upgrades, rollback, uninstall/purge, or hosted fleet
 control. Those remain open under
 [#103](https://github.com/CryptoJym/plimsoll/issues/103); retain state rather
 than describing manual deletion as rollback.
+
+The source installer PR is intentionally not promotion-ready by itself. It
+must remain blocked until the atomic Claude config contract
+[#130](https://github.com/CryptoJym/plimsoll/issues/130), live runtime/source
+attestation [#131](https://github.com/CryptoJym/plimsoll/issues/131), and atomic
+LaunchAgent manifest ownership
+[#132](https://github.com/CryptoJym/plimsoll/issues/132), plus the single
+machine-readable CLI contract
+[#133](https://github.com/CryptoJym/plimsoll/issues/133), merge and this lane is
+rebased onto them. The installer rejects an obvious existing plist symlink and
+enforces a private regular-file postcondition, but those checks do not replace
+#132's race-safe source implementation. Compatibility parsing on this branch
+does not replace #133's requirement to invoke a real built CLI mode that emits
+exactly one typed JSON receipt. Until #131 lands, plist/PID/cwd/runtime checks
+are useful local evidence, not cryptographic proof of the running source SHA.
+Do not use this PR alone for either real canary.
 
 > **Codex note:** Codex records token usage on *trace spans* (`gen_ai.usage.*`), not log events. The generated config enables logs, traces, and metrics — if you disable the trace exporter, codex token attribution silently drops to zero. We learned this the hard way (see "The audit story" below).
 
