@@ -32,10 +32,13 @@ function writeExecutable(file: string, body: string) {
 
 function run(
   args: string[],
-  options: { cwd: string; env: NodeJS.ProcessEnv },
+  options: { cwd: string; env: NodeJS.ProcessEnv; umask?: "0777" },
 ): Promise<CommandResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn("/bin/bash", [installer, ...args], {
+    const bashArgs = options.umask
+      ? ["-c", "umask \"$1\"; shift; exec /bin/bash \"$@\"", "plimsoll-proof", options.umask, installer, ...args]
+      : [installer, ...args];
+    const child = spawn("/bin/bash", bashArgs, {
       cwd: options.cwd,
       env: options.env,
       stdio: ["ignore", "pipe", "pipe"],
@@ -95,6 +98,65 @@ function lockOwner(pid: number, ownerNonce: string) {
   })}\n`;
 }
 
+async function withExclusiveLockFixture<T>(
+  lock: string,
+  contents: string,
+  operation: () => Promise<T>,
+  options: { ageMs?: number } = {},
+): Promise<T> {
+  let descriptor: number | undefined;
+  let identity: fs.Stats | undefined;
+  try {
+    descriptor = fs.openSync(
+      lock,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+      0o600,
+    );
+    identity = fs.fstatSync(descriptor);
+    fs.fchmodSync(descriptor, 0o600);
+    identity = fs.fstatSync(descriptor);
+    fs.writeFileSync(descriptor, contents, "utf8");
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+    if (options.ageMs) {
+      const timestamp = new Date(Date.now() - options.ageMs);
+      fs.utimesSync(lock, timestamp, timestamp);
+      identity = fs.lstatSync(lock);
+    }
+  } catch (error) {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch {}
+    }
+    if (identity) {
+      try {
+        const visible = fs.lstatSync(lock);
+        if (visible.dev === identity.dev && visible.ino === identity.ino &&
+            visible.isFile() && !visible.isSymbolicLink()) fs.unlinkSync(lock);
+      } catch {}
+    }
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw new Error(`proof refused to overwrite an existing coordination lock: ${lock}`);
+    }
+    throw error;
+  }
+  try {
+    return await operation();
+  } finally {
+    try {
+      const visible = fs.lstatSync(lock);
+      if (identity && visible.dev === identity.dev && visible.ino === identity.ino &&
+          visible.isFile() && !visible.isSymbolicLink()) {
+        fs.unlinkSync(lock);
+      } else {
+        throw new Error(`proof fixture lock ownership changed; retained without removal: ${lock}`);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+    }
+  }
+}
+
 async function main() {
   check("proof_runs_on_literal_node_22", process.versions.node.split(".")[0] === "22", {
     execPath: process.execPath,
@@ -109,7 +171,8 @@ async function main() {
     const neutral = path.join(sandbox, "neutral");
     const home = path.join(sandbox, "home");
     const plimsollHome = path.join(home, "Library", "Application Support", "Plimsoll");
-    const machineLock = `/private/tmp/com.plimsoll.source-install.${process.getuid!()}.lock`;
+    const lockRoot = path.join(sandbox, "coordination-locks");
+    const machineLock = path.join(lockRoot, `com.plimsoll.source-install.${process.getuid!()}.lock`);
     const checkout = path.join(sandbox, "checkout");
     const adapters = path.join(sandbox, "adapters");
     const externalPnpmDir = path.join(sandbox, "external-pnpm");
@@ -121,6 +184,7 @@ async function main() {
     fs.mkdirSync(adapters, { recursive: true });
     fs.mkdirSync(externalPnpmDir, { recursive: true });
     fs.mkdirSync(stateDir, { recursive: true });
+    fs.mkdirSync(lockRoot, { mode: 0o700 });
 
     writeExecutable(path.join(adapters, "node"), `#!/bin/sh
 case "$2" in
@@ -288,8 +352,12 @@ exit 0
       PLIMSOLL_FIXTURE_COMMAND_LOG: commands,
       PLIMSOLL_FIXTURE_STATE_DIR: stateDir,
       PLIMSOLL_INSTALL_DOCTOR_ATTEMPTS: "1",
+      PLIMSOLL_SOURCE_INSTALL_TEST_ROOT: sandbox,
     };
     const sourceArgs = ["--ref", expectedSha, "--node", process.execPath, "--pnpm", pnpm];
+    check("proof_coordination_lock_namespace_is_isolated",
+      machineLock.startsWith(`${sandbox}${path.sep}`) && !machineLock.startsWith("/private/tmp/"),
+      machineLock);
 
     fs.mkdirSync(path.join(home, ".codex"), { recursive: true });
     fs.mkdirSync(path.join(home, ".claude"), { recursive: true });
@@ -437,18 +505,65 @@ exit 0
     const ownedTarget = path.join(sandbox, "owned-target");
     const ownedLock = machineLock;
     const ownedLockBytes = lockOwner(process.pid, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
-    fs.writeFileSync(ownedLock, ownedLockBytes, { mode: 0o600 });
-    const alreadyOwned = await run(["apply", ...sourceArgs], {
-      cwd: neutral,
-      env: { ...baseEnv, PLIMSOLL_DIR: ownedTarget },
+    const ownedObservation = await withExclusiveLockFixture(ownedLock, ownedLockBytes, async () => {
+      const result = await run(["apply", ...sourceArgs], {
+        cwd: neutral,
+        env: { ...baseEnv, PLIMSOLL_DIR: ownedTarget },
+      });
+      return { result, retainedBytes: fs.readFileSync(ownedLock, "utf8") };
     });
+    const alreadyOwned = ownedObservation.result;
     const ownedReceipt = parseReceipt(alreadyOwned);
-    check("concurrent_live_owner_is_refused_without_lock_theft",
+    check("competing_publisher_refuses_live_owner_without_lock_theft",
       alreadyOwned.code !== 0 && ownedReceipt.errorStage === "install_already_running" &&
-        fs.readFileSync(ownedLock, "utf8") === ownedLockBytes &&
+        ownedObservation.retainedBytes === ownedLockBytes &&
         !fs.existsSync(ownedTarget),
       { alreadyOwned, ownedReceipt });
-    fs.unlinkSync(ownedLock);
+
+    const proveTornRecovery = async (label: string, contents: string) => {
+      const target = path.join(sandbox, `${label}-target`);
+      const result = await withExclusiveLockFixture(machineLock, contents, () =>
+        run(["apply", ...sourceArgs], {
+          cwd: neutral,
+          env: { ...baseEnv, PLIMSOLL_DIR: target, PLIMSOLL_FIXTURE_FETCH_FAIL: "1" },
+        }), { ageMs: 60_000 });
+      const receipt = parseReceipt(result);
+      check(`${label}_lock_is_recovered_after_bounded_grace`,
+        result.code === 42 && receipt.errorStage === "source_fetch" && !fs.existsSync(machineLock),
+        { result, receipt });
+    };
+    await proveTornRecovery("zero_byte_torn", "");
+    await proveTornRecovery("partial_json_torn", "{\"version\":1");
+
+    const reusedPidTarget = path.join(sandbox, "reused-pid-target");
+    const reusedPidBytes = `${JSON.stringify({
+      version: 1,
+      pid: process.pid,
+      processStartFingerprint: `sha256:${"f".repeat(64)}`,
+      ownerNonce: "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+    })}\n`;
+    const reusedPid = await withExclusiveLockFixture(machineLock, reusedPidBytes, () =>
+      run(["apply", ...sourceArgs], {
+        cwd: neutral,
+        env: { ...baseEnv, PLIMSOLL_DIR: reusedPidTarget, PLIMSOLL_FIXTURE_FETCH_FAIL: "1" },
+      }));
+    const reusedPidReceipt = parseReceipt(reusedPid);
+    check("live_pid_with_mismatched_start_fingerprint_is_reclaimed",
+      reusedPid.code === 42 && reusedPidReceipt.errorStage === "source_fetch" && !fs.existsSync(machineLock),
+      { reusedPid, reusedPidReceipt });
+
+    const restrictiveUmaskTarget = path.join(sandbox, "restrictive-umask-occupied");
+    fs.writeFileSync(restrictiveUmaskTarget, "occupied\n");
+    const restrictiveUmask = await run(["apply", ...sourceArgs], {
+      cwd: neutral,
+      env: { ...baseEnv, PLIMSOLL_DIR: restrictiveUmaskTarget },
+      umask: "0777",
+    });
+    const restrictiveUmaskReceipt = parseReceipt(restrictiveUmask);
+    check("restrictive_umask_cannot_wedge_coordination_lock",
+      restrictiveUmask.code !== 0 && restrictiveUmaskReceipt.errorStage === "checkout_target" &&
+        !fs.existsSync(machineLock) && fs.readdirSync(lockRoot).length === 0,
+      { restrictiveUmask, restrictiveUmaskReceipt, lockArtifacts: fs.readdirSync(lockRoot) });
 
     const syncTarget = path.join(sandbox, "sync-target");
     const syncState = path.join(sandbox, "sync-state");
@@ -793,21 +908,22 @@ exit 0
     const retryState = path.join(sandbox, "retry-state");
     fs.mkdirSync(retryState);
     const staleRetryLock = machineLock;
-    fs.writeFileSync(staleRetryLock, `${JSON.stringify({
+    const staleRetryBytes = `${JSON.stringify({
       version: 1,
       pid: 999999,
       processStartFingerprint: `sha256:${"a".repeat(64)}`,
       ownerNonce: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
-    })}\n`, { mode: 0o600 });
-    const interrupted = await run(["apply", ...sourceArgs], {
-      cwd: neutral,
-      env: {
-        ...baseEnv,
-        PLIMSOLL_DIR: retryTarget,
-        PLIMSOLL_FIXTURE_STATE_DIR: retryState,
-        PLIMSOLL_FIXTURE_INSTALL_FAIL_ONCE: "1",
-      },
-    });
+    })}\n`;
+    const interrupted = await withExclusiveLockFixture(staleRetryLock, staleRetryBytes, () =>
+      run(["apply", ...sourceArgs], {
+        cwd: neutral,
+        env: {
+          ...baseEnv,
+          PLIMSOLL_DIR: retryTarget,
+          PLIMSOLL_FIXTURE_STATE_DIR: retryState,
+          PLIMSOLL_FIXTURE_INSTALL_FAIL_ONCE: "1",
+        },
+      }));
     const interruptedReceipt = parseReceipt(interrupted);
     const resumed = await run(["apply", ...sourceArgs], {
       cwd: neutral,
@@ -899,7 +1015,8 @@ exit 0
         fs.readFileSync(path.join(home, ".claude", ".credentials.json"), "utf8") === credentialSentinel,
       home);
     check("per_uid_machine_coordination_lock_is_removed_after_each_operation",
-      !fs.existsSync(machineLock), machineLock);
+      !fs.existsSync(machineLock) && fs.readdirSync(lockRoot).length === 0,
+      { machineLock, lockArtifacts: fs.readdirSync(lockRoot) });
 
     const receipt = {
       issue: 128,
@@ -910,7 +1027,7 @@ exit 0
         realLaunchAgentsTouched: 0,
         realToolConfigsTouched: 0,
         credentialReadsOrCopies: 0,
-        perUidMachineCoordinationLock: "transient_acquired_and_removed",
+        perUidMachineCoordinationLock: "temporary_namespace_acquired_and_removed",
       },
       node: { execPath: process.execPath, version: process.versions.node },
       checks,

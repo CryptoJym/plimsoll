@@ -245,6 +245,7 @@ exit 0
     PATH: isolatedPath,
     PLIMSOLL_COMMAND_LOG: commandLog,
     PLIMSOLL_LAUNCHCTL_LOG: launchctlLog,
+    PLIMSOLL_SOURCE_INSTALL_TEST_ROOT: sandbox,
   };
 
   const dryHome = path.join(sandbox, "dry-home");

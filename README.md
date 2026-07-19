@@ -173,6 +173,11 @@ control. Those remain open under
 [#103](https://github.com/CryptoJym/plimsoll/issues/103); retain state rather
 than describing manual deletion as rollback.
 
+The installer proofs use a guarded temporary coordination-lock
+namespace whose HOME, checkout, and collector home must all be inside the same
+private proof root. It never creates, truncates, or removes the production
+per-UID lock under `/private/tmp`.
+
 The source installer PR is intentionally not promotion-ready by itself. It
 must remain blocked until the atomic Claude config contract
 [#130](https://github.com/CryptoJym/plimsoll/issues/130), live runtime/source

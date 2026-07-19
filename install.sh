@@ -325,11 +325,13 @@ cleanup_lock() {
   if [ "$LOCK_HELD" != "1" ] || [ -z "$LOCK_NONCE" ]; then return 0; fi
   LOCK_PATH="$INSTALL_LOCK" LOCK_PID="$$" LOCK_NONCE_VALUE="$LOCK_NONCE" "$NODE_BIN" -e '
     const fs = require("node:fs");
+    const path = require("node:path");
     const lock = process.env.LOCK_PATH;
     try {
-      if (lock !== `/private/tmp/com.plimsoll.source-install.${process.getuid()}.lock`) process.exit(0);
+      if (!path.isAbsolute(lock)) process.exit(0);
       const before = fs.lstatSync(lock);
-      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.uid !== process.getuid()) process.exit(0);
+      if (!before.isFile() || before.isSymbolicLink() || ![1, 2].includes(before.nlink) ||
+          before.uid !== process.getuid() || (before.mode & 0o777) !== 0o600) process.exit(0);
       const descriptor = fs.openSync(lock, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
       let value;
       try {
@@ -339,9 +341,24 @@ cleanup_lock() {
       } finally { fs.closeSync(descriptor); }
       if (value?.version !== 1 || value.pid !== Number(process.env.LOCK_PID) ||
           value.ownerNonce !== process.env.LOCK_NONCE_VALUE) process.exit(0);
+      const temp = path.join(path.dirname(lock), `.${path.basename(lock)}.${value.ownerNonce}.tmp`);
+      let tempIdentity;
+      if (before.nlink === 2) {
+        tempIdentity = fs.lstatSync(temp);
+        if (!tempIdentity.isFile() || tempIdentity.isSymbolicLink() || tempIdentity.dev !== before.dev ||
+            tempIdentity.ino !== before.ino || tempIdentity.uid !== process.getuid()) process.exit(0);
+      }
       const visible = fs.lstatSync(lock);
       if (visible.dev !== before.dev || visible.ino !== before.ino || visible.isSymbolicLink()) process.exit(0);
       fs.unlinkSync(lock);
+      if (tempIdentity) {
+        const visibleTemp = fs.lstatSync(temp);
+        if (visibleTemp.dev === before.dev && visibleTemp.ino === before.ino && !visibleTemp.isSymbolicLink()) {
+          fs.unlinkSync(temp);
+        }
+      }
+      const directory = fs.openSync(path.dirname(lock), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
     } catch (error) {
       if (error?.code !== "ENOENT") process.exit(0);
     }
@@ -385,7 +402,57 @@ prepare_default_collector_home() {
 acquire_lock() {
   lock_uid="$($NODE_BIN -p 'process.getuid()' 2>/dev/null || true)"
   case "$lock_uid" in ''|*[!0-9]*) fail "install_lock_identity" 1 ;; esac
-  INSTALL_LOCK="/private/tmp/com.plimsoll.source-install.${lock_uid}.lock"
+  INSTALL_LOCK="$(
+    LOCK_UID="$lock_uid" \
+    TEST_ROOT="${PLIMSOLL_SOURCE_INSTALL_TEST_ROOT:-}" \
+    SECURE_HOME="$HOME" \
+    SECURE_APP="$PLIMSOLL_DIR" \
+    SECURE_COLLECTOR_HOME="$DEFAULT_COLLECTOR_HOME" \
+    "$NODE_BIN" -e '
+      const fs = require("node:fs");
+      const path = require("node:path");
+      const uid = process.getuid();
+      if (String(uid) !== process.env.LOCK_UID) process.exit(1);
+      const testRootInput = process.env.TEST_ROOT;
+      if (!testRootInput) {
+        for (const directory of ["/private", "/private/tmp"]) {
+          const stat = fs.lstatSync(directory);
+          if (!stat.isDirectory() || stat.isSymbolicLink()) process.exit(1);
+        }
+        process.stdout.write(`/private/tmp/com.plimsoll.source-install.${uid}.lock`);
+        process.exit(0);
+      }
+      const root = path.resolve(testRootInput);
+      const rootStat = fs.lstatSync(root);
+      if (!rootStat.isDirectory() || rootStat.isSymbolicLink() || rootStat.uid !== uid ||
+          (rootStat.mode & 0o777) !== 0o700 ||
+          !/^plimsoll-(?:source-installer|install-doctor)-proof-/.test(path.basename(root))) {
+        process.exit(1);
+      }
+      const inside = candidate => {
+        const resolved = path.resolve(candidate);
+        return resolved === root || resolved.startsWith(`${root}${path.sep}`);
+      };
+      if (![process.env.SECURE_HOME, process.env.SECURE_APP, process.env.SECURE_COLLECTOR_HOME]
+        .every(candidate => typeof candidate === "string" && inside(candidate))) process.exit(1);
+      const lockDirectory = path.join(root, "coordination-locks");
+      try { fs.mkdirSync(lockDirectory, { mode: 0o700 }); } catch (error) {
+        if (error?.code !== "EEXIST") process.exit(1);
+      }
+      const directory = fs.openSync(lockDirectory, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      try {
+        const stat = fs.fstatSync(directory);
+        if (!stat.isDirectory() || stat.uid !== uid) process.exit(1);
+        fs.fchmodSync(directory, 0o700);
+        fs.fsyncSync(directory);
+      } finally { fs.closeSync(directory); }
+      process.stdout.write(path.join(lockDirectory, `com.plimsoll.source-install.${uid}.lock`));
+    ' 2>/dev/null
+  )"
+  lock_path_status=$?
+  if [ "$lock_path_status" -ne 0 ] || [ -z "$INSTALL_LOCK" ]; then
+    fail "install_lock_identity" 1
+  fi
   LOCK_NONCE="$(LOCK_PATH="$INSTALL_LOCK" LOCK_PID="$$" "$NODE_BIN" -e '
     const crypto = require("node:crypto");
     const fs = require("node:fs");
@@ -393,12 +460,7 @@ acquire_lock() {
     const { spawnSync } = require("node:child_process");
     const lock = process.env.LOCK_PATH;
     const ownerPid = Number(process.env.LOCK_PID);
-    const expectedLock = `/private/tmp/com.plimsoll.source-install.${process.getuid()}.lock`;
-    if (lock !== expectedLock) process.exit(74);
-    for (const directory of ["/private", "/private/tmp"]) {
-      const stat = fs.lstatSync(directory);
-      if (!stat.isDirectory() || stat.isSymbolicLink()) process.exit(74);
-    }
+    if (!path.isAbsolute(lock) || path.basename(lock) !== `com.plimsoll.source-install.${process.getuid()}.lock`) process.exit(74);
     const fingerprint = pid => {
       const result = spawnSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
         encoding: "utf8",
@@ -422,17 +484,59 @@ acquire_lock() {
       const directory = fs.openSync(path.dirname(lock), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
       try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
     };
-    const create = () => {
-      const descriptor = fs.openSync(
-        lock,
-        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
-        0o600,
-      );
+    const sameIdentity = (stat, identity) => stat.dev === identity.dev && stat.ino === identity.ino;
+    const unlinkSame = (candidate, identity) => {
       try {
+        const visible = fs.lstatSync(candidate);
+        if (sameIdentity(visible, identity) && visible.isFile() && !visible.isSymbolicLink() &&
+            visible.uid === process.getuid()) fs.unlinkSync(candidate);
+      } catch (error) {
+        if (error?.code !== "ENOENT") throw error;
+      }
+    };
+    const tempFor = nonce => path.join(path.dirname(lock), `.${path.basename(lock)}.${nonce}.tmp`);
+    const create = () => {
+      // The fixed lock name is never visible until a complete, fsynced,
+      // mode-0600 inode can be linked to it without replacing an owner.
+      const temp = tempFor(ownerNonce);
+      let descriptor;
+      let identity;
+      let published = false;
+      try {
+        descriptor = fs.openSync(
+          temp,
+          fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+          0o600,
+        );
+        fs.fchmodSync(descriptor, 0o600);
+        identity = fs.fstatSync(descriptor);
+        if (!identity.isFile() || identity.uid !== process.getuid() || identity.nlink !== 1 ||
+            (identity.mode & 0o777) !== 0o600) throw new Error("unsafe temporary lock");
         fs.writeFileSync(descriptor, payload, "utf8");
         fs.fsyncSync(descriptor);
-      } finally { fs.closeSync(descriptor); }
-      syncParent();
+        fs.closeSync(descriptor);
+        descriptor = undefined;
+        fs.linkSync(temp, lock);
+        published = true;
+        const linked = fs.lstatSync(lock);
+        if (!linked.isFile() || linked.isSymbolicLink() || !sameIdentity(linked, identity) ||
+            linked.nlink !== 2 || linked.uid !== process.getuid() || (linked.mode & 0o777) !== 0o600) {
+          throw new Error("lock publication race");
+        }
+        syncParent();
+        try {
+          unlinkSame(temp, identity);
+          syncParent();
+        } catch {}
+      } catch (error) {
+        if (descriptor !== undefined) {
+          try { fs.closeSync(descriptor); } catch {}
+        }
+        if (identity && !published) {
+          try { unlinkSame(temp, identity); } catch {}
+        }
+        throw error;
+      }
       fs.writeSync(1, ownerNonce);
     };
     try { create(); process.exit(0); } catch (error) {
@@ -440,21 +544,44 @@ acquire_lock() {
     }
     let before;
     let value;
+    let tempIdentity;
+    const recoverTorn = () => {
+      if (!before || Date.now() - before.mtimeMs < 30000) process.exit(74);
+      try {
+        const visible = fs.lstatSync(lock);
+        if (!sameIdentity(visible, before) || visible.size !== before.size ||
+            visible.mtimeMs !== before.mtimeMs || visible.isSymbolicLink()) process.exit(75);
+        fs.unlinkSync(lock);
+        syncParent();
+        create();
+        process.exit(0);
+      } catch { process.exit(75); }
+    };
     try {
       before = fs.lstatSync(lock);
-      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.uid !== process.getuid() ||
-          (before.mode & 0o077) !== 0 || before.size > 4096) process.exit(74);
+      if (!before.isFile() || before.isSymbolicLink() || ![1, 2].includes(before.nlink) ||
+          before.uid !== process.getuid() || before.size > 4096 || (before.mode & 0o7000) !== 0) process.exit(74);
+      if ((before.mode & 0o777) !== 0o600 || before.size === 0) recoverTorn();
       const descriptor = fs.openSync(lock, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
       try {
         const opened = fs.fstatSync(descriptor);
         if (opened.dev !== before.dev || opened.ino !== before.ino) process.exit(75);
         value = JSON.parse(fs.readFileSync(descriptor, "utf8"));
       } finally { fs.closeSync(descriptor); }
-    } catch { process.exit(74); }
-    if (Object.keys(value).sort().join(",") !== "ownerNonce,pid,processStartFingerprint,version" ||
+    } catch { recoverTorn(); }
+    if (!value || typeof value !== "object" || Array.isArray(value) ||
+        Object.keys(value).sort().join(",") !== "ownerNonce,pid,processStartFingerprint,version" ||
         value.version !== 1 || !Number.isSafeInteger(value.pid) || value.pid <= 1 ||
         typeof value.ownerNonce !== "string" || !/^[0-9a-f-]{36}$/i.test(value.ownerNonce) ||
-        !/^sha256:[0-9a-f]{64}$/.test(value.processStartFingerprint)) process.exit(74);
+        !/^sha256:[0-9a-f]{64}$/.test(value.processStartFingerprint)) recoverTorn();
+    if (before.nlink === 2) {
+      try {
+        const temp = tempFor(value.ownerNonce);
+        tempIdentity = fs.lstatSync(temp);
+        if (!tempIdentity.isFile() || tempIdentity.isSymbolicLink() || !sameIdentity(tempIdentity, before) ||
+            tempIdentity.uid !== process.getuid()) process.exit(74);
+      } catch { process.exit(74); }
+    }
     let live = false;
     try { process.kill(value.pid, 0); live = true; } catch (error) {
       if (error?.code === "EPERM") process.exit(74);
@@ -469,6 +596,7 @@ acquire_lock() {
       const visible = fs.lstatSync(lock);
       if (visible.dev !== before.dev || visible.ino !== before.ino || visible.isSymbolicLink()) process.exit(75);
       fs.unlinkSync(lock);
+      if (tempIdentity) unlinkSame(tempFor(value.ownerNonce), before);
       syncParent();
       create();
     } catch { process.exit(75); }

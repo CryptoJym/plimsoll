@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const SYSTEM_E2E_SCHEMA = "plimsoll.system-e2e-proof.v2" as const;
-export const SUPPORT_NORMALIZATION_VERSION = 4 as const;
+export const SUPPORT_NORMALIZATION_VERSION = 5 as const;
 /** Fixed release thresholds. These are never derived from an observed run. */
 export const SYSTEM_E2E_BUDGETS = {
   directRows: 500,
@@ -186,6 +186,9 @@ function normalizeString(
   }
   if (/^(?:v)?22\.\d+\.\d+$/.test(value) && /^(?:node|nodeVersion|version)$/i.test(key)) {
     return "<node-major-22>";
+  }
+  if (key === "error" && ["AbortError", "TypeError"].includes(value)) {
+    return "<loopback-connectivity-error>";
   }
   if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value) && /(?:At|Time)$/i.test(key)) {
     return "<volatile-iso-time>";
