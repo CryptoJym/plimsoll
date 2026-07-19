@@ -35,6 +35,9 @@ jobs:
       - name: Prove source installer and read-only doctor
         run: pnpm proof:install-doctor
 
+      - name: Prove deterministic two-phase source canary install
+        run: pnpm proof:source-installer
+
       - name: Prove surgical Codex config reconciliation
         run: pnpm proof:codex-config-apply
 

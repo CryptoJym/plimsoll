@@ -57,7 +57,8 @@ The outcome join uses **linkage keys**: both Plimsoll and the GitHub side hash t
 
 ## Quickstart
 
-Requirements: macOS, Node >=20 <25.
+Requirements for the published foreground CLI: macOS, Node >=20 <25. The
+team source-canary installer below is narrower and pins Node 22.
 
 ```bash
 # wire Claude Code + Codex telemetry (idempotent, takes backups; --dry-run to preview)
@@ -84,33 +85,75 @@ is **not yet a published `plimsoll lifecycle` command or an authorized live
 rollout**; release signing, npm publication, and real-Mac service integration
 remain under [#103](https://github.com/CryptoJym/plimsoll/issues/103).
 
-**Contributors / running from source** (adds pnpm + git):
+## Team Mac source-canary runbook
+
+This is the reviewed development-checkout path for team canaries. It is not
+the final signed package lifecycle. Get one approved, full 40-character commit
+from the canary owner; never substitute `main`, another branch, or a shortened
+SHA. The installer fetches that exact remote object, verifies the fetched and
+checked-out commits, uses `pnpm install --frozen-lockfile`, and records a
+sanitized JSON receipt on stdout.
+
+Requirements: macOS arm64 or x86_64, git, one absolute Node 22 executable, one
+absolute pnpm executable, and a bootstrap checkout containing `install.sh`.
+Node 25 may remain the interactive-shell default: pass Node 22 explicitly.
+pnpm does not need to be on a non-interactive shell's `PATH`.
 
 ```bash
-git clone https://github.com/CryptoJym/plimsoll.git
-cd plimsoll
-./install.sh --dry-run                        # preflight and exact mutation plan only
-./install.sh                                  # setup + development LaunchAgent + strict gate
+# Values are machine-local except the approved commit; do not share credentials.
+SOURCE_SHA=<approved-full-40-character-commit>
+NODE22=/absolute/path/to/node
+PNPM=/absolute/path/to/pnpm
 
-# Equivalent manual source commands:
-pnpm install
-pnpm collector setup --yes                    # idempotent; backs up changed tool configs
-pnpm collector install-launch-agent --dev --repo-root "$PWD" --pnpm "$(command -v pnpm)" --load
-pnpm collector doctor --read-only --json      # exits 0 only after a real token signal
-pnpm report -- --repository your-org/your-repo   # after a few sessions: the economics
+./install.sh --dry-run --ref "$SOURCE_SHA" --node "$NODE22" --pnpm "$PNPM"
+./install.sh apply --ref "$SOURCE_SHA" --node "$NODE22" --pnpm "$PNPM"
+# success is service_ready on a new/cold ledger, not capture proof
+
+# Quit and start a new, already locally authenticated Codex or Claude session.
+# Perform one ordinary token-bearing local interaction, then:
+./install.sh verify --ref "$SOURCE_SHA" --node "$NODE22" --pnpm "$PNPM"
+# only this phase succeeds as signal_verified
 ```
 
-`setup` applies the tool configs for you (idempotent, takes backups,
-`--dry-run` to preview); `generate-config` prints exactly what to add to
-`~/.claude/settings.json` and `~/.codex/config.toml` if you'd rather paste
-by hand — hooks plus OTLP exporters pointed at `127.0.0.1:48271`. Nothing
-is configured behind your back.
+The fresh-machine and partial-install path is the same command. `setup`
+reconciles only the Plimsoll-owned Claude/Codex telemetry fields, preserves
+unrelated settings, keeps exact preimage backups for changed files, and makes
+no new backups on a no-op retry. Interrupted apply is resumable with the same
+commit and runtime arguments. A failure receipt names the literal retained
+checkout/dependency/config/service state; it does not claim rollback.
 
-The source install script's `--dry-run` does not clone, install dependencies,
-write Claude/Codex or Plimsoll files, register a LaunchAgent, or start a
-collector. The real install fails closed if the final doctor gate is below
-`signal_verified`; the JSON report names the incomplete readiness level and
-each missing/conflicted requirement.
+`--dry-run` is a byte no-op: it does not fetch, clone, install, write tool or
+Plimsoll files/backups, touch the plist/ledger, inspect credentials, bind a
+port, or start/stop a process. Apply defaults to local metadata capture and its
+postcondition rejects hosted sync/signing. Enrollment is a separate,
+per-device future step; credentials and agent authentication never move
+between Macs.
+
+To stop while retaining the checkout, tool config, plist, and ledger, use the
+same pinned runtime and source directory:
+
+```bash
+PATH="$(dirname "$NODE22"):$(dirname "$PNPM"):$PATH" \
+  "$PNPM" --dir "$HOME/.plimsoll/app" collector unload-launch-agent
+
+# Resume/reconcile after diagnosing a stale PID, plist, or occupied port:
+./install.sh apply --ref "$SOURCE_SHA" --node "$NODE22" --pnpm "$PNPM"
+./install.sh verify --ref "$SOURCE_SHA" --node "$NODE22" --pnpm "$PNPM"
+```
+
+Do not delete a stale PID or kill an unknown port owner just to make the gate
+green. Inspect ownership first (`lsof -nP -iTCP:48271 -sTCP:LISTEN`), preserve
+the stopped/state-retained boundary, and escalate a conflicting owner. Apply
+reconciles one Plimsoll LaunchAgent; verify is read-only.
+
+Proof of done is: the apply receipt says `service_ready`, a newly started
+native agent emits a real token signal, the verify receipt says
+`signal_verified`, `pnpm proof:source-installer` passes under Node 22, and the
+service can be stopped and resumed without a second owner. Source install does
+not provide signed upgrades, rollback, uninstall/purge, or hosted fleet
+control. Those remain open under
+[#103](https://github.com/CryptoJym/plimsoll/issues/103); retain state rather
+than describing manual deletion as rollback.
 
 > **Codex note:** Codex records token usage on *trace spans* (`gen_ai.usage.*`), not log events. The generated config enables logs, traces, and metrics — if you disable the trace exporter, codex token attribution silently drops to zero. We learned this the hard way (see "The audit story" below).
 

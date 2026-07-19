@@ -28,6 +28,7 @@
     "proof:outbox": "tsx scripts/outbox-proof.ts",
     "proof:codex-config-apply": "tsx scripts/codex-config-apply-proof.ts",
     "proof:install-doctor": "tsx scripts/install-doctor-proof.ts",
+    "proof:source-installer": "tsx scripts/source-installer-proof.ts",
     "proof:metric-truth": "tsx scripts/metric-truth-proof.ts",
     "proof:http-boundary": "tsx scripts/local-http-boundary-proof.ts",
     "proof:privacy-mode": "tsx scripts/privacy-mode-proof.ts",

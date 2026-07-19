@@ -40,6 +40,7 @@ const root = path.resolve(import.meta.dirname, "..");
 const cli = path.join(root, "packages", "collector-cli", "src", "cli.ts");
 const tsx = path.join(root, "node_modules", "tsx", "dist", "cli.mjs");
 const installScript = path.join(root, "install.sh");
+const sourceInstallSha = "74be1da7774357eab02cd9e5e31aa314bdb8ddba";
 const proofWorkflow = path.join(root, ".github", "workflows", "proof.yml");
 const partialCodexFixture = path.join(root, "scripts", "fixtures", "codex-partial-legacy.toml");
 const checks: Check[] = [];
@@ -114,6 +115,7 @@ async function main() {
   const requiredStandaloneGates = [
     "pnpm proof:allocation",
     "pnpm proof:install-doctor",
+    "pnpm proof:source-installer",
     "pnpm proof:codex-config-apply",
     "pnpm proof:http-boundary",
     "pnpm proof:dashboard",
@@ -173,15 +175,37 @@ async function main() {
     path.join(stubBin, "git"),
     `#!/bin/sh
 printf 'git %s\\n' "$*" >> "$PLIMSOLL_COMMAND_LOG"
-if [ "$1" = "clone" ]; then mkdir -p "$3/.git"; fi
-exit 0
+if [ "$1" = "init" ]; then mkdir -p "$2/.git"; exit 0; fi
+if [ "$1" != "-C" ]; then exit 90; fi
+repo="$2"
+shift 2
+case "$1 $2" in
+  "remote add") printf '%s\\n' "$4" > "$repo/.git/origin" ;;
+  "remote get-url") cat "$repo/.git/origin" ;;
+  "status --porcelain") ;;
+  "fetch --no-tags") printf '%s\\n' "$4" > "$repo/.git/fetched" ;;
+  "rev-parse --verify")
+    case "$3" in *FETCH_HEAD*) cat "$repo/.git/fetched" ;; *HEAD*) cat "$repo/.git/head" ;; *) exit 91 ;; esac
+    ;;
+  "cat-file -e") ;;
+  "checkout --detach") printf '%s\\n' "$3" > "$repo/.git/head" ;;
+  *) exit 92 ;;
+esac
 `,
   );
   writeExecutable(
     path.join(stubBin, "pnpm"),
     `#!/bin/sh
 printf 'pnpm %s\\n' "$*" >> "$PLIMSOLL_COMMAND_LOG"
-case " $* " in *" collector doctor --read-only --json "*) exit 17 ;; esac
+if [ "$1" = "--version" ]; then printf '10.25.0\\n'; exit 0; fi
+case " $* " in
+  *" collector setup --yes "*) printf '{"status":"setup_applied"}\\n' ;;
+  *" collector unload-launch-agent "*) exit 1 ;;
+  *" collector doctor --read-only --json "*)
+    printf '{"ok":false,"readiness":"service_ready","readOnly":true,"node":{"version":"${process.versions.node}","range":">=20 <25","supported":true},"config":{"status":"valid","valid":true,"createdDuringCommand":false},"telemetry":{"ok":true,"claude":{"ok":true},"codex":{"ok":true}},"launchAgent":{"ok":true,"path":{"ok":true}},"runtime":{"ok":true,"ownershipVersion":{"expected":2,"actual":2},"processLive":true,"identityMatchesStatus":true},"connectivity":{"reachable":true,"signal":{"verified":false}},"dataMode":"metadata","privacyMode":"metadata_only","privacy":{"mode":"metadata_only","configuredDataMode":"metadata","rawEvidenceCapture":"disabled"},"syncConfigured":false,"uploadSigningConfigured":false}\\n'
+    exit 17
+    ;;
+esac
 exit 0
 `,
   );
@@ -196,7 +220,15 @@ exit 0
   const dryHome = path.join(sandbox, "dry-home");
   const dryPlimsoll = path.join(sandbox, "dry-plimsoll");
   const dryTarget = path.join(sandbox, "dry-target");
-  const dryRun = await command("/bin/bash", [installScript, "--dry-run"], {
+  const installerArgs = [
+    "--ref",
+    sourceInstallSha,
+    "--node",
+    process.execPath,
+    "--pnpm",
+    path.join(stubBin, "pnpm"),
+  ];
+  const dryRun = await command("/bin/bash", [installScript, "--dry-run", ...installerArgs], {
     cwd: neutralCwd,
     env: {
       ...commonEnv,
@@ -205,21 +237,26 @@ exit 0
       PLIMSOLL_DIR: dryTarget,
     },
   });
+  const dryReceipt = parseJson(dryRun.stdout);
   check("source_installer_dry_run_succeeds", dryRun.code === 0, dryRun);
   check(
-    "source_installer_dry_run_is_node_22",
-    dryRun.stdout.includes(`Node: ${process.versions.node} (supported: >=20 <25)`),
-    dryRun.stdout,
+    "source_installer_dry_run_is_literal_node_22",
+    dryReceipt.runtime.nodeMajor === 22 && dryReceipt.runtime.nodeVersion === process.versions.node,
+    dryReceipt,
   );
   check(
-    "source_installer_plans_supported_dev_path",
-    dryRun.stdout.includes("install-launch-agent --dev --repo-root"),
-    dryRun.stdout,
+    "source_installer_plans_immutable_frozen_two_phase_path",
+    dryReceipt.source.commit === sourceInstallSha &&
+      dryReceipt.source.input === "full_commit_sha" &&
+      dryReceipt.source.remoteObjectVerified === false &&
+      dryReceipt.retainedState.dependencies === "planned_frozen_lockfile" &&
+      dryReceipt.retainedState.service === "planned_single_launch_agent_reconcile",
+    dryReceipt,
   );
   check(
-    "source_installer_plans_strict_read_only_doctor",
-    dryRun.stdout.includes("doctor --read-only --json (failure stops installation)"),
-    dryRun.stdout,
+    "source_installer_dry_run_reports_no_capture_claim",
+    dryReceipt.state === "plan_validated" && dryReceipt.readiness === "not_checked",
+    dryReceipt,
   );
   check(
     "source_installer_dry_run_creates_nothing",
@@ -240,25 +277,34 @@ exit 0
   const installHome = path.join(sandbox, "install-home");
   const installPlimsoll = path.join(sandbox, "install-plimsoll");
   const installTarget = path.join(sandbox, "install-target");
-  const failedInstall = await command("/bin/bash", [installScript], {
+  fs.rmSync(commandLog, { force: true });
+  const coldInstall = await command("/bin/bash", [installScript, "apply", ...installerArgs], {
     cwd: neutralCwd,
     env: {
       ...commonEnv,
       HOME: installHome,
       PLIMSOLL_HOME: installPlimsoll,
       PLIMSOLL_DIR: installTarget,
+      PLIMSOLL_INSTALL_DOCTOR_ATTEMPTS: "1",
     },
   });
+  const coldInstallReceipt = parseJson(coldInstall.stdout);
   const installCommands = fs.readFileSync(commandLog, "utf8");
-  check("source_installer_fails_closed_on_doctor", failedInstall.code === 17, failedInstall);
+  check(
+    "source_installer_accepts_truthful_cold_service_ready",
+    coldInstall.code === 0 && coldInstallReceipt.state === "service_ready" &&
+      coldInstallReceipt.nextAction === "restart_a_locally_authenticated_agent_then_run_verify",
+    { coldInstall, coldInstallReceipt },
+  );
   check(
     "source_installer_executes_supported_dev_path",
     installCommands.includes("collector install-launch-agent --dev --repo-root"),
     installCommands,
   );
   check(
-    "source_installer_does_not_swallow_doctor_failure",
-    installCommands.trimEnd().endsWith("collector doctor --read-only --json"),
+    "source_installer_uses_frozen_lockfile_then_read_only_doctor",
+    installCommands.includes("install --frozen-lockfile") &&
+      installCommands.trimEnd().endsWith("collector doctor --read-only --json"),
     installCommands,
   );
 
@@ -280,7 +326,16 @@ esac
     );
     fs.symlinkSync(path.join(stubBin, "git"), path.join(unsupportedBin, "git"));
     fs.symlinkSync(path.join(stubBin, "pnpm"), path.join(unsupportedBin, "pnpm"));
-    const unsupported = await command("/bin/bash", [installScript, "--dry-run"], {
+    const unsupported = await command("/bin/bash", [
+      installScript,
+      "--dry-run",
+      "--ref",
+      sourceInstallSha,
+      "--node",
+      path.join(unsupportedBin, "node"),
+      "--pnpm",
+      path.join(unsupportedBin, "pnpm"),
+    ], {
       cwd: neutralCwd,
       env: {
         ...commonEnv,
@@ -293,9 +348,9 @@ esac
     });
     check(
       `source_installer_rejects_node_${major}_without_mutation`,
-      unsupported.code !== 0 &&
+        unsupported.code !== 0 &&
         unsupported.stderr.includes(`Unsupported Node ${major}.0.0`) &&
-        unsupported.stderr.includes("requires >=20 <25") &&
+        unsupported.stderr.includes("require Node 22") &&
         !fs.existsSync(unsupportedHome) &&
         !fs.existsSync(unsupportedPlimsoll) &&
         !fs.existsSync(unsupportedTarget) &&

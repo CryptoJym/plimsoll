@@ -50,9 +50,15 @@ activation from their presence; track
 | `priority add\|remove\|list` | Manage the priority-repo list (hashed; URLs stay local) |
 | `purge-local-data` | Dry-run or explicit purge of local buffered events |
 
-Background (LaunchAgent) mode for npm installs is still being fitted — track
-[plimsoll#11](https://github.com/CryptoJym/plimsoll/issues/11). For now run
-`start` in a terminal or from the git checkout.
+Background mode for the published npm package, plus signed upgrade, rollback,
+and uninstall, remains under
+[plimsoll#103](https://github.com/CryptoJym/plimsoll/issues/103). Do not infer
+that lifecycle from the source tree. Team development canaries use the
+deterministic Node 22, exact-commit, two-phase source runbook in the repository
+[README](../../README.md#team-mac-source-canary-runbook): apply may finish
+truthfully at `service_ready`; only verify after a newly started locally
+authenticated agent may claim `signal_verified`. Credentials never move
+between machines.
 
 ## What leaves your machine
 
