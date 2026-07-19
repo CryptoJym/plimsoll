@@ -11,45 +11,6 @@ import { parse as parseToml } from "smol-toml";
 const privatePathReceipt = (value: string) =>
   `sha256:${createHash("sha256").update(path.resolve(value)).digest("hex")}`;
 
-async function waitForCollectorStopped(
-  pidPath: string,
-  identity: CollectorRuntimeIdentity | null,
-  timeoutMs = 4_000,
-) {
-  const deadline = Date.now() + timeoutMs;
-  let removedPidFile = false;
-  while (Date.now() < deadline) {
-    const processLive = identity ? processIdentityIsLive(identity) : false;
-    const current = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);
-    const stillOwned = Boolean(
-      identity &&
-      current.kind === "current" &&
-      current.record.instanceId === identity.instanceId &&
-      current.record.pid === identity.pid &&
-      current.record.processStartFingerprint === identity.processStartFingerprint,
-    );
-    if (identity && !processLive && stillOwned) {
-      removedPidFile = removeCollectorPidFileIfOwned(
-        pidPath,
-        identity,
-        LAUNCH_AGENT_LABEL,
-      ) || removedPidFile;
-    }
-    const after = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);
-    const pidCleaned = identity
-      ? after.kind !== "current" ||
-        after.record.instanceId !== identity.instanceId ||
-        after.record.pid !== identity.pid ||
-        after.record.processStartFingerprint !== identity.processStartFingerprint
-      : after.kind === "missing";
-    if (!processLive && pidCleaned) {
-      return { stopped: true, pidCleaned: true, removedPidFile };
-    }
-    await new Promise<void>((resolve) => setTimeout(resolve, 50));
-  }
-  return { stopped: false, pidCleaned: false, removedPidFile };
-}
-
 import { LocalEventBuffer } from "./buffer";
 import {
   assertCollectorPrivacyMode,
@@ -118,13 +79,19 @@ import { uploadBufferedEvents } from "./upload";
 import { runAttributionRepair, runWorkspaceHistoryUpload } from "./upload-history";
 import {
   acquireCollectorStartOwnership,
+  captureLaunchAgentUnloadPriorState,
   createCollectorRuntimeIdentity,
+  observeCollectorListener,
+  observeLaunchAgentUnloadTerminalState,
   processIdentityIsLive,
   readCollectorPidFile,
   readProcessStartFingerprint,
   removeCollectorPidFileIfOwned,
   runtimeIdentityMatches,
   verifyCollectorRuntimeIdentity,
+  type LaunchAgentLabelObservation,
+  type LaunchAgentUnloadOutcome,
+  type LaunchAgentUnloadPriorState,
   type CollectorPidRecord,
   type CollectorRuntimeIdentity,
 } from "./runtime-ownership";
@@ -257,39 +224,75 @@ async function readStdin() {
   return Buffer.concat(chunks).toString("utf8");
 }
 
-function runLaunchctl(args: string[]) {
+function runLaunchctl(args: string[], setExitCode = true) {
   const result = spawnSync(args[0] ?? "launchctl", args.slice(1), {
     stdio: "inherit",
   });
 
-  if (result.status !== 0) {
+  if (setExitCode && result.status !== 0) {
     process.exitCode = result.status ?? 1;
   }
   return result.status === 0;
 }
 
-function launchctlJobState() {
+function launchctlJobState(): LaunchAgentLabelObservation & {
+  exitCode: number | null;
+  errorCode: string | null;
+} {
   const args = launchctlPrintCommand();
   const result = spawnSync(args[0] ?? "launchctl", args.slice(1), {
-    stdio: "ignore",
+    encoding: "utf8",
+    env: { ...process.env, LANG: "C", LC_ALL: "C" },
+    stdio: ["ignore", "pipe", "pipe"],
   });
+  const errorCode = (result.error as NodeJS.ErrnoException | undefined)?.code ?? null;
+  const details = { exitCode: result.status, errorCode };
+  if (result.error) return { kind: "query_failed", ...details };
+  if (result.status !== 0) return { kind: "not_reported", ...details };
+  const pidMatch = result.stdout.match(/^\s*pid\s*=\s*(\d+)\s*$/m);
+  const pid = pidMatch ? Number(pidMatch[1]) : null;
+  const processStartFingerprint = pid ? readProcessStartFingerprint(pid) : null;
   return {
-    labelReported: !result.error && result.status === 0,
-    exitCode: result.status,
-    errorCode: (result.error as NodeJS.ErrnoException | undefined)?.code ?? null,
+    kind: "reported",
+    processIdentity: pid && processStartFingerprint
+      ? {
+          pid,
+          processStartFingerprint,
+        }
+      : null,
+    ...details,
   };
 }
 
-function launchctlJobIsLoaded() {
-  return launchctlJobState().labelReported;
-}
-
-function loadVisibleLaunchAgent(plistPath: string, manifestChanged = false) {
+async function loadVisibleLaunchAgent(
+  plistPath: string,
+  port: number,
+  manifestChanged = false,
+) {
   const visible = inspectLaunchAgentManifest();
   if (!visible.ok || visible.plistPath !== plistPath) {
     return { loaded: false, status: "visible_manifest_invalid" as const, manifestDigest: null };
   }
-  if (launchctlJobIsLoaded()) {
+  const pidPath = collectorLogPath("collector.pid");
+  const observeLabel = () => launchctlJobState();
+  const observeListener = () => observeCollectorListener(port);
+  const prior = await captureLaunchAgentUnloadPriorState({
+    label: LAUNCH_AGENT_LABEL,
+    pidPath,
+    port,
+    observeLabel,
+    observeListener,
+  });
+  if (prior.label.kind === "reported") {
+    if (prior.ownership !== "consistent") {
+      return {
+        loaded: false,
+        status: `prior_owner_${prior.ownership}` as const,
+        manifestDigest: visible.manifestDigest,
+        manifestIdentityDigest: visible.manifestIdentityDigest,
+        prior: unloadPriorReceipt(prior),
+      };
+    }
     if (manifestChanged) {
       return {
         loaded: false,
@@ -303,6 +306,25 @@ function loadVisibleLaunchAgent(plistPath: string, manifestChanged = false) {
       status: "already_loaded" as const,
       manifestDigest: visible.manifestDigest,
       manifestIdentityDigest: visible.manifestIdentityDigest,
+    };
+  }
+  const terminal = await observeLaunchAgentUnloadTerminalState({
+    label: LAUNCH_AGENT_LABEL,
+    pidPath,
+    port,
+    prior,
+    timeoutMs: 0,
+    observeLabel,
+    observeListener,
+  });
+  if (!terminal.stopped) {
+    return {
+      loaded: false,
+      status: `prior_state_${terminal.state}` as const,
+      manifestDigest: visible.manifestDigest,
+      manifestIdentityDigest: visible.manifestIdentityDigest,
+      prior: unloadPriorReceipt(prior),
+      terminal: terminal.final,
     };
   }
   const loaded = runLaunchctl(launchctlBootstrapCommand(plistPath));
@@ -330,6 +352,7 @@ function loadVisibleLaunchAgent(plistPath: string, manifestChanged = false) {
   if (!unchangedAfterBootstrap) {
     const bootoutSucceeded = runLaunchctl(launchctlBootoutCommand());
     const labelStateAfterBootout = launchctlJobState();
+    const labelReportedAfterBootout = labelStateAfterBootout.kind === "reported";
     return {
       loaded: false,
       status: "post_bootstrap_manifest_changed" as const,
@@ -340,19 +363,19 @@ function loadVisibleLaunchAgent(plistPath: string, manifestChanged = false) {
       cleanup: {
         bootoutAttempted: true,
         bootoutSucceeded,
-        labelReportedAfterBootout: labelStateAfterBootout.labelReported,
+        labelReportedAfterBootout,
         labelQueryExitCode: labelStateAfterBootout.exitCode,
         labelQueryErrorCode: labelStateAfterBootout.errorCode,
-        labelState: labelStateAfterBootout.labelReported
+        labelState: labelReportedAfterBootout
           ? "reported" as const
-          : labelStateAfterBootout.errorCode
+          : labelStateAfterBootout.kind === "query_failed"
             ? "query_failed" as const
             : "not_reported" as const,
         status: !bootoutSucceeded
           ? "bootout_failed" as const
-          : labelStateAfterBootout.labelReported
+          : labelReportedAfterBootout
             ? "bootout_succeeded_label_still_reported" as const
-            : labelStateAfterBootout.errorCode
+            : labelStateAfterBootout.kind === "query_failed"
               ? "bootout_succeeded_label_query_failed" as const
               : "bootout_succeeded_label_not_reported" as const,
       },
@@ -363,6 +386,106 @@ function loadVisibleLaunchAgent(plistPath: string, manifestChanged = false) {
     status: "bootstrap_succeeded" as const,
     manifestDigest: visible.manifestDigest,
     manifestIdentityDigest: visible.manifestIdentityDigest,
+  };
+}
+
+function unloadPriorReceipt(prior: LaunchAgentUnloadPriorState) {
+  return {
+    labelState: prior.label.kind,
+    labelProcessIdentity:
+      prior.label.kind === "reported" ? prior.label.processIdentity : null,
+    listenerState: prior.listener.kind,
+    listenerRuntimeIdentity: prior.listenerRuntimeIdentity,
+    pidRecordState: prior.pidRecordKind,
+    pidRuntimeIdentity: prior.pidRuntimeIdentity,
+    ownership: prior.ownership,
+  };
+}
+
+async function executeLaunchAgentUnload(port: number): Promise<{
+  unloaded: boolean;
+  reason: "launchctl_failed" | LaunchAgentUnloadOutcome["state"] | null;
+  status: "already_stopped" | "stopped" | "stopped_after_launchctl_failure" | "refused";
+  bootoutAttempted: boolean;
+  bootoutSucceeded: boolean | null;
+  prior: ReturnType<typeof unloadPriorReceipt>;
+  outcome: LaunchAgentUnloadOutcome;
+}> {
+  const pidPath = collectorLogPath("collector.pid");
+  const observeLabel = () => launchctlJobState();
+  const observeListener = () => observeCollectorListener(port);
+  const prior = await captureLaunchAgentUnloadPriorState({
+    label: LAUNCH_AGENT_LABEL,
+    pidPath,
+    port,
+    observeLabel,
+    observeListener,
+  });
+
+  if (prior.label.kind !== "reported") {
+    const outcome = await observeLaunchAgentUnloadTerminalState({
+      label: LAUNCH_AGENT_LABEL,
+      pidPath,
+      port,
+      prior,
+      timeoutMs: 0,
+      observeLabel,
+      observeListener,
+    });
+    return {
+      unloaded: outcome.stopped,
+      reason: outcome.stopped ? null : outcome.state,
+      status: outcome.stopped ? "already_stopped" : "refused",
+      bootoutAttempted: false,
+      bootoutSucceeded: null,
+      prior: unloadPriorReceipt(prior),
+      outcome,
+    };
+  }
+
+  const bootoutSucceeded = runLaunchctl(launchctlBootoutCommand(), false);
+  const outcome = await observeLaunchAgentUnloadTerminalState({
+    label: LAUNCH_AGENT_LABEL,
+    pidPath,
+    port,
+    prior,
+    timeoutMs: bootoutSucceeded ? 4_000 : 0,
+    observeLabel,
+    observeListener,
+  });
+  // Provider/action truth remains literal in bootoutSucceeded, while terminal
+  // state truth decides whether the requested unload has actually completed.
+  const unloaded = outcome.stopped;
+  return {
+    unloaded,
+    reason: unloaded ? null : bootoutSucceeded ? outcome.state : "launchctl_failed",
+    status: unloaded
+      ? bootoutSucceeded ? "stopped" : "stopped_after_launchctl_failure"
+      : "refused",
+    bootoutAttempted: true,
+    bootoutSucceeded,
+    prior: unloadPriorReceipt(prior),
+    outcome,
+  };
+}
+
+function launchAgentUnloadReceipt(
+  result: Awaited<ReturnType<typeof executeLaunchAgentUnload>>,
+) {
+  const pidPath = collectorLogPath("collector.pid");
+  return {
+    unloaded: result.unloaded,
+    status: result.status,
+    reason: result.reason,
+    label: LAUNCH_AGENT_LABEL,
+    bootoutAttempted: result.bootoutAttempted,
+    bootoutSucceeded: result.bootoutSucceeded,
+    pidCleaned: result.outcome.pidCleaned,
+    removedPidFile: result.outcome.removedPidFile,
+    prior: result.prior,
+    terminal: result.outcome.final,
+    timing: result.outcome.timing,
+    pidPathHash: privatePathReceipt(pidPath),
   };
 }
 
@@ -1861,7 +1984,7 @@ async function main() {
       throw new Error("LaunchAgent visible manifest postcondition failed after install.");
     }
     const load = flag("--load")
-      ? loadVisibleLaunchAgent(result.plistPath, result.receipt.changed)
+      ? await loadVisibleLaunchAgent(result.plistPath, config.port, result.receipt.changed)
       : { loaded: false, status: "not_requested" as const, manifestDigest: visible.manifestDigest };
     console.log(
       JSON.stringify(
@@ -1899,22 +2022,13 @@ async function main() {
       process.exitCode = 1;
       return;
     }
-    const load = loadVisibleLaunchAgent(plistPath);
+    const load = await loadVisibleLaunchAgent(plistPath, config.port);
     console.log(JSON.stringify({ ...load, plistPath, label: LAUNCH_AGENT_LABEL }, null, 2));
     if (!load.loaded && process.exitCode === undefined) process.exitCode = 1;
     return;
   }
 
   if (command === "unload-launch-agent") {
-    const pidPath = collectorLogPath("collector.pid");
-    const pidRead = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);
-    const identity: CollectorRuntimeIdentity | null = pidRead.kind === "current"
-      ? {
-          instanceId: pidRead.record.instanceId,
-          pid: pidRead.record.pid,
-          processStartFingerprint: pidRead.record.processStartFingerprint,
-        }
-      : null;
     console.log(
       JSON.stringify(
         {
@@ -1926,24 +2040,9 @@ async function main() {
         2,
       ),
     );
-    const bootoutSucceeded = runLaunchctl(launchctlBootoutCommand());
-    const outcome = await waitForCollectorStopped(pidPath, identity);
-    const unloaded = bootoutSucceeded && outcome.stopped;
-    console.log(JSON.stringify({
-      unloaded,
-      reason: unloaded
-        ? null
-        : !bootoutSucceeded
-          ? "launchctl_failed"
-          : !identity && pidRead.kind !== "missing"
-            ? "pid_cleanup_unproven"
-            : "shutdown_timeout",
-      label: LAUNCH_AGENT_LABEL,
-      pidCleaned: outcome.pidCleaned,
-      removedPidFile: outcome.removedPidFile,
-      pidPathHash: privatePathReceipt(pidPath),
-    }, null, 2));
-    if (!unloaded) process.exitCode = 1;
+    const result = await executeLaunchAgentUnload(config.port);
+    console.log(JSON.stringify(launchAgentUnloadReceipt(result), null, 2));
+    if (!result.unloaded) process.exitCode = 1;
     return;
   }
 
@@ -1953,41 +2052,13 @@ async function main() {
       console.log(JSON.stringify(preview.receipt, null, 2));
       return;
     }
-    let unloadOutcome: Awaited<ReturnType<typeof waitForCollectorStopped>> | null = null;
+    let unloadResult: Awaited<ReturnType<typeof executeLaunchAgentUnload>> | null = null;
     if (flag("--unload")) {
-      const pidPath = collectorLogPath("collector.pid");
-      const pidRead = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);
-      const identity: CollectorRuntimeIdentity | null = pidRead.kind === "current"
-        ? {
-            instanceId: pidRead.record.instanceId,
-            pid: pidRead.record.pid,
-            processStartFingerprint: pidRead.record.processStartFingerprint,
-          }
-        : null;
-      const bootoutSucceeded = runLaunchctl(launchctlBootoutCommand());
-      if (!bootoutSucceeded) {
+      unloadResult = await executeLaunchAgentUnload(config.port);
+      if (!unloadResult.unloaded) {
         console.log(JSON.stringify({
           removed: false,
-          unloaded: false,
-          reason: "launchctl_failed",
-          label: LAUNCH_AGENT_LABEL,
-          pidCleaned: false,
-          pidPathHash: privatePathReceipt(pidPath),
-        }, null, 2));
-        process.exitCode = 1;
-        return;
-      }
-      unloadOutcome = await waitForCollectorStopped(pidPath, identity);
-      if (!unloadOutcome.stopped) {
-        console.log(JSON.stringify({
-          removed: false,
-          unloaded: false,
-          reason: !identity && pidRead.kind !== "missing"
-            ? "pid_cleanup_unproven"
-            : "shutdown_timeout",
-          label: LAUNCH_AGENT_LABEL,
-          pidCleaned: unloadOutcome.pidCleaned,
-          pidPathHash: privatePathReceipt(pidPath),
+          ...launchAgentUnloadReceipt(unloadResult),
         }, null, 2));
         process.exitCode = 1;
         return;
@@ -1999,7 +2070,12 @@ async function main() {
         {
           ...removed.receipt,
           removed: removed.receipt.status === "removed",
-          ...(unloadOutcome ? { unloaded: true, pidCleaned: unloadOutcome.pidCleaned } : {}),
+          ...(unloadResult
+            ? {
+                unloaded: true,
+                unload: launchAgentUnloadReceipt(unloadResult),
+              }
+            : {}),
         },
         null,
         2,

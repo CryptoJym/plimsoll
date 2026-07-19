@@ -26,6 +26,11 @@
       "name": "idle_dashboard_resources",
       "kind": "json_receipt",
       "expectedArtifactDigest": "sha256:a060a7b3e65fc2298a9bb1e3bc44ecad7c5340faa8251c77d2fa82081a4e778d"
+    },
+    {
+      "name": "launch_agent_unload_terminal_truth",
+      "kind": "json_result",
+      "expectedArtifactDigest": "sha256:26f22448fd385aee5d75bcb382e6c5eed47807bb316e378b6c0cee01c8f91cf4"
     }
   ]
 }

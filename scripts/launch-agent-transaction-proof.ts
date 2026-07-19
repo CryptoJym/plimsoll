@@ -747,7 +747,7 @@ esac
         secondLoadReceipt.loaded === true &&
         secondLoadReceipt.status === "already_loaded" &&
         launchctlCalls.filter((entry) => entry === "bootstrap").length === 1 &&
-        launchctlCalls.filter((entry) => entry === "print").length === 2,
+        launchctlCalls.filter((entry) => entry === "print").length === 3,
       {
         firstStatus: firstLoadReceipt.status,
         secondStatus: secondLoadReceipt.status,
@@ -791,7 +791,7 @@ esac
         swapCleanup.status === "bootout_succeeded_label_not_reported" &&
         fs.readFileSync(swapLaunchctlState, "utf8").trim() === "booted_out" &&
         fs.readFileSync(swapLoadInstall.plistPath, "utf8").trim() === "operator-bootstrap-window-replacement" &&
-        swapCalls.join(",") === "print,bootstrap,bootout,print",
+        swapCalls.join(",") === "print,print,bootstrap,bootout,print",
       {
         exitCode: swapLoad.code,
         status: swapLoadReceipt.status,

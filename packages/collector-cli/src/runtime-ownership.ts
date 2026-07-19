@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import net from "node:net";
 import path from "node:path";
 
 // Long enough for the existing synchronous ledger open/prune path, but finite:
@@ -8,10 +9,74 @@ import path from "node:path";
 export const START_LOCK_LEASE_MS = 120_000;
 const OWNER_STABILITY_DELAY_MS = 100;
 
-export type CollectorRuntimeIdentity = Readonly<{
-  instanceId: string;
+export type ProcessIdentity = Readonly<{
   pid: number;
   processStartFingerprint: string;
+}>;
+
+export type CollectorRuntimeIdentity = ProcessIdentity & Readonly<{
+  instanceId: string;
+}>;
+
+export type CollectorListenerObservation =
+  | { kind: "absent" }
+  | { kind: "collector"; runtimeIdentity: CollectorRuntimeIdentity }
+  | { kind: "unrelated" }
+  | { kind: "indeterminate" };
+
+export type LaunchAgentLabelObservation =
+  | { kind: "reported"; processIdentity: ProcessIdentity | null }
+  | { kind: "not_reported" }
+  | { kind: "query_failed" };
+
+export type LaunchAgentUnloadPriorState = Readonly<{
+  label: LaunchAgentLabelObservation;
+  listener: CollectorListenerObservation;
+  listenerRuntimeIdentity: CollectorRuntimeIdentity | null;
+  ownership: "consistent" | "ambiguous" | "unproven" | "unrelated";
+  pidRecordKind: CollectorPidFileRead["kind"];
+  pidRuntimeIdentity: CollectorRuntimeIdentity | null;
+}>;
+
+export type LaunchAgentUnloadState =
+  | "stopped"
+  | "still_stopping"
+  | "live_conflict"
+  | "stale_owned_record"
+  | "unrelated_listener"
+  | "ambiguous_prior_owner"
+  | "indeterminate";
+
+export type LaunchAgentUnloadObservation = Readonly<{
+  state: LaunchAgentUnloadState;
+  stopped: boolean;
+  labelState: LaunchAgentLabelObservation["kind"];
+  listenerState: CollectorListenerObservation["kind"];
+  pidRecordState: CollectorPidFileRead["kind"];
+  pidCleaned: boolean;
+  removedPidFile: boolean;
+  priorRuntimeLive: boolean;
+  priorRuntimeCount: number;
+  currentListenerMatchesPrior: boolean;
+  currentPidMatchesPrior: boolean;
+  currentListenerRuntimeIdentity: CollectorRuntimeIdentity | null;
+  currentPidRuntimeIdentity: CollectorRuntimeIdentity | null;
+}>;
+
+export type LaunchAgentUnloadOutcome = Readonly<{
+  stopped: boolean;
+  state: LaunchAgentUnloadState;
+  pidCleaned: boolean;
+  removedPidFile: boolean;
+  final: LaunchAgentUnloadObservation;
+  timing: {
+    timeoutMs: number;
+    pollIntervalMs: number;
+    elapsedMs: number;
+    observations: number;
+    deadlineCrossed: boolean;
+    finalObservation: true;
+  };
 }>;
 
 export type CollectorPidRecord = CollectorRuntimeIdentity & {
@@ -164,7 +229,7 @@ export function runtimeIdentityMatches(
   );
 }
 
-export function processIdentityIsLive(identity: CollectorRuntimeIdentity) {
+export function processIdentityIsLive(identity: ProcessIdentity) {
   return (
     processIsRunning(identity.pid) &&
     readProcessStartFingerprint(identity.pid) === identity.processStartFingerprint
@@ -199,31 +264,331 @@ function sleep(milliseconds: number) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
-async function statusRuntimeIdentity(port: number, timeoutMs: number) {
+function validRuntimeIdentity(value: unknown): value is CollectorRuntimeIdentity {
+  const identity = value as Partial<CollectorRuntimeIdentity> | null | undefined;
+  return Boolean(
+    identity &&
+      Number.isInteger(identity.pid) &&
+      (identity.pid ?? 0) > 0 &&
+      typeof identity.instanceId === "string" &&
+      identity.instanceId.length >= 32 &&
+      typeof identity.processStartFingerprint === "string" &&
+      identity.processStartFingerprint.startsWith("sha256:"),
+  );
+}
+
+function probeLoopbackPort(port: number, timeoutMs: number) {
+  return new Promise<"open" | "closed" | "indeterminate">((resolve) => {
+    const socket = net.createConnection({ host: "127.0.0.1", port });
+    let settled = false;
+    const finish = (state: "open" | "closed" | "indeterminate") => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(state);
+    };
+    socket.once("connect", () => finish("open"));
+    socket.once("timeout", () => finish("indeterminate"));
+    socket.once("error", (error: NodeJS.ErrnoException) => {
+      finish(error.code === "ECONNREFUSED" ? "closed" : "indeterminate");
+    });
+    socket.setTimeout(timeoutMs);
+  });
+}
+
+export async function observeCollectorListener(
+  port: number,
+  options: { probeTimeoutMs?: number } = {},
+): Promise<CollectorListenerObservation> {
+  const timeoutMs = Math.max(1, options.probeTimeoutMs ?? 250);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch("http://127.0.0.1:" + port + "/status", {
       signal: controller.signal,
     });
-    if (!response.ok) return null;
+    if (!response.ok) return { kind: "unrelated" };
     const body = (await response.json()) as { runtimeIdentity?: unknown };
-    const identity = body.runtimeIdentity as Partial<CollectorRuntimeIdentity> | undefined;
-    if (
-      !identity ||
-      !Number.isInteger(identity.pid) ||
-      (identity.pid ?? 0) <= 0 ||
-      typeof identity.instanceId !== "string" ||
-      typeof identity.processStartFingerprint !== "string"
-    ) {
-      return null;
-    }
-    return identity as CollectorRuntimeIdentity;
+    if (!validRuntimeIdentity(body.runtimeIdentity)) return { kind: "unrelated" };
+    return { kind: "collector", runtimeIdentity: body.runtimeIdentity };
   } catch {
-    return null;
+    const portState = await probeLoopbackPort(port, timeoutMs);
+    return portState === "open"
+      ? { kind: "unrelated" }
+      : portState === "closed"
+        ? { kind: "absent" }
+        : { kind: "indeterminate" };
   } finally {
     clearTimeout(timer);
   }
+}
+
+async function statusRuntimeIdentity(port: number, timeoutMs: number) {
+  const listener = await observeCollectorListener(port, { probeTimeoutMs: timeoutMs });
+  return listener.kind === "collector" ? listener.runtimeIdentity : null;
+}
+
+function identityKey(identity: ProcessIdentity) {
+  return [identity.pid, identity.processStartFingerprint].join("|");
+}
+
+function pidRuntimeIdentity(read: CollectorPidFileRead): CollectorRuntimeIdentity | null {
+  return read.kind === "current"
+    ? {
+        instanceId: read.record.instanceId,
+        pid: read.record.pid,
+        processStartFingerprint: read.record.processStartFingerprint,
+      }
+    : null;
+}
+
+function priorRuntimeIdentities(prior: LaunchAgentUnloadPriorState) {
+  const candidates = [
+    prior.label.kind === "reported" ? prior.label.processIdentity : null,
+    prior.pidRuntimeIdentity,
+    prior.listenerRuntimeIdentity,
+  ].filter((identity): identity is ProcessIdentity | CollectorRuntimeIdentity => Boolean(identity));
+  return [...new Map(candidates.map((identity) => [identityKey(identity), identity])).values()];
+}
+
+function processIdentityMatches(left: ProcessIdentity, right: ProcessIdentity) {
+  return left.pid === right.pid &&
+    left.processStartFingerprint === right.processStartFingerprint;
+}
+
+function matchesAnyPrior(
+  identity: CollectorRuntimeIdentity | null,
+  identities: readonly ProcessIdentity[],
+) {
+  return Boolean(identity && identities.some((candidate) => processIdentityMatches(identity, candidate)));
+}
+
+export async function captureLaunchAgentUnloadPriorState(options: {
+  label: string;
+  pidPath: string;
+  port: number;
+  observeLabel: () => LaunchAgentLabelObservation | Promise<LaunchAgentLabelObservation>;
+  observeListener?: () => Promise<CollectorListenerObservation>;
+  readPidFile?: (pidPath: string, label: string) => CollectorPidFileRead;
+}): Promise<LaunchAgentUnloadPriorState> {
+  const readPidFile = options.readPidFile ?? readCollectorPidFile;
+  const [label, listener] = await Promise.all([
+    options.observeLabel(),
+    options.observeListener?.() ?? observeCollectorListener(options.port),
+  ]);
+  const pidRead = readPidFile(options.pidPath, options.label);
+  const pidIdentity = pidRuntimeIdentity(pidRead);
+  const listenerIdentity = listener.kind === "collector" ? listener.runtimeIdentity : null;
+  const ownership = listener.kind === "unrelated"
+    ? "unrelated" as const
+    : pidRead.kind === "legacy" || pidRead.kind === "invalid" || listener.kind === "indeterminate"
+      ? "unproven" as const
+      : pidIdentity && listenerIdentity && !runtimeIdentityMatches(pidIdentity, listenerIdentity)
+        ? "ambiguous" as const
+        : "consistent" as const;
+  return Object.freeze({
+    label,
+    listener,
+    listenerRuntimeIdentity: listenerIdentity,
+    ownership,
+    pidRecordKind: pidRead.kind,
+    pidRuntimeIdentity: pidIdentity,
+  });
+}
+
+async function observeLaunchAgentUnloadOnce(options: {
+  label: string;
+  pidPath: string;
+  prior: LaunchAgentUnloadPriorState;
+  observeLabel: () => LaunchAgentLabelObservation | Promise<LaunchAgentLabelObservation>;
+  observeListener: () => Promise<CollectorListenerObservation>;
+  processIsLive: (identity: ProcessIdentity) => boolean;
+  readPidFile: (pidPath: string, label: string) => CollectorPidFileRead;
+  removePidFile: (
+    pidPath: string,
+    identity: CollectorRuntimeIdentity,
+    label: string,
+  ) => boolean;
+  removedPidFile: boolean;
+}): Promise<LaunchAgentUnloadObservation> {
+  const priorIdentities = priorRuntimeIdentities(options.prior);
+  const [labelState, listenerState] = await Promise.all([
+    options.observeLabel(),
+    options.observeListener(),
+  ]);
+  const priorRuntimeLive = priorIdentities.some(options.processIsLive);
+  const listenerIdentity = listenerState.kind === "collector"
+    ? listenerState.runtimeIdentity
+    : null;
+  const currentListenerMatchesPrior = matchesAnyPrior(listenerIdentity, priorIdentities);
+
+  let pidRead = options.readPidFile(options.pidPath, options.label);
+  let currentPidIdentity = pidRuntimeIdentity(pidRead);
+  let currentPidMatchesPrior = matchesAnyPrior(currentPidIdentity, priorIdentities);
+  let removedPidFile = options.removedPidFile;
+  if (
+    currentPidIdentity &&
+    currentPidMatchesPrior &&
+    options.prior.ownership === "consistent" &&
+    !options.processIsLive(currentPidIdentity)
+  ) {
+    removedPidFile = options.removePidFile(
+      options.pidPath,
+      currentPidIdentity,
+      options.label,
+    ) || removedPidFile;
+    pidRead = options.readPidFile(options.pidPath, options.label);
+    currentPidIdentity = pidRuntimeIdentity(pidRead);
+    currentPidMatchesPrior = matchesAnyPrior(currentPidIdentity, priorIdentities);
+  }
+
+  const pidCleaned = pidRead.kind === "missing";
+  let state: LaunchAgentUnloadState;
+  if (
+    options.prior.ownership === "ambiguous" ||
+    (pidRead.kind === "current" && !currentPidMatchesPrior)
+  ) {
+    state = "ambiguous_prior_owner";
+  } else if (listenerState.kind === "unrelated" || options.prior.ownership === "unrelated") {
+    state = "unrelated_listener";
+  } else if (
+    options.prior.ownership === "unproven" &&
+    (options.prior.pidRecordKind === "legacy" || options.prior.pidRecordKind === "invalid")
+  ) {
+    state = "stale_owned_record";
+  } else if (
+    labelState.kind === "query_failed" ||
+    listenerState.kind === "indeterminate" ||
+    options.prior.ownership === "unproven"
+  ) {
+    state = "indeterminate";
+  } else if (pidRead.kind === "legacy" || pidRead.kind === "invalid") {
+    state = "stale_owned_record";
+  } else if (
+    listenerState.kind === "collector" &&
+    !currentListenerMatchesPrior
+  ) {
+    state = "live_conflict";
+  } else if (
+    labelState.kind === "reported" ||
+    priorRuntimeLive ||
+    listenerState.kind === "collector" ||
+    pidRead.kind === "current"
+  ) {
+    state = labelState.kind === "not_reported" && priorRuntimeLive
+      ? "live_conflict"
+      : "still_stopping";
+  } else {
+    state = "stopped";
+  }
+
+  return Object.freeze({
+    state,
+    stopped: state === "stopped",
+    labelState: labelState.kind,
+    listenerState: listenerState.kind,
+    pidRecordState: pidRead.kind,
+    pidCleaned,
+    removedPidFile,
+    priorRuntimeLive,
+    priorRuntimeCount: priorIdentities.length,
+    currentListenerMatchesPrior,
+    currentPidMatchesPrior,
+    currentListenerRuntimeIdentity: listenerIdentity,
+    currentPidRuntimeIdentity: currentPidIdentity,
+  });
+}
+
+export async function observeLaunchAgentUnloadTerminalState(options: {
+  label: string;
+  pidPath: string;
+  port: number;
+  prior: LaunchAgentUnloadPriorState;
+  timeoutMs?: number;
+  pollIntervalMs?: number;
+  observeLabel: () => LaunchAgentLabelObservation | Promise<LaunchAgentLabelObservation>;
+  observeListener?: () => Promise<CollectorListenerObservation>;
+  processIsLive?: (identity: ProcessIdentity) => boolean;
+  readPidFile?: (pidPath: string, label: string) => CollectorPidFileRead;
+  removePidFile?: (
+    pidPath: string,
+    identity: CollectorRuntimeIdentity,
+    label: string,
+  ) => boolean;
+  now?: () => number;
+  poll?: (milliseconds: number) => Promise<void>;
+}): Promise<LaunchAgentUnloadOutcome> {
+  const timeoutMs = Math.max(0, options.timeoutMs ?? 4_000);
+  const pollIntervalMs = Math.max(1, options.pollIntervalMs ?? 50);
+  const now = options.now ?? Date.now;
+  const poll = options.poll ?? sleep;
+  const startedAt = now();
+  const deadline = startedAt + timeoutMs;
+  const observeListener = options.observeListener ?? (() => observeCollectorListener(options.port));
+  const processIsLive = options.processIsLive ?? processIdentityIsLive;
+  const readPidFile = options.readPidFile ?? readCollectorPidFile;
+  const removePidFile = options.removePidFile ?? removeCollectorPidFileIfOwned;
+  let removedPidFile = false;
+  let observations = 0;
+  let deadlineCrossed = false;
+  let final: LaunchAgentUnloadObservation;
+
+  while (true) {
+    final = await observeLaunchAgentUnloadOnce({
+      label: options.label,
+      pidPath: options.pidPath,
+      prior: options.prior,
+      observeLabel: options.observeLabel,
+      observeListener,
+      processIsLive,
+      readPidFile,
+      removePidFile,
+      removedPidFile,
+    });
+    observations += 1;
+    removedPidFile = final.removedPidFile;
+    if (final.stopped) break;
+
+    const observedAt = now();
+    if (observedAt >= deadline) {
+      deadlineCrossed = true;
+      // Receipt construction gets one last fresh observation. This closes the
+      // race where cleanup completes after the final scheduled poll but before
+      // the command returns a timeout receipt.
+      final = await observeLaunchAgentUnloadOnce({
+        label: options.label,
+        pidPath: options.pidPath,
+        prior: options.prior,
+        observeLabel: options.observeLabel,
+        observeListener,
+        processIsLive,
+        readPidFile,
+        removePidFile,
+        removedPidFile,
+      });
+      observations += 1;
+      removedPidFile = final.removedPidFile;
+      break;
+    }
+    await poll(Math.min(pollIntervalMs, Math.max(0, deadline - observedAt)));
+  }
+
+  const elapsedMs = Math.max(0, now() - startedAt);
+  return Object.freeze({
+    stopped: final.stopped,
+    state: final.state,
+    pidCleaned: final.pidCleaned,
+    removedPidFile,
+    final,
+    timing: {
+      timeoutMs,
+      pollIntervalMs,
+      elapsedMs,
+      observations,
+      deadlineCrossed,
+      finalObservation: true as const,
+    },
+  });
 }
 
 export async function verifyCollectorRuntimeIdentity(

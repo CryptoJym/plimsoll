@@ -253,7 +253,10 @@ function launchAgentCommand(
   command: "unload-launch-agent" | "uninstall-launch-agent",
   fakeBin: string,
   launchctlExit = 0,
+  bootoutPid?: number,
 ) {
+  const launchctlState = path.join(home, "launchctl.state");
+  fs.writeFileSync(launchctlState, String(bootoutPid ?? process.pid) + "\n", { mode: 0o600 });
   return watch(
     spawn(process.execPath, [cliPath, command], {
       cwd,
@@ -262,6 +265,8 @@ function launchAgentCommand(
         PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
         PLIMSOLL_HOME: home,
         PLIMSOLL_PROOF_LAUNCHCTL_EXIT: String(launchctlExit),
+        PLIMSOLL_PROOF_LAUNCHCTL_STATE: launchctlState,
+        ...(bootoutPid ? { PLIMSOLL_PROOF_BOOTOUT_PID: String(bootoutPid) } : {}),
       },
       stdio: ["ignore", "pipe", "pipe"],
     }),
@@ -506,8 +511,69 @@ async function main() {
     fs.mkdirSync(fakeBin, { recursive: true });
     fs.writeFileSync(
       path.join(fakeBin, "launchctl"),
-      "#!/bin/sh\nexit \"${PLIMSOLL_PROOF_LAUNCHCTL_EXIT:-0}\"\n",
+      [
+        "#!/bin/sh",
+        'state="${PLIMSOLL_PROOF_LAUNCHCTL_STATE:?}"',
+        'if [ "$1" = "print" ]; then',
+        '  [ -f "$state" ] || exit 113',
+        "  printf '    pid = %s\\n' \"$(cat \"$state\")\"",
+        "  exit 0",
+        "fi",
+        'if [ "$1" = "bootout" ]; then',
+        '  code="${PLIMSOLL_PROOF_LAUNCHCTL_EXIT:-0}"',
+        '  [ "$code" = "0" ] || exit "$code"',
+        '  if [ -n "${PLIMSOLL_PROOF_BOOTOUT_PID:-}" ]; then',
+        '    kill -TERM "$PLIMSOLL_PROOF_BOOTOUT_PID"',
+        "  fi",
+        '  rm -f "$state"',
+        "  exit 0",
+        "fi",
+        "exit 64",
+        "",
+      ].join("\n"),
       { mode: 0o755 },
+    );
+    const unloadHome = path.join(tempRoot, "truthful-unload");
+    const unloadPort = await availablePort();
+    writeConfig(unloadHome, unloadPort);
+    const unloadOwner = startCollector(cliPath, unloadHome);
+    children.push(unloadOwner);
+    await waitFor(
+      () => Boolean(statusReceipt(unloadOwner, "active")),
+      "Unload fixture owner did not become active.",
+    );
+    check(unloadOwner.child.pid, "Unload fixture owner has no PID.");
+    const truthfulUnload = launchAgentCommand(
+      cliPath,
+      unloadHome,
+      root,
+      "unload-launch-agent",
+      fakeBin,
+      0,
+      unloadOwner.child.pid,
+    );
+    children.push(truthfulUnload);
+    await waitFor(
+      () => truthfulUnload.receipts.some(
+        (receipt) =>
+          receipt.unloaded === true &&
+          receipt.status === "stopped" &&
+          (receipt.terminal as Receipt | undefined)?.labelState === "not_reported" &&
+          (receipt.terminal as Receipt | undefined)?.listenerState === "absent" &&
+          (receipt.terminal as Receipt | undefined)?.pidRecordState === "missing",
+      ),
+      "Unload did not report the aggregate terminal state: " + truthfulUnload.output,
+      7_000,
+    );
+    const truthfulUnloadExit = await waitForExit(truthfulUnload.child);
+    check(truthfulUnloadExit.code === 0, "Truthful aggregate unload exited nonzero.");
+    await waitForExit(unloadOwner.child);
+    const truthfulReceipt = truthfulUnload.receipts.find((receipt) => receipt.unloaded === true);
+    check(
+      truthfulReceipt &&
+        !JSON.stringify(truthfulReceipt).includes(tempRoot) &&
+        !JSON.stringify(truthfulReceipt).includes(root),
+      "Unload receipt exposed a filesystem path.",
     );
     const legacyUnloadHome = path.join(tempRoot, "legacy-unload");
     writeConfig(legacyUnloadHome, await availablePort());
@@ -524,7 +590,7 @@ async function main() {
     await waitFor(
       () => legacyUnload.receipts.some(
         (receipt) =>
-          receipt.unloaded === false && receipt.reason === "pid_cleanup_unproven",
+          receipt.unloaded === false && receipt.reason === "stale_owned_record",
       ),
       "Unload promoted a legacy PID residue to successful cleanup.",
       7_000,
@@ -640,7 +706,8 @@ async function main() {
             "owner death after first valid status cannot yield already_running",
             "foreign exact-shape status cannot spoof collector ownership",
             "inert CLI-shaped and legacy processes cannot pass stop authorization",
-            "unload requires launchctl success and literal PID cleanup proof",
+            "unload records launchctl failure and requires aggregate terminal-state proof",
+            "unload receipts are path-free and legacy PID residue is retained",
             "reused PID fingerprint and expired lock lease both recover",
             "crash-only restart is throttled",
             "rendered plist passes plutil on macOS",
