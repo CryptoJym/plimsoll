@@ -627,8 +627,15 @@ export function applyClaudeSettings(
   try {
     const { snapshot, current } = readClaudePreimage(file);
     const plan = reconcileClaudeDocument(current, generated);
-    if (plan.changes.length === 0) return { path: file, changed: false, changes: [] };
-    if (options.dryRun) return { path: file, changed: true, changes: plan.changes };
+    if (plan.changes.length === 0 || options.dryRun) {
+      if (snapshot.exists && snapshot.leaf) {
+        assertVisibleClaudeContent(snapshot, snapshot.leaf, current);
+      } else {
+        assertStableClaudePath(snapshot);
+      }
+      if (plan.changes.length === 0) return { path: file, changed: false, changes: [] };
+      return { path: file, changed: true, changes: plan.changes };
+    }
     const backupPath = writeClaudePlan(snapshot, current, plan.next, options.transactionHooks);
     return { path: file, changed: true, changes: plan.changes, backupPath };
   } catch (error) {
