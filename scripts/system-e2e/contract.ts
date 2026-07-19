@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const SYSTEM_E2E_SCHEMA = "plimsoll.system-e2e-proof.v2" as const;
-export const SUPPORT_NORMALIZATION_VERSION = 3 as const;
+export const SUPPORT_NORMALIZATION_VERSION = 4 as const;
 /** Fixed release thresholds. These are never derived from an observed run. */
 export const SYSTEM_E2E_BUDGETS = {
   directRows: 500,
@@ -203,6 +203,8 @@ function normalizeString(
 }
 
 const VOLATILE_NUMBER_KEYS = /^(?:pid|port|durationMs|elapsedMs|warmP95Ms|tempBytes|maxRssBytes|serializedBytes|receiptBytes|parentCredentialLikeNameCount)$/i;
+const RESOURCE_VOLATILE_NUMBER_PATH =
+  /^(?:root\.scenarios\[\d+\]\{id=bounded_generation_capture\}\.(?:counters\.(?:fileBytesRead|filesOpened|maintenanceRuns)|measurements\.(?:rssGrowthBytes|statusProbes|warmStatusP95Ms))|root\.scenarios\[\d+\]\{id=dashboard_projection_budget\}\.measurements\.generation|root\.scenarios\[\d+\]\{id=no_change_constant_work\}\.counters\.maintenanceRuns)$/;
 
 /**
  * Preserve the complete parsed result shape while replacing only explicitly
@@ -213,19 +215,32 @@ export function normalizeSupportingArtifact(
   value: unknown,
   context: SupportingNormalizationContext,
   key = "root",
+  fieldPath = "root",
 ): unknown {
   if (Array.isArray(value)) {
-    return value.map((child) => normalizeSupportingArtifact(child, context, key));
+    return value.map((child, index) =>
+      normalizeSupportingArtifact(child, context, key, `${fieldPath}[${index}]`)
+    );
   }
   if (value && typeof value === "object") {
+    const record = value as Record<string, unknown>;
+    const objectPath = typeof record.id === "string"
+      ? `${fieldPath}{id=${record.id}}`
+      : fieldPath;
     return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>)
+      Object.entries(record)
         .sort(([left], [right]) => left.localeCompare(right))
-        .map(([childKey, child]) => [childKey, normalizeSupportingArtifact(child, context, childKey)]),
+        .map(([childKey, child]) => [
+          childKey,
+          normalizeSupportingArtifact(child, context, childKey, `${objectPath}.${childKey}`),
+        ]),
     );
   }
   if (typeof value === "string") return normalizeString(value, key, context);
-  if (typeof value === "number" && VOLATILE_NUMBER_KEYS.test(key)) {
+  if (
+    typeof value === "number" &&
+    (VOLATILE_NUMBER_KEYS.test(key) || RESOURCE_VOLATILE_NUMBER_PATH.test(fieldPath))
+  ) {
     assert.ok(Number.isFinite(value) && value >= 0, `${key} must be a nonnegative finite measurement`);
     return "<volatile-number>";
   }
@@ -341,8 +356,9 @@ function assertResourceReceipt(receipt: unknown) {
   assert.equal(receipt.summary.failed, 0);
   assert.equal(receipt.summary.notWired, 0);
   assert.equal(receipt.summary.requiredIncomplete, 0);
-  assert.ok(Array.isArray(receipt.scenarios) && receipt.scenarios.length > 0);
-  for (const [index, scenario] of receipt.scenarios.entries()) {
+  const resourceScenarios = receipt.scenarios;
+  assert.ok(Array.isArray(resourceScenarios) && resourceScenarios.length > 0);
+  for (const [index, scenario] of resourceScenarios.entries()) {
     if (scenario.status === "pass") {
       exactKeys(scenario, ["id", "required", "status", "detail", "durationMs", "counters", "measurements"], `resource scenario ${index}`);
     } else {
@@ -351,6 +367,78 @@ function assertResourceReceipt(receipt: unknown) {
       assert.equal(scenario.required, false);
     }
   }
+
+  const scenario = (id: string) => {
+    const value = resourceScenarios.find((entry) =>
+      entry && typeof entry === "object" && (entry as Record<string, unknown>).id === id
+    );
+    assert.ok(value && typeof value === "object" && !Array.isArray(value), `resource scenario ${id} is missing`);
+    return value as Record<string, unknown>;
+  };
+  const integer = (value: unknown, label: string) => {
+    assert.ok(Number.isSafeInteger(value) && Number(value) >= 0, `${label} must be a nonnegative safe integer`);
+    return Number(value);
+  };
+  const finite = (value: unknown, label: string) => {
+    assert.ok(typeof value === "number" && Number.isFinite(value) && value >= 0, `${label} must be nonnegative and finite`);
+    return value;
+  };
+  const childRecord = (value: unknown, label: string) => {
+    assert.ok(value && typeof value === "object" && !Array.isArray(value), `${label} must be an object`);
+    return value as Record<string, unknown>;
+  };
+
+  // The 200ms automatic wall cap intentionally makes the exact number of
+  // 64KiB slices scheduling-dependent. Validate the raw receipt against the
+  // fixture and per-cadence bounds before normalizing only those runtime
+  // counts. Loss/duplication outcomes remain exact and digest-bound.
+  const bounded = scenario("bounded_generation_capture");
+  const boundedCounters = childRecord(bounded.counters, "bounded capture counters");
+  const boundedMeasurements = childRecord(bounded.measurements, "bounded capture measurements");
+  const statusProbes = integer(boundedMeasurements.statusProbes, "bounded capture status probes");
+  const maintenanceRuns = integer(boundedCounters.maintenanceRuns, "bounded capture maintenance runs");
+  const filesOpened = integer(boundedCounters.filesOpened, "bounded capture files opened");
+  const fileBytesRead = integer(boundedCounters.fileBytesRead, "bounded capture file bytes read");
+  const denseBytes = integer(boundedMeasurements.denseBytes, "bounded capture dense bytes");
+  assert.ok(statusProbes >= 1 && statusProbes <= 180, "bounded capture cadence count exceeded fixture cap");
+  assert.equal(maintenanceRuns, statusProbes + 4, "bounded capture maintenance count lost its fixed adversarial runs");
+  assert.ok(denseBytes >= 13 * 1024 * 1024, "bounded capture dense fixture shrank below 13 MiB");
+  assert.ok(fileBytesRead >= denseBytes, "bounded capture did not read the complete dense fixture");
+  assert.ok(fileBytesRead <= filesOpened * 128 * 1024, "bounded capture exceeded the per-open byte ceiling");
+  // Dense capture has at most eight 64KiB slices per cadence. The fixture has
+  // eight fixed adversarial/rotation cadences (also eight slices each) plus
+  // at most eight 128KiB explicit-history opens.
+  assert.ok(filesOpened >= statusProbes, "bounded capture opened fewer files than active cadences");
+  assert.ok(filesOpened <= statusProbes * 8 + 72, "bounded capture exceeded fixture-derived open work");
+  assert.equal(integer(boundedCounters.rawEventWrites, "bounded capture raw writes"), 101);
+  assert.equal(integer(boundedCounters.fullHistoryFileReads, "bounded capture full-history reads"), 0);
+  assert.equal(integer(boundedMeasurements.automaticPreinstallBodyReads, "bounded capture automatic preinstall reads"), 0);
+  assert.equal(integer(boundedMeasurements.explicitFullPreinstallBodyReads, "bounded capture explicit preinstall reads"), 1);
+  assert.equal(boundedMeasurements.denseExact, true);
+  assert.equal(boundedMeasurements.rotationExactlyOnce, true);
+  assert.ok(finite(boundedMeasurements.warmStatusP95Ms, "bounded capture warm status p95") <= 500);
+  assert.ok(finite(boundedMeasurements.rssGrowthBytes, "bounded capture RSS growth") < 768 * 1024 * 1024);
+
+  const noChangeMeasurements = childRecord(
+    scenario("no_change_constant_work").measurements,
+    "no-change measurements",
+  );
+  assert.equal(integer(noChangeMeasurements.replayRolloutFilesRead, "replay rollout reads"), 1);
+  assert.equal(integer(noChangeMeasurements.replayTranscriptFilesRead, "replay transcript reads"), 1);
+  assert.equal(integer(noChangeMeasurements.replayEventsAppended, "replay appended events"), 0);
+  assert.equal(integer(noChangeMeasurements.replayRawEventWrites, "replay raw writes"), 0);
+  assert.equal(integer(noChangeMeasurements.replayEventMutationsInserted, "replay inserted mutations"), 0);
+
+  const dashboardMeasurements = childRecord(
+    scenario("dashboard_projection_budget").measurements,
+    "dashboard measurements",
+  );
+  assert.ok(integer(dashboardMeasurements.generation, "dashboard generation") > 0);
+  assert.equal(dashboardMeasurements.coherent, true);
+  assert.equal(integer(dashboardMeasurements.warmRequests, "dashboard warm requests"), 20);
+  assert.ok(finite(dashboardMeasurements.warmP95Ms, "dashboard warm p95") <= 500);
+  assert.equal(integer(dashboardMeasurements.snapshotBuildsDuringRefresh, "dashboard snapshot builds"), 0);
+  assert.equal(integer(dashboardMeasurements.snapshotCacheHits, "dashboard snapshot cache hits"), 25);
 }
 
 export function parseSupportingArtifact(

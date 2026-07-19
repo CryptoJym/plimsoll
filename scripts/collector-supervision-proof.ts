@@ -246,6 +246,28 @@ function stopCollector(cliPath: string, home: string, cwd: string) {
   );
 }
 
+function launchAgentCommand(
+  cliPath: string,
+  home: string,
+  cwd: string,
+  command: "unload-launch-agent" | "uninstall-launch-agent",
+  fakeBin: string,
+  launchctlExit = 0,
+) {
+  return watch(
+    spawn(process.execPath, [cliPath, command], {
+      cwd,
+      env: {
+        ...process.env,
+        PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
+        PLIMSOLL_HOME: home,
+        PLIMSOLL_PROOF_LAUNCHCTL_EXIT: String(launchctlExit),
+      },
+      stdio: ["ignore", "pipe", "pipe"],
+    }),
+  );
+}
+
 function statusReceipt(watched: WatchedChild, status: string) {
   return watched.receipts.find((receipt) => receipt.status === status);
 }
@@ -480,6 +502,57 @@ async function main() {
     await waitForExit(legacyStop.child);
     process.kill(inert.pid, 0);
 
+    const fakeBin = path.join(tempRoot, "fake-bin");
+    fs.mkdirSync(fakeBin, { recursive: true });
+    fs.writeFileSync(
+      path.join(fakeBin, "launchctl"),
+      "#!/bin/sh\nexit \"${PLIMSOLL_PROOF_LAUNCHCTL_EXIT:-0}\"\n",
+      { mode: 0o755 },
+    );
+    const legacyUnloadHome = path.join(tempRoot, "legacy-unload");
+    writeConfig(legacyUnloadHome, await availablePort());
+    const legacyPidPath = path.join(legacyUnloadHome, "collector.pid");
+    fs.writeFileSync(legacyPidPath, String(inert.pid) + "\n", { mode: 0o600 });
+    const legacyUnload = launchAgentCommand(
+      cliPath,
+      legacyUnloadHome,
+      root,
+      "unload-launch-agent",
+      fakeBin,
+    );
+    children.push(legacyUnload);
+    await waitFor(
+      () => legacyUnload.receipts.some(
+        (receipt) =>
+          receipt.unloaded === false && receipt.reason === "pid_cleanup_unproven",
+      ),
+      "Unload promoted a legacy PID residue to successful cleanup.",
+      7_000,
+    );
+    const legacyUnloadExit = await waitForExit(legacyUnload.child);
+    check(legacyUnloadExit.code !== 0, "Legacy PID unload did not fail closed.");
+    check(fs.existsSync(legacyPidPath), "Legacy PID residue was deleted without ownership proof.");
+
+    const failedBootoutHome = path.join(tempRoot, "failed-bootout");
+    writeConfig(failedBootoutHome, await availablePort());
+    const failedBootout = launchAgentCommand(
+      cliPath,
+      failedBootoutHome,
+      root,
+      "unload-launch-agent",
+      fakeBin,
+      7,
+    );
+    children.push(failedBootout);
+    await waitFor(
+      () => failedBootout.receipts.some(
+        (receipt) => receipt.unloaded === false && receipt.reason === "launchctl_failed",
+      ),
+      "Unload promoted a failed launchctl bootout to success.",
+    );
+    const failedBootoutExit = await waitForExit(failedBootout.child);
+    check(failedBootoutExit.code !== 0, "Failed launchctl bootout exited successfully.");
+
     const reusedPidHome = path.join(tempRoot, "reused-pid-lock");
     const reusedPidPort = await availablePort();
     writeConfig(reusedPidHome, reusedPidPort);
@@ -567,6 +640,7 @@ async function main() {
             "owner death after first valid status cannot yield already_running",
             "foreign exact-shape status cannot spoof collector ownership",
             "inert CLI-shaped and legacy processes cannot pass stop authorization",
+            "unload requires launchctl success and literal PID cleanup proof",
             "reused PID fingerprint and expired lock lease both recover",
             "crash-only restart is throttled",
             "rendered plist passes plutil on macOS",

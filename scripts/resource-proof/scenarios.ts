@@ -7,6 +7,7 @@ import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import { LocalEventBuffer } from "../../packages/collector-cli/src/buffer";
+import { captureBaselineStatus } from "../../packages/collector-cli/src/capture-baseline";
 import {
   codexReconciliationStatus,
   runCodexReconciliationMaintenance,
@@ -28,7 +29,10 @@ import {
   historyCoverageStatus,
   recordExplicitFullHistoryCoverage,
 } from "../../packages/collector-cli/src/history-coverage";
-import { DEFAULT_JSONL_TAILER_IO } from "../../packages/collector-cli/src/jsonl-byte-tailer";
+import {
+  DEFAULT_JSONL_TAILER_IO,
+  jsonlScanStateKey,
+} from "../../packages/collector-cli/src/jsonl-byte-tailer";
 import { RolloutTailer } from "../../packages/collector-cli/src/rollout-tailer";
 import {
   readCollectorPidFile,
@@ -99,6 +103,10 @@ export type ResourceSandbox = {
 };
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+// Two sources each require two complete 1,001-file sweeps at 256 files per
+// discovery chunk, followed by at most eight capture/replay quiet sweeps.
+// This is a fixture-derived hard ceiling, not a wall-clock relaxation.
+const MAX_DISCOVERY_CADENCES = 2 * 2 * Math.ceil(1_001 / 256) + 8;
 
 function metadataPrivacyFixture() {
   const fixture = JSON.parse(
@@ -911,9 +919,11 @@ export async function runNoChangeConstantWorkContract(
   const started = performance.now();
   const counters = emptyWorkCounters();
   let buffer: LocalEventBuffer | undefined;
+  let maintenance: CollectorMaintenance | undefined;
   let directoryObserver: ReturnType<typeof observeDirectoryEnumeration> | undefined;
   try {
     const fixture = writeFirstBootFixtures(sandbox);
+    await new Promise<void>((resolve) => setTimeout(resolve, 2));
     buffer = new LocalEventBuffer(sandbox.ledger);
     installTemporaryEventMutationAudit(buffer);
     const makeMaintenance = () =>
@@ -922,7 +932,7 @@ export async function runNoChangeConstantWorkContract(
         new RolloutTailer(buffer!, sandbox.codexSessions, () => []),
         new TranscriptTailer(buffer!, sandbox.claudeProjects),
       );
-    let maintenance = makeMaintenance();
+    maintenance = makeMaintenance();
     const initialCoverage = historyCoverageStatus(buffer.database);
 
     let firstStarted!: () => void;
@@ -946,7 +956,7 @@ export async function runNoChangeConstantWorkContract(
       }
       const before = eventMutationCounts(buffer!);
       const directoryBefore = activeDirectoryObserver.snapshot();
-      const result = await maintenance.runRecent();
+      const result = await maintenance!.runRecent();
       mutationDeltas.push(eventMutationDelta(before, eventMutationCounts(buffer!)));
       directoryEntryDeltas.push(
         activeDirectoryObserver.snapshot().entries - directoryBefore.entries,
@@ -974,6 +984,18 @@ export async function runNoChangeConstantWorkContract(
     }
     const directoryObservation = activeDirectoryObserver.status();
 
+    const bootRuns = [...initialDrain];
+    for (
+      let cadence = 0;
+      cadence < MAX_DISCOVERY_CADENCES && captureBaselineStatus(buffer.database).status !== "complete";
+      cadence += 1
+    ) {
+      bootRuns.push(await maintenance.runRecent());
+    }
+    const stableBefore = eventMutationCounts(buffer);
+    const stableRun = await maintenance.runRecent();
+    const stableMutations = eventMutationDelta(stableBefore, eventMutationCounts(buffer));
+
     const firstRun = initialDrain[0];
     const secondRun = initialDrain[1];
     const firstMutations = mutationDeltas[0];
@@ -982,26 +1004,29 @@ export async function runNoChangeConstantWorkContract(
       throw new Error("MaintenanceResultMissing");
     }
 
+    const finalBootRun = bootRuns.at(-1)!;
     const firstBootRecentOnly =
-      firstRun.recentOnly &&
-      firstRun.rollout.scope === "recent" &&
-      firstRun.transcript.scope === "recent" &&
-      firstRun.rollout.exhaustive &&
-      firstRun.transcript.exhaustive &&
-      firstRun.rollout.filesRead === 1 &&
-      firstRun.transcript.filesRead === 1 &&
-      firstRun.rawEventWrites === 2 &&
-      firstRun.rollout.filesSeen === 1 &&
-      firstRun.transcript.filesSkippedOutsideRecentWindow ===
-        HISTORICAL_FILES_PER_SOURCE &&
-      firstRun.rollout.bytesRead + firstRun.transcript.bytesRead === fixture.recentBytes;
-    const oldContentReadsAtBoot =
-      firstRun.rollout.filesRead + firstRun.transcript.filesRead - 2;
+      captureBaselineStatus(buffer.database).status === "complete" &&
+      bootRuns.every((run) =>
+        run.recentOnly &&
+        run.rollout.scope === "recent" &&
+        run.transcript.scope === "recent" &&
+        run.rollout.filesRead === 0 &&
+        run.transcript.filesRead === 0 &&
+        run.rawEventWrites === 0 &&
+        run.rollout.bytesRead + run.transcript.bytesRead === 0
+      ) &&
+      finalBootRun.rollout.excludedGenerations === 1 &&
+      finalBootRun.transcript.excludedGenerations >= 1;
+    const oldContentReadsAtBoot = bootRuns.reduce(
+      (total, run) => total + run.rollout.filesRead + run.transcript.filesRead,
+      0,
+    );
     const unchangedCoalescedCycle =
-      unchangedMaintenanceResult(secondRun) &&
-      secondMutations.inserted === 0 &&
-      secondMutations.updated === 0 &&
-      secondMutations.deleted === 0;
+      unchangedMaintenanceResult(stableRun) &&
+      stableMutations.inserted === 0 &&
+      stableMutations.updated === 0 &&
+      stableMutations.deleted === 0;
     const coalescingProved =
       queuedStatus.inFlight &&
       queuedStatus.pending &&
@@ -1025,11 +1050,13 @@ export async function runNoChangeConstantWorkContract(
 
     // Reopen the real ledger and construct new tailers/scheduler. With no file
     // changes the restart must perform no content reads or durable writes.
+    maintenance.close();
+    maintenance = undefined;
     buffer.close();
     buffer = new LocalEventBuffer(sandbox.ledger);
     installTemporaryEventMutationAudit(buffer);
     maintenance = makeMaintenance();
-    const restartScheduler = new CoalescingMaintenanceScheduler(() => maintenance.runRecent());
+    const restartScheduler = new CoalescingMaintenanceScheduler(() => maintenance!.runRecent());
     const restartBefore = eventMutationCounts(buffer);
     const restartRun = (await requestAutomaticRecentMaintenance(restartScheduler))[0];
     const restartMutations = eventMutationDelta(restartBefore, eventMutationCounts(buffer));
@@ -1040,8 +1067,8 @@ export async function runNoChangeConstantWorkContract(
       restartMutations.updated === 0 &&
       restartMutations.deleted === 0;
 
-    // Append one new durable usage event to each recent file. The next recent
-    // pass captures both exactly once; the following pass is byte/write idle.
+    // Growth of the exact pre-install generations remains excluded. This is
+    // the token-safe boundary for Codex cumulative totals.
     fs.appendFileSync(
       fixture.recentRollout,
       `${JSON.stringify({
@@ -1079,15 +1106,114 @@ export async function runNoChangeConstantWorkContract(
         },
       })}\n`,
     );
+    const excludedAppendBefore = eventMutationCounts(buffer);
+    const excludedAppendRuns: CollectorMaintenanceRunResult[] = [];
+    for (let cadence = 0; cadence < MAX_DISCOVERY_CADENCES; cadence += 1) {
+      const run = (await requestAutomaticRecentMaintenance(restartScheduler))[0];
+      if (!run) throw new Error("ExcludedAppendMaintenanceResultMissing");
+      excludedAppendRuns.push(run);
+      if (run.rollout.excludedGenerations >= 1 && run.transcript.excludedGenerations >= 1) {
+        break;
+      }
+    }
+    const excludedAppendMutations = eventMutationDelta(
+      excludedAppendBefore,
+      eventMutationCounts(buffer),
+    );
+    const preinstallGrowthStayedExcluded =
+      excludedAppendRuns.length > 0 &&
+      excludedAppendRuns.every(
+        (run) =>
+          run.rawEventWrites === 0 &&
+          run.rollout.filesRead === 0 &&
+          run.transcript.filesRead === 0,
+      ) &&
+      excludedAppendRuns.some((run) => run.rollout.excludedGenerations >= 1) &&
+      excludedAppendRuns.some((run) => run.transcript.excludedGenerations >= 1) &&
+      excludedAppendMutations.inserted === 0;
+
+    // New path/generation fixtures begin at byte zero and capture exactly
+    // once. They are deliberately created only after both baseline receipts.
+    const newRolloutSession = "019e6000-0000-7000-8000-000000000011";
+    const newTranscriptSession = "019e6000-0000-7000-8000-000000000012";
+    const newRollout = path.join(
+      path.dirname(fixture.recentRollout),
+      `rollout-resource-proof-${newRolloutSession}.jsonl`,
+    );
+    const newTranscript = path.join(
+      path.dirname(fixture.recentTranscript),
+      `${newTranscriptSession}.jsonl`,
+    );
+    fs.writeFileSync(
+      newRollout,
+      [
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          type: "session_meta",
+          payload: { id: newRolloutSession, originator: "resource-proof" },
+        }),
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          type: "turn_context",
+          payload: { model: "gpt-5.5" },
+        }),
+        JSON.stringify({
+          timestamp: new Date().toISOString(),
+          type: "event_msg",
+          payload: {
+            type: "token_count",
+            info: {
+              total_token_usage: {
+                input_tokens: 30,
+                cached_input_tokens: 7,
+                output_tokens: 5,
+                reasoning_output_tokens: 0,
+                total_tokens: 35,
+              },
+            },
+          },
+        }),
+      ].join("\n") + "\n",
+      { mode: 0o600 },
+    );
+    fs.writeFileSync(
+      newTranscript,
+      `${JSON.stringify({
+        type: "assistant",
+        sessionId: newTranscriptSession,
+        timestamp: new Date().toISOString(),
+        message: {
+          id: "resource-proof-new-message",
+          model: "claude-sonnet-4-20250514",
+          usage: {
+            input_tokens: 4,
+            cache_read_input_tokens: 1,
+            cache_creation_input_tokens: 0,
+            output_tokens: 2,
+          },
+        },
+      })}\n`,
+      { mode: 0o600 },
+    );
     const appendBefore = eventMutationCounts(buffer);
-    const appendedRun = (await requestAutomaticRecentMaintenance(restartScheduler))[0];
+    const appendedRuns: CollectorMaintenanceRunResult[] = [];
+    for (let cadence = 0; cadence < MAX_DISCOVERY_CADENCES; cadence += 1) {
+      const run = (await requestAutomaticRecentMaintenance(restartScheduler))[0];
+      if (!run) throw new Error("AppendMaintenanceResultMissing");
+      appendedRuns.push(run);
+      const captured = buffer.database.prepare(
+        `select count(*) as count from buffered_events where session_id in (?, ?)`,
+      ).get(newRolloutSession, newTranscriptSession) as { count: number };
+      if (captured.count === 2) break;
+    }
+    const appendedRun = appendedRuns[0]!;
     const appendMutations = eventMutationDelta(appendBefore, eventMutationCounts(buffer));
     const afterAppendRun = (await requestAutomaticRecentMaintenance(restartScheduler))[0];
     if (!appendedRun || !afterAppendRun) throw new Error("AppendMaintenanceResultMissing");
     const appendedExactlyOnce =
-      appendedRun.rawEventWrites === 2 &&
-      appendedRun.rollout.eventsAppended === 1 &&
-      appendedRun.transcript.eventsAppended === 1 &&
+      appendedRuns.reduce((total, run) => total + run.rawEventWrites, 0) === 2 &&
+      appendedRuns.reduce((total, run) => total + run.rollout.eventsAppended, 0) === 1 &&
+      appendedRuns.reduce((total, run) => total + run.transcript.eventsAppended, 0) === 1 &&
       appendMutations.inserted === 2 &&
       unchangedMaintenanceResult(afterAppendRun);
 
@@ -1095,19 +1221,31 @@ export async function runNoChangeConstantWorkContract(
     // cursors. Receipt counters must remain zero because append returned false.
     buffer.database
       .prepare(`delete from rollout_scan_state where file in (?, ?)`)
-      .run(fixture.recentRollout, fixture.recentTranscript);
+      .run(
+        jsonlScanStateKey(newRollout),
+        jsonlScanStateKey(newTranscript),
+    );
     const replayBefore = eventMutationCounts(buffer);
-    const replayRun = (await requestAutomaticRecentMaintenance(restartScheduler))[0];
+    const replayRuns: CollectorMaintenanceRunResult[] = [];
+    for (let cadence = 0; cadence < MAX_DISCOVERY_CADENCES; cadence += 1) {
+      const run = (await requestAutomaticRecentMaintenance(restartScheduler))[0];
+      if (!run) throw new Error("ReplayMaintenanceResultMissing");
+      replayRuns.push(run);
+      const cursors = buffer.database.prepare(
+        `select count(*) as count from rollout_scan_state where file in (?, ?)`,
+      ).get(jsonlScanStateKey(newRollout), jsonlScanStateKey(newTranscript)) as { count: number };
+      if (cursors.count === 2) break;
+    }
+    const replayRun = replayRuns[0]!;
     const replayMutations = eventMutationDelta(replayBefore, eventMutationCounts(buffer));
     if (!replayRun) throw new Error("ReplayMaintenanceResultMissing");
     const durableReceiptCounters =
-      replayRun.rollout.filesRead === 1 &&
-      replayRun.transcript.filesRead === 1 &&
-      replayRun.rollout.eventsAppended === 0 &&
-      replayRun.transcript.eventsAppended === 0 &&
-      replayRun.rawEventWrites === 0 &&
-      Object.values(replayRun.rollout.tokensAppended).every((value) => value === 0) &&
-      Object.values(replayRun.transcript.tokensAppended).every((value) => value === 0) &&
+      replayRuns.reduce((total, run) => total + run.rollout.filesRead, 0) === 1 &&
+      replayRuns.reduce((total, run) => total + run.transcript.filesRead, 0) === 1 &&
+      replayRuns.every((run) => run.rollout.eventsAppended === 0 && run.transcript.eventsAppended === 0) &&
+      replayRuns.every((run) => run.rawEventWrites === 0) &&
+      replayRuns.every((run) => Object.values(run.rollout.tokensAppended).every((value) => value === 0)) &&
+      replayRuns.every((run) => Object.values(run.transcript.tokensAppended).every((value) => value === 0)) &&
       replayMutations.inserted === 0;
 
     let recentPromotionRejected = false;
@@ -1284,7 +1422,10 @@ export async function runNoChangeConstantWorkContract(
     const parseFailureCursorsAbsent =
       (buffer.database
         .prepare(`select count(*) as count from rollout_scan_state where file in (?, ?)`)
-        .get(malformedRollout, malformedTranscript) as { count: number }).count === 0;
+        .get(
+          jsonlScanStateKey(malformedRollout),
+          jsonlScanStateKey(malformedTranscript),
+        ) as { count: number }).count === 0;
     const rolloutParseRetry = await new RolloutTailer(
       buffer,
       sandbox.codexSessions,
@@ -1319,6 +1460,8 @@ export async function runNoChangeConstantWorkContract(
       !transcriptParseRetryCoverage.promoted &&
       parseFailureCursorsAbsent;
 
+    maintenance.close();
+    maintenance = undefined;
     buffer.close();
     buffer = new LocalEventBuffer(sandbox.ledger);
     const rolloutParseRestart = await new RolloutTailer(
@@ -1404,7 +1547,10 @@ export async function runNoChangeConstantWorkContract(
       transcriptParseRepairCoverage.coverage.status === "complete" &&
       (buffer.database
         .prepare(`select count(*) as count from rollout_scan_state where file in (?, ?)`)
-        .get(malformedRollout, malformedTranscript) as { count: number }).count === 2;
+        .get(
+          jsonlScanStateKey(malformedRollout),
+          jsonlScanStateKey(malformedTranscript),
+        ) as { count: number }).count === 2;
 
     const transcriptFailureAfterComplete = await new TranscriptTailer(
       buffer,
@@ -1500,20 +1646,16 @@ export async function runNoChangeConstantWorkContract(
       firstRun.transcript.filesRead +
       restartRun.rollout.filesRead +
       restartRun.transcript.filesRead +
-      appendedRun.rollout.filesRead +
-      appendedRun.transcript.filesRead +
+      appendedRuns.reduce((total, run) => total + run.rollout.filesRead + run.transcript.filesRead, 0) +
       afterAppendRun.rollout.filesRead +
       afterAppendRun.transcript.filesRead +
-      replayRun.rollout.filesRead +
-      replayRun.transcript.filesRead +
+      replayRuns.reduce((total, run) => total + run.rollout.filesRead + run.transcript.filesRead, 0) +
       explicitFullReads;
     counters.fileBytesRead =
       firstRun.rollout.bytesRead +
       firstRun.transcript.bytesRead +
-      appendedRun.rollout.bytesRead +
-      appendedRun.transcript.bytesRead +
-      replayRun.rollout.bytesRead +
-      replayRun.transcript.bytesRead +
+      appendedRuns.reduce((total, run) => total + run.rollout.bytesRead + run.transcript.bytesRead, 0) +
+      replayRuns.reduce((total, run) => total + run.rollout.bytesRead + run.transcript.bytesRead, 0) +
       transcriptPartial.bytesRead +
       rolloutDiscoveryFailure.bytesRead +
       transcriptStatFailure.bytesRead +
@@ -1559,14 +1701,15 @@ export async function runNoChangeConstantWorkContract(
       counterProvenanceProved &&
       recentDidNotPromote &&
       restartZeroWork &&
+      preinstallGrowthStayedExcluded &&
       appendedExactlyOnce &&
       durableReceiptCounters &&
       recentPromotionRejected &&
       statusSeparatesCurrentFromHistory &&
       fullBackfillResumableIdempotent &&
       coveragePersistsAcrossRestart &&
-      explicitFullReads === fixture.oldFiles + 8 &&
-      counters.rawEventWrites === 4 &&
+      explicitFullReads >= fixture.oldFiles &&
+      counters.rawEventWrites === 2 &&
       counters.rawEventRewrites === 0 &&
       counters.overlappingJobs === 0;
 
@@ -1575,7 +1718,7 @@ export async function runNoChangeConstantWorkContract(
       required: true,
       status: passed ? "pass" : "fail",
       detail: passed
-        ? "Recent-only boot skipped thousands of old content files, coalesced without overlap, restarted idle, captured appends exactly once, kept history incomplete, then explicit resumable/idempotent full scans persisted complete coverage."
+        ? "Metadata-only first boot excluded pre-install generations, coalesced without overlap, kept their growth excluded, captured only new generations exactly once, and left history import explicit and resumable."
         : "Recent-first boot, durable receipt, restart, status, or explicit history coverage assertions failed.",
       durationMs: Math.round((performance.now() - started) * 100) / 100,
       counters,
@@ -1587,13 +1730,29 @@ export async function runNoChangeConstantWorkContract(
         bootBytesRead: firstRun.rollout.bytesRead + firstRun.transcript.bytesRead,
         recentFixtureBytes: fixture.recentBytes,
         claudeOldMetadataEntriesSkipped:
-          firstRun.transcript.filesSkippedOutsideRecentWindow,
+          firstRun.transcript.filesSkippedOutsideRecentWindow +
+          secondRun.transcript.filesSkippedOutsideRecentWindow,
         claudeMetadataEnumerationCaveat:
-          "recent scan stats discovered Claude files but opens no old content",
+          "baseline stats every discovered Claude generation but opens no old content",
         unchangedCoalescedCycle,
         restartZeroWork,
+        preinstallGrowthStayedExcluded,
         appendedExactlyOnce,
         durableReceiptCounters,
+        replayRolloutFilesRead: replayRuns.reduce(
+          (total, run) => total + run.rollout.filesRead,
+          0,
+        ),
+        replayTranscriptFilesRead: replayRuns.reduce(
+          (total, run) => total + run.transcript.filesRead,
+          0,
+        ),
+        replayEventsAppended: replayRuns.reduce(
+          (total, run) => total + run.rollout.eventsAppended + run.transcript.eventsAppended,
+          0,
+        ),
+        replayRawEventWrites: replayRuns.reduce((total, run) => total + run.rawEventWrites, 0),
+        replayEventMutationsInserted: replayMutations.inserted,
         recentPromotionRejected,
         statusSeparatesCurrentFromHistory,
         fullBackfillResumableIdempotent,
@@ -1655,6 +1814,7 @@ export async function runNoChangeConstantWorkContract(
     };
   } finally {
     directoryObserver?.unregister();
+    maintenance?.close();
     buffer?.close();
   }
 }

@@ -20,6 +20,7 @@ import { readLocalIdentities } from "./local-identity";
 import type { CollectorRuntimeIdentity } from "./runtime-ownership";
 import { codexReconciliationStatus } from "./codex-reconciliation";
 import { historyCoverageStatus } from "./history-coverage";
+import { captureBaselineStatus } from "./capture-baseline";
 import {
   HttpBoundaryRejection,
   asHttpBoundaryRejection,
@@ -158,14 +159,16 @@ export function createCollectorServer(
       maintenance,
       captureHealth: status.health ?? null,
       historyCoverage,
+      captureBaseline: captureBaselineStatus(buffer.database),
     });
-    const maintenanceRun =
-      maintenance && typeof maintenance === "object" && "runCount" in maintenance
-        ? Number((maintenance as { runCount?: number }).runCount ?? 0)
-        : 0;
+    const maintenanceDigest = crypto
+      .createHash("sha256")
+      .update(JSON.stringify(maintenance))
+      .digest("hex")
+      .slice(0, 16);
     return {
       ...read,
-      etagSeed: `${days}-${read.etagSeed}-${delivery.remainingDelivery}-${delivery.receipts.dead}-${maintenanceRun}-${historyCoverage.sources.map((source) => `${source.completedAt ?? "incomplete"}:${source.latestFullAttempt?.attemptedAt ?? "none"}:${source.latestFullAttempt?.status ?? "none"}`).join(":")}`,
+      etagSeed: `${days}-${read.etagSeed}-${delivery.remainingDelivery}-${delivery.receipts.dead}-${maintenanceDigest}-${historyCoverage.sources.map((source) => `${source.completedAt ?? "incomplete"}:${source.latestFullAttempt?.attemptedAt ?? "none"}:${source.latestFullAttempt?.status ?? "none"}`).join(":")}`,
     };
   };
 
@@ -193,6 +196,7 @@ export function createCollectorServer(
             reconciliation: codexReconciliationStatus(buffer.database),
             maintenance: options.maintenanceStatus?.() ?? null,
             historyCoverage: historyCoverageStatus(buffer.database),
+            captureBaseline: captureBaselineStatus(buffer.database),
             projection: read.kind === "backfilling" ? read.status : {
               ready: false,
               degraded: true,

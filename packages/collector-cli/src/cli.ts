@@ -1,11 +1,54 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { isDeepStrictEqual } from "node:util";
 import { parse as parseToml } from "smol-toml";
+
+const privatePathReceipt = (value: string) =>
+  `sha256:${createHash("sha256").update(path.resolve(value)).digest("hex")}`;
+
+async function waitForCollectorStopped(
+  pidPath: string,
+  identity: CollectorRuntimeIdentity | null,
+  timeoutMs = 4_000,
+) {
+  const deadline = Date.now() + timeoutMs;
+  let removedPidFile = false;
+  while (Date.now() < deadline) {
+    const processLive = identity ? processIdentityIsLive(identity) : false;
+    const current = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);
+    const stillOwned = Boolean(
+      identity &&
+      current.kind === "current" &&
+      current.record.instanceId === identity.instanceId &&
+      current.record.pid === identity.pid &&
+      current.record.processStartFingerprint === identity.processStartFingerprint,
+    );
+    if (identity && !processLive && stillOwned) {
+      removedPidFile = removeCollectorPidFileIfOwned(
+        pidPath,
+        identity,
+        LAUNCH_AGENT_LABEL,
+      ) || removedPidFile;
+    }
+    const after = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);
+    const pidCleaned = identity
+      ? after.kind !== "current" ||
+        after.record.instanceId !== identity.instanceId ||
+        after.record.pid !== identity.pid ||
+        after.record.processStartFingerprint !== identity.processStartFingerprint
+      : after.kind === "missing";
+    if (!processLive && pidCleaned) {
+      return { stopped: true, pidCleaned: true, removedPidFile };
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, 50));
+  }
+  return { stopped: false, pidCleaned: false, removedPidFile };
+}
 
 import { LocalEventBuffer } from "./buffer";
 import {
@@ -42,6 +85,7 @@ import { TranscriptTailer } from "./transcript-tailer";
 import {
   CoalescingMaintenanceScheduler,
   CollectorMaintenance,
+  automaticCaptureRuntimeStatus,
   requestAutomaticRecentMaintenance,
 } from "./maintenance";
 import { codexReconciliationStatus } from "./codex-reconciliation";
@@ -49,6 +93,7 @@ import {
   historyCoverageStatus,
   recordExplicitFullHistoryCoverage,
 } from "./history-coverage";
+import { captureBaselineStatus } from "./capture-baseline";
 import { createCollectorServer } from "./server";
 import {
   applyClaudeSettings,
@@ -218,6 +263,7 @@ function runLaunchctl(args: string[]) {
   if (result.status !== 0) {
     process.exitCode = result.status ?? 1;
   }
+  return result.status === 0;
 }
 
 async function checkCollectorConnectivity(port: number) {
@@ -688,7 +734,7 @@ async function main() {
           {
             status: "already_running",
             pid: ownership.runtimeIdentity.pid,
-            pidPath: ownership.pidPath,
+            pidPathHash: privatePathReceipt(ownership.pidPath),
             port: ownership.port,
             runtimeIdentity: ownership.runtimeIdentity,
           },
@@ -701,9 +747,14 @@ async function main() {
 
     const buffer = openBuffer(config);
     let scheduler: CoalescingMaintenanceScheduler | undefined;
+    let maintenance: CollectorMaintenance | undefined;
+    const maintenanceAbort = new AbortController();
     const server = createCollectorServer(config, buffer, {
       runtimeIdentity,
-      maintenanceStatus: () => scheduler?.status() ?? null,
+      maintenanceStatus: () => ({
+        scheduler: scheduler?.status() ?? null,
+        capture: maintenance?.status() ?? null,
+      }),
     });
     let ownsPidFile = false;
     let shuttingDown = false;
@@ -836,12 +887,14 @@ async function main() {
       }
     };
 
-    // Codex usage truth rides rollout files (issue 0022): full walk on boot
-    // (backfills any uncaptured history, idempotent), then a recent-days tail.
-    const maintenance = new CollectorMaintenance(
+    // First boot records a metadata-only, whole-generation exclusion baseline.
+    // Later automatic cadences tail only new generations within hard work
+    // limits; full history remains an explicit operator command.
+    maintenance = new CollectorMaintenance(
       buffer,
       new RolloutTailer(buffer),
       new TranscriptTailer(buffer),
+      maintenanceAbort.signal,
     );
     scheduler = new CoalescingMaintenanceScheduler(async () => {
       const result = await maintenance.runRecent();
@@ -867,6 +920,13 @@ async function main() {
       try {
         await requestAutomaticRecentMaintenance(scheduler);
       } catch (error) {
+        if (
+          maintenanceAbort.signal.aborted &&
+          error instanceof Error &&
+          error.message === "automatic_maintenance_aborted"
+        ) {
+          return;
+        }
         console.warn(
           JSON.stringify({
             warning: "maintenance_failed",
@@ -889,29 +949,93 @@ async function main() {
     for (const timer of timers) timer.unref();
 
     const shutdown = (signal: string) => {
-      if (shuttingDown) return;
+      if (shuttingDown) {
+        server.closeIdleConnections?.();
+        server.closeAllConnections?.();
+        return;
+      }
       shuttingDown = true;
       for (const timer of timers) clearInterval(timer);
+      scheduler?.stopAccepting();
+      maintenanceAbort.abort();
+      maintenance?.close();
       ownership.release();
-      server.close(() => {
-        buffer.close();
-        if (ownsPidFile) {
-          removeCollectorPidFileIfOwned(pidPath, runtimeIdentity, LAUNCH_AGENT_LABEL);
-        }
-        console.log(
-          JSON.stringify({
-            status: "stopped",
-            signal,
-            pid: process.pid,
-            pidPath,
-          }),
-        );
-        process.exit(0);
+      const hardDeadlineMs = 2_500;
+      const forceAfterMs = 750;
+      const deadlineAt = performance.now() + hardDeadlineMs;
+      let serverClosed = false;
+      let maintenanceIdle = false;
+      const serverClose = new Promise<void>((resolve) => {
+        server.close(() => {
+          serverClosed = true;
+          resolve();
+        });
       });
+      const forceTimer = setTimeout(() => {
+        server.closeIdleConnections?.();
+        server.closeAllConnections?.();
+      }, forceAfterMs);
+      forceTimer.unref();
+      const idle = (scheduler?.waitForIdle() ?? Promise.resolve()).then(() => {
+        maintenanceIdle = true;
+      });
+      const deadline = new Promise<void>((resolve) => {
+        setTimeout(resolve, hardDeadlineMs);
+      });
+      void (async () => {
+        try {
+          await Promise.race([Promise.allSettled([serverClose, idle]).then(() => undefined), deadline]);
+          if (!serverClosed) {
+            server.closeIdleConnections?.();
+            server.closeAllConnections?.();
+            const remaining = Math.max(0, deadlineAt - performance.now());
+            if (remaining > 0) {
+              await Promise.race([
+                serverClose,
+                new Promise<void>((resolve) => {
+                  const timer = setTimeout(resolve, remaining);
+                  timer.unref();
+                }),
+              ]);
+            }
+          }
+          // Never close SQLite while maintenance may still be inside a write.
+          if (maintenanceIdle) buffer.close();
+        } catch {
+          // PID ownership cleanup below is the non-negotiable finalizer.
+        } finally {
+          clearTimeout(forceTimer);
+          server.closeIdleConnections?.();
+          server.closeAllConnections?.();
+          ownership.release();
+          let pidCleaned = !ownsPidFile;
+          if (ownsPidFile) {
+            removeCollectorPidFileIfOwned(pidPath, runtimeIdentity, LAUNCH_AGENT_LABEL);
+            const remaining = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);
+            pidCleaned =
+              remaining.kind !== "current" ||
+              remaining.record.instanceId !== runtimeIdentity.instanceId ||
+              remaining.record.pid !== runtimeIdentity.pid ||
+              remaining.record.processStartFingerprint !== runtimeIdentity.processStartFingerprint;
+          }
+          console.log(
+            JSON.stringify({
+              status: pidCleaned ? "stopped" : "shutdown_incomplete",
+              signal,
+              pid: process.pid,
+              pidCleaned,
+              maintenanceIdle,
+              listenerClosed: serverClosed,
+              hardDeadlineMs,
+            }),
+          );
+          process.exit(pidCleaned ? 0 : 1);
+        }
+      })();
     };
 
-    process.once("SIGINT", () => shutdown("SIGINT"));
-    process.once("SIGTERM", () => shutdown("SIGTERM"));
+    process.on("SIGINT", () => shutdown("SIGINT"));
+    process.on("SIGTERM", () => shutdown("SIGTERM"));
     server.on("error", (error: NodeJS.ErrnoException) => {
       ownership.release();
       buffer.close();
@@ -945,7 +1069,7 @@ async function main() {
             {
               status: "error",
               code: "ownership_failed",
-              pidPath,
+              pidFileOwned: ownsPidFile,
               port: config.port,
               message: error instanceof Error ? error.message : String(error),
             },
@@ -964,7 +1088,7 @@ async function main() {
           dataMode: config.policy.dataMode,
           port: config.port,
           pid: process.pid,
-          pidPath,
+          pidFileOwned: ownsPidFile,
           runtimeIdentity,
           hookEndpoints: {
             claudeCode: `http://127.0.0.1:${config.port}/hooks/claude-code`,
@@ -998,10 +1122,10 @@ async function main() {
     console.log(
       JSON.stringify(
         {
-          configPath: collectorConfigPath(),
-          bufferPath,
+          configPathHash: privatePathReceipt(collectorConfigPath()),
+          bufferPathHash: privatePathReceipt(bufferPath),
           bufferFileBytes: fs.existsSync(bufferPath) ? fs.statSync(bufferPath).size : 0,
-          pidPath: collectorLogPath("collector.pid"),
+          pidPathHash: privatePathReceipt(collectorLogPath("collector.pid")),
           port: config.port,
           dataMode: config.policy.dataMode,
           privacyMode: "metadata_only",
@@ -1019,6 +1143,8 @@ async function main() {
             reason: "projection backfill has not published a coherent health snapshot",
           },
           historyCoverage: historyCoverageStatus(buffer.database),
+          captureBaseline: captureBaselineStatus(buffer.database),
+          automaticCapture: automaticCaptureRuntimeStatus(buffer.database),
         },
         null,
         2,
@@ -1664,6 +1790,15 @@ async function main() {
   }
 
   if (command === "unload-launch-agent") {
+    const pidPath = collectorLogPath("collector.pid");
+    const pidRead = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);
+    const identity: CollectorRuntimeIdentity | null = pidRead.kind === "current"
+      ? {
+          instanceId: pidRead.record.instanceId,
+          pid: pidRead.record.pid,
+          processStartFingerprint: pidRead.record.processStartFingerprint,
+        }
+      : null;
     console.log(
       JSON.stringify(
         {
@@ -1675,19 +1810,74 @@ async function main() {
         2,
       ),
     );
-    runLaunchctl(launchctlBootoutCommand());
+    const bootoutSucceeded = runLaunchctl(launchctlBootoutCommand());
+    const outcome = await waitForCollectorStopped(pidPath, identity);
+    const unloaded = bootoutSucceeded && outcome.stopped;
+    console.log(JSON.stringify({
+      unloaded,
+      reason: unloaded
+        ? null
+        : !bootoutSucceeded
+          ? "launchctl_failed"
+          : !identity && pidRead.kind !== "missing"
+            ? "pid_cleanup_unproven"
+            : "shutdown_timeout",
+      label: LAUNCH_AGENT_LABEL,
+      pidCleaned: outcome.pidCleaned,
+      removedPidFile: outcome.removedPidFile,
+      pidPathHash: privatePathReceipt(pidPath),
+    }, null, 2));
+    if (!unloaded) process.exitCode = 1;
     return;
   }
 
   if (command === "uninstall-launch-agent") {
+    let unloadOutcome: Awaited<ReturnType<typeof waitForCollectorStopped>> | null = null;
     if (flag("--unload")) {
-      runLaunchctl(launchctlBootoutCommand());
+      const pidPath = collectorLogPath("collector.pid");
+      const pidRead = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);
+      const identity: CollectorRuntimeIdentity | null = pidRead.kind === "current"
+        ? {
+            instanceId: pidRead.record.instanceId,
+            pid: pidRead.record.pid,
+            processStartFingerprint: pidRead.record.processStartFingerprint,
+          }
+        : null;
+      const bootoutSucceeded = runLaunchctl(launchctlBootoutCommand());
+      if (!bootoutSucceeded) {
+        console.log(JSON.stringify({
+          removed: false,
+          unloaded: false,
+          reason: "launchctl_failed",
+          label: LAUNCH_AGENT_LABEL,
+          pidCleaned: false,
+          pidPathHash: privatePathReceipt(pidPath),
+        }, null, 2));
+        process.exitCode = 1;
+        return;
+      }
+      unloadOutcome = await waitForCollectorStopped(pidPath, identity);
+      if (!unloadOutcome.stopped) {
+        console.log(JSON.stringify({
+          removed: false,
+          unloaded: false,
+          reason: !identity && pidRead.kind !== "missing"
+            ? "pid_cleanup_unproven"
+            : "shutdown_timeout",
+          label: LAUNCH_AGENT_LABEL,
+          pidCleaned: unloadOutcome.pidCleaned,
+          pidPathHash: privatePathReceipt(pidPath),
+        }, null, 2));
+        process.exitCode = 1;
+        return;
+      }
     }
     const removed = uninstallLaunchAgent({});
     console.log(
       JSON.stringify(
         {
           removed,
+          ...(unloadOutcome ? { unloaded: true, pidCleaned: unloadOutcome.pidCleaned } : {}),
           label: LAUNCH_AGENT_LABEL,
         },
         null,
@@ -1817,7 +2007,7 @@ async function main() {
                   ? "invalid_pid_file"
                   : "pid_file_missing",
             pid,
-            pidPath,
+            pidPathHash: privatePathReceipt(pidPath),
             launchAgentStopCommand,
             removedPidFile: false,
           },
@@ -1845,7 +2035,7 @@ async function main() {
             stopped: false,
             reason: "process_not_running_or_reused",
             pid: runtimeIdentity.pid,
-            pidPath,
+            pidPathHash: privatePathReceipt(pidPath),
             launchAgentStopCommand,
             removedPidFile,
           },
@@ -1870,7 +2060,7 @@ async function main() {
             stopped: false,
             reason: "runtime_identity_unverified",
             pid: runtimeIdentity.pid,
-            pidPath,
+            pidPathHash: privatePathReceipt(pidPath),
             launchAgentStopCommand,
             removedPidFile: false,
             runtimeIdentity,
@@ -1884,12 +2074,55 @@ async function main() {
 
     try {
       process.kill(runtimeIdentity.pid, "SIGTERM");
+      const stopDeadlineAt = Date.now() + 4_000;
+      let processLive = true;
+      let removedPidFile = false;
+      while (Date.now() < stopDeadlineAt) {
+        processLive = processIdentityIsLive(runtimeIdentity);
+        const currentPid = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);
+        const stillOwned =
+          currentPid.kind === "current" &&
+          currentPid.record.instanceId === runtimeIdentity.instanceId &&
+          currentPid.record.pid === runtimeIdentity.pid &&
+          currentPid.record.processStartFingerprint === runtimeIdentity.processStartFingerprint;
+        if (!processLive && stillOwned) {
+          removedPidFile = removeCollectorPidFileIfOwned(
+            pidPath,
+            runtimeIdentity,
+            LAUNCH_AGENT_LABEL,
+          ) || removedPidFile;
+        }
+        const after = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);
+        const pidClean =
+          after.kind !== "current" ||
+          after.record.instanceId !== runtimeIdentity.instanceId ||
+          after.record.pid !== runtimeIdentity.pid ||
+          after.record.processStartFingerprint !== runtimeIdentity.processStartFingerprint;
+        if (!processLive && pidClean) {
+          console.log(
+            JSON.stringify(
+              {
+                stopped: true,
+                pid: runtimeIdentity.pid,
+                pidCleaned: true,
+                removedPidFile,
+                runtimeIdentity,
+              },
+              null,
+              2,
+            ),
+          );
+          return;
+        }
+        await new Promise<void>((resolve) => setTimeout(resolve, 50));
+      }
       console.log(
         JSON.stringify(
           {
-            stopped: true,
+            stopped: false,
+            reason: "shutdown_timeout",
             pid: runtimeIdentity.pid,
-            pidPath,
+            pidPathHash: privatePathReceipt(pidPath),
             launchAgentStopCommand,
             runtimeIdentity,
           },
@@ -1910,7 +2143,7 @@ async function main() {
             reason: "kill_failed",
             message: error instanceof Error ? error.message : String(error),
             pid: runtimeIdentity.pid,
-            pidPath,
+            pidPathHash: privatePathReceipt(pidPath),
             launchAgentStopCommand,
             removedPidFile,
             runtimeIdentity,
