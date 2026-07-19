@@ -67,11 +67,13 @@ import {
 import { appendForwardedHook } from "./forwarder";
 import {
   installLaunchAgent,
+  inspectLaunchAgentManifest,
   LAUNCH_AGENT_LABEL,
   LAUNCH_AGENT_SYSTEM_PATHS,
   launchAgentPlistPath,
   launchctlBootoutCommand,
   launchctlBootstrapCommand,
+  launchctlPrintCommand,
   uninstallLaunchAgent,
 } from "./launch-agent";
 import {
@@ -210,11 +212,11 @@ Config tools:
       Reads GitHub only. POLICY.json is {"requiredChecks":["check name"]};
       without it required-check coverage and check-derived metrics are UNKNOWN.
       GITHUB_TOKEN/GH_TOKEN stays provider-side and is never persisted or printed.
-  install-launch-agent [--load]
+  install-launch-agent [--load] [--dry-run]
   install-launch-agent --dev [--repo-root PATH] [--pnpm PATH] [--load]
   load-launch-agent
   unload-launch-agent
-  uninstall-launch-agent [--unload]
+  uninstall-launch-agent [--unload] [--dry-run]
   purge-local-data [--confirm] [--include-config]
 `);
 }
@@ -264,6 +266,41 @@ function runLaunchctl(args: string[]) {
     process.exitCode = result.status ?? 1;
   }
   return result.status === 0;
+}
+
+function launchctlJobIsLoaded() {
+  const args = launchctlPrintCommand();
+  const result = spawnSync(args[0] ?? "launchctl", args.slice(1), {
+    stdio: "ignore",
+  });
+  return !result.error && result.status === 0;
+}
+
+function loadVisibleLaunchAgent(plistPath: string, manifestChanged = false) {
+  const visible = inspectLaunchAgentManifest();
+  if (!visible.ok || visible.plistPath !== plistPath) {
+    return { loaded: false, status: "visible_manifest_invalid" as const, manifestDigest: null };
+  }
+  if (launchctlJobIsLoaded()) {
+    if (manifestChanged) {
+      return {
+        loaded: false,
+        status: "loaded_job_requires_explicit_reload" as const,
+        manifestDigest: visible.manifestDigest,
+      };
+    }
+    return {
+      loaded: true,
+      status: "already_loaded" as const,
+      manifestDigest: visible.manifestDigest,
+    };
+  }
+  const loaded = runLaunchctl(launchctlBootstrapCommand(plistPath));
+  return {
+    loaded,
+    status: loaded ? "bootstrap_succeeded" as const : "launchctl_failed" as const,
+    manifestDigest: visible.manifestDigest,
+  };
 }
 
 async function checkCollectorConnectivity(port: number) {
@@ -705,7 +742,15 @@ async function main() {
     finalizeActivatedPendingJoin();
   }
 
-  const configRead = command === "doctor" || command === "setup" ? readCollectorConfig() : null;
+  const noCreateConfigCommands = new Set([
+    "doctor",
+    "setup",
+    "install-launch-agent",
+    "load-launch-agent",
+    "unload-launch-agent",
+    "uninstall-launch-agent",
+  ]);
+  const configRead = noCreateConfigCommands.has(command) ? readCollectorConfig() : null;
   let strictSetupConfig: CollectorConfig | null = null;
   if (command === "setup" && configRead?.status === "invalid") {
     // Strict parsing preserves the specific privacy/error reason without the
@@ -714,7 +759,7 @@ async function main() {
   }
   const configPath = configRead?.path ?? collectorConfigPath();
   const config = configRead?.config ?? strictSetupConfig ??
-    (command === "doctor" || command === "setup" ? collectorConfigSchema.parse({}) : loadCollectorConfig());
+    (noCreateConfigCommands.has(command) ? collectorConfigSchema.parse({}) : loadCollectorConfig());
   assertCollectorPrivacyMode(config, command, {
     willEnableUpload: command === "join" || Boolean(optionValue("--url")),
   });
@@ -1728,41 +1773,57 @@ async function main() {
     const repoRoot = development
       ? optionValue("--repo-root") ?? process.cwd()
       : path.dirname(stableCliPath ?? process.cwd());
-    const plistPath = installLaunchAgent({
+    const dryRun = flag("--dry-run");
+    const result = installLaunchAgent({
       repoRoot,
       pnpmPath: optionValue("--pnpm") ?? "pnpm",
       programArguments: development
         ? undefined
         : [process.execPath, stableCliPath ?? runningScript, "start"],
       workingDirectory: development ? repoRoot : path.dirname(stableCliPath ?? runningScript),
+      dryRun,
     });
+    if (dryRun) {
+      console.log(JSON.stringify({
+        ...result.receipt,
+        runtime: development ? "development" : "packaged",
+        loadIntent: flag("--load") ? "would_load_after_visible_postcondition" : "not_requested",
+      }, null, 2));
+      return;
+    }
+    const visible = inspectLaunchAgentManifest();
+    if (!visible.ok || visible.manifestDigest !== result.receipt.manifestDigest) {
+      throw new Error("LaunchAgent visible manifest postcondition failed after install.");
+    }
+    const load = flag("--load")
+      ? loadVisibleLaunchAgent(result.plistPath, result.receipt.changed)
+      : { loaded: false, status: "not_requested" as const, manifestDigest: visible.manifestDigest };
     console.log(
       JSON.stringify(
         {
+          ...result.receipt,
           installed: true,
           runtime: development ? "development" : "packaged",
-          plistPath,
-          label: LAUNCH_AGENT_LABEL,
-          loadCommand: launchctlBootstrapCommand(plistPath).join(" "),
+          plistPath: result.plistPath,
+          load,
         },
         null,
         2,
       ),
     );
-    if (flag("--load")) {
-      runLaunchctl(launchctlBootstrapCommand(plistPath));
-    }
+    if (flag("--load") && !load.loaded && process.exitCode === undefined) process.exitCode = 1;
     return;
   }
 
   if (command === "load-launch-agent") {
     const plistPath = launchAgentPlistPath();
-    if (!fs.existsSync(plistPath)) {
+    const visible = inspectLaunchAgentManifest();
+    if (!visible.ok) {
       console.log(
         JSON.stringify(
           {
             loaded: false,
-            reason: "plist_missing",
+            reason: visible.status === "missing" ? "plist_missing" : "plist_invalid",
             plistPath,
             label: LAUNCH_AGENT_LABEL,
           },
@@ -1770,22 +1831,12 @@ async function main() {
           2,
         ),
       );
+      process.exitCode = 1;
       return;
     }
-
-    console.log(
-      JSON.stringify(
-        {
-          loading: true,
-          plistPath,
-          label: LAUNCH_AGENT_LABEL,
-          loadCommand: launchctlBootstrapCommand(plistPath).join(" "),
-        },
-        null,
-        2,
-      ),
-    );
-    runLaunchctl(launchctlBootstrapCommand(plistPath));
+    const load = loadVisibleLaunchAgent(plistPath);
+    console.log(JSON.stringify({ ...load, plistPath, label: LAUNCH_AGENT_LABEL }, null, 2));
+    if (!load.loaded && process.exitCode === undefined) process.exitCode = 1;
     return;
   }
 
@@ -1832,6 +1883,11 @@ async function main() {
   }
 
   if (command === "uninstall-launch-agent") {
+    if (flag("--dry-run")) {
+      const preview = uninstallLaunchAgent({ dryRun: true });
+      console.log(JSON.stringify(preview.receipt, null, 2));
+      return;
+    }
     let unloadOutcome: Awaited<ReturnType<typeof waitForCollectorStopped>> | null = null;
     if (flag("--unload")) {
       const pidPath = collectorLogPath("collector.pid");
@@ -1876,9 +1932,9 @@ async function main() {
     console.log(
       JSON.stringify(
         {
-          removed,
+          ...removed.receipt,
+          removed: removed.receipt.status === "removed",
           ...(unloadOutcome ? { unloaded: true, pidCleaned: unloadOutcome.pidCleaned } : {}),
-          label: LAUNCH_AGENT_LABEL,
         },
         null,
         2,
