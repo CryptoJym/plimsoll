@@ -1,5 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
+import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { parse as parseToml } from "smol-toml";
 
@@ -120,6 +121,16 @@ type CodexPathSnapshot = {
   leaf?: FileIdentity;
 };
 
+export type CodexApplyOptions = {
+  dryRun?: boolean;
+  /** Deterministic synthetic-proof seam; production callers must leave this unset. */
+  transactionHooks?: {
+    afterBackup?: () => void;
+    beforeCommit?: () => void;
+    afterCommit?: () => void;
+  };
+};
+
 const MANAGED_TABLES: ManagedTable[] = [
   { path: ["otel"], keys: ["environment", "log_user_prompt"] },
   { path: ["otel", "exporter", "otlp-http"], keys: ["endpoint", "protocol", "headers"] },
@@ -233,6 +244,19 @@ function readCodexPreimage(file: string) {
   }
 }
 
+function readDescriptor(descriptor: number) {
+  const chunks: Buffer[] = [];
+  let position = 0;
+  while (true) {
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    const bytesRead = fs.readSync(descriptor, chunk, 0, chunk.length, position);
+    if (bytesRead === 0) break;
+    chunks.push(chunk.subarray(0, bytesRead));
+    position += bytesRead;
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 function writeDescriptor(descriptor: number, content: string) {
   const bytes = Buffer.from(content);
   let offset = 0;
@@ -249,7 +273,109 @@ function unlinkIfIdentity(file: string, identity: FileIdentity | undefined) {
   }
 }
 
-function backupCodexPreimage(file: string, snapshot: CodexPathSnapshot, current: string) {
+function assertBoundPreimage(
+  file: string,
+  descriptor: number,
+  expectedIdentity: FileIdentity,
+  expectedContent: string,
+) {
+  const beforeRead = fileIdentity(fs.fstatSync(descriptor));
+  if (!sameIdentity(beforeRead, expectedIdentity)) {
+    unsafePath(file, "bound config.toml identity changed before commit");
+  }
+  const content = readDescriptor(descriptor);
+  const afterRead = fileIdentity(fs.fstatSync(descriptor));
+  if (!sameIdentity(afterRead, expectedIdentity) || content !== expectedContent) {
+    unsafePath(file, "bound config.toml content changed before commit");
+  }
+}
+
+function assertVisiblePreimage(
+  file: string,
+  snapshot: CodexPathSnapshot,
+  expectedContent: string,
+) {
+  assertStableCodexPath(file, snapshot);
+  if (!snapshot.leaf) unsafePath(file, "config.toml preimage identity is missing");
+  const descriptor = openNoFollow(snapshot.absolutePath, fs.constants.O_RDONLY);
+  try {
+    assertBoundPreimage(file, descriptor, snapshot.leaf, expectedContent);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  assertStableCodexPath(file, snapshot);
+}
+
+function assertVisibleCommit(
+  file: string,
+  snapshot: CodexPathSnapshot,
+  committedIdentity: FileIdentity,
+  expectedContent: string,
+) {
+  const visible = inspectCodexPath(file);
+  if (
+    !visible.exists ||
+    !visible.leaf ||
+    !sameAncestors(visible.ancestors, snapshot.ancestors) ||
+    !sameIdentity(visible.leaf, committedIdentity)
+  ) {
+    unsafePath(file, "visible config.toml identity does not match the committed plan");
+  }
+  const descriptor = openNoFollow(visible.absolutePath, fs.constants.O_RDONLY);
+  try {
+    assertBoundPreimage(file, descriptor, committedIdentity, expectedContent);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  const afterRead = inspectCodexPath(file);
+  if (
+    !afterRead.exists ||
+    !afterRead.leaf ||
+    !sameAncestors(afterRead.ancestors, snapshot.ancestors) ||
+    !sameIdentity(afterRead.leaf, committedIdentity)
+  ) {
+    unsafePath(file, "visible config.toml changed while verifying the committed plan");
+  }
+}
+
+function fsyncParentDirectory(file: string) {
+  const descriptor = fs.openSync(path.dirname(path.resolve(file)), fs.constants.O_RDONLY);
+  try {
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function prepareCodexTemp(file: string, snapshot: CodexPathSnapshot, next: string) {
+  const directory = path.dirname(snapshot.absolutePath);
+  const tempPath = path.join(
+    directory,
+    `.${path.basename(snapshot.absolutePath)}.plimsoll-tmp-${randomUUID()}`,
+  );
+  const descriptor = openNoFollow(
+    tempPath,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+  );
+  const identity = fileIdentity(fs.fstatSync(descriptor));
+  try {
+    fs.fchmodSync(descriptor, (snapshot.leaf?.mode ?? 0o600) & 0o777);
+    writeDescriptor(descriptor, next);
+    return { tempPath, identity };
+  } catch (error) {
+    unlinkIfIdentity(tempPath, identity);
+    throw error;
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function backupCodexPreimage(
+  file: string,
+  snapshot: CodexPathSnapshot,
+  current: string,
+  boundDescriptor: number,
+) {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
   const backupPath = `${file}.plimsoll-backup-${stamp}`;
   const absoluteBackupPath = path.resolve(backupPath);
@@ -259,10 +385,13 @@ function backupCodexPreimage(file: string, snapshot: CodexPathSnapshot, current:
   );
   const created = fileIdentity(fs.fstatSync(descriptor));
   try {
-    assertStableCodexPath(file, snapshot);
+    if (!snapshot.leaf) unsafePath(file, "config.toml preimage identity is missing before backup");
+    assertBoundPreimage(file, boundDescriptor, snapshot.leaf, current);
+    assertVisiblePreimage(file, snapshot, current);
     fs.fchmodSync(descriptor, (snapshot.leaf?.mode ?? 0o600) & 0o777);
     writeDescriptor(descriptor, current);
-    assertStableCodexPath(file, snapshot);
+    assertBoundPreimage(file, boundDescriptor, snapshot.leaf, current);
+    assertVisiblePreimage(file, snapshot, current);
   } catch (error) {
     unlinkIfIdentity(absoluteBackupPath, created);
     throw error;
@@ -277,52 +406,57 @@ function writeCodexPlan(
   snapshot: CodexPathSnapshot,
   current: string,
   next: string,
+  hooks: NonNullable<CodexApplyOptions["transactionHooks"]> = {},
 ) {
   assertStableCodexPath(file, snapshot);
-  if (!snapshot.exists) {
-    const descriptor = openNoFollow(
-      snapshot.absolutePath,
-      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
-    );
-    let createdIdentity: FileIdentity | undefined;
-    try {
-      fs.fchmodSync(descriptor, 0o600);
-      const opened = fileIdentity(fs.fstatSync(descriptor));
-      createdIdentity = opened;
-      const created = inspectCodexPath(file);
-      if (
-        !sameAncestors(created.ancestors, snapshot.ancestors) ||
-        !created.leaf ||
-        !sameIdentity(opened, created.leaf)
-      ) {
-        unsafePath(file, "new config.toml path changed during exclusive creation");
-      }
-      writeDescriptor(descriptor, next);
-      return undefined;
-    } catch (error) {
-      unlinkIfIdentity(snapshot.absolutePath, createdIdentity);
-      throw error;
-    } finally {
-      fs.closeSync(descriptor);
-    }
-  }
-
-  const descriptor = openNoFollow(snapshot.absolutePath, fs.constants.O_RDWR);
+  const boundDescriptor = snapshot.exists
+    ? openNoFollow(snapshot.absolutePath, fs.constants.O_RDONLY)
+    : undefined;
+  let temp: ReturnType<typeof prepareCodexTemp> | undefined;
   try {
-    const opened = fileIdentity(fs.fstatSync(descriptor));
-    if (!snapshot.leaf || !sameIdentity(opened, snapshot.leaf)) {
-      unsafePath(file, "config.toml was replaced before mutation");
+    if (snapshot.exists) {
+      if (boundDescriptor === undefined || !snapshot.leaf) {
+        unsafePath(file, "config.toml preimage could not be bound before commit");
+      }
+      assertBoundPreimage(file, boundDescriptor, snapshot.leaf, current);
+      assertVisiblePreimage(file, snapshot, current);
     }
-    const currentAtWrite = fs.readFileSync(descriptor, "utf8");
-    if (currentAtWrite !== current) unsafePath(file, "config.toml content changed after planning");
+
+    temp = prepareCodexTemp(file, snapshot, next);
     assertStableCodexPath(file, snapshot);
-    const backupPath = backupCodexPreimage(file, snapshot, current);
-    assertStableCodexPath(file, snapshot);
-    fs.ftruncateSync(descriptor, 0);
-    writeDescriptor(descriptor, next);
+
+    const backupPath = snapshot.exists
+      ? backupCodexPreimage(file, snapshot, current, boundDescriptor!)
+      : undefined;
+    if (backupPath) fsyncParentDirectory(file);
+    hooks.afterBackup?.();
+
+    if (snapshot.exists) {
+      assertBoundPreimage(file, boundDescriptor!, snapshot.leaf!, current);
+      assertVisiblePreimage(file, snapshot, current);
+    } else {
+      assertStableCodexPath(file, snapshot);
+    }
+
+    hooks.beforeCommit?.();
+    if (snapshot.exists) {
+      assertBoundPreimage(file, boundDescriptor!, snapshot.leaf!, current);
+      assertVisiblePreimage(file, snapshot, current);
+      fs.renameSync(temp.tempPath, snapshot.absolutePath);
+    } else {
+      assertStableCodexPath(file, snapshot);
+      fs.linkSync(temp.tempPath, snapshot.absolutePath);
+      fs.unlinkSync(temp.tempPath);
+    }
+
+    hooks.afterCommit?.();
+    assertVisibleCommit(file, snapshot, temp.identity, next);
+    fsyncParentDirectory(file);
+    assertVisibleCommit(file, snapshot, temp.identity, next);
     return backupPath;
   } finally {
-    fs.closeSync(descriptor);
+    if (boundDescriptor !== undefined) fs.closeSync(boundDescriptor);
+    if (temp) unlinkIfIdentity(temp.tempPath, temp.identity);
   }
 }
 
@@ -653,6 +787,37 @@ function hasOwnedHeaderDrift(document: TomlRecord) {
   });
 }
 
+function hookCommands(value: unknown): string[] {
+  if (Array.isArray(value)) return value.flatMap((entry) => hookCommands(entry));
+  if (!isRecord(value)) return [];
+  return Object.entries(value).flatMap(([key, entry]) =>
+    key === "command" && typeof entry === "string" ? [entry] : hookCommands(entry)
+  );
+}
+
+function isPlimsollHookPath(command: string) {
+  return command.normalize("NFKC").toLowerCase().includes("/hooks/codex");
+}
+
+function hookOwnershipDrift(currentEntries: unknown, expectedEntries: unknown) {
+  if (!Array.isArray(expectedEntries) || expectedEntries.length !== 1) return true;
+  const expectedOwnedCommands = hookCommands(expectedEntries).filter(isPlimsollHookPath);
+  const currentOwnedCommands = hookCommands(currentEntries).filter(isPlimsollHookPath);
+  return expectedOwnedCommands.length !== 1 ||
+    currentOwnedCommands.length !== 1 ||
+    currentOwnedCommands[0] !== expectedOwnedCommands[0] ||
+    !containsExpected(currentEntries, expectedEntries);
+}
+
+function hasOwnedHookDrift(document: TomlRecord, expected: TomlRecord) {
+  return HOOK_EVENTS.some((event) =>
+    hookOwnershipDrift(
+      getPath(document, ["hooks", event]),
+      getPath(expected, ["hooks", event]),
+    )
+  );
+}
+
 function generatedHookBlock(file: string, generatedLines: string[], event: string) {
   const headers = scanToml(generatedLines).headers;
   const startHeader = headers.find((entry) =>
@@ -673,7 +838,11 @@ function generatedHookBlock(file: string, generatedLines: string[], event: strin
 function reconcileCodexToml(file: string, current: string, generatedToml: string) {
   const document = parseDocument(file, current);
   const expected = parseDocument(file, generatedToml, true);
-  if (containsExpected(document, expected) && !hasOwnedHeaderDrift(document)) {
+  if (
+    containsExpected(document, expected) &&
+    !hasOwnedHeaderDrift(document) &&
+    !hasOwnedHookDrift(document, expected)
+  ) {
     return { next: current, changes: [] as string[] };
   }
 
@@ -781,13 +950,19 @@ function reconcileCodexToml(file: string, current: string, generatedToml: string
     if (!Array.isArray(expectedEntries) || expectedEntries.length !== 1) {
       throw new Error(`${file}: generated Codex TOML has an unsupported hooks.${event} layout.`);
     }
-    if (containsExpected(currentEntries, expectedEntries)) continue;
-    if (Array.isArray(currentEntries) && currentEntries.some((entry) => JSON.stringify(entry).includes("/hooks/codex"))) {
+    const expectedOwnedCommands = hookCommands(expectedEntries).filter(isPlimsollHookPath);
+    if (expectedOwnedCommands.length !== 1) {
+      throw new Error(`${file}: generated Codex TOML has an unsupported hooks.${event} command layout.`);
+    }
+    const currentOwnedCommands = hookCommands(currentEntries).filter(isPlimsollHookPath);
+    const containsCanonicalEntry = containsExpected(currentEntries, expectedEntries);
+    if (currentOwnedCommands.length > 0 && hookOwnershipDrift(currentEntries, expectedEntries)) {
       throw new Error(
-        `${file}: hooks.${event} already contains a different Plimsoll Codex hook; ` +
+        `${file}: hooks.${event} already contains a different Plimsoll Codex hook or a non-canonical owned alias; ` +
         "refusing to write or create a backup.",
       );
     }
+    if (containsCanonicalEntry) continue;
     hookBlocks.push(...generatedHookBlock(file, generatedLines, event), "");
     changes.push(`hooks.${event} + generated Plimsoll command hook`);
   }
@@ -808,7 +983,11 @@ function reconcileCodexToml(file: string, current: string, generatedToml: string
       "refusing to write or create a backup.",
     );
   }
-  if (!containsExpected(reconciled, expected) || hasOwnedHeaderDrift(reconciled)) {
+  if (
+    !containsExpected(reconciled, expected) ||
+    hasOwnedHeaderDrift(reconciled) ||
+    hasOwnedHookDrift(reconciled, expected)
+  ) {
     throw new Error(`${file}: Codex reconciliation did not produce the complete generated subset; refusing to write or create a backup.`);
   }
   return { next, changes };
@@ -818,7 +997,7 @@ function reconcileCodexToml(file: string, current: string, generatedToml: string
 export function applyCodexConfig(
   file: string,
   generatedToml: string,
-  options: { dryRun?: boolean } = {},
+  options: CodexApplyOptions = {},
 ): ApplyResult {
   const { snapshot, current } = readCodexPreimage(file);
   const plan = reconcileCodexToml(file, current, generatedToml);
@@ -830,6 +1009,6 @@ export function applyCodexConfig(
   if (options.dryRun) {
     return { path: file, changed: true, changes };
   }
-  const backupPath = writeCodexPlan(file, snapshot, current, plan.next);
+  const backupPath = writeCodexPlan(file, snapshot, current, plan.next, options.transactionHooks);
   return { path: file, changed: true, changes, backupPath };
 }

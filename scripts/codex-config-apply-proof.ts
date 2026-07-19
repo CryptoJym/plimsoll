@@ -31,6 +31,18 @@ function backupFiles(directory: string) {
   return fs.readdirSync(directory).filter((name) => name.includes(".plimsoll-backup-")).sort();
 }
 
+function tempFiles(directory: string) {
+  return fs.readdirSync(directory).filter((name) => name.includes(".plimsoll-tmp-")).sort();
+}
+
+function recursiveTempFiles(directory: string): string[] {
+  return fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) => {
+    const entryPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) return recursiveTempFiles(entryPath);
+    return entry.name.includes(".plimsoll-tmp-") ? [entryPath] : [];
+  }).sort();
+}
+
 function expectRejected(file: string, generated: string, expectedMessage: RegExp) {
   const before = fs.readFileSync(file, "utf8");
   let message = "";
@@ -41,8 +53,11 @@ function expectRejected(file: string, generated: string, expectedMessage: RegExp
   }
   check(
     `rejects_${path.basename(file, ".toml")}_before_mutation`,
-    expectedMessage.test(message) && fs.readFileSync(file, "utf8") === before && backupFiles(path.dirname(file)).length === 0,
-    { message, backups: backupFiles(path.dirname(file)) },
+    expectedMessage.test(message) &&
+      fs.readFileSync(file, "utf8") === before &&
+      backupFiles(path.dirname(file)).length === 0 &&
+      tempFiles(path.dirname(file)).length === 0,
+    { message, backups: backupFiles(path.dirname(file)), temps: tempFiles(path.dirname(file)) },
   );
 }
 
@@ -90,6 +105,7 @@ function main() {
       { backups: backupFiles(path.dirname(config)) },
     );
 
+    const preCommitInode = fs.lstatSync(config).ino;
     const applied = applyCodexConfig(config, generated);
     check(
       "dry_run_and_apply_report_identical_changes",
@@ -105,6 +121,11 @@ function main() {
     );
 
     const reconciledText = fs.readFileSync(config, "utf8");
+    check(
+      "apply_atomically_replaces_inode_and_visible_path_matches_plan",
+      fs.lstatSync(config).ino !== preCommitInode && tempFiles(path.dirname(config)).length === 0,
+      { before: preCommitInode, after: fs.lstatSync(config).ino, temps: tempFiles(path.dirname(config)) },
+    );
     const reconciled = parseToml(reconciledText) as Record<string, any>;
     const expected = parseToml(generated) as Record<string, any>;
     const exporters = ["exporter", "trace_exporter", "metrics_exporter"];
@@ -152,6 +173,140 @@ function main() {
         fs.readFileSync(config, "utf8") === beforeSecond &&
         isDeepStrictEqual(backupFiles(path.dirname(config)), backupsAfterFirst),
       { second, backups: backupFiles(path.dirname(config)) },
+    );
+
+    const appendDir = path.join(sandbox, "concurrent-append");
+    fs.mkdirSync(appendDir);
+    const appendConfig = path.join(appendDir, "config.toml");
+    const appendedBytes = "\n# synthetic concurrent append must survive\n";
+    fs.writeFileSync(appendConfig, partial);
+    let appendMessage = "";
+    try {
+      applyCodexConfig(appendConfig, generated, {
+        transactionHooks: {
+          beforeCommit: () => fs.appendFileSync(appendConfig, appendedBytes),
+        },
+      });
+    } catch (error) {
+      appendMessage = error instanceof Error ? error.message : String(error);
+    }
+    const appendBackups = backupFiles(appendDir);
+    check(
+      "concurrent_append_immediately_before_commit_is_rejected_and_preserved",
+      /bound config\.toml content changed before commit/.test(appendMessage) &&
+        fs.readFileSync(appendConfig, "utf8") === partial + appendedBytes &&
+        appendBackups.length === 1 &&
+        fs.readFileSync(path.join(appendDir, appendBackups[0]!), "utf8") === partial &&
+        tempFiles(appendDir).length === 0,
+      { message: appendMessage, backups: appendBackups, temps: tempFiles(appendDir) },
+    );
+
+    const sameInodeDir = path.join(sandbox, "same-inode-content-swap");
+    fs.mkdirSync(sameInodeDir);
+    const sameInodeConfig = path.join(sameInodeDir, "config.toml");
+    const sameInodeReplacement = `${partial}\n# same inode replacement\n`;
+    fs.writeFileSync(sameInodeConfig, partial);
+    const sameInodeBefore = fs.lstatSync(sameInodeConfig).ino;
+    let sameInodeAfter = 0;
+    let sameInodeMessage = "";
+    try {
+      applyCodexConfig(sameInodeConfig, generated, {
+        transactionHooks: {
+          afterBackup: () => {
+            fs.writeFileSync(sameInodeConfig, sameInodeReplacement);
+            sameInodeAfter = fs.lstatSync(sameInodeConfig).ino;
+          },
+        },
+      });
+    } catch (error) {
+      sameInodeMessage = error instanceof Error ? error.message : String(error);
+    }
+    const sameInodeBackups = backupFiles(sameInodeDir);
+    check(
+      "post_backup_same_inode_content_swap_is_rejected_and_preserved",
+      sameInodeAfter === sameInodeBefore &&
+        /bound config\.toml content changed before commit/.test(sameInodeMessage) &&
+        fs.readFileSync(sameInodeConfig, "utf8") === sameInodeReplacement &&
+        sameInodeBackups.length === 1 &&
+        fs.readFileSync(path.join(sameInodeDir, sameInodeBackups[0]!), "utf8") === partial &&
+        tempFiles(sameInodeDir).length === 0,
+      {
+        message: sameInodeMessage,
+        beforeInode: sameInodeBefore,
+        afterInode: sameInodeAfter,
+        backups: sameInodeBackups,
+        temps: tempFiles(sameInodeDir),
+      },
+    );
+
+    const preCommitSwapDir = path.join(sandbox, "pre-commit-path-swap");
+    fs.mkdirSync(preCommitSwapDir);
+    const preCommitSwapConfig = path.join(preCommitSwapDir, "config.toml");
+    const preCommitDetached = path.join(preCommitSwapDir, "config.detached.toml");
+    const preCommitVisibleReplacement = "# synthetic visible replacement before commit\n";
+    fs.writeFileSync(preCommitSwapConfig, partial);
+    let preCommitSwapMessage = "";
+    try {
+      applyCodexConfig(preCommitSwapConfig, generated, {
+        transactionHooks: {
+          beforeCommit: () => {
+            fs.renameSync(preCommitSwapConfig, preCommitDetached);
+            fs.writeFileSync(preCommitSwapConfig, preCommitVisibleReplacement);
+          },
+        },
+      });
+    } catch (error) {
+      preCommitSwapMessage = error instanceof Error ? error.message : String(error);
+    }
+    const preCommitSwapBackups = backupFiles(preCommitSwapDir);
+    check(
+      "pathname_replacement_immediately_before_commit_is_rejected_without_detached_inode_write",
+      /config\.toml was replaced after planning/.test(preCommitSwapMessage) &&
+        fs.readFileSync(preCommitDetached, "utf8") === partial &&
+        fs.readFileSync(preCommitSwapConfig, "utf8") === preCommitVisibleReplacement &&
+        preCommitSwapBackups.length === 1 &&
+        fs.readFileSync(path.join(preCommitSwapDir, preCommitSwapBackups[0]!), "utf8") === partial &&
+        tempFiles(preCommitSwapDir).length === 0,
+      { message: preCommitSwapMessage, backups: preCommitSwapBackups, temps: tempFiles(preCommitSwapDir) },
+    );
+
+    const postCommitSwapDir = path.join(sandbox, "post-commit-visible-swap");
+    fs.mkdirSync(postCommitSwapDir);
+    const postCommitSwapConfig = path.join(postCommitSwapDir, "config.toml");
+    const postCommitDetached = path.join(postCommitSwapDir, "config.committed.toml");
+    const postCommitVisibleReplacement = "# synthetic visible replacement after commit\n";
+    fs.writeFileSync(postCommitSwapConfig, partial);
+    let postCommitReturned = false;
+    let postCommitSwapMessage = "";
+    try {
+      applyCodexConfig(postCommitSwapConfig, generated, {
+        transactionHooks: {
+          afterCommit: () => {
+            fs.renameSync(postCommitSwapConfig, postCommitDetached);
+            fs.writeFileSync(postCommitSwapConfig, postCommitVisibleReplacement);
+          },
+        },
+      });
+      postCommitReturned = true;
+    } catch (error) {
+      postCommitSwapMessage = error instanceof Error ? error.message : String(error);
+    }
+    const postCommitSwapBackups = backupFiles(postCommitSwapDir);
+    check(
+      "visible_path_replacement_after_commit_never_reports_success",
+      !postCommitReturned &&
+        /visible config\.toml identity does not match the committed plan/.test(postCommitSwapMessage) &&
+        fs.readFileSync(postCommitDetached, "utf8") === reconciledText &&
+        fs.readFileSync(postCommitSwapConfig, "utf8") === postCommitVisibleReplacement &&
+        postCommitSwapBackups.length === 1 &&
+        fs.readFileSync(path.join(postCommitSwapDir, postCommitSwapBackups[0]!), "utf8") === partial &&
+        tempFiles(postCommitSwapDir).length === 0,
+      {
+        message: postCommitSwapMessage,
+        returned: postCommitReturned,
+        backups: postCommitSwapBackups,
+        temps: tempFiles(postCommitSwapDir),
+      },
     );
 
     const caseAliasDir = path.join(sandbox, "case-alias");
@@ -316,6 +471,23 @@ function main() {
     );
     expectRejected(hookConflict, generated, /already contains a different Plimsoll Codex hook/);
 
+    for (const event of ["UserPromptSubmit", "PostToolUse", "Stop"] as const) {
+      for (const [kind, endpoint] of [
+        ["case", "/HOOKS/CODEX"],
+        ["unicode", "/ｈｏｏｋｓ/ｃｏｄｅｘ"],
+      ] as const) {
+        const hookAliasDir = path.join(sandbox, `hook-${kind}-${event}`);
+        fs.mkdirSync(hookAliasDir);
+        const hookAlias = path.join(hookAliasDir, `hook-${kind}-${event}.toml`);
+        fs.writeFileSync(
+          hookAlias,
+          `${reconciledText}\n[[hooks.${event}]]\n[[hooks.${event}.hooks]]\ntype = "command"\n` +
+          `command = "curl http://127.0.0.1:${port}${endpoint}"\ntimeout = 5\n`,
+        );
+        expectRejected(hookAlias, generated, /non-canonical owned alias/);
+      }
+    }
+
     const foreignDir = path.join(sandbox, "foreign");
     fs.mkdirSync(foreignDir);
     const foreign = path.join(foreignDir, "foreign.toml");
@@ -335,6 +507,11 @@ function main() {
       "all_rejections_leave_synthetic_home_absent",
       !fs.existsSync(syntheticHome),
       syntheticHome,
+    );
+    check(
+      "all_success_and_rejection_paths_leave_no_transaction_temp_artifacts",
+      recursiveTempFiles(sandbox).length === 0,
+      recursiveTempFiles(sandbox),
     );
 
     console.log(JSON.stringify({ issue: 123, ok: true, fixture: path.relative(root, fixturePath), checks }, null, 2));
