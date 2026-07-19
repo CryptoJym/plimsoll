@@ -545,6 +545,72 @@ export function runExistingSignalFidelityProof(
   };
 }
 
+export function runMaintenanceRegressionContract(
+  sandbox: ResourceSandbox,
+): ScenarioReceipt {
+  const started = performance.now();
+  const tsxCli = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
+  const proof = path.join(repoRoot, "scripts", "maintenance-proof.ts");
+  const result = spawnSync(process.execPath, [tsxCli, proof], {
+    cwd: repoRoot,
+    env: buildAllowlistedChildEnvironment(sandbox),
+    encoding: "utf8",
+    timeout: 300_000,
+    maxBuffer: 16 * 1024 * 1024,
+  });
+  let receipt: {
+    status?: unknown;
+    checks?: unknown;
+    names?: unknown;
+  } = {};
+  try {
+    receipt = JSON.parse(result.stdout || "{}") as typeof receipt;
+  } catch {
+    // The structured receipt check below fails closed. Child output remains
+    // omitted so a failure cannot copy fixture or operator paths upstream.
+  }
+  const names = Array.isArray(receipt.names)
+    ? receipt.names.filter((name): name is string => typeof name === "string")
+    : [];
+  const exactPendingIdentityProved = names.includes(
+    "crash_resume_binds_exact_pending_generations_for_both_sources",
+  );
+  const stalledCadenceBackoffProved = names.includes(
+    "successful_stalled_baseline_returns_to_normal_cadence",
+  );
+  const passed =
+    result.status === 0 &&
+    !result.error &&
+    receipt.status === "pass" &&
+    typeof receipt.checks === "number" &&
+    receipt.checks === names.length &&
+    exactPendingIdentityProved &&
+    stalledCadenceBackoffProved;
+  const failureDetail = result.error
+    ? "child_process_spawn_error"
+    : result.signal
+      ? `terminated by ${result.signal}`
+      : `exit ${result.status}; structured receipt or required checks missing`;
+  return {
+    id: "maintenance_regression_proof",
+    required: true,
+    status: passed ? "pass" : "fail",
+    detail: passed
+      ? "The isolated maintenance proof binds crash recovery to exact Codex and Claude generation identities and backs stalled work off to normal cadence."
+      : `Maintenance regression proof failed: ${failureDetail}; child output omitted.`,
+    durationMs: Math.round((performance.now() - started) * 100) / 100,
+    counters: emptyWorkCounters(),
+    measurements: {
+      exitCode: result.status,
+      checks: typeof receipt.checks === "number" ? receipt.checks : 0,
+      exactPendingIdentityProved,
+      stalledCadenceBackoffProved,
+      stdoutBytes: Buffer.byteLength(result.stdout ?? ""),
+      stderrBytes: Buffer.byteLength(result.stderr ?? ""),
+    },
+  };
+}
+
 type EventMutationCounts = {
   inserted: number;
   updated: number;

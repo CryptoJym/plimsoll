@@ -26,8 +26,8 @@ import {
 import {
   beginAutomaticCaptureBaseline,
   captureBaselineStatus,
-  completeAutomaticCaptureBaseline,
   stageAutomaticCaptureBaselineObservation,
+  stageAutomaticCaptureBaselinePending,
   type CaptureBaselineStatus,
 } from "../packages/collector-cli/src/capture-baseline";
 import {
@@ -360,6 +360,30 @@ async function proveAdaptiveBaselineCadence() {
     { calls, initial, afterAmbiguity, beforeNormalRetry, scheduler: scheduler.status() },
   );
 
+  const stalledClock = fakeCadenceTimer();
+  let stalledCalls = 0;
+  const stalledScheduler = new CoalescingMaintenanceScheduler(async () => {
+    stalledCalls += 1;
+    return fakeRun();
+  });
+  const stalledCadence = new AutomaticMaintenanceCadence(
+    stalledScheduler,
+    () => fakeBaselineStatus("in_progress"),
+    { timer: stalledClock.timer },
+  );
+  stalledCadence.start();
+  await stalledClock.advance(5_000);
+  const stalled = stalledCadence.status();
+  stalledCadence.stop();
+  check(
+    "successful_stalled_baseline_returns_to_normal_cadence",
+    stalledCalls === 1 &&
+      stalled.retryClass === "normal" &&
+      stalled.nextRetryAt !== null &&
+      stalledScheduler.status().maxConcurrentJobs === 1,
+    { stalledCalls, stalled, scheduler: stalledScheduler.status() },
+  );
+
   const failureClock = fakeCadenceTimer();
   let failures = 0;
   const failingScheduler = new CoalescingMaintenanceScheduler(async () => {
@@ -462,7 +486,7 @@ async function proveDurableSlowSourceFairness(root: string) {
   }
 }
 
-async function proveCrashResumeDropsOnlyEphemeralPending(root: string) {
+async function proveCrashResumeBindsExactPendingIdentities(root: string) {
   const ledger = path.join(root, "baseline-crash-resume.sqlite");
   const codexRoot = path.join(root, "baseline-crash-codex");
   const claudeRoot = path.join(root, "baseline-crash-claude");
@@ -470,75 +494,113 @@ async function proveCrashResumeDropsOnlyEphemeralPending(root: string) {
   const codexDay = path.join(codexRoot, year!, month!, day!);
   fs.mkdirSync(codexDay, { recursive: true });
   fs.mkdirSync(claudeRoot, { recursive: true });
-  const files: string[] = [];
+  const codexFiles: string[] = [];
+  const claudeFiles: string[] = [];
   for (let index = 0; index < 64; index += 1) {
-    const file = path.join(codexDay, `rollout-crash-${String(index).padStart(4, "0")}.jsonl`);
-    fs.writeFileSync(file, "{}\n");
-    files.push(file);
+    const codexFile = path.join(codexDay, `rollout-crash-${String(index).padStart(4, "0")}.jsonl`);
+    const claudeFile = path.join(claudeRoot, `transcript-crash-${String(index).padStart(4, "0")}.jsonl`);
+    fs.writeFileSync(codexFile, "{}\n");
+    fs.writeFileSync(claudeFile, "{}\n");
+    codexFiles.push(codexFile);
+    claudeFiles.push(claudeFile);
   }
   await new Promise<void>((resolve) => setTimeout(resolve, 2));
   const buffer = new LocalEventBuffer(ledger);
   const startedAt = new Date().toISOString();
-  const codex = beginAutomaticCaptureBaseline(buffer.database, "codex", {
-    startedAt,
-    filesDiscovered: 0,
-  });
-  if (!codex.latestRun) throw new Error("crash_resume_codex_run_missing");
-  for (let index = 0; index < 7; index += 1) {
-    const precise = fs.lstatSync(files[index]!, { bigint: true });
-    stageAutomaticCaptureBaselineObservation(buffer.database, "codex", {
-      runId: codex.latestRun.runId,
-      observedAt: new Date().toISOString(),
-      filesDiscovered: 64,
-      filesValidated: index + 1,
-      observation: {
-        path: files[index]!,
-        device: precise.dev,
-        inode: precise.ino,
-        size: precise.size,
-        birthtimeNs: precise.birthtimeNs,
-      },
+  const observation = (file: string) => {
+    const precise = fs.lstatSync(file, { bigint: true });
+    return {
+      path: file,
+      device: precise.dev,
+      inode: precise.ino,
+      size: precise.size,
+      birthtimeNs: precise.birthtimeNs,
+    };
+  };
+  for (const [source, files] of [
+    ["codex", codexFiles],
+    ["claude_code", claudeFiles],
+  ] as const) {
+    const began = beginAutomaticCaptureBaseline(buffer.database, source, {
+      startedAt,
+      filesDiscovered: 0,
     });
+    if (!began.latestRun) throw new Error(`crash_resume_${source}_run_missing`);
+    const pending = stageAutomaticCaptureBaselinePending(buffer.database, source, {
+      runId: began.latestRun.runId,
+      observedAt: new Date().toISOString(),
+      observations: files.map(observation),
+    });
+    for (let index = 0; index < 7; index += 1) {
+      stageAutomaticCaptureBaselineObservation(buffer.database, source, {
+        runId: began.latestRun.runId,
+        observedAt: new Date().toISOString(),
+        filesDiscovered: pending.filesDiscovered,
+        filesValidated: index + 1,
+        observation: observation(files[index]!),
+        resolvePending: true,
+      });
+    }
   }
-  const claude = beginAutomaticCaptureBaseline(buffer.database, "claude_code", {
-    startedAt,
-    filesDiscovered: 0,
-  });
-  if (!claude.latestRun) throw new Error("crash_resume_claude_run_missing");
-  completeAutomaticCaptureBaseline(buffer.database, "claude_code", {
-    runId: claude.latestRun.runId,
-    completedAt: new Date().toISOString(),
-  });
   const before = captureBaselineStatus(buffer.database);
+  const holding = path.join(root, "baseline-crash-holding");
+  fs.mkdirSync(holding, { recursive: true });
+  const missingCodex = path.join(holding, path.basename(codexFiles[7]!));
+  const missingClaude = path.join(holding, path.basename(claudeFiles[7]!));
+  fs.renameSync(codexFiles[7]!, missingCodex);
+  fs.renameSync(claudeFiles[7]!, missingClaude);
   const maintenance = new CollectorMaintenance(
     buffer,
     new RolloutTailer(buffer, codexRoot, () => []),
     new TranscriptTailer(buffer, claudeRoot),
   );
   try {
-    for (let cadence = 0; cadence < 6 && captureBaselineStatus(buffer.database).status !== "complete"; cadence += 1) {
+    for (let cadence = 0; cadence < 10; cadence += 1) {
+      await maintenance.runRecent();
+      if (captureBaselineStatus(buffer.database).progress.state === "ambiguous") break;
+    }
+    const missing = captureBaselineStatus(buffer.database);
+    fs.renameSync(missingCodex, codexFiles[7]!);
+    fs.renameSync(missingClaude, claudeFiles[7]!);
+    for (let cadence = 0; cadence < 12 && captureBaselineStatus(buffer.database).status !== "complete"; cadence += 1) {
       await maintenance.runRecent();
     }
-    const after = captureBaselineStatus(buffer.database);
-    const codexAfter = after.sources.find((source) => source.source === "codex")?.latestRun;
+    const recovered = captureBaselineStatus(buffer.database);
+    const capture = await maintenance.runRecent();
     const events = (buffer.database
       .prepare(`select count(*) as count from buffered_events`)
       .get() as { count: number }).count;
+    const sourceProof = recovered.sources.map((source) => ({
+      source: source.source,
+      status: source.status,
+      discovered: source.latestRun?.filesDiscovered,
+      validated: source.latestRun?.filesValidated,
+      baselined: source.latestRun?.filesBaselined,
+    }));
     check(
-      "crash_resume_rewalks_inactive_namespace_without_promoting_lost_pending",
+      "crash_resume_binds_exact_pending_generations_for_both_sources",
       before.status === "blocked" &&
-        before.progress.pendingMetadata === 57 &&
-        after.status === "complete" &&
-        codexAfter?.filesDiscovered === codexAfter?.filesValidated &&
-        codexAfter?.filesValidated === 135 &&
-        codexAfter?.filesBaselined === 64 &&
+        before.progress.pendingMetadata === 114 &&
+        missing.status === "blocked" &&
+        missing.progress.state === "ambiguous" &&
+        recovered.status === "complete" &&
+        sourceProof.every((source) =>
+          source.status === "complete" &&
+          source.discovered === source.validated &&
+          source.baselined === 64
+        ) &&
+        capture.rollout.filesRead === 0 &&
+        capture.transcript.filesRead === 0 &&
+        capture.rawEventWrites === 0 &&
         events === 0,
       {
         beforeState: before.progress.state,
         beforePending: before.progress.pendingMetadata,
-        afterState: after.progress.state,
-        discovered: codexAfter?.filesDiscovered,
-        validated: codexAfter?.filesValidated,
+        missingState: missing.progress.state,
+        recoveredState: recovered.progress.state,
+        sourceProof,
+        restoredPreinstallBodyReads: capture.rollout.filesRead + capture.transcript.filesRead,
+        restoredPreinstallWrites: capture.rawEventWrites,
         events,
       },
     );
@@ -890,7 +952,7 @@ async function main() {
   let buffer = new LocalEventBuffer(ledger);
   try {
     await proveDurableSlowSourceFairness(root);
-    await proveCrashResumeDropsOnlyEphemeralPending(root);
+    await proveCrashResumeBindsExactPendingIdentities(root);
     // Reopening proves additive schema/trigger creation is idempotent.
     buffer.close();
     buffer = new LocalEventBuffer(ledger);

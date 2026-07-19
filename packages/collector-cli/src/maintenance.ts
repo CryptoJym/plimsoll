@@ -935,7 +935,7 @@ export type AutomaticMaintenanceCadenceTimer = {
 
 /**
  * The daemon has one maintenance timer owner. Baseline follow-ups use the
- * fixed startup interval only while the aggregate baseline is in progress;
+ * fixed startup interval only after observable baseline progress. Stalled,
  * complete, failed, ambiguous and pre-start states fall back to the ordinary
  * cadence. Scheduling happens after the coalesced run drains, so callbacks do
  * not accumulate during a slow filesystem slice.
@@ -1014,8 +1014,18 @@ export class AutomaticMaintenanceCadence {
     };
   }
 
-  private classifyRetry(): "startup" | "normal" {
-    return this.baselineStatus().progress.state === "in_progress" ? "startup" : "normal";
+  private classifyRetry(
+    before: ReturnType<typeof captureBaselineStatus>["progress"],
+    after: ReturnType<typeof captureBaselineStatus>["progress"],
+  ): "startup" | "normal" {
+    const advanced =
+      (before.state === "not_established" && after.state === "in_progress") ||
+      after.sourcesComplete > before.sourcesComplete ||
+      after.filesDiscovered > before.filesDiscovered ||
+      after.filesValidated > before.filesValidated ||
+      after.filesBaselined > before.filesBaselined ||
+      after.pendingMetadata < before.pendingMetadata;
+    return after.state === "in_progress" && advanced ? "startup" : "normal";
   }
 
   private schedule(retryClass: "boot" | "startup" | "normal") {
@@ -1041,6 +1051,7 @@ export class AutomaticMaintenanceCadence {
     this.inFlight = true;
     this.triggerCount += 1;
     let failed = false;
+    const baselineBefore = this.baselineStatus().progress;
     try {
       await requestAutomaticRecentMaintenance(this.scheduler);
     } catch (error) {
@@ -1049,7 +1060,10 @@ export class AutomaticMaintenanceCadence {
       this.options.onError?.(error);
     } finally {
       this.inFlight = false;
-      if (this.accepting) this.schedule(failed ? "normal" : this.classifyRetry());
+      if (this.accepting) {
+        const baselineAfter = this.baselineStatus().progress;
+        this.schedule(failed ? "normal" : this.classifyRetry(baselineBefore, baselineAfter));
+      }
     }
   }
 }

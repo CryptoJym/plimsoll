@@ -21,7 +21,9 @@ import {
   classifyCaptureBaselineFile,
   completeAutomaticCaptureBaseline,
   recordAutomaticCaptureBaselineProgress,
+  resolveAutomaticCaptureBaselinePending,
   stageAutomaticCaptureBaselineObservation,
+  stageAutomaticCaptureBaselinePending,
   type CaptureBaselineFileObservation,
 } from "./capture-baseline";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
@@ -307,10 +309,10 @@ export class RolloutTailer {
     runId: string;
     filesDiscovered: number;
     filesValidated: number;
-    resumeValidationDebt: number;
     cutoffMs: number;
     sweepsCompleted: number;
     newGenerationsThisSweep: number;
+    capacityDeferredThisSweep: boolean;
   } | null = null;
   private captureAttempt: {
     discovery: IncrementalJsonlDiscovery;
@@ -423,11 +425,10 @@ export class RolloutTailer {
           runId: began.latestRun.runId,
           filesDiscovered: began.latestRun.filesDiscovered,
           filesValidated: began.latestRun.filesValidated,
-          resumeValidationDebt:
-            began.latestRun.filesDiscovered - began.latestRun.filesValidated,
           cutoffMs: Date.parse(began.latestRun.startedAt),
           sweepsCompleted: 0,
           newGenerationsThisSweep: 0,
+          capacityDeferredThisSweep: false,
         };
       }
 
@@ -443,7 +444,25 @@ export class RolloutTailer {
             files: [], entriesVisited: 0, errors: 0, done: false,
             limitReached: false, yields: 0, lastYieldAt: null,
           };
-      attempt.pendingFiles.push(...chunk.files);
+      if (chunk.files.length > 0) {
+        const pending = stageAutomaticCaptureBaselinePending(
+          this.buffer.database,
+          "codex",
+          {
+            runId: attempt.runId,
+            observedAt: new Date().toISOString(),
+            observations: chunk.files.map((discovered) =>
+              baselineObservation(discovered.file, discovered.stat, discovered.precise)
+            ),
+          },
+        );
+        attempt.filesDiscovered = pending.filesDiscovered;
+        const acceptedFiles = chunk.files.filter((_, index) => pending.accepted[index]);
+        if (acceptedFiles.length < chunk.files.length) {
+          attempt.capacityDeferredThisSweep = true;
+        }
+        attempt.pendingFiles.push(...acceptedFiles);
+      }
       result.baselinePendingMetadataPeak = Math.max(
         result.baselinePendingMetadataPeak ?? 0,
         attempt.pendingFiles.length,
@@ -451,9 +470,6 @@ export class RolloutTailer {
       if (attempt.pendingFiles.length > AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP) {
         throw new Error("automatic_baseline_pending_metadata_cap_exceeded");
       }
-      const resumedFiles = Math.min(attempt.resumeValidationDebt, chunk.files.length);
-      attempt.resumeValidationDebt -= resumedFiles;
-      attempt.filesDiscovered += chunk.files.length - resumedFiles;
       result.filesSeen = chunk.files.length;
       result.activity.discoveryEntries = chunk.entriesVisited;
       result.cooperativeYields += chunk.yields;
@@ -482,14 +498,16 @@ export class RolloutTailer {
               observation: baselineObservation(file, stat, discovered.precise),
               filesDiscovered: attempt.filesDiscovered,
               filesValidated: attempt.filesValidated + 1,
+              resolvePending: true,
             })) attempt.newGenerationsThisSweep += 1;
           } else {
-            recordAutomaticCaptureBaselineProgress(this.buffer.database, "codex", {
+            if (!resolveAutomaticCaptureBaselinePending(this.buffer.database, "codex", {
               runId: attempt.runId,
-              updatedAt: new Date().toISOString(),
+              observedAt: new Date().toISOString(),
+              observation: baselineObservation(file, stat, discovered.precise),
               filesDiscovered: attempt.filesDiscovered,
               filesValidated: attempt.filesValidated + 1,
-            });
+            })) throw new Error("capture_baseline_pending_identity_mismatch");
           }
           attempt.filesValidated += 1;
           attempt.pendingFiles.shift();
@@ -535,6 +553,17 @@ export class RolloutTailer {
           filesDiscovered: attempt.filesDiscovered,
           filesValidated: attempt.filesValidated,
         });
+        result.automaticBudget = automatic.budget.status();
+        return result;
+      }
+
+      if (attempt.capacityDeferredThisSweep) {
+        attempt.discovery.close();
+        attempt.discovery = this.recentDiscovery(scanNow, options.discoveryLimit);
+        attempt.capacityDeferredThisSweep = false;
+        attempt.newGenerationsThisSweep = 0;
+        result.activity.truncated = true;
+        result.deferredGenerations = 1;
         result.automaticBudget = automatic.budget.status();
         return result;
       }

@@ -1075,6 +1075,7 @@ async function main() {
     home: machineAHome,
     temp: machineATmp,
     requiredAssertions: [
+      '"id": "maintenance_regression_proof"',
       '"id": "no_change_constant_work"',
       '"id": "dashboard_projection_budget"',
       '"overall": "pass"',

@@ -458,6 +458,15 @@ function assertResourceReceipt(receipt: unknown) {
   assert.equal(noChangeMeasurements.claudeValidatedBeforeComplete, true);
   assert.equal(noChangeMeasurements.baselineProgressFair, true);
 
+  const maintenanceMeasurements = childRecord(
+    scenario("maintenance_regression_proof").measurements,
+    "maintenance regression measurements",
+  );
+  assert.equal(integer(maintenanceMeasurements.exitCode, "maintenance proof exit code"), 0);
+  assert.ok(integer(maintenanceMeasurements.checks, "maintenance proof checks") >= 20);
+  assert.equal(maintenanceMeasurements.exactPendingIdentityProved, true);
+  assert.equal(maintenanceMeasurements.stalledCadenceBackoffProved, true);
+
   const dashboardMeasurements = childRecord(
     scenario("dashboard_projection_budget").measurements,
     "dashboard measurements",

@@ -289,6 +289,18 @@ function verifyMeasurements(
   assert.equal(firstBoot.parseFailuresPersistAcrossRestart, true);
   assert.equal(firstBoot.repairedParseFailuresPromote, true);
   assert.equal(firstBoot.coveragePersistsAcrossRestart, true);
+  const maintenanceScenario = resourceScenarios
+    .map((entry, index) => object(entry, `resource scenario ${index}`))
+    .find((scenario) => scenario.id === "maintenance_regression_proof");
+  assert.ok(maintenanceScenario, "maintenance regression scenario missing");
+  const maintenance = object(
+    maintenanceScenario.measurements,
+    "maintenance regression measurements",
+  );
+  assert.equal(integer(maintenance.exitCode, "maintenance proof exit code"), 0);
+  assert.ok(integer(maintenance.checks, "maintenance proof checks") >= 20);
+  assert.equal(maintenance.exactPendingIdentityProved, true);
+  assert.equal(maintenance.stalledCadenceBackoffProved, true);
   const dashboard = object(measurements.dashboard, "dashboard measurements");
   exactKeys(dashboard, ["rawRowsScanned", "filesOpened", "fileBytesRead", "filesystemEntriesScanned"], "dashboard measurements");
   assert.ok(Object.values(dashboard).every((value) => value === 0), "dashboard scan work must remain exactly zero");

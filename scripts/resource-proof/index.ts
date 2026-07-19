@@ -20,6 +20,7 @@ import {
   runPoisonContinuationContract,
   runDashboardProjectionBudgetContract,
   runIntegratedCaptureProjectionOutboxContract,
+  runMaintenanceRegressionContract,
   runMetadataPrivacySentinelsContract,
   runLearningFactPrivacyAndResourceContract,
   resourceReceiptPrivacyLeakCount,
@@ -107,6 +108,7 @@ async function main() {
     scenarios.push(runArchitectureContract());
     scenarios.push(runEmptyLedgerContract(sandbox));
     scenarios.push(runExistingSignalFidelityProof(sandbox, runExistingProof));
+    scenarios.push(runMaintenanceRegressionContract(sandbox));
     scenarios.push(await runNoChangeConstantWorkContract(sandbox));
     scenarios.push(await runBoundedCaptureContract(sandbox));
     scenarios.push(runBoundedCodexReconciliationContract(sandbox));
