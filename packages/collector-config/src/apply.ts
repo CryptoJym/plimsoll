@@ -113,6 +113,19 @@ function assertSafeClaudeLeaf(stat: fs.Stats) {
   if (uid !== undefined && stat.uid !== uid) claudeFail("UNSAFE_LEAF_OWNER");
 }
 
+function assertSafeClaudeAncestor(stat: fs.Stats) {
+  if (!stat.isDirectory()) claudeFail("UNSAFE_ANCESTOR_TYPE");
+  const uid = currentUid();
+  if (uid !== undefined && stat.uid !== uid && stat.uid !== 0) {
+    claudeFail("UNSAFE_ANCESTOR_OWNER");
+  }
+  const permissions = stat.mode & 0o7777;
+  const trustedRootStickyDirectory = stat.uid === 0 && (permissions & 0o1000) !== 0;
+  if ((permissions & 0o022) !== 0 && !trustedRootStickyDirectory) {
+    claudeFail("UNSAFE_ANCESTOR_MODE");
+  }
+}
+
 function inspectClaudePath(file: string): ClaudePathSnapshot {
   const absolutePath = path.resolve(file);
   const parsed = path.parse(absolutePath);
@@ -134,7 +147,7 @@ function inspectClaudePath(file: string): ClaudePathSnapshot {
       if (path.dirname(cursor) === parsed.root && stat.uid === 0) continue;
       claudeFail("UNSAFE_ANCESTOR_SYMLINK");
     }
-    if (!stat.isDirectory()) claudeFail("UNSAFE_ANCESTOR_TYPE");
+    assertSafeClaudeAncestor(stat);
     ancestors.push({ path: cursor, ...claudeIdentity(stat) });
   }
 
@@ -272,8 +285,8 @@ function ensureClaudeParent(
         if (path.dirname(cursor) !== parsed.root || before.uid !== 0) {
           claudeFail("UNSAFE_ANCESTOR_SYMLINK");
         }
-      } else if (!before.isDirectory()) {
-        claudeFail("UNSAFE_ANCESTOR_TYPE");
+      } else {
+        assertSafeClaudeAncestor(before);
       }
     }
   }
@@ -426,7 +439,58 @@ function backupClaudePreimage(
     current,
   );
   fsyncClaudeDirectory(path.dirname(snapshot.absolutePath));
-  return backupPath;
+  return { backupPath, identity: created };
+}
+
+function assertClaudeBackup(
+  snapshot: ClaudePathSnapshot,
+  backup: ReturnType<typeof backupClaudePreimage>,
+  current: string,
+) {
+  try {
+    assertVisibleClaudeContent(
+      { ...snapshot, absolutePath: backup.backupPath, exists: true, leaf: backup.identity },
+      backup.identity,
+      current,
+    );
+  } catch (error) {
+    unlinkClaudeObject(backup.backupPath, backup.identity);
+    throw error;
+  }
+}
+
+function restoreUnexpectedClaudeClaim(
+  claimPath: string,
+  destination: string,
+  claimIdentity: ClaudeFileIdentity,
+) {
+  if (claudeLstat(destination)) return;
+  const claim = claudeLstat(claimPath);
+  if (
+    !claim ||
+    claim.isSymbolicLink() ||
+    !claim.isFile() ||
+    claim.dev !== claimIdentity.device ||
+    claim.ino !== claimIdentity.inode
+  ) {
+    return;
+  }
+  try {
+    fs.linkSync(claimPath, destination);
+    fs.unlinkSync(claimPath);
+  } catch {
+    // Preserve the claimed object rather than risk overwriting a concurrently
+    // created destination. The caller still fails closed and reports no success.
+    return;
+  }
+  const restored = claudeLstat(destination);
+  if (
+    !restored ||
+    restored.dev !== claimIdentity.device ||
+    restored.ino !== claimIdentity.inode
+  ) {
+    claudeFail("COMMIT_CLAIM_RESTORE_FAILED");
+  }
 }
 
 function writeClaudePlan(
@@ -441,6 +505,7 @@ function writeClaudePlan(
     ? claudeOpenNoFollow(snapshot.absolutePath, fs.constants.O_RDONLY)
     : undefined;
   let prepared: ReturnType<typeof prepareClaudeFile> | undefined;
+  let claim: { path: string; identity: ClaudeFileIdentity } | undefined;
   try {
     if (snapshot.exists) {
       if (boundDescriptor === undefined || !snapshot.leaf) claudeFail("MISSING_PREIMAGE_IDENTITY");
@@ -457,10 +522,11 @@ function writeClaudePlan(
       next,
     );
 
-    const backupPath = snapshot.exists
+    const backup = snapshot.exists
       ? backupClaudePreimage(snapshot, current, boundDescriptor!)
       : undefined;
     runClaudeHook(hooks.afterBackup);
+    if (backup) assertClaudeBackup(snapshot, backup, current);
 
     if (snapshot.exists) {
       assertClaudeBoundContent(boundDescriptor!, snapshot.leaf!, current);
@@ -473,12 +539,41 @@ function writeClaudePlan(
       prepared.identity,
       next,
     );
+    if (backup) assertClaudeBackup(snapshot, backup, current);
     runClaudeHook(hooks.beforeCommit);
 
     if (snapshot.exists) {
       assertClaudeBoundContent(boundDescriptor!, snapshot.leaf!, current);
       assertVisibleClaudeContent(snapshot, snapshot.leaf!, current);
-      fs.renameSync(prepared.tempPath, snapshot.absolutePath);
+      if (backup) assertClaudeBackup(snapshot, backup, current);
+
+      // Node exposes no compare-and-swap rename. Claim the visible preimage by
+      // atomically moving it aside, verify the claimed inode/content, then use
+      // a no-clobber hard-link publication. A concurrent destination can make
+      // the operation fail, but it can never be overwritten by this commit.
+      const claimPath = path.join(
+        path.dirname(snapshot.absolutePath),
+        `.${path.basename(snapshot.absolutePath)}.plimsoll-claim-${randomUUID()}`,
+      );
+      if (claudeLstat(claimPath)) claudeFail("COMMIT_CLAIM_COLLISION");
+      fs.renameSync(snapshot.absolutePath, claimPath);
+      const claimedStat = claudeLstat(claimPath);
+      if (!claimedStat) claudeFail("COMMIT_CLAIM_MISSING");
+      const claimedIdentity = claudeIdentity(claimedStat);
+      claim = { path: claimPath, identity: claimedIdentity };
+      try {
+        assertVisibleClaudeContent(
+          { ...snapshot, absolutePath: claimPath, exists: true, leaf: snapshot.leaf },
+          snapshot.leaf!,
+          current,
+        );
+      } catch {
+        restoreUnexpectedClaudeClaim(claimPath, snapshot.absolutePath, claimedIdentity);
+        claim = undefined;
+        claudeFail("COMMIT_CLAIM_MISMATCH");
+      }
+      fs.linkSync(prepared.tempPath, snapshot.absolutePath);
+      fs.unlinkSync(prepared.tempPath);
     } else {
       assertStableClaudePath(snapshot);
       // No-clobber publication for a fresh file. A plain rename could replace
@@ -489,12 +584,24 @@ function writeClaudePlan(
 
     runClaudeHook(hooks.afterCommit);
     assertVisibleClaudeContent(snapshot, prepared.identity, next);
+    if (backup) assertClaudeBackup(snapshot, backup, current);
     fsyncClaudeDirectory(path.dirname(snapshot.absolutePath));
     assertVisibleClaudeContent(snapshot, prepared.identity, next);
-    return backupPath;
+    if (backup) assertClaudeBackup(snapshot, backup, current);
+    if (claim) {
+      unlinkClaudeObject(claim.path, claim.identity);
+      claim = undefined;
+      fsyncClaudeDirectory(path.dirname(snapshot.absolutePath));
+      assertVisibleClaudeContent(snapshot, prepared.identity, next);
+      if (backup) assertClaudeBackup(snapshot, backup, current);
+    }
+    return backup?.backupPath;
   } finally {
     if (boundDescriptor !== undefined) fs.closeSync(boundDescriptor);
     if (prepared) unlinkClaudeObject(prepared.tempPath, prepared.identity);
+    if (claim) {
+      restoreUnexpectedClaudeClaim(claim.path, snapshot.absolutePath, claim.identity);
+    }
   }
 }
 
@@ -541,6 +648,46 @@ function isOwnedClaudeHook(value: unknown) {
   const kinds = hookUrlKinds(value);
   if (kinds.includes("alias")) claudeFail("HOOK_URL_ALIAS");
   return kinds.includes("owned");
+}
+
+function isDirectOwnedClaudeHook(value: unknown) {
+  if (!isJsonRecord(value) || typeof value.url !== "string") return false;
+  const folded = aliasFold(value.url);
+  if (!/^http:\/\/127\.0\.0\.1:\d+\/hooks\/claude-code$/.test(folded)) return false;
+  if (value.url !== folded) claudeFail("HOOK_URL_ALIAS");
+  return true;
+}
+
+function stripOwnedClaudeHookLeaves(value: unknown): { value: unknown; removed: number } {
+  if (isDirectOwnedClaudeHook(value)) return { value: undefined, removed: 1 };
+  if (Array.isArray(value)) {
+    const kept: unknown[] = [];
+    let removed = 0;
+    for (const entry of value) {
+      const stripped = stripOwnedClaudeHookLeaves(entry);
+      removed += stripped.removed;
+      if (stripped.value !== undefined) kept.push(stripped.value);
+    }
+    return { value: kept, removed };
+  }
+  if (!isJsonRecord(value)) return { value, removed: 0 };
+  const next: Record<string, unknown> = {};
+  let removed = 0;
+  for (const [key, entry] of Object.entries(value)) {
+    const stripped = stripOwnedClaudeHookLeaves(entry);
+    removed += stripped.removed;
+    if (stripped.value !== undefined) next[key] = stripped.value;
+  }
+  return { value: next, removed };
+}
+
+function hasOperatorClaudeHookRemainder(value: unknown, expectedEnvelope: unknown) {
+  if (!isJsonRecord(value) || !isJsonRecord(expectedEnvelope)) return value !== undefined;
+  if (Array.isArray(value.hooks) && value.hooks.length > 0) return true;
+  return Object.entries(value).some(([key, entry]) =>
+    key !== "hooks" &&
+    (!Object.hasOwn(expectedEnvelope, key) || !isDeepStrictEqual(entry, expectedEnvelope[key])),
+  );
 }
 
 function parseClaudeDocument(current: string) {
@@ -597,15 +744,21 @@ function reconcileClaudeDocument(
     const existingValue = currentHooks[event];
     if (existingValue !== undefined && !Array.isArray(existingValue)) claudeFail("INVALID_HOOK_EVENT");
     const existing = (existingValue ?? []) as unknown[];
-    const foreign: unknown[] = [];
-    const owned: unknown[] = [];
+    const desired: unknown[] = [];
     for (const entry of existing) {
-      (isOwnedClaudeHook(entry) ? owned : foreign).push(entry);
+      if (!isOwnedClaudeHook(entry)) {
+        desired.push(entry);
+        continue;
+      }
+      const stripped = stripOwnedClaudeHookLeaves(entry);
+      if (stripped.removed === 0) claudeFail("INVALID_OWNED_HOOK");
+      if (hasOperatorClaudeHookRemainder(stripped.value, expectedEntries[0])) {
+        desired.push(stripped.value);
+      }
     }
-    const alreadyExact = owned.length === expectedEntries.length &&
-      owned.every((entry, index) => isDeepStrictEqual(entry, expectedEntries[index]));
-    if (!alreadyExact) {
-      hooks[event] = [...foreign, ...expectedEntries];
+    desired.push(...expectedEntries);
+    if (!isDeepStrictEqual(existing, desired)) {
+      hooks[event] = desired;
       changes.push(`claude.hooks.${event}.reconcile`);
     }
   }

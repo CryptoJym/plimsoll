@@ -132,8 +132,12 @@ function main() {
       env: { USER_SETTING: "preserve", OTEL_LOGS_EXPORTER: "legacy" },
       hooks: {
         UserPromptSubmit: [
-          { hooks: [{ type: "command", command: "synthetic-foreign-hook" }] },
-          { hooks: [{ type: "http", url: canonicalUrl }] },
+          {
+            hooks: [
+              { type: "command", command: "synthetic-foreign-hook" },
+              { type: "http", url: canonicalUrl },
+            ],
+          },
         ],
         ForeignEvent: [{ marker: secretSentinel }],
       },
@@ -256,6 +260,42 @@ function main() {
       { error: swapError, replacementPreserved: true },
     );
 
+    const commitWindowDir = path.join(sandbox, "commit-window-replacement");
+    fs.mkdirSync(commitWindowDir, { mode: 0o700 });
+    const commitWindowFile = path.join(commitWindowDir, "settings.json");
+    const commitWindowDetached = path.join(commitWindowDir, "settings.original.json");
+    writeJson(commitWindowFile, preimage);
+    const commitWindowSource = fs.readFileSync(commitWindowFile, "utf8");
+    const commitWindowReplacement = `${JSON.stringify({ concurrent: secretSentinel })}\n`;
+    const originalRename = fs.renameSync;
+    let injectedCommitWindow = false;
+    let commitWindowError = "";
+    try {
+      fs.renameSync = ((oldPath: fs.PathLike, newPath: fs.PathLike) => {
+        if (
+          !injectedCommitWindow &&
+          String(oldPath) === commitWindowFile &&
+          String(newPath).includes(".plimsoll-claim-")
+        ) {
+          injectedCommitWindow = true;
+          originalRename(commitWindowFile, commitWindowDetached);
+          fs.writeFileSync(commitWindowFile, commitWindowReplacement, { mode: 0o600 });
+        }
+        return originalRename(oldPath, newPath);
+      }) as typeof fs.renameSync;
+      commitWindowError = errorMessage(() => applyClaudeSettings(commitWindowFile, generated));
+    } finally {
+      fs.renameSync = originalRename;
+    }
+    check(
+      "commit_window_path_replacement_is_restored_and_never_clobbered",
+      injectedCommitWindow &&
+        commitWindowError === "CLAUDE_CONFIG_COMMIT_CLAIM_MISMATCH" &&
+        fs.readFileSync(commitWindowDetached, "utf8") === commitWindowSource &&
+        fs.readFileSync(commitWindowFile, "utf8") === commitWindowReplacement,
+      { error: commitWindowError, replacementPreserved: true },
+    );
+
     const postDir = path.join(sandbox, "post-commit-swap");
     fs.mkdirSync(postDir, { mode: 0o700 });
     const postFile = path.join(postDir, "settings.json");
@@ -301,6 +341,31 @@ function main() {
         fs.readFileSync(path.join(interruptDir, backups(interruptDir)[0]!), "utf8") === interruptSource &&
         temps(interruptDir).length === 0,
       { error: interruptError, backups: backups(interruptDir).length },
+    );
+
+    const backupRaceDir = path.join(sandbox, "backup-hardlink-race");
+    fs.mkdirSync(backupRaceDir, { mode: 0o700 });
+    const backupRaceFile = path.join(backupRaceDir, "settings.json");
+    const backupAlias = path.join(backupRaceDir, "backup-alias");
+    writeJson(backupRaceFile, preimage);
+    const backupRaceSource = fs.readFileSync(backupRaceFile, "utf8");
+    const backupRaceError = errorMessage(() => applyClaudeSettings(backupRaceFile, generated, {
+      transactionHooks: {
+        afterBackup: () => {
+          const backup = backups(backupRaceDir)[0];
+          assert.ok(backup);
+          fs.linkSync(path.join(backupRaceDir, backup), backupAlias);
+        },
+      },
+    }));
+    check(
+      "backup_hardlink_change_after_durability_is_rejected_before_commit",
+      backupRaceError === "CLAUDE_CONFIG_UNSAFE_LEAF_LINK_COUNT" &&
+        fs.readFileSync(backupRaceFile, "utf8") === backupRaceSource &&
+        backups(backupRaceDir).length === 0 &&
+        fs.readFileSync(backupAlias, "utf8") === backupRaceSource &&
+        temps(backupRaceDir).length === 0,
+      { error: backupRaceError, backups: backups(backupRaceDir).length },
     );
 
     const preparedLinkDir = path.join(sandbox, "prepared-hardlink");
@@ -402,6 +467,21 @@ function main() {
         backups(ancestorTarget).length === 0,
       { error: ancestorError },
     );
+
+    const writableAncestor = path.join(sandbox, "writable-ancestor");
+    const privateChild = path.join(writableAncestor, "claude");
+    fs.mkdirSync(privateChild, { recursive: true, mode: 0o700 });
+    fs.chmodSync(writableAncestor, 0o777);
+    const writableAncestorFile = path.join(privateChild, "settings.json");
+    const writableAncestorError = errorMessage(() => applyClaudeSettings(writableAncestorFile, generated));
+    check(
+      "operator_owned_writable_intermediate_ancestor_fails_closed",
+      writableAncestorError === "CLAUDE_CONFIG_UNSAFE_ANCESTOR_MODE" &&
+        !fs.existsSync(writableAncestorFile) &&
+        backups(privateChild).length === 0,
+      { error: writableAncestorError, created: fs.existsSync(writableAncestorFile) },
+    );
+    fs.chmodSync(writableAncestor, 0o700);
 
     const unsafeModeDir = path.join(sandbox, "unsafe-mode");
     fs.mkdirSync(unsafeModeDir, { mode: 0o700 });
