@@ -414,6 +414,14 @@ function assertResourceReceipt(receipt: unknown) {
   assert.equal(integer(boundedCounters.fullHistoryFileReads, "bounded capture full-history reads"), 0);
   assert.equal(integer(boundedMeasurements.automaticPreinstallBodyReads, "bounded capture automatic preinstall reads"), 0);
   assert.equal(integer(boundedMeasurements.explicitFullPreinstallBodyReads, "bounded capture explicit preinstall reads"), 1);
+  assert.equal(integer(boundedMeasurements.claudePreinstallBodyReads, "bounded capture Claude preinstall reads"), 0);
+  assert.equal(integer(boundedMeasurements.ignoredAliasEntriesVisited, "bounded capture ignored alias entries"), 1);
+  assert.equal(boundedMeasurements.irrelevantSymlinkBaselineSafe, true);
+  assert.equal(boundedMeasurements.irrelevantExternalDirectorySymlinkIgnored, true);
+  assert.equal(boundedMeasurements.matchingSymlinkFailsClosed, true);
+  assert.equal(boundedMeasurements.nonmatchingNonregularIgnored, true);
+  assert.equal(boundedMeasurements.matchingNonregularFailsClosed, true);
+  assert.equal(boundedMeasurements.realDirectoriesStillRecurse, true);
   assert.equal(boundedMeasurements.denseExact, true);
   assert.equal(boundedMeasurements.rotationExactlyOnce, true);
   assert.ok(finite(boundedMeasurements.warmStatusP95Ms, "bounded capture warm status p95") <= 500);

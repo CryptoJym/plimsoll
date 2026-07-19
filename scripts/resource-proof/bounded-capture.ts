@@ -1,4 +1,4 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
@@ -9,9 +9,11 @@ import {
   captureBaselineStatus,
   completeAutomaticCaptureBaseline,
 } from "../../packages/collector-cli/src/capture-baseline";
+import { CaptureWorkBudget } from "../../packages/collector-cli/src/capture-work-budget";
 import { collectorConfigSchema } from "../../packages/collector-cli/src/config";
 import { historyCoverageStatus, recordExplicitFullHistoryCoverage } from "../../packages/collector-cli/src/history-coverage";
 import { DEFAULT_JSONL_TAILER_IO, jsonlScanStateKey } from "../../packages/collector-cli/src/jsonl-byte-tailer";
+import { IncrementalJsonlDiscovery } from "../../packages/collector-cli/src/incremental-jsonl-discovery";
 import { CollectorMaintenance } from "../../packages/collector-cli/src/maintenance";
 import { RolloutTailer } from "../../packages/collector-cli/src/rollout-tailer";
 import { createCollectorServer } from "../../packages/collector-cli/src/server";
@@ -74,6 +76,83 @@ function writeDenseRollout(file: string, sessionId: string, records = DENSE_TOKE
   }
   fs.writeFileSync(file, `${lines.join("\n")}\n`, { mode: 0o600 });
   return fs.statSync(file).size;
+}
+
+async function collectDiscovery(root: string) {
+  const discovery = new IncrementalJsonlDiscovery([root], {
+    recursive: true,
+    matches: (name) => name.endsWith(".jsonl"),
+    maxEntries: 100,
+  });
+  const files: string[] = [];
+  let errors = 0;
+  let entriesVisited = 0;
+  let done = false;
+  try {
+    for (let cadence = 0; cadence < 4 && !done; cadence += 1) {
+      const chunk = await discovery.collect(new CaptureWorkBudget(), { maxFiles: 100 });
+      files.push(...chunk.files.map((entry) => entry.file));
+      errors += chunk.errors;
+      entriesVisited += chunk.entriesVisited;
+      done = chunk.done;
+    }
+  } finally {
+    discovery.close();
+  }
+  return { files, errors, entriesVisited, done };
+}
+
+async function proveDiscoveryEntryPolicy(root: string) {
+  const policyRoot = path.join(root, "discovery-entry-policy");
+  const externalDirectory = path.join(policyRoot, "external-transcripts");
+  const externalFile = path.join(policyRoot, "external.jsonl");
+  const ignoredAliasRoot = path.join(policyRoot, "ignored-alias");
+  const matchingAliasRoot = path.join(policyRoot, "matching-alias");
+  const ignoredNonregularRoot = path.join(policyRoot, "ignored-nonregular");
+  const matchingNonregularRoot = path.join(policyRoot, "matching-nonregular");
+  const realDirectoryRoot = path.join(policyRoot, "real-directory");
+  for (const directory of [
+    externalDirectory,
+    ignoredAliasRoot,
+    matchingAliasRoot,
+    ignoredNonregularRoot,
+    matchingNonregularRoot,
+    path.join(realDirectoryRoot, "nested"),
+  ]) fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(externalDirectory, "hidden.jsonl"), "{}\n", { mode: 0o600 });
+  fs.writeFileSync(externalFile, "{}\n", { mode: 0o600 });
+  fs.writeFileSync(path.join(realDirectoryRoot, "nested", "visible.jsonl"), "{}\n", { mode: 0o600 });
+  fs.symlinkSync(externalDirectory, path.join(ignoredAliasRoot, "external-alias"), "dir");
+  fs.symlinkSync(externalFile, path.join(matchingAliasRoot, "trap.jsonl"), "file");
+
+  const ignoredFifo = path.join(ignoredNonregularRoot, "collector.pipe");
+  const matchingFifo = path.join(matchingNonregularRoot, "trap.jsonl");
+  for (const fifo of [ignoredFifo, matchingFifo]) {
+    const created = spawnSync("mkfifo", [fifo], {
+      env: { PATH: "/usr/bin:/bin", LANG: "C", LC_ALL: "C" },
+      stdio: "ignore",
+    });
+    if (created.status !== 0) throw new Error("bounded_discovery_fifo_fixture_unavailable");
+  }
+
+  const ignoredAlias = await collectDiscovery(ignoredAliasRoot);
+  const matchingAlias = await collectDiscovery(matchingAliasRoot);
+  const ignoredNonregular = await collectDiscovery(ignoredNonregularRoot);
+  const matchingNonregular = await collectDiscovery(matchingNonregularRoot);
+  const realDirectory = await collectDiscovery(realDirectoryRoot);
+  return {
+    irrelevantExternalDirectorySymlinkIgnored:
+      ignoredAlias.done && ignoredAlias.errors === 0 && ignoredAlias.files.length === 0,
+    matchingSymlinkFailsClosed:
+      matchingAlias.done && matchingAlias.errors === 1 && matchingAlias.files.length === 0,
+    nonmatchingNonregularIgnored:
+      ignoredNonregular.done && ignoredNonregular.errors === 0 && ignoredNonregular.files.length === 0,
+    matchingNonregularFailsClosed:
+      matchingNonregular.done && matchingNonregular.errors === 1 && matchingNonregular.files.length === 0,
+    realDirectoriesStillRecurse:
+      realDirectory.done && realDirectory.errors === 0 && realDirectory.files.length === 1,
+    ignoredAliasEntriesVisited: ignoredAlias.entriesVisited,
+  };
 }
 
 function percentile(values: number[], fraction: number) {
@@ -243,9 +322,16 @@ export async function runBoundedCaptureContract(
   const preinstall = path.join(day, `rollout-preinstall-${uuid(1)}.jsonl`);
   fs.writeFileSync(preinstall, "", { mode: 0o600 });
   fs.truncateSync(preinstall, PREINSTALL_BYTES);
+  const externalClaudeDirectory = path.join(root, "external-claude-directory");
+  fs.mkdirSync(externalClaudeDirectory, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(externalClaudeDirectory, "hidden.jsonl"), "{}\n", { mode: 0o600 });
+  fs.symlinkSync(externalClaudeDirectory, path.join(claudeRoot, "external-alias"), "dir");
+  const claudePreinstall = path.join(claudeRoot, "preinstall.jsonl");
+  fs.writeFileSync(claudePreinstall, "{}\n", { mode: 0o600 });
   await new Promise<void>((resolve) => setTimeout(resolve, 2));
 
   let preinstallBodyReads = 0;
+  let claudePreinstallBodyReads = 0;
   let totalBodyOpens = 0;
   let totalBodyBytesRead = 0;
   const io = {
@@ -260,11 +346,21 @@ export async function runBoundedCaptureContract(
       return read;
     },
   };
+  const transcriptIo = {
+    ...DEFAULT_JSONL_TAILER_IO,
+    readTail: (...args: Parameters<typeof DEFAULT_JSONL_TAILER_IO.readTail>) => {
+      if (path.resolve(args[0]) === path.resolve(claudePreinstall)) {
+        claudePreinstallBodyReads += 1;
+      }
+      return DEFAULT_JSONL_TAILER_IO.readTail(...args);
+    },
+  };
+  const discoveryEntryPolicy = await proveDiscoveryEntryPolicy(root);
   let buffer = new LocalEventBuffer(path.join(root, "ledger.sqlite"));
   let maintenance = new CollectorMaintenance(
     buffer,
     new RolloutTailer(buffer, codexRoot, () => [], io),
-    new TranscriptTailer(buffer, claudeRoot),
+    new TranscriptTailer(buffer, claudeRoot, transcriptIo),
   );
   const baselineRun = await maintenance.runRecent();
   for (let cadence = 0; cadence < 12 && captureBaselineStatus(buffer.database).status !== "complete"; cadence += 1) {
@@ -272,12 +368,20 @@ export async function runBoundedCaptureContract(
   }
   const excludedRun = await maintenance.runRecent();
   const baseline = captureBaselineStatus(buffer.database);
+  const claudeBaseline = baseline.sources.find((source) => source.source === "claude_code");
+  const irrelevantSymlinkBaselineSafe =
+    baseline.status === "complete" &&
+    claudeBaseline?.status === "complete" &&
+    claudeBaseline.latestRun?.discoveryErrors === 0 &&
+    claudeBaseline.excludedGenerations === 1 &&
+    claudePreinstallBodyReads === 0;
   const baselineNoBody =
     baseline.status === "complete" &&
     baselineRun.rawEventWrites === 0 &&
     baselineRun.rollout.bytesRead === 0 &&
     preinstallBodyReads === 0 &&
-    excludedRun.rollout.excludedGenerations === 1;
+    excludedRun.rollout.excludedGenerations === 1 &&
+    irrelevantSymlinkBaselineSafe;
 
   fs.appendFileSync(preinstall, `${tokenLine(uuid(1), 1)}\n`);
   const growthRun = await maintenance.runRecent();
@@ -331,7 +435,7 @@ export async function runBoundedCaptureContract(
       maintenance = new CollectorMaintenance(
         buffer,
         new RolloutTailer(buffer, codexRoot, () => [], io),
-        new TranscriptTailer(buffer, claudeRoot),
+        new TranscriptTailer(buffer, claudeRoot, transcriptIo),
       );
       server = createCollectorServer(config, buffer, {
         maintenanceStatus: () => ({ capture: maintenance.status() }),
@@ -455,6 +559,12 @@ export async function runBoundedCaptureContract(
     signalCleanup.stdoutPrivate &&
     signalCleanup.pidMatchesCollectorProcess &&
     signalCleanup.nodeMajor === 22;
+  const discoveryEntryPolicySafe =
+    discoveryEntryPolicy.irrelevantExternalDirectorySymlinkIgnored &&
+    discoveryEntryPolicy.matchingSymlinkFailsClosed &&
+    discoveryEntryPolicy.nonmatchingNonregularIgnored &&
+    discoveryEntryPolicy.matchingNonregularFailsClosed &&
+    discoveryEntryPolicy.realDirectoriesStillRecurse;
 
   counters.filesOpened = totalBodyOpens;
   counters.fileBytesRead = totalBodyBytesRead;
@@ -474,14 +584,15 @@ export async function runBoundedCaptureContract(
     rotationExactlyOnce &&
     historyTruth &&
     privacyClean &&
-    signalSafe;
+    signalSafe &&
+    discoveryEntryPolicySafe;
   return {
     id: "bounded_generation_capture",
     required: true,
     status: passed ? "pass" : "fail",
     detail: passed
-      ? "A 500 MiB pre-install generation was metadata-only excluded; a dense 13+ MiB new generation resumed across bounded cadences/restart with responsive HTTP, exact tokens, private state, and graceful in-work SIGTERM cleanup."
-      : "Generation exclusion, bounded cadence, exact resume, HTTP latency, privacy, malformed-input, history, or shutdown assertions failed.",
+      ? "A 500 MiB pre-install generation and an irrelevant external-directory alias were metadata-only handled without body reads; candidate aliases/nonregular entries failed closed, while a dense 13+ MiB new generation resumed across bounded cadences/restart with responsive HTTP, exact tokens, private state, and graceful in-work SIGTERM cleanup."
+      : "Generation exclusion, discovery entry policy, bounded cadence, exact resume, HTTP latency, privacy, malformed-input, history, or shutdown assertions failed.",
     durationMs: Math.round((performance.now() - started) * 100) / 100,
     counters,
     measurements: {
@@ -491,6 +602,15 @@ export async function runBoundedCaptureContract(
       denseBytes,
       denseTokenRecords: DENSE_TOKEN_RECORDS,
       baselineNoBody,
+      irrelevantSymlinkBaselineSafe,
+      irrelevantExternalDirectorySymlinkIgnored:
+        discoveryEntryPolicy.irrelevantExternalDirectorySymlinkIgnored,
+      matchingSymlinkFailsClosed: discoveryEntryPolicy.matchingSymlinkFailsClosed,
+      nonmatchingNonregularIgnored: discoveryEntryPolicy.nonmatchingNonregularIgnored,
+      matchingNonregularFailsClosed: discoveryEntryPolicy.matchingNonregularFailsClosed,
+      realDirectoriesStillRecurse: discoveryEntryPolicy.realDirectoriesStillRecurse,
+      ignoredAliasEntriesVisited: discoveryEntryPolicy.ignoredAliasEntriesVisited,
+      claudePreinstallBodyReads,
       preinstallGrowthExcluded,
       firstCadenceBounded,
       denseExact,
