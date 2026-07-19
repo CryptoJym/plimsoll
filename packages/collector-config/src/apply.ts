@@ -1,4 +1,5 @@
 import fs from "node:fs";
+import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { parse as parseToml } from "smol-toml";
 
@@ -102,6 +103,23 @@ type ManagedTable = {
   keys: string[];
 };
 
+type FileIdentity = {
+  device: number;
+  inode: number;
+  mode: number;
+};
+
+type PathIdentity = FileIdentity & {
+  path: string;
+};
+
+type CodexPathSnapshot = {
+  absolutePath: string;
+  ancestors: PathIdentity[];
+  exists: boolean;
+  leaf?: FileIdentity;
+};
+
 const MANAGED_TABLES: ManagedTable[] = [
   { path: ["otel"], keys: ["environment", "log_user_prompt"] },
   { path: ["otel", "exporter", "otlp-http"], keys: ["endpoint", "protocol", "headers"] },
@@ -112,7 +130,201 @@ const MANAGED_TABLES: ManagedTable[] = [
 
 const HOOK_EVENTS = ["UserPromptSubmit", "PostToolUse", "Stop"] as const;
 const PLIMSOLL_HEADER = "x-plimsoll-source";
-const LEGACY_PLIMSOLL_HEADERS = new Set(["x-cfo-one-source"]);
+const LEGACY_PLIMSOLL_HEADER = "x-cfo-one-source";
+
+function fileIdentity(stat: fs.Stats): FileIdentity {
+  return { device: stat.dev, inode: stat.ino, mode: stat.mode };
+}
+
+function sameIdentity(left: FileIdentity, right: FileIdentity) {
+  return left.device === right.device && left.inode === right.inode;
+}
+
+function unsafePath(file: string, detail: string): never {
+  throw new Error(`${file}: ${detail}; refusing to read through a link or create a backup/write.`);
+}
+
+function lstat(file: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(file);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+/**
+ * Capture every writable path component. macOS root compatibility aliases
+ * such as /var -> /private/var are root-owned and accepted; any symlink below
+ * the filesystem root is an unsafe operator-controlled traversal.
+ */
+function inspectCodexPath(file: string): CodexPathSnapshot {
+  const absolutePath = path.resolve(file);
+  const parsed = path.parse(absolutePath);
+  const segments = absolutePath.slice(parsed.root.length).split(path.sep).filter(Boolean);
+  const ancestors: PathIdentity[] = [];
+  let cursor = parsed.root;
+  let missingAncestor = false;
+  for (const segment of segments.slice(0, -1)) {
+    cursor = path.join(cursor, segment);
+    if (missingAncestor) continue;
+    const stat = lstat(cursor);
+    if (!stat) {
+      missingAncestor = true;
+      continue;
+    }
+    if (stat.isSymbolicLink()) {
+      if (path.dirname(cursor) === parsed.root && stat.uid === 0) continue;
+      unsafePath(file, `ancestor ${JSON.stringify(cursor)} is a symbolic link`);
+    }
+    if (!stat.isDirectory()) unsafePath(file, `ancestor ${JSON.stringify(cursor)} is not a directory`);
+    ancestors.push({ path: cursor, ...fileIdentity(stat) });
+  }
+
+  const leafStat = lstat(absolutePath);
+  if (!leafStat) return { absolutePath, ancestors, exists: false };
+  if (missingAncestor) unsafePath(file, "an ancestor appeared while inspecting config.toml");
+  if (leafStat.isSymbolicLink()) unsafePath(file, "config.toml is a symbolic link");
+  if (!leafStat.isFile()) unsafePath(file, "config.toml is not a regular file");
+  return { absolutePath, ancestors, exists: true, leaf: fileIdentity(leafStat) };
+}
+
+function sameAncestors(left: PathIdentity[], right: PathIdentity[]) {
+  return left.length === right.length && left.every((entry, index) =>
+    entry.path === right[index]?.path && sameIdentity(entry, right[index]!)
+  );
+}
+
+function assertStableCodexPath(file: string, expected: CodexPathSnapshot) {
+  const current = inspectCodexPath(file);
+  if (current.absolutePath !== expected.absolutePath || current.exists !== expected.exists) {
+    unsafePath(file, "config.toml path identity changed after planning");
+  }
+  if (!sameAncestors(current.ancestors, expected.ancestors)) {
+    unsafePath(file, "a config.toml ancestor changed after planning");
+  }
+  if (expected.exists && (!current.leaf || !expected.leaf || !sameIdentity(current.leaf, expected.leaf))) {
+    unsafePath(file, "config.toml was replaced after planning");
+  }
+}
+
+function openNoFollow(file: string, flags: number) {
+  try {
+    return fs.openSync(file, flags | fs.constants.O_NOFOLLOW);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ELOOP" || code === "EMLINK") unsafePath(file, "config.toml became a symbolic link");
+    throw error;
+  }
+}
+
+function readCodexPreimage(file: string) {
+  const snapshot = inspectCodexPath(file);
+  if (!snapshot.exists) return { snapshot, current: "" };
+  const descriptor = openNoFollow(snapshot.absolutePath, fs.constants.O_RDONLY);
+  try {
+    const opened = fileIdentity(fs.fstatSync(descriptor));
+    if (!snapshot.leaf || !sameIdentity(opened, snapshot.leaf)) {
+      unsafePath(file, "config.toml was replaced while opening it");
+    }
+    return { snapshot, current: fs.readFileSync(descriptor, "utf8") };
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function writeDescriptor(descriptor: number, content: string) {
+  const bytes = Buffer.from(content);
+  let offset = 0;
+  while (offset < bytes.length) {
+    offset += fs.writeSync(descriptor, bytes, offset, bytes.length - offset, offset);
+  }
+  fs.fsyncSync(descriptor);
+}
+
+function unlinkIfIdentity(file: string, identity: FileIdentity | undefined) {
+  const leaf = lstat(file);
+  if (identity && leaf && !leaf.isSymbolicLink() && sameIdentity(identity, fileIdentity(leaf))) {
+    fs.unlinkSync(file);
+  }
+}
+
+function backupCodexPreimage(file: string, snapshot: CodexPathSnapshot, current: string) {
+  const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+  const backupPath = `${file}.plimsoll-backup-${stamp}`;
+  const absoluteBackupPath = path.resolve(backupPath);
+  const descriptor = openNoFollow(
+    absoluteBackupPath,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+  );
+  const created = fileIdentity(fs.fstatSync(descriptor));
+  try {
+    assertStableCodexPath(file, snapshot);
+    fs.fchmodSync(descriptor, (snapshot.leaf?.mode ?? 0o600) & 0o777);
+    writeDescriptor(descriptor, current);
+    assertStableCodexPath(file, snapshot);
+  } catch (error) {
+    unlinkIfIdentity(absoluteBackupPath, created);
+    throw error;
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  return backupPath;
+}
+
+function writeCodexPlan(
+  file: string,
+  snapshot: CodexPathSnapshot,
+  current: string,
+  next: string,
+) {
+  assertStableCodexPath(file, snapshot);
+  if (!snapshot.exists) {
+    const descriptor = openNoFollow(
+      snapshot.absolutePath,
+      fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+    );
+    let createdIdentity: FileIdentity | undefined;
+    try {
+      fs.fchmodSync(descriptor, 0o600);
+      const opened = fileIdentity(fs.fstatSync(descriptor));
+      createdIdentity = opened;
+      const created = inspectCodexPath(file);
+      if (
+        !sameAncestors(created.ancestors, snapshot.ancestors) ||
+        !created.leaf ||
+        !sameIdentity(opened, created.leaf)
+      ) {
+        unsafePath(file, "new config.toml path changed during exclusive creation");
+      }
+      writeDescriptor(descriptor, next);
+      return undefined;
+    } catch (error) {
+      unlinkIfIdentity(snapshot.absolutePath, createdIdentity);
+      throw error;
+    } finally {
+      fs.closeSync(descriptor);
+    }
+  }
+
+  const descriptor = openNoFollow(snapshot.absolutePath, fs.constants.O_RDWR);
+  try {
+    const opened = fileIdentity(fs.fstatSync(descriptor));
+    if (!snapshot.leaf || !sameIdentity(opened, snapshot.leaf)) {
+      unsafePath(file, "config.toml was replaced before mutation");
+    }
+    const currentAtWrite = fs.readFileSync(descriptor, "utf8");
+    if (currentAtWrite !== current) unsafePath(file, "config.toml content changed after planning");
+    assertStableCodexPath(file, snapshot);
+    const backupPath = backupCodexPreimage(file, snapshot, current);
+    assertStableCodexPath(file, snapshot);
+    fs.ftruncateSync(descriptor, 0);
+    writeDescriptor(descriptor, next);
+    return backupPath;
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
 
 function isRecord(value: unknown): value is TomlRecord {
   return Boolean(value && typeof value === "object" && !Array.isArray(value));
@@ -376,7 +588,7 @@ function splitInlineTable(value: string): string[] | null {
   return entries;
 }
 
-function reconcileHeaders(file: string, raw: string, current: TomlRecord) {
+function reconcileHeaders(file: string, raw: string) {
   const entries = splitInlineTable(raw);
   if (!entries) {
     throw new Error(`${file}: managed exporter headers use an unsupported layout; refusing to write or create a backup.`);
@@ -391,22 +603,25 @@ function reconcileHeaders(file: string, raw: string, current: TomlRecord) {
       kept.push(entry);
       continue;
     }
-    if (LEGACY_PLIMSOLL_HEADERS.has(key[0]!)) {
+    const header = key[0]!;
+    if (!/^[\x00-\x7f]+$/.test(header)) {
+      throw new Error(
+        `${file}: managed exporter headers contain non-ASCII header name ${JSON.stringify(header)}; ` +
+        "refusing to write or create a backup.",
+      );
+    }
+    const folded = header.toLowerCase();
+    if (folded === LEGACY_PLIMSOLL_HEADER) {
       removedLegacy = true;
       continue;
     }
-    if (key[0] === PLIMSOLL_HEADER) {
+    if (folded === PLIMSOLL_HEADER) {
       foundPlimsoll = true;
-      if (current[PLIMSOLL_HEADER] !== "codex") {
-        kept.push(`"${PLIMSOLL_HEADER}" = "codex"`);
-      } else {
-        kept.push(entry);
-      }
       continue;
     }
     kept.push(entry);
   }
-  if (!foundPlimsoll) kept.push(`"${PLIMSOLL_HEADER}" = "codex"`);
+  kept.push(`"${PLIMSOLL_HEADER}" = "codex"`);
   return {
     value: `{ ${kept.join(", ")} }`,
     action: removedLegacy
@@ -417,11 +632,24 @@ function reconcileHeaders(file: string, raw: string, current: TomlRecord) {
   };
 }
 
-function hasLegacyHeaders(document: TomlRecord) {
+function headersNeedReconciliation(headers: TomlRecord) {
+  let canonicalCount = 0;
+  for (const [header, value] of Object.entries(headers)) {
+    if (!/^[\x00-\x7f]+$/.test(header)) return true;
+    const folded = header.toLowerCase();
+    if (folded === LEGACY_PLIMSOLL_HEADER) return true;
+    if (folded !== PLIMSOLL_HEADER) continue;
+    canonicalCount += 1;
+    if (header !== PLIMSOLL_HEADER || value !== "codex") return true;
+  }
+  return canonicalCount !== 1;
+}
+
+function hasOwnedHeaderDrift(document: TomlRecord) {
   return MANAGED_TABLES.some((table) => {
     if (!table.keys.includes("headers")) return false;
     const headers = getPath(document, [...table.path, "headers"]);
-    return isRecord(headers) && [...LEGACY_PLIMSOLL_HEADERS].some((key) => Object.hasOwn(headers, key));
+    return isRecord(headers) && headersNeedReconciliation(headers);
   });
 }
 
@@ -445,7 +673,7 @@ function generatedHookBlock(file: string, generatedLines: string[], event: strin
 function reconcileCodexToml(file: string, current: string, generatedToml: string) {
   const document = parseDocument(file, current);
   const expected = parseDocument(file, generatedToml, true);
-  if (containsExpected(document, expected) && !hasLegacyHeaders(document)) {
+  if (containsExpected(document, expected) && !hasOwnedHeaderDrift(document)) {
     return { next: current, changes: [] as string[] };
   }
 
@@ -512,9 +740,9 @@ function reconcileCodexToml(file: string, current: string, generatedToml: string
     for (const { key, value, generated } of desired) {
       const currentValue = getPath(document, [...table.path, key]);
       const assignment = assignments.find((entry) => entry.keyPath[0] === key);
-      const legacyHeaders = key === "headers" && isRecord(currentValue) &&
-        [...LEGACY_PLIMSOLL_HEADERS].some((legacy) => Object.hasOwn(currentValue, legacy));
-      if (isDeepStrictEqual(currentValue, value) && !legacyHeaders) continue;
+      const ownedHeaderDrift = key === "headers" && isRecord(currentValue) &&
+        headersNeedReconciliation(currentValue);
+      if (isDeepStrictEqual(currentValue, value) && !ownedHeaderDrift) continue;
       if (currentValue !== undefined && !assignment) {
         throw new Error(
           `${file}: ${displayPath([...table.path, key])} uses an unsupported dotted or inline layout; ` +
@@ -530,7 +758,7 @@ function reconcileCodexToml(file: string, current: string, generatedToml: string
       let nextValue = generated.valueRaw;
       let action = "replace with generated Plimsoll value";
       if (key === "headers" && isRecord(currentValue)) {
-        const reconciled = reconcileHeaders(file, assignment.valueRaw, currentValue);
+        const reconciled = reconcileHeaders(file, assignment.valueRaw);
         nextValue = reconciled.value;
         action = reconciled.action;
       }
@@ -580,7 +808,7 @@ function reconcileCodexToml(file: string, current: string, generatedToml: string
       "refusing to write or create a backup.",
     );
   }
-  if (!containsExpected(reconciled, expected) || hasLegacyHeaders(reconciled)) {
+  if (!containsExpected(reconciled, expected) || hasOwnedHeaderDrift(reconciled)) {
     throw new Error(`${file}: Codex reconciliation did not produce the complete generated subset; refusing to write or create a backup.`);
   }
   return { next, changes };
@@ -592,8 +820,7 @@ export function applyCodexConfig(
   generatedToml: string,
   options: { dryRun?: boolean } = {},
 ): ApplyResult {
-  const exists = fs.existsSync(file);
-  const current = exists ? fs.readFileSync(file, "utf8") : "";
+  const { snapshot, current } = readCodexPreimage(file);
   const plan = reconcileCodexToml(file, current, generatedToml);
   if (plan.conflict) {
     return { path: file, changed: false, changes: [], conflict: plan.conflict };
@@ -603,7 +830,6 @@ export function applyCodexConfig(
   if (options.dryRun) {
     return { path: file, changed: true, changes };
   }
-  const backupPath = exists ? backup(file) : undefined;
-  fs.writeFileSync(file, plan.next);
+  const backupPath = writeCodexPlan(file, snapshot, current, plan.next);
   return { path: file, changed: true, changes, backupPath };
 }

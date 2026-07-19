@@ -46,9 +46,19 @@ function expectRejected(file: string, generated: string, expectedMessage: RegExp
   );
 }
 
+function ownedHeaderNames(headers: Record<string, unknown>) {
+  return Object.keys(headers).filter((name) => {
+    const folded = name.toLowerCase();
+    return folded === "x-cfo-one-source" || folded === "x-plimsoll-source";
+  });
+}
+
 function main() {
   check("proof_runs_on_node_22", Number(process.versions.node.split(".")[0]) === 22, process.versions.node);
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-codex-config-proof-"));
+  const operatorHome = process.env.HOME;
+  const syntheticHome = path.join(sandbox, "must-remain-absent-home");
+  process.env.HOME = syntheticHome;
   try {
     const port = 49123;
     const generated = generateCodexConfigToml({
@@ -65,6 +75,7 @@ function main() {
     check(
       "dry_run_reports_complete_legacy_reconciliation",
       dryPlan.changed &&
+        dryPlan.changes.length === 8 &&
         dryPlan.changes.some((change) => change.includes("otel.environment replace")) &&
         dryPlan.changes.filter((change) => change.includes("replace legacy x-cfo-one-source")).length === 3 &&
         dryPlan.changes.some((change) => change.includes("features.hooks +")) &&
@@ -143,6 +154,140 @@ function main() {
       { second, backups: backupFiles(path.dirname(config)) },
     );
 
+    const caseAliasDir = path.join(sandbox, "case-alias");
+    fs.mkdirSync(caseAliasDir);
+    const caseAlias = path.join(caseAliasDir, "case-alias.toml");
+    const caseAliasSource = partial.replaceAll('"x-cfo-one-source"', '"X-CFO-One-Source"');
+    fs.writeFileSync(caseAlias, caseAliasSource);
+    const caseAliasResult = applyCodexConfig(caseAlias, generated);
+    const caseAliasDocument = parseToml(fs.readFileSync(caseAlias, "utf8")) as Record<string, any>;
+    check(
+      "case_insensitive_legacy_aliases_collapse_to_one_canonical_owned_header",
+      caseAliasResult.changed &&
+        caseAliasResult.changes.length === 8 &&
+        caseAliasResult.changes.filter((change) => change.includes("replace legacy x-cfo-one-source")).length === 3 &&
+        ["exporter", "trace_exporter", "metrics_exporter"].every((name) => {
+          const headers = caseAliasDocument.otel[name]["otlp-http"].headers as Record<string, unknown>;
+          return isDeepStrictEqual(ownedHeaderNames(headers), ["x-plimsoll-source"]) &&
+            headers["x-plimsoll-source"] === "codex";
+        }),
+      { changes: caseAliasResult.changes, document: caseAliasDocument },
+    );
+
+    const confusableDir = path.join(sandbox, "unicode-confusable");
+    fs.mkdirSync(confusableDir);
+    const confusable = path.join(confusableDir, "unicode-confusable.toml");
+    fs.writeFileSync(
+      confusable,
+      partial.replaceAll('"x-cfo-one-source"', '"ｘ-cfo-one-source"'),
+    );
+    expectRejected(confusable, generated, /non-ASCII header name/);
+
+    const leafTargetDir = path.join(sandbox, "leaf-symlink-target");
+    const leafLinkDir = path.join(sandbox, "leaf-symlink-link");
+    fs.mkdirSync(leafTargetDir);
+    fs.mkdirSync(leafLinkDir);
+    const leafTarget = path.join(leafTargetDir, "target.toml");
+    const leafLink = path.join(leafLinkDir, "config.toml");
+    fs.writeFileSync(leafTarget, partial);
+    fs.symlinkSync(leafTarget, leafLink);
+    let leafLinkMessage = "";
+    try {
+      applyCodexConfig(leafLink, generated);
+    } catch (error) {
+      leafLinkMessage = error instanceof Error ? error.message : String(error);
+    }
+    check(
+      "leaf_symlink_is_rejected_without_target_or_backup_mutation",
+      /config\.toml is a symbolic link/.test(leafLinkMessage) &&
+        fs.lstatSync(leafLink).isSymbolicLink() &&
+        fs.readFileSync(leafTarget, "utf8") === partial &&
+        backupFiles(leafTargetDir).length === 0 &&
+        backupFiles(leafLinkDir).length === 0,
+      { message: leafLinkMessage },
+    );
+
+    const ancestorTargetDir = path.join(sandbox, "ancestor-symlink-target");
+    const ancestorLink = path.join(sandbox, "ancestor-symlink-link");
+    fs.mkdirSync(ancestorTargetDir);
+    const ancestorTarget = path.join(ancestorTargetDir, "config.toml");
+    fs.writeFileSync(ancestorTarget, partial);
+    fs.symlinkSync(ancestorTargetDir, ancestorLink);
+    let ancestorLinkMessage = "";
+    try {
+      applyCodexConfig(path.join(ancestorLink, "config.toml"), generated);
+    } catch (error) {
+      ancestorLinkMessage = error instanceof Error ? error.message : String(error);
+    }
+    check(
+      "ancestor_symlink_is_rejected_without_target_or_backup_mutation",
+      /ancestor .* is a symbolic link/.test(ancestorLinkMessage) &&
+        fs.readFileSync(ancestorTarget, "utf8") === partial &&
+        backupFiles(ancestorTargetDir).length === 0,
+      { message: ancestorLinkMessage },
+    );
+
+    const leafSwapDir = path.join(sandbox, "leaf-swap");
+    const leafSwapTargetDir = path.join(sandbox, "leaf-swap-target");
+    fs.mkdirSync(leafSwapDir);
+    fs.mkdirSync(leafSwapTargetDir);
+    const leafSwap = path.join(leafSwapDir, "config.toml");
+    const leafSwapPreserved = path.join(leafSwapDir, "config.pre-swap.toml");
+    const leafSwapTarget = path.join(leafSwapTargetDir, "target.toml");
+    fs.writeFileSync(leafSwap, partial);
+    check("leaf_swap_dry_run_plans_without_mutation", applyCodexConfig(leafSwap, generated, { dryRun: true }).changed, leafSwap);
+    fs.renameSync(leafSwap, leafSwapPreserved);
+    fs.writeFileSync(leafSwapTarget, partial);
+    fs.symlinkSync(leafSwapTarget, leafSwap);
+    let leafSwapMessage = "";
+    try {
+      applyCodexConfig(leafSwap, generated);
+    } catch (error) {
+      leafSwapMessage = error instanceof Error ? error.message : String(error);
+    }
+    check(
+      "leaf_swap_after_dry_run_is_rejected_without_target_or_backup_mutation",
+      /config\.toml is a symbolic link/.test(leafSwapMessage) &&
+        fs.readFileSync(leafSwapPreserved, "utf8") === partial &&
+        fs.readFileSync(leafSwapTarget, "utf8") === partial &&
+        backupFiles(leafSwapDir).length === 0 &&
+        backupFiles(leafSwapTargetDir).length === 0,
+      { message: leafSwapMessage },
+    );
+
+    const ancestorSwapRoot = path.join(sandbox, "ancestor-swap");
+    const ancestorSwapParent = path.join(ancestorSwapRoot, "config-parent");
+    const ancestorSwapPreserved = path.join(ancestorSwapRoot, "config-parent.pre-swap");
+    const ancestorSwapTarget = path.join(ancestorSwapRoot, "swap-target");
+    fs.mkdirSync(ancestorSwapParent, { recursive: true });
+    fs.mkdirSync(ancestorSwapTarget);
+    const ancestorSwapConfig = path.join(ancestorSwapParent, "config.toml");
+    fs.writeFileSync(ancestorSwapConfig, partial);
+    check(
+      "ancestor_swap_dry_run_plans_without_mutation",
+      applyCodexConfig(ancestorSwapConfig, generated, { dryRun: true }).changed,
+      ancestorSwapConfig,
+    );
+    fs.renameSync(ancestorSwapParent, ancestorSwapPreserved);
+    const ancestorSwapTargetConfig = path.join(ancestorSwapTarget, "config.toml");
+    fs.writeFileSync(ancestorSwapTargetConfig, partial);
+    fs.symlinkSync(ancestorSwapTarget, ancestorSwapParent);
+    let ancestorSwapMessage = "";
+    try {
+      applyCodexConfig(ancestorSwapConfig, generated);
+    } catch (error) {
+      ancestorSwapMessage = error instanceof Error ? error.message : String(error);
+    }
+    check(
+      "ancestor_swap_after_dry_run_is_rejected_without_target_or_backup_mutation",
+      /ancestor .* is a symbolic link/.test(ancestorSwapMessage) &&
+        fs.readFileSync(path.join(ancestorSwapPreserved, "config.toml"), "utf8") === partial &&
+        fs.readFileSync(ancestorSwapTargetConfig, "utf8") === partial &&
+        backupFiles(ancestorSwapPreserved).length === 0 &&
+        backupFiles(ancestorSwapTarget).length === 0,
+      { message: ancestorSwapMessage },
+    );
+
     const malformedDir = path.join(sandbox, "malformed");
     fs.mkdirSync(malformedDir);
     const malformed = path.join(malformedDir, "malformed.toml");
@@ -186,8 +331,16 @@ function main() {
       foreignResult,
     );
 
+    check(
+      "all_rejections_leave_synthetic_home_absent",
+      !fs.existsSync(syntheticHome),
+      syntheticHome,
+    );
+
     console.log(JSON.stringify({ issue: 123, ok: true, fixture: path.relative(root, fixturePath), checks }, null, 2));
   } finally {
+    if (operatorHome === undefined) delete process.env.HOME;
+    else process.env.HOME = operatorHome;
     fs.rmSync(sandbox, { recursive: true, force: true });
   }
 }
