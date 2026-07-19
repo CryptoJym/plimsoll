@@ -14,6 +14,11 @@ const ERROR_TABLE = "automatic_capture_baseline_observation_errors";
 const SCHEMA_VERSION = 2;
 const initializedDatabases = new WeakSet<object>();
 
+/** Automatic discovery holds at most one small metadata chunk per source. */
+export const AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP = 64;
+export const AUTOMATIC_DISCOVERY_ENTRY_CAP = 256;
+export const AUTOMATIC_DISCOVERY_WALL_MS = 50;
+
 export const CAPTURE_BASELINE_NOT_ESTABLISHED =
   "capture_baseline_not_established" as const;
 export const CAPTURE_BASELINE_IN_PROGRESS = "capture_baseline_in_progress" as const;
@@ -85,6 +90,19 @@ export type CaptureBaselineSourceStatus = {
 export type CaptureBaselineStatus = {
   status: "complete" | "blocked";
   reason: CaptureBaselineFailureReason | null;
+  progress: {
+    state: "not_established" | "in_progress" | "complete" | "failed" | "ambiguous";
+    sourcesComplete: number;
+    sourcesInProgress: number;
+    sourcesFailed: number;
+    filesDiscovered: number;
+    filesValidated: number;
+    filesBaselined: number;
+    pendingMetadata: number;
+    pendingMetadataPerSourceCap: number;
+    pendingMetadataAggregateCap: number;
+    deferredSources: number;
+  };
   sources: CaptureBaselineSourceStatus[];
 };
 
@@ -482,11 +500,49 @@ export function captureBaselineStatus(database: Database.Database): CaptureBasel
         source.status === "complete" && source.unresolvedObservationErrors === 0,
     );
   const blocker = sources.find((source) => source.status !== "complete");
+  const latestRuns = sources
+    .map((source) => source.latestRun)
+    .filter((run): run is CaptureBaselineRunProgress => Boolean(run));
+  const sourcesComplete = sources.filter(
+    (source) => source.status === "complete" && source.unresolvedObservationErrors === 0,
+  ).length;
+  const sourcesInProgress = sources.filter((source) => source.status === "in_progress").length;
+  const sourcesFailed = sources.filter(
+    (source) => source.status === "failed" || source.unresolvedObservationErrors > 0,
+  ).length;
+  const filesDiscovered = latestRuns.reduce((total, run) => total + run.filesDiscovered, 0);
+  const filesValidated = latestRuns.reduce((total, run) => total + run.filesValidated, 0);
+  const ambiguous = sources.some((source) =>
+    source.reason === CAPTURE_BASELINE_DISCOVERY_AMBIGUOUS ||
+    source.reason === CAPTURE_BASELINE_STAT_AMBIGUOUS ||
+    source.reason === CAPTURE_BASELINE_GENERATION_AMBIGUOUS ||
+    source.unresolvedObservationErrors > 0,
+  );
   return {
     status: ready ? "complete" : "blocked",
     reason: ready
       ? null
       : blocker?.reason ?? CAPTURE_BASELINE_GENERATION_AMBIGUOUS,
+    progress: {
+      state: ready
+        ? "complete"
+        : sourcesFailed > 0
+          ? ambiguous ? "ambiguous" : "failed"
+          : sourcesInProgress > 0
+            ? "in_progress"
+            : "not_established",
+      sourcesComplete,
+      sourcesInProgress,
+      sourcesFailed,
+      filesDiscovered,
+      filesValidated,
+      filesBaselined: latestRuns.reduce((total, run) => total + run.filesBaselined, 0),
+      pendingMetadata: Math.max(0, filesDiscovered - filesValidated),
+      pendingMetadataPerSourceCap: AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP,
+      pendingMetadataAggregateCap:
+        AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP * sources.length,
+      deferredSources: sources.length - sourcesComplete,
+    },
     sources,
   };
 }
@@ -856,9 +912,9 @@ export function classifyCaptureBaselineFile(
   const unresolvedError = database.prepare(
     `select 1 from ${ERROR_TABLE} where resolved_at is null limit 1`,
   ).get() as { 1: number } | undefined;
-  const allSourcesEstablished =
-    !unresolvedError &&
-    sourceRows.every(({ row }) => row !== undefined && stateIsValid(row) && row.status === "complete");
+  const allSourcesEstablished = sourceRows.every(
+    ({ row }) => row !== undefined && stateIsValid(row) && row.status === "complete",
+  );
   // Explicit history repair stays available when the automatic baseline is
   // absent or failed. Automatic capture, however, is globally fail-closed:
   // neither source becomes live until both discovery snapshots are complete.
@@ -887,8 +943,17 @@ export function classifyCaptureBaselineFile(
        where source = ? and run_id = ? and generation_key = ?`,
     )
     .get(source, sourceState?.status === "complete" ? sourceState.runId : "__inactive__", normalized.generationKey) as
-    | { baselineSize: number; lastObservedSize: number; historyCoveredSize: number }
-    | undefined;
+      | { baselineSize: number; lastObservedSize: number; historyCoveredSize: number }
+      | undefined;
+  if (options.mode === "automatic" && unresolvedError && matching) {
+    return {
+      decision: "block",
+      reason: CAPTURE_BASELINE_GENERATION_AMBIGUOUS,
+      matchedExcludedGeneration: true,
+      observedGrowth: false,
+      historyInvalidated: false,
+    };
+  }
   if (!matching) {
     // A trustworthy replacement generation at the same hashed path resolves
     // an earlier same-generation truncation receipt. No path is persisted or

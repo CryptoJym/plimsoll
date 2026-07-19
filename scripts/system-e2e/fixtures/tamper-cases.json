@@ -116,6 +116,12 @@
       "expectedError": "committed artifact contract mismatch"
     },
     {
+      "id": "resource_baseline_pending_cap",
+      "mutations": [{ "pointer": "/flow/phaseChain/4/artifact/scenarios/6/measurements/pendingMetadataWithinCap", "replacement": false }],
+      "resign": true,
+      "expectedError": "committed artifact contract mismatch"
+    },
+    {
       "id": "phase_receipt_field_missing",
       "mutations": [{ "pointer": "/flow/phaseChain/0/semanticDigest", "remove": true }],
       "resign": false,

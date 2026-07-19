@@ -52,18 +52,32 @@ export class IncrementalJsonlDiscovery {
 
   async collect(
     budget: CaptureWorkBudget,
-    options: { maxFiles?: number; signal?: AbortSignal } = {},
+    options: {
+      maxFiles?: number;
+      maxEntries?: number;
+      maxWallMs?: number;
+      signal?: AbortSignal;
+    } = {},
   ): Promise<DiscoveryChunk> {
     const files: Array<{ file: string; stat: fs.Stats; precise: fs.BigIntStats }> = [];
     const startingVisited = this.visited;
     const startingErrors = this.errors;
     const maxFiles = Math.max(1, Math.min(options.maxFiles ?? 256, 1_024));
+    const maxEntries = options.maxEntries === undefined
+      ? Number.MAX_SAFE_INTEGER
+      : Math.max(1, Math.min(options.maxEntries, 16_384));
+    const maxWallMs = options.maxWallMs === undefined
+      ? Number.POSITIVE_INFINITY
+      : Math.max(1, Math.min(options.maxWallMs, 100));
+    const collectStartedAt = performance.now();
     let stepsSinceYield = 0;
     let yields = 0;
     let lastYieldAt: string | null = null;
     while (
       !this.finished &&
       files.length < maxFiles &&
+      this.visited - startingVisited < maxEntries &&
+      performance.now() - collectStartedAt < maxWallMs &&
       !options.signal?.aborted &&
       budget.canContinue()
     ) {

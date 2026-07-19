@@ -7,7 +7,11 @@ import type { Readable } from "node:stream";
 import { fileURLToPath } from "node:url";
 
 import { LocalEventBuffer } from "../../packages/collector-cli/src/buffer";
-import { captureBaselineStatus } from "../../packages/collector-cli/src/capture-baseline";
+import {
+  AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP,
+  captureBaselineStatus,
+  type CaptureBaselineStatus,
+} from "../../packages/collector-cli/src/capture-baseline";
 import {
   codexReconciliationStatus,
   runCodexReconciliationMaintenance,
@@ -103,10 +107,17 @@ export type ResourceSandbox = {
 };
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
-// Two sources each require two complete 1,001-file sweeps at 256 files per
-// discovery chunk, followed by at most eight capture/replay quiet sweeps.
-// This is a fixture-derived hard ceiling, not a wall-clock relaxation.
-const MAX_DISCOVERY_CADENCES = 2 * 2 * Math.ceil(1_001 / 256) + 8;
+const HISTORICAL_FILES_PER_SOURCE = 1_200;
+const RECENT_BASELINE_CODEX_FILES = 200;
+const BASELINE_FIXTURE_CODEX_GENERATIONS = RECENT_BASELINE_CODEX_FILES + 1;
+const BASELINE_FIXTURE_CLAUDE_GENERATIONS = HISTORICAL_FILES_PER_SOURCE + 1;
+// Both sources require two stable sweeps. Alternating source priority means a
+// cadence may spend its budget on only one source, so the safe deterministic
+// ceiling is the sum of both chunk counts plus mutation/replay quiet sweeps.
+const MAX_DISCOVERY_CADENCES = 2 * (
+  Math.ceil(BASELINE_FIXTURE_CODEX_GENERATIONS / AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP) +
+  Math.ceil(BASELINE_FIXTURE_CLAUDE_GENERATIONS / AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP)
+) + 12;
 
 function metadataPrivacyFixture() {
   const fixture = JSON.parse(
@@ -581,8 +592,6 @@ function installTemporaryEventMutationAudit(buffer: LocalEventBuffer) {
   `);
 }
 
-const HISTORICAL_FILES_PER_SOURCE = 1_001;
-
 function syntheticUuid(prefix: "codex" | "claude", index: number) {
   const head = prefix === "codex" ? "019d0000" : "019c0000";
   return `${head}-0000-7000-8000-${String(index).padStart(12, "0")}`;
@@ -631,6 +640,14 @@ function writeFirstBootFixtures(sandbox: ResourceSandbox) {
   fs.writeFileSync(recentRollout, `${rollout.map((entry) => JSON.stringify(entry)).join("\n")}\n`, {
     mode: 0o600,
   });
+  for (let index = 0; index < RECENT_BASELINE_CODEX_FILES; index += 1) {
+    const sessionId = `019e6100-0000-7000-8000-${String(index).padStart(12, "0")}`;
+    fs.writeFileSync(
+      path.join(rolloutDay, `rollout-baseline-${sessionId}.jsonl`),
+      `${JSON.stringify({ type: "response_item", payload: { baselineFixture: index } })}\n`,
+      { mode: 0o600 },
+    );
+  }
 
   const oldRolloutDay = path.join(sandbox.codexSessions, "2020", "01", "01");
   fs.mkdirSync(oldRolloutDay, { recursive: true, mode: 0o700 });
@@ -689,6 +706,19 @@ function writeFirstBootFixtures(sandbox: ResourceSandbox) {
     );
     fs.utimesSync(file, oldMtime, oldMtime);
   }
+  const nestedNoncandidateDirectory = path.join(
+    sandbox.claudeProjects,
+    "nested-noncandidates",
+    "deeper",
+  );
+  fs.mkdirSync(nestedNoncandidateDirectory, { recursive: true, mode: 0o700 });
+  for (let index = 0; index < 300; index += 1) {
+    fs.writeFileSync(
+      path.join(nestedNoncandidateDirectory, `ignored-${String(index).padStart(4, "0")}.txt`),
+      "ignored\n",
+      { mode: 0o600 },
+    );
+  }
 
   return {
     observedAt,
@@ -705,6 +735,9 @@ function writeFirstBootFixtures(sandbox: ResourceSandbox) {
     ),
     recentBytes: fs.statSync(recentRollout).size + fs.statSync(recentTranscript).size,
     oldFiles: HISTORICAL_FILES_PER_SOURCE * 2,
+    baselineCodexGenerations: BASELINE_FIXTURE_CODEX_GENERATIONS,
+    baselineClaudeGenerations: BASELINE_FIXTURE_CLAUDE_GENERATIONS,
+    nestedNoncandidateEntries: 300,
   };
 }
 
@@ -985,12 +1018,16 @@ export async function runNoChangeConstantWorkContract(
     const directoryObservation = activeDirectoryObserver.status();
 
     const bootRuns = [...initialDrain];
+    const baselineSnapshots: CaptureBaselineStatus[] = [
+      captureBaselineStatus(buffer.database),
+    ];
     for (
       let cadence = 0;
       cadence < MAX_DISCOVERY_CADENCES && captureBaselineStatus(buffer.database).status !== "complete";
       cadence += 1
     ) {
       bootRuns.push(await maintenance.runRecent());
+      baselineSnapshots.push(captureBaselineStatus(buffer.database));
     }
     const stableBefore = eventMutationCounts(buffer);
     const stableRun = await maintenance.runRecent();
@@ -1005,6 +1042,37 @@ export async function runNoChangeConstantWorkContract(
     }
 
     const finalBootRun = bootRuns.at(-1)!;
+    const sourcePending = (snapshot: CaptureBaselineStatus, source: "codex" | "claude_code") => {
+      const run = snapshot.sources.find((entry) => entry.source === source)?.latestRun;
+      return run ? Math.max(0, run.filesDiscovered - run.filesValidated) : 0;
+    };
+    const maxCodexPendingMetadata = Math.max(
+      ...baselineSnapshots.map((snapshot) => sourcePending(snapshot, "codex")),
+      ...bootRuns.map((run) => run.rollout.baselinePendingMetadataPeak ?? 0),
+    );
+    const maxClaudePendingMetadata = Math.max(
+      ...baselineSnapshots.map((snapshot) => sourcePending(snapshot, "claude_code")),
+      ...bootRuns.map((run) => run.transcript.baselinePendingMetadataPeak ?? 0),
+    );
+    const maxAggregatePendingMetadata = Math.max(
+      maxCodexPendingMetadata + maxClaudePendingMetadata,
+      ...baselineSnapshots.map((snapshot) => snapshot.progress.pendingMetadata),
+    );
+    const pendingMetadataWithinCap =
+      maxCodexPendingMetadata <= AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP &&
+      maxClaudePendingMetadata <= AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP &&
+      maxAggregatePendingMetadata <= AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP * 2;
+    const codexValidatedBeforeComplete = baselineSnapshots.some((snapshot) => {
+      const source = snapshot.sources.find((entry) => entry.source === "codex");
+      return source?.status === "in_progress" && Number(source.latestRun?.filesValidated ?? 0) > 0;
+    });
+    const claudeValidatedBeforeComplete = baselineSnapshots.some((snapshot) => {
+      const source = snapshot.sources.find((entry) => entry.source === "claude_code");
+      return source?.status === "in_progress" && Number(source.latestRun?.filesValidated ?? 0) > 0;
+    });
+    const baselineProgressFair = codexValidatedBeforeComplete && claudeValidatedBeforeComplete;
+    const baselineCadenceBounded = bootRuns.length <= MAX_DISCOVERY_CADENCES + initialDrain.length;
+    const startupReadinessUpperBoundSeconds = MAX_DISCOVERY_CADENCES * 5;
     const firstBootRecentOnly =
       captureBaselineStatus(buffer.database).status === "complete" &&
       bootRuns.every((run) =>
@@ -1016,8 +1084,8 @@ export async function runNoChangeConstantWorkContract(
         run.rawEventWrites === 0 &&
         run.rollout.bytesRead + run.transcript.bytesRead === 0
       ) &&
-      finalBootRun.rollout.excludedGenerations === 1 &&
-      finalBootRun.transcript.excludedGenerations >= 1;
+      finalBootRun.rollout.excludedGenerations === fixture.baselineCodexGenerations &&
+      finalBootRun.transcript.excludedGenerations === fixture.baselineClaudeGenerations;
     const oldContentReadsAtBoot = bootRuns.reduce(
       (total, run) => total + run.rollout.filesRead + run.transcript.filesRead,
       0,
@@ -1694,7 +1762,12 @@ export async function runNoChangeConstantWorkContract(
 
     const passed =
       fixture.oldFiles >= 2_000 &&
+      fixture.baselineCodexGenerations >= 200 &&
+      fixture.baselineClaudeGenerations >= 1_200 &&
       firstBootRecentOnly &&
+      pendingMetadataWithinCap &&
+      baselineProgressFair &&
+      baselineCadenceBounded &&
       oldContentReadsAtBoot === 0 &&
       unchangedCoalescedCycle &&
       coalescingProved &&
@@ -1724,6 +1797,22 @@ export async function runNoChangeConstantWorkContract(
       counters,
       measurements: {
         syntheticHistoricalFiles: fixture.oldFiles,
+        baselineCodexGenerations: fixture.baselineCodexGenerations,
+        baselineClaudeGenerations: fixture.baselineClaudeGenerations,
+        nestedNoncandidateEntries: fixture.nestedNoncandidateEntries,
+        baselineCadences: bootRuns.length,
+        baselineCadenceLimit: MAX_DISCOVERY_CADENCES + initialDrain.length,
+        startupReadinessUpperBoundSeconds,
+        maximumStartupDutyCycle: 0.04,
+        maxCodexPendingMetadata,
+        maxClaudePendingMetadata,
+        maxAggregatePendingMetadata,
+        pendingMetadataPerSourceCap: AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP,
+        pendingMetadataAggregateCap: AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP * 2,
+        pendingMetadataWithinCap,
+        codexValidatedBeforeComplete,
+        claudeValidatedBeforeComplete,
+        baselineProgressFair,
         firstBootRecentOnly,
         oldContentReadsAtBoot,
         initialEventsAppended: firstRun.rawEventWrites,

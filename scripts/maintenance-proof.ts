@@ -11,17 +11,33 @@ import {
   runCodexReconciliationMaintenance,
 } from "../packages/collector-cli/src/codex-reconciliation";
 import {
+  AUTOMATIC_BASELINE_STARTUP_INTERVAL_MS,
+  AUTOMATIC_MAINTENANCE_NORMAL_INTERVAL_MS,
+  AutomaticMaintenanceCadence,
   CoalescingMaintenanceScheduler,
   CollectorMaintenance,
   drainProjectionMigration,
   requestAutomaticRecentMaintenance,
   runRepoEnrichmentMaintenance,
   runRepricingMaintenance,
+  type AutomaticMaintenanceCadenceTimer,
   type CollectorMaintenanceRunResult,
 } from "../packages/collector-cli/src/maintenance";
-import { RolloutTailer, type RolloutScanResult } from "../packages/collector-cli/src/rollout-tailer";
+import {
+  beginAutomaticCaptureBaseline,
+  captureBaselineStatus,
+  completeAutomaticCaptureBaseline,
+  stageAutomaticCaptureBaselineObservation,
+  type CaptureBaselineStatus,
+} from "../packages/collector-cli/src/capture-baseline";
+import {
+  RolloutTailer,
+  type RolloutScanOptions,
+  type RolloutScanResult,
+} from "../packages/collector-cli/src/rollout-tailer";
 import {
   TranscriptTailer,
+  type TranscriptScanOptions,
   type TranscriptScanResult,
 } from "../packages/collector-cli/src/transcript-tailer";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
@@ -241,6 +257,295 @@ async function proveStoppingCancelsPendingFollowup() {
     calls === 1 && status.runCount === 1 && !status.pending && !status.inFlight && !status.accepting,
     { calls, ...status },
   );
+}
+
+function fakeBaselineStatus(
+  state: CaptureBaselineStatus["progress"]["state"],
+): CaptureBaselineStatus {
+  const complete = state === "complete";
+  return {
+    status: complete ? "complete" : "blocked",
+    reason: complete ? null : "capture_baseline_in_progress",
+    progress: {
+      state,
+      sourcesComplete: complete ? 2 : 0,
+      sourcesInProgress: state === "in_progress" ? 2 : 0,
+      sourcesFailed: state === "failed" || state === "ambiguous" ? 1 : 0,
+      filesDiscovered: 0,
+      filesValidated: 0,
+      filesBaselined: 0,
+      pendingMetadata: 0,
+      pendingMetadataPerSourceCap: 64,
+      pendingMetadataAggregateCap: 128,
+      deferredSources: complete ? 0 : 2,
+    },
+    sources: [],
+  };
+}
+
+function fakeCadenceTimer() {
+  let now = Date.parse("2026-07-19T12:00:00.000Z");
+  let nextId = 1;
+  const entries = new Map<number, { at: number; callback: () => void }>();
+  const timer: AutomaticMaintenanceCadenceTimer = {
+    now: () => now,
+    setTimeout: (callback, delayMs) => {
+      const id = nextId++;
+      entries.set(id, { at: now + delayMs, callback });
+      return id;
+    },
+    clearTimeout: (handle) => entries.delete(Number(handle)),
+  };
+  return {
+    timer,
+    advance: async (milliseconds: number) => {
+      now += milliseconds;
+      for (;;) {
+        const due = [...entries.entries()]
+          .filter(([, entry]) => entry.at <= now)
+          .sort((left, right) => left[1].at - right[1].at)[0];
+        if (!due) break;
+        entries.delete(due[0]);
+        due[1].callback();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    },
+  };
+}
+
+async function proveAdaptiveBaselineCadence() {
+  const clock = fakeCadenceTimer();
+  let state: CaptureBaselineStatus["progress"]["state"] = "not_established";
+  let calls = 0;
+  const scheduler = new CoalescingMaintenanceScheduler(async () => {
+    calls += 1;
+    state = calls === 1 ? "in_progress" : "ambiguous";
+    return fakeRun();
+  });
+  const cadence = new AutomaticMaintenanceCadence(
+    scheduler,
+    () => fakeBaselineStatus(state),
+    { timer: clock.timer },
+  );
+  cadence.start();
+  const initial = cadence.status();
+  await clock.advance(4_999);
+  const beforeBoot = cadence.status();
+  await clock.advance(1);
+  const afterBoot = cadence.status();
+  await clock.advance(4_999);
+  const beforeStartupFollowup = cadence.status();
+  await clock.advance(1);
+  const afterAmbiguity = cadence.status();
+  await clock.advance(59_999);
+  const beforeNormalRetry = cadence.status();
+  cadence.stop();
+  check(
+    "baseline_followups_use_one_bounded_startup_timer_then_ambiguous_returns_to_normal",
+    initial.retryClass === "boot" &&
+      initial.nextRetryAt !== null &&
+      beforeBoot.triggerCount === 0 &&
+      afterBoot.triggerCount === 1 &&
+      afterBoot.retryClass === "startup" &&
+      beforeStartupFollowup.triggerCount === 1 &&
+      calls === 2 &&
+      afterAmbiguity.retryClass === "normal" &&
+      afterAmbiguity.nextRetryAt !== null &&
+      beforeNormalRetry.triggerCount === 2 &&
+      scheduler.status().maxConcurrentJobs === 1 &&
+      scheduler.status().overlappingJobs === 0 &&
+      afterAmbiguity.maximumStartupDutyCycle === 0.04 &&
+      AUTOMATIC_BASELINE_STARTUP_INTERVAL_MS === 5_000 &&
+      AUTOMATIC_MAINTENANCE_NORMAL_INTERVAL_MS === 60_000,
+    { calls, initial, afterAmbiguity, beforeNormalRetry, scheduler: scheduler.status() },
+  );
+
+  const failureClock = fakeCadenceTimer();
+  let failures = 0;
+  const failingScheduler = new CoalescingMaintenanceScheduler(async () => {
+    failures += 1;
+    throw new Error("cadence-proof-failure");
+  });
+  const failingCadence = new AutomaticMaintenanceCadence(
+    failingScheduler,
+    () => fakeBaselineStatus("in_progress"),
+    { timer: failureClock.timer },
+  );
+  failingCadence.start();
+  await failureClock.advance(5_000);
+  await failureClock.advance(59_999);
+  const failedStatus = failingCadence.status();
+  failingCadence.stop();
+  check(
+    "failed_maintenance_never_spins_on_startup_cadence",
+    failures === 1 &&
+      failedStatus.failedTriggers === 1 &&
+      failedStatus.retryClass === "normal" &&
+      failingScheduler.status().failedRuns === 1,
+    { failures, cadence: failedStatus, scheduler: failingScheduler.status() },
+  );
+}
+
+async function proveDurableSlowSourceFairness(root: string) {
+  const buffer = new LocalEventBuffer(path.join(root, "source-fairness.sqlite"));
+  const startedAt = new Date().toISOString();
+  for (const source of ["codex", "claude_code"] as const) {
+    beginAutomaticCaptureBaseline(buffer.database, source, {
+      startedAt,
+      filesDiscovered: 0,
+    });
+  }
+  const order: string[] = [];
+  let codexProgress = 0;
+  let claudeProgress = 0;
+  const makeRollout = () => ({
+    scan: async (options: RolloutScanOptions) => {
+      order.push("codex");
+      const result = emptyRollout();
+      const budget = options.automatic!.budget;
+      if (budget.canContinue()) {
+        codexProgress += 1;
+        // Emulate a slow source exhausting the shared cadence without burning
+        // CPU or depending on host wall-clock speed.
+        budget.recordSlice({ bytesRead: 512 * 1024, recordsParsed: 0, eventsAppended: 0 });
+      }
+      result.exhaustive = false;
+      result.deferredGenerations = 1;
+      result.automaticBudget = budget.status();
+      return result;
+    },
+    close: () => undefined,
+  });
+  const makeTranscript = () => ({
+    scan: async (options: TranscriptScanOptions) => {
+      order.push("claude_code");
+      const result = emptyTranscript();
+      const budget = options.automatic!.budget;
+      if (budget.canContinue()) claudeProgress += 1;
+      result.exhaustive = false;
+      result.deferredGenerations = 1;
+      result.automaticBudget = budget.status();
+      return result;
+    },
+    close: () => undefined,
+  });
+  try {
+    const first = new CollectorMaintenance(
+      buffer,
+      makeRollout() as unknown as RolloutTailer,
+      makeTranscript() as unknown as TranscriptTailer,
+    );
+    await first.runRecent();
+    first.close();
+    const afterFirst = [...order];
+    const second = new CollectorMaintenance(
+      buffer,
+      makeRollout() as unknown as RolloutTailer,
+      makeTranscript() as unknown as TranscriptTailer,
+    );
+    await second.runRecent();
+    const statusText = JSON.stringify(second.status());
+    second.close();
+    check(
+      "slow_source_turn_is_fair_and_durable_across_maintenance_restart",
+      afterFirst[0] === "codex" &&
+        afterFirst[1] === "claude_code" &&
+        order[2] === "claude_code" &&
+        order[3] === "codex" &&
+        codexProgress >= 1 &&
+        claudeProgress >= 1 &&
+        !statusText.includes(root),
+      { order, codexProgress, claudeProgress, statusPathFree: !statusText.includes(root) },
+    );
+  } finally {
+    buffer.close();
+  }
+}
+
+async function proveCrashResumeDropsOnlyEphemeralPending(root: string) {
+  const ledger = path.join(root, "baseline-crash-resume.sqlite");
+  const codexRoot = path.join(root, "baseline-crash-codex");
+  const claudeRoot = path.join(root, "baseline-crash-claude");
+  const [year, month, day] = new Date().toISOString().slice(0, 10).split("-");
+  const codexDay = path.join(codexRoot, year!, month!, day!);
+  fs.mkdirSync(codexDay, { recursive: true });
+  fs.mkdirSync(claudeRoot, { recursive: true });
+  const files: string[] = [];
+  for (let index = 0; index < 64; index += 1) {
+    const file = path.join(codexDay, `rollout-crash-${String(index).padStart(4, "0")}.jsonl`);
+    fs.writeFileSync(file, "{}\n");
+    files.push(file);
+  }
+  await new Promise<void>((resolve) => setTimeout(resolve, 2));
+  const buffer = new LocalEventBuffer(ledger);
+  const startedAt = new Date().toISOString();
+  const codex = beginAutomaticCaptureBaseline(buffer.database, "codex", {
+    startedAt,
+    filesDiscovered: 0,
+  });
+  if (!codex.latestRun) throw new Error("crash_resume_codex_run_missing");
+  for (let index = 0; index < 7; index += 1) {
+    const precise = fs.lstatSync(files[index]!, { bigint: true });
+    stageAutomaticCaptureBaselineObservation(buffer.database, "codex", {
+      runId: codex.latestRun.runId,
+      observedAt: new Date().toISOString(),
+      filesDiscovered: 64,
+      filesValidated: index + 1,
+      observation: {
+        path: files[index]!,
+        device: precise.dev,
+        inode: precise.ino,
+        size: precise.size,
+        birthtimeNs: precise.birthtimeNs,
+      },
+    });
+  }
+  const claude = beginAutomaticCaptureBaseline(buffer.database, "claude_code", {
+    startedAt,
+    filesDiscovered: 0,
+  });
+  if (!claude.latestRun) throw new Error("crash_resume_claude_run_missing");
+  completeAutomaticCaptureBaseline(buffer.database, "claude_code", {
+    runId: claude.latestRun.runId,
+    completedAt: new Date().toISOString(),
+  });
+  const before = captureBaselineStatus(buffer.database);
+  const maintenance = new CollectorMaintenance(
+    buffer,
+    new RolloutTailer(buffer, codexRoot, () => []),
+    new TranscriptTailer(buffer, claudeRoot),
+  );
+  try {
+    for (let cadence = 0; cadence < 6 && captureBaselineStatus(buffer.database).status !== "complete"; cadence += 1) {
+      await maintenance.runRecent();
+    }
+    const after = captureBaselineStatus(buffer.database);
+    const codexAfter = after.sources.find((source) => source.source === "codex")?.latestRun;
+    const events = (buffer.database
+      .prepare(`select count(*) as count from buffered_events`)
+      .get() as { count: number }).count;
+    check(
+      "crash_resume_rewalks_inactive_namespace_without_promoting_lost_pending",
+      before.status === "blocked" &&
+        before.progress.pendingMetadata === 57 &&
+        after.status === "complete" &&
+        codexAfter?.filesDiscovered === codexAfter?.filesValidated &&
+        codexAfter?.filesValidated === 135 &&
+        codexAfter?.filesBaselined === 64 &&
+        events === 0,
+      {
+        beforeState: before.progress.state,
+        beforePending: before.progress.pendingMetadata,
+        afterState: after.progress.state,
+        discovered: codexAfter?.filesDiscovered,
+        validated: codexAfter?.filesValidated,
+        events,
+      },
+    );
+  } finally {
+    maintenance.close();
+    buffer.close();
+  }
 }
 
 async function proveProjectionDutyCycle(){
@@ -574,6 +879,7 @@ async function proveIntegratedIdle(
 async function main() {
   await proveCoalescing();
   await proveStoppingCancelsPendingFollowup();
+  await proveAdaptiveBaselineCadence();
   await proveProjectionDutyCycle();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-maintenance-proof-"));
   const ledger = path.join(root, "ledger.sqlite");
@@ -583,6 +889,8 @@ async function main() {
   fs.mkdirSync(transcriptRoot, { recursive: true });
   let buffer = new LocalEventBuffer(ledger);
   try {
+    await proveDurableSlowSourceFairness(root);
+    await proveCrashResumeDropsOnlyEphemeralPending(root);
     // Reopening proves additive schema/trigger creation is idempotent.
     buffer.close();
     buffer = new LocalEventBuffer(ledger);

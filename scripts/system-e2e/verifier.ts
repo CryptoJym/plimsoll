@@ -248,8 +248,8 @@ function verifyMeasurements(
   exactKeys(idle, ["rawEventWrites", "rawEventRewrites", "filesOpened", "fileBytesRead", "fullHistoryFileReads", "overlappingJobs"], "idle measurements");
   assert.equal(integer(idle.rawEventWrites, "history fixture writes"), 2);
   assert.equal(integer(idle.rawEventRewrites, "history fixture rewrites"), 0);
-  assert.equal(integer(idle.fullHistoryFileReads, "explicit history reads"), 2_012);
-  assert.equal(integer(idle.filesOpened, "history files opened"), 2_016);
+  assert.equal(integer(idle.fullHistoryFileReads, "explicit history reads"), 2_610);
+  assert.equal(integer(idle.filesOpened, "history files opened"), 2_614);
   assert.ok(integer(idle.fileBytesRead, "history bytes read") > 0);
   assert.equal(integer(idle.overlappingJobs, "overlapping history jobs"), 0);
   const firstBootScenario = resourceScenarios
@@ -266,6 +266,22 @@ function verifyMeasurements(
   assert.equal(integer(firstBoot.replayEventsAppended, "replay appended events"), 0);
   assert.equal(integer(firstBoot.replayRawEventWrites, "replay raw event writes"), 0);
   assert.equal(integer(firstBoot.replayEventMutationsInserted, "replay inserted mutations"), 0);
+  assert.ok(integer(firstBoot.baselineCodexGenerations, "baseline Codex generations") >= 200);
+  assert.ok(integer(firstBoot.baselineClaudeGenerations, "baseline Claude generations") >= 1_200);
+  assert.ok(
+    integer(firstBoot.baselineCadences, "baseline cadences") <=
+      integer(firstBoot.baselineCadenceLimit, "baseline cadence limit"),
+  );
+  assert.equal(number(firstBoot.maximumStartupDutyCycle, "startup duty cycle"), 0.04);
+  assert.ok(integer(firstBoot.maxCodexPendingMetadata, "Codex pending metadata") <= 64);
+  assert.ok(integer(firstBoot.maxClaudePendingMetadata, "Claude pending metadata") <= 64);
+  assert.ok(integer(firstBoot.maxAggregatePendingMetadata, "aggregate pending metadata") <= 128);
+  assert.equal(integer(firstBoot.pendingMetadataPerSourceCap, "pending metadata source cap"), 64);
+  assert.equal(integer(firstBoot.pendingMetadataAggregateCap, "pending metadata aggregate cap"), 128);
+  assert.equal(firstBoot.pendingMetadataWithinCap, true);
+  assert.equal(firstBoot.codexValidatedBeforeComplete, true);
+  assert.equal(firstBoot.claudeValidatedBeforeComplete, true);
+  assert.equal(firstBoot.baselineProgressFair, true);
   assert.equal(firstBoot.inaccessibleItemsBlockPromotion, true);
   assert.equal(firstBoot.failedAttemptDisclosedAfterComplete, true);
   assert.equal(firstBoot.unchangedParseFailuresRetained, true);

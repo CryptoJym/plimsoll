@@ -13,6 +13,9 @@ import {
   type JsonlTailerIo,
 } from "./jsonl-byte-tailer";
 import {
+  AUTOMATIC_DISCOVERY_ENTRY_CAP,
+  AUTOMATIC_DISCOVERY_WALL_MS,
+  AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP,
   beginAutomaticCaptureBaseline,
   captureBaselineStatus,
   classifyCaptureBaselineFile,
@@ -81,6 +84,7 @@ export type RolloutScanResult = {
   excludedGenerations: number;
   excludedBytes: number;
   deferredGenerations: number;
+  baselinePendingMetadataPeak?: number;
   aborted: boolean;
   lastYieldAt: string | null;
   automaticBudget: CaptureBudgetStatus | null;
@@ -303,6 +307,7 @@ export class RolloutTailer {
     runId: string;
     filesDiscovered: number;
     filesValidated: number;
+    resumeValidationDebt: number;
     cutoffMs: number;
     sweepsCompleted: number;
     newGenerationsThisSweep: number;
@@ -418,6 +423,8 @@ export class RolloutTailer {
           runId: began.latestRun.runId,
           filesDiscovered: began.latestRun.filesDiscovered,
           filesValidated: began.latestRun.filesValidated,
+          resumeValidationDebt:
+            began.latestRun.filesDiscovered - began.latestRun.filesValidated,
           cutoffMs: Date.parse(began.latestRun.startedAt),
           sweepsCompleted: 0,
           newGenerationsThisSweep: 0,
@@ -425,11 +432,28 @@ export class RolloutTailer {
       }
 
       const attempt = this.baselineAttempt;
-      const chunk = await attempt.discovery.collect(automatic.budget, {
-        signal: options.signal,
-      });
+      const chunk = attempt.pendingFiles.length === 0
+        ? await attempt.discovery.collect(automatic.budget, {
+            signal: options.signal,
+            maxFiles: AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP,
+            maxEntries: AUTOMATIC_DISCOVERY_ENTRY_CAP,
+            maxWallMs: AUTOMATIC_DISCOVERY_WALL_MS,
+          })
+        : {
+            files: [], entriesVisited: 0, errors: 0, done: false,
+            limitReached: false, yields: 0, lastYieldAt: null,
+          };
       attempt.pendingFiles.push(...chunk.files);
-      attempt.filesDiscovered += chunk.files.length;
+      result.baselinePendingMetadataPeak = Math.max(
+        result.baselinePendingMetadataPeak ?? 0,
+        attempt.pendingFiles.length,
+      );
+      if (attempt.pendingFiles.length > AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP) {
+        throw new Error("automatic_baseline_pending_metadata_cap_exceeded");
+      }
+      const resumedFiles = Math.min(attempt.resumeValidationDebt, chunk.files.length);
+      attempt.resumeValidationDebt -= resumedFiles;
+      attempt.filesDiscovered += chunk.files.length - resumedFiles;
       result.filesSeen = chunk.files.length;
       result.activity.discoveryEntries = chunk.entriesVisited;
       result.cooperativeYields += chunk.yields;
@@ -478,6 +502,7 @@ export class RolloutTailer {
             filesValidated: attempt.filesValidated,
             statErrors: result.statErrors,
           });
+          attempt.discovery.close();
           this.baselineAttempt = null;
           result.exhaustive = false;
           result.automaticBudget = automatic.budget.status();
@@ -802,7 +827,9 @@ export class RolloutTailer {
     if (attempt.pendingFiles.length === 0 && !attempt.discoveryDone) {
       const chunk = await attempt.discovery.collect(budget, {
         signal: options.signal,
-        maxFiles: 256,
+        maxFiles: AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP,
+        maxEntries: AUTOMATIC_DISCOVERY_ENTRY_CAP,
+        maxWallMs: AUTOMATIC_DISCOVERY_WALL_MS,
       });
       attempt.pendingFiles.push(...chunk.files);
       attempt.discoveryDone = chunk.done;

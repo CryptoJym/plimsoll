@@ -322,6 +322,8 @@ export async function runBoundedCaptureContract(
   const preinstall = path.join(day, `rollout-preinstall-${uuid(1)}.jsonl`);
   fs.writeFileSync(preinstall, "", { mode: 0o600 });
   fs.truncateSync(preinstall, PREINSTALL_BYTES);
+  const recoveryPreinstall = path.join(day, `rollout-recovery-${uuid(8)}.jsonl`);
+  fs.writeFileSync(recoveryPreinstall, "{}\n", { mode: 0o600 });
   const externalClaudeDirectory = path.join(root, "external-claude-directory");
   fs.mkdirSync(externalClaudeDirectory, { recursive: true, mode: 0o700 });
   fs.writeFileSync(path.join(externalClaudeDirectory, "hidden.jsonl"), "{}\n", { mode: 0o600 });
@@ -331,15 +333,17 @@ export async function runBoundedCaptureContract(
   await new Promise<void>((resolve) => setTimeout(resolve, 2));
 
   let preinstallBodyReads = 0;
+  let recoveryBodyReads = 0;
   let claudePreinstallBodyReads = 0;
   let totalBodyOpens = 0;
   let totalBodyBytesRead = 0;
   const io = {
     ...DEFAULT_JSONL_TAILER_IO,
     readTail: (...args: Parameters<typeof DEFAULT_JSONL_TAILER_IO.readTail>) => {
-      if (path.resolve(args[0]) === path.resolve(preinstall)) preinstallBodyReads += 1;
       const read = DEFAULT_JSONL_TAILER_IO.readTail(...args);
       if (read) {
+        if (path.resolve(args[0]) === path.resolve(preinstall)) preinstallBodyReads += 1;
+        if (path.resolve(args[0]) === path.resolve(recoveryPreinstall)) recoveryBodyReads += 1;
         totalBodyOpens += 1;
         totalBodyBytesRead += read.bytesRead;
       }
@@ -380,7 +384,7 @@ export async function runBoundedCaptureContract(
     baselineRun.rawEventWrites === 0 &&
     baselineRun.rollout.bytesRead === 0 &&
     preinstallBodyReads === 0 &&
-    excludedRun.rollout.excludedGenerations === 1 &&
+    excludedRun.rollout.excludedGenerations === 2 &&
     irrelevantSymlinkBaselineSafe;
 
   fs.appendFileSync(preinstall, `${tokenLine(uuid(1), 1)}\n`);
@@ -390,6 +394,35 @@ export async function runBoundedCaptureContract(
     growthRun.rollout.eventsAppended === 0 &&
     preinstallBodyReads === 0;
   const automaticPreinstallBodyReads = preinstallBodyReads;
+
+  fs.truncateSync(recoveryPreinstall, 0);
+  const ambiguityRun = await maintenance.runRecent();
+  const ambiguityStatus = captureBaselineStatus(buffer.database);
+  const truncationBlockedWithoutRead =
+    ambiguityStatus.progress.state === "ambiguous" &&
+    ambiguityRun.rawEventWrites === 0 &&
+    recoveryBodyReads === 0;
+  fs.unlinkSync(recoveryPreinstall);
+  fs.writeFileSync(
+    recoveryPreinstall,
+    `${JSON.stringify({ type: "session_meta", payload: { id: uuid(8) } })}\n${tokenLine(uuid(8), 1)}\n`,
+    { mode: 0o600 },
+  );
+  const recoveryRuns: Array<Awaited<ReturnType<CollectorMaintenance["runRecent"]>>> = [];
+  for (let run = 0; run < 8; run += 1) {
+    recoveryRuns.push(await maintenance.runRecent());
+    const count = (buffer.database
+      .prepare(`select count(*) as count from buffered_events where session_id = ?`)
+      .get(uuid(8)) as { count: number }).count;
+    if (count === 1 && captureBaselineStatus(buffer.database).status === "complete") break;
+  }
+  await maintenance.runRecent();
+  const replacementRecoveredExactlyOnce =
+    captureBaselineStatus(buffer.database).status === "complete" &&
+    (buffer.database.prepare(`select count(*) as count from buffered_events where session_id = ?`)
+      .get(uuid(8)) as { count: number }).count === 1 &&
+    recoveryBodyReads === 1 &&
+    recoveryRuns.some((run) => run.rollout.eventsAppended === 1);
 
   const denseSession = uuid(2);
   const dense = path.join(day, `rollout-dense-${denseSession}.jsonl`);
@@ -528,7 +561,7 @@ export async function runBoundedCaptureContract(
   const historyTruth =
     !fullCoverage.promoted &&
     historyCoverageStatus(buffer.database).status === "incomplete" &&
-    exclusionAfterFull?.excludedGenerations === 1;
+    exclusionAfterFull?.excludedGenerations === 2;
 
   const statusResponse = await fetch(`http://127.0.0.1:${port}/status`);
   const statusText = await statusResponse.text();
@@ -568,7 +601,8 @@ export async function runBoundedCaptureContract(
 
   counters.filesOpened = totalBodyOpens;
   counters.fileBytesRead = totalBodyBytesRead;
-  counters.rawEventWrites = denseTotals.events + (rotationExactlyOnce ? 2 : 0);
+  counters.rawEventWrites = denseTotals.events + (rotationExactlyOnce ? 2 : 0) +
+    (replacementRecoveredExactlyOnce ? 1 : 0);
   counters.maintenanceRuns = latencies.length + adversarialReceipts.length;
   counters.listenersCreated = 3;
   const passed =
@@ -576,6 +610,8 @@ export async function runBoundedCaptureContract(
     denseBytes >= 13 * 1024 * 1024 &&
     baselineNoBody &&
     preinstallGrowthExcluded &&
+    truncationBlockedWithoutRead &&
+    replacementRecoveredExactlyOnce &&
     firstCadenceBounded &&
     denseExact &&
     restartPerformed &&
@@ -612,6 +648,9 @@ export async function runBoundedCaptureContract(
       ignoredAliasEntriesVisited: discoveryEntryPolicy.ignoredAliasEntriesVisited,
       claudePreinstallBodyReads,
       preinstallGrowthExcluded,
+      truncationBlockedWithoutRead,
+      replacementRecoveredExactlyOnce,
+      recoveryBodyReads,
       firstCadenceBounded,
       denseExact,
       crashResumeReopenedLedger: restartPerformed,
