@@ -246,9 +246,9 @@ function verifyMeasurements(
 
   const idle = object(measurements.idle, "idle measurements");
   exactKeys(idle, ["rawEventWrites", "rawEventRewrites", "filesOpened", "fileBytesRead", "fullHistoryFileReads", "overlappingJobs"], "idle measurements");
-  assert.equal(integer(idle.rawEventWrites, "history fixture writes"), 4);
+  assert.equal(integer(idle.rawEventWrites, "history fixture writes"), 2);
   assert.equal(integer(idle.rawEventRewrites, "history fixture rewrites"), 0);
-  assert.equal(integer(idle.fullHistoryFileReads, "explicit history reads"), 2_010);
+  assert.equal(integer(idle.fullHistoryFileReads, "explicit history reads"), 2_012);
   assert.equal(integer(idle.filesOpened, "history files opened"), 2_016);
   assert.ok(integer(idle.fileBytesRead, "history bytes read") > 0);
   assert.equal(integer(idle.overlappingJobs, "overlapping history jobs"), 0);
@@ -261,6 +261,11 @@ function verifyMeasurements(
   assert.equal(integer(firstBoot.oldContentReadsAtBoot, "old boot reads"), 0);
   assert.equal(firstBoot.restartZeroWork, true);
   assert.equal(firstBoot.appendedExactlyOnce, true);
+  assert.equal(integer(firstBoot.replayRolloutFilesRead, "replay rollout reads"), 1);
+  assert.equal(integer(firstBoot.replayTranscriptFilesRead, "replay transcript reads"), 1);
+  assert.equal(integer(firstBoot.replayEventsAppended, "replay appended events"), 0);
+  assert.equal(integer(firstBoot.replayRawEventWrites, "replay raw event writes"), 0);
+  assert.equal(integer(firstBoot.replayEventMutationsInserted, "replay inserted mutations"), 0);
   assert.equal(firstBoot.inaccessibleItemsBlockPromotion, true);
   assert.equal(firstBoot.failedAttemptDisclosedAfterComplete, true);
   assert.equal(firstBoot.unchangedParseFailuresRetained, true);

@@ -1099,9 +1099,11 @@ async function main() {
   const idle = resourceReceipt.scenarios.find((row) => row.id === "no_change_constant_work");
   const dashboard = resourceReceipt.scenarios.find((row) => row.id === "dashboard_projection_budget");
   assert.equal(idle?.status, "pass");
-  assert.equal(idle?.counters.rawEventWrites, 4);
+  // Only the two post-baseline generations are inserted. Replaying their
+  // byte cursors is idempotent and must not inflate this durable write count.
+  assert.equal(idle?.counters.rawEventWrites, 2);
   assert.equal(idle?.counters.rawEventRewrites, 0);
-  assert.equal(idle?.counters.fullHistoryFileReads, 2_010);
+  assert.equal(idle?.counters.fullHistoryFileReads, 2_012);
   assert.equal(idle?.counters.filesOpened, 2_016);
   assert.ok((idle?.counters.fileBytesRead ?? 0) > 0);
   assert.equal(idle?.counters.overlappingJobs, 0);
@@ -1109,6 +1111,11 @@ async function main() {
   assert.equal(idle?.measurements.oldContentReadsAtBoot, 0);
   assert.equal(idle?.measurements.restartZeroWork, true);
   assert.equal(idle?.measurements.appendedExactlyOnce, true);
+  assert.equal(idle?.measurements.replayRolloutFilesRead, 1);
+  assert.equal(idle?.measurements.replayTranscriptFilesRead, 1);
+  assert.equal(idle?.measurements.replayEventsAppended, 0);
+  assert.equal(idle?.measurements.replayRawEventWrites, 0);
+  assert.equal(idle?.measurements.replayEventMutationsInserted, 0);
   assert.equal(idle?.measurements.inaccessibleItemsBlockPromotion, true);
   assert.equal(idle?.measurements.failedAttemptDisclosedAfterComplete, true);
   assert.equal(idle?.measurements.unchangedParseFailuresRetained, true);
