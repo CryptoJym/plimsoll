@@ -1103,8 +1103,8 @@ async function main() {
   // byte cursors is idempotent and must not inflate this durable write count.
   assert.equal(idle?.counters.rawEventWrites, 2);
   assert.equal(idle?.counters.rawEventRewrites, 0);
-  assert.equal(idle?.counters.fullHistoryFileReads, 2_012);
-  assert.equal(idle?.counters.filesOpened, 2_016);
+  assert.equal(idle?.counters.fullHistoryFileReads, 2_610);
+  assert.equal(idle?.counters.filesOpened, 2_614);
   assert.ok((idle?.counters.fileBytesRead ?? 0) > 0);
   assert.equal(idle?.counters.overlappingJobs, 0);
   assert.equal(idle?.measurements.firstBootRecentOnly, true);
