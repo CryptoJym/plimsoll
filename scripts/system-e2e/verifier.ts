@@ -246,7 +246,27 @@ function verifyMeasurements(
 
   const idle = object(measurements.idle, "idle measurements");
   exactKeys(idle, ["rawEventWrites", "rawEventRewrites", "filesOpened", "fileBytesRead", "fullHistoryFileReads", "overlappingJobs"], "idle measurements");
-  assert.ok(Object.values(idle).every((value) => value === 0), "idle work must remain exactly zero");
+  assert.equal(integer(idle.rawEventWrites, "history fixture writes"), 4);
+  assert.equal(integer(idle.rawEventRewrites, "history fixture rewrites"), 0);
+  assert.equal(integer(idle.fullHistoryFileReads, "explicit history reads"), 2_010);
+  assert.equal(integer(idle.filesOpened, "history files opened"), 2_016);
+  assert.ok(integer(idle.fileBytesRead, "history bytes read") > 0);
+  assert.equal(integer(idle.overlappingJobs, "overlapping history jobs"), 0);
+  const firstBootScenario = resourceScenarios
+    .map((entry, index) => object(entry, `resource scenario ${index}`))
+    .find((scenario) => scenario.id === "no_change_constant_work");
+  assert.ok(firstBootScenario, "first-boot resource scenario missing");
+  const firstBoot = object(firstBootScenario.measurements, "first-boot measurements");
+  assert.equal(firstBoot.firstBootRecentOnly, true);
+  assert.equal(integer(firstBoot.oldContentReadsAtBoot, "old boot reads"), 0);
+  assert.equal(firstBoot.restartZeroWork, true);
+  assert.equal(firstBoot.appendedExactlyOnce, true);
+  assert.equal(firstBoot.inaccessibleItemsBlockPromotion, true);
+  assert.equal(firstBoot.failedAttemptDisclosedAfterComplete, true);
+  assert.equal(firstBoot.unchangedParseFailuresRetained, true);
+  assert.equal(firstBoot.parseFailuresPersistAcrossRestart, true);
+  assert.equal(firstBoot.repairedParseFailuresPromote, true);
+  assert.equal(firstBoot.coveragePersistsAcrossRestart, true);
   const dashboard = object(measurements.dashboard, "dashboard measurements");
   exactKeys(dashboard, ["rawRowsScanned", "filesOpened", "fileBytesRead", "filesystemEntriesScanned"], "dashboard measurements");
   assert.ok(Object.values(dashboard).every((value) => value === 0), "dashboard scan work must remain exactly zero");

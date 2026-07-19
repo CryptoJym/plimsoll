@@ -19,6 +19,7 @@ import { saveCollectorConfig } from "./config";
 import { readLocalIdentities } from "./local-identity";
 import type { CollectorRuntimeIdentity } from "./runtime-ownership";
 import { codexReconciliationStatus } from "./codex-reconciliation";
+import { historyCoverageStatus } from "./history-coverage";
 import {
   HttpBoundaryRejection,
   asHttpBoundaryRejection,
@@ -136,6 +137,7 @@ export function createCollectorServer(
     if (read.kind !== "ready") return read;
     const delivery = buffer.delivery.status();
     const maintenance = options.maintenanceStatus?.() ?? null;
+    const historyCoverage = historyCoverageStatus(buffer.database);
     const status = read.snapshot.status as Record<string, unknown>;
     const stats = (status.stats ?? {}) as Record<string, unknown>;
     stats.unuploadedCount = delivery.remainingDelivery;
@@ -154,6 +156,8 @@ export function createCollectorServer(
       delivery,
       reconciliation: codexReconciliationStatus(buffer.database),
       maintenance,
+      captureHealth: status.health ?? null,
+      historyCoverage,
     });
     const maintenanceRun =
       maintenance && typeof maintenance === "object" && "runCount" in maintenance
@@ -161,7 +165,7 @@ export function createCollectorServer(
         : 0;
     return {
       ...read,
-      etagSeed: `${days}-${read.etagSeed}-${delivery.remainingDelivery}-${delivery.receipts.dead}-${maintenanceRun}`,
+      etagSeed: `${days}-${read.etagSeed}-${delivery.remainingDelivery}-${delivery.receipts.dead}-${maintenanceRun}-${historyCoverage.sources.map((source) => `${source.completedAt ?? "incomplete"}:${source.latestFullAttempt?.attemptedAt ?? "none"}:${source.latestFullAttempt?.status ?? "none"}`).join(":")}`,
     };
   };
 
@@ -188,12 +192,19 @@ export function createCollectorServer(
             delivery: buffer.delivery.status(),
             reconciliation: codexReconciliationStatus(buffer.database),
             maintenance: options.maintenanceStatus?.() ?? null,
+            historyCoverage: historyCoverageStatus(buffer.database),
             projection: read.kind === "backfilling" ? read.status : {
               ready: false,
               degraded: true,
               degradedReason: "unsupported_projection_window",
             },
             health: {
+              generatedAt: new Date().toISOString(),
+              overall: "amber",
+              sources: [],
+              reason: "projection backfill has not published a coherent health snapshot",
+            },
+            captureHealth: {
               generatedAt: new Date().toISOString(),
               overall: "amber",
               sources: [],

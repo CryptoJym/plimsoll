@@ -35,16 +35,18 @@ async function main() {
       runNoChangeConstantWorkContract(second),
     ]);
   });
+  const expectedEntries = concurrentSuccess[0]!.counters.filesystemEntriesScanned;
   for (const receipt of concurrentSuccess) {
     assert.equal(receipt.status, "pass");
-    assert.equal(receipt.counters.filesystemEntriesScanned, 12);
-    assert.equal(receipt.counters.maintenanceRuns, 3);
+    assert.equal(receipt.counters.filesystemEntriesScanned, expectedEntries);
+    assert.ok(receipt.counters.filesystemEntriesScanned > 2_000);
+    assert.equal(receipt.counters.maintenanceRuns, 6);
     assert.equal(receipt.measurements?.counterProvenanceProved, true);
     assert.equal(receipt.measurements?.filesystemObserverRestored, true);
   }
   assert.deepEqual(
     concurrentSuccess.map((receipt) => receipt.counters.filesystemEntriesScanned),
-    [12, 12],
+    [expectedEntries, expectedEntries],
     "separate sandbox observers must not count each other's directory entries",
   );
   assert.equal(
@@ -66,7 +68,7 @@ async function main() {
     },
   );
   assert.equal(successAfterFailure.status, "pass");
-  assert.equal(successAfterFailure.counters.filesystemEntriesScanned, 12);
+  assert.equal(successAfterFailure.counters.filesystemEntriesScanned, expectedEntries);
   assert.equal(successAfterFailure.measurements?.counterProvenanceProved, true);
   assert.equal(injectedFailure.status, "fail");
   assert.equal(

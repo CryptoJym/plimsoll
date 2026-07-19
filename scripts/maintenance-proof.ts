@@ -14,6 +14,7 @@ import {
   CoalescingMaintenanceScheduler,
   CollectorMaintenance,
   drainProjectionMigration,
+  requestAutomaticRecentMaintenance,
   runRepoEnrichmentMaintenance,
   runRepricingMaintenance,
   type CollectorMaintenanceRunResult,
@@ -35,6 +36,11 @@ function check(name: string, condition: unknown, detail: Record<string, unknown>
 
 function emptyRollout(): RolloutScanResult {
   return {
+    scope: "recent",
+    exhaustive: true,
+    discoveryErrors: 0,
+    statErrors: 0,
+    readErrors: 0,
     filesSeen: 0,
     filesRead: 0,
     filesParsed: 0,
@@ -59,6 +65,11 @@ function emptyRollout(): RolloutScanResult {
 
 function emptyTranscript(): TranscriptScanResult {
   return {
+    scope: "recent",
+    exhaustive: true,
+    discoveryErrors: 0,
+    statErrors: 0,
+    readErrors: 0,
     filesSeen: 0,
     filesRead: 0,
     filesParsed: 0,
@@ -68,6 +79,7 @@ function emptyTranscript(): TranscriptScanResult {
     bytesRead: 0,
     bytesDeferred: 0,
     sessionsSkippedLiveCovered: 0,
+    filesSkippedOutsideRecentWindow: 0,
     eventsAppended: 0,
     tokensAppended: { input: 0, cacheRead: 0, output: 0 },
     parseErrors: 0,
@@ -81,14 +93,14 @@ function emptyTranscript(): TranscriptScanResult {
   };
 }
 
-function fakeRun(recentOnly: boolean): CollectorMaintenanceRunResult {
-  const multiplier = recentOnly ? 1 : 10;
+function fakeRun(): CollectorMaintenanceRunResult {
+  const multiplier = 1;
   const rollout = emptyRollout();
   const transcript = emptyTranscript();
   rollout.filesRead = multiplier;
   transcript.filesRead = 2 * multiplier;
   return {
-    recentOnly,
+    recentOnly: true,
     rollout,
     transcript,
     reconciliation: {
@@ -134,25 +146,25 @@ async function proveCoalescing() {
   const firstReleasePromise = new Promise<void>((resolve) => {
     releaseFirst = resolve;
   });
-  const calls: boolean[] = [];
+  let calls = 0;
   let active = 0;
   let maxActive = 0;
-  const scheduler = new CoalescingMaintenanceScheduler(async (recentOnly) => {
-    calls.push(recentOnly);
+  const scheduler = new CoalescingMaintenanceScheduler(async () => {
+    calls += 1;
     active += 1;
     maxActive = Math.max(maxActive, active);
-    if (calls.length === 1) {
+    if (calls === 1) {
       firstStarted();
       await firstReleasePromise;
     }
     active -= 1;
-    return fakeRun(recentOnly);
+    return fakeRun();
   });
 
-  const first = scheduler.trigger(true);
+  const first = requestAutomaticRecentMaintenance(scheduler);
   await firstStartedPromise;
-  const second = scheduler.trigger(true);
-  const fullWhileActive = scheduler.trigger(false);
+  const second = requestAutomaticRecentMaintenance(scheduler);
+  const third = requestAutomaticRecentMaintenance(scheduler);
   const activeStatus = scheduler.status();
   check(
     "active_trigger_is_coalesced_and_visible",
@@ -163,23 +175,21 @@ async function proveCoalescing() {
     activeStatus,
   );
   releaseFirst();
-  await Promise.all([first, second, fullWhileActive]);
+  await Promise.all([first, second, third]);
   const finalStatus = scheduler.status();
   check(
-    "full_request_dominates_pending_recent_without_overlap",
-    calls.length === 2 &&
-      calls[0] === true &&
-      calls[1] === false &&
+    "automatic_recent_requests_coalesce_without_full_mode_or_overlap",
+    calls === 2 &&
       maxActive === 1 &&
       finalStatus.runCount === 2 &&
       finalStatus.overlappingJobs === 0 &&
       finalStatus.maxConcurrentJobs === 1 &&
-      finalStatus.rolloutFilesRead === 11 &&
-      finalStatus.transcriptFilesRead === 22 &&
-      finalStatus.rawEventWrites === 33 &&
-      finalStatus.repriceRowsVisited === 44 &&
-      finalStatus.reconciliationRowsVisited === 66 &&
-      finalStatus.enrichmentRowsVisited === 55 &&
+      finalStatus.rolloutFilesRead === 2 &&
+      finalStatus.transcriptFilesRead === 4 &&
+      finalStatus.rawEventWrites === 6 &&
+      finalStatus.repriceRowsVisited === 8 &&
+      finalStatus.reconciliationRowsVisited === 12 &&
+      finalStatus.enrichmentRowsVisited === 10 &&
       !finalStatus.inFlight &&
       !finalStatus.pending,
     { calls, maxActive, ...finalStatus },
@@ -501,7 +511,7 @@ async function proveIntegratedIdle(
     new RolloutTailer(buffer, rolloutRoot, () => []),
     new TranscriptTailer(buffer, transcriptRoot),
   );
-  const idle = await maintenance.run(false);
+  const idle = await maintenance.runRecent();
   check(
     "integrated_unchanged_cycle_has_zero_parse_write_and_row_visits",
     idle.rollout.filesRead === 0 &&

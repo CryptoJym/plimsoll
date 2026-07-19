@@ -15,6 +15,10 @@ import os from "node:os";
 import path from "node:path";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
+import {
+  historyCoverageStatus,
+  recordExplicitFullHistoryCoverage,
+} from "../packages/collector-cli/src/history-coverage";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 
@@ -95,7 +99,7 @@ async function proveRolloutTailing() {
   const split = Math.floor(firstToken.length / 2);
   fs.writeFileSync(file, completePrefix + firstToken.slice(0, split));
 
-  const first = await new RolloutTailer(buffer, path.join(tempDir, "rollouts"), () => []).scan();
+  const first = await new RolloutTailer(buffer, path.join(tempDir, "rollouts"), () => []).scan({ scope: "full" });
   assert.equal(first.filesRead, 1);
   assert.equal(first.eventsAppended, 0, "partial token line must not commit");
   assert.equal(first.parseErrors, 0, "partial framing is not a JSON parse error");
@@ -111,7 +115,7 @@ async function proveRolloutTailing() {
 
   fs.appendFileSync(file, firstToken.slice(split) + "\n");
   const firstCompletionSize = fs.statSync(file).size;
-  const second = await new RolloutTailer(buffer, path.join(tempDir, "rollouts"), () => []).scan();
+  const second = await new RolloutTailer(buffer, path.join(tempDir, "rollouts"), () => []).scan({ scope: "full" });
   const suffixFromCommit = firstCompletionSize - firstCursor.committedOffset;
   assert.equal(second.eventsAppended, 1);
   assert.equal(second.tokensAppended.input, 100);
@@ -120,14 +124,14 @@ async function proveRolloutTailing() {
     `read ${second.bytesRead} bytes for ${suffixFromCommit}-byte suffix plus bounded probes`,
   );
 
-  const unchanged = await new RolloutTailer(buffer, path.join(tempDir, "rollouts"), () => []).scan();
+  const unchanged = await new RolloutTailer(buffer, path.join(tempDir, "rollouts"), () => []).scan({ scope: "full" });
   assert.equal(unchanged.filesRead, 0);
   assert.equal(unchanged.bytesRead, 0);
   assert.equal(unchanged.eventsAppended, 0);
 
   const secondToken = tokenCountLine("2026-07-15T10:00:04.000Z", 250, 50, 25) + "\n";
   fs.appendFileSync(file, secondToken);
-  const appended = await new RolloutTailer(buffer, path.join(tempDir, "rollouts"), () => []).scan();
+  const appended = await new RolloutTailer(buffer, path.join(tempDir, "rollouts"), () => []).scan({ scope: "full" });
   assert.equal(appended.eventsAppended, 1);
   assert.equal(appended.tokensAppended.input, 150, "cumulative state must telescope across scans");
   assert.ok(appended.bytesRead <= Buffer.byteLength(secondToken) + 1024);
@@ -150,7 +154,7 @@ async function proveRolloutTailing() {
     buffer,
     path.join(tempDir, "rollouts"),
     () => [],
-  ).scan();
+  ).scan({ scope: "full" });
   assert.equal(emptyStateRebuild.checkpointRebuilds, 1);
   assert.deepEqual(
     buffer.database
@@ -171,7 +175,7 @@ async function proveRolloutTailing() {
     buffer,
     path.join(tempDir, "rollouts"),
     () => [],
-  ).scan();
+  ).scan({ scope: "full" });
   assert.equal(nullStateRebuild.checkpointRebuilds, 1);
   assert.deepEqual(
     buffer.database
@@ -198,7 +202,7 @@ async function proveRolloutTailing() {
     buffer,
     path.join(tempDir, "rollouts"),
     () => [],
-  ).scan();
+  ).scan({ scope: "full" });
   assert.equal(wrongTypeRebuild.checkpointRebuilds, 1);
 
   buffer.database
@@ -208,7 +212,7 @@ async function proveRolloutTailing() {
     buffer,
     path.join(tempDir, "rollouts"),
     () => [],
-  ).scan();
+  ).scan({ scope: "full" });
   assert.equal(wrongVersionRebuild.checkpointRebuilds, 1);
 
   buffer.database
@@ -218,7 +222,7 @@ async function proveRolloutTailing() {
     buffer,
     path.join(tempDir, "rollouts"),
     () => [],
-  ).scan();
+  ).scan({ scope: "full" });
   assert.equal(malformedStateRebuild.checkpointRebuilds, 1);
 
   const rotated = [
@@ -232,7 +236,7 @@ async function proveRolloutTailing() {
     buffer,
     path.join(tempDir, "rollouts"),
     () => [],
-  ).scan();
+  ).scan({ scope: "full" });
   assert.equal(afterTruncation.filesReset, 1);
   assert.equal(afterTruncation.eventsAppended, 1);
   assert.equal(
@@ -259,14 +263,14 @@ async function proveRolloutTailing() {
     buffer,
     path.join(tempDir, "rollouts"),
     () => [],
-  ).scan();
+  ).scan({ scope: "full" });
   assert.equal(legacyUnchanged.filesRead, 0, "unchanged legacy rows must not trigger a corpus rebuild");
   fs.appendFileSync(legacyFile, tokenCountLine("2026-07-15T12:00:03.000Z", 25, 0, 2) + "\n");
   const legacyGrowth = await new RolloutTailer(
     buffer,
     path.join(tempDir, "rollouts"),
     () => [],
-  ).scan();
+  ).scan({ scope: "full" });
   assert.equal(legacyGrowth.legacyRebuilds, 1);
   assert.equal(
     (buffer.database
@@ -296,7 +300,7 @@ async function proveRolloutTailing() {
     buffer,
     path.join(tempDir, "rollouts"),
     () => [],
-  ).scan();
+  ).scan({ scope: "full" });
   assert.equal(continuityInitial.eventsAppended, 1);
   const beforeRewrite = fs.statSync(continuityFile);
   const continuityReplacement = sharedHead + [
@@ -322,7 +326,7 @@ async function proveRolloutTailing() {
     buffer,
     path.join(tempDir, "rollouts"),
     () => [],
-  ).scan();
+  ).scan({ scope: "full" });
   assert.equal(continuityReset.filesReset, 1);
   assert.equal(
     (buffer.database
@@ -337,7 +341,7 @@ async function proveRolloutTailing() {
     .prepare(`select count(*) as n from buffered_events where event_type = 'usage_rollout'`)
     .get() as { n: number }).n;
   buffer.database.prepare(`delete from rollout_scan_state where file = ?`).run(legacyFile);
-  await new RolloutTailer(buffer, path.join(tempDir, "rollouts"), () => []).scan();
+  await new RolloutTailer(buffer, path.join(tempDir, "rollouts"), () => []).scan({ scope: "full" });
   const afterReplay = (buffer.database
     .prepare(`select count(*) as n from buffered_events where event_type = 'usage_rollout'`)
     .get() as { n: number }).n;
@@ -366,22 +370,22 @@ async function proveTranscriptTailing() {
   const file = path.join(projectDir, `${TRANSCRIPT_SESSION}.jsonl`);
   fs.writeFileSync(file, assistantLine("msg-1", 20, 2) + "\n");
 
-  const first = await new TranscriptTailer(buffer, projectsDir).scan();
+  const first = await new TranscriptTailer(buffer, projectsDir).scan({ scope: "full" });
   assert.equal(first.eventsAppended, 1);
   const secondLine = assistantLine("msg-2", 30, 3);
   const split = Math.floor(secondLine.length / 2);
   fs.appendFileSync(file, secondLine.slice(0, split));
-  const partial = await new TranscriptTailer(buffer, projectsDir).scan();
+  const partial = await new TranscriptTailer(buffer, projectsDir).scan({ scope: "full" });
   assert.equal(partial.eventsAppended, 0);
   assert.equal(partial.parseErrors, 0);
   assert.equal(partial.bytesDeferred, Buffer.byteLength(secondLine.slice(0, split)));
 
-  const unchanged = await new TranscriptTailer(buffer, projectsDir).scan();
+  const unchanged = await new TranscriptTailer(buffer, projectsDir).scan({ scope: "full" });
   assert.equal(unchanged.filesRead, 0);
   assert.equal(unchanged.bytesRead, 0);
 
   fs.appendFileSync(file, secondLine.slice(split) + "\n");
-  const completedAfterRestart = await new TranscriptTailer(buffer, projectsDir).scan();
+  const completedAfterRestart = await new TranscriptTailer(buffer, projectsDir).scan({ scope: "full" });
   assert.equal(completedAfterRestart.eventsAppended, 1);
   const totals = buffer.database
     .prepare(
@@ -394,7 +398,7 @@ async function proveTranscriptTailing() {
   buffer.database
     .prepare(`update rollout_scan_state set parser_state_json = ? where file = ?`)
     .run("{}", file);
-  const emptyStateRebuild = await new TranscriptTailer(buffer, projectsDir).scan();
+  const emptyStateRebuild = await new TranscriptTailer(buffer, projectsDir).scan({ scope: "full" });
   assert.equal(emptyStateRebuild.checkpointRebuilds, 1);
   assert.deepEqual(
     buffer.database
@@ -410,7 +414,7 @@ async function proveTranscriptTailing() {
     .prepare(`update rollout_scan_state set parser_state_json = ?, checkpoint_version = ? where file = ?`)
     .run("null", 999, file);
   fs.appendFileSync(file, assistantLine("msg-3", 10, 1) + "\n");
-  const invalidVersionRebuild = await new TranscriptTailer(buffer, projectsDir).scan();
+  const invalidVersionRebuild = await new TranscriptTailer(buffer, projectsDir).scan({ scope: "full" });
   assert.equal(invalidVersionRebuild.checkpointRebuilds, 1);
   assert.deepEqual(
     buffer.database
@@ -432,10 +436,178 @@ async function proveTranscriptTailing() {
   };
 }
 
+async function proveParseFailuresRemainUnresolved() {
+  const root = path.join(tempDir, "parse-failure-durability");
+  const ledger = path.join(root, "proof.sqlite");
+  const rolloutRoot = path.join(root, "rollouts");
+  const rolloutDay = path.join(rolloutRoot, "2026", "07", "19");
+  const transcriptRoot = path.join(root, "transcripts");
+  const transcriptProject = path.join(transcriptRoot, "proof-project");
+  const rolloutFile = path.join(
+    rolloutDay,
+    "rollout-proof-019e6000-0000-7000-8000-000000000011.jsonl",
+  );
+  const transcriptFile = path.join(
+    transcriptProject,
+    "019e6000-0000-7000-8000-000000000012.jsonl",
+  );
+  fs.mkdirSync(rolloutDay, { recursive: true });
+  fs.mkdirSync(transcriptProject, { recursive: true });
+  const validRollout = `${JSON.stringify({
+    timestamp: "2026-07-19T12:00:00.000Z",
+    type: "event_msg",
+    payload: { type: "token_count" },
+  })}\n`;
+  const validTranscript = `${JSON.stringify({
+    type: "assistant",
+    sessionId: "019e6000-0000-7000-8000-000000000012",
+    timestamp: "2026-07-19T12:00:00.000Z",
+    message: { id: "empty-usage", usage: {} },
+  })}\n`;
+  fs.writeFileSync(rolloutFile, validRollout);
+  fs.writeFileSync(transcriptFile, validTranscript);
+
+  let parseBuffer = new LocalEventBuffer(ledger);
+  const scanRollout = () =>
+    new RolloutTailer(parseBuffer, rolloutRoot, () => []).scan({ scope: "full" });
+  const scanTranscript = () =>
+    new TranscriptTailer(parseBuffer, transcriptRoot).scan({ scope: "full" });
+  const cursor = (file: string) =>
+    parseBuffer.database
+      .prepare(
+        `select size as observedSize, committed_offset as committedOffset,
+                mtime_ms as mtimeMs
+         from rollout_scan_state where file = ?`,
+      )
+      .get(file) as
+      | { observedSize: number; committedOffset: number; mtimeMs: number }
+      | undefined;
+
+  try {
+    const rolloutInitial = await scanRollout();
+    recordExplicitFullHistoryCoverage(parseBuffer.database, "codex", rolloutInitial);
+    const transcriptInitial = await scanTranscript();
+    const initialCoverage = recordExplicitFullHistoryCoverage(
+      parseBuffer.database,
+      "claude_code",
+      transcriptInitial,
+    );
+    assert.equal(initialCoverage.promoted, true);
+    assert.equal(initialCoverage.coverage.status, "complete");
+    const rolloutCursorBefore = cursor(rolloutFile);
+    const transcriptCursorBefore = cursor(transcriptFile);
+    assert.ok(rolloutCursorBefore && transcriptCursorBefore);
+
+    fs.writeFileSync(
+      rolloutFile,
+      '{"type":"event_msg","payload":{"type":"token_count"\n',
+    );
+    fs.writeFileSync(
+      transcriptFile,
+      '{"type":"assistant","message":{"usage":\n',
+    );
+    const rolloutFailure = await scanRollout();
+    const rolloutFailureCoverage = recordExplicitFullHistoryCoverage(
+      parseBuffer.database,
+      "codex",
+      rolloutFailure,
+    );
+    const transcriptFailure = await scanTranscript();
+    const transcriptFailureCoverage = recordExplicitFullHistoryCoverage(
+      parseBuffer.database,
+      "claude_code",
+      transcriptFailure,
+    );
+    assert.equal(rolloutFailure.parseErrors, 1);
+    assert.equal(transcriptFailure.parseErrors, 1);
+    assert.equal(rolloutFailureCoverage.promoted, false);
+    assert.equal(transcriptFailureCoverage.promoted, false);
+    assert.equal(transcriptFailureCoverage.coverage.status, "complete");
+    assert.equal(
+      transcriptFailureCoverage.coverage.sources.find(
+        (source) => source.source === "claude_code",
+      )?.latestFullAttempt?.parseErrors,
+      1,
+    );
+    assert.deepEqual(cursor(rolloutFile), rolloutCursorBefore);
+    assert.deepEqual(cursor(transcriptFile), transcriptCursorBefore);
+
+    const rolloutRetry = await scanRollout();
+    recordExplicitFullHistoryCoverage(parseBuffer.database, "codex", rolloutRetry);
+    const transcriptRetry = await scanTranscript();
+    recordExplicitFullHistoryCoverage(parseBuffer.database, "claude_code", transcriptRetry);
+    assert.equal(rolloutRetry.filesRead, 1);
+    assert.equal(transcriptRetry.filesRead, 1);
+    assert.equal(rolloutRetry.parseErrors, 1);
+    assert.equal(transcriptRetry.parseErrors, 1);
+
+    parseBuffer.close();
+    parseBuffer = new LocalEventBuffer(ledger);
+    const rolloutRestart = await scanRollout();
+    recordExplicitFullHistoryCoverage(parseBuffer.database, "codex", rolloutRestart);
+    const transcriptRestart = await scanTranscript();
+    const restartCoverage = recordExplicitFullHistoryCoverage(
+      parseBuffer.database,
+      "claude_code",
+      transcriptRestart,
+    );
+    assert.equal(rolloutRestart.parseErrors, 1);
+    assert.equal(transcriptRestart.parseErrors, 1);
+    assert.equal(restartCoverage.promoted, false);
+    assert.equal(restartCoverage.coverage.status, "complete");
+
+    fs.writeFileSync(
+      rolloutFile,
+      `${JSON.stringify({
+        timestamp: "2026-07-19T12:00:00.000Z",
+        type: "event_msg",
+        payload: { type: "token_count", repaired: true },
+      })}\n`,
+    );
+    fs.writeFileSync(
+      transcriptFile,
+      `${JSON.stringify({
+        type: "assistant",
+        sessionId: "019e6000-0000-7000-8000-000000000012",
+        timestamp: "2026-07-19T12:00:00.000Z",
+        message: { id: "empty-usage-repaired", usage: {}, repaired: true },
+      })}\n`,
+    );
+    const rolloutRepair = await scanRollout();
+    const rolloutRepairCoverage = recordExplicitFullHistoryCoverage(
+      parseBuffer.database,
+      "codex",
+      rolloutRepair,
+    );
+    const transcriptRepair = await scanTranscript();
+    const transcriptRepairCoverage = recordExplicitFullHistoryCoverage(
+      parseBuffer.database,
+      "claude_code",
+      transcriptRepair,
+    );
+    assert.equal(rolloutRepair.filesRead, 1);
+    assert.equal(transcriptRepair.filesRead, 1);
+    assert.equal(rolloutRepair.parseErrors, 0);
+    assert.equal(transcriptRepair.parseErrors, 0);
+    assert.equal(rolloutRepairCoverage.promoted, true);
+    assert.equal(transcriptRepairCoverage.promoted, true);
+    assert.equal(historyCoverageStatus(parseBuffer.database).status, "complete");
+    return {
+      bothTailersRetriedUnchanged: true,
+      bothTailersRetriedAfterRestart: true,
+      priorCompletionPreservedAndFailureDisclosed: true,
+      repairedFilesRereadAndPromoted: true,
+    };
+  } finally {
+    parseBuffer.close();
+  }
+}
+
 async function main() {
   try {
     const rollout = await proveRolloutTailing();
     const transcript = await proveTranscriptTailing();
+    const parseFailureDurability = await proveParseFailuresRemainUnresolved();
 
     const persistedEvents = JSON.stringify(
       buffer.database.prepare(`select payload_json from buffered_events`).all(),
@@ -456,6 +628,7 @@ async function main() {
           passed: true,
           rollout,
           transcript,
+          parseFailureDurability,
           privacy: { rawContentPersisted: false, rawPathPersistedInCursor: false },
         },
         null,

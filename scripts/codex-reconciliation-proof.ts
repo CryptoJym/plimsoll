@@ -1161,6 +1161,8 @@ async function proveContextRevisionCrashRollbackAndOverlap(root: string) {
       return {
         recentOnly: true,
         rollout: {
+          scope: "recent" as const,
+          exhaustive: true, discoveryErrors: 0, statErrors: 0, readErrors: 0,
           filesSeen: 0, filesRead: 0, filesParsed: 0, filesReset: 0, legacyRebuilds: 0,
           checkpointRebuilds: 0, bytesRead: 0, bytesDeferred: 0,
           sessionsSkippedOtlpCovered: 0, eventsAppended: 0,
@@ -1171,9 +1173,11 @@ async function proveContextRevisionCrashRollbackAndOverlap(root: string) {
           },
         },
         transcript: {
+          scope: "recent" as const,
+          exhaustive: true, discoveryErrors: 0, statErrors: 0, readErrors: 0,
           filesSeen: 0, filesRead: 0, filesParsed: 0, filesReset: 0, legacyRebuilds: 0,
           checkpointRebuilds: 0, bytesRead: 0, bytesDeferred: 0,
-          sessionsSkippedLiveCovered: 0, eventsAppended: 0,
+          sessionsSkippedLiveCovered: 0, filesSkippedOutsideRecentWindow: 0, eventsAppended: 0,
           tokensAppended: { input: 0, cacheRead: 0, output: 0 }, parseErrors: 0,
           activity: {
             lastActivityAt: null, filesToday: 0, discoveryEntries: 0,
@@ -1192,10 +1196,10 @@ async function proveContextRevisionCrashRollbackAndOverlap(root: string) {
         rawEventWrites: 0,
       };
     });
-    const first = scheduler.trigger(true);
+    const first = scheduler.trigger();
     await startedSignal;
-    const second = scheduler.trigger(true);
-    const third = scheduler.trigger(false);
+    const second = scheduler.trigger();
+    const third = scheduler.trigger();
     releaseFirst();
     await Promise.all([first, second, third]);
     const schedulerStatus = scheduler.status();

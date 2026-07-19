@@ -41,6 +41,24 @@ export type JsonlTailRead = {
   checkpointRebuild: boolean;
 };
 
+/** Narrow filesystem seam used by tailers so failure paths can be proved
+ * without replacing process-wide `fs` methods. The default delegates at call
+ * time, preserving filesystem instrumentation used by the resource proofs.
+ */
+export type JsonlTailerIo = {
+  readDirents(directory: string): fs.Dirent[];
+  readNames(directory: string): string[];
+  stat(file: string): fs.Stats;
+  readTail: typeof readJsonlTail;
+};
+
+export const DEFAULT_JSONL_TAILER_IO: JsonlTailerIo = {
+  readDirents: (directory) => fs.readdirSync(directory, { withFileTypes: true }),
+  readNames: (directory) => fs.readdirSync(directory),
+  stat: (file) => fs.statSync(file),
+  readTail: readJsonlTail,
+};
+
 type RawCursorRow = {
   size: number;
   committedOffset: number | null;

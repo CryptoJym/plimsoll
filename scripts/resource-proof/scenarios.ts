@@ -20,8 +20,15 @@ import { LAUNCH_AGENT_LABEL } from "../../packages/collector-cli/src/launch-agen
 import {
   CoalescingMaintenanceScheduler,
   CollectorMaintenance,
+  requestAutomaticRecentMaintenance,
   type CollectorMaintenanceRunResult,
 } from "../../packages/collector-cli/src/maintenance";
+import {
+  EXPLICIT_FULL_BACKFILL_NOT_COMPLETED,
+  historyCoverageStatus,
+  recordExplicitFullHistoryCoverage,
+} from "../../packages/collector-cli/src/history-coverage";
+import { DEFAULT_JSONL_TAILER_IO } from "../../packages/collector-cli/src/jsonl-byte-tailer";
 import { RolloutTailer } from "../../packages/collector-cli/src/rollout-tailer";
 import {
   readCollectorPidFile,
@@ -566,7 +573,14 @@ function installTemporaryEventMutationAudit(buffer: LocalEventBuffer) {
   `);
 }
 
-function writeNoChangeFixtures(sandbox: ResourceSandbox) {
+const HISTORICAL_FILES_PER_SOURCE = 1_001;
+
+function syntheticUuid(prefix: "codex" | "claude", index: number) {
+  const head = prefix === "codex" ? "019d0000" : "019c0000";
+  return `${head}-0000-7000-8000-${String(index).padStart(12, "0")}`;
+}
+
+function writeFirstBootFixtures(sandbox: ResourceSandbox) {
   const now = new Date();
   const observedAt = now.toISOString();
   const [year, month, day] = observedAt.slice(0, 10).split("-");
@@ -602,17 +616,37 @@ function writeNoChangeFixtures(sandbox: ResourceSandbox) {
       },
     },
   ];
-  fs.writeFileSync(
-    path.join(rolloutDay, `rollout-resource-proof-${rolloutSession}.jsonl`),
-    `${rollout.map((entry) => JSON.stringify(entry)).join("\n")}\n`,
-    { mode: 0o600 },
+  const recentRollout = path.join(
+    rolloutDay,
+    `rollout-resource-proof-${rolloutSession}.jsonl`,
   );
+  fs.writeFileSync(recentRollout, `${rollout.map((entry) => JSON.stringify(entry)).join("\n")}\n`, {
+    mode: 0o600,
+  });
+
+  const oldRolloutDay = path.join(sandbox.codexSessions, "2020", "01", "01");
+  fs.mkdirSync(oldRolloutDay, { recursive: true, mode: 0o700 });
+  const oldMtime = new Date("2020-01-01T00:00:00.000Z");
+  for (let index = 0; index < HISTORICAL_FILES_PER_SOURCE; index += 1) {
+    const sessionId = syntheticUuid("codex", index);
+    const file = path.join(oldRolloutDay, `rollout-old-${sessionId}.jsonl`);
+    fs.writeFileSync(
+      file,
+      `${JSON.stringify({
+        type: "response_item",
+        payload: { syntheticOldContent: `codex-old-${index}` },
+      })}\n`,
+      { mode: 0o600 },
+    );
+    fs.utimesSync(file, oldMtime, oldMtime);
+  }
 
   const transcriptSession = "019e6000-0000-7000-8000-000000000002";
   const transcriptDirectory = path.join(sandbox.claudeProjects, "resource-proof");
   fs.mkdirSync(transcriptDirectory, { recursive: true, mode: 0o700 });
+  const recentTranscript = path.join(transcriptDirectory, `${transcriptSession}.jsonl`);
   fs.writeFileSync(
-    path.join(transcriptDirectory, `${transcriptSession}.jsonl`),
+    recentTranscript,
     `${JSON.stringify({
       type: "assistant",
       sessionId: transcriptSession,
@@ -630,6 +664,40 @@ function writeNoChangeFixtures(sandbox: ResourceSandbox) {
     })}\n`,
     { mode: 0o600 },
   );
+
+  const oldTranscriptDirectory = path.join(sandbox.claudeProjects, "old-history");
+  fs.mkdirSync(oldTranscriptDirectory, { recursive: true, mode: 0o700 });
+  for (let index = 0; index < HISTORICAL_FILES_PER_SOURCE; index += 1) {
+    const sessionId = syntheticUuid("claude", index);
+    const file = path.join(oldTranscriptDirectory, `${sessionId}.jsonl`);
+    fs.writeFileSync(
+      file,
+      `${JSON.stringify({
+        type: "user",
+        sessionId,
+        syntheticOldContent: `claude-old-${index}`,
+      })}\n`,
+      { mode: 0o600 },
+    );
+    fs.utimesSync(file, oldMtime, oldMtime);
+  }
+
+  return {
+    observedAt,
+    recentRollout,
+    recentTranscript,
+    oldRolloutDay,
+    oldRolloutTarget: path.join(
+      oldRolloutDay,
+      `rollout-old-${syntheticUuid("codex", 0)}.jsonl`,
+    ),
+    oldTranscriptTarget: path.join(
+      oldTranscriptDirectory,
+      `${syntheticUuid("claude", HISTORICAL_FILES_PER_SOURCE - 1)}.jsonl`,
+    ),
+    recentBytes: fs.statSync(recentRollout).size + fs.statSync(recentTranscript).size,
+    oldFiles: HISTORICAL_FILES_PER_SOURCE * 2,
+  };
 }
 
 function unchangedMaintenanceResult(result: CollectorMaintenanceRunResult) {
@@ -832,10 +900,9 @@ export async function runPoisonContinuationContract(
 }
 
 /**
- * Production #77 path: both real JSONL tailers, the real maintenance worker,
- * and its real coalescing scheduler. A promise handshake holds the first job
- * while concurrent recent/full triggers queue; no wall-clock delay determines
- * correctness.
+ * Production #124 path: thousands of synthetic historical files plus a small
+ * recent tail exercise the real tailers, recent-only daemon worker, coalescing
+ * scheduler, persisted history coverage, restart, and explicit full backfill.
  */
 export async function runNoChangeConstantWorkContract(
   sandbox: ResourceSandbox,
@@ -846,14 +913,17 @@ export async function runNoChangeConstantWorkContract(
   let buffer: LocalEventBuffer | undefined;
   let directoryObserver: ReturnType<typeof observeDirectoryEnumeration> | undefined;
   try {
-    writeNoChangeFixtures(sandbox);
+    const fixture = writeFirstBootFixtures(sandbox);
     buffer = new LocalEventBuffer(sandbox.ledger);
     installTemporaryEventMutationAudit(buffer);
-    const maintenance = new CollectorMaintenance(
-      buffer,
-      new RolloutTailer(buffer, sandbox.codexSessions, () => []),
-      new TranscriptTailer(buffer, sandbox.claudeProjects),
-    );
+    const makeMaintenance = () =>
+      new CollectorMaintenance(
+        buffer!,
+        new RolloutTailer(buffer!, sandbox.codexSessions, () => []),
+        new TranscriptTailer(buffer!, sandbox.claudeProjects),
+      );
+    let maintenance = makeMaintenance();
+    const initialCoverage = historyCoverageStatus(buffer.database);
 
     let firstStarted!: () => void;
     let releaseFirst!: () => void;
@@ -863,20 +933,20 @@ export async function runNoChangeConstantWorkContract(
     const firstReleaseSignal = new Promise<void>((resolve) => {
       releaseFirst = resolve;
     });
-    const runModes: boolean[] = [];
+    let automaticInvocations = 0;
     const mutationDeltas: EventMutationCounts[] = [];
     const directoryEntryDeltas: number[] = [];
     const activeDirectoryObserver = observeDirectoryEnumeration(sandbox.root);
     directoryObserver = activeDirectoryObserver;
-    const scheduler = new CoalescingMaintenanceScheduler(async (recentOnly) => {
-      const invocation = runModes.push(recentOnly);
-      if (invocation === 1) {
+    const scheduler = new CoalescingMaintenanceScheduler(async () => {
+      automaticInvocations += 1;
+      if (automaticInvocations === 1) {
         firstStarted();
         await firstReleaseSignal;
       }
       const before = eventMutationCounts(buffer!);
       const directoryBefore = activeDirectoryObserver.snapshot();
-      const result = await maintenance.run(recentOnly);
+      const result = await maintenance.runRecent();
       mutationDeltas.push(eventMutationDelta(before, eventMutationCounts(buffer!)));
       directoryEntryDeltas.push(
         activeDirectoryObserver.snapshot().entries - directoryBefore.entries,
@@ -885,21 +955,19 @@ export async function runNoChangeConstantWorkContract(
     });
 
     let initialDrain: CollectorMaintenanceRunResult[] = [];
-    let thirdDrain: CollectorMaintenanceRunResult[] = [];
     let queuedStatus = scheduler.status();
     let finalStatus = scheduler.status();
     try {
       if (options.injectFailureAfterObserverRegistration) {
         throw new Error("InjectedDirectoryObserverFailure");
       }
-      const initial = scheduler.trigger(true);
+      const initial = requestAutomaticRecentMaintenance(scheduler);
       await firstStartedSignal;
-      const concurrentRecent = scheduler.trigger(true);
-      const concurrentFull = scheduler.trigger(false);
+      const concurrentRecent = requestAutomaticRecentMaintenance(scheduler);
+      const concurrentInterval = requestAutomaticRecentMaintenance(scheduler);
       queuedStatus = scheduler.status();
       releaseFirst();
-      [initialDrain] = await Promise.all([initial, concurrentRecent, concurrentFull]);
-      thirdDrain = await scheduler.trigger(true);
+      [initialDrain] = await Promise.all([initial, concurrentRecent, concurrentInterval]);
       finalStatus = scheduler.status();
     } finally {
       activeDirectoryObserver.unregister();
@@ -908,73 +976,40 @@ export async function runNoChangeConstantWorkContract(
 
     const firstRun = initialDrain[0];
     const secondRun = initialDrain[1];
-    const thirdRun = thirdDrain[0];
+    const firstMutations = mutationDeltas[0];
     const secondMutations = mutationDeltas[1];
-    const thirdMutations = mutationDeltas[2];
-    if (!firstRun || !secondRun || !thirdRun || !secondMutations || !thirdMutations) {
+    if (!firstRun || !secondRun || !firstMutations || !secondMutations) {
       throw new Error("MaintenanceResultMissing");
     }
 
-    const fullHistoryFileReads =
-      secondRun.rollout.filesRead + secondRun.transcript.filesRead;
-    const fileBytesRead =
-      secondRun.rollout.bytesRead +
-      secondRun.transcript.bytesRead +
-      thirdRun.rollout.bytesRead +
-      thirdRun.transcript.bytesRead;
-    const rawEventWrites = secondMutations.inserted + thirdMutations.inserted;
-    const rawEventRewrites =
-      secondMutations.updated +
-      secondMutations.deleted +
-      thirdMutations.updated +
-      thirdMutations.deleted;
-    const repriceRowsVisited =
-      secondRun.repricing.rowsVisited + thirdRun.repricing.rowsVisited;
-    const reconciliationRowsVisited =
-      secondRun.reconciliation.rowsVisited + thirdRun.reconciliation.rowsVisited;
-    const enrichmentRowsVisited =
-      secondRun.enrichment.rowsVisited + thirdRun.enrichment.rowsVisited;
-
-    counters.filesOpened =
-      secondRun.rollout.filesRead +
-      secondRun.transcript.filesRead +
-      thirdRun.rollout.filesRead +
-      thirdRun.transcript.filesRead;
-    counters.fileBytesRead = fileBytesRead;
-    counters.fullHistoryFileReads = fullHistoryFileReads;
-    counters.rawEventWrites = rawEventWrites;
-    counters.rawEventRewrites = rawEventRewrites;
-    counters.repriceRowsVisited = repriceRowsVisited;
-    counters.reconciliationRowsVisited = reconciliationRowsVisited;
-    counters.enrichmentRowsVisited = enrichmentRowsVisited;
-    counters.maintenanceRuns = finalStatus.runCount;
-    counters.overlappingJobs = finalStatus.overlappingJobs;
-    counters.filesystemEntriesScanned = directoryObservation.entries;
-
-    const firstRunBounded =
+    const firstBootRecentOnly =
+      firstRun.recentOnly &&
+      firstRun.rollout.scope === "recent" &&
+      firstRun.transcript.scope === "recent" &&
+      firstRun.rollout.exhaustive &&
+      firstRun.transcript.exhaustive &&
       firstRun.rollout.filesRead === 1 &&
       firstRun.transcript.filesRead === 1 &&
       firstRun.rawEventWrites === 2 &&
-      firstRun.reconciliation.backfillComplete &&
-      firstRun.repricing.backfillComplete &&
-      firstRun.enrichment.backfillComplete;
-    const deterministicIdleCounters =
+      firstRun.rollout.filesSeen === 1 &&
+      firstRun.transcript.filesSkippedOutsideRecentWindow ===
+        HISTORICAL_FILES_PER_SOURCE &&
+      firstRun.rollout.bytesRead + firstRun.transcript.bytesRead === fixture.recentBytes;
+    const oldContentReadsAtBoot =
+      firstRun.rollout.filesRead + firstRun.transcript.filesRead - 2;
+    const unchangedCoalescedCycle =
       unchangedMaintenanceResult(secondRun) &&
-      unchangedMaintenanceResult(thirdRun) &&
       secondMutations.inserted === 0 &&
       secondMutations.updated === 0 &&
-      secondMutations.deleted === 0 &&
-      thirdMutations.inserted === 0 &&
-      thirdMutations.updated === 0 &&
-      thirdMutations.deleted === 0;
+      secondMutations.deleted === 0;
     const coalescingProved =
       queuedStatus.inFlight &&
       queuedStatus.pending &&
       queuedStatus.triggerCount === 3 &&
       queuedStatus.coalescedTriggerCount === 2 &&
-      runModes.join(",") === "true,false,true" &&
-      finalStatus.triggerCount === 4 &&
-      finalStatus.runCount === 3 &&
+      automaticInvocations === 2 &&
+      finalStatus.triggerCount === 3 &&
+      finalStatus.runCount === 2 &&
       finalStatus.maxConcurrentJobs === 1 &&
       finalStatus.overlappingJobs === 0 &&
       finalStatus.failedRuns === 0;
@@ -982,45 +1017,615 @@ export async function runNoChangeConstantWorkContract(
       directoryObservation.restored &&
       directoryEntryDeltas.length === finalStatus.runCount &&
       directoryEntryDeltas.reduce((total, count) => total + count, 0) ===
-        counters.filesystemEntriesScanned &&
-      counters.maintenanceRuns === finalStatus.runCount;
+        directoryObservation.entries;
+    const recentDidNotPromote =
+      initialCoverage.status === "incomplete" &&
+      initialCoverage.reason === EXPLICIT_FULL_BACKFILL_NOT_COMPLETED &&
+      historyCoverageStatus(buffer.database).status === "incomplete";
+
+    // Reopen the real ledger and construct new tailers/scheduler. With no file
+    // changes the restart must perform no content reads or durable writes.
+    buffer.close();
+    buffer = new LocalEventBuffer(sandbox.ledger);
+    installTemporaryEventMutationAudit(buffer);
+    maintenance = makeMaintenance();
+    const restartScheduler = new CoalescingMaintenanceScheduler(() => maintenance.runRecent());
+    const restartBefore = eventMutationCounts(buffer);
+    const restartRun = (await requestAutomaticRecentMaintenance(restartScheduler))[0];
+    const restartMutations = eventMutationDelta(restartBefore, eventMutationCounts(buffer));
+    if (!restartRun) throw new Error("RestartMaintenanceResultMissing");
+    const restartZeroWork =
+      unchangedMaintenanceResult(restartRun) &&
+      restartMutations.inserted === 0 &&
+      restartMutations.updated === 0 &&
+      restartMutations.deleted === 0;
+
+    // Append one new durable usage event to each recent file. The next recent
+    // pass captures both exactly once; the following pass is byte/write idle.
+    fs.appendFileSync(
+      fixture.recentRollout,
+      `${JSON.stringify({
+        timestamp: new Date().toISOString(),
+        type: "event_msg",
+        payload: {
+          type: "token_count",
+          info: {
+            total_token_usage: {
+              input_tokens: 30,
+              cached_input_tokens: 7,
+              output_tokens: 5,
+              reasoning_output_tokens: 0,
+              total_tokens: 35,
+            },
+          },
+        },
+      })}\n`,
+    );
+    fs.appendFileSync(
+      fixture.recentTranscript,
+      `${JSON.stringify({
+        type: "assistant",
+        sessionId: "019e6000-0000-7000-8000-000000000002",
+        timestamp: new Date().toISOString(),
+        message: {
+          id: "resource-proof-message-2",
+          model: "claude-sonnet-4-20250514",
+          usage: {
+            input_tokens: 4,
+            cache_read_input_tokens: 1,
+            cache_creation_input_tokens: 0,
+            output_tokens: 2,
+          },
+        },
+      })}\n`,
+    );
+    const appendBefore = eventMutationCounts(buffer);
+    const appendedRun = (await requestAutomaticRecentMaintenance(restartScheduler))[0];
+    const appendMutations = eventMutationDelta(appendBefore, eventMutationCounts(buffer));
+    const afterAppendRun = (await requestAutomaticRecentMaintenance(restartScheduler))[0];
+    if (!appendedRun || !afterAppendRun) throw new Error("AppendMaintenanceResultMissing");
+    const appendedExactlyOnce =
+      appendedRun.rawEventWrites === 2 &&
+      appendedRun.rollout.eventsAppended === 1 &&
+      appendedRun.transcript.eventsAppended === 1 &&
+      appendMutations.inserted === 2 &&
+      unchangedMaintenanceResult(afterAppendRun);
+
+    // Force deterministic event replay by removing only the two recent byte
+    // cursors. Receipt counters must remain zero because append returned false.
+    buffer.database
+      .prepare(`delete from rollout_scan_state where file in (?, ?)`)
+      .run(fixture.recentRollout, fixture.recentTranscript);
+    const replayBefore = eventMutationCounts(buffer);
+    const replayRun = (await requestAutomaticRecentMaintenance(restartScheduler))[0];
+    const replayMutations = eventMutationDelta(replayBefore, eventMutationCounts(buffer));
+    if (!replayRun) throw new Error("ReplayMaintenanceResultMissing");
+    const durableReceiptCounters =
+      replayRun.rollout.filesRead === 1 &&
+      replayRun.transcript.filesRead === 1 &&
+      replayRun.rollout.eventsAppended === 0 &&
+      replayRun.transcript.eventsAppended === 0 &&
+      replayRun.rawEventWrites === 0 &&
+      Object.values(replayRun.rollout.tokensAppended).every((value) => value === 0) &&
+      Object.values(replayRun.transcript.tokensAppended).every((value) => value === 0) &&
+      replayMutations.inserted === 0;
+
+    let recentPromotionRejected = false;
+    try {
+      recordExplicitFullHistoryCoverage(buffer.database, "codex", appendedRun.rollout);
+    } catch {
+      recentPromotionRejected = true;
+    }
+
+    // HTTP status exposes current capture health separately from the still
+    // incomplete historical-coverage marker.
+    const statusServer = createCollectorServer(collectorConfigSchema.parse({}), buffer);
+    statusServer.unref();
+    await new Promise<void>((resolve) => statusServer.listen(0, "127.0.0.1", resolve));
+    const statusAddress = statusServer.address();
+    if (!statusAddress || typeof statusAddress === "string") {
+      throw new Error("HistoryStatusListenerMissing");
+    }
+    const statusResponse = await fetch(`http://127.0.0.1:${statusAddress.port}/status`);
+    const httpStatus = (await statusResponse.json()) as Record<string, unknown>;
+    await new Promise<void>((resolve) => statusServer.close(() => resolve()));
+    const httpHistory = httpStatus.historyCoverage as
+      | { status?: unknown; reason?: unknown }
+      | undefined;
+    const statusSeparatesCurrentFromHistory =
+      statusResponse.ok &&
+      Object.hasOwn(httpStatus, "captureHealth") &&
+      httpHistory?.status === "incomplete" &&
+      httpHistory.reason === EXPLICIT_FULL_BACKFILL_NOT_COMPLETED;
+
+    // Full history is literal and explicit. Truncation and forced discovery,
+    // stat, and open failures all persist honest failed-attempt receipts but
+    // cannot promote coverage. Later exhaustive passes resume from cursors.
+    const transcriptPartial = await new TranscriptTailer(
+      buffer,
+      sandbox.claudeProjects,
+    ).scan({ scope: "full", discoveryLimit: 500 });
+    const partialCoverage = recordExplicitFullHistoryCoverage(
+      buffer.database,
+      "claude_code",
+      transcriptPartial,
+    );
+
+    const syntheticFsError = (code: string) =>
+      Object.assign(new Error("SyntheticHistoryFilesystemFailure"), { code });
+    const rolloutDiscoveryFailure = await new RolloutTailer(
+      buffer,
+      sandbox.codexSessions,
+      () => [],
+      {
+        ...DEFAULT_JSONL_TAILER_IO,
+        readNames: (directory) => {
+          if (path.resolve(directory) === path.resolve(fixture.oldRolloutDay)) {
+            throw syntheticFsError("EACCES");
+          }
+          return DEFAULT_JSONL_TAILER_IO.readNames(directory);
+        },
+      },
+    ).scan({ scope: "full" });
+    const rolloutDiscoveryCoverage = recordExplicitFullHistoryCoverage(
+      buffer.database,
+      "codex",
+      rolloutDiscoveryFailure,
+    );
+
+    const transcriptStatFailure = await new TranscriptTailer(
+      buffer,
+      sandbox.claudeProjects,
+      {
+        ...DEFAULT_JSONL_TAILER_IO,
+        stat: (file) => {
+          if (path.resolve(file) === path.resolve(fixture.oldTranscriptTarget)) {
+            throw syntheticFsError("ENOENT");
+          }
+          return DEFAULT_JSONL_TAILER_IO.stat(file);
+        },
+      },
+    ).scan({ scope: "full" });
+    const transcriptStatCoverage = recordExplicitFullHistoryCoverage(
+      buffer.database,
+      "claude_code",
+      transcriptStatFailure,
+    );
+
+    const rolloutOpenFailure = await new RolloutTailer(
+      buffer,
+      sandbox.codexSessions,
+      () => [],
+      {
+        ...DEFAULT_JSONL_TAILER_IO,
+        readTail: (file, stat, cursor) => {
+          if (path.resolve(file) === path.resolve(fixture.oldRolloutTarget)) {
+            throw syntheticFsError("ENOENT");
+          }
+          return DEFAULT_JSONL_TAILER_IO.readTail(file, stat, cursor);
+        },
+      },
+    ).scan({ scope: "full" });
+    const rolloutOpenCoverage = recordExplicitFullHistoryCoverage(
+      buffer.database,
+      "codex",
+      rolloutOpenFailure,
+    );
+
+    const rolloutFull = await new RolloutTailer(
+      buffer,
+      sandbox.codexSessions,
+      () => [],
+    ).scan({ scope: "full" });
+    const rolloutCoverage = recordExplicitFullHistoryCoverage(
+      buffer.database,
+      "codex",
+      rolloutFull,
+    );
+    const transcriptFull = await new TranscriptTailer(
+      buffer,
+      sandbox.claudeProjects,
+    ).scan({ scope: "full" });
+    const completedCoverage = recordExplicitFullHistoryCoverage(
+      buffer.database,
+      "claude_code",
+      transcriptFull,
+    );
+    const rolloutIdempotent = await new RolloutTailer(
+      buffer,
+      sandbox.codexSessions,
+      () => [],
+    ).scan({ scope: "full" });
+    const transcriptIdempotent = await new TranscriptTailer(
+      buffer,
+      sandbox.claudeProjects,
+    ).scan({ scope: "full" });
+
+    // Complete malformed lines must remain unresolved across unchanged scans
+    // and process restarts. Repairing the file then causes a real re-read and
+    // permits a new exhaustive full attempt to promote both sources.
+    const malformedRollout = path.join(
+      path.dirname(fixture.recentRollout),
+      "rollout-malformed-019e6000-0000-7000-8000-000000000003.jsonl",
+    );
+    const malformedTranscript = path.join(
+      path.dirname(fixture.recentTranscript),
+      "019e6000-0000-7000-8000-000000000004.jsonl",
+    );
+    fs.writeFileSync(
+      malformedRollout,
+      '{"type":"event_msg","payload":{"type":"token_count"\n',
+      { mode: 0o600 },
+    );
+    fs.writeFileSync(
+      malformedTranscript,
+      '{"type":"assistant","message":{"usage":\n',
+      { mode: 0o600 },
+    );
+    const rolloutParseFailure = await new RolloutTailer(
+      buffer,
+      sandbox.codexSessions,
+      () => [],
+    ).scan({ scope: "full" });
+    const rolloutParseFailureCoverage = recordExplicitFullHistoryCoverage(
+      buffer.database,
+      "codex",
+      rolloutParseFailure,
+    );
+    const transcriptParseFailure = await new TranscriptTailer(
+      buffer,
+      sandbox.claudeProjects,
+    ).scan({ scope: "full" });
+    const transcriptParseFailureCoverage = recordExplicitFullHistoryCoverage(
+      buffer.database,
+      "claude_code",
+      transcriptParseFailure,
+    );
+    const parseFailureCursorsAbsent =
+      (buffer.database
+        .prepare(`select count(*) as count from rollout_scan_state where file in (?, ?)`)
+        .get(malformedRollout, malformedTranscript) as { count: number }).count === 0;
+    const rolloutParseRetry = await new RolloutTailer(
+      buffer,
+      sandbox.codexSessions,
+      () => [],
+    ).scan({ scope: "full" });
+    const rolloutParseRetryCoverage = recordExplicitFullHistoryCoverage(
+      buffer.database,
+      "codex",
+      rolloutParseRetry,
+    );
+    const transcriptParseRetry = await new TranscriptTailer(
+      buffer,
+      sandbox.claudeProjects,
+    ).scan({ scope: "full" });
+    const transcriptParseRetryCoverage = recordExplicitFullHistoryCoverage(
+      buffer.database,
+      "claude_code",
+      transcriptParseRetry,
+    );
+    const unchangedParseFailuresRetained =
+      rolloutParseFailure.parseErrors === 1 &&
+      transcriptParseFailure.parseErrors === 1 &&
+      !rolloutParseFailureCoverage.promoted &&
+      !transcriptParseFailureCoverage.promoted &&
+      rolloutParseFailureCoverage.coverage.status === "complete" &&
+      transcriptParseFailureCoverage.coverage.status === "complete" &&
+      rolloutParseRetry.filesRead === 1 &&
+      transcriptParseRetry.filesRead === 1 &&
+      rolloutParseRetry.parseErrors === 1 &&
+      transcriptParseRetry.parseErrors === 1 &&
+      !rolloutParseRetryCoverage.promoted &&
+      !transcriptParseRetryCoverage.promoted &&
+      parseFailureCursorsAbsent;
+
+    buffer.close();
+    buffer = new LocalEventBuffer(sandbox.ledger);
+    const rolloutParseRestart = await new RolloutTailer(
+      buffer,
+      sandbox.codexSessions,
+      () => [],
+    ).scan({ scope: "full" });
+    const rolloutParseRestartCoverage = recordExplicitFullHistoryCoverage(
+      buffer.database,
+      "codex",
+      rolloutParseRestart,
+    );
+    const transcriptParseRestart = await new TranscriptTailer(
+      buffer,
+      sandbox.claudeProjects,
+    ).scan({ scope: "full" });
+    const transcriptParseRestartCoverage = recordExplicitFullHistoryCoverage(
+      buffer.database,
+      "claude_code",
+      transcriptParseRestart,
+    );
+    const parseFailuresPersistAcrossRestart =
+      rolloutParseRestart.filesRead === 1 &&
+      transcriptParseRestart.filesRead === 1 &&
+      rolloutParseRestart.parseErrors === 1 &&
+      transcriptParseRestart.parseErrors === 1 &&
+      !rolloutParseRestartCoverage.promoted &&
+      !transcriptParseRestartCoverage.promoted &&
+      rolloutParseRestartCoverage.coverage.status === "complete" &&
+      transcriptParseRestartCoverage.coverage.status === "complete" &&
+      rolloutParseRestartCoverage.coverage.sources.find(
+        (source) => source.source === "codex",
+      )?.latestFullAttempt?.parseErrors === 1 &&
+      transcriptParseRestartCoverage.coverage.sources.find(
+        (source) => source.source === "claude_code",
+      )?.latestFullAttempt?.parseErrors === 1;
+
+    fs.writeFileSync(
+      malformedRollout,
+      `${JSON.stringify({
+        timestamp: fixture.observedAt,
+        type: "event_msg",
+        payload: { type: "token_count" },
+      })}\n`,
+      { mode: 0o600 },
+    );
+    fs.writeFileSync(
+      malformedTranscript,
+      `${JSON.stringify({
+        type: "assistant",
+        sessionId: "019e6000-0000-7000-8000-000000000004",
+        timestamp: fixture.observedAt,
+        message: { id: "repaired-empty-usage", usage: {} },
+      })}\n`,
+      { mode: 0o600 },
+    );
+    const rolloutParseRepair = await new RolloutTailer(
+      buffer,
+      sandbox.codexSessions,
+      () => [],
+    ).scan({ scope: "full" });
+    const rolloutParseRepairCoverage = recordExplicitFullHistoryCoverage(
+      buffer.database,
+      "codex",
+      rolloutParseRepair,
+    );
+    const transcriptParseRepair = await new TranscriptTailer(
+      buffer,
+      sandbox.claudeProjects,
+    ).scan({ scope: "full" });
+    const transcriptParseRepairCoverage = recordExplicitFullHistoryCoverage(
+      buffer.database,
+      "claude_code",
+      transcriptParseRepair,
+    );
+    const repairedParseFailuresPromote =
+      rolloutParseRepair.filesRead === 1 &&
+      transcriptParseRepair.filesRead === 1 &&
+      rolloutParseRepair.parseErrors === 0 &&
+      transcriptParseRepair.parseErrors === 0 &&
+      rolloutParseRepairCoverage.promoted &&
+      transcriptParseRepairCoverage.promoted &&
+      transcriptParseRepairCoverage.coverage.status === "complete" &&
+      (buffer.database
+        .prepare(`select count(*) as count from rollout_scan_state where file in (?, ?)`)
+        .get(malformedRollout, malformedTranscript) as { count: number }).count === 2;
+
+    const transcriptFailureAfterComplete = await new TranscriptTailer(
+      buffer,
+      sandbox.claudeProjects,
+      {
+        ...DEFAULT_JSONL_TAILER_IO,
+        stat: (file) => {
+          if (path.resolve(file) === path.resolve(fixture.recentTranscript)) {
+            throw syntheticFsError("ENOENT");
+          }
+          return DEFAULT_JSONL_TAILER_IO.stat(file);
+        },
+      },
+    ).scan({ scope: "full" });
+    const preservedCoverage = recordExplicitFullHistoryCoverage(
+      buffer.database,
+      "claude_code",
+      transcriptFailureAfterComplete,
+    );
+    const preservedClaudeStatus = preservedCoverage.coverage.sources.find(
+      (source) => source.source === "claude_code",
+    );
+    const inaccessibleItemsBlockPromotion =
+      transcriptPartial.activity.truncated &&
+      !transcriptPartial.exhaustive &&
+      !partialCoverage.promoted &&
+      rolloutDiscoveryFailure.discoveryErrors === 1 &&
+      !rolloutDiscoveryFailure.exhaustive &&
+      !rolloutDiscoveryCoverage.promoted &&
+      transcriptStatFailure.statErrors === 1 &&
+      !transcriptStatFailure.exhaustive &&
+      !transcriptStatCoverage.promoted &&
+      rolloutOpenFailure.readErrors === 1 &&
+      !rolloutOpenFailure.exhaustive &&
+      !rolloutOpenCoverage.promoted;
+    const failedAttemptDisclosedAfterComplete =
+      !preservedCoverage.promoted &&
+      preservedCoverage.coverage.status === "complete" &&
+      preservedClaudeStatus?.status === "complete" &&
+      preservedClaudeStatus.latestFullAttempt?.status === "incomplete" &&
+      preservedClaudeStatus.latestFullAttempt.statErrors === 1;
+    const fullBackfillResumableIdempotent =
+      rolloutFull.scope === "full" &&
+      rolloutFull.exhaustive &&
+      rolloutCoverage.promoted &&
+      rolloutCoverage.coverage.status === "incomplete" &&
+      transcriptFull.exhaustive &&
+      transcriptFull.filesRead > 0 &&
+      completedCoverage.promoted &&
+      completedCoverage.coverage.status === "complete" &&
+      rolloutIdempotent.filesRead === 0 &&
+      transcriptIdempotent.filesRead === 0 &&
+      rolloutIdempotent.eventsAppended === 0 &&
+      transcriptIdempotent.eventsAppended === 0 &&
+      inaccessibleItemsBlockPromotion &&
+      failedAttemptDisclosedAfterComplete &&
+      unchangedParseFailuresRetained &&
+      parseFailuresPersistAcrossRestart &&
+      repairedParseFailuresPromote;
+
+    buffer.close();
+    buffer = new LocalEventBuffer(sandbox.ledger);
+    const persistedCoverage = historyCoverageStatus(buffer.database);
+    const persistedClaudeStatus = persistedCoverage.sources.find(
+      (source) => source.source === "claude_code",
+    );
+    const coveragePersistsAcrossRestart =
+      persistedCoverage.status === "complete" &&
+      persistedClaudeStatus?.status === "complete" &&
+      persistedClaudeStatus.latestFullAttempt?.status === "incomplete" &&
+      persistedClaudeStatus.latestFullAttempt.statErrors === 1;
+
+    const explicitFullReads =
+      transcriptPartial.filesRead +
+      rolloutDiscoveryFailure.filesRead +
+      transcriptStatFailure.filesRead +
+      rolloutOpenFailure.filesRead +
+      rolloutFull.filesRead +
+      transcriptFull.filesRead +
+      rolloutIdempotent.filesRead +
+      transcriptIdempotent.filesRead +
+      rolloutParseFailure.filesRead +
+      transcriptParseFailure.filesRead +
+      rolloutParseRetry.filesRead +
+      transcriptParseRetry.filesRead +
+      rolloutParseRestart.filesRead +
+      transcriptParseRestart.filesRead +
+      rolloutParseRepair.filesRead +
+      transcriptParseRepair.filesRead +
+      transcriptFailureAfterComplete.filesRead;
+    counters.filesOpened =
+      firstRun.rollout.filesRead +
+      firstRun.transcript.filesRead +
+      restartRun.rollout.filesRead +
+      restartRun.transcript.filesRead +
+      appendedRun.rollout.filesRead +
+      appendedRun.transcript.filesRead +
+      afterAppendRun.rollout.filesRead +
+      afterAppendRun.transcript.filesRead +
+      replayRun.rollout.filesRead +
+      replayRun.transcript.filesRead +
+      explicitFullReads;
+    counters.fileBytesRead =
+      firstRun.rollout.bytesRead +
+      firstRun.transcript.bytesRead +
+      appendedRun.rollout.bytesRead +
+      appendedRun.transcript.bytesRead +
+      replayRun.rollout.bytesRead +
+      replayRun.transcript.bytesRead +
+      transcriptPartial.bytesRead +
+      rolloutDiscoveryFailure.bytesRead +
+      transcriptStatFailure.bytesRead +
+      rolloutOpenFailure.bytesRead +
+      rolloutFull.bytesRead +
+      transcriptFull.bytesRead +
+      rolloutIdempotent.bytesRead +
+      transcriptIdempotent.bytesRead +
+      rolloutParseFailure.bytesRead +
+      transcriptParseFailure.bytesRead +
+      rolloutParseRetry.bytesRead +
+      transcriptParseRetry.bytesRead +
+      rolloutParseRestart.bytesRead +
+      transcriptParseRestart.bytesRead +
+      rolloutParseRepair.bytesRead +
+      transcriptParseRepair.bytesRead +
+      transcriptFailureAfterComplete.bytesRead;
+    counters.fullHistoryFileReads = explicitFullReads;
+    counters.rawEventWrites = firstMutations.inserted + appendMutations.inserted;
+    counters.rawEventRewrites =
+      firstMutations.updated +
+      firstMutations.deleted +
+      secondMutations.updated +
+      secondMutations.deleted +
+      restartMutations.updated +
+      restartMutations.deleted +
+      appendMutations.updated +
+      appendMutations.deleted +
+      replayMutations.updated +
+      replayMutations.deleted;
+    counters.maintenanceRuns = finalStatus.runCount + restartScheduler.status().runCount;
+    counters.overlappingJobs =
+      finalStatus.overlappingJobs + restartScheduler.status().overlappingJobs;
+    counters.listenersCreated = 1;
+    counters.filesystemEntriesScanned = directoryObservation.entries;
+
     const passed =
-      firstRunBounded &&
-      deterministicIdleCounters &&
+      fixture.oldFiles >= 2_000 &&
+      firstBootRecentOnly &&
+      oldContentReadsAtBoot === 0 &&
+      unchangedCoalescedCycle &&
       coalescingProved &&
       counterProvenanceProved &&
-      fullHistoryFileReads === 0 &&
-      fileBytesRead === 0 &&
-      rawEventWrites === 0 &&
-      rawEventRewrites === 0 &&
-      repriceRowsVisited === 0 &&
-      reconciliationRowsVisited === 0 &&
-      enrichmentRowsVisited === 0;
+      recentDidNotPromote &&
+      restartZeroWork &&
+      appendedExactlyOnce &&
+      durableReceiptCounters &&
+      recentPromotionRejected &&
+      statusSeparatesCurrentFromHistory &&
+      fullBackfillResumableIdempotent &&
+      coveragePersistsAcrossRestart &&
+      explicitFullReads === fixture.oldFiles + 8 &&
+      counters.rawEventWrites === 4 &&
+      counters.rawEventRewrites === 0 &&
+      counters.overlappingJobs === 0;
 
     return {
       id: "no_change_constant_work",
       required: true,
       status: passed ? "pass" : "fail",
       detail: passed
-        ? "Real rollout/transcript maintenance completed one bounded migration, then two unchanged cycles performed no history reads, event mutations, Codex reconciliation/repricing/enrichment visits, or overlapping work."
-        : "No-change production contract failed one or more deterministic work assertions.",
+        ? "Recent-only boot skipped thousands of old content files, coalesced without overlap, restarted idle, captured appends exactly once, kept history incomplete, then explicit resumable/idempotent full scans persisted complete coverage."
+        : "Recent-first boot, durable receipt, restart, status, or explicit history coverage assertions failed.",
       durationMs: Math.round((performance.now() - started) * 100) / 100,
       counters,
       measurements: {
-        firstRunBounded,
+        syntheticHistoricalFiles: fixture.oldFiles,
+        firstBootRecentOnly,
+        oldContentReadsAtBoot,
         initialEventsAppended: firstRun.rawEventWrites,
-        unchangedCycles: 2,
-        deterministicIdleCounters,
+        bootBytesRead: firstRun.rollout.bytesRead + firstRun.transcript.bytesRead,
+        recentFixtureBytes: fixture.recentBytes,
+        claudeOldMetadataEntriesSkipped:
+          firstRun.transcript.filesSkippedOutsideRecentWindow,
+        claudeMetadataEnumerationCaveat:
+          "recent scan stats discovered Claude files but opens no old content",
+        unchangedCoalescedCycle,
+        restartZeroWork,
+        appendedExactlyOnce,
+        durableReceiptCounters,
+        recentPromotionRejected,
+        statusSeparatesCurrentFromHistory,
+        fullBackfillResumableIdempotent,
+        inaccessibleItemsBlockPromotion,
+        failedAttemptDisclosedAfterComplete,
+        unchangedParseFailuresRetained,
+        parseFailuresPersistAcrossRestart,
+        repairedParseFailuresPromote,
+        parseFailureRetryReads:
+          rolloutParseRetry.filesRead + transcriptParseRetry.filesRead,
+        parseFailureRestartReads:
+          rolloutParseRestart.filesRead + transcriptParseRestart.filesRead,
+        parseRepairReads:
+          rolloutParseRepair.filesRead + transcriptParseRepair.filesRead,
+        forcedDiscoveryErrors: rolloutDiscoveryFailure.discoveryErrors,
+        forcedStatErrors: transcriptStatFailure.statErrors,
+        forcedReadErrors: rolloutOpenFailure.readErrors,
+        persistedLatestFullAttemptStatus:
+          persistedClaudeStatus?.latestFullAttempt?.status ?? "missing",
+        coveragePersistsAcrossRestart,
+        finalHistoricalCoverage: persistedCoverage.status,
+        truncatedTranscriptFilesRead: transcriptPartial.filesRead,
+        resumedTranscriptFilesRead: transcriptFull.filesRead,
+        explicitFullReads,
         concurrentTriggersQueued: 2,
-        runModes: runModes.map((recentOnly) => (recentOnly ? "recent" : "full")).join(","),
         triggerCount: finalStatus.triggerCount,
         coalescedTriggerCount: finalStatus.coalescedTriggerCount,
         schedulerRunCount: finalStatus.runCount,
         maxConcurrentJobs: finalStatus.maxConcurrentJobs,
         filesystemEnumerationCalls: directoryObservation.calls,
         setupFilesystemEntriesScanned: directoryEntryDeltas[0] ?? 0,
-        unchangedFilesystemEntriesScanned:
-          (directoryEntryDeltas[1] ?? 0) + (directoryEntryDeltas[2] ?? 0),
+        unchangedFilesystemEntriesScanned: directoryEntryDeltas[1] ?? 0,
         filesystemObserverRestored: directoryObservation.restored,
         counterProvenanceProved,
         filesystemCounterSource: "observed fs.readdirSync returned entries",
@@ -1037,7 +1642,7 @@ export async function runNoChangeConstantWorkContract(
       id: "no_change_constant_work",
       required: true,
       status: "fail",
-      detail: `No-change production contract raised ${
+      detail: `Recent-first boot production contract raised ${
         error instanceof Error ? error.name : "UnknownError"
       }; error text is omitted from the receipt.`,
       durationMs: Math.round((performance.now() - started) * 100) / 100,
