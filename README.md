@@ -121,6 +121,10 @@ unrelated settings, keeps exact preimage backups for changed files, and makes
 no new backups on a no-op retry. Interrupted apply is resumable with the same
 commit and runtime arguments. A failure receipt names the literal retained
 checkout/dependency/config/service state; it does not claim rollback.
+Apply also stores a private, hash-only source/runtime identity inside the
+checkout's Git metadata. Verify refuses a different commit, Node executable,
+pnpm executable, version, or repository provenance; it does not fetch or
+upgrade anything.
 
 `--dry-run` is a byte no-op: it does not fetch, clone, install, write tool or
 Plimsoll files/backups, touch the plist/ledger, inspect credentials, bind a

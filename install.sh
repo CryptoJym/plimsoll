@@ -35,6 +35,8 @@ ERROR_STAGE="none"
 RECEIPT_EMITTED=0
 INSTALL_LOCK="${PLIMSOLL_DIR}.plimsoll-install.lock"
 LOCK_HELD=0
+INSTALL_IDENTITY_PATH="$PLIMSOLL_DIR/.git/plimsoll-source-install.v1.json"
+INSTALLED_IDENTITY_MATCHED="false"
 
 usage() {
   cat <<'EOF'
@@ -181,6 +183,14 @@ select_pnpm() {
 select_node || exit 1
 select_pnpm || exit 1
 
+case "$PLIMSOLL_DIR" in
+  /*) ;;
+  *) echo "PLIMSOLL_DIR must be an absolute path." >&2; exit 1 ;;
+esac
+PATH_INPUTS="$PLIMSOLL_DIR\n$NODE_BIN\n$PNPM_BIN" "$NODE_BIN" -e '
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(process.env.PATH_INPUTS ?? "")) process.exit(1);
+' || { echo "Target and runtime paths must not contain control characters." >&2; exit 1; }
+
 SYSTEM_NAME="$(uname -s 2>/dev/null || true)"
 ARCHITECTURE="$(uname -m 2>/dev/null || true)"
 if [ "$SYSTEM_NAME" != "Darwin" ]; then
@@ -213,6 +223,7 @@ emit_receipt() {
   RECEIPT_SERVICE="$SERVICE_RESULT" \
   RECEIPT_READINESS="$READINESS" \
   RECEIPT_ERROR_STAGE="$ERROR_STAGE" \
+  RECEIPT_INSTALLED_IDENTITY_MATCHED="$INSTALLED_IDENTITY_MATCHED" \
   "$NODE_BIN" -e '
     const env = process.env;
     const state = env.RECEIPT_STATE;
@@ -245,6 +256,7 @@ emit_receipt() {
         architecture: env.RECEIPT_ARCH,
         absoluteExecutablesSelected: true,
         identityBoundByDoctor: ["service_ready", "signal_verified"].includes(readiness),
+        installedIdentityMatched: env.RECEIPT_INSTALLED_IDENTITY_MATCHED === "true",
       },
       retainedState: {
         checkout: env.RECEIPT_CHECKOUT,
@@ -319,6 +331,84 @@ acquire_lock() {
   printf '%s\n' "$$" > "$INSTALL_LOCK/owner.pid" || fail "install_lock_owner" $?
   LOCK_HELD=1
 }
+
+persist_install_identity() {
+  IDENTITY_PATH="$INSTALL_IDENTITY_PATH" \
+  IDENTITY_SHA="$SOURCE_REF" \
+  IDENTITY_PROVENANCE="$REPO_PROVENANCE" \
+  IDENTITY_NODE_PATH="$NODE_BIN" \
+  IDENTITY_NODE_VERSION="$NODE_VERSION" \
+  IDENTITY_PNPM_PATH="$PNPM_BIN" \
+  IDENTITY_PNPM_VERSION="$PNPM_VERSION" \
+  "$NODE_BIN" -e '
+    const crypto = require("node:crypto");
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const hash = value => `sha256:${crypto.createHash("sha256").update(value).digest("hex")}`;
+    const target = process.env.IDENTITY_PATH;
+    const payload = `${JSON.stringify({
+      schema: "plimsoll.source-install.v1",
+      sourceCommit: process.env.IDENTITY_SHA,
+      sourceProvenance: process.env.IDENTITY_PROVENANCE,
+      nodeVersion: process.env.IDENTITY_NODE_VERSION,
+      nodePathHash: hash(process.env.IDENTITY_NODE_PATH),
+      pnpmVersion: process.env.IDENTITY_PNPM_VERSION,
+      pnpmPathHash: hash(process.env.IDENTITY_PNPM_PATH),
+    }, null, 2)}\n`;
+    try {
+      const stat = fs.lstatSync(target);
+      if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) process.exit(2);
+      const current = fs.readFileSync(target, "utf8");
+      if (current === payload) process.exit(0);
+    } catch (error) {
+      if (error?.code !== "ENOENT") process.exit(2);
+    }
+    const temporary = `${target}.prepared-${process.pid}`;
+    try {
+      fs.writeFileSync(temporary, payload, { encoding: "utf8", flag: "wx", mode: 0o600 });
+      const handle = fs.openSync(temporary, "r");
+      try { fs.fsyncSync(handle); } finally { fs.closeSync(handle); }
+      fs.renameSync(temporary, target);
+      const directory = fs.openSync(path.dirname(target), "r");
+      try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+    } finally {
+      try { fs.unlinkSync(temporary); } catch (error) { if (error?.code !== "ENOENT") throw error; }
+    }
+  ' >/dev/null 2>&1 || return 1
+  INSTALLED_IDENTITY_MATCHED="true"
+}
+
+verify_install_identity() {
+  IDENTITY_PATH="$INSTALL_IDENTITY_PATH" \
+  IDENTITY_SHA="$SOURCE_REF" \
+  IDENTITY_PROVENANCE="$REPO_PROVENANCE" \
+  IDENTITY_NODE_PATH="$NODE_BIN" \
+  IDENTITY_NODE_VERSION="$NODE_VERSION" \
+  IDENTITY_PNPM_PATH="$PNPM_BIN" \
+  IDENTITY_PNPM_VERSION="$PNPM_VERSION" \
+  "$NODE_BIN" -e '
+    const crypto = require("node:crypto");
+    const fs = require("node:fs");
+    const hash = value => `sha256:${crypto.createHash("sha256").update(value).digest("hex")}`;
+    try {
+      const stat = fs.lstatSync(process.env.IDENTITY_PATH);
+      if (!stat.isFile() || stat.isSymbolicLink() || (stat.mode & 0o077) !== 0) process.exit(1);
+      const value = JSON.parse(fs.readFileSync(process.env.IDENTITY_PATH, "utf8"));
+      const keys = Object.keys(value).sort().join(",");
+      if (
+        keys !== "nodePathHash,nodeVersion,pnpmPathHash,pnpmVersion,schema,sourceCommit,sourceProvenance" ||
+        value.schema !== "plimsoll.source-install.v1" ||
+        value.sourceCommit !== process.env.IDENTITY_SHA ||
+        value.sourceProvenance !== process.env.IDENTITY_PROVENANCE ||
+        value.nodeVersion !== process.env.IDENTITY_NODE_VERSION ||
+        value.nodePathHash !== hash(process.env.IDENTITY_NODE_PATH) ||
+        value.pnpmVersion !== process.env.IDENTITY_PNPM_VERSION ||
+        value.pnpmPathHash !== hash(process.env.IDENTITY_PNPM_PATH)
+      ) process.exit(1);
+    } catch { process.exit(1); }
+  ' >/dev/null 2>&1 || return 1
+  INSTALLED_IDENTITY_MATCHED="true"
+}
 trap interrupted INT TERM HUP
 trap cleanup_lock EXIT
 
@@ -348,7 +438,7 @@ case "$PNPM_VERSION" in
 esac
 
 if [ "$MODE" = "verify" ]; then
-  if [ ! -d "$PLIMSOLL_DIR/.git" ]; then
+  if [ ! -d "$PLIMSOLL_DIR/.git" ] || [ -L "$PLIMSOLL_DIR" ] || [ -L "$PLIMSOLL_DIR/.git" ]; then
     CHECKOUT_RESULT="missing"
     fail "checkout_missing" 1
   fi
@@ -361,9 +451,10 @@ if [ "$MODE" = "verify" ]; then
   DEPENDENCIES_RESULT="retained_not_reinstalled"
   CONFIG_RESULT="read_only_verification"
   SERVICE_RESULT="read_only_verification"
+  verify_install_identity || fail "installed_identity" 1
 else
   acquire_lock
-  if [ -L "$PLIMSOLL_DIR" ]; then
+  if [ -L "$PLIMSOLL_DIR" ] || [ -L "$PLIMSOLL_DIR/.git" ]; then
     CHECKOUT_RESULT="symlink_conflict"
     fail "checkout_target" 1
   fi
@@ -512,11 +603,13 @@ fi
 
 if [ "$READINESS" = "service_ready" ]; then
   SERVICE_RESULT="service_ready"
+  persist_install_identity || fail "installed_identity_write" 1
   emit_receipt "service_ready"
   exit 0
 fi
 if [ "$READINESS" = "signal_verified" ]; then
   SERVICE_RESULT="signal_verified"
+  persist_install_identity || fail "installed_identity_write" 1
   emit_receipt "signal_verified"
   exit 0
 fi

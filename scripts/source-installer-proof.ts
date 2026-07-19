@@ -363,6 +363,7 @@ exit 0
         applyReceipt.runtime.nodeVersion === process.versions.node &&
         applyReceipt.runtime.pnpmVersion === "10.25.0" &&
         applyReceipt.retainedState.toolConfig === "applied_with_exact_preimage_backups" &&
+        applyReceipt.runtime.installedIdentityMatched === true &&
         applyReceipt.credentialOperations === 0 &&
         applyReceipt.rollbackClaimed === false,
       { apply, applyReceipt });
@@ -373,6 +374,40 @@ exit 0
         !applyCommands.includes("git pull") &&
         !applyCommands.includes("git clone"),
       applyCommands);
+
+    const installIdentity = path.join(applyTarget, ".git", "plimsoll-source-install.v1.json");
+    check("apply_persists_private_hash_only_runtime_identity",
+      (fs.statSync(installIdentity).mode & 0o777) === 0o600 &&
+        !fs.readFileSync(installIdentity, "utf8").includes(process.execPath) &&
+        !fs.readFileSync(installIdentity, "utf8").includes(pnpm) &&
+        JSON.parse(fs.readFileSync(installIdentity, "utf8")).sourceCommit === expectedSha,
+      fs.readFileSync(installIdentity, "utf8"));
+
+    const alternateNode = path.join(sandbox, "alternate-node-22");
+    fs.symlinkSync(process.execPath, alternateNode);
+    const wrongRuntimeVerify = await run([
+      "verify",
+      "--ref",
+      expectedSha,
+      "--node",
+      alternateNode,
+      "--pnpm",
+      pnpm,
+    ], {
+      cwd: neutral,
+      env: {
+        ...baseEnv,
+        PLIMSOLL_DIR: applyTarget,
+        PLIMSOLL_FIXTURE_STATE_DIR: applyState,
+        PLIMSOLL_FIXTURE_DOCTOR: "signal_verified",
+      },
+    });
+    const wrongRuntimeReceipt = parseReceipt(wrongRuntimeVerify);
+    check("verify_is_bound_to_installed_source_and_runtime_identity",
+      wrongRuntimeVerify.code !== 0 && wrongRuntimeReceipt.errorStage === "installed_identity" &&
+        wrongRuntimeReceipt.runtime.installedIdentityMatched === false &&
+        wrongRuntimeReceipt.readiness === "not_checked",
+      { wrongRuntimeVerify, wrongRuntimeReceipt });
 
     const coldVerify = await run(["verify", ...sourceArgs], {
       cwd: neutral,
@@ -495,6 +530,7 @@ exit 0
 
     const allReceipts = [
       apply.stdout,
+      wrongRuntimeVerify.stdout,
       coldVerify.stdout,
       contradictory.stdout,
       signalVerify.stdout,
