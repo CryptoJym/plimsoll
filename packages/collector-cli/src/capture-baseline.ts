@@ -765,6 +765,7 @@ export function stageAutomaticCaptureBaselinePending(
   pendingMetadata: number;
   newlyPending: number;
   accepted: boolean[];
+  deferred: boolean[];
 } {
   ensureCaptureBaselineSchema(database);
   if (
@@ -781,6 +782,7 @@ export function stageAutomaticCaptureBaselinePending(
   let pendingMetadata = 0;
   let newlyPending = 0;
   const accepted: boolean[] = [];
+  const deferred: boolean[] = [];
   database.transaction(() => {
     const current = stateRow(database, source);
     if (!current || !stateIsValid(current) || current.runId !== input.runId) {
@@ -797,14 +799,28 @@ export function stageAutomaticCaptureBaselinePending(
        ) values (?, ?, ?, ?, ?, ?)
        on conflict(source, run_id, path_key, generation_key) do nothing`,
     );
+    const alreadyStaged = database.prepare(
+      `select 1 from ${GENERATION_TABLE}
+       where source = ? and run_id = ? and generation_key = ?`,
+    );
     pendingMetadata = pendingGenerationCount(database, source, input.runId);
     for (const observation of normalized as NormalizedObservation[]) {
       if (exists.get(source, input.runId, observation.pathKey, observation.generationKey)) {
         accepted.push(true);
+        deferred.push(false);
+        continue;
+      }
+      // A stable-sweep observation that is already durably staged needs no
+      // second queue row or counter increment. Discovery already obtained its
+      // stat receipt; skipping it keeps cumulative progress identity-unique.
+      if (alreadyStaged.get(source, input.runId, observation.generationKey)) {
+        accepted.push(false);
+        deferred.push(false);
         continue;
       }
       if (pendingMetadata >= AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP) {
         accepted.push(false);
+        deferred.push(true);
         continue;
       }
       const inserted = insert.run(
@@ -818,6 +834,7 @@ export function stageAutomaticCaptureBaselinePending(
       newlyPending += inserted;
       pendingMetadata += inserted;
       accepted.push(inserted === 1);
+      deferred.push(inserted !== 1);
     }
     if (pendingMetadata > AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP) {
       throw new Error("automatic_baseline_pending_metadata_cap_exceeded");
@@ -832,7 +849,7 @@ export function stageAutomaticCaptureBaselinePending(
        where source = ? and run_id = ? and status = 'in_progress'`,
     ).run(input.observedAt, filesDiscovered, source, input.runId);
   }).immediate();
-  return { filesDiscovered, pendingMetadata, newlyPending, accepted };
+  return { filesDiscovered, pendingMetadata, newlyPending, accepted, deferred };
 }
 
 export function resolveAutomaticCaptureBaselinePending(

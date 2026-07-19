@@ -458,7 +458,7 @@ export class RolloutTailer {
         );
         attempt.filesDiscovered = pending.filesDiscovered;
         const acceptedFiles = chunk.files.filter((_, index) => pending.accepted[index]);
-        if (acceptedFiles.length < chunk.files.length) {
+        if (pending.deferred.some(Boolean)) {
           attempt.capacityDeferredThisSweep = true;
         }
         attempt.pendingFiles.push(...acceptedFiles);

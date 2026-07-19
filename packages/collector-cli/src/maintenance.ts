@@ -1017,14 +1017,14 @@ export class AutomaticMaintenanceCadence {
   private classifyRetry(
     before: ReturnType<typeof captureBaselineStatus>["progress"],
     after: ReturnType<typeof captureBaselineStatus>["progress"],
+    discoveryAdvanced: boolean,
   ): "startup" | "normal" {
     const advanced =
       (before.state === "not_established" && after.state === "in_progress") ||
       after.sourcesComplete > before.sourcesComplete ||
-      after.filesDiscovered > before.filesDiscovered ||
-      after.filesValidated > before.filesValidated ||
       after.filesBaselined > before.filesBaselined ||
-      after.pendingMetadata < before.pendingMetadata;
+      after.pendingMetadata !== before.pendingMetadata ||
+      discoveryAdvanced;
     return after.state === "in_progress" && advanced ? "startup" : "normal";
   }
 
@@ -1051,9 +1051,15 @@ export class AutomaticMaintenanceCadence {
     this.inFlight = true;
     this.triggerCount += 1;
     let failed = false;
+    let discoveryAdvanced = false;
     const baselineBefore = this.baselineStatus().progress;
     try {
-      await requestAutomaticRecentMaintenance(this.scheduler);
+      const results = await requestAutomaticRecentMaintenance(this.scheduler);
+      discoveryAdvanced = results.some(
+        (result) =>
+          result.rollout.activity.discoveryEntries > 0 ||
+          result.transcript.activity.discoveryEntries > 0,
+      );
     } catch (error) {
       failed = true;
       this.failedTriggers += 1;
@@ -1062,7 +1068,11 @@ export class AutomaticMaintenanceCadence {
       this.inFlight = false;
       if (this.accepting) {
         const baselineAfter = this.baselineStatus().progress;
-        this.schedule(failed ? "normal" : this.classifyRetry(baselineBefore, baselineAfter));
+        this.schedule(
+          failed
+            ? "normal"
+            : this.classifyRetry(baselineBefore, baselineAfter, discoveryAdvanced),
+        );
       }
     }
   }

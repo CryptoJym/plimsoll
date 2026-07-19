@@ -467,6 +467,19 @@ function assertResourceReceipt(receipt: unknown) {
   assert.equal(maintenanceMeasurements.exactPendingIdentityProved, true);
   assert.equal(maintenanceMeasurements.stalledCadenceBackoffProved, true);
 
+  const ownershipMeasurements = childRecord(
+    scenario("duplicate_start_single_owner").measurements,
+    "duplicate-start ownership measurements",
+  );
+  assert.equal(ownershipMeasurements.stopCommandExitedCleanly, true);
+  assert.equal(ownershipMeasurements.stopReceiptReportedStopped, true);
+  assert.equal(ownershipMeasurements.stopReceiptReason, "none");
+  assert.equal(ownershipMeasurements.ownerExitedCleanly, true);
+  assert.equal(integer(ownershipMeasurements.ownerExitCode, "owner exit code"), 0);
+  assert.equal(ownershipMeasurements.ownerExitSignal, "none");
+  assert.equal(ownershipMeasurements.stoppedThroughCli, true);
+  assert.equal(ownershipMeasurements.pidRecordRemoved, true);
+
   const dashboardMeasurements = childRecord(
     scenario("dashboard_projection_budget").measurements,
     "dashboard measurements",

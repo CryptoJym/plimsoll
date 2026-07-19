@@ -2524,7 +2524,9 @@ function spawnCollectorCli(
   });
   const exit = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
     (resolve) => {
-      child.once("exit", (code, signal) => {
+      // `exit` may precede the final stdout data event. Resolve on `close` so
+      // callers never classify a partially delivered JSON receipt.
+      child.once("close", (code, signal) => {
         if (!activeSettled) {
           activeSettled = true;
           resolveActive(null);
@@ -2589,8 +2591,10 @@ export async function runDuplicateStartSingleOwnerContract(
   const started = performance.now();
   const counters = emptyWorkCounters();
   const children: CapturedChild[] = [];
+  let lifecycleStage = "build";
   try {
     const packagedCli = buildPackagedCollectorCli(sandbox);
+    lifecycleStage = "start_race";
     const port = await assignLoopbackPort();
     fs.writeFileSync(
       path.join(sandbox.plimsollHome, "collector.config.json"),
@@ -2617,6 +2621,7 @@ export async function runDuplicateStartSingleOwnerContract(
     const owner = candidates[ownerChoice.index]!;
     const loser = candidates[ownerChoice.index === 0 ? 1 : 0]!;
 
+    lifecycleStage = "owner_identity";
     const ownerRead = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);
     if (ownerRead.kind !== "current") throw new Error("OwnerPidRecordMissing");
     const ownerIdentity: CollectorRuntimeIdentity = {
@@ -2689,6 +2694,7 @@ export async function runDuplicateStartSingleOwnerContract(
       counters.listenersCreated === 1 &&
       counters.restartRequests === 0;
 
+    lifecycleStage = "stop_command";
     const stopper = spawnCollectorCli(sandbox, packagedCli.cliPath, "stop");
     children.push(stopper);
     const stopperUsesExactPackagePath =
@@ -2697,13 +2703,13 @@ export async function runDuplicateStartSingleOwnerContract(
       stopper.child.spawnargs[2] === "stop";
     const stopperExit = await withDeadline(stopper.exit, 20_000, "StopCommandTimeout");
     const stopperReceipt = parseCapturedJson(stopper.output.stdout);
+    lifecycleStage = "owner_shutdown";
     const ownerExit = await withDeadline(owner.exit, 20_000, "OwnerShutdownTimeout");
+    const stopCommandExitedCleanly = stopperExit.code === 0 && stopperExit.signal === null;
+    const stopReceiptReportedStopped = stopperReceipt.stopped === true;
+    const ownerExitedCleanly = ownerExit.code === 0 && ownerExit.signal === null;
     const stoppedThroughCli =
-      stopperExit.code === 0 &&
-      stopperExit.signal === null &&
-      stopperReceipt.stopped === true &&
-      ownerExit.code === 0 &&
-      ownerExit.signal === null;
+      stopCommandExitedCleanly && stopReceiptReportedStopped && ownerExitedCleanly;
     const pidRecordRemoved =
       readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL).kind === "missing";
 
@@ -2748,6 +2754,13 @@ export async function runDuplicateStartSingleOwnerContract(
         ownerChildPidMatches,
         ownerPidRecordUnchanged,
         startLockReleased,
+        stopCommandExitedCleanly,
+        stopReceiptReportedStopped,
+        stopReceiptReason:
+          typeof stopperReceipt.reason === "string" ? stopperReceipt.reason : "none",
+        ownerExitedCleanly,
+        ownerExitCode: ownerExit.code,
+        ownerExitSignal: ownerExit.signal ?? "none",
         stoppedThroughCli,
         pidRecordRemoved,
         candidateRestartRequests: counters.restartRequests,
@@ -2766,7 +2779,10 @@ export async function runDuplicateStartSingleOwnerContract(
       }; child output and error text are omitted from the receipt.`,
       durationMs: Math.round((performance.now() - started) * 100) / 100,
       counters,
-      measurements: { candidatesRaced: children.filter((child) => child !== undefined).length },
+      measurements: {
+        candidatesRaced: children.filter((child) => child !== undefined).length,
+        lifecycleStage,
+      },
     };
   } finally {
     await Promise.all(children.map((child) => boundedChildCleanup(child)));

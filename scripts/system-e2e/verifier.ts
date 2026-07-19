@@ -301,6 +301,22 @@ function verifyMeasurements(
   assert.ok(integer(maintenance.checks, "maintenance proof checks") >= 20);
   assert.equal(maintenance.exactPendingIdentityProved, true);
   assert.equal(maintenance.stalledCadenceBackoffProved, true);
+  const ownershipScenario = resourceScenarios
+    .map((entry, index) => object(entry, `resource scenario ${index}`))
+    .find((scenario) => scenario.id === "duplicate_start_single_owner");
+  assert.ok(ownershipScenario, "duplicate-start ownership scenario missing");
+  const ownership = object(
+    ownershipScenario.measurements,
+    "duplicate-start ownership measurements",
+  );
+  assert.equal(ownership.stopCommandExitedCleanly, true);
+  assert.equal(ownership.stopReceiptReportedStopped, true);
+  assert.equal(ownership.stopReceiptReason, "none");
+  assert.equal(ownership.ownerExitedCleanly, true);
+  assert.equal(integer(ownership.ownerExitCode, "owner exit code"), 0);
+  assert.equal(ownership.ownerExitSignal, "none");
+  assert.equal(ownership.stoppedThroughCli, true);
+  assert.equal(ownership.pidRecordRemoved, true);
   const dashboard = object(measurements.dashboard, "dashboard measurements");
   exactKeys(dashboard, ["rawRowsScanned", "filesOpened", "fileBytesRead", "filesystemEntriesScanned"], "dashboard measurements");
   assert.ok(Object.values(dashboard).every((value) => value === 0), "dashboard scan work must remain exactly zero");

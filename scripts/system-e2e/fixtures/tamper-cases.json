@@ -111,13 +111,13 @@
     },
     {
       "id": "resource_replay_raw_write_counter",
-      "mutations": [{ "pointer": "/flow/phaseChain/4/artifact/scenarios/6/measurements/replayRawEventWrites", "replacement": 1 }],
+      "mutations": [{ "pointer": "/flow/phaseChain/4/artifact/scenarios/7/measurements/replayRawEventWrites", "replacement": 1 }],
       "resign": true,
       "expectedError": "committed artifact contract mismatch"
     },
     {
       "id": "resource_baseline_pending_cap",
-      "mutations": [{ "pointer": "/flow/phaseChain/4/artifact/scenarios/6/measurements/pendingMetadataWithinCap", "replacement": false }],
+      "mutations": [{ "pointer": "/flow/phaseChain/4/artifact/scenarios/7/measurements/pendingMetadataWithinCap", "replacement": false }],
       "resign": true,
       "expectedError": "committed artifact contract mismatch"
     },

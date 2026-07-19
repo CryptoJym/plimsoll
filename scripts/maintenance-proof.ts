@@ -368,7 +368,17 @@ async function proveAdaptiveBaselineCadence() {
   });
   const stalledCadence = new AutomaticMaintenanceCadence(
     stalledScheduler,
-    () => fakeBaselineStatus("in_progress"),
+    () => {
+      const status = fakeBaselineStatus("in_progress");
+      // Rewalking an already-staged generation used to inflate both counters
+      // and counterfeit progress. Equal D/V churn with no unique baseline,
+      // pending, completion, or discovery movement must stay on 60 seconds.
+      if (stalledCalls > 0) {
+        status.progress.filesDiscovered = 513;
+        status.progress.filesValidated = 513;
+      }
+      return status;
+    },
     { timer: stalledClock.timer },
   );
   stalledCadence.start();
@@ -381,7 +391,13 @@ async function proveAdaptiveBaselineCadence() {
       stalled.retryClass === "normal" &&
       stalled.nextRetryAt !== null &&
       stalledScheduler.status().maxConcurrentJobs === 1,
-    { stalledCalls, stalled, scheduler: stalledScheduler.status() },
+    {
+      stalledCalls,
+      counterOnlyDiscovered: 513,
+      counterOnlyValidated: 513,
+      stalled,
+      scheduler: stalledScheduler.status(),
+    },
   );
 
   const failureClock = fakeCadenceTimer();
@@ -492,8 +508,10 @@ async function proveCrashResumeBindsExactPendingIdentities(root: string) {
   const claudeRoot = path.join(root, "baseline-crash-claude");
   const [year, month, day] = new Date().toISOString().slice(0, 10).split("-");
   const codexDay = path.join(codexRoot, year!, month!, day!);
+  const holding = path.join(root, "baseline-crash-holding");
   fs.mkdirSync(codexDay, { recursive: true });
   fs.mkdirSync(claudeRoot, { recursive: true });
+  fs.mkdirSync(holding, { recursive: true });
   const codexFiles: string[] = [];
   const claudeFiles: string[] = [];
   for (let index = 0; index < 64; index += 1) {
@@ -504,6 +522,13 @@ async function proveCrashResumeBindsExactPendingIdentities(root: string) {
     codexFiles.push(codexFile);
     claudeFiles.push(claudeFile);
   }
+  // These generations exist before the cutoff but begin outside both source
+  // trees. During recovery they replace the missing path and must not be able
+  // to discharge the original path+generation debt.
+  const substituteCodex = path.join(holding, "substitute-codex.jsonl");
+  const substituteClaude = path.join(holding, "substitute-claude.jsonl");
+  fs.writeFileSync(substituteCodex, "{}\n");
+  fs.writeFileSync(substituteClaude, "{}\n");
   await new Promise<void>((resolve) => setTimeout(resolve, 2));
   const buffer = new LocalEventBuffer(ledger);
   const startedAt = new Date().toISOString();
@@ -543,12 +568,12 @@ async function proveCrashResumeBindsExactPendingIdentities(root: string) {
     }
   }
   const before = captureBaselineStatus(buffer.database);
-  const holding = path.join(root, "baseline-crash-holding");
-  fs.mkdirSync(holding, { recursive: true });
   const missingCodex = path.join(holding, path.basename(codexFiles[7]!));
   const missingClaude = path.join(holding, path.basename(claudeFiles[7]!));
   fs.renameSync(codexFiles[7]!, missingCodex);
   fs.renameSync(claudeFiles[7]!, missingClaude);
+  fs.renameSync(substituteCodex, codexFiles[7]!);
+  fs.renameSync(substituteClaude, claudeFiles[7]!);
   const maintenance = new CollectorMaintenance(
     buffer,
     new RolloutTailer(buffer, codexRoot, () => []),
@@ -559,7 +584,9 @@ async function proveCrashResumeBindsExactPendingIdentities(root: string) {
       await maintenance.runRecent();
       if (captureBaselineStatus(buffer.database).progress.state === "ambiguous") break;
     }
-    const missing = captureBaselineStatus(buffer.database);
+    const substituted = captureBaselineStatus(buffer.database);
+    fs.unlinkSync(codexFiles[7]!);
+    fs.unlinkSync(claudeFiles[7]!);
     fs.renameSync(missingCodex, codexFiles[7]!);
     fs.renameSync(missingClaude, claudeFiles[7]!);
     for (let cadence = 0; cadence < 12 && captureBaselineStatus(buffer.database).status !== "complete"; cadence += 1) {
@@ -581,13 +608,14 @@ async function proveCrashResumeBindsExactPendingIdentities(root: string) {
       "crash_resume_binds_exact_pending_generations_for_both_sources",
       before.status === "blocked" &&
         before.progress.pendingMetadata === 114 &&
-        missing.status === "blocked" &&
-        missing.progress.state === "ambiguous" &&
+        substituted.status === "blocked" &&
+        substituted.progress.state === "ambiguous" &&
         recovered.status === "complete" &&
         sourceProof.every((source) =>
           source.status === "complete" &&
           source.discovered === source.validated &&
-          source.baselined === 64
+          source.discovered === 65 &&
+          source.baselined === 65
         ) &&
         capture.rollout.filesRead === 0 &&
         capture.transcript.filesRead === 0 &&
@@ -596,7 +624,7 @@ async function proveCrashResumeBindsExactPendingIdentities(root: string) {
       {
         beforeState: before.progress.state,
         beforePending: before.progress.pendingMetadata,
-        missingState: missing.progress.state,
+        substitutedState: substituted.progress.state,
         recoveredState: recovered.progress.state,
         sourceProof,
         restoredPreinstallBodyReads: capture.rollout.filesRead + capture.transcript.filesRead,
