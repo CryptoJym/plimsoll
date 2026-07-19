@@ -115,6 +115,7 @@ async function main() {
     "pnpm proof:allocation",
     "pnpm proof:install-doctor",
     "pnpm proof:codex-config-apply",
+    "pnpm proof:claude-config-apply",
     "pnpm proof:http-boundary",
     "pnpm proof:dashboard",
     "pnpm proof:dashboard-security",

@@ -21,59 +21,620 @@ export type ApplyResult = {
   conflict?: string;
 };
 
-function backup(file: string): string {
+type ClaudeFileIdentity = {
+  device: number;
+  inode: number;
+  mode: number;
+  links: number;
+  uid: number;
+};
+
+type ClaudePathIdentity = ClaudeFileIdentity & { path: string };
+
+type ClaudePathSnapshot = {
+  absolutePath: string;
+  ancestors: ClaudePathIdentity[];
+  exists: boolean;
+  leaf?: ClaudeFileIdentity;
+};
+
+export type ClaudeApplyOptions = {
+  dryRun?: boolean;
+  /** Deterministic synthetic-proof seam; production callers must leave this unset. */
+  transactionHooks?: {
+    afterParentCreate?: () => void;
+    afterPrepare?: () => void;
+    afterBackup?: () => void;
+    beforeCommit?: () => void;
+    afterCommit?: () => void;
+  };
+};
+
+class ClaudeConfigError extends Error {
+  constructor(readonly code: string) {
+    super(`CLAUDE_CONFIG_${code}`);
+    this.name = "ClaudeConfigError";
+  }
+}
+
+function claudeFail(code: string): never {
+  throw new ClaudeConfigError(code);
+}
+
+function runClaudeHook(hook: (() => void) | undefined) {
+  if (!hook) return;
+  try {
+    hook();
+  } catch {
+    claudeFail("TRANSACTION_ABORTED");
+  }
+}
+
+function claudeLstat(file: string): fs.Stats | null {
+  try {
+    return fs.lstatSync(file);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function claudeIdentity(stat: fs.Stats): ClaudeFileIdentity {
+  return {
+    device: stat.dev,
+    inode: stat.ino,
+    mode: stat.mode,
+    links: stat.nlink,
+    uid: stat.uid,
+  };
+}
+
+function sameClaudeIdentity(left: ClaudeFileIdentity, right: ClaudeFileIdentity) {
+  return left.device === right.device &&
+    left.inode === right.inode &&
+    left.mode === right.mode &&
+    left.links === right.links &&
+    left.uid === right.uid;
+}
+
+function currentUid() {
+  return typeof process.getuid === "function" ? process.getuid() : undefined;
+}
+
+function assertSafeClaudeLeaf(stat: fs.Stats) {
+  if (stat.isSymbolicLink()) claudeFail("UNSAFE_LEAF_SYMLINK");
+  if (!stat.isFile()) claudeFail("UNSAFE_LEAF_TYPE");
+  if (stat.nlink !== 1) claudeFail("UNSAFE_LEAF_LINK_COUNT");
+  const permissions = stat.mode & 0o777;
+  if ((permissions & 0o111) !== 0 || (permissions & 0o022) !== 0) {
+    claudeFail("UNSAFE_LEAF_MODE");
+  }
+  const uid = currentUid();
+  if (uid !== undefined && stat.uid !== uid) claudeFail("UNSAFE_LEAF_OWNER");
+}
+
+function inspectClaudePath(file: string): ClaudePathSnapshot {
+  const absolutePath = path.resolve(file);
+  const parsed = path.parse(absolutePath);
+  const segments = absolutePath.slice(parsed.root.length).split(path.sep).filter(Boolean);
+  const ancestors: ClaudePathIdentity[] = [];
+  let cursor = parsed.root;
+  let missingAncestor = false;
+  for (const segment of segments.slice(0, -1)) {
+    cursor = path.join(cursor, segment);
+    if (missingAncestor) continue;
+    const stat = claudeLstat(cursor);
+    if (!stat) {
+      missingAncestor = true;
+      continue;
+    }
+    if (stat.isSymbolicLink()) {
+      // macOS exposes root-owned compatibility aliases such as /var. They are
+      // outside the operator-writable subtree; all lower symlinks fail closed.
+      if (path.dirname(cursor) === parsed.root && stat.uid === 0) continue;
+      claudeFail("UNSAFE_ANCESTOR_SYMLINK");
+    }
+    if (!stat.isDirectory()) claudeFail("UNSAFE_ANCESTOR_TYPE");
+    ancestors.push({ path: cursor, ...claudeIdentity(stat) });
+  }
+
+  const leafStat = claudeLstat(absolutePath);
+  if (!leafStat) return { absolutePath, ancestors, exists: false };
+  if (missingAncestor) claudeFail("PATH_CHANGED");
+  assertSafeClaudeLeaf(leafStat);
+  return { absolutePath, ancestors, exists: true, leaf: claudeIdentity(leafStat) };
+}
+
+function sameClaudeAncestors(left: ClaudePathIdentity[], right: ClaudePathIdentity[]) {
+  return left.length === right.length && left.every((entry, index) =>
+    entry.path === right[index]?.path &&
+      entry.device === right[index]?.device &&
+      entry.inode === right[index]?.inode &&
+      entry.mode === right[index]?.mode &&
+      entry.uid === right[index]?.uid,
+  );
+}
+
+function assertStableClaudePath(expected: ClaudePathSnapshot) {
+  const current = inspectClaudePath(expected.absolutePath);
+  if (current.absolutePath !== expected.absolutePath || current.exists !== expected.exists) {
+    claudeFail("PATH_CHANGED");
+  }
+  if (!sameClaudeAncestors(current.ancestors, expected.ancestors)) {
+    claudeFail("ANCESTOR_CHANGED");
+  }
+  if (expected.exists && (!current.leaf || !expected.leaf || !sameClaudeIdentity(current.leaf, expected.leaf))) {
+    claudeFail("LEAF_CHANGED");
+  }
+}
+
+function claudeOpenNoFollow(file: string, flags: number) {
+  try {
+    return fs.openSync(file, flags | fs.constants.O_NOFOLLOW);
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (code === "ELOOP" || code === "EMLINK") claudeFail("UNSAFE_SYMLINK");
+    throw error;
+  }
+}
+
+function claudeReadDescriptor(descriptor: number) {
+  const chunks: Buffer[] = [];
+  let position = 0;
+  while (true) {
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    const bytesRead = fs.readSync(descriptor, chunk, 0, chunk.length, position);
+    if (bytesRead === 0) break;
+    chunks.push(chunk.subarray(0, bytesRead));
+    position += bytesRead;
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function claudeWriteDescriptor(descriptor: number, content: string) {
+  const bytes = Buffer.from(content);
+  let offset = 0;
+  while (offset < bytes.length) {
+    offset += fs.writeSync(descriptor, bytes, offset, bytes.length - offset, offset);
+  }
+  fs.fsyncSync(descriptor);
+}
+
+function assertClaudeBoundContent(
+  descriptor: number,
+  expectedIdentity: ClaudeFileIdentity,
+  expectedContent: string,
+) {
+  const before = claudeIdentity(fs.fstatSync(descriptor));
+  if (!sameClaudeIdentity(before, expectedIdentity)) claudeFail("BOUND_IDENTITY_CHANGED");
+  const content = claudeReadDescriptor(descriptor);
+  const after = claudeIdentity(fs.fstatSync(descriptor));
+  if (!sameClaudeIdentity(after, expectedIdentity) || content !== expectedContent) {
+    claudeFail("BOUND_CONTENT_CHANGED");
+  }
+}
+
+function readClaudePreimage(file: string) {
+  const snapshot = inspectClaudePath(file);
+  if (!snapshot.exists) return { snapshot, current: "" };
+  const descriptor = claudeOpenNoFollow(snapshot.absolutePath, fs.constants.O_RDONLY);
+  try {
+    const opened = claudeIdentity(fs.fstatSync(descriptor));
+    assertSafeClaudeLeaf(fs.fstatSync(descriptor));
+    if (!snapshot.leaf || !sameClaudeIdentity(opened, snapshot.leaf)) claudeFail("LEAF_CHANGED");
+    const current = claudeReadDescriptor(descriptor);
+    assertClaudeBoundContent(descriptor, snapshot.leaf, current);
+    assertStableClaudePath(snapshot);
+    return { snapshot, current };
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function fsyncClaudeDirectory(directory: string) {
+  const descriptor = claudeOpenNoFollow(directory, fs.constants.O_RDONLY);
+  try {
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function ensureClaudeParent(
+  snapshot: ClaudePathSnapshot,
+  hook: (() => void) | undefined,
+) {
+  const directory = path.dirname(snapshot.absolutePath);
+  const parsed = path.parse(directory);
+  const segments = directory.slice(parsed.root.length).split(path.sep).filter(Boolean);
+  let cursor = parsed.root;
+  for (const segment of segments) {
+    const parent = cursor;
+    cursor = path.join(cursor, segment);
+    const before = claudeLstat(cursor);
+    if (!before) {
+      try {
+        fs.mkdirSync(cursor, { mode: 0o700 });
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      }
+      const created = claudeLstat(cursor);
+      if (!created || !created.isDirectory() || created.isSymbolicLink()) {
+        claudeFail("PARENT_CREATE_RACE");
+      }
+      const uid = currentUid();
+      if ((created.mode & 0o777) !== 0o700 || (uid !== undefined && created.uid !== uid)) {
+        claudeFail("UNSAFE_PARENT_MODE");
+      }
+      fsyncClaudeDirectory(parent);
+    } else {
+      if (before.isSymbolicLink()) {
+        if (path.dirname(cursor) !== parsed.root || before.uid !== 0) {
+          claudeFail("UNSAFE_ANCESTOR_SYMLINK");
+        }
+      } else if (!before.isDirectory()) {
+        claudeFail("UNSAFE_ANCESTOR_TYPE");
+      }
+    }
+  }
+
+  const parentStat = claudeLstat(directory);
+  if (!parentStat || !parentStat.isDirectory() || parentStat.isSymbolicLink()) {
+    claudeFail("UNSAFE_PARENT");
+  }
+  const uid = currentUid();
+  if ((uid !== undefined && parentStat.uid !== uid) || (parentStat.mode & 0o022) !== 0) {
+    claudeFail("UNSAFE_PARENT_MODE");
+  }
+
+  const createdReady = inspectClaudePath(snapshot.absolutePath);
+  if (createdReady.exists !== snapshot.exists) claudeFail("PATH_CHANGED");
+  for (const ancestor of snapshot.ancestors) {
+    const current = createdReady.ancestors.find((entry) => entry.path === ancestor.path);
+    if (
+      !current ||
+      current.device !== ancestor.device ||
+      current.inode !== ancestor.inode ||
+      current.mode !== ancestor.mode ||
+      current.uid !== ancestor.uid
+    ) {
+      claudeFail("ANCESTOR_CHANGED");
+    }
+  }
+  runClaudeHook(hook);
+  const ready = inspectClaudePath(snapshot.absolutePath);
+  if (
+    ready.exists !== createdReady.exists ||
+    !sameClaudeAncestors(ready.ancestors, createdReady.ancestors) ||
+    (createdReady.exists &&
+      (!ready.leaf || !createdReady.leaf || !sameClaudeIdentity(ready.leaf, createdReady.leaf)))
+  ) {
+    claudeFail("ANCESTOR_CHANGED");
+  }
+  return ready;
+}
+
+function assertVisibleClaudeContent(
+  snapshot: ClaudePathSnapshot,
+  expectedIdentity: ClaudeFileIdentity,
+  expectedContent: string,
+) {
+  const visible = inspectClaudePath(snapshot.absolutePath);
+  if (
+    !visible.exists ||
+    !visible.leaf ||
+    !sameClaudeAncestors(visible.ancestors, snapshot.ancestors) ||
+    !sameClaudeIdentity(visible.leaf, expectedIdentity)
+  ) {
+    claudeFail("VISIBLE_IDENTITY_MISMATCH");
+  }
+  const descriptor = claudeOpenNoFollow(visible.absolutePath, fs.constants.O_RDONLY);
+  try {
+    assertClaudeBoundContent(descriptor, expectedIdentity, expectedContent);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  const after = inspectClaudePath(snapshot.absolutePath);
+  if (
+    !after.exists ||
+    !after.leaf ||
+    !sameClaudeAncestors(after.ancestors, snapshot.ancestors) ||
+    !sameClaudeIdentity(after.leaf, expectedIdentity)
+  ) {
+    claudeFail("VISIBLE_POSTCONDITION_CHANGED");
+  }
+}
+
+function unlinkClaudeObject(file: string, identity: ClaudeFileIdentity | undefined) {
+  const current = claudeLstat(file);
+  if (
+    identity &&
+    current &&
+    !current.isSymbolicLink() &&
+    current.isFile() &&
+    current.dev === identity.device &&
+    current.ino === identity.inode
+  ) {
+    fs.unlinkSync(file);
+  }
+}
+
+function prepareClaudeFile(snapshot: ClaudePathSnapshot, next: string) {
+  const tempPath = path.join(
+    path.dirname(snapshot.absolutePath),
+    `.${path.basename(snapshot.absolutePath)}.plimsoll-tmp-${randomUUID()}`,
+  );
+  const descriptor = claudeOpenNoFollow(
+    tempPath,
+    fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL,
+  );
+  const identity = claudeIdentity(fs.fstatSync(descriptor));
+  try {
+    if (identity.links !== 1) claudeFail("PREPARED_LINK_COUNT");
+    const mode = snapshot.leaf ? snapshot.leaf.mode & 0o777 : 0o600;
+    fs.fchmodSync(descriptor, mode);
+    claudeWriteDescriptor(descriptor, next);
+  } catch (error) {
+    unlinkClaudeObject(tempPath, identity);
+    throw error;
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  assertVisibleClaudeContent(
+    { ...snapshot, absolutePath: tempPath, exists: true, leaf: identity },
+    { ...identity, mode: (identity.mode & ~0o777) | (snapshot.leaf ? snapshot.leaf.mode & 0o777 : 0o600) },
+    next,
+  );
+  return {
+    tempPath,
+    identity: claudeIdentity(fs.lstatSync(tempPath)),
+  };
+}
+
+function backupClaudePreimage(
+  snapshot: ClaudePathSnapshot,
+  current: string,
+  boundDescriptor: number,
+) {
+  if (!snapshot.leaf) claudeFail("MISSING_PREIMAGE_IDENTITY");
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  const backupPath = `${file}.plimsoll-backup-${stamp}`;
-  fs.copyFileSync(file, backupPath);
+  const backupPath = `${snapshot.absolutePath}.plimsoll-backup-${stamp}-${randomUUID()}`;
+  const descriptor = claudeOpenNoFollow(
+    backupPath,
+    fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_EXCL,
+  );
+  let created = claudeIdentity(fs.fstatSync(descriptor));
+  try {
+    if (created.links !== 1) claudeFail("BACKUP_LINK_COUNT");
+    assertClaudeBoundContent(boundDescriptor, snapshot.leaf, current);
+    assertVisibleClaudeContent(snapshot, snapshot.leaf, current);
+    fs.fchmodSync(descriptor, snapshot.leaf.mode & 0o777);
+    claudeWriteDescriptor(descriptor, current);
+    created = claudeIdentity(fs.fstatSync(descriptor));
+    assertClaudeBoundContent(descriptor, created, current);
+    assertClaudeBoundContent(boundDescriptor, snapshot.leaf, current);
+    assertVisibleClaudeContent(snapshot, snapshot.leaf, current);
+  } catch (error) {
+    fs.closeSync(descriptor);
+    unlinkClaudeObject(backupPath, created);
+    throw error;
+  }
+  fs.closeSync(descriptor);
+  assertVisibleClaudeContent(
+    { ...snapshot, absolutePath: backupPath, exists: true, leaf: created },
+    created,
+    current,
+  );
+  fsyncClaudeDirectory(path.dirname(snapshot.absolutePath));
   return backupPath;
+}
+
+function writeClaudePlan(
+  initial: ClaudePathSnapshot,
+  current: string,
+  next: string,
+  hooks: NonNullable<ClaudeApplyOptions["transactionHooks"]> = {},
+) {
+  const snapshot = ensureClaudeParent(initial, hooks.afterParentCreate);
+  assertStableClaudePath(snapshot);
+  const boundDescriptor = snapshot.exists
+    ? claudeOpenNoFollow(snapshot.absolutePath, fs.constants.O_RDONLY)
+    : undefined;
+  let prepared: ReturnType<typeof prepareClaudeFile> | undefined;
+  try {
+    if (snapshot.exists) {
+      if (boundDescriptor === undefined || !snapshot.leaf) claudeFail("MISSING_PREIMAGE_IDENTITY");
+      assertClaudeBoundContent(boundDescriptor, snapshot.leaf, current);
+      assertVisibleClaudeContent(snapshot, snapshot.leaf, current);
+    }
+
+    prepared = prepareClaudeFile(snapshot, next);
+    runClaudeHook(hooks.afterPrepare);
+    assertStableClaudePath(snapshot);
+    assertVisibleClaudeContent(
+      { ...snapshot, absolutePath: prepared.tempPath, exists: true, leaf: prepared.identity },
+      prepared.identity,
+      next,
+    );
+
+    const backupPath = snapshot.exists
+      ? backupClaudePreimage(snapshot, current, boundDescriptor!)
+      : undefined;
+    runClaudeHook(hooks.afterBackup);
+
+    if (snapshot.exists) {
+      assertClaudeBoundContent(boundDescriptor!, snapshot.leaf!, current);
+      assertVisibleClaudeContent(snapshot, snapshot.leaf!, current);
+    } else {
+      assertStableClaudePath(snapshot);
+    }
+    assertVisibleClaudeContent(
+      { ...snapshot, absolutePath: prepared.tempPath, exists: true, leaf: prepared.identity },
+      prepared.identity,
+      next,
+    );
+    runClaudeHook(hooks.beforeCommit);
+
+    if (snapshot.exists) {
+      assertClaudeBoundContent(boundDescriptor!, snapshot.leaf!, current);
+      assertVisibleClaudeContent(snapshot, snapshot.leaf!, current);
+      fs.renameSync(prepared.tempPath, snapshot.absolutePath);
+    } else {
+      assertStableClaudePath(snapshot);
+      // No-clobber publication for a fresh file. A plain rename could replace
+      // a concurrently-created operator file between the final check and commit.
+      fs.linkSync(prepared.tempPath, snapshot.absolutePath);
+      fs.unlinkSync(prepared.tempPath);
+    }
+
+    runClaudeHook(hooks.afterCommit);
+    assertVisibleClaudeContent(snapshot, prepared.identity, next);
+    fsyncClaudeDirectory(path.dirname(snapshot.absolutePath));
+    assertVisibleClaudeContent(snapshot, prepared.identity, next);
+    return backupPath;
+  } finally {
+    if (boundDescriptor !== undefined) fs.closeSync(boundDescriptor);
+    if (prepared) unlinkClaudeObject(prepared.tempPath, prepared.identity);
+  }
+}
+
+function isJsonRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
+}
+
+function aliasFold(value: string) {
+  return value.normalize("NFKC").toLowerCase();
+}
+
+function rejectManagedAliases(keys: string[], managed: string[], code: string) {
+  const managedFolded = new Map(managed.map((key) => [aliasFold(key), key]));
+  for (const key of keys) {
+    const canonical = managedFolded.get(aliasFold(key));
+    if (canonical && key !== canonical) claudeFail(code);
+  }
+}
+
+function hookUrlKinds(value: unknown): Array<"owned" | "alias"> {
+  const kinds: Array<"owned" | "alias"> = [];
+  const visit = (node: unknown) => {
+    if (Array.isArray(node)) {
+      for (const entry of node) visit(entry);
+      return;
+    }
+    if (!isJsonRecord(node)) return;
+    for (const [key, entry] of Object.entries(node)) {
+      if (aliasFold(key) === "url" && key !== "url") claudeFail("HOOK_FIELD_ALIAS");
+      if (key === "url" && typeof entry === "string") {
+        const folded = aliasFold(entry);
+        if (/^http:\/\/127\.0\.0\.1:\d+\/hooks\/claude-code$/.test(folded)) {
+          kinds.push(entry === folded ? "owned" : "alias");
+        }
+      }
+      visit(entry);
+    }
+  };
+  visit(value);
+  return kinds;
+}
+
+function isOwnedClaudeHook(value: unknown) {
+  const kinds = hookUrlKinds(value);
+  if (kinds.includes("alias")) claudeFail("HOOK_URL_ALIAS");
+  return kinds.includes("owned");
+}
+
+function parseClaudeDocument(current: string) {
+  if (current === "") return {} as Record<string, unknown>;
+  try {
+    const parsed = JSON.parse(current) as unknown;
+    if (!isJsonRecord(parsed)) claudeFail("INVALID_ROOT");
+    return parsed;
+  } catch (error) {
+    if (error instanceof ClaudeConfigError) throw error;
+    claudeFail("MALFORMED_JSON");
+  }
+}
+
+function reconcileClaudeDocument(
+  currentSource: string,
+  generated: { env: Record<string, string>; hooks?: Record<string, unknown[]> },
+) {
+  const current = parseClaudeDocument(currentSource);
+  if (!isJsonRecord(generated) || !isJsonRecord(generated.env)) claudeFail("INVALID_GENERATED_ENV");
+  if (generated.hooks !== undefined && !isJsonRecord(generated.hooks)) {
+    claudeFail("INVALID_GENERATED_HOOKS");
+  }
+  if (!Object.values(generated.env).every((value) => typeof value === "string")) {
+    claudeFail("INVALID_GENERATED_ENV");
+  }
+  if (current.env !== undefined && !isJsonRecord(current.env)) claudeFail("INVALID_ENV");
+  if (current.hooks !== undefined && !isJsonRecord(current.hooks)) claudeFail("INVALID_HOOKS");
+
+  const generatedEnvKeys = Object.keys(generated.env);
+  const currentEnv = (current.env ?? {}) as Record<string, unknown>;
+  rejectManagedAliases(Object.keys(currentEnv), generatedEnvKeys, "ENV_KEY_ALIAS");
+  const env = { ...currentEnv };
+  const changes: string[] = [];
+  for (const [key, value] of Object.entries(generated.env)) {
+    if (!Object.hasOwn(env, key) || env[key] !== value) {
+      env[key] = value;
+      changes.push(`claude.env.${key}.set`);
+    }
+  }
+
+  const generatedHooks = generated.hooks ?? {};
+  const generatedEvents = Object.keys(generatedHooks);
+  const currentHooks = (current.hooks ?? {}) as Record<string, unknown>;
+  rejectManagedAliases(Object.keys(currentHooks), generatedEvents, "HOOK_EVENT_ALIAS");
+  const hooks = { ...currentHooks };
+  for (const [event, expectedEntries] of Object.entries(generatedHooks)) {
+    if (!Array.isArray(expectedEntries) || expectedEntries.length === 0) {
+      claudeFail("INVALID_GENERATED_HOOKS");
+    }
+    if (!expectedEntries.every((entry) => isOwnedClaudeHook(entry))) {
+      claudeFail("INVALID_GENERATED_HOOKS");
+    }
+    const existingValue = currentHooks[event];
+    if (existingValue !== undefined && !Array.isArray(existingValue)) claudeFail("INVALID_HOOK_EVENT");
+    const existing = (existingValue ?? []) as unknown[];
+    const foreign: unknown[] = [];
+    const owned: unknown[] = [];
+    for (const entry of existing) {
+      (isOwnedClaudeHook(entry) ? owned : foreign).push(entry);
+    }
+    const alreadyExact = owned.length === expectedEntries.length &&
+      owned.every((entry, index) => isDeepStrictEqual(entry, expectedEntries[index]));
+    if (!alreadyExact) {
+      hooks[event] = [...foreign, ...expectedEntries];
+      changes.push(`claude.hooks.${event}.reconcile`);
+    }
+  }
+
+  const next = { ...current, env, hooks };
+  const reparsed = JSON.parse(`${JSON.stringify(next, null, 2)}\n`) as unknown;
+  if (!isJsonRecord(reparsed) || !isDeepStrictEqual(reparsed, next)) {
+    claudeFail("INVALID_PLAN");
+  }
+  return { next: `${JSON.stringify(next, null, 2)}\n`, changes };
 }
 
 /** Merge generated env + hooks into Claude Code settings.json. */
 export function applyClaudeSettings(
   file: string,
   generated: { env: Record<string, string>; hooks?: Record<string, unknown[]> },
-  options: { dryRun?: boolean } = {},
+  options: ClaudeApplyOptions = {},
 ): ApplyResult {
-  const exists = fs.existsSync(file);
-  const current = exists
-    ? (JSON.parse(fs.readFileSync(file, "utf8")) as Record<string, unknown>)
-    : {};
-  const changes: string[] = [];
-
-  const env = { ...((current.env as Record<string, string> | undefined) ?? {}) };
-  for (const [key, value] of Object.entries(generated.env)) {
-    if (env[key] !== value) {
-      changes.push(`env.${key} ${key in env ? `"${env[key]}" → ` : "+ "}"${value}"`);
-      env[key] = value;
-    }
+  try {
+    const { snapshot, current } = readClaudePreimage(file);
+    const plan = reconcileClaudeDocument(current, generated);
+    if (plan.changes.length === 0) return { path: file, changed: false, changes: [] };
+    if (options.dryRun) return { path: file, changed: true, changes: plan.changes };
+    const backupPath = writeClaudePlan(snapshot, current, plan.next, options.transactionHooks);
+    return { path: file, changed: true, changes: plan.changes, backupPath };
+  } catch (error) {
+    if (error instanceof ClaudeConfigError) throw error;
+    claudeFail("IO_FAILURE");
   }
-
-  const hooks = { ...((current.hooks as Record<string, unknown[]> | undefined) ?? {}) };
-  for (const [event, entries] of Object.entries(generated.hooks ?? {})) {
-    const existing = Array.isArray(hooks[event]) ? [...(hooks[event] as unknown[])] : [];
-    const has = (url: string) =>
-      existing.some((entry) =>
-        JSON.stringify(entry).includes(`"url":${JSON.stringify(url)}`),
-      );
-    for (const entry of entries) {
-      const url = JSON.stringify(entry).match(/"url":("([^"]+)")/)?.[2];
-      if (url && has(url)) continue;
-      existing.push(entry);
-      changes.push(`hooks.${event} + plimsoll http hook`);
-    }
-    hooks[event] = existing;
-  }
-
-  if (changes.length === 0) {
-    return { path: file, changed: false, changes: [] };
-  }
-  if (options.dryRun) {
-    return { path: file, changed: true, changes };
-  }
-  const next = { ...current, env, hooks };
-  const backupPath = exists ? backup(file) : undefined;
-  fs.writeFileSync(file, `${JSON.stringify(next, null, 2)}\n`);
-  return { path: file, changed: true, changes, backupPath };
 }
 
 type TomlRecord = Record<string, unknown>;

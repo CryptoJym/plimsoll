@@ -38,6 +38,9 @@ jobs:
       - name: Prove surgical Codex config reconciliation
         run: pnpm proof:codex-config-apply
 
+      - name: Prove atomic Claude config reconciliation
+        run: pnpm proof:claude-config-apply
+
       - name: Prove atomic local lifecycle transactions
         run: pnpm proof:lifecycle
 
