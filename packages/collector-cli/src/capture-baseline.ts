@@ -10,9 +10,15 @@ import {
 
 const STATE_TABLE = "automatic_capture_baseline_state";
 const GENERATION_TABLE = "automatic_capture_baseline_generations";
+const PENDING_GENERATION_TABLE = "automatic_capture_baseline_pending_generations";
 const ERROR_TABLE = "automatic_capture_baseline_observation_errors";
 const SCHEMA_VERSION = 2;
 const initializedDatabases = new WeakSet<object>();
+
+/** Automatic discovery holds at most one small metadata chunk per source. */
+export const AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP = 64;
+export const AUTOMATIC_DISCOVERY_ENTRY_CAP = 256;
+export const AUTOMATIC_DISCOVERY_WALL_MS = 50;
 
 export const CAPTURE_BASELINE_NOT_ESTABLISHED =
   "capture_baseline_not_established" as const;
@@ -85,6 +91,19 @@ export type CaptureBaselineSourceStatus = {
 export type CaptureBaselineStatus = {
   status: "complete" | "blocked";
   reason: CaptureBaselineFailureReason | null;
+  progress: {
+    state: "not_established" | "in_progress" | "complete" | "failed" | "ambiguous";
+    sourcesComplete: number;
+    sourcesInProgress: number;
+    sourcesFailed: number;
+    filesDiscovered: number;
+    filesValidated: number;
+    filesBaselined: number;
+    pendingMetadata: number;
+    pendingMetadataPerSourceCap: number;
+    pendingMetadataAggregateCap: number;
+    deferredSources: number;
+  };
   sources: CaptureBaselineSourceStatus[];
 };
 
@@ -118,6 +137,13 @@ export type StageCaptureBaselineObservationInput = {
   observation: CaptureBaselineFileObservation;
   filesDiscovered: number;
   filesValidated: number;
+  resolvePending?: boolean;
+};
+
+export type StageCaptureBaselinePendingInput = {
+  runId: string;
+  observedAt: string;
+  observations: CaptureBaselineFileObservation[];
 };
 
 export type CaptureBaselineDecision =
@@ -362,6 +388,17 @@ export function ensureCaptureBaselineSchema(database: Database.Database): void {
     );
     create index if not exists idx_capture_baseline_generation
       on ${GENERATION_TABLE} (source, run_id, generation_key);
+    create table if not exists ${PENDING_GENERATION_TABLE} (
+      source text not null check (source in ('codex', 'claude_code')),
+      run_id text not null,
+      path_key text not null,
+      generation_key text not null,
+      baseline_size integer not null check (baseline_size >= 0),
+      discovered_at text not null,
+      primary key (source, run_id, path_key, generation_key)
+    );
+    create index if not exists idx_capture_baseline_pending_run
+      on ${PENDING_GENERATION_TABLE} (source, run_id);
     create table if not exists ${ERROR_TABLE} (
       source text not null check (source in ('codex', 'claude_code')),
       path_key text not null,
@@ -376,6 +413,18 @@ export function ensureCaptureBaselineSchema(database: Database.Database): void {
       on ${ERROR_TABLE} (source, resolved_at, last_observed_at);
   `);
   initializedDatabases.add(database);
+}
+
+function pendingGenerationCount(
+  database: Database.Database,
+  source: HistoryCoverageSource,
+  runId: string,
+): number {
+  return (database.prepare(
+    `select count(*) as count
+     from ${PENDING_GENERATION_TABLE}
+     where source = ? and run_id = ?`,
+  ).get(source, runId) as { count: number }).count;
 }
 
 function sourceStatus(
@@ -482,11 +531,49 @@ export function captureBaselineStatus(database: Database.Database): CaptureBasel
         source.status === "complete" && source.unresolvedObservationErrors === 0,
     );
   const blocker = sources.find((source) => source.status !== "complete");
+  const latestRuns = sources
+    .map((source) => source.latestRun)
+    .filter((run): run is CaptureBaselineRunProgress => Boolean(run));
+  const sourcesComplete = sources.filter(
+    (source) => source.status === "complete" && source.unresolvedObservationErrors === 0,
+  ).length;
+  const sourcesInProgress = sources.filter((source) => source.status === "in_progress").length;
+  const sourcesFailed = sources.filter(
+    (source) => source.status === "failed" || source.unresolvedObservationErrors > 0,
+  ).length;
+  const filesDiscovered = latestRuns.reduce((total, run) => total + run.filesDiscovered, 0);
+  const filesValidated = latestRuns.reduce((total, run) => total + run.filesValidated, 0);
+  const ambiguous = sources.some((source) =>
+    source.reason === CAPTURE_BASELINE_DISCOVERY_AMBIGUOUS ||
+    source.reason === CAPTURE_BASELINE_STAT_AMBIGUOUS ||
+    source.reason === CAPTURE_BASELINE_GENERATION_AMBIGUOUS ||
+    source.unresolvedObservationErrors > 0,
+  );
   return {
     status: ready ? "complete" : "blocked",
     reason: ready
       ? null
       : blocker?.reason ?? CAPTURE_BASELINE_GENERATION_AMBIGUOUS,
+    progress: {
+      state: ready
+        ? "complete"
+        : sourcesFailed > 0
+          ? ambiguous ? "ambiguous" : "failed"
+          : sourcesInProgress > 0
+            ? "in_progress"
+            : "not_established",
+      sourcesComplete,
+      sourcesInProgress,
+      sourcesFailed,
+      filesDiscovered,
+      filesValidated,
+      filesBaselined: latestRuns.reduce((total, run) => total + run.filesBaselined, 0),
+      pendingMetadata: Math.max(0, filesDiscovered - filesValidated),
+      pendingMetadataPerSourceCap: AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP,
+      pendingMetadataAggregateCap:
+        AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP * sources.length,
+      deferredSources: sources.length - sourcesComplete,
+    },
     sources,
   };
 }
@@ -514,12 +601,46 @@ export function beginAutomaticCaptureBaseline(
   // every boot; a fresh exhaustive walk can safely add/dedupe observations in
   // the same inactive namespace before the single-row arm flip.
   const runId = input.runId ??
-    (prior?.status === "in_progress" ? prior.runId : crypto.randomUUID());
+    (prior?.status === "in_progress" || prior?.status === "failed"
+      ? prior.runId
+      : crypto.randomUUID());
   if (!validRunId(runId)) throw new Error("capture_baseline_invalid_run_id");
 
   const existing = sourceStatus(database, source);
   if (existing.status === "complete") return existing;
-  if (prior?.status === "in_progress" && prior.runId === runId) return existing;
+  if (prior?.status === "in_progress" && prior.runId === runId) {
+    // A crash loses the in-memory path queue but not its exact hashed
+    // path+generation identities. Refuse count-only recovery from ledgers
+    // created before that identity journal existed or from a torn write.
+    const pending = pendingGenerationCount(database, source, runId);
+    if (prior.filesDiscovered - prior.filesValidated !== pending) {
+      database.prepare(
+        `update ${STATE_TABLE}
+         set status = 'failed', updated_at = ?, discovery_errors = discovery_errors + 1,
+           error_code = ?, error_at = ?
+         where source = ? and run_id = ? and status = 'in_progress'`,
+      ).run(
+        input.startedAt,
+        CAPTURE_BASELINE_GENERATION_AMBIGUOUS,
+        input.startedAt,
+        source,
+        runId,
+      );
+      return sourceStatus(database, source);
+    }
+    return existing;
+  }
+  if (prior?.status === "failed" && prior.runId === runId) {
+    const pending = pendingGenerationCount(database, source, runId);
+    if (prior.filesDiscovered - prior.filesValidated !== pending) return existing;
+    database.prepare(
+      `update ${STATE_TABLE}
+       set status = 'in_progress', updated_at = ?, completed_at = null,
+         discovery_errors = 0, stat_errors = 0, error_code = null, error_at = null
+       where source = ? and run_id = ? and status = 'failed'`,
+    ).run(input.startedAt, source, runId);
+    return sourceStatus(database, source);
+  }
   const failed = discoveryErrors > 0;
   database.transaction(() => {
     // An explicitly selected replacement run is rare (focused tests and
@@ -529,6 +650,9 @@ export function beginAutomaticCaptureBaseline(
     if (prior && prior.runId !== runId && prior.status !== "complete") {
       database
         .prepare(`delete from ${GENERATION_TABLE} where source = ? and run_id = ?`)
+        .run(source, prior.runId);
+      database
+        .prepare(`delete from ${PENDING_GENERATION_TABLE} where source = ? and run_id = ?`)
         .run(source, prior.runId);
     }
     database.prepare(
@@ -628,6 +752,165 @@ export function recordAutomaticCaptureBaselineProgress(
 }
 
 /**
+ * Durably journal the exact stat-only identities held by the bounded in-memory
+ * queue. A process restart may re-walk other files, but only the same hashed
+ * path+generation can discharge this debt.
+ */
+export function stageAutomaticCaptureBaselinePending(
+  database: Database.Database,
+  source: HistoryCoverageSource,
+  input: StageCaptureBaselinePendingInput,
+): {
+  filesDiscovered: number;
+  pendingMetadata: number;
+  newlyPending: number;
+  accepted: boolean[];
+  deferred: boolean[];
+} {
+  ensureCaptureBaselineSchema(database);
+  if (
+    !validRunId(input.runId) ||
+    !validTimestamp(input.observedAt) ||
+    input.observations.length > AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP
+  ) throw new Error("capture_baseline_invalid_pending_receipt");
+  const normalized = input.observations.map((observation) => normalizeObservation(observation));
+  if (normalized.some((observation) => !observation)) {
+    throw new Error("capture_baseline_invalid_pending_observation");
+  }
+
+  let filesDiscovered = 0;
+  let pendingMetadata = 0;
+  let newlyPending = 0;
+  const accepted: boolean[] = [];
+  const deferred: boolean[] = [];
+  database.transaction(() => {
+    const current = stateRow(database, source);
+    if (!current || !stateIsValid(current) || current.runId !== input.runId) {
+      throw new Error("capture_baseline_pending_run_mismatch");
+    }
+    if (current.status !== "in_progress") return;
+    const exists = database.prepare(
+      `select 1 from ${PENDING_GENERATION_TABLE}
+       where source = ? and run_id = ? and path_key = ? and generation_key = ?`,
+    );
+    const insert = database.prepare(
+      `insert into ${PENDING_GENERATION_TABLE} (
+         source, run_id, path_key, generation_key, baseline_size, discovered_at
+       ) values (?, ?, ?, ?, ?, ?)
+       on conflict(source, run_id, path_key, generation_key) do nothing`,
+    );
+    const alreadyStaged = database.prepare(
+      `select 1 from ${GENERATION_TABLE}
+       where source = ? and run_id = ? and generation_key = ?`,
+    );
+    pendingMetadata = pendingGenerationCount(database, source, input.runId);
+    for (const observation of normalized as NormalizedObservation[]) {
+      if (exists.get(source, input.runId, observation.pathKey, observation.generationKey)) {
+        accepted.push(true);
+        deferred.push(false);
+        continue;
+      }
+      // A stable-sweep observation that is already durably staged needs no
+      // second queue row or counter increment. Discovery already obtained its
+      // stat receipt; skipping it keeps cumulative progress identity-unique.
+      if (alreadyStaged.get(source, input.runId, observation.generationKey)) {
+        accepted.push(false);
+        deferred.push(false);
+        continue;
+      }
+      if (pendingMetadata >= AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP) {
+        accepted.push(false);
+        deferred.push(true);
+        continue;
+      }
+      const inserted = insert.run(
+        source,
+        input.runId,
+        observation.pathKey,
+        observation.generationKey,
+        observation.size,
+        input.observedAt,
+      ).changes;
+      newlyPending += inserted;
+      pendingMetadata += inserted;
+      accepted.push(inserted === 1);
+      deferred.push(inserted !== 1);
+    }
+    if (pendingMetadata > AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP) {
+      throw new Error("automatic_baseline_pending_metadata_cap_exceeded");
+    }
+    filesDiscovered = current.filesValidated + pendingMetadata;
+    if (filesDiscovered < current.filesDiscovered) {
+      throw new Error("capture_baseline_pending_identity_mismatch");
+    }
+    database.prepare(
+      `update ${STATE_TABLE}
+       set updated_at = ?, files_discovered = ?
+       where source = ? and run_id = ? and status = 'in_progress'`,
+    ).run(input.observedAt, filesDiscovered, source, input.runId);
+  }).immediate();
+  return { filesDiscovered, pendingMetadata, newlyPending, accepted, deferred };
+}
+
+export function resolveAutomaticCaptureBaselinePending(
+  database: Database.Database,
+  source: HistoryCoverageSource,
+  input: {
+    runId: string;
+    observedAt: string;
+    observation: CaptureBaselineFileObservation;
+    filesDiscovered: number;
+    filesValidated: number;
+  },
+): boolean {
+  ensureCaptureBaselineSchema(database);
+  if (
+    !validRunId(input.runId) ||
+    !validTimestamp(input.observedAt) ||
+    !validCount(input.filesDiscovered) ||
+    !validCount(input.filesValidated) ||
+    input.filesValidated > input.filesDiscovered
+  ) throw new Error("capture_baseline_invalid_pending_run");
+  const normalized = normalizeObservation(input.observation);
+  if (!normalized) throw new Error("capture_baseline_invalid_pending_observation");
+  let resolved = false;
+  database.transaction(() => {
+    const current = stateRow(database, source);
+    if (!current || !stateIsValid(current) || current.runId !== input.runId) {
+      throw new Error("capture_baseline_pending_run_mismatch");
+    }
+    if (current.status !== "in_progress") return;
+    if (
+      input.filesDiscovered < current.filesDiscovered ||
+      input.filesValidated < current.filesValidated ||
+      input.filesValidated > input.filesDiscovered
+    ) throw new Error("capture_baseline_nonmonotonic_progress");
+    const deleted = database.prepare(
+      `delete from ${PENDING_GENERATION_TABLE}
+       where source = ? and run_id = ? and path_key = ? and generation_key = ?`,
+    ).run(source, input.runId, normalized.pathKey, normalized.generationKey);
+    if (deleted.changes !== 1) return;
+    const pendingMetadata = pendingGenerationCount(database, source, input.runId);
+    if (input.filesDiscovered - input.filesValidated !== pendingMetadata) {
+      throw new Error("capture_baseline_pending_identity_mismatch");
+    }
+    database.prepare(
+      `update ${STATE_TABLE}
+       set updated_at = ?, files_discovered = ?, files_validated = ?
+       where source = ? and run_id = ? and status = 'in_progress'`,
+    ).run(
+      input.observedAt,
+      input.filesDiscovered,
+      input.filesValidated,
+      source,
+      input.runId,
+    );
+    resolved = true;
+  }).immediate();
+  return resolved;
+}
+
+/**
  * Stage one stat-only observation under an inactive run. Rows contain only
  * hashes and numeric metadata; the O(1) state-row arm flip later makes the
  * run visible to automatic classification.
@@ -665,6 +948,24 @@ export function stageAutomaticCaptureBaselineObservation(
       throw new Error("capture_baseline_stage_run_mismatch");
     }
     if (current.status !== "in_progress") return;
+    if (input.resolvePending) {
+      const deleted = database.prepare(
+        `delete from ${PENDING_GENERATION_TABLE}
+         where source = ? and run_id = ? and path_key = ? and generation_key = ?`,
+      ).run(
+        source,
+        input.runId,
+        normalized.pathKey,
+        normalized.generationKey,
+      );
+      if (deleted.changes !== 1) {
+        throw new Error("capture_baseline_pending_identity_mismatch");
+      }
+      const pendingMetadata = pendingGenerationCount(database, source, input.runId);
+      if (input.filesDiscovered - input.filesValidated !== pendingMetadata) {
+        throw new Error("capture_baseline_pending_identity_mismatch");
+      }
+    }
     const inserted = database.prepare(
       `insert into ${GENERATION_TABLE} (
          source, run_id, path_key, generation_key, baseline_size,
@@ -768,11 +1069,15 @@ export function completeAutomaticCaptureBaseline(
     if (current.status === "complete") return;
     if (current.status !== "in_progress") return;
 
+    const pendingMetadata = pendingGenerationCount(database, source, input.runId);
     const discoveryMismatch =
       discoveryErrors > 0 ||
-      current.filesValidated !== current.filesDiscovered;
+      current.filesValidated !== current.filesDiscovered ||
+      pendingMetadata > 0;
     const failureReason = discoveryMismatch
-      ? CAPTURE_BASELINE_DISCOVERY_AMBIGUOUS
+      ? pendingMetadata > 0
+        ? CAPTURE_BASELINE_GENERATION_AMBIGUOUS
+        : CAPTURE_BASELINE_DISCOVERY_AMBIGUOUS
       : statErrors > 0
         ? CAPTURE_BASELINE_STAT_AMBIGUOUS
         : null;
@@ -856,9 +1161,9 @@ export function classifyCaptureBaselineFile(
   const unresolvedError = database.prepare(
     `select 1 from ${ERROR_TABLE} where resolved_at is null limit 1`,
   ).get() as { 1: number } | undefined;
-  const allSourcesEstablished =
-    !unresolvedError &&
-    sourceRows.every(({ row }) => row !== undefined && stateIsValid(row) && row.status === "complete");
+  const allSourcesEstablished = sourceRows.every(
+    ({ row }) => row !== undefined && stateIsValid(row) && row.status === "complete",
+  );
   // Explicit history repair stays available when the automatic baseline is
   // absent or failed. Automatic capture, however, is globally fail-closed:
   // neither source becomes live until both discovery snapshots are complete.
@@ -887,8 +1192,17 @@ export function classifyCaptureBaselineFile(
        where source = ? and run_id = ? and generation_key = ?`,
     )
     .get(source, sourceState?.status === "complete" ? sourceState.runId : "__inactive__", normalized.generationKey) as
-    | { baselineSize: number; lastObservedSize: number; historyCoveredSize: number }
-    | undefined;
+      | { baselineSize: number; lastObservedSize: number; historyCoveredSize: number }
+      | undefined;
+  if (options.mode === "automatic" && unresolvedError && matching) {
+    return {
+      decision: "block",
+      reason: CAPTURE_BASELINE_GENERATION_AMBIGUOUS,
+      matchedExcludedGeneration: true,
+      observedGrowth: false,
+      historyInvalidated: false,
+    };
+  }
   if (!matching) {
     // A trustworthy replacement generation at the same hashed path resolves
     // an earlier same-generation truncation receipt. No path is persisted or

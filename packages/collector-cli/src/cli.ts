@@ -85,10 +85,10 @@ import {
 import { RolloutTailer } from "./rollout-tailer";
 import { TranscriptTailer } from "./transcript-tailer";
 import {
+  AutomaticMaintenanceCadence,
   CoalescingMaintenanceScheduler,
   CollectorMaintenance,
   automaticCaptureRuntimeStatus,
-  requestAutomaticRecentMaintenance,
 } from "./maintenance";
 import { codexReconciliationStatus } from "./codex-reconciliation";
 import {
@@ -855,12 +855,14 @@ async function main() {
 
     const buffer = openBuffer(config);
     let scheduler: CoalescingMaintenanceScheduler | undefined;
+    let maintenanceCadence: AutomaticMaintenanceCadence | undefined;
     let maintenance: CollectorMaintenance | undefined;
     const maintenanceAbort = new AbortController();
     const server = createCollectorServer(config, buffer, {
       runtimeIdentity,
       maintenanceStatus: () => ({
         scheduler: scheduler?.status() ?? null,
+        cadence: maintenanceCadence?.status() ?? null,
         capture: maintenance?.status() ?? null,
       }),
     });
@@ -1024,32 +1026,31 @@ async function main() {
       }
       return result;
     });
-    const runAutomaticMaintenance = async () => {
-      try {
-        await requestAutomaticRecentMaintenance(scheduler);
-      } catch (error) {
-        if (
-          maintenanceAbort.signal.aborted &&
-          error instanceof Error &&
-          error.message === "automatic_maintenance_aborted"
-        ) {
-          return;
-        }
-        console.warn(
-          JSON.stringify({
-            warning: "maintenance_failed",
-            message: error instanceof Error ? error.message : String(error),
-          }),
-        );
-      }
-    };
+    maintenanceCadence = new AutomaticMaintenanceCadence(
+      scheduler,
+      () => captureBaselineStatus(buffer.database),
+      {
+        onError: (error) => {
+          if (
+            maintenanceAbort.signal.aborted &&
+            error instanceof Error &&
+            error.message === "automatic_maintenance_aborted"
+          ) return;
+          console.warn(
+            JSON.stringify({
+              warning: "maintenance_failed",
+              message: error instanceof Error ? error.message : String(error),
+            }),
+          );
+        },
+      },
+    );
 
     runPrune();
     // Boot capture is deferred so the OTLP receiver binds first, but it uses
     // the exact same bounded recent-tail entrypoint as the interval. Historical
     // files are available only through the explicit scan commands below.
-    timers.push(setTimeout(() => void runAutomaticMaintenance(), 5_000));
-    timers.push(setInterval(() => void runAutomaticMaintenance(), 60 * 1000));
+    maintenanceCadence.start();
     timers.push(setInterval(runPrune, 6 * 60 * 60 * 1000));
     if (config.uploadUrl) {
       timers.push(setInterval(() => void runSync(), config.syncIntervalSeconds * 1000));
@@ -1063,6 +1064,7 @@ async function main() {
         return;
       }
       shuttingDown = true;
+      maintenanceCadence?.stop();
       for (const timer of timers) clearInterval(timer);
       scheduler?.stopAccepting();
       maintenanceAbort.abort();

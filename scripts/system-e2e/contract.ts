@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const SYSTEM_E2E_SCHEMA = "plimsoll.system-e2e-proof.v2" as const;
-export const SUPPORT_NORMALIZATION_VERSION = 4 as const;
+export const SUPPORT_NORMALIZATION_VERSION = 5 as const;
 /** Fixed release thresholds. These are never derived from an observed run. */
 export const SYSTEM_E2E_BUDGETS = {
   directRows: 500,
@@ -204,7 +204,7 @@ function normalizeString(
 
 const VOLATILE_NUMBER_KEYS = /^(?:pid|port|durationMs|elapsedMs|warmP95Ms|tempBytes|maxRssBytes|serializedBytes|receiptBytes|parentCredentialLikeNameCount)$/i;
 const RESOURCE_VOLATILE_NUMBER_PATH =
-  /^(?:root\.scenarios\[\d+\]\{id=bounded_generation_capture\}\.(?:counters\.(?:fileBytesRead|filesOpened|maintenanceRuns)|measurements\.(?:rssGrowthBytes|statusProbes|warmStatusP95Ms))|root\.scenarios\[\d+\]\{id=dashboard_projection_budget\}\.measurements\.generation|root\.scenarios\[\d+\]\{id=no_change_constant_work\}\.counters\.maintenanceRuns)$/;
+  /^(?:root\.scenarios\[\d+\]\{id=bounded_generation_capture\}\.(?:counters\.(?:fileBytesRead|filesOpened|maintenanceRuns)|measurements\.(?:rssGrowthBytes|statusProbes|warmStatusP95Ms))|root\.scenarios\[\d+\]\{id=dashboard_projection_budget\}\.measurements\.generation|root\.scenarios\[\d+\]\{id=no_change_constant_work\}\.(?:counters\.maintenanceRuns|measurements\.(?:baselineCadences|maxCodexPendingMetadata|maxClaudePendingMetadata|maxAggregatePendingMetadata)))$/;
 
 /**
  * Preserve the complete parsed result shape while replacing only explicitly
@@ -410,7 +410,7 @@ function assertResourceReceipt(receipt: unknown) {
   // at most eight 128KiB explicit-history opens.
   assert.ok(filesOpened >= statusProbes, "bounded capture opened fewer files than active cadences");
   assert.ok(filesOpened <= statusProbes * 8 + 72, "bounded capture exceeded fixture-derived open work");
-  assert.equal(integer(boundedCounters.rawEventWrites, "bounded capture raw writes"), 101);
+  assert.equal(integer(boundedCounters.rawEventWrites, "bounded capture raw writes"), 102);
   assert.equal(integer(boundedCounters.fullHistoryFileReads, "bounded capture full-history reads"), 0);
   assert.equal(integer(boundedMeasurements.automaticPreinstallBodyReads, "bounded capture automatic preinstall reads"), 0);
   assert.equal(integer(boundedMeasurements.explicitFullPreinstallBodyReads, "bounded capture explicit preinstall reads"), 1);
@@ -424,6 +424,9 @@ function assertResourceReceipt(receipt: unknown) {
   assert.equal(boundedMeasurements.realDirectoriesStillRecurse, true);
   assert.equal(boundedMeasurements.denseExact, true);
   assert.equal(boundedMeasurements.rotationExactlyOnce, true);
+  assert.equal(boundedMeasurements.truncationBlockedWithoutRead, true);
+  assert.equal(boundedMeasurements.replacementRecoveredExactlyOnce, true);
+  assert.equal(integer(boundedMeasurements.recoveryBodyReads, "replacement recovery reads"), 1);
   assert.ok(finite(boundedMeasurements.warmStatusP95Ms, "bounded capture warm status p95") <= 500);
   assert.ok(finite(boundedMeasurements.rssGrowthBytes, "bounded capture RSS growth") < 768 * 1024 * 1024);
 
@@ -436,6 +439,46 @@ function assertResourceReceipt(receipt: unknown) {
   assert.equal(integer(noChangeMeasurements.replayEventsAppended, "replay appended events"), 0);
   assert.equal(integer(noChangeMeasurements.replayRawEventWrites, "replay raw writes"), 0);
   assert.equal(integer(noChangeMeasurements.replayEventMutationsInserted, "replay inserted mutations"), 0);
+  assert.ok(integer(noChangeMeasurements.baselineCodexGenerations, "baseline Codex generations") >= 200);
+  assert.ok(integer(noChangeMeasurements.baselineClaudeGenerations, "baseline Claude generations") >= 1_200);
+  assert.ok(integer(noChangeMeasurements.nestedNoncandidateEntries, "nested noncandidate entries") >= 300);
+  assert.ok(
+    integer(noChangeMeasurements.baselineCadences, "baseline cadences") <=
+      integer(noChangeMeasurements.baselineCadenceLimit, "baseline cadence limit"),
+  );
+  assert.equal(integer(noChangeMeasurements.startupReadinessUpperBoundSeconds, "startup readiness bound"), 290);
+  assert.equal(finite(noChangeMeasurements.maximumStartupDutyCycle, "startup duty cycle"), 0.04);
+  assert.ok(integer(noChangeMeasurements.maxCodexPendingMetadata, "Codex pending metadata") <= 64);
+  assert.ok(integer(noChangeMeasurements.maxClaudePendingMetadata, "Claude pending metadata") <= 64);
+  assert.ok(integer(noChangeMeasurements.maxAggregatePendingMetadata, "aggregate pending metadata") <= 128);
+  assert.equal(integer(noChangeMeasurements.pendingMetadataPerSourceCap, "pending metadata source cap"), 64);
+  assert.equal(integer(noChangeMeasurements.pendingMetadataAggregateCap, "pending metadata aggregate cap"), 128);
+  assert.equal(noChangeMeasurements.pendingMetadataWithinCap, true);
+  assert.equal(noChangeMeasurements.codexValidatedBeforeComplete, true);
+  assert.equal(noChangeMeasurements.claudeValidatedBeforeComplete, true);
+  assert.equal(noChangeMeasurements.baselineProgressFair, true);
+
+  const maintenanceMeasurements = childRecord(
+    scenario("maintenance_regression_proof").measurements,
+    "maintenance regression measurements",
+  );
+  assert.equal(integer(maintenanceMeasurements.exitCode, "maintenance proof exit code"), 0);
+  assert.ok(integer(maintenanceMeasurements.checks, "maintenance proof checks") >= 20);
+  assert.equal(maintenanceMeasurements.exactPendingIdentityProved, true);
+  assert.equal(maintenanceMeasurements.stalledCadenceBackoffProved, true);
+
+  const ownershipMeasurements = childRecord(
+    scenario("duplicate_start_single_owner").measurements,
+    "duplicate-start ownership measurements",
+  );
+  assert.equal(ownershipMeasurements.stopCommandExitedCleanly, true);
+  assert.equal(ownershipMeasurements.stopReceiptReportedStopped, true);
+  assert.equal(ownershipMeasurements.stopReceiptReason, "none");
+  assert.equal(ownershipMeasurements.ownerExitedCleanly, true);
+  assert.equal(integer(ownershipMeasurements.ownerExitCode, "owner exit code"), 0);
+  assert.equal(ownershipMeasurements.ownerExitSignal, "none");
+  assert.equal(ownershipMeasurements.stoppedThroughCli, true);
+  assert.equal(ownershipMeasurements.pidRecordRemoved, true);
 
   const dashboardMeasurements = childRecord(
     scenario("dashboard_projection_budget").measurements,

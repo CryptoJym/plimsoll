@@ -11,17 +11,33 @@ import {
   runCodexReconciliationMaintenance,
 } from "../packages/collector-cli/src/codex-reconciliation";
 import {
+  AUTOMATIC_BASELINE_STARTUP_INTERVAL_MS,
+  AUTOMATIC_MAINTENANCE_NORMAL_INTERVAL_MS,
+  AutomaticMaintenanceCadence,
   CoalescingMaintenanceScheduler,
   CollectorMaintenance,
   drainProjectionMigration,
   requestAutomaticRecentMaintenance,
   runRepoEnrichmentMaintenance,
   runRepricingMaintenance,
+  type AutomaticMaintenanceCadenceTimer,
   type CollectorMaintenanceRunResult,
 } from "../packages/collector-cli/src/maintenance";
-import { RolloutTailer, type RolloutScanResult } from "../packages/collector-cli/src/rollout-tailer";
+import {
+  beginAutomaticCaptureBaseline,
+  captureBaselineStatus,
+  stageAutomaticCaptureBaselineObservation,
+  stageAutomaticCaptureBaselinePending,
+  type CaptureBaselineStatus,
+} from "../packages/collector-cli/src/capture-baseline";
+import {
+  RolloutTailer,
+  type RolloutScanOptions,
+  type RolloutScanResult,
+} from "../packages/collector-cli/src/rollout-tailer";
 import {
   TranscriptTailer,
+  type TranscriptScanOptions,
   type TranscriptScanResult,
 } from "../packages/collector-cli/src/transcript-tailer";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
@@ -241,6 +257,385 @@ async function proveStoppingCancelsPendingFollowup() {
     calls === 1 && status.runCount === 1 && !status.pending && !status.inFlight && !status.accepting,
     { calls, ...status },
   );
+}
+
+function fakeBaselineStatus(
+  state: CaptureBaselineStatus["progress"]["state"],
+): CaptureBaselineStatus {
+  const complete = state === "complete";
+  return {
+    status: complete ? "complete" : "blocked",
+    reason: complete ? null : "capture_baseline_in_progress",
+    progress: {
+      state,
+      sourcesComplete: complete ? 2 : 0,
+      sourcesInProgress: state === "in_progress" ? 2 : 0,
+      sourcesFailed: state === "failed" || state === "ambiguous" ? 1 : 0,
+      filesDiscovered: 0,
+      filesValidated: 0,
+      filesBaselined: 0,
+      pendingMetadata: 0,
+      pendingMetadataPerSourceCap: 64,
+      pendingMetadataAggregateCap: 128,
+      deferredSources: complete ? 0 : 2,
+    },
+    sources: [],
+  };
+}
+
+function fakeCadenceTimer() {
+  let now = Date.parse("2026-07-19T12:00:00.000Z");
+  let nextId = 1;
+  const entries = new Map<number, { at: number; callback: () => void }>();
+  const timer: AutomaticMaintenanceCadenceTimer = {
+    now: () => now,
+    setTimeout: (callback, delayMs) => {
+      const id = nextId++;
+      entries.set(id, { at: now + delayMs, callback });
+      return id;
+    },
+    clearTimeout: (handle) => entries.delete(Number(handle)),
+  };
+  return {
+    timer,
+    advance: async (milliseconds: number) => {
+      now += milliseconds;
+      for (;;) {
+        const due = [...entries.entries()]
+          .filter(([, entry]) => entry.at <= now)
+          .sort((left, right) => left[1].at - right[1].at)[0];
+        if (!due) break;
+        entries.delete(due[0]);
+        due[1].callback();
+        await new Promise<void>((resolve) => setImmediate(resolve));
+      }
+    },
+  };
+}
+
+async function proveAdaptiveBaselineCadence() {
+  const clock = fakeCadenceTimer();
+  let state: CaptureBaselineStatus["progress"]["state"] = "not_established";
+  let calls = 0;
+  const scheduler = new CoalescingMaintenanceScheduler(async () => {
+    calls += 1;
+    state = calls === 1 ? "in_progress" : "ambiguous";
+    return fakeRun();
+  });
+  const cadence = new AutomaticMaintenanceCadence(
+    scheduler,
+    () => fakeBaselineStatus(state),
+    { timer: clock.timer },
+  );
+  cadence.start();
+  const initial = cadence.status();
+  await clock.advance(4_999);
+  const beforeBoot = cadence.status();
+  await clock.advance(1);
+  const afterBoot = cadence.status();
+  await clock.advance(4_999);
+  const beforeStartupFollowup = cadence.status();
+  await clock.advance(1);
+  const afterAmbiguity = cadence.status();
+  await clock.advance(59_999);
+  const beforeNormalRetry = cadence.status();
+  cadence.stop();
+  check(
+    "baseline_followups_use_one_bounded_startup_timer_then_ambiguous_returns_to_normal",
+    initial.retryClass === "boot" &&
+      initial.nextRetryAt !== null &&
+      beforeBoot.triggerCount === 0 &&
+      afterBoot.triggerCount === 1 &&
+      afterBoot.retryClass === "startup" &&
+      beforeStartupFollowup.triggerCount === 1 &&
+      calls === 2 &&
+      afterAmbiguity.retryClass === "normal" &&
+      afterAmbiguity.nextRetryAt !== null &&
+      beforeNormalRetry.triggerCount === 2 &&
+      scheduler.status().maxConcurrentJobs === 1 &&
+      scheduler.status().overlappingJobs === 0 &&
+      afterAmbiguity.maximumStartupDutyCycle === 0.04 &&
+      AUTOMATIC_BASELINE_STARTUP_INTERVAL_MS === 5_000 &&
+      AUTOMATIC_MAINTENANCE_NORMAL_INTERVAL_MS === 60_000,
+    { calls, initial, afterAmbiguity, beforeNormalRetry, scheduler: scheduler.status() },
+  );
+
+  const stalledClock = fakeCadenceTimer();
+  let stalledCalls = 0;
+  const stalledScheduler = new CoalescingMaintenanceScheduler(async () => {
+    stalledCalls += 1;
+    return fakeRun();
+  });
+  const stalledCadence = new AutomaticMaintenanceCadence(
+    stalledScheduler,
+    () => {
+      const status = fakeBaselineStatus("in_progress");
+      // Rewalking an already-staged generation used to inflate both counters
+      // and counterfeit progress. Equal D/V churn with no unique baseline,
+      // pending, completion, or discovery movement must stay on 60 seconds.
+      if (stalledCalls > 0) {
+        status.progress.filesDiscovered = 513;
+        status.progress.filesValidated = 513;
+      }
+      return status;
+    },
+    { timer: stalledClock.timer },
+  );
+  stalledCadence.start();
+  await stalledClock.advance(5_000);
+  const stalled = stalledCadence.status();
+  stalledCadence.stop();
+  check(
+    "successful_stalled_baseline_returns_to_normal_cadence",
+    stalledCalls === 1 &&
+      stalled.retryClass === "normal" &&
+      stalled.nextRetryAt !== null &&
+      stalledScheduler.status().maxConcurrentJobs === 1,
+    {
+      stalledCalls,
+      counterOnlyDiscovered: 513,
+      counterOnlyValidated: 513,
+      stalled,
+      scheduler: stalledScheduler.status(),
+    },
+  );
+
+  const failureClock = fakeCadenceTimer();
+  let failures = 0;
+  const failingScheduler = new CoalescingMaintenanceScheduler(async () => {
+    failures += 1;
+    throw new Error("cadence-proof-failure");
+  });
+  const failingCadence = new AutomaticMaintenanceCadence(
+    failingScheduler,
+    () => fakeBaselineStatus("in_progress"),
+    { timer: failureClock.timer },
+  );
+  failingCadence.start();
+  await failureClock.advance(5_000);
+  await failureClock.advance(59_999);
+  const failedStatus = failingCadence.status();
+  failingCadence.stop();
+  check(
+    "failed_maintenance_never_spins_on_startup_cadence",
+    failures === 1 &&
+      failedStatus.failedTriggers === 1 &&
+      failedStatus.retryClass === "normal" &&
+      failingScheduler.status().failedRuns === 1,
+    { failures, cadence: failedStatus, scheduler: failingScheduler.status() },
+  );
+}
+
+async function proveDurableSlowSourceFairness(root: string) {
+  const buffer = new LocalEventBuffer(path.join(root, "source-fairness.sqlite"));
+  const startedAt = new Date().toISOString();
+  for (const source of ["codex", "claude_code"] as const) {
+    beginAutomaticCaptureBaseline(buffer.database, source, {
+      startedAt,
+      filesDiscovered: 0,
+    });
+  }
+  const order: string[] = [];
+  let codexProgress = 0;
+  let claudeProgress = 0;
+  const makeRollout = () => ({
+    scan: async (options: RolloutScanOptions) => {
+      order.push("codex");
+      const result = emptyRollout();
+      const budget = options.automatic!.budget;
+      if (budget.canContinue()) {
+        codexProgress += 1;
+        // Emulate a slow source exhausting the shared cadence without burning
+        // CPU or depending on host wall-clock speed.
+        budget.recordSlice({ bytesRead: 512 * 1024, recordsParsed: 0, eventsAppended: 0 });
+      }
+      result.exhaustive = false;
+      result.deferredGenerations = 1;
+      result.automaticBudget = budget.status();
+      return result;
+    },
+    close: () => undefined,
+  });
+  const makeTranscript = () => ({
+    scan: async (options: TranscriptScanOptions) => {
+      order.push("claude_code");
+      const result = emptyTranscript();
+      const budget = options.automatic!.budget;
+      if (budget.canContinue()) claudeProgress += 1;
+      result.exhaustive = false;
+      result.deferredGenerations = 1;
+      result.automaticBudget = budget.status();
+      return result;
+    },
+    close: () => undefined,
+  });
+  try {
+    const first = new CollectorMaintenance(
+      buffer,
+      makeRollout() as unknown as RolloutTailer,
+      makeTranscript() as unknown as TranscriptTailer,
+    );
+    await first.runRecent();
+    first.close();
+    const afterFirst = [...order];
+    const second = new CollectorMaintenance(
+      buffer,
+      makeRollout() as unknown as RolloutTailer,
+      makeTranscript() as unknown as TranscriptTailer,
+    );
+    await second.runRecent();
+    const statusText = JSON.stringify(second.status());
+    second.close();
+    check(
+      "slow_source_turn_is_fair_and_durable_across_maintenance_restart",
+      afterFirst[0] === "codex" &&
+        afterFirst[1] === "claude_code" &&
+        order[2] === "claude_code" &&
+        order[3] === "codex" &&
+        codexProgress >= 1 &&
+        claudeProgress >= 1 &&
+        !statusText.includes(root),
+      { order, codexProgress, claudeProgress, statusPathFree: !statusText.includes(root) },
+    );
+  } finally {
+    buffer.close();
+  }
+}
+
+async function proveCrashResumeBindsExactPendingIdentities(root: string) {
+  const ledger = path.join(root, "baseline-crash-resume.sqlite");
+  const codexRoot = path.join(root, "baseline-crash-codex");
+  const claudeRoot = path.join(root, "baseline-crash-claude");
+  const [year, month, day] = new Date().toISOString().slice(0, 10).split("-");
+  const codexDay = path.join(codexRoot, year!, month!, day!);
+  const holding = path.join(root, "baseline-crash-holding");
+  fs.mkdirSync(codexDay, { recursive: true });
+  fs.mkdirSync(claudeRoot, { recursive: true });
+  fs.mkdirSync(holding, { recursive: true });
+  const codexFiles: string[] = [];
+  const claudeFiles: string[] = [];
+  for (let index = 0; index < 64; index += 1) {
+    const codexFile = path.join(codexDay, `rollout-crash-${String(index).padStart(4, "0")}.jsonl`);
+    const claudeFile = path.join(claudeRoot, `transcript-crash-${String(index).padStart(4, "0")}.jsonl`);
+    fs.writeFileSync(codexFile, "{}\n");
+    fs.writeFileSync(claudeFile, "{}\n");
+    codexFiles.push(codexFile);
+    claudeFiles.push(claudeFile);
+  }
+  // These generations exist before the cutoff but begin outside both source
+  // trees. During recovery they replace the missing path and must not be able
+  // to discharge the original path+generation debt.
+  const substituteCodex = path.join(holding, "substitute-codex.jsonl");
+  const substituteClaude = path.join(holding, "substitute-claude.jsonl");
+  fs.writeFileSync(substituteCodex, "{}\n");
+  fs.writeFileSync(substituteClaude, "{}\n");
+  await new Promise<void>((resolve) => setTimeout(resolve, 2));
+  const buffer = new LocalEventBuffer(ledger);
+  const startedAt = new Date().toISOString();
+  const observation = (file: string) => {
+    const precise = fs.lstatSync(file, { bigint: true });
+    return {
+      path: file,
+      device: precise.dev,
+      inode: precise.ino,
+      size: precise.size,
+      birthtimeNs: precise.birthtimeNs,
+    };
+  };
+  for (const [source, files] of [
+    ["codex", codexFiles],
+    ["claude_code", claudeFiles],
+  ] as const) {
+    const began = beginAutomaticCaptureBaseline(buffer.database, source, {
+      startedAt,
+      filesDiscovered: 0,
+    });
+    if (!began.latestRun) throw new Error(`crash_resume_${source}_run_missing`);
+    const pending = stageAutomaticCaptureBaselinePending(buffer.database, source, {
+      runId: began.latestRun.runId,
+      observedAt: new Date().toISOString(),
+      observations: files.map(observation),
+    });
+    for (let index = 0; index < 7; index += 1) {
+      stageAutomaticCaptureBaselineObservation(buffer.database, source, {
+        runId: began.latestRun.runId,
+        observedAt: new Date().toISOString(),
+        filesDiscovered: pending.filesDiscovered,
+        filesValidated: index + 1,
+        observation: observation(files[index]!),
+        resolvePending: true,
+      });
+    }
+  }
+  const before = captureBaselineStatus(buffer.database);
+  const missingCodex = path.join(holding, path.basename(codexFiles[7]!));
+  const missingClaude = path.join(holding, path.basename(claudeFiles[7]!));
+  fs.renameSync(codexFiles[7]!, missingCodex);
+  fs.renameSync(claudeFiles[7]!, missingClaude);
+  fs.renameSync(substituteCodex, codexFiles[7]!);
+  fs.renameSync(substituteClaude, claudeFiles[7]!);
+  const maintenance = new CollectorMaintenance(
+    buffer,
+    new RolloutTailer(buffer, codexRoot, () => []),
+    new TranscriptTailer(buffer, claudeRoot),
+  );
+  try {
+    for (let cadence = 0; cadence < 10; cadence += 1) {
+      await maintenance.runRecent();
+      if (captureBaselineStatus(buffer.database).progress.state === "ambiguous") break;
+    }
+    const substituted = captureBaselineStatus(buffer.database);
+    fs.unlinkSync(codexFiles[7]!);
+    fs.unlinkSync(claudeFiles[7]!);
+    fs.renameSync(missingCodex, codexFiles[7]!);
+    fs.renameSync(missingClaude, claudeFiles[7]!);
+    for (let cadence = 0; cadence < 12 && captureBaselineStatus(buffer.database).status !== "complete"; cadence += 1) {
+      await maintenance.runRecent();
+    }
+    const recovered = captureBaselineStatus(buffer.database);
+    const capture = await maintenance.runRecent();
+    const events = (buffer.database
+      .prepare(`select count(*) as count from buffered_events`)
+      .get() as { count: number }).count;
+    const sourceProof = recovered.sources.map((source) => ({
+      source: source.source,
+      status: source.status,
+      discovered: source.latestRun?.filesDiscovered,
+      validated: source.latestRun?.filesValidated,
+      baselined: source.latestRun?.filesBaselined,
+    }));
+    check(
+      "crash_resume_binds_exact_pending_generations_for_both_sources",
+      before.status === "blocked" &&
+        before.progress.pendingMetadata === 114 &&
+        substituted.status === "blocked" &&
+        substituted.progress.state === "ambiguous" &&
+        recovered.status === "complete" &&
+        sourceProof.every((source) =>
+          source.status === "complete" &&
+          source.discovered === source.validated &&
+          source.discovered === 65 &&
+          source.baselined === 65
+        ) &&
+        capture.rollout.filesRead === 0 &&
+        capture.transcript.filesRead === 0 &&
+        capture.rawEventWrites === 0 &&
+        events === 0,
+      {
+        beforeState: before.progress.state,
+        beforePending: before.progress.pendingMetadata,
+        substitutedState: substituted.progress.state,
+        recoveredState: recovered.progress.state,
+        sourceProof,
+        restoredPreinstallBodyReads: capture.rollout.filesRead + capture.transcript.filesRead,
+        restoredPreinstallWrites: capture.rawEventWrites,
+        events,
+      },
+    );
+  } finally {
+    maintenance.close();
+    buffer.close();
+  }
 }
 
 async function proveProjectionDutyCycle(){
@@ -574,6 +969,7 @@ async function proveIntegratedIdle(
 async function main() {
   await proveCoalescing();
   await proveStoppingCancelsPendingFollowup();
+  await proveAdaptiveBaselineCadence();
   await proveProjectionDutyCycle();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-maintenance-proof-"));
   const ledger = path.join(root, "ledger.sqlite");
@@ -583,6 +979,8 @@ async function main() {
   fs.mkdirSync(transcriptRoot, { recursive: true });
   let buffer = new LocalEventBuffer(ledger);
   try {
+    await proveDurableSlowSourceFairness(root);
+    await proveCrashResumeBindsExactPendingIdentities(root);
     // Reopening proves additive schema/trigger creation is idempotent.
     buffer.close();
     buffer = new LocalEventBuffer(ledger);

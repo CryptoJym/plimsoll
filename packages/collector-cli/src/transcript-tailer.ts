@@ -14,12 +14,17 @@ import {
   type JsonlTailerIo,
 } from "./jsonl-byte-tailer";
 import {
+  AUTOMATIC_DISCOVERY_ENTRY_CAP,
+  AUTOMATIC_DISCOVERY_WALL_MS,
+  AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP,
   beginAutomaticCaptureBaseline,
   captureBaselineStatus,
   classifyCaptureBaselineFile,
   completeAutomaticCaptureBaseline,
   recordAutomaticCaptureBaselineProgress,
+  resolveAutomaticCaptureBaselinePending,
   stageAutomaticCaptureBaselineObservation,
+  stageAutomaticCaptureBaselinePending,
   type CaptureBaselineFileObservation,
 } from "./capture-baseline";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
@@ -80,6 +85,7 @@ export type TranscriptScanResult = {
   excludedGenerations: number;
   excludedBytes: number;
   deferredGenerations: number;
+  baselinePendingMetadataPeak?: number;
   aborted: boolean;
   lastYieldAt: string | null;
   automaticBudget: CaptureBudgetStatus | null;
@@ -289,6 +295,7 @@ export class TranscriptTailer {
     cutoffMs: number;
     sweepsCompleted: number;
     newGenerationsThisSweep: number;
+    capacityDeferredThisSweep: boolean;
   } | null = null;
   private captureAttempt: {
     discovery: IncrementalJsonlDiscovery;
@@ -408,15 +415,48 @@ export class TranscriptTailer {
           cutoffMs: Date.parse(began.latestRun.startedAt),
           sweepsCompleted: 0,
           newGenerationsThisSweep: 0,
+          capacityDeferredThisSweep: false,
         };
       }
 
       const attempt = this.baselineAttempt;
-      const chunk = await attempt.discovery.collect(automatic.budget, {
-        signal: options.signal,
-      });
-      attempt.pendingFiles.push(...chunk.files);
-      attempt.filesDiscovered += chunk.files.length;
+      const chunk = attempt.pendingFiles.length === 0
+        ? await attempt.discovery.collect(automatic.budget, {
+            signal: options.signal,
+            maxFiles: AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP,
+            maxEntries: AUTOMATIC_DISCOVERY_ENTRY_CAP,
+            maxWallMs: AUTOMATIC_DISCOVERY_WALL_MS,
+          })
+        : {
+            files: [], entriesVisited: 0, errors: 0, done: false,
+            limitReached: false, yields: 0, lastYieldAt: null,
+          };
+      if (chunk.files.length > 0) {
+        const pending = stageAutomaticCaptureBaselinePending(
+          this.buffer.database,
+          "claude_code",
+          {
+            runId: attempt.runId,
+            observedAt: new Date().toISOString(),
+            observations: chunk.files.map((discovered) =>
+              baselineObservation(discovered.file, discovered.stat, discovered.precise)
+            ),
+          },
+        );
+        attempt.filesDiscovered = pending.filesDiscovered;
+        const acceptedFiles = chunk.files.filter((_, index) => pending.accepted[index]);
+        if (pending.deferred.some(Boolean)) {
+          attempt.capacityDeferredThisSweep = true;
+        }
+        attempt.pendingFiles.push(...acceptedFiles);
+      }
+      result.baselinePendingMetadataPeak = Math.max(
+        result.baselinePendingMetadataPeak ?? 0,
+        attempt.pendingFiles.length,
+      );
+      if (attempt.pendingFiles.length > AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP) {
+        throw new Error("automatic_baseline_pending_metadata_cap_exceeded");
+      }
       result.filesSeen = chunk.files.length;
       result.activity.discoveryEntries = chunk.entriesVisited;
       result.cooperativeYields += chunk.yields;
@@ -445,14 +485,16 @@ export class TranscriptTailer {
               observation: baselineObservation(file, stat, discovered.precise),
               filesDiscovered: attempt.filesDiscovered,
               filesValidated: attempt.filesValidated + 1,
+              resolvePending: true,
             })) attempt.newGenerationsThisSweep += 1;
           } else {
-            recordAutomaticCaptureBaselineProgress(this.buffer.database, "claude_code", {
+            if (!resolveAutomaticCaptureBaselinePending(this.buffer.database, "claude_code", {
               runId: attempt.runId,
-              updatedAt: new Date().toISOString(),
+              observedAt: new Date().toISOString(),
+              observation: baselineObservation(file, stat, discovered.precise),
               filesDiscovered: attempt.filesDiscovered,
               filesValidated: attempt.filesValidated + 1,
-            });
+            })) throw new Error("capture_baseline_pending_identity_mismatch");
           }
           attempt.filesValidated += 1;
           attempt.pendingFiles.shift();
@@ -465,6 +507,7 @@ export class TranscriptTailer {
             filesValidated: attempt.filesValidated,
             statErrors: result.statErrors,
           });
+          attempt.discovery.close();
           this.baselineAttempt = null;
           result.exhaustive = false;
           result.automaticBudget = automatic.budget.status();
@@ -497,6 +540,17 @@ export class TranscriptTailer {
           filesDiscovered: attempt.filesDiscovered,
           filesValidated: attempt.filesValidated,
         });
+        result.automaticBudget = automatic.budget.status();
+        return result;
+      }
+
+      if (attempt.capacityDeferredThisSweep) {
+        attempt.discovery.close();
+        attempt.discovery = this.recentDiscovery(options.discoveryLimit);
+        attempt.capacityDeferredThisSweep = false;
+        attempt.newGenerationsThisSweep = 0;
+        result.activity.truncated = true;
+        result.deferredGenerations = 1;
         result.automaticBudget = automatic.budget.status();
         return result;
       }
@@ -789,7 +843,9 @@ export class TranscriptTailer {
     if (attempt.pendingFiles.length === 0 && !attempt.discoveryDone) {
       const chunk = await attempt.discovery.collect(budget, {
         signal: options.signal,
-        maxFiles: 256,
+        maxFiles: AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP,
+        maxEntries: AUTOMATIC_DISCOVERY_ENTRY_CAP,
+        maxWallMs: AUTOMATIC_DISCOVERY_WALL_MS,
       });
       attempt.pendingFiles.push(...chunk.files);
       attempt.discoveryDone = chunk.done;

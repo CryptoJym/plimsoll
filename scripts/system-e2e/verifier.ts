@@ -248,8 +248,8 @@ function verifyMeasurements(
   exactKeys(idle, ["rawEventWrites", "rawEventRewrites", "filesOpened", "fileBytesRead", "fullHistoryFileReads", "overlappingJobs"], "idle measurements");
   assert.equal(integer(idle.rawEventWrites, "history fixture writes"), 2);
   assert.equal(integer(idle.rawEventRewrites, "history fixture rewrites"), 0);
-  assert.equal(integer(idle.fullHistoryFileReads, "explicit history reads"), 2_012);
-  assert.equal(integer(idle.filesOpened, "history files opened"), 2_016);
+  assert.equal(integer(idle.fullHistoryFileReads, "explicit history reads"), 2_610);
+  assert.equal(integer(idle.filesOpened, "history files opened"), 2_614);
   assert.ok(integer(idle.fileBytesRead, "history bytes read") > 0);
   assert.equal(integer(idle.overlappingJobs, "overlapping history jobs"), 0);
   const firstBootScenario = resourceScenarios
@@ -266,12 +266,57 @@ function verifyMeasurements(
   assert.equal(integer(firstBoot.replayEventsAppended, "replay appended events"), 0);
   assert.equal(integer(firstBoot.replayRawEventWrites, "replay raw event writes"), 0);
   assert.equal(integer(firstBoot.replayEventMutationsInserted, "replay inserted mutations"), 0);
+  assert.ok(integer(firstBoot.baselineCodexGenerations, "baseline Codex generations") >= 200);
+  assert.ok(integer(firstBoot.baselineClaudeGenerations, "baseline Claude generations") >= 1_200);
+  // The producer validates these scheduling-dependent values against the raw
+  // resource receipt before normalizing them. The independent verifier binds
+  // the explicit normalization marker and the stable caps/limit below.
+  assert.equal(firstBoot.baselineCadences, "<volatile-number>");
+  assert.equal(number(firstBoot.maximumStartupDutyCycle, "startup duty cycle"), 0.04);
+  assert.equal(firstBoot.maxCodexPendingMetadata, "<volatile-number>");
+  assert.equal(firstBoot.maxClaudePendingMetadata, "<volatile-number>");
+  assert.equal(firstBoot.maxAggregatePendingMetadata, "<volatile-number>");
+  assert.equal(integer(firstBoot.baselineCadenceLimit, "baseline cadence limit"), 60);
+  assert.equal(integer(firstBoot.pendingMetadataPerSourceCap, "pending metadata source cap"), 64);
+  assert.equal(integer(firstBoot.pendingMetadataAggregateCap, "pending metadata aggregate cap"), 128);
+  assert.equal(firstBoot.pendingMetadataWithinCap, true);
+  assert.equal(firstBoot.codexValidatedBeforeComplete, true);
+  assert.equal(firstBoot.claudeValidatedBeforeComplete, true);
+  assert.equal(firstBoot.baselineProgressFair, true);
   assert.equal(firstBoot.inaccessibleItemsBlockPromotion, true);
   assert.equal(firstBoot.failedAttemptDisclosedAfterComplete, true);
   assert.equal(firstBoot.unchangedParseFailuresRetained, true);
   assert.equal(firstBoot.parseFailuresPersistAcrossRestart, true);
   assert.equal(firstBoot.repairedParseFailuresPromote, true);
   assert.equal(firstBoot.coveragePersistsAcrossRestart, true);
+  const maintenanceScenario = resourceScenarios
+    .map((entry, index) => object(entry, `resource scenario ${index}`))
+    .find((scenario) => scenario.id === "maintenance_regression_proof");
+  assert.ok(maintenanceScenario, "maintenance regression scenario missing");
+  const maintenance = object(
+    maintenanceScenario.measurements,
+    "maintenance regression measurements",
+  );
+  assert.equal(integer(maintenance.exitCode, "maintenance proof exit code"), 0);
+  assert.ok(integer(maintenance.checks, "maintenance proof checks") >= 20);
+  assert.equal(maintenance.exactPendingIdentityProved, true);
+  assert.equal(maintenance.stalledCadenceBackoffProved, true);
+  const ownershipScenario = resourceScenarios
+    .map((entry, index) => object(entry, `resource scenario ${index}`))
+    .find((scenario) => scenario.id === "duplicate_start_single_owner");
+  assert.ok(ownershipScenario, "duplicate-start ownership scenario missing");
+  const ownership = object(
+    ownershipScenario.measurements,
+    "duplicate-start ownership measurements",
+  );
+  assert.equal(ownership.stopCommandExitedCleanly, true);
+  assert.equal(ownership.stopReceiptReportedStopped, true);
+  assert.equal(ownership.stopReceiptReason, "none");
+  assert.equal(ownership.ownerExitedCleanly, true);
+  assert.equal(integer(ownership.ownerExitCode, "owner exit code"), 0);
+  assert.equal(ownership.ownerExitSignal, "none");
+  assert.equal(ownership.stoppedThroughCli, true);
+  assert.equal(ownership.pidRecordRemoved, true);
   const dashboard = object(measurements.dashboard, "dashboard measurements");
   exactKeys(dashboard, ["rawRowsScanned", "filesOpened", "fileBytesRead", "filesystemEntriesScanned"], "dashboard measurements");
   assert.ok(Object.values(dashboard).every((value) => value === 0), "dashboard scan work must remain exactly zero");

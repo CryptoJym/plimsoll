@@ -18,6 +18,7 @@ const PRICING_TARGET_KEY = "pricing_catalog_backfill_target";
 const PRICING_CURSOR_KEY = "pricing_catalog_backfill_cursor";
 const REPO_BACKFILL_CURSOR_KEY = "repo_enrichment_backfill_cursor";
 const REPO_BACKFILL_COMPLETE_KEY = "repo_enrichment_backfill_complete";
+const AUTOMATIC_CAPTURE_SOURCE_TURN_KEY = "automatic_capture_source_turn";
 const AUTOMATIC_CAPTURE_RUNTIME_TABLE = "automatic_capture_runtime_state";
 
 function ensureAutomaticCaptureRuntimeState(database: Database.Database) {
@@ -565,7 +566,6 @@ export class CollectorMaintenance {
     budget: CaptureWorkBudget;
   } | null = null;
   private lastBudget: CaptureBudgetStatus | null = null;
-  private preferClaude = false;
 
   constructor(
     private readonly buffer: LocalEventBuffer,
@@ -595,9 +595,27 @@ export class CollectorMaintenance {
 
   async runRecent(): Promise<CollectorMaintenanceRunResult> {
     const budget = new CaptureWorkBudget();
-    const phase = captureBaselineStatus(this.buffer.database).status === "complete"
+    const baselineAtStart = captureBaselineStatus(this.buffer.database);
+    // Completed source snapshots stay armed while a per-generation ambiguity
+    // blocks aggregate readiness. Capture classification remains globally
+    // fail-closed, but it must inspect a trustworthy same-path replacement to
+    // resolve that receipt; sending complete sources back through baseline is
+    // a dead end because their baseline branches intentionally return early.
+    const phase = baselineAtStart.sources.every((source) => source.status === "complete")
       ? "capture" as const
       : "baseline" as const;
+    // Advance the turn before work starts. If this process dies in a slow
+    // source, the next process begins with the other source instead of
+    // manufacturing starvation across restarts.
+    const firstSource = maintenanceState(
+      this.buffer.database,
+      AUTOMATIC_CAPTURE_SOURCE_TURN_KEY,
+    ) === "claude_code" ? "claude_code" as const : "codex" as const;
+    setMaintenanceState(
+      this.buffer.database,
+      AUTOMATIC_CAPTURE_SOURCE_TURN_KEY,
+      firstSource === "codex" ? "claude_code" : "codex",
+    );
     const startedAt = new Date().toISOString();
     let rollout: RolloutScanResult | undefined;
     let transcript: TranscriptScanResult | undefined;
@@ -620,14 +638,13 @@ export class CollectorMaintenance {
       });
     };
     try {
-      if (phase === "capture" && this.preferClaude) {
+      if (firstSource === "claude_code") {
         transcript = await runTranscript();
         rollout = await runRollout();
       } else {
         rollout = await runRollout();
         transcript = await runTranscript();
       }
-      this.preferClaude = !this.preferClaude;
       this.lastBudget = budget.status();
       const errorCount =
         rollout.discoveryErrors + rollout.statErrors + rollout.readErrors + rollout.parseErrors + rollout.unresolvedRecords +
@@ -703,13 +720,16 @@ export class CollectorMaintenance {
       rollout.discoveryErrors + rollout.statErrors + rollout.readErrors + rollout.parseErrors + rollout.unresolvedRecords +
       transcript.discoveryErrors + transcript.statErrors + transcript.readErrors + transcript.parseErrors + transcript.unresolvedRecords;
     const finalBudget = budget.status();
-    const baselineIncomplete = phase === "baseline" && captureBaselineStatus(this.buffer.database).status !== "complete";
+    const baselineProgress = captureBaselineStatus(this.buffer.database).progress.state;
+    const baselineIncomplete = phase === "baseline" && baselineProgress !== "complete";
+    const baselineFailed = phase === "baseline" &&
+      (baselineProgress === "failed" || baselineProgress === "ambiguous");
     const deferred = finalBudget.exhausted || postCaptureDeferred.length > 0 ||
       rollout.deferredGenerations > 0 || transcript.deferredGenerations > 0;
     recordAutomaticCaptureRuntimeState(
       this.buffer.database,
       phase,
-      this.signal?.aborted ? "aborted" : errorCount > 0 ? "complete_with_errors" :
+      this.signal?.aborted ? "aborted" : baselineFailed ? "failed" : errorCount > 0 ? "complete_with_errors" :
         baselineIncomplete ? "baseline_in_progress" : deferred ? "deferred" : "complete",
       finalBudget,
       rollout,
@@ -889,4 +909,171 @@ export function requestAutomaticRecentMaintenance(
   scheduler: CoalescingMaintenanceScheduler,
 ) {
   return scheduler.trigger();
+}
+
+export const AUTOMATIC_BASELINE_STARTUP_INTERVAL_MS = 5_000;
+export const AUTOMATIC_MAINTENANCE_NORMAL_INTERVAL_MS = 60_000;
+
+export type AutomaticMaintenanceCadenceStatus = {
+  accepting: boolean;
+  inFlight: boolean;
+  retryClass: "boot" | "startup" | "normal" | null;
+  nextRetryAt: string | null;
+  startupIntervalMs: number;
+  normalIntervalMs: number;
+  activeBudgetMs: number;
+  maximumStartupDutyCycle: number;
+  triggerCount: number;
+  failedTriggers: number;
+};
+
+export type AutomaticMaintenanceCadenceTimer = {
+  now: () => number;
+  setTimeout: (callback: () => void, delayMs: number) => unknown;
+  clearTimeout: (handle: unknown) => void;
+};
+
+/**
+ * The daemon has one maintenance timer owner. Baseline follow-ups use the
+ * fixed startup interval only after observable baseline progress. Stalled,
+ * complete, failed, ambiguous and pre-start states fall back to the ordinary
+ * cadence. Scheduling happens after the coalesced run drains, so callbacks do
+ * not accumulate during a slow filesystem slice.
+ */
+export class AutomaticMaintenanceCadence {
+  private accepting = true;
+  private inFlight = false;
+  private timer: unknown | null = null;
+  private retryClass: "boot" | "startup" | "normal" | null = null;
+  private nextRetryAt: string | null = null;
+  private triggerCount = 0;
+  private failedTriggers = 0;
+
+  constructor(
+    private readonly scheduler: CoalescingMaintenanceScheduler,
+    private readonly baselineStatus: () => ReturnType<typeof captureBaselineStatus>,
+    private readonly options: {
+      startupIntervalMs?: number;
+      normalIntervalMs?: number;
+      activeBudgetMs?: number;
+      onError?: (error: unknown) => void;
+      timer?: AutomaticMaintenanceCadenceTimer;
+    } = {},
+  ) {}
+
+  start() {
+    if (!this.accepting || this.timer || this.inFlight) return;
+    this.schedule("boot");
+  }
+
+  stop() {
+    this.accepting = false;
+    if (this.timer) this.timerApi().clearTimeout(this.timer);
+    this.timer = null;
+    this.retryClass = null;
+    this.nextRetryAt = null;
+  }
+
+  status(): AutomaticMaintenanceCadenceStatus {
+    const startupIntervalMs = this.startupIntervalMs();
+    const activeBudgetMs = this.activeBudgetMs();
+    return {
+      accepting: this.accepting,
+      inFlight: this.inFlight,
+      // While a run is active the next retry has not been selected yet; null
+      // is more truthful and avoids another aggregate SQLite status query on
+      // every HTTP poll.
+      retryClass: this.retryClass,
+      nextRetryAt: this.nextRetryAt,
+      startupIntervalMs,
+      normalIntervalMs: this.normalIntervalMs(),
+      activeBudgetMs,
+      maximumStartupDutyCycle: Number((activeBudgetMs / startupIntervalMs).toFixed(4)),
+      triggerCount: this.triggerCount,
+      failedTriggers: this.failedTriggers,
+    };
+  }
+
+  private startupIntervalMs() {
+    return Math.max(1, this.options.startupIntervalMs ?? AUTOMATIC_BASELINE_STARTUP_INTERVAL_MS);
+  }
+
+  private normalIntervalMs() {
+    return Math.max(1, this.options.normalIntervalMs ?? AUTOMATIC_MAINTENANCE_NORMAL_INTERVAL_MS);
+  }
+
+  private activeBudgetMs() {
+    return Math.max(1, this.options.activeBudgetMs ?? 200);
+  }
+
+  private timerApi(): AutomaticMaintenanceCadenceTimer {
+    return this.options.timer ?? {
+      now: () => Date.now(),
+      setTimeout: (callback, delayMs) => setTimeout(callback, delayMs),
+      clearTimeout: (handle) => clearTimeout(handle as ReturnType<typeof setTimeout>),
+    };
+  }
+
+  private classifyRetry(
+    before: ReturnType<typeof captureBaselineStatus>["progress"],
+    after: ReturnType<typeof captureBaselineStatus>["progress"],
+    discoveryAdvanced: boolean,
+  ): "startup" | "normal" {
+    const advanced =
+      (before.state === "not_established" && after.state === "in_progress") ||
+      after.sourcesComplete > before.sourcesComplete ||
+      after.filesBaselined > before.filesBaselined ||
+      after.pendingMetadata !== before.pendingMetadata ||
+      discoveryAdvanced;
+    return after.state === "in_progress" && advanced ? "startup" : "normal";
+  }
+
+  private schedule(retryClass: "boot" | "startup" | "normal") {
+    if (!this.accepting || this.timer) return;
+    const delay = retryClass === "normal" ? this.normalIntervalMs() : this.startupIntervalMs();
+    this.retryClass = retryClass;
+    const timerApi = this.timerApi();
+    this.nextRetryAt = new Date(timerApi.now() + delay).toISOString();
+    this.timer = timerApi.setTimeout(() => {
+      this.timer = null;
+      this.retryClass = null;
+      this.nextRetryAt = null;
+      void this.fire();
+    }, delay);
+    if (
+      typeof this.timer === "object" && this.timer !== null &&
+      "unref" in this.timer && typeof (this.timer as { unref?: unknown }).unref === "function"
+    ) (this.timer as { unref: () => void }).unref();
+  }
+
+  private async fire() {
+    if (!this.accepting || this.inFlight) return;
+    this.inFlight = true;
+    this.triggerCount += 1;
+    let failed = false;
+    let discoveryAdvanced = false;
+    const baselineBefore = this.baselineStatus().progress;
+    try {
+      const results = await requestAutomaticRecentMaintenance(this.scheduler);
+      discoveryAdvanced = results.some(
+        (result) =>
+          result.rollout.activity.discoveryEntries > 0 ||
+          result.transcript.activity.discoveryEntries > 0,
+      );
+    } catch (error) {
+      failed = true;
+      this.failedTriggers += 1;
+      this.options.onError?.(error);
+    } finally {
+      this.inFlight = false;
+      if (this.accepting) {
+        const baselineAfter = this.baselineStatus().progress;
+        this.schedule(
+          failed
+            ? "normal"
+            : this.classifyRetry(baselineBefore, baselineAfter, discoveryAdvanced),
+        );
+      }
+    }
+  }
 }
