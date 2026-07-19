@@ -157,9 +157,12 @@ Do not delete a stale PID or kill an unknown port owner just to make the gate
 green. Inspect ownership first (`lsof -nP -iTCP:48271 -sTCP:LISTEN`), preserve
 the stopped/state-retained boundary, and escalate a conflicting owner. Apply
 reconciles one Plimsoll LaunchAgent. If a service loaded by the current apply
-fails readiness, the installer requests an unload and reports whether stopped
-state was confirmed. Verify changes no checkout, config, service, plist, or
-ledger data; apply and verify both use one transient machine-global owner lock.
+fails readiness, the installer requests an unload and reports the unload
+command outcome as `stop_unverified`; command success alone is never promoted
+to proof that the job, process, and listener stopped. Verify changes no
+checkout, config, service, plist, or ledger data; apply and verify both use one
+transient per-UID machine coordination lock, shared across HOME overrides for
+that account.
 
 Proof of done is: the apply receipt says `service_ready`, a newly started
 native agent emits a real token signal, the verify receipt says
@@ -177,8 +180,9 @@ attestation [#131](https://github.com/CryptoJym/plimsoll/issues/131), and atomic
 LaunchAgent manifest ownership
 [#132](https://github.com/CryptoJym/plimsoll/issues/132), plus the single
 machine-readable CLI contract
-[#133](https://github.com/CryptoJym/plimsoll/issues/133), merge and this lane is
-rebased onto them. The installer rejects an obvious existing plist symlink and
+[#133](https://github.com/CryptoJym/plimsoll/issues/133), and custom collector
+home isolation [#135](https://github.com/CryptoJym/plimsoll/issues/135), merge
+and this lane is rebased onto them. The installer rejects an obvious existing plist symlink and
 enforces a private regular-file postcondition, but those checks do not replace
 #132's race-safe source implementation. Compatibility parsing on this branch
 does not replace #133's requirement to invoke a real built CLI mode that emits

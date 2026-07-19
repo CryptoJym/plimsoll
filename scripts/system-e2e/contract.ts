@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const SYSTEM_E2E_SCHEMA = "plimsoll.system-e2e-proof.v2" as const;
-export const SUPPORT_NORMALIZATION_VERSION = 3 as const;
+export const SUPPORT_NORMALIZATION_VERSION = 4 as const;
 /** Fixed release thresholds. These are never derived from an observed run. */
 export const SYSTEM_E2E_BUDGETS = {
   directRows: 500,
@@ -184,7 +184,7 @@ function normalizeString(
     assert.match(parsed.port, /^\d+$/, `${key} must include the fixture port`);
     return `<loopback-http-url>${parsed.pathname}`;
   }
-  if (/^(?:v)?22\.\d+\.\d+$/.test(value) && /^(?:node|version)$/i.test(key)) {
+  if (/^(?:v)?22\.\d+\.\d+$/.test(value) && /^(?:node|nodeVersion|version)$/i.test(key)) {
     return "<node-major-22>";
   }
   if (/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z$/.test(value) && /(?:At|Time)$/i.test(key)) {

@@ -65,9 +65,11 @@ in
 [issues #130](https://github.com/CryptoJym/plimsoll/issues/130),
 [#131](https://github.com/CryptoJym/plimsoll/issues/131), and
 [#132](https://github.com/CryptoJym/plimsoll/issues/132), and
-[#133](https://github.com/CryptoJym/plimsoll/issues/133) merge and the installer
-is rebased; compatibility parsing or an installer receipt from the standalone
-PR is not live proof.
+[#133](https://github.com/CryptoJym/plimsoll/issues/133), plus custom
+collector-home isolation
+[#135](https://github.com/CryptoJym/plimsoll/issues/135), merge and the
+installer is rebased; compatibility parsing or an installer receipt from the
+standalone PR is not live proof.
 
 ## What leaves your machine
 

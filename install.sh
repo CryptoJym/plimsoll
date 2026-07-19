@@ -36,8 +36,9 @@ SERVICE_RESULT="not_started"
 READINESS="not_checked"
 ERROR_STAGE="none"
 RECEIPT_EMITTED=0
-INSTALL_LOCK="$DEFAULT_COLLECTOR_HOME/.source-install.lock"
+INSTALL_LOCK=""
 LOCK_HELD=0
+LOCK_NONCE=""
 INSTALL_IDENTITY_PATH="$PLIMSOLL_DIR/.git/plimsoll-source-install.v1.json"
 INSTALLED_IDENTITY_MATCHED="false"
 SERVICE_LOADED_BY_INSTALLER=0
@@ -45,6 +46,7 @@ DOCTOR_TOKEN_EVENTS="unknown"
 DOCTOR_RUNTIME_HASH="unknown"
 BASELINE_TOKEN_EVENTS="unknown"
 BASELINE_RUNTIME_HASH="unknown"
+LOCAL_ONLY_CONFIRMED="false"
 
 usage() {
   cat <<'EOF'
@@ -125,7 +127,7 @@ absolute_executable() {
     *) candidate="$(command -v "$candidate" 2>/dev/null || true)" ;;
   esac
   case "$candidate" in
-    /*) [ -x "$candidate" ] || return 1 ;;
+    /*) [ -f "$candidate" ] && [ -x "$candidate" ] || return 1 ;;
     *) return 1 ;;
   esac
   printf '%s\n' "$candidate"
@@ -238,6 +240,7 @@ emit_receipt() {
   RECEIPT_READINESS="$READINESS" \
   RECEIPT_ERROR_STAGE="$ERROR_STAGE" \
   RECEIPT_INSTALLED_IDENTITY_MATCHED="$INSTALLED_IDENTITY_MATCHED" \
+  RECEIPT_LOCAL_ONLY_CONFIRMED="$LOCAL_ONLY_CONFIRMED" \
   "$NODE_BIN" -e '
     const env = process.env;
     const state = env.RECEIPT_STATE;
@@ -280,7 +283,8 @@ emit_receipt() {
         ledger: "not_inspected_or_modified_directly",
       },
       readiness,
-      localOnlyDefault: true,
+      localOnlyRequired: true,
+      localOnlyConfirmed: env.RECEIPT_LOCAL_ONLY_CONFIRMED === "true",
       hostedEnrollmentPerformed: false,
       credentialOperations: 0,
       rollbackClaimed: false,
@@ -293,9 +297,9 @@ emit_receipt() {
 stop_loaded_service_after_failure() {
   if [ "$SERVICE_LOADED_BY_INSTALLER" != "1" ]; then return 0; fi
   if PATH="$RUNTIME_PATH" "$PNPM_BIN" --silent --dir "$PLIMSOLL_DIR" collector unload-launch-agent >/dev/null 2>&1; then
-    SERVICE_RESULT="stopped_state_retained_after_failed_apply"
+    SERVICE_RESULT="unload_succeeded_stop_unverified"
   else
-    SERVICE_RESULT="stop_requested_state_unconfirmed"
+    SERVICE_RESULT="unload_failed_stop_unverified"
   fi
   SERVICE_LOADED_BY_INSTALLER=0
 }
@@ -318,17 +322,35 @@ interrupted() {
 }
 
 cleanup_lock() {
-  if [ "$LOCK_HELD" = "1" ] && [ -d "$INSTALL_LOCK" ] && [ ! -L "$INSTALL_LOCK" ]; then
-    if [ -L "$INSTALL_LOCK/owner.pid" ] || [ ! -f "$INSTALL_LOCK/owner.pid" ]; then return 0; fi
-    lock_owner="$(cat "$INSTALL_LOCK/owner.pid" 2>/dev/null || true)"
-    if [ "$lock_owner" = "$$" ]; then
-      rm -f "$INSTALL_LOCK/owner.pid" 2>/dev/null || true
-      rmdir "$INSTALL_LOCK" 2>/dev/null || true
-    fi
-  fi
+  if [ "$LOCK_HELD" != "1" ] || [ -z "$LOCK_NONCE" ]; then return 0; fi
+  LOCK_PATH="$INSTALL_LOCK" LOCK_PID="$$" LOCK_NONCE_VALUE="$LOCK_NONCE" "$NODE_BIN" -e '
+    const fs = require("node:fs");
+    const lock = process.env.LOCK_PATH;
+    try {
+      if (lock !== `/private/tmp/com.plimsoll.source-install.${process.getuid()}.lock`) process.exit(0);
+      const before = fs.lstatSync(lock);
+      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.uid !== process.getuid()) process.exit(0);
+      const descriptor = fs.openSync(lock, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      let value;
+      try {
+        const opened = fs.fstatSync(descriptor);
+        if (opened.dev !== before.dev || opened.ino !== before.ino || opened.size > 4096) process.exit(0);
+        value = JSON.parse(fs.readFileSync(descriptor, "utf8"));
+      } finally { fs.closeSync(descriptor); }
+      if (value?.version !== 1 || value.pid !== Number(process.env.LOCK_PID) ||
+          value.ownerNonce !== process.env.LOCK_NONCE_VALUE) process.exit(0);
+      const visible = fs.lstatSync(lock);
+      if (visible.dev !== before.dev || visible.ino !== before.ino || visible.isSymbolicLink()) process.exit(0);
+      fs.unlinkSync(lock);
+    } catch (error) {
+      if (error?.code !== "ENOENT") process.exit(0);
+    }
+  ' >/dev/null 2>&1 || true
+  LOCK_HELD=0
+  LOCK_NONCE=""
 }
 
-acquire_lock() {
+prepare_default_collector_home() {
   SECURE_HOME="$HOME" SECURE_TARGET="$DEFAULT_COLLECTOR_HOME" "$NODE_BIN" -e '
     const fs = require("node:fs");
     const path = require("node:path");
@@ -357,34 +379,108 @@ acquire_lock() {
       fs.fchmodSync(descriptor, 0o700);
       fs.fsyncSync(descriptor);
     } finally { fs.closeSync(descriptor); }
-  ' >/dev/null 2>&1 || fail "install_lock_parent" 1
-  if mkdir "$INSTALL_LOCK" 2>/dev/null; then
-    (set -C; umask 077; printf '%s\n' "$$" > "$INSTALL_LOCK/owner.pid") 2>/dev/null || fail "install_lock_owner" $?
-    LOCK_HELD=1
-    return 0
-  fi
-  if [ -L "$INSTALL_LOCK" ] || [ ! -d "$INSTALL_LOCK" ]; then
-    fail "install_lock_conflict" 1
-  fi
-  if [ -L "$INSTALL_LOCK/owner.pid" ] || [ ! -f "$INSTALL_LOCK/owner.pid" ]; then
-    fail "install_lock_conflict" 1
-  fi
-  lock_owner="$(cat "$INSTALL_LOCK/owner.pid" 2>/dev/null || true)"
-  case "$lock_owner" in
-    ''|*[!0-9]*) ;;
-    *)
-      if kill -0 "$lock_owner" 2>/dev/null; then
-        fail "install_already_running" 1
-      fi
-      ;;
+  ' >/dev/null 2>&1
+}
+
+acquire_lock() {
+  lock_uid="$($NODE_BIN -p 'process.getuid()' 2>/dev/null || true)"
+  case "$lock_uid" in ''|*[!0-9]*) fail "install_lock_identity" 1 ;; esac
+  INSTALL_LOCK="/private/tmp/com.plimsoll.source-install.${lock_uid}.lock"
+  LOCK_NONCE="$(LOCK_PATH="$INSTALL_LOCK" LOCK_PID="$$" "$NODE_BIN" -e '
+    const crypto = require("node:crypto");
+    const fs = require("node:fs");
+    const path = require("node:path");
+    const { spawnSync } = require("node:child_process");
+    const lock = process.env.LOCK_PATH;
+    const ownerPid = Number(process.env.LOCK_PID);
+    const expectedLock = `/private/tmp/com.plimsoll.source-install.${process.getuid()}.lock`;
+    if (lock !== expectedLock) process.exit(74);
+    for (const directory of ["/private", "/private/tmp"]) {
+      const stat = fs.lstatSync(directory);
+      if (!stat.isDirectory() || stat.isSymbolicLink()) process.exit(74);
+    }
+    const fingerprint = pid => {
+      const result = spawnSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
+        encoding: "utf8",
+        env: { LANG: "C", LC_ALL: "C", PATH: "/usr/bin:/bin" },
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 2000,
+      });
+      if (result.status !== 0 || !result.stdout.trim()) return null;
+      return `sha256:${crypto.createHash("sha256").update(result.stdout.trim()).digest("hex")}`;
+    };
+    const ownerStartFingerprint = fingerprint(ownerPid);
+    if (!Number.isSafeInteger(ownerPid) || ownerPid <= 1 || !ownerStartFingerprint) process.exit(74);
+    const ownerNonce = crypto.randomUUID();
+    const payload = `${JSON.stringify({
+      version: 1,
+      pid: ownerPid,
+      processStartFingerprint: ownerStartFingerprint,
+      ownerNonce,
+    })}\n`;
+    const syncParent = () => {
+      const directory = fs.openSync(path.dirname(lock), fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+    };
+    const create = () => {
+      const descriptor = fs.openSync(
+        lock,
+        fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        fs.writeFileSync(descriptor, payload, "utf8");
+        fs.fsyncSync(descriptor);
+      } finally { fs.closeSync(descriptor); }
+      syncParent();
+      fs.writeSync(1, ownerNonce);
+    };
+    try { create(); process.exit(0); } catch (error) {
+      if (error?.code !== "EEXIST") process.exit(74);
+    }
+    let before;
+    let value;
+    try {
+      before = fs.lstatSync(lock);
+      if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.uid !== process.getuid() ||
+          (before.mode & 0o077) !== 0 || before.size > 4096) process.exit(74);
+      const descriptor = fs.openSync(lock, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+      try {
+        const opened = fs.fstatSync(descriptor);
+        if (opened.dev !== before.dev || opened.ino !== before.ino) process.exit(75);
+        value = JSON.parse(fs.readFileSync(descriptor, "utf8"));
+      } finally { fs.closeSync(descriptor); }
+    } catch { process.exit(74); }
+    if (Object.keys(value).sort().join(",") !== "ownerNonce,pid,processStartFingerprint,version" ||
+        value.version !== 1 || !Number.isSafeInteger(value.pid) || value.pid <= 1 ||
+        typeof value.ownerNonce !== "string" || !/^[0-9a-f-]{36}$/i.test(value.ownerNonce) ||
+        !/^sha256:[0-9a-f]{64}$/.test(value.processStartFingerprint)) process.exit(74);
+    let live = false;
+    try { process.kill(value.pid, 0); live = true; } catch (error) {
+      if (error?.code === "EPERM") process.exit(74);
+      if (error?.code !== "ESRCH") process.exit(74);
+    }
+    if (live) {
+      const currentFingerprint = fingerprint(value.pid);
+      if (!currentFingerprint) process.exit(74);
+      if (currentFingerprint === value.processStartFingerprint) process.exit(73);
+    }
+    try {
+      const visible = fs.lstatSync(lock);
+      if (visible.dev !== before.dev || visible.ino !== before.ino || visible.isSymbolicLink()) process.exit(75);
+      fs.unlinkSync(lock);
+      syncParent();
+      create();
+    } catch { process.exit(75); }
+  ' 2>/dev/null)"
+  lock_status=$?
+  case "$lock_status" in
+    0) LOCK_HELD=1 ;;
+    73) fail "install_already_running" 1 ;;
+    75) fail "install_lock_race" 1 ;;
+    *) fail "install_lock_conflict" 1 ;;
   esac
-  # Only a dead/invalid lock with the one expected regular owner file is
-  # reclaimed. Any extra content is retained for operator inspection.
-  rm -f "$INSTALL_LOCK/owner.pid" 2>/dev/null || fail "install_lock_conflict" $?
-  rmdir "$INSTALL_LOCK" 2>/dev/null || fail "install_lock_conflict" $?
-  mkdir "$INSTALL_LOCK" 2>/dev/null || fail "install_lock_race" $?
-  (set -C; umask 077; printf '%s\n' "$$" > "$INSTALL_LOCK/owner.pid") 2>/dev/null || fail "install_lock_owner" $?
-  LOCK_HELD=1
+  prepare_default_collector_home || fail "collector_home_parent" 1
 }
 
 prepare_launch_agent_destination() {
@@ -617,7 +713,12 @@ if [ "$MODE" = "verify" ]; then
     CHECKOUT_RESULT="remote_conflict"
     fail "checkout_remote" 1
   fi
-  verify_dirty="$(git -C "$PLIMSOLL_DIR" status --porcelain --untracked-files=no 2>/dev/null || true)"
+  verify_dirty="$(git -C "$PLIMSOLL_DIR" status --porcelain --untracked-files=no 2>/dev/null)"
+  verify_status=$?
+  if [ "$verify_status" -ne 0 ]; then
+    CHECKOUT_RESULT="inspection_failed_retained"
+    fail "checkout_inspection" "$verify_status"
+  fi
   if [ -n "$verify_dirty" ]; then
     CHECKOUT_RESULT="dirty_retained"
     fail "checkout_dirty" 1
@@ -650,7 +751,12 @@ else
     CHECKOUT_RESULT="existing_repository"
   fi
 
-  dirty="$(git -C "$PLIMSOLL_DIR" status --porcelain --untracked-files=no 2>/dev/null || true)"
+  dirty="$(git -C "$PLIMSOLL_DIR" status --porcelain --untracked-files=no 2>/dev/null)"
+  dirty_status=$?
+  if [ "$dirty_status" -ne 0 ]; then
+    CHECKOUT_RESULT="inspection_failed_retained"
+    fail "checkout_inspection" "$dirty_status"
+  fi
   if [ -n "$dirty" ]; then
     CHECKOUT_RESULT="dirty_retained"
     fail "checkout_dirty" 1
@@ -672,7 +778,12 @@ else
 
   PATH="$RUNTIME_PATH" "$PNPM_BIN" --dir "$PLIMSOLL_DIR" install --frozen-lockfile >/dev/null 2>&1 || fail "frozen_install" $?
   DEPENDENCIES_RESULT="frozen_lockfile_installed"
-  dirty="$(git -C "$PLIMSOLL_DIR" status --porcelain --untracked-files=no 2>/dev/null || true)"
+  dirty="$(git -C "$PLIMSOLL_DIR" status --porcelain --untracked-files=no 2>/dev/null)"
+  dirty_status=$?
+  if [ "$dirty_status" -ne 0 ]; then
+    CHECKOUT_RESULT="inspection_failed_retained"
+    fail "checkout_inspection" "$dirty_status"
+  fi
   if [ -n "$dirty" ]; then
     CHECKOUT_RESULT="dirty_retained"
     fail "frozen_install_changed_source" 1
@@ -738,8 +849,14 @@ else
       } catch { process.exit(1); }
     });
   ' >/dev/null 2>&1 || fail "local_only_preflight" 1
+  LOCAL_ONLY_CONFIRMED="true"
 
-  dirty="$(git -C "$PLIMSOLL_DIR" status --porcelain --untracked-files=no 2>/dev/null || true)"
+  dirty="$(git -C "$PLIMSOLL_DIR" status --porcelain --untracked-files=no 2>/dev/null)"
+  dirty_status=$?
+  if [ "$dirty_status" -ne 0 ]; then
+    CHECKOUT_RESULT="inspection_failed_retained"
+    fail "checkout_inspection" "$dirty_status"
+  fi
   if [ -n "$dirty" ]; then
     CHECKOUT_RESULT="dirty_retained"
     fail "config_step_changed_source" 1
@@ -842,6 +959,7 @@ while [ "$attempt" -le "$doctor_attempts" ]; do
 done
 
 if [ "$READINESS" = "service_ready" ] || [ "$READINESS" = "signal_verified" ]; then
+  LOCAL_ONLY_CONFIRMED="true"
   verify_live_service_binding || fail "service_identity_binding" 1
 fi
 

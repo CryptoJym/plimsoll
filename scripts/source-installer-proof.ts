@@ -81,6 +81,20 @@ function commandLog(file: string) {
   return fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
 }
 
+function lockOwner(pid: number, ownerNonce: string) {
+  const started = spawnSync("/bin/ps", ["-p", String(pid), "-o", "lstart="], {
+    encoding: "utf8",
+    env: { LANG: "C", LC_ALL: "C", PATH: "/usr/bin:/bin" },
+  });
+  if (started.status !== 0 || !started.stdout.trim()) throw new Error("lock fixture could not fingerprint owner");
+  return `${JSON.stringify({
+    version: 1,
+    pid,
+    processStartFingerprint: `sha256:${createHash("sha256").update(started.stdout.trim()).digest("hex")}`,
+    ownerNonce,
+  })}\n`;
+}
+
 async function main() {
   check("proof_runs_on_literal_node_22", process.versions.node.split(".")[0] === "22", {
     execPath: process.execPath,
@@ -95,6 +109,7 @@ async function main() {
     const neutral = path.join(sandbox, "neutral");
     const home = path.join(sandbox, "home");
     const plimsollHome = path.join(home, "Library", "Application Support", "Plimsoll");
+    const machineLock = `/private/tmp/com.plimsoll.source-install.${process.getuid!()}.lock`;
     const checkout = path.join(sandbox, "checkout");
     const adapters = path.join(sandbox, "adapters");
     const externalPnpmDir = path.join(sandbox, "external-pnpm");
@@ -137,6 +152,7 @@ case "$1 $2" in
     cat "$repo/.git/origin"
     ;;
   "status --porcelain")
+    if [ "\${PLIMSOLL_FIXTURE_STATUS_FAIL:-0}" = "1" ]; then exit 93; fi
     if [ "\${PLIMSOLL_FIXTURE_DIRTY:-0}" = "1" ] || [ -f "$PLIMSOLL_FIXTURE_STATE_DIR/dirty-after-install" ]; then
       printf ' M retained\n'
     fi
@@ -309,6 +325,7 @@ exit 0
           receipt.runtime.nodeMajor === 22 &&
           receipt.runtime.architecture === architecture &&
           receipt.source.remoteObjectVerified === false &&
+          receipt.localOnlyRequired === true && receipt.localOnlyConfirmed === false &&
           receipt.retainedState.dependencies === "planned_frozen_lockfile" &&
           digestTree(sandbox) === beforeDryRun,
         { dryRun, receipt, beforeDryRun, after: digestTree(sandbox) });
@@ -328,6 +345,22 @@ exit 0
       customHome.code !== 0 && customHome.stderr.includes("Custom PLIMSOLL_HOME is not supported") &&
         !fs.existsSync(customHomeTarget) && !fs.existsSync(path.join(sandbox, "unsupported-custom-home")),
       customHome);
+
+    const nonRegularTargets = [externalPnpmDir, path.join(sandbox, "pnpm-fifo")];
+    const fifo = spawnSync("/usr/bin/mkfifo", [nonRegularTargets[1]], { encoding: "utf8" });
+    check("fifo_fixture_created", fifo.status === 0, fifo.stderr);
+    fs.chmodSync(nonRegularTargets[1], 0o700);
+    for (const [index, nonRegular] of nonRegularTargets.entries()) {
+      const target = path.join(sandbox, `non-regular-pnpm-target-${index}`);
+      const result = await run(["--dry-run", "--ref", expectedSha, "--node", process.execPath, "--pnpm", nonRegular], {
+        cwd: neutral,
+        env: { ...baseEnv, PLIMSOLL_DIR: target },
+      });
+      check(`non_regular_pnpm_${index}_is_refused_before_mutation`,
+        result.code !== 0 && result.stderr.includes("pnpm was not found as an absolute executable") &&
+          !fs.existsSync(target),
+        result);
+    }
 
     const mutableTarget = path.join(sandbox, "mutable-target");
     const mutable = await run(["--dry-run", "--ref", "main", "--node", process.execPath, "--pnpm", pnpm], {
@@ -382,10 +415,29 @@ exit 0
         fs.existsSync(path.join(wrongTarget, ".git")),
       { wrong, wrongReceipt });
 
+    const inspectionTarget = path.join(sandbox, "inspection-target");
+    const inspectionState = path.join(sandbox, "inspection-state");
+    fs.mkdirSync(inspectionState);
+    const inspectionFailure = await run(["apply", ...sourceArgs], {
+      cwd: neutral,
+      env: {
+        ...baseEnv,
+        PLIMSOLL_DIR: inspectionTarget,
+        PLIMSOLL_FIXTURE_STATE_DIR: inspectionState,
+        PLIMSOLL_FIXTURE_STATUS_FAIL: "1",
+      },
+    });
+    const inspectionReceipt = parseReceipt(inspectionFailure);
+    check("git_status_failure_is_not_treated_as_clean",
+      inspectionFailure.code === 93 && inspectionReceipt.errorStage === "checkout_inspection" &&
+        inspectionReceipt.retainedState.checkout === "inspection_failed_retained" &&
+        !commandLog(commands).includes(`pnpm --dir ${inspectionTarget} install`),
+      { inspectionFailure, inspectionReceipt });
+
     const ownedTarget = path.join(sandbox, "owned-target");
-    const ownedLock = path.join(plimsollHome, ".source-install.lock");
-    fs.mkdirSync(ownedLock, { recursive: true });
-    fs.writeFileSync(path.join(ownedLock, "owner.pid"), `${process.pid}\n`);
+    const ownedLock = machineLock;
+    const ownedLockBytes = lockOwner(process.pid, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    fs.writeFileSync(ownedLock, ownedLockBytes, { mode: 0o600 });
     const alreadyOwned = await run(["apply", ...sourceArgs], {
       cwd: neutral,
       env: { ...baseEnv, PLIMSOLL_DIR: ownedTarget },
@@ -393,10 +445,10 @@ exit 0
     const ownedReceipt = parseReceipt(alreadyOwned);
     check("concurrent_live_owner_is_refused_without_lock_theft",
       alreadyOwned.code !== 0 && ownedReceipt.errorStage === "install_already_running" &&
-        fs.readFileSync(path.join(ownedLock, "owner.pid"), "utf8").trim() === String(process.pid) &&
+        fs.readFileSync(ownedLock, "utf8") === ownedLockBytes &&
         !fs.existsSync(ownedTarget),
       { alreadyOwned, ownedReceipt });
-    fs.rmSync(ownedLock, { recursive: true });
+    fs.unlinkSync(ownedLock);
 
     const syncTarget = path.join(sandbox, "sync-target");
     const syncState = path.join(sandbox, "sync-state");
@@ -416,6 +468,7 @@ exit 0
     const syncCommands = commandLog(commands).slice(commandsBeforeSync);
     check("hosted_sync_is_refused_before_any_service_mutation",
       syncRefused.code !== 0 && syncReceipt.errorStage === "local_only_preflight" &&
+        syncReceipt.localOnlyRequired === true && syncReceipt.localOnlyConfirmed === false &&
         syncReceipt.retainedState.service === "not_started" &&
         !syncCommands.includes("unload-launch-agent") &&
         !syncCommands.includes("install-launch-agent") &&
@@ -739,9 +792,13 @@ exit 0
     const retryTarget = path.join(sandbox, "retry-target");
     const retryState = path.join(sandbox, "retry-state");
     fs.mkdirSync(retryState);
-    const staleRetryLock = path.join(plimsollHome, ".source-install.lock");
-    fs.mkdirSync(staleRetryLock);
-    fs.writeFileSync(path.join(staleRetryLock, "owner.pid"), "999999\n");
+    const staleRetryLock = machineLock;
+    fs.writeFileSync(staleRetryLock, `${JSON.stringify({
+      version: 1,
+      pid: 999999,
+      processStartFingerprint: `sha256:${"a".repeat(64)}`,
+      ownerNonce: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+    })}\n`, { mode: 0o600 });
     const interrupted = await run(["apply", ...sourceArgs], {
       cwd: neutral,
       env: {
@@ -789,7 +846,7 @@ exit 0
     check("occupied_port_readiness_failure_stops_loaded_service_and_retains_state",
       staleRuntime.code !== 0 && staleRuntimeReceipt.errorStage === "service_readiness" &&
         staleRuntimeReceipt.readiness === "invalid" &&
-        ["stopped_state_retained_after_failed_apply", "stop_requested_state_unconfirmed"].includes(staleRuntimeReceipt.retainedState.service) &&
+        ["unload_succeeded_stop_unverified", "unload_failed_stop_unverified"].includes(staleRuntimeReceipt.retainedState.service) &&
         !fs.existsSync(path.join(plimsollHome, "collector.pid")) &&
         occupiedRequests > 0 &&
         staleRuntimeReceipt.rollbackClaimed === false,
@@ -835,12 +892,14 @@ exit 0
         [applyReceipt, signalReceipt, resumedReceipt].every((receipt) =>
           receipt.credentialOperations === 0 &&
           receipt.hostedEnrollmentPerformed === false &&
-          receipt.localOnlyDefault === true),
+          receipt.localOnlyRequired === true && receipt.localOnlyConfirmed === true),
       allReceipts);
     check("credential_files_remain_byte_exact",
       fs.readFileSync(path.join(home, ".codex", "auth.json"), "utf8") === credentialSentinel &&
         fs.readFileSync(path.join(home, ".claude", ".credentials.json"), "utf8") === credentialSentinel,
       home);
+    check("per_uid_machine_coordination_lock_is_removed_after_each_operation",
+      !fs.existsSync(machineLock), machineLock);
 
     const receipt = {
       issue: 128,
@@ -851,6 +910,7 @@ exit 0
         realLaunchAgentsTouched: 0,
         realToolConfigsTouched: 0,
         credentialReadsOrCopies: 0,
+        perUidMachineCoordinationLock: "transient_acquired_and_removed",
       },
       node: { execPath: process.execPath, version: process.versions.node },
       checks,
