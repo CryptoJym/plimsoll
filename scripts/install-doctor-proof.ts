@@ -114,6 +114,7 @@ async function main() {
   const requiredStandaloneGates = [
     "pnpm proof:allocation",
     "pnpm proof:install-doctor",
+    "pnpm proof:launch-agent",
     "pnpm proof:codex-config-apply",
     "pnpm proof:claude-config-apply",
     "pnpm proof:http-boundary",
@@ -161,10 +162,16 @@ async function main() {
 
   const neutralCwd = path.join(sandbox, "neutral-cwd");
   const stubBin = path.join(sandbox, "stub-bin");
+  const unreachableFetchFixture = path.join(sandbox, "unreachable-fetch.mjs");
   const commandLog = path.join(sandbox, "commands.log");
   const launchctlLog = path.join(sandbox, "launchctl.log");
   fs.mkdirSync(neutralCwd, { recursive: true });
   fs.mkdirSync(stubBin, { recursive: true });
+  fs.writeFileSync(
+    unreachableFetchFixture,
+    "globalThis.fetch = async () => { throw new TypeError('synthetic unreachable'); };\n",
+    { mode: 0o600 },
+  );
   fs.symlinkSync(process.execPath, path.join(stubBin, "node"));
   writeExecutable(
     path.join(stubBin, "launchctl"),
@@ -315,10 +322,16 @@ esac
     PLIMSOLL_COLLECTOR_DOCTOR_TIMEOUT_MS: "100",
     PLIMSOLL_LAUNCHCTL_LOG: launchctlLog,
   };
+  const blankDoctorEnv = {
+    ...doctorBaseEnv,
+    NODE_OPTIONS: [process.env.NODE_OPTIONS, `--import=${unreachableFetchFixture}`]
+      .filter(Boolean)
+      .join(" "),
+  };
   const blankDoctor = await command(
     process.execPath,
     [tsx, cli, "doctor", "--read-only", "--json"],
-    { cwd: neutralCwd, env: doctorBaseEnv },
+    { cwd: neutralCwd, env: blankDoctorEnv },
   );
   if (blankDoctor.stdout.trim().length === 0) {
     const stderrFrames = [...blankDoctor.stderr.matchAll(/\s+at\s+([A-Za-z0-9_.<>]+)/g)]
@@ -351,7 +364,7 @@ esac
     {
       cwd: neutralCwd,
       env: {
-        ...doctorBaseEnv,
+        ...blankDoctorEnv,
         HOME: packagedBlankHome,
         PLIMSOLL_HOME: packagedBlankPlimsoll,
       },
