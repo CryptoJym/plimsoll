@@ -5,10 +5,11 @@ import path from "node:path";
 import type { LocalEventBuffer } from "./buffer";
 import { resolveGitContext } from "./git-context";
 import {
+  DEFAULT_JSONL_TAILER_IO,
   ensureJsonlScanState,
   loadJsonlScanCursor,
-  readJsonlTail,
   rememberJsonlScanCursor,
+  type JsonlTailerIo,
 } from "./jsonl-byte-tailer";
 import { deterministicEventId } from "./normalizer";
 import {
@@ -41,6 +42,11 @@ import {
  */
 
 export type TranscriptScanResult = {
+  scope: "recent" | "full";
+  exhaustive: boolean;
+  discoveryErrors: number;
+  statErrors: number;
+  readErrors: number;
   filesSeen: number;
   filesRead: number;
   filesParsed: number;
@@ -50,6 +56,7 @@ export type TranscriptScanResult = {
   bytesRead: number;
   bytesDeferred: number;
   sessionsSkippedLiveCovered: number;
+  filesSkippedOutsideRecentWindow: number;
   eventsAppended: number;
   tokensAppended: { input: number; cacheRead: number; output: number };
   parseErrors: number;
@@ -80,6 +87,12 @@ type TranscriptParserState = {
 
 const PARSER_KIND = "claude-transcript-v2";
 const CHECKPOINT_VERSION = 2;
+
+export type TranscriptScanOptions = {
+  scope: "recent" | "full";
+  now?: Date;
+  discoveryLimit?: number;
+};
 
 function validateTranscriptParserState(value: unknown): TranscriptParserState | undefined {
   if (!isRecord(value)) return undefined;
@@ -129,6 +142,7 @@ export class TranscriptTailer {
   constructor(
     private readonly buffer: LocalEventBuffer,
     private readonly projectsDir = path.join(os.homedir(), ".claude", "projects"),
+    private readonly io: JsonlTailerIo = DEFAULT_JSONL_TAILER_IO,
   ) {
     ensureJsonlScanState(this.buffer.database);
   }
@@ -146,10 +160,15 @@ export class TranscriptTailer {
     return Boolean(row);
   }
 
-  async scan(options: { recentOnly?: boolean; now?: Date } = {}): Promise<TranscriptScanResult> {
+  async scan(options: TranscriptScanOptions): Promise<TranscriptScanResult> {
     const scanNow = options.now ?? new Date();
     const today = scanNow.toISOString().slice(0, 10);
     const result: TranscriptScanResult = {
+      scope: options.scope,
+      exhaustive: false,
+      discoveryErrors: 0,
+      statErrors: 0,
+      readErrors: 0,
       filesSeen: 0,
       filesRead: 0,
       filesParsed: 0,
@@ -159,6 +178,7 @@ export class TranscriptTailer {
       bytesRead: 0,
       bytesDeferred: 0,
       sessionsSkippedLiveCovered: 0,
+      filesSkippedOutsideRecentWindow: 0,
       eventsAppended: 0,
       tokensAppended: { input: 0, cacheRead: 0, output: 0 },
       parseErrors: 0,
@@ -172,13 +192,17 @@ export class TranscriptTailer {
     };
     const now = scanNow;
     const recentCutoff = now.getTime() - 48 * 60 * 60 * 1000;
-    for (const file of this.discover()) {
+    const discovery = this.discover(options.discoveryLimit);
+    result.activity.truncated = discovery.truncated;
+    result.discoveryErrors = discovery.errors;
+    for (const file of discovery.files) {
       result.filesSeen += 1;
       result.activity.discoveryEntries += 1;
       let stat: fs.Stats;
       try {
-        stat = fs.statSync(file);
+        stat = this.io.stat(file);
       } catch {
+        result.statErrors += 1;
         continue;
       }
       const mtime = stat.mtime.toISOString();
@@ -186,7 +210,10 @@ export class TranscriptTailer {
         result.activity.lastActivityAt = mtime;
       }
       if (mtime.slice(0, 10) === today) result.activity.filesToday += 1;
-      if (options.recentOnly && stat.mtime.getTime() < recentCutoff) continue;
+      if (options.scope === "recent" && stat.mtime.getTime() < recentCutoff) {
+        result.filesSkippedOutsideRecentWindow += 1;
+        continue;
+      }
       const cursor = loadJsonlScanCursor<TranscriptParserState>(
         this.buffer.database,
         file,
@@ -194,12 +221,13 @@ export class TranscriptTailer {
         CHECKPOINT_VERSION,
         validateTranscriptParserState,
       );
-      let read: ReturnType<typeof readJsonlTail>;
+      let read: ReturnType<JsonlTailerIo["readTail"]>;
       try {
-        read = readJsonlTail(file, stat, cursor);
+        read = this.io.readTail(file, stat, cursor);
       } catch {
         // Rotation may remove a file between stat and open. One vanished file
         // must not abort the rest of the discovery set.
+        result.readErrors += 1;
         continue;
       }
       if (!read) {
@@ -217,42 +245,67 @@ export class TranscriptTailer {
         ? this.initialParserState(file)
         : cursor.parserState;
       const commit = this.buffer.database.transaction(() => {
+        const parseErrorsBefore = result.parseErrors;
         const parserState = this.ingestLines(file, read.lines, result, initialState);
-        rememberJsonlScanCursor(
-          this.buffer.database,
-          file,
-          PARSER_KIND,
-          CHECKPOINT_VERSION,
-          read,
-          parserState,
-        );
+        // Do not consume complete malformed input. Keeping the prior cursor
+        // makes the unresolved error durable across unchanged scans/restarts.
+        if (result.parseErrors === parseErrorsBefore) {
+          rememberJsonlScanCursor(
+            this.buffer.database,
+            file,
+            PARSER_KIND,
+            CHECKPOINT_VERSION,
+            read,
+            parserState,
+          );
+        }
       });
       commit();
       await new Promise((resolve) => setImmediate(resolve));
     }
+    result.exhaustive =
+      !result.activity.truncated &&
+      result.discoveryErrors === 0 &&
+      result.statErrors === 0 &&
+      result.readErrors === 0;
     return result;
   }
 
-  private discover(limit = 100_000): string[] {
+  private discover(limit = 100_000): {
+    files: string[];
+    truncated: boolean;
+    errors: number;
+  } {
     const files: string[] = [];
     const stack = [this.projectsDir];
     let seen = 0;
+    let truncated = false;
+    let errors = 0;
+    const boundedLimit = Math.max(1, limit);
     while (stack.length > 0) {
       const dir = stack.pop()!;
       let entries: fs.Dirent[];
       try {
-        entries = fs.readdirSync(dir, { withFileTypes: true });
-      } catch {
+        entries = this.io.readDirents(dir);
+      } catch (error) {
+        if (!(dir === this.projectsDir && (error as NodeJS.ErrnoException).code === "ENOENT")) {
+          errors += 1;
+        }
         continue;
       }
       for (const entry of entries) {
-        if (seen++ > limit) return files.sort();
+        if (seen >= boundedLimit) {
+          truncated = true;
+          break;
+        }
+        seen += 1;
         const full = path.join(dir, entry.name);
         if (entry.isDirectory()) stack.push(full);
         else if (entry.name.endsWith(".jsonl")) files.push(full);
       }
+      if (truncated) break;
     }
-    return files.sort();
+    return { files: files.sort(), truncated, errors };
   }
 
   private initialParserState(file: string): TranscriptParserState {
@@ -375,11 +428,13 @@ export class TranscriptTailer {
         costUsd: priced?.costUsd,
         metadata,
       });
-      this.buffer.append(event, []);
-      result.eventsAppended += 1;
-      result.tokensAppended.input += entry.input;
-      result.tokensAppended.cacheRead += entry.cacheRead;
-      result.tokensAppended.output += entry.output;
+      const inserted = this.buffer.append(event, []);
+      if (inserted) {
+        result.eventsAppended += 1;
+        result.tokensAppended.input += entry.input;
+        result.tokensAppended.cacheRead += entry.cacheRead;
+        result.tokensAppended.output += entry.output;
+      }
     }
     return state;
   }

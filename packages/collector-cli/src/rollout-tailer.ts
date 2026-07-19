@@ -5,10 +5,11 @@ import path from "node:path";
 import type { LocalEventBuffer } from "./buffer";
 import { resolveGitContext } from "./git-context";
 import {
+  DEFAULT_JSONL_TAILER_IO,
   ensureJsonlScanState,
   loadJsonlScanCursor,
-  readJsonlTail,
   rememberJsonlScanCursor,
+  type JsonlTailerIo,
 } from "./jsonl-byte-tailer";
 import { readLocalIdentities, type LocalIdentity, type LocalIdentityPaths } from "./local-identity";
 import { deterministicEventId } from "./normalizer";
@@ -44,6 +45,11 @@ import {
  */
 
 export type RolloutScanResult = {
+  scope: "recent" | "full";
+  exhaustive: boolean;
+  discoveryErrors: number;
+  statErrors: number;
+  readErrors: number;
   filesSeen: number;
   filesRead: number;
   filesParsed: number;
@@ -66,6 +72,12 @@ export type RolloutScanResult = {
 };
 
 type TokenTotals = { input: number; cachedInput: number; output: number; reasoningOutput: number };
+
+export type RolloutScanOptions = {
+  scope: "recent" | "full";
+  now?: Date;
+  discoveryLimit?: number;
+};
 
 type PersistedGitContext = {
   remoteUrlHash?: string;
@@ -226,6 +238,7 @@ export class RolloutTailer {
     private readonly buffer: LocalEventBuffer,
     private readonly sessionsDir = path.join(os.homedir(), ".codex", "sessions"),
     private readonly identityProvider: () => LocalIdentity[] = readLocalIdentities,
+    private readonly io: JsonlTailerIo = DEFAULT_JSONL_TAILER_IO,
   ) {
     ensureJsonlScanState(this.buffer.database);
   }
@@ -233,16 +246,21 @@ export class RolloutTailer {
   private codexIdentity: LocalIdentity | undefined;
 
   /**
-   * recentOnly limits discovery to today+yesterday (UTC) day directories.
+   * scope=recent limits discovery to today+yesterday (UTC) day directories.
    * Async on purpose: the collector serves HTTP on the same event loop, and
    * the first full-history walk reads thousands of files — yielding between
    * files keeps the dashboard responsive while a scan runs (owner-reported
    * freeze, sounding 0026).
    */
-  async scan(options: { recentOnly?: boolean; now?: Date } = {}): Promise<RolloutScanResult> {
+  async scan(options: RolloutScanOptions): Promise<RolloutScanResult> {
     const scanNow = options.now ?? new Date();
     const today = scanNow.toISOString().slice(0, 10);
     const result: RolloutScanResult = {
+      scope: options.scope,
+      exhaustive: false,
+      discoveryErrors: 0,
+      statErrors: 0,
+      readErrors: 0,
       filesSeen: 0,
       filesRead: 0,
       filesParsed: 0,
@@ -271,13 +289,17 @@ export class RolloutTailer {
     if (this.codexIdentity?.actorHash && this.codexIdentity.email) {
       this.buffer.setAccountEmail(this.codexIdentity.actorHash, this.codexIdentity.email);
     }
-    for (const file of this.discover(options)) {
+    const discovery = this.discover(options);
+    result.activity.truncated = discovery.truncated;
+    result.discoveryErrors = discovery.errors;
+    for (const file of discovery.files) {
       result.filesSeen += 1;
       result.activity.discoveryEntries += 1;
       let stat: fs.Stats;
       try {
-        stat = fs.statSync(file);
+        stat = this.io.stat(file);
       } catch {
+        result.statErrors += 1;
         continue;
       }
       const mtime = stat.mtime.toISOString();
@@ -292,12 +314,13 @@ export class RolloutTailer {
         CHECKPOINT_VERSION,
         validateRolloutParserState,
       );
-      let read: ReturnType<typeof readJsonlTail>;
+      let read: ReturnType<JsonlTailerIo["readTail"]>;
       try {
-        read = readJsonlTail(file, stat, cursor);
+        read = this.io.readTail(file, stat, cursor);
       } catch {
         // Rotation may remove a file between stat and open. One vanished file
         // must not abort the rest of the discovery set.
+        result.readErrors += 1;
         continue;
       }
       if (!read) {
@@ -315,27 +338,56 @@ export class RolloutTailer {
         ? this.initialParserState(file)
         : cursor.parserState;
       const commit = this.buffer.database.transaction(() => {
+        const parseErrorsBefore = result.parseErrors;
         const parserState = this.ingestLines(file, read.lines, result, initialState);
-        rememberJsonlScanCursor(
-          this.buffer.database,
-          file,
-          PARSER_KIND,
-          CHECKPOINT_VERSION,
-          read,
-          parserState,
-        );
+        // A complete malformed line is unresolved input, not consumed input.
+        // Retain the prior cursor (or no cursor on first read) so unchanged
+        // retries and restarts cannot turn a failed full scan into completion.
+        if (result.parseErrors === parseErrorsBefore) {
+          rememberJsonlScanCursor(
+            this.buffer.database,
+            file,
+            PARSER_KIND,
+            CHECKPOINT_VERSION,
+            read,
+            parserState,
+          );
+        }
       });
       commit();
       await new Promise((resolve) => setImmediate(resolve));
     }
+    result.exhaustive =
+      !result.activity.truncated &&
+      result.discoveryErrors === 0 &&
+      result.statErrors === 0 &&
+      result.readErrors === 0;
     return result;
   }
 
-  private discover(options: { recentOnly?: boolean; now?: Date }): string[] {
+  private discover(options: RolloutScanOptions): {
+    files: string[];
+    truncated: boolean;
+    errors: number;
+  } {
     const now = options.now ?? new Date();
     const files: string[] = [];
     const dayDirs: string[] = [];
-    if (options.recentOnly) {
+    const limit = Math.max(1, options.discoveryLimit ?? Number.MAX_SAFE_INTEGER);
+    let truncated = false;
+    let errors = 0;
+    const listDirs = (dir: string, root = false) => {
+      try {
+        return this.io
+          .readDirents(dir)
+          .filter((entry) => entry.isDirectory())
+          .map((entry) => path.join(dir, entry.name));
+      } catch (error) {
+        if (!(root && (error as NodeJS.ErrnoException).code === "ENOENT")) errors += 1;
+        return [];
+      }
+    };
+    if (options.scope === "recent") {
       for (const offset of [0, 1]) {
         const day = new Date(now.getTime() - offset * 24 * 60 * 60 * 1000);
         const iso = day.toISOString().slice(0, 10);
@@ -343,7 +395,7 @@ export class RolloutTailer {
       }
     } else {
       // Full walk: sessions/YYYY/MM/DD — three bounded levels.
-      for (const year of listDirs(this.sessionsDir)) {
+      for (const year of listDirs(this.sessionsDir, true)) {
         for (const month of listDirs(year)) {
           dayDirs.push(...listDirs(month));
         }
@@ -352,17 +404,33 @@ export class RolloutTailer {
     for (const dir of dayDirs) {
       let entries: string[];
       try {
-        entries = fs.readdirSync(dir);
-      } catch {
+        entries = this.io.readNames(dir);
+      } catch (error) {
+        // A recent day directory commonly does not exist yet. In a full walk,
+        // however, day directories came from discovery, so disappearance or
+        // inaccessibility means the walk was not exhaustive.
+        if (
+          !(
+            options.scope === "recent" &&
+            (error as NodeJS.ErrnoException).code === "ENOENT"
+          )
+        ) {
+          errors += 1;
+        }
         continue;
       }
       for (const entry of entries) {
         if (entry.startsWith("rollout-") && entry.endsWith(".jsonl")) {
+          if (files.length >= limit) {
+            truncated = true;
+            break;
+          }
           files.push(path.join(dir, entry));
         }
       }
+      if (truncated) break;
     }
-    return files.sort();
+    return { files: files.sort(), truncated, errors };
   }
 
   private sessionHasNonRolloutTokens(sessionId: string) {
@@ -425,7 +493,7 @@ export class RolloutTailer {
       try {
         parsed = JSON.parse(line) as Record<string, unknown>;
       } catch {
-        result.parseErrors += 1; // usually a partial trailing line mid-write
+        result.parseErrors += 1; // partial trailing bytes are deferred before this parser
         continue;
       }
       const type = parsed.type;
@@ -531,23 +599,14 @@ export class RolloutTailer {
         costUsd: priced?.costUsd,
         metadata,
       });
-      this.buffer.append(event, []);
-      result.eventsAppended += 1;
-      result.tokensAppended.input += entry.delta.input;
-      result.tokensAppended.cachedInput += entry.delta.cachedInput;
-      result.tokensAppended.output += entry.delta.output;
+      const inserted = this.buffer.append(event, []);
+      if (inserted) {
+        result.eventsAppended += 1;
+        result.tokensAppended.input += entry.delta.input;
+        result.tokensAppended.cachedInput += entry.delta.cachedInput;
+        result.tokensAppended.output += entry.delta.output;
+      }
     }
     return state;
-  }
-}
-
-function listDirs(dir: string): string[] {
-  try {
-    return fs
-      .readdirSync(dir, { withFileTypes: true })
-      .filter((entry) => entry.isDirectory())
-      .map((entry) => path.join(dir, entry.name));
-  } catch {
-    return [];
   }
 }

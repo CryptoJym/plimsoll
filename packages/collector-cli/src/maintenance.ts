@@ -366,7 +366,7 @@ export function runRepoEnrichmentMaintenance(
 }
 
 export type CollectorMaintenanceRunResult = {
-  recentOnly: boolean;
+  recentOnly: true;
   rollout: RolloutScanResult;
   transcript: TranscriptScanResult;
   reconciliation: CodexReconciliationResult;
@@ -442,9 +442,9 @@ export class CollectorMaintenance {
     private readonly transcriptTailer: TranscriptTailer,
   ) {}
 
-  async run(recentOnly: boolean): Promise<CollectorMaintenanceRunResult> {
-    const rollout = await this.rolloutTailer.scan({ recentOnly });
-    const transcript = await this.transcriptTailer.scan({ recentOnly });
+  async runRecent(): Promise<CollectorMaintenanceRunResult> {
+    const rollout = await this.rolloutTailer.scan({ scope: "recent" });
+    const transcript = await this.transcriptTailer.scan({ scope: "recent" });
     const reconciliation = runCodexReconciliationMaintenance(this.buffer.database);
     const repricing = runRepricingMaintenance(this.buffer.database);
     const enrichment = runRepoEnrichmentMaintenance(this.buffer.database);
@@ -456,7 +456,7 @@ export class CollectorMaintenance {
     }
     const drained=await drainProjectionMigration(this.buffer.projection);
     return {
-      recentOnly,
+      recentOnly: true,
       rollout,
       transcript,
       reconciliation,
@@ -495,13 +495,14 @@ type DrainWaiter = {
 };
 
 /**
- * One daemon entrypoint for boot, interval, and explicit internal triggers.
- * Concurrent requests collapse into one pending follow-up; a full-history
- * request (`recentOnly=false`) dominates any pending recent request.
+ * One daemon entrypoint for boot, interval, and internal recent-tail triggers.
+ * Concurrent requests collapse into one pending follow-up. There is no full
+ * mode in this scheduler; only the explicit scan-rollouts/scan-transcripts CLI
+ * commands may request full history.
  */
 export class CoalescingMaintenanceScheduler {
   private running = false;
-  private pendingRecentOnly: boolean | undefined;
+  private pending = false;
   private waiters: DrainWaiter[] = [];
   private triggerCount = 0;
   private runCount = 0;
@@ -521,15 +522,12 @@ export class CoalescingMaintenanceScheduler {
   private lastRun: CollectorMaintenanceRunResult | null = null;
 
   constructor(
-    private readonly runJob: (recentOnly: boolean) => Promise<CollectorMaintenanceRunResult>,
+    private readonly runJob: () => Promise<CollectorMaintenanceRunResult>,
   ) {}
 
-  trigger(recentOnly: boolean) {
+  trigger() {
     this.triggerCount += 1;
-    this.pendingRecentOnly =
-      this.pendingRecentOnly === undefined
-        ? recentOnly
-        : this.pendingRecentOnly && recentOnly;
+    this.pending = true;
     if (this.running) this.coalescedTriggerCount += 1;
 
     const promise = new Promise<CollectorMaintenanceRunResult[]>((resolve, reject) => {
@@ -545,7 +543,7 @@ export class CoalescingMaintenanceScheduler {
   status(): MaintenanceSchedulerStatus {
     return {
       inFlight: this.running,
-      pending: this.pendingRecentOnly !== undefined,
+      pending: this.pending,
       triggerCount: this.triggerCount,
       runCount: this.runCount,
       coalescedTriggerCount: this.coalescedTriggerCount,
@@ -567,16 +565,15 @@ export class CoalescingMaintenanceScheduler {
   private async drain() {
     const results: CollectorMaintenanceRunResult[] = [];
     let firstError: unknown;
-    while (this.pendingRecentOnly !== undefined) {
-      const recentOnly = this.pendingRecentOnly;
-      this.pendingRecentOnly = undefined;
+    while (this.pending) {
+      this.pending = false;
       this.runCount += 1;
       this.lastStartedAt = new Date().toISOString();
       if (this.activeJobs > 0) this.overlappingJobs += 1;
       this.activeJobs += 1;
       this.maxConcurrentJobs = Math.max(this.maxConcurrentJobs, this.activeJobs);
       try {
-        const result = await this.runJob(recentOnly);
+        const result = await this.runJob();
         this.lastRun = result;
         this.rolloutFilesRead += result.rollout.filesRead;
         this.transcriptFilesRead += result.transcript.filesRead;
@@ -602,4 +599,14 @@ export class CoalescingMaintenanceScheduler {
       else waiter.resolve(results);
     }
   }
+}
+
+/**
+ * The only automatic boot/interval entrypoint. Its signature cannot express a
+ * full-history request, so daemon scheduling stays recent-only by construction.
+ */
+export function requestAutomaticRecentMaintenance(
+  scheduler: CoalescingMaintenanceScheduler,
+) {
+  return scheduler.trigger();
 }

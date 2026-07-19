@@ -42,8 +42,13 @@ import { TranscriptTailer } from "./transcript-tailer";
 import {
   CoalescingMaintenanceScheduler,
   CollectorMaintenance,
+  requestAutomaticRecentMaintenance,
 } from "./maintenance";
 import { codexReconciliationStatus } from "./codex-reconciliation";
+import {
+  historyCoverageStatus,
+  recordExplicitFullHistoryCoverage,
+} from "./history-coverage";
 import { createCollectorServer } from "./server";
 import {
   applyClaudeSettings,
@@ -838,14 +843,14 @@ async function main() {
       new RolloutTailer(buffer),
       new TranscriptTailer(buffer),
     );
-    scheduler = new CoalescingMaintenanceScheduler(async (recentOnly) => {
-      const result = await maintenance.run(recentOnly);
+    scheduler = new CoalescingMaintenanceScheduler(async () => {
+      const result = await maintenance.runRecent();
       const { rollout, transcript, reconciliation, repricing, enrichment } = result;
       if (rollout.eventsAppended > 0 || rollout.parseErrors > 0) {
-        console.log(JSON.stringify({ status: "rollout_scan", recentOnly, ...rollout }));
+        console.log(JSON.stringify({ status: "rollout_scan", ...rollout }));
       }
       if (transcript.eventsAppended > 0 || transcript.parseErrors > 0) {
-        console.log(JSON.stringify({ status: "transcript_scan", recentOnly, ...transcript }));
+        console.log(JSON.stringify({ status: "transcript_scan", ...transcript }));
       }
       if (reconciliation.rowsChanged > 0) {
         console.log(JSON.stringify({ status: "codex_reconciliation", ...reconciliation }));
@@ -858,9 +863,9 @@ async function main() {
       }
       return result;
     });
-    const runRolloutScan = async (recentOnly: boolean) => {
+    const runAutomaticMaintenance = async () => {
       try {
-        await scheduler.trigger(recentOnly);
+        await requestAutomaticRecentMaintenance(scheduler);
       } catch (error) {
         console.warn(
           JSON.stringify({
@@ -872,12 +877,11 @@ async function main() {
     };
 
     runPrune();
-    // Boot backfill is deferred so the OTLP receiver binds first — the
-    // first-ever walk reads every historical rollout (2,669 files at first
-    // deploy) and must not delay ingest. Later boots skip unchanged files
-    // via rollout_scan_state, so the deferred walk is cheap from then on.
-    timers.push(setTimeout(() => void runRolloutScan(false), 5_000));
-    timers.push(setInterval(() => void runRolloutScan(true), 60 * 1000));
+    // Boot capture is deferred so the OTLP receiver binds first, but it uses
+    // the exact same bounded recent-tail entrypoint as the interval. Historical
+    // files are available only through the explicit scan commands below.
+    timers.push(setTimeout(() => void runAutomaticMaintenance(), 5_000));
+    timers.push(setInterval(() => void runAutomaticMaintenance(), 60 * 1000));
     timers.push(setInterval(runPrune, 6 * 60 * 60 * 1000));
     if (config.uploadUrl) {
       timers.push(setInterval(() => void runSync(), config.syncIntervalSeconds * 1000));
@@ -1014,6 +1018,7 @@ async function main() {
             sources: [],
             reason: "projection backfill has not published a coherent health snapshot",
           },
+          historyCoverage: historyCoverageStatus(buffer.database),
         },
         null,
         2,
@@ -1102,16 +1107,26 @@ async function main() {
 
   if (command === "scan-rollouts") {
     const buffer = openBuffer(config);
-    const result = await new RolloutTailer(buffer).scan({ recentOnly: false });
-    console.log(JSON.stringify(result, null, 2));
+    const result = await new RolloutTailer(buffer).scan({ scope: "full" });
+    const historyCoverage = recordExplicitFullHistoryCoverage(
+      buffer.database,
+      "codex",
+      result,
+    );
+    console.log(JSON.stringify({ ...result, historyCoverage }, null, 2));
     buffer.close();
     return;
   }
 
   if (command === "scan-transcripts") {
     const buffer = openBuffer(config);
-    const result = await new TranscriptTailer(buffer).scan({ recentOnly: false });
-    console.log(JSON.stringify(result, null, 2));
+    const result = await new TranscriptTailer(buffer).scan({ scope: "full" });
+    const historyCoverage = recordExplicitFullHistoryCoverage(
+      buffer.database,
+      "claude_code",
+      result,
+    );
+    console.log(JSON.stringify({ ...result, historyCoverage }, null, 2));
     buffer.close();
     return;
   }

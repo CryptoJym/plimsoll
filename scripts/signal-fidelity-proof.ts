@@ -1482,7 +1482,7 @@ async function main() {
   );
 
   const tailer = new RolloutTailer(buffer, rolloutDir, proofIdentities);
-  const firstScan = await tailer.scan();
+  const firstScan = await tailer.scan({ scope: "full" });
   const rolloutRows = buffer.database
     .prepare(
       `select session_id as sessionId, model, input_tokens as inputTokens,
@@ -1531,7 +1531,7 @@ async function main() {
   // Clearing the persistent scan state forces a true re-parse — which must
   // not change counts or sums (deterministic ids + conflict-ignore inserts).
   buffer.database.prepare(`delete from rollout_scan_state`).run();
-  const rescan = await new RolloutTailer(buffer, rolloutDir, proofIdentities).scan();
+  const rescan = await new RolloutTailer(buffer, rolloutDir, proofIdentities).scan({ scope: "full" });
   const afterRescan = buffer.database
     .prepare(
       `select count(*) as n, coalesce(sum(input_tokens),0) as input from buffered_events
@@ -1561,7 +1561,7 @@ async function main() {
       }),
     ].join("\n") + "\n",
   );
-  const unpricedScan = await new RolloutTailer(buffer, rolloutDir, proofIdentities).scan();
+  const unpricedScan = await new RolloutTailer(buffer, rolloutDir, proofIdentities).scan({ scope: "full" });
   runRepricingMaintenance(buffer.database, {
     backfillLimit: 25_000,
     candidateLimit: 25_000,
@@ -1708,7 +1708,7 @@ async function main() {
     path.join(projDir, `${SESSION}.jsonl`),
     tline({ type: "assistant", sessionId: SESSION, timestamp: "2026-06-10T10:00:00.000Z", message: { id: "msg_skip_1", model: "claude-fable-5", usage: { input_tokens: 999, output_tokens: 999 } } }) + "\n",
   );
-  const transcriptScan = await new TranscriptTailer(buffer, projectsDir).scan();
+  const transcriptScan = await new TranscriptTailer(buffer, projectsDir).scan({ scope: "full" });
   const transcriptRows = buffer.database
     .prepare(
       `select session_id as sid, model, input_tokens as i, cache_read_tokens as c, output_tokens as o,
@@ -1742,7 +1742,7 @@ async function main() {
       !transcriptRows.some((row) => row.sid === SESSION),
     JSON.stringify({ skipped: transcriptScan.sessionsSkippedLiveCovered }),
   );
-  const transcriptRescan = await new TranscriptTailer(buffer, projectsDir).scan();
+  const transcriptRescan = await new TranscriptTailer(buffer, projectsDir).scan({ scope: "full" });
   const transcriptPersisted = JSON.stringify(
     buffer.database.prepare(`select payload_json from buffered_events where source = 'claude_code'`).all(),
   );

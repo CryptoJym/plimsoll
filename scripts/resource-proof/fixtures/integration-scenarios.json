@@ -16,10 +16,12 @@
     },
     {
       "id": "no_change_constant_work",
-      "issue": 77,
-      "blockedBy": [77],
-      "detail": "Run an unchanged interval and prove zero history reads, event rewrites, repricing/enrichment visits, and overlapping jobs.",
+      "issue": 124,
+      "blockedBy": [124],
+      "detail": "Prove recent-only first boot over thousands of old files, coalesced and idle restart behavior, exact append receipts, and explicit resumable full-history coverage.",
       "requiredCounters": [
+        "filesOpened",
+        "fileBytesRead",
         "fullHistoryFileReads",
         "rawEventRewrites",
         "repriceRowsVisited",
