@@ -654,10 +654,16 @@ async function main() {
     finalizeActivatedPendingJoin();
   }
 
-  const configRead = command === "doctor" ? readCollectorConfig() : null;
+  const configRead = command === "doctor" || command === "setup" ? readCollectorConfig() : null;
+  let strictSetupConfig: CollectorConfig | null = null;
+  if (command === "setup" && configRead?.status === "invalid") {
+    // Strict parsing preserves the specific privacy/error reason without the
+    // create-on-missing behavior that setup preview must avoid.
+    strictSetupConfig = loadCollectorConfig();
+  }
   const configPath = configRead?.path ?? collectorConfigPath();
-  const config = configRead?.config ??
-    (command === "doctor" ? collectorConfigSchema.parse({}) : loadCollectorConfig());
+  const config = configRead?.config ?? strictSetupConfig ??
+    (command === "doctor" || command === "setup" ? collectorConfigSchema.parse({}) : loadCollectorConfig());
   assertCollectorPrivacyMode(config, command, {
     willEnableUpload: command === "join" || Boolean(optionValue("--url")),
   });
@@ -1043,7 +1049,13 @@ async function main() {
       for (const change of plan.changes) console.log(`${plan.path}: ${change}`);
       if (plan.conflict) console.warn(`${plan.path}: ${plan.conflict}`);
     }
+    if (planCodex.conflict) {
+      console.error("Codex config conflict blocks setup; no config was written.");
+      process.exitCode = 1;
+      return;
+    }
     if (!planClaude.changed && !planCodex.changed) {
+      if (!dryRun && configRead?.status === "missing") loadCollectorConfig();
       console.log(JSON.stringify({ status: "setup_noop", claude: claudeFile, codex: codexFile, conflict: planCodex.conflict ?? null }));
       return;
     }
@@ -1065,6 +1077,7 @@ async function main() {
         return;
       }
     }
+    if (configRead?.status === "missing") loadCollectorConfig();
     const resultClaude = applyClaudeSettings(claudeFile, claudeGenerated);
     const resultCodex = applyCodexConfig(codexFile, codexToml);
     console.log(

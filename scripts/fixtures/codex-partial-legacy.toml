@@ -1,0 +1,43 @@
+# Synthetic regression fixture for GitHub #123. No operator values or credentials.
+model = "synthetic-neutral-model"
+
+[operator_preferences]
+preserve_me = "synthetic-operator-value" # This comment must survive byte-for-byte.
+
+[otel]
+environment = "synthetic-legacy-environment" # Plimsoll owns this key; replace only its value.
+log_user_prompt = false
+
+[otel.exporter."otlp-http"]
+endpoint = "http://127.0.0.1:__PLIMSOLL_PORT__/v1/logs"
+protocol = "json"
+headers = { "x-cfo-one-source" = "codex", "x-synthetic-operator" = "keep" } # Keep the unrelated header and comment.
+
+[otel.trace_exporter."otlp-http"]
+endpoint = "http://127.0.0.1:__PLIMSOLL_PORT__/v1/traces"
+protocol = "json"
+headers = { "x-cfo-one-source" = "codex" }
+
+[otel.metrics_exporter."otlp-http"]
+endpoint = "http://127.0.0.1:__PLIMSOLL_PORT__/v1/metrics"
+protocol = "json"
+headers = { "x-cfo-one-source" = "codex" }
+
+[features]
+responses_websockets = true # Existing feature remains operator-owned.
+
+[hooks]
+state = "synthetic-existing-state" # Existing hook state remains operator-owned.
+
+[[hooks.UserPromptSubmit]]
+name = "synthetic-operator-hook"
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "printf synthetic-operator-hook"
+timeout = 9
+statusMessage = "Synthetic operator hook"
+
+[mcp_servers.synthetic]
+command = "synthetic-mcp-command"
+enabled = false

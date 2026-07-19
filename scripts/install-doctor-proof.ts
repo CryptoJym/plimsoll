@@ -41,6 +41,7 @@ const cli = path.join(root, "packages", "collector-cli", "src", "cli.ts");
 const tsx = path.join(root, "node_modules", "tsx", "dist", "cli.mjs");
 const installScript = path.join(root, "install.sh");
 const proofWorkflow = path.join(root, ".github", "workflows", "proof.yml");
+const partialCodexFixture = path.join(root, "scripts", "fixtures", "codex-partial-legacy.toml");
 const checks: Check[] = [];
 
 function check(name: string, condition: unknown, detail: unknown) {
@@ -113,6 +114,7 @@ async function main() {
   const requiredStandaloneGates = [
     "pnpm proof:allocation",
     "pnpm proof:install-doctor",
+    "pnpm proof:codex-config-apply",
     "pnpm proof:http-boundary",
     "pnpm proof:dashboard",
     "pnpm proof:dashboard-security",
@@ -364,6 +366,120 @@ esac
     packagedBlankReceipt,
   );
 
+  const cleanSetupHome = path.join(sandbox, "clean-setup-home");
+  const cleanSetupPlimsoll = path.join(sandbox, "clean-setup-plimsoll");
+  const cleanSetup = await command(
+    process.execPath,
+    [tsx, cli, "setup", "--dry-run"],
+    {
+      cwd: neutralCwd,
+      env: {
+        ...doctorBaseEnv,
+        HOME: cleanSetupHome,
+        PLIMSOLL_HOME: cleanSetupPlimsoll,
+      },
+    },
+  );
+  check(
+    "fresh_home_setup_dry_run_is_byte_absent_preview",
+    cleanSetup.code === 0 &&
+      cleanSetup.stdout.includes('"status":"setup_dry_run"') &&
+      !fs.existsSync(cleanSetupHome) &&
+      !fs.existsSync(cleanSetupPlimsoll),
+    {
+      ...cleanSetup,
+      homeExists: fs.existsSync(cleanSetupHome),
+      plimsollHomeExists: fs.existsSync(cleanSetupPlimsoll),
+    },
+  );
+
+  const rejectedSetupHome = path.join(sandbox, "rejected-setup-home");
+  const rejectedSetupPlimsoll = path.join(sandbox, "rejected-setup-plimsoll");
+  const rejectedToolDir = path.join(sandbox, "rejected-tool-config");
+  const rejectedClaude = path.join(rejectedToolDir, "settings.json");
+  const rejectedCodex = path.join(rejectedToolDir, "config.toml");
+  fs.mkdirSync(rejectedToolDir);
+  const malformedCodex = '[otel]\nenvironment = "first"\n[otel]\nenvironment = "duplicate"\n';
+  fs.writeFileSync(rejectedCodex, malformedCodex);
+  const rejectedSetup = await command(
+    process.execPath,
+    [
+      tsx,
+      cli,
+      "setup",
+      "--yes",
+      "--claude-settings",
+      rejectedClaude,
+      "--codex-config",
+      rejectedCodex,
+    ],
+    {
+      cwd: neutralCwd,
+      env: {
+        ...doctorBaseEnv,
+        HOME: rejectedSetupHome,
+        PLIMSOLL_HOME: rejectedSetupPlimsoll,
+      },
+    },
+  );
+  check(
+    "invalid_plan_blocks_default_config_and_all_tool_writes",
+    rejectedSetup.code !== 0 &&
+      rejectedSetup.stderr.includes("existing Codex config.toml is invalid") &&
+      !fs.existsSync(rejectedSetupHome) &&
+      !fs.existsSync(rejectedSetupPlimsoll) &&
+      !fs.existsSync(rejectedClaude) &&
+      fs.readFileSync(rejectedCodex, "utf8") === malformedCodex &&
+      backupCount(rejectedToolDir) === 0,
+    {
+      ...rejectedSetup,
+      homeExists: fs.existsSync(rejectedSetupHome),
+      plimsollHomeExists: fs.existsSync(rejectedSetupPlimsoll),
+    },
+  );
+
+  const freshApplyHome = path.join(sandbox, "fresh-apply-home");
+  const freshApplyPlimsoll = path.join(sandbox, "fresh-apply-plimsoll");
+  const freshToolDir = path.join(sandbox, "fresh-tool-config");
+  const freshClaude = path.join(freshToolDir, "settings.json");
+  const freshCodex = path.join(freshToolDir, "config.toml");
+  fs.mkdirSync(freshToolDir);
+  const freshApply = await command(
+    process.execPath,
+    [
+      tsx,
+      cli,
+      "setup",
+      "--yes",
+      "--claude-settings",
+      freshClaude,
+      "--codex-config",
+      freshCodex,
+    ],
+    {
+      cwd: neutralCwd,
+      env: {
+        ...doctorBaseEnv,
+        HOME: freshApplyHome,
+        PLIMSOLL_HOME: freshApplyPlimsoll,
+      },
+    },
+  );
+  check(
+    "fresh_apply_creates_default_only_after_valid_plan",
+    freshApply.code === 0 &&
+      freshApply.stdout.includes('"status": "setup_applied"') &&
+      fs.existsSync(path.join(freshApplyPlimsoll, "collector.config.json")) &&
+      fs.existsSync(freshClaude) &&
+      fs.existsSync(freshCodex) &&
+      !fs.existsSync(freshApplyHome),
+    {
+      ...freshApply,
+      homeExists: fs.existsSync(freshApplyHome),
+      defaultConfigExists: fs.existsSync(path.join(freshApplyPlimsoll, "collector.config.json")),
+    },
+  );
+
   const fixtureHome = path.join(sandbox, "fixture-home");
   const fixturePlimsoll = path.join(sandbox, "fixture-plimsoll");
   const claudeDir = path.join(fixtureHome, ".claude");
@@ -379,7 +495,6 @@ esac
   const claudeSettings = path.join(claudeDir, "settings.json");
   const codexConfig = path.join(codexDir, "config.toml");
   fs.writeFileSync(claudeSettings, JSON.stringify({ existing: { keep: true } }, null, 2) + "\n");
-  fs.writeFileSync(codexConfig, 'model = "neutral-model"\n');
 
   server = http.createServer();
   await new Promise<void>((resolve, reject) => {
@@ -401,6 +516,9 @@ esac
     PLIMSOLL_COLLECTOR_DOCTOR_TIMEOUT_MS: "500",
     PLIMSOLL_LAUNCHCTL_LOG: launchctlLog,
   };
+  const partialCodexConfig = fs.readFileSync(partialCodexFixture, "utf8")
+    .replaceAll("__PLIMSOLL_PORT__", String(port));
+  fs.writeFileSync(codexConfig, partialCodexConfig);
   const firstSetup = await command(
     process.execPath,
     [tsx, cli, "setup", "--yes"],
@@ -426,7 +544,11 @@ esac
   check(
     "isolated_setup_preserves_existing_config",
     JSON.parse(fs.readFileSync(claudeSettings, "utf8")).existing.keep === true &&
-      fs.readFileSync(codexConfig, "utf8").includes('model = "neutral-model"'),
+      fs.readFileSync(codexConfig, "utf8").includes('model = "synthetic-neutral-model"') &&
+      fs.readFileSync(codexConfig, "utf8").includes('state = "synthetic-existing-state"') &&
+      fs.readFileSync(codexConfig, "utf8").includes('command = "printf synthetic-operator-hook"') &&
+      fs.readFileSync(codexConfig, "utf8").includes('"x-synthetic-operator" = "keep"') &&
+      !fs.readFileSync(codexConfig, "utf8").includes("x-cfo-one-source"),
     { claudeSettings, codexConfig },
   );
   check(
