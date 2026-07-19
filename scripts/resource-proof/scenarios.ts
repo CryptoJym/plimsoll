@@ -103,6 +103,10 @@ export type ResourceSandbox = {
 };
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+// Two sources each require two complete 1,001-file sweeps at 256 files per
+// discovery chunk, followed by at most eight capture/replay quiet sweeps.
+// This is a fixture-derived hard ceiling, not a wall-clock relaxation.
+const MAX_DISCOVERY_CADENCES = 2 * 2 * Math.ceil(1_001 / 256) + 8;
 
 function metadataPrivacyFixture() {
   const fixture = JSON.parse(
@@ -983,7 +987,7 @@ export async function runNoChangeConstantWorkContract(
     const bootRuns = [...initialDrain];
     for (
       let cadence = 0;
-      cadence < 12 && captureBaselineStatus(buffer.database).status !== "complete";
+      cadence < MAX_DISCOVERY_CADENCES && captureBaselineStatus(buffer.database).status !== "complete";
       cadence += 1
     ) {
       bootRuns.push(await maintenance.runRecent());
@@ -1104,7 +1108,7 @@ export async function runNoChangeConstantWorkContract(
     );
     const excludedAppendBefore = eventMutationCounts(buffer);
     const excludedAppendRuns: CollectorMaintenanceRunResult[] = [];
-    for (let cadence = 0; cadence < 12; cadence += 1) {
+    for (let cadence = 0; cadence < MAX_DISCOVERY_CADENCES; cadence += 1) {
       const run = (await requestAutomaticRecentMaintenance(restartScheduler))[0];
       if (!run) throw new Error("ExcludedAppendMaintenanceResultMissing");
       excludedAppendRuns.push(run);
@@ -1193,7 +1197,7 @@ export async function runNoChangeConstantWorkContract(
     );
     const appendBefore = eventMutationCounts(buffer);
     const appendedRuns: CollectorMaintenanceRunResult[] = [];
-    for (let cadence = 0; cadence < 12; cadence += 1) {
+    for (let cadence = 0; cadence < MAX_DISCOVERY_CADENCES; cadence += 1) {
       const run = (await requestAutomaticRecentMaintenance(restartScheduler))[0];
       if (!run) throw new Error("AppendMaintenanceResultMissing");
       appendedRuns.push(run);
@@ -1223,7 +1227,7 @@ export async function runNoChangeConstantWorkContract(
     );
     const replayBefore = eventMutationCounts(buffer);
     const replayRuns: CollectorMaintenanceRunResult[] = [];
-    for (let cadence = 0; cadence < 12; cadence += 1) {
+    for (let cadence = 0; cadence < MAX_DISCOVERY_CADENCES; cadence += 1) {
       const run = (await requestAutomaticRecentMaintenance(restartScheduler))[0];
       if (!run) throw new Error("ReplayMaintenanceResultMissing");
       replayRuns.push(run);
@@ -1735,6 +1739,20 @@ export async function runNoChangeConstantWorkContract(
         preinstallGrowthStayedExcluded,
         appendedExactlyOnce,
         durableReceiptCounters,
+        replayRolloutFilesRead: replayRuns.reduce(
+          (total, run) => total + run.rollout.filesRead,
+          0,
+        ),
+        replayTranscriptFilesRead: replayRuns.reduce(
+          (total, run) => total + run.transcript.filesRead,
+          0,
+        ),
+        replayEventsAppended: replayRuns.reduce(
+          (total, run) => total + run.rollout.eventsAppended + run.transcript.eventsAppended,
+          0,
+        ),
+        replayRawEventWrites: replayRuns.reduce((total, run) => total + run.rawEventWrites, 0),
+        replayEventMutationsInserted: replayMutations.inserted,
         recentPromotionRejected,
         statusSeparatesCurrentFromHistory,
         fullBackfillResumableIdempotent,
