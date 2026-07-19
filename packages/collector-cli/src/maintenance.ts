@@ -102,6 +102,7 @@ function recordAutomaticCaptureRuntimeState(
 }
 
 export function automaticCaptureRuntimeStatus(database: Database.Database) {
+  ensureAutomaticCaptureRuntimeState(database);
   const row = database.prepare(
     `select generation, phase, status, completed_at as completedAt,
        bytes_read as bytesRead, records_parsed as recordsParsed,
