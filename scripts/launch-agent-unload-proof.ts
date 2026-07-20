@@ -8,11 +8,13 @@ import path from "node:path";
 import {
   captureLaunchAgentUnloadPriorState,
   observeLaunchAgentUnloadTerminalState,
+  readCollectorPidCleanupState,
   readCollectorPidFile,
   removeCollectorPidFileIfOwned,
   removeCollectorPidFileIfOwnedDetailed,
   runtimeIdentityMatches,
   type CollectorListenerObservation,
+  type CollectorPidCleanupResult,
   type CollectorPidFileRead,
   type CollectorRuntimeIdentity,
   type LaunchAgentLabelObservation,
@@ -23,6 +25,22 @@ import {
 const LABEL = "com.plimsoll.collector";
 const PID_PATH = "/fixture/collector.pid";
 const PORT = 48_271;
+
+function fixtureCleanupResult(removed: boolean): CollectorPidCleanupResult {
+  return {
+    removed,
+    ambiguous: false,
+    quarantined: false,
+    persistent: {
+      ambiguous: false,
+      markerState: "missing",
+      claimCount: 0,
+      quarantineCount: 0,
+      inventoryTruncated: false,
+    },
+    disposition: removed ? "removed" : "not_owned",
+  };
+}
 
 type Snapshot = {
   label: LaunchAgentLabelObservation;
@@ -113,12 +131,14 @@ async function runScenario(scenario: Scenario) {
     );
   const readPidFile = () => snapshot().pid;
   const removePidFile = (_pidPath: string, candidate: CollectorRuntimeIdentity) => {
-    if (!scenario.removeOwnedPid) return false;
+    if (!scenario.removeOwnedPid) return fixtureCleanupResult(false);
     const read = snapshot().pid;
-    if (read.kind !== "current" || !runtimeIdentityMatches(read.record, candidate)) return false;
+    if (read.kind !== "current" || !runtimeIdentityMatches(read.record, candidate)) {
+      return fixtureCleanupResult(false);
+    }
     snapshot().pid = missing();
     removals += 1;
-    return true;
+    return fixtureCleanupResult(true);
   };
 
   const prior = await captureLaunchAgentUnloadPriorState({
@@ -212,7 +232,7 @@ async function main() {
     "terminal_between_last_poll_and_receipt_is_stopped",
     atReceiptBoundary.outcome.stopped &&
       atReceiptBoundary.outcome.timing.deadlineCrossed &&
-      atReceiptBoundary.outcome.timing.finalObservation,
+      atReceiptBoundary.outcome.timing.finalObservationPerformed,
     "The mandatory receipt-time observation closes the deadline race.",
   );
 
@@ -457,7 +477,7 @@ async function main() {
       "pid_symlink_is_rejected_without_target_mutation",
       symlinkRead.kind === "unsafe" &&
         symlinkRead.reason === "leaf_symlink" &&
-        !symlinkRemoved &&
+        !symlinkRemoved.removed &&
         fs.lstatSync(symlinkPid).isSymbolicLink() &&
         fs.readFileSync(symlinkTarget, "utf8") === ownedRaw,
       "No-follow inspection leaves both the symlink and its target byte-exact.",
@@ -471,7 +491,7 @@ async function main() {
       "pid_file_with_unsafe_mode_is_retained",
       permissiveRead.kind === "unsafe" &&
         permissiveRead.reason === "mode" &&
-        !removeCollectorPidFileIfOwned(permissivePid, owner, LABEL) &&
+        !removeCollectorPidFileIfOwned(permissivePid, owner, LABEL).removed &&
         fs.readFileSync(permissivePid, "utf8") === ownedRaw,
       "A non-private ownership record cannot authorize cleanup.",
     );
@@ -487,12 +507,15 @@ async function main() {
         regularReplacementInode = fs.lstatSync(swapPid).ino;
       },
     });
+    const swapCleanupState = readCollectorPidCleanupState(swapPid, LABEL);
     check(
       "pid_swap_before_claim_preserves_both_objects",
       !swapCleanup.removed &&
         swapCleanup.ambiguous &&
         !swapCleanup.quarantined &&
         swapCleanup.disposition === "preclaim_changed" &&
+        swapCleanupState.markerState === "present" &&
+        swapCleanupState.ambiguous &&
         fs.readFileSync(preservedOwner, "utf8") === ownedRaw &&
         fs.readFileSync(swapPid, "utf8") === foreignRaw &&
         fs.lstatSync(swapPid).ino === regularReplacementInode &&
@@ -521,6 +544,7 @@ async function main() {
     const midSymlinkHidden = fs.readdirSync(pidFixtureRoot).filter((entry) =>
       entry.includes(`${path.basename(midSymlinkPid)}.plimsoll-`)
     );
+    const midSymlinkCleanupState = readCollectorPidCleanupState(midSymlinkPid, LABEL);
     check(
       "mid_claim_symlink_replacement_stays_visible_and_unfollowed",
       !midSymlinkCleanup.removed &&
@@ -531,8 +555,10 @@ async function main() {
         fs.readlinkSync(midSymlinkPid) === midSymlinkTarget &&
         fs.readFileSync(midSymlinkTarget, "utf8") === foreignRaw &&
         fs.readFileSync(midSymlinkOwner, "utf8") === ownedRaw &&
-        midSymlinkHidden.length === 0,
-      "A symlink swapped before claim is never moved, followed, hidden, or reported removed.",
+        midSymlinkHidden.length === 1 &&
+        midSymlinkHidden[0] === `.${path.basename(midSymlinkPid)}.plimsoll-cleanup-marker` &&
+        midSymlinkCleanupState.markerState === "present",
+      "A symlink swapped before claim is never moved or followed; the private durable marker records unresolved cleanup.",
     );
 
     const disappearedPid = path.join(pidFixtureRoot, "disappeared.pid");
@@ -546,12 +572,14 @@ async function main() {
         beforeClaim: () => fs.renameSync(disappearedPid, disappearedOwner),
       },
     );
+    const disappearedCleanupState = readCollectorPidCleanupState(disappearedPid, LABEL);
     check(
       "replacement_disappearing_before_claim_latches_ambiguity",
       !disappearedCleanup.removed &&
         disappearedCleanup.ambiguous &&
         !disappearedCleanup.quarantined &&
         disappearedCleanup.disposition === "preclaim_changed" &&
+        disappearedCleanupState.markerState === "present" &&
         !fs.existsSync(disappearedPid) &&
         fs.readFileSync(disappearedOwner, "utf8") === ownedRaw,
       "A missing preclaim path is an ambiguous race, not successful cleanup.",
@@ -578,9 +606,9 @@ async function main() {
       },
     );
     const collisionQuarantines = fs.readdirSync(pidFixtureRoot).filter((entry) =>
-      entry.includes(`${path.basename(collisionPid)}.plimsoll-remove-`) &&
-      entry.includes(".plimsoll-quarantine-")
+      entry.startsWith(`.${path.basename(collisionPid)}.plimsoll-quarantine-`)
     );
+    const collisionCleanupState = readCollectorPidCleanupState(collisionPid, LABEL);
     const quarantinedReplacement = collisionQuarantines[0]
       ? path.join(pidFixtureRoot, collisionQuarantines[0])
       : "";
@@ -590,6 +618,8 @@ async function main() {
         collisionCleanup.ambiguous &&
         collisionCleanup.quarantined &&
         collisionCleanup.disposition === "mismatch_quarantined" &&
+        collisionCleanupState.markerState === "present" &&
+        collisionCleanupState.quarantineCount === 1 &&
         fs.readFileSync(collisionPid, "utf8") === collisionBytes &&
         collisionQuarantines.length === 1 &&
         fs.lstatSync(quarantinedReplacement).ino === movedReplacementInode &&
@@ -641,14 +671,15 @@ async function main() {
         !aggregateSymlinkOutcome.removedPidFile &&
         aggregateSymlinkOutcome.pidCleanupAmbiguous &&
         !aggregateSymlinkOutcome.pidCleanupQuarantined &&
-        aggregateSymlinkOutcome.timing.finalObservation === true &&
+        aggregateSymlinkOutcome.final.pidCleanupMarkerState === "present" &&
+        aggregateSymlinkOutcome.timing.finalObservationPerformed === true &&
         fs.lstatSync(aggregateSymlinkPid).isSymbolicLink() &&
         fs.lstatSync(aggregateSymlinkPid).ino === aggregateSymlinkInode &&
         fs.readlinkSync(aggregateSymlinkPid) === aggregateSymlinkTarget &&
         fs.readFileSync(aggregateSymlinkTarget, "utf8") === foreignRaw &&
         fs.readFileSync(aggregateSymlinkOwner, "utf8") === ownedRaw &&
-        aggregateSymlinkHidden.length === 0,
-      "The exact reviewer race remains visible, ambiguous, and nonterminal through the final receipt.",
+        aggregateSymlinkHidden.length === 1,
+      "The exact reviewer race remains visible, durably marked, ambiguous, and nonterminal even though the final observation was performed.",
     );
 
     const receiptPid = path.join(pidFixtureRoot, "receipt-race.pid");
@@ -695,10 +726,43 @@ async function main() {
         receiptRace.pidCleanupAmbiguous &&
         !receiptRace.pidCleanupQuarantined &&
         receiptRace.final.pidCleanupAmbiguous &&
-        receiptRace.timing.finalObservation === true &&
+        receiptRace.final.pidCleanupMarkerState === "present" &&
+        receiptRace.timing.finalObservationPerformed === true &&
         fs.readFileSync(receiptPid, "utf8") === foreignRaw &&
         fs.readFileSync(receiptOwner, "utf8") === ownedRaw,
-      "A failed cleanup remains nonterminal when a new owner appears at the receipt boundary.",
+      "A performed final observation remains separate from stopped truth when a new owner appears.",
+    );
+
+    const cleanPid = path.join(pidFixtureRoot, "clean.pid");
+    fs.writeFileSync(cleanPid, ownedRaw, { mode: 0o600 });
+    const cleanCleanup = removeCollectorPidFileIfOwned(cleanPid, owner, LABEL);
+    const cleanCleanupState = readCollectorPidCleanupState(cleanPid, LABEL);
+    check(
+      "exact_cleanup_clears_its_exact_private_marker",
+      cleanCleanup.removed &&
+        !cleanCleanup.ambiguous &&
+        cleanCleanup.disposition === "removed" &&
+        !fs.existsSync(cleanPid) &&
+        !cleanCleanupState.ambiguous &&
+        cleanCleanupState.markerState === "missing" &&
+        cleanCleanupState.claimCount === 0 &&
+        cleanCleanupState.quarantineCount === 0,
+      "The clean control removes the exact owned PID and only its exact identity-bound marker transaction.",
+    );
+
+    const boundedPid = path.join(pidFixtureRoot, "bounded-inventory.pid");
+    for (let index = 0; index < 257; index += 1) {
+      fs.writeFileSync(
+        path.join(pidFixtureRoot, `bounded-entry-${String(index).padStart(3, "0")}`),
+        "fixture\n",
+        { mode: 0o600 },
+      );
+    }
+    const boundedCleanupState = readCollectorPidCleanupState(boundedPid, LABEL);
+    check(
+      "cleanup_inventory_is_bounded_and_fails_closed",
+      boundedCleanupState.ambiguous && boundedCleanupState.inventoryTruncated,
+      "A directory beyond the fixed 256-entry inventory bound remains ambiguous instead of hiding later artifacts.",
     );
   } finally {
     fs.rmSync(pidFixtureRoot, { recursive: true, force: true });

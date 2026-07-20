@@ -5,7 +5,7 @@
     {
       "name": "install_doctor",
       "kind": "json_result",
-      "expectedArtifactDigest": "sha256:2776218ae542a31d4cb3d84b9c0c37f9a5275e21c12ed36349b553d82510c868"
+      "expectedArtifactDigest": "sha256:d36111b4ad112999b0c5153be3ae1da560a942969afc501c985c351f16fc0597"
     },
     {
       "name": "transactional_join",
@@ -25,12 +25,12 @@
     {
       "name": "idle_dashboard_resources",
       "kind": "json_receipt",
-      "expectedArtifactDigest": "sha256:a060a7b3e65fc2298a9bb1e3bc44ecad7c5340faa8251c77d2fa82081a4e778d"
+      "expectedArtifactDigest": "sha256:b0b5ef1056a7b5889524333ffb0d4fa211e9045375c167f84199558b753743ac"
     },
     {
       "name": "launch_agent_unload_terminal_truth",
       "kind": "json_result",
-      "expectedArtifactDigest": "sha256:ad4e481aec1c9006479800e7c6002a253874fb2b79d8a229910c690cc9832200"
+      "expectedArtifactDigest": "sha256:2b5e8eedca193c872b70800434eeb27894324ed89e4ff01f5ce2bfbc6ffb08ad"
     }
   ]
 }

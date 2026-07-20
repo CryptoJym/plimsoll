@@ -12,7 +12,9 @@ import {
   renderLaunchAgentPlist,
 } from "../packages/collector-cli/src/launch-agent";
 import {
+  readCollectorPidCleanupState,
   readProcessStartFingerprint,
+  removeCollectorPidFileIfOwnedDetailed,
   runtimeIdentityMatches,
   START_LOCK_LEASE_MS,
   type CollectorPidRecord,
@@ -595,6 +597,212 @@ async function main() {
       "Unload receipt exposed a filesystem path.",
     );
 
+    const durableHome = path.join(tempRoot, "durable-cleanup-reopen");
+    const durablePort = await availablePort();
+    writeConfig(durableHome, durablePort);
+    const durableOwner = startCollector(cliPath, durableHome);
+    children.push(durableOwner);
+    await waitFor(
+      () => Boolean(statusReceipt(durableOwner, "active")),
+      "Durable cleanup fixture owner did not become active.",
+    );
+    const durableActive = statusReceipt(durableOwner, "active");
+    const durableIdentity = durableActive?.runtimeIdentity as
+      | CollectorRuntimeIdentity
+      | undefined;
+    check(durableIdentity, "Durable cleanup fixture emitted no runtime identity.");
+    const durablePidPath = path.join(durableHome, "collector.pid");
+    const detailedAmbiguity = removeCollectorPidFileIfOwnedDetailed(
+      durablePidPath,
+      durableIdentity,
+      LAUNCH_AGENT_LABEL,
+      {
+        beforeClaim: () => {
+          const stat = fs.statSync(durablePidPath);
+          fs.utimesSync(
+            durablePidPath,
+            new Date(stat.atimeMs),
+            new Date(stat.mtimeMs + 10_000),
+          );
+        },
+      },
+    );
+    const durableBeforeSignal = readCollectorPidCleanupState(
+      durablePidPath,
+      LAUNCH_AGENT_LABEL,
+    );
+    check(
+      detailedAmbiguity.disposition === "preclaim_changed" &&
+        detailedAmbiguity.ambiguous &&
+        !detailedAmbiguity.removed &&
+        durableBeforeSignal.markerState === "present" &&
+        fs.existsSync(durablePidPath),
+      "Production detailed cleanup did not durably mark its preclaim ambiguity.",
+    );
+    durableOwner.child.kill("SIGTERM");
+    await waitFor(
+      () => Boolean(statusReceipt(durableOwner, "shutdown_incomplete")),
+      "SIGTERM finalizer did not consume the durable ambiguity.",
+      7_000,
+    );
+    const durableShutdown = statusReceipt(durableOwner, "shutdown_incomplete");
+    const durableOwnerExit = await waitForExit(durableOwner.child);
+    const durableAfterExit = readCollectorPidCleanupState(
+      durablePidPath,
+      LAUNCH_AGENT_LABEL,
+    );
+    check(
+      durableOwnerExit.code !== 0 &&
+        durableShutdown?.pidCleaned === false &&
+        durableShutdown?.pidRecordState === "current" &&
+        durableShutdown?.processState === "exiting" &&
+        (durableShutdown?.cleanupAttempt as Receipt | undefined)?.disposition ===
+          "persistent_ambiguity" &&
+        durableAfterExit.markerState === "present" &&
+        fs.existsSync(durablePidPath),
+      "SIGTERM promoted a durable cleanup ambiguity to stopped or PID-cleaned truth.",
+    );
+
+    const durableStop = stopCollector(cliPath, durableHome, root);
+    children.push(durableStop);
+    await waitFor(
+      () => durableStop.receipts.some(
+        (receipt) => receipt.reason === "pid_cleanup_ambiguous",
+      ),
+      "A separate stop process did not reopen the durable cleanup marker.",
+    );
+    const durableStopExit = await waitForExit(durableStop.child);
+    const durableStopReceipt = durableStop.receipts.find(
+      (receipt) => receipt.reason === "pid_cleanup_ambiguous",
+    );
+    check(
+      durableStopExit.code !== 0 &&
+        durableStopReceipt?.stopped === false &&
+        durableStopReceipt.pidCleaned === false &&
+        durableStopReceipt.pidRecordState === "current" &&
+        (durableStopReceipt.pidCleanup as Receipt | undefined)?.markerState === "present" &&
+        !JSON.stringify(durableStopReceipt).includes(tempRoot),
+      "Separate stop lost marker truth, emitted a false terminal receipt, or exposed a path.",
+    );
+
+    const durableUnload = launchAgentCommand(
+      cliPath,
+      durableHome,
+      root,
+      "unload-launch-agent",
+      fakeBin,
+      0,
+      undefined,
+      { initiallyLoaded: false },
+    );
+    children.push(durableUnload);
+    await waitFor(
+      () => durableUnload.receipts.some(
+        (receipt) => receipt.unloaded === false && receipt.reason === "indeterminate",
+      ),
+      "A later unload observer did not reopen the durable cleanup ambiguity.",
+      7_000,
+    );
+    const durableUnloadExit = await waitForExit(durableUnload.child);
+    const durableUnloadReceipt = durableUnload.receipts.find(
+      (receipt) => receipt.unloaded === false,
+    );
+    check(
+      durableUnloadExit.code !== 0 &&
+        durableUnloadReceipt?.pidCleaned === false &&
+        durableUnloadReceipt.bootoutAttempted === false &&
+        (durableUnloadReceipt.terminal as Receipt | undefined)?.pidCleanupMarkerState ===
+          "present" &&
+        (durableUnloadReceipt.timing as Receipt | undefined)?.finalObservationPerformed === true &&
+        !JSON.stringify(durableUnloadReceipt).includes(tempRoot),
+      "Post-exit unload lost durable marker truth, skipped final observation, or exposed a path.",
+    );
+
+    const collisionHome = path.join(tempRoot, "durable-cleanup-collision");
+    writeConfig(collisionHome, await availablePort());
+    const collisionPidPath = path.join(collisionHome, "collector.pid");
+    const collisionOwnerRecord = writePidRecord(collisionHome, durableIdentity, root);
+    const collisionPreserved = path.join(collisionHome, "preserved-owner.pid");
+    const replacementRecord: CollectorPidRecord = {
+      ...collisionOwnerRecord,
+      ...inertIdentity,
+      instanceId: randomUUID(),
+    };
+    const collisionCleanup = removeCollectorPidFileIfOwnedDetailed(
+      collisionPidPath,
+      durableIdentity,
+      LAUNCH_AGENT_LABEL,
+      {
+        afterPreClaimCheck: () => {
+          fs.renameSync(collisionPidPath, collisionPreserved);
+          fs.writeFileSync(
+            collisionPidPath,
+            JSON.stringify(replacementRecord, null, 2) + "\n",
+            { mode: 0o600 },
+          );
+        },
+        beforeMismatchRestore: () => {
+          fs.writeFileSync(collisionPidPath, "operator-collision\n", { mode: 0o600 });
+        },
+      },
+    );
+    const collisionPersistent = readCollectorPidCleanupState(
+      collisionPidPath,
+      LAUNCH_AGENT_LABEL,
+    );
+    check(
+      collisionCleanup.disposition === "mismatch_quarantined" &&
+        collisionCleanup.quarantined &&
+        collisionPersistent.markerState === "present" &&
+        collisionPersistent.quarantineCount === 1 &&
+        fs.readFileSync(collisionPidPath, "utf8") === "operator-collision\n",
+      "The marker-plus-collision fixture did not retain its exact quarantine inventory.",
+    );
+    const collisionStop = stopCollector(cliPath, collisionHome, root);
+    children.push(collisionStop);
+    await waitFor(
+      () => collisionStop.receipts.some(
+        (receipt) => receipt.reason === "pid_cleanup_ambiguous",
+      ),
+      "Stop did not fail closed on marker plus visible collision.",
+    );
+    const collisionStopExit = await waitForExit(collisionStop.child);
+    check(collisionStopExit.code !== 0, "Marker-plus-collision stop exited successfully.");
+    fs.unlinkSync(collisionPidPath);
+    const missingQuarantineUnload = launchAgentCommand(
+      cliPath,
+      collisionHome,
+      root,
+      "unload-launch-agent",
+      fakeBin,
+      0,
+      undefined,
+      { initiallyLoaded: false },
+    );
+    children.push(missingQuarantineUnload);
+    await waitFor(
+      () => missingQuarantineUnload.receipts.some(
+        (receipt) => receipt.unloaded === false && receipt.reason === "indeterminate",
+      ),
+      "Missing-visible-PID plus quarantine was promoted to already stopped.",
+      7_000,
+    );
+    const missingQuarantineExit = await waitForExit(missingQuarantineUnload.child);
+    const missingQuarantineReceipt = missingQuarantineUnload.receipts.find(
+      (receipt) => receipt.unloaded === false,
+    );
+    check(
+      missingQuarantineExit.code !== 0 &&
+        missingQuarantineReceipt?.pidCleaned === false &&
+        (missingQuarantineReceipt.terminal as Receipt | undefined)?.pidRecordState === "missing" &&
+        (missingQuarantineReceipt.terminal as Receipt | undefined)
+          ?.pidCleanupQuarantineCount === 1 &&
+        (missingQuarantineReceipt.terminal as Receipt | undefined)?.pidCleanupQuarantined ===
+          true &&
+        readCollectorPidCleanupState(collisionPidPath, LAUNCH_AGENT_LABEL).quarantineCount === 1,
+      "Quarantine ambiguity did not survive visible PID removal and a later process reopen.",
+    );
+
     const alreadyStoppedHome = path.join(tempRoot, "known-label-not-found");
     writeConfig(alreadyStoppedHome, await availablePort());
     const alreadyStopped = launchAgentCommand(
@@ -798,6 +1006,8 @@ async function main() {
             "only exact launchctl label-not-found output becomes not_reported",
             "unexpected launchctl exit codes and output remain query_failed",
             "unload receipts are path-free and legacy PID residue is retained",
+            "durable cleanup ambiguity survives SIGTERM, stop, and unload process reopen",
+            "marker-plus-collision and missing-PID quarantine remain nonterminal",
             "reused PID fingerprint and expired lock lease both recover",
             "crash-only restart is throttled",
             "rendered plist passes plutil on macOS",
