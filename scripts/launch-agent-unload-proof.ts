@@ -1,10 +1,15 @@
 #!/usr/bin/env node
 
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 import {
   captureLaunchAgentUnloadPriorState,
   observeLaunchAgentUnloadTerminalState,
+  readCollectorPidFile,
+  removeCollectorPidFileIfOwned,
   runtimeIdentityMatches,
   type CollectorListenerObservation,
   type CollectorPidFileRead,
@@ -29,6 +34,7 @@ type Scenario = {
   name: string;
   prior: Snapshot;
   snapshots: Snapshot[];
+  receiptBoundarySnapshot?: Snapshot;
   timeoutMs?: number;
   pollIntervalMs?: number;
   removeOwnedPid?: boolean;
@@ -42,9 +48,24 @@ function identity(seed: number): CollectorRuntimeIdentity {
   };
 }
 
+function fixtureFileIdentity(owner: CollectorRuntimeIdentity) {
+  return {
+    device: 1,
+    inode: owner.pid,
+    mode: 0o100600,
+    uid: 501,
+    gid: 20,
+    links: 1,
+    size: 20,
+    modifiedMs: 1,
+    changedMs: 1,
+  };
+}
+
 function current(owner: CollectorRuntimeIdentity): CollectorPidFileRead {
   return {
     kind: "current",
+    fileIdentity: fixtureFileIdentity(owner),
     raw: "fixture-owned-record",
     record: {
       ...owner,
@@ -67,12 +88,16 @@ const gone = (): LaunchAgentLabelObservation => ({ kind: "not_reported" });
 
 async function runScenario(scenario: Scenario) {
   let clock = 0;
+  let clockReads = 0;
   let snapshotIndex = 0;
   let activeSnapshot = scenario.snapshots[0]!;
+  let receiptBoundaryActive = false;
   let removals = 0;
   const snapshot = () => activeSnapshot;
   const observeLabel = () => {
-    activeSnapshot = scenario.snapshots[Math.min(snapshotIndex, scenario.snapshots.length - 1)]!;
+    activeSnapshot = receiptBoundaryActive && scenario.receiptBoundarySnapshot
+      ? scenario.receiptBoundarySnapshot
+      : scenario.snapshots[Math.min(snapshotIndex, scenario.snapshots.length - 1)]!;
     return activeSnapshot.label;
   };
   const observeListener = async () => {
@@ -115,7 +140,14 @@ async function runScenario(scenario: Scenario) {
     processIsLive: isLive,
     readPidFile,
     removePidFile,
-    now: () => clock,
+    now: () => {
+      clockReads += 1;
+      if (clockReads === 2 && scenario.receiptBoundarySnapshot) {
+        receiptBoundaryActive = true;
+        activeSnapshot = scenario.receiptBoundarySnapshot;
+      }
+      return clock;
+    },
     poll: async (milliseconds) => {
       clock += milliseconds;
     },
@@ -155,8 +187,8 @@ async function main() {
   });
   check(
     "immediate_exit_is_stopped",
-    immediate.outcome.stopped && immediate.outcome.timing.observations === 1,
-    "The first aggregate observation proves stopped without a synthetic delay.",
+    immediate.outcome.stopped && immediate.outcome.timing.observations === 2,
+    "A terminal candidate is confirmed by the mandatory receipt-boundary observation.",
   );
 
   const beforeDeadline = await runScenario({
@@ -194,6 +226,27 @@ async function main() {
     "A label, listener, process, and PID record still live after the final observation fail closed.",
   );
 
+  const reappearedAtReceiptBoundary = await runScenario({
+    name: "terminal-then-reappeared",
+    prior: stopping(owner),
+    snapshots: [terminal(owner)],
+    receiptBoundarySnapshot: stopping(foreign),
+  });
+  check(
+    "owner_reappearing_at_receipt_boundary_is_not_reported_stopped",
+    !reappearedAtReceiptBoundary.outcome.stopped &&
+      reappearedAtReceiptBoundary.outcome.state === "live_conflict" &&
+      runtimeIdentityMatches(
+        reappearedAtReceiptBoundary.outcome.final.currentPidRuntimeIdentity,
+        foreign,
+      ) &&
+      runtimeIdentityMatches(
+        reappearedAtReceiptBoundary.outcome.final.currentListenerRuntimeIdentity,
+        foreign,
+      ),
+    "The final aggregate observation runs after the receipt clock and records the newly live owner.",
+  );
+
   const listenerFirst = await runScenario({
     name: "listener-first",
     prior: stopping(owner),
@@ -204,7 +257,7 @@ async function main() {
   });
   check(
     "listener_close_before_pid_cleanup_converges",
-    listenerFirst.outcome.stopped && listenerFirst.outcome.timing.observations === 2,
+    listenerFirst.outcome.stopped && listenerFirst.outcome.timing.observations === 3,
     "Listener closure alone is still_stopping until process/PID cleanup also completes.",
   );
 
@@ -218,7 +271,7 @@ async function main() {
   });
   check(
     "pid_cleanup_before_process_reap_converges",
-    pidFirst.outcome.stopped && pidFirst.outcome.timing.observations === 2,
+    pidFirst.outcome.stopped && pidFirst.outcome.timing.observations === 3,
     "PID cleanup alone is not terminal while the captured runtime identity remains live.",
   );
 
@@ -294,8 +347,28 @@ async function main() {
 
   const staleUnproven = await runScenario({
     name: "legacy-record",
-    prior: { label: gone(), listener: absent(), pid: { kind: "legacy", pid: owner.pid, raw: String(owner.pid) }, live: [] },
-    snapshots: [{ label: gone(), listener: absent(), pid: { kind: "legacy", pid: owner.pid, raw: String(owner.pid) }, live: [] }],
+    prior: {
+      label: gone(),
+      listener: absent(),
+      pid: {
+        kind: "legacy",
+        fileIdentity: fixtureFileIdentity(owner),
+        pid: owner.pid,
+        raw: String(owner.pid),
+      },
+      live: [],
+    },
+    snapshots: [{
+      label: gone(),
+      listener: absent(),
+      pid: {
+        kind: "legacy",
+        fileIdentity: fixtureFileIdentity(owner),
+        pid: owner.pid,
+        raw: String(owner.pid),
+      },
+      live: [],
+    }],
     timeoutMs: 0,
     removeOwnedPid: true,
   });
@@ -339,6 +412,89 @@ async function main() {
     !indeterminate.outcome.stopped && indeterminate.outcome.state === "indeterminate",
     "A launchctl query failure cannot become an absent-label claim.",
   );
+
+  const unsafePid = await runScenario({
+    name: "unsafe-pid-file",
+    prior: {
+      label: gone(),
+      listener: absent(),
+      pid: { kind: "unsafe", reason: "leaf_symlink" },
+      live: [],
+    },
+    snapshots: [{
+      label: gone(),
+      listener: absent(),
+      pid: { kind: "unsafe", reason: "leaf_symlink" },
+      live: [],
+    }],
+    timeoutMs: 0,
+  });
+  check(
+    "unsafe_pid_file_is_indeterminate",
+    unsafePid.prior.ownership === "unproven" &&
+      !unsafePid.outcome.stopped &&
+      unsafePid.outcome.state === "indeterminate",
+    "Unsafe PID-file state is retained as an ownership blocker, never promoted to missing.",
+  );
+
+  const pidFixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-unload-pid-"));
+  try {
+    fs.chmodSync(pidFixtureRoot, 0o700);
+    const owned = current(owner);
+    const replacement = current(foreign);
+    assert.equal(owned.kind, "current");
+    assert.equal(replacement.kind, "current");
+    const ownedRaw = `${JSON.stringify(owned.record, null, 2)}\n`;
+    const foreignRaw = `${JSON.stringify(replacement.record, null, 2)}\n`;
+    const symlinkTarget = path.join(pidFixtureRoot, "symlink-target");
+    const symlinkPid = path.join(pidFixtureRoot, "symlink.pid");
+    fs.writeFileSync(symlinkTarget, ownedRaw, { mode: 0o600 });
+    fs.symlinkSync(symlinkTarget, symlinkPid);
+    const symlinkRead = readCollectorPidFile(symlinkPid, LABEL);
+    const symlinkRemoved = removeCollectorPidFileIfOwned(symlinkPid, owner, LABEL);
+    check(
+      "pid_symlink_is_rejected_without_target_mutation",
+      symlinkRead.kind === "unsafe" &&
+        symlinkRead.reason === "leaf_symlink" &&
+        !symlinkRemoved &&
+        fs.lstatSync(symlinkPid).isSymbolicLink() &&
+        fs.readFileSync(symlinkTarget, "utf8") === ownedRaw,
+      "No-follow inspection leaves both the symlink and its target byte-exact.",
+    );
+
+    const permissivePid = path.join(pidFixtureRoot, "permissive.pid");
+    fs.writeFileSync(permissivePid, ownedRaw, { mode: 0o644 });
+    fs.chmodSync(permissivePid, 0o644);
+    const permissiveRead = readCollectorPidFile(permissivePid, LABEL);
+    check(
+      "pid_file_with_unsafe_mode_is_retained",
+      permissiveRead.kind === "unsafe" &&
+        permissiveRead.reason === "mode" &&
+        !removeCollectorPidFileIfOwned(permissivePid, owner, LABEL) &&
+        fs.readFileSync(permissivePid, "utf8") === ownedRaw,
+      "A non-private ownership record cannot authorize cleanup.",
+    );
+
+    const swapPid = path.join(pidFixtureRoot, "swap.pid");
+    const preservedOwner = path.join(pidFixtureRoot, "preserved-owner.pid");
+    fs.writeFileSync(swapPid, ownedRaw, { mode: 0o600 });
+    const swapRemoved = removeCollectorPidFileIfOwned(swapPid, owner, LABEL, {
+      beforeClaim: () => {
+        fs.renameSync(swapPid, preservedOwner);
+        fs.writeFileSync(swapPid, foreignRaw, { mode: 0o600 });
+      },
+    });
+    check(
+      "pid_swap_before_claim_preserves_both_objects",
+      !swapRemoved &&
+        fs.readFileSync(preservedOwner, "utf8") === ownedRaw &&
+        fs.readFileSync(swapPid, "utf8") === foreignRaw &&
+        readCollectorPidFile(swapPid, LABEL).kind === "current",
+      "Identity-bound rename-claim cleanup restores the replacement and retains the original object.",
+    );
+  } finally {
+    fs.rmSync(pidFixtureRoot, { recursive: true, force: true });
+  }
 
   const pathFreeMaterial = JSON.stringify({
     prior: stalePid.prior,

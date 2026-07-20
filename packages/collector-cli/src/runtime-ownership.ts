@@ -88,10 +88,33 @@ export type CollectorPidRecord = CollectorRuntimeIdentity & {
 };
 
 export type CollectorPidFileRead =
-  | { kind: "current"; raw: string; record: CollectorPidRecord }
-  | { kind: "invalid"; raw: string }
-  | { kind: "legacy"; pid: number; raw: string }
+  | { kind: "current"; fileIdentity: PidFileIdentity; raw: string; record: CollectorPidRecord }
+  | { kind: "invalid"; fileIdentity: PidFileIdentity; raw: string }
+  | { kind: "legacy"; fileIdentity: PidFileIdentity; pid: number; raw: string }
+  | { kind: "unsafe"; reason: PidFileUnsafeReason }
   | { kind: "missing" };
+
+export type PidFileIdentity = Readonly<{
+  device: number;
+  inode: number;
+  mode: number;
+  uid: number;
+  gid: number;
+  links: number;
+  size: number;
+  modifiedMs: number;
+  changedMs: number;
+}>;
+
+export type PidFileUnsafeReason =
+  | "ancestor_symlink"
+  | "leaf_symlink"
+  | "nonregular"
+  | "link_count"
+  | "owner"
+  | "mode"
+  | "identity_changed"
+  | "unreadable";
 
 type StartLockRecord = CollectorRuntimeIdentity & {
   createdAt: string;
@@ -190,16 +213,191 @@ function parseCurrentPidRecord(raw: string, label: string): CollectorPidRecord |
   return null;
 }
 
+type PidPathIdentity = PidFileIdentity & Readonly<{ path: string }>;
+
+type InspectedPidFile =
+  | { kind: "safe"; fileIdentity: PidFileIdentity; raw: string }
+  | { kind: "unsafe"; reason: PidFileUnsafeReason }
+  | { kind: "missing" };
+
+function currentUid() {
+  return typeof process.getuid === "function" ? process.getuid() : undefined;
+}
+
+function pidFileIdentity(stat: fs.Stats): PidFileIdentity {
+  return {
+    device: stat.dev,
+    inode: stat.ino,
+    mode: stat.mode,
+    uid: stat.uid,
+    gid: stat.gid,
+    links: stat.nlink,
+    size: stat.size,
+    modifiedMs: stat.mtimeMs,
+    changedMs: stat.ctimeMs,
+  };
+}
+
+function samePidFileIdentity(left: PidFileIdentity, right: PidFileIdentity) {
+  return left.device === right.device &&
+    left.inode === right.inode &&
+    left.mode === right.mode &&
+    left.uid === right.uid &&
+    left.gid === right.gid &&
+    left.links === right.links &&
+    left.size === right.size &&
+    left.modifiedMs === right.modifiedMs &&
+    left.changedMs === right.changedMs;
+}
+
+function samePidFileObject(left: PidFileIdentity, right: PidFileIdentity) {
+  return left.device === right.device && left.inode === right.inode;
+}
+
+function lstatPidPath(file: string) {
+  try {
+    return fs.lstatSync(file);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function inspectPidAncestors(file: string):
+  | { kind: "safe"; identities: PidPathIdentity[] }
+  | { kind: "unsafe"; reason: PidFileUnsafeReason }
+  | { kind: "missing" } {
+  const absolutePath = path.resolve(file);
+  const parsed = path.parse(absolutePath);
+  const segments = absolutePath.slice(parsed.root.length).split(path.sep).filter(Boolean);
+  const identities: PidPathIdentity[] = [];
+  let cursor = parsed.root;
+  let missing = false;
+  try {
+    for (const segment of segments.slice(0, -1)) {
+      cursor = path.join(cursor, segment);
+      if (missing) continue;
+      const stat = lstatPidPath(cursor);
+      if (!stat) {
+        missing = true;
+        continue;
+      }
+      if (stat.isSymbolicLink()) {
+        // macOS exposes root-owned top-level compatibility aliases such as
+        // /var and /tmp. No user-owned or nested alias is trusted.
+        if (path.dirname(cursor) === parsed.root && stat.uid === 0) continue;
+        return { kind: "unsafe", reason: "ancestor_symlink" };
+      }
+      if (!stat.isDirectory()) return { kind: "unsafe", reason: "nonregular" };
+      const uid = currentUid();
+      if (uid !== undefined && stat.uid !== uid && stat.uid !== 0) {
+        return { kind: "unsafe", reason: "owner" };
+      }
+      const permissions = stat.mode & 0o7777;
+      const trustedStickyRoot = stat.uid === 0 && (permissions & 0o1000) !== 0;
+      if ((permissions & 0o022) !== 0 && !trustedStickyRoot) {
+        return { kind: "unsafe", reason: "mode" };
+      }
+      identities.push({ path: cursor, ...pidFileIdentity(stat) });
+    }
+  } catch {
+    return { kind: "unsafe", reason: "unreadable" };
+  }
+  return missing ? { kind: "missing" } : { kind: "safe", identities };
+}
+
+function samePidAncestors(left: readonly PidPathIdentity[], right: readonly PidPathIdentity[]) {
+  return left.length === right.length && left.every((entry, index) => {
+    const other = right[index];
+    return Boolean(other && entry.path === other.path && samePidFileIdentity(entry, other));
+  });
+}
+
+function validatePidLeaf(stat: fs.Stats): PidFileUnsafeReason | null {
+  if (stat.isSymbolicLink()) return "leaf_symlink";
+  if (!stat.isFile()) return "nonregular";
+  if (stat.nlink !== 1) return "link_count";
+  const uid = currentUid();
+  if (uid !== undefined && stat.uid !== uid) return "owner";
+  if ((stat.mode & 0o7777) !== 0o600) return "mode";
+  return null;
+}
+
+function readPidDescriptor(descriptor: number) {
+  const chunks: Buffer[] = [];
+  let position = 0;
+  while (true) {
+    const chunk = Buffer.allocUnsafe(64 * 1024);
+    const bytesRead = fs.readSync(descriptor, chunk, 0, chunk.length, position);
+    if (bytesRead === 0) break;
+    chunks.push(chunk.subarray(0, bytesRead));
+    position += bytesRead;
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+function inspectCollectorPidFile(pidPath: string): InspectedPidFile {
+  const absolutePath = path.resolve(pidPath);
+  const ancestors = inspectPidAncestors(absolutePath);
+  if (ancestors.kind !== "safe") return ancestors;
+  let initialStat: fs.Stats;
+  try {
+    const stat = lstatPidPath(absolutePath);
+    if (!stat) return { kind: "missing" };
+    const unsafeReason = validatePidLeaf(stat);
+    if (unsafeReason) return { kind: "unsafe", reason: unsafeReason };
+    initialStat = stat;
+  } catch {
+    return { kind: "unsafe", reason: "unreadable" };
+  }
+  const initialIdentity = pidFileIdentity(initialStat);
+  let descriptor: number | undefined;
+  try {
+    descriptor = fs.openSync(absolutePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const boundBefore = fs.fstatSync(descriptor);
+    if (validatePidLeaf(boundBefore)) return { kind: "unsafe", reason: "identity_changed" };
+    const boundBeforeIdentity = pidFileIdentity(boundBefore);
+    if (!samePidFileIdentity(initialIdentity, boundBeforeIdentity)) {
+      return { kind: "unsafe", reason: "identity_changed" };
+    }
+    const raw = readPidDescriptor(descriptor);
+    const boundAfterIdentity = pidFileIdentity(fs.fstatSync(descriptor));
+    if (!samePidFileIdentity(boundBeforeIdentity, boundAfterIdentity)) {
+      return { kind: "unsafe", reason: "identity_changed" };
+    }
+    const finalStat = lstatPidPath(absolutePath);
+    const finalAncestors = inspectPidAncestors(absolutePath);
+    if (
+      !finalStat ||
+      finalAncestors.kind !== "safe" ||
+      !samePidAncestors(ancestors.identities, finalAncestors.identities) ||
+      !samePidFileIdentity(boundAfterIdentity, pidFileIdentity(finalStat))
+    ) {
+      return { kind: "unsafe", reason: "identity_changed" };
+    }
+    return { kind: "safe", fileIdentity: boundAfterIdentity, raw };
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    return {
+      kind: "unsafe",
+      reason: code === "ELOOP" || code === "EMLINK" ? "leaf_symlink" : "unreadable",
+    };
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
+}
+
 export function readCollectorPidFile(pidPath: string, label: string): CollectorPidFileRead {
-  if (!fs.existsSync(pidPath)) return { kind: "missing" };
-  const raw = fs.readFileSync(pidPath, "utf8");
+  const inspected = inspectCollectorPidFile(pidPath);
+  if (inspected.kind !== "safe") return inspected;
+  const { fileIdentity, raw } = inspected;
   const trimmed = raw.trim();
   const legacyPid = Number(trimmed);
   if (Number.isInteger(legacyPid) && legacyPid > 0) {
-    return { kind: "legacy", pid: legacyPid, raw };
+    return { kind: "legacy", fileIdentity, pid: legacyPid, raw };
   }
   const current = parseCurrentPidRecord(trimmed, label);
-  if (current) return { kind: "current", raw, record: current };
+  if (current) return { kind: "current", fileIdentity, raw, record: current };
   try {
     const previous = JSON.parse(trimmed) as { label?: unknown; pid?: unknown; version?: unknown };
     if (
@@ -208,12 +406,12 @@ export function readCollectorPidFile(pidPath: string, label: string): CollectorP
       Number.isInteger(previous.pid) &&
       Number(previous.pid) > 0
     ) {
-      return { kind: "legacy", pid: Number(previous.pid), raw };
+      return { kind: "legacy", fileIdentity, pid: Number(previous.pid), raw };
     }
   } catch {
     // Not a legacy JSON record.
   }
-  return { kind: "invalid", raw };
+  return { kind: "invalid", fileIdentity, raw };
 }
 
 export function runtimeIdentityMatches(
@@ -252,12 +450,82 @@ export function removeCollectorPidFileIfOwned(
   pidPath: string,
   identity: CollectorRuntimeIdentity,
   label: string,
+  hooks: { beforeClaim?: () => void; afterClaim?: () => void } = {},
 ) {
   const current = readCollectorPidFile(pidPath, label);
   if (current.kind !== "current" || !runtimeIdentityMatches(current.record, identity)) {
     return false;
   }
-  return removeFileIfUnchanged(pidPath, current.raw);
+  const absolutePath = path.resolve(pidPath);
+  const claimPath = path.join(
+    path.dirname(absolutePath),
+    `.${path.basename(absolutePath)}.plimsoll-remove-${randomUUID()}`,
+  );
+  let claimIdentity: PidFileIdentity | null = null;
+  try {
+    hooks.beforeClaim?.();
+    fs.renameSync(absolutePath, claimPath);
+    const claimStat = lstatPidPath(claimPath);
+    if (!claimStat) return false;
+    claimIdentity = pidFileIdentity(claimStat);
+    if (!samePidFileObject(current.fileIdentity, claimIdentity)) {
+      restorePidClaim(claimPath, absolutePath, claimIdentity);
+      return false;
+    }
+    const claimed = inspectCollectorPidFile(claimPath);
+    if (
+      claimed.kind !== "safe" ||
+      !samePidFileObject(claimIdentity, claimed.fileIdentity) ||
+      claimed.raw !== current.raw
+    ) {
+      restorePidClaim(claimPath, absolutePath, claimIdentity);
+      return false;
+    }
+    claimIdentity = claimed.fileIdentity;
+    hooks.afterClaim?.();
+    const verified = inspectCollectorPidFile(claimPath);
+    if (
+      verified.kind !== "safe" ||
+      !samePidFileIdentity(claimIdentity, verified.fileIdentity) ||
+      verified.raw !== current.raw ||
+      lstatPidPath(absolutePath)
+    ) {
+      restorePidClaim(claimPath, absolutePath, claimIdentity);
+      return false;
+    }
+    const beforeUnlink = lstatPidPath(claimPath);
+    if (!beforeUnlink || !samePidFileIdentity(claimIdentity, pidFileIdentity(beforeUnlink))) {
+      return false;
+    }
+    fs.unlinkSync(claimPath);
+    return !lstatPidPath(claimPath) && !lstatPidPath(absolutePath);
+  } catch {
+    if (claimIdentity) restorePidClaim(claimPath, absolutePath, claimIdentity);
+    return false;
+  }
+}
+
+function restorePidClaim(
+  claimPath: string,
+  destination: string,
+  expectedClaim: PidFileIdentity,
+) {
+  try {
+    if (lstatPidPath(destination)) return false;
+    const claim = lstatPidPath(claimPath);
+    if (
+      !claim ||
+      claim.isSymbolicLink() ||
+      !claim.isFile() ||
+      !samePidFileObject(expectedClaim, pidFileIdentity(claim))
+    ) return false;
+    fs.linkSync(claimPath, destination);
+    fs.unlinkSync(claimPath);
+    const restored = lstatPidPath(destination);
+    return Boolean(restored && samePidFileObject(expectedClaim, pidFileIdentity(restored)));
+  } catch {
+    return false;
+  }
 }
 
 function sleep(milliseconds: number) {
@@ -381,7 +649,10 @@ export async function captureLaunchAgentUnloadPriorState(options: {
   const listenerIdentity = listener.kind === "collector" ? listener.runtimeIdentity : null;
   const ownership = listener.kind === "unrelated"
     ? "unrelated" as const
-    : pidRead.kind === "legacy" || pidRead.kind === "invalid" || listener.kind === "indeterminate"
+    : pidRead.kind === "legacy" ||
+        pidRead.kind === "invalid" ||
+        pidRead.kind === "unsafe" ||
+        listener.kind === "indeterminate"
       ? "unproven" as const
       : pidIdentity && listenerIdentity && !runtimeIdentityMatches(pidIdentity, listenerIdentity)
         ? "ambiguous" as const
@@ -444,7 +715,15 @@ async function observeLaunchAgentUnloadOnce(options: {
 
   const pidCleaned = pidRead.kind === "missing";
   let state: LaunchAgentUnloadState;
+  const currentPidMatchesListener = runtimeIdentityMatches(currentPidIdentity, listenerIdentity);
   if (
+    pidRead.kind === "current" &&
+    !currentPidMatchesPrior &&
+    listenerState.kind === "collector" &&
+    currentPidMatchesListener
+  ) {
+    state = "live_conflict";
+  } else if (
     options.prior.ownership === "ambiguous" ||
     (pidRead.kind === "current" && !currentPidMatchesPrior)
   ) {
@@ -458,6 +737,7 @@ async function observeLaunchAgentUnloadOnce(options: {
     state = "stale_owned_record";
   } else if (
     labelState.kind === "query_failed" ||
+    pidRead.kind === "unsafe" ||
     listenerState.kind === "indeterminate" ||
     options.prior.ownership === "unproven"
   ) {
@@ -552,28 +832,30 @@ export async function observeLaunchAgentUnloadTerminalState(options: {
     const observedAt = now();
     if (observedAt >= deadline) {
       deadlineCrossed = true;
-      // Receipt construction gets one last fresh observation. This closes the
-      // race where cleanup completes after the final scheduled poll but before
-      // the command returns a timeout receipt.
-      final = await observeLaunchAgentUnloadOnce({
-        label: options.label,
-        pidPath: options.pidPath,
-        prior: options.prior,
-        observeLabel: options.observeLabel,
-        observeListener,
-        processIsLive,
-        readPidFile,
-        removePidFile,
-        removedPidFile,
-      });
-      observations += 1;
-      removedPidFile = final.removedPidFile;
       break;
     }
     await poll(Math.min(pollIntervalMs, Math.max(0, deadline - observedAt)));
   }
 
-  const elapsedMs = Math.max(0, now() - startedAt);
+  // Freeze the receipt clock before the mandatory final aggregate read. No
+  // injected clock runs after this observation, so a clock hook cannot mutate
+  // ownership between the final truth read and serialization.
+  const receiptBoundaryAt = now();
+  deadlineCrossed = deadlineCrossed || receiptBoundaryAt >= deadline;
+  final = await observeLaunchAgentUnloadOnce({
+    label: options.label,
+    pidPath: options.pidPath,
+    prior: options.prior,
+    observeLabel: options.observeLabel,
+    observeListener,
+    processIsLive,
+    readPidFile,
+    removePidFile,
+    removedPidFile,
+  });
+  observations += 1;
+  removedPidFile = final.removedPidFile;
+  const elapsedMs = Math.max(0, receiptBoundaryAt - startedAt);
   return Object.freeze({
     stopped: final.stopped,
     state: final.state,
@@ -743,7 +1025,11 @@ export async function acquireCollectorStartOwnership(options: {
         knownUnhealthyRecord = pidRecordKey(rechecked.record);
       }
 
-      if (rechecked.kind !== "missing") {
+      if (
+        rechecked.kind === "current" ||
+        rechecked.kind === "legacy" ||
+        rechecked.kind === "invalid"
+      ) {
         removeFileIfUnchanged(options.pidPath, rechecked.raw);
       }
 

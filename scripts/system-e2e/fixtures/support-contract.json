@@ -30,7 +30,7 @@
     {
       "name": "launch_agent_unload_terminal_truth",
       "kind": "json_result",
-      "expectedArtifactDigest": "sha256:26f22448fd385aee5d75bcb382e6c5eed47807bb316e378b6c0cee01c8f91cf4"
+      "expectedArtifactDigest": "sha256:223256465f1a95814f7718a23f3e8b9566b339380b0a80ab9da5870b812b31fd"
     }
   ]
 }

@@ -1091,9 +1091,12 @@ async function main() {
     temp: machineBTmp,
     requiredAssertions: [
       "terminal_between_last_poll_and_receipt_is_stopped",
+      "owner_reappearing_at_receipt_boundary_is_not_reported_stopped",
       "wrapper_parent_and_collector_child_are_one_owned_layout",
       "unrelated_listener_is_retained_and_refused",
       "pid_reuse_does_not_keep_or_signal_the_foreign_process",
+      "pid_symlink_is_rejected_without_target_mutation",
+      "pid_swap_before_claim_preserves_both_objects",
       "unload_receipts_are_path_free",
     ],
     sourceHeadCommit,

@@ -254,9 +254,16 @@ function launchAgentCommand(
   fakeBin: string,
   launchctlExit = 0,
   bootoutPid?: number,
+  behavior: {
+    initiallyLoaded?: boolean;
+    printExit?: number;
+    printStderr?: string;
+  } = {},
 ) {
   const launchctlState = path.join(home, "launchctl.state");
-  fs.writeFileSync(launchctlState, String(bootoutPid ?? process.pid) + "\n", { mode: 0o600 });
+  if (behavior.initiallyLoaded !== false) {
+    fs.writeFileSync(launchctlState, String(bootoutPid ?? process.pid) + "\n", { mode: 0o600 });
+  }
   return watch(
     spawn(process.execPath, [cliPath, command], {
       cwd,
@@ -266,6 +273,10 @@ function launchAgentCommand(
         PLIMSOLL_HOME: home,
         PLIMSOLL_PROOF_LAUNCHCTL_EXIT: String(launchctlExit),
         PLIMSOLL_PROOF_LAUNCHCTL_STATE: launchctlState,
+        PLIMSOLL_PROOF_LAUNCHCTL_PRINT_EXIT: String(behavior.printExit ?? 0),
+        PLIMSOLL_PROOF_LAUNCHCTL_PRINT_STDERR: behavior.printStderr ?? "",
+        PLIMSOLL_PROOF_LAUNCHCTL_NOT_FOUND:
+          `Could not find service "${LAUNCH_AGENT_LABEL}" in domain for user gui: ${process.getuid?.() ?? "unknown"}`,
         ...(bootoutPid ? { PLIMSOLL_PROOF_BOOTOUT_PID: String(bootoutPid) } : {}),
       },
       stdio: ["ignore", "pipe", "pipe"],
@@ -515,7 +526,15 @@ async function main() {
         "#!/bin/sh",
         'state="${PLIMSOLL_PROOF_LAUNCHCTL_STATE:?}"',
         'if [ "$1" = "print" ]; then',
-        '  [ -f "$state" ] || exit 113',
+        '  code="${PLIMSOLL_PROOF_LAUNCHCTL_PRINT_EXIT:-0}"',
+        '  if [ "$code" != "0" ]; then',
+        '    printf "%s\\n" "$PLIMSOLL_PROOF_LAUNCHCTL_PRINT_STDERR" >&2',
+        '    exit "$code"',
+        '  fi',
+        '  if [ ! -f "$state" ]; then',
+        '    printf "%s\\n" "$PLIMSOLL_PROOF_LAUNCHCTL_NOT_FOUND" >&2',
+        '    exit 113',
+        '  fi',
         "  printf '    pid = %s\\n' \"$(cat \"$state\")\"",
         "  exit 0",
         "fi",
@@ -575,6 +594,75 @@ async function main() {
         !JSON.stringify(truthfulReceipt).includes(root),
       "Unload receipt exposed a filesystem path.",
     );
+
+    const alreadyStoppedHome = path.join(tempRoot, "known-label-not-found");
+    writeConfig(alreadyStoppedHome, await availablePort());
+    const alreadyStopped = launchAgentCommand(
+      cliPath,
+      alreadyStoppedHome,
+      root,
+      "unload-launch-agent",
+      fakeBin,
+      0,
+      undefined,
+      { initiallyLoaded: false },
+    );
+    children.push(alreadyStopped);
+    await waitFor(
+      () => alreadyStopped.receipts.some(
+        (receipt) =>
+          receipt.unloaded === true &&
+          receipt.status === "already_stopped" &&
+          receipt.bootoutAttempted === false &&
+          (receipt.prior as Receipt | undefined)?.labelState === "not_reported",
+      ),
+      "The exact launchctl label-not-found result was not recognized.",
+    );
+    const alreadyStoppedExit = await waitForExit(alreadyStopped.child);
+    check(alreadyStoppedExit.code === 0, "Known label-not-found should be idempotent success.");
+
+    const exactNotFound =
+      `Could not find service "${LAUNCH_AGENT_LABEL}" in domain for user gui: ${process.getuid?.() ?? "unknown"}`;
+    const unexpectedPrintCases = [
+      { name: "permission-denied-77", code: 77, stderr: "permission denied" },
+      { name: "wrong-output-113", code: 113, stderr: "permission denied" },
+      { name: "wrong-code-known-output", code: 1, stderr: exactNotFound },
+    ];
+    for (const fixture of unexpectedPrintCases) {
+      const fixtureHome = path.join(tempRoot, `launchctl-print-${fixture.name}`);
+      writeConfig(fixtureHome, await availablePort());
+      const command = launchAgentCommand(
+        cliPath,
+        fixtureHome,
+        root,
+        "unload-launch-agent",
+        fakeBin,
+        0,
+        undefined,
+        {
+          initiallyLoaded: false,
+          printExit: fixture.code,
+          printStderr: fixture.stderr,
+        },
+      );
+      children.push(command);
+      await waitFor(
+        () => command.receipts.some((receipt) => receipt.unloaded === false),
+        `Unexpected launchctl print fixture ${fixture.name} produced no refusal receipt.`,
+      );
+      const exit = await waitForExit(command.child);
+      const receipt = command.receipts.find((candidate) => candidate.unloaded === false);
+      check(
+        exit.code !== 0 &&
+          receipt?.status === "refused" &&
+          receipt.reason === "indeterminate" &&
+          receipt.bootoutAttempted === false &&
+          (receipt.prior as Receipt | undefined)?.labelState === "query_failed" &&
+          (receipt.terminal as Receipt | undefined)?.labelState === "query_failed",
+        `Unexpected launchctl print fixture ${fixture.name} was promoted to absence.`,
+      );
+    }
+
     const legacyUnloadHome = path.join(tempRoot, "legacy-unload");
     writeConfig(legacyUnloadHome, await availablePort());
     const legacyPidPath = path.join(legacyUnloadHome, "collector.pid");
@@ -707,6 +795,8 @@ async function main() {
             "foreign exact-shape status cannot spoof collector ownership",
             "inert CLI-shaped and legacy processes cannot pass stop authorization",
             "unload records launchctl failure and requires aggregate terminal-state proof",
+            "only exact launchctl label-not-found output becomes not_reported",
+            "unexpected launchctl exit codes and output remain query_failed",
             "unload receipts are path-free and legacy PID residue is retained",
             "reused PID fingerprint and expired lock lease both recover",
             "crash-only restart is throttled",

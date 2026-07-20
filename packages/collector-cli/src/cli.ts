@@ -248,7 +248,20 @@ function launchctlJobState(): LaunchAgentLabelObservation & {
   const errorCode = (result.error as NodeJS.ErrnoException | undefined)?.code ?? null;
   const details = { exitCode: result.status, errorCode };
   if (result.error) return { kind: "query_failed", ...details };
-  if (result.status !== 0) return { kind: "not_reported", ...details };
+  if (result.status !== 0) {
+    const uid = typeof process.getuid === "function" ? process.getuid() : null;
+    const notFoundLine = uid === null
+      ? null
+      : `Could not find service "${LAUNCH_AGENT_LABEL}" in domain for user gui: ${uid}`;
+    const normalizedStderr = result.stderr.replace(/\r\n/g, "\n").trim();
+    const knownNotFound =
+      result.status === 113 &&
+      result.stdout.trim() === "" &&
+      notFoundLine !== null &&
+      (normalizedStderr === notFoundLine ||
+        normalizedStderr === `Bad request.\n${notFoundLine}`);
+    return { kind: knownNotFound ? "not_reported" : "query_failed", ...details };
+  }
   const pidMatch = result.stdout.match(/^\s*pid\s*=\s*(\d+)\s*$/m);
   const pid = pidMatch ? Number(pidMatch[1]) : null;
   const processStartFingerprint = pid ? readProcessStartFingerprint(pid) : null;
