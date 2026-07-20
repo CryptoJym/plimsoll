@@ -19,6 +19,7 @@
     "proof:learning-facts": "tsx scripts/learning-facts-proof.ts",
     "proof:lifecycle": "tsx scripts/lifecycle-proof.ts",
     "proof:maintenance": "tsx scripts/maintenance-proof.ts",
+    "proof:git-context": "tsx scripts/git-context-proof.ts",
     "proof:codex-reconciliation": "tsx scripts/codex-reconciliation-proof.ts",
     "proof:resource-concurrency": "tsx scripts/resource-proof/concurrency-proof.ts",
     "proof:resource": "tsx scripts/resource-proof/index.ts",

@@ -117,6 +117,7 @@ async function main() {
     "pnpm proof:launch-agent",
     "pnpm proof:codex-config-apply",
     "pnpm proof:claude-config-apply",
+    "pnpm proof:git-context",
     "pnpm proof:http-boundary",
     "pnpm proof:dashboard",
     "pnpm proof:dashboard-security",

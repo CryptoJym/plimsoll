@@ -53,6 +53,9 @@ jobs:
       - name: Prove atomic local lifecycle transactions
         run: pnpm proof:lifecycle
 
+      - name: Prove bounded nonblocking Git metadata maintenance
+        run: pnpm proof:git-context
+
       - name: Prove local HTTP trust boundary
         run: pnpm proof:http-boundary
 
