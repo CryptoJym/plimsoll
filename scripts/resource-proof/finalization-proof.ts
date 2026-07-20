@@ -680,6 +680,7 @@ async function main() {
           TZ: "UTC",
           LANG: "C",
           LC_ALL: "C",
+          PATH: "/usr/bin:/bin:/usr/sbin:/sbin",
           PLIMSOLL_RESOURCE_PROOF_TEST_FINAL_PRIVACY_FAILURE: "1",
         },
         encoding: "utf8",
