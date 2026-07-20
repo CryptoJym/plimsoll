@@ -44,6 +44,14 @@ type RequestResult = { status: number; elapsedMs: number; body: Record<string, u
 
 const checks: Check[] = [];
 const PRIVATE_PATH_SENTINEL = "maintenance-boundary-private-path-sentinel";
+const FIFO_AVAILABILITY_BUDGETS = {
+  waveConcurrency: 100,
+  statusP95Ms: 100,
+  statusMaxMs: 500,
+  hookP95Ms: 750,
+  hookMaxMs: 1_200,
+  deadlineToReapMs: 2_500,
+} as const;
 
 function pass(name: string, detail: Record<string, unknown>) {
   checks.push({ name, passed: true, detail });
@@ -300,7 +308,7 @@ async function fifoAvailabilityProof() {
   const server = createCollectorServer(config, buffer, {
     maintenanceStatus: () => boundary.status(),
   });
-  const waveConcurrency = 100;
+  const waveConcurrency = FIFO_AVAILABILITY_BUDGETS.waveConcurrency;
   const agent = new http.Agent({ keepAlive: true, maxSockets: waveConcurrency });
   let runPromise: Promise<MaintenanceRunOutcome> | null = null;
   try {
@@ -341,10 +349,22 @@ async function fifoAvailabilityProof() {
     const statusMax = Math.max(...statuses.map((row) => row.elapsedMs));
     const hookP95 = percentile(hooks.map((row) => row.elapsedMs), 0.95);
     const hookMax = Math.max(...hooks.map((row) => row.elapsedMs));
-    assert.ok(statusP95 <= 100, `status p95 ${statusP95.toFixed(1)}ms exceeded 100ms`);
-    assert.ok(statusMax <= 500, `status max ${statusMax.toFixed(1)}ms exceeded 500ms`);
-    assert.ok(hookP95 <= 500, `hook p95 ${hookP95.toFixed(1)}ms exceeded 500ms`);
-    assert.ok(hookMax <= 1_200, `hook max ${hookMax.toFixed(1)}ms exceeded 1200ms`);
+    assert.ok(
+      statusP95 <= FIFO_AVAILABILITY_BUDGETS.statusP95Ms,
+      `status p95 ${statusP95.toFixed(1)}ms exceeded ${FIFO_AVAILABILITY_BUDGETS.statusP95Ms}ms`,
+    );
+    assert.ok(
+      statusMax <= FIFO_AVAILABILITY_BUDGETS.statusMaxMs,
+      `status max ${statusMax.toFixed(1)}ms exceeded ${FIFO_AVAILABILITY_BUDGETS.statusMaxMs}ms`,
+    );
+    assert.ok(
+      hookP95 <= FIFO_AVAILABILITY_BUDGETS.hookP95Ms,
+      `hook p95 ${hookP95.toFixed(1)}ms exceeded ${FIFO_AVAILABILITY_BUDGETS.hookP95Ms}ms`,
+    );
+    assert.ok(
+      hookMax <= FIFO_AVAILABILITY_BUDGETS.hookMaxMs,
+      `hook max ${hookMax.toFixed(1)}ms exceeded ${FIFO_AVAILABILITY_BUDGETS.hookMaxMs}ms`,
+    );
 
     await rejectsWith(runPromise, "maintenance_deadline_exceeded");
     const elapsedMs = performance.now() - runStartedAt;
@@ -362,7 +382,11 @@ async function fifoAvailabilityProof() {
     assert.equal(status.reap.reapedChildren, 1, "stalled child must emit close and be reaped");
     assert.equal(status.reap.orphanRisk, false, "reaped child must leave no orphan risk");
     assert.equal(status.childPresent, false, "reaped child must not remain attached");
-    assert.ok(elapsedMs <= 2_500, `deadline and reap took ${elapsedMs.toFixed(1)}ms`);
+    assert.ok(
+      elapsedMs <= FIFO_AVAILABILITY_BUDGETS.deadlineToReapMs,
+      `deadline and reap took ${elapsedMs.toFixed(1)}ms, exceeded ` +
+        `${FIFO_AVAILABILITY_BUDGETS.deadlineToReapMs}ms`,
+    );
 
     const serialized = JSON.stringify({ statuses: statuses.map((row) => row.body), status });
     assert.equal(serialized.includes(PRIVATE_PATH_SENTINEL), false, "receipts must remain path-free");
@@ -375,6 +399,7 @@ async function fifoAvailabilityProof() {
         { route: "/hooks/codex", concurrency: waveConcurrency },
       ],
       agentMaxSockets: waveConcurrency,
+      budgets: FIFO_AVAILABILITY_BUDGETS,
       statusP95Ms: Number(statusP95.toFixed(3)),
       statusMaxMs: Number(statusMax.toFixed(3)),
       hookP95Ms: Number(hookP95.toFixed(3)),
