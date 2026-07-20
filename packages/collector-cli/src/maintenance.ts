@@ -348,7 +348,11 @@ export function runRepoEnrichmentMaintenance(
         .prepare(
           `select id, session_id as sessionId
            from buffered_events indexed by idx_events_repo_enrichment_seed
-           where id > @cursor and session_id is not null and (
+           where id > @cursor and session_id is not null
+             and not exists (
+               select 1 from repo_context_event_links l
+               where l.event_id = buffered_events.id
+             ) and (
              repo_hash is not null or input_tokens is not null or
              output_tokens is not null or cost_usd is not null
            )
@@ -394,25 +398,39 @@ export function runRepoEnrichmentMaintenance(
       `select e.rowid, e.id,
          (select r.repo_hash from buffered_events r
           where r.session_id = e.session_id and r.repo_hash is not null
+            and not exists (
+              select 1 from repo_context_event_links l where l.event_id = r.id
+            )
             and r.observed_at <= e.observed_at
           order by r.observed_at desc, r.rowid desc limit 1) as backwardRepoHash,
          (select r.branch_hash from buffered_events r
           where r.session_id = e.session_id and r.repo_hash is not null
+            and not exists (
+              select 1 from repo_context_event_links l where l.event_id = r.id
+            )
             and r.observed_at <= e.observed_at
           order by r.observed_at desc, r.rowid desc limit 1) as backwardBranchHash,
          (select r.repo_hash from buffered_events r
           where r.session_id = e.session_id and r.repo_hash is not null
+            and not exists (
+              select 1 from repo_context_event_links l where l.event_id = r.id
+            )
             and r.observed_at > e.observed_at
             and (strftime('%s', r.observed_at) - strftime('%s', e.observed_at)) <= 600
           order by r.observed_at, r.rowid limit 1) as forwardRepoHash,
          (select r.branch_hash from buffered_events r
           where r.session_id = e.session_id and r.repo_hash is not null
+            and not exists (
+              select 1 from repo_context_event_links l where l.event_id = r.id
+            )
             and r.observed_at > e.observed_at
             and (strftime('%s', r.observed_at) - strftime('%s', e.observed_at)) <= 600
           order by r.observed_at, r.rowid limit 1) as forwardBranchHash
        from buffered_events e
        where e.session_id = @sessionId and e.rowid > @cursorRowid
-         and e.repo_hash is null
+         and e.repo_hash is null and not exists (
+           select 1 from repo_context_event_links l where l.event_id = e.id
+         )
          and (e.input_tokens is not null or e.output_tokens is not null or e.cost_usd is not null)
        order by e.rowid
        limit @limit`,
@@ -422,7 +440,9 @@ export function runRepoEnrichmentMaintenance(
          repo_hash = @repoHash,
          branch_hash = @branchHash,
          payload_json = json_set(payload_json, '$.metadata.repoStitched', json('true'))
-       where id = @id and repo_hash is null`,
+       where id = @id and repo_hash is null and not exists (
+         select 1 from repo_context_event_links l where l.event_id = @id
+       )`,
     );
     const removeSession = database.prepare(
       `delete from repo_enrichment_dirty where session_id = ?`,
@@ -710,6 +730,9 @@ export class CollectorMaintenance {
     }
     if (!rollout || !transcript) throw new Error("automatic_maintenance_result_missing");
     const postCaptureDeferred: string[] = [];
+    if (!this.signal?.aborted && budget.canStart(5)) {
+      this.buffer.drainRepoContextSuppressions();
+    } else postCaptureDeferred.push("repo_context_suppression");
     let reconciliation: CodexReconciliationResult = {
       backfillComplete: false, legacyRowsVisited: 0, contextRowsVisited: 0,
       candidateRowsVisited: 0, rowsVisited: 0, rowsChanged: 0, stitched: 0,

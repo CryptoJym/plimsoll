@@ -12,6 +12,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
+import { Worker } from "node:worker_threads";
 import zlib from "node:zlib";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
@@ -174,6 +175,67 @@ function slowRequest(port: number) {
   });
 }
 
+async function prepareStatusProbeDuringAppend(port: number, signal: SharedArrayBuffer) {
+  const worker = new Worker(
+    `
+      const http = require("node:http");
+      const { parentPort, workerData } = require("node:worker_threads");
+      const state = new Int32Array(workerData.signal);
+      const wait = Atomics.wait(state, 0, 0, 5_000);
+      if (wait === "timed-out") {
+        parentPort.postMessage({ error: "AppendSignalTimeout" });
+      } else {
+        const startedAtMs = Date.now();
+        const started = performance.now();
+        const request = http.request({
+          host: "127.0.0.1",
+          port: workerData.port,
+          path: "/status",
+          method: "GET",
+          headers: { connection: "close" },
+        }, (response) => {
+          response.resume();
+          response.on("end", () => parentPort.postMessage({
+            status: response.statusCode || 0,
+            elapsedMs: performance.now() - started,
+            startedAtMs,
+          }));
+        });
+        request.setTimeout(5_000, () => request.destroy(new Error("StatusProbeTimeout")));
+        request.on("error", () => parentPort.postMessage({ error: "StatusProbeFailed" }));
+        request.end();
+      }
+    `,
+    { eval: true, workerData: { port, signal } },
+  );
+  await new Promise<void>((resolve, reject) => {
+    worker.once("online", resolve);
+    worker.once("error", reject);
+  });
+  const result = new Promise<{ status: number; elapsedMs: number; startedAtMs: number }>(
+    (resolve, reject) => {
+      worker.once("message", (message: {
+        error?: string;
+        status?: number;
+        elapsedMs?: number;
+        startedAtMs?: number;
+      }) => {
+        if (message.error) {
+          reject(new Error(message.error));
+          return;
+        }
+        resolve({
+          status: message.status ?? 0,
+          elapsedMs: message.elapsedMs ?? Number.POSITIVE_INFINITY,
+          startedAtMs: message.startedAtMs ?? Number.POSITIVE_INFINITY,
+        });
+      });
+      worker.once("error", reject);
+    },
+  ).finally(() => worker.terminate());
+  return { result };
+}
+
 function totalChanges(buffer: LocalEventBuffer) {
   return Number(
     (buffer.database.prepare("select total_changes() as n").get() as { n: number }).n,
@@ -189,6 +251,111 @@ function stableRejection(result: HttpResult, reason: string, status: number) {
     result.bodyBytes <= 128 &&
     SENTINELS.every((sentinel) => !JSON.stringify(result.body).includes(sentinel))
   );
+}
+
+function maxRecordBody(cwdSentinel: string) {
+  return JSON.stringify({
+    resourceLogs: [{
+      scopeLogs: [{
+        logRecords: Array.from({ length: LOCAL_HTTP_LIMITS.otlpRecords }, (_, index) => ({
+          timeUnixNano: String(1_760_000_000_000_000_000n + BigInt(index)),
+          attributes: [
+            { key: "cwd", value: { stringValue: `${cwdSentinel}/${index}` } },
+            { key: "gen_ai.usage.input_tokens", value: { intValue: "1" } },
+            { key: "gen_ai.usage.output_tokens", value: { intValue: "2" } },
+          ],
+        })),
+      }],
+    }],
+  });
+}
+
+async function isolatedMaxRecordRun(index: number) {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), `plimsoll-http-max128-${index}-`));
+  const previousHome = process.env.PLIMSOLL_HOME;
+  process.env.PLIMSOLL_HOME = home;
+  const buffer = new LocalEventBuffer(path.join(home, "ledger.sqlite"));
+  const server = createCollectorServer(collectorConfigSchema.parse({}), buffer);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const port = (server.address() as AddressInfo).port;
+    const cwdSentinel = `/HTTP_MAX128_PRIVATE_CWD_${index}`;
+    const body = maxRecordBody(cwdSentinel);
+    const signal = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+    const signalView = new Int32Array(signal);
+    buffer.database.function("proof_isolated_max_append_notify", () => {
+      Atomics.store(signalView, 0, 1);
+      Atomics.notify(signalView, 0);
+      return 1;
+    });
+    buffer.database.exec(`
+      create temp table proof_isolated_max_append_gate (
+        singleton integer primary key check (singleton = 1)
+      );
+      create temp trigger proof_isolated_max_append_started
+      after insert on main.buffered_events
+      when not exists (select 1 from proof_isolated_max_append_gate)
+      begin
+        insert into proof_isolated_max_append_gate values (1);
+        select proof_isolated_max_append_notify();
+      end;
+    `);
+    const { result: statusPromise } = await prepareStatusProbeDuringAppend(port, signal);
+    const acceptedPromise = request(port, "/v1/logs", body, {
+      "x-plimsoll-source": "codex",
+    });
+    const [accepted, status] = await Promise.all([acceptedPromise, statusPromise]);
+    const facts = buffer.database.prepare(
+      `select count(*) as events,
+         coalesce(sum(input_tokens), 0) as inputTokens,
+         coalesce(sum(output_tokens), 0) as outputTokens,
+         coalesce(sum(instr(payload_json, ?)), 0) as rawCwdMatches
+       from buffered_events`,
+    ).get(cwdSentinel) as {
+      events: number;
+      inputTokens: number;
+      outputTokens: number;
+      rawCwdMatches: number;
+    };
+    const contexts = Number((buffer.database.prepare(
+      `select count(*) as count from repo_context_event_links`,
+    ).get() as { count: number }).count);
+    const pending = Number((buffer.database.prepare(
+      `select count(*) as count from repo_context_event_links where fill_pending = 1`,
+    ).get() as { count: number }).count);
+    const handoffs = Number((buffer.database.prepare(
+      `select count(*) as count from repo_context_handoffs`,
+    ).get() as { count: number }).count);
+    const overflow = buffer.repoContextUnknownCounters()
+      .find((row) => row.reason === "queue_overflow")?.droppedCount ?? 0;
+    return {
+      index,
+      acceptedStatus: accepted.status,
+      accepted: accepted.body.accepted,
+      acceptedEvents: accepted.body.events,
+      acceptedRecordCount: accepted.body.recordCount,
+      acceptedMs: Number(accepted.elapsedMs.toFixed(2)),
+      statusCode: status.status,
+      statusMs: Number(status.elapsedMs.toFixed(2)),
+      facts,
+      contexts,
+      pending,
+      handoffs,
+      overflow,
+      signal: Atomics.load(signalView, 0),
+    };
+  } finally {
+    if (server.listening) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    buffer.close();
+    fs.rmSync(home, { recursive: true, force: true });
+    if (previousHome === undefined) delete process.env.PLIMSOLL_HOME;
+    else process.env.PLIMSOLL_HOME = previousHome;
+  }
 }
 
 async function main() {
@@ -409,6 +576,7 @@ async function main() {
       { bodyBytes: Buffer.byteLength(highNodeBody), elapsedMs: highNodes.elapsedMs },
     );
 
+    const changesBeforeHighRecords = totalChanges(buffer);
     const highRecordEnvelope = {
       resourceLogs: [
         {
@@ -421,11 +589,20 @@ async function main() {
     const highRecords = await request(port, "/v1/logs", JSON.stringify(highRecordEnvelope), {
       "x-plimsoll-source": "codex",
     });
+    const changesAfterHighRecords = totalChanges(buffer);
     check(
       "otlp_record_cardinality_rejected_before_write",
       stableRejection(highRecords, "otlp_record_limit_exceeded", 413) &&
-        highRecords.elapsedMs < 500,
-      highRecords,
+        highRecords.elapsedMs < 50 &&
+        changesAfterHighRecords === changesBeforeHighRecords &&
+        buffer.repoContextQueueStatus().queued === 0,
+      {
+        status: highRecords.status,
+        reason: highRecords.body.reason,
+        elapsedMs: highRecords.elapsedMs,
+        changesBefore: changesBeforeHighRecords,
+        changesAfter: changesAfterHighRecords,
+      },
     );
 
     const highAttributeEnvelope = {
@@ -494,6 +671,129 @@ async function main() {
       },
     );
 
+    const maxCwdSentinel = "/HTTP_MAX_PRIVATE_CWD";
+    const maxBody = maxRecordBody(maxCwdSentinel);
+    const appendSignal = new SharedArrayBuffer(Int32Array.BYTES_PER_ELEMENT);
+    const appendSignalView = new Int32Array(appendSignal);
+    buffer.database.function("proof_max_append_notify", () => {
+      Atomics.store(appendSignalView, 0, 1);
+      Atomics.notify(appendSignalView, 0);
+      return 1;
+    });
+    buffer.database.exec(`
+      create temp table proof_max_append_gate (
+        singleton integer primary key check (singleton = 1)
+      );
+      create temp trigger proof_max_append_started
+      after insert on main.buffered_events
+      when not exists (select 1 from proof_max_append_gate)
+      begin
+        insert into proof_max_append_gate values (1);
+        select proof_max_append_notify();
+      end;
+    `);
+    const { result: statusProbe } = await prepareStatusProbeDuringAppend(port, appendSignal);
+    let maxSettledAtMs = Number.POSITIVE_INFINITY;
+    const maxAcceptedPromise = request(port, "/v1/logs", maxBody, {
+      "x-plimsoll-source": "codex",
+    }).finally(() => {
+      maxSettledAtMs = Date.now();
+    });
+    const [maxAccepted, statusDuringMax] = await Promise.all([
+      maxAcceptedPromise,
+      statusProbe,
+    ]);
+    buffer.database.exec(`
+      drop trigger proof_max_append_started;
+      drop table proof_max_append_gate;
+    `);
+    const maxFacts = buffer.database
+      .prepare(
+        `select count(*) as count,
+           (select count(*) from repo_context_event_links) as contexts,
+           coalesce(sum(input_tokens), 0) as inputTokens,
+           coalesce(sum(output_tokens), 0) as outputTokens,
+           coalesce(sum(instr(payload_json, ?)), 0) as rawCwdMatches
+         from buffered_events`,
+      )
+      .get(maxCwdSentinel) as {
+        count: number;
+        contexts: number;
+        inputTokens: number;
+        outputTokens: number;
+        rawCwdMatches: number;
+      };
+    const maxHandoffs = Number((buffer.database
+      .prepare(`select count(*) as count from repo_context_handoffs`)
+      .get() as { count: number }).count);
+    const maxPendingContexts = Number((buffer.database
+      .prepare(
+        `select count(*) as count from repo_context_event_links where fill_pending = 1`,
+      )
+      .get() as { count: number }).count);
+    const maxOverflow = buffer.repoContextUnknownCounters()
+      .find((row) => row.reason === "queue_overflow")?.droppedCount;
+    check(
+      "maximum_128_record_http_path_is_exact_durable_and_concurrently_available",
+      Buffer.byteLength(maxBody) <= LOCAL_HTTP_LIMITS.compressedBodyBytes &&
+        maxAccepted.status === 202 && maxAccepted.body.accepted === true &&
+        maxAccepted.body.events === LOCAL_HTTP_LIMITS.otlpRecords &&
+        maxAccepted.body.recordCount === LOCAL_HTTP_LIMITS.otlpRecords &&
+        maxAccepted.elapsedMs <= 500 &&
+        maxFacts.count === LOCAL_HTTP_LIMITS.otlpRecords &&
+        maxFacts.contexts === LOCAL_HTTP_LIMITS.otlpRecords &&
+        maxFacts.inputTokens === LOCAL_HTTP_LIMITS.otlpRecords &&
+        maxFacts.outputTokens === LOCAL_HTTP_LIMITS.otlpRecords * 2 &&
+        maxFacts.rawCwdMatches === 0 &&
+        buffer.repoContextQueueStatus().queued === 128 &&
+        maxHandoffs === 128 &&
+        maxPendingContexts === 128 &&
+        (maxOverflow ?? 0) === 0 &&
+        Atomics.load(appendSignalView, 0) === 1 &&
+        statusDuringMax.startedAtMs <= maxSettledAtMs &&
+        statusDuringMax.status === 200 && statusDuringMax.elapsedMs <= 250,
+      {
+        acceptedStatus: maxAccepted.status,
+        acceptedElapsedMs: Math.round(maxAccepted.elapsedMs * 100) / 100,
+        bodyBytes: Buffer.byteLength(maxBody),
+        events: maxFacts.count,
+        inputTokens: maxFacts.inputTokens,
+        outputTokens: maxFacts.outputTokens,
+        queued: buffer.repoContextQueueStatus().queued,
+        handoffs: maxHandoffs,
+        pendingContexts: maxPendingContexts,
+        overflow: maxOverflow,
+        concurrentStatusIssuedBeforeMaxSettled:
+          statusDuringMax.startedAtMs <= maxSettledAtMs,
+        statusCode: statusDuringMax.status,
+        statusElapsedMs: Math.round(statusDuringMax.elapsedMs * 100) / 100,
+      },
+    );
+
+    const isolatedMaxRuns: Awaited<ReturnType<typeof isolatedMaxRecordRun>>[] = [];
+    for (let index = 0; index < 10; index += 1) {
+      isolatedMaxRuns.push(await isolatedMaxRecordRun(index));
+    }
+    check(
+      "ten_isolated_max128_runs_preserve_status_and_exact_capture_budgets",
+      isolatedMaxRuns.length === 10 && isolatedMaxRuns.every((run) =>
+        run.acceptedStatus === 202 && run.accepted === true &&
+        run.acceptedEvents === LOCAL_HTTP_LIMITS.otlpRecords &&
+        run.acceptedRecordCount === LOCAL_HTTP_LIMITS.otlpRecords &&
+        run.acceptedMs <= 500 &&
+        run.statusCode === 200 && run.statusMs <= 250 &&
+        run.facts.events === LOCAL_HTTP_LIMITS.otlpRecords &&
+        run.facts.inputTokens === LOCAL_HTTP_LIMITS.otlpRecords &&
+        run.facts.outputTokens === LOCAL_HTTP_LIMITS.otlpRecords * 2 &&
+        run.facts.rawCwdMatches === 0 &&
+        run.contexts === LOCAL_HTTP_LIMITS.otlpRecords &&
+        run.pending === LOCAL_HTTP_LIMITS.otlpRecords &&
+        run.handoffs === LOCAL_HTTP_LIMITS.otlpRecords &&
+        run.overflow === 0 && run.signal === 1
+      ),
+      isolatedMaxRuns,
+    );
+
     const accepted = await request(
       port,
       "/hooks/codex",
@@ -532,6 +832,11 @@ async function main() {
 }
 
 main().catch((error) => {
-  console.error(error instanceof Error ? error.name : "ProofFailure");
+  const name = error instanceof Error ? error.name : "ProofFailure";
+  const message = error instanceof Error ? error.message : "";
+  const safeReason = /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(message)
+    ? message
+    : "http_boundary_proof_failed";
+  console.error(JSON.stringify({ error: name, reason: safeReason }));
   process.exitCode = 1;
 });

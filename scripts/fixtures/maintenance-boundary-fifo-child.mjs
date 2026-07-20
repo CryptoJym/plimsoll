@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-const schema = 1;
+const schema = 2;
 const spawnNonce = process.env.PLIMSOLL_MAINTENANCE_SPAWN_NONCE ?? "";
 const root = process.env.PLIMSOLL_HOME ?? process.env.TMPDIR ?? "/tmp";
 const fifoPath = path.join(root, "maintenance-boundary-block.fifo");

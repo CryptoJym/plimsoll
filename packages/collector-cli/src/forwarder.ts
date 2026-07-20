@@ -6,6 +6,7 @@ import {
   type ToolSource,
 } from "../../shared/src/index";
 import { sealOutboundEvent } from "./outbound-envelope";
+import { attachRepoContextSidecar, extractRepoContextCwd } from "./repo-context";
 
 export function appendForwardedHook(
   payload: unknown,
@@ -37,6 +38,9 @@ export function appendForwardedHook(
       ...(presealed.ok ? presealed.omittedFields : []),
     ]),
   };
+
+  const cwd = extractRepoContextCwd(payload);
+  if (cwd) attachRepoContextSidecar(canonical.event, canonical.event.id, cwd);
 
   options.buffer.append(canonical.event, canonical.suppressedFields);
   return canonical;

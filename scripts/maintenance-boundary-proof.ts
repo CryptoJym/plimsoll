@@ -31,10 +31,18 @@ import {
   type MaintenanceProgressStage,
 } from "../packages/collector-cli/src/maintenance-progress";
 import {
+  MAINTENANCE_PROTOCOL_MAX_BYTES,
   MAINTENANCE_PROTOCOL_MAX_FRAMES_PER_JOB,
   MAINTENANCE_PROTOCOL_SCHEMA,
+  maintenanceProtocolFrameBytes,
+  parseMaintenanceWorkerRequest,
   type MaintenanceRunRequest,
 } from "../packages/collector-cli/src/maintenance-protocol";
+import {
+  REPO_CONTEXT_RESOLVER_VERSION,
+  type RepoContextRequest,
+  type RepoContextResult,
+} from "../packages/collector-cli/src/repo-context";
 import type { MaintenanceRunOutcome } from "../packages/collector-cli/src/maintenance";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 
@@ -97,7 +105,11 @@ function outcome(rawEventWrites = 1): MaintenanceRunOutcome {
   };
 }
 
-function resultReceipt(request: MaintenanceRunRequest, value = outcome()) {
+function resultReceipt(
+  request: MaintenanceRunRequest,
+  value = outcome(),
+  repoContexts: RepoContextResult[] = [],
+) {
   return {
     schema: MAINTENANCE_PROTOCOL_SCHEMA,
     type: "result" as const,
@@ -105,6 +117,7 @@ function resultReceipt(request: MaintenanceRunRequest, value = outcome()) {
     nonce: request.nonce,
     sequence: 1,
     result: value,
+    repoContexts,
   };
 }
 
@@ -1324,6 +1337,130 @@ async function sourceAndDistWorkerProof() {
   }
 }
 
+async function repoContextProtocolProof() {
+  const privateCwd = path.join(os.tmpdir(), PRIVATE_PATH_SENTINEL, "repo-context");
+  const contextId = `repoctx:v1:${"a".repeat(64)}`;
+  const request: RepoContextRequest = { contextId, source: "codex", cwd: privateCwd };
+  const frame = {
+    schema: MAINTENANCE_PROTOCOL_SCHEMA,
+    type: "run" as const,
+    generation: 1,
+    nonce: "00000000-0000-4000-8000-000000000001",
+    deadlineMs: 1_000,
+    quarantine: null,
+    repoContexts: [request],
+  };
+  const parsedFrame = parseMaintenanceWorkerRequest(frame);
+  assert.equal(parsedFrame?.type, "run");
+  assert.deepEqual(parsedFrame?.type === "run" ? parsedFrame.repoContexts : null, [request]);
+  assert.equal(
+    parseMaintenanceWorkerRequest({
+      ...frame,
+      repoContexts: [{ ...request, cwd: `${privateCwd}${path.sep}` }],
+    }),
+    null,
+  );
+  assert.equal(
+    parseMaintenanceWorkerRequest({
+      ...frame,
+      repoContexts: [{ ...request, source: "invalid_source" }],
+    }),
+    null,
+  );
+  assert.equal(
+    parseMaintenanceWorkerRequest({ ...frame, repoContexts: [request, request] }),
+    null,
+  );
+  assert.equal(
+    parseMaintenanceWorkerRequest({
+      ...frame,
+      repoContexts: Array.from({ length: 9 }, (_, index) => ({
+        ...request,
+        contextId: `repoctx:v1:${index.toString(16).padStart(64, "0")}`,
+      })),
+    }),
+    null,
+  );
+  assert.equal(
+    parseMaintenanceWorkerRequest({
+      ...frame,
+      repoContexts: [{ ...request, extra: true }],
+    }),
+    null,
+  );
+  const oversized = { ...frame, padding: "x".repeat(MAINTENANCE_PROTOCOL_MAX_BYTES) };
+  assert.ok(maintenanceProtocolFrameBytes(oversized) > MAINTENANCE_PROTOCOL_MAX_BYTES);
+  assert.equal(parseMaintenanceWorkerRequest(oversized), null);
+
+  const resolved: RepoContextResult = {
+    contextId,
+    repoHash: `sha256:${"b".repeat(64)}`,
+    branchHash: null,
+    headSha: "c".repeat(40),
+    resolvedAt: "2026-07-20T18:00:00.000Z",
+    resolverVersion: REPO_CONTEXT_RESOLVER_VERSION,
+  };
+  let accepted = false;
+  let applied = 0;
+  let privateRequestObserved = false;
+  const harness = fakeBoundary((spawnNonce) => {
+    const child = new FakeChild(23_100);
+    child.onSend = (raw) => {
+      const received = raw as MaintenanceRunRequest;
+      if (received.type !== "run") return;
+      privateRequestObserved = received.repoContexts[0]?.cwd === privateCwd;
+      queueMicrotask(() => child.emit(
+        "message",
+        resultReceipt(received, outcome(5), [resolved]),
+      ));
+    };
+    ready(child, spawnNonce);
+    return child;
+  });
+  const result = await harness.boundary.run({
+    repoContexts: [request],
+    onRepoContextsAccepted: () => {
+      accepted = true;
+    },
+    onRepoContexts: (results) => {
+      assert.deepEqual(results, [resolved]);
+      applied += results.length;
+    },
+  });
+  const projected = { status: harness.boundary.status(), result };
+  assert.equal(JSON.stringify(projected).includes(PRIVATE_PATH_SENTINEL), false);
+  assert.equal(accepted, true);
+  assert.equal(privateRequestObserved, true);
+  assert.equal(applied, 1);
+  assert.equal(await harness.boundary.shutdown(), true);
+
+  const mismatch = fakeBoundary((spawnNonce) => {
+    const child = new FakeChild(23_101);
+    child.onSend = (raw) => {
+      const received = raw as MaintenanceRunRequest;
+      if (received.type !== "run") return;
+      queueMicrotask(() => child.emit("message", resultReceipt(received, outcome(), [])));
+    };
+    ready(child, spawnNonce);
+    return child;
+  });
+  await rejectsWith(
+    mismatch.boundary.run({ repoContexts: [request] }),
+    "maintenance_repo_context_result_mismatch",
+  );
+  assert.equal(mismatch.boundary.status().reap.reapedChildren, 1);
+  await mismatch.boundary.shutdown();
+
+  pass("repo_context_protocol_is_strict_bounded_and_path_free", {
+    schema: MAINTENANCE_PROTOCOL_SCHEMA,
+    acceptedBatchSize: 1,
+    maxBatchSize: 8,
+    exactResultFence: true,
+    privateRequestObserved: true,
+    publicPathValues: 0,
+  });
+}
+
 async function pathFreeReceiptProof() {
   const candidateHash = maintenanceCandidateHash(`${PRIVATE_PATH_SENTINEL}/rollout.jsonl`);
   let requestSeen: MaintenanceRunRequest | null = null;
@@ -1360,8 +1497,8 @@ async function pathFreeReceiptProof() {
     status: harness.boundary.status(),
     progressStatus,
     result,
-    request: requestSeen,
   };
+  assert.ok(requestSeen, "private child request should be observed by the fixture");
   assert.equal(JSON.stringify(projected).includes(PRIVATE_PATH_SENTINEL), false);
   assert.equal(
     JSON.stringify(projected).includes(candidateHash),
@@ -1393,6 +1530,7 @@ async function main() {
   await staleFenceAndImmediateSecondJobProof();
   await deterministicRaceProof();
   await sourceAndDistWorkerProof();
+  await repoContextProtocolProof();
   await pathFreeReceiptProof();
 
   const receipt = {

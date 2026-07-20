@@ -17,6 +17,7 @@ import {
 } from "../../shared/src/index";
 
 import { resolveGitContext } from "./git-context";
+import { attachRepoContextSidecar } from "./repo-context";
 import {
   asRecord,
   classifyEventType,
@@ -257,14 +258,15 @@ function buildLogEvent(
     onRepoLabel?: (repoHash: string, label: string) => void;
   },
 ): { event: AiInteractionEvent; suppressedFields: string[] } {
+  const repoContextCwd = workdirFromRawRecord(record);
   const resolvedGit = context.resolveGit
-    ? resolveGitContext(workdirFromRawRecord(record))
+    ? resolveGitContext(repoContextCwd)
     : undefined;
   if (resolvedGit?.remoteUrlHash && resolvedGit.remoteLabel) {
     context.onRepoLabel?.(resolvedGit.remoteUrlHash, resolvedGit.remoteLabel);
   }
   const gitContext = resolvedGit
-    ? (({ remoteLabel: _l, ...rest }) => rest)(resolvedGit)
+    ? (({ remoteLabel: _label, ...linkage }) => linkage)(resolvedGit)
     : undefined;
   const sanitized = sanitizeForPolicy(record, context.policy);
   const safeRecord = asRecord(sanitized.value);
@@ -360,6 +362,9 @@ function buildLogEvent(
       ...(costEstimated ? { costEstimated: true } : {}),
     },
   });
+  if (!context.resolveGit && repoContextCwd) {
+    attachRepoContextSidecar(event, event.id, repoContextCwd);
+  }
 
   return {
     event,
@@ -383,6 +388,7 @@ function buildSpanEvent(
     containerSuppressedFields?: string[];
   },
 ): { event: AiInteractionEvent; suppressedFields: string[] } {
+  const repoContextCwd = workdirFromRawRecord(span);
   const sanitized = sanitizeForPolicy(span, context.policy);
   const safeSpan = asRecord(sanitized.value);
   const rawAttrs = flattenOtelAttributes(safeSpan.attributes);
@@ -506,6 +512,7 @@ function buildSpanEvent(
       ...(context.serviceName ? { serviceName: context.serviceName } : {}),
     },
   });
+  if (repoContextCwd) attachRepoContextSidecar(event, event.id, repoContextCwd);
 
   return {
     event,

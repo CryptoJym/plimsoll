@@ -1,18 +1,77 @@
 import type { LocalEventBuffer } from "./buffer";
 import type { CollectorMaintenance } from "./maintenance";
 import {
+  MAINTENANCE_PROTOCOL_MAX_BYTES,
   MAINTENANCE_PROTOCOL_SCHEMA,
   maintenanceProtocolFrameBytes,
   parseMaintenanceWorkerRequest,
   projectMaintenanceResult,
   type MaintenanceWorkerReceipt,
 } from "./maintenance-protocol";
+import { maintenanceCandidateHash, type MaintenanceProgress } from "./maintenance-progress";
+import {
+  REPO_CONTEXT_RESOLVER_VERSION,
+  resolveRepoContextRequests,
+  type RepoContextRequest,
+  type RepoContextResult,
+} from "./repo-context";
 
 export type MaintenanceWorkerServiceInput = {
   maintenance: CollectorMaintenance;
   buffer: LocalEventBuffer;
   spawnNonce: string;
 };
+
+type RepoContextResolver = typeof resolveRepoContextRequests;
+
+export function resolveMaintenanceRepoContexts(
+  requests: readonly RepoContextRequest[],
+  options: {
+    quarantine: MaintenanceProgress | null;
+    reportProgress: (progress: MaintenanceProgress) => boolean;
+    recordRepoLabel: (repoHash: string, label: string) => void;
+    resolveRequests?: RepoContextResolver;
+  },
+) {
+  const unknownResult = (repoContext: RepoContextRequest): RepoContextResult => ({
+    contextId: repoContext.contextId,
+    repoHash: null,
+    branchHash: null,
+    headSha: null,
+    resolvedAt: new Date().toISOString(),
+    resolverVersion: REPO_CONTEXT_RESOLVER_VERSION,
+  });
+  const results: RepoContextResult[] = [];
+  for (const repoContext of requests) {
+    if (repoContext.source !== "codex" && repoContext.source !== "claude_code") {
+      results.push(unknownResult(repoContext));
+      continue;
+    }
+    const candidateHash = maintenanceCandidateHash(repoContext.cwd);
+    const quarantined = options.quarantine?.source === repoContext.source &&
+      options.quarantine.stage === "git_context" &&
+      options.quarantine.candidateHash === candidateHash;
+    if (quarantined || !options.reportProgress({
+      source: repoContext.source,
+      stage: "git_context",
+      candidateHash,
+    })) {
+      results.push(unknownResult(repoContext));
+      continue;
+    }
+    try {
+      const [resolved] = (options.resolveRequests ?? resolveRepoContextRequests)([repoContext], {
+        onRepoLabel: options.recordRepoLabel,
+      });
+      results.push(resolved ?? unknownResult(repoContext));
+    } catch {
+      // Git attribution is best-effort and happens after token/cursor commit.
+      // A resolver or local label-write fault degrades only this exact context.
+      results.push(unknownResult(repoContext));
+    }
+  }
+  return results;
+}
 
 export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput) {
   let active = false;
@@ -30,7 +89,9 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
   } | null = null;
 
   const send = (receipt: MaintenanceWorkerReceipt) => {
-    if (!process.send || maintenanceProtocolFrameBytes(receipt) > 64 * 1024) return false;
+    if (!process.send || maintenanceProtocolFrameBytes(receipt) > MAINTENANCE_PROTOCOL_MAX_BYTES) {
+      return false;
+    }
     try {
       // `process.send()` returning false is backpressure, not rejection: the
       // frame is already queued. Emitting a second terminal receipt would
@@ -116,33 +177,84 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
       lastAckedSequence: 0,
       ackWaiters: [],
     };
+    const reportProgress = (progress: MaintenanceProgress) => {
+      const key = `${progress.source}:${progress.stage}:${progress.candidateHash ?? "none"}`;
+      if (progress.stage !== "git_context" && key === lastProgressKey) return true;
+      if (progress.stage === "jsonl_open" && progressFrames >= 118) return false;
+      const critical = progress.stage === "source_scan" || progress.stage === "jsonl_validation";
+      if (progressFrames >= (critical ? 120 : 112)) return false;
+      const sent = send({
+        schema: MAINTENANCE_PROTOCOL_SCHEMA,
+        type: "progress",
+        generation: request.generation,
+        nonce: request.nonce,
+        sequence: ++sequence,
+        stage: progress.stage,
+        source: progress.source,
+        candidateHash: progress.candidateHash,
+      });
+      if (sent) {
+        progressFrames += 1;
+        lastProgressKey = key;
+      }
+      return sent;
+    };
+    const resolveWithProgress = (requests: readonly RepoContextRequest[]) => {
+      return resolveMaintenanceRepoContexts(requests, {
+        quarantine: request.quarantine,
+        reportProgress,
+        recordRepoLabel: (repoHash, label) => input.buffer.recordRepoLabel(repoHash, label),
+      });
+    };
+    try {
+      input.buffer.beginChildRepoContextRun();
+    } catch {
+      active = false;
+      activeJob = null;
+      send({
+        schema: MAINTENANCE_PROTOCOL_SCHEMA,
+        type: "error",
+        generation: request.generation,
+        nonce: request.nonce,
+        sequence: ++sequence,
+        reason: "maintenance_failed",
+      });
+      return;
+    }
     void input.maintenance.runRecent({
       quarantine: request.quarantine ?? undefined,
-      onProgress: (progress) => {
-        const key = `${progress.source}:${progress.stage}:${progress.candidateHash ?? "none"}`;
-        if (key === lastProgressKey) return true;
-        if (progress.stage === "jsonl_open" && progressFrames >= 118) return false;
-        const critical = progress.stage === "source_scan" || progress.stage === "jsonl_validation";
-        if (progressFrames >= (critical ? 120 : 112)) return false;
-        const sent = send({
-          schema: MAINTENANCE_PROTOCOL_SCHEMA,
-          type: "progress",
-          generation: request.generation,
-          nonce: request.nonce,
-          sequence: ++sequence,
-          stage: progress.stage,
-          source: progress.source,
-          candidateHash: progress.candidateHash,
-        });
-        if (sent) {
-          progressFrames += 1;
-          lastProgressKey = key;
-        }
-        return sent;
-      },
+      onProgress: reportProgress,
     }).then(
       async (result) => {
         if (closed) return;
+        let repoContexts;
+        try {
+          // runRecent resolves only after both capture sources and their
+          // cursor/event transactions have committed. Filesystem attribution
+          // therefore cannot make already-captured usage disappear.
+          input.buffer.drainRepoContextFills();
+          const childRepoContexts = input.buffer.finishChildRepoContextRun();
+          const childResults = resolveWithProgress(childRepoContexts);
+          input.buffer.applyRepoContextResults(childResults);
+          repoContexts = resolveWithProgress(request.repoContexts);
+        } catch {
+          try {
+            input.buffer.abandonChildRepoContextRun();
+          } catch {
+            // Residual inflight truth is recovered by the parent failure gate.
+          }
+          active = false;
+          activeJob = null;
+          send({
+            schema: MAINTENANCE_PROTOCOL_SCHEMA,
+            type: "error",
+            generation: request.generation,
+            nonce: request.nonce,
+            sequence: ++sequence,
+            reason: "maintenance_failed",
+          });
+          return;
+        }
         await flushSends();
         const acked = await waitForAck(sequence, request.deadlineMs);
         if (!acked || closed) return;
@@ -155,9 +267,15 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
           nonce: request.nonce,
           sequence: ++sequence,
           result: projectMaintenanceResult(result),
+          repoContexts,
         });
       },
       async () => {
+        try {
+          input.buffer.abandonChildRepoContextRun();
+        } catch {
+          // Residual inflight truth is recovered by the parent failure gate.
+        }
         await flushSends();
         const acked = await waitForAck(sequence, request.deadlineMs);
         if (!acked || closed) return;
