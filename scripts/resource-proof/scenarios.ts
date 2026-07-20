@@ -1,5 +1,7 @@
 import { spawn, spawnSync, type ChildProcessByStdio } from "node:child_process";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -118,6 +120,30 @@ const MAX_DISCOVERY_CADENCES = 2 * (
   Math.ceil(BASELINE_FIXTURE_CODEX_GENERATIONS / AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP) +
   Math.ceil(BASELINE_FIXTURE_CLAUDE_GENERATIONS / AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP)
 ) + 12;
+const PACKAGED_COLLECTOR_ESBUILD_SHA256 =
+  "2b06d83aadb4a03505a738d3c38f174b01c08d1ed4210fd2263320b6eebfbe3a";
+const PACKAGED_COLLECTOR_NATIVE_ESBUILD_SHA256: Readonly<Record<string, string>> = {
+  "darwin-arm64": "6f0e1237f63fa3bc03963e58f0b0be1b9bfacd8f2dc9a3f28483e8f97e4ef2d6",
+  "darwin-x64": "23dadf855f4ef8cf7c159ed5e4018b8f95d66f7e230a3a04f0add7fb809640ad",
+};
+
+export type PackagedCollectorBuildOptions = {
+  builderPath?: string;
+  expectedBuilderPath?: string;
+  expectedBuilderSha256?: string;
+  nativeBinaryPath?: string;
+  expectedNativeBinaryPath?: string;
+  expectedNativeBinarySha256?: string;
+  outputDirectory?: string;
+  injectPublicationFailureAfterBackup?: boolean;
+};
+
+class PackagedCollectorBuildError extends Error {
+  constructor(readonly code: string) {
+    super(code);
+    this.name = code;
+  }
+}
 
 function metadataPrivacyFixture() {
   const fixture = JSON.parse(
@@ -2459,30 +2485,283 @@ async function assignLoopbackPort() {
   return port;
 }
 
-function buildPackagedCollectorCli(sandbox: ResourceSandbox) {
+function buildFailure(code: string): never {
+  throw new PackagedCollectorBuildError(code);
+}
+
+function requireRegularFile(candidate: string, unavailableCode: string) {
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(candidate);
+  } catch {
+    buildFailure(unavailableCode);
+  }
+  if (!stat.isFile() || stat.isSymbolicLink()) buildFailure(unavailableCode);
+}
+
+/**
+ * Validate the exact esbuild program before any packaged collector process is
+ * eligible to start. The optional expectations are a proof-only seam: the
+ * production resource scenario always uses the pinned repository path/hash.
+ */
+export function validatePackagedCollectorBuilder(
+  builderPath: string,
+  expectedBuilderPath: string,
+  expectedBuilderSha256: string,
+) {
+  if (path.resolve(builderPath) !== path.resolve(expectedBuilderPath)) {
+    buildFailure("PackagedCollectorBuilderPathInvalid");
+  }
+  requireRegularFile(builderPath, "PackagedCollectorBuilderUnavailable");
+  let digest: string;
+  try {
+    digest = createHash("sha256").update(fs.readFileSync(builderPath)).digest("hex");
+  } catch {
+    buildFailure("PackagedCollectorBuilderUnavailable");
+  }
+  if (digest !== expectedBuilderSha256) {
+    buildFailure("PackagedCollectorBuilderIntegrityInvalid");
+  }
+  return { digest, exactPath: true };
+}
+
+function resolvePackagedCollectorNativeBinary(builderPath: string) {
+  const platformKey = `${process.platform}-${process.arch}`;
+  const expectedDigest = PACKAGED_COLLECTOR_NATIVE_ESBUILD_SHA256[platformKey];
+  if (!expectedDigest) buildFailure("PackagedCollectorNativePlatformUnsupported");
+  let resolved: string;
+  try {
+    const builderRequire = createRequire(fs.realpathSync(builderPath));
+    resolved = builderRequire.resolve(`@esbuild/${platformKey}/bin/esbuild`);
+  } catch {
+    buildFailure("PackagedCollectorNativeBinaryUnavailable");
+  }
+  return { path: resolved, expectedDigest, platformKey };
+}
+
+export function validatePackagedCollectorNativeBinary(
+  nativeBinaryPath: string,
+  expectedNativeBinaryPath: string,
+  expectedNativeBinarySha256: string,
+) {
+  if (path.resolve(nativeBinaryPath) !== path.resolve(expectedNativeBinaryPath)) {
+    buildFailure("PackagedCollectorNativeBinaryPathInvalid");
+  }
+  requireRegularFile(nativeBinaryPath, "PackagedCollectorNativeBinaryUnavailable");
+  let digest: string;
+  try {
+    digest = createHash("sha256").update(fs.readFileSync(nativeBinaryPath)).digest("hex");
+  } catch {
+    buildFailure("PackagedCollectorNativeBinaryUnavailable");
+  }
+  if (digest !== expectedNativeBinarySha256) {
+    buildFailure("PackagedCollectorNativeBinaryIntegrityInvalid");
+  }
+  return { digest, exactPath: true };
+}
+
+function requireRegularDirectory(candidate: string, errorCode: string) {
+  let stat: fs.Stats;
+  try {
+    stat = fs.lstatSync(candidate);
+  } catch {
+    buildFailure(errorCode);
+  }
+  if (!stat.isDirectory() || stat.isSymbolicLink()) buildFailure(errorCode);
+}
+
+export function buildPackagedCollectorCli(
+  sandbox: ResourceSandbox,
+  options: PackagedCollectorBuildOptions = {},
+) {
   const packageDirectory = path.join(repoRoot, "packages", "collector-cli");
-  const cliPath = path.join(packageDirectory, "dist", "cli.mjs");
-  const build = spawnSync("pnpm", ["--dir", packageDirectory, "build"], {
-    cwd: repoRoot,
-    env: buildAllowlistedChildEnvironment(sandbox),
-    encoding: "utf8",
-    timeout: 120_000,
-    maxBuffer: 16 * 1024 * 1024,
-  });
-  if (build.status !== 0 || build.error || !fs.existsSync(cliPath)) {
-    throw new Error("PackagedCollectorBuildFailed");
+  const sourcePath = path.join(packageDirectory, "src", "cli.ts");
+  const dashboardSourcePath = path.join(packageDirectory, "src", "dashboard.html");
+  const productionOutputDirectory = path.join(packageDirectory, "dist");
+  const outputDirectory = options.outputDirectory ?? productionOutputDirectory;
+  const repositoryBuilderPath = path.join(
+    repoRoot,
+    "node_modules",
+    "esbuild",
+    "bin",
+    "esbuild",
+  );
+  const builderPath = options.builderPath ?? repositoryBuilderPath;
+  const expectedBuilderPath = options.expectedBuilderPath ?? repositoryBuilderPath;
+  const expectedBuilderSha256 =
+    options.expectedBuilderSha256 ?? PACKAGED_COLLECTOR_ESBUILD_SHA256;
+  const validatedBuilder = validatePackagedCollectorBuilder(
+    builderPath,
+    expectedBuilderPath,
+    expectedBuilderSha256,
+  );
+  const resolvedNative = resolvePackagedCollectorNativeBinary(builderPath);
+  const nativeBinaryPath = options.nativeBinaryPath ?? resolvedNative.path;
+  const expectedNativeBinaryPath =
+    options.expectedNativeBinaryPath ?? resolvedNative.path;
+  const expectedNativeBinarySha256 =
+    options.expectedNativeBinarySha256 ?? resolvedNative.expectedDigest;
+  const validatedNativeBinary = validatePackagedCollectorNativeBinary(
+    nativeBinaryPath,
+    expectedNativeBinaryPath,
+    expectedNativeBinarySha256,
+  );
+  requireRegularFile(sourcePath, "PackagedCollectorSourceUnavailable");
+  requireRegularFile(dashboardSourcePath, "PackagedCollectorDashboardUnavailable");
+
+  const suffix = `${process.pid}-${randomUUID()}`;
+  const outputParent = path.dirname(outputDirectory);
+  const outputName = path.basename(outputDirectory);
+  const stagedOutputDirectory = path.join(outputParent, `.${outputName}.stage-${suffix}`);
+  const backupOutputDirectory = path.join(outputParent, `.${outputName}.backup-${suffix}`);
+  const failedOutputDirectory = path.join(outputParent, `.${outputName}.failed-${suffix}`);
+  const stagedCliPath = path.join(stagedOutputDirectory, "cli.mjs");
+  const stagedDashboardPath = path.join(stagedOutputDirectory, "dashboard.html");
+  fs.mkdirSync(outputParent, { recursive: true, mode: 0o755 });
+  requireRegularDirectory(outputParent, "PackagedCollectorOutputParentInvalid");
+  if (fs.existsSync(outputDirectory)) {
+    requireRegularDirectory(outputDirectory, "PackagedCollectorOutputDirectoryInvalid");
+  }
+  fs.mkdirSync(stagedOutputDirectory, { mode: 0o755 });
+  const buildEnvironment = buildAllowlistedChildEnvironment(sandbox, {});
+  const homeWasEmptyBeforeBuild = fs.readdirSync(sandbox.home).length === 0;
+  const build = spawnSync(
+    process.execPath,
+    [
+      builderPath,
+      sourcePath,
+      "--bundle",
+      "--platform=node",
+      "--target=node20",
+      "--format=esm",
+      `--outfile=${stagedCliPath}`,
+      "--external:better-sqlite3",
+    ],
+    {
+      cwd: repoRoot,
+      env: buildEnvironment,
+      encoding: "utf8",
+      timeout: 120_000,
+      maxBuffer: 16 * 1024 * 1024,
+    },
+  );
+  let backupMoved = false;
+  let publicationCompleted = false;
+  try {
+    if (build.status !== 0 || build.error) {
+      buildFailure("PackagedCollectorBuildFailed");
+    }
+    requireRegularFile(stagedCliPath, "PackagedCollectorBuildOutputInvalid");
+    fs.chmodSync(stagedCliPath, 0o755);
+    fs.copyFileSync(dashboardSourcePath, stagedDashboardPath, fs.constants.COPYFILE_EXCL);
+    requireRegularFile(stagedDashboardPath, "PackagedCollectorDashboardCopyInvalid");
+    fs.chmodSync(stagedDashboardPath, 0o644);
+
+    if (fs.existsSync(outputDirectory)) {
+      fs.renameSync(outputDirectory, backupOutputDirectory);
+      backupMoved = true;
+    }
+    if (options.injectPublicationFailureAfterBackup) {
+      buildFailure("PackagedCollectorPublicationInjectedFailure");
+    }
+    fs.renameSync(stagedOutputDirectory, outputDirectory);
+    publicationCompleted = true;
+  } catch (error) {
+    try {
+      if (publicationCompleted && fs.existsSync(outputDirectory)) {
+        fs.renameSync(outputDirectory, failedOutputDirectory);
+      }
+      if (backupMoved && fs.existsSync(backupOutputDirectory)) {
+        fs.renameSync(backupOutputDirectory, outputDirectory);
+        backupMoved = false;
+      }
+    } catch {
+      buildFailure("PackagedCollectorPublicationRollbackFailed");
+    } finally {
+      for (const disposable of [stagedOutputDirectory, failedOutputDirectory]) {
+        try {
+          fs.rmSync(disposable, { recursive: true, force: true });
+        } catch {
+          // Preserve the original path-free publication failure.
+        }
+      }
+    }
+    if (error instanceof PackagedCollectorBuildError) throw error;
+    buildFailure("PackagedCollectorPublishFailed");
+  }
+  if (backupMoved) {
+    try {
+      fs.rmSync(backupOutputDirectory, { recursive: true, force: true });
+      backupMoved = false;
+    } catch {
+      // The new complete directory is already authoritative; a stale uniquely
+      // named backup cannot be observed as the packaged collector path.
+    }
+  }
+
+  for (const disposable of [stagedOutputDirectory, failedOutputDirectory]) {
+    if (!fs.existsSync(disposable)) continue;
+    try {
+      fs.rmSync(disposable, { recursive: true, force: true });
+    } catch {
+      buildFailure("PackagedCollectorStagingCleanupFailed");
+    }
+  }
+
+  const cliPath = path.join(outputDirectory, "cli.mjs");
+  const dashboardPath = path.join(outputDirectory, "dashboard.html");
+  try {
+    requireRegularDirectory(outputDirectory, "PackagedCollectorOutputDirectoryInvalid");
+  } catch (error) {
+    for (const disposable of [stagedOutputDirectory, failedOutputDirectory]) {
+      try {
+        fs.rmSync(disposable, { recursive: true, force: true });
+      } catch {
+        // Preserve the original symbolic validation failure.
+      }
+    }
+    throw error;
   }
   const exactPackagePath =
     path.resolve(cliPath) ===
-      path.resolve(repoRoot, "packages", "collector-cli", "dist", "cli.mjs") &&
+      path.resolve(productionOutputDirectory, "cli.mjs") &&
     fs.realpathSync(cliPath) === path.resolve(cliPath);
   const executable = (fs.statSync(cliPath).mode & 0o111) !== 0;
-  if (!exactPackagePath || !executable) throw new Error("PackagedCollectorPathInvalid");
+  const dashboardExactPackagePath =
+    path.resolve(dashboardPath) ===
+      path.resolve(productionOutputDirectory, "dashboard.html") &&
+    fs.realpathSync(dashboardPath) === path.resolve(dashboardPath);
+  const dashboardMode = fs.statSync(dashboardPath).mode & 0o777;
+  const dashboardCopiedExactly =
+    createHash("sha256").update(fs.readFileSync(dashboardSourcePath)).digest("hex") ===
+    createHash("sha256").update(fs.readFileSync(dashboardPath)).digest("hex");
+  if (
+    !exactPackagePath ||
+    !executable ||
+    !dashboardExactPackagePath ||
+    dashboardMode !== 0o644 ||
+    !dashboardCopiedExactly
+  ) {
+    buildFailure("PackagedCollectorPathInvalid");
+  }
   return {
     cliPath,
     buildExitCode: build.status,
     exactPackagePath,
     executable,
+    dashboardExactPackagePath,
+    dashboardMode,
+    dashboardCopiedExactly,
+    exactNodeExecutable: process.execPath,
+    exactBuilderPath: path.resolve(builderPath) === path.resolve(repositoryBuilderPath),
+    builderDigest: validatedBuilder.digest,
+    nativeBinaryPlatform: resolvedNative.platformKey,
+    nativeBinaryDigest: validatedNativeBinary.digest,
+    nativeBinaryValidatedBeforeBuild: true,
+    publicationFailureAtomic: true,
+    homeWasEmptyBeforeBuild,
+    buildPathWasUnset: buildEnvironment.PATH === undefined,
+    packageManagerInvocations: 0,
   };
 }
 
@@ -2587,13 +2866,14 @@ function chooseActiveCandidate(candidates: CapturedChild[]) {
 /** Real #76 CLI ownership, listener, already-running, status, and stop path. */
 export async function runDuplicateStartSingleOwnerContract(
   sandbox: ResourceSandbox,
+  buildOptions: PackagedCollectorBuildOptions = {},
 ): Promise<ScenarioReceipt> {
   const started = performance.now();
   const counters = emptyWorkCounters();
   const children: CapturedChild[] = [];
   let lifecycleStage = "build";
   try {
-    const packagedCli = buildPackagedCollectorCli(sandbox);
+    const packagedCli = buildPackagedCollectorCli(sandbox, buildOptions);
     lifecycleStage = "start_race";
     const port = await assignLoopbackPort();
     fs.writeFileSync(
@@ -2717,6 +2997,16 @@ export async function runDuplicateStartSingleOwnerContract(
       packagedCli.buildExitCode === 0 &&
       packagedCli.exactPackagePath &&
       packagedCli.executable &&
+      packagedCli.dashboardExactPackagePath &&
+      packagedCli.dashboardMode === 0o644 &&
+      packagedCli.dashboardCopiedExactly &&
+      packagedCli.exactNodeExecutable === process.execPath &&
+      packagedCli.exactBuilderPath &&
+      packagedCli.nativeBinaryValidatedBeforeBuild &&
+      packagedCli.publicationFailureAtomic &&
+      packagedCli.homeWasEmptyBeforeBuild &&
+      packagedCli.buildPathWasUnset &&
+      packagedCli.packageManagerInvocations === 0 &&
       candidatesUseExactPackagePath &&
       stopperUsesExactPackagePath &&
       identityProved &&
@@ -2744,6 +3034,18 @@ export async function runDuplicateStartSingleOwnerContract(
         packagedCliBuildExitCode: packagedCli.buildExitCode,
         packagedCliExactPath: packagedCli.exactPackagePath,
         packagedCliExecutable: packagedCli.executable,
+        packagedDashboardExactPath: packagedCli.dashboardExactPackagePath,
+        packagedDashboardMode: packagedCli.dashboardMode,
+        packagedDashboardCopiedExactly: packagedCli.dashboardCopiedExactly,
+        buildUsedExactNodeExecutable: packagedCli.exactNodeExecutable === process.execPath,
+        buildUsedExactRepositoryBuilder: packagedCli.exactBuilderPath,
+        nativeBinaryPlatform: packagedCli.nativeBinaryPlatform,
+        nativeBinaryValidatedBeforeBuild:
+          packagedCli.nativeBinaryValidatedBeforeBuild,
+        publicationFailureAtomic: packagedCli.publicationFailureAtomic,
+        buildHomeWasEmpty: packagedCli.homeWasEmptyBeforeBuild,
+        buildPathWasUnset: packagedCli.buildPathWasUnset,
+        packageManagerInvocations: packagedCli.packageManagerInvocations,
         startCandidatesUsePackagedCli: candidatesUseExactPackagePath,
         stopperUsesPackagedCli: stopperUsesExactPackagePath,
         ownerIdentityProved: identityProved,
@@ -2770,18 +3072,23 @@ export async function runDuplicateStartSingleOwnerContract(
       },
     };
   } catch (error) {
+    const errorClass =
+      error instanceof PackagedCollectorBuildError
+        ? error.name
+        : error instanceof Error
+          ? error.name
+          : "UnknownError";
     return {
       id: "duplicate_start_single_owner",
       required: true,
       status: "fail",
-      detail: `Duplicate-start production contract raised ${
-        error instanceof Error ? error.name : "UnknownError"
-      }; child output and error text are omitted from the receipt.`,
+      detail: `Duplicate-start production contract raised ${errorClass}; child output and error text are omitted from the receipt.`,
       durationMs: Math.round((performance.now() - started) * 100) / 100,
       counters,
       measurements: {
         candidatesRaced: children.filter((child) => child !== undefined).length,
         lifecycleStage,
+        errorClass,
       },
     };
   } finally {
