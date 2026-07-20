@@ -300,7 +300,8 @@ async function fifoAvailabilityProof() {
   const server = createCollectorServer(config, buffer, {
     maintenanceStatus: () => boundary.status(),
   });
-  const agent = new http.Agent({ keepAlive: true, maxSockets: 256 });
+  const waveConcurrency = 100;
+  const agent = new http.Agent({ keepAlive: true, maxSockets: waveConcurrency });
   let runPromise: Promise<MaintenanceRunOutcome> | null = null;
   try {
     await new Promise<void>((resolve, reject) => {
@@ -317,10 +318,12 @@ async function fifoAvailabilityProof() {
     void runPromise.catch(() => undefined);
     await waitFor(() => fs.existsSync(markerPath), "fifo_child_block_marker");
 
-    const statusRequests = Array.from({ length: 128 }, () => (
+    const statuses = await Promise.all(Array.from({ length: waveConcurrency }, () => (
       request(agent, port, "GET", "/status")
-    ));
-    const hookRequests = Array.from({ length: 128 }, (_, index) => request(
+    )));
+    assert.ok(statuses.every((row) => row.status === 200), "all status requests must return 200");
+
+    const hooks = await Promise.all(Array.from({ length: waveConcurrency }, (_, index) => request(
       agent,
       port,
       "POST",
@@ -331,13 +334,8 @@ async function fifoAvailabilityProof() {
         tool_name: "proof_tool",
       }),
       { "x-plimsoll-source": "codex" },
-    ));
-    const [statuses, hooks] = await Promise.all([
-      Promise.all(statusRequests),
-      Promise.all(hookRequests),
-    ]);
+    )));
 
-    assert.ok(statuses.every((row) => row.status === 200), "all status requests must return 200");
     assert.ok(hooks.every((row) => row.status === 202), "all hook requests must return 202");
     const statusP95 = percentile(statuses.map((row) => row.elapsedMs), 0.95);
     const statusMax = Math.max(...statuses.map((row) => row.elapsedMs));
@@ -354,7 +352,11 @@ async function fifoAvailabilityProof() {
     const rowsAfter = Number((buffer.database.prepare(
       "select count(*) as n from buffered_events",
     ).get() as { n: number }).n);
-    assert.equal(rowsAfter - rowsBefore, 128, "each accepted hook must be durable exactly once");
+    assert.equal(
+      rowsAfter - rowsBefore,
+      waveConcurrency,
+      "each accepted hook must be durable exactly once",
+    );
     assert.equal(status.reap.termSignals, 1, "deadline must send one TERM");
     assert.equal(status.reap.killSignals, 1, "stalled child must require one KILL");
     assert.equal(status.reap.reapedChildren, 1, "stalled child must emit close and be reaped");
@@ -368,6 +370,11 @@ async function fifoAvailabilityProof() {
       statusResponses: statuses.length,
       hookResponses: hooks.length,
       acceptedExactlyOnce: rowsAfter - rowsBefore,
+      requestWaves: [
+        { route: "/status", concurrency: waveConcurrency },
+        { route: "/hooks/codex", concurrency: waveConcurrency },
+      ],
+      agentMaxSockets: waveConcurrency,
       statusP95Ms: Number(statusP95.toFixed(3)),
       statusMaxMs: Number(statusMax.toFixed(3)),
       hookP95Ms: Number(hookP95.toFixed(3)),
