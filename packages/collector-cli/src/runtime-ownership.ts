@@ -586,17 +586,78 @@ function cleanupArchiveNames(pidPath: string, transactionId: string) {
 }
 
 function inspectCleanupSlot(slotPath: string): CleanupSlotInspection {
-  const inspected = inspectCollectorPidFile(slotPath);
-  if (inspected.kind === "missing") return inspected;
-  if (inspected.kind !== "safe" || inspected.fileIdentity.size > CLEANUP_ARTIFACT_MAX_BYTES) {
+  const absolutePath = path.resolve(slotPath);
+  const ancestors = inspectPidAncestors(absolutePath);
+  if (ancestors.kind === "missing") return { kind: "missing" };
+  if (ancestors.kind !== "safe") return { kind: "unsafe" };
+
+  let initialIdentity: PidFileIdentity;
+  try {
+    const initialStat = lstatPidPath(absolutePath);
+    if (!initialStat) return { kind: "missing" };
+    if (
+      validatePidLeaf(initialStat) ||
+      initialStat.size > CLEANUP_ARTIFACT_MAX_BYTES
+    ) {
+      return { kind: "unsafe" };
+    }
+    initialIdentity = pidFileIdentity(initialStat);
+  } catch {
     return { kind: "unsafe" };
   }
-  return {
-    kind: "present",
-    path: slotPath,
-    raw: inspected.raw,
-    fileIdentity: inspected.fileIdentity,
-  };
+
+  let descriptor: number | undefined;
+  try {
+    descriptor = fs.openSync(absolutePath, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    const boundBefore = fs.fstatSync(descriptor);
+    if (
+      validatePidLeaf(boundBefore) ||
+      boundBefore.size > CLEANUP_ARTIFACT_MAX_BYTES
+    ) {
+      return { kind: "unsafe" };
+    }
+    const boundBeforeIdentity = pidFileIdentity(boundBefore);
+    if (!samePidFileIdentity(initialIdentity, boundBeforeIdentity)) {
+      return { kind: "unsafe" };
+    }
+
+    const chunks: Buffer[] = [];
+    let bytesRead = 0;
+    while (bytesRead <= CLEANUP_ARTIFACT_MAX_BYTES) {
+      const remaining = CLEANUP_ARTIFACT_MAX_BYTES + 1 - bytesRead;
+      const chunk = Buffer.allocUnsafe(Math.min(64 * 1024, remaining));
+      const read = fs.readSync(descriptor, chunk, 0, chunk.length, bytesRead);
+      if (read === 0) break;
+      chunks.push(chunk.subarray(0, read));
+      bytesRead += read;
+      if (bytesRead > CLEANUP_ARTIFACT_MAX_BYTES) return { kind: "unsafe" };
+    }
+    const raw = Buffer.concat(chunks, bytesRead).toString("utf8");
+    const boundAfterIdentity = pidFileIdentity(fs.fstatSync(descriptor));
+    if (!samePidFileIdentity(boundBeforeIdentity, boundAfterIdentity)) {
+      return { kind: "unsafe" };
+    }
+    const finalStat = lstatPidPath(absolutePath);
+    const finalAncestors = inspectPidAncestors(absolutePath);
+    if (
+      !finalStat ||
+      finalAncestors.kind !== "safe" ||
+      !samePidAncestors(ancestors.identities, finalAncestors.identities) ||
+      !samePidFileIdentity(boundAfterIdentity, pidFileIdentity(finalStat))
+    ) {
+      return { kind: "unsafe" };
+    }
+    return {
+      kind: "present",
+      path: absolutePath,
+      raw,
+      fileIdentity: boundAfterIdentity,
+    };
+  } catch {
+    return { kind: "unsafe" };
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
 }
 
 function validProcessIdentity(value: unknown): value is ProcessIdentity {

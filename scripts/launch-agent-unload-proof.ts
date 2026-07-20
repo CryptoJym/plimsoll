@@ -26,6 +26,15 @@ import {
 const LABEL = "com.plimsoll.collector";
 const PID_PATH = "/fixture/collector.pid";
 const PORT = 48_271;
+const CLEANUP_ARTIFACT_LIMIT = 256 * 1024;
+
+type PositionalReadSync = (
+  descriptor: number,
+  buffer: Buffer,
+  offset: number,
+  length: number,
+  position: number | null,
+) => number;
 
 function cleanupSlots(pidPath: string) {
   const directory = path.dirname(pidPath);
@@ -783,20 +792,131 @@ async function main() {
       deadMarkerPid,
       secondDeadMarkerRecord.transactionId,
     ).marker;
-    fs.writeFileSync(secondArchivedMarker, "archive-replacement\n", { mode: 0o600 });
-    const tamperedRetirementState = readCollectorPidCleanupState(deadMarkerPid, LABEL);
-    const tamperedRetirementReconciliation = reconcileCollectorPidCleanupState(
-      deadMarkerPid,
+    const oversizedArchiveBytes = 3 * 1024 * 1024;
+    fs.writeFileSync(secondArchivedMarker, Buffer.alloc(oversizedArchiveBytes, 0x58), {
+      mode: 0o600,
+    });
+    const oversizedArchiveIdentity = fs.lstatSync(secondArchivedMarker);
+    const originalReadSync = fs.readSync as PositionalReadSync;
+    let oversizedArchiveReadCalls = 0;
+    (fs as unknown as { readSync: PositionalReadSync }).readSync = (
+      descriptor,
+      buffer,
+      offset,
+      length,
+      position,
+    ) => {
+      const descriptorStat = fs.fstatSync(descriptor);
+      if (
+        descriptorStat.dev === oversizedArchiveIdentity.dev &&
+        descriptorStat.ino === oversizedArchiveIdentity.ino
+      ) {
+        oversizedArchiveReadCalls += 1;
+      }
+      return originalReadSync(descriptor, buffer, offset, length, position);
+    };
+    let oversizedRetirementState: ReturnType<typeof readCollectorPidCleanupState>;
+    let oversizedRetirementReconciliation: ReturnType<
+      typeof reconcileCollectorPidCleanupState
+    >;
+    try {
+      oversizedRetirementState = readCollectorPidCleanupState(deadMarkerPid, LABEL);
+      oversizedRetirementReconciliation = reconcileCollectorPidCleanupState(
+        deadMarkerPid,
+        LABEL,
+      );
+    } finally {
+      (fs as unknown as { readSync: PositionalReadSync }).readSync = originalReadSync;
+    }
+    check(
+      "oversized_archived_marker_is_rejected_before_body_read",
+      oversizedRetirementState.ambiguous &&
+        oversizedRetirementState.unsafeArtifactCount === 1 &&
+        !oversizedRetirementReconciliation.reconciled &&
+        oversizedRetirementReconciliation.disposition === "unsafe_artifact" &&
+        oversizedArchiveReadCalls === 0 &&
+        fs.lstatSync(secondArchivedMarker).size === oversizedArchiveBytes,
+      "A multi-megabyte private archived marker is rejected from descriptor metadata before any body read or body-sized allocation, remains intact, and fails closed.",
+    );
+
+    const growingArchivePid = path.join(pidFixtureRoot, "growing-archive.pid");
+    const growingArchivePreserved = path.join(
+      pidFixtureRoot,
+      "growing-archive-preserved.pid",
+    );
+    fs.writeFileSync(growingArchivePid, ownedRaw, { mode: 0o600 });
+    const growingArchiveCleanup = removeCollectorPidFileIfOwnedDetailed(
+      growingArchivePid,
+      owner,
+      LABEL,
+      { beforeClaim: () => fs.renameSync(growingArchivePid, growingArchivePreserved) },
+    );
+    const growingArchiveSlots = cleanupSlots(growingArchivePid);
+    makeMarkerActorDead(growingArchiveSlots.marker);
+    const growingArchiveRecord = JSON.parse(
+      fs.readFileSync(growingArchiveSlots.marker, "utf8"),
+    ) as { transactionId: string };
+    const growingArchiveClean = reconcileCollectorPidCleanupState(
+      growingArchivePid,
+      LABEL,
+    );
+    const growingArchivedMarker = cleanupArchive(
+      growingArchivePid,
+      growingArchiveRecord.transactionId,
+    ).marker;
+    const growingArchiveInitialBytes = fs.lstatSync(growingArchivedMarker).size;
+    const growingArchiveIdentity = fs.lstatSync(growingArchivedMarker);
+    const growthBytes = 2 * 1024 * 1024;
+    let growingArchiveReadBytes = 0;
+    let growingArchiveMaxRequest = 0;
+    let archiveGrewDuringRead = false;
+    (fs as unknown as { readSync: PositionalReadSync }).readSync = (
+      descriptor,
+      buffer,
+      offset,
+      length,
+      position,
+    ) => {
+      const descriptorStat = fs.fstatSync(descriptor);
+      const isGrowingArchive = descriptorStat.dev === growingArchiveIdentity.dev &&
+        descriptorStat.ino === growingArchiveIdentity.ino;
+      const read = originalReadSync(descriptor, buffer, offset, length, position);
+      if (isGrowingArchive) {
+        growingArchiveReadBytes += read;
+        growingArchiveMaxRequest = Math.max(growingArchiveMaxRequest, length);
+        if (!archiveGrewDuringRead && read > 0) {
+          fs.appendFileSync(growingArchivedMarker, Buffer.alloc(growthBytes, 0x47));
+          archiveGrewDuringRead = true;
+        }
+      }
+      return read;
+    };
+    let growingRetirementState: ReturnType<typeof readCollectorPidCleanupState>;
+    try {
+      growingRetirementState = readCollectorPidCleanupState(growingArchivePid, LABEL);
+    } finally {
+      (fs as unknown as { readSync: PositionalReadSync }).readSync = originalReadSync;
+    }
+    const growingRetirementReconciliation = reconcileCollectorPidCleanupState(
+      growingArchivePid,
       LABEL,
     );
     check(
-      "completed_guard_requires_exact_archived_marker_proof",
-      tamperedRetirementState.ambiguous &&
-        tamperedRetirementState.unsafeArtifactCount === 1 &&
-        !tamperedRetirementReconciliation.reconciled &&
-        tamperedRetirementReconciliation.disposition === "unsafe_artifact" &&
-        fs.readFileSync(secondArchivedMarker, "utf8") === "archive-replacement\n",
-      "A completed fixed guard is clean only while its directly addressed retired marker remains byte-exact; archive replacement is preserved and fails closed.",
+      "archived_marker_growth_reads_only_limit_plus_one",
+      growingArchiveCleanup.disposition === "preclaim_changed" &&
+        growingArchiveClean.reconciled &&
+        !growingArchiveClean.after.ambiguous &&
+        archiveGrewDuringRead &&
+        growingArchiveReadBytes === CLEANUP_ARTIFACT_LIMIT + 1 &&
+        growingArchiveMaxRequest <= 64 * 1024 &&
+        growingRetirementState.ambiguous &&
+        growingRetirementState.unsafeArtifactCount === 1 &&
+        !growingRetirementReconciliation.reconciled &&
+        growingRetirementReconciliation.disposition === "unsafe_artifact" &&
+        fs.lstatSync(growingArchivedMarker).ino === growingArchiveIdentity.ino &&
+        fs.lstatSync(growingArchivedMarker).size === growingArchiveInitialBytes + growthBytes &&
+        fs.readFileSync(growingArchivePreserved, "utf8") === ownedRaw,
+      "Concurrent archived-marker growth is retained, reads at most the fixed limit plus one byte in bounded chunks, and becomes unsafe ambiguity.",
     );
 
     const markerRacePid = path.join(pidFixtureRoot, "marker-race.pid");
