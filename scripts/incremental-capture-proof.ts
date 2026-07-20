@@ -27,6 +27,10 @@ import {
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 import { jsonlScanStateKey } from "../packages/collector-cli/src/jsonl-byte-tailer";
+import { runRepoEnrichmentMaintenance } from "../packages/collector-cli/src/maintenance";
+import { deterministicEventId } from "../packages/collector-cli/src/normalizer";
+import { resolveRepoContextRequests } from "../packages/collector-cli/src/repo-context";
+import { aiInteractionEventSchema, remoteLinkageHash } from "../packages/shared/src/index";
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-incremental-proof-"));
 const buffer = new LocalEventBuffer(path.join(tempDir, "proof.sqlite"));
@@ -809,6 +813,421 @@ async function proveTranscriptChunkParity() {
   };
 }
 
+async function proveDeferredRepoContextOccurrences() {
+  const root = path.join(tempDir, "deferred-repo-context-occurrences");
+  fs.mkdirSync(root, { recursive: true });
+  const occurrenceBuffer = new LocalEventBuffer(path.join(root, "ledger.sqlite"));
+  const cwdA = path.join(root, "repo-a");
+  const cwdB = path.join(root, "repo-b");
+  fs.mkdirSync(cwdA, { recursive: true });
+  fs.mkdirSync(cwdB, { recursive: true });
+  try {
+    occurrenceBuffer.beginChildRepoContextRun();
+    const rolloutRoot = path.join(root, "rollouts");
+    const rolloutDay = path.join(rolloutRoot, "2026", "07", "20");
+    fs.mkdirSync(rolloutDay, { recursive: true });
+    const sessionId = "019e8000-0000-7000-8000-000000000001";
+    const rolloutFile = path.join(
+      rolloutDay,
+      `rollout-proof-${sessionId}.jsonl`,
+    );
+    const ignored = Array.from({ length: 63 }, (_, index) => rolloutLine(
+      `2026-07-20T12:00:${String(index % 60).padStart(2, "0")}.000Z`,
+      "response_item",
+      { index },
+    ));
+    fs.writeFileSync(
+      rolloutFile,
+      [
+        rolloutLine("2026-07-20T11:59:59.000Z", "session_meta", {
+          id: sessionId,
+          cwd: cwdA,
+        }),
+        ...ignored,
+        tokenCountLine("2026-07-20T12:01:00.000Z", 10, 0, 1),
+        tokenCountLine("2026-07-20T12:01:01.000Z", 20, 0, 2),
+        rolloutLine("2026-07-20T12:01:02.000Z", "turn_context", {
+          model: "gpt-5.5",
+          cwd: cwdB,
+        }),
+        tokenCountLine("2026-07-20T12:01:03.000Z", 30, 0, 3),
+        rolloutLine("2026-07-20T12:01:04.000Z", "turn_context", {
+          model: "gpt-5.5",
+          cwd: cwdA,
+        }),
+        tokenCountLine("2026-07-20T12:01:05.000Z", 40, 0, 4),
+      ].join("\n") + "\n",
+    );
+    const rolloutScan = await new RolloutTailer(
+      occurrenceBuffer,
+      rolloutRoot,
+      () => [],
+    ).scan({ scope: "full" });
+    const rolloutRows = occurrenceBuffer.database.prepare(
+      `select e.input_tokens as inputTokens, l.context_id as contextId
+       from buffered_events e left join repo_context_event_links l on l.event_id = e.id
+       where e.event_type = 'usage_rollout' and e.session_id = ?
+       order by e.observed_at`,
+    ).all(sessionId) as Array<{ inputTokens: number; contextId: string | null }>;
+    assert.equal(rolloutScan.slicesCommitted >= 2, true);
+    assert.equal(rolloutRows.length, 4);
+    assert.ok(rolloutRows.every((row) => row.inputTokens === 10 && row.contextId));
+    assert.equal(rolloutRows[0]!.contextId, rolloutRows[1]!.contextId);
+    assert.notEqual(rolloutRows[1]!.contextId, rolloutRows[2]!.contextId);
+    assert.notEqual(
+      rolloutRows[0]!.contextId,
+      rolloutRows[3]!.contextId,
+      "the same cwd at a later occurrence must not reuse the earlier occurrence id",
+    );
+    const rolloutIdsBeforeReplay = rolloutRows.map((row) => row.contextId);
+    occurrenceBuffer.database.prepare(
+      `delete from rollout_scan_state where file = ?`,
+    ).run(jsonlScanStateKey(rolloutFile));
+    await new RolloutTailer(occurrenceBuffer, rolloutRoot, () => []).scan({ scope: "full" });
+    const rolloutIdsAfterReplay = (occurrenceBuffer.database.prepare(
+      `select l.context_id as contextId
+       from buffered_events e left join repo_context_event_links l on l.event_id = e.id
+       where e.event_type = 'usage_rollout' and e.session_id = ? order by e.observed_at`,
+    ).all(sessionId) as Array<{ contextId: string | null }>).map((row) => row.contextId);
+    assert.deepEqual(rolloutIdsAfterReplay, rolloutIdsBeforeReplay);
+
+    const transcriptRoot = path.join(root, "transcripts");
+    const transcriptProject = path.join(transcriptRoot, "project");
+    fs.mkdirSync(transcriptProject, { recursive: true });
+    const transcriptSession = "019e8000-0000-7000-8000-000000000002";
+    const transcriptFile = path.join(transcriptProject, `${transcriptSession}.jsonl`);
+    const transcriptLine = (
+      messageId: string,
+      input: number,
+      cwd: string,
+      timestamp: string,
+    ) => JSON.stringify({
+      type: "assistant",
+      sessionId: transcriptSession,
+      cwd,
+      timestamp,
+      message: {
+        id: messageId,
+        model: "claude-sonnet-4-20250514",
+        usage: { input_tokens: input, output_tokens: input / 10 },
+      },
+    });
+    fs.writeFileSync(
+      transcriptFile,
+      [
+        transcriptLine("stable-message", 10, cwdA, "2026-07-20T13:00:00.000Z"),
+        transcriptLine("stable-message", 20, cwdA, "2026-07-20T13:00:01.000Z"),
+        transcriptLine("conflict-message", 10, cwdA, "2026-07-20T13:00:02.000Z"),
+        transcriptLine("conflict-message", 20, cwdB, "2026-07-20T13:00:03.000Z"),
+      ].join("\n") + "\n",
+    );
+    await new TranscriptTailer(occurrenceBuffer, transcriptRoot).scan({ scope: "full" });
+    let stableRows = occurrenceBuffer.database.prepare(
+      `select l.context_id as contextId
+       from buffered_events e left join repo_context_event_links l on l.event_id = e.id
+       where e.event_type = 'usage_transcript' and e.session_id = ?
+         and e.observed_at in (?, ?) order by e.observed_at`,
+    ).all(
+      transcriptSession,
+      "2026-07-20T13:00:00.000Z",
+      "2026-07-20T13:00:01.000Z",
+    ) as Array<{ contextId: string | null }>;
+    const conflictingRows = occurrenceBuffer.database.prepare(
+      `select l.context_id as contextId
+       from buffered_events e left join repo_context_event_links l on l.event_id = e.id
+       where e.event_type = 'usage_transcript' and e.session_id = ?
+         and e.observed_at in (?, ?) order by e.observed_at`,
+    ).all(
+      transcriptSession,
+      "2026-07-20T13:00:02.000Z",
+      "2026-07-20T13:00:03.000Z",
+    ) as Array<{ contextId: string | null }>;
+    assert.equal(stableRows.length, 2);
+    assert.ok(stableRows[0]!.contextId);
+    assert.equal(stableRows[0]!.contextId, stableRows[1]!.contextId);
+    assert.equal(conflictingRows.length, 2);
+    assert.ok(conflictingRows.every((row) => row.contextId));
+    assert.equal(conflictingRows[0]!.contextId, conflictingRows[1]!.contextId);
+
+    // Equal usage with a different cwd emits no event, but must still make
+    // the occurrence conflict terminal. A later revision cannot last-win.
+    fs.appendFileSync(
+      transcriptFile,
+      transcriptLine("stable-message", 20, cwdB, "2026-07-20T13:00:04.000Z") + "\n",
+    );
+    const zeroDeltaConflict = await new TranscriptTailer(
+      occurrenceBuffer,
+      transcriptRoot,
+    ).scan({ scope: "full" });
+    assert.equal(zeroDeltaConflict.eventsAppended, 0);
+    fs.appendFileSync(
+      transcriptFile,
+      transcriptLine("stable-message", 30, cwdA, "2026-07-20T13:00:05.000Z") + "\n",
+    );
+    await new TranscriptTailer(occurrenceBuffer, transcriptRoot).scan({ scope: "full" });
+    stableRows = occurrenceBuffer.database.prepare(
+      `select l.context_id as contextId
+       from buffered_events e left join repo_context_event_links l on l.event_id = e.id
+       where e.event_type = 'usage_transcript' and e.session_id = ?
+         and e.observed_at in (?, ?, ?) order by e.observed_at`,
+    ).all(
+      transcriptSession,
+      "2026-07-20T13:00:00.000Z",
+      "2026-07-20T13:00:01.000Z",
+      "2026-07-20T13:00:05.000Z",
+    ) as Array<{ contextId: string | null }>;
+    assert.equal(stableRows.length, 3);
+    assert.equal(stableRows[0]!.contextId, stableRows[1]!.contextId);
+    assert.equal(stableRows[2]!.contextId, stableRows[0]!.contextId);
+    const conflicts = occurrenceBuffer.database.prepare(
+      `select count(*) as count from transcript_usage_revision_state
+       where session_id = ? and context_conflict = 1`,
+    ).get(transcriptSession) as { count: number };
+    assert.equal(conflicts.count, 2);
+
+    const liveSession = "019e8000-0000-7000-8000-000000000003";
+    occurrenceBuffer.database.prepare(
+      `insert into session_usage_authority (source, session_id, authority, claimed_at)
+       values ('codex', ?, 'live', ?)`,
+    ).run(liveSession, "2026-07-20T13:30:00.000Z");
+    fs.writeFileSync(
+      path.join(rolloutDay, `rollout-proof-${liveSession}.jsonl`),
+      [
+        rolloutLine("2026-07-20T13:30:00.000Z", "session_meta", {
+          id: liveSession,
+          cwd: path.join(root, "live-session-unused-context"),
+        }),
+        tokenCountLine("2026-07-20T13:30:01.000Z", 99, 0, 9),
+      ].join("\n") + "\n",
+    );
+    const liveCovered = await new RolloutTailer(
+      occurrenceBuffer,
+      rolloutRoot,
+      () => [],
+    ).scan({ scope: "full" });
+    assert.equal(liveCovered.sessionsSkippedOtlpCovered, 1);
+    assert.equal(occurrenceBuffer.repoContextInflightCount(), 3);
+
+    const childRequests = occurrenceBuffer.finishChildRepoContextRun();
+    assert.equal(
+      childRequests.length,
+      3,
+      "the cross-slice transcript conflict must cancel its child-owned request",
+    );
+    assert.equal(occurrenceBuffer.repoContextInflightCount(), 3);
+    const usageRowsBeforeResolution = (occurrenceBuffer.database.prepare(
+      `select count(*) as count from buffered_events
+       where event_type in ('usage_rollout', 'usage_transcript')`,
+    ).get() as { count: number }).count;
+    const unknownApply = occurrenceBuffer.applyRepoContextResults(
+      resolveRepoContextRequests(childRequests),
+    );
+    assert.equal(unknownApply.unknownResults, 3);
+    assert.equal(occurrenceBuffer.repoContextInflightCount(), 0);
+    assert.equal(
+      (occurrenceBuffer.database.prepare(
+        `select count(*) as count from buffered_events
+         where event_type in ('usage_rollout', 'usage_transcript')`,
+      ).get() as { count: number }).count,
+      usageRowsBeforeResolution,
+    );
+    assert.ok((occurrenceBuffer.database.prepare(
+      `select count(*) as count from rollout_scan_state`,
+    ).get() as { count: number }).count > 0);
+
+    const durableState = JSON.stringify(occurrenceBuffer.database.prepare(
+      `select parser_state_json as parserState from rollout_scan_state`,
+    ).all());
+    assert.equal(durableState.includes(cwdA), false);
+    assert.equal(durableState.includes(cwdB), false);
+    return {
+      rolloutCrossSliceContextIdPersisted: true,
+      rolloutPendingTokensBoundAtParseTime: true,
+      rolloutRepeatedCwdHasDistinctOccurrence: true,
+      rolloutReplayIdsStable: true,
+      transcriptSameMessageSameCwdStable: true,
+      transcriptDifferentCwdConflictUnknown: true,
+      transcriptZeroDeltaConflictDetected: true,
+      transcriptConflictCancelsChildInflight: true,
+      liveCoveredSessionConsumesNoChildCapacity: true,
+      resolverFailurePreservesTokensAndCursors: true,
+      rawCwdAbsentFromParserState: true,
+    };
+  } finally {
+    occurrenceBuffer.close();
+  }
+}
+
+async function proveResolvedTranscriptConflictIsTerminal() {
+  const root = path.join(tempDir, "resolved-transcript-context-conflict");
+  const transcriptRoot = path.join(root, "transcripts");
+  const transcriptProject = path.join(transcriptRoot, "project");
+  const cwdA = path.join(root, "repo-a");
+  const cwdB = path.join(root, "repo-b");
+  for (const [cwd, remote, head] of [
+    [cwdA, "https://example.invalid/team/resolved-a.git", "a".repeat(40)],
+    [cwdB, "https://example.invalid/team/resolved-b.git", "b".repeat(40)],
+  ] as const) {
+    fs.mkdirSync(path.join(cwd, ".git", "refs", "heads"), { recursive: true });
+    fs.writeFileSync(path.join(cwd, ".git", "HEAD"), "ref: refs/heads/main\n");
+    fs.writeFileSync(path.join(cwd, ".git", "refs", "heads", "main"), `${head}\n`);
+    fs.writeFileSync(
+      path.join(cwd, ".git", "config"),
+      `[remote "origin"]\n\turl = ${remote}\n`,
+    );
+  }
+  fs.mkdirSync(transcriptProject, { recursive: true });
+  const sessionId = "019e8000-0000-7000-8000-000000000099";
+  const messageId = "resolved-then-conflicting-message";
+  const transcriptFile = path.join(transcriptProject, `${sessionId}.jsonl`);
+  const usageLine = (input: number, cwd: string, timestamp: string) => JSON.stringify({
+    type: "assistant",
+    sessionId,
+    cwd,
+    timestamp,
+    message: {
+      id: messageId,
+      model: "claude-sonnet-4-20250514",
+      usage: { input_tokens: input, output_tokens: input / 10 },
+    },
+  });
+  fs.writeFileSync(
+    transcriptFile,
+    [
+      usageLine(10, cwdA, "2026-07-20T15:00:00.000Z"),
+      usageLine(20, cwdA, "2026-07-20T15:00:01.000Z"),
+    ].join("\n") + "\n",
+  );
+  const conflictBuffer = new LocalEventBuffer(path.join(root, "ledger.sqlite"), {
+    delivery: { enabled: true },
+  });
+  try {
+    conflictBuffer.beginChildRepoContextRun();
+    await new TranscriptTailer(conflictBuffer, transcriptRoot).scan({ scope: "full" });
+    const requests = conflictBuffer.finishChildRepoContextRun();
+    assert.equal(requests.length, 1);
+    const apply = conflictBuffer.applyRepoContextResults(resolveRepoContextRequests(requests));
+    assert.equal(apply.rowsFilled, 2);
+    const linkedBefore = conflictBuffer.database.prepare(
+      `select l.context_id as contextId, e.repo_hash as repoHash,
+         e.branch_hash as branchHash, e.head_sha as headSha
+       from buffered_events e left join repo_context_event_links l on l.event_id = e.id
+       where e.session_id = ? order by e.observed_at`,
+    ).all(sessionId) as Array<{
+      contextId: string | null;
+      repoHash: string | null;
+      branchHash: string | null;
+      headSha: string | null;
+    }>;
+    assert.equal(linkedBefore.length, 2);
+    assert.ok(linkedBefore.every((row) => row.contextId && row.repoHash && row.branchHash && row.headSha));
+
+    const lease = conflictBuffer.delivery.lease({ leaseId: "resolved-context-conflict-proof" });
+    assert.equal(lease.items.length, 2);
+    const sealedBefore = conflictBuffer.database.prepare(
+      `select delivery_id as deliveryId, sealed_envelope_json as sealed, attempt_count as attempts
+       from upload_outbox order by delivery_id`,
+    ).all() as Array<{ deliveryId: string; sealed: string; attempts: number }>;
+    assert.ok(sealedBefore.every((row) => row.sealed && row.attempts === 1));
+
+    fs.appendFileSync(
+      transcriptFile,
+      usageLine(20, cwdB, "2026-07-20T15:00:02.000Z") + "\n",
+    );
+    const zeroDeltaConflict = await new TranscriptTailer(
+      conflictBuffer,
+      transcriptRoot,
+    ).scan({ scope: "full" });
+    assert.equal(zeroDeltaConflict.eventsAppended, 0);
+    assert.deepEqual(conflictBuffer.drainRepoContextSuppressions(), {
+      contextsVisited: 1,
+      rowsVisited: 2,
+      rowsCleared: 2,
+    });
+    const sealedAfter = conflictBuffer.database.prepare(
+      `select delivery_id as deliveryId, sealed_envelope_json as sealed, attempt_count as attempts
+       from upload_outbox order by delivery_id`,
+    ).all() as Array<{ deliveryId: string; sealed: string; attempts: number }>;
+    assert.deepEqual(sealedAfter, sealedBefore, "attempted outbound bytes must remain immutable");
+
+    fs.appendFileSync(
+      transcriptFile,
+      usageLine(30, cwdA, "2026-07-20T15:00:03.000Z") + "\n",
+    );
+    await new TranscriptTailer(conflictBuffer, transcriptRoot).scan({ scope: "full" });
+    const terminalRows = conflictBuffer.database.prepare(
+      `select e.input_tokens as inputTokens, e.output_tokens as outputTokens,
+         l.context_id as contextId, e.repo_hash as repoHash,
+         e.branch_hash as branchHash, e.head_sha as headSha
+       from buffered_events e left join repo_context_event_links l on l.event_id = e.id
+       where e.session_id = ? order by e.observed_at`,
+    ).all(sessionId) as Array<{
+      inputTokens: number;
+      outputTokens: number;
+      contextId: string | null;
+      repoHash: string | null;
+      branchHash: string | null;
+      headSha: string | null;
+    }>;
+    assert.equal(terminalRows.length, 3);
+    assert.equal(terminalRows.reduce((sum, row) => sum + row.inputTokens, 0), 30);
+    assert.equal(terminalRows.reduce((sum, row) => sum + row.outputTokens, 0), 3);
+    assert.ok(terminalRows.every((row) =>
+      row.repoHash === null && row.branchHash === null && row.headSha === null
+    ));
+    assert.equal(terminalRows[0]!.contextId, terminalRows[1]!.contextId);
+    assert.equal(terminalRows[2]!.contextId, terminalRows[0]!.contextId);
+    assert.equal((conflictBuffer.database.prepare(
+      `select count(*) as count from repo_context_suppressions
+       where reason = 'transcript_context_conflict'`,
+    ).get() as { count: number }).count, 1);
+    assert.equal((conflictBuffer.database.prepare(
+      `select context_conflict as conflict from transcript_usage_revision_state
+       where session_id = ?`,
+    ).get(sessionId) as { conflict: number }).conflict, 1);
+    assert.deepEqual(conflictBuffer.drainRepoContextFills(), { rowsVisited: 0, rowsFilled: 0 });
+    const legacyDonor = aiInteractionEventSchema.parse({
+      id: deterministicEventId(["resolved-conflict-legacy-donor", sessionId]),
+      source: "codex",
+      dataMode: "metadata",
+      eventType: "assistant_response",
+      observedAt: "2026-07-20T15:00:04.000Z",
+      sessionId,
+      inputTokens: 1,
+      outputTokens: 1,
+      actionClass: "other",
+      metadata: {
+        git: {
+          remoteUrlHash: remoteLinkageHash("https://example.invalid/conflict-donor.git"),
+        },
+      },
+    });
+    conflictBuffer.append(legacyDonor);
+    runRepoEnrichmentMaintenance(conflictBuffer.database, {
+      legacyBackfillLimit: 32,
+      sessionLimit: 8,
+      eventLimit: 32,
+    });
+    const exactRowsAfterLegacyStitch = conflictBuffer.database.prepare(
+      `select e.repo_hash as repoHash
+       from buffered_events e join repo_context_event_links l on l.event_id = e.id
+       where e.session_id = ? and e.event_type = 'usage_transcript'`,
+    ).all(sessionId) as Array<{ repoHash: string | null }>;
+    assert.equal(exactRowsAfterLegacyStitch.length, 3);
+    assert.ok(exactRowsAfterLegacyStitch.every((row) => row.repoHash === null));
+    return {
+      priorResolvedRowsReturnedToUnknown: true,
+      laterRevisionsRemainUnknown: true,
+      tokenTruthPreserved: true,
+      attemptedOutboundBytesImmutable: true,
+      suppressionTombstoneDurable: true,
+      terminalContextExcludedFromLegacyStitching: true,
+    };
+  } finally {
+    conflictBuffer.close();
+  }
+}
+
 function proveNanosecondGenerationIdentity() {
   const identityBuffer = new LocalEventBuffer(
     path.join(tempDir, "nanosecond-generation-ledger.sqlite"),
@@ -885,6 +1304,8 @@ async function main() {
     const transcript = await proveTranscriptTailing();
     const parseFailureDurability = await proveParseFailuresRemainUnresolved();
     const transcriptChunkParity = await proveTranscriptChunkParity();
+    const deferredRepoContextOccurrences = await proveDeferredRepoContextOccurrences();
+    const resolvedTranscriptConflict = await proveResolvedTranscriptConflictIsTerminal();
     const nanosecondGenerationIdentity = proveNanosecondGenerationIdentity();
 
     const persistedEvents = JSON.stringify(
@@ -944,6 +1365,8 @@ async function main() {
           rollout,
           transcript,
           transcriptChunkParity,
+          deferredRepoContextOccurrences,
+          resolvedTranscriptConflict,
           nanosecondGenerationIdentity,
           parseFailureDurability,
           privacy: {

@@ -1,9 +1,16 @@
 import type { CollectorMaintenanceRunResult, MaintenanceRunOutcome } from "./maintenance";
 import type { MaintenanceProgress, MaintenanceProgressStage } from "./maintenance-progress";
+import {
+  validRepoContextRequest,
+  validRepoContextResult,
+  type RepoContextRequest,
+  type RepoContextResult,
+} from "./repo-context";
 
-export const MAINTENANCE_PROTOCOL_SCHEMA = 1 as const;
+export const MAINTENANCE_PROTOCOL_SCHEMA = 2 as const;
 export const MAINTENANCE_PROTOCOL_MAX_BYTES = 64 * 1024;
 export const MAINTENANCE_PROTOCOL_MAX_FRAMES_PER_JOB = 128;
+export const MAINTENANCE_PROTOCOL_MAX_REPO_CONTEXTS = 8;
 
 export type MaintenanceRunRequest = {
   schema: typeof MAINTENANCE_PROTOCOL_SCHEMA;
@@ -12,6 +19,7 @@ export type MaintenanceRunRequest = {
   nonce: string;
   deadlineMs: number;
   quarantine: MaintenanceProgress | null;
+  repoContexts: RepoContextRequest[];
 };
 
 export type MaintenanceShutdownRequest = {
@@ -46,6 +54,7 @@ export type MaintenanceResultReceipt = {
   nonce: string;
   sequence: number;
   result: MaintenanceRunOutcome;
+  repoContexts: RepoContextResult[];
 };
 
 export type MaintenanceErrorReceipt = {
@@ -140,6 +149,41 @@ function parseProgress(value: unknown): MaintenanceProgress | null {
   };
 }
 
+function parseRepoContextRequests(value: unknown): RepoContextRequest[] | null {
+  if (!Array.isArray(value) || value.length > MAINTENANCE_PROTOCOL_MAX_REPO_CONTEXTS) return null;
+  const parsed: RepoContextRequest[] = [];
+  const ids = new Set<string>();
+  for (const candidate of value) {
+    if (!validRepoContextRequest(candidate) || ids.has(candidate.contextId)) return null;
+    ids.add(candidate.contextId);
+    parsed.push({
+      contextId: candidate.contextId,
+      source: candidate.source,
+      cwd: candidate.cwd,
+    });
+  }
+  return parsed;
+}
+
+function parseRepoContextResults(value: unknown): RepoContextResult[] | null {
+  if (!Array.isArray(value) || value.length > MAINTENANCE_PROTOCOL_MAX_REPO_CONTEXTS) return null;
+  const parsed: RepoContextResult[] = [];
+  const ids = new Set<string>();
+  for (const candidate of value) {
+    if (!validRepoContextResult(candidate) || ids.has(candidate.contextId)) return null;
+    ids.add(candidate.contextId);
+    parsed.push({
+      contextId: candidate.contextId,
+      repoHash: candidate.repoHash,
+      branchHash: candidate.branchHash,
+      headSha: candidate.headSha,
+      resolvedAt: candidate.resolvedAt,
+      resolverVersion: candidate.resolverVersion,
+    });
+  }
+  return parsed;
+}
+
 export function parseMaintenanceWorkerRequest(value: unknown): MaintenanceWorkerRequest | null {
   if (!boundedFrame(value) || !value || typeof value !== "object") return null;
   const row = value as Record<string, unknown>;
@@ -165,7 +209,15 @@ export function parseMaintenanceWorkerRequest(value: unknown): MaintenanceWorker
   }
   if (
     row.type !== "run" ||
-    !exactKeys(row, ["schema", "type", "generation", "nonce", "deadlineMs", "quarantine"]) ||
+    !exactKeys(row, [
+      "schema",
+      "type",
+      "generation",
+      "nonce",
+      "deadlineMs",
+      "quarantine",
+      "repoContexts",
+    ]) ||
     !validGeneration(row.generation) ||
     !Number.isSafeInteger(row.deadlineMs) ||
     Number(row.deadlineMs) < 1 ||
@@ -173,6 +225,8 @@ export function parseMaintenanceWorkerRequest(value: unknown): MaintenanceWorker
   ) return null;
   const quarantine = row.quarantine === null ? null : parseProgress(row.quarantine);
   if (row.quarantine !== null && !quarantine) return null;
+  const repoContexts = parseRepoContextRequests(row.repoContexts);
+  if (!repoContexts) return null;
   return {
     schema: MAINTENANCE_PROTOCOL_SCHEMA,
     type: "run",
@@ -180,6 +234,7 @@ export function parseMaintenanceWorkerRequest(value: unknown): MaintenanceWorker
     nonce: row.nonce as string,
     deadlineMs: Number(row.deadlineMs),
     quarantine,
+    repoContexts,
   };
 }
 
@@ -268,10 +323,27 @@ export function parseMaintenanceWorkerReceipt(value: unknown): MaintenanceWorker
   }
   if (!validGeneration(row.generation) || !validNonce(row.nonce)) return null;
   if (row.type === "result") {
-    if (!exactKeys(row, ["schema", "type", "generation", "nonce", "sequence", "result"]) || !validGeneration(row.sequence)) return null;
+    if (!exactKeys(row, [
+      "schema",
+      "type",
+      "generation",
+      "nonce",
+      "sequence",
+      "result",
+      "repoContexts",
+    ]) || !validGeneration(row.sequence)) return null;
     const result = parseMaintenanceResult(row.result);
-    if (!result) return null;
-    return { schema: MAINTENANCE_PROTOCOL_SCHEMA, type: "result", generation: Number(row.generation), nonce: row.nonce as string, sequence: Number(row.sequence), result };
+    const repoContexts = parseRepoContextResults(row.repoContexts);
+    if (!result || !repoContexts) return null;
+    return {
+      schema: MAINTENANCE_PROTOCOL_SCHEMA,
+      type: "result",
+      generation: Number(row.generation),
+      nonce: row.nonce as string,
+      sequence: Number(row.sequence),
+      result,
+      repoContexts,
+    };
   }
   if (row.type === "progress") {
     if (!exactKeys(row, ["schema", "type", "generation", "nonce", "sequence", "stage", "source", "candidateHash"]) || !validGeneration(row.sequence)) return null;

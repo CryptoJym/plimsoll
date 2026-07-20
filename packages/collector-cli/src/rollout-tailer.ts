@@ -3,7 +3,11 @@ import os from "node:os";
 import path from "node:path";
 
 import type { LocalEventBuffer } from "./buffer";
-import { resolveGitContext } from "./git-context";
+import {
+  attachRepoContextId,
+  validRepoContextId,
+  type RepoContextRequest,
+} from "./repo-context";
 import {
   DEFAULT_JSONL_TAILER_IO,
   ensureJsonlScanState,
@@ -119,14 +123,6 @@ export type RolloutScanOptions = {
   deferredBeforeIo?: boolean;
 };
 
-type PersistedGitContext = {
-  remoteUrlHash?: string;
-  branchHash?: string;
-  headSha?: string;
-};
-
-type PreparedGitContexts = ReadonlyMap<string, PersistedGitContext | undefined>;
-
 type RolloutParserState = {
   parserKind: "codex-rollout-v2";
   checkpointVersion: 2;
@@ -138,7 +134,8 @@ type RolloutParserState = {
   planType?: string;
   previous: TokenTotals;
   tokenCountIndex: number;
-  git?: PersistedGitContext;
+  contextOccurrenceIndex: number;
+  activeRepoContextId?: string;
 };
 
 const PARSER_KIND = "codex-rollout-v2";
@@ -185,6 +182,10 @@ function validateRolloutParserState(value: unknown): RolloutParserState | undefi
       "planType",
       "previous",
       "tokenCountIndex",
+      "contextOccurrenceIndex",
+      "activeRepoContextId",
+      // Accepted only to migrate old checkpoints without rebuilding or
+      // carrying their parser-wide attribution forward.
       "git",
     ])
   ) {
@@ -201,6 +202,16 @@ function validateRolloutParserState(value: unknown): RolloutParserState | undefi
   ) {
     return undefined;
   }
+  const contextOccurrenceIndex = value.contextOccurrenceIndex === undefined
+    ? -1
+    : value.contextOccurrenceIndex;
+  if (
+    typeof contextOccurrenceIndex !== "number" ||
+    !Number.isSafeInteger(contextOccurrenceIndex) ||
+    contextOccurrenceIndex < -1
+  ) {
+    return undefined;
+  }
   const conversationId = optionalString(value.conversationId);
   const sessionStartedAt = optionalString(value.sessionStartedAt);
   const originator = optionalString(value.originator);
@@ -211,21 +222,26 @@ function validateRolloutParserState(value: unknown): RolloutParserState | undefi
     return undefined;
   }
   if (conversationId && !UUID_EXACT_RE.test(conversationId)) return undefined;
-  const git = validatePersistedGit(value.git);
-  if (value.git !== undefined && !git) return undefined;
+  if (value.git !== undefined && !validLegacyPersistedGit(value.git)) return undefined;
+  if (value.activeRepoContextId !== undefined && !validRepoContextId(value.activeRepoContextId)) {
+    return undefined;
+  }
 
   return {
     parserKind: PARSER_KIND,
     checkpointVersion: CHECKPOINT_VERSION,
     previous: { ...value.previous },
     tokenCountIndex: value.tokenCountIndex,
+    contextOccurrenceIndex,
     ...(conversationId ? { conversationId: conversationId.toLowerCase() } : {}),
     ...(sessionStartedAt ? { sessionStartedAt } : {}),
     ...(originator ? { originator } : {}),
     ...(cliVersion ? { cliVersion } : {}),
     ...(model ? { model } : {}),
     ...(planType ? { planType } : {}),
-    ...(git ? { git } : {}),
+    ...(typeof value.activeRepoContextId === "string"
+      ? { activeRepoContextId: value.activeRepoContextId }
+      : {}),
   };
 }
 
@@ -243,18 +259,13 @@ function isTokenTotals(value: unknown): value is TokenTotals {
   });
 }
 
-function validatePersistedGit(value: unknown): PersistedGitContext | undefined {
-  if (!isRecord(value)) return undefined;
-  if (!hasOnlyKeys(value, ["remoteUrlHash", "branchHash", "headSha"])) return undefined;
-  for (const key of ["remoteUrlHash", "branchHash", "headSha"] as const) {
-    if (value[key] !== undefined && typeof value[key] !== "string") return undefined;
+function validLegacyPersistedGit(value: unknown) {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["remoteUrlHash", "branchHash", "headSha"])) {
+    return false;
   }
-  const git = {
-    ...(typeof value.remoteUrlHash === "string" ? { remoteUrlHash: value.remoteUrlHash } : {}),
-    ...(typeof value.branchHash === "string" ? { branchHash: value.branchHash } : {}),
-    ...(typeof value.headSha === "string" ? { headSha: value.headSha } : {}),
-  };
-  return git.remoteUrlHash || git.branchHash || git.headSha ? git : undefined;
+  return ["remoteUrlHash", "branchHash", "headSha"].every(
+    (key) => value[key] === undefined || typeof value[key] === "string",
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -789,24 +800,16 @@ export class RolloutTailer {
           const initialState = read.reset || !cursor?.parserState
             ? this.initialParserState(candidate.file)
             : cursor.parserState;
-          // User-controlled paths must be resolved before SQLite acquires its
-          // write lock. Validate the open rollout generation on both sides of
-          // metadata preparation so a changed source never advances a cursor.
+          // Git work is deferred until after capture. Validate the open
+          // generation immediately before the event/cursor transaction so a
+          // changed source never advances durable truth.
           if (options.onProgress?.({ stage: "jsonl_validation", candidateHash }) === false) {
             validationDeferred = true;
             throw new Error("maintenance_progress_budget_exhausted");
           }
-          read.assertStableForCommit();
           const fallbackObservedAt = this.fallbackObservedAt(read.mtimeMs);
-          const gitContexts = read.unresolvedRecord
-            ? new Map<string, PersistedGitContext | undefined>()
-            : this.prepareGitContexts(read.lines, options);
-          if (options.onProgress?.({ stage: "jsonl_validation", candidateHash }) === false) {
-            validationDeferred = true;
-            throw new Error("maintenance_progress_budget_exhausted");
-          }
           read.assertStableForCommit();
-          this.buffer.database.transaction(() => {
+          this.buffer.transactionWithRepoContextHandoffs(() => {
             if (read.unresolvedRecord) {
               rememberJsonlScanCursor(
                 this.buffer.database,
@@ -824,7 +827,7 @@ export class RolloutTailer {
               result,
               initialState,
               fallbackObservedAt,
-              gitContexts,
+              read.fileIdentity,
             );
             if (result.parseErrors !== parseErrorsBefore) {
               parseFailure = true;
@@ -838,7 +841,7 @@ export class RolloutTailer {
               read,
               parserState,
             );
-          })();
+          });
           committed = true;
           // Only a durable cursor commit transfers ownership away from the
           // active discovery attempt. Validation deferral keeps it pending.
@@ -1086,21 +1089,8 @@ export class RolloutTailer {
       conversationId: conversationIdFromFilename(file),
       previous: { ...ZERO },
       tokenCountIndex: -1,
+      contextOccurrenceIndex: -1,
     };
-  }
-
-  private safeGitContext(cwd: string): PersistedGitContext | undefined {
-    const git = resolveGitContext(cwd);
-    if (git?.remoteUrlHash && git.remoteLabel) {
-      this.buffer.recordRepoLabel(git.remoteUrlHash, git.remoteLabel);
-    }
-    if (!git) return undefined;
-    const safe = {
-      remoteUrlHash: git.remoteUrlHash,
-      branchHash: git.branchHash,
-      headSha: git.headSha,
-    };
-    return safe.remoteUrlHash || safe.branchHash || safe.headSha ? safe : undefined;
   }
 
   private fallbackObservedAt(mtimeMs: number) {
@@ -1110,48 +1100,45 @@ export class RolloutTailer {
       : new Date().toISOString();
   }
 
-  /**
-   * Resolve every Git working directory before entering the cursor/event
-   * transaction. Malformed lines remain the parser's responsibility; this
-   * pass only discovers valid metadata paths and never reads message content.
-   */
-  private prepareGitContexts(lines: string[], options: RolloutScanOptions): PreparedGitContexts {
-    const cwds = new Set<string>();
-    for (const line of lines) {
-      if (!line.includes('"session_meta"') && !line.includes('"turn_context"')) continue;
-      try {
-        const parsed = JSON.parse(line) as Record<string, unknown>;
-        if (parsed.type !== "session_meta" && parsed.type !== "turn_context") continue;
-        const payload = (parsed.payload ?? {}) as Record<string, unknown>;
-        if (typeof payload.cwd === "string") cwds.add(payload.cwd);
-      } catch {
-        // ingestLines records the parse failure inside the transaction.
-      }
-    }
-    return new Map([...cwds].map((cwd) => {
-      const candidateHash = maintenanceCandidateHash(cwd);
-      if (options.quarantine?.stage === "git_context" &&
-        options.quarantine.candidateHash === candidateHash) return [cwd, undefined] as const;
-      if (options.onProgress?.({ stage: "git_context", candidateHash }) === false) {
-        return [cwd, undefined] as const;
-      }
-      return [cwd, this.safeGitContext(cwd)] as const;
-    }));
-  }
-
   private ingestLines(
     lines: string[],
     result: RolloutScanResult,
     state: RolloutParserState,
     fallbackObservedAt: string,
-    gitContexts: PreparedGitContexts,
+    fileIdentity: string,
   ) {
+    type ActiveContext =
+      | { kind: "persisted"; contextId: string }
+      | { kind: "request"; request: RepoContextRequest }
+      | undefined;
     const pending: Array<{
       index: number;
       observedAt: string | undefined;
       delta: TokenTotals;
       model: string | undefined;
+      repoContext: ActiveContext;
     }> = [];
+    let activeRepoContext: ActiveContext = state.activeRepoContextId
+      ? { kind: "persisted", contextId: state.activeRepoContextId }
+      : undefined;
+
+    const observeContext = (
+      type: "session_meta" | "turn_context",
+      cwd: unknown,
+    ): ActiveContext => {
+      state.contextOccurrenceIndex += 1;
+      state.activeRepoContextId = undefined;
+      if (typeof cwd !== "string") return undefined;
+      const occurrence = [
+        "codex-rollout",
+        fileIdentity,
+        state.conversationId ?? "unknown",
+        type,
+        String(state.contextOccurrenceIndex),
+      ].join(":");
+      const request = this.buffer.repoContextOccurrenceRequest("codex", occurrence, cwd);
+      return request ? { kind: "request", request } : undefined;
+    };
 
     for (const line of lines) {
       // Privacy prefilter: message/reasoning lines are never JSON-parsed.
@@ -1174,12 +1161,12 @@ export class RolloutTailer {
         }
         if (typeof parsed.timestamp === "string") state.sessionStartedAt = parsed.timestamp;
         else if (typeof payload.timestamp === "string") state.sessionStartedAt = payload.timestamp as string;
-        if (typeof payload.cwd === "string") state.git = gitContexts.get(payload.cwd);
+        activeRepoContext = observeContext("session_meta", payload.cwd);
         if (typeof payload.originator === "string") state.originator = payload.originator;
         if (typeof payload.cli_version === "string") state.cliVersion = payload.cli_version;
       } else if (type === "turn_context") {
         if (typeof payload.model === "string" && payload.model) state.model = payload.model;
-        if (typeof payload.cwd === "string") state.git = gitContexts.get(payload.cwd);
+        activeRepoContext = observeContext("turn_context", payload.cwd);
       } else if (type === "event_msg" && payload.type === "token_count") {
         state.tokenCountIndex += 1;
         const info = (payload.info ?? {}) as Record<string, unknown>;
@@ -1195,15 +1182,45 @@ export class RolloutTailer {
           observedAt: typeof parsed.timestamp === "string" ? parsed.timestamp : undefined,
           delta,
           model: state.model,
+          repoContext: activeRepoContext,
         });
       }
     }
 
-    if (!state.conversationId || pending.length === 0) return state;
-    if (this.sessionHasNonRolloutTokens(state.conversationId)) {
-      result.sessionsSkippedOtlpCovered += 1;
+    const sessionCovered = state.conversationId
+      ? this.sessionHasNonRolloutTokens(state.conversationId)
+      : false;
+    if (sessionCovered) {
+      if (pending.length > 0) result.sessionsSkippedOtlpCovered += 1;
+      if (activeRepoContext?.kind === "request") state.activeRepoContextId = undefined;
       return state;
     }
+
+    // Only contexts that can affect a token or the next slice consume bounded
+    // resolver capacity. This prevents context-only amplification from
+    // displacing the final context that actually owns usage.
+    const requests = new Map<string, RepoContextRequest>();
+    for (const entry of pending) {
+      if (entry.repoContext?.kind === "request") {
+        requests.set(entry.repoContext.request.contextId, entry.repoContext.request);
+      }
+    }
+    if (activeRepoContext?.kind === "request") {
+      requests.set(activeRepoContext.request.contextId, activeRepoContext.request);
+    }
+    for (const request of requests.values()) {
+      this.buffer.stageRepoContextRequest(request);
+    }
+    if (activeRepoContext?.kind === "persisted") {
+      state.activeRepoContextId = activeRepoContext.contextId;
+    } else if (activeRepoContext?.kind === "request") {
+      // Persist the path-free occurrence identity even when resolver capacity
+      // rejects ownership. Later token rows then receive a terminal sidecar
+      // receipt and can never fall back into legacy session stitching.
+      state.activeRepoContextId = activeRepoContext.request.contextId;
+    }
+
+    if (!state.conversationId || pending.length === 0) return state;
     result.filesParsed += 1;
 
     // Identity window: only sessions that started at/after the current
@@ -1233,15 +1250,6 @@ export class RolloutTailer {
       if (state.planType) metadata.planType = state.planType;
       if (entry.delta.reasoningOutput > 0) metadata.reasoningOutputTokens = entry.delta.reasoningOutput;
       if (priced) metadata.costEstimated = true;
-      // Hashed linkage keys ONLY — GitLinkageContext.remoteLabel is local
-      // display data and must never enter event metadata (upload-proofed).
-      if (state.git) {
-        metadata.git = {
-          remoteUrlHash: state.git.remoteUrlHash,
-          branchHash: state.git.branchHash,
-          headSha: state.git.headSha,
-        };
-      }
 
       const event: AiInteractionEvent = aiInteractionEventSchema.parse({
         id: deterministicEventId(["codex-rollout", state.conversationId, String(entry.index)]),
@@ -1260,6 +1268,14 @@ export class RolloutTailer {
         costUsd: priced?.costUsd,
         metadata,
       });
+      const repoContextId = entry.repoContext?.kind === "persisted"
+        ? entry.repoContext.contextId
+        : entry.repoContext?.kind === "request"
+          ? entry.repoContext.request.contextId
+          : undefined;
+      if (repoContextId && !attachRepoContextId(event, repoContextId)) {
+        throw new Error("rollout_repo_context_binding_failed");
+      }
       const inserted = this.buffer.append(event, []);
       if (inserted) {
         result.eventsAppended += 1;

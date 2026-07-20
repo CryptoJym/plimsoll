@@ -120,6 +120,7 @@ import {
 import { computeCaptureHealth } from "../packages/collector-cli/src/health";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
+import { resolveRepoContextRequests } from "../packages/collector-cli/src/repo-context";
 import {
   runRepoEnrichmentMaintenance,
   runRepricingMaintenance,
@@ -150,6 +151,19 @@ type Check = { name: string; passed: boolean; detail: string };
 const checks: Check[] = [];
 function check(name: string, passed: boolean, detail: string | undefined) {
   checks.push({ name, passed, detail: detail ?? "(no detail)" });
+}
+
+function resolveDeferredRepoContexts(buffer: LocalEventBuffer) {
+  for (let batchIndex = 0; batchIndex < 32; batchIndex += 1) {
+    const pending = buffer.takeRepoContextBatch();
+    if (pending.length === 0) return;
+    const inflight = buffer.beginRepoContextResolution(pending);
+    const results = resolveRepoContextRequests(inflight, {
+      onRepoLabel: (repoHash, label) => buffer.recordRepoLabel(repoHash, label),
+    });
+    buffer.applyRepoContextResults(results);
+  }
+  throw new Error("deferred repo-context proof queue did not drain");
 }
 
 const SYSTEM_DATE_NOW = Date.now.bind(Date);
@@ -1481,6 +1495,7 @@ async function main() {
 
   const tailer = new RolloutTailer(buffer, rolloutDir, proofIdentities);
   const firstScan = await tailer.scan({ scope: "full" });
+  resolveDeferredRepoContexts(buffer);
   const rolloutRows = buffer.database
     .prepare(
       `select session_id as sessionId, model, input_tokens as inputTokens,
@@ -1793,6 +1808,7 @@ async function main() {
     tline({ type: "assistant", sessionId: SESSION, timestamp: "2026-06-10T10:00:00.000Z", message: { id: "msg_skip_1", model: "claude-fable-5", usage: { input_tokens: 999, output_tokens: 999 } } }) + "\n",
   );
   const transcriptScan = await new TranscriptTailer(buffer, projectsDir).scan({ scope: "full" });
+  resolveDeferredRepoContexts(buffer);
   const transcriptRows = buffer.database
     .prepare(
       `select session_id as sid, model, input_tokens as i, cache_read_tokens as c, output_tokens as o,

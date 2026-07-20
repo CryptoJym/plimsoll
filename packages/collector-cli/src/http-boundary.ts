@@ -9,7 +9,13 @@ export const LOCAL_HTTP_LIMITS = Object.freeze({
   jsonNodes: 100_000,
   otlpResources: 64,
   otlpScopes: 256,
-  otlpRecords: 2_048,
+  // Availability ceiling: the full synchronous normalize + durable append
+  // path remains comfortably inside the fixed 1.5 s request deadline on the
+  // supported canary hardware. Limit + 1 is rejected before normalization.
+  // One HTTP batch must fit the exact deferred-context ownership window. This
+  // keeps listener admission below the status-availability budget and makes
+  // 129+ a pre-write rejection rather than post-capture overflow work.
+  otlpRecords: 128,
   otlpAttributesPerContainer: 128,
   otlpAttributesTotal: 16_384,
   requestDeadlineMs: 1_500,

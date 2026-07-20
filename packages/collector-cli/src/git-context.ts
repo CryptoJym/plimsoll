@@ -160,14 +160,7 @@ function resolveRemoteUrl(commonDir: string): GitLookup<string | undefined> {
   return { kind: "ok", value: firstRemoteUrl };
 }
 
-export function resolveGitContext(cwd: string | undefined): GitLinkageContext | undefined {
-  if (!cwd || typeof cwd !== "string") return undefined;
-
-  const cached = cache.get(cwd);
-  if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
-    return cached.context;
-  }
-
+function resolveGitContextCore(cwd: string): GitLinkageContext | undefined {
   let context: GitLinkageContext | undefined;
   try {
     const located = findGitDir(cwd);
@@ -176,7 +169,6 @@ export function resolveGitContext(cwd: string | undefined): GitLinkageContext | 
       const head = resolveHead(gitDir, commonDir);
       const remote = resolveRemoteUrl(commonDir);
       if (head.kind !== "ok" || remote.kind !== "ok") {
-        cache.set(cwd, { at: Date.now(), context: undefined });
         return undefined;
       }
       const { ref, headSha } = head.value;
@@ -196,6 +188,34 @@ export function resolveGitContext(cwd: string | undefined): GitLinkageContext | 
     context = undefined;
   }
 
+  return context;
+}
+
+/**
+ * Deferred attribution owns a fixed transient queue and must never retain raw
+ * cwd strings in this module's compatibility cache. This entrypoint performs
+ * neither cache reads nor cache writes.
+ */
+export function resolveGitContextUncached(cwd: string | undefined): GitLinkageContext | undefined {
+  if (!cwd || typeof cwd !== "string") return undefined;
+  return resolveGitContextCore(cwd);
+}
+
+export function resolveGitContext(cwd: string | undefined): GitLinkageContext | undefined {
+  if (!cwd || typeof cwd !== "string") return undefined;
+
+  const cached = cache.get(cwd);
+  if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
+    return cached.context;
+  }
+
+  const context = resolveGitContextCore(cwd);
+
   cache.set(cwd, { at: Date.now(), context });
   return context;
+}
+
+/** Numeric-only proof seam. Raw cache keys and values remain inaccessible. */
+export function gitContextCacheSizeForProof() {
+  return cache.size;
 }

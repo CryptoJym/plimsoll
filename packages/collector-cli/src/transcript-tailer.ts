@@ -4,7 +4,11 @@ import os from "node:os";
 import path from "node:path";
 
 import type { LocalEventBuffer } from "./buffer";
-import { resolveGitContext } from "./git-context";
+import {
+  attachRepoContextId,
+  validRepoContextId,
+  type RepoContextRequest,
+} from "./repo-context";
 import {
   DEFAULT_JSONL_TAILER_IO,
   ensureJsonlScanState,
@@ -57,7 +61,8 @@ import {
  *    estimate is a floor — cacheCreationTokens rides metadata for later.
  *  - Privacy: lines are prefiltered (assistant + usage only); only numbers,
  *    ids, model and timestamps are persisted — never message content.
- *  - Repo linkage from the entry cwd via hashed git context.
+ *  - Repo linkage is occurrence-bound at capture and resolved only after the
+ *    token/cursor commit; raw cwd stays transient.
  *  - Identity: NOT stamped. Claude's local config has no login-window
  *    equivalent of codex's last_refresh, so history stays unattributed
  *    rather than guessed.
@@ -105,26 +110,23 @@ export type TranscriptScanResult = {
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
 const UUID_EXACT_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-type PersistedGitContext = {
-  remoteUrlHash?: string;
-  branchHash?: string;
-  headSha?: string;
-};
-
-type PreparedGitContexts = ReadonlyMap<string, PersistedGitContext | undefined>;
-
 type TranscriptParserState = {
   parserKind: "claude-transcript-v3";
   checkpointVersion: 3;
   sessionId?: string;
-  git?: PersistedGitContext;
   pending?: TranscriptPendingUsage;
   usageRevisions?: TranscriptUsageRevision[];
 };
 
 type TranscriptUsageRevision = Pick<
   TranscriptPendingUsage,
-  "messageId" | "input" | "cacheRead" | "cacheCreation" | "output"
+  | "messageId"
+  | "input"
+  | "cacheRead"
+  | "cacheCreation"
+  | "output"
+  | "repoContextId"
+  | "contextConflict"
 >;
 
 type TranscriptPendingUsage = {
@@ -135,6 +137,8 @@ type TranscriptPendingUsage = {
   cacheRead: number;
   cacheCreation: number;
   output: number;
+  repoContextId?: string;
+  contextConflict?: boolean;
 };
 
 const PARSER_KIND = "claude-transcript-v3";
@@ -165,8 +169,7 @@ function validateTranscriptParserState(value: unknown): TranscriptParserState | 
   if (value.sessionId !== undefined) {
     if (typeof value.sessionId !== "string" || !UUID_EXACT_RE.test(value.sessionId)) return undefined;
   }
-  const git = validatePersistedGit(value.git);
-  if (value.git !== undefined && !git) return undefined;
+  if (value.git !== undefined && !validLegacyPersistedGit(value.git)) return undefined;
   const pending = validatePendingUsage(value.pending);
   if (value.pending !== undefined && !pending) return undefined;
   const usageRevisions = validateUsageRevisions(value.usageRevisions);
@@ -175,7 +178,6 @@ function validateTranscriptParserState(value: unknown): TranscriptParserState | 
     parserKind: PARSER_KIND,
     checkpointVersion: CHECKPOINT_VERSION,
     ...(value.sessionId ? { sessionId: value.sessionId.toLowerCase() } : {}),
-    ...(git ? { git } : {}),
     ...(pending ? { pending } : {}),
     ...(usageRevisions?.length ? { usageRevisions } : {}),
   };
@@ -196,6 +198,8 @@ function validateUsageRevisions(value: unknown): TranscriptUsageRevision[] | und
       cacheRead: normalized.cacheRead,
       cacheCreation: normalized.cacheCreation,
       output: normalized.output,
+      ...(normalized.repoContextId ? { repoContextId: normalized.repoContextId } : {}),
+      ...(normalized.contextConflict ? { contextConflict: true } : {}),
     });
   }
   return revisions;
@@ -212,6 +216,8 @@ function validatePendingUsage(value: unknown): TranscriptPendingUsage | undefine
       "cacheRead",
       "cacheCreation",
       "output",
+      "repoContextId",
+      "contextConflict",
     ]) ||
     typeof value.messageId !== "string" ||
     value.messageId.length === 0 ||
@@ -224,6 +230,8 @@ function validatePendingUsage(value: unknown): TranscriptPendingUsage | undefine
   }
   if (value.observedAt !== undefined && typeof value.observedAt !== "string") return undefined;
   if (value.model !== undefined && typeof value.model !== "string") return undefined;
+  if (value.repoContextId !== undefined && !validRepoContextId(value.repoContextId)) return undefined;
+  if (value.contextConflict !== undefined && typeof value.contextConflict !== "boolean") return undefined;
   return {
     messageId: value.messageId,
     ...(typeof value.observedAt === "string" ? { observedAt: value.observedAt } : {}),
@@ -232,21 +240,18 @@ function validatePendingUsage(value: unknown): TranscriptPendingUsage | undefine
     cacheRead: Number(value.cacheRead),
     cacheCreation: Number(value.cacheCreation),
     output: Number(value.output),
+    ...(typeof value.repoContextId === "string" ? { repoContextId: value.repoContextId } : {}),
+    ...(value.contextConflict === true ? { contextConflict: true } : {}),
   };
 }
 
-function validatePersistedGit(value: unknown): PersistedGitContext | undefined {
-  if (!isRecord(value)) return undefined;
-  if (!hasOnlyKeys(value, ["remoteUrlHash", "branchHash", "headSha"])) return undefined;
-  for (const key of ["remoteUrlHash", "branchHash", "headSha"] as const) {
-    if (value[key] !== undefined && typeof value[key] !== "string") return undefined;
+function validLegacyPersistedGit(value: unknown) {
+  if (!isRecord(value) || !hasOnlyKeys(value, ["remoteUrlHash", "branchHash", "headSha"])) {
+    return false;
   }
-  const git = {
-    ...(typeof value.remoteUrlHash === "string" ? { remoteUrlHash: value.remoteUrlHash } : {}),
-    ...(typeof value.branchHash === "string" ? { branchHash: value.branchHash } : {}),
-    ...(typeof value.headSha === "string" ? { headSha: value.headSha } : {}),
-  };
-  return git.remoteUrlHash || git.branchHash || git.headSha ? git : undefined;
+  return ["remoteUrlHash", "branchHash", "headSha"].every(
+    (key) => value[key] === undefined || typeof value[key] === "string",
+  );
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -328,10 +333,26 @@ export class TranscriptTailer {
         cache_read_tokens integer not null check (cache_read_tokens >= 0),
         cache_creation_tokens integer not null check (cache_creation_tokens >= 0),
         output_tokens integer not null check (output_tokens >= 0),
+        repo_context_id text,
+        context_conflict integer not null default 0 check (context_conflict in (0, 1)),
         updated_at text not null,
         primary key (source, session_id, message_key)
       )
     `);
+    const revisionColumns = new Set(
+      (this.buffer.database.pragma("table_info(transcript_usage_revision_state)") as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    if (!revisionColumns.has("repo_context_id")) {
+      this.buffer.database.exec(
+        `alter table transcript_usage_revision_state add column repo_context_id text`,
+      );
+    }
+    if (!revisionColumns.has("context_conflict")) {
+      this.buffer.database.exec(
+        `alter table transcript_usage_revision_state add column context_conflict integer not null default 0`,
+      );
+    }
   }
 
   close() {
@@ -777,24 +798,16 @@ export class TranscriptTailer {
           const initialState = read.reset || !cursor?.parserState
             ? this.initialParserState(candidate.file)
             : cursor.parserState;
-          // Keep user-controlled path IO outside the SQLite write lock. A
-          // second validation after metadata preparation prevents a changed
-          // transcript generation from advancing its durable cursor.
+          // Repo-context preparation is filesystem-free. Git resolution is a
+          // post-commit maintenance phase, so a stalled resolver cannot make
+          // token or cursor truth disappear.
           if (options.onProgress?.({ stage: "jsonl_validation", candidateHash }) === false) {
             validationDeferred = true;
             throw new Error("maintenance_progress_budget_exhausted");
           }
-          read.assertStableForCommit();
           const fallbackObservedAt = this.fallbackObservedAt(read.mtimeMs);
-          const gitContexts = read.unresolvedRecord
-            ? new Map<string, PersistedGitContext | undefined>()
-            : this.prepareGitContexts(read.lines, options);
-          if (options.onProgress?.({ stage: "jsonl_validation", candidateHash }) === false) {
-            validationDeferred = true;
-            throw new Error("maintenance_progress_budget_exhausted");
-          }
           read.assertStableForCommit();
-          this.buffer.database.transaction(() => {
+          this.buffer.transactionWithRepoContextHandoffs(() => {
             if (read.unresolvedRecord) {
               rememberJsonlScanCursor(
                 this.buffer.database,
@@ -813,7 +826,6 @@ export class TranscriptTailer {
               initialState,
               !read.workRemaining && read.deferredBytes === 0,
               fallbackObservedAt,
-              gitContexts,
             );
             if (result.parseErrors !== parseErrorsBefore) {
               parseFailure = true;
@@ -827,7 +839,7 @@ export class TranscriptTailer {
               read,
               parserState,
             );
-          })();
+          });
           committed = true;
           consumeAutomaticFile(candidate.file);
           result.slicesCommitted += 1;
@@ -1032,50 +1044,11 @@ export class TranscriptTailer {
     };
   }
 
-  private safeGitContext(cwd: string): PersistedGitContext | undefined {
-    const git = resolveGitContext(cwd);
-    if (git?.remoteUrlHash && git.remoteLabel) {
-      this.buffer.recordRepoLabel(git.remoteUrlHash, git.remoteLabel);
-    }
-    if (!git) return undefined;
-    const safe = {
-      remoteUrlHash: git.remoteUrlHash,
-      branchHash: git.branchHash,
-      headSha: git.headSha,
-    };
-    return safe.remoteUrlHash || safe.branchHash || safe.headSha ? safe : undefined;
-  }
-
   private fallbackObservedAt(mtimeMs: number) {
     const observed = new Date(mtimeMs);
     return Number.isFinite(mtimeMs) && !Number.isNaN(observed.getTime())
       ? observed.toISOString()
       : new Date().toISOString();
-  }
-
-  /** Resolve assistant-entry Git metadata before the write transaction. */
-  private prepareGitContexts(lines: string[], options: TranscriptScanOptions): PreparedGitContexts {
-    const cwds = new Set<string>();
-    for (const line of lines) {
-      if (!line.includes('"assistant"') || !line.includes('"usage"')) continue;
-      try {
-        const parsed = JSON.parse(line) as Record<string, unknown>;
-        if (parsed.type === "assistant" && typeof parsed.cwd === "string") {
-          cwds.add(parsed.cwd);
-        }
-      } catch {
-        // ingestLines records the parse failure inside the transaction.
-      }
-    }
-    return new Map([...cwds].map((cwd) => {
-      const candidateHash = maintenanceCandidateHash(cwd);
-      if (options.quarantine?.stage === "git_context" &&
-        options.quarantine.candidateHash === candidateHash) return [cwd, undefined] as const;
-      if (options.onProgress?.({ stage: "git_context", candidateHash }) === false) {
-        return [cwd, undefined] as const;
-      }
-      return [cwd, this.safeGitContext(cwd)] as const;
-    }));
   }
 
   private ingestLines(
@@ -1084,7 +1057,6 @@ export class TranscriptTailer {
     state: TranscriptParserState,
     flushAtStableEof: boolean,
     fallbackObservedAt: string,
-    gitContexts: PreparedGitContexts,
   ) {
     // Upgrade an old v3 pending snapshot into the durable revision model
     // before processing new bytes. This keeps existing cursors compatible.
@@ -1093,6 +1065,10 @@ export class TranscriptTailer {
       delete state.pending;
       this.applyUsageRevision(state, pending, result, fallbackObservedAt);
     }
+    const parsedEntries: Array<{
+      usage: TranscriptPendingUsage;
+      repoContextRequest?: RepoContextRequest;
+    }> = [];
     for (const line of lines) {
       // Prefilter: only assistant entries with usage are ever parsed.
       if (!line.includes('"assistant"') || !line.includes('"usage"')) continue;
@@ -1107,7 +1083,6 @@ export class TranscriptTailer {
       if (!state.sessionId && typeof parsed.sessionId === "string") {
         state.sessionId = parsed.sessionId.match(UUID_RE)?.[0]?.toLowerCase();
       }
-      if (typeof parsed.cwd === "string") state.git = gitContexts.get(parsed.cwd);
       const message = (parsed.message ?? {}) as Record<string, unknown>;
       const usage = (message.usage ?? {}) as Record<string, unknown>;
       const messageId = typeof message.id === "string" ? message.id : undefined;
@@ -1125,7 +1100,37 @@ export class TranscriptTailer {
         cacheCreation: num("cache_creation_input_tokens"),
         output: num("output_tokens"),
       };
-      this.applyUsageRevision(state, next, result, fallbackObservedAt);
+      let repoContextRequest: RepoContextRequest | undefined;
+      if (state.sessionId && typeof parsed.cwd === "string") {
+        const occurrence = [
+          "claude-transcript",
+          state.sessionId,
+          this.messageKey(messageId),
+        ].join(":");
+        repoContextRequest = this.buffer.repoContextOccurrenceRequest(
+          "claude_code",
+          occurrence,
+          parsed.cwd,
+        ) ?? undefined;
+      }
+      parsedEntries.push({ usage: next, ...(repoContextRequest ? { repoContextRequest } : {}) });
+    }
+    const candidatesByMessage = new Map<string, Set<string>>();
+    for (const entry of parsedEntries) {
+      if (!entry.repoContextRequest) continue;
+      const ids = candidatesByMessage.get(entry.usage.messageId) ?? new Set<string>();
+      ids.add(entry.repoContextRequest.contextId);
+      candidatesByMessage.set(entry.usage.messageId, ids);
+    }
+    for (const entry of parsedEntries) {
+      this.applyUsageRevision(
+        state,
+        entry.usage,
+        result,
+        fallbackObservedAt,
+        entry.repoContextRequest,
+        (candidatesByMessage.get(entry.usage.messageId)?.size ?? 0) > 1,
+      );
     }
     void flushAtStableEof;
     return state;
@@ -1136,6 +1141,8 @@ export class TranscriptTailer {
     entry: TranscriptPendingUsage,
     result: TranscriptScanResult,
     fallbackObservedAt: string,
+    repoContextRequest?: RepoContextRequest,
+    forceContextConflict = false,
   ) {
     if (!state.sessionId) {
       result.parseErrors += 1;
@@ -1168,6 +1175,20 @@ export class TranscriptTailer {
       cacheCreation: entry.cacheCreation - (previous?.cacheCreation ?? 0),
       output: entry.output - (previous?.output ?? 0),
     };
+    const priorContextId = previous?.repoContextId;
+    const candidateContextId = repoContextRequest?.contextId;
+    const contextConflict = Boolean(
+      previous?.contextConflict ||
+      forceContextConflict ||
+      (priorContextId && candidateContextId && priorContextId !== candidateContextId),
+    );
+    const repoContextId = priorContextId ?? candidateContextId;
+    if (contextConflict && !previous?.contextConflict && repoContextId) {
+      this.buffer.suppressRepoContextId(repoContextId);
+    }
+    if (!contextConflict && repoContextRequest) {
+      this.buffer.stageRepoContextRequest(repoContextRequest);
+    }
     state.usageRevisions = [
       ...revisions.filter((candidate) => candidate.messageId !== entry.messageId),
       {
@@ -1176,18 +1197,23 @@ export class TranscriptTailer {
         cacheRead: entry.cacheRead,
         cacheCreation: entry.cacheCreation,
         output: entry.output,
+        ...(repoContextId ? { repoContextId } : {}),
+        ...(contextConflict ? { contextConflict: true } : {}),
       },
     ].slice(-64);
     this.buffer.database.prepare(
       `insert into transcript_usage_revision_state (
          source, session_id, message_key, input_tokens, cache_read_tokens,
-         cache_creation_tokens, output_tokens, updated_at
-       ) values ('claude_code', ?, ?, ?, ?, ?, ?, ?)
+         cache_creation_tokens, output_tokens, repo_context_id,
+         context_conflict, updated_at
+       ) values ('claude_code', ?, ?, ?, ?, ?, ?, ?, ?, ?)
        on conflict(source, session_id, message_key) do update set
          input_tokens = excluded.input_tokens,
          cache_read_tokens = excluded.cache_read_tokens,
          cache_creation_tokens = excluded.cache_creation_tokens,
          output_tokens = excluded.output_tokens,
+         repo_context_id = excluded.repo_context_id,
+         context_conflict = excluded.context_conflict,
          updated_at = excluded.updated_at`,
     ).run(
       state.sessionId,
@@ -1196,6 +1222,8 @@ export class TranscriptTailer {
       entry.cacheRead,
       entry.cacheCreation,
       entry.output,
+      repoContextId ?? null,
+      contextConflict ? 1 : 0,
       new Date().toISOString(),
     );
     if (delta.input === 0 && delta.output === 0 && delta.cacheRead === 0 && delta.cacheCreation === 0) return;
@@ -1209,13 +1237,6 @@ export class TranscriptTailer {
     });
     const metadata: Record<string, unknown> = { usageSource: "transcript" };
     if (priced) metadata.costEstimated = true;
-    if (state.git) {
-      metadata.git = {
-        remoteUrlHash: state.git.remoteUrlHash,
-        branchHash: state.git.branchHash,
-        headSha: state.git.headSha,
-      };
-    }
     const event: AiInteractionEvent = aiInteractionEventSchema.parse({
       id: previous
         ? deterministicEventId([
@@ -1243,6 +1264,12 @@ export class TranscriptTailer {
       costUsd: priced?.costUsd,
       metadata,
     });
+    // The context id is path-free exclusion evidence even when terminally
+    // conflicted or not admitted for resolution. Binding it prevents exact
+    // UNKNOWN rows from re-entering legacy session stitching.
+    if (repoContextId && !attachRepoContextId(event, repoContextId)) {
+      throw new Error("transcript_repo_context_binding_failed");
+    }
     const inserted = this.buffer.append(event, []);
     if (inserted) {
       result.eventsAppended += 1;
@@ -1285,11 +1312,26 @@ export class TranscriptTailer {
   private durableUsageRevision(sessionId: string, messageId: string): TranscriptUsageRevision | undefined {
     const row = this.buffer.database.prepare(
       `select input_tokens as input, cache_read_tokens as cacheRead,
-         cache_creation_tokens as cacheCreation, output_tokens as output
+         cache_creation_tokens as cacheCreation, output_tokens as output,
+         repo_context_id as repoContextId, context_conflict as contextConflict
        from transcript_usage_revision_state
        where source = 'claude_code' and session_id = ? and message_key = ?`,
-    ).get(sessionId, this.messageKey(messageId)) as Omit<TranscriptUsageRevision, "messageId"> | undefined;
-    return row ? { messageId, ...row } : undefined;
+    ).get(sessionId, this.messageKey(messageId)) as
+      | (Omit<TranscriptUsageRevision, "messageId" | "contextConflict"> & {
+          contextConflict: number;
+        })
+      | undefined;
+    return row
+      ? {
+          messageId,
+          input: row.input,
+          cacheRead: row.cacheRead,
+          cacheCreation: row.cacheCreation,
+          output: row.output,
+          ...(row.repoContextId ? { repoContextId: row.repoContextId } : {}),
+          ...(row.contextConflict === 1 ? { contextConflict: true } : {}),
+        }
+      : undefined;
   }
 
   private messageKey(messageId: string) {

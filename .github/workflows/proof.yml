@@ -56,6 +56,12 @@ jobs:
       - name: Prove bounded nonblocking Git metadata maintenance
         run: pnpm proof:git-context
 
+      - name: Prove deferred repository context transaction and privacy bounds
+        run: pnpm proof:repo-context
+
+      - name: Prove incremental tailer context and cursor semantics
+        run: pnpm proof:incremental-capture
+
       - name: Prove local HTTP trust boundary
         run: pnpm proof:http-boundary
 

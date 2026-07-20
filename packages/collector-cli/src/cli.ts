@@ -1095,6 +1095,9 @@ async function main() {
     // This connection owns the HTTP event loop. Never inherit better-sqlite3's
     // five-second busy wait when the maintenance child briefly owns a writer.
     const buffer = openBuffer(config, false, 0);
+    // Runtime ownership is already proven above. Recover ID-only handoff and
+    // inflight receipts once, before intake or the child can create live work.
+    buffer.recoverRepoContextState();
     let scheduler: CoalescingMaintenanceScheduler<MaintenanceRunOutcome> | undefined;
     let maintenanceCadence: AutomaticMaintenanceCadence<MaintenanceRunOutcome> | undefined;
     let cachedBaseline = captureBaselineStatus(buffer.database);
@@ -1264,7 +1267,42 @@ async function main() {
     // Later automatic cadences tail only new generations within hard work
     // limits; full history remains an explicit operator command.
     scheduler = new CoalescingMaintenanceScheduler(async () => {
-      const result = await maintenanceBoundary.run();
+      const drainedRepoContexts = buffer.takeRepoContextBatch();
+      const repoContexts = buffer.beginRepoContextResolution(drainedRepoContexts);
+      let result: MaintenanceRunOutcome;
+      try {
+        result = await maintenanceBoundary.run({
+          repoContexts,
+          onRepoContexts: (resolved) => {
+            buffer.applyRepoContextResults(resolved);
+          },
+        });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : "";
+        const boundaryUnavailable = new Set([
+          "maintenance_boundary_stopping",
+          "maintenance_circuit_open",
+          "maintenance_child_not_reaped",
+          "maintenance_job_already_in_flight",
+          "maintenance_worker_spawn_failed",
+          "maintenance_worker_unavailable",
+          "maintenance_child_not_ready",
+          "maintenance_worker_ready_timeout",
+          "maintenance_ready_pid_mismatch",
+          "maintenance_send_failed",
+          "maintenance_repo_context_prepare_failed",
+        ]).has(message);
+        try {
+          buffer.failRepoContextRun(
+            repoContexts,
+            boundaryUnavailable ? "boundary_unavailable" : "worker_crash",
+          );
+        } catch {
+          // Preserve the boundary's literal failure. Parent startup remains
+          // the final recovery boundary without exposing any raw cwd.
+        }
+        throw error;
+      }
       try {
         cachedBaseline = captureBaselineStatus(buffer.database);
       } catch {

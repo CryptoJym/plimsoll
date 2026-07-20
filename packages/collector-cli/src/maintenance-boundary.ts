@@ -6,11 +6,17 @@ import type { MaintenanceProgress } from "./maintenance-progress";
 import {
   MAINTENANCE_PROTOCOL_MAX_BYTES,
   MAINTENANCE_PROTOCOL_MAX_FRAMES_PER_JOB,
+  MAINTENANCE_PROTOCOL_MAX_REPO_CONTEXTS,
   MAINTENANCE_PROTOCOL_SCHEMA,
   maintenanceProtocolFrameBytes,
   parseMaintenanceWorkerReceipt,
   type MaintenanceWorkerReceipt,
 } from "./maintenance-protocol";
+import {
+  validRepoContextRequest,
+  type RepoContextRequest,
+  type RepoContextResult,
+} from "./repo-context";
 
 export type MaintenanceBoundaryState =
   | "ready"
@@ -112,6 +118,14 @@ type ActiveJob = {
   reject: (error: Error) => void;
   settled: boolean;
   nextSequence: number;
+  expectedRepoContextIds: string[];
+  onRepoContexts?: (results: RepoContextResult[]) => void;
+};
+
+export type MaintenanceBoundaryRunOptions = {
+  repoContexts?: RepoContextRequest[];
+  onRepoContextsAccepted?: () => void;
+  onRepoContexts?: (results: RepoContextResult[]) => void;
 };
 
 function iso(ms: number | null) {
@@ -287,7 +301,7 @@ export class MaintenanceProcessBoundary {
     };
   }
 
-  async run(): Promise<MaintenanceRunOutcome> {
+  async run(options: MaintenanceBoundaryRunOptions = {}): Promise<MaintenanceRunOutcome> {
     if (!this.accepting) throw new Error("maintenance_boundary_stopping");
     if (this.runReserved || this.active) throw new Error("maintenance_job_already_in_flight");
     if (this.terminating || this.orphanRisk) throw new Error("maintenance_child_not_reaped");
@@ -306,6 +320,19 @@ export class MaintenanceProcessBoundary {
       this.quarantineUntilMs = null;
       this.quarantine = null;
     }
+    const suppliedRepoContexts = options.repoContexts ?? [];
+    const contextIds = new Set<string>();
+    if (!Array.isArray(suppliedRepoContexts) ||
+      suppliedRepoContexts.length > MAINTENANCE_PROTOCOL_MAX_REPO_CONTEXTS) {
+      throw new Error("maintenance_repo_context_request_invalid");
+    }
+    for (const request of suppliedRepoContexts) {
+      if (!validRepoContextRequest(request) || contextIds.has(request.contextId)) {
+        throw new Error("maintenance_repo_context_request_invalid");
+      }
+      contextIds.add(request.contextId);
+    }
+    const repoContexts = suppliedRepoContexts.map((request) => ({ ...request }));
     this.runReserved = true;
     let job!: Promise<MaintenanceRunOutcome>;
     try {
@@ -316,6 +343,11 @@ export class MaintenanceProcessBoundary {
         throw new Error("maintenance_worker_unavailable");
       }
 
+      try {
+        options.onRepoContextsAccepted?.();
+      } catch {
+        throw new Error("maintenance_repo_context_prepare_failed");
+      }
       const generation = ++this.generation;
       const nonce = randomUUID();
       const startedAtMs = this.now();
@@ -337,16 +369,24 @@ export class MaintenanceProcessBoundary {
           reject,
           settled: false,
           nextSequence: 1,
+          expectedRepoContextIds: [...contextIds].sort(),
+          onRepoContexts: options.onRepoContexts,
         };
         try {
-          this.child!.send({
+          const request = {
             schema: MAINTENANCE_PROTOCOL_SCHEMA,
             type: "run",
             generation,
             nonce,
             deadlineMs: this.deadlineMs(),
             quarantine: this.quarantine,
-          });
+            repoContexts,
+          } as const;
+          if (maintenanceProtocolFrameBytes(request) > MAINTENANCE_PROTOCOL_MAX_BYTES) {
+            void this.failActive("maintenance_protocol_request_oversized", false);
+            return;
+          }
+          this.child!.send(request);
         } catch {
           void this.failActive("maintenance_send_failed", false);
         }
@@ -529,6 +569,23 @@ export class MaintenanceProcessBoundary {
     }
     if (receipt.type === "error") {
       void this.failActive(receipt.reason, false);
+      return;
+    }
+    const receivedContextIds = receipt.repoContexts.map((result) => result.contextId).sort();
+    if (
+      receivedContextIds.length !== active.expectedRepoContextIds.length ||
+      receivedContextIds.some((contextId, index) => (
+        contextId !== active.expectedRepoContextIds[index]
+      ))
+    ) {
+      this.invalidFrames += 1;
+      void this.failActive("maintenance_repo_context_result_mismatch", false);
+      return;
+    }
+    try {
+      active.onRepoContexts?.(receipt.repoContexts);
+    } catch {
+      void this.failActive("maintenance_repo_context_apply_failed", false);
       return;
     }
     active.settled = true;
