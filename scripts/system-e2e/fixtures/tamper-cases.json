@@ -122,6 +122,12 @@
       "expectedError": "committed artifact contract mismatch"
     },
     {
+      "id": "unload_terminal_truth",
+      "mutations": [{ "pointer": "/flow/phaseChain/5/artifact/ok", "replacement": false }],
+      "resign": true,
+      "expectedError": "committed artifact contract mismatch"
+    },
+    {
       "id": "phase_receipt_field_missing",
       "mutations": [{ "pointer": "/flow/phaseChain/0/semanticDigest", "remove": true }],
       "resign": false,
@@ -171,7 +177,8 @@
         { "pointer": "/flow/phaseChain/1/sourceHeadCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" },
         { "pointer": "/flow/phaseChain/2/sourceHeadCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" },
         { "pointer": "/flow/phaseChain/3/sourceHeadCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" },
-        { "pointer": "/flow/phaseChain/4/sourceHeadCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" }
+        { "pointer": "/flow/phaseChain/4/sourceHeadCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" },
+        { "pointer": "/flow/phaseChain/5/sourceHeadCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" }
       ],
       "resign": true,
       "expectedError": "source head commit does not match out-of-band expected commit"
@@ -184,7 +191,8 @@
         { "pointer": "/flow/phaseChain/1/testedTreeCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" },
         { "pointer": "/flow/phaseChain/2/testedTreeCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" },
         { "pointer": "/flow/phaseChain/3/testedTreeCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" },
-        { "pointer": "/flow/phaseChain/4/testedTreeCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" }
+        { "pointer": "/flow/phaseChain/4/testedTreeCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" },
+        { "pointer": "/flow/phaseChain/5/testedTreeCommit", "replacement": "ffffffffffffffffffffffffffffffffffffffff" }
       ],
       "resign": true,
       "expectedError": "tested tree commit does not match verifier checkout"

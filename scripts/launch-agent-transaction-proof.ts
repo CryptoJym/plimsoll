@@ -685,7 +685,13 @@ function main() {
     fs.writeFileSync(launchctl, `#!/bin/sh
 printf '%s\\n' "$1" >> "$PLIMSOLL_TEST_LAUNCHCTL_LOG"
 case "$1" in
-  print) test -f "$PLIMSOLL_TEST_LAUNCHCTL_STATE" && ! grep -qx 'booted_out' "$PLIMSOLL_TEST_LAUNCHCTL_STATE" ;;
+  print)
+    if test -f "$PLIMSOLL_TEST_LAUNCHCTL_STATE" && ! grep -qx 'booted_out' "$PLIMSOLL_TEST_LAUNCHCTL_STATE"; then
+      exit 0
+    fi
+    printf '%s\n' 'Could not find service "com.plimsoll.collector" in domain for user gui: '"$(id -u)" >&2
+    exit 113
+    ;;
   bootstrap)
     if [ "\${PLIMSOLL_TEST_LAUNCHCTL_FAIL:-0}" = "1" ]; then exit 42; fi
     : > "$PLIMSOLL_TEST_LAUNCHCTL_STATE"
@@ -747,7 +753,7 @@ esac
         secondLoadReceipt.loaded === true &&
         secondLoadReceipt.status === "already_loaded" &&
         launchctlCalls.filter((entry) => entry === "bootstrap").length === 1 &&
-        launchctlCalls.filter((entry) => entry === "print").length === 2,
+        launchctlCalls.filter((entry) => entry === "print").length === 4,
       {
         firstStatus: firstLoadReceipt.status,
         secondStatus: secondLoadReceipt.status,
@@ -785,13 +791,13 @@ esac
         swapCleanup.bootoutAttempted === true &&
         swapCleanup.bootoutSucceeded === true &&
         swapCleanup.labelReportedAfterBootout === false &&
-        swapCleanup.labelQueryExitCode === 1 &&
+        swapCleanup.labelQueryExitCode === 113 &&
         swapCleanup.labelQueryErrorCode === null &&
         swapCleanup.labelState === "not_reported" &&
         swapCleanup.status === "bootout_succeeded_label_not_reported" &&
         fs.readFileSync(swapLaunchctlState, "utf8").trim() === "booted_out" &&
         fs.readFileSync(swapLoadInstall.plistPath, "utf8").trim() === "operator-bootstrap-window-replacement" &&
-        swapCalls.join(",") === "print,bootstrap,bootout,print",
+        swapCalls.join(",") === "print,print,print,bootstrap,bootout,print",
       {
         exitCode: swapLoad.code,
         status: swapLoadReceipt.status,

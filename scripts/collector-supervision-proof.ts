@@ -12,7 +12,9 @@ import {
   renderLaunchAgentPlist,
 } from "../packages/collector-cli/src/launch-agent";
 import {
+  readCollectorPidCleanupState,
   readProcessStartFingerprint,
+  removeCollectorPidFileIfOwnedDetailed,
   runtimeIdentityMatches,
   START_LOCK_LEASE_MS,
   type CollectorPidRecord,
@@ -227,9 +229,18 @@ async function startOneShotIdentityOwner(port: number) {
 }
 
 function startCollector(cliPath: string, home: string) {
+  return collectorCommand(cliPath, home, path.dirname(cliPath), "start");
+}
+
+function collectorCommand(
+  cliPath: string,
+  home: string,
+  cwd: string,
+  ...args: string[]
+) {
   return watch(
-    spawn(process.execPath, [cliPath, "start"], {
-      cwd: path.dirname(cliPath),
+    spawn(process.execPath, [cliPath, ...args], {
+      cwd,
       env: { ...process.env, PLIMSOLL_HOME: home },
       stdio: ["ignore", "pipe", "pipe"],
     }),
@@ -237,13 +248,7 @@ function startCollector(cliPath: string, home: string) {
 }
 
 function stopCollector(cliPath: string, home: string, cwd: string) {
-  return watch(
-    spawn(process.execPath, [cliPath, "stop"], {
-      cwd,
-      env: { ...process.env, PLIMSOLL_HOME: home },
-      stdio: ["ignore", "pipe", "pipe"],
-    }),
-  );
+  return collectorCommand(cliPath, home, cwd, "stop");
 }
 
 function launchAgentCommand(
@@ -253,7 +258,17 @@ function launchAgentCommand(
   command: "unload-launch-agent" | "uninstall-launch-agent",
   fakeBin: string,
   launchctlExit = 0,
+  bootoutPid?: number,
+  behavior: {
+    initiallyLoaded?: boolean;
+    printExit?: number;
+    printStderr?: string;
+  } = {},
 ) {
+  const launchctlState = path.join(home, "launchctl.state");
+  if (behavior.initiallyLoaded !== false) {
+    fs.writeFileSync(launchctlState, String(bootoutPid ?? process.pid) + "\n", { mode: 0o600 });
+  }
   return watch(
     spawn(process.execPath, [cliPath, command], {
       cwd,
@@ -262,6 +277,12 @@ function launchAgentCommand(
         PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}`,
         PLIMSOLL_HOME: home,
         PLIMSOLL_PROOF_LAUNCHCTL_EXIT: String(launchctlExit),
+        PLIMSOLL_PROOF_LAUNCHCTL_STATE: launchctlState,
+        PLIMSOLL_PROOF_LAUNCHCTL_PRINT_EXIT: String(behavior.printExit ?? 0),
+        PLIMSOLL_PROOF_LAUNCHCTL_PRINT_STDERR: behavior.printStderr ?? "",
+        PLIMSOLL_PROOF_LAUNCHCTL_NOT_FOUND:
+          `Could not find service "${LAUNCH_AGENT_LABEL}" in domain for user gui: ${process.getuid?.() ?? "unknown"}`,
+        ...(bootoutPid ? { PLIMSOLL_PROOF_BOOTOUT_PID: String(bootoutPid) } : {}),
       },
       stdio: ["ignore", "pipe", "pipe"],
     }),
@@ -484,7 +505,8 @@ async function main() {
       ),
       "Inert CLI-shaped process was not blocked by exact runtime identity.",
     );
-    await waitForExit(deniedStop.child);
+    const deniedStopExit = await waitForExit(deniedStop.child);
+    check(deniedStopExit.code !== 0, "Unverified live runtime stop exited successfully.");
     process.kill(inert.pid, 0);
 
     fs.writeFileSync(path.join(inertHome, "collector.pid"), String(inert.pid) + "\n", {
@@ -499,16 +521,545 @@ async function main() {
         ),
       "Legacy PID record was not safely blocked.",
     );
-    await waitForExit(legacyStop.child);
+    const legacyStopExit = await waitForExit(legacyStop.child);
+    check(legacyStopExit.code !== 0, "Legacy PID stop exited successfully.");
     process.kill(inert.pid, 0);
 
     const fakeBin = path.join(tempRoot, "fake-bin");
     fs.mkdirSync(fakeBin, { recursive: true });
     fs.writeFileSync(
       path.join(fakeBin, "launchctl"),
-      "#!/bin/sh\nexit \"${PLIMSOLL_PROOF_LAUNCHCTL_EXIT:-0}\"\n",
+      [
+        "#!/bin/sh",
+        'state="${PLIMSOLL_PROOF_LAUNCHCTL_STATE:?}"',
+        'if [ "$1" = "print" ]; then',
+        '  code="${PLIMSOLL_PROOF_LAUNCHCTL_PRINT_EXIT:-0}"',
+        '  if [ "$code" != "0" ]; then',
+        '    printf "%s\\n" "$PLIMSOLL_PROOF_LAUNCHCTL_PRINT_STDERR" >&2',
+        '    exit "$code"',
+        '  fi',
+        '  if [ ! -f "$state" ]; then',
+        '    printf "%s\\n" "$PLIMSOLL_PROOF_LAUNCHCTL_NOT_FOUND" >&2',
+        '    exit 113',
+        '  fi',
+        "  printf '    pid = %s\\n' \"$(cat \"$state\")\"",
+        "  exit 0",
+        "fi",
+        'if [ "$1" = "bootout" ]; then',
+        '  code="${PLIMSOLL_PROOF_LAUNCHCTL_EXIT:-0}"',
+        '  [ "$code" = "0" ] || exit "$code"',
+        '  if [ -n "${PLIMSOLL_PROOF_BOOTOUT_PID:-}" ]; then',
+        '    kill -TERM "$PLIMSOLL_PROOF_BOOTOUT_PID"',
+        "  fi",
+        '  rm -f "$state"',
+        "  exit 0",
+        "fi",
+        "exit 64",
+        "",
+      ].join("\n"),
       { mode: 0o755 },
     );
+    const unloadHome = path.join(tempRoot, "truthful-unload");
+    const unloadPort = await availablePort();
+    writeConfig(unloadHome, unloadPort);
+    const unloadOwner = startCollector(cliPath, unloadHome);
+    children.push(unloadOwner);
+    await waitFor(
+      () => Boolean(statusReceipt(unloadOwner, "active")),
+      "Unload fixture owner did not become active.",
+    );
+    check(unloadOwner.child.pid, "Unload fixture owner has no PID.");
+    const truthfulUnload = launchAgentCommand(
+      cliPath,
+      unloadHome,
+      root,
+      "unload-launch-agent",
+      fakeBin,
+      0,
+      unloadOwner.child.pid,
+    );
+    children.push(truthfulUnload);
+    await waitFor(
+      () => truthfulUnload.receipts.some(
+        (receipt) =>
+          receipt.unloaded === true &&
+          receipt.status === "stopped" &&
+          (receipt.terminal as Receipt | undefined)?.labelState === "not_reported" &&
+          (receipt.terminal as Receipt | undefined)?.listenerState === "absent" &&
+          (receipt.terminal as Receipt | undefined)?.pidRecordState === "missing",
+      ),
+      "Unload did not report the aggregate terminal state: " + truthfulUnload.output,
+      7_000,
+    );
+    const truthfulUnloadExit = await waitForExit(truthfulUnload.child);
+    check(truthfulUnloadExit.code === 0, "Truthful aggregate unload exited nonzero.");
+    await waitForExit(unloadOwner.child);
+    const truthfulReceipt = truthfulUnload.receipts.find((receipt) => receipt.unloaded === true);
+    check(
+      truthfulReceipt &&
+        !JSON.stringify(truthfulReceipt).includes(tempRoot) &&
+        !JSON.stringify(truthfulReceipt).includes(root),
+      "Unload receipt exposed a filesystem path.",
+    );
+
+    const durableHome = path.join(tempRoot, "durable-cleanup-reopen");
+    const durablePort = await availablePort();
+    writeConfig(durableHome, durablePort);
+    const durableOwner = startCollector(cliPath, durableHome);
+    children.push(durableOwner);
+    await waitFor(
+      () => Boolean(statusReceipt(durableOwner, "active")),
+      "Durable cleanup fixture owner did not become active.",
+    );
+    const durableActive = statusReceipt(durableOwner, "active");
+    const durableIdentity = durableActive?.runtimeIdentity as
+      | CollectorRuntimeIdentity
+      | undefined;
+    check(durableIdentity, "Durable cleanup fixture emitted no runtime identity.");
+    const durablePidPath = path.join(durableHome, "collector.pid");
+    const detailedAmbiguity = removeCollectorPidFileIfOwnedDetailed(
+      durablePidPath,
+      durableIdentity,
+      LAUNCH_AGENT_LABEL,
+      {
+        beforeClaim: () => {
+          const stat = fs.statSync(durablePidPath);
+          fs.utimesSync(
+            durablePidPath,
+            new Date(stat.atimeMs),
+            new Date(stat.mtimeMs + 10_000),
+          );
+        },
+      },
+    );
+    const durableBeforeSignal = readCollectorPidCleanupState(
+      durablePidPath,
+      LAUNCH_AGENT_LABEL,
+    );
+    check(
+      detailedAmbiguity.disposition === "preclaim_changed" &&
+        detailedAmbiguity.ambiguous &&
+        !detailedAmbiguity.removed &&
+        durableBeforeSignal.markerState === "present" &&
+        fs.existsSync(durablePidPath),
+      "Production detailed cleanup did not durably mark its preclaim ambiguity.",
+    );
+    durableOwner.child.kill("SIGTERM");
+    await waitFor(
+      () => Boolean(statusReceipt(durableOwner, "shutdown_incomplete")),
+      "SIGTERM finalizer did not consume the durable ambiguity.",
+      7_000,
+    );
+    const durableShutdown = statusReceipt(durableOwner, "shutdown_incomplete");
+    const durableOwnerExit = await waitForExit(durableOwner.child);
+    const durableAfterExit = readCollectorPidCleanupState(
+      durablePidPath,
+      LAUNCH_AGENT_LABEL,
+    );
+    check(
+      durableOwnerExit.code !== 0 &&
+        durableShutdown?.pidCleaned === false &&
+        durableShutdown?.pidRecordState === "current" &&
+        durableShutdown?.processState === "exiting" &&
+        (durableShutdown?.cleanupAttempt as Receipt | undefined)?.disposition ===
+          "persistent_ambiguity" &&
+        durableAfterExit.markerState === "present" &&
+        fs.existsSync(durablePidPath),
+      "SIGTERM promoted a durable cleanup ambiguity to stopped or PID-cleaned truth.",
+    );
+
+    const durableStop = stopCollector(cliPath, durableHome, root);
+    children.push(durableStop);
+    await waitFor(
+      () => durableStop.receipts.some(
+        (receipt) => receipt.reason === "pid_cleanup_ambiguous",
+      ),
+      "A separate stop process did not reopen the durable cleanup marker.",
+    );
+    const durableStopExit = await waitForExit(durableStop.child);
+    const durableStopReceipt = durableStop.receipts.find(
+      (receipt) => receipt.reason === "pid_cleanup_ambiguous",
+    );
+    check(
+      durableStopExit.code !== 0 &&
+        durableStopReceipt?.stopped === false &&
+        durableStopReceipt.pidCleaned === false &&
+        durableStopReceipt.pidRecordState === "current" &&
+        (durableStopReceipt.pidCleanup as Receipt | undefined)?.markerState === "present" &&
+        !JSON.stringify(durableStopReceipt).includes(tempRoot),
+      "Separate stop lost marker truth, emitted a false terminal receipt, or exposed a path.",
+    );
+
+    const durableUnload = launchAgentCommand(
+      cliPath,
+      durableHome,
+      root,
+      "unload-launch-agent",
+      fakeBin,
+      0,
+      undefined,
+      { initiallyLoaded: false },
+    );
+    children.push(durableUnload);
+    await waitFor(
+      () => durableUnload.receipts.some(
+        (receipt) => receipt.unloaded === false && receipt.reason === "indeterminate",
+      ),
+      "A later unload observer did not reopen the durable cleanup ambiguity.",
+      7_000,
+    );
+    const durableUnloadExit = await waitForExit(durableUnload.child);
+    const durableUnloadReceipt = durableUnload.receipts.find(
+      (receipt) => receipt.unloaded === false,
+    );
+    check(
+      durableUnloadExit.code !== 0 &&
+        durableUnloadReceipt?.pidCleaned === false &&
+        durableUnloadReceipt.bootoutAttempted === false &&
+        (durableUnloadReceipt.terminal as Receipt | undefined)?.pidCleanupMarkerState ===
+          "present" &&
+        (durableUnloadReceipt.timing as Receipt | undefined)?.finalObservationPerformed === true &&
+        !JSON.stringify(durableUnloadReceipt).includes(tempRoot),
+      "Post-exit unload lost durable marker truth, skipped final observation, or exposed a path.",
+    );
+
+    const blockedStart = startCollector(cliPath, durableHome);
+    children.push(blockedStart);
+    const blockedStartExit = await waitForExit(blockedStart.child);
+    const blockedStartRaw = blockedStart.errors.join("").trim();
+    const blockedStartReceipt = JSON.parse(blockedStartRaw) as Receipt;
+    check(
+      blockedStartExit.code !== 0 &&
+        blockedStartReceipt.status === "error" &&
+        blockedStartReceipt.code === "pid_cleanup_ambiguous" &&
+        typeof blockedStartReceipt.pidPathHash === "string" &&
+        blockedStartReceipt.port === durablePort &&
+        !blockedStartRaw.includes(tempRoot) &&
+        !blockedStartRaw.includes(root) &&
+        !blockedStartRaw.includes(" at "),
+      "Packaged start ownership failure was not stable, path-free JSON with a nonzero exit.",
+    );
+
+    const unavailablePsHome = path.join(tempRoot, "start-fingerprint-unavailable");
+    writeConfig(unavailablePsHome, await availablePort());
+    const unavailablePsBin = path.join(tempRoot, "unavailable-ps-bin");
+    fs.mkdirSync(unavailablePsBin, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(unavailablePsBin, "ps"), "#!/bin/sh\nexit 127\n", {
+      mode: 0o700,
+    });
+    const unavailablePsStart = watch(
+      spawn(process.execPath, [cliPath, "start"], {
+        cwd: root,
+        env: {
+          ...process.env,
+          PATH: unavailablePsBin,
+          PLIMSOLL_HOME: unavailablePsHome,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      }),
+    );
+    children.push(unavailablePsStart);
+    const unavailablePsExit = await waitForExit(unavailablePsStart.child);
+    const unavailablePsRaw = unavailablePsStart.errors.join("").trim();
+    const unavailablePsReceipt = JSON.parse(unavailablePsRaw) as Receipt;
+    check(
+      unavailablePsExit.code !== 0 &&
+        unavailablePsReceipt.status === "error" &&
+        unavailablePsReceipt.code === "process_fingerprint_unavailable" &&
+        typeof unavailablePsReceipt.pidPathHash === "string" &&
+        !unavailablePsRaw.includes(tempRoot) &&
+        !unavailablePsRaw.includes(root) &&
+        !unavailablePsRaw.includes(" at ") &&
+        !fs.existsSync(path.join(unavailablePsHome, "collector.pid")),
+      "Packaged start leaked a stack/path or mutated PID state when ps was unavailable.",
+    );
+
+    const blockedDoctor = collectorCommand(
+      cliPath,
+      durableHome,
+      root,
+      "doctor",
+      "--read-only",
+      "--json",
+    );
+    children.push(blockedDoctor);
+    const blockedDoctorExit = await waitForExit(blockedDoctor.child);
+    const blockedDoctorRuntime = blockedDoctor.receipts[0]?.runtime as Receipt | undefined;
+    const blockedDoctorReconciliation = blockedDoctorRuntime
+      ?.pidCleanupReconciliation as Receipt | undefined;
+    check(
+      blockedDoctorExit.code !== 0 &&
+        blockedDoctorReconciliation?.disposition === "actor_live" &&
+        blockedDoctorReconciliation.reconciled === false &&
+        fs.existsSync(path.join(durableHome, ".collector.pid.plimsoll-cleanup-marker")),
+      "Read-only doctor did not report the live cleanup actor without mutating its marker.",
+    );
+
+    const reconciledHome = path.join(tempRoot, "dead-actor-reconciliation");
+    const reconciledPort = await availablePort();
+    writeConfig(reconciledHome, reconciledPort);
+    const deadActorProcess = spawn(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000)"],
+      { stdio: "ignore" },
+    );
+    check(deadActorProcess.pid, "Could not create cleanup actor fixture.");
+    auxiliaryChildren.push(deadActorProcess);
+    const deadActorIdentity = runtimeIdentity(deadActorProcess.pid);
+    deadActorProcess.kill("SIGTERM");
+    await waitForExit(deadActorProcess);
+    for (let index = 0; index < 1_200; index += 1) {
+      fs.writeFileSync(path.join(reconciledHome, `.unrelated-${index}`), "unrelated\n", {
+        mode: 0o600,
+      });
+    }
+    const reconciledMarkerPath = path.join(
+      reconciledHome,
+      ".collector.pid.plimsoll-cleanup-marker",
+    );
+    fs.writeFileSync(
+      reconciledMarkerPath,
+      JSON.stringify({
+        actor: {
+          pid: deadActorIdentity.pid,
+          processStartFingerprint: deadActorIdentity.processStartFingerprint,
+        },
+        label: LAUNCH_AGENT_LABEL,
+        schema: "plimsoll.collector-pid-cleanup.v2",
+        state: "in_progress",
+        target: durableIdentity,
+        transactionId: randomUUID(),
+      }) + "\n",
+      { mode: 0o600 },
+    );
+
+    const eligibleDoctor = collectorCommand(
+      cliPath,
+      reconciledHome,
+      root,
+      "doctor",
+      "--read-only",
+      "--json",
+    );
+    children.push(eligibleDoctor);
+    const eligibleDoctorExit = await waitForExit(eligibleDoctor.child);
+    const eligibleDoctorRuntime = eligibleDoctor.receipts[0]?.runtime as Receipt | undefined;
+    const eligibleDoctorReconciliation = eligibleDoctorRuntime
+      ?.pidCleanupReconciliation as Receipt | undefined;
+    check(
+      eligibleDoctorExit.code !== 0 &&
+        eligibleDoctorReconciliation?.disposition === "eligible_dead_actor" &&
+        eligibleDoctorReconciliation.eligible === true &&
+        eligibleDoctorReconciliation.reconciled === false &&
+        fs.existsSync(reconciledMarkerPath),
+      "Read-only doctor mutated or misreported an eligible dead-actor marker.",
+    );
+
+    const reconciledStop = stopCollector(cliPath, reconciledHome, root);
+    children.push(reconciledStop);
+    const reconciledStopExit = await waitForExit(reconciledStop.child);
+    const reconciledStopReceipt = reconciledStop.receipts.find(
+      (receipt) => receipt.status === "already_stopped",
+    );
+    check(
+      reconciledStopExit.code === 0 &&
+        reconciledStopReceipt?.stopped === true &&
+        reconciledStopReceipt.reason === null &&
+        reconciledStopReceipt.pidRecordState === "missing" &&
+        reconciledStopReceipt.listenerState === "absent" &&
+        (reconciledStopReceipt.pidCleanupReconciliation as Receipt | undefined)
+          ?.disposition === "marker_cleared" &&
+        !fs.existsSync(reconciledMarkerPath),
+      "Packaged stop did not reconcile the dead actor and prove already-stopped truth.",
+    );
+
+    const cleanMissingStop = stopCollector(cliPath, reconciledHome, root);
+    children.push(cleanMissingStop);
+    const cleanMissingStopExit = await waitForExit(cleanMissingStop.child);
+    const cleanMissingStopReceipt = cleanMissingStop.receipts.find(
+      (receipt) => receipt.status === "already_stopped",
+    );
+    check(
+      cleanMissingStopExit.code === 0 &&
+        cleanMissingStopReceipt?.stopped === true &&
+        cleanMissingStopReceipt.reason === null &&
+        (cleanMissingStopReceipt.pidCleanupReconciliation as Receipt | undefined)
+          ?.disposition === "clean",
+      "Clean missing-PID stop did not return consistent already-stopped JSON and exit zero.",
+    );
+
+    foreignServer = http.createServer((_request, response) => {
+      response.writeHead(404, { "content-type": "text/plain" });
+      response.end("not a collector\n");
+    });
+    await new Promise<void>((resolve, reject) => {
+      foreignServer?.once("error", reject);
+      foreignServer?.listen(reconciledPort, "127.0.0.1", resolve);
+    });
+    const missingPidOccupiedStop = stopCollector(cliPath, reconciledHome, root);
+    children.push(missingPidOccupiedStop);
+    const missingPidOccupiedExit = await waitForExit(missingPidOccupiedStop.child);
+    const missingPidOccupiedReceipt = missingPidOccupiedStop.receipts.find(
+      (receipt) => receipt.stopped === false,
+    );
+    check(
+      missingPidOccupiedExit.code !== 0 &&
+        missingPidOccupiedReceipt?.status === "refused" &&
+        missingPidOccupiedReceipt.reason === "listener_still_present" &&
+        missingPidOccupiedReceipt.pidRecordState === "missing" &&
+        missingPidOccupiedReceipt.listenerState === "unrelated",
+      "Missing PID plus present listener was promoted to success or exited zero.",
+    );
+    await new Promise<void>((resolve, reject) => {
+      foreignServer?.close((error) => (error ? reject(error) : resolve()));
+    });
+    foreignServer = null;
+
+    const collisionHome = path.join(tempRoot, "durable-cleanup-collision");
+    writeConfig(collisionHome, await availablePort());
+    const collisionPidPath = path.join(collisionHome, "collector.pid");
+    const collisionOwnerRecord = writePidRecord(collisionHome, durableIdentity, root);
+    const collisionCleanup = removeCollectorPidFileIfOwnedDetailed(
+      collisionPidPath,
+      durableIdentity,
+      LAUNCH_AGENT_LABEL,
+      {
+        afterClaim: () => {
+          fs.writeFileSync(collisionPidPath, "operator-collision\n", { mode: 0o600 });
+        },
+      },
+    );
+    const fixedQuarantinePath = path.join(
+      collisionHome,
+      ".collector.pid.plimsoll-quarantine",
+    );
+    const collisionPersistent = readCollectorPidCleanupState(
+      collisionPidPath,
+      LAUNCH_AGENT_LABEL,
+    );
+    check(
+      collisionCleanup.disposition === "destination_reappeared" &&
+        collisionCleanup.quarantined &&
+        collisionPersistent.markerState === "present" &&
+        collisionPersistent.quarantineCount === 1 &&
+        fs.readFileSync(collisionPidPath, "utf8") === "operator-collision\n" &&
+        fs.readFileSync(fixedQuarantinePath, "utf8") ===
+          JSON.stringify(collisionOwnerRecord, null, 2) + "\n",
+      "The marker-plus-collision fixture did not retain its exact quarantine inventory.",
+    );
+    const collisionStop = stopCollector(cliPath, collisionHome, root);
+    children.push(collisionStop);
+    await waitFor(
+      () => collisionStop.receipts.some(
+        (receipt) => receipt.reason === "pid_cleanup_ambiguous",
+      ),
+      "Stop did not fail closed on marker plus visible collision.",
+    );
+    const collisionStopExit = await waitForExit(collisionStop.child);
+    check(collisionStopExit.code !== 0, "Marker-plus-collision stop exited successfully.");
+    fs.unlinkSync(collisionPidPath);
+    const missingQuarantineUnload = launchAgentCommand(
+      cliPath,
+      collisionHome,
+      root,
+      "unload-launch-agent",
+      fakeBin,
+      0,
+      undefined,
+      { initiallyLoaded: false },
+    );
+    children.push(missingQuarantineUnload);
+    await waitFor(
+      () => missingQuarantineUnload.receipts.some(
+        (receipt) => receipt.unloaded === false && receipt.reason === "indeterminate",
+      ),
+      "Missing-visible-PID plus quarantine was promoted to already stopped.",
+      7_000,
+    );
+    const missingQuarantineExit = await waitForExit(missingQuarantineUnload.child);
+    const missingQuarantineReceipt = missingQuarantineUnload.receipts.find(
+      (receipt) => receipt.unloaded === false,
+    );
+    check(
+      missingQuarantineExit.code !== 0 &&
+        missingQuarantineReceipt?.pidCleaned === false &&
+        (missingQuarantineReceipt.terminal as Receipt | undefined)?.pidRecordState === "missing" &&
+        (missingQuarantineReceipt.terminal as Receipt | undefined)
+          ?.pidCleanupQuarantineCount === 1 &&
+        (missingQuarantineReceipt.terminal as Receipt | undefined)?.pidCleanupQuarantined ===
+          true &&
+        readCollectorPidCleanupState(collisionPidPath, LAUNCH_AGENT_LABEL).quarantineCount === 1,
+      "Quarantine ambiguity did not survive visible PID removal and a later process reopen.",
+    );
+
+    const alreadyStoppedHome = path.join(tempRoot, "known-label-not-found");
+    writeConfig(alreadyStoppedHome, await availablePort());
+    const alreadyStopped = launchAgentCommand(
+      cliPath,
+      alreadyStoppedHome,
+      root,
+      "unload-launch-agent",
+      fakeBin,
+      0,
+      undefined,
+      { initiallyLoaded: false },
+    );
+    children.push(alreadyStopped);
+    await waitFor(
+      () => alreadyStopped.receipts.some(
+        (receipt) =>
+          receipt.unloaded === true &&
+          receipt.status === "already_stopped" &&
+          receipt.bootoutAttempted === false &&
+          (receipt.prior as Receipt | undefined)?.labelState === "not_reported",
+      ),
+      "The exact launchctl label-not-found result was not recognized.",
+    );
+    const alreadyStoppedExit = await waitForExit(alreadyStopped.child);
+    check(alreadyStoppedExit.code === 0, "Known label-not-found should be idempotent success.");
+
+    const exactNotFound =
+      `Could not find service "${LAUNCH_AGENT_LABEL}" in domain for user gui: ${process.getuid?.() ?? "unknown"}`;
+    const unexpectedPrintCases = [
+      { name: "permission-denied-77", code: 77, stderr: "permission denied" },
+      { name: "wrong-output-113", code: 113, stderr: "permission denied" },
+      { name: "wrong-code-known-output", code: 1, stderr: exactNotFound },
+    ];
+    for (const fixture of unexpectedPrintCases) {
+      const fixtureHome = path.join(tempRoot, `launchctl-print-${fixture.name}`);
+      writeConfig(fixtureHome, await availablePort());
+      const command = launchAgentCommand(
+        cliPath,
+        fixtureHome,
+        root,
+        "unload-launch-agent",
+        fakeBin,
+        0,
+        undefined,
+        {
+          initiallyLoaded: false,
+          printExit: fixture.code,
+          printStderr: fixture.stderr,
+        },
+      );
+      children.push(command);
+      await waitFor(
+        () => command.receipts.some((receipt) => receipt.unloaded === false),
+        `Unexpected launchctl print fixture ${fixture.name} produced no refusal receipt.`,
+      );
+      const exit = await waitForExit(command.child);
+      const receipt = command.receipts.find((candidate) => candidate.unloaded === false);
+      check(
+        exit.code !== 0 &&
+          receipt?.status === "refused" &&
+          receipt.reason === "indeterminate" &&
+          receipt.bootoutAttempted === false &&
+          (receipt.prior as Receipt | undefined)?.labelState === "query_failed" &&
+          (receipt.terminal as Receipt | undefined)?.labelState === "query_failed",
+        `Unexpected launchctl print fixture ${fixture.name} was promoted to absence.`,
+      );
+    }
+
     const legacyUnloadHome = path.join(tempRoot, "legacy-unload");
     writeConfig(legacyUnloadHome, await availablePort());
     const legacyPidPath = path.join(legacyUnloadHome, "collector.pid");
@@ -524,7 +1075,7 @@ async function main() {
     await waitFor(
       () => legacyUnload.receipts.some(
         (receipt) =>
-          receipt.unloaded === false && receipt.reason === "pid_cleanup_unproven",
+          receipt.unloaded === false && receipt.reason === "stale_owned_record",
       ),
       "Unload promoted a legacy PID residue to successful cleanup.",
       7_000,
@@ -640,7 +1191,17 @@ async function main() {
             "owner death after first valid status cannot yield already_running",
             "foreign exact-shape status cannot spoof collector ownership",
             "inert CLI-shaped and legacy processes cannot pass stop authorization",
-            "unload requires launchctl success and literal PID cleanup proof",
+            "unload records launchctl failure and requires aggregate terminal-state proof",
+            "only exact launchctl label-not-found output becomes not_reported",
+            "unexpected launchctl exit codes and output remain query_failed",
+            "unload receipts are path-free and legacy PID residue is retained",
+            "durable cleanup ambiguity survives SIGTERM, stop, and unload process reopen",
+            "packaged start failures are stable path-free JSON with nonzero exit",
+            "packaged start contains fingerprint acquisition inside the JSON error boundary",
+            "doctor reports live and eligible cleanup actors without mutation",
+            "dead actor plus 1200 unrelated files reconciles to already-stopped truth",
+            "missing PID stop exit status matches absent versus present listener truth",
+            "marker-plus-collision and missing-PID quarantine remain nonterminal",
             "reused PID fingerprint and expired lock lease both recover",
             "crash-only restart is throttled",
             "rendered plist passes plutil on macOS",

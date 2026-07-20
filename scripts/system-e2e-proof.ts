@@ -1083,6 +1083,28 @@ async function main() {
     sourceHeadCommit,
     testedTreeCommit,
   });
+  const unload = runSupportingProof({
+    name: "launch_agent_unload_terminal_truth",
+    kind: "json_result",
+    script: "scripts/launch-agent-unload-proof.ts",
+    home: machineBHome,
+    temp: machineBTmp,
+    requiredAssertions: [
+      "terminal_between_last_poll_and_receipt_is_stopped",
+      "owner_reappearing_at_receipt_boundary_is_not_reported_stopped",
+      "wrapper_parent_and_collector_child_are_one_owned_layout",
+      "unrelated_listener_is_retained_and_refused",
+      "pid_reuse_does_not_keep_or_signal_the_foreign_process",
+      "pid_symlink_is_rejected_without_target_mutation",
+      "pid_swap_before_claim_preserves_both_objects",
+      "mid_claim_symlink_never_becomes_aggregate_stopped_truth",
+      "restore_collision_preserves_visible_object_and_quarantines_exact_replacement",
+      "cleanup_ambiguity_survives_reappearance_before_final_receipt",
+      "unload_receipts_are_path_free",
+    ],
+    sourceHeadCommit,
+    testedTreeCommit,
+  });
 
   const resourceReceipt = JSON.parse(fs.readFileSync(resourceReceiptPath, "utf8")) as {
     overall: string;
@@ -1129,7 +1151,7 @@ async function main() {
   assert.equal(dashboard?.counters.fileBytesRead, 0);
   assert.equal(dashboard?.counters.filesystemEntriesScanned, 0);
 
-  const phases = [install, join, privacy, lifecycle, resource];
+  const phases = [install, join, privacy, lifecycle, resource, unload];
   assert.equal(phases.length, supportContract.phases.length, "support phase count drifted");
   const rootGuardReceipts = finalizeRootGuards(rootGuards);
   assert.ok(rootGuardReceipts.length > 0 && rootGuardReceipts.every((guard) => guard.unchanged));

@@ -38,6 +38,12 @@ jobs:
       - name: Prove atomic no-follow LaunchAgent manifest lifecycle
         run: pnpm proof:launch-agent
 
+      - name: Prove truthful LaunchAgent unload and collector supervision
+        run: |
+          pnpm --dir packages/collector-cli build
+          pnpm proof:launch-agent-unload
+          pnpm proof:collector-supervision
+
       - name: Prove surgical Codex config reconciliation
         run: pnpm proof:codex-config-apply
 

@@ -309,6 +309,19 @@ function assertJoinResult(value: unknown) {
   }
 }
 
+function assertLaunchAgentUnloadResult(value: unknown) {
+  exactKeys(value, ["issue", "ok", "proof", "node", "checks"], "LaunchAgent unload result");
+  assert.equal(value.issue, 143);
+  assert.equal(value.ok, true);
+  assert.equal(value.proof, "launch-agent-unload-terminal-truth");
+  assert.ok(Array.isArray(value.checks) && value.checks.length >= 15, "unload checks are missing");
+  for (const [index, check] of value.checks.entries()) {
+    exactKeys(check, ["name", "detail"], `unload check ${index}`);
+    assert.match(String(check.name), /^[a-z0-9_]+$/);
+    assert.ok(String(check.detail).length > 0);
+  }
+}
+
 function assertLifecycleResult(value: ReturnType<typeof parsePassLinesWithSummary>) {
   exactKeys(value.summary, ["proof", "checks", "passed", "failed", "liveStateTouched"], "lifecycle summary");
   assert.equal(value.summary.proof, "lifecycle");
@@ -501,6 +514,7 @@ export function parseSupportingArtifact(
   if (kind === "json_result") {
     const parsed = parsePrettyJsonExactly(stdout, "supporting JSON result");
     if ((parsed as Record<string, unknown>).issue === 107) assertInstallResult(parsed);
+    else if ((parsed as Record<string, unknown>).issue === 143) assertLaunchAgentUnloadResult(parsed);
     else assertJoinResult(parsed);
     return normalizeSupportingArtifact(parsed, context);
   }

@@ -30,6 +30,8 @@
     "proof:claude-config-apply": "tsx scripts/claude-config-apply-proof.ts",
     "proof:install-doctor": "tsx scripts/install-doctor-proof.ts",
     "proof:launch-agent": "tsx scripts/launch-agent-transaction-proof.ts",
+    "proof:launch-agent-unload": "tsx scripts/launch-agent-unload-proof.ts",
+    "proof:collector-supervision": "tsx scripts/collector-supervision-proof.ts",
     "proof:metric-truth": "tsx scripts/metric-truth-proof.ts",
     "proof:http-boundary": "tsx scripts/local-http-boundary-proof.ts",
     "proof:privacy-mode": "tsx scripts/privacy-mode-proof.ts",
