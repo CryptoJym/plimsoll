@@ -230,6 +230,38 @@ function runReceiptWriteAdversaries(tempRoot: string) {
     .readdirSync(fixtureRoot)
     .filter((name) => name.startsWith(".partial-receipt.json.") && name.endsWith(".tmp"));
 
+  finalizationStage = "receipt_write_stable_temp_alias";
+  const temporaryAlias = path.resolve(os.tmpdir());
+  const canonicalTemporaryRoot = fs.realpathSync.native(temporaryAlias);
+  let stableTemporaryRootAliasNormalized = true;
+  if (
+    temporaryAlias !== canonicalTemporaryRoot &&
+    within(canonicalTemporaryRoot, tempRoot)
+  ) {
+    const aliasedTempRoot = path.join(
+      temporaryAlias,
+      path.relative(canonicalTemporaryRoot, tempRoot),
+    );
+    const canonicalAliasParent = path.join(tempRoot, "stable-temp-alias");
+    const aliasedReceipt = path.join(
+      aliasedTempRoot,
+      "stable-temp-alias",
+      "receipt.json",
+    );
+    const canonicalAliasedReceipt = path.join(
+      canonicalAliasParent,
+      "receipt.json",
+    );
+    fs.mkdirSync(canonicalAliasParent, { mode: 0o700 });
+    writeResourceReceiptAtomically(aliasedReceipt, serialized);
+    const aliasedReceiptStat = fs.lstatSync(canonicalAliasedReceipt);
+    stableTemporaryRootAliasNormalized =
+      aliasedReceiptStat.isFile() &&
+      !aliasedReceiptStat.isSymbolicLink() &&
+      (aliasedReceiptStat.mode & 0o777) === 0o600 &&
+      fs.readFileSync(canonicalAliasedReceipt, "utf8") === serialized;
+  }
+
   finalizationStage = "receipt_write_ancestor_alias";
   const externalAncestorRoot = path.join(tempRoot, "ancestor-external");
   const externalNested = path.join(externalAncestorRoot, "nested");
@@ -287,6 +319,7 @@ function runReceiptWriteAdversaries(tempRoot: string) {
       fs.readFileSync(partialDestination, "utf8") === partialBefore &&
       (fs.statSync(partialDestination).mode & 0o777) === 0o600 &&
       partialResidue.length === 0,
+    stableTemporaryRootAliasNormalized,
     ancestorSymlinkEscapeRejected:
       ancestorFailure === "ResourceReceiptAncestorInvalid" &&
       fs.lstatSync(ancestorAlias).isSymbolicLink() &&

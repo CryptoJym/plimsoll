@@ -104,6 +104,38 @@ type ReceiptAncestor = {
   inode: number;
 };
 
+/**
+ * macOS exposes private system directories through fixed root aliases such as
+ * `/var` -> `/private/var`. Normalize only those verified platform roots before
+ * applying the no-follow ancestor policy. `TMPDIR` is intentionally not trusted:
+ * caller-created aliases below a stable root remain visible to lstat and fail.
+ */
+function normalizeStableTemporaryRoot(candidate: string) {
+  const resolved = path.resolve(candidate);
+  if (process.platform !== "darwin") return resolved;
+  for (const [aliasRoot, expectedCanonicalRoot] of [
+    ["/var", "/private/var"],
+    ["/tmp", "/private/tmp"],
+  ] as const) {
+    let observedCanonicalRoot: string;
+    try {
+      observedCanonicalRoot = fs.realpathSync.native(aliasRoot);
+    } catch {
+      continue;
+    }
+    if (
+      observedCanonicalRoot === expectedCanonicalRoot &&
+      within(aliasRoot, resolved)
+    ) {
+      return path.join(
+        observedCanonicalRoot,
+        path.relative(aliasRoot, resolved),
+      );
+    }
+  }
+  return resolved;
+}
+
 function receiptAncestorPaths(parent: string) {
   const parsed = path.parse(parent);
   const relative = path.relative(parsed.root, parent);
@@ -194,7 +226,7 @@ function sameReceiptAncestorAuthority(
 }
 
 function prepareResourceReceiptDestination(receiptPath: string) {
-  const resolved = path.resolve(receiptPath);
+  const resolved = normalizeStableTemporaryRoot(receiptPath);
   const parent = path.dirname(resolved);
   let ancestors: ReceiptAncestor[];
   try {
@@ -218,7 +250,7 @@ function prepareResourceReceiptDestination(receiptPath: string) {
 }
 
 function observeResourceReceiptDestination(receiptPath: string) {
-  const resolved = path.resolve(receiptPath);
+  const resolved = normalizeStableTemporaryRoot(receiptPath);
   const parent = path.dirname(resolved);
   const ancestors = observeNoFollowReceiptAncestors(parent);
   try {
@@ -691,7 +723,13 @@ async function main() {
       "Application Support",
       "Plimsoll",
     );
-    if (within(liveCollectorHome, receiptPath)) {
+    if (
+      within(liveCollectorHome, receiptPath) ||
+      within(
+        normalizeStableTemporaryRoot(liveCollectorHome),
+        normalizeStableTemporaryRoot(receiptPath),
+      )
+    ) {
       throw new Error("--receipt must not point inside the operator's live Plimsoll directory");
     }
   }
