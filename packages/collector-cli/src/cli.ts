@@ -495,6 +495,8 @@ function launchAgentUnloadReceipt(
     bootoutSucceeded: result.bootoutSucceeded,
     pidCleaned: result.outcome.pidCleaned,
     removedPidFile: result.outcome.removedPidFile,
+    pidCleanupAmbiguous: result.outcome.pidCleanupAmbiguous,
+    pidCleanupQuarantined: result.outcome.pidCleanupQuarantined,
     prior: result.prior,
     terminal: result.outcome.final,
     timing: result.outcome.timing,

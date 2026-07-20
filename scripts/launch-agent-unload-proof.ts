@@ -10,6 +10,7 @@ import {
   observeLaunchAgentUnloadTerminalState,
   readCollectorPidFile,
   removeCollectorPidFileIfOwned,
+  removeCollectorPidFileIfOwnedDetailed,
   runtimeIdentityMatches,
   type CollectorListenerObservation,
   type CollectorPidFileRead,
@@ -478,19 +479,226 @@ async function main() {
     const swapPid = path.join(pidFixtureRoot, "swap.pid");
     const preservedOwner = path.join(pidFixtureRoot, "preserved-owner.pid");
     fs.writeFileSync(swapPid, ownedRaw, { mode: 0o600 });
-    const swapRemoved = removeCollectorPidFileIfOwned(swapPid, owner, LABEL, {
+    let regularReplacementInode = 0;
+    const swapCleanup = removeCollectorPidFileIfOwnedDetailed(swapPid, owner, LABEL, {
       beforeClaim: () => {
         fs.renameSync(swapPid, preservedOwner);
         fs.writeFileSync(swapPid, foreignRaw, { mode: 0o600 });
+        regularReplacementInode = fs.lstatSync(swapPid).ino;
       },
     });
     check(
       "pid_swap_before_claim_preserves_both_objects",
-      !swapRemoved &&
+      !swapCleanup.removed &&
+        swapCleanup.ambiguous &&
+        !swapCleanup.quarantined &&
+        swapCleanup.disposition === "preclaim_changed" &&
         fs.readFileSync(preservedOwner, "utf8") === ownedRaw &&
         fs.readFileSync(swapPid, "utf8") === foreignRaw &&
+        fs.lstatSync(swapPid).ino === regularReplacementInode &&
         readCollectorPidFile(swapPid, LABEL).kind === "current",
-      "Identity-bound rename-claim cleanup restores the replacement and retains the original object.",
+      "The no-follow preclaim identity check leaves the exact regular replacement visible.",
+    );
+
+    const midSymlinkPid = path.join(pidFixtureRoot, "mid-symlink.pid");
+    const midSymlinkOwner = path.join(pidFixtureRoot, "mid-symlink-owner.pid");
+    const midSymlinkTarget = path.join(pidFixtureRoot, "mid-symlink-target");
+    fs.writeFileSync(midSymlinkPid, ownedRaw, { mode: 0o600 });
+    fs.writeFileSync(midSymlinkTarget, foreignRaw, { mode: 0o600 });
+    let symlinkReplacementInode = 0;
+    const midSymlinkCleanup = removeCollectorPidFileIfOwnedDetailed(
+      midSymlinkPid,
+      owner,
+      LABEL,
+      {
+        beforeClaim: () => {
+          fs.renameSync(midSymlinkPid, midSymlinkOwner);
+          fs.symlinkSync(midSymlinkTarget, midSymlinkPid);
+          symlinkReplacementInode = fs.lstatSync(midSymlinkPid).ino;
+        },
+      },
+    );
+    const midSymlinkHidden = fs.readdirSync(pidFixtureRoot).filter((entry) =>
+      entry.includes(`${path.basename(midSymlinkPid)}.plimsoll-`)
+    );
+    check(
+      "mid_claim_symlink_replacement_stays_visible_and_unfollowed",
+      !midSymlinkCleanup.removed &&
+        midSymlinkCleanup.ambiguous &&
+        !midSymlinkCleanup.quarantined &&
+        fs.lstatSync(midSymlinkPid).isSymbolicLink() &&
+        fs.lstatSync(midSymlinkPid).ino === symlinkReplacementInode &&
+        fs.readlinkSync(midSymlinkPid) === midSymlinkTarget &&
+        fs.readFileSync(midSymlinkTarget, "utf8") === foreignRaw &&
+        fs.readFileSync(midSymlinkOwner, "utf8") === ownedRaw &&
+        midSymlinkHidden.length === 0,
+      "A symlink swapped before claim is never moved, followed, hidden, or reported removed.",
+    );
+
+    const disappearedPid = path.join(pidFixtureRoot, "disappeared.pid");
+    const disappearedOwner = path.join(pidFixtureRoot, "disappeared-owner.pid");
+    fs.writeFileSync(disappearedPid, ownedRaw, { mode: 0o600 });
+    const disappearedCleanup = removeCollectorPidFileIfOwnedDetailed(
+      disappearedPid,
+      owner,
+      LABEL,
+      {
+        beforeClaim: () => fs.renameSync(disappearedPid, disappearedOwner),
+      },
+    );
+    check(
+      "replacement_disappearing_before_claim_latches_ambiguity",
+      !disappearedCleanup.removed &&
+        disappearedCleanup.ambiguous &&
+        !disappearedCleanup.quarantined &&
+        disappearedCleanup.disposition === "preclaim_changed" &&
+        !fs.existsSync(disappearedPid) &&
+        fs.readFileSync(disappearedOwner, "utf8") === ownedRaw,
+      "A missing preclaim path is an ambiguous race, not successful cleanup.",
+    );
+
+    const collisionPid = path.join(pidFixtureRoot, "collision.pid");
+    const collisionOwner = path.join(pidFixtureRoot, "collision-owner.pid");
+    const collisionBytes = "operator-collision\n";
+    fs.writeFileSync(collisionPid, ownedRaw, { mode: 0o600 });
+    let movedReplacementInode = 0;
+    const collisionCleanup = removeCollectorPidFileIfOwnedDetailed(
+      collisionPid,
+      owner,
+      LABEL,
+      {
+        afterPreClaimCheck: () => {
+          fs.renameSync(collisionPid, collisionOwner);
+          fs.writeFileSync(collisionPid, foreignRaw, { mode: 0o600 });
+          movedReplacementInode = fs.lstatSync(collisionPid).ino;
+        },
+        beforeMismatchRestore: () => {
+          fs.writeFileSync(collisionPid, collisionBytes, { mode: 0o600 });
+        },
+      },
+    );
+    const collisionQuarantines = fs.readdirSync(pidFixtureRoot).filter((entry) =>
+      entry.includes(`${path.basename(collisionPid)}.plimsoll-remove-`) &&
+      entry.includes(".plimsoll-quarantine-")
+    );
+    const quarantinedReplacement = collisionQuarantines[0]
+      ? path.join(pidFixtureRoot, collisionQuarantines[0])
+      : "";
+    check(
+      "restore_collision_preserves_visible_object_and_quarantines_exact_replacement",
+      !collisionCleanup.removed &&
+        collisionCleanup.ambiguous &&
+        collisionCleanup.quarantined &&
+        collisionCleanup.disposition === "mismatch_quarantined" &&
+        fs.readFileSync(collisionPid, "utf8") === collisionBytes &&
+        collisionQuarantines.length === 1 &&
+        fs.lstatSync(quarantinedReplacement).ino === movedReplacementInode &&
+        fs.readFileSync(quarantinedReplacement, "utf8") === foreignRaw &&
+        fs.readFileSync(collisionOwner, "utf8") === ownedRaw,
+      "A restore collision is retained literally: visible collision plus exact quarantined replacement.",
+    );
+
+    const aggregateSymlinkPid = path.join(pidFixtureRoot, "aggregate-symlink.pid");
+    const aggregateSymlinkOwner = path.join(pidFixtureRoot, "aggregate-symlink-owner.pid");
+    const aggregateSymlinkTarget = path.join(pidFixtureRoot, "aggregate-symlink-target");
+    fs.writeFileSync(aggregateSymlinkPid, ownedRaw, { mode: 0o600 });
+    fs.writeFileSync(aggregateSymlinkTarget, foreignRaw, { mode: 0o600 });
+    const aggregateSymlinkPrior = await captureLaunchAgentUnloadPriorState({
+      label: LABEL,
+      pidPath: aggregateSymlinkPid,
+      port: PORT,
+      observeLabel: gone,
+      observeListener: async () => absent(),
+    });
+    let aggregateSymlinkInode = 0;
+    const aggregateSymlinkOutcome = await observeLaunchAgentUnloadTerminalState({
+      label: LABEL,
+      pidPath: aggregateSymlinkPid,
+      port: PORT,
+      prior: aggregateSymlinkPrior,
+      timeoutMs: 0,
+      observeLabel: gone,
+      observeListener: async () => absent(),
+      processIsLive: () => false,
+      removePidFile: (pidPath, candidate, label) =>
+        removeCollectorPidFileIfOwnedDetailed(pidPath, candidate, label, {
+          beforeClaim: () => {
+            fs.renameSync(aggregateSymlinkPid, aggregateSymlinkOwner);
+            fs.symlinkSync(aggregateSymlinkTarget, aggregateSymlinkPid);
+            aggregateSymlinkInode = fs.lstatSync(aggregateSymlinkPid).ino;
+          },
+        }),
+      now: () => 0,
+    });
+    const aggregateSymlinkHidden = fs.readdirSync(pidFixtureRoot).filter((entry) =>
+      entry.includes(`${path.basename(aggregateSymlinkPid)}.plimsoll-`)
+    );
+    check(
+      "mid_claim_symlink_never_becomes_aggregate_stopped_truth",
+      !aggregateSymlinkOutcome.stopped &&
+        aggregateSymlinkOutcome.state === "indeterminate" &&
+        !aggregateSymlinkOutcome.pidCleaned &&
+        !aggregateSymlinkOutcome.removedPidFile &&
+        aggregateSymlinkOutcome.pidCleanupAmbiguous &&
+        !aggregateSymlinkOutcome.pidCleanupQuarantined &&
+        aggregateSymlinkOutcome.timing.finalObservation === true &&
+        fs.lstatSync(aggregateSymlinkPid).isSymbolicLink() &&
+        fs.lstatSync(aggregateSymlinkPid).ino === aggregateSymlinkInode &&
+        fs.readlinkSync(aggregateSymlinkPid) === aggregateSymlinkTarget &&
+        fs.readFileSync(aggregateSymlinkTarget, "utf8") === foreignRaw &&
+        fs.readFileSync(aggregateSymlinkOwner, "utf8") === ownedRaw &&
+        aggregateSymlinkHidden.length === 0,
+      "The exact reviewer race remains visible, ambiguous, and nonterminal through the final receipt.",
+    );
+
+    const receiptPid = path.join(pidFixtureRoot, "receipt-race.pid");
+    const receiptOwner = path.join(pidFixtureRoot, "receipt-race-owner.pid");
+    fs.writeFileSync(receiptPid, ownedRaw, { mode: 0o600 });
+    const receiptPrior = await captureLaunchAgentUnloadPriorState({
+      label: LABEL,
+      pidPath: receiptPid,
+      port: PORT,
+      observeLabel: gone,
+      observeListener: async () => absent(),
+    });
+    let receiptClockReads = 0;
+    let cleanupCalls = 0;
+    const receiptRace = await observeLaunchAgentUnloadTerminalState({
+      label: LABEL,
+      pidPath: receiptPid,
+      port: PORT,
+      prior: receiptPrior,
+      timeoutMs: 0,
+      observeLabel: gone,
+      observeListener: async () => absent(),
+      processIsLive: () => false,
+      removePidFile: (pidPath, candidate, label) => {
+        cleanupCalls += 1;
+        return removeCollectorPidFileIfOwnedDetailed(pidPath, candidate, label, {
+          beforeClaim: () => fs.renameSync(receiptPid, receiptOwner),
+        });
+      },
+      now: () => {
+        receiptClockReads += 1;
+        if (receiptClockReads === 3) {
+          fs.writeFileSync(receiptPid, foreignRaw, { mode: 0o600 });
+        }
+        return 0;
+      },
+    });
+    check(
+      "cleanup_ambiguity_survives_reappearance_before_final_receipt",
+      cleanupCalls === 1 &&
+        !receiptRace.stopped &&
+        !receiptRace.pidCleaned &&
+        !receiptRace.removedPidFile &&
+        receiptRace.pidCleanupAmbiguous &&
+        !receiptRace.pidCleanupQuarantined &&
+        receiptRace.final.pidCleanupAmbiguous &&
+        receiptRace.timing.finalObservation === true &&
+        fs.readFileSync(receiptPid, "utf8") === foreignRaw &&
+        fs.readFileSync(receiptOwner, "utf8") === ownedRaw,
+      "A failed cleanup remains nonterminal when a new owner appears at the receipt boundary.",
     );
   } finally {
     fs.rmSync(pidFixtureRoot, { recursive: true, force: true });

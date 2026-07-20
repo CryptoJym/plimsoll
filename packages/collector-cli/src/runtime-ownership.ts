@@ -55,6 +55,8 @@ export type LaunchAgentUnloadObservation = Readonly<{
   pidRecordState: CollectorPidFileRead["kind"];
   pidCleaned: boolean;
   removedPidFile: boolean;
+  pidCleanupAmbiguous: boolean;
+  pidCleanupQuarantined: boolean;
   priorRuntimeLive: boolean;
   priorRuntimeCount: number;
   currentListenerMatchesPrior: boolean;
@@ -68,6 +70,8 @@ export type LaunchAgentUnloadOutcome = Readonly<{
   state: LaunchAgentUnloadState;
   pidCleaned: boolean;
   removedPidFile: boolean;
+  pidCleanupAmbiguous: boolean;
+  pidCleanupQuarantined: boolean;
   final: LaunchAgentUnloadObservation;
   timing: {
     timeoutMs: number;
@@ -115,6 +119,28 @@ export type PidFileUnsafeReason =
   | "mode"
   | "identity_changed"
   | "unreadable";
+
+export type CollectorPidCleanupResult = Readonly<{
+  removed: boolean;
+  ambiguous: boolean;
+  quarantined: boolean;
+  disposition:
+    | "removed"
+    | "not_owned"
+    | "preclaim_changed"
+    | "mismatch_quarantined"
+    | "claim_missing"
+    | "claim_changed"
+    | "destination_reappeared"
+    | "operation_failed";
+}>;
+
+export type CollectorPidCleanupHooks = Readonly<{
+  beforeClaim?: () => void;
+  afterPreClaimCheck?: () => void;
+  beforeMismatchRestore?: () => void;
+  afterClaim?: () => void;
+}>;
 
 type StartLockRecord = CollectorRuntimeIdentity & {
   createdAt: string;
@@ -450,11 +476,20 @@ export function removeCollectorPidFileIfOwned(
   pidPath: string,
   identity: CollectorRuntimeIdentity,
   label: string,
-  hooks: { beforeClaim?: () => void; afterClaim?: () => void } = {},
+  hooks: CollectorPidCleanupHooks = {},
 ) {
+  return removeCollectorPidFileIfOwnedDetailed(pidPath, identity, label, hooks).removed;
+}
+
+export function removeCollectorPidFileIfOwnedDetailed(
+  pidPath: string,
+  identity: CollectorRuntimeIdentity,
+  label: string,
+  hooks: CollectorPidCleanupHooks = {},
+): CollectorPidCleanupResult {
   const current = readCollectorPidFile(pidPath, label);
   if (current.kind !== "current" || !runtimeIdentityMatches(current.record, identity)) {
-    return false;
+    return cleanupResult("not_owned");
   }
   const absolutePath = path.resolve(pidPath);
   const claimPath = path.join(
@@ -464,13 +499,19 @@ export function removeCollectorPidFileIfOwned(
   let claimIdentity: PidFileIdentity | null = null;
   try {
     hooks.beforeClaim?.();
+    const preClaim = lstatPidPath(absolutePath);
+    if (!preClaim || !samePidFileIdentity(current.fileIdentity, pidFileIdentity(preClaim))) {
+      return cleanupResult("preclaim_changed", { ambiguous: true });
+    }
+    hooks.afterPreClaimCheck?.();
     fs.renameSync(absolutePath, claimPath);
     const claimStat = lstatPidPath(claimPath);
-    if (!claimStat) return false;
+    if (!claimStat) return cleanupResult("claim_missing", { ambiguous: true });
     claimIdentity = pidFileIdentity(claimStat);
     if (!samePidFileObject(current.fileIdentity, claimIdentity)) {
-      restorePidClaim(claimPath, absolutePath, claimIdentity);
-      return false;
+      hooks.beforeMismatchRestore?.();
+      const quarantined = quarantinePidClaim(claimPath, claimIdentity);
+      return cleanupResult("mismatch_quarantined", { ambiguous: true, quarantined });
     }
     const claimed = inspectCollectorPidFile(claimPath);
     if (
@@ -478,53 +519,76 @@ export function removeCollectorPidFileIfOwned(
       !samePidFileObject(claimIdentity, claimed.fileIdentity) ||
       claimed.raw !== current.raw
     ) {
-      restorePidClaim(claimPath, absolutePath, claimIdentity);
-      return false;
+      const quarantined = quarantinePidClaim(claimPath, claimIdentity);
+      return cleanupResult("claim_changed", { ambiguous: true, quarantined });
     }
     claimIdentity = claimed.fileIdentity;
     hooks.afterClaim?.();
     const verified = inspectCollectorPidFile(claimPath);
+    if (lstatPidPath(absolutePath)) {
+      const quarantined = quarantinePidClaim(claimPath, claimIdentity);
+      return cleanupResult("destination_reappeared", { ambiguous: true, quarantined });
+    }
     if (
       verified.kind !== "safe" ||
       !samePidFileIdentity(claimIdentity, verified.fileIdentity) ||
-      verified.raw !== current.raw ||
-      lstatPidPath(absolutePath)
+      verified.raw !== current.raw
     ) {
-      restorePidClaim(claimPath, absolutePath, claimIdentity);
-      return false;
+      const quarantined = quarantinePidClaim(claimPath, claimIdentity);
+      return cleanupResult("claim_changed", { ambiguous: true, quarantined });
     }
     const beforeUnlink = lstatPidPath(claimPath);
     if (!beforeUnlink || !samePidFileIdentity(claimIdentity, pidFileIdentity(beforeUnlink))) {
-      return false;
+      return cleanupResult("claim_changed", {
+        ambiguous: true,
+        quarantined: Boolean(beforeUnlink),
+      });
     }
     fs.unlinkSync(claimPath);
-    return !lstatPidPath(claimPath) && !lstatPidPath(absolutePath);
+    const claimSurvived = Boolean(lstatPidPath(claimPath));
+    const destinationReappeared = Boolean(lstatPidPath(absolutePath));
+    if (claimSurvived || destinationReappeared) {
+      return cleanupResult(
+        destinationReappeared ? "destination_reappeared" : "claim_changed",
+        { ambiguous: true, quarantined: claimSurvived },
+      );
+    }
+    return cleanupResult("removed", { removed: true });
   } catch {
-    if (claimIdentity) restorePidClaim(claimPath, absolutePath, claimIdentity);
-    return false;
+    const quarantined = claimIdentity ? quarantinePidClaim(claimPath, claimIdentity) : false;
+    return cleanupResult("operation_failed", { ambiguous: true, quarantined });
   }
 }
 
-function restorePidClaim(
-  claimPath: string,
-  destination: string,
-  expectedClaim: PidFileIdentity,
-) {
+function cleanupResult(
+  disposition: CollectorPidCleanupResult["disposition"],
+  overrides: Partial<Pick<CollectorPidCleanupResult, "removed" | "ambiguous" | "quarantined">> = {},
+): CollectorPidCleanupResult {
+  return Object.freeze({
+    removed: overrides.removed ?? false,
+    ambiguous: overrides.ambiguous ?? false,
+    quarantined: overrides.quarantined ?? false,
+    disposition,
+  });
+}
+
+function quarantinePidClaim(claimPath: string, expectedClaim: PidFileIdentity) {
   try {
-    if (lstatPidPath(destination)) return false;
     const claim = lstatPidPath(claimPath);
-    if (
-      !claim ||
-      claim.isSymbolicLink() ||
-      !claim.isFile() ||
-      !samePidFileObject(expectedClaim, pidFileIdentity(claim))
-    ) return false;
-    fs.linkSync(claimPath, destination);
-    fs.unlinkSync(claimPath);
-    const restored = lstatPidPath(destination);
-    return Boolean(restored && samePidFileObject(expectedClaim, pidFileIdentity(restored)));
+    if (!claim || !samePidFileObject(expectedClaim, pidFileIdentity(claim))) return false;
+    const quarantinePath = path.join(
+      path.dirname(claimPath),
+      `.${path.basename(claimPath)}.plimsoll-quarantine-${randomUUID()}`,
+    );
+    if (lstatPidPath(quarantinePath)) return true;
+    fs.renameSync(claimPath, quarantinePath);
+    const quarantined = lstatPidPath(quarantinePath);
+    return Boolean(
+      quarantined && samePidFileObject(expectedClaim, pidFileIdentity(quarantined)),
+    );
   } catch {
-    return false;
+    const retained = lstatPidPath(claimPath);
+    return Boolean(retained && samePidFileObject(expectedClaim, pidFileIdentity(retained)));
   }
 }
 
@@ -679,8 +743,10 @@ async function observeLaunchAgentUnloadOnce(options: {
     pidPath: string,
     identity: CollectorRuntimeIdentity,
     label: string,
-  ) => boolean;
+  ) => boolean | CollectorPidCleanupResult;
   removedPidFile: boolean;
+  pidCleanupAmbiguous: boolean;
+  pidCleanupQuarantined: boolean;
 }): Promise<LaunchAgentUnloadObservation> {
   const priorIdentities = priorRuntimeIdentities(options.prior);
   const [labelState, listenerState] = await Promise.all([
@@ -697,23 +763,36 @@ async function observeLaunchAgentUnloadOnce(options: {
   let currentPidIdentity = pidRuntimeIdentity(pidRead);
   let currentPidMatchesPrior = matchesAnyPrior(currentPidIdentity, priorIdentities);
   let removedPidFile = options.removedPidFile;
+  let pidCleanupAmbiguous = options.pidCleanupAmbiguous;
+  let pidCleanupQuarantined = options.pidCleanupQuarantined;
   if (
+    !pidCleanupAmbiguous &&
     currentPidIdentity &&
     currentPidMatchesPrior &&
     options.prior.ownership === "consistent" &&
     !options.processIsLive(currentPidIdentity)
   ) {
-    removedPidFile = options.removePidFile(
+    const attemptedIdentity = currentPidIdentity;
+    const cleanup = options.removePidFile(
       options.pidPath,
       currentPidIdentity,
       options.label,
-    ) || removedPidFile;
+    );
+    const cleanupRemoved = typeof cleanup === "boolean" ? cleanup : cleanup.removed;
+    removedPidFile = cleanupRemoved || removedPidFile;
+    if (typeof cleanup !== "boolean") {
+      pidCleanupAmbiguous = cleanup.ambiguous || pidCleanupAmbiguous;
+      pidCleanupQuarantined = cleanup.quarantined || pidCleanupQuarantined;
+    }
     pidRead = options.readPidFile(options.pidPath, options.label);
     currentPidIdentity = pidRuntimeIdentity(pidRead);
     currentPidMatchesPrior = matchesAnyPrior(currentPidIdentity, priorIdentities);
+    if (!cleanupRemoved && !runtimeIdentityMatches(attemptedIdentity, currentPidIdentity)) {
+      pidCleanupAmbiguous = true;
+    }
   }
 
-  const pidCleaned = pidRead.kind === "missing";
+  const pidCleaned = pidRead.kind === "missing" && !pidCleanupAmbiguous;
   let state: LaunchAgentUnloadState;
   const currentPidMatchesListener = runtimeIdentityMatches(currentPidIdentity, listenerIdentity);
   if (
@@ -737,6 +816,7 @@ async function observeLaunchAgentUnloadOnce(options: {
     state = "stale_owned_record";
   } else if (
     labelState.kind === "query_failed" ||
+    pidCleanupAmbiguous ||
     pidRead.kind === "unsafe" ||
     listenerState.kind === "indeterminate" ||
     options.prior.ownership === "unproven"
@@ -770,6 +850,8 @@ async function observeLaunchAgentUnloadOnce(options: {
     pidRecordState: pidRead.kind,
     pidCleaned,
     removedPidFile,
+    pidCleanupAmbiguous,
+    pidCleanupQuarantined,
     priorRuntimeLive,
     priorRuntimeCount: priorIdentities.length,
     currentListenerMatchesPrior,
@@ -794,7 +876,7 @@ export async function observeLaunchAgentUnloadTerminalState(options: {
     pidPath: string,
     identity: CollectorRuntimeIdentity,
     label: string,
-  ) => boolean;
+  ) => boolean | CollectorPidCleanupResult;
   now?: () => number;
   poll?: (milliseconds: number) => Promise<void>;
 }): Promise<LaunchAgentUnloadOutcome> {
@@ -807,8 +889,10 @@ export async function observeLaunchAgentUnloadTerminalState(options: {
   const observeListener = options.observeListener ?? (() => observeCollectorListener(options.port));
   const processIsLive = options.processIsLive ?? processIdentityIsLive;
   const readPidFile = options.readPidFile ?? readCollectorPidFile;
-  const removePidFile = options.removePidFile ?? removeCollectorPidFileIfOwned;
+  const removePidFile = options.removePidFile ?? removeCollectorPidFileIfOwnedDetailed;
   let removedPidFile = false;
+  let pidCleanupAmbiguous = false;
+  let pidCleanupQuarantined = false;
   let observations = 0;
   let deadlineCrossed = false;
   let final: LaunchAgentUnloadObservation;
@@ -824,9 +908,13 @@ export async function observeLaunchAgentUnloadTerminalState(options: {
       readPidFile,
       removePidFile,
       removedPidFile,
+      pidCleanupAmbiguous,
+      pidCleanupQuarantined,
     });
     observations += 1;
     removedPidFile = final.removedPidFile;
+    pidCleanupAmbiguous = final.pidCleanupAmbiguous;
+    pidCleanupQuarantined = final.pidCleanupQuarantined;
     if (final.stopped) break;
 
     const observedAt = now();
@@ -852,15 +940,21 @@ export async function observeLaunchAgentUnloadTerminalState(options: {
     readPidFile,
     removePidFile,
     removedPidFile,
+    pidCleanupAmbiguous,
+    pidCleanupQuarantined,
   });
   observations += 1;
   removedPidFile = final.removedPidFile;
+  pidCleanupAmbiguous = final.pidCleanupAmbiguous;
+  pidCleanupQuarantined = final.pidCleanupQuarantined;
   const elapsedMs = Math.max(0, receiptBoundaryAt - startedAt);
   return Object.freeze({
     stopped: final.stopped,
     state: final.state,
     pidCleaned: final.pidCleaned,
     removedPidFile,
+    pidCleanupAmbiguous,
+    pidCleanupQuarantined,
     final,
     timing: {
       timeoutMs,
