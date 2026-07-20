@@ -226,6 +226,8 @@ export class MaintenanceProcessBoundary {
   private oversizedFrames = 0;
   private lateFrames = 0;
   private framesThisJob = 0;
+  private controlFramesThisChild = 0;
+  private controlFrameLimitExceeded = false;
   private termSignals = 0;
   private killSignals = 0;
   private pidMismatches = 0;
@@ -414,6 +416,8 @@ export class MaintenanceProcessBoundary {
       throw new Error(reason);
     }
     this.child = child;
+    this.controlFramesThisChild = 0;
+    this.controlFrameLimitExceeded = false;
     this.spawnNonce = spawnNonce;
     this.childReady = false;
     this.childFingerprint = null;
@@ -445,6 +449,16 @@ export class MaintenanceProcessBoundary {
       this.invalidFrames += 1;
       void this.failProtocol("maintenance_protocol_invalid");
       return;
+    }
+    if (receipt.type === "ready" || receipt.type === "closed") {
+      if (this.controlFrameLimitExceeded) return;
+      this.controlFramesThisChild += 1;
+      if (this.controlFramesThisChild > MAINTENANCE_PROTOCOL_MAX_FRAMES_PER_JOB) {
+        this.controlFrameLimitExceeded = true;
+        this.invalidFrames += 1;
+        void this.failProtocol("maintenance_protocol_control_frame_limit");
+        return;
+      }
     }
     if (receipt.type === "ready") {
       if (!this.readyPromise || this.childReady || this.active) {
@@ -549,7 +563,8 @@ export class MaintenanceProcessBoundary {
     const child = this.child;
     const wasReady = this.childReady;
     const wasStarting = this.readyPromise !== null;
-    const expectedClose = this.terminating !== null || !this.accepting || this.state === "stopping";
+    const expectedClose = this.terminating !== null || this.orphanRisk ||
+      !this.accepting || this.state === "stopping";
     if (child) {
       child.removeListener("message", this.onMessage);
       child.removeListener("error", this.onChildError);
@@ -561,6 +576,8 @@ export class MaintenanceProcessBoundary {
     this.childFingerprint = null;
     this.parentFingerprintPromise = null;
     this.spawnNonce = null;
+    this.controlFramesThisChild = 0;
+    this.controlFrameLimitExceeded = false;
     this.reapedChildren += 1;
     this.orphanRisk = false;
     const waiters = this.closeWaiters;

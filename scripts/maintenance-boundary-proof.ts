@@ -26,8 +26,12 @@ import {
   type MaintenanceBoundaryChild,
   type MaintenanceBoundaryOptions,
 } from "../packages/collector-cli/src/maintenance-boundary";
-import { maintenanceCandidateHash } from "../packages/collector-cli/src/maintenance-progress";
 import {
+  maintenanceCandidateHash,
+  type MaintenanceProgressStage,
+} from "../packages/collector-cli/src/maintenance-progress";
+import {
+  MAINTENANCE_PROTOCOL_MAX_FRAMES_PER_JOB,
   MAINTENANCE_PROTOCOL_SCHEMA,
   type MaintenanceRunRequest,
 } from "../packages/collector-cli/src/maintenance-protocol";
@@ -103,6 +107,7 @@ class FakeChild extends EventEmitter {
   readonly signals: NodeJS.Signals[] = [];
   onSend: ((message: unknown) => void) | null = null;
   closeOn: NodeJS.Signals | null = "SIGTERM";
+  closeOnShutdown = true;
   private closed = false;
 
   constructor(pid: number) {
@@ -113,7 +118,7 @@ class FakeChild extends EventEmitter {
   send(message: unknown, ...args: unknown[]) {
     this.sent.push(message);
     this.onSend?.(message);
-    if ((message as { type?: string })?.type === "shutdown") {
+    if (this.closeOnShutdown && (message as { type?: string })?.type === "shutdown") {
       queueMicrotask(() => this.close(null));
     }
     const callback = [...args].reverse().find((value) => typeof value === "function") as
@@ -698,8 +703,18 @@ async function disconnectErrorAndPidReuseProof() {
   assert.ok(fingerprintBindings.every((binding) => (
     binding.parentPid === process.pid && binding.spawnNonce === fingerprintBindings[0]!.spawnNonce
   )));
+  const timedOutAt = reuseStatus.lastTimedOutAt;
+  const failureCount = reuseStatus.circuit.failureCount;
   reuse.children[0]!.close();
   await tick();
+  const lateCloseStatus = reuse.boundary.status();
+  assert.equal(lateCloseStatus.childPresent, false);
+  assert.equal(lateCloseStatus.reap.orphanRisk, false);
+  assert.equal(lateCloseStatus.lastOutcome, "timed_out");
+  assert.equal(lateCloseStatus.lastFailure, "maintenance_deadline_exceeded");
+  assert.equal(lateCloseStatus.lastTimedOutAt, timedOutAt);
+  assert.equal(lateCloseStatus.circuit.failureCount, failureCount);
+  assert.equal(lateCloseStatus.state, "circuit_open");
   assert.equal(await reuse.boundary.shutdown(), true);
 
   pass("disconnect_error_and_pid_reuse_fail_closed", {
@@ -710,6 +725,205 @@ async function disconnectErrorAndPidReuseProof() {
     unrelatedKillSignals: reuseStatus.reap.killSignals,
     pidMismatches: reuseStatus.reap.pidMismatches,
     nonceAndParentBound: true,
+    lateTrackedClosePreservedTimeout: true,
+    lateTrackedCloseFailureCount: lateCloseStatus.circuit.failureCount,
+  });
+}
+
+async function controlFrameFloodProof() {
+  let releaseReadyFingerprint!: (value: string | null) => void;
+  let readyFingerprintReleased = false;
+  let readySpawnNonce = "";
+  const readyFlood = fakeBoundary((spawnNonce) => {
+    readySpawnNonce = spawnNonce;
+    return new FakeChild(20_450);
+  }, {
+    fingerprint: async () => {
+      if (readyFingerprintReleased) return "ready-flood-process";
+      return new Promise<string | null>((resolve) => {
+        releaseReadyFingerprint = (value) => {
+          readyFingerprintReleased = true;
+          resolve(value);
+        };
+      });
+    },
+  });
+  const readyRun = readyFlood.boundary.run();
+  void readyRun.catch(() => undefined);
+  await tick();
+  const readyChild = readyFlood.children[0]!;
+  for (let index = 0; index < 200; index += 1) {
+    readyChild.emit("message", {
+      schema: MAINTENANCE_PROTOCOL_SCHEMA,
+      type: "ready",
+      spawnNonce: readySpawnNonce,
+    });
+  }
+  assert.equal(readyFlood.boundary.status().generation, 0);
+  releaseReadyFingerprint("ready-flood-process");
+  await rejectsWith(readyRun, "maintenance_protocol_control_frame_limit");
+  await waitFor(() => readyFlood.boundary.status().state === "circuit_open", "ready_flood_circuit");
+  const readyStatus = readyFlood.boundary.status();
+  assert.equal(readyStatus.protocol.invalidFrames, 1);
+  assert.ok(
+    readyStatus.protocol.lateFrames <= MAINTENANCE_PROTOCOL_MAX_FRAMES_PER_JOB,
+    "ready flood must leave only bounded pending readiness continuations",
+  );
+  assert.equal(readyStatus.generation, 0);
+  assert.equal(readyStatus.childPresent, false);
+  assert.equal(readyStatus.reap.reapedChildren, 1);
+  assert.equal(readyStatus.reap.orphanRisk, false);
+  assert.equal(readyStatus.circuit.failureCount, 1);
+  assert.equal(await readyFlood.boundary.shutdown(), true);
+
+  const closedFlood = fakeBoundary((spawnNonce) => {
+    const child = new FakeChild(20_451);
+    child.closeOnShutdown = false;
+    child.onSend = (raw) => {
+      const request = raw as MaintenanceRunRequest;
+      if (request.type === "run") {
+        queueMicrotask(() => child.emit("message", resultReceipt(request)));
+      }
+    };
+    ready(child, spawnNonce);
+    return child;
+  }, {
+    termGraceMs: 100,
+  });
+  await closedFlood.boundary.run();
+  const closedChild = closedFlood.children[0]!;
+  const stopping = closedFlood.boundary.shutdown();
+  for (let index = 0; index < 200; index += 1) {
+    closedChild.emit("message", {
+      schema: MAINTENANCE_PROTOCOL_SCHEMA,
+      type: "closed",
+      nonce: randomUUID(),
+    });
+  }
+  assert.equal(await stopping, true);
+  await waitFor(
+    () => closedFlood.boundary.status().circuit.failureCount === 1,
+    "closed_flood_circuit",
+  );
+  const closedStatus = closedFlood.boundary.status();
+  assert.equal(closedStatus.protocol.invalidFrames, 1);
+  assert.equal(closedStatus.lastFailure, "maintenance_protocol_control_frame_limit");
+  assert.equal(closedStatus.childPresent, false);
+  assert.equal(closedStatus.reap.reapedChildren, 1);
+  assert.equal(closedStatus.reap.orphanRisk, false);
+  assert.equal(closedStatus.circuit.failureCount, 1);
+
+  pass("ready_and_closed_control_frame_floods_fail_closed", {
+    injectedReadyFrames: 200,
+    admittedReadyGenerations: readyStatus.generation,
+    boundedReadyContinuations: readyStatus.protocol.lateFrames,
+    readyFloodReaped: readyStatus.reap.reapedChildren,
+    injectedClosedFrames: 200,
+    closedFloodReaped: closedStatus.reap.reapedChildren,
+    readyCircuitFailures: readyStatus.circuit.failureCount,
+    closedCircuitFailures: closedStatus.circuit.failureCount,
+  });
+}
+
+async function progressStageTimeoutProof() {
+  const stages = [
+    "source_scan",
+    "discovery_directory",
+    "candidate_metadata",
+    "jsonl_open",
+    "jsonl_validation",
+    "git_context",
+  ] as const satisfies readonly MaintenanceProgressStage[];
+  const stageReceipts: Array<Record<string, unknown>> = [];
+
+  for (const [index, stage] of stages.entries()) {
+    const privateCandidate = `${PRIVATE_PATH_SENTINEL}/${stage}/candidate.jsonl`;
+    const candidateHash = stage === "source_scan" ? null : maintenanceCandidateHash(privateCandidate);
+    const harness = fakeBoundary((spawnNonce) => {
+      const child = new FakeChild(20_460 + index);
+      child.onSend = (raw) => {
+        const request = raw as MaintenanceRunRequest;
+        if (request.type !== "run") return;
+        queueMicrotask(() => child.emit("message", {
+          schema: MAINTENANCE_PROTOCOL_SCHEMA,
+          type: "progress",
+          generation: request.generation,
+          nonce: request.nonce,
+          sequence: 1,
+          stage,
+          source: index % 2 === 0 ? "codex" : "claude_code",
+          candidateHash,
+        }));
+      };
+      ready(child, spawnNonce);
+      return child;
+    }, {
+      deadlineMs: 5,
+      termGraceMs: 5,
+      killGraceMs: 5,
+    });
+
+    const stalled = harness.boundary.run();
+    void stalled.catch(() => undefined);
+    await rejectsWith(stalled, "maintenance_deadline_exceeded");
+    const status = harness.boundary.status();
+    const child = harness.children[0]!;
+    assert.equal(status.lastOutcome, "timed_out");
+    assert.equal(status.lastFailure, "maintenance_deadline_exceeded");
+    assert.equal(status.state, "circuit_open");
+    assert.equal(status.circuit.failureCount, 1);
+    assert.equal(status.quarantine.stage, stage);
+    assert.equal(status.quarantine.candidateHash, candidateHash);
+    assert.ok(status.quarantine.until);
+    assert.equal(status.childPresent, false);
+    assert.equal(status.reap.reapedChildren, 1);
+    assert.equal(status.reap.orphanRisk, false);
+    assert.equal(
+      child.sent.some((message) => (
+        (message as { type?: string; sequence?: number }).type === "ack" &&
+        (message as { sequence?: number }).sequence === 1
+      )),
+      true,
+      `${stage} progress receipt must be acknowledged before the induced stall`,
+    );
+    assert.equal(
+      JSON.stringify(status).includes(PRIVATE_PATH_SENTINEL),
+      false,
+      `${stage} quarantine must remain path-free`,
+    );
+    stageReceipts.push({
+      stage,
+      candidateIdentity: candidateHash === null ? "none" : "sha256",
+      timedOut: status.lastOutcome === "timed_out",
+      circuitFailures: status.circuit.failureCount,
+      reapedChildren: status.reap.reapedChildren,
+      pathFree: true,
+    });
+    assert.equal(await harness.boundary.shutdown(), true);
+  }
+
+  pass("all_progress_stages_timeout_quarantine_and_reap", {
+    stages: stageReceipts,
+    injectedAfterProductionSchemaReceipt: true,
+    operatingSystemRegularFileStallClaimed: false,
+  });
+}
+
+function staticParentFilesystemIsolationProof() {
+  const boundarySource = fs.readFileSync(
+    path.resolve("packages/collector-cli/src/maintenance-boundary.ts"),
+    "utf8",
+  );
+  assert.doesNotMatch(boundarySource, /from\s+["'](?:node:)?fs["']/);
+  assert.doesNotMatch(
+    boundarySource,
+    /\b(?:readFile|readdir|lstat|stat|open|createReadStream)(?:Sync)?\s*\(/,
+  );
+  pass("parent_boundary_has_no_user_filesystem_reads", {
+    staticSourceChecked: "packages/collector-cli/src/maintenance-boundary.ts",
+    filesystemModuleImported: false,
+    userFilesystemReadPrimitivePresent: false,
+    processFingerprintSurface: "/bin/ps bounded child identity only",
   });
 }
 
@@ -1060,6 +1274,9 @@ async function main() {
   await spawnFailureAndConcurrentStartupProof();
   await shutdownDuringLazyStartupProof();
   await disconnectErrorAndPidReuseProof();
+  await controlFrameFloodProof();
+  await progressStageTimeoutProof();
+  staticParentFilesystemIsolationProof();
   await malformedOversizedFrameProof();
   await realWorkerCrashProof();
   await staleFenceAndImmediateSecondJobProof();
