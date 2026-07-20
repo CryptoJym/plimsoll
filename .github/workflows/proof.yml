@@ -108,10 +108,10 @@ jobs:
           pnpm proof:system-e2e:tamper -- --receipt evidence/system-e2e-proof-repeat.json --expected-source-commit "${{ github.event.pull_request.head.sha || github.sha }}"
 
       - name: Run strict isolated resource proof
-        run: pnpm proof:resource --require-integrated --receipt evidence/resource-proof.json
+        run: node ./node_modules/tsx/dist/cli.mjs ./scripts/resource-proof/index.ts --require-integrated --receipt evidence/resource-proof.json
 
       - name: Prove finalized privacy failures fail closed
-        run: pnpm proof:resource-finalization
+        run: node ./node_modules/tsx/dist/cli.mjs ./scripts/resource-proof/finalization-proof.ts
 
       - name: Upload evidence artifact
         if: always()
