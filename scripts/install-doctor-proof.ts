@@ -127,8 +127,8 @@ async function main() {
     "pnpm proof:outbox",
     "pnpm proof:join-isolation",
     "pnpm proof:outcome-timeline",
-    "pnpm proof:resource --require-integrated --receipt evidence/resource-proof.json",
-    "pnpm proof:resource-finalization",
+    "node ./node_modules/tsx/dist/cli.mjs ./scripts/resource-proof/index.ts --require-integrated --receipt evidence/resource-proof.json",
+    "node ./node_modules/tsx/dist/cli.mjs ./scripts/resource-proof/finalization-proof.ts",
   ];
   const gateCounts = Object.fromEntries(requiredStandaloneGates.map((gate) => [
     gate,

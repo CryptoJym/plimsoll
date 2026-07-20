@@ -1,8 +1,11 @@
 #!/usr/bin/env node
 
 import fs from "node:fs";
+import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   createResourceSandbox,
@@ -73,6 +76,634 @@ function summarize(scenarios: ScenarioReceipt[]) {
   };
 }
 
+export type ResourceReceiptWriteOptions = {
+  injectFailureAfterBytes?: number;
+  injectParentReplacementAfterTempWrite?: {
+    displacedParent: string;
+    replacementReceipt: string;
+  };
+  testBarrierAfterTempWrite?: {
+    directory: string;
+  };
+};
+
+class ResourceReceiptFinalizeError extends Error {
+  constructor(readonly code: string) {
+    super(code);
+    this.name = code;
+  }
+}
+
+function receiptFinalizeFailure(code: string): never {
+  throw new ResourceReceiptFinalizeError(code);
+}
+
+type ReceiptAncestor = {
+  path: string;
+  device: number;
+  inode: number;
+};
+
+/**
+ * macOS exposes private system directories through fixed root aliases such as
+ * `/var` -> `/private/var`. Normalize only those verified platform roots before
+ * applying the no-follow ancestor policy. `TMPDIR` is intentionally not trusted:
+ * caller-created aliases below a stable root remain visible to lstat and fail.
+ */
+function normalizeStableTemporaryRoot(candidate: string) {
+  const resolved = path.resolve(candidate);
+  if (process.platform !== "darwin") return resolved;
+  for (const [aliasRoot, expectedCanonicalRoot] of [
+    ["/var", "/private/var"],
+    ["/tmp", "/private/tmp"],
+  ] as const) {
+    let observedCanonicalRoot: string;
+    try {
+      observedCanonicalRoot = fs.realpathSync.native(aliasRoot);
+    } catch {
+      continue;
+    }
+    if (
+      observedCanonicalRoot === expectedCanonicalRoot &&
+      within(aliasRoot, resolved)
+    ) {
+      return path.join(
+        observedCanonicalRoot,
+        path.relative(aliasRoot, resolved),
+      );
+    }
+  }
+  return resolved;
+}
+
+function receiptAncestorPaths(parent: string) {
+  const parsed = path.parse(parent);
+  const relative = path.relative(parsed.root, parent);
+  const components = relative ? relative.split(path.sep).filter(Boolean) : [];
+  const paths: string[] = [];
+  let current = parsed.root;
+  for (const component of ["", ...components]) {
+    if (component) current = path.join(current, component);
+    paths.push(current);
+  }
+  return paths;
+}
+
+function validateObservedReceiptAncestor(current: string, stat: fs.Stats) {
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    receiptFinalizeFailure("ResourceReceiptAncestorInvalid");
+  }
+  return { path: current, device: stat.dev, inode: stat.ino };
+}
+
+function validateCanonicalReceiptParent(parent: string) {
+  try {
+    if (fs.realpathSync.native(parent) !== parent) {
+      receiptFinalizeFailure("ResourceReceiptAncestorInvalid");
+    }
+  } catch (error) {
+    if (error instanceof ResourceReceiptFinalizeError) throw error;
+    receiptFinalizeFailure("ResourceReceiptAncestorUnavailable");
+  }
+}
+
+/** Initial preparation is the only receipt path that may create an ancestor. */
+function prepareNoFollowReceiptAncestors(parent: string) {
+  const ancestors: ReceiptAncestor[] = [];
+  for (const current of receiptAncestorPaths(parent)) {
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(current);
+    } catch (error) {
+      if (
+        (error as NodeJS.ErrnoException).code !== "ENOENT" ||
+        current === path.parse(parent).root
+      ) {
+        receiptFinalizeFailure("ResourceReceiptAncestorUnavailable");
+      }
+      try {
+        fs.mkdirSync(current, { mode: 0o700 });
+        stat = fs.lstatSync(current);
+      } catch {
+        receiptFinalizeFailure("ResourceReceiptAncestorUnavailable");
+      }
+    }
+    ancestors.push(validateObservedReceiptAncestor(current, stat));
+  }
+  validateCanonicalReceiptParent(parent);
+  return ancestors;
+}
+
+/** Authority observation is strictly read-only and never recreates a missing path. */
+function observeNoFollowReceiptAncestors(parent: string) {
+  const ancestors: ReceiptAncestor[] = [];
+  for (const current of receiptAncestorPaths(parent)) {
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(current);
+    } catch {
+      receiptFinalizeFailure("ResourceReceiptAncestorUnavailable");
+    }
+    ancestors.push(validateObservedReceiptAncestor(current, stat));
+  }
+  validateCanonicalReceiptParent(parent);
+  return ancestors;
+}
+
+function sameReceiptAncestorAuthority(
+  expected: readonly ReceiptAncestor[],
+  observed: readonly ReceiptAncestor[],
+) {
+  return (
+    expected.length === observed.length &&
+    expected.every(
+      (entry, index) =>
+        entry.path === observed[index]?.path &&
+        entry.device === observed[index]?.device &&
+        entry.inode === observed[index]?.inode,
+    )
+  );
+}
+
+function prepareResourceReceiptDestination(receiptPath: string) {
+  const resolved = normalizeStableTemporaryRoot(receiptPath);
+  const parent = path.dirname(resolved);
+  let ancestors: ReceiptAncestor[];
+  try {
+    ancestors = prepareNoFollowReceiptAncestors(parent);
+    try {
+      const destinationStat = fs.lstatSync(resolved);
+      if (!destinationStat.isFile() && !destinationStat.isSymbolicLink()) {
+        receiptFinalizeFailure("ResourceReceiptDestinationInvalid");
+      }
+    } catch (error) {
+      if (error instanceof ResourceReceiptFinalizeError) throw error;
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        receiptFinalizeFailure("ResourceReceiptDestinationUnavailable");
+      }
+    }
+  } catch (error) {
+    if (error instanceof ResourceReceiptFinalizeError) throw error;
+    receiptFinalizeFailure("ResourceReceiptAncestorUnavailable");
+  }
+  return { resolved, parent, ancestors };
+}
+
+function observeResourceReceiptDestination(receiptPath: string) {
+  const resolved = normalizeStableTemporaryRoot(receiptPath);
+  const parent = path.dirname(resolved);
+  const ancestors = observeNoFollowReceiptAncestors(parent);
+  try {
+    const destinationStat = fs.lstatSync(resolved);
+    if (!destinationStat.isFile() && !destinationStat.isSymbolicLink()) {
+      receiptFinalizeFailure("ResourceReceiptDestinationInvalid");
+    }
+  } catch (error) {
+    if (error instanceof ResourceReceiptFinalizeError) throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      receiptFinalizeFailure("ResourceReceiptDestinationUnavailable");
+    }
+  }
+  return { resolved, parent, ancestors };
+}
+
+function assertSimpleReceiptName(name: string) {
+  if (!name || name === "." || name === ".." || path.basename(name) !== name) {
+    receiptFinalizeFailure("ResourceReceiptNameInvalid");
+  }
+}
+
+function anchoredParentStillAuthoritative(
+  absoluteParent: string,
+  expectedDevice: number,
+  expectedInode: number,
+) {
+  try {
+    const authority = observeNoFollowReceiptAncestors(absoluteParent).at(-1);
+    return Boolean(
+      authority &&
+        authority.device === expectedDevice &&
+        authority.inode === expectedInode,
+    );
+  } catch (error) {
+    if (error instanceof ResourceReceiptFinalizeError) return false;
+    throw error;
+  }
+}
+
+const receiptBarrierWaitState = new Int32Array(new SharedArrayBuffer(4));
+
+function waitAtReceiptTestBarrier(args: {
+  absoluteParent: string;
+  directory: string;
+}) {
+  const directory = path.resolve(args.directory);
+  if (path.dirname(directory) !== path.dirname(path.resolve(args.absoluteParent))) {
+    receiptFinalizeFailure("ResourceReceiptBarrierInvalid");
+  }
+  let directoryStat: fs.Stats;
+  try {
+    directoryStat = fs.lstatSync(directory);
+    if (
+      !directoryStat.isDirectory() ||
+      directoryStat.isSymbolicLink() ||
+      fs.realpathSync.native(directory) !== directory
+    ) {
+      receiptFinalizeFailure("ResourceReceiptBarrierInvalid");
+    }
+  } catch (error) {
+    if (error instanceof ResourceReceiptFinalizeError) throw error;
+    receiptFinalizeFailure("ResourceReceiptBarrierUnavailable");
+  }
+
+  const readyPath = path.join(directory, "writer-ready");
+  const continuePath = path.join(directory, "parent-displaced");
+  try {
+    fs.writeFileSync(readyPath, "ready\n", {
+      flag: "wx",
+      mode: 0o600,
+    });
+  } catch {
+    receiptFinalizeFailure("ResourceReceiptBarrierUnavailable");
+  }
+
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    try {
+      const stat = fs.lstatSync(continuePath);
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        receiptFinalizeFailure("ResourceReceiptBarrierInvalid");
+      }
+      return;
+    } catch (error) {
+      if (error instanceof ResourceReceiptFinalizeError) throw error;
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        receiptFinalizeFailure("ResourceReceiptBarrierUnavailable");
+      }
+    }
+    if (Date.now() >= deadline) {
+      receiptFinalizeFailure("ResourceReceiptBarrierTimeout");
+    }
+    Atomics.wait(receiptBarrierWaitState, 0, 0, 10);
+  }
+}
+
+function anchoredEntryExists(name: string) {
+  try {
+    fs.lstatSync(name);
+    return true;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return false;
+    receiptFinalizeFailure("ResourceReceiptDestinationUnavailable");
+  }
+}
+
+function writeResourceReceiptFromAnchoredCwd(args: {
+  absoluteParent: string;
+  finalName: string;
+  tempName: string;
+  expectedDevice: number;
+  expectedInode: number;
+  serialized: string;
+  injectFailureAfterBytes?: number;
+  injectParentReplacementAfterTempWrite?: {
+    displacedParent: string;
+    replacementReceipt: string;
+  };
+  testBarrierAfterTempWrite?: {
+    directory: string;
+  };
+}) {
+  assertSimpleReceiptName(args.finalName);
+  assertSimpleReceiptName(args.tempName);
+  const anchoredParent = fs.statSync(".");
+  if (
+    !anchoredParent.isDirectory() ||
+    anchoredParent.dev !== args.expectedDevice ||
+    anchoredParent.ino !== args.expectedInode ||
+    !anchoredParentStillAuthoritative(
+      args.absoluteParent,
+      args.expectedDevice,
+      args.expectedInode,
+    )
+  ) {
+    receiptFinalizeFailure("ResourceReceiptAncestorChanged");
+  }
+
+  try {
+    const destination = fs.lstatSync(args.finalName);
+    if (!destination.isFile() && !destination.isSymbolicLink()) {
+      receiptFinalizeFailure("ResourceReceiptDestinationInvalid");
+    }
+  } catch (error) {
+    if (error instanceof ResourceReceiptFinalizeError) throw error;
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+      receiptFinalizeFailure("ResourceReceiptDestinationUnavailable");
+    }
+  }
+
+  const bytes = Buffer.from(args.serialized, "utf8");
+  const injectAfter = args.injectFailureAfterBytes;
+  if (
+    injectAfter !== undefined &&
+    (!Number.isSafeInteger(injectAfter) || injectAfter < 0 || injectAfter >= bytes.length)
+  ) {
+    receiptFinalizeFailure("ResourceReceiptInjectionInvalid");
+  }
+
+  const backupName = `.${args.finalName}.${process.pid}.${randomUUID()}.backup`;
+  const failedName = `.${args.finalName}.${process.pid}.${randomUUID()}.failed`;
+  let fd: number | undefined;
+  let backupMoved = false;
+  let published = false;
+  try {
+    fd = fs.openSync(
+      args.tempName,
+      fs.constants.O_WRONLY |
+        fs.constants.O_CREAT |
+        fs.constants.O_EXCL |
+        (fs.constants.O_NOFOLLOW ?? 0),
+      0o600,
+    );
+    const opened = fs.fstatSync(fd);
+    const openedPath = fs.lstatSync(args.tempName);
+    if (
+      !opened.isFile() ||
+      openedPath.isSymbolicLink() ||
+      opened.dev !== openedPath.dev ||
+      opened.ino !== openedPath.ino
+    ) {
+      receiptFinalizeFailure("ResourceReceiptTempInvalid");
+    }
+    fs.fchmodSync(fd, 0o600);
+    let offset = 0;
+    while (offset < bytes.length) {
+      if (injectAfter !== undefined && offset >= injectAfter) {
+        receiptFinalizeFailure("ResourceReceiptInjectedWriteFailure");
+      }
+      const remainingBeforeInjection =
+        injectAfter === undefined ? bytes.length - offset : injectAfter - offset;
+      const length = Math.min(bytes.length - offset, remainingBeforeInjection);
+      if (length <= 0) receiptFinalizeFailure("ResourceReceiptInjectedWriteFailure");
+      const written = fs.writeSync(fd, bytes, offset, length, null);
+      if (written <= 0) receiptFinalizeFailure("ResourceReceiptWriteFailed");
+      offset += written;
+    }
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+
+    if (args.testBarrierAfterTempWrite) {
+      waitAtReceiptTestBarrier({
+        absoluteParent: args.absoluteParent,
+        directory: args.testBarrierAfterTempWrite.directory,
+      });
+    }
+
+    const replacement = args.injectParentReplacementAfterTempWrite;
+    if (replacement) {
+      if (
+        path.dirname(path.resolve(replacement.displacedParent)) !==
+          path.dirname(path.resolve(args.absoluteParent)) ||
+        path.resolve(replacement.displacedParent) === path.resolve(args.absoluteParent)
+      ) {
+        receiptFinalizeFailure("ResourceReceiptInjectionInvalid");
+      }
+      fs.renameSync(args.absoluteParent, replacement.displacedParent);
+      fs.mkdirSync(args.absoluteParent, { mode: 0o700 });
+      fs.writeFileSync(
+        path.join(args.absoluteParent, args.finalName),
+        replacement.replacementReceipt,
+        { mode: 0o600 },
+      );
+    }
+
+    if (
+      !anchoredParentStillAuthoritative(
+        args.absoluteParent,
+        args.expectedDevice,
+        args.expectedInode,
+      )
+    ) {
+      receiptFinalizeFailure("ResourceReceiptAncestorChanged");
+    }
+    if (anchoredEntryExists(args.finalName)) {
+      fs.renameSync(args.finalName, backupName);
+      backupMoved = true;
+    }
+    fs.renameSync(args.tempName, args.finalName);
+    published = true;
+
+    if (
+      !anchoredParentStillAuthoritative(
+        args.absoluteParent,
+        args.expectedDevice,
+        args.expectedInode,
+      )
+    ) {
+      receiptFinalizeFailure("ResourceReceiptAncestorChanged");
+    }
+    const finalized = fs.lstatSync(args.finalName);
+    if (
+      !finalized.isFile() ||
+      finalized.isSymbolicLink() ||
+      (finalized.mode & 0o777) !== 0o600 ||
+      finalized.size !== bytes.length
+    ) {
+      receiptFinalizeFailure("ResourceReceiptFinalStateInvalid");
+    }
+    const directoryFd = fs.openSync(
+      ".",
+      fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0),
+    );
+    try {
+      fs.fsyncSync(directoryFd);
+    } finally {
+      fs.closeSync(directoryFd);
+    }
+    if (backupMoved) {
+      fs.unlinkSync(backupName);
+      backupMoved = false;
+    }
+    return { bytesWritten: bytes.length, mode: finalized.mode & 0o777 };
+  } catch (error) {
+    if (fd !== undefined) {
+      try {
+        fs.closeSync(fd);
+      } catch {
+        // Preserve the original path-free finalization failure.
+      }
+    }
+    try {
+      if (published && anchoredEntryExists(args.finalName)) {
+        fs.renameSync(args.finalName, failedName);
+        published = false;
+      }
+      if (backupMoved && anchoredEntryExists(backupName)) {
+        fs.renameSync(backupName, args.finalName);
+        backupMoved = false;
+      }
+      for (const disposable of [args.tempName, failedName, backupName]) {
+        try {
+          fs.unlinkSync(disposable);
+        } catch (cleanupError) {
+          if ((cleanupError as NodeJS.ErrnoException).code !== "ENOENT") {
+            receiptFinalizeFailure("ResourceReceiptRollbackFailed");
+          }
+        }
+      }
+    } catch (rollbackError) {
+      if (rollbackError instanceof ResourceReceiptFinalizeError) throw rollbackError;
+      receiptFinalizeFailure("ResourceReceiptRollbackFailed");
+    }
+    if (error instanceof ResourceReceiptFinalizeError) throw error;
+    receiptFinalizeFailure("ResourceReceiptAtomicWriteFailed");
+  }
+}
+
+export function writeResourceReceiptAtomically(
+  receiptPath: string,
+  serialized: string,
+  options: ResourceReceiptWriteOptions = {},
+) {
+  const initialAuthority = prepareResourceReceiptDestination(receiptPath);
+  const confirmedAuthority = observeResourceReceiptDestination(receiptPath);
+  if (
+    !sameReceiptAncestorAuthority(
+      initialAuthority.ancestors,
+      confirmedAuthority.ancestors,
+    )
+  ) {
+    receiptFinalizeFailure("ResourceReceiptAncestorChanged");
+  }
+  const expectedParent = initialAuthority.ancestors.at(-1);
+  if (!expectedParent) receiptFinalizeFailure("ResourceReceiptAncestorUnavailable");
+  const finalName = path.basename(initialAuthority.resolved);
+  const tempName = `.${finalName}.${process.pid}.${randomUUID()}.tmp`;
+  const modulePath = fileURLToPath(import.meta.url);
+  const repoRoot = path.resolve(path.dirname(modulePath), "../..");
+  const tsxCli = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
+  const run = spawnSync(
+    process.execPath,
+    [
+      tsxCli,
+      modulePath,
+      "--atomic-receipt-child",
+    ],
+    {
+      cwd: initialAuthority.parent,
+      env: {
+        HOME: initialAuthority.parent,
+        USERPROFILE: initialAuthority.parent,
+        TMPDIR: initialAuthority.parent,
+        TMP: initialAuthority.parent,
+        TEMP: initialAuthority.parent,
+        TZ: "UTC",
+        LANG: "C",
+        LC_ALL: "C",
+      },
+      input: JSON.stringify({
+        absoluteParent: initialAuthority.parent,
+        finalName,
+        tempName,
+        expectedDevice: expectedParent.device,
+        expectedInode: expectedParent.inode,
+        serialized,
+        injectFailureAfterBytes: options.injectFailureAfterBytes,
+        injectParentReplacementAfterTempWrite:
+          options.injectParentReplacementAfterTempWrite,
+        testBarrierAfterTempWrite: options.testBarrierAfterTempWrite,
+      }),
+      encoding: "utf8",
+      timeout: 30_000,
+      maxBuffer: 1024 * 1024,
+    },
+  );
+  let result: { passed?: boolean; bytesWritten?: number; mode?: number; error?: string } = {};
+  try {
+    result = JSON.parse(run.stdout || "{}") as typeof result;
+  } catch {
+    receiptFinalizeFailure("ResourceReceiptChildProtocolInvalid");
+  }
+  if (
+    run.status !== 0 ||
+    run.error ||
+    result.passed !== true ||
+    result.bytesWritten !== Buffer.byteLength(serialized) ||
+    result.mode !== 0o600
+  ) {
+    const symbolicError =
+      typeof result.error === "string" && /^ResourceReceipt[A-Za-z]+$/.test(result.error)
+        ? result.error
+        : "ResourceReceiptChildFailed";
+    receiptFinalizeFailure(symbolicError);
+  }
+  return { bytesWritten: result.bytesWritten, mode: result.mode };
+}
+
+function atomicReceiptChildMain() {
+  const input = fs.readFileSync(0, "utf8");
+  if (Buffer.byteLength(input) > 1024 * 1024) {
+    receiptFinalizeFailure("ResourceReceiptChildInputInvalid");
+  }
+  let request: {
+    absoluteParent?: unknown;
+    finalName?: unknown;
+    tempName?: unknown;
+    expectedDevice?: unknown;
+    expectedInode?: unknown;
+    serialized?: unknown;
+    injectFailureAfterBytes?: unknown;
+    injectParentReplacementAfterTempWrite?: unknown;
+    testBarrierAfterTempWrite?: unknown;
+  } = {};
+  try {
+    request = JSON.parse(input) as typeof request;
+  } catch {
+    receiptFinalizeFailure("ResourceReceiptChildInputInvalid");
+  }
+  if (
+    typeof request.absoluteParent !== "string" ||
+    typeof request.finalName !== "string" ||
+    typeof request.tempName !== "string" ||
+    typeof request.serialized !== "string" ||
+    !Number.isSafeInteger(request.expectedDevice) ||
+    !Number.isSafeInteger(request.expectedInode) ||
+    (request.injectFailureAfterBytes !== undefined &&
+      !Number.isSafeInteger(request.injectFailureAfterBytes)) ||
+    (request.injectParentReplacementAfterTempWrite !== undefined &&
+      (typeof request.injectParentReplacementAfterTempWrite !== "object" ||
+        request.injectParentReplacementAfterTempWrite === null ||
+        typeof (request.injectParentReplacementAfterTempWrite as Record<string, unknown>)
+          .displacedParent !== "string" ||
+        typeof (request.injectParentReplacementAfterTempWrite as Record<string, unknown>)
+          .replacementReceipt !== "string")) ||
+    (request.testBarrierAfterTempWrite !== undefined &&
+      (typeof request.testBarrierAfterTempWrite !== "object" ||
+        request.testBarrierAfterTempWrite === null ||
+        typeof (request.testBarrierAfterTempWrite as Record<string, unknown>)
+          .directory !== "string"))
+  ) {
+    receiptFinalizeFailure("ResourceReceiptChildArgumentsInvalid");
+  }
+  const result = writeResourceReceiptFromAnchoredCwd({
+    absoluteParent: request.absoluteParent,
+    finalName: request.finalName,
+    tempName: request.tempName,
+    expectedDevice: request.expectedDevice as number,
+    expectedInode: request.expectedInode as number,
+    serialized: request.serialized,
+    injectFailureAfterBytes: request.injectFailureAfterBytes as number | undefined,
+    injectParentReplacementAfterTempWrite:
+      request.injectParentReplacementAfterTempWrite as
+        | { displacedParent: string; replacementReceipt: string }
+        | undefined,
+    testBarrierAfterTempWrite:
+      request.testBarrierAfterTempWrite as { directory: string } | undefined,
+  });
+  process.stdout.write(`${JSON.stringify({ passed: true, ...result })}\n`);
+}
+
 async function main() {
   if (process.argv.includes("--help") || process.argv.includes("-h")) {
     printHelp();
@@ -92,7 +723,13 @@ async function main() {
       "Application Support",
       "Plimsoll",
     );
-    if (within(liveCollectorHome, receiptPath)) {
+    if (
+      within(liveCollectorHome, receiptPath) ||
+      within(
+        normalizeStableTemporaryRoot(liveCollectorHome),
+        normalizeStableTemporaryRoot(receiptPath),
+      )
+    ) {
       throw new Error("--receipt must not point inside the operator's live Plimsoll directory");
     }
   }
@@ -187,10 +824,7 @@ async function main() {
       throw new Error("ResourceReceiptPrivacyViolation");
     }
     if (receiptPath) {
-      const resolved = path.resolve(receiptPath);
-      fs.mkdirSync(path.dirname(resolved), { recursive: true });
-      fs.writeFileSync(resolved, serialized, { mode: 0o600 });
-      fs.chmodSync(resolved, 0o600);
+      writeResourceReceiptAtomically(receiptPath, serialized);
     }
     process.stdout.write(serialized);
 
@@ -202,10 +836,31 @@ async function main() {
   }
 }
 
-main().catch((error) => {
-  const errorClass = error instanceof Error ? error.name : "UnknownError";
-  process.stderr.write(
-    `${JSON.stringify({ schema: RESOURCE_PROOF_SCHEMA, overall: "fail", error: errorClass })}\n`,
-  );
-  process.exitCode = 1;
-});
+const invokedAsScript = Boolean(
+  process.argv[1] &&
+    path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url)),
+);
+if (invokedAsScript) {
+  if (process.argv[2] === "--atomic-receipt-child") {
+    try {
+      atomicReceiptChildMain();
+    } catch (error) {
+      const errorClass =
+        error instanceof ResourceReceiptFinalizeError
+          ? error.name
+          : "ResourceReceiptChildFailed";
+      process.stdout.write(
+        `${JSON.stringify({ passed: false, error: errorClass })}\n`,
+      );
+      process.exitCode = 1;
+    }
+  } else {
+    main().catch((error) => {
+      const errorClass = error instanceof Error ? error.name : "UnknownError";
+      process.stderr.write(
+        `${JSON.stringify({ schema: RESOURCE_PROOF_SCHEMA, overall: "fail", error: errorClass })}\n`,
+      );
+      process.exitCode = 1;
+    });
+  }
+}
