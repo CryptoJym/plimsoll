@@ -2570,6 +2570,300 @@ function requireRegularDirectory(candidate: string, errorCode: string) {
   if (!stat.isDirectory() || stat.isSymbolicLink()) buildFailure(errorCode);
 }
 
+function resourceFixtureManifest(root: string) {
+  const entries = new Map<string, string>();
+  const visit = (current: string) => {
+    for (const entry of fs
+      .readdirSync(current, { withFileTypes: true })
+      .sort((left, right) => left.name.localeCompare(right.name))) {
+      const full = path.join(current, entry.name);
+      const relative = path.relative(root, full);
+      const stat = fs.lstatSync(full);
+      if (entry.isDirectory()) {
+        entries.set(relative, `directory:${stat.mode & 0o777}`);
+        visit(full);
+      } else if (entry.isFile()) {
+        const digest = createHash("sha256").update(fs.readFileSync(full)).digest("hex");
+        entries.set(relative, `file:${stat.mode & 0o777}:${stat.size}:${digest}`);
+      } else if (entry.isSymbolicLink()) {
+        entries.set(relative, `symlink:${fs.readlinkSync(full)}`);
+      } else {
+        entries.set(relative, `other:${stat.mode & 0o777}:${stat.size}`);
+      }
+    }
+  };
+  visit(root);
+  return entries;
+}
+
+function manifestHasExactAdditions(
+  before: ReadonlyMap<string, string>,
+  after: ReadonlyMap<string, string>,
+  expectedAdditions: readonly string[],
+) {
+  const expected = new Set(expectedAdditions);
+  if (after.size !== before.size + expected.size) return false;
+  for (const [name, fingerprint] of before) {
+    if (after.get(name) !== fingerprint) return false;
+  }
+  for (const name of expected) {
+    if (!after.has(name) || before.has(name)) return false;
+  }
+  return true;
+}
+
+const PACKAGED_RUNTIME_DEPENDENCY_VERSIONS = {
+  "better-sqlite3": "12.10.0",
+  bindings: "1.5.0",
+  "file-uri-to-path": "1.0.0",
+} as const;
+
+function canonicalFrozenRuntimeDependencyGraphRoot() {
+  try {
+    const canonicalRoot = fs.realpathSync.native(
+      path.join(repoRoot, "node_modules"),
+    );
+    const rootStat = fs.lstatSync(canonicalRoot);
+    if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
+      buildFailure("PackagedCollectorRuntimeDependencyGraphInvalid");
+    }
+    return canonicalRoot;
+  } catch (error) {
+    if (error instanceof PackagedCollectorBuildError) throw error;
+    buildFailure("PackagedCollectorRuntimeDependencyGraphInvalid");
+  }
+}
+
+function resolveFrozenPackageRoot(
+  resolver: NodeRequire,
+  packageName: keyof typeof PACKAGED_RUNTIME_DEPENDENCY_VERSIONS,
+  dependencyGraphRoot: string,
+) {
+  let entry: string;
+  try {
+    entry = fs.realpathSync.native(resolver.resolve(packageName));
+  } catch {
+    buildFailure("PackagedCollectorRuntimeDependencyUnavailable");
+  }
+  const entryStat = fs.lstatSync(entry);
+  if (
+    !within(dependencyGraphRoot, entry) ||
+    !entryStat.isFile() ||
+    entryStat.isSymbolicLink()
+  ) {
+    buildFailure("PackagedCollectorRuntimeDependencyInvalid");
+  }
+  let current = path.dirname(entry);
+  for (;;) {
+    if (!within(dependencyGraphRoot, current)) {
+      buildFailure("PackagedCollectorRuntimeDependencyInvalid");
+    }
+    const packageJsonPath = path.join(current, "package.json");
+    try {
+      const stat = fs.lstatSync(packageJsonPath);
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        buildFailure("PackagedCollectorRuntimeDependencyInvalid");
+      }
+      const parsed = JSON.parse(fs.readFileSync(packageJsonPath, "utf8")) as {
+        name?: unknown;
+        version?: unknown;
+      };
+      if (parsed.name === packageName) {
+        if (
+          typeof parsed.version !== "string" ||
+          parsed.version !== PACKAGED_RUNTIME_DEPENDENCY_VERSIONS[packageName]
+        ) {
+          buildFailure("PackagedCollectorRuntimeDependencyVersionInvalid");
+        }
+        const root = fs.realpathSync.native(current);
+        const rootStat = fs.lstatSync(root);
+        if (
+          !within(dependencyGraphRoot, root) ||
+          !within(root, entry) ||
+          !rootStat.isDirectory() ||
+          rootStat.isSymbolicLink()
+        ) {
+          buildFailure("PackagedCollectorRuntimeDependencyInvalid");
+        }
+        return { entry, root, packageJsonPath, version: parsed.version };
+      }
+    } catch (error) {
+      if (error instanceof PackagedCollectorBuildError) throw error;
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        buildFailure("PackagedCollectorRuntimeDependencyInvalid");
+      }
+    }
+    const parent = path.dirname(current);
+    if (parent === current) {
+      buildFailure("PackagedCollectorRuntimeDependencyUnavailable");
+    }
+    current = parent;
+  }
+}
+
+function collectAllowlistedRuntimeTree(root: string) {
+  const stat = fs.lstatSync(root);
+  if (!stat.isDirectory() || stat.isSymbolicLink()) {
+    buildFailure("PackagedCollectorRuntimeDependencyInvalid");
+  }
+  const files: string[] = [];
+  const visit = (current: string) => {
+    for (const entry of fs
+      .readdirSync(current, { withFileTypes: true })
+      .sort((left, right) => left.name.localeCompare(right.name))) {
+      const full = path.join(current, entry.name);
+      const observed = fs.lstatSync(full);
+      if (entry.isDirectory()) {
+        if (!observed.isDirectory() || observed.isSymbolicLink()) {
+          buildFailure("PackagedCollectorRuntimeDependencyInvalid");
+        }
+        visit(full);
+      } else if (entry.isFile()) {
+        if (!observed.isFile() || observed.isSymbolicLink()) {
+          buildFailure("PackagedCollectorRuntimeDependencyInvalid");
+        }
+        files.push(path.relative(root, full));
+      } else {
+        buildFailure("PackagedCollectorRuntimeDependencyInvalid");
+      }
+    }
+  };
+  visit(root);
+  return files;
+}
+
+function manifestDigest(manifest: ReadonlyMap<string, string>) {
+  const hash = createHash("sha256");
+  for (const [name, fingerprint] of [...manifest].sort(([left], [right]) =>
+    left.localeCompare(right),
+  )) {
+    hash.update(`${name}\0${fingerprint}\0`);
+  }
+  return hash.digest("hex");
+}
+
+function runtimeDependencyManifest(root: string) {
+  return new Map(
+    [...resourceFixtureManifest(root)].filter(
+      ([name]) => name === "node_modules" || name.startsWith(`node_modules${path.sep}`),
+    ),
+  );
+}
+
+function sameManifest(
+  expected: ReadonlyMap<string, string>,
+  observed: ReadonlyMap<string, string>,
+) {
+  return (
+    expected.size === observed.size &&
+    [...expected].every(
+      ([name, fingerprint]) => observed.get(name) === fingerprint,
+    )
+  );
+}
+
+function stagePackagedRuntimeDependencies(stagedOutputDirectory: string) {
+  const dependencyGraphRoot = canonicalFrozenRuntimeDependencyGraphRoot();
+  const repositoryRequire = createRequire(path.join(repoRoot, "package.json"));
+  const betterSqlite = resolveFrozenPackageRoot(
+    repositoryRequire,
+    "better-sqlite3",
+    dependencyGraphRoot,
+  );
+  const betterSqliteRequire = createRequire(betterSqlite.entry);
+  const bindings = resolveFrozenPackageRoot(
+    betterSqliteRequire,
+    "bindings",
+    dependencyGraphRoot,
+  );
+  const bindingsRequire = createRequire(bindings.entry);
+  const fileUriToPath = resolveFrozenPackageRoot(
+    bindingsRequire,
+    "file-uri-to-path",
+    dependencyGraphRoot,
+  );
+  const copies: Array<{ source: string; relative: string; mode: number }> = [];
+  const addFile = (
+    packageName: keyof typeof PACKAGED_RUNTIME_DEPENDENCY_VERSIONS,
+    packageRoot: string,
+    packageRelative: string,
+    mode = 0o644,
+  ) => {
+    copies.push({
+      source: path.join(packageRoot, packageRelative),
+      relative: path.join("node_modules", packageName, packageRelative),
+      mode,
+    });
+  };
+
+  for (const packageRelative of ["package.json", "LICENSE"]) {
+    addFile("better-sqlite3", betterSqlite.root, packageRelative);
+  }
+  for (const libraryRelative of collectAllowlistedRuntimeTree(
+    path.join(betterSqlite.root, "lib"),
+  )) {
+    addFile(
+      "better-sqlite3",
+      betterSqlite.root,
+      path.join("lib", libraryRelative),
+    );
+  }
+  addFile(
+    "better-sqlite3",
+    betterSqlite.root,
+    path.join("build", "Release", "better_sqlite3.node"),
+    0o755,
+  );
+  for (const packageRelative of ["package.json", "LICENSE.md", "bindings.js"]) {
+    addFile("bindings", bindings.root, packageRelative);
+  }
+  for (const packageRelative of ["package.json", "LICENSE", "index.js"]) {
+    addFile("file-uri-to-path", fileUriToPath.root, packageRelative);
+  }
+
+  for (const copy of copies.sort((left, right) =>
+    left.relative.localeCompare(right.relative),
+  )) {
+    let sourceStat: fs.Stats;
+    try {
+      sourceStat = fs.lstatSync(copy.source);
+    } catch {
+      buildFailure("PackagedCollectorRuntimeDependencyUnavailable");
+    }
+    if (!sourceStat.isFile() || sourceStat.isSymbolicLink()) {
+      buildFailure("PackagedCollectorRuntimeDependencyInvalid");
+    }
+    const destination = path.join(stagedOutputDirectory, copy.relative);
+    fs.mkdirSync(path.dirname(destination), { recursive: true, mode: 0o755 });
+    try {
+      fs.copyFileSync(copy.source, destination, fs.constants.COPYFILE_EXCL);
+      fs.chmodSync(destination, copy.mode);
+    } catch {
+      buildFailure("PackagedCollectorRuntimeDependencyCopyFailed");
+    }
+    const destinationStat = fs.lstatSync(destination);
+    if (
+      !destinationStat.isFile() ||
+      destinationStat.isSymbolicLink() ||
+      (destinationStat.mode & 0o777) !== copy.mode
+    ) {
+      buildFailure("PackagedCollectorRuntimeDependencyCopyInvalid");
+    }
+  }
+
+  const expectedManifest = runtimeDependencyManifest(stagedOutputDirectory);
+  return {
+    expectedManifest,
+    digest: manifestDigest(expectedManifest),
+    fileCount: copies.length,
+    versions: {
+      betterSqlite: betterSqlite.version,
+      bindings: bindings.version,
+      fileUriToPath: fileUriToPath.version,
+    },
+  };
+}
+
 export function buildPackagedCollectorCli(
   sandbox: ResourceSandbox,
   options: PackagedCollectorBuildOptions = {},
@@ -2577,8 +2871,11 @@ export function buildPackagedCollectorCli(
   const packageDirectory = path.join(repoRoot, "packages", "collector-cli");
   const sourcePath = path.join(packageDirectory, "src", "cli.ts");
   const dashboardSourcePath = path.join(packageDirectory, "src", "dashboard.html");
-  const productionOutputDirectory = path.join(packageDirectory, "dist");
-  const outputDirectory = options.outputDirectory ?? productionOutputDirectory;
+  const outputDirectory =
+    options.outputDirectory ??
+    path.join(sandbox.root, `packaged-collector-${randomUUID()}`);
+  const usedDefaultSandboxOutput =
+    options.outputDirectory === undefined && within(sandbox.root, outputDirectory);
   const repositoryBuilderPath = path.join(
     repoRoot,
     "node_modules",
@@ -2617,6 +2914,7 @@ export function buildPackagedCollectorCli(
   const failedOutputDirectory = path.join(outputParent, `.${outputName}.failed-${suffix}`);
   const stagedCliPath = path.join(stagedOutputDirectory, "cli.mjs");
   const stagedDashboardPath = path.join(stagedOutputDirectory, "dashboard.html");
+  const fixtureManifestBeforeBuild = resourceFixtureManifest(sandbox.root);
   fs.mkdirSync(outputParent, { recursive: true, mode: 0o755 });
   requireRegularDirectory(outputParent, "PackagedCollectorOutputParentInvalid");
   if (fs.existsSync(outputDirectory)) {
@@ -2624,19 +2922,20 @@ export function buildPackagedCollectorCli(
   }
   fs.mkdirSync(stagedOutputDirectory, { mode: 0o755 });
   const buildEnvironment = buildAllowlistedChildEnvironment(sandbox, {});
-  const homeWasEmptyBeforeBuild = fs.readdirSync(sandbox.home).length === 0;
+  const homeEntryCountBeforeBuild = fs.readdirSync(sandbox.home).length;
+  const buildArguments = [
+    builderPath,
+    sourcePath,
+    "--bundle",
+    "--platform=node",
+    "--target=node20",
+    "--format=esm",
+    `--outfile=${stagedCliPath}`,
+    "--external:better-sqlite3",
+  ];
   const build = spawnSync(
     process.execPath,
-    [
-      builderPath,
-      sourcePath,
-      "--bundle",
-      "--platform=node",
-      "--target=node20",
-      "--format=esm",
-      `--outfile=${stagedCliPath}`,
-      "--external:better-sqlite3",
-    ],
+    buildArguments,
     {
       cwd: repoRoot,
       env: buildEnvironment,
@@ -2647,6 +2946,9 @@ export function buildPackagedCollectorCli(
   );
   let backupMoved = false;
   let publicationCompleted = false;
+  let stagedRuntimeDependencies:
+    | ReturnType<typeof stagePackagedRuntimeDependencies>
+    | undefined;
   try {
     if (build.status !== 0 || build.error) {
       buildFailure("PackagedCollectorBuildFailed");
@@ -2656,6 +2958,8 @@ export function buildPackagedCollectorCli(
     fs.copyFileSync(dashboardSourcePath, stagedDashboardPath, fs.constants.COPYFILE_EXCL);
     requireRegularFile(stagedDashboardPath, "PackagedCollectorDashboardCopyInvalid");
     fs.chmodSync(stagedDashboardPath, 0o644);
+    stagedRuntimeDependencies =
+      stagePackagedRuntimeDependencies(stagedOutputDirectory);
 
     if (fs.existsSync(outputDirectory)) {
       fs.renameSync(outputDirectory, backupOutputDirectory);
@@ -2722,28 +3026,64 @@ export function buildPackagedCollectorCli(
     }
     throw error;
   }
+  const canonicalOutputDirectory = fs.realpathSync.native(outputDirectory);
   const exactPackagePath =
-    path.resolve(cliPath) ===
-      path.resolve(productionOutputDirectory, "cli.mjs") &&
-    fs.realpathSync(cliPath) === path.resolve(cliPath);
+    path.resolve(cliPath) === path.resolve(outputDirectory, "cli.mjs") &&
+    fs.realpathSync.native(cliPath) ===
+      path.join(canonicalOutputDirectory, "cli.mjs");
   const executable = (fs.statSync(cliPath).mode & 0o111) !== 0;
   const dashboardExactPackagePath =
-    path.resolve(dashboardPath) ===
-      path.resolve(productionOutputDirectory, "dashboard.html") &&
-    fs.realpathSync(dashboardPath) === path.resolve(dashboardPath);
+    path.resolve(dashboardPath) === path.resolve(outputDirectory, "dashboard.html") &&
+    fs.realpathSync.native(dashboardPath) ===
+      path.join(canonicalOutputDirectory, "dashboard.html");
   const dashboardMode = fs.statSync(dashboardPath).mode & 0o777;
   const dashboardCopiedExactly =
     createHash("sha256").update(fs.readFileSync(dashboardSourcePath)).digest("hex") ===
     createHash("sha256").update(fs.readFileSync(dashboardPath)).digest("hex");
+  if (!stagedRuntimeDependencies) {
+    buildFailure("PackagedCollectorRuntimeDependencyUnavailable");
+  }
+  const observedRuntimeDependencyManifest =
+    runtimeDependencyManifest(outputDirectory);
+  const runtimeDependencyManifestExact = sameManifest(
+    stagedRuntimeDependencies.expectedManifest,
+    observedRuntimeDependencyManifest,
+  );
+  const runtimeDependencyTreeDigest = manifestDigest(
+    observedRuntimeDependencyManifest,
+  );
   if (
     !exactPackagePath ||
     !executable ||
     !dashboardExactPackagePath ||
     dashboardMode !== 0o644 ||
-    !dashboardCopiedExactly
+    !dashboardCopiedExactly ||
+    !runtimeDependencyManifestExact ||
+    runtimeDependencyTreeDigest !== stagedRuntimeDependencies.digest
   ) {
     buildFailure("PackagedCollectorPathInvalid");
   }
+  const fixtureManifestAfterBuild = resourceFixtureManifest(sandbox.root);
+  const outputRelative = path.relative(sandbox.root, outputDirectory);
+  const fixtureManifestDeltaExact = usedDefaultSandboxOutput
+    ? manifestHasExactAdditions(
+        fixtureManifestBeforeBuild,
+        fixtureManifestAfterBuild,
+        [
+          outputRelative,
+          path.join(outputRelative, "cli.mjs"),
+          path.join(outputRelative, "dashboard.html"),
+          ...[...stagedRuntimeDependencies.expectedManifest.keys()].map((name) =>
+            path.join(outputRelative, name),
+          ),
+        ],
+      )
+    : fixtureManifestBeforeBuild.size === fixtureManifestAfterBuild.size &&
+      [...fixtureManifestBeforeBuild].every(
+        ([name, fingerprint]) =>
+          fixtureManifestAfterBuild.get(name) === fingerprint,
+      );
+  const homeEntryCountAfterBuild = fs.readdirSync(sandbox.home).length;
   return {
     cliPath,
     buildExitCode: build.status,
@@ -2752,16 +3092,30 @@ export function buildPackagedCollectorCli(
     dashboardExactPackagePath,
     dashboardMode,
     dashboardCopiedExactly,
+    runtimeDependencyManifestExact,
+    runtimeDependencyTreeDigest,
+    runtimeDependencyManifestEntryCount:
+      observedRuntimeDependencyManifest.size,
+    runtimeDependencyFileCount: stagedRuntimeDependencies.fileCount,
+    runtimeDependencyVersions: stagedRuntimeDependencies.versions,
     exactNodeExecutable: process.execPath,
     exactBuilderPath: path.resolve(builderPath) === path.resolve(repositoryBuilderPath),
     builderDigest: validatedBuilder.digest,
     nativeBinaryPlatform: resolvedNative.platformKey,
     nativeBinaryDigest: validatedNativeBinary.digest,
-    nativeBinaryValidatedBeforeBuild: true,
-    publicationFailureAtomic: true,
-    homeWasEmptyBeforeBuild,
+    expectedNativeBinaryDigest: expectedNativeBinarySha256,
+    usedDefaultSandboxOutput,
+    fixtureManifestEntryCountBeforeBuild: fixtureManifestBeforeBuild.size,
+    fixtureManifestEntryCountAfterBuild: fixtureManifestAfterBuild.size,
+    fixtureManifestDeltaExact,
+    homeEntryCountBeforeBuild,
+    homeEntryCountAfterBuild,
     buildPathWasUnset: buildEnvironment.PATH === undefined,
-    packageManagerInvocations: 0,
+    buildEnvironmentKeyCount: Object.keys(buildEnvironment).length,
+    buildInvocationExecutableBasename: path.basename(process.execPath),
+    buildInvocationArgumentCount: buildArguments.length,
+    buildInvocationArgumentZeroMatchedValidatedBuilder:
+      path.resolve(buildArguments[0]!) === path.resolve(builderPath),
   };
 }
 
@@ -3000,13 +3354,24 @@ export async function runDuplicateStartSingleOwnerContract(
       packagedCli.dashboardExactPackagePath &&
       packagedCli.dashboardMode === 0o644 &&
       packagedCli.dashboardCopiedExactly &&
+      packagedCli.runtimeDependencyManifestExact &&
+      /^[a-f0-9]{64}$/.test(packagedCli.runtimeDependencyTreeDigest) &&
+      packagedCli.runtimeDependencyManifestEntryCount > 0 &&
+      packagedCli.runtimeDependencyFileCount > 0 &&
+      packagedCli.runtimeDependencyVersions.betterSqlite === "12.10.0" &&
+      packagedCli.runtimeDependencyVersions.bindings === "1.5.0" &&
+      packagedCli.runtimeDependencyVersions.fileUriToPath === "1.0.0" &&
       packagedCli.exactNodeExecutable === process.execPath &&
       packagedCli.exactBuilderPath &&
-      packagedCli.nativeBinaryValidatedBeforeBuild &&
-      packagedCli.publicationFailureAtomic &&
-      packagedCli.homeWasEmptyBeforeBuild &&
+      packagedCli.nativeBinaryDigest === packagedCli.expectedNativeBinaryDigest &&
+      packagedCli.usedDefaultSandboxOutput &&
+      packagedCli.fixtureManifestDeltaExact &&
+      packagedCli.homeEntryCountBeforeBuild === 0 &&
+      packagedCli.homeEntryCountAfterBuild === 0 &&
       packagedCli.buildPathWasUnset &&
-      packagedCli.packageManagerInvocations === 0 &&
+      packagedCli.buildInvocationExecutableBasename === path.basename(process.execPath) &&
+      packagedCli.buildInvocationArgumentCount > 0 &&
+      packagedCli.buildInvocationArgumentZeroMatchedValidatedBuilder &&
       candidatesUseExactPackagePath &&
       stopperUsesExactPackagePath &&
       identityProved &&
@@ -3037,15 +3402,45 @@ export async function runDuplicateStartSingleOwnerContract(
         packagedDashboardExactPath: packagedCli.dashboardExactPackagePath,
         packagedDashboardMode: packagedCli.dashboardMode,
         packagedDashboardCopiedExactly: packagedCli.dashboardCopiedExactly,
+        runtimeDependencyManifestExact:
+          packagedCli.runtimeDependencyManifestExact,
+        runtimeDependencyTreeDigest:
+          packagedCli.runtimeDependencyTreeDigest,
+        runtimeDependencyManifestEntryCount:
+          packagedCli.runtimeDependencyManifestEntryCount,
+        runtimeDependencyFileCount: packagedCli.runtimeDependencyFileCount,
+        betterSqliteRuntimeVersion:
+          packagedCli.runtimeDependencyVersions.betterSqlite,
+        bindingsRuntimeVersion:
+          packagedCli.runtimeDependencyVersions.bindings,
+        fileUriToPathRuntimeVersion:
+          packagedCli.runtimeDependencyVersions.fileUriToPath,
         buildUsedExactNodeExecutable: packagedCli.exactNodeExecutable === process.execPath,
         buildUsedExactRepositoryBuilder: packagedCli.exactBuilderPath,
         nativeBinaryPlatform: packagedCli.nativeBinaryPlatform,
-        nativeBinaryValidatedBeforeBuild:
-          packagedCli.nativeBinaryValidatedBeforeBuild,
-        publicationFailureAtomic: packagedCli.publicationFailureAtomic,
-        buildHomeWasEmpty: packagedCli.homeWasEmptyBeforeBuild,
+        nativeBinaryDigestMatchedExpected:
+          packagedCli.nativeBinaryDigest === packagedCli.expectedNativeBinaryDigest,
+        packagedOutputInsideTemporaryFixture:
+          packagedCli.usedDefaultSandboxOutput,
+        packagedOutputFixtureManifestExact:
+          packagedCli.fixtureManifestDeltaExact,
+        fixtureManifestEntryCountBeforeBuild:
+          packagedCli.fixtureManifestEntryCountBeforeBuild,
+        fixtureManifestEntryCountAfterBuild:
+          packagedCli.fixtureManifestEntryCountAfterBuild,
+        buildHomeEntryCountBefore: packagedCli.homeEntryCountBeforeBuild,
+        buildHomeEntryCountAfter: packagedCli.homeEntryCountAfterBuild,
+        buildHomeUnchanged:
+          packagedCli.homeEntryCountBeforeBuild ===
+          packagedCli.homeEntryCountAfterBuild,
         buildPathWasUnset: packagedCli.buildPathWasUnset,
-        packageManagerInvocations: packagedCli.packageManagerInvocations,
+        buildEnvironmentKeyCount: packagedCli.buildEnvironmentKeyCount,
+        buildInvocationExecutableBasename:
+          packagedCli.buildInvocationExecutableBasename,
+        buildInvocationArgumentCount:
+          packagedCli.buildInvocationArgumentCount,
+        buildInvocationArgumentZeroMatchedValidatedBuilder:
+          packagedCli.buildInvocationArgumentZeroMatchedValidatedBuilder,
         startCandidatesUsePackagedCli: candidatesUseExactPackagePath,
         stopperUsesPackagedCli: stopperUsesExactPackagePath,
         ownerIdentityProved: identityProved,

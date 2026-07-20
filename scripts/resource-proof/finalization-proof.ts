@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 
@@ -22,6 +22,153 @@ type PrivacyFixture = {
 };
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../..");
+const finalizationProofPath = fileURLToPath(import.meta.url);
+const parentChangeFixturePath = path.join(
+  repoRoot,
+  "scripts",
+  "resource-proof",
+  "fixtures",
+  "receipt-parent-change-fixture.mjs",
+);
+let finalizationStage = "startup";
+
+function within(parent: string, candidate: string) {
+  const relative = path.relative(path.resolve(parent), path.resolve(candidate));
+  return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+}
+
+type BoundedChildOutcome = {
+  status: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+  outputExceeded: boolean;
+  forcedKill: boolean;
+  reapTimedOut: boolean;
+};
+
+function spawnBoundedJsonChild(
+  args: string[],
+  input: string,
+  env: NodeJS.ProcessEnv,
+) {
+  const child = spawn(process.execPath, args, {
+    cwd: repoRoot,
+    env,
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let stdout = "";
+  let stderr = "";
+  let timedOut = false;
+  let outputExceeded = false;
+  let forcedKill = false;
+  let reapTimedOut = false;
+  let settled = false;
+  let completionTimeout: NodeJS.Timeout | undefined;
+  let killTimeout: NodeJS.Timeout | undefined;
+  let reapTimeout: NodeJS.Timeout | undefined;
+  let resolveOutcome!: (outcome: BoundedChildOutcome) => void;
+  const completion = new Promise<BoundedChildOutcome>((resolve) => {
+    resolveOutcome = resolve;
+  });
+  const finish = (status: number | null, signal: NodeJS.Signals | null) => {
+    if (settled) return;
+    settled = true;
+    if (completionTimeout) clearTimeout(completionTimeout);
+    if (killTimeout) clearTimeout(killTimeout);
+    if (reapTimeout) clearTimeout(reapTimeout);
+    resolveOutcome({
+      status,
+      signal,
+      stdout,
+      stderr,
+      timedOut,
+      outputExceeded,
+      forcedKill,
+      reapTimedOut,
+    });
+  };
+  const beginTermination = () => {
+    if (settled || killTimeout || reapTimeout) return;
+    child.kill("SIGTERM");
+    killTimeout = setTimeout(() => {
+      if (settled) return;
+      forcedKill = true;
+      child.kill("SIGKILL");
+      reapTimeout = setTimeout(() => {
+        if (settled) return;
+        reapTimedOut = true;
+        child.unref();
+        finish(null, "SIGKILL");
+      }, 3_000);
+    }, 3_000);
+  };
+  child.once("error", () => {
+    // `close` still supplies the bounded symbolic outcome; never emit raw errors.
+  });
+  child.once("close", (status, signal) => {
+    finish(status, signal);
+  });
+  const append = (current: string, chunk: Buffer) => {
+    const next = current + chunk.toString("utf8");
+    if (Buffer.byteLength(next) > 64 * 1024) {
+      outputExceeded = true;
+      beginTermination();
+      return current;
+    }
+    return next;
+  };
+  child.stdout.on("data", (chunk: Buffer) => {
+    stdout = append(stdout, chunk);
+  });
+  child.stderr.on("data", (chunk: Buffer) => {
+    stderr = append(stderr, chunk);
+  });
+  child.stdin.end(input);
+  completionTimeout = setTimeout(() => {
+    timedOut = true;
+    beginTermination();
+  }, 40_000);
+  return {
+    completion,
+    terminateAndReap: async () => {
+      beginTermination();
+      return completion;
+    },
+  };
+}
+
+function parseChildReceipt(output: string) {
+  try {
+    const parsed = JSON.parse(output) as Record<string, unknown>;
+    return parsed && typeof parsed === "object" ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+async function waitForFixtureBarrier(candidate: string) {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    try {
+      const stat = fs.lstatSync(candidate);
+      if (!stat.isFile() || stat.isSymbolicLink()) {
+        throw new Error("FixtureBarrierInvalid");
+      }
+      return;
+    } catch (error) {
+      if (error instanceof Error && error.message === "FixtureBarrierInvalid") {
+        throw error;
+      }
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        throw new Error("FixtureBarrierUnavailable");
+      }
+    }
+    if (Date.now() >= deadline) throw new Error("FixtureBarrierTimeout");
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
 
 function digestTree(directory: string) {
   const hash = createHash("sha256");
@@ -55,6 +202,7 @@ function runReceiptWriteAdversaries(tempRoot: string) {
   fs.mkdirSync(fixtureRoot, { mode: 0o700 });
   const serialized = '{"schema":"receipt-adversary","complete":true}\n';
 
+  finalizationStage = "receipt_write_symlink";
   const externalTarget = path.join(fixtureRoot, "external-target");
   const symlinkDestination = path.join(fixtureRoot, "symlink-receipt.json");
   fs.writeFileSync(externalTarget, "external-must-not-change\n", { mode: 0o600 });
@@ -62,12 +210,14 @@ function runReceiptWriteAdversaries(tempRoot: string) {
   writeResourceReceiptAtomically(symlinkDestination, serialized);
   const symlinkDestinationStat = fs.lstatSync(symlinkDestination);
 
+  finalizationStage = "receipt_write_nonregular";
   const nonregularDestination = path.join(fixtureRoot, "nonregular-receipt.json");
   fs.mkdirSync(nonregularDestination, { mode: 0o700 });
   const nonregularFailure = errorName(() =>
     writeResourceReceiptAtomically(nonregularDestination, serialized),
   );
 
+  finalizationStage = "receipt_write_partial";
   const partialDestination = path.join(fixtureRoot, "partial-receipt.json");
   fs.writeFileSync(partialDestination, "previous-complete-receipt\n", { mode: 0o600 });
   const partialBefore = fs.readFileSync(partialDestination, "utf8");
@@ -80,6 +230,7 @@ function runReceiptWriteAdversaries(tempRoot: string) {
     .readdirSync(fixtureRoot)
     .filter((name) => name.startsWith(".partial-receipt.json.") && name.endsWith(".tmp"));
 
+  finalizationStage = "receipt_write_ancestor_alias";
   const externalAncestorRoot = path.join(tempRoot, "ancestor-external");
   const externalNested = path.join(externalAncestorRoot, "nested");
   const externalReceipt = path.join(externalNested, "receipt.json");
@@ -95,6 +246,7 @@ function runReceiptWriteAdversaries(tempRoot: string) {
     .readdirSync(externalNested)
     .filter((name) => name.startsWith(".receipt.json.") && name.endsWith(".tmp"));
 
+  finalizationStage = "receipt_write_parent_change";
   const raceParent = path.join(tempRoot, "receipt-race-parent");
   const raceDisplacedParent = path.join(tempRoot, "receipt-race-displaced");
   const raceReceipt = path.join(raceParent, "receipt.json");
@@ -108,12 +260,18 @@ function runReceiptWriteAdversaries(tempRoot: string) {
       },
     }),
   );
+  finalizationStage = /^ResourceReceipt[A-Za-z]+$/.test(raceFailure)
+    ? `receipt_write_parent_change_${raceFailure}`
+    : "receipt_write_parent_change_unknown";
   const raceResidue = [raceParent, raceDisplacedParent].flatMap((directory) =>
-    fs
-      .readdirSync(directory)
-      .filter((name) => /^\.receipt\.json\..*\.(tmp|backup|failed)$/.test(name)),
+    fs.existsSync(directory)
+      ? fs
+          .readdirSync(directory)
+          .filter((name) => /^\.receipt\.json\..*\.(tmp|backup|failed)$/.test(name))
+      : ["missing-directory"],
   );
 
+  finalizationStage = "receipt_write_assertions";
   return {
     symlinkNeutralizedWithoutFollowing:
       fs.readFileSync(externalTarget, "utf8") === "external-must-not-change\n" &&
@@ -136,6 +294,8 @@ function runReceiptWriteAdversaries(tempRoot: string) {
       externalTempResidue.length === 0,
     parentReplacementRaceFailsWithoutOverwrite:
       raceFailure === "ResourceReceiptAncestorChanged" &&
+      fs.existsSync(raceDisplacedParent) &&
+      fs.existsSync(raceReceipt) &&
       fs.readFileSync(path.join(raceDisplacedParent, "receipt.json"), "utf8") ===
         "original-parent-prior-receipt\n" &&
       fs.readFileSync(raceReceipt, "utf8") ===
@@ -145,11 +305,173 @@ function runReceiptWriteAdversaries(tempRoot: string) {
   };
 }
 
+async function runSeparateProcessParentChangeProof(tempRoot: string) {
+  const fixtureRoot = path.join(tempRoot, "separate-process-parent-change");
+  const receiptParent = path.join(fixtureRoot, "receipt-parent");
+  const displacedParent = path.join(fixtureRoot, "receipt-parent-displaced");
+  const barrierDirectory = path.join(fixtureRoot, "barrier");
+  const isolatedHome = path.join(fixtureRoot, "home");
+  const receiptPath = path.join(receiptParent, "receipt.json");
+  const boundarySentinel = path.join(tempRoot, "separate-process-boundary-sentinel");
+  const priorReceipt = "separate-process-prior-receipt\n";
+  const replacementReceipt = "separate-process-replacement-receipt\n";
+  const attemptedReceipt = '{"schema":"separate-process-proof","complete":true}\n';
+
+  fs.mkdirSync(fixtureRoot, { mode: 0o700 });
+  fs.mkdirSync(receiptParent, { mode: 0o700 });
+  fs.mkdirSync(barrierDirectory, { mode: 0o700 });
+  fs.mkdirSync(isolatedHome, { mode: 0o700 });
+  fs.writeFileSync(receiptPath, priorReceipt, { mode: 0o600 });
+  fs.writeFileSync(boundarySentinel, "outside-fixture-must-not-change\n", {
+    mode: 0o600,
+  });
+  const boundaryBefore = fs.readFileSync(boundarySentinel);
+
+  const childEnvironment: NodeJS.ProcessEnv = {
+    HOME: isolatedHome,
+    USERPROFILE: isolatedHome,
+    TMPDIR: fixtureRoot,
+    TMP: fixtureRoot,
+    TEMP: fixtureRoot,
+    TZ: "UTC",
+    LANG: "C",
+    LC_ALL: "C",
+  };
+  const racerRequest = JSON.stringify({
+    fixtureRoot,
+    parent: receiptParent,
+    displacedParent,
+    barrierDirectory,
+    finalName: "receipt.json",
+    replacementReceipt,
+  });
+  const racer = spawnBoundedJsonChild(
+    [parentChangeFixturePath],
+    racerRequest,
+    childEnvironment,
+  );
+  let racerOutcome: BoundedChildOutcome | undefined;
+  try {
+    await waitForFixtureBarrier(path.join(barrierDirectory, "racer-ready"));
+    const writerFailure = errorName(() =>
+      writeResourceReceiptAtomically(receiptPath, attemptedReceipt, {
+        testBarrierAfterTempWrite: { directory: barrierDirectory },
+      }),
+    );
+    const parentAbsentAfterWriterReturn = !fs.existsSync(receiptParent);
+    fs.writeFileSync(path.join(barrierDirectory, "writer-done"), "done\n", {
+      flag: "wx",
+      mode: 0o600,
+    });
+    racerOutcome = await racer.completion;
+    const racerReceipt = parseChildReceipt(racerOutcome.stdout);
+    const receiptResidue = [receiptParent, displacedParent].flatMap(
+      (directory) =>
+        fs.existsSync(directory)
+          ? fs
+              .readdirSync(directory)
+              .filter((name) =>
+                /^\.receipt\.json\..*\.(tmp|backup|failed)$/.test(name),
+              )
+          : ["missing-directory"],
+    );
+    const childOutput = [racerOutcome.stdout, racerOutcome.stderr].join("\n");
+
+    const checks = {
+      separateProcessMissingParentFailsClosed:
+        writerFailure === "ResourceReceiptAncestorChanged" &&
+        racerOutcome.status === 0 &&
+        racerOutcome.signal === null &&
+        racerReceipt.passed === true,
+      separateProcessObservationDidNotRecreateParent:
+        parentAbsentAfterWriterReturn &&
+        racerReceipt.parentAbsentBeforeReplacement === true &&
+        racerReceipt.replacementInstalled === true,
+      separateProcessPriorAndReplacementReceiptsPreserved:
+        fs.readFileSync(path.join(displacedParent, "receipt.json"), "utf8") ===
+          priorReceipt &&
+        fs.readFileSync(receiptPath, "utf8") === replacementReceipt,
+      separateProcessReceiptResidueRemoved: receiptResidue.length === 0,
+      separateProcessConfiguredPathsWithinFixtureAndSentinelUnchanged:
+        within(fixtureRoot, receiptParent) &&
+        within(fixtureRoot, displacedParent) &&
+        within(fixtureRoot, barrierDirectory) &&
+        Buffer.compare(boundaryBefore, fs.readFileSync(boundarySentinel)) === 0,
+      separateProcessChildrenBoundedAndPathFree:
+        !racerOutcome.timedOut &&
+        !racerOutcome.outputExceeded &&
+        !racerOutcome.forcedKill &&
+        !racerOutcome.reapTimedOut &&
+        racerOutcome.stderr.length === 0 &&
+        !childOutput.includes(tempRoot) &&
+        !childOutput.includes(os.homedir()),
+      separateProcessScrubbedHomeUnchanged:
+        fs.readdirSync(isolatedHome).length === 0,
+    };
+    return {
+      checks,
+      measurements: {
+        writerFailure,
+        parentAbsentAfterWriterReturn,
+        racerExitCode: racerOutcome.status,
+        racerTimedOut: racerOutcome.timedOut,
+        racerForcedKill: racerOutcome.forcedKill,
+        racerReapTimedOut: racerOutcome.reapTimedOut,
+        racerReportedParentAbsent:
+          racerReceipt.parentAbsentBeforeReplacement === true,
+        racerReportedReplacementInstalled:
+          racerReceipt.replacementInstalled === true,
+        receiptResidueEntries: receiptResidue.length,
+        isolatedHomeEntries: fs.readdirSync(isolatedHome).length,
+      },
+    };
+  } finally {
+    if (!racerOutcome) {
+      await racer.terminateAndReap();
+    }
+  }
+}
+
+async function separateProcessParentChangeProofMain() {
+  const canonicalTempRoot = fs.realpathSync.native(os.tmpdir());
+  const tempRoot = fs.mkdtempSync(
+    path.join(canonicalTempRoot, "plimsoll-parent-change-proof-"),
+  );
+  try {
+    const result = await runSeparateProcessParentChangeProof(tempRoot);
+    const passed = Object.values(result.checks).every(Boolean);
+    process.stdout.write(`${JSON.stringify({ passed, ...result })}\n`);
+    if (!passed) process.exitCode = 1;
+  } finally {
+    fs.rmSync(tempRoot, { recursive: true, force: true });
+  }
+}
+
 async function runBuildFailureAdversaries(tempRoot: string) {
   const sandbox = await createResourceSandbox();
   try {
+    const observedFailureStates: Array<{
+      fixtureManifestUnchanged: boolean;
+      homeEntryCountBefore: number;
+      homeEntryCountAfter: number;
+    }> = [];
+    const runObservedFailure = async (
+      options: Parameters<typeof runDuplicateStartSingleOwnerContract>[1],
+    ) => {
+      const manifestBefore = digestTree(sandbox.root);
+      const homeEntryCountBefore = fs.readdirSync(sandbox.home).length;
+      const receipt = await runDuplicateStartSingleOwnerContract(sandbox, options);
+      const manifestAfter = digestTree(sandbox.root);
+      const homeEntryCountAfter = fs.readdirSync(sandbox.home).length;
+      observedFailureStates.push({
+        fixtureManifestUnchanged: manifestBefore === manifestAfter,
+        homeEntryCountBefore,
+        homeEntryCountAfter,
+      });
+      return receipt;
+    };
     const missingBuilder = path.join(tempRoot, "missing-builder.mjs");
-    const missing = await runDuplicateStartSingleOwnerContract(sandbox, {
+    const missing = await runObservedFailure({
       builderPath: missingBuilder,
       expectedBuilderPath: missingBuilder,
       expectedBuilderSha256: "0".repeat(64),
@@ -166,7 +488,7 @@ async function runBuildFailureAdversaries(tempRoot: string) {
     const trustedBytes = fs.readFileSync(repositoryBuilder);
     const trustedDigest = createHash("sha256").update(trustedBytes).digest("hex");
     fs.writeFileSync(tamperedBuilder, Buffer.concat([trustedBytes, Buffer.from("\n// tampered\n")]));
-    const tampered = await runDuplicateStartSingleOwnerContract(sandbox, {
+    const tampered = await runObservedFailure({
       builderPath: tamperedBuilder,
       expectedBuilderPath: tamperedBuilder,
       expectedBuilderSha256: trustedDigest,
@@ -186,7 +508,7 @@ async function runBuildFailureAdversaries(tempRoot: string) {
       Buffer.concat([trustedNativeBytes, Buffer.from("tampered")]),
       { mode: 0o700 },
     );
-    const tamperedNative = await runDuplicateStartSingleOwnerContract(sandbox, {
+    const tamperedNative = await runObservedFailure({
       nativeBinaryPath: tamperedNativeBinary,
       expectedNativeBinaryPath: tamperedNativeBinary,
       expectedNativeBinarySha256: trustedNativeDigest,
@@ -199,7 +521,7 @@ async function runBuildFailureAdversaries(tempRoot: string) {
       mode: 0o600,
     });
     const atomicBefore = digestTree(atomicOutput);
-    const publicationFailure = await runDuplicateStartSingleOwnerContract(sandbox, {
+    const publicationFailure = await runObservedFailure({
       outputDirectory: atomicOutput,
       injectPublicationFailureAfterBackup: true,
     });
@@ -244,6 +566,16 @@ async function runBuildFailureAdversaries(tempRoot: string) {
           "PackagedCollectorPublicationInjectedFailure" &&
         atomicBefore === atomicAfter &&
         publicationResidue.length === 0,
+      buildFailuresLeaveFixtureManifestUnchanged:
+        observedFailureStates.length === 4 &&
+        observedFailureStates.every((state) => state.fixtureManifestUnchanged),
+      buildFailuresLeaveScrubbedHomeUnchanged:
+        observedFailureStates.length === 4 &&
+        observedFailureStates.every(
+          (state) =>
+            state.homeEntryCountBefore === 0 &&
+            state.homeEntryCountAfter === 0,
+        ),
       failuresAreSymbolicAndPathFree:
         !symbolic.includes(tempRoot) &&
         !symbolic.includes(sandbox.root) &&
@@ -260,10 +592,17 @@ async function main() {
     path.join(canonicalTempRoot, "plimsoll-finalization-proof-"),
   );
   try {
+    finalizationStage = "build_failure_checks";
     const buildFailureChecks = await runBuildFailureAdversaries(tempRoot);
+    finalizationStage = "receipt_write_checks";
     const receiptWriteChecks = runReceiptWriteAdversaries(tempRoot);
+    finalizationStage = "concurrency_integrity_check";
+    const separateProcessProof =
+      await runSeparateProcessParentChangeProof(tempRoot);
     const receiptPath = path.join(tempRoot, "resource-receipt.json");
     const linkedReceiptTarget = path.join(tempRoot, "linked-receipt-target");
+    const resourceChildHome = path.join(tempRoot, "resource-child-home");
+    fs.mkdirSync(resourceChildHome, { mode: 0o700 });
     fs.writeFileSync(linkedReceiptTarget, "linked-target-must-not-change\n", {
       mode: 0o600,
     });
@@ -287,6 +626,7 @@ async function main() {
       ...values.map((value) => value.slice(0, fixture.prefixLength)),
       os.homedir(),
     ];
+    finalizationStage = "integrated_resource_child";
     const run = spawnSync(
       process.execPath,
       [
@@ -299,15 +639,14 @@ async function main() {
       {
         cwd: repoRoot,
         env: {
-          HOME: os.homedir(),
-          USERPROFILE: os.homedir(),
+          HOME: resourceChildHome,
+          USERPROFILE: resourceChildHome,
           TMPDIR: tempRoot,
           TMP: tempRoot,
           TEMP: tempRoot,
           TZ: "UTC",
           LANG: "C",
           LC_ALL: "C",
-          PATH: process.env.PATH,
           PLIMSOLL_RESOURCE_PROOF_TEST_FINAL_PRIVACY_FAILURE: "1",
         },
         encoding: "utf8",
@@ -346,6 +685,7 @@ async function main() {
     const finalReceiptTempResidue = fs
       .readdirSync(tempRoot)
       .filter((name) => name.startsWith(".resource-receipt.json.") && name.endsWith(".tmp"));
+    finalizationStage = "final_receipt_checks";
     const checks = {
       subprocessExitedNonzero: run.status === 1,
       finalizedReceiptFailed:
@@ -364,11 +704,18 @@ async function main() {
         ownership?.status === "pass" &&
         ownership.measurements?.buildUsedExactNodeExecutable === true &&
         ownership.measurements?.buildUsedExactRepositoryBuilder === true &&
-        ownership.measurements?.nativeBinaryValidatedBeforeBuild === true &&
-        ownership.measurements?.publicationFailureAtomic === true &&
-        ownership.measurements?.buildHomeWasEmpty === true &&
+        ownership.measurements?.nativeBinaryDigestMatchedExpected === true &&
+        ownership.measurements?.packagedOutputInsideTemporaryFixture === true &&
+        ownership.measurements?.packagedOutputFixtureManifestExact === true &&
+        ownership.measurements?.buildHomeEntryCountBefore === 0 &&
+        ownership.measurements?.buildHomeEntryCountAfter === 0 &&
+        ownership.measurements?.buildHomeUnchanged === true &&
         ownership.measurements?.buildPathWasUnset === true &&
-        ownership.measurements?.packageManagerInvocations === 0,
+        ownership.measurements?.buildInvocationExecutableBasename === "node" &&
+        typeof ownership.measurements?.buildInvocationArgumentCount === "number" &&
+        ownership.measurements.buildInvocationArgumentCount > 0 &&
+        ownership.measurements?.buildInvocationArgumentZeroMatchedValidatedBuilder ===
+          true,
       exactPackagedArtifacts:
         ownership?.measurements?.packagedCliExactPath === true &&
         ownership.measurements?.packagedCliExecutable === true &&
@@ -383,6 +730,7 @@ async function main() {
         ownership.measurements?.alreadyRunningCandidates === 1,
       ...buildFailureChecks,
       ...receiptWriteChecks,
+      ...separateProcessProof.checks,
       integratedSymlinkReceiptNeutralized:
         fs.readFileSync(linkedReceiptTarget, "utf8") ===
           "linked-target-must-not-change\n" &&
@@ -393,6 +741,8 @@ async function main() {
       receiptOverwriteExact: stdout === persisted,
       receiptModeOwnerOnly: mode === 0o600,
       childStderrEmpty: stderr.length === 0,
+      resourceProofChildHomeUnchanged:
+        fs.readdirSync(resourceChildHome).length === 0,
     };
     const passed = Object.values(checks).every(Boolean);
     process.stdout.write(
@@ -406,12 +756,40 @@ async function main() {
       })}\n`,
     );
     if (!passed) process.exitCode = 1;
+    finalizationStage = "complete";
   } finally {
     fs.rmSync(tempRoot, { recursive: true, force: true });
   }
 }
 
-main().catch(() => {
-  process.stdout.write(`${JSON.stringify({ passed: false, failedSafely: true })}\n`);
-  process.exitCode = 1;
-});
+const invokedAsScript = Boolean(
+  process.argv[1] &&
+    path.resolve(process.argv[1]) === path.resolve(finalizationProofPath),
+);
+if (
+  invokedAsScript &&
+  process.argv[2] === "--receipt-parent-change-only"
+) {
+  separateProcessParentChangeProofMain().catch(() => {
+    process.stdout.write(
+      `${JSON.stringify({ passed: false, failedSafely: true })}\n`,
+    );
+    process.exitCode = 1;
+  });
+} else if (invokedAsScript) {
+  main().catch((error) => {
+    const errorName = error instanceof Error ? error.name : "";
+    const symbolicError = /^[A-Za-z][A-Za-z0-9]+$/.test(errorName)
+      ? errorName
+      : "FinalizationProofFailed";
+    process.stdout.write(
+      `${JSON.stringify({
+        passed: false,
+        failedSafely: true,
+        stage: finalizationStage,
+        error: symbolicError,
+      })}\n`,
+    );
+    process.exitCode = 1;
+  });
+}
