@@ -615,7 +615,10 @@ export class TranscriptTailer {
       stat: fs.Stats;
       cursor: JsonlScanCursor<TranscriptParserState> | undefined;
     }> = [];
-    let automaticFilesConsumed = 0;
+    const automaticFilesConsumed = new Set<string>();
+    const consumeAutomaticFile = (file: string) => {
+      if (automatic) automaticFilesConsumed.add(file);
+    };
     for (let index = 0; index < discoveredFiles.length; index += 1) {
       const discovered = discoveredFiles[index]!;
       const file = discovered.file;
@@ -629,11 +632,11 @@ export class TranscriptTailer {
         result.deferredGenerations += discoveredFiles.length - index;
         break;
       }
-      if (automatic) automaticFilesConsumed = index + 1;
       const candidateHash = maintenanceCandidateHash(file);
       if (options.quarantine?.stage === "candidate_metadata" &&
         options.quarantine.candidateHash === candidateHash) {
         result.deferredGenerations += 1;
+        consumeAutomaticFile(file);
         continue;
       }
       if (!discovered.stat && options.onProgress?.({ stage: "candidate_metadata", candidateHash }) === false) {
@@ -645,6 +648,7 @@ export class TranscriptTailer {
         stat = discovered.stat ?? this.regularFileStat(file);
       } catch {
         result.statErrors += 1;
+        consumeAutomaticFile(file);
         continue;
       }
       const mtime = stat.mtime.toISOString();
@@ -654,6 +658,7 @@ export class TranscriptTailer {
       if (mtime.slice(0, 10) === today) result.activity.filesToday += 1;
       if (options.scope === "recent" && stat.mtime.getTime() < recentCutoff) {
         result.filesSkippedOutsideRecentWindow += 1;
+        consumeAutomaticFile(file);
         continue;
       }
       const observation = baselineObservation(file, stat, discovered.precise);
@@ -667,10 +672,12 @@ export class TranscriptTailer {
         if (decision.decision === "exclude") {
           result.excludedGenerations += 1;
           result.excludedBytes += stat.size;
+          consumeAutomaticFile(file);
           continue;
         }
         if (decision.decision === "block") {
           result.statErrors += 1;
+          consumeAutomaticFile(file);
           continue;
         }
       }
@@ -683,6 +690,7 @@ export class TranscriptTailer {
         );
         if (decision.decision === "block") {
           result.statErrors += 1;
+          consumeAutomaticFile(file);
           continue;
         }
       }
@@ -695,7 +703,6 @@ export class TranscriptTailer {
       );
       candidates.push({ file, stat, cursor });
     }
-    if (automatic) this.consumeAutomaticCaptureFiles(automaticFilesConsumed);
 
     const preferNewest = automatic ? this.nextCandidatePreference() === "newest" : false;
     candidates.sort((left, right) => {
@@ -711,6 +718,7 @@ export class TranscriptTailer {
       if ((options.quarantine?.stage === "jsonl_open" || options.quarantine?.stage === "jsonl_validation") &&
         options.quarantine.candidateHash === candidateHash) {
         result.deferredGenerations += 1;
+        consumeAutomaticFile(candidate.file);
         continue;
       }
       if (options.onProgress?.({ stage: "jsonl_open", candidateHash }) === false) {
@@ -741,10 +749,14 @@ export class TranscriptTailer {
         let read: NonNullable<ReturnType<JsonlTailerIo["readTail"]>>;
         try {
           const next = this.io.readTail(candidate.file, candidate.stat, cursor, limits);
-          if (!next) break;
+          if (!next) {
+            consumeAutomaticFile(candidate.file);
+            break;
+          }
           read = next;
         } catch {
           result.readErrors += 1;
+          consumeAutomaticFile(candidate.file);
           break;
         }
         if (!countedFile) {
@@ -760,6 +772,7 @@ export class TranscriptTailer {
         const before = resultMutationSnapshot(result);
         let parseFailure = false;
         let committed = false;
+        let validationDeferred = false;
         try {
           const initialState = read.reset || !cursor?.parserState
             ? this.initialParserState(candidate.file)
@@ -768,6 +781,7 @@ export class TranscriptTailer {
           // second validation after metadata preparation prevents a changed
           // transcript generation from advancing its durable cursor.
           if (options.onProgress?.({ stage: "jsonl_validation", candidateHash }) === false) {
+            validationDeferred = true;
             throw new Error("maintenance_progress_budget_exhausted");
           }
           read.assertStableForCommit();
@@ -776,6 +790,7 @@ export class TranscriptTailer {
             ? new Map<string, PersistedGitContext | undefined>()
             : this.prepareGitContexts(read.lines, options);
           if (options.onProgress?.({ stage: "jsonl_validation", candidateHash }) === false) {
+            validationDeferred = true;
             throw new Error("maintenance_progress_budget_exhausted");
           }
           read.assertStableForCommit();
@@ -814,13 +829,21 @@ export class TranscriptTailer {
             );
           })();
           committed = true;
+          consumeAutomaticFile(candidate.file);
           result.slicesCommitted += 1;
           if (read.unresolvedRecord) result.unresolvedRecords += 1;
         } catch {
           const parseErrors = result.parseErrors - before.parseErrors;
           restoreResultMutationSnapshot(result, before);
-          if (parseFailure) result.parseErrors += Math.max(1, parseErrors);
-          else result.readErrors += 1;
+          if (parseFailure) {
+            result.parseErrors += Math.max(1, parseErrors);
+            consumeAutomaticFile(candidate.file);
+          } else if (!validationDeferred) {
+            result.readErrors += 1;
+            consumeAutomaticFile(candidate.file);
+          } else {
+            result.activity.truncated = true;
+          }
         } finally {
           read.close();
         }
@@ -845,6 +868,7 @@ export class TranscriptTailer {
         if (automatic && !automatic.budget.canContinue()) break;
       }
     }
+    if (automatic) this.consumeAutomaticCaptureFiles(automaticFilesConsumed);
     for (const candidate of candidates) {
       const cursor = loadJsonlScanCursor<TranscriptParserState>(
         this.buffer.database,
@@ -926,10 +950,10 @@ export class TranscriptTailer {
     };
   }
 
-  private consumeAutomaticCaptureFiles(count: number) {
+  private consumeAutomaticCaptureFiles(files: ReadonlySet<string>) {
     const attempt = this.captureAttempt;
     if (!attempt) return;
-    attempt.pendingFiles.splice(0, Math.max(0, count));
+    attempt.pendingFiles = attempt.pendingFiles.filter((pending) => !files.has(pending.file));
     if (attempt.discoveryDone && attempt.pendingFiles.length === 0) {
       attempt.discovery.close();
       this.captureAttempt = null;

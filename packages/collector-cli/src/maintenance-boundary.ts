@@ -78,6 +78,11 @@ export type MaintenanceBoundaryChild = Pick<
 
 type TimerHandle = ReturnType<typeof setTimeout>;
 
+export type MaintenanceProcessFingerprintBinding = {
+  parentPid: number;
+  spawnNonce: string;
+};
+
 export type MaintenanceBoundaryOptions = {
   entryPath: string;
   execArgv?: string[];
@@ -92,7 +97,10 @@ export type MaintenanceBoundaryOptions = {
   setTimer?: (callback: () => void, delayMs: number) => TimerHandle;
   clearTimer?: (handle: TimerHandle) => void;
   spawnChild?: (spawnNonce: string) => MaintenanceBoundaryChild;
-  fingerprint?: (pid: number) => Promise<string | null>;
+  fingerprint?: (
+    pid: number,
+    binding: MaintenanceProcessFingerprintBinding,
+  ) => Promise<string | null>;
 };
 
 type ActiveJob = {
@@ -110,25 +118,40 @@ function iso(ms: number | null) {
   return ms === null ? null : new Date(ms).toISOString();
 }
 
-function asyncProcessFingerprint(pid: number): Promise<string | null> {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return Promise.resolve(null);
+function asyncProcessFingerprint(
+  pid: number,
+  binding: MaintenanceProcessFingerprintBinding,
+): Promise<string | null> {
+  if (
+    !Number.isSafeInteger(pid) || pid <= 0 ||
+    !Number.isSafeInteger(binding.parentPid) || binding.parentPid <= 0 ||
+    !/^[a-f0-9-]{16,80}$/i.test(binding.spawnNonce)
+  ) return Promise.resolve(null);
   return new Promise((resolve) => {
     execFile(
       "/bin/ps",
-      ["-p", String(pid), "-o", "lstart="],
+      ["-ww", "-p", String(pid), "-o", "ppid=", "-o", "lstart=", "-o", "command="],
       {
         encoding: "utf8",
         env: { ...process.env, LANG: "C", LC_ALL: "C" },
         timeout: 500,
       },
       (error, stdout) => {
-        const startedAt = !error && typeof stdout === "string"
+        const processRecord = !error && typeof stdout === "string"
           ? stdout.trim().replace(/\s+/g, " ")
           : "";
-        if (!startedAt) return resolve(null);
+        const parentMatch = /^(\d+)\s+/.exec(processRecord);
+        const nonceBinding = `__maintenance_worker ${binding.spawnNonce}`;
+        if (
+          !parentMatch || Number(parentMatch[1]) !== binding.parentPid ||
+          !processRecord.includes(nonceBinding)
+        ) return resolve(null);
         resolve(
           "sha256:" + createHash("sha256")
-            .update("plimsoll-process-start-v1\0" + pid + "\0" + startedAt)
+            .update(
+              "plimsoll-process-start-v2\0" + pid + "\0" +
+              binding.parentPid + "\0" + binding.spawnNonce + "\0" + processRecord,
+            )
             .digest("hex"),
         );
       },
@@ -184,6 +207,7 @@ export class MaintenanceProcessBoundary {
   private readyReject: ((error: Error) => void) | null = null;
   private readyTimer: TimerHandle | null = null;
   private active: ActiveJob | null = null;
+  private runReserved = false;
   private generation = 0;
   private lastStartedAtMs: number | null = null;
   private lastCompletedAtMs: number | null = null;
@@ -208,6 +232,7 @@ export class MaintenanceProcessBoundary {
   private reapedChildren = 0;
   private orphanRisk = false;
   private terminating: Promise<boolean> | null = null;
+  private idleFailure: Promise<void> | null = null;
   private closeWaiters: Array<() => void> = [];
 
   constructor(private readonly options: MaintenanceBoundaryOptions) {}
@@ -220,7 +245,7 @@ export class MaintenanceProcessBoundary {
       source: this.activeProgress?.source ?? "unknown",
       deadlineMs: this.deadlineMs(),
       generation: this.generation,
-      inFlight: this.active !== null,
+      inFlight: this.runReserved || this.active !== null,
       childPresent: this.child !== null,
       childReady: this.childReady,
       childFingerprint: this.childFingerprint,
@@ -262,7 +287,7 @@ export class MaintenanceProcessBoundary {
 
   async run(): Promise<MaintenanceRunOutcome> {
     if (!this.accepting) throw new Error("maintenance_boundary_stopping");
-    if (this.active) throw new Error("maintenance_job_already_in_flight");
+    if (this.runReserved || this.active) throw new Error("maintenance_job_already_in_flight");
     if (this.terminating || this.orphanRisk) throw new Error("maintenance_child_not_reaped");
     const now = this.now();
     if (this.circuitOpenUntilMs !== null && now < this.circuitOpenUntilMs) {
@@ -279,47 +304,55 @@ export class MaintenanceProcessBoundary {
       this.quarantineUntilMs = null;
       this.quarantine = null;
     }
+    this.runReserved = true;
+    let job!: Promise<MaintenanceRunOutcome>;
+    try {
+      await this.ensureWorker();
+      if (!this.accepting) throw new Error("maintenance_boundary_stopping");
+      if (!this.child || !this.childReady || !this.child.connected) {
+        await this.handleChildFailure("maintenance_worker_unavailable");
+        throw new Error("maintenance_worker_unavailable");
+      }
 
-    await this.ensureWorker();
-    if (!this.child || !this.childReady || !this.child.connected) {
-      throw new Error("maintenance_worker_unavailable");
-    }
-
-    const generation = ++this.generation;
-    const nonce = randomUUID();
-    const startedAtMs = this.now();
-    this.lastStartedAtMs = startedAtMs;
-    this.framesThisJob = 0;
-    this.state = "in_flight";
-    this.stage = "automatic_capture";
-    this.activeProgress = null;
-    return new Promise<MaintenanceRunOutcome>((resolve, reject) => {
-      const timer = this.setTimer(() => {
-        void this.failActive("maintenance_deadline_exceeded", true);
-      }, this.deadlineMs());
-      this.active = {
-        generation,
-        nonce,
-        startedAtMs,
-        timer,
-        resolve,
-        reject,
-        settled: false,
-        nextSequence: 1,
-      };
-      try {
-        this.child!.send({
-          schema: MAINTENANCE_PROTOCOL_SCHEMA,
-          type: "run",
+      const generation = ++this.generation;
+      const nonce = randomUUID();
+      const startedAtMs = this.now();
+      this.lastStartedAtMs = startedAtMs;
+      this.framesThisJob = 0;
+      this.state = "in_flight";
+      this.stage = "automatic_capture";
+      this.activeProgress = null;
+      job = new Promise<MaintenanceRunOutcome>((resolve, reject) => {
+        const timer = this.setTimer(() => {
+          void this.failActive("maintenance_deadline_exceeded", true);
+        }, this.deadlineMs());
+        this.active = {
           generation,
           nonce,
-          deadlineMs: this.deadlineMs(),
-          quarantine: this.quarantine,
-        });
-      } catch {
-        void this.failActive("maintenance_send_failed", false);
-      }
-    });
+          startedAtMs,
+          timer,
+          resolve,
+          reject,
+          settled: false,
+          nextSequence: 1,
+        };
+        try {
+          this.child!.send({
+            schema: MAINTENANCE_PROTOCOL_SCHEMA,
+            type: "run",
+            generation,
+            nonce,
+            deadlineMs: this.deadlineMs(),
+            quarantine: this.quarantine,
+          });
+        } catch {
+          void this.failActive("maintenance_send_failed", false);
+        }
+      });
+    } finally {
+      this.runReserved = false;
+    }
+    return job;
   }
 
   async shutdown(): Promise<boolean> {
@@ -366,13 +399,26 @@ export class MaintenanceProcessBoundary {
     this.state = this.failureCount > 0 ? "recovering" : "ready";
     this.stage = "spawning";
     const spawnNonce = randomUUID();
-    const child = this.spawnChild(spawnNonce);
+    let child: MaintenanceBoundaryChild;
+    try {
+      child = this.spawnChild(spawnNonce);
+    } catch {
+      const reason = "maintenance_worker_spawn_failed";
+      this.child = null;
+      this.childReady = false;
+      this.childFingerprint = null;
+      this.parentFingerprintPromise = null;
+      this.spawnNonce = null;
+      this.recordOutcome("failed", this.now());
+      this.openCircuit(reason);
+      throw new Error(reason);
+    }
     this.child = child;
     this.spawnNonce = spawnNonce;
     this.childReady = false;
     this.childFingerprint = null;
     this.parentFingerprintPromise = child.pid
-      ? this.fingerprint(child.pid).then((fingerprint) => {
+      ? this.fingerprint(child.pid, spawnNonce).then((fingerprint) => {
           if (this.child === child && fingerprint) this.childFingerprint = fingerprint;
           return fingerprint;
         })
@@ -383,6 +429,7 @@ export class MaintenanceProcessBoundary {
     });
     child.on("message", this.onMessage);
     child.on("error", this.onChildError);
+    child.on("disconnect", this.onChildDisconnect);
     child.on("close", this.onChildClose);
     this.readyTimer = this.setTimer(() => {
       void this.failReady("maintenance_worker_ready_timeout");
@@ -399,12 +446,6 @@ export class MaintenanceProcessBoundary {
       void this.failProtocol("maintenance_protocol_invalid");
       return;
     }
-    this.framesThisJob += 1;
-    if (this.framesThisJob > MAINTENANCE_PROTOCOL_MAX_FRAMES_PER_JOB) {
-      this.invalidFrames += 1;
-      void this.failProtocol("maintenance_protocol_frame_limit");
-      return;
-    }
     if (receipt.type === "ready") {
       if (!this.readyPromise || this.childReady || this.active) {
         this.invalidFrames += 1;
@@ -417,6 +458,12 @@ export class MaintenanceProcessBoundary {
         this.invalidFrames += 1;
         void this.failProtocol("maintenance_protocol_false_closed");
       }
+      return;
+    }
+    this.framesThisJob += 1;
+    if (this.framesThisJob > MAINTENANCE_PROTOCOL_MAX_FRAMES_PER_JOB) {
+      this.invalidFrames += 1;
+      void this.failProtocol("maintenance_protocol_frame_limit");
       return;
     }
     const active = this.active;
@@ -491,8 +538,11 @@ export class MaintenanceProcessBoundary {
   };
 
   private readonly onChildError = () => {
-    if (this.active) void this.failActive("maintenance_worker_error", false);
-    else if (this.readyPromise) void this.failReady("maintenance_worker_error");
+    void this.handleChildFailure("maintenance_worker_error");
+  };
+
+  private readonly onChildDisconnect = () => {
+    void this.handleChildFailure("maintenance_worker_disconnected");
   };
 
   private readonly onChildClose = () => {
@@ -503,6 +553,7 @@ export class MaintenanceProcessBoundary {
     if (child) {
       child.removeListener("message", this.onMessage);
       child.removeListener("error", this.onChildError);
+      child.removeListener("disconnect", this.onChildDisconnect);
       child.removeListener("close", this.onChildClose);
     }
     this.child = null;
@@ -518,11 +569,15 @@ export class MaintenanceProcessBoundary {
     if (wasStarting) {
       this.readyReject?.(new Error("maintenance_worker_closed_before_ready"));
       this.clearReadyWaiters();
-      if (!expectedClose) this.openCircuit("maintenance_worker_closed_before_ready");
+      if (!expectedClose) {
+        this.recordOutcome("failed", this.now());
+        this.openCircuit("maintenance_worker_closed_before_ready");
+      }
     }
     if (this.active && !this.active.settled) {
       void this.failActive("maintenance_worker_closed", false);
     } else if (wasReady && !expectedClose) {
+      this.recordOutcome("failed", this.now());
       this.openCircuit("maintenance_worker_closed_idle");
     }
   };
@@ -563,6 +618,7 @@ export class MaintenanceProcessBoundary {
     this.readyTimer = null;
     const reject = this.readyReject;
     this.clearReadyWaiters();
+    this.recordOutcome("failed", this.now());
     await this.terminateChild(reason);
     this.openCircuit(reason);
     reject?.(new Error(reason));
@@ -573,10 +629,33 @@ export class MaintenanceProcessBoundary {
     if (this.readyPromise) return this.failReady(reason);
     if (!this.child || this.terminating) return;
     this.lastFailure = reason;
+    this.recordOutcome("failed", this.now());
     this.state = "recovering";
     this.stage = "terminating";
     await this.terminateChild(reason);
     this.openCircuit(reason);
+  }
+
+  private handleChildFailure(reason: string): Promise<void> {
+    if (!this.accepting || this.state === "stopping" || this.state === "stopped") {
+      return Promise.resolve();
+    }
+    if (this.active) return this.failActive(reason, false);
+    if (this.readyPromise) return this.failReady(reason);
+    if (this.terminating) return this.terminating.then(() => undefined);
+    if (!this.child) return Promise.resolve();
+    if (this.idleFailure) return this.idleFailure;
+    this.lastFailure = reason;
+    this.recordOutcome("failed", this.now());
+    this.state = "recovering";
+    this.stage = "terminating";
+    this.idleFailure = (async () => {
+      await this.terminateChild(reason);
+      this.openCircuit(reason);
+    })().finally(() => {
+      this.idleFailure = null;
+    });
+    return this.idleFailure;
   }
 
   private async failActive(reason: string, timedOut: boolean) {
@@ -618,11 +697,12 @@ export class MaintenanceProcessBoundary {
     this.stage = "terminating";
     this.terminating = (async () => {
       const pid = child.pid;
+      const spawnNonce = this.spawnNonce;
       // Await the parent observation even when the worker never became ready;
       // malformed/blocked startup must still be fingerprint-safe and killable.
       const expected = this.childFingerprint ?? await this.parentFingerprintPromise;
       const signalIfSame = async (signal: NodeJS.Signals) => {
-        const observed = pid ? await this.fingerprint(pid) : null;
+        const observed = pid && spawnNonce ? await this.fingerprint(pid, spawnNonce) : null;
         if (!expected || !observed || observed !== expected || this.child !== child) {
           this.pidMismatches += 1;
           return false;
@@ -672,7 +752,7 @@ export class MaintenanceProcessBoundary {
 
   private spawnChild(spawnNonce: string) {
     if (this.options.spawnChild) return this.options.spawnChild(spawnNonce);
-    return fork(this.options.entryPath, ["__maintenance_worker"], {
+    return fork(this.options.entryPath, ["__maintenance_worker", spawnNonce], {
       execArgv: this.options.execArgv ?? process.execArgv,
       env: maintenanceWorkerEnvironment(this.options.env ?? process.env, spawnNonce),
       stdio: ["ignore", "ignore", "ignore", "ipc"],
@@ -694,7 +774,12 @@ export class MaintenanceProcessBoundary {
   private now() { return this.options.now?.() ?? Date.now(); }
   private setTimer(callback: () => void, delayMs: number) { return (this.options.setTimer ?? setTimeout)(callback, delayMs); }
   private clearTimer(handle: TimerHandle) { (this.options.clearTimer ?? clearTimeout)(handle); }
-  private fingerprint(pid: number) { return (this.options.fingerprint ?? asyncProcessFingerprint)(pid); }
+  private fingerprint(pid: number, spawnNonce: string) {
+    return (this.options.fingerprint ?? asyncProcessFingerprint)(pid, {
+      parentPid: process.pid,
+      spawnNonce,
+    });
+  }
 
   private recordOutcome(state: "completed" | "timed_out" | "failed", atMs: number) {
     const at = new Date(atMs).toISOString();

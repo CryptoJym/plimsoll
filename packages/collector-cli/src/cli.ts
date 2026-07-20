@@ -895,8 +895,13 @@ async function main() {
   }
 
   if (command === "__maintenance_worker") {
-    const spawnNonce = process.env.PLIMSOLL_MAINTENANCE_SPAWN_NONCE ?? "";
-    if (!/^[a-f0-9-]{16,80}$/i.test(spawnNonce) || !process.send) {
+    const spawnNonce = process.argv[3] ?? "";
+    const environmentNonce = process.env.PLIMSOLL_MAINTENANCE_SPAWN_NONCE ?? "";
+    if (
+      !/^[a-f0-9-]{16,80}$/i.test(spawnNonce) ||
+      spawnNonce !== environmentNonce ||
+      !process.send
+    ) {
       process.exitCode = 64;
       return;
     }

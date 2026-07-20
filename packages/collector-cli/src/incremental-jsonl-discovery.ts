@@ -38,6 +38,7 @@ export class IncrementalJsonlDiscovery {
   private finished = false;
   private limitReached = false;
   private paused = false;
+  private pendingEntry: { entry: fs.Dirent; candidate: string } | null = null;
 
   constructor(
     roots: string[],
@@ -122,11 +123,16 @@ export class IncrementalJsonlDiscovery {
         // failures must not keep descriptors alive or throw during shutdown.
       }
     }
+    this.pendingEntry = null;
     this.finished = true;
   }
 
   private step(): { file: string; stat: fs.Stats; precise: fs.BigIntStats } | null {
     if (this.finished) return null;
+    // readSync has already advanced the directory iterator. Keep that Dirent
+    // until the next path-bearing operation is admitted so a progress-frame
+    // soft cap cannot silently discard either a file or a subdirectory.
+    if (this.pendingEntry) return this.processPendingEntry();
     if (this.visited >= this.options.maxEntries) {
       this.limitReached = true;
       this.errors += 1;
@@ -138,8 +144,10 @@ export class IncrementalJsonlDiscovery {
         this.finished = true;
         return null;
       }
-      const root = this.roots[this.rootIndex++]!;
-      this.openDirectory(root, true);
+      const root = this.roots[this.rootIndex]!;
+      // A rejected discovery_directory progress frame is not an attempted
+      // root. Advance only after the open/skip/error step was admitted.
+      if (this.openDirectory(root, true)) this.rootIndex += 1;
       return null;
     }
 
@@ -175,26 +183,43 @@ export class IncrementalJsonlDiscovery {
       this.errors += 1;
       return null;
     }
+    this.pendingEntry = { entry, candidate };
+    return this.processPendingEntry();
+  }
+
+  private processPendingEntry(): { file: string; stat: fs.Stats; precise: fs.BigIntStats } | null {
+    const pending = this.pendingEntry;
+    if (!pending) return null;
+    const { entry, candidate } = pending;
     if (entry.isDirectory()) {
-      if (this.options.recursive) this.openDirectory(candidate, false);
+      if (this.options.recursive && !this.openDirectory(candidate, false)) return null;
+      this.pendingEntry = null;
       return null;
     }
-    if (!this.options.matches(entry.name)) return null;
+    if (!this.options.matches(entry.name)) {
+      this.pendingEntry = null;
+      return null;
+    }
     if (entry.isSymbolicLink()) {
       // A candidate alias can escape roots or cause one physical generation
       // to be observed under an attacker-controlled name. It is never
       // followed. Irrelevant aliases were rejected by the name predicate
       // above and do not make an otherwise complete discovery ambiguous.
       this.errors += 1;
+      this.pendingEntry = null;
       return null;
     }
     if (!entry.isFile()) {
       this.errors += 1;
+      this.pendingEntry = null;
       return null;
     }
     const candidateHash = maintenanceCandidateHash(candidate);
     if (this.options.quarantinedCandidateHash === candidateHash ||
-      this.options.isCandidateQuarantined?.(candidateHash)) return null;
+      this.options.isCandidateQuarantined?.(candidateHash)) {
+      this.pendingEntry = null;
+      return null;
+    }
     if (this.options.beforeFilesystemStep?.({
       stage: "candidate_metadata",
       candidateHash,
@@ -213,40 +238,44 @@ export class IncrementalJsonlDiscovery {
         !this.hasStableContainedAncestors(candidate)
       ) {
         this.errors += 1;
+        this.pendingEntry = null;
         return null;
       }
       const precise = fs.lstatSync(candidate, { bigint: true });
       if (precise.isSymbolicLink() || !precise.isFile()) {
         this.errors += 1;
+        this.pendingEntry = null;
         return null;
       }
+      this.pendingEntry = null;
       return { file: candidate, stat: metadata, precise };
     } catch {
       this.errors += 1;
+      this.pendingEntry = null;
       return null;
     }
   }
 
-  private openDirectory(directory: string, isRoot: boolean) {
+  private openDirectory(directory: string, isRoot: boolean): boolean {
     const candidateHash = maintenanceCandidateHash(directory);
     if (this.options.quarantinedCandidateHash === candidateHash ||
-      this.options.isCandidateQuarantined?.(candidateHash)) return;
+      this.options.isCandidateQuarantined?.(candidateHash)) return true;
     if (this.options.beforeFilesystemStep?.({
       stage: "discovery_directory",
       candidateHash,
     }) === false) {
       this.paused = true;
-      return;
+      return false;
     }
     try {
       const metadata = fs.lstatSync(directory);
       if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
         this.errors += 1;
-        return;
+        return true;
       }
       if (!this.hasStableContainedAncestors(directory)) {
         this.errors += 1;
-        return;
+        return true;
       }
       const handle = fs.opendirSync(directory);
       const afterOpen = fs.lstatSync(directory);
@@ -258,7 +287,7 @@ export class IncrementalJsonlDiscovery {
       ) {
         handle.closeSync();
         this.errors += 1;
-        return;
+        return true;
       }
       this.stack.push({
         directory,
@@ -274,6 +303,7 @@ export class IncrementalJsonlDiscovery {
         this.errors += 1;
       }
     }
+    return true;
   }
 
   private popFrame(validate = true) {

@@ -629,7 +629,10 @@ export class RolloutTailer {
       stat: fs.Stats;
       cursor: JsonlScanCursor<RolloutParserState> | undefined;
     }> = [];
-    let automaticFilesConsumed = 0;
+    const automaticFilesConsumed = new Set<string>();
+    const consumeAutomaticFile = (file: string) => {
+      if (automatic) automaticFilesConsumed.add(file);
+    };
 
     for (let index = 0; index < discoveredFiles.length; index += 1) {
       const discovered = discoveredFiles[index]!;
@@ -644,11 +647,11 @@ export class RolloutTailer {
         result.deferredGenerations += discoveredFiles.length - index;
         break;
       }
-      if (automatic) automaticFilesConsumed = index + 1;
       const candidateHash = maintenanceCandidateHash(file);
       if (options.quarantine?.stage === "candidate_metadata" &&
         options.quarantine.candidateHash === candidateHash) {
         result.deferredGenerations += 1;
+        consumeAutomaticFile(file);
         continue;
       }
       if (!discovered.stat && options.onProgress?.({ stage: "candidate_metadata", candidateHash }) === false) {
@@ -660,6 +663,7 @@ export class RolloutTailer {
         stat = discovered.stat ?? this.regularFileStat(file);
       } catch {
         result.statErrors += 1;
+        consumeAutomaticFile(file);
         continue;
       }
       const mtime = stat.mtime.toISOString();
@@ -678,10 +682,12 @@ export class RolloutTailer {
         if (decision.decision === "exclude") {
           result.excludedGenerations += 1;
           result.excludedBytes += stat.size;
+          consumeAutomaticFile(file);
           continue;
         }
         if (decision.decision === "block") {
           result.statErrors += 1;
+          consumeAutomaticFile(file);
           continue;
         }
       }
@@ -694,6 +700,7 @@ export class RolloutTailer {
         );
         if (decision.decision === "block") {
           result.statErrors += 1;
+          consumeAutomaticFile(file);
           continue;
         }
       }
@@ -706,7 +713,6 @@ export class RolloutTailer {
       );
       candidates.push({ file, stat, cursor });
     }
-    if (automatic) this.consumeAutomaticCaptureFiles(automaticFilesConsumed);
 
     // Resume already-cursored growth first, then newest new generations. A
     // large older deferred file cannot outrank a currently growing session.
@@ -725,6 +731,7 @@ export class RolloutTailer {
       if ((options.quarantine?.stage === "jsonl_open" || options.quarantine?.stage === "jsonl_validation") &&
         options.quarantine.candidateHash === candidateHash) {
         result.deferredGenerations += 1;
+        consumeAutomaticFile(candidate.file);
         continue;
       }
       if (options.onProgress?.({ stage: "jsonl_open", candidateHash }) === false) {
@@ -750,10 +757,18 @@ export class RolloutTailer {
         let read: NonNullable<ReturnType<JsonlTailerIo["readTail"]>>;
         try {
           const next = this.io.readTail(candidate.file, candidate.stat, cursor, limits);
-          if (!next) break;
+          if (!next) {
+            // A stable no-more-data observation is terminal for this
+            // discovery candidate even though no cursor write is needed.
+            consumeAutomaticFile(candidate.file);
+            break;
+          }
           read = next;
         } catch {
           result.readErrors += 1;
+          // The failure is explicit and surfaced; a later discovery sweep may
+          // retry it without pinning the current bounded candidate batch.
+          consumeAutomaticFile(candidate.file);
           break;
         }
         if (!countedFile) {
@@ -769,6 +784,7 @@ export class RolloutTailer {
         const before = resultMutationSnapshot(result);
         let parseFailure = false;
         let committed = false;
+        let validationDeferred = false;
         try {
           const initialState = read.reset || !cursor?.parserState
             ? this.initialParserState(candidate.file)
@@ -777,6 +793,7 @@ export class RolloutTailer {
           // write lock. Validate the open rollout generation on both sides of
           // metadata preparation so a changed source never advances a cursor.
           if (options.onProgress?.({ stage: "jsonl_validation", candidateHash }) === false) {
+            validationDeferred = true;
             throw new Error("maintenance_progress_budget_exhausted");
           }
           read.assertStableForCommit();
@@ -785,6 +802,7 @@ export class RolloutTailer {
             ? new Map<string, PersistedGitContext | undefined>()
             : this.prepareGitContexts(read.lines, options);
           if (options.onProgress?.({ stage: "jsonl_validation", candidateHash }) === false) {
+            validationDeferred = true;
             throw new Error("maintenance_progress_budget_exhausted");
           }
           read.assertStableForCommit();
@@ -822,13 +840,23 @@ export class RolloutTailer {
             );
           })();
           committed = true;
+          // Only a durable cursor commit transfers ownership away from the
+          // active discovery attempt. Validation deferral keeps it pending.
+          consumeAutomaticFile(candidate.file);
           result.slicesCommitted += 1;
           if (read.unresolvedRecord) result.unresolvedRecords += 1;
         } catch {
           const parseErrors = result.parseErrors - before.parseErrors;
           restoreResultMutationSnapshot(result, before);
-          if (parseFailure) result.parseErrors += Math.max(1, parseErrors);
-          else result.readErrors += 1;
+          if (parseFailure) {
+            result.parseErrors += Math.max(1, parseErrors);
+            consumeAutomaticFile(candidate.file);
+          } else if (!validationDeferred) {
+            result.readErrors += 1;
+            consumeAutomaticFile(candidate.file);
+          } else {
+            result.activity.truncated = true;
+          }
         } finally {
           read.close();
         }
@@ -854,6 +882,7 @@ export class RolloutTailer {
         if (automatic && !automatic.budget.canContinue()) break;
       }
     }
+    if (automatic) this.consumeAutomaticCaptureFiles(automaticFilesConsumed);
 
     // Deferred truth is computed once from durable cursors, never summed per
     // slice. Excluded generations are reported separately and are not fake
@@ -941,10 +970,10 @@ export class RolloutTailer {
     return { files, errors, truncated: truncated || !done, discoveryEntries: entries };
   }
 
-  private consumeAutomaticCaptureFiles(count: number) {
+  private consumeAutomaticCaptureFiles(files: ReadonlySet<string>) {
     const attempt = this.captureAttempt;
     if (!attempt) return;
-    attempt.pendingFiles.splice(0, Math.max(0, count));
+    attempt.pendingFiles = attempt.pendingFiles.filter((pending) => !files.has(pending.file));
     if (attempt.discoveryDone && attempt.pendingFiles.length === 0) {
       attempt.discovery.close();
       this.captureAttempt = null;

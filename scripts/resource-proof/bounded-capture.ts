@@ -264,10 +264,22 @@ async function proveSignalCleanup(root: string, repoRoot: string) {
     try {
       const response = await fetch(`http://127.0.0.1:${port}/status`);
       const status = (await response.json()) as {
-        maintenance?: { capture?: { inFlight?: boolean; source?: string; budget?: { slices?: number } } };
+        maintenance?: {
+          boundary?: {
+            inFlight?: boolean;
+            stage?: string;
+            source?: string;
+            generation?: number;
+          };
+        };
       };
-      const capture = status.maintenance?.capture;
-      if (capture?.inFlight && capture.source === "codex" && Number(capture.budget?.slices ?? 0) > 0) {
+      const capture = status.maintenance?.boundary;
+      if (
+        capture?.inFlight &&
+        capture.stage === "automatic_capture" &&
+        capture.source === "codex" &&
+        Number(capture.generation ?? 0) > 0
+      ) {
         observedInFileWork = true;
         child.kill("SIGTERM");
         break;
@@ -303,7 +315,7 @@ async function proveSignalCleanup(root: string, repoRoot: string) {
     pidMatchesCollectorProcess,
     nodeMajor: Number(process.versions.node.split(".")[0]),
     activePidFileOwned: stdout.includes('"pidFileOwned":true'),
-    shutdownReportedStopped: stdout.includes('"status":"stopped"'),
+    shutdownReportedReady: stdout.includes('"status":"shutdown_ready"'),
     shutdownReportedIncomplete: stdout.includes('"status":"shutdown_incomplete"'),
   };
 }
@@ -670,7 +682,7 @@ export async function runBoundedCaptureContract(
       signalPidMatchesCollectorProcess: signalCleanup.pidMatchesCollectorProcess,
       signalNodeMajor: signalCleanup.nodeMajor,
       signalActivePidFileOwned: signalCleanup.activePidFileOwned,
-      signalShutdownReportedStopped: signalCleanup.shutdownReportedStopped,
+      signalShutdownReportedReady: signalCleanup.shutdownReportedReady,
       signalShutdownReportedIncomplete: signalCleanup.shutdownReportedIncomplete,
     },
   };

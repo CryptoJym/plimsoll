@@ -103,6 +103,7 @@ class FakeChild extends EventEmitter {
   readonly signals: NodeJS.Signals[] = [];
   onSend: ((message: unknown) => void) | null = null;
   closeOn: NodeJS.Signals | null = "SIGTERM";
+  private closed = false;
 
   constructor(pid: number) {
     super();
@@ -129,7 +130,8 @@ class FakeChild extends EventEmitter {
   }
 
   close(signal: NodeJS.Signals | null = null) {
-    if (!this.connected) return;
+    if (this.closed) return;
+    this.closed = true;
     this.connected = false;
     this.emit("close", null, signal);
   }
@@ -381,6 +383,52 @@ async function fifoAvailabilityProof() {
   }
 }
 
+async function blockedShutdownProof() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), `${PRIVATE_PATH_SENTINEL}-shutdown-`));
+  const fifoPath = path.join(root, "maintenance-boundary-block.fifo");
+  const markerPath = path.join(root, "maintenance-boundary-blocked.marker");
+  const fixturePath = path.resolve("scripts/fixtures/maintenance-boundary-fifo-child.mjs");
+  const mkfifo = await import("node:child_process").then(({ spawnSync }) => (
+    spawnSync("/usr/bin/mkfifo", [fifoPath], { encoding: "utf8" })
+  ));
+  assert.equal(mkfifo.status, 0);
+  const boundary = new MaintenanceProcessBoundary({
+    entryPath: fixturePath,
+    execArgv: [],
+    env: { ...process.env, HOME: root, TMPDIR: root, PLIMSOLL_HOME: root },
+    deadlineMs: 10_000,
+    readyDeadlineMs: 1_000,
+    termGraceMs: 100,
+    killGraceMs: 800,
+  });
+  const active = boundary.run();
+  void active.catch(() => undefined);
+  try {
+    await waitFor(() => fs.existsSync(markerPath), "shutdown_fifo_child_block_marker");
+    const startedAt = performance.now();
+    const stopped = await boundary.shutdown();
+    const elapsedMs = performance.now() - startedAt;
+    await rejectsWith(active, "maintenance_boundary_stopping");
+    const status = boundary.status();
+    assert.equal(stopped, true);
+    assert.ok(elapsedMs <= 2_500, `blocked shutdown took ${elapsedMs.toFixed(1)}ms`);
+    assert.equal(status.reap.termSignals, 1);
+    assert.equal(status.reap.killSignals, 1);
+    assert.equal(status.reap.reapedChildren, 1);
+    assert.equal(status.reap.orphanRisk, false);
+    pass("shutdown_reaps_synchronously_blocked_child", {
+      shutdownMs: Number(elapsedMs.toFixed(3)),
+      termSignals: status.reap.termSignals,
+      killSignals: status.reap.killSignals,
+      reapedChildren: status.reap.reapedChildren,
+      orphanRisk: status.reap.orphanRisk,
+    });
+  } finally {
+    await boundary.shutdown();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
 async function circuitAndRecoveryProof() {
   const clock = new ManualClock();
   const candidateHash = maintenanceCandidateHash(`${PRIVATE_PATH_SENTINEL}/candidate.jsonl`);
@@ -467,6 +515,267 @@ async function circuitAndRecoveryProof() {
     recoveredWrites: recovered.rawEventWrites,
     immediateSecondJobWrites: second.rawEventWrites,
     stopped,
+  });
+}
+
+async function spawnFailureAndConcurrentStartupProof() {
+  const clock = new ManualClock();
+  const spawnFailure = fakeBoundary((spawnNonce, index) => {
+    if (index === 0) throw new Error(`${PRIVATE_PATH_SENTINEL}/spawn-detail`);
+    const child = new FakeChild(20_100 + index);
+    child.onSend = (raw) => {
+      const request = raw as MaintenanceRunRequest;
+      if (request.type === "run") {
+        queueMicrotask(() => child.emit("message", resultReceipt(request, outcome(4))));
+      }
+    };
+    ready(child, spawnNonce);
+    return child;
+  }, {
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    initialCircuitMs: 50,
+  });
+  await rejectsWith(spawnFailure.boundary.run(), "maintenance_worker_spawn_failed");
+  const failedStatus = spawnFailure.boundary.status();
+  assert.equal(failedStatus.state, "circuit_open");
+  assert.equal(failedStatus.lastOutcome, "failed");
+  assert.equal(failedStatus.lastFailure, "maintenance_worker_spawn_failed");
+  assert.equal(failedStatus.childPresent, false);
+  assert.equal(failedStatus.childReady, false);
+  assert.equal(failedStatus.inFlight, false);
+  await rejectsWith(spawnFailure.boundary.run(), "maintenance_circuit_open");
+  assert.equal(spawnFailure.spawnCount(), 1, "open circuit must not retry a throwing spawn");
+  clock.advanceBy(50);
+  assert.equal((await spawnFailure.boundary.run()).rawEventWrites, 4);
+  assert.equal(spawnFailure.spawnCount(), 2);
+  assert.equal(await spawnFailure.boundary.shutdown(), true);
+
+  let heldNonce = "";
+  const exactConcurrent = fakeBoundary((spawnNonce) => {
+    heldNonce = spawnNonce;
+    const child = new FakeChild(20_201);
+    child.onSend = (raw) => {
+      const request = raw as MaintenanceRunRequest;
+      if (request.type === "run") {
+        queueMicrotask(() => child.emit("message", resultReceipt(request, outcome(6))));
+      }
+    };
+    return child;
+  });
+  const exactFirst = exactConcurrent.boundary.run();
+  void exactFirst.catch(() => undefined);
+  await tick();
+  assert.equal(exactConcurrent.boundary.status().inFlight, true, "lazy startup reserves the run slot");
+  await rejectsWith(exactConcurrent.boundary.run(), "maintenance_job_already_in_flight");
+  const heldChild = exactConcurrent.children[0];
+  assert.ok(heldChild);
+  ready(heldChild, heldNonce);
+  assert.equal((await exactFirst).rawEventWrites, 6);
+  assert.equal(exactConcurrent.boundary.status().generation, 1);
+  assert.equal(heldChild.sent.filter((message) => (
+    (message as { type?: string }).type === "run"
+  )).length, 1);
+  assert.equal(await exactConcurrent.boundary.shutdown(), true);
+
+  pass("spawn_failure_circuits_and_lazy_start_is_single_flight", {
+    spawnFailureNormalized: true,
+    openCircuitSpawnAttempts: 1,
+    recoveredWrites: 4,
+    concurrentSecondRejected: true,
+    acceptedGenerations: 1,
+  });
+}
+
+async function shutdownDuringLazyStartupProof() {
+  let releaseFingerprint!: (value: string | null) => void;
+  let spawnNonce = "";
+  const harness = fakeBoundary((nonce) => {
+    spawnNonce = nonce;
+    const child = new FakeChild(20_250);
+    ready(child, nonce);
+    return child;
+  }, {
+    fingerprint: async () => new Promise<string | null>((resolve) => {
+      releaseFingerprint = resolve;
+    }),
+  });
+  const pending = harness.boundary.run();
+  void pending.catch(() => undefined);
+  await tick();
+  assert.ok(spawnNonce);
+  const stopping = harness.boundary.shutdown();
+  releaseFingerprint("startup-process");
+  await rejectsWith(pending, "maintenance_boundary_stopping");
+  assert.equal(await stopping, true);
+  const status = harness.boundary.status();
+  assert.equal(status.generation, 0);
+  assert.equal(status.state, "stopped");
+  assert.equal(status.accepting, false);
+  assert.equal(harness.children[0]!.sent.some((message) => (
+    (message as { type?: string }).type === "run"
+  )), false);
+  pass("shutdown_during_lazy_startup_admits_no_job", {
+    generation: status.generation,
+    stopped: status.state === "stopped",
+    runFrames: 0,
+    reapedChildren: status.reap.reapedChildren,
+  });
+}
+
+async function disconnectErrorAndPidReuseProof() {
+  const clock = new ManualClock();
+  const lifecycle = fakeBoundary((spawnNonce, index) => {
+    const child = new FakeChild(20_300 + index);
+    child.onSend = (raw) => {
+      const request = raw as MaintenanceRunRequest;
+      if (request.type === "run") {
+        queueMicrotask(() => child.emit("message", resultReceipt(request, outcome(index + 1))));
+      }
+    };
+    ready(child, spawnNonce);
+    return child;
+  }, {
+    now: clock.now,
+    setTimer: clock.setTimer,
+    clearTimer: clock.clearTimer,
+    initialCircuitMs: 50,
+  });
+  await lifecycle.boundary.run();
+  const disconnected = lifecycle.children[0]!;
+  disconnected.connected = false;
+  disconnected.emit("disconnect");
+  await waitFor(() => lifecycle.boundary.status().state === "circuit_open", "disconnect_circuit");
+  const disconnectStatus = lifecycle.boundary.status();
+  assert.equal(disconnectStatus.lastOutcome, "failed");
+  assert.equal(disconnectStatus.lastFailure, "maintenance_worker_disconnected");
+  assert.equal(disconnectStatus.childPresent, false);
+  assert.equal(disconnectStatus.reap.reapedChildren, 1);
+  await rejectsWith(lifecycle.boundary.run(), "maintenance_circuit_open");
+
+  clock.advanceBy(50);
+  await lifecycle.boundary.run();
+  lifecycle.children[1]!.emit("error", new Error(`${PRIVATE_PATH_SENTINEL}/idle-error`));
+  await waitFor(() => lifecycle.boundary.status().state === "circuit_open", "idle_error_circuit");
+  assert.equal(lifecycle.boundary.status().lastFailure, "maintenance_worker_error");
+  assert.equal(lifecycle.boundary.status().reap.reapedChildren, 2);
+
+  clock.advanceBy(50);
+  await lifecycle.boundary.run();
+  const stoppingChild = lifecycle.children[2]!;
+  const stopped = lifecycle.boundary.shutdown();
+  stoppingChild.emit("error", new Error(`${PRIVATE_PATH_SENTINEL}/expected-stop-error`));
+  assert.equal(await stopped, true);
+  assert.equal(lifecycle.boundary.status().circuit.failureCount, 0);
+
+  let fingerprintCalls = 0;
+  const fingerprintBindings: Array<{ parentPid: number; spawnNonce: string }> = [];
+  const reuse = fakeBoundary((spawnNonce) => {
+    const child = new FakeChild(20_400);
+    child.closeOn = null;
+    ready(child, spawnNonce);
+    return child;
+  }, {
+    deadlineMs: 5,
+    termGraceMs: 5,
+    killGraceMs: 5,
+    fingerprint: async (_pid, binding) => {
+      fingerprintBindings.push(binding);
+      fingerprintCalls += 1;
+      return fingerprintCalls === 1 ? "original-process" : "same-second-reused-process";
+    },
+  });
+  const failed = reuse.boundary.run();
+  void failed.catch(() => undefined);
+  await rejectsWith(failed, "maintenance_deadline_exceeded");
+  const reuseStatus = reuse.boundary.status();
+  assert.equal(reuseStatus.reap.termSignals, 0);
+  assert.equal(reuseStatus.reap.killSignals, 0);
+  assert.ok(reuseStatus.reap.pidMismatches >= 2);
+  assert.equal(reuseStatus.reap.orphanRisk, true);
+  assert.ok(fingerprintBindings.length >= 3);
+  assert.ok(fingerprintBindings.every((binding) => (
+    binding.parentPid === process.pid && binding.spawnNonce === fingerprintBindings[0]!.spawnNonce
+  )));
+  reuse.children[0]!.close();
+  await tick();
+  assert.equal(await reuse.boundary.shutdown(), true);
+
+  pass("disconnect_error_and_pid_reuse_fail_closed", {
+    disconnectedChildReaped: disconnectStatus.reap.reapedChildren,
+    idleErrorReaped: true,
+    stoppingErrorIgnored: true,
+    unrelatedTermSignals: reuseStatus.reap.termSignals,
+    unrelatedKillSignals: reuseStatus.reap.killSignals,
+    pidMismatches: reuseStatus.reap.pidMismatches,
+    nonceAndParentBound: true,
+  });
+}
+
+async function malformedOversizedFrameProof() {
+  const harness = fakeBoundary((spawnNonce) => {
+    const child = new FakeChild(20_500);
+    child.onSend = (raw) => {
+      const request = raw as MaintenanceRunRequest;
+      if (request.type !== "run") return;
+      queueMicrotask(() => child.emit("message", {
+        ...resultReceipt(request),
+        unexpected: "x".repeat(70 * 1024),
+      }));
+    };
+    ready(child, spawnNonce);
+    return child;
+  });
+  const failed = harness.boundary.run();
+  void failed.catch(() => undefined);
+  await rejectsWith(failed, "maintenance_protocol_invalid");
+  const status = harness.boundary.status();
+  assert.equal(status.protocol.oversizedFrames, 1);
+  assert.equal(status.protocol.invalidFrames, 1);
+  assert.equal(status.lastOutcome, "failed");
+  assert.equal(status.reap.reapedChildren, 1);
+  assert.equal(status.reap.orphanRisk, false);
+  assert.equal(await harness.boundary.shutdown(), true);
+  pass("malformed_oversized_frame_fails_closed", {
+    oversizedFrames: status.protocol.oversizedFrames,
+    invalidFrames: status.protocol.invalidFrames,
+    reapedChildren: status.reap.reapedChildren,
+    rawValueInReceipt: false,
+  });
+}
+
+async function realWorkerCrashProof() {
+  const fixturePath = path.resolve("scripts/fixtures/maintenance-boundary-crash-child.mjs");
+  const boundary = new MaintenanceProcessBoundary({
+    entryPath: fixturePath,
+    execArgv: [],
+    env: { ...process.env },
+    deadlineMs: 3_000,
+    readyDeadlineMs: 1_000,
+    termGraceMs: 100,
+    killGraceMs: 500,
+  });
+  const failed = boundary.run();
+  void failed.catch(() => undefined);
+  await assert.rejects(failed, (error: unknown) => (
+    error instanceof Error && [
+      "maintenance_worker_disconnected",
+      "maintenance_worker_closed",
+    ].includes(error.message)
+  ));
+  await waitFor(() => boundary.status().state === "circuit_open", "real_crash_circuit");
+  const status = boundary.status();
+  assert.equal(status.lastOutcome, "failed");
+  assert.equal(status.childPresent, false);
+  assert.equal(status.reap.reapedChildren, 1);
+  assert.equal(status.reap.orphanRisk, false);
+  assert.equal(await boundary.shutdown(), true);
+  pass("real_worker_crash_is_reaped_and_circuited", {
+    lastFailure: status.lastFailure,
+    reapedChildren: status.reap.reapedChildren,
+    orphanRisk: status.reap.orphanRisk,
+    childPresent: status.childPresent,
   });
 }
 
@@ -746,7 +1055,13 @@ async function pathFreeReceiptProof() {
 async function main() {
   assert.equal(process.versions.node.split(".")[0], "22", "proof requires Node 22");
   await fifoAvailabilityProof();
+  await blockedShutdownProof();
   await circuitAndRecoveryProof();
+  await spawnFailureAndConcurrentStartupProof();
+  await shutdownDuringLazyStartupProof();
+  await disconnectErrorAndPidReuseProof();
+  await malformedOversizedFrameProof();
+  await realWorkerCrashProof();
   await staleFenceAndImmediateSecondJobProof();
   await deterministicRaceProof();
   await sourceAndDistWorkerProof();
