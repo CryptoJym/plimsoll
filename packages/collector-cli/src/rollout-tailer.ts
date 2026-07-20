@@ -28,6 +28,10 @@ import {
 } from "./capture-baseline";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
 import { IncrementalJsonlDiscovery } from "./incremental-jsonl-discovery";
+import {
+  maintenanceCandidateHash,
+  type MaintenanceProgressStage,
+} from "./maintenance-progress";
 import { readLocalIdentities, type LocalIdentity, type LocalIdentityPaths } from "./local-identity";
 import { deterministicEventId } from "./normalizer";
 import {
@@ -110,6 +114,9 @@ export type RolloutScanOptions = {
     budget: CaptureWorkBudget;
   };
   signal?: AbortSignal;
+  quarantine?: { stage: MaintenanceProgressStage; candidateHash: string };
+  onProgress?: (progress: { stage: MaintenanceProgressStage; candidateHash: string | null }) => boolean;
+  deferredBeforeIo?: boolean;
 };
 
 type PersistedGitContext = {
@@ -117,6 +124,8 @@ type PersistedGitContext = {
   branchHash?: string;
   headSha?: string;
 };
+
+type PreparedGitContexts = ReadonlyMap<string, PersistedGitContext | undefined>;
 
 type RolloutParserState = {
   parserKind: "codex-rollout-v2";
@@ -303,6 +312,7 @@ function restoreResultMutationSnapshot(
 }
 
 export class RolloutTailer {
+  private activeBoundaryOptions: Pick<RolloutScanOptions, "quarantine" | "onProgress"> = {};
   private baselineAttempt: {
     discovery: IncrementalJsonlDiscovery;
     pendingFiles: Array<{ file: string; stat: fs.Stats; precise: fs.BigIntStats }>;
@@ -346,6 +356,10 @@ export class RolloutTailer {
    * freeze, sounding 0026).
    */
   async scan(options: RolloutScanOptions): Promise<RolloutScanResult> {
+    this.activeBoundaryOptions = {
+      quarantine: options.quarantine,
+      onProgress: options.onProgress,
+    };
     const scanNow = options.now ?? new Date();
     const today = scanNow.toISOString().slice(0, 10);
     const result: RolloutScanResult = {
@@ -384,6 +398,12 @@ export class RolloutTailer {
         truncated: false,
       },
     };
+    if (options.deferredBeforeIo) {
+      result.activity.truncated = true;
+      result.deferredGenerations = 1;
+      result.automaticBudget = options.automatic?.budget.status() ?? null;
+      return result;
+    }
     try {
       this.codexIdentity = this.identityProvider().find((entry) => entry.source === "codex");
     } catch {
@@ -420,7 +440,7 @@ export class RolloutTailer {
           return result;
         }
         this.baselineAttempt = {
-          discovery: this.recentDiscovery(scanNow, options.discoveryLimit),
+          discovery: this.recentDiscovery(scanNow, options.discoveryLimit, options),
           pendingFiles: [],
           runId: began.latestRun.runId,
           filesDiscovered: began.latestRun.filesDiscovered,
@@ -559,7 +579,7 @@ export class RolloutTailer {
 
       if (attempt.capacityDeferredThisSweep) {
         attempt.discovery.close();
-        attempt.discovery = this.recentDiscovery(scanNow, options.discoveryLimit);
+        attempt.discovery = this.recentDiscovery(scanNow, options.discoveryLimit, options);
         attempt.capacityDeferredThisSweep = false;
         attempt.newGenerationsThisSweep = 0;
         result.activity.truncated = true;
@@ -571,7 +591,7 @@ export class RolloutTailer {
       attempt.sweepsCompleted += 1;
       if (attempt.sweepsCompleted < 2 || attempt.newGenerationsThisSweep > 0) {
         attempt.discovery.close();
-        attempt.discovery = this.recentDiscovery(scanNow, options.discoveryLimit);
+        attempt.discovery = this.recentDiscovery(scanNow, options.discoveryLimit, options);
         attempt.newGenerationsThisSweep = 0;
         result.activity.truncated = true;
         result.deferredGenerations = 1;
@@ -625,6 +645,16 @@ export class RolloutTailer {
         break;
       }
       if (automatic) automaticFilesConsumed = index + 1;
+      const candidateHash = maintenanceCandidateHash(file);
+      if (options.quarantine?.stage === "candidate_metadata" &&
+        options.quarantine.candidateHash === candidateHash) {
+        result.deferredGenerations += 1;
+        continue;
+      }
+      if (!discovered.stat && options.onProgress?.({ stage: "candidate_metadata", candidateHash }) === false) {
+        result.deferredGenerations += discoveredFiles.length - index;
+        break;
+      }
       let stat: fs.Stats;
       try {
         stat = discovered.stat ?? this.regularFileStat(file);
@@ -691,6 +721,16 @@ export class RolloutTailer {
 
     for (let candidateIndex = 0; candidateIndex < candidates.length; candidateIndex += 1) {
       const candidate = candidates[candidateIndex]!;
+      const candidateHash = maintenanceCandidateHash(candidate.file);
+      if ((options.quarantine?.stage === "jsonl_open" || options.quarantine?.stage === "jsonl_validation") &&
+        options.quarantine.candidateHash === candidateHash) {
+        result.deferredGenerations += 1;
+        continue;
+      }
+      if (options.onProgress?.({ stage: "jsonl_open", candidateHash }) === false) {
+        result.deferredGenerations += candidates.length - candidateIndex;
+        break;
+      }
       if (options.signal?.aborted) {
         result.aborted = true;
         break;
@@ -733,9 +773,23 @@ export class RolloutTailer {
           const initialState = read.reset || !cursor?.parserState
             ? this.initialParserState(candidate.file)
             : cursor.parserState;
+          // User-controlled paths must be resolved before SQLite acquires its
+          // write lock. Validate the open rollout generation on both sides of
+          // metadata preparation so a changed source never advances a cursor.
+          if (options.onProgress?.({ stage: "jsonl_validation", candidateHash }) === false) {
+            throw new Error("maintenance_progress_budget_exhausted");
+          }
+          read.assertStableForCommit();
+          const fallbackObservedAt = this.fallbackObservedAt(read.mtimeMs);
+          const gitContexts = read.unresolvedRecord
+            ? new Map<string, PersistedGitContext | undefined>()
+            : this.prepareGitContexts(read.lines, options);
+          if (options.onProgress?.({ stage: "jsonl_validation", candidateHash }) === false) {
+            throw new Error("maintenance_progress_budget_exhausted");
+          }
+          read.assertStableForCommit();
           this.buffer.database.transaction(() => {
             if (read.unresolvedRecord) {
-              read.assertStableForCommit();
               rememberJsonlScanCursor(
                 this.buffer.database,
                 candidate.file,
@@ -747,12 +801,17 @@ export class RolloutTailer {
               return;
             }
             const parseErrorsBefore = result.parseErrors;
-            const parserState = this.ingestLines(candidate.file, read.lines, result, initialState);
+            const parserState = this.ingestLines(
+              read.lines,
+              result,
+              initialState,
+              fallbackObservedAt,
+              gitContexts,
+            );
             if (result.parseErrors !== parseErrorsBefore) {
               parseFailure = true;
               throw new Error("rollout_slice_parse_failed");
             }
-            read.assertStableForCommit();
             rememberJsonlScanCursor(
               this.buffer.database,
               candidate.file,
@@ -825,7 +884,7 @@ export class RolloutTailer {
     return result;
   }
 
-  private recentDiscovery(now: Date, limit?: number) {
+  private recentDiscovery(now: Date, limit?: number, _options?: RolloutScanOptions) {
     const roots = [0, 1].map((offset) => {
       const day = new Date(now.getTime() - offset * 24 * 60 * 60 * 1000);
       return path.join(this.sessionsDir, ...day.toISOString().slice(0, 10).split("-"));
@@ -835,6 +894,16 @@ export class RolloutTailer {
       matches: (name) => name.startsWith("rollout-") && name.endsWith(".jsonl"),
       maxEntries: Math.max(1, limit ?? 100_000),
       missingRootsAreEmpty: true,
+      isCandidateQuarantined: (candidateHash) => {
+        const quarantine = this.activeBoundaryOptions.quarantine;
+        return Boolean(
+          quarantine &&
+          (quarantine.stage.startsWith("discovery_") || quarantine.stage === "candidate_metadata") &&
+          quarantine.candidateHash === candidateHash,
+        );
+      },
+      beforeFilesystemStep: (progress) =>
+        this.activeBoundaryOptions.onProgress?.(progress) ?? true,
     });
   }
 
@@ -844,7 +913,7 @@ export class RolloutTailer {
   ) {
     if (!this.captureAttempt) {
       this.captureAttempt = {
-        discovery: this.recentDiscovery(options.now ?? new Date(), options.discoveryLimit),
+        discovery: this.recentDiscovery(options.now ?? new Date(), options.discoveryLimit, options),
         pendingFiles: [],
         discoveryDone: false,
       };
@@ -1005,11 +1074,48 @@ export class RolloutTailer {
     return safe.remoteUrlHash || safe.branchHash || safe.headSha ? safe : undefined;
   }
 
+  private fallbackObservedAt(mtimeMs: number) {
+    const observed = new Date(mtimeMs);
+    return Number.isFinite(mtimeMs) && !Number.isNaN(observed.getTime())
+      ? observed.toISOString()
+      : new Date().toISOString();
+  }
+
+  /**
+   * Resolve every Git working directory before entering the cursor/event
+   * transaction. Malformed lines remain the parser's responsibility; this
+   * pass only discovers valid metadata paths and never reads message content.
+   */
+  private prepareGitContexts(lines: string[], options: RolloutScanOptions): PreparedGitContexts {
+    const cwds = new Set<string>();
+    for (const line of lines) {
+      if (!line.includes('"session_meta"') && !line.includes('"turn_context"')) continue;
+      try {
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        if (parsed.type !== "session_meta" && parsed.type !== "turn_context") continue;
+        const payload = (parsed.payload ?? {}) as Record<string, unknown>;
+        if (typeof payload.cwd === "string") cwds.add(payload.cwd);
+      } catch {
+        // ingestLines records the parse failure inside the transaction.
+      }
+    }
+    return new Map([...cwds].map((cwd) => {
+      const candidateHash = maintenanceCandidateHash(cwd);
+      if (options.quarantine?.stage === "git_context" &&
+        options.quarantine.candidateHash === candidateHash) return [cwd, undefined] as const;
+      if (options.onProgress?.({ stage: "git_context", candidateHash }) === false) {
+        return [cwd, undefined] as const;
+      }
+      return [cwd, this.safeGitContext(cwd)] as const;
+    }));
+  }
+
   private ingestLines(
-    file: string,
     lines: string[],
     result: RolloutScanResult,
     state: RolloutParserState,
+    fallbackObservedAt: string,
+    gitContexts: PreparedGitContexts,
   ) {
     const pending: Array<{
       index: number;
@@ -1039,12 +1145,12 @@ export class RolloutTailer {
         }
         if (typeof parsed.timestamp === "string") state.sessionStartedAt = parsed.timestamp;
         else if (typeof payload.timestamp === "string") state.sessionStartedAt = payload.timestamp as string;
-        if (typeof payload.cwd === "string") state.git = this.safeGitContext(payload.cwd);
+        if (typeof payload.cwd === "string") state.git = gitContexts.get(payload.cwd);
         if (typeof payload.originator === "string") state.originator = payload.originator;
         if (typeof payload.cli_version === "string") state.cliVersion = payload.cli_version;
       } else if (type === "turn_context") {
         if (typeof payload.model === "string" && payload.model) state.model = payload.model;
-        if (typeof payload.cwd === "string") state.git = this.safeGitContext(payload.cwd);
+        if (typeof payload.cwd === "string") state.git = gitContexts.get(payload.cwd);
       } else if (type === "event_msg" && payload.type === "token_count") {
         state.tokenCountIndex += 1;
         const info = (payload.info ?? {}) as Record<string, unknown>;
@@ -1082,14 +1188,6 @@ export class RolloutTailer {
       Date.parse(state.sessionStartedAt) >= Date.parse(identity.validFrom)
         ? identity.actorHash
         : undefined;
-    const fallbackObservedAt = (() => {
-      try {
-        return fs.statSync(file).mtime.toISOString();
-      } catch {
-        return new Date().toISOString();
-      }
-    })();
-
     for (const entry of pending) {
       const priced = estimateCostUsd({
         model: entry.model,

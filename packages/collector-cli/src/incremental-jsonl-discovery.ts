@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { CaptureWorkBudget } from "./capture-work-budget";
+import { maintenanceCandidateHash } from "./maintenance-progress";
 
 type Frame = {
   directory: string;
@@ -36,6 +37,7 @@ export class IncrementalJsonlDiscovery {
   private errors = 0;
   private finished = false;
   private limitReached = false;
+  private paused = false;
 
   constructor(
     roots: string[],
@@ -44,6 +46,12 @@ export class IncrementalJsonlDiscovery {
       matches: (entryName: string) => boolean;
       maxEntries: number;
       missingRootsAreEmpty?: boolean;
+      beforeFilesystemStep?: (progress: {
+        stage: "discovery_directory" | "discovery_read" | "candidate_metadata";
+        candidateHash: string;
+      }) => boolean;
+      quarantinedCandidateHash?: string;
+      isCandidateQuarantined?: (candidateHash: string) => boolean;
     },
   ) {
     this.roots = roots.map((root) => path.resolve(root));
@@ -73,8 +81,10 @@ export class IncrementalJsonlDiscovery {
     let stepsSinceYield = 0;
     let yields = 0;
     let lastYieldAt: string | null = null;
+    this.paused = false;
     while (
       !this.finished &&
+      !this.paused &&
       files.length < maxFiles &&
       this.visited - startingVisited < maxEntries &&
       performance.now() - collectStartedAt < maxWallMs &&
@@ -134,6 +144,19 @@ export class IncrementalJsonlDiscovery {
     }
 
     const frame = this.stack[this.stack.length - 1]!;
+    const directoryHash = maintenanceCandidateHash(frame.directory);
+    if (this.options.quarantinedCandidateHash === directoryHash ||
+      this.options.isCandidateQuarantined?.(directoryHash)) {
+      this.popFrame(false);
+      return null;
+    }
+    if (this.options.beforeFilesystemStep?.({
+      stage: "discovery_read",
+      candidateHash: directoryHash,
+    }) === false) {
+      this.paused = true;
+      return null;
+    }
     let entry: fs.Dirent | null;
     try {
       entry = frame.handle.readSync();
@@ -169,6 +192,16 @@ export class IncrementalJsonlDiscovery {
       this.errors += 1;
       return null;
     }
+    const candidateHash = maintenanceCandidateHash(candidate);
+    if (this.options.quarantinedCandidateHash === candidateHash ||
+      this.options.isCandidateQuarantined?.(candidateHash)) return null;
+    if (this.options.beforeFilesystemStep?.({
+      stage: "candidate_metadata",
+      candidateHash,
+    }) === false) {
+      this.paused = true;
+      return null;
+    }
     try {
       // Bind the discovered name to a physical generation in this same
       // bounded step. Later rename/replace races cannot cause a post-cutoff
@@ -195,6 +228,16 @@ export class IncrementalJsonlDiscovery {
   }
 
   private openDirectory(directory: string, isRoot: boolean) {
+    const candidateHash = maintenanceCandidateHash(directory);
+    if (this.options.quarantinedCandidateHash === candidateHash ||
+      this.options.isCandidateQuarantined?.(candidateHash)) return;
+    if (this.options.beforeFilesystemStep?.({
+      stage: "discovery_directory",
+      candidateHash,
+    }) === false) {
+      this.paused = true;
+      return;
+    }
     try {
       const metadata = fs.lstatSync(directory);
       if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
@@ -233,20 +276,30 @@ export class IncrementalJsonlDiscovery {
     }
   }
 
-  private popFrame() {
-    const frame = this.stack.pop();
+  private popFrame(validate = true) {
+    const frame = this.stack[this.stack.length - 1];
     if (!frame) return;
+    if (validate && this.options.beforeFilesystemStep?.({
+      stage: "discovery_directory",
+      candidateHash: maintenanceCandidateHash(frame.directory),
+    }) === false) {
+      this.paused = true;
+      return;
+    }
+    this.stack.pop();
     try {
-      const current = fs.lstatSync(frame.directory);
-      if (
-        current.isSymbolicLink() ||
-        !current.isDirectory() ||
-        current.dev !== frame.dev ||
-        current.ino !== frame.ino ||
-        current.mtimeMs !== frame.mtimeMs ||
-        current.ctimeMs !== frame.ctimeMs ||
-        !this.hasStableContainedAncestors(frame.directory)
-      ) this.errors += 1;
+      if (validate) {
+        const current = fs.lstatSync(frame.directory);
+        if (
+          current.isSymbolicLink() ||
+          !current.isDirectory() ||
+          current.dev !== frame.dev ||
+          current.ino !== frame.ino ||
+          current.mtimeMs !== frame.mtimeMs ||
+          current.ctimeMs !== frame.ctimeMs ||
+          !this.hasStableContainedAncestors(frame.directory)
+        ) this.errors += 1;
+      }
       frame.handle.closeSync();
     } catch {
       this.errors += 1;

@@ -86,6 +86,7 @@ import {
   CoalescingMaintenanceScheduler,
   CollectorMaintenance,
   automaticCaptureRuntimeStatus,
+  type MaintenanceRunOutcome,
 } from "./maintenance";
 import { codexReconciliationStatus } from "./codex-reconciliation";
 import {
@@ -94,6 +95,9 @@ import {
 } from "./history-coverage";
 import { captureBaselineStatus } from "./capture-baseline";
 import { createCollectorServer } from "./server";
+import { MaintenanceProcessBoundary } from "./maintenance-boundary";
+import { runMaintenanceWorkerService } from "./maintenance-worker";
+import { readLocalIdentities } from "./local-identity";
 import {
   applyClaudeSettings,
   applyCodexConfig,
@@ -230,7 +234,11 @@ Config tools:
 `);
 }
 
-function openBuffer(config: CollectorConfig, deliveryOverride = false) {
+function openBuffer(
+  config: CollectorConfig,
+  deliveryOverride = false,
+  databaseBusyTimeoutMs = 5_000,
+) {
   ensureCollectorHome();
   return new LocalEventBuffer(collectorBufferPath(), {
     workspaceId: config.tenantId,
@@ -238,6 +246,7 @@ function openBuffer(config: CollectorConfig, deliveryOverride = false) {
       enabled: Boolean(config.uploadUrl) || deliveryOverride,
       limits: config.delivery,
     },
+    databaseBusyTimeoutMs,
   });
 }
 
@@ -885,6 +894,28 @@ async function main() {
     return;
   }
 
+  if (command === "__maintenance_worker") {
+    const spawnNonce = process.env.PLIMSOLL_MAINTENANCE_SPAWN_NONCE ?? "";
+    if (!/^[a-f0-9-]{16,80}$/i.test(spawnNonce) || !process.send) {
+      process.exitCode = 64;
+      return;
+    }
+    const workerConfig = loadCollectorConfig();
+    assertCollectorPrivacyMode(workerConfig, "automatic maintenance worker");
+    const workerBuffer = openBuffer(workerConfig, false, 900);
+    const workerMaintenance = new CollectorMaintenance(
+      workerBuffer,
+      new RolloutTailer(workerBuffer),
+      new TranscriptTailer(workerBuffer),
+    );
+    runMaintenanceWorkerService({
+      maintenance: workerMaintenance,
+      buffer: workerBuffer,
+      spawnNonce,
+    });
+    return;
+  }
+
   if (command === "join") {
     // Join runs before ordinary config loading because loadCollectorConfig()
     // creates a default file. A refused/failed join must leave even a missing
@@ -1056,18 +1087,42 @@ async function main() {
       return;
     }
 
-    const buffer = openBuffer(config);
-    let scheduler: CoalescingMaintenanceScheduler | undefined;
-    let maintenanceCadence: AutomaticMaintenanceCadence | undefined;
-    let maintenance: CollectorMaintenance | undefined;
-    const maintenanceAbort = new AbortController();
+    // This connection owns the HTTP event loop. Never inherit better-sqlite3's
+    // five-second busy wait when the maintenance child briefly owns a writer.
+    const buffer = openBuffer(config, false, 0);
+    let scheduler: CoalescingMaintenanceScheduler<MaintenanceRunOutcome> | undefined;
+    let maintenanceCadence: AutomaticMaintenanceCadence<MaintenanceRunOutcome> | undefined;
+    let cachedBaseline = captureBaselineStatus(buffer.database);
+    const maintenanceBoundary = new MaintenanceProcessBoundary({
+      entryPath: process.argv[1]!,
+      execArgv: process.execArgv,
+      env: process.env,
+      deadlineMs: 1_000,
+      readyDeadlineMs: 1_000,
+    });
+    let detectedIdentities: Array<Record<string, unknown>> = [];
+    try {
+      detectedIdentities = readLocalIdentities().map((entry) => ({
+        source: entry.source,
+        email: entry.email ?? null,
+        planType: entry.planType ?? null,
+        actorHash: entry.actorHash ?? null,
+      }));
+    } catch {
+      detectedIdentities = [];
+    }
+    let refreshStatusSnapshot = () => false;
     const server = createCollectorServer(config, buffer, {
       runtimeIdentity,
       maintenanceStatus: () => ({
+        boundary: maintenanceBoundary.status(),
         scheduler: scheduler?.status() ?? null,
         cadence: maintenanceCadence?.status() ?? null,
-        capture: maintenance?.status() ?? null,
       }),
+      detectedIdentities: () => detectedIdentities,
+      registerStatusRefresher: (refresh) => {
+        refreshStatusSnapshot = refresh;
+      },
     });
     let ownsPidFile = false;
     let shuttingDown = false;
@@ -1203,14 +1258,15 @@ async function main() {
     // First boot records a metadata-only, whole-generation exclusion baseline.
     // Later automatic cadences tail only new generations within hard work
     // limits; full history remains an explicit operator command.
-    maintenance = new CollectorMaintenance(
-      buffer,
-      new RolloutTailer(buffer),
-      new TranscriptTailer(buffer),
-      maintenanceAbort.signal,
-    );
     scheduler = new CoalescingMaintenanceScheduler(async () => {
-      const result = await maintenance.runRecent();
+      const result = await maintenanceBoundary.run();
+      try {
+        cachedBaseline = captureBaselineStatus(buffer.database);
+      } catch {
+        // Keep the last coherent parent snapshot; the child receipt remains
+        // authoritative for whether this generation completed.
+      }
+      refreshStatusSnapshot();
       const { rollout, transcript, reconciliation, repricing, enrichment } = result;
       if (rollout.eventsAppended > 0 || rollout.parseErrors > 0) {
         console.log(JSON.stringify({ status: "rollout_scan", ...rollout }));
@@ -1231,14 +1287,11 @@ async function main() {
     });
     maintenanceCadence = new AutomaticMaintenanceCadence(
       scheduler,
-      () => captureBaselineStatus(buffer.database),
+      () => cachedBaseline,
       {
         onError: (error) => {
-          if (
-            maintenanceAbort.signal.aborted &&
-            error instanceof Error &&
-            error.message === "automatic_maintenance_aborted"
-          ) return;
+          if (shuttingDown && error instanceof Error &&
+            error.message === "maintenance_boundary_stopping") return;
           console.warn(
             JSON.stringify({
               warning: "maintenance_failed",
@@ -1260,6 +1313,23 @@ async function main() {
     }
     for (const timer of timers) timer.unref();
 
+    const stopMaintenanceBeforeFatalExit = async () => {
+      maintenanceCadence?.stop();
+      for (const timer of timers) clearInterval(timer);
+      scheduler?.stopAccepting();
+      ownership.release();
+      const [idle, child] = await Promise.allSettled([
+        scheduler?.waitForIdle() ?? Promise.resolve(),
+        maintenanceBoundary.shutdown(),
+      ]);
+      const maintenanceIdle = idle.status === "fulfilled";
+      const maintenanceChildReaped = child.status === "fulfilled" && child.value;
+      // The maintenance child may own the SQLite writer. Never close the
+      // parent's connection while either the scheduler or child can still use it.
+      if (maintenanceIdle && maintenanceChildReaped) buffer.close();
+      return { maintenanceIdle, maintenanceChildReaped };
+    };
+
     const shutdown = (signal: string) => {
       if (shuttingDown) {
         server.closeIdleConnections?.();
@@ -1270,14 +1340,13 @@ async function main() {
       maintenanceCadence?.stop();
       for (const timer of timers) clearInterval(timer);
       scheduler?.stopAccepting();
-      maintenanceAbort.abort();
-      maintenance?.close();
       ownership.release();
       const hardDeadlineMs = 2_500;
       const forceAfterMs = 750;
       const deadlineAt = performance.now() + hardDeadlineMs;
       let serverClosed = false;
       let maintenanceIdle = false;
+      let maintenanceChildReaped = false;
       const serverClose = new Promise<void>((resolve) => {
         server.close(() => {
           serverClosed = true;
@@ -1292,12 +1361,18 @@ async function main() {
       const idle = (scheduler?.waitForIdle() ?? Promise.resolve()).then(() => {
         maintenanceIdle = true;
       });
+      const childShutdown = maintenanceBoundary.shutdown().then((stopped) => {
+        maintenanceChildReaped = stopped;
+      });
       const deadline = new Promise<void>((resolve) => {
         setTimeout(resolve, hardDeadlineMs);
       });
       void (async () => {
         try {
-          await Promise.race([Promise.allSettled([serverClose, idle]).then(() => undefined), deadline]);
+          await Promise.race([
+            Promise.allSettled([serverClose, idle, childShutdown]).then(() => undefined),
+            deadline,
+          ]);
           if (!serverClosed) {
             server.closeIdleConnections?.();
             server.closeAllConnections?.();
@@ -1312,8 +1387,9 @@ async function main() {
               ]);
             }
           }
-          // Never close SQLite while maintenance may still be inside a write.
-          if (maintenanceIdle) buffer.close();
+          // Never close SQLite until the child is reaped and the parent
+          // scheduler no longer has a boundary call in flight.
+          if (maintenanceIdle && maintenanceChildReaped) buffer.close();
         } catch {
           // PID ownership cleanup below is the non-negotiable finalizer.
         } finally {
@@ -1333,7 +1409,7 @@ async function main() {
             remaining.kind === "missing" &&
             !persistentCleanup.ambiguous &&
             !cleanupAttempt?.ambiguous;
-          const shutdownReady = pidCleaned && serverClosed;
+          const shutdownReady = pidCleaned && serverClosed && maintenanceChildReaped;
           console.log(
             JSON.stringify({
               // The process is still executing this receipt. Only the stop or
@@ -1346,6 +1422,7 @@ async function main() {
               pidCleanup: pidCleanupStateReceipt(persistentCleanup),
               cleanupAttempt: pidCleanupAttemptReceipt(cleanupAttempt),
               maintenanceIdle,
+              maintenanceChildReaped,
               listenerClosed: serverClosed,
               listenerState: serverClosed ? "closed" : "close_incomplete",
               processState: "exiting",
@@ -1361,53 +1438,63 @@ async function main() {
     process.on("SIGINT", () => shutdown("SIGINT"));
     process.on("SIGTERM", () => shutdown("SIGTERM"));
     server.on("error", (error: NodeJS.ErrnoException) => {
-      ownership.release();
-      buffer.close();
-      const cleanupAttempt = ownsPidFile
-        ? removeCollectorPidFileIfOwned(pidPath, runtimeIdentity, LAUNCH_AGENT_LABEL)
-        : null;
-      const remaining = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);
-      const persistentCleanup = readCollectorPidCleanupState(pidPath, LAUNCH_AGENT_LABEL);
-      console.error(
-        JSON.stringify(
-          {
-            status: "error",
-            code: error.code === "EADDRINUSE" ? "port_in_use" : "listen_failed",
-            port: config.port,
-            message: error.message,
-            pidCleaned: remaining.kind === "missing" && !persistentCleanup.ambiguous,
-            pidRecordState: remaining.kind,
-            pidCleanup: pidCleanupStateReceipt(persistentCleanup),
-            cleanupAttempt: pidCleanupAttemptReceipt(cleanupAttempt),
-          },
-          null,
-          2,
-        ),
-      );
-      process.exit(1);
-    });
-    server.listen(config.port, "127.0.0.1", () => {
-      try {
-        ownership.writePidFile(collectorPidRecord(runtimeIdentity));
-        ownsPidFile = true;
-      } catch (error) {
-        ownership.release();
-        server.close();
-        buffer.close();
+      if (shuttingDown) return;
+      shuttingDown = true;
+      void (async () => {
+        const maintenance = await stopMaintenanceBeforeFatalExit();
+        const cleanupAttempt = ownsPidFile
+          ? removeCollectorPidFileIfOwned(pidPath, runtimeIdentity, LAUNCH_AGENT_LABEL)
+          : null;
+        const remaining = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);
+        const persistentCleanup = readCollectorPidCleanupState(pidPath, LAUNCH_AGENT_LABEL);
         console.error(
           JSON.stringify(
             {
               status: "error",
-              code: "ownership_failed",
-              pidFileOwned: ownsPidFile,
+              code: error.code === "EADDRINUSE" ? "port_in_use" : "listen_failed",
               port: config.port,
-              message: error instanceof Error ? error.message : String(error),
+              message: error.message,
+              pidCleaned: remaining.kind === "missing" && !persistentCleanup.ambiguous,
+              pidRecordState: remaining.kind,
+              pidCleanup: pidCleanupStateReceipt(persistentCleanup),
+              cleanupAttempt: pidCleanupAttemptReceipt(cleanupAttempt),
+              ...maintenance,
             },
             null,
             2,
           ),
         );
         process.exit(1);
+      })();
+    });
+    server.listen(config.port, "127.0.0.1", () => {
+      try {
+        ownership.writePidFile(collectorPidRecord(runtimeIdentity));
+        ownsPidFile = true;
+      } catch (error) {
+        shuttingDown = true;
+        void (async () => {
+          const listenerClosed = await new Promise<boolean>((resolve) => {
+            server.close((closeError) => resolve(!closeError));
+          });
+          const maintenance = await stopMaintenanceBeforeFatalExit();
+          console.error(
+            JSON.stringify(
+              {
+                status: "error",
+                code: "ownership_failed",
+                pidFileOwned: ownsPidFile,
+                port: config.port,
+                message: error instanceof Error ? error.message : String(error),
+                listenerClosed,
+                ...maintenance,
+              },
+              null,
+              2,
+            ),
+          );
+          process.exit(1);
+        })();
         return;
       }
       ownership.release();

@@ -59,6 +59,9 @@ jobs:
       - name: Prove local HTTP trust boundary
         run: pnpm proof:http-boundary
 
+      - name: Prove isolated automatic maintenance availability
+        run: pnpm proof:maintenance-boundary
+
       - name: Prove shipped dashboard projection truth
         run: pnpm proof:dashboard
 

@@ -1,7 +1,6 @@
 import type { LocalEventBuffer } from "./buffer";
 import { assertCollectorPrivacyMode, type CollectorConfig } from "./config";
-import { resolveGitContext } from "./git-context";
-import { asRecord, normalizeHookPayload, stringField } from "./normalizer";
+import { normalizeHookPayload } from "./normalizer";
 import {
   canonicalizeSuppressionReceipts,
   type ToolSource,
@@ -18,18 +17,12 @@ export function appendForwardedHook(
   },
 ) {
   assertCollectorPrivacyMode(options.config, "hook capture");
-  // Resolve git linkage keys from the hook's cwd before sanitization hashes it.
-  const cwd = stringField(asRecord(payload), ["cwd", "current_working_directory", "workdir"]);
-  const resolved = resolveGitContext(cwd);
-  if (resolved?.remoteUrlHash && resolved.remoteLabel) {
-    options.buffer.recordRepoLabel(resolved.remoteUrlHash, resolved.remoteLabel);
-  }
-  const { remoteLabel: _localOnly, ...gitContext } = resolved ?? {};
-
+  // Hook admission must not touch caller-selected filesystem paths. Repository
+  // linkage is intentionally UNKNOWN here; bounded maintenance may enrich it
+  // later without making event capture depend on local filesystem latency.
   const normalized = normalizeHookPayload(payload, {
     policy: options.config.policy,
     source: options.source,
-    gitContext: resolved ? gitContext : undefined,
     transportPath: options.transportPath,
   });
   // Successful hook/fallback responses are public proof surfaces before the

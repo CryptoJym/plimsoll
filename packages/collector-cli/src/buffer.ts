@@ -97,9 +97,14 @@ export class LocalEventBuffer {
       delivery?: { enabled?: boolean; limits?: Partial<DeliveryLimits> };
       workspaceId?: string;
       learningFacts?: { limits?: Partial<LearningFactLimits> };
+      /** HTTP collectors fail fast under child-writer contention; maintenance
+       * workers may use a short bounded wait. The better-sqlite3 default is
+       * five seconds, which is never appropriate on the listener event loop. */
+      databaseBusyTimeoutMs?: number;
     } = {},
   ) {
-    this.db = new Database(path);
+    const timeout = Math.max(0, Math.min(options.databaseBusyTimeoutMs ?? 5_000, 5_000));
+    this.db = new Database(path, { timeout });
     this.db.pragma("journal_mode = WAL");
     const newLedger = !this.db
       .prepare(`select 1 from sqlite_master where type='table' and name='buffered_events'`)
@@ -616,7 +621,16 @@ export class LocalEventBuffer {
          on conflict(source, session_id) do nothing`,
       )
       .run(event.source, event.sessionId, authority, claimedAt);
-    return authority === desired;
+    // Another connection can win between the compatibility lookup and the
+    // insert. Always re-read the durable winner; returning our proposed value
+    // would allow both the live receiver and maintenance tailer to append.
+    const winner = this.db
+      .prepare(
+        `select authority from session_usage_authority
+         where source = ? and session_id = ?`,
+      )
+      .get(event.source, event.sessionId) as { authority: "tailer" | "live" } | undefined;
+    return winner?.authority === desired;
   }
 
   sessionUsageAuthority(source: "codex" | "claude_code", sessionId: string) {

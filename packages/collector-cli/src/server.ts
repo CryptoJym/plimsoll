@@ -16,7 +16,6 @@ import {
 import { appendForwardedHook } from "./forwarder";
 import { explodeOtlpPayload } from "./otlp";
 import { saveCollectorConfig } from "./config";
-import { readLocalIdentities } from "./local-identity";
 import type { CollectorRuntimeIdentity } from "./runtime-ownership";
 import { codexReconciliationStatus } from "./codex-reconciliation";
 import { historyCoverageStatus } from "./history-coverage";
@@ -130,6 +129,10 @@ export function createCollectorServer(
   options: {
     runtimeIdentity?: CollectorRuntimeIdentity;
     maintenanceStatus?: () => unknown;
+    /** Sanitized startup cache. HTTP handlers never discover user files. */
+    detectedIdentities?: () => Array<Record<string, unknown>>;
+    /** Registers a refresh callable for startup/child-receipt points only. */
+    registerStatusRefresher?: (refresh: () => boolean) => void;
   } = {},
 ) {
   assertCollectorPrivacyMode(config, "collector server");
@@ -172,19 +175,101 @@ export function createCollectorServer(
     };
   };
 
+  let lastCoherentStatus: {
+    body: Record<string, unknown>;
+    generation: number | null;
+    cachedAt: string;
+  } | null = null;
+  let lastStatusRefreshError: "database_busy" | "status_refresh_failed" | null = null;
+  const currentStatus = () => {
+    const read = snapshotResponse(30);
+    if (read.kind === "ready") {
+      const body = read.snapshot.status as Record<string, unknown>;
+      lastCoherentStatus = {
+        body,
+        generation: read.snapshot.generation,
+        cachedAt: new Date().toISOString(),
+      };
+      return { body, generation: read.snapshot.generation };
+    }
+    const body: Record<string, unknown> = {
+      ok: true,
+      runtimeIdentity: options.runtimeIdentity ?? null,
+      dataMode: config.policy.dataMode,
+      privacyMode: "metadata_only",
+      privacy: collectorPrivacyReadiness(config),
+      retentionDays: config.retentionDays,
+      stats: null,
+      delivery: buffer.delivery.status(),
+      reconciliation: codexReconciliationStatus(buffer.database),
+      maintenance: options.maintenanceStatus?.() ?? null,
+      historyCoverage: historyCoverageStatus(buffer.database),
+      captureBaseline: captureBaselineStatus(buffer.database),
+      projection: read.kind === "backfilling" ? read.status : {
+        ready: false,
+        degraded: true,
+        degradedReason: "unsupported_projection_window",
+      },
+      health: {
+        generatedAt: new Date().toISOString(),
+        overall: "amber",
+        sources: [],
+        reason: "projection backfill has not published a coherent health snapshot",
+      },
+      captureHealth: {
+        generatedAt: new Date().toISOString(),
+        overall: "amber",
+        sources: [],
+        reason: "projection backfill has not published a coherent health snapshot",
+      },
+    };
+    lastCoherentStatus = { body, generation: null, cachedAt: new Date().toISOString() };
+    return { body, generation: null };
+  };
+
+  // Prime one coherent in-memory response before accepting requests. The
+  // parent connection is fail-fast, so a rare startup writer collision falls
+  // through to the bounded minimal status below rather than waiting seconds.
+  const refreshStatus = () => {
+    try {
+      currentStatus();
+      lastStatusRefreshError = null;
+      return true;
+    } catch (error) {
+      const code = error && typeof error === "object" && "code" in error
+        ? String((error as { code?: unknown }).code ?? "")
+        : "";
+      lastStatusRefreshError = code === "SQLITE_BUSY" || code === "SQLITE_LOCKED"
+        ? "database_busy"
+        : "status_refresh_failed";
+      return false;
+    }
+  };
+  refreshStatus();
+  options.registerStatusRefresher?.(refreshStatus);
+
   return http.createServer(async (request, response) => {
     const budget = createRequestBudget();
     try {
       assertAllowedHost(request);
 
       if (request.method === "GET" && request.url === "/status") {
-        const read = snapshotResponse(30);
-        if (read.kind === "ready") {
-          sendJson(response, read.snapshot.status, 200, {
-            "x-plimsoll-projection-generation": String(read.snapshot.generation),
-          });
-        } else {
-          sendJson(response, {
+          // Cache-only by construction: no SQLite or user-path filesystem call
+          // executes on the availability endpoint.
+          const cached = lastCoherentStatus;
+          const ageMs = cached ? Math.max(0, Date.now() - Date.parse(cached.cachedAt)) : null;
+          const body: Record<string, unknown> = cached
+            ? {
+                ...cached.body,
+                maintenance: options.maintenanceStatus?.() ?? null,
+                statusFreshness: {
+                  state: lastStatusRefreshError ? "last_coherent" : "coherent",
+                  reason: lastStatusRefreshError,
+                  cachedAt: cached.cachedAt,
+                  ageMs,
+                },
+              }
+            : {
             ok: true,
             runtimeIdentity: options.runtimeIdentity ?? null,
             dataMode: config.policy.dataMode,
@@ -192,15 +277,15 @@ export function createCollectorServer(
             privacy: collectorPrivacyReadiness(config),
             retentionDays: config.retentionDays,
             stats: null,
-            delivery: buffer.delivery.status(),
-            reconciliation: codexReconciliationStatus(buffer.database),
+            delivery: null,
+            reconciliation: null,
             maintenance: options.maintenanceStatus?.() ?? null,
-            historyCoverage: historyCoverageStatus(buffer.database),
-            captureBaseline: captureBaselineStatus(buffer.database),
-            projection: read.kind === "backfilling" ? read.status : {
+            historyCoverage: null,
+            captureBaseline: null,
+            projection: {
               ready: false,
               degraded: true,
-              degradedReason: "unsupported_projection_window",
+              degradedReason: "database_busy_no_coherent_snapshot",
             },
             health: {
               generatedAt: new Date().toISOString(),
@@ -214,8 +299,16 @@ export function createCollectorServer(
               sources: [],
               reason: "projection backfill has not published a coherent health snapshot",
             },
+            statusFreshness: {
+              state: "unavailable",
+              reason: lastStatusRefreshError ?? "coherent_snapshot_not_established",
+              cachedAt: null,
+              ageMs: null,
+            },
+          };
+          sendJson(response, body, 200, cached?.generation === null || cached?.generation === undefined ? {} : {
+            "x-plimsoll-projection-generation": String(cached.generation),
           });
-        }
         return;
       }
 
@@ -237,23 +330,12 @@ export function createCollectorServer(
           // Detected local identities (emails/plans from each tool's own
           // config). Served to the loopback page only — nothing leaves the
           // machine from here; attachment to an account row is the human's call.
-          let detectedIdentities: Array<Record<string, unknown>> = [];
-          try {
-            detectedIdentities = readLocalIdentities().map((entry) => ({
-              source: entry.source,
-              email: entry.email ?? null,
-              planType: entry.planType ?? null,
-              actorHash: entry.actorHash ?? null,
-            }));
-          } catch {
-            detectedIdentities = [];
-          }
           sendJson(response, {
             accounts,
             accountAliases: buffer.listAccountAliases(),
             priorityRepos: buffer.listPriorityRepos(),
             subscriptions: config.subscriptions,
-            detectedIdentities,
+            detectedIdentities: options.detectedIdentities?.() ?? [],
           });
           return;
         }

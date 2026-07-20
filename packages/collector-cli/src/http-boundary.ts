@@ -37,6 +37,7 @@ export type HttpBoundaryReason =
   | "source_mismatch"
   | "source_not_allowed"
   | "source_required"
+  | "storage_busy_retry"
   | "unsupported_content_encoding";
 
 export class HttpBoundaryRejection extends Error {
@@ -50,8 +51,12 @@ export class HttpBoundaryRejection extends Error {
 }
 
 export function asHttpBoundaryRejection(error: unknown) {
-  return error instanceof HttpBoundaryRejection
-    ? error
+  if (error instanceof HttpBoundaryRejection) return error;
+  const code = error && typeof error === "object" && "code" in error
+    ? String((error as { code?: unknown }).code ?? "")
+    : "";
+  return code === "SQLITE_BUSY" || code === "SQLITE_LOCKED"
+    ? new HttpBoundaryRejection("storage_busy_retry", 503)
     : new HttpBoundaryRejection("internal_rejection", 400);
 }
 
