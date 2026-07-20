@@ -740,6 +740,40 @@ async function main() {
       "Packaged start ownership failure was not stable, path-free JSON with a nonzero exit.",
     );
 
+    const unavailablePsHome = path.join(tempRoot, "start-fingerprint-unavailable");
+    writeConfig(unavailablePsHome, await availablePort());
+    const unavailablePsBin = path.join(tempRoot, "unavailable-ps-bin");
+    fs.mkdirSync(unavailablePsBin, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(unavailablePsBin, "ps"), "#!/bin/sh\nexit 127\n", {
+      mode: 0o700,
+    });
+    const unavailablePsStart = watch(
+      spawn(process.execPath, [cliPath, "start"], {
+        cwd: root,
+        env: {
+          ...process.env,
+          PATH: unavailablePsBin,
+          PLIMSOLL_HOME: unavailablePsHome,
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      }),
+    );
+    children.push(unavailablePsStart);
+    const unavailablePsExit = await waitForExit(unavailablePsStart.child);
+    const unavailablePsRaw = unavailablePsStart.errors.join("").trim();
+    const unavailablePsReceipt = JSON.parse(unavailablePsRaw) as Receipt;
+    check(
+      unavailablePsExit.code !== 0 &&
+        unavailablePsReceipt.status === "error" &&
+        unavailablePsReceipt.code === "process_fingerprint_unavailable" &&
+        typeof unavailablePsReceipt.pidPathHash === "string" &&
+        !unavailablePsRaw.includes(tempRoot) &&
+        !unavailablePsRaw.includes(root) &&
+        !unavailablePsRaw.includes(" at ") &&
+        !fs.existsSync(path.join(unavailablePsHome, "collector.pid")),
+      "Packaged start leaked a stack/path or mutated PID state when ps was unavailable.",
+    );
+
     const blockedDoctor = collectorCommand(
       cliPath,
       durableHome,
@@ -1163,6 +1197,7 @@ async function main() {
             "unload receipts are path-free and legacy PID residue is retained",
             "durable cleanup ambiguity survives SIGTERM, stop, and unload process reopen",
             "packaged start failures are stable path-free JSON with nonzero exit",
+            "packaged start contains fingerprint acquisition inside the JSON error boundary",
             "doctor reports live and eligible cleanup actors without mutation",
             "dead actor plus 1200 unrelated files reconciles to already-stopped truth",
             "missing PID stop exit status matches absent versus present listener truth",

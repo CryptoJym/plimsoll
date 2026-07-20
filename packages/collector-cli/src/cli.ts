@@ -1012,10 +1012,12 @@ async function main() {
   });
 
   if (command === "start") {
-    const pidPath = collectorLogPath("collector.pid");
-    const runtimeIdentity = createCollectorRuntimeIdentity();
+    let pidPath = "";
+    let runtimeIdentity: CollectorRuntimeIdentity;
     let ownership: Awaited<ReturnType<typeof acquireCollectorStartOwnership>>;
     try {
+      pidPath = collectorLogPath("collector.pid");
+      runtimeIdentity = createCollectorRuntimeIdentity();
       ownership = await acquireCollectorStartOwnership({
         candidateIdentity: runtimeIdentity,
         label: LAUNCH_AGENT_LABEL,
@@ -1030,7 +1032,7 @@ async function main() {
             error instanceof CollectorStartOwnershipError
               ? error.code
               : "ownership_failed",
-          pidPathHash: privatePathReceipt(pidPath),
+          pidPathHash: pidPath ? privatePathReceipt(pidPath) : null,
           port: config.port,
         }),
       );

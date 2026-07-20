@@ -176,6 +176,8 @@ export type CollectorPidCleanupReconciliationResult = Readonly<{
 export type CollectorPidCleanupReconciliationHooks = Readonly<{
   beforeMarkerClaim?: () => void;
   beforeClear?: () => void;
+  afterMarkerMoveCheck?: () => void;
+  afterGuardRewriteCheck?: () => void;
 }>;
 
 export type CollectorPidCleanupHooks = Readonly<{
@@ -183,6 +185,9 @@ export type CollectorPidCleanupHooks = Readonly<{
   afterPreClaimCheck?: () => void;
   beforeMismatchRestore?: () => void;
   afterClaim?: () => void;
+  afterPidMoveCheck?: () => void;
+  afterMarkerMoveCheck?: () => void;
+  afterGuardRewriteCheck?: () => void;
 }>;
 
 type StartLockRecord = CollectorRuntimeIdentity & {
@@ -539,7 +544,7 @@ type CleanupMarkerRecord = Readonly<{
   actor: ProcessIdentity;
   label: string;
   schema: "plimsoll.collector-pid-cleanup.v2";
-  state: "in_progress";
+  state: "in_progress" | "retirement_pending" | "retirement_complete";
   target: CollectorRuntimeIdentity;
   transactionId: string;
 }>;
@@ -564,6 +569,19 @@ function cleanupArtifactNames(pidPath: string) {
     pidClaimPath: path.join(directory, `.${basename}.plimsoll-remove-claim`),
     markerClaimPath: path.join(directory, `.${basename}.plimsoll-cleanup-marker-claim`),
     quarantinePath: path.join(directory, `.${basename}.plimsoll-quarantine`),
+    archiveRoot: path.join(directory, `.${basename}.plimsoll-cleanup-archive`),
+  };
+}
+
+function cleanupArchiveNames(pidPath: string, transactionId: string) {
+  const names = cleanupArtifactNames(pidPath);
+  const transactionDirectory = path.join(names.archiveRoot, transactionId);
+  return {
+    root: names.archiveRoot,
+    transactionDirectory,
+    pid: path.join(transactionDirectory, "pid"),
+    marker: path.join(transactionDirectory, "marker"),
+    guard: path.join(transactionDirectory, "guard"),
   };
 }
 
@@ -601,7 +619,9 @@ function inspectCleanupMarker(slotPath: string, label: string): CleanupMarkerIns
       Object.keys(parsed).sort().join("|") !==
         "actor|label|schema|state|target|transactionId" ||
       parsed.schema !== "plimsoll.collector-pid-cleanup.v2" ||
-      parsed.state !== "in_progress" ||
+      !["in_progress", "retirement_pending", "retirement_complete"].includes(
+        parsed.state ?? "",
+      ) ||
       parsed.label !== label ||
       typeof parsed.transactionId !== "string" ||
       !/^[0-9a-f-]{36}$/.test(parsed.transactionId) ||
@@ -616,18 +636,47 @@ function inspectCleanupMarker(slotPath: string, label: string): CleanupMarkerIns
   }
 }
 
+function markerRaw(record: CleanupMarkerRecord) {
+  return `${JSON.stringify(record)}\n`;
+}
+
+function archivedMarkerMatches(pidPath: string, marker: Extract<
+  CleanupMarkerInspection,
+  { kind: "present" }
+>) {
+  if (marker.record.state !== "retirement_complete") return true;
+  const archived = inspectCleanupSlot(
+    cleanupArchiveNames(pidPath, marker.record.transactionId).marker,
+  );
+  return archived.kind === "present" && archived.raw === markerRaw({
+    ...marker.record,
+    state: "in_progress",
+  });
+}
+
 function inspectCleanupArtifacts(pidPath: string, label: string) {
   const names = cleanupArtifactNames(pidPath);
-  const marker = inspectCleanupMarker(names.markerPath, label);
+  const inspectedMarker = inspectCleanupMarker(names.markerPath, label);
   const pidClaim = inspectCleanupSlot(names.pidClaimPath);
-  const markerClaim = inspectCleanupMarker(names.markerClaimPath, label);
+  const inspectedMarkerClaim = inspectCleanupMarker(names.markerClaimPath, label);
   const quarantine = inspectCleanupSlot(names.quarantinePath);
-  const markerState = marker.kind === "missing"
+  const marker: CleanupMarkerInspection = inspectedMarker.kind === "present" &&
+      !archivedMarkerMatches(pidPath, inspectedMarker)
+    ? { kind: "unsafe" }
+    : inspectedMarker;
+  const markerClaim: CleanupMarkerInspection = inspectedMarkerClaim.kind === "present" &&
+      !archivedMarkerMatches(pidPath, inspectedMarkerClaim)
+    ? { kind: "unsafe" }
+    : inspectedMarkerClaim;
+  const markerState = marker.kind === "missing" ||
+      (marker.kind === "present" && marker.record.state === "retirement_complete")
     ? "missing" as const
     : marker.kind === "present"
       ? "present" as const
       : "unsafe" as const;
-  const claimCount = Number(pidClaim.kind !== "missing") + Number(markerClaim.kind !== "missing");
+  const markerClaimActive = markerClaim.kind !== "missing" &&
+    !(markerClaim.kind === "present" && markerClaim.record.state === "retirement_complete");
+  const claimCount = Number(pidClaim.kind !== "missing") + Number(markerClaimActive);
   const quarantineCount = Number(quarantine.kind !== "missing");
   const unsafeArtifactCount = [marker, pidClaim, markerClaim, quarantine]
     .filter((artifact) => artifact.kind === "unsafe").length;
@@ -654,21 +703,27 @@ function createCleanupMarker(
   pidPath: string,
   label: string,
   target: CollectorRuntimeIdentity,
-): CleanupArtifact | null {
+): PresentCleanupMarker | null {
   const actorFingerprint = readProcessStartFingerprint(process.pid);
   if (!actorFingerprint) return null;
-  const names = cleanupArtifactNames(pidPath);
-  const raw = `${JSON.stringify({
+  const artifacts = inspectCleanupArtifacts(pidPath, label);
+  const markerPath = artifacts.marker.kind === "missing"
+    ? artifacts.names.markerPath
+    : artifacts.markerClaim.kind === "missing"
+      ? artifacts.names.markerClaimPath
+      : null;
+  if (!markerPath) return null;
+  const raw = markerRaw({
     actor: { pid: process.pid, processStartFingerprint: actorFingerprint },
     label,
     schema: "plimsoll.collector-pid-cleanup.v2",
     state: "in_progress",
     target,
     transactionId: randomUUID(),
-  } satisfies CleanupMarkerRecord)}\n`;
+  });
   try {
-    fs.writeFileSync(names.markerPath, raw, { flag: "wx", mode: 0o600 });
-    const inspected = inspectCleanupMarker(names.markerPath, label);
+    fs.writeFileSync(markerPath, raw, { flag: "wx", mode: 0o600 });
+    const inspected = inspectCleanupMarker(markerPath, label);
     if (inspected.kind !== "present" || inspected.raw !== raw) return null;
     return inspected;
   } catch {
@@ -676,58 +731,124 @@ function createCleanupMarker(
   }
 }
 
-function claimExactArtifact(
-  source: CleanupArtifact,
-  destinationPath: string,
-): CleanupArtifact | null {
+type CleanupArchiveMoveResult =
+  | { kind: "exact"; artifact: CleanupArtifact }
+  | { kind: "changed" | "failed" };
+
+function privateCleanupDirectory(directoryPath: string) {
   try {
-    const before = inspectCleanupSlot(source.path);
-    if (
-      before.kind !== "present" ||
-      !samePidFileIdentity(source.fileIdentity, before.fileIdentity) ||
-      before.raw !== source.raw ||
-      lstatPidPath(destinationPath)
-    ) {
-      return null;
-    }
-    fs.writeFileSync(destinationPath, source.raw, { flag: "wx", mode: 0o600 });
-    const destination = inspectCleanupSlot(destinationPath);
-    const sourceBeforeUnlink = inspectCleanupSlot(source.path);
-    if (
-      destination.kind !== "present" ||
-      destination.raw !== source.raw ||
-      sourceBeforeUnlink.kind !== "present" ||
-      !samePidFileIdentity(source.fileIdentity, sourceBeforeUnlink.fileIdentity) ||
-      sourceBeforeUnlink.raw !== source.raw
-    ) {
-      return null;
-    }
-    fs.unlinkSync(source.path);
-    const claimed = inspectCleanupSlot(destinationPath);
-    return !lstatPidPath(source.path) &&
-      claimed.kind === "present" &&
-      claimed.raw === source.raw
-      ? claimed
-      : null;
+    const stat = fs.lstatSync(directoryPath);
+    const uid = currentUid();
+    return stat.isDirectory() &&
+      !stat.isSymbolicLink() &&
+      (uid === undefined || stat.uid === uid) &&
+      (stat.mode & 0o7777) === 0o700;
   } catch {
-    return null;
+    return false;
   }
 }
 
-function clearExactArtifact(artifact: CleanupArtifact) {
+function ensureCleanupArchive(pidPath: string, transactionId: string) {
+  // Retired proof objects are intentionally append-only and addressed by the
+  // marker UUID. The hot path never scans this directory; optional manual
+  // compaction can be designed separately without weakening cleanup truth.
+  const archive = cleanupArchiveNames(pidPath, transactionId);
   try {
-    const current = inspectCleanupSlot(artifact.path);
-    if (
-      current.kind !== "present" ||
-      !samePidFileIdentity(artifact.fileIdentity, current.fileIdentity) ||
-      current.raw !== artifact.raw
-    ) {
-      return false;
+    fs.mkdirSync(archive.root, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") return null;
+  }
+  if (!privateCleanupDirectory(archive.root)) return null;
+  try {
+    fs.mkdirSync(archive.transactionDirectory, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") return null;
+  }
+  return privateCleanupDirectory(archive.transactionDirectory) ? archive : null;
+}
+
+// The destination lives inside an operation-owned UUID directory. No pathname
+// is unlinked: a replacement after the final source check is moved intact and
+// then fails post-verification. A concurrent reconciler either observes the
+// exact already-moved inode or fails without overwriting either pathname.
+function moveExactArtifactToArchive(
+  source: CleanupArtifact,
+  destinationPath: string,
+  afterLastCheck?: () => void,
+): CleanupArchiveMoveResult {
+  try {
+    const destinationBefore = inspectCleanupSlot(destinationPath);
+    const sourceBefore = inspectCleanupSlot(source.path);
+    if (destinationBefore.kind === "present") {
+      const sourceAfterPriorMove = inspectCleanupSlot(source.path);
+      return sourceAfterPriorMove.kind === "missing" &&
+          samePidFileObject(source.fileIdentity, destinationBefore.fileIdentity) &&
+          destinationBefore.raw === source.raw
+        ? { kind: "exact", artifact: destinationBefore }
+        : { kind: "failed" };
     }
-    fs.unlinkSync(artifact.path);
-    return !lstatPidPath(artifact.path);
+    if (
+      destinationBefore.kind !== "missing" ||
+      sourceBefore.kind !== "present" ||
+      !samePidFileIdentity(source.fileIdentity, sourceBefore.fileIdentity) ||
+      sourceBefore.raw !== source.raw
+    ) {
+      return { kind: "failed" };
+    }
+    afterLastCheck?.();
+    if (inspectCleanupSlot(destinationPath).kind !== "missing") {
+      return { kind: "failed" };
+    }
+    fs.renameSync(source.path, destinationPath);
+    const destination = inspectCleanupSlot(destinationPath);
+    const sourceAfter = inspectCleanupSlot(source.path);
+    if (
+      destination.kind === "present" &&
+      samePidFileObject(source.fileIdentity, destination.fileIdentity) &&
+      destination.raw === source.raw &&
+      sourceAfter.kind === "missing"
+    ) {
+      return { kind: "exact", artifact: destination };
+    }
+    return { kind: "changed" };
   } catch {
-    return false;
+    return { kind: "failed" };
+  }
+}
+
+function rewriteExactArtifact(
+  artifact: CleanupArtifact,
+  replacementRaw: string,
+  afterLastCheck?: () => void,
+) {
+  let descriptor: number | undefined;
+  try {
+    descriptor = fs.openSync(
+      artifact.path,
+      fs.constants.O_RDWR | fs.constants.O_NOFOLLOW,
+    );
+    const before = fs.fstatSync(descriptor);
+    if (
+      validatePidLeaf(before) ||
+      !samePidFileIdentity(artifact.fileIdentity, pidFileIdentity(before)) ||
+      readPidDescriptor(descriptor) !== artifact.raw
+    ) {
+      return null;
+    }
+    afterLastCheck?.();
+    fs.ftruncateSync(descriptor, 0);
+    fs.writeSync(descriptor, replacementRaw, 0, "utf8");
+    fs.fsyncSync(descriptor);
+    const rewritten = inspectCleanupSlot(artifact.path);
+    return rewritten.kind === "present" &&
+      samePidFileObject(artifact.fileIdentity, rewritten.fileIdentity) &&
+      rewritten.raw === replacementRaw
+      ? rewritten
+      : null;
+  } catch {
+    return null;
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
   }
 }
 
@@ -740,6 +861,119 @@ function processIdentityState(identity: ProcessIdentity): "live" | "not_live" | 
   const fingerprint = readProcessStartFingerprint(identity.pid);
   if (!fingerprint) return "indeterminate";
   return fingerprint === identity.processStartFingerprint ? "live" : "not_live";
+}
+
+type PresentCleanupMarker = Extract<CleanupMarkerInspection, { kind: "present" }>;
+
+function sameCleanupTransaction(
+  left: CleanupMarkerRecord,
+  right: CleanupMarkerRecord,
+) {
+  return left.transactionId === right.transactionId &&
+    left.label === right.label &&
+    left.actor.pid === right.actor.pid &&
+    left.actor.processStartFingerprint === right.actor.processStartFingerprint &&
+    runtimeIdentityMatches(left.target, right.target);
+}
+
+function writeRetirementGuard(
+  guardPath: string,
+  record: CleanupMarkerRecord,
+  label: string,
+) {
+  const raw = markerRaw({ ...record, state: "retirement_pending" });
+  try {
+    fs.writeFileSync(guardPath, raw, { flag: "wx", mode: 0o600 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") return null;
+  }
+  const guard = inspectCleanupMarker(guardPath, label);
+  return guard.kind === "present" && guard.raw === raw ? guard : null;
+}
+
+function completeMarkerRetirement(
+  pidPath: string,
+  label: string,
+  hooks: CollectorPidCleanupReconciliationHooks = {},
+) {
+  let artifacts = inspectCleanupArtifacts(pidPath, label);
+  const markerSlots = [artifacts.marker, artifacts.markerClaim]
+    .filter((artifact): artifact is PresentCleanupMarker => artifact.kind === "present");
+  const active = markerSlots.filter(
+    (artifact) => artifact.record.state !== "retirement_complete",
+  );
+  const inProgress = active.find((artifact) => artifact.record.state === "in_progress") ?? null;
+  let pending = active.find((artifact) => artifact.record.state === "retirement_pending") ?? null;
+  const transaction = inProgress?.record ?? pending?.record ?? null;
+  if (
+    !transaction ||
+    active.length > 2 ||
+    active.some((artifact) => !sameCleanupTransaction(artifact.record, transaction)) ||
+    (active.length === 2 && (!inProgress || !pending))
+  ) {
+    return false;
+  }
+
+  const archive = ensureCleanupArchive(pidPath, transaction.transactionId);
+  if (!archive) return false;
+
+  const completed = markerSlots.filter(
+    (artifact) => artifact.record.state === "retirement_complete",
+  );
+  for (const oldGuard of completed) {
+    const oldArchive = ensureCleanupArchive(pidPath, oldGuard.record.transactionId);
+    if (!oldArchive) return false;
+    if (moveExactArtifactToArchive(oldGuard, oldArchive.guard).kind !== "exact") {
+      return false;
+    }
+  }
+
+  artifacts = inspectCleanupArtifacts(pidPath, label);
+  if (!pending) {
+    const guardPath = inProgress?.path === artifacts.names.markerPath
+      ? artifacts.names.markerClaimPath
+      : artifacts.names.markerPath;
+    pending = writeRetirementGuard(guardPath, transaction, label);
+    if (!pending) return false;
+  }
+
+  if (inProgress) {
+    hooks.beforeMarkerClaim?.();
+    const moved = moveExactArtifactToArchive(
+      inProgress,
+      archive.marker,
+      hooks.afterMarkerMoveCheck,
+    );
+    if (moved.kind !== "exact") return false;
+  } else {
+    const archived = inspectCleanupSlot(archive.marker);
+    if (
+      archived.kind !== "present" ||
+      archived.raw !== markerRaw({ ...transaction, state: "in_progress" })
+    ) {
+      return false;
+    }
+  }
+
+  const pendingAfterMove = inspectCleanupMarker(pending.path, label);
+  if (
+    pendingAfterMove.kind !== "present" ||
+    pendingAfterMove.record.state !== "retirement_pending" ||
+    !sameCleanupTransaction(pendingAfterMove.record, transaction)
+  ) {
+    return false;
+  }
+  const completedRaw = markerRaw({ ...transaction, state: "retirement_complete" });
+  const rewritten = rewriteExactArtifact(
+    pendingAfterMove,
+    completedRaw,
+    () => {
+      hooks.beforeClear?.();
+      hooks.afterGuardRewriteCheck?.();
+    },
+  );
+  if (!rewritten) return false;
+  return !readCollectorPidCleanupState(pidPath, label).ambiguous;
 }
 
 function reconciliationResult(
@@ -780,12 +1014,20 @@ export function reconcileCollectorPidCleanupState(
   }
   const markerSlots = [artifacts.marker, artifacts.markerClaim]
     .filter((artifact): artifact is Extract<CleanupMarkerInspection, { kind: "present" }> =>
-      artifact.kind === "present");
-  if (markerSlots.length !== 1) {
+      artifact.kind === "present" && artifact.record.state !== "retirement_complete");
+  const transaction = markerSlots.find(
+    (artifact) => artifact.record.state === "in_progress",
+  )?.record ?? markerSlots[0]?.record;
+  if (
+    !transaction ||
+    markerSlots.length > 2 ||
+    markerSlots.some((artifact) => !sameCleanupTransaction(artifact.record, transaction)) ||
+    (markerSlots.length === 2 &&
+      !markerSlots.some((artifact) => artifact.record.state === "in_progress"))
+  ) {
     return reconciliationResult(pidPath, label, "multiple_marker_slots", before);
   }
-  const marker = markerSlots[0];
-  const actorState = processIdentityState(marker.record.actor);
+  const actorState = processIdentityState(transaction.actor);
   if (actorState === "live") {
     return reconciliationResult(pidPath, label, "actor_live", before);
   }
@@ -798,20 +1040,18 @@ export function reconcileCollectorPidCleanupState(
     });
   }
 
-  let claimed: CleanupArtifact | null = marker;
-  if (marker.path === artifacts.names.markerPath) {
-    options.hooks?.beforeMarkerClaim?.();
-    claimed = claimExactArtifact(marker, artifacts.names.markerClaimPath);
-  }
-  if (!claimed) return reconciliationResult(pidPath, label, "clear_race", before);
-  options.hooks?.beforeClear?.();
-  if (!clearExactArtifact(claimed)) {
+  const disposition = markerSlots.some(
+    (artifact) => artifact.path === artifacts.names.markerPath,
+  )
+    ? "marker_cleared" as const
+    : "marker_claim_cleared" as const;
+  if (!completeMarkerRetirement(pidPath, label, options.hooks)) {
     return reconciliationResult(pidPath, label, "clear_race", before);
   }
   return reconciliationResult(
     pidPath,
     label,
-    marker.path === artifacts.names.markerPath ? "marker_cleared" : "marker_claim_cleared",
+    disposition,
     before,
     { eligible: true, reconciled: true },
   );
@@ -840,8 +1080,11 @@ export function removeCollectorPidFileIfOwnedDetailed(
   }
   const names = cleanupArtifactNames(pidPath);
   const absolutePath = names.absolutePath;
-  let claim: CleanupArtifact | null = null;
   try {
+    const archive = ensureCleanupArchive(pidPath, marker.record.transactionId);
+    if (!archive) {
+      return cleanupResult(pidPath, label, "operation_failed", { ambiguous: true });
+    }
     hooks.beforeClaim?.();
     const preClaim = lstatPidPath(absolutePath);
     if (!preClaim || !samePidFileIdentity(current.fileIdentity, pidFileIdentity(preClaim))) {
@@ -856,61 +1099,47 @@ export function removeCollectorPidFileIfOwnedDetailed(
     ) {
       return cleanupResult(pidPath, label, "marker_create_failed", { ambiguous: true });
     }
-    claim = claimExactArtifact(
+    const pidMove = moveExactArtifactToArchive(
       { path: absolutePath, raw: current.raw, fileIdentity: current.fileIdentity },
-      names.pidClaimPath,
+      archive.pid,
+      hooks.afterPidMoveCheck,
     );
-    if (!claim) {
-      const afterClaimFailure = readCollectorPidFile(absolutePath, label);
+    if (pidMove.kind !== "exact") {
+      return cleanupResult(pidPath, label, "preclaim_changed", { ambiguous: true });
+    }
+    hooks.afterClaim?.();
+    if (lstatPidPath(absolutePath)) {
+      let quarantined = false;
+      try {
+        fs.writeFileSync(names.quarantinePath, pidMove.artifact.raw, {
+          flag: "wx",
+          mode: 0o600,
+        });
+        const quarantine = inspectCleanupSlot(names.quarantinePath);
+        quarantined = quarantine.kind === "present" &&
+          quarantine.raw === pidMove.artifact.raw;
+      } catch {
+        quarantined = false;
+      }
+      return cleanupResult(pidPath, label, "destination_reappeared", { ambiguous: true, quarantined });
+    }
+    const archivedPid = inspectCleanupSlot(archive.pid);
+    if (
+      archivedPid.kind !== "present" ||
+      !samePidFileIdentity(pidMove.artifact.fileIdentity, archivedPid.fileIdentity) ||
+      archivedPid.raw !== current.raw
+    ) {
       return cleanupResult(
         pidPath,
         label,
-        afterClaimFailure.kind === "current" &&
-          runtimeIdentityMatches(afterClaimFailure.record, current.record) &&
-          samePidFileIdentity(afterClaimFailure.fileIdentity, current.fileIdentity)
-          ? "claim_missing"
-          : "preclaim_changed",
+        "claim_changed",
         { ambiguous: true },
       );
     }
-    hooks.afterClaim?.();
-    const verified = inspectCleanupSlot(claim.path);
-    if (lstatPidPath(absolutePath)) {
-      const quarantined = Boolean(claimExactArtifact(claim, names.quarantinePath));
-      return cleanupResult(pidPath, label, "destination_reappeared", { ambiguous: true, quarantined });
-    }
-    if (
-      verified.kind !== "present" ||
-      !samePidFileIdentity(claim.fileIdentity, verified.fileIdentity) ||
-      verified.raw !== current.raw
-    ) {
-      const quarantined = Boolean(claimExactArtifact(claim, names.quarantinePath));
-      return cleanupResult(pidPath, label, "claim_changed", { ambiguous: true, quarantined });
-    }
-    const markerClaim = claimExactArtifact(marker, names.markerClaimPath);
-    if (!markerClaim) {
-      const quarantined = Boolean(claimExactArtifact(claim, names.quarantinePath));
-      return cleanupResult(pidPath, label, "marker_clear_failed", {
-        ambiguous: true,
-        quarantined,
-      });
-    }
-    if (!clearExactArtifact(claim)) {
-      return cleanupResult(pidPath, label, "claim_changed", {
-        ambiguous: true,
-        quarantined: false,
-      });
-    }
-    const destinationReappeared = Boolean(lstatPidPath(absolutePath));
-    if (destinationReappeared) {
-      return cleanupResult(
-        pidPath,
-        label,
-        "destination_reappeared",
-        { ambiguous: true, quarantined: false },
-      );
-    }
-    if (!clearExactArtifact(markerClaim)) {
+    if (!completeMarkerRetirement(pidPath, label, {
+      afterMarkerMoveCheck: hooks.afterMarkerMoveCheck,
+      afterGuardRewriteCheck: hooks.afterGuardRewriteCheck,
+    })) {
       return cleanupResult(pidPath, label, "marker_clear_failed", {
         removed: true,
         ambiguous: true,
@@ -918,8 +1147,7 @@ export function removeCollectorPidFileIfOwnedDetailed(
     }
     return cleanupResult(pidPath, label, "removed", { removed: true });
   } catch {
-    const quarantined = claim ? Boolean(claimExactArtifact(claim, names.quarantinePath)) : false;
-    return cleanupResult(pidPath, label, "operation_failed", { ambiguous: true, quarantined });
+    return cleanupResult(pidPath, label, "operation_failed", { ambiguous: true });
   }
 }
 

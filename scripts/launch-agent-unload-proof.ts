@@ -35,6 +35,17 @@ function cleanupSlots(pidPath: string) {
     pidClaim: path.join(directory, `.${basename}.plimsoll-remove-claim`),
     markerClaim: path.join(directory, `.${basename}.plimsoll-cleanup-marker-claim`),
     quarantine: path.join(directory, `.${basename}.plimsoll-quarantine`),
+    archiveRoot: path.join(directory, `.${basename}.plimsoll-cleanup-archive`),
+  };
+}
+
+function cleanupArchive(pidPath: string, transactionId: string) {
+  const transactionDirectory = path.join(cleanupSlots(pidPath).archiveRoot, transactionId);
+  return {
+    transactionDirectory,
+    pid: path.join(transactionDirectory, "pid"),
+    marker: path.join(transactionDirectory, "marker"),
+    guard: path.join(transactionDirectory, "guard"),
   };
 }
 
@@ -543,6 +554,42 @@ async function main() {
         readCollectorPidFile(swapPid, LABEL).kind === "current",
       "The no-follow preclaim identity check leaves the exact regular replacement visible.",
     );
+
+    const postcheckPid = path.join(pidFixtureRoot, "postcheck.pid");
+    const postcheckOwner = path.join(pidFixtureRoot, "postcheck-owner.pid");
+    fs.writeFileSync(postcheckPid, ownedRaw, { mode: 0o600 });
+    let postcheckReplacementInode = 0;
+    const postcheckCleanup = removeCollectorPidFileIfOwnedDetailed(
+      postcheckPid,
+      owner,
+      LABEL,
+      {
+        afterPidMoveCheck: () => {
+          fs.renameSync(postcheckPid, postcheckOwner);
+          fs.writeFileSync(postcheckPid, foreignRaw, { mode: 0o600 });
+          postcheckReplacementInode = fs.lstatSync(postcheckPid).ino;
+        },
+      },
+    );
+    const postcheckMarker = JSON.parse(
+      fs.readFileSync(cleanupSlots(postcheckPid).marker, "utf8"),
+    ) as { transactionId: string };
+    const postcheckArchivedPid = cleanupArchive(
+      postcheckPid,
+      postcheckMarker.transactionId,
+    ).pid;
+    check(
+      "pid_replacement_after_last_check_is_archived_not_deleted",
+      !postcheckCleanup.removed &&
+        postcheckCleanup.ambiguous &&
+        postcheckCleanup.disposition === "preclaim_changed" &&
+        !fs.existsSync(postcheckPid) &&
+        fs.lstatSync(postcheckArchivedPid).ino === postcheckReplacementInode &&
+        fs.readFileSync(postcheckArchivedPid, "utf8") === foreignRaw &&
+        fs.readFileSync(postcheckOwner, "utf8") === ownedRaw &&
+        readCollectorPidCleanupState(postcheckPid, LABEL).markerState === "present",
+      "A PID-path replacement after the last check is moved intact into the transaction archive while the active marker keeps the receipt ambiguous.",
+    );
     const liveMarkerReconciliation = reconcileCollectorPidCleanupState(swapPid, LABEL);
     check(
       "live_cleanup_actor_marker_refuses_reconciliation",
@@ -572,7 +619,7 @@ async function main() {
       },
     );
     const midSymlinkHidden = fs.readdirSync(pidFixtureRoot).filter((entry) =>
-      entry.includes(`${path.basename(midSymlinkPid)}.plimsoll-`)
+      entry === `.${path.basename(midSymlinkPid)}.plimsoll-cleanup-marker`
     );
     const midSymlinkCleanupState = readCollectorPidCleanupState(midSymlinkPid, LABEL);
     check(
@@ -674,6 +721,9 @@ async function main() {
     );
     const deadMarkerSlots = cleanupSlots(deadMarkerPid);
     makeMarkerActorDead(deadMarkerSlots.marker);
+    const firstDeadMarkerRecord = JSON.parse(
+      fs.readFileSync(deadMarkerSlots.marker, "utf8"),
+    ) as { transactionId: string };
     fs.writeFileSync(deadMarkerPid, foreignRaw, { mode: 0o600 });
     const visibleBeforeReconciliation = {
       inode: fs.lstatSync(deadMarkerPid).ino,
@@ -695,6 +745,60 @@ async function main() {
       "Only the exact unchanged dead-actor marker is cleared; visible PID identity and bytes are untouched.",
     );
 
+    const secondDeadMarkerPreserved = path.join(
+      pidFixtureRoot,
+      "dead-marker-second-preserved.pid",
+    );
+    fs.writeFileSync(deadMarkerPid, ownedRaw, { mode: 0o600 });
+    const secondDeadMarkerCleanup = removeCollectorPidFileIfOwnedDetailed(
+      deadMarkerPid,
+      owner,
+      LABEL,
+      { beforeClaim: () => fs.renameSync(deadMarkerPid, secondDeadMarkerPreserved) },
+    );
+    makeMarkerActorDead(deadMarkerSlots.marker);
+    const secondDeadMarkerRecord = JSON.parse(
+      fs.readFileSync(deadMarkerSlots.marker, "utf8"),
+    ) as { transactionId: string };
+    const secondDeadMarkerReconciliation = reconcileCollectorPidCleanupState(
+      deadMarkerPid,
+      LABEL,
+    );
+    check(
+      "sequential_dead_marker_reconciliations_reuse_fixed_slots_without_wedge",
+      secondDeadMarkerCleanup.disposition === "preclaim_changed" &&
+        secondDeadMarkerReconciliation.reconciled &&
+        secondDeadMarkerReconciliation.disposition === "marker_cleared" &&
+        !secondDeadMarkerReconciliation.after.ambiguous &&
+        fs.existsSync(
+          cleanupArchive(deadMarkerPid, firstDeadMarkerRecord.transactionId).guard,
+        ) &&
+        fs.existsSync(
+          cleanupArchive(deadMarkerPid, secondDeadMarkerRecord.transactionId).marker,
+        ) &&
+        fs.readFileSync(secondDeadMarkerPreserved, "utf8") === ownedRaw,
+      "A second dead-marker transaction retires the prior completed guard directly into its UUID archive and reaches clean state without scanning.",
+    );
+    const secondArchivedMarker = cleanupArchive(
+      deadMarkerPid,
+      secondDeadMarkerRecord.transactionId,
+    ).marker;
+    fs.writeFileSync(secondArchivedMarker, "archive-replacement\n", { mode: 0o600 });
+    const tamperedRetirementState = readCollectorPidCleanupState(deadMarkerPid, LABEL);
+    const tamperedRetirementReconciliation = reconcileCollectorPidCleanupState(
+      deadMarkerPid,
+      LABEL,
+    );
+    check(
+      "completed_guard_requires_exact_archived_marker_proof",
+      tamperedRetirementState.ambiguous &&
+        tamperedRetirementState.unsafeArtifactCount === 1 &&
+        !tamperedRetirementReconciliation.reconciled &&
+        tamperedRetirementReconciliation.disposition === "unsafe_artifact" &&
+        fs.readFileSync(secondArchivedMarker, "utf8") === "archive-replacement\n",
+      "A completed fixed guard is clean only while its directly addressed retired marker remains byte-exact; archive replacement is preserved and fails closed.",
+    );
+
     const markerRacePid = path.join(pidFixtureRoot, "marker-race.pid");
     const markerRacePreservedPid = path.join(pidFixtureRoot, "marker-race-preserved.pid");
     fs.writeFileSync(markerRacePid, ownedRaw, { mode: 0o600 });
@@ -704,26 +808,80 @@ async function main() {
     const markerRaceSlots = cleanupSlots(markerRacePid);
     makeMarkerActorDead(markerRaceSlots.marker);
     const markerRaceOriginal = path.join(pidFixtureRoot, "marker-race-original");
+    const markerRaceRecord = JSON.parse(
+      fs.readFileSync(markerRaceSlots.marker, "utf8"),
+    ) as { transactionId: string };
+    let markerRaceReplacementInode = 0;
     const markerRaceReconciliation = reconcileCollectorPidCleanupState(
       markerRacePid,
       LABEL,
       {
         hooks: {
-          beforeMarkerClaim: () => {
+          afterMarkerMoveCheck: () => {
             fs.renameSync(markerRaceSlots.marker, markerRaceOriginal);
             fs.writeFileSync(markerRaceSlots.marker, "replacement-marker\n", { mode: 0o600 });
+            markerRaceReplacementInode = fs.lstatSync(markerRaceSlots.marker).ino;
           },
         },
       },
     );
     check(
-      "marker_replacement_before_claim_fails_closed",
+      "marker_replacement_after_last_check_is_archived_not_deleted",
       !markerRaceReconciliation.reconciled &&
         markerRaceReconciliation.disposition === "clear_race" &&
-        markerRaceReconciliation.after.markerState === "unsafe" &&
-        fs.readFileSync(markerRaceSlots.marker, "utf8") === "replacement-marker\n" &&
+        markerRaceReconciliation.after.claimCount === 1 &&
+        !fs.existsSync(markerRaceSlots.marker) &&
+        fs.lstatSync(cleanupArchive(markerRacePid, markerRaceRecord.transactionId).marker).ino ===
+          markerRaceReplacementInode &&
+        fs.readFileSync(
+          cleanupArchive(markerRacePid, markerRaceRecord.transactionId).marker,
+          "utf8",
+        ) === "replacement-marker\n" &&
         fs.existsSync(markerRaceOriginal),
-      "Reconciliation never deletes a marker-path replacement or claims it as the dead actor's marker.",
+      "A marker replacement after the last check is archived byte-exact and the pending fixed guard keeps reconciliation ambiguous.",
+    );
+
+    const archiveCollisionPid = path.join(pidFixtureRoot, "archive-collision.pid");
+    const archiveCollisionPreservedPid = path.join(
+      pidFixtureRoot,
+      "archive-collision-preserved.pid",
+    );
+    fs.writeFileSync(archiveCollisionPid, ownedRaw, { mode: 0o600 });
+    removeCollectorPidFileIfOwnedDetailed(archiveCollisionPid, owner, LABEL, {
+      beforeClaim: () => fs.renameSync(archiveCollisionPid, archiveCollisionPreservedPid),
+    });
+    const archiveCollisionSlots = cleanupSlots(archiveCollisionPid);
+    makeMarkerActorDead(archiveCollisionSlots.marker);
+    const archiveCollisionRaw = fs.readFileSync(archiveCollisionSlots.marker, "utf8");
+    const archiveCollisionRecord = JSON.parse(archiveCollisionRaw) as {
+      transactionId: string;
+    };
+    const archiveCollisionDestination = cleanupArchive(
+      archiveCollisionPid,
+      archiveCollisionRecord.transactionId,
+    ).marker;
+    const archiveCollisionReconciliation = reconcileCollectorPidCleanupState(
+      archiveCollisionPid,
+      LABEL,
+      {
+        hooks: {
+          afterMarkerMoveCheck: () => {
+            fs.writeFileSync(archiveCollisionDestination, "archive-collision\n", {
+              mode: 0o600,
+            });
+          },
+        },
+      },
+    );
+    check(
+      "occupied_operation_archive_destination_is_never_overwritten",
+      !archiveCollisionReconciliation.reconciled &&
+        archiveCollisionReconciliation.disposition === "clear_race" &&
+        archiveCollisionReconciliation.after.ambiguous &&
+        fs.readFileSync(archiveCollisionSlots.marker, "utf8") === archiveCollisionRaw &&
+        fs.readFileSync(archiveCollisionDestination, "utf8") === "archive-collision\n" &&
+        fs.readFileSync(archiveCollisionPreservedPid, "utf8") === ownedRaw,
+      "A destination created after the last source check is retained byte-exact, and the active marker is not moved or overwritten.",
     );
 
     const clearRacePid = path.join(pidFixtureRoot, "clear-race.pid");
@@ -735,6 +893,7 @@ async function main() {
     const clearRaceSlots = cleanupSlots(clearRacePid);
     makeMarkerActorDead(clearRaceSlots.marker);
     const clearRaceOriginal = path.join(pidFixtureRoot, "clear-race-original");
+    let clearRaceReplacementInode = 0;
     const clearRaceReconciliation = reconcileCollectorPidCleanupState(
       clearRacePid,
       LABEL,
@@ -743,6 +902,7 @@ async function main() {
           beforeClear: () => {
             fs.renameSync(clearRaceSlots.markerClaim, clearRaceOriginal);
             fs.writeFileSync(clearRaceSlots.markerClaim, "replacement-claim\n", { mode: 0o600 });
+            clearRaceReplacementInode = fs.lstatSync(clearRaceSlots.markerClaim).ino;
           },
         },
       },
@@ -753,9 +913,10 @@ async function main() {
         clearRaceReconciliation.disposition === "clear_race" &&
         clearRaceReconciliation.after.claimCount === 1 &&
         clearRaceReconciliation.after.unsafeArtifactCount === 1 &&
+        fs.lstatSync(clearRaceSlots.markerClaim).ino === clearRaceReplacementInode &&
         fs.readFileSync(clearRaceSlots.markerClaim, "utf8") === "replacement-claim\n" &&
         fs.existsSync(clearRaceOriginal),
-      "The exact marker claim is reverified before unlink; a replacement remains explicit ambiguity.",
+      "The descriptor-bound final rewrite updates only the moved intended guard; the fixed-path replacement survives as explicit ambiguity.",
     );
 
     const markerClaimPid = path.join(pidFixtureRoot, "marker-claim-only.pid");
@@ -833,7 +994,7 @@ async function main() {
       now: () => 0,
     });
     const aggregateSymlinkHidden = fs.readdirSync(pidFixtureRoot).filter((entry) =>
-      entry.includes(`${path.basename(aggregateSymlinkPid)}.plimsoll-`)
+      entry === `.${path.basename(aggregateSymlinkPid)}.plimsoll-cleanup-marker`
     );
     check(
       "mid_claim_symlink_never_becomes_aggregate_stopped_truth",
