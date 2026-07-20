@@ -12,6 +12,7 @@ import { RolloutTailer, type RolloutScanResult } from "./rollout-tailer";
 import { TranscriptTailer, type TranscriptScanResult } from "./transcript-tailer";
 import { captureBaselineStatus } from "./capture-baseline";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
+import type { MaintenanceProgress } from "./maintenance-progress";
 
 const PRICING_VERSION_KEY = "pricing_catalog_applied";
 const PRICING_TARGET_KEY = "pricing_catalog_backfill_target";
@@ -500,6 +501,27 @@ export type CollectorMaintenanceRunResult = {
   postCaptureDeferred?: string[];
 };
 
+/** Path/content-free result projected across the maintenance child boundary. */
+export type MaintenanceRunOutcome = {
+  recentOnly: true;
+  rollout: {
+    filesRead: number;
+    parseErrors: number;
+    eventsAppended: number;
+    activity: { discoveryEntries: number };
+  };
+  transcript: {
+    filesRead: number;
+    parseErrors: number;
+    eventsAppended: number;
+    activity: { discoveryEntries: number };
+  };
+  reconciliation: { rowsChanged: number; rowsVisited: number };
+  repricing: { repriced: number; rowsVisited: number };
+  enrichment: { backward: number; forward: number; rowsVisited: number };
+  rawEventWrites: number;
+};
+
 export type ProjectionDrainResult = {
   slices: number;
   yields: number;
@@ -593,7 +615,10 @@ export class CollectorMaintenance {
     this.transcriptTailer.close();
   }
 
-  async runRecent(): Promise<CollectorMaintenanceRunResult> {
+  async runRecent(options: {
+    quarantine?: Pick<MaintenanceProgress, "source" | "stage" | "candidateHash">;
+    onProgress?: (progress: MaintenanceProgress) => boolean;
+  } = {}): Promise<CollectorMaintenanceRunResult> {
     const budget = new CaptureWorkBudget();
     const baselineAtStart = captureBaselineStatus(this.buffer.database);
     // Completed source snapshots stay armed while a per-generation ambiguity
@@ -621,20 +646,42 @@ export class CollectorMaintenance {
     let transcript: TranscriptScanResult | undefined;
     const runRollout = async () => {
       this.current = { phase, source: "codex", startedAt, budget };
+      const sourceAccepted = options.onProgress?.({
+        source: "codex",
+        stage: "source_scan",
+        candidateHash: null,
+      }) !== false;
       return this.rolloutTailer.scan({
         scope: "recent",
         now: new Date(startedAt),
         automatic: { phase, budget },
         signal: this.signal,
+        quarantine: options.quarantine?.source === "codex" && options.quarantine.candidateHash
+          ? { stage: options.quarantine.stage, candidateHash: options.quarantine.candidateHash }
+          : undefined,
+        onProgress: (progress) => options.onProgress?.({ source: "codex", ...progress }) ?? true,
+        deferredBeforeIo: !sourceAccepted ||
+          (options.quarantine?.source === "codex" && options.quarantine.stage === "source_scan"),
       });
     };
     const runTranscript = async () => {
       this.current = { phase, source: "claude_code", startedAt, budget };
+      const sourceAccepted = options.onProgress?.({
+        source: "claude_code",
+        stage: "source_scan",
+        candidateHash: null,
+      }) !== false;
       return this.transcriptTailer.scan({
         scope: "recent",
         now: new Date(startedAt),
         automatic: { phase, budget },
         signal: this.signal,
+        quarantine: options.quarantine?.source === "claude_code" && options.quarantine.candidateHash
+          ? { stage: options.quarantine.stage, candidateHash: options.quarantine.candidateHash }
+          : undefined,
+        onProgress: (progress) => options.onProgress?.({ source: "claude_code", ...progress }) ?? true,
+        deferredBeforeIo: !sourceAccepted ||
+          (options.quarantine?.source === "claude_code" && options.quarantine.stage === "source_scan"),
       });
     };
     try {
@@ -749,7 +796,9 @@ export class CollectorMaintenance {
   }
 }
 
-export type MaintenanceSchedulerStatus = {
+export type MaintenanceSchedulerStatus<
+  T extends MaintenanceRunOutcome = CollectorMaintenanceRunResult,
+> = {
   accepting: boolean;
   inFlight: boolean;
   pending: boolean;
@@ -767,11 +816,11 @@ export type MaintenanceSchedulerStatus = {
   enrichmentRowsVisited: number;
   lastStartedAt: string | null;
   lastCompletedAt: string | null;
-  lastRun: CollectorMaintenanceRunResult | null;
+  lastRun: T | null;
 };
 
-type DrainWaiter = {
-  resolve: (results: CollectorMaintenanceRunResult[]) => void;
+type DrainWaiter<T extends MaintenanceRunOutcome> = {
+  resolve: (results: T[]) => void;
   reject: (error: unknown) => void;
 };
 
@@ -781,11 +830,13 @@ type DrainWaiter = {
  * mode in this scheduler; only the explicit scan-rollouts/scan-transcripts CLI
  * commands may request full history.
  */
-export class CoalescingMaintenanceScheduler {
+export class CoalescingMaintenanceScheduler<
+  T extends MaintenanceRunOutcome = CollectorMaintenanceRunResult,
+> {
   private accepting = true;
   private running = false;
   private pending = false;
-  private waiters: DrainWaiter[] = [];
+  private waiters: Array<DrainWaiter<T>> = [];
   private triggerCount = 0;
   private runCount = 0;
   private coalescedTriggerCount = 0;
@@ -801,11 +852,11 @@ export class CoalescingMaintenanceScheduler {
   private enrichmentRowsVisited = 0;
   private lastStartedAt: string | null = null;
   private lastCompletedAt: string | null = null;
-  private lastRun: CollectorMaintenanceRunResult | null = null;
+  private lastRun: T | null = null;
   private idleWaiters: Array<() => void> = [];
 
   constructor(
-    private readonly runJob: () => Promise<CollectorMaintenanceRunResult>,
+    private readonly runJob: () => Promise<T>,
   ) {}
 
   trigger() {
@@ -816,7 +867,7 @@ export class CoalescingMaintenanceScheduler {
     this.pending = true;
     if (this.running) this.coalescedTriggerCount += 1;
 
-    const promise = new Promise<CollectorMaintenanceRunResult[]>((resolve, reject) => {
+    const promise = new Promise<T[]>((resolve, reject) => {
       this.waiters.push({ resolve, reject });
     });
     if (!this.running) {
@@ -826,7 +877,7 @@ export class CoalescingMaintenanceScheduler {
     return promise;
   }
 
-  status(): MaintenanceSchedulerStatus {
+  status(): MaintenanceSchedulerStatus<T> {
     return {
       accepting: this.accepting,
       inFlight: this.running,
@@ -860,7 +911,7 @@ export class CoalescingMaintenanceScheduler {
   }
 
   private async drain() {
-    const results: CollectorMaintenanceRunResult[] = [];
+    const results: T[] = [];
     let firstError: unknown;
     while (this.pending) {
       this.pending = false;
@@ -905,8 +956,8 @@ export class CoalescingMaintenanceScheduler {
  * The only automatic boot/interval entrypoint. Its signature cannot express a
  * full-history request, so daemon scheduling stays recent-only by construction.
  */
-export function requestAutomaticRecentMaintenance(
-  scheduler: CoalescingMaintenanceScheduler,
+export function requestAutomaticRecentMaintenance<T extends MaintenanceRunOutcome>(
+  scheduler: CoalescingMaintenanceScheduler<T>,
 ) {
   return scheduler.trigger();
 }
@@ -940,7 +991,9 @@ export type AutomaticMaintenanceCadenceTimer = {
  * cadence. Scheduling happens after the coalesced run drains, so callbacks do
  * not accumulate during a slow filesystem slice.
  */
-export class AutomaticMaintenanceCadence {
+export class AutomaticMaintenanceCadence<
+  T extends MaintenanceRunOutcome = CollectorMaintenanceRunResult,
+> {
   private accepting = true;
   private inFlight = false;
   private timer: unknown | null = null;
@@ -950,7 +1003,7 @@ export class AutomaticMaintenanceCadence {
   private failedTriggers = 0;
 
   constructor(
-    private readonly scheduler: CoalescingMaintenanceScheduler,
+    private readonly scheduler: CoalescingMaintenanceScheduler<T>,
     private readonly baselineStatus: () => ReturnType<typeof captureBaselineStatus>,
     private readonly options: {
       startupIntervalMs?: number;

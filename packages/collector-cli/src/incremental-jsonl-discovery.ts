@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { CaptureWorkBudget } from "./capture-work-budget";
+import { maintenanceCandidateHash } from "./maintenance-progress";
 
 type Frame = {
   directory: string;
@@ -36,6 +37,8 @@ export class IncrementalJsonlDiscovery {
   private errors = 0;
   private finished = false;
   private limitReached = false;
+  private paused = false;
+  private pendingEntry: { entry: fs.Dirent; candidate: string } | null = null;
 
   constructor(
     roots: string[],
@@ -44,6 +47,12 @@ export class IncrementalJsonlDiscovery {
       matches: (entryName: string) => boolean;
       maxEntries: number;
       missingRootsAreEmpty?: boolean;
+      beforeFilesystemStep?: (progress: {
+        stage: "discovery_directory" | "discovery_read" | "candidate_metadata";
+        candidateHash: string;
+      }) => boolean;
+      quarantinedCandidateHash?: string;
+      isCandidateQuarantined?: (candidateHash: string) => boolean;
     },
   ) {
     this.roots = roots.map((root) => path.resolve(root));
@@ -73,8 +82,10 @@ export class IncrementalJsonlDiscovery {
     let stepsSinceYield = 0;
     let yields = 0;
     let lastYieldAt: string | null = null;
+    this.paused = false;
     while (
       !this.finished &&
+      !this.paused &&
       files.length < maxFiles &&
       this.visited - startingVisited < maxEntries &&
       performance.now() - collectStartedAt < maxWallMs &&
@@ -112,11 +123,16 @@ export class IncrementalJsonlDiscovery {
         // failures must not keep descriptors alive or throw during shutdown.
       }
     }
+    this.pendingEntry = null;
     this.finished = true;
   }
 
   private step(): { file: string; stat: fs.Stats; precise: fs.BigIntStats } | null {
     if (this.finished) return null;
+    // readSync has already advanced the directory iterator. Keep that Dirent
+    // until the next path-bearing operation is admitted so a progress-frame
+    // soft cap cannot silently discard either a file or a subdirectory.
+    if (this.pendingEntry) return this.processPendingEntry();
     if (this.visited >= this.options.maxEntries) {
       this.limitReached = true;
       this.errors += 1;
@@ -128,12 +144,27 @@ export class IncrementalJsonlDiscovery {
         this.finished = true;
         return null;
       }
-      const root = this.roots[this.rootIndex++]!;
-      this.openDirectory(root, true);
+      const root = this.roots[this.rootIndex]!;
+      // A rejected discovery_directory progress frame is not an attempted
+      // root. Advance only after the open/skip/error step was admitted.
+      if (this.openDirectory(root, true)) this.rootIndex += 1;
       return null;
     }
 
     const frame = this.stack[this.stack.length - 1]!;
+    const directoryHash = maintenanceCandidateHash(frame.directory);
+    if (this.options.quarantinedCandidateHash === directoryHash ||
+      this.options.isCandidateQuarantined?.(directoryHash)) {
+      this.popFrame(false);
+      return null;
+    }
+    if (this.options.beforeFilesystemStep?.({
+      stage: "discovery_read",
+      candidateHash: directoryHash,
+    }) === false) {
+      this.paused = true;
+      return null;
+    }
     let entry: fs.Dirent | null;
     try {
       entry = frame.handle.readSync();
@@ -152,21 +183,48 @@ export class IncrementalJsonlDiscovery {
       this.errors += 1;
       return null;
     }
+    this.pendingEntry = { entry, candidate };
+    return this.processPendingEntry();
+  }
+
+  private processPendingEntry(): { file: string; stat: fs.Stats; precise: fs.BigIntStats } | null {
+    const pending = this.pendingEntry;
+    if (!pending) return null;
+    const { entry, candidate } = pending;
     if (entry.isDirectory()) {
-      if (this.options.recursive) this.openDirectory(candidate, false);
+      if (this.options.recursive && !this.openDirectory(candidate, false)) return null;
+      this.pendingEntry = null;
       return null;
     }
-    if (!this.options.matches(entry.name)) return null;
+    if (!this.options.matches(entry.name)) {
+      this.pendingEntry = null;
+      return null;
+    }
     if (entry.isSymbolicLink()) {
       // A candidate alias can escape roots or cause one physical generation
       // to be observed under an attacker-controlled name. It is never
       // followed. Irrelevant aliases were rejected by the name predicate
       // above and do not make an otherwise complete discovery ambiguous.
       this.errors += 1;
+      this.pendingEntry = null;
       return null;
     }
     if (!entry.isFile()) {
       this.errors += 1;
+      this.pendingEntry = null;
+      return null;
+    }
+    const candidateHash = maintenanceCandidateHash(candidate);
+    if (this.options.quarantinedCandidateHash === candidateHash ||
+      this.options.isCandidateQuarantined?.(candidateHash)) {
+      this.pendingEntry = null;
+      return null;
+    }
+    if (this.options.beforeFilesystemStep?.({
+      stage: "candidate_metadata",
+      candidateHash,
+    }) === false) {
+      this.paused = true;
       return null;
     }
     try {
@@ -180,30 +238,44 @@ export class IncrementalJsonlDiscovery {
         !this.hasStableContainedAncestors(candidate)
       ) {
         this.errors += 1;
+        this.pendingEntry = null;
         return null;
       }
       const precise = fs.lstatSync(candidate, { bigint: true });
       if (precise.isSymbolicLink() || !precise.isFile()) {
         this.errors += 1;
+        this.pendingEntry = null;
         return null;
       }
+      this.pendingEntry = null;
       return { file: candidate, stat: metadata, precise };
     } catch {
       this.errors += 1;
+      this.pendingEntry = null;
       return null;
     }
   }
 
-  private openDirectory(directory: string, isRoot: boolean) {
+  private openDirectory(directory: string, isRoot: boolean): boolean {
+    const candidateHash = maintenanceCandidateHash(directory);
+    if (this.options.quarantinedCandidateHash === candidateHash ||
+      this.options.isCandidateQuarantined?.(candidateHash)) return true;
+    if (this.options.beforeFilesystemStep?.({
+      stage: "discovery_directory",
+      candidateHash,
+    }) === false) {
+      this.paused = true;
+      return false;
+    }
     try {
       const metadata = fs.lstatSync(directory);
       if (metadata.isSymbolicLink() || !metadata.isDirectory()) {
         this.errors += 1;
-        return;
+        return true;
       }
       if (!this.hasStableContainedAncestors(directory)) {
         this.errors += 1;
-        return;
+        return true;
       }
       const handle = fs.opendirSync(directory);
       const afterOpen = fs.lstatSync(directory);
@@ -215,7 +287,7 @@ export class IncrementalJsonlDiscovery {
       ) {
         handle.closeSync();
         this.errors += 1;
-        return;
+        return true;
       }
       this.stack.push({
         directory,
@@ -231,22 +303,33 @@ export class IncrementalJsonlDiscovery {
         this.errors += 1;
       }
     }
+    return true;
   }
 
-  private popFrame() {
-    const frame = this.stack.pop();
+  private popFrame(validate = true) {
+    const frame = this.stack[this.stack.length - 1];
     if (!frame) return;
+    if (validate && this.options.beforeFilesystemStep?.({
+      stage: "discovery_directory",
+      candidateHash: maintenanceCandidateHash(frame.directory),
+    }) === false) {
+      this.paused = true;
+      return;
+    }
+    this.stack.pop();
     try {
-      const current = fs.lstatSync(frame.directory);
-      if (
-        current.isSymbolicLink() ||
-        !current.isDirectory() ||
-        current.dev !== frame.dev ||
-        current.ino !== frame.ino ||
-        current.mtimeMs !== frame.mtimeMs ||
-        current.ctimeMs !== frame.ctimeMs ||
-        !this.hasStableContainedAncestors(frame.directory)
-      ) this.errors += 1;
+      if (validate) {
+        const current = fs.lstatSync(frame.directory);
+        if (
+          current.isSymbolicLink() ||
+          !current.isDirectory() ||
+          current.dev !== frame.dev ||
+          current.ino !== frame.ino ||
+          current.mtimeMs !== frame.mtimeMs ||
+          current.ctimeMs !== frame.ctimeMs ||
+          !this.hasStableContainedAncestors(frame.directory)
+        ) this.errors += 1;
+      }
       frame.handle.closeSync();
     } catch {
       this.errors += 1;

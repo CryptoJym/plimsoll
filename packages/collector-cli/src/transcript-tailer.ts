@@ -29,6 +29,10 @@ import {
 } from "./capture-baseline";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
 import { IncrementalJsonlDiscovery } from "./incremental-jsonl-discovery";
+import {
+  maintenanceCandidateHash,
+  type MaintenanceProgressStage,
+} from "./maintenance-progress";
 import { deterministicEventId } from "./normalizer";
 import {
   aiInteractionEventSchema,
@@ -107,6 +111,8 @@ type PersistedGitContext = {
   headSha?: string;
 };
 
+type PreparedGitContexts = ReadonlyMap<string, PersistedGitContext | undefined>;
+
 type TranscriptParserState = {
   parserKind: "claude-transcript-v3";
   checkpointVersion: 3;
@@ -143,6 +149,9 @@ export type TranscriptScanOptions = {
     budget: CaptureWorkBudget;
   };
   signal?: AbortSignal;
+  quarantine?: { stage: MaintenanceProgressStage; candidateHash: string };
+  onProgress?: (progress: { stage: MaintenanceProgressStage; candidateHash: string | null }) => boolean;
+  deferredBeforeIo?: boolean;
 };
 
 function validateTranscriptParserState(value: unknown): TranscriptParserState | undefined {
@@ -286,6 +295,7 @@ function restoreResultMutationSnapshot(
 }
 
 export class TranscriptTailer {
+  private activeBoundaryOptions: Pick<TranscriptScanOptions, "quarantine" | "onProgress"> = {};
   private baselineAttempt: {
     discovery: IncrementalJsonlDiscovery;
     pendingFiles: Array<{ file: string; stat: fs.Stats; precise: fs.BigIntStats }>;
@@ -336,6 +346,10 @@ export class TranscriptTailer {
   }
 
   async scan(options: TranscriptScanOptions): Promise<TranscriptScanResult> {
+    this.activeBoundaryOptions = {
+      quarantine: options.quarantine,
+      onProgress: options.onProgress,
+    };
     const scanNow = options.now ?? new Date();
     const today = scanNow.toISOString().slice(0, 10);
     const result: TranscriptScanResult = {
@@ -375,6 +389,12 @@ export class TranscriptTailer {
         truncated: false,
       },
     };
+    if (options.deferredBeforeIo) {
+      result.activity.truncated = true;
+      result.deferredGenerations = 1;
+      result.automaticBudget = options.automatic?.budget.status() ?? null;
+      return result;
+    }
     const now = scanNow;
     const recentCutoff = now.getTime() - 48 * 60 * 60 * 1000;
     if (options.scope === "recent" && !options.automatic) {
@@ -407,7 +427,7 @@ export class TranscriptTailer {
           return result;
         }
         this.baselineAttempt = {
-          discovery: this.recentDiscovery(options.discoveryLimit),
+          discovery: this.recentDiscovery(options.discoveryLimit, options),
           pendingFiles: [],
           runId: began.latestRun.runId,
           filesDiscovered: began.latestRun.filesDiscovered,
@@ -546,7 +566,7 @@ export class TranscriptTailer {
 
       if (attempt.capacityDeferredThisSweep) {
         attempt.discovery.close();
-        attempt.discovery = this.recentDiscovery(options.discoveryLimit);
+        attempt.discovery = this.recentDiscovery(options.discoveryLimit, options);
         attempt.capacityDeferredThisSweep = false;
         attempt.newGenerationsThisSweep = 0;
         result.activity.truncated = true;
@@ -558,7 +578,7 @@ export class TranscriptTailer {
       attempt.sweepsCompleted += 1;
       if (attempt.sweepsCompleted < 2 || attempt.newGenerationsThisSweep > 0) {
         attempt.discovery.close();
-        attempt.discovery = this.recentDiscovery(options.discoveryLimit);
+        attempt.discovery = this.recentDiscovery(options.discoveryLimit, options);
         attempt.newGenerationsThisSweep = 0;
         result.activity.truncated = true;
         result.deferredGenerations = 1;
@@ -595,7 +615,10 @@ export class TranscriptTailer {
       stat: fs.Stats;
       cursor: JsonlScanCursor<TranscriptParserState> | undefined;
     }> = [];
-    let automaticFilesConsumed = 0;
+    const automaticFilesConsumed = new Set<string>();
+    const consumeAutomaticFile = (file: string) => {
+      if (automatic) automaticFilesConsumed.add(file);
+    };
     for (let index = 0; index < discoveredFiles.length; index += 1) {
       const discovered = discoveredFiles[index]!;
       const file = discovered.file;
@@ -609,12 +632,23 @@ export class TranscriptTailer {
         result.deferredGenerations += discoveredFiles.length - index;
         break;
       }
-      if (automatic) automaticFilesConsumed = index + 1;
+      const candidateHash = maintenanceCandidateHash(file);
+      if (options.quarantine?.stage === "candidate_metadata" &&
+        options.quarantine.candidateHash === candidateHash) {
+        result.deferredGenerations += 1;
+        consumeAutomaticFile(file);
+        continue;
+      }
+      if (!discovered.stat && options.onProgress?.({ stage: "candidate_metadata", candidateHash }) === false) {
+        result.deferredGenerations += discoveredFiles.length - index;
+        break;
+      }
       let stat: fs.Stats;
       try {
         stat = discovered.stat ?? this.regularFileStat(file);
       } catch {
         result.statErrors += 1;
+        consumeAutomaticFile(file);
         continue;
       }
       const mtime = stat.mtime.toISOString();
@@ -624,6 +658,7 @@ export class TranscriptTailer {
       if (mtime.slice(0, 10) === today) result.activity.filesToday += 1;
       if (options.scope === "recent" && stat.mtime.getTime() < recentCutoff) {
         result.filesSkippedOutsideRecentWindow += 1;
+        consumeAutomaticFile(file);
         continue;
       }
       const observation = baselineObservation(file, stat, discovered.precise);
@@ -637,10 +672,12 @@ export class TranscriptTailer {
         if (decision.decision === "exclude") {
           result.excludedGenerations += 1;
           result.excludedBytes += stat.size;
+          consumeAutomaticFile(file);
           continue;
         }
         if (decision.decision === "block") {
           result.statErrors += 1;
+          consumeAutomaticFile(file);
           continue;
         }
       }
@@ -653,6 +690,7 @@ export class TranscriptTailer {
         );
         if (decision.decision === "block") {
           result.statErrors += 1;
+          consumeAutomaticFile(file);
           continue;
         }
       }
@@ -665,7 +703,6 @@ export class TranscriptTailer {
       );
       candidates.push({ file, stat, cursor });
     }
-    if (automatic) this.consumeAutomaticCaptureFiles(automaticFilesConsumed);
 
     const preferNewest = automatic ? this.nextCandidatePreference() === "newest" : false;
     candidates.sort((left, right) => {
@@ -677,6 +714,17 @@ export class TranscriptTailer {
     });
 
     for (const candidate of candidates) {
+      const candidateHash = maintenanceCandidateHash(candidate.file);
+      if ((options.quarantine?.stage === "jsonl_open" || options.quarantine?.stage === "jsonl_validation") &&
+        options.quarantine.candidateHash === candidateHash) {
+        result.deferredGenerations += 1;
+        consumeAutomaticFile(candidate.file);
+        continue;
+      }
+      if (options.onProgress?.({ stage: "jsonl_open", candidateHash }) === false) {
+        result.deferredGenerations += candidates.length;
+        break;
+      }
       if (options.signal?.aborted) {
         result.aborted = true;
         break;
@@ -701,10 +749,14 @@ export class TranscriptTailer {
         let read: NonNullable<ReturnType<JsonlTailerIo["readTail"]>>;
         try {
           const next = this.io.readTail(candidate.file, candidate.stat, cursor, limits);
-          if (!next) break;
+          if (!next) {
+            consumeAutomaticFile(candidate.file);
+            break;
+          }
           read = next;
         } catch {
           result.readErrors += 1;
+          consumeAutomaticFile(candidate.file);
           break;
         }
         if (!countedFile) {
@@ -720,13 +772,30 @@ export class TranscriptTailer {
         const before = resultMutationSnapshot(result);
         let parseFailure = false;
         let committed = false;
+        let validationDeferred = false;
         try {
           const initialState = read.reset || !cursor?.parserState
             ? this.initialParserState(candidate.file)
             : cursor.parserState;
+          // Keep user-controlled path IO outside the SQLite write lock. A
+          // second validation after metadata preparation prevents a changed
+          // transcript generation from advancing its durable cursor.
+          if (options.onProgress?.({ stage: "jsonl_validation", candidateHash }) === false) {
+            validationDeferred = true;
+            throw new Error("maintenance_progress_budget_exhausted");
+          }
+          read.assertStableForCommit();
+          const fallbackObservedAt = this.fallbackObservedAt(read.mtimeMs);
+          const gitContexts = read.unresolvedRecord
+            ? new Map<string, PersistedGitContext | undefined>()
+            : this.prepareGitContexts(read.lines, options);
+          if (options.onProgress?.({ stage: "jsonl_validation", candidateHash }) === false) {
+            validationDeferred = true;
+            throw new Error("maintenance_progress_budget_exhausted");
+          }
+          read.assertStableForCommit();
           this.buffer.database.transaction(() => {
             if (read.unresolvedRecord) {
-              read.assertStableForCommit();
               rememberJsonlScanCursor(
                 this.buffer.database,
                 candidate.file,
@@ -739,17 +808,17 @@ export class TranscriptTailer {
             }
             const parseErrorsBefore = result.parseErrors;
             const parserState = this.ingestLines(
-              candidate.file,
               read.lines,
               result,
               initialState,
               !read.workRemaining && read.deferredBytes === 0,
+              fallbackObservedAt,
+              gitContexts,
             );
             if (result.parseErrors !== parseErrorsBefore) {
               parseFailure = true;
               throw new Error("transcript_slice_parse_failed");
             }
-            read.assertStableForCommit();
             rememberJsonlScanCursor(
               this.buffer.database,
               candidate.file,
@@ -760,13 +829,21 @@ export class TranscriptTailer {
             );
           })();
           committed = true;
+          consumeAutomaticFile(candidate.file);
           result.slicesCommitted += 1;
           if (read.unresolvedRecord) result.unresolvedRecords += 1;
         } catch {
           const parseErrors = result.parseErrors - before.parseErrors;
           restoreResultMutationSnapshot(result, before);
-          if (parseFailure) result.parseErrors += Math.max(1, parseErrors);
-          else result.readErrors += 1;
+          if (parseFailure) {
+            result.parseErrors += Math.max(1, parseErrors);
+            consumeAutomaticFile(candidate.file);
+          } else if (!validationDeferred) {
+            result.readErrors += 1;
+            consumeAutomaticFile(candidate.file);
+          } else {
+            result.activity.truncated = true;
+          }
         } finally {
           read.close();
         }
@@ -791,6 +868,7 @@ export class TranscriptTailer {
         if (automatic && !automatic.budget.canContinue()) break;
       }
     }
+    if (automatic) this.consumeAutomaticCaptureFiles(automaticFilesConsumed);
     for (const candidate of candidates) {
       const cursor = loadJsonlScanCursor<TranscriptParserState>(
         this.buffer.database,
@@ -816,12 +894,22 @@ export class TranscriptTailer {
     return result;
   }
 
-  private recentDiscovery(limit?: number) {
+  private recentDiscovery(limit?: number, _options?: TranscriptScanOptions) {
     return new IncrementalJsonlDiscovery([this.projectsDir], {
       recursive: true,
       matches: (name) => name.endsWith(".jsonl"),
       maxEntries: Math.max(1, limit ?? 100_000),
       missingRootsAreEmpty: true,
+      isCandidateQuarantined: (candidateHash) => {
+        const quarantine = this.activeBoundaryOptions.quarantine;
+        return Boolean(
+          quarantine &&
+          (quarantine.stage.startsWith("discovery_") || quarantine.stage === "candidate_metadata") &&
+          quarantine.candidateHash === candidateHash,
+        );
+      },
+      beforeFilesystemStep: (progress) =>
+        this.activeBoundaryOptions.onProgress?.(progress) ?? true,
     });
   }
 
@@ -831,7 +919,7 @@ export class TranscriptTailer {
   ) {
     if (!this.captureAttempt) {
       this.captureAttempt = {
-        discovery: this.recentDiscovery(options.discoveryLimit),
+        discovery: this.recentDiscovery(options.discoveryLimit, options),
         pendingFiles: [],
         discoveryDone: false,
       };
@@ -862,10 +950,10 @@ export class TranscriptTailer {
     };
   }
 
-  private consumeAutomaticCaptureFiles(count: number) {
+  private consumeAutomaticCaptureFiles(files: ReadonlySet<string>) {
     const attempt = this.captureAttempt;
     if (!attempt) return;
-    attempt.pendingFiles.splice(0, Math.max(0, count));
+    attempt.pendingFiles = attempt.pendingFiles.filter((pending) => !files.has(pending.file));
     if (attempt.discoveryDone && attempt.pendingFiles.length === 0) {
       attempt.discovery.close();
       this.captureAttempt = null;
@@ -958,20 +1046,46 @@ export class TranscriptTailer {
     return safe.remoteUrlHash || safe.branchHash || safe.headSha ? safe : undefined;
   }
 
+  private fallbackObservedAt(mtimeMs: number) {
+    const observed = new Date(mtimeMs);
+    return Number.isFinite(mtimeMs) && !Number.isNaN(observed.getTime())
+      ? observed.toISOString()
+      : new Date().toISOString();
+  }
+
+  /** Resolve assistant-entry Git metadata before the write transaction. */
+  private prepareGitContexts(lines: string[], options: TranscriptScanOptions): PreparedGitContexts {
+    const cwds = new Set<string>();
+    for (const line of lines) {
+      if (!line.includes('"assistant"') || !line.includes('"usage"')) continue;
+      try {
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        if (parsed.type === "assistant" && typeof parsed.cwd === "string") {
+          cwds.add(parsed.cwd);
+        }
+      } catch {
+        // ingestLines records the parse failure inside the transaction.
+      }
+    }
+    return new Map([...cwds].map((cwd) => {
+      const candidateHash = maintenanceCandidateHash(cwd);
+      if (options.quarantine?.stage === "git_context" &&
+        options.quarantine.candidateHash === candidateHash) return [cwd, undefined] as const;
+      if (options.onProgress?.({ stage: "git_context", candidateHash }) === false) {
+        return [cwd, undefined] as const;
+      }
+      return [cwd, this.safeGitContext(cwd)] as const;
+    }));
+  }
+
   private ingestLines(
-    file: string,
     lines: string[],
     result: TranscriptScanResult,
     state: TranscriptParserState,
     flushAtStableEof: boolean,
+    fallbackObservedAt: string,
+    gitContexts: PreparedGitContexts,
   ) {
-    const fallbackObservedAt = (() => {
-      try {
-        return fs.statSync(file).mtime.toISOString();
-      } catch {
-        return new Date().toISOString();
-      }
-    })();
     // Upgrade an old v3 pending snapshot into the durable revision model
     // before processing new bytes. This keeps existing cursors compatible.
     if (state.pending) {
@@ -993,7 +1107,7 @@ export class TranscriptTailer {
       if (!state.sessionId && typeof parsed.sessionId === "string") {
         state.sessionId = parsed.sessionId.match(UUID_RE)?.[0]?.toLowerCase();
       }
-      if (typeof parsed.cwd === "string") state.git = this.safeGitContext(parsed.cwd);
+      if (typeof parsed.cwd === "string") state.git = gitContexts.get(parsed.cwd);
       const message = (parsed.message ?? {}) as Record<string, unknown>;
       const usage = (message.usage ?? {}) as Record<string, unknown>;
       const messageId = typeof message.id === "string" ? message.id : undefined;

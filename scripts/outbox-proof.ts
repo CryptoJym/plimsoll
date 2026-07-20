@@ -2388,11 +2388,15 @@ async function hookPromotionAdmissionProof() {
     const localMetadata = (localEvent?.metadata ?? {}) as Record<string, unknown>;
     const wireEvent = wireEnvelope?.event;
     const wireMetadata = (wireEvent?.metadata ?? {}) as Record<string, unknown>;
-    const expectedGit = {
-      remoteUrlHash: resolverRemoteUrlHash,
-      branchHash: resolverBranchHash,
-      headSha: resolverHeadSha,
-    };
+    // Immediate hook admission deliberately leaves repository attribution
+    // UNKNOWN (represented by an omitted `git` object). The real repository
+    // is a trap here: if the HTTP path synchronously consults caller-selected
+    // `cwd`, its derived linkage would become observable on a proof surface.
+    const repositoryAttributionUnknown =
+      localMetadata.git === undefined &&
+      wireMetadata.git === undefined &&
+      !("cwd" in localMetadata) &&
+      !("cwd" in wireMetadata);
     const callerAuthorityMetadataKeys = [
       "source",
       "SOURCE",
@@ -2465,8 +2469,7 @@ async function hookPromotionAdmissionProof() {
       wireEvent.outputTokens === localEvent.outputTokens &&
       wireEvent.costUsd === localEvent.costUsd &&
       wireEvent.actorId === localEvent.actorId &&
-      JSON.stringify(localMetadata.git) === JSON.stringify(expectedGit) &&
-      JSON.stringify(wireMetadata.git) === JSON.stringify(expectedGit) &&
+      repositoryAttributionUnknown &&
       callerAuthorityMetadataKeys.every(
         (key) => !(key in localMetadata) && !(key in wireMetadata),
       ) &&
@@ -2477,6 +2480,10 @@ async function hookPromotionAdmissionProof() {
         ...Object.values(unsafeValues),
         ...Object.values(authoritySpoofs),
         hookRepo,
+        remoteUrl,
+        resolverRemoteUrlHash,
+        resolverBranchHash,
+        resolverHeadSha,
       ]
         .flatMap((value) => [
           value,
@@ -2517,6 +2524,7 @@ async function hookPromotionAdmissionProof() {
         exactParity,
         authorityReceiptContract,
         authorityReceipts: responseReceipts.filter((receipt) => receipt.startsWith("hook.authority.")),
+        repositoryAttributionUnknown,
         positiveControls,
         leaks: valueTerms.filter((term) => surfaces.some((surface) => surface.includes(term))).length,
       },

@@ -66,8 +66,9 @@ export type JsonlTailRead = {
   legacyRebuild: boolean;
   checkpointRebuild: boolean;
   /**
-   * Revalidate the still-open generation immediately before the caller writes
-   * parsed events and this cursor in one transaction. Throws on ambiguity.
+   * Revalidate the still-open generation immediately before the caller opens
+   * its database write transaction. This performs user-path filesystem calls,
+   * so it must never execute while SQLite holds the write lock.
    */
   assertStableForCommit(): void;
   /** Idempotent. Call from a finally block after commit or rollback. */
@@ -408,8 +409,9 @@ export function rememberJsonlScanCursor<T>(
 /**
  * Read complete JSONL records after the last committed newline. Partial bytes
  * remain only in the source file: no content carry is copied into SQLite.
- * The checkpoint advances after its caller commits parsed events and state in
- * one database transaction, so a crash replays deterministic ids safely.
+ * After validating the open generation outside SQLite, the caller advances
+ * parsed events and checkpoint state in one database transaction, so a crash
+ * replays deterministic ids safely without holding a write lock over path IO.
  */
 export function readJsonlTail(
   file: string,

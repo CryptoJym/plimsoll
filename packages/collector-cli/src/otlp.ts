@@ -61,10 +61,11 @@ type ExplodeOptions = {
   source?: ToolSource;
   transportPath?: string;
   /**
-   * Resolve git linkage keys from working directories found in raw record
-   * attributes (before sanitization removes them). Must be disabled for
-   * archive backfills: replaying old workdirs against current git state
-   * would attribute today's HEAD to historical sessions.
+   * Opt in to synchronous git linkage resolution for trusted offline callers.
+   * Network admission leaves this disabled so caller-selected working
+   * directories can never put filesystem latency on the HTTP event loop.
+   * Archive backfills must also leave it disabled: replaying old workdirs
+   * against current git state would attribute today's HEAD to old sessions.
    */
   resolveGit?: boolean;
   /** Receives (repoHash, label) for local-only repo_labels recording. */
@@ -630,7 +631,9 @@ export function explodeOtlpPayload(
                 ...resource.suppressedFields,
                 ...scopeReceipts,
               ],
-              resolveGit: options.resolveGit ?? true,
+              // UNKNOWN linkage is the admission default. Filesystem-derived
+              // attribution is an explicit offline-only compatibility path.
+              resolveGit: options.resolveGit ?? false,
               onRepoLabel: options.onRepoLabel,
             }),
           );

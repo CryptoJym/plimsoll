@@ -10,7 +10,8 @@
  *      map to assistant_response.
  *   3. Metric datapoints (claude_code.token.usage) are parsed with values.
  *   4. Codex trace spans carrying gen_ai.usage.* produce token-attributed events.
- *   5. Codex tool_result `arguments` (cmd/workdir) are suppressed; no raw
+ *   5. Immediate hook/OTLP admission leaves repository attribution UNKNOWN;
+ *      Codex tool_result `arguments` (cmd/workdir) are suppressed and no raw
  *      command bodies or absolute paths persist in metadata mode.
  *   6. Hook tool_name maps to actionClass (Bash→shell, Edit→edit, mcp__*→mcp).
  *   7. Upload drains oldest-first and advances the uploaded_at watermark.
@@ -594,8 +595,10 @@ async function main() {
     await postJson(port, "/hooks/claude-code", fixture.body);
   }
 
-  // Linkage fixtures: a real temp git repo referenced by hook cwd and by a
-  // codex tool_result arguments.workdir (which itself must stay suppressed).
+  // Admission-boundary fixtures: caller-controlled cwd/workdir values point at
+  // a real Git repo, but the synchronous HTTP path must neither inspect that
+  // path nor invent linkage. The same repo is reused later to positively prove
+  // the explicit offline rollout/transcript attribution paths.
   const proofRepo = createTempGitRepo(tempDir);
   await postJson(port, "/hooks/claude-code", {
     hook_event_name: "SessionStart",
@@ -758,7 +761,9 @@ async function main() {
     sessionId: string;
     repoHash: string | null;
   }>;
-  const projectedSessionId = projectedSessions.find((row) => row.repoHash)?.sessionId;
+  const projectedSessionId =
+    projectedSessions.find((row) => row.sessionId === SESSION)?.sessionId ??
+    projectedSessions[0]?.sessionId;
   const dashSession = (await fetch(
     `http://127.0.0.1:${port}/api/session?id=${encodeURIComponent(projectedSessionId ?? "")}`,
   ).then((r) => r.json())) as { rollup: Record<string, unknown>; receipts: { linkage: unknown[] } };
@@ -785,17 +790,20 @@ async function main() {
     }),
   );
   const dashRepos = (await fetch(`http://127.0.0.1:${port}/api/repos`).then((r) => r.json())) as Array<{
-    repoHash?: string;
-    label?: string;
+    repoHash?: string | null;
+    label?: string | null;
   }>;
   check(
-    "repo_label_displayed_locally",
-    dashRepos.some((row) => row.label === "github.com/proof-owner/proof-repo"),
-    JSON.stringify(dashRepos.map((row) => row.label)),
+    "dashboard_does_not_invent_repo_for_unknown_admission",
+    dashRepos.length >= 1 && dashRepos.every((row) => row.repoHash == null && row.label == null),
+    JSON.stringify(dashRepos.map((row) => ({ repoHash: row.repoHash, label: row.label }))),
   );
   check(
-    "dashboard_session_receipts_traceable",
-    Boolean(dashSession.rollup) && dashSession.receipts.linkage.length >= 1,
+    "dashboard_unknown_admission_receipts_remain_path_free",
+    Boolean(dashSession.rollup) &&
+      Array.isArray(dashSession.receipts.linkage) &&
+      dashSession.receipts.linkage.length === 0 &&
+      !JSON.stringify(dashSession).includes(proofRepo.repoDir),
     `linkage rows: ${dashSession.receipts?.linkage?.length}`,
   );
 
@@ -898,8 +906,9 @@ async function main() {
     `actionClass=other rate across tool events: ${(actionClassOtherRate * 100).toFixed(1)}%`,
   );
 
-  // Linkage assertions: hook cwd and codex workdir resolve to identical
-  // hashed keys that the GitHub importer can reproduce.
+  // Admission assertions: hook cwd and OTLP workdir stay explicit UNKNOWN.
+  // The raw values are already proven absent above; the column checks below
+  // also guard against silently reintroducing synchronous filesystem lookup.
   const expectedRemoteHash = remoteLinkageHash("git@github.com:Proof-Owner/Proof-Repo.git");
   const expectedBranchHash = branchLinkageHash("proof-branch");
   const sessionStart = rows.find((row) => row.payload.eventType === "session_start");
@@ -907,14 +916,9 @@ async function main() {
     | Record<string, unknown>
     | undefined;
   check(
-    "hook_cwd_git_linkage_captured",
-    Boolean(
-      sessionGit &&
-        sessionGit.remoteUrlHash === expectedRemoteHash &&
-        sessionGit.branchHash === expectedBranchHash &&
-        sessionGit.headSha === proofRepo.headSha,
-    ),
-    sessionGit ? JSON.stringify(sessionGit) : "session_start git context missing",
+    "hook_cwd_git_linkage_unknown_at_admission",
+    sessionGit === undefined && !JSON.stringify(sessionStart?.payload ?? {}).includes(proofRepo.repoDir),
+    sessionGit ? JSON.stringify(sessionGit) : "UNKNOWN (no synchronous git context)",
   );
 
   const codexLinkage = rows.find(
@@ -927,24 +931,21 @@ async function main() {
     | Record<string, unknown>
     | undefined;
   check(
-    "codex_workdir_git_linkage_captured",
-    Boolean(
-      codexGit &&
-        codexGit.remoteUrlHash === expectedRemoteHash &&
-        codexGit.headSha === proofRepo.headSha,
-    ),
-    codexGit ? JSON.stringify(codexGit) : "codex tool_result git context missing",
+    "codex_workdir_git_linkage_unknown_at_admission",
+    codexGit === undefined && !JSON.stringify(codexLinkage?.payload ?? {}).includes(proofRepo.repoDir),
+    codexGit ? JSON.stringify(codexGit) : "UNKNOWN (no synchronous git context)",
   );
 
-  const linkageColumns = new Database(bufferPath, { readonly: true })
+  const admissionLinkageColumns = new Database(bufferPath, { readonly: true })
     .prepare(
-      `select count(*) as n from buffered_events where repo_hash = ? and branch_hash = ? and head_sha = ?`,
+      `select count(*) as n from buffered_events
+       where repo_hash is not null or branch_hash is not null or head_sha is not null`,
     )
-    .get(expectedRemoteHash, expectedBranchHash, proofRepo.headSha) as { n: number };
+    .get() as { n: number };
   check(
-    "linkage_promoted_to_columns",
-    linkageColumns.n >= 2,
-    `rows with repo/branch/sha columns: ${linkageColumns.n}`,
+    "linkage_columns_unknown_at_admission",
+    admissionLinkageColumns.n === 0,
+    `immediate rows with repo/branch/sha columns: ${admissionLinkageColumns.n}`,
   );
 
   // Attribution: hashed account promoted (sanitizer re-hashes protected ids,
@@ -962,20 +963,18 @@ async function main() {
     JSON.stringify({ account: storedAccount?.accountHash, machine: os.hostname(), rows: storedAccount?.n }),
   );
 
-  // Buckets + leverage: proof repo is priority; codex stitched session is unlinked.
+  // Buckets + leverage: configuring a priority repo must not retroactively
+  // attribute UNKNOWN immediate events. All current spend remains unlinked.
   buffer.setPriorityRepo(expectedRemoteHash!, "github.com/proof-owner/proof-repo");
   const accounts = dashboardAccounts(buffer.database, [
     { account: storedAccount?.accountHash ?? "none", plan: "Max", usdPerMonth: 200, vendor: "anthropic" },
   ]);
   const proofAccount = accounts.accounts.find((a) => a.accountHash === storedAccount?.accountHash);
-  // Both the claude api_request session and the stitched codex session link to
-  // the proof repo, so the full $0.0613 lands in priority — nothing leaks to
-  // other/unlinked. Fully-accounted buckets are the strongest assertion.
   check(
     "priority_buckets_computed",
-    Math.abs(accounts.buckets.priorityUsd - 0.0613) < 0.001 &&
+    accounts.buckets.priorityUsd === 0 &&
       accounts.buckets.otherUsd === 0 &&
-      accounts.buckets.unlinkedUsd === 0,
+      Math.abs(accounts.buckets.unlinkedUsd - 0.0613) < 0.001,
     JSON.stringify(accounts.buckets),
   );
   const multiPlan = dashboardAccounts(buffer.database, [
@@ -1109,19 +1108,18 @@ async function main() {
   );
   const sessionRow = sessionsRows.find((row) => row.sessionId === SESSION);
   check(
-    "session_list_resolves_dominant_repo",
-    Boolean(sessionRow && sessionRow.repoHash === expectedRemoteHash),
+    "session_list_preserves_unknown_repo_at_admission",
+    Boolean(sessionRow && sessionRow.repoHash == null && sessionRow.repoLabel == null),
     JSON.stringify({ repoHash: sessionRow?.repoHash, repoLabel: sessionRow?.repoLabel ?? null }),
   );
 
   const summaryView = dashboardSummary(buffer.database);
   const reposView = dashboardRepos(buffer.database) as Array<{ costUsd: number }>;
   const sessionDetail = dashboardSessionDetail(buffer.database, SESSION);
-  const repoDetail = dashboardRepoDetail(buffer.database, expectedRemoteHash!);
   check(
-    "dashboard_detail_queries_execute",
-    Boolean(sessionDetail && repoDetail),
-    JSON.stringify({ sessionDetail: Boolean(sessionDetail), repoDetail: Boolean(repoDetail) }),
+    "dashboard_unknown_session_detail_executes",
+    Boolean(sessionDetail) && dashboardRepoDetail(buffer.database, expectedRemoteHash!) === null,
+    JSON.stringify({ sessionDetail: Boolean(sessionDetail), repoDetail: false }),
   );
 
   // Cache-WRITE tokens are a first-class column (issue 0024 / #26): the
@@ -1522,6 +1520,69 @@ async function main() {
       .every((row) => row.repoHash === expectedRemoteHash),
     JSON.stringify({ repoHash: rolloutRows[0]?.repoHash, expected: expectedRemoteHash }),
   );
+  const offlineLinkageColumns = buffer.database
+    .prepare(
+      `select count(*) as n from buffered_events
+       where session_id = ? and repo_hash = ? and branch_hash = ? and head_sha = ?`,
+    )
+    .get(ROLLOUT_SESSION, expectedRemoteHash, expectedBranchHash, proofRepo.headSha) as { n: number };
+  check(
+    "linkage_promoted_to_columns",
+    offlineLinkageColumns.n === 2,
+    `offline rollout rows with repo/branch/sha columns: ${offlineLinkageColumns.n}`,
+  );
+
+  // The proof clock is restored before the historical-tail section so later
+  // sync/retention checks keep real-time semantics. Use the dashboard's
+  // explicit long-history window here rather than making this assertion
+  // depend on the wall-clock date of the machine running the proof.
+  const offlineRepos = dashboardRepos(buffer.database, 3650);
+  check(
+    "repo_label_displayed_locally",
+    offlineRepos.some(
+      (row) =>
+        row.repoHash === expectedRemoteHash &&
+        row.label === "github.com/proof-owner/proof-repo",
+    ),
+    JSON.stringify(
+      offlineRepos.map((row) => ({ repoHash: row.repoHash, label: row.label })),
+    ),
+  );
+  const offlineSessions = dashboardSessions(buffer.database, 3650) as Array<{
+    sessionId: string;
+    repoHash: string | null;
+    repoLabel: string | null;
+  }>;
+  const offlineSessionRow = offlineSessions.find((row) => row.sessionId === ROLLOUT_SESSION);
+  check(
+    "session_list_resolves_dominant_repo",
+    Boolean(offlineSessionRow && offlineSessionRow.repoHash === expectedRemoteHash),
+    JSON.stringify({
+      repoHash: offlineSessionRow?.repoHash,
+      repoLabel: offlineSessionRow?.repoLabel ?? null,
+    }),
+  );
+  const offlineSessionDetail = dashboardSessionDetail(buffer.database, ROLLOUT_SESSION);
+  const offlineRepoDetail = dashboardRepoDetail(buffer.database, expectedRemoteHash!, 3650);
+  check(
+    "dashboard_session_receipts_traceable",
+    Boolean(
+      offlineSessionDetail &&
+        offlineSessionDetail.receipts.linkage.some(
+          (receipt) =>
+            (receipt as { repoHash?: string }).repoHash === expectedRemoteHash,
+        ),
+    ),
+    `offline linkage rows: ${offlineSessionDetail?.receipts.linkage.length ?? 0}`,
+  );
+  check(
+    "dashboard_detail_queries_execute",
+    Boolean(offlineSessionDetail && offlineRepoDetail),
+    JSON.stringify({
+      sessionDetail: Boolean(offlineSessionDetail),
+      repoDetail: Boolean(offlineRepoDetail),
+    }),
+  );
   check(
     "rollout_otlp_covered_session_skipped",
     firstScan.sessionsSkippedOtlpCovered >= 1 &&
@@ -1758,6 +1819,14 @@ async function main() {
       tRows.every((row) => row.repo === expectedRemoteHash) &&
       tRows.every((row) => String(row.payload).includes('"costEstimated":true')),
     JSON.stringify({ rows: tRows.length, ...tSum }),
+  );
+  check(
+    "transcript_repo_linkage_from_cwd",
+    tRows.length === 3 && tRows.every((row) => row.repo === expectedRemoteHash),
+    JSON.stringify({
+      linked: tRows.filter((row) => row.repo === expectedRemoteHash).length,
+      expected: expectedRemoteHash,
+    }),
   );
   check(
     "transcript_live_covered_session_skipped",

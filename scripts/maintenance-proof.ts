@@ -26,10 +26,17 @@ import {
 import {
   beginAutomaticCaptureBaseline,
   captureBaselineStatus,
+  completeAutomaticCaptureBaseline,
   stageAutomaticCaptureBaselineObservation,
   stageAutomaticCaptureBaselinePending,
   type CaptureBaselineStatus,
 } from "../packages/collector-cli/src/capture-baseline";
+import {
+  CaptureWorkBudget,
+  type CaptureBudgetLimits,
+} from "../packages/collector-cli/src/capture-work-budget";
+import { IncrementalJsonlDiscovery } from "../packages/collector-cli/src/incremental-jsonl-discovery";
+import { maintenanceCandidateHash } from "../packages/collector-cli/src/maintenance-progress";
 import {
   RolloutTailer,
   type RolloutScanOptions,
@@ -638,6 +645,432 @@ async function proveCrashResumeBindsExactPendingIdentities(root: string) {
   }
 }
 
+type BoundaryProofProgress = Parameters<NonNullable<TranscriptScanOptions["onProgress"]>>[0];
+
+function softCapProgressGate() {
+  let frames = 0;
+  let lastKey = "";
+  const blocked: BoundaryProofProgress[] = [];
+  return {
+    onProgress: (progress: BoundaryProofProgress) => {
+      const key = `${progress.stage}:${progress.candidateHash ?? "none"}`;
+      if (key === lastKey) return true;
+      const critical = progress.stage === "source_scan" || progress.stage === "jsonl_validation";
+      if (frames >= (critical ? 120 : 112)) {
+        blocked.push(progress);
+        return false;
+      }
+      frames += 1;
+      lastKey = key;
+      return true;
+    },
+    status: () => ({ frames, blocked: [...blocked] }),
+  };
+}
+
+function validationCapProgressGate() {
+  let blocked: BoundaryProofProgress | null = null;
+  const stages: BoundaryProofProgress["stage"][] = [];
+  return {
+    onProgress: (progress: BoundaryProofProgress) => {
+      stages.push(progress.stage);
+      if (blocked) return false;
+      if (progress.stage === "jsonl_validation") {
+        blocked = progress;
+        return false;
+      }
+      return true;
+    },
+    status: () => ({ blocked, stages: [...stages] }),
+  };
+}
+
+function recordingProgressGate() {
+  const stages: BoundaryProofProgress["stage"][] = [];
+  return {
+    onProgress: (progress: BoundaryProofProgress) => {
+      stages.push(progress.stage);
+      return true;
+    },
+    stages,
+  };
+}
+
+function automaticCaptureBudget() {
+  // Keep host speed from becoming the cadence boundary in this fixture: the
+  // 112-frame protocol cap must be the only injected stop condition.
+  return new CaptureWorkBudget({
+    maxBytes: 16 * 1024 * 1024,
+    maxRecords: 4_096,
+    maxEvents: 4_096,
+    maxWallMs: 10_000,
+    sliceBytes: 64 * 1024,
+    sliceRecords: 64,
+  } as unknown as CaptureBudgetLimits);
+}
+
+async function proveDiscoverySoftCapResume(root: string) {
+  const metadataRoot = path.join(root, "soft-cap-metadata");
+  fs.mkdirSync(metadataRoot, { recursive: true });
+  const metadataFiles = Array.from({ length: 70 }, (_, index) => {
+    const file = path.join(metadataRoot, `candidate-${String(index).padStart(3, "0")}.jsonl`);
+    fs.writeFileSync(file, "{}\n");
+    return file;
+  });
+  let metadataProgress = softCapProgressGate();
+  const metadataDiscovery = new IncrementalJsonlDiscovery([metadataRoot], {
+    recursive: false,
+    matches: (name) => name.endsWith(".jsonl"),
+    maxEntries: 1_000,
+    beforeFilesystemStep: (progress) => metadataProgress.onProgress(progress),
+  });
+  const metadataFirst = await metadataDiscovery.collect(automaticCaptureBudget(), {
+    maxFiles: 256,
+    maxEntries: 1_000,
+    maxWallMs: 100,
+  });
+  const metadataFirstStatus = metadataProgress.status();
+  const metadataBlocked = metadataFirstStatus.blocked[0];
+  metadataProgress = softCapProgressGate();
+  const metadataSecond = await metadataDiscovery.collect(automaticCaptureBudget(), {
+    maxFiles: 256,
+    maxEntries: 1_000,
+    maxWallMs: 100,
+  });
+  const metadataThird = await metadataDiscovery.collect(automaticCaptureBudget(), {
+    maxFiles: 256,
+    maxEntries: 1_000,
+    maxWallMs: 100,
+  });
+  metadataDiscovery.close();
+  const metadataObserved = [...metadataFirst.files, ...metadataSecond.files].map((entry) => entry.file);
+  const metadataBlockedPath = metadataFiles.find(
+    (file) => maintenanceCandidateHash(file) === metadataBlocked?.candidateHash,
+  );
+  check(
+    "candidate_metadata_soft_cap_retains_consumed_dirent_for_next_cadence",
+    metadataFirstStatus.frames === 112 &&
+      metadataBlocked?.stage === "candidate_metadata" &&
+      metadataFirst.files.length === 55 &&
+      metadataSecond.done &&
+      metadataSecond.files.some((entry) => entry.file === metadataBlockedPath) &&
+      metadataThird.files.length === 0 && metadataThird.done &&
+      metadataObserved.length === metadataFiles.length &&
+      new Set(metadataObserved).size === metadataFiles.length,
+    {
+      capFrames: metadataFirstStatus.frames,
+      blockedStage: metadataBlocked?.stage,
+      firstFiles: metadataFirst.files.length,
+      resumedFiles: metadataSecond.files.length,
+      totalUnique: new Set(metadataObserved).size,
+    },
+  );
+
+  const makePadding = (name: string) => {
+    const directory = path.join(root, name);
+    fs.mkdirSync(directory, { recursive: true });
+    for (let index = 0; index < 53; index += 1) {
+      fs.writeFileSync(path.join(directory, `padding-${String(index).padStart(3, "0")}.jsonl`), "{}\n");
+    }
+    return directory;
+  };
+
+  const subdirPadding = makePadding("soft-cap-subdir-padding");
+  const subdirMissing = path.join(root, "soft-cap-subdir-missing");
+  const subdirParent = path.join(root, "soft-cap-subdir-parent");
+  const targetSubdir = path.join(subdirParent, "target-child");
+  const targetSubdirFile = path.join(targetSubdir, "target.jsonl");
+  fs.mkdirSync(targetSubdir, { recursive: true });
+  fs.writeFileSync(targetSubdirFile, "{}\n");
+  let subdirProgress = softCapProgressGate();
+  const subdirDiscovery = new IncrementalJsonlDiscovery(
+    [subdirPadding, subdirMissing, subdirParent],
+    {
+      recursive: true,
+      matches: (name) => name.endsWith(".jsonl"),
+      maxEntries: 1_000,
+      missingRootsAreEmpty: true,
+      beforeFilesystemStep: (progress) => subdirProgress.onProgress(progress),
+    },
+  );
+  const subdirFirst = await subdirDiscovery.collect(automaticCaptureBudget(), {
+    maxFiles: 256, maxEntries: 1_000, maxWallMs: 100,
+  });
+  const subdirFirstStatus = subdirProgress.status();
+  subdirProgress = softCapProgressGate();
+  const subdirSecond = await subdirDiscovery.collect(automaticCaptureBudget(), {
+    maxFiles: 256, maxEntries: 1_000, maxWallMs: 100,
+  });
+  subdirDiscovery.close();
+  check(
+    "discovery_directory_soft_cap_retains_consumed_subdirectory_for_next_cadence",
+    subdirFirstStatus.frames === 112 &&
+      subdirFirstStatus.blocked[0]?.stage === "discovery_directory" &&
+      subdirFirstStatus.blocked[0]?.candidateHash === maintenanceCandidateHash(targetSubdir) &&
+      subdirSecond.done &&
+      subdirSecond.files.filter((entry) => entry.file === targetSubdirFile).length === 1,
+    {
+      capFrames: subdirFirstStatus.frames,
+      blockedStage: subdirFirstStatus.blocked[0]?.stage,
+      firstFiles: subdirFirst.files.length,
+      resumedTargetCount: subdirSecond.files.filter((entry) => entry.file === targetSubdirFile).length,
+    },
+  );
+
+  const rootPadding = makePadding("soft-cap-root-padding");
+  const missingRoots = Array.from({ length: 3 }, (_, index) =>
+    path.join(root, `soft-cap-root-missing-${index}`));
+  const targetRoot = path.join(root, "soft-cap-target-root");
+  const targetRootFile = path.join(targetRoot, "target.jsonl");
+  fs.mkdirSync(targetRoot, { recursive: true });
+  fs.writeFileSync(targetRootFile, "{}\n");
+  let rootProgress = softCapProgressGate();
+  const rootDiscovery = new IncrementalJsonlDiscovery(
+    [rootPadding, ...missingRoots, targetRoot],
+    {
+      recursive: false,
+      matches: (name) => name.endsWith(".jsonl"),
+      maxEntries: 1_000,
+      missingRootsAreEmpty: true,
+      beforeFilesystemStep: (progress) => rootProgress.onProgress(progress),
+    },
+  );
+  await rootDiscovery.collect(automaticCaptureBudget(), {
+    maxFiles: 256, maxEntries: 1_000, maxWallMs: 100,
+  });
+  const rootFirstStatus = rootProgress.status();
+  rootProgress = softCapProgressGate();
+  const rootSecond = await rootDiscovery.collect(automaticCaptureBudget(), {
+    maxFiles: 256, maxEntries: 1_000, maxWallMs: 100,
+  });
+  rootDiscovery.close();
+  check(
+    "discovery_directory_soft_cap_does_not_advance_unadmitted_root",
+    rootFirstStatus.frames === 112 &&
+      rootFirstStatus.blocked[0]?.stage === "discovery_directory" &&
+      rootFirstStatus.blocked[0]?.candidateHash === maintenanceCandidateHash(targetRoot) &&
+      rootSecond.done && rootSecond.files.some((entry) => entry.file === targetRootFile),
+    {
+      capFrames: rootFirstStatus.frames,
+      blockedStage: rootFirstStatus.blocked[0]?.stage,
+      resumedTarget: rootSecond.files.some((entry) => entry.file === targetRootFile),
+    },
+  );
+}
+
+async function proveJsonlOpenSoftCapResume(root: string) {
+  for (const source of ["codex", "claude_code"] as const) {
+    const sourceRoot = path.join(root, `soft-cap-${source}`);
+    const buffer = new LocalEventBuffer(path.join(root, `soft-cap-${source}.sqlite`));
+    const now = new Date();
+    const nowIso = now.toISOString();
+    try {
+      for (const baselineSource of ["codex", "claude_code"] as const) {
+        const began = beginAutomaticCaptureBaseline(buffer.database, baselineSource, {
+          startedAt: nowIso,
+          filesDiscovered: 0,
+        });
+        if (!began.latestRun) throw new Error(`soft_cap_${baselineSource}_baseline_missing`);
+        completeAutomaticCaptureBaseline(buffer.database, baselineSource, {
+          runId: began.latestRun.runId,
+          completedAt: nowIso,
+        });
+      }
+
+      const files = Array.from({ length: 60 }, (_, index) => {
+        const suffix = String(index + 1).padStart(12, "0");
+        const sessionId = `019e8000-0000-7000-8000-${suffix}`;
+        if (source === "codex") {
+          const [year, month, day] = nowIso.slice(0, 10).split("-");
+          const directory = path.join(sourceRoot, year!, month!, day!);
+          fs.mkdirSync(directory, { recursive: true });
+          const file = path.join(directory, `rollout-soft-cap-${sessionId}.jsonl`);
+          fs.writeFileSync(file, `${JSON.stringify({
+            timestamp: nowIso,
+            type: "session_meta",
+            payload: { id: sessionId },
+          })}\n${JSON.stringify({
+            timestamp: nowIso,
+            type: "event_msg",
+            payload: {
+              type: "token_count",
+              info: { total_token_usage: {
+                input_tokens: index + 1,
+                cached_input_tokens: 0,
+                output_tokens: 1,
+                reasoning_output_tokens: 0,
+                total_tokens: index + 2,
+              } },
+              rate_limits: { plan_type: "pro" },
+            },
+          })}\n`);
+          return file;
+        }
+        const directory = path.join(sourceRoot, "proof-project");
+        fs.mkdirSync(directory, { recursive: true });
+        const file = path.join(directory, `${sessionId}.jsonl`);
+        fs.writeFileSync(file, `${JSON.stringify({
+          type: "assistant",
+          sessionId,
+          timestamp: nowIso,
+          message: {
+            id: `soft-cap-${index}`,
+            model: "claude-sonnet-4-20250514",
+            usage: {
+              input_tokens: index + 1,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+              output_tokens: 1,
+            },
+          },
+        })}\n`);
+        return file;
+      });
+
+      const tailer = source === "codex"
+        ? new RolloutTailer(buffer, sourceRoot, () => [])
+        : new TranscriptTailer(buffer, sourceRoot);
+      const scan = async (gate: ReturnType<typeof softCapProgressGate>) => tailer.scan({
+        scope: "recent",
+        now,
+        automatic: { phase: "capture", budget: automaticCaptureBudget() },
+        onProgress: gate.onProgress,
+      } as RolloutScanOptions & TranscriptScanOptions);
+      const firstGate = softCapProgressGate();
+      const first = await scan(firstGate);
+      const deferredBatch = first.filesSeen;
+      const second = await scan(softCapProgressGate());
+      const third = await scan(softCapProgressGate());
+      const fourth = await scan(softCapProgressGate());
+      const eventType = source === "codex" ? "usage_rollout" : "usage_transcript";
+      const storedEvents = (buffer.database.prepare(
+        `select count(*) as count from buffered_events where source = ? and event_type = ?`,
+      ).get(source, eventType) as { count: number }).count;
+      const firstStatus = firstGate.status();
+      check(
+        `${source}_jsonl_open_soft_cap_retains_candidate_batch_until_admitted`,
+        firstStatus.frames === 112 &&
+          firstStatus.blocked.some((entry) => entry.stage === "candidate_metadata") &&
+          firstStatus.blocked.some((entry) => entry.stage === "jsonl_open") &&
+          deferredBatch >= 54 && first.eventsAppended === 0 &&
+          second.eventsAppended === deferredBatch &&
+          second.eventsAppended + third.eventsAppended === files.length &&
+          fourth.eventsAppended === 0 && storedEvents === files.length,
+        {
+          source,
+          capFrames: firstStatus.frames,
+          blockedStages: firstStatus.blocked.map((entry) => entry.stage),
+          deferredBatch,
+          appendedByCadence: [first.eventsAppended, second.eventsAppended, third.eventsAppended, fourth.eventsAppended],
+          storedEvents,
+        },
+      );
+      tailer.close();
+
+      const validationRoot = path.join(root, `validation-cap-${source}`);
+      const validationSession = "019e9000-0000-7000-8000-000000000001";
+      let validationFile: string;
+      if (source === "codex") {
+        const [year, month, day] = nowIso.slice(0, 10).split("-");
+        const directory = path.join(validationRoot, year!, month!, day!);
+        fs.mkdirSync(directory, { recursive: true });
+        validationFile = path.join(directory, `rollout-validation-cap-${validationSession}.jsonl`);
+        fs.writeFileSync(validationFile, `${JSON.stringify({
+          timestamp: nowIso,
+          type: "session_meta",
+          payload: { id: validationSession },
+        })}\n${JSON.stringify({
+          timestamp: nowIso,
+          type: "event_msg",
+          payload: {
+            type: "token_count",
+            info: { total_token_usage: {
+              input_tokens: 7,
+              cached_input_tokens: 0,
+              output_tokens: 1,
+              reasoning_output_tokens: 0,
+              total_tokens: 8,
+            } },
+            rate_limits: { plan_type: "pro" },
+          },
+        })}\n`);
+      } else {
+        fs.mkdirSync(validationRoot, { recursive: true });
+        validationFile = path.join(validationRoot, `${validationSession}.jsonl`);
+        fs.writeFileSync(validationFile, `${JSON.stringify({
+          type: "assistant",
+          sessionId: validationSession,
+          timestamp: nowIso,
+          message: {
+            id: "validation-cap-message",
+            model: "claude-sonnet-4-20250514",
+            usage: {
+              input_tokens: 7,
+              cache_read_input_tokens: 0,
+              cache_creation_input_tokens: 0,
+              output_tokens: 1,
+            },
+          },
+        })}\n`);
+      }
+      const validationTailer = source === "codex"
+        ? new RolloutTailer(buffer, validationRoot, () => [])
+        : new TranscriptTailer(buffer, validationRoot);
+      const validationScan = async (
+        onProgress: NonNullable<TranscriptScanOptions["onProgress"]>,
+      ) => validationTailer.scan({
+          scope: "recent",
+          now,
+          automatic: { phase: "capture", budget: automaticCaptureBudget() },
+          onProgress,
+        } as RolloutScanOptions & TranscriptScanOptions);
+      const validationGate = validationCapProgressGate();
+      const validationFirst = await validationScan(validationGate.onProgress);
+      const validationSecondGate = recordingProgressGate();
+      const validationSecond = await validationScan(validationSecondGate.onProgress);
+      const validationThird = await validationScan(recordingProgressGate().onProgress);
+      const validationStored = (buffer.database.prepare(
+        `select count(*) as count from buffered_events
+         where source = ? and event_type = ? and session_id = ?`,
+      ).get(source, eventType, validationSession) as { count: number }).count;
+      const validationStatus = validationGate.status();
+      check(
+        `${source}_jsonl_validation_cap_retains_candidate_until_cursor_commit`,
+        validationStatus.blocked?.stage === "jsonl_validation" &&
+          validationStatus.blocked.candidateHash === maintenanceCandidateHash(validationFile) &&
+          validationFirst.eventsAppended === 0 &&
+          validationFirst.slicesCommitted === 0 &&
+          validationFirst.readErrors === 0 &&
+          validationFirst.activity.truncated &&
+          validationSecond.eventsAppended === 1 &&
+          validationSecond.slicesCommitted === 1 &&
+          !validationSecondGate.stages.some((stage) =>
+            stage === "discovery_directory" ||
+            stage === "discovery_read" ||
+            stage === "candidate_metadata") &&
+          validationThird.eventsAppended === 0 &&
+          validationStored === 1,
+        {
+          source,
+          blockedStage: validationStatus.blocked?.stage,
+          first: {
+            events: validationFirst.eventsAppended,
+            commits: validationFirst.slicesCommitted,
+            readErrors: validationFirst.readErrors,
+          },
+          nextCadenceStages: validationSecondGate.stages,
+          nextCadenceEvents: validationSecond.eventsAppended,
+          rescanEvents: validationThird.eventsAppended,
+          storedEvents: validationStored,
+        },
+      );
+      validationTailer.close();
+    } finally {
+      buffer.close();
+    }
+  }
+}
+
 async function proveProjectionDutyCycle(){
   let cursor=0,parityCursor=0;
   const highWater=100_000;
@@ -981,6 +1414,8 @@ async function main() {
   try {
     await proveDurableSlowSourceFairness(root);
     await proveCrashResumeBindsExactPendingIdentities(root);
+    await proveDiscoverySoftCapResume(root);
+    await proveJsonlOpenSoftCapResume(root);
     // Reopening proves additive schema/trigger creation is idempotent.
     buffer.close();
     buffer = new LocalEventBuffer(ledger);
