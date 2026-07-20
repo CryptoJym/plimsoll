@@ -455,6 +455,7 @@ export class MaintenanceProcessBoundary {
       this.controlFramesThisChild += 1;
       if (this.controlFramesThisChild > MAINTENANCE_PROTOCOL_MAX_FRAMES_PER_JOB) {
         this.controlFrameLimitExceeded = true;
+        if (!this.accepting || this.state === "stopping" || this.state === "stopped") return;
         this.invalidFrames += 1;
         void this.failProtocol("maintenance_protocol_control_frame_limit");
         return;
@@ -699,6 +700,10 @@ export class MaintenanceProcessBoundary {
   }
 
   private openCircuit(reason: string) {
+    // Shutdown owns a monotonic terminal state. An older async failure may
+    // finish termination after shutdown has already proved stopped/closed;
+    // preserve its recorded receipt, but never reopen the terminal boundary.
+    if (!this.accepting || this.state === "stopping" || this.state === "stopped") return;
     this.failureCount += 1;
     const delay = this.failureCount === 1 ? this.initialCircuitMs() : this.escalatedCircuitMs();
     this.circuitOpenUntilMs = this.now() + delay;

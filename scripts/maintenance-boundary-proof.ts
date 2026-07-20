@@ -792,6 +792,7 @@ async function controlFrameFloodProof() {
   });
   await closedFlood.boundary.run();
   const closedChild = closedFlood.children[0]!;
+  const beforeClosedFlood = closedFlood.boundary.status();
   const stopping = closedFlood.boundary.shutdown();
   for (let index = 0; index < 200; index += 1) {
     closedChild.emit("message", {
@@ -801,17 +802,18 @@ async function controlFrameFloodProof() {
     });
   }
   assert.equal(await stopping, true);
-  await waitFor(
-    () => closedFlood.boundary.status().circuit.failureCount === 1,
-    "closed_flood_circuit",
-  );
+  await tick();
   const closedStatus = closedFlood.boundary.status();
-  assert.equal(closedStatus.protocol.invalidFrames, 1);
-  assert.equal(closedStatus.lastFailure, "maintenance_protocol_control_frame_limit");
+  assert.equal(closedStatus.accepting, false);
+  assert.equal(closedStatus.state, "stopped");
+  assert.equal(closedStatus.stage, "closed");
+  assert.equal(closedStatus.protocol.invalidFrames, beforeClosedFlood.protocol.invalidFrames);
+  assert.equal(closedStatus.lastFailure, beforeClosedFlood.lastFailure);
+  assert.equal(closedStatus.lastOutcome, beforeClosedFlood.lastOutcome);
   assert.equal(closedStatus.childPresent, false);
   assert.equal(closedStatus.reap.reapedChildren, 1);
   assert.equal(closedStatus.reap.orphanRisk, false);
-  assert.equal(closedStatus.circuit.failureCount, 1);
+  assert.equal(closedStatus.circuit.failureCount, beforeClosedFlood.circuit.failureCount);
 
   pass("ready_and_closed_control_frame_floods_fail_closed", {
     injectedReadyFrames: 200,
@@ -822,23 +824,99 @@ async function controlFrameFloodProof() {
     closedFloodReaped: closedStatus.reap.reapedChildren,
     readyCircuitFailures: readyStatus.circuit.failureCount,
     closedCircuitFailures: closedStatus.circuit.failureCount,
+    closedShutdownState: closedStatus.state,
+    closedShutdownStage: closedStatus.stage,
+  });
+}
+
+async function terminalShutdownMonotonicityProof() {
+  let fingerprintCalls = 0;
+  let releaseSignalFingerprint!: (value: string | null) => void;
+  const harness = fakeBoundary((spawnNonce) => {
+    const child = new FakeChild(20_452);
+    child.onSend = (raw) => {
+      const request = raw as MaintenanceRunRequest;
+      if (request.type === "run") {
+        queueMicrotask(() => child.emit("message", resultReceipt(request)));
+      }
+    };
+    ready(child, spawnNonce);
+    return child;
+  }, {
+    fingerprint: async () => {
+      fingerprintCalls += 1;
+      if (fingerprintCalls === 1) return "terminal-race-process";
+      return new Promise<string | null>((resolve) => {
+        releaseSignalFingerprint = resolve;
+      });
+    },
+    termGraceMs: 100,
+  });
+  await harness.boundary.run();
+  const child = harness.children[0]!;
+  child.emit("message", {
+    schema: MAINTENANCE_PROTOCOL_SCHEMA,
+    type: "invalid_control_for_terminal_race",
+  });
+  await waitFor(() => fingerprintCalls === 2, "terminal_race_signal_fingerprint");
+  const failureBeforeShutdown = harness.boundary.status();
+  assert.equal(failureBeforeShutdown.lastOutcome, "failed");
+  assert.equal(failureBeforeShutdown.lastFailure, "maintenance_protocol_invalid");
+  assert.equal(failureBeforeShutdown.circuit.failureCount, 0);
+
+  const stopped = await harness.boundary.shutdown();
+  assert.equal(stopped, true);
+  const terminalBeforeRelease = harness.boundary.status();
+  assert.equal(terminalBeforeRelease.accepting, false);
+  assert.equal(terminalBeforeRelease.state, "stopped");
+  assert.equal(terminalBeforeRelease.stage, "closed");
+
+  releaseSignalFingerprint("terminal-race-process");
+  await waitFor(
+    () => harness.boundary.status().reap.pidMismatches >= 1,
+    "terminal_race_failure_continuation",
+  );
+  await tick();
+  const terminalAfterRelease = harness.boundary.status();
+  assert.equal(terminalAfterRelease.accepting, false);
+  assert.equal(terminalAfterRelease.state, "stopped");
+  assert.equal(terminalAfterRelease.stage, "closed");
+  assert.equal(terminalAfterRelease.lastOutcome, "failed");
+  assert.equal(terminalAfterRelease.lastFailure, "maintenance_protocol_invalid");
+  assert.equal(terminalAfterRelease.circuit.failureCount, 0);
+  assert.equal(terminalAfterRelease.childPresent, false);
+  assert.equal(terminalAfterRelease.reap.orphanRisk, false);
+
+  pass("terminal_shutdown_is_monotonic_after_async_failure", {
+    shutdownReturned: stopped,
+    accepting: terminalAfterRelease.accepting,
+    state: terminalAfterRelease.state,
+    stage: terminalAfterRelease.stage,
+    preexistingFailurePreserved: terminalAfterRelease.lastFailure,
+    postShutdownCircuitFailures: terminalAfterRelease.circuit.failureCount,
+    childPresent: terminalAfterRelease.childPresent,
+    orphanRisk: terminalAfterRelease.reap.orphanRisk,
   });
 }
 
 async function progressStageTimeoutProof() {
-  const stages = [
-    "source_scan",
-    "discovery_directory",
-    "candidate_metadata",
-    "jsonl_open",
-    "jsonl_validation",
-    "git_context",
-  ] as const satisfies readonly MaintenanceProgressStage[];
+  const stageCases = {
+    source_scan: "none",
+    discovery_directory: "sha256",
+    discovery_read: "sha256",
+    candidate_metadata: "sha256",
+    jsonl_open: "sha256",
+    jsonl_validation: "sha256",
+    git_context: "sha256",
+  } as const satisfies Record<MaintenanceProgressStage, "none" | "sha256">;
+  const stages = Object.keys(stageCases) as MaintenanceProgressStage[];
   const stageReceipts: Array<Record<string, unknown>> = [];
 
   for (const [index, stage] of stages.entries()) {
     const privateCandidate = `${PRIVATE_PATH_SENTINEL}/${stage}/candidate.jsonl`;
-    const candidateHash = stage === "source_scan" ? null : maintenanceCandidateHash(privateCandidate);
+    const candidateHash = stageCases[stage] === "none"
+      ? null
+      : maintenanceCandidateHash(privateCandidate);
     const harness = fakeBoundary((spawnNonce) => {
       const child = new FakeChild(20_460 + index);
       child.onSend = (raw) => {
@@ -1275,6 +1353,7 @@ async function main() {
   await shutdownDuringLazyStartupProof();
   await disconnectErrorAndPidReuseProof();
   await controlFrameFloodProof();
+  await terminalShutdownMonotonicityProof();
   await progressStageTimeoutProof();
   staticParentFilesystemIsolationProof();
   await malformedOversizedFrameProof();
