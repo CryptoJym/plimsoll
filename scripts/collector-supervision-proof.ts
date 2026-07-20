@@ -229,9 +229,18 @@ async function startOneShotIdentityOwner(port: number) {
 }
 
 function startCollector(cliPath: string, home: string) {
+  return collectorCommand(cliPath, home, path.dirname(cliPath), "start");
+}
+
+function collectorCommand(
+  cliPath: string,
+  home: string,
+  cwd: string,
+  ...args: string[]
+) {
   return watch(
-    spawn(process.execPath, [cliPath, "start"], {
-      cwd: path.dirname(cliPath),
+    spawn(process.execPath, [cliPath, ...args], {
+      cwd,
       env: { ...process.env, PLIMSOLL_HOME: home },
       stdio: ["ignore", "pipe", "pipe"],
     }),
@@ -239,13 +248,7 @@ function startCollector(cliPath: string, home: string) {
 }
 
 function stopCollector(cliPath: string, home: string, cwd: string) {
-  return watch(
-    spawn(process.execPath, [cliPath, "stop"], {
-      cwd,
-      env: { ...process.env, PLIMSOLL_HOME: home },
-      stdio: ["ignore", "pipe", "pipe"],
-    }),
-  );
+  return collectorCommand(cliPath, home, cwd, "stop");
 }
 
 function launchAgentCommand(
@@ -502,7 +505,8 @@ async function main() {
       ),
       "Inert CLI-shaped process was not blocked by exact runtime identity.",
     );
-    await waitForExit(deniedStop.child);
+    const deniedStopExit = await waitForExit(deniedStop.child);
+    check(deniedStopExit.code !== 0, "Unverified live runtime stop exited successfully.");
     process.kill(inert.pid, 0);
 
     fs.writeFileSync(path.join(inertHome, "collector.pid"), String(inert.pid) + "\n", {
@@ -517,7 +521,8 @@ async function main() {
         ),
       "Legacy PID record was not safely blocked.",
     );
-    await waitForExit(legacyStop.child);
+    const legacyStopExit = await waitForExit(legacyStop.child);
+    check(legacyStopExit.code !== 0, "Legacy PID stop exited successfully.");
     process.kill(inert.pid, 0);
 
     const fakeBin = path.join(tempRoot, "fake-bin");
@@ -718,44 +723,194 @@ async function main() {
       "Post-exit unload lost durable marker truth, skipped final observation, or exposed a path.",
     );
 
+    const blockedStart = startCollector(cliPath, durableHome);
+    children.push(blockedStart);
+    const blockedStartExit = await waitForExit(blockedStart.child);
+    const blockedStartRaw = blockedStart.errors.join("").trim();
+    const blockedStartReceipt = JSON.parse(blockedStartRaw) as Receipt;
+    check(
+      blockedStartExit.code !== 0 &&
+        blockedStartReceipt.status === "error" &&
+        blockedStartReceipt.code === "pid_cleanup_ambiguous" &&
+        typeof blockedStartReceipt.pidPathHash === "string" &&
+        blockedStartReceipt.port === durablePort &&
+        !blockedStartRaw.includes(tempRoot) &&
+        !blockedStartRaw.includes(root) &&
+        !blockedStartRaw.includes(" at "),
+      "Packaged start ownership failure was not stable, path-free JSON with a nonzero exit.",
+    );
+
+    const blockedDoctor = collectorCommand(
+      cliPath,
+      durableHome,
+      root,
+      "doctor",
+      "--read-only",
+      "--json",
+    );
+    children.push(blockedDoctor);
+    const blockedDoctorExit = await waitForExit(blockedDoctor.child);
+    const blockedDoctorRuntime = blockedDoctor.receipts[0]?.runtime as Receipt | undefined;
+    const blockedDoctorReconciliation = blockedDoctorRuntime
+      ?.pidCleanupReconciliation as Receipt | undefined;
+    check(
+      blockedDoctorExit.code !== 0 &&
+        blockedDoctorReconciliation?.disposition === "actor_live" &&
+        blockedDoctorReconciliation.reconciled === false &&
+        fs.existsSync(path.join(durableHome, ".collector.pid.plimsoll-cleanup-marker")),
+      "Read-only doctor did not report the live cleanup actor without mutating its marker.",
+    );
+
+    const reconciledHome = path.join(tempRoot, "dead-actor-reconciliation");
+    const reconciledPort = await availablePort();
+    writeConfig(reconciledHome, reconciledPort);
+    const deadActorProcess = spawn(
+      process.execPath,
+      ["-e", "setInterval(() => {}, 1000)"],
+      { stdio: "ignore" },
+    );
+    check(deadActorProcess.pid, "Could not create cleanup actor fixture.");
+    auxiliaryChildren.push(deadActorProcess);
+    const deadActorIdentity = runtimeIdentity(deadActorProcess.pid);
+    deadActorProcess.kill("SIGTERM");
+    await waitForExit(deadActorProcess);
+    for (let index = 0; index < 1_200; index += 1) {
+      fs.writeFileSync(path.join(reconciledHome, `.unrelated-${index}`), "unrelated\n", {
+        mode: 0o600,
+      });
+    }
+    const reconciledMarkerPath = path.join(
+      reconciledHome,
+      ".collector.pid.plimsoll-cleanup-marker",
+    );
+    fs.writeFileSync(
+      reconciledMarkerPath,
+      JSON.stringify({
+        actor: {
+          pid: deadActorIdentity.pid,
+          processStartFingerprint: deadActorIdentity.processStartFingerprint,
+        },
+        label: LAUNCH_AGENT_LABEL,
+        schema: "plimsoll.collector-pid-cleanup.v2",
+        state: "in_progress",
+        target: durableIdentity,
+        transactionId: randomUUID(),
+      }) + "\n",
+      { mode: 0o600 },
+    );
+
+    const eligibleDoctor = collectorCommand(
+      cliPath,
+      reconciledHome,
+      root,
+      "doctor",
+      "--read-only",
+      "--json",
+    );
+    children.push(eligibleDoctor);
+    const eligibleDoctorExit = await waitForExit(eligibleDoctor.child);
+    const eligibleDoctorRuntime = eligibleDoctor.receipts[0]?.runtime as Receipt | undefined;
+    const eligibleDoctorReconciliation = eligibleDoctorRuntime
+      ?.pidCleanupReconciliation as Receipt | undefined;
+    check(
+      eligibleDoctorExit.code !== 0 &&
+        eligibleDoctorReconciliation?.disposition === "eligible_dead_actor" &&
+        eligibleDoctorReconciliation.eligible === true &&
+        eligibleDoctorReconciliation.reconciled === false &&
+        fs.existsSync(reconciledMarkerPath),
+      "Read-only doctor mutated or misreported an eligible dead-actor marker.",
+    );
+
+    const reconciledStop = stopCollector(cliPath, reconciledHome, root);
+    children.push(reconciledStop);
+    const reconciledStopExit = await waitForExit(reconciledStop.child);
+    const reconciledStopReceipt = reconciledStop.receipts.find(
+      (receipt) => receipt.status === "already_stopped",
+    );
+    check(
+      reconciledStopExit.code === 0 &&
+        reconciledStopReceipt?.stopped === true &&
+        reconciledStopReceipt.reason === null &&
+        reconciledStopReceipt.pidRecordState === "missing" &&
+        reconciledStopReceipt.listenerState === "absent" &&
+        (reconciledStopReceipt.pidCleanupReconciliation as Receipt | undefined)
+          ?.disposition === "marker_cleared" &&
+        !fs.existsSync(reconciledMarkerPath),
+      "Packaged stop did not reconcile the dead actor and prove already-stopped truth.",
+    );
+
+    const cleanMissingStop = stopCollector(cliPath, reconciledHome, root);
+    children.push(cleanMissingStop);
+    const cleanMissingStopExit = await waitForExit(cleanMissingStop.child);
+    const cleanMissingStopReceipt = cleanMissingStop.receipts.find(
+      (receipt) => receipt.status === "already_stopped",
+    );
+    check(
+      cleanMissingStopExit.code === 0 &&
+        cleanMissingStopReceipt?.stopped === true &&
+        cleanMissingStopReceipt.reason === null &&
+        (cleanMissingStopReceipt.pidCleanupReconciliation as Receipt | undefined)
+          ?.disposition === "clean",
+      "Clean missing-PID stop did not return consistent already-stopped JSON and exit zero.",
+    );
+
+    foreignServer = http.createServer((_request, response) => {
+      response.writeHead(404, { "content-type": "text/plain" });
+      response.end("not a collector\n");
+    });
+    await new Promise<void>((resolve, reject) => {
+      foreignServer?.once("error", reject);
+      foreignServer?.listen(reconciledPort, "127.0.0.1", resolve);
+    });
+    const missingPidOccupiedStop = stopCollector(cliPath, reconciledHome, root);
+    children.push(missingPidOccupiedStop);
+    const missingPidOccupiedExit = await waitForExit(missingPidOccupiedStop.child);
+    const missingPidOccupiedReceipt = missingPidOccupiedStop.receipts.find(
+      (receipt) => receipt.stopped === false,
+    );
+    check(
+      missingPidOccupiedExit.code !== 0 &&
+        missingPidOccupiedReceipt?.status === "refused" &&
+        missingPidOccupiedReceipt.reason === "listener_still_present" &&
+        missingPidOccupiedReceipt.pidRecordState === "missing" &&
+        missingPidOccupiedReceipt.listenerState === "unrelated",
+      "Missing PID plus present listener was promoted to success or exited zero.",
+    );
+    await new Promise<void>((resolve, reject) => {
+      foreignServer?.close((error) => (error ? reject(error) : resolve()));
+    });
+    foreignServer = null;
+
     const collisionHome = path.join(tempRoot, "durable-cleanup-collision");
     writeConfig(collisionHome, await availablePort());
     const collisionPidPath = path.join(collisionHome, "collector.pid");
     const collisionOwnerRecord = writePidRecord(collisionHome, durableIdentity, root);
-    const collisionPreserved = path.join(collisionHome, "preserved-owner.pid");
-    const replacementRecord: CollectorPidRecord = {
-      ...collisionOwnerRecord,
-      ...inertIdentity,
-      instanceId: randomUUID(),
-    };
     const collisionCleanup = removeCollectorPidFileIfOwnedDetailed(
       collisionPidPath,
       durableIdentity,
       LAUNCH_AGENT_LABEL,
       {
-        afterPreClaimCheck: () => {
-          fs.renameSync(collisionPidPath, collisionPreserved);
-          fs.writeFileSync(
-            collisionPidPath,
-            JSON.stringify(replacementRecord, null, 2) + "\n",
-            { mode: 0o600 },
-          );
-        },
-        beforeMismatchRestore: () => {
+        afterClaim: () => {
           fs.writeFileSync(collisionPidPath, "operator-collision\n", { mode: 0o600 });
         },
       },
+    );
+    const fixedQuarantinePath = path.join(
+      collisionHome,
+      ".collector.pid.plimsoll-quarantine",
     );
     const collisionPersistent = readCollectorPidCleanupState(
       collisionPidPath,
       LAUNCH_AGENT_LABEL,
     );
     check(
-      collisionCleanup.disposition === "mismatch_quarantined" &&
+      collisionCleanup.disposition === "destination_reappeared" &&
         collisionCleanup.quarantined &&
         collisionPersistent.markerState === "present" &&
         collisionPersistent.quarantineCount === 1 &&
-        fs.readFileSync(collisionPidPath, "utf8") === "operator-collision\n",
+        fs.readFileSync(collisionPidPath, "utf8") === "operator-collision\n" &&
+        fs.readFileSync(fixedQuarantinePath, "utf8") ===
+          JSON.stringify(collisionOwnerRecord, null, 2) + "\n",
       "The marker-plus-collision fixture did not retain its exact quarantine inventory.",
     );
     const collisionStop = stopCollector(cliPath, collisionHome, root);
@@ -1007,6 +1162,10 @@ async function main() {
             "unexpected launchctl exit codes and output remain query_failed",
             "unload receipts are path-free and legacy PID residue is retained",
             "durable cleanup ambiguity survives SIGTERM, stop, and unload process reopen",
+            "packaged start failures are stable path-free JSON with nonzero exit",
+            "doctor reports live and eligible cleanup actors without mutation",
+            "dead actor plus 1200 unrelated files reconciles to already-stopped truth",
+            "missing PID stop exit status matches absent versus present listener truth",
             "marker-plus-collision and missing-PID quarantine remain nonterminal",
             "reused PID fingerprint and expired lock lease both recover",
             "crash-only restart is throttled",

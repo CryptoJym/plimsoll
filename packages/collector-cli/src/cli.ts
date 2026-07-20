@@ -17,6 +17,17 @@ const pidCleanupStateReceipt = (state: CollectorPidCleanupState) => ({
   claimCount: state.claimCount,
   quarantineCount: state.quarantineCount,
   inventoryTruncated: state.inventoryTruncated,
+  unsafeArtifactCount: state.unsafeArtifactCount,
+});
+
+const pidCleanupReconciliationReceipt = (
+  result: CollectorPidCleanupReconciliationResult,
+) => ({
+  reconciled: result.reconciled,
+  eligible: result.eligible,
+  disposition: result.disposition,
+  before: pidCleanupStateReceipt(result.before),
+  after: pidCleanupStateReceipt(result.after),
 });
 
 const pidCleanupAttemptReceipt = (result: CollectorPidCleanupResult | null) =>
@@ -104,6 +115,7 @@ import { uploadBufferedEvents } from "./upload";
 import { runAttributionRepair, runWorkspaceHistoryUpload } from "./upload-history";
 import {
   acquireCollectorStartOwnership,
+  CollectorStartOwnershipError,
   captureLaunchAgentUnloadPriorState,
   createCollectorRuntimeIdentity,
   observeCollectorListener,
@@ -112,6 +124,7 @@ import {
   readCollectorPidCleanupState,
   readCollectorPidFile,
   readProcessStartFingerprint,
+  reconcileCollectorPidCleanupState,
   removeCollectorPidFileIfOwned,
   runtimeIdentityMatches,
   verifyCollectorRuntimeIdentity,
@@ -120,6 +133,7 @@ import {
   type LaunchAgentUnloadPriorState,
   type CollectorPidRecord,
   type CollectorPidCleanupResult,
+  type CollectorPidCleanupReconciliationResult,
   type CollectorPidCleanupState,
   type CollectorRuntimeIdentity,
 } from "./runtime-ownership";
@@ -440,6 +454,9 @@ function unloadPriorReceipt(prior: LaunchAgentUnloadPriorState) {
     pidRecordState: prior.pidRecordKind,
     pidRuntimeIdentity: prior.pidRuntimeIdentity,
     pidCleanup: pidCleanupStateReceipt(prior.pidCleanupState),
+    pidCleanupReconciliation: pidCleanupReconciliationReceipt(
+      prior.pidCleanupReconciliation,
+    ),
     ownership: prior.ownership,
   };
 }
@@ -997,12 +1014,29 @@ async function main() {
   if (command === "start") {
     const pidPath = collectorLogPath("collector.pid");
     const runtimeIdentity = createCollectorRuntimeIdentity();
-    const ownership = await acquireCollectorStartOwnership({
-      candidateIdentity: runtimeIdentity,
-      label: LAUNCH_AGENT_LABEL,
-      pidPath,
-      port: config.port,
-    });
+    let ownership: Awaited<ReturnType<typeof acquireCollectorStartOwnership>>;
+    try {
+      ownership = await acquireCollectorStartOwnership({
+        candidateIdentity: runtimeIdentity,
+        label: LAUNCH_AGENT_LABEL,
+        pidPath,
+        port: config.port,
+      });
+    } catch (error) {
+      console.error(
+        JSON.stringify({
+          status: "error",
+          code:
+            error instanceof CollectorStartOwnershipError
+              ? error.code
+              : "ownership_failed",
+          pidPathHash: privatePathReceipt(pidPath),
+          port: config.port,
+        }),
+      );
+      process.exitCode = 1;
+      return;
+    }
     if (ownership.kind === "already_running") {
       console.log(
         JSON.stringify(
@@ -1566,7 +1600,12 @@ async function main() {
     const launchAgent = readLaunchAgentState(plistPath);
     const connectivity = await checkCollectorConnectivity(config.port);
     const pidRead = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);
-    const pidCleanup = readCollectorPidCleanupState(pidPath, LAUNCH_AGENT_LABEL);
+    const pidCleanupReconciliation = reconcileCollectorPidCleanupState(
+      pidPath,
+      LAUNCH_AGENT_LABEL,
+      { apply: false },
+    );
+    const pidCleanup = pidCleanupReconciliation.after;
     const pidRecord = pidRead.kind === "current" ? pidRead.record : null;
     const runtime = {
       ok: Boolean(
@@ -1578,6 +1617,9 @@ async function main() {
       pidPath,
       pidFileStatus: pidRead.kind,
       pidCleanup: pidCleanupStateReceipt(pidCleanup),
+      pidCleanupReconciliation: pidCleanupReconciliationReceipt(
+        pidCleanupReconciliation,
+      ),
       ownershipVersion: {
         expected: 2,
         actual: pidRecord?.version ?? null,
@@ -2254,7 +2296,11 @@ async function main() {
   if (command === "stop") {
     const pidPath = collectorLogPath("collector.pid");
     const launchAgentStopCommand = launchctlBootoutCommand().join(" ");
-    const initialCleanup = readCollectorPidCleanupState(pidPath, LAUNCH_AGENT_LABEL);
+    const initialReconciliation = reconcileCollectorPidCleanupState(
+      pidPath,
+      LAUNCH_AGENT_LABEL,
+    );
+    const initialCleanup = initialReconciliation.after;
     const pidRead = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);
     if (initialCleanup.ambiguous) {
       const listener = await observeCollectorListener(config.port);
@@ -2272,6 +2318,9 @@ async function main() {
             pidCleaned: false,
             pidRecordState: pidRead.kind,
             pidCleanup: pidCleanupStateReceipt(initialCleanup),
+            pidCleanupReconciliation: pidCleanupReconciliationReceipt(
+              initialReconciliation,
+            ),
             cleanupAttempt: pidCleanupAttemptReceipt(null),
             processState:
               recordedProcessLive === null
@@ -2294,24 +2343,35 @@ async function main() {
     if (pidRead.kind !== "current") {
       const pid = pidRead.kind === "legacy" ? pidRead.pid : null;
       const listener = await observeCollectorListener(config.port);
+      const alreadyStopped = pidRead.kind === "missing" && listener.kind === "absent";
+      const reason = alreadyStopped
+        ? null
+        : pidRead.kind === "legacy"
+          ? "legacy_pid_file_blocked"
+          : pidRead.kind === "invalid"
+            ? "invalid_pid_file"
+            : pidRead.kind === "unsafe"
+              ? "unsafe_pid_file"
+              : listener.kind === "indeterminate"
+                ? "listener_indeterminate"
+                : "listener_still_present";
       console.log(
         JSON.stringify(
           {
-            stopped: false,
-            reason:
-              pidRead.kind === "legacy"
-                ? "legacy_pid_file_blocked"
-                : pidRead.kind === "invalid"
-                  ? "invalid_pid_file"
-                  : "pid_file_missing",
+            stopped: alreadyStopped,
+            status: alreadyStopped ? "already_stopped" : "refused",
+            reason,
             pid,
             pidPathHash: privatePathReceipt(pidPath),
             launchAgentStopCommand,
             pidCleaned: pidRead.kind === "missing",
             pidRecordState: pidRead.kind,
             pidCleanup: pidCleanupStateReceipt(initialCleanup),
+            pidCleanupReconciliation: pidCleanupReconciliationReceipt(
+              initialReconciliation,
+            ),
             cleanupAttempt: pidCleanupAttemptReceipt(null),
-            processState: "unknown",
+            processState: pidRead.kind === "missing" ? "not_present" : "unknown",
             listenerState: listener.kind,
             listenerRuntimeIdentity:
               listener.kind === "collector" ? listener.runtimeIdentity : null,
@@ -2321,6 +2381,7 @@ async function main() {
           2,
         ),
       );
+      if (!alreadyStopped) process.exitCode = 1;
       return;
     }
 
@@ -2354,6 +2415,9 @@ async function main() {
             pidCleaned,
             pidRecordState: after.kind,
             pidCleanup: pidCleanupStateReceipt(persistentCleanup),
+            pidCleanupReconciliation: pidCleanupReconciliationReceipt(
+              initialReconciliation,
+            ),
             cleanupAttempt: pidCleanupAttemptReceipt(cleanupAttempt),
             processState: "not_live",
             listenerState: listener.kind,
@@ -2390,6 +2454,9 @@ async function main() {
             pidCleaned: false,
             pidRecordState: pidRead.kind,
             pidCleanup: pidCleanupStateReceipt(initialCleanup),
+            pidCleanupReconciliation: pidCleanupReconciliationReceipt(
+              initialReconciliation,
+            ),
             cleanupAttempt: pidCleanupAttemptReceipt(null),
             processState: processLive ? "live" : "not_live",
             listenerState: listener.kind,
@@ -2402,6 +2469,7 @@ async function main() {
           2,
         ),
       );
+      process.exitCode = 1;
       return;
     }
 
@@ -2453,6 +2521,9 @@ async function main() {
                 pidCleaned: true,
                 pidRecordState: lastPidRead.kind,
                 pidCleanup: pidCleanupStateReceipt(lastPersistentCleanup),
+                pidCleanupReconciliation: pidCleanupReconciliationReceipt(
+                  initialReconciliation,
+                ),
                 cleanupAttempt: pidCleanupAttemptReceipt(lastCleanupAttempt),
                 processState: "not_live",
                 listenerState: lastListener.kind,
@@ -2488,6 +2559,9 @@ async function main() {
             pidCleaned: false,
             pidRecordState: lastPidRead.kind,
             pidCleanup: pidCleanupStateReceipt(lastPersistentCleanup),
+            pidCleanupReconciliation: pidCleanupReconciliationReceipt(
+              initialReconciliation,
+            ),
             cleanupAttempt: pidCleanupAttemptReceipt(lastCleanupAttempt),
             processState: processLive ? "live" : "not_live",
             listenerState: lastListener.kind,
@@ -2527,6 +2601,9 @@ async function main() {
               !persistentCleanup.ambiguous,
             pidRecordState: after.kind,
             pidCleanup: pidCleanupStateReceipt(persistentCleanup),
+            pidCleanupReconciliation: pidCleanupReconciliationReceipt(
+              initialReconciliation,
+            ),
             cleanupAttempt: pidCleanupAttemptReceipt(cleanupAttempt),
             processState: processLive ? "live" : "not_live",
             listenerState: listener.kind,

@@ -5,7 +5,7 @@
     {
       "name": "install_doctor",
       "kind": "json_result",
-      "expectedArtifactDigest": "sha256:d36111b4ad112999b0c5153be3ae1da560a942969afc501c985c351f16fc0597"
+      "expectedArtifactDigest": "sha256:2a072d0e18ff10f1c9e5ce6d4ea84b89eaa7fc25844f6ad0a3a741d69d08e43b"
     },
     {
       "name": "transactional_join",
@@ -30,7 +30,7 @@
     {
       "name": "launch_agent_unload_terminal_truth",
       "kind": "json_result",
-      "expectedArtifactDigest": "sha256:2b5e8eedca193c872b70800434eeb27894324ed89e4ff01f5ce2bfbc6ffb08ad"
+      "expectedArtifactDigest": "sha256:94c3a3b799a540d3ca58f8f5e0e2d9071208c2bb726356ef4645c170d2210a4c"
     }
   ]
 }

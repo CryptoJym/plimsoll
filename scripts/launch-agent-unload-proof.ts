@@ -10,6 +10,7 @@ import {
   observeLaunchAgentUnloadTerminalState,
   readCollectorPidCleanupState,
   readCollectorPidFile,
+  reconcileCollectorPidCleanupState,
   removeCollectorPidFileIfOwned,
   removeCollectorPidFileIfOwnedDetailed,
   runtimeIdentityMatches,
@@ -26,6 +27,25 @@ const LABEL = "com.plimsoll.collector";
 const PID_PATH = "/fixture/collector.pid";
 const PORT = 48_271;
 
+function cleanupSlots(pidPath: string) {
+  const directory = path.dirname(pidPath);
+  const basename = path.basename(pidPath);
+  return {
+    marker: path.join(directory, `.${basename}.plimsoll-cleanup-marker`),
+    pidClaim: path.join(directory, `.${basename}.plimsoll-remove-claim`),
+    markerClaim: path.join(directory, `.${basename}.plimsoll-cleanup-marker-claim`),
+    quarantine: path.join(directory, `.${basename}.plimsoll-quarantine`),
+  };
+}
+
+function makeMarkerActorDead(markerPath: string) {
+  const marker = JSON.parse(fs.readFileSync(markerPath, "utf8")) as {
+    actor: { pid: number; processStartFingerprint: string };
+  };
+  marker.actor.processStartFingerprint = `sha256:${"0".repeat(64)}`;
+  fs.writeFileSync(markerPath, `${JSON.stringify(marker)}\n`, { mode: 0o600 });
+}
+
 function fixtureCleanupResult(removed: boolean): CollectorPidCleanupResult {
   return {
     removed,
@@ -37,6 +57,7 @@ function fixtureCleanupResult(removed: boolean): CollectorPidCleanupResult {
       claimCount: 0,
       quarantineCount: 0,
       inventoryTruncated: false,
+      unsafeArtifactCount: 0,
     },
     disposition: removed ? "removed" : "not_owned",
   };
@@ -522,6 +543,15 @@ async function main() {
         readCollectorPidFile(swapPid, LABEL).kind === "current",
       "The no-follow preclaim identity check leaves the exact regular replacement visible.",
     );
+    const liveMarkerReconciliation = reconcileCollectorPidCleanupState(swapPid, LABEL);
+    check(
+      "live_cleanup_actor_marker_refuses_reconciliation",
+      !liveMarkerReconciliation.reconciled &&
+        !liveMarkerReconciliation.eligible &&
+        liveMarkerReconciliation.disposition === "actor_live" &&
+        liveMarkerReconciliation.after.markerState === "present",
+      "A marker owned by the still-live exact cleanup actor remains explicit ambiguity.",
+    );
 
     const midSymlinkPid = path.join(pidFixtureRoot, "mid-symlink.pid");
     const midSymlinkOwner = path.join(pidFixtureRoot, "mid-symlink-owner.pid");
@@ -586,27 +616,20 @@ async function main() {
     );
 
     const collisionPid = path.join(pidFixtureRoot, "collision.pid");
-    const collisionOwner = path.join(pidFixtureRoot, "collision-owner.pid");
     const collisionBytes = "operator-collision\n";
     fs.writeFileSync(collisionPid, ownedRaw, { mode: 0o600 });
-    let movedReplacementInode = 0;
     const collisionCleanup = removeCollectorPidFileIfOwnedDetailed(
       collisionPid,
       owner,
       LABEL,
       {
-        afterPreClaimCheck: () => {
-          fs.renameSync(collisionPid, collisionOwner);
-          fs.writeFileSync(collisionPid, foreignRaw, { mode: 0o600 });
-          movedReplacementInode = fs.lstatSync(collisionPid).ino;
-        },
-        beforeMismatchRestore: () => {
+        afterClaim: () => {
           fs.writeFileSync(collisionPid, collisionBytes, { mode: 0o600 });
         },
       },
     );
     const collisionQuarantines = fs.readdirSync(pidFixtureRoot).filter((entry) =>
-      entry.startsWith(`.${path.basename(collisionPid)}.plimsoll-quarantine-`)
+      entry === `.${path.basename(collisionPid)}.plimsoll-quarantine`
     );
     const collisionCleanupState = readCollectorPidCleanupState(collisionPid, LABEL);
     const quarantinedReplacement = collisionQuarantines[0]
@@ -617,15 +640,164 @@ async function main() {
       !collisionCleanup.removed &&
         collisionCleanup.ambiguous &&
         collisionCleanup.quarantined &&
-        collisionCleanup.disposition === "mismatch_quarantined" &&
+        collisionCleanup.disposition === "destination_reappeared" &&
         collisionCleanupState.markerState === "present" &&
         collisionCleanupState.quarantineCount === 1 &&
         fs.readFileSync(collisionPid, "utf8") === collisionBytes &&
         collisionQuarantines.length === 1 &&
-        fs.lstatSync(quarantinedReplacement).ino === movedReplacementInode &&
-        fs.readFileSync(quarantinedReplacement, "utf8") === foreignRaw &&
-        fs.readFileSync(collisionOwner, "utf8") === ownedRaw,
-      "A restore collision is retained literally: visible collision plus exact quarantined replacement.",
+        fs.readFileSync(quarantinedReplacement, "utf8") === ownedRaw,
+      "A destination collision is retained literally beside the fixed exact owned-record quarantine.",
+    );
+    makeMarkerActorDead(cleanupSlots(collisionPid).marker);
+    const quarantinedReconciliation = reconcileCollectorPidCleanupState(
+      collisionPid,
+      LABEL,
+    );
+    check(
+      "claim_or_quarantine_never_auto_reconciles",
+      !quarantinedReconciliation.reconciled &&
+        quarantinedReconciliation.disposition === "quarantine_present" &&
+        quarantinedReconciliation.after.quarantineCount === 1 &&
+        fs.readFileSync(collisionPid, "utf8") === collisionBytes &&
+        fs.readFileSync(quarantinedReplacement, "utf8") === ownedRaw,
+      "Even a dead actor cannot clear a quarantine or reinterpret the visible PID collision.",
+    );
+
+    const deadMarkerPid = path.join(pidFixtureRoot, "dead-marker.pid");
+    const deadMarkerPreserved = path.join(pidFixtureRoot, "dead-marker-preserved.pid");
+    fs.writeFileSync(deadMarkerPid, ownedRaw, { mode: 0o600 });
+    const deadMarkerCleanup = removeCollectorPidFileIfOwnedDetailed(
+      deadMarkerPid,
+      owner,
+      LABEL,
+      { beforeClaim: () => fs.renameSync(deadMarkerPid, deadMarkerPreserved) },
+    );
+    const deadMarkerSlots = cleanupSlots(deadMarkerPid);
+    makeMarkerActorDead(deadMarkerSlots.marker);
+    fs.writeFileSync(deadMarkerPid, foreignRaw, { mode: 0o600 });
+    const visibleBeforeReconciliation = {
+      inode: fs.lstatSync(deadMarkerPid).ino,
+      raw: fs.readFileSync(deadMarkerPid, "utf8"),
+    };
+    const deadMarkerReconciliation = reconcileCollectorPidCleanupState(
+      deadMarkerPid,
+      LABEL,
+    );
+    check(
+      "dead_marker_only_actor_reconciles_without_touching_visible_pid",
+      deadMarkerCleanup.disposition === "preclaim_changed" &&
+        deadMarkerReconciliation.reconciled &&
+        deadMarkerReconciliation.disposition === "marker_cleared" &&
+        !deadMarkerReconciliation.after.ambiguous &&
+        fs.lstatSync(deadMarkerPid).ino === visibleBeforeReconciliation.inode &&
+        fs.readFileSync(deadMarkerPid, "utf8") === visibleBeforeReconciliation.raw &&
+        fs.readFileSync(deadMarkerPreserved, "utf8") === ownedRaw,
+      "Only the exact unchanged dead-actor marker is cleared; visible PID identity and bytes are untouched.",
+    );
+
+    const markerRacePid = path.join(pidFixtureRoot, "marker-race.pid");
+    const markerRacePreservedPid = path.join(pidFixtureRoot, "marker-race-preserved.pid");
+    fs.writeFileSync(markerRacePid, ownedRaw, { mode: 0o600 });
+    removeCollectorPidFileIfOwnedDetailed(markerRacePid, owner, LABEL, {
+      beforeClaim: () => fs.renameSync(markerRacePid, markerRacePreservedPid),
+    });
+    const markerRaceSlots = cleanupSlots(markerRacePid);
+    makeMarkerActorDead(markerRaceSlots.marker);
+    const markerRaceOriginal = path.join(pidFixtureRoot, "marker-race-original");
+    const markerRaceReconciliation = reconcileCollectorPidCleanupState(
+      markerRacePid,
+      LABEL,
+      {
+        hooks: {
+          beforeMarkerClaim: () => {
+            fs.renameSync(markerRaceSlots.marker, markerRaceOriginal);
+            fs.writeFileSync(markerRaceSlots.marker, "replacement-marker\n", { mode: 0o600 });
+          },
+        },
+      },
+    );
+    check(
+      "marker_replacement_before_claim_fails_closed",
+      !markerRaceReconciliation.reconciled &&
+        markerRaceReconciliation.disposition === "clear_race" &&
+        markerRaceReconciliation.after.markerState === "unsafe" &&
+        fs.readFileSync(markerRaceSlots.marker, "utf8") === "replacement-marker\n" &&
+        fs.existsSync(markerRaceOriginal),
+      "Reconciliation never deletes a marker-path replacement or claims it as the dead actor's marker.",
+    );
+
+    const clearRacePid = path.join(pidFixtureRoot, "clear-race.pid");
+    const clearRacePreservedPid = path.join(pidFixtureRoot, "clear-race-preserved.pid");
+    fs.writeFileSync(clearRacePid, ownedRaw, { mode: 0o600 });
+    removeCollectorPidFileIfOwnedDetailed(clearRacePid, owner, LABEL, {
+      beforeClaim: () => fs.renameSync(clearRacePid, clearRacePreservedPid),
+    });
+    const clearRaceSlots = cleanupSlots(clearRacePid);
+    makeMarkerActorDead(clearRaceSlots.marker);
+    const clearRaceOriginal = path.join(pidFixtureRoot, "clear-race-original");
+    const clearRaceReconciliation = reconcileCollectorPidCleanupState(
+      clearRacePid,
+      LABEL,
+      {
+        hooks: {
+          beforeClear: () => {
+            fs.renameSync(clearRaceSlots.markerClaim, clearRaceOriginal);
+            fs.writeFileSync(clearRaceSlots.markerClaim, "replacement-claim\n", { mode: 0o600 });
+          },
+        },
+      },
+    );
+    check(
+      "marker_claim_replacement_before_clear_fails_closed",
+      !clearRaceReconciliation.reconciled &&
+        clearRaceReconciliation.disposition === "clear_race" &&
+        clearRaceReconciliation.after.claimCount === 1 &&
+        clearRaceReconciliation.after.unsafeArtifactCount === 1 &&
+        fs.readFileSync(clearRaceSlots.markerClaim, "utf8") === "replacement-claim\n" &&
+        fs.existsSync(clearRaceOriginal),
+      "The exact marker claim is reverified before unlink; a replacement remains explicit ambiguity.",
+    );
+
+    const markerClaimPid = path.join(pidFixtureRoot, "marker-claim-only.pid");
+    const markerClaimPreservedPid = path.join(
+      pidFixtureRoot,
+      "marker-claim-only-preserved.pid",
+    );
+    fs.writeFileSync(markerClaimPid, ownedRaw, { mode: 0o600 });
+    removeCollectorPidFileIfOwnedDetailed(markerClaimPid, owner, LABEL, {
+      beforeClaim: () => fs.renameSync(markerClaimPid, markerClaimPreservedPid),
+    });
+    const markerClaimSlots = cleanupSlots(markerClaimPid);
+    makeMarkerActorDead(markerClaimSlots.marker);
+    fs.renameSync(markerClaimSlots.marker, markerClaimSlots.markerClaim);
+    const markerClaimReconciliation = reconcileCollectorPidCleanupState(
+      markerClaimPid,
+      LABEL,
+    );
+    check(
+      "dead_marker_claim_only_actor_reconciles_exact_slot",
+      markerClaimReconciliation.reconciled &&
+        markerClaimReconciliation.disposition === "marker_claim_cleared" &&
+        !markerClaimReconciliation.after.ambiguous &&
+        fs.readFileSync(markerClaimPreservedPid, "utf8") === ownedRaw,
+      "A valid dead-actor marker claim is cleared only from its exact fixed slot.",
+    );
+
+    const fixedClaimPid = path.join(pidFixtureRoot, "fixed-claim.pid");
+    const fixedClaimSlots = cleanupSlots(fixedClaimPid);
+    fs.writeFileSync(fixedClaimSlots.pidClaim, ownedRaw, { mode: 0o600 });
+    const fixedClaimState = readCollectorPidCleanupState(fixedClaimPid, LABEL);
+    const fixedClaimReconciliation = reconcileCollectorPidCleanupState(
+      fixedClaimPid,
+      LABEL,
+    );
+    check(
+      "matching_fixed_claim_slot_is_counted_and_never_auto_cleared",
+      fixedClaimState.ambiguous &&
+        fixedClaimState.claimCount === 1 &&
+        fixedClaimReconciliation.disposition === "pid_claim_present" &&
+        fs.readFileSync(fixedClaimSlots.pidClaim, "utf8") === ownedRaw,
+      "The exact PID-claim slot counts immediately and is never reconciled as marker-only residue.",
     );
 
     const aggregateSymlinkPid = path.join(pidFixtureRoot, "aggregate-symlink.pid");
@@ -751,7 +923,7 @@ async function main() {
     );
 
     const boundedPid = path.join(pidFixtureRoot, "bounded-inventory.pid");
-    for (let index = 0; index < 257; index += 1) {
+    for (let index = 0; index < 1_200; index += 1) {
       fs.writeFileSync(
         path.join(pidFixtureRoot, `bounded-entry-${String(index).padStart(3, "0")}`),
         "fixture\n",
@@ -760,9 +932,13 @@ async function main() {
     }
     const boundedCleanupState = readCollectorPidCleanupState(boundedPid, LABEL);
     check(
-      "cleanup_inventory_is_bounded_and_fails_closed",
-      boundedCleanupState.ambiguous && boundedCleanupState.inventoryTruncated,
-      "A directory beyond the fixed 256-entry inventory bound remains ambiguous instead of hiding later artifacts.",
+      "unrelated_home_entries_do_not_consume_cleanup_inventory",
+      !boundedCleanupState.ambiguous &&
+        !boundedCleanupState.inventoryTruncated &&
+        boundedCleanupState.claimCount === 0 &&
+        boundedCleanupState.quarantineCount === 0 &&
+        boundedCleanupState.unsafeArtifactCount === 0,
+      "Twelve hundred unrelated entries do not affect the four exact cleanup artifact slots.",
     );
   } finally {
     fs.rmSync(pidFixtureRoot, { recursive: true, force: true });

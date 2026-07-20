@@ -37,6 +37,7 @@ export type LaunchAgentUnloadPriorState = Readonly<{
   pidRecordKind: CollectorPidFileRead["kind"];
   pidRuntimeIdentity: CollectorRuntimeIdentity | null;
   pidCleanupState: CollectorPidCleanupState;
+  pidCleanupReconciliation: CollectorPidCleanupReconciliationResult;
 }>;
 
 export type LaunchAgentUnloadState =
@@ -150,6 +151,31 @@ export type CollectorPidCleanupState = Readonly<{
   claimCount: number;
   quarantineCount: number;
   inventoryTruncated: boolean;
+  unsafeArtifactCount: number;
+}>;
+
+export type CollectorPidCleanupReconciliationResult = Readonly<{
+  reconciled: boolean;
+  eligible: boolean;
+  disposition:
+    | "clean"
+    | "eligible_dead_actor"
+    | "actor_live"
+    | "actor_indeterminate"
+    | "pid_claim_present"
+    | "quarantine_present"
+    | "unsafe_artifact"
+    | "multiple_marker_slots"
+    | "marker_cleared"
+    | "marker_claim_cleared"
+    | "clear_race";
+  before: CollectorPidCleanupState;
+  after: CollectorPidCleanupState;
+}>;
+
+export type CollectorPidCleanupReconciliationHooks = Readonly<{
+  beforeMarkerClaim?: () => void;
+  beforeClear?: () => void;
 }>;
 
 export type CollectorPidCleanupHooks = Readonly<{
@@ -501,188 +527,294 @@ export function removeCollectorPidFileIfOwned(
   return removeCollectorPidFileIfOwnedDetailed(pidPath, identity, label, hooks);
 }
 
-const PID_CLEANUP_INVENTORY_LIMIT = 256;
+const CLEANUP_ARTIFACT_MAX_BYTES = 256 * 1024;
 
-type CleanupMarker = Readonly<{
+type CleanupArtifact = Readonly<{
   path: string;
   raw: string;
   fileIdentity: PidFileIdentity;
 }>;
 
-type CleanupMarkerClaim = CleanupMarker;
+type CleanupMarkerRecord = Readonly<{
+  actor: ProcessIdentity;
+  label: string;
+  schema: "plimsoll.collector-pid-cleanup.v2";
+  state: "in_progress";
+  target: CollectorRuntimeIdentity;
+  transactionId: string;
+}>;
+
+type CleanupMarkerInspection =
+  | { kind: "missing" }
+  | { kind: "unsafe" }
+  | ({ kind: "present"; record: CleanupMarkerRecord } & CleanupArtifact);
+
+type CleanupSlotInspection =
+  | { kind: "missing" }
+  | { kind: "unsafe" }
+  | ({ kind: "present" } & CleanupArtifact);
 
 function cleanupArtifactNames(pidPath: string) {
   const absolutePath = path.resolve(pidPath);
+  const directory = path.dirname(absolutePath);
   const basename = path.basename(absolutePath);
   return {
     absolutePath,
-    directory: path.dirname(absolutePath),
-    markerPath: path.join(path.dirname(absolutePath), `.${basename}.plimsoll-cleanup-marker`),
-    pidClaimPrefix: `.${basename}.plimsoll-remove-`,
-    quarantinePrefix: `.${basename}.plimsoll-quarantine-`,
-    markerClaimPrefix: `.${basename}.plimsoll-cleanup-marker-remove-`,
+    markerPath: path.join(directory, `.${basename}.plimsoll-cleanup-marker`),
+    pidClaimPath: path.join(directory, `.${basename}.plimsoll-remove-claim`),
+    markerClaimPath: path.join(directory, `.${basename}.plimsoll-cleanup-marker-claim`),
+    quarantinePath: path.join(directory, `.${basename}.plimsoll-quarantine`),
   };
 }
 
-function cleanupMarkerState(markerPath: string, label: string): CollectorPidCleanupState["markerState"] {
-  const inspected = inspectCollectorPidFile(markerPath);
-  if (inspected.kind === "missing") return "missing";
-  if (inspected.kind !== "safe") return "unsafe";
-  try {
-    const parsed = JSON.parse(inspected.raw) as Record<string, unknown>;
-    return Object.keys(parsed).sort().join("|") ===
-        "label|schema|state|transactionId" &&
-      parsed.schema === "plimsoll.collector-pid-cleanup.v1" &&
-      parsed.state === "in_progress" &&
-      parsed.label === label &&
-      typeof parsed.transactionId === "string" &&
-      parsed.transactionId.length >= 32
-      ? "present"
-      : "unsafe";
-  } catch {
-    return "unsafe";
+function inspectCleanupSlot(slotPath: string): CleanupSlotInspection {
+  const inspected = inspectCollectorPidFile(slotPath);
+  if (inspected.kind === "missing") return inspected;
+  if (inspected.kind !== "safe" || inspected.fileIdentity.size > CLEANUP_ARTIFACT_MAX_BYTES) {
+    return { kind: "unsafe" };
   }
+  return {
+    kind: "present",
+    path: slotPath,
+    raw: inspected.raw,
+    fileIdentity: inspected.fileIdentity,
+  };
+}
+
+function validProcessIdentity(value: unknown): value is ProcessIdentity {
+  const identity = value as Partial<ProcessIdentity> | null | undefined;
+  return Boolean(
+    identity &&
+      Number.isInteger(identity.pid) &&
+      (identity.pid ?? 0) > 0 &&
+      typeof identity.processStartFingerprint === "string" &&
+      identity.processStartFingerprint.startsWith("sha256:"),
+  );
+}
+
+function inspectCleanupMarker(slotPath: string, label: string): CleanupMarkerInspection {
+  const inspected = inspectCleanupSlot(slotPath);
+  if (inspected.kind !== "present") return inspected;
+  try {
+    const parsed = JSON.parse(inspected.raw) as Partial<CleanupMarkerRecord>;
+    if (
+      Object.keys(parsed).sort().join("|") !==
+        "actor|label|schema|state|target|transactionId" ||
+      parsed.schema !== "plimsoll.collector-pid-cleanup.v2" ||
+      parsed.state !== "in_progress" ||
+      parsed.label !== label ||
+      typeof parsed.transactionId !== "string" ||
+      !/^[0-9a-f-]{36}$/.test(parsed.transactionId) ||
+      !validProcessIdentity(parsed.actor) ||
+      !validRuntimeIdentity(parsed.target)
+    ) {
+      return { kind: "unsafe" };
+    }
+    return { ...inspected, record: parsed as CleanupMarkerRecord };
+  } catch {
+    return { kind: "unsafe" };
+  }
+}
+
+function inspectCleanupArtifacts(pidPath: string, label: string) {
+  const names = cleanupArtifactNames(pidPath);
+  const marker = inspectCleanupMarker(names.markerPath, label);
+  const pidClaim = inspectCleanupSlot(names.pidClaimPath);
+  const markerClaim = inspectCleanupMarker(names.markerClaimPath, label);
+  const quarantine = inspectCleanupSlot(names.quarantinePath);
+  const markerState = marker.kind === "missing"
+    ? "missing" as const
+    : marker.kind === "present"
+      ? "present" as const
+      : "unsafe" as const;
+  const claimCount = Number(pidClaim.kind !== "missing") + Number(markerClaim.kind !== "missing");
+  const quarantineCount = Number(quarantine.kind !== "missing");
+  const unsafeArtifactCount = [marker, pidClaim, markerClaim, quarantine]
+    .filter((artifact) => artifact.kind === "unsafe").length;
+  const state: CollectorPidCleanupState = Object.freeze({
+    ambiguous:
+      markerState !== "missing" || claimCount > 0 || quarantineCount > 0,
+    markerState,
+    claimCount,
+    quarantineCount,
+    inventoryTruncated: false,
+    unsafeArtifactCount,
+  });
+  return { names, marker, pidClaim, markerClaim, quarantine, state };
 }
 
 export function readCollectorPidCleanupState(
   pidPath: string,
   label: string,
 ): CollectorPidCleanupState {
-  const names = cleanupArtifactNames(pidPath);
-  const ancestors = inspectPidAncestors(names.absolutePath);
-  if (ancestors.kind === "unsafe") {
-    return Object.freeze({
-      ambiguous: true,
-      markerState: "unsafe" as const,
-      claimCount: 0,
-      quarantineCount: 0,
-      inventoryTruncated: true,
-    });
-  }
-  if (ancestors.kind === "missing") {
-    return Object.freeze({
-      ambiguous: false,
-      markerState: "missing" as const,
-      claimCount: 0,
-      quarantineCount: 0,
-      inventoryTruncated: false,
-    });
-  }
-
-  const markerState = cleanupMarkerState(names.markerPath, label);
-  let claimCount = 0;
-  let quarantineCount = 0;
-  let inventoryTruncated = false;
-  let directory: fs.Dir | undefined;
-  try {
-    directory = fs.opendirSync(names.directory);
-    let scanned = 0;
-    while (scanned < PID_CLEANUP_INVENTORY_LIMIT) {
-      const entry = directory.readSync();
-      if (!entry) break;
-      scanned += 1;
-      if (
-        entry.name.startsWith(names.pidClaimPrefix) ||
-        entry.name.startsWith(names.markerClaimPrefix)
-      ) {
-        claimCount += 1;
-      } else if (entry.name.startsWith(names.quarantinePrefix)) {
-        quarantineCount += 1;
-      }
-    }
-    if (scanned === PID_CLEANUP_INVENTORY_LIMIT) {
-      inventoryTruncated = directory.readSync() !== null;
-    }
-  } catch {
-    inventoryTruncated = true;
-  } finally {
-    try {
-      directory?.closeSync();
-    } catch {
-      inventoryTruncated = true;
-    }
-  }
-  return Object.freeze({
-    ambiguous:
-      markerState !== "missing" ||
-      claimCount > 0 ||
-      quarantineCount > 0 ||
-      inventoryTruncated,
-    markerState,
-    claimCount,
-    quarantineCount,
-    inventoryTruncated,
-  });
+  return inspectCleanupArtifacts(pidPath, label).state;
 }
 
-function createCleanupMarker(pidPath: string, label: string): CleanupMarker | null {
+function createCleanupMarker(
+  pidPath: string,
+  label: string,
+  target: CollectorRuntimeIdentity,
+): CleanupArtifact | null {
+  const actorFingerprint = readProcessStartFingerprint(process.pid);
+  if (!actorFingerprint) return null;
   const names = cleanupArtifactNames(pidPath);
   const raw = `${JSON.stringify({
-    schema: "plimsoll.collector-pid-cleanup.v1",
-    state: "in_progress",
+    actor: { pid: process.pid, processStartFingerprint: actorFingerprint },
     label,
+    schema: "plimsoll.collector-pid-cleanup.v2",
+    state: "in_progress",
+    target,
     transactionId: randomUUID(),
-  })}\n`;
+  } satisfies CleanupMarkerRecord)}\n`;
   try {
     fs.writeFileSync(names.markerPath, raw, { flag: "wx", mode: 0o600 });
-    const inspected = inspectCollectorPidFile(names.markerPath);
-    if (inspected.kind !== "safe" || inspected.raw !== raw) return null;
-    return {
-      path: names.markerPath,
-      raw,
-      fileIdentity: inspected.fileIdentity,
-    };
+    const inspected = inspectCleanupMarker(names.markerPath, label);
+    if (inspected.kind !== "present" || inspected.raw !== raw) return null;
+    return inspected;
   } catch {
     return null;
   }
 }
 
-function claimExactCleanupMarker(marker: CleanupMarker): CleanupMarkerClaim | null {
-  const claimPath = `${marker.path}-remove-${randomUUID()}`;
+function claimExactArtifact(
+  source: CleanupArtifact,
+  destinationPath: string,
+): CleanupArtifact | null {
   try {
-    const before = inspectCollectorPidFile(marker.path);
+    const before = inspectCleanupSlot(source.path);
     if (
-      before.kind !== "safe" ||
-      !samePidFileIdentity(marker.fileIdentity, before.fileIdentity) ||
-      before.raw !== marker.raw
+      before.kind !== "present" ||
+      !samePidFileIdentity(source.fileIdentity, before.fileIdentity) ||
+      before.raw !== source.raw ||
+      lstatPidPath(destinationPath)
     ) {
       return null;
     }
-    fs.renameSync(marker.path, claimPath);
-    const claimed = inspectCollectorPidFile(claimPath);
+    fs.writeFileSync(destinationPath, source.raw, { flag: "wx", mode: 0o600 });
+    const destination = inspectCleanupSlot(destinationPath);
+    const sourceBeforeUnlink = inspectCleanupSlot(source.path);
     if (
-      claimed.kind !== "safe" ||
-      !samePidFileObject(marker.fileIdentity, claimed.fileIdentity) ||
-      claimed.raw !== marker.raw ||
-      lstatPidPath(marker.path)
+      destination.kind !== "present" ||
+      destination.raw !== source.raw ||
+      sourceBeforeUnlink.kind !== "present" ||
+      !samePidFileIdentity(source.fileIdentity, sourceBeforeUnlink.fileIdentity) ||
+      sourceBeforeUnlink.raw !== source.raw
     ) {
       return null;
     }
-    return {
-      path: claimPath,
-      raw: marker.raw,
-      fileIdentity: claimed.fileIdentity,
-    };
+    fs.unlinkSync(source.path);
+    const claimed = inspectCleanupSlot(destinationPath);
+    return !lstatPidPath(source.path) &&
+      claimed.kind === "present" &&
+      claimed.raw === source.raw
+      ? claimed
+      : null;
   } catch {
     return null;
   }
 }
 
-function clearExactCleanupMarkerClaim(marker: CleanupMarkerClaim) {
+function clearExactArtifact(artifact: CleanupArtifact) {
   try {
-    const claimed = inspectCollectorPidFile(marker.path);
+    const current = inspectCleanupSlot(artifact.path);
     if (
-      claimed.kind !== "safe" ||
-      !samePidFileIdentity(marker.fileIdentity, claimed.fileIdentity) ||
-      claimed.raw !== marker.raw
+      current.kind !== "present" ||
+      !samePidFileIdentity(artifact.fileIdentity, current.fileIdentity) ||
+      current.raw !== artifact.raw
     ) {
       return false;
     }
-    fs.unlinkSync(marker.path);
-    return !lstatPidPath(marker.path);
+    fs.unlinkSync(artifact.path);
+    return !lstatPidPath(artifact.path);
   } catch {
     return false;
   }
+}
+
+function processIdentityState(identity: ProcessIdentity): "live" | "not_live" | "indeterminate" {
+  try {
+    process.kill(identity.pid, 0);
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH" ? "not_live" : "indeterminate";
+  }
+  const fingerprint = readProcessStartFingerprint(identity.pid);
+  if (!fingerprint) return "indeterminate";
+  return fingerprint === identity.processStartFingerprint ? "live" : "not_live";
+}
+
+function reconciliationResult(
+  pidPath: string,
+  label: string,
+  disposition: CollectorPidCleanupReconciliationResult["disposition"],
+  before: CollectorPidCleanupState,
+  options: { eligible?: boolean; reconciled?: boolean } = {},
+): CollectorPidCleanupReconciliationResult {
+  return Object.freeze({
+    reconciled: options.reconciled ?? false,
+    eligible: options.eligible ?? false,
+    disposition,
+    before,
+    after: readCollectorPidCleanupState(pidPath, label),
+  });
+}
+
+export function reconcileCollectorPidCleanupState(
+  pidPath: string,
+  label: string,
+  options: {
+    apply?: boolean;
+    hooks?: CollectorPidCleanupReconciliationHooks;
+  } = {},
+): CollectorPidCleanupReconciliationResult {
+  const artifacts = inspectCleanupArtifacts(pidPath, label);
+  const before = artifacts.state;
+  if (!before.ambiguous) return reconciliationResult(pidPath, label, "clean", before);
+  if (before.unsafeArtifactCount > 0) {
+    return reconciliationResult(pidPath, label, "unsafe_artifact", before);
+  }
+  if (artifacts.pidClaim.kind !== "missing") {
+    return reconciliationResult(pidPath, label, "pid_claim_present", before);
+  }
+  if (artifacts.quarantine.kind !== "missing") {
+    return reconciliationResult(pidPath, label, "quarantine_present", before);
+  }
+  const markerSlots = [artifacts.marker, artifacts.markerClaim]
+    .filter((artifact): artifact is Extract<CleanupMarkerInspection, { kind: "present" }> =>
+      artifact.kind === "present");
+  if (markerSlots.length !== 1) {
+    return reconciliationResult(pidPath, label, "multiple_marker_slots", before);
+  }
+  const marker = markerSlots[0];
+  const actorState = processIdentityState(marker.record.actor);
+  if (actorState === "live") {
+    return reconciliationResult(pidPath, label, "actor_live", before);
+  }
+  if (actorState === "indeterminate") {
+    return reconciliationResult(pidPath, label, "actor_indeterminate", before);
+  }
+  if (options.apply === false) {
+    return reconciliationResult(pidPath, label, "eligible_dead_actor", before, {
+      eligible: true,
+    });
+  }
+
+  let claimed: CleanupArtifact | null = marker;
+  if (marker.path === artifacts.names.markerPath) {
+    options.hooks?.beforeMarkerClaim?.();
+    claimed = claimExactArtifact(marker, artifacts.names.markerClaimPath);
+  }
+  if (!claimed) return reconciliationResult(pidPath, label, "clear_race", before);
+  options.hooks?.beforeClear?.();
+  if (!clearExactArtifact(claimed)) {
+    return reconciliationResult(pidPath, label, "clear_race", before);
+  }
+  return reconciliationResult(
+    pidPath,
+    label,
+    marker.path === artifacts.names.markerPath ? "marker_cleared" : "marker_claim_cleared",
+    before,
+    { eligible: true, reconciled: true },
+  );
 }
 
 export function removeCollectorPidFileIfOwnedDetailed(
@@ -691,7 +823,7 @@ export function removeCollectorPidFileIfOwnedDetailed(
   label: string,
   hooks: CollectorPidCleanupHooks = {},
 ): CollectorPidCleanupResult {
-  const priorCleanup = readCollectorPidCleanupState(pidPath, label);
+  const priorCleanup = reconcileCollectorPidCleanupState(pidPath, label).after;
   if (priorCleanup.ambiguous) {
     return cleanupResult(pidPath, label, "persistent_ambiguity", {
       ambiguous: true,
@@ -702,16 +834,13 @@ export function removeCollectorPidFileIfOwnedDetailed(
   if (current.kind !== "current" || !runtimeIdentityMatches(current.record, identity)) {
     return cleanupResult(pidPath, label, "not_owned");
   }
-  const marker = createCleanupMarker(pidPath, label);
+  const marker = createCleanupMarker(pidPath, label, identity);
   if (!marker) {
     return cleanupResult(pidPath, label, "marker_create_failed", { ambiguous: true });
   }
-  const absolutePath = cleanupArtifactNames(pidPath).absolutePath;
-  const claimPath = path.join(
-    path.dirname(absolutePath),
-    `.${path.basename(absolutePath)}.plimsoll-remove-${randomUUID()}`,
-  );
-  let claimIdentity: PidFileIdentity | null = null;
+  const names = cleanupArtifactNames(pidPath);
+  const absolutePath = names.absolutePath;
+  let claim: CleanupArtifact | null = null;
   try {
     hooks.beforeClaim?.();
     const preClaim = lstatPidPath(absolutePath);
@@ -719,76 +848,69 @@ export function removeCollectorPidFileIfOwnedDetailed(
       return cleanupResult(pidPath, label, "preclaim_changed", { ambiguous: true });
     }
     hooks.afterPreClaimCheck?.();
-    const markerBeforeClaim = inspectCollectorPidFile(marker.path);
+    const markerBeforeClaim = inspectCleanupMarker(marker.path, label);
     if (
-      markerBeforeClaim.kind !== "safe" ||
+      markerBeforeClaim.kind !== "present" ||
       !samePidFileIdentity(marker.fileIdentity, markerBeforeClaim.fileIdentity) ||
       markerBeforeClaim.raw !== marker.raw
     ) {
       return cleanupResult(pidPath, label, "marker_create_failed", { ambiguous: true });
     }
-    fs.renameSync(absolutePath, claimPath);
-    const claimStat = lstatPidPath(claimPath);
-    if (!claimStat) return cleanupResult(pidPath, label, "claim_missing", { ambiguous: true });
-    claimIdentity = pidFileIdentity(claimStat);
-    if (!samePidFileObject(current.fileIdentity, claimIdentity)) {
-      hooks.beforeMismatchRestore?.();
-      const quarantined = quarantinePidClaim(claimPath, claimIdentity);
-      return cleanupResult(pidPath, label, "mismatch_quarantined", { ambiguous: true, quarantined });
+    claim = claimExactArtifact(
+      { path: absolutePath, raw: current.raw, fileIdentity: current.fileIdentity },
+      names.pidClaimPath,
+    );
+    if (!claim) {
+      const afterClaimFailure = readCollectorPidFile(absolutePath, label);
+      return cleanupResult(
+        pidPath,
+        label,
+        afterClaimFailure.kind === "current" &&
+          runtimeIdentityMatches(afterClaimFailure.record, current.record) &&
+          samePidFileIdentity(afterClaimFailure.fileIdentity, current.fileIdentity)
+          ? "claim_missing"
+          : "preclaim_changed",
+        { ambiguous: true },
+      );
     }
-    const claimed = inspectCollectorPidFile(claimPath);
-    if (
-      claimed.kind !== "safe" ||
-      !samePidFileObject(claimIdentity, claimed.fileIdentity) ||
-      claimed.raw !== current.raw
-    ) {
-      const quarantined = quarantinePidClaim(claimPath, claimIdentity);
-      return cleanupResult(pidPath, label, "claim_changed", { ambiguous: true, quarantined });
-    }
-    claimIdentity = claimed.fileIdentity;
     hooks.afterClaim?.();
-    const verified = inspectCollectorPidFile(claimPath);
+    const verified = inspectCleanupSlot(claim.path);
     if (lstatPidPath(absolutePath)) {
-      const quarantined = quarantinePidClaim(claimPath, claimIdentity);
+      const quarantined = Boolean(claimExactArtifact(claim, names.quarantinePath));
       return cleanupResult(pidPath, label, "destination_reappeared", { ambiguous: true, quarantined });
     }
     if (
-      verified.kind !== "safe" ||
-      !samePidFileIdentity(claimIdentity, verified.fileIdentity) ||
+      verified.kind !== "present" ||
+      !samePidFileIdentity(claim.fileIdentity, verified.fileIdentity) ||
       verified.raw !== current.raw
     ) {
-      const quarantined = quarantinePidClaim(claimPath, claimIdentity);
+      const quarantined = Boolean(claimExactArtifact(claim, names.quarantinePath));
       return cleanupResult(pidPath, label, "claim_changed", { ambiguous: true, quarantined });
     }
-    const markerClaim = claimExactCleanupMarker(marker);
+    const markerClaim = claimExactArtifact(marker, names.markerClaimPath);
     if (!markerClaim) {
-      const quarantined = quarantinePidClaim(claimPath, claimIdentity);
+      const quarantined = Boolean(claimExactArtifact(claim, names.quarantinePath));
       return cleanupResult(pidPath, label, "marker_clear_failed", {
         ambiguous: true,
         quarantined,
       });
     }
-    const beforeUnlink = lstatPidPath(claimPath);
-    if (!beforeUnlink || !samePidFileIdentity(claimIdentity, pidFileIdentity(beforeUnlink))) {
+    if (!clearExactArtifact(claim)) {
       return cleanupResult(pidPath, label, "claim_changed", {
         ambiguous: true,
-        quarantined: Boolean(beforeUnlink),
+        quarantined: false,
       });
     }
-    fs.unlinkSync(claimPath);
-    const claimSurvived = Boolean(lstatPidPath(claimPath));
     const destinationReappeared = Boolean(lstatPidPath(absolutePath));
-    if (claimSurvived || destinationReappeared) {
+    if (destinationReappeared) {
       return cleanupResult(
         pidPath,
         label,
-        destinationReappeared ? "destination_reappeared" : "claim_changed",
-        { ambiguous: true, quarantined: claimSurvived },
+        "destination_reappeared",
+        { ambiguous: true, quarantined: false },
       );
     }
-    if (!clearExactCleanupMarkerClaim(markerClaim)) {
-      const persistent = readCollectorPidCleanupState(pidPath, label);
-      if (!persistent.ambiguous) createCleanupMarker(pidPath, label);
+    if (!clearExactArtifact(markerClaim)) {
       return cleanupResult(pidPath, label, "marker_clear_failed", {
         removed: true,
         ambiguous: true,
@@ -796,7 +918,7 @@ export function removeCollectorPidFileIfOwnedDetailed(
     }
     return cleanupResult(pidPath, label, "removed", { removed: true });
   } catch {
-    const quarantined = claimIdentity ? quarantinePidClaim(claimPath, claimIdentity) : false;
+    const quarantined = claim ? Boolean(claimExactArtifact(claim, names.quarantinePath)) : false;
     return cleanupResult(pidPath, label, "operation_failed", { ambiguous: true, quarantined });
   }
 }
@@ -815,26 +937,6 @@ function cleanupResult(
     persistent,
     disposition,
   });
-}
-
-function quarantinePidClaim(claimPath: string, expectedClaim: PidFileIdentity) {
-  try {
-    const claim = lstatPidPath(claimPath);
-    if (!claim || !samePidFileObject(expectedClaim, pidFileIdentity(claim))) return false;
-    const quarantinePath = path.join(
-      path.dirname(claimPath),
-      `.${path.basename(claimPath).replace(/^\./, "").replace(/\.plimsoll-remove-.*$/, "")}.plimsoll-quarantine-${randomUUID()}`,
-    );
-    if (lstatPidPath(quarantinePath)) return true;
-    fs.renameSync(claimPath, quarantinePath);
-    const quarantined = lstatPidPath(quarantinePath);
-    return Boolean(
-      quarantined && samePidFileObject(expectedClaim, pidFileIdentity(quarantined)),
-    );
-  } catch {
-    const retained = lstatPidPath(claimPath);
-    return Boolean(retained && samePidFileObject(expectedClaim, pidFileIdentity(retained)));
-  }
 }
 
 function sleep(milliseconds: number) {
@@ -948,9 +1050,16 @@ export async function captureLaunchAgentUnloadPriorState(options: {
   observeListener?: () => Promise<CollectorListenerObservation>;
   readPidFile?: (pidPath: string, label: string) => CollectorPidFileRead;
   readCleanupState?: (pidPath: string, label: string) => CollectorPidCleanupState;
+  reconcileCleanupState?: (
+    pidPath: string,
+    label: string,
+  ) => CollectorPidCleanupReconciliationResult;
 }): Promise<LaunchAgentUnloadPriorState> {
   const readPidFile = options.readPidFile ?? readCollectorPidFile;
   const readCleanupState = options.readCleanupState ?? readCollectorPidCleanupState;
+  const pidCleanupReconciliation = (
+    options.reconcileCleanupState ?? reconcileCollectorPidCleanupState
+  )(options.pidPath, options.label);
   const [label, listener] = await Promise.all([
     options.observeLabel(),
     options.observeListener?.() ?? observeCollectorListener(options.port),
@@ -978,6 +1087,7 @@ export async function captureLaunchAgentUnloadPriorState(options: {
     pidRecordKind: pidRead.kind,
     pidRuntimeIdentity: pidIdentity,
     pidCleanupState,
+    pidCleanupReconciliation,
   });
 }
 
@@ -990,6 +1100,10 @@ async function observeLaunchAgentUnloadOnce(options: {
   processIsLive: (identity: ProcessIdentity) => boolean;
   readPidFile: (pidPath: string, label: string) => CollectorPidFileRead;
   readCleanupState: (pidPath: string, label: string) => CollectorPidCleanupState;
+  reconcileCleanupState: (
+    pidPath: string,
+    label: string,
+  ) => CollectorPidCleanupReconciliationResult;
   removePidFile: (
     pidPath: string,
     identity: CollectorRuntimeIdentity,
@@ -1011,6 +1125,7 @@ async function observeLaunchAgentUnloadOnce(options: {
   const currentListenerMatchesPrior = matchesAnyPrior(listenerIdentity, priorIdentities);
 
   let pidRead = options.readPidFile(options.pidPath, options.label);
+  options.reconcileCleanupState(options.pidPath, options.label);
   let persistentCleanup = options.readCleanupState(options.pidPath, options.label);
   let currentPidIdentity = pidRuntimeIdentity(pidRead);
   let currentPidMatchesPrior = matchesAnyPrior(currentPidIdentity, priorIdentities);
@@ -1138,6 +1253,10 @@ export async function observeLaunchAgentUnloadTerminalState(options: {
   processIsLive?: (identity: ProcessIdentity) => boolean;
   readPidFile?: (pidPath: string, label: string) => CollectorPidFileRead;
   readCleanupState?: (pidPath: string, label: string) => CollectorPidCleanupState;
+  reconcileCleanupState?: (
+    pidPath: string,
+    label: string,
+  ) => CollectorPidCleanupReconciliationResult;
   removePidFile?: (
     pidPath: string,
     identity: CollectorRuntimeIdentity,
@@ -1156,6 +1275,8 @@ export async function observeLaunchAgentUnloadTerminalState(options: {
   const processIsLive = options.processIsLive ?? processIdentityIsLive;
   const readPidFile = options.readPidFile ?? readCollectorPidFile;
   const readCleanupState = options.readCleanupState ?? readCollectorPidCleanupState;
+  const reconcileCleanupState =
+    options.reconcileCleanupState ?? reconcileCollectorPidCleanupState;
   const removePidFile = options.removePidFile ?? removeCollectorPidFileIfOwnedDetailed;
   let removedPidFile = false;
   let pidCleanupAmbiguous = false;
@@ -1174,6 +1295,7 @@ export async function observeLaunchAgentUnloadTerminalState(options: {
       processIsLive,
       readPidFile,
       readCleanupState,
+      reconcileCleanupState,
       removePidFile,
       removedPidFile,
       pidCleanupAmbiguous,
@@ -1207,6 +1329,7 @@ export async function observeLaunchAgentUnloadTerminalState(options: {
     processIsLive,
     readPidFile,
     readCleanupState,
+    reconcileCleanupState,
     removePidFile,
     removedPidFile,
     pidCleanupAmbiguous,
@@ -1327,7 +1450,7 @@ export async function acquireCollectorStartOwnership(options: {
   fs.mkdirSync(path.dirname(options.pidPath), { recursive: true, mode: 0o700 });
 
   while (Date.now() <= deadline) {
-    if (readCollectorPidCleanupState(options.pidPath, options.label).ambiguous) {
+    if (reconcileCollectorPidCleanupState(options.pidPath, options.label).after.ambiguous) {
       throw new CollectorStartOwnershipError(
         "pid_cleanup_ambiguous",
         "Collector PID cleanup has unresolved private ownership artifacts.",
@@ -1368,7 +1491,7 @@ export async function acquireCollectorStartOwnership(options: {
     try {
       fs.writeFileSync(lockPath, serializedLock, { flag: "wx", mode: 0o600 });
 
-      if (readCollectorPidCleanupState(options.pidPath, options.label).ambiguous) {
+      if (reconcileCollectorPidCleanupState(options.pidPath, options.label).after.ambiguous) {
         releaseLock(lockPath, serializedLock);
         throw new CollectorStartOwnershipError(
           "pid_cleanup_ambiguous",
