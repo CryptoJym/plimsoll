@@ -180,6 +180,9 @@ Commands:
                         never runs in the collector server/background path.
   scan-rollouts         Read codex rollout files into the ledger once (full history walk)
   scan-transcripts      Read Claude Code transcript usage into the ledger once (full history walk)
+  drain-projections     Drain a stalled dashboard-projection repair backlog at full
+                        budget until the dashboard is caught up (run with the
+                        collector stopped; safe to interrupt and re-run)
   install-launch-agent  Write the user LaunchAgent plist
   load-launch-agent     Load an installed user LaunchAgent plist
   unload-launch-agent   Unload the user LaunchAgent without removing the plist
@@ -1105,8 +1108,13 @@ async function main() {
       entryPath: process.argv[1]!,
       execArgv: process.execArgv,
       env: process.env,
-      deadlineMs: 1_000,
-      readyDeadlineMs: 1_000,
+      // Cold start of the tsx child (compile + opening a large WAL ledger) alone
+      // can exceed 1s, which killed every run before its first slice committed
+      // (issue #177: projections frozen behind 2M buffered events). The child's
+      // writer holds stay bounded by its own slice budget (maxActiveMs <= 5s in
+      // maintenance.ts), so these deadlines govern startup + coordination only.
+      deadlineMs: 30_000,
+      readyDeadlineMs: 10_000,
     });
     let detectedIdentities: Array<Record<string, unknown>> = [];
     try {
@@ -1713,6 +1721,45 @@ async function main() {
       result,
     );
     console.log(JSON.stringify({ ...result, historyCoverage }, null, 2));
+    buffer.close();
+    return;
+  }
+
+  if (command === "drain-projections") {
+    // Explicit recovery for a stalled projection backlog (issue #177). The
+    // background cadence gives the drain only post-capture budget scraps
+    // (maxSlices: 1, <=25ms), which can never catch up once repairs pile up
+    // behind an outage. This loops the same slice machinery at full budget
+    // until the dashboard is caught up. Run it with the collector stopped to
+    // avoid writer contention; it is safe to interrupt and re-run.
+    const buffer = openBuffer(config);
+    const projection = buffer.projection;
+    const startedAt = Date.now();
+    let rounds = 0;
+    for (;;) {
+      projection.runMaintenance();
+      rounds++;
+      if (rounds % 25 === 0 || rounds === 1) {
+        const status = projection.status();
+        const backlogTotal =
+          status.backlog.repairs + status.backlog.compactMutations +
+          status.backlog.compactGcDays + status.backlog.dirtySessions +
+          status.backlog.accountInvalidations + status.backlog.expiryWindows;
+        console.log(JSON.stringify({
+          status: "drain_progress", rounds,
+          elapsedSeconds: Math.round((Date.now() - startedAt) / 1000),
+          backlog: status.backlog,
+          migrationComplete: status.backfill.complete &&
+            status.backfill.parityComplete && status.backfill.metricComplete,
+        }));
+        if (backlogTotal === 0 && status.backfill.complete &&
+          status.backfill.parityComplete && status.backfill.metricComplete) break;
+      }
+      // Yield between synchronous slices so signals stay responsive.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    const final = projection.status();
+    console.log(JSON.stringify({ status: "drain_complete", rounds, backlog: final.backlog }, null, 2));
     buffer.close();
     return;
   }
