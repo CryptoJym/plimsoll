@@ -34,6 +34,14 @@ export const MODEL_PRICING: Record<string, ModelPrice> = {
   // estimates now include it instead of flooring. Long-context (1m) tiers
   // bill standard.
   "claude-fable-5": { input: 10.0, cachedInput: 1.0, output: 50.0, cacheWrite: 12.5, vendor: "anthropic", asOf: "2026-06-10" },
+  // Claude 5 family (platform.claude.com/docs pricing, fetched 2026-08-20).
+  // Absence here was load-bearing: 44,599 of the 30-day window's 59,397
+  // claude-opus-5 calls (75%) sat at cost NULL because no catalog key
+  // prefix-matched them. Sonnet 5 has an intro rate ($2/$10) through
+  // 2026-08-31; the standard rate is pinned so estimates never undercount
+  // after the promo lapses.
+  "claude-opus-5": { input: 5.0, cachedInput: 0.5, output: 25.0, cacheWrite: 6.25, vendor: "anthropic", asOf: "2026-08-20" },
+  "claude-sonnet-5": { input: 3.0, cachedInput: 0.3, output: 15.0, cacheWrite: 3.75, vendor: "anthropic", asOf: "2026-08-20" },
   "claude-opus-4-8": { input: 5.0, cachedInput: 0.5, output: 25.0, cacheWrite: 6.25, vendor: "anthropic", asOf: "2026-06-10" },
   "claude-opus-4-7": { input: 5.0, cachedInput: 0.5, output: 25.0, cacheWrite: 6.25, vendor: "anthropic", asOf: "2026-06-10" },
   "claude-opus-4-6": { input: 5.0, cachedInput: 0.5, output: 25.0, cacheWrite: 6.25, vendor: "anthropic", asOf: "2026-06-10" },

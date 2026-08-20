@@ -48,7 +48,7 @@ import {
   type TranscriptScanResult,
 } from "../packages/collector-cli/src/transcript-tailer";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
-import { MODEL_PRICING } from "../packages/shared/src/pricing";
+import { MODEL_PRICING, estimateCostUsd, priceForModel } from "../packages/shared/src/pricing";
 
 const checks: Array<{ name: string; detail: Record<string, unknown> }> = [];
 
@@ -1201,6 +1201,25 @@ function proveDirtyMaintenance(buffer: LocalEventBuffer) {
     "unchanged_pricing_catalog_visits_zero_event_rows",
     pricingIdle.rowsVisited === 0 && pricingIdle.repriced === 0 && !pricingIdle.catalogChanged,
     pricingIdle,
+  );
+
+  // The fleet's live Claude 5 model ids must price, including dated variants
+  // via longest-prefix match. claude-opus-5 missing from the catalog left 75%
+  // of a real 30-day window's opus calls at cost NULL (2026-08-20 audit).
+  const opus5PerMillion = estimateCostUsd({
+    model: "claude-opus-5",
+    inputTokens: 1_000_000,
+    outputTokens: 1_000_000,
+    cacheReadTokens: 1_000_000,
+    cacheCreationTokens: 1_000_000,
+  });
+  check(
+    "claude_5_family_models_price",
+    opus5PerMillion?.costUsd === 5 + 0.5 + 25 + 6.25 &&
+      priceForModel("claude-sonnet-5")?.output === 15 &&
+      priceForModel("claude-opus-5-20260601")?.input === 5 &&
+      priceForModel("claude-fable-5")?.output === 50,
+    { opus5PerMillion },
   );
 
   MODEL_PRICING[priceModel] = {
