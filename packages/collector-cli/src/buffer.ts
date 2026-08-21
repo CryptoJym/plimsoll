@@ -152,7 +152,12 @@ export class LocalEventBuffer {
   constructor(
     path: string,
     options: {
-      delivery?: { enabled?: boolean; limits?: Partial<DeliveryLimits> };
+      delivery?: {
+        enabled?: boolean;
+        limits?: Partial<DeliveryLimits>;
+        /** Injectable clock for delivery eligibility bookkeeping (issue 0182). */
+        now?: () => Date;
+      };
       workspaceId?: string;
       learningFacts?: { limits?: Partial<LearningFactLimits> };
       /** HTTP collectors fail fast under child-writer contention; maintenance

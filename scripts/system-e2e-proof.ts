@@ -36,7 +36,10 @@ import {
   buildWorkEpisodeFact,
 } from "../packages/collector-cli/src/learning-facts";
 import { OutcomeTimelineStore } from "../packages/collector-cli/src/outcome-timeline-store";
-import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
+import {
+  DeliveryUploadError,
+  uploadBufferedEvents,
+} from "../packages/collector-cli/src/upload";
 import {
   allocateEvents,
   collectAllocationEvents,
@@ -215,6 +218,12 @@ const FLOW_TIME = {
   attempt2Result: "2026-07-01T10:04:00.000Z",
   end: "2026-07-01T10:30:00.000Z",
 } as const;
+// Issue 0182: delivery enqueue/eligibility bookkeeping (outbox
+// next_attempt_at, receipts, watermark stamps) runs on this pinned clock, not
+// the wall clock. It sits after every fixture event time and before both
+// injected upload clocks, so lease eligibility can never depend on the
+// calendar date of the machine running the proof.
+const FLOW_DELIVERY_CLOCK = "2026-07-01T11:00:00.000Z";
 
 const flowFingerprint = digest({
   schema: SCHEMA,
@@ -445,7 +454,11 @@ async function runSharedFlow() {
     },
   });
   const bufferA = new LocalEventBuffer(machineALedger, {
-    delivery: { enabled: true, limits: config.delivery },
+    delivery: {
+      enabled: true,
+      limits: config.delivery,
+      now: () => new Date(FLOW_DELIVERY_CLOCK),
+    },
     workspaceId: WORKSPACE_A,
   });
   const bufferB = new LocalEventBuffer(machineBLedger, { workspaceId: WORKSPACE_B });
@@ -528,7 +541,7 @@ async function runSharedFlow() {
     assert.notEqual(path.dirname(machineALedger), path.dirname(machineBLedger));
 
     const firstRequests: string[][] = [];
-    let offlineFailure = false;
+    let offlineError: unknown = null;
     try {
       await uploadBufferedEvents(config, bufferA, {
         now: () => new Date("2026-08-01T11:00:00.000Z"),
@@ -537,11 +550,30 @@ async function runSharedFlow() {
           throw new Error("injected offline transport");
         },
       });
-    } catch {
-      offlineFailure = true;
+    } catch (error) {
+      offlineError = error;
     }
-    assert.equal(offlineFailure, true, "offline upload must remain retryable");
-    assert.equal(firstRequests.length, 1, "offline cycle must issue one bounded request");
+    // Assertion order is the contract (issue 0182): the fetch attempt is
+    // proven FIRST. An empty claim — e.g. fixture-vs-clock skew silently
+    // skipping every eligibility row — returns without throwing, so asserting
+    // the throw first would let an empty claim masquerade as retryability.
+    assert.equal(
+      firstRequests.length,
+      1,
+      `offline cycle must attempt the transport exactly once before any failure ` +
+        `classification; attempted=${firstRequests.length}, threw=${offlineError !== null}. ` +
+        `An empty claim here means batch eligibility silently skipped every row ` +
+        `(fixture-vs-now skew), not a transport failure.`,
+    );
+    assert.ok(
+      offlineError instanceof DeliveryUploadError,
+      "offline upload must remain retryable by throwing a delivery failure",
+    );
+    assert.equal(
+      offlineError.failureClass,
+      "remote_transient",
+      "injected transport failure must classify as retryable remote_transient",
+    );
 
     const accepted: string[] = [];
     const reconnectRequests: string[][] = [];
