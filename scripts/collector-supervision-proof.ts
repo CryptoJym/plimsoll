@@ -13,10 +13,11 @@ import {
 } from "../packages/collector-cli/src/launch-agent";
 import {
   readCollectorPidCleanupState,
-  readProcessStartFingerprint,
+  readUtcProcessStartFingerprint,
   removeCollectorPidFileIfOwnedDetailed,
   runtimeIdentityMatches,
   START_LOCK_LEASE_MS,
+  UTC_PROCESS_START_ALGORITHM,
   type CollectorPidRecord,
   type CollectorRuntimeIdentity,
 } from "../packages/collector-cli/src/runtime-ownership";
@@ -142,9 +143,14 @@ function writeConfig(home: string, port: number) {
 }
 
 function runtimeIdentity(pid: number, instanceId = randomUUID()): CollectorRuntimeIdentity {
-  const processStartFingerprint = readProcessStartFingerprint(pid);
+  const processStartFingerprint = readUtcProcessStartFingerprint(pid);
   check(processStartFingerprint, "Could not fingerprint proof process " + pid + ".");
-  return { instanceId, pid, processStartFingerprint };
+  return {
+    instanceId,
+    pid,
+    processStartFingerprint,
+    processStartFingerprintAlgorithm: UTC_PROCESS_START_ALGORITHM,
+  };
 }
 
 function writePidRecord(
@@ -158,7 +164,7 @@ function writePidRecord(
     cwd: root,
     label: LAUNCH_AGENT_LABEL,
     startedAt: new Date().toISOString(),
-    version: 2,
+    version: 3,
   };
   fs.writeFileSync(
     path.join(home, "collector.pid"),
@@ -180,7 +186,7 @@ function writeStartLock(
         ...identity,
         createdAt,
         label: LAUNCH_AGENT_LABEL,
-        version: 2,
+        version: 3,
       },
       null,
       2,

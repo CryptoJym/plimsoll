@@ -120,6 +120,7 @@ import { uploadBufferedEvents } from "./upload";
 import { runAttributionRepair, runWorkspaceHistoryUpload } from "./upload-history";
 import {
   acquireCollectorStartOwnership,
+  classifyProcessIdentity,
   CollectorStartOwnershipError,
   captureLaunchAgentUnloadPriorState,
   createCollectorRuntimeIdentity,
@@ -128,10 +129,11 @@ import {
   processIdentityIsLive,
   readCollectorPidCleanupState,
   readCollectorPidFile,
-  readProcessStartFingerprint,
+  readUtcProcessStartFingerprint,
   reconcileCollectorPidCleanupState,
   removeCollectorPidFileIfOwned,
   runtimeIdentityMatches,
+  UTC_PROCESS_START_ALGORITHM,
   verifyCollectorRuntimeIdentity,
   type LaunchAgentLabelObservation,
   type LaunchAgentUnloadOutcome,
@@ -330,13 +332,16 @@ function launchctlJobState(): LaunchAgentLabelObservation & {
   }
   const pidMatch = result.stdout.match(/^\s*pid\s*=\s*(\d+)\s*$/m);
   const pid = pidMatch ? Number(pidMatch[1]) : null;
-  const processStartFingerprint = pid ? readProcessStartFingerprint(pid) : null;
+  // The label observation is compared against persisted identities, so it
+  // must use the same UTC algorithm and carry the explicit tag.
+  const processStartFingerprint = pid ? readUtcProcessStartFingerprint(pid) : null;
   return {
     kind: "reported",
     processIdentity: pid && processStartFingerprint
       ? {
           pid,
           processStartFingerprint,
+          processStartFingerprintAlgorithm: UTC_PROCESS_START_ALGORITHM,
         }
       : null,
     ...details,
@@ -898,8 +903,10 @@ function collectorPidRecord(runtimeIdentity: CollectorRuntimeIdentity): Collecto
     label: LAUNCH_AGENT_LABEL,
     pid: runtimeIdentity.pid,
     processStartFingerprint: runtimeIdentity.processStartFingerprint,
+    processStartFingerprintAlgorithm:
+      runtimeIdentity.processStartFingerprintAlgorithm ?? UTC_PROCESS_START_ALGORITHM,
     startedAt: new Date().toISOString(),
-    version: 2,
+    version: 3,
   };
 }
 
@@ -1832,7 +1839,7 @@ async function main() {
         pidCleanupReconciliation,
       ),
       ownershipVersion: {
-        expected: 2,
+        expected: 3,
         actual: pidRecord?.version ?? null,
       },
       processLive: pidRecord ? processIdentityIsLive(pidRecord) : false,
@@ -2665,8 +2672,42 @@ async function main() {
       instanceId: pidRead.record.instanceId,
       pid: pidRead.record.pid,
       processStartFingerprint: pidRead.record.processStartFingerprint,
+      processStartFingerprintAlgorithm:
+        pidRead.record.processStartFingerprintAlgorithm,
     };
-    if (!processIdentityIsLive(runtimeIdentity)) {
+    const identityClass = classifyProcessIdentity(runtimeIdentity);
+    if (identityClass === "indeterminate") {
+      // Fail closed: no signal, no cleanup, no mutation.
+      const listener = await observeCollectorListener(config.port);
+      console.log(
+        JSON.stringify(
+          {
+            stopped: false,
+            reason: "runtime_identity_indeterminate",
+            pid: runtimeIdentity.pid,
+            pidPathHash: privatePathReceipt(pidPath),
+            launchAgentStopCommand,
+            pidCleaned: false,
+            pidRecordState: pidRead.kind,
+            pidCleanup: pidCleanupStateReceipt(initialCleanup),
+            pidCleanupReconciliation: pidCleanupReconciliationReceipt(
+              initialReconciliation,
+            ),
+            cleanupAttempt: pidCleanupAttemptReceipt(null),
+            processState: "indeterminate",
+            listenerState: listener.kind,
+            listenerRuntimeIdentity:
+              listener.kind === "collector" ? listener.runtimeIdentity : null,
+            removedPidFile: false,
+          },
+          null,
+          2,
+        ),
+      );
+      process.exitCode = 1;
+      return;
+    }
+    if (identityClass === "stale") {
       const cleanupAttempt = removeCollectorPidFileIfOwned(
         pidPath,
         runtimeIdentity,
@@ -2714,8 +2755,7 @@ async function main() {
     });
     if (
       !identityVerified ||
-      readProcessStartFingerprint(runtimeIdentity.pid) !==
-        runtimeIdentity.processStartFingerprint
+      classifyProcessIdentity(runtimeIdentity) === "indeterminate"
     ) {
       const processLive = processIdentityIsLive(runtimeIdentity);
       const listener = await observeCollectorListener(config.port);
