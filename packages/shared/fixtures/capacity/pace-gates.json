@@ -1,0 +1,38 @@
+{
+  "now": "2026-08-21T00:00:00.000Z",
+  "minElapsedMs": 86400000,
+  "minObservations": 3,
+  "cases": [
+    {
+      "case": "too_few_observations",
+      "expect": "UNKNOWN",
+      "expectedReasonPrefix": "observation_count_gate_not_met",
+      "observations": [
+        { "at": "2026-08-20T00:00:00.000Z", "cumulativeTokens": 1000 },
+        { "at": "2026-08-20T23:59:00.000Z", "cumulativeTokens": 9000 }
+      ]
+    },
+    {
+      "case": "elapsed_window_too_short",
+      "expect": "UNKNOWN",
+      "expectedReasonPrefix": "elapsed_time_gate_not_met",
+      "observations": [
+        { "at": "2026-08-20T12:00:00.000Z", "cumulativeTokens": 1000 },
+        { "at": "2026-08-20T18:00:00.000Z", "cumulativeTokens": 5000 },
+        { "at": "2026-08-20T23:30:00.000Z", "cumulativeTokens": 9000 }
+      ]
+    },
+    {
+      "case": "gates_pass_estimate_is_derived_uncertain",
+      "expect": "ESTIMATED",
+      "knownLimitTokens": 220000,
+      "limitObservedAt": "2026-08-20T23:00:00.000Z",
+      "observations": [
+        { "at": "2026-08-19T00:00:00.000Z", "cumulativeTokens": 0 },
+        { "at": "2026-08-19T18:00:00.000Z", "cumulativeTokens": 60000 },
+        { "at": "2026-08-20T06:00:00.000Z", "cumulativeTokens": 120000 },
+        { "at": "2026-08-20T20:00:00.000Z", "cumulativeTokens": 200000 }
+      ]
+    }
+  ]
+}

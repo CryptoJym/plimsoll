@@ -9,3 +9,4 @@ export * from "./metric-registry";
 export * from "./learning-evidence";
 export * from "./outcome-timeline";
 export * from "./lane-receipts";
+export * from "./capacity";

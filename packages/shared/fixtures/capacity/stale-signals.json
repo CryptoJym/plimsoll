@@ -1,0 +1,41 @@
+{
+  "now": "2026-08-21T00:00:00.000Z",
+  "maxAgeMs": 21600000,
+  "profiles": [
+    { "profileId": "anthropic.max.james", "provider": "anthropic" }
+  ],
+  "signalsByProfile": {
+    "anthropic.max.james": [
+      {
+        "signalId": "signal.fresh.five_hour",
+        "profileId": "anthropic.max.james",
+        "dimension": "five_hour_window",
+        "unit": "tokens",
+        "limit": 220000,
+        "used": 180000,
+        "source": "local_telemetry",
+        "observedAt": "2026-08-20T23:30:00.000Z"
+      },
+      {
+        "signalId": "signal.stale.weekly",
+        "profileId": "anthropic.max.james",
+        "dimension": "weekly_all_models",
+        "unit": "tokens",
+        "limit": 4000000,
+        "used": 1000000,
+        "source": "local_telemetry",
+        "observedAt": "2026-08-19T00:00:00.000Z"
+      },
+      {
+        "signalId": "signal.missing.provider_report",
+        "profileId": "anthropic.max.james",
+        "dimension": "provider_reported_share",
+        "unit": "percent",
+        "limit": null,
+        "used": null,
+        "source": "provider_report",
+        "observedAt": null
+      }
+    ]
+  }
+}
