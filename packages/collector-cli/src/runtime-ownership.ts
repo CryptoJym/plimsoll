@@ -383,10 +383,31 @@ function inspectPidAncestors(file: string):
   return missing ? { kind: "missing" } : { kind: "safe", identities };
 }
 
-function samePidAncestors(left: readonly PidPathIdentity[], right: readonly PidPathIdentity[]) {
+/**
+ * Re-validation of the ancestor chain compares only the properties that
+ * participate in resolving this exact path: object identity (device/inode),
+ * type and permissions, and ownership. Directory metadata such as link
+ * count, size, mtime, and ctime changes whenever any unrelated process
+ * creates or removes an entry inside a shared ancestor (for example the
+ * machine-wide temp root), so observing those between the initial walk and
+ * the post-read re-walk records benign neighbor activity as tampering. A
+ * real path swap still trips this check: replacement changes device/inode,
+ * aliasing is rejected by the symlink/nonregular walk, and re-permissioning
+ * or re-owning changes mode/uid/gid.
+ */
+function samePidAncestorResolution(
+  left: readonly PidPathIdentity[],
+  right: readonly PidPathIdentity[],
+) {
   return left.length === right.length && left.every((entry, index) => {
     const other = right[index];
-    return Boolean(other && entry.path === other.path && samePidFileIdentity(entry, other));
+    return Boolean(other &&
+      entry.path === other.path &&
+      entry.device === other.device &&
+      entry.inode === other.inode &&
+      entry.mode === other.mode &&
+      entry.uid === other.uid &&
+      entry.gid === other.gid);
   });
 }
 
@@ -447,7 +468,7 @@ function inspectCollectorPidFile(pidPath: string): InspectedPidFile {
     if (
       !finalStat ||
       finalAncestors.kind !== "safe" ||
-      !samePidAncestors(ancestors.identities, finalAncestors.identities) ||
+      !samePidAncestorResolution(ancestors.identities, finalAncestors.identities) ||
       !samePidFileIdentity(boundAfterIdentity, pidFileIdentity(finalStat))
     ) {
       return { kind: "unsafe", reason: "identity_changed" };
@@ -642,7 +663,7 @@ function inspectCleanupSlot(slotPath: string): CleanupSlotInspection {
     if (
       !finalStat ||
       finalAncestors.kind !== "safe" ||
-      !samePidAncestors(ancestors.identities, finalAncestors.identities) ||
+      !samePidAncestorResolution(ancestors.identities, finalAncestors.identities) ||
       !samePidFileIdentity(boundAfterIdentity, pidFileIdentity(finalStat))
     ) {
       return { kind: "unsafe" };

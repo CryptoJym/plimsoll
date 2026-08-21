@@ -579,8 +579,13 @@ async function main() {
       unloadOwner.child.pid,
     );
     children.push(truthfulUnload);
-    await waitFor(
-      () => truthfulUnload.receipts.some(
+    // Observe only after the command process has fully settled: its receipt
+    // stream is complete at exit, so a loaded runner cannot starve the
+    // observation window while the command is still working toward its
+    // terminal-state conclusion.
+    const truthfulUnloadExit = await waitForExit(truthfulUnload.child, 60_000);
+    check(
+      truthfulUnload.receipts.some(
         (receipt) =>
           receipt.unloaded === true &&
           receipt.status === "stopped" &&
@@ -589,9 +594,7 @@ async function main() {
           (receipt.terminal as Receipt | undefined)?.pidRecordState === "missing",
       ),
       "Unload did not report the aggregate terminal state: " + truthfulUnload.output,
-      7_000,
     );
-    const truthfulUnloadExit = await waitForExit(truthfulUnload.child);
     check(truthfulUnloadExit.code === 0, "Truthful aggregate unload exited nonzero.");
     await waitForExit(unloadOwner.child);
     const truthfulReceipt = truthfulUnload.receipts.find((receipt) => receipt.unloaded === true);
@@ -701,14 +704,14 @@ async function main() {
       { initiallyLoaded: false },
     );
     children.push(durableUnload);
-    await waitFor(
-      () => durableUnload.receipts.some(
+    const durableUnloadExit = await waitForExit(durableUnload.child, 60_000);
+    check(
+      durableUnload.receipts.some(
         (receipt) => receipt.unloaded === false && receipt.reason === "indeterminate",
       ),
-      "A later unload observer did not reopen the durable cleanup ambiguity.",
-      7_000,
+      "A later unload observer did not reopen the durable cleanup ambiguity: " +
+        durableUnload.output,
     );
-    const durableUnloadExit = await waitForExit(durableUnload.child);
     const durableUnloadReceipt = durableUnload.receipts.find(
       (receipt) => receipt.unloaded === false,
     );
@@ -949,13 +952,13 @@ async function main() {
     );
     const collisionStop = stopCollector(cliPath, collisionHome, root);
     children.push(collisionStop);
-    await waitFor(
-      () => collisionStop.receipts.some(
+    const collisionStopExit = await waitForExit(collisionStop.child, 60_000);
+    check(
+      collisionStop.receipts.some(
         (receipt) => receipt.reason === "pid_cleanup_ambiguous",
       ),
-      "Stop did not fail closed on marker plus visible collision.",
+      "Stop did not fail closed on marker plus visible collision: " + collisionStop.output,
     );
-    const collisionStopExit = await waitForExit(collisionStop.child);
     check(collisionStopExit.code !== 0, "Marker-plus-collision stop exited successfully.");
     fs.unlinkSync(collisionPidPath);
     const missingQuarantineUnload = launchAgentCommand(
@@ -969,14 +972,14 @@ async function main() {
       { initiallyLoaded: false },
     );
     children.push(missingQuarantineUnload);
-    await waitFor(
-      () => missingQuarantineUnload.receipts.some(
+    const missingQuarantineExit = await waitForExit(missingQuarantineUnload.child, 60_000);
+    check(
+      missingQuarantineUnload.receipts.some(
         (receipt) => receipt.unloaded === false && receipt.reason === "indeterminate",
       ),
-      "Missing-visible-PID plus quarantine was promoted to already stopped.",
-      7_000,
+      "Missing-visible-PID plus quarantine was promoted to already stopped: " +
+        missingQuarantineUnload.output,
     );
-    const missingQuarantineExit = await waitForExit(missingQuarantineUnload.child);
     const missingQuarantineReceipt = missingQuarantineUnload.receipts.find(
       (receipt) => receipt.unloaded === false,
     );
@@ -1005,17 +1008,18 @@ async function main() {
       { initiallyLoaded: false },
     );
     children.push(alreadyStopped);
-    await waitFor(
-      () => alreadyStopped.receipts.some(
+    const alreadyStoppedExit = await waitForExit(alreadyStopped.child, 60_000);
+    check(
+      alreadyStopped.receipts.some(
         (receipt) =>
           receipt.unloaded === true &&
           receipt.status === "already_stopped" &&
           receipt.bootoutAttempted === false &&
           (receipt.prior as Receipt | undefined)?.labelState === "not_reported",
       ),
-      "The exact launchctl label-not-found result was not recognized.",
+      "The exact launchctl label-not-found result was not recognized: " +
+        alreadyStopped.output,
     );
-    const alreadyStoppedExit = await waitForExit(alreadyStopped.child);
     check(alreadyStoppedExit.code === 0, "Known label-not-found should be idempotent success.");
 
     const exactNotFound =
@@ -1043,20 +1047,19 @@ async function main() {
         },
       );
       children.push(command);
-      await waitFor(
-        () => command.receipts.some((receipt) => receipt.unloaded === false),
-        `Unexpected launchctl print fixture ${fixture.name} produced no refusal receipt.`,
-      );
-      const exit = await waitForExit(command.child);
+      const exit = await waitForExit(command.child, 60_000);
       const receipt = command.receipts.find((candidate) => candidate.unloaded === false);
       check(
-        exit.code !== 0 &&
-          receipt?.status === "refused" &&
+        receipt?.status === "refused" &&
           receipt.reason === "indeterminate" &&
           receipt.bootoutAttempted === false &&
           (receipt.prior as Receipt | undefined)?.labelState === "query_failed" &&
           (receipt.terminal as Receipt | undefined)?.labelState === "query_failed",
         `Unexpected launchctl print fixture ${fixture.name} was promoted to absence.`,
+      );
+      check(
+        exit.code !== 0,
+        `Unexpected launchctl print fixture ${fixture.name} exited successfully.`,
       );
     }
 
@@ -1072,15 +1075,15 @@ async function main() {
       fakeBin,
     );
     children.push(legacyUnload);
-    await waitFor(
-      () => legacyUnload.receipts.some(
+    const legacyUnloadExit = await waitForExit(legacyUnload.child, 60_000);
+    check(
+      legacyUnload.receipts.some(
         (receipt) =>
           receipt.unloaded === false && receipt.reason === "stale_owned_record",
       ),
-      "Unload promoted a legacy PID residue to successful cleanup.",
-      7_000,
+      "Unload promoted a legacy PID residue to successful cleanup: " +
+        legacyUnload.output,
     );
-    const legacyUnloadExit = await waitForExit(legacyUnload.child);
     check(legacyUnloadExit.code !== 0, "Legacy PID unload did not fail closed.");
     check(fs.existsSync(legacyPidPath), "Legacy PID residue was deleted without ownership proof.");
 
@@ -1095,13 +1098,13 @@ async function main() {
       7,
     );
     children.push(failedBootout);
-    await waitFor(
-      () => failedBootout.receipts.some(
+    const failedBootoutExit = await waitForExit(failedBootout.child, 60_000);
+    check(
+      failedBootout.receipts.some(
         (receipt) => receipt.unloaded === false && receipt.reason === "launchctl_failed",
       ),
-      "Unload promoted a failed launchctl bootout to success.",
+      "Unload promoted a failed launchctl bootout to success: " + failedBootout.output,
     );
-    const failedBootoutExit = await waitForExit(failedBootout.child);
     check(failedBootoutExit.code !== 0, "Failed launchctl bootout exited successfully.");
 
     const reusedPidHome = path.join(tempRoot, "reused-pid-lock");
