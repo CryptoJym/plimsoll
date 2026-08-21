@@ -105,6 +105,7 @@ function identity(seed: number): CollectorRuntimeIdentity {
     instanceId: `00000000-0000-4000-8000-${String(seed).padStart(12, "0")}`,
     pid: 10_000 + seed,
     processStartFingerprint: `sha256:${seed.toString(16).padStart(64, "0")}`,
+    processStartFingerprintAlgorithm: "plimsoll-ps-lstart-utc-v2",
   };
 }
 
@@ -133,7 +134,7 @@ function current(owner: CollectorRuntimeIdentity): CollectorPidFileRead {
       cwd: "/fixture",
       label: LABEL,
       startedAt: "2026-07-19T00:00:00.000Z",
-      version: 2,
+      version: 3,
     },
   };
 }
@@ -165,11 +166,11 @@ async function runScenario(scenario: Scenario) {
     snapshotIndex += 1;
     return listener;
   };
-  const isLive = (candidate: ProcessIdentity) =>
+  const classify = (candidate: ProcessIdentity): "live" | "stale" | "indeterminate" =>
     snapshot().live.some((owner) =>
       owner.pid === candidate.pid &&
       owner.processStartFingerprint === candidate.processStartFingerprint
-    );
+    ) ? "live" : "stale";
   const readPidFile = () => snapshot().pid;
   const removePidFile = (_pidPath: string, candidate: CollectorRuntimeIdentity) => {
     if (!scenario.removeOwnedPid) return fixtureCleanupResult(false);
@@ -199,7 +200,7 @@ async function runScenario(scenario: Scenario) {
     pollIntervalMs: scenario.pollIntervalMs ?? 50,
     observeLabel,
     observeListener,
-    processIsLive: isLive,
+    classifyIdentity: classify,
     readPidFile,
     removePidFile,
     now: () => {
@@ -1102,7 +1103,7 @@ async function main() {
       timeoutMs: 0,
       observeLabel: gone,
       observeListener: async () => absent(),
-      processIsLive: () => false,
+      classifyIdentity: () => "stale",
       removePidFile: (pidPath, candidate, label) =>
         removeCollectorPidFileIfOwnedDetailed(pidPath, candidate, label, {
           beforeClaim: () => {
@@ -1155,7 +1156,7 @@ async function main() {
       timeoutMs: 0,
       observeLabel: gone,
       observeListener: async () => absent(),
-      processIsLive: () => false,
+      classifyIdentity: () => "stale",
       removePidFile: (pidPath, candidate, label) => {
         cleanupCalls += 1;
         return removeCollectorPidFileIfOwnedDetailed(pidPath, candidate, label, {

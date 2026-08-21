@@ -3262,6 +3262,8 @@ export async function runDuplicateStartSingleOwnerContract(
       instanceId: ownerRead.record.instanceId,
       pid: ownerRead.record.pid,
       processStartFingerprint: ownerRead.record.processStartFingerprint,
+      processStartFingerprintAlgorithm:
+        ownerRead.record.processStartFingerprintAlgorithm,
     };
     const pidRecordBeforeLoser = ownerRead.raw;
     const loserExit = await withDeadline(loser.exit, 20_000, "LoserExitTimeout");

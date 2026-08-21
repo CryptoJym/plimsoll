@@ -148,7 +148,11 @@ function asyncProcessFingerprint(
       ["-ww", "-p", String(pid), "-o", "ppid=", "-o", "lstart=", "-o", "command="],
       {
         encoding: "utf8",
-        env: { ...process.env, LANG: "C", LC_ALL: "C" },
+        // Issue #175: lstart must render timezone-invariantly or a parent
+        // observed across timezones would fail its own child binding.
+        // This fingerprint is ephemeral (never persisted), so pinning the
+        // rendering does not disturb any frozen legacy domain.
+        env: { ...process.env, LANG: "C", LC_ALL: "C", TZ: "UTC" },
         timeout: 500,
       },
       (error, stdout) => {

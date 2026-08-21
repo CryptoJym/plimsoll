@@ -22,7 +22,10 @@ import {
   launchAgentPlistPath,
   renderLaunchAgentPlist,
 } from "../packages/collector-cli/src/launch-agent";
-import { readProcessStartFingerprint } from "../packages/collector-cli/src/runtime-ownership";
+import {
+  readUtcProcessStartFingerprint,
+  UTC_PROCESS_START_ALGORITHM,
+} from "../packages/collector-cli/src/runtime-ownership";
 
 type CommandResult = {
   code: number | null;
@@ -605,12 +608,13 @@ esac
     renderedFixturePlist,
     { mode: 0o600 },
   );
-  const fingerprint = readProcessStartFingerprint(process.pid);
+  const fingerprint = readUtcProcessStartFingerprint(process.pid);
   check("proof_runtime_fingerprint_available", Boolean(fingerprint), { pid: process.pid });
   const runtimeIdentity = {
     instanceId: randomUUID(),
     pid: process.pid,
     processStartFingerprint: fingerprint!,
+    processStartFingerprintAlgorithm: UTC_PROCESS_START_ALGORITHM,
   };
   fs.writeFileSync(
     path.join(fixturePlimsoll, "collector.pid"),
@@ -620,7 +624,7 @@ esac
       cwd: neutralCwd,
       label: LAUNCH_AGENT_LABEL,
       startedAt: new Date().toISOString(),
-      version: 2,
+      version: 3,
     }, null, 2) + "\n",
     { mode: 0o600 },
   );

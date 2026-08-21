@@ -9,9 +9,31 @@ import path from "node:path";
 export const START_LOCK_LEASE_MS = 120_000;
 const OWNER_STABILITY_DELAY_MS = 100;
 
+// Issue #175: the legacy fingerprint hashes `ps -o lstart` text rendered in
+// the observer's local timezone. That algorithm and its hash domain are
+// frozen forever: persisted v2 records must keep validating against it.
+// New records use a UTC-rendered observation in a fresh hash domain.
+// An absent algorithm tag on record version 2 means the legacy algorithm.
+export const LEGACY_PROCESS_START_ALGORITHM = "plimsoll-ps-lstart-local-v1";
+export const UTC_PROCESS_START_ALGORITHM = "plimsoll-ps-lstart-utc-v2";
+
+const PROCESS_START_ALGORITHMS = new Set<string>([
+  LEGACY_PROCESS_START_ALGORITHM,
+  UTC_PROCESS_START_ALGORITHM,
+]);
+
+function isKnownFingerprintAlgorithm(value: unknown): value is string {
+  return typeof value === "string" && PROCESS_START_ALGORITHMS.has(value);
+}
+
+// The tri-state classifier result. `stale` is the ONLY state that may
+// authorize retirement or takeover; `indeterminate` never does.
+export type ProcessIdentityLiveness = "live" | "stale" | "indeterminate";
+
 export type ProcessIdentity = Readonly<{
   pid: number;
   processStartFingerprint: string;
+  processStartFingerprintAlgorithm?: string;
 }>;
 
 export type CollectorRuntimeIdentity = ProcessIdentity & Readonly<{
@@ -94,8 +116,57 @@ export type CollectorPidRecord = CollectorRuntimeIdentity & {
   cwd: string;
   label: string;
   startedAt: string;
-  version: 2;
+  version: 3;
 };
+
+// Parsed union of ownership-record generations. A record without an
+// algorithm tag is a legacy v2 record bound to the frozen legacy algorithm.
+// Unknown or mismatched algorithms fail closed (parsed as invalid).
+export type ParsedOwnershipIdentity = CollectorRuntimeIdentity & Readonly<{
+  processStartFingerprintAlgorithm: string;
+  legacy: boolean;
+}>;
+
+function parseOwnershipIdentityFields(
+  value: {
+    pid?: unknown;
+    instanceId?: unknown;
+    processStartFingerprint?: unknown;
+    processStartFingerprintAlgorithm?: unknown;
+  },
+): ParsedOwnershipIdentity | null {
+  if (
+    !Number.isInteger(value.pid) ||
+    ((value.pid as number) ?? 0) <= 0 ||
+    typeof value.instanceId !== "string" ||
+    value.instanceId.length < 32 ||
+    typeof value.processStartFingerprint !== "string" ||
+    !value.processStartFingerprint.startsWith("sha256:")
+  ) {
+    return null;
+  }
+  if (value.processStartFingerprintAlgorithm === undefined) {
+    return Object.freeze({
+      pid: value.pid as number,
+      instanceId: value.instanceId,
+      processStartFingerprint: value.processStartFingerprint,
+      processStartFingerprintAlgorithm: LEGACY_PROCESS_START_ALGORITHM,
+      legacy: true,
+    });
+  }
+  if (!isKnownFingerprintAlgorithm(value.processStartFingerprintAlgorithm)) {
+    // Unknown algorithm tag: fail closed. The record can never be
+    // interpreted as live by this binary.
+    return null;
+  }
+  return Object.freeze({
+    pid: value.pid as number,
+    instanceId: value.instanceId,
+    processStartFingerprint: value.processStartFingerprint,
+    processStartFingerprintAlgorithm: value.processStartFingerprintAlgorithm,
+    legacy: false,
+  });
+}
 
 export type CollectorPidFileRead =
   | { kind: "current"; fileIdentity: PidFileIdentity; raw: string; record: CollectorPidRecord }
@@ -193,8 +264,34 @@ export type CollectorPidCleanupHooks = Readonly<{
 type StartLockRecord = CollectorRuntimeIdentity & {
   createdAt: string;
   label: string;
-  version: 2;
+  version: 3;
 };
+
+function parseStartLock(raw: string, label: string): StartLockRecord | null {
+  try {
+    const parsed = JSON.parse(raw) as Omit<Partial<StartLockRecord>, "version"> & {
+      version?: unknown;
+      processStartFingerprintAlgorithm?: unknown;
+    };
+    // v2 and v3 parse as one union; a lock without an algorithm tag binds
+    // to the legacy algorithm. Unknown or mismatched tags fail closed.
+    if (
+      (parsed.version !== 2 && parsed.version !== 3) ||
+      parsed.label !== label ||
+      typeof parsed.createdAt !== "string" ||
+      !Number.isFinite(Date.parse(parsed.createdAt))
+    ) {
+      return null;
+    }
+    const identity = parseOwnershipIdentityFields(parsed);
+    if (!identity) return null;
+    return { ...(parsed as Omit<StartLockRecord, keyof CollectorRuntimeIdentity>), ...identity };
+  } catch {
+    // Invalid lock records are recoverable stale state only via the
+    // explicit dead-owner path below.
+  }
+  return null;
+}
 
 export type CollectorStartOwnership =
   | {
@@ -216,7 +313,9 @@ export class CollectorStartOwnershipError extends Error {
     readonly code:
       | "process_fingerprint_unavailable"
       | "pid_cleanup_ambiguous"
-      | "start_in_progress",
+      | "start_in_progress"
+      | "prior_owner_unverifiable"
+      | "unsafe_prior_record",
     message: string,
   ) {
     super(message);
@@ -233,6 +332,10 @@ function processIsRunning(pid: number) {
   }
 }
 
+// Legacy v1 observation: `ps -o lstart=` rendered in the observer's local
+// timezone with a C locale. The algorithm, its text handling, and its hash
+// domain are immutable — changing any of them would invalidate persisted
+// legacy records.
 export function readProcessStartFingerprint(pid: number) {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   const result = spawnSync("ps", ["-p", String(pid), "-o", "lstart="], {
@@ -251,8 +354,71 @@ export function readProcessStartFingerprint(pid: number) {
   );
 }
 
+// UTC v2 observation: the same ps source rendered under TZ=UTC so the text
+// is identical regardless of the observer's timezone or locale. Fresh hash
+// domain; the legacy domain is never reused.
+export function readUtcProcessStartFingerprint(pid: number) {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
+  const result = spawnSync("ps", ["-p", String(pid), "-o", "lstart="], {
+    encoding: "utf8",
+    env: { ...process.env, LANG: "C", LC_ALL: "C", TZ: "UTC" },
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 1_000,
+  });
+  const startedAt = result.status === 0 ? result.stdout.trim().replace(/\s+/g, " ") : "";
+  if (!startedAt) return null;
+  return (
+    "sha256:" +
+    createHash("sha256")
+      .update("plimsoll-process-start-utc-v2\0" + pid + "\0" + startedAt)
+      .digest("hex")
+  );
+}
+
+function readProcessStartFingerprintFor(
+  algorithm: string,
+  pid: number,
+): string | null {
+  return algorithm === UTC_PROCESS_START_ALGORITHM
+    ? readUtcProcessStartFingerprint(pid)
+    : readProcessStartFingerprint(pid);
+}
+
+// Tri-state liveness. Never collapse this to a boolean for cleanup
+// authority: only "stale" may retire, and every uncertain path
+// (unreadable ps, EPERM, unknown/mismatched algorithm) is indeterminate.
+export function classifyProcessIdentity(
+  identity: ProcessIdentity,
+): ProcessIdentityLiveness {
+  try {
+    process.kill(identity.pid, 0);
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH"
+      ? "stale"
+      : "indeterminate";
+  }
+  // Unknown or mismatched algorithm tags fail closed.
+  if (!isKnownFingerprintAlgorithm(identity.processStartFingerprintAlgorithm ?? undefined)) {
+    return "indeterminate";
+  }
+  const observed = readProcessStartFingerprintFor(
+    identity.processStartFingerprintAlgorithm ?? LEGACY_PROCESS_START_ALGORITHM,
+    identity.pid,
+  );
+  if (!observed) return "indeterminate";
+  if (observed === identity.processStartFingerprint) return "live";
+  // A legacy fingerprint mismatch may be a pure timezone-rendering artifact
+  // (issue #175's core hazard), so it never authorizes retirement.
+  // A UTC-fingerprint mismatch on a live PID proves the recorded process
+  // exited and the PID was reused: genuinely stale.
+  return (identity.processStartFingerprintAlgorithm ?? LEGACY_PROCESS_START_ALGORITHM) ===
+      UTC_PROCESS_START_ALGORITHM
+    ? "stale"
+    : "indeterminate";
+}
+
 export function createCollectorRuntimeIdentity(): CollectorRuntimeIdentity {
-  const processStartFingerprint = readProcessStartFingerprint(process.pid);
+  const processStartFingerprint = readUtcProcessStartFingerprint(process.pid);
   if (!processStartFingerprint) {
     throw new CollectorStartOwnershipError(
       "process_fingerprint_unavailable",
@@ -263,27 +429,34 @@ export function createCollectorRuntimeIdentity(): CollectorRuntimeIdentity {
     instanceId: randomUUID(),
     pid: process.pid,
     processStartFingerprint,
+    processStartFingerprintAlgorithm: UTC_PROCESS_START_ALGORITHM,
   });
 }
 
-function parseCurrentPidRecord(raw: string, label: string): CollectorPidRecord | null {
+function parseCurrentPidRecord(
+  raw: string,
+  label: string,
+): (CollectorPidRecord & ParsedOwnershipIdentity) | null {
   try {
-    const parsed = JSON.parse(raw) as Partial<CollectorPidRecord>;
+    const parsed = JSON.parse(raw) as Omit<Partial<CollectorPidRecord>, "version"> & {
+      version?: unknown;
+      processStartFingerprintAlgorithm?: unknown;
+    };
+    // v2 and v3 parse as one union: v3 requires the algorithm tag, v2
+    // records without the tag bind to the legacy algorithm. An unknown or
+    // mismatched tag fails closed and returns null.
     if (
-      parsed.version === 2 &&
-      parsed.label === label &&
-      Number.isInteger(parsed.pid) &&
-      (parsed.pid ?? 0) > 0 &&
-      typeof parsed.instanceId === "string" &&
-      parsed.instanceId.length >= 32 &&
-      typeof parsed.processStartFingerprint === "string" &&
-      parsed.processStartFingerprint.startsWith("sha256:") &&
-      Array.isArray(parsed.command) &&
-      typeof parsed.cwd === "string" &&
-      typeof parsed.startedAt === "string"
+      (parsed.version !== 2 && parsed.version !== 3) ||
+      parsed.label !== label ||
+      !Array.isArray(parsed.command) ||
+      typeof parsed.cwd !== "string" ||
+      typeof parsed.startedAt !== "string"
     ) {
-      return parsed as CollectorPidRecord;
+      return null;
     }
+    const identity = parseOwnershipIdentityFields(parsed);
+    if (!identity) return null;
+    return { ...(parsed as Omit<CollectorPidRecord, keyof CollectorRuntimeIdentity>), ...identity };
   } catch {
     // Invalid ownership records never become authority.
   }
@@ -512,6 +685,10 @@ export function readCollectorPidFile(pidPath: string, label: string): CollectorP
   return { kind: "invalid", fileIdentity, raw };
 }
 
+function identityAlgorithm(identity: ProcessIdentity): string {
+  return identity.processStartFingerprintAlgorithm ?? LEGACY_PROCESS_START_ALGORITHM;
+}
+
 export function runtimeIdentityMatches(
   left: CollectorRuntimeIdentity | null | undefined,
   right: CollectorRuntimeIdentity | null | undefined,
@@ -521,15 +698,15 @@ export function runtimeIdentityMatches(
       right &&
       left.pid === right.pid &&
       left.instanceId === right.instanceId &&
-      left.processStartFingerprint === right.processStartFingerprint,
+      left.processStartFingerprint === right.processStartFingerprint &&
+      identityAlgorithm(left) === identityAlgorithm(right),
   );
 }
 
+// Boolean liveness remains for read-only observation paths. Cleanup
+// authority MUST use classifyProcessIdentity instead.
 export function processIdentityIsLive(identity: ProcessIdentity) {
-  return (
-    processIsRunning(identity.pid) &&
-    readProcessStartFingerprint(identity.pid) === identity.processStartFingerprint
-  );
+  return classifyProcessIdentity(identity) === "live";
 }
 
 function removeFileIfUnchanged(filePath: string, expected: string) {
@@ -564,11 +741,21 @@ type CleanupArtifact = Readonly<{
 type CleanupMarkerRecord = Readonly<{
   actor: ProcessIdentity;
   label: string;
-  schema: "plimsoll.collector-pid-cleanup.v2";
+  // Cleanup markers are created only as schema v3, which carries explicit
+  // algorithm tags on both the actor and the target. Schema-v2 markers
+  // (untagged) parse as legacy and their raw bytes are preserved exactly.
+  schema: "plimsoll.collector-pid-cleanup.v3";
   state: "in_progress" | "retirement_pending" | "retirement_complete";
   target: CollectorRuntimeIdentity;
   transactionId: string;
 }>;
+
+const CLEANUP_MARKER_SCHEMAS = [
+  "plimsoll.collector-pid-cleanup.v3",
+  "plimsoll.collector-pid-cleanup.v2",
+] as const;
+
+type CleanupMarkerSchema = (typeof CLEANUP_MARKER_SCHEMAS)[number];
 
 type CleanupMarkerInspection =
   | { kind: "missing" }
@@ -688,7 +875,10 @@ function validProcessIdentity(value: unknown): value is ProcessIdentity {
       Number.isInteger(identity.pid) &&
       (identity.pid ?? 0) > 0 &&
       typeof identity.processStartFingerprint === "string" &&
-      identity.processStartFingerprint.startsWith("sha256:"),
+      identity.processStartFingerprint.startsWith("sha256:") &&
+      // Unknown algorithm tags fail closed even at the shape level.
+      (identity.processStartFingerprintAlgorithm === undefined ||
+        isKnownFingerprintAlgorithm(identity.processStartFingerprintAlgorithm)),
   );
 }
 
@@ -700,7 +890,7 @@ function inspectCleanupMarker(slotPath: string, label: string): CleanupMarkerIns
     if (
       Object.keys(parsed).sort().join("|") !==
         "actor|label|schema|state|target|transactionId" ||
-      parsed.schema !== "plimsoll.collector-pid-cleanup.v2" ||
+      !CLEANUP_MARKER_SCHEMAS.includes(parsed.schema as CleanupMarkerSchema) ||
       !["in_progress", "retirement_pending", "retirement_complete"].includes(
         parsed.state ?? "",
       ) ||
@@ -712,6 +902,20 @@ function inspectCleanupMarker(slotPath: string, label: string): CleanupMarkerIns
     ) {
       return { kind: "unsafe" };
     }
+    // v3 markers must carry explicit algorithm tags on actor and target;
+    // a v3 marker missing either tag fails closed.
+    if (
+      parsed.schema === "plimsoll.collector-pid-cleanup.v3" &&
+      (parsed.actor.processStartFingerprintAlgorithm === undefined ||
+        parsed.target.processStartFingerprintAlgorithm === undefined ||
+        !isKnownFingerprintAlgorithm(parsed.actor.processStartFingerprintAlgorithm) ||
+        !isKnownFingerprintAlgorithm(parsed.target.processStartFingerprintAlgorithm))
+    ) {
+      return { kind: "unsafe" };
+    }
+    // The raw bytes are never rewritten here: legacy v2 markers flow
+    // through byte-identically, and retirement moves preserve exact bytes
+    // via moveExactArtifactToArchive.
     return { ...inspected, record: parsed as CleanupMarkerRecord };
   } catch {
     return { kind: "unsafe" };
@@ -786,7 +990,7 @@ function createCleanupMarker(
   label: string,
   target: CollectorRuntimeIdentity,
 ): PresentCleanupMarker | null {
-  const actorFingerprint = readProcessStartFingerprint(process.pid);
+  const actorFingerprint = readUtcProcessStartFingerprint(process.pid);
   if (!actorFingerprint) return null;
   const artifacts = inspectCleanupArtifacts(pidPath, label);
   const markerPath = artifacts.marker.kind === "missing"
@@ -796,9 +1000,13 @@ function createCleanupMarker(
       : null;
   if (!markerPath) return null;
   const raw = markerRaw({
-    actor: { pid: process.pid, processStartFingerprint: actorFingerprint },
+    actor: {
+      pid: process.pid,
+      processStartFingerprint: actorFingerprint,
+      processStartFingerprintAlgorithm: UTC_PROCESS_START_ALGORITHM,
+    },
     label,
-    schema: "plimsoll.collector-pid-cleanup.v2",
+    schema: "plimsoll.collector-pid-cleanup.v3",
     state: "in_progress",
     target,
     transactionId: randomUUID(),
@@ -935,14 +1143,8 @@ function rewriteExactArtifact(
 }
 
 function processIdentityState(identity: ProcessIdentity): "live" | "not_live" | "indeterminate" {
-  try {
-    process.kill(identity.pid, 0);
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ESRCH" ? "not_live" : "indeterminate";
-  }
-  const fingerprint = readProcessStartFingerprint(identity.pid);
-  if (!fingerprint) return "indeterminate";
-  return fingerprint === identity.processStartFingerprint ? "live" : "not_live";
+  const classified = classifyProcessIdentity(identity);
+  return classified === "stale" ? "not_live" : classified;
 }
 
 type PresentCleanupMarker = Extract<CleanupMarkerInspection, { kind: "present" }>;
@@ -955,6 +1157,7 @@ function sameCleanupTransaction(
     left.label === right.label &&
     left.actor.pid === right.actor.pid &&
     left.actor.processStartFingerprint === right.actor.processStartFingerprint &&
+    identityAlgorithm(left.actor) === identityAlgorithm(right.actor) &&
     runtimeIdentityMatches(left.target, right.target);
 }
 
@@ -1255,15 +1458,9 @@ function sleep(milliseconds: number) {
 
 function validRuntimeIdentity(value: unknown): value is CollectorRuntimeIdentity {
   const identity = value as Partial<CollectorRuntimeIdentity> | null | undefined;
-  return Boolean(
-    identity &&
-      Number.isInteger(identity.pid) &&
-      (identity.pid ?? 0) > 0 &&
-      typeof identity.instanceId === "string" &&
-      identity.instanceId.length >= 32 &&
-      typeof identity.processStartFingerprint === "string" &&
-      identity.processStartFingerprint.startsWith("sha256:"),
-  );
+  return validProcessIdentity(value) &&
+    typeof identity?.instanceId === "string" &&
+    identity.instanceId.length >= 32;
 }
 
 function probeLoopbackPort(port: number, timeoutMs: number) {
@@ -1318,7 +1515,7 @@ async function statusRuntimeIdentity(port: number, timeoutMs: number) {
 }
 
 function identityKey(identity: ProcessIdentity) {
-  return [identity.pid, identity.processStartFingerprint].join("|");
+  return [identity.pid, identity.processStartFingerprint, identityAlgorithm(identity)].join("|");
 }
 
 function pidRuntimeIdentity(read: CollectorPidFileRead): CollectorRuntimeIdentity | null {
@@ -1327,6 +1524,8 @@ function pidRuntimeIdentity(read: CollectorPidFileRead): CollectorRuntimeIdentit
         instanceId: read.record.instanceId,
         pid: read.record.pid,
         processStartFingerprint: read.record.processStartFingerprint,
+        processStartFingerprintAlgorithm:
+          read.record.processStartFingerprintAlgorithm ?? LEGACY_PROCESS_START_ALGORITHM,
       }
     : null;
 }
@@ -1407,7 +1606,9 @@ async function observeLaunchAgentUnloadOnce(options: {
   prior: LaunchAgentUnloadPriorState;
   observeLabel: () => LaunchAgentLabelObservation | Promise<LaunchAgentLabelObservation>;
   observeListener: () => Promise<CollectorListenerObservation>;
-  processIsLive: (identity: ProcessIdentity) => boolean;
+  // Tri-state authority: cleanup runs only on "stale". An injected boolean
+  // liveness predicate must never become cleanup authority (issue #175).
+  classifyIdentity: (identity: ProcessIdentity) => ProcessIdentityLiveness;
   readPidFile: (pidPath: string, label: string) => CollectorPidFileRead;
   readCleanupState: (pidPath: string, label: string) => CollectorPidCleanupState;
   reconcileCleanupState: (
@@ -1428,7 +1629,9 @@ async function observeLaunchAgentUnloadOnce(options: {
     options.observeLabel(),
     options.observeListener(),
   ]);
-  const priorRuntimeLive = priorIdentities.some(options.processIsLive);
+  const priorRuntimeLive = priorIdentities.some(
+    (identity) => options.classifyIdentity(identity) === "live",
+  );
   const listenerIdentity = listenerState.kind === "collector"
     ? listenerState.runtimeIdentity
     : null;
@@ -1451,7 +1654,7 @@ async function observeLaunchAgentUnloadOnce(options: {
     currentPidIdentity &&
     currentPidMatchesPrior &&
     options.prior.ownership === "consistent" &&
-    !options.processIsLive(currentPidIdentity)
+    options.classifyIdentity(currentPidIdentity) === "stale"
   ) {
     const attemptedIdentity = currentPidIdentity;
     const cleanup = options.removePidFile(
@@ -1560,7 +1763,7 @@ export async function observeLaunchAgentUnloadTerminalState(options: {
   pollIntervalMs?: number;
   observeLabel: () => LaunchAgentLabelObservation | Promise<LaunchAgentLabelObservation>;
   observeListener?: () => Promise<CollectorListenerObservation>;
-  processIsLive?: (identity: ProcessIdentity) => boolean;
+  classifyIdentity?: (identity: ProcessIdentity) => ProcessIdentityLiveness;
   readPidFile?: (pidPath: string, label: string) => CollectorPidFileRead;
   readCleanupState?: (pidPath: string, label: string) => CollectorPidCleanupState;
   reconcileCleanupState?: (
@@ -1582,7 +1785,7 @@ export async function observeLaunchAgentUnloadTerminalState(options: {
   const startedAt = now();
   const deadline = startedAt + timeoutMs;
   const observeListener = options.observeListener ?? (() => observeCollectorListener(options.port));
-  const processIsLive = options.processIsLive ?? processIdentityIsLive;
+  const classifyIdentity = options.classifyIdentity ?? classifyProcessIdentity;
   const readPidFile = options.readPidFile ?? readCollectorPidFile;
   const readCleanupState = options.readCleanupState ?? readCollectorPidCleanupState;
   const reconcileCleanupState =
@@ -1602,7 +1805,7 @@ export async function observeLaunchAgentUnloadTerminalState(options: {
       prior: options.prior,
       observeLabel: options.observeLabel,
       observeListener,
-      processIsLive,
+      classifyIdentity,
       readPidFile,
       readCleanupState,
       reconcileCleanupState,
@@ -1636,7 +1839,7 @@ export async function observeLaunchAgentUnloadTerminalState(options: {
     prior: options.prior,
     observeLabel: options.observeLabel,
     observeListener,
-    processIsLive,
+    classifyIdentity,
     readPidFile,
     readCleanupState,
     reconcileCleanupState,
@@ -1693,35 +1896,14 @@ export async function verifyCollectorRuntimeIdentity(
   return processIdentityIsLive(expected);
 }
 
-function parseStartLock(raw: string, label: string): StartLockRecord | null {
-  try {
-    const parsed = JSON.parse(raw) as Partial<StartLockRecord>;
-    if (
-      parsed.version === 2 &&
-      parsed.label === label &&
-      Number.isInteger(parsed.pid) &&
-      (parsed.pid ?? 0) > 0 &&
-      typeof parsed.instanceId === "string" &&
-      parsed.instanceId.length >= 32 &&
-      typeof parsed.processStartFingerprint === "string" &&
-      parsed.processStartFingerprint.startsWith("sha256:") &&
-      typeof parsed.createdAt === "string" &&
-      Number.isFinite(Date.parse(parsed.createdAt))
-    ) {
-      return parsed as StartLockRecord;
-    }
-  } catch {
-    // Invalid lock records are recoverable stale state.
-  }
-  return null;
-}
-
 function startLockIsCurrent(lock: StartLockRecord, now: number) {
   const ageMs = now - Date.parse(lock.createdAt);
+  // A live or indeterminate lock holder blocks startup; only a proven-stale
+  // lease may be reclaimed.
   return (
     ageMs >= 0 &&
     ageMs <= START_LOCK_LEASE_MS &&
-    processIdentityIsLive(lock)
+    classifyProcessIdentity(lock) !== "stale"
   );
 }
 
@@ -1734,6 +1916,7 @@ function pidRecordKey(record: CollectorPidRecord) {
     record.pid,
     record.instanceId,
     record.processStartFingerprint,
+    identityAlgorithm(record),
   ].join("|");
 }
 
@@ -1767,25 +1950,101 @@ export async function acquireCollectorStartOwnership(options: {
       );
     }
     const existing = readCollectorPidFile(options.pidPath, options.label);
-    if (existing.kind === "current" && knownUnhealthyRecord !== pidRecordKey(existing.record)) {
-      if (
-        await verifyCollectorRuntimeIdentity(options.port, existing.record, {
-          probeCount: 2,
-          probeTimeoutMs,
-        })
-      ) {
-        return {
-          kind: "already_running",
-          pidPath: options.pidPath,
-          port: options.port,
-          runtimeIdentity: {
-            instanceId: existing.record.instanceId,
-            pid: existing.record.pid,
-            processStartFingerprint: existing.record.processStartFingerprint,
-          },
-        };
+    if (existing.kind === "unsafe") {
+      throw new CollectorStartOwnershipError(
+        "unsafe_prior_record",
+        "The collector PID file failed its safety inspection; ownership is unverifiable.",
+      );
+    }
+    if (existing.kind === "invalid") {
+      throw new CollectorStartOwnershipError(
+        "prior_owner_unverifiable",
+        "The collector PID record cannot be parsed as any known ownership generation.",
+      );
+    }
+    if (existing.kind === "legacy") {
+      // Legacy owner: only kill(pid, 0) === ESRCH authorizes retirement.
+      // A present PID (hash verifiable or not) blocks startup fail-closed.
+      try {
+        process.kill(existing.pid, 0);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ESRCH") {
+          throw new CollectorStartOwnershipError(
+            "prior_owner_unverifiable",
+            "A legacy collector PID record is present but liveness could not be disproven.",
+          );
+        }
+        if (!removeFileIfUnchanged(options.pidPath, existing.raw)) {
+          throw new CollectorStartOwnershipError(
+            "prior_owner_unverifiable",
+            "A dead legacy collector PID record changed before retirement.",
+          );
+        }
+        // Explicit dead-legacy retirement succeeded; fall through to claim.
       }
-      knownUnhealthyRecord = pidRecordKey(existing.record);
+      if (existing.raw && fs.existsSync(options.pidPath)) {
+        const stillThere = readCollectorPidFile(options.pidPath, options.label);
+        if (
+          stillThere.kind === "legacy" ||
+          stillThere.kind === "current" ||
+          stillThere.kind === "invalid"
+        ) {
+          throw new CollectorStartOwnershipError(
+            "prior_owner_unverifiable",
+            "A live legacy collector PID record blocks startup.",
+          );
+        }
+      }
+    }
+    if (existing.kind === "current" && knownUnhealthyRecord !== pidRecordKey(existing.record)) {
+      const classified = classifyProcessIdentity(existing.record);
+      if (classified === "indeterminate") {
+        throw new CollectorStartOwnershipError(
+          "prior_owner_unverifiable",
+          "The recorded collector identity could not be verified exactly; takeover is refused.",
+        );
+      }
+      const existingAlgorithm =
+        existing.record.processStartFingerprintAlgorithm ?? LEGACY_PROCESS_START_ALGORITHM;
+      if (classified === "live") {
+        if (
+          await verifyCollectorRuntimeIdentity(options.port, existing.record, {
+            probeCount: 2,
+            probeTimeoutMs,
+          })
+        ) {
+          return {
+            kind: "already_running",
+            pidPath: options.pidPath,
+            port: options.port,
+            runtimeIdentity: {
+              instanceId: existing.record.instanceId,
+              pid: existing.record.pid,
+              processStartFingerprint: existing.record.processStartFingerprint,
+              processStartFingerprintAlgorithm:
+                existing.record.processStartFingerprintAlgorithm ??
+                LEGACY_PROCESS_START_ALGORITHM,
+            },
+          };
+        }
+        if (existingAlgorithm === LEGACY_PROCESS_START_ALGORITHM) {
+          // A live legacy owner verified by exact hash match blocks
+          // fail-closed; its record may never be removed by this binary.
+          throw new CollectorStartOwnershipError(
+            "prior_owner_unverifiable",
+            "A legacy collector PID record verifies live and blocks startup.",
+          );
+        }
+        // Timezone-invariant liveness with an unconfirmed listener retries
+        // via the knownUnhealthyRecord loop; removal still requires the
+        // record to classify stale on a later pass.
+        knownUnhealthyRecord = pidRecordKey(existing.record);
+        await sleep(100);
+        continue;
+      }
+      // classified === "stale": the PID is absent (ESRCH), or a v3 record
+      // shows same-PID/wrong-hash reuse. Retirement is authorized.
+      void existingAlgorithm;
     }
 
     const serializedLock =
@@ -1795,7 +2054,9 @@ export async function acquireCollectorStartOwnership(options: {
         label: options.label,
         pid: options.candidateIdentity.pid,
         processStartFingerprint: options.candidateIdentity.processStartFingerprint,
-        version: 2,
+        processStartFingerprintAlgorithm:
+          options.candidateIdentity.processStartFingerprintAlgorithm ?? UTC_PROCESS_START_ALGORITHM,
+        version: 3,
       } satisfies StartLockRecord) + "\n";
 
     try {
@@ -1810,37 +2071,54 @@ export async function acquireCollectorStartOwnership(options: {
       }
 
       const rechecked = readCollectorPidFile(options.pidPath, options.label);
-      if (
-        rechecked.kind === "current" &&
-        knownUnhealthyRecord !== pidRecordKey(rechecked.record)
-      ) {
-        if (
-          await verifyCollectorRuntimeIdentity(options.port, rechecked.record, {
-            probeCount: 2,
-            probeTimeoutMs,
-          })
-        ) {
+      if (rechecked.kind === "current" && knownUnhealthyRecord !== pidRecordKey(rechecked.record)) {
+        const classified = classifyProcessIdentity(rechecked.record);
+        if (classified === "indeterminate") {
           releaseLock(lockPath, serializedLock);
-          return {
-            kind: "already_running",
-            pidPath: options.pidPath,
-            port: options.port,
-            runtimeIdentity: {
-              instanceId: rechecked.record.instanceId,
-              pid: rechecked.record.pid,
-              processStartFingerprint: rechecked.record.processStartFingerprint,
-            },
-          };
+          throw new CollectorStartOwnershipError(
+            "prior_owner_unverifiable",
+            "The re-checked collector identity could not be verified exactly; takeover is refused.",
+          );
         }
-        knownUnhealthyRecord = pidRecordKey(rechecked.record);
+        if (classified === "live") {
+          if (
+            await verifyCollectorRuntimeIdentity(options.port, rechecked.record, {
+              probeCount: 2,
+              probeTimeoutMs,
+            })
+          ) {
+            releaseLock(lockPath, serializedLock);
+            return {
+              kind: "already_running",
+              pidPath: options.pidPath,
+              port: options.port,
+              runtimeIdentity: {
+                instanceId: rechecked.record.instanceId,
+                pid: rechecked.record.pid,
+                processStartFingerprint: rechecked.record.processStartFingerprint,
+                processStartFingerprintAlgorithm:
+                  rechecked.record.processStartFingerprintAlgorithm ??
+                  LEGACY_PROCESS_START_ALGORITHM,
+              },
+            };
+          }
+          knownUnhealthyRecord = pidRecordKey(rechecked.record);
+          releaseLock(lockPath, serializedLock);
+          await sleep(100);
+          continue;
+        }
       }
 
-      if (
-        rechecked.kind === "current" ||
-        rechecked.kind === "legacy" ||
-        rechecked.kind === "invalid"
-      ) {
+      // Only proven-stale current records or already-retired dead legacy
+      // records reach this removal. Invalid/unsafe records never do.
+      if (rechecked.kind === "current") {
         removeFileIfUnchanged(options.pidPath, rechecked.raw);
+      } else if (rechecked.kind !== "missing") {
+        releaseLock(lockPath, serializedLock);
+        throw new CollectorStartOwnershipError(
+          "prior_owner_unverifiable",
+          "An unexpected prior collector record (" + rechecked.kind + ") appeared during start.",
+        );
       }
 
       let released = false;
