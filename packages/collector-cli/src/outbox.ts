@@ -286,13 +286,25 @@ export class DeliveryOutbox {
   private enabled: boolean;
   private limits: DeliveryLimits;
   private workspaceId: string | null;
+  /** Injectable clock for eligibility/claim bookkeeping (issue 0182). Every
+   * timestamp this class writes that later feeds a lease/eligibility
+   * comparison — notably enqueueRaw's next_attempt_at — must come from here,
+   * never from the wall clock, or an injected caller clock can silently
+   * disagree with these stamps and empty a claim. */
+  private readonly clock: () => Date;
 
   constructor(
     private readonly db: Database.Database,
-    options: { enabled?: boolean; limits?: Partial<DeliveryLimits>; workspaceId?: string } = {},
+    options: {
+      enabled?: boolean;
+      limits?: Partial<DeliveryLimits>;
+      workspaceId?: string;
+      now?: () => Date;
+    } = {},
   ) {
     this.enabled = options.enabled ?? false;
     this.limits = asLimits(options.limits);
+    this.clock = options.now ?? (() => new Date());
     this.workspaceId = options.workspaceId?.trim() || null;
     this.initializeSchema();
     if (this.enabled) this.reopenMigrationPastWatermark();
@@ -543,8 +555,8 @@ export class DeliveryOutbox {
          migration_complete = 0, migration_paused_reason = null,
          privacy_migration_version = 1, updated_at = @now
        where singleton = 1 and privacy_migration_version < 1`,
-    ).run({ now: new Date().toISOString() });
-  }
+     ).run({ now: this.clock().toISOString() });
+   }
 
   /**
    * Keep the completed legacy watermark truthful without scanning history.
@@ -561,12 +573,12 @@ export class DeliveryOutbox {
            and migration_cursor_rowid <
              (select coalesce(max(rowid), 0) from buffered_events)`,
       )
-      .run({ now: new Date().toISOString() });
+      .run({ now: this.clock().toISOString() });
   }
 
   noteRawAppend(rawRowid: number) {
     if (!Number.isSafeInteger(rawRowid) || rawRowid <= 0) return;
-    const now = new Date().toISOString();
+    const now = this.clock().toISOString();
     if (this.enabled) {
       // A configured append is projected in the same transaction immediately
       // after this call, so an already-complete high-water can advance in O(1).
@@ -603,13 +615,13 @@ export class DeliveryOutbox {
         this.db,
         row.rawRowid,
         existingReceipt.reason,
-        new Date().toISOString(),
+        this.clock().toISOString(),
       );
       return { enqueued: 0, dead: 0 };
     }
     const prepared = prepareDelivery(row, this.limits.maxItemBytes);
     if (prepared.ok === false) {
-      const terminalAt = new Date().toISOString();
+      const terminalAt = this.clock().toISOString();
       if (isTerminalPrivacyReason(prepared.reason)) {
         markRawPrivacyDisposition(this.db, row.rawRowid, prepared.reason, terminalAt);
       }
@@ -626,7 +638,7 @@ export class DeliveryOutbox {
       };
     }
     if (!row.privacyGeneration) {
-      const terminalAt = new Date().toISOString();
+      const terminalAt = this.clock().toISOString();
       markRawPrivacyDisposition(
         this.db,
         row.rawRowid,
@@ -645,7 +657,10 @@ export class DeliveryOutbox {
         }),
       };
     }
-    const now = new Date().toISOString();
+    // next_attempt_at is the lease-eligibility gate. It must come from the
+    // injectable clock: a wall-clock stamp here can silently fall after a
+    // caller's injected lease clock and empty every future claim (issue 0182).
+    const now = this.clock().toISOString();
     const inserted = this.db
       .prepare(
         `insert or ignore into upload_outbox
@@ -704,7 +719,7 @@ export class DeliveryOutbox {
         rawRowid,
         repoHash: canonicalLinkage(repoHash),
         branchHash: canonicalLinkage(branchHash),
-        now: new Date().toISOString(),
+        now: this.clock().toISOString(),
       }).changes;
   }
 
