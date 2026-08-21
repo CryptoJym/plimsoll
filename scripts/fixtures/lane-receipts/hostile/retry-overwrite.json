@@ -1,0 +1,26 @@
+{
+  "description": "A retry that erased the original failure observation and rewrote the source head.",
+  "before": [
+    {
+      "attemptId": "attempt-7",
+      "sourceHead": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "observations": [
+        { "result": "fail", "sourceHead": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "failureSummary": "proof:lane-receipts failed check X" }
+      ]
+    }
+  ],
+  "after": [
+    {
+      "attemptId": "attempt-7",
+      "sourceHead": "cccccccccccccccccccccccccccccccccccccccc",
+      "observations": [
+        { "result": "pass", "sourceHead": "cccccccccccccccccccccccccccccccccccccccc" }
+      ]
+    }
+  ],
+  "overwriteAttempt": {
+    "attemptId": "attempt-7",
+    "sourceHead": "dddddddddddddddddddddddddddddddddddddddd",
+    "result": "pass"
+  }
+}

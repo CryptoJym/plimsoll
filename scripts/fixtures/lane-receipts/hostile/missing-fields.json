@@ -1,0 +1,26 @@
+{
+  "description": "Preflight missing required fields and carrying an out-of-vocabulary liveness value.",
+  "preflights": [
+    { "laneId": "lane-001", "ownerRole": "builder" },
+    {
+      "laneId": "lane-002",
+      "ownerRole": "emperor",
+      "branch": "feat/x",
+      "baseSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "headSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "cleanState": "CLEAN",
+      "lastActivityAtMs": 1000,
+      "liveness": "ZOMBIE"
+    },
+    {
+      "laneId": "lane-003",
+      "ownerRole": "builder",
+      "branch": "feat/y",
+      "baseSha": "not-a-sha",
+      "headSha": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+      "cleanState": 7,
+      "lastActivityAtMs": "yesterday",
+      "liveness": null
+    }
+  ]
+}
