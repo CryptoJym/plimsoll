@@ -248,6 +248,12 @@ tr.row:focus-visible{background:rgba(35,137,167,.12)}
 .vendor-break{padding-top:6px}
 .leverage-good{color:var(--signal-green)}
 .leverage-low{color:var(--signal-amber)}
+.outcome-grid{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:1px;background:var(--line);border:1px solid var(--line);margin:12px 0}
+.outcome-stat{background:var(--sea-1);padding:11px 12px;min-width:0}
+.outcome-stat small{display:block;color:var(--foam-faint);font-size:9px;letter-spacing:.14em;text-transform:uppercase;margin-bottom:5px}
+.outcome-stat b{font-size:18px;color:var(--foam);font-variant-numeric:tabular-nums;font-weight:400}
+.outcome-note{font-size:10px;color:var(--foam-faint);margin:8px 0 12px}
+@media(max-width:760px){.outcome-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 [hidden]{display:none!important}
 @media (prefers-reduced-motion:reduce){
   *,*::before,*::after{animation:none!important;transition:none!important}
@@ -332,6 +338,17 @@ tr.row:focus-visible{background:rgba(35,137,167,.12)}
     <section class="plate span12">
       <h2>Daily spend</h2>
       <svg class="spark" id="spark" preserveAspectRatio="none"></svg>
+    </section>
+
+    <section class="plate span12" id="outcome-plate">
+      <h2>Outcome performance · <span class="plate-meta plain" id="outcome-meta">immutable timeline · observed only</span></h2>
+      <div class="outcome-grid" id="outcome-metrics" aria-live="polite"></div>
+      <svg class="spark" id="outcome-spark" preserveAspectRatio="none"></svg>
+      <div class="outcome-note" id="outcome-note">UNKNOWN means the timeline lacks required evidence or policy coverage — never zero.</div>
+      <table id="t-outcomes" aria-label="Outcome performance over time"><thead><tr>
+        <th scope="col">day</th><th class="num" scope="col">pulls</th><th class="num" scope="col">merged</th><th class="num" scope="col">first pass</th><th class="num" scope="col">failed</th><th class="num" scope="col">unknown</th><th class="num" scope="col">rework</th>
+      </tr></thead><tbody></tbody></table>
+      <div class="empty" id="e-outcomes" hidden>no materialized outcome timeline in this window — run the explicit outcome backfill</div>
     </section>
 
     <section class="plate span6">
@@ -553,6 +570,53 @@ function drawSpark(daily){
   }
 }
 
+function outcomeDuration(ms){
+  if(ms==null)return"UNKNOWN";
+  if(ms<60000)return Math.round(ms/1000)+"s";
+  if(ms<3600000)return Math.round(ms/60000)+"m";
+  return Math.round(ms/3600000)+"h";
+}
+function drawOutcomeSpark(daily){
+  const svg=$("#outcome-spark"),W=svg.clientWidth||1000,H=120,pad=18;
+  svg.setAttribute("role","img");svg.setAttribute("viewBox",`0 0 ${W} ${H}`);clear(svg);
+  if(!daily.length){
+    svg.setAttribute("aria-label","No materialized outcome timeline in window");
+    const message=svgNode("text",{x:W/2,y:H/2,"text-anchor":"middle"});message.textContent="no materialized outcomes in window";svg.appendChild(message);return;
+  }
+  const max=Math.max(...daily.map(d=>Number(d.merged)||0),1),bw=Math.max(2,(W-pad*2)/daily.length-3);
+  svg.setAttribute("aria-label",`Observed merges over time, ${daily[0].day} to ${daily[daily.length-1].day}, peak ${max} in one day`);
+  svg.appendChild(svgNode("line",{x1:0,y1:H-14,x2:W,y2:H-14}));
+  daily.forEach((d,i)=>{
+    const merged=Number(d.merged)||0;if(!merged)return;
+    const h=Math.max(2.5,merged/max*(H-34)),x=pad+i*((W-pad*2)/daily.length),rect=svgNode("rect",{class:"bar",x,y:H-14-h,width:bw,height:h});
+    add(rect,add(svgNode("title"),`${d.day} · ${fmt(merged)} merged observed · ${fmt(d.firstPass)} first pass · ${fmt(d.checksUnknown)} UNKNOWN checks`));svg.appendChild(rect);
+  });
+  for(const entry of [{x:pad,y:H-3,text:daily[0].day},{x:W-pad,y:H-3,text:daily[daily.length-1].day,anchor:"end"},{x:W-pad,y:12,text:`peak ${fmt(max)} merged/day`,anchor:"end"}]){
+    const label=svgNode("text",{x:entry.x,y:entry.y,...(entry.anchor?{"text-anchor":entry.anchor}:{})});label.textContent=entry.text;svg.appendChild(label);
+  }
+}
+function renderOutcomePerformance(performance){
+  const box=clear($("#outcome-metrics"));
+  if(!performance){
+    const stat=node("div",null,"outcome-stat");add(stat,node("small","outcome timeline"),node("b","not materialized","foam-dim"));box.appendChild(stat);
+    $("#outcome-meta").textContent="run explicit outcome backfill";drawOutcomeSpark([]);rows("#t-outcomes","#e-outcomes",[],()=>null);return;
+  }
+  const totals=performance.totals||{},daily=Array.isArray(performance.daily)?performance.daily:[];
+  const stats=[
+    ["merged · observed",fmt(totals.merged)],
+    ["first pass",fmt(totals.firstPass)],
+    ["checks UNKNOWN",fmt(totals.checksUnknown)],
+    ["avg time to green",outcomeDuration(totals.averageTimeToGreenMs)],
+  ];
+  for(const [label,value] of stats){const stat=node("div",null,"outcome-stat");add(stat,node("small",label),node("b",value));box.appendChild(stat)}
+  $("#outcome-meta").textContent=`generation ${fmt(performance.generation)} · ${fmt(totals.pulls)} dated pulls`;
+  $("#outcome-note").textContent=`${fmt(totals.mergeUnknown)} merge UNKNOWN · ${fmt(totals.reworkObserved)} rework observed · UNKNOWN means required evidence or policy coverage is absent — never zero.`;
+  drawOutcomeSpark(daily);
+  rows("#t-outcomes","#e-outcomes",daily,item=>tableRow([
+    {content:item.day},{content:fmt(item.pulls),className:"num"},{content:fmt(item.merged),className:"num brass"},{content:fmt(item.firstPass),className:"num"},{content:fmt(item.firstPassFailed),className:"num"},{content:fmt(item.checksUnknown),className:"num hash"},{content:fmt(item.reworkObserved),className:"num"},
+  ]));
+}
+
 function gauge(pct){
   const water=$("#gauge-water"), line=$("#gauge-line"), num=$("#cov-pct");
   // water height = unattributed share; line sits at attribution mark
@@ -710,6 +774,7 @@ function renderSnapshot(d){
   $("#kv-cachew").textContent=t.cacheCreationTokens>0?fmt(t.cacheCreationTokens):"—";$("#kv-sessions").textContent=fmt(t.sessions);
   const pct=t.sessions?t.sessionsWithTokens/t.sessions:0;gauge(pct);$("#cov-note").textContent=`${fmt(t.sessionsWithTokens)} of ${fmt(t.sessions)} sessions carry token telemetry`;
   drawSpark(s.daily||[]);
+  renderOutcomePerformance(d.outcomePerformance||null);
   const planUsd=(acct.accounts||[]).reduce((sum,item)=>sum+(item.subscription?(item.subscription.planCostWindow||0):0),0);renderRail(t.costUsd||0,planUsd,$("#window-label").textContent);
   rows("#t-models","#e-models",s.byModel||[],item=>{
     const model=node("span",item.model);model.title=String(item.model??"");

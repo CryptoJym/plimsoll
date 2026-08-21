@@ -786,6 +786,7 @@ export type OutcomeTimelineBackfillReceipt = {
   completedThrough: string | null;
   activeUntil: string | null;
   rateReceipt: GitHubRateReceipt | null;
+  performance: { inserted: number; updated: number; unchanged: number; generation: number };
 };
 
 export async function runOutcomeTimelineBackfill(input: {
@@ -1178,6 +1179,15 @@ export async function runOutcomeTimelineBackfill(input: {
     incomplete: runCoverage.filter((row) => row.status === "incomplete").length,
     unknown: runCoverage.filter((row) => row.status === "unknown").length,
   };
+  // The GitHub collection is still explicit and bounded. This follow-up is
+  // local-only: materialize every immutable fact we already have, including
+  // historical rows from earlier backfill runs.
+  const performance = input.store.materializePerformance({
+    repositoryExternalId: repoExternalId,
+    requiredChecks: input.requiredChecks,
+    reworkWindowDays,
+    now: now(),
+  });
   const receipt: OutcomeTimelineBackfillReceipt = {
     schema: "plimsoll.outcome-timeline-backfill.v1",
     runId,
@@ -1194,6 +1204,7 @@ export async function runOutcomeTimelineBackfill(input: {
     completedThrough: state.completedThrough,
     activeUntil: state.activeWindow?.until ?? null,
     rateReceipt: state.lastRateReceipt,
+    performance,
   };
   input.store.recordRun(runId, receipt, now());
   return receipt;

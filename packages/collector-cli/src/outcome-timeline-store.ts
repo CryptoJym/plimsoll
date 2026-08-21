@@ -12,6 +12,12 @@ import {
   type OutcomeTimelineCoverage,
   type PullTimelineFact,
 } from "../../shared/src/index";
+import {
+  deriveOutcomePerformanceRecords,
+  parseOutcomePerformanceRecord,
+  summarizeOutcomePerformance,
+  type OutcomePerformanceRecord,
+} from "./performance-layer";
 
 function canonicalValue(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(canonicalValue);
@@ -83,6 +89,26 @@ export class OutcomeTimelineStore {
         canonical_json text not null,
         recorded_at text not null
       );
+
+      -- Derived-only local read model. Immutable facts remain the source of
+      -- truth; this table makes old facts usable by dashboard/report callers
+      -- without any GitHub request or background work.
+      create table if not exists outcome_timeline_performance (
+        repository_external_id text not null,
+        pull_external_id text not null,
+        pull_number integer not null,
+        occurred_at text,
+        canonical_json text not null,
+        materialized_at text not null,
+        primary key (repository_external_id, pull_external_id)
+      );
+      create index if not exists outcome_timeline_performance_time
+        on outcome_timeline_performance(repository_external_id, occurred_at, pull_number);
+      create table if not exists outcome_timeline_performance_state (
+        singleton integer primary key check (singleton = 1),
+        generation integer not null
+      );
+      insert or ignore into outcome_timeline_performance_state (singleton, generation) values (1, 0);
     `);
   }
 
@@ -225,6 +251,114 @@ export class OutcomeTimelineStore {
           .prepare("select canonical_json as canonicalJson from outcome_timeline_coverage order by id")
           .all() as Array<{ canonicalJson: string }>);
     return rows.map((row) => outcomeTimelineCoverageSchema.parse(JSON.parse(row.canonicalJson)));
+  }
+
+  /**
+   * Deterministically materialize all persisted timeline facts. Replays only
+   * update rows whose canonical derivation changed, so an already backfilled
+   * store is a no-op. This never fetches or fabricates outcome evidence.
+   */
+  materializePerformance(input: {
+    repositoryExternalId?: string;
+    requiredChecks?: { names: string[] };
+    reworkWindowDays?: number;
+    now?: string;
+  } = {}): { inserted: number; updated: number; unchanged: number; generation: number } {
+    const now = input.now ?? new Date().toISOString();
+    const facts = this.facts(input.repositoryExternalId);
+    const coverage = this.coverage().filter(
+      (row) => !input.repositoryExternalId || row.repositoryExternalId === input.repositoryExternalId,
+    );
+    const records = deriveOutcomePerformanceRecords({
+      facts,
+      coverage,
+      requiredChecks: input.requiredChecks,
+      reworkWindowDays: input.reworkWindowDays,
+    });
+    return this.database.transaction(() => {
+      const existing = this.database.prepare(
+        `select canonical_json as canonicalJson from outcome_timeline_performance
+         where repository_external_id = ? and pull_external_id = ?`,
+      );
+      const insert = this.database.prepare(
+        `insert into outcome_timeline_performance
+         (repository_external_id, pull_external_id, pull_number, occurred_at, canonical_json, materialized_at)
+         values (?, ?, ?, ?, ?, ?)`,
+      );
+      const update = this.database.prepare(
+        `update outcome_timeline_performance set pull_number = ?, occurred_at = ?, canonical_json = ?, materialized_at = ?
+         where repository_external_id = ? and pull_external_id = ?`,
+      );
+      let inserted = 0;
+      let updated = 0;
+      let unchanged = 0;
+      for (const record of records) {
+        const canonicalJson = canonicalTimelineJson(record);
+        const prior = existing.get(record.repositoryExternalId, record.pullExternalId) as
+          | { canonicalJson: string }
+          | undefined;
+        if (!prior) {
+          insert.run(
+            record.repositoryExternalId,
+            record.pullExternalId,
+            record.pullNumber,
+            record.occurredAt,
+            canonicalJson,
+            now,
+          );
+          inserted += 1;
+        } else if (prior.canonicalJson !== canonicalJson) {
+          update.run(
+            record.pullNumber,
+            record.occurredAt,
+            canonicalJson,
+            now,
+            record.repositoryExternalId,
+            record.pullExternalId,
+          );
+          updated += 1;
+        } else {
+          unchanged += 1;
+        }
+      }
+      if (inserted || updated) {
+        this.database.prepare(
+          `update outcome_timeline_performance_state set generation = generation + 1 where singleton = 1`,
+        ).run();
+      }
+      const generation = (this.database.prepare(
+        `select generation from outcome_timeline_performance_state where singleton = 1`,
+      ).get() as { generation: number }).generation;
+      return { inserted, updated, unchanged, generation };
+    })();
+  }
+
+  performanceRecords(repositoryExternalId?: string): OutcomePerformanceRecord[] {
+    const rows = repositoryExternalId
+      ? (this.database.prepare(
+          `select canonical_json as canonicalJson from outcome_timeline_performance
+           where repository_external_id = ? order by occurred_at, pull_number, pull_external_id`,
+        ).all(repositoryExternalId) as Array<{ canonicalJson: string }>)
+      : (this.database.prepare(
+          `select canonical_json as canonicalJson from outcome_timeline_performance
+           order by occurred_at, pull_number, pull_external_id`,
+        ).all() as Array<{ canonicalJson: string }>);
+    return rows.map((row) => parseOutcomePerformanceRecord(JSON.parse(row.canonicalJson)));
+  }
+
+  performanceGeneration(): number {
+    return (this.database.prepare(
+      `select generation from outcome_timeline_performance_state where singleton = 1`,
+    ).get() as { generation: number }).generation;
+  }
+
+  performanceSummary(days: number, asOf?: string) {
+    return summarizeOutcomePerformance({
+      records: this.performanceRecords(),
+      days,
+      generation: this.performanceGeneration(),
+      asOf,
+    });
   }
 
   close(): void {

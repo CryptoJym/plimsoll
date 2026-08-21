@@ -47,6 +47,9 @@
     "learning:evidence": "tsx scripts/learning-evidence-packet.ts",
     "proof:dashboard-security": "tsx scripts/dashboard-security-proof.ts",
     "proof:outcome-timeline": "tsx scripts/outcome-timeline-proof.ts --receipt evidence/outcome-timeline-proof.json",
+    "proof:performance-layer": "tsx scripts/performance-layer-proof.ts",
+    "backfill:outcome-performance": "tsx packages/collector-cli/src/cli.ts backfill-outcome-performance",
+    "weekly:performance": "tsx packages/collector-cli/src/cli.ts weekly-performance-rollup",
     "report": "tsx scripts/efficiency-report.ts",
     "backfill": "tsx scripts/backfill-v1-archive.ts"
   },

@@ -131,6 +131,8 @@ export function createCollectorServer(
     maintenanceStatus?: () => unknown;
     /** Sanitized startup cache. HTTP handlers never discover user files. */
     detectedIdentities?: () => Array<Record<string, unknown>>;
+    /** Local materialized outcome read model; no provider/network path. */
+    outcomePerformance?: (days: number, asOf: string) => Record<string, unknown>;
     /** Registers a refresh callable for startup/child-receipt points only. */
     registerStatusRefresher?: (refresh: () => boolean) => void;
   } = {},
@@ -139,6 +141,14 @@ export function createCollectorServer(
   const snapshotResponse = (days: number) => {
     const read = buffer.projection.readSnapshot(days, config.subscriptions);
     if (read.kind !== "ready") return read;
+    // Keep dashboard transport to its one snapshot request. The performance
+    // model is already materialized from immutable facts; this read never
+    // fetches GitHub or runs a backfill.
+    const performanceAsOf = new Date(
+      Date.parse(read.snapshot.window.since) + days * 24 * 60 * 60 * 1000,
+    ).toISOString();
+    const outcomePerformance = options.outcomePerformance?.(days, performanceAsOf) ?? null;
+    (read.snapshot as Record<string, unknown>).outcomePerformance = outcomePerformance;
     const delivery = buffer.delivery.status();
     const maintenance = options.maintenanceStatus?.() ?? null;
     const historyCoverage = historyCoverageStatus(buffer.database);
@@ -169,9 +179,12 @@ export function createCollectorServer(
       .update(JSON.stringify(maintenance))
       .digest("hex")
       .slice(0, 16);
+    const outcomeGeneration = outcomePerformance && typeof outcomePerformance.generation === "number"
+      ? outcomePerformance.generation
+      : "none";
     return {
       ...read,
-      etagSeed: `${days}-${read.etagSeed}-${delivery.remainingDelivery}-${delivery.receipts.dead}-${maintenanceDigest}-${historyCoverage.sources.map((source) => `${source.completedAt ?? "incomplete"}:${source.latestFullAttempt?.attemptedAt ?? "none"}:${source.latestFullAttempt?.status ?? "none"}`).join(":")}`,
+      etagSeed: `${days}-${read.etagSeed}-${outcomeGeneration}-${delivery.remainingDelivery}-${delivery.receipts.dead}-${maintenanceDigest}-${historyCoverage.sources.map((source) => `${source.completedAt ?? "incomplete"}:${source.latestFullAttempt?.attemptedAt ?? "none"}:${source.latestFullAttempt?.status ?? "none"}`).join(":")}`,
     };
   };
 

@@ -113,6 +113,7 @@ import {
   runOutcomeTimelineBackfill,
 } from "./github-outcome-backfill";
 import { OutcomeTimelineStore } from "./outcome-timeline-store";
+import { formatWeeklyPerformanceMarkdown } from "./performance-layer";
 import { prepareRepoLabelsPush, pushRepoLabels } from "./repo-labels";
 import { runSessionSync, sessionIdsFromBatches } from "./session-sync";
 import { uploadBufferedEvents } from "./upload";
@@ -178,6 +179,12 @@ Commands:
                         every completed check attempt, reviews, lifecycle events,
                         linked issues, and full-SHA reverts. Resumes from local state;
                         never runs in the collector server/background path.
+  backfill-outcome-performance
+                        Derive local, materialized pull outcomes from the immutable
+                        outcome timeline; missing evidence remains literal UNKNOWN.
+  weekly-performance-rollup
+                        Write local weekly outcome-performance JSON + Markdown on demand;
+                        never scheduled or uploaded.
   scan-rollouts         Read codex rollout files into the ledger once (full history walk)
   scan-transcripts      Read Claude Code transcript usage into the ledger once (full history walk)
   drain-projections     Drain a stalled dashboard-projection repair backlog at full
@@ -228,6 +235,11 @@ Config tools:
       Reads GitHub only. POLICY.json is {"requiredChecks":["check name"]};
       without it required-check coverage and check-derived metrics are UNKNOWN.
       GITHUB_TOKEN/GH_TOKEN stays provider-side and is never persisted or printed.
+  backfill-outcome-performance [--repository owner/repo] [--store PATH]
+      [--required-checks POLICY.json] [--rework-window-days 14]
+      Local-only deterministic materialization of existing outcome-timeline facts.
+  weekly-performance-rollup [--store PATH] [--out-dir DIR] [--until ISO]
+      Generates weekly-performance-YYYY-MM-DD.{json,md}; explicit/on-demand only.
   install-launch-agent [--load] [--dry-run]
   install-launch-agent --dev [--repo-root PATH] [--pnpm PATH] [--load]
   load-launch-agent
@@ -1098,6 +1110,18 @@ async function main() {
     // This connection owns the HTTP event loop. Never inherit better-sqlite3's
     // five-second busy wait when the maintenance child briefly owns a writer.
     const buffer = openBuffer(config, false, 0);
+    // Outcome facts intentionally live outside the capture ledger. Opening the
+    // local read model here does not schedule collection; the only writer is
+    // an explicit backfill command.
+    const outcomeTimelineStore = new OutcomeTimelineStore(
+      path.join(collectorHome(), "outcome-timeline-v1.sqlite"),
+    );
+    let outcomeTimelineStoreClosed = false;
+    const closeOutcomeTimelineStore = () => {
+      if (outcomeTimelineStoreClosed) return;
+      outcomeTimelineStore.close();
+      outcomeTimelineStoreClosed = true;
+    };
     // Runtime ownership is already proven above. Recover ID-only handoff and
     // inflight receipts once, before intake or the child can create live work.
     buffer.recoverRepoContextState();
@@ -1136,6 +1160,7 @@ async function main() {
         cadence: maintenanceCadence?.status() ?? null,
       }),
       detectedIdentities: () => detectedIdentities,
+      outcomePerformance: (days, asOf) => outcomeTimelineStore.performanceSummary(days, asOf),
       registerStatusRefresher: (refresh) => {
         refreshStatusSnapshot = refresh;
       },
@@ -1377,7 +1402,10 @@ async function main() {
       const maintenanceChildReaped = child.status === "fulfilled" && child.value;
       // The maintenance child may own the SQLite writer. Never close the
       // parent's connection while either the scheduler or child can still use it.
-      if (maintenanceIdle && maintenanceChildReaped) buffer.close();
+      if (maintenanceIdle && maintenanceChildReaped) {
+        buffer.close();
+        closeOutcomeTimelineStore();
+      }
       return { maintenanceIdle, maintenanceChildReaped };
     };
 
@@ -1440,10 +1468,14 @@ async function main() {
           }
           // Never close SQLite until the child is reaped and the parent
           // scheduler no longer has a boundary call in flight.
-          if (maintenanceIdle && maintenanceChildReaped) buffer.close();
+          if (maintenanceIdle && maintenanceChildReaped) {
+            buffer.close();
+            closeOutcomeTimelineStore();
+          }
         } catch {
           // PID ownership cleanup below is the non-negotiable finalizer.
         } finally {
+          closeOutcomeTimelineStore();
           clearTimeout(forceTimer);
           server.closeIdleConnections?.();
           server.closeAllConnections?.();
@@ -2127,6 +2159,71 @@ async function main() {
       });
       console.log(JSON.stringify(receipt, null, 2));
       if (receipt.status === "incomplete" || receipt.status === "unknown") process.exitCode = 1;
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  if (command === "backfill-outcome-performance") {
+    const repository = optionValue("--repository");
+    const match = repository?.match(/^([^/]+)\/([^/]+)$/);
+    if (repository && !match) {
+      console.error("backfill-outcome-performance --repository must be owner/repo.");
+      process.exitCode = 1;
+      return;
+    }
+    const reworkWindowDaysRaw = optionValue("--rework-window-days") ?? "14";
+    const reworkWindowDays = Number(reworkWindowDaysRaw);
+    if (!Number.isInteger(reworkWindowDays) || reworkWindowDays < 1 || reworkWindowDays > 365) {
+      throw new Error(`--rework-window-days expects an integer from 1 through 365, got: ${reworkWindowDaysRaw}`);
+    }
+    const databasePath = optionValue("--store") ?? path.join(collectorHome(), "outcome-timeline-v1.sqlite");
+    const store = new OutcomeTimelineStore(databasePath);
+    try {
+      const repositoryExternalId = match
+        ? `github:repository:${match[1]!.toLowerCase()}/${match[2]!.toLowerCase()}`
+        : undefined;
+      const receipt = store.materializePerformance({
+        repositoryExternalId,
+        requiredChecks: readRequiredCheckPolicy(optionValue("--required-checks")),
+        reworkWindowDays,
+      });
+      console.log(JSON.stringify({
+        schema: "plimsoll.outcome-performance-backfill.v1",
+        localOnly: true,
+        repositoryExternalId: repositoryExternalId ?? null,
+        ...receipt,
+      }, null, 2));
+    } finally {
+      store.close();
+    }
+    return;
+  }
+
+  if (command === "weekly-performance-rollup") {
+    const until = optionValue("--until") ?? new Date().toISOString();
+    const untilMs = Date.parse(until);
+    if (!Number.isFinite(untilMs)) throw new Error(`--until expects an ISO timestamp, got: ${until}`);
+    const asOf = new Date(untilMs).toISOString();
+    const databasePath = optionValue("--store") ?? path.join(collectorHome(), "outcome-timeline-v1.sqlite");
+    const outputDirectory = path.resolve(optionValue("--out-dir") ?? path.join(process.cwd(), "performance-rollups"));
+    const week = asOf.slice(0, 10);
+    const jsonPath = path.join(outputDirectory, `weekly-performance-${week}.json`);
+    const markdownPath = path.join(outputDirectory, `weekly-performance-${week}.md`);
+    const store = new OutcomeTimelineStore(databasePath);
+    try {
+      const summary = store.performanceSummary(7, asOf);
+      fs.mkdirSync(outputDirectory, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(jsonPath, `${JSON.stringify(summary, null, 2)}\n`, { mode: 0o600 });
+      fs.writeFileSync(markdownPath, formatWeeklyPerformanceMarkdown(summary), { mode: 0o600 });
+      console.log(JSON.stringify({
+        schema: "plimsoll.weekly-performance-rollup.v1",
+        scheduled: false,
+        localOnly: true,
+        summary,
+        outputs: { jsonPath, markdownPath },
+      }, null, 2));
     } finally {
       store.close();
     }
