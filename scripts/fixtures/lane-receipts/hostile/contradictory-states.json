@@ -1,0 +1,25 @@
+{
+  "description": "Preflight records whose fields contradict each other.",
+  "preflights": [
+    {
+      "laneId": "lane-contradictory-complete",
+      "ownerRole": "builder",
+      "branch": "feat/complete-dirty",
+      "baseSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "headSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "cleanState": "DIRTY",
+      "lastActivityAtMs": 1000,
+      "liveness": "COMPLETE"
+    },
+    {
+      "laneId": "lane-contradictory-blocked",
+      "ownerRole": "builder",
+      "branch": "feat/blocked-no-reason",
+      "baseSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "headSha": "cccccccccccccccccccccccccccccccccccccccc",
+      "cleanState": "CLEAN",
+      "lastActivityAtMs": 1000,
+      "liveness": "BLOCKED"
+    }
+  ]
+}

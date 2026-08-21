@@ -1,0 +1,15 @@
+{
+  "description": "An ACTIVE lane whose last activity is far older than the liveness budget.",
+  "nowMs": 1800000000000,
+  "stalenessBudgetMs": 1800000,
+  "preflight": {
+    "laneId": "lane-stale",
+    "ownerRole": "builder",
+    "branch": "feat/stale",
+    "baseSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "headSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "cleanState": "DIRTY",
+    "lastActivityAtMs": 1790000000000,
+    "liveness": "ACTIVE"
+  }
+}

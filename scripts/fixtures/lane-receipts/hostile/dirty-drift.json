@@ -1,0 +1,23 @@
+{
+  "description": "Dirty worktree without an owner and a lane based on a stale base.",
+  "canonicalBaseSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "expectedLanes": ["lane-present", "lane-missing"],
+  "worktrees": [
+    {
+      "name": "wt-drifted",
+      "laneId": "lane-present",
+      "branch": "feat/drift",
+      "baseSha": "9999999999999999999999999999999999999999",
+      "headSha": "cccccccccccccccccccccccccccccccccccccccc",
+      "clean": true
+    },
+    {
+      "name": "wt-abandoned",
+      "laneId": null,
+      "branch": "feat/abandoned",
+      "baseSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "headSha": "dddddddddddddddddddddddddddddddddddddddd",
+      "clean": false
+    }
+  ]
+}

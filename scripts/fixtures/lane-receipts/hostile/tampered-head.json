@@ -1,0 +1,39 @@
+{
+  "description": "Receipt head does not match the preflight head, plus a malformed replacement SHA.",
+  "preflight": {
+    "laneId": "lane-tamper",
+    "ownerRole": "builder",
+    "branch": "feat/tamper",
+    "baseSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "headSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "cleanState": "CLEAN",
+    "lastActivityAtMs": 1000,
+    "liveness": "COMPLETE"
+  },
+  "receipt": {
+    "schemaVersion": 1,
+    "laneId": "lane-tamper",
+    "attemptId": "attempt-1",
+    "branch": "feat/tamper",
+    "baseSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "headSha": "dddddddddddddddddddddddddddddddddddddddd",
+    "changedFiles": ["src/a.ts"],
+    "exactTests": ["pnpm proof:lane-receipts"],
+    "failures": [],
+    "blockers": [],
+    "resumeCommand": "git -C wt-tamper checkout bbbb"
+  },
+  "tamperedReceipt": {
+    "schemaVersion": 1,
+    "laneId": "lane-tamper",
+    "attemptId": "attempt-1",
+    "branch": "feat/tamper",
+    "baseSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "headSha": "DEADBEEF",
+    "changedFiles": ["src/a.ts"],
+    "exactTests": ["pnpm proof:lane-receipts"],
+    "failures": [],
+    "blockers": [],
+    "resumeCommand": "echo ok"
+  }
+}

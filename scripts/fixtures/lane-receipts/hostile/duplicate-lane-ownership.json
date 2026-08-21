@@ -1,0 +1,23 @@
+{
+  "description": "Two worktrees claim the same lane ID and two lanes share one head.",
+  "worktrees": [
+    {
+      "name": "wt-alpha",
+      "laneId": "lane-shared",
+      "owner": "builder-a",
+      "branch": "feat/shared-a",
+      "baseSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "headSha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "clean": true
+    },
+    {
+      "name": "wt-beta",
+      "laneId": "lane-shared",
+      "owner": "builder-b",
+      "branch": "feat/shared-b",
+      "baseSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "headSha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "clean": true
+    }
+  ]
+}

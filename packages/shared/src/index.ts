@@ -8,3 +8,4 @@ export * from "./suppression-receipt";
 export * from "./metric-registry";
 export * from "./learning-evidence";
 export * from "./outcome-timeline";
+export * from "./lane-receipts";
