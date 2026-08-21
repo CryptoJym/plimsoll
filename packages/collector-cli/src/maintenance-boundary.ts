@@ -1,7 +1,7 @@
 import { fork, execFile, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 
-import type { MaintenanceRunOutcome } from "./maintenance";
+import type { MaintenanceRunOutcome, MaintenanceStageTimings } from "./maintenance";
 import type { MaintenanceProgress } from "./maintenance-progress";
 import {
   MAINTENANCE_PROTOCOL_MAX_BYTES,
@@ -45,6 +45,7 @@ export type MaintenanceBoundaryStatus = {
     rawEventWrites: number;
     rolloutFilesRead: number;
     transcriptFilesRead: number;
+    stageTimings: MaintenanceStageTimings | null;
   } | null;
   lastFailure: string | null;
   lastOutcome: "completed" | "timed_out" | "failed" | null;
@@ -599,6 +600,7 @@ export class MaintenanceProcessBoundary {
       rawEventWrites: receipt.result.rawEventWrites,
       rolloutFilesRead: receipt.result.rollout.filesRead,
       transcriptFilesRead: receipt.result.transcript.filesRead,
+      stageTimings: receipt.result.stageTimings ?? null,
     };
     this.lastFailure = null;
     this.recordOutcome("completed", completedAtMs);

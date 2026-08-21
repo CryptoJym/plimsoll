@@ -508,6 +508,21 @@ export function runRepoEnrichmentMaintenance(
   })();
 }
 
+/**
+ * Per-stage wall-clock elapsed time for one automatic recent-only cycle, in
+ * whole milliseconds. Every stage reports even when its work was deferred
+ * (0 ms), so a deadline kill names the real consumer instead of an inference.
+ */
+export type MaintenanceStageTimings = {
+  codexCaptureMs: number;
+  claudeCaptureMs: number;
+  reconciliationMs: number;
+  repricingMs: number;
+  enrichmentMs: number;
+  projectionDrainMs: number;
+  totalMs: number;
+};
+
 export type CollectorMaintenanceRunResult = {
   recentOnly: true;
   rollout: RolloutScanResult;
@@ -519,6 +534,7 @@ export type CollectorMaintenanceRunResult = {
   projectionDrain?: ProjectionDrainResult;
   rawEventWrites: number;
   postCaptureDeferred?: string[];
+  stageTimings?: MaintenanceStageTimings;
 };
 
 /** Path/content-free result projected across the maintenance child boundary. */
@@ -540,6 +556,7 @@ export type MaintenanceRunOutcome = {
   repricing: { repriced: number; rowsVisited: number };
   enrichment: { backward: number; forward: number; rowsVisited: number };
   rawEventWrites: number;
+  stageTimings?: MaintenanceStageTimings;
 };
 
 export type ProjectionDrainResult = {
@@ -638,7 +655,14 @@ export class CollectorMaintenance {
   async runRecent(options: {
     quarantine?: Pick<MaintenanceProgress, "source" | "stage" | "candidateHash">;
     onProgress?: (progress: MaintenanceProgress) => boolean;
+    clock?: () => number;
   } = {}): Promise<CollectorMaintenanceRunResult> {
+    // Monotonic stage timing source. Injectable so fixture proofs can assert
+    // exact per-stage durations deterministically (issue #61 first step).
+    const clock = options.clock ?? (() => performance.now());
+    const runStartedAtMs = clock();
+    let codexCaptureMs = 0;
+    let claudeCaptureMs = 0;
     const budget = new CaptureWorkBudget();
     const baselineAtStart = captureBaselineStatus(this.buffer.database);
     // Completed source snapshots stay armed while a per-generation ambiguity
@@ -671,6 +695,7 @@ export class CollectorMaintenance {
         stage: "source_scan",
         candidateHash: null,
       }) !== false;
+      const scanStartedAtMs = clock();
       return this.rolloutTailer.scan({
         scope: "recent",
         now: new Date(startedAt),
@@ -682,6 +707,8 @@ export class CollectorMaintenance {
         onProgress: (progress) => options.onProgress?.({ source: "codex", ...progress }) ?? true,
         deferredBeforeIo: !sourceAccepted ||
           (options.quarantine?.source === "codex" && options.quarantine.stage === "source_scan"),
+      }).finally(() => {
+        codexCaptureMs = Math.max(0, Math.round(clock() - scanStartedAtMs));
       });
     };
     const runTranscript = async () => {
@@ -691,6 +718,7 @@ export class CollectorMaintenance {
         stage: "source_scan",
         candidateHash: null,
       }) !== false;
+      const scanStartedAtMs = clock();
       return this.transcriptTailer.scan({
         scope: "recent",
         now: new Date(startedAt),
@@ -702,6 +730,8 @@ export class CollectorMaintenance {
         onProgress: (progress) => options.onProgress?.({ source: "claude_code", ...progress }) ?? true,
         deferredBeforeIo: !sourceAccepted ||
           (options.quarantine?.source === "claude_code" && options.quarantine.stage === "source_scan"),
+      }).finally(() => {
+        claudeCaptureMs = Math.max(0, Math.round(clock() - scanStartedAtMs));
       });
     };
     try {
@@ -738,38 +768,56 @@ export class CollectorMaintenance {
       candidateRowsVisited: 0, rowsVisited: 0, rowsChanged: 0, stitched: 0,
       priced: 0, sliceDurationMs: 0, timeBudgetExhausted: true,
     };
+    let reconciliationMs = 0;
     if (!this.signal?.aborted && budget.canStart(15)) {
-      reconciliation = runCodexReconciliationMaintenance(this.buffer.database, {
-        legacyRowLimit: 64,
-        legacyChunkLimit: 64,
-        contextWindowLimit: 2,
-        contextRowLimit: 64,
-        candidateLimit: 32,
-        freshCandidateLimit: 16,
-        timeLimitMs: Math.max(1, Math.min(25, Math.floor(budget.remainingWallMs() - 5))),
-      });
+      const stageStartedAtMs = clock();
+      try {
+        reconciliation = runCodexReconciliationMaintenance(this.buffer.database, {
+          legacyRowLimit: 64,
+          legacyChunkLimit: 64,
+          contextWindowLimit: 2,
+          contextRowLimit: 64,
+          candidateLimit: 32,
+          freshCandidateLimit: 16,
+          timeLimitMs: Math.max(1, Math.min(25, Math.floor(budget.remainingWallMs() - 5))),
+        });
+      } finally {
+        reconciliationMs = Math.max(0, Math.round(clock() - stageStartedAtMs));
+      }
     } else postCaptureDeferred.push("reconciliation");
     let repricing: RepricingMaintenanceResult = {
       catalogFingerprint: pricingCatalogFingerprint(), catalogChanged: false,
       backfillComplete: false, legacyRowsVisited: 0, candidateRowsVisited: 0,
       rowsVisited: 0, repriced: 0,
     };
+    let repricingMs = 0;
     if (!this.signal?.aborted && budget.canStart(12)) {
-      repricing = runRepricingMaintenance(this.buffer.database, {
-        backfillLimit: 32,
-        candidateLimit: 32,
-      });
+      const stageStartedAtMs = clock();
+      try {
+        repricing = runRepricingMaintenance(this.buffer.database, {
+          backfillLimit: 32,
+          candidateLimit: 32,
+        });
+      } finally {
+        repricingMs = Math.max(0, Math.round(clock() - stageStartedAtMs));
+      }
     } else postCaptureDeferred.push("repricing");
     let enrichment: RepoEnrichmentMaintenanceResult = {
       backfillComplete: false, legacyRowsVisited: 0, sessionsVisited: 0,
       candidateRowsVisited: 0, rowsVisited: 0, backward: 0, forward: 0,
     };
+    let enrichmentMs = 0;
     if (!this.signal?.aborted && budget.canStart(12)) {
-      enrichment = runRepoEnrichmentMaintenance(this.buffer.database, {
-        legacyBackfillLimit: 32,
-        sessionLimit: 4,
-        eventLimit: 32,
-      });
+      const stageStartedAtMs = clock();
+      try {
+        enrichment = runRepoEnrichmentMaintenance(this.buffer.database, {
+          legacyBackfillLimit: 32,
+          sessionLimit: 4,
+          eventLimit: 32,
+        });
+      } finally {
+        enrichmentMs = Math.max(0, Math.round(clock() - stageStartedAtMs));
+      }
     } else postCaptureDeferred.push("enrichment");
     if (rollout.activity && !this.signal?.aborted && budget.canStart(3)) {
       this.buffer.projection.recordCaptureActivity({ source: "codex", ...rollout.activity });
@@ -777,13 +825,19 @@ export class CollectorMaintenance {
     if (transcript.activity && !this.signal?.aborted && budget.canStart(3)) {
       this.buffer.projection.recordCaptureActivity({ source: "claude_code", ...transcript.activity });
     } else postCaptureDeferred.push("claude_activity");
+    let projectionDrainMs = 0;
     const drained = !this.signal?.aborted && budget.canStart(10)
-      ? await drainProjectionMigration(this.buffer.projection, {
-          maxSlices: 1,
-          maxActiveMs: Math.max(1, Math.min(25, Math.floor(budget.remainingWallMs() - 5))),
-          signal: this.signal,
-          budget,
-        })
+      ? await (() => {
+          const stageStartedAtMs = clock();
+          return drainProjectionMigration(this.buffer.projection, {
+            maxSlices: 1,
+            maxActiveMs: Math.max(1, Math.min(25, Math.floor(budget.remainingWallMs() - 5))),
+            signal: this.signal,
+            budget,
+          }).finally(() => {
+            projectionDrainMs = Math.max(0, Math.round(clock() - stageStartedAtMs));
+          });
+        })()
       : null;
     if (!drained) postCaptureDeferred.push("projection");
     const errorCount =
@@ -815,6 +869,15 @@ export class CollectorMaintenance {
       ...(drained ? { projection: drained.receipt, projectionDrain: drained.drain } : {}),
       rawEventWrites: rollout.eventsAppended + transcript.eventsAppended,
       postCaptureDeferred,
+      stageTimings: {
+        codexCaptureMs,
+        claudeCaptureMs,
+        reconciliationMs,
+        repricingMs,
+        enrichmentMs,
+        projectionDrainMs,
+        totalMs: Math.max(0, Math.round(clock() - runStartedAtMs)),
+      },
     };
   }
 }

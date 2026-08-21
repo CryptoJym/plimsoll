@@ -102,6 +102,15 @@ function outcome(rawEventWrites = 1): MaintenanceRunOutcome {
     repricing: { repriced: 0, rowsVisited: 0 },
     enrichment: { backward: 0, forward: 0, rowsVisited: 0 },
     rawEventWrites,
+    stageTimings: {
+      codexCaptureMs: rawEventWrites,
+      claudeCaptureMs: 2,
+      reconciliationMs: 3,
+      repricingMs: 4,
+      enrichmentMs: 5,
+      projectionDrainMs: 6,
+      totalMs: 21 + rawEventWrites,
+    },
   };
 }
 
