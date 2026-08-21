@@ -21,6 +21,18 @@ const UNLINKED_ACCOUNT = "__unlinked_account__";
 const SAFE_SOURCES=new Set(["anthropic_admin","anthropic_usage","claude_code","codex","github","openai_usage","manual","unknown"]);
 const SAFE_EVENT_TYPES=new Set(["session_start","session_stop","user_prompt_submit","assistant_response","tool_use","tool_result","otel_span","usage_rollout","usage_transcript","unknown"]);
 const SAFE_ACTIONS=new Set(["continue","validate","test","edit","read","write","shell","mcp","browser","review","other"]);
+/**
+ * Usage authority between the two ingest paths that record the same Claude
+ * Code work (issue #179): `assistant_response` rows come from live OTLP
+ * capture, `usage_transcript` rows come from the transcript backfill tailer.
+ * When both paths carry usage for one (source, session), the live path is
+ * authoritative and backfill facts are projected with their usage zeroed, so
+ * each unit of usage is counted exactly once while both raw evidence rows
+ * stay untouched. This mirrors the ingest-time doctrine in buffer.ts
+ * claimSessionUsageAuthority ("live capture wins an already-mixed legacy
+ * session") and repairs ledgers whose mixed rows predate that gate.
+ */
+const USAGE_AUTHORITY_RULE = "assistant_response_live_wins";
 
 type RawProjectionRow = {
   rawRowid: number;
@@ -198,6 +210,32 @@ function costNanos(value: number | null | undefined) {
   return Math.round(value * 1_000_000_000);
 }
 
+function carriesUsage(row: Pick<RawProjectionRow,
+  "inputTokens"|"outputTokens"|"cacheReadTokens"|"cacheCreationTokens"|"costUsd">) {
+  return row.inputTokens !== null || row.outputTokens !== null ||
+    row.cacheReadTokens !== null || row.cacheCreationTokens !== null || row.costUsd !== null;
+}
+
+/**
+ * Aggregation-time dedupe for dual-path sessions: a `usage_transcript` row
+ * contributes no usage when the live path already recorded usage for the same
+ * (source, session). Sessionless rows cannot be matched and always count.
+ * The decision is derived from raw evidence, so it is deterministic regardless
+ * of projection order, and removing the stored fact later subtracts exactly
+ * what was added.
+ */
+function backfillUsageSuppressed(db: Database.Database, row: RawProjectionRow) {
+  return row.eventType === "usage_transcript" && row.sessionId !== null && carriesUsage(row) &&
+    Boolean(db.prepare(
+      `select 1 from buffered_events
+       where source = ? and session_id = ? and event_type = 'assistant_response'
+         and (input_tokens is not null or output_tokens is not null
+           or cache_read_tokens is not null or cache_creation_tokens is not null
+           or cost_usd is not null)
+       limit 1`,
+    ).get(row.source, row.sessionId));
+}
+
 function safeClassification(value:string|null|undefined,allowed:Set<string>,fallback:string){
   return value&&allowed.has(value)?value:fallback;
 }
@@ -219,7 +257,7 @@ function day(value: string) {
   return value.slice(0, 10);
 }
 
-function factFromRaw(row: RawProjectionRow): ProjectionFact {
+function factFromRaw(row: RawProjectionRow, suppressUsage = false): ProjectionFact {
   return {
     projectionId: sha256(`event:${row.id}`),
     rawRowid: row.rawRowid,
@@ -229,11 +267,11 @@ function factFromRaw(row: RawProjectionRow): ProjectionFact {
     sessionHash: safeHash(row.sessionId),
     actionClass: safeClassification(row.actionClass,SAFE_ACTIONS,"other"),
     model: safeModel(row.model),
-    inputTokens: row.inputTokens,
-    outputTokens: row.outputTokens,
-    cacheReadTokens: row.cacheReadTokens,
-    cacheCreationTokens: row.cacheCreationTokens,
-    costNanos: costNanos(row.costUsd),
+    inputTokens: suppressUsage ? null : row.inputTokens,
+    outputTokens: suppressUsage ? null : row.outputTokens,
+    cacheReadTokens: suppressUsage ? null : row.cacheReadTokens,
+    cacheCreationTokens: suppressUsage ? null : row.cacheCreationTokens,
+    costNanos: suppressUsage ? null : costNanos(row.costUsd),
     repoHash: canonicalLinkage(row.repoHash),
     branchHash: canonicalLinkage(row.branchHash),
     headHash: safeHash(row.headSha),
@@ -1091,7 +1129,7 @@ export class DashboardProjectionStore {
         if (previous) this.removeStoredFact(previous, now);
         compactRows.push(row);
       } else {
-        this.applyFact(factFromRaw(row), now);
+        this.applyFact(factFromRaw(row, backfillUsageSuppressed(this.db, row)), now);
       }
     }
     if (compactRows.length) this.addCompactRows(compactRows);
@@ -2303,7 +2341,8 @@ export class DashboardProjectionStore {
     this.applyReferenceBatch(
       "dashboard_parity_window",
       windows,
-      rows.filter((row) => Boolean(row.privacyEligible)).map(factFromRaw),
+      rows.filter((row) => Boolean(row.privacyEligible))
+        .map((row) => factFromRaw(row, backfillUsageSuppressed(this.db, row))),
     );
     const exhausted=rows.length<BACKFILL_ROWS;
     const cursor = exhausted?(control.backfillHighWater??0):(rows.at(-1)?.rawRowid ?? control.parityCursor);
@@ -2650,10 +2689,29 @@ export class DashboardProjectionStore {
         inputTokens:total.inputTokens,outputTokens:total.outputTokens,cacheReadTokens:total.cacheReadTokens,
         cacheCreationTokens:total.cacheCreationTokens,costUsd:usd(total.costNanos),sessions:sessionCounts.sessions,
         sessionsWithTokens:sessionCounts.sessionsWithTokens??0,oldest:span.oldest,newest:span.newest},
-        bySource,daily,byModel,actionMix},sessions,repos,
+        usageAuthority:this.usageAuthoritySummary(days,cutoff),bySource,daily,byModel,actionMix},sessions,repos,
       accounts:{days,buckets,accounts:accountRows,priorityRepoCount:priority.size},
       status:{stats,health,projection:{ready:true,parityReady:true,generation,counters}}};
     return {snapshot,rowsVisited};
+  }
+
+  /**
+   * Operator-facing record of the aggregation-time usage preference rule: how
+   * many in-window sessions had usage recorded by both ingest paths, and
+   * which path won. Backfill rows in those sessions are projected without
+   * usage; their raw evidence is untouched.
+   */
+  private usageAuthoritySummary(days: number, cutoff: string) {
+    const dualSessions = this.db.prepare(
+      `select count(*) as n from (
+         select session_hash from dashboard_event_facts
+          where observed_at >= ? and session_hash is not null and event_type = 'usage_transcript'
+         intersect
+         select session_hash from dashboard_event_facts
+          where observed_at >= ? and session_hash is not null and event_type = 'assistant_response'
+       )`,
+    ).get(cutoff, cutoff) as { n: number };
+    return { rule: USAGE_AUTHORITY_RULE, backfillSessionsSuppressed: dualSessions.n };
   }
 
   private lifetimeStats() {
