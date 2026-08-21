@@ -114,6 +114,29 @@ each missing/conflicted requirement.
 
 > **Codex note:** Codex records token usage on *trace spans* (`gen_ai.usage.*`), not log events. The generated config enables logs, traces, and metrics — if you disable the trace exporter, codex token attribution silently drops to zero. We learned this the hard way (see "The audit story" below).
 
+## Local outcome performance
+
+`backfill-outcome-timeline` remains the explicit, bounded GitHub collection
+command. After each run, Plimsoll deterministically materializes its immutable
+pull facts into local performance rows for the dashboard. This is not a new
+feed and does not fetch in the dashboard request path. `MERGED`,
+`FIRST_PASS`, and `REWORK_OBSERVED` are only emitted when the timeline proves
+them; missing evidence or required-check policy coverage is the literal
+`UNKNOWN`, never a fabricated failure, zero, or no-rework result.
+
+```bash
+# Re-derive an existing local outcome store without making a provider request.
+pnpm backfill:outcome-performance -- --required-checks ./required-checks.json
+
+# Create a local seven-day Markdown + JSON summary on demand (no scheduler).
+pnpm weekly:performance -- --out-dir ./performance-rollups
+```
+
+The dashboard's **Outcome performance** panel uses the same materialized rows
+as the weekly rollup. Its time buckets use the observed merge timestamp when
+available, otherwise the observed pull-creation timestamp; rows without either
+stay undated rather than being assigned an invented date.
+
 ## What gets collected — and what never does
 
 Plimsoll's default is **metadata mode**. In metadata mode, these are *removed before the local database write* — not redacted later, never stored:
