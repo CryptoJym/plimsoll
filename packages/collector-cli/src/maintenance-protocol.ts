@@ -1,4 +1,4 @@
-import type { CollectorMaintenanceRunResult, MaintenanceRunOutcome } from "./maintenance";
+import type { CollectorMaintenanceRunResult, MaintenanceRunOutcome, MaintenanceStageTimings } from "./maintenance";
 import type { MaintenanceProgress, MaintenanceProgressStage } from "./maintenance-progress";
 import {
   validRepoContextRequest,
@@ -7,7 +7,7 @@ import {
   type RepoContextResult,
 } from "./repo-context";
 
-export const MAINTENANCE_PROTOCOL_SCHEMA = 2 as const;
+export const MAINTENANCE_PROTOCOL_SCHEMA = 3 as const;
 export const MAINTENANCE_PROTOCOL_MAX_BYTES = 64 * 1024;
 export const MAINTENANCE_PROTOCOL_MAX_FRAMES_PER_JOB = 128;
 export const MAINTENANCE_PROTOCOL_MAX_REPO_CONTEXTS = 8;
@@ -238,6 +238,41 @@ export function parseMaintenanceWorkerRequest(value: unknown): MaintenanceWorker
   };
 }
 
+const STAGE_TIMING_KEYS = [
+  "codexCaptureMs",
+  "claudeCaptureMs",
+  "reconciliationMs",
+  "repricingMs",
+  "enrichmentMs",
+  "projectionDrainMs",
+  "totalMs",
+] as const;
+
+export function projectMaintenanceStageTimings(
+  timings: MaintenanceStageTimings,
+): MaintenanceStageTimings {
+  return {
+    codexCaptureMs: timings.codexCaptureMs,
+    claudeCaptureMs: timings.claudeCaptureMs,
+    reconciliationMs: timings.reconciliationMs,
+    repricingMs: timings.repricingMs,
+    enrichmentMs: timings.enrichmentMs,
+    projectionDrainMs: timings.projectionDrainMs,
+    totalMs: timings.totalMs,
+  };
+}
+
+function parseMaintenanceStageTimings(value: unknown): MaintenanceStageTimings | null {
+  const row = record(value);
+  if (!row || !exactKeys(row, STAGE_TIMING_KEYS)) return null;
+  const parsed: Record<string, number> = {};
+  for (const key of STAGE_TIMING_KEYS) {
+    if (!count(row[key])) return null;
+    parsed[key] = Number(row[key]);
+  }
+  return parsed as unknown as MaintenanceStageTimings;
+}
+
 export function projectMaintenanceResult(result: CollectorMaintenanceRunResult): MaintenanceRunOutcome {
   return {
     recentOnly: true,
@@ -267,13 +302,28 @@ export function projectMaintenanceResult(result: CollectorMaintenanceRunResult):
       rowsVisited: result.enrichment.rowsVisited,
     },
     rawEventWrites: result.rawEventWrites,
+    ...(result.stageTimings
+      ? { stageTimings: projectMaintenanceStageTimings(result.stageTimings) }
+      : {}),
   };
 }
 
 function parseMaintenanceResult(value: unknown): MaintenanceRunOutcome | null {
   const row = record(value);
-  if (!row || !exactKeys(row, ["recentOnly", "rollout", "transcript", "reconciliation", "repricing", "enrichment", "rawEventWrites"]) ||
+  if (!row ||
+    !exactKeys(row, [
+      "recentOnly",
+      "rollout",
+      "transcript",
+      "reconciliation",
+      "repricing",
+      "enrichment",
+      "rawEventWrites",
+      "stageTimings",
+    ]) ||
     row.recentOnly !== true || !count(row.rawEventWrites)) return null;
+  const stageTimings = parseMaintenanceStageTimings(row.stageTimings);
+  if (!stageTimings) return null;
   const parseSource = (value: unknown) => {
     const source = record(value);
     if (!source || !exactKeys(source, ["filesRead", "parseErrors", "eventsAppended", "activity"]) ||
@@ -304,6 +354,7 @@ function parseMaintenanceResult(value: unknown): MaintenanceRunOutcome | null {
     repricing: { repriced: Number(repricing.repriced), rowsVisited: Number(repricing.rowsVisited) },
     enrichment: { backward: Number(enrichment.backward), forward: Number(enrichment.forward), rowsVisited: Number(enrichment.rowsVisited) },
     rawEventWrites: Number(row.rawEventWrites),
+    stageTimings,
   };
 }
 
