@@ -1,14 +1,17 @@
 #!/usr/bin/env node
 
 /**
- * Issue #179 regression proof: dashboard cost double-counting.
+ * Issue #179/#193 regression proof: dashboard usage double-counting across
+ * the two ingest paths.
  *
- * A legacy ledger can hold the same Claude Code session's usage twice — once
- * from live capture (`assistant_response`) and once from transcript backfill
- * (`usage_transcript`). Fixtures here insert both paths directly as raw rows
+ * A legacy ledger can hold the same session's usage twice — once from live
+ * capture (any non-tailer event type, e.g. `assistant_response` or
+ * `otel_span`) and once from a backfill tailer (`usage_transcript` or
+ * `usage_rollout`). Fixtures here insert both paths directly as raw rows
  * (bypassing the ingest-time authority gate, exactly like pre-gate data) and
  * prove the projection counts each unit of usage exactly once under the
- * documented preference rule: live wins, backfill is projected without usage.
+ * documented preference rule: live wins, backfill is projected without usage,
+ * regardless of event class pairing (#193 gap 1) or arrival order (#193 gap 2).
  */
 
 import assert from "node:assert/strict";
@@ -41,7 +44,7 @@ function rawUsageRow(
   db: LocalEventBuffer["database"],
   input: {
     source?: string;
-    eventType: "assistant_response" | "usage_transcript";
+    eventType: string;
     sessionId: string | null;
     model?: string;
     observedAt?: string;
@@ -159,11 +162,15 @@ function main() {
       Math.abs(projected30 - 5.1) < 1e-6 && Math.abs(projected30 - naiveCombined) > 1,
       { projected30, naiveCombined });
 
-    // Acceptance-criterion form: projection total == chosen path's raw sum.
+    // Acceptance-criterion form: projection total == chosen path's raw sum,
+    // computed independently from raw evidence with the ingest gate's class
+    // definition (tailer = usage_rollout|usage_transcript, live = the rest).
     const chosenPathSum = Number((buffer.database.prepare(
-      `select coalesce(sum(case when e.event_type='usage_transcript' and e.session_id is not null
+      `select coalesce(sum(case when e.event_type in ('usage_rollout','usage_transcript')
+         and e.session_id is not null
          and exists (select 1 from buffered_events live where live.source=e.source
-           and live.session_id=e.session_id and live.event_type='assistant_response'
+           and live.session_id=e.session_id
+           and live.event_type not in ('usage_rollout','usage_transcript')
            and (live.input_tokens is not null or live.output_tokens is not null
              or live.cache_read_tokens is not null or live.cache_creation_tokens is not null
              or live.cost_usd is not null)) then null else e.cost_usd end),0) as cost
@@ -186,7 +193,7 @@ function main() {
     const authority = (readySnapshot(buffer, 30).summary as Record<string, unknown>).usageAuthority as
       { rule: string; backfillSessionsSuppressed: number };
     check("snapshot_exposes_usage_authority_rule",
-      authority.rule === "assistant_response_live_wins" &&
+      authority.rule === "live_capture_usage_wins" &&
       authority.backfillSessionsSuppressed === 1,
       authority);
 
@@ -245,7 +252,7 @@ function main() {
       const reopenedAuthority =
         (readySnapshot(reopened, 30).summary as Record<string, unknown>).usageAuthority as
           { rule: string };
-      check("reopen_exposes_same_rule", reopenedAuthority.rule === "assistant_response_live_wins",
+      check("reopen_exposes_same_rule", reopenedAuthority.rule === "live_capture_usage_wins",
         reopenedAuthority);
     } finally {
       reopened.close();
@@ -253,6 +260,113 @@ function main() {
 
     console.log(`usage-dedupe-proof: ${checks.length} checks green`);
     for (const entry of checks) console.log(`  ok ${entry.name}`);
+  } finally {
+    buffer.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+
+  issue193EventClassAndOrderGaps();
+}
+
+/**
+ * Issue #193 adversarial fixtures: the merged #185 dedupe only suppressed
+ * `usage_transcript` against `assistant_response` siblings and never
+ * re-derived facts when the live sibling arrived later. Every check in this
+ * section FAILS on that code and must PASS after the fix.
+ */
+function issue193EventClassAndOrderGaps() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-issue193-proof-"));
+  const buffer = new LocalEventBuffer(path.join(root, "ledger.sqlite"));
+  try {
+    // Gap 1a — legacy mixed CODEX session: tailer class is usage_rollout.
+    const codexRollout = "i193-codex-rollout-mixed";
+    rawUsageRow(buffer.database, { source: "codex", eventType: "usage_rollout",
+      sessionId: codexRollout, model: "gpt-fable-5", inputTokens: 400, outputTokens: 40, costUsd: 4 });
+    rawUsageRow(buffer.database, { source: "codex", eventType: "assistant_response",
+      sessionId: codexRollout, model: "gpt-fable-5", inputTokens: 100, outputTokens: 10, costUsd: 1.5 });
+    rawUsageRow(buffer.database, { source: "codex", eventType: "assistant_response",
+      sessionId: codexRollout, model: "gpt-fable-5", inputTokens: 50, outputTokens: 5, costUsd: 0.5 });
+
+    // Gap 1b — live usage arrived as otel_span; transcript must still lose.
+    const otelLive = "i193-otel-span-live";
+    rawUsageRow(buffer.database, { eventType: "otel_span", sessionId: otelLive,
+      model: "claude-fable-5", inputTokens: 120, outputTokens: 12, costUsd: 0.7 });
+    rawUsageRow(buffer.database, { eventType: "otel_span", sessionId: otelLive,
+      model: "claude-fable-5", inputTokens: 30, outputTokens: 3, costUsd: 0.3 });
+    rawUsageRow(buffer.database, { eventType: "usage_transcript", sessionId: otelLive,
+      model: "claude-fable-5", inputTokens: 700, outputTokens: 70, costUsd: 3 });
+    rawUsageRow(buffer.database, { eventType: "usage_transcript", sessionId: otelLive,
+      model: "claude-fable-5", inputTokens: 600, outputTokens: 60, costUsd: 2 });
+
+    // Negative control: transcript + live row WITHOUT usage is not dual-path;
+    // the backfill stays authoritative and must keep counting its usage.
+    const noUsageLive = "i193-live-without-usage";
+    rawUsageRow(buffer.database, { eventType: "usage_transcript", sessionId: noUsageLive,
+      model: "claude-fable-5", inputTokens: 90, outputTokens: 9, costUsd: 9.9 });
+    rawUsageRow(buffer.database, { eventType: "assistant_response", sessionId: noUsageLive,
+      model: "claude-fable-5" });
+
+    settle(buffer);
+    // Expected: 2.0 (rollout session, live only) + 1.0 (otel session, live only)
+    //           + 9.9 (no-usage-live control keeps backfill) = 12.9
+    let projected30 = windowCostUsd(buffer.database, 30);
+    check("i193_rollout_and_otel_live_siblings_suppress_backfill",
+      Math.abs(projected30 - 12.9) < 1e-6,
+      { projected30, expected: 12.9 });
+
+    let authority = (readySnapshot(buffer, 30).summary as Record<string, unknown>).usageAuthority as
+      { rule: string; backfillSessionsSuppressed: number };
+    check("i193_summary_counts_dual_path_sessions_by_class",
+      authority.backfillSessionsSuppressed === 2 && authority.rule === "live_capture_usage_wins",
+      authority);
+
+    // Gap 2 — transcript-first arrival order. Project the tailer fact with no
+    // live sibling present, THEN record live capture for the same session.
+    const lateLive = "i193-transcript-first";
+    rawUsageRow(buffer.database, { eventType: "usage_transcript", sessionId: lateLive,
+      model: "claude-fable-5", inputTokens: 500, outputTokens: 50, costUsd: 6 });
+    settle(buffer);
+    const transcriptFirstAlone = windowCostUsd(buffer.database, 30);
+    check("i193_transcript_first_counts_before_sibling",
+      Math.abs(transcriptFirstAlone - 18.9) < 1e-6, // 12.9 + 6.0
+      { transcriptFirstAlone });
+    rawUsageRow(buffer.database, { eventType: "assistant_response", sessionId: lateLive,
+      model: "claude-fable-5", inputTokens: 150, outputTokens: 15, costUsd: 2 });
+    settle(buffer);
+
+    // Same shape with the rollout tailer class and an otel_span live sibling.
+    const rolloutFirst = "i193-rollout-first";
+    rawUsageRow(buffer.database, { eventType: "usage_rollout", sessionId: rolloutFirst,
+      model: "gpt-fable-5", inputTokens: 300, outputTokens: 30, costUsd: 5 });
+    settle(buffer);
+    rawUsageRow(buffer.database, { eventType: "otel_span", sessionId: rolloutFirst,
+      model: "gpt-fable-5", inputTokens: 80, outputTokens: 8, costUsd: 1.25 });
+    settle(buffer);
+
+    projected30 = windowCostUsd(buffer.database, 30);
+    // Converged total: 12.9 + 2.0 (late live wins) + 1.25 (otel wins) = 16.15
+    check("i193_late_live_sibling_rederives_projected_backfill_fact",
+      Math.abs(projected30 - 16.15) < 1e-6,
+      { projected30, expected: 16.15 });
+
+    const lifetime = readySnapshot(buffer, 30).status.stats as Record<string, number>;
+    check("i193_converged_lifetime_single_counted",
+      Math.abs(Number(lifetime.totalCostUsd) - 16.15) < 1e-6,
+      { totalCostUsd: lifetime.totalCostUsd });
+
+    authority = (readySnapshot(buffer, 30).summary as Record<string, unknown>).usageAuthority as
+      { rule: string; backfillSessionsSuppressed: number };
+    check("i193_summary_tracks_all_four_suppressed_sessions",
+      authority.backfillSessionsSuppressed === 4,
+      authority);
+
+    const state = buffer.projection.status();
+    check("i193_parity_settles_green_after_order_repairs",
+      state.ready && state.parityReady && !state.degraded &&
+      state.degradedReason !== "projection_parity_mismatch",
+      { state });
+
+    console.log(`issue-193 fixtures: ${checks.length - 13} checks green`);
   } finally {
     buffer.close();
     fs.rmSync(root, { recursive: true, force: true });

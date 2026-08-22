@@ -22,17 +22,34 @@ const SAFE_SOURCES=new Set(["anthropic_admin","anthropic_usage","claude_code","c
 const SAFE_EVENT_TYPES=new Set(["session_start","session_stop","user_prompt_submit","assistant_response","tool_use","tool_result","otel_span","usage_rollout","usage_transcript","unknown"]);
 const SAFE_ACTIONS=new Set(["continue","validate","test","edit","read","write","shell","mcp","browser","review","other"]);
 /**
- * Usage authority between the two ingest paths that record the same Claude
- * Code work (issue #179): `assistant_response` rows come from live OTLP
- * capture, `usage_transcript` rows come from the transcript backfill tailer.
- * When both paths carry usage for one (source, session), the live path is
- * authoritative and backfill facts are projected with their usage zeroed, so
- * each unit of usage is counted exactly once while both raw evidence rows
- * stay untouched. This mirrors the ingest-time doctrine in buffer.ts
- * claimSessionUsageAuthority ("live capture wins an already-mixed legacy
- * session") and repairs ledgers whose mixed rows predate that gate.
+ * Usage authority between the two ingest paths that record the same work
+ * (issue #179): tailer-class rows (`usage_rollout` from the rollout backfill
+ * tailer, `usage_transcript` from the transcript backfill tailer) versus
+ * live-class rows (any other event type recorded by live OTLP capture, e.g.
+ * `assistant_response` or `otel_span`). When both classes carry usage for one
+ * (source, session), the live class is authoritative and backfill facts are
+ * projected with their usage zeroed, so each unit of usage is counted exactly
+ * once while both raw evidence rows stay untouched. The class definition is
+ * keyed to buffer.ts claimSessionUsageAuthority — `('usage_rollout',
+ * 'usage_transcript')` as tailer, anything else usage-bearing as live — and
+ * repairs ledgers whose mixed rows predate that gate (issue #193).
  */
-const USAGE_AUTHORITY_RULE = "assistant_response_live_wins";
+const USAGE_AUTHORITY_RULE = "live_capture_usage_wins";
+const USAGE_TAILER_EVENT_TYPES = ["usage_rollout", "usage_transcript"] as const;
+
+function isUsageTailerEventType(eventType: string) {
+  return (USAGE_TAILER_EVENT_TYPES as readonly string[]).includes(eventType);
+}
+
+/** Live-class sibling carrying any usage field for the same (source, session). */
+const LIVE_USAGE_SIBLING_SQL = `
+  select 1 from buffered_events
+   where source = ? and session_id = ?
+     and event_type not in ('usage_rollout','usage_transcript')
+     and (input_tokens is not null or output_tokens is not null
+       or cache_read_tokens is not null or cache_creation_tokens is not null
+       or cost_usd is not null)
+   limit 1`;
 
 type RawProjectionRow = {
   rawRowid: number;
@@ -217,23 +234,18 @@ function carriesUsage(row: Pick<RawProjectionRow,
 }
 
 /**
- * Aggregation-time dedupe for dual-path sessions: a `usage_transcript` row
- * contributes no usage when the live path already recorded usage for the same
- * (source, session). Sessionless rows cannot be matched and always count.
- * The decision is derived from raw evidence, so it is deterministic regardless
- * of projection order, and removing the stored fact later subtracts exactly
- * what was added.
+ * Aggregation-time dedupe for dual-path sessions: a tailer-class row
+ * (`usage_rollout` or `usage_transcript`) contributes no usage when the live
+ * class (any non-tailer event type, e.g. `assistant_response` or `otel_span`)
+ * already recorded usage for the same (source, session). Sessionless rows
+ * cannot be matched and always count. The decision is derived from raw
+ * evidence; when a live sibling arrives after a tailer fact was projected,
+ * applyProjectionRows re-enqueues that fact so both arrival orders
+ * converge to the same totals (issue #193).
  */
 function backfillUsageSuppressed(db: Database.Database, row: RawProjectionRow) {
-  return row.eventType === "usage_transcript" && row.sessionId !== null && carriesUsage(row) &&
-    Boolean(db.prepare(
-      `select 1 from buffered_events
-       where source = ? and session_id = ? and event_type = 'assistant_response'
-         and (input_tokens is not null or output_tokens is not null
-           or cache_read_tokens is not null or cache_creation_tokens is not null
-           or cost_usd is not null)
-       limit 1`,
-    ).get(row.source, row.sessionId));
+  return isUsageTailerEventType(row.eventType) && row.sessionId !== null && carriesUsage(row) &&
+    Boolean(db.prepare(LIVE_USAGE_SIBLING_SQL).get(row.source, row.sessionId));
 }
 
 function safeClassification(value:string|null|undefined,allowed:Set<string>,fallback:string){
@@ -1133,6 +1145,27 @@ export class DashboardProjectionStore {
       }
     }
     if (compactRows.length) this.addCompactRows(compactRows);
+    // A live-class usage row may arrive after its tailer siblings were already
+    // projected (transcript-first ordering). Re-enqueue those siblings so the
+    // suppression rule is re-derived and totals converge regardless of the
+    // order in which the two paths recorded the same session (issue #193).
+    const liveUsageSessions = new Set<string>();
+    for (const row of rows) {
+      if (!isUsageTailerEventType(row.eventType) && row.sessionId !== null && carriesUsage(row)) {
+        liveUsageSessions.add(`${row.source}\u0000${row.sessionId}`);
+      }
+    }
+    for (const key of liveUsageSessions) {
+      const [source, sessionId] = key.split("\u0000");
+      this.db.prepare(
+        `insert or ignore into dashboard_projection_repairs (raw_rowid, reason, queued_at)
+         select b.rowid, 'sibling_live_usage', ?
+         from buffered_events b
+         where b.source = ? and b.session_id = ?
+           and b.event_type in ('usage_rollout','usage_transcript')
+           and exists (select 1 from dashboard_event_facts f where f.raw_rowid = b.rowid)`,
+      ).run(now.toISOString(), source, sessionId);
+    }
   }
 
   private compactWindowCutoffs() {
@@ -2689,26 +2722,37 @@ export class DashboardProjectionStore {
         inputTokens:total.inputTokens,outputTokens:total.outputTokens,cacheReadTokens:total.cacheReadTokens,
         cacheCreationTokens:total.cacheCreationTokens,costUsd:usd(total.costNanos),sessions:sessionCounts.sessions,
         sessionsWithTokens:sessionCounts.sessionsWithTokens??0,oldest:span.oldest,newest:span.newest},
-        usageAuthority:this.usageAuthoritySummary(days,cutoff),bySource,daily,byModel,actionMix},sessions,repos,
+        usageAuthority:this.usageAuthoritySummary(cutoff),bySource,daily,byModel,actionMix},sessions,repos,
       accounts:{days,buckets,accounts:accountRows,priorityRepoCount:priority.size},
       status:{stats,health,projection:{ready:true,parityReady:true,generation,counters}}};
     return {snapshot,rowsVisited};
   }
 
   /**
-   * Operator-facing record of the aggregation-time usage preference rule: how
-   * many in-window sessions had usage recorded by both ingest paths, and
-   * which path won. Backfill rows in those sessions are projected without
-   * usage; their raw evidence is untouched.
+   * Operator-facing record of the aggregation-time usage preference rule:
+   * how many in-window (source, session) pairs had usage recorded by BOTH
+   * ingest classes — tailer (`usage_rollout`/`usage_transcript`) and live
+   * (any other event type) — i.e. sessions whose backfill usage is suppressed
+   * under USAGE_AUTHORITY_RULE. Derived from raw evidence with the same class
+   * definition as the ingest gate and backfillUsageSuppressed, so the count
+   * names what it says: backfill sessions actually suppressed (issue #193).
    */
-  private usageAuthoritySummary(days: number, cutoff: string) {
+  private usageAuthoritySummary(cutoff: string) {
     const dualSessions = this.db.prepare(
       `select count(*) as n from (
-         select session_hash from dashboard_event_facts
-          where observed_at >= ? and session_hash is not null and event_type = 'usage_transcript'
+         select source, session_id from buffered_events
+          where observed_at >= ? and session_id is not null
+            and event_type in ('usage_rollout','usage_transcript')
+            and (input_tokens is not null or output_tokens is not null
+              or cache_read_tokens is not null or cache_creation_tokens is not null
+              or cost_usd is not null)
          intersect
-         select session_hash from dashboard_event_facts
-          where observed_at >= ? and session_hash is not null and event_type = 'assistant_response'
+         select source, session_id from buffered_events
+          where observed_at >= ? and session_id is not null
+            and event_type not in ('usage_rollout','usage_transcript')
+            and (input_tokens is not null or output_tokens is not null
+              or cache_read_tokens is not null or cache_creation_tokens is not null
+              or cost_usd is not null)
        )`,
     ).get(cutoff, cutoff) as { n: number };
     return { rule: USAGE_AUTHORITY_RULE, backfillSessionsSuppressed: dualSessions.n };
