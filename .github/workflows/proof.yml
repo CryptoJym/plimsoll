@@ -83,6 +83,9 @@ jobs:
       - name: Prove versioned learning-metric truth
         run: pnpm proof:metric-truth
 
+      - name: Prove capacity planning doctrine gates
+        run: pnpm proof:capacity
+
       - name: Prove bounded learning evidence packets
         run: pnpm proof:learning-evidence
 

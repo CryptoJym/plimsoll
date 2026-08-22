@@ -270,7 +270,11 @@ export function classifyCapacitySignalFreshness(input: {
   }
   if (input.observedAt === null) return { status: "UNKNOWN", ageMs: null };
   const observedMs = Date.parse(requireIsoTimestamp("observedAt", input.observedAt));
-  const ageMs = Math.max(0, nowMs - observedMs);
+  // A future-dated observation (clock skew, bad input) is not trustworthy
+  // evidence. The freshness gate must fail CLOSED: future-dated signals are
+  // UNKNOWN, never fresh, and never silently clamped to age zero.
+  if (observedMs > nowMs) return { status: "UNKNOWN", ageMs: null };
+  const ageMs = nowMs - observedMs;
   return { status: ageMs <= input.maxAgeMs ? "fresh" : "STALE", ageMs };
 }
 
@@ -374,7 +378,8 @@ function staleAlertsForProfile(
         severity: "MISSING_SIGNAL",
         message:
           `signal ${signal.signalId} for ${signal.profileId}/${signal.dimension} has no ` +
-          "observation timestamp; its capacity stays UNKNOWN, not zero",
+          "trustworthy observation timestamp (missing or future-dated); its capacity " +
+          "stays UNKNOWN, not zero",
         lastObservedAt: null,
         ageMs: null,
       });
@@ -463,6 +468,22 @@ export function estimateCapacityLinearPace(input: {
         reason: `elapsed_time_gate_not_met: ${elapsedMs}ms/${minElapsedMs}ms`,
       },
     };
+  }
+
+  // A cumulative counter that decreases anywhere inside the window means a
+  // quota reset happened mid-window; linear interpolation across the reset is
+  // meaningless and would return a bogus "valid" pace. Fail closed to UNKNOWN.
+  for (let index = 1; index < observations.length; index++) {
+    if (observations[index]!.cumulativeTokens < observations[index - 1]!.cumulativeTokens) {
+      const resetReason =
+        `quota_reset_detected_in_window: cumulative_tokens_decreased_between_` +
+        `${observations[index - 1]!.at}_and_${observations[index]!.at}`;
+      return {
+        ...base,
+        reason: resetReason,
+        projectedExhaustion: { ...base.projectedExhaustion, reason: resetReason },
+      };
+    }
   }
 
   const deltaTokens = last.cumulativeTokens - first.cumulativeTokens;
@@ -579,6 +600,23 @@ export function buildCapacityPlan(input: {
     providerById.set(profile.profileId, profile.provider);
   }
   const options = { now: input.now, maxAgeMs };
+  // Map keys are identity, not just lookup sugar. A signal stored under one
+  // profile's key but stamped with another profile's profileId would silently
+  // blend profiles (the exact thing the doctrine forbids), so the mismatch is
+  // rejected instead of being summarized under whichever key won.
+  for (const [mapKey, signals] of Object.entries(input.signalsByProfile)) {
+    if (!profileIds.has(mapKey)) {
+      throw new Error(`usage signals reference unknown profile ${mapKey}`);
+    }
+    for (const signal of signals) {
+      if (signal.profileId !== mapKey) {
+        throw new Error(
+          `capacity signal ${signal.signalId} carries profileId ${signal.profileId} ` +
+            `but is keyed under ${mapKey}`,
+        );
+      }
+    }
+  }
   const calendar = buildCapacityResetCalendar({
     events: input.resets.filter((event) => profileIds.has(event.profileId)),
     now: input.now,
@@ -636,6 +674,11 @@ export function buildCapacityPlan(input: {
     for (const [profileId, costs] of Object.entries(input.costsByProfile)) {
       if (!profileIds.has(profileId)) {
         throw new Error(`cost facts reference unknown profile ${profileId}`);
+      }
+      if (costs.profileId !== profileId) {
+        throw new Error(
+          `cost facts carry profileId ${costs.profileId} but are keyed under ${profileId}`,
+        );
       }
       requireNonNegativeNumber(costs.subscriptionUsdPerMonth);
       requireNonNegativeNumber(costs.apiEquivalentUsd);
