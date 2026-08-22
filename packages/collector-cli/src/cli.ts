@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { isDeepStrictEqual } from "node:util";
+import Database from "better-sqlite3";
 import { parse as parseToml } from "smol-toml";
 
 const privatePathReceipt = (value: string) =>
@@ -249,6 +250,53 @@ Config tools:
   uninstall-launch-agent [--unload] [--dry-run]
   purge-local-data [--confirm] [--include-config]
 `);
+}
+
+/**
+ * Payload-free quarantined-history counts for read-only surfaces (doctor).
+ * Opens the ledger strictly readonly and never reads event bodies.
+ * Quarantined = rows withheld from the CURRENT workspace: bound to a
+ * different workspace (production pre-join capture binds LOCAL) or
+ * unassigned. Before any binding exists, only unassigned rows count —
+ * mirroring LocalEventBuffer.enrollmentStatus (#163 rework).
+ */
+function readonlyQuarantinedHistoryRows(bufferPath: string): number | null {
+  if (!fs.existsSync(bufferPath)) return null;
+  let database: Database.Database | null = null;
+  try {
+    database = new Database(bufferPath, { readonly: true, fileMustExist: true });
+    const hasTable = (name: string) =>
+      Boolean(
+        database?.prepare(
+          `select 1 from sqlite_master where type = 'table' and name = ?`,
+        ).get(name),
+      );
+    if (!hasTable("buffered_events") || !hasTable("upload_outbox")) return 0;
+    let currentWorkspaceId: string | undefined;
+    if (hasTable("collector_workspace_binding")) {
+      const binding = database
+        .prepare(
+          `select current_workspace_id as currentWorkspaceId
+           from collector_workspace_binding where singleton = 1`,
+        )
+        .get() as { currentWorkspaceId: string } | undefined;
+      currentWorkspaceId = binding?.currentWorkspaceId;
+    }
+    const predicate = currentWorkspaceId === undefined
+      ? "workspace_id is null"
+      : "(workspace_id is null or workspace_id <> ?)";
+    const params = currentWorkspaceId === undefined ? [] : [currentWorkspaceId];
+    const count = (sql: string) =>
+      (database?.prepare(`select count(*) as n from ${sql}`).get(...params) as { n: number }).n;
+    return (
+      count(`buffered_events where ${predicate}`) +
+      count(`upload_outbox where ${predicate}`)
+    );
+  } catch {
+    return null;
+  } finally {
+    database?.close();
+  }
 }
 
 function openBuffer(
@@ -1027,6 +1075,7 @@ async function main() {
           uploadUrl: result.uploadUrl,
           uploadSigningConfigured: result.uploadSigningConfigured,
           workspaceBoundary: result.workspaceBoundary,
+          enrollment: result.enrollment,
           syncConfigured: true,
           privacyMode: "metadata_only",
           handshake: result.handshake,
@@ -1660,6 +1709,7 @@ async function main() {
             reason: "projection backfill has not published a coherent health snapshot",
           },
           historyCoverage: historyCoverageStatus(buffer.database),
+          enrollment: buffer.enrollmentStatus(),
           captureBaseline: captureBaselineStatus(buffer.database),
           automaticCapture: automaticCaptureRuntimeStatus(buffer.database),
         },
@@ -1924,6 +1974,11 @@ async function main() {
           retentionDays: config.retentionDays,
           syncConfigured: Boolean(config.uploadUrl),
           uploadSigningConfigured: Boolean(config.uploadSigningSecret),
+          enrollment: {
+            futureOnlyEnrollment: true,
+            managed: Boolean(config.uploadUrl),
+            quarantinedHistoryRows: readonlyQuarantinedHistoryRows(bufferPath),
+          },
           sqlite: {
             exists: fs.existsSync(bufferPath),
             walExists: fs.existsSync(`${bufferPath}-wal`),

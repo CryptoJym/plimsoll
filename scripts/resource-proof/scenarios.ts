@@ -950,6 +950,8 @@ export async function runPoisonContinuationContract(
     delivery: { maxOldestAgeDays: 3650, requestTimeoutSeconds: 1 },
   });
   const buffer = new LocalEventBuffer(path.join(sandbox.plimsollHome, "poison-continuation.sqlite"), {
+    // Issue 0089: capture pre-bound to config.tenantId (future-only enrollment).
+    workspaceId: config.tenantId,
     delivery: { enabled: true, limits: config.delivery },
   });
   const eventId = (n: number) =>

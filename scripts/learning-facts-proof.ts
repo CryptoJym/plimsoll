@@ -100,6 +100,11 @@ async function main() {
   let buffer: LocalEventBuffer | undefined;
   const openBuffer = () =>
     new LocalEventBuffer(ledger, {
+      // Issue 0089: enrollment is future-only. The upload stage uploads under
+      // the default tenant, so this fixture must capture its rows already
+      // bound to that tenant; unbound rows stay quarantined and are no longer
+      // adopted implicitly by useWorkspace.
+      workspaceId: collectorConfigSchema.parse({}).tenantId,
       delivery: { enabled: true },
       learningFacts: {
         limits: { attempts: 20, episodes: 10, exposures: 10, techniqueIdentities: 4 },

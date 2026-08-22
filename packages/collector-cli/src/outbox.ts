@@ -942,7 +942,9 @@ export class DeliveryOutbox {
              attempt_count as attemptCount
            from upload_outbox
            where state in ('pending','retry') and next_attempt_at <= @now
-             and (@workspaceId is null or workspace_id = @workspaceId)
+             -- Fail closed (#163 rework): a null workspace binding claims
+             -- ONLY unassigned rows, never rows bound to any workspace.
+             and workspace_id is @workspaceId
            order by case
                when exists (
                  select 1 from upload_validation_candidates c

@@ -92,6 +92,11 @@ export type JoinResult =
         fromWorkspaceId: string;
         toWorkspaceId: string;
         boundLegacyRows: number;
+        quarantinedHistoryRows: number;
+      };
+      enrollment: {
+        mode: "future_only";
+        quarantinedHistoryRows: number;
       };
       handshake: {
         uploadedEvents: 1;
@@ -337,6 +342,42 @@ function ledgerMatchesPending(homeDir: string, pending: PendingJoin) {
   }
 }
 
+/** Payload-free quarantine counts for receipts; never reads event bodies. */
+function readEnrollmentStatus(homeDir: string) {
+  const ledgerPath = collectorBufferPath(homeDir);
+  if (!fs.existsSync(ledgerPath)) {
+    return { mode: "future_only" as const, quarantinedHistoryRows: 0 };
+  }
+  const buffer = new LocalEventBuffer(ledgerPath);
+  try {
+    return buffer.enrollmentStatus();
+  } finally {
+    buffer.close();
+  }
+}
+
+/**
+ * Payload-free per-workspace row census (#163 rework). Counts rows by
+ * workspace binding (unassigned rows under a sentinel key) across both
+ * durable tables. Comparing before vs after join trips on ANY relabel or
+ * release — including relabeling prior LOCAL rows into the joined workspace
+ * and releasing pre-enrollment outbox rows — which the earlier
+ * NULL-count-only comparison could not see.
+ */
+function workspaceRowCensus(buffer: LocalEventBuffer): Record<string, number> {
+  const census: Record<string, number> = {};
+  for (const table of ["buffered_events", "upload_outbox"] as const) {
+    const rows = buffer.database
+      .prepare(
+        `select coalesce(workspace_id, '∅unbound') as ws, count(*) as n
+         from ${table} group by ws order by ws`,
+      )
+      .all() as Array<{ ws: string; n: number }>;
+    for (const row of rows) census[`${table}:${row.ws}`] = row.n;
+  }
+  return census;
+}
+
 function activationAlreadyComplete(homeDir: string, pending: PendingJoin) {
   return (
     configMatchesPending(collectorConfigPath(homeDir), pending) &&
@@ -345,6 +386,7 @@ function activationAlreadyComplete(homeDir: string, pending: PendingJoin) {
 }
 
 function completedJoinResult(homeDir: string, pending: PendingJoin): JoinResult {
+  const enrollment = readEnrollmentStatus(homeDir);
   return {
     joined: true,
     configPath: collectorConfigPath(homeDir),
@@ -355,7 +397,9 @@ function completedJoinResult(homeDir: string, pending: PendingJoin): JoinResult 
       fromWorkspaceId: pending.fromWorkspaceId,
       toWorkspaceId: pending.stagedConfig.tenantId,
       boundLegacyRows: 0,
+      quarantinedHistoryRows: enrollment.quarantinedHistoryRows,
     },
+    enrollment: { mode: "future_only", quarantinedHistoryRows: enrollment.quarantinedHistoryRows },
     handshake: {
       uploadedEvents: 1,
       selfTestEventId: pending.handshakeEventId ?? pending.probeSourceId,
@@ -510,21 +554,50 @@ async function activatePendingJoin(
     const activeLedgerPath = collectorBufferPath(options.homeDir);
     fs.mkdirSync(path.dirname(activeLedgerPath), { recursive: true, mode: 0o700 });
     const activeBuffer = new LocalEventBuffer(activeLedgerPath);
-    let workspaceBoundary: ReturnType<LocalEventBuffer["transitionWorkspace"]>;
+    let workspaceBoundary: {
+      fromWorkspaceId: string;
+      toWorkspaceId: string;
+      boundLegacyRows: number;
+      quarantinedHistoryRows: number;
+    };
     try {
+      // Future-only enrollment (issue 0089): the transition moves only the
+      // ledger audience. It must never relabel pre-enrollment rows; the
+      // post-transition quarantine count AND the per-workspace row census
+      // are asserted so a regression that reattaches or releases history —
+      // by relabel OR by outbox release (#163 rework) — fails loudly here.
+      const beforeQuarantined = activeBuffer.enrollmentStatus().quarantinedHistoryRows;
+      const beforeCensus = workspaceRowCensus(activeBuffer);
       const currentBinding = activeBuffer.workspaceBinding();
       if (currentBinding?.currentWorkspaceId === pending.stagedConfig.tenantId) {
         workspaceBoundary = {
           fromWorkspaceId: pending.fromWorkspaceId,
           toWorkspaceId: pending.stagedConfig.tenantId,
           boundLegacyRows: 0,
+          quarantinedHistoryRows: beforeQuarantined,
         };
       } else {
-        workspaceBoundary = activeBuffer.transitionWorkspace(
-          pending.fromWorkspaceId,
-          pending.stagedConfig.tenantId,
+        workspaceBoundary = {
+          ...activeBuffer.transitionWorkspace(
+            pending.fromWorkspaceId,
+            pending.stagedConfig.tenantId,
+          ),
+          quarantinedHistoryRows: activeBuffer.enrollmentStatus().quarantinedHistoryRows,
+        };
+      }
+      const afterCensus = workspaceRowCensus(activeBuffer);
+      if (JSON.stringify(beforeCensus) !== JSON.stringify(afterCensus)) {
+        throw new Error(
+          "Join activation changed the per-workspace row binding of existing rows; " +
+            "enrollment must be future-only and never relabel or release prior history. " +
+            `before=${JSON.stringify(beforeCensus)} after=${JSON.stringify(afterCensus)}`,
         );
       }
+      // The census above is a strict refinement of the earlier
+      // quarantined-count comparison (#163 rework): every relabel or release
+      // of any row — bound or unbound — changes some census bucket, while a
+      // pure audience change (cross-workspace reassignment) legitimately
+      // moves rows between "withheld" buckets without touching any row.
     } finally {
       activeBuffer.close();
     }
@@ -539,6 +612,10 @@ async function activatePendingJoin(
       uploadUrl: pending.stagedConfig.uploadUrl ?? "",
       uploadSigningConfigured: Boolean(pending.stagedConfig.uploadSigningSecret),
       workspaceBoundary,
+      enrollment: {
+        mode: "future_only",
+        quarantinedHistoryRows: workspaceBoundary.quarantinedHistoryRows,
+      },
       handshake: {
         uploadedEvents: 1,
         selfTestEventId,
