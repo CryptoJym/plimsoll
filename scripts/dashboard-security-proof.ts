@@ -10,6 +10,12 @@ import type { AddressInfo } from "node:net";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
+import {
+  LoaderGenerationGate,
+  domTextReadinessExpression,
+  receiptIsContentFree,
+  waitForDomText,
+} from "./fixtures/dashboard-dom-wait";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const repoRoot = path.resolve(path.dirname(scriptPath), "..");
@@ -257,8 +263,8 @@ type TimeoutStage =
   | "debugger_target";
 
 class ProofTimeoutError extends Error {
-  constructor(readonly stage: TimeoutStage) {
-    super(`proof_timeout:${stage}`);
+  constructor(readonly stage: TimeoutStage, detail?: string) {
+    super(detail ? `proof_timeout:${stage}:${detail}` : `proof_timeout:${stage}`);
     this.name = "ProofTimeoutError";
   }
 }
@@ -882,13 +888,28 @@ async function evaluate<T>(
   return result.result?.value as T;
 }
 
-async function waitForText(cdp: CdpClient, marker: string, signal: AbortSignal) {
-  const deadline = Date.now() + DASHBOARD_READY_MS;
-  while (Date.now() < deadline) {
-    if (await evaluate<boolean>(cdp, `document.body.textContent.includes(${JSON.stringify(marker)})`, false, signal)) return;
-    await abortableDelay(50, signal);
-  }
-  throw new ProofTimeoutError("dashboard_readiness");
+async function waitForDashboardReady(
+  cdp: CdpClient,
+  marker: string,
+  signal: AbortSignal,
+  gate: LoaderGenerationGate,
+) {
+  const receipt = await waitForDomText({
+    probe: async () => {
+      const status = await evaluate<string>(cdp, domTextReadinessExpression(marker), false, signal);
+      if (status !== "missing" && status !== "mounted" && status !== "ready") {
+        throw new Error("readiness_probe_unexpected_status");
+      }
+      return status;
+    },
+    delay: (ms) => abortableDelay(ms, signal),
+    now: () => Date.now(),
+    signal,
+    generationCommitted: () => gate.isGenerationCommitted(),
+    abortError: () => new ProofTimeoutError("browser_proof_overall"),
+  }, { timeoutMs: DASHBOARD_READY_MS, pollMs: 50 });
+  if (!receiptIsContentFree(receipt)) throw new Error("readiness_receipt_leaked_content");
+  return receipt;
 }
 
 function startFixtureServer(html: string, mutations: Array<{ route: string; body: unknown }>) {
@@ -982,12 +1003,25 @@ async function browserProof(html: string) {
       const request = params.request as { url?: string } | undefined;if (request?.url) requests.push(request.url);
     });
     await Promise.all([cdp.send("Page.enable"), cdp.send("Runtime.enable"), cdp.send("Network.enable"), cdp.send("Log.enable")]);
+    const navigationGate = new LoaderGenerationGate();
+    cdp.on("Page.frameNavigated", (params) => {
+      const frame = params.frame as { id?: string; loaderId?: string } | undefined;
+      if (frame?.id) navigationGate.observe(frame.id, frame.loaderId ?? "");
+    });
 
     const observations: string[] = [];
     for (const viewport of [{ name: "desktop", width: 1280, height: 900, mobile: false }, { name: "mobile", width: 390, height: 844, mobile: true }]) {
       await cdp.send("Emulation.setDeviceMetricsOverride", { width: viewport.width, height: viewport.height, deviceScaleFactor: 1, mobile: viewport.mobile });
-      await cdp.send("Page.navigate", { url: `${base}/` });
-      await waitForText(cdp, payloads.html, controller.signal);
+      const navigation = await cdp.send<{ frameId?: string; loaderId?: string }>("Page.navigate", { url: `${base}/` });
+      if (!navigation.frameId || !navigation.loaderId) throw new Error("navigation_generation_unavailable");
+      navigationGate.arm(navigation.frameId, navigation.loaderId);
+      const readiness = await waitForDashboardReady(cdp, payloads.html, controller.signal, navigationGate);
+      if (!readiness.ok) throw new ProofTimeoutError("dashboard_readiness", readiness.detail);
+      check(
+        `browser_${viewport.name}_readiness_bounded_content_free`,
+        readiness.ok && readiness.elapsedMs <= DASHBOARD_READY_MS && receiptIsContentFree(readiness),
+        JSON.stringify(readiness),
+      );
       observations.push(await evaluate<string>(cdp, "document.body.textContent"));
       await evaluate(cdp, `openSession(${JSON.stringify(snapshotFixture.sessions[0].sessionId)})`, true);
       observations.push(await evaluate<string>(cdp, "document.querySelector('#d-body').textContent"));
@@ -1113,10 +1147,12 @@ async function main() {
 
 main().catch((error) => {
   if (error instanceof ProofTimeoutError) {
+    const stageDetail = error.message.split(":")[2];
     console.error(JSON.stringify({
       proof: "dashboard-security",
       error: "proof_timeout",
       stage: error.stage,
+      ...(stageDetail ? { detail: stageDetail } : {}),
     }));
   } else {
     console.error(error instanceof Error ? error.stack : String(error));
