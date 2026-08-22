@@ -74,6 +74,9 @@ jobs:
       - name: Prove shipped dashboard browser security
         run: pnpm proof:dashboard-security
 
+      - name: Prove race-safe dashboard DOM wait fixtures
+        run: pnpm proof:dashboard-dom-wait
+
       - name: Prove paired attempts and explicit technique exposure
         run: pnpm proof:learning-facts
 
