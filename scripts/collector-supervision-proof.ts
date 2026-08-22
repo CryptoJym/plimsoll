@@ -6,6 +6,14 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
+import {
+  check,
+  watch,
+  waitFor,
+  waitForExit,
+  type Receipt,
+  type WatchedChild,
+} from "./lib/supervision-watch";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import {
   LAUNCH_AGENT_LABEL,
@@ -21,101 +29,6 @@ import {
   type CollectorPidRecord,
   type CollectorRuntimeIdentity,
 } from "../packages/collector-cli/src/runtime-ownership";
-
-type Receipt = Record<string, unknown>;
-
-type WatchedChild = {
-  child: ChildProcess;
-  errors: string[];
-  exit: { code: number | null; signal: NodeJS.Signals | null } | null;
-  output: string;
-  receipts: Receipt[];
-};
-
-function check(condition: unknown, message: string): asserts condition {
-  if (!condition) throw new Error(message);
-}
-
-function watch(child: ChildProcess): WatchedChild {
-  const watched: WatchedChild = {
-    child,
-    errors: [],
-    exit: null,
-    output: "",
-    receipts: [],
-  };
-  let stdoutRemainder = "";
-  let jsonBuffer = "";
-  let stderr = "";
-  const consumeLine = (line: string) => {
-    const trimmed = line.trim();
-    if (!jsonBuffer && !trimmed.startsWith("{")) return;
-    jsonBuffer = jsonBuffer ? jsonBuffer + "\n" + line : line;
-    try {
-      watched.receipts.push(JSON.parse(jsonBuffer) as Receipt);
-      jsonBuffer = "";
-    } catch {
-      // Pretty-printed JSON is complete only after its closing brace.
-    }
-  };
-  child.stdout?.setEncoding("utf8");
-  child.stderr?.setEncoding("utf8");
-  child.stdout?.on("data", (chunk: string) => {
-    watched.output += chunk;
-    stdoutRemainder += chunk;
-    const lines = stdoutRemainder.split("\n");
-    stdoutRemainder = lines.pop() ?? "";
-    for (const line of lines) consumeLine(line);
-  });
-  child.stderr?.on("data", (chunk: string) => {
-    stderr += chunk;
-    watched.errors.push(chunk);
-  });
-  child.on("error", (error) => {
-    watched.errors.push("spawn_error: " + error.message);
-  });
-  child.on("exit", (code, signal) => {
-    watched.exit = { code, signal };
-    if (stdoutRemainder) consumeLine(stdoutRemainder);
-    if (stderr.trim() && watched.errors.length === 0) watched.errors.push(stderr);
-  });
-  return watched;
-}
-
-function waitFor(
-  predicate: () => boolean,
-  message: string,
-  timeoutMs = 15_000,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  return new Promise((resolve, reject) => {
-    const poll = () => {
-      if (predicate()) {
-        resolve();
-        return;
-      }
-      if (Date.now() > deadline) {
-        reject(new Error(message));
-        return;
-      }
-      setTimeout(poll, 25);
-    };
-    poll();
-  });
-}
-
-function waitForExit(child: ChildProcess, timeoutMs = 10_000) {
-  if (child.exitCode !== null || child.signalCode !== null) {
-    return Promise.resolve({ code: child.exitCode, signal: child.signalCode });
-  }
-  return new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("Child did not exit in time.")), timeoutMs);
-    child.once("exit", (code, signal) => {
-      clearTimeout(timer);
-      resolve({ code, signal });
-    });
-  });
-}
 
 async function availablePort() {
   const server = net.createServer();
@@ -585,10 +498,10 @@ async function main() {
       unloadOwner.child.pid,
     );
     children.push(truthfulUnload);
-    // Observe only after the command process has fully settled: its receipt
-    // stream is complete at exit, so a loaded runner cannot starve the
-    // observation window while the command is still working toward its
-    // terminal-state conclusion.
+    // Observe only after the command process has fully settled. Settled means
+    // 'close', not 'exit': Node emits 'exit' at process reap while stdio may
+    // still hold undrained receipt bytes; only 'close' guarantees the streams
+    // are drained (issue #187 class 2 — the empty-aggregate false red).
     const truthfulUnloadExit = await waitForExit(truthfulUnload.child, 60_000);
     check(
       truthfulUnload.receipts.some(
