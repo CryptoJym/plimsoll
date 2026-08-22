@@ -1018,7 +1018,7 @@ async function browserProof(html: string) {
       const readiness = await waitForDashboardReady(cdp, payloads.html, controller.signal, navigationGate);
       if (!readiness.ok) throw new ProofTimeoutError("dashboard_readiness", readiness.detail);
       check(
-        `browser_${viewport.name}_readiness_generation_gated`,
+        `browser_${viewport.name}_readiness_bounded_content_free`,
         readiness.ok && readiness.elapsedMs <= DASHBOARD_READY_MS && receiptIsContentFree(readiness),
         JSON.stringify(readiness),
       );

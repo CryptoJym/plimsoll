@@ -97,7 +97,7 @@ All timing is injected fake-clock (`FakeClock`); acceptance rests on receipts, n
 | `npm run proof:dashboard-dom-wait` (legacy shim swap) | exit 1 — `passed 4 / failed 10` (expected, evidence above) |
 | `npm run proof:dashboard-security` | exit 0 — `{"proof":"dashboard-security","checks":19,"passed":19,"failed":[]}` ×3 consecutive exact-source runs (incl. `browser_mobile_readiness_generation_gated` and `browser_mobile_dom_inert`) |
 | `npm run proof:privacy-mode -- --receipt evidence/privacy-mode-proof.json` | exit 0 — 15 checks, no private sentinel |
-| `node tsx scripts/resource-proof/index.ts --require-integrated --receipt evidence/resource-proof.json` | exit 0 — `"overall":"pass"` (13 pass incl. dashboard_projection_budget, metadata_privacy_sentinels) |
+| `node tsx scripts/resource-proof/index.ts --require-integrated --receipt evidence/resource-proof.json` | exit 0 — `"overall":"pass"` (15 passed, 1 skipped (optional existing_signal_fidelity_proof), 0 failed incl. dashboard_projection_budget, metadata_privacy_sentinels) |
 | `node tsx scripts/resource-proof/finalization-proof.ts` | exit 0 — `"passed":true`, 0 private-term leaks |
 | `npm run proof:system-e2e -- --receipt evidence/system-e2e-proof.json --expected-source-commit <HEAD>` | exit 0 |
 | `npm run proof:system-e2e:verify -- --receipt evidence/system-e2e-proof.json …` | exit 0 |
