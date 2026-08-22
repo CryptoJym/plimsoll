@@ -35,6 +35,10 @@ import {
   requireOtlpSource,
   type LocalProducerSource,
 } from "./http-boundary";
+import {
+  createRejectionDiagnostics,
+  type CollectorServer,
+} from "./rejection-diagnostics";
 
 let dashboardHtml: string | undefined;
 function loadDashboardHtml() {
@@ -135,9 +139,22 @@ export function createCollectorServer(
     outcomePerformance?: (days: number, asOf: string) => Record<string, unknown>;
     /** Registers a refresh callable for startup/child-receipt points only. */
     registerStatusRefresher?: (refresh: () => boolean) => void;
+    /**
+     * Injectable clock for rejection-diagnostics windows (proof fixtures).
+     * Production defaults to wall-clock time.
+     */
+    diagnosticsNowMs?: () => number;
   } = {},
 ) {
   assertCollectorPrivacyMode(config, "collector server");
+
+  // Issue #0075 (#144): repeated identical admission rejections are
+  // aggregated. Decisions at the HTTP boundary stay fail-closed and their
+  // responses stay byte-for-byte identical; only the terminal/log stream is
+  // bounded by reason class plus interval summary.
+  const rejectionDiagnostics = createRejectionDiagnostics({
+    nowMs: options.diagnosticsNowMs,
+  });
   const snapshotResponse = (days: number) => {
     const read = buffer.projection.readSnapshot(days, config.subscriptions);
     if (read.kind !== "ready") return read;
@@ -261,7 +278,7 @@ export function createCollectorServer(
   refreshStatus();
   options.registerStatusRefresher?.(refreshStatus);
 
-  return http.createServer(async (request, response) => {
+  const httpServer = http.createServer(async (request, response) => {
     const budget = createRequestBudget();
     try {
       assertAllowedHost(request);
@@ -281,8 +298,7 @@ export function createCollectorServer(
                   cachedAt: cached.cachedAt,
                   ageMs,
                 },
-              }
-            : {
+              }            : {
             ok: true,
             runtimeIdentity: options.runtimeIdentity ?? null,
             dataMode: config.policy.dataMode,
@@ -319,6 +335,9 @@ export function createCollectorServer(
               ageMs: null,
             },
           };
+          // In-memory monotonic admission counters by bounded reason class.
+          // No ledger or filesystem work executes on this path.
+          body.httpAdmission = rejectionDiagnostics.counters();
           sendJson(response, body, 200, cached?.generation === null || cached?.generation === undefined ? {} : {
             "x-plimsoll-projection-generation": String(cached.generation),
           });
@@ -557,6 +576,7 @@ export function createCollectorServer(
           buffer,
           source,
         });
+        rejectionDiagnostics.recordAccepted(source);
         response.writeHead(202, { "content-type": "application/json" });
         response.end(
           JSON.stringify({
@@ -602,6 +622,7 @@ export function createCollectorServer(
             exploded.metricSamples,
             exploded.admissionDrops,
           );
+          rejectionDiagnostics.recordAccepted(source);
           response.writeHead(202, { "content-type": "application/json" });
           response.end(
             JSON.stringify({
@@ -638,6 +659,7 @@ export function createCollectorServer(
           source,
           transportPath: request.url,
         });
+        rejectionDiagnostics.recordAccepted(source);
         response.writeHead(202, { "content-type": "application/json" });
         response.end(
           JSON.stringify({
@@ -657,7 +679,12 @@ export function createCollectorServer(
         error: "collector_request_rejected",
         reason: failure.reason,
       };
-      console.warn(JSON.stringify(rejection));
+      // Aggregate identical rejections: emit the first occurrence of a
+      // bounded reason promptly plus any window summaries it just closed.
+      // The HTTP response below stays byte-for-byte unchanged.
+      const observed = rejectionDiagnostics.observeRejection(failure.reason);
+      for (const line of observed.summaries) console.warn(JSON.stringify(line));
+      if (observed.first) console.warn(JSON.stringify(rejection));
       if (!response.headersSent) {
         response.writeHead(failure.status, {
           connection: "close",
@@ -669,4 +696,11 @@ export function createCollectorServer(
       }
     }
   });
+
+  const server = httpServer as CollectorServer;
+  server.plimsollHttpDiagnostics = {
+    flush: () => rejectionDiagnostics.flush(),
+    counters: () => rejectionDiagnostics.counters(),
+  };
+  return server;
 }
