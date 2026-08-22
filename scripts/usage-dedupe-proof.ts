@@ -266,6 +266,7 @@ function main() {
   }
 
   issue193EventClassAndOrderGaps();
+  issue193ReworkFixtures();
 }
 
 /**
@@ -375,3 +376,96 @@ function issue193EventClassAndOrderGaps() {
 
 // Referenced so the type import stays honest even though fixtures bypass it.
 main();
+
+function repairFactsCounter(db: LocalEventBuffer["database"]) {
+  return (db.prepare(
+    `select repair_facts as n from dashboard_projection_control where singleton=1`,
+  ).get() as { n: number }).n;
+}
+
+/**
+ * Rework fixtures for the two post-audit gaps (issue #193):
+ *
+ * Gap 1 — repair amplification. The sibling-repair enqueue used to fire on
+ * EVERY live-usage event, so a legacy session with N already-projected
+ * tailer facts re-drained N repair rows for each new live row forever.
+ * The fix enqueues only when a batch introduces the FIRST live-usage row
+ * for a (source, session): first arrival drains exactly once, later live
+ * rows drain zero sibling repairs, totals still converge.
+ *
+ * Gap 2 — summary/suppression mismatch. Suppression's live-sibling lookup
+ * is unbounded in time, but usageAuthoritySummary required BOTH sides to be
+ * inside the reporting window. The fix keeps the window on the tailer side
+ * only; an out-of-window live sibling must still yield a suppressed AND
+ * counted session.
+ */
+function issue193ReworkFixtures() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-i193-rework-proof-"));
+  const buffer = new LocalEventBuffer(path.join(root, "ledger.sqlite"));
+  try {
+    // --- Gap 1: sibling-repair amplification -----------------------------
+    const amp = "i193r-amplified-session";
+    const tailerFacts = 5;
+    for (let i = 0; i < tailerFacts; i += 1) {
+      rawUsageRow(buffer.database, { eventType: "usage_transcript", sessionId: amp,
+        model: "claude-fable-5", inputTokens: 10 + i, outputTokens: i, costUsd: 1 });
+    }
+    settle(buffer);
+    const baselineRepairs = repairFactsCounter(buffer.database);
+
+    // FIRST live-usage row for the pair: the sibling repair is required and
+    // must be drained exactly once — one per projected tailer fact — plus
+    // the live row's own raw_insert repair.
+    rawUsageRow(buffer.database, { eventType: "assistant_response", sessionId: amp,
+      model: "claude-fable-5", inputTokens: 100, outputTokens: 10, costUsd: 2 });
+    settle(buffer);
+    const firstLiveDelta = repairFactsCounter(buffer.database) - baselineRepairs;
+    check("i193r_first_live_row_drains_sibling_repairs_exactly_once",
+      firstLiveDelta === tailerFacts + 1,
+      { firstLiveDelta, expectedSiblingRepairs: tailerFacts, plusRawInsert: 1 });
+
+    // SECOND live-usage row for the same pair: suppression cannot change
+    // (the predicate is existential), so ZERO additional sibling repairs
+    // may be enqueued — only the live row's own raw_insert repair drains.
+    const afterFirst = repairFactsCounter(buffer.database);
+    rawUsageRow(buffer.database, { eventType: "assistant_response", sessionId: amp,
+      model: "claude-fable-5", inputTokens: 200, outputTokens: 20, costUsd: 2 });
+    settle(buffer);
+    const secondLiveDelta = repairFactsCounter(buffer.database) - afterFirst;
+    check("i193r_second_live_row_enqueues_zero_sibling_repairs",
+      secondLiveDelta === 1,
+      { secondLiveDelta, expectedSiblingRepairs: 0 });
+
+    // Totals converge to the suppressed value either way: 5 suppressed $1
+    // tailers + 2 live rows at $2 = $4 counted exactly once.
+    let projected30 = windowCostUsd(buffer.database, 30);
+    check("i193r_totals_converge_to_suppressed_value",
+      Math.abs(projected30 - 4) < 1e-6, { projected30, expected: 4 });
+
+    // --- Gap 2: out-of-window live sibling suppresses AND counts ---------
+    const stale = "i193r-stale-live-session";
+    rawUsageRow(buffer.database, { eventType: "assistant_response", sessionId: stale,
+      observedAt: new Date(NOW.getTime() - 61 * DAY_MS).toISOString(),
+      model: "claude-fable-5", inputTokens: 900, outputTokens: 90, costUsd: 50 });
+    rawUsageRow(buffer.database, { eventType: "usage_transcript", sessionId: stale,
+      model: "claude-fable-5", inputTokens: 500, outputTokens: 50, costUsd: 50 });
+    settle(buffer);
+
+    const authority = (readySnapshot(buffer, 30).summary as Record<string, unknown>)
+      .usageAuthority as { rule: string; backfillSessionsSuppressed: number };
+    check("i193r_out_of_window_live_sibling_suppresses_and_counts",
+      authority.backfillSessionsSuppressed === 2 && authority.rule === "live_capture_usage_wins",
+      authority);
+
+    // And the suppression really fired: the in-window $50 tailer contributes
+    // nothing, so the window total stays at the converged $4 from above.
+    projected30 = windowCostUsd(buffer.database, 30);
+    check("i193r_stale_sibling_actually_suppresses_window_total",
+      Math.abs(projected30 - 4) < 1e-6, { projected30, expected: 4 });
+
+    console.log(`rework fixtures: ${checks.length - 20} checks green`);
+  } finally {
+    buffer.close();
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}

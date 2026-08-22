@@ -1149,14 +1149,29 @@ export class DashboardProjectionStore {
     // projected (transcript-first ordering). Re-enqueue those siblings so the
     // suppression rule is re-derived and totals converge regardless of the
     // order in which the two paths recorded the same session (issue #193).
-    const liveUsageSessions = new Set<string>();
+    const liveUsageBatchCounts = new Map<string, number>();
     for (const row of rows) {
       if (!isUsageTailerEventType(row.eventType) && row.sessionId !== null && carriesUsage(row)) {
-        liveUsageSessions.add(`${row.source}\u0000${row.sessionId}`);
+        const key = `${row.source}\u0000${row.sessionId}`;
+        liveUsageBatchCounts.set(key, (liveUsageBatchCounts.get(key) ?? 0) + 1);
       }
     }
-    for (const key of liveUsageSessions) {
+    for (const [key, batchLiveRows] of liveUsageBatchCounts) {
       const [source, sessionId] = key.split("\u0000");
+      // Only the batch that introduces the FIRST live-usage row for a
+      // (source, session) can flip the suppression predicate; once a live
+      // sibling predates this batch the rule was already in force, and
+      // re-enqueueing siblings would re-drain the whole tailer fact set on
+      // every later live event without changing any total (issue #193).
+      const liveRowsTotal = this.db.prepare(
+        `select count(*) as n from buffered_events
+          where source = ? and session_id = ?
+            and event_type not in ('usage_rollout','usage_transcript')
+            and (input_tokens is not null or output_tokens is not null
+              or cache_read_tokens is not null or cache_creation_tokens is not null
+              or cost_usd is not null)`,
+      ).get(source, sessionId) as { n: number };
+      if (liveRowsTotal.n > batchLiveRows) continue;
       this.db.prepare(
         `insert or ignore into dashboard_projection_repairs (raw_rowid, reason, queued_at)
          select b.rowid, 'sibling_live_usage', ?
@@ -2730,11 +2745,14 @@ export class DashboardProjectionStore {
 
   /**
    * Operator-facing record of the aggregation-time usage preference rule:
-   * how many in-window (source, session) pairs had usage recorded by BOTH
-   * ingest classes — tailer (`usage_rollout`/`usage_transcript`) and live
-   * (any other event type) — i.e. sessions whose backfill usage is suppressed
-   * under USAGE_AUTHORITY_RULE. Derived from raw evidence with the same class
-   * definition as the ingest gate and backfillUsageSuppressed, so the count
+   * how many (source, session) pairs have backfill usage suppressed under
+   * USAGE_AUTHORITY_RULE — i.e. pairs with tailer-class usage
+   * (`usage_rollout`/`usage_transcript`) inside the reporting window whose
+   * live class (any other event type) also recorded usage. The observed_at
+   * window binds ONLY the tailer/backfill side (it is the reporting window);
+   * the live side is unbounded, exactly matching LIVE_USAGE_SIBLING_SQL and
+   * backfillUsageSuppressed, which carry no time bound. Derived from raw
+   * evidence with the same class definition as the ingest gate, so the count
    * names what it says: backfill sessions actually suppressed (issue #193).
    */
   private usageAuthoritySummary(cutoff: string) {
@@ -2748,13 +2766,13 @@ export class DashboardProjectionStore {
               or cost_usd is not null)
          intersect
          select source, session_id from buffered_events
-          where observed_at >= ? and session_id is not null
+          where session_id is not null
             and event_type not in ('usage_rollout','usage_transcript')
             and (input_tokens is not null or output_tokens is not null
               or cache_read_tokens is not null or cache_creation_tokens is not null
               or cost_usd is not null)
        )`,
-    ).get(cutoff, cutoff) as { n: number };
+    ).get(cutoff) as { n: number };
     return { rule: USAGE_AUTHORITY_RULE, backfillSessionsSuppressed: dualSessions.n };
   }
 
