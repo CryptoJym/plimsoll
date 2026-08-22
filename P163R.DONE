@@ -1,0 +1,28 @@
+P163R.DONE
+
+Date: 2026-08-22 (session-local)
+Sandbox: plimsoll #163 clone (runs/p163), branch main, HEAD e3778dc.
+
+Completion state per the rework brief:
+
+- Gap 2 (P0): DONE — LOCAL-tenant-only adoption of NULL rows in useWorkspace
+  (buffer.ts); proof and proof:privacy-mode both exit 0 at HEAD again;
+  enrollment-privacy and join-isolation stay green.
+- Gap 3 (P1): DONE — enrollmentStatus + doctor readonly count report rows
+  withheld from the CURRENT workspace (bound elsewhere or NULL), payload-free;
+  shape = events + outbox summed, breakdown fields kept.
+- Gap 4 (P1): DONE — join activation compares per-workspace row census
+  before/after; relabel OR outbox release trips it.
+- Gap 6 (P2): DONE — listUnuploaded and outbox lease fail closed; unbound
+  readers see ONLY NULL rows.
+- Gap 1 red-team fixtures + plant-bite captures: NOT DONE (documented in
+  REWORK-NOTES.md).
+- Gap 5 unbound-row cases in outbox-proof / learning-facts-proof: NOT DONE
+  (documented in REWORK-NOTES.md).
+
+Battery results in this session at HEAD (details + outputs in REWORK-NOTES.md):
+proof 0 (106/106) · proof:privacy-mode 0 (15/15) · proof:enrollment-privacy 0 ·
+proof:join-isolation 0 · proof:outbox 0 · proof:learning-facts 0 ·
+npx tsc --noEmit 0.
+
+No assertion weakened or deleted. No live collector home touched. No push, no gh.
