@@ -64,6 +64,8 @@ jobs:
 
       - name: Prove local HTTP trust boundary
         run: pnpm proof:http-boundary
+      - name: Prove bounded admission-rejection diagnostics
+        run: pnpm proof:rejection-aggregation
 
       - name: Prove isolated automatic maintenance availability
         run: pnpm proof:maintenance-boundary
