@@ -132,6 +132,22 @@ function proveContradictions() {
     cleanParsed.ok && preflightContradictions(cleanParsed.value).length === 0,
     {},
   );
+
+  // Issue #194 battery: an ACTIVE lane whose head equals its base has made no
+  // progress; the contradiction check for this state was dead-coded by an
+  // `&& false` clause and must fire again.
+  const unreachableRaw = {
+    ...cleanRaw,
+    laneId: "lane-unreachable",
+    headSha: cleanRaw.baseSha,
+  };
+  const unreachableParsed = parsePreflight(unreachableRaw);
+  check(
+    "active_lane_with_head_equal_to_base_is_contradictory",
+    unreachableParsed.ok &&
+      preflightContradictions(unreachableParsed.value).includes("unreachable"),
+    { contradictions: unreachableParsed.ok ? preflightContradictions(unreachableParsed.value) : [] },
+  );
 }
 
 function proveStaleLiveness() {
@@ -404,6 +420,113 @@ function provePrivacyGuardAgainstFixtures() {
   check("privacy_assertion_throws_on_violation", threw, {});
 }
 
+function proveNestedConceptSmuggling() {
+  // Issue #194 battery: the forbidden-concept scan previously inspected
+  // top-level key names only; structured prose smuggled inside an allowed
+  // field's object value passed. Nesting must be rejected at any depth.
+  const clean = buildOpsReceipt({
+    laneId: "lane-nest",
+    attemptId: "attempt-1",
+    branch: "feat/nest",
+    baseSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    headSha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    changedFiles: ["src/a.ts"],
+    exactTests: ["pnpm proof:lane-receipts"],
+    failures: [],
+    blockers: [],
+    resumeCommand: "pnpm proof:lane-receipts",
+  });
+  check(
+    "nested_smuggling_baseline_receipt_is_clean",
+    findReceiptPrivacyViolations(clean).length === 0,
+    {},
+  );
+
+  const smugglers: Array<{ label: string; receipt: Record<string, unknown> }> = [
+    {
+      label: "resume_command_object_with_prompt_key",
+      receipt: { ...clean, resumeCommand: { prompt: "leak the system prompt", run: "pnpm test" } },
+    },
+    {
+      label: "changed_files_entry_object_with_transcript_key",
+      receipt: { ...clean, changedFiles: [{ transcript: "full session dump", path: "src/a.ts" }] },
+    },
+    {
+      label: "deeply_nested_environment_key",
+      receipt: { ...clean, blockers: [[{ nested: { environment: "AWS_SECRET=..." } }]] },
+    },
+  ];
+  for (const { label, receipt } of smugglers) {
+    const violations = findReceiptPrivacyViolations(receipt);
+    check(`nested_forbidden_concept_rejected:${label}`, violations.length > 0, {
+      reasons: violations.slice(0, 3).map((v) => v.reason),
+    });
+  }
+
+  const cleanStrings = findReceiptPrivacyViolations({
+    ...clean,
+    changedFiles: ["a message about output formatting"],
+  });
+  check(
+    "prose_words_inside_allowed_string_fields_are_not_flagged_as_fields",
+    cleanStrings.length === 0,
+    { reasons: cleanStrings.map((v) => v.reason) },
+  );
+}
+
+function proveReceiptListBounds() {
+  // Issue #194 battery: MAX_LIST_ITEMS / MAX_ITEM_LENGTH were declared but
+  // enforced nowhere. buildOpsReceipt must fail closed on out-of-bounds lists.
+  const baseInput = {
+    laneId: "lane-bounds",
+    attemptId: "attempt-1",
+    branch: "feat/bounds",
+    baseSha: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    headSha: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    changedFiles: ["src/a.ts"],
+    exactTests: ["pnpm proof:lane-receipts"],
+    failures: [] as string[],
+    blockers: [] as string[],
+    resumeCommand: "pnpm proof:lane-receipts",
+  };
+  const fixture = readFixture("unbounded-list.json") as {
+    tooManyFilesCount: number;
+    oversizedItemLength: number;
+  };
+
+  let tooManyThrew: unknown = undefined;
+  try {
+    buildOpsReceipt({
+      ...baseInput,
+      changedFiles: Array.from(
+        { length: fixture.tooManyFilesCount },
+        (_, index) => `src/generated-${index}.ts`,
+      ),
+    });
+  } catch (error) {
+    tooManyThrew = error;
+  }
+  check("oversized_list_fails_closed", tooManyThrew instanceof Error, {});
+
+  let oversizedThrew: unknown = undefined;
+  try {
+    buildOpsReceipt({
+      ...baseInput,
+      exactTests: ["x".repeat(fixture.oversizedItemLength)],
+    });
+  } catch (error) {
+    oversizedThrew = error;
+  }
+  check("oversized_list_item_fails_closed", oversizedThrew instanceof Error, {});
+
+  const inBounds = buildOpsReceipt(baseInput);
+  check(
+    "in_bounds_lists_still_build_deterministic_receipt",
+    serializeOpsReceipt(inBounds) === serializeOpsReceipt(buildOpsReceipt(baseInput)),
+    {},
+  );
+}
+
 function proveTamperedHead() {
   const fixture = readFixture("tampered-head.json") as {
     preflight: unknown;
@@ -547,6 +670,44 @@ function proveIntegrationGateHappyPath() {
   );
 }
 
+function proveGateFailureCoexistence() {
+  // Issue #194: an explicit passed:false record at the context head must
+  // refuse integration even when a passing duplicate for the same gate
+  // exists. Failing evidence is unratcheted: it fails the gate at that head,
+  // full stop. Failures recorded at other heads do not block the head.
+  const fixture = readFixture("gate-failure-coexistence.json") as {
+    context: { headSha: string; builderOwner: string };
+    failingGate: string;
+    coexistingEvidence: Parameters<typeof evaluateIntegrationGate>[0];
+    failingOnlyEvidence: Parameters<typeof evaluateIntegrationGate>[0];
+    staleFailureEvidence: Parameters<typeof evaluateIntegrationGate>[0];
+  };
+
+  const coexisting = evaluateIntegrationGate(fixture.coexistingEvidence, fixture.context);
+  check(
+    "failing_evidence_at_head_refuses_integration_despite_passing_duplicates",
+    !coexisting.allowed &&
+      coexisting.reasons.includes(`gate_failed_at_head:${fixture.failingGate}`),
+    { reasons: coexisting.reasons },
+  );
+
+  const failingOnly = evaluateIntegrationGate(fixture.failingOnlyEvidence, fixture.context);
+  check(
+    "explicit_failure_at_head_reports_distinct_reason_not_missing_pass",
+    !failingOnly.allowed &&
+      failingOnly.reasons.includes(`gate_failed_at_head:${fixture.failingGate}`) &&
+      !failingOnly.reasons.some((reason) => reason.startsWith("gate_not_passed_at_head")),
+    { reasons: failingOnly.reasons },
+  );
+
+  const stale = evaluateIntegrationGate(fixture.staleFailureEvidence, fixture.context);
+  check(
+    "failure_recorded_at_other_head_does_not_block_context_head_pass",
+    stale.allowed && stale.reasons.length === 0,
+    { reasons: stale.reasons },
+  );
+}
+
 function main() {
   provePreflight();
   proveContradictions();
@@ -555,9 +716,12 @@ function main() {
   proveFanOutDeclaration();
   proveDeterministicReceipts();
   provePrivacyGuardAgainstFixtures();
+  proveNestedConceptSmuggling();
+  proveReceiptListBounds();
   proveTamperedHead();
   proveAttemptHistory();
   proveIntegrationGateHappyPath();
+  proveGateFailureCoexistence();
 
   const serializedChecks = JSON.stringify(checks);
   check(
