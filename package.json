@@ -48,6 +48,7 @@
     "proof:learning-evidence": "tsx scripts/learning-evidence-proof.ts",
     "learning:evidence": "tsx scripts/learning-evidence-packet.ts",
     "proof:dashboard-security": "tsx scripts/dashboard-security-proof.ts",
+    "proof:dashboard-dom-wait": "tsx scripts/dashboard-dom-wait-proof.ts",
     "proof:outcome-timeline": "tsx scripts/outcome-timeline-proof.ts --receipt evidence/outcome-timeline-proof.json",
     "proof:performance-layer": "tsx scripts/performance-layer-proof.ts",
     "proof:lane-receipts": "tsx scripts/lane-receipt-proof.ts",
