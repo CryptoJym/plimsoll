@@ -136,7 +136,7 @@ export function preflightContradictions(record: PreflightRecord): string[] {
   if (record.liveness === "BLOCKED" && !record.blockedReason) {
     contradictions.push("blocked_without_reason");
   }
-  if (record.liveness === "ACTIVE" && record.headSha === record.baseSha && false) {
+  if (record.liveness === "ACTIVE" && record.headSha === record.baseSha) {
     contradictions.push("unreachable");
   }
   return contradictions;
@@ -437,6 +437,12 @@ function sortedUnique(values: readonly string[]): string[] {
  * byte-identical JSON and the same content hash.
  */
 export function buildOpsReceipt(input: OpsReceiptInput): OpsReceipt {
+  for (const field of ["changedFiles", "exactTests", "failures", "blockers"] as const) {
+    const value = input[field];
+    if (!isBoundedStringList(value)) {
+      throw new Error(`receipt_list_out_of_bounds:${field}:max_items=${MAX_LIST_ITEMS}:max_item_length=${MAX_ITEM_LENGTH}`);
+    }
+  }
   const core = {
     schemaVersion: RECEIPT_SCHEMA_VERSION,
     laneId: input.laneId,
@@ -564,24 +570,38 @@ function scanStringForViolations(value: string): PrivacyViolation[] {
 }
 
 /**
- * Reject receipts that carry forbidden top-level fields or secret-like /
- * home-path strings anywhere in their serialized form. Structural allowlist
- * first, then pattern scan; both must pass.
+ * Reject receipts that carry forbidden fields or secret-like / home-path
+ * strings anywhere in their serialized form. The field allowlist and
+ * forbidden-concept checks apply to object keys at every depth (nested
+ * structures cannot smuggle prompt/transcript/environment-shaped payloads
+ * under an allowed top-level field); the pattern scan runs over the full
+ * serialized form. Both must pass.
  */
 export function findReceiptPrivacyViolations(receipt: unknown): PrivacyViolation[] {
   const violations: PrivacyViolation[] = [];
   if (typeof receipt !== "object" || receipt === null) {
     return [{ reason: "receipt_not_an_object" }];
   }
-  const record = receipt as Record<string, unknown>;
-  for (const key of Object.keys(record)) {
-    if (!ALLOWED_RECEIPT_FIELDS.has(key)) violations.push({ reason: `forbidden_field:${key}` });
-    const lower = key.toLowerCase();
-    if (FORBIDDEN_FIELD_CONCEPTS.some((concept) => lower.includes(concept))) {
-      violations.push({ reason: `forbidden_field_concept:${key}` });
+
+  const visit = (value: unknown, path: string): void => {
+    if (Array.isArray(value)) {
+      value.forEach((item, index) => visit(item, `${path}[${index}]`));
+      return;
     }
-  }
-  const serialized = JSON.stringify(record);
+    if (typeof value !== "object" || value === null) return;
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      const qualified = path.length > 0 ? `${path}.${key}` : key;
+      if (!ALLOWED_RECEIPT_FIELDS.has(key)) violations.push({ reason: `forbidden_field:${qualified}` });
+      const lower = key.toLowerCase();
+      if (FORBIDDEN_FIELD_CONCEPTS.some((concept) => lower.includes(concept))) {
+        violations.push({ reason: `forbidden_field_concept:${qualified}` });
+      }
+      visit(child, qualified);
+    }
+  };
+  visit(receipt, "");
+
+  const serialized = JSON.stringify(receipt);
   violations.push(...scanStringForViolations(serialized));
   return violations;
 }
@@ -721,11 +741,24 @@ export function evaluateIntegrationGate(
   const reasons: string[] = [];
   for (const gate of REQUIRED_GATES) {
     const match = evidence.filter((item) => item.gate === gate);
+    if (match.length === 0) {
+      reasons.push(`gate_missing_evidence:${gate}`);
+      continue;
+    }
+    // Unratcheted refusal: any explicit failure recorded at the exact head
+    // being integrated fails the gate, regardless of any passing duplicates
+    // (reruns, duplicate lanes, or re-submissions cannot outvote it).
+    const failedAtHead = match.filter(
+      (item) => !item.passed && item.headSha === context.headSha,
+    );
+    if (failedAtHead.length > 0) {
+      reasons.push(`gate_failed_at_head:${gate}`);
+      continue;
+    }
     const passing = match.filter(
       (item) => item.passed && item.headSha === context.headSha,
     );
-    if (match.length === 0) reasons.push(`gate_missing_evidence:${gate}`);
-    else if (passing.length === 0) reasons.push(`gate_not_passed_at_head:${gate}`);
+    if (passing.length === 0) reasons.push(`gate_not_passed_at_head:${gate}`);
   }
   const reviewers = new Set(
     evidence.filter((item) => item.gate === "adversarial-review").map((item) => item.reviewer),

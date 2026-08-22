@@ -1,0 +1,28 @@
+{
+  "comment": "Issue #194: explicit passed:false evidence at the exact context head must refuse integration even when passing duplicates for the same gate exist. Synthetic SHAs only.",
+  "context": {
+    "headSha": "cccccccccccccccccccccccccccccccccccccccc",
+    "builderOwner": "builder-a"
+  },
+  "failingGate": "privacy",
+  "coexistingEvidence": [
+    { "gate": "typescript-exact-head", "passed": true, "headSha": "cccccccccccccccccccccccccccccccccccccccc", "reviewer": "typecheck" },
+    { "gate": "privacy", "passed": true, "headSha": "cccccccccccccccccccccccccccccccccccccccc", "reviewer": "guard-duplicate-lane" },
+    { "gate": "privacy", "passed": false, "headSha": "cccccccccccccccccccccccccccccccccccccccc", "reviewer": "adversarial-reviewer" },
+    { "gate": "tamper", "passed": true, "headSha": "cccccccccccccccccccccccccccccccccccccccc", "reviewer": "census" },
+    { "gate": "adversarial-review", "passed": true, "headSha": "cccccccccccccccccccccccccccccccccccccccc", "reviewer": "independent-reviewer" }
+  ],
+  "failingOnlyEvidence": [
+    { "gate": "typescript-exact-head", "passed": true, "headSha": "cccccccccccccccccccccccccccccccccccccccc", "reviewer": "typecheck" },
+    { "gate": "privacy", "passed": false, "headSha": "cccccccccccccccccccccccccccccccccccccccc", "reviewer": "guard" },
+    { "gate": "tamper", "passed": true, "headSha": "cccccccccccccccccccccccccccccccccccccccc", "reviewer": "census" },
+    { "gate": "adversarial-review", "passed": true, "headSha": "cccccccccccccccccccccccccccccccccccccccc", "reviewer": "independent-reviewer" }
+  ],
+  "staleFailureEvidence": [
+    { "gate": "typescript-exact-head", "passed": true, "headSha": "cccccccccccccccccccccccccccccccccccccccc", "reviewer": "typecheck" },
+    { "gate": "privacy", "passed": false, "headSha": "dddddddddddddddddddddddddddddddddddddddd", "reviewer": "guard" },
+    { "gate": "privacy", "passed": true, "headSha": "cccccccccccccccccccccccccccccccccccccccc", "reviewer": "guard" },
+    { "gate": "tamper", "passed": true, "headSha": "cccccccccccccccccccccccccccccccccccccccc", "reviewer": "census" },
+    { "gate": "adversarial-review", "passed": true, "headSha": "cccccccccccccccccccccccccccccccccccccccc", "reviewer": "independent-reviewer" }
+  ]
+}

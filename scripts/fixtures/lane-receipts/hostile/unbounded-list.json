@@ -1,0 +1,5 @@
+{
+  "comment": "Issue #194 battery: MAX_LIST_ITEMS / MAX_ITEM_LENGTH bounds were declared but enforced nowhere. These lists exceed the declared caps and buildOpsReceipt must fail closed.",
+  "tooManyFilesCount": 513,
+  "oversizedItemLength": 4097
+}
