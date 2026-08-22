@@ -1416,6 +1416,14 @@ async function main() {
       return { maintenanceIdle, maintenanceChildReaped };
     };
 
+    const flushRejectionSummaries = () => {
+      // Issue #0075 (#144): at most one bounded summary per active rejection
+      // reason on the way out; restart only loses ephemeral suppression state.
+      for (const line of server.plimsollHttpDiagnostics.flush()) {
+        console.warn(JSON.stringify(line));
+      }
+    };
+
     const shutdown = (signal: string) => {
       if (shuttingDown) {
         server.closeIdleConnections?.();
@@ -1423,6 +1431,7 @@ async function main() {
         return;
       }
       shuttingDown = true;
+      flushRejectionSummaries();
       maintenanceCadence?.stop();
       for (const timer of timers) clearInterval(timer);
       scheduler?.stopAccepting();
@@ -1530,6 +1539,7 @@ async function main() {
     server.on("error", (error: NodeJS.ErrnoException) => {
       if (shuttingDown) return;
       shuttingDown = true;
+      flushRejectionSummaries();
       void (async () => {
         const maintenance = await stopMaintenanceBeforeFatalExit();
         const cleanupAttempt = ownsPidFile

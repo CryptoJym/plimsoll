@@ -23,28 +23,36 @@ export const LOCAL_HTTP_LIMITS = Object.freeze({
 
 export type LocalProducerSource = "claude_code" | "codex";
 
-export type HttpBoundaryReason =
-  | "browser_origin_not_allowed"
-  | "compressed_body_too_large"
-  | "compression_ratio_too_large"
-  | "decoded_body_too_large"
-  | "host_not_allowed"
-  | "internal_rejection"
-  | "invalid_compressed_body"
-  | "invalid_json"
-  | "json_depth_exceeded"
-  | "json_node_limit_exceeded"
-  | "otlp_attribute_limit_exceeded"
-  | "otlp_record_limit_exceeded"
-  | "otlp_resource_limit_exceeded"
-  | "otlp_scope_limit_exceeded"
-  | "request_deadline_exceeded"
-  | "request_stream_error"
-  | "source_mismatch"
-  | "source_not_allowed"
-  | "source_required"
-  | "storage_busy_retry"
-  | "unsupported_content_encoding";
+/**
+ * The complete closed set of admission rejection reasons. Aggregation,
+ * counters, and diagnostics key strictly on this compile-time enum — never on
+ * paths, host strings, header values, payloads, IPs, or arbitrary error text.
+ */
+export const HTTP_BOUNDARY_REASONS = [
+  "browser_origin_not_allowed",
+  "compressed_body_too_large",
+  "compression_ratio_too_large",
+  "decoded_body_too_large",
+  "host_not_allowed",
+  "internal_rejection",
+  "invalid_compressed_body",
+  "invalid_json",
+  "json_depth_exceeded",
+  "json_node_limit_exceeded",
+  "otlp_attribute_limit_exceeded",
+  "otlp_record_limit_exceeded",
+  "otlp_resource_limit_exceeded",
+  "otlp_scope_limit_exceeded",
+  "request_deadline_exceeded",
+  "request_stream_error",
+  "source_mismatch",
+  "source_not_allowed",
+  "source_required",
+  "storage_busy_retry",
+  "unsupported_content_encoding",
+] as const;
+
+export type HttpBoundaryReason = (typeof HTTP_BOUNDARY_REASONS)[number];
 
 export class HttpBoundaryRejection extends Error {
   constructor(

@@ -253,6 +253,31 @@ function stableRejection(result: HttpResult, reason: string, status: number) {
   );
 }
 
+type CounterSnapshot = {
+  totals: { rejectedTotal: number; emittedFirstTotal: number; suppressedTotal: number; summarizedTotal: number };
+  reasons: Array<{
+    rejected: number;
+    emittedFirst: number;
+    suppressed: number;
+    summarized: number;
+    openWindow: { count: number } | null;
+  }>;
+};
+
+/** rejected == emitted-first + suppressed == summarized + open-window count. */
+function conservationIdentity(c: CounterSnapshot) {
+  const open = c.reasons.reduce((sum, row) => sum + (row.openWindow?.count ?? 0), 0);
+  return (
+    c.reasons.every(
+      (row) =>
+        row.rejected === row.emittedFirst + row.suppressed &&
+        row.rejected === row.summarized + (row.openWindow?.count ?? 0),
+    ) &&
+    c.totals.rejectedTotal === c.totals.emittedFirstTotal + c.totals.suppressedTotal &&
+    c.totals.rejectedTotal === c.totals.summarizedTotal + open
+  );
+}
+
 function maxRecordBody(cwdSentinel: string) {
   return JSON.stringify({
     resourceLogs: [{
@@ -658,15 +683,72 @@ async function main() {
     );
 
     const warningText = warnings.join("\n");
-    const expectedWarningCount = invalidHostValues.length + hostMultiplicityResponses.length + 13;
+    // Issue #0075 (#144): identical rejections inside one suppression window
+    // are aggregated. This proof runs well inside a single window with no
+    // flush, so every bounded reason must produce exactly one first line and
+    // zero summaries — independent of how many requests were rejected.
+    const warningReasonCounts = new Map<string, number>();
+    let warningShapesValid = warnings.length > 0;
+    for (const warning of warnings) {
+      try {
+        const parsed = JSON.parse(warning) as Record<string, unknown>;
+        if (
+          parsed.error !== "collector_request_rejected" ||
+          typeof parsed.reason !== "string" ||
+          Object.keys(parsed).length !== 2
+        ) {
+          warningShapesValid = false;
+        } else {
+          const reason = parsed.reason;
+          warningReasonCounts.set(reason, (warningReasonCounts.get(reason) ?? 0) + 1);
+        }
+      } catch {
+        warningShapesValid = false;
+      }
+    }
+    const rejectedReasonCounts = new Map<string, number>();
+    for (const result of [
+      ...invalidHostResponses,
+      ...hostMultiplicityResponses,
+      hookOrigin,
+      otlpOrigin,
+      missingSource,
+      hostileSource,
+      swappedHookSource,
+      oversized,
+      bombResult,
+      highRatio,
+      deep,
+      highNodes,
+      highRecords,
+      highAttributes,
+      deadline,
+    ]) {
+      const reason = String((result.body as { reason?: unknown }).reason ?? "");
+      rejectedReasonCounts.set(reason, (rejectedReasonCounts.get(reason) ?? 0) + 1);
+    }
+    const counters = server.plimsollHttpDiagnostics.counters();
+    const counterRowsMatchRejections = [...rejectedReasonCounts.entries()].every(
+      ([reason, count]) =>
+        counters.reasons.find((row) => row.reason === reason)?.rejected === count &&
+        counters.reasons.find((row) => row.reason === reason)?.emittedFirst === 1,
+    );
     check(
       "all_rejection_receipts_are_bounded_and_value_free",
-      warnings.length === expectedWarningCount &&
+      warningShapesValid &&
+        warningReasonCounts.size === rejectedReasonCounts.size &&
+        [...rejectedReasonCounts.keys()].every(
+          (reason) => warningReasonCounts.get(reason) === 1 && rejectedReasonCounts.get(reason)! >= 1,
+        ) &&
+        counterRowsMatchRejections &&
+        conservationIdentity(counters) &&
         warnings.every((warning) => Buffer.byteLength(warning) <= 128) &&
         SENTINELS.every((sentinel) => !warningText.includes(sentinel)),
       {
-        warningCount: warnings.length,
-        expectedWarningCount,
+        distinctRejectedReasons: rejectedReasonCounts.size,
+        rejectionCount: [...rejectedReasonCounts.values()].reduce((a, b) => a + b, 0),
+        loggedLines: warnings.length,
+        perReason: Object.fromEntries([...rejectedReasonCounts].map(([reason, count]) => [reason, { rejections: count, logLines: warningReasonCounts.get(reason) ?? 0 }])),
         maxWarningBytes: Math.max(...warnings.map((warning) => Buffer.byteLength(warning))),
       },
     );
