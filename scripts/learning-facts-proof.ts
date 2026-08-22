@@ -747,6 +747,146 @@ async function main() {
       { uploadedEvents: uploaded.uploadedEvents, uploadBodies: uploadBodies.length },
     );
 
+    //
+    // #163 rework, gap 5 — the unbound/legacy producer path.
+    //
+    // A rollback-compatible raw producer (a build from before the workspace
+    // column, or a rolled-back binary) writes `workspace_id` NULL. That shape
+    // must stay covered here, in the CURRENT withholding semantics:
+    //   1. a bound MANAGED workspace never reads or uploads an unassigned row;
+    //   2. an unbound reader sees ONLY unassigned rows, never a bound row.
+    // A managed tenant is used deliberately: binding the LOCAL tenant
+    // legitimately adopts unassigned rows, so it cannot prove withholding.
+    proofStage = "unbound_legacy_producer";
+    const legacyLedger = path.join(root, "legacy-unbound-facts.sqlite");
+    const managedTenant = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+    const managedConfig = collectorConfigSchema.parse({
+      uploadUrl: "http://127.0.0.1/fake-learning-ingest",
+      tenantId: managedTenant,
+      installKey: "learning-facts-proof-install",
+    });
+    const unboundEventId = "00000000-0000-4000-8000-000000000700";
+    const unboundQueuedId = "00000000-0000-4000-8000-000000000702";
+    const managedEventId = "00000000-0000-4000-8000-000000000701";
+    // Stage 1 — the pre-workspace install: an UNBOUND, delivery-enabled buffer
+    // leaves unassigned rows in BOTH durable tables (buffered_events and
+    // upload_outbox), which is the only shape that reaches the outbox claim
+    // unassigned.
+    const preWorkspaceBuffer = new LocalEventBuffer(legacyLedger, {
+      delivery: { enabled: true },
+    });
+    preWorkspaceBuffer.append(aiInteractionEventSchema.parse({
+      id: unboundQueuedId,
+      source: "codex",
+      sessionId: "session-proof-100",
+      dataMode: "metadata",
+      eventType: "assistant_response",
+      observedAt: "2026-07-17T12:00:53.000Z",
+      actionClass: "other",
+      metadata: { proofKind: "legacy-unbound-queued" },
+    }));
+    preWorkspaceBuffer.close();
+    // Stage 2 — that install later binds a MANAGED workspace.
+    const legacyBuffer = new LocalEventBuffer(legacyLedger, {
+      workspaceId: managedTenant,
+      delivery: { enabled: true },
+    });
+    // The rollback-compatible raw producer: no workspace column value at all.
+    legacyBuffer.database
+      .prepare(
+        `insert into buffered_events
+          (id, source, event_type, data_mode, observed_at, payload_json,
+           suppressed_fields_json, created_at, uploaded_at, workspace_id)
+         values (?, 'codex', 'assistant_response', 'metadata', ?, ?, '[]', ?, null, null)`,
+      )
+      .run(
+        unboundEventId,
+        "2026-07-17T12:00:51.000Z",
+        JSON.stringify(aiInteractionEventSchema.parse({
+          id: unboundEventId,
+          source: "codex",
+          sessionId: "session-proof-100",
+          dataMode: "metadata",
+          eventType: "assistant_response",
+          observedAt: "2026-07-17T12:00:51.000Z",
+          actionClass: "other",
+          metadata: { proofKind: "legacy-unbound" },
+        })),
+        "2026-07-17T12:00:51.000Z",
+      );
+    legacyBuffer.append(aiInteractionEventSchema.parse({
+      id: managedEventId,
+      source: "codex",
+      sessionId: "session-proof-100",
+      dataMode: "metadata",
+      eventType: "assistant_response",
+      observedAt: "2026-07-17T12:00:52.000Z",
+      actionClass: "other",
+      metadata: { proofKind: "managed-workspace" },
+    }));
+    const managedVisible = legacyBuffer.listUnuploaded().map((row) => row.id);
+    const legacyBodies: string[] = [];
+    const legacyUploaded = await uploadBufferedEvents(managedConfig, legacyBuffer, {
+      fetchImpl: async (_input, init) => {
+        legacyBodies.push(String(init?.body ?? ""));
+        return new Response(JSON.stringify({ accepted: 1 }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      },
+    });
+    const unboundRowsAfter = legacyBuffer.database
+      .prepare(
+        `select id, workspace_id as workspaceId, uploaded_at as uploadedAt
+         from buffered_events where id in (?, ?) order by id`,
+      )
+      .all(unboundEventId, unboundQueuedId) as Array<{
+        id: string;
+        workspaceId: string | null;
+        uploadedAt: string | null;
+      }>;
+    const legacyEnrollment = legacyBuffer.enrollmentStatus();
+    check(
+      "bound_managed_workspace_never_reads_or_uploads_unbound_legacy_rows",
+      !managedVisible.includes(unboundEventId) &&
+        !managedVisible.includes(unboundQueuedId) &&
+        managedVisible.includes(managedEventId) &&
+        // Over the wire, not by label.
+        legacyUploaded.uploadedEvents === 1 &&
+        legacyBodies.length === 1 &&
+        legacyBodies[0].includes(managedEventId) &&
+        !legacyBodies.join("").includes(unboundEventId) &&
+        !legacyBodies.join("").includes(unboundQueuedId) &&
+        unboundRowsAfter.length === 2 &&
+        unboundRowsAfter.every(
+          (row) => row.workspaceId === null && row.uploadedAt === null,
+        ) &&
+        legacyEnrollment.quarantinedEventRows === 2,
+      {
+        managedVisible,
+        uploadedEvents: legacyUploaded.uploadedEvents,
+        unboundRowsAfter,
+        quarantinedEventRows: legacyEnrollment.quarantinedEventRows,
+      },
+    );
+    legacyBuffer.close();
+    const unboundReader = new LocalEventBuffer(legacyLedger, { delivery: { enabled: true } });
+    const unboundVisible = unboundReader.listUnuploaded().map((row) => row.id);
+    const unboundClaimed = unboundReader.delivery
+      .lease({ maxRows: 50 })
+      .items.map((item) => item.envelope.event.id);
+    check(
+      "unbound_reader_sees_only_unassigned_rows_never_bound_rows",
+      unboundVisible.includes(unboundEventId) &&
+        unboundVisible.includes(unboundQueuedId) &&
+        !unboundVisible.includes(managedEventId) &&
+        unboundClaimed.includes(unboundQueuedId) &&
+        !unboundClaimed.includes(managedEventId) &&
+        unboundReader.workspaceBinding()?.currentWorkspaceId === managedTenant,
+      { unboundVisible, unboundClaimed, binding: unboundReader.workspaceBinding() },
+    );
+    unboundReader.close();
+
     proofStage = "privacy";
     const liveText = sqliteText(buffer.database);
     const openFiles = fileSurfaces(ledger);
