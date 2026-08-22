@@ -298,7 +298,8 @@ export function createCollectorServer(
                   cachedAt: cached.cachedAt,
                   ageMs,
                 },
-              }            : {
+              }
+            : {
             ok: true,
             runtimeIdentity: options.runtimeIdentity ?? null,
             dataMode: config.policy.dataMode,
