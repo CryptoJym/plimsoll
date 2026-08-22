@@ -12,7 +12,10 @@
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
+
+import { scanCapacityDoctrine } from "./capacity-dependency-reachability";
 
 import {
   CAPACITY_PLAN_SCHEMA,
@@ -114,6 +117,18 @@ function prove(name: string, condition: unknown, detail: Record<string, unknown>
     now: fixture.now,
     maxAgeMs: fixture.maxAgeMs,
   });
+  // Issue #195: a future-dated observation (clock skew, bad input) must fail
+  // CLOSED — it is UNKNOWN, never fresh, and never clamped to age zero.
+  const futureFreshness = classifyCapacitySignalFreshness({
+    observedAt: "2026-08-22T00:00:00.000Z",
+    now: fixture.now,
+    maxAgeMs: fixture.maxAgeMs,
+  });
+  prove(
+    "freshness_classifies_future_dated_observation_as_unknown_never_fresh",
+    futureFreshness.status === "UNKNOWN" && futureFreshness.ageMs === null,
+    { futureFreshness },
+  );
   prove(
     "freshness_classifies_stale_and_missing_without_inventing_values",
     staleFreshness.status === "STALE" && staleFreshness.ageMs === 2 * 24 * 60 * 60 * 1000 &&
@@ -149,6 +164,36 @@ function prove(name: string, condition: unknown, detail: Record<string, unknown>
     fresh.freshness === "fresh" && fresh.remaining === 40_000 &&
       Math.abs(fresh.remainingFraction! - 40_000 / 220_000) < 1e-9,
     { fresh },
+  );
+
+  const futureDatedPlan = buildCapacityPlan({
+    profiles: [{ profileId: "anthropic.max.james", provider: "anthropic" }],
+    resets: [],
+    signalsByProfile: {
+      "anthropic.max.james": [
+        {
+          signalId: "signal.future.skewed_clock",
+          profileId: "anthropic.max.james",
+          dimension: "five_hour_window",
+          unit: "tokens",
+          limit: 220_000,
+          used: 10_000,
+          source: "local_telemetry",
+          observedAt: "2026-08-22T00:00:00.000Z",
+        },
+      ],
+    },
+    now: fixture.now,
+    maxAgeMs: fixture.maxAgeMs,
+  });
+  const futureRow = futureDatedPlan.summaries[0]!.constraints[0]!;
+  prove(
+    "future_dated_signal_yields_no_headroom_and_raises_unknown_alert",
+    futureRow.freshness === "UNKNOWN" && futureRow.remaining === null &&
+      futureRow.remainingFraction === null && futureRow.ageMs === null &&
+      futureDatedPlan.staleAlerts.length === 1 &&
+      futureDatedPlan.staleAlerts[0]!.severity === "MISSING_SIGNAL",
+    { row: futureRow, alerts: futureDatedPlan.staleAlerts },
   );
 
   const severities = plan.staleAlerts.map((alert) => alert.severity);
@@ -284,6 +329,28 @@ function prove(name: string, condition: unknown, detail: Record<string, unknown>
       staleLimitEstimate.projectedExhaustion.state === "UNKNOWN",
     { staleLimitEstimate },
   );
+
+  // Issue #195: a cumulative counter that DROPS mid-window is a quota reset;
+  // linear interpolation across it previously returned a negative
+  // "stale-valid" pace instead of failing closed to UNKNOWN.
+  const resetWindowEstimate = estimateCapacityLinearPace({
+    observations: [
+      { at: "2026-08-18T00:00:00.000Z", cumulativeTokens: 200_000 },
+      { at: "2026-08-19T00:00:00.000Z", cumulativeTokens: 210_000 },
+      { at: "2026-08-20T20:00:00.000Z", cumulativeTokens: 5_000 },
+    ],
+    now: fixture.now,
+  });
+  prove(
+    "pace_gate_blocks_quota_reset_negative_delta_as_unknown_never_negative_pace",
+    resetWindowEstimate.state === "UNKNOWN" &&
+      typeof resetWindowEstimate.reason === "string" &&
+      resetWindowEstimate.reason.startsWith("quota_reset_detected_in_window") &&
+      resetWindowEstimate.tokensPerDay === null &&
+      resetWindowEstimate.observationWindow === null &&
+      resetWindowEstimate.claimClass === "observed",
+    { resetWindowEstimate },
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -355,52 +422,185 @@ function prove(name: string, condition: unknown, detail: Record<string, unknown>
   );
   prove("cost_facts_must_reference_known_profiles", true, {});
 
+  // Issue #195: a signal stored under one profile's key but stamped with
+  // another profile's profileId must be rejected, not silently summarized.
+  let mismatchedSignalThrew = false;
+  try {
+    buildCapacityPlan({
+      profiles: [
+        { profileId: "a.one", provider: "anthropic" },
+        { profileId: "b.two", provider: "anthropic" },
+      ],
+      resets: [],
+      signalsByProfile: {
+        "a.one": [{
+          signalId: "s.mismatch", profileId: "b.two", dimension: "five_hour_window",
+          unit: "tokens", limit: 100, used: 50, source: "local_telemetry",
+          observedAt: "2026-08-21T00:00:00.000Z",
+        }],
+      },
+      now: "2026-08-21T00:00:00.000Z",
+    });
+  } catch {
+    mismatchedSignalThrew = true;
+  }
+  let unknownKeyThrew = false;
+  try {
+    buildCapacityPlan({
+      profiles: [{ profileId: "a.one", provider: "anthropic" }],
+      resets: [],
+      signalsByProfile: {
+        "ghost.profile": [{
+          signalId: "s.ghost", profileId: "ghost.profile", dimension: "five_hour_window",
+          unit: "tokens", limit: 100, used: 50, source: "local_telemetry",
+          observedAt: "2026-08-21T00:00:00.000Z",
+        }],
+      },
+      now: "2026-08-21T00:00:00.000Z",
+    });
+  } catch {
+    unknownKeyThrew = true;
+  }
+  let mismatchedCostKeyThrew = false;
+  try {
+    buildCapacityPlan({
+      profiles: [
+        { profileId: "a.one", provider: "anthropic" },
+        { profileId: "b.two", provider: "anthropic" },
+      ],
+      resets: [],
+      signalsByProfile: {},
+      costsByProfile: {
+        "a.one": { profileId: "b.two", subscriptionUsdPerMonth: 1, apiEquivalentUsd: 2, observedAt: "2026-08-21T00:00:00.000Z" },
+      },
+      now: "2026-08-21T00:00:00.000Z",
+    });
+  } catch {
+    mismatchedCostKeyThrew = true;
+  }
+  prove(
+    "profile_id_map_key_mismatch_rejected_for_signals_keys_and_costs",
+    mismatchedSignalThrew && unknownKeyThrew && mismatchedCostKeyThrew,
+    { mismatchedSignalThrew, unknownKeyThrew, mismatchedCostKeyThrew },
+  );
+
   prove("plan_schema_is_versioned", plan.schema === CAPACITY_PLAN_SCHEMA, { schema: plan.schema });
 }
 
 // ---------------------------------------------------------------------------
 // 5. STATIC DEPENDENCY PROOF — capacity must not feed decision surfaces.
 //
-// Scans every TypeScript source file in the repo and fails if any module
-// concerned with routing, coaching, ranking, compensation, discipline,
-// interventions, D3/D4 hosted phases, or individual performance verdicts
-// imports the capacity module; if the capacity module itself imports any
-// scoring/decision surface; or if the capacity export surface grows a verb
-// belonging to those domains.
+// Reachability-based (issue #195): relative import specifiers are resolved
+// and barrel/index re-export chains are followed, so `from "./index"` can no
+// longer smuggle capacity into a decision surface. Decision surfaces are
+// detected by CONTENT as well as by file name.
 // ---------------------------------------------------------------------------
 {
-  const forbiddenConsumerPattern =
-    /(?:rout|coach|rank|ranking|compensat|disciplin|intervent|verdict|score|scoring|performance[-_.]?layer|metric[-_.]?registry)/i;
-  const forbiddenExportPattern =
-    /export (?:async )?function [A-Za-z]*(?:Route|rout|Coach|coach|Rank|rank|Compensat|Disciplin|Intervent|Verdict|Score|Scoring)[A-Za-z]*\(/;
-
-  const sourceDirs = ["packages", "scripts"];
-  const tsFiles: string[] = [];
-  const walk = (dir: string) => {
-    for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
-      if (entry.name === "node_modules" || entry.name.startsWith(".")) continue;
-      const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) walk(full);
-      else if (entry.name.endsWith(".ts")) tsFiles.push(full);
-    }
-  };
-  for (const dir of sourceDirs) walk(path.join(root, dir));
-
-  const capacityFiles = tsFiles.filter((file) => /capacity/i.test(path.basename(file)));
-  const importersOfCapacity = tsFiles.filter((file) => {
-    if (capacityFiles.includes(file)) return false;
-    const text = fs.readFileSync(file, "utf8");
-    return /from\s+"[^"]*capacity"/.test(text) || /from\s+'[^']*capacity'/.test(text);
-  });
-
-  const offendingImporters = importersOfCapacity.filter((file) => forbiddenConsumerPattern.test(file));
+  const report = scanCapacityDoctrine(root);
   prove(
-    "static_proof_no_decision_surface_module_imports_capacity",
-    offendingImporters.length === 0,
-    { importersOfCapacity, offendingImporters },
+    "static_proof_no_module_reaches_and_consumes_capacity_from_decision_surface",
+    report.offendingImporters.length === 0,
+    { offenders: report.offendingImporters, scannedFiles: report.scannedFiles.length },
   );
 
-  const capacitySource = capacityFiles
+  // FALSIFICATION FIXTURES — the exact bypass shapes from issue #195, planted
+  // in a throwaway sandbox tree. The gate must turn RED naming each offender.
+  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-capacity-bypass-"));
+  try {
+    const sharedSrc = path.join(sandbox, "packages/shared/src");
+    fs.mkdirSync(sharedSrc, { recursive: true });
+    fs.writeFileSync(
+      path.join(sharedSrc, "capacity.ts"),
+      [
+        "export const CAPACITY_PLAN_SCHEMA = \"plimsoll.capacity-plan.v1\" as const;",
+        "export function buildCapacityPlan(): string { return CAPACITY_PLAN_SCHEMA; }",
+        "",
+      ].join("\n"),
+    );
+    fs.writeFileSync(
+      path.join(sharedSrc, "index.ts"),
+      [
+        'export * from "./capacity";',
+        'export * from "./harmless";',
+        "",
+      ].join("\n"),
+    );
+    fs.writeFileSync(
+      path.join(sharedSrc, "harmless.ts"),
+      "export function harmlessHelper(): number { return 7; }\n",
+    );
+    // Offender 1: decision surface by FILE NAME, bypassing via the barrel.
+    fs.writeFileSync(
+      path.join(sharedSrc, "metric-registry.ts"),
+      [
+        'import { buildCapacityPlan } from "./index";',
+        "export function registerMetric(): string { return buildCapacityPlan(); }",
+        "",
+      ].join("\n"),
+    );
+    // Offender 2: decision surface by CONTENT ONLY (innocuous filename).
+    fs.writeFileSync(
+      path.join(sharedSrc, "summarizer.ts"),
+      [
+        'import { buildCapacityPlan } from "./index";',
+        "export function scoreTechnique(): string { return buildCapacityPlan(); }",
+        "",
+      ].join("\n"),
+    );
+    // Offender 3: transitive consumer that never names a capacity symbol.
+    fs.mkdirSync(path.join(sandbox, "packages/cli"), { recursive: true });
+    fs.writeFileSync(
+      path.join(sandbox, "packages/cli/dispatcher.ts"),
+      [
+        'import { scoreTechnique } from "../shared/src/summarizer";',
+        "export function routeTask(): string { return scoreTechnique(); }",
+        "",
+      ].join("\n"),
+    );
+    // Negative control: a file that REACHES capacity through the barrel
+    // without consuming any capacity symbol stays green — reachability alone
+    // does not condemn, actual capacity-symbol consumption does.
+    fs.writeFileSync(
+      path.join(sharedSrc, "innocent-bystander.ts"),
+      [
+        'import { harmlessHelper } from "./index";',
+        "export function summarizeInnocently(): number { return harmlessHelper(); }",
+        "",
+      ].join("\n"),
+    );
+
+    const bypass = scanCapacityDoctrine(sandbox);
+    const offenderPaths = bypass.offendingImporters.map((offense) => offense.file);
+
+    prove(
+      "falsification_barrel_import_in_named_decision_surface_turns_red",
+      offenderPaths.some((file) => file.endsWith("metric-registry.ts")),
+      { offenders: bypass.offendingImporters },
+    );
+    prove(
+      "falsification_barrel_import_in_content_detected_decision_surface_turns_red",
+      offenderPaths.some((file) => file.endsWith("summarizer.ts")),
+      { offenders: bypass.offendingImporters },
+    );
+    prove(
+      "falsification_transitive_consumer_without_capacity_symbols_turns_red",
+      offenderPaths.some((file) => file.endsWith("dispatcher.ts")),
+      { offenders: bypass.offendingImporters },
+    );
+    prove(
+      "falsification_negative_control_non_decision_surface_stays_green",
+      !offenderPaths.some((file) => file.endsWith("innocent-bystander.ts")) &&
+        bypass.filesReachingCapacity.some((file) => file.endsWith("innocent-bystander.ts")),
+      {
+        offenders: bypass.offendingImporters,
+        reaching: bypass.filesReachingCapacity.map((file) => path.basename(file)),
+      },
+    );
+  } finally {
+    fs.rmSync(sandbox, { recursive: true, force: true });
+  }
+
+  const capacitySource = report.capacityModules
     .filter((file) => file.includes(`${path.sep}src${path.sep}`))
     .map((file) => fs.readFileSync(file, "utf8"))
     .join("\n");
