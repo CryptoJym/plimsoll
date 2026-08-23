@@ -27,6 +27,39 @@ export type MaintenanceBoundaryState =
   | "stopping"
   | "stopped";
 
+/**
+ * Issue #181. A deadline kill proves that the JOB overran, never that the
+ * candidate holding the stage at kill time is the slow one. The only evidence
+ * this parent may measure without touching the filesystem is how long that
+ * candidate itself occupied the deadline window before the timer fired: a
+ * candidate that held the stage for at least this share of the window is the
+ * measured dominant consumer, because no other stage could have held more.
+ * Anything under the threshold is an unproven blame and stays UNKNOWN.
+ */
+export const QUARANTINE_BLAME_SHARE = 0.5;
+
+export type MaintenanceQuarantineVerdict =
+  | "proven_slow"
+  | "unproven"
+  | "no_candidate";
+
+export type MaintenanceQuarantineEvidence = {
+  /** Measured milliseconds this candidate held the stage before the kill. */
+  onStageMs: number;
+  /** Measured milliseconds it had to hold to be blamed. */
+  thresholdMs: number;
+  deadlineMs: number;
+};
+
+export type MaintenanceUnprovenBlame = {
+  source: "codex" | "claude_code";
+  stage: MaintenanceProgress["stage"];
+  candidateHash: string | null;
+  onStageMs: number;
+  thresholdMs: number;
+  observedAt: string;
+};
+
 export type MaintenanceBoundaryStatus = {
   state: MaintenanceBoundaryState;
   accepting: boolean;
