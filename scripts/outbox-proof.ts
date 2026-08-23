@@ -81,9 +81,15 @@ function bulkyAllowedMetadata(count = 16) {
 
 function enabledBuffer(file = ledger(), overrides: Record<string, number> = {}) {
   const cfg = config(overrides);
+  // Issue 0089: enrollment is future-only — unbound rows are quarantined and
+  // never adopted by a later workspace selection, so fixtures that upload
+  // under `cfg` must capture their rows bound to cfg.tenantId.
   return {
     cfg,
-    buffer: new LocalEventBuffer(file, { delivery: { enabled: true, limits: cfg.delivery } }),
+    buffer: new LocalEventBuffer(file, {
+      workspaceId: cfg.tenantId,
+      delivery: { enabled: true, limits: cfg.delivery },
+    }),
   };
 }
 
@@ -374,7 +380,10 @@ function migrationProof() {
 async function migrationReopenProof() {
   const file = ledger();
   const cfg = config({ migrationBatchRows: 1, migrationBatchBytes: 1_000_000 });
+  // Issue 0089: future-only enrollment quarantines unbound rows, so this
+  // fixture captures and poisons rows already bound to cfg.tenantId.
   let buffer = new LocalEventBuffer(file, {
+    workspaceId: cfg.tenantId,
     delivery: { enabled: true, limits: cfg.delivery },
   });
   buffer.append(event(20));
@@ -387,15 +396,16 @@ async function migrationReopenProof() {
   const completed = buffer.delivery.status(instant(36)).migration;
   buffer.close();
 
-  buffer = new LocalEventBuffer(file);
+  buffer = new LocalEventBuffer(file, { workspaceId: cfg.tenantId });
   buffer.append(event(21));
   const invalidatedInAppend = buffer.delivery.status(instant(37)).migration;
   // Simulate a rollback-compatible producer that writes raw truth without the
   // current append helper. Re-enable must still compare the O(1) rowid high-water.
-  insertLegacyPoison(buffer, 22, JSON.stringify(event(22)));
+  insertLegacyPoison(buffer, 22, JSON.stringify(event(22)), cfg.tenantId);
   buffer.close();
 
   buffer = new LocalEventBuffer(file, {
+    workspaceId: cfg.tenantId,
     delivery: { enabled: true, limits: cfg.delivery },
   });
   const reopened = buffer.delivery.status(instant(38)).migration;
@@ -450,26 +460,185 @@ async function migrationReopenProof() {
   buffer.close();
 }
 
-function insertLegacyPoison(buffer: LocalEventBuffer, n: number, payloadJson: string) {
+function insertLegacyPoison(
+  buffer: LocalEventBuffer,
+  n: number,
+  payloadJson: string,
+  workspaceId?: string,
+) {
+  // Issue 0089: the simulated rollback-compatible raw producer labels its row
+  // with the active workspace; unbound rows are permanently quarantined.
+  //
+  // #163 rework: `workspaceId` is OPTIONAL again. Omitting it reproduces the
+  // real rollback-compatible producer — a build written before the workspace
+  // column existed, or a rolled-back binary — which writes `workspace_id`
+  // NULL. That shape must stay covered by a proof, not merely be asserted
+  // about in a comment.
   buffer.database
     .prepare(
       `insert into buffered_events
         (id, source, event_type, data_mode, observed_at, payload_json,
-         suppressed_fields_json, created_at, uploaded_at)
-       values (?, 'codex', 'assistant_response', 'metadata', ?, ?, '[]', ?, null)`,
+         suppressed_fields_json, created_at, uploaded_at, workspace_id)
+       values (?, 'codex', 'assistant_response', 'metadata', ?, ?, '[]', ?, null, ?)`,
     )
-    .run(uuid(n), instant(n).toISOString(), payloadJson, instant(n).toISOString());
+    .run(
+      uuid(n),
+      instant(n).toISOString(),
+      payloadJson,
+      instant(n).toISOString(),
+      workspaceId ?? null,
+    );
+}
+
+/**
+ * #163 rework, gap 5 — the unbound/legacy producer path.
+ *
+ * A rollback-compatible raw producer writes `workspace_id` NULL. This proof
+ * holds the CURRENT withholding semantics in both directions:
+ *   1. a bound MANAGED workspace never sees, claims, leases or uploads an
+ *      unassigned row (it is not its history);
+ *   2. an unbound reader sees ONLY unassigned rows and never a bound row
+ *      (fail-closed, not "no predicate = see everything").
+ * The LOCAL tenant is deliberately not used here: binding LOCAL legitimately
+ * adopts unassigned rows (same local owner), so it cannot prove withholding.
+ */
+async function unboundLegacyProducerWithholdingProof() {
+  const file = ledger();
+  const managedTenant = "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee";
+  const cfg = collectorConfigSchema.parse({
+    uploadUrl: "http://127.0.0.1:1/ingest",
+    tenantId: managedTenant,
+    installKey: "proof-install",
+    delivery: { maxOldestAgeDays: 3650, maxBackoffSeconds: 60, requestTimeoutSeconds: 1 },
+  });
+
+  // Stage 1 — the pre-workspace install. An UNBOUND, delivery-enabled buffer
+  // produces unassigned rows in BOTH durable tables: buffered_events (the raw
+  // producer) and upload_outbox (the queued delivery). This is the shape a
+  // rolled-back or pre-migration build leaves behind, and the only shape that
+  // reaches the outbox claim unassigned.
+  const legacy = new LocalEventBuffer(file, {
+    delivery: { enabled: true, limits: cfg.delivery },
+  });
+  insertLegacyPoison(legacy, 700, JSON.stringify(event(700)));
+  legacy.append(event(702));
+  legacy.close();
+
+  // Stage 2 — that same install later binds a MANAGED workspace and captures
+  // its own row. The unassigned history is not this workspace's history.
+  const seed = new LocalEventBuffer(file, {
+    workspaceId: managedTenant,
+    delivery: { enabled: true, limits: cfg.delivery },
+  });
+  seed.append(event(701));
+  const unboundRawId = uuid(700);
+  const unboundQueuedId = uuid(702);
+  const managedId = uuid(701);
+  const seededWorkspaces = seed.database
+    .prepare(`select id, workspace_id as ws from buffered_events order by id`)
+    .all() as Array<{ id: string; ws: string | null }>;
+  const seededOutbox = seed.database
+    .prepare(`select raw_id as rawId, workspace_id as ws from upload_outbox order by raw_id`)
+    .all() as Array<{ rawId: string | null; ws: string | null }>;
+  record(
+    "unbound_legacy_producer_rows_are_really_unbound_in_both_tables",
+    seededWorkspaces.find((row) => row.id === unboundRawId)?.ws === null &&
+      seededWorkspaces.find((row) => row.id === unboundQueuedId)?.ws === null &&
+      seededWorkspaces.find((row) => row.id === managedId)?.ws === managedTenant &&
+      seededOutbox.some((row) => row.rawId === unboundQueuedId && row.ws === null) &&
+      seededOutbox.some((row) => row.rawId === managedId && row.ws === managedTenant),
+    { seededWorkspaces, seededOutbox },
+  );
+
+  const managedVisible = seed.listUnuploaded().map((row) => row.id);
+  const bodies: string[] = [];
+  const result = await uploadBufferedEvents(cfg, seed, {
+    fetchImpl: async (_input, init) => {
+      bodies.push(String(init?.body ?? ""));
+      return response(200, { accepted: requestIds(init).length });
+    },
+    now: () => instant(750),
+  });
+  const sentIds = bodies.flatMap((body) => requestIds({ body } as RequestInit));
+  const unboundAfter = seed.database
+    .prepare(
+      `select id, workspace_id as ws, uploaded_at as uploadedAt from buffered_events
+       where id in (?, ?) order by id`,
+    )
+    .all(unboundRawId, unboundQueuedId) as Array<{
+      id: string;
+      ws: string | null;
+      uploadedAt: string | null;
+    }>;
+  const unboundOutboxAfter = seed.database
+    .prepare(`select raw_id as rawId, workspace_id as ws, state from upload_outbox where workspace_id is null`)
+    .all() as Array<{ rawId: string | null; ws: string | null; state: string }>;
+  const enrollment = seed.enrollmentStatus();
+  record(
+    "bound_managed_workspace_never_reads_claims_or_uploads_unbound_rows",
+    !managedVisible.includes(unboundRawId) &&
+      !managedVisible.includes(unboundQueuedId) &&
+      managedVisible.includes(managedId) &&
+      // Over the wire, not by label: only the managed workspace's own row.
+      result.uploadedEvents === 1 &&
+      result.markedUploaded === 1 &&
+      sentIds.length === 1 &&
+      sentIds[0] === managedId &&
+      !bodies.join("").includes(unboundRawId) &&
+      !bodies.join("").includes(unboundQueuedId) &&
+      unboundAfter.every((row) => row.ws === null && row.uploadedAt === null) &&
+      unboundOutboxAfter.length >= 1 &&
+      unboundOutboxAfter.every((row) => row.state !== "acknowledged") &&
+      enrollment.quarantinedEventRows === 2,
+    {
+      managedVisible,
+      sentIds,
+      uploadedEvents: result.uploadedEvents,
+      markedUploaded: result.markedUploaded,
+      unboundAfter,
+      unboundOutboxAfter,
+      enrollment,
+    },
+  );
+  seed.close();
+
+  // Direction 2 — the unbound reader. It must see the unassigned rows and
+  // NOTHING that belongs to a workspace (fail closed, not "no predicate").
+  const unboundReader = new LocalEventBuffer(file, {
+    delivery: { enabled: true, limits: cfg.delivery },
+  });
+  const unboundVisible = unboundReader.listUnuploaded().map((row) => row.id);
+  const unboundClaim = unboundReader.delivery.lease({ maxRows: 50, now: instant(760) });
+  const claimedRawIds = unboundClaim.items.map((item) => item.envelope.event.id);
+  record(
+    "unbound_reader_sees_only_unassigned_rows_never_bound_rows",
+    unboundVisible.includes(unboundRawId) &&
+      unboundVisible.includes(unboundQueuedId) &&
+      !unboundVisible.includes(managedId) &&
+      claimedRawIds.includes(unboundQueuedId) &&
+      !claimedRawIds.includes(managedId) &&
+      unboundReader.workspaceBinding()?.currentWorkspaceId === managedTenant,
+    {
+      unboundVisible,
+      claimedRawIds,
+      binding: unboundReader.workspaceBinding(),
+    },
+  );
+  unboundReader.close();
 }
 
 async function localPoisonProof() {
   const file = ledger();
-  const seed = new LocalEventBuffer(file);
-  insertLegacyPoison(seed, 30, "{");
-  insertLegacyPoison(seed, 31, JSON.stringify({ ...event(31), source: "invalid_source" }));
+  const cfg = config();
+  // Issue 0089: capture pre-bound to cfg.tenantId; unbound history stays
+  // quarantined and is never adopted by a later workspace selection.
+  const seed = new LocalEventBuffer(file, { workspaceId: cfg.tenantId });
+  insertLegacyPoison(seed, 30, "{", cfg.tenantId);
+  insertLegacyPoison(seed, 31, JSON.stringify({ ...event(31), source: "invalid_source" }), cfg.tenantId);
   seed.append(event(32));
   seed.close();
 
-  const { buffer, cfg } = enabledBuffer(file);
+  const { buffer } = enabledBuffer(file);
   let httpCalls = 0;
   const fetchImpl: typeof fetch = async () => {
     httpCalls += 1;
@@ -527,7 +696,9 @@ async function limitOnePoisonFairnessProof() {
   for (const poisonPosition of [0, 1, 2]) {
     const base = 300 + poisonPosition * 10;
     const cfg = config({ maxBackoffSeconds: 30, maxProbesPerCycle: 1 });
+    // Issue 0089: capture pre-bound to cfg.tenantId (future-only enrollment).
     const buffer = new LocalEventBuffer(ledger(), {
+      workspaceId: cfg.tenantId,
       delivery: { enabled: true, limits: cfg.delivery },
     });
     const items = [event(base), event(base + 1), event(base + 2)];
@@ -593,7 +764,9 @@ async function limitOnePoisonFairnessProof() {
 
   {
     const cfg = config({ maxBackoffSeconds: 30, maxProbesPerCycle: 1 });
+    // Issue 0089: capture pre-bound to cfg.tenantId (future-only enrollment).
     const buffer = new LocalEventBuffer(ledger(), {
+      workspaceId: cfg.tenantId,
       delivery: { enabled: true, limits: cfg.delivery },
     });
     const knownGood = event(340);
@@ -653,7 +826,9 @@ async function crashBetweenSiblingAckAndQuarantineProof() {
   const cfg = config({ maxBackoffSeconds: 30, maxProbesPerCycle: 2, leaseSeconds: 120 });
   const poison = event(350);
   const valid = event(351);
+  // Issue 0089: capture pre-bound to cfg.tenantId (future-only enrollment).
   let buffer = new LocalEventBuffer(file, {
+    workspaceId: cfg.tenantId,
     delivery: { enabled: true, limits: cfg.delivery },
   });
   buffer.append(poison);
@@ -682,6 +857,7 @@ async function crashBetweenSiblingAckAndQuarantineProof() {
   buffer.close();
 
   buffer = new LocalEventBuffer(file, {
+    workspaceId: cfg.tenantId,
     delivery: { enabled: true, limits: cfg.delivery },
   });
   const replayRequests: string[][] = [];
@@ -921,7 +1097,9 @@ async function linkageAndRetentionProof() {
 async function noMarkPressureAndPrivacyProof() {
   {
     const file = ledger();
-    const buffer = new LocalEventBuffer(file);
+    // Issue 0089: capture pre-bound to the default tenant; unbound history
+    // stays quarantined and is invisible to every upload lease.
+    const buffer = new LocalEventBuffer(file, { workspaceId: config().tenantId });
     buffer.append(event(140));
     const before = buffer.database
       .prepare(`select uploaded_at as uploadedAt, (select count(*) from upload_outbox) as active, (select count(*) from upload_receipts) as receipts, (select outbox_attempts_total from upload_control where singleton = 1) as attempts from buffered_events`)
@@ -943,7 +1121,9 @@ async function noMarkPressureAndPrivacyProof() {
   }
   {
     const file = ledger();
-    const buffer = new LocalEventBuffer(file);
+    // Issue 0089: capture pre-bound to the default tenant; unbound history
+    // stays quarantined and is invisible to every upload lease.
+    const buffer = new LocalEventBuffer(file, { workspaceId: config().tenantId });
     const tokenSentinel = "STATELESS_ACCESS_TOKEN_SENTINEL";
     const malformedLinkage = "sha256:not-a-canonical-linkage";
     buffer.append(event(141, { metadata: { accessToken: tokenSentinel } }));
@@ -1000,7 +1180,8 @@ async function noMarkPressureAndPrivacyProof() {
     buffer.close();
   }
   {
-    const buffer = new LocalEventBuffer(ledger());
+    // Issue 0089: capture pre-bound to the default tenant (future-only).
+    const buffer = new LocalEventBuffer(ledger(), { workspaceId: config().tenantId });
     const oversizedId = uuid(144);
     const laterId = uuid(145);
     buffer.append(event(144, { metadata: bulkyAllowedMetadata(64) }));
@@ -1192,7 +1373,11 @@ async function policyResponseAndLegacyReadbackProof() {
 
   const file = ledger();
   const cfg = config();
+  // Issue 0089: enrollment is future-only, so a fixture that later uploads
+  // under `cfg` must capture its rows already bound to cfg.tenantId. Legacy
+  // unbound rows are quarantined and would no longer be adopted implicitly.
   let buffer: LocalEventBuffer | undefined = new LocalEventBuffer(file, {
+    workspaceId: cfg.tenantId,
     delivery: { enabled: true, limits: cfg.delivery },
   });
   let server: ReturnType<typeof createCollectorServer> | undefined;
@@ -1216,6 +1401,7 @@ async function policyResponseAndLegacyReadbackProof() {
     server = undefined;
     buffer.close();
     buffer = new LocalEventBuffer(file, {
+      workspaceId: cfg.tenantId,
       delivery: { enabled: true, limits: cfg.delivery },
     });
     const hookListReopened = buffer.list(10).find((row) => row.id === hookId)?.suppressedFields ?? [];
@@ -1310,6 +1496,7 @@ async function policyResponseAndLegacyReadbackProof() {
     server = undefined;
     buffer.close();
     buffer = new LocalEventBuffer(file, {
+      workspaceId: cfg.tenantId,
       delivery: { enabled: true, limits: cfg.delivery },
     });
     const fallbackListReopened =
@@ -1660,6 +1847,9 @@ async function semanticScalarSpanParityProof() {
   };
 
   let buffer: LocalEventBuffer | undefined = new LocalEventBuffer(file, {
+    // Issue 0089: capture pre-bound to cfg.tenantId; unbound history stays
+    // quarantined and is never adopted by a later workspace selection.
+    workspaceId: cfg.tenantId,
     delivery: { enabled: true, limits: cfg.delivery },
   });
   let server: ReturnType<typeof createCollectorServer> | undefined;
@@ -1695,6 +1885,8 @@ async function semanticScalarSpanParityProof() {
     server = undefined;
     buffer.close();
     buffer = new LocalEventBuffer(file, {
+      // Issue 0089: reopen bound to cfg.tenantId (future-only enrollment).
+      workspaceId: cfg.tenantId,
       delivery: { enabled: true, limits: cfg.delivery },
     });
     const reopened = buffer.list(20).find((row) => row.id === capturedId);
@@ -1977,6 +2169,9 @@ async function topLevelPromotionAdmissionProof() {
   };
 
   let buffer: LocalEventBuffer | undefined = new LocalEventBuffer(file, {
+    // Issue 0089: capture pre-bound to cfg.tenantId; unbound history stays
+    // quarantined and is never adopted by a later workspace selection.
+    workspaceId: cfg.tenantId,
     delivery: { enabled: true, limits: cfg.delivery },
   });
   let server: ReturnType<typeof createCollectorServer> | undefined;
@@ -2052,6 +2247,8 @@ async function topLevelPromotionAdmissionProof() {
     server = undefined;
     buffer.close();
     buffer = new LocalEventBuffer(file, {
+      // Issue 0089: reopen bound to cfg.tenantId (future-only enrollment).
+      workspaceId: cfg.tenantId,
       delivery: { enabled: true, limits: cfg.delivery },
     });
     const reopened = buffer.list(10).find((row) => row.id === capturedId);
@@ -2321,6 +2518,9 @@ async function hookPromotionAdmissionProof() {
   };
 
   let buffer: LocalEventBuffer | undefined = new LocalEventBuffer(file, {
+    // Issue 0089: capture pre-bound to cfg.tenantId; unbound history stays
+    // quarantined and is never adopted by a later workspace selection.
+    workspaceId: cfg.tenantId,
     delivery: { enabled: true, limits: cfg.delivery },
   });
   let server: ReturnType<typeof createCollectorServer> | undefined;
@@ -2352,6 +2552,8 @@ async function hookPromotionAdmissionProof() {
     server = undefined;
     buffer.close();
     buffer = new LocalEventBuffer(file, {
+      // Issue 0089: reopen bound to cfg.tenantId (future-only enrollment).
+      workspaceId: cfg.tenantId,
       delivery: { enabled: true, limits: cfg.delivery },
     });
     const reopened = buffer.list(10).find((row) => row.id === capturedId);
@@ -2803,6 +3005,9 @@ async function suppressionReceiptProductionParityProof() {
     ...safeKeys.map((key) => `${prefix}${key}`),
   ];
   let buffer = new LocalEventBuffer(file, {
+    // Issue 0089: capture pre-bound to cfg.tenantId; unbound history stays
+    // quarantined and is never adopted by a later workspace selection.
+    workspaceId: cfg.tenantId,
     delivery: { enabled: true, limits: cfg.delivery },
   });
   buffer.appendMany(exploded.events, exploded.metricSamples, exploded.admissionDrops);
@@ -2817,6 +3022,9 @@ async function suppressionReceiptProductionParityProof() {
   buffer.close();
 
   buffer = new LocalEventBuffer(file, {
+    // Issue 0089: capture pre-bound to cfg.tenantId; unbound history stays
+    // quarantined and is never adopted by a later workspace selection.
+    workspaceId: cfg.tenantId,
     delivery: { enabled: true, limits: cfg.delivery },
   });
   const reopened = buffer.database
@@ -3527,7 +3735,9 @@ async function requestBudgetAndResumableValidationProof() {
 function pressureAgeByteOversizeAndStatusProof() {
   {
     const file = ledger();
-    const seed = new LocalEventBuffer(file);
+    // Issue 0089: seed pre-bound so the migrated row stays visible to the
+    // workspace-scoped status/lease boundary (future-only enrollment).
+    const seed = new LocalEventBuffer(file, { workspaceId: config().tenantId });
     const old = event(170);
     seed.append(old);
     seed.database.prepare(`update buffered_events set created_at = ? where id = ?`).run("2020-01-01T00:00:00.000Z", old.id);
@@ -3611,6 +3821,7 @@ async function main() {
     migrationProof();
     await migrationReopenProof();
     await localPoisonProof();
+    await unboundLegacyProducerWithholdingProof();
     await remotePoisonPositionProof();
     await limitOnePoisonFairnessProof();
     await crashBetweenSiblingAckAndQuarantineProof();
@@ -3644,6 +3855,6 @@ async function main() {
 }
 
 void main().catch((error) => {
-  console.error(error instanceof Error ? error.message : String(error));
+  console.error(error instanceof Error ? `${error.message}\n${error.stack}` : String(error));
   process.exitCode = 1;
 });

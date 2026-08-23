@@ -318,7 +318,12 @@ async function run(mode: WorkerMode, root: string, operatorHome: string): Promis
     capturedLogs.push(parts.map((part) => (typeof part === "string" ? part : "[non_string]")).join(" "));
   };
   try {
-    buffer = new LocalEventBuffer(ledger, { delivery: { enabled: true, limits: config.delivery } });
+    // Issue 0089: capture pre-bound to config.tenantId; unbound history stays
+    // quarantined and is invisible to every upload lease.
+    buffer = new LocalEventBuffer(ledger, {
+      workspaceId: config.tenantId,
+      delivery: { enabled: true, limits: config.delivery },
+    });
     server = createCollectorServer(config, buffer);
     const port = await listen(server);
     const before = durableState(buffer);
@@ -392,7 +397,12 @@ async function run(mode: WorkerMode, root: string, operatorHome: string): Promis
     buffer.close();
     buffer = undefined;
 
-    buffer = new LocalEventBuffer(ledger, { delivery: { enabled: true, limits: config.delivery } });
+    // Issue 0089: capture pre-bound to config.tenantId; unbound history stays
+    // quarantined and is invisible to every upload lease.
+    buffer = new LocalEventBuffer(ledger, {
+      workspaceId: config.tenantId,
+      delivery: { enabled: true, limits: config.delivery },
+    });
     const reopened = durableState(buffer);
     checks.reopenPreservesBoundary =
       reopened.raw === 1 && reopened.facts === 1 && reopened.outbox === 1 && reopened.repairs === 0;

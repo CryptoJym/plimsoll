@@ -5,6 +5,7 @@ import Database from "better-sqlite3";
 
 import {
   canonicalizeSuppressionReceipts,
+  LOCAL_TENANT_ID,
   type AiInteractionEvent,
 } from "../../shared/src/index";
 import type { MetricSample } from "./otlp";
@@ -560,9 +561,18 @@ export class LocalEventBuffer {
   }
 
   /**
-   * Select the ledger's upload audience. The first selection migrates legacy
-   * unassigned rows. A later mismatch fails closed: only join's explicit
-   * transition may change an initialized ledger audience.
+   * Select the ledger's upload audience (issue 0089). Enrollment is
+   * future-only: no selection ever relabels pre-existing rows. Unassigned
+   * rows stay in local quarantine until an explicitly confirmed history
+   * operation moves them. A mismatch fails closed: only join's explicit
+   * transactional activation may change an initialized ledger audience.
+   *
+   * Single legacy exception (issue #163 rework): binding the unmanaged
+   * default LOCAL tenant adopts workspace-unassigned rows left by
+   * pre-workspace builds (every install upgraded via migrateEventColumns).
+   * Same local owner, no enrollment involved — legacy upload behavior
+   * returns. Binding ANY managed/joined workspace must never adopt
+   * unassigned rows: that relabel is the exact leak class #163 quarantines.
    */
   useWorkspace(workspaceId: string) {
     const requested = workspaceId.trim();
@@ -584,27 +594,29 @@ export class LocalEventBuffer {
         );
       }
       if (!binding) {
-        const now = new Date().toISOString();
         this.db
           .prepare(
             `insert into collector_workspace_binding
               (singleton, current_workspace_id, previous_workspace_id, changed_at)
              values (1, @workspaceId, null, @now)`,
           )
-          .run({ workspaceId: requested, now });
-        this.db
-          .prepare(`update buffered_events set workspace_id = ? where workspace_id is null`)
-          .run(requested);
-        this.delivery.bindUnassignedWorkspace(requested);
-      } else if (binding.previousWorkspaceId === null) {
-        // Pre-reassignment compatibility: direct/older producers in the same
-        // continuous workspace may still append unassigned rows. Once any
-        // transition has occurred, null stays quarantined forever.
-        this.db
-          .prepare(`update buffered_events set workspace_id = ? where workspace_id is null`)
-          .run(requested);
-        this.delivery.bindUnassignedWorkspace(requested);
+          .run({ workspaceId: requested, now: new Date().toISOString() });
       }
+      if (requested === LOCAL_TENANT_ID) {
+        // LOCAL-only adoption of pre-workspace rows. A managed/joined
+        // selection deliberately leaves `workspace_id is null` rows untouched:
+        // they remain quarantined from every managed audience.
+        this.db
+          .prepare(`update buffered_events set workspace_id = ? where workspace_id is null`)
+          .run(LOCAL_TENANT_ID);
+        this.db
+          .prepare(`update upload_outbox set workspace_id = ? where workspace_id is null`)
+          .run(LOCAL_TENANT_ID);
+      }
+      // Deliberately no backfill for managed workspaces here or in any later
+      // selection: once a managed workspace is selected, unassigned history is
+      // permanently ineligible for that audience (lease and list filters are
+      // workspace-scoped), which is the quarantine contract.
     });
     run();
     this.workspaceId = requested;
@@ -613,9 +625,11 @@ export class LocalEventBuffer {
   }
 
   /**
-   * Transactional reassignment boundary inside the ledger. Existing and
-   * legacy-unassigned rows stay bound to `fromWorkspaceId`; only subsequent
-   * appends are labeled for `toWorkspaceId`.
+   * Transactional reassignment boundary inside the ledger (issue 0089).
+   * Future-only: existing rows — including legacy-unassigned ones — are never
+   * relabeled. Prior bound rows stay bound to `fromWorkspaceId`, unassigned
+   * rows stay unbound (local quarantine); only subsequent appends are labeled
+   * for `toWorkspaceId`.
    */
   transitionWorkspace(fromWorkspaceId: string, toWorkspaceId: string) {
     const from = fromWorkspaceId.trim();
@@ -625,7 +639,6 @@ export class LocalEventBuffer {
       this.useWorkspace(to);
       return { fromWorkspaceId: from, toWorkspaceId: to, boundLegacyRows: 0 };
     }
-    let boundLegacyRows = 0;
     const run = this.db.transaction(() => {
       const binding = this.db
         .prepare(
@@ -646,10 +659,6 @@ export class LocalEventBuffer {
           `Cannot transition ledger from ${from}: it is bound to ${binding.currentWorkspaceId}.`,
         );
       }
-      boundLegacyRows += this.db
-        .prepare(`update buffered_events set workspace_id = ? where workspace_id is null`)
-        .run(from).changes;
-      boundLegacyRows += this.delivery.bindUnassignedWorkspace(from);
       this.db
         .prepare(
           `update collector_workspace_binding set
@@ -666,7 +675,7 @@ export class LocalEventBuffer {
     run();
     this.workspaceId = to;
     this.delivery.setWorkspace(to);
-    return { fromWorkspaceId: from, toWorkspaceId: to, boundLegacyRows };
+    return { fromWorkspaceId: from, toWorkspaceId: to, boundLegacyRows: 0 };
   }
 
   workspaceBinding() {
@@ -680,6 +689,44 @@ export class LocalEventBuffer {
       | { currentWorkspaceId: string; previousWorkspaceId: string | null; changedAt: string }
       | undefined;
     return row ?? null;
+  }
+
+  /**
+   * Payload-free enrollment receipt (issue 0089, #163 rework). Counts only —
+   * never event, envelope, or payload bytes. Quarantined rows are the rows
+   * WITHHELD FROM THE CURRENT WORKSPACE: rows bound to a different workspace
+   * (production pre-join capture binds LOCAL via openBuffer) plus unassigned
+   * legacy rows. Before any binding exists, only unassigned rows count.
+   * These rows are invisible to every workspace-scoped lease/list filter.
+   */
+  enrollmentStatus() {
+    const binding = this.workspaceBinding();
+    const currentWorkspaceId = binding?.currentWorkspaceId ?? null;
+    const withheldPredicate = currentWorkspaceId === null
+      ? `workspace_id is null`
+      : `(workspace_id is null or workspace_id <> ?)`;
+    const countParams = currentWorkspaceId === null ? [] : [currentWorkspaceId];
+    const quarantinedEventRows = (
+      this.db
+        .prepare(
+          `select count(*) as n from buffered_events where ${withheldPredicate}`,
+        )
+        .get(...countParams) as { n: number }
+    ).n;
+    const quarantinedOutboxRows = (
+      this.db
+        .prepare(
+          `select count(*) as n from upload_outbox where ${withheldPredicate}`,
+        )
+        .get(...countParams) as { n: number }
+    ).n;
+    return {
+      futureOnlyEnrollment: true as const,
+      currentWorkspaceId,
+      quarantinedHistoryRows: quarantinedEventRows + quarantinedOutboxRows,
+      quarantinedEventRows,
+      quarantinedOutboxRows,
+    };
   }
 
   private migrateEventColumns() {
@@ -2174,7 +2221,15 @@ export class LocalEventBuffer {
       .prepare(`select 1 from account_labels where account_hash = ?`)
       .get(accountHash);
     if (exists) return;
-    const base = `${os.userInfo().username}@${MACHINE}`;
+    // The label is cosmetic; a missing passwd entry (uv_os_get_passwd ENOENT
+    // under unavailable directory services) must never fail a capture append.
+    let username: string;
+    try {
+      username = os.userInfo().username;
+    } catch {
+      username = "local";
+    }
+    const base = `${username}@${MACHINE}`;
     const taken = this.db
       .prepare(`select count(*) as n from account_labels where label like ?`)
       .get(`${base}%`) as { n: number };
@@ -2408,11 +2463,13 @@ export class LocalEventBuffer {
         from buffered_events
         where uploaded_at is null
           and ${privacyEligible}
-          and (? is null or workspace_id = ?)
+          -- Fail closed (#163 rework): a null workspace binding sees ONLY
+          -- unassigned rows, never rows bound to any workspace.
+          and workspace_id is ?
         order by created_at asc
         limit ?`,
       )
-      .all(this.workspaceId, this.workspaceId, maxRows) as Array<
+      .all(this.workspaceId, maxRows) as Array<
       Parameters<LocalEventBuffer["rowToBufferedEvent"]>[0] & { payloadBytes: number }
     >;
 
