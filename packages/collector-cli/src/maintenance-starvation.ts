@@ -17,6 +17,8 @@ import type Database from "better-sqlite3";
 export const MAINTENANCE_DEADLINE_KILLS_KEY = "maintenance_deadline_kills";
 export const MAINTENANCE_LAST_DEADLINE_KILL_AT_KEY = "maintenance_last_deadline_kill_at";
 export const MAINTENANCE_PROGRESS_CHECKPOINT_KEY = "maintenance_progress_checkpoint";
+export const GIT_CONTEXT_COMMITTED_KEY = "maintenance_git_context_committed";
+export const GIT_CONTEXT_DEFERRED_KEY = "maintenance_git_context_last_deferred";
 
 export type MaintenanceDeadlineBlameCheckpoint = {
   at: string;
@@ -33,6 +35,16 @@ export type MaintenanceStarvationReceipt = {
   backlog: {
     fillPendingEventLinks: number;
     dirtyEnrichmentSessions: number;
+  };
+  /**
+   * Issue #181 resumability receipt: how much `git_context` work the bounded
+   * batch has committed in total, and how much the last pass carried forward.
+   * A rising committed count under a deferral proves the batch is advancing
+   * rather than repeating from zero.
+   */
+  gitContext: {
+    committedTotal: number;
+    lastDeferred: number;
   };
   /** Kills have occurred while enrichment work is still visibly stuck. */
   starving: boolean;
@@ -76,6 +88,27 @@ export function recordMaintenanceDeadlineKill(
   setStateValue(database, MAINTENANCE_DEADLINE_KILLS_KEY, String(kills));
   setStateValue(database, MAINTENANCE_LAST_DEADLINE_KILL_AT_KEY, at.toISOString());
   return kills;
+}
+
+function safeCount(value: string | null) {
+  const parsed = Number(value ?? "0");
+  return Number.isSafeInteger(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+/**
+ * Record one bounded `git_context` pass: what it committed and what it left
+ * for the next cycle. The committed total is cumulative on purpose — it is
+ * the number that separates "resuming" from "restarting from zero".
+ */
+export function recordGitContextBatchProgress(
+  database: Database.Database,
+  pass: { committed: number; deferred: number },
+): void {
+  const committed = Math.max(0, Math.trunc(pass.committed) || 0);
+  const deferred = Math.max(0, Math.trunc(pass.deferred) || 0);
+  const total = safeCount(stateValue(database, GIT_CONTEXT_COMMITTED_KEY)) + committed;
+  setStateValue(database, GIT_CONTEXT_COMMITTED_KEY, String(total));
+  setStateValue(database, GIT_CONTEXT_DEFERRED_KEY, String(deferred));
 }
 
 /** Durably record what the killed child was last seen doing. */
@@ -137,6 +170,10 @@ export function maintenanceStarvationReceipt(
     lastDeadlineKillAt,
     lastCheckpoint,
     backlog,
+    gitContext: {
+      committedTotal: safeCount(stateValue(database, GIT_CONTEXT_COMMITTED_KEY)),
+      lastDeferred: safeCount(stateValue(database, GIT_CONTEXT_DEFERRED_KEY)),
+    },
     starving: deadlineKills > 0 && (backlog.fillPendingEventLinks > 0 || backlog.dirtyEnrichmentSessions > 0),
   };
 }

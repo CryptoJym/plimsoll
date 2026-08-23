@@ -802,15 +802,28 @@ export class MaintenanceProcessBoundary {
     // UNKNOWN and never applied.
     const proven = timedOut && timedOutProgress !== null &&
       heldMs !== null && heldMs >= this.blameThresholdMs();
-    if (timedOut && timedOutProgress) {
-      this.lastBlame = {
-        source: timedOutProgress.source,
-        stage: timedOutProgress.stage,
-        candidateHash: timedOutProgress.candidateHash,
-        heldMs,
-        attribution: proven ? "proven" : "unknown",
-      };
+    if (timedOut) {
+      this.lastBlame = timedOutProgress
+        ? {
+            source: timedOutProgress.source,
+            stage: timedOutProgress.stage,
+            candidateHash: timedOutProgress.candidateHash,
+            heldMs,
+            attribution: proven ? "proven" : "unknown",
+          }
+        : {
+            // A child that died before its first frame leaves no candidate at
+            // all. That is still a kill worth counting, and it is the purest
+            // UNKNOWN: there is nothing here that could be blamed.
+            source: null,
+            stage: null,
+            candidateHash: null,
+            heldMs: null,
+            attribution: "unknown",
+          };
       if (!proven) this.unknownBlames += 1;
+      // Every deadline kill is reported, candidate or not, or the kill rate
+      // would silently undercount exactly the worst hangs (issue #181).
       try {
         this.options.onDeadline?.({
           progress: timedOutProgress,
@@ -821,7 +834,7 @@ export class MaintenanceProcessBoundary {
       } catch {
         // Starvation bookkeeping must never mask the boundary failure itself.
       }
-      if (proven) {
+      if (proven && timedOutProgress) {
         this.quarantine = timedOutProgress;
         this.quarantineUntilMs = this.now() + this.escalatedCircuitMs();
       }

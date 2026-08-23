@@ -7,3 +7,8 @@ evidence/
 *.sqlite-wal
 dist/
 *.tgz
+
+# Ox lane session data and preservation copies (issue #181 lane)
+.oc-data/
+.p181-preserved/
+opencode.json

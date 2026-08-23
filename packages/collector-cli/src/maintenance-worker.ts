@@ -9,6 +9,7 @@ import {
   type MaintenanceWorkerReceipt,
 } from "./maintenance-protocol";
 import { maintenanceCandidateHash, type MaintenanceProgress } from "./maintenance-progress";
+import { recordGitContextBatchProgress } from "./maintenance-starvation";
 import {
   REPO_CONTEXT_RESOLVER_VERSION,
   resolveRepoContextRequests,
@@ -24,6 +25,159 @@ export type MaintenanceWorkerServiceInput = {
 
 type RepoContextResolver = typeof resolveRepoContextRequests;
 
+/**
+ * Issue #181. `git_context` resolution used to be the one all-or-nothing unit
+ * left in the maintenance cycle: every context in the batch was resolved into
+ * an in-memory array and the whole array was committed once, at the end. A
+ * deadline kill landing anywhere inside that loop therefore discarded every
+ * context the run had already resolved, and the next cycle began the same
+ * batch again from zero — measured on a real ledger as 48,280 event links
+ * stuck `fill_pending` against only 93 contexts ever resolved.
+ *
+ * The batch is now bounded and resumable instead:
+ *   - each result is committed as it resolves (`commit`), so a kill keeps
+ *     every context that completed;
+ *   - the pass stops at a wall budget derived from the job deadline; and
+ *   - the unresolved remainder is DEFERRED, never burned as UNKNOWN, so the
+ *     next cycle continues from it rather than restarting.
+ */
+export const GIT_CONTEXT_BUDGET_SHARE = 0.5;
+export const GIT_CONTEXT_MAX_BUDGET_MS = 10_000;
+/** Bound on the resumable carry-over so a stuck resolver cannot grow it. */
+export const GIT_CONTEXT_CARRY_OVER_LIMIT = 64;
+
+/**
+ * Half the job deadline, never more than ten seconds. The other half stays
+ * with capture, the protocol ack and child teardown. This is a share of the
+ * EXISTING deadline: issue #181 is fixed by making the work resumable, not by
+ * enlarging the budget it overran.
+ */
+export function gitContextBudgetMs(deadlineMs: number) {
+  const bounded = Number.isSafeInteger(deadlineMs) && deadlineMs > 0
+    ? Math.min(deadlineMs, 60_000)
+    : 1;
+  return Math.max(
+    1,
+    Math.min(Math.floor(bounded * GIT_CONTEXT_BUDGET_SHARE), GIT_CONTEXT_MAX_BUDGET_MS),
+  );
+}
+
+export type MaintenanceRepoContextBatch = {
+  results: RepoContextResult[];
+  /** Contexts this pass actually resolved (committed when `commit` is given). */
+  resolved: number;
+  /** Contexts left for the next cycle. Never burned as UNKNOWN. */
+  deferred: RepoContextRequest[];
+  budgetExhausted: boolean;
+  elapsedMs: number;
+};
+
+export type MaintenanceRepoContextBatchOptions = {
+  quarantine: MaintenanceProgress | null;
+  reportProgress: (progress: MaintenanceProgress) => boolean;
+  recordRepoLabel: (repoHash: string, label: string) => void;
+  resolveRequests?: RepoContextResolver;
+  /** Wall budget for this pass. Exhaustion defers; it never burns a context. */
+  budgetMs?: number;
+  now?: () => number;
+  /**
+   * Durably commit each result AS IT RESOLVES. Without this the batch is
+   * again all-or-nothing and a kill discards it (the pre-#181 behavior).
+   */
+  commit?: (results: RepoContextResult[]) => void;
+  /**
+   * Only a caller that can carry the remainder to a later cycle may defer.
+   * The parent-supplied batch owes the protocol one result per requested id,
+   * so it keeps the original burn-on-exhaustion behavior.
+   */
+  deferrable?: boolean;
+};
+
+export function resolveRepoContextBatch(
+  requests: readonly RepoContextRequest[],
+  options: MaintenanceRepoContextBatchOptions,
+): MaintenanceRepoContextBatch {
+  const unknownResult = (repoContext: RepoContextRequest): RepoContextResult => ({
+    contextId: repoContext.contextId,
+    repoHash: null,
+    branchHash: null,
+    headSha: null,
+    resolvedAt: new Date().toISOString(),
+    resolverVersion: REPO_CONTEXT_RESOLVER_VERSION,
+  });
+  const now = options.now ?? (() => performance.now());
+  const startedAtMs = now();
+  const budgetMs = options.budgetMs;
+  const canDefer = options.deferrable === true;
+  const results: RepoContextResult[] = [];
+  const deferred: RepoContextRequest[] = [];
+  let resolved = 0;
+  let budgetExhausted = false;
+
+  const emit = (result: RepoContextResult) => {
+    results.push(result);
+    options.commit?.([result]);
+  };
+
+  for (let index = 0; index < requests.length; index += 1) {
+    const repoContext = requests[index]!;
+    if (canDefer && budgetMs !== undefined && now() - startedAtMs >= budgetMs) {
+      budgetExhausted = true;
+      deferred.push(...requests.slice(index));
+      break;
+    }
+    if (repoContext.source !== "codex" && repoContext.source !== "claude_code") {
+      emit(unknownResult(repoContext));
+      continue;
+    }
+    const candidateHash = maintenanceCandidateHash(repoContext.cwd);
+    // A quarantined candidate is PROVEN slow, so skipping it is a decision,
+    // not a deferral: it stays an exact UNKNOWN result.
+    if (
+      options.quarantine?.source === repoContext.source &&
+      options.quarantine.stage === "git_context" &&
+      options.quarantine.candidateHash === candidateHash
+    ) {
+      emit(unknownResult(repoContext));
+      continue;
+    }
+    if (!options.reportProgress({
+      source: repoContext.source,
+      stage: "git_context",
+      candidateHash,
+    })) {
+      // A refused progress frame means the parent stopped accepting work for
+      // this job, not that this context failed. Carry it when we can.
+      if (canDefer) {
+        budgetExhausted = true;
+        deferred.push(...requests.slice(index));
+        break;
+      }
+      emit(unknownResult(repoContext));
+      continue;
+    }
+    try {
+      const [result] = (options.resolveRequests ?? resolveRepoContextRequests)([repoContext], {
+        onRepoLabel: options.recordRepoLabel,
+      });
+      emit(result ?? unknownResult(repoContext));
+    } catch {
+      // Git attribution is best-effort and happens after token/cursor commit.
+      // A resolver or local label-write fault degrades only this exact context.
+      emit(unknownResult(repoContext));
+    }
+    resolved += 1;
+  }
+
+  return {
+    results,
+    resolved,
+    deferred,
+    budgetExhausted,
+    elapsedMs: Math.max(0, now() - startedAtMs),
+  };
+}
+
 export function resolveMaintenanceRepoContexts(
   requests: readonly RepoContextRequest[],
   options: {
@@ -33,49 +187,39 @@ export function resolveMaintenanceRepoContexts(
     resolveRequests?: RepoContextResolver;
   },
 ) {
-  const unknownResult = (repoContext: RepoContextRequest): RepoContextResult => ({
-    contextId: repoContext.contextId,
-    repoHash: null,
-    branchHash: null,
-    headSha: null,
-    resolvedAt: new Date().toISOString(),
-    resolverVersion: REPO_CONTEXT_RESOLVER_VERSION,
-  });
-  const results: RepoContextResult[] = [];
-  for (const repoContext of requests) {
-    if (repoContext.source !== "codex" && repoContext.source !== "claude_code") {
-      results.push(unknownResult(repoContext));
-      continue;
-    }
-    const candidateHash = maintenanceCandidateHash(repoContext.cwd);
-    const quarantined = options.quarantine?.source === repoContext.source &&
-      options.quarantine.stage === "git_context" &&
-      options.quarantine.candidateHash === candidateHash;
-    if (quarantined || !options.reportProgress({
-      source: repoContext.source,
-      stage: "git_context",
-      candidateHash,
-    })) {
-      results.push(unknownResult(repoContext));
-      continue;
-    }
-    try {
-      const [resolved] = (options.resolveRequests ?? resolveRepoContextRequests)([repoContext], {
-        onRepoLabel: options.recordRepoLabel,
-      });
-      results.push(resolved ?? unknownResult(repoContext));
-    } catch {
-      // Git attribution is best-effort and happens after token/cursor commit.
-      // A resolver or local label-write fault degrades only this exact context.
-      results.push(unknownResult(repoContext));
-    }
+  return resolveRepoContextBatch(requests, options).results;
+}
+
+/**
+ * Bound the resumable carry-over. Contexts already waiting keep their place;
+ * anything past the limit is returned so the caller can retire it rather than
+ * leaving an inflight row behind forever.
+ */
+export function boundRepoContextCarryOver(
+  carried: readonly RepoContextRequest[],
+  fresh: readonly RepoContextRequest[],
+  limit = GIT_CONTEXT_CARRY_OVER_LIMIT,
+) {
+  const bounded = Math.max(1, Math.trunc(limit));
+  const seen = new Set<string>();
+  const kept: RepoContextRequest[] = [];
+  const overflow: RepoContextRequest[] = [];
+  for (const request of [...carried, ...fresh]) {
+    if (seen.has(request.contextId)) continue;
+    seen.add(request.contextId);
+    if (kept.length < bounded) kept.push(request);
+    else overflow.push(request);
   }
-  return results;
+  return { kept, overflow };
 }
 
 export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput) {
   let active = false;
   let closed = false;
+  // Issue #181 cursor: contexts a budget-bounded pass did not reach. They keep
+  // their durable inflight rows, so the next job continues from here instead
+  // of restarting the batch.
+  let carriedRepoContexts: RepoContextRequest[] = [];
   let progressFrames = 0;
   let lastProgressKey = "";
   let sequence = 0;
@@ -233,9 +377,41 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
           // cursor/event transactions have committed. Filesystem attribution
           // therefore cannot make already-captured usage disappear.
           input.buffer.drainRepoContextFills();
-          const childRepoContexts = input.buffer.finishChildRepoContextRun();
-          const childResults = resolveWithProgress(childRepoContexts);
-          input.buffer.applyRepoContextResults(childResults);
+          // Issue #181: the child batch is bounded, committed per context and
+          // resumable. Carry-over is processed first so a deferred context
+          // cannot be starved by a steady arrival of fresh ones.
+          const { kept, overflow } = boundRepoContextCarryOver(
+            carriedRepoContexts,
+            input.buffer.finishChildRepoContextRun(),
+          );
+          carriedRepoContexts = [];
+          const childBatch = resolveRepoContextBatch(kept, {
+            quarantine: request.quarantine,
+            reportProgress,
+            recordRepoLabel: (repoHash, label) => input.buffer.recordRepoLabel(repoHash, label),
+            budgetMs: gitContextBudgetMs(request.deadlineMs),
+            commit: (committed) => {
+              input.buffer.applyRepoContextResults(committed);
+            },
+            deferrable: true,
+          });
+          carriedRepoContexts = childBatch.deferred;
+          // Anything past the carry-over bound is retired exactly, so its
+          // durable inflight row can never outlive this worker unnoticed.
+          if (overflow.length > 0) {
+            input.buffer.applyRepoContextResults(overflow.map((repoContext) => ({
+              contextId: repoContext.contextId,
+              repoHash: null,
+              branchHash: null,
+              headSha: null,
+              resolvedAt: new Date().toISOString(),
+              resolverVersion: REPO_CONTEXT_RESOLVER_VERSION,
+            })));
+          }
+          recordGitContextBatchProgress(input.buffer.database, {
+            committed: childBatch.results.length,
+            deferred: childBatch.deferred.length + overflow.length,
+          });
           repoContexts = resolveWithProgress(request.repoContexts);
         } catch {
           try {

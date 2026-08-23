@@ -44,9 +44,20 @@ import {
 import {
   maintenanceBacklogSnapshot,
   maintenanceStarvationReceipt,
+  recordGitContextBatchProgress,
   recordMaintenanceDeadlineBlame,
   recordMaintenanceDeadlineKill,
 } from "../packages/collector-cli/src/maintenance-starvation";
+import {
+  boundRepoContextCarryOver,
+  gitContextBudgetMs,
+  resolveRepoContextBatch,
+} from "../packages/collector-cli/src/maintenance-worker";
+import {
+  REPO_CONTEXT_RESOLVER_VERSION,
+  type RepoContextRequest,
+  type RepoContextResult,
+} from "../packages/collector-cli/src/repo-context";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
@@ -139,6 +150,12 @@ class FakeChild {
   send(message: unknown, callback?: (error: Error | null) => void) {
     this.sent.push(message);
     this.onSend?.(message);
+    // A real worker closes when told to shut down. Without this the boundary
+    // waits on its termination grace timer, and under a manual clock that
+    // timer never fires — the proof would hang instead of asserting.
+    if ((message as { type?: string })?.type === "shutdown") {
+      queueMicrotask(() => this.close());
+    }
     queueMicrotask(() => callback?.(null));
     return true;
   }
@@ -386,7 +403,177 @@ async function resumableBatchProgressProof(root: string) {
 }
 
 /**
- * Scenario 1b: a deadline kill durably records what the killed run had
+ * Scenario 1b: the `git_context` batch — the one all-or-nothing unit left in
+ * the cycle — is bounded, committed per context, and resumable.
+ *
+ * Pre-#181 the whole batch was resolved into an array and committed once at
+ * the end, so a kill anywhere inside the loop discarded every context the run
+ * had already resolved and the next cycle restarted the same batch from zero.
+ */
+async function resumableGitContextBatchProof(root: string) {
+  const ledger = path.join(root, "git-context-resume.sqlite");
+  let buffer = new LocalEventBuffer(ledger);
+  const CONTEXTS = 6;
+  const PER_CONTEXT_MS = 10;
+  // Deliberately smaller than the whole batch: this fixture is larger than
+  // one window by construction.
+  const BUDGET_MS = 25;
+  const EXPECTED_FIRST_PASS = 3;
+
+  const contextId = (index: number) => `repoctx:v1:${index.toString(16).padStart(64, "0")}`;
+  const repoHash = (index: number) => `sha256:${(index + 1).toString(16).padStart(64, "0")}`;
+  const requests: RepoContextRequest[] = Array.from({ length: CONTEXTS }, (_, index) => ({
+    contextId: contextId(index),
+    source: "codex" as const,
+    cwd: path.join(root, `git-context-repo-${index}`),
+  }));
+  for (const request of requests) {
+    buffer.database.prepare(
+      `insert into repo_context_inflight (context_id, started_at, owner)
+       values (?, ?, 'child')`,
+    ).run(request.contextId, "2026-08-03T09:00:00.000Z");
+  }
+
+  const resultRows = () => (buffer.database.prepare(
+    `select count(*) as n from repo_context_results`,
+  ).get() as { n: number }).n;
+  const inflightIds = () => (buffer.database.prepare(
+    `select context_id as contextId from repo_context_inflight order by context_id`,
+  ).all() as Array<{ contextId: string }>).map((row) => row.contextId);
+
+  let clockMs = 0;
+  const now = () => clockMs;
+  let resolverCalls = 0;
+  const resolvedIds: string[] = [];
+  // Observed at the moment each context begins resolving, BEFORE its own
+  // result exists. Under an end-of-batch commit every observation is zero.
+  const durableResultsWhileResolving: number[] = [];
+  const resolveRequests = (batch: readonly RepoContextRequest[]): RepoContextResult[] => {
+    resolverCalls += 1;
+    durableResultsWhileResolving.push(resultRows());
+    clockMs += PER_CONTEXT_MS;
+    return batch.map((request) => {
+      const index = requests.findIndex((candidate) => candidate.contextId === request.contextId);
+      resolvedIds.push(request.contextId);
+      return {
+        contextId: request.contextId,
+        repoHash: repoHash(index),
+        branchHash: null,
+        headSha: null,
+        resolvedAt: "2026-08-03T09:00:00.000Z",
+        resolverVersion: REPO_CONTEXT_RESOLVER_VERSION,
+      };
+    });
+  };
+  const passOptions = () => ({
+    quarantine: null,
+    reportProgress: () => true,
+    recordRepoLabel: () => undefined,
+    resolveRequests,
+    budgetMs: BUDGET_MS,
+    now,
+    commit: (committed: RepoContextResult[]) => {
+      buffer.applyRepoContextResults(committed);
+    },
+    deferrable: true,
+  });
+
+  const passOne = resolveRepoContextBatch(requests, passOptions());
+  recordGitContextBatchProgress(buffer.database, {
+    committed: passOne.results.length,
+    deferred: passOne.deferred.length,
+  });
+
+  assert.equal(passOne.resolved, EXPECTED_FIRST_PASS,
+    "one budget window must resolve only part of the batch");
+  assert.equal(passOne.budgetExhausted, true, "the window must be the thing that stopped it");
+  assert.equal(passOne.deferred.length, CONTEXTS - EXPECTED_FIRST_PASS,
+    "the remainder must be deferred for the next cycle");
+  assert.deepEqual(durableResultsWhileResolving, [0, 1, 2],
+    "each resolved context must be durable before the next one starts");
+  assert.equal(resultRows(), EXPECTED_FIRST_PASS,
+    "the partial batch must already be committed when the window closes");
+  assert.deepEqual(
+    inflightIds(),
+    passOne.deferred.map((request) => request.contextId).sort(),
+    "deferred contexts keep their inflight rows: deferral is not a burn",
+  );
+  assert.equal(
+    passOne.results.some((result) => result.repoHash === null),
+    false,
+    "a deferred context must never be committed as an UNKNOWN result",
+  );
+  const afterPassOne = maintenanceStarvationReceipt(buffer.database);
+  assert.equal(afterPassOne.gitContext.committedTotal, EXPECTED_FIRST_PASS);
+  assert.equal(afterPassOne.gitContext.lastDeferred, CONTEXTS - EXPECTED_FIRST_PASS);
+
+  // Model the deadline kill: the worker dies here. Reopen the ledger and prove
+  // the committed half survived rather than vanishing with the process.
+  buffer.close();
+  buffer = new LocalEventBuffer(ledger);
+  assert.equal(resultRows(), EXPECTED_FIRST_PASS,
+    "committed contexts must survive the process that resolved them");
+
+  const passTwo = resolveRepoContextBatch(passOne.deferred, passOptions());
+  recordGitContextBatchProgress(buffer.database, {
+    committed: passTwo.results.length,
+    deferred: passTwo.deferred.length,
+  });
+
+  assert.equal(passTwo.resolved, CONTEXTS - EXPECTED_FIRST_PASS);
+  assert.equal(passTwo.deferred.length, 0, "the second window must drain the batch");
+  assert.equal(resultRows(), CONTEXTS);
+  assert.equal(resolverCalls, CONTEXTS,
+    "a resumed batch must not re-resolve what it already committed");
+  assert.equal(new Set(resolvedIds).size, CONTEXTS, "every context resolved exactly once");
+  assert.deepEqual(durableResultsWhileResolving, [0, 1, 2, 3, 4, 5],
+    "the durable committed count must rise monotonically across both windows");
+  assert.deepEqual(inflightIds(), [], "a drained batch leaves no inflight row behind");
+  const afterPassTwo = maintenanceStarvationReceipt(buffer.database);
+  assert.equal(afterPassTwo.gitContext.committedTotal, CONTEXTS,
+    "the committed total must accumulate across windows, not reset");
+  assert.equal(afterPassTwo.gitContext.lastDeferred, 0);
+
+  // The budget is a share of the EXISTING deadline. #181 is not fixed by
+  // enlarging the 30s the child overran.
+  assert.equal(gitContextBudgetMs(30_000), 10_000);
+  assert.equal(gitContextBudgetMs(100), 50);
+  assert.equal(gitContextBudgetMs(1), 1, "the budget may never exceed the deadline");
+  const cliSource = fs.readFileSync(
+    path.resolve("packages/collector-cli/src/cli.ts"),
+    "utf8",
+  );
+  assert.match(cliSource, /deadlineMs:\s*30_000/,
+    "the production deadline must still be 30s: resumability is the fix, not a bigger constant");
+
+  // The carry-over cursor is bounded, deduplicated and order-preserving.
+  const carried = requests.slice(0, 4);
+  const carryOver = boundRepoContextCarryOver(carried, [requests[3]!, requests[4]!], 5);
+  assert.deepEqual(
+    carryOver.kept.map((request) => request.contextId),
+    [...carried, requests[4]!].map((request) => request.contextId),
+    "already-waiting contexts keep their place and duplicates collapse",
+  );
+  const overBound = boundRepoContextCarryOver(requests, [], 2);
+  assert.equal(overBound.kept.length, 2);
+  assert.equal(overBound.overflow.length, CONTEXTS - 2,
+    "the carry-over is bounded and returns its overflow for exact retirement");
+
+  pass("git_context_batch_is_bounded_committed_per_context_and_resumable", {
+    seededContexts: CONTEXTS,
+    firstWindowResolved: passOne.resolved,
+    firstWindowDeferred: passOne.deferred.length,
+    durableResultsWhileResolving,
+    resolverCalls,
+    committedTotal: afterPassTwo.gitContext.committedTotal,
+    budgetMsForProductionDeadline: gitContextBudgetMs(30_000),
+    productionDeadlineUnchangedMs: 30_000,
+  });
+  buffer.close();
+}
+
+/**
+ * Scenario 1c: a deadline kill durably records what the killed run had
  * reached (checkpoint + kill counter) instead of discarding everything.
  */
 async function deadlineKillRecordsProgressProof(root: string) {
@@ -468,8 +655,12 @@ async function quarantineProvableBlameProof() {
       const request = raw as MaintenanceRunRequest;
       if (request.type !== "run") return;
       slowRunRequest = request;
-      queueMicrotask(() => child.emit("message",
-        progressFrame(request, 1, "jsonl_open", "codex", slowCandidate)));
+      // The first child stalls after naming its candidate, which is what the
+      // deadline kills. Its replacement completes, so the recovery run can be
+      // observed instead of hanging the proof.
+      queueMicrotask(() => child.emit("message", index === 0
+        ? progressFrame(request, 1, "jsonl_open", "codex", slowCandidate)
+        : resultReceipt(request)));
     };
     ready(child, spawnNonce);
     return child;
@@ -516,6 +707,12 @@ async function quarantineProvableBlameProof() {
     child.onSend = (raw) => {
       const request = raw as MaintenanceRunRequest;
       if (request.type !== "run") return;
+      if (index > 0) {
+        queueMicrotask(() => child.emit("message", resultReceipt(request)));
+        return;
+      }
+      // One busy candidate consumes the window; the fast candidate arrives
+      // 5ms before the kill and is merely the one on stage when it lands.
       queueMicrotask(() => child.emit("message",
         progressFrame(request, 1, "candidate_metadata", "codex", busyCandidate)));
       fastClock.setTimer(() => {
@@ -535,7 +732,11 @@ async function quarantineProvableBlameProof() {
   const fastFailed = fastHarness.boundary.run();
   void fastFailed.catch(() => undefined);
   await tick();
-  fastClock.advanceBy(100);
+  // Step to 95ms so the fast candidate takes the stage BEFORE the kill lands,
+  // then let the deadline fire: it held the stage for a measured 5ms.
+  fastClock.advanceBy(95);
+  await tick();
+  fastClock.advanceBy(5);
   await tick();
   await rejectsWith(fastFailed, "maintenance_deadline_exceeded");
   const fastStatus = fastHarness.boundary.status();
@@ -544,7 +745,10 @@ async function quarantineProvableBlameProof() {
   assert.equal(fastStatus.quarantine.lastBlame?.candidateHash, fastCandidate,
     "the unproven blame must still be recorded, naming its subject");
   assert.equal(fastStatus.quarantine.lastBlame?.attribution, "unknown");
-  assert.ok((fastStatus.quarantine.lastBlame?.heldMs ?? Infinity) < 50,
+  const fastHeldMs = fastStatus.quarantine.lastBlame?.heldMs ?? Infinity;
+  assert.ok(fastHeldMs > 0,
+    "the fast candidate really was the one on stage when the kill landed");
+  assert.ok(fastHeldMs < 50,
     "the fast candidate demonstrably held the stage far less than the window");
   assert.equal(fastStatus.quarantine.unknownBlames, 1);
 
@@ -600,6 +804,11 @@ async function starvationReceiptReflectsBacklogProof(root: string) {
       `insert into repo_context_event_links (event_id, context_id) values (?, ?)`,
     ).run(`backlog-token-${index}`, contextId(index.toString(16)));
   }
+  // Appending a session-bearing event enqueues its own dirty row, so the
+  // seeded rows are counted on top of what the fixture already produced.
+  const autoDirtySessions = (buffer.database.prepare(
+    `select count(*) as n from repo_enrichment_dirty`,
+  ).get() as { n: number }).n;
   for (let index = 0; index < DIRTY_SESSIONS_SEEDED; index += 1) {
     buffer.database.prepare(
       `insert into repo_enrichment_dirty
@@ -616,8 +825,10 @@ async function starvationReceiptReflectsBacklogProof(root: string) {
   assert.equal(before.deadlineKills, 0);
   assert.equal(before.backlog.fillPendingEventLinks, FILL_PENDING_SEEDED,
     "receipt must count the seeded fill_pending backlog");
-  assert.equal(before.backlog.dirtyEnrichmentSessions, DIRTY_SESSIONS_SEEDED,
+  assert.equal(before.backlog.dirtyEnrichmentSessions,
+    autoDirtySessions + DIRTY_SESSIONS_SEEDED,
     "receipt must count the seeded dirty-session backlog");
+  assert.ok(autoDirtySessions > 0, "the fixture must produce a real dirty queue");
   assert.equal(before.starving, false,
     "no kills yet: backlog alone is not starvation");
 
@@ -654,18 +865,65 @@ async function starvationReceiptReflectsBacklogProof(root: string) {
   buffer.close();
 }
 
+/** Every scenario above must register exactly one check. */
+const EXPECTED_CHECKS = 5;
+let completed = false;
+
 async function main() {
+  // Bound to the range package.json actually declares. Pinning one exact
+  // major would turn a supported runtime into a fake red.
+  const nodeMajor = Number(process.versions.node.split(".")[0]);
+  assert.ok(nodeMajor >= 20 && nodeMajor < 25,
+    `proof requires the declared engines range (>=20 <25), got ${process.versions.node}`);
   const root = fs.mkdtempSync(path.join(os.tmpdir(), `${SENTINEL}-`));
   try {
     await resumableBatchProgressProof(root);
+    await resumableGitContextBatchProof(root);
     await deadlineKillRecordsProgressProof(root);
     await quarantineProvableBlameProof();
     await starvationReceiptReflectsBacklogProof(root);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
-  console.log(JSON.stringify({ status: "pass", checks }, null, 2));
+  assert.equal(checks.length, EXPECTED_CHECKS,
+    `expected ${EXPECTED_CHECKS} checks, ran ${checks.length}`);
+  completed = true;
+  clearTimeout(watchdog);
+  const receipt = { status: "pass", checks };
+  assert.equal(JSON.stringify(receipt).includes(SENTINEL), false,
+    "the receipt must remain path-free");
+  console.log(JSON.stringify(receipt, null, 2));
 }
+
+// A hang that still holds a live handle never reaches the exit guard below,
+// so it would sit forever instead of failing. The watchdog is unref'd: it can
+// only fire while something else is keeping the loop alive, which is exactly
+// the hang case.
+const WATCHDOG_MS = 120_000;
+const watchdog = setTimeout(() => {
+  console.error(JSON.stringify({
+    status: "fail",
+    error: "proof_watchdog_timeout",
+    checksRun: checks.length,
+    expected: EXPECTED_CHECKS,
+  }, null, 2));
+  process.exit(1);
+}, WATCHDOG_MS);
+watchdog.unref();
+
+// An unresolved await inside a scenario drains the event loop and Node then
+// exits 0 with no output — a silent green that hides every unrun check. The
+// same silence this proof exists to abolish is refused here too.
+process.on("exit", (code) => {
+  if (completed || code !== 0) return;
+  console.error(JSON.stringify({
+    status: "fail",
+    error: "proof_exited_before_completion",
+    checksRun: checks.length,
+    expected: EXPECTED_CHECKS,
+  }, null, 2));
+  process.exitCode = 1;
+});
 
 main().catch((error) => {
   console.error(JSON.stringify({
