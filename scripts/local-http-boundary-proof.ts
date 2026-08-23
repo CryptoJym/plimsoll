@@ -913,12 +913,38 @@ async function main() {
   if (failed.length > 0) process.exitCode = 1;
 }
 
+/**
+ * Content-free failure detail. The reason field stays a strict identifier so it is
+ * safe to log anywhere; detail/at add just enough to diagnose a hosted-only failure
+ * without leaking content or absolute paths: the message is scrubbed of credentials
+ * and repo-rooted, and only the first in-repo stack frame is reported. A failure that
+ * cannot say why it failed costs more than it protects.
+ */
+function contentFreeDetail(error: unknown) {
+  const raw = error instanceof Error ? error.message : String(error ?? "");
+  const scrubbed = raw
+    .replaceAll(process.cwd(), "<repo>")
+    .replace(/\/Users\/[^/\s]+/g, "<home>")
+    .replace(/(gh[pousr]_[A-Za-z0-9]{16,}|sk-[A-Za-z0-9]{16,}|Bearer\s+[A-Za-z0-9._-]{16,})/g, "<redacted>")
+    .slice(0, 240);
+  const stack = error instanceof Error && typeof error.stack === "string" ? error.stack : "";
+  const frame = stack
+    .split("\n")
+    .map((line) => line.trim())
+    .find((line) => line.startsWith("at ") && line.includes(process.cwd()));
+  const at = frame
+    ? frame.replaceAll(process.cwd(), "<repo>").replace(/\/Users\/[^/\s]+/g, "<home>").slice(0, 160)
+    : null;
+  return { detail: scrubbed || null, at };
+}
+
 main().catch((error) => {
   const name = error instanceof Error ? error.name : "ProofFailure";
   const message = error instanceof Error ? error.message : "";
   const safeReason = /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(message)
     ? message
     : "http_boundary_proof_failed";
-  console.error(JSON.stringify({ error: name, reason: safeReason }));
+  const { detail, at } = contentFreeDetail(error);
+  console.error(JSON.stringify({ error: name, reason: safeReason, detail, at }));
   process.exitCode = 1;
 });
