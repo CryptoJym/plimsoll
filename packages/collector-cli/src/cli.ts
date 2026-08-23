@@ -97,6 +97,11 @@ import {
 import { captureBaselineStatus } from "./capture-baseline";
 import { createCollectorServer } from "./server";
 import { MaintenanceProcessBoundary } from "./maintenance-boundary";
+import {
+  maintenanceStarvationReceipt,
+  recordMaintenanceDeadlineBlame,
+  recordMaintenanceDeadlineKill,
+} from "./maintenance-starvation";
 import { runMaintenanceWorkerService } from "./maintenance-worker";
 import { readLocalIdentities } from "./local-identity";
 import {
@@ -1195,6 +1200,30 @@ async function main() {
       // maintenance.ts), so these deadlines govern startup + coordination only.
       deadlineMs: 30_000,
       readyDeadlineMs: 10_000,
+      // Issue #181: a deadline kill must never vanish silently. Record the
+      // kill rate and the last-seen stage durably, and surface the receipt
+      // so enrichment starvation cannot recur invisibly.
+      onDeadline: (info) => {
+        try {
+          recordMaintenanceDeadlineKill(buffer.database);
+          recordMaintenanceDeadlineBlame(buffer.database, {
+            at: new Date().toISOString(),
+            source: info.progress?.source ?? null,
+            stage: info.progress?.stage ?? null,
+            heldMs: info.heldMs,
+            attribution: info.attribution,
+          });
+          const receipt = maintenanceStarvationReceipt(buffer.database);
+          if (receipt.starving) {
+            console.warn(JSON.stringify({
+              warning: "maintenance_starvation",
+              ...receipt,
+            }));
+          }
+        } catch {
+          // Starvation bookkeeping must never mask the boundary failure.
+        }
+      },
     });
     let detectedIdentities: Array<Record<string, unknown>> = [];
     try {
@@ -1208,12 +1237,20 @@ async function main() {
       detectedIdentities = [];
     }
     let refreshStatusSnapshot = () => false;
+    const starvationReceiptSnapshot = () => {
+      try {
+        return maintenanceStarvationReceipt(buffer.database);
+      } catch {
+        return null;
+      }
+    };
     const server = createCollectorServer(config, buffer, {
       runtimeIdentity,
       maintenanceStatus: () => ({
         boundary: maintenanceBoundary.status(),
         scheduler: scheduler?.status() ?? null,
         cadence: maintenanceCadence?.status() ?? null,
+        starvation: starvationReceiptSnapshot(),
       }),
       detectedIdentities: () => detectedIdentities,
       outcomePerformance: (days, asOf) => outcomeTimelineStore.performanceSummary(days, asOf),

@@ -62,6 +62,17 @@ export type MaintenanceBoundaryStatus = {
     stage: MaintenanceProgress["stage"] | null;
     candidateHash: string | null;
     until: string | null;
+    // Issue #181: the applied quarantine above only ever carries PROVEN
+    // blame (the candidate's own measured time-on-stage). Every kill also
+    // records what was on stage and whether that blame could be proven.
+    lastBlame: {
+      source: string | null;
+      stage: string | null;
+      candidateHash: string | null;
+      heldMs: number | null;
+      attribution: "proven" | "unknown";
+    } | null;
+    unknownBlames: number;
   };
   protocol: {
     invalidFrames: number;
@@ -108,6 +119,18 @@ export type MaintenanceBoundaryOptions = {
     pid: number,
     binding: MaintenanceProcessFingerprintBinding,
   ) => Promise<string | null>;
+  // Minimum measured time a candidate must have held the stage at kill time
+  // before its blame is "proven". Below it, being on stage at kill time is
+  // not evidence that THIS candidate was slow (issue #181 misattribution).
+  blameThresholdMs?: number;
+  // Fired on every deadline kill so the shell can durably record partial
+  // progress and the kill rate instead of discarding the batch silently.
+  onDeadline?: (info: {
+    progress: MaintenanceProgress | null;
+    heldMs: number | null;
+    attribution: "proven" | "unknown";
+    reason: string;
+  }) => void;
 };
 
 type ActiveJob = {
@@ -236,8 +259,12 @@ export class MaintenanceProcessBoundary {
   private lastOutcome: "completed" | "timed_out" | "failed" | null = null;
   private lastTimedOutAt: string | null = null;
   private activeProgress: MaintenanceProgress | null = null;
+  private activeProgressAtMs: number | null = null;
+  private activeProgressKey: string | null = null;
   private quarantine: MaintenanceProgress | null = null;
   private quarantineUntilMs: number | null = null;
+  private lastBlame: MaintenanceBoundaryStatus["quarantine"]["lastBlame"] = null;
+  private unknownBlames = 0;
   private failureCount = 0;
   private circuitOpenUntilMs: number | null = null;
   private skippedJobs = 0;
@@ -289,6 +316,8 @@ export class MaintenanceProcessBoundary {
         stage: this.quarantine?.stage ?? null,
         candidateHash: this.quarantine?.candidateHash ?? null,
         until: iso(this.quarantineUntilMs),
+        lastBlame: this.lastBlame,
+        unknownBlames: this.unknownBlames,
       },
       protocol: {
         invalidFrames: this.invalidFrames,
@@ -361,6 +390,8 @@ export class MaintenanceProcessBoundary {
       this.state = "in_flight";
       this.stage = "automatic_capture";
       this.activeProgress = null;
+      this.activeProgressAtMs = null;
+      this.activeProgressKey = null;
       job = new Promise<MaintenanceRunOutcome>((resolve, reject) => {
         const timer = this.setTimer(() => {
           void this.failActive("maintenance_deadline_exceeded", true);
@@ -559,6 +590,13 @@ export class MaintenanceProcessBoundary {
         stage: receipt.stage,
         candidateHash: receipt.candidateHash,
       };
+      // Time-on-stage starts at the FIRST frame for a given
+      // source/stage/candidate key; repeats of the same key extend the hold.
+      const progressKey = `${receipt.source}:${receipt.stage}:${receipt.candidateHash ?? "none"}`;
+      if (progressKey !== this.activeProgressKey) {
+        this.activeProgressKey = progressKey;
+        this.activeProgressAtMs = this.now();
+      }
       try {
         this.child?.send({
           schema: MAINTENANCE_PROTOCOL_SCHEMA,
@@ -597,6 +635,8 @@ export class MaintenanceProcessBoundary {
     this.clearTimer(active.timer);
     this.active = null;
     this.activeProgress = null;
+    this.activeProgressAtMs = null;
+    this.activeProgressKey = null;
     const completedAtMs = this.now();
     this.lastCompletedAtMs = completedAtMs;
     this.lastDurationMs = Math.max(0, completedAtMs - active.startedAtMs);
@@ -746,20 +786,72 @@ export class MaintenanceProcessBoundary {
     this.clearTimer(active.timer);
     this.active = null;
     const timedOutProgress = this.activeProgress;
+    const heldStartMs = this.activeProgressAtMs;
     this.activeProgress = null;
+    this.activeProgressAtMs = null;
+    this.activeProgressKey = null;
     this.lastFailure = reason;
     this.lastCompletedAtMs = this.now();
     this.lastDurationMs = Math.max(0, this.lastCompletedAtMs - active.startedAtMs);
+    const heldMs = heldStartMs !== null
+      ? Math.max(0, this.lastCompletedAtMs - heldStartMs)
+      : null;
+    // Issue #181: a candidate may be quarantined only on evidence that IT
+    // was slow — measured as its own time-on-stage at kill time. Being on
+    // stage when the deadline fired is not proof; that blame is recorded as
+    // UNKNOWN and never applied.
+    const proven = timedOut && timedOutProgress !== null &&
+      heldMs !== null && heldMs >= this.blameThresholdMs();
+    if (timedOut) {
+      this.lastBlame = timedOutProgress
+        ? {
+            source: timedOutProgress.source,
+            stage: timedOutProgress.stage,
+            candidateHash: timedOutProgress.candidateHash,
+            heldMs,
+            attribution: proven ? "proven" : "unknown",
+          }
+        : {
+            // A child that died before its first frame leaves no candidate at
+            // all. That is still a kill worth counting, and it is the purest
+            // UNKNOWN: there is nothing here that could be blamed.
+            source: null,
+            stage: null,
+            candidateHash: null,
+            heldMs: null,
+            attribution: "unknown",
+          };
+      if (!proven) this.unknownBlames += 1;
+      // Every deadline kill is reported, candidate or not, or the kill rate
+      // would silently undercount exactly the worst hangs (issue #181).
+      try {
+        this.options.onDeadline?.({
+          progress: timedOutProgress,
+          heldMs,
+          attribution: proven ? "proven" : "unknown",
+          reason,
+        });
+      } catch {
+        // Starvation bookkeeping must never mask the boundary failure itself.
+      }
+      if (proven && timedOutProgress) {
+        this.quarantine = timedOutProgress;
+        this.quarantineUntilMs = this.now() + this.escalatedCircuitMs();
+      }
+    }
     this.recordOutcome(timedOut ? "timed_out" : "failed", this.lastCompletedAtMs);
     this.state = timedOut ? "timed_out" : "recovering";
     this.stage = "terminating";
-    if (timedOut && timedOutProgress) {
-      this.quarantine = timedOutProgress;
-      this.quarantineUntilMs = this.now() + this.escalatedCircuitMs();
-    }
     await this.terminateChild(reason);
     this.openCircuit(reason);
     active.reject(new Error(reason));
+  }
+
+  private blameThresholdMs() {
+    return Math.max(
+      1,
+      Math.min(this.options.blameThresholdMs ?? Math.floor(this.deadlineMs() / 2), 60_000),
+    );
   }
 
   private openCircuit(reason: string) {
