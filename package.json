@@ -36,6 +36,7 @@
     "proof:codex-config-apply": "tsx scripts/codex-config-apply-proof.ts",
     "proof:claude-config-apply": "tsx scripts/claude-config-apply-proof.ts",
     "proof:install-doctor": "tsx scripts/install-doctor-proof.ts",
+    "proof:npm-packaging": "tsx scripts/npm-packaging-proof.ts",
     "proof:launch-agent": "tsx scripts/launch-agent-transaction-proof.ts",
     "proof:launch-agent-unload": "tsx scripts/launch-agent-unload-proof.ts",
     "proof:fingerprint-versioning": "tsx scripts/fingerprint-versioning-proof.ts",

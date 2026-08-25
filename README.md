@@ -60,29 +60,37 @@ The outcome join uses **linkage keys**: both Plimsoll and the GitHub side hash t
 Requirements: macOS, Node >=20 <25.
 
 ```bash
-# wire Claude Code + Codex telemetry (idempotent, takes backups; --dry-run to preview)
-npx -y @plimsoll/cli setup
+# one-liner: wires Claude Code + Codex telemetry, installs + loads the
+# background LaunchAgent, then verifies the collector answers
+npx -y @plimsoll/cli install
+```
 
-# run the collector + dashboard → http://127.0.0.1:48271
-npx -y @plimsoll/cli start
+That's it. The collector runs as a user LaunchAgent (`com.plimsoll.collector`)
+that execs the installed `plimsoll` binary directly — no git checkout, no pnpm.
+Open the dashboard at http://127.0.0.1:48271 and start a Claude Code or Codex
+session; the first token-bearing event flips readiness from `service_ready` to
+`signal_verified`.
 
-# inspect readiness without creating config, a ledger, or service files
-npx -y @plimsoll/cli doctor --read-only --json
+Useful follow-ups (all work through npx without a global install):
+
+```bash
+npx -y @plimsoll/cli doctor --read-only --json   # inspect readiness; creates nothing
+npx -y @plimsoll/cli setup --dry-run             # preview telemetry config changes
 ```
 
 `doctor` is a diagnostic gate, not an installer and not capture proof by
 itself. Its readiness progresses through `not_installed` → `configured` →
 `service_ready` → `signal_verified`; only `signal_verified` returns `ok:true`
 and exit 0. A cold ledger therefore fails honestly until a real token-bearing
-Claude Code or Codex event reaches the collector. Background LaunchAgent mode
-for npm installs is still being fitted — until then `start` runs in a terminal.
+Claude Code or Codex event reaches the collector.
 
 The source tree also contains the adapter-driven update/rollback/uninstall and
 sanitized support-bundle transaction primitive described in
 [docs/local-lifecycle.md](docs/local-lifecycle.md). It is isolated-proofed but
 is **not yet a published `plimsoll lifecycle` command or an authorized live
-rollout**; release signing, npm publication, and real-Mac service integration
-remain under [#103](https://github.com/CryptoJym/plimsoll/issues/103).
+rollout**; release signing and the signed standalone binary remain future work
+([#103](https://github.com/CryptoJym/plimsoll/issues/103)). Releases publish
+from CI on a version tag with npm provenance.
 
 **Contributors / running from source** (adds pnpm + git):
 
