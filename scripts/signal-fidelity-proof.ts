@@ -145,11 +145,21 @@ import {
   generateClaudeCodeSettings,
   generateCodexConfigToml,
 } from "../packages/collector-config/src/index";
+import { installProofCompletionGuard, type ProofCompletionGuard } from "./lib/completion-guard";
 
 type Check = { name: string; passed: boolean; detail: string };
 
 const checks: Check[] = [];
+
+// Issue #210: refuse silent partial runs. The clock-fixture child mode
+// (PLIMSOLL_PROOF_CLOCK_CASE) prints a fixture and exits without running the
+// battery, so it must not install the guard.
+const completion: ProofCompletionGuard | null =
+  process.env.PLIMSOLL_PROOF_CLOCK_CASE === "1"
+    ? null
+    : installProofCompletionGuard({ proof: "signal-fidelity-proof", expectedChecks: 106 });
 function check(name: string, passed: boolean, detail: string | undefined) {
+  completion?.check(name);
   checks.push({ name, passed, detail: detail ?? "(no detail)" });
 }
 
@@ -3982,6 +3992,7 @@ async function main() {
     ].join("\n"),
   );
 
+  completion?.complete();
   console.log(JSON.stringify(artifact, null, 2));
   if (!passed) process.exitCode = 1;
 }

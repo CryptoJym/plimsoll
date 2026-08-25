@@ -21,10 +21,16 @@ import { aiInteractionEventSchema } from "../packages/shared/src/index";
 
 const checks: Array<{ name: string; detail: Record<string, unknown> }> = [];
 
+// Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+const EXPECTED_CHECKS = 19;
+const completion = installProofCompletionGuard({ proof: "codex-reconciliation-proof", expectedChecks: EXPECTED_CHECKS });
+
 function check(name: string, condition: unknown, detail: Record<string, unknown>) {
   assert.ok(condition, `${name}: ${JSON.stringify(detail)}`);
   checks.push({ name, detail });
+  completion.check(name);
 }
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 type LegacyFixtureShape = "irrelevant" | "sparse" | "dense-context" | "mixed";
 
@@ -1252,6 +1258,7 @@ async function main() {
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
+  completion.complete();
   process.stdout.write(
     `${JSON.stringify(
       {

@@ -31,6 +31,7 @@ import { runRepoEnrichmentMaintenance } from "../packages/collector-cli/src/main
 import { deterministicEventId } from "../packages/collector-cli/src/normalizer";
 import { resolveRepoContextRequests } from "../packages/collector-cli/src/repo-context";
 import { aiInteractionEventSchema, remoteLinkageHash } from "../packages/shared/src/index";
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-incremental-proof-"));
 const buffer = new LocalEventBuffer(path.join(tempDir, "proof.sqlite"));
@@ -1299,14 +1300,24 @@ function proveNanosecondGenerationIdentity() {
 }
 
 async function main() {
+  // Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+  const EXPECTED_CHECKS = 8;
+  const completion = installProofCompletionGuard({ proof: "incremental-capture-proof", expectedChecks: EXPECTED_CHECKS });
   try {
     const rollout = await proveRolloutTailing();
+    completion.check("rollout_tailing");
     const transcript = await proveTranscriptTailing();
+    completion.check("transcript_tailing");
     const parseFailureDurability = await proveParseFailuresRemainUnresolved();
+    completion.check("parse_failure_durability");
     const transcriptChunkParity = await proveTranscriptChunkParity();
+    completion.check("transcript_chunk_parity");
     const deferredRepoContextOccurrences = await proveDeferredRepoContextOccurrences();
+    completion.check("deferred_repo_context_occurrences");
     const resolvedTranscriptConflict = await proveResolvedTranscriptConflictIsTerminal();
+    completion.check("resolved_transcript_conflict_terminal");
     const nanosecondGenerationIdentity = proveNanosecondGenerationIdentity();
+    completion.check("nanosecond_generation_identity");
 
     const persistedEvents = JSON.stringify(
       buffer.database.prepare(`select payload_json from buffered_events`).all(),
@@ -1357,6 +1368,8 @@ async function main() {
       "secure-delete cursor migration must scrub the legacy path from DB/WAL/SHM bytes",
     );
 
+    completion.check("receipt_privacy_and_legacy_cursor_scrub");
+    completion.complete();
     process.stdout.write(
       `${JSON.stringify(
         {

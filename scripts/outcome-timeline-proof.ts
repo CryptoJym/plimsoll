@@ -24,10 +24,16 @@ import {
   type OutcomeReworkWatch,
   type PullTimelineFact,
 } from "../packages/shared/src/index";
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 type Check = { name: string; passed: boolean; detail: Record<string, unknown> };
 const checks: Check[] = [];
+
+// Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+const EXPECTED_CHECKS = 28;
+const completion = installProofCompletionGuard({ proof: "outcome-timeline-proof", expectedChecks: EXPECTED_CHECKS });
 function prove(name: string, passed: boolean, detail: Record<string, unknown>) {
+  completion.check(name);
   checks.push({ name, passed, detail });
   assert.equal(passed, true, `${name}: ${JSON.stringify(detail)}`);
 }
@@ -1011,6 +1017,7 @@ async function main() {
     tokenObservedOnlyInRequest,
   });
 
+  completion.complete();
   const artifact = {
     schema: "plimsoll.outcome-timeline-proof.v1",
     generatedAt: new Date().toISOString(),

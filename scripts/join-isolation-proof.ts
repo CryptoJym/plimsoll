@@ -25,11 +25,16 @@ import {
   resumePendingJoin,
 } from "../packages/collector-cli/src/join";
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 type Check = { name: string; detail: Record<string, unknown> };
 type RequestRecord = { init?: RequestInit; url: string; body: Record<string, unknown> };
 
 const checks: Check[] = [];
+
+// Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+const EXPECTED_CHECKS = 16;
+const completion = installProofCompletionGuard({ proof: "join-isolation-proof", expectedChecks: EXPECTED_CHECKS });
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-join-isolation-proof-"));
 const originalPlimsollHome = process.env.PLIMSOLL_HOME;
 delete process.env.PLIMSOLL_HOME;
@@ -43,6 +48,7 @@ const TOKEN = "pljt_never-print-this-single-use-token";
 
 function check(name: string, condition: unknown, detail: Record<string, unknown>) {
   assert.ok(condition, `${name}: ${JSON.stringify(detail)}`);
+  completion.check(name);
   checks.push({ name, detail });
 }
 
@@ -1061,6 +1067,7 @@ try {
     );
   }
 
+  completion.complete();
   console.log(
     JSON.stringify(
       {

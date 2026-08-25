@@ -26,14 +26,20 @@ import {
   estimateCapacityLinearPace,
   type CapacityPaceEstimate,
 } from "../packages/shared/src/index";
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 const root = process.cwd();
 const fixtures = path.join(root, "packages/shared/fixtures/capacity");
 type Check = { name: string; detail: Record<string, unknown> };
 const checks: Check[] = [];
 
+// Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+const EXPECTED_CHECKS = 40;
+const completion = installProofCompletionGuard({ proof: "capacity-proof", expectedChecks: EXPECTED_CHECKS });
+
 function prove(name: string, condition: unknown, detail: Record<string, unknown>) {
   assert.ok(condition, `${name}: ${JSON.stringify(detail)}`);
+  completion.check(name);
   checks.push({ name, detail });
 }
 
@@ -842,4 +848,5 @@ function prove(name: string, condition: unknown, detail: Record<string, unknown>
   );
 }
 
+completion.complete();
 console.log(JSON.stringify({ schema: "plimsoll.capacity-proof.v1", passed: checks.length, checks }, null, 2));

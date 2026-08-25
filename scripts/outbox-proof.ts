@@ -27,10 +27,16 @@ import {
   suppressionReceiptForAttributeKey,
   type AiInteractionEvent,
 } from "../packages/shared/src/index";
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 type Check = { name: string; passed: boolean; detail: Record<string, unknown> };
 const checks: Check[] = [];
+
+// Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+const EXPECTED_CHECKS = 67;
+const completion = installProofCompletionGuard({ proof: "outbox-proof", expectedChecks: EXPECTED_CHECKS });
 const record = (name: string, passed: boolean, detail: Record<string, unknown> = {}) => {
+  completion.check(name);
   checks.push({ name, passed, detail });
   if (!passed) throw new Error(`${name} failed: ${JSON.stringify(detail)}`);
 };
@@ -3832,6 +3838,7 @@ async function main() {
     await hostilePrivacyAndLinkageProof();
     await requestBudgetAndResumableValidationProof();
     pressureAgeByteOversizeAndStatusProof();
+    completion.complete();
     const failed = checks.filter((check) => !check.passed);
     console.log(
       JSON.stringify(

@@ -21,10 +21,16 @@ const REMOTE = "https://github.com/CryptoJym/plimsoll.git";
 const REMOTE_LABEL = "github.com/cryptojym/plimsoll";
 const checks: Array<{ name: string; detail: Record<string, unknown> }> = [];
 
+// Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+const EXPECTED_CHECKS = 23;
+const completion = installProofCompletionGuard({ proof: "git-context-proof", expectedChecks: EXPECTED_CHECKS });
+
 function check(name: string, condition: unknown, detail: Record<string, unknown>) {
   assert.ok(condition, `${name}: ${JSON.stringify(detail)}`);
   checks.push({ name, detail });
+  completion.check(name);
 }
+
 
 function write(file: string, content: string, mode = 0o600) {
   fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
@@ -100,6 +106,7 @@ async function proveOldReadPrimitiveBlocks(fifo: string) {
     await closeChild(child);
   }
 }
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 function proveValidRepositories(root: string) {
   const normal = normalRepo(root, "normal");
@@ -456,6 +463,7 @@ async function main() {
       !serializedChecks.includes(root) && !serializedChecks.includes(REMOTE),
       { pathAndContentFree: !serializedChecks.includes(root) && !serializedChecks.includes(REMOTE) },
     );
+    completion.complete();
     console.log(JSON.stringify({ status: "passed", checks }, null, 2));
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

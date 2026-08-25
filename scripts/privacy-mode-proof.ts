@@ -41,6 +41,7 @@ import {
   aiInteractionEventSchema,
   policyConfigSchema,
 } from "../packages/shared/src/index";
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 type Check = { name: string; passed: boolean; detail: Record<string, unknown> };
 type SentinelFixture = {
@@ -53,6 +54,10 @@ const startedAt = Date.now();
 const repoRoot = process.cwd();
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-privacy-mode-proof-"));
 const checks: Check[] = [];
+
+// Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+const EXPECTED_CHECKS = 15;
+const completion = installProofCompletionGuard({ proof: "privacy-mode-proof", expectedChecks: EXPECTED_CHECKS });
 const cliSource = path.join(repoRoot, "packages", "collector-cli", "src", "cli.ts");
 const fixture = JSON.parse(
   fs.readFileSync(
@@ -65,6 +70,7 @@ const sentinelPrefixes = sentinelValues.map((value) => value.slice(0, fixture.pr
 const privateTerms = [...sentinelValues, ...sentinelPrefixes];
 
 function record(name: string, passed: boolean, detail: Record<string, unknown> = {}) {
+  completion.check(name);
   checks.push({ name, passed, detail });
   console.log(`${passed ? "PASS" : "FAIL"} ${name}`);
 }
@@ -1155,6 +1161,7 @@ async function main() {
     { receipt: path.relative(repoRoot, receiptPath) },
   );
 
+  completion.complete();
   // Refresh the receipt with its own final check included.
   receipt.passed = checks.every((check) => check.passed);
   receipt.checks = checks;

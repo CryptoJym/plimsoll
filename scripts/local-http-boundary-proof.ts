@@ -22,6 +22,7 @@ import {
   isAllowedLocalHostValue,
 } from "../packages/collector-cli/src/http-boundary";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 type Receipt = { error?: unknown; reason?: unknown; [key: string]: unknown };
 type HttpResult = {
@@ -34,6 +35,10 @@ type HttpResult = {
 type Check = { name: string; passed: boolean; detail: unknown };
 
 const checks: Check[] = [];
+
+// Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+const EXPECTED_CHECKS = 19;
+const completion = installProofCompletionGuard({ proof: "local-http-boundary-proof", expectedChecks: EXPECTED_CHECKS });
 const SENTINELS = [
   "HOST_VALUE_MUST_NOT_LEAK.example",
   "ORIGIN_VALUE_MUST_NOT_LEAK.example",
@@ -42,6 +47,7 @@ const SENTINELS = [
 ];
 
 function check(name: string, passed: boolean, detail: unknown) {
+  completion.check(name);
   checks.push({ name, passed, detail });
 }
 
@@ -901,6 +907,7 @@ async function main() {
   for (const result of checks) {
     console.log(`${result.passed ? "PASS" : "FAIL"} ${result.name} ${JSON.stringify(result.detail)}`);
   }
+  completion.complete();
   const failed = checks.filter((result) => !result.passed);
   console.log(
     JSON.stringify({

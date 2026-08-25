@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawn, spawnSync } from "node:child_process";
+import { installProofCompletionGuard } from "../lib/completion-guard";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 
@@ -620,6 +621,9 @@ async function runBuildFailureAdversaries(tempRoot: string) {
 }
 
 async function main() {
+  // Issue #210: refuse silent partial runs. Installed only for the main battery;
+// the --receipt-parent-change-only child mode is expected to fail safely.
+  const completion = installProofCompletionGuard({ proof: "resource-finalization-proof", expectedChecks: 5 });
   const canonicalTempRoot = fs.realpathSync.native(os.tmpdir());
   const tempRoot = fs.mkdtempSync(
     path.join(canonicalTempRoot, "plimsoll-finalization-proof-"),
@@ -627,11 +631,14 @@ async function main() {
   try {
     finalizationStage = "build_failure_checks";
     const buildFailureChecks = await runBuildFailureAdversaries(tempRoot);
+    completion.check("build_failure_adversaries");
     finalizationStage = "receipt_write_checks";
     const receiptWriteChecks = runReceiptWriteAdversaries(tempRoot);
+    completion.check("receipt_write_adversaries");
     finalizationStage = "concurrency_integrity_check";
     const separateProcessProof =
       await runSeparateProcessParentChangeProof(tempRoot);
+    completion.check("separate_process_parent_change");
     const receiptPath = path.join(tempRoot, "resource-receipt.json");
     const linkedReceiptTarget = path.join(tempRoot, "linked-receipt-target");
     const resourceChildHome = path.join(tempRoot, "resource-child-home");
@@ -720,6 +727,7 @@ async function main() {
       .readdirSync(tempRoot)
       .filter((name) => name.startsWith(".resource-receipt.json.") && name.endsWith(".tmp"));
     finalizationStage = "final_receipt_checks";
+    completion.check("integrated_resource_child");
     const checks = {
       subprocessExitedNonzero: run.status === 1,
       finalizedReceiptFailed:
@@ -778,6 +786,8 @@ async function main() {
       resourceProofChildHomeUnchanged:
         fs.readdirSync(resourceChildHome).length === 0,
     };
+    completion.check("final_receipt_assertions");
+    completion.complete();
     const passed = Object.values(checks).every(Boolean);
     process.stdout.write(
       `${JSON.stringify({

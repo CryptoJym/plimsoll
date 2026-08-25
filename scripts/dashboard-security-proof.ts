@@ -16,6 +16,7 @@ import {
   receiptIsContentFree,
   waitForDomText,
 } from "./fixtures/dashboard-dom-wait";
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 const scriptPath = fileURLToPath(import.meta.url);
 const repoRoot = path.resolve(path.dirname(scriptPath), "..");
@@ -167,8 +168,13 @@ const settingsFixture = {
 
 type CheckReceipt = { name: string; passed: boolean; detail: string };
 const checks: CheckReceipt[] = [];
+
+// Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+const EXPECTED_CHECKS = 19;
+const completion = installProofCompletionGuard({ proof: "dashboard-security-proof", expectedChecks: EXPECTED_CHECKS });
 function check(name: string, passed: unknown, detail: string) {
   const receipt = { name, passed: Boolean(passed), detail };
+  completion.check(name);
   checks.push(receipt);
   console.log(`${receipt.passed ? "PASS" : "FAIL"} ${name} — ${detail}`);
 }
@@ -1140,6 +1146,7 @@ async function main() {
   proveTimeoutExitSurface();
   await actualServerHeaderProof();
   await browserProof(html);
+  completion.complete();
   const failed = checks.filter((receipt) => !receipt.passed);
   console.log(JSON.stringify({ proof: "dashboard-security", checks: checks.length, passed: checks.length - failed.length, failed: failed.map((receipt) => receipt.name) }));
   if (failed.length) process.exitCode = 1;

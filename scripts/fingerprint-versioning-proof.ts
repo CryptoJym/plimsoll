@@ -40,9 +40,14 @@ import {
 
 const checks: Array<{ name: string; detail: Record<string, unknown> }> = [];
 
+// Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+const EXPECTED_CHECKS = 14;
+const completion = installProofCompletionGuard({ proof: "fingerprint-versioning-proof", expectedChecks: EXPECTED_CHECKS });
+
 function check(name: string, condition: unknown, detail: Record<string, unknown> = {}) {
   assert.ok(condition, `${name}: ${JSON.stringify(detail)}`);
   checks.push({ name, detail });
+  completion.check(name);
 }
 
 function spawnLiveChild() {
@@ -55,6 +60,7 @@ function spawnLiveChild() {
 async function waitForExit(child: import("node:child_process").ChildProcess) {
   await new Promise<void>((resolve) => child.once("exit", () => resolve()));
 }
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 async function main() {
   const fixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-fingerprint-175-"));
@@ -415,6 +421,7 @@ async function main() {
     fs.rmSync(fixtureRoot, { recursive: true, force: true });
   }
 
+  completion.complete();
   console.log(JSON.stringify({ issue: "175", passed: true, checks }, null, 2));
 }
 

@@ -17,6 +17,7 @@ import {
 } from "../packages/collector-cli/src/learning-facts";
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 const SCHEMA = "plimsoll.learning-facts-proof.v1" as const;
 const PRIVATE = {
@@ -33,10 +34,15 @@ const PRIVATE = {
 
 const privateTerms = Object.values(PRIVATE);
 const checks: Array<{ name: string; detail: Record<string, unknown> }> = [];
+
+// Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+const EXPECTED_CHECKS = 34;
+const completion = installProofCompletionGuard({ proof: "learning-facts-proof", expectedChecks: EXPECTED_CHECKS });
 let proofStage = "startup";
 
 function check(name: string, condition: unknown, detail: Record<string, unknown> = {}) {
   assert.ok(condition, `${name}: ${JSON.stringify(detail)}`);
+  completion.check(name);
   checks.push({ name, detail });
 }
 
@@ -273,6 +279,7 @@ async function main() {
       name: "retry_links_require_an_explicit_existing_attempt",
       detail: { attemptCountUnchanged: store.attempts().length === 4 },
     });
+    completion.check("retry_links_require_an_explicit_existing_attempt");
     const missingEpisode = adaptToolInteractionEvent({
       event: event({
         id: "00000000-0000-5000-9000-000000000302",
@@ -290,6 +297,7 @@ async function main() {
       name: "attempt_episode_links_require_an_explicit_existing_episode",
       detail: { attemptCountUnchanged: store.attempts().length === 4 },
     });
+    completion.check("attempt_episode_links_require_an_explicit_existing_episode");
 
     proofStage = "episode_time_boundaries";
     const preEpisodeStart = adaptToolInteractionEvent({
@@ -638,6 +646,7 @@ async function main() {
       name: "retrospective_exposure_after_outcome_is_rejected",
       detail: { exposureCountUnchanged: store.exposures().length === 1 },
     });
+    completion.check("retrospective_exposure_after_outcome_is_rejected");
     assert.throws(
       () => store.recordTechniqueExposure({
         ...exposure,
@@ -650,6 +659,7 @@ async function main() {
       name: "effectiveness_and_raw_fields_are_not_part_of_exposure_schema",
       detail: { rejected: true },
     });
+    completion.check("effectiveness_and_raw_fields_are_not_part_of_exposure_schema");
 
     proofStage = "indexes";
     const indexes = buffer.database.prepare(
@@ -694,6 +704,7 @@ async function main() {
         name: "fact_row_capacity_fails_closed",
         detail: { episodeLimit: 1 },
       });
+    completion.check("fact_row_capacity_fails_closed");
     } finally {
       limitedDb.close();
     }
@@ -924,7 +935,8 @@ async function main() {
       learningFactRowsWritten,
       nodeMajor: Number(process.versions.node.split(".")[0]),
     };
-    process.stdout.write(`${JSON.stringify({
+    completion.complete();
+process.stdout.write(`${JSON.stringify({
       schema: SCHEMA,
       passed: true,
       checks: checks.length,

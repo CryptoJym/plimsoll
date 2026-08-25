@@ -38,10 +38,15 @@ const NULL_BODY_TYPE_ERROR = "Cannot read properties of null (reading 'textConte
 
 type CheckReceipt = { name: string; passed: boolean; detail: string };
 const checks: CheckReceipt[] = [];
+
+// Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+const EXPECTED_CHECKS = 14;
+const completion = installProofCompletionGuard({ proof: "dashboard-dom-wait-proof", expectedChecks: EXPECTED_CHECKS });
 function check(name: string, passed: unknown, detail: string) {
   const receipt = { name, passed: Boolean(passed), detail };
   checks.push(receipt);
   console.log(`${receipt.passed ? "PASS" : "FAIL"} ${name} — ${detail}`);
+  completion.check(name);
 }
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
@@ -104,6 +109,7 @@ class FakeClock {
     this.currentMs = target;
   }
 }
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 type ProbePhase = { from: number; status: DashboardReadinessStatus | "throw"; errorText?: string };
 
@@ -530,6 +536,7 @@ async function main() {
   }
 
   const failed = checks.filter((receipt) => !receipt.passed);
+  completion.complete();
   console.log(JSON.stringify({ proof: "dashboard-dom-wait", checks: checks.length, passed: checks.length - failed.length, failed: failed.map((receipt) => receipt.name) }));
   if (failed.length) process.exitCode = 1;
 }

@@ -56,6 +56,7 @@ import {
   rootGuardContractPath,
   type SupportingKind,
 } from "./system-e2e/contract";
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 type PhaseReceipt = {
   schema: "plimsoll.system-e2e-phase-receipt.v1";
@@ -1018,6 +1019,9 @@ async function runSharedFlow() {
 }
 
 async function main() {
+  // Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+  const EXPECTED_CHECKS = 5;
+  const completion = installProofCompletionGuard({ proof: "system-e2e-proof", expectedChecks: EXPECTED_CHECKS });
   assert.equal(process.versions.node.split(".")[0], "22", "system E2E requires exact Node 22");
   const startedAt = Date.now();
   const usageBefore = process.resourceUsage();
@@ -1030,6 +1034,7 @@ async function main() {
   );
   const rootGuards = prepareRootGuards();
   const sharedFlow = await runSharedFlow();
+  completion.check("shared_flow");
 
   const install = runSupportingProof({
     name: "install_doctor",
@@ -1185,8 +1190,10 @@ async function main() {
 
   const phases = [install, join, privacy, lifecycle, resource, unload];
   assert.equal(phases.length, supportContract.phases.length, "support phase count drifted");
+  completion.check("all_six_supporting_phases");
   const rootGuardReceipts = finalizeRootGuards(rootGuards);
   assert.ok(rootGuardReceipts.length > 0 && rootGuardReceipts.every((guard) => guard.unchanged));
+  completion.check("root_guards_unchanged");
   const wallMs = Date.now() - startedAt;
   const usageAfter = process.resourceUsage();
   const phaseCpuMs = phases.reduce((sum, phase) => sum + phase.measurements.cpuMs, 0);
@@ -1374,6 +1381,9 @@ async function main() {
   assert.ok(!receiptPath.startsWith(`${liveHome}${path.sep}`), "receipt cannot target live Plimsoll home");
   fs.mkdirSync(path.dirname(receiptPath), { recursive: true });
   fs.writeFileSync(receiptPath, serialized, { mode: 0o600 });
+  completion.check("receipt_written_to_disk");
+  completion.check("deterministic_receipt_written");
+  completion.complete();
   console.log(JSON.stringify({
     schema: receipt.schema,
     status: receipt.status,

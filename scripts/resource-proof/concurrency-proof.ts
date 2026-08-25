@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 
+import { installProofCompletionGuard } from "../lib/completion-guard";
 import {
   createResourceSandbox,
   removeResourceSandbox,
@@ -28,6 +29,10 @@ async function withSandboxes<T>(
 async function main() {
   const originalReaddirSync = fs.readdirSync;
 
+  // Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+  const EXPECTED_CHECKS = 2;
+  const completion = installProofCompletionGuard({ proof: "resource-concurrency-proof", expectedChecks: EXPECTED_CHECKS });
+
   const concurrentSuccess = await withSandboxes(2, async ([first, second]) => {
     assert.ok(first && second);
     return Promise.all([
@@ -44,6 +49,7 @@ async function main() {
     assert.equal(receipt.measurements?.counterProvenanceProved, true);
     assert.equal(receipt.measurements?.filesystemObserverRestored, true);
   }
+  completion.check("concurrent_success");
   assert.deepEqual(
     concurrentSuccess.map((receipt) => receipt.counters.filesystemEntriesScanned),
     [expectedEntries, expectedEntries],
@@ -84,6 +90,8 @@ async function main() {
     "injected failure must restore the exact original fs.readdirSync identity",
   );
 
+  completion.check("success_after_injected_failure");
+  completion.complete();
   process.stdout.write(
     `${JSON.stringify(
       {
