@@ -5,7 +5,7 @@ import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 
 import { collectorHome } from "./config";
-
+import { collectorHomeIdentityHash, resolveCollectorHome } from "./collector-home";
 export const LAUNCH_AGENT_LABEL = "com.plimsoll.collector";
 export const LAUNCH_AGENT_SYSTEM_PATHS = [
   "/opt/homebrew/bin",
@@ -46,6 +46,10 @@ export type LaunchAgentOptions = {
   transactionHooks?: LaunchAgentTransactionHooks;
 };
 
+export type LaunchAgentEnvironmentKeys =
+  | readonly ["PATH", "PLIMSOLL_COLLECTOR_DATA_MODE"]
+  | readonly ["PATH", "PLIMSOLL_COLLECTOR_DATA_MODE", "PLIMSOLL_HOME"];
+
 export type LaunchAgentInstallReceipt = {
   schema: "plimsoll.launch-agent-install.v1";
   operation: "install";
@@ -57,7 +61,9 @@ export type LaunchAgentInstallReceipt = {
   manifestDigest: string;
   manifestMode: "0600";
   privacyMode: "metadata_only";
-  environmentKeys: readonly ["PATH", "PLIMSOLL_COLLECTOR_DATA_MODE"];
+  environmentKeys: LaunchAgentEnvironmentKeys;
+  /** Path-free identity of the propagated collector home (null = default). */
+  homeIdentityHash: string | null;
   rollback: null | {
     available: true;
     preimageDigest: string;
@@ -558,9 +564,24 @@ function validateOwnedManifest(source: string) {
   exactKeys(keepAlive, ["SuccessfulExit"], "PLIST_KEEPALIVE_KEYS_UNEXPECTED");
   if (keepAlive.SuccessfulExit !== false) fail("PLIST_KEEPALIVE_INVALID");
   const environment = record(plist.EnvironmentVariables, "PLIST_ENVIRONMENT_INVALID");
-  exactKeys(environment, ["PATH", "PLIMSOLL_COLLECTOR_DATA_MODE"], "PLIST_ENVIRONMENT_KEYS_UNEXPECTED");
+  const baseEnvironmentKeys = ["PATH", "PLIMSOLL_COLLECTOR_DATA_MODE"];
+  const extendedEnvironmentKeys = [...baseEnvironmentKeys, "PLIMSOLL_HOME"];
+  const environmentKeys = Object.keys(environment).sort();
+  if (
+    !isDeepStrictEqual(environmentKeys, [...baseEnvironmentKeys].sort()) &&
+    !isDeepStrictEqual(environmentKeys, [...extendedEnvironmentKeys].sort())
+  ) {
+    fail("PLIST_ENVIRONMENT_KEYS_UNEXPECTED");
+  }
   if (environment.PLIMSOLL_COLLECTOR_DATA_MODE !== "metadata") fail("PLIST_PRIVACY_MODE_INVALID");
   if (typeof environment.PATH !== "string") fail("PLIST_PATH_INVALID");
+  if (Object.hasOwn(environment, "PLIMSOLL_HOME")) {
+    const home = environment.PLIMSOLL_HOME;
+    // Structural check only; the canonical resolver re-applies the full
+    // ownership/privacy policy when the daemon resolves this value.
+    if (typeof home !== "string" || !path.isAbsolute(home)) fail("PLIST_HOME_INVALID");
+    assertSafeString(home, "PLIST_HOME_INVALID");
+  }
   const pathEntries = environment.PATH.split(path.delimiter);
   if (pathEntries.length === 0 || pathEntries.some((entry) => !path.isAbsolute(entry))) fail("PLIST_PATH_INVALID");
   if (pathEntries.some((entry) => /[\u0000-\u001f\u007f-\u009f]/.test(entry))) fail("PLIST_PATH_INVALID");
@@ -672,12 +693,30 @@ export function launchAgentPlistPath(homeDir = os.homedir(), label = LAUNCH_AGEN
   return path.join(launchAgentsDir(homeDir), `${label}.plist`);
 }
 
+export function launchAgentEnvironmentKeys(options?: Partial<LaunchAgentOptions>): LaunchAgentEnvironmentKeys {
+  const home = resolvedPropagatedHome(options);
+  return home
+    ? ["PATH", "PLIMSOLL_COLLECTOR_DATA_MODE", "PLIMSOLL_HOME"]
+    : ["PATH", "PLIMSOLL_COLLECTOR_DATA_MODE"];
+}
+
+/**
+ * The collector home propagated to the daemon through the LaunchAgent
+ * boundary: the validated custom `PLIMSOLL_HOME`, or null when the default
+ * home applies (default-home manifests stay byte-identical to before).
+ */
+export function resolvedPropagatedHome(_options?: Partial<LaunchAgentOptions>) {
+  const resolved = resolveCollectorHome();
+  return resolved.source === "env" ? resolved.home : null;
+}
+
 export function renderLaunchAgentPlist(options: LaunchAgentOptions) {
   assertAllowedOptions(options);
   const homeDir = options.homeDir ?? os.homedir();
   const label = LAUNCH_AGENT_LABEL;
   const pnpmPath = options.pnpmPath ?? "pnpm";
   const logDirectory = collectorHome(homeDir);
+  const propagatedHome = resolvedPropagatedHome(options);
   const programArguments = options.programArguments ?? [pnpmPath, "--dir", options.repoRoot, "collector", "start"];
   const workingDirectory = options.workingDirectory ?? options.repoRoot;
   const inheritedPathEntries = (process.env.PATH ?? "").split(path.delimiter);
@@ -727,7 +766,7 @@ ${programArguments.map(stringElement).join("\n")}
   <dict>
     <key>PLIMSOLL_COLLECTOR_DATA_MODE</key>
     <string>metadata</string>
-    <key>PATH</key>
+${propagatedHome ? `    <key>PLIMSOLL_HOME</key>\n    <string>${escapeXml(propagatedHome)}</string>\n` : ""}    <key>PATH</key>
     <string>${escapeXml(launchAgentPath)}</string>
   </dict>
 </dict>
@@ -861,6 +900,7 @@ function installReceipt(
   preimage: { snapshot: PathSnapshot; content: Buffer | null },
   wouldChange = status === "installed",
 ): LaunchAgentInstallReceipt {
+  const propagatedHome = resolvedPropagatedHome();
   return {
     schema: "plimsoll.launch-agent-install.v1",
     operation: "install",
@@ -872,7 +912,8 @@ function installReceipt(
     manifestDigest,
     manifestMode: "0600",
     privacyMode: "metadata_only",
-    environmentKeys: ["PATH", "PLIMSOLL_COLLECTOR_DATA_MODE"],
+    environmentKeys: launchAgentEnvironmentKeys(),
+    homeIdentityHash: propagatedHome ? collectorHomeIdentityHash(propagatedHome) : null,
     rollback: rollback && preimage.content && preimage.snapshot.leaf ? {
       available: true,
       preimageDigest: digest(preimage.content),

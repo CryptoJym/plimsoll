@@ -5,6 +5,7 @@ import path from "node:path";
 import { z } from "zod";
 
 import { DEFAULT_POLICY, LOCAL_TENANT_ID, policyConfigSchema } from "../../shared/src/index";
+import { resolveCollectorHome } from "./collector-home";
 
 export const DEFAULT_COLLECTOR_PORT = 48271;
 
@@ -179,8 +180,10 @@ export type CollectorConfigReadResult =
     };
 
 export function collectorHome(homeDir = os.homedir()) {
-  if (process.env.PLIMSOLL_HOME) return process.env.PLIMSOLL_HOME;
-  return path.join(homeDir, "Library", "Application Support", "Plimsoll");
+  // Issue #135: the single canonical resolver. A custom PLIMSOLL_HOME is
+  // validated (absolute, user-owned, private, non-symlink) or the command
+  // fails closed — it never silently falls back to the default home.
+  return resolveCollectorHome({ homeDir }).home;
 }
 
 export function collectorConfigPath(homeDir = os.homedir()) {

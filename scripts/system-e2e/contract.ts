@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const SYSTEM_E2E_SCHEMA = "plimsoll.system-e2e-proof.v2" as const;
-export const SUPPORT_NORMALIZATION_VERSION = 5 as const;
+export const SUPPORT_NORMALIZATION_VERSION = 6 as const;
 /** Fixed release thresholds. These are never derived from an observed run. */
 export const SYSTEM_E2E_BUDGETS = {
   directRows: 500,
@@ -195,7 +195,9 @@ function normalizeString(
     return "<volatile-uuid>";
   }
   if (/^(?:sha256:)?[0-9a-f]{64}$/i.test(value) &&
-      /(?:before|after|fingerprint|digest)/i.test(key)) {
+      /(?:before|after|fingerprint|digest|hash)/i.test(key)) {
+    // Issue #135: home/config/pid identity hashes are digests of sandbox
+    // paths, so they can never match across temp roots — volatile here.
     return "<volatile-digest>";
   }
   if (DIAGNOSTIC_TEXT_KEYS.has(key)) return value.length > 0 ? `<nonempty-${key}>` : "";
