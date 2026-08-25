@@ -1,0 +1,16 @@
+{
+  "now": "2026-08-21T00:00:00.000Z",
+  "maxAgeMs": 21600000,
+  "profiles": [
+    { "profileId": "anthropic.max.james", "provider": "anthropic" }
+  ],
+  "report": {
+    "schema": "plimsoll.provider-capacity-report.v1",
+    "profileId": "anthropic.max.james",
+    "observedAt": "2026-08-20T23:45:00.000Z",
+    "entries": [
+      { "dimension": "five_hour_window", "unit": "tokens", "limit": 220000, "used": 180000 },
+      { "dimension": "weekly_all_models", "unit": "tokens", "limit": 4000000, "remaining": 2500000 }
+    ]
+  }
+}

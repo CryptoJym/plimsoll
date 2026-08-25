@@ -1,0 +1,11 @@
+{
+  "comment": "Issue #167 wave 1: provider-reported remaining that exceeds the known limit is contradictory input; the lane refuses instead of silently clamping to zero headroom or inventing a negative usage fact.",
+  "report": {
+    "schema": "plimsoll.provider-capacity-report.v1",
+    "profileId": "anthropic.max.james",
+    "observedAt": "2026-08-20T23:45:00.000Z",
+    "entries": [
+      { "dimension": "weekly_all_models", "unit": "tokens", "limit": 1000000, "remaining": 1200000 }
+    ]
+  }
+}

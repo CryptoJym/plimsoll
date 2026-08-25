@@ -22,6 +22,8 @@
  *   level.
  */
 
+import { createHash } from "node:crypto";
+
 export const CAPACITY_SCHEMA_VERSION = 1 as const;
 export const CAPACITY_PLAN_SCHEMA = "plimsoll.capacity-plan.v1" as const;
 
@@ -699,4 +701,276 @@ export function buildCapacityPlan(input: {
     unknownLegend:
       "UNKNOWN means evidence is missing or stale; it is never a zero. Headroom, pace, and exhaustion projections exist only where fresh evidence supports them.",
   };
+}
+
+// ---------------------------------------------------------------------------
+// Provider-reported capacity headroom ingestion lane (issue #167).
+//
+// Local-first, credential-non-custodial: the owner supplies what their
+// provider console or API REPORTS about quota headroom, and this boundary
+// validates that report into provider_report usage signals for
+// buildCapacityPlan. The report is data, never a client:
+//
+// - Any credential-shaped KEY or VALUE anywhere in the payload fails the
+//   entire report closed before anything is echoed, stored, or forwarded.
+// - Findings are described by redacted path and shape only — credential key
+//   names are genericized to `<redacted-key>` and secret contents never
+//   appear in error messages.
+// - The lane accepts no credentials, holds no credentials, and derives no
+//   network calls from the report; it stays a pure local fact lane.
+//
+// Structural validation is a closed allowlist: only the documented fields
+// exist, so anything else (including smuggled payloads) is refused. Derived
+// numbers stay honest: `remaining` without a known limit degrades to UNKNOWN
+// usage, never to zero, matching the plan-level doctrine.
+// ---------------------------------------------------------------------------
+
+export const PROVIDER_REPORT_SCHEMA = "plimsoll.provider-capacity-report.v1" as const;
+
+/** Bounded input: one report may carry at most this many entries. */
+export const PROVIDER_REPORT_MAX_ENTRIES = 64 as const;
+
+/** Recursion bounds so hostile nesting fails closed instead of crashing. */
+const PROVIDER_REPORT_MAX_DEPTH = 12 as const;
+const PROVIDER_REPORT_MAX_NODES = 2048 as const;
+
+/** Top-level and per-entry field names that structural validation allows. */
+const PROVIDER_REPORT_ALLOWED_FIELDS = new Set([
+  "schema",
+  "profileId",
+  "observedAt",
+  "entries",
+  "dimension",
+  "unit",
+  "limit",
+  "used",
+  "remaining",
+]);
+
+/** Normalized (lowercase alnum-only) key names that always mean credentials. */
+const CREDENTIAL_KEY_EXACT = new Set([
+  "apikey",
+  "token",
+  "secret",
+  "password",
+  "passphrase",
+  "authorization",
+  "authheader",
+  "bearer",
+  "cookie",
+  "credential",
+  "credentials",
+  "privatekey",
+  "accesstoken",
+  "refreshtoken",
+  "idtoken",
+  "authtoken",
+  "sessiontoken",
+  "accesskey",
+  "secretkey",
+  "clientsecret",
+  "apisecret",
+  "signingkey",
+  "sshkey",
+]);
+
+/**
+ * Substrings that mean credentials even inside longer field names. Deliberately
+ * narrow so legitimate capacity fields (`usedTokens`, `limitTokens`) match
+ * nothing here.
+ */
+const CREDENTIAL_KEY_SUBSTRINGS = [
+  "apikey",
+  "apisecret",
+  "clientsecret",
+  "secretkey",
+  "privatekey",
+  "accesstoken",
+  "refreshtoken",
+  "authtoken",
+  "sessiontoken",
+  "idtoken",
+  "bearertoken",
+] as const;
+
+/** Credential VALUE shapes, independent of field name. */
+const CREDENTIAL_VALUE_PATTERNS: ReadonlyArray<{ kind: string; pattern: RegExp }> = [
+  { kind: "jwt", pattern: /^eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{5,}$/ },
+  { kind: "auth_header_value", pattern: /\b(?:bearer|basic)\s+[A-Za-z0-9._~+/=-]{16,}/i },
+  { kind: "provider_api_key", pattern: /\bsk-[A-Za-z0-9_-]{20,}\b/ },
+  { kind: "aws_access_key", pattern: /\b(?:AKIA|ASIA)[0-9A-Z]{16}\b/ },
+  { kind: "github_token", pattern: /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/ },
+  { kind: "slack_token", pattern: /\bxox[bparsa]-[A-Za-z0-9-]{10,}\b/ },
+  { kind: "google_api_key", pattern: /\bAIza[0-9A-Za-z_-]{30,}/ },
+  { kind: "gitlab_token", pattern: /\bglpat-[A-Za-z0-9_-]{15,}\b/ },
+  { kind: "shopify_token", pattern: /\bshp(?:at|pa|ca)_[a-fA-F0-9]{20,}\b/ },
+  { kind: "npm_token", pattern: /\bnpm_[A-Za-z0-9]{30,}\b/ },
+];
+
+type CapacityCredentialFinding = { path: string; kind: string };
+
+function normalizeReportKey(key: string): string {
+  return key.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+}
+
+function classifyCredentialValue(value: string): string | null {
+  for (const { kind, pattern } of CREDENTIAL_VALUE_PATTERNS) {
+    if (pattern.test(value)) return kind;
+  }
+  // Opaque high-entropy fallback for NON-allowlisted slots only: a long
+  // digit-and-letter blob with no structure in a field this lane never
+  // defined is treated as credential material. Allowlisted text fields
+  // (dimension labels, identities, timestamps) are exempt so legitimate
+  // labels cannot false-positive.
+  if (/^[A-Za-z0-9+/=_-]{40,}$/.test(value) && /[A-Za-z]/.test(value) && /\d/.test(value)) {
+    return "opaque_high_entropy";
+  }
+  return null;
+}
+
+function collectCredentialFindings(
+  value: unknown,
+  path: string,
+  strictValues: boolean,
+  findings: CapacityCredentialFinding[],
+  state: { nodes: number },
+  depth: number,
+): void {
+  state.nodes += 1;
+  if (
+    state.nodes > PROVIDER_REPORT_MAX_NODES ||
+    depth > PROVIDER_REPORT_MAX_DEPTH
+  ) {
+    throw new Error("provider_report_payload_out_of_bounds");
+  }
+  if (Array.isArray(value)) {
+    for (const [index, item] of value.entries()) {
+      collectCredentialFindings(item, `${path}[${index}]`, strictValues, findings, state, depth + 1);
+    }
+    return;
+  }
+  if (value !== null && typeof value === "object") {
+    for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+      const normalized = normalizeReportKey(key);
+      if (
+        CREDENTIAL_KEY_EXACT.has(normalized) ||
+        CREDENTIAL_KEY_SUBSTRINGS.some((concept) => normalized.includes(concept))
+      ) {
+        // Genericized like other privacy surfaces: attacker-controlled or
+        // accidental credential key names do not echo into receipts.
+        findings.push({ path: `${path}.<redacted-key>`, kind: "credential_shaped_key" });
+        continue; // do not descend into credential values
+      }
+      const childStrict = strictValues || !PROVIDER_REPORT_ALLOWED_FIELDS.has(key);
+      collectCredentialFindings(child, `${path}.${key}`, childStrict, findings, state, depth + 1);
+    }
+    return;
+  }
+  if (typeof value === "string") {
+    const kind = classifyCredentialValue(value);
+    if (kind !== null && (strictValues || kind !== "opaque_high_entropy")) {
+      findings.push({ path, kind: `credential_value_shape:${kind}` });
+    }
+  }
+}
+
+/**
+ * Deterministic signal identity: the same reported fact re-ingested yields
+ * the same signal id, so replaying a report cannot duplicate dimensions.
+ */
+function deriveProviderReportSignalId(profileId: string, dimension: string): string {
+  return (
+    "pr:" + createHash("sha256").update(`${profileId}\u0000${dimension}`).digest("hex").slice(0, 32)
+  );
+}
+
+/**
+ * Validate one owner-supplied provider capacity report and turn it into
+ * provider_report usage signals ready for buildCapacityPlan. Throws on any
+ * credential material, out-of-bounds payload, unknown field, bad number or
+ * timestamp, duplicate dimension, or contradictory remaining/limit facts.
+ */
+export function parseProviderCapacityReport(raw: unknown): CapacityUsageSignal[] {
+  const findings: CapacityCredentialFinding[] = [];
+  collectCredentialFindings(raw, "report", false, findings, { nodes: 0 }, 0);
+  if (findings.length > 0) {
+    throw new Error(
+      "provider_report_credential_material_rejected: " +
+        findings.map((finding) => `${finding.path}:${finding.kind}`).join("; ") +
+        " — the whole report was refused; resupply only reported quota facts",
+    );
+  }
+
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    throw new Error("invalid capacity provider report payload");
+  }
+  const report = raw as Record<string, unknown>;
+  const unknownTopLevel = Object.keys(report)
+    .filter((key) => !["schema", "profileId", "observedAt", "entries"].includes(key))
+    .sort();
+  if (unknownTopLevel.length > 0) {
+    throw new Error(`unknown provider report field ${unknownTopLevel.join(",")}`);
+  }
+  if (report.schema !== PROVIDER_REPORT_SCHEMA) {
+    throw new Error(`unsupported provider report schema ${String(report.schema)}`);
+  }
+  const profileId = requireIdentity("report.profileId", report.profileId);
+  const observedAt = requireIsoTimestamp("report.observedAt", report.observedAt);
+  if (!Array.isArray(report.entries)) {
+    throw new Error("provider report entries must be an array");
+  }
+  if (report.entries.length > PROVIDER_REPORT_MAX_ENTRIES) {
+    throw new Error(
+      `provider_report_entries_out_of_bounds: ${report.entries.length}/${PROVIDER_REPORT_MAX_ENTRIES}`,
+    );
+  }
+
+  const signals: CapacityUsageSignal[] = [];
+  const seenDimensions = new Set<string>();
+  for (const [index, entryRaw] of report.entries.entries()) {
+    if (typeof entryRaw !== "object" || entryRaw === null || Array.isArray(entryRaw)) {
+      throw new Error(`invalid provider report entry ${index}`);
+    }
+    const entry = entryRaw as Record<string, unknown>;
+    const unknownEntryFields = Object.keys(entry)
+      .filter((key) => !["dimension", "unit", "limit", "used", "remaining"].includes(key))
+      .sort();
+    if (unknownEntryFields.length > 0) {
+      throw new Error(`unknown provider report entry field ${unknownEntryFields.join(",")}`);
+    }
+    const dimension = requireIdentity("report.entry.dimension", entry.dimension);
+    if (seenDimensions.has(dimension)) {
+      throw new Error(`duplicate capacity dimension ${profileId}/${dimension}`);
+    }
+    seenDimensions.add(dimension);
+    if (!CAPACITY_UNITS.includes(entry.unit as CapacityUnit)) {
+      throw new Error(`invalid capacity unit ${String(entry.unit)}`);
+    }
+    const unit = entry.unit as CapacityUnit;
+    const limit = requireNonNegativeNumber(entry.limit);
+    let used = requireNonNegativeNumber(entry.used);
+    const remaining = requireNonNegativeNumber(entry.remaining);
+    if (used === null && remaining !== null && limit !== null) {
+      const derived = limit - remaining;
+      if (derived < 0) {
+        throw new Error(
+          `contradictory provider report entry ${index}: remaining ${remaining} exceeds limit ${limit}`,
+        );
+      }
+      used = derived;
+    }
+    // `remaining` without a known limit cannot produce usage; it degrades to
+    // UNKNOWN exactly like the plan doctrine demands — never to zero.
+    signals.push({
+      signalId: deriveProviderReportSignalId(profileId, dimension),
+      profileId,
+      dimension,
+      unit,
+      limit,
+      used,
+      source: "provider_report",
+      observedAt,
+    });
+  }
+  return signals;
 }
