@@ -135,6 +135,12 @@ jobs:
       - name: Prove finalized privacy failures fail closed
         run: node ./node_modules/tsx/dist/cli.mjs ./scripts/resource-proof/finalization-proof.ts
 
+      - name: Prove the published privacy spec derives from the source lists (#13)
+        run: pnpm proof:privacy-spec
+
+      - name: Diff-check the published privacy spec freshness (#13)
+        run: pnpm docs:privacy --check
+
       - name: Upload evidence artifact
         if: always()
         uses: actions/upload-artifact@v4
