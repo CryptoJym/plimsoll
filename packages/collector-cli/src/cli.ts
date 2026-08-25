@@ -79,6 +79,11 @@ import {
   uninstallLaunchAgent,
 } from "./launch-agent";
 import {
+  defaultLifecycleAuthorityRoot,
+  LifecycleMutationAuthority,
+  type LifecycleMutationLease,
+} from "./lifecycle-authority";
+import {
   cleanupStaleJoinHandshakeDirectories,
   finalizeActivatedPendingJoin,
   performJoin,
@@ -436,129 +441,220 @@ function launchctlJobState(): LaunchAgentLabelObservation & {
   };
 }
 
+// Issue #158: one canonical mutation authority for every LaunchAgent
+// mutation this CLI performs (install, uninstall, load, unload, owned-PID
+// cleanup). Read-only inspection and doctor never acquire a lease.
+function launchAgentMutationAuthority() {
+  return new LifecycleMutationAuthority(defaultLifecycleAuthorityRoot());
+}
+
+type LaunchAgentFence =
+  | { kind: "unfenced" }
+  | { kind: "held"; lease: LifecycleMutationLease }
+  | { kind: "busy" }
+  | { kind: "ambiguous" };
+
+function acquireLaunchAgentFence(authority?: LifecycleMutationAuthority): LaunchAgentFence {
+  if (!authority) return { kind: "unfenced" };
+  const acquisition = authority.acquire();
+  if (acquisition.kind === "acquired") return { kind: "held", lease: acquisition.lease };
+  return acquisition.kind === "busy" ? { kind: "busy" } : { kind: "ambiguous" };
+}
+
+function releaseLaunchAgentFence(fence: LaunchAgentFence) {
+  if (fence.kind !== "held") return;
+  // Release touches only this process's own record; superseded or expired
+  // owners cannot affect a successor.
+  fence.lease.release();
+}
+
+function assertLaunchAgentFence(fence: LaunchAgentFence) {
+  if (fence.kind !== "held") return;
+  const state = fence.lease.assertCurrent();
+  if (!state.ok) throw new Error(`LIFECYCLE_FENCE_${state.reason.toUpperCase()}`);
+}
+
+/** Wraps owned-PID-file removal so a stale authority authorizes no
+ * destructive cleanup: the fence is revalidated immediately before the
+ * removal attempt, and a lost fence reports a non-attempted cleanup while
+ * the surrounding observer keeps reporting true terminal state. */
+function fencedPidRemover(fence: LaunchAgentFence) {
+  if (fence.kind !== "held") return undefined;
+  return (pidPath: string, identity: Parameters<typeof removeCollectorPidFileIfOwned>[1], label: string) => {
+    const state = fence.lease.assertCurrent();
+    if (!state.ok) {
+      return {
+        removed: false,
+        ambiguous: false,
+        quarantined: false,
+        persistent: readCollectorPidCleanupState(pidPath, label),
+        disposition: "operation_failed" as const,
+      };
+    }
+    return removeCollectorPidFileIfOwned(pidPath, identity, label);
+  };
+}
+
+/** Wraps cleanup-state reconciliation so retirement of another actor's
+ * artifacts also revalidates the fence immediately before acting. */
+function fencedReconciler(fence: LaunchAgentFence) {
+  if (fence.kind !== "held") return undefined;
+  return (pidPath: string, label: string) => {
+    const state = fence.lease.assertCurrent();
+    if (!state.ok) {
+      return {
+        reconciled: false,
+        eligible: false,
+        disposition: "clear_race" as const,
+        before: readCollectorPidCleanupState(pidPath, label),
+        after: readCollectorPidCleanupState(pidPath, label),
+      };
+    }
+    return reconcileCollectorPidCleanupState(pidPath, label);
+  };
+}
+
 async function loadVisibleLaunchAgent(
   plistPath: string,
   port: number,
   manifestChanged = false,
+  authority?: LifecycleMutationAuthority,
 ) {
   const visible = inspectLaunchAgentManifest();
   if (!visible.ok || visible.plistPath !== plistPath) {
     return { loaded: false, status: "visible_manifest_invalid" as const, manifestDigest: null };
   }
-  const pidPath = collectorLogPath("collector.pid");
-  const observeLabel = () => launchctlJobState();
-  const observeListener = () => observeCollectorListener(port);
-  const prior = await captureLaunchAgentUnloadPriorState({
-    label: LAUNCH_AGENT_LABEL,
-    pidPath,
-    port,
-    observeLabel,
-    observeListener,
-  });
-  if (prior.label.kind === "reported") {
-    if (prior.ownership !== "consistent") {
+  const fence = acquireLaunchAgentFence(authority);
+  if (fence.kind === "busy" || fence.kind === "ambiguous") {
+    return {
+      loaded: false,
+      status: fence.kind === "busy" ? "lifecycle_fence_busy" as const : "lifecycle_fence_ambiguous" as const,
+      manifestDigest: visible.manifestDigest,
+    };
+  }
+  try {
+    const pidPath = collectorLogPath("collector.pid");
+    const observeLabel = () => launchctlJobState();
+    const observeListener = () => observeCollectorListener(port);
+    const prior = await captureLaunchAgentUnloadPriorState({
+      label: LAUNCH_AGENT_LABEL,
+      pidPath,
+      port,
+      observeLabel,
+      observeListener,
+      reconcileCleanupState: fencedReconciler(fence),
+    });
+    if (prior.label.kind === "reported") {
+      if (prior.ownership !== "consistent") {
+        return {
+          loaded: false,
+          status: `prior_owner_${prior.ownership}` as const,
+          manifestDigest: visible.manifestDigest,
+          manifestIdentityDigest: visible.manifestIdentityDigest,
+          prior: unloadPriorReceipt(prior),
+        };
+      }
+      if (manifestChanged) {
+        return {
+          loaded: false,
+          status: "loaded_job_requires_explicit_reload" as const,
+          manifestDigest: visible.manifestDigest,
+          manifestIdentityDigest: visible.manifestIdentityDigest,
+        };
+      }
+      return {
+        loaded: true,
+        status: "already_loaded" as const,
+        manifestDigest: visible.manifestDigest,
+        manifestIdentityDigest: visible.manifestIdentityDigest,
+      };
+    }
+    const terminal = await observeLaunchAgentUnloadTerminalState({
+      label: LAUNCH_AGENT_LABEL,
+      pidPath,
+      port,
+      prior,
+      timeoutMs: 0,
+      observeLabel,
+      observeListener,
+      reconcileCleanupState: fencedReconciler(fence),
+      removePidFile: fencedPidRemover(fence),
+    });
+    if (!terminal.stopped) {
       return {
         loaded: false,
-        status: `prior_owner_${prior.ownership}` as const,
+        status: `prior_state_${terminal.state}` as const,
         manifestDigest: visible.manifestDigest,
         manifestIdentityDigest: visible.manifestIdentityDigest,
         prior: unloadPriorReceipt(prior),
+        terminal: terminal.final,
       };
     }
-    if (manifestChanged) {
+    assertLaunchAgentFence(fence);
+    const loaded = runLaunchctl(launchctlBootstrapCommand(plistPath));
+    if (!loaded) {
       return {
         loaded: false,
-        status: "loaded_job_requires_explicit_reload" as const,
+        status: "launchctl_failed" as const,
         manifestDigest: visible.manifestDigest,
         manifestIdentityDigest: visible.manifestIdentityDigest,
+      };
+    }
+    let after: ReturnType<typeof inspectLaunchAgentManifest> | null = null;
+    try {
+      after = inspectLaunchAgentManifest();
+    } catch {
+      after = null;
+    }
+    const unchangedAfterBootstrap = Boolean(
+      after?.ok &&
+      after.plistPath === plistPath &&
+      after.manifestDigest === visible.manifestDigest &&
+      after.manifestIdentityDigest === visible.manifestIdentityDigest &&
+      after.mode === visible.mode,
+    );
+    if (!unchangedAfterBootstrap) {
+      assertLaunchAgentFence(fence);
+      const bootoutSucceeded = runLaunchctl(launchctlBootoutCommand());
+      const labelStateAfterBootout = launchctlJobState();
+      const labelReportedAfterBootout = labelStateAfterBootout.kind === "reported";
+      return {
+        loaded: false,
+        status: "post_bootstrap_manifest_changed" as const,
+        manifestDigest: visible.manifestDigest,
+        manifestIdentityDigest: visible.manifestIdentityDigest,
+        postBootstrapManifestDigest: after?.ok ? after.manifestDigest : null,
+        postBootstrapManifestIdentityDigest: after?.ok ? after.manifestIdentityDigest : null,
+        cleanup: {
+          bootoutAttempted: true,
+          bootoutSucceeded,
+          labelReportedAfterBootout,
+          labelQueryExitCode: labelStateAfterBootout.exitCode,
+          labelQueryErrorCode: labelStateAfterBootout.errorCode,
+          labelState: labelReportedAfterBootout
+            ? "reported" as const
+            : labelStateAfterBootout.kind === "query_failed"
+              ? "query_failed" as const
+              : "not_reported" as const,
+          status: !bootoutSucceeded
+            ? "bootout_failed" as const
+            : labelReportedAfterBootout
+              ? "bootout_succeeded_label_still_reported" as const
+              : labelStateAfterBootout.kind === "query_failed"
+                ? "bootout_succeeded_label_query_failed" as const
+                : "bootout_succeeded_label_not_reported" as const,
+        },
       };
     }
     return {
       loaded: true,
-      status: "already_loaded" as const,
+      status: "bootstrap_succeeded" as const,
       manifestDigest: visible.manifestDigest,
       manifestIdentityDigest: visible.manifestIdentityDigest,
     };
+  } finally {
+    releaseLaunchAgentFence(fence);
   }
-  const terminal = await observeLaunchAgentUnloadTerminalState({
-    label: LAUNCH_AGENT_LABEL,
-    pidPath,
-    port,
-    prior,
-    timeoutMs: 0,
-    observeLabel,
-    observeListener,
-  });
-  if (!terminal.stopped) {
-    return {
-      loaded: false,
-      status: `prior_state_${terminal.state}` as const,
-      manifestDigest: visible.manifestDigest,
-      manifestIdentityDigest: visible.manifestIdentityDigest,
-      prior: unloadPriorReceipt(prior),
-      terminal: terminal.final,
-    };
-  }
-  const loaded = runLaunchctl(launchctlBootstrapCommand(plistPath));
-  if (!loaded) {
-    return {
-      loaded: false,
-      status: "launchctl_failed" as const,
-      manifestDigest: visible.manifestDigest,
-      manifestIdentityDigest: visible.manifestIdentityDigest,
-    };
-  }
-  let after: ReturnType<typeof inspectLaunchAgentManifest> | null = null;
-  try {
-    after = inspectLaunchAgentManifest();
-  } catch {
-    after = null;
-  }
-  const unchangedAfterBootstrap = Boolean(
-    after?.ok &&
-    after.plistPath === plistPath &&
-    after.manifestDigest === visible.manifestDigest &&
-    after.manifestIdentityDigest === visible.manifestIdentityDigest &&
-    after.mode === visible.mode,
-  );
-  if (!unchangedAfterBootstrap) {
-    const bootoutSucceeded = runLaunchctl(launchctlBootoutCommand());
-    const labelStateAfterBootout = launchctlJobState();
-    const labelReportedAfterBootout = labelStateAfterBootout.kind === "reported";
-    return {
-      loaded: false,
-      status: "post_bootstrap_manifest_changed" as const,
-      manifestDigest: visible.manifestDigest,
-      manifestIdentityDigest: visible.manifestIdentityDigest,
-      postBootstrapManifestDigest: after?.ok ? after.manifestDigest : null,
-      postBootstrapManifestIdentityDigest: after?.ok ? after.manifestIdentityDigest : null,
-      cleanup: {
-        bootoutAttempted: true,
-        bootoutSucceeded,
-        labelReportedAfterBootout,
-        labelQueryExitCode: labelStateAfterBootout.exitCode,
-        labelQueryErrorCode: labelStateAfterBootout.errorCode,
-        labelState: labelReportedAfterBootout
-          ? "reported" as const
-          : labelStateAfterBootout.kind === "query_failed"
-            ? "query_failed" as const
-            : "not_reported" as const,
-        status: !bootoutSucceeded
-          ? "bootout_failed" as const
-          : labelReportedAfterBootout
-            ? "bootout_succeeded_label_still_reported" as const
-            : labelStateAfterBootout.kind === "query_failed"
-              ? "bootout_succeeded_label_query_failed" as const
-              : "bootout_succeeded_label_not_reported" as const,
-      },
-    };
-  }
-  return {
-    loaded: true,
-    status: "bootstrap_succeeded" as const,
-    manifestDigest: visible.manifestDigest,
-    manifestIdentityDigest: visible.manifestIdentityDigest,
-  };
 }
 
 function unloadPriorReceipt(prior: LaunchAgentUnloadPriorState) {
@@ -578,71 +674,93 @@ function unloadPriorReceipt(prior: LaunchAgentUnloadPriorState) {
   };
 }
 
-async function executeLaunchAgentUnload(port: number): Promise<{
+async function executeLaunchAgentUnload(port: number, authority?: LifecycleMutationAuthority): Promise<{
   unloaded: boolean;
-  reason: "launchctl_failed" | LaunchAgentUnloadOutcome["state"] | null;
+  reason: "launchctl_failed" | "lifecycle_fence_busy" | "lifecycle_fence_ambiguous" | LaunchAgentUnloadOutcome["state"] | null;
   status: "already_stopped" | "stopped" | "stopped_after_launchctl_failure" | "refused";
   bootoutAttempted: boolean;
   bootoutSucceeded: boolean | null;
-  prior: ReturnType<typeof unloadPriorReceipt>;
-  outcome: LaunchAgentUnloadOutcome;
+  prior: ReturnType<typeof unloadPriorReceipt> | null;
+  outcome: LaunchAgentUnloadOutcome | null;
 }> {
-  const pidPath = collectorLogPath("collector.pid");
-  const observeLabel = () => launchctlJobState();
-  const observeListener = () => observeCollectorListener(port);
-  const prior = await captureLaunchAgentUnloadPriorState({
-    label: LAUNCH_AGENT_LABEL,
-    pidPath,
-    port,
-    observeLabel,
-    observeListener,
-  });
+  const fence = acquireLaunchAgentFence(authority);
+  if (fence.kind === "busy" || fence.kind === "ambiguous") {
+    return {
+      unloaded: false,
+      reason: fence.kind === "busy" ? "lifecycle_fence_busy" : "lifecycle_fence_ambiguous",
+      status: "refused",
+      bootoutAttempted: false,
+      bootoutSucceeded: null,
+      prior: null,
+      outcome: null,
+    };
+  }
+    try {
+    const pidPath = collectorLogPath("collector.pid");
+    const observeLabel = () => launchctlJobState();
+    const observeListener = () => observeCollectorListener(port);
+    const prior = await captureLaunchAgentUnloadPriorState({
+      label: LAUNCH_AGENT_LABEL,
+      pidPath,
+      port,
+      observeLabel,
+      observeListener,
+      reconcileCleanupState: fencedReconciler(fence),
+    });
 
-  if (prior.label.kind !== "reported") {
+    if (prior.label.kind !== "reported") {
+      const outcome = await observeLaunchAgentUnloadTerminalState({
+        label: LAUNCH_AGENT_LABEL,
+        pidPath,
+        port,
+        prior,
+        timeoutMs: 0,
+        observeLabel,
+        observeListener,
+        reconcileCleanupState: fencedReconciler(fence),
+        removePidFile: fencedPidRemover(fence),
+      });
+      return {
+        unloaded: outcome.stopped,
+        reason: outcome.stopped ? null : outcome.state,
+        status: outcome.stopped ? "already_stopped" : "refused",
+        bootoutAttempted: false,
+        bootoutSucceeded: null,
+        prior: unloadPriorReceipt(prior),
+        outcome,
+      };
+    }
+
+    assertLaunchAgentFence(fence);
+    const bootoutSucceeded = runLaunchctl(launchctlBootoutCommand(), false);
     const outcome = await observeLaunchAgentUnloadTerminalState({
       label: LAUNCH_AGENT_LABEL,
       pidPath,
       port,
       prior,
-      timeoutMs: 0,
+      timeoutMs: bootoutSucceeded ? 4_000 : 0,
       observeLabel,
       observeListener,
+      reconcileCleanupState: fencedReconciler(fence),
+      removePidFile: fencedPidRemover(fence),
     });
+    // Provider/action truth remains literal in bootoutSucceeded, while terminal
+    // state truth decides whether the requested unload has actually completed.
+    const unloaded = outcome.stopped;
     return {
-      unloaded: outcome.stopped,
-      reason: outcome.stopped ? null : outcome.state,
-      status: outcome.stopped ? "already_stopped" : "refused",
-      bootoutAttempted: false,
-      bootoutSucceeded: null,
+      unloaded,
+      reason: unloaded ? null : bootoutSucceeded ? outcome.state : "launchctl_failed",
+      status: unloaded
+        ? bootoutSucceeded ? "stopped" : "stopped_after_launchctl_failure"
+        : "refused",
+      bootoutAttempted: true,
+      bootoutSucceeded,
       prior: unloadPriorReceipt(prior),
       outcome,
     };
+  } finally {
+    releaseLaunchAgentFence(fence);
   }
-
-  const bootoutSucceeded = runLaunchctl(launchctlBootoutCommand(), false);
-  const outcome = await observeLaunchAgentUnloadTerminalState({
-    label: LAUNCH_AGENT_LABEL,
-    pidPath,
-    port,
-    prior,
-    timeoutMs: bootoutSucceeded ? 4_000 : 0,
-    observeLabel,
-    observeListener,
-  });
-  // Provider/action truth remains literal in bootoutSucceeded, while terminal
-  // state truth decides whether the requested unload has actually completed.
-  const unloaded = outcome.stopped;
-  return {
-    unloaded,
-    reason: unloaded ? null : bootoutSucceeded ? outcome.state : "launchctl_failed",
-    status: unloaded
-      ? bootoutSucceeded ? "stopped" : "stopped_after_launchctl_failure"
-      : "refused",
-    bootoutAttempted: true,
-    bootoutSucceeded,
-    prior: unloadPriorReceipt(prior),
-    outcome,
-  };
 }
 
 function launchAgentUnloadReceipt(
@@ -656,13 +774,17 @@ function launchAgentUnloadReceipt(
     label: LAUNCH_AGENT_LABEL,
     bootoutAttempted: result.bootoutAttempted,
     bootoutSucceeded: result.bootoutSucceeded,
-    pidCleaned: result.outcome.pidCleaned,
-    removedPidFile: result.outcome.removedPidFile,
-    pidCleanupAmbiguous: result.outcome.pidCleanupAmbiguous,
-    pidCleanupQuarantined: result.outcome.pidCleanupQuarantined,
-    prior: result.prior,
-    terminal: result.outcome.final,
-    timing: result.outcome.timing,
+    ...(result.outcome
+      ? {
+          pidCleaned: result.outcome.pidCleaned,
+          removedPidFile: result.outcome.removedPidFile,
+          pidCleanupAmbiguous: result.outcome.pidCleanupAmbiguous,
+          pidCleanupQuarantined: result.outcome.pidCleanupQuarantined,
+          prior: result.prior,
+          terminal: result.outcome.final,
+          timing: result.outcome.timing,
+        }
+      : { lifecycleFenceRefused: true as const }),
     pidPathHash: privatePathReceipt(pidPath),
   };
 }
@@ -2584,6 +2706,9 @@ async function main() {
         : [process.execPath, stableCliPath ?? runningScript, "start"],
       workingDirectory: development ? repoRoot : path.dirname(stableCliPath ?? runningScript),
       dryRun,
+      // Issue #158: real installs hold the shared lifecycle mutation lease;
+      // previews never acquire it.
+      ...(dryRun ? {} : { mutationAuthority: launchAgentMutationAuthority() }),
     });
     if (dryRun) {
       console.log(JSON.stringify({
@@ -2598,7 +2723,7 @@ async function main() {
       throw new Error("LaunchAgent visible manifest postcondition failed after install.");
     }
     const load = flag("--load")
-      ? await loadVisibleLaunchAgent(result.plistPath, config.port, result.receipt.changed)
+      ? await loadVisibleLaunchAgent(result.plistPath, config.port, result.receipt.changed, launchAgentMutationAuthority())
       : { loaded: false, status: "not_requested" as const, manifestDigest: visible.manifestDigest };
     console.log(
       JSON.stringify(
@@ -2636,7 +2761,7 @@ async function main() {
       process.exitCode = 1;
       return;
     }
-    const load = await loadVisibleLaunchAgent(plistPath, config.port);
+    const load = await loadVisibleLaunchAgent(plistPath, config.port, false, launchAgentMutationAuthority());
     console.log(JSON.stringify({ ...load, plistPath, label: LAUNCH_AGENT_LABEL }, null, 2));
     if (!load.loaded && process.exitCode === undefined) process.exitCode = 1;
     return;
@@ -2654,7 +2779,7 @@ async function main() {
         2,
       ),
     );
-    const result = await executeLaunchAgentUnload(config.port);
+    const result = await executeLaunchAgentUnload(config.port, launchAgentMutationAuthority());
     console.log(JSON.stringify(launchAgentUnloadReceipt(result), null, 2));
     if (!result.unloaded) process.exitCode = 1;
     return;
@@ -2666,9 +2791,10 @@ async function main() {
       console.log(JSON.stringify(preview.receipt, null, 2));
       return;
     }
+    const mutationAuthority = launchAgentMutationAuthority();
     let unloadResult: Awaited<ReturnType<typeof executeLaunchAgentUnload>> | null = null;
     if (flag("--unload")) {
-      unloadResult = await executeLaunchAgentUnload(config.port);
+      unloadResult = await executeLaunchAgentUnload(config.port, mutationAuthority);
       if (!unloadResult.unloaded) {
         console.log(JSON.stringify({
           removed: false,
@@ -2678,7 +2804,8 @@ async function main() {
         return;
       }
     }
-    const removed = uninstallLaunchAgent({});
+    // Issue #158: the manifest removal itself fences on the same authority.
+    const removed = uninstallLaunchAgent({ mutationAuthority });
     console.log(
       JSON.stringify(
         {

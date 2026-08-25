@@ -120,6 +120,15 @@ export type LifecycleSupportSnapshot = {
 export type LifecycleAdapter = {
   acquireLock(operationId: string): Promise<boolean>;
   releaseLock(operationId: string): Promise<void>;
+  /**
+   * Issue #158: optional fencing hook. Adapters backed by the shared
+   * lifecycle mutation authority revalidate their lease here; managers call
+   * it immediately before every mutating step so a stale authority can never
+   * act on a successor's state. Adapters without an authority leave it unset.
+   * Fence loss throws LifecycleInterruption: the journal stays resumable and
+   * no automatic rollback runs on behalf of a superseded owner.
+   */
+  assertFence?(operationId: string): Promise<void>;
   readJournal(): Promise<LifecycleJournal | null>;
   writeJournal(journal: LifecycleJournal): Promise<void>;
   clearJournal(operationId: string): Promise<void>;
@@ -268,6 +277,10 @@ export class LifecycleManager {
     }
   }
 
+  private fence(operationId: string) {
+    return this.adapter.assertFence?.(operationId);
+  }
+
   private async boundedReadiness(expectedVersion: string) {
     const controller = new AbortController();
     let timer: NodeJS.Timeout | undefined;
@@ -310,8 +323,9 @@ export class LifecycleManager {
     };
   }
 
-  private async finishRequiredRollback(journal: LifecycleJournal) {
+  private async finishRequiredRollback(journal: LifecycleJournal, operationId: string) {
     if (journal.phase === "rollback_required") {
+      await this.fence(operationId);
       try {
         await this.adapter.restore(journal.snapshotId);
       } catch {
@@ -355,7 +369,7 @@ export class LifecycleManager {
         }
         journal = existing;
         if (journal.phase === "rollback_required" || journal.phase === "rollback_complete") {
-          return await this.finishRequiredRollback(journal);
+          return await this.finishRequiredRollback(journal, operationId);
         }
       } else {
         await this.assertFreshOperation(operationId);
@@ -372,16 +386,19 @@ export class LifecycleManager {
       }
 
       if (!phaseAtLeast(journal.phase, "snapshotted")) {
+        await this.fence(operationId);
         journal.snapshotId = await this.adapter.snapshot(operationId);
         journal.phase = "snapshotted";
         await this.adapter.writeJournal(journal);
       }
       if (!phaseAtLeast(journal.phase, "staged")) {
+        await this.fence(operationId);
         await this.adapter.stage(artifact);
         journal.phase = "staged";
         await this.adapter.writeJournal(journal);
       }
       if (!phaseAtLeast(journal.phase, "switched")) {
+        await this.fence(operationId);
         await this.adapter.switchTo(artifact);
         journal.phase = "switched";
         await this.adapter.writeJournal(journal);
@@ -417,7 +434,7 @@ export class LifecycleManager {
       if (journal && phaseAtLeast(journal.phase, "snapshotted")) {
         journal.phase = "rollback_required";
         await this.adapter.writeJournal(journal);
-        await this.finishRequiredRollback(journal);
+        await this.finishRequiredRollback(journal, operationId);
       }
       throw error;
     } finally {
@@ -439,6 +456,7 @@ export class LifecycleManager {
       if (await this.adapter.readJournal()) throw new Error("lifecycle recovery is required before uninstall");
       await this.assertFreshOperation(input.operationId);
       const fromVersion = await this.adapter.installedVersion();
+      if (apply) await this.fence(input.operationId);
       const ownedTargets = await this.adapter.uninstallOwned({ apply });
       const receipt: LifecycleReceipt = {
         schemaVersion: LIFECYCLE_SCHEMA_VERSION,
@@ -474,6 +492,7 @@ export class LifecycleManager {
     try {
       if (await this.adapter.readJournal()) throw new Error("lifecycle recovery is required before purge");
       await this.assertFreshOperation(input.operationId);
+      if (apply) await this.fence(input.operationId);
       const targets = await this.adapter.purgeOwnedData({
         apply,
         confirmation: apply ? input.confirmation ?? null : null,

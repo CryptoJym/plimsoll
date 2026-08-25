@@ -57,6 +57,25 @@ the target version. A different operation cannot cross its lock or journal.
 After a terminal receipt, the operation ID is permanently consumed and must
 not be reused.
 
+## One fenced mutation authority
+
+Issue #158: load, unload, install, uninstall, update, rollback, purge, and
+owned-PID cleanup all serialize through one shared lifecycle mutation
+authority (`src/lifecycle-authority.ts`) instead of separate lock domains.
+A lease from this authority carries a durable monotonically increasing
+fencing revision plus an expiring owner identity. Every mutating step
+revalidates the exact lease immediately before acting; a superseded or
+expired owner fails closed with `LifecycleInterruption`, leaves its journal
+resumable for a retry under a fresh lease, and never runs an automatic
+rollback on behalf of a successor. Busy, expired, superseded, released, and
+ambiguous outcomes are literal path-free codes; an ambiguous domain state
+(junk entry, malformed record, symlinked record) authorizes no destructive
+cleanup. The canonical authority root is
+`<collector home>/lifecycle-authority`; directories are `0700` and records
+`0600`. Read-only observation, doctor, previews, dry runs, and exact no-op
+installs never acquire the mutation lease. No daemon, watcher, polling loop,
+credential movement, or hosted control surface is involved.
+
 ## Uninstall, purge, leave, and revoke
 
 Uninstall is a preview unless `--apply` is explicit. Apply removes the owned

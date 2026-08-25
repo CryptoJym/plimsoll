@@ -4,6 +4,7 @@ import path from "node:path";
 
 import {
   LIFECYCLE_SCHEMA_VERSION,
+  LifecycleInterruption,
   PURGE_CONFIRMATION,
   immutableRuntimeRelativePath,
   type LifecycleAdapter,
@@ -13,6 +14,7 @@ import {
   type LifecycleSupportSnapshot,
   type RuntimeArtifact,
 } from "./lifecycle";
+import { LifecycleMutationAuthority, type LifecycleMutationLease } from "./lifecycle-authority";
 
 const FILE_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
@@ -171,11 +173,15 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
   private readonly journalPath: string;
   private readonly lockPath: string;
   private readonly currentPath: string;
+  /** Operation-ID → held mutation lease. Bounded; one process holds at most a
+   * handful of concurrent lifecycle operations. */
+  private readonly fences = new Map<string, LifecycleMutationLease>();
 
   constructor(
     private readonly paths: ManagedLifecyclePaths,
     private readonly service: LifecycleServiceAdapter,
     private readonly database: LifecycleDatabaseAdapter,
+    private readonly authority?: LifecycleMutationAuthority,
   ) {
     for (const [label, candidate] of Object.entries({
       lifecycleRoot: paths.lifecycleRoot,
@@ -232,6 +238,23 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
 
   async acquireLock(operationId: string) {
     this.initialize();
+    if (this.authority) {
+      // Issue #158: the exclusive mutation lease is the shared lifecycle
+      // authority's fenced revision, not a private lock domain. Busy and
+      // ambiguous outcomes both refuse the operation (false); an ambiguous
+      // authority never falls back to acting unlocked.
+      const acquisition = this.authority.acquire();
+      if (acquisition.kind !== "acquired") return false;
+      if (this.fences.size >= 8 && !this.fences.has(operationId)) {
+        const oldest = this.fences.keys().next();
+        if (!oldest.done) {
+          this.fences.get(oldest.value)?.release();
+          this.fences.delete(oldest.value);
+        }
+      }
+      this.fences.set(operationId, acquisition.lease);
+      return true;
+    }
     try {
       fs.mkdirSync(this.lockPath, { mode: DIRECTORY_MODE });
       writeJson(path.join(this.lockPath, "owner.json"), { schemaVersion: 1, operationId }, this.root);
@@ -245,10 +268,34 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
   }
 
   async releaseLock(operationId: string) {
+    const lease = this.fences.get(operationId);
+    if (lease) {
+      // Release touches only this operation's own record. A superseded or
+      // expired owner therefore cannot affect a successor.
+      this.fences.delete(operationId);
+      lease.release();
+      return;
+    }
     if (!fs.existsSync(this.lockPath)) return;
     const owner = readJson<{ operationId?: string }>(path.join(this.lockPath, "owner.json"));
     if (owner?.operationId !== operationId) return;
     fs.rmSync(this.lockPath, { recursive: true, force: true });
+  }
+
+  async assertFence(operationId: string) {
+    if (!this.authority) return;
+    const lease = this.fences.get(operationId);
+    if (!lease) {
+      // Invariant violation: a fenced mutating step ran without holding the
+      // mutation lease. Fail closed rather than act unowned.
+      throw new Error(`lifecycle fence is not held for operation ${operationId}`);
+    }
+    const revalidation = lease.assertCurrent();
+    if (!revalidation.ok) {
+      throw new LifecycleInterruption(
+        `lifecycle fence lost before a mutating step: ${revalidation.reason}`,
+      );
+    }
   }
 
   async readJournal() {
