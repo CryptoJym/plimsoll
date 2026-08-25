@@ -465,6 +465,14 @@ function buildSpanEvent(
   const otelHasException = spanHasExceptionEvent(safeSpan);
   const otelHasError =
     isErrorStatus(otelStatusCode) || otelHasException || attributesHaveError(attrs);
+  // Collector-generated completion timestamp (issue #156): lets runtime fact
+  // promotion close attempt timing from the span's own end. Producers cannot
+  // set this key (generated dispositions are rejected on OTLP surfaces).
+  const spanEndedAt = unixNanoToIso(
+    typeof safeSpan.endTimeUnixNano === "string" || typeof safeSpan.endTimeUnixNano === "number"
+      ? safeSpan.endTimeUnixNano
+      : "",
+  );
 
   const event = aiInteractionEventSchema.parse({
     actorId: stringField(attrs, [...usageFieldKeys.actorId]),
@@ -506,6 +514,7 @@ function buildSpanEvent(
       ...(otelStatusCode !== undefined ? { otelStatusCode } : {}),
       ...(otelHasException ? { otelHasException: true } : {}),
       ...(otelHasError ? { otelHasError: true } : {}),
+      ...(spanEndedAt ? { otelSpanEndAt: spanEndedAt } : {}),
       ...(traceId ? { traceId } : {}),
       ...(spanId ? { spanId } : {}),
       ...(context.transportPath ? { transport_path: context.transportPath } : {}),

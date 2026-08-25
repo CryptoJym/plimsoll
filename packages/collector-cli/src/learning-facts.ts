@@ -167,6 +167,7 @@ export function buildWorkEpisodeFact(input: {
   sourceEpisodeKey: string;
   workClass: WorkClass;
   complexityBand: WorkComplexityBand;
+  parentEpisodeId?: string;
   startedAt: string;
   endedAt?: string;
 }): WorkEpisodeFact {
@@ -185,6 +186,7 @@ export function buildWorkEpisodeFact(input: {
     sessionId: input.sessionId,
     workClass: input.workClass,
     complexityBand: input.complexityBand,
+    parentEpisodeId: input.parentEpisodeId,
     startedAt: input.startedAt,
     endedAt: input.endedAt,
     durationMs,
@@ -279,13 +281,13 @@ export class LearningFactStore {
         session_id text not null check(length(session_id) between 1 and 96),
         work_class text not null check(work_class in ('implementation','debugging','review','research','operations','other')),
         complexity_band text not null check(complexity_band in ('low','medium','high','unknown')),
+        parent_episode_id text,
         started_at text not null,
         ended_at text,
         duration_ms integer check(duration_ms is null or duration_ms between 0 and 2592000000),
         created_at text not null,
         check((ended_at is null) = (duration_ms is null))
-      );
-      create table if not exists tool_attempt_facts (
+      );      create table if not exists tool_attempt_facts (
         operation_id text primary key,
         source text not null,
         session_id text not null check(length(session_id) between 1 and 96),
@@ -356,6 +358,15 @@ export class LearningFactStore {
           mode
         );
     `);
+    // Existing ledgers created before optional episode parent linkage keep
+    // their original table shape; add the column in place (new-only data).
+    const workEpisodeColumns = new Set(
+      (this.db.pragma("table_info(work_episode_facts)") as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    if (!workEpisodeColumns.has("parent_episode_id")) {
+      this.db.exec(`alter table work_episode_facts add column parent_episode_id text`);
+    }
   }
 
   private assertCapacity(
@@ -525,10 +536,30 @@ export class LearningFactStore {
   recordWorkEpisode(input: unknown): { inserted: boolean; fact: WorkEpisodeFact } {
     const fact = workEpisodeFactSchema.parse(input);
     return this.db.transaction(() => {
+      if (fact.parentEpisodeId) {
+        const parent = this.db
+          .prepare(
+            `select source, session_id as sessionId, started_at as startedAt
+             from work_episode_facts where episode_id = ?`,
+          )
+          .get(fact.parentEpisodeId) as {
+            source: ToolSource;
+            sessionId: string;
+            startedAt: string;
+          } | undefined;
+        if (!parent) throw new Error("WorkEpisodeParentMissing");
+        if (parent.source !== fact.source || parent.sessionId !== fact.sessionId) {
+          throw new Error("WorkEpisodeParentIdentityConflict");
+        }
+        if (Date.parse(parent.startedAt) > Date.parse(fact.startedAt)) {
+          throw new Error("WorkEpisodeParentPrecedesChildStart");
+        }
+      }
       const row = this.db
         .prepare(
           `select episode_id as episodeId, source, session_id as sessionId,
              work_class as workClass, complexity_band as complexityBand,
+             parent_episode_id as parentEpisodeId,
              started_at as startedAt, ended_at as endedAt, duration_ms as durationMs
            from work_episode_facts where episode_id = ?`,
         )
@@ -539,6 +570,7 @@ export class LearningFactStore {
       if (row) {
         const existing = workEpisodeFactSchema.parse({
           ...row,
+          parentEpisodeId: row.parentEpisodeId ?? undefined,
           endedAt: row.endedAt ?? undefined,
           durationMs: row.durationMs ?? undefined,
         });
@@ -556,12 +588,13 @@ export class LearningFactStore {
       this.db.prepare(
         `insert into work_episode_facts
           (episode_id, source, session_id, work_class, complexity_band,
-           started_at, ended_at, duration_ms, created_at)
+           parent_episode_id, started_at, ended_at, duration_ms, created_at)
          values
           (@episodeId, @source, @sessionId, @workClass, @complexityBand,
-           @startedAt, @endedAt, @durationMs, @createdAt)`,
+           @parentEpisodeId, @startedAt, @endedAt, @durationMs, @createdAt)`,
       ).run({
         ...fact,
+        parentEpisodeId: fact.parentEpisodeId ?? null,
         endedAt: fact.endedAt ?? null,
         durationMs: fact.durationMs ?? null,
         createdAt: new Date().toISOString(),
@@ -694,16 +727,38 @@ export class LearningFactStore {
       this.db.prepare(
         `select episode_id as episodeId, source, session_id as sessionId,
            work_class as workClass, complexity_band as complexityBand,
+           parent_episode_id as parentEpisodeId,
            started_at as startedAt, ended_at as endedAt, duration_ms as durationMs
          from work_episode_facts order by started_at, episode_id`,
       ).all() as Array<Record<string, unknown>>
     ).map((row) =>
       workEpisodeFactSchema.parse({
         ...row,
+        parentEpisodeId: row.parentEpisodeId ?? undefined,
         endedAt: row.endedAt ?? undefined,
         durationMs: row.durationMs ?? undefined,
       }),
     );
+  }
+
+  episodeById(episodeId: string): WorkEpisodeFact | undefined {
+    const row = this.db
+      .prepare(
+        `select episode_id as episodeId, source, session_id as sessionId,
+           work_class as workClass, complexity_band as complexityBand,
+           parent_episode_id as parentEpisodeId,
+           started_at as startedAt, ended_at as endedAt, duration_ms as durationMs
+         from work_episode_facts where episode_id = ?`,
+      )
+      .get(episodeId) as Record<string, unknown> | undefined;
+    return row
+      ? workEpisodeFactSchema.parse({
+          ...row,
+          parentEpisodeId: row.parentEpisodeId ?? undefined,
+          endedAt: row.endedAt ?? undefined,
+          durationMs: row.durationMs ?? undefined,
+        })
+      : undefined;
   }
 
   exposures(): TechniqueExposureFact[] {

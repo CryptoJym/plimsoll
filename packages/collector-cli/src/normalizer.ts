@@ -276,10 +276,12 @@ export function classifyEventType(candidate: string | undefined): AiInteractionE
   if (normalized.includes("stop") || normalized.includes("sessionstop")) return "session_stop";
   if (normalized.includes("sessionstart")) return "session_start";
   if (normalized.includes("toolresult")) return "tool_result";
+  // Post-tool hook phases report the completion of an already-started tool;
+  // counting them as new starts would fabricate attempts (issue #156).
+  if (normalized.includes("posttool")) return "tool_result";
   if (
     normalized.includes("tool") ||
-    normalized.includes("pretool") ||
-    normalized.includes("posttool")
+    normalized.includes("pretool")
   ) return "tool_use";
   if (normalized.includes("assistant")) return "assistant_response";
   if (
