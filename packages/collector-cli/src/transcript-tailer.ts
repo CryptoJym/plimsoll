@@ -31,6 +31,11 @@ import {
   stageAutomaticCaptureBaselinePending,
   type CaptureBaselineFileObservation,
 } from "./capture-baseline";
+import {
+  loadCaptureRotation,
+  rememberCaptureRotation,
+  rotateAfterServed,
+} from "./capture-fairness";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
 import { IncrementalJsonlDiscovery } from "./incremental-jsonl-discovery";
 import {
@@ -734,151 +739,202 @@ export class TranscriptTailer {
         : rightCursor - leftCursor || right.stat.mtimeMs - left.stat.mtimeMs || left.file.localeCompare(right.file);
     });
 
-    for (const candidate of candidates) {
-      const candidateHash = maintenanceCandidateHash(candidate.file);
-      if ((options.quarantine?.stage === "jsonl_open" || options.quarantine?.stage === "jsonl_validation") &&
-        options.quarantine.candidateHash === candidateHash) {
-        result.deferredGenerations += 1;
-        consumeAutomaticFile(candidate.file);
-        continue;
-      }
-      if (options.onProgress?.({ stage: "jsonl_open", candidateHash }) === false) {
-        result.deferredGenerations += candidates.length;
-        break;
-      }
-      if (options.signal?.aborted) {
-        result.aborted = true;
-        break;
-      }
-      if (automatic && !automatic.budget.canContinue()) break;
-      let cursor = candidate.cursor;
-      let countedFile = false;
-      while (true) {
-        if (options.signal?.aborted) {
-          result.aborted = true;
+    // Fair progress across concurrent generations (#141). Automatic cadences
+    // serve one fixed slice quantum per generation per rotation turn, then
+    // resume after whichever generation was served last cadence, so an
+    // incomplete generation can never monopolize consecutive cadences while
+    // another eligible generation remains unserviced. Explicit scans still
+    // drain each candidate fully in one pass.
+    const rotationKeyOf = (candidate: { file: string }) =>
+      maintenanceCandidateHash(candidate.file);
+    let queue = (automatic
+      ? rotateAfterServed(
+          candidates,
+          rotationKeyOf,
+          loadCaptureRotation(this.buffer.database, "claude_code"),
+        )
+      : candidates
+    ).map((candidate) => ({ ...candidate, countedFile: false }));
+    let lastServedRotationKey: string | null = null;
+    while (queue.length > 0) {
+      const carry: typeof queue = [];
+      for (const candidate of queue) {
+        const candidateHash = maintenanceCandidateHash(candidate.file);
+        if ((options.quarantine?.stage === "jsonl_open" || options.quarantine?.stage === "jsonl_validation") &&
+          options.quarantine.candidateHash === candidateHash) {
+          result.deferredGenerations += 1;
+          consumeAutomaticFile(candidate.file);
+          continue;
+        }
+        if (options.onProgress?.({ stage: "jsonl_open", candidateHash }) === false) {
+          result.deferredGenerations += candidates.length;
+          queue = [];
           break;
         }
-        let limits = automatic
-          ? automatic.budget.remainingSlice()
-          : { maxBytes: 128 * 1024, maxRecords: 64 };
-        if (!limits) break;
-        if (automatic && cursor?.parserState?.pending) {
-          const slots = automatic.budget.remainingEventSlots();
-          if (slots <= 1) break;
-          limits = { ...limits, maxRecords: Math.min(limits.maxRecords, slots - 1) };
+        if (options.signal?.aborted) {
+          result.aborted = true;
+          queue = [];
+          break;
         }
-        let read: NonNullable<ReturnType<JsonlTailerIo["readTail"]>>;
-        try {
-          const next = this.io.readTail(candidate.file, candidate.stat, cursor, limits);
-          if (!next) {
+        if (automatic && !automatic.budget.canContinue()) {
+          queue = [];
+          break;
+        }
+        let cursor = candidate.cursor;
+        let countedFile = candidate.countedFile;
+        let pausedWithWork = false;
+        while (true) {
+          if (options.signal?.aborted) {
+            result.aborted = true;
+            break;
+          }
+          let limits = automatic
+            ? automatic.budget.remainingSlice()
+            : { maxBytes: 128 * 1024, maxRecords: 64 };
+          if (!limits) break;
+          if (automatic && cursor?.parserState?.pending) {
+            const slots = automatic.budget.remainingEventSlots();
+            if (slots <= 1) break;
+            limits = { ...limits, maxRecords: Math.min(limits.maxRecords, slots - 1) };
+          }
+          let read: NonNullable<ReturnType<JsonlTailerIo["readTail"]>>;
+          try {
+            const next = this.io.readTail(candidate.file, candidate.stat, cursor, limits);
+            if (!next) {
+              consumeAutomaticFile(candidate.file);
+              break;
+            }
+            read = next;
+          } catch {
+            result.readErrors += 1;
             consumeAutomaticFile(candidate.file);
             break;
           }
-          read = next;
-        } catch {
-          result.readErrors += 1;
-          consumeAutomaticFile(candidate.file);
-          break;
-        }
-        if (!countedFile) {
-          result.filesRead += 1;
-          countedFile = true;
-        }
-        result.bytesRead += read.bytesRead;
-        result.recordsParsed += read.lines.length;
-        if (read.reset) result.filesReset += 1;
-        if (read.legacyRebuild) result.legacyRebuilds += 1;
-        if (read.checkpointRebuild) result.checkpointRebuilds += 1;
-
-        const before = resultMutationSnapshot(result);
-        let parseFailure = false;
-        let committed = false;
-        let validationDeferred = false;
-        try {
-          const initialState = read.reset || !cursor?.parserState
-            ? this.initialParserState(candidate.file)
-            : cursor.parserState;
-          // Repo-context preparation is filesystem-free. Git resolution is a
-          // post-commit maintenance phase, so a stalled resolver cannot make
-          // token or cursor truth disappear.
-          if (options.onProgress?.({ stage: "jsonl_validation", candidateHash }) === false) {
-            validationDeferred = true;
-            throw new Error("maintenance_progress_budget_exhausted");
+          if (!countedFile) {
+            result.filesRead += 1;
+            countedFile = true;
           }
-          const fallbackObservedAt = this.fallbackObservedAt(read.mtimeMs);
-          read.assertStableForCommit();
-          this.buffer.transactionWithRepoContextHandoffs(() => {
-            if (read.unresolvedRecord) {
+          result.bytesRead += read.bytesRead;
+          result.recordsParsed += read.lines.length;
+          if (read.reset) result.filesReset += 1;
+          if (read.legacyRebuild) result.legacyRebuilds += 1;
+          if (read.checkpointRebuild) result.checkpointRebuilds += 1;
+
+          const before = resultMutationSnapshot(result);
+          let parseFailure = false;
+          let committed = false;
+          let validationDeferred = false;
+          try {
+            const initialState = read.reset || !cursor?.parserState
+              ? this.initialParserState(candidate.file)
+              : cursor.parserState;
+            // Repo-context preparation is filesystem-free. Git resolution is a
+            // post-commit maintenance phase, so a stalled resolver cannot make
+            // token or cursor truth disappear.
+            if (options.onProgress?.({ stage: "jsonl_validation", candidateHash }) === false) {
+              validationDeferred = true;
+              throw new Error("maintenance_progress_budget_exhausted");
+            }
+            const fallbackObservedAt = this.fallbackObservedAt(read.mtimeMs);
+            read.assertStableForCommit();
+            this.buffer.transactionWithRepoContextHandoffs(() => {
+              if (read.unresolvedRecord) {
+                rememberJsonlScanCursor(
+                  this.buffer.database,
+                  candidate.file,
+                  PARSER_KIND,
+                  CHECKPOINT_VERSION,
+                  read,
+                  initialState,
+                );
+                return;
+              }
+              const parseErrorsBefore = result.parseErrors;
+              const parserState = this.ingestLines(
+                read.lines,
+                result,
+                initialState,
+                !read.workRemaining && read.deferredBytes === 0,
+                fallbackObservedAt,
+              );
+              if (result.parseErrors !== parseErrorsBefore) {
+                parseFailure = true;
+                throw new Error("transcript_slice_parse_failed");
+              }
               rememberJsonlScanCursor(
                 this.buffer.database,
                 candidate.file,
                 PARSER_KIND,
                 CHECKPOINT_VERSION,
                 read,
-                initialState,
+                parserState,
               );
-              return;
+            });
+            committed = true;
+            consumeAutomaticFile(candidate.file);
+            result.slicesCommitted += 1;
+            if (read.unresolvedRecord) result.unresolvedRecords += 1;
+          } catch {
+            const parseErrors = result.parseErrors - before.parseErrors;
+            restoreResultMutationSnapshot(result, before);
+            if (parseFailure) {
+              result.parseErrors += Math.max(1, parseErrors);
+              consumeAutomaticFile(candidate.file);
+            } else if (!validationDeferred) {
+              result.readErrors += 1;
+              consumeAutomaticFile(candidate.file);
+            } else {
+              result.activity.truncated = true;
             }
-            const parseErrorsBefore = result.parseErrors;
-            const parserState = this.ingestLines(
-              read.lines,
-              result,
-              initialState,
-              !read.workRemaining && read.deferredBytes === 0,
-              fallbackObservedAt,
-            );
-            if (result.parseErrors !== parseErrorsBefore) {
-              parseFailure = true;
-              throw new Error("transcript_slice_parse_failed");
-            }
-            rememberJsonlScanCursor(
+          } finally {
+            read.close();
+          }
+          const appended = committed ? result.eventsAppended - before.eventsAppended : 0;
+          automatic?.budget.recordSlice({
+            bytesRead: read.bytesRead,
+            recordsParsed: read.lines.length,
+            eventsAppended: appended,
+          });
+          if (committed) lastServedRotationKey = rotationKeyOf(candidate);
+          const moreWork =
+            committed && !read.unresolvedRecord && !parseFailure && read.workRemaining;
+          if (!moreWork) break;
+          if (automatic) {
+            // One bounded slice is this generation's quantum for the turn.
+            // Yield cooperatively, snapshot the fresh cursor, and let the
+            // rotation hand the next turn to a different generation.
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            result.cooperativeYields += 1;
+            result.lastYieldAt = new Date().toISOString();
+            automatic.budget.recordYield();
+            candidate.cursor = loadJsonlScanCursor<TranscriptParserState>(
               this.buffer.database,
               candidate.file,
               PARSER_KIND,
               CHECKPOINT_VERSION,
-              read,
-              parserState,
+              validateTranscriptParserState,
             );
-          });
-          committed = true;
-          consumeAutomaticFile(candidate.file);
-          result.slicesCommitted += 1;
-          if (read.unresolvedRecord) result.unresolvedRecords += 1;
-        } catch {
-          const parseErrors = result.parseErrors - before.parseErrors;
-          restoreResultMutationSnapshot(result, before);
-          if (parseFailure) {
-            result.parseErrors += Math.max(1, parseErrors);
-            consumeAutomaticFile(candidate.file);
-          } else if (!validationDeferred) {
-            result.readErrors += 1;
-            consumeAutomaticFile(candidate.file);
-          } else {
-            result.activity.truncated = true;
+            pausedWithWork = true;
+            break;
           }
-        } finally {
-          read.close();
+          await new Promise<void>((resolve) => setImmediate(resolve));
+          result.cooperativeYields += 1;
+          result.lastYieldAt = new Date().toISOString();
+          cursor = loadJsonlScanCursor<TranscriptParserState>(
+            this.buffer.database,
+            candidate.file,
+            PARSER_KIND,
+            CHECKPOINT_VERSION,
+            validateTranscriptParserState,
+          );
         }
-        const appended = committed ? result.eventsAppended - before.eventsAppended : 0;
-        automatic?.budget.recordSlice({
-          bytesRead: read.bytesRead,
-          recordsParsed: read.lines.length,
-          eventsAppended: appended,
-        });
-        if (!committed || read.unresolvedRecord || parseFailure || !read.workRemaining) break;
-        await new Promise<void>((resolve) => setImmediate(resolve));
-        result.cooperativeYields += 1;
-        result.lastYieldAt = new Date().toISOString();
-        automatic?.budget.recordYield();
-        cursor = loadJsonlScanCursor<TranscriptParserState>(
-          this.buffer.database,
-          candidate.file,
-          PARSER_KIND,
-          CHECKPOINT_VERSION,
-          validateTranscriptParserState,
-        );
-        if (automatic && !automatic.budget.canContinue()) break;
+        candidate.countedFile = countedFile;
+        if (automatic && pausedWithWork && automatic.budget.canContinue()) carry.push(candidate);
       }
+      queue = carry;
+    }
+    if (automatic && lastServedRotationKey) {
+      rememberCaptureRotation(this.buffer.database, "claude_code", lastServedRotationKey);
     }
     if (automatic) this.consumeAutomaticCaptureFiles(automaticFilesConsumed);
     for (const candidate of candidates) {
