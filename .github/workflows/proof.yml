@@ -93,6 +93,9 @@ jobs:
       - name: Prove capacity planning doctrine gates
         run: pnpm proof:capacity
 
+      - name: Prove local capacity rail store, projection, CLI, dashboard, retention, and doctor
+        run: pnpm proof:capacity-rail
+
       - name: Prove bounded learning evidence packets
         run: pnpm proof:learning-evidence
 
