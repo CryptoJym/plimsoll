@@ -67,6 +67,15 @@ import {
  *    seconds while the tailer lags a scan interval, so a span-emitting
  *    session always has token-bearing non-rollout events by the time the
  *    tailer sees its rollout — those sessions are skipped (and counted).
+ *  - Counter lineage (issue #153): the FIRST totals observation of a file
+ *    lineage diffs against an assumed-zero baseline, so an inherited,
+ *    forked, resumed, or otherwise nonzero cumulative counter would enter
+ *    validated usage whole. Such a first delta is classified instead:
+ *    typed token columns stay zero, the raw source-reported totals are
+ *    preserved in the row metadata (`counterLineage` +
+ *    `sourceCumulative*`), and scan results report the excluded volume.
+ *    Lineage stays UNKNOWN by design; only deltas BETWEEN observed totals
+ *    count as validated marginal consumption.
  */
 
 export type RolloutScanResult = {
@@ -86,6 +95,15 @@ export type RolloutScanResult = {
   sessionsSkippedOtlpCovered: number;
   eventsAppended: number;
   tokensAppended: { input: number; cachedInput: number; output: number };
+  /**
+   * Issue #153: rows whose token columns were zeroed because their first
+   * cumulative counter could not be attributed to observed marginals, and
+   * the raw source-reported volume that was therefore excluded from
+   * validated usage. Optional only for legacy result literals; scan()
+   * always sets both.
+   */
+  unvalidatedFirstRows?: number;
+  tokensUnvalidated?: { input: number; cachedInput: number; output: number };
   parseErrors: number;
   unresolvedRecords: number;
   recordsParsed: number;
@@ -142,6 +160,15 @@ const PARSER_KIND = "codex-rollout-v2";
 const CHECKPOINT_VERSION = 2;
 
 const ZERO: TokenTotals = { input: 0, cachedInput: 0, output: 0, reasoningOutput: 0 };
+
+function isZeroTotals(totals: TokenTotals) {
+  return (
+    totals.input === 0 &&
+    totals.cachedInput === 0 &&
+    totals.output === 0 &&
+    totals.reasoningOutput === 0
+  );
+}
 
 function totalsFrom(usage: Record<string, unknown> | undefined): TokenTotals | undefined {
   if (!usage || typeof usage !== "object") return undefined;
@@ -308,6 +335,8 @@ function resultMutationSnapshot(result: RolloutScanResult) {
     filesParsed: result.filesParsed,
     sessionsSkippedOtlpCovered: result.sessionsSkippedOtlpCovered,
     tokens: { ...result.tokensAppended },
+    unvalidatedFirstRows: result.unvalidatedFirstRows ?? 0,
+    tokensUnvalidated: { ...(result.tokensUnvalidated ?? { input: 0, cachedInput: 0, output: 0 }) },
   };
 }
 
@@ -320,6 +349,8 @@ function restoreResultMutationSnapshot(
   result.filesParsed = snapshot.filesParsed;
   result.sessionsSkippedOtlpCovered = snapshot.sessionsSkippedOtlpCovered;
   result.tokensAppended = { ...snapshot.tokens };
+  result.unvalidatedFirstRows = snapshot.unvalidatedFirstRows;
+  result.tokensUnvalidated = { ...snapshot.tokensUnvalidated };
 }
 
 export class RolloutTailer {
@@ -390,6 +421,8 @@ export class RolloutTailer {
       sessionsSkippedOtlpCovered: 0,
       eventsAppended: 0,
       tokensAppended: { input: 0, cachedInput: 0, output: 0 },
+      unvalidatedFirstRows: 0,
+      tokensUnvalidated: { input: 0, cachedInput: 0, output: 0 },
       parseErrors: 0,
       unresolvedRecords: 0,
       recordsParsed: 0,
@@ -1117,6 +1150,7 @@ export class RolloutTailer {
       delta: TokenTotals;
       model: string | undefined;
       repoContext: ActiveContext;
+      lineageFirstUnknown?: TokenTotals;
     }> = [];
     let activeRepoContext: ActiveContext = state.activeRepoContextId
       ? { kind: "persisted", contextId: state.activeRepoContextId }
@@ -1174,6 +1208,17 @@ export class RolloutTailer {
         if (!totals) continue;
         const rateLimits = (payload.rate_limits ?? {}) as Record<string, unknown>;
         if (typeof rateLimits.plan_type === "string") state.planType = rateLimits.plan_type;
+        // Issue #153: the lineage's first totals observation diffs against
+        // an ASSUMED zero baseline. A nonzero result cannot be attributed to
+        // observed marginals — it may be genuine catch-up usage of a young
+        // session or an inherited/forked/resumed counter — so its lineage is
+        // UNKNOWN and it must not enter validated usage. An observed all-zero
+        // first total legitimately anchors the baseline: later deltas from
+        // that observed zero are validated marginals (tokenCountIndex > 0).
+        const lineageFirstUnknown =
+          state.tokenCountIndex === 0 && isZeroTotals(state.previous) && !isZeroTotals(totals)
+            ? totals
+            : undefined;
         const delta = diff(totals, state.previous);
         state.previous = totals;
         if (delta.input === 0 && delta.output === 0) continue; // periodic no-op emission
@@ -1183,6 +1228,7 @@ export class RolloutTailer {
           delta,
           model: state.model,
           repoContext: activeRepoContext,
+          ...(lineageFirstUnknown ? { lineageFirstUnknown } : {}),
         });
       }
     }
@@ -1235,12 +1281,19 @@ export class RolloutTailer {
         ? identity.actorHash
         : undefined;
     for (const entry of pending) {
-      const priced = estimateCostUsd({
-        model: entry.model,
-        inputTokens: entry.delta.input,
-        outputTokens: entry.delta.output,
-        cacheReadTokens: entry.delta.cachedInput,
-      });
+      const unvalidated = entry.lineageFirstUnknown !== undefined;
+      // Validated marginal consumption excludes the unclassified first
+      // counter entirely; the raw source observation is preserved in the
+      // row metadata below. Unvalidated usage is never priced.
+      const marginal: TokenTotals = unvalidated ? ZERO : entry.delta;
+      const priced = unvalidated
+        ? undefined
+        : estimateCostUsd({
+            model: entry.model,
+            inputTokens: entry.delta.input,
+            outputTokens: entry.delta.output,
+            cacheReadTokens: entry.delta.cachedInput,
+          });
       const metadata: Record<string, unknown> = {
         usageSource: "rollout",
         turnIndex: entry.index,
@@ -1248,7 +1301,15 @@ export class RolloutTailer {
       if (state.originator) metadata.originator = state.originator;
       if (state.cliVersion) metadata.cliVersion = state.cliVersion;
       if (state.planType) metadata.planType = state.planType;
-      if (entry.delta.reasoningOutput > 0) metadata.reasoningOutputTokens = entry.delta.reasoningOutput;
+      if (unvalidated && entry.lineageFirstUnknown) {
+        metadata.counterLineage = "unknown_nonzero_first";
+        metadata.sourceCumulativeInput = entry.lineageFirstUnknown.input;
+        metadata.sourceCumulativeCachedInput = entry.lineageFirstUnknown.cachedInput;
+        metadata.sourceCumulativeOutput = entry.lineageFirstUnknown.output;
+        metadata.sourceCumulativeReasoningOutput = entry.lineageFirstUnknown.reasoningOutput;
+      } else if (entry.delta.reasoningOutput > 0) {
+        metadata.reasoningOutputTokens = entry.delta.reasoningOutput;
+      }
       if (priced) metadata.costEstimated = true;
 
       const event: AiInteractionEvent = aiInteractionEventSchema.parse({
@@ -1262,9 +1323,9 @@ export class RolloutTailer {
         sessionId: state.conversationId,
         model: entry.model,
         actionClass: "other",
-        inputTokens: entry.delta.input,
-        outputTokens: entry.delta.output,
-        cacheReadTokens: entry.delta.cachedInput,
+        inputTokens: marginal.input,
+        outputTokens: marginal.output,
+        cacheReadTokens: marginal.cachedInput,
         costUsd: priced?.costUsd,
         metadata,
       });
@@ -1279,9 +1340,17 @@ export class RolloutTailer {
       const inserted = this.buffer.append(event, []);
       if (inserted) {
         result.eventsAppended += 1;
-        result.tokensAppended.input += entry.delta.input;
-        result.tokensAppended.cachedInput += entry.delta.cachedInput;
-        result.tokensAppended.output += entry.delta.output;
+        result.tokensAppended.input += marginal.input;
+        result.tokensAppended.cachedInput += marginal.cachedInput;
+        result.tokensAppended.output += marginal.output;
+        if (unvalidated) {
+          result.unvalidatedFirstRows = (result.unvalidatedFirstRows ?? 0) + 1;
+          result.tokensUnvalidated = {
+            input: (result.tokensUnvalidated?.input ?? 0) + entry.delta.input,
+            cachedInput: (result.tokensUnvalidated?.cachedInput ?? 0) + entry.delta.cachedInput,
+            output: (result.tokensUnvalidated?.output ?? 0) + entry.delta.output,
+          };
+        }
       }
     }
     return state;

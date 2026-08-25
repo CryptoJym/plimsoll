@@ -1515,18 +1515,38 @@ async function main() {
       }),
       { input: 0, cached: 0, output: 0, cost: 0 },
     );
+  // Issue #153: the lineage's first cumulative total (1000/200/50) is
+  // classified unvalidated — typed columns zero, raw totals in metadata,
+  // never priced. Only the delta row (2000/400/80) is validated usage.
+  const rolloutSessionMeta = rolloutRows
+    .filter((row) => row.sessionId === ROLLOUT_SESSION)
+    .map((row) => JSON.parse(row.payloadJson as string).metadata);
   check(
     "rollout_usage_ingested_exact",
     rolloutRows.filter((row) => row.sessionId === ROLLOUT_SESSION).length === 2 &&
-      rolloutSums.input === 3000 &&
-      rolloutSums.cached === 600 &&
-      rolloutSums.output === 130 &&
+      rolloutSums.input === 2000 &&
+      rolloutSums.cached === 400 &&
+      rolloutSums.output === 80 &&
       rolloutRows.every((row) => row.sessionId !== ROLLOUT_SESSION || row.model === "gpt-5.5") &&
       rolloutSums.cost > 0 &&
-      rolloutRows.every(
-        (row) => row.sessionId !== ROLLOUT_SESSION || String(row.payloadJson).includes('"costEstimated":true'),
-      ),
+      rolloutSessionMeta.filter((metadata) => metadata.counterLineage === "unknown_nonzero_first").length === 1 &&
+      rolloutSessionMeta
+        .filter((metadata) => metadata.counterLineage !== "unknown_nonzero_first")
+        .every((metadata) => metadata.costEstimated === true),
     JSON.stringify({ events: firstScan.eventsAppended, ...rolloutSums }),
+  );
+  const lineageRow = rolloutSessionMeta.find((metadata) => metadata.counterLineage === "unknown_nonzero_first");
+  check(
+    "rollout_lineage_first_counter_preserved_raw",
+    Boolean(lineageRow) &&
+      lineageRow!.sourceCumulativeInput === 1000 &&
+      lineageRow!.sourceCumulativeCachedInput === 200 &&
+      lineageRow!.sourceCumulativeOutput === 50 &&
+      lineageRow!.sourceCumulativeReasoningOutput === 10 &&
+      lineageRow!.costEstimated === undefined &&
+      firstScan.tokensUnvalidated?.input === 1000 &&
+      firstScan.unvalidatedFirstRows === 1,
+    JSON.stringify({ tokensUnvalidated: firstScan.tokensUnvalidated, lineage: lineageRow }),
   );
   check(
     "rollout_repo_linkage_from_cwd",
@@ -1638,7 +1658,9 @@ async function main() {
     .get() as { n: number; input: number };
   check(
     "rollout_rescan_idempotent",
-    afterRescan.n === 2 && afterRescan.input === 3000 && rescan.sessionsSkippedOtlpCovered >= 1,
+    // 3000 = validated marginals only; the lineage-first counter (1000)
+    // stays excluded after a full stateless re-parse (issue #153).
+    afterRescan.n === 2 && afterRescan.input === 2000 && rescan.sessionsSkippedOtlpCovered >= 1,
     JSON.stringify({ rows: afterRescan.n, input: afterRescan.input }),
   );
   // Rate-table updates must heal existing rows: a model unpriced at ingest
@@ -1650,6 +1672,15 @@ async function main() {
     [
       rolloutLine("2026-06-10T12:00:00.000Z", "session_meta", { id: UNPRICED_SESSION, cwd: proofRepo.repoDir }),
       rolloutLine("2026-06-10T12:00:01.000Z", "turn_context", { turn_id: "t-u", model: "proof-unpriceable-model" }),
+      // An OBSERVED all-zero total legitimately anchors the baseline
+      // (issue #153): the later 800-token total is a validated marginal.
+      tokenCountLine("2026-06-10T12:00:05.000Z", {
+        input_tokens: 0,
+        cached_input_tokens: 0,
+        output_tokens: 0,
+        reasoning_output_tokens: 0,
+        total_tokens: 0,
+      }),
       tokenCountLine("2026-06-10T12:00:10.000Z", {
         input_tokens: 800,
         cached_input_tokens: 0,

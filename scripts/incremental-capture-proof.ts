@@ -131,7 +131,48 @@ async function proveRolloutTailing() {
   const second = await new RolloutTailer(buffer, path.join(tempDir, "rollouts"), () => []).scan({ scope: "full" });
   const suffixFromCommit = firstCompletionSize - firstCursor.committedOffset;
   assert.equal(second.eventsAppended, 1);
-  assert.equal(second.tokensAppended.input, 100);
+  // Issue #153: the lineage's FIRST cumulative total (100) cannot be
+  // attributed to observed marginals, so it is classified unvalidated —
+  // typed columns stay zero and the raw totals ride in metadata.
+  assert.equal(second.tokensAppended.input, 0);
+  assert.deepEqual(second.tokensUnvalidated, { input: 100, cachedInput: 20, output: 10 });
+  assert.equal(second.unvalidatedFirstRows, 1);
+  const firstRowMetadata = buffer.database
+    .prepare(
+      `select input_tokens as inputTokens, output_tokens as outputTokens,
+         cache_read_tokens as cacheReadTokens, payload_json as payloadJson
+       from buffered_events where event_type = 'usage_rollout' and session_id = ?`,
+    )
+    .get(ROLLOUT_SESSION) as {
+    inputTokens: number;
+    outputTokens: number;
+    cacheReadTokens: number;
+    payloadJson: string;
+  };
+  assert.deepEqual(
+    {
+      inputTokens: firstRowMetadata.inputTokens,
+      outputTokens: firstRowMetadata.outputTokens,
+      cacheReadTokens: firstRowMetadata.cacheReadTokens,
+      counterLineage: JSON.parse(firstRowMetadata.payloadJson).metadata.counterLineage,
+      sourceCumulativeInput: JSON.parse(firstRowMetadata.payloadJson).metadata.sourceCumulativeInput,
+      sourceCumulativeCachedInput:
+        JSON.parse(firstRowMetadata.payloadJson).metadata.sourceCumulativeCachedInput,
+      sourceCumulativeOutput: JSON.parse(firstRowMetadata.payloadJson).metadata.sourceCumulativeOutput,
+      costEstimated: JSON.parse(firstRowMetadata.payloadJson).metadata.costEstimated,
+    },
+    {
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadTokens: 0,
+      counterLineage: "unknown_nonzero_first",
+      sourceCumulativeInput: 100,
+      sourceCumulativeCachedInput: 20,
+      sourceCumulativeOutput: 10,
+      costEstimated: undefined,
+    },
+    "lineage-first counter must be preserved raw but excluded from validated tokens",
+  );
   assert.ok(
     second.bytesRead <= suffixFromCommit + firstCursor.headBytes + firstCursor.continuityBytes,
     `read ${second.bytesRead} bytes for ${suffixFromCommit}-byte suffix plus bounded probes`,
@@ -159,7 +200,7 @@ async function proveRolloutTailing() {
        from buffered_events where event_type = 'usage_rollout' and session_id = ?`,
     )
     .get(ROLLOUT_SESSION) as { events: number; inputTokens: number };
-  assert.deepEqual(rolloutTotals, { events: 2, inputTokens: 250 });
+  assert.deepEqual(rolloutTotals, { events: 2, inputTokens: 150 });
 
   // Persisted parser state is untrusted input. Empty objects, JSON null,
   // wrong field types, and an incompatible checkpoint version must all force
@@ -180,7 +221,7 @@ async function proveRolloutTailing() {
          from buffered_events where event_type = 'usage_rollout' and session_id = ?`,
       )
       .get(ROLLOUT_SESSION),
-    { events: 2, inputTokens: 250 },
+    { events: 2, inputTokens: 150 },
   );
 
   buffer.database
@@ -201,7 +242,9 @@ async function proveRolloutTailing() {
          from buffered_events where event_type = 'usage_rollout' and session_id = ?`,
       )
       .get(ROLLOUT_SESSION),
-    { events: 3, inputTokens: 400 },
+    // Rebuild replays deterministically: the lineage-first counter is
+    // classified unvalidated again (duplicate id), only true marginals add.
+    { events: 3, inputTokens: 300 },
   );
 
   buffer.database
@@ -871,7 +914,13 @@ async function proveDeferredRepoContextOccurrences() {
     ).all(sessionId) as Array<{ inputTokens: number; contextId: string | null }>;
     assert.equal(rolloutScan.slicesCommitted >= 2, true);
     assert.equal(rolloutRows.length, 4);
-    assert.ok(rolloutRows.every((row) => row.inputTokens === 10 && row.contextId));
+    // Issue #153: the lineage's first cumulative total (10) is classified
+    // unvalidated and contributes zero validated tokens; the later rows are
+    // true deltas of 10 each. Repo-occurrence linkage is unaffected.
+    assert.ok(
+      rolloutRows[0]!.inputTokens === 0 &&
+        rolloutRows.slice(1).every((row) => row.inputTokens === 10 && row.contextId),
+    );
     assert.equal(rolloutRows[0]!.contextId, rolloutRows[1]!.contextId);
     assert.notEqual(rolloutRows[1]!.contextId, rolloutRows[2]!.contextId);
     assert.notEqual(
