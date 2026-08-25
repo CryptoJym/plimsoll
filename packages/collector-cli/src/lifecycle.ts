@@ -39,6 +39,13 @@ export const LIFECYCLE_UNINSTALL_RETAINED_TARGETS = [
   "workspace_membership",
 ] as const satisfies readonly LifecycleRetainedTarget[];
 
+export type RuntimeArtifactFile = {
+  /** Bounded POSIX subpath under the immutable runtime directory. */
+  relativePath: string;
+  sha256: `sha256:${string}`;
+  sourcePath: string;
+};
+
 export type RuntimeArtifact = {
   version: string;
   platform: "darwin";
@@ -46,6 +53,12 @@ export type RuntimeArtifact = {
   nodeMajor: number;
   sha256: `sha256:${string}`;
   sourcePath: string;
+  /**
+   * Additional files staged beside the executable so the packaged runtime is
+   * self-contained (vendored native dependencies). Optional for backward
+   * compatibility with single-file artifacts.
+   */
+  files?: readonly RuntimeArtifactFile[];
 };
 
 export type LifecycleJournal = {
@@ -146,11 +159,30 @@ export function validateRuntimeArtifact(artifact: RuntimeArtifact) {
   }
   if (!path.isAbsolute(artifact.sourcePath)) throw new Error("artifact source must be absolute");
   if (!/^sha256:[a-f0-9]{64}$/.test(artifact.sha256)) throw new Error("artifact digest must be sha256");
+  const seen = new Set<string>();
+  for (const [index, file] of (artifact.files ?? []).entries()) {
+    const label = `artifact file ${index}`;
+    if (!path.isAbsolute(file.sourcePath)) throw new Error(`${label} source must be absolute`);
+    if (!/^sha256:[a-f0-9]{64}$/.test(file.sha256)) throw new Error(`${label} digest must be sha256`);
+    if (!/^[A-Za-z0-9._/-]+$/.test(file.relativePath) || file.relativePath.includes("..") ||
+        file.relativePath.startsWith("/") || file.relativePath.endsWith("/")) {
+      throw new Error(`${label} relative path is not bounded`);
+    }
+    const normalized = path.posix.normalize(file.relativePath);
+    if (normalized === "" || normalized === "." || normalized !== file.relativePath) {
+      throw new Error(`${label} relative path is not normalized`);
+    }
+    if (normalized === path.posix.join("bin", "plimsoll.mjs")) {
+      throw new Error(`${label} collides with the runtime executable`);
+    }
+    if (seen.has(normalized)) throw new Error(`${label} duplicates a previous relative path`);
+    seen.add(normalized);
+  }
 }
 
 export function immutableRuntimeRelativePath(artifact: RuntimeArtifact) {
   validateRuntimeArtifact(artifact);
-  return path.join("versions", artifact.version, `${artifact.platform}-${artifact.architecture}`, "bin", "plimsoll");
+  return path.join("versions", artifact.version, `${artifact.platform}-${artifact.architecture}`, "bin", "plimsoll.mjs");
 }
 
 function phaseAtLeast(phase: LifecyclePhase, expected: LifecyclePhase) {

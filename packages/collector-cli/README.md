@@ -29,12 +29,41 @@ through `not_installed`, `configured`, `service_ready`, and `signal_verified`;
 only the last state has a live matching collector identity plus a real
 token-bearing signal, returns `ok:true`, and exits 0.
 
-The repository's lifecycle transaction core now has isolated source proof for
-staged update, rollback, preview-default uninstall, separate exact-confirmation
-purge, and allowlisted support output. Those primitives are not yet exposed as
-a published CLI command. Do not infer package publication or live service
-activation from their presence; track
+The lifecycle commands below are real operator surfaces backed by the
+transaction core: staged update with automatic rollback, preview-default
+uninstall, separate exact-confirmation purge, and allowlisted support output —
+proven end to end against the packaged bundle (`pnpm proof:lifecycle-operator`).
+They never invoke `launchctl`; loading, unloading, and restart stay explicit
+operator steps. npm publication, release signing, and live-fleet rollout
+remain gated under
 [plimsoll#103](https://github.com/CryptoJym/plimsoll/issues/103).
+
+## Lifecycle
+
+```sh
+# Pin the currently running packaged bundle as the immutable runtime, repoint
+# the owned LaunchAgent manifest at it, verify durable readiness; any failure
+# restores the previous runtime, config, database, and manifest automatically.
+npx @plimsoll/cli@<version> lifecycle update --operation-id <id> --artifact self
+
+# Afterwards, restart the daemon on the new immutable runtime explicitly:
+npx @plimsoll/cli@<version> load-launch-agent
+
+# Preview (default) or apply removal of ONLY owned targets:
+npx @plimsoll/cli@<version> lifecycle uninstall --operation-id <id> [--apply]
+
+# Data deletion is a separate operation requiring the exact confirmation:
+npx -y @plimsoll/cli@<version> lifecycle purge --operation-id <id> \
+  --apply --confirm-exact "PURGE PLIMSOLL LOCAL DATA"
+
+# Sanitized, bounded diagnostics (versions, readiness, aggregate log codes):
+npx @plimsoll/cli@<version> lifecycle support-bundle --operation-id <id>
+```
+
+`lifecycle update --artifact self` refuses to run from a source checkout or a
+shell shim; it pins only a real packaged bundle. Every operation prints one
+JSON receipt naming exactly what it owns, what it retained, and what only a
+separate purge may remove.
 
 ## Commands
 
@@ -44,6 +73,9 @@ activation from their presence; track
 | `start` / `stop` | Run / stop the local hook + OTLP receiver |
 | `status` | Print local buffer and policy status |
 | `doctor --read-only --json` | Verify Node, collector/tool config, LaunchAgent, runtime identity, connectivity, and token signal without writing |
+| `install-launch-agent` / `load-launch-agent` | Write the user LaunchAgent plist / load an installed one |
+| `uninstall-launch-agent` / `unload-launch-agent` | Remove the plist / unload without removing |
+| `lifecycle update\|rollback\|uninstall\|purge\|support-bundle` | Transactional immutable-runtime updates with automatic rollback, preview-default uninstall, exact-confirmation purge, sanitized support bundle |
 | `scan-rollouts` | One-time full-history walk of Codex rollout files into the ledger |
 | `scan-transcripts` | One-time full-history walk of Claude Code transcripts into the ledger |
 | `label account HASH NAME` | Local-only display label for a hashed account |

@@ -407,7 +407,9 @@ async function main() {
         !fs.existsSync(happy.paths.collectorConfig) &&
         !fs.existsSync(happy.paths.database) &&
         !fs.existsSync(happy.paths.history[0]!) &&
-        fs.readdirSync(snapshotsRoot).length === 0,
+        // Purge removes the snapshot copies; the directory itself may be
+        // absent (receipt persistence no longer resurrects pruned roots).
+        (!fs.existsSync(snapshotsRoot) || fs.readdirSync(snapshotsRoot).length === 0),
       purged,
     );
   } finally {

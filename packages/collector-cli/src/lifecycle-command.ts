@@ -18,10 +18,13 @@ export async function runLifecycleCommand(input: {
   argv: readonly string[];
   adapter: LifecycleAdapter;
   resolveArtifact: LifecycleArtifactResolver;
+  readinessTimeoutMs?: number;
 }) {
   const [action] = input.argv;
   const operationId = option(input.argv, "--operation-id") ?? "";
-  const manager = new LifecycleManager(input.adapter);
+  const manager = new LifecycleManager(input.adapter, {
+    ...(input.readinessTimeoutMs !== undefined ? { readinessTimeoutMs: input.readinessTimeoutMs } : {}),
+  });
   if (action === "update" || action === "rollback") {
     const reference = option(input.argv, "--artifact");
     if (!reference) throw new Error(`${action} requires --artifact`);

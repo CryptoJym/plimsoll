@@ -104,6 +104,14 @@ import {
 } from "./maintenance-starvation";
 import { runMaintenanceWorkerService } from "./maintenance-worker";
 import { readLocalIdentities } from "./local-identity";
+import { runLifecycleCommand } from "./lifecycle-command";
+import {
+  composeLifecycleAdapter,
+  resolveArtifactFromBundle,
+  resolveSelfArtifact,
+} from "./lifecycle-adapters";
+import { PURGE_CONFIRMATION } from "./lifecycle";
+import { PLIMSOLL_VERSION } from "./version";
 import {
   applyClaudeSettings,
   applyCodexConfig,
@@ -202,6 +210,8 @@ Commands:
   load-launch-agent     Load an installed user LaunchAgent plist
   unload-launch-agent   Unload the user LaunchAgent without removing the plist
   uninstall-launch-agent Remove the user LaunchAgent plist
+  lifecycle             Transactional runtime update/rollback, preview-default
+                        uninstall/purge, and sanitized support bundle (see below)
   label account HASH NAME    Set a local-only display label for a hashed account
   priority add|remove URL    Manage the priority-repo list (hashed; URL kept locally)
   priority list              Show priority repos
@@ -254,6 +264,27 @@ Config tools:
   unload-launch-agent
   uninstall-launch-agent [--unload] [--dry-run]
   purge-local-data [--confirm] [--include-config]
+  lifecycle update --operation-id ID --artifact self|BUNDLE.mjs --artifact-version V [--readiness-timeout-ms MS]
+  lifecycle rollback --operation-id ID --artifact self|BUNDLE.mjs --artifact-version V
+      Stage the digest-verified bundle (plus its vendored native dependencies)
+      into the immutable versions/VERSION/darwin-ARCH runtime, repoint the owned
+      LaunchAgent manifest at it, verify durable readiness, and restore the
+      previous runtime/config/database/manifest on any failure. Never invokes
+      launchctl; run "load-launch-agent" afterwards to restart the daemon on
+      the new immutable runtime. "self" pins the currently running packaged
+      bundle (npx/source checkouts are refused).
+  lifecycle uninstall --operation-id ID [--apply]
+      Preview (default) or remove ONLY owned targets: service manifest,
+      runtime pointer and versions. Ledger, history, credentials, config, and
+      workspace membership are retained; purge-only data is never touched.
+  lifecycle purge --operation-id ID [--apply --confirm-exact "${PURGE_CONFIRMATION}"]
+      Preview (default) or delete collector config, workspace credentials,
+      ledger, history, and lifecycle snapshots. Requires both --apply and the
+      exact confirmation string. Leaving a workspace or revoking a device are
+      separate hosted operations and are NOT performed here.
+  lifecycle support-bundle --operation-id ID
+      Sanitized, bounded diagnostics: versions, coarse readiness, counters,
+      aggregate log codes. No paths, prompts, tokens, or secrets.
 `);
 }
 
@@ -1108,6 +1139,7 @@ async function main() {
     "load-launch-agent",
     "unload-launch-agent",
     "uninstall-launch-agent",
+    "lifecycle",
   ]);
   const configRead = noCreateConfigCommands.has(command) ? readCollectorConfig() : null;
   let strictSetupConfig: CollectorConfig | null = null;
@@ -1972,6 +2004,7 @@ async function main() {
         {
           ok,
           readiness,
+          version: PLIMSOLL_VERSION,
           readOnly: true,
           node,
           configPath,
@@ -2433,6 +2466,38 @@ async function main() {
     }
 
     throw new Error("Expected tool to be claude-code, codex, or all.");
+  }
+
+  if (command === "lifecycle") {
+    const action = process.argv[3] ?? "";
+    if (!["update", "rollback", "uninstall", "purge", "support-bundle"].includes(action)) {
+      throw new Error("Expected lifecycle update|rollback|uninstall|purge|support-bundle");
+    }
+    const resolveArtifact = async (reference: string) => {
+      if (reference === "self") return resolveSelfArtifact();
+      if (!path.isAbsolute(reference) || !fs.existsSync(reference)) {
+        throw new Error("--artifact must be `self` or an absolute path to a built plimsoll bundle");
+      }
+      const version = optionValue("--artifact-version");
+      if (!version) {
+        throw new Error("explicit --artifact paths require --artifact-version (the version to record)");
+      }
+      return resolveArtifactFromBundle({
+        bundlePath: fs.realpathSync(reference),
+        version,
+      });
+    };
+    const readinessTimeoutOption = Number(optionValue("--readiness-timeout-ms"));
+    const result = await runLifecycleCommand({
+      argv: [action, ...process.argv.slice(4)],
+      adapter: composeLifecycleAdapter(),
+      resolveArtifact,
+      ...(optionValue("--readiness-timeout-ms") !== undefined && Number.isFinite(readinessTimeoutOption)
+        ? { readinessTimeoutMs: readinessTimeoutOption }
+        : {}),
+    });
+    console.log(JSON.stringify(result, null, 2));
+    return;
   }
 
   if (command === "install-launch-agent") {
