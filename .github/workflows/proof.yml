@@ -93,6 +93,9 @@ jobs:
       - name: Prove capacity planning doctrine gates
         run: pnpm proof:capacity
 
+      - name: Prove matched-outcome capacity research guardrails
+        run: pnpm proof:capacity-research
+
       - name: Prove bounded learning evidence packets
         run: pnpm proof:learning-evidence
 
