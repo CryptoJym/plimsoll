@@ -45,9 +45,10 @@
  *    tooling, keyed to exact repo-relative PATHS (see ENFORCEMENT_TOOLING),
  *    never to a name pattern: the scanner does not police itself, and its
  *    proof legitimately imports and exercises capacity APIs because that is
- *    what enforcing the doctrine requires. Because the allowlist is a fixed
- *    two-path set, no decision surface can join it by renaming itself, and
- *    a file with the same basename in any other directory is still policed.
+ *    what enforcing the doctrine requires. The allowlist is a closed set of
+ *    exact paths (issue #174 adds the matched-outcome capacity research
+ *    guardrail proof), so no decision surface can join it by renaming itself,
+ *    and a file with the same basename in any other directory is still policed.
  */
 
 import fs from "node:fs";
@@ -92,13 +93,17 @@ const DECISION_MODULE_IMPORT_PATTERN =
  *
  * The key is an exact repo-relative PATH, never a name pattern. That is the
  * whole point: a `/capacity/i` basename exemption is the P3 bypass this issue
- * exists to close, so the allowlist is a closed two-element set that nothing
- * can join by renaming itself, and `packages/shared/src/capacity-proof.ts`
+ * exists to close, so the allowlist is a closed set of exact paths that
+ * nothing can join by renaming itself, and `packages/shared/src/capacity-proof.ts`
  * (same basename, different directory) is policed like any other file.
  */
 const ENFORCEMENT_TOOLING: ReadonlySet<string> = new Set([
   "scripts/capacity-dependency-reachability.ts",
   "scripts/capacity-proof.ts",
+  // Issue #174: the matched-outcome capacity research guardrail proof. It
+  // exercises the capacity research protocol APIs for the same reason the
+  // #173 proof exercises the planning APIs — enforcement requires handling.
+  "scripts/capacity-research-proof.ts",
 ]);
 
 function collectTypeScriptFiles(rootDir: string): string[] {
