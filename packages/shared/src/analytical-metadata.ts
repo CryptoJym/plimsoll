@@ -140,7 +140,6 @@ const GENERATED_ANALYTICAL_SCALARS = new Map<string, AnalyticalScalarKind>([
   ["otelHasException", "boolean"],
   ["repoStitched", "boolean"],
 ]);
-
 // OTLP semantic-convention keys use their documented lowercase spelling.
 // Camel-case entries below are explicit legacy producer aliases, not a
 // case-insensitive contract: only the literal map key receives admission.
@@ -164,6 +163,7 @@ const RECORD_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
   ["mcp_server", "component"],
   ["request_id", "identifier"],
   ["call_id", "identifier"],
+  ["plimsoll.retry_of", "identifier"],
   ["gen_ai.response.id", "identifier"],
   ["plimsoll.project", "linkage"],
   ["cfo_one.project", "linkage"],
@@ -213,6 +213,7 @@ const RESOURCE_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
 
 const GENERATED_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
   ["otelEventName", "signal"],
+  ["otelSpanEndAt", "timestamp"],
   ["gen_ai.system", "component"],
   ["serviceName", "component"],
   ["toolClassDetail", "component"],

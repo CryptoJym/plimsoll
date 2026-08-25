@@ -769,6 +769,7 @@ export const workEpisodeFactSchema = z
     sessionId: learningDimensionIdSchema,
     workClass: workClassSchema,
     complexityBand: workComplexityBandSchema,
+    parentEpisodeId: learningFactIdSchema.optional(),
     startedAt: timestampSchema,
     endedAt: timestampSchema.optional(),
     durationMs: z
@@ -805,6 +806,13 @@ export const workEpisodeFactSchema = z
         code: "custom",
         message: "Episode durationMs must be derived exactly from its timestamps.",
         path: ["durationMs"],
+      });
+    }
+    if (fact.parentEpisodeId === fact.episodeId) {
+      context.addIssue({
+        code: "custom",
+        message: "An episode cannot be its own parent.",
+        path: ["parentEpisodeId"],
       });
     }
   });

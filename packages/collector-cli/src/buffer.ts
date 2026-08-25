@@ -14,6 +14,7 @@ import { ensureCodexReconciliationSchema } from "./codex-reconciliation";
 import { DeliveryOutbox, type DeliveryLimits } from "./outbox";
 import { DashboardProjectionStore } from "./dashboard-projection";
 import { LearningFactStore, type LearningFactLimits } from "./learning-facts";
+import { promoteRuntimeLearningFacts } from "./runtime-facts";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import {
   canonicalRepoContextCwd,
@@ -2009,6 +2010,15 @@ export class LocalEventBuffer {
       // caller's SQLite transaction. Projection failure is contained as a
       // durable repair receipt so capture remains available.
       this.projection.tryApplyRawRow(Number(result.lastInsertRowid));
+      // Runtime learning facts (#156) promote from the same durable moment.
+      // The promoter is total (it records bounded drop receipts instead of
+      // throwing); the guard keeps fact promotion structurally unable to
+      // fail an event append even if that invariant regresses.
+      try {
+        promoteRuntimeLearningFacts(this, event);
+      } catch {
+        /* capture availability outranks learning-fact promotion */
+      }
       return {
         appended: true,
         repoContextRequest: resolvedRepoContext.exists ? null : repoContextRequest,

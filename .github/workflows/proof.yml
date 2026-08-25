@@ -93,6 +93,9 @@ jobs:
       - name: Prove paired attempts and explicit technique exposure
         run: pnpm proof:learning-facts
 
+      - name: Prove runtime capture promotes bounded learning facts
+        run: pnpm proof:runtime-facts
+
       - name: Run signal-fidelity proof
         run: pnpm proof
 

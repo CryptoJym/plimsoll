@@ -894,7 +894,8 @@ async function main() {
   const toolHookRows = rows
     .filter(
       (row) =>
-        row.payload.eventType === "tool_use" &&
+        // The hook fixtures are PostToolUse payloads: completion-phase events.
+        row.payload.eventType === "tool_result" &&
         row.source === "claude_code" &&
         row.payload.sessionId === SESSION &&
         toolHookObservedAt.has(row.payload.observedAt),

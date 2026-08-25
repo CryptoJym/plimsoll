@@ -5,5 +5,6 @@ export * from "./lifecycle";
 export * from "./lifecycle-command";
 export * from "./lifecycle-filesystem";
 export * from "./normalizer";
+export * from "./runtime-facts";
 export * from "./server";
 export * from "./version";
