@@ -1,30 +1,36 @@
 # Local lifecycle transaction contract
 
-Status: **source-validated primitive; not a published installer or live fleet
-rollout**. GitHub issue #103 remains open.
+Status: **operator command shipped in the packaged CLI; npm publication,
+release signing, and live-fleet rollout remain open under GitHub issue #103.**
 
 The lifecycle core is a transaction coordinator for the canonical packaged
 Mac installer. It deliberately has no filesystem, process, service-manager,
-network, registry, or credential access. The installer supplies explicit
-filesystem, SQLite-backup, service, health, and artifact adapters.
+network, registry, or credential access of its own; the installed
+`plimsoll` command supplies real filesystem, SQLite-online-backup, and
+LaunchAgent-manifest adapters (`src/lifecycle-adapters.ts`).
 
-## Update and rollback
+## Operator commands
 
-`runLifecycleCommand` accepts these exact operations at the injected command
-boundary:
+The packaged CLI exposes exactly these operations:
 
 ```text
-update --operation-id ID --artifact REF
-rollback --operation-id ID --artifact REF
-uninstall --operation-id ID [--apply]
-purge --operation-id ID [--apply --confirm-exact "PURGE PLIMSOLL LOCAL DATA"]
-support-bundle --operation-id ID
+plimsoll lifecycle update   --operation-id ID --artifact self|BUNDLE.mjs [--artifact-version V] [--readiness-timeout-ms MS]
+plimsoll lifecycle rollback --operation-id ID --artifact self|BUNDLE.mjs [--artifact-version V]
+plimsoll lifecycle uninstall --operation-id ID [--apply]
+plimsoll lifecycle purge     --operation-id ID [--apply --confirm-exact "PURGE PLIMSOLL LOCAL DATA"]
+plimsoll lifecycle support-bundle --operation-id ID
 ```
 
-This is not yet exposed as the installed `plimsoll lifecycle` command. The
-package/release adapter, release signing, trusted npm publication, and real-Mac
-service integration remain work under #103. Until those gates land, these are
-source APIs and isolated proof fixtures, not operator instructions.
+`--artifact self` pins the currently running packaged bundle (a source
+checkout or shell shim is refused). The resolver stages the bundle plus its
+vendored native dependency closure (`better-sqlite3`, `bindings`,
+`file-uri-to-path`) into a digest-verified artifact, so the immutable runtime
+executes without the original `node_modules`. Explicit artifact paths are
+absolute built bundles and require `--artifact-version`.
+
+Every operation prints one JSON receipt plus a boundary statement. Update and
+rollback never invoke `launchctl`: they publish the desired manifest and the
+operator restarts explicitly with `plimsoll load-launch-agent`.
 
 An update or rollback:
 
@@ -33,7 +39,8 @@ An update or rollback:
 3. snapshots compatible config, the database through an injected online
    backup adapter, and the owned service manifest;
 4. copies a digest-verified artifact to an immutable absolute
-   `versions/VERSION/darwin-ARCH/bin/plimsoll` path;
+   `versions/VERSION/darwin-ARCH/bin/plimsoll.mjs` path, together with its
+   vendored companion files (each digest-verified);
 5. asks the injected service adapter to activate that exact executable and
    atomically moves the convenience `current` pointer;
 6. accepts success only when runtime version, service, config compatibility,
@@ -53,8 +60,11 @@ not be reused.
 ## Uninstall, purge, leave, and revoke
 
 Uninstall is a preview unless `--apply` is explicit. Apply removes the owned
-service manifest, exact tool-config fragments, runtime pointer, and versioned
-runtimes. It preserves the collector config, workspace credentials, ledger,
+service manifest, runtime pointer, and versioned runtimes. (Surgical removal
+of embedded tool-config fragments is not wired yet: the real adapter reports
+`tool_config_fragments` as owned but owns no fragment files until the
+config-removal lane lands, and receipts say exactly that.) It preserves the
+collector config, workspace credentials, ledger,
 history, lifecycle snapshots, and workspace membership. Both preview and apply
 receipts expose those under typed `retainedTargets`; `lifecycle_snapshots`
 never appears in uninstall `ownedTargets`. The same receipts classify the
@@ -89,17 +99,31 @@ transitions and categories, never paths or secret values.
 
 ## Isolated proof
 
-Run on the repository's supported Node 22 environment:
+Two gates run on the repository's supported Node 22 environment:
 
 ```sh
-pnpm proof:lifecycle
+pnpm proof:lifecycle            # transaction primitives with injected adapters
+pnpm proof:lifecycle-operator   # real adapter composition + packaged CLI end to end
 ```
 
-The proof uses a fresh temporary ownership root and injected service/database
-adapters. It covers arm64/x64 metadata, supported and unsupported Node majors,
-permissions, health and disk-full rollback, interruption/reopen, lock races,
-completed-ID reuse, failed-restore recovery, readiness cancellation/deadline,
-malformed state, lifecycle/snapshot ancestor and leaf symlink swaps,
-preview/apply/purge snapshot deletion, and support-bundle privacy. It never
-invokes `launchctl`, a browser, a provider, the npm registry, or an installed
-Plimsoll service and never reads the operator's config or ledger.
+The primitive proof uses a fresh temporary ownership root and injected
+service/database adapters. It covers arm64/x64 metadata, supported and
+unsupported Node majors, permissions, health and disk-full rollback,
+interruption/reopen, lock races, completed-ID reuse, failed-restore recovery,
+readiness cancellation/deadline, malformed state, lifecycle/snapshot ancestor
+and leaf symlink swaps, preview/apply/purge snapshot deletion, and
+support-bundle privacy.
+
+The operator proof builds the actual packaged bundle and drives it through
+temporary sandbox homes: self-pin enrollment through the real CLI process,
+immutable-runtime execution of the staged copy (the daemon's exact entry
+point), manifest decisions that never reference dist/npx-cache/repo paths,
+production durable-readiness including automatic rollback when the collector
+config is incompatible, live-ledger online backup across an upgrade,
+interruption/reopen, lock races, completed-ID reuse, companion-digest tamper,
+architecture-directory symlink swaps, preview/apply uninstall and purge
+separation, support-bundle sanitization, truthful blank-sandbox doctor with
+the shared version source, and a stub `launchctl` asserting zero service-
+manager invocations. Neither proof touches a browser, a provider, the npm
+registry, or an installed Plimsoll service; the operator proof reads only its
+own sandbox config and ledger.

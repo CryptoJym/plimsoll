@@ -77,12 +77,27 @@ and exit 0. A cold ledger therefore fails honestly until a real token-bearing
 Claude Code or Codex event reaches the collector. Background LaunchAgent mode
 for npm installs is still being fitted — until then `start` runs in a terminal.
 
-The source tree also contains the adapter-driven update/rollback/uninstall and
-sanitized support-bundle transaction primitive described in
-[docs/local-lifecycle.md](docs/local-lifecycle.md). It is isolated-proofed but
-is **not yet a published `plimsoll lifecycle` command or an authorized live
-rollout**; release signing, npm publication, and real-Mac service integration
-remain under [#103](https://github.com/CryptoJym/plimsoll/issues/103).
+The packaged CLI also ships transactional lifecycle commands backed by an
+immutable, version-pinned runtime
+([docs/local-lifecycle.md](docs/local-lifecycle.md)):
+
+```bash
+# Pin the running packaged bundle as the immutable runtime and repoint the
+# owned LaunchAgent manifest at it; any readiness failure restores the
+# previous runtime, config, database, and manifest automatically.
+npx -y @plimsoll/cli@<version> lifecycle update --operation-id <id> --artifact self
+
+# Restart the daemon on the new immutable runtime (explicit, never automatic):
+npx -y @plimsoll/cli@<version> load-launch-agent
+
+# Preview-default uninstall of ONLY owned targets; data purge is a separate,
+# exact-confirmation operation. Support bundles are sanitized and bounded.
+```
+
+These commands never invoke `launchctl`, never run from a source checkout via
+`self`, and print one JSON receipt each. Release signing, npm publication,
+and live-fleet rollout remain gated under
+[#103](https://github.com/CryptoJym/plimsoll/issues/103).
 
 **Contributors / running from source** (adds pnpm + git):
 

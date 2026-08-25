@@ -351,35 +351,80 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     assertAbsoluteOwnedPath(artifact.sourcePath, this.paths.artifactSourceRoot, "artifact source");
     assertNoSymlink(artifact.sourcePath, this.paths.artifactSourceRoot);
     if (sha256(artifact.sourcePath) !== artifact.sha256) throw new Error("artifact digest mismatch");
+    const runtimeDirectory = path.join(
+      this.root,
+      "versions",
+      artifact.version,
+      `${artifact.platform}-${artifact.architecture}`,
+    );
     const target = path.join(this.root, immutableRuntimeRelativePath(artifact));
-    assertNoSymlink(path.dirname(target), this.root);
-    ensureDirectory(path.dirname(target), this.root);
-    if (fs.existsSync(target)) {
-      const stat = fs.lstatSync(target);
-      if (!stat.isFile() || stat.isSymbolicLink() || sha256(target) !== artifact.sha256) {
-        throw new Error("immutable runtime target already differs");
-      }
-      fs.chmodSync(target, EXECUTABLE_MODE);
-      return;
-    }
-    const staging = `${target}.staging`;
-    fs.rmSync(staging, { force: true });
+    const stagedCompanions: Array<{ destination: string }> = [];
     try {
-      copyRegularFile(artifact.sourcePath, staging, EXECUTABLE_MODE, this.root);
-      if (sha256(staging) !== artifact.sha256) throw new Error("staged artifact digest mismatch");
-      fs.renameSync(staging, target);
-    } catch (error) {
+      for (const [index, file] of (artifact.files ?? []).entries()) {
+        const destination = path.join(runtimeDirectory, ...file.relativePath.split("/"));
+        assertAbsoluteOwnedPath(destination, this.root, `companion ${index} destination`);
+        assertNoSymlink(path.dirname(destination), this.root);
+        ensureDirectory(path.dirname(destination), this.root);
+        if (fs.existsSync(destination)) {
+          fs.rmSync(destination, { force: true });
+        }
+        // Companion sources live in the artifact staging area next to the
+        // bundle; their absolute paths were validated when resolved.
+        assertAbsoluteOwnedPath(file.sourcePath, this.paths.artifactSourceRoot, `companion ${index} source`);
+        assertNoSymlink(file.sourcePath, this.paths.artifactSourceRoot);
+        copyRegularFile(file.sourcePath, destination, FILE_MODE, this.root);
+        if (sha256(destination) !== file.sha256) throw new Error(`companion ${index} digest mismatch`);
+        stagedCompanions.push({ destination });
+      }
+      assertNoSymlink(path.dirname(target), this.root);
+      ensureDirectory(path.dirname(target), this.root);
+      if (fs.existsSync(target)) {
+        const stat = fs.lstatSync(target);
+        if (!stat.isFile() || stat.isSymbolicLink() || sha256(target) !== artifact.sha256) {
+          throw new Error("immutable runtime target already differs");
+        }
+        fs.chmodSync(target, EXECUTABLE_MODE);
+        return;
+      }
+      const staging = `${target}.staging`;
       fs.rmSync(staging, { force: true });
+      try {
+        copyRegularFile(artifact.sourcePath, staging, EXECUTABLE_MODE, this.root);
+        if (sha256(staging) !== artifact.sha256) throw new Error("staged artifact digest mismatch");
+        fs.renameSync(staging, target);
+      } catch (error) {
+        fs.rmSync(staging, { force: true });
+        throw error;
+      }
+    } catch (error) {
+      for (const staged of stagedCompanions.reverse()) {
+        fs.rmSync(staged.destination, { force: true });
+      }
       throw error;
     }
   }
 
-  async switchTo(artifact: RuntimeArtifact) {
+  private verifyStagedRuntime(artifact: RuntimeArtifact) {
     const executablePath = path.join(this.root, immutableRuntimeRelativePath(artifact));
     const stat = fs.lstatSync(executablePath);
     if (!stat.isFile() || stat.isSymbolicLink() || sha256(executablePath) !== artifact.sha256) {
       throw new Error("staged runtime is not immutable or does not match");
     }
+    // Companion relative paths are rooted at the architecture directory.
+    const runtimeDirectory = path.dirname(path.dirname(executablePath));
+    for (const [index, file] of (artifact.files ?? []).entries()) {
+      const companion = path.join(runtimeDirectory, ...file.relativePath.split("/"));
+      assertNoSymlink(companion, this.root);
+      const companionStat = fs.lstatSync(companion);
+      if (!companionStat.isFile() || companionStat.isSymbolicLink() || sha256(companion) !== file.sha256) {
+        throw new Error(`staged companion ${index} is not immutable or does not match`);
+      }
+    }
+    return executablePath;
+  }
+
+  async switchTo(artifact: RuntimeArtifact) {
+    const executablePath = this.verifyStagedRuntime(artifact);
     await this.service.activate({ executablePath, version: artifact.version });
     const targetDirectory = path.dirname(path.dirname(executablePath));
     const temporary = `${this.currentPath}.next`;
@@ -463,7 +508,11 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
   }
 
   async persistReceipt(receipt: LifecycleReceipt) {
-    this.initialize();
+    // Receipt persistence must not resurrect directories that destructive
+    // operations just removed (versions/, snapshots/), so only the receipt
+    // roots are ensured here.
+    ensureDirectory(this.receiptsRoot, this.root);
+    ensureDirectory(this.completedRoot, this.root);
     if (receipt.status !== "rollback_required") {
       // The durable, unbounded marker is the operation-ID authority. Commit
       // it before the bounded display receipt so a stop between the two can

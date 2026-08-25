@@ -1055,6 +1055,36 @@ export function inspectLaunchAgentManifest(options: { homeDir?: string } = {}) {
   }
 }
 
+/**
+ * Read-only inspection of an owned manifest's executable decision. Returns
+ * exactly what launchd would exec, so lifecycle adapters can verify a
+ * manifest points at the intended immutable runtime without invoking
+ * launchctl. Missing or unowned manifests fail with LaunchAgent codes.
+ */
+export function readLaunchAgentProgramArguments(options: { homeDir?: string } = {}): {
+  plistPath: string;
+  programArguments: readonly string[];
+  workingDirectory: string;
+  manifestDigest: string;
+} {
+  const homeDir = ensureHomeRoot(options.homeDir ?? os.homedir());
+  const plistPath = launchAgentPlistPath(homeDir);
+  const preimage = readPreimage(plistPath);
+  try {
+    if (!preimage.content) fail("PLIST_MISSING");
+    const plist = validateOwnedManifest(preimage.content.toString("utf8"));
+    assertStablePath(preimage.snapshot);
+    return {
+      plistPath,
+      programArguments: strings(plist.ProgramArguments, "PLIST_ARGUMENTS_INVALID"),
+      workingDirectory: plist.WorkingDirectory as string,
+      manifestDigest: digest(preimage.content),
+    };
+  } finally {
+    if (preimage.descriptor !== undefined) fs.closeSync(preimage.descriptor);
+  }
+}
+
 export function uninstallLaunchAgent(options: {
   homeDir?: string;
   label?: string;
