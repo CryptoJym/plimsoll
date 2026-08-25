@@ -48,6 +48,24 @@
  *    what enforcing the doctrine requires. Because the allowlist is a fixed
  *    two-path set, no decision surface can join it by renaming itself, and
  *    a file with the same basename in any other directory is still policed.
+ *
+ * 8. (#170 sanctioned wiring surfaces) Issue #170 orders capacity INTO the
+ *    local product surfaces (ledger store, CLI commands, doctor, dashboard
+ *    endpoint). Wiring requires naming capacity symbols somewhere in product
+ *    code, which Tier 0 would condemn in any file. The sanctioned set below
+ *    is a CLOSED, exact-path allowlist of the three files that carry that
+ *    wiring — the rail store itself, the ledger that hosts its tables, and
+ *    the CLI entry point that dispatches its commands. Rules:
+ *      - Path-keyed like ENFORCEMENT_TOOLING: a byte-identical copy at any
+ *        other path offends normally (proven by falsification fixtures).
+ *      - Exemption is OFFENSE-LEVEL ONLY. Sanctioned files stay scanned,
+ *        stay direct consumers in the graph, and (for the capacity-named
+ *        rail module) stay providers of their own doctrine symbols.
+ *      - Transitive protection is intact everywhere it matters: any file
+ *        OUTSIDE the set that consumes capacity — including every decision
+ *        surface, directly OR through the sanctioned files — still turns
+ *        red. What is NOT protected is adding new capacity-consuming code
+ *        inside those three exact files; reviewers must eyeball them.
  */
 
 import fs from "node:fs";
@@ -63,6 +81,8 @@ export type CapacityReachabilityReport = {
   capacityModules: string[];
   filesReachingCapacity: string[];
   offendingImporters: CapacityReachabilityOffense[];
+  /** Issue #170: the closed exact-path wiring allowlist, echoed for receipts. */
+  sanctionedCapacitySurfaces: string[];
 };
 
 /** Decision-surface signal in a FILE NAME (kept from the original gate). */
@@ -101,6 +121,19 @@ const ENFORCEMENT_TOOLING: ReadonlySet<string> = new Set([
   "scripts/capacity-proof.ts",
   "scripts/provider-capacity-sync-proof.ts",
   "scripts/provider-capacity-adapters-proof.ts",
+  "scripts/capacity-rail-proof.ts",
+]);
+
+/**
+ * Issue #170 sanctioned wiring surfaces — the CLOSED exact-path set of files
+ * allowed to carry capacity into the local product (see rule 8 above). A
+ * decision surface can never join this set by renaming; it would have to BE
+ * one of these three paths.
+ */
+export const SANCTIONED_CAPACITY_SURFACES: ReadonlySet<string> = new Set([
+  "packages/collector-cli/src/capacity-rail.ts",
+  "packages/collector-cli/src/buffer.ts",
+  "packages/collector-cli/src/cli.ts",
 ]);
 
 function collectTypeScriptFiles(rootDir: string): string[] {
@@ -176,6 +209,10 @@ export function scanCapacityDoctrine(rootDir: string): CapacityReachabilityRepor
   /** Exact repo-relative path match against the enforcement-tooling allowlist. */
   const isEnforcementTooling = (file: string): boolean =>
     ENFORCEMENT_TOOLING.has(path.relative(rootDir, file).split(path.sep).join("/"));
+
+  /** Exact repo-relative path match against the #170 wiring allowlist. */
+  const isSanctionedCapacitySurface = (file: string): boolean =>
+    SANCTIONED_CAPACITY_SURFACES.has(path.relative(rootDir, file).split(path.sep).join("/"));
 
   // PROVIDER role: capacity-named files supply the doctrine symbol set. The
   // gate's own tooling is excluded — `scanCapacityDoctrine` and the report
@@ -386,7 +423,11 @@ export function scanCapacityDoctrine(rootDir: string): CapacityReachabilityRepor
     // P3 bypass this issue closes. A capacity-named file that is not this
     // gate's own tooling offends on exactly the same terms as any other file,
     // decision surface or not.
-    if (isEnforcementTooling(file)) continue;
+    //
+    // Issue #170: the closed sanctioned-wiring set gets the same path-keyed,
+    // offense-level-only treatment (see rule 8). Everything outside those
+    // exact paths — decision surfaces above all — is policed unchanged.
+    if (isEnforcementTooling(file) || isSanctionedCapacitySurface(file)) continue;
 
     const reasons: string[] = [];
     if (isDecisionSurface) {
@@ -419,5 +460,6 @@ export function scanCapacityDoctrine(rootDir: string): CapacityReachabilityRepor
     capacityModules: [...capacityModules].sort(),
     filesReachingCapacity: filesReachingCapacity.sort(),
     offendingImporters,
+    sanctionedCapacitySurfaces: [...SANCTIONED_CAPACITY_SURFACES].sort(),
   };
 }

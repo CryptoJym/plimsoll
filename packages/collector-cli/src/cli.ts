@@ -56,6 +56,7 @@ import {
   assertCollectorPrivacyMode,
   collectorHome,
   collectorBufferPath,
+  collectorCapacitySurfacePath,
   collectorConfigPath,
   collectorLogPath,
   collectorPrivacyReadiness,
@@ -188,6 +189,13 @@ function printHelp() {
 Commands:
   start                 Start the local hook/OTLP receiver in the foreground
   status                Print local buffer and policy status
+  capacity status       Print the compact local Capacity Rail projection (no provider calls)
+  capacity refresh --input FILE
+                        Manual refresh: apply a bounded plimsoll.capacity-provider-facts.v1
+                        document; failures preserve the last coherent state and are marked
+                        honestly. No background cadence exists.
+  capacity forget-profile --profile ID
+                        Remove a profile: latest rows drop now, history ages out per policy
   join TOKEN|URL        Join a hosted workspace: redeem the admin's single-use
                         token, write sync credentials, verify with a handshake
                         (use --reassign for an explicit workspace change)
@@ -316,6 +324,89 @@ Config tools:
       Sanitized, bounded diagnostics: versions, coarse readiness, counters,
       aggregate log codes. No paths, prompts, tokens, or secrets.
 `);
+}
+
+/**
+ * Payload-free quarantined-history counts for read-only surfaces (doctor).
+ * Opens the ledger strictly readonly and never reads event bodies.
+ * Quarantined = rows withheld from the CURRENT workspace: bound to a
+ * different workspace (production pre-join capture binds LOCAL) or
+ * unassigned. Before any binding exists, only unassigned rows count —
+ * mirroring LocalEventBuffer.enrollmentStatus (#163 rework).
+ */
+function readonlyQuarantinedHistoryRows(bufferPath: string): number | null {
+  if (!fs.existsSync(bufferPath)) return null;
+  let database: Database.Database | null = null;
+  try {
+    database = new Database(bufferPath, { readonly: true, fileMustExist: true });
+    const hasTable = (name: string) =>
+      Boolean(
+        database?.prepare(
+          `select 1 from sqlite_master where type = 'table' and name = ?`,
+        ).get(name),
+      );
+    if (!hasTable("buffered_events") || !hasTable("upload_outbox")) return 0;
+    let currentWorkspaceId: string | undefined;
+    if (hasTable("collector_workspace_binding")) {
+      const binding = database
+        .prepare(
+          `select current_workspace_id as currentWorkspaceId
+           from collector_workspace_binding where singleton = 1`,
+        )
+        .get() as { currentWorkspaceId: string } | undefined;
+      currentWorkspaceId = binding?.currentWorkspaceId;
+    }
+    const predicate = currentWorkspaceId === undefined
+      ? "workspace_id is null"
+      : "(workspace_id is null or workspace_id <> ?)";
+    const params = currentWorkspaceId === undefined ? [] : [currentWorkspaceId];
+    const count = (sql: string) =>
+      (database?.prepare(`select count(*) as n from ${sql}`).get(...params) as { n: number }).n;
+    return (
+      count(`buffered_events where ${predicate}`) +
+      count(`upload_outbox where ${predicate}`)
+    );
+  } catch {
+    return null;
+  } finally {
+    database?.close();
+  }
+}
+
+/**
+ * Capacity fields for `doctor --read-only --json` (issue #170). Reads ONLY
+ * the cached status surface file written by the rail — zero provider calls
+ * and zero SQLite opens on this path; absence is reported honestly.
+ */
+function readCapacityDoctorSurface(bufferPath: string): {
+  cachePath: string;
+  cacheStatus: "absent" | "unreadable" | "available";
+  surface: unknown;
+} {
+  const cachePath = collectorCapacitySurfacePath(bufferPath);
+  let stat: fs.Stats | null = null;
+  try {
+    stat = fs.statSync(cachePath);
+  } catch (error) {
+    return {
+      cachePath,
+      cacheStatus: (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "unreadable",
+      surface: null,
+    };
+  }
+  if (!stat.isFile() || stat.size > 256 * 1024) {
+    return { cachePath, cacheStatus: "unreadable", surface: null };
+  }
+  try {
+    const parsed: unknown = JSON.parse(fs.readFileSync(cachePath, "utf8"));
+    const schema = (parsed as { schema?: unknown } | null)?.schema;
+    if (schema !== "plimsoll.capacity-rail.v1") {
+      return { cachePath, cacheStatus: "unreadable", surface: null };
+    }
+    return { cachePath, cacheStatus: "available", surface: parsed };
+  } catch {
+    return { cachePath, cacheStatus: "unreadable", surface: null };
+  }
 }
 
 function openBuffer(
@@ -2276,6 +2367,89 @@ async function main() {
     return;
   }
 
+  if (command === "capacity") {
+    // Issue #170: local Capacity Rail surfaces. Manual refresh only — these
+    // commands never call a provider on their own; the owner applies a
+    // bounded provider-facts document by hand.
+    const subcommand = process.argv[3] ?? "help";
+    if (subcommand === "status") {
+      const buffer = openBuffer(config);
+      const status = buffer.capacityRail.railProjection();
+      const surfacePath = collectorCapacitySurfacePath(collectorBufferPath());
+      console.log(JSON.stringify({ ...status, surfacePath }, null, 2));
+      buffer.capacityRail.writeStatusSurface(status);
+      buffer.close();
+      return;
+    }
+    if (subcommand === "refresh") {
+      const inputPath = optionValue("--input");
+      if (!inputPath) {
+        console.error(JSON.stringify({
+          status: "error",
+          errorKind: "missing_input",
+          message:
+            "manual refresh requires --input FILE containing a " +
+            "plimsoll.capacity-provider-facts.v1 document; the rail never calls providers itself",
+        }));
+        process.exitCode = 1;
+        return;
+      }
+      let raw: string;
+      try {
+        raw = fs.readFileSync(inputPath, "utf8");
+      } catch (error) {
+        console.error(JSON.stringify({
+          status: "error",
+          errorKind: "input_unreadable",
+          message: error instanceof Error ? error.message : String(error),
+        }));
+        process.exitCode = 1;
+        return;
+      }
+      const buffer = openBuffer(config);
+      try {
+        const receipt = buffer.capacityRail.applyProviderFacts(raw);
+        const status = buffer.capacityRail.railProjection();
+        buffer.capacityRail.writeStatusSurface(status);
+        console.log(JSON.stringify(receipt, null, 2));
+      } catch (error) {
+        // The store already recorded the honest FAILED probe receipt and
+        // preserved the previous coherent state; report and fail the run.
+        console.error(JSON.stringify({
+          status: "error",
+          errorKind: (error as { errorKind?: string }).errorKind ?? "apply_failed",
+          message: error instanceof Error ? error.message : String(error),
+        }));
+        process.exitCode = 1;
+      } finally {
+        buffer.close();
+      }
+      return;
+    }
+    if (subcommand === "forget-profile") {
+      const profileId = optionValue("--profile");
+      const buffer = openBuffer(config);
+      try {
+        const receipt = buffer.capacityRail.forgetProfile(profileId ?? null);
+        buffer.capacityRail.writeStatusSurface();
+        console.log(JSON.stringify({ status: "profile_removed", ...receipt }, null, 2));
+      } catch (error) {
+        console.error(JSON.stringify({
+          status: "error",
+          errorKind: "invalid_identity",
+          message: error instanceof Error ? error.message : String(error),
+        }));
+        process.exitCode = 1;
+      } finally {
+        buffer.close();
+      }
+      return;
+    }
+    console.log(`usage: plimsoll capacity <status|refresh --input FILE|forget-profile --profile ID>`);
+    process.exitCode = subcommand === "help" ? 0 : 1;
+    return;
+  }
+
   if (command === "drain-projections") {
     // Explicit recovery for a stalled projection backlog (issue #177). The
     // background cadence gives the drain only post-capture budget scraps
@@ -2477,6 +2651,12 @@ async function main() {
             managed: Boolean(config.uploadUrl),
             inspection: connectivity.enrollment ? "complete" : "not_inspected",
             quarantinedHistoryRows: connectivity.enrollment?.quarantinedHistoryRows ?? null,
+          },
+          capacity: {
+            // Issue #170: sourced only from the cached status surface file —
+            // no provider call, no SQLite open on this path.
+            ...readCapacityDoctorSurface(bufferPath),
+            refreshMode: "manual_only_no_background_cadence" as const,
           },
           sqlite: {
             exists: fs.existsSync(bufferPath),

@@ -80,6 +80,7 @@
     "proof:release-qualification": "tsx scripts/release-qualification-proof.ts",
     "proof:privacy-spec": "tsx scripts/privacy-spec-proof.ts",
     "docs:privacy": "tsx scripts/privacy-spec.ts",
+    "proof:capacity-rail": "tsx scripts/capacity-rail-proof.ts",
     "backfill:outcome-performance": "tsx packages/collector-cli/src/cli.ts backfill-outcome-performance",
     "weekly:performance": "tsx packages/collector-cli/src/cli.ts weekly-performance-rollup",
     "report": "tsx scripts/efficiency-report.ts",

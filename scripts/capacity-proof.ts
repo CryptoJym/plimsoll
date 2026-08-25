@@ -810,6 +810,131 @@ function prove(name: string, condition: unknown, detail: Record<string, unknown>
     }
   }
 
+    // ---------------------------------------------------------------------
+    // Issue #170 SANCTIONED WIRING rule. The closed exact-path allowlist
+    // (SANCTIONED_CAPACITY_SURFACES) carries capacity into the product.
+    // Pinned from both sides:
+    //   (a) path-keyed — a wiring-shaped consumer at any other path is RED;
+    //   (b) decision surfaces OUTSIDE the set still turn RED when they
+    //       consume capacity, even THROUGH a sanctioned surface file;
+    //   (c) sanctioned non-capacity-named files are NOT symbol providers;
+    //   (d) the real repo scan echoes the exact sanctioned set.
+    // ---------------------------------------------------------------------
+    {
+      const sandboxWire = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-capacity-p170-wire-"));
+      try {
+        const cliSrc = path.join(sandboxWire, "packages/collector-cli/src");
+        const sharedSrc = path.join(sandboxWire, "packages/shared/src");
+        fs.mkdirSync(cliSrc, { recursive: true });
+        fs.mkdirSync(sharedSrc, { recursive: true });
+        fs.writeFileSync(
+          path.join(sharedSrc, "capacity.ts"),
+          [
+            "export const CAPACITY_PLAN_SCHEMA = \"plimsoll.capacity-plan.v1\" as const;",
+            "export function buildCapacityPlan(): string { return CAPACITY_PLAN_SCHEMA; }",
+            "",
+          ].join("\n"),
+        );
+        // The sanctioned rail module at its EXACT allowed path: exempt from
+        // offense reporting and a legitimate provider of its own symbols.
+        fs.writeFileSync(
+          path.join(cliSrc, "capacity-rail.ts"),
+          [
+            'import { buildCapacityPlan } from "../../shared/src/index";',
+            "",
+            exportFn("buildCapacityRailStatus", `string { return buildCapacityPlan(); }`),
+            "",
+          ].join("\n"),
+        );
+        // (a) The SAME wiring shape at a DIFFERENT path: must stay RED. A
+        // copy cannot join the allowlist by location or by name.
+        fs.writeFileSync(
+          path.join(cliSrc, "capacity-rail-copy.ts"),
+          [
+            'import { buildCapacityPlan } from "../../shared/src/index";',
+            "",
+            exportFn("buildCapacityRailStatusCopy", `string { return buildCapacityPlan(); }`),
+            "",
+          ].join("\n"),
+        );
+        // A sanctioned-path LEDGER host consuming the rail: exempt.
+        fs.writeFileSync(
+          path.join(cliSrc, "buffer.ts"),
+          [
+            'import { buildCapacityRailStatus } from "./capacity-rail";',
+            "",
+            exportFn("attachRailToLedger", `string { return buildCapacityRailStatus(); }`),
+            "",
+          ].join("\n"),
+        );
+        // (b) A decision surface OUTSIDE the set that consumes capacity only
+        // THROUGH the sanctioned ledger file: still RED via propagation.
+        fs.writeFileSync(
+          path.join(cliSrc, "task-dispatcher.ts"),
+          [
+            'import { attachRailToLedger } from "./buffer";',
+            "",
+            exportFn("routeTaskPlacement", `string { return attachRailToLedger(); }`),
+            "",
+          ].join("\n"),
+        );
+        // (c) A bystander reaching capacity modules without consuming any
+        // capacity symbol stays GREEN (reachability alone does not condemn).
+        fs.writeFileSync(path.join(sharedSrc, "index.ts"), 'export * from "./capacity";\n');
+        fs.writeFileSync(
+          path.join(cliSrc, "innocent-bystander.ts"),
+          "export function harmlessEcho(): number { return 1; }\n",
+        );
+        const bypass = scanCapacityDoctrine(sandboxWire);
+        const offenderPaths = bypass.offendingImporters.map((offense) => offense.file);
+        prove(
+          "falsification_p170_wiring_copy_outside_sanctioned_paths_turns_red",
+          offenderPaths.some((file) => file.endsWith("capacity-rail-copy.ts")),
+          { offenders: bypass.offendingImporters },
+        );
+        prove(
+          "falsification_p170_decision_surface_through_sanctioned_surface_turns_red",
+          offenderPaths.some((file) =>
+            file.endsWith(path.join("task-dispatcher.ts")),
+          ) &&
+            bypass.offendingImporters.find((offense) =>
+              offense.file.endsWith("task-dispatcher.ts"),
+            )?.reasons.includes("decision_surface_transitively_consumes_capacity"),
+          { offenders: bypass.offendingImporters },
+        );
+        prove(
+          "falsification_p170_exact_sanctioned_paths_stay_exempt",
+          !offenderPaths.some((file) => file.endsWith(path.join("src", "capacity-rail.ts"))) &&
+            !offenderPaths.some((file) => file.endsWith(path.join("cli", "buffer.ts"))) &&
+            bypass.scannedFiles.some((file) => file.endsWith(path.join("src", "capacity-rail.ts"))),
+          { offenders: bypass.offendingImporters },
+        );
+        prove(
+          "p170_sanctioned_noncapacity_file_is_not_a_symbol_provider",
+          (() => {
+            const railSymbolsOnly = [...bypass.capacityModules].filter((file) =>
+              file.endsWith(path.join("src", "capacity-rail.ts")),
+            );
+            const bufferIsProvider = bypass.capacityModules.some((file) =>
+              file.endsWith(path.join("cli", "buffer.ts")),
+            );
+            return railSymbolsOnly.length === 1 && !bufferIsProvider;
+          })(),
+          { capacityModules: bypass.capacityModules },
+        );
+        prove(
+          "p170_real_repo_echoes_the_closed_sanctioned_set",
+          report.sanctionedCapacitySurfaces.length === 3 &&
+            report.sanctionedCapacitySurfaces.includes("packages/collector-cli/src/capacity-rail.ts") &&
+            report.sanctionedCapacitySurfaces.includes("packages/collector-cli/src/buffer.ts") &&
+            report.sanctionedCapacitySurfaces.includes("packages/collector-cli/src/cli.ts"),
+          { sanctioned: report.sanctionedCapacitySurfaces },
+        );
+      } finally {
+        fs.rmSync(sandboxWire, { recursive: true, force: true });
+      }
+    }
+
   const capacitySource = report.capacityModules
     .filter((file) => file.includes(`${path.sep}src${path.sep}`))
     .map((file) => fs.readFileSync(file, "utf8"))

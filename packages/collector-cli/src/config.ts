@@ -202,6 +202,15 @@ export function collectorDeviceIdentityPath(homeDir = os.homedir()) {
   return path.join(collectorHome(homeDir), "device.identity.json");
 }
 
+/**
+ * Bounded cached capacity status surface (issue #170), written next to the
+ * ledger so SQLite-free readers such as `doctor --read-only --json` can show
+ * capacity freshness without opening the database or calling a provider.
+ */
+export function collectorCapacitySurfacePath(bufferPath = collectorBufferPath()) {
+  return `${bufferPath}-capacity-status.json`;
+}
+
 export function collectorLogPath(name: string, homeDir = os.homedir()) {
   return path.join(collectorHome(homeDir), name);
 }
