@@ -44,6 +44,9 @@ jobs:
           pnpm proof:launch-agent-unload
           pnpm proof:collector-supervision
 
+      - name: Prove hosted-runner flake classes stay fixed (#187)
+        run: pnpm proof:flake-regression
+
       - name: Prove surgical Codex config reconciliation
         run: pnpm proof:codex-config-apply
 
