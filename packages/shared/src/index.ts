@@ -10,3 +10,4 @@ export * from "./learning-evidence";
 export * from "./outcome-timeline";
 export * from "./lane-receipts";
 export * from "./capacity";
+export * from "./provider-capacity-snapshot";

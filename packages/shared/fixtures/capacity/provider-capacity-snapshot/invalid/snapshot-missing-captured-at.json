@@ -1,0 +1,6 @@
+{
+  "mustReject": true,
+  "target": "providerCapacitySnapshotV1",
+  "because": "an observation without its capture time has no freshness and must be refused",
+  "payload": { "schema": "plimsoll.provider-capacity-snapshot.v1", "unit": { "deviceInstallId": "dev-1", "providerProfileId": "anthropic.max.primary", "window": "five_hour", "adapterVersion": "1.4.2" }, "observation": { "usedBasisPoints": 5000, "source": "provider_report" } }
+}

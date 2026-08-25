@@ -60,6 +60,7 @@
     "proof:performance-layer": "tsx scripts/performance-layer-proof.ts",
     "proof:lane-receipts": "tsx scripts/lane-receipt-proof.ts",
     "proof:capacity": "tsx scripts/capacity-proof.ts",
+    "proof:capacity-contract": "tsx scripts/provider-capacity-sync-proof.ts",
     "backfill:outcome-performance": "tsx packages/collector-cli/src/cli.ts backfill-outcome-performance",
     "weekly:performance": "tsx packages/collector-cli/src/cli.ts weekly-performance-rollup",
     "report": "tsx scripts/efficiency-report.ts",

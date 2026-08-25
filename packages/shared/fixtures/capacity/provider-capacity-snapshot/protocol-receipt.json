@@ -1,0 +1,29 @@
+{
+  "compatibilityPolicy": "exact_fingerprint_match",
+  "contractMaterialDigest": "sha256:927675c6c8e5c485b899661377c0f64aa2cdffee19c3a9a419155802f5901cfc",
+  "fixtureCount": 19,
+  "fixtureDigests": {
+    "invalid/adapter-secret-shape.json": "sha256:cb0c65621b62bd4e76b7acc2f318ecf9f52d36177e658a9857e17889460cde71",
+    "invalid/profile-prompt-text.json": "sha256:039df876e313ef78d9ac89b62670e1d6888cf9ccb055eeca92df95f7db6d1263",
+    "invalid/snapshot-bps-over-max.json": "sha256:0d2d76f5cadccb44e3cd3b180f13493ee93c1639dd75600f10614a774f26de58",
+    "invalid/snapshot-fractional-bps.json": "sha256:740c50723d3eb028d263d00eafa28753cc707f749e541ab3cef2b6d0cefac983",
+    "invalid/snapshot-missing-captured-at.json": "sha256:c22aa52152998303472972ebed738b10f142650451c480a97ad3d31dd02d5b1f",
+    "invalid/snapshot-negative-bps.json": "sha256:8833e872a14ee6c97068a1930b156976f2ae2e9567941dd4fb601faffefdd399",
+    "invalid/snapshot-productivity-field.json": "sha256:1b17bb15554d52387dc2cf65dcc4ac9a558edcf86893cd36ae268d9c4429b96a",
+    "invalid/snapshot-stored-remaining.json": "sha256:d93e24ff4fbdfb5eac357bd169281f1671a12fc053097024b5cb2270610d02ec",
+    "invalid/snapshot-wrong-schema.json": "sha256:3f68d9963a76e4b1e70af2b58e74cbd287657da14d87dad593002af48eed8d2c",
+    "invalid/sync-duplicate-unit.json": "sha256:07a35131d1bf97fe6c486017188f3bbe97e1c2b8d31bcefb7a7d444f6a00c498",
+    "invalid/sync-row-actor-email-in-body.json": "sha256:bdb1450ff11556533b12f74b21c9f8a2bbf58809994a87ea36f4b054115a26d6",
+    "invalid/sync-row-billing-field.json": "sha256:1ac1307a3ebd2180596c6324a6f784b8ce4b7bbeecaae007007271f834cbf40c",
+    "invalid/sync-row-deviceid-in-body.json": "sha256:6b7c9a70f11d4e457d702b789215b82408dc132526ee440d48ea7f59f512a3e1",
+    "invalid/sync-row-prompt-field.json": "sha256:0602de91cb595fff19fbb3f9a8ef9c515e8e356c0e5d8b9635b7a174ae822799",
+    "invalid/sync-row-tenantid-in-body.json": "sha256:5bfcb2590c2657a01f3e1bf56d3dcdfe05d6eee8a8f3e63cf982bae8fc29d171",
+    "invalid/window-email-shape.json": "sha256:9a18d6586e7b7be525dd2408e4f6a4a6c402ab8fa975bdcf1201536068931b2f",
+    "invalid/window-path-shape.json": "sha256:2c6c7847ab1bac88cd531f10872aa38bae77a35f6fb99ce1024d9b1a17873ee5",
+    "valid/snapshot-fresh.json": "sha256:87ff3c82b7ef599699b65c2e5caa399a53f84a760e27ba7d1cf15f28435dea75",
+    "valid/sync-batch.json": "sha256:cd1e5daa2779d7328136acccdb6c94bad5fa2eff80598dd7477024af71ec564e"
+  },
+  "generatedAt": "2026-08-25T00:00:00.000Z",
+  "protocolFingerprint": "sha256:632d0106ce0cc1a136bcfdfd95f0c3e9ea80f16a693ba9338e220a8dd1d207ca",
+  "protocolId": "plimsoll.provider-capacity.protocol.v1"
+}
