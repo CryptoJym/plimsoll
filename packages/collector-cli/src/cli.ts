@@ -198,6 +198,9 @@ Commands:
   drain-projections     Drain a stalled dashboard-projection repair backlog at full
                         budget until the dashboard is caught up (run with the
                         collector stopped; safe to interrupt and re-run)
+  install               One-liner installer: apply telemetry configs, register and
+                        load the LaunchAgent, then verify the collector answers.
+                        Packaged (npm/npx) by default; --dev for source trees; --dry-run to preview
   install-launch-agent  Write the user LaunchAgent plist
   load-launch-agent     Load an installed user LaunchAgent plist
   unload-launch-agent   Unload the user LaunchAgent without removing the plist
@@ -248,6 +251,8 @@ Config tools:
       Local-only deterministic materialization of existing outcome-timeline facts.
   weekly-performance-rollup [--store PATH] [--out-dir DIR] [--until ISO]
       Generates weekly-performance-YYYY-MM-DD.{json,md}; explicit/on-demand only.
+  install [--dry-run] [--yes]
+  install --dev [--repo-root PATH] [--pnpm PATH]
   install-launch-agent [--load] [--dry-run]
   install-launch-agent --dev [--repo-root PATH] [--pnpm PATH] [--load]
   load-launch-agent
@@ -2433,6 +2438,79 @@ async function main() {
     }
 
     throw new Error("Expected tool to be claude-code, codex, or all.");
+  }
+
+  if (command === "install") {
+    const runningScript = process.argv[1] ?? "";
+    const development = flag("--dev");
+    const packaged = /\.(mjs|cjs|js)$/.test(runningScript) && fs.existsSync(runningScript);
+    if (!development && !packaged) {
+      throw new Error(
+        "Source-tree installs require --dev. Packaged installs (npm i -g @plimsoll/cli / npx @plimsoll/cli) run the installed plimsoll executable.",
+      );
+    }
+    if (!development && (optionValue("--repo-root") || optionValue("--pnpm"))) {
+      throw new Error("--repo-root and --pnpm are development-only options; add --dev.");
+    }
+    const dryRun = flag("--dry-run");
+    const self = [process.execPath, runningScript];
+    const forwarded = dryRun ? ["--dry-run"] : [];
+    const runInstallStep = (label: string, args: string[]) => {
+      console.error(`plimsoll install: ${label}`);
+      const result = spawnSync(self[0]!, [...self.slice(1), ...args], { stdio: "inherit" });
+      if (result.status !== 0 || result.error) {
+        throw new Error(
+          `install step failed: ${label} (exit ${result.status ?? result.error?.code ?? "unknown"})`,
+        );
+      }
+    };
+    runInstallStep("apply telemetry configs", ["setup", "--yes", ...forwarded]);
+    runInstallStep("register + load LaunchAgent", [
+      "install-launch-agent",
+      "--load",
+      ...(development
+        ? ["--dev", "--repo-root", optionValue("--repo-root") ?? process.cwd(), "--pnpm", optionValue("--pnpm") ?? "pnpm"]
+        : []),
+      ...forwarded,
+    ]);
+    if (dryRun) {
+      console.log(JSON.stringify({ status: "preview", runtime: development ? "development" : "packaged" }, null, 2));
+      return;
+    }
+    const verifyTimeoutMs = Number(process.env.PLIMSOLL_INSTALL_VERIFY_TIMEOUT_MS ?? "15000");
+    const deadline = Date.now() +
+      (Number.isFinite(verifyTimeoutMs) && verifyTimeoutMs >= 0 ? verifyTimeoutMs : 15000);
+    let connectivity: Awaited<ReturnType<typeof checkCollectorConnectivity>> | null = null;
+    while (Date.now() < deadline) {
+      connectivity = await checkCollectorConnectivity(config.port);
+      if (connectivity.reachable) break;
+      await new Promise((resolve) => setTimeout(resolve, 400));
+    }
+    const reachable = connectivity?.reachable === true;
+    console.log(
+      JSON.stringify(
+        {
+          status: reachable ? "installed" : "install_incomplete",
+          runtime: development ? "development" : "packaged",
+          port: config.port,
+          dashboardUrl: `http://127.0.0.1:${config.port}/`,
+          collector: {
+            reachable,
+            signalVerified: connectivity?.signal.verified === true,
+            tokenAttributedEvents: connectivity?.signal.tokenAttributedEvents ?? null,
+            statusUrl: connectivity?.statusUrl ?? `http://127.0.0.1:${config.port}/status`,
+          },
+          nextSteps: [
+            "plimsoll doctor --read-only --json   # signal_verified only after a real Claude Code / Codex event arrives",
+            "restart any running Claude Code / Codex sessions so they pick up telemetry",
+          ],
+        },
+        null,
+        2,
+      ),
+    );
+    if (!reachable && process.exitCode === undefined) process.exitCode = 1;
+    return;
   }
 
   if (command === "install-launch-agent") {
