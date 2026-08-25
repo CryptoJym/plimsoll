@@ -68,6 +68,9 @@ jobs:
       - name: Prove incremental tailer context and cursor semantics
         run: pnpm proof:incremental-capture
 
+      - name: Prove fair capture progress across concurrent generations
+        run: pnpm proof:capture-fairness
+
       - name: Prove local HTTP trust boundary
         run: pnpm proof:http-boundary
       - name: Prove bounded admission-rejection diagnostics (runner-scaled)
