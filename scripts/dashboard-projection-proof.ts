@@ -23,6 +23,7 @@ import {
 } from "../packages/collector-cli/src/dashboard-api";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const NOW = new Date("2026-07-15T12:00:00.000Z");
@@ -37,8 +38,13 @@ Date.now = () => NOW.getTime();
 
 const checks: Array<{ name: string; detail: Record<string, unknown> }> = [];
 
+// Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+const EXPECTED_CHECKS = 53;
+const completion = installProofCompletionGuard({ proof: "dashboard-projection-proof", expectedChecks: EXPECTED_CHECKS });
+
 function check(name: string, condition: unknown, detail: Record<string, unknown> = {}) {
   assert.ok(condition, `${name}: ${JSON.stringify(detail)}`);
+  completion.check(name);
   checks.push({ name, detail });
 }
 
@@ -1455,6 +1461,7 @@ async function main() {
       {metric:legacy.projection.status().backfill.metricSampleCount});
     legacy.close();
 
+    completion.complete();
     console.log(JSON.stringify({
       schema: "plimsoll.dashboard-projection-proof.v1",
       status: "pass",

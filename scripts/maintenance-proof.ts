@@ -52,9 +52,14 @@ import { MODEL_PRICING, estimateCostUsd, priceForModel } from "../packages/share
 
 const checks: Array<{ name: string; detail: Record<string, unknown> }> = [];
 
+// Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+const EXPECTED_CHECKS = 28;
+const completion = installProofCompletionGuard({ proof: "maintenance-proof", expectedChecks: EXPECTED_CHECKS });
+
 function check(name: string, condition: unknown, detail: Record<string, unknown>) {
   assert.ok(condition, `${name}: ${JSON.stringify(detail)}`);
   checks.push({ name, detail });
+  completion.check(name);
 }
 
 function emptyRollout(): RolloutScanResult {
@@ -95,6 +100,7 @@ function emptyRollout(): RolloutScanResult {
     },
   };
 }
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 function emptyTranscript(): TranscriptScanResult {
   return {
@@ -1458,6 +1464,7 @@ async function main() {
     fs.rmSync(root, { recursive: true, force: true });
   }
 
+  completion.complete();
   process.stdout.write(
     `${JSON.stringify(
       {

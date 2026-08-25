@@ -22,6 +22,7 @@ import {
   type LaunchAgentUnloadOutcome,
   type ProcessIdentity,
 } from "../packages/collector-cli/src/runtime-ownership";
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 const LABEL = "com.plimsoll.collector";
 const PID_PATH = "/fixture/collector.pid";
@@ -232,8 +233,13 @@ function stopping(owner: CollectorRuntimeIdentity): Snapshot {
 }
 
 const checks: Array<{ name: string; detail: string }> = [];
+
+// Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+const EXPECTED_CHECKS = 39;
+const completion = installProofCompletionGuard({ proof: "launch-agent-unload-proof", expectedChecks: EXPECTED_CHECKS });
 function check(name: string, condition: unknown, detail: string) {
   assert.ok(condition, `${name}: ${detail}`);
+  completion.check(name);
   checks.push({ name, detail });
 }
 
@@ -1243,6 +1249,7 @@ async function main() {
     node: process.version,
     checks,
   };
+  completion.complete();
   process.stdout.write(`${JSON.stringify(receipt, null, 2)}\n`);
 }
 

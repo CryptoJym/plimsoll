@@ -30,11 +30,16 @@ import {
 } from "../packages/collector-cli/src/join";
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import { LOCAL_TENANT_ID } from "../packages/shared/src/index";
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 type Check = { name: string; adversarial: boolean; detail: Record<string, unknown> };
 type RequestRecord = { init?: RequestInit; url: string; body: Record<string, unknown> };
 
 const checks: Check[] = [];
+
+// Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+const EXPECTED_CHECKS = 21;
+const completion = installProofCompletionGuard({ proof: "enrollment-privacy-proof", expectedChecks: EXPECTED_CHECKS });
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-enrollment-privacy-proof-"));
 const originalPlimsollHome = process.env.PLIMSOLL_HOME;
 delete process.env.PLIMSOLL_HOME;
@@ -60,6 +65,7 @@ function check(
   detail: Record<string, unknown>,
 ) {
   assert.ok(condition, `${name}: ${JSON.stringify(detail)}`);
+  completion.check(name);
   checks.push({ name, adversarial, detail });
 }
 
@@ -1168,6 +1174,7 @@ try {
     );
   }
 
+  completion.complete();
   const adversarialChecks = checks.filter((entry) => entry.adversarial);
   console.log(
     JSON.stringify(

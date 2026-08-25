@@ -25,13 +25,19 @@ import type {
   CollectorServer,
   RejectionDiagnosticsCounters,
 } from "../packages/collector-cli/src/rejection-diagnostics";
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 type Check = { name: string; passed: boolean; detail: unknown };
 type BurstResult = { status: number; bodyText: string };
 
 const checks: Check[] = [];
 
+// Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+const EXPECTED_CHECKS = 18;
+const completion = installProofCompletionGuard({ proof: "rejection-aggregation-proof", expectedChecks: EXPECTED_CHECKS });
+
 function check(name: string, passed: boolean, detail: unknown) {
+  completion.check(name);
   checks.push({ name, passed, detail });
 }
 
@@ -914,6 +920,7 @@ async function main() {
   for (const result of checks) {
     console.log(`${result.passed ? "PASS" : "FAIL"} ${result.name} ${JSON.stringify(result.detail)}`);
   }
+  completion.complete();
   const failed = checks.filter((result) => !result.passed);
   console.log(
     JSON.stringify({

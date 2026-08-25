@@ -45,12 +45,17 @@ import {
 } from "../packages/collector-cli/src/repo-context";
 import type { MaintenanceRunOutcome } from "../packages/collector-cli/src/maintenance";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 type Check = { name: string; passed: true; detail: Record<string, unknown> };
 type TimerHandle = ReturnType<typeof setTimeout>;
 type RequestResult = { status: number; elapsedMs: number; body: Record<string, unknown> };
 
 const checks: Check[] = [];
+
+// Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+const EXPECTED_CHECKS = 17;
+const completion = installProofCompletionGuard({ proof: "maintenance-boundary-proof", expectedChecks: EXPECTED_CHECKS });
 const PRIVATE_PATH_SENTINEL = "maintenance-boundary-private-path-sentinel";
 const FIFO_AVAILABILITY_BUDGETS = {
   waveConcurrency: 100,
@@ -62,6 +67,7 @@ const FIFO_AVAILABILITY_BUDGETS = {
 } as const;
 
 function pass(name: string, detail: Record<string, unknown>) {
+  completion.check(name);
   checks.push({ name, passed: true, detail });
 }
 
@@ -1554,6 +1560,7 @@ async function main() {
       productionFilesChanged: false,
     },
   };
+  completion.complete();
   assert.equal(JSON.stringify(receipt).includes(PRIVATE_PATH_SENTINEL), false);
   console.log(JSON.stringify(receipt, null, 2));
 }

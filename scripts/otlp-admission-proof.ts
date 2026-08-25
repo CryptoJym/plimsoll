@@ -20,11 +20,17 @@ import {
   GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
   isCanonicalSuppressionReceipt,
 } from "../packages/shared/src/index";
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 type Check = { name: string; passed: boolean; detail: string };
 const checks: Check[] = [];
 
+// Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+const EXPECTED_CHECKS = 20;
+const completion = installProofCompletionGuard({ proof: "otlp-admission-proof", expectedChecks: EXPECTED_CHECKS });
+
 function check(name: string, passed: boolean, detail: unknown) {
+  completion.check(name);
   checks.push({ name, passed, detail: typeof detail === "string" ? detail : JSON.stringify(detail) });
 }
 
@@ -784,6 +790,7 @@ async function main() {
     fs.rmSync(tempHome, { recursive: true, force: true });
   }
 
+  completion.complete();
   const failed = checks.filter((entry) => !entry.passed);
   console.log(JSON.stringify({ proof: "otlp_admission", checks, passed: failed.length === 0 }, null, 2));
   if (failed.length > 0) {

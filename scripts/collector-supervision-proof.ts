@@ -29,6 +29,7 @@ import {
   type CollectorPidRecord,
   type CollectorRuntimeIdentity,
 } from "../packages/collector-cli/src/runtime-ownership";
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 async function availablePort() {
   const server = net.createServer();
@@ -220,6 +221,8 @@ async function stopOwner(watched: WatchedChild) {
 }
 
 async function main() {
+  // Issue #210: refuse silent partial runs. One unit per completed scenario block.
+  const completion = installProofCompletionGuard({ proof: "collector-supervision-proof", expectedChecks: 28 });
   const root = path.resolve(import.meta.dirname, "..");
   const cliPath = path.join(root, "packages", "collector-cli", "dist", "cli.mjs");
   check(fs.existsSync(cliPath), "Build the packaged CLI before running this proof.");
@@ -293,6 +296,7 @@ async function main() {
       runtimeIdentityMatches(status.runtimeIdentity, pidRecord),
       "/status did not return the exact PID-record runtime identity.",
     );
+    completion.check("concurrent_starts_converge");
     const stopper = stopCollector(cliPath, concurrentHome, root);
     children.push(stopper);
     await waitFor(
@@ -303,6 +307,7 @@ async function main() {
     check(stopperExit.code === 0, "Packaged stop command did not exit successfully.");
     await waitForExit(owner.child);
     check(!fs.existsSync(pidPath), "Owner PID file survived graceful shutdown.");
+    completion.check("packaged_stop_validates_recorded_cli_path");
 
     const staleHome = path.join(tempRoot, "stale");
     const stalePort = await availablePort();
@@ -332,6 +337,7 @@ async function main() {
     check(recoveredPid.pid === recoveredReceipt?.pid, "Recovered owner PID was not recorded.");
     check(recoveredPid.pid !== sentinel.pid, "Stale unrelated PID remained authoritative.");
     await stopOwner(recovered);
+    completion.check("stale_pid_recovers_without_signaling_sentinel");
 
     const ownerDeathHome = path.join(tempRoot, "owner-death");
     const ownerDeathPort = await availablePort();
@@ -355,6 +361,7 @@ async function main() {
     );
     await waitForExit(transientOwner.watched.child);
     await stopOwner(replacement);
+    completion.check("owner_death_after_first_valid_status");
 
     const foreignHome = path.join(tempRoot, "foreign-listener");
     const foreignPort = await availablePort();
@@ -399,6 +406,7 @@ async function main() {
       foreignServer?.close((error) => (error ? reject(error) : resolve()));
     });
     foreignServer = null;
+    completion.check("foreign_exact_shape_status_cannot_spoof_owner");
 
     const inertHome = path.join(tempRoot, "inert-argv");
     const inertPort = await availablePort();
@@ -443,6 +451,7 @@ async function main() {
     const legacyStopExit = await waitForExit(legacyStop.child);
     check(legacyStopExit.code !== 0, "Legacy PID stop exited successfully.");
     process.kill(inert.pid, 0);
+    completion.check("inert_and_legacy_processes_cannot_pass_stop_authorization");
 
     const fakeBin = path.join(tempRoot, "fake-bin");
     fs.mkdirSync(fakeBin, { recursive: true });
@@ -523,6 +532,7 @@ async function main() {
         !JSON.stringify(truthfulReceipt).includes(root),
       "Unload receipt exposed a filesystem path.",
     );
+    completion.check("unload_records_launchctl_failure_with_aggregate_terminal_proof");
 
     const durableHome = path.join(tempRoot, "durable-cleanup-reopen");
     const durablePort = await availablePort();
@@ -589,6 +599,7 @@ async function main() {
         fs.existsSync(durablePidPath),
       "SIGTERM promoted a durable cleanup ambiguity to stopped or PID-cleaned truth.",
     );
+    completion.check("durable_ambiguity_survives_sigterm");
 
     const durableStop = stopCollector(cliPath, durableHome, root);
     children.push(durableStop);
@@ -611,6 +622,7 @@ async function main() {
         !JSON.stringify(durableStopReceipt).includes(tempRoot),
       "Separate stop lost marker truth, emitted a false terminal receipt, or exposed a path.",
     );
+    completion.check("durable_ambiguity_survives_stop_reopen");
 
     const durableUnload = launchAgentCommand(
       cliPath,
@@ -644,6 +656,7 @@ async function main() {
         !JSON.stringify(durableUnloadReceipt).includes(tempRoot),
       "Post-exit unload lost durable marker truth, skipped final observation, or exposed a path.",
     );
+    completion.check("durable_ambiguity_survives_unload_reopen");
 
     const blockedStart = startCollector(cliPath, durableHome);
     children.push(blockedStart);
@@ -661,6 +674,7 @@ async function main() {
         !blockedStartRaw.includes(" at "),
       "Packaged start ownership failure was not stable, path-free JSON with a nonzero exit.",
     );
+    completion.check("packaged_start_failure_is_stable_path_free_json");
 
     const unavailablePsHome = path.join(tempRoot, "start-fingerprint-unavailable");
     writeConfig(unavailablePsHome, await availablePort());
@@ -695,6 +709,7 @@ async function main() {
         !fs.existsSync(path.join(unavailablePsHome, "collector.pid")),
       "Packaged start leaked a stack/path or mutated PID state when ps was unavailable.",
     );
+    completion.check("fingerprint_acquisition_inside_json_error_boundary");
 
     const blockedDoctor = collectorCommand(
       cliPath,
@@ -716,6 +731,7 @@ async function main() {
         fs.existsSync(path.join(durableHome, ".collector.pid.plimsoll-cleanup-marker")),
       "Read-only doctor did not report the live cleanup actor without mutating its marker.",
     );
+    completion.check("doctor_reports_live_cleanup_actor_without_mutation");
 
     const reconciledHome = path.join(tempRoot, "dead-actor-reconciliation");
     const reconciledPort = await availablePort();
@@ -776,6 +792,7 @@ async function main() {
         fs.existsSync(reconciledMarkerPath),
       "Read-only doctor mutated or misreported an eligible dead-actor marker.",
     );
+    completion.check("doctor_reports_eligible_dead_actor_without_mutation");
 
     const reconciledStop = stopCollector(cliPath, reconciledHome, root);
     children.push(reconciledStop);
@@ -794,6 +811,7 @@ async function main() {
         !fs.existsSync(reconciledMarkerPath),
       "Packaged stop did not reconcile the dead actor and prove already-stopped truth.",
     );
+    completion.check("dead_actor_plus_unrelated_files_reconcile_to_already_stopped");
 
     const cleanMissingStop = stopCollector(cliPath, reconciledHome, root);
     children.push(cleanMissingStop);
@@ -809,6 +827,7 @@ async function main() {
           ?.disposition === "clean",
       "Clean missing-PID stop did not return consistent already-stopped JSON and exit zero.",
     );
+    completion.check("missing_pid_stop_matches_absent_listener_truth");
 
     foreignServer = http.createServer((_request, response) => {
       response.writeHead(404, { "content-type": "text/plain" });
@@ -832,6 +851,7 @@ async function main() {
         missingPidOccupiedReceipt.listenerState === "unrelated",
       "Missing PID plus present listener was promoted to success or exited zero.",
     );
+    completion.check("missing_pid_stop_matches_present_listener_truth");
     await new Promise<void>((resolve, reject) => {
       foreignServer?.close((error) => (error ? reject(error) : resolve()));
     });
@@ -869,6 +889,7 @@ async function main() {
           JSON.stringify(collisionOwnerRecord, null, 2) + "\n",
       "The marker-plus-collision fixture did not retain its exact quarantine inventory.",
     );
+    completion.check("marker_plus_collision_quarantine_remains_nonterminal");
     const collisionStop = stopCollector(cliPath, collisionHome, root);
     children.push(collisionStop);
     const collisionStopExit = await waitForExit(collisionStop.child, 60_000);
@@ -879,6 +900,7 @@ async function main() {
       "Stop did not fail closed on marker plus visible collision: " + collisionStop.output,
     );
     check(collisionStopExit.code !== 0, "Marker-plus-collision stop exited successfully.");
+    completion.check("marker_plus_collision_stop_fails_closed");
     fs.unlinkSync(collisionPidPath);
     const missingQuarantineUnload = launchAgentCommand(
       cliPath,
@@ -913,6 +935,7 @@ async function main() {
         readCollectorPidCleanupState(collisionPidPath, LAUNCH_AGENT_LABEL).quarantineCount === 1,
       "Quarantine ambiguity did not survive visible PID removal and a later process reopen.",
     );
+    completion.check("missing_pid_quarantine_survives_reopen");
 
     const alreadyStoppedHome = path.join(tempRoot, "known-label-not-found");
     writeConfig(alreadyStoppedHome, await availablePort());
@@ -940,6 +963,7 @@ async function main() {
         alreadyStopped.output,
     );
     check(alreadyStoppedExit.code === 0, "Known label-not-found should be idempotent success.");
+    completion.check("exact_label_not_found_is_not_reported");
 
     const exactNotFound =
       `Could not find service "${LAUNCH_AGENT_LABEL}" in domain for user gui: ${process.getuid?.() ?? "unknown"}`;
@@ -981,6 +1005,7 @@ async function main() {
         `Unexpected launchctl print fixture ${fixture.name} exited successfully.`,
       );
     }
+    completion.check("unexpected_launchctl_output_remains_query_failed");
 
     const legacyUnloadHome = path.join(tempRoot, "legacy-unload");
     writeConfig(legacyUnloadHome, await availablePort());
@@ -1005,6 +1030,7 @@ async function main() {
     );
     check(legacyUnloadExit.code !== 0, "Legacy PID unload did not fail closed.");
     check(fs.existsSync(legacyPidPath), "Legacy PID residue was deleted without ownership proof.");
+    completion.check("unload_receipts_path_free_legacy_residue_retained");
 
     const failedBootoutHome = path.join(tempRoot, "failed-bootout");
     writeConfig(failedBootoutHome, await availablePort());
@@ -1025,6 +1051,7 @@ async function main() {
       "Unload promoted a failed launchctl bootout to success: " + failedBootout.output,
     );
     check(failedBootoutExit.code !== 0, "Failed launchctl bootout exited successfully.");
+    completion.check("unexpected_launchctl_exit_codes_fail_closed");
 
     const reusedPidHome = path.join(tempRoot, "reused-pid-lock");
     const reusedPidPort = await availablePort();
@@ -1046,6 +1073,7 @@ async function main() {
     );
     process.kill(inert.pid, 0);
     await stopOwner(reusedPidRecovery);
+    completion.check("reused_pid_fingerprint_recovers");
 
     const expiredLeaseHome = path.join(tempRoot, "expired-lock-lease");
     const expiredLeasePort = await availablePort();
@@ -1063,6 +1091,7 @@ async function main() {
     );
     process.kill(inert.pid, 0);
     await stopOwner(expiredLeaseRecovery);
+    completion.check("expired_lock_lease_recovers");
 
     const packagedPlist = renderLaunchAgentPlist({
       homeDir: tempRoot,
@@ -1092,6 +1121,7 @@ async function main() {
       });
       check(lint.status === 0, "Packaged plist is not valid XML: " + lint.stderr);
     }
+    completion.check("rendered_plist_passes_plutil");
 
     const devPlist = renderLaunchAgentPlist({
       homeDir: tempRoot,
@@ -1101,6 +1131,8 @@ async function main() {
     check(devPlist.includes("<string>--dir</string>"), "Explicit dev plist lost --dir.");
     check(devPlist.includes("<string>" + root + "</string>"), "Explicit dev plist lost repo root.");
     check(devPlist.includes("<string>collector</string>"), "Explicit dev plist lost collector script.");
+    completion.check("packaged_and_dev_arguments_separated");
+    completion.complete();
 
     console.log(
       JSON.stringify(

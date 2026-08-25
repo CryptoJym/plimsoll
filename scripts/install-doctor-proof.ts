@@ -26,6 +26,7 @@ import {
   readUtcProcessStartFingerprint,
   UTC_PROCESS_START_ALGORITHM,
 } from "../packages/collector-cli/src/runtime-ownership";
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 type CommandResult = {
   code: number | null;
@@ -47,7 +48,12 @@ const proofWorkflow = path.join(root, ".github", "workflows", "proof.yml");
 const partialCodexFixture = path.join(root, "scripts", "fixtures", "codex-partial-legacy.toml");
 const checks: Check[] = [];
 
+// Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+const EXPECTED_CHECKS = 55;
+const completion = installProofCompletionGuard({ proof: "install-doctor-proof", expectedChecks: EXPECTED_CHECKS });
+
 function check(name: string, condition: unknown, detail: unknown) {
+  completion.check(name);
   checks.push({ name, passed: Boolean(condition), detail });
   if (!condition) throw new Error(`${name}: ${JSON.stringify(detail)}`);
 }
@@ -896,6 +902,7 @@ esac
     node: { execPath: process.execPath, version: process.versions.node },
     checks,
   };
+  completion.complete();
   const evidenceDir = path.join(root, "evidence");
   fs.mkdirSync(evidenceDir, { recursive: true });
   fs.writeFileSync(

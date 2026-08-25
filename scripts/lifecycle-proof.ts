@@ -36,9 +36,14 @@ import { PLIMSOLL_VERSION } from "../packages/collector-cli/src/version";
 type Check = { name: string; passed: boolean; detail: unknown };
 const checks: Check[] = [];
 
+// Issue #210: refuse silent partial runs (see scripts/lib/completion-guard.ts).
+const EXPECTED_CHECKS = 41;
+const completion = installProofCompletionGuard({ proof: "lifecycle-proof", expectedChecks: EXPECTED_CHECKS });
+
 function check(name: string, condition: unknown, detail: unknown) {
   const row = { name, passed: Boolean(condition), detail };
   checks.push(row);
+  completion.check(name);
   console.log(`${row.passed ? "PASS" : "FAIL"} ${name}`);
   if (!condition) throw new Error(`${name}: ${JSON.stringify(detail)}`);
 }
@@ -55,6 +60,7 @@ function write(file: string, content: string, mode = 0o600) {
 function mode(file: string) {
   return fs.statSync(file).mode & 0o777;
 }
+import { installProofCompletionGuard } from "./lib/completion-guard";
 
 type Fixture = ReturnType<typeof fixture>;
 
@@ -741,6 +747,7 @@ async function main() {
   const boundary = lifecycleBoundaryStatement();
   check("leave_and_revoke_are_distinct_unperformed_operations", boundary.leave === "distinct_operation_not_performed" && boundary.revoke === "hosted_owner_operation_not_performed" && boundary.credentialsMoved === false && boundary.liveServiceTouched === false, boundary);
 
+  completion.complete();
   const failed = checks.filter((row) => !row.passed);
   console.log(JSON.stringify({ proof: "lifecycle", checks: checks.length, passed: checks.length - failed.length, failed: failed.map((row) => row.name), liveStateTouched: false }));
 }
