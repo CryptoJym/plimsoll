@@ -335,6 +335,18 @@ tr.row:focus-visible{background:rgba(35,137,167,.12)}
       <div id="watch-rows" class="legend watch-rows"><span class="muted">sounding…</span></div>
     </section>
 
+    <section class="plate span12" id="capacity-plate">
+      <h2>Capacity rail · manual refresh only
+        <span class="plate-meta plain" id="cap-meta">sourced from the compact local projection — no provider calls, no raw-history scans</span>
+      </h2>
+      <table id="t-capacity" aria-label="Provider capacity rail"><thead><tr>
+        <th scope="col">profile</th><th scope="col">dimension</th><th class="num" scope="col">used</th><th class="num" scope="col">limit</th>
+        <th class="num" scope="col">headroom</th><th scope="col">freshness</th><th scope="col">observed</th>
+      </tr></thead><tbody></tbody></table>
+      <div class="empty" id="e-capacity" hidden>never refreshed — run `plimsoll capacity refresh --input FILE` with a provider-facts document</div>
+      <div class="outcome-note" id="cap-note"></div>
+    </section>
+
     <section class="plate span12">
       <h2>Daily spend</h2>
       <svg class="spark" id="spark" preserveAspectRatio="none"></svg>
@@ -836,8 +848,40 @@ function renderSnapshot(d){
   const crumbs=clear($("#crumbs"));add(crumbs,`127.0.0.1 · window ${fmt(s.days)}d · generation ${fmt(d.generation)} · `,node("b","nothing leaves this machine from this page"));
 }
 
+function renderCapacity(rail){
+  if(!rail){$("#t-capacity").hidden=true;$("#e-capacity").hidden=false;$("#cap-note").textContent="";return}
+  $("#cap-meta").textContent=`compact local projection · probe ${rail.probe?.state||"NEVER_RUN"}`+
+    (rail.probe?.lastSuccessAt?` · last success ${rail.probe.lastSuccessAt.slice(0,16).replace("T"," ")}`:"")+
+    " · no background cadence";
+  rows("#t-capacity","#e-capacity",Array.isArray(rail.constraints)?rail.constraints:[],item=>{
+    const headroom=item.remainingFraction==null?"—":Math.round(item.remainingFraction*100)+"%";
+    const freshness=node("span",item.freshness,"hash "+(item.freshness==="fresh"?"foam":"foam-dim"));
+    freshness.title="UNKNOWN means evidence is missing, stale, or future-dated — never zero";
+    return tableRow([
+      {content:item.profileId,className:"wide"},
+      {content:item.dimension},
+      {content:fmt(item.used),className:"num"},
+      {content:fmt(item.limit),className:"num"},
+      {content:headroom,className:"num cov-num"+(item.remainingFraction!=null&&item.remainingFraction<=.2?" bad":"")},
+      {content:freshness},
+      {content:String(item.observedAt||"").slice(0,16).replace("T"," "),className:"hash"},
+    ]);
+  });
+  const legend=rail.unknownLegend?rail.unknownLegend:"";
+  $("#cap-note").textContent=legend;
+}
 let dashboardCache=null;
 let dashboardEtag=null;
+let capacityCache=null;
+async function loadCapacity(){
+  try{
+    const response=await fetch("/api/capacity"),payload=await response.json();
+    if(!response.ok)throw new Error(payload.error||("HTTP "+response.status));
+    capacityCache=payload;renderCapacity(capacityCache);
+  }catch(e){
+    if(!capacityCache)renderCapacity(null);
+  }
+}
 async function refresh(redrawOnly=false){
   try{
     const days=Number(localStorage.getItem("plimsoll-window")||"30");
@@ -858,6 +902,7 @@ async function refresh(redrawOnly=false){
     $("#lamp").classList.remove("ok"); $("#lamp").classList.add("warn");
     $("#lamp-text").textContent=String(e&&e.message)==="projection_backfilling"?"projection backfilling":"collector unreachable";
   }
+  await loadCapacity();
 }
 // ——— settings ———
 const post=(route,body)=>fetch(route,{method:"POST",headers:{"content-type":"application/json","x-plimsoll-local":"1"},body:JSON.stringify(body)}).then(async r=>{const d=await r.json();if(!r.ok)throw new Error(d.error||r.status);return d});

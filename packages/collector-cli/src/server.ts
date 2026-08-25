@@ -372,6 +372,16 @@ export function createCollectorServer(
           });
           return;
         }
+        if (url.pathname === "/api/capacity") {
+          // Issue #170: the Capacity Rail serves ONLY its compact projection
+          // tables. No provider call and no raw-history scan is possible on
+          // this path; the cached status surface stays fresh for SQLite-free
+          // readers (doctor) as a side effect.
+          const rail = buffer.capacityRail.railProjection();
+          buffer.capacityRail.writeStatusSurface(rail);
+          sendJson(response, rail);
+          return;
+        }
         if (url.pathname === "/api/snapshot") {
           const read = snapshotResponse(days);
           if (read.kind === "unsupported") {

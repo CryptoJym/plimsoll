@@ -936,6 +936,21 @@ function startFixtureServer(html: string, mutations: Array<{ route: string; body
       "/api/settings": settingsFixture,
       "/api/session": sessionFixture,
       "/api/repo": repoFixture,
+      // Issue #170: the dashboard polls the Capacity Rail on every refresh.
+      // The fixture serves an honest never-refreshed rail (bounded payload).
+      "/api/capacity": {
+        schema: "plimsoll.capacity-rail.v1",
+        generatedAt: "2026-01-01T00:00:00.000Z",
+        manualRefreshOnly: true,
+        freshnessWindowMs: 21600000,
+        profiles: [],
+        constraints: [],
+        constraintsTruncated: false,
+        storedCounts: { exactChanges: 0, windowBuckets: 0, dailySummaries: 0 },
+        probe: { state: "NEVER_RUN", lastAttemptAt: null, lastSuccessAt: null, consecutiveFailures: 0, lastErrorKind: null, lastErrorMessage: null },
+        retention: { exactChangesDays: 7, windowHistoryDays: 30, dailySummariesDays: 90, latestUntilProfileRemoval: true, lastSweptAt: null },
+        unknownLegend: "UNKNOWN means evidence is missing or stale; it is never a zero.",
+      },
     };
     if (url.pathname in fixtures) {
       response.writeHead(200, { "content-type": "application/json", "x-content-type-options": "nosniff" });

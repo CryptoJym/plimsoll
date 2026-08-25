@@ -11,6 +11,8 @@ import {
 import type { MetricSample } from "./otlp";
 import type { OtlpAdmissionDrop, OtlpDropReason } from "./otlp-admission";
 import { ensureCodexReconciliationSchema } from "./codex-reconciliation";
+import { CapacityRailStore } from "./capacity-rail";
+import { collectorCapacitySurfacePath } from "./config";
 import { DeliveryOutbox, type DeliveryLimits } from "./outbox";
 import { DashboardProjectionStore } from "./dashboard-projection";
 import { LearningFactStore, type LearningFactLimits } from "./learning-facts";
@@ -149,6 +151,8 @@ export class LocalEventBuffer {
   readonly delivery: DeliveryOutbox;
   readonly projection: DashboardProjectionStore;
   readonly learningFacts: LearningFactStore;
+  /** Local Capacity Rail (issue #170) — bounded capacity self-view tables. */
+  readonly capacityRail: CapacityRailStore;
 
   constructor(
     path: string,
@@ -558,6 +562,12 @@ export class LocalEventBuffer {
       options.learningFacts?.limits,
     );
     this.projection = new DashboardProjectionStore(this.db, { newLedger });
+    // Local Capacity Rail (issue #170): bounded self-view tables inside the
+    // ordinary ledger, with the cached status surface written beside it for
+    // SQLite-free readers (doctor).
+    this.capacityRail = new CapacityRailStore(this.db, {
+      surfacePath: collectorCapacitySurfacePath(path),
+    });
   }
 
   /**
