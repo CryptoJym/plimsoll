@@ -536,9 +536,59 @@ async function main() {
       { missingSource, hostileSource, swappedHookSource },
     );
 
+    // Declared-length oversize is rejected before the upload is consumed.
+    // The body is fed defensively because the server tears down an
+    // early-rejected multi-megabyte upload mid-flight (issue #196 raised the
+    // wire cap from 256 KiB to 2 MiB, so this body no longer fits one write).
     const oversizedBody = Buffer.alloc(LOCAL_HTTP_LIMITS.compressedBodyBytes + 1, "x");
-    const oversized = await request(port, "/v1/logs", oversizedBody, {
-      "x-plimsoll-source": "codex",
+    const oversizedStartedAt = performance.now();
+    const oversized = await new Promise<HttpResult>((resolve) => {
+      const client = http.request(
+        {
+          host: "127.0.0.1",
+          port,
+          path: "/v1/logs",
+          method: "POST",
+          headers: {
+            connection: "close",
+            "content-type": "application/json",
+            "content-length": String(oversizedBody.length),
+            "x-plimsoll-source": "codex",
+          },
+        },
+        (response) => {
+          const chunks: Buffer[] = [];
+          response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+          response.on("end", () => {
+            let parsed: Receipt = {};
+            try {
+              parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as Receipt;
+            } catch {}
+            resolve({
+              status: response.statusCode ?? 0,
+              body: parsed,
+              bodyBytes: Buffer.concat(chunks).length,
+              elapsedMs: performance.now() - oversizedStartedAt,
+              headers: response.headers,
+            });
+          });
+        },
+      );
+      const settleSafely = (fallback: Receipt, status = 0) => {
+        resolve({
+          status,
+          body: fallback,
+          bodyBytes: 0,
+          elapsedMs: performance.now() - startedAt,
+          headers: {},
+        });
+      };
+      client.on("error", () => settleSafely({ reason: "socket_reset_during_early_rejection" }));
+      try {
+        client.end(oversizedBody.subarray(0, 64 * 1024));
+      } catch {
+        settleSafely({ reason: "socket_reset_during_early_rejection" });
+      }
     });
     check(
       "compressed_transport_bytes_have_fixed_ceiling",
