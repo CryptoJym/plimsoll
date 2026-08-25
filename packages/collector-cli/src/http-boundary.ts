@@ -2,7 +2,12 @@ import type http from "node:http";
 import zlib from "node:zlib";
 
 export const LOCAL_HTTP_LIMITS = Object.freeze({
-  compressedBodyBytes: 256 * 1024,
+  // Issue #196: the wire ceiling equals the decoded ceiling, so any body whose
+  // decoded form fits every downstream budget is admitted to decoding. The
+  // former standalone 256 KiB wire cap rejected entire production batches
+  // (compressed_body_too_large storms) that the decoded/ratio/node budgets
+  // were already sized to accept.
+  compressedBodyBytes: 2 * 1024 * 1024,
   decodedBodyBytes: 2 * 1024 * 1024,
   compressionRatio: 32,
   jsonDepth: 32,

@@ -15,6 +15,14 @@ const REPAIR_ROWS = 250;
 const COMPACT_GC_ITEMS = 1_000;
 const SESSION_REPAIR_ROWS = 1_000;
 const SESSION_REPAIR_BUDGET_MS = 50;
+/**
+ * Issue #196: publication normally waits for a fully quiescent projection,
+ * but under sustained ingestion some backlog is virtually always open, so a
+ * strict gate can freeze the served snapshot indefinitely while facts keep
+ * landing. Past this bound the read path republishes from current aggregates
+ * instead of serving a frozen summary; the normal quiescent path is unchanged.
+ */
+export const SNAPSHOT_MAX_STALENESS_MS = 15 * 60_000;
 const CANONICAL_SHA256 = /^sha256:[0-9a-f]{64}$/;
 const UNLINKED_REPO = "__unlinked__";
 const UNLINKED_ACCOUNT = "__unlinked_account__";
@@ -2570,11 +2578,17 @@ export class DashboardProjectionStore {
     };
   }
 
-  private publishSnapshots(now: Date) {
+  private publishSnapshots(now: Date, force=false) {
     const control = this.control();
     if (!control.backfillComplete||!control.metricBackfillComplete) return false;
-    const backlog = this.backlog();
-    if (backlog.repairs || backlog.compactMutations||backlog.compactGcDays||backlog.dirtySessions || backlog.accountInvalidations) return false;
+    // Issue #196: `force` skips only the backlog quiescence gate — the
+    // staleness-bounded read-path fallback publishes slightly-pre-repair
+    // aggregates rather than serving a frozen summary forever. Backfill
+    // completion stays mandatory so a first migration never publishes partials.
+    if (!force) {
+      const backlog = this.backlog();
+      if (backlog.repairs || backlog.compactMutations||backlog.compactGcDays||backlog.dirtySessions || backlog.accountInvalidations) return false;
+    }
     const generation = control.generation + 1;
     let rowsVisited = 0;
     for (const days of DASHBOARD_WINDOWS) {
@@ -2863,10 +2877,18 @@ export class DashboardProjectionStore {
 
   readSnapshot(days:number,subscriptions:SubscriptionConfig[]=[]):SnapshotRead {
     if(!DASHBOARD_WINDOWS.includes(days as typeof DASHBOARD_WINDOWS[number])) return {kind:"unsupported",supportedDays:DASHBOARD_WINDOWS};
+    let control=this.control();
+    if(control.ready&&control.dirty&&control.lastSuccessAt&&
+      Date.now()-Date.parse(control.lastSuccessAt)>SNAPSHOT_MAX_STALENESS_MS){
+      // Issue #196 liveness fallback: bounded staleness beats an indefinite
+      // freeze. A forced republish that cannot take the writer (SQLITE_BUSY)
+      // falls through to the cached copy — availability never regresses.
+      try{ this.publishSnapshots(new Date(), true); }catch{}
+      control=this.control();
+    }
     const row=this.db.prepare(
       `select payload_json as payloadJson,generation from dashboard_snapshots where days=?`,
     ).get(days) as {payloadJson:string;generation:number}|undefined;
-    const control=this.control();
     if(!row||!control.ready)return {kind:"backfilling",status:this.status()};
     const snapshot=json<SnapshotCore>(row.payloadJson);
     const cutoff=(this.db.prepare(`select cutoff_at as cutoffAt from dashboard_window_control where days=?`).get(days) as {cutoffAt:string}).cutoffAt;
@@ -2876,7 +2898,12 @@ export class DashboardProjectionStore {
       snapshot.projection.degradedReason=control.degradedReason??"projection_pending";}
     this.decoratePresentation(snapshot,subscriptions);
     snapshot.status.health = this.buildHealth(days, new Date(Date.now()));
-    this.db.prepare(`update dashboard_projection_control set snapshot_cache_hits=snapshot_cache_hits+1 where singleton=1`).run();
+    // Issue #196: the cache-hit counter is telemetry, not correctness — under
+    // writer contention it must never turn a served read into SQLITE_BUSY
+    // (the intermittent dashboard 503/stall mode).
+    try{
+      this.db.prepare(`update dashboard_projection_control set snapshot_cache_hits=snapshot_cache_hits+1 where singleton=1`).run();
+    }catch{}
     const settings=(this.db.prepare(`select settings_version as version from dashboard_projection_control where singleton=1`).get() as {version:number}).version;
     return {kind:"ready",snapshot,etagSeed:`${row.generation}-${settings}-${cutoff}`};
   }
