@@ -92,13 +92,14 @@ const DECISION_MODULE_IMPORT_PATTERN =
  *
  * The key is an exact repo-relative PATH, never a name pattern. That is the
  * whole point: a `/capacity/i` basename exemption is the P3 bypass this issue
- * exists to close, so the allowlist is a closed two-element set that nothing
+ * exists to close, so the allowlist is a closed set of exact paths that nothing
  * can join by renaming itself, and `packages/shared/src/capacity-proof.ts`
  * (same basename, different directory) is policed like any other file.
  */
 const ENFORCEMENT_TOOLING: ReadonlySet<string> = new Set([
   "scripts/capacity-dependency-reachability.ts",
   "scripts/capacity-proof.ts",
+  "scripts/provider-capacity-sync-proof.ts",
 ]);
 
 function collectTypeScriptFiles(rootDir: string): string[] {

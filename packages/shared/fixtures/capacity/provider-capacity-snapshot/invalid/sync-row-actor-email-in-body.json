@@ -1,0 +1,20 @@
+{
+  "mustReject": true,
+  "target": "providerCapacitySyncBatch",
+  "because": "the sanitized body asserts no actor",
+  "payload": {
+    "kind": "provider_capacity_sync",
+    "installKey": "ik-local-x",
+    "snapshots": [
+      {
+        "providerProfileId": "anthropic.max.primary",
+        "window": "five_hour",
+        "adapterVersion": "1.4.2",
+        "usedBasisPoints": 8200,
+        "source": "provider_report",
+        "capturedAt": "2026-08-20T23:45:00.000Z",
+        "actorEmail": "someone@example.com"
+      }
+    ]
+  }
+}

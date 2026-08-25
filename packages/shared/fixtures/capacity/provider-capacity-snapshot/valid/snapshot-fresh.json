@@ -1,0 +1,14 @@
+{
+  "schema": "plimsoll.provider-capacity-snapshot.v1",
+  "unit": {
+    "deviceInstallId": "018f6d2a-9c1e-7b4a-b3f2-5d1c8e7a1234",
+    "providerProfileId": "anthropic.max.primary",
+    "window": "five_hour",
+    "adapterVersion": "1.4.2"
+  },
+  "observation": {
+    "usedBasisPoints": 8200,
+    "source": "provider_report",
+    "capturedAt": "2026-08-20T23:45:00.000Z"
+  }
+}
