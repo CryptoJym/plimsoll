@@ -193,7 +193,6 @@ exit 0
     path.join(stubBin, "pnpm"),
     `#!/bin/sh
 printf 'pnpm %s\\n' "$*" >> "$PLIMSOLL_COMMAND_LOG"
-case " $* " in *" collector doctor --read-only --json "*) exit 17 ;; esac
 exit 0
 `,
   );
@@ -230,7 +229,15 @@ exit 0
   );
   check(
     "source_installer_plans_strict_read_only_doctor",
-    dryRun.stdout.includes("doctor --read-only --json (failure stops installation)"),
+    // Issue #133: the installer gate is the machine-mode doctor receipt; the
+    // plan line names it and keeps the failure-stops semantics.
+    dryRun.stdout.includes("machine doctor --read-only     (receipt ok:false stops installation)"),
+    dryRun.stdout,
+  );
+  check(
+    "source_installer_plans_direct_runtime_not_pnpm_script",
+    dryRun.stdout.includes("never via pnpm") &&
+      !/\bpnpm\s+collector\b/.test(fs.readFileSync(installScript, "utf8")),
     dryRun.stdout,
   );
   check(
@@ -252,6 +259,10 @@ exit 0
   const installHome = path.join(sandbox, "install-home");
   const installPlimsoll = path.join(sandbox, "install-plimsoll");
   const installTarget = path.join(sandbox, "install-target");
+  // Issue #133: the stub clone contains no node_modules, so the installer must
+  // fail closed at its runtime-entrypoint check (exit 65) and never reach a
+  // machine step — and it must do so without ever invoking the package-manager
+  // "collector" script for a receipt.
   const failedInstall = await command("/bin/bash", [installScript], {
     cwd: neutralCwd,
     env: {
@@ -262,15 +273,18 @@ exit 0
     },
   });
   const installCommands = fs.readFileSync(commandLog, "utf8");
-  check("source_installer_fails_closed_on_doctor", failedInstall.code === 17, failedInstall);
+  check("source_installer_fails_closed_when_runtime_entrypoints_missing", failedInstall.code === 65, {
+    code: failedInstall.code,
+    stderr: failedInstall.stderr.slice(0, 300),
+  });
   check(
-    "source_installer_executes_supported_dev_path",
-    installCommands.includes("collector install-launch-agent --dev --repo-root"),
+    "source_installer_never_routes_receipts_through_pnpm_script",
+    !installCommands.includes("collector "),
     installCommands,
   );
   check(
-    "source_installer_does_not_swallow_doctor_failure",
-    installCommands.trimEnd().endsWith("collector doctor --read-only --json"),
+    "source_installer_runs_no_machine_step_without_runtime",
+    installCommands.includes("pnpm install") && !fs.existsSync(path.join(installPlimsoll, "collector.config.json")),
     installCommands,
   );
 
