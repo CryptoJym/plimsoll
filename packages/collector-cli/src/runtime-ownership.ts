@@ -105,6 +105,11 @@ export type LaunchAgentUnloadOutcome = Readonly<{
     timeoutMs: number;
     pollIntervalMs: number;
     elapsedMs: number;
+    // Wall time charged to the system's settle budget (inter-poll waits).
+    // Observer execution overhead is accounted separately so a starved
+    // machine cannot silently consume the settle window.
+    settleWaitedMs: number;
+    observerOverheadMs: number;
     observations: number;
     deadlineCrossed: boolean;
     finalObservationPerformed: true;
@@ -1621,7 +1626,6 @@ async function observeLaunchAgentUnloadOnce(options: {
     label: string,
   ) => CollectorPidCleanupResult;
   removedPidFile: boolean;
-  pidCleanupAmbiguous: boolean;
   pidCleanupQuarantined: boolean;
 }): Promise<LaunchAgentUnloadObservation> {
   const priorIdentities = priorRuntimeIdentities(options.prior);
@@ -1643,8 +1647,21 @@ async function observeLaunchAgentUnloadOnce(options: {
   let currentPidIdentity = pidRuntimeIdentity(pidRead);
   let currentPidMatchesPrior = matchesAnyPrior(currentPidIdentity, priorIdentities);
   let removedPidFile = options.removedPidFile;
+  // Cleanup ambiguity is derived fresh from this pass's own reads and
+  // removal attempt, never carried across passes. During a healthy teardown
+  // the SIGTERM'd owner runs its own pid-cleanup transaction, so an observer
+  // pass can legitimately see in-flight ambiguity that retires moments
+  // later; latching it would convert normal settling into a permanent false
+  // "indeterminate". Durable artifacts re-derive ambiguity on every fresh
+  // read, so genuine unresolved races still fail closed. Quarantine stays
+  // sticky: it only arises from a real replacement collision and must stay
+  // visible for the whole session even if the artifact is later removed.
   let pidCleanupAmbiguous =
-    options.pidCleanupAmbiguous || options.prior.pidCleanupState.ambiguous || persistentCleanup.ambiguous;
+    options.prior.pidCleanupState.ambiguous || persistentCleanup.ambiguous;
+  // Quarantine only ever arises from a real replacement collision (never
+  // from healthy teardown cooperation), so once it is seen this session its
+  // ambiguity stands even if the artifact itself is later removed.
+  if (options.pidCleanupQuarantined) pidCleanupAmbiguous = true;
   let pidCleanupQuarantined =
     options.pidCleanupQuarantined ||
     options.prior.pidCleanupState.quarantineCount > 0 ||
@@ -1782,8 +1799,6 @@ export async function observeLaunchAgentUnloadTerminalState(options: {
   const pollIntervalMs = Math.max(1, options.pollIntervalMs ?? 50);
   const now = options.now ?? Date.now;
   const poll = options.poll ?? sleep;
-  const startedAt = now();
-  const deadline = startedAt + timeoutMs;
   const observeListener = options.observeListener ?? (() => observeCollectorListener(options.port));
   const classifyIdentity = options.classifyIdentity ?? classifyProcessIdentity;
   const readPidFile = options.readPidFile ?? readCollectorPidFile;
@@ -1791,14 +1806,25 @@ export async function observeLaunchAgentUnloadTerminalState(options: {
   const reconcileCleanupState =
     options.reconcileCleanupState ?? reconcileCollectorPidCleanupState;
   const removePidFile = options.removePidFile ?? removeCollectorPidFileIfOwnedDetailed;
-  let removedPidFile = false;
-  let pidCleanupAmbiguous = false;
-  let pidCleanupQuarantined = false;
+  // The settle window budgets how long the SYSTEM gets to finish dying, not
+  // how much wall time fits our own observation passes. Under CPU starvation
+  // a single pass (launchctl print, ps fingerprinting, listener probe) can
+  // take seconds; charging that overhead against a fixed wall-clock deadline
+  // made unload verdicts depend on machine load instead of system state (the
+  // #202 refused/indeterminate false red). Only actual inter-poll settle
+  // waits consume the budget; pass execution is accounted separately as
+  // observer overhead and reported in the receipt.
+  const startedAt = now();
+  let settleWaitedMs = 0;
+  let observerOverheadMs = 0;
   let observations = 0;
   let deadlineCrossed = false;
+  let removedPidFile = false;
+  let pidCleanupQuarantined = false;
   let final: LaunchAgentUnloadObservation;
 
   while (true) {
+    const passStartedAt = now();
     final = await observeLaunchAgentUnloadOnce({
       label: options.label,
       pidPath: options.pidPath,
@@ -1811,28 +1837,30 @@ export async function observeLaunchAgentUnloadTerminalState(options: {
       reconcileCleanupState,
       removePidFile,
       removedPidFile,
-      pidCleanupAmbiguous,
       pidCleanupQuarantined,
     });
     observations += 1;
     removedPidFile = final.removedPidFile;
-    pidCleanupAmbiguous = final.pidCleanupAmbiguous;
     pidCleanupQuarantined = final.pidCleanupQuarantined;
+    const passCompletedAt = now();
+    observerOverheadMs += Math.max(0, passCompletedAt - passStartedAt);
     if (final.stopped) break;
 
-    const observedAt = now();
-    if (observedAt >= deadline) {
+    const remainingSettleMs = timeoutMs - settleWaitedMs;
+    if (remainingSettleMs <= 0) {
       deadlineCrossed = true;
       break;
     }
-    await poll(Math.min(pollIntervalMs, Math.max(0, deadline - observedAt)));
+    await poll(Math.min(pollIntervalMs, remainingSettleMs));
+    settleWaitedMs += Math.max(0, now() - passCompletedAt);
   }
 
   // Freeze the receipt clock before the mandatory final aggregate read. No
   // injected clock runs after this observation, so a clock hook cannot mutate
-  // ownership between the final truth read and serialization.
+  // ownership between the final truth read and serialization. The final pass
+  // itself is observer overhead after the decision, not settle time; one
+  // trailing clock read accounts for it without re-running any observer.
   const receiptBoundaryAt = now();
-  deadlineCrossed = deadlineCrossed || receiptBoundaryAt >= deadline;
   final = await observeLaunchAgentUnloadOnce({
     label: options.label,
     pidPath: options.pidPath,
@@ -1845,26 +1873,28 @@ export async function observeLaunchAgentUnloadTerminalState(options: {
     reconcileCleanupState,
     removePidFile,
     removedPidFile,
-    pidCleanupAmbiguous,
     pidCleanupQuarantined,
   });
+  const receiptCompletedAt = now();
   observations += 1;
   removedPidFile = final.removedPidFile;
-  pidCleanupAmbiguous = final.pidCleanupAmbiguous;
   pidCleanupQuarantined = final.pidCleanupQuarantined;
-  const elapsedMs = Math.max(0, receiptBoundaryAt - startedAt);
+  observerOverheadMs += Math.max(0, receiptCompletedAt - receiptBoundaryAt);
+  const elapsedMs = Math.max(0, receiptCompletedAt - startedAt);
   return Object.freeze({
     stopped: final.stopped,
     state: final.state,
     pidCleaned: final.pidCleaned,
     removedPidFile,
-    pidCleanupAmbiguous,
+    pidCleanupAmbiguous: final.pidCleanupAmbiguous,
     pidCleanupQuarantined,
     final,
     timing: {
       timeoutMs,
       pollIntervalMs,
       elapsedMs,
+      settleWaitedMs,
+      observerOverheadMs,
       observations,
       deadlineCrossed,
       finalObservationPerformed: true as const,
