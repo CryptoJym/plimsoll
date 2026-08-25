@@ -86,6 +86,15 @@ workspace. The receipt therefore records these as
 `not_run_requires_hosted_authorization` or
 `not_run_requires_owner_authorization`; it never simulates them as passing.
 
+The companion gate `pnpm proof:fleet-release-gate` proves the client-side half
+of those boundaries synthetically: two members/two machines stay distinct, one
+actor maps across own devices only through the workspace binding, each device
+transmits only its own install key, a 401 revocation opens the auth circuit so
+the next upload cycle sends nothing, rotation restores only the intended device
+and drains exactly once, and a fresh ledger presenting the revoked key is
+refused again even after circuit expiry. It uses injected transports only; the
+hosted registry semantics themselves remain external gates.
+
 Run the source gate with Node 22:
 
 ```sh
