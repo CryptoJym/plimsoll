@@ -35,6 +35,9 @@ jobs:
       - name: Prove source installer and read-only doctor
         run: pnpm proof:install-doctor
 
+      - name: Prove machine-mode receipts and installer runtime boundary
+        run: pnpm proof:machine-receipt
+
       - name: Prove atomic no-follow LaunchAgent manifest lifecycle
         run: pnpm proof:launch-agent
 

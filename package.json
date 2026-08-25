@@ -47,6 +47,7 @@
     "proof:codex-config-apply": "tsx scripts/codex-config-apply-proof.ts",
     "proof:claude-config-apply": "tsx scripts/claude-config-apply-proof.ts",
     "proof:install-doctor": "tsx scripts/install-doctor-proof.ts",
+    "proof:machine-receipt": "tsx scripts/machine-receipt-proof.ts",
     "proof:launch-agent": "tsx scripts/launch-agent-transaction-proof.ts",
     "proof:collector-home": "tsx scripts/collector-home-proof.ts",
     "proof:launch-agent-unload": "tsx scripts/launch-agent-unload-proof.ts",

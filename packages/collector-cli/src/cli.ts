@@ -66,6 +66,7 @@ import {
   type CollectorConfig,
 } from "./config";
 import { appendForwardedHook } from "./forwarder";
+import { runMachineMode } from "./machine";
 import {
   loadOrCreateLocalIngestAuth,
   readLocalIngestAuth,
@@ -315,6 +316,12 @@ Config tools:
   lifecycle support-bundle --operation-id ID
       Sanitized, bounded diagnostics: versions, coarse readiness, counters,
       aggregate log codes. No paths, prompts, tokens, or secrets.
+  stop                  Stop the foreground daemon using the local PID file
+  machine CMD [args...] Automation surface: run an operator command (setup, doctor,
+                        install-launch-agent, load-launch-agent, unload-launch-agent,
+                        start, status, stop) and emit exactly ONE versioned JSON
+                        receipt on stdout; diagnostics go to sanitized stderr.
+                        Exit codes and schema: docs/machine-mode.md
 `);
 }
 
@@ -1290,6 +1297,20 @@ async function main() {
     return;
   }
 
+  // Issue #133: the one automation surface. Must run before any config or
+  // ledger side effects: the wrapper itself is read-only; only the inner
+  // command it spawns may mutate state, and its receipt is the sole stdout.
+  if (command === "machine") {
+    process.exitCode = await runMachineMode({
+      execPath: process.execPath,
+      execArgv: process.execArgv,
+      entryScript: process.argv[1] ?? "",
+      innerArgv: process.argv.slice(3),
+      env: process.env,
+    });
+    return;
+  }
+
   if (command === "__maintenance_worker") {
     const spawnNonce = process.argv[3] ?? "";
     const environmentNonce = process.env.PLIMSOLL_MAINTENANCE_SPAWN_NONCE ?? "";
@@ -2182,8 +2203,13 @@ async function main() {
 
     const planClaude = applyClaudeSettings(claudeFile, claudeGenerated, { dryRun: true });
     const planCodex = applyCodexConfig(codexFile, codexToml, { dryRun: true });
+    // Issue #133: inside a machine-mode pipeline the plan preview is a
+    // diagnostic, not stdout content — stdout must stay exactly one JSON value.
+    const machinePipeline = process.env.PLIMSOLL_MACHINE_CHILD === "1";
     for (const plan of [planClaude, planCodex]) {
-      for (const change of plan.changes) console.log(`${plan.path}: ${change}`);
+      for (const change of plan.changes) {
+        (machinePipeline ? console.error : console.log)(`${plan.path}: ${change}`);
+      }
       if (plan.conflict) console.warn(`${plan.path}: ${plan.conflict}`);
     }
     if (planCodex.conflict) {
@@ -3060,17 +3086,18 @@ async function main() {
   }
 
   if (command === "unload-launch-agent") {
-    console.log(
-      JSON.stringify(
-        {
-          unloading: true,
-          label: LAUNCH_AGENT_LABEL,
-          unloadCommand: launchctlBootoutCommand().join(" "),
-        },
-        null,
-        2,
-      ),
-    );
+    const unloadProgressReceipt = {
+      unloading: true,
+      label: LAUNCH_AGENT_LABEL,
+      unloadCommand: launchctlBootoutCommand().join(" "),
+    };
+    if (process.env.PLIMSOLL_MACHINE_CHILD === "1") {
+      // Machine pipeline (issue #133): the final receipt is the only stdout
+      // value; progress goes to stderr.
+      console.warn(JSON.stringify(unloadProgressReceipt));
+    } else {
+      console.log(JSON.stringify(unloadProgressReceipt, null, 2));
+    }
     const result = await executeLaunchAgentUnload(config.port, launchAgentMutationAuthority());
     console.log(JSON.stringify(launchAgentUnloadReceipt(result), null, 2));
     if (!result.unloaded) process.exitCode = 1;
