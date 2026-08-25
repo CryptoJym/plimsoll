@@ -6,6 +6,7 @@ import { isDeepStrictEqual } from "node:util";
 
 import { collectorHome } from "./config";
 import { collectorHomeIdentityHash, resolveCollectorHome } from "./collector-home";
+import type { LifecycleMutationAuthority, LifecycleMutationLease } from "./lifecycle-authority";
 export const LAUNCH_AGENT_LABEL = "com.plimsoll.collector";
 export const LAUNCH_AGENT_SYSTEM_PATHS = [
   "/opt/homebrew/bin",
@@ -44,6 +45,13 @@ export type LaunchAgentOptions = {
   workingDirectory?: string;
   dryRun?: boolean;
   transactionHooks?: LaunchAgentTransactionHooks;
+  /**
+   * Issue #158: when set, the mutating window of install/uninstall holds one
+   * lease from the shared lifecycle mutation authority and revalidates it
+   * immediately before each commit-critical step. Previews, exact no-op
+   * installs, and read-only inspection never acquire the lease.
+   */
+  mutationAuthority?: LifecycleMutationAuthority;
 };
 
 export type LaunchAgentEnvironmentKeys =
@@ -133,6 +141,21 @@ function runHook(hook: (() => void) | undefined) {
   } catch {
     fail("TRANSACTION_ABORTED");
   }
+}
+
+function acquireMutationFence(
+  options: { mutationAuthority?: LifecycleMutationAuthority },
+): LifecycleMutationLease | null {
+  if (!options.mutationAuthority) return null;
+  const acquisition = options.mutationAuthority.acquire();
+  if (acquisition.kind === "acquired") return acquisition.lease;
+  fail(acquisition.kind === "busy" ? "LIFECYCLE_FENCE_BUSY" : "LIFECYCLE_FENCE_AMBIGUOUS");
+}
+
+function assertMutationFence(fence: LifecycleMutationLease | null) {
+  if (!fence) return;
+  const state = fence.assertCurrent();
+  if (!state.ok) fail(`LIFECYCLE_FENCE_${state.reason.toUpperCase()}`);
 }
 
 function digest(value: string | Buffer) {
@@ -953,8 +976,17 @@ export function installLaunchAgent(options: LaunchAgentOptions): LaunchAgentInst
       };
     }
 
-    const snapshot = ensureParent(initial.snapshot, homeDir, options.transactionHooks?.afterParentCreate);
-    if (snapshot.exists !== initial.snapshot.exists) fail("PATH_CHANGED");
+    // Mutating section: hold the shared lifecycle mutation lease across every
+    // step and revalidate it immediately before each commit-critical action.
+    const fence = acquireMutationFence(options);
+    let snapshot: PathSnapshot;
+    try {
+      snapshot = ensureParent(initial.snapshot, homeDir, options.transactionHooks?.afterParentCreate);
+      if (snapshot.exists !== initial.snapshot.exists) fail("PATH_CHANGED");
+    } catch (error) {
+      fence?.release();
+      throw error;
+    }
     const boundDescriptor = initial.descriptor;
     let prepared: ReturnType<typeof prepareFile> | undefined;
     let committed: ReturnType<typeof prepareFile> | undefined;
@@ -967,6 +999,7 @@ export function installLaunchAgent(options: LaunchAgentOptions): LaunchAgentInst
         if (!readBound(boundDescriptor, snapshot.leaf).equals(initial.content)) fail("BOUND_CONTENT_CHANGED");
         assertVisibleContent(snapshot, snapshot.leaf, initial.content);
       }
+      assertMutationFence(fence);
       prepared = prepareFile(snapshot, desired);
       runHook(options.transactionHooks?.afterPrepare);
       assertStablePath(snapshot);
@@ -986,6 +1019,7 @@ export function installLaunchAgent(options: LaunchAgentOptions): LaunchAgentInst
       if (snapshot.exists) {
         assertVisibleContent(snapshot, snapshot.leaf!, initial.content!);
         if (rollback) assertRollback(snapshot, rollback, initial.content!);
+        assertMutationFence(fence);
         const claimPath = path.join(
           path.dirname(snapshot.absolutePath),
           `.${path.basename(snapshot.absolutePath)}.plimsoll-claim-${randomUUID()}`,
@@ -1021,6 +1055,7 @@ export function installLaunchAgent(options: LaunchAgentOptions): LaunchAgentInst
         path.dirname(snapshot.absolutePath),
         `.${path.basename(snapshot.absolutePath)}.plimsoll-commit-${randomUUID()}`,
       );
+      assertMutationFence(fence);
       fs.renameSync(prepared.path, committedPath);
       const committedStat = lstat(committedPath);
       if (!committedStat) fail("COMMIT_OBJECT_MISSING");
@@ -1033,6 +1068,7 @@ export function installLaunchAgent(options: LaunchAgentOptions): LaunchAgentInst
         committed.identity,
         desired,
       );
+      assertMutationFence(fence);
       fs.linkSync(committed.path, snapshot.absolutePath);
       fs.unlinkSync(committed.path);
       const publishedIdentity = identity(fs.lstatSync(snapshot.absolutePath));
@@ -1051,6 +1087,7 @@ export function installLaunchAgent(options: LaunchAgentOptions): LaunchAgentInst
       fsyncDirectory(path.dirname(snapshot.absolutePath));
       assertVisibleContent(snapshot, visible.leaf, desired);
       if (claim) {
+        assertMutationFence(fence);
         unlinkIfIdentity(claim.path, claim.identity);
         claim = undefined;
         fsyncDirectory(path.dirname(snapshot.absolutePath));
@@ -1067,6 +1104,7 @@ export function installLaunchAgent(options: LaunchAgentOptions): LaunchAgentInst
       if (committed) unlinkIfIdentity(committed.path, committed.identity);
       if (published) unlinkIfIdentity(published.path, published.identity);
       if (claim) restoreUnexpectedClaim(claim.path, snapshot.absolutePath, claim.identity);
+      if (fence) fence.release();
     }
   } finally {
     if (initial.descriptor !== undefined) fs.closeSync(initial.descriptor);
@@ -1131,6 +1169,8 @@ export function uninstallLaunchAgent(options: {
   label?: string;
   dryRun?: boolean;
   transactionHooks?: Pick<LaunchAgentTransactionHooks, "beforeCommit" | "afterCommit">;
+  /** Issue #158: fences the apply path on the shared lifecycle authority. */
+  mutationAuthority?: LifecycleMutationAuthority;
 }): { plistPath: string; receipt: LaunchAgentUninstallReceipt } {
   if ((options.label ?? LAUNCH_AGENT_LABEL) !== LAUNCH_AGENT_LABEL) fail("LABEL_NOT_ALLOWLISTED");
   const homeDir = ensureHomeRoot(options.homeDir ?? os.homedir());
@@ -1170,50 +1210,60 @@ export function uninstallLaunchAgent(options: {
     }
     assertStablePath(preimage.snapshot);
     runHook(options.transactionHooks?.beforeCommit);
-    assertVisibleContent(preimage.snapshot, preimage.snapshot.leaf!, preimage.content);
-    const claimPath = path.join(
-      path.dirname(preimage.snapshot.absolutePath),
-      `.${path.basename(preimage.snapshot.absolutePath)}.plimsoll-remove-${randomUUID()}`,
-    );
-    fs.renameSync(preimage.snapshot.absolutePath, claimPath);
-    const claimed = lstat(claimPath);
-    if (!claimed) fail("REMOVE_CLAIM_MISSING");
-    const claimIdentity = identity(claimed);
-    if (!sameObject(claimIdentity, preimage.snapshot.leaf!)) {
-      restoreUnexpectedClaim(claimPath, preimage.snapshot.absolutePath, claimIdentity);
-      fail("REMOVE_CLAIM_MISMATCH");
-    }
+    // Mutating section: hold and revalidate the shared lifecycle mutation
+    // lease immediately before the removal claim and each destructive step.
+    const fence = acquireMutationFence(options);
     try {
-      assertVisibleContent(
-        { ...preimage.snapshot, absolutePath: claimPath, exists: true, leaf: claimIdentity },
-        claimIdentity,
-        preimage.content,
+      assertMutationFence(fence);
+      assertVisibleContent(preimage.snapshot, preimage.snapshot.leaf!, preimage.content);
+      const claimPath = path.join(
+        path.dirname(preimage.snapshot.absolutePath),
+        `.${path.basename(preimage.snapshot.absolutePath)}.plimsoll-remove-${randomUUID()}`,
       );
-    } catch {
-      restoreUnexpectedClaim(claimPath, preimage.snapshot.absolutePath, claimIdentity);
-      fail("REMOVE_CLAIM_MISMATCH");
+      assertMutationFence(fence);
+      fs.renameSync(preimage.snapshot.absolutePath, claimPath);
+      const claimed = lstat(claimPath);
+      if (!claimed) fail("REMOVE_CLAIM_MISSING");
+      const claimIdentity = identity(claimed);
+      if (!sameObject(claimIdentity, preimage.snapshot.leaf!)) {
+        restoreUnexpectedClaim(claimPath, preimage.snapshot.absolutePath, claimIdentity);
+        fail("REMOVE_CLAIM_MISMATCH");
+      }
+      try {
+        assertVisibleContent(
+          { ...preimage.snapshot, absolutePath: claimPath, exists: true, leaf: claimIdentity },
+          claimIdentity,
+          preimage.content,
+        );
+      } catch {
+        restoreUnexpectedClaim(claimPath, preimage.snapshot.absolutePath, claimIdentity);
+        fail("REMOVE_CLAIM_MISMATCH");
+      }
+      runHook(options.transactionHooks?.afterCommit);
+      if (lstat(preimage.snapshot.absolutePath)) {
+        restoreUnexpectedClaim(claimPath, preimage.snapshot.absolutePath, claimIdentity);
+        fail("REMOVE_DESTINATION_REAPPEARED");
+      }
+      assertMutationFence(fence);
+      unlinkIfIdentity(claimPath, claimIdentity);
+      fsyncDirectory(path.dirname(preimage.snapshot.absolutePath));
+      if (lstat(preimage.snapshot.absolutePath)) fail("REMOVE_POSTCONDITION_CHANGED");
+      return {
+        plistPath,
+        receipt: {
+          schema: "plimsoll.launch-agent-uninstall.v1",
+          operation: "uninstall",
+          status: "removed",
+          target: "user_launch_agent",
+          label: LAUNCH_AGENT_LABEL,
+          changed: true,
+          wouldChange: true,
+          removedManifestDigest: digest(preimage.content),
+        },
+      };
+    } finally {
+      fence?.release();
     }
-    runHook(options.transactionHooks?.afterCommit);
-    if (lstat(preimage.snapshot.absolutePath)) {
-      restoreUnexpectedClaim(claimPath, preimage.snapshot.absolutePath, claimIdentity);
-      fail("REMOVE_DESTINATION_REAPPEARED");
-    }
-    unlinkIfIdentity(claimPath, claimIdentity);
-    fsyncDirectory(path.dirname(preimage.snapshot.absolutePath));
-    if (lstat(preimage.snapshot.absolutePath)) fail("REMOVE_POSTCONDITION_CHANGED");
-    return {
-      plistPath,
-      receipt: {
-        schema: "plimsoll.launch-agent-uninstall.v1",
-        operation: "uninstall",
-        status: "removed",
-        target: "user_launch_agent",
-        label: LAUNCH_AGENT_LABEL,
-        changed: true,
-        wouldChange: true,
-        removedManifestDigest: digest(preimage.content),
-      },
-    };
   } finally {
     if (preimage.descriptor !== undefined) fs.closeSync(preimage.descriptor);
   }
