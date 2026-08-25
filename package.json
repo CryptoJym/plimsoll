@@ -22,6 +22,7 @@
     "proof:maintenance-starvation": "tsx scripts/maintenance-starvation-proof.ts",
     "proof:maintenance-boundary": "tsx scripts/maintenance-boundary-proof.ts",
     "proof:incremental-capture": "tsx scripts/incremental-capture-proof.ts",
+    "proof:token-lineage": "tsx scripts/token-lineage-proof.ts",
     "proof:git-context": "tsx scripts/git-context-proof.ts",
     "proof:repo-context": "tsx scripts/repo-context-proof.ts",
     "proof:codex-reconciliation": "tsx scripts/codex-reconciliation-proof.ts",
