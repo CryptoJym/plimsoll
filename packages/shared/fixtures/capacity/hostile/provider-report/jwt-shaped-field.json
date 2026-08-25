@@ -1,0 +1,17 @@
+{
+  "comment": "Issue #167 wave 1: a JWT-shaped value planted in an allowlisted text field (a dimension label here) is still credential-shaped and must be refused; allowlisted slots get named-shape scrutiny even though they skip the opaque-blob heuristic. The token is synthetic.",
+  "report": {
+    "schema": "plimsoll.provider-capacity-report.v1",
+    "profileId": "anthropic.max.james",
+    "observedAt": "2026-08-20T23:45:00.000Z",
+    "entries": [
+      {
+        "dimension": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzeW50aGV0aWMifQ.SYNTHETICSIGnbGciOiJIUzI1",
+        "unit": "tokens",
+        "limit": 220000,
+        "used": 180000
+      }
+    ]
+  },
+  "mustNotEcho": "eyJzdWIiOiJzeW50aGV0aWMifQ"
+}

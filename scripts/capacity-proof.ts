@@ -19,12 +19,16 @@ import { scanCapacityDoctrine } from "./capacity-dependency-reachability";
 
 import {
   CAPACITY_PLAN_SCHEMA,
+  PROVIDER_REPORT_MAX_ENTRIES,
+  PROVIDER_REPORT_SCHEMA,
   assertCapacityMergeApproval,
   buildCapacityPlan,
   buildCapacityResetCalendar,
   classifyCapacitySignalFreshness,
   estimateCapacityLinearPace,
+  parseProviderCapacityReport,
   type CapacityPaceEstimate,
+  type CapacityUsageSignal,
 } from "../packages/shared/src/index";
 
 const root = process.cwd();
@@ -839,6 +843,334 @@ function prove(name: string, condition: unknown, detail: Record<string, unknown>
     !/(?:capacity[A-Za-z]*\s*=>\s*.*outcomePerformance)|(?:outcomePerformance\s*=.*[Cc]apacity)/.test(dashboard) &&
       !/[Cc]apacity.*outcomePerformance/.test(server),
     {},
+  );
+}
+
+// ---------------------------------------------------------------------------
+// 6. Provider-reported capacity headroom ingestion lane (issue #167).
+//
+// Local-first, credential-non-custodial: owner-supplied provider reports are
+// validated into provider_report signals; credential material anywhere in the
+// payload refuses the whole report with redacted findings.
+// ---------------------------------------------------------------------------
+{
+  const fixture = JSON.parse(
+    fs.readFileSync(path.join(fixtures, "provider-report.json"), "utf8"),
+  ) as {
+    now: string;
+    maxAgeMs: number;
+    profiles: Array<{ profileId: string; provider: string }>;
+    report: unknown;
+  };
+
+  const signals = parseProviderCapacityReport(fixture.report);
+  const fiveHour = signals.find((signal) => signal.dimension === "five_hour_window")!;
+  const weekly = signals.find((signal) => signal.dimension === "weekly_all_models")!;
+  prove(
+    "provider_report_fixture_parses_into_provider_source_signals",
+    signals.length === 2 &&
+      signals.every((signal) => signal.source === "provider_report") &&
+      signals.every((signal) => signal.profileId === "anthropic.max.james") &&
+      signals.every((signal) => signal.observedAt === "2026-08-20T23:45:00.000Z"),
+    { signals },
+  );
+  prove(
+    "provider_report_remaining_derives_used_without_silent_clamping",
+    weekly.limit === 4_000_000 && weekly.used === 1_500_000 && fiveHour.used === 180_000,
+    { fiveHour, weekly },
+  );
+
+  const reportPlan = buildCapacityPlan({
+    profiles: fixture.profiles,
+    resets: [],
+    signalsByProfile: { "anthropic.max.james": signals },
+    now: fixture.now,
+    maxAgeMs: fixture.maxAgeMs,
+  });
+  const handBuiltPlan = buildCapacityPlan({
+    profiles: fixture.profiles,
+    resets: [],
+    signalsByProfile: {
+      "anthropic.max.james": [
+        {
+          signalId: "hand.built.five_hour",
+          profileId: "anthropic.max.james",
+          dimension: "five_hour_window",
+          unit: "tokens",
+          limit: 220_000,
+          used: 180_000,
+          source: "provider_report",
+          observedAt: "2026-08-20T23:45:00.000Z",
+        },
+        {
+          signalId: "hand.built.weekly",
+          profileId: "anthropic.max.james",
+          dimension: "weekly_all_models",
+          unit: "tokens",
+          limit: 4_000_000,
+          used: 1_500_000,
+          source: "provider_report",
+          observedAt: "2026-08-20T23:45:00.000Z",
+        },
+      ],
+    } satisfies Record<string, CapacityUsageSignal[]>,
+    now: fixture.now,
+    maxAgeMs: fixture.maxAgeMs,
+  });
+  assert.deepStrictEqual(
+    reportPlan.summaries[0]!.constraints,
+    handBuiltPlan.summaries[0]!.constraints,
+  );
+  prove(
+    "provider_report_signals_feed_plan_with_fresh_headroom_parity_to_hand_built",
+    reportPlan.summaries[0]!.constraints.length === 2 &&
+      reportPlan.summaries[0]!.constraints.every((row) => row.freshness === "fresh") &&
+      reportPlan.summaries[0]!.constraints.find((row) => row.dimension === "five_hour_window")!
+        .remaining === 40_000 &&
+      reportPlan.summaries[0]!.constraints.find((row) => row.dimension === "weekly_all_models")!
+        .remaining === 2_500_000,
+    { constraints: reportPlan.summaries[0]!.constraints },
+  );
+
+  const reparsed = parseProviderCapacityReport(fixture.report);
+  prove(
+    "provider_report_signal_ids_deterministic_across_reparses",
+    JSON.stringify(reparsed.map((signal) => signal.signalId)) ===
+      JSON.stringify(signals.map((signal) => signal.signalId)),
+    {
+      first: signals.map((signal) => signal.signalId),
+      second: reparsed.map((signal) => signal.signalId),
+    },
+  );
+
+  // Hostile fixtures — each must refuse whole, redacted.
+  const hostileDir = path.join(fixtures, "hostile", "provider-report");
+
+  const topLevel = JSON.parse(
+    fs.readFileSync(path.join(hostileDir, "credential-top-level.json"), "utf8"),
+  ) as { report: unknown; mustNotEcho: string };
+  let topLevelError: string | null = null;
+  try {
+    parseProviderCapacityReport(topLevel.report);
+  } catch (error) {
+    topLevelError = error instanceof Error ? error.message : String(error);
+  }
+  prove(
+    "hostile_top_level_credential_key_rejects_whole_report_and_redacted",
+    topLevelError !== null &&
+      topLevelError.startsWith("provider_report_credential_material_rejected") &&
+      !topLevelError.includes(topLevel.mustNotEcho) &&
+      topLevelError.includes("<redacted-key>") &&
+      !topLevelError.includes("apiKey"),
+    { error: topLevelError },
+  );
+
+  const nested = JSON.parse(
+    fs.readFileSync(path.join(hostileDir, "credential-nested-entry.json"), "utf8"),
+  ) as { report: unknown; mustNotEcho: string };
+  let nestedError: string | null = null;
+  try {
+    parseProviderCapacityReport(nested.report);
+  } catch (error) {
+    nestedError = error instanceof Error ? error.message : String(error);
+  }
+  prove(
+    "hostile_nested_authorization_smuggling_rejected_and_value_never_echoed",
+    nestedError !== null &&
+      nestedError.startsWith("provider_report_credential_material_rejected") &&
+      !nestedError.includes(nested.mustNotEcho),
+    { error: nestedError },
+  );
+
+  const jwtShaped = JSON.parse(
+    fs.readFileSync(path.join(hostileDir, "jwt-shaped-field.json"), "utf8"),
+  ) as { report: unknown; mustNotEcho: string };
+  let jwtError: string | null = null;
+  try {
+    parseProviderCapacityReport(jwtShaped.report);
+  } catch (error) {
+    jwtError = error instanceof Error ? error.message : String(error);
+  }
+  prove(
+    "hostile_jwt_shaped_allowlisted_field_value_rejected",
+    jwtError !== null &&
+      jwtError.startsWith("provider_report_credential_material_rejected") &&
+      jwtError.includes("credential_value_shape:jwt") &&
+      !jwtError.includes(jwtShaped.mustNotEcho),
+    { error: jwtError },
+  );
+
+  const contradictory = JSON.parse(
+    fs.readFileSync(path.join(hostileDir, "contradictory-remaining.json"), "utf8"),
+  ) as { report: unknown };
+  let contradictoryError: string | null = null;
+  try {
+    parseProviderCapacityReport(contradictory.report);
+  } catch (error) {
+    contradictoryError = error instanceof Error ? error.message : String(error);
+  }
+  prove(
+    "hostile_remaining_exceeding_limit_refused_not_clamped_or_negated",
+    contradictoryError !== null &&
+      contradictoryError.startsWith("contradictory provider report entry"),
+    { error: contradictoryError },
+  );
+
+  // Structural fail-closed cases.
+  const validEntry = {
+    dimension: "five_hour_window",
+    unit: "tokens",
+    limit: 220_000,
+    used: 180_000,
+  };
+  const baseReport = {
+    schema: PROVIDER_REPORT_SCHEMA,
+    profileId: "anthropic.max.james",
+    observedAt: "2026-08-20T23:45:00.000Z",
+    entries: [validEntry],
+  };
+
+  assert.throws(() =>
+    parseProviderCapacityReport({ ...baseReport, schema: "plimsoll.provider-capacity-report.v2" }),
+  );
+  assert.throws(() =>
+    parseProviderCapacityReport({
+      ...baseReport,
+      entries: [
+        { ...validEntry },
+        { ...validEntry, dimension: "five_hour_window" },
+      ],
+    }),
+  );
+  assert.throws(() =>
+    parseProviderCapacityReport({
+      ...baseReport,
+      entries: [{ ...validEntry, used: -5 }],
+    }),
+  );
+  prove(
+    "provider_report_refuses_wrong_schema_duplicate_dimensions_and_negative_usage",
+    true,
+    {},
+  );
+
+  assert.throws(() =>
+    parseProviderCapacityReport({
+      ...baseReport,
+      entries: [{ ...validEntry, quotaNote: "honest prose note" }],
+    }),
+  );
+  prove("provider_report_unknown_entry_fields_refused", true, {});
+
+  const emptySignals = parseProviderCapacityReport({
+    ...baseReport,
+    entries: [],
+  });
+  const emptyPlan = buildCapacityPlan({
+    profiles: fixture.profiles,
+    resets: [],
+    signalsByProfile: { "anthropic.max.james": emptySignals },
+    now: fixture.now,
+    maxAgeMs: fixture.maxAgeMs,
+  });
+  prove(
+    "empty_provider_report_is_an_honest_empty_lane_not_an_error",
+    emptySignals.length === 0 && emptyPlan.summaries[0]!.constraints.length === 0,
+    { emptySignals },
+  );
+
+  const futureReport = parseProviderCapacityReport({
+    ...baseReport,
+    observedAt: "2026-08-22T00:00:00.000Z",
+  });
+  const futurePlan = buildCapacityPlan({
+    profiles: fixture.profiles,
+    resets: [],
+    signalsByProfile: { "anthropic.max.james": futureReport },
+    now: fixture.now,
+    maxAgeMs: fixture.maxAgeMs,
+  });
+  prove(
+    "future_dated_provider_report_stays_unknown_through_existing_freshness_gate",
+    futureReport.length === 1 &&
+      futurePlan.summaries[0]!.constraints[0]!.freshness === "UNKNOWN" &&
+      futurePlan.summaries[0]!.constraints[0]!.remaining === null &&
+      futurePlan.staleAlerts.length === 1 &&
+      futurePlan.staleAlerts[0]!.severity === "MISSING_SIGNAL",
+    { report: futureReport, alerts: futurePlan.staleAlerts },
+  );
+
+  assert.throws(() =>
+    parseProviderCapacityReport({
+      ...baseReport,
+      entries: Array.from({ length: PROVIDER_REPORT_MAX_ENTRIES + 1 }, (_, index) => ({
+        ...validEntry,
+        dimension: `dimension_${index}`,
+      })),
+    }),
+  );
+  prove("provider_report_entry_bounds_enforced_fail_closed", true, {});
+
+  // Adversarial: opaque secret blob hidden in an UNKNOWN field deep inside an
+  // entry must still be caught (whole-payload scan), while a long-but-legit
+  // allowlisted dimension label must NOT false-positive.
+  let smuggledBlobError: string | null = null;
+  try {
+    parseProviderCapacityReport({
+      ...baseReport,
+      entries: [{ ...validEntry, note: { deep: { blob: "A1b2".repeat(10) } } }],
+    });
+  } catch (error) {
+    smuggledBlobError = error instanceof Error ? error.message : String(error);
+  }
+  prove(
+    "adversarial_opaque_secret_blob_in_unknown_nested_field_caught",
+    smuggledBlobError !== null &&
+      smuggledBlobError.includes("credential_value_shape:opaque_high_entropy"),
+    { error: smuggledBlobError },
+  );
+
+  const longLegitDimension =
+    "five_hour_window_" + "abcdefghij".repeat(3) + "1234567890";
+  const benignSignals = parseProviderCapacityReport({
+    ...baseReport,
+    entries: [{ ...validEntry, dimension: longLegitDimension }],
+  });
+  prove(
+    "negative_control_long_legitimate_dimension_label_does_not_trip_credential_scan",
+    benignSignals.length === 1 && benignSignals[0]!.dimension === longLegitDimension,
+    { dimension: longLegitDimension },
+  );
+
+  // Adversarial: hostile nesting depth fails closed instead of crashing the
+  // scanner (stack-exhaustion attempt).
+  let deepPayload: Record<string, unknown> = { leaf: "A1b2".repeat(10) };
+  for (let level = 0; level < 32; level++) {
+    deepPayload = { child: deepPayload };
+  }
+  let deepError: string | null = null;
+  try {
+    parseProviderCapacityReport({ ...baseReport, extra: deepPayload });
+  } catch (error) {
+    deepError = error instanceof Error ? error.message : String(error);
+  }
+  prove(
+    "adversarial_deeply_nested_payload_fails_closed_without_crashing",
+    deepError !== null && deepError.startsWith("provider_report_payload_out_of_bounds"),
+    { error: deepError },
+  );
+
+  // The lane is descriptive context only: parsed signals carry no ranking or
+  // verdict fields and feed only buildCapacityPlan-shaped summaries.
+  prove(
+    "provider_report_lane_stays_descriptive_context_only",
+    signals.every(
+      (signal) =>
+        !Object.keys(signal).some((key) =>
+          /(?:rank|score|verdict|coach|route|compensat|disciplin)/i.test(key),
+        ),
+    ),
+    { keys: Object.keys(signals[0]!) },
   );
 }
 
