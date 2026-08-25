@@ -1,11 +1,11 @@
 {
   "schema": "plimsoll.system-e2e-support-contract.v1",
-  "normalizationVersion": 5,
+  "normalizationVersion": 6,
   "phases": [
     {
       "name": "install_doctor",
       "kind": "json_result",
-      "expectedArtifactDigest": "sha256:166fe3b00a76a192effa2eb160a19413e70a5835b0fad1359fc09f307c309eb2"
+      "expectedArtifactDigest": "sha256:a1c61d93224f4c6899cf0ae648bc72b1cc9b01d55f5d4aa025d3f006c1d52f67"
     },
     {
       "name": "transactional_join",

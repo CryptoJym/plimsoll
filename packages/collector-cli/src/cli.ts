@@ -50,6 +50,10 @@ const pidCleanupAttemptReceipt = (result: CollectorPidCleanupResult | null) =>
 
 import { LocalEventBuffer } from "./buffer";
 import {
+  collectorHomeIdentityHash,
+  resolveCollectorHome,
+} from "./collector-home";
+import {
   assertCollectorPrivacyMode,
   collectorHome,
   collectorBufferPath,
@@ -693,6 +697,14 @@ async function checkCollectorConnectivity(port: number) {
       (runtimeCandidate as Partial<CollectorRuntimeIdentity>).processStartFingerprint!.startsWith("sha256:")
         ? (runtimeCandidate as CollectorRuntimeIdentity)
         : null;
+    // Issue #135 runtime attestation: the live daemon reports the path-free
+    // identity of the home it actually runs against. Null means the daemon
+    // predates home attestation; an explicit mismatch is drift.
+    const daemonHomeHash = body?.homeIdentityHash;
+    const homeIdentityHash =
+      typeof daemonHomeHash === "string" && /^sha256:[0-9a-f]{64}$/.test(daemonHomeHash)
+        ? daemonHomeHash
+        : null;
     const health = body?.health && typeof body.health === "object"
       ? (body.health as { sources?: unknown })
       : null;
@@ -720,6 +732,7 @@ async function checkCollectorConnectivity(port: number) {
       status: response.status,
       statusUrl: `http://127.0.0.1:${port}/status`,
       runtimeIdentity,
+      homeIdentityHash,
       signal: {
         verified: signalVerified,
         tokenAttributedEvents:
@@ -735,6 +748,7 @@ async function checkCollectorConnectivity(port: number) {
       error: error instanceof Error ? error.name : String(error),
       statusUrl: `http://127.0.0.1:${port}/status`,
       runtimeIdentity: null,
+      homeIdentityHash: null,
       signal: {
         verified: false,
         tokenAttributedEvents: null,
@@ -856,6 +870,7 @@ function readLaunchAgentState(plistPath: string) {
       label: LAUNCH_AGENT_LABEL,
       plistPath,
       runtime: null,
+      homeIdentity: null,
       path: null,
     };
   }
@@ -917,6 +932,22 @@ function readLaunchAgentState(plistPath: string) {
       ? plist.EnvironmentVariables as Record<string, unknown>
       : null;
     const launchAgentPath = typeof environment?.PATH === "string" ? environment.PATH : "";
+    // Issue #135: compare the manifest's propagated collector home with the
+    // home this command resolved, using path-free identity hashes only. The
+    // daemon runs whatever PLIMSOLL_HOME the manifest carries (default home
+    // when absent), so a mismatch here means setup/doctor/status would inspect
+    // one home while launchd starts the daemon against another.
+    const expectedHomeHash = collectorHomeIdentityHash(collectorHome());
+    const manifestHome = typeof environment?.PLIMSOLL_HOME === "string"
+      ? environment.PLIMSOLL_HOME
+      : null;
+    const observedHomeHash = manifestHome ? privatePathReceipt(manifestHome) : null;
+    const homeIdentity = {
+      ok: observedHomeHash === expectedHomeHash,
+      manifestHomePresent: manifestHome !== null,
+      expectedHash: expectedHomeHash,
+      observedHash: observedHomeHash,
+    };
     const launchAgentPathEntries = launchAgentPath.split(path.delimiter);
     const normalizedPathEntries = launchAgentPathEntries.map((entry) => path.resolve(entry));
     const requiredPathEntries = [...new Set([
@@ -952,7 +983,8 @@ function readLaunchAgentState(plistPath: string) {
       plist.StandardOutPath === collectorLogPath("collector.out.log") &&
       plist.StandardErrorPath === collectorLogPath("collector.err.log") &&
       environment?.PLIMSOLL_COLLECTOR_DATA_MODE === "metadata" &&
-      pathOk,
+      pathOk &&
+      homeIdentity.ok,
     );
     return {
       ok: matchesExpectedRuntime,
@@ -961,6 +993,7 @@ function readLaunchAgentState(plistPath: string) {
       label: LAUNCH_AGENT_LABEL,
       plistPath,
       runtime,
+      homeIdentity,
       path: {
         ok: pathOk,
         ...pathValidation,
@@ -974,6 +1007,7 @@ function readLaunchAgentState(plistPath: string) {
       label: LAUNCH_AGENT_LABEL,
       plistPath,
       runtime: null,
+      homeIdentity: null,
       path: null,
     };
   }
@@ -1278,6 +1312,7 @@ async function main() {
     };
     const server = createCollectorServer(config, buffer, {
       runtimeIdentity,
+      homeIdentityHash: collectorHomeIdentityHash(collectorHome()),
       maintenanceStatus: () => ({
         boundary: maintenanceBoundary.status(),
         scheduler: scheduler?.status() ?? null,
@@ -1752,11 +1787,14 @@ async function main() {
   if (command === "status") {
     const buffer = openBuffer(config);
     const bufferPath = collectorBufferPath();
+    const resolvedHome = resolveCollectorHome();
     const projected = buffer.projection.readSnapshot(30, config.subscriptions);
     const projectedStatus = projected.kind === "ready" ? projected.snapshot.status : null;
     console.log(
       JSON.stringify(
         {
+          homeIdentityHash: collectorHomeIdentityHash(collectorHome()),
+          homeSource: resolvedHome.source,
           configPathHash: privatePathReceipt(collectorConfigPath()),
           bufferPathHash: privatePathReceipt(bufferPath),
           bufferFileBytes: fs.existsSync(bufferPath) ? fs.statSync(bufferPath).size : 0,
@@ -1954,6 +1992,11 @@ async function main() {
     );
     const pidCleanup = pidCleanupReconciliation.after;
     const pidRecord = pidRead.kind === "current" ? pidRead.record : null;
+    const expectedHomeHash = collectorHomeIdentityHash(collectorHome());
+    const resolvedHome = resolveCollectorHome();
+    const daemonHomeMatches = connectivity.homeIdentityHash === null
+      ? "unattested" as const
+      : connectivity.homeIdentityHash === expectedHomeHash;
     const runtime = {
       ok: Boolean(
         pidRecord &&
@@ -1975,6 +2018,13 @@ async function main() {
       identityMatchesStatus: pidRecord
         ? runtimeIdentityMatches(pidRecord, connectivity.runtimeIdentity)
         : false,
+      home: {
+        source: resolvedHome.source,
+        identityHash: expectedHomeHash,
+        custom: resolvedHome.source === "env",
+        daemonReportedHash: connectivity.homeIdentityHash,
+        daemonHomeMatches,
+      },
     };
     const nodeMajor = Number(process.versions.node.split(".")[0]);
     const node = {
@@ -1988,7 +2038,15 @@ async function main() {
       claude.ok &&
       codex.ok,
     );
-    const serviceReady = configured && launchAgent.ok && connectivity.reachable && runtime.ok;
+    // Issue #135: an explicit daemon-reported home drift (not merely an
+    // unattested daemon) blocks service readiness — doctor must never bless a
+    // service that runs against a different collector home.
+    const serviceReady =
+      configured &&
+      launchAgent.ok &&
+      connectivity.reachable &&
+      runtime.ok &&
+      daemonHomeMatches !== false;
     const signalVerified = serviceReady && connectivity.signal.verified;
     const readiness = signalVerified
       ? "signal_verified"

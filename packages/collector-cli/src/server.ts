@@ -132,6 +132,8 @@ export function createCollectorServer(
   buffer: LocalEventBuffer,
   options: {
     runtimeIdentity?: CollectorRuntimeIdentity;
+    /** Path-free identity of the collector home this daemon binds (issue #135). */
+    homeIdentityHash?: string;
     maintenanceStatus?: () => unknown;
     /** Sanitized startup cache. HTTP handlers never discover user files. */
     detectedIdentities?: () => Array<Record<string, unknown>>;
@@ -175,6 +177,7 @@ export function createCollectorServer(
     Object.assign(status, {
       ok: true,
       runtimeIdentity: options.runtimeIdentity ?? null,
+      homeIdentityHash: options.homeIdentityHash ?? null,
       dataMode: config.policy.dataMode,
       privacyMode: "metadata_only",
       privacy: collectorPrivacyReadiness(config),
@@ -225,6 +228,7 @@ export function createCollectorServer(
     const body: Record<string, unknown> = {
       ok: true,
       runtimeIdentity: options.runtimeIdentity ?? null,
+      homeIdentityHash: options.homeIdentityHash ?? null,
       dataMode: config.policy.dataMode,
       privacyMode: "metadata_only",
       privacy: collectorPrivacyReadiness(config),
@@ -302,6 +306,7 @@ export function createCollectorServer(
             : {
             ok: true,
             runtimeIdentity: options.runtimeIdentity ?? null,
+            homeIdentityHash: options.homeIdentityHash ?? null,
             dataMode: config.policy.dataMode,
             privacyMode: "metadata_only",
             privacy: collectorPrivacyReadiness(config),
