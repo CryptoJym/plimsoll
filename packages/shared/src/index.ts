@@ -34,3 +34,4 @@ export {
   type DeviceStatus,
   type DeviceTelemetry,
 } from "./device-registry";
+export * from "./provider-profiles";
