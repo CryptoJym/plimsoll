@@ -542,6 +542,7 @@ async function main() {
     // wire cap from 256 KiB to 2 MiB, so this body no longer fits one write).
     const oversizedBody = Buffer.alloc(LOCAL_HTTP_LIMITS.compressedBodyBytes + 1, "x");
     const oversizedStartedAt = performance.now();
+    const startedAt = performance.now();
     const oversized = await new Promise<HttpResult>((resolve) => {
       const client = http.request(
         {
