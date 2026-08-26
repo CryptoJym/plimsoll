@@ -38,6 +38,13 @@ jobs:
       - name: Prove atomic no-follow LaunchAgent manifest lifecycle
         run: pnpm proof:launch-agent
 
+      - name: Prove packaged runtime provenance and direct-Node LaunchAgent (#155)
+        run: pnpm proof:packaged-runtime
+        # Once upstream restores packages/collector-cli/src/lifecycle-adapters.ts
+        # and capture-fairness.ts (currently absent from main), add:
+        #   pnpm runtime:build && pnpm runtime:verify
+        # to enforce built-artifact provenance continuously.
+
       - name: Prove truthful LaunchAgent unload and collector supervision
         run: |
           pnpm --dir packages/collector-cli build

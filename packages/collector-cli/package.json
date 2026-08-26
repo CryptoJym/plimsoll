@@ -22,7 +22,7 @@
     "access": "public"
   },
   "scripts": {
-    "build": "esbuild src/cli.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/cli.mjs --external:better-sqlite3 && cp src/dashboard.html dist/dashboard.html && chmod +x dist/cli.mjs"
+    "build": "node ../../node_modules/tsx/dist/cli.mjs ../../scripts/build-packaged-runtime.ts"
   },
   "dependencies": {
     "better-sqlite3": "^12.10.0"
