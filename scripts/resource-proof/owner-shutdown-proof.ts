@@ -75,6 +75,16 @@ function waitForSignalArmed(child: import("node:child_process").ChildProcess) {
   });
 }
 
+/**
+ * Narrow the stop classification to its failure reason. A `failed:false`
+ * classification has no reason, mirroring the union shape in owner-shutdown.ts
+ * while keeping the strip-types harness type-safe under tsc.
+ */
+function stopFailureReason(observation: Parameters<typeof classifyStopCommand>[0]) {
+  const classification = classifyStopCommand(observation);
+  return classification.failed ? classification.reason : undefined;
+}
+
 async function main() {
   // T1: stop-command classification table.
   await check("stop_timeout_classifies_StopCommandFailure", () =>
@@ -85,49 +95,49 @@ async function main() {
       stopperReceiptParsed: false,
       stopReceiptReportedStopped: false,
     }).failed &&
-    classifyStopCommand({
+    stopFailureReason({
       stopperSettled: false,
       stopperExitCode: null,
       stopperSignal: null,
       stopperReceiptParsed: false,
       stopReceiptReportedStopped: false,
-    }).reason === "StopCommandTimeout",
+    }) === "StopCommandTimeout",
   );
   await check("stop_nonzero_exit_classifies_StopCommandFailure", () =>
-    classifyStopCommand({
+    stopFailureReason({
       stopperSettled: true,
       stopperExitCode: 1,
       stopperSignal: null,
       stopperReceiptParsed: true,
       stopReceiptReportedStopped: false,
-    }).reason === "StopCommandExitNonZero",
+    }) === "StopCommandExitNonZero",
   );
   await check("stop_signalled_classifies_StopCommandFailure", () =>
-    classifyStopCommand({
+    stopFailureReason({
       stopperSettled: true,
       stopperExitCode: null,
       stopperSignal: "SIGKILL",
       stopperReceiptParsed: false,
       stopReceiptReportedStopped: false,
-    }).reason === "StopCommandSignalled",
+    }) === "StopCommandSignalled",
   );
   await check("stop_unparseable_receipt_classifies_StopCommandFailure", () =>
-    classifyStopCommand({
+    stopFailureReason({
       stopperSettled: true,
       stopperExitCode: 0,
       stopperSignal: null,
       stopperReceiptParsed: false,
       stopReceiptReportedStopped: false,
-    }).reason === "StopReceiptUnparseable",
+    }) === "StopReceiptUnparseable",
   );
   await check("stop_not_stopped_receipt_classifies_StopCommandFailure", () =>
-    classifyStopCommand({
+    stopFailureReason({
       stopperSettled: true,
       stopperExitCode: 0,
       stopperSignal: null,
       stopperReceiptParsed: true,
       stopReceiptReportedStopped: false,
-    }).reason === "StopReceiptNotStopped",
+    }) === "StopReceiptNotStopped",
   );
   await check(
     "clean_stop_receipt_does_not_fail",

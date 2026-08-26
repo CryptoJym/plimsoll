@@ -852,14 +852,45 @@ esac
       env: { ...baseEnv, PLIMSOLL_TEST_LAUNCHCTL_FAIL: "1" },
     });
     const failedLoadReceipt = parseJson(failedLoad.stdout);
+    // Issue #158's mutation authority creates its private lease skeleton
+    // under the collector home before any launchctl mutation so concurrent
+    // loaders fence correctly; a released lease leaves only its own in-place
+    // released marker. A failed load must therefore leave at most that
+    // skeleton with every lease record marked released — never a config,
+    // ledger, launchctl state, or a held lease.
+    const failedLoadFootprint = (() => {
+      if (!fs.existsSync(cliHome)) return { skeletonOnly: true, entries: [] as string[] };
+      const entries = fs.readdirSync(cliHome);
+      if (entries.length !== 1 || entries[0] !== "lifecycle-authority") {
+        return { skeletonOnly: false, entries };
+      }
+      const authorityRoot = path.join(cliHome, "lifecycle-authority");
+      const walk = (directory: string): string[] =>
+        fs.readdirSync(directory, { withFileTypes: true }).flatMap((entry) =>
+          entry.isDirectory()
+            ? walk(path.join(directory, entry.name))
+            : [path.join(directory, entry.name)],
+        );
+      const files = walk(authorityRoot);
+      const releasedLeaseRecords = files.every((file) =>
+        /\/leases\/\d{20}\.json$/.test(file) &&
+        fs.readFileSync(file, "utf8").includes('"released"'),
+      );
+      return { skeletonOnly: releasedLeaseRecords, entries };
+    })();
     check(
       "launchctl_load_failure_is_literal_and_never_claims_active",
       failedLoad.code === 42 &&
         failedLoadReceipt.loaded === false &&
         failedLoadReceipt.status === "launchctl_failed" &&
         !fs.existsSync(launchctlState) &&
-        !fs.existsSync(cliHome),
-      { exitCode: failedLoad.code, status: failedLoadReceipt.status, activeClaimed: false },
+        failedLoadFootprint.skeletonOnly,
+      {
+        exitCode: failedLoad.code,
+        status: failedLoadReceipt.status,
+        activeClaimed: false,
+        footprintEntries: failedLoadFootprint.entries,
+      },
     );
 
     fs.rmSync(launchctlLog, { force: true });
