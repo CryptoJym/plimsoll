@@ -52,6 +52,9 @@ export const collectorConfigSchema = z
     uploadUrl: z.string().url().optional(),
     tenantId: z.string().trim().min(1).default(LOCAL_TENANT_ID),
     installKey: z.string().trim().min(1).default("local-dev"),
+    /** Stable local identity metadata; these are identifiers, not secrets. */
+    deviceId: z.string().trim().min(1).optional(),
+    keyId: z.string().trim().min(1).optional(),
     /** Explicit fleet-management marker. Older joined configs are also
      * recognized from their upload/tenant/install credentials. */
     managed: z.boolean().default(false),
@@ -192,6 +195,11 @@ export function collectorConfigPath(homeDir = os.homedir()) {
 
 export function collectorBufferPath(homeDir = os.homedir()) {
   return path.join(collectorHome(homeDir), "work-ledger.sqlite");
+}
+
+/** Local non-secret identity metadata; credentials never live in this file. */
+export function collectorDeviceIdentityPath(homeDir = os.homedir()) {
+  return path.join(collectorHome(homeDir), "device.identity.json");
 }
 
 export function collectorLogPath(name: string, homeDir = os.homedir()) {

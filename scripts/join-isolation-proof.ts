@@ -17,6 +17,7 @@ import {
 } from "../packages/collector-cli/src/config";
 import { appendForwardedHook } from "../packages/collector-cli/src/forwarder";
 import {
+  CLOUD_JOIN_PATH,
   COLLECTOR_APP_VERSION,
   JOIN_HANDSHAKE_DIRECTORY_PREFIX,
   finalizeActivatedPendingJoin,
@@ -202,6 +203,40 @@ async function waitFor(predicate: () => boolean, message: string, timeoutMs = 10
 
 async function main() {
 try {
+  // A managed collector must explicitly authorize a cross-workspace audience
+  // change. The refusal is config-preserving and does not start the probe.
+  const reassignRequiredHome = home("reassign-required");
+  const reassignRequiredFixture = writeConfig(reassignRequiredHome);
+  let reassignRequiredCalls = 0;
+  const reassignRequired = await performJoin({
+    target: TOKEN,
+    baseUrl: "https://workspace-b.example",
+    homeDir: reassignRequiredHome,
+    fetchImpl: (async (input) => {
+      reassignRequiredCalls += 1;
+      assert.equal(requestUrl(input).pathname, CLOUD_JOIN_PATH);
+      return responseJson({
+        ok: true,
+        tenantId: TENANT_B,
+        installKey: INSTALL_B,
+        uploadUrl: "https://workspace-b.example/api/work-intelligence/ingest",
+      }, 201);
+    }) as typeof fetch,
+  });
+  check(
+    "cross_workspace_rejoin_requires_explicit_reassign",
+    !reassignRequired.joined &&
+      reassignRequired.reason === "reassign_required" &&
+      reassignRequiredCalls === 1 &&
+      fs.readFileSync(reassignRequiredFixture.configPath, "utf8") === reassignRequiredFixture.bytes &&
+      !fs.existsSync(pendingJoinPath(reassignRequiredHome)),
+    {
+      reason: reassignRequired.joined ? "joined" : reassignRequired.reason,
+      calls: reassignRequiredCalls,
+      configPreserved: fs.readFileSync(reassignRequiredFixture.configPath, "utf8") === reassignRequiredFixture.bytes,
+    },
+  );
+
   // Workspace A has real unsent history. Joining B may see neither its bytes
   // nor its outbox; only one isolated synthetic probe is eligible.
   const isolatedHome = home("workspace-a-backlog");
@@ -235,6 +270,7 @@ try {
     target: TOKEN,
     baseUrl: "https://workspace-b.example",
     homeDir: isolatedHome,
+    reassign: true,
     temporaryRoot,
     fetchImpl: successfulFetch({
       configPath: configAPath,
@@ -345,6 +381,7 @@ try {
         target: TOKEN,
         baseUrl: "https://workspace-b.example",
         homeDir: failedHome,
+        reassign: true,
         temporaryRoot: failedTemp,
         fetchImpl: (async (input, init) => {
           failedCalls += 1;
@@ -418,6 +455,7 @@ try {
         target: TOKEN,
         baseUrl: "https://workspace-b.example",
         homeDir: activatedPendingHome,
+        reassign: true,
         temporaryRoot: path.join(root, "activated-pending-resume-temp"),
         fetchImpl: successfulFetch({
           configPath: activatedPendingFixture.configPath,
@@ -472,6 +510,7 @@ try {
         target: TOKEN,
         baseUrl: "https://workspace-b.example",
         homeDir: activatedStartupHome,
+        reassign: true,
         temporaryRoot: path.join(root, "activated-pending-startup-temp"),
         fetchImpl: successfulFetch({
           configPath: activatedStartupFixture.configPath,
@@ -512,6 +551,7 @@ try {
     target: `${TOKEN}-winner`,
     baseUrl: "https://workspace-b.example",
     homeDir: concurrentHome,
+    reassign: true,
     temporaryRoot: path.join(root, "concurrent-join-temp"),
     fetchImpl: (async (input) => {
       const url = requestUrl(input);
@@ -539,6 +579,7 @@ try {
         target: `${TOKEN}-loser`,
         baseUrl: "https://workspace-b.example",
         homeDir: concurrentHome,
+        reassign: true,
         fetchImpl: (async () => {
           losingNetworkRequests += 1;
           throw new Error("concurrent losing join must not reach network");
@@ -583,6 +624,7 @@ try {
         target: TOKEN,
         baseUrl: "https://workspace-b.example",
         homeDir: zeroAcceptedHome,
+        reassign: true,
         temporaryRoot: zeroAcceptedTemp,
         fetchImpl: (async (input) => {
           zeroAcceptedCalls += 1;

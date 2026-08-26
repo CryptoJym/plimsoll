@@ -6,16 +6,27 @@ import path from "node:path";
 import { z } from "zod";
 
 import collectorPackage from "../package.json";
+import { DEFAULT_POLICY } from "../../shared/src/index";
 import { LocalEventBuffer } from "./buffer";
 import {
   assertCollectorPrivacyMode,
   collectorBufferPath,
   collectorConfigPath,
   collectorConfigSchema,
+  isManagedOrUploadEnabled,
   type CollectorConfig,
 } from "./config";
 import { appendForwardedHook } from "./forwarder";
 import { uploadBufferedEvents } from "./upload";
+import {
+  loadOrCreateDeviceIdentity,
+  readDeviceIdentity,
+  restoreDeviceIdentity,
+  setDeviceKey,
+  setDeviceStatus,
+  type LocalDeviceIdentity,
+} from "./device-identity";
+import { assertNoRedirect, validatedTransportUrl } from "./http-transport";
 
 /**
  * Fleet join is transactional: redeem into memory, prove only a fresh
@@ -25,6 +36,7 @@ import { uploadBufferedEvents } from "./upload";
 export const CLOUD_JOIN_PATH = "/api/work-intelligence/join";
 export const COLLECTOR_APP_VERSION = collectorPackage.version;
 export const JOIN_HANDSHAKE_DIRECTORY_PREFIX = "plimsoll-join-handshake-";
+const JOIN_KEY_ID_PATTERN = /^key_[A-Za-z0-9][A-Za-z0-9._:-]{3,127}$/;
 
 export type JoinTarget = { token: string; baseUrl: string | null };
 
@@ -37,6 +49,9 @@ export function parseJoinTarget(raw: string, explicitBaseUrl?: string): JoinTarg
   const trimmed = raw.trim();
   if (/^https?:\/\//i.test(trimmed)) {
     const url = new URL(trimmed);
+    if (url.username || url.password) {
+      throw new Error("Join URL must not contain embedded credentials.");
+    }
     return {
       token: url.hash.replace(/^#/, "").trim(),
       baseUrl: explicitBaseUrl?.trim() || url.origin,
@@ -53,6 +68,8 @@ const joinGrantSchema = z.object({
   uploadUrl: z.string().url(),
   ingestKey: z.string().trim().min(1).optional(),
   uploadSigningSecret: z.string().trim().min(16).optional(),
+  keyId: z.string().trim().regex(JOIN_KEY_ID_PATTERN).optional(),
+  policyVersion: z.string().trim().min(1).optional(),
 });
 
 const pendingJoinSchema = z.object({
@@ -79,6 +96,8 @@ export const JOIN_REFUSAL_MESSAGES: Record<string, string> = {
   revoked: "This join token was revoked by your workspace admin.",
   signing_unconfigured:
     "The workspace server requires signed uploads but has no signing secret configured. Your token was NOT consumed — ask the workspace owner to fix the server, then retry.",
+  reassign_required:
+    "This collector is already joined to another workspace. Reassignment is explicit; retry with join --reassign after reviewing the workspace boundary.",
 };
 
 export type JoinResult =
@@ -86,6 +105,10 @@ export type JoinResult =
       joined: true;
       configPath: string;
       tenantId: string;
+      deviceId: string;
+      keyId: string;
+      policyVersion: string;
+      status: "active";
       uploadUrl: string;
       uploadSigningConfigured: boolean;
       workspaceBoundary: {
@@ -112,40 +135,6 @@ export type JoinResult =
       httpStatus: number;
       configTouched: false;
     };
-
-function isLoopbackHostname(hostname: string) {
-  const normalized = hostname.toLowerCase().replace(/^\[|\]$/g, "");
-  return (
-    normalized === "localhost" ||
-    normalized.endsWith(".localhost") ||
-    normalized === "::1" ||
-    /^127(?:\.\d{1,3}){3}$/.test(normalized)
-  );
-}
-
-function validatedTransportUrl(raw: string, label: string) {
-  let url: URL;
-  try {
-    url = new URL(raw);
-  } catch {
-    throw new Error(`${label} must be a valid absolute URL.`);
-  }
-  if (url.username || url.password) {
-    throw new Error(`${label} must not contain embedded credentials.`);
-  }
-  if (url.protocol === "https:") return url;
-  if (url.protocol === "http:" && isLoopbackHostname(url.hostname)) return url;
-  throw new Error(`${label} must use HTTPS (HTTP is allowed only for an explicit loopback development URL).`);
-}
-
-function assertNoRedirect(response: Response, label: string, expectedOrigin: string) {
-  if (response.redirected || (response.status >= 300 && response.status < 400)) {
-    throw new Error(`${label} redirects are rejected.`);
-  }
-  if (response.url && new URL(response.url).origin !== expectedOrigin) {
-    throw new Error(`${label} response escaped its authenticated origin.`);
-  }
-}
 
 function readConfigWithoutCreating(configPath: string): CollectorConfig {
   if (!fs.existsSync(configPath)) return collectorConfigSchema.parse({});
@@ -197,7 +186,11 @@ function readPendingJoin(file: string) {
   return pendingJoinSchema.parse(JSON.parse(fs.readFileSync(file, "utf8")));
 }
 
-function stageGrant(existing: CollectorConfig, grant: z.infer<typeof joinGrantSchema>) {
+function stageGrant(
+  existing: CollectorConfig,
+  grant: z.infer<typeof joinGrantSchema>,
+  identity: ReturnType<typeof loadOrCreateDeviceIdentity>,
+) {
   // Credential absence is meaningful. Destructure every stale credential out
   // before applying the grant so a rejoin cannot inherit an old secret/key.
   const {
@@ -206,14 +199,21 @@ function stageGrant(existing: CollectorConfig, grant: z.infer<typeof joinGrantSc
     tenantId: _staleTenantId,
     uploadSigningSecret: _staleSigningSecret,
     uploadUrl: _staleUploadUrl,
+    deviceId: _staleDeviceId,
+    keyId: _staleKeyId,
     ...localSettings
   } = existing;
   return collectorConfigSchema.parse({
     ...localSettings,
     managed: true,
     tenantId: grant.tenantId,
+    deviceId: identity.deviceId,
+    keyId: grant.keyId ?? identity.keyId,
     installKey: grant.installKey,
     uploadUrl: grant.uploadUrl,
+    policy: grant.policyVersion
+      ? { ...existing.policy, tenantId: grant.tenantId, version: grant.policyVersion }
+      : { ...existing.policy, tenantId: grant.tenantId, version: DEFAULT_POLICY.version },
     ...(grant.ingestKey ? { ingestKey: grant.ingestKey } : {}),
     ...(grant.uploadSigningSecret
       ? { uploadSigningSecret: grant.uploadSigningSecret }
@@ -336,7 +336,9 @@ function ledgerMatchesPending(homeDir: string, pending: PendingJoin) {
   if (!fs.existsSync(ledgerPath)) return false;
   const buffer = new LocalEventBuffer(ledgerPath);
   try {
-    return buffer.workspaceBinding()?.currentWorkspaceId === pending.stagedConfig.tenantId;
+    const binding = buffer.workspaceBinding();
+    return binding?.currentWorkspaceId === pending.stagedConfig.tenantId &&
+      (!pending.stagedConfig.deviceId || binding.currentDeviceId === pending.stagedConfig.deviceId);
   } finally {
     buffer.close();
   }
@@ -391,6 +393,10 @@ function completedJoinResult(homeDir: string, pending: PendingJoin): JoinResult 
     joined: true,
     configPath: collectorConfigPath(homeDir),
     tenantId: pending.stagedConfig.tenantId,
+    deviceId: pending.stagedConfig.deviceId ?? "",
+    keyId: pending.stagedConfig.keyId ?? "",
+    policyVersion: pending.stagedConfig.policy.version,
+    status: "active",
     uploadUrl: pending.stagedConfig.uploadUrl ?? "",
     uploadSigningConfigured: Boolean(pending.stagedConfig.uploadSigningSecret),
     workspaceBoundary: {
@@ -453,14 +459,34 @@ async function activatePendingJoin(
     fetchImpl: typeof fetch;
     pendingFile: string;
     temporaryRoot?: string;
+    identityBeforeActivation?: LocalDeviceIdentity | null;
     /** Proof-only interruption seam after config activation, before journal unlink. */
     afterConfigActivation?: () => void;
   },
 ): Promise<JoinResult> {
   let pending = pendingInput;
   assertCollectorPrivacyMode(pending.stagedConfig, "join", { willEnableUpload: true });
+  const identityBeforeActivation = Object.hasOwn(options, "identityBeforeActivation")
+    ? options.identityBeforeActivation ?? null
+    : readDeviceIdentity(options.homeDir);
+  const identity = loadOrCreateDeviceIdentity(options.homeDir, {
+    seed: {
+      deviceId: pending.stagedConfig.deviceId,
+      keyId: pending.stagedConfig.keyId,
+    },
+  });
+  if (identity.status === "revoked") {
+    throw new Error("Join cannot activate a revoked device identity; reinstall to create a new device.");
+  }
+  if (pending.stagedConfig.deviceId && pending.stagedConfig.deviceId !== identity.deviceId) {
+    throw new Error("Pending join device identity does not match this collector home.");
+  }
   const activeConfigPath = collectorConfigPath(options.homeDir);
   if (activationAlreadyComplete(options.homeDir, pending)) {
+    if (pending.stagedConfig.keyId && pending.stagedConfig.keyId !== identity.keyId) {
+      setDeviceKey(options.homeDir, pending.stagedConfig.keyId);
+    }
+    setDeviceStatus(options.homeDir, "active");
     fs.rmSync(options.pendingFile, { force: true });
     return completedJoinResult(options.homeDir, pending);
   }
@@ -504,9 +530,11 @@ async function activatePendingJoin(
   const removeSignalCleanup = installSignalCleanup(cleanupTemporaryState);
   let selfTestEventId = "";
   let handshakeAcknowledged = false;
+  let activeConfigActivated = false;
   try {
     buffer = new LocalEventBuffer(temporaryLedgerPath, {
       workspaceId: pending.stagedConfig.tenantId,
+      deviceId: identity.deviceId,
       delivery: { enabled: true, limits: pending.stagedConfig.delivery },
     });
     const normalized = appendForwardedHook(
@@ -553,7 +581,9 @@ async function activatePendingJoin(
     cleanupTemporaryState();
     const activeLedgerPath = collectorBufferPath(options.homeDir);
     fs.mkdirSync(path.dirname(activeLedgerPath), { recursive: true, mode: 0o700 });
-    const activeBuffer = new LocalEventBuffer(activeLedgerPath);
+    const activeBuffer = new LocalEventBuffer(activeLedgerPath, {
+      deviceId: pending.stagedConfig.deviceId,
+    });
     let workspaceBoundary: {
       fromWorkspaceId: string;
       toWorkspaceId: string;
@@ -570,6 +600,10 @@ async function activatePendingJoin(
       const beforeCensus = workspaceRowCensus(activeBuffer);
       const currentBinding = activeBuffer.workspaceBinding();
       if (currentBinding?.currentWorkspaceId === pending.stagedConfig.tenantId) {
+        activeBuffer.useWorkspace(
+          pending.stagedConfig.tenantId,
+          pending.stagedConfig.deviceId,
+        );
         workspaceBoundary = {
           fromWorkspaceId: pending.fromWorkspaceId,
           toWorkspaceId: pending.stagedConfig.tenantId,
@@ -581,6 +615,7 @@ async function activatePendingJoin(
           ...activeBuffer.transitionWorkspace(
             pending.fromWorkspaceId,
             pending.stagedConfig.tenantId,
+            pending.stagedConfig.deviceId,
           ),
           quarantinedHistoryRows: activeBuffer.enrollmentStatus().quarantinedHistoryRows,
         };
@@ -602,13 +637,22 @@ async function activatePendingJoin(
       activeBuffer.close();
     }
 
+    if (pending.stagedConfig.keyId && pending.stagedConfig.keyId !== identity.keyId) {
+      setDeviceKey(options.homeDir, pending.stagedConfig.keyId);
+    }
+    setDeviceStatus(options.homeDir, "active");
     activateConfigAtomically(pending.stagedConfig, activeConfigPath);
+    activeConfigActivated = true;
     options.afterConfigActivation?.();
     fs.rmSync(options.pendingFile, { force: true });
     return {
       joined: true,
       configPath: activeConfigPath,
       tenantId: pending.stagedConfig.tenantId,
+      deviceId: identity.deviceId,
+      keyId: pending.stagedConfig.keyId ?? identity.keyId,
+      policyVersion: pending.stagedConfig.policy.version,
+      status: "active",
       uploadUrl: pending.stagedConfig.uploadUrl ?? "",
       uploadSigningConfigured: Boolean(pending.stagedConfig.uploadSigningSecret),
       workspaceBoundary,
@@ -624,6 +668,9 @@ async function activatePendingJoin(
       },
     };
   } catch (error) {
+    if (!activeConfigActivated) {
+      restoreDeviceIdentity(options.homeDir, identityBeforeActivation);
+    }
     throw new Error(
       `Join grant was not activated because its ${
         handshakeAcknowledged ? "workspace activation" : "isolated handshake"
@@ -691,6 +738,8 @@ export async function performJoin(options: {
   temporaryRoot?: string;
   /** Test/proof seam only; simulates interruption after config activation. */
   afterConfigActivation?: () => void;
+  /** Required when a managed collector changes its workspace audience. */
+  reassign?: boolean;
 }): Promise<JoinResult> {
   const { token, baseUrl } = parseJoinTarget(options.target, options.baseUrl);
   if (!token) {
@@ -722,6 +771,10 @@ export async function performJoin(options: {
     // Join activates managed upload. Refuse unsupported evidence mode before
     // token redemption, network access, or local-state mutation.
     assertCollectorPrivacyMode(existingConfig, "join", { willEnableUpload: true });
+    const existingIdentity = readDeviceIdentity(homeDir);
+    if (existingIdentity?.status === "revoked") {
+      throw new Error("Join cannot activate a revoked device identity; reinstall to create a new device.");
+    }
     const response = await fetchImpl(joinUrl, {
       method: "POST",
       redirect: "manual",
@@ -751,11 +804,27 @@ export async function performJoin(options: {
     }
 
     const grant = joinGrantSchema.parse(body);
+    if (
+      isManagedOrUploadEnabled(existingConfig) &&
+      existingConfig.tenantId !== grant.tenantId &&
+      options.reassign !== true
+    ) {
+      return {
+        joined: false,
+        reason: "reassign_required",
+        message: JOIN_REFUSAL_MESSAGES.reassign_required,
+        httpStatus: response.status,
+        configTouched: false,
+      };
+    }
     const uploadUrl = validatedTransportUrl(grant.uploadUrl, "Granted upload URL");
     if (uploadUrl.origin !== joinUrl.origin) {
       throw new Error("Granted upload URL must use the same origin as the workspace join URL.");
     }
-    const stagedConfig = stageGrant(existingConfig, grant);
+    const identity = loadOrCreateDeviceIdentity(homeDir, {
+      seed: { deviceId: existingConfig.deviceId, keyId: existingConfig.keyId },
+    });
+    const stagedConfig = stageGrant(existingConfig, grant, identity);
     const pending = pendingJoinSchema.parse({
       version: 1,
       createdAt: new Date().toISOString(),
@@ -772,6 +841,7 @@ export async function performJoin(options: {
       fetchImpl,
       pendingFile,
       temporaryRoot: options.temporaryRoot,
+      identityBeforeActivation: existingIdentity,
       afterConfigActivation: options.afterConfigActivation,
     });
   } finally {

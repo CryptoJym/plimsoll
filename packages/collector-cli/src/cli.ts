@@ -116,6 +116,12 @@ import {
 } from "./maintenance-starvation";
 import { runMaintenanceWorkerService } from "./maintenance-worker";
 import { readLocalIdentities } from "./local-identity";
+import {
+  loadOrCreateDeviceIdentity,
+  readDeviceIdentity,
+  recordDeviceSeen,
+  recordDeviceUpload,
+} from "./device-identity";
 import { runLifecycleCommand } from "./lifecycle-command";
 import {
   composeLifecycleAdapter,
@@ -183,6 +189,7 @@ Commands:
   status                Print local buffer and policy status
   join TOKEN|URL        Join a hosted workspace: redeem the admin's single-use
                         token, write sync credentials, verify with a handshake
+                        (use --reassign for an explicit workspace change)
   doctor --read-only --json
                         Read-only readiness check; never creates config, ledger, plist, logs, or directories
   export                Print buffered events as JSON
@@ -233,8 +240,9 @@ Commands:
   stop                  Stop the foreground daemon using the local PID file
 
 Config tools:
-  join "<join-url>#<token>" | join --token-stdin --url <cloud-base-url> | join --resume
-      Prefer --token-stdin (or join -) so the single-use secret never enters
+  join "<join-url>#<token>" | join --token-prompt --url <cloud-base-url> | join --token-stdin --url <cloud-base-url> | join --token-fd FD --url <cloud-base-url> | join --resume
+      Add --reassign only after reviewing the explicit A → B boundary.
+      Prefer --token-prompt, --token-stdin, --token-fd, or join - so the single-use secret never enters
       shell history or process arguments. Workspace URL env: PLIMSOLL_CLOUD_URL.
       join --dry-run is unsupported and fails before token, network, or local-state mutation.
   generate-config claude-code|codex|all   (metadata-only; encrypted evidence vault not implemented)
@@ -315,8 +323,13 @@ function openBuffer(
   databaseBusyTimeoutMs = 5_000,
 ) {
   ensureCollectorHome();
+  const identity = loadOrCreateDeviceIdentity(undefined, {
+    seed: { deviceId: config.deviceId, keyId: config.keyId },
+  });
+  recordDeviceSeen();
   return new LocalEventBuffer(collectorBufferPath(), {
     workspaceId: config.tenantId,
+    deviceId: identity.deviceId,
     delivery: {
       enabled: Boolean(config.uploadUrl) || deliveryOverride,
       limits: config.delivery,
@@ -348,6 +361,50 @@ async function readStdin() {
   }
 
   return Buffer.concat(chunks).toString("utf8");
+}
+
+function readSecretFromPrompt() {
+  if (!process.stdin.isTTY || typeof process.stdin.setRawMode !== "function") {
+    throw new Error("join --token-prompt requires an interactive terminal; use --token-stdin or --token-fd in automation.");
+  }
+  process.stderr.write("Join token (input hidden): ");
+  process.stdin.setRawMode(true);
+  process.stdin.resume();
+  return new Promise<string>((resolve, reject) => {
+    let secret = "";
+    let onData: (chunk: Buffer | string) => void;
+    const cleanup = () => {
+      process.stdin.removeListener("data", onData);
+      process.stdin.setRawMode?.(false);
+      process.stderr.write("\n");
+    };
+    onData = (chunk: Buffer | string) => {
+      for (const character of String(chunk)) {
+        if (character === "\u0003") {
+          cleanup();
+          reject(new Error("Join token prompt cancelled."));
+          return;
+        } else if (character === "\r" || character === "\n") {
+          cleanup();
+          resolve(secret);
+          return;
+        } else if (character === "\u0008" || character === "\u007f") {
+          secret = secret.slice(0, -1);
+        } else {
+          secret += character;
+        }
+      }
+    };
+    process.stdin.on("data", onData);
+  });
+}
+
+function readSecretFromFd(value: string) {
+  const fd = Number(value);
+  if (!value.trim() || !Number.isSafeInteger(fd) || fd < 0) {
+    throw new Error("join --token-fd requires a non-negative file descriptor.");
+  }
+  return fs.readFileSync(fd, "utf8");
 }
 
 function runLaunchctl(args: string[], setExitCode = true) {
@@ -1269,23 +1326,57 @@ async function main() {
           "No token was read, no request was sent, and no local state was changed.",
       );
     }
-    const joinArguments = process.argv.slice(3);
+    const rawJoinArguments = process.argv.slice(3);
+    const reassign = rawJoinArguments.includes("--reassign");
+    if (rawJoinArguments.filter((argument) => argument === "--reassign").length > 1) {
+      throw new Error("join --reassign may be provided only once.");
+    }
+    const joinArguments = rawJoinArguments.filter((argument) => argument !== "--reassign");
     const targetArgument = joinArguments[0];
     const resume = targetArgument === "--resume";
-    if (resume && joinArguments.length !== 1) {
+    if (resume && (joinArguments.length !== 1 || reassign)) {
       throw new Error("join --resume does not accept another token or URL.");
     }
+    const tokenFromPrompt = targetArgument === "--token-prompt";
     const tokenFromStdin = targetArgument === "--token-stdin" || targetArgument === "-";
-    if (!resume && (!targetArgument || (targetArgument.startsWith("--") && !tokenFromStdin))) {
+    const tokenFromFd = targetArgument === "--token-fd";
+    if (
+      !resume &&
+      (!targetArgument ||
+        (targetArgument.startsWith("--") &&
+          !tokenFromPrompt &&
+          !tokenFromStdin &&
+          !tokenFromFd))
+    ) {
       throw new Error(
-        'Usage: plimsoll join --token-stdin --url <cloud-base-url>  |  plimsoll join "<join-url>#<token>"  |  plimsoll join --resume',
+        'Usage: plimsoll join --token-prompt --url <cloud-base-url>  |  plimsoll join --token-stdin --url <cloud-base-url>  |  plimsoll join "<join-url>#<token>"  |  plimsoll join --resume',
       );
     }
     let joinBaseUrl: string | undefined;
-    for (let index = 1; !resume && index < joinArguments.length; index += 1) {
+    let joinTokenFd: string | undefined;
+    if (tokenFromFd) {
+      const value = joinArguments[1];
+      if (value === undefined || !value.trim() || value.startsWith("--")) {
+        throw new Error("join --token-fd requires a file descriptor value.");
+      }
+      joinTokenFd = value;
+    }
+    for (let index = tokenFromFd ? 2 : 1; !resume && index < joinArguments.length; index += 1) {
       const argument = joinArguments[index];
       if (argument === "--token-stdin") {
         throw new Error("Choose either a positional join token/URL or --token-stdin, not both.");
+      }
+      if (argument === "--token-fd") {
+        if (!tokenFromFd || joinTokenFd !== undefined) {
+          throw new Error("join --token-fd may be provided only once as the token source.");
+        }
+        const value = joinArguments[index + 1];
+        if (value === undefined || !value.trim() || value.startsWith("--")) {
+          throw new Error("join --token-fd requires a file descriptor value.");
+        }
+        joinTokenFd = value;
+        index += 1;
+        continue;
       }
       if (argument !== "--url") {
         throw new Error(`Unsupported join option or argument: ${argument}`);
@@ -1305,15 +1396,22 @@ async function main() {
     const result = resume
       ? await resumePendingJoin()
       : await (async () => {
-          const target = tokenFromStdin ? (await readStdin()).trim() : targetArgument;
+          const target = tokenFromStdin
+            ? (await readStdin()).trim()
+            : tokenFromPrompt
+              ? (await readSecretFromPrompt()).trim()
+              : tokenFromFd
+                ? readSecretFromFd(joinTokenFd ?? "").trim()
+                : targetArgument;
           if (!target) {
             throw new Error(
-              'Usage: plimsoll join --token-stdin --url <cloud-base-url>  |  plimsoll join "<join-url>#<token>"  |  plimsoll join --resume',
+              'Usage: plimsoll join --token-prompt --url <cloud-base-url>  |  plimsoll join --token-stdin --url <cloud-base-url>  |  plimsoll join "<join-url>#<token>"  |  plimsoll join --resume',
             );
           }
           return performJoin({
             target,
             baseUrl: joinBaseUrl ?? process.env.PLIMSOLL_CLOUD_URL,
+            reassign,
           });
         })();
     if (!result.joined) {
@@ -1339,6 +1437,10 @@ async function main() {
           status: "joined",
           configPath: result.configPath,
           tenantId: result.tenantId,
+          deviceId: result.deviceId,
+          keyId: result.keyId,
+          policyVersion: result.policyVersion,
+          deviceStatus: result.status,
           installCredentialsConfigured: true,
           uploadUrl: result.uploadUrl,
           uploadSigningConfigured: result.uploadSigningConfigured,
@@ -1987,6 +2089,7 @@ async function main() {
 
   if (command === "status") {
     const buffer = openBuffer(config);
+    const device = readDeviceIdentity();
     const bufferPath = collectorBufferPath();
     const resolvedHome = resolveCollectorHome();
     const projected = buffer.projection.readSnapshot(30, config.subscriptions);
@@ -2001,6 +2104,22 @@ async function main() {
           bufferFileBytes: fs.existsSync(bufferPath) ? fs.statSync(bufferPath).size : 0,
           pidPathHash: privatePathReceipt(collectorLogPath("collector.pid")),
           port: config.port,
+          appVersion: PLIMSOLL_VERSION,
+          policyVersion: config.policy.version,
+          device: device
+            ? {
+                deviceId: device.deviceId,
+                tenantId: config.tenantId,
+                keyId: device.keyId,
+                appVersion: PLIMSOLL_VERSION,
+                policyVersion: config.policy.version,
+                createdAt: device.createdAt,
+                lastSeenAt: device.lastSeenAt,
+                lastUploadAt: device.lastUploadAt,
+                queueAgeSeconds: buffer.delivery.queueAgeSeconds(),
+                status: device.status,
+              }
+            : null,
           dataMode: config.policy.dataMode,
           privacyMode: "metadata_only",
           privacy: collectorPrivacyReadiness(config),
@@ -2402,6 +2521,7 @@ async function main() {
         break;
       }
     }
+    if (uploadedEvents > 0) recordDeviceUpload();
     console.log(
       JSON.stringify(
         {
