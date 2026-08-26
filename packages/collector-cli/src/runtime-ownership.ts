@@ -46,6 +46,24 @@ export type CollectorListenerObservation =
   | { kind: "unrelated" }
   | { kind: "indeterminate" };
 
+// Issue #148: a bounded process-tree observation. The LaunchAgent label
+// reports the wrapper PID while the collector PID record and the TCP
+// listener belong to a Node descendant, so ownership decisions must compare
+// whole trees with start fingerprints instead of single PIDs. The member
+// count is capped so a hostile process table can never make this walk
+// unbounded; `truncated` records that the cap (or the ps row cap) hid
+// processes from this observation.
+export type BoundedProcessTree = Readonly<{
+  root: ProcessIdentity | null;
+  members: readonly ProcessIdentity[];
+  truncated: boolean;
+}>;
+
+// Tri-state verdict for "who owns the port". `owned_by_members` requires an
+// exact (pid AND start fingerprint) match against the supplied membership;
+// anything uncertain is `unknown`, never silently owned or foreign.
+export type PortOwnershipVerdict = "owned_by_members" | "foreign" | "unknown";
+
 export type LaunchAgentLabelObservation =
   | { kind: "reported"; processIdentity: ProcessIdentity | null }
   | { kind: "not_reported" }
@@ -55,7 +73,12 @@ export type LaunchAgentUnloadPriorState = Readonly<{
   label: LaunchAgentLabelObservation;
   listener: CollectorListenerObservation;
   listenerRuntimeIdentity: CollectorRuntimeIdentity | null;
-  ownership: "consistent" | "ambiguous" | "unproven" | "unrelated";
+  ownership: "consistent" | "ambiguous" | "unproven" | "unrelated" | "prior_unresponsive";
+  /** Issue #148: set iff ownership === "prior_unresponsive". The exact
+   * membership (prior child tree + PID record) the port was proven against,
+   * reused for poll-time reclassification so a genuinely foreign takeover
+   * still reports unrelated_listener. */
+  portOwnershipMembers?: readonly ProcessIdentity[];
   pidRecordKind: CollectorPidFileRead["kind"];
   pidRuntimeIdentity: CollectorRuntimeIdentity | null;
   pidCleanupState: CollectorPidCleanupState;
@@ -68,6 +91,7 @@ export type LaunchAgentUnloadState =
   | "live_conflict"
   | "stale_owned_record"
   | "unrelated_listener"
+  | "prior_unresponsive"
   | "ambiguous_prior_owner"
   | "indeterminate";
 
@@ -382,6 +406,160 @@ function readProcessStartFingerprintFor(
   return algorithm === UTC_PROCESS_START_ALGORITHM
     ? readUtcProcessStartFingerprint(pid)
     : readProcessStartFingerprint(pid);
+}
+
+const PROCESS_TREE_MAX_NODES = 64;
+const PROCESS_TABLE_MAX_ROWS = 4096;
+const PORT_OWNER_MAX_PIDS = 16;
+
+type ProcessTableRow = { pid: number; ppid: number };
+
+// One atomic ps snapshot: separate per-PID queries could interleave with
+// process churn and render a tree that never existed.
+function processTableSnapshot(): { rows: ProcessTableRow[]; truncated: boolean } | null {
+  const result = spawnSync("ps", ["-eo", "pid=,ppid="], {
+    encoding: "utf8",
+    env: { ...process.env, LANG: "C", LC_ALL: "C" },
+    stdio: ["ignore", "pipe", "pipe"],
+    timeout: 1_000,
+  });
+  if (result.error || (result.status !== 0 && result.status !== null)) return null;
+  const rows: ProcessTableRow[] = [];
+  for (const line of result.stdout.split("\n")) {
+    if (rows.length >= PROCESS_TABLE_MAX_ROWS) return { rows, truncated: true };
+    const match = line.trim().match(/^(\d+)\s+(\d+)$/);
+    if (!match) continue;
+    const pid = Number(match[1]);
+    const ppid = Number(match[2]);
+    if (Number.isInteger(pid) && pid > 0 && Number.isInteger(ppid) && ppid >= 0) {
+      rows.push({ pid, ppid });
+    }
+  }
+  return { rows, truncated: false };
+}
+
+/**
+ * Issue #148: capture the wrapper-rooted descendant set as start-fingerprinted
+ * identities. The root itself must be fingerprintable — a dead or unobservable
+ * root yields an empty proven membership rather than an invented one. BFS is
+ * capped at PROCESS_TREE_MAX_NODES members; the cap sets `truncated` instead of
+ * growing without bound.
+ */
+export function captureBoundedDescendantTree(
+  rootPid: number | null | undefined,
+  options: { maxNodes?: number } = {},
+): BoundedProcessTree {
+  const maxNodes = Math.max(1, Math.min(options.maxNodes ?? PROCESS_TREE_MAX_NODES, PROCESS_TREE_MAX_NODES));
+  if (!Number.isInteger(rootPid) || ((rootPid as number) ?? 0) <= 0) {
+    return Object.freeze({ root: null, members: Object.freeze([]), truncated: false });
+  }
+  const rootFingerprint = readUtcProcessStartFingerprint(rootPid as number);
+  if (!rootFingerprint) {
+    return Object.freeze({ root: null, members: Object.freeze([]), truncated: false });
+  }
+  const root: ProcessIdentity = Object.freeze({
+    pid: rootPid as number,
+    processStartFingerprint: rootFingerprint,
+    processStartFingerprintAlgorithm: UTC_PROCESS_START_ALGORITHM,
+  });
+  const table = processTableSnapshot();
+  if (!table) {
+    // The root is proven live but its descendants are unobservable; claiming
+    // an exact child tree here would be fabrication.
+    return Object.freeze({ root, members: Object.freeze([root]), truncated: true });
+  }
+  const childrenByParent = new Map<number, number[]>();
+  for (const row of table.rows) {
+    const siblings = childrenByParent.get(row.ppid);
+    if (siblings) siblings.push(row.pid);
+    else childrenByParent.set(row.ppid, [row.pid]);
+  }
+  const members: ProcessIdentity[] = [root];
+  const seen = new Set<number>([root.pid]);
+  let frontier = [root.pid];
+  let truncated = table.truncated;
+  while (frontier.length > 0) {
+    const next: number[] = [];
+    for (const pid of frontier) {
+      for (const child of childrenByParent.get(pid) ?? []) {
+        if (seen.has(child)) continue;
+        seen.add(child);
+        if (members.length >= maxNodes) {
+          truncated = true;
+          continue;
+        }
+        // A descendant that exits between the snapshot and its fingerprint
+        // read contributes no membership; it can own nothing.
+        const fingerprint = readUtcProcessStartFingerprint(child);
+        if (!fingerprint) continue;
+        members.push(Object.freeze({
+          pid: child,
+          processStartFingerprint: fingerprint,
+          processStartFingerprintAlgorithm: UTC_PROCESS_START_ALGORITHM,
+        }));
+        next.push(child);
+      }
+    }
+    frontier = next;
+  }
+  return Object.freeze({ root, members: Object.freeze(members), truncated });
+}
+
+/**
+ * Issue #148: classify the LISTEN owner of a loopback port against an exact
+ * membership. Ownership requires the owning PID's UTC start fingerprint to
+ * equal a member's fingerprint exactly — a reused PID never matches.
+ * Unresolvable owners (ps failed, process gone mid-read) make the verdict
+ * `unknown` so callers fail closed instead of guessing.
+ */
+export function portOwnershipAgainstMembers(
+  port: number,
+  members: readonly ProcessIdentity[],
+  options: { lsofPath?: string } = {},
+): PortOwnershipVerdict {
+  if (!Number.isInteger(port) || (port as number) <= 0) return "unknown";
+  if (members.length === 0) return "foreign";
+  const result = spawnSync(
+    options.lsofPath ?? "lsof",
+    ["-nP", "-ti", `tcp:${port}`, "-sTCP:LISTEN"],
+    {
+      encoding: "utf8",
+      env: { ...process.env, LANG: "C", LC_ALL: "C" },
+      stdio: ["ignore", "pipe", "pipe"],
+      timeout: 1_000,
+    },
+  );
+  if (result.error) return "unknown";
+  if (result.status !== 0 && result.status !== 1) return "unknown";
+  const pids: number[] = [];
+  for (const line of result.stdout.split("\n")) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const pid = Number(trimmed);
+    if (!Number.isInteger(pid) || pid <= 0) continue;
+    pids.push(pid);
+    if (pids.length >= PORT_OWNER_MAX_PIDS) break;
+  }
+  if (pids.length === 0) return "unknown";
+  let unresolved = false;
+  for (const pid of pids) {
+    const fingerprint = readUtcProcessStartFingerprint(pid);
+    if (!fingerprint) {
+      unresolved = true;
+      continue;
+    }
+    if (
+      members.some((member) =>
+        member.pid === pid &&
+        member.processStartFingerprint === fingerprint &&
+        (member.processStartFingerprintAlgorithm ?? LEGACY_PROCESS_START_ALGORITHM) ===
+          UTC_PROCESS_START_ALGORITHM
+      )
+    ) {
+      return "owned_by_members";
+    }
+  }
+  return unresolved ? "unknown" : "foreign";
 }
 
 // Tri-state liveness. Never collapse this to a boolean for cleanup
@@ -1563,6 +1741,12 @@ export async function captureLaunchAgentUnloadPriorState(options: {
     pidPath: string,
     label: string,
   ) => CollectorPidCleanupReconciliationResult;
+  /** Issue #148 deterministic seams. Production callers leave these unset. */
+  captureProcessTree?: (rootPid: number | null) => BoundedProcessTree;
+  classifyPortOwnership?: (
+    port: number,
+    members: readonly ProcessIdentity[],
+  ) => PortOwnershipVerdict;
 }): Promise<LaunchAgentUnloadPriorState> {
   const readPidFile = options.readPidFile ?? readCollectorPidFile;
   const readCleanupState = options.readCleanupState ?? readCollectorPidCleanupState;
@@ -1577,7 +1761,14 @@ export async function captureLaunchAgentUnloadPriorState(options: {
   const pidCleanupState = readCleanupState(options.pidPath, options.label);
   const pidIdentity = pidRuntimeIdentity(pidRead);
   const listenerIdentity = listener.kind === "collector" ? listener.runtimeIdentity : null;
-  const ownership = listener.kind === "unrelated"
+
+  // Issue #148: the transport probe classifies any open port that will not
+  // speak /status as "unrelated". Before accepting that verdict, compare the
+  // port's owning processes against the exact prior child tree (launchd
+  // wrapper root plus bounded descendants) joined with the PID record
+  // identity. A port owned by exactly those processes is OUR unresponsive
+  // runtime, not an unrelated listener.
+  let ownership: LaunchAgentUnloadPriorState["ownership"] = listener.kind === "unrelated"
     ? "unrelated" as const
     : pidRead.kind === "legacy" ||
         pidRead.kind === "invalid" ||
@@ -1588,11 +1779,31 @@ export async function captureLaunchAgentUnloadPriorState(options: {
       : pidIdentity && listenerIdentity && !runtimeIdentityMatches(pidIdentity, listenerIdentity)
         ? "ambiguous" as const
         : "consistent" as const;
+  let portOwnershipMembers: readonly ProcessIdentity[] | undefined;
+  if (listener.kind === "unrelated") {
+    const captureTree = options.captureProcessTree ?? captureBoundedDescendantTree;
+    const classifyOwnership = options.classifyPortOwnership ?? portOwnershipAgainstMembers;
+    const treeRootPid =
+      label.kind === "reported" && label.processIdentity ? label.processIdentity.pid : null;
+    const tree = captureTree(treeRootPid);
+    const members = [
+      ...tree.members,
+      ...(pidIdentity &&
+      !tree.members.some((member) => processIdentityMatches(member, pidIdentity))
+        ? [pidIdentity]
+        : []),
+    ];
+    if (classifyOwnership(options.port, members) === "owned_by_members") {
+      ownership = "prior_unresponsive";
+      portOwnershipMembers = members;
+    }
+  }
   return Object.freeze({
     label,
     listener,
     listenerRuntimeIdentity: listenerIdentity,
     ownership,
+    ...(portOwnershipMembers ? { portOwnershipMembers } : {}),
     pidRecordKind: pidRead.kind,
     pidRuntimeIdentity: pidIdentity,
     pidCleanupState,
@@ -1623,6 +1834,11 @@ async function observeLaunchAgentUnloadOnce(options: {
   removedPidFile: boolean;
   pidCleanupAmbiguous: boolean;
   pidCleanupQuarantined: boolean;
+  /** Issue #148: live reclassification of a still-silent port against the
+   * exact prior membership captured with the prior state. Absent seam means
+   * the static prior evidence stands (fixture determinism); production wires
+   * the real port-owner classifier. */
+  classifyPriorPortOwnership?: () => PortOwnershipVerdict | Promise<PortOwnershipVerdict>;
 }): Promise<LaunchAgentUnloadObservation> {
   const priorIdentities = priorRuntimeIdentities(options.prior);
   const [labelState, listenerState] = await Promise.all([
@@ -1680,6 +1896,24 @@ async function observeLaunchAgentUnloadOnce(options: {
 
   const pidCleaned =
     pidRead.kind === "missing" && !pidCleanupAmbiguous && !persistentCleanup.ambiguous;
+  // Issue #148: a silent port that was proven owned by the exact prior child
+  // tree at capture time must not degrade into unrelated_listener while it is
+  // still held by those same processes. Reclassify live so a genuine foreign
+  // takeover still escalates to unrelated_listener.
+  let listenerOwnedByPriorTree = false;
+  if (
+    options.prior.ownership === "prior_unresponsive" &&
+    (listenerState.kind === "unrelated" || listenerState.kind === "indeterminate")
+  ) {
+    const verdict = options.classifyPriorPortOwnership
+      ? await options.classifyPriorPortOwnership()
+      : "owned_by_members" as const;
+    // `unknown` stands on the proven capture-time membership rather than
+    // fabricating foreignness; only a proven foreign owner escalates.
+    listenerOwnedByPriorTree =
+      verdict !== "foreign" &&
+      options.prior.ownership === "prior_unresponsive";
+  }
   let state: LaunchAgentUnloadState;
   const currentPidMatchesListener = runtimeIdentityMatches(currentPidIdentity, listenerIdentity);
   if (
@@ -1694,6 +1928,8 @@ async function observeLaunchAgentUnloadOnce(options: {
     (pidRead.kind === "current" && !currentPidMatchesPrior)
   ) {
     state = "ambiguous_prior_owner";
+  } else if (listenerOwnedByPriorTree) {
+    state = "prior_unresponsive";
   } else if (listenerState.kind === "unrelated" || options.prior.ownership === "unrelated") {
     state = "unrelated_listener";
   } else if (
@@ -1777,6 +2013,11 @@ export async function observeLaunchAgentUnloadTerminalState(options: {
   ) => CollectorPidCleanupResult;
   now?: () => number;
   poll?: (milliseconds: number) => Promise<void>;
+  /** Issue #148: overrides the live port-owner classification used to keep a
+   * proven prior-tree listener classified prior_unresponsive instead of
+   * unrelated_listener. Defaults to the real lsof+ps classifier against
+   * options.port. */
+  classifyPortOwnership?: () => PortOwnershipVerdict | Promise<PortOwnershipVerdict>;
 }): Promise<LaunchAgentUnloadOutcome> {
   const timeoutMs = Math.max(0, options.timeoutMs ?? 4_000);
   const pollIntervalMs = Math.max(1, options.pollIntervalMs ?? 50);
@@ -1791,6 +2032,12 @@ export async function observeLaunchAgentUnloadTerminalState(options: {
   const reconcileCleanupState =
     options.reconcileCleanupState ?? reconcileCollectorPidCleanupState;
   const removePidFile = options.removePidFile ?? removeCollectorPidFileIfOwnedDetailed;
+  const priorMembers = options.prior.portOwnershipMembers;
+  const defaultPriorPortClassifier: (() => PortOwnershipVerdict) | undefined = priorMembers?.length
+    ? () => portOwnershipAgainstMembers(options.port, priorMembers)
+    : undefined;
+  const classifyPriorPortOwnership =
+    options.classifyPortOwnership ?? defaultPriorPortClassifier;
   let removedPidFile = false;
   let pidCleanupAmbiguous = false;
   let pidCleanupQuarantined = false;
@@ -1813,6 +2060,7 @@ export async function observeLaunchAgentUnloadTerminalState(options: {
       removedPidFile,
       pidCleanupAmbiguous,
       pidCleanupQuarantined,
+      classifyPriorPortOwnership,
     });
     observations += 1;
     removedPidFile = final.removedPidFile;
@@ -1847,6 +2095,7 @@ export async function observeLaunchAgentUnloadTerminalState(options: {
     removedPidFile,
     pidCleanupAmbiguous,
     pidCleanupQuarantined,
+    classifyPriorPortOwnership,
   });
   observations += 1;
   removedPidFile = final.removedPidFile;
