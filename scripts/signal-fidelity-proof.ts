@@ -2049,7 +2049,8 @@ async function main() {
   // only on acceptance; the handshake rides the REAL signed sync path; a
   // refused token leaves the config byte-identical with a clear reason.
   const joinHome = path.join(tempDir, "join-home");
-  fs.mkdirSync(joinHome, { recursive: true });
+  fs.mkdirSync(joinHome, { recursive: true, mode: 0o700 });
+  fs.chmodSync(joinHome, 0o700);
   const previousPlimsollHome = process.env.PLIMSOLL_HOME;
   process.env.PLIMSOLL_HOME = joinHome; // collectorHome() prefers the env var — keep the real config out of reach
   try {

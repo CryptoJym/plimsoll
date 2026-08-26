@@ -330,7 +330,6 @@ function runGoldenObservations() {
   record(
     "golden_live_identity_classified_live",
     classifyProcessIdentity({
-      instanceId: randomUUID(),
       pid: process.pid,
       processStartFingerprint: selfFingerprint!,
       processStartFingerprintAlgorithm: UTC_PROCESS_START_ALGORITHM,
@@ -341,7 +340,6 @@ function runGoldenObservations() {
   // classify stale or indeterminate depending on errno, but never live.
   const hugePid = 2 ** 31 - 1;
   const hugePidClassification = classifyProcessIdentity({
-    instanceId: randomUUID(),
     pid: hugePid,
     processStartFingerprint: "sha256:synthetic",
     processStartFingerprintAlgorithm: UTC_PROCESS_START_ALGORITHM,
@@ -360,7 +358,6 @@ function runGoldenObservations() {
 function spawnSyncExitThenClassify() {
   const child = spawnSync(process.execPath, ["-e", "process.exit(0)"]);
   return classifyProcessIdentity({
-    instanceId: randomUUID(),
     pid: child.pid ?? -1,
     processStartFingerprint: readUtcProcessStartFingerprint(child.pid ?? -1) ?? "sha256:none",
     processStartFingerprintAlgorithm: UTC_PROCESS_START_ALGORITHM,
