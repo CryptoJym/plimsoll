@@ -16,6 +16,10 @@ import {
   LearningFactStore,
 } from "../packages/collector-cli/src/learning-facts";
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
+import {
+  toolAttemptResultSignalSchema,
+  toolAttemptStartSignalSchema,
+} from "../packages/shared/src/index";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 
 const SCHEMA = "plimsoll.learning-facts-proof.v1" as const;
@@ -459,10 +463,116 @@ async function main() {
       { openEpisode: true, durationMs: openCompleted.durationMs },
     );
 
+    //
+    // #100 adversarial probes: hostile producers and buggy adapters must not
+    // be able to mutate promoted identity, forge cross-session results,
+    // close retry cycles, or place exposures outside their episode.
+    //
+    proofStage = "hostile_identity";
+    assert.throws(
+      () =>
+        store.recordToolSignal(
+          toolAttemptResultSignalSchema.parse({
+            kind: "result",
+            operationId: starts[0].operationId,
+            source: starts[0].source,
+            sessionId: "session-forge-other-100",
+            endedAt: "2026-07-17T12:05:00.000Z",
+            resultStatus: "success",
+          }),
+        ),
+      /ToolAttemptResultIdentityConflict/,
+    );
+    checks.push({
+      name: "cross_session_result_forgery_rejected",
+      detail: {
+        targetStillUnknown: store.attempts().find(
+          (attempt) => attempt.operationId === starts[0].operationId,
+        )?.resultStatus === "failure",
+      },
+    });
+    assert.throws(
+      () =>
+        store.recordToolSignal(
+          toolAttemptStartSignalSchema.parse({
+            ...starts[0],
+            toolClass: "local_io",
+            toolName: "read",
+          }),
+        ),
+      /ToolAttemptIdentityConflict/,
+    );
+    checks.push({
+      name: "attempt_identity_mutation_on_replay_rejected",
+      detail: {
+        dimensionsUnchanged: store.attempts().find(
+          (attempt) => attempt.operationId === starts[0].operationId,
+        )?.toolName === "shell",
+      },
+    });
+    const cycleA = adaptToolInteractionEvent({
+      event: event({
+        id: "00000000-0000-5000-9000-000000000320",
+        type: "tool_use",
+        observedAt: "2026-07-17T12:00:41.000Z",
+      }),
+      sourceOperationKey: "cycle-attempt-a",
+      episodeId: episode.episodeId,
+    });
+    const cycleB = adaptToolInteractionEvent({
+      event: event({
+        id: "00000000-0000-5000-9000-000000000321",
+        type: "tool_use",
+        observedAt: "2026-07-17T12:00:42.000Z",
+      }),
+      sourceOperationKey: "cycle-attempt-b",
+      retryOfSourceOperationKey: "cycle-attempt-a",
+      episodeId: episode.episodeId,
+    });
+    store.recordToolSignal(cycleA);
+    store.recordToolSignal(cycleB);
+    assert.throws(
+      () =>
+        store.recordToolSignal(
+          toolAttemptStartSignalSchema.parse({ ...cycleA, retryOf: cycleB.operationId }),
+        ),
+      /ToolAttemptIdentityConflict/,
+    );
+    check(
+      "retry_cycle_closure_rejected_and_chain_acyclic",
+      store.attempts().find((attempt) => attempt.operationId === cycleA.operationId)
+        ?.retryOf === undefined &&
+        store.attempts().find((attempt) => attempt.operationId === cycleB.operationId)
+          ?.retryOf === cycleA.operationId,
+      { cycleRejected: true },
+    );
+
     check(
       "technique_absence_is_not_inferred_from_attempt_mix",
       store.exposures().length === 0,
       { exposuresBeforeExplicitWrite: store.exposures().length },
+    );
+    const outsideEpisodeExposure = buildTechniqueExposureFact({
+      episodeId: episode.episodeId,
+      techniqueId: "bounded-retry-playbook",
+      techniqueVersion: "1.2.0",
+      assignmentId: "intervention-100-window",
+      workClass: episode.workClass,
+      complexityBand: episode.complexityBand,
+      exposedAt: "2026-07-17T12:01:40.000Z",
+      mode: "control",
+    });
+    assert.throws(
+      () =>
+        store.recordTechniqueExposure(outsideEpisodeExposure, {
+          outcomeObservedAt: "2026-07-17T12:02:00.000Z",
+        }),
+      /TechniqueExposureOutsideEpisode/,
+    );
+    check(
+      "exposure_outside_episode_window_rejected_even_when_prospective",
+      store.exposures().length === 0,
+      { exposuresUnchanged: store.exposures().length },
     );
     proofStage = "exposure";
     const canonicalExposureInput = {
