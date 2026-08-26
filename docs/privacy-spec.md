@@ -198,9 +198,9 @@ names only). Typed event fields:
 2. `sessionId` — string, optional.
 3. `tenantId` — string, optional.
 4. `actorId` — string, optional — normalized name also appears in `protectedMetadataFieldNames`; inside free-form metadata such keys are value-hashed (see *Collected hashed*), and as a typed field it crosses under the outbound identifier contract.
-5. `source` — enum(anthropic_admin | anthropic_usage | claude_code | codex | github | openai_usage | manual | unknown), required.
+5. `source` — enum(anthropic_admin | anthropic_usage | claude_code | codex | github | openai_usage | vendor_import | manual | unknown), required.
 6. `dataMode` — enum(metadata | event_detail | evidence), optional.
-7. `eventType` — enum(session_start | session_stop | user_prompt_submit | assistant_response | tool_use | tool_result | otel_span | usage_rollout | usage_transcript | unknown), required.
+7. `eventType` — enum(session_start | session_stop | user_prompt_submit | assistant_response | tool_use | tool_result | otel_span | usage_rollout | usage_transcript | usage_vendor_import | unknown), required.
 8. `observedAt` — string, required.
 9. `model` — string, optional.
 10. `projectKey` — string, optional.

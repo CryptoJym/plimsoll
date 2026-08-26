@@ -49,7 +49,7 @@ const dominantAccountSql = `
   ) where rn = 1`;
 
 export function dashboardSummary(db: Database.Database, days = 30) {
-  const since = sinceIso(days);
+  const since = sinceIso(days, db);
   const totals = db
     .prepare(
       `select
@@ -85,7 +85,11 @@ export function dashboardSummary(db: Database.Database, days = 30) {
     .prepare(
       `select substr(observed_at, 1, 10) as day,
         coalesce(sum(cost_usd), 0) as costUsd,
-        coalesce(sum(input_tokens), 0) + coalesce(sum(output_tokens), 0) as tokens
+        coalesce(sum(input_tokens), 0) + coalesce(sum(output_tokens), 0) as tokens,
+        sum(case when source = 'vendor_import' then 1 else 0 end) as vendorEvents,
+        coalesce(sum(case when source = 'vendor_import' then cost_usd else 0 end), 0) as vendorCostUsd,
+        coalesce(sum(case when source = 'vendor_import' then input_tokens else 0 end), 0) +
+          coalesce(sum(case when source = 'vendor_import' then output_tokens else 0 end), 0) as vendorTokens
       from buffered_events where observed_at >= ? group by day order by day asc`,
     )
     .all(since);
@@ -122,7 +126,7 @@ export function dashboardSummary(db: Database.Database, days = 30) {
 }
 
 export function dashboardSessions(db: Database.Database, days = 30, limit = 60) {
-  const since = sinceIso(days);
+  const since = sinceIso(days, db);
   // Aggregate first, then join labels from the outer row. The previous shape
   // called max() inside a correlated subquery's WHERE, which SQLite rejects at
   // run time ("misuse of aggregate function") — /api/sessions 500'd on every
@@ -155,7 +159,7 @@ export function dashboardSessions(db: Database.Database, days = 30, limit = 60) 
 }
 
 export function dashboardRepos(db: Database.Database, days = 30) {
-  const since = sinceIso(days);
+  const since = sinceIso(days, db);
   // Event-grain attribution (issue 0008): token events carry repo columns
   // (stitched from their session timeline, or native on rollout events), so a
   // multi-repo session's cost splits per repo instead of lumping onto its
@@ -283,7 +287,7 @@ export function dashboardAccounts(
   subscriptions: SubscriptionConfig[],
   days = 30,
 ) {
-  const since = sinceIso(days);
+  const since = sinceIso(days, db);
   // A session's whole cost is attributed to its cost-dominant account hash
   // and event-dominant repo hash. max(hash) attributed straddle sessions to
   // whichever hash happened to sort higher — on 2026-06-10 that moved ~$486
@@ -385,7 +389,7 @@ export function dashboardAccounts(
 }
 
 export function dashboardRepoDetail(db: Database.Database, repoHash: string, days = 30) {
-  const since = sinceIso(days);
+  const since = sinceIso(days, db);
   const label = (db.prepare(`select label from repo_labels where repo_hash = ?`).get(repoHash) as
     | { label: string }
     | undefined)?.label;
@@ -432,7 +436,12 @@ export function dashboardRepoDetail(db: Database.Database, repoHash: string, day
   return { repoHash, label: label ?? null, days, totals, daily, branches, actionMix, models };
 }
 
-function sinceIso(days: number) {
+function sinceIso(days: number, db?: Database.Database) {
   const clamped = Math.max(1, Math.min(days, 1825));
-  return new Date(Date.now() - clamped * 24 * 60 * 60 * 1000).toISOString();
+  const rolling = new Date(Date.now() - clamped * 24 * 60 * 60 * 1000).toISOString();
+  if (clamped !== 1825 || !db) return rolling;
+  const extended = db.prepare(
+    `select cutoff_at as cutoffAt from dashboard_window_control where days=1825`,
+  ).get() as { cutoffAt: string } | undefined;
+  return extended?.cutoffAt && extended.cutoffAt < rolling ? extended.cutoffAt : rolling;
 }

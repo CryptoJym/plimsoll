@@ -78,6 +78,7 @@ separate purge may remove.
 | `lifecycle update\|rollback\|uninstall\|purge\|support-bundle` | Transactional immutable-runtime updates with automatic rollback, preview-default uninstall, exact-confirmation purge, sanitized support bundle |
 | `scan-rollouts` | One-time full-history walk of Codex rollout files into the ledger |
 | `scan-transcripts` | One-time full-history walk of Claude Code transcripts into the ledger |
+| `import anthropic FILE` | Import an Anthropic CSV as daily vendor-reported usage; captured days win overlaps |
 | `label account HASH NAME` | Local-only display label for a hashed account |
 | `priority add\|remove\|list` | Manage the priority-repo list (hashed; URLs stay local) |
 | `purge-local-data` | Dry-run or explicit purge of local buffered events |

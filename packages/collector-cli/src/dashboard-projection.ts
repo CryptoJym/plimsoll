@@ -26,8 +26,8 @@ export const SNAPSHOT_MAX_STALENESS_MS = 15 * 60_000;
 const CANONICAL_SHA256 = /^sha256:[0-9a-f]{64}$/;
 const UNLINKED_REPO = "__unlinked__";
 const UNLINKED_ACCOUNT = "__unlinked_account__";
-const SAFE_SOURCES=new Set(["anthropic_admin","anthropic_usage","claude_code","codex","github","openai_usage","manual","unknown"]);
-const SAFE_EVENT_TYPES=new Set(["session_start","session_stop","user_prompt_submit","assistant_response","tool_use","tool_result","otel_span","usage_rollout","usage_transcript","unknown"]);
+const SAFE_SOURCES=new Set(["anthropic_admin","anthropic_usage","claude_code","codex","github","openai_usage","vendor_import","manual","unknown"]);
+const SAFE_EVENT_TYPES=new Set(["session_start","session_stop","user_prompt_submit","assistant_response","tool_use","tool_result","otel_span","usage_rollout","usage_transcript","usage_vendor_import","unknown"]);
 const SAFE_ACTIONS=new Set(["continue","validate","test","edit","read","write","shell","mcp","browser","review","other"]);
 /**
  * Usage authority between the two ingest paths that record the same work
@@ -649,6 +649,9 @@ export class DashboardProjectionStore {
         days integer not null, day text not null,
         events integer not null default 0,
         cost_nanos integer not null default 0, tokens integer not null default 0,
+        vendor_events integer not null default 0,
+        vendor_cost_nanos integer not null default 0,
+        vendor_tokens integer not null default 0,
         primary key (days, day)
       );
       create table if not exists dashboard_model_window (
@@ -801,8 +804,8 @@ export class DashboardProjectionStore {
         select old.rowid,old.observed_at,old.source,old.event_type,old.action_class,
           strftime('%Y-%m-%dT%H:%M:%fZ','now')
         where old.session_id is null and old.model is null
-          and old.source in ('anthropic_admin','anthropic_usage','claude_code','codex','github','openai_usage','manual','unknown')
-          and old.event_type in ('session_start','session_stop','user_prompt_submit','assistant_response','tool_use','tool_result','otel_span','usage_rollout','usage_transcript','unknown')
+          and old.source in ('anthropic_admin','anthropic_usage','claude_code','codex','github','openai_usage','vendor_import','manual','unknown')
+          and old.event_type in ('session_start','session_stop','user_prompt_submit','assistant_response','tool_use','tool_result','otel_span','usage_rollout','usage_transcript','usage_vendor_import','unknown')
           and (old.action_class is null or old.action_class in ('continue','validate','test','edit','read','write','shell','mcp','browser','review','other'))
           and old.input_tokens is null and old.output_tokens is null
           and old.cache_read_tokens is null and old.cache_creation_tokens is null
@@ -844,8 +847,8 @@ export class DashboardProjectionStore {
         select old.rowid,old.observed_at,old.source,old.event_type,old.action_class,
           strftime('%Y-%m-%dT%H:%M:%fZ','now')
         where old.session_id is null and old.model is null
-          and old.source in ('anthropic_admin','anthropic_usage','claude_code','codex','github','openai_usage','manual','unknown')
-          and old.event_type in ('session_start','session_stop','user_prompt_submit','assistant_response','tool_use','tool_result','otel_span','usage_rollout','usage_transcript','unknown')
+          and old.source in ('anthropic_admin','anthropic_usage','claude_code','codex','github','openai_usage','vendor_import','manual','unknown')
+          and old.event_type in ('session_start','session_stop','user_prompt_submit','assistant_response','tool_use','tool_result','otel_span','usage_rollout','usage_transcript','usage_vendor_import','unknown')
           and (old.action_class is null or old.action_class in ('continue','validate','test','edit','read','write','shell','mcp','browser','review','other'))
           and old.input_tokens is null and old.output_tokens is null
           and old.cache_read_tokens is null and old.cache_creation_tokens is null
@@ -961,6 +964,15 @@ export class DashboardProjectionStore {
     ]){
       const name=definition.split(" ")[0]!;
       if(!controlColumns.has(name))this.db.exec(`alter table dashboard_projection_control add column ${definition}`);
+    }
+    const dailyColumns=new Set((this.db.pragma("table_info(dashboard_daily_window)") as Array<{name:string}>).map((row)=>row.name));
+    for(const definition of [
+      "vendor_events integer not null default 0",
+      "vendor_cost_nanos integer not null default 0",
+      "vendor_tokens integer not null default 0",
+    ]){
+      const name=definition.split(" ")[0]!;
+      if(!dailyColumns.has(name))this.db.exec(`alter table dashboard_daily_window add column ${definition}`);
     }
     const cancellationColumns=new Set((this.db.pragma("table_info(dashboard_compact_cancellations)") as Array<{name:string}>).map((row)=>row.name));
     if(!cancellationColumns.has("bucket_day")){
@@ -1537,11 +1549,19 @@ export class DashboardProjectionStore {
         cost_nanos=cost_nanos+excluded.cost_nanos`,
     ).run({ ...values, source: fact.source });
     this.db.prepare(
-      `insert into dashboard_daily_window (days,day,events,cost_nanos,tokens)
-       values (@days,@day,@events,@costNanos,@tokens)
+      `insert into dashboard_daily_window
+       (days,day,events,cost_nanos,tokens,vendor_events,vendor_cost_nanos,vendor_tokens)
+       values (@days,@day,@events,@costNanos,@tokens,@vendorEvents,@vendorCostNanos,@vendorTokens)
        on conflict(days,day) do update set cost_nanos=cost_nanos+excluded.cost_nanos,
-        tokens=tokens+excluded.tokens,events=events+excluded.events`,
-    ).run({ days, day: day(fact.observedAt), events:sign, costNanos: values.costNanos, tokens: values.inputTokens + values.outputTokens });
+        tokens=tokens+excluded.tokens,events=events+excluded.events,
+        vendor_events=vendor_events+excluded.vendor_events,
+        vendor_cost_nanos=vendor_cost_nanos+excluded.vendor_cost_nanos,
+        vendor_tokens=vendor_tokens+excluded.vendor_tokens`,
+    ).run({ days, day: day(fact.observedAt), events:sign, costNanos: values.costNanos,
+      tokens: values.inputTokens + values.outputTokens,
+      vendorEvents: fact.source === "vendor_import" ? sign : 0,
+      vendorCostNanos: fact.source === "vendor_import" ? values.costNanos : 0,
+      vendorTokens: fact.source === "vendor_import" ? values.inputTokens + values.outputTokens : 0 });
     if (
       fact.model &&
       (fact.inputTokens !== null || fact.outputTokens !== null || fact.costNanos !== null)
@@ -2448,7 +2468,13 @@ export class DashboardProjectionStore {
          from dashboard_window_control where days=?`,
       ).get(days) as { cutoffAt: string;targetCutoffAt:string|null;cursorAt:string|null;cursorId:string|null;
         compactHighWater:number|null;compactCursorSegment:number|null;compactCursorOffset:number|null };
-      const target = sinceIso(days, now);
+      const rollingTarget = sinceIso(days, now);
+      // 1825d is the user-facing "all history" window. A vendor import may
+      // move its floor earlier than five years; do not roll that explicit
+      // extension forward on the next maintenance cycle.
+      const target = days === 1825 && row.cutoffAt < rollingTarget
+        ? row.cutoffAt
+        : rollingTarget;
       const delta = Date.parse(target) - Date.parse(row.cutoffAt);
       if (delta < 0) {
         rollback = true;
@@ -2657,10 +2683,14 @@ export class DashboardProjectionStore {
       inputTokens: Number(row.inputTokens), outputTokens: Number(row.outputTokens), costUsd: usd(row.costNanos),
     }));
     const dailyRows = this.db.prepare(
-      `select day,cost_nanos as costNanos,tokens from dashboard_daily_window
-       where days=? and (cost_nanos!=0 or tokens!=0) order by day`,
+       `select day,cost_nanos as costNanos,tokens,
+        vendor_events as vendorEvents,vendor_cost_nanos as vendorCostNanos,
+        vendor_tokens as vendorTokens from dashboard_daily_window
+       where days=? and (cost_nanos!=0 or tokens!=0 or vendor_events!=0) order by day`,
     ).all(days) as Array<Record<string, unknown>>;
-    const daily = dailyRows.map((row)=>({day:row.day,costUsd:usd(row.costNanos),tokens:Number(row.tokens)}));
+    const daily = dailyRows.map((row)=>({day:row.day,costUsd:usd(row.costNanos),tokens:Number(row.tokens),
+      vendorReported:Number(row.vendorEvents)>0,vendorEvents:Number(row.vendorEvents),
+      vendorCostUsd:usd(row.vendorCostNanos),vendorTokens:Number(row.vendorTokens)}));
     const modelRows = this.db.prepare(
       `select model,calls,unpriced_calls as unpricedCalls,input_tokens as inputTokens,
         output_tokens as outputTokens,cache_read_tokens as cacheReadTokens,
@@ -2872,7 +2902,35 @@ export class DashboardProjectionStore {
         metricComplete:Boolean(c.metricBackfillComplete),metricSampleCount:c.metricBackfillComplete?c.metricSampleCount:null,
         progressMode:"bounded_rowid_watermark_no_exact_remaining",sliceRows:BACKFILL_ROWS},
       backlog,counters:this.workCounters(),retention:{rawTtlActivation:"bounded_active",
-        projectionParityReady:Boolean(c.parityReady)}};
+      projectionParityReady:Boolean(c.parityReady)}};
+  }
+
+  /**
+   * Extend the all-history reporting floor for a vendor import. The regular
+   * windows remain rolling; only the all-history window may move backwards.
+   * Import callers do this before appending the first vendor fact so that its
+   * immediate projection is admitted to the expanded window.
+   */
+  expandAllHistoryTo(cutoffAt: string) {
+    if (!/^\d{4}-\d{2}-\d{2}T00:00:00\.000Z$/.test(cutoffAt) ||
+      !Number.isFinite(Date.parse(cutoffAt))) {
+      throw new Error("vendor_import_invalid_history_floor");
+    }
+    const row = this.db.prepare(
+      `select cutoff_at as cutoffAt,target_cutoff_at as targetCutoffAt
+       from dashboard_window_control where days=?`,
+    ).get(1825) as { cutoffAt:string; targetCutoffAt:string|null } | undefined;
+    if (!row || cutoffAt >= row.cutoffAt) return false;
+    if (row.targetCutoffAt !== null) throw new Error("vendor_import_history_window_busy");
+    this.db.prepare(
+      `update dashboard_window_control set cutoff_at=?,last_success_at=null where days=?`,
+    ).run(cutoffAt, 1825);
+    this.db.prepare(
+      `update dashboard_projection_control set dirty=1,
+        degraded_reason=case when generation>0 then 'projection_repair_backlog' else degraded_reason end
+       where singleton=1`,
+    ).run();
+    return true;
   }
 
   readSnapshot(days:number,subscriptions:SubscriptionConfig[]=[]):SnapshotRead {

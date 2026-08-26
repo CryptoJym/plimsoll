@@ -10,3 +10,4 @@ export * from "./normalizer";
 export * from "./runtime-facts";
 export * from "./server";
 export * from "./version";
+export * from "./vendor-import";
