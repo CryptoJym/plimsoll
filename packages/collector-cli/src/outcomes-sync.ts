@@ -12,6 +12,7 @@ import {
   githubOutcomeIngestBatchSchema,
   remoteLinkageHash,
   branchLinkageHash,
+  workRepoLabelSchema,
   type GitHubOutcomeIngestBatch,
 } from "../../shared/src/index";
 
@@ -57,6 +58,38 @@ const MAX_CHECKED_PULLS = 20;
 const MAX_REVERT_PAGES = 3;
 const MAX_REOPEN_PULLS = 20;
 const MAX_LINKED_SESSION_IDS = 50;
+
+type GitHubRepositoryParts = {
+  owner: string;
+  repo: string;
+  remoteUrlHash: string;
+};
+
+/**
+ * Normalize the explicitly named repository once, before it participates in
+ * either the hash spine or an external id. The wire schema trims display
+ * fields, but hashing/external-id construction before parsing would otherwise
+ * let surrounding whitespace create a different repository hash and id.
+ */
+function normalizeGitHubRepository(ownerInput: string, repoInput: string): GitHubRepositoryParts {
+  const owner = ownerInput.trim().toLowerCase();
+  const repo = repoInput.trim().toLowerCase();
+  const remoteUrlHash = remoteLinkageHash(`https://github.com/${owner}/${repo}.git`);
+  const parsed = workRepoLabelSchema.safeParse({
+    provider: "github",
+    owner,
+    name: repo,
+    remoteUrlHash,
+  });
+  if (!parsed.success || !parsed.data.owner || !parsed.data.remoteUrlHash) {
+    throw new Error("--repository expects a safe GitHub owner/repo slug.");
+  }
+  return {
+    owner: parsed.data.owner,
+    repo: parsed.data.name,
+    remoteUrlHash: parsed.data.remoteUrlHash,
+  };
+}
 
 export type LedgerSessionLink = {
   sessionId: string;
@@ -207,10 +240,9 @@ export function buildOutcomePush(input: {
   signals: ReworkSignal[];
   reworkWindowDays: number;
 }): OutcomePush {
-  const owner = input.owner.toLowerCase();
-  const repo = input.repo.toLowerCase();
+  const normalizedRepository = normalizeGitHubRepository(input.owner, input.repo);
+  const { owner, repo, remoteUrlHash } = normalizedRepository;
   const repoSlug = `github.com/${owner}/${repo}`;
-  const remoteUrlHash = remoteLinkageHash(`https://${repoSlug}.git`);
 
   const byPull = new Map<number, { sessions: Map<string, SessionPullJoin>; via: Set<string> }>();
   for (const join of input.joins) {
@@ -630,10 +662,12 @@ export async function runOutcomesSync(
     );
   }
 
-  const [owner, repo] = options.repository.split("/");
-  if (!owner || !repo || options.repository.split("/").length !== 2) {
-    throw new Error(`--repository expects owner/repo, got: ${options.repository}`);
+  const repositoryParts = options.repository.trim().split("/");
+  if (repositoryParts.length !== 2 || !repositoryParts[0] || !repositoryParts[1]) {
+    throw new Error("--repository expects a safe GitHub owner/repo slug.");
   }
+  const normalizedRepository = normalizeGitHubRepository(repositoryParts[0], repositoryParts[1]);
+  const { owner, repo } = normalizedRepository;
 
   const sinceDays = options.sinceDays ?? 30;
   const reworkWindowDays = options.reworkWindowDays ?? 14;
@@ -643,7 +677,7 @@ export async function runOutcomesSync(
   }
   const since = new Date(Date.parse(until) - sinceDays * 24 * 60 * 60 * 1000).toISOString();
   const token = options.githubToken ?? process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN;
-  const repoHash = remoteLinkageHash(`https://github.com/${owner}/${repo}.git`);
+  const repoHash = normalizedRepository.remoteUrlHash;
 
   let ledger = options.ledgerDb ?? null;
   let ownsLedger = false;

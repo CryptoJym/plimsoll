@@ -3891,6 +3891,28 @@ async function main() {
       JSON.stringify({ invalid: invalidOutcomeMetadata, valid: validOutcomeMetadata }),
     );
 
+    const whitespaceRepositoryPush = buildOutcomePush({
+      tenantId: d2Config.tenantId,
+      owner: " Acme ",
+      repo: " Widgets ",
+      pulls: [d2PullSummaries[0]!],
+      joins: [d2Joins[0]!],
+      signals: [],
+      reworkWindowDays: 14,
+    });
+    check(
+      "outcomes_repository_input_is_canonicalized_before_hashing",
+      whitespaceRepositoryPush.batch?.repository.owner === "acme" &&
+        whitespaceRepositoryPush.batch.repository.name === "widgets" &&
+        whitespaceRepositoryPush.batch.repository.remoteUrlHash === d2RepoHash &&
+        whitespaceRepositoryPush.batch.artifacts[0]?.externalId === "github.com/acme/widgets/pull/7" &&
+        whitespaceRepositoryPush.batch.artifacts[0]?.id === "artifact:github.com/acme/widgets/pull/7",
+      JSON.stringify({
+        repository: whitespaceRepositoryPush.batch?.repository,
+        externalId: whitespaceRepositoryPush.batch?.artifacts[0]?.externalId,
+      }),
+    );
+
     // 18d. End-to-end: signed push, honest counters, statuses/outcomes per
     // PR, dry-run sends nothing, and a re-run posts a byte-identical batch.
     const d2Run1 = await runOutcomesSync(d2Config, {
