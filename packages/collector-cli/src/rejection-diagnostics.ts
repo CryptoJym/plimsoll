@@ -137,6 +137,7 @@ export function createRejectionDiagnostics(options: {
   const acceptedBySource: Record<LocalProducerSource, number> = {
     claude_code: 0,
     codex: 0,
+    gemini_cli: 0,
   };
   if (options.initialByReason) {
     for (const [reason, seed] of Object.entries(options.initialByReason)) {

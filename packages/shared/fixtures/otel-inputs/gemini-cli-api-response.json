@@ -1,0 +1,40 @@
+{
+  "resourceLogs": [
+    {
+      "resource": {
+        "attributes": [
+          { "key": "service.name", "value": { "stringValue": "gemini_cli" } },
+          { "key": "service.version", "value": { "stringValue": "0.34.0" } }
+        ]
+      },
+      "scopeLogs": [
+        {
+          "scope": { "name": "gemini-cli.telemetry" },
+          "logRecords": [
+            {
+              "attributes": [
+                { "key": "event.name", "value": { "stringValue": "gemini_cli.api_response" } },
+                { "key": "session.id", "value": { "stringValue": "gemini-session-fixture" } },
+                { "key": "model", "value": { "stringValue": "gemini-2.5-pro" } },
+                { "key": "input_token_count", "value": { "intValue": "1200" } },
+                { "key": "output_token_count", "value": { "intValue": "300" } },
+                { "key": "cached_content_token_count", "value": { "intValue": "50" } },
+                { "key": "thoughts_token_count", "value": { "intValue": "80" } },
+                { "key": "tool_token_count", "value": { "intValue": "20" } },
+                { "key": "total_token_count", "value": { "intValue": "1600" } },
+                { "key": "status_code", "value": { "intValue": "200" } },
+                { "key": "function_name", "value": { "stringValue": "run_shell_command" } },
+                { "key": "function_args", "value": { "stringValue": "RAW_GEMINI_FUNCTION_ARGS_SENTINEL" } },
+                { "key": "request_text", "value": { "stringValue": "RAW_GEMINI_REQUEST_TEXT_SENTINEL" } },
+                { "key": "response_text", "value": { "stringValue": "RAW_GEMINI_RESPONSE_TEXT_SENTINEL" } },
+                { "key": "gen_ai.input.messages", "value": { "stringValue": "RAW_GEMINI_INPUT_MESSAGES_SENTINEL" } },
+                { "key": "gen_ai.output.messages", "value": { "stringValue": "RAW_GEMINI_OUTPUT_MESSAGES_SENTINEL" } },
+                { "key": "gen_ai.system_instructions", "value": { "stringValue": "RAW_GEMINI_SYSTEM_INSTRUCTIONS_SENTINEL" } }
+              ]
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

@@ -15,6 +15,7 @@ const MODEL_KEYS = ["model", "slug", "gen_ai.request.model", "gen_ai.response.mo
 const INPUT_TOKEN_KEYS = [
   "inputTokens",
   "input_tokens",
+  "input_token_count",
   "gen_ai.usage.input_tokens",
   "llm.usage.prompt_tokens",
 ] as const;
@@ -22,6 +23,9 @@ const INPUT_TOKEN_KEYS = [
 const OUTPUT_TOKEN_KEYS = [
   "outputTokens",
   "output_tokens",
+  "output_token_count",
+  "thoughts_token_count",
+  "tool_token_count",
   "gen_ai.usage.output_tokens",
   "llm.usage.completion_tokens",
 ] as const;
@@ -32,6 +36,7 @@ const CACHE_READ_TOKEN_KEYS = [
   "gen_ai.usage.cache_read_tokens",
   "gen_ai.usage.cache_read.input_tokens",
   "gen_ai.usage.cached_tokens",
+  "cached_content_token_count",
 ] as const;
 
 const CACHE_CREATION_TOKEN_KEYS = [
@@ -137,6 +142,7 @@ const RECORD_ANALYTICAL_SCALARS = new Map<string, AnalyticalScalarKind>([
   ["event.sequence", "token_count"],
   ["http.response.status_code", "status_code"],
   ["status.code", "status_code"],
+  ["status_code", "status_code"],
   ["error", "boolean"],
   ["failed", "boolean"],
   ["success", "boolean"],
@@ -166,8 +172,11 @@ const RECORD_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
   ["tool_name", "component"],
   ["toolName", "component"],
   ["tool", "component"],
+  ["function_name", "component"],
   ["name", "component"],
   ["gen_ai.tool.name", "component"],
+  ["tool_type", "classification"],
+  ["mcp_server_name", "component"],
   ["plimsoll.action_class", "classification"],
   ["cfo_one.action_class", "classification"],
   ["action_class", "classification"],

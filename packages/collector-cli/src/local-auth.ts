@@ -9,14 +9,16 @@ import { HttpBoundaryRejection } from "./http-boundary";
 /**
  * These are Plimsoll credentials, not provider credentials. They are created
  * from local randomness and are only ever persisted in the private Plimsoll
- * home. The three values deliberately have separate audiences: a producer
- * token cannot be replayed as a management credential, and Claude/Codex
+ * home. Each value deliberately has a separate audience: a producer token
+ * cannot be replayed as a management credential, and Claude/Codex/Gemini
  * cannot impersonate one another.
  */
 export type LocalIngestAuth = {
   version: 1;
   claudeCodeProducer: string;
   codexProducer: string;
+  /** Added for the Gemini CLI OTLP source; absent only in legacy files. */
+  geminiCliProducer?: string;
   managementRead: string;
 };
 
@@ -38,6 +40,7 @@ function newAuth(): LocalIngestAuth {
     version: LOCAL_INGEST_AUTH_VERSION,
     claudeCodeProducer: newToken(),
     codexProducer: newToken(),
+    geminiCliProducer: newToken(),
     managementRead: newToken(),
   });
 }
@@ -46,21 +49,27 @@ function validAuth(value: unknown): value is LocalIngestAuth {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record).sort();
-  if (keys.join(",") !== "claudeCodeProducer,codexProducer,managementRead,version") {
+  const legacyKeys = "claudeCodeProducer,codexProducer,managementRead,version";
+  const currentKeys = "claudeCodeProducer,codexProducer,geminiCliProducer,managementRead,version";
+  if (keys.join(",") !== legacyKeys && keys.join(",") !== currentKeys) {
     return false;
   }
+  const geminiValid = record.geminiCliProducer === undefined ||
+    (typeof record.geminiCliProducer === "string" && TOKEN_PATTERN.test(record.geminiCliProducer));
   return record.version === LOCAL_INGEST_AUTH_VERSION &&
     typeof record.claudeCodeProducer === "string" &&
     typeof record.codexProducer === "string" &&
     typeof record.managementRead === "string" &&
+    geminiValid &&
     TOKEN_PATTERN.test(record.claudeCodeProducer) &&
     TOKEN_PATTERN.test(record.codexProducer) &&
     TOKEN_PATTERN.test(record.managementRead) &&
     new Set([
       record.claudeCodeProducer,
       record.codexProducer,
+      record.geminiCliProducer,
       record.managementRead,
-    ]).size === 3;
+    ].filter((token): token is string => typeof token === "string")).size === (record.geminiCliProducer ? 4 : 3);
 }
 
 function isPrivateRegularFile(file: string) {
@@ -113,12 +122,11 @@ function authFileExists(home: string) {
   }
 }
 
-function writeNewAuth(home: string, overwrite: boolean) {
+function writeAuth(home: string, auth: LocalIngestAuth, overwrite: boolean) {
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
   if (!isPrivateDirectory(home)) throw new Error("local_ingest_auth_home_unsafe");
   const file = authPath(home);
   const temporary = `${file}.${process.pid}.${crypto.randomBytes(8).toString("hex")}.tmp`;
-  const auth = newAuth();
   let descriptor: number | undefined;
   try {
     descriptor = fs.openSync(temporary, "wx", 0o600);
@@ -152,10 +160,18 @@ function writeNewAuth(home: string, overwrite: boolean) {
   }
 }
 
+function writeNewAuth(home: string, overwrite: boolean) {
+  return writeAuth(home, newAuth(), overwrite);
+}
+
+function migrateLegacyAuth(home: string, existing: LocalIngestAuth) {
+  return writeAuth(home, { ...existing, geminiCliProducer: newToken() }, true);
+}
+
 /** Provision once and return the same values on every subsequent call. */
 export function loadOrCreateLocalIngestAuth(home: string): LocalIngestAuth {
   const existing = readLocalIngestAuth(home);
-  if (existing) return existing;
+  if (existing) return existing.geminiCliProducer ? existing : migrateLegacyAuth(home, existing);
   if (authFileExists(home)) throw new Error("local_ingest_auth_invalid");
   return writeNewAuth(home, false);
 }
@@ -180,7 +196,8 @@ function tokenMatches(supplied: string | undefined, expected: string) {
 function assertCredentialRoute(url: URL, kind: "management" | "producer") {
   const allowed = kind === "management"
     ? url.pathname === "/status" || url.pathname === "/" || url.pathname === "/index.html" || url.pathname.startsWith("/api/")
-    : url.pathname.startsWith("/hooks/") || ["/v1/logs", "/v1/traces", "/v1/metrics"].includes(url.pathname);
+    : url.pathname.startsWith("/hooks/") ||
+      ["/v1/logs", "/v1/traces", "/v1/metrics", "/gemini/v1/logs", "/gemini/v1/traces", "/gemini/v1/metrics"].includes(url.pathname);
   if (!allowed) throw new HttpBoundaryRejection("internal_rejection", 400);
 }
 
@@ -206,11 +223,19 @@ export function assertProducerToken(
   url: URL,
 ) {
   assertCredentialRoute(url, "producer");
-  const supplied = suppliedToken(request);
+  const supplied = suppliedToken(request) ??
+    (source === "gemini_cli" && url.pathname.startsWith("/gemini/")
+      ? url.searchParams.get("x-plimsoll-token") ?? undefined
+      : undefined);
   if (supplied === undefined) {
     throw new HttpBoundaryRejection("producer_token_required", 401);
   }
-  const expected = source === "claude_code" ? auth.claudeCodeProducer : auth.codexProducer;
+  const expected = source === "claude_code"
+    ? auth.claudeCodeProducer
+    : source === "codex"
+      ? auth.codexProducer
+      : auth.geminiCliProducer;
+  if (!expected) throw new HttpBoundaryRejection("producer_token_invalid", 401);
   if (!tokenMatches(supplied, expected)) {
     throw new HttpBoundaryRejection("producer_token_invalid", 401);
   }

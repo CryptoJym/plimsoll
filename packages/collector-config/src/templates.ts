@@ -16,6 +16,7 @@ export type ToolConfigOptions = {
    */
   claudeCodeProducerToken?: string;
   codexProducerToken?: string;
+  geminiCliProducerToken?: string;
 };
 
 function assertSupportedDataMode(options: ToolConfigOptions) {
@@ -181,6 +182,34 @@ export function generateCodexConfigToml(options: ToolConfigOptions) {
   ].join("\n");
 }
 
+/**
+ * Gemini CLI's HTTP exporter appends /v1/{logs,traces,metrics} to its
+ * configured endpoint. The source-qualified path lets Gemini use its native
+ * exporter without a producer-controlled x-plimsoll-source header.
+ */
+export function generateGeminiCliSettings(options: ToolConfigOptions) {
+  assertSupportedDataMode(options);
+
+  const endpoint = `http://127.0.0.1:${port(options)}/gemini`;
+  const otlpEndpoint = options.geminiCliProducerToken
+    ? `${endpoint}?x-plimsoll-token=${encodeURIComponent(options.geminiCliProducerToken)}`
+    : endpoint;
+
+  return {
+    telemetry: {
+      enabled: true,
+      target: "local",
+      otlpEndpoint,
+      otlpProtocol: "http",
+      useCollector: true,
+      traces: false,
+      logPrompts: false,
+    },
+  };
+}
+
+export const generateGeminiSettings = generateGeminiCliSettings;
+
 export function generateSetupInstructions(options: ToolConfigOptions) {
   assertSupportedDataMode(options);
 
@@ -189,6 +218,7 @@ export function generateSetupInstructions(options: ToolConfigOptions) {
     claudeCodeSettingsPath: "~/.claude/settings.json or project .claude/settings.json",
     codexConfigPath:
       "~/.codex/config.toml, project .codex/config.toml, or managed requirements.toml with managed_dir",
+    geminiCliSettingsPath: "~/.gemini/settings.json or project .gemini/settings.json",
     collectorStartCommand: `${shellQuote(options.pnpmCommand ?? "pnpm")} --dir ${shellQuote(options.repoRoot)} collector start`,
     collectorDoctorCommand: `${shellQuote(options.pnpmCommand ?? "pnpm")} --dir ${shellQuote(options.repoRoot)} collector doctor`,
     privacyDefaults: {

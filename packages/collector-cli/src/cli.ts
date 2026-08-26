@@ -135,6 +135,7 @@ import {
   applyCodexConfig,
   generateClaudeCodeSettings,
   generateCodexConfigToml,
+  generateGeminiCliSettings,
   generateSetupInstructions,
 } from "../../collector-config/src/index";
 import type { ToolSource } from "../../shared/src/index";
@@ -195,7 +196,7 @@ Commands:
   export                Print buffered events as JSON
   forward-hook SOURCE   Read hook JSON from stdin and append it without requiring the receiver
   self-test-hook SOURCE Emit one synthetic hook event into the local buffer
-  generate-config TOOL  Print Claude Code or Codex config for metadata collection
+  generate-config TOOL  Print Claude Code, Codex, or Gemini CLI config for metadata collection
   setup                 APPLY the Claude Code + Codex telemetry config (idempotent; --yes, --dry-run)
   upload                Drain un-uploaded events to the tenant ingest API (marks rows, keeps local copies)
   upload-history        Workspace backfill: push the FULL ledger history to the joined
@@ -245,7 +246,7 @@ Config tools:
       Prefer --token-prompt, --token-stdin, --token-fd, or join - so the single-use secret never enters
       shell history or process arguments. Workspace URL env: PLIMSOLL_CLOUD_URL.
       join --dry-run is unsupported and fails before token, network, or local-state mutation.
-  generate-config claude-code|codex|all   (metadata-only; encrypted evidence vault not implemented)
+  generate-config claude-code|codex|gemini-cli|all   (metadata-only; encrypted evidence vault not implemented)
   upload [--url URL --limit 500] [--ingest-key KEY] [--signing-secret SECRET] [--no-mark] [--max-batches 20]
   upload-history [--dry-run] [--full] [--until ISO] [--limit N] [--batch-size 500] [--concurrency 1..8] [--delay-ms 250] [--url URL]
       Default resumes from the local watermark (workspace-backfill-state.json) and scopes
@@ -2071,6 +2072,7 @@ async function main() {
             logs: `http://127.0.0.1:${config.port}/v1/logs`,
             traces: `http://127.0.0.1:${config.port}/v1/traces`,
             metrics: `http://127.0.0.1:${config.port}/v1/metrics`,
+            geminiCli: `http://127.0.0.1:${config.port}/gemini`,
           },
           privacy: {
             ...collectorPrivacyReadiness(config),
@@ -2170,6 +2172,7 @@ async function main() {
       dataMode: config.policy.dataMode,
       claudeCodeProducerToken: localAuth.claudeCodeProducer,
       codexProducerToken: localAuth.codexProducer,
+      geminiCliProducerToken: localAuth.geminiCliProducer,
     };
     const claudeGenerated = generateClaudeCodeSettings(toolOptions);
     const codexToml = generateCodexConfigToml(toolOptions);
@@ -2312,6 +2315,7 @@ async function main() {
         ? {
             claudeCodeProducerToken: localAuth.claudeCodeProducer,
             codexProducerToken: localAuth.codexProducer,
+            geminiCliProducerToken: localAuth.geminiCliProducer,
           }
         : {}),
     };
@@ -2881,6 +2885,7 @@ async function main() {
         ? {
             claudeCodeProducerToken: localAuth.claudeCodeProducer,
             codexProducerToken: localAuth.codexProducer,
+            geminiCliProducerToken: localAuth.geminiCliProducer,
           }
         : {}),
     };
@@ -2895,6 +2900,11 @@ async function main() {
       return;
     }
 
+    if (tool === "gemini-cli") {
+      console.log(JSON.stringify(generateGeminiCliSettings(options), null, 2));
+      return;
+    }
+
     if (tool === "all") {
       console.log(
         JSON.stringify(
@@ -2902,6 +2912,7 @@ async function main() {
             instructions: generateSetupInstructions(options),
             claudeCodeSettings: generateClaudeCodeSettings(options),
             codexConfigToml: generateCodexConfigToml(options),
+            geminiCliSettings: generateGeminiCliSettings(options),
           },
           null,
           2,
@@ -2910,7 +2921,7 @@ async function main() {
       return;
     }
 
-    throw new Error("Expected tool to be claude-code, codex, or all.");
+    throw new Error("Expected tool to be claude-code, codex, gemini-cli, or all.");
   }
 
   if (command === "lifecycle") {

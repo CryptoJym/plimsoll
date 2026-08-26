@@ -29,9 +29,11 @@ import {
   assertBoundedOtlpCardinality,
   assertHookSource,
   assertNoBrowserOrigin,
+  canonicalOtlpTransportPath,
   createRequestBudget,
   createSourceRateLimiter,
   decodeBoundedRequestBody,
+  isOtlpPath,
   parseBoundedJson,
   readBoundedRequestBody,
   requireOtlpSource,
@@ -691,7 +693,7 @@ export function createCollectorServer(
 
       if (
         request.method === "POST" &&
-        (request.url === "/v1/logs" || request.url === "/v1/traces" || request.url === "/v1/metrics")
+        isOtlpPath(request.url)
       ) {
         assertNoBrowserOrigin(request);
         const source = requireOtlpSource(request);
@@ -710,7 +712,7 @@ export function createCollectorServer(
         const exploded = explodeOtlpPayload(parsedEnvelope, {
           policy: config.policy,
           source,
-          transportPath: request.url,
+          transportPath: canonicalOtlpTransportPath(request.url),
           onRepoLabel: (hash, label) => repoLabels.push({ hash, label }),
         });
 
@@ -767,7 +769,7 @@ export function createCollectorServer(
           config,
           buffer,
           source,
-          transportPath: request.url,
+          transportPath: canonicalOtlpTransportPath(request.url),
         });
         rejectionDiagnostics.recordAccepted(source);
         response.writeHead(202, { "content-type": "application/json" });

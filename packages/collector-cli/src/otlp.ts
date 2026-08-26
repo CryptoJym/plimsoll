@@ -135,10 +135,11 @@ function eventSourceFor(attrs: Record<string, unknown>, fallback: ToolSource | u
   // Transport authentication is authoritative. A producer-controlled
   // service.name must never turn an authenticated Codex batch into Claude
   // events (or vice versa); only legacy/unknown callers may infer a source.
-  if (fallback === "claude_code" || fallback === "codex") return fallback;
+  if (fallback === "claude_code" || fallback === "codex" || fallback === "gemini_cli") return fallback;
   const service = (serviceName ?? "").toLowerCase();
   if (service.includes("claude")) return "claude_code";
   if (service.includes("codex")) return "codex";
+  if (service.includes("gemini")) return "gemini_cli";
   return fallback ?? "unknown";
 }
 
@@ -313,7 +314,7 @@ function buildLogEvent(
     cacheCreationTokens !== undefined ||
     costUsd !== undefined;
 
-  const toolName = boundedSignalName(stringField(attrs, ["tool_name", "toolName", "tool"]));
+  const toolName = boundedSignalName(stringField(attrs, ["tool_name", "toolName", "tool", "function_name"]));
   const explicitAction = explicitActionFrom(attrs);
   const derived = explicitAction.present ? undefined : deriveActionClass(toolName);
   const mcpServer = stringField(attrs, ["mcp_server"]);
@@ -440,7 +441,7 @@ function buildSpanEvent(
     cacheCreationTokensSpan !== undefined ||
     costUsd !== undefined;
   const toolName = boundedSignalName(
-    stringField(attrs, ["tool_name", "toolName", "tool", "gen_ai.tool.name"]),
+    stringField(attrs, ["tool_name", "toolName", "tool", "function_name", "gen_ai.tool.name"]),
   );
   const explicitAction = explicitActionFrom(attrs);
   const derived = explicitAction.present ? undefined : deriveActionClass(toolName);
