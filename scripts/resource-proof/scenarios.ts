@@ -48,6 +48,14 @@ import {
 import { TranscriptTailer } from "../../packages/collector-cli/src/transcript-tailer";
 import { uploadBufferedEvents } from "../../packages/collector-cli/src/upload";
 import { createCollectorServer } from "../../packages/collector-cli/src/server";
+import {
+  classifyOwnerShutdown,
+  classifyStopCommand,
+  observeChildExit,
+  reapFixtureChild,
+  withSymbolicDeadline,
+  type ReapOutcome,
+} from "./owner-shutdown";
 import { aiInteractionEventSchema } from "../../packages/shared/src/index";
 import {
   WORK_COUNTER_NAMES,
@@ -2464,22 +2472,6 @@ type CapturedChild = {
   exit: Promise<{ code: number | null; signal: NodeJS.Signals | null }>;
 };
 
-function withDeadline<T>(promise: Promise<T>, milliseconds: number, code: string) {
-  return new Promise<T>((resolve, reject) => {
-    const timeout = setTimeout(() => reject(new Error(code)), milliseconds);
-    promise.then(
-      (value) => {
-        clearTimeout(timeout);
-        resolve(value);
-      },
-      (error) => {
-        clearTimeout(timeout);
-        reject(error);
-      },
-    );
-  });
-}
-
 async function assignLoopbackPort() {
   const reservation = await holdLoopbackPort();
   const port = reservation.port;
@@ -3186,15 +3178,23 @@ function processIdIsLive(pid: number) {
   }
 }
 
-async function boundedChildCleanup(candidate: CapturedChild) {
-  if (candidate.child.exitCode !== null || candidate.child.signalCode !== null) return;
-  candidate.child.kill("SIGTERM");
-  try {
-    await withDeadline(candidate.exit, 3_000, "ChildCleanupTimeout");
-  } catch {
-    candidate.child.kill("SIGKILL");
-    await withDeadline(candidate.exit, 3_000, "ChildKillTimeout").catch(() => undefined);
-  }
+type FixtureChildRole = "candidate_owner" | "candidate_loser" | "stop_command" | "fixture_child";
+
+/**
+ * Boundedly reap every fixture child and record one symbolic ReapOutcome per
+ * role. Unlike the previous silent swallow, a child that survives SIGKILL is
+ * reported as CleanupFailure so residue can never pass unnoticed (#162).
+ */
+async function reapFixtureChildren(
+  children: Array<{ role: FixtureChildRole; handle: CapturedChild }>,
+): Promise<Record<string, ReapOutcome>> {
+  const outcomes: Record<string, ReapOutcome> = {};
+  await Promise.all(
+    children.map(async (entry) => {
+      outcomes[entry.role] = await reapFixtureChild(entry.handle.child, entry.handle.exit);
+    }),
+  );
+  return outcomes;
 }
 
 function chooseActiveCandidate(candidates: CapturedChild[]) {
@@ -3224,9 +3224,48 @@ export async function runDuplicateStartSingleOwnerContract(
   sandbox: ResourceSandbox,
   buildOptions: PackagedCollectorBuildOptions = {},
 ): Promise<ScenarioReceipt> {
-  const started = performance.now();
   const counters = emptyWorkCounters();
-  const children: CapturedChild[] = [];
+  const childEntries: Array<{ role: FixtureChildRole; handle: CapturedChild }> = [];
+  let receipt: ScenarioReceipt;
+  let reapOutcomes: Record<string, ReapOutcome> = {};
+  try {
+    receipt = await attemptDuplicateStartSingleOwnerContract(
+      sandbox,
+      buildOptions,
+      counters,
+      childEntries,
+    );
+  } finally {
+    // Await and reap every fixture child on every failure path (#162).
+    reapOutcomes = await reapFixtureChildren(childEntries);
+  }
+  const cleanupFailureRoles = Object.entries(reapOutcomes)
+    .filter(([, outcome]) => outcome === "CleanupFailure")
+    .map(([role]) => role);
+  const allChildrenReapedCleanly = cleanupFailureRoles.length === 0;
+  receipt.measurements = {
+    ...receipt.measurements,
+    ...reapOutcomes,
+    fixtureChildrenTracked: childEntries.length,
+    fixtureChildrenReapedCleanly: allChildrenReapedCleanly,
+  };
+  if (!allChildrenReapedCleanly && receipt.status === "pass") {
+    // Residue must never pass silently: a fixture child that survived
+    // SIGKILL fails the scenario regardless of the assertion outcomes.
+    receipt.status = "fail";
+    receipt.detail =
+      "Duplicate-start production contract passed its assertions but left fixture child residue (CleanupFailure); failed closed.";
+  }
+  return receipt;
+}
+
+async function attemptDuplicateStartSingleOwnerContract(
+  sandbox: ResourceSandbox,
+  buildOptions: PackagedCollectorBuildOptions,
+  counters: ReturnType<typeof emptyWorkCounters>,
+  childEntries: Array<{ role: FixtureChildRole; handle: CapturedChild }>,
+): Promise<ScenarioReceipt> {
+  const started = performance.now();
   let lifecycleStage = "build";
   try {
     const packagedCli = buildPackagedCollectorCli(sandbox, buildOptions);
@@ -3242,20 +3281,33 @@ export async function runDuplicateStartSingleOwnerContract(
       spawnCollectorCli(sandbox, packagedCli.cliPath, "start"),
       spawnCollectorCli(sandbox, packagedCli.cliPath, "start"),
     ];
-    children.push(...candidates);
+    childEntries.push(
+      { role: "fixture_child", handle: candidates[0]! },
+      { role: "fixture_child", handle: candidates[1]! },
+    );
     const candidatesUseExactPackagePath = candidates.every(
       (candidate) =>
         candidate.child.spawnfile === process.execPath &&
         candidate.child.spawnargs[1] === packagedCli.cliPath &&
         candidate.child.spawnargs[2] === "start",
     );
-    const ownerChoice = await withDeadline(
+    const ownerChoice = await withSymbolicDeadline(
       chooseActiveCandidate(candidates),
       20_000,
       "CollectorReadinessTimeout",
     );
+    const loserIndex = ownerChoice.index === 0 ? 1 : 0;
+    childEntries[ownerChoice.index]!.role = "candidate_owner";
+    childEntries[loserIndex]!.role = "candidate_loser";
     const owner = candidates[ownerChoice.index]!;
-    const loser = candidates[ownerChoice.index === 0 ? 1 : 0]!;
+    const loser = candidates[loserIndex]!;
+    // #162: an owner that exits before any stop command exists has exited
+    // early; record that fact the moment it happens, before stop spawn.
+    let ownerExitedBeforeStopSpawned = false;
+    let stopSpawned = false;
+    void owner.exit.then(() => {
+      if (!stopSpawned) ownerExitedBeforeStopSpawned = true;
+    });
 
     lifecycleStage = "owner_identity";
     const ownerRead = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);
@@ -3268,11 +3320,11 @@ export async function runDuplicateStartSingleOwnerContract(
         ownerRead.record.processStartFingerprintAlgorithm,
     };
     const pidRecordBeforeLoser = ownerRead.raw;
-    const loserExit = await withDeadline(loser.exit, 20_000, "LoserExitTimeout");
+    const loserExit = await withSymbolicDeadline(loser.exit, 20_000, "LoserExitTimeout");
     const loserReceipt = parseCapturedJson(loser.output.stdout);
     const pidRecordAfterLoser = fs.readFileSync(pidPath, "utf8");
 
-    const statusResponse = await withDeadline(
+    const statusResponse = await withSymbolicDeadline(
       fetch(`http://127.0.0.1:${port}/status`),
       10_000,
       "StatusReadinessTimeout",
@@ -3333,19 +3385,49 @@ export async function runDuplicateStartSingleOwnerContract(
       counters.restartRequests === 0;
 
     lifecycleStage = "stop_command";
+    stopSpawned = true;
     const stopper = spawnCollectorCli(sandbox, packagedCli.cliPath, "stop");
-    children.push(stopper);
+    childEntries.push({ role: "stop_command", handle: stopper });
     const stopperUsesExactPackagePath =
       stopper.child.spawnfile === process.execPath &&
       stopper.child.spawnargs[1] === packagedCli.cliPath &&
       stopper.child.spawnargs[2] === "stop";
-    const stopperExit = await withDeadline(stopper.exit, 20_000, "StopCommandTimeout");
-    const stopperReceipt = parseCapturedJson(stopper.output.stdout);
+    // #162: the 20 second bounded budgets are preserved verbatim; only the
+    // failure handling changes. Timeouts become symbolic classes instead of
+    // unclassified throws.
+    const stopperObservation = await observeChildExit(stopper.exit, 20_000);
+    let stopperReceipt: Record<string, unknown> | null = null;
+    if (stopperObservation.settled) {
+      try {
+        stopperReceipt = parseCapturedJson(stopper.output.stdout);
+      } catch {
+        stopperReceipt = null;
+      }
+    }
     lifecycleStage = "owner_shutdown";
-    const ownerExit = await withDeadline(owner.exit, 20_000, "OwnerShutdownTimeout");
-    const stopCommandExitedCleanly = stopperExit.code === 0 && stopperExit.signal === null;
-    const stopReceiptReportedStopped = stopperReceipt.stopped === true;
-    const ownerExitedCleanly = ownerExit.code === 0 && ownerExit.signal === null;
+    const ownerObservation = await observeChildExit(owner.exit, 20_000);
+    const stopClassification = classifyStopCommand({
+      stopperSettled: stopperObservation.settled,
+      stopperExitCode: stopperObservation.settled ? stopperObservation.code : null,
+      stopperSignal: stopperObservation.settled ? stopperObservation.signal : null,
+      stopperReceiptParsed: stopperReceipt !== null,
+      stopReceiptReportedStopped: stopperReceipt?.stopped === true,
+    });
+    const shutdownClassification = classifyOwnerShutdown({
+      ownerExitedBeforeStopSpawned,
+      stopFailed: stopClassification.failed,
+      stopFailureReason: stopClassification.failed ? stopClassification.reason : null,
+      ownerExitSettled: ownerObservation.settled,
+    });
+    const stopCommandExitedCleanly =
+      stopperObservation.settled &&
+      stopperObservation.code === 0 &&
+      stopperObservation.signal === null;
+    const stopReceiptReportedStopped = stopperReceipt?.stopped === true;
+    const ownerExitedCleanly =
+      ownerObservation.settled &&
+      ownerObservation.code === 0 &&
+      ownerObservation.signal === null;
     const stoppedThroughCli =
       stopCommandExitedCleanly && stopReceiptReportedStopped && ownerExitedCleanly;
     const pidRecordRemoved =
@@ -3384,7 +3466,8 @@ export async function runDuplicateStartSingleOwnerContract(
       startLockReleased &&
       counterProvenanceProved &&
       stoppedThroughCli &&
-      pidRecordRemoved;
+      pidRecordRemoved &&
+      shutdownClassification.failureClass === null;
     return {
       id: "duplicate_start_single_owner",
       required: true,
@@ -3458,12 +3541,20 @@ export async function runDuplicateStartSingleOwnerContract(
         stopCommandExitedCleanly,
         stopReceiptReportedStopped,
         stopReceiptReason:
-          typeof stopperReceipt.reason === "string" ? stopperReceipt.reason : "none",
+          typeof stopperReceipt?.reason === "string" ? stopperReceipt.reason : "none",
         ownerExitedCleanly,
-        ownerExitCode: ownerExit.code,
-        ownerExitSignal: ownerExit.signal ?? "none",
+        ownerExitCode: ownerObservation.settled ? ownerObservation.code : null,
+        ownerExitSignal:
+          ownerObservation.settled ? (ownerObservation.signal ?? "none") : "unsettled",
         stoppedThroughCli,
         pidRecordRemoved,
+        shutdownFailureClass: shutdownClassification.failureClass ?? "none",
+        shutdownFailureReason: shutdownClassification.reason,
+        stopCommandFailureReason: stopClassification.failed
+          ? stopClassification.reason
+          : "none",
+        stopperExitObserved: stopperObservation.settled,
+        ownerExitObserved: ownerObservation.settled,
         candidateRestartRequests: counters.restartRequests,
         counterProvenanceProved,
         listenerCounterSource: "packaged CLI active start outputs",
@@ -3485,13 +3576,11 @@ export async function runDuplicateStartSingleOwnerContract(
       durationMs: Math.round((performance.now() - started) * 100) / 100,
       counters,
       measurements: {
-        candidatesRaced: children.filter((child) => child !== undefined).length,
+        candidatesRaced: childEntries.length,
         lifecycleStage,
         errorClass,
       },
     };
-  } finally {
-    await Promise.all(children.map((child) => boundedChildCleanup(child)));
   }
 }
 
