@@ -232,8 +232,9 @@ paid-launch-ready.
 - The exact per-install credential rotation/replay construction and the exact
   database-enforced tenant-isolation mechanism remain implementation decisions
   subject to adversarial review.
-- Current local retention does not yet prove that local-only raw rows expire;
-  uploaded-only pruning cannot satisfy the launch gate.
+- Issue #166 closes the uploaded-only pruning gap: bounded raw retention now
+  expires local-only and `not_enrolled` rows, while pending sanitized delivery
+  copies and their explicit state remain queryable.
 
 ## Consequences
 

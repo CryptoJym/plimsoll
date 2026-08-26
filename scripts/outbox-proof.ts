@@ -1085,11 +1085,12 @@ async function linkageAndRetentionProof() {
   buffer.database.prepare(`update buffered_events set created_at = ? where id = ?`).run("2020-01-01T00:00:00.000Z", uuid(132));
   const prunePending = buffer.prune(0);
   const pendingExists = (buffer.database.prepare(`select count(*) as n from buffered_events where id = ?`).get(uuid(132)) as { n: number }).n;
+  const pendingOutbox = (buffer.database.prepare(`select count(*) as n from upload_outbox where raw_id = ?`).get(uuid(132)) as { n: number }).n;
   const status = buffer.delivery.status(instant(620));
   record(
-    "retention_compatibility_gate_preserves_pending_raw",
-    pendingExists === 1 && prunePending.events >= 1 && status.retention.mode === "compatibility_uploaded_only" && status.retention.rawTtlBlockedBy === "projection_parity",
-    { pendingExists, prunedUploaded: prunePending.events, retention: status.retention },
+    "retention_expires_pending_raw_but_preserves_outbox",
+    pendingExists === 0 && pendingOutbox === 1 && prunePending.events >= 1 && status.retention.mode === "raw_ttl" && status.retention.rawTtlBlockedBy === null && status.retention.pendingDeliverySurvivesRawExpiry === true,
+    { pendingExists, pendingOutbox, prunedEvents: prunePending.events, retention: status.retention },
   );
   buffer.close();
 }

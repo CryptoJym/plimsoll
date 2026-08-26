@@ -2871,7 +2871,7 @@ export class DashboardProjectionStore {
         metricHighWater:c.metricBackfillHighWater,metricCursor:c.metricBackfillCursor,
         metricComplete:Boolean(c.metricBackfillComplete),metricSampleCount:c.metricBackfillComplete?c.metricSampleCount:null,
         progressMode:"bounded_rowid_watermark_no_exact_remaining",sliceRows:BACKFILL_ROWS},
-      backlog,counters:this.workCounters(),retention:{rawTtlActivation:"explicit_proof_gated",
+      backlog,counters:this.workCounters(),retention:{rawTtlActivation:"bounded_active",
         projectionParityReady:Boolean(c.parityReady)}};
   }
 

@@ -295,8 +295,9 @@ const SEED_SHAPES = [PRODUCTION_SHAPE, LEGACY_UNBOUND_SHAPE];
 /**
  * Rows WITHHELD FROM THE CURRENT WORKSPACE: bound to a different workspace
  * (the production pre-join shape) or unassigned (the legacy shape). Mirrors
- * `LocalEventBuffer.enrollmentStatus` / doctor's readonly count, so a receipt
- * comparison is a real comparison. Payload-free: ids and labels only.
+ * `LocalEventBuffer.enrollmentStatus`. Doctor intentionally reports
+ * `not_inspected` without an authenticated daemon rather than opening SQLite.
+ * Payload-free: ids and labels only.
  */
 function withheldRows(ledgerPath: string): QuarantineRow[] {
   const buffer = new LocalEventBuffer(ledgerPath);
@@ -677,14 +678,14 @@ async function firstJoinAndRejoinScenario(shape: SeedShape) {
     const doctorReceipt = JSON.parse(doctor.stdout) as Record<string, any>;
     const doctorOutput = `${doctor.stdout}\n${doctor.stderr}`;
     check(
-      `doctor_receipt_reports_future_only_quarantine_state_readonly__${shape.label}`,
+      `doctor_receipt_reports_future_only_and_does_not_open_sqlite__${shape.label}`,
       true,
       typeof doctorReceipt.ok === "boolean" &&
         doctorReceipt.enrollment?.futureOnlyEnrollment === true &&
-        doctorReceipt.enrollment?.quarantinedHistoryRows === quarantineBeforeRejoin &&
+        doctorReceipt.enrollment?.inspection === "not_inspected" &&
+        doctorReceipt.enrollment?.quarantinedHistoryRows === null &&
         LEGACY_EVENT_IDS.every((id) => !doctorOutput.includes(id)) &&
-        (shape.preEnrollmentWorkspaceId === null ||
-          doctorReceipt.enrollment?.quarantinedHistoryRows > 0),
+        doctorReceipt.sqlite?.opened === false,
       {
         seedShape: shape.label,
         exit: doctor.exit,

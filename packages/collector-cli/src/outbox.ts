@@ -110,8 +110,9 @@ export type DeliveryStatus = {
     };
   };
   retention: {
-    mode: "compatibility_uploaded_only";
-    rawTtlBlockedBy: "projection_parity";
+    mode: "raw_ttl";
+    rawTtlBlockedBy: null;
+    pendingDeliverySurvivesRawExpiry: true;
   };
   counters: {
     outboxRowsEnqueued: number;
@@ -1184,7 +1185,7 @@ export class DeliveryOutbox {
           rawCreatedAt: row.rawCreatedAt,
           rawGeneration: row.rawGeneration,
         }).changes;
-        if (marked !== 1) {
+        if (marked !== 1 && !this.rawRetentionExpired(row)) {
           locallyDead += this.deadActive(id, "local_privacy_violation", terminalAt);
           continue;
         }
@@ -1519,8 +1520,9 @@ export class DeliveryOutbox {
         },
       },
       retention: {
-        mode: "compatibility_uploaded_only",
-        rawTtlBlockedBy: "projection_parity",
+        mode: "raw_ttl",
+        rawTtlBlockedBy: null,
+        pendingDeliverySurvivesRawExpiry: true,
       },
       counters: {
         outboxRowsEnqueued: control.outboxEnqueuedTotal,
@@ -1590,7 +1592,13 @@ export class DeliveryOutbox {
          from buffered_events where rowid = ?`,
       )
       .get(lineage.rawRowid) as RawPrivacyRow | undefined;
-    if (!raw || raw.uploadedAt !== null) return "local_privacy_violation";
+    if (!raw) {
+      // Raw retention is independent from delivery. The sealed outbox copy
+      // remains authoritative after a recorded expiry; an unrecorded delete
+      // is still a local integrity violation.
+      return this.rawRetentionExpired(lineage) ? null : "local_privacy_violation";
+    }
+    if (raw.uploadedAt !== null) return "local_privacy_violation";
     if (raw.privacyDisposition) return raw.privacyDisposition;
     if (raw.dataMode === "evidence") return "local_evidence_quarantined";
     if (raw.dataMode !== "metadata") return "local_privacy_violation";
@@ -1611,6 +1619,30 @@ export class DeliveryOutbox {
       return "local_privacy_violation";
     }
     return null;
+  }
+
+  private rawRetentionExpired(lineage: RawLineageSnapshot) {
+    if (
+      lineage.rawRowid === null ||
+      lineage.rawId === null ||
+      lineage.rawCreatedAt === null
+    ) {
+      return false;
+    }
+    return Boolean(
+      this.db
+        .prepare(
+          `select 1 as expired from raw_retention_receipts
+           where event_id = ? and raw_rowid = ? and raw_created_at = ?
+             and raw_generation is ? limit 1`,
+        )
+        .get(
+          lineage.rawId,
+          lineage.rawRowid,
+          lineage.rawCreatedAt,
+          lineage.rawGeneration,
+        ),
+    );
   }
 
   private quarantineLinkedEvidence(rawRowid: number, terminalAt: string) {

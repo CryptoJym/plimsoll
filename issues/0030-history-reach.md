@@ -8,8 +8,10 @@
   usage, dedupe by message id, sourced Anthropic estimates flagged costEstimated, repo
   linkage from cwd, live-covered sessions skipped, content never parsed beyond assistant
   usage lines, never persisted); dashboard window selector (30d → all history, clamp 5y);
-  prune semantics fixed — retention now ages out UPLOADED rows only (the backfills were
-  all created the same day; a created_at prune would have erased months in one sweep).
+  prune semantics fixed — bounded retention now ages out every eligible raw row,
+  including never-uploaded local rows, with an explicit expiry receipt (the
+  backfills were all created the same day; a created_at prune would have erased
+  months in one sweep).
 - Codex side audited: 2026/03 rollouts dir is EMPTY on disk (pre-plimsoll cleanup), so
   April-23-onward IS everything that exists. Honest floor, documented.
 - Anthropic rates added (platform.claude.com pricing, fetched 2026-06-10) with correct
@@ -19,5 +21,5 @@
 ## Acceptance (proof, 60 checks)
 - [x] transcript_usage_ingested_exact_and_deduped (exact $0.2395 fable estimate)
 - [x] transcript_live_covered_session_skipped · transcript_rescan_idempotent_and_content_free
-- [x] retention_prune_spares_unuploaded_history
+- [x] retention_prune_expires_unuploaded_history_with_receipt
 - [ ] Live: claude ledger reach ≈ 2026-04-06; "all history" window renders; capture watch green.

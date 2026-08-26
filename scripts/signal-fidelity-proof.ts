@@ -2015,7 +2015,7 @@ async function main() {
     "raw account email absent from all upload bodies (lives in account_labels only)",
   );
 
-  // 8. Retention prune: uploaded rows age out; local history NEVER does.
+  // 8. Retention prune: raw rows age out even when they were never uploaded.
   await new Promise((resolve) => setTimeout(resolve, 5));
   buffer.append(
     aiInteractionEventSchema.parse({
@@ -2037,10 +2037,13 @@ async function main() {
   const survivor = buffer.database
     .prepare(`select count(*) as n from buffered_events where uploaded_at is null`)
     .get() as { n: number };
+  const expiryReceipt = buffer.database
+    .prepare(`select reason from raw_retention_receipts where event_id = ?`)
+    .get("prune-survivor-0000") as { reason: string } | undefined;
   check(
-    "retention_prune_spares_unuploaded_history",
-    pruned.events > 0 && survivor.n === 1 && buffer.stats().count === 1,
-    JSON.stringify({ pruned: pruned.events, unuploadedSurvivors: survivor.n }),
+    "retention_prune_expires_unuploaded_history_with_receipt",
+    pruned.events > 0 && survivor.n === 0 && expiryReceipt?.reason === "retention_window_elapsed",
+    JSON.stringify({ pruned: pruned.events, unuploadedSurvivors: survivor.n, expiryReceipt }),
   );
 
   buffer.close();

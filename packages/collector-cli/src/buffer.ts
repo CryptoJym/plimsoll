@@ -62,6 +62,24 @@ export type BufferStats = {
   totalCostUsd: number;
 };
 
+export type RawRetentionStatus = {
+  inspection: "complete";
+  policy: { retentionDays: number; cutoffAt: string };
+  states: {
+    retained: number;
+    pendingDelivery: number;
+    quarantined: number;
+    expired: number;
+    notInspected: 0;
+  };
+  lastPass: {
+    rowsVisited: number;
+    rowsExpired: number;
+    hasMore: boolean;
+    at: string | null;
+  };
+};
+
 export type OtlpAdmissionCounter = {
   source: string;
   reason: OtlpDropReason;
@@ -250,6 +268,25 @@ export class LocalEventBuffer {
         value text not null,
         updated_at text not null
       );
+      create table if not exists raw_retention_receipts (
+        event_id text primary key,
+        raw_rowid integer not null,
+        raw_created_at text not null,
+        raw_generation text,
+        expired_at text not null,
+        reason text not null check (reason = 'retention_window_elapsed')
+      );
+      create table if not exists raw_retention_control (
+        singleton integer primary key check (singleton = 1),
+        last_cutoff_at text,
+        last_run_at text,
+        last_rows_visited integer not null default 0,
+        last_rows_expired integer not null default 0,
+        last_has_more integer not null default 0,
+        expired_total integer not null default 0
+      );
+      insert or ignore into raw_retention_control (singleton)
+      values (1);
       create table if not exists reprice_dirty_events (
         event_id text primary key,
         queued_at text not null
@@ -344,6 +381,15 @@ export class LocalEventBuffer {
         )
       ) without rowid;
     `);
+    const retentionControlColumns = new Set(
+      (this.db.pragma("table_info(raw_retention_control)") as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    if (!retentionControlColumns.has("expired_total")) {
+      this.db.exec(
+        `alter table raw_retention_control add column expired_total integer not null default 0`,
+      );
+    }
     const repoContextInflightColumns = new Set(
       (this.db.pragma("table_info(repo_context_inflight)") as Array<{ name: string }>)
         .map((column) => column.name),
@@ -405,7 +451,10 @@ export class LocalEventBuffer {
         on buffered_events (workspace_id, uploaded_at, created_at);
       create index if not exists idx_events_session on buffered_events (session_id, observed_at);
       create index if not exists idx_events_observed on buffered_events (observed_at);
+      create index if not exists idx_events_retention on buffered_events (created_at, id);
       create index if not exists idx_events_repo on buffered_events (repo_hash, branch_hash);
+      create index if not exists idx_raw_retention_expired
+        on raw_retention_receipts (expired_at, event_id);
       create index if not exists idx_repo_context_event_links_pending_context
         on repo_context_event_links (context_id, event_id)
         where fill_pending = 1;
@@ -2624,25 +2673,155 @@ export class LocalEventBuffer {
     return run(ids);
   }
 
-  prune(retentionDays = 90) {
-    const cutoff = new Date(Date.now() - retentionDays * 24 * 60 * 60 * 1000).toISOString();
-    // Compatibility gate until #80 proves projection parity: uploaded raw
-    // rows retain the historical cleanup behavior, while pending/dead raw
-    // evidence never expires independently. `/status.delivery.retention`
-    // names this honestly as compatibility_uploaded_only rather than claiming
-    // a raw TTL the current analytics path cannot yet tolerate.
-    // An upgrade must not delete the history its initial projection/parity
-    // passes have not consumed. This preserves the existing uploaded-only
-    // compatibility cleanup without silently activating an independent raw TTL.
-    const events = this.projection.status().parityReady
-      ? this.db
-        .prepare(`delete from buffered_events where created_at < ? and uploaded_at is not null`)
-        .run(cutoff).changes
-      : 0;
-    const metricSamples = this.db
-      .prepare(`delete from metric_samples where created_at < ?`)
-      .run(cutoff).changes;
-    return { cutoff, events, metricSamples };
+  prune(
+    retentionDays = 90,
+    options: { maxRows?: number; now?: Date } = {},
+  ) {
+    const requestedRows = Number.isFinite(options.maxRows) ? Math.trunc(options.maxRows!) : 1_000;
+    const maxRows = Math.max(1, Math.min(requestedRows, 10_000));
+    const now = options.now ?? new Date();
+    const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1_000).toISOString();
+    // Delivery owns a bounded sanitized copy. Protect a legacy unuploaded row
+    // until migration has copied that body; once an outbox row exists, raw
+    // expiry is independent of upload acknowledgement. Local-only ledgers do
+    // not have that protection and therefore expire every old raw row.
+    const deliveryProtection = this.delivery.isEnabled()
+      ? `and (e.uploaded_at is not null or exists (
+           select 1 from upload_outbox o
+           where o.raw_rowid = e.rowid and (o.raw_id is null or o.raw_id = e.id)
+         ))`
+      : "";
+    const run = this.db.transaction(() => {
+      const candidates = this.db
+        .prepare(
+          `select e.rowid as rawRowid, e.id as eventId,
+             e.created_at as rawCreatedAt, e.privacy_generation as rawGeneration
+           from buffered_events e indexed by idx_events_retention
+           where e.created_at < ? ${deliveryProtection}
+           order by e.created_at, e.id
+           limit ?`,
+        )
+        .all(cutoff, maxRows) as Array<{
+        rawRowid: number;
+        eventId: string;
+        rawCreatedAt: string;
+        rawGeneration: string | null;
+      }>;
+      const recordExpiry = this.db.prepare(
+        `insert or ignore into raw_retention_receipts
+           (event_id, raw_rowid, raw_created_at, raw_generation, expired_at, reason)
+         values (@eventId, @rawRowid, @rawCreatedAt, @rawGeneration, @expiredAt,
+           'retention_window_elapsed')`,
+      );
+      const removeRaw = this.db.prepare(`delete from buffered_events where rowid = ?`);
+      let events = 0;
+      for (const row of candidates) {
+        recordExpiry.run({
+          eventId: row.eventId,
+          rawRowid: row.rawRowid,
+          rawCreatedAt: row.rawCreatedAt,
+          rawGeneration: row.rawGeneration,
+          expiredAt: now.toISOString(),
+        });
+        events += removeRaw.run(row.rawRowid).changes;
+      }
+      const remainingBudget = Math.max(0, maxRows - candidates.length);
+      const metricRows = remainingBudget === 0
+        ? []
+        : this.db.prepare(
+          `select rowid as rowid from metric_samples
+           where created_at < ? order by created_at, rowid limit ?`,
+        ).all(cutoff, remainingBudget) as Array<{ rowid: number }>;
+      let metricSamples = 0;
+      const removeMetric = this.db.prepare(`delete from metric_samples where rowid = ?`);
+      for (const row of metricRows) metricSamples += removeMetric.run(row.rowid).changes;
+      const hasMore = candidates.length === maxRows || metricRows.length === remainingBudget;
+      this.db.prepare(
+        `update raw_retention_control set last_cutoff_at=?,last_run_at=?,
+           last_rows_visited=?,last_rows_expired=?,last_has_more=?,
+           expired_total=expired_total+? where singleton=1`,
+      ).run(
+        cutoff,
+        now.toISOString(),
+        candidates.length + metricRows.length,
+        events + metricSamples,
+        hasMore ? 1 : 0,
+        events,
+      );
+      return {
+        events,
+        eventRowsVisited: candidates.length,
+        metricSamples,
+        metricRowsVisited: metricRows.length,
+        hasMore,
+      };
+    })();
+    return {
+      cutoff,
+      events: run.events,
+      metricSamples: run.metricSamples,
+      eventRowsVisited: run.eventRowsVisited,
+      metricRowsVisited: run.metricRowsVisited,
+      hasMore: run.hasMore,
+    };
+  }
+
+  retentionStatus(retentionDays = 90, now = new Date()): RawRetentionStatus {
+    const cutoffAt = new Date(
+      now.getTime() - retentionDays * 24 * 60 * 60 * 1_000,
+    ).toISOString();
+    const binding = this.workspaceBinding();
+    const quarantinePredicate = binding
+      ? `(data_mode = 'evidence' or privacy_disposition is not null or
+          workspace_id is null or workspace_id <> ?)`
+      : `(data_mode = 'evidence' or privacy_disposition is not null)`;
+    const quarantineParams = binding ? [binding.currentWorkspaceId] : [];
+    const retained = (
+      this.db.prepare(
+        `select count(*) as n from buffered_events
+         where not ${quarantinePredicate}`,
+      ).get(...quarantineParams) as { n: number }
+    ).n;
+    const quarantined = (
+      this.db.prepare(
+        `select count(*) as n from buffered_events where ${quarantinePredicate}`,
+      ).get(...quarantineParams) as { n: number }
+    ).n;
+    const pendingDelivery = (
+      this.db.prepare(
+        `select count(*) as n from upload_outbox
+         where state in ('pending','retry','in_flight')`,
+      ).get() as { n: number }
+    ).n;
+    const pass = this.db.prepare(
+      `select last_rows_visited as rowsVisited,last_rows_expired as rowsExpired,
+         last_has_more as hasMore,last_run_at as at,expired_total as expired
+       from raw_retention_control
+       where singleton=1`,
+    ).get() as {
+      rowsVisited: number;
+      rowsExpired: number;
+      hasMore: number;
+      at: string | null;
+      expired: number;
+    };
+    return {
+      inspection: "complete",
+      policy: { retentionDays, cutoffAt },
+      states: {
+        retained,
+        pendingDelivery,
+        quarantined,
+        expired: pass.expired,
+        notInspected: 0,
+      },
+      lastPass: {
+        rowsVisited: pass.rowsVisited,
+        rowsExpired: pass.rowsExpired,
+        hasMore: Boolean(pass.hasMore),
+        at: pass.at,
+      },
+    };
   }
 
   stats(): BufferStats {
