@@ -703,6 +703,16 @@ export function createCollectorServer(
     }
   });
 
+  // Issue #0015: bounded projection work can block this loop for well over
+  // Node's default 5s keepAliveTimeout. The expiry timer then fires on
+  // unblock and closes the idle socket at the same instant the next
+  // dashboard poll or hook POST arrives on it — the client sees ECONNRESET
+  // instead of a served response (proof gate
+  // raw_history_growth_does_not_change_snapshot_work_shape failed exactly
+  // this way). Serve every request on its own connection: loopback setup
+  // cost is negligible, and a connection that carries one request cannot be
+  // reaped mid-request.
+  httpServer.keepAliveTimeout = 0;
   const server = httpServer as CollectorServer;
   server.plimsollHttpDiagnostics = {
     flush: () => rejectionDiagnostics.flush(),
