@@ -444,6 +444,18 @@ const fmt=(n)=>n==null?"—":Number(n).toLocaleString("en-US");
 const usd=(n)=>n==null?"—":"$"+Number(n).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2});
 const short=(h)=>h?h.replace("sha256:","").slice(0,8):"·";
 const SVG_NS="http://www.w3.org/2000/svg";
+// Issue 0056 (#104): management reads require the separate read credential.
+// The operator opens the dashboard once with ?token=<management credential>;
+// the page stores it locally and sends it as a header on every API call.
+try{
+  const urlToken=new URLSearchParams(location.search).get("token");
+  if(urlToken)localStorage.setItem("plimsoll-management-token",urlToken);
+}catch(e){}
+function authHeaders(extra){
+  let token=null;
+  try{token=localStorage.getItem("plimsoll-management-token")}catch(e){}
+  return Object.assign({},extra||{},token?{"x-plimsoll-token":token}:{});
+}
 
 function add(parent,...children){
   for(const child of children.flat(Infinity)){
@@ -703,7 +715,7 @@ function renderSessionDetail(d){
 async function openSession(id){
   openDrawer($("#drawer"));$("#d-sid").textContent=id;drawerLoading();
   try{
-    const response=await fetch("/api/session?id="+encodeURIComponent(id)),detail=await response.json();
+    const response=await fetch("/api/session?id="+encodeURIComponent(id),{headers:authHeaders()}),detail=await response.json();
     if(!response.ok||detail.error)throw new Error((detail&&(detail.message||detail.error))||("HTTP "+response.status));renderSessionDetail(detail);
   }catch(e){drawerError("receipts",e)}
 }
@@ -735,7 +747,7 @@ function renderRepoDetail(d){
 async function openRepo(hash){
   openDrawer($("#drawer"));$("#d-sid").textContent=short(hash);drawerLoading();
   try{
-    const days=Number(localStorage.getItem("plimsoll-window")||"30"),response=await fetch("/api/repo?hash="+encodeURIComponent(hash)+"&days="+days),detail=await response.json();
+    const days=Number(localStorage.getItem("plimsoll-window")||"30"),response=await fetch("/api/repo?hash="+encodeURIComponent(hash)+"&days="+days,{headers:authHeaders()}),detail=await response.json();
     if(!response.ok||detail.error)throw new Error((detail&&(detail.message||detail.error))||("HTTP "+response.status));
     $("#d-sid").textContent=detail.label||short(hash);renderRepoDetail(detail);
   }catch(e){drawerError("repository detail",e)}
@@ -844,7 +856,7 @@ async function refresh(redrawOnly=false){
     const q="?days="+days;
     if(!redrawOnly||!dashboardCache||dashboardCache.window?.days!==days){
       const headers=dashboardEtag?{"if-none-match":dashboardEtag}:{};
-      const r=await fetch("/api/snapshot"+q,{headers});
+      const r=await fetch("/api/snapshot"+q,{headers:authHeaders(headers)});
       if(r.status!==304){
         const payload=await r.json();
         if(!r.ok)throw new Error(payload.error||("HTTP "+r.status));
@@ -860,10 +872,10 @@ async function refresh(redrawOnly=false){
   }
 }
 // ——— settings ———
-const post=(route,body)=>fetch(route,{method:"POST",headers:{"content-type":"application/json","x-plimsoll-local":"1"},body:JSON.stringify(body)}).then(async r=>{const d=await r.json();if(!r.ok)throw new Error(d.error||r.status);return d});
+const post=(route,body)=>fetch(route,{method:"POST",headers:authHeaders({"content-type":"application/json","x-plimsoll-local":"1"}),body:JSON.stringify(body)}).then(async r=>{const d=await r.json();if(!r.ok)throw new Error(d.error||r.status);return d});
 let settingsCache={accounts:[],priorityRepos:[],subscriptions:[]};
 async function loadSettings(){
-  const response=await fetch("/api/settings"),payload=await response.json();
+  const response=await fetch("/api/settings",{headers:authHeaders()}),payload=await response.json();
   if(!response.ok)throw new Error(payload.error||("HTTP "+response.status));renderSettings(payload);
 }
 function renderSettings(payload){

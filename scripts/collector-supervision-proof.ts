@@ -15,6 +15,7 @@ import {
   type WatchedChild,
 } from "./lib/supervision-watch";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
+import { readLocalIngestAuth } from "../packages/collector-cli/src/local-auth";
 import {
   LAUNCH_AGENT_LABEL,
   renderLaunchAgentPlist,
@@ -284,7 +285,14 @@ async function main() {
     );
     const followerExit = await waitForExit(follower.child);
     check(followerExit.code === 0, "already_running must be a successful exit.");
-    const response = await fetch("http://127.0.0.1:" + concurrentPort + "/status");
+    // Issue 0056 (#104): enforcing daemons gate status behind the
+    // management credential provisioned in their own home.
+    const daemonCredential = readLocalIngestAuth(concurrentHome);
+    const response = await fetch("http://127.0.0.1:" + concurrentPort + "/status", {
+      headers: daemonCredential
+        ? { "x-plimsoll-token": daemonCredential.managementRead }
+        : {},
+    });
     check(response.ok, "Exactly one collector listener was not healthy.");
     const status = (await response.json()) as {
       runtimeIdentity?: CollectorRuntimeIdentity;

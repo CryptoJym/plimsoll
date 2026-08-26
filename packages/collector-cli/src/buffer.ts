@@ -79,6 +79,10 @@ const REPO_CONTEXT_CONFLICT_ROW_LIMIT = 128;
 const REPO_CONTEXT_RESULT_LIMIT = 4_096;
 const REPO_CONTEXT_RESULT_GC_LIMIT = 128;
 
+function sha256DigestHex(text: string) {
+  return crypto.createHash("sha256").update(text).digest();
+}
+
 export type RepoContextDropReason =
   | "queue_overflow"
   | "boundary_unavailable"
@@ -227,6 +231,19 @@ export class LocalEventBuffer {
         first_dropped_at text not null,
         last_dropped_at text not null,
         primary key (source, reason)
+      );
+      -- Issue 0056 (#104): same event ID with a different payload digest is a
+      -- collision, never a silent overwrite. Receipts carry bounded counters
+      -- and content digests only — never raw rejected payload values.
+      create table if not exists event_collision_quarantine (
+        event_id text primary key,
+        conflict_count integer not null check (
+          conflict_count >= 1 and conflict_count <= ${REPO_CONTEXT_COUNTER_LIMIT}
+        ),
+        first_conflict_digest text not null,
+        last_conflict_digest text not null,
+        first_conflicted_at text not null,
+        last_conflicted_at text not null
       );
       create table if not exists maintenance_state (
         key text primary key,
@@ -1852,6 +1869,60 @@ export class LocalEventBuffer {
     return this.recordRepoContextConflictDigest(contextId, digest);
   }
 
+  private recordEventCollisionDigest(eventId: string, digest: string) {
+    const now = new Date().toISOString();
+    const existing = this.db
+      .prepare(
+        `select last_conflict_digest as lastDigest
+         from event_collision_quarantine where event_id = ?`,
+      )
+      .get(eventId) as { lastDigest: string } | undefined;
+    if (existing?.lastDigest === digest) return;
+    if (existing) {
+      this.db
+        .prepare(
+          `update event_collision_quarantine set
+             conflict_count = min(@limit, conflict_count + 1),
+             last_conflict_digest = @digest,
+             last_conflicted_at = @now
+           where event_id = @eventId`,
+        )
+        .run({
+          eventId,
+          digest,
+          now,
+          limit: REPO_CONTEXT_COUNTER_LIMIT,
+        });
+      return;
+    }
+    this.db
+      .prepare(
+        `insert into event_collision_quarantine
+           (event_id, conflict_count, first_conflict_digest, last_conflict_digest,
+            first_conflicted_at, last_conflicted_at)
+         values (@eventId, 1, @digest, @digest, @now, @now)`,
+      )
+      .run({ eventId, digest, now });
+  }
+
+  /**
+   * Bounded ingest-integrity summary for the management status surface:
+   * counts only — no event IDs, digests, or payload material.
+   */
+  eventCollisionSummary() {
+    const row = this.db
+      .prepare(
+        `select count(*) as quarantinedEventIds,
+                coalesce(sum(conflict_count), 0) as totalConflicts
+         from event_collision_quarantine`,
+      )
+      .get() as { quarantinedEventIds: number; totalConflicts: number };
+    return {
+      quarantinedEventIds: Number(row.quarantinedEventIds),
+      totalConflicts: Math.min(Number(row.totalConflicts), REPO_CONTEXT_COUNTER_LIMIT),
+    };
+  }
+
   private recordRepoContextConflictDigest(contextId: string, digest: string) {
     const now = new Date().toISOString();
     const existing = this.db
@@ -1927,6 +1998,7 @@ export class LocalEventBuffer {
       (repoContextConflict ? null : resolvedRepoContext.headSha);
     const privacyGeneration = crypto.randomUUID();
     const canonicalSuppressedFields = canonicalizeSuppressionReceipts(suppressedFields);
+    const payloadJson = JSON.stringify(event);
     const result = this.db
       .prepare(
         `insert or ignore into buffered_events
@@ -1946,7 +2018,7 @@ export class LocalEventBuffer {
         eventType: event.eventType,
         dataMode: event.dataMode,
         observedAt: event.observedAt,
-        payloadJson: JSON.stringify(event),
+        payloadJson,
         suppressedFieldsJson: JSON.stringify(canonicalSuppressedFields),
         createdAt,
         sessionId: event.sessionId ?? null,
@@ -1989,7 +2061,7 @@ export class LocalEventBuffer {
         dataMode: event.dataMode,
         createdAt,
         uploadedAt: null,
-        payloadJson: JSON.stringify(event),
+        payloadJson,
         suppressedFieldsJson: JSON.stringify(canonicalSuppressedFields),
         repoHash,
         branchHash,
@@ -2026,9 +2098,22 @@ export class LocalEventBuffer {
     }
     // Deterministic replay never rewrites the evidence row or resets its
     // upload marker. It may repair an absent delivery projection from the
-    // already-committed raw truth.
+    // already-committed raw truth. Issue 0056 (#104): a repeated ID is then
+    // classified — identical payload digest dedupes; a different digest is a
+    // collision and earns a bounded quarantine receipt (digests only, never
+    // raw rejected values).
     this.delivery.repairRawById(event.id);
-    return { appended: false, repoContextRequest: null };
+    const existingRow = this.db
+      .prepare(`select payload_json as payloadJson from buffered_events where id = ?`)
+      .get(event.id) as { payloadJson: string } | undefined;
+    if (!existingRow) return { appended: false, repoContextRequest: null };
+    const incomingDigest = sha256DigestHex(payloadJson);
+    const storedDigest = sha256DigestHex(existingRow.payloadJson);
+    if (incomingDigest.equals(storedDigest)) {
+      return { appended: false, deduplicated: true, repoContextRequest: null };
+    }
+    this.recordEventCollisionDigest(event.id, `sha256:${storedDigest.toString("hex")}`);
+    return { appended: false, collisionQuarantined: true, repoContextRequest: null };
   }
 
   private closeUnreservedRepoContextLink(
@@ -2122,7 +2207,25 @@ export class LocalEventBuffer {
     return legacy.live ? "live" : legacy.tailer ? "tailer" : null;
   }
 
-  append(event: AiInteractionEvent, suppressedFields: string[] = []) {
+  append(
+    event: AiInteractionEvent,
+    suppressedFields?: string[],
+    options?: { integrityReceipt?: false | undefined },
+  ): boolean;
+  append(
+    event: AiInteractionEvent,
+    suppressedFields: string[] | undefined,
+    options: { integrityReceipt: true },
+  ): {
+    appended: boolean;
+    deduplicated?: true;
+    collisionQuarantined?: true;
+  };
+  append(
+    event: AiInteractionEvent,
+    suppressedFields: string[] = [],
+    options: { integrityReceipt?: boolean } = {},
+  ) {
     const ownsHandoffs = this.activeRepoContextCommitScope === null;
     const handoffs = this.activeRepoContextCommitScope ?? this.newRepoContextHandoffBatch();
     let result: ReturnType<LocalEventBuffer["appendInCurrentTransaction"]>;
@@ -2149,7 +2252,14 @@ export class LocalEventBuffer {
       takeRepoContextId(event);
     }
     if (ownsHandoffs) this.finalizeRepoContextHandoffs(handoffs);
-    return result.appended;
+    if (!options.integrityReceipt) return result.appended;
+    return {
+      appended: result.appended,
+      ...(result.deduplicated ? { deduplicated: true as const } : {}),
+      ...(result.collisionQuarantined
+        ? { collisionQuarantined: true as const }
+        : {}),
+    };
   }
 
   appendMany(
@@ -2194,6 +2304,10 @@ export class LocalEventBuffer {
       }
     }
     if (ownsHandoffs) this.finalizeRepoContextHandoffs(handoffs);
+    return {
+      deduplicatedCount: appended.filter((entry) => entry.deduplicated).length,
+      collisionQuarantinedCount: appended.filter((entry) => entry.collisionQuarantined).length,
+    };
   }
 
   private recordOtlpAdmissionDrop(drop: OtlpAdmissionDrop, now: string) {

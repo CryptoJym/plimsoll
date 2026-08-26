@@ -22,6 +22,7 @@ import { historyCoverageStatus } from "./history-coverage";
 import { captureBaselineStatus } from "./capture-baseline";
 import {
   HttpBoundaryRejection,
+  LOCAL_HTTP_LIMITS,
   asHttpBoundaryRejection,
   assertBoundedJsonNodes,
   assertAllowedHost,
@@ -29,12 +30,18 @@ import {
   assertHookSource,
   assertNoBrowserOrigin,
   createRequestBudget,
+  createSourceRateLimiter,
   decodeBoundedRequestBody,
   parseBoundedJson,
   readBoundedRequestBody,
   requireOtlpSource,
   type LocalProducerSource,
 } from "./http-boundary";
+import {
+  assertManagementCredential,
+  assertProducerToken,
+  type LocalIngestAuth,
+} from "./local-auth";
 import {
   createRejectionDiagnostics,
   type CollectorServer,
@@ -102,6 +109,10 @@ function firstHeader(value: string | string[] | undefined) {
   return Array.isArray(value) ? value[0] : value;
 }
 
+function requestUrl(request: http.IncomingMessage) {
+  return new URL(request.url ?? "/", "http://127.0.0.1");
+}
+
 function hookSourceFromPath(rawUrl: string | undefined): LocalProducerSource | undefined {
   try {
     const pathname = new URL(rawUrl ?? "", "http://127.0.0.1").pathname;
@@ -146,9 +157,33 @@ export function createCollectorServer(
      * Production defaults to wall-clock time.
      */
     diagnosticsNowMs?: () => number;
+    /**
+     * Issue 0056 (#104): provisioned Plimsoll-local credentials. When present,
+     * ingestion requires the source-bound producer token, management reads
+     * require the separate read credential, and only minimal /healthz stays
+     * unauthenticated. Absent (isolated proof fixtures), the legacy loopback
+     * boundary applies unchanged.
+     */
+    localAuth?: LocalIngestAuth;
+    /** Proof-injectable per-source admission ceiling (defaults to the limit). */
+    perSourceRequestLimit?: number;
   } = {},
 ) {
   assertCollectorPrivacyMode(config, "collector server");
+
+  const localAuth = options.localAuth ?? null;
+  const authEnforced = localAuth !== null;
+  const sourceRateLimiter = createSourceRateLimiter(
+    options.perSourceRequestLimit ?? LOCAL_HTTP_LIMITS.perSourceRequestsPerWindow,
+  );
+  const assertSourceAdmission = (source: LocalProducerSource) => {
+    if (!authEnforced) return;
+    sourceRateLimiter.assertAdmissible(source);
+  };
+  const assertManagementRead = (request: http.IncomingMessage) => {
+    if (!authEnforced || !localAuth) return;
+    assertManagementCredential(request, localAuth, requestUrl(request));
+  };
 
   // Issue #0075 (#144): repeated identical admission rejections are
   // aggregated. Decisions at the HTTP boundary stay fail-closed and their
@@ -187,6 +222,7 @@ export function createCollectorServer(
         counterLifetime: "durable",
         dropped: buffer.otlpAdmissionCounters(),
       },
+      ingestIntegrity: buffer.eventCollisionSummary(),
       delivery,
       reconciliation: codexReconciliationStatus(buffer.database),
       maintenance,
@@ -287,7 +323,16 @@ export function createCollectorServer(
     try {
       assertAllowedHost(request);
 
+      // Issue 0056 (#104): the only unauthenticated surface. Minimal by
+      // construction — no runtime identity, counters, delivery, or ledger
+      // state of any kind.
+      if (request.method === "GET" && request.url === "/healthz") {
+        sendJson(response, { ok: true });
+        return;
+      }
+
       if (request.method === "GET" && request.url === "/status") {
+          assertManagementRead(request);
           // Cache-only by construction: no SQLite or user-path filesystem call
           // executes on the availability endpoint.
           const cached = lastCoherentStatus;
@@ -357,7 +402,8 @@ export function createCollectorServer(
       }
 
       if (request.method === "GET" && request.url?.startsWith("/api/")) {
-        const url = new URL(request.url, "http://127.0.0.1");
+        assertManagementRead(request);
+        const url = requestUrl(request);
         const days = Number(url.searchParams.get("days") ?? 30) || 30;
         if (url.pathname === "/api/settings") {
           const accounts = buffer.database
@@ -374,6 +420,9 @@ export function createCollectorServer(
             priorityRepos: buffer.listPriorityRepos(),
             subscriptions: config.subscriptions,
             detectedIdentities: options.detectedIdentities?.() ?? [],
+            // Issue 0056 (#104): live ingest-integrity counts on the
+            // credential-gated management surface. /status stays cache-only.
+            ingestIntegrity: buffer.eventCollisionSummary(),
           });
           return;
         }
@@ -457,6 +506,7 @@ export function createCollectorServer(
           sendJson(response, { error: "untrusted_write_origin" }, 403);
           return;
         }
+        assertManagementRead(request);
         const body = decodeBoundedRequestBody(
           request,
           await readBoundedRequestBody(request, budget),
@@ -570,6 +620,10 @@ export function createCollectorServer(
         const source = hookSourceFromPath(request.url);
         if (!source) throw new HttpBoundaryRejection("source_not_allowed", 401);
         assertHookSource(request, source);
+        assertSourceAdmission(source);
+        if (localAuth) {
+          assertProducerToken(request, localAuth, source, requestUrl(request));
+        }
         const body = decodeBoundedRequestBody(
           request,
           await readBoundedRequestBody(request, budget),
@@ -590,6 +644,10 @@ export function createCollectorServer(
             continue: true,
             eventId: normalized.event.id,
             suppressedFields: normalized.suppressedFields,
+            ...(normalized.deduplicated ? { deduplicated: true } : {}),
+            ...(normalized.collisionQuarantined
+              ? { collisionQuarantined: true }
+              : {}),
           }),
         );
         return;
@@ -601,6 +659,10 @@ export function createCollectorServer(
       ) {
         assertNoBrowserOrigin(request);
         const source = requireOtlpSource(request);
+        assertSourceAdmission(source);
+        if (localAuth) {
+          assertProducerToken(request, localAuth, source, requestUrl(request));
+        }
         const body = decodeBoundedRequestBody(
           request,
           await readBoundedRequestBody(request, budget),
@@ -623,7 +685,7 @@ export function createCollectorServer(
         ) {
           budget.checkpoint();
           for (const { hash, label } of repoLabels) buffer.recordRepoLabel(hash, label);
-          buffer.appendMany(
+          const integrity = buffer.appendMany(
             exploded.events,
             exploded.metricSamples,
             exploded.admissionDrops,
@@ -640,6 +702,12 @@ export function createCollectorServer(
               parseFailures: exploded.parseFailures,
               droppedEvents: exploded.droppedEventCount,
               droppedByReason: exploded.admissionDrops,
+              ...(integrity.deduplicatedCount
+                ? { deduplicated: integrity.deduplicatedCount }
+                : {}),
+              ...(integrity.collisionQuarantinedCount
+                ? { collisionQuarantined: integrity.collisionQuarantinedCount }
+                : {}),
               suppressedFields: canonicalizeSuppressionReceipts([
                 ...exploded.events.flatMap((entry) => entry.suppressedFields),
                 ...exploded.metricSamples.flatMap((sample) => sample.suppressedFields),
