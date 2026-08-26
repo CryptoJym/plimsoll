@@ -1,0 +1,16 @@
+{
+  "schemaVersion": 1,
+  "deviceId": "mac-ops-001",
+  "cohortId": "wave-2026-34",
+  "observedState": "switched",
+  "appliedArtifact": { "version": "0.8.2", "sha256": "3f2a9c1e5b7d4c6a8e0f2b4d6a8c0e2f4b6d8a0c2e4f6a8b0c2d4e6f8a0b2c4" },
+  "highestDesiredVersionSeen": 7,
+  "rejectedDigests": [],
+  "lastSignalAtMs": 1756160000000,
+  "generatedAtMs": 1756160000000,
+  "diagnostics": {
+    "configBody": "uploadUrl=https://fleet.internal/api/ingest\nuploadSigningSecret=pljs_live_signing_secret_value\ninstallKey=pli_workspace_install_key_value",
+    "lastPrompt": "summarize the quarterly token spend for finance review",
+    "shellCommandOutput": "total 128\\ndrwxr-xr-x 12 staff staff 384 Aug 26 07:12 Ledger.sqlite"
+  }
+}
