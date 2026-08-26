@@ -135,10 +135,11 @@ function eventSourceFor(attrs: Record<string, unknown>, fallback: ToolSource | u
   // Transport authentication is authoritative. A producer-controlled
   // service.name must never turn an authenticated Codex batch into Claude
   // events (or vice versa); only legacy/unknown callers may infer a source.
-  if (fallback === "claude_code" || fallback === "codex") return fallback;
+  if (fallback === "claude_code" || fallback === "codex" || fallback === "cursor") return fallback;
   const service = (serviceName ?? "").toLowerCase();
   if (service.includes("claude")) return "claude_code";
   if (service.includes("codex")) return "codex";
+  if (service.includes("cursor")) return "cursor";
   return fallback ?? "unknown";
 }
 
@@ -313,14 +314,15 @@ function buildLogEvent(
     cacheCreationTokens !== undefined ||
     costUsd !== undefined;
 
-  const toolName = boundedSignalName(stringField(attrs, ["tool_name", "toolName", "tool"]));
+  const toolName = boundedSignalName(stringField(attrs, ["tool_name", "toolName", "tool", "cursor.tool.name"]));
   const explicitAction = explicitActionFrom(attrs);
   const derived = explicitAction.present ? undefined : deriveActionClass(toolName);
-  const mcpServer = stringField(attrs, ["mcp_server"]);
+  const mcpServer = stringField(attrs, ["mcp_server", "cursor.mcp.server.name"]);
+  const cursorMcpTool = stringField(attrs, ["cursor.tool.kind"]) === "mcp";
   const actionClass =
     explicitAction.present
       ? explicitAction.actionClass
-      : (derived?.actionClass === "other" && mcpServer ? "mcp" : derived?.actionClass) ??
+      : (derived?.actionClass === "other" && (mcpServer || cursorMcpTool) ? "mcp" : derived?.actionClass) ??
         "other";
 
   const eventType = hasUsage
@@ -440,7 +442,7 @@ function buildSpanEvent(
     cacheCreationTokensSpan !== undefined ||
     costUsd !== undefined;
   const toolName = boundedSignalName(
-    stringField(attrs, ["tool_name", "toolName", "tool", "gen_ai.tool.name"]),
+    stringField(attrs, ["tool_name", "toolName", "tool", "gen_ai.tool.name", "cursor.tool.name"]),
   );
   const explicitAction = explicitActionFrom(attrs);
   const derived = explicitAction.present ? undefined : deriveActionClass(toolName);
@@ -510,7 +512,11 @@ function buildSpanEvent(
     projectKey: stringField(attrs, ["plimsoll.project", "cfo_one.project", "project_key", "project"]),
     customerKey: stringField(attrs, ["plimsoll.customer", "cfo_one.customer", "customer_key", "customer"]),
     workflowKey: stringField(attrs, ["plimsoll.workflow", "cfo_one.workflow", "workflow_key", "workflow"]),
-    actionClass: explicitAction.present ? explicitAction.actionClass : derived?.actionClass ?? "other",
+    actionClass: explicitAction.present
+      ? explicitAction.actionClass
+      : (derived?.actionClass === "other" && stringField(attrs, ["cursor.tool.kind"]) === "mcp"
+        ? "mcp"
+        : derived?.actionClass ?? "other"),
     inputTokens,
     outputTokens,
     cacheReadTokens: cacheReadTokensSpan,

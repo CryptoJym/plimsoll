@@ -232,13 +232,17 @@ export function unixNanoToIso(value: string | number) {
 }
 
 export function inferSource(payload: Record<string, unknown>, fallback?: ToolSource): ToolSource {
-  const source = stringField(payload, ["source", "tool", "provider"]);
+  const source = stringField(payload, ["source", "tool", "provider", "service.name", "serviceName"]);
   if (source?.toLowerCase().includes("claude")) {
     return "claude_code";
   }
 
   if (source?.toLowerCase().includes("codex")) {
     return "codex";
+  }
+
+  if (source?.toLowerCase().includes("cursor")) {
+    return "cursor";
   }
 
   return fallback ?? "unknown";
@@ -250,11 +254,11 @@ const TOOL_NAME_KEYS = ["tool_name", "toolName", "tool", "name"];
 
 const TOOL_CLASS_RULES: Array<{ pattern: RegExp; actionClass: ActionClass; detail?: string }> = [
   { pattern: /^mcp__claude-in-chrome__/i, actionClass: "browser" },
-  { pattern: /^mcp__|^mcp[._]/i, actionClass: "mcp" },
-  { pattern: /^(bash|shell|exec_command|local_shell|run_command|run_terminal_cmd|execute_command|container\.exec|unified_exec)$/i, actionClass: "shell" },
+  { pattern: /^mcp$|^mcp__|^mcp[._:]/i, actionClass: "mcp" },
+  { pattern: /^(bash|shell|terminal|exec_command|local_shell|run_command|run_terminal_cmd|run_terminal_command|execute_command|container\.exec|unified_exec)$/i, actionClass: "shell" },
   { pattern: /^(write|create_file|write_file)$/i, actionClass: "write" },
-  { pattern: /^(edit|multiedit|notebookedit|apply_patch|applypatch|str_replace_editor|str_replace|update_file)$/i, actionClass: "edit" },
-  { pattern: /^(read|grep|glob|ls|list_dir|list_files|view|view_image|read_file|codebase_search|file_search|search|find|rg)$/i, actionClass: "read" },
+  { pattern: /^(delete|edit|edit_file|multiedit|notebookedit|apply_patch|applypatch|str_replace_editor|str_replace|update_file)$/i, actionClass: "edit" },
+  { pattern: /^(read|grep|glob|ls|list_dir|list_directory|list_files|view|view_image|read_file|codebase_search|code_search|file_search|search|search_files|find|rg)$/i, actionClass: "read" },
   { pattern: /^(webfetch|websearch|web_search|web_fetch|fetch|open_url|browser.*)$/i, actionClass: "browser" },
   { pattern: /^(task|agent|dispatch_agent|delegate)$/i, actionClass: "other", detail: "delegate" },
   { pattern: /^(todowrite|todoread|exitplanmode|enterplanmode|update_plan|taskcreate|taskupdate)$/i, actionClass: "other", detail: "plan" },
@@ -279,9 +283,16 @@ export function classifyEventType(candidate: string | undefined): AiInteractionE
   if (!normalized) return undefined;
   if (normalized === "otelspan" || normalized === "span") return "otel_span";
 
-  if (normalized.includes("userprompt")) return "user_prompt_submit";
+  if (normalized.includes("userprompt") || normalized === "beforesubmitprompt") return "user_prompt_submit";
+  if (normalized.includes("sessionend")) return "session_stop";
   if (normalized.includes("stop") || normalized.includes("sessionstop")) return "session_stop";
   if (normalized.includes("sessionstart")) return "session_start";
+  if (normalized.includes("beforeshellexecution")) return "tool_use";
+  if (normalized.includes("aftershellexecution")) return "tool_result";
+  if (normalized.includes("beforemcpexecution")) return "tool_use";
+  if (normalized.includes("aftermcpexecution")) return "tool_result";
+  if (normalized.includes("beforereadfile")) return "tool_use";
+  if (normalized.includes("afterfileedit")) return "tool_result";
   if (normalized.includes("toolresult")) return "tool_result";
   // Post-tool hook phases report the completion of an already-started tool;
   // counting them as new starts would fabricate attempts (issue #156).
@@ -298,6 +309,16 @@ export function classifyEventType(candidate: string | undefined): AiInteractionE
   ) return "otel_span";
   if (normalized.includes("otel")) return "otel_span";
 
+  return undefined;
+}
+
+function cursorHookToolName(candidate: string | undefined) {
+  const normalized = candidate?.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+  if (!normalized) return undefined;
+  if (normalized.includes("shellexecution")) return "shell";
+  if (normalized.includes("mcpexecution")) return "mcp";
+  if (normalized.includes("readfile")) return "read_file";
+  if (normalized.includes("fileedit")) return "edit_file";
   return undefined;
 }
 
@@ -358,9 +379,12 @@ export function normalizeHookPayload(
   const eventType =
     eventTypeSelection.value ??
     inferEventType(admittedTopLevel.attributes, admittedNames.accepted);
+  const rawEventType = stringField(raw, ["eventType", "event_type", "hook_event_name", "type", "name"]);
+  const specializedCursorToolName = cursorHookToolName(rawEventType);
+  const reportedToolName = stringFromRecords(sourceRecords, TOOL_NAME_KEYS);
   const toolName =
     eventType === "tool_use" || eventType === "tool_result"
-      ? stringFromRecords(sourceRecords, TOOL_NAME_KEYS)
+      ? reportedToolName ?? specializedCursorToolName
       : undefined;
   const actionSelection = selectValidatedHookAuthority(
     authorityPartitions,
@@ -391,7 +415,11 @@ export function normalizeHookPayload(
     typeof validatedTransportPath.value === "string"
     ? validatedTransportPath.value
     : undefined;
-  const derived = explicitActionClass ? undefined : deriveActionClass(toolName);
+  const derived = explicitActionClass
+    ? undefined
+    : deriveActionClass(specializedCursorToolName && reportedToolName
+      ? specializedCursorToolName
+      : toolName);
   // Authority-like aliases were partitioned before this copy. This routine
   // view can contain analytical metadata, never caller claims for transport,
   // tenant, data mode, resolver linkage, event identity/time/type or action.

@@ -26,7 +26,7 @@ export const SNAPSHOT_MAX_STALENESS_MS = 15 * 60_000;
 const CANONICAL_SHA256 = /^sha256:[0-9a-f]{64}$/;
 const UNLINKED_REPO = "__unlinked__";
 const UNLINKED_ACCOUNT = "__unlinked_account__";
-const SAFE_SOURCES=new Set(["anthropic_admin","anthropic_usage","claude_code","codex","github","openai_usage","manual","unknown"]);
+const SAFE_SOURCES=new Set(["anthropic_admin","anthropic_usage","claude_code","codex","cursor","github","openai_usage","manual","unknown"]);
 const SAFE_EVENT_TYPES=new Set(["session_start","session_stop","user_prompt_submit","assistant_response","tool_use","tool_result","otel_span","usage_rollout","usage_transcript","unknown"]);
 const SAFE_ACTIONS=new Set(["continue","validate","test","edit","read","write","shell","mcp","browser","review","other"]);
 /**
@@ -801,7 +801,7 @@ export class DashboardProjectionStore {
         select old.rowid,old.observed_at,old.source,old.event_type,old.action_class,
           strftime('%Y-%m-%dT%H:%M:%fZ','now')
         where old.session_id is null and old.model is null
-          and old.source in ('anthropic_admin','anthropic_usage','claude_code','codex','github','openai_usage','manual','unknown')
+          and old.source in ('anthropic_admin','anthropic_usage','claude_code','codex','cursor','github','openai_usage','manual','unknown')
           and old.event_type in ('session_start','session_stop','user_prompt_submit','assistant_response','tool_use','tool_result','otel_span','usage_rollout','usage_transcript','unknown')
           and (old.action_class is null or old.action_class in ('continue','validate','test','edit','read','write','shell','mcp','browser','review','other'))
           and old.input_tokens is null and old.output_tokens is null
@@ -844,7 +844,7 @@ export class DashboardProjectionStore {
         select old.rowid,old.observed_at,old.source,old.event_type,old.action_class,
           strftime('%Y-%m-%dT%H:%M:%fZ','now')
         where old.session_id is null and old.model is null
-          and old.source in ('anthropic_admin','anthropic_usage','claude_code','codex','github','openai_usage','manual','unknown')
+          and old.source in ('anthropic_admin','anthropic_usage','claude_code','codex','cursor','github','openai_usage','manual','unknown')
           and old.event_type in ('session_start','session_stop','user_prompt_submit','assistant_response','tool_use','tool_result','otel_span','usage_rollout','usage_transcript','unknown')
           and (old.action_class is null or old.action_class in ('continue','validate','test','edit','read','write','shell','mcp','browser','review','other'))
           and old.input_tokens is null and old.output_tokens is null

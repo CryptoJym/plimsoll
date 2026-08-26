@@ -1,0 +1,16 @@
+{
+  "conversation_id": "cursor-fixture-conversation",
+  "generation_id": "cursor-fixture-generation",
+  "hook_event_name": "postToolUse",
+  "tool_name": "run_terminal_cmd",
+  "command": "CURSOR_RAW_COMMAND_SENTINEL",
+  "output": "CURSOR_RAW_OUTPUT_SENTINEL",
+  "tool_input": "CURSOR_RAW_TOOL_INPUT_SENTINEL",
+  "tool_output": "CURSOR_RAW_TOOL_OUTPUT_SENTINEL",
+  "result": "CURSOR_RAW_RESULT_SENTINEL",
+  "task": "CURSOR_RAW_TASK_SENTINEL",
+  "text": "CURSOR_RAW_TEXT_SENTINEL",
+  "error_message": "CURSOR_RAW_ERROR_SENTINEL",
+  "transcript_path": "/private/CURSOR_RAW_PATH_SENTINEL.jsonl",
+  "workspace_roots": ["/private/CURSOR_RAW_WORKSPACE_SENTINEL"]
+}

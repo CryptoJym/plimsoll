@@ -31,7 +31,7 @@ export const LOCAL_HTTP_LIMITS = Object.freeze({
   perSourceRateWindowMs: 60_000,
 });
 
-export type LocalProducerSource = "claude_code" | "codex";
+export type LocalProducerSource = "claude_code" | "codex" | "cursor";
 
 /**
  * The complete closed set of admission rejection reasons. Aggregation,
@@ -137,7 +137,7 @@ function producerSourceHeader(request: http.IncomingMessage) {
 }
 
 function parsedProducerSource(value: string | undefined): LocalProducerSource | undefined {
-  if (value === "claude_code" || value === "codex") return value;
+  if (value === "claude_code" || value === "codex" || value === "cursor") return value;
   return undefined;
 }
 
