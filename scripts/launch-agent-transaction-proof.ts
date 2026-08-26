@@ -146,6 +146,136 @@ function main() {
       { status: preview.receipt.status, homeTreeUnchanged: true },
     );
 
+    // Issue #132 adversarial additions: every case below tries to break the
+    // no-follow atomic installer and must fail closed without mutating
+    // operator state. All run through the direct library API so they stay
+    // executable independently of CLI subprocess health.
+
+    const stickyHome = freshHome(sandbox, "sticky-parent-home");
+    const stickyParent = path.dirname(launchAgentPlistPath(stickyHome));
+    fs.mkdirSync(stickyParent, { recursive: true, mode: 0o700 });
+    fs.chmodSync(stickyParent, 0o1777);
+    const stickyError = errorCode(() => installLaunchAgent(options(stickyHome)));
+    check(
+      "sticky_world_writable_parent_is_rejected_without_root_trust",
+      (process.getuid?.() ?? 1) !== 0 &&
+        stickyError === "LAUNCH_AGENT_UNSAFE_ANCESTOR_MODE" &&
+        !fs.existsSync(launchAgentPlistPath(stickyHome)),
+      { error: stickyError, manifestCreated: false },
+    );
+
+    const fifoHome = freshHome(sandbox, "fifo-destination-home");
+    const fifoParent = path.dirname(launchAgentPlistPath(fifoHome));
+    fs.mkdirSync(fifoParent, { recursive: true, mode: 0o700 });
+    const fifoPath = launchAgentPlistPath(fifoHome);
+    const fifoCreated = spawnSync("/usr/bin/mkfifo", [fifoPath], { timeout: 5000 });
+    const fifoBefore = treeDigest(fifoHome);
+    const fifoApplyError = errorCode(() => installLaunchAgent(options(fifoHome)));
+    const fifoPreviewError = errorCode(() => installLaunchAgent({ ...options(fifoHome), dryRun: true }));
+    check(
+      "fifo_destination_is_rejected_as_non_regular_for_apply_and_preview",
+      fifoCreated.status === 0 &&
+        fifoApplyError === "LAUNCH_AGENT_UNSAFE_LEAF_TYPE" &&
+        fifoPreviewError === "LAUNCH_AGENT_UNSAFE_LEAF_TYPE" &&
+        fs.lstatSync(fifoPath).isFIFO() &&
+        treeDigest(fifoHome) === fifoBefore,
+      { applyError: fifoApplyError, previewError: fifoPreviewError, fifoPreserved: true },
+    );
+
+    const preparedSwapHome = freshHome(sandbox, "prepared-symlink-swap-home");
+    const preparedSwapTarget = path.join(sandbox, "prepared-swap-operator-target");
+    fs.writeFileSync(preparedSwapTarget, "operator-prepared-swap-target\n", { mode: 0o600 });
+    let preparedSwapAlias = "";
+    const preparedSwapError = errorCode(() => installLaunchAgent({
+      ...options(preparedSwapHome),
+      transactionHooks: {
+        afterPrepare: () => {
+          const directory = path.dirname(launchAgentPlistPath(preparedSwapHome));
+          const preparedName = hiddenFiles(directory, "plimsoll-prepared")[0]!;
+          preparedSwapAlias = path.join(directory, preparedName);
+          fs.unlinkSync(preparedSwapAlias);
+          fs.symlinkSync(preparedSwapTarget, preparedSwapAlias);
+        },
+      },
+    }));
+    check(
+      "prepared_object_symlink_swap_fails_closed_and_preserves_operator_target",
+      preparedSwapError === "LAUNCH_AGENT_UNSAFE_LEAF_SYMLINK" &&
+        !fs.existsSync(launchAgentPlistPath(preparedSwapHome)) &&
+        fs.lstatSync(preparedSwapAlias).isSymbolicLink() &&
+        fs.readlinkSync(preparedSwapAlias) === preparedSwapTarget &&
+        fs.readFileSync(preparedSwapTarget, "utf8") === "operator-prepared-swap-target\n",
+      { error: preparedSwapError, manifestCreated: false, targetPreserved: true },
+    );
+
+    const ambiguousExtraHome = freshHome(sandbox, "ambiguous-extra-key-home");
+    const ambiguousExtraParent = path.dirname(launchAgentPlistPath(ambiguousExtraHome));
+    fs.mkdirSync(ambiguousExtraParent, { recursive: true, mode: 0o700 });
+    const ambiguousExtra =
+      renderLaunchAgentPlist(options(ambiguousExtraHome)).replace(
+        "  <key>RunAtLoad</key>",
+        "  <key>OperatorExtra</key>\n  <string>operator-value</string>\n  <key>RunAtLoad</key>",
+      );
+    fs.writeFileSync(launchAgentPlistPath(ambiguousExtraHome), ambiguousExtra, { mode: 0o600 });
+    const ambiguousExtraInstallError = errorCode(() => installLaunchAgent(options(ambiguousExtraHome)));
+    const ambiguousExtraUninstallError = errorCode(() => uninstallLaunchAgent({ homeDir: ambiguousExtraHome }));
+    const ambiguousForeignHome = freshHome(sandbox, "ambiguous-foreign-args-home");
+    const ambiguousForeignParent = path.dirname(launchAgentPlistPath(ambiguousForeignHome));
+    fs.mkdirSync(ambiguousForeignParent, { recursive: true, mode: 0o700 });
+    const ambiguousForeign = renderLaunchAgentPlist(options(ambiguousForeignHome)).replace(
+      /(<key>ProgramArguments<\/key>)\s*<array>[\s\S]*?<\/array>/,
+      `$1
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>operator-foreign-program</string>
+  </array>`,
+    );
+    fs.writeFileSync(launchAgentPlistPath(ambiguousForeignHome), ambiguousForeign, { mode: 0o600 });
+    const ambiguousForeignInstallError = errorCode(() => installLaunchAgent(options(ambiguousForeignHome)));
+    const ambiguousForeignUninstallError = errorCode(() => uninstallLaunchAgent({ homeDir: ambiguousForeignHome }));
+    check(
+      "ambiguous_owned_label_manifests_are_never_adopted_replaced_or_uninstalled",
+      ambiguousExtraInstallError === "LAUNCH_AGENT_PLIST_KEYS_UNEXPECTED" &&
+        ambiguousExtraUninstallError === "LAUNCH_AGENT_PLIST_KEYS_UNEXPECTED" &&
+        fs.readFileSync(launchAgentPlistPath(ambiguousExtraHome), "utf8") === ambiguousExtra &&
+        ambiguousForeignInstallError === "LAUNCH_AGENT_PLIST_ARGUMENTS_UNOWNED" &&
+        ambiguousForeignUninstallError === "LAUNCH_AGENT_PLIST_ARGUMENTS_UNOWNED" &&
+        fs.readFileSync(launchAgentPlistPath(ambiguousForeignHome), "utf8") === ambiguousForeign,
+      {
+        extraKeyErrors: [ambiguousExtraInstallError, ambiguousExtraUninstallError],
+        foreignArgsErrors: [ambiguousForeignInstallError, ambiguousForeignUninstallError],
+        bytesPreserved: true,
+      },
+    );
+
+    const hostileEnvHome = freshHome(sandbox, "hostile-env-home");
+    const hostileEnvBefore = treeDigest(hostileEnvHome);
+    const savedPlimsollHome = process.env.PLIMSOLL_HOME;
+    process.env.PLIMSOLL_HOME = `${hostileEnvHome}${"\n"}operator-injected`;
+    const hostileControlError = errorCode(() => installLaunchAgent(options(hostileEnvHome)));
+    process.env.PLIMSOLL_HOME = path.join(sandbox, "hostile-env-link-target");
+    fs.mkdirSync(path.join(sandbox, "hostile-env-link-target"), { mode: 0o700 });
+    const hostileLinkPath = path.join(sandbox, "hostile-env-link");
+    fs.symlinkSync(path.join(sandbox, "hostile-env-link-target"), hostileLinkPath);
+    process.env.PLIMSOLL_HOME = hostileLinkPath;
+    const hostileSymlinkError = errorCode(() => installLaunchAgent(options(hostileEnvHome)));
+    if (savedPlimsollHome === undefined) delete process.env.PLIMSOLL_HOME;
+    else process.env.PLIMSOLL_HOME = savedPlimsollHome;
+    check(
+      "hostile_plimsoll_home_env_fails_closed_before_any_manifest_write",
+      hostileControlError.startsWith("collector_home_home_not_absolute") &&
+        hostileSymlinkError.startsWith("collector_home_home_is_symlink") &&
+        !fs.existsSync(launchAgentPlistPath(hostileEnvHome)) &&
+        treeDigest(hostileEnvHome) === hostileEnvBefore,
+      {
+        controlCharsRejected: hostileControlError.startsWith("collector_home_home_not_absolute"),
+        symlinkRejected: hostileSymlinkError.startsWith("collector_home_home_is_symlink"),
+        manifestCreated: false,
+        homeTreeUnchanged: true,
+      },
+    );
+
     const cliPreviewState = path.join(sandbox, "cli-preview-state-must-stay-absent");
     const cliPreview = command(process.execPath, [
       tsx,
