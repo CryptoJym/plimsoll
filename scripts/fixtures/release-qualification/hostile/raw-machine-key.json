@@ -1,0 +1,18 @@
+{
+  "comment": "Issue #171 hostile: machine identity arriving as a raw key/hostname instead of a pseudonymous SHA-256 hash must be refused.",
+  "receipt": {
+    "schema": "plimsoll.canary-compatibility-receipt.v1",
+    "machineRole": "studio0",
+    "machineKeyHash": "studio0-canary-raw-key-NOT-A-HASH",
+    "osPlatform": "darwin-arm64-macos26",
+    "plimsollVersion": "0.1.0",
+    "providerVersions": {},
+    "attestations": {
+      "isolatedHome": true,
+      "readOnly": true,
+      "noInstall": true,
+      "noServiceActivation": true
+    },
+    "result": "compatible"
+  }
+}

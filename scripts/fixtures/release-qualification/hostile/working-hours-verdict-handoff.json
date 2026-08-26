@@ -1,0 +1,15 @@
+{
+  "comment": "Issue #171 hostile: builder handoff smuggling a working-hours verdict field. Unknown fields must refuse the handoff — SSH/reachability/quota/event-volume/working-hours facts stay operational context only.",
+  "handoff": {
+    "laneId": "lane-171-first-signed-artifact",
+    "builderActor": "builder-a",
+    "baseSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "headSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "changedFiles": ["packages/shared/src/release-qualification.ts"],
+    "testReceipt": { "suite": "pnpm-proof-release-qualification", "passed": true },
+    "fixtureFingerprint": "sha256:b23ee42fd85d405dcd43cd3e5c5405200e21fb9e745ef2da14db7aa5bd7a6be1",
+    "unresolvedFindings": [],
+    "artifactDigest": "sha256:13051e349c6f87a0f83427b2d742806fc8e01699c7429ce5b94acd0cece66dbc",
+    "workingHoursVerdict": "underperforms"
+  }
+}

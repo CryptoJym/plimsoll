@@ -1,0 +1,20 @@
+{
+  "comment": "Issue #171 authorized-MacBook isolated-home read-only compatibility receipt. Same closed vocabulary as Studio0; result may honestly be incompatible.",
+  "receipt": {
+    "schema": "plimsoll.canary-compatibility-receipt.v1",
+    "machineRole": "authorized_macbook",
+    "machineKeyHash": "6b9097fb0cbb2b469021ad065a55098b4c76af899079329ea05de2ff7c0d4f83",
+    "osPlatform": "darwin-arm64-macos26",
+    "plimsollVersion": "0.1.0",
+    "providerVersions": {
+      "codex_cli": "0.54.2-synthetic"
+    },
+    "attestations": {
+      "isolatedHome": true,
+      "readOnly": true,
+      "noInstall": true,
+      "noServiceActivation": true
+    },
+    "result": "compatible"
+  }
+}
