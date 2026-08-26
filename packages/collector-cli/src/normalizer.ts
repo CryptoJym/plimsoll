@@ -241,20 +241,26 @@ export function inferSource(payload: Record<string, unknown>, fallback?: ToolSou
     return "codex";
   }
 
+  if (source?.toLowerCase().includes("gemini")) {
+    return "gemini_cli";
+  }
+
   return fallback ?? "unknown";
 }
 
 export { usageFieldKeys } from "../../shared/src/index";
 
-const TOOL_NAME_KEYS = ["tool_name", "toolName", "tool", "name"];
+const TOOL_NAME_KEYS = ["tool_name", "toolName", "tool", "function_name", "name"];
 
 const TOOL_CLASS_RULES: Array<{ pattern: RegExp; actionClass: ActionClass; detail?: string }> = [
   { pattern: /^mcp__claude-in-chrome__/i, actionClass: "browser" },
   { pattern: /^mcp__|^mcp[._]/i, actionClass: "mcp" },
   { pattern: /^(bash|shell|exec_command|local_shell|run_command|run_terminal_cmd|execute_command|container\.exec|unified_exec)$/i, actionClass: "shell" },
   { pattern: /^(write|create_file|write_file)$/i, actionClass: "write" },
+  { pattern: /^(replace|insert_at_line|edit_file)$/i, actionClass: "edit" },
   { pattern: /^(edit|multiedit|notebookedit|apply_patch|applypatch|str_replace_editor|str_replace|update_file)$/i, actionClass: "edit" },
-  { pattern: /^(read|grep|glob|ls|list_dir|list_files|view|view_image|read_file|codebase_search|file_search|search|find|rg)$/i, actionClass: "read" },
+  { pattern: /^(read|grep|glob|ls|list_dir|list_files|list_directory|view|view_image|read_file|read_many_files|codebase_search|file_search|search|search_file_content|find|rg)$/i, actionClass: "read" },
+  { pattern: /^(run_shell_command|shell|execute|run_command)$/i, actionClass: "shell" },
   { pattern: /^(webfetch|websearch|web_search|web_fetch|fetch|open_url|browser.*)$/i, actionClass: "browser" },
   { pattern: /^(task|agent|dispatch_agent|delegate)$/i, actionClass: "other", detail: "delegate" },
   { pattern: /^(todowrite|todoread|exitplanmode|enterplanmode|update_plan|taskcreate|taskupdate)$/i, actionClass: "other", detail: "plan" },

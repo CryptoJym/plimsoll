@@ -44,28 +44,34 @@ names only, never values.
 | 12 | `command_body` |
 | 13 | `diff` |
 | 14 | `file_body` |
-| 15 | `full_command` |
-| 16 | `output` |
-| 17 | `patch` |
-| 18 | `prompt` |
-| 19 | `prompt_body` |
-| 20 | `raw` |
-| 21 | `raw_api_body` |
-| 22 | `raw_body` |
-| 23 | `raw_output` |
-| 24 | `raw_prompt` |
-| 25 | `response` |
-| 26 | `screenshot` |
-| 27 | `stderr` |
-| 28 | `stdin` |
-| 29 | `stdout` |
-| 30 | `tool_arguments` |
-| 31 | `tool_input` |
-| 32 | `tool_output` |
-| 33 | `tool_response` |
-| 34 | `user_prompt` |
+| 15 | `function_args` |
+| 16 | `full_command` |
+| 17 | `gen_ai.input.messages` |
+| 18 | `gen_ai.output.messages` |
+| 19 | `gen_ai.system_instructions` |
+| 20 | `output` |
+| 21 | `patch` |
+| 22 | `prompt` |
+| 23 | `prompt_body` |
+| 24 | `raw` |
+| 25 | `raw_api_body` |
+| 26 | `raw_body` |
+| 27 | `raw_output` |
+| 28 | `raw_prompt` |
+| 29 | `response` |
+| 30 | `request_text` |
+| 31 | `response_text` |
+| 32 | `screenshot` |
+| 33 | `stderr` |
+| 34 | `stdin` |
+| 35 | `stdout` |
+| 36 | `tool_arguments` |
+| 37 | `tool_input` |
+| 38 | `tool_output` |
+| 39 | `tool_response` |
+| 40 | `user_prompt` |
 
-Count: **34** — source: `packages/shared/src/schemas.ts :: forbiddenRawContentFieldNames`.
+Count: **40** — source: `packages/shared/src/schemas.ts :: forbiddenRawContentFieldNames`.
 Named sentinel checks enforcing this section:
 
 - `raw_command_and_path_suppressed` — `scripts/signal-fidelity-proof.ts`
@@ -102,24 +108,30 @@ evidence vault implemented (ADR-0004).
 | 10 | `cmd` |
 | 11 | `command` |
 | 12 | `diff` |
-| 13 | `full_command` |
-| 14 | `patch` |
-| 15 | `prompt_body` |
-| 16 | `raw` |
-| 17 | `raw_api_body` |
-| 18 | `raw_body` |
-| 19 | `raw_output` |
-| 20 | `raw_prompt` |
-| 21 | `response` |
-| 22 | `screenshot` |
-| 23 | `stderr` |
-| 24 | `stdin` |
-| 25 | `stdout` |
-| 26 | `tool_arguments` |
-| 27 | `tool_response` |
-| 28 | `user_prompt` |
+| 13 | `function_args` |
+| 14 | `full_command` |
+| 15 | `gen_ai.input.messages` |
+| 16 | `gen_ai.output.messages` |
+| 17 | `gen_ai.system_instructions` |
+| 18 | `patch` |
+| 19 | `prompt_body` |
+| 20 | `raw` |
+| 21 | `raw_api_body` |
+| 22 | `raw_body` |
+| 23 | `raw_output` |
+| 24 | `raw_prompt` |
+| 25 | `response` |
+| 26 | `request_text` |
+| 27 | `response_text` |
+| 28 | `screenshot` |
+| 29 | `stderr` |
+| 30 | `stdin` |
+| 31 | `stdout` |
+| 32 | `tool_arguments` |
+| 33 | `tool_response` |
+| 34 | `user_prompt` |
 
-Count: **28** — source: `computed from forbiddenRawContentFieldNames minus rawContentCategorySchema`.
+Count: **34** — source: `computed from forbiddenRawContentFieldNames minus rawContentCategorySchema`.
 Named sentinel checks enforcing this section:
 
 - `managed_config_write_rejects_evidence_before_filesystem_write` — `scripts/privacy-mode-proof.ts`
@@ -198,7 +210,7 @@ names only). Typed event fields:
 2. `sessionId` — string, optional.
 3. `tenantId` — string, optional.
 4. `actorId` — string, optional — normalized name also appears in `protectedMetadataFieldNames`; inside free-form metadata such keys are value-hashed (see *Collected hashed*), and as a typed field it crosses under the outbound identifier contract.
-5. `source` — enum(anthropic_admin | anthropic_usage | claude_code | codex | github | openai_usage | manual | unknown), required.
+5. `source` — enum(anthropic_admin | anthropic_usage | claude_code | codex | gemini_cli | github | openai_usage | manual | unknown), required.
 6. `dataMode` — enum(metadata | event_detail | evidence), optional.
 7. `eventType` — enum(session_start | session_stop | user_prompt_submit | assistant_response | tool_use | tool_result | otel_span | usage_rollout | usage_transcript | unknown), required.
 8. `observedAt` — string, required.

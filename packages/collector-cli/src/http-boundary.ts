@@ -31,7 +31,7 @@ export const LOCAL_HTTP_LIMITS = Object.freeze({
   perSourceRateWindowMs: 60_000,
 });
 
-export type LocalProducerSource = "claude_code" | "codex";
+export type LocalProducerSource = "claude_code" | "codex" | "gemini_cli";
 
 /**
  * The complete closed set of admission rejection reasons. Aggregation,
@@ -137,15 +137,51 @@ function producerSourceHeader(request: http.IncomingMessage) {
 }
 
 function parsedProducerSource(value: string | undefined): LocalProducerSource | undefined {
-  if (value === "claude_code" || value === "codex") return value;
+  if (value === "claude_code" || value === "codex" || value === "gemini_cli") return value;
   return undefined;
+}
+
+const OTLP_SIGNAL_PATHS = new Set(["/v1/logs", "/v1/traces", "/v1/metrics"]);
+
+function pathProducerSource(rawUrl: string | undefined) {
+  try {
+    const pathname = new URL(rawUrl ?? "", "http://127.0.0.1").pathname;
+    if (pathname.startsWith("/gemini/") && OTLP_SIGNAL_PATHS.has(pathname.slice("/gemini".length))) {
+      return "gemini_cli" as const;
+    }
+  } catch {
+    return undefined;
+  }
+  return undefined;
+}
+
+export function isOtlpPath(rawUrl: string | undefined) {
+  try {
+    const pathname = new URL(rawUrl ?? "", "http://127.0.0.1").pathname;
+    return OTLP_SIGNAL_PATHS.has(pathname) || pathProducerSource(rawUrl) === "gemini_cli";
+  } catch {
+    return false;
+  }
+}
+
+/** Keep the persisted receipt stable when Gemini's source-qualified endpoint is used. */
+export function canonicalOtlpTransportPath(rawUrl: string | undefined) {
+  try {
+    const pathname = new URL(rawUrl ?? "", "http://127.0.0.1").pathname;
+    return pathname.startsWith("/gemini/") ? pathname.slice("/gemini".length) : pathname;
+  } catch {
+    return rawUrl;
+  }
 }
 
 export function requireOtlpSource(request: http.IncomingMessage): LocalProducerSource {
   const claimed = producerSourceHeader(request);
+  const routed = pathProducerSource(request.url);
+  if (!claimed.present && routed) return routed;
   if (!claimed.present) throw new HttpBoundaryRejection("source_required", 401);
   const parsed = parsedProducerSource(claimed.value);
   if (!parsed) throw new HttpBoundaryRejection("source_not_allowed", 401);
+  if (routed && parsed !== routed) throw new HttpBoundaryRejection("source_mismatch", 401);
   return parsed;
 }
 
