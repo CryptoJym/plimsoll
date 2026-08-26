@@ -12,6 +12,7 @@ export const toolSourceSchema = z.enum([
   "codex",
   "github",
   "openai_usage",
+  "vendor_import",
   "manual",
   "unknown",
 ]);
@@ -272,6 +273,7 @@ export const aiInteractionEventSchema = z
       "otel_span",
       "usage_rollout",
       "usage_transcript",
+      "usage_vendor_import",
       "unknown",
     ]),
     observedAt: timestampSchema,

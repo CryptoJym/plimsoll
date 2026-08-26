@@ -151,6 +151,7 @@ import { prepareRepoLabelsPush, pushRepoLabels } from "./repo-labels";
 import { runSessionSync, sessionIdsFromBatches } from "./session-sync";
 import { uploadBufferedEvents } from "./upload";
 import { runAttributionRepair, runWorkspaceHistoryUpload } from "./upload-history";
+import { importVendorCsv } from "./vendor-import";
 import {
   acquireCollectorStartOwnership,
   classifyProcessIdentity,
@@ -224,6 +225,7 @@ Commands:
                         never scheduled or uploaded.
   scan-rollouts         Read codex rollout files into the ledger once (full history walk)
   scan-transcripts      Read Claude Code transcript usage into the ledger once (full history walk)
+  import VENDOR FILE     Import a vendor CSV as daily vendor-reported usage (captured overlap days win)
   drain-projections     Drain a stalled dashboard-projection repair backlog at full
                         budget until the dashboard is caught up (run with the
                         collector stopped; safe to interrupt and re-run)
@@ -2254,6 +2256,32 @@ async function main() {
     );
     console.log(JSON.stringify({ ...result, historyCoverage }, null, 2));
     buffer.close();
+    return;
+  }
+
+  if (command === "import") {
+    const vendor = process.argv[3];
+    const file = process.argv[4];
+    if (!vendor || !file || process.argv.length !== 5) {
+      throw new Error("Usage: plimsoll import anthropic FILE");
+    }
+    let csv: string;
+    try {
+      csv = fs.readFileSync(file, "utf8");
+    } catch {
+      throw new Error("vendor_import_file_unreadable");
+    }
+    const buffer = openBuffer(config);
+    try {
+      const receipt = importVendorCsv(buffer, vendor, csv);
+      console.log(JSON.stringify({
+        status: "vendor_imported",
+        fileHash: privatePathReceipt(file),
+        ...receipt,
+      }, null, 2));
+    } finally {
+      buffer.close();
+    }
     return;
   }
 

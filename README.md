@@ -70,6 +70,11 @@ npx -y @plimsoll/cli start
 npx -y @plimsoll/cli doctor --read-only --json
 ```
 
+To extend the local line with an Anthropic Console CSV, run
+`plimsoll import anthropic EXPORT.csv`. Imported rows are immutable,
+sessionless daily vendor-reported facts; captured days win overlaps and the
+dashboard marks imported days with hatched bars.
+
 `doctor` is a diagnostic gate, not an installer and not capture proof by
 itself. Its readiness progresses through `not_installed` → `configured` →
 `service_ready` → `signal_verified`; only `signal_verified` returns `ok:true`

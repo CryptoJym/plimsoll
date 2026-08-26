@@ -229,7 +229,7 @@ export function buildSessionSyncRow(snapshot: SessionSnapshot): NormalizedSessio
   if (!sealed.ok) {
     const sourceValid = [
       "anthropic_admin", "anthropic_usage", "claude_code", "codex",
-      "github", "openai_usage", "manual", "unknown",
+      "github", "openai_usage", "vendor_import", "manual", "unknown",
     ].includes(snapshot.source);
     const reason: SessionSkipReason = !sourceValid
       ? "source_invalid"

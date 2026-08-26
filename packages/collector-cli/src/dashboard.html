@@ -137,6 +137,7 @@ header.mast{
 /* ——— sparkline ——— */
 .spark{width:100%; height:120px; display:block}
 .spark .bar{fill:var(--waterline); opacity:.75}
+.spark .bar.vendor{fill:url(#vendor-hatch); opacity:.95}
 .spark .bar:hover{fill:var(--brass); opacity:1}
 .spark text{fill:var(--foam-faint); font-size:9px; font-family:var(--mono)}
 .spark line{stroke:var(--line)}
@@ -293,7 +294,7 @@ tr.row:focus-visible{background:rgba(35,137,167,.12)}
     <section class="plate span5 reading">
       <h2>Attributed spend · <span id="window-label">30 days</span></h2>
       <div class="figure" id="fig-cost">—</div>
-      <div class="unit">USD, summed from per-request telemetry</div>
+      <div class="unit">USD, local telemetry + vendor-reported history</div>
       <dl class="kv vendor-kv" id="kv-vendors"></dl>
       <dl class="kv">
         <dt>input tokens</dt><dd id="kv-in">—</dd>
@@ -336,7 +337,7 @@ tr.row:focus-visible{background:rgba(35,137,167,.12)}
     </section>
 
     <section class="plate span12">
-      <h2>Daily spend</h2>
+      <h2>Daily spend <span class="plate-meta plain" id="daily-provenance"></span></h2>
       <svg class="spark" id="spark" preserveAspectRatio="none"></svg>
     </section>
 
@@ -548,7 +549,7 @@ function fillDays(daily){
   const start=Date.parse(daily[0].day+"T00:00:00Z"), end=Date.parse(daily[daily.length-1].day+"T00:00:00Z");
   for(let t=start;t<=end;t+=86400000){
     const day=new Date(t).toISOString().slice(0,10);
-    out.push(byDay.get(day)||{day,costUsd:0,tokens:0});
+    out.push(byDay.get(day)||{day,costUsd:0,tokens:0,vendorReported:false,vendorEvents:0,vendorCostUsd:0,vendorTokens:0});
   }
   return out;
 }
@@ -562,6 +563,10 @@ function drawSpark(daily){
     message.textContent="no spend recorded in window";svg.appendChild(message);return;
   }
   daily=fillDays(daily);
+  const defs=svgNode("defs"),pattern=svgNode("pattern",{id:"vendor-hatch",width:6,height:6,patternUnits:"userSpaceOnUse",patternTransform:"rotate(25)"});
+  pattern.appendChild(svgNode("rect",{width:6,height:6,fill:"var(--waterline)",opacity:.45}));
+  pattern.appendChild(svgNode("line",{x1:0,y1:0,x2:0,y2:6,stroke:"var(--brass)","stroke-width":2,opacity:.9}));
+  defs.appendChild(pattern);svg.appendChild(defs);
   const max=Math.max(...daily.map(d=>d.costUsd),0.01);
   const bw=Math.max(2,(W-pad*2)/daily.length-3);
   svg.appendChild(svgNode("line",{x1:0,y1:H-14,x2:W,y2:H-14}));
@@ -569,8 +574,8 @@ function drawSpark(daily){
     if(!(d.costUsd>0))return;
     const h=Math.max(2.5,(d.costUsd/max)*(H-34));
     const x=pad+i*((W-pad*2)/daily.length);
-    const group=svgNode("g",{class:"bar-g"}),rect=svgNode("rect",{class:"bar",x,y:H-14-h,width:bw,height:h});
-    add(rect,add(svgNode("title"),`${d.day} · ${usd(d.costUsd)} · ${fmt(d.tokens)} tok`));group.appendChild(rect);svg.appendChild(group);
+    const group=svgNode("g",{class:"bar-g"}),rect=svgNode("rect",{class:"bar"+(d.vendorReported?" vendor":""),x,y:H-14-h,width:bw,height:h});
+    add(rect,add(svgNode("title"),`${d.day} · ${usd(d.costUsd)} · ${fmt(d.tokens)} tok`+(d.vendorReported?" · vendor-reported, captured overlap days excluded":"")));group.appendChild(rect);svg.appendChild(group);
   });
   for(const entry of [
     {x:pad,y:H-3,text:daily[0].day},
@@ -785,7 +790,11 @@ function renderSnapshot(d){
   $("#kv-in").textContent=fmt(t.inputTokens);$("#kv-out").textContent=fmt(t.outputTokens);$("#kv-cache").textContent=fmt(t.cacheReadTokens);
   $("#kv-cachew").textContent=t.cacheCreationTokens>0?fmt(t.cacheCreationTokens):"—";$("#kv-sessions").textContent=fmt(t.sessions);
   const pct=t.sessions?t.sessionsWithTokens/t.sessions:0;gauge(pct);$("#cov-note").textContent=`${fmt(t.sessionsWithTokens)} of ${fmt(t.sessions)} sessions carry token telemetry`;
-  drawSpark(s.daily||[]);
+  const daily=Array.isArray(s.daily)?s.daily:[];
+  const vendorDays=daily.filter(item=>item.vendorReported===true).length;
+  $("#daily-provenance").textContent=vendorDays?`${fmt(vendorDays)} vendor-reported day${vendorDays===1?"":"s"} · hatched`:
+    "captured days only";
+  drawSpark(daily);
   renderOutcomePerformance(d.outcomePerformance||null);
   const planUsd=(acct.accounts||[]).reduce((sum,item)=>sum+(item.subscription?(item.subscription.planCostWindow||0):0),0);renderRail(t.costUsd||0,planUsd,$("#window-label").textContent);
   rows("#t-models","#e-models",s.byModel||[],item=>{
@@ -798,7 +807,7 @@ function renderSnapshot(d){
       {content:fmt(item.outputTokens),className:"num"},{content:costCell,className:"num brass"},
     ]);
   });
-  const vendors={claude_code:["Anthropic · Claude Code",""],codex:["OpenAI · Codex"," ~"]},vendorList=clear($("#kv-vendors"));
+  const vendors={claude_code:["Anthropic · Claude Code",""],codex:["OpenAI · Codex"," ~"],vendor_import:["Vendor-reported import",""]},vendorList=clear($("#kv-vendors"));
   for(const item of (s.bySource||[]).filter(value=>value.costUsd>0||value.events>0)){
     const [name,tilde]=vendors[item.source]||[item.source,""];vendorList.appendChild(node("dt",name));
     const value=node("dd"),bold=node("b",tilde+usd(item.costUsd));add(value,bold,` · ${fmt(item.sessions)} sess`);vendorList.appendChild(value);

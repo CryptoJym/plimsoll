@@ -38,6 +38,7 @@
     "proof:resource": "tsx scripts/resource-proof/index.ts",
     "proof:resource-finalization": "tsx scripts/resource-proof/finalization-proof.ts",
     "proof:dashboard": "tsx scripts/dashboard-projection-proof.ts",
+    "proof:vendor-import": "tsx scripts/vendor-import-proof.ts",
     "proof:usage-dedupe": "tsx scripts/usage-dedupe-proof.ts",
     "proof:join-isolation": "tsx scripts/join-isolation-proof.ts",
     "proof:device-registry": "tsx scripts/device-registry-proof.ts",
