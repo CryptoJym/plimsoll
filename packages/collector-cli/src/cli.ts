@@ -159,6 +159,7 @@ import {
   runtimeIdentityMatches,
   UTC_PROCESS_START_ALGORITHM,
   verifyCollectorRuntimeIdentity,
+  type CollectorListenerObservation,
   type LaunchAgentLabelObservation,
   type LaunchAgentUnloadOutcome,
   type LaunchAgentUnloadPriorState,
@@ -522,6 +523,58 @@ function fencedReconciler(fence: LaunchAgentFence) {
   };
 }
 
+// Issue #148: a launchctl bootstrap success says launchd accepted the job —
+// it does NOT say a collector is actually serving. The load receipt must
+// carry both facts separately, so after bootstrap we probe /status for a
+// bounded window and record what was proven.
+const LOAD_READINESS_TIMEOUT_MS = 2_000;
+const LOAD_READINESS_POLL_MS = 100;
+
+export type LaunchAgentLoadReadiness = {
+  verified: boolean;
+  listenerState: CollectorListenerObservation["kind"];
+  runtimeLive: boolean | null;
+  elapsedMs: number;
+  observations: number;
+  deadlineCrossed: boolean;
+};
+
+async function verifyPostBootstrapReadiness(
+  port: number,
+  options: { timeoutMs?: number; pollIntervalMs?: number } = {},
+): Promise<LaunchAgentLoadReadiness> {
+  const timeoutMs = Math.max(0, options.timeoutMs ?? LOAD_READINESS_TIMEOUT_MS);
+  const pollIntervalMs = Math.max(1, options.pollIntervalMs ?? LOAD_READINESS_POLL_MS);
+  const startedAt = Date.now();
+  const deadline = startedAt + timeoutMs;
+  let observations = 0;
+  let listenerState: CollectorListenerObservation["kind"] = "absent";
+  let runtimeLive: boolean | null = null;
+  let deadlineCrossed = false;
+  while (true) {
+    const observed = await observeCollectorListener(port);
+    observations += 1;
+    listenerState = observed.kind;
+    runtimeLive =
+      observed.kind === "collector" ? processIdentityIsLive(observed.runtimeIdentity) : null;
+    if (observed.kind === "collector" && runtimeLive === true) break;
+    const now = Date.now();
+    if (now >= deadline) {
+      deadlineCrossed = true;
+      break;
+    }
+    await new Promise((resolve) => setTimeout(resolve, Math.min(pollIntervalMs, deadline - now)));
+  }
+  return {
+    verified: listenerState === "collector" && runtimeLive === true,
+    listenerState,
+    runtimeLive,
+    elapsedMs: Math.max(0, Date.now() - startedAt),
+    observations,
+    deadlineCrossed,
+  };
+}
+
 async function loadVisibleLaunchAgent(
   plistPath: string,
   port: number,
@@ -659,6 +712,10 @@ async function loadVisibleLaunchAgent(
       status: "bootstrap_succeeded" as const,
       manifestDigest: visible.manifestDigest,
       manifestIdentityDigest: visible.manifestIdentityDigest,
+      // Issue #148: bootstrap truth and collector readiness are separate
+      // facts. `loaded` stays literal; `readiness` records whether a live
+      // collector actually answered /status within the bounded window.
+      readiness: await verifyPostBootstrapReadiness(port),
     };
   } finally {
     releaseLaunchAgentFence(fence);

@@ -47,6 +47,7 @@
     "proof:launch-agent": "tsx scripts/launch-agent-transaction-proof.ts",
     "proof:collector-home": "tsx scripts/collector-home-proof.ts",
     "proof:launch-agent-unload": "tsx scripts/launch-agent-unload-proof.ts",
+    "proof:lifecycle-readiness": "tsx scripts/lifecycle-readiness-proof.ts",
     "proof:fingerprint-versioning": "tsx scripts/fingerprint-versioning-proof.ts",
     "proof:collector-supervision": "tsx scripts/collector-supervision-proof.ts",
     "proof:flake-regression": "tsx scripts/runtime-flake-regression-proof.ts",
