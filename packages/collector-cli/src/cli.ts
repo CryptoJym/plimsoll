@@ -137,6 +137,7 @@ import {
 } from "./github-outcome-backfill";
 import { OutcomeTimelineStore } from "./outcome-timeline-store";
 import { formatWeeklyPerformanceMarkdown } from "./performance-layer";
+import { runLearningMaterialization } from "./learning-materializer";
 import { prepareRepoLabelsPush, pushRepoLabels } from "./repo-labels";
 import { runSessionSync, sessionIdsFromBatches } from "./session-sync";
 import { uploadBufferedEvents } from "./upload";
@@ -265,8 +266,15 @@ Config tools:
   backfill-outcome-performance [--repository owner/repo] [--store PATH]
       [--required-checks POLICY.json] [--rework-window-days 14]
       Local-only deterministic materialization of existing outcome-timeline facts.
-  weekly-performance-rollup [--store PATH] [--out-dir DIR] [--until ISO]
-      Generates weekly-performance-YYYY-MM-DD.{json,md}; explicit/on-demand only.
+   weekly-performance-rollup [--store PATH] [--out-dir DIR] [--until ISO]
+       Generates weekly-performance-YYYY-MM-DD.{json,md}; explicit/on-demand only.
+   materialize-learning-evidence [--ledger PATH] [--store PATH] [--state PATH]
+       [--out PATH] [--until ISO] [--window-days N] [--max-new-events N]
+       One deterministic high-watered pass joining allocation, token origin,
+       materialized outcomes, work episodes, attempts, and prospective
+       technique exposure into one versioned learning evidence packet.
+       Manual/on-demand only; never scheduled continuously. Missing
+       dependencies are reported as not_estimable, never substituted.
   install-launch-agent [--load] [--dry-run]
   install-launch-agent --dev [--repo-root PATH] [--pnpm PATH] [--load]
   load-launch-agent
@@ -2549,6 +2557,33 @@ async function main() {
     } finally {
       store.close();
     }
+    return;
+  }
+
+  if (command === "materialize-learning-evidence") {
+    const until = optionValue("--until") ?? new Date().toISOString();
+    if (!Number.isFinite(Date.parse(until))) throw new Error(`--until expects an ISO timestamp, got: ${until}`);
+    const windowDaysRaw = optionValue("--window-days") ?? "7";
+    const windowDays = Number(windowDaysRaw);
+    if (!Number.isInteger(windowDays) || windowDays < 1 || windowDays > 365) {
+      throw new Error(`--window-days expects an integer from 1 through 365, got: ${windowDaysRaw}`);
+    }
+    const maxNewEventsRaw = optionValue("--max-new-events") ?? "100000";
+    const maxNewEvents = Number(maxNewEventsRaw);
+    if (!Number.isInteger(maxNewEvents) || maxNewEvents < 0) {
+      throw new Error(`--max-new-events expects a non-negative integer, got: ${maxNewEventsRaw}`);
+    }
+    const receipt = runLearningMaterialization({
+      ledgerPath: optionValue("--ledger") ?? path.join(collectorHome(), "work-ledger.sqlite"),
+      outcomeStorePath: optionValue("--store") ?? path.join(collectorHome(), "outcome-timeline-v1.sqlite"),
+      statePath: optionValue("--state") ?? path.join(collectorHome(), "learning-materialization-v1.sqlite"),
+      outPath: optionValue("--out") ?? path.join(process.cwd(), "evidence", "learning-evidence-packet.json"),
+      until,
+      windowDays,
+      maxNewUsageEvents: maxNewEvents,
+    });
+    console.log(JSON.stringify(receipt, null, 2));
+    if (receipt.status === "blocked_dependencies") process.exitCode = 1;
     return;
   }
 
