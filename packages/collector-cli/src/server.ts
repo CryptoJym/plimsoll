@@ -118,6 +118,7 @@ function hookSourceFromPath(rawUrl: string | undefined): LocalProducerSource | u
     const pathname = new URL(rawUrl ?? "", "http://127.0.0.1").pathname;
     if (pathname === "/hooks/claude-code") return "claude_code";
     if (pathname === "/hooks/codex") return "codex";
+    if (pathname === "/hooks/cursor") return "cursor";
   } catch {
     return undefined;
   }

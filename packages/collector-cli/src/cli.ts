@@ -193,8 +193,8 @@ Commands:
   doctor --read-only --json
                         Read-only readiness check; never creates config, ledger, plist, logs, or directories
   export                Print buffered events as JSON
-  forward-hook SOURCE   Read hook JSON from stdin and append it without requiring the receiver
-  self-test-hook SOURCE Emit one synthetic hook event into the local buffer
+  forward-hook SOURCE   Read Claude/Codex/Cursor hook JSON from stdin and append it without requiring the receiver
+  self-test-hook SOURCE Emit one synthetic Claude/Codex/Cursor hook event into the local buffer
   generate-config TOOL  Print Claude Code or Codex config for metadata collection
   setup                 APPLY the Claude Code + Codex telemetry config (idempotent; --yes, --dry-run)
   upload                Drain un-uploaded events to the tenant ingest API (marks rows, keeps local copies)
@@ -351,7 +351,8 @@ function optionValue(name: string) {
 function collectorSourceFromArg(value: string | undefined): ToolSource {
   if (value === "claude-code") return "claude_code";
   if (value === "codex") return "codex";
-  throw new Error("Expected source to be claude-code or codex.");
+  if (value === "cursor") return "cursor";
+  throw new Error("Expected source to be claude-code, codex, or cursor.");
 }
 
 async function readStdin() {
@@ -2066,6 +2067,7 @@ async function main() {
           hookEndpoints: {
             claudeCode: `http://127.0.0.1:${config.port}/hooks/claude-code`,
             codex: `http://127.0.0.1:${config.port}/hooks/codex`,
+            cursor: `http://127.0.0.1:${config.port}/hooks/cursor`,
           },
           otlpEndpoints: {
             logs: `http://127.0.0.1:${config.port}/v1/logs`,

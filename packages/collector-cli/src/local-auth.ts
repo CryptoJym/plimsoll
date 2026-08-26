@@ -9,14 +9,16 @@ import { HttpBoundaryRejection } from "./http-boundary";
 /**
  * These are Plimsoll credentials, not provider credentials. They are created
  * from local randomness and are only ever persisted in the private Plimsoll
- * home. The three values deliberately have separate audiences: a producer
- * token cannot be replayed as a management credential, and Claude/Codex
- * cannot impersonate one another.
+ * home. The producer values deliberately have separate audiences: a producer
+ * token cannot be replayed as a management credential, and the supported
+ * producers cannot impersonate one another.
  */
 export type LocalIngestAuth = {
   version: 1;
   claudeCodeProducer: string;
   codexProducer: string;
+  /** Added for Cursor without invalidating legacy two-producer auth files. */
+  cursorProducer?: string;
   managementRead: string;
 };
 
@@ -38,6 +40,7 @@ function newAuth(): LocalIngestAuth {
     version: LOCAL_INGEST_AUTH_VERSION,
     claudeCodeProducer: newToken(),
     codexProducer: newToken(),
+    cursorProducer: newToken(),
     managementRead: newToken(),
   });
 }
@@ -46,9 +49,14 @@ function validAuth(value: unknown): value is LocalIngestAuth {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
   const keys = Object.keys(record).sort();
-  if (keys.join(",") !== "claudeCodeProducer,codexProducer,managementRead,version") {
+  const legacyKeys = "claudeCodeProducer,codexProducer,managementRead,version";
+  const currentKeys = "claudeCodeProducer,codexProducer,cursorProducer,managementRead,version";
+  if (keys.join(",") !== legacyKeys && keys.join(",") !== currentKeys) {
     return false;
   }
+  const cursorValid = record.cursorProducer === undefined || (
+    typeof record.cursorProducer === "string" && TOKEN_PATTERN.test(record.cursorProducer)
+  );
   return record.version === LOCAL_INGEST_AUTH_VERSION &&
     typeof record.claudeCodeProducer === "string" &&
     typeof record.codexProducer === "string" &&
@@ -56,11 +64,14 @@ function validAuth(value: unknown): value is LocalIngestAuth {
     TOKEN_PATTERN.test(record.claudeCodeProducer) &&
     TOKEN_PATTERN.test(record.codexProducer) &&
     TOKEN_PATTERN.test(record.managementRead) &&
+    cursorValid &&
     new Set([
       record.claudeCodeProducer,
       record.codexProducer,
+      record.cursorProducer,
       record.managementRead,
-    ]).size === 3;
+    ].filter((token): token is string => typeof token === "string")).size ===
+      (record.cursorProducer === undefined ? 3 : 4);
 }
 
 function isPrivateRegularFile(file: string) {
@@ -210,7 +221,13 @@ export function assertProducerToken(
   if (supplied === undefined) {
     throw new HttpBoundaryRejection("producer_token_required", 401);
   }
-  const expected = source === "claude_code" ? auth.claudeCodeProducer : auth.codexProducer;
+  const expected = source === "claude_code"
+    ? auth.claudeCodeProducer
+    : source === "codex"
+      ? auth.codexProducer
+      // Legacy auth files predate Cursor. Preserve their validity and use the
+      // existing producer audience until the operator rotates credentials.
+      : auth.cursorProducer ?? auth.codexProducer;
   if (!tokenMatches(supplied, expected)) {
     throw new HttpBoundaryRejection("producer_token_invalid", 401);
   }

@@ -7,16 +7,24 @@ const SESSION_ID_KEYS = [
   "conversation_id",
   "thread_id",
   "session.id",
+  "cursor.conversation.id",
   "gen_ai.session.id",
 ] as const;
 
-const MODEL_KEYS = ["model", "slug", "gen_ai.request.model", "gen_ai.response.model"] as const;
+const MODEL_KEYS = [
+  "model",
+  "slug",
+  "gen_ai.request.model",
+  "gen_ai.response.model",
+  "cursor.model.name",
+] as const;
 
 const INPUT_TOKEN_KEYS = [
   "inputTokens",
   "input_tokens",
   "gen_ai.usage.input_tokens",
   "llm.usage.prompt_tokens",
+  "cursor.api.request.input_tokens",
 ] as const;
 
 const OUTPUT_TOKEN_KEYS = [
@@ -24,6 +32,7 @@ const OUTPUT_TOKEN_KEYS = [
   "output_tokens",
   "gen_ai.usage.output_tokens",
   "llm.usage.completion_tokens",
+  "cursor.api.request.output_tokens",
 ] as const;
 
 const CACHE_READ_TOKEN_KEYS = [
@@ -32,6 +41,7 @@ const CACHE_READ_TOKEN_KEYS = [
   "gen_ai.usage.cache_read_tokens",
   "gen_ai.usage.cache_read.input_tokens",
   "gen_ai.usage.cached_tokens",
+  "cursor.api.request.cache_read_tokens",
 ] as const;
 
 const CACHE_CREATION_TOKEN_KEYS = [
@@ -41,6 +51,7 @@ const CACHE_CREATION_TOKEN_KEYS = [
   "cache_creation.input_tokens",
   "gen_ai.usage.cache_creation_input_tokens",
   "gen_ai.usage.cache_creation.input_tokens",
+  "cursor.api.request.cache_creation_tokens",
 ] as const;
 
 const COST_KEYS = [
@@ -50,6 +61,7 @@ const COST_KEYS = [
   "gen_ai.usage.cost_usd",
   "plimsoll.estimated_cost_usd",
   "cfo_one.estimated_cost_usd",
+  "cursor.cost.usd",
 ] as const;
 
 const ACTOR_ID_KEYS = [
@@ -176,6 +188,26 @@ const RECORD_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
   ["call_id", "identifier"],
   ["plimsoll.retry_of", "identifier"],
   ["gen_ai.response.id", "identifier"],
+  ["cursor.event.id", "identifier"],
+  ["cursor.source_event.id", "identifier"],
+  ["cursor.request.id", "identifier"],
+  ["cursor.usage_event.id", "identifier"],
+  ["cursor.tool.name", "component"],
+  ["cursor.tool.kind", "classification"],
+  ["cursor.tool.status", "classification"],
+  ["cursor.mcp.server.name", "component"],
+  ["cursor.hook.name", "component"],
+  ["cursor.hook.type", "classification"],
+  ["cursor.hook.outcome", "classification"],
+  ["cursor.skill.name", "component"],
+  ["cursor.skill.trigger", "classification"],
+  ["cursor.skill.source", "classification"],
+  ["cursor.plugin.name", "component"],
+  ["cursor.plugin.scope", "classification"],
+  ["cursor.cloud_agent.pull_request.kind", "classification"],
+  ["cursor.cloud_agent.setup.kind", "classification"],
+  ["cursor.cloud_agent.setup.reason", "classification"],
+  ["cursor.cloud_agent.artifact.content_type", "component"],
   ["plimsoll.project", "linkage"],
   ["cfo_one.project", "linkage"],
   ["project_key", "linkage"],
@@ -220,6 +252,8 @@ const RECORD_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
 const RESOURCE_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
   ["service.name", "component"],
   ["service.version", "version"],
+  ["cursor.surface", "classification"],
+  ["cursor.entrypoint", "classification"],
 ];
 
 const GENERATED_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
