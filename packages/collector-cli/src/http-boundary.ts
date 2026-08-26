@@ -129,7 +129,11 @@ export function assertNoBrowserOrigin(request: http.IncomingMessage) {
 }
 
 function producerSourceHeader(request: http.IncomingMessage) {
-  return firstHeader(request.headers["x-plimsoll-source"]);
+  const value = request.headers["x-plimsoll-source"];
+  return {
+    present: value !== undefined,
+    value: Array.isArray(value) ? undefined : value,
+  };
 }
 
 function parsedProducerSource(value: string | undefined): LocalProducerSource | undefined {
@@ -139,8 +143,8 @@ function parsedProducerSource(value: string | undefined): LocalProducerSource | 
 
 export function requireOtlpSource(request: http.IncomingMessage): LocalProducerSource {
   const claimed = producerSourceHeader(request);
-  if (!claimed) throw new HttpBoundaryRejection("source_required", 401);
-  const parsed = parsedProducerSource(claimed);
+  if (!claimed.present) throw new HttpBoundaryRejection("source_required", 401);
+  const parsed = parsedProducerSource(claimed.value);
   if (!parsed) throw new HttpBoundaryRejection("source_not_allowed", 401);
   return parsed;
 }
@@ -150,8 +154,8 @@ export function assertHookSource(
   pathSource: LocalProducerSource,
 ) {
   const claimed = producerSourceHeader(request);
-  if (!claimed) return;
-  const parsed = parsedProducerSource(claimed);
+  if (!claimed.present) return;
+  const parsed = parsedProducerSource(claimed.value);
   if (!parsed) throw new HttpBoundaryRejection("source_not_allowed", 401);
   if (parsed !== pathSource) throw new HttpBoundaryRejection("source_mismatch", 401);
 }
