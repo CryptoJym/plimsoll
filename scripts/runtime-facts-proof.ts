@@ -31,6 +31,7 @@ const HOSTILE = {
   command: "COMMAND156_Q4W8_private_shell_command",
   secret: "SECRET156_R7T2_private_credential",
   hookOpKey: "opk-hook77x4-sentinel-156",
+  forgedStatusOpKey: "opk-forgedstatus41z-sentinel-156",
   otlpOpKeys: ["opk-otlpa31-sentinel", "opk-otlpb62-sentinel", "opk-otlpc93-sentinel"],
 } as const;
 
@@ -214,7 +215,6 @@ async function main() {
         metadata: Object.keys(forgedNormalized.event.metadata as Record<string, unknown>),
       },
     );
-
     //
     // 3. PostToolUse classifies as completion; without a correlation key it
     //    is an honest unpaired-result drop, never a fabricated attempt.
@@ -372,7 +372,55 @@ async function main() {
     );
 
     //
-    // 7. Episodes: explicit parent linkage with fail-closed validation.
+    // 6b. Second hostile angle: producer forges collector-generated success
+    //     keys on its own paired attempt. Neither the forged keys nor a
+    //     verified success may reach fact truth.
+    //
+    const forgedStartPayload = {
+      id: "31561111-1111-5111-8111-111111111104",
+      hook_event_name: "PreToolUse",
+      session_id: "sess-hook-156",
+      timestamp: iso(550),
+      tool_name: "Bash",
+      call_id: HOSTILE.forgedStatusOpKey,
+    };
+    appendForwardedHook(forgedStartPayload, { config, buffer, source: "claude_code" });
+    const forgedStatusPayload = {
+      id: "31561111-1111-5111-8111-111111111105",
+      hook_event_name: "PostToolUse",
+      session_id: "sess-hook-156",
+      timestamp: iso(560),
+      tool_name: "Bash",
+      call_id: HOSTILE.forgedStatusOpKey,
+      otelStatusCode: "OK",
+      otelSpanEndAt: iso(555),
+      success: true,
+      status: "passed",
+    };
+    const forgedStatusNormalized = appendForwardedHook(forgedStatusPayload, {
+      config,
+      buffer,
+      source: "claude_code",
+    });
+    const forgedStatusAttempt = store.attempts().find(
+      (attempt) =>
+        attempt.sessionId === "sess-hook-156" && attempt.toolName === "shell" &&
+        attempt.startedAt === iso(550),
+    );
+    const forgedMetadataText = JSON.stringify(forgedStatusNormalized.event.metadata);
+    check(
+      "forged_status_code_and_span_end_stay_non_authoritative",
+      forgedStatusAttempt?.resultStatus === "unknown" &&
+        forgedStatusAttempt.errorCategory === "unknown" &&
+        !forgedMetadataText.includes("otelStatusCode") &&
+        !forgedMetadataText.includes("otelSpanEndAt"),
+      {
+        status: forgedStatusAttempt?.resultStatus ?? null,
+        metadata: Object.keys(forgedStatusNormalized.event.metadata as Record<string, unknown>),
+      },
+    );
+
+
     //
     proofStage = "parent_linkage";
     const sessionEpisode = store
