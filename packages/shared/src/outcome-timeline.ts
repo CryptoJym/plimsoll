@@ -299,7 +299,25 @@ export function derivePullOutcomeTimeline(input: {
           row.repositoryExternalId === repositoryExternalId &&
           (!row.pullExternalId || row.pullExternalId === pullExternalId),
       );
-      const providerCoverageComplete = relevantCoverage.every((row) => row.status === "complete");
+      // Coverage is append-only across retry runs. A prior failed observation
+      // must not poison a pull after a later observation covers the same
+      // dimension successfully; the caller supplies observations in durable
+      // replay order, so the last observation wins per dimension.
+      const latestCoverage = new Map<OutcomeTimelineCoverage["dimension"], OutcomeTimelineCoverage>();
+      for (const row of relevantCoverage) latestCoverage.set(row.dimension, row);
+      const checkCoverageDimensions = new Set<OutcomeTimelineCoverage["dimension"]>([
+        "pull",
+        "revisions",
+        "checks",
+        "required_checks",
+      ]);
+      const providerCoverageComplete = [...latestCoverage.entries()]
+        .filter(([dimension]) => checkCoverageDimensions.has(dimension))
+        .every(([, row]) => row.status === "complete");
+      const reworkCoverageComplete = ["timeline_events", "reverts"].every((dimension) => {
+        const row = latestCoverage.get(dimension as OutcomeTimelineCoverage["dimension"]);
+        return !row || row.status === "complete";
+      });
       const checkStates = new Map<string, ReturnType<typeof checkStateForSha>>();
       if (policy?.length) {
         for (const revision of revisions) {
@@ -436,7 +454,9 @@ export function derivePullOutcomeTimeline(input: {
         correctionLoops: checkMetricsKnown ? correctionLoops : null,
         reviewCorrections,
         greenMultiCommitWithoutRework: checkMetricsKnown
-          ? allKnownGreen && correctionLoops.length === 0 && rework.every((signal) => !signal.inWindow)
+          ? reworkCoverageComplete
+            ? allKnownGreen && correctionLoops.length === 0 && rework.every((signal) => !signal.inWindow)
+            : null
           : null,
         rework,
       };
