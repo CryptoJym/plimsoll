@@ -1,0 +1,11 @@
+{
+  "comment": "Issue #171 Studio 3 preflight while the SSH mapping is still missing. Valid record; derived status MUST be BLOCKED_MISSING_SSH_MAPPING and canary progression refused.",
+  "preflight": {
+    "schema": "plimsoll.studio3-preflight.v1",
+    "machineKeyHash": "d91220310a6805c1026084da73fd69a8a7f6cec002fdee867974f8e651c02deb",
+    "osPlatform": "linux-x64-ubuntu24",
+    "plimsollVersion": "0.1.0",
+    "providerVersions": {},
+    "sshMapping": "missing"
+  }
+}

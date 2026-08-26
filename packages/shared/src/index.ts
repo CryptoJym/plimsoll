@@ -12,3 +12,4 @@ export * from "./lane-receipts";
 export * from "./fleet-operations";
 export * from "./capacity";
 export * from "./provider-capacity-snapshot";
+export * from "./release-qualification";

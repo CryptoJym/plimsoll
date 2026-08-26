@@ -1,0 +1,18 @@
+{
+  "comment": "Issue #171 hostile: a receipt claiming noInstall=false must be refused — a non-isolated/non-read-only run cannot be laundered into an isolated-home compatibility receipt.",
+  "receipt": {
+    "schema": "plimsoll.canary-compatibility-receipt.v1",
+    "machineRole": "studio0",
+    "machineKeyHash": "9b0ef79e8117fb43fe3428c8a8712f88066de54ca569e46b4d344f916f12525e",
+    "osPlatform": "darwin-arm64-macos26",
+    "plimsollVersion": "0.1.0",
+    "providerVersions": {},
+    "attestations": {
+      "isolatedHome": true,
+      "readOnly": true,
+      "noInstall": false,
+      "noServiceActivation": true
+    },
+    "result": "compatible"
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "comment": "Issue #171 Studio0 isolated-home read-only compatibility receipt. machineKeyHash is the SHA-256 of a synthetic local key label; no hostname, username, or path.",
+  "receipt": {
+    "schema": "plimsoll.canary-compatibility-receipt.v1",
+    "machineRole": "studio0",
+    "machineKeyHash": "9b0ef79e8117fb43fe3428c8a8712f88066de54ca569e46b4d344f916f12525e",
+    "osPlatform": "darwin-arm64-macos26",
+    "plimsollVersion": "0.1.0",
+    "providerVersions": {
+      "codex_cli": "0.55.0-synthetic",
+      "claude_code": "2.0.0-synthetic"
+    },
+    "attestations": {
+      "isolatedHome": true,
+      "readOnly": true,
+      "noInstall": true,
+      "noServiceActivation": true
+    },
+    "result": "compatible"
+  }
+}

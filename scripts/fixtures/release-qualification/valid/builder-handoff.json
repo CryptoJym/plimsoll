@@ -1,0 +1,20 @@
+{
+  "comment": "Issue #171 valid builder handoff. Synthetic SHAs/digests only — nothing here identifies a real commit, artifact, person, or machine.",
+  "handoff": {
+    "laneId": "lane-171-first-signed-artifact",
+    "builderActor": "builder-a",
+    "baseSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "headSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "changedFiles": [
+      "packages/shared/src/release-qualification.ts",
+      "scripts/release-qualification-proof.ts"
+    ],
+    "testReceipt": { "suite": "pnpm-proof-release-qualification", "passed": true },
+    "fixtureFingerprint": "sha256:b23ee42fd85d405dcd43cd3e5c5405200e21fb9e745ef2da14db7aa5bd7a6be1",
+    "unresolvedFindings": [],
+    "artifactDigest": "sha256:13051e349c6f87a0f83427b2d742806fc8e01699c7429ce5b94acd0cece66dbc",
+    "configFingerprint": "sha256:7412b0f22fb8f3e952e3cb17ee3dfd2e480c80f8622467ae605b5984ae6a9341",
+    "dependencyFingerprint": "sha256:f51fc6e618330f1ca0845109b9241c20fde2bbe7bf8a6cb9b234188ad782df23",
+    "schemaFingerprint": "sha256:973adfab532b32f3841e0c1aebc9573f293f88d2844abca981b813370c750531"
+  }
+}
