@@ -245,10 +245,10 @@ export class OutcomeTimelineStore {
   coverage(runId?: string): OutcomeTimelineCoverage[] {
     const rows = runId
       ? (this.database
-          .prepare("select canonical_json as canonicalJson from outcome_timeline_coverage where run_id = ? order by id")
+          .prepare("select canonical_json as canonicalJson from outcome_timeline_coverage where run_id = ? order by rowid")
           .all(runId) as Array<{ canonicalJson: string }>)
       : (this.database
-          .prepare("select canonical_json as canonicalJson from outcome_timeline_coverage order by id")
+          .prepare("select canonical_json as canonicalJson from outcome_timeline_coverage order by rowid")
           .all() as Array<{ canonicalJson: string }>);
     return rows.map((row) => outcomeTimelineCoverageSchema.parse(JSON.parse(row.canonicalJson)));
   }

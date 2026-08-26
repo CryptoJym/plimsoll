@@ -73,7 +73,7 @@ function completeCoverage(
     (row) => row.repositoryExternalId === repositoryExternalId &&
       row.pullExternalId === pullExternalId && row.dimension === dimension,
   );
-  return rows.length > 0 && rows.every((row) => row.status === "complete");
+  return rows.length > 0 && rows.at(-1)?.status === "complete";
 }
 
 export function deriveOutcomePerformanceRecords(input: {

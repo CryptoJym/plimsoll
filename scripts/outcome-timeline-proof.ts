@@ -197,6 +197,187 @@ async function main() {
     { cases: incompleteDerivations },
   );
 
+  const coverageRecovery = [
+    {
+      runId: "coverage-recovery-old",
+      repositoryExternalId: "github:repository:fixture/repo",
+      pullExternalId: "github:pull:PR1",
+      dimension: "checks" as const,
+      status: "incomplete" as const,
+      reason: "provider_failure" as const,
+    },
+    {
+      runId: "coverage-recovery-new",
+      repositoryExternalId: "github:repository:fixture/repo",
+      pullExternalId: "github:pull:PR1",
+      dimension: "checks" as const,
+      status: "complete" as const,
+      reason: "complete" as const,
+    },
+    ...["pull", "revisions", "required_checks"].map((dimension) => ({
+      runId: `coverage-recovery-${dimension}`,
+      repositoryExternalId: "github:repository:fixture/repo",
+      pullExternalId: "github:pull:PR1",
+      dimension: dimension as "pull" | "revisions" | "required_checks",
+      status: "complete" as const,
+      reason: "complete" as const,
+    })),
+  ] satisfies OutcomeTimelineCoverage[];
+  const recovered = derivePullOutcomeTimeline({
+    facts: facts.filter((fact) => fact.pullNumber === 1),
+    coverage: coverageRecovery,
+    requiredChecks: { names: fixture.requiredChecks },
+    reworkWindowDays: fixture.reworkWindowDays,
+  })[0]!;
+  prove(
+    "newer_complete_coverage_reopens_metrics_after_prior_provider_failure",
+    recovered.coverage === "complete" && recovered.firstPassSuccess === false && recovered.retryEpisodes?.length === 1,
+    { recovered },
+  );
+  const coverageRecoveryStore = new OutcomeTimelineStore(path.join(sandbox, "coverage-recovery.sqlite"));
+  coverageRecoveryStore.appendFacts(facts.filter((fact) => fact.pullNumber === 1), "2026-07-30T00:00:00.000Z");
+  const coverageRecoveryRows = ["pull", "revisions", "required_checks"].map((dimension) => ({
+    runId: `persisted-recovery-${dimension}`,
+    repositoryExternalId: "github:repository:fixture/repo",
+    pullExternalId: "github:pull:PR1",
+    dimension: dimension as "pull" | "revisions" | "required_checks",
+    status: "complete" as const,
+    reason: "complete" as const,
+  }));
+  coverageRecoveryStore.recordCoverage([
+    ...coverageRecoveryRows,
+    {
+      runId: "persisted-recovery-old-checks",
+      repositoryExternalId: "github:repository:fixture/repo",
+      pullExternalId: "github:pull:PR1",
+      dimension: "checks" as const,
+      status: "incomplete" as const,
+      reason: "provider_failure" as const,
+    },
+  ]);
+  const persistedUnknown = coverageRecoveryStore.materializePerformance({
+    repositoryExternalId: "github:repository:fixture/repo",
+    requiredChecks: { names: fixture.requiredChecks },
+    reworkWindowDays: fixture.reworkWindowDays,
+    now: "2026-07-30T00:00:00.000Z",
+  });
+  coverageRecoveryStore.recordCoverage([
+    {
+      runId: "persisted-recovery-new-checks",
+      repositoryExternalId: "github:repository:fixture/repo",
+      pullExternalId: "github:pull:PR1",
+      dimension: "checks",
+      status: "complete",
+      reason: "complete",
+    },
+  ]);
+  const persistedRecovered = coverageRecoveryStore.materializePerformance({
+    repositoryExternalId: "github:repository:fixture/repo",
+    requiredChecks: { names: fixture.requiredChecks },
+    reworkWindowDays: fixture.reworkWindowDays,
+    now: "2026-07-30T01:00:00.000Z",
+  });
+  const persistedRecord = coverageRecoveryStore.performanceRecords()[0]!;
+  prove(
+    "persisted_performance_rederives_after_later_coverage_recovery",
+    persistedUnknown.inserted === 1 &&
+      persistedRecord.checkOutcome === "FIRST_PASS_FAILED" &&
+      persistedRecovered.updated === 1 &&
+      persistedRecovered.generation === 2,
+    { persistedUnknown, persistedRecovered, persistedRecord },
+  );
+  coverageRecoveryStore.close();
+  const checkKnownReworkUnknown = derivePullOutcomeTimeline({
+    facts: facts.filter((fact) => fact.pullNumber === 4),
+    coverage: [
+      ...["pull", "revisions", "checks", "required_checks"].map((dimension) => ({
+        runId: `check-known-${dimension}`,
+        repositoryExternalId: "github:repository:fixture/repo",
+        pullExternalId: "github:pull:PR4",
+        dimension: dimension as "pull" | "revisions" | "checks" | "required_checks",
+        status: "complete" as const,
+        reason: "complete" as const,
+      })),
+      {
+        runId: "rework-incomplete",
+        repositoryExternalId: "github:repository:fixture/repo",
+        pullExternalId: "github:pull:PR4",
+        dimension: "reverts" as const,
+        status: "incomplete" as const,
+        reason: "pagination_limit" as const,
+      },
+    ],
+    requiredChecks: { names: fixture.requiredChecks },
+    reworkWindowDays: fixture.reworkWindowDays,
+  })[0]!;
+  prove(
+    "incomplete_rework_coverage_does_not_hide_known_checks_or_claim_no_rework",
+    checkKnownReworkUnknown.coverage === "complete" &&
+      checkKnownReworkUnknown.firstPassSuccess === true &&
+      checkKnownReworkUnknown.greenMultiCommitWithoutRework === null,
+    { checkKnownReworkUnknown },
+  );
+
+  class CoverageBoundaryAdapter implements GitHubOutcomeTimelineAdapter {
+    async listChangedPullsPage() {
+      return {
+        items: [
+          {
+            number: 21,
+            pullExternalId: "github:pull:COVERAGE-BOUNDARY",
+            updatedAt: "2026-07-21T00:00:00.000Z",
+          },
+        ],
+        nextCursor: null,
+        etag: '"coverage-boundary"',
+        rateReceipt: null,
+        coverage: { dimension: "changed_pulls" as const, status: "complete" as const, reason: "complete" as const },
+      };
+    }
+    async collectPull(input: { repositoryExternalId: string; pull: ChangedPullRef }): Promise<PullCollection> {
+      return {
+        facts: [
+          {
+            schemaVersion: 1,
+            externalId: input.pull.pullExternalId,
+            repositoryExternalId: input.repositoryExternalId,
+            pullExternalId: input.pull.pullExternalId,
+            pullNumber: input.pull.number,
+            kind: "pull",
+            createdAt: input.pull.updatedAt,
+          },
+        ],
+        coverage: [{ dimension: "checks", status: "incomplete", reason: "provider_failure" }],
+        rateReceipt: null,
+        // The runner must not trust this boolean when coverage is incomplete.
+        retryable: false,
+      };
+    }
+  }
+  const coverageBoundaryStore = new OutcomeTimelineStore(path.join(sandbox, "coverage-boundary.sqlite"));
+  const coverageBoundaryRun = await runOutcomeTimelineBackfill({
+    owner: "fixture",
+    repo: "coverage-boundary",
+    since: "2026-07-01T00:00:00.000Z",
+    until: "2026-07-30T00:00:00.000Z",
+    maxPulls: 1,
+    store: coverageBoundaryStore,
+    adapter: new CoverageBoundaryAdapter(),
+    requiredChecks: { names: ["ci"] },
+    runId: "coverage-boundary-run",
+    now: () => "2026-07-30T00:00:00.000Z",
+  });
+  const coverageBoundaryState = coverageBoundaryStore.readState("github:repository:fixture/coverage-boundary")!;
+  prove(
+    "incomplete_pull_coverage_keeps_pending_pull_for_deterministic_retry",
+    coverageBoundaryRun.processedPulls === 0 &&
+      coverageBoundaryRun.status === "incomplete" &&
+      coverageBoundaryState.completedThrough === null &&
+      coverageBoundaryState.activeWindow?.pendingPulls[0]?.number === 21,
+    { receipt: coverageBoundaryRun, state: coverageBoundaryState },
+  );
+  coverageBoundaryStore.close();
+
   const strictPrivacy = pullTimelineFactSchema.safeParse({
     ...facts[0],
     title: "must never become canonical",

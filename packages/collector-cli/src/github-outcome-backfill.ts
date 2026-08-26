@@ -1139,10 +1139,15 @@ export async function runOutcomeTimelineBackfill(input: {
       );
     }
     runCoverage.push(...rows);
+    // Coverage is authoritative even when an injected/provider adapter gets
+    // its convenience retry flag wrong. Do not consume a pending PR or
+    // advance the window while any requested dimension is uncovered.
+    const pullRetryable =
+      collection.retryable || collection.coverage.some((observation) => observation.status !== "complete");
     const nextState: OutcomeTimelineBackfillState = {
       ...state,
       lastRateReceipt: collection.rateReceipt ?? state.lastRateReceipt,
-      reworkWatch: collection.retryable
+      reworkWatch: pullRetryable
         ? state.reworkWatch
         : updateReworkWatch(
             state.reworkWatch,
@@ -1152,7 +1157,7 @@ export async function runOutcomeTimelineBackfill(input: {
           ),
       activeWindow: {
         ...state.activeWindow,
-        pendingPulls: collection.retryable
+        pendingPulls: pullRetryable
           ? state.activeWindow.pendingPulls
           : state.activeWindow.pendingPulls.slice(1),
       },
@@ -1166,7 +1171,7 @@ export async function runOutcomeTimelineBackfill(input: {
     state = nextState;
     insertedFacts += appended.inserted;
     duplicateFacts += appended.duplicates;
-    if (collection.retryable) {
+    if (pullRetryable) {
       stoppedForRetry = true;
     } else {
       processedPulls += 1;
