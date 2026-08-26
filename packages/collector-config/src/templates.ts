@@ -42,7 +42,7 @@ function hookForwardCommand(options: ToolConfigOptions, source: "claude-code" | 
   // curl into the local receiver keeps per-event overhead at ~10ms; spawning
   // pnpm/node per hook event costs 1-2s per tool call across the whole fleet.
   const tokenHeader = options.codexProducerToken
-    ? ` -H 'x-plimsoll-token: ${options.codexProducerToken}'`
+    ? ` -H ${shellQuote(`x-plimsoll-token: ${options.codexProducerToken}`)}`
     : "";
   return `curl -s --max-time 2 -X POST -H 'Content-Type: application/json'${tokenHeader} --data-binary @- http://127.0.0.1:${port(options)}/hooks/${source} || true`;
 }

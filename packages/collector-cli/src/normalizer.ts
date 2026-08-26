@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 
 import {
+  ANALYTICAL_METADATA_LIMITS,
   DEFAULT_POLICY,
   GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
   admittedMetadataAttributes,
@@ -124,13 +125,19 @@ function collectOtelSignals(value: unknown, signals: OTelSignals) {
     const valueAtKey = record[key];
     if (typeof valueAtKey === "string" || typeof valueAtKey === "number") {
       const timestamp = unixNanoToIso(valueAtKey);
-      if (timestamp) signals.timestamps.push(timestamp);
+      if (timestamp && timestampIsNotFromTheFuture(timestamp)) signals.timestamps.push(timestamp);
     }
   }
 
   for (const nested of Object.values(record)) {
     collectOtelSignals(nested, signals);
   }
+}
+
+function timestampIsNotFromTheFuture(value: string) {
+  const parsedAt = Date.parse(value);
+  return !Number.isNaN(parsedAt) &&
+    parsedAt <= Date.now() + ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs;
 }
 
 function extractOtelSignals(payload: Record<string, unknown>): OTelSignals {

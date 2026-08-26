@@ -96,6 +96,17 @@ export type MetadataStringKind =
 
 export type OtlpAttributeSurface = "record" | "resource" | "scope";
 
+/** Hard limits for producer-controlled analytical values and timestamps. */
+export const ANALYTICAL_METADATA_LIMITS = Object.freeze({
+  // Keeps values inside JavaScript's exact integer range and SQLite's integer
+  // range while rejecting numeric bombs before they reach event construction.
+  maxSafeNumericValue: Number.MAX_SAFE_INTEGER,
+  // A clock-skewed producer may be a few minutes ahead; far-future values are
+  // not trustworthy event timestamps and are suppressed by the same validator
+  // used by both hook and OTLP capture.
+  maxFutureTimestampSkewMs: 5 * 60 * 1000,
+});
+
 export type MetadataKeyDisposition =
   | {
       valueKind: "analytical_scalar";
@@ -511,17 +522,27 @@ export function safeMetadataStringAttribute(key: string, value: unknown) {
   if (kind === "timestamp") {
     if (typeof value !== "string" || hasUnsafeMetadataString(value)) return null;
     const candidate = value.trim();
-    return candidate.length <= 80 && !Number.isNaN(Date.parse(candidate)) ? candidate : null;
+    const parsedAt = Date.parse(candidate);
+    return candidate.length <= 80 &&
+      !Number.isNaN(parsedAt) &&
+      parsedAt <= Date.now() + ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs
+      ? candidate
+      : null;
   }
   return null;
 }
 
 function finiteNonnegative(value: unknown) {
-  if (typeof value === "number") return Number.isFinite(value) && value >= 0;
+  if (typeof value === "number") {
+    return Number.isFinite(value) &&
+      value >= 0 &&
+      value <= ANALYTICAL_METADATA_LIMITS.maxSafeNumericValue;
+  }
   return (
     typeof value === "string" &&
     /^(?:0|[1-9][0-9]*)(?:\.[0-9]+)?$/.test(value) &&
-    Number.isFinite(Number(value))
+    Number.isFinite(Number(value)) &&
+    Number(value) <= ANALYTICAL_METADATA_LIMITS.maxSafeNumericValue
   );
 }
 

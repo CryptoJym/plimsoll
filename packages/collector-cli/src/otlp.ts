@@ -1,6 +1,7 @@
 import {
   DEFAULT_POLICY,
   GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
+  ANALYTICAL_METADATA_LIMITS,
   admittedMetadataAttributes,
   aiInteractionEventSchema,
   canonicalizeSuppressionReceipts,
@@ -106,16 +107,23 @@ function recordTimestamp(record: Record<string, unknown>, attrs: Record<string, 
     const value = record[key];
     if (typeof value === "string" || typeof value === "number") {
       const iso = unixNanoToIso(value);
-      if (iso) return iso;
+      if (iso && timestampIsNotFromTheFuture(iso)) return iso;
     }
   }
 
   const attrTimestamp = stringField(attrs, ["event.timestamp", "timestamp"]);
   if (attrTimestamp && !Number.isNaN(Date.parse(attrTimestamp))) {
-    return new Date(attrTimestamp).toISOString();
+    const normalized = new Date(attrTimestamp).toISOString();
+    if (timestampIsNotFromTheFuture(normalized)) return normalized;
   }
 
   return new Date().toISOString();
+}
+
+function timestampIsNotFromTheFuture(value: string) {
+  const parsedAt = Date.parse(value);
+  return !Number.isNaN(parsedAt) &&
+    parsedAt <= Date.now() + ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs;
 }
 
 function intTokens(value: number | undefined) {
@@ -124,6 +132,10 @@ function intTokens(value: number | undefined) {
 }
 
 function eventSourceFor(attrs: Record<string, unknown>, fallback: ToolSource | undefined, serviceName: string | undefined): ToolSource {
+  // Transport authentication is authoritative. A producer-controlled
+  // service.name must never turn an authenticated Codex batch into Claude
+  // events (or vice versa); only legacy/unknown callers may infer a source.
+  if (fallback === "claude_code" || fallback === "codex") return fallback;
   const service = (serviceName ?? "").toLowerCase();
   if (service.includes("claude")) return "claude_code";
   if (service.includes("codex")) return "codex";
@@ -468,11 +480,14 @@ function buildSpanEvent(
   // Collector-generated completion timestamp (issue #156): lets runtime fact
   // promotion close attempt timing from the span's own end. Producers cannot
   // set this key (generated dispositions are rejected on OTLP surfaces).
-  const spanEndedAt = unixNanoToIso(
+  const rawSpanEndedAt = unixNanoToIso(
     typeof safeSpan.endTimeUnixNano === "string" || typeof safeSpan.endTimeUnixNano === "number"
       ? safeSpan.endTimeUnixNano
       : "",
   );
+  const spanEndedAt = rawSpanEndedAt && timestampIsNotFromTheFuture(rawSpanEndedAt)
+    ? rawSpanEndedAt
+    : undefined;
 
   const event = aiInteractionEventSchema.parse({
     actorId: stringField(attrs, [...usageFieldKeys.actorId]),
