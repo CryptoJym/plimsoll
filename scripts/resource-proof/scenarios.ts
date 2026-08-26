@@ -24,6 +24,7 @@ import {
   collectorHome,
 } from "../../packages/collector-cli/src/config";
 import { LAUNCH_AGENT_LABEL } from "../../packages/collector-cli/src/launch-agent";
+import { readLocalIngestAuth } from "../../packages/collector-cli/src/local-auth";
 import {
   CoalescingMaintenanceScheduler,
   CollectorMaintenance,
@@ -3325,7 +3326,13 @@ async function attemptDuplicateStartSingleOwnerContract(
     const pidRecordAfterLoser = fs.readFileSync(pidPath, "utf8");
 
     const statusResponse = await withSymbolicDeadline(
-      fetch(`http://127.0.0.1:${port}/status`),
+      fetch(`http://127.0.0.1:${port}/status`, {
+        // Issue 0056 (#104): enforcing daemons gate status behind the
+        // provisioned management credential from their own home.
+        headers: readLocalIngestAuth(sandbox.plimsollHome)
+          ? { "x-plimsoll-token": readLocalIngestAuth(sandbox.plimsollHome)!.managementRead }
+          : {},
+      }),
       10_000,
       "StatusReadinessTimeout",
     );

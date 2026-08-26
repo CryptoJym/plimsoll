@@ -30,6 +30,7 @@ import {
   collectorConfigPath,
   collectorLogPath,
 } from "../packages/collector-cli/src/config";
+import { readLocalIngestAuth } from "../packages/collector-cli/src/local-auth";
 import {
   FilesystemLifecycleAdapter,
   type LifecycleServiceAdapter,
@@ -88,9 +89,21 @@ function reserveLoopbackPort(): Promise<number> {
   });
 }
 
-function fetchStatus(port: number): Promise<Record<string, unknown> | null> {
+function fetchStatus(
+  port: number,
+  managementToken?: string,
+): Promise<Record<string, unknown> | null> {
   return new Promise((resolve) => {
-    const request = http.get(`http://127.0.0.1:${port}/status`, { timeout: 3_000 }, (response) => {
+    // Issue 0056 (#104): an enforcing daemon gates status behind the
+    // provisioned management credential, which this proof reads from the
+    // daemon's own isolated home.
+    const headers = managementToken
+      ? { "x-plimsoll-token": managementToken }
+      : {};
+    const request = http.get(
+      `http://127.0.0.1:${port}/status`,
+      { timeout: 3_000, headers },
+      (response) => {
       let body = "";
       response.on("data", (chunk) => {
         body += chunk;
@@ -519,7 +532,8 @@ async function portOwnershipProof() {
   });
 
   if (activeSeen) {
-    const statusBody = await fetchStatus(port);
+    const daemonCredential = readLocalIngestAuth(homeA);
+    const statusBody = await fetchStatus(port, daemonCredential?.managementRead);
     record(
       "daemon_attests_exact_home_identity_over_status_endpoint",
       statusBody?.homeIdentityHash === collectorHomeIdentityHash(homeA),

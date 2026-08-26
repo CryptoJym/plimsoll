@@ -42,6 +42,16 @@ export function appendForwardedHook(
   const cwd = extractRepoContextCwd(payload);
   if (cwd) attachRepoContextSidecar(canonical.event, canonical.event.id, cwd);
 
-  options.buffer.append(canonical.event, canonical.suppressedFields);
-  return canonical;
+  const appended = options.buffer.append(
+    canonical.event,
+    canonical.suppressedFields,
+    { integrityReceipt: true },
+  );
+  return {
+    ...canonical,
+    ...(appended.deduplicated ? { deduplicated: true as const } : {}),
+    ...(appended.collisionQuarantined
+      ? { collisionQuarantined: true as const }
+      : {}),
+  };
 }

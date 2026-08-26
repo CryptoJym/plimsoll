@@ -68,6 +68,10 @@ import {
 } from "./config";
 import { appendForwardedHook } from "./forwarder";
 import {
+  loadOrCreateLocalIngestAuth,
+  readLocalIngestAuth,
+} from "./local-auth";
+import {
   installLaunchAgent,
   inspectLaunchAgentManifest,
   LAUNCH_AGENT_LABEL,
@@ -854,7 +858,7 @@ function launchAgentUnloadReceipt(
   };
 }
 
-async function checkCollectorConnectivity(port: number) {
+async function checkCollectorConnectivity(port: number, managementToken?: string) {
   const controller = new AbortController();
   const timeoutMs = Number(process.env.PLIMSOLL_COLLECTOR_DOCTOR_TIMEOUT_MS ?? "3000");
   const timeout = setTimeout(() => controller.abort(), Number.isFinite(timeoutMs) ? timeoutMs : 3000);
@@ -862,6 +866,9 @@ async function checkCollectorConnectivity(port: number) {
   try {
     const response = await fetch(`http://127.0.0.1:${port}/status`, {
       signal: controller.signal,
+      // Issue 0056 (#104): enforcing daemons gate status behind the
+      // provisioned management credential; doctor presents it when present.
+      headers: managementToken ? { "x-plimsoll-token": managementToken } : {},
     });
     let body: Record<string, unknown> | null = null;
     try {
@@ -1500,6 +1507,9 @@ async function main() {
     const server = createCollectorServer(config, buffer, {
       runtimeIdentity,
       homeIdentityHash: collectorHomeIdentityHash(collectorHome()),
+      // Issue 0056 (#104): the daemon provisions (first start) or loads the
+      // Plimsoll-local producer/management credentials and enforces them.
+      localAuth: loadOrCreateLocalIngestAuth(collectorHome()),
       maintenanceStatus: () => ({
         boundary: maintenanceBoundary.status(),
         scheduler: scheduler?.status() ?? null,
@@ -2027,10 +2037,15 @@ async function main() {
     const dryRun = process.argv.includes("--dry-run");
     const claudeFile = argValue("--claude-settings") ?? path.join(os.homedir(), ".claude", "settings.json");
     const codexFile = argValue("--codex-config") ?? path.join(os.homedir(), ".codex", "config.toml");
+    // Setup is the installer: it provisions the Plimsoll-local credentials so
+    // generated tool configs bind each producer to its own source-bound token.
+    const localAuth = loadOrCreateLocalIngestAuth(collectorHome());
     const toolOptions = {
       repoRoot: process.cwd(),
       port: config.port,
       dataMode: config.policy.dataMode,
+      claudeCodeProducerToken: localAuth.claudeCodeProducer,
+      codexProducerToken: localAuth.codexProducer,
     };
     const claudeGenerated = generateClaudeCodeSettings(toolOptions);
     const codexToml = generateCodexConfigToml(toolOptions);
@@ -2162,15 +2177,27 @@ async function main() {
     const pidPath = collectorLogPath("collector.pid");
     const claudePath = path.join(os.homedir(), ".claude", "settings.json");
     const codexPath = path.join(os.homedir(), ".codex", "config.toml");
+    // Doctor is read-only: it compares against provisioned credentials when
+    // they exist and never creates the credential file as a side effect.
+    const localAuth = readLocalIngestAuth(collectorHome());
     const toolOptions = {
       repoRoot: process.cwd(),
       port: config.port,
       dataMode: config.policy.dataMode,
+      ...(localAuth
+        ? {
+            claudeCodeProducerToken: localAuth.claudeCodeProducer,
+            codexProducerToken: localAuth.codexProducer,
+          }
+        : {}),
     };
     const claude = readClaudeTelemetryConfig(claudePath, generateClaudeCodeSettings(toolOptions));
     const codex = readCodexTelemetryConfig(codexPath, generateCodexConfigToml(toolOptions));
     const launchAgent = readLaunchAgentState(plistPath);
-    const connectivity = await checkCollectorConnectivity(config.port);
+    const connectivity = await checkCollectorConnectivity(
+      config.port,
+      readLocalIngestAuth(collectorHome())?.managementRead,
+    );
     const pidRead = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);
     const pidCleanupReconciliation = reconcileCollectorPidCleanupState(
       pidPath,
@@ -2704,12 +2731,20 @@ async function main() {
 
   if (command === "generate-config") {
     const tool = process.argv[3] ?? "all";
+    // Printing stays side-effect free: tokens appear only when provisioned.
+    const localAuth = readLocalIngestAuth(collectorHome());
     const options = {
       repoRoot: optionValue("--repo-root") ?? process.cwd(),
       port: config.port,
       dataMode: flag("--evidence") ? "evidence" as const : config.policy.dataMode,
       confirmEvidence: flag("--confirm-evidence"),
       pnpmCommand: optionValue("--pnpm") ?? "pnpm",
+      ...(localAuth
+        ? {
+            claudeCodeProducerToken: localAuth.claudeCodeProducer,
+            codexProducerToken: localAuth.codexProducer,
+          }
+        : {}),
     };
 
     if (tool === "claude-code") {

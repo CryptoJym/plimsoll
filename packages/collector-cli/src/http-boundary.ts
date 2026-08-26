@@ -24,6 +24,11 @@ export const LOCAL_HTTP_LIMITS = Object.freeze({
   otlpAttributesPerContainer: 128,
   otlpAttributesTotal: 16_384,
   requestDeadlineMs: 1_500,
+  // Issue 0056 (#104): per-source admission ceiling before any body decode or
+  // ledger work. Generous for real tool cadence (hooks + periodic OTLP
+  // exports), yet bounds a flood so it cannot monopolize the event loop.
+  perSourceRequestsPerWindow: 600,
+  perSourceRateWindowMs: 60_000,
 });
 
 export type LocalProducerSource = "claude_code" | "codex";
@@ -44,14 +49,19 @@ export const HTTP_BOUNDARY_REASONS = [
   "invalid_json",
   "json_depth_exceeded",
   "json_node_limit_exceeded",
+  "management_credential_invalid",
+  "management_credential_required",
   "otlp_attribute_limit_exceeded",
   "otlp_record_limit_exceeded",
   "otlp_resource_limit_exceeded",
   "otlp_scope_limit_exceeded",
+  "producer_token_invalid",
+  "producer_token_required",
   "request_deadline_exceeded",
   "request_stream_error",
   "source_mismatch",
   "source_not_allowed",
+  "source_rate_limit_exceeded",
   "source_required",
   "storage_busy_retry",
   "unsupported_content_encoding",
@@ -397,4 +407,34 @@ export function assertBoundedOtlpCardinality(root: unknown) {
       stack.push(entry);
     }
   }
+}
+
+export type SourceRateLimiter = {
+  assertAdmissible: (source: LocalProducerSource) => void;
+};
+
+/**
+ * Fixed-window per-source admission counter. Keys are the closed
+ * LocalProducerSource set, so the table is bounded by construction; the
+ * check runs before body reads, decoding, or any ledger mutation.
+ */
+export function createSourceRateLimiter(
+  limit: number = LOCAL_HTTP_LIMITS.perSourceRequestsPerWindow,
+  windowMs: number = LOCAL_HTTP_LIMITS.perSourceRateWindowMs,
+): SourceRateLimiter {
+  const windows = new Map<LocalProducerSource, { windowStart: number; count: number }>();
+  return {
+    assertAdmissible(source) {
+      const nowMs = Date.now();
+      const entry = windows.get(source);
+      if (!entry || nowMs - entry.windowStart >= windowMs) {
+        windows.set(source, { windowStart: nowMs, count: 1 });
+        return;
+      }
+      if (entry.count >= Math.max(1, limit)) {
+        throw new HttpBoundaryRejection("source_rate_limit_exceeded", 429);
+      }
+      entry.count += 1;
+    },
+  };
 }

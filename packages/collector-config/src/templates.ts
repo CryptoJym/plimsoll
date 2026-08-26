@@ -8,6 +8,14 @@ export type ToolConfigOptions = {
   dataMode?: DataMode;
   confirmEvidence?: boolean;
   pnpmCommand?: string;
+  /**
+   * Issue 0056 (#104): Plimsoll-local producer credentials. When provided,
+   * generated configs bind each tool's exporter/hook traffic to its own
+   * source-bound token; absent, output stays byte-identical to the legacy
+   * tokenless generation.
+   */
+  claudeCodeProducerToken?: string;
+  codexProducerToken?: string;
 };
 
 function assertSupportedDataMode(options: ToolConfigOptions) {
@@ -33,7 +41,10 @@ function tomlString(value: string) {
 function hookForwardCommand(options: ToolConfigOptions, source: "claude-code" | "codex") {
   // curl into the local receiver keeps per-event overhead at ~10ms; spawning
   // pnpm/node per hook event costs 1-2s per tool call across the whole fleet.
-  return `curl -s --max-time 2 -X POST -H 'Content-Type: application/json' --data-binary @- http://127.0.0.1:${port(options)}/hooks/${source} || true`;
+  const tokenHeader = options.codexProducerToken
+    ? ` -H 'x-plimsoll-token: ${options.codexProducerToken}'`
+    : "";
+  return `curl -s --max-time 2 -X POST -H 'Content-Type: application/json'${tokenHeader} --data-binary @- http://127.0.0.1:${port(options)}/hooks/${source} || true`;
 }
 
 function port(options: ToolConfigOptions) {
@@ -44,6 +55,12 @@ export function generateClaudeCodeSettings(options: ToolConfigOptions) {
   assertSupportedDataMode(options);
 
   const hookUrl = `http://127.0.0.1:${port(options)}/hooks/claude-code`;
+  const otlpHeaders = options.claudeCodeProducerToken
+    ? `x-plimsoll-source=claude_code,x-plimsoll-token=${options.claudeCodeProducerToken}`
+    : "x-plimsoll-source=claude_code";
+  const hookHeaders = options.claudeCodeProducerToken
+    ? { "x-plimsoll-token": options.claudeCodeProducerToken }
+    : undefined;
 
   return {
     env: {
@@ -54,7 +71,7 @@ export function generateClaudeCodeSettings(options: ToolConfigOptions) {
       OTEL_EXPORTER_OTLP_ENDPOINT: `http://127.0.0.1:${port(options)}`,
       OTEL_EXPORTER_OTLP_LOGS_ENDPOINT: `http://127.0.0.1:${port(options)}/v1/logs`,
       OTEL_EXPORTER_OTLP_METRICS_ENDPOINT: `http://127.0.0.1:${port(options)}/v1/metrics`,
-      OTEL_EXPORTER_OTLP_HEADERS: "x-plimsoll-source=claude_code",
+      OTEL_EXPORTER_OTLP_HEADERS: otlpHeaders,
       OTEL_LOG_USER_PROMPTS: options.dataMode === "evidence" ? "1" : "0",
       OTEL_LOG_TOOL_DETAILS: options.dataMode === "evidence" ? "1" : "0",
       OTEL_LOG_TOOL_CONTENT: options.dataMode === "evidence" ? "1" : "0",
@@ -67,6 +84,7 @@ export function generateClaudeCodeSettings(options: ToolConfigOptions) {
             {
               type: "http",
               url: hookUrl,
+              ...(hookHeaders ? { headers: hookHeaders } : {}),
               timeout: 5,
             },
           ],
@@ -79,6 +97,7 @@ export function generateClaudeCodeSettings(options: ToolConfigOptions) {
             {
               type: "http",
               url: hookUrl,
+              ...(hookHeaders ? { headers: hookHeaders } : {}),
               timeout: 5,
             },
           ],
@@ -90,6 +109,7 @@ export function generateClaudeCodeSettings(options: ToolConfigOptions) {
             {
               type: "http",
               url: hookUrl,
+              ...(hookHeaders ? { headers: hookHeaders } : {}),
               timeout: 5,
             },
           ],
@@ -107,7 +127,9 @@ export function generateCodexConfigToml(options: ToolConfigOptions) {
   const exporterTable = (signalPath: string) => [
     `endpoint = ${tomlString(`http://127.0.0.1:${basePort}${signalPath}`)}`,
     'protocol = "json"',
-    'headers = { "x-plimsoll-source" = "codex" }',
+    options.codexProducerToken
+      ? `headers = { "x-plimsoll-source" = "codex", "x-plimsoll-token" = ${tomlString(options.codexProducerToken)} }`
+      : 'headers = { "x-plimsoll-source" = "codex" }',
   ];
 
   return [

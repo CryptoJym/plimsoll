@@ -4,6 +4,9 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 
+import { collectorHome } from "./config";
+import { readLocalIngestAuth } from "./local-auth";
+
 // Long enough for the existing synchronous ledger open/prune path, but finite:
 // launchd's throttled retry can recover an abandoned lock after two minutes.
 export const START_LOCK_LEASE_MS = 120_000;
@@ -1660,6 +1663,20 @@ function probeLoopbackPort(port: number, timeoutMs: number) {
   });
 }
 
+/**
+ * Issue 0056 (#104): lifecycle probes are the collector talking to itself.
+ * When credentials are provisioned, present the management credential so the
+ * enforcing daemon still classifies as "collector" instead of "unrelated".
+ */
+function lifecycleProbeHeaders(): Record<string, string> {
+  try {
+    const auth = readLocalIngestAuth(collectorHome());
+    return auth ? { "x-plimsoll-token": auth.managementRead } : {};
+  } catch {
+    return {};
+  }
+}
+
 export async function observeCollectorListener(
   port: number,
   options: { probeTimeoutMs?: number } = {},
@@ -1670,6 +1687,7 @@ export async function observeCollectorListener(
   try {
     const response = await fetch("http://127.0.0.1:" + port + "/status", {
       signal: controller.signal,
+      headers: lifecycleProbeHeaders(),
     });
     if (!response.ok) return { kind: "unrelated" };
     const body = (await response.json()) as { runtimeIdentity?: unknown };
