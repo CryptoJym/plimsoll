@@ -138,7 +138,7 @@ growth extends its high-water mark. Existing read-model rows remain untouched
 until one transaction atomically swaps the finalized replacement. This matters
 on the observed ledger, where a single session exceeds 230,000 rows.
 
-Legacy migration captures a raw rowid high-water without `COUNT(*)`, dual-writes new events, copies at most 1,000 rows per slice, then performs an independent bounded reference pass for all five windows. Reads switch only after reference totals, dirty sessions, and repair queues settle. Retention consumes the persisted parity marker but activation remains explicit and proof-gated.
+Legacy migration captures a raw rowid high-water without `COUNT(*)`, dual-writes new events, copies at most 1,000 rows per slice, then performs an independent bounded reference pass for all five windows. Reads switch only after reference totals, dirty sessions, and repair queues settle. Raw retention is independent of the persisted parity marker under #166; the retention pass remains bounded and records an explicit expiry receipt.
 
 The daemon accelerates only this initial migration with a cooperative duty
 cycle: up to 40 slices per 60-second scheduler run, a `setImmediate` yield
@@ -158,7 +158,8 @@ Tailers persist path-free activity aggregates. Snapshot/status health joins thos
 
 - Main dashboard and status refresh become constant-row reads with deterministic zero raw/filesystem request scans.
 - The dominant generic-span class is compressed by bounded batches instead of duplicating millions of indexed facts.
-- Raw TTL can later become independent of analytics because compact facts and lifetime receipts survive raw deletion.
+- Raw TTL is independent of analytics because compact facts, lifetime receipts,
+  and explicit raw-expiry receipts survive raw deletion.
 - Failure is honest: initial migration returns `projection_backfilling`; later failures serve the last coherent generation as stale/degraded.
 - Exact dominant repo/account, multi-repo fallback, distinct branch/session, unpriced, cache, subscription, and tail semantics remain testable.
 

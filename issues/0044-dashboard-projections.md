@@ -50,7 +50,8 @@ Maintain bounded analytics read models from promoted privacy-safe facts and publ
 - [ ] `/api/snapshot?days=` serves summary, sessions, repositories, accounts, status, generation, freshness, degraded state, and ETag; compatibility routes slice the same generation.
 - [ ] The dashboard makes one snapshot request per 30 seconds; resize only redraws browser cache.
 - [ ] `/status`, CLI status, and detail routes read projections/facts only; filesystem methods can be forced to throw while snapshot/status remain available.
-- [ ] Retention exposes projection parity/readiness but raw-TTL activation remains explicit and proof-gated.
+- [ ] Retention exposes explicit retained, pending-delivery, quarantined, expired,
+  and not-inspected states; #166 owns raw-TTL expiry and its proof gate.
 - [ ] Warm snapshot p95 is at most 500 ms with deterministic raw/filesystem request scan counters equal to zero; raw-history growth with fixed projection cardinality does not change request work.
 - [ ] `pnpm proof`, issue #77/#78/#79 focused proofs, TypeScript, CLI build, projection proof, and the resource dashboard scenario pass.
 

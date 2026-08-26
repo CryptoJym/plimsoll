@@ -4,7 +4,8 @@
 
 - Source implementation adds a durable sanitized outbox, compact terminal receipts, one bounded sanitized validation witness, bounded migration, finite leases, poison continuation, and exact constant-work status gauges.
 - Configured capture commits new raw evidence and its delivery projection atomically; unconfigured local capture does not duplicate event storage.
-- Raw TTL remains explicitly blocked on `projection_parity`; this change does not delete pending/dead raw evidence or claim #80 is complete.
+- Raw TTL is now owned by #166: the bounded retention pass expires eligible
+  local raw rows while pending delivery keeps its sanitized outbox copy.
 
 ## Scope
 
@@ -24,7 +25,7 @@ Implementation branch: `agent/plimsoll-79-outbox`, originally stacked on the #77
 - `pnpm --dir packages/collector-cli build`: passes under Node 22.
 - `git diff --check`: passes.
 
-The focused proof covers atomic rollback/replay, duplicate zero rewrite, configured versus unconfigured capture, completed-watermark reopen after disabled/direct raw append, bounded migration/uploaded skip, a lossless small-slice pause/resume, local invalid rows, poison first/middle/last at output limit one and two probes, global 422 with a prior witness, crash between sibling acknowledgement and quarantine, auth, 429, network failure, deterministic backoff, crash after remote success, exact retry bytes, linkage before/after seal, raw-retention compatibility, `--no-mark` zero mutation, row/byte/age pressure, true item oversize rejection, normalized hostile privacy keys, acknowledged-only partial batches, and singleton status gauges.
+The focused proof covers atomic rollback/replay, duplicate zero rewrite, configured versus unconfigured capture, completed-watermark reopen after disabled/direct raw append, bounded migration/uploaded skip, a lossless small-slice pause/resume, local invalid rows, poison first/middle/last at output limit one and two probes, global 422 with a prior witness, crash between sibling acknowledgement and quarantine, auth, 429, network failure, deterministic backoff, crash after remote success, exact retry bytes, linkage before/after seal, raw-retention expiry with outbox survival, `--no-mark` zero mutation, row/byte/age pressure, true item oversize rejection, normalized hostile privacy keys, acknowledged-only partial batches, and singleton status gauges.
 
 ## Operational Boundaries
 
@@ -41,4 +42,6 @@ The focused proof covers atomic rollback/replay, duplicate zero rewrite, configu
 - A completed watermark is invalidated transactionally by a disabled append and reconciled against SQLite's O(1) maximum rowid when delivery is re-enabled, so rollback-compatible direct inserts cannot disappear behind a stale `complete` bit.
 - Limit-one validation isolation leases at most one bounded lookahead per remaining output slot. A singleton sanitized witness is re-probed only under the same hashed upload contract; candidate failure proof and witness acknowledgement settle idempotently after a crash, while an ambiguous global 400/422 writes zero dead letters.
 - `upload --no-mark` deliberately stays on the stateless legacy snapshot builder; it acquires no lease and mutates no attempt, receipt, outbox, or `uploaded_at` state.
-- #80 must prove projection parity before changing `compatibility_uploaded_only` retention behavior.
+- #166 owns the raw-retention transition: projection maintenance remains
+  bounded, while raw rows expire independently and pending delivery uses its
+  sanitized outbox copy.

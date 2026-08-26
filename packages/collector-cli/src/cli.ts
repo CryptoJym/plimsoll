@@ -6,7 +6,6 @@ import os from "node:os";
 import path from "node:path";
 import readline from "node:readline/promises";
 import { isDeepStrictEqual } from "node:util";
-import Database from "better-sqlite3";
 import { parse as parseToml } from "smol-toml";
 
 const privatePathReceipt = (value: string) =>
@@ -308,53 +307,6 @@ Config tools:
       Sanitized, bounded diagnostics: versions, coarse readiness, counters,
       aggregate log codes. No paths, prompts, tokens, or secrets.
 `);
-}
-
-/**
- * Payload-free quarantined-history counts for read-only surfaces (doctor).
- * Opens the ledger strictly readonly and never reads event bodies.
- * Quarantined = rows withheld from the CURRENT workspace: bound to a
- * different workspace (production pre-join capture binds LOCAL) or
- * unassigned. Before any binding exists, only unassigned rows count —
- * mirroring LocalEventBuffer.enrollmentStatus (#163 rework).
- */
-function readonlyQuarantinedHistoryRows(bufferPath: string): number | null {
-  if (!fs.existsSync(bufferPath)) return null;
-  let database: Database.Database | null = null;
-  try {
-    database = new Database(bufferPath, { readonly: true, fileMustExist: true });
-    const hasTable = (name: string) =>
-      Boolean(
-        database?.prepare(
-          `select 1 from sqlite_master where type = 'table' and name = ?`,
-        ).get(name),
-      );
-    if (!hasTable("buffered_events") || !hasTable("upload_outbox")) return 0;
-    let currentWorkspaceId: string | undefined;
-    if (hasTable("collector_workspace_binding")) {
-      const binding = database
-        .prepare(
-          `select current_workspace_id as currentWorkspaceId
-           from collector_workspace_binding where singleton = 1`,
-        )
-        .get() as { currentWorkspaceId: string } | undefined;
-      currentWorkspaceId = binding?.currentWorkspaceId;
-    }
-    const predicate = currentWorkspaceId === undefined
-      ? "workspace_id is null"
-      : "(workspace_id is null or workspace_id <> ?)";
-    const params = currentWorkspaceId === undefined ? [] : [currentWorkspaceId];
-    const count = (sql: string) =>
-      (database?.prepare(`select count(*) as n from ${sql}`).get(...params) as { n: number }).n;
-    return (
-      count(`buffered_events where ${predicate}`) +
-      count(`upload_outbox where ${predicate}`)
-    );
-  } catch {
-    return null;
-  } finally {
-    database?.close();
-  }
 }
 
 function openBuffer(
@@ -921,12 +873,62 @@ async function checkCollectorConnectivity(port: number, managementToken?: string
       sources.some((source) => source.lastTokenEventAt !== null) ||
       (Number.isFinite(tokenAttributedEvents) && tokenAttributedEvents > 0);
 
+    const retentionValue = body?.retention;
+    const retention = retentionValue && typeof retentionValue === "object" && !Array.isArray(retentionValue)
+      ? retentionValue as Record<string, unknown>
+      : null;
+    const retentionStates = retention?.states;
+    const retentionPolicy = retention?.policy;
+    const retentionLastPass = retention?.lastPass;
+    const safeRetention = response.ok && body?.ok === true && retention &&
+      retention.inspection === "complete" &&
+      retentionPolicy && typeof retentionPolicy === "object" && !Array.isArray(retentionPolicy) &&
+      retentionStates && typeof retentionStates === "object" && !Array.isArray(retentionStates) &&
+      retentionLastPass && typeof retentionLastPass === "object" && !Array.isArray(retentionLastPass)
+      ? {
+          inspection: "complete" as const,
+          policy: {
+            retentionDays: Number((retentionPolicy as Record<string, unknown>).retentionDays),
+            cutoffAt: String((retentionPolicy as Record<string, unknown>).cutoffAt),
+          },
+          states: {
+            retained: Number((retentionStates as Record<string, unknown>).retained),
+            pendingDelivery: Number((retentionStates as Record<string, unknown>).pendingDelivery),
+            quarantined: Number((retentionStates as Record<string, unknown>).quarantined),
+            expired: Number((retentionStates as Record<string, unknown>).expired),
+            notInspected: Number((retentionStates as Record<string, unknown>).notInspected),
+          },
+          lastPass: {
+            rowsVisited: Number((retentionLastPass as Record<string, unknown>).rowsVisited),
+            rowsExpired: Number((retentionLastPass as Record<string, unknown>).rowsExpired),
+            hasMore: Boolean((retentionLastPass as Record<string, unknown>).hasMore),
+            at: typeof (retentionLastPass as Record<string, unknown>).at === "string"
+              ? (retentionLastPass as Record<string, unknown>).at as string
+              : null,
+          },
+        }
+      : null;
+    const enrollmentValue = body?.enrollment;
+    const enrollment = enrollmentValue && typeof enrollmentValue === "object" && !Array.isArray(enrollmentValue)
+      ? enrollmentValue as Record<string, unknown>
+      : null;
+    const safeEnrollment = response.ok && body?.ok === true && enrollment?.futureOnlyEnrollment === true
+      ? {
+          futureOnlyEnrollment: true as const,
+          quarantinedHistoryRows: Number.isSafeInteger(enrollment.quarantinedHistoryRows)
+            ? Number(enrollment.quarantinedHistoryRows)
+            : null,
+        }
+      : null;
+
     return {
       reachable: response.ok && body?.ok === true,
       status: response.status,
       statusUrl: `http://127.0.0.1:${port}/status`,
       runtimeIdentity,
       homeIdentityHash,
+      retention: safeRetention,
+      enrollment: safeEnrollment,
       signal: {
         verified: signalVerified,
         tokenAttributedEvents:
@@ -943,6 +945,8 @@ async function checkCollectorConnectivity(port: number, managementToken?: string
       statusUrl: `http://127.0.0.1:${port}/status`,
       runtimeIdentity: null,
       homeIdentityHash: null,
+      retention: null,
+      enrollment: null,
       signal: {
         verified: false,
         tokenAttributedEvents: null,
@@ -2004,6 +2008,7 @@ async function main() {
           syncConfigured: Boolean(config.uploadUrl),
           reconciliation: codexReconciliationStatus(buffer.database),
           stats: projectedStatus?.stats ?? null,
+          retention: buffer.retentionStatus(config.retentionDays),
           delivery: buffer.delivery.status(),
           projection: buffer.projection.status(),
           captureHealth: projectedStatus?.health ?? {
@@ -2316,10 +2321,23 @@ async function main() {
           retentionDays: config.retentionDays,
           syncConfigured: Boolean(config.uploadUrl),
           uploadSigningConfigured: Boolean(config.uploadSigningSecret),
+          retention: connectivity.retention ?? {
+            inspection: "not_inspected",
+            policy: { retentionDays: config.retentionDays, cutoffAt: null },
+            states: {
+              retained: null,
+              pendingDelivery: null,
+              quarantined: null,
+              expired: null,
+              notInspected: 1,
+            },
+            lastPass: null,
+          },
           enrollment: {
             futureOnlyEnrollment: true,
             managed: Boolean(config.uploadUrl),
-            quarantinedHistoryRows: readonlyQuarantinedHistoryRows(bufferPath),
+            inspection: connectivity.enrollment ? "complete" : "not_inspected",
+            quarantinedHistoryRows: connectivity.enrollment?.quarantinedHistoryRows ?? null,
           },
           sqlite: {
             exists: fs.existsSync(bufferPath),

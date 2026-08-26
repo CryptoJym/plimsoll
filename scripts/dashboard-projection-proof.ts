@@ -1419,9 +1419,10 @@ async function main() {
     check("legacy_constructor_does_not_scan_or_materialize_history",
       (legacy.database.prepare(`select count(*) as n from dashboard_event_facts`).get() as {n:number}).n === 0 &&
       legacy.projection.status().backfill.highWater === null&&
-      legacy.projection.status().backfill.metricSampleCount===null&&migrationPrune.events===0&&
-      (legacy.database.prepare(`select count(*) as n from buffered_events where rowid=1`).get() as {n:number}).n===1,
-      legacy.projection.status());
+      legacy.projection.status().backfill.metricSampleCount===null&&migrationPrune.events===1&&
+      (legacy.database.prepare(`select count(*) as n from buffered_events where rowid=1`).get() as {n:number}).n===0&&
+      (legacy.database.prepare(`select reason from raw_retention_receipts where raw_rowid=1`).get() as {reason:string}).reason === "retention_window_elapsed",
+      { ...legacy.projection.status(), migrationPrune });
     const firstSlice = legacy.projection.runMaintenance(NOW);
     check("legacy_backfill_slice_is_bounded", firstSlice.backfillRowsVisited === 1_000 && firstSlice.metricRowsVisited===1_000&&firstSlice.parityRowsVisited === 0,
       firstSlice as unknown as Record<string, unknown>);
