@@ -68,6 +68,7 @@
     "proof:outcome-timeline": "tsx scripts/outcome-timeline-proof.ts --receipt evidence/outcome-timeline-proof.json",
     "proof:performance-layer": "tsx scripts/performance-layer-proof.ts",
     "proof:lane-receipts": "tsx scripts/lane-receipt-proof.ts",
+    "proof:fleet-operations": "tsx scripts/fleet-operations-proof.ts",
     "proof:capacity": "tsx scripts/capacity-proof.ts",
     "proof:capacity-contract": "tsx scripts/provider-capacity-sync-proof.ts",
     "proof:capacity-adapters": "tsx scripts/provider-capacity-adapters-proof.ts",
