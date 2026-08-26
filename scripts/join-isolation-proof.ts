@@ -723,7 +723,10 @@ try {
   // above; the stale sentinel here must remain byte-for-byte exact.
   const dryRunHome = path.join(root, "dry-run-home");
   const dryRunTemp = path.join(root, "dry-run-temp");
-  fs.mkdirSync(dryRunHome);
+  // #135 hardened home validation rejects group/other-accessible homes, so
+  // fixture homes used as PLIMSOLL_HOME must be created private like a real
+  // first-run ensureCollectorHome() would.
+  fs.mkdirSync(dryRunHome, { mode: 0o700 });
   fs.mkdirSync(dryRunTemp);
   // tsx initializes this empty launcher cache directory before application
   // code runs even with transform caching disabled. Preseed it so the before
@@ -834,7 +837,7 @@ try {
   // ledger are not opened until the probe is acknowledged, so both stay exact.
   const signalHome = path.join(root, "signal-home");
   const signalTemp = path.join(root, "signal-temp");
-  fs.mkdirSync(signalHome);
+  fs.mkdirSync(signalHome, { mode: 0o700 });
   fs.mkdirSync(signalTemp);
   const signalConfig = oldConfig();
   const signalConfigBytes = `${JSON.stringify(signalConfig, null, 4)}\n\n`;
