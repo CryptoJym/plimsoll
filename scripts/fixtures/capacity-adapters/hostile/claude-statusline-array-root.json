@@ -1,0 +1,3 @@
+[
+  { "rate_limits": { "five_hour": { "used_percentage": 42 } } }
+]
