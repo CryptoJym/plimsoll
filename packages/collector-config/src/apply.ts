@@ -50,7 +50,7 @@ export type ClaudeApplyOptions = {
   };
 };
 
-class ClaudeConfigError extends Error {
+export class ClaudeConfigError extends Error {
   constructor(readonly code: string) {
     super(`CLAUDE_CONFIG_${code}`);
     this.name = "ClaudeConfigError";
@@ -704,12 +704,23 @@ function parseClaudeDocument(current: string) {
 
 function reconcileClaudeDocument(
   currentSource: string,
-  generated: { env: Record<string, string>; hooks?: Record<string, unknown[]> },
+  generated: {
+    env: Record<string, string>;
+    hooks?: Record<string, unknown[]>;
+    /** Optional managed statusLine entry (issue #169). Strictly owned shape. */
+    statusLine?: Record<string, unknown>;
+  },
 ) {
   const current = parseClaudeDocument(currentSource);
   if (!isJsonRecord(generated) || !isJsonRecord(generated.env)) claudeFail("INVALID_GENERATED_ENV");
   if (generated.hooks !== undefined && !isJsonRecord(generated.hooks)) {
     claudeFail("INVALID_GENERATED_HOOKS");
+  }
+  if (
+    generated.statusLine !== undefined &&
+    (!isJsonRecord(generated.statusLine) || Object.keys(generated.statusLine).length === 0)
+  ) {
+    claudeFail("INVALID_GENERATED_STATUS_LINE");
   }
   if (!Object.values(generated.env).every((value) => typeof value === "string")) {
     claudeFail("INVALID_GENERATED_ENV");
@@ -763,7 +774,30 @@ function reconcileClaudeDocument(
     }
   }
 
-  const next = { ...current, env, hooks };
+  const next: Record<string, unknown> = { ...current, env, hooks };
+
+  // Managed statusLine (issue #169): same alias discipline as env/hooks. An
+  // operator key that folds to the managed name but is spelled differently
+  // (e.g. "statusline") is refused rather than silently shadowed; a
+  // non-object value is refused. The owned-vs-operator decision itself lives
+  // with the caller — this layer only performs the validated merge.
+  if (generated.statusLine !== undefined) {
+    rejectManagedAliases(
+      Object.keys(current).filter((key) => key !== "statusLine"),
+      ["statusLine"],
+      "STATUS_LINE_KEY_ALIAS",
+    );
+    if (
+      current.statusLine !== undefined &&
+      (!isJsonRecord(current.statusLine) || Array.isArray(current.statusLine))
+    ) {
+      claudeFail("INVALID_STATUS_LINE");
+    }
+    if (!isDeepStrictEqual(current.statusLine, generated.statusLine)) {
+      next.statusLine = generated.statusLine;
+      changes.push("claude.statusLine.set");
+    }
+  }
   const reparsed = JSON.parse(`${JSON.stringify(next, null, 2)}\n`) as unknown;
   if (!isJsonRecord(reparsed) || !isDeepStrictEqual(reparsed, next)) {
     claudeFail("INVALID_PLAN");
@@ -771,10 +805,14 @@ function reconcileClaudeDocument(
   return { next: `${JSON.stringify(next, null, 2)}\n`, changes };
 }
 
-/** Merge generated env + hooks into Claude Code settings.json. */
+/** Merge generated env + hooks (+ optional managed statusLine) into Claude Code settings.json. */
 export function applyClaudeSettings(
   file: string,
-  generated: { env: Record<string, string>; hooks?: Record<string, unknown[]> },
+  generated: {
+    env: Record<string, string>;
+    hooks?: Record<string, unknown[]>;
+    statusLine?: Record<string, unknown>;
+  },
   options: ClaudeApplyOptions = {},
 ): ApplyResult {
   try {

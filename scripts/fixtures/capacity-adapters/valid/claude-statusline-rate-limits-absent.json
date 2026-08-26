@@ -1,0 +1,7 @@
+{
+  "session_id": "9f1c0eaa-1111-4c2c-9d10-2f6f5a0b7c02",
+  "transcript_path": "/Users/operator/.claude/projects/-repo-probe/session.jsonl",
+  "cwd": "/Users/operator/repo",
+  "model": { "id": "claude-opus-4-6", "display_name": "Opus 4.6" },
+  "version": "2.1.205"
+}

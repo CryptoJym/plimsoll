@@ -1,0 +1,9 @@
+{
+  "session_id": "9f1c0eaa-1111-4c2c-9d10-2f6f5a0b7c03",
+  "model": { "display_name": "Opus 4.6" },
+  "version": "2.1.205",
+  "rate_limits": {
+    "five_hour": { "used_percentage": 88.25, "resets_at": 1798345200 },
+    "seven_day_sonnet": { "used_percentage": 4, "resets_at": "not-a-time" }
+  }
+}

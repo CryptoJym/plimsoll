@@ -100,6 +100,7 @@ const ENFORCEMENT_TOOLING: ReadonlySet<string> = new Set([
   "scripts/capacity-dependency-reachability.ts",
   "scripts/capacity-proof.ts",
   "scripts/provider-capacity-sync-proof.ts",
+  "scripts/provider-capacity-adapters-proof.ts",
 ]);
 
 function collectTypeScriptFiles(rootDir: string): string[] {
