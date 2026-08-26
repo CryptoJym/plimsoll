@@ -1021,6 +1021,7 @@ try {
       target: TOKEN,
       baseUrl: "https://workspace-c.example",
       homeDir: reassignHome,
+      reassign: true,
       temporaryRoot,
       fetchImpl: grantFetch({
         requests,

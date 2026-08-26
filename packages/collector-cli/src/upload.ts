@@ -9,6 +9,8 @@ import {
   type AiWorkIngestBatch,
 } from "../../shared/src/index";
 import { sealOutboundEnvelope } from "./outbound-envelope";
+import { assertNoRedirect, validatedTransportUrl } from "./http-transport";
+import { PLIMSOLL_VERSION } from "./version";
 
 /**
  * Project attribution parity (issue 0036): the ledger's per-event repo
@@ -36,7 +38,7 @@ export function buildIngestBatch(
   buffer: LocalEventBuffer,
   options: { limit?: number; maxBytes?: number; appVersion?: string } = {},
 ): { batch: AiWorkIngestBatch | null; rows: BufferedEventRow[] } {
-  buffer.useWorkspace(config.tenantId);
+  buffer.useWorkspace(config.tenantId, config.deviceId);
   const candidateRows = buffer.listUnuploaded({
     maxRows: options.limit ?? 500,
     maxBytes: options.maxBytes,
@@ -57,7 +59,7 @@ export function buildIngestBatch(
   const batch = aiWorkIngestBatchSchema.parse({
     tenantId: config.tenantId,
     installKey: config.installKey,
-    appVersion: options.appVersion ?? "0.1.0",
+    appVersion: options.appVersion ?? PLIMSOLL_VERSION,
     events,
   });
   return { batch, rows };
@@ -174,36 +176,39 @@ async function postItems(input: {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), input.timeoutSeconds * 1_000);
   timeout.unref();
+  let response: Response;
   try {
-    const response = await input.fetchImpl(input.url, {
+    response = await input.fetchImpl(input.url, {
       method: "POST",
       headers,
       body,
       signal: controller.signal,
+      redirect: "manual",
     });
-    if (!response.ok) {
-      await response.body?.cancel().catch(() => undefined);
-      return {
-        ok: false,
-        status: response.status,
-        statusClass: statusClass(response.status),
-        summary: {},
-        requestBytes: bytes,
-      };
-    }
-    const parsed = await response.json().catch(() => ({}));
-    return {
-      ok: true,
-      status: response.status,
-      statusClass: statusClass(response.status),
-      summary: response.ok ? safeResponseSummary(parsed) : {},
-      requestBytes: bytes,
-    };
   } catch {
     return { ok: false, status: 0, statusClass: "network", summary: {}, requestBytes: bytes };
   } finally {
     clearTimeout(timeout);
   }
+  assertNoRedirect(response, "Upload", new URL(input.url).origin);
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => undefined);
+    return {
+      ok: false,
+      status: response.status,
+      statusClass: statusClass(response.status),
+      summary: {},
+      requestBytes: bytes,
+    };
+  }
+  const parsed = await response.json().catch(() => ({}));
+  return {
+    ok: true,
+    status: response.status,
+    statusClass: statusClass(response.status),
+    summary: response.ok ? safeResponseSummary(parsed) : {},
+    requestBytes: bytes,
+  };
 }
 
 function failureForProbe(result: ProbeResult): Exclude<DeliveryFailureClass, "none"> {
@@ -216,13 +221,25 @@ function failureForProbe(result: ProbeResult): Exclude<DeliveryFailureClass, "no
   return "remote_contract";
 }
 
+function validatedUploadUrl(config: CollectorConfig, override?: string) {
+  const raw = override ?? config.uploadUrl;
+  if (!raw) throw new Error("No upload URL configured. Pass --url or set uploadUrl in collector.config.json.");
+  const url = validatedTransportUrl(raw, "Upload URL");
+  if (override && config.uploadUrl) {
+    const configured = validatedTransportUrl(config.uploadUrl, "Configured upload URL");
+    if (configured.origin !== url.origin) {
+      throw new Error("Upload URL must use the same origin as the configured workspace audience.");
+    }
+  }
+  return url.href;
+}
+
 async function uploadStateless(
   config: CollectorConfig,
   buffer: LocalEventBuffer,
   options: UploadOptions,
 ) {
-  const url = options.url ?? config.uploadUrl;
-  if (!url) throw new Error("No upload URL configured. Pass --url or set uploadUrl in collector.config.json.");
+  const url = validatedUploadUrl(config, options.url);
   // Examine a bounded snapshot independently of the transient request cap so
   // one locally oversized row cannot hide a later eligible row in no-mark
   // mode. This mode intentionally mutates no retry or upload state.
@@ -256,18 +273,18 @@ async function uploadStateless(
   for (const item of candidateItems) {
     if (items.length >= outputLimit) break;
     const candidate = [...items, item];
-    if (bodyForItems(config, candidate, options.appVersion ?? "0.1.0").bytes <= maxRequestBytes) {
+    if (bodyForItems(config, candidate, options.appVersion ?? PLIMSOLL_VERSION).bytes <= maxRequestBytes) {
       items.push(item);
     }
   }
   if (items.length === 0) {
     throw new DeliveryUploadError("local_request_budget", "local_request_budget");
   }
-  const sentBatch = bodyForItems(config, items, options.appVersion ?? "0.1.0").batch;
+  const sentBatch = bodyForItems(config, items, options.appVersion ?? PLIMSOLL_VERSION).batch;
   const result = await postItems({
     config,
     items,
-    appVersion: options.appVersion ?? "0.1.0",
+    appVersion: options.appVersion ?? PLIMSOLL_VERSION,
     url,
     ingestKey: options.ingestKey ?? config.ingestKey,
     signingSecret: options.signingSecret ?? config.uploadSigningSecret,
@@ -315,15 +332,14 @@ export async function uploadBufferedEvents(
   options: UploadOptions = {},
 ) {
   assertCollectorPrivacyMode(config, "upload");
-  buffer.useWorkspace(config.tenantId);
+  const url = validatedUploadUrl(config, options.url);
+  buffer.useWorkspace(config.tenantId, config.deviceId);
   if (options.markUploaded === false) return uploadStateless(config, buffer, options);
-  const url = options.url ?? config.uploadUrl;
-  if (!url) throw new Error("No upload URL configured. Pass --url or set uploadUrl in collector.config.json.");
 
   buffer.delivery.configure({ enabled: true, limits: config.delivery });
   const nowFn = options.now ?? (() => new Date());
   buffer.delivery.migrateLegacy({ now: nowFn() });
-  const appVersion = options.appVersion ?? "0.1.0";
+  const appVersion = options.appVersion ?? PLIMSOLL_VERSION;
   const contractHash = uploadContractHash(config, url, appVersion);
   const outputLimit = Math.max(
     1,

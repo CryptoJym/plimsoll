@@ -48,6 +48,8 @@ export type BufferedEventRow = {
   /** Durable upload audience. Null means legacy/unassigned and is never
    * eligible once a ledger has an initialized workspace binding. */
   workspaceId: string | null;
+  /** Stable local device identity. Null is retained only for legacy rows. */
+  deviceId: string | null;
 };
 
 export type BufferStats = {
@@ -156,6 +158,7 @@ const EVENT_COLUMNS = [
   "machine text",
   "account_hash text",
   "workspace_id text",
+  "device_id text",
   "privacy_generation text",
   "privacy_disposition text",
   "privacy_disposed_at text",
@@ -164,6 +167,7 @@ const EVENT_COLUMNS = [
 export class LocalEventBuffer {
   private readonly db: Database.Database;
   private workspaceId: string | null = null;
+  private deviceId: string | null = null;
   private readonly repoContextQueue: RepoContextRequest[] = [];
   private readonly queuedRepoContextIds = new Set<string>();
   private activeRepoContextCommitScope: RepoContextHandoffBatch | null = null;
@@ -183,6 +187,7 @@ export class LocalEventBuffer {
         now?: () => Date;
       };
       workspaceId?: string;
+      deviceId?: string;
       learningFacts?: { limits?: Partial<LearningFactLimits> };
       /** HTTP collectors fail fast under child-writer contention; maintenance
        * workers may use a short bounded wait. The better-sqlite3 default is
@@ -193,6 +198,7 @@ export class LocalEventBuffer {
     const timeout = Math.max(0, Math.min(options.databaseBusyTimeoutMs ?? 5_000, 5_000));
     this.db = new Database(path, { timeout });
     this.db.pragma("journal_mode = WAL");
+    this.deviceId = options.deviceId?.trim() || null;
     const newLedger = !this.db
       .prepare(`select 1 from sqlite_master where type='table' and name='buffered_events'`)
       .get();
@@ -414,6 +420,16 @@ export class LocalEventBuffer {
       this.recordRepoContextDrop("resolution_failed", discardedRepoContextResults);
     }
     this.migrateEventColumns();
+    const bindingColumns = new Set(
+      (this.db.pragma("table_info(collector_workspace_binding)") as Array<{ name: string }>)
+        .map((column) => column.name),
+    );
+    if (!bindingColumns.has("current_device_id")) {
+      this.db.exec(`alter table collector_workspace_binding add column current_device_id text`);
+    }
+    if (!bindingColumns.has("previous_device_id")) {
+      this.db.exec(`alter table collector_workspace_binding add column previous_device_id text`);
+    }
     // Establish the ledger-local winner before the parent begins serving or
     // can spawn a second connection. First admission therefore only reads it.
     this.repoContextHmacKey();
@@ -443,7 +459,10 @@ export class LocalEventBuffer {
         select raise(abort, 'privacy_disposition_is_terminal');
       end;
     `);
-    this.delivery = new DeliveryOutbox(this.db, options.delivery);
+    this.delivery = new DeliveryOutbox(this.db, {
+      ...(options.delivery ?? {}),
+      deviceId: options.deviceId,
+    });
     if (options.workspaceId) this.useWorkspace(options.workspaceId);
     this.db.exec(`
       create index if not exists idx_events_upload on buffered_events (uploaded_at, created_at);
@@ -641,18 +660,20 @@ export class LocalEventBuffer {
    * returns. Binding ANY managed/joined workspace must never adopt
    * unassigned rows: that relabel is the exact leak class #163 quarantines.
    */
-  useWorkspace(workspaceId: string) {
+  useWorkspace(workspaceId: string, deviceId = this.deviceId) {
     const requested = workspaceId.trim();
     if (!requested) throw new Error("Workspace binding requires a non-empty workspace id.");
+    let requestedDevice = deviceId?.trim() || null;
     const run = this.db.transaction(() => {
       const binding = this.db
         .prepare(
           `select current_workspace_id as currentWorkspaceId,
-             previous_workspace_id as previousWorkspaceId
+             previous_workspace_id as previousWorkspaceId,
+             current_device_id as currentDeviceId
            from collector_workspace_binding where singleton = 1`,
         )
         .get() as
-        | { currentWorkspaceId: string; previousWorkspaceId: string | null }
+        | { currentWorkspaceId: string; previousWorkspaceId: string | null; currentDeviceId: string | null }
         | undefined;
       if (binding && binding.currentWorkspaceId !== requested) {
         throw new Error(
@@ -660,14 +681,29 @@ export class LocalEventBuffer {
             "Use the transactional join/reassign flow; refusing to relabel queued rows.",
         );
       }
+      if (binding?.currentDeviceId && requestedDevice && binding.currentDeviceId !== requestedDevice) {
+        throw new Error(
+          `Ledger device binding mismatch: active=${binding.currentDeviceId}, requested=${requestedDevice}. ` +
+          "Use the transactional device rotation/reinstall flow; refusing to relabel queued rows.",
+        );
+      }
+      // A reopened ledger may omit the device option. Once its binding has a
+      // device, inherit that binding rather than creating new unbound rows.
+      if (!requestedDevice && binding?.currentDeviceId) {
+        requestedDevice = binding.currentDeviceId;
+      }
       if (!binding) {
         this.db
           .prepare(
             `insert into collector_workspace_binding
-              (singleton, current_workspace_id, previous_workspace_id, changed_at)
-             values (1, @workspaceId, null, @now)`,
+              (singleton, current_workspace_id, previous_workspace_id, current_device_id, previous_device_id, changed_at)
+             values (1, @workspaceId, null, @deviceId, null, @now)`,
           )
-          .run({ workspaceId: requested, now: new Date().toISOString() });
+          .run({ workspaceId: requested, deviceId: requestedDevice, now: new Date().toISOString() });
+      } else if (!binding.currentDeviceId && requestedDevice) {
+        this.db
+          .prepare(`update collector_workspace_binding set current_device_id = ? where singleton = 1`)
+          .run(requestedDevice);
       }
       if (requested === LOCAL_TENANT_ID) {
         // LOCAL-only adoption of pre-workspace rows. A managed/joined
@@ -679,6 +715,20 @@ export class LocalEventBuffer {
         this.db
           .prepare(`update upload_outbox set workspace_id = ? where workspace_id is null`)
           .run(LOCAL_TENANT_ID);
+        if (requestedDevice) {
+          this.db
+            .prepare(
+              `update buffered_events set device_id = ?
+               where workspace_id = ? and device_id is null`,
+            )
+            .run(requestedDevice, LOCAL_TENANT_ID);
+          this.db
+            .prepare(
+              `update upload_outbox set device_id = ?
+               where workspace_id = ? and device_id is null`,
+            )
+            .run(requestedDevice, LOCAL_TENANT_ID);
+        }
       }
       // Deliberately no backfill for managed workspaces here or in any later
       // selection: once a managed workspace is selected, unassigned history is
@@ -687,7 +737,9 @@ export class LocalEventBuffer {
     });
     run();
     this.workspaceId = requested;
+    this.deviceId = requestedDevice;
     this.delivery.setWorkspace(requested);
+    if (requestedDevice) this.delivery.setDevice(requestedDevice);
     return requested;
   }
 
@@ -698,50 +750,62 @@ export class LocalEventBuffer {
    * rows stay unbound (local quarantine); only subsequent appends are labeled
    * for `toWorkspaceId`.
    */
-  transitionWorkspace(fromWorkspaceId: string, toWorkspaceId: string) {
+  transitionWorkspace(fromWorkspaceId: string, toWorkspaceId: string, deviceId = this.deviceId) {
     const from = fromWorkspaceId.trim();
     const to = toWorkspaceId.trim();
     if (!from || !to) throw new Error("Workspace transition requires non-empty ids.");
+    let requestedDevice = deviceId?.trim() || null;
     if (from === to) {
-      this.useWorkspace(to);
+      this.useWorkspace(to, requestedDevice);
       return { fromWorkspaceId: from, toWorkspaceId: to, boundLegacyRows: 0 };
     }
     const run = this.db.transaction(() => {
       const binding = this.db
         .prepare(
-          `select current_workspace_id as currentWorkspaceId
+          `select current_workspace_id as currentWorkspaceId,
+             current_device_id as currentDeviceId
            from collector_workspace_binding where singleton = 1`,
         )
-        .get() as { currentWorkspaceId: string } | undefined;
+        .get() as { currentWorkspaceId: string; currentDeviceId: string | null } | undefined;
       if (!binding) {
         this.db
           .prepare(
             `insert into collector_workspace_binding
-              (singleton, current_workspace_id, previous_workspace_id, changed_at)
-             values (1, @from, null, @now)`,
+              (singleton, current_workspace_id, previous_workspace_id, current_device_id, previous_device_id, changed_at)
+             values (1, @from, null, @deviceId, null, @now)`,
           )
-          .run({ from, now: new Date().toISOString() });
+          .run({ from, deviceId: requestedDevice, now: new Date().toISOString() });
       } else if (binding.currentWorkspaceId !== from) {
         throw new Error(
           `Cannot transition ledger from ${from}: it is bound to ${binding.currentWorkspaceId}.`,
         );
+      } else if (binding.currentDeviceId && requestedDevice && binding.currentDeviceId !== requestedDevice) {
+        throw new Error(
+          `Cannot transition ledger device from ${binding.currentDeviceId}: requested ${requestedDevice}.`,
+        );
+      } else if (binding.currentDeviceId && !requestedDevice) {
+        requestedDevice = binding.currentDeviceId;
       }
       this.db
         .prepare(
           `update collector_workspace_binding set
              previous_workspace_id = current_workspace_id,
+             previous_device_id = current_device_id,
              current_workspace_id = @to,
+             current_device_id = @deviceId,
              changed_at = @now
            where singleton = 1`,
         )
-        .run({ to, now: new Date().toISOString() });
+        .run({ to, deviceId: requestedDevice, now: new Date().toISOString() });
       // Auth/contract circuits describe the prior workspace endpoint and must
       // not block the newly authenticated audience after reassignment.
       this.delivery.clearCircuit();
     });
     run();
     this.workspaceId = to;
+    this.deviceId = requestedDevice;
     this.delivery.setWorkspace(to);
+    if (requestedDevice) this.delivery.setDevice(requestedDevice);
     return { fromWorkspaceId: from, toWorkspaceId: to, boundLegacyRows: 0 };
   }
 
@@ -749,13 +813,26 @@ export class LocalEventBuffer {
     const row = this.db
       .prepare(
         `select current_workspace_id as currentWorkspaceId,
-           previous_workspace_id as previousWorkspaceId, changed_at as changedAt
+           previous_workspace_id as previousWorkspaceId,
+           current_device_id as currentDeviceId,
+           previous_device_id as previousDeviceId,
+           changed_at as changedAt
          from collector_workspace_binding where singleton = 1`,
       )
       .get() as
-      | { currentWorkspaceId: string; previousWorkspaceId: string | null; changedAt: string }
+      | {
+          currentWorkspaceId: string;
+          previousWorkspaceId: string | null;
+          currentDeviceId: string | null;
+          previousDeviceId: string | null;
+          changedAt: string;
+        }
       | undefined;
     return row ?? null;
+  }
+
+  get currentDeviceId() {
+    return this.deviceId;
   }
 
   /**
@@ -769,10 +846,17 @@ export class LocalEventBuffer {
   enrollmentStatus() {
     const binding = this.workspaceBinding();
     const currentWorkspaceId = binding?.currentWorkspaceId ?? null;
+    const currentDeviceId = binding?.currentDeviceId ?? null;
     const withheldPredicate = currentWorkspaceId === null
       ? `workspace_id is null`
-      : `(workspace_id is null or workspace_id <> ?)`;
-    const countParams = currentWorkspaceId === null ? [] : [currentWorkspaceId];
+      : currentDeviceId === null
+        ? `(workspace_id is null or workspace_id <> ?)`
+        : `(workspace_id is null or workspace_id <> ? or device_id is null or device_id <> ?)`;
+    const countParams = currentWorkspaceId === null
+      ? []
+      : currentDeviceId === null
+        ? [currentWorkspaceId]
+        : [currentWorkspaceId, currentDeviceId];
     const quarantinedEventRows = (
       this.db
         .prepare(
@@ -790,6 +874,7 @@ export class LocalEventBuffer {
     return {
       futureOnlyEnrollment: true as const,
       currentWorkspaceId,
+      currentDeviceId,
       quarantinedHistoryRows: quarantinedEventRows + quarantinedOutboxRows,
       quarantinedEventRows,
       quarantinedOutboxRows,
@@ -2054,12 +2139,12 @@ export class LocalEventBuffer {
           (id, source, event_type, data_mode, observed_at, payload_json, suppressed_fields_json,
            created_at, session_id, action_class, model, input_tokens, output_tokens,
            cache_read_tokens, cache_creation_tokens, cost_usd, uploaded_at, repo_hash, branch_hash, head_sha,
-           machine, account_hash, workspace_id, privacy_generation)
+           machine, account_hash, workspace_id, device_id, privacy_generation)
         values
           (@id, @source, @eventType, @dataMode, @observedAt, @payloadJson, @suppressedFieldsJson,
            @createdAt, @sessionId, @actionClass, @model, @inputTokens, @outputTokens,
            @cacheReadTokens, @cacheCreationTokens, @costUsd, null, @repoHash, @branchHash, @headSha,
-           @machine, @accountHash, @workspaceId, @privacyGeneration)`,
+           @machine, @accountHash, @workspaceId, @deviceId, @privacyGeneration)`,
       )
       .run({
         id: event.id,
@@ -2084,6 +2169,7 @@ export class LocalEventBuffer {
         machine: MACHINE,
         accountHash: event.actorId ?? null,
         workspaceId: this.workspaceId,
+        deviceId: this.deviceId,
         privacyGeneration,
       });
     if (result.changes > 0) {
@@ -2117,6 +2203,7 @@ export class LocalEventBuffer {
         workspaceId: this.workspaceId,
         privacyGeneration,
         privacyDisposition: null,
+        deviceId: this.deviceId,
       });
       if (repoContextConflict && repoContextId && existingRepoHash && resolvedRepoContext.repoHash) {
         this.recordRepoContextRowConflict(
@@ -2577,6 +2664,7 @@ export class LocalEventBuffer {
     repoHash: string | null;
     branchHash: string | null;
     workspaceId: string | null;
+    deviceId: string | null;
   }): BufferedEventRow {
     let storedSuppressedFields: unknown;
     try {
@@ -2599,6 +2687,7 @@ export class LocalEventBuffer {
       repoHash: row.repoHash ?? null,
       branchHash: row.branchHash ?? null,
       workspaceId: row.workspaceId ?? null,
+      deviceId: row.deviceId ?? null,
     };
   }
 
@@ -2610,7 +2699,7 @@ export class LocalEventBuffer {
           observed_at as observedAt, payload_json as payloadJson,
           suppressed_fields_json as suppressedFieldsJson, created_at as createdAt,
           uploaded_at as uploadedAt, repo_hash as repoHash, branch_hash as branchHash,
-          workspace_id as workspaceId
+          workspace_id as workspaceId, device_id as deviceId
         from buffered_events
         where ${privacyEligible}
         order by created_at desc
@@ -2631,7 +2720,7 @@ export class LocalEventBuffer {
           observed_at as observedAt, payload_json as payloadJson,
           suppressed_fields_json as suppressedFieldsJson, created_at as createdAt,
           uploaded_at as uploadedAt, repo_hash as repoHash, branch_hash as branchHash,
-          workspace_id as workspaceId,
+          workspace_id as workspaceId, device_id as deviceId,
           length(cast(payload_json as blob)) as payloadBytes
         from buffered_events
         where uploaded_at is null
@@ -2639,10 +2728,11 @@ export class LocalEventBuffer {
           -- Fail closed (#163 rework): a null workspace binding sees ONLY
           -- unassigned rows, never rows bound to any workspace.
           and workspace_id is ?
+          and device_id is ?
         order by created_at asc
         limit ?`,
       )
-      .all(this.workspaceId, maxRows) as Array<
+      .all(this.workspaceId, this.deviceId, maxRows) as Array<
       Parameters<LocalEventBuffer["rowToBufferedEvent"]>[0] & { payloadBytes: number }
     >;
 
@@ -2661,12 +2751,13 @@ export class LocalEventBuffer {
     if (ids.length === 0) return 0;
     const privacyEligible = terminalPrivacyEligibilitySql(this.db, "buffered_events");
     const mark = this.db.prepare(
-      `update buffered_events set uploaded_at = ? where id = ? and ${privacyEligible}`,
+      `update buffered_events set uploaded_at = ? where id = ?
+         and workspace_id is ? and device_id is ? and ${privacyEligible}`,
     );
     const run = this.db.transaction((eventIds: string[]) => {
       let updated = 0;
       for (const id of eventIds) {
-        updated += mark.run(uploadedAt, id).changes;
+        updated += mark.run(uploadedAt, id, this.workspaceId, this.deviceId).changes;
       }
       return updated;
     });

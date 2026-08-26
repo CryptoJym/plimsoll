@@ -136,6 +136,7 @@ export type DeliveryStatus = {
 export type LeasedDeliveryItem = {
   deliveryId: string;
   rawRowid: number | null;
+  deviceId?: string | null;
   envelopeJson: string;
   envelope: AiWorkIngestEvent;
   attemptCount: number;
@@ -167,11 +168,12 @@ type RawDeliveryRow = {
   repoHash: string | null;
   branchHash: string | null;
   workspaceId: string | null;
+  deviceId: string | null;
 };
 
 type LegacyCandidateRow = Pick<
   RawDeliveryRow,
-  "rawRowid" | "rawId" | "createdAt" | "uploadedAt" | "workspaceId"
+  "rawRowid" | "rawId" | "createdAt" | "uploadedAt" | "workspaceId" | "deviceId"
 > & { dataMode: string; rowBytes: number };
 
 type ActiveDeliveryRow = {
@@ -185,6 +187,7 @@ type ActiveDeliveryRow = {
   repoHash: string | null;
   branchHash: string | null;
   attemptCount: number;
+  deviceId: string | null;
 };
 
 type RawPrivacyRow = {
@@ -198,7 +201,7 @@ type RawPrivacyRow = {
 
 type RawLineageSnapshot = Pick<
   ActiveDeliveryRow,
-  "deliveryId" | "rawRowid" | "rawId" | "rawCreatedAt" | "rawGeneration"
+  "deliveryId" | "rawRowid" | "rawId" | "rawCreatedAt" | "rawGeneration" | "deviceId"
 >;
 
 type PreparedDelivery =
@@ -287,6 +290,7 @@ export class DeliveryOutbox {
   private enabled: boolean;
   private limits: DeliveryLimits;
   private workspaceId: string | null;
+  private deviceId: string | null;
   /** Injectable clock for eligibility/claim bookkeeping (issue 0182). Every
    * timestamp this class writes that later feeds a lease/eligibility
    * comparison — notably enqueueRaw's next_attempt_at — must come from here,
@@ -300,6 +304,7 @@ export class DeliveryOutbox {
       enabled?: boolean;
       limits?: Partial<DeliveryLimits>;
       workspaceId?: string;
+      deviceId?: string;
       now?: () => Date;
     } = {},
   ) {
@@ -307,6 +312,7 @@ export class DeliveryOutbox {
     this.limits = asLimits(options.limits);
     this.clock = options.now ?? (() => new Date());
     this.workspaceId = options.workspaceId?.trim() || null;
+    this.deviceId = options.deviceId?.trim() || null;
     this.initializeSchema();
     if (this.enabled) this.reopenMigrationPastWatermark();
   }
@@ -315,10 +321,12 @@ export class DeliveryOutbox {
     enabled: boolean;
     limits?: Partial<DeliveryLimits>;
     workspaceId?: string;
+    deviceId?: string;
   }) {
     this.enabled = options.enabled;
     this.limits = asLimits(options.limits);
     if (options.workspaceId) this.setWorkspace(options.workspaceId);
+    if (options.deviceId) this.setDevice(options.deviceId);
     if (this.enabled) this.reopenMigrationPastWatermark();
   }
 
@@ -326,6 +334,27 @@ export class DeliveryOutbox {
     const value = workspaceId.trim();
     if (!value) throw new Error("Delivery workspace requires a non-empty id.");
     this.workspaceId = value;
+  }
+
+  setDevice(deviceId: string) {
+    const value = deviceId.trim();
+    if (!value) throw new Error("Delivery device requires a non-empty id.");
+    this.deviceId = value;
+  }
+
+  queueAgeSeconds(now = new Date()) {
+    const row = this.db
+      .prepare(
+        `select min(created_at) as oldestCreatedAt
+         from upload_outbox
+         where state in ('pending', 'retry', 'in_flight')
+           and workspace_id is ? and device_id is ?`,
+      )
+      .get(this.workspaceId, this.deviceId) as { oldestCreatedAt: string | null };
+    if (!row.oldestCreatedAt) return null;
+    const createdAt = Date.parse(row.oldestCreatedAt);
+    if (!Number.isFinite(createdAt)) return null;
+    return Math.max(0, Math.floor((now.getTime() - createdAt) / 1_000));
   }
 
   bindUnassignedWorkspace(workspaceId: string) {
@@ -363,6 +392,7 @@ export class DeliveryOutbox {
         raw_created_at text,
         raw_generation text,
         workspace_id text,
+        device_id text,
         base_envelope_json text not null,
         base_bytes integer not null,
         repo_hash text,
@@ -531,6 +561,9 @@ export class DeliveryOutbox {
     if (!outboxColumns.some((column) => column.name === "workspace_id")) {
       this.db.exec(`alter table upload_outbox add column workspace_id text`);
     }
+    if (!outboxColumns.some((column) => column.name === "device_id")) {
+      this.db.exec(`alter table upload_outbox add column device_id text`);
+    }
     for (const column of ["raw_id", "raw_created_at", "raw_generation"]) {
       if (!outboxColumns.some((existing) => existing.name === column)) {
         this.db.exec(`alter table upload_outbox add column ${column} text`);
@@ -538,7 +571,7 @@ export class DeliveryOutbox {
     }
     this.db.exec(
       `create index if not exists idx_upload_outbox_workspace_due
-         on upload_outbox (workspace_id, state, next_attempt_at, created_at);
+         on upload_outbox (workspace_id, device_id, state, next_attempt_at, created_at);
        create index if not exists idx_upload_outbox_raw_generation
          on upload_outbox (raw_generation, created_at, delivery_id);
        create trigger if not exists trg_upload_outbox_lineage_immutable
@@ -665,10 +698,10 @@ export class DeliveryOutbox {
     const inserted = this.db
       .prepare(
         `insert or ignore into upload_outbox
-          (delivery_id, raw_rowid, raw_id, raw_created_at, raw_generation, workspace_id,
+          (delivery_id, raw_rowid, raw_id, raw_created_at, raw_generation, workspace_id, device_id,
            base_envelope_json, base_bytes, repo_hash, branch_hash,
            state, attempt_count, next_attempt_at, last_failure_class, created_at, updated_at)
-         select @deliveryId, @rawRowid, @rawId, @createdAt, @privacyGeneration, @workspaceId,
+         select @deliveryId, @rawRowid, @rawId, @createdAt, @privacyGeneration, @workspaceId, @deviceId,
            @baseEnvelopeJson, @baseBytes, @repoHash, @branchHash,
            'pending', 0, @now, 'none', @createdAt, @now
          where not exists (
@@ -681,6 +714,7 @@ export class DeliveryOutbox {
         rawId: row.rawId,
         privacyGeneration: row.privacyGeneration,
         workspaceId: row.workspaceId,
+        deviceId: row.deviceId,
         createdAt: row.createdAt,
         now,
       }).changes;
@@ -697,6 +731,7 @@ export class DeliveryOutbox {
            suppressed_fields_json as suppressedFieldsJson,
            repo_hash as repoHash, branch_hash as branchHash,
            workspace_id as workspaceId,
+           device_id as deviceId,
            privacy_generation as privacyGeneration,
            privacy_disposition as privacyDisposition
          from buffered_events where id = ?`,
@@ -758,7 +793,7 @@ export class DeliveryOutbox {
       .prepare(
         `select rowid as rawRowid, id as rawId, created_at as createdAt,
            data_mode as dataMode, uploaded_at as uploadedAt,
-           workspace_id as workspaceId,
+           workspace_id as workspaceId, device_id as deviceId,
            length(cast(payload_json as blob)) +
              length(cast(suppressed_fields_json as blob)) as rowBytes
          from buffered_events
@@ -782,7 +817,7 @@ export class DeliveryOutbox {
          uploaded_at as uploadedAt, payload_json as payloadJson,
          suppressed_fields_json as suppressedFieldsJson,
          repo_hash as repoHash, branch_hash as branchHash,
-         workspace_id as workspaceId,
+         workspace_id as workspaceId, device_id as deviceId,
          privacy_generation as privacyGeneration,
          privacy_disposition as privacyDisposition,
          length(cast(payload_json as blob)) +
@@ -807,6 +842,9 @@ export class DeliveryOutbox {
         if (!row) continue;
         const rowBytes = row.rowBytes ?? 0;
         if (this.workspaceId !== null && row.workspaceId !== this.workspaceId) {
+          continue;
+        }
+        if (this.deviceId !== null && row.deviceId !== this.deviceId) {
           continue;
         }
         if (row.uploadedAt) {
@@ -940,12 +978,14 @@ export class DeliveryOutbox {
              base_envelope_json as baseEnvelopeJson,
              sealed_envelope_json as sealedEnvelopeJson,
              repo_hash as repoHash, branch_hash as branchHash,
+             device_id as deviceId,
              attempt_count as attemptCount
            from upload_outbox
            where state in ('pending','retry') and next_attempt_at <= @now
              -- Fail closed (#163 rework): a null workspace binding claims
              -- ONLY unassigned rows, never rows bound to any workspace.
              and workspace_id is @workspaceId
+             and device_id is @deviceId
            order by case
                when exists (
                  select 1 from upload_validation_candidates c
@@ -957,7 +997,7 @@ export class DeliveryOutbox {
              next_attempt_at, created_at, delivery_id
            limit @maxRows`,
         )
-        .all({ now: nowIso, workspaceId: this.workspaceId, maxRows }) as ActiveDeliveryRow[];
+        .all({ now: nowIso, workspaceId: this.workspaceId, deviceId: this.deviceId, maxRows }) as ActiveDeliveryRow[];
 
       for (const row of candidates) {
         const authoritativeReason = this.authoritativePrivacyReason(row);
@@ -1055,6 +1095,7 @@ export class DeliveryOutbox {
         items.push({
           deliveryId: row.deliveryId,
           rawRowid: row.rawRowid,
+          deviceId: row.deviceId,
           envelopeJson,
           envelope: outboundEnvelope,
           attemptCount,
@@ -1077,7 +1118,7 @@ export class DeliveryOutbox {
     const getActive = this.db.prepare(
       `select delivery_id as deliveryId, raw_rowid as rawRowid,
          raw_id as rawId, raw_created_at as rawCreatedAt,
-         raw_generation as rawGeneration
+         raw_generation as rawGeneration, device_id as deviceId
        from upload_outbox
        where delivery_id = ? and state = 'in_flight' and lease_id = ?`,
     );
@@ -1090,7 +1131,7 @@ export class DeliveryOutbox {
           | undefined;
         if (!active) continue;
         const reason =
-          active.rawRowid !== item.rawRowid
+          active.rawRowid !== item.rawRowid || active.deviceId !== (item.deviceId ?? null)
             ? "local_privacy_violation"
             : this.authoritativePrivacyReason(active);
         if (reason) {
@@ -1153,13 +1194,17 @@ export class DeliveryOutbox {
       `select delivery_id as deliveryId, raw_rowid as rawRowid,
          raw_id as rawId, raw_created_at as rawCreatedAt,
          raw_generation as rawGeneration,
+         device_id as deviceId,
          attempt_count as attemptCount, created_at as createdAt
-       from upload_outbox where delivery_id = ? and state = 'in_flight' and lease_id = ?`,
+       from upload_outbox
+       where delivery_id = ? and state = 'in_flight' and lease_id = ?
+         and workspace_id is ? and device_id is ?`,
     );
     const markRaw = this.db.prepare(
       `update buffered_events set uploaded_at = @terminalAt
        where rowid = @rawRowid and id = @rawId and created_at = @rawCreatedAt
          and privacy_generation = @rawGeneration and uploaded_at is null
+         and workspace_id is @workspaceId and device_id is @deviceId
          and ${privacyEligible}`,
     );
     const remove = this.db.prepare(`delete from upload_outbox where delivery_id = ? and lease_id = ?`);
@@ -1169,7 +1214,7 @@ export class DeliveryOutbox {
       let locallyDead = 0;
       const acknowledgedIds: string[] = [];
       for (const id of ids) {
-        const row = get.get(id, leaseId) as
+        const row = get.get(id, leaseId, this.workspaceId, this.deviceId) as
           | (RawLineageSnapshot & { attemptCount: number; createdAt: string })
           | undefined;
         if (!row) continue;
@@ -1184,6 +1229,8 @@ export class DeliveryOutbox {
           rawId: row.rawId,
           rawCreatedAt: row.rawCreatedAt,
           rawGeneration: row.rawGeneration,
+          workspaceId: this.workspaceId,
+          deviceId: this.deviceId,
         }).changes;
         if (marked !== 1 && !this.rawRetentionExpired(row)) {
           locallyDead += this.deadActive(id, "local_privacy_violation", terminalAt);
@@ -1673,7 +1720,7 @@ export class DeliveryOutbox {
       .prepare(
         `select delivery_id as deliveryId, raw_rowid as rawRowid,
            raw_id as rawId, raw_created_at as rawCreatedAt,
-           raw_generation as rawGeneration
+           raw_generation as rawGeneration, device_id as deviceId
          from upload_outbox indexed by idx_upload_outbox_raw_generation
          where raw_generation is null
          order by raw_generation, created_at, delivery_id

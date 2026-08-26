@@ -1,5 +1,7 @@
 export * from "./buffer";
 export * from "./config";
+export * from "./device-identity";
+export * from "./http-transport";
 export * from "./learning-facts";
 export * from "./lifecycle";
 export * from "./lifecycle-command";

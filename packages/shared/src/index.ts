@@ -13,3 +13,24 @@ export * from "./fleet-operations";
 export * from "./capacity";
 export * from "./provider-capacity-snapshot";
 export * from "./release-qualification";
+export {
+  DEVICE_REGISTRY_SCHEMA_VERSION,
+  DEVICE_STATUSES,
+  activateDevice,
+  createDeviceRegistry,
+  enrollDevice,
+  leaveDevice,
+  previewDeviceReassignment,
+  reassignDevice,
+  reinstallDevice,
+  renderDeviceRegistry,
+  revokeDevice,
+  rotateDeviceKey,
+  tenantScopedActorPseudonym,
+  type DeviceRegistry,
+  type DeviceRegistryEntry as PairedDeviceRegistryEntry,
+  type DeviceRegistryResult,
+  type DeviceRegistryView,
+  type DeviceStatus,
+  type DeviceTelemetry,
+} from "./device-registry";
