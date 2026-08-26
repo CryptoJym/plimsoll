@@ -3283,8 +3283,8 @@ async function main() {
     );
 
     // 17c. Wire rows obey the strict contract; poisoned sessions skip with
-    // reasons; honest totals (unpriced stays unpriced); junk ids use only the
-    // deterministic UUID and never export their raw local value.
+    // reasons; honest totals (unpriced stays unpriced); non-UUID ids carry the
+    // bounded raw join key alongside their deterministic UUID.
     const wireRows = snapshotsT1.map((snapshot) => buildSessionSyncRow(snapshot));
     const okRows = wireRows.flatMap((row) => (row.ok ? [row] : []));
     const skipReasons = wireRows
@@ -3311,7 +3311,7 @@ async function main() {
         v7Wire.row.totals.costUsd > 0 &&
         junkWire !== undefined &&
         junkWire.idDerived &&
-        !JSON.stringify(junkWire.row).includes(junkSessionRaw) &&
+        junkWire.row.session.metadata.externalSessionId === junkSessionRaw &&
         okRows.find((row) => row.row.session.id === v4Session.toLowerCase())?.row.totals
           .pricedEvents === 0,
       JSON.stringify({ eligible: okRows.length, skipped: skipReasons, batchParses: wireBatchParses }),
@@ -3458,6 +3458,19 @@ async function main() {
       delayMs: 0,
       log: sessionLog,
     });
+    let sessionDryUnjoined: Awaited<ReturnType<typeof runSessionSync>> | null = null;
+    let sessionDryUnjoinedError: string | null = null;
+    try {
+      sessionDryUnjoined = await runSessionSync(collectorConfigSchema.parse({}), {
+        until: untilT1,
+        ledgerPath: sessionLedgerPath,
+        dryRun: true,
+        delayMs: 0,
+        log: sessionLog,
+      });
+    } catch (error) {
+      sessionDryUnjoinedError = error instanceof Error ? error.message : String(error);
+    }
     const storeAfterDry = JSON.stringify([...sessionStore.entries()].sort());
 
     // Adversarial session lane: unsafe raw ids and otherwise-approved fields
@@ -3540,6 +3553,9 @@ async function main() {
         sessionRunSubset.sentSessions === 1 &&
         sessionDry.ok &&
         sessionDry.dryRun &&
+        sessionDryUnjoined?.ok === true &&
+        sessionDryUnjoined.dryRun &&
+        sessionDryUnjoinedError === null &&
         storeBeforeDry === storeAfterDry &&
         sessionSignatureFailures === 0 &&
         sessionLogs.every((line) => !line.includes(SESSION_INSTALL_KEY)),
@@ -3562,8 +3578,12 @@ async function main() {
           unsafeSessionBodies.every((body) => !body.includes(sentinel)) &&
           unsafeSessionLogs.every((line) => !line.includes(sentinel))
         ) &&
-        unsafeSessionBodies.every((body) => !body.includes(junkSessionRaw)) &&
-        sessionWireRows.every((row) => row.session.metadata.externalSessionId === undefined) &&
+        unsafeSessionBodies.some((body) => body.includes(junkSessionRaw)) &&
+        sessionWireRows
+          .filter((row) => row.session.id !== junkOnce.id)
+          .every((row) => row.session.metadata.externalSessionId === undefined) &&
+        sessionWireRows.find((row) => row.session.id === junkOnce.id)?.session.metadata.externalSessionId ===
+          junkSessionRaw &&
         sessionWireRows.some((row) => row.session.id === v4Session.toLowerCase()) &&
         sessionWireRows.some((row) => row.session.id === v7Session),
       JSON.stringify({
