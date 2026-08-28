@@ -169,11 +169,18 @@ function migrateLegacyAuth(home: string, existing: LocalIngestAuth) {
 }
 
 /** Provision once and return the same values on every subsequent call. */
-export function loadOrCreateLocalIngestAuth(home: string): LocalIngestAuth {
+export function loadOrCreateLocalIngestAuth(
+  home: string,
+  options: { dryRun?: boolean } = {},
+): LocalIngestAuth {
   const existing = readLocalIngestAuth(home);
-  if (existing) return existing.geminiCliProducer ? existing : migrateLegacyAuth(home, existing);
+  if (existing) {
+    return existing.geminiCliProducer || options.dryRun
+      ? existing
+      : migrateLegacyAuth(home, existing);
+  }
   if (authFileExists(home)) throw new Error("local_ingest_auth_invalid");
-  return writeNewAuth(home, false);
+  return options.dryRun ? newAuth() : writeNewAuth(home, false);
 }
 
 /** Explicit rotation boundary for local operators; never reads tool accounts. */

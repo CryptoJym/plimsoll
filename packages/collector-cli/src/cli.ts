@@ -2165,7 +2165,10 @@ async function main() {
     const codexFile = argValue("--codex-config") ?? path.join(os.homedir(), ".codex", "config.toml");
     // Setup is the installer: it provisions the Plimsoll-local credentials so
     // generated tool configs bind each producer to its own source-bound token.
-    const localAuth = loadOrCreateLocalIngestAuth(collectorHome());
+    // Planning may need producer tokens, but provisioning them belongs only
+    // after a valid plan and explicit confirmation. A dry-run and a rejected
+    // plan must leave the Plimsoll home byte-absent.
+    const localAuth = loadOrCreateLocalIngestAuth(collectorHome(), { dryRun: true });
     const toolOptions = {
       repoRoot: process.cwd(),
       port: config.port,
@@ -2211,9 +2214,22 @@ async function main() {
         return;
       }
     }
+    const appliedAuth = loadOrCreateLocalIngestAuth(collectorHome());
+    const appliedToolOptions = {
+      ...toolOptions,
+      claudeCodeProducerToken: appliedAuth.claudeCodeProducer,
+      codexProducerToken: appliedAuth.codexProducer,
+      geminiCliProducerToken: appliedAuth.geminiCliProducer,
+    };
     if (configRead?.status === "missing") loadCollectorConfig();
-    const resultClaude = applyClaudeSettings(claudeFile, claudeGenerated);
-    const resultCodex = applyCodexConfig(codexFile, codexToml);
+    const resultClaude = applyClaudeSettings(
+      claudeFile,
+      generateClaudeCodeSettings(appliedToolOptions),
+    );
+    const resultCodex = applyCodexConfig(
+      codexFile,
+      generateCodexConfigToml(appliedToolOptions),
+    );
     console.log(
       JSON.stringify(
         {
