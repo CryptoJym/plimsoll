@@ -78,6 +78,7 @@ separate purge may remove.
 | `lifecycle update\|rollback\|uninstall\|purge\|support-bundle` | Transactional immutable-runtime updates with automatic rollback, preview-default uninstall, exact-confirmation purge, sanitized support bundle |
 | `scan-rollouts` | One-time full-history walk of Codex rollout files into the ledger |
 | `scan-transcripts` | One-time full-history walk of Claude Code transcripts into the ledger |
+| `sync-outcomes --repository owner/repo` | Preview or send the bounded, idempotent session-to-PR outcome join for one named GitHub repository |
 | `label account HASH NAME` | Local-only display label for a hashed account |
 | `priority add\|remove\|list` | Manage the priority-repo list (hashed; URLs stay local) |
 | `purge-local-data` | Dry-run or explicit purge of local buffered events |
@@ -85,6 +86,22 @@ separate purge may remove.
 Background (LaunchAgent) mode for npm installs is still being fitted — track
 [plimsoll#11](https://github.com/CryptoJym/plimsoll/issues/11). For now run
 `start` in a terminal or from the git checkout.
+
+## Hosted outcome sync
+
+After joining a workspace, send the local session-to-PR outcome join for one
+explicitly named repository. Preview the bounded join first, then repeat
+without `--dry-run` to send it:
+
+```sh
+npx @plimsoll/cli sync-outcomes --repository owner/repo --dry-run
+npx @plimsoll/cli sync-outcomes --repository owner/repo
+```
+
+The feed contains merge status, fetched check results, and bounded rework
+signals keyed by linkage hashes and deterministic IDs. It does not send PR
+titles, bodies, diffs, paths, or branch names. The command is explicit and
+stateless; it is not part of the background collector cycle.
 
 ## What leaves your machine
 
