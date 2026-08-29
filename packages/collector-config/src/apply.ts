@@ -900,6 +900,7 @@ const MANAGED_TABLES: ManagedTable[] = [
 
 const HOOK_EVENTS = ["UserPromptSubmit", "PostToolUse", "Stop"] as const;
 const PLIMSOLL_HEADER = "x-plimsoll-source";
+const PLIMSOLL_TOKEN_HEADER = "x-plimsoll-token";
 const LEGACY_PLIMSOLL_HEADER = "x-cfo-one-source";
 
 function fileIdentity(stat: fs.Stats): FileIdentity {
@@ -1481,9 +1482,10 @@ function splitInlineTable(value: string): string[] | null {
   return entries;
 }
 
-function reconcileHeaders(file: string, raw: string) {
+function reconcileHeaders(file: string, raw: string, generatedRaw: string) {
   const entries = splitInlineTable(raw);
-  if (!entries) {
+  const generatedEntries = splitInlineTable(generatedRaw);
+  if (!entries || !generatedEntries) {
     throw new Error(`${file}: managed exporter headers use an unsupported layout; refusing to write or create a backup.`);
   }
   const kept: string[] = [];
@@ -1512,9 +1514,16 @@ function reconcileHeaders(file: string, raw: string) {
       foundPlimsoll = true;
       continue;
     }
+    if (folded === PLIMSOLL_TOKEN_HEADER) continue;
     kept.push(entry);
   }
-  kept.push(`"${PLIMSOLL_HEADER}" = "codex"`);
+  kept.push(...generatedEntries.filter((entry) => {
+    const equals = topLevelEquals(entry);
+    const key = equals === -1 ? null : parseDottedKey(entry.slice(0, equals).trim());
+    if (!key || key.length !== 1) return false;
+    const folded = key[0]!.toLowerCase();
+    return folded === PLIMSOLL_HEADER || folded === PLIMSOLL_TOKEN_HEADER;
+  }));
   return {
     value: `{ ${kept.join(", ")} }`,
     action: removedLegacy
@@ -1686,7 +1695,7 @@ function reconcileCodexToml(file: string, current: string, generatedToml: string
       let nextValue = generated.valueRaw;
       let action = "replace with generated Plimsoll value";
       if (key === "headers" && isRecord(currentValue)) {
-        const reconciled = reconcileHeaders(file, assignment.valueRaw);
+        const reconciled = reconcileHeaders(file, assignment.valueRaw, generated.valueRaw);
         nextValue = reconciled.value;
         action = reconciled.action;
       }
