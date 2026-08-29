@@ -31,10 +31,12 @@ import {
  *   the same --until, nothing changes (the cloud reports what it did:
  *   inserted/updated/skippedStale). No resume watermark: the whole walk is
  *   cheap (thousands of sessions, not hundreds of thousands of events).
- * - Privacy parity: only canonical linkage hashes, privacy-safe actor aliases
- *   and typed counters cross. Raw non-UUID session ids are deterministically
- *   replaced and never leave the machine. The shared outbound sealer runs
- *   both while rows are built and immediately before batch construction.
+ * - Privacy parity: only canonical linkage hashes, privacy-safe actor aliases,
+ *   bounded safe join identifiers and typed counters cross. Unsafe raw session
+ *   ids are rejected before derivation; safe non-UUID ids are retained under
+ *   `externalSessionId` so historical event rows can join to their session.
+ *   The shared outbound sealer runs both while rows are built and immediately
+ *   before batch construction.
  * - Honest numbers: costUsd sums PRICED events only; pricedEvents says how
  *   many. An unpriced session renders "unpriced" in the audit, never $0.00.
  */
@@ -53,7 +55,7 @@ const POSTGRES_UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a
 /**
  * Deterministic UUID for ledger session ids the cloud's uuid column would
  * reject. Same ledger id → same UUID on every run, so cloud upserts dedupe
- * re-sends without exporting the original. The namespace part
+ * re-sends. The namespace part
  * ("session-sync") is deliberately distinct from the event
  * lane's "workspace-backfill", so a session id that happens to equal some
  * event's raw id can never collide into the same derived UUID.
@@ -195,10 +197,16 @@ export function buildSessionSyncRow(snapshot: SessionSnapshot): NormalizedSessio
   if (hasUnsafeOutboundString(snapshot.sessionId)) {
     return { ok: false, reason: "forbidden_content", detail: "unsafe session id" };
   }
-  const ensured = ensureUuidSessionId(snapshot.sessionId);
+  const rawSessionId = snapshot.sessionId.trim();
+  const ensured = ensureUuidSessionId(rawSessionId);
   const metadata: Record<string, unknown> = {};
   if (snapshot.branchHash) metadata.branchHash = snapshot.branchHash;
   if (snapshot.accountHash) metadata.externalActorId = snapshot.accountHash;
+  // Historical non-UUID event rows are stored with a NULL uuid column and
+  // their original session id in metadata.externalSessionId. Keep the same
+  // bounded safe join key on the session snapshot while using a deterministic
+  // UUID as the primary row id.
+  if (ensured.derived) metadata.externalSessionId = rawSessionId;
 
   const candidate = {
     session: {
@@ -481,13 +489,17 @@ export async function runSessionSync(
   const fetchImpl = options.fetchImpl ?? fetch;
 
   const url = options.url ?? config.uploadUrl;
-  if (!url) {
+  if (!options.dryRun && !url) {
     throw new Error(
       "This machine has not joined a workspace (no uploadUrl in collector.config.json). " +
         'Run: plimsoll join "<join-url>#<token>" — then retry upload-history --sessions.',
     );
   }
-  if ((!config.installKey || config.installKey === "local-dev") && !config.ingestKey) {
+  if (
+    !options.dryRun &&
+    (!config.installKey || config.installKey === "local-dev") &&
+    !config.ingestKey
+  ) {
     throw new Error(
       "No workspace install credentials found (installKey is missing/local-dev and there is no ingestKey). " +
         'Run: plimsoll join "<join-url>#<token>" — then retry upload-history --sessions.',
@@ -585,7 +597,7 @@ export async function runSessionSync(
     const task = (async () => {
       try {
         const result = await postHistoryBatch({
-          url,
+          url: url!,
           body,
           installKey: config.installKey,
           ingestKey: config.ingestKey,

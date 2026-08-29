@@ -368,8 +368,9 @@ export type AiWorkAttributionRepairBatch = z.infer<typeof aiWorkAttributionRepai
  * event lane already stored on event rows, in the session_id uuid column
  * (claude v4 ids and codex v7 ids) — so session rows JOIN to their events.
  * Non-uuid ledger ids derive the same UUID on every run
- * (collector-cli/session-sync.ts); the raw local identifier never crosses the
- * session-sync outbound boundary.
+ * (collector-cli/session-sync.ts); the original id may also cross only as the
+ * bounded `session.metadata.externalSessionId` join key, after the shared
+ * outbound privacy gate has rejected unsafe values.
  *
  * `kind` discriminates it from event batches on the shared ingest route (the
  * attribution_repair pattern). Totals are typed — not loose metadata — so the
