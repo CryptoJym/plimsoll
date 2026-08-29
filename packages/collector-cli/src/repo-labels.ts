@@ -4,6 +4,7 @@ import Database from "better-sqlite3";
 
 import { assertCollectorPrivacyMode, collectorBufferPath } from "./config";
 import type { CollectorConfig } from "./config";
+import { assertNoRedirect, validatedTransportUrl } from "./http-transport";
 import { canonicalLinkage } from "./outbound-envelope";
 import {
   normalizeGitRemote,
@@ -230,6 +231,24 @@ export function prepareRepoLabelsPush(options: { ledgerPath?: string } = {}): {
 const LABELS_PATH = "/api/work-intelligence/repo-labels";
 const MAX_LABELS_PER_BATCH = 200;
 
+function validatedLabelsUrl(config: CollectorConfig, override?: string) {
+  const raw = override ?? config.uploadUrl;
+  if (!raw) {
+    throw new Error("No upload URL configured. Pass --url or set uploadUrl in collector.config.json.");
+  }
+  const url = validatedTransportUrl(raw, "Repo labels URL");
+  if (override && config.uploadUrl) {
+    const configured = validatedTransportUrl(config.uploadUrl, "Configured workspace URL");
+    if (configured.origin !== url.origin) {
+      throw new Error("Repo labels URL must use the same origin as the configured workspace audience.");
+    }
+  }
+  url.pathname = LABELS_PATH;
+  url.search = "";
+  url.hash = "";
+  return url;
+}
+
 /**
  * POST the prepared rows to the workspace labels route — same machine-path
  * auth as event uploads (install key + HMAC over `${ts}.${body}`); the
@@ -277,8 +296,7 @@ export async function pushRepoLabels(
 
   // The labels route lives next to the ingest route; derive it so a custom
   // --url pointing at the ingest endpoint still lands on the right path.
-  const url = new URL(baseUrl);
-  url.pathname = LABELS_PATH;
+  const url = validatedLabelsUrl(config, options.url);
 
   let pushed = 0;
   let created = 0;
@@ -309,7 +327,13 @@ export async function pushRepoLabels(
       headers["x-plimsoll-upload-signature"] = `sha256=${digest}`;
     }
 
-    const response = await fetchImpl(url.toString(), { method: "POST", headers, body });
+    const response = await fetchImpl(url.toString(), {
+      method: "POST",
+      headers,
+      body,
+      redirect: "manual",
+    });
+    assertNoRedirect(response, "Repo labels upload", url.origin);
     const responseBody = (await response.json().catch(() => ({}))) as {
       error?: unknown;
       created?: unknown;
