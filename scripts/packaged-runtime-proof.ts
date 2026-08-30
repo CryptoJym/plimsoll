@@ -21,6 +21,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   buildRuntime,
   scanBundleSpecifiers,
@@ -118,6 +119,10 @@ export function parsePsOutput(
     return [{ pid: Number(match[1]), rssKb: Number(match[2]), command: match[3]! }];
   });
 }
+
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts for details.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 async function main() {
   const ambientHome = process.env.PLIMSOLL_HOME;
@@ -659,7 +664,7 @@ function probeEndpoint(port: number): Promise<boolean> {
   });
 }
 
-main().catch((error: unknown) => {
+main().then(() => guard.complete()).catch((error: unknown) => {
   console.error(error instanceof Error ? `${error.message}` : String(error));
   process.exit(1);
 });

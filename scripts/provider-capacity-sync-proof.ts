@@ -24,6 +24,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   CAPACITY_BASIS_POINTS_MAX,
   CAPACITY_UPLOAD_CONSENT_KIND,
@@ -59,6 +60,12 @@ function prove(name: string, condition: unknown, detail: Record<string, unknown>
   assert.ok(condition, `${name}: ${JSON.stringify(detail)}`);
   checks.push({ name, detail });
 }
+
+// Refuses the two silent-green modes — an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts for why each is needed.
+const guard = guardProofCompletion({
+  countChecks: () => checks.length,
+});
 
 function sha256File(fullPath: string): string {
   return `sha256:${createHash("sha256").update(fs.readFileSync(fullPath)).digest("hex")}`;
@@ -784,3 +791,4 @@ const MAX_AGE_MS = 6 * 60 * 60 * 1000;
 }
 
 console.log(JSON.stringify({ issue: "168", passed: checks.length, checks }, null, 2));
+guard.complete();

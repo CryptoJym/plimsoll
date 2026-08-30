@@ -17,6 +17,7 @@ import type { AddressInfo } from "node:net";
 
 import Database from "better-sqlite3";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { LOCAL_HTTP_LIMITS } from "../packages/collector-cli/src/http-boundary";
@@ -927,6 +928,10 @@ function SENTINELS_ABSENT(text: string) {
   );
 }
 
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
+
 async function main() {
   await integrationChecks();
 
@@ -946,7 +951,7 @@ async function main() {
   if (failed.length > 0) process.exitCode = 1;
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   const message = error instanceof Error ? error.message : String(error);
   console.error(JSON.stringify({ error: "rejection_aggregation_proof_failed", message: message.slice(0, 200) }));
   process.exitCode = 1;

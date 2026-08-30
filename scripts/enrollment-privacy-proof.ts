@@ -15,6 +15,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import {
   collectorBufferPath,
@@ -958,6 +959,10 @@ async function redTeamOutboxReleaseAfterJoin() {
   );
 }
 
+// Refuses the two silent-green modes: an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
+
 async function main() {
 try {
   for (const shape of SEED_SHAPES) {
@@ -1193,7 +1198,7 @@ try {
 }
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });

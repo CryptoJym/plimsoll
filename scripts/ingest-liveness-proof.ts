@@ -23,6 +23,7 @@ import zlib from "node:zlib";
 
 import Database from "better-sqlite3";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import {
@@ -215,6 +216,10 @@ function settle(buffer: LocalEventBuffer, maxSlices = 200) {
   }
   throw new Error(`projection did not settle: ${JSON.stringify(buffer.projection.status())}`);
 }
+
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 async function main() {
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-ingest-liveness-"));
@@ -505,7 +510,7 @@ async function main() {
   if (failed.length > 0) process.exitCode = 1;
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });

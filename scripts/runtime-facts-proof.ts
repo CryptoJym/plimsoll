@@ -7,6 +7,7 @@ import path from "node:path";
 
 import Database from "better-sqlite3";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { appendForwardedHook } from "../packages/collector-cli/src/forwarder";
@@ -114,6 +115,10 @@ function otlpEnvelope(spans: ReturnType<typeof toolSpan>[]) {
     ],
   };
 }
+
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts for details.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 async function main() {
   check("node_22_runtime", Number(process.versions.node.split(".")[0]) === 22, {
@@ -625,7 +630,7 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   const message = error instanceof Error ? error.message : "";
   const safePrefix = message.match(/^([a-zA-Z0-9_.:-]{1,120})/)?.[1];
   process.stderr.write(`${JSON.stringify({

@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import {
   deriveActionClass,
@@ -81,6 +82,10 @@ async function dispatchRequest(server: http.Server, request: http.IncomingMessag
     }
   });
 }
+
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts for details.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 async function main() {
   const fixturePath = path.join(
@@ -278,4 +283,4 @@ async function main() {
   if (failed.length > 0) process.exitCode = 1;
 }
 
-void main();
+void main().then(() => guard.complete());

@@ -5,6 +5,7 @@ import { mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync }
 import { homedir } from "node:os";
 import { resolve } from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   LEARNING_ANALYSIS_VERSION,
   LEARNING_EVIDENCE_SCHEMA_VERSION,
@@ -32,6 +33,12 @@ function prove(name: string, run: () => void, detail: string): void {
   run();
   checks.push({ name, detail });
 }
+
+// Refuses the two silent-green modes — an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts for why each is needed.
+const guard = guardProofCompletion({
+  countChecks: () => checks.length,
+});
 
 const START = "2026-06-01T00:00:00.000Z";
 const END = "2026-07-01T00:00:00.000Z";
@@ -972,3 +979,4 @@ prove(
 
 console.log(`learning evidence proof: ${checks.length}/${checks.length} checks passed`);
 for (const check of checks) console.log(`  ✓ ${check.name} — ${check.detail}`);
+guard.complete();

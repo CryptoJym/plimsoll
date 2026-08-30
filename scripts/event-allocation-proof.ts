@@ -4,6 +4,7 @@ import assert from "node:assert/strict";
 
 import Database from "better-sqlite3";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   allocateEvents,
   collectAllocationEvents,
@@ -68,6 +69,10 @@ function pull(
 function totalPrimaryTokens(rows: Array<{ inputTokens: number; outputTokens: number }>) {
   return rows.reduce((sum, row) => sum + row.inputTokens + row.outputTokens, 0);
 }
+
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts for details.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 function main() {
   const repos = [hash("a"), hash("b"), hash("c")];
@@ -516,3 +521,4 @@ function main() {
 }
 
 main();
+guard.complete();

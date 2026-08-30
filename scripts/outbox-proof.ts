@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { normalizeHookPayload } from "../packages/collector-cli/src/normalizer";
@@ -3809,6 +3810,10 @@ function pressureAgeByteOversizeAndStatusProof() {
   }
 }
 
+// Refuses the two silent-green modes: an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
+
 async function main() {
   try {
     await policyResponseAndLegacyReadbackProof();
@@ -3855,7 +3860,7 @@ async function main() {
   }
 }
 
-void main().catch((error) => {
+void main().then(() => guard.complete()).catch((error) => {
   console.error(error instanceof Error ? `${error.message}\n${error.stack}` : String(error));
   process.exitCode = 1;
 });

@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema, collectorDeviceIdentityPath } from "../packages/collector-cli/src/config";
 import {
@@ -47,6 +48,11 @@ function check(name: string, condition: unknown) {
   assert.ok(condition, name);
   checks.push(name);
 }
+
+// Refuses the two silent-green modes: an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts. This file has no
+// main() wrapper — the guard completes as the last top-level statement.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 let registry = createDeviceRegistry();
 const enrolled = enrollDevice(registry, {
@@ -246,3 +252,4 @@ try {
 }
 
 console.log(JSON.stringify({ ok: true, proof: "device-registry", checks }, null, 2));
+guard.complete();

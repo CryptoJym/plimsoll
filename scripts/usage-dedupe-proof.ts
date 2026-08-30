@@ -20,6 +20,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 
 const NOW = new Date("2026-08-20T16:00:00.000Z");
@@ -108,6 +109,11 @@ function windowCostUsd(db: LocalEventBuffer["database"], days: number) {
     `select cost_nanos as costNanos from dashboard_window_totals where days=?`,
   ).get(days) as { costNanos: number }).costNanos) / 1_000_000_000;
 }
+
+// Refuses the two silent-green modes: an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts. main() here is
+// synchronous, so completion is a plain statement after the call below.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 function main() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-usage-dedupe-proof-"));
@@ -376,6 +382,7 @@ function issue193EventClassAndOrderGaps() {
 
 // Referenced so the type import stays honest even though fixtures bypass it.
 main();
+guard.complete();
 
 function repairFactsCounter(db: LocalEventBuffer["database"]) {
   return (db.prepare(

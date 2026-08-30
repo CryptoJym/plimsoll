@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import {
   codexReconciliationStatus,
@@ -1418,6 +1419,10 @@ async function proveIntegratedIdle(
   );
 }
 
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts for details.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
+
 async function main() {
   await proveCoalescing();
   await proveStoppingCancelsPendingFollowup();
@@ -1472,7 +1477,7 @@ async function main() {
   );
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   process.stderr.write(
     `${JSON.stringify({
       status: "fail",

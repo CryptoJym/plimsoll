@@ -19,6 +19,7 @@ import os from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   CollectorHomeError,
   collectorHomeIdentityHash,
@@ -141,6 +142,10 @@ function waitFor(condition: () => boolean, timeoutMs: number, stepMs = 100): Pro
     tick();
   });
 }
+
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 async function main() {
   // ---------------------------------------------------------------------------
@@ -607,7 +612,7 @@ async function run() {
 }
 }
 
-run().catch((error) => {
+run().then(() => guard.complete()).catch((error) => {
   console.error(error instanceof Error ? error.message : String(error));
   process.exitCode = 1;
   fs.rmSync(root, { recursive: true, force: true });

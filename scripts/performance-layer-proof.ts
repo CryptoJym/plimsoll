@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { OutcomeTimelineStore } from "../packages/collector-cli/src/outcome-timeline-store";
 import type { OutcomeTimelineCoverage, PullTimelineFact } from "../packages/shared/src/index";
 
@@ -15,6 +16,12 @@ function prove(name: string, condition: unknown, detail: Record<string, unknown>
   assert.ok(condition, `${name}: ${JSON.stringify(detail)}`);
   checks.push({ name, detail });
 }
+
+// Refuses the two silent-green modes — an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts for why each is needed.
+const guard = guardProofCompletion({
+  countChecks: () => checks.length,
+});
 
 const repository = "github:repository:fixture/performance";
 const sha = "a".repeat(40);
@@ -148,3 +155,4 @@ try {
 }
 
 console.log(JSON.stringify({ schema: "plimsoll.performance-layer-proof.v1", passed: checks.length, checks }, null, 2));
+guard.complete();
