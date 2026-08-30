@@ -1,6 +1,7 @@
 /** Adversarial, pure proof for the versioned learning-metric contract (#97). */
 import assert from "node:assert/strict";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   ANALYSIS_MANIFEST_VERSION,
   CLAIM_CLASSES,
@@ -25,6 +26,10 @@ function prove(name: string, run: () => void, detail: string): void {
   run();
   checks.push({ name, detail });
 }
+
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 function exactProject(
   id: string,
@@ -1128,3 +1133,4 @@ prove(
 
 console.log(`metric truth proof: ${checks.length}/${checks.length} checks passed`);
 for (const check of checks) console.log(`  ✓ ${check.name} — ${check.detail}`);
+guard.complete();

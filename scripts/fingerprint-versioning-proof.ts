@@ -25,6 +25,7 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   acquireCollectorStartOwnership,
   CollectorStartOwnershipError,
@@ -44,6 +45,10 @@ function check(name: string, condition: unknown, detail: Record<string, unknown>
   assert.ok(condition, `${name}: ${JSON.stringify(detail)}`);
   checks.push({ name, detail });
 }
+
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 function spawnLiveChild() {
   const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000);"], {
@@ -418,7 +423,7 @@ async function main() {
   console.log(JSON.stringify({ issue: "175", passed: true, checks }, null, 2));
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });

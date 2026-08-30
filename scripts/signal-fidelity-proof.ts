@@ -59,6 +59,7 @@ import type { AddressInfo } from "node:net";
 
 import Database from "better-sqlite3";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigPath, collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { performJoin } from "../packages/collector-cli/src/join";
@@ -4030,7 +4031,12 @@ if (process.env.PLIMSOLL_PROOF_CLOCK_CASE === "1") {
     restoreProofDateNow();
   }
 } else {
-  main().catch((error) => {
+  // Refuses two silent-green failure modes: an early event-loop drain and a
+  // hang that never exits. Scoped to this branch only — the recursive
+  // PLIMSOLL_PROOF_CLOCK_CASE child run above legitimately exits without
+  // ever reaching main(), and must not trip the guard.
+  const guard = guardProofCompletion({ countChecks: () => checks.length });
+  main().then(() => guard.complete()).catch((error) => {
     console.error(error);
     process.exitCode = 1;
   });

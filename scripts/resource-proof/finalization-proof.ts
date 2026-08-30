@@ -8,6 +8,7 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createRequire } from "node:module";
 
+import { guardProofCompletion } from "../lib/proof-completion";
 import {
   createResourceSandbox,
   removeResourceSandbox,
@@ -811,7 +812,12 @@ if (
     process.exitCode = 1;
   });
 } else if (invokedAsScript) {
-  main().catch((error) => {
+  // Refuses the two silent-green modes: an early event-loop drain and a
+  // hang that never exits. See scripts/lib/proof-completion.ts. Scoped to
+  // this branch (not module scope) since --receipt-parent-change-only is a
+  // separate, non-default entrypoint this guard does not cover.
+  const guard = guardProofCompletion();
+  main().then(() => guard.complete()).catch((error) => {
     const errorName = error instanceof Error ? error.name : "";
     const symbolicError = /^[A-Za-z][A-Za-z0-9]+$/.test(errorName)
       ? errorName

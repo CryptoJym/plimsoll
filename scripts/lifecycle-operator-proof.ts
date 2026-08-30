@@ -19,6 +19,7 @@ import path from "node:path";
 
 import Database from "better-sqlite3";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   LaunchAgentManifestLifecycleService,
   SqliteOnlineBackupAdapter,
@@ -138,6 +139,10 @@ function manifestDecision() {
 }
 
 let liveLedger: Database.Database | null = null;
+
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts for details.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 async function main(): Promise<void> {
   try {
@@ -559,7 +564,7 @@ async function main(): Promise<void> {
   }
 }
 
-main().catch((error: unknown) => {
+main().then(() => guard.complete()).catch((error: unknown) => {
   console.error(error);
   process.exitCode = 1;
 });

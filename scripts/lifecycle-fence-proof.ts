@@ -16,6 +16,7 @@ import path from "node:path";
 
 delete process.env.PLIMSOLL_HOME;
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   LifecycleInterruption,
   LifecycleManager,
@@ -141,6 +142,10 @@ function fixture(name: string) {
     new FilesystemLifecycleAdapter(paths, service, database, authority);
   return { paths, compose, artifact, counters, delays };
 }
+
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts for details.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 async function main() {
   // ---- Authority primitives ------------------------------------------------
@@ -513,6 +518,7 @@ async function main() {
 }
 
 main().then(() => {
+  guard.complete();
   process.exit(checks.every((row) => row.passed) ? 0 : 1);
 }).catch((error: unknown) => {
   console.error(String(error));

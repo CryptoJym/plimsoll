@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   PROOF_CHECKS,
   collectPrivacySpecModel,
@@ -30,6 +31,12 @@ function check(
   run();
   checks.push({ name, adversarial });
 }
+
+// Refuses the two silent-green modes — an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts for why each is needed.
+const guard = guardProofCompletion({
+  countChecks: () => checks.length,
+});
 
 function mutatedModel(mutate: (model: PrivacySpecModel) => void): PrivacySpecModel {
   const model = collectPrivacySpecModel();
@@ -191,3 +198,4 @@ console.log(`privacy spec proof: ${checks.length}/${checks.length} checks passed
 for (const entry of checks) {
   console.log(`  ✓${entry.adversarial ? " [adversarial]" : ""} ${entry.name}`);
 }
+guard.complete();

@@ -6,6 +6,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   canonicalBytes,
   digest,
@@ -16,6 +17,10 @@ import {
   supportContractPath,
   type SupportingNormalizationContext,
 } from "./system-e2e/contract";
+
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts.
+const guard = guardProofCompletion();
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const fixturePath = path.join(repoRoot, "scripts", "system-e2e", "fixtures", "path-normalization.json");
@@ -266,3 +271,4 @@ console.log(JSON.stringify({
   actualChildSemanticDigest: actualChildDigest,
   actualChildMysteryPathRejected: true,
 }, null, 2));
+guard.complete();

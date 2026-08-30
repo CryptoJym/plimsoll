@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   captureLaunchAgentUnloadPriorState,
   observeLaunchAgentUnloadTerminalState,
@@ -236,6 +237,10 @@ function check(name: string, condition: unknown, detail: string) {
   assert.ok(condition, `${name}: ${detail}`);
   checks.push({ name, detail });
 }
+
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 async function main() {
   assert.equal(process.versions.node.split(".")[0], "22", "unload proof requires exact Node 22");
@@ -1246,7 +1251,7 @@ async function main() {
   process.stdout.write(`${JSON.stringify(receipt, null, 2)}\n`);
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });

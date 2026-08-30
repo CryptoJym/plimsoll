@@ -5,6 +5,7 @@ import { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { SqliteOnlineBackupAdapter } from "../packages/collector-cli/src/lifecycle-adapters";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
@@ -43,6 +44,10 @@ function olden(buffer: LocalEventBuffer, id: string) {
 function prune(buffer: LocalEventBuffer, maxRows: number) {
   return buffer.prune(0, { maxRows });
 }
+
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts for details.
+const guard = guardProofCompletion();
 
 async function main() {
 try {
@@ -183,3 +188,4 @@ try {
 }
 
 await main();
+guard.complete();

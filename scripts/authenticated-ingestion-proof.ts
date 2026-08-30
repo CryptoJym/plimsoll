@@ -12,6 +12,7 @@ import os from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import {
@@ -89,6 +90,10 @@ function totalChanges(buffer: LocalEventBuffer) {
     (buffer.database.prepare("select total_changes() as count").get() as { count: number }).count,
   );
 }
+
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 async function main() {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-authenticated-ingestion-"));
@@ -277,7 +282,7 @@ async function main() {
   if (failed.length > 0) process.exitCode = 1;
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   console.error(JSON.stringify({ error: "authenticated_ingestion_proof_failed", reason: error instanceof Error ? error.message : "unknown" }));
   process.exitCode = 1;
 });

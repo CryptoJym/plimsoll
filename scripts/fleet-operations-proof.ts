@@ -18,6 +18,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   ALLOWED_FLEET_TRANSITIONS,
   DEFAULT_SIGNAL_STALENESS_MS,
@@ -57,6 +58,12 @@ function check(
   assert.ok(condition, `${name}: ${JSON.stringify(detail)}`);
   checks.push({ name, adversarial, detail });
 }
+
+// Refuses the two silent-green modes — an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts for why each is needed.
+const guard = guardProofCompletion({
+  countChecks: () => checks.length,
+});
 
 function readFixture(name: string): Record<string, unknown> {
   return JSON.parse(fs.readFileSync(path.join(hostileDir, name), "utf8")) as Record<string, unknown>;
@@ -521,3 +528,4 @@ console.log(
     2,
   ),
 );
+guard.complete();

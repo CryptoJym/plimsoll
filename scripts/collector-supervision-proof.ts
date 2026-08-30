@@ -6,6 +6,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   check,
   watch,
@@ -219,6 +220,10 @@ async function stopOwner(watched: WatchedChild) {
   }
   await waitForExit(watched.child);
 }
+
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts.
+const guard = guardProofCompletion();
 
 async function main() {
   const root = path.resolve(import.meta.dirname, "..");
@@ -1160,7 +1165,7 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });
