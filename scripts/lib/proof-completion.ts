@@ -26,15 +26,36 @@
  * scenario — or exited early through a path that still printed something —
  * cannot read as a pass.
  *
- * Install at the entrypoint, before `main()` is invoked:
+ * Two installation forms, both valid. Pick by how much the proof can tell you.
  *
- *   const guard = guardProofCompletion({
- *     expectedChecks: EXPECTED_CHECKS,
- *     countChecks: () => checks.length,
- *   });
+ * 1. INLINE — the proof knows its exact check count up front. Completion is
+ *    asserted before the receipt is printed, so a short run never emits a
+ *    "pass" receipt at all:
  *
- * then call `guard.complete()` inside `main()` immediately before the receipt
- * is printed.
+ *      const guard = guardProofCompletion({
+ *        expectedChecks: EXPECTED_CHECKS,
+ *        countChecks: () => checks.length,
+ *      });
+ *
+ *    then call `guard.complete()` inside `main()` immediately before the
+ *    receipt is printed.
+ *
+ * 2. ENTRYPOINT — the proof registers checks dynamically, or its receipt is
+ *    printed from several places. Complete on the settled main promise and let
+ *    the script's own reporter handle the throw:
+ *
+ *      const guard = guardProofCompletion({ countChecks: () => checks.length });
+ *
+ *      main().then(() => guard.complete()).catch((error) => { ...existing... });
+ *
+ *    A count mismatch rejects into the script's existing `.catch`, which
+ *    already prints a failure and sets a non-zero exit code.
+ *
+ * `expectedChecks` and `countChecks` are both optional. Omit `expectedChecks`
+ * when the count is not fixed — the drain and hang refusals, which are the
+ * reason this module exists, do not depend on it. Omit `countChecks` too when
+ * the proof keeps no check tally; the guard then reports without counts rather
+ * than inventing one.
  */
 import assert from "node:assert/strict";
 
@@ -44,30 +65,48 @@ export const DEFAULT_PROOF_WATCHDOG_MS = 120_000;
 export type ProofCompletionGuard = {
   /**
    * Assert the full check set ran, then disarm both guards. Call this inside
-   * `main()` immediately before printing the receipt — never at the top.
+   * `main()` immediately before printing the receipt — never at the top — or
+   * on the settled main promise at the entrypoint.
    */
   complete: () => void;
-  /** The count `complete()` enforces, for inclusion in a receipt. */
-  readonly expectedChecks: number;
+  /**
+   * The count `complete()` enforces, for inclusion in a receipt.
+   * `undefined` when the proof does not declare a fixed count.
+   */
+  readonly expectedChecks: number | undefined;
 };
 
 export function guardProofCompletion(options: {
-  /** How many checks a complete run must register. */
-  expectedChecks: number;
+  /**
+   * How many checks a complete run must register. Omit when the count is not
+   * fixed; the drain and hang refusals do not depend on it.
+   */
+  expectedChecks?: number;
   /** Reads the live check count. Called lazily, at failure time. */
-  countChecks: () => number;
+  countChecks?: () => number;
   /** Hang ceiling. Defaults to {@link DEFAULT_PROOF_WATCHDOG_MS}. */
   watchdogMs?: number;
-}): ProofCompletionGuard {
+} = {}): ProofCompletionGuard {
   const { expectedChecks, countChecks } = options;
   const watchdogMs = options.watchdogMs ?? DEFAULT_PROOF_WATCHDOG_MS;
   let completed = false;
+
+  // Counting must never be what breaks the guard: a proof whose tally throws
+  // mid-teardown still has to report the drain or hang it was installed for.
+  const safeCount = (): number | undefined => {
+    if (!countChecks) return undefined;
+    try {
+      return countChecks();
+    } catch {
+      return undefined;
+    }
+  };
 
   const report = (error: string) => {
     console.error(JSON.stringify({
       status: "fail",
       error,
-      checksRun: countChecks(),
+      checksRun: safeCount(),
       expected: expectedChecks,
     }, null, 2));
   };
@@ -91,11 +130,19 @@ export function guardProofCompletion(options: {
   return {
     expectedChecks,
     complete() {
-      assert.equal(
-        countChecks(),
-        expectedChecks,
-        `expected ${expectedChecks} checks, ran ${countChecks()}`,
-      );
+      // The count assertion is an extra, only available when the proof both
+      // declares a fixed total and can tally what it ran. When either is
+      // absent the drain and hang refusals still stand on their own — they
+      // are the reason this module exists. Asserting against an absent count
+      // would turn a guard into a false alarm.
+      if (expectedChecks !== undefined && countChecks) {
+        const ran = countChecks();
+        assert.equal(
+          ran,
+          expectedChecks,
+          `expected ${expectedChecks} checks, ran ${ran}`,
+        );
+      }
       completed = true;
       clearTimeout(watchdog);
     },
