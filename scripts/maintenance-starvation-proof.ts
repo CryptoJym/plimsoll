@@ -26,6 +26,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { CollectorMaintenance } from "../packages/collector-cli/src/maintenance";
 import {
@@ -867,7 +868,13 @@ async function starvationReceiptReflectsBacklogProof(root: string) {
 
 /** Every scenario above must register exactly one check. */
 const EXPECTED_CHECKS = 5;
-let completed = false;
+
+// Refuses the two silent-green modes — an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts for why each is needed.
+const guard = guardProofCompletion({
+  expectedChecks: EXPECTED_CHECKS,
+  countChecks: () => checks.length,
+});
 
 async function main() {
   // Bound to the range package.json actually declares. Pinning one exact
@@ -885,45 +892,12 @@ async function main() {
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
-  assert.equal(checks.length, EXPECTED_CHECKS,
-    `expected ${EXPECTED_CHECKS} checks, ran ${checks.length}`);
-  completed = true;
-  clearTimeout(watchdog);
+  guard.complete();
   const receipt = { status: "pass", checks };
   assert.equal(JSON.stringify(receipt).includes(SENTINEL), false,
     "the receipt must remain path-free");
   console.log(JSON.stringify(receipt, null, 2));
 }
-
-// A hang that still holds a live handle never reaches the exit guard below,
-// so it would sit forever instead of failing. The watchdog is unref'd: it can
-// only fire while something else is keeping the loop alive, which is exactly
-// the hang case.
-const WATCHDOG_MS = 120_000;
-const watchdog = setTimeout(() => {
-  console.error(JSON.stringify({
-    status: "fail",
-    error: "proof_watchdog_timeout",
-    checksRun: checks.length,
-    expected: EXPECTED_CHECKS,
-  }, null, 2));
-  process.exit(1);
-}, WATCHDOG_MS);
-watchdog.unref();
-
-// An unresolved await inside a scenario drains the event loop and Node then
-// exits 0 with no output — a silent green that hides every unrun check. The
-// same silence this proof exists to abolish is refused here too.
-process.on("exit", (code) => {
-  if (completed || code !== 0) return;
-  console.error(JSON.stringify({
-    status: "fail",
-    error: "proof_exited_before_completion",
-    checksRun: checks.length,
-    expected: EXPECTED_CHECKS,
-  }, null, 2));
-  process.exitCode = 1;
-});
 
 main().catch((error) => {
   console.error(JSON.stringify({
