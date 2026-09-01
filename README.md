@@ -77,6 +77,11 @@ and exit 0. A cold ledger therefore fails honestly until a real token-bearing
 Claude Code or Codex event reaches the collector. Background LaunchAgent mode
 for npm installs is still being fitted — until then `start` runs in a terminal.
 
+The optional macOS menubar companion provides a status-bar glance at collector
+state, event count, and token coverage. See
+[packages/mac-menubar](packages/mac-menubar) for SwiftPM build instructions;
+App Store packaging is separate release work.
+
 The packaged CLI also ships transactional lifecycle commands backed by an
 immutable, version-pinned runtime
 ([docs/local-lifecycle.md](docs/local-lifecycle.md)):
