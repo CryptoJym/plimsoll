@@ -16,6 +16,7 @@ import {
   runtimeIdentityMatches,
   type CollectorListenerObservation,
   type CollectorPidCleanupResult,
+  type CollectorPidCleanupState,
   type CollectorPidFileRead,
   type CollectorRuntimeIdentity,
   type LaunchAgentLabelObservation,
@@ -88,6 +89,9 @@ type Snapshot = {
   listener: CollectorListenerObservation;
   pid: CollectorPidFileRead;
   live: CollectorRuntimeIdentity[];
+  // Optional injected private-cleanup artifact state for this snapshot.
+  // When absent, the pass observes fully retired cleanup state.
+  cleanup?: CollectorPidCleanupState;
 };
 
 type Scenario = {
@@ -98,6 +102,10 @@ type Scenario = {
   timeoutMs?: number;
   pollIntervalMs?: number;
   removeOwnedPid?: boolean;
+  // Simulated CPU starvation: each observer probe advances the wall clock by
+  // this amount before reporting, so observation passes consume real time
+  // that must NOT be charged against the system's settle budget.
+  observerOverheadMsPerCall?: number;
 };
 
 function identity(seed: number): CollectorRuntimeIdentity {
@@ -147,6 +155,32 @@ const reported = (owner: CollectorRuntimeIdentity | null): LaunchAgentLabelObser
 });
 const gone = (): LaunchAgentLabelObservation => ({ kind: "not_reported" });
 
+function cleanCleanupState(): CollectorPidCleanupState {
+  return Object.freeze({
+    ambiguous: false,
+    markerState: "missing",
+    claimCount: 0,
+    quarantineCount: 0,
+    inventoryTruncated: false,
+    unsafeArtifactCount: 0,
+  });
+}
+
+function cleanupStateFixture(fixtures: {
+  markerPresent?: boolean;
+  quarantineCount?: number;
+}): CollectorPidCleanupState {
+  const quarantineCount = fixtures.quarantineCount ?? 0;
+  return Object.freeze({
+    ambiguous: Boolean(fixtures.markerPresent) || quarantineCount > 0,
+    markerState: fixtures.markerPresent ? "present" : "missing",
+    claimCount: 0,
+    quarantineCount,
+    inventoryTruncated: false,
+    unsafeArtifactCount: 0,
+  });
+}
+
 async function runScenario(scenario: Scenario) {
   let clock = 0;
   let clockReads = 0;
@@ -154,14 +188,17 @@ async function runScenario(scenario: Scenario) {
   let activeSnapshot = scenario.snapshots[0]!;
   let receiptBoundaryActive = false;
   let removals = 0;
+  const overheadMs = scenario.observerOverheadMsPerCall ?? 0;
   const snapshot = () => activeSnapshot;
   const observeLabel = () => {
+    clock += overheadMs;
     activeSnapshot = receiptBoundaryActive && scenario.receiptBoundarySnapshot
       ? scenario.receiptBoundarySnapshot
       : scenario.snapshots[Math.min(snapshotIndex, scenario.snapshots.length - 1)]!;
     return activeSnapshot.label;
   };
   const observeListener = async () => {
+    clock += overheadMs;
     const listener = snapshot().listener;
     snapshotIndex += 1;
     return listener;
@@ -172,6 +209,7 @@ async function runScenario(scenario: Scenario) {
       owner.processStartFingerprint === candidate.processStartFingerprint
     ) ? "live" : "stale";
   const readPidFile = () => snapshot().pid;
+  const readCleanupState = () => snapshot().cleanup ?? cleanCleanupState();
   const removePidFile = (_pidPath: string, candidate: CollectorRuntimeIdentity) => {
     if (!scenario.removeOwnedPid) return fixtureCleanupResult(false);
     const read = snapshot().pid;
@@ -202,6 +240,7 @@ async function runScenario(scenario: Scenario) {
     observeListener,
     classifyIdentity: classify,
     readPidFile,
+    readCleanupState,
     removePidFile,
     now: () => {
       clockReads += 1;
@@ -498,6 +537,133 @@ async function main() {
       !unsafePid.outcome.stopped &&
       unsafePid.outcome.state === "indeterminate",
     "Unsafe PID-file state is retained as an ownership blocker, never promoted to missing.",
+  );
+
+  // Issue #202: CPU starvation must not consume the settle window. Each
+  // observer probe burns 1500ms of wall clock (simulated starvation) while
+  // the system itself only ever gets 500ms settle waits. The owner settles
+  // on the fifth pass; a wall-clock deadline would have given up mid-teardown.
+  const starvedObserver = await runScenario({
+    name: "starved-observer",
+    prior: stopping(owner),
+    snapshots: [
+      stopping(owner),
+      stopping(owner),
+      stopping(owner),
+      stopping(owner),
+      terminal(owner),
+    ],
+    timeoutMs: 4_000,
+    pollIntervalMs: 500,
+    observerOverheadMsPerCall: 1_500,
+  });
+  check(
+    "observer_starvation_does_not_consume_the_settle_window",
+    starvedObserver.outcome.stopped &&
+      !starvedObserver.outcome.timing.deadlineCrossed &&
+      starvedObserver.outcome.timing.settleWaitedMs === 2_000 &&
+      starvedObserver.outcome.timing.observerOverheadMs === 18_000 &&
+      starvedObserver.outcome.timing.elapsedMs ===
+        starvedObserver.outcome.timing.settleWaitedMs +
+          starvedObserver.outcome.timing.observerOverheadMs,
+    "A load-starved observer still grants the dying owner its full accounted settle window and reports the accounting honestly. timing=" +
+      JSON.stringify(starvedObserver.outcome.timing) +
+      " state=" + starvedObserver.outcome.state,
+  );
+
+  // Issue #202 adversarial: transient cleanup ambiguity seen while the
+  // SIGTERM'd owner's own cleanup transaction is in flight must not latch.
+  // Once that transaction retires, a fully settled state is stopped truth.
+  const healingAmbiguity = await runScenario({
+    name: "healing-ambiguity",
+    prior: stopping(owner),
+    snapshots: [
+      {
+        ...stopping(owner),
+        cleanup: cleanupStateFixture({ markerPresent: true }),
+      },
+      terminal(owner),
+    ],
+    timeoutMs: 200,
+    pollIntervalMs: 50,
+  });
+  check(
+    "transient_teardown_cleanup_ambiguity_self_heals_to_stopped",
+    healingAmbiguity.outcome.stopped &&
+      !healingAmbiguity.outcome.pidCleanupAmbiguous &&
+      !healingAmbiguity.outcome.final.pidCleanupAmbiguous &&
+      !healingAmbiguity.outcome.timing.deadlineCrossed,
+    "In-flight teardown ambiguity retires with the owner's transaction instead of poisoning the final verdict.",
+  );
+
+  // Safety pin: durable ambiguity that does NOT retire keeps the unload
+  // refused even though label, listener, process, and PID record are gone.
+  const durableAmbiguity = await runScenario({
+    name: "durable-ambiguity",
+    prior: { label: gone(), listener: absent(), pid: missing(), live: [] },
+    snapshots: [{
+      label: gone(),
+      listener: absent(),
+      pid: missing(),
+      live: [],
+      cleanup: cleanupStateFixture({ markerPresent: true }),
+    }],
+    timeoutMs: 0,
+  });
+  check(
+    "durable_cleanup_ambiguity_keeps_unload_refused",
+    !durableAmbiguity.outcome.stopped &&
+      durableAmbiguity.outcome.state === "indeterminate" &&
+      durableAmbiguity.outcome.pidCleanupAmbiguous &&
+      !durableAmbiguity.outcome.pidCleaned,
+    "A marker that stays present at the final aggregate read still fails closed.",
+  );
+
+  // Safety pin: a quarantine is never produced by healthy teardown, so it
+  // remains session-visible even if the artifact later disappears; it can
+  // never be silently promoted to stopped truth.
+  const clearedQuarantine = await runScenario({
+    name: "cleared-quarantine",
+    prior: { label: gone(), listener: absent(), pid: missing(), live: [] },
+    snapshots: [
+      {
+        label: gone(),
+        listener: absent(),
+        pid: missing(),
+        live: [],
+        cleanup: cleanupStateFixture({ quarantineCount: 1 }),
+      },
+      terminal(owner),
+    ],
+    timeoutMs: 200,
+    pollIntervalMs: 50,
+  });
+  check(
+    "quarantine_remains_session_visible_and_blocks_stopped_truth",
+    !clearedQuarantine.outcome.stopped &&
+      clearedQuarantine.outcome.state === "indeterminate" &&
+      clearedQuarantine.outcome.pidCleanupQuarantined &&
+      clearedQuarantine.outcome.pidCleanupAmbiguous &&
+      clearedQuarantine.outcome.timing.deadlineCrossed,
+    "A replacement collision seen this session is never forgotten or promoted, even after the artifact vanishes.",
+  );
+
+  // Not-looser pin: an unresolved system still exhausts exactly its settle
+  // budget and fails closed with the same states as before the fix.
+  const unresolved = await runScenario({
+    name: "unresolved-system",
+    prior: stopping(owner),
+    snapshots: [stopping(owner), stopping(owner), stopping(owner)],
+    timeoutMs: 100,
+    pollIntervalMs: 50,
+  });
+  check(
+    "unresolved_system_exactly_exhausts_settle_budget_and_fails_closed",
+    !unresolved.outcome.stopped &&
+      unresolved.outcome.state === "still_stopping" &&
+      unresolved.outcome.timing.deadlineCrossed &&
+      unresolved.outcome.timing.settleWaitedMs === unresolved.outcome.timing.timeoutMs,
+    "Without settling, the wait ends precisely at the accounted budget and reports still_stopping.",
   );
 
   const pidFixtureRoot = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-unload-pid-"));

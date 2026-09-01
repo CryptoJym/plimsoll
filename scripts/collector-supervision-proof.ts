@@ -511,6 +511,13 @@ async function main() {
     // still hold undrained receipt bytes; only 'close' guarantees the streams
     // are drained (issue #187 class 2 — the empty-aggregate false red).
     const truthfulUnloadExit = await waitForExit(truthfulUnload.child, 60_000);
+    // Exit-code truth is checked before the receipt predicate so a nonzero
+    // exit (issue #202's refused/indeterminate false red) reports the CLI's
+    // own verdict and timing instead of masquerading as an aggregate problem.
+    check(
+      truthfulUnloadExit.code === 0,
+      "Truthful aggregate unload exited nonzero. output=" + truthfulUnload.output,
+    );
     check(
       truthfulUnload.receipts.some(
         (receipt) =>
@@ -522,7 +529,6 @@ async function main() {
       ),
       "Unload did not report the aggregate terminal state: " + truthfulUnload.output,
     );
-    check(truthfulUnloadExit.code === 0, "Truthful aggregate unload exited nonzero.");
     await waitForExit(unloadOwner.child);
     const truthfulReceipt = truthfulUnload.receipts.find((receipt) => receipt.unloaded === true);
     check(
