@@ -151,6 +151,9 @@ jobs:
       - name: Diff-check the published privacy spec freshness (#13)
         run: pnpm docs:privacy --check
 
+      - name: Prove README release command contract (#1)
+        run: pnpm proof:release-readiness
+
       - name: Upload evidence artifact
         if: always()
         uses: actions/upload-artifact@v4

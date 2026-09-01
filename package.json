@@ -78,6 +78,7 @@
     "proof:capacity-contract": "tsx scripts/provider-capacity-sync-proof.ts",
     "proof:capacity-adapters": "tsx scripts/provider-capacity-adapters-proof.ts",
     "proof:release-qualification": "tsx scripts/release-qualification-proof.ts",
+    "proof:release-readiness": "tsx scripts/release-readiness-proof.ts",
     "proof:privacy-spec": "tsx scripts/privacy-spec-proof.ts",
     "docs:privacy": "tsx scripts/privacy-spec.ts",
     "backfill:outcome-performance": "tsx packages/collector-cli/src/cli.ts backfill-outcome-performance",
