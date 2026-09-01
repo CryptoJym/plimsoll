@@ -127,6 +127,9 @@ jobs:
       - name: Prove transactional join and workspace isolation
         run: pnpm proof:join-isolation
 
+      - name: Prove client-side fleet release gate
+        run: pnpm proof:fleet-release-gate
+
       - name: Prove immutable outcome timeline and bounded recovery
         run: pnpm proof:outcome-timeline
 

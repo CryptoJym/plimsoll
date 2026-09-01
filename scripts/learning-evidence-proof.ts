@@ -970,5 +970,136 @@ prove(
   "second run reports zero work and does not replace/rewrite the JSON packet",
 );
 
+prove(
+  "model-version change is stratified, disclosed, and never silently pooled",
+  () => {
+    const balancedModels = [
+      ...Array.from({ length: 3 }, (_, index) => pair(
+        `model-a-${index}`,
+        12,
+        10,
+        cohort({
+          modelId: "model-v1",
+          actorClusterId: `model-actor-a-${index}`,
+          repoClusterId: `model-repo-a-${index}`,
+        }),
+      )),
+      ...Array.from({ length: 3 }, (_, index) => pair(
+        `model-b-${index}`,
+        11,
+        10,
+        cohort({
+          modelId: "model-v2",
+          actorClusterId: `model-actor-b-${index}`,
+          repoClusterId: `model-repo-b-${index}`,
+        }),
+      )),
+    ];
+    const balancedResult = compileLearningEvidencePacket(manifestFor(balancedModels));
+    assert.equal(balancedResult.status, "computed");
+    if (balancedResult.status === "computed") {
+      assert.equal(balancedResult.packet.sample.protectedStratumCount, 2);
+      assert.equal(balancedResult.packet.effect.protectedStratumDirectionHeterogeneous, false);
+      assert.equal(balancedResult.packet.claimClass, "observational_association");
+      assert.ok(!balancedResult.packet.notEstimableReasons.includes("simpson_reversal"));
+    }
+
+    // A mid-window model upgrade flips the sign only when the pooled crude
+    // average hides it. Equal-weight model strata expose the flip and fail closed.
+    const flippedModels = [
+      ...Array.from({ length: 5 }, (_, index) => pair(
+        `flip-model-a-${index}`,
+        12,
+        10,
+        cohort({
+          modelId: "model-v1",
+          actorClusterId: `flip-actor-a-${index}`,
+          repoClusterId: `flip-repo-a-${index}`,
+        }),
+      )),
+      pair(
+        "flip-model-b-0",
+        4,
+        10,
+        cohort({
+          modelId: "model-v2",
+          actorClusterId: "flip-actor-b-0",
+          repoClusterId: "flip-repo-b-0",
+        }),
+      ),
+    ];
+    const flippedResult = compileLearningEvidencePacket(manifestFor(flippedModels));
+    assert.equal(flippedResult.status, "computed");
+    if (flippedResult.status === "computed") {
+      assert.ok((flippedResult.packet.effect.crudePairWeightedEstimate ?? 0) > 0);
+      assert.ok((flippedResult.packet.effect.equalStratumEstimate ?? 0) < 0);
+      assert.equal(flippedResult.packet.effect.protectedStratumDirectionHeterogeneous, true);
+      assert.ok(flippedResult.packet.notEstimableReasons.includes("simpson_reversal"));
+      assert.equal(flippedResult.packet.claimClass, "not_estimable");
+      assert.equal(flippedResult.packet.effect.rawEstimate, null);
+      assert.equal(flippedResult.packet.skillCandidateReview.publicationAuthorized, false);
+    }
+
+    // A model-cohort change alters the exact source rows, so the weekly job's
+    // no-op fingerprint misses and the analysis reruns instead of skipping.
+    const changedModel = manifestFor(basePairs.map((item) => structuredClone(item)));
+    changedModel.pairs[0].exposed.cohort.modelId = "model-v2";
+    changedModel.pairs[0].control.cohort.modelId = "model-v2";
+    changedModel.source.rowDigest = computeLearningPairDigest(changedModel.pairs);
+    assert.notEqual(computeLearningSourceFingerprint(changedModel), baseRun.sourceFingerprint);
+    const rerun = compileLearningEvidencePacket(changedModel, {
+      previousSourceFingerprint: baseRun.sourceFingerprint,
+    });
+    assert.equal(rerun.status, "computed");
+    if (rerun.status === "computed") assert.ok(rerun.analysisWorkUnits > 0);
+  },
+  "model upgrades form explicit protected strata; hidden sign flips fail closed; cohort drift forces re-analysis",
+);
+
+prove(
+  "quality non-inferiority evidence stays review-only and cannot auto-publish",
+  () => {
+    // Base evidence already favors the technique with a strictly positive
+    // worst-case bound — non-inferior by any margin for higher_is_better.
+    const lower = baseRun.packet.effect.lowerBound;
+    assert.ok(lower !== null && lower > 0, "fixture must be genuinely non-inferior");
+    const review = baseRun.packet.skillCandidateReview;
+    assert.equal(review.publicationAuthorized, false);
+    assert.equal(review.installationAuthorized, false);
+    assert.equal(review.ownerApprovalRequired, true);
+    assert.equal(review.independentVerificationRequired, true);
+    assert.equal(review.inventoryDisposition, "insufficient_evidence");
+    assert.equal(review.currentState, "observed");
+
+    // Adversarial: a perfect, zero-variance result still cannot flip a single
+    // authorization flag or move past the observed lifecycle state.
+    const perfectPairs = Array.from({ length: 8 }, (_, index) =>
+      pair(
+        `perfect-${index}`,
+        1,
+        0,
+        cohort({
+          actorClusterId: `perfect-actor-${index}`,
+          repoClusterId: `perfect-repo-${index}`,
+        }),
+      ),
+    );
+    const perfectResult = compileLearningEvidencePacket(manifestFor(perfectPairs));
+    assert.equal(perfectResult.status, "computed");
+    if (perfectResult.status === "computed") {
+      assert.equal(perfectResult.packet.effect.rawEstimate, 1);
+      assert.equal(perfectResult.packet.effect.lowerBound, 1);
+      assert.equal(perfectResult.packet.effect.upperBound, 1);
+      assert.equal(perfectResult.packet.claimClass, "observational_association");
+      assert.equal(perfectResult.packet.skillCandidateReview.publicationAuthorized, false);
+      assert.equal(perfectResult.packet.skillCandidateReview.installationAuthorized, false);
+      assert.equal(perfectResult.packet.skillCandidateReview.ownerApprovalRequired, true);
+      assert.equal(perfectResult.packet.causalClaim, false);
+      assert.equal(perfectResult.packet.prescriptiveClaim, false);
+    }
+  },
+  "even a perfect non-inferior outcome leaves publication/installation unauthorized and owner approval required",
+);
+
 console.log(`learning evidence proof: ${checks.length}/${checks.length} checks passed`);
 for (const check of checks) console.log(`  ✓ ${check.name} — ${check.detail}`);
