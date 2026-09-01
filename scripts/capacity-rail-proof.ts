@@ -237,9 +237,22 @@ function factsDoc(overrides: Record<string, unknown> = {}): Record<string, unkno
     { surfacePath },
   );
   // Idempotent re-refresh converges instead of duplicating.
-  buffer.capacityRail.applyProviderFacts(factsDoc());
+  const firstRefresh = buffer.capacityRail.applyProviderFacts(factsDoc());
   const snapshotsAfter = buffer.database.prepare(`select count(*) as n from capacity_rail_snapshots`).get() as { n: number };
-  prove("refresh_is_idempotent_by_exact_timestamp", snapshotsAfter.n === 3, snapshotsAfter);
+  const secondRefresh = buffer.capacityRail.applyProviderFacts(factsDoc());
+  const snapshotsAfterIdenticalRefresh = buffer.database
+    .prepare(`select count(*) as n from capacity_rail_snapshots`)
+    .get() as { n: number };
+  prove(
+    "refresh_records_new_exact_timestamp_once",
+    firstRefresh.snapshotsRecorded === 1 && snapshotsAfter.n === 3,
+    { firstRefresh, snapshotsAfter },
+  );
+  prove(
+    "identical_refresh_is_a_no_op_without_duplicate_snapshot",
+    secondRefresh.snapshotsRecorded === 0 && snapshotsAfterIdenticalRefresh.n === 3,
+    { secondRefresh, snapshotsAfterIdenticalRefresh },
+  );
   buffer.close();
   fs.rmSync(home, { recursive: true, force: true });
 }

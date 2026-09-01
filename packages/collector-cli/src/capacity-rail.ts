@@ -573,6 +573,14 @@ export class CapacityRailStore {
          used_value = excluded.used_value, source = excluded.source,
          observed_at = excluded.observed_at, updated_at = excluded.updated_at`,
     );
+    // A provider may replay the same observation when an owner refreshes a
+    // cached report. The observation identity is its profile, dimension, and
+    // observed timestamp; replaying it must not grow the exact-change log or
+    // inflate the window/daily sample counts.
+    const existingSnapshot = this.database.prepare(
+      `select 1 from capacity_rail_snapshots
+       where profile_id = ? and dimension = ? and observed_at = ? limit 1`,
+    );
     const ordered = [...facts.observations].sort((left, right) =>
       left.observedAt.localeCompare(right.observedAt),
     );
@@ -582,7 +590,17 @@ export class CapacityRailStore {
       }
       const touchedWindows = new Set<string>();
       const touchedDays = new Set<string>();
+      const appliedObservations: typeof ordered = [];
       for (const observation of ordered) {
+        if (
+          existingSnapshot.get(
+            observation.profileId,
+            observation.dimension,
+            observation.observedAt,
+          )
+        ) {
+          continue;
+        }
         insertSnapshot.run(
           observation.profileId,
           observation.dimension,
@@ -593,6 +611,7 @@ export class CapacityRailStore {
           observation.observedAt,
           now,
         );
+        appliedObservations.push(observation);
         const bucketStart = railBucketStart(observation.observedAt);
         upsertWindow.run(
           bucketStart,
@@ -632,11 +651,11 @@ export class CapacityRailStore {
       return {
         appliedAt: now,
         profilesRegistered: facts.profiles.length,
-        snapshotsRecorded: ordered.length,
+        snapshotsRecorded: appliedObservations.length,
         windowBucketsTouched: touchedWindows.size,
         dailySummariesTouched: touchedDays.size,
         latestRowsReplaced: new Set(
-          ordered.map((observation) => `${observation.profileId}\u0000${observation.dimension}`),
+          appliedObservations.map((observation) => `${observation.profileId}\u0000${observation.dimension}`),
         ).size,
       };
     });
