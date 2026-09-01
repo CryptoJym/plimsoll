@@ -82,6 +82,13 @@ import {
   uninstallLaunchAgent,
 } from "./launch-agent";
 import {
+  daemonBackend,
+  installSystemdUserUnit,
+  readSystemdUserUnitState,
+  systemdUserStopCommand,
+  type SystemdUserUnitState,
+} from "./daemon";
+import {
   defaultLifecycleAuthorityRoot,
   LifecycleMutationAuthority,
   type LifecycleMutationLease,
@@ -232,6 +239,7 @@ Commands:
   load-launch-agent     Load an installed user LaunchAgent plist
   unload-launch-agent   Unload the user LaunchAgent without removing the plist
   uninstall-launch-agent Remove the user LaunchAgent plist
+  install-daemon        Install and enable the platform daemon (systemd user on Linux, LaunchAgent on macOS)
   lifecycle             Transactional runtime update/rollback, preview-default
                         uninstall/purge, and sanitized support bundle (see below)
   label account HASH NAME    Set a local-only display label for a hashed account
@@ -290,6 +298,8 @@ Config tools:
        dependencies are reported as not_estimable, never substituted.
   install-launch-agent [--load] [--dry-run]
   install-launch-agent --dev [--repo-root PATH] [--pnpm PATH] [--load]
+  install-daemon [--dry-run]
+  install-daemon --dev [--repo-root PATH] [--pnpm PATH]
   load-launch-agent
   unload-launch-agent
   uninstall-launch-agent [--unload] [--dry-run]
@@ -1452,7 +1462,7 @@ async function main() {
           handshake: result.handshake,
           nextSteps: [
             "plimsoll status   # syncConfigured: true; existing history was not part of the handshake",
-            "restart a running collector (or: plimsoll install-launch-agent && plimsoll load-launch-agent) so the daemon picks up sync",
+            "restart a running collector (or: plimsoll install-daemon) so the daemon picks up sync",
           ],
         },
         null,
@@ -1474,6 +1484,7 @@ async function main() {
     "load-launch-agent",
     "unload-launch-agent",
     "uninstall-launch-agent",
+    "install-daemon",
     "lifecycle",
   ]);
   const configRead = noCreateConfigCommands.has(command) ? readCollectorConfig() : null;
@@ -2238,7 +2249,7 @@ async function main() {
           claude: { path: resultClaude.path, changed: resultClaude.changed, backup: resultClaude.backupPath ?? null },
           codex: { path: resultCodex.path, changed: resultCodex.changed, backup: resultCodex.backupPath ?? null, conflict: resultCodex.conflict ?? null },
           nextSteps: [
-            "plimsoll install-launch-agent && plimsoll load-launch-agent",
+            "plimsoll install-daemon",
             "open http://127.0.0.1:" + config.port + "/",
             "restart any running Claude Code / Codex sessions so they pick up telemetry",
           ],
@@ -2316,7 +2327,8 @@ async function main() {
   }
 
   if (command === "doctor") {
-    const plistPath = launchAgentPlistPath();
+    const backend = daemonBackend();
+    const plistPath = process.platform === "darwin" ? launchAgentPlistPath() : null;
     const pidPath = collectorLogPath("collector.pid");
     const claudePath = path.join(os.homedir(), ".claude", "settings.json");
     const codexPath = path.join(os.homedir(), ".codex", "config.toml");
@@ -2337,7 +2349,12 @@ async function main() {
     };
     const claude = readClaudeTelemetryConfig(claudePath, generateClaudeCodeSettings(toolOptions));
     const codex = readCodexTelemetryConfig(codexPath, generateCodexConfigToml(toolOptions));
-    const launchAgent = readLaunchAgentState(plistPath);
+    const launchAgent = process.platform === "darwin" && plistPath
+      ? readLaunchAgentState(plistPath)
+      : null;
+    const daemon: typeof launchAgent | SystemdUserUnitState = process.platform === "linux"
+      ? readSystemdUserUnitState()
+      : launchAgent;
     const connectivity = await checkCollectorConnectivity(
       config.port,
       readLocalIngestAuth(collectorHome())?.managementRead,
@@ -2401,7 +2418,7 @@ async function main() {
     // service that runs against a different collector home.
     const serviceReady =
       configured &&
-      launchAgent.ok &&
+      daemon?.ok === true &&
       connectivity.reachable &&
       runtime.ok &&
       daemonHomeMatches !== false;
@@ -2436,6 +2453,11 @@ async function main() {
             ok: claude.ok && codex.ok,
             claude,
             codex,
+          },
+          daemon: {
+            platform: backend.platform,
+            kind: backend.kind,
+            ...(daemon ?? {}),
           },
           launchAgent,
           runtime,
@@ -2972,6 +2994,91 @@ async function main() {
     return;
   }
 
+  if (command === "install-daemon") {
+    const runningScript = process.argv[1] ?? "";
+    const packaged = /\.(mjs|cjs|js)$/.test(runningScript) && fs.existsSync(runningScript);
+    const development = !packaged;
+    if (packaged && flag("--dev")) {
+      throw new Error("Packaged daemon installs do not accept --dev.");
+    }
+    if (!development && (optionValue("--repo-root") || optionValue("--pnpm"))) {
+      throw new Error("--repo-root and --pnpm are development-only options; add --dev.");
+    }
+
+    const stableCliPath = packaged ? fs.realpathSync(runningScript) : null;
+    const repoRoot = development
+      ? optionValue("--repo-root") ?? process.cwd()
+      : path.dirname(stableCliPath ?? process.cwd());
+    const dryRun = flag("--dry-run");
+    const programArguments = development
+      ? undefined
+      : [process.execPath, stableCliPath ?? runningScript, "start"];
+    const workingDirectory = development
+      ? repoRoot
+      : path.dirname(stableCliPath ?? runningScript);
+
+    if (process.platform === "linux") {
+      const result = installSystemdUserUnit({
+        platform: process.platform,
+        repoRoot,
+        pnpmPath: optionValue("--pnpm") ?? "pnpm",
+        programArguments,
+        workingDirectory,
+        dryRun,
+      });
+      console.log(JSON.stringify({
+        ...result.receipt,
+        installed: !dryRun,
+        runtime: development ? "development" : "packaged",
+        unitPath: result.unitPath,
+      }, null, 2));
+      if (!dryRun && !result.receipt.enabled) process.exitCode = 1;
+      return;
+    }
+
+    if (process.platform !== "darwin") {
+      throw new Error(`Unsupported daemon platform: ${process.platform}. Plimsoll supports macOS and Linux.`);
+    }
+    const result = installLaunchAgent({
+      repoRoot,
+      pnpmPath: optionValue("--pnpm") ?? "pnpm",
+      programArguments,
+      workingDirectory,
+      dryRun,
+      ...(dryRun ? {} : { mutationAuthority: launchAgentMutationAuthority() }),
+    });
+    if (dryRun) {
+      console.log(JSON.stringify({
+        ...result.receipt,
+        installed: false,
+        runtime: development ? "development" : "packaged",
+        target: "launch_agent",
+        loadIntent: "would_enable_after_visible_postcondition",
+      }, null, 2));
+      return;
+    }
+    const visible = inspectLaunchAgentManifest();
+    if (!visible.ok || visible.manifestDigest !== result.receipt.manifestDigest) {
+      throw new Error("LaunchAgent visible manifest postcondition failed after install.");
+    }
+    const load = await loadVisibleLaunchAgent(
+      result.plistPath,
+      config.port,
+      result.receipt.changed,
+      launchAgentMutationAuthority(),
+    );
+    console.log(JSON.stringify({
+      ...result.receipt,
+      installed: true,
+      runtime: development ? "development" : "packaged",
+      target: "launch_agent",
+      plistPath: result.plistPath,
+      load,
+    }, null, 2));
+    if (!load.loaded && process.exitCode === undefined) process.exitCode = 1;
+    return;
+  }
+
   if (command === "install-launch-agent") {
     const runningScript = process.argv[1] ?? "";
     const development = flag("--dev");
@@ -3221,6 +3328,45 @@ async function main() {
   }
 
   if (command === "stop") {
+    if (process.platform === "linux") {
+      const backend = daemonBackend("linux");
+      const unitPath = backend.manifestPath();
+      const stopCommand = systemdUserStopCommand();
+      if (!fs.existsSync(unitPath)) {
+        console.log(JSON.stringify({
+          stopped: false,
+          status: "absent",
+          reason: "unit_missing",
+          daemon: {
+            platform: backend.platform,
+            kind: backend.kind,
+            unitPath,
+            stopCommand,
+          },
+        }, null, 2));
+        return;
+      }
+      const stopped = spawnSync(stopCommand[0], stopCommand.slice(1), {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      const stoppedSuccessfully = stopped.status === 0;
+      console.log(JSON.stringify({
+        stopped: stoppedSuccessfully,
+        status: stoppedSuccessfully ? "stopped" : "refused",
+        reason: stoppedSuccessfully ? null : "systemctl_failed",
+        daemon: {
+          platform: backend.platform,
+          kind: backend.kind,
+          unitPath,
+          stopCommand,
+        },
+        exitCode: stopped.status,
+        errorCode: (stopped.error as NodeJS.ErrnoException | undefined)?.code ?? null,
+      }, null, 2));
+      if (!stoppedSuccessfully) process.exitCode = 1;
+      return;
+    }
     const pidPath = collectorLogPath("collector.pid");
     const launchAgentStopCommand = launchctlBootoutCommand().join(" ");
     const initialReconciliation = reconcileCollectorPidCleanupState(

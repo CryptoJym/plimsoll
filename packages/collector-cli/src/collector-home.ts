@@ -38,7 +38,20 @@ export type ResolvedCollectorHome = {
   source: "default" | "env";
 };
 
-export function defaultCollectorHome(homeDir = os.homedir()) {
+export type CollectorPlatform = "darwin" | "linux";
+
+export function defaultCollectorHome(
+  homeDir = os.homedir(),
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+) {
+  if (platform === "linux") {
+    const xdgDataHome = env.XDG_DATA_HOME?.trim();
+    if (xdgDataHome && path.isAbsolute(xdgDataHome)) {
+      return path.join(xdgDataHome, "plimsoll");
+    }
+    return path.join(homeDir, ".local", "share", "plimsoll");
+  }
   return path.join(homeDir, "Library", "Application Support", "Plimsoll");
 }
 
@@ -52,12 +65,20 @@ function lstatSafe(file: string): fs.Stats | null {
 }
 
 export function resolveCollectorHome(
-  options: { env?: NodeJS.ProcessEnv; homeDir?: string; uid?: number } = {},
+  options: {
+    env?: NodeJS.ProcessEnv;
+    homeDir?: string;
+    platform?: NodeJS.Platform;
+    uid?: number;
+  } = {},
 ): ResolvedCollectorHome {
   const env = options.env ?? process.env;
   const raw = env.PLIMSOLL_HOME?.trim();
   if (!raw) {
-    return { home: defaultCollectorHome(options.homeDir), source: "default" };
+    return {
+      home: defaultCollectorHome(options.homeDir, options.platform, env),
+      source: "default",
+    };
   }
   if (/[\u0000-\u001f\u007f-\u009f]/.test(raw)) {
     throw new CollectorHomeError("home_not_absolute", "PLIMSOLL_HOME contains control characters.");

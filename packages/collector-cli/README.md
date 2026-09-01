@@ -72,8 +72,9 @@ separate purge may remove.
 | `setup` | Apply Claude Code + Codex telemetry config (idempotent; `--yes`, `--dry-run`) |
 | `start` / `stop` | Run / stop the local hook + OTLP receiver |
 | `status` | Print local buffer and policy status |
-| `doctor --read-only --json` | Verify Node, collector/tool config, LaunchAgent, runtime identity, connectivity, and token signal without writing |
-| `install-launch-agent` / `load-launch-agent` | Write the user LaunchAgent plist / load an installed one |
+| `doctor --read-only --json` | Verify Node, collector/tool config, platform daemon, runtime identity, connectivity, and token signal without writing |
+| `install-daemon` | Write and enable the platform daemon: systemd user service on Linux, LaunchAgent on macOS |
+| `install-launch-agent` / `load-launch-agent` | macOS-compatible LaunchAgent manifest and load commands |
 | `uninstall-launch-agent` / `unload-launch-agent` | Remove the plist / unload without removing |
 | `lifecycle update\|rollback\|uninstall\|purge\|support-bundle` | Transactional immutable-runtime updates with automatic rollback, preview-default uninstall, exact-confirmation purge, sanitized support bundle |
 | `scan-rollouts` | One-time full-history walk of Codex rollout files into the ledger |
@@ -82,9 +83,8 @@ separate purge may remove.
 | `priority add\|remove\|list` | Manage the priority-repo list (hashed; URLs stay local) |
 | `purge-local-data` | Dry-run or explicit purge of local buffered events |
 
-Background (LaunchAgent) mode for npm installs is still being fitted — track
-[plimsoll#11](https://github.com/CryptoJym/plimsoll/issues/11). For now run
-`start` in a terminal or from the git checkout.
+Source installs can use `install-daemon` to write and enable the platform
+service. Packaged background distribution remains a separate release concern.
 
 ## What leaves your machine
 
