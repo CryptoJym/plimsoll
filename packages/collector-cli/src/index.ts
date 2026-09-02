@@ -1,5 +1,6 @@
 export * from "./buffer";
 export * from "./config";
+export * from "./daemon";
 export * from "./device-identity";
 export * from "./http-transport";
 export * from "./learning-facts";

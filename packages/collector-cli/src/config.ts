@@ -182,11 +182,15 @@ export type CollectorConfigReadResult =
       config: null;
     };
 
-export function collectorHome(homeDir = os.homedir()) {
+export function collectorHome(
+  homeDir = os.homedir(),
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+) {
   // Issue #135: the single canonical resolver. A custom PLIMSOLL_HOME is
   // validated (absolute, user-owned, private, non-symlink) or the command
   // fails closed — it never silently falls back to the default home.
-  return resolveCollectorHome({ homeDir }).home;
+  return resolveCollectorHome({ homeDir, platform, env }).home;
 }
 
 export function collectorConfigPath(homeDir = os.homedir()) {
