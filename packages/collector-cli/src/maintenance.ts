@@ -331,7 +331,12 @@ type RepoCandidate = {
  */
 export function runRepoEnrichmentMaintenance(
   database: Database.Database,
-  options: { legacyBackfillLimit?: number; sessionLimit?: number; eventLimit?: number } = {},
+  options: {
+    legacyBackfillLimit?: number;
+    sessionLimit?: number;
+    eventLimit?: number;
+    skipLegacyBackfill?: boolean;
+  } = {},
 ): RepoEnrichmentMaintenanceResult {
   const legacyBackfillLimit = Math.max(
     1,
@@ -343,7 +348,7 @@ export function runRepoEnrichmentMaintenance(
   return database.transaction(() => {
     let backfillComplete = maintenanceState(database, REPO_BACKFILL_COMPLETE_KEY) === "1";
     let legacyRowsVisited = 0;
-    if (!backfillComplete) {
+    if (!backfillComplete && !options.skipLegacyBackfill) {
       const cursor = maintenanceState(database, REPO_BACKFILL_CURSOR_KEY) ?? "";
       const legacyRows = database
         .prepare(
@@ -823,18 +828,11 @@ export class CollectorMaintenance {
       candidateRowsVisited: 0, rowsVisited: 0, backward: 0, forward: 0,
     };
     let enrichmentMs = 0;
-    if (!this.signal?.aborted && budget.canStart(12)) {
-      const stageStartedAtMs = clock();
-      try {
-        enrichment = runRepoEnrichmentMaintenance(this.buffer.database, {
-          legacyBackfillLimit: 32,
-          sessionLimit: 4,
-          eventLimit: 32,
-        });
-      } finally {
-        enrichmentMs = Math.max(0, Math.round(clock() - stageStartedAtMs));
-      }
-    } else postCaptureDeferred.push("enrichment");
+    // Enrichment is intentionally not part of the automatic capture job. On
+    // a production-size ledger its synchronous candidate query measured about
+    // 29 seconds per row, so even one call can consume the entire boundary.
+    // The low-priority one-row enrichment job owns this queue instead.
+    postCaptureDeferred.push("enrichment");
     if (rollout.activity && !this.signal?.aborted && budget.canStart(3)) {
       this.buffer.projection.recordCaptureActivity({ source: "codex", ...rollout.activity });
     } else postCaptureDeferred.push("codex_activity");

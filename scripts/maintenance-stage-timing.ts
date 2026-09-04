@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
-import { existsSync, statSync, unlinkSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdirSync, statSync, unlinkSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import Database from "better-sqlite3";
 import {
@@ -15,13 +15,16 @@ import {
 const source = process.argv.slice(2).find((argument) => argument !== "--");
 if (!source) throw new Error("usage: pnpm timing:maintenance-stages -- /absolute/path/to/work-ledger.sqlite");
 const sourceBytes = statSync(source).size;
-const freeKb = Number(execFileSync("df", ["-Pk", tmpdir()], { encoding: "utf8" }).trim().split(/\s+/).at(-3));
+const scratch = join(homedir(), "Projects", "plimsoll-lanes", "scratch");
+mkdirSync(scratch, { recursive: true });
+const freeKb = Number(execFileSync("df", ["-Pk", scratch], { encoding: "utf8" }).trim().split(/\s+/).at(-3));
 const freeBytes = freeKb * 1024;
-if (!Number.isFinite(freeBytes) || freeBytes < sourceBytes * 2) {
+const requiredRemainingBytes = 60 * 1024 ** 3;
+if (!Number.isFinite(freeBytes) || freeBytes - sourceBytes < requiredRemainingBytes) {
   throw new Error(`maintenance_timing_insufficient_space:${freeBytes}:${sourceBytes}`);
 }
 
-const copy = join(tmpdir(), `plimsoll-maintenance-timing-${process.pid}-${basename(source)}`);
+const copy = join(scratch, `plimsoll-maintenance-timing-${process.pid}-${basename(source)}`);
 // Hold one short read snapshot while `cp` captures the main file and WAL. This
 // prevents a checkpoint from changing the main database between those copies;
 // the connection is closed immediately afterward so it cannot pin the WAL.
@@ -61,7 +64,18 @@ try {
     }),
     walCheckpoint: runWalCheckpointStage(database, { remainingMs, batchSize }),
   };
-  console.log(JSON.stringify({ timing: "maintenance_stage_batches", copyOnly: true, ...readings }));
+  const measuredStages = {
+    retention: readings.retention,
+    pendingEventLinkFill: readings.pendingEventLinkFill,
+    enrichment: readings.enrichment,
+    gitContext: readings.gitContext,
+    walCheckpoint: readings.walCheckpoint,
+  };
+  const rates = Object.fromEntries(Object.entries(measuredStages).map(([stage, reading]) => [stage, {
+      activeRowsPerMinute: reading.ms > 0 ? reading.rows * 60_000 / reading.ms : null,
+      cadenceRowsPerMinute: reading.rows / 5,
+    }]));
+  console.log(JSON.stringify({ timing: "maintenance_stage_batches", copyOnly: true, scratch, rates, ...readings }));
 } finally {
   database?.close();
   for (const suffix of ["", "-wal", "-shm"]) {
