@@ -22,6 +22,7 @@
     "proof:maintenance-starvation": "tsx scripts/maintenance-starvation-proof.ts",
     "proof:maintenance-stages": "tsx scripts/maintenance-stage-primitives-proof.ts",
     "proof:maintenance-stage-integration": "tsx scripts/maintenance-stage-integration-proof.ts",
+    "proof:enrichment-job": "tsx scripts/enrichment-job-proof.ts",
     "timing:maintenance-stages": "tsx scripts/maintenance-stage-timing.ts",
     "proof:maintenance-boundary": "tsx scripts/maintenance-boundary-proof.ts",
     "proof:maintenance-worker-ready": "tsx scripts/maintenance-worker-ready-proof.ts",

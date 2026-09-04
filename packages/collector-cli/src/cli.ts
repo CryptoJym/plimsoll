@@ -105,6 +105,14 @@ import {
   recordMaintenanceDeadlineKill,
 } from "./maintenance-starvation";
 import { runMaintenanceWorkerService } from "./maintenance-worker";
+import {
+  AutomaticEnrichmentCadence,
+  EnrichmentProcessBoundary,
+  IdleEnrichmentScheduler,
+  lowerEnrichmentProcessPriority,
+  runEnrichmentWorkerService,
+} from "./enrichment-job";
+import { runEnrichmentMaintenanceJob } from "./maintenance-stage-primitives";
 import { readLocalIdentities } from "./local-identity";
 import {
   applyClaudeSettings,
@@ -1026,6 +1034,35 @@ async function main() {
     return;
   }
 
+  if (command === "__enrichment_worker") {
+    const spawnNonce = process.argv[3] ?? "";
+    if (
+      !/^[a-f0-9-]{16,80}$/i.test(spawnNonce) ||
+      spawnNonce !== process.env.PLIMSOLL_ENRICHMENT_SPAWN_NONCE ||
+      !process.send
+    ) {
+      process.exitCode = 64;
+      return;
+    }
+    let workerBuffer: ReturnType<typeof openBuffer> | null = null;
+    lowerEnrichmentProcessPriority();
+    runEnrichmentWorkerService({
+      spawnNonce,
+      execute: (deadlineMs) => {
+        const workerConfig = loadCollectorConfig();
+        assertCollectorPrivacyMode(workerConfig, "automatic enrichment worker");
+        workerBuffer = openBuffer(workerConfig, false, 900);
+        const result = runEnrichmentMaintenanceJob(workerBuffer.database, { remainingMs: deadlineMs });
+        return { rows: result.rows, ms: result.ms };
+      },
+      close: () => {
+        workerBuffer?.close();
+        workerBuffer = null;
+      },
+    });
+    return;
+  }
+
   if (command === "__startup_wal_checkpoint") {
     const nonce = process.argv[3] ?? "";
     const timeoutMs = Number(process.argv[4]);
@@ -1246,6 +1283,8 @@ async function main() {
     buffer.recoverRepoContextState();
     let scheduler: CoalescingMaintenanceScheduler<MaintenanceAttemptOutcome> | undefined;
     let maintenanceCadence: AutomaticMaintenanceCadence<MaintenanceAttemptOutcome> | undefined;
+    let enrichmentScheduler: IdleEnrichmentScheduler | undefined;
+    let enrichmentCadence: AutomaticEnrichmentCadence | undefined;
     let cachedBaseline = captureBaselineStatus(buffer.database);
     const maintenanceBoundary = new MaintenanceProcessBoundary({
       entryPath: process.argv[1]!,
@@ -1296,6 +1335,15 @@ async function main() {
           ...info,
         }));
       },
+    });
+    const enrichmentBoundary = new EnrichmentProcessBoundary({
+      entryPath: process.argv[1]!,
+      execArgv: process.execArgv,
+      env: process.env,
+      deadlineMs: 15_000,
+      readyDeadlineMs: 10_000,
+      termGraceMs: 250,
+      killGraceMs: 750,
     });
     let detectedIdentities: Array<Record<string, unknown>> = [];
     try {
@@ -1465,6 +1513,9 @@ async function main() {
     // Later automatic cadences tail only new generations within hard work
     // limits; full history remains an explicit operator command.
     scheduler = new CoalescingMaintenanceScheduler(async () => {
+      // If the low-priority child won the idle check immediately before this
+      // main trigger, let that single bounded row finish or be reaped first.
+      await enrichmentScheduler?.waitForIdle();
       const drainedRepoContexts = buffer.takeRepoContextBatch();
       const repoContexts = buffer.beginRepoContextResolution(drainedRepoContexts);
       let result: MaintenanceAttemptOutcome;
@@ -1553,12 +1604,36 @@ async function main() {
         },
       },
     );
+    enrichmentScheduler = new IdleEnrichmentScheduler(
+      () => !scheduler!.status().inFlight,
+      async () => {
+        const result = await enrichmentBoundary.run({ acceptPartial: true });
+        if (result.outcome === "PARTIAL_OK") {
+          console.log(JSON.stringify({ status: "enrichment_partial_ok", rows: result.rows, ms: result.ms }));
+        } else if (result.rows > 0) {
+          console.log(JSON.stringify({ status: "repo_stitch", rows: result.rows, ms: result.ms }));
+        }
+        return result;
+      },
+    );
+    enrichmentCadence = new AutomaticEnrichmentCadence(enrichmentScheduler, {
+      intervalMs: 5 * 60_000,
+      onError: (error) => {
+        if (shuttingDown && error instanceof Error &&
+            error.message === "enrichment_boundary_stopping") return;
+        console.warn(JSON.stringify({
+          warning: "enrichment_failed",
+          message: error instanceof Error ? error.message : String(error),
+        }));
+      },
+    });
 
     runPrune();
     // Boot capture is deferred so the OTLP receiver binds first, but it uses
     // the exact same bounded recent-tail entrypoint as the interval. Historical
     // files are available only through the explicit scan commands below.
     maintenanceCadence.start();
+    enrichmentCadence.start();
     timers.push(setInterval(runPrune, 6 * 60 * 60 * 1000));
     if (config.uploadUrl) {
       timers.push(setInterval(() => void runSync(), config.syncIntervalSeconds * 1000));
@@ -1567,22 +1642,31 @@ async function main() {
 
     const stopMaintenanceBeforeFatalExit = async () => {
       maintenanceCadence?.stop();
+      enrichmentCadence?.stop();
       for (const timer of timers) clearInterval(timer);
       scheduler?.stopAccepting();
+      enrichmentScheduler?.stopAccepting();
       ownership.release();
-      const [idle, child] = await Promise.allSettled([
+      const [idle, child, enrichmentIdle, enrichmentChild] = await Promise.allSettled([
         scheduler?.waitForIdle() ?? Promise.resolve(),
         maintenanceBoundary.shutdown(),
+        enrichmentScheduler?.waitForIdle() ?? Promise.resolve(),
+        enrichmentBoundary.shutdown(),
       ]);
       const maintenanceIdle = idle.status === "fulfilled";
       const maintenanceChildReaped = child.status === "fulfilled" && child.value;
+      const enrichmentStopped = enrichmentIdle.status === "fulfilled" &&
+        enrichmentChild.status === "fulfilled" && enrichmentChild.value;
       // The maintenance child may own the SQLite writer. Never close the
       // parent's connection while either the scheduler or child can still use it.
-      if (maintenanceIdle && maintenanceChildReaped) {
+      if (maintenanceIdle && maintenanceChildReaped && enrichmentStopped) {
         buffer.close();
         closeOutcomeTimelineStore();
       }
-      return { maintenanceIdle, maintenanceChildReaped };
+      return {
+        maintenanceIdle: maintenanceIdle && enrichmentIdle.status === "fulfilled",
+        maintenanceChildReaped: maintenanceChildReaped && enrichmentStopped,
+      };
     };
 
     const flushRejectionSummaries = () => {
@@ -1602,8 +1686,10 @@ async function main() {
       shuttingDown = true;
       flushRejectionSummaries();
       maintenanceCadence?.stop();
+      enrichmentCadence?.stop();
       for (const timer of timers) clearInterval(timer);
       scheduler?.stopAccepting();
+      enrichmentScheduler?.stopAccepting();
       ownership.release();
       const hardDeadlineMs = 2_500;
       const forceAfterMs = 750;
@@ -1611,6 +1697,7 @@ async function main() {
       let serverClosed = false;
       let maintenanceIdle = false;
       let maintenanceChildReaped = false;
+      let enrichmentChildReaped = false;
       const serverClose = new Promise<void>((resolve) => {
         server.close(() => {
           serverClosed = true;
@@ -1628,13 +1715,16 @@ async function main() {
       const childShutdown = maintenanceBoundary.shutdown().then((stopped) => {
         maintenanceChildReaped = stopped;
       });
+      const enrichmentShutdown = enrichmentBoundary.shutdown().then((stopped) => {
+        enrichmentChildReaped = stopped;
+      });
       const deadline = new Promise<void>((resolve) => {
         setTimeout(resolve, hardDeadlineMs);
       });
       void (async () => {
         try {
           await Promise.race([
-            Promise.allSettled([serverClose, idle, childShutdown]).then(() => undefined),
+            Promise.allSettled([serverClose, idle, childShutdown, enrichmentShutdown]).then(() => undefined),
             deadline,
           ]);
           if (!serverClosed) {
@@ -1653,7 +1743,7 @@ async function main() {
           }
           // Never close SQLite until the child is reaped and the parent
           // scheduler no longer has a boundary call in flight.
-          if (maintenanceIdle && maintenanceChildReaped) {
+          if (maintenanceIdle && maintenanceChildReaped && enrichmentChildReaped) {
             buffer.close();
             closeOutcomeTimelineStore();
           }
@@ -1677,7 +1767,7 @@ async function main() {
             remaining.kind === "missing" &&
             !persistentCleanup.ambiguous &&
             !cleanupAttempt?.ambiguous;
-          const shutdownReady = pidCleaned && serverClosed && maintenanceChildReaped;
+          const shutdownReady = pidCleaned && serverClosed && maintenanceChildReaped && enrichmentChildReaped;
           console.log(
             JSON.stringify({
               // The process is still executing this receipt. Only the stop or
@@ -1691,6 +1781,7 @@ async function main() {
               cleanupAttempt: pidCleanupAttemptReceipt(cleanupAttempt),
               maintenanceIdle,
               maintenanceChildReaped,
+              enrichmentChildReaped,
               listenerClosed: serverClosed,
               listenerState: serverClosed ? "closed" : "close_incomplete",
               processState: "exiting",
