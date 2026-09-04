@@ -1405,7 +1405,9 @@ async function runHiddenWorker(entryPath: string, execArgv: string[], label: str
       PLIMSOLL_HOME: home,
     },
     deadlineMs: 3_000,
-    readyDeadlineMs: 3_000,
+    // Match the production readiness contract. This window now covers only
+    // process/module startup; ledger initialization starts inside the job.
+    readyDeadlineMs: 10_000,
     termGraceMs: 250,
     killGraceMs: 750,
   });
