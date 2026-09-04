@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -97,6 +97,7 @@ import {
 import { captureBaselineStatus } from "./capture-baseline";
 import { createCollectorServer } from "./server";
 import { MaintenanceProcessBoundary } from "./maintenance-boundary";
+import { checkpointWalInBoundedChild, runStartupWalSelfHeal } from "./startup-wal-self-heal";
 import {
   maintenanceStarvationReceipt,
   recordMaintenanceDeadlineBlame,
@@ -996,6 +997,24 @@ async function main() {
     return;
   }
 
+  if (command === "__startup_wal_checkpoint") {
+    const nonce = process.argv[3] ?? "";
+    const timeoutMs = Number(process.argv[4]);
+    if (!/^[a-f0-9-]{16,80}$/i.test(nonce) || nonce !== process.env.PLIMSOLL_STARTUP_WAL_NONCE ||
+      !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) {
+      process.exitCode = 64;
+      return;
+    }
+    const database = new Database(collectorBufferPath(), { timeout: Math.max(1, timeoutMs - 250) });
+    try {
+      database.pragma(`busy_timeout = ${Math.max(1, timeoutMs - 250)}`);
+      const rows = database.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number; log: number; checkpointed: number }>;
+      process.stdout.write(JSON.stringify(rows[0] ?? { busy: 1, log: 0, checkpointed: 0 }));
+    } finally { database.close(); }
+    return;
+  }
+
+
   if (command === "join") {
     // Join runs before ordinary config loading because loadCollectorConfig()
     // creates a default file. A refused/failed join must leave even a missing
@@ -1168,6 +1187,16 @@ async function main() {
       return;
     }
 
+    const startupWalNonce = randomUUID();
+    const startupWalReceipt = await runStartupWalSelfHeal({
+      ledgerPath: collectorBufferPath(),
+      thresholdBytes: config.startupWalCheckpointBytes,
+      runCheckpoint: (timeoutMs) => checkpointWalInBoundedChild({
+        entryPath: process.argv[1]!, execArgv: process.execArgv, nonce: startupWalNonce, timeoutMs,
+      }),
+    });
+    console.log(JSON.stringify(startupWalReceipt));
+
     // This connection owns the HTTP event loop. Never inherit better-sqlite3's
     // five-second busy wait when the maintenance child briefly owns a writer.
     const buffer = openBuffer(config, false, 0);
@@ -1223,6 +1252,12 @@ async function main() {
         } catch {
           // Starvation bookkeeping must never mask the boundary failure.
         }
+      },
+      onOrphanRecovery: (info) => {
+        console.warn(JSON.stringify({
+          warning: "maintenance_orphan_recovery",
+          ...info,
+        }));
       },
     });
     let detectedIdentities: Array<Record<string, unknown>> = [];

@@ -86,6 +86,8 @@ export type MaintenanceBoundaryStatus = {
     pidMismatches: number;
     reapedChildren: number;
     orphanRisk: boolean;
+    orphanRecoveryAttempts: number;
+    orphanRecoveryFailures: number;
   };
 };
 
@@ -130,6 +132,15 @@ export type MaintenanceBoundaryOptions = {
     heldMs: number | null;
     attribution: "proven" | "unknown";
     reason: string;
+  }) => void;
+  orphanRecoveryAttempts?: number;
+  orphanRetryBackoffMs?: number;
+  onOrphanRecovery?: (info: {
+    pid: number | null;
+    ageMs: number;
+    attempt: number;
+    signalsSent: NodeJS.Signals[];
+    outcome: "reaped" | "gone" | "still_alive";
   }) => void;
 };
 
@@ -279,6 +290,11 @@ export class MaintenanceProcessBoundary {
   private pidMismatches = 0;
   private reapedChildren = 0;
   private orphanRisk = false;
+  private orphanSinceMs: number | null = null;
+  private orphanSignalsSent: NodeJS.Signals[] = [];
+  private orphanRecoveryAttempts = 0;
+  private orphanRecoveryFailures = 0;
+  private recoveringOrphan: Promise<boolean> | null = null;
   private terminating: Promise<boolean> | null = null;
   private idleFailure: Promise<void> | null = null;
   private closeWaiters: Array<() => void> = [];
@@ -331,6 +347,8 @@ export class MaintenanceProcessBoundary {
         pidMismatches: this.pidMismatches,
         reapedChildren: this.reapedChildren,
         orphanRisk: this.orphanRisk,
+        orphanRecoveryAttempts: this.orphanRecoveryAttempts,
+        orphanRecoveryFailures: this.orphanRecoveryFailures,
       },
     };
   }
@@ -338,7 +356,11 @@ export class MaintenanceProcessBoundary {
   async run(options: MaintenanceBoundaryRunOptions = {}): Promise<MaintenanceRunOutcome> {
     if (!this.accepting) throw new Error("maintenance_boundary_stopping");
     if (this.runReserved || this.active) throw new Error("maintenance_job_already_in_flight");
-    if (this.terminating || this.orphanRisk) throw new Error("maintenance_child_not_reaped");
+    if (this.orphanRisk && !(await this.recoverOrphan())) {
+      throw new Error("maintenance_child_not_reaped");
+    }
+    if (this.runReserved || this.active) throw new Error("maintenance_job_already_in_flight");
+    if (this.terminating) throw new Error("maintenance_child_not_reaped");
     const now = this.now();
     if (this.circuitOpenUntilMs !== null && now < this.circuitOpenUntilMs) {
       this.state = "circuit_open";
@@ -684,6 +706,8 @@ export class MaintenanceProcessBoundary {
     this.controlFrameLimitExceeded = false;
     this.reapedChildren += 1;
     this.orphanRisk = false;
+    this.orphanSinceMs = null;
+    this.orphanSignalsSent = [];
     const waiters = this.closeWaiters;
     this.closeWaiters = [];
     for (const resolve of waiters) resolve();
@@ -873,6 +897,7 @@ export class MaintenanceProcessBoundary {
     if (!child) return true;
     this.stage = "terminating";
     this.terminating = (async () => {
+      this.orphanSignalsSent = [];
       const pid = child.pid;
       const spawnNonce = this.spawnNonce;
       // Await the parent observation even when the worker never became ready;
@@ -889,6 +914,7 @@ export class MaintenanceProcessBoundary {
           if (signaled) {
             if (signal === "SIGTERM") this.termSignals += 1;
             if (signal === "SIGKILL") this.killSignals += 1;
+            this.orphanSignalsSent.push(signal);
           }
           return signaled;
         } catch {
@@ -899,12 +925,119 @@ export class MaintenanceProcessBoundary {
       if (await this.waitForClose(this.termGraceMs())) return true;
       await signalIfSame("SIGKILL");
       if (await this.waitForClose(this.killGraceMs())) return true;
+      const afterKill = pid && spawnNonce ? await this.fingerprint(pid, spawnNonce) : null;
+      if (expected && (!afterKill || afterKill !== expected) && this.child === child) {
+        this.pidMismatches += 1;
+        this.detachGoneChild(child);
+        return true;
+      }
       this.orphanRisk = this.child === child;
+      if (this.orphanRisk && this.orphanSinceMs === null) this.orphanSinceMs = this.now();
       return !this.orphanRisk;
     })().finally(() => {
       this.terminating = null;
     });
     return this.terminating;
+  }
+
+  private recoverOrphan() {
+    if (!this.orphanRisk) return Promise.resolve(true);
+    if (this.recoveringOrphan) return this.recoveringOrphan;
+    this.recoveringOrphan = (async () => {
+      const child = this.child;
+      const pid = child?.pid ?? null;
+      const spawnNonce = this.spawnNonce;
+      const expected = this.childFingerprint ?? await this.parentFingerprintPromise;
+      const signalsSent: NodeJS.Signals[] = [...this.orphanSignalsSent];
+      const attempts = Math.max(1, Math.min(this.options.orphanRecoveryAttempts ?? 2, 5));
+      const emit = (attempt: number, outcome: "reaped" | "gone" | "still_alive") => {
+        try {
+          this.options.onOrphanRecovery?.({
+            pid,
+            ageMs: Math.max(0, this.now() - (this.orphanSinceMs ?? this.now())),
+            attempt,
+            signalsSent: [...signalsSent],
+            outcome,
+          });
+        } catch {
+          // Recovery diagnostics must never weaken the process fence.
+        }
+      };
+      for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        this.orphanRecoveryAttempts += 1;
+        if (!child || this.child !== child) {
+          this.orphanRisk = false;
+          this.orphanSinceMs = null;
+          emit(attempt, "reaped");
+          return true;
+        }
+        const observed = pid && spawnNonce ? await this.fingerprint(pid, spawnNonce) : null;
+        if (!expected) {
+          if (attempt < attempts) await this.orphanBackoff(attempt);
+          continue;
+        }
+        if (!observed || observed !== expected) {
+          this.pidMismatches += 1;
+          this.detachGoneChild(child);
+          emit(attempt, "gone");
+          return true;
+        }
+        for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+          const current = pid && spawnNonce ? await this.fingerprint(pid, spawnNonce) : null;
+          if (!current || current !== expected || this.child !== child) {
+            this.detachGoneChild(child);
+            emit(attempt, "gone");
+            return true;
+          }
+          try {
+            if (child.kill(signal)) {
+              signalsSent.push(signal);
+              if (signal === "SIGTERM") this.termSignals += 1;
+              else this.killSignals += 1;
+            }
+          } catch {
+            // The bounded identity check below decides whether retry is safe.
+          }
+          const grace = signal === "SIGTERM" ? this.termGraceMs() : this.killGraceMs();
+          if (await this.waitForClose(grace)) {
+            emit(attempt, "reaped");
+            return true;
+          }
+        }
+        if (attempt < attempts) await this.orphanBackoff(attempt);
+      }
+      this.orphanRecoveryFailures += 1;
+      emit(attempts, "still_alive");
+      return false;
+    })().finally(() => {
+      this.recoveringOrphan = null;
+    });
+    return this.recoveringOrphan;
+  }
+
+  private detachGoneChild(child: MaintenanceBoundaryChild) {
+    if (this.child !== child) return;
+    child.removeListener("message", this.onMessage);
+    child.removeListener("error", this.onChildError);
+    child.removeListener("disconnect", this.onChildDisconnect);
+    child.removeListener("close", this.onChildClose);
+    this.child = null;
+    this.childReady = false;
+    this.childFingerprint = null;
+    this.parentFingerprintPromise = null;
+    this.spawnNonce = null;
+    this.orphanRisk = false;
+    this.orphanSinceMs = null;
+    this.orphanSignalsSent = [];
+    this.reapedChildren += 1;
+  }
+
+  private orphanBackoff(attempt: number) {
+    const base = Math.max(1, Math.min(this.options.orphanRetryBackoffMs ?? 100, 5_000));
+    const delayMs = Math.min(base * 2 ** (attempt - 1), 5_000);
+    return new Promise<void>((resolve) => {
+      this.setTimer(resolve, delayMs);
+    });
   }
 
 
@@ -932,7 +1065,7 @@ export class MaintenanceProcessBoundary {
     return fork(this.options.entryPath, ["__maintenance_worker", spawnNonce], {
       execArgv: this.options.execArgv ?? process.execArgv,
       env: maintenanceWorkerEnvironment(this.options.env ?? process.env, spawnNonce),
-      stdio: ["ignore", "ignore", "ignore", "ipc"],
+      stdio: ["ignore", "ignore", "inherit", "ipc"],
     });
   }
 

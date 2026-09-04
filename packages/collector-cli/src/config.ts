@@ -55,6 +55,8 @@ export const collectorConfigSchema = z
      * recognized from their upload/tenant/install credentials. */
     managed: z.boolean().default(false),
     retentionDays: z.number().int().min(1).max(3650).default(90),
+    startupWalCheckpointBytes: z.number().int().min(1).max(100 * 1024 * 1024 * 1024)
+      .default(1024 * 1024 * 1024),
     subscriptions: z
       .array(
         z.object({
