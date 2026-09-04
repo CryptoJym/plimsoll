@@ -21,6 +21,7 @@
     "proof:maintenance": "tsx scripts/maintenance-proof.ts",
     "proof:maintenance-starvation": "tsx scripts/maintenance-starvation-proof.ts",
     "proof:maintenance-boundary": "tsx scripts/maintenance-boundary-proof.ts",
+    "proof:maintenance-worker-ready": "tsx scripts/maintenance-worker-ready-proof.ts",
     "proof:startup-wal-self-heal": "tsx scripts/startup-wal-self-heal-proof.ts",
     "proof:incremental-capture": "tsx scripts/incremental-capture-proof.ts",
     "proof:git-context": "tsx scripts/git-context-proof.ts",

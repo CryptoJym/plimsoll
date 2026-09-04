@@ -18,9 +18,23 @@ import {
 } from "./repo-context";
 
 export type MaintenanceWorkerServiceInput = {
-  maintenance: CollectorMaintenance;
-  buffer: LocalEventBuffer;
+  maintenance?: CollectorMaintenance;
+  buffer?: LocalEventBuffer;
+  initialize?: () => {
+    maintenance: CollectorMaintenance;
+    buffer: LocalEventBuffer;
+  };
   spawnNonce: string;
+  transport?: MaintenanceWorkerTransport;
+  onStage?: (receipt: MaintenanceWorkerStageReceipt) => void;
+};
+
+export type MaintenanceWorkerStageReceipt = { stage: string; ms: number };
+
+export type MaintenanceWorkerTransport = {
+  send: (receipt: unknown, callback?: () => void) => boolean;
+  on: (event: "message" | "disconnect", listener: (value?: unknown) => void) => unknown;
+  disconnect?: () => void;
 };
 
 type RepoContextResolver = typeof resolveRepoContextRequests;
@@ -214,6 +228,33 @@ export function boundRepoContextCarryOver(
 }
 
 export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput) {
+  const serviceStartedAt = performance.now();
+  const transport: MaintenanceWorkerTransport = input.transport ?? {
+    send: (receipt, callback) => callback
+      ? process.send?.(receipt, callback) ?? false
+      : process.send?.(receipt) ?? false,
+    on: (event, listener) => process.on(event, listener),
+    disconnect: () => process.disconnect?.(),
+  };
+  let runtime = input.maintenance && input.buffer
+    ? { maintenance: input.maintenance, buffer: input.buffer }
+    : null;
+  const reportStage = (stage: string, startedAt = serviceStartedAt) => {
+    try {
+      input.onStage?.({ stage, ms: Math.max(0, Math.round(performance.now() - startedAt)) });
+    } catch {
+      // Diagnostics must never prevent readiness or maintenance.
+    }
+  };
+  const initialize = () => {
+    if (runtime) return runtime;
+    const startedAt = performance.now();
+    reportStage("initialization_start", startedAt);
+    runtime = input.initialize?.() ?? null;
+    if (!runtime) throw new Error("maintenance_worker_initializer_missing");
+    reportStage("initialization_complete", startedAt);
+    return runtime;
+  };
   let active = false;
   let closed = false;
   // Issue #181 cursor: contexts a budget-bounded pass did not reach. They keep
@@ -233,7 +274,7 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
   } | null = null;
 
   const send = (receipt: MaintenanceWorkerReceipt) => {
-    if (!process.send || maintenanceProtocolFrameBytes(receipt) > MAINTENANCE_PROTOCOL_MAX_BYTES) {
+    if (maintenanceProtocolFrameBytes(receipt) > MAINTENANCE_PROTOCOL_MAX_BYTES) {
       return false;
     }
     try {
@@ -241,7 +282,7 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
       // frame is already queued. Emitting a second terminal receipt would
       // become a stale frame in the next generation.
       pendingSends += 1;
-      process.send(receipt, () => {
+      transport.send(receipt, () => {
         pendingSends = Math.max(0, pendingSends - 1);
         if (pendingSends === 0) {
           const waiters = sendWaiters;
@@ -278,13 +319,13 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
   const close = (nonce: string) => {
     if (closed) return;
     closed = true;
-    input.maintenance.close();
-    input.buffer.close();
+    runtime?.maintenance.close();
+    runtime?.buffer.close();
     send({ schema: MAINTENANCE_PROTOCOL_SCHEMA, type: "closed", nonce });
-    process.disconnect?.();
+    transport.disconnect?.();
   };
 
-  process.on("message", (raw) => {
+  transport.on("message", (raw) => {
     const request = parseMaintenanceWorkerRequest(raw);
     if (!request) return;
     if (request.type === "ack") {
@@ -321,6 +362,22 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
       lastAckedSequence: 0,
       ackWaiters: [],
     };
+    let worker;
+    try {
+      worker = initialize();
+    } catch {
+      active = false;
+      activeJob = null;
+      send({
+        schema: MAINTENANCE_PROTOCOL_SCHEMA,
+        type: "error",
+        generation: request.generation,
+        nonce: request.nonce,
+        sequence: 1,
+        reason: "maintenance_failed",
+      });
+      return;
+    }
     const reportProgress = (progress: MaintenanceProgress) => {
       const key = `${progress.source}:${progress.stage}:${progress.candidateHash ?? "none"}`;
       if (progress.stage !== "git_context" && key === lastProgressKey) return true;
@@ -347,11 +404,11 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
       return resolveMaintenanceRepoContexts(requests, {
         quarantine: request.quarantine,
         reportProgress,
-        recordRepoLabel: (repoHash, label) => input.buffer.recordRepoLabel(repoHash, label),
+        recordRepoLabel: (repoHash, label) => worker.buffer.recordRepoLabel(repoHash, label),
       });
     };
     try {
-      input.buffer.beginChildRepoContextRun();
+      worker.buffer.beginChildRepoContextRun();
     } catch {
       active = false;
       activeJob = null;
@@ -365,7 +422,7 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
       });
       return;
     }
-    void input.maintenance.runRecent({
+    void worker.maintenance.runRecent({
       quarantine: request.quarantine ?? undefined,
       onProgress: reportProgress,
     }).then(
@@ -376,22 +433,22 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
           // runRecent resolves only after both capture sources and their
           // cursor/event transactions have committed. Filesystem attribution
           // therefore cannot make already-captured usage disappear.
-          input.buffer.drainRepoContextFills();
+          worker.buffer.drainRepoContextFills();
           // Issue #181: the child batch is bounded, committed per context and
           // resumable. Carry-over is processed first so a deferred context
           // cannot be starved by a steady arrival of fresh ones.
           const { kept, overflow } = boundRepoContextCarryOver(
             carriedRepoContexts,
-            input.buffer.finishChildRepoContextRun(),
+            worker.buffer.finishChildRepoContextRun(),
           );
           carriedRepoContexts = [];
           const childBatch = resolveRepoContextBatch(kept, {
             quarantine: request.quarantine,
             reportProgress,
-            recordRepoLabel: (repoHash, label) => input.buffer.recordRepoLabel(repoHash, label),
+            recordRepoLabel: (repoHash, label) => worker.buffer.recordRepoLabel(repoHash, label),
             budgetMs: gitContextBudgetMs(request.deadlineMs),
             commit: (committed) => {
-              input.buffer.applyRepoContextResults(committed);
+              worker.buffer.applyRepoContextResults(committed);
             },
             deferrable: true,
           });
@@ -399,7 +456,7 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
           // Anything past the carry-over bound is retired exactly, so its
           // durable inflight row can never outlive this worker unnoticed.
           if (overflow.length > 0) {
-            input.buffer.applyRepoContextResults(overflow.map((repoContext) => ({
+            worker.buffer.applyRepoContextResults(overflow.map((repoContext) => ({
               contextId: repoContext.contextId,
               repoHash: null,
               branchHash: null,
@@ -408,14 +465,14 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
               resolverVersion: REPO_CONTEXT_RESOLVER_VERSION,
             })));
           }
-          recordGitContextBatchProgress(input.buffer.database, {
+          recordGitContextBatchProgress(worker.buffer.database, {
             committed: childBatch.results.length,
             deferred: childBatch.deferred.length + overflow.length,
           });
           repoContexts = resolveWithProgress(request.repoContexts);
         } catch {
           try {
-            input.buffer.abandonChildRepoContextRun();
+            worker.buffer.abandonChildRepoContextRun();
           } catch {
             // Residual inflight truth is recovered by the parent failure gate.
           }
@@ -448,7 +505,7 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
       },
       async () => {
         try {
-          input.buffer.abandonChildRepoContextRun();
+          worker.buffer.abandonChildRepoContextRun();
         } catch {
           // Residual inflight truth is recovered by the parent failure gate.
         }
@@ -469,13 +526,15 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
     );
   });
 
-  process.on("disconnect", () => {
+  transport.on("disconnect", () => {
     if (!active) close("00000000-0000-0000-0000-000000000000");
   });
 
+  reportStage("process_up");
   send({
     schema: MAINTENANCE_PROTOCOL_SCHEMA,
     type: "ready",
     spawnNonce: input.spawnNonce,
   });
+  reportStage("ready_sent");
 }

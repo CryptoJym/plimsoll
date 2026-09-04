@@ -981,18 +981,42 @@ async function main() {
       process.exitCode = 64;
       return;
     }
-    const workerConfig = loadCollectorConfig();
-    assertCollectorPrivacyMode(workerConfig, "automatic maintenance worker");
-    const workerBuffer = openBuffer(workerConfig, false, 900);
-    const workerMaintenance = new CollectorMaintenance(
-      workerBuffer,
-      new RolloutTailer(workerBuffer),
-      new TranscriptTailer(workerBuffer),
-    );
     runMaintenanceWorkerService({
-      maintenance: workerMaintenance,
-      buffer: workerBuffer,
       spawnNonce,
+      onStage: ({ stage, ms }) => {
+        console.error(JSON.stringify({ warning: "maintenance_worker_stage", stage, ms }));
+      },
+      initialize: () => {
+        let startedAt = performance.now();
+        const workerConfig = loadCollectorConfig();
+        console.error(JSON.stringify({
+          warning: "maintenance_worker_stage", stage: "config_loaded",
+          ms: Math.max(0, Math.round(performance.now() - startedAt)),
+        }));
+        startedAt = performance.now();
+        assertCollectorPrivacyMode(workerConfig, "automatic maintenance worker");
+        console.error(JSON.stringify({
+          warning: "maintenance_worker_stage", stage: "privacy_checked",
+          ms: Math.max(0, Math.round(performance.now() - startedAt)),
+        }));
+        startedAt = performance.now();
+        const workerBuffer = openBuffer(workerConfig, false, 900);
+        console.error(JSON.stringify({
+          warning: "maintenance_worker_stage", stage: "ledger_opened",
+          ms: Math.max(0, Math.round(performance.now() - startedAt)),
+        }));
+        startedAt = performance.now();
+        const workerMaintenance = new CollectorMaintenance(
+          workerBuffer,
+          new RolloutTailer(workerBuffer),
+          new TranscriptTailer(workerBuffer),
+        );
+        console.error(JSON.stringify({
+          warning: "maintenance_worker_stage", stage: "maintenance_constructed",
+          ms: Math.max(0, Math.round(performance.now() - startedAt)),
+        }));
+        return { maintenance: workerMaintenance, buffer: workerBuffer };
+      },
     });
     return;
   }
@@ -1228,7 +1252,7 @@ async function main() {
       // writer holds stay bounded by its own slice budget (maxActiveMs <= 5s in
       // maintenance.ts), so these deadlines govern startup + coordination only.
       deadlineMs: 30_000,
-      readyDeadlineMs: 10_000,
+      readyDeadlineMs: 45_000, // 2026-09-04: guards process start only (ready is sent before the ledger opens); 10 s flaked under heavy disk I/O from the lane sweeps
       // Issue #181: a deadline kill must never vanish silently. Record the
       // kill rate and the last-seen stage durably, and surface the receipt
       // so enrichment starvation cannot recur invisibly.
