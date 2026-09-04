@@ -232,6 +232,22 @@ export class LocalEventBuffer {
         value text not null,
         updated_at text not null
       );
+      create table if not exists maintenance_stage_cursors (
+        stage text primary key check (stage in (
+          'retention_deletion', 'wal_checkpoint', 'pending_event_link_fill',
+          'enrichment', 'git_context'
+        )),
+        cursor text,
+        rows_total integer not null default 0 check (rows_total >= 0),
+        request_json text,
+        updated_at text not null
+      ) without rowid;
+      create table if not exists maintenance_git_context_queue (
+        context_id text primary key,
+        source text not null check (source in ('codex', 'claude_code')),
+        cwd text not null,
+        queued_at text not null
+      ) without rowid;
       create table if not exists reprice_dirty_events (
         event_id text primary key,
         queued_at text not null
@@ -326,6 +342,17 @@ export class LocalEventBuffer {
         )
       ) without rowid;
     `);
+    const insertMaintenanceStage = this.db.prepare(
+      `insert into maintenance_stage_cursors (stage, updated_at)
+       values (?, ?) on conflict(stage) do nothing`,
+    );
+    const maintenanceStageCreatedAt = new Date().toISOString();
+    this.db.transaction(() => {
+      for (const stage of [
+        "retention_deletion", "wal_checkpoint", "pending_event_link_fill",
+        "enrichment", "git_context",
+      ]) insertMaintenanceStage.run(stage, maintenanceStageCreatedAt);
+    })();
     const repoContextInflightColumns = new Set(
       (this.db.pragma("table_info(repo_context_inflight)") as Array<{ name: string }>)
         .map((column) => column.name),
