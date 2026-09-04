@@ -13,6 +13,7 @@ import { TranscriptTailer, type TranscriptScanResult } from "./transcript-tailer
 import { captureBaselineStatus } from "./capture-baseline";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
 import type { MaintenanceProgress } from "./maintenance-progress";
+import type { MaintenanceJobProgress } from "./maintenance-protocol";
 
 const PRICING_VERSION_KEY = "pricing_catalog_applied";
 const PRICING_TARGET_KEY = "pricing_catalog_backfill_target";
@@ -559,6 +560,19 @@ export type MaintenanceRunOutcome = {
   stageTimings?: MaintenanceStageTimings;
 };
 
+export type MaintenancePartialOutcome = {
+  outcome: "PARTIAL_OK";
+  progress: MaintenanceJobProgress;
+};
+
+export type MaintenanceAttemptOutcome = MaintenanceRunOutcome | MaintenancePartialOutcome;
+
+export function isMaintenancePartialOutcome(
+  value: MaintenanceAttemptOutcome,
+): value is MaintenancePartialOutcome {
+  return "outcome" in value && value.outcome === "PARTIAL_OK";
+}
+
 export type ProjectionDrainResult = {
   slices: number;
   yields: number;
@@ -655,6 +669,8 @@ export class CollectorMaintenance {
   async runRecent(options: {
     quarantine?: Pick<MaintenanceProgress, "source" | "stage" | "candidateHash">;
     onProgress?: (progress: MaintenanceProgress) => boolean;
+    /** Split A calls this synchronously after each bounded transaction commits. */
+    onDurableCommit?: (progress: MaintenanceJobProgress) => boolean;
     clock?: () => number;
   } = {}): Promise<CollectorMaintenanceRunResult> {
     // Monotonic stage timing source. Injectable so fixture proofs can assert
@@ -883,7 +899,7 @@ export class CollectorMaintenance {
 }
 
 export type MaintenanceSchedulerStatus<
-  T extends MaintenanceRunOutcome = CollectorMaintenanceRunResult,
+  T extends MaintenanceAttemptOutcome = CollectorMaintenanceRunResult,
 > = {
   accepting: boolean;
   inFlight: boolean;
@@ -905,7 +921,7 @@ export type MaintenanceSchedulerStatus<
   lastRun: T | null;
 };
 
-type DrainWaiter<T extends MaintenanceRunOutcome> = {
+type DrainWaiter<T extends MaintenanceAttemptOutcome> = {
   resolve: (results: T[]) => void;
   reject: (error: unknown) => void;
 };
@@ -917,7 +933,7 @@ type DrainWaiter<T extends MaintenanceRunOutcome> = {
  * commands may request full history.
  */
 export class CoalescingMaintenanceScheduler<
-  T extends MaintenanceRunOutcome = CollectorMaintenanceRunResult,
+  T extends MaintenanceAttemptOutcome = CollectorMaintenanceRunResult,
 > {
   private accepting = true;
   private running = false;
@@ -1009,12 +1025,17 @@ export class CoalescingMaintenanceScheduler<
       try {
         const result = await this.runJob();
         this.lastRun = result;
-        this.rolloutFilesRead += result.rollout.filesRead;
-        this.transcriptFilesRead += result.transcript.filesRead;
-        this.rawEventWrites += result.rawEventWrites;
-        this.repriceRowsVisited += result.repricing.rowsVisited;
-        this.reconciliationRowsVisited += result.reconciliation.rowsVisited;
-        this.enrichmentRowsVisited += result.enrichment.rowsVisited;
+        if (isMaintenancePartialOutcome(result)) {
+          results.push(result);
+          continue;
+        }
+        const completed = result as MaintenanceRunOutcome;
+        this.rolloutFilesRead += completed.rollout.filesRead;
+        this.transcriptFilesRead += completed.transcript.filesRead;
+        this.rawEventWrites += completed.rawEventWrites;
+        this.repriceRowsVisited += completed.repricing.rowsVisited;
+        this.reconciliationRowsVisited += completed.reconciliation.rowsVisited;
+        this.enrichmentRowsVisited += completed.enrichment.rowsVisited;
         results.push(result);
       } catch (error) {
         this.failedRuns += 1;
@@ -1042,7 +1063,7 @@ export class CoalescingMaintenanceScheduler<
  * The only automatic boot/interval entrypoint. Its signature cannot express a
  * full-history request, so daemon scheduling stays recent-only by construction.
  */
-export function requestAutomaticRecentMaintenance<T extends MaintenanceRunOutcome>(
+export function requestAutomaticRecentMaintenance<T extends MaintenanceAttemptOutcome>(
   scheduler: CoalescingMaintenanceScheduler<T>,
 ) {
   return scheduler.trigger();
@@ -1078,7 +1099,7 @@ export type AutomaticMaintenanceCadenceTimer = {
  * not accumulate during a slow filesystem slice.
  */
 export class AutomaticMaintenanceCadence<
-  T extends MaintenanceRunOutcome = CollectorMaintenanceRunResult,
+  T extends MaintenanceAttemptOutcome = CollectorMaintenanceRunResult,
 > {
   private accepting = true;
   private inFlight = false;
@@ -1196,8 +1217,10 @@ export class AutomaticMaintenanceCadence<
       const results = await requestAutomaticRecentMaintenance(this.scheduler);
       discoveryAdvanced = results.some(
         (result) =>
-          result.rollout.activity.discoveryEntries > 0 ||
-          result.transcript.activity.discoveryEntries > 0,
+          !isMaintenancePartialOutcome(result) && (
+            result.rollout.activity.discoveryEntries > 0 ||
+            result.transcript.activity.discoveryEntries > 0
+          ),
       );
     } catch (error) {
       failed = true;

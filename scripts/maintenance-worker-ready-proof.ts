@@ -25,6 +25,12 @@ async function main() {
   const transport = new FakeTransport();
   const stages: MaintenanceWorkerStageReceipt[] = [];
   let initialized = 0;
+  let durableCommit: ((progress: {
+    stage: "fill_pending_event_links";
+    rows: number;
+    ms: number;
+    remaining: number;
+  }) => boolean) | undefined;
   const never = new Promise<never>(() => undefined);
   runMaintenanceWorkerService({
     spawnNonce: randomUUID(),
@@ -39,7 +45,10 @@ async function main() {
         },
         maintenance: {
           close() {},
-          runRecent: () => never,
+          runRecent: (options: { onDurableCommit?: typeof durableCommit }) => {
+            durableCommit = options.onDurableCommit;
+            return never;
+          },
         },
       } as never;
     },
@@ -61,11 +70,22 @@ async function main() {
   });
   assert.equal(initialized, 1, "ledger initialization belongs to the first job");
   assert.equal(stages.some((stage) => stage.stage === "initialization_start"), true);
+  assert.ok(durableCommit, "busy worker must retain its durable-commit reporter");
+  assert.equal(durableCommit({
+    stage: "fill_pending_event_links",
+    rows: 100,
+    ms: 12,
+    remaining: 50,
+  }), true);
+  const progress = transport.sent.find((receipt) => (
+    (receipt as { type?: string }).type === "maintenance_job_progress"
+  )) as { sequence: number; rows: number } | undefined;
+  assert.equal(progress?.rows, 100, "busy worker must send durable progress immediately");
 
   console.log(JSON.stringify({
     proof: "maintenance_worker_ready",
-    checks: 4,
-    passed: 4,
+    checks: 5,
+    passed: 5,
     readyBeforeInitialization: true,
     stageLogs: stages,
   }));

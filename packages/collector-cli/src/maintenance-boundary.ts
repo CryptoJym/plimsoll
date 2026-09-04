@@ -1,7 +1,11 @@
 import { fork, execFile, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 
-import type { MaintenanceRunOutcome, MaintenanceStageTimings } from "./maintenance";
+import type {
+  MaintenancePartialOutcome,
+  MaintenanceRunOutcome,
+  MaintenanceStageTimings,
+} from "./maintenance";
 import type { MaintenanceProgress } from "./maintenance-progress";
 import {
   MAINTENANCE_PROTOCOL_MAX_BYTES,
@@ -11,7 +15,10 @@ import {
   maintenanceProtocolFrameBytes,
   parseMaintenanceWorkerReceipt,
   type MaintenanceWorkerReceipt,
+  type MaintenanceJobProgress,
 } from "./maintenance-protocol";
+
+export type MaintenancePartialOk = MaintenancePartialOutcome;
 import {
   validRepoContextRequest,
   type RepoContextRequest,
@@ -48,7 +55,7 @@ export type MaintenanceBoundaryStatus = {
     stageTimings: MaintenanceStageTimings | null;
   } | null;
   lastFailure: string | null;
-  lastOutcome: "completed" | "timed_out" | "failed" | null;
+  lastOutcome: "completed" | "PARTIAL_OK" | "timed_out" | "failed" | null;
   lastTimedOutAt: string | null;
   circuit: {
     failureCount: number;
@@ -109,6 +116,8 @@ export type MaintenanceBoundaryOptions = {
   env?: NodeJS.ProcessEnv;
   deadlineMs?: number;
   readyDeadlineMs?: number;
+  /** Time held back from the hard deadline for the final ACK and child reap. */
+  teardownMarginMs?: number;
   termGraceMs?: number;
   killGraceMs?: number;
   initialCircuitMs?: number;
@@ -125,9 +134,11 @@ export type MaintenanceBoundaryOptions = {
   // before its blame is "proven". Below it, being on stage at kill time is
   // not evidence that THIS candidate was slow (issue #181 misattribution).
   blameThresholdMs?: number;
-  // Fired on every deadline kill so the shell can durably record partial
-  // progress and the kill rate instead of discarding the batch silently.
+  // Fired at the work cutoff. The shell records either an acknowledged
+  // partial completion receipt or a true zero-progress deadline kill.
   onDeadline?: (info: {
+    outcome: "PARTIAL_OK" | "timed_out";
+    jobProgress: MaintenanceJobProgress | null;
     progress: MaintenanceProgress | null;
     heldMs: number | null;
     attribution: "proven" | "unknown";
@@ -149,18 +160,20 @@ type ActiveJob = {
   nonce: string;
   startedAtMs: number;
   timer: TimerHandle;
-  resolve: (result: MaintenanceRunOutcome) => void;
+  resolve: (result: MaintenanceRunOutcome | MaintenancePartialOk) => void;
   reject: (error: Error) => void;
   settled: boolean;
   nextSequence: number;
   expectedRepoContextIds: string[];
   onRepoContexts?: (results: RepoContextResult[]) => void;
+  acknowledgedJobProgress: MaintenanceJobProgress | null;
 };
 
 export type MaintenanceBoundaryRunOptions = {
   repoContexts?: RepoContextRequest[];
   onRepoContextsAccepted?: () => void;
   onRepoContexts?: (results: RepoContextResult[]) => void;
+  acceptPartial?: boolean;
 };
 
 function iso(ms: number | null) {
@@ -267,7 +280,7 @@ export class MaintenanceProcessBoundary {
   private lastDurationMs: number | null = null;
   private lastResult: MaintenanceBoundaryStatus["lastResult"] = null;
   private lastFailure: string | null = null;
-  private lastOutcome: "completed" | "timed_out" | "failed" | null = null;
+  private lastOutcome: "completed" | "PARTIAL_OK" | "timed_out" | "failed" | null = null;
   private lastTimedOutAt: string | null = null;
   private activeProgress: MaintenanceProgress | null = null;
   private activeProgressAtMs: number | null = null;
@@ -353,7 +366,9 @@ export class MaintenanceProcessBoundary {
     };
   }
 
-  async run(options: MaintenanceBoundaryRunOptions = {}): Promise<MaintenanceRunOutcome> {
+  async run(options: MaintenanceBoundaryRunOptions & { acceptPartial: true }): Promise<MaintenanceRunOutcome | MaintenancePartialOk>;
+  async run(options?: MaintenanceBoundaryRunOptions): Promise<MaintenanceRunOutcome>;
+  async run(options: MaintenanceBoundaryRunOptions = {}): Promise<MaintenanceRunOutcome | MaintenancePartialOk> {
     if (!this.accepting) throw new Error("maintenance_boundary_stopping");
     if (this.runReserved || this.active) throw new Error("maintenance_job_already_in_flight");
     if (this.orphanRisk && !(await this.recoverOrphan())) {
@@ -390,7 +405,7 @@ export class MaintenanceProcessBoundary {
     }
     const repoContexts = suppliedRepoContexts.map((request) => ({ ...request }));
     this.runReserved = true;
-    let job!: Promise<MaintenanceRunOutcome>;
+    let job!: Promise<MaintenanceRunOutcome | MaintenancePartialOk>;
     try {
       await this.ensureWorker();
       if (!this.accepting) throw new Error("maintenance_boundary_stopping");
@@ -414,10 +429,10 @@ export class MaintenanceProcessBoundary {
       this.activeProgress = null;
       this.activeProgressAtMs = null;
       this.activeProgressKey = null;
-      job = new Promise<MaintenanceRunOutcome>((resolve, reject) => {
+      job = new Promise<MaintenanceRunOutcome | MaintenancePartialOk>((resolve, reject) => {
         const timer = this.setTimer(() => {
           void this.failActive("maintenance_deadline_exceeded", true);
-        }, this.deadlineMs());
+        }, this.workDeadlineMs());
         this.active = {
           generation,
           nonce,
@@ -429,6 +444,7 @@ export class MaintenanceProcessBoundary {
           nextSequence: 1,
           expectedRepoContextIds: [...contextIds].sort(),
           onRepoContexts: options.onRepoContexts,
+          acknowledgedJobProgress: null,
         };
         try {
           const request = {
@@ -436,7 +452,7 @@ export class MaintenanceProcessBoundary {
             type: "run",
             generation,
             nonce,
-            deadlineMs: this.deadlineMs(),
+            deadlineMs: this.workDeadlineMs(),
             quarantine: this.quarantine,
             repoContexts,
           } as const;
@@ -606,18 +622,28 @@ export class MaintenanceProcessBoundary {
       return;
     }
     active.nextSequence += 1;
-    if (receipt.type === "progress") {
-      this.activeProgress = {
-        source: receipt.source,
-        stage: receipt.stage,
-        candidateHash: receipt.candidateHash,
-      };
-      // Time-on-stage starts at the FIRST frame for a given
-      // source/stage/candidate key; repeats of the same key extend the hold.
-      const progressKey = `${receipt.source}:${receipt.stage}:${receipt.candidateHash ?? "none"}`;
-      if (progressKey !== this.activeProgressKey) {
-        this.activeProgressKey = progressKey;
-        this.activeProgressAtMs = this.now();
+    if (receipt.type === "progress" || receipt.type === "maintenance_job_progress") {
+      const jobProgress = receipt.type === "maintenance_job_progress"
+        ? {
+            stage: receipt.stage,
+            rows: receipt.rows,
+            ms: receipt.ms,
+            remaining: receipt.remaining,
+          }
+        : null;
+      if (receipt.type === "progress") {
+        this.activeProgress = {
+          source: receipt.source,
+          stage: receipt.stage,
+          candidateHash: receipt.candidateHash,
+        };
+        // Time-on-stage starts at the FIRST frame for a given
+        // source/stage/candidate key; repeats of the same key extend the hold.
+        const progressKey = `${receipt.source}:${receipt.stage}:${receipt.candidateHash ?? "none"}`;
+        if (progressKey !== this.activeProgressKey) {
+          this.activeProgressKey = progressKey;
+          this.activeProgressAtMs = this.now();
+        }
       }
       try {
         this.child?.send({
@@ -626,6 +652,10 @@ export class MaintenanceProcessBoundary {
           generation: receipt.generation,
           nonce: receipt.nonce,
           sequence: receipt.sequence,
+        }, (error: Error | null) => {
+          if (!error && jobProgress && this.active === active && !active.settled) {
+            active.acknowledgedJobProgress = jobProgress;
+          }
         });
       } catch {
         void this.failActive("maintenance_protocol_ack_failed", false);
@@ -810,6 +840,7 @@ export class MaintenanceProcessBoundary {
     this.clearTimer(active.timer);
     this.active = null;
     const timedOutProgress = this.activeProgress;
+    const acknowledgedJobProgress = active.acknowledgedJobProgress;
     const heldStartMs = this.activeProgressAtMs;
     this.activeProgress = null;
     this.activeProgressAtMs = null;
@@ -826,7 +857,8 @@ export class MaintenanceProcessBoundary {
     // UNKNOWN and never applied.
     const proven = timedOut && timedOutProgress !== null &&
       heldMs !== null && heldMs >= this.blameThresholdMs();
-    if (timedOut) {
+    const partialOk = timedOut && acknowledgedJobProgress !== null;
+    if (timedOut && !partialOk) {
       this.lastBlame = timedOutProgress
         ? {
             source: timedOutProgress.source,
@@ -846,27 +878,38 @@ export class MaintenanceProcessBoundary {
             attribution: "unknown",
           };
       if (!proven) this.unknownBlames += 1;
-      // Every deadline kill is reported, candidate or not, or the kill rate
-      // would silently undercount exactly the worst hangs (issue #181).
+      if (proven && timedOutProgress) {
+        this.quarantine = timedOutProgress;
+        this.quarantineUntilMs = this.now() + this.escalatedCircuitMs();
+      }
+    }
+    if (timedOut) {
       try {
         this.options.onDeadline?.({
+          outcome: partialOk ? "PARTIAL_OK" : "timed_out",
+          jobProgress: acknowledgedJobProgress,
           progress: timedOutProgress,
           heldMs,
           attribution: proven ? "proven" : "unknown",
           reason,
         });
       } catch {
-        // Starvation bookkeeping must never mask the boundary failure itself.
-      }
-      if (proven && timedOutProgress) {
-        this.quarantine = timedOutProgress;
-        this.quarantineUntilMs = this.now() + this.escalatedCircuitMs();
+        // Deadline bookkeeping must never mask the boundary outcome itself.
       }
     }
-    this.recordOutcome(timedOut ? "timed_out" : "failed", this.lastCompletedAtMs);
+    this.recordOutcome(partialOk ? "PARTIAL_OK" : timedOut ? "timed_out" : "failed", this.lastCompletedAtMs);
     this.state = timedOut ? "timed_out" : "recovering";
     this.stage = "terminating";
     await this.terminateChild(reason);
+    if (partialOk) {
+      this.failureCount = 0;
+      this.circuitOpenUntilMs = null;
+      this.lastFailure = null;
+      this.state = "ready";
+      this.stage = "idle";
+      active.resolve({ outcome: "PARTIAL_OK", progress: acknowledgedJobProgress });
+      return;
+    }
     this.openCircuit(reason);
     active.reject(new Error(reason));
   }
@@ -1076,6 +1119,10 @@ export class MaintenanceProcessBoundary {
   }
 
   private deadlineMs() { return Math.max(1, Math.min(this.options.deadlineMs ?? 1_000, 60_000)); }
+  private teardownMarginMs() {
+    return Math.max(0, Math.min(this.options.teardownMarginMs ?? 0, this.deadlineMs() - 1));
+  }
+  private workDeadlineMs() { return Math.max(1, this.deadlineMs() - this.teardownMarginMs()); }
   private readyDeadlineMs() { return Math.max(1, Math.min(this.options.readyDeadlineMs ?? 1_000, 60_000)); }
   private termGraceMs() { return Math.max(1, Math.min(this.options.termGraceMs ?? 250, 5_000)); }
   private killGraceMs() { return Math.max(1, Math.min(this.options.killGraceMs ?? 750, 5_000)); }
@@ -1091,7 +1138,7 @@ export class MaintenanceProcessBoundary {
     });
   }
 
-  private recordOutcome(state: "completed" | "timed_out" | "failed", atMs: number) {
+  private recordOutcome(state: "completed" | "PARTIAL_OK" | "timed_out" | "failed", atMs: number) {
     const at = new Date(atMs).toISOString();
     this.lastOutcome = state;
     if (state === "timed_out") this.lastTimedOutAt = at;

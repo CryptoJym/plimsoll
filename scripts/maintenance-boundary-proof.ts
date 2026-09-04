@@ -37,13 +37,18 @@ import {
   maintenanceProtocolFrameBytes,
   parseMaintenanceWorkerRequest,
   type MaintenanceRunRequest,
+  type MaintenanceJobProgressReceipt,
 } from "../packages/collector-cli/src/maintenance-protocol";
 import {
   REPO_CONTEXT_RESOLVER_VERSION,
   type RepoContextRequest,
   type RepoContextResult,
 } from "../packages/collector-cli/src/repo-context";
-import type { MaintenanceRunOutcome } from "../packages/collector-cli/src/maintenance";
+import {
+  CoalescingMaintenanceScheduler,
+  isMaintenancePartialOutcome,
+  type MaintenanceRunOutcome,
+} from "../packages/collector-cli/src/maintenance";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 
 type Check = { name: string; passed: true; detail: Record<string, unknown> };
@@ -1240,6 +1245,75 @@ async function realWorkerCrashProof() {
   });
 }
 
+async function partialOkArbitrationProof() {
+  const deadlineReceipts: unknown[] = [];
+  const harness = fakeBoundary((spawnNonce) => {
+    const child = new FakeChild(22_500);
+    child.onSend = (raw) => {
+      const request = raw as MaintenanceRunRequest;
+      if (request.type !== "run") return;
+      queueMicrotask(() => child.emit("message", {
+        schema: MAINTENANCE_PROTOCOL_SCHEMA,
+        type: "maintenance_job_progress",
+        generation: request.generation,
+        nonce: request.nonce,
+        sequence: 1,
+        stage: "fill_pending_event_links",
+        rows: 250,
+        ms: 19,
+        remaining: 900,
+      } satisfies MaintenanceJobProgressReceipt));
+    };
+    ready(child, spawnNonce);
+    return child;
+  }, {
+    deadlineMs: 20,
+    teardownMarginMs: 5,
+    onDeadline: (receipt) => deadlineReceipts.push(receipt),
+  });
+
+  const result = await harness.boundary.run({ acceptPartial: true });
+  assert.equal(isMaintenancePartialOutcome(result), true);
+  if (!isMaintenancePartialOutcome(result)) throw new Error("expected_partial_ok");
+  assert.equal(result.outcome, "PARTIAL_OK");
+  assert.deepEqual(result.progress, {
+    stage: "fill_pending_event_links",
+    rows: 250,
+    ms: 19,
+    remaining: 900,
+  });
+  const status = harness.boundary.status();
+  assert.equal(status.lastOutcome, "PARTIAL_OK");
+  assert.equal(status.circuit.failureCount, 0);
+  assert.equal(status.circuit.openUntil, null);
+  assert.equal(deadlineReceipts.length, 1);
+  assert.equal((deadlineReceipts[0] as { outcome?: string }).outcome, "PARTIAL_OK");
+  const scheduler = new CoalescingMaintenanceScheduler(async () => result);
+  const scheduled = await scheduler.trigger();
+  assert.equal(scheduled.length, 1);
+  assert.equal(scheduler.status().failedRuns, 0);
+  assert.equal(scheduler.status().runCount, 1);
+  assert.equal(await harness.boundary.shutdown(), true);
+
+  const zeroProgress = fakeBoundary((spawnNonce) => {
+    const child = new FakeChild(22_501);
+    ready(child, spawnNonce);
+    return child;
+  }, { deadlineMs: 10, teardownMarginMs: 2 });
+  await rejectsWith(zeroProgress.boundary.run(), "maintenance_deadline_exceeded");
+  assert.equal(zeroProgress.boundary.status().lastOutcome, "timed_out");
+  assert.equal(zeroProgress.boundary.status().circuit.failureCount, 1);
+  assert.notEqual(zeroProgress.boundary.status().circuit.openUntil, null);
+  await zeroProgress.boundary.shutdown();
+
+  pass("deadline_after_acknowledged_progress_is_partial_ok", {
+    outcome: result.outcome,
+    circuitFailures: status.circuit.failureCount,
+    zeroProgressCircuitFailures: zeroProgress.boundary.status().circuit.failureCount,
+    schedulerFailedRuns: scheduler.status().failedRuns,
+  });
+}
+
 async function staleFenceAndImmediateSecondJobProof() {
   let firstRequest: MaintenanceRunRequest | null = null;
   let runNumber = 0;
@@ -1662,6 +1736,12 @@ async function main() {
     console.log(JSON.stringify({ proof: "maintenance_boundary_real_worker", checks }));
     return;
   }
+  if (process.env.PLIMSOLL_MAINTENANCE_PROOF_FOCUS === "partial_ok") {
+    await partialOkArbitrationProof();
+    await realWorkerCrashProof();
+    console.log(JSON.stringify({ proof: "maintenance_boundary_partial_ok", checks }));
+    return;
+  }
   await fifoAvailabilityProof();
   await blockedShutdownProof();
   await circuitAndRecoveryProof();
@@ -1676,6 +1756,7 @@ async function main() {
   staticParentFilesystemIsolationProof();
   await malformedOversizedFrameProof();
   await realWorkerCrashProof();
+  await partialOkArbitrationProof();
   await staleFenceAndImmediateSecondJobProof();
   await deterministicRaceProof();
   await sourceAndDistWorkerProof();

@@ -1,4 +1,4 @@
-const schema = 3;
+const schema = 4;
 const spawnNonce = process.env.PLIMSOLL_MAINTENANCE_SPAWN_NONCE ?? "";
 
 process.on("message", (message) => {
