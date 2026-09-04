@@ -8,6 +8,7 @@ import {
   projectMaintenanceResult,
   type MaintenanceWorkerReceipt,
   type MaintenanceJobProgress,
+  type MaintenanceFailureStage,
 } from "./maintenance-protocol";
 import { maintenanceCandidateHash, type MaintenanceProgress } from "./maintenance-progress";
 import { recordGitContextBatchProgress } from "./maintenance-starvation";
@@ -41,6 +42,34 @@ export type MaintenanceWorkerTransport = {
 };
 
 type RepoContextResolver = typeof resolveRepoContextRequests;
+
+function maintenanceFailureDiagnostic(error: unknown) {
+  const candidate = error !== null && typeof error === "object"
+    ? error as { name?: unknown; code?: unknown; message?: unknown }
+    : null;
+  const rawClass = typeof candidate?.code === "string"
+    ? candidate.code
+    : typeof candidate?.name === "string"
+      ? candidate.name
+      : "UnknownError";
+  const errorClass = /^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(rawClass)
+    ? rawClass
+    : "UnknownError";
+  const rawMessage = typeof candidate?.message === "string"
+    ? candidate.message
+    : typeof error === "string"
+      ? error
+      : errorClass;
+  const pathFree = rawMessage
+    .replace(/file:\/\/\S+/gi, "[path]")
+    .replace(/[A-Za-z]:\\[^\s"'(),;]+/g, "[path]")
+    .replace(/(^|[\s("'=])(?:~|\/)\S+/g, "$1[path]")
+    .replace(/[\\/\u0000-\u001f\u007f]/g, "_");
+  return {
+    errorClass,
+    message: Array.from(pathFree).slice(0, 200).join("") || errorClass,
+  };
+}
 
 /**
  * Issue #181. `git_context` resolution used to be the one all-or-nothing unit
@@ -357,6 +386,7 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
     }
     active = true;
     const jobStartedAt = performance.now();
+    let failureStage: MaintenanceFailureStage = "initialization";
     const remainingJobMs = () => Math.max(
       0,
       request.deadlineMs - Math.max(0, Math.round(performance.now() - jobStartedAt)),
@@ -373,8 +403,9 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
     let worker;
     try {
       worker = initialize();
-    } catch {
+    } catch (error) {
       active = false;
+      const progressAcknowledged = (activeJob?.lastAckedSequence ?? 0) > 0;
       activeJob = null;
       send({
         schema: MAINTENANCE_PROTOCOL_SCHEMA,
@@ -383,6 +414,10 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
         nonce: request.nonce,
         sequence: 1,
         reason: "maintenance_failed",
+        ...maintenanceFailureDiagnostic(error),
+        stage: failureStage,
+        elapsedMs: Math.max(0, Math.round(performance.now() - jobStartedAt)),
+        progressAcknowledged,
       });
       return;
     }
@@ -428,10 +463,12 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
         recordRepoLabel: (repoHash, label) => worker.buffer.recordRepoLabel(repoHash, label),
       });
     };
+    failureStage = "child_repo_context_start";
     try {
       worker.buffer.beginChildRepoContextRun();
-    } catch {
+    } catch (error) {
       active = false;
+      const progressAcknowledged = (activeJob?.lastAckedSequence ?? 0) > 0;
       activeJob = null;
       send({
         schema: MAINTENANCE_PROTOCOL_SCHEMA,
@@ -440,10 +477,15 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
         nonce: request.nonce,
         sequence: ++sequence,
         reason: "maintenance_failed",
+        ...maintenanceFailureDiagnostic(error),
+        stage: failureStage,
+        elapsedMs: Math.max(0, Math.round(performance.now() - jobStartedAt)),
+        progressAcknowledged,
       });
       return;
     }
     if (worker.buffer.database) {
+      failureStage = "deadline_stages";
       try {
         runDeadlineMaintenanceStages(worker.buffer.database, {
           deadlineMs: request.deadlineMs,
@@ -452,8 +494,9 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
           parityReady: true,
           onDurableCommit: reportJobProgress,
         });
-      } catch {
+      } catch (error) {
         active = false;
+        const progressAcknowledged = (activeJob?.lastAckedSequence ?? 0) > 0;
         activeJob = null;
         send({
           schema: MAINTENANCE_PROTOCOL_SCHEMA,
@@ -462,10 +505,15 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
           nonce: request.nonce,
           sequence: ++sequence,
           reason: "maintenance_failed",
+          ...maintenanceFailureDiagnostic(error),
+          stage: failureStage,
+          elapsedMs: Math.max(0, Math.round(performance.now() - jobStartedAt)),
+          progressAcknowledged,
         });
         return;
       }
     }
+    failureStage = "recent_maintenance";
     void worker.maintenance.runRecent({
       quarantine: request.quarantine ?? undefined,
       onProgress: reportProgress,
@@ -474,6 +522,7 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
       async (result) => {
         if (closed) return;
         let repoContexts;
+        failureStage = "repo_context";
         try {
           // runRecent resolves only after both capture sources and their
           // cursor/event transactions have committed. Filesystem attribution
@@ -528,13 +577,14 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
             remaining: remainingJobMs(),
           });
           repoContexts = resolveWithProgress(request.repoContexts);
-        } catch {
+        } catch (error) {
           try {
             worker.buffer.abandonChildRepoContextRun();
           } catch {
             // Residual inflight truth is recovered by the parent failure gate.
           }
           active = false;
+          const progressAcknowledged = (activeJob?.lastAckedSequence ?? 0) > 0;
           activeJob = null;
           send({
             schema: MAINTENANCE_PROTOCOL_SCHEMA,
@@ -543,6 +593,10 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
             nonce: request.nonce,
             sequence: ++sequence,
             reason: "maintenance_failed",
+            ...maintenanceFailureDiagnostic(error),
+            stage: failureStage,
+            elapsedMs: Math.max(0, Math.round(performance.now() - jobStartedAt)),
+            progressAcknowledged,
           });
           return;
         }
@@ -561,7 +615,7 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
           repoContexts,
         });
       },
-      async () => {
+      async (error) => {
         try {
           worker.buffer.abandonChildRepoContextRun();
         } catch {
@@ -571,6 +625,7 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
         const acked = await waitForAck(sequence, request.deadlineMs);
         if (!acked || closed) return;
         active = false;
+        const progressAcknowledged = (activeJob?.lastAckedSequence ?? 0) > 0;
         activeJob = null;
         if (!closed) send({
           schema: MAINTENANCE_PROTOCOL_SCHEMA,
@@ -579,6 +634,10 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
           nonce: request.nonce,
           sequence: ++sequence,
           reason: "maintenance_failed",
+          ...maintenanceFailureDiagnostic(error),
+          stage: "recent_maintenance",
+          elapsedMs: Math.max(0, Math.round(performance.now() - jobStartedAt)),
+          progressAcknowledged,
         });
       },
     );

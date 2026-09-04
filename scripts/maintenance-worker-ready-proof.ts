@@ -82,11 +82,50 @@ async function main() {
   )) as { sequence: number; rows: number } | undefined;
   assert.equal(progress?.rows, 100, "busy worker must send durable progress immediately");
 
+  const failureTransport = new FakeTransport();
+  runMaintenanceWorkerService({
+    spawnNonce: randomUUID(),
+    transport: failureTransport,
+    initialize: () => {
+      const error = new Error("database is locked at /Users/private/customer/ledger.sqlite") as Error & { code: string };
+      error.code = "SQLITE_BUSY";
+      throw error;
+    },
+  });
+  failureTransport.emit("message", {
+    schema: MAINTENANCE_PROTOCOL_SCHEMA,
+    type: "run",
+    generation: 1,
+    nonce: randomUUID(),
+    deadlineMs: 500,
+    quarantine: null,
+    repoContexts: [],
+  });
+  const failure = failureTransport.sent.find((receipt) => (
+    (receipt as { type?: string }).type === "error"
+  )) as Record<string, unknown> | undefined;
+  assert.deepEqual(failure && {
+    reason: failure.reason,
+    errorClass: failure.errorClass,
+    message: failure.message,
+    stage: failure.stage,
+    progressAcknowledged: failure.progressAcknowledged,
+  }, {
+    reason: "maintenance_failed",
+    errorClass: "SQLITE_BUSY",
+    message: "database is locked at [path]",
+    stage: "initialization",
+    progressAcknowledged: false,
+  });
+  assert.equal(typeof failure?.elapsedMs, "number");
+  assert.equal(JSON.stringify(failure).includes("/Users/private"), false);
+
   console.log(JSON.stringify({
     proof: "maintenance_worker_ready",
-    checks: 5,
-    passed: 5,
+    checks: 8,
+    passed: 8,
     readyBeforeInitialization: true,
+    failureDiagnosticsPathFree: true,
     stageLogs: stages,
   }));
 }

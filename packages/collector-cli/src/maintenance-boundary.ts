@@ -16,9 +16,27 @@ import {
   parseMaintenanceWorkerReceipt,
   type MaintenanceWorkerReceipt,
   type MaintenanceJobProgress,
+  type MaintenanceErrorReceipt,
 } from "./maintenance-protocol";
 
 export type MaintenancePartialOk = MaintenancePartialOutcome;
+
+export class MaintenanceFailureError extends Error {
+  readonly reason = "maintenance_failed";
+  readonly errorClass: string;
+  readonly stage: string;
+  readonly elapsedMs: number;
+  readonly progressAcknowledged: boolean;
+
+  constructor(receipt: Extract<MaintenanceErrorReceipt, { reason: "maintenance_failed" }>) {
+    super(receipt.message);
+    this.name = "MaintenanceFailureError";
+    this.errorClass = receipt.errorClass;
+    this.stage = receipt.stage;
+    this.elapsedMs = receipt.elapsedMs;
+    this.progressAcknowledged = receipt.progressAcknowledged;
+  }
+}
 import {
   validRepoContextRequest,
   type RepoContextRequest,
@@ -663,7 +681,7 @@ export class MaintenanceProcessBoundary {
       return;
     }
     if (receipt.type === "error") {
-      void this.failActive(receipt.reason, false);
+      void this.failActive(receipt.reason, false, receipt.reason === "maintenance_failed" ? receipt : undefined);
       return;
     }
     const receivedContextIds = receipt.repoContexts.map((result) => result.contextId).sort();
@@ -833,7 +851,11 @@ export class MaintenanceProcessBoundary {
     return this.idleFailure;
   }
 
-  private async failActive(reason: string, timedOut: boolean) {
+  private async failActive(
+    reason: string,
+    timedOut: boolean,
+    diagnostic?: Extract<MaintenanceErrorReceipt, { reason: "maintenance_failed" }>,
+  ) {
     const active = this.active;
     if (!active || active.settled) return;
     active.settled = true;
@@ -911,7 +933,7 @@ export class MaintenanceProcessBoundary {
       return;
     }
     this.openCircuit(reason);
-    active.reject(new Error(reason));
+    active.reject(diagnostic ? new MaintenanceFailureError(diagnostic) : new Error(reason));
   }
 
   private blameThresholdMs() {

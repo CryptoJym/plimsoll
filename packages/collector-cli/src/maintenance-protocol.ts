@@ -57,6 +57,15 @@ export type MaintenanceResultReceipt = {
   repoContexts: RepoContextResult[];
 };
 
+export const MAINTENANCE_FAILURE_STAGES = [
+  "initialization",
+  "child_repo_context_start",
+  "deadline_stages",
+  "recent_maintenance",
+  "repo_context",
+] as const;
+export type MaintenanceFailureStage = typeof MAINTENANCE_FAILURE_STAGES[number];
+
 export type MaintenanceErrorReceipt = {
   schema: typeof MAINTENANCE_PROTOCOL_SCHEMA;
   type: "error";
@@ -64,7 +73,16 @@ export type MaintenanceErrorReceipt = {
   nonce: string;
   sequence: number;
   reason: "maintenance_failed" | "worker_busy" | "invalid_request";
-};
+} & ({
+  reason: "maintenance_failed";
+  errorClass: string;
+  message: string;
+  stage: MaintenanceFailureStage;
+  elapsedMs: number;
+  progressAcknowledged: boolean;
+} | {
+  reason: "worker_busy" | "invalid_request";
+});
 
 export type MaintenanceProgressReceipt = {
   schema: typeof MAINTENANCE_PROTOCOL_SCHEMA;
@@ -456,8 +474,22 @@ export function parseMaintenanceWorkerReceipt(value: unknown): MaintenanceWorker
     };
   }
   if (row.type === "error") {
-    if (!exactKeys(row, ["schema", "type", "generation", "nonce", "sequence", "reason"]) || !validGeneration(row.sequence)) return null;
+    if (!validGeneration(row.sequence)) return null;
     if (!["maintenance_failed", "worker_busy", "invalid_request"].includes(String(row.reason))) return null;
+    if (row.reason === "maintenance_failed") {
+      if (!exactKeys(row, [
+        "schema", "type", "generation", "nonce", "sequence", "reason",
+        "errorClass", "message", "stage", "elapsedMs", "progressAcknowledged",
+      ]) || typeof row.errorClass !== "string" ||
+        !/^[A-Za-z][A-Za-z0-9_.-]{0,63}$/.test(row.errorClass) ||
+        typeof row.message !== "string" || Array.from(row.message).length > 200 ||
+        /[\\/\u0000-\u001f\u007f]/.test(row.message) ||
+        typeof row.stage !== "string" ||
+        !(MAINTENANCE_FAILURE_STAGES as readonly string[]).includes(row.stage) ||
+        !count(row.elapsedMs) || typeof row.progressAcknowledged !== "boolean") return null;
+    } else if (!exactKeys(row, ["schema", "type", "generation", "nonce", "sequence", "reason"])) {
+      return null;
+    }
     return row as MaintenanceErrorReceipt;
   }
   return null;
