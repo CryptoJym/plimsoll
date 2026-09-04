@@ -1211,6 +1211,66 @@ async function malformedOversizedFrameProof() {
   });
 }
 
+async function diagnosticFailureReceiptProof() {
+  const privatePath = `/Users/private/${PRIVATE_PATH_SENTINEL}/ledger.sqlite`;
+  const harness = fakeBoundary((spawnNonce) => {
+    const child = new FakeChild(20_510);
+    child.onSend = (raw) => {
+      const request = raw as MaintenanceRunRequest;
+      if (request.type !== "run") return;
+      queueMicrotask(() => {
+        child.emit("message", {
+          schema: MAINTENANCE_PROTOCOL_SCHEMA,
+          type: "maintenance_job_progress",
+          generation: request.generation,
+          nonce: request.nonce,
+          sequence: 1,
+          stage: "wal_checkpoint",
+          rows: 0,
+          ms: 12,
+          remaining: 500,
+        });
+        child.emit("message", {
+          schema: MAINTENANCE_PROTOCOL_SCHEMA,
+          type: "error",
+          generation: request.generation,
+          nonce: request.nonce,
+          sequence: 2,
+          reason: "maintenance_failed",
+          errorClass: "SQLITE_BUSY",
+          message: "database is locked at [path]",
+          stage: "deadline_stages",
+          elapsedMs: 37,
+          progressAcknowledged: true,
+        });
+      });
+    };
+    ready(child, spawnNonce);
+    return child;
+  });
+
+  const failed = harness.boundary.run();
+  await assert.rejects(failed, (error: unknown) => {
+    const row = error as Error & Record<string, unknown>;
+    assert.equal(row.message, "database is locked at [path]");
+    assert.equal(row.errorClass, "SQLITE_BUSY");
+    assert.equal(row.stage, "deadline_stages");
+    assert.equal(row.elapsedMs, 37);
+    assert.equal(row.progressAcknowledged, true);
+    assert.equal(JSON.stringify(row).includes(privatePath), false);
+    return true;
+  });
+  assert.equal(await harness.boundary.shutdown(), true);
+  pass("maintenance_failure_receipt_keeps_bounded_path_free_diagnostics", {
+    errorClass: "SQLITE_BUSY",
+    message: "database is locked at [path]",
+    stage: "deadline_stages",
+    elapsedMs: 37,
+    progressAcknowledged: true,
+    pathFree: true,
+  });
+}
+
 async function realWorkerCrashProof() {
   const fixturePath = path.resolve("scripts/fixtures/maintenance-boundary-crash-child.mjs");
   const boundary = new MaintenanceProcessBoundary({
@@ -1742,6 +1802,11 @@ async function main() {
     console.log(JSON.stringify({ proof: "maintenance_boundary_partial_ok", checks }));
     return;
   }
+  if (process.env.PLIMSOLL_MAINTENANCE_PROOF_FOCUS === "failure_diagnostics") {
+    await diagnosticFailureReceiptProof();
+    console.log(JSON.stringify({ proof: "maintenance_boundary_failure_diagnostics", checks }));
+    return;
+  }
   await fifoAvailabilityProof();
   await blockedShutdownProof();
   await circuitAndRecoveryProof();
@@ -1755,6 +1820,7 @@ async function main() {
   await progressStageTimeoutProof();
   staticParentFilesystemIsolationProof();
   await malformedOversizedFrameProof();
+  await diagnosticFailureReceiptProof();
   await realWorkerCrashProof();
   await partialOkArbitrationProof();
   await staleFenceAndImmediateSecondJobProof();

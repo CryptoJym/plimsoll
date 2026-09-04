@@ -254,6 +254,32 @@ async function unitChecks() {
 
   const mod = rejectionDiagnostics;
 
+  const clientClasses = [
+    mod.classifyRejectionClient({ headers: { "x-plimsoll-source": "codex" }, socket: { remotePort: 55123 } }),
+    mod.classifyRejectionClient({ headers: { "x-plimsoll-source": "claude_code" }, socket: { remotePort: 55124 } }),
+    mod.classifyRejectionClient({ headers: { "user-agent": "OTel-OTLP-Exporter-Java/1.2" }, socket: { remotePort: 55125 } }),
+    mod.classifyRejectionClient({ headers: { "user-agent": SENTINEL_SOURCE }, socket: { remotePort: 55126 } }),
+  ];
+  check(
+    "rejection_client_identity_is_closed_content_free_and_fixed_cardinality",
+    JSON.stringify(clientClasses) === JSON.stringify(["codex", "claude_code", "otlp_exporter", "unknown"]) &&
+      !JSON.stringify(clientClasses).includes(SENTINEL_SOURCE),
+    { clientClasses },
+  );
+
+  let identityNow = T0;
+  const identityAgg = mod.createRejectionDiagnostics({ nowMs: () => identityNow });
+  const identityFirst = identityAgg.observeRejection("compressed_body_too_large", "codex");
+  identityNow += INTERVAL_MS;
+  const identityBoundary = identityAgg.observeRejection("compressed_body_too_large", "claude_code");
+  check(
+    "compressed_body_summary_records_bounded_client_class_without_raw_headers",
+    identityFirst.first && identityBoundary.summaries.length === 1 &&
+      identityBoundary.summaries[0]?.clientClass === "codex" &&
+      !JSON.stringify(identityBoundary).includes(SENTINEL_SOURCE),
+    { identityFirst, identityBoundary },
+  );
+
   // Every bounded reason must have a compile-time symbolic next action.
   const reasonEnumValues = Object.values(mod.HTTP_BOUNDARY_REASONS);
   const actionMap = mod.HTTP_REJECTION_NEXT_ACTIONS as Record<string, string>;

@@ -54,6 +54,13 @@ Background (LaunchAgent) mode for npm installs is still being fitted — track
 [plimsoll#11](https://github.com/CryptoJym/plimsoll/issues/11). For now run
 `start` in a terminal or from the git checkout.
 
+Before opening the HTTP listener, `start` makes one bounded
+`wal_checkpoint(TRUNCATE)` attempt when `work-ledger.sqlite-wal` is larger
+than `startupWalCheckpointBytes` (default 1 GiB), and emits a structured
+before/after receipt. A checkpoint can truncate the WAL only when no other
+process retains a conflicting SQLite reader or writer; maintenance orphan
+recovery is what prevents an abandoned worker from defeating later attempts.
+
 ## What leaves your machine
 
 Nothing, unless you configure an upload target. Identifying values are

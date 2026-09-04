@@ -36,6 +36,7 @@ import {
   type LocalProducerSource,
 } from "./http-boundary";
 import {
+  classifyRejectionClient,
   createRejectionDiagnostics,
   type CollectorServer,
 } from "./rejection-diagnostics";
@@ -676,16 +677,18 @@ export function createCollectorServer(
       response.end(JSON.stringify({ error: "not_found" }));
     } catch (error) {
       const failure = asHttpBoundaryRejection(error);
+      const clientClass = classifyRejectionClient(request);
       const rejection = {
         error: "collector_request_rejected",
         reason: failure.reason,
       };
+      const diagnosticRejection = { ...rejection, clientClass };
       // Aggregate identical rejections: emit the first occurrence of a
       // bounded reason promptly plus any window summaries it just closed.
       // The HTTP response below stays byte-for-byte unchanged.
-      const observed = rejectionDiagnostics.observeRejection(failure.reason);
+      const observed = rejectionDiagnostics.observeRejection(failure.reason, clientClass);
       for (const line of observed.summaries) console.warn(JSON.stringify(line));
-      if (observed.first) console.warn(JSON.stringify(rejection));
+      if (observed.first) console.warn(JSON.stringify(diagnosticRejection));
       if (!response.headersSent) {
         response.writeHead(failure.status, {
           connection: "close",

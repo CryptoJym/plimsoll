@@ -65,14 +65,16 @@ export function checkpointWalInBoundedChild(options: {
     child.stdout.on("data", (chunk) => {
       if (output.length < 4096) output += String(chunk).slice(0, 4096 - output.length);
     });
+    let timedOut = false;
     const timer = setTimeout(() => {
+      timedOut = true;
       child.kill("SIGKILL");
-      reject(new Error("startup_wal_checkpoint_timed_out"));
-    }, options.timeoutMs);
+    }, Math.max(1, options.timeoutMs - 100));
     timer.unref();
     child.once("error", (error) => { clearTimeout(timer); reject(error); });
     child.once("close", (code) => {
       clearTimeout(timer);
+      if (timedOut) return reject(new Error("startup_wal_checkpoint_timed_out"));
       if (code !== 0) return reject(new Error("startup_wal_checkpoint_failed"));
       try {
         const parsed = JSON.parse(output) as WalCheckpointCounts;

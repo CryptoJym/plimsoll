@@ -97,7 +97,7 @@ import {
 } from "./history-coverage";
 import { captureBaselineStatus } from "./capture-baseline";
 import { createCollectorServer } from "./server";
-import { MaintenanceProcessBoundary } from "./maintenance-boundary";
+import { MaintenanceFailureError, MaintenanceProcessBoundary } from "./maintenance-boundary";
 import { checkpointWalInBoundedChild, runStartupWalSelfHeal } from "./startup-wal-self-heal";
 import {
   maintenanceStarvationReceipt,
@@ -1598,7 +1598,21 @@ async function main() {
           console.warn(
             JSON.stringify({
               warning: "maintenance_failed",
-              message: error instanceof Error ? error.message : String(error),
+              ...(error instanceof MaintenanceFailureError
+                ? {
+                    errorClass: error.errorClass,
+                    message: error.message,
+                    stage: error.stage,
+                    elapsedMs: error.elapsedMs,
+                    progressAcknowledged: error.progressAcknowledged,
+                  }
+                : {
+                    errorClass: error instanceof Error ? error.name : "UnknownError",
+                    message: error instanceof Error ? error.message : String(error),
+                    stage: "boundary",
+                    elapsedMs: null,
+                    progressAcknowledged: false,
+                  }),
             }),
           );
         },

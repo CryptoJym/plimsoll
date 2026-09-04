@@ -23,6 +23,28 @@ export const REJECTION_SUMMARY_INTERVAL_MS = 60_000;
  */
 export const REJECTION_COUNTER_CAP = Number.MAX_SAFE_INTEGER;
 
+export const REJECTION_CLIENT_CLASSES = [
+  "codex",
+  "claude_code",
+  "otlp_exporter",
+  "unknown",
+] as const;
+export type RejectionClientClass = (typeof REJECTION_CLIENT_CLASSES)[number];
+
+/** Reduce request identity to a closed enum; never retain raw header values. */
+export function classifyRejectionClient(request: {
+  headers: http.IncomingHttpHeaders;
+  socket?: { remotePort?: number };
+}): RejectionClientClass {
+  const source = request.headers["x-plimsoll-source"];
+  const firstSource = Array.isArray(source) ? source[0] : source;
+  if (firstSource === "codex" || firstSource === "claude_code") return firstSource;
+  const agent = request.headers["user-agent"];
+  const firstAgent = (Array.isArray(agent) ? agent[0] : agent)?.toLowerCase() ?? "";
+  if (/\b(?:otel|opentelemetry|otlp)[\s/_-]/.test(firstAgent)) return "otlp_exporter";
+  return "unknown";
+}
+
 /**
  * Symbolic next operator action per bounded reason. Compile-time exhaustive:
  * adding a reason to `HTTP_BOUNDARY_REASONS` without an action here fails
@@ -56,6 +78,7 @@ export const HTTP_REJECTION_NEXT_ACTIONS: Record<HttpBoundaryReason, string> = {
 export type RejectionSummaryLine = {
   error: "collector_request_rejected_summary";
   reason: HttpBoundaryReason;
+  clientClass: RejectionClientClass;
   /** Total rejections accounted by this closed window (first + suppressed). */
   count: number;
   /** Rejections inside the window after its first occurrence. */
@@ -73,6 +96,7 @@ export type RejectionObservation = {
 
 export type RejectionCounterRow = {
   reason: HttpBoundaryReason;
+  clientClass: RejectionClientClass;
   rejected: number;
   suppressed: number;
   emittedFirst: number;
@@ -93,13 +117,15 @@ export type RejectionDiagnosticsCounters = {
     emittedFirstTotal: number;
     summarizedTotal: number;
   };
-  /** Only reasons with nonzero activity; cardinality bounded by the enum. */
+  /** Only active reason/client pairs; cardinality bounded by two closed enums. */
   reasons: RejectionCounterRow[];
 };
 
 type WindowState = { firstAtMs: number; count: number; suppressed: number };
 
 type ReasonState = {
+  reason: HttpBoundaryReason;
+  clientClass: RejectionClientClass;
   rejected: number;
   suppressed: number;
   emittedFirst: number;
@@ -128,14 +154,16 @@ export function createRejectionDiagnostics(options: {
   initialByReason?: Partial<Record<HttpBoundaryReason, SeedReasonState>>;
 } = {}) {
   const nowMs = options.nowMs ?? Date.now;
-  const states = new Map<HttpBoundaryReason, ReasonState>();
+  const states = new Map<string, ReasonState>();
   const acceptedBySource: Record<LocalProducerSource, number> = {
     claude_code: 0,
     codex: 0,
   };
   if (options.initialByReason) {
     for (const [reason, seed] of Object.entries(options.initialByReason)) {
-      states.set(reason as HttpBoundaryReason, {
+      states.set(`${reason}:unknown`, {
+        reason: reason as HttpBoundaryReason,
+        clientClass: "unknown",
         rejected: seed.rejected,
         suppressed: seed.suppressed,
         emittedFirst: seed.emittedFirst,
@@ -147,17 +175,17 @@ export function createRejectionDiagnostics(options: {
     }
   }
 
-  const stateFor = (reason: HttpBoundaryReason): ReasonState => {
-    let state = states.get(reason);
+  const stateFor = (reason: HttpBoundaryReason, clientClass: RejectionClientClass): ReasonState => {
+    const key = `${reason}:${clientClass}`;
+    let state = states.get(key);
     if (!state) {
-      state = { rejected: 0, suppressed: 0, emittedFirst: 0, summarized: 0, window: null };
-      states.set(reason, state);
+      state = { reason, clientClass, rejected: 0, suppressed: 0, emittedFirst: 0, summarized: 0, window: null };
+      states.set(key, state);
     }
     return state;
   };
 
   const closeWindow = (
-    reason: HttpBoundaryReason,
     state: ReasonState,
   ): RejectionSummaryLine => {
     const window = state.window!;
@@ -168,28 +196,32 @@ export function createRejectionDiagnostics(options: {
     }
     return {
       error: "collector_request_rejected_summary",
-      reason,
+      reason: state.reason,
+      clientClass: state.clientClass,
       count: window.count,
       suppressed: window.suppressed,
       intervalMs: REJECTION_SUMMARY_INTERVAL_MS,
-      action: HTTP_REJECTION_NEXT_ACTIONS[reason],
+      action: HTTP_REJECTION_NEXT_ACTIONS[state.reason],
     };
   };
 
   return {
-    observeRejection(reason: HttpBoundaryReason): RejectionObservation {
+    observeRejection(
+      reason: HttpBoundaryReason,
+      clientClass: RejectionClientClass = "unknown",
+    ): RejectionObservation {
       const now = nowMs();
       const summaries: RejectionSummaryLine[] = [];
-      for (const [key, state] of states) {
+      for (const state of states.values()) {
         if (
           state.window !== null &&
           now - state.window.firstAtMs >= REJECTION_SUMMARY_INTERVAL_MS
         ) {
-          summaries.push(closeWindow(key, state));
+          summaries.push(closeWindow(state));
         }
       }
 
-      const state = stateFor(reason);
+      const state = stateFor(reason, clientClass);
       // Saturated: keep decisions and HTTP behavior unchanged, freeze counting.
       if (state.rejected >= REJECTION_COUNTER_CAP) {
         return { first: false, summaries };
@@ -211,8 +243,8 @@ export function createRejectionDiagnostics(options: {
 
     flush(): RejectionSummaryLine[] {
       const summaries: RejectionSummaryLine[] = [];
-      for (const [key, state] of states) {
-        if (state.window !== null) summaries.push(closeWindow(key, state));
+      for (const state of states.values()) {
+        if (state.window !== null) summaries.push(closeWindow(state));
       }
       return summaries;
     },
@@ -229,9 +261,7 @@ export function createRejectionDiagnostics(options: {
       let emittedFirstTotal = 0;
       let summarizedTotal = 0;
       const rows: RejectionCounterRow[] = [];
-      for (const reason of HTTP_BOUNDARY_REASONS) {
-        const state = states.get(reason);
-        if (!state) continue;
+      for (const state of states.values()) {
         if (
           state.rejected === 0 &&
           state.suppressed === 0 &&
@@ -246,7 +276,8 @@ export function createRejectionDiagnostics(options: {
         emittedFirstTotal += state.emittedFirst;
         summarizedTotal += state.summarized;
         rows.push({
-          reason,
+          reason: state.reason,
+          clientClass: state.clientClass,
           rejected: state.rejected,
           suppressed: state.suppressed,
           emittedFirst: state.emittedFirst,
