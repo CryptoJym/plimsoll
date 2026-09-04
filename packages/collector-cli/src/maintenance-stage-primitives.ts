@@ -20,7 +20,12 @@ export type MaintenanceStageCursor = {
   updatedAt: string;
 };
 
-export type BoundedStageResult = { rows: number; ms: number; remaining: number };
+export type BoundedStageResult = {
+  rows: number;
+  ms: number;
+  remaining: number;
+  batchSize: number;
+};
 
 type TimedOptions = {
   remainingMs: number;
@@ -41,9 +46,9 @@ function budget(options: TimedOptions) {
     started,
     allowed,
     canStart: () => allowed > 0 && now() - started < allowed,
-    result: (rows: number): BoundedStageResult => {
+    result: (rows: number, batchSize = boundedBatchSize(options.batchSize)): BoundedStageResult => {
       const ms = Math.max(0, Math.round(now() - started));
-      return { rows, ms, remaining: Math.max(0, allowed - ms) };
+      return { rows, ms, remaining: Math.max(0, allowed - ms), batchSize };
     },
   };
 }
@@ -125,58 +130,47 @@ export function runRetentionDeletionStage(
   ensureMaintenanceStageSchema(database);
   const timer = budget(options);
   if (!timer.canStart()) return timer.result(0);
-  const limit = Math.min(boundedBatchSize(options.batchSize), 1_000);
+  const stored = readMaintenanceStageCursor(database, "retention_deletion").cursor;
+  let adaptiveBatchSize = Math.min(boundedBatchSize(options.batchSize), 1_000);
+  if (stored) {
+    try {
+      const parsed = JSON.parse(stored) as { batchSize?: number };
+      if (Number.isSafeInteger(parsed.batchSize) && Number(parsed.batchSize) > 0) {
+        adaptiveBatchSize = Math.min(adaptiveBatchSize, Number(parsed.batchSize));
+      }
+    } catch {
+      // Older rowid cursor receipts are safely replaced by the observed-time scan.
+    }
+  }
   const wallNow = options.wallNow?.() ?? Date.now();
   const cutoff = new Date(wallNow - Math.max(0, options.retentionDays) * 86_400_000).toISOString();
   const rows = database.transaction(() => {
     let deleted = 0;
-    const stored = readMaintenanceStageCursor(database, "retention_deletion").cursor;
-    let cursors: { events: number; metrics: number } = { events: 0, metrics: 0 };
-    if (stored) {
-      try {
-        const parsed = JSON.parse(stored) as Partial<typeof cursors>;
-        cursors = {
-          events: Math.max(0, Math.trunc(parsed.events ?? 0)),
-          metrics: Math.max(0, Math.trunc(parsed.metrics ?? 0)),
-        };
-      } catch {
-        cursors = { events: 0, metrics: 0 };
-      }
-    }
-    let visited = 0;
     if (options.parityReady) {
       const candidates = database.prepare(
-        `select rowid, id, created_at as createdAt, uploaded_at as uploadedAt
-         from buffered_events where rowid > ? order by rowid limit ?`,
-      ).all(cursors.events, limit) as Array<{
-        rowid: number; id: string; createdAt: string; uploadedAt: string | null;
-      }>;
+        `select id from buffered_events indexed by idx_events_observed
+         where observed_at < ? and uploaded_at is not null
+         order by observed_at limit ?`,
+      ).all(cutoff, adaptiveBatchSize) as Array<{ id: string }>;
       const remove = database.prepare(`delete from buffered_events where id = ?`);
-      for (const candidate of candidates) {
-        if (candidate.createdAt < cutoff && candidate.uploadedAt !== null) {
-          deleted += remove.run(candidate.id).changes;
-        }
-      }
-      visited += candidates.length;
-      cursors.events = candidates.length < limit ? 0 : candidates.at(-1)!.rowid;
+      for (const candidate of candidates) deleted += remove.run(candidate.id).changes;
     }
-    if (visited < limit) {
+    if (deleted < adaptiveBatchSize) {
       const candidates = database.prepare(
-        `select rowid, id, created_at as createdAt from metric_samples
-         where rowid > ? order by rowid limit ?`,
-      ).all(cursors.metrics, limit - visited) as Array<{
-        rowid: number; id: string; createdAt: string;
-      }>;
+        `select id from metric_samples indexed by idx_metrics_observed
+         where created_at < ? order by created_at limit ?`,
+      ).all(cutoff, adaptiveBatchSize - deleted) as Array<{ id: string }>;
       const remove = database.prepare(`delete from metric_samples where id = ?`);
-      for (const candidate of candidates) {
-        if (candidate.createdAt < cutoff) deleted += remove.run(candidate.id).changes;
-      }
-      cursors.metrics = candidates.length < limit - visited ? 0 : candidates.at(-1)!.rowid;
+      for (const candidate of candidates) deleted += remove.run(candidate.id).changes;
     }
-    advance(database, "retention_deletion", deleted, JSON.stringify(cursors));
     return deleted;
   })();
-  return timer.result(rows);
+  const result = timer.result(rows, adaptiveBatchSize);
+  const nextBatchSize = result.ms <= 0 || rows <= 0
+    ? adaptiveBatchSize
+    : Math.max(1, Math.min(1_000, Math.floor(rows * 2_750 / result.ms)));
+  advance(database, "retention_deletion", rows, JSON.stringify({ batchSize: nextBatchSize }));
+  return result;
 }
 
 type CheckpointReading = { busy: number; log: number; checkpointed: number };
@@ -199,7 +193,7 @@ export function runWalCheckpointStage(
   if (!timer.canStart()) return { ...timer.result(0), passive: null, truncate: null };
   const passive = checkpoint(database, "PASSIVE");
   const truncate = passive.busy === 0 && timer.canStart() ? checkpoint(database, "TRUNCATE") : null;
-  const pages = (truncate ?? passive).checkpointed;
+  const pages = Math.max(0, (truncate ?? passive).checkpointed);
   advance(database, "wal_checkpoint", pages, JSON.stringify(truncate ?? passive));
   return { ...timer.result(pages), passive, truncate };
 }
@@ -252,17 +246,80 @@ export function runEnrichmentStage(
   ensureMaintenanceStageSchema(database);
   const timer = budget(options);
   if (!timer.canStart()) return timer.result(0);
-  const limit = boundedBatchSize(options.batchSize);
+  const limit = Math.min(boundedBatchSize(options.batchSize), 1);
   const result = database.transaction(() => {
     const slice = runRepoEnrichmentMaintenance(database, {
       legacyBackfillLimit: limit,
       sessionLimit: Math.min(limit, 500),
       eventLimit: limit,
+      skipLegacyBackfill: true,
     });
     advance(database, "enrichment", slice.rowsVisited, null);
     return slice;
   })();
   return timer.result(result.rowsVisited);
+}
+
+export type EnrichmentMaintenanceJobResult = BoundedStageResult & {
+  skipped: boolean;
+  timedOut: boolean;
+};
+
+export function runEnrichmentMaintenanceJob(
+  database: Database.Database,
+  options: { remainingMs: number; now?: () => number },
+): EnrichmentMaintenanceJobResult {
+  if (options.remainingMs < 5_000) {
+    return { rows: 0, ms: 0, remaining: Math.max(0, options.remainingMs), batchSize: 1,
+      skipped: true, timedOut: false };
+  }
+  const result = runEnrichmentStage(database, { ...options, batchSize: 1 });
+  return { ...result, skipped: false, timedOut: result.ms >= options.remainingMs };
+}
+
+export type DeadlineMaintenanceStagesResult = {
+  remainingMs: number;
+  stages: Array<{ stage: "wal_checkpoint" | "retention" | "fill_pending_event_links" } & BoundedStageResult>;
+};
+
+export function runDeadlineMaintenanceStages(
+  database: Database.Database,
+  options: {
+    deadlineMs: number;
+    teardownMarginMs: number;
+    retentionDays: number;
+    parityReady: boolean;
+    now?: () => number;
+    onDurableCommit?: (progress: {
+      stage: "wal_checkpoint" | "retention" | "fill_pending_event_links";
+      rows: number; ms: number; remaining: number;
+    }) => boolean;
+  },
+): DeadlineMaintenanceStagesResult {
+  const now = options.now ?? (() => performance.now());
+  const startedAt = now();
+  const workBudget = Math.max(0, Math.trunc(options.deadlineMs) - Math.max(0, Math.trunc(options.teardownMarginMs)));
+  const remaining = () => Math.max(0, workBudget - Math.max(0, Math.round(now() - startedAt)));
+  const stages: DeadlineMaintenanceStagesResult["stages"] = [];
+  const emit = (stage: "wal_checkpoint" | "retention" | "fill_pending_event_links", result: BoundedStageResult) => {
+    const progress = { stage, rows: result.rows, ms: result.ms, remaining: remaining() };
+    stages.push({ ...progress, batchSize: result.batchSize });
+    return options.onDurableCommit?.(progress) !== false;
+  };
+
+  const checkpointBudget = Math.min(1_000, remaining());
+  const checkpoint = runWalCheckpointStage(database, { remainingMs: checkpointBudget, batchSize: 1, now });
+  if (!emit("wal_checkpoint", checkpoint)) return { remainingMs: remaining(), stages };
+  const retention = runRetentionDeletionStage(database, {
+    remainingMs: Math.min(3_000, remaining()), batchSize: 64,
+    retentionDays: options.retentionDays, parityReady: options.parityReady, now,
+  });
+  if (!emit("retention", retention)) return { remainingMs: remaining(), stages };
+  const pending = runPendingEventLinkFillStage(database, {
+    remainingMs: remaining(), batchSize: 256, now,
+  });
+  emit("fill_pending_event_links", pending);
+  return { remainingMs: remaining(), stages };
 }
 
 export function runGitContextStage(

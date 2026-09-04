@@ -11,6 +11,7 @@ import {
 } from "./maintenance-protocol";
 import { maintenanceCandidateHash, type MaintenanceProgress } from "./maintenance-progress";
 import { recordGitContextBatchProgress } from "./maintenance-starvation";
+import { runDeadlineMaintenanceStages } from "./maintenance-stage-primitives";
 import {
   REPO_CONTEXT_RESOLVER_VERSION,
   resolveRepoContextRequests,
@@ -24,6 +25,7 @@ export type MaintenanceWorkerServiceInput = {
   initialize?: () => {
     maintenance: CollectorMaintenance;
     buffer: LocalEventBuffer;
+    retentionDays?: number;
   };
   spawnNonce: string;
   transport?: MaintenanceWorkerTransport;
@@ -237,7 +239,7 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
     on: (event, listener) => process.on(event, listener),
     disconnect: () => process.disconnect?.(),
   };
-  let runtime = input.maintenance && input.buffer
+  let runtime: { maintenance: CollectorMaintenance; buffer: LocalEventBuffer; retentionDays?: number } | null = input.maintenance && input.buffer
     ? { maintenance: input.maintenance, buffer: input.buffer }
     : null;
   const reportStage = (stage: string, startedAt = serviceStartedAt) => {
@@ -354,6 +356,11 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
       return;
     }
     active = true;
+    const jobStartedAt = performance.now();
+    const remainingJobMs = () => Math.max(
+      0,
+      request.deadlineMs - Math.max(0, Math.round(performance.now() - jobStartedAt)),
+    );
     progressFrames = 0;
     lastProgressKey = "";
     sequence = 0;
@@ -436,6 +443,29 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
       });
       return;
     }
+    if (worker.buffer.database) {
+      try {
+        runDeadlineMaintenanceStages(worker.buffer.database, {
+          deadlineMs: request.deadlineMs,
+          teardownMarginMs: 0,
+          retentionDays: worker.retentionDays ?? 90,
+          parityReady: true,
+          onDurableCommit: reportJobProgress,
+        });
+      } catch {
+        active = false;
+        activeJob = null;
+        send({
+          schema: MAINTENANCE_PROTOCOL_SCHEMA,
+          type: "error",
+          generation: request.generation,
+          nonce: request.nonce,
+          sequence: ++sequence,
+          reason: "maintenance_failed",
+        });
+        return;
+      }
+    }
     void worker.maintenance.runRecent({
       quarantine: request.quarantine ?? undefined,
       onProgress: reportProgress,
@@ -462,9 +492,15 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
             quarantine: request.quarantine,
             reportProgress,
             recordRepoLabel: (repoHash, label) => worker.buffer.recordRepoLabel(repoHash, label),
-            budgetMs: gitContextBudgetMs(request.deadlineMs),
+            budgetMs: Math.min(gitContextBudgetMs(request.deadlineMs), remainingJobMs()),
             commit: (committed) => {
               worker.buffer.applyRepoContextResults(committed);
+              reportJobProgress({
+                stage: "git_context",
+                rows: committed.length,
+                ms: Math.max(0, Math.round(performance.now() - gitContextStartedAt)),
+                remaining: remainingJobMs(),
+              });
             },
             deferrable: true,
           });
@@ -485,11 +521,11 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
             committed: childBatch.results.length,
             deferred: childBatch.deferred.length + overflow.length,
           });
-          reportJobProgress({
+          if (overflow.length > 0 || childBatch.results.length === 0) reportJobProgress({
             stage: "git_context",
-            rows: childBatch.results.length + overflow.length,
+            rows: overflow.length,
             ms: Math.max(0, Math.round(performance.now() - gitContextStartedAt)),
-            remaining: childBatch.deferred.length,
+            remaining: remainingJobMs(),
           });
           repoContexts = resolveWithProgress(request.repoContexts);
         } catch {

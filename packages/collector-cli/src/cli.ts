@@ -1016,7 +1016,11 @@ async function main() {
           warning: "maintenance_worker_stage", stage: "maintenance_constructed",
           ms: Math.max(0, Math.round(performance.now() - startedAt)),
         }));
-        return { maintenance: workerMaintenance, buffer: workerBuffer };
+        return {
+          maintenance: workerMaintenance,
+          buffer: workerBuffer,
+          retentionDays: workerConfig.retentionDays,
+        };
       },
     });
     return;

@@ -23,6 +23,8 @@ function fixture() {
       output_tokens integer, cost_usd real, payload_json text not null default '{}'
     );
     create table metric_samples (id text primary key, created_at text not null);
+    create index idx_events_observed on buffered_events (observed_at);
+    create index idx_metrics_observed on metric_samples (created_at);
     create table repo_context_results (
       context_id text primary key, repo_hash text not null, branch_hash text,
       head_sha text, resolved_at text not null, resolver_version text not null,

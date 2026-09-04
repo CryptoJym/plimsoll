@@ -428,6 +428,7 @@ export class LocalEventBuffer {
       create index if not exists idx_events_account on buffered_events (account_hash, observed_at);
       create index if not exists idx_metrics_name on metric_samples (metric_name, observed_at);
       create index if not exists idx_metrics_session on metric_samples (session_id);
+      create index if not exists idx_metrics_observed on metric_samples (created_at);
       create index if not exists idx_events_unpriced_usage
         on buffered_events (id)
         where event_type in ('usage_rollout','usage_transcript')
