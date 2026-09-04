@@ -87,7 +87,8 @@ import {
   CoalescingMaintenanceScheduler,
   CollectorMaintenance,
   automaticCaptureRuntimeStatus,
-  type MaintenanceRunOutcome,
+  isMaintenancePartialOutcome,
+  type MaintenanceAttemptOutcome,
 } from "./maintenance";
 import { codexReconciliationStatus } from "./codex-reconciliation";
 import {
@@ -1239,8 +1240,8 @@ async function main() {
     // Runtime ownership is already proven above. Recover ID-only handoff and
     // inflight receipts once, before intake or the child can create live work.
     buffer.recoverRepoContextState();
-    let scheduler: CoalescingMaintenanceScheduler<MaintenanceRunOutcome> | undefined;
-    let maintenanceCadence: AutomaticMaintenanceCadence<MaintenanceRunOutcome> | undefined;
+    let scheduler: CoalescingMaintenanceScheduler<MaintenanceAttemptOutcome> | undefined;
+    let maintenanceCadence: AutomaticMaintenanceCadence<MaintenanceAttemptOutcome> | undefined;
     let cachedBaseline = captureBaselineStatus(buffer.database);
     const maintenanceBoundary = new MaintenanceProcessBoundary({
       entryPath: process.argv[1]!,
@@ -1252,11 +1253,19 @@ async function main() {
       // writer holds stay bounded by its own slice budget (maxActiveMs <= 5s in
       // maintenance.ts), so these deadlines govern startup + coordination only.
       deadlineMs: 30_000,
+      teardownMarginMs: 1_000,
       readyDeadlineMs: 45_000, // 2026-09-04: guards process start only (ready is sent before the ledger opens); 10 s flaked under heavy disk I/O from the lane sweeps
       // Issue #181: a deadline kill must never vanish silently. Record the
       // kill rate and the last-seen stage durably, and surface the receipt
       // so enrichment starvation cannot recur invisibly.
       onDeadline: (info) => {
+        if (info.outcome === "PARTIAL_OK" && info.jobProgress) {
+          console.log(JSON.stringify({
+            status: "maintenance_partial_ok",
+            ...info.jobProgress,
+          }));
+          return;
+        }
         try {
           recordMaintenanceDeadlineKill(buffer.database);
           recordMaintenanceDeadlineBlame(buffer.database, {
@@ -1454,9 +1463,10 @@ async function main() {
     scheduler = new CoalescingMaintenanceScheduler(async () => {
       const drainedRepoContexts = buffer.takeRepoContextBatch();
       const repoContexts = buffer.beginRepoContextResolution(drainedRepoContexts);
-      let result: MaintenanceRunOutcome;
+      let result: MaintenanceAttemptOutcome;
       try {
         result = await maintenanceBoundary.run({
+          acceptPartial: true,
           repoContexts,
           onRepoContexts: (resolved) => {
             buffer.applyRepoContextResults(resolved);
@@ -1487,6 +1497,16 @@ async function main() {
           // the final recovery boundary without exposing any raw cwd.
         }
         throw error;
+      }
+      if (isMaintenancePartialOutcome(result)) {
+        try {
+          buffer.failRepoContextRun(repoContexts, "boundary_unavailable");
+        } catch {
+          // The acknowledged stage commit is still successful; startup recovery
+          // owns any unresolved parent handoff left by the disposable child.
+        }
+        refreshStatusSnapshot();
+        return result;
       }
       try {
         cachedBaseline = captureBaselineStatus(buffer.database);

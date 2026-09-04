@@ -7,7 +7,7 @@ import {
   type RepoContextResult,
 } from "./repo-context";
 
-export const MAINTENANCE_PROTOCOL_SCHEMA = 3 as const;
+export const MAINTENANCE_PROTOCOL_SCHEMA = 4 as const;
 export const MAINTENANCE_PROTOCOL_MAX_BYTES = 64 * 1024;
 export const MAINTENANCE_PROTOCOL_MAX_FRAMES_PER_JOB = 128;
 export const MAINTENANCE_PROTOCOL_MAX_REPO_CONTEXTS = 8;
@@ -77,6 +77,32 @@ export type MaintenanceProgressReceipt = {
   candidateHash: string | null;
 };
 
+/** Split-A contract: emit this only after the described rows are durably committed. */
+export const MAINTENANCE_JOB_PROGRESS_STAGES = [
+  "retention",
+  "wal_checkpoint",
+  "fill_pending_event_links",
+  "enrichment",
+  "git_context",
+] as const;
+
+export type MaintenanceJobProgressStage = typeof MAINTENANCE_JOB_PROGRESS_STAGES[number];
+
+export type MaintenanceJobProgress = {
+  stage: MaintenanceJobProgressStage;
+  rows: number;
+  ms: number;
+  remaining: number;
+};
+
+export type MaintenanceJobProgressReceipt = MaintenanceJobProgress & {
+  schema: typeof MAINTENANCE_PROTOCOL_SCHEMA;
+  type: "maintenance_job_progress";
+  generation: number;
+  nonce: string;
+  sequence: number;
+};
+
 export type MaintenanceClosedReceipt = {
   schema: typeof MAINTENANCE_PROTOCOL_SCHEMA;
   type: "closed";
@@ -87,6 +113,7 @@ export type MaintenanceWorkerReceipt =
   | MaintenanceReadyReceipt
   | MaintenanceResultReceipt
   | MaintenanceProgressReceipt
+  | MaintenanceJobProgressReceipt
   | MaintenanceErrorReceipt
   | MaintenanceClosedReceipt;
 
@@ -407,6 +434,25 @@ export function parseMaintenanceWorkerReceipt(value: unknown): MaintenanceWorker
       nonce: row.nonce as string,
       sequence: Number(row.sequence),
       ...progress,
+    };
+  }
+  if (row.type === "maintenance_job_progress") {
+    if (!exactKeys(row, [
+      "schema", "type", "generation", "nonce", "sequence", "stage", "rows", "ms", "remaining",
+    ]) || !validGeneration(row.sequence) ||
+      typeof row.stage !== "string" ||
+      !(MAINTENANCE_JOB_PROGRESS_STAGES as readonly string[]).includes(row.stage) ||
+      !count(row.rows) || !count(row.ms) || !count(row.remaining)) return null;
+    return {
+      schema: MAINTENANCE_PROTOCOL_SCHEMA,
+      type: "maintenance_job_progress",
+      generation: Number(row.generation),
+      nonce: row.nonce as string,
+      sequence: Number(row.sequence),
+      stage: row.stage as MaintenanceJobProgressStage,
+      rows: Number(row.rows),
+      ms: Number(row.ms),
+      remaining: Number(row.remaining),
     };
   }
   if (row.type === "error") {

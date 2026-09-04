@@ -7,6 +7,7 @@ import {
   parseMaintenanceWorkerRequest,
   projectMaintenanceResult,
   type MaintenanceWorkerReceipt,
+  type MaintenanceJobProgress,
 } from "./maintenance-protocol";
 import { maintenanceCandidateHash, type MaintenanceProgress } from "./maintenance-progress";
 import { recordGitContextBatchProgress } from "./maintenance-starvation";
@@ -400,6 +401,19 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
       }
       return sent;
     };
+    const reportJobProgress = (progress: MaintenanceJobProgress) => {
+      if (progressFrames >= 120) return false;
+      const sent = send({
+        schema: MAINTENANCE_PROTOCOL_SCHEMA,
+        type: "maintenance_job_progress",
+        generation: request.generation,
+        nonce: request.nonce,
+        sequence: ++sequence,
+        ...progress,
+      });
+      if (sent) progressFrames += 1;
+      return sent;
+    };
     const resolveWithProgress = (requests: readonly RepoContextRequest[]) => {
       return resolveMaintenanceRepoContexts(requests, {
         quarantine: request.quarantine,
@@ -425,6 +439,7 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
     void worker.maintenance.runRecent({
       quarantine: request.quarantine ?? undefined,
       onProgress: reportProgress,
+      onDurableCommit: reportJobProgress,
     }).then(
       async (result) => {
         if (closed) return;
@@ -442,6 +457,7 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
             worker.buffer.finishChildRepoContextRun(),
           );
           carriedRepoContexts = [];
+          const gitContextStartedAt = performance.now();
           const childBatch = resolveRepoContextBatch(kept, {
             quarantine: request.quarantine,
             reportProgress,
@@ -468,6 +484,12 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
           recordGitContextBatchProgress(worker.buffer.database, {
             committed: childBatch.results.length,
             deferred: childBatch.deferred.length + overflow.length,
+          });
+          reportJobProgress({
+            stage: "git_context",
+            rows: childBatch.results.length + overflow.length,
+            ms: Math.max(0, Math.round(performance.now() - gitContextStartedAt)),
+            remaining: childBatch.deferred.length,
           });
           repoContexts = resolveWithProgress(request.repoContexts);
         } catch {
