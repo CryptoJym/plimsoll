@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import Database from "better-sqlite3";
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
