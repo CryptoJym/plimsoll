@@ -13,6 +13,7 @@ import { TranscriptTailer, type TranscriptScanResult } from "./transcript-tailer
 import { captureBaselineStatus } from "./capture-baseline";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
 import type { MaintenanceProgress } from "./maintenance-progress";
+import type { MaintenanceJobProgress } from "./maintenance-protocol";
 
 const PRICING_VERSION_KEY = "pricing_catalog_applied";
 const PRICING_TARGET_KEY = "pricing_catalog_backfill_target";
@@ -317,10 +318,15 @@ export type RepoEnrichmentMaintenanceResult = {
 type RepoCandidate = {
   rowid: number;
   id: string;
-  backwardRepoHash: string | null;
-  backwardBranchHash: string | null;
-  forwardRepoHash: string | null;
-  forwardBranchHash: string | null;
+  sessionId: string;
+  observedAt: string;
+};
+
+type RepoNeighbor = {
+  id: string;
+  repoHash: string | null;
+  branchHash: string | null;
+  observedAt: string;
 };
 
 /**
@@ -330,7 +336,13 @@ type RepoCandidate = {
  */
 export function runRepoEnrichmentMaintenance(
   database: Database.Database,
-  options: { legacyBackfillLimit?: number; sessionLimit?: number; eventLimit?: number } = {},
+  options: {
+    legacyBackfillLimit?: number;
+    sessionLimit?: number;
+    eventLimit?: number;
+    neighborLimit?: number;
+    skipLegacyBackfill?: boolean;
+  } = {},
 ): RepoEnrichmentMaintenanceResult {
   const legacyBackfillLimit = Math.max(
     1,
@@ -338,11 +350,12 @@ export function runRepoEnrichmentMaintenance(
   );
   const sessionLimit = Math.max(1, Math.min(options.sessionLimit ?? 50, 500));
   const eventLimit = Math.max(1, Math.min(options.eventLimit ?? 5_000, 25_000));
+  const neighborLimit = Math.max(1, Math.min(options.neighborLimit ?? 50, 250));
 
   return database.transaction(() => {
     let backfillComplete = maintenanceState(database, REPO_BACKFILL_COMPLETE_KEY) === "1";
     let legacyRowsVisited = 0;
-    if (!backfillComplete) {
+    if (!backfillComplete && !options.skipLegacyBackfill) {
       const cursor = maintenanceState(database, REPO_BACKFILL_CURSOR_KEY) ?? "";
       const legacyRows = database
         .prepare(
@@ -395,37 +408,7 @@ export function runRepoEnrichmentMaintenance(
       )
       .all(sessionLimit) as Array<{ sessionId: string; cursorRowid: number }>;
     const selectCandidates = database.prepare(
-      `select e.rowid, e.id,
-         (select r.repo_hash from buffered_events r
-          where r.session_id = e.session_id and r.repo_hash is not null
-            and not exists (
-              select 1 from repo_context_event_links l where l.event_id = r.id
-            )
-            and r.observed_at <= e.observed_at
-          order by r.observed_at desc, r.rowid desc limit 1) as backwardRepoHash,
-         (select r.branch_hash from buffered_events r
-          where r.session_id = e.session_id and r.repo_hash is not null
-            and not exists (
-              select 1 from repo_context_event_links l where l.event_id = r.id
-            )
-            and r.observed_at <= e.observed_at
-          order by r.observed_at desc, r.rowid desc limit 1) as backwardBranchHash,
-         (select r.repo_hash from buffered_events r
-          where r.session_id = e.session_id and r.repo_hash is not null
-            and not exists (
-              select 1 from repo_context_event_links l where l.event_id = r.id
-            )
-            and r.observed_at > e.observed_at
-            and (strftime('%s', r.observed_at) - strftime('%s', e.observed_at)) <= 600
-          order by r.observed_at, r.rowid limit 1) as forwardRepoHash,
-         (select r.branch_hash from buffered_events r
-          where r.session_id = e.session_id and r.repo_hash is not null
-            and not exists (
-              select 1 from repo_context_event_links l where l.event_id = r.id
-            )
-            and r.observed_at > e.observed_at
-            and (strftime('%s', r.observed_at) - strftime('%s', e.observed_at)) <= 600
-          order by r.observed_at, r.rowid limit 1) as forwardBranchHash
+      `select e.rowid, e.id, e.session_id as sessionId, e.observed_at as observedAt
        from buffered_events e
        where e.session_id = @sessionId and e.rowid > @cursorRowid
          and e.repo_hash is null and not exists (
@@ -434,6 +417,20 @@ export function runRepoEnrichmentMaintenance(
          and (e.input_tokens is not null or e.output_tokens is not null or e.cost_usd is not null)
        order by e.rowid
        limit @limit`,
+    );
+    const selectBackwardNeighbors = database.prepare(
+      `select id, repo_hash as repoHash, branch_hash as branchHash,
+         observed_at as observedAt
+       from buffered_events indexed by idx_events_session
+       where session_id = @sessionId and observed_at <= @observedAt
+       order by observed_at desc, rowid desc limit @limit`,
+    );
+    const selectForwardNeighbors = database.prepare(
+      `select id, repo_hash as repoHash, branch_hash as branchHash,
+         observed_at as observedAt
+       from buffered_events indexed by idx_events_session
+       where session_id = @sessionId and observed_at > @observedAt
+       order by observed_at, rowid limit @limit`,
     );
     const apply = database.prepare(
       `update buffered_events set
@@ -468,12 +465,37 @@ export function runRepoEnrichmentMaintenance(
       remainingEvents -= candidates.length;
 
       for (const row of candidates) {
-        const repoHash = row.backwardRepoHash ?? row.forwardRepoHash;
+        const backwardNeighbors = selectBackwardNeighbors.all({
+          sessionId: row.sessionId,
+          observedAt: row.observedAt,
+          limit: neighborLimit,
+        }) as RepoNeighbor[];
+        const forwardNeighbors = selectForwardNeighbors.all({
+          sessionId: row.sessionId,
+          observedAt: row.observedAt,
+          limit: neighborLimit,
+        }) as RepoNeighbor[];
+        const neighborIds = [...backwardNeighbors, ...forwardNeighbors].map((neighbor) => neighbor.id);
+        const linked = neighborIds.length === 0
+          ? new Set<string>()
+          : new Set((database.prepare(
+              `select event_id as eventId from repo_context_event_links
+               where event_id in (${neighborIds.map(() => "?").join(",")})`,
+            ).all(...neighborIds) as Array<{ eventId: string }>).map((link) => link.eventId));
+        const backwardNeighbor = backwardNeighbors.find(
+          (neighbor) => neighbor.repoHash !== null && !linked.has(neighbor.id),
+        );
+        const candidateTime = Date.parse(row.observedAt);
+        const forwardNeighbor = forwardNeighbors.find((neighbor) => (
+          neighbor.repoHash !== null && !linked.has(neighbor.id) &&
+          Number.isFinite(candidateTime) &&
+          Date.parse(neighbor.observedAt) - candidateTime <= 600_000
+        ));
+        const selected = backwardNeighbor ?? forwardNeighbor;
+        const repoHash = selected?.repoHash ?? null;
         if (!repoHash) continue;
-        const direction = row.backwardRepoHash ? "backward" : "forward";
-        const branchHash = row.backwardRepoHash
-          ? row.backwardBranchHash
-          : row.forwardBranchHash;
+        const direction = backwardNeighbor ? "backward" : "forward";
+        const branchHash = selected?.branchHash ?? null;
         const changed = apply.run({ id: row.id, repoHash, branchHash }).changes;
         if (direction === "backward") backward += changed;
         else forward += changed;
@@ -558,6 +580,19 @@ export type MaintenanceRunOutcome = {
   rawEventWrites: number;
   stageTimings?: MaintenanceStageTimings;
 };
+
+export type MaintenancePartialOutcome = {
+  outcome: "PARTIAL_OK";
+  progress: MaintenanceJobProgress;
+};
+
+export type MaintenanceAttemptOutcome = MaintenanceRunOutcome | MaintenancePartialOutcome;
+
+export function isMaintenancePartialOutcome(
+  value: MaintenanceAttemptOutcome,
+): value is MaintenancePartialOutcome {
+  return "outcome" in value && value.outcome === "PARTIAL_OK";
+}
 
 export type ProjectionDrainResult = {
   slices: number;
@@ -655,6 +690,8 @@ export class CollectorMaintenance {
   async runRecent(options: {
     quarantine?: Pick<MaintenanceProgress, "source" | "stage" | "candidateHash">;
     onProgress?: (progress: MaintenanceProgress) => boolean;
+    /** Split A calls this synchronously after each bounded transaction commits. */
+    onDurableCommit?: (progress: MaintenanceJobProgress) => boolean;
     clock?: () => number;
   } = {}): Promise<CollectorMaintenanceRunResult> {
     // Monotonic stage timing source. Injectable so fixture proofs can assert
@@ -807,18 +844,11 @@ export class CollectorMaintenance {
       candidateRowsVisited: 0, rowsVisited: 0, backward: 0, forward: 0,
     };
     let enrichmentMs = 0;
-    if (!this.signal?.aborted && budget.canStart(12)) {
-      const stageStartedAtMs = clock();
-      try {
-        enrichment = runRepoEnrichmentMaintenance(this.buffer.database, {
-          legacyBackfillLimit: 32,
-          sessionLimit: 4,
-          eventLimit: 32,
-        });
-      } finally {
-        enrichmentMs = Math.max(0, Math.round(clock() - stageStartedAtMs));
-      }
-    } else postCaptureDeferred.push("enrichment");
+    // Enrichment is intentionally not part of the automatic capture job. On
+    // a production-size ledger its synchronous candidate query measured about
+    // 29 seconds per row, so even one call can consume the entire boundary.
+    // The low-priority one-row enrichment job owns this queue instead.
+    postCaptureDeferred.push("enrichment");
     if (rollout.activity && !this.signal?.aborted && budget.canStart(3)) {
       this.buffer.projection.recordCaptureActivity({ source: "codex", ...rollout.activity });
     } else postCaptureDeferred.push("codex_activity");
@@ -883,7 +913,7 @@ export class CollectorMaintenance {
 }
 
 export type MaintenanceSchedulerStatus<
-  T extends MaintenanceRunOutcome = CollectorMaintenanceRunResult,
+  T extends MaintenanceAttemptOutcome = CollectorMaintenanceRunResult,
 > = {
   accepting: boolean;
   inFlight: boolean;
@@ -905,7 +935,7 @@ export type MaintenanceSchedulerStatus<
   lastRun: T | null;
 };
 
-type DrainWaiter<T extends MaintenanceRunOutcome> = {
+type DrainWaiter<T extends MaintenanceAttemptOutcome> = {
   resolve: (results: T[]) => void;
   reject: (error: unknown) => void;
 };
@@ -917,7 +947,7 @@ type DrainWaiter<T extends MaintenanceRunOutcome> = {
  * commands may request full history.
  */
 export class CoalescingMaintenanceScheduler<
-  T extends MaintenanceRunOutcome = CollectorMaintenanceRunResult,
+  T extends MaintenanceAttemptOutcome = CollectorMaintenanceRunResult,
 > {
   private accepting = true;
   private running = false;
@@ -1009,12 +1039,17 @@ export class CoalescingMaintenanceScheduler<
       try {
         const result = await this.runJob();
         this.lastRun = result;
-        this.rolloutFilesRead += result.rollout.filesRead;
-        this.transcriptFilesRead += result.transcript.filesRead;
-        this.rawEventWrites += result.rawEventWrites;
-        this.repriceRowsVisited += result.repricing.rowsVisited;
-        this.reconciliationRowsVisited += result.reconciliation.rowsVisited;
-        this.enrichmentRowsVisited += result.enrichment.rowsVisited;
+        if (isMaintenancePartialOutcome(result)) {
+          results.push(result);
+          continue;
+        }
+        const completed = result as MaintenanceRunOutcome;
+        this.rolloutFilesRead += completed.rollout.filesRead;
+        this.transcriptFilesRead += completed.transcript.filesRead;
+        this.rawEventWrites += completed.rawEventWrites;
+        this.repriceRowsVisited += completed.repricing.rowsVisited;
+        this.reconciliationRowsVisited += completed.reconciliation.rowsVisited;
+        this.enrichmentRowsVisited += completed.enrichment.rowsVisited;
         results.push(result);
       } catch (error) {
         this.failedRuns += 1;
@@ -1042,7 +1077,7 @@ export class CoalescingMaintenanceScheduler<
  * The only automatic boot/interval entrypoint. Its signature cannot express a
  * full-history request, so daemon scheduling stays recent-only by construction.
  */
-export function requestAutomaticRecentMaintenance<T extends MaintenanceRunOutcome>(
+export function requestAutomaticRecentMaintenance<T extends MaintenanceAttemptOutcome>(
   scheduler: CoalescingMaintenanceScheduler<T>,
 ) {
   return scheduler.trigger();
@@ -1078,7 +1113,7 @@ export type AutomaticMaintenanceCadenceTimer = {
  * not accumulate during a slow filesystem slice.
  */
 export class AutomaticMaintenanceCadence<
-  T extends MaintenanceRunOutcome = CollectorMaintenanceRunResult,
+  T extends MaintenanceAttemptOutcome = CollectorMaintenanceRunResult,
 > {
   private accepting = true;
   private inFlight = false;
@@ -1196,8 +1231,10 @@ export class AutomaticMaintenanceCadence<
       const results = await requestAutomaticRecentMaintenance(this.scheduler);
       discoveryAdvanced = results.some(
         (result) =>
-          result.rollout.activity.discoveryEntries > 0 ||
-          result.transcript.activity.discoveryEntries > 0,
+          !isMaintenancePartialOutcome(result) && (
+            result.rollout.activity.discoveryEntries > 0 ||
+            result.transcript.activity.discoveryEntries > 0
+          ),
       );
     } catch (error) {
       failed = true;

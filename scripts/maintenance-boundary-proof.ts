@@ -37,13 +37,18 @@ import {
   maintenanceProtocolFrameBytes,
   parseMaintenanceWorkerRequest,
   type MaintenanceRunRequest,
+  type MaintenanceJobProgressReceipt,
 } from "../packages/collector-cli/src/maintenance-protocol";
 import {
   REPO_CONTEXT_RESOLVER_VERSION,
   type RepoContextRequest,
   type RepoContextResult,
 } from "../packages/collector-cli/src/repo-context";
-import type { MaintenanceRunOutcome } from "../packages/collector-cli/src/maintenance";
+import {
+  CoalescingMaintenanceScheduler,
+  isMaintenancePartialOutcome,
+  type MaintenanceRunOutcome,
+} from "../packages/collector-cli/src/maintenance";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 
 type Check = { name: string; passed: true; detail: Record<string, unknown> };
@@ -323,7 +328,7 @@ async function fifoAvailabilityProof() {
       PLIMSOLL_HOME: root,
     },
     deadlineMs: 1_500,
-    readyDeadlineMs: 1_000,
+    readyDeadlineMs: 5_000, // 2026-09-05: fork+fingerprint takes >1 s on a loaded host; the proof is about reaping a FIFO-blocked child, not ready latency
     termGraceMs: 100,
     killGraceMs: 800,
   });
@@ -784,6 +789,121 @@ async function disconnectErrorAndPidReuseProof() {
   });
 }
 
+async function orphanRecoveryProof() {
+  const receipts: Array<Record<string, unknown>> = [];
+  const recovered = fakeBoundary((spawnNonce, spawnIndex) => {
+    const child = new FakeChild(20_450 + spawnIndex);
+    child.closeOn = spawnIndex === 0 ? null : "SIGTERM";
+    child.onSend = (raw) => {
+      const request = raw as MaintenanceRunRequest;
+      if (request.type !== "run") return;
+      if (spawnIndex === 0) return;
+      queueMicrotask(() => child.emit("message", resultReceipt(request, outcome(7))));
+    };
+    ready(child, spawnNonce);
+    return child;
+  }, {
+    deadlineMs: 5,
+    termGraceMs: 5,
+    killGraceMs: 5,
+    initialCircuitMs: 1,
+    orphanRetryBackoffMs: 1,
+    onOrphanRecovery: (receipt) => receipts.push(receipt),
+  });
+  const first = recovered.boundary.run();
+  void first.catch(() => undefined);
+  await rejectsWith(first, "maintenance_deadline_exceeded");
+  assert.equal(recovered.boundary.status().reap.orphanRisk, true);
+  recovered.children[0]!.closeOn = "SIGKILL";
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  const next = await recovered.boundary.run();
+  assert.equal(next.rawEventWrites, 7);
+  assert.equal(recovered.spawnCount(), 2);
+  assert.equal(recovered.boundary.status().reap.orphanRisk, false);
+  assert.ok(recovered.boundary.status().reap.orphanRecoveryAttempts >= 1);
+  assert.equal(await recovered.boundary.shutdown(), true);
+
+  const unkillable = fakeBoundary((spawnNonce) => {
+    const child = new FakeChild(20_460);
+    child.closeOn = null;
+    ready(child, spawnNonce);
+    return child;
+  }, {
+    deadlineMs: 5,
+    termGraceMs: 5,
+    killGraceMs: 5,
+    initialCircuitMs: 1,
+    orphanRecoveryAttempts: 2,
+    orphanRetryBackoffMs: 1,
+    onOrphanRecovery: (receipt) => receipts.push(receipt),
+  });
+  const timedOut = unkillable.boundary.run();
+  void timedOut.catch(() => undefined);
+  await rejectsWith(timedOut, "maintenance_deadline_exceeded");
+  await new Promise((resolve) => setTimeout(resolve, 2));
+  await rejectsWith(unkillable.boundary.run(), "maintenance_child_not_reaped");
+  const stuck = unkillable.boundary.status();
+  assert.equal(unkillable.spawnCount(), 1, "an unreaped child must fence a second worker");
+  assert.equal(stuck.reap.orphanRisk, true);
+  assert.equal(stuck.reap.orphanRecoveryFailures, 1);
+  const loud = receipts.find((receipt) => receipt.outcome === "still_alive");
+  assert.ok(loud);
+  assert.equal(loud.pid, 20_460);
+  assert.ok(Number(loud.ageMs) >= 0);
+  assert.deepEqual(loud.signalsSent, [
+    "SIGTERM", "SIGKILL", "SIGTERM", "SIGKILL", "SIGTERM", "SIGKILL",
+  ]);
+
+  pass("orphan_escalation_recovers_or_reports_without_double_worker", {
+    recoveredSpawns: recovered.spawnCount(),
+    recoveryAttempts: recovered.boundary.status().reap.orphanRecoveryAttempts,
+    stuckSpawns: unkillable.spawnCount(),
+    stuckFailures: stuck.reap.orphanRecoveryFailures,
+    receipt: loud,
+  });
+}
+
+async function busyWorkerGoneAfterKillProof() {
+  let fingerprintCalls = 0;
+  const harness = fakeBoundary((spawnNonce) => {
+    const child = new FakeChild(20_470);
+    child.closeOn = null;
+    child.onSend = (raw) => {
+      const request = raw as MaintenanceRunRequest;
+      if (request.type !== "run") return;
+      // A busy native SQLite call emits no close event before the grace expires.
+    };
+    ready(child, spawnNonce);
+    return child;
+  }, {
+    deadlineMs: 5,
+    termGraceMs: 5,
+    killGraceMs: 5,
+    fingerprint: async () => {
+      fingerprintCalls += 1;
+      // Parent bind, TERM check, KILL check, then confirmed gone.
+      return fingerprintCalls < 4 ? "busy-worker" : null;
+    },
+  });
+
+  const run = harness.boundary.run();
+  void run.catch(() => undefined);
+  await rejectsWith(run, "maintenance_deadline_exceeded");
+  const status = harness.boundary.status();
+  assert.deepEqual(harness.children[0]!.signals, ["SIGTERM", "SIGKILL"]);
+  assert.equal(status.childPresent, false);
+  assert.equal(status.reap.orphanRisk, false);
+  assert.equal(status.reap.reapedChildren, 1);
+  assert.equal(await harness.boundary.shutdown(), true);
+
+  pass("busy_worker_confirmed_gone_after_kill_clears_fence", {
+    signals: harness.children[0]!.signals,
+    fingerprintCalls,
+    childPresent: status.childPresent,
+    orphanRisk: status.reap.orphanRisk,
+  });
+}
+
 async function controlFrameFloodProof() {
   let releaseReadyFingerprint!: (value: string | null) => void;
   let readyFingerprintReleased = false;
@@ -1091,6 +1211,66 @@ async function malformedOversizedFrameProof() {
   });
 }
 
+async function diagnosticFailureReceiptProof() {
+  const privatePath = `/Users/private/${PRIVATE_PATH_SENTINEL}/ledger.sqlite`;
+  const harness = fakeBoundary((spawnNonce) => {
+    const child = new FakeChild(20_510);
+    child.onSend = (raw) => {
+      const request = raw as MaintenanceRunRequest;
+      if (request.type !== "run") return;
+      queueMicrotask(() => {
+        child.emit("message", {
+          schema: MAINTENANCE_PROTOCOL_SCHEMA,
+          type: "maintenance_job_progress",
+          generation: request.generation,
+          nonce: request.nonce,
+          sequence: 1,
+          stage: "wal_checkpoint",
+          rows: 0,
+          ms: 12,
+          remaining: 500,
+        });
+        child.emit("message", {
+          schema: MAINTENANCE_PROTOCOL_SCHEMA,
+          type: "error",
+          generation: request.generation,
+          nonce: request.nonce,
+          sequence: 2,
+          reason: "maintenance_failed",
+          errorClass: "SQLITE_BUSY",
+          message: "database is locked at [path]",
+          stage: "deadline_stages",
+          elapsedMs: 37,
+          progressAcknowledged: true,
+        });
+      });
+    };
+    ready(child, spawnNonce);
+    return child;
+  });
+
+  const failed = harness.boundary.run();
+  await assert.rejects(failed, (error: unknown) => {
+    const row = error as Error & Record<string, unknown>;
+    assert.equal(row.message, "database is locked at [path]");
+    assert.equal(row.errorClass, "SQLITE_BUSY");
+    assert.equal(row.stage, "deadline_stages");
+    assert.equal(row.elapsedMs, 37);
+    assert.equal(row.progressAcknowledged, true);
+    assert.equal(JSON.stringify(row).includes(privatePath), false);
+    return true;
+  });
+  assert.equal(await harness.boundary.shutdown(), true);
+  pass("maintenance_failure_receipt_keeps_bounded_path_free_diagnostics", {
+    errorClass: "SQLITE_BUSY",
+    message: "database is locked at [path]",
+    stage: "deadline_stages",
+    elapsedMs: 37,
+    progressAcknowledged: true,
+    pathFree: true,
+  });
+}
+
 async function realWorkerCrashProof() {
   const fixturePath = path.resolve("scripts/fixtures/maintenance-boundary-crash-child.mjs");
   const boundary = new MaintenanceProcessBoundary({
@@ -1122,6 +1302,75 @@ async function realWorkerCrashProof() {
     reapedChildren: status.reap.reapedChildren,
     orphanRisk: status.reap.orphanRisk,
     childPresent: status.childPresent,
+  });
+}
+
+async function partialOkArbitrationProof() {
+  const deadlineReceipts: unknown[] = [];
+  const harness = fakeBoundary((spawnNonce) => {
+    const child = new FakeChild(22_500);
+    child.onSend = (raw) => {
+      const request = raw as MaintenanceRunRequest;
+      if (request.type !== "run") return;
+      queueMicrotask(() => child.emit("message", {
+        schema: MAINTENANCE_PROTOCOL_SCHEMA,
+        type: "maintenance_job_progress",
+        generation: request.generation,
+        nonce: request.nonce,
+        sequence: 1,
+        stage: "fill_pending_event_links",
+        rows: 250,
+        ms: 19,
+        remaining: 900,
+      } satisfies MaintenanceJobProgressReceipt));
+    };
+    ready(child, spawnNonce);
+    return child;
+  }, {
+    deadlineMs: 20,
+    teardownMarginMs: 5,
+    onDeadline: (receipt) => deadlineReceipts.push(receipt),
+  });
+
+  const result = await harness.boundary.run({ acceptPartial: true });
+  assert.equal(isMaintenancePartialOutcome(result), true);
+  if (!isMaintenancePartialOutcome(result)) throw new Error("expected_partial_ok");
+  assert.equal(result.outcome, "PARTIAL_OK");
+  assert.deepEqual(result.progress, {
+    stage: "fill_pending_event_links",
+    rows: 250,
+    ms: 19,
+    remaining: 900,
+  });
+  const status = harness.boundary.status();
+  assert.equal(status.lastOutcome, "PARTIAL_OK");
+  assert.equal(status.circuit.failureCount, 0);
+  assert.equal(status.circuit.openUntil, null);
+  assert.equal(deadlineReceipts.length, 1);
+  assert.equal((deadlineReceipts[0] as { outcome?: string }).outcome, "PARTIAL_OK");
+  const scheduler = new CoalescingMaintenanceScheduler(async () => result);
+  const scheduled = await scheduler.trigger();
+  assert.equal(scheduled.length, 1);
+  assert.equal(scheduler.status().failedRuns, 0);
+  assert.equal(scheduler.status().runCount, 1);
+  assert.equal(await harness.boundary.shutdown(), true);
+
+  const zeroProgress = fakeBoundary((spawnNonce) => {
+    const child = new FakeChild(22_501);
+    ready(child, spawnNonce);
+    return child;
+  }, { deadlineMs: 10, teardownMarginMs: 2 });
+  await rejectsWith(zeroProgress.boundary.run(), "maintenance_deadline_exceeded");
+  assert.equal(zeroProgress.boundary.status().lastOutcome, "timed_out");
+  assert.equal(zeroProgress.boundary.status().circuit.failureCount, 1);
+  assert.notEqual(zeroProgress.boundary.status().circuit.openUntil, null);
+  await zeroProgress.boundary.shutdown();
+
+  pass("deadline_after_acknowledged_progress_is_partial_ok", {
+    outcome: result.outcome,
+    circuitFailures: status.circuit.failureCount,
+    zeroProgressCircuitFailures: zeroProgress.boundary.status().circuit.failureCount,
+    schedulerFailedRuns: scheduler.status().failedRuns,
   });
 }
 
@@ -1290,7 +1539,9 @@ async function runHiddenWorker(entryPath: string, execArgv: string[], label: str
       PLIMSOLL_HOME: home,
     },
     deadlineMs: 3_000,
-    readyDeadlineMs: 3_000,
+    // Match the production readiness contract. This window now covers only
+    // process/module startup; ledger initialization starts inside the job.
+    readyDeadlineMs: 10_000,
     termGraceMs: 250,
     killGraceMs: 750,
   });
@@ -1524,18 +1775,54 @@ async function pathFreeReceiptProof() {
 
 async function main() {
   assert.equal(process.versions.node.split(".")[0], "22", "proof requires Node 22");
+  if (process.env.PLIMSOLL_MAINTENANCE_PROOF_FOCUS === "orphan_recovery") {
+    await orphanRecoveryProof();
+    console.log(JSON.stringify({ proof: "maintenance_boundary_orphan_recovery", checks }));
+    return;
+  }
+  if (process.env.PLIMSOLL_MAINTENANCE_PROOF_FOCUS === "busy_worker_kill") {
+    await busyWorkerGoneAfterKillProof();
+    console.log(JSON.stringify({ proof: "maintenance_boundary_busy_worker_kill", checks }));
+    return;
+  }
+  if (process.env.PLIMSOLL_MAINTENANCE_PROOF_FOCUS === "job_deadline") {
+    await progressStageTimeoutProof();
+    console.log(JSON.stringify({ proof: "maintenance_boundary_job_deadline", checks }));
+    return;
+  }
+  if (process.env.PLIMSOLL_MAINTENANCE_PROOF_FOCUS === "real_worker") {
+    await realWorkerCrashProof();
+    await sourceAndDistWorkerProof();
+    console.log(JSON.stringify({ proof: "maintenance_boundary_real_worker", checks }));
+    return;
+  }
+  if (process.env.PLIMSOLL_MAINTENANCE_PROOF_FOCUS === "partial_ok") {
+    await partialOkArbitrationProof();
+    await realWorkerCrashProof();
+    console.log(JSON.stringify({ proof: "maintenance_boundary_partial_ok", checks }));
+    return;
+  }
+  if (process.env.PLIMSOLL_MAINTENANCE_PROOF_FOCUS === "failure_diagnostics") {
+    await diagnosticFailureReceiptProof();
+    console.log(JSON.stringify({ proof: "maintenance_boundary_failure_diagnostics", checks }));
+    return;
+  }
   await fifoAvailabilityProof();
   await blockedShutdownProof();
   await circuitAndRecoveryProof();
   await spawnFailureAndConcurrentStartupProof();
   await shutdownDuringLazyStartupProof();
   await disconnectErrorAndPidReuseProof();
+  await orphanRecoveryProof();
+  await busyWorkerGoneAfterKillProof();
   await controlFrameFloodProof();
   await terminalShutdownMonotonicityProof();
   await progressStageTimeoutProof();
   staticParentFilesystemIsolationProof();
   await malformedOversizedFrameProof();
+  await diagnosticFailureReceiptProof();
   await realWorkerCrashProof();
+  await partialOkArbitrationProof();
   await staleFenceAndImmediateSecondJobProof();
   await deterministicRaceProof();
   await sourceAndDistWorkerProof();

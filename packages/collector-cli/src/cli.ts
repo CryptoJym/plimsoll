@@ -1,6 +1,7 @@
 #!/usr/bin/env node
+import Database from "better-sqlite3";
 import { spawnSync } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -99,7 +100,8 @@ import {
   CoalescingMaintenanceScheduler,
   CollectorMaintenance,
   automaticCaptureRuntimeStatus,
-  type MaintenanceRunOutcome,
+  isMaintenancePartialOutcome,
+  type MaintenanceAttemptOutcome,
 } from "./maintenance";
 import { codexReconciliationStatus } from "./codex-reconciliation";
 import {
@@ -108,13 +110,22 @@ import {
 } from "./history-coverage";
 import { captureBaselineStatus } from "./capture-baseline";
 import { createCollectorServer } from "./server";
-import { MaintenanceProcessBoundary } from "./maintenance-boundary";
+import { MaintenanceFailureError, MaintenanceProcessBoundary } from "./maintenance-boundary";
+import { checkpointWalInBoundedChild, runStartupWalSelfHeal } from "./startup-wal-self-heal";
 import {
   maintenanceStarvationReceipt,
   recordMaintenanceDeadlineBlame,
   recordMaintenanceDeadlineKill,
 } from "./maintenance-starvation";
 import { runMaintenanceWorkerService } from "./maintenance-worker";
+import {
+  AutomaticEnrichmentCadence,
+  EnrichmentProcessBoundary,
+  IdleEnrichmentScheduler,
+  lowerEnrichmentProcessPriority,
+  runEnrichmentWorkerService,
+} from "./enrichment-job";
+import { runEnrichmentMaintenanceJob } from "./maintenance-stage-primitives";
 import { readLocalIdentities } from "./local-identity";
 import {
   loadOrCreateDeviceIdentity,
@@ -1301,21 +1312,96 @@ async function main() {
       process.exitCode = 64;
       return;
     }
-    const workerConfig = loadCollectorConfig();
-    assertCollectorPrivacyMode(workerConfig, "automatic maintenance worker");
-    const workerBuffer = openBuffer(workerConfig, false, 900);
-    const workerMaintenance = new CollectorMaintenance(
-      workerBuffer,
-      new RolloutTailer(workerBuffer),
-      new TranscriptTailer(workerBuffer),
-    );
     runMaintenanceWorkerService({
-      maintenance: workerMaintenance,
-      buffer: workerBuffer,
       spawnNonce,
+      onStage: ({ stage, ms }) => {
+        console.error(JSON.stringify({ warning: "maintenance_worker_stage", stage, ms }));
+      },
+      initialize: () => {
+        let startedAt = performance.now();
+        const workerConfig = loadCollectorConfig();
+        console.error(JSON.stringify({
+          warning: "maintenance_worker_stage", stage: "config_loaded",
+          ms: Math.max(0, Math.round(performance.now() - startedAt)),
+        }));
+        startedAt = performance.now();
+        assertCollectorPrivacyMode(workerConfig, "automatic maintenance worker");
+        console.error(JSON.stringify({
+          warning: "maintenance_worker_stage", stage: "privacy_checked",
+          ms: Math.max(0, Math.round(performance.now() - startedAt)),
+        }));
+        startedAt = performance.now();
+        const workerBuffer = openBuffer(workerConfig, false, 900);
+        console.error(JSON.stringify({
+          warning: "maintenance_worker_stage", stage: "ledger_opened",
+          ms: Math.max(0, Math.round(performance.now() - startedAt)),
+        }));
+        startedAt = performance.now();
+        const workerMaintenance = new CollectorMaintenance(
+          workerBuffer,
+          new RolloutTailer(workerBuffer),
+          new TranscriptTailer(workerBuffer),
+        );
+        console.error(JSON.stringify({
+          warning: "maintenance_worker_stage", stage: "maintenance_constructed",
+          ms: Math.max(0, Math.round(performance.now() - startedAt)),
+        }));
+        return {
+          maintenance: workerMaintenance,
+          buffer: workerBuffer,
+          retentionDays: workerConfig.retentionDays,
+        };
+      },
     });
     return;
   }
+
+  if (command === "__enrichment_worker") {
+    const spawnNonce = process.argv[3] ?? "";
+    if (
+      !/^[a-f0-9-]{16,80}$/i.test(spawnNonce) ||
+      spawnNonce !== process.env.PLIMSOLL_ENRICHMENT_SPAWN_NONCE ||
+      !process.send
+    ) {
+      process.exitCode = 64;
+      return;
+    }
+    let workerBuffer: ReturnType<typeof openBuffer> | null = null;
+    lowerEnrichmentProcessPriority();
+    runEnrichmentWorkerService({
+      spawnNonce,
+      execute: (deadlineMs) => {
+        const workerConfig = loadCollectorConfig();
+        assertCollectorPrivacyMode(workerConfig, "automatic enrichment worker");
+        workerBuffer = openBuffer(workerConfig, false, 900);
+        const result = runEnrichmentMaintenanceJob(workerBuffer.database, { remainingMs: deadlineMs });
+        return { rows: result.rows, ms: result.ms };
+      },
+      close: () => {
+        workerBuffer?.close();
+        workerBuffer = null;
+      },
+    });
+    return;
+  }
+
+  if (command === "__startup_wal_checkpoint") {
+    const nonce = process.argv[3] ?? "";
+    const timeoutMs = Number(process.argv[4]);
+    if (!/^[a-f0-9-]{16,80}$/i.test(nonce) || nonce !== process.env.PLIMSOLL_STARTUP_WAL_NONCE ||
+      !Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) {
+      process.exitCode = 64;
+      return;
+    }
+    const database = new Database(collectorBufferPath(), { timeout: Math.max(1, timeoutMs - 250) });
+    try {
+      database.pragma(`busy_timeout = ${Math.max(1, timeoutMs - 250)}`);
+      const rows = database.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number; log: number; checkpointed: number }>;
+      process.stdout.write(JSON.stringify(rows[0] ?? { busy: 1, log: 0, checkpointed: 0 }));
+    } finally { database.close(); }
+    return;
+  }
+
 
   if (command === "join") {
     // Join runs before ordinary config loading because loadCollectorConfig()
@@ -1535,6 +1621,16 @@ async function main() {
       return;
     }
 
+    const startupWalNonce = randomUUID();
+    const startupWalReceipt = await runStartupWalSelfHeal({
+      ledgerPath: collectorBufferPath(),
+      thresholdBytes: config.startupWalCheckpointBytes,
+      runCheckpoint: (timeoutMs) => checkpointWalInBoundedChild({
+        entryPath: process.argv[1]!, execArgv: process.execArgv, nonce: startupWalNonce, timeoutMs,
+      }),
+    });
+    console.log(JSON.stringify(startupWalReceipt));
+
     // This connection owns the HTTP event loop. Never inherit better-sqlite3's
     // five-second busy wait when the maintenance child briefly owns a writer.
     const buffer = openBuffer(config, false, 0);
@@ -1553,8 +1649,10 @@ async function main() {
     // Runtime ownership is already proven above. Recover ID-only handoff and
     // inflight receipts once, before intake or the child can create live work.
     buffer.recoverRepoContextState();
-    let scheduler: CoalescingMaintenanceScheduler<MaintenanceRunOutcome> | undefined;
-    let maintenanceCadence: AutomaticMaintenanceCadence<MaintenanceRunOutcome> | undefined;
+    let scheduler: CoalescingMaintenanceScheduler<MaintenanceAttemptOutcome> | undefined;
+    let maintenanceCadence: AutomaticMaintenanceCadence<MaintenanceAttemptOutcome> | undefined;
+    let enrichmentScheduler: IdleEnrichmentScheduler | undefined;
+    let enrichmentCadence: AutomaticEnrichmentCadence | undefined;
     let cachedBaseline = captureBaselineStatus(buffer.database);
     const maintenanceBoundary = new MaintenanceProcessBoundary({
       entryPath: process.argv[1]!,
@@ -1566,11 +1664,19 @@ async function main() {
       // writer holds stay bounded by its own slice budget (maxActiveMs <= 5s in
       // maintenance.ts), so these deadlines govern startup + coordination only.
       deadlineMs: 30_000,
-      readyDeadlineMs: 10_000,
+      teardownMarginMs: 1_000,
+      readyDeadlineMs: 45_000, // 2026-09-04: guards process start only (ready is sent before the ledger opens); 10 s flaked under heavy disk I/O from the lane sweeps
       // Issue #181: a deadline kill must never vanish silently. Record the
       // kill rate and the last-seen stage durably, and surface the receipt
       // so enrichment starvation cannot recur invisibly.
       onDeadline: (info) => {
+        if (info.outcome === "PARTIAL_OK" && info.jobProgress) {
+          console.log(JSON.stringify({
+            status: "maintenance_partial_ok",
+            ...info.jobProgress,
+          }));
+          return;
+        }
         try {
           recordMaintenanceDeadlineKill(buffer.database);
           recordMaintenanceDeadlineBlame(buffer.database, {
@@ -1591,6 +1697,21 @@ async function main() {
           // Starvation bookkeeping must never mask the boundary failure.
         }
       },
+      onOrphanRecovery: (info) => {
+        console.warn(JSON.stringify({
+          warning: "maintenance_orphan_recovery",
+          ...info,
+        }));
+      },
+    });
+    const enrichmentBoundary = new EnrichmentProcessBoundary({
+      entryPath: process.argv[1]!,
+      execArgv: process.execArgv,
+      env: process.env,
+      deadlineMs: 15_000,
+      readyDeadlineMs: 10_000,
+      termGraceMs: 250,
+      killGraceMs: 750,
     });
     let detectedIdentities: Array<Record<string, unknown>> = [];
     try {
@@ -1764,11 +1885,15 @@ async function main() {
     // Later automatic cadences tail only new generations within hard work
     // limits; full history remains an explicit operator command.
     scheduler = new CoalescingMaintenanceScheduler(async () => {
+      // If the low-priority child won the idle check immediately before this
+      // main trigger, let that single bounded row finish or be reaped first.
+      await enrichmentScheduler?.waitForIdle();
       const drainedRepoContexts = buffer.takeRepoContextBatch();
       const repoContexts = buffer.beginRepoContextResolution(drainedRepoContexts);
-      let result: MaintenanceRunOutcome;
+      let result: MaintenanceAttemptOutcome;
       try {
         result = await maintenanceBoundary.run({
+          acceptPartial: true,
           repoContexts,
           onRepoContexts: (resolved) => {
             buffer.applyRepoContextResults(resolved);
@@ -1799,6 +1924,16 @@ async function main() {
           // the final recovery boundary without exposing any raw cwd.
         }
         throw error;
+      }
+      if (isMaintenancePartialOutcome(result)) {
+        try {
+          buffer.failRepoContextRun(repoContexts, "boundary_unavailable");
+        } catch {
+          // The acknowledged stage commit is still successful; startup recovery
+          // owns any unresolved parent handoff left by the disposable child.
+        }
+        refreshStatusSnapshot();
+        return result;
       }
       try {
         cachedBaseline = captureBaselineStatus(buffer.database);
@@ -1835,18 +1970,56 @@ async function main() {
           console.warn(
             JSON.stringify({
               warning: "maintenance_failed",
-              message: error instanceof Error ? error.message : String(error),
+              ...(error instanceof MaintenanceFailureError
+                ? {
+                    errorClass: error.errorClass,
+                    message: error.message,
+                    stage: error.stage,
+                    elapsedMs: error.elapsedMs,
+                    progressAcknowledged: error.progressAcknowledged,
+                  }
+                : {
+                    errorClass: error instanceof Error ? error.name : "UnknownError",
+                    message: error instanceof Error ? error.message : String(error),
+                    stage: "boundary",
+                    elapsedMs: null,
+                    progressAcknowledged: false,
+                  }),
             }),
           );
         },
       },
     );
+    enrichmentScheduler = new IdleEnrichmentScheduler(
+      () => !scheduler!.status().inFlight,
+      async () => {
+        const result = await enrichmentBoundary.run({ acceptPartial: true });
+        if (result.outcome === "PARTIAL_OK") {
+          console.log(JSON.stringify({ status: "enrichment_partial_ok", rows: result.rows, ms: result.ms }));
+        } else if (result.rows > 0) {
+          console.log(JSON.stringify({ status: "repo_stitch", rows: result.rows, ms: result.ms }));
+        }
+        return result;
+      },
+    );
+    enrichmentCadence = new AutomaticEnrichmentCadence(enrichmentScheduler, {
+      intervalMs: 5 * 60_000,
+      onError: (error) => {
+        if (shuttingDown && error instanceof Error &&
+            error.message === "enrichment_boundary_stopping") return;
+        console.warn(JSON.stringify({
+          warning: "enrichment_failed",
+          message: error instanceof Error ? error.message : String(error),
+        }));
+      },
+    });
 
     runPrune();
     // Boot capture is deferred so the OTLP receiver binds first, but it uses
     // the exact same bounded recent-tail entrypoint as the interval. Historical
     // files are available only through the explicit scan commands below.
     maintenanceCadence.start();
+    enrichmentCadence.start();
     timers.push(setInterval(runPrune, 6 * 60 * 60 * 1000));
     if (config.uploadUrl) {
       timers.push(setInterval(() => void runSync(), config.syncIntervalSeconds * 1000));
@@ -1855,22 +2028,31 @@ async function main() {
 
     const stopMaintenanceBeforeFatalExit = async () => {
       maintenanceCadence?.stop();
+      enrichmentCadence?.stop();
       for (const timer of timers) clearInterval(timer);
       scheduler?.stopAccepting();
+      enrichmentScheduler?.stopAccepting();
       ownership.release();
-      const [idle, child] = await Promise.allSettled([
+      const [idle, child, enrichmentIdle, enrichmentChild] = await Promise.allSettled([
         scheduler?.waitForIdle() ?? Promise.resolve(),
         maintenanceBoundary.shutdown(),
+        enrichmentScheduler?.waitForIdle() ?? Promise.resolve(),
+        enrichmentBoundary.shutdown(),
       ]);
       const maintenanceIdle = idle.status === "fulfilled";
       const maintenanceChildReaped = child.status === "fulfilled" && child.value;
+      const enrichmentStopped = enrichmentIdle.status === "fulfilled" &&
+        enrichmentChild.status === "fulfilled" && enrichmentChild.value;
       // The maintenance child may own the SQLite writer. Never close the
       // parent's connection while either the scheduler or child can still use it.
-      if (maintenanceIdle && maintenanceChildReaped) {
+      if (maintenanceIdle && maintenanceChildReaped && enrichmentStopped) {
         buffer.close();
         closeOutcomeTimelineStore();
       }
-      return { maintenanceIdle, maintenanceChildReaped };
+      return {
+        maintenanceIdle: maintenanceIdle && enrichmentIdle.status === "fulfilled",
+        maintenanceChildReaped: maintenanceChildReaped && enrichmentStopped,
+      };
     };
 
     const flushRejectionSummaries = () => {
@@ -1890,8 +2072,10 @@ async function main() {
       shuttingDown = true;
       flushRejectionSummaries();
       maintenanceCadence?.stop();
+      enrichmentCadence?.stop();
       for (const timer of timers) clearInterval(timer);
       scheduler?.stopAccepting();
+      enrichmentScheduler?.stopAccepting();
       ownership.release();
       const hardDeadlineMs = 2_500;
       const forceAfterMs = 750;
@@ -1899,6 +2083,7 @@ async function main() {
       let serverClosed = false;
       let maintenanceIdle = false;
       let maintenanceChildReaped = false;
+      let enrichmentChildReaped = false;
       const serverClose = new Promise<void>((resolve) => {
         server.close(() => {
           serverClosed = true;
@@ -1916,13 +2101,16 @@ async function main() {
       const childShutdown = maintenanceBoundary.shutdown().then((stopped) => {
         maintenanceChildReaped = stopped;
       });
+      const enrichmentShutdown = enrichmentBoundary.shutdown().then((stopped) => {
+        enrichmentChildReaped = stopped;
+      });
       const deadline = new Promise<void>((resolve) => {
         setTimeout(resolve, hardDeadlineMs);
       });
       void (async () => {
         try {
           await Promise.race([
-            Promise.allSettled([serverClose, idle, childShutdown]).then(() => undefined),
+            Promise.allSettled([serverClose, idle, childShutdown, enrichmentShutdown]).then(() => undefined),
             deadline,
           ]);
           if (!serverClosed) {
@@ -1941,7 +2129,7 @@ async function main() {
           }
           // Never close SQLite until the child is reaped and the parent
           // scheduler no longer has a boundary call in flight.
-          if (maintenanceIdle && maintenanceChildReaped) {
+          if (maintenanceIdle && maintenanceChildReaped && enrichmentChildReaped) {
             buffer.close();
             closeOutcomeTimelineStore();
           }
@@ -1965,7 +2153,7 @@ async function main() {
             remaining.kind === "missing" &&
             !persistentCleanup.ambiguous &&
             !cleanupAttempt?.ambiguous;
-          const shutdownReady = pidCleaned && serverClosed && maintenanceChildReaped;
+          const shutdownReady = pidCleaned && serverClosed && maintenanceChildReaped && enrichmentChildReaped;
           console.log(
             JSON.stringify({
               // The process is still executing this receipt. Only the stop or
@@ -1979,6 +2167,7 @@ async function main() {
               cleanupAttempt: pidCleanupAttemptReceipt(cleanupAttempt),
               maintenanceIdle,
               maintenanceChildReaped,
+              enrichmentChildReaped,
               listenerClosed: serverClosed,
               listenerState: serverClosed ? "closed" : "close_incomplete",
               processState: "exiting",

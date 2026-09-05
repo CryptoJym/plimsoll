@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
-const schema = 3;
+const schema = 4; // 2026-09-05: protocol bumped to 4 (progress frames); the fixture spoke 3 and every receipt was rejected as maintenance_protocol_invalid
 const spawnNonce = process.env.PLIMSOLL_MAINTENANCE_SPAWN_NONCE ?? "";
 const root = process.env.PLIMSOLL_HOME ?? process.env.TMPDIR ?? "/tmp";
 const fifoPath = path.join(root, "maintenance-boundary-block.fifo");

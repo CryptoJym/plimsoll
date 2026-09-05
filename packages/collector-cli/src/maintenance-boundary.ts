@@ -1,7 +1,11 @@
 import { fork, execFile, type ChildProcess } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 
-import type { MaintenanceRunOutcome, MaintenanceStageTimings } from "./maintenance";
+import type {
+  MaintenancePartialOutcome,
+  MaintenanceRunOutcome,
+  MaintenanceStageTimings,
+} from "./maintenance";
 import type { MaintenanceProgress } from "./maintenance-progress";
 import {
   MAINTENANCE_PROTOCOL_MAX_BYTES,
@@ -11,7 +15,28 @@ import {
   maintenanceProtocolFrameBytes,
   parseMaintenanceWorkerReceipt,
   type MaintenanceWorkerReceipt,
+  type MaintenanceJobProgress,
+  type MaintenanceErrorReceipt,
 } from "./maintenance-protocol";
+
+export type MaintenancePartialOk = MaintenancePartialOutcome;
+
+export class MaintenanceFailureError extends Error {
+  readonly reason = "maintenance_failed";
+  readonly errorClass: string;
+  readonly stage: string;
+  readonly elapsedMs: number;
+  readonly progressAcknowledged: boolean;
+
+  constructor(receipt: Extract<MaintenanceErrorReceipt, { reason: "maintenance_failed" }>) {
+    super(receipt.message);
+    this.name = "MaintenanceFailureError";
+    this.errorClass = receipt.errorClass;
+    this.stage = receipt.stage;
+    this.elapsedMs = receipt.elapsedMs;
+    this.progressAcknowledged = receipt.progressAcknowledged;
+  }
+}
 import {
   validRepoContextRequest,
   type RepoContextRequest,
@@ -48,7 +73,7 @@ export type MaintenanceBoundaryStatus = {
     stageTimings: MaintenanceStageTimings | null;
   } | null;
   lastFailure: string | null;
-  lastOutcome: "completed" | "timed_out" | "failed" | null;
+  lastOutcome: "completed" | "PARTIAL_OK" | "timed_out" | "failed" | null;
   lastTimedOutAt: string | null;
   circuit: {
     failureCount: number;
@@ -86,6 +111,8 @@ export type MaintenanceBoundaryStatus = {
     pidMismatches: number;
     reapedChildren: number;
     orphanRisk: boolean;
+    orphanRecoveryAttempts: number;
+    orphanRecoveryFailures: number;
   };
 };
 
@@ -107,6 +134,8 @@ export type MaintenanceBoundaryOptions = {
   env?: NodeJS.ProcessEnv;
   deadlineMs?: number;
   readyDeadlineMs?: number;
+  /** Time held back from the hard deadline for the final ACK and child reap. */
+  teardownMarginMs?: number;
   termGraceMs?: number;
   killGraceMs?: number;
   initialCircuitMs?: number;
@@ -123,13 +152,24 @@ export type MaintenanceBoundaryOptions = {
   // before its blame is "proven". Below it, being on stage at kill time is
   // not evidence that THIS candidate was slow (issue #181 misattribution).
   blameThresholdMs?: number;
-  // Fired on every deadline kill so the shell can durably record partial
-  // progress and the kill rate instead of discarding the batch silently.
+  // Fired at the work cutoff. The shell records either an acknowledged
+  // partial completion receipt or a true zero-progress deadline kill.
   onDeadline?: (info: {
+    outcome: "PARTIAL_OK" | "timed_out";
+    jobProgress: MaintenanceJobProgress | null;
     progress: MaintenanceProgress | null;
     heldMs: number | null;
     attribution: "proven" | "unknown";
     reason: string;
+  }) => void;
+  orphanRecoveryAttempts?: number;
+  orphanRetryBackoffMs?: number;
+  onOrphanRecovery?: (info: {
+    pid: number | null;
+    ageMs: number;
+    attempt: number;
+    signalsSent: NodeJS.Signals[];
+    outcome: "reaped" | "gone" | "still_alive";
   }) => void;
 };
 
@@ -138,18 +178,20 @@ type ActiveJob = {
   nonce: string;
   startedAtMs: number;
   timer: TimerHandle;
-  resolve: (result: MaintenanceRunOutcome) => void;
+  resolve: (result: MaintenanceRunOutcome | MaintenancePartialOk) => void;
   reject: (error: Error) => void;
   settled: boolean;
   nextSequence: number;
   expectedRepoContextIds: string[];
   onRepoContexts?: (results: RepoContextResult[]) => void;
+  acknowledgedJobProgress: MaintenanceJobProgress | null;
 };
 
 export type MaintenanceBoundaryRunOptions = {
   repoContexts?: RepoContextRequest[];
   onRepoContextsAccepted?: () => void;
   onRepoContexts?: (results: RepoContextResult[]) => void;
+  acceptPartial?: boolean;
 };
 
 function iso(ms: number | null) {
@@ -256,7 +298,7 @@ export class MaintenanceProcessBoundary {
   private lastDurationMs: number | null = null;
   private lastResult: MaintenanceBoundaryStatus["lastResult"] = null;
   private lastFailure: string | null = null;
-  private lastOutcome: "completed" | "timed_out" | "failed" | null = null;
+  private lastOutcome: "completed" | "PARTIAL_OK" | "timed_out" | "failed" | null = null;
   private lastTimedOutAt: string | null = null;
   private activeProgress: MaintenanceProgress | null = null;
   private activeProgressAtMs: number | null = null;
@@ -279,6 +321,11 @@ export class MaintenanceProcessBoundary {
   private pidMismatches = 0;
   private reapedChildren = 0;
   private orphanRisk = false;
+  private orphanSinceMs: number | null = null;
+  private orphanSignalsSent: NodeJS.Signals[] = [];
+  private orphanRecoveryAttempts = 0;
+  private orphanRecoveryFailures = 0;
+  private recoveringOrphan: Promise<boolean> | null = null;
   private terminating: Promise<boolean> | null = null;
   private idleFailure: Promise<void> | null = null;
   private closeWaiters: Array<() => void> = [];
@@ -331,14 +378,22 @@ export class MaintenanceProcessBoundary {
         pidMismatches: this.pidMismatches,
         reapedChildren: this.reapedChildren,
         orphanRisk: this.orphanRisk,
+        orphanRecoveryAttempts: this.orphanRecoveryAttempts,
+        orphanRecoveryFailures: this.orphanRecoveryFailures,
       },
     };
   }
 
-  async run(options: MaintenanceBoundaryRunOptions = {}): Promise<MaintenanceRunOutcome> {
+  async run(options: MaintenanceBoundaryRunOptions & { acceptPartial: true }): Promise<MaintenanceRunOutcome | MaintenancePartialOk>;
+  async run(options?: MaintenanceBoundaryRunOptions): Promise<MaintenanceRunOutcome>;
+  async run(options: MaintenanceBoundaryRunOptions = {}): Promise<MaintenanceRunOutcome | MaintenancePartialOk> {
     if (!this.accepting) throw new Error("maintenance_boundary_stopping");
     if (this.runReserved || this.active) throw new Error("maintenance_job_already_in_flight");
-    if (this.terminating || this.orphanRisk) throw new Error("maintenance_child_not_reaped");
+    if (this.orphanRisk && !(await this.recoverOrphan())) {
+      throw new Error("maintenance_child_not_reaped");
+    }
+    if (this.runReserved || this.active) throw new Error("maintenance_job_already_in_flight");
+    if (this.terminating) throw new Error("maintenance_child_not_reaped");
     const now = this.now();
     if (this.circuitOpenUntilMs !== null && now < this.circuitOpenUntilMs) {
       this.state = "circuit_open";
@@ -368,7 +423,7 @@ export class MaintenanceProcessBoundary {
     }
     const repoContexts = suppliedRepoContexts.map((request) => ({ ...request }));
     this.runReserved = true;
-    let job!: Promise<MaintenanceRunOutcome>;
+    let job!: Promise<MaintenanceRunOutcome | MaintenancePartialOk>;
     try {
       await this.ensureWorker();
       if (!this.accepting) throw new Error("maintenance_boundary_stopping");
@@ -392,10 +447,10 @@ export class MaintenanceProcessBoundary {
       this.activeProgress = null;
       this.activeProgressAtMs = null;
       this.activeProgressKey = null;
-      job = new Promise<MaintenanceRunOutcome>((resolve, reject) => {
+      job = new Promise<MaintenanceRunOutcome | MaintenancePartialOk>((resolve, reject) => {
         const timer = this.setTimer(() => {
           void this.failActive("maintenance_deadline_exceeded", true);
-        }, this.deadlineMs());
+        }, this.workDeadlineMs());
         this.active = {
           generation,
           nonce,
@@ -407,6 +462,7 @@ export class MaintenanceProcessBoundary {
           nextSequence: 1,
           expectedRepoContextIds: [...contextIds].sort(),
           onRepoContexts: options.onRepoContexts,
+          acknowledgedJobProgress: null,
         };
         try {
           const request = {
@@ -414,7 +470,7 @@ export class MaintenanceProcessBoundary {
             type: "run",
             generation,
             nonce,
-            deadlineMs: this.deadlineMs(),
+            deadlineMs: this.workDeadlineMs(),
             quarantine: this.quarantine,
             repoContexts,
           } as const;
@@ -584,18 +640,28 @@ export class MaintenanceProcessBoundary {
       return;
     }
     active.nextSequence += 1;
-    if (receipt.type === "progress") {
-      this.activeProgress = {
-        source: receipt.source,
-        stage: receipt.stage,
-        candidateHash: receipt.candidateHash,
-      };
-      // Time-on-stage starts at the FIRST frame for a given
-      // source/stage/candidate key; repeats of the same key extend the hold.
-      const progressKey = `${receipt.source}:${receipt.stage}:${receipt.candidateHash ?? "none"}`;
-      if (progressKey !== this.activeProgressKey) {
-        this.activeProgressKey = progressKey;
-        this.activeProgressAtMs = this.now();
+    if (receipt.type === "progress" || receipt.type === "maintenance_job_progress") {
+      const jobProgress = receipt.type === "maintenance_job_progress"
+        ? {
+            stage: receipt.stage,
+            rows: receipt.rows,
+            ms: receipt.ms,
+            remaining: receipt.remaining,
+          }
+        : null;
+      if (receipt.type === "progress") {
+        this.activeProgress = {
+          source: receipt.source,
+          stage: receipt.stage,
+          candidateHash: receipt.candidateHash,
+        };
+        // Time-on-stage starts at the FIRST frame for a given
+        // source/stage/candidate key; repeats of the same key extend the hold.
+        const progressKey = `${receipt.source}:${receipt.stage}:${receipt.candidateHash ?? "none"}`;
+        if (progressKey !== this.activeProgressKey) {
+          this.activeProgressKey = progressKey;
+          this.activeProgressAtMs = this.now();
+        }
       }
       try {
         this.child?.send({
@@ -604,6 +670,10 @@ export class MaintenanceProcessBoundary {
           generation: receipt.generation,
           nonce: receipt.nonce,
           sequence: receipt.sequence,
+        }, (error: Error | null) => {
+          if (!error && jobProgress && this.active === active && !active.settled) {
+            active.acknowledgedJobProgress = jobProgress;
+          }
         });
       } catch {
         void this.failActive("maintenance_protocol_ack_failed", false);
@@ -611,7 +681,7 @@ export class MaintenanceProcessBoundary {
       return;
     }
     if (receipt.type === "error") {
-      void this.failActive(receipt.reason, false);
+      void this.failActive(receipt.reason, false, receipt.reason === "maintenance_failed" ? receipt : undefined);
       return;
     }
     const receivedContextIds = receipt.repoContexts.map((result) => result.contextId).sort();
@@ -684,6 +754,8 @@ export class MaintenanceProcessBoundary {
     this.controlFrameLimitExceeded = false;
     this.reapedChildren += 1;
     this.orphanRisk = false;
+    this.orphanSinceMs = null;
+    this.orphanSignalsSent = [];
     const waiters = this.closeWaiters;
     this.closeWaiters = [];
     for (const resolve of waiters) resolve();
@@ -779,13 +851,18 @@ export class MaintenanceProcessBoundary {
     return this.idleFailure;
   }
 
-  private async failActive(reason: string, timedOut: boolean) {
+  private async failActive(
+    reason: string,
+    timedOut: boolean,
+    diagnostic?: Extract<MaintenanceErrorReceipt, { reason: "maintenance_failed" }>,
+  ) {
     const active = this.active;
     if (!active || active.settled) return;
     active.settled = true;
     this.clearTimer(active.timer);
     this.active = null;
     const timedOutProgress = this.activeProgress;
+    const acknowledgedJobProgress = active.acknowledgedJobProgress;
     const heldStartMs = this.activeProgressAtMs;
     this.activeProgress = null;
     this.activeProgressAtMs = null;
@@ -802,7 +879,8 @@ export class MaintenanceProcessBoundary {
     // UNKNOWN and never applied.
     const proven = timedOut && timedOutProgress !== null &&
       heldMs !== null && heldMs >= this.blameThresholdMs();
-    if (timedOut) {
+    const partialOk = timedOut && acknowledgedJobProgress !== null;
+    if (timedOut && !partialOk) {
       this.lastBlame = timedOutProgress
         ? {
             source: timedOutProgress.source,
@@ -822,29 +900,40 @@ export class MaintenanceProcessBoundary {
             attribution: "unknown",
           };
       if (!proven) this.unknownBlames += 1;
-      // Every deadline kill is reported, candidate or not, or the kill rate
-      // would silently undercount exactly the worst hangs (issue #181).
+      if (proven && timedOutProgress) {
+        this.quarantine = timedOutProgress;
+        this.quarantineUntilMs = this.now() + this.escalatedCircuitMs();
+      }
+    }
+    if (timedOut) {
       try {
         this.options.onDeadline?.({
+          outcome: partialOk ? "PARTIAL_OK" : "timed_out",
+          jobProgress: acknowledgedJobProgress,
           progress: timedOutProgress,
           heldMs,
           attribution: proven ? "proven" : "unknown",
           reason,
         });
       } catch {
-        // Starvation bookkeeping must never mask the boundary failure itself.
-      }
-      if (proven && timedOutProgress) {
-        this.quarantine = timedOutProgress;
-        this.quarantineUntilMs = this.now() + this.escalatedCircuitMs();
+        // Deadline bookkeeping must never mask the boundary outcome itself.
       }
     }
-    this.recordOutcome(timedOut ? "timed_out" : "failed", this.lastCompletedAtMs);
+    this.recordOutcome(partialOk ? "PARTIAL_OK" : timedOut ? "timed_out" : "failed", this.lastCompletedAtMs);
     this.state = timedOut ? "timed_out" : "recovering";
     this.stage = "terminating";
     await this.terminateChild(reason);
+    if (partialOk) {
+      this.failureCount = 0;
+      this.circuitOpenUntilMs = null;
+      this.lastFailure = null;
+      this.state = "ready";
+      this.stage = "idle";
+      active.resolve({ outcome: "PARTIAL_OK", progress: acknowledgedJobProgress });
+      return;
+    }
     this.openCircuit(reason);
-    active.reject(new Error(reason));
+    active.reject(diagnostic ? new MaintenanceFailureError(diagnostic) : new Error(reason));
   }
 
   private blameThresholdMs() {
@@ -873,6 +962,7 @@ export class MaintenanceProcessBoundary {
     if (!child) return true;
     this.stage = "terminating";
     this.terminating = (async () => {
+      this.orphanSignalsSent = [];
       const pid = child.pid;
       const spawnNonce = this.spawnNonce;
       // Await the parent observation even when the worker never became ready;
@@ -889,6 +979,7 @@ export class MaintenanceProcessBoundary {
           if (signaled) {
             if (signal === "SIGTERM") this.termSignals += 1;
             if (signal === "SIGKILL") this.killSignals += 1;
+            this.orphanSignalsSent.push(signal);
           }
           return signaled;
         } catch {
@@ -899,12 +990,119 @@ export class MaintenanceProcessBoundary {
       if (await this.waitForClose(this.termGraceMs())) return true;
       await signalIfSame("SIGKILL");
       if (await this.waitForClose(this.killGraceMs())) return true;
+      const afterKill = pid && spawnNonce ? await this.fingerprint(pid, spawnNonce) : null;
+      if (expected && (!afterKill || afterKill !== expected) && this.child === child) {
+        this.pidMismatches += 1;
+        this.detachGoneChild(child);
+        return true;
+      }
       this.orphanRisk = this.child === child;
+      if (this.orphanRisk && this.orphanSinceMs === null) this.orphanSinceMs = this.now();
       return !this.orphanRisk;
     })().finally(() => {
       this.terminating = null;
     });
     return this.terminating;
+  }
+
+  private recoverOrphan() {
+    if (!this.orphanRisk) return Promise.resolve(true);
+    if (this.recoveringOrphan) return this.recoveringOrphan;
+    this.recoveringOrphan = (async () => {
+      const child = this.child;
+      const pid = child?.pid ?? null;
+      const spawnNonce = this.spawnNonce;
+      const expected = this.childFingerprint ?? await this.parentFingerprintPromise;
+      const signalsSent: NodeJS.Signals[] = [...this.orphanSignalsSent];
+      const attempts = Math.max(1, Math.min(this.options.orphanRecoveryAttempts ?? 2, 5));
+      const emit = (attempt: number, outcome: "reaped" | "gone" | "still_alive") => {
+        try {
+          this.options.onOrphanRecovery?.({
+            pid,
+            ageMs: Math.max(0, this.now() - (this.orphanSinceMs ?? this.now())),
+            attempt,
+            signalsSent: [...signalsSent],
+            outcome,
+          });
+        } catch {
+          // Recovery diagnostics must never weaken the process fence.
+        }
+      };
+      for (let attempt = 1; attempt <= attempts; attempt += 1) {
+        this.orphanRecoveryAttempts += 1;
+        if (!child || this.child !== child) {
+          this.orphanRisk = false;
+          this.orphanSinceMs = null;
+          emit(attempt, "reaped");
+          return true;
+        }
+        const observed = pid && spawnNonce ? await this.fingerprint(pid, spawnNonce) : null;
+        if (!expected) {
+          if (attempt < attempts) await this.orphanBackoff(attempt);
+          continue;
+        }
+        if (!observed || observed !== expected) {
+          this.pidMismatches += 1;
+          this.detachGoneChild(child);
+          emit(attempt, "gone");
+          return true;
+        }
+        for (const signal of ["SIGTERM", "SIGKILL"] as const) {
+          const current = pid && spawnNonce ? await this.fingerprint(pid, spawnNonce) : null;
+          if (!current || current !== expected || this.child !== child) {
+            this.detachGoneChild(child);
+            emit(attempt, "gone");
+            return true;
+          }
+          try {
+            if (child.kill(signal)) {
+              signalsSent.push(signal);
+              if (signal === "SIGTERM") this.termSignals += 1;
+              else this.killSignals += 1;
+            }
+          } catch {
+            // The bounded identity check below decides whether retry is safe.
+          }
+          const grace = signal === "SIGTERM" ? this.termGraceMs() : this.killGraceMs();
+          if (await this.waitForClose(grace)) {
+            emit(attempt, "reaped");
+            return true;
+          }
+        }
+        if (attempt < attempts) await this.orphanBackoff(attempt);
+      }
+      this.orphanRecoveryFailures += 1;
+      emit(attempts, "still_alive");
+      return false;
+    })().finally(() => {
+      this.recoveringOrphan = null;
+    });
+    return this.recoveringOrphan;
+  }
+
+  private detachGoneChild(child: MaintenanceBoundaryChild) {
+    if (this.child !== child) return;
+    child.removeListener("message", this.onMessage);
+    child.removeListener("error", this.onChildError);
+    child.removeListener("disconnect", this.onChildDisconnect);
+    child.removeListener("close", this.onChildClose);
+    this.child = null;
+    this.childReady = false;
+    this.childFingerprint = null;
+    this.parentFingerprintPromise = null;
+    this.spawnNonce = null;
+    this.orphanRisk = false;
+    this.orphanSinceMs = null;
+    this.orphanSignalsSent = [];
+    this.reapedChildren += 1;
+  }
+
+  private orphanBackoff(attempt: number) {
+    const base = Math.max(1, Math.min(this.options.orphanRetryBackoffMs ?? 100, 5_000));
+    const delayMs = Math.min(base * 2 ** (attempt - 1), 5_000);
+    return new Promise<void>((resolve) => {
+      this.setTimer(resolve, delayMs);
+    });
   }
 
 
@@ -932,7 +1130,7 @@ export class MaintenanceProcessBoundary {
     return fork(this.options.entryPath, ["__maintenance_worker", spawnNonce], {
       execArgv: this.options.execArgv ?? process.execArgv,
       env: maintenanceWorkerEnvironment(this.options.env ?? process.env, spawnNonce),
-      stdio: ["ignore", "ignore", "ignore", "ipc"],
+      stdio: ["ignore", "ignore", "inherit", "ipc"],
     });
   }
 
@@ -943,6 +1141,10 @@ export class MaintenanceProcessBoundary {
   }
 
   private deadlineMs() { return Math.max(1, Math.min(this.options.deadlineMs ?? 1_000, 60_000)); }
+  private teardownMarginMs() {
+    return Math.max(0, Math.min(this.options.teardownMarginMs ?? 0, this.deadlineMs() - 1));
+  }
+  private workDeadlineMs() { return Math.max(1, this.deadlineMs() - this.teardownMarginMs()); }
   private readyDeadlineMs() { return Math.max(1, Math.min(this.options.readyDeadlineMs ?? 1_000, 60_000)); }
   private termGraceMs() { return Math.max(1, Math.min(this.options.termGraceMs ?? 250, 5_000)); }
   private killGraceMs() { return Math.max(1, Math.min(this.options.killGraceMs ?? 750, 5_000)); }
@@ -958,7 +1160,7 @@ export class MaintenanceProcessBoundary {
     });
   }
 
-  private recordOutcome(state: "completed" | "timed_out" | "failed", atMs: number) {
+  private recordOutcome(state: "completed" | "PARTIAL_OK" | "timed_out" | "failed", atMs: number) {
     const at = new Date(atMs).toISOString();
     this.lastOutcome = state;
     if (state === "timed_out") this.lastTimedOutAt = at;
