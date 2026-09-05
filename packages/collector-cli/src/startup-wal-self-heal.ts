@@ -40,7 +40,8 @@ export async function runStartupWalSelfHeal(options: {
   try {
     const timed = new Promise<never>((_, reject) => {
       timer = setTimeout(() => reject(new Error("startup_wal_checkpoint_timed_out")), timeoutMs);
-      timer.unref();
+      // 2026-09-05: do not unref — with nothing else keeping the loop alive (CLI, proofs) an
+      // unref'd timer lets Node exit before the timeout fires and the race never settles.
     });
     const counts = await Promise.race([options.runCheckpoint(timeoutMs), timed]);
     return { ...base, attempted: true, outcome: counts.busy === 0 ? "completed" : "busy",
