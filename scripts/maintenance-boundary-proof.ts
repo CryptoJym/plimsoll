@@ -327,7 +327,7 @@ async function fifoAvailabilityProof() {
       TMPDIR: root,
       PLIMSOLL_HOME: root,
     },
-    deadlineMs: 6_000, // 2026-09-05: was 1.5 s; on a loaded host the child's ready+fingerprint alone can exceed that, so the run was killed before the fixture ever got its run message
+    deadlineMs: 1_500,
     readyDeadlineMs: 5_000, // 2026-09-05: fork+fingerprint takes >1 s on a loaded host; the proof is about reaping a FIFO-blocked child, not ready latency
     termGraceMs: 100,
     killGraceMs: 800,
