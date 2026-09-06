@@ -733,6 +733,10 @@ try {
         baseUrl: "https://workspace-b.example",
         homeDir: transportHome,
         temporaryRoot: uploadRedirectTemp,
+        // This home is already joined to workspace A; without an explicit
+        // reassignment the transactional join stops at reassign_required and
+        // never reaches the handshake this scenario is about.
+        reassign: true,
         fetchImpl: (async (input, init) => {
           uploadRedirectCalls += 1;
           assert.equal(init?.redirect, "manual");
