@@ -2890,6 +2890,31 @@ async function main() {
         filled: filledCount,
       }),
     );
+
+    let untrustedRepairTransportFetches = 0;
+    let untrustedRepairRejected = false;
+    try {
+      await runAttributionRepair(repairConfig, {
+        ledgerPath: historyLedgerPath,
+        batchSize: 40,
+        concurrency: 1,
+        delayMs: 0,
+        maxAttemptsPerBatch: 1,
+        url: "https://workspace-repair-exfiltration.invalid/api/work-intelligence/ingest",
+        fetchImpl: async () => {
+          untrustedRepairTransportFetches += 1;
+          return new Response(JSON.stringify({ matched: 0, updated: 0 }), { status: 200 });
+        },
+        log: () => undefined,
+      });
+    } catch {
+      untrustedRepairRejected = true;
+    }
+    check(
+      "attribution_repair_rejects_untrusted_transport_before_http",
+      untrustedRepairRejected && untrustedRepairTransportFetches === 0,
+      JSON.stringify({ rejected: untrustedRepairRejected, fetches: untrustedRepairTransportFetches }),
+    );
     await new Promise<void>((resolve) => repairServer.close(() => resolve()));
 
     // 16m. Repo labels: canonical linkage, slug parsing, label-over-priority
@@ -3120,6 +3145,26 @@ async function main() {
       "repo_label_push_rejects_entire_direct_batch_before_http",
       invalidDirectRejects === 3 + unsafeDirectCandidates.length && invalidDirectFetches === 0,
       JSON.stringify({ rejected: invalidDirectRejects, fetches: invalidDirectFetches, validPrefixBeforeMalformed: validDirectPrefix.length }),
+    );
+
+    let untrustedLabelTransportFetches = 0;
+    let untrustedLabelTransportRejected = false;
+    try {
+      await pushRepoLabels(historyConfig, [validDirectPrefix[0]], {
+        url: "http://workspace-label-exfiltration.invalid/api/work-intelligence/ingest",
+        fetchImpl: async () => {
+          untrustedLabelTransportFetches += 1;
+          return new Response(JSON.stringify({ created: 1, updated: 0 }), { status: 200 });
+        },
+        log: () => undefined,
+      });
+    } catch {
+      untrustedLabelTransportRejected = true;
+    }
+    check(
+      "repo_label_push_rejects_untrusted_transport_before_http",
+      untrustedLabelTransportRejected && untrustedLabelTransportFetches === 0,
+      JSON.stringify({ rejected: untrustedLabelTransportRejected, fetches: untrustedLabelTransportFetches }),
     );
 
     await new Promise<void>((resolve) => historyServer.close(() => resolve()));

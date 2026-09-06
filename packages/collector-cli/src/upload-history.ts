@@ -11,6 +11,7 @@ import {
 } from "./config";
 import { deterministicEventId } from "./normalizer";
 import { canonicalLinkage, hasUnsafeOutboundString, sealOutboundEnvelope } from "./outbound-envelope";
+import { assertNoRedirect, validatedTransportUrl } from "./http-transport";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import {
   aiWorkAttributionRepairBatchSchema,
@@ -550,6 +551,7 @@ export async function postHistoryBatch(input: {
   updated: number | null;
   attempts: number;
 }> {
+  const url = validatedTransportUrl(input.url, "Workspace upload URL");
   let lastError = "";
   for (let attempt = 1; attempt <= input.maxAttempts; attempt += 1) {
     const headers: Record<string, string> = {
@@ -569,10 +571,17 @@ export async function postHistoryBatch(input: {
 
     let response: Response | null = null;
     try {
-      response = await input.fetchImpl(input.url, { method: "POST", headers, body: input.body });
+      response = await input.fetchImpl(url.toString(), {
+        method: "POST",
+        headers,
+        body: input.body,
+        redirect: "manual",
+      });
     } catch (error) {
       lastError = `network: ${error instanceof Error ? error.message : String(error)}`;
     }
+
+    if (response) assertNoRedirect(response, "Workspace upload", url.origin);
 
     if (response?.ok) {
       const body = (await response.json().catch(() => ({}))) as {
@@ -660,6 +669,7 @@ export async function runWorkspaceHistoryUpload(
         'Run: plimsoll join "<join-url>#<token>" — then retry upload-history.',
     );
   }
+  const transportUrl = validatedWorkspaceUploadUrl(config, options.url);
 
   const ledgerPath = options.ledgerPath ?? collectorBufferPath();
   let ledger: Database.Database;
@@ -679,7 +689,7 @@ export async function runWorkspaceHistoryUpload(
   const pageSize = Math.max(batchSize, Math.min(options.pageSize ?? 4_000, 20_000));
   const maxAttempts = Math.max(1, Math.min(options.maxAttemptsPerBatch ?? 5, 10));
   const appVersion = options.appVersion ?? "0.1.0";
-  const target = backfillTargetFingerprint(url, config.tenantId);
+  const target = backfillTargetFingerprint(transportUrl, config.tenantId);
   const statePath = options.statePath ?? defaultBackfillStatePath();
 
   let state: WorkspaceBackfillState | null = options.full ? null : readBackfillState(statePath);
@@ -843,7 +853,7 @@ export async function runWorkspaceHistoryUpload(
     const task = (async () => {
       try {
         const result = await postHistoryBatch({
-          url,
+          url: transportUrl,
           body: batch.body,
           installKey: config.installKey,
           ingestKey: config.ingestKey,
@@ -1080,6 +1090,21 @@ export type AttributionRepairResult = {
   dryRun: boolean;
 };
 
+function validatedWorkspaceUploadUrl(config: CollectorConfig, override?: string) {
+  const raw = override ?? config.uploadUrl;
+  if (!raw) {
+    throw new Error("No upload URL configured. Pass --url or set uploadUrl in collector.config.json.");
+  }
+  const url = validatedTransportUrl(raw, "Workspace upload URL");
+  if (override && config.uploadUrl) {
+    const configured = validatedTransportUrl(config.uploadUrl, "Configured workspace URL");
+    if (configured.origin !== url.origin) {
+      throw new Error("Workspace upload URL must use the same origin as the configured workspace audience.");
+    }
+  }
+  return url.href;
+}
+
 /**
  * Fill projectKey on ALREADY-UPLOADED workspace rows. The bulk ingest lane is
  * first-writer-wins (createMany skipDuplicates), so re-sending events can
@@ -1129,6 +1154,7 @@ export async function runAttributionRepair(
         'Run: plimsoll join "<join-url>#<token>" — then retry upload-history --repair-attribution.',
     );
   }
+  const transportUrl = validatedWorkspaceUploadUrl(config, options.url);
 
   const ledgerPath = options.ledgerPath ?? collectorBufferPath();
   let ledger: Database.Database;
@@ -1206,7 +1232,7 @@ export async function runAttributionRepair(
     const task = (async () => {
       try {
         const result = await postHistoryBatch({
-          url,
+          url: transportUrl,
           body,
           installKey: config.installKey,
           ingestKey: config.ingestKey,
