@@ -804,6 +804,13 @@ export async function performJoin(options: {
     }
 
     const grant = joinGrantSchema.parse(body);
+    // Validate the granted transport before any tenant semantics are consulted:
+    // a grant that points uploads at another origin is refused outright, even
+    // when it would otherwise only have asked for a reassignment.
+    const uploadUrl = validatedTransportUrl(grant.uploadUrl, "Granted upload URL");
+    if (uploadUrl.origin !== joinUrl.origin) {
+      throw new Error("Granted upload URL must use the same origin as the workspace join URL.");
+    }
     if (
       isManagedOrUploadEnabled(existingConfig) &&
       existingConfig.tenantId !== grant.tenantId &&
@@ -816,10 +823,6 @@ export async function performJoin(options: {
         httpStatus: response.status,
         configTouched: false,
       };
-    }
-    const uploadUrl = validatedTransportUrl(grant.uploadUrl, "Granted upload URL");
-    if (uploadUrl.origin !== joinUrl.origin) {
-      throw new Error("Granted upload URL must use the same origin as the workspace join URL.");
     }
     const identity = loadOrCreateDeviceIdentity(homeDir, {
       seed: { deviceId: existingConfig.deviceId, keyId: existingConfig.keyId },
