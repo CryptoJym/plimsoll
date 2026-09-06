@@ -16,7 +16,6 @@ import type { AddressInfo } from "node:net";
 import { build } from "esbuild";
 
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
-import { generateCodexConfigToml } from "../packages/collector-config/src/index";
 import {
   LAUNCH_AGENT_LABEL,
   launchAgentPlistPath,
@@ -667,11 +666,14 @@ esac
   );
 
   const fullCodexConfig = fs.readFileSync(codexConfig, "utf8");
-  const generatedCodex = generateCodexConfigToml({ repoRoot: neutralCwd, port });
-  const traceSection = generatedCodex.match(
+  // Cut the trace section out of the installed file itself: the installer signs
+  // exporter headers with a producer token, so a token-less regenerated template
+  // never matches the installed bytes and the "incomplete" scenario silently
+  // stayed complete (proof red on main since 2026-08-26).
+  const traceSection = fullCodexConfig.match(
     /\[otel\.trace_exporter\."otlp-http"\][\s\S]*?(?=\n\[otel\.metrics_exporter)/,
   )?.[0];
-  check("proof_finds_generated_trace_section", Boolean(traceSection), generatedCodex);
+  check("proof_finds_installed_trace_section", Boolean(traceSection), fullCodexConfig);
   fs.writeFileSync(codexConfig, fullCodexConfig.replace(traceSection!, ""));
   const incompleteDoctor = await command(
     process.execPath,
