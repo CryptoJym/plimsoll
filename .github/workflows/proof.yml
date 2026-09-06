@@ -7,7 +7,11 @@ on:
 
 jobs:
   proof:
-    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
@@ -32,13 +36,19 @@ jobs:
       - name: Prove event allocation conservation
         run: pnpm proof:allocation
 
+      - name: Prove platform daemon and XDG home behavior
+        run: pnpm proof:daemon
+
       - name: Prove source installer and read-only doctor
+        if: runner.os == 'macOS'
         run: pnpm proof:install-doctor
 
       - name: Prove atomic no-follow LaunchAgent manifest lifecycle
+        if: runner.os == 'macOS'
         run: pnpm proof:launch-agent
 
       - name: Prove packaged runtime provenance and direct-Node LaunchAgent (#155)
+        if: runner.os == 'macOS'
         run: pnpm proof:packaged-runtime
         # Once upstream restores packages/collector-cli/src/lifecycle-adapters.ts
         # and capture-fairness.ts (currently absent from main), add:
@@ -46,12 +56,14 @@ jobs:
         # to enforce built-artifact provenance continuously.
 
       - name: Prove truthful LaunchAgent unload and collector supervision
+        if: runner.os == 'macOS'
         run: |
           pnpm --dir packages/collector-cli build
           pnpm proof:launch-agent-unload
           pnpm proof:collector-supervision
 
       - name: Prove lifecycle receipts separate wrapper ownership and collector readiness (#148)
+        if: runner.os == 'macOS'
         run: pnpm proof:lifecycle-readiness
 
       - name: Prove hosted-runner flake classes stay fixed (#187)
@@ -67,6 +79,7 @@ jobs:
         run: pnpm proof:lifecycle
 
       - name: Prove packaged lifecycle operator commands end to end
+        if: runner.os == 'macOS'
         run: pnpm proof:lifecycle-operator
 
       - name: Prove bounded nonblocking Git metadata maintenance

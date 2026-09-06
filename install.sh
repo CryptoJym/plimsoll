@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Plimsoll source enrollment script — macOS.
+# Plimsoll source enrollment script — macOS and Linux.
 # Clones (or updates) the repo, installs deps, applies the generated telemetry
-# config, installs the development LaunchAgent, and runs the strict doctor.
+# config, installs the development daemon, and runs the strict doctor.
 set -euo pipefail
 
 PLIMSOLL_DIR="${PLIMSOLL_DIR:-$HOME/.plimsoll/app}"
@@ -24,6 +24,31 @@ command -v git >/dev/null || { echo "git is required"; exit 1; }
 command -v node >/dev/null || { echo "Node >=20 <25 is required (https://nodejs.org)"; exit 1; }
 command -v pnpm >/dev/null || { echo "pnpm is required: corepack enable && corepack prepare pnpm@latest --activate"; exit 1; }
 
+PLIMSOLL_PLATFORM="$(uname -s)"
+case "$PLIMSOLL_PLATFORM" in
+  Darwin)
+    PLIMSOLL_DAEMON_LABEL="LaunchAgent"
+    PLIMSOLL_LEDGER_PATH="$HOME/Library/Application Support/Plimsoll"
+    ;;
+  Linux)
+    command -v systemctl >/dev/null || { echo "systemctl is required for the Linux user daemon"; exit 1; }
+    PLIMSOLL_DAEMON_LABEL="systemd user service"
+    if [[ "${XDG_DATA_HOME:-}" == /* ]]; then
+      PLIMSOLL_LEDGER_PATH="$XDG_DATA_HOME/plimsoll"
+    else
+      PLIMSOLL_LEDGER_PATH="$HOME/.local/share/plimsoll"
+    fi
+    ;;
+  *)
+    echo "Unsupported platform: $PLIMSOLL_PLATFORM. Plimsoll supports macOS and Linux." >&2
+    exit 1
+    ;;
+esac
+
+if [ -n "${PLIMSOLL_HOME:-}" ]; then
+  PLIMSOLL_LEDGER_PATH="$PLIMSOLL_HOME"
+fi
+
 NODE_MAJOR="$(node -p 'Number(process.versions.node.split(".")[0])')"
 case "$NODE_MAJOR" in
   ''|*[!0-9]*) echo "Could not determine the Node major version." >&2; exit 1 ;;
@@ -38,9 +63,10 @@ if [ "$DRY_RUN" = "1" ]; then
 Plimsoll source install dry-run (no files, config, service, or processes will be changed)
   repository: $REPO_URL
   target: $PLIMSOLL_DIR
+  platform: $PLIMSOLL_PLATFORM
   Node: $(node -p 'process.versions.node') (supported: >=20 <25)
   plan: clone/update; pnpm install; collector setup --yes
-  plan: collector install-launch-agent --dev --repo-root "$PLIMSOLL_DIR" --pnpm "$(command -v pnpm)" --load
+  plan: collector install-daemon --dev --repo-root "$PLIMSOLL_DIR" --pnpm "$(command -v pnpm)" --load
   gate: collector doctor --read-only --json (failure stops installation)
 EOF
   exit 0
@@ -61,13 +87,13 @@ echo "── Configuring Claude Code and Codex telemetry ───────�
 pnpm collector setup --yes
 
 echo
-echo "── Installing collector LaunchAgent ──────────────────────────"
-pnpm collector install-launch-agent --dev --repo-root "$PLIMSOLL_DIR" --pnpm "$(command -v pnpm)" --load
+echo "── Installing collector $PLIMSOLL_DAEMON_LABEL ───────────────"
+pnpm collector install-daemon --dev --repo-root "$PLIMSOLL_DIR" --pnpm "$(command -v pnpm)" --load
 
 echo
 echo "── Doctor ─────────────────────────────────────────────────────"
 pnpm collector doctor --read-only --json
 
 echo
-echo "Plimsoll installed. Ledger: ~/Library/Application Support/Plimsoll"
+echo "Plimsoll installed. Ledger: $PLIMSOLL_LEDGER_PATH"
 echo "Readiness: signal_verified. Re-run doctor after future config or service changes."

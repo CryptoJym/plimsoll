@@ -57,7 +57,7 @@ The outcome join uses **linkage keys**: both Plimsoll and the GitHub side hash t
 
 ## Quickstart
 
-Requirements: macOS, Node >=20 <25.
+Requirements: macOS or Linux, Node >=20 <25.
 
 ```bash
 # wire Claude Code + Codex telemetry (idempotent, takes backups; --dry-run to preview)
@@ -74,8 +74,9 @@ npx -y @plimsoll/cli doctor --read-only --json
 itself. Its readiness progresses through `not_installed` → `configured` →
 `service_ready` → `signal_verified`; only `signal_verified` returns `ok:true`
 and exit 0. A cold ledger therefore fails honestly until a real token-bearing
-Claude Code or Codex event reaches the collector. Background LaunchAgent mode
-for npm installs is still being fitted — until then `start` runs in a terminal.
+Claude Code or Codex event reaches the collector. Source installs can run the
+platform daemon with `install-daemon`; packaged background distribution remains
+tracked separately.
 
 The packaged CLI also ships transactional lifecycle commands backed by an
 immutable, version-pinned runtime
@@ -105,12 +106,12 @@ and live-fleet rollout remain gated under
 git clone https://github.com/CryptoJym/plimsoll.git
 cd plimsoll
 ./install.sh --dry-run                        # preflight and exact mutation plan only
-./install.sh                                  # setup + development LaunchAgent + strict gate
+./install.sh                                  # setup + platform daemon + strict gate
 
 # Equivalent manual source commands:
 pnpm install
 pnpm collector setup --yes                    # idempotent; backs up changed tool configs
-pnpm collector install-launch-agent --dev --repo-root "$PWD" --pnpm "$(command -v pnpm)" --load
+pnpm collector install-daemon --dev --repo-root "$PWD" --pnpm "$(command -v pnpm)" --load
 pnpm collector doctor --read-only --json      # exits 0 only after a real token signal
 pnpm report -- --repository your-org/your-repo   # after a few sessions: the economics
 ```
@@ -122,7 +123,7 @@ by hand — hooks plus OTLP exporters pointed at `127.0.0.1:48271`. Nothing
 is configured behind your back.
 
 The source install script's `--dry-run` does not clone, install dependencies,
-write Claude/Codex or Plimsoll files, register a LaunchAgent, or start a
+write Claude/Codex or Plimsoll files, register a daemon, or start a
 collector. The real install fails closed if the final doctor gate is below
 `signal_verified`; the JSON report names the incomplete readiness level and
 each missing/conflicted requirement.
@@ -211,13 +212,14 @@ The hosted product (separate, commercial) is the **comparative and prescriptive*
 | Action-class derivation, privacy suppression | ✅ proof-gated (14 checks) |
 | Git linkage + PR efficiency report | ✅ verified on a real PR |
 | Retention, watermark sync, backfill | ✅ |
-| Linux / Windows | 🚧 [issue 0007](issues/0007-linux-windows-support.md) |
+| Linux | ✅ XDG data home + systemd user daemon |
+| Windows | 🚧 later platform lane |
 | More agents (Cursor, Gemini CLI, …) | 🚧 community lanes ([0005](issues/0005-cursor-adapter.md), [0006](issues/0006-gemini-cli-adapter.md)) |
 
 ## Roadmap
 
-1. **v0.1 — Open release** (now): macOS collector, Claude Code + Codex, local efficiency reports, signal-fidelity CI. ([issue 0001](issues/0001-v0.1-release-readiness.md))
-2. **v0.2 — Coverage**: codex live verification, per-event repo attribution for multi-repo sessions, rework-window detection for true Validated Delivery Yield, Linux support.
+1. **v0.1 — Open release** (now): macOS and Linux collector, Claude Code + Codex, local efficiency reports, signal-fidelity CI. ([issue 0001](issues/0001-v0.1-release-readiness.md))
+2. **v0.2 — Coverage**: codex live verification, per-event repo attribution for multi-repo sessions, and rework-window detection for true Validated Delivery Yield.
 3. **v0.3 — Reach**: adapters for more agents (Cursor, Gemini CLI, Copilot CLI), npx one-line install, menubar app, signed standalone binary.
 4. **Hosted beta** (commercial, separate repo): team rollups, benchmarks, Efficiency Brief.
 

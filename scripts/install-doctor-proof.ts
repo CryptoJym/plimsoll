@@ -225,7 +225,7 @@ exit 0
   );
   check(
     "source_installer_plans_supported_dev_path",
-    dryRun.stdout.includes("install-launch-agent --dev --repo-root"),
+    dryRun.stdout.includes("install-daemon --dev --repo-root"),
     dryRun.stdout,
   );
   check(
@@ -265,7 +265,7 @@ exit 0
   check("source_installer_fails_closed_on_doctor", failedInstall.code === 17, failedInstall);
   check(
     "source_installer_executes_supported_dev_path",
-    installCommands.includes("collector install-launch-agent --dev --repo-root"),
+    installCommands.includes("collector install-daemon --dev --repo-root"),
     installCommands,
   );
   check(
