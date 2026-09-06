@@ -740,18 +740,31 @@ async function main() {
     // zero summaries — independent of how many requests were rejected.
     const warningReasonCounts = new Map<string, number>();
     let warningShapesValid = warnings.length > 0;
+    const firstLinePairCounts = new Map<string, number>();
     for (const warning of warnings) {
       try {
         const parsed = JSON.parse(warning) as Record<string, unknown>;
+        // The first-line receipt carries a bounded client class label
+        // ("codex", "claude", ...) since the admission diagnostics landed; it is
+        // a fixed-cardinality tag, not request content, so it stays value-free.
+        const keys = Object.keys(parsed).filter((key) => key !== "clientClass");
+        const clientClassValid =
+          parsed.clientClass === undefined ||
+          (typeof parsed.clientClass === "string" && /^[a-z_]{1,16}$/.test(parsed.clientClass));
         if (
           parsed.error !== "collector_request_rejected" ||
           typeof parsed.reason !== "string" ||
-          Object.keys(parsed).length !== 2
+          keys.length !== 2 ||
+          !clientClassValid
         ) {
           warningShapesValid = false;
         } else {
           const reason = parsed.reason;
           warningReasonCounts.set(reason, (warningReasonCounts.get(reason) ?? 0) + 1);
+          // Suppression windows are keyed by reason AND client class, so a
+          // reason hit from two client classes legitimately logs two first lines.
+          const pair = `${reason}:${String(parsed.clientClass ?? "unknown")}`;
+          firstLinePairCounts.set(pair, (firstLinePairCounts.get(pair) ?? 0) + 1);
         }
       } catch {
         warningShapesValid = false;
@@ -779,18 +792,29 @@ async function main() {
       rejectedReasonCounts.set(reason, (rejectedReasonCounts.get(reason) ?? 0) + 1);
     }
     const counters = server.plimsollHttpDiagnostics.counters();
-    const counterRowsMatchRejections = [...rejectedReasonCounts.entries()].every(
-      ([reason, count]) =>
-        counters.reasons.find((row) => row.reason === reason)?.rejected === count &&
-        counters.reasons.find((row) => row.reason === reason)?.emittedFirst === 1,
-    );
+    // Counter rows are per (reason, client class): every row for a reason must
+    // have emitted exactly one first line, and the rows must add up to the
+    // rejections the proof itself triggered for that reason.
+    const counterRowsMatchRejections = [...rejectedReasonCounts.entries()].every(([reason, count]) => {
+      const rows = counters.reasons.filter((row) => row.reason === reason);
+      return (
+        rows.length > 0 &&
+        rows.every((row) => row.emittedFirst === 1) &&
+        rows.reduce((sum, row) => sum + row.rejected, 0) === count
+      );
+    });
     check(
       "all_rejection_receipts_are_bounded_and_value_free",
       warningShapesValid &&
         warningReasonCounts.size === rejectedReasonCounts.size &&
         [...rejectedReasonCounts.keys()].every(
-          (reason) => warningReasonCounts.get(reason) === 1 && rejectedReasonCounts.get(reason)! >= 1,
+          (reason) =>
+            (warningReasonCounts.get(reason) ?? 0) >= 1 &&
+            warningReasonCounts.get(reason) ===
+              counters.reasons.filter((row) => row.reason === reason).length &&
+            rejectedReasonCounts.get(reason)! >= 1,
         ) &&
+        [...firstLinePairCounts.values()].every((count) => count === 1) &&
         counterRowsMatchRejections &&
         conservationIdentity(counters) &&
         warnings.every((warning) => Buffer.byteLength(warning) <= 128) &&
