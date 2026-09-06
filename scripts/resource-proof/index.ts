@@ -7,6 +7,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { guardProofCompletion } from "../lib/proof-completion";
 import {
   createResourceSandbox,
   loadUnwiredIntegrationScenarios,
@@ -855,7 +856,13 @@ if (invokedAsScript) {
       process.exitCode = 1;
     }
   } else {
-    main().catch((error) => {
+    // Refuses the two silent-green modes: an early event-loop drain and a
+    // hang that never exits. See scripts/lib/proof-completion.ts. Declared
+    // here, not at module scope, because this file is also imported (for
+    // writeResourceReceiptAtomically) by finalization-proof.ts — a top-level
+    // guard would install a stray exit listener in every importer.
+    const guard = guardProofCompletion();
+    main().then(() => guard.complete()).catch((error) => {
       const errorClass = error instanceof Error ? error.name : "UnknownError";
       process.stderr.write(
         `${JSON.stringify({ schema: RESOURCE_PROOF_SCHEMA, overall: "fail", error: errorClass })}\n`,

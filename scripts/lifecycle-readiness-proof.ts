@@ -14,6 +14,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   captureBoundedDescendantTree,
   captureLaunchAgentUnloadPriorState,
@@ -166,6 +167,10 @@ async function runReadinessScenario(scenario: ReadinessScenario) {
   });
   return { prior, outcome };
 }
+
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 async function main() {
   check("proof_runs_on_exact_node_22", process.versions.node.split(".")[0] === "22", {
@@ -593,7 +598,7 @@ esac
   console.log(JSON.stringify({ issue: 148, ok: true, checks }, null, 2));
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });

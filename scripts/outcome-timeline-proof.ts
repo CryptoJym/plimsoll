@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   GitHubRestOutcomeTimelineAdapter,
   GitHubTimelineProviderError,
@@ -31,6 +32,12 @@ function prove(name: string, passed: boolean, detail: Record<string, unknown>) {
   checks.push({ name, passed, detail });
   assert.equal(passed, true, `${name}: ${JSON.stringify(detail)}`);
 }
+
+// Refuses the two silent-green modes — an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts for why each is needed.
+const guard = guardProofCompletion({
+  countChecks: () => checks.length,
+});
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const fixturePath = path.join(
@@ -1211,7 +1218,7 @@ async function main() {
   }
 }
 
-void main().catch((error) => {
+void main().then(() => guard.complete()).catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });

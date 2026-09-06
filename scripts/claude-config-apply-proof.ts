@@ -10,6 +10,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   applyClaudeSettings,
   generateClaudeCodeSettings,
@@ -53,6 +54,11 @@ function errorMessage(action: () => unknown) {
 function writeJson(file: string, value: unknown, mode = 0o600) {
   fs.writeFileSync(file, `${JSON.stringify(value, null, 2)}\n`, { mode });
 }
+
+// Refuses the two silent-green modes: an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts. main() here is
+// synchronous, so completion is a plain statement after the call below.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 function main() {
   check("proof_runs_on_node_22", Number(process.versions.node.split(".")[0]) === 22, {
@@ -585,3 +591,4 @@ function main() {
 }
 
 main();
+guard.complete();

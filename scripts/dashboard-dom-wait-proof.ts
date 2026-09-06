@@ -25,6 +25,7 @@ import {
   type DashboardReadinessStatus,
   type DomWaitReceipt,
 } from "./fixtures/dashboard-dom-wait";
+import { guardProofCompletion } from "./lib/proof-completion";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -43,6 +44,12 @@ function check(name: string, passed: unknown, detail: string) {
   checks.push(receipt);
   console.log(`${receipt.passed ? "PASS" : "FAIL"} ${name} — ${detail}`);
 }
+
+// Refuses the two silent-green modes — an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts for why each is needed.
+const guard = guardProofCompletion({
+  countChecks: () => checks.length,
+});
 
 const tick = () => new Promise<void>((resolve) => setImmediate(resolve));
 
@@ -534,7 +541,7 @@ async function main() {
   if (failed.length) process.exitCode = 1;
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   console.error(error instanceof Error ? error.stack : String(error));
   process.exitCode = 1;
 });

@@ -5,7 +5,12 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { verifySystemE2EReceipt } from "./system-e2e/verifier";
+
+// Refuses the two silent-green modes — an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts for why each is needed.
+const guard = guardProofCompletion();
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 const expectedCommitIndex = process.argv.indexOf("--expected-source-commit");
@@ -28,3 +33,4 @@ assert.ok(fs.existsSync(receiptPath), `system E2E receipt is missing: ${receiptP
 const receipt = JSON.parse(fs.readFileSync(receiptPath, "utf8")) as unknown;
 const verified = verifySystemE2EReceipt(receipt, repoRoot, expectedSourceHeadCommit);
 console.log(JSON.stringify({ ...verified, receipt: path.relative(repoRoot, receiptPath) }, null, 2));
+guard.complete();

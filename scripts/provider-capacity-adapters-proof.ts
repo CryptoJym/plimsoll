@@ -32,6 +32,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   ADAPTER_BACKOFF_BASE_MS,
   CAPACITY_ADAPTER_ERRORS,
@@ -62,6 +63,12 @@ function prove(name: string, condition: unknown, detail: Record<string, unknown>
   assert.ok(condition, `${name}: ${JSON.stringify(detail)}`);
   checks.push({ name, detail });
 }
+
+// Refuses the two silent-green modes — an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts for why each is needed.
+const guard = guardProofCompletion({
+  countChecks: () => checks.length,
+});
 
 function freshScratch(label: string): string {
   const dir = path.join(scratchRoot, label);
@@ -997,7 +1004,7 @@ async function main() {
 );
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });

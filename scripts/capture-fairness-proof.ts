@@ -12,6 +12,7 @@ import path from "node:path";
 
 import Database from "better-sqlite3";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   CAPTURE_ROTATION_SCHEMA_VERSION,
   loadCaptureRotation,
@@ -30,6 +31,10 @@ function check(name: string, condition: unknown, detail?: unknown) {
   console.log(`${row.passed ? "PASS" : "FAIL"} ${name}`);
   if (!row.passed) throw new Error(`${name}: ${JSON.stringify(detail ?? null)}`);
 }
+
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts for details.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 const workdir = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-capture-fairness-"));
 const db = new Database(path.join(workdir, "ledger.sqlite"));
@@ -171,3 +176,5 @@ try {
   db.close();
   fs.rmSync(workdir, { recursive: true, force: true });
 }
+
+guard.complete();

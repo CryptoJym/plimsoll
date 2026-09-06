@@ -7,6 +7,7 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { AddressInfo } from "node:net";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
@@ -172,6 +173,12 @@ function check(name: string, passed: unknown, detail: string) {
   checks.push(receipt);
   console.log(`${receipt.passed ? "PASS" : "FAIL"} ${name} — ${detail}`);
 }
+
+// Refuses the two silent-green modes — an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts for why each is needed.
+const guard = guardProofCompletion({
+  countChecks: () => checks.length,
+});
 
 function inlineBlock(html: string, tag: "script" | "style") {
   const opening = `<${tag}>`, start = html.indexOf(opening), end = html.indexOf(`</${tag}>`, start + opening.length);
@@ -1145,7 +1152,7 @@ async function main() {
   if (failed.length) process.exitCode = 1;
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   if (error instanceof ProofTimeoutError) {
     const stageDetail = error.message.split(":")[2];
     console.error(JSON.stringify({

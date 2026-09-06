@@ -5,6 +5,7 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   digest,
   loadTamperContract,
@@ -12,6 +13,10 @@ import {
   type TamperMutation,
 } from "./system-e2e/contract";
 import { verifySystemE2EReceipt } from "./system-e2e/verifier";
+
+// Refuses the two silent-green modes — an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts for why each is needed.
+const guard = guardProofCompletion();
 
 const repoRoot = path.resolve(import.meta.dirname, "..");
 
@@ -131,3 +136,4 @@ console.log(JSON.stringify({
   rejected: results.length,
   results,
 }, null, 2));
+guard.complete();

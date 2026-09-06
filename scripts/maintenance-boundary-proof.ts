@@ -19,6 +19,7 @@ import { randomUUID } from "node:crypto";
 
 import { build } from "esbuild";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import {
@@ -1773,6 +1774,10 @@ async function pathFreeReceiptProof() {
   });
 }
 
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts for details.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
+
 async function main() {
   assert.equal(process.versions.node.split(".")[0], "22", "proof requires Node 22");
   if (process.env.PLIMSOLL_MAINTENANCE_PROOF_FOCUS === "orphan_recovery") {
@@ -1845,7 +1850,7 @@ async function main() {
   console.log(JSON.stringify(receipt, null, 2));
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   console.error(JSON.stringify({
     proof: "maintenance_boundary",
     ok: false,

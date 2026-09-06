@@ -14,6 +14,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import {
   beginAutomaticCaptureBaseline,
@@ -1347,6 +1348,10 @@ function proveNanosecondGenerationIdentity() {
   }
 }
 
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts for details.
+const guard = guardProofCompletion();
+
 async function main() {
   try {
     const rollout = await proveRolloutTailing();
@@ -1435,7 +1440,7 @@ async function main() {
   }
 }
 
-main().catch((error: unknown) => {
+main().then(() => guard.complete()).catch((error: unknown) => {
   console.error(error);
   process.exitCode = 1;
 });

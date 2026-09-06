@@ -19,6 +19,9 @@ import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import os from "node:os";
 
+// Extension-qualified: this proof runs on stock Node (--experimental-strip-types),
+// whose resolver does not extension-guess. See the header note above.
+import { guardProofCompletion } from "../lib/proof-completion.ts";
 import {
   OWNER_SHUTDOWN_FAILURE_CLASSES,
   SymbolicProofError,
@@ -41,6 +44,10 @@ function check(name: string, body: () => boolean | Promise<boolean>): Promise<vo
       if (!ok) throw new Error(`check_failed:${name}`);
     });
 }
+
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts.
+const guard = guardProofCompletion({ countChecks: () => checksRun });
 
 function spawnNode(script: string) {
   const child = spawn(process.execPath, ["-e", script], {
@@ -311,7 +318,7 @@ async function main() {
   if (!passed) process.exitCode = 1;
 }
 
-main().catch((error: unknown) => {
+main().then(() => guard.complete()).catch((error: unknown) => {
   console.error(String(error));
   process.exitCode = 1;
 });

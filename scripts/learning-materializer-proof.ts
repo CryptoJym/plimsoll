@@ -10,6 +10,7 @@ import { spawnSync } from "node:child_process";
 
 import Database from "better-sqlite3";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   LearningFactStore,
   buildTechniqueExposureFact,
@@ -38,6 +39,12 @@ function check(name: string, condition: unknown, detail: Record<string, unknown>
   assert.ok(condition, `${name}: ${JSON.stringify(detail)}`);
   checks.push({ name, detail });
 }
+
+// Refuses the two silent-green modes — an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts for why each is needed.
+const guard = guardProofCompletion({
+  countChecks: () => checks.length,
+});
 
 const PRODUCTION_BUFFERED_EVENTS_DDL = `
   create table if not exists buffered_events (
@@ -741,7 +748,7 @@ async function main(): Promise<void> {
   }, null, 2));
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   console.error(JSON.stringify({ schema: SCHEMA, status: "failed", error: String(error), stack: (error instanceof Error ? (error.stack ?? "").split("\n").slice(0,4) : []) }, null, 2));
   process.exit(1);
 });

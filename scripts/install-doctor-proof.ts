@@ -15,6 +15,7 @@ import path from "node:path";
 import type { AddressInfo } from "node:net";
 import { build } from "esbuild";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { generateCodexConfigToml } from "../packages/collector-config/src/index";
 import {
@@ -103,6 +104,10 @@ function digestTree(directory: string): string {
 function backupCount(directory: string) {
   return fs.readdirSync(directory).filter((name) => name.includes(".plimsoll-backup-")).length;
 }
+
+// Refuses the two silent-green modes: an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 async function main() {
   const nodeMajor = Number(process.versions.node.split(".")[0]);
@@ -912,7 +917,7 @@ esac
   }
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   console.error(error instanceof Error ? error.stack ?? error.message : String(error));
   process.exitCode = 1;
 });

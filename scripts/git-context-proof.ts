@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { performance } from "node:perf_hooks";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { resolveGitContext } from "../packages/collector-cli/src/git-context";
 import { readBoundedRegularFile } from "../packages/collector-cli/src/safe-file-read";
@@ -443,6 +444,10 @@ async function proveMaintenanceTailerLatency(root: string) {
   }
 }
 
+// Refuses the two silent-green modes: an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
+
 async function main() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-git-context-proof-"));
   try {
@@ -462,7 +467,7 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   console.error(error instanceof Error ? error.message : "git context proof failed");
   process.exitCode = 1;
 });

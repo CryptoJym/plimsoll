@@ -8,6 +8,7 @@ import { gunzipSync } from "node:zlib";
 
 import Database from "better-sqlite3";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import {
@@ -298,6 +299,10 @@ function compactMutationRepairDependencyFixture(root:string,label:string,reopenA
   return {queued,repairSelectionPlan,firstReceipt,afterFirst,receipts,updatedObservedAt,
     updatedPayload,sources,finalState};
 }
+
+// Refuses the two silent-green modes: an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 async function main() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-projection-proof-"));
@@ -1478,7 +1483,7 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   Date.now = originalDateNow;
   console.error(error instanceof Error ? error.stack : error);
   process.exitCode = 1;

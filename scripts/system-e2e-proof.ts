@@ -45,6 +45,7 @@ import {
   collectAllocationEvents,
   type PullCandidate,
 } from "./event-allocation";
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   SYSTEM_E2E_SCHEMA,
   SYSTEM_E2E_BUDGETS,
@@ -1017,6 +1018,10 @@ async function runSharedFlow() {
   }
 }
 
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts.
+const guard = guardProofCompletion();
+
 async function main() {
   assert.equal(process.versions.node.split(".")[0], "22", "system E2E requires exact Node 22");
   const startedAt = Date.now();
@@ -1390,6 +1395,7 @@ async function main() {
 }
 
 main()
+  .then(() => guard.complete())
   .catch((error) => {
     console.error(error instanceof Error ? error.stack ?? error.message : String(error));
     process.exitCode = 1;

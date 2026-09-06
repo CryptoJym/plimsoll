@@ -8,6 +8,7 @@ import { performance } from "node:perf_hooks";
 
 import Database from "better-sqlite3";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { appendForwardedHook } from "../packages/collector-cli/src/forwarder";
@@ -79,6 +80,11 @@ function contextId(buffer: LocalEventBuffer, eventId: string) {
 function artifactContains(file: string, sentinel: string) {
   return fs.existsSync(file) && fs.readFileSync(file).includes(Buffer.from(sentinel));
 }
+
+// Refuses the two silent-green modes: an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts. This file has no
+// main() wrapper, so the guard completes as the last top-level statement.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-repo-context-proof-"));
 try {
@@ -1430,3 +1436,4 @@ try {
 } finally {
   fs.rmSync(root, { recursive: true, force: true });
 }
+guard.complete();

@@ -11,6 +11,7 @@ import os from "node:os";
 import path from "node:path";
 import type { AddressInfo } from "node:net";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { metadataSafeOtlpAttributes } from "../packages/collector-cli/src/otlp";
@@ -27,6 +28,10 @@ const checks: Check[] = [];
 function check(name: string, passed: boolean, detail: unknown) {
   checks.push({ name, passed, detail: typeof detail === "string" ? detail : JSON.stringify(detail) });
 }
+
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 function attr(key: string, value: string | number | boolean) {
   if (typeof value === "number" && Number.isInteger(value)) {
@@ -791,7 +796,7 @@ async function main() {
   }
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   console.error(error);
   process.exitCode = 1;
 });

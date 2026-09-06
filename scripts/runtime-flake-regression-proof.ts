@@ -34,6 +34,7 @@ import {
   readUtcProcessStartFingerprint,
   UTC_PROCESS_START_ALGORITHM,
 } from "../packages/collector-cli/src/runtime-ownership";
+import { guardProofCompletion } from "./lib/proof-completion";
 import { waitForExit, watch } from "./lib/supervision-watch";
 
 // Synthetic label on purpose: these scenarios exercise the pid-file path
@@ -364,6 +365,10 @@ function spawnSyncExitThenClassify() {
   });
 }
 
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
+
 async function main() {
   const nodeMajor = Number(process.versions.node.split(".")[0]);
   record("proof_runs_on_supported_node", nodeMajor >= 20 && nodeMajor < 25, {
@@ -396,7 +401,7 @@ async function main() {
   console.log(JSON.stringify(receipt, null, 2));
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   console.error(error instanceof Error ? error.stack ?? error.message : String(error));
   process.exitCode = 1;
 });

@@ -8,6 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   LIFECYCLE_PURGE_ONLY_TARGETS,
   LIFECYCLE_UNINSTALL_RETAINED_TARGETS,
@@ -240,6 +241,10 @@ async function rejection(action: () => unknown | Promise<unknown>) {
     return error as Error;
   }
 }
+
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts for details.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 async function main() {
   check("proof_runs_on_exact_node_22", process.versions.node.startsWith("22."), process.versions.node);
@@ -747,7 +752,7 @@ async function main() {
   console.log(JSON.stringify({ proof: "lifecycle", checks: checks.length, passed: checks.length - failed.length, failed: failed.map((row) => row.name), liveStateTouched: false }));
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   console.error(error instanceof Error ? error.stack : error);
   process.exitCode = 1;
 });

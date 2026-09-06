@@ -3,6 +3,7 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 
+import { guardProofCompletion } from "../lib/proof-completion";
 import {
   createResourceSandbox,
   removeResourceSandbox,
@@ -24,6 +25,11 @@ async function withSandboxes<T>(
     await Promise.all(sandboxes.map((sandbox) => removeResourceSandbox(sandbox)));
   }
 }
+
+// Refuses the two silent-green modes: an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts. This proof keeps
+// no check tally, so the guard only refuses drain/hang.
+const guard = guardProofCompletion();
 
 async function main() {
   const originalReaddirSync = fs.readdirSync;
@@ -112,7 +118,7 @@ async function main() {
   );
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   process.stderr.write(
     `${JSON.stringify({
       status: "fail",

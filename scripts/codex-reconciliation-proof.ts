@@ -8,6 +8,7 @@ import path from "node:path";
 
 import Database from "better-sqlite3";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import {
   codexReconciliationStatus,
@@ -1239,6 +1240,10 @@ async function proveContextRevisionCrashRollbackAndOverlap(root: string) {
   }
 }
 
+// Refuses the two silent-green modes: an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
+
 async function main() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-codex-reconciliation-proof-"));
   try {
@@ -1267,7 +1272,7 @@ async function main() {
   );
 }
 
-main().catch((error) => {
+main().then(() => guard.complete()).catch((error) => {
   process.stderr.write(
     `${JSON.stringify({
       status: "fail",

@@ -4,6 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   installLaunchAgent,
   LAUNCH_AGENT_LABEL,
@@ -24,6 +25,10 @@ function check(name: string, condition: unknown, details: Record<string, unknown
   if (!condition) throw new Error(`${name} failed: ${JSON.stringify(details)}`);
   checks.push({ name, passed: true, details });
 }
+
+// Refuses two silent-green failure modes: an early event-loop drain and a
+// hang that never exits. See scripts/lib/proof-completion.ts.
+const guard = guardProofCompletion({ countChecks: () => checks.length });
 
 function sha256(value: string | Buffer) {
   return `sha256:${createHash("sha256").update(value).digest("hex")}`;
@@ -1076,3 +1081,4 @@ esac
 }
 
 main();
+guard.complete();

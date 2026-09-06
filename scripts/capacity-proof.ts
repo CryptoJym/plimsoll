@@ -15,6 +15,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import { scanCapacityDoctrine } from "./capacity-dependency-reachability";
 
 import {
@@ -40,6 +41,12 @@ function prove(name: string, condition: unknown, detail: Record<string, unknown>
   assert.ok(condition, `${name}: ${JSON.stringify(detail)}`);
   checks.push({ name, detail });
 }
+
+// Refuses the two silent-green modes — an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts for why each is needed.
+const guard = guardProofCompletion({
+  countChecks: () => checks.length,
+});
 
 // ---------------------------------------------------------------------------
 // 1. Reset calendar — kinds stay separate, sorted, horizon-bounded.
@@ -1175,3 +1182,4 @@ function prove(name: string, condition: unknown, detail: Record<string, unknown>
 }
 
 console.log(JSON.stringify({ schema: "plimsoll.capacity-proof.v1", passed: checks.length, checks }, null, 2));
+guard.complete();

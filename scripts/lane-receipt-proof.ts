@@ -17,6 +17,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
+import { guardProofCompletion } from "./lib/proof-completion";
 import {
   appendAttemptObservation,
   assertReceiptPrivacy,
@@ -44,6 +45,12 @@ function check(name: string, condition: unknown, detail: Record<string, unknown>
   assert.ok(condition, `${name}: ${JSON.stringify(detail)}`);
   checks.push(detail && Object.keys(detail).length > 0 ? { name, detail } : { name });
 }
+
+// Refuses the two silent-green modes — an early event-loop drain and a hang
+// that never exits. See scripts/lib/proof-completion.ts for why each is needed.
+const guard = guardProofCompletion({
+  countChecks: () => checks.length,
+});
 
 function readFixture(name: string): Record<string, unknown> {
   return JSON.parse(fs.readFileSync(path.join(hostileDir, name), "utf8")) as Record<
@@ -733,3 +740,4 @@ function main() {
 }
 
 main();
+guard.complete();
