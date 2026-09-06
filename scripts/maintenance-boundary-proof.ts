@@ -1850,6 +1850,7 @@ main().catch((error) => {
     proof: "maintenance_boundary",
     ok: false,
     reason: error instanceof Error ? error.message : "proof_failed",
+    at: error instanceof Error ? (error.stack ?? "").split("\n").filter((line) => line.includes("maintenance-boundary-proof")).slice(0, 2) : [],
   }));
   process.exitCode = 1;
 });

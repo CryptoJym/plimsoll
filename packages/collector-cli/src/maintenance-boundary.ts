@@ -991,10 +991,19 @@ export class MaintenanceProcessBoundary {
       await signalIfSame("SIGKILL");
       if (await this.waitForClose(this.killGraceMs())) return true;
       const afterKill = pid && spawnNonce ? await this.fingerprint(pid, spawnNonce) : null;
-      if (expected && (!afterKill || afterKill !== expected) && this.child === child) {
+      if (expected && afterKill === null && this.child === child) {
+        // Nothing answers at the pid any more: the worker is gone even though
+        // its close event has not arrived yet. Detach it as reaped.
         this.pidMismatches += 1;
         this.detachGoneChild(child);
         return true;
+      }
+      if (expected && afterKill !== null && afterKill !== expected && this.child === child) {
+        // A live process with another fingerprint is pid reuse or an ambiguous
+        // observation. We sent it nothing and cannot prove our worker exited,
+        // so fail closed: keep the handle, flag orphan risk, and let the tracked
+        // close event (or orphan recovery) clear it.
+        this.pidMismatches += 1;
       }
       this.orphanRisk = this.child === child;
       if (this.orphanRisk && this.orphanSinceMs === null) this.orphanSinceMs = this.now();
