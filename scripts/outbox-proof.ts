@@ -2426,7 +2426,12 @@ async function hookPromotionAdmissionProof() {
   const resolverBranchHash = branchLinkageHash("main")!;
   const resolverHeadSha = git("rev-parse", "HEAD").stdout.trim();
   const selectedEventId = "81818181-8181-4181-8181-818181818181";
-  const selectedObservedAt = instant(2_996).toISOString();
+  // The proof clock runs an hour ahead of wall time so synthetic rows sort last,
+  // but the ingestion boundary rejects analytical timestamps beyond its future
+  // skew allowance and falls back to the capture instant. Keep this row's
+  // observedAt on the wall clock so the identity control measures parity, not
+  // the skew guard.
+  const selectedObservedAt = new Date(Date.now() - 5_000).toISOString();
   const unsafeValues = {
     model: "sk_live_PRIVATE_HOOK_MODEL_VALUE_81",
     session: "/Users/private/hook-session-value-81",
