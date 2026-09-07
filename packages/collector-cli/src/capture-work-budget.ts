@@ -43,14 +43,17 @@ export class CaptureWorkBudget {
     private readonly limits: CaptureBudgetLimits = AUTOMATIC_CAPTURE_LIMITS,
   ) {}
 
-  remainingSlice() {
+  remainingSlice(retryOversizedRecord = false) {
     if (!this.canContinue()) return null;
     const remainingBytes = this.limits.maxBytes - this.bytesRead;
     if (remainingBytes < 2_048) return null;
     return {
       maxBytes: Math.max(
         2_048,
-        Math.min(this.limits.sliceBytes, remainingBytes),
+        // An unresolved record needs a larger read to make progress. Permit
+        // its retry to use the remaining cadence allowance without raising
+        // the shared byte, record, event, or wall-clock ceilings.
+        retryOversizedRecord ? remainingBytes : Math.min(this.limits.sliceBytes, remainingBytes),
       ),
       maxRecords: Math.max(
         1,
