@@ -158,6 +158,7 @@ function reconciledPayload(
     sessionId: string | null;
     model: string | null;
     costUsd: number | null;
+    costKind: "estimated" | null;
     sessionChanged: boolean;
     modelChanged: boolean;
     costChanged: boolean;
@@ -168,7 +169,10 @@ function reconciledPayload(
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return payloadJson;
     if (changes.sessionChanged) parsed.sessionId = changes.sessionId;
     if (changes.modelChanged) parsed.model = changes.model;
-    if (changes.costChanged) parsed.costUsd = changes.costUsd;
+    if (changes.costChanged) {
+      parsed.costUsd = changes.costUsd;
+      parsed.costKind = changes.costKind;
+    }
     if (changes.sessionChanged || changes.costChanged) {
       const existingMetadata = parsed.metadata;
       const metadata =
@@ -577,6 +581,7 @@ export function runCodexReconciliationMaintenance(
            session_id = @sessionId,
            model = @model,
            cost_usd = @costUsd,
+           cost_kind = coalesce(@costKind, cost_kind),
            payload_json = @payloadJson
          where id = @id`,
       );
@@ -639,16 +644,18 @@ export function runCodexReconciliationMaintenance(
           const sessionChanged = sessionId !== row.sessionId;
           const modelChanged = model !== row.model;
           const costChanged = costUsd !== row.costUsd;
+          const costKind = costChanged ? "estimated" as const : null;
           if (sessionChanged || modelChanged || costChanged) {
             const payloadJson = reconciledPayload(row.payloadJson, {
               sessionId,
               model,
               costUsd,
+              costKind,
               sessionChanged,
               modelChanged,
               costChanged,
             });
-            rowsChanged += apply.run({ id: row.id, sessionId, model, costUsd, payloadJson })
+            rowsChanged += apply.run({ id: row.id, sessionId, model, costUsd, costKind, payloadJson })
               .changes;
             if (sessionChanged) stitched += 1;
             if (costChanged) priced += 1;

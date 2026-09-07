@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const SYSTEM_E2E_SCHEMA = "plimsoll.system-e2e-proof.v2" as const;
-export const SUPPORT_NORMALIZATION_VERSION = 6 as const;
+export const SUPPORT_NORMALIZATION_VERSION = 7 as const;
 /** Fixed release thresholds. These are never derived from an observed run. */
 export const SYSTEM_E2E_BUDGETS = {
   directRows: 500,
@@ -225,7 +225,25 @@ export function normalizeSupportingArtifact(
     );
   }
   if (value && typeof value === "object") {
-    const record = value as Record<string, unknown>;
+    let record = value as Record<string, unknown>;
+    if (key === "workspaceBinding") {
+      // Device/epoch identities are generated independently in each disposable
+      // install. Validate their relationship before replacing only their values.
+      exactKeys(record, ["changedAt", "currentDeviceId", "currentInstallationEpochId",
+        "currentInstallationEpochStartedAt", "currentWorkspaceId", "previousDeviceId",
+        "previousWorkspaceId"], "workspace binding");
+      const uuid = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+      assert.match(String(record.currentDeviceId), /^dev_[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/, "workspace device identity invalid");
+      assert.equal(record.previousDeviceId, record.currentDeviceId, "workspace device identity changed during reassignment");
+      assert.match(String(record.currentInstallationEpochId), uuid, "workspace epoch identity invalid");
+      assert.equal(record.previousWorkspaceId, "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", "previous workspace binding changed");
+      assert.equal(record.currentWorkspaceId, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", "current workspace binding changed");
+      for (const time of [record.changedAt, record.currentInstallationEpochStartedAt]) {
+        assert.ok(typeof time === "string" && /^\d{4}-\d{2}-\d{2}T.*Z$/.test(time) && Number.isFinite(Date.parse(time)), "workspace binding timestamp invalid");
+      }
+      record = { ...record, currentDeviceId: "<fixture-device-id>", previousDeviceId: "<fixture-device-id>",
+        currentInstallationEpochId: "<fixture-installation-epoch-id>" };
+    }
     const objectPath = typeof record.id === "string"
       ? `${fieldPath}{id=${record.id}}`
       : fieldPath;
@@ -504,7 +522,8 @@ function assertResourceReceipt(receipt: unknown) {
   assert.equal(integer(dashboardMeasurements.warmRequests, "dashboard warm requests"), 20);
   assert.ok(finite(dashboardMeasurements.warmP95Ms, "dashboard warm p95") <= 500);
   assert.equal(integer(dashboardMeasurements.snapshotBuildsDuringRefresh, "dashboard snapshot builds"), 0);
-  assert.equal(integer(dashboardMeasurements.snapshotCacheHits, "dashboard snapshot cache hits"), 25);
+  assert.equal(integer(dashboardMeasurements.snapshotCacheHits, "dashboard snapshot cache hits"), 0);
+  assert.equal(integer(dashboardMeasurements.sqliteWritesDuringRefresh, "dashboard SQLite writes during GET"), 0);
 }
 
 export function parseSupportingArtifact(

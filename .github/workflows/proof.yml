@@ -8,7 +8,9 @@ on:
 jobs:
   proof:
     runs-on: macos-14
-    timeout-minutes: 10
+    # Allow the measured sequential artifact, repeated E2E and resource gates.
+    # Per-proof deadlines and acceptance thresholds remain unchanged.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -26,111 +28,188 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Isolate every proof home and provider root
+        shell: bash
+        run: |
+          proof_home="${RUNNER_TEMP}/plimsoll-ci-home"
+          mkdir -p "$proof_home/.plimsoll" "$proof_home/.codex" "$proof_home/.claude" "$proof_home/tmp"
+          chmod 700 "$proof_home" "$proof_home/.plimsoll"
+          {
+            echo "HOME=$proof_home"
+            echo "USERPROFILE=$proof_home"
+            echo "PLIMSOLL_HOME=$proof_home/.plimsoll"
+            echo "CODEX_HOME=$proof_home/.codex"
+            echo "CLAUDE_CONFIG_DIR=$proof_home/.claude"
+            echo "XDG_CONFIG_HOME=$proof_home/.config"
+            echo "XDG_CACHE_HOME=$proof_home/.cache"
+            echo "XDG_STATE_HOME=$proof_home/.local/state"
+            echo "TMPDIR=$proof_home/tmp"
+          } >> "$GITHUB_ENV"
+
       - name: Typecheck
+        id: typecheck
         run: pnpm exec tsc --noEmit
 
+      - name: Reject incomplete proofs and require WAL, authentication and retention receipts
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:completion
+          pnpm proof:startup-wal-self-heal
+          pnpm proof:authenticated-ingestion
+          pnpm proof:retention
+
       - name: Prove event allocation conservation
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:allocation
 
+      - name: Prove integrated capture, provenance, supervision and delivery
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:collector-reliability
+          pnpm proof:collector-clock
+          pnpm proof:lifecycle-manifest-rollback
+          pnpm proof:dashboard-cdp
+          pnpm proof:future-admission
+          pnpm proof:child-identity
+          pnpm proof:economics
+          pnpm proof:finance-export
+          pnpm proof:finance-projection
+          pnpm proof:delivery
+          pnpm proof:repo-labels-response
+
       - name: Prove source installer and read-only doctor
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:install-doctor
 
       - name: Prove atomic no-follow LaunchAgent manifest lifecycle
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:launch-agent
 
       - name: Prove packaged runtime provenance and direct-Node LaunchAgent (#155)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:packaged-runtime
-        # Once upstream restores packages/collector-cli/src/lifecycle-adapters.ts
-        # and capture-fairness.ts (currently absent from main), add:
-        #   pnpm runtime:build && pnpm runtime:verify
-        # to enforce built-artifact provenance continuously.
+
+      - name: Verify and qualify the exact packed artifact
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm runtime:build
+          pnpm runtime:verify
+          pnpm proof:install-artifact
 
       - name: Prove truthful LaunchAgent unload and collector supervision
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: |
           pnpm --dir packages/collector-cli build
           pnpm proof:launch-agent-unload
           pnpm proof:collector-supervision
 
       - name: Prove lifecycle receipts separate wrapper ownership and collector readiness (#148)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:lifecycle-readiness
 
       - name: Prove hosted-runner flake classes stay fixed (#187)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:flake-regression
 
       - name: Prove surgical Codex config reconciliation
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-config-apply
 
       - name: Prove atomic Claude config reconciliation
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:claude-config-apply
 
       - name: Prove atomic local lifecycle transactions
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:lifecycle
 
       - name: Prove packaged lifecycle operator commands end to end
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:lifecycle-operator
 
       - name: Prove bounded nonblocking Git metadata maintenance
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:git-context
 
       - name: Prove deferred repository context transaction and privacy bounds
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:repo-context
 
       - name: Prove incremental tailer context and cursor semantics
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:incremental-capture
 
       - name: Prove fair capture progress across concurrent generations
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-fairness
 
       - name: Prove local HTTP trust boundary
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:http-boundary
       - name: Prove bounded admission-rejection diagnostics (runner-scaled)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:rejection-aggregation
         env:
           REJECTION_PROOF_SCALE: "0.05"
 
       - name: Prove isolated automatic maintenance availability
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:maintenance-boundary
 
       - name: Prove shipped dashboard projection truth
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dashboard
 
       - name: Prove shipped dashboard browser security
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dashboard-security
 
       - name: Prove race-safe dashboard DOM wait fixtures
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dashboard-dom-wait
 
       - name: Prove paired attempts and explicit technique exposure
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:learning-facts
 
       - name: Prove runtime capture promotes bounded learning facts
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:runtime-facts
 
       - name: Run signal-fidelity proof
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof
 
       - name: Prove versioned learning-metric truth
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:metric-truth
 
       - name: Prove capacity planning doctrine gates
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capacity
 
       - name: Prove bounded learning evidence packets
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:learning-evidence
 
       - name: Prove suppression receipt capture-to-upload parity
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:outbox
 
       - name: Prove managed metadata-only privacy mode
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:privacy-mode --receipt evidence/privacy-mode-proof.json
 
       - name: Prove transactional join and workspace isolation
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:join-isolation
 
       - name: Prove immutable outcome timeline and bounded recovery
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:outcome-timeline
 
       - name: Prove source-only integrated learning and fleet flow
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: |
           pnpm proof:system-e2e:path-normalization
           pnpm proof:system-e2e -- --receipt evidence/system-e2e-proof.json --expected-source-commit "${{ github.event.pull_request.head.sha || github.sha }}"
@@ -140,15 +219,19 @@ jobs:
           pnpm proof:system-e2e:tamper -- --receipt evidence/system-e2e-proof-repeat.json --expected-source-commit "${{ github.event.pull_request.head.sha || github.sha }}"
 
       - name: Run strict isolated resource proof
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: node ./node_modules/tsx/dist/cli.mjs ./scripts/resource-proof/index.ts --require-integrated --receipt evidence/resource-proof.json
 
       - name: Prove finalized privacy failures fail closed
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: node ./node_modules/tsx/dist/cli.mjs ./scripts/resource-proof/finalization-proof.ts
 
       - name: Prove the published privacy spec derives from the source lists (#13)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:privacy-spec
 
       - name: Diff-check the published privacy spec freshness (#13)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm docs:privacy --check
 
       - name: Upload evidence artifact

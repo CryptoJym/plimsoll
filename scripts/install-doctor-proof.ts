@@ -41,6 +41,7 @@ type Check = {
 const root = path.resolve(import.meta.dirname, "..");
 const cli = path.join(root, "packages", "collector-cli", "src", "cli.ts");
 const tsx = path.join(root, "node_modules", "tsx", "dist", "cli.mjs");
+const tsxLoader = path.join(root, "node_modules", "tsx", "dist", "loader.mjs");
 const installScript = path.join(root, "install.sh");
 const proofWorkflow = path.join(root, ".github", "workflows", "proof.yml");
 const partialCodexFixture = path.join(root, "scripts", "fixtures", "codex-partial-legacy.toml");
@@ -57,7 +58,11 @@ function command(
   options: { cwd: string; env: NodeJS.ProcessEnv },
 ): Promise<CommandResult> {
   return new Promise((resolve, reject) => {
-    const child = spawn(executable, args, {
+    // The source CLI needs a loader, not a wrapper IPC socket whose path can
+    // exceed macOS limits under a deeply nested disposable TMPDIR.
+    const invocation = executable === process.execPath && args[0] === tsx
+      ? ["--import", tsxLoader, ...args.slice(1)] : args;
+    const child = spawn(executable, invocation, {
       cwd: options.cwd,
       env: options.env,
       stdio: ["ignore", "pipe", "pipe"],

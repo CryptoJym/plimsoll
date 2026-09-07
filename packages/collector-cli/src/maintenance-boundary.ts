@@ -225,10 +225,10 @@ function asyncProcessFingerprint(
           ? stdout.trim().replace(/\s+/g, " ")
           : "";
         const parentMatch = /^(\d+)\s+/.exec(processRecord);
-        const nonceBinding = `__maintenance_worker ${binding.spawnNonce}`;
+        const nonceBinding = new RegExp(`(?:^|\\s)__maintenance_worker ${binding.spawnNonce}(?:\\s|$)`);
         if (
           !parentMatch || Number(parentMatch[1]) !== binding.parentPid ||
-          !processRecord.includes(nonceBinding)
+          !nonceBinding.test(processRecord)
         ) return resolve(null);
         resolve(
           "sha256:" + createHash("sha256")
@@ -783,7 +783,7 @@ export class MaintenanceProcessBoundary {
       if (this.readyPromise) await this.failReady("maintenance_ready_identity_mismatch");
       return;
     }
-    const observed = await this.parentFingerprintPromise;
+    const observed = await this.expectedFingerprint(child, receipt.spawnNonce);
     if (this.child !== child || this.readyPromise !== readyToken || receipt.spawnNonce !== this.spawnNonce) {
       this.lateFrames += 1;
       return;
@@ -967,7 +967,7 @@ export class MaintenanceProcessBoundary {
       const spawnNonce = this.spawnNonce;
       // Await the parent observation even when the worker never became ready;
       // malformed/blocked startup must still be fingerprint-safe and killable.
-      const expected = this.childFingerprint ?? await this.parentFingerprintPromise;
+      const expected = spawnNonce ? await this.expectedFingerprint(child, spawnNonce) : null;
       const signalIfSame = async (signal: NodeJS.Signals) => {
         const observed = pid && spawnNonce ? await this.fingerprint(pid, spawnNonce) : null;
         if (!expected || !observed || observed !== expected || this.child !== child) {
@@ -991,10 +991,9 @@ export class MaintenanceProcessBoundary {
       await signalIfSame("SIGKILL");
       if (await this.waitForClose(this.killGraceMs())) return true;
       const afterKill = pid && spawnNonce ? await this.fingerprint(pid, spawnNonce) : null;
-      if (expected && afterKill === null && this.child === child) {
-        // Nothing answers at the pid any more: the worker is gone even though
-        // its close event has not arrived yet. Detach it as reaped.
-        this.pidMismatches += 1;
+      if (this.childExited(child) && this.child === child) {
+        // ChildProcess exit state is positive evidence for this spawn. A
+        // missing ps result alone may be a timeout and cannot prove exit.
         this.detachGoneChild(child);
         return true;
       }
@@ -1021,7 +1020,6 @@ export class MaintenanceProcessBoundary {
       const child = this.child;
       const pid = child?.pid ?? null;
       const spawnNonce = this.spawnNonce;
-      const expected = this.childFingerprint ?? await this.parentFingerprintPromise;
       const signalsSent: NodeJS.Signals[] = [...this.orphanSignalsSent];
       const attempts = Math.max(1, Math.min(this.options.orphanRecoveryAttempts ?? 2, 5));
       const emit = (attempt: number, outcome: "reaped" | "gone" | "still_alive") => {
@@ -1045,6 +1043,12 @@ export class MaintenanceProcessBoundary {
           emit(attempt, "reaped");
           return true;
         }
+        if (this.childExited(child)) {
+          this.detachGoneChild(child);
+          emit(attempt, "gone");
+          return true;
+        }
+        const expected = spawnNonce ? await this.expectedFingerprint(child, spawnNonce) : null;
         const observed = pid && spawnNonce ? await this.fingerprint(pid, spawnNonce) : null;
         if (!expected) {
           if (attempt < attempts) await this.orphanBackoff(attempt);
@@ -1052,16 +1056,20 @@ export class MaintenanceProcessBoundary {
         }
         if (!observed || observed !== expected) {
           this.pidMismatches += 1;
-          this.detachGoneChild(child);
-          emit(attempt, "gone");
-          return true;
+          // A missing or changed observation is not an exit receipt. Retain
+          // the tracked child and its close listener; never start a second one.
+          if (attempt < attempts) await this.orphanBackoff(attempt);
+          continue;
         }
         for (const signal of ["SIGTERM", "SIGKILL"] as const) {
           const current = pid && spawnNonce ? await this.fingerprint(pid, spawnNonce) : null;
           if (!current || current !== expected || this.child !== child) {
-            this.detachGoneChild(child);
-            emit(attempt, "gone");
-            return true;
+            if (this.child !== child || this.childExited(child)) {
+              this.detachGoneChild(child);
+              emit(attempt, "gone");
+              return true;
+            }
+            break;
           }
           try {
             if (child.kill(signal)) {
@@ -1167,6 +1175,28 @@ export class MaintenanceProcessBoundary {
       parentPid: process.pid,
       spawnNonce,
     });
+  }
+
+  private childExited(child: MaintenanceBoundaryChild) {
+    const state = child as MaintenanceBoundaryChild & { exitCode?: number | null; signalCode?: string | null };
+    return typeof state.exitCode === "number" || typeof state.signalCode === "string";
+  }
+
+  private async expectedFingerprint(child: MaintenanceBoundaryChild, spawnNonce: string) {
+    const prior = this.childFingerprint ?? await this.parentFingerprintPromise;
+    if (prior) return prior;
+    if (this.child !== child || this.spawnNonce !== spawnNonce || !child.pid) return null;
+    // A transient first ps failure is not a permanent identity. Every later
+    // observation still verifies this parent's PID and the exact fresh spawn
+    // nonce before it can establish the fingerprint. Known identities never
+    // change, so PID reuse continues to fail closed.
+    const observed = await this.fingerprint(child.pid, spawnNonce);
+    if (this.child !== child || this.spawnNonce !== spawnNonce) return null;
+    if (observed) {
+      this.childFingerprint = observed;
+      this.parentFingerprintPromise = Promise.resolve(observed);
+    }
+    return observed;
   }
 
   private recordOutcome(state: "completed" | "PARTIAL_OK" | "timed_out" | "failed", atMs: number) {

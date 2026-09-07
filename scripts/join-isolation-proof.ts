@@ -22,10 +22,26 @@ import {
   JOIN_HANDSHAKE_DIRECTORY_PREFIX,
   finalizeActivatedPendingJoin,
   pendingJoinPath,
-  performJoin,
-  resumePendingJoin,
+  performJoin as rawPerformJoin,
+  resumePendingJoin as rawResumePendingJoin,
 } from "../packages/collector-cli/src/join";
-import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
+import { uploadBufferedEvents as rawUpload } from "../packages/collector-cli/src/upload";
+
+import { acknowledgingFetch } from "./fixtures/delivery-ack-fixture";
+import { deliveryAcknowledgement, deliveryExpectation } from "../packages/collector-cli/src/delivery-ack";
+const performJoin: typeof rawPerformJoin = options => rawPerformJoin({ ...options,
+  ...(options.fetchImpl ? { fetchImpl: acknowledgingFetch(options.fetchImpl) } : {}),
+});
+const resumePendingJoin: typeof rawResumePendingJoin = options => rawResumePendingJoin({ ...options,
+  ...(options?.fetchImpl ? { fetchImpl: acknowledgingFetch(options.fetchImpl) } : {}),
+});
+const uploadBufferedEvents: typeof rawUpload = (config, buffer, options = {}) => rawUpload(config, buffer, { ...options,
+  ...(options.fetchImpl ? { fetchImpl: acknowledgingFetch(options.fetchImpl) } : {}),
+});
+function successAck(body: string) {
+  const expected = deliveryExpectation(body, JSON.parse(body).installKey);
+  return { ok: true, accepted: expected.itemIds.length, ack: deliveryAcknowledgement(expected, expected.itemIds) };
+}
 
 type Check = { name: string; detail: Record<string, unknown> };
 type RequestRecord = { init?: RequestInit; url: string; body: Record<string, unknown> };
@@ -639,7 +655,7 @@ try {
           return responseJson({ ok: true, accepted: 0 }, 200);
         }) as typeof fetch,
       }),
-    /did not explicitly acknowledge exactly/i,
+    /remote_contract/i,
   );
   check(
     "two_xx_without_probe_acknowledgement_does_not_activate",
@@ -660,12 +676,13 @@ try {
         target: TOKEN,
         baseUrl: "http://workspace-b.example",
         homeDir: transportHome,
+        reassign: true,
         fetchImpl: (async () => {
           insecureCalls += 1;
           return responseJson({});
         }) as typeof fetch,
       }),
-    /must use HTTPS/i,
+    /insecure_url/i,
   );
   check(
     "external_http_rejected_before_network",
@@ -682,6 +699,7 @@ try {
         target: TOKEN,
         baseUrl: "https://workspace-b.example",
         homeDir: transportHome,
+        reassign: true,
         fetchImpl: (async (_input, init) => {
           redirectMode = init?.redirect;
           return new Response(null, {
@@ -690,7 +708,7 @@ try {
           });
         }) as typeof fetch,
       }),
-    /redirects are rejected/i,
+    /redirect_rejected/i,
   );
   check(
     "join_redirect_rejected_without_config_change",
@@ -705,6 +723,7 @@ try {
         target: TOKEN,
         baseUrl: "https://workspace-b.example",
         homeDir: transportHome,
+        reassign: true,
         fetchImpl: (async () => {
           crossOriginCalls += 1;
           return responseJson({
@@ -732,6 +751,7 @@ try {
         target: TOKEN,
         baseUrl: "https://workspace-b.example",
         homeDir: transportHome,
+        reassign: true,
         temporaryRoot: uploadRedirectTemp,
         fetchImpl: (async (input, init) => {
           uploadRedirectCalls += 1;
@@ -770,12 +790,6 @@ try {
   // first-run ensureCollectorHome() would.
   fs.mkdirSync(dryRunHome, { mode: 0o700 });
   fs.mkdirSync(dryRunTemp);
-  // tsx initializes this empty launcher cache directory before application
-  // code runs even with transform caching disabled. Preseed it so the before
-  // snapshot isolates Plimsoll's filesystem behavior.
-  if (typeof process.getuid === "function") {
-    fs.mkdirSync(path.join(dryRunTemp, `tsx-${process.getuid()}`));
-  }
   const dryRunConfigPath = path.join(dryRunHome, "collector.config.json");
   const dryRunLedgerPath = path.join(dryRunHome, "work-ledger.sqlite");
   const dryRunStaleDirectory = path.join(
@@ -805,7 +819,8 @@ try {
     assert.ok(address && typeof address !== "string");
     const dryRun = await runChild(
       [
-        "node_modules/tsx/dist/cli.mjs",
+        "--import",
+        path.resolve("node_modules/tsx/dist/loader.mjs"),
         "packages/collector-cli/src/cli.ts",
         "join",
         "--dry-run",
@@ -823,7 +838,8 @@ try {
     );
     const unsupportedJoin = await runChild(
       [
-        "node_modules/tsx/dist/cli.mjs",
+        "--import",
+        path.resolve("node_modules/tsx/dist/loader.mjs"),
         "packages/collector-cli/src/cli.ts",
         "join",
         TOKEN,
@@ -920,7 +936,7 @@ try {
         cliResumeRequests += 1;
         resumedProbeId = events[0]?.event?.id ?? "";
         response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify({ ok: true, accepted: 1 }));
+        response.end(JSON.stringify(successAck(body)));
         return;
       }
       heldHandshake = true;
@@ -935,10 +951,12 @@ try {
     const child = spawn(
       process.execPath,
       [
-        "node_modules/tsx/dist/cli.mjs",
+        "--import",
+        path.resolve("node_modules/tsx/dist/loader.mjs"),
         "packages/collector-cli/src/cli.ts",
         "join",
         "--token-stdin",
+        "--reassign",
         "--url",
         `http://127.0.0.1:${address.port}`,
       ],
@@ -984,7 +1002,8 @@ try {
     resumeMode = true;
     const cliResume = await runChild(
       [
-        "node_modules/tsx/dist/cli.mjs",
+        "--import",
+        path.resolve("node_modules/tsx/dist/loader.mjs"),
         "packages/collector-cli/src/cli.ts",
         "join",
         "--resume",
@@ -1046,7 +1065,7 @@ try {
         return;
       }
       response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ ok: true, accepted: 1 }));
+      response.end(JSON.stringify(successAck(body)));
     });
   });
   await new Promise<void>((resolve) => cliServer.listen(0, "127.0.0.1", resolve));
@@ -1055,7 +1074,8 @@ try {
     assert.ok(address && typeof address !== "string");
     const child = await runChild(
       [
-        "node_modules/tsx/dist/cli.mjs",
+        "--import",
+        path.resolve("node_modules/tsx/dist/loader.mjs"),
         "packages/collector-cli/src/cli.ts",
         "join",
         "--token-stdin",

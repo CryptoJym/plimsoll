@@ -1,3 +1,5 @@
+import { createProofCompletion } from "./lib/proof-completion";
+const completion = createProofCompletion("startup-wal-self-heal", 3);
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -41,6 +43,7 @@ try {
     timeoutMs: 50,
   });
 
+  completion.check("checkpoint_above_threshold");
   fs.writeFileSync(walPath, Buffer.alloc(64));
   const below = await runStartupWalSelfHeal({
     ledgerPath,
@@ -56,6 +59,7 @@ try {
   assert.equal(DEFAULT_STARTUP_WAL_CHECKPOINT_BYTES, 1024 * 1024 * 1024);
 
   fs.writeFileSync(walPath, Buffer.alloc(65));
+  completion.check("skip_at_threshold");
   const timedOut = await runStartupWalSelfHeal({
     ledgerPath,
     thresholdBytes: 64,
@@ -64,6 +68,7 @@ try {
   });
   assert.equal(timedOut.outcome, "timed_out");
 
+  completion.check("pending_checkpoint_times_out");
   console.log(JSON.stringify({
     proof: "startup_wal_self_heal",
     checks: 3,
@@ -76,6 +81,7 @@ try {
 } finally {
   fs.rmSync(tempDir, { recursive: true, force: true });
 }
+completion.complete();
 }
 
 main().catch((error) => {

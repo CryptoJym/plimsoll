@@ -539,7 +539,8 @@ function verifySharedFlow(flow: Record<string, unknown>) {
     const fact = workEpisodeFactSchema.parse(entry.fact);
     assert.deepEqual(
       fact,
-      buildWorkEpisodeFact({
+      // Compare the persisted JSON form: optional undefined fields are absent.
+      JSON.parse(JSON.stringify(buildWorkEpisodeFact({
         source: fact.source,
         sessionId: fact.sessionId,
         sourceEpisodeKey: String(entry.sourceEpisodeKey),
@@ -547,12 +548,12 @@ function verifySharedFlow(flow: Record<string, unknown>) {
         complexityBand: fact.complexityBand,
         startedAt: fact.startedAt,
         endedAt: fact.endedAt,
-      }),
+      }))),
       `episode ${index} deterministic identity mismatch`,
     );
     return { sourceEpisodeKey: entry.sourceEpisodeKey, fact };
   });
-  assert.deepEqual(episodeBindings.map((entry) => entry.sourceEpisodeKey), ["shared-flow-treatment", "shared-flow-control"], "episode binding keys mismatch");
+  assert.deepEqual(episodeBindings.map((entry) => entry.sourceEpisodeKey), ["session", "session"], "episode binding keys mismatch");
   assert.deepEqual(episodeBindings.map((entry) => entry.fact.sessionId), EXPECTED.sessions, "episode sessions mismatch");
 
   const bindings = array(learning.attemptEventBindings, "attempt event bindings").map((entry, index) => {

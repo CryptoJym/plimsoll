@@ -663,7 +663,8 @@ async function main() {
     const run = spawnSync(
       process.execPath,
       [
-        path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs"),
+        "--import",
+        path.join(repoRoot, "node_modules", "tsx", "dist", "loader.mjs"),
         path.join(repoRoot, "scripts", "resource-proof", "index.ts"),
         "--require-integrated",
         "--receipt",

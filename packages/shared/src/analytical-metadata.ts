@@ -1,4 +1,7 @@
-import { isForbiddenRawContentFieldName } from "./schemas";
+import {
+  isForbiddenRawContentFieldName,
+  type EventCostKind,
+} from "./schemas";
 
 const SESSION_ID_KEYS = [
   "sessionId",
@@ -48,14 +51,19 @@ const CACHE_CREATION_TOKEN_KEYS = [
   "gen_ai.usage.cache_creation.input_tokens",
 ] as const;
 
-const COST_KEYS = [
+const REPORTED_COST_KEYS = [
   "costUsd",
   "cost_usd",
-  "estimated_cost_usd",
   "gen_ai.usage.cost_usd",
+] as const;
+
+const ESTIMATED_COST_KEYS = [
+  "estimated_cost_usd",
   "plimsoll.estimated_cost_usd",
   "cfo_one.estimated_cost_usd",
 ] as const;
+
+const COST_KEYS = [...REPORTED_COST_KEYS, ...ESTIMATED_COST_KEYS] as const;
 
 const ACTOR_ID_KEYS = [
   "actorId",
@@ -72,12 +80,100 @@ export const usageFieldKeys = {
   actorId: ACTOR_ID_KEYS,
   cacheReadTokens: CACHE_READ_TOKEN_KEYS,
   cacheCreationTokens: CACHE_CREATION_TOKEN_KEYS,
-  costUsd: COST_KEYS,
+  /** Backward-compatible name for the reported-cost aliases only. */
+  costUsd: REPORTED_COST_KEYS,
+  reportedCostUsd: REPORTED_COST_KEYS,
+  estimatedCostUsd: ESTIMATED_COST_KEYS,
   inputTokens: INPUT_TOKEN_KEYS,
   model: MODEL_KEYS,
   outputTokens: OUTPUT_TOKEN_KEYS,
   sessionId: SESSION_ID_KEYS,
 } as const;
+
+export type AdmittedCost = {
+  value: number | undefined;
+  kind: EventCostKind | undefined;
+};
+
+type CostObservation = {
+  key: string;
+  value: number;
+  kind: Exclude<EventCostKind, "unknown">;
+};
+
+function numericCostValue(value: unknown): number | undefined {
+  if (typeof value === "number") {
+    return Number.isFinite(value) && value >= 0 ? value : undefined;
+  }
+  if (typeof value === "string" && value.trim()) {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
+  }
+  return undefined;
+}
+
+function sameCostValue(left: number, right: number) {
+  return left === right || (Object.is(left, -0) && Object.is(right, 0)) ||
+    (Object.is(left, 0) && Object.is(right, -0));
+}
+
+/**
+ * Read one admitted cost amount and its provenance from sanitized metadata.
+ *
+ * All aliases for one kind must agree. A mixed kind, conflicting value, or
+ * malformed admitted marker keeps the chosen amount, but only as `unknown`;
+ * it is never assigned a reported kind. `actualChosenAmount` is for callers
+ * that already have a typed amount (for example a legacy raw event); markers
+ * must prove that amount or the returned kind is `unknown`.
+ */
+export function admittedCost(
+  records: readonly Record<string, unknown>[],
+  actualChosenAmount?: number,
+): AdmittedCost {
+  const observations: CostObservation[] = [];
+  let malformedMarker = false;
+  const allKeys = new Set<string>(COST_KEYS);
+  for (const record of records) {
+    for (const key of allKeys) {
+      if (!(key in record)) continue;
+      const value = numericCostValue(record[key]);
+      if (value === undefined) {
+        malformedMarker = true;
+        continue;
+      }
+      observations.push({
+        key,
+        value,
+        kind: (REPORTED_COST_KEYS as readonly string[]).includes(key)
+          ? "reported"
+          : "estimated",
+      });
+    }
+  }
+
+  if (observations.length === 0) {
+    return actualChosenAmount === undefined
+      ? { value: undefined, kind: malformedMarker ? "unknown" : undefined }
+      : { value: actualChosenAmount, kind: "unknown" };
+  }
+
+  const kinds = new Set(observations.map((observation) => observation.kind));
+  const firstValue = observations[0]!.value;
+  const valuesAgree = observations.every((observation) => sameCostValue(observation.value, firstValue));
+  const markerProvesAmount = actualChosenAmount === undefined ||
+    observations.every((observation) => sameCostValue(observation.value, actualChosenAmount));
+  if (malformedMarker || kinds.size !== 1 || !valuesAgree || !markerProvesAmount) {
+    return {
+      value: actualChosenAmount ?? firstValue,
+      kind: "unknown",
+    };
+  }
+
+  return {
+    value: actualChosenAmount ?? firstValue,
+    kind: observations[0]!.kind,
+  };
+}
 
 export type AnalyticalScalarKind =
   | "token_count"
@@ -207,6 +303,27 @@ const RECORD_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
   ["time", "timestamp"],
   ["actionClass", "classification"],
   ["decision", "classification"],
+  ["workItemId", "identifier"],
+  ["workEvidenceRef", "identifier"],
+  ["workAttributionState", "classification"],
+  ["dispatchProjectKey", "linkage"],
+  ["companyRef", "identifier"],
+  ["attemptId", "identifier"],
+  ["parentAttemptId", "identifier"],
+  ["acceptedOutcomeId", "identifier"],
+  ["sourceEventId", "identifier"],
+  ["sourceVersion", "version"],
+  ["captureRootId", "identifier"],
+  ["captureProfileId", "identifier"],
+  ["installationEpochId", "identifier"],
+  ["logicalSourceEventId", "identifier"],
+  ["sourceIdentityEvidenceRef", "identifier"],
+  ["captureAccountHash", "linkage"],
+  ["accountEvidenceRef", "identifier"],
+  ["costKind", "classification"],
+  ["rateVersion", "version"],
+  ["rateObservedAt", "timestamp"],
+  ["rateEffectiveAt", "timestamp"],
   ["eventType", "classification"],
   ["event_type", "classification"],
   ["hook_event_name", "classification"],

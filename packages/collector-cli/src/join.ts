@@ -26,7 +26,7 @@ import {
   setDeviceStatus,
   type LocalDeviceIdentity,
 } from "./device-identity";
-import { assertNoRedirect, validatedTransportUrl } from "./http-transport";
+import { assertNoRedirect, postJson, validatedTransportUrl } from "./http-transport";
 
 /**
  * Fleet join is transactional: redeem into memory, prove only a fresh
@@ -80,6 +80,8 @@ const pendingJoinSchema = z.object({
   joinOrigin: z.string().url(),
   appVersion: z.string().trim().min(1),
   probeSourceId: z.string().trim().min(1),
+  /** Persisted activation identity, distinct for each native join; resumes reuse it. */
+  installationEpochId: z.string().uuid().optional(),
   handshakeEventId: z.string().trim().min(1).optional(),
   stagedConfig: collectorConfigSchema,
 });
@@ -120,6 +122,8 @@ export type JoinResult =
       enrollment: {
         mode: "future_only";
         quarantinedHistoryRows: number;
+        installationEpochId: string | null;
+        admissionCutoffAt: string | null;
       };
       handshake: {
         uploadedEvents: 1;
@@ -338,6 +342,7 @@ function ledgerMatchesPending(homeDir: string, pending: PendingJoin) {
   try {
     const binding = buffer.workspaceBinding();
     return binding?.currentWorkspaceId === pending.stagedConfig.tenantId &&
+      (!pending.installationEpochId || binding.currentInstallationEpochId === pending.installationEpochId) &&
       (!pending.stagedConfig.deviceId || binding.currentDeviceId === pending.stagedConfig.deviceId);
   } finally {
     buffer.close();
@@ -348,7 +353,8 @@ function ledgerMatchesPending(homeDir: string, pending: PendingJoin) {
 function readEnrollmentStatus(homeDir: string) {
   const ledgerPath = collectorBufferPath(homeDir);
   if (!fs.existsSync(ledgerPath)) {
-    return { mode: "future_only" as const, quarantinedHistoryRows: 0 };
+    return { mode: "future_only" as const, quarantinedHistoryRows: 0,
+      currentInstallationEpochId: null, currentInstallationEpochStartedAt: null };
   }
   const buffer = new LocalEventBuffer(ledgerPath);
   try {
@@ -405,7 +411,9 @@ function completedJoinResult(homeDir: string, pending: PendingJoin): JoinResult 
       boundLegacyRows: 0,
       quarantinedHistoryRows: enrollment.quarantinedHistoryRows,
     },
-    enrollment: { mode: "future_only", quarantinedHistoryRows: enrollment.quarantinedHistoryRows },
+    enrollment: { mode: "future_only", quarantinedHistoryRows: enrollment.quarantinedHistoryRows,
+      installationEpochId: enrollment.currentInstallationEpochId,
+      admissionCutoffAt: enrollment.currentInstallationEpochStartedAt },
     handshake: {
       uploadedEvents: 1,
       selfTestEventId: pending.handshakeEventId ?? pending.probeSourceId,
@@ -603,6 +611,7 @@ async function activatePendingJoin(
         activeBuffer.useWorkspace(
           pending.stagedConfig.tenantId,
           pending.stagedConfig.deviceId,
+          pending.installationEpochId,
         );
         workspaceBoundary = {
           fromWorkspaceId: pending.fromWorkspaceId,
@@ -616,6 +625,7 @@ async function activatePendingJoin(
             pending.fromWorkspaceId,
             pending.stagedConfig.tenantId,
             pending.stagedConfig.deviceId,
+            pending.installationEpochId,
           ),
           quarantinedHistoryRows: activeBuffer.enrollmentStatus().quarantinedHistoryRows,
         };
@@ -642,6 +652,7 @@ async function activatePendingJoin(
     }
     setDeviceStatus(options.homeDir, "active");
     activateConfigAtomically(pending.stagedConfig, activeConfigPath);
+    const enrollment = readEnrollmentStatus(options.homeDir);
     activeConfigActivated = true;
     options.afterConfigActivation?.();
     fs.rmSync(options.pendingFile, { force: true });
@@ -659,6 +670,8 @@ async function activatePendingJoin(
       enrollment: {
         mode: "future_only",
         quarantinedHistoryRows: workspaceBoundary.quarantinedHistoryRows,
+        installationEpochId: enrollment.currentInstallationEpochId,
+        admissionCutoffAt: enrollment.currentInstallationEpochStartedAt,
       },
       handshake: {
         uploadedEvents: 1,
@@ -775,9 +788,8 @@ export async function performJoin(options: {
     if (existingIdentity?.status === "revoked") {
       throw new Error("Join cannot activate a revoked device identity; reinstall to create a new device.");
     }
-    const response = await fetchImpl(joinUrl, {
-      method: "POST",
-      redirect: "manual",
+    const response = await postJson({
+      url: joinUrl.href, fetchImpl,
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         token,
@@ -785,13 +797,12 @@ export async function performJoin(options: {
         appVersion,
       }),
     });
-    assertNoRedirect(response, "Workspace join", joinUrl.origin);
-    const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+    const body = (response.body ?? {}) as Record<string, unknown>;
 
     if (!response.ok) {
       // Never include an untrusted response body: it may contain token or grant
       // material. Refusals leave the active config byte-for-byte untouched.
-      const reason = typeof body.reason === "string" ? body.reason : "unknown_error";
+      const reason = typeof body.reason === "string" && Object.hasOwn(JOIN_REFUSAL_MESSAGES, body.reason) ? body.reason : "unknown_error";
       return {
         joined: false,
         reason,
@@ -803,7 +814,9 @@ export async function performJoin(options: {
       };
     }
 
-    const grant = joinGrantSchema.parse(body);
+    const parsedGrant = joinGrantSchema.safeParse(body);
+    if (!parsedGrant.success) throw new Error("Workspace join failed: invalid_response");
+    const grant = parsedGrant.data;
     if (
       isManagedOrUploadEnabled(existingConfig) &&
       existingConfig.tenantId !== grant.tenantId &&
@@ -833,6 +846,7 @@ export async function performJoin(options: {
       joinOrigin: joinUrl.origin,
       appVersion,
       probeSourceId: crypto.randomUUID(),
+      installationEpochId: crypto.randomUUID(),
       stagedConfig,
     });
     writePendingJoin(pending, pendingFile);

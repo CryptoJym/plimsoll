@@ -497,11 +497,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     assertNoSymlink(metadataPath, snapshot);
     const metadata = readJson<SnapshotMetadata>(metadataPath);
     if (!isSnapshotMetadata(metadata)) throw new Error("rollback snapshot is missing");
-    const entries = [
-      ["config", this.paths.collectorConfig],
-      ["service", this.paths.serviceManifest],
-    ] as const;
-    for (const [label, destination] of entries) {
+    const restoreFile = (label: "config" | "service", destination: string) => {
       const source = path.join(snapshot, label);
       assertNoSymlink(source, snapshot);
       assertNoSymlink(destination, this.paths.ownershipRoot);
@@ -512,7 +508,8 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       } else {
         fs.rmSync(destination, { force: true });
       }
-    }
+    };
+    restoreFile("config", this.paths.collectorConfig);
     const databaseSnapshot = path.join(snapshot, "database");
     assertNoSymlink(databaseSnapshot, snapshot);
     assertNoSymlink(this.paths.database, this.paths.ownershipRoot);
@@ -552,6 +549,10 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       executablePath: metadata.currentExecutable,
       version: metadata.currentVersion,
     });
+    // Service restoration may regenerate or remove a manifest. The snapshot
+    // is authoritative, including a legacy source install with no version
+    // pointer and a managed install's prior Node path and environment.
+    restoreFile("service", this.paths.serviceManifest);
   }
 
   async persistReceipt(receipt: LifecycleReceipt) {

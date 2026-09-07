@@ -1,3 +1,6 @@
+import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
+import { createProofCompletion } from "./lib/proof-completion";
+const completion = process.env.PLIMSOLL_PROOF_CLOCK_CASE === "1" ? null : createProofCompletion("signal-fidelity", 107);
 /**
  * Signal-fidelity proof for the v2 collector capture path.
  *
@@ -151,6 +154,7 @@ type Check = { name: string; passed: boolean; detail: string };
 const checks: Check[] = [];
 function check(name: string, passed: boolean, detail: string | undefined) {
   checks.push({ name, passed, detail: detail ?? "(no detail)" });
+  completion?.check(name, passed);
 }
 
 function resolveDeferredRepoContexts(buffer: LocalEventBuffer) {
@@ -1951,7 +1955,7 @@ async function main() {
       uploadBodies.push(body);
       received.push((JSON.parse(body).events as unknown[]).length);
       response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ accepted: true }));
+      response.end(JSON.stringify(acceptedFixtureDelivery(body, String(request.headers["x-plimsoll-install-key"]))));
     });
   });
   await new Promise<void>((resolve) => stub.listen(0, "127.0.0.1", () => resolve()));
@@ -2091,7 +2095,7 @@ async function main() {
         handshakeHeaders.push(request.headers);
         handshakeBodies.push(body);
         response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify({ ok: true, accepted: (JSON.parse(body).events as unknown[]).length }));
+        response.end(JSON.stringify(acceptedFixtureDelivery(body, JOIN_INSTALL_KEY)));
       });
     });
     await new Promise<void>((resolve) => joinServer.listen(0, "127.0.0.1", () => resolve()));
@@ -2498,7 +2502,7 @@ async function main() {
         response.writeHead(200, { "content-type": "application/json" });
         // Mirrors production: the response echoes the install key — the CLI
         // must never print it.
-        response.end(JSON.stringify({ ok: true, accepted: batch.events.length, inserted, installKey: HISTORY_INSTALL_KEY }));
+        response.end(JSON.stringify({ ...acceptedFixtureDelivery(body, HISTORY_INSTALL_KEY), inserted, installKey: HISTORY_INSTALL_KEY }));
       });
     });
     await new Promise<void>((resolve) => historyServer.listen(0, "127.0.0.1", () => resolve()));
@@ -2646,7 +2650,7 @@ async function main() {
         resumeStore.set(entry.event.id, entry.event);
       }
       void input;
-      return new Response(JSON.stringify({ ok: true, accepted: batch.events.length, inserted }), {
+      return new Response(JSON.stringify({ ...acceptedFixtureDelivery(body, HISTORY_INSTALL_KEY), inserted }), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -2743,7 +2747,8 @@ async function main() {
       !failClosed.ok &&
         failClosed.acceptedEvents === 0 &&
         /401/.test(failClosed.reason ?? "") &&
-        /signature|credentials/i.test(failClosed.reason ?? "") &&
+        !String(failClosed.reason).includes(HISTORY_SECRET) &&
+        !String(failClosed.reason).includes(badSecretConfig.uploadSigningSecret!) &&
         !failClosedLogs.some((line) => line.includes("workspace_backfill_retry")),
       JSON.stringify({ reason: (failClosed.reason ?? "").slice(0, 140), accepted: failClosed.acceptedEvents }),
     );
@@ -2843,7 +2848,7 @@ async function main() {
           }
         }
         response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify({ ok: true, accepted: 0, matched, updated, kind: batch.kind }));
+        response.end(JSON.stringify({ ...acceptedFixtureDelivery(body, HISTORY_INSTALL_KEY), matched, updated, kind: batch.kind }));
       });
     });
     await new Promise<void>((resolve) => repairServer.listen(0, "127.0.0.1", () => resolve()));
@@ -3157,7 +3162,7 @@ async function main() {
     );
 
     // Fixture ledger: three healthy sessions (codex v7 with two repos —
-    // dominant pair must win; claude v4; junk-id), two poisoned sessions
+    // mixed attribution must stay unknown; claude v4; junk-id), two poisoned sessions
     // (unknown source, timezone-less timestamp) that must SKIP with reasons,
     // and sessionless events that must not invent sessions.
     const sessionHome = path.join(tempDir, "session-home");
@@ -3198,7 +3203,7 @@ async function main() {
       );
     const junkSessionRaw = "session-junk-0042";
     let seedIndex = 0;
-    // v7 codex session: 10 events on repo A, 20 on repo B (B must dominate),
+    // v7 codex session: 10 events on repo A, 20 on repo B (no single owner),
     // 5 priced.
     for (let i = 0; i < 30; i += 1) {
       seedSessionEvent({
@@ -3250,7 +3255,7 @@ async function main() {
       .run();
 
     // 17b. Snapshots reconcile to the ledger exactly; --until scoping is the
-    // idempotency horizon; dominant (repo, branch) pair wins attribution.
+    // idempotency horizon; mixed repo/branch sessions retain unknown attribution.
     const untilT1 = new Date(Date.now() + 1000).toISOString();
     const snapshotsT1 = collectSessionSnapshots(sessionSeed.database, { until: untilT1 });
     const v7Snap = snapshotsT1.find((row) => row.sessionId === v7Session);
@@ -3266,8 +3271,8 @@ async function main() {
         v7Snap.cacheCreationTokens === 210 &&
         v7Snap.pricedEvents === 5 &&
         Math.abs(v7Snap.costUsd - 0.1) < 1e-9 &&
-        v7Snap.repoHash === SESSION_REPO_B &&
-        v7Snap.branchHash === SESSION_BRANCH_B &&
+        v7Snap.repoHash === null &&
+        v7Snap.branchHash === null &&
         v7Snap.startedAt === "2026-05-01T00:00:00.000Z" &&
         v7Snap.endedAt === "2026-05-01T00:00:29.000Z" &&
         v7Snap.accountHash === "sha256:sessionproofaccount0000000000000000000001" &&
@@ -3278,7 +3283,7 @@ async function main() {
         !snapshotsT1.some((row) => row.sessionId === null),
       JSON.stringify({
         sessions: snapshotsT1.map((row) => `${row.sessionId}:${row.events}`),
-        v7Dominant: `${v7Snap?.repoHash}@${v7Snap?.branchHash}`,
+        mixedSessionAttribution: `${v7Snap?.repoHash}@${v7Snap?.branchHash}`,
       }),
     );
 
@@ -3303,8 +3308,9 @@ async function main() {
       okRows.length === 3 &&
         skipReasons === "schema_invalid,source_invalid" &&
         wireBatchParses &&
-        v7Wire?.row.session.projectKey === SESSION_REPO_B &&
-        v7Wire.row.session.metadata.branchHash === SESSION_BRANCH_B &&
+        v7Wire !== undefined &&
+        v7Wire.row.session.projectKey === undefined &&
+        v7Wire.row.session.metadata.branchHash === undefined &&
         v7Wire.row.session.metadata.externalActorId ===
           "sha256:sessionproofaccount0000000000000000000001" &&
         v7Wire.row.session.metadata.externalSessionId === undefined &&
@@ -3367,8 +3373,7 @@ async function main() {
         response.writeHead(200, { "content-type": "application/json" });
         response.end(
           JSON.stringify({
-            ok: true,
-            accepted: batch.sessions.length,
+            ...acceptedFixtureDelivery(body, SESSION_INSTALL_KEY),
             inserted,
             updated,
             installKey: SESSION_INSTALL_KEY,
@@ -3726,7 +3731,7 @@ async function main() {
       d2PostedBodies.push(body);
       const parsed = JSON.parse(body) as { artifacts: unknown[]; outcomes: unknown[] };
       return json({
-        ok: true,
+        ...acceptedFixtureDelivery(body, D2_INSTALL_KEY),
         acceptedArtifacts: parsed.artifacts.length,
         acceptedOutcomes: parsed.outcomes.length,
         detachedActorRefs: 0,
@@ -4020,6 +4025,7 @@ async function main() {
 
   console.log(JSON.stringify(artifact, null, 2));
   if (!passed) process.exitCode = 1;
+  completion!.complete();
 }
 
 if (process.env.PLIMSOLL_PROOF_CLOCK_CASE === "1") {
@@ -4032,6 +4038,7 @@ if (process.env.PLIMSOLL_PROOF_CLOCK_CASE === "1") {
 } else {
   main().catch((error) => {
     console.error(error);
-    process.exitCode = 1;
+    // Terminal proof failure must not leave its fixture HTTP server holding CI open.
+    process.exit(1);
   });
 }

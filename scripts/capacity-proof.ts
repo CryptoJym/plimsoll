@@ -491,6 +491,21 @@ function prove(name: string, condition: unknown, detail: Record<string, unknown>
   prove("plan_schema_is_versioned", plan.schema === CAPACITY_PLAN_SCHEMA, { schema: plan.schema });
 }
 
+// Adversarial time inputs for the descriptive pace calculator.
+{
+  const now = "2026-09-08T00:00:00.000Z";
+  const observations = [
+    { at: "2026-09-01T00:00:00.000Z", cumulativeTokens: 0 },
+    { at: "2026-09-02T00:00:00.000Z", cumulativeTokens: 10 },
+    { at: "2026-09-03T00:00:00.000Z", cumulativeTokens: 20 },
+  ];
+  const future = estimateCapacityLinearPace({ now: observations[0]!.at, observations });
+  prove("pace_future_observations_rejected", future.state === "UNKNOWN" && future.tokensPerDay === null, future);
+  const stale = estimateCapacityLinearPace({ now, observations, maxAgeMs: 1000 });
+  const duplicate = estimateCapacityLinearPace({ now, observations: [observations[0]!, observations[0]!, observations[2]!] });
+  prove("pace_stale_and_duplicate_observations_not_current", stale.state === "UNKNOWN" && duplicate.state === "UNKNOWN", {stale,duplicate});
+}
+
 // ---------------------------------------------------------------------------
 // 5. STATIC DEPENDENCY PROOF — capacity must not feed decision surfaces.
 //

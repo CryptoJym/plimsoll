@@ -9,7 +9,7 @@ import { normalizeHookPayload } from "../packages/collector-cli/src/normalizer";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { sealOutboundEnvelope } from "../packages/collector-cli/src/outbound-envelope";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
-import { DeliveryUploadError, uploadBufferedEvents } from "../packages/collector-cli/src/upload";
+import { DeliveryUploadError, uploadBufferedEvents as uploadWithProtocol } from "../packages/collector-cli/src/upload";
 import {
   GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
   GENERIC_SUPPRESSION_RECEIPT,
@@ -27,6 +27,13 @@ import {
   suppressionReceiptForAttributeKey,
   type AiInteractionEvent,
 } from "../packages/shared/src/index";
+
+// These positive mock servers implement v1; original outbox assertions remain.
+import { acknowledgingFetch } from "./fixtures/delivery-ack-fixture";
+const uploadBufferedEvents: typeof uploadWithProtocol = (config, buffer, options = {}) =>
+  uploadWithProtocol(config, buffer, { ...options,
+    ...(options.fetchImpl ? { fetchImpl: acknowledgingFetch(options.fetchImpl) } : {}),
+  });
 
 type Check = { name: string; passed: boolean; detail: Record<string, unknown> };
 const checks: Check[] = [];
@@ -1652,7 +1659,8 @@ async function policyResponseAndLegacyReadbackProof() {
   const cliRun = spawnSync(
     process.execPath,
     [
-      path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs"),
+      "--import",
+      path.join(process.cwd(), "node_modules", "tsx", "dist", "loader.mjs"),
       path.join(process.cwd(), "packages", "collector-cli", "src", "cli.ts"),
       "self-test-hook",
       "codex",

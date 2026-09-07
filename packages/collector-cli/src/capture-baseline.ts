@@ -583,6 +583,18 @@ export function captureBaselineStatus(database: Database.Database): CaptureBasel
  * promoted. A crash between begin and complete therefore blocks automatic
  * capture instead of silently treating an incomplete snapshot as exhaustive.
  */
+/** A new native enrollment extends the metadata-only exclusion boundary.
+ * Retain generation receipts, cursors and pending metadata; restart of the
+ * same epoch does not call this. Absent provider baselines stay absent so an
+ * explicitly disabled provider can still establish its empty fence. */
+export function advanceCaptureBaselineEnrollment(database: Database.Database, startedAt: string): void {
+  ensureCaptureBaselineSchema(database);
+  if (!validTimestamp(startedAt)) throw new Error("capture_baseline_invalid_enrollment_cutoff");
+  database.prepare(`update ${STATE_TABLE} set
+    status = case when status = 'complete' then 'in_progress' else status end,
+    started_at = ?, updated_at = ?, completed_at = null`).run(startedAt, startedAt);
+}
+
 export function beginAutomaticCaptureBaseline(
   database: Database.Database,
   source: HistoryCoverageSource,

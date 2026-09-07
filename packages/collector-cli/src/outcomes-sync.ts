@@ -1,4 +1,5 @@
-import crypto from "node:crypto";
+import { postDelivery } from "./delivery-post";
+import { TransportError, type JsonPostResult } from "./http-transport";
 
 import Database from "better-sqlite3";
 
@@ -759,34 +760,18 @@ export async function runOutcomesSync(
   const url = new URL(baseUrl);
   url.pathname = OUTCOMES_PATH;
   const body = JSON.stringify(push.batch);
-  const headers: Record<string, string> = {
-    "content-type": "application/json",
-    "x-plimsoll-install-key": config.installKey,
-  };
-  if (config.ingestKey) headers["x-plimsoll-ingest-key"] = config.ingestKey;
-  if (config.uploadSigningSecret) {
-    const timestamp = new Date().toISOString();
-    const digest = crypto
-      .createHmac("sha256", config.uploadSigningSecret)
-      .update(`${timestamp}.${body}`)
-      .digest("hex");
-    headers["x-plimsoll-upload-timestamp"] = timestamp;
-    headers["x-plimsoll-upload-signature"] = `sha256=${digest}`;
+  let response: JsonPostResult | undefined;
+  let failure: string | undefined;
+  try {
+    response = await postDelivery({ url: url.toString(), body, installKey: config.installKey,
+      ingestKey: config.ingestKey, signingSecret: config.uploadSigningSecret, fetchImpl,
+      timeoutMs: config.delivery.requestTimeoutSeconds * 1_000 });
+  } catch (error) {
+    failure = error instanceof TransportError ? error.code : "invalid_acknowledgement";
   }
-
-  const response = await fetchImpl(url.toString(), { method: "POST", headers, body });
-  const responseBody = (await response.json().catch(() => ({}))) as {
-    error?: unknown;
-    acceptedArtifacts?: unknown;
-    acceptedOutcomes?: unknown;
-    detachedSessionRefs?: unknown;
-    detachedActorRefs?: unknown;
-  };
-  if (!response.ok) {
-    // NB: error bodies can echo request fields — surface only the server's
-    // error code, never the raw body.
-    const errorCode = typeof responseBody.error === "string" ? responseBody.error : "unknown_error";
-    const reason = `Workspace refused the outcomes batch with HTTP ${response.status} (${errorCode}). Nothing was recorded as accepted.`;
+  const responseBody = (response?.body ?? {}) as Record<string, unknown>;
+  if (!response?.ok) {
+    const reason = `Workspace outcomes deferred: ${failure ?? `remote_${response?.status}`}. Nothing was recorded as accepted.`;
     log(JSON.stringify({ status: "outcomes_sync_failed", reason }));
     return {
       ...baseResult,

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import net from "node:net";
 import path from "node:path";
 
+import { readLocalIngestAuth } from "../../packages/collector-cli/src/local-auth";
 import { LocalEventBuffer } from "../../packages/collector-cli/src/buffer";
 import {
   beginAutomaticCaptureBaseline,
@@ -71,6 +72,8 @@ function writeDenseRollout(file: string, sessionId: string, records = DENSE_TOKE
       payload: { model: "gpt-5.5" },
     }),
   ];
+  // An observed zero anchors marginals; an assumed zero is UNKNOWN by contract.
+  lines.push(tokenLine(sessionId, 0));
   for (let index = 1; index <= records; index += 1) {
     lines.push(tokenLine(sessionId, index, padding));
   }
@@ -258,11 +261,14 @@ async function proveSignalCleanup(root: string, repoRoot: string) {
   });
   heldHeader.write("GET /status HTTP/1.1\r\nHost: 127.0.0.1");
 
+  const auth = readLocalIngestAuth(collectorHome);
+  if (!auth) throw new Error("bounded_child_auth_missing");
+  const managementHeaders = { "x-plimsoll-token": auth.managementRead };
   let observedInFileWork = false;
   const pollDeadline = performance.now() + 9_000;
   while (performance.now() < pollDeadline) {
     try {
-      const response = await fetch(`http://127.0.0.1:${port}/status`);
+      const response = await fetch(`http://127.0.0.1:${port}/status`, { headers: managementHeaders });
       const status = (await response.json()) as {
         maintenance?: {
           boundary?: {
@@ -301,7 +307,7 @@ async function proveSignalCleanup(root: string, repoRoot: string) {
   heldHeader.destroy();
   let reachable = true;
   try {
-    await fetch(`http://127.0.0.1:${port}/status`);
+    await fetch(`http://127.0.0.1:${port}/status`, { headers: managementHeaders });
   } catch {
     reachable = false;
   }
@@ -311,6 +317,8 @@ async function proveSignalCleanup(root: string, repoRoot: string) {
     pidCleaned: !fs.existsSync(pidFile),
     listenerClosed: !reachable,
     stderrEmpty: stderr.trim().length === 0,
+    stderrBytes: Buffer.byteLength(stderr),
+    stderrCodes: [...stderr.matchAll(/\b(?:[A-Z][A-Za-z]+Error|[a-z]+(?:_[a-z]+){1,5})\b/g)].map((match) => match[0]).filter((value, index, values) => values.indexOf(value) === index).slice(0, 16),
     stdoutPrivate: !stdout.includes(root) && !stdout.includes(home) && !stdout.includes(collectorHome),
     pidMatchesCollectorProcess,
     nodeMajor: Number(process.versions.node.split(".")[0]),
@@ -640,7 +648,7 @@ export async function runBoundedCaptureContract(
     status: passed ? "pass" : "fail",
     detail: passed
       ? "A 500 MiB pre-install generation and an irrelevant external-directory alias were metadata-only handled without body reads; candidate aliases/nonregular entries failed closed, while a dense 13+ MiB new generation resumed across bounded cadences/restart with responsive HTTP, exact tokens, private state, and graceful in-work SIGTERM cleanup."
-      : "Generation exclusion, discovery entry policy, bounded cadence, exact resume, HTTP latency, privacy, malformed-input, history, or shutdown assertions failed.",
+      : `Generation exclusion, discovery entry policy, bounded cadence, exact resume, HTTP latency, privacy, malformed-input, history, or shutdown assertions failed: ${JSON.stringify({ denseTotals, signalCleanup })}`,
     durationMs: Math.round((performance.now() - started) * 100) / 100,
     counters,
     measurements: {

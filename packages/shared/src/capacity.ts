@@ -421,7 +421,7 @@ export function estimateCapacityLinearPace(input: {
   if (!Number.isInteger(minObservations) || minObservations < 2) {
     throw new Error("capacity minObservations must be an integer >= 2");
   }
-  const observations = [...input.observations].map((observation) => ({
+  let observations = [...input.observations].map((observation) => ({
     at: requireIsoTimestamp("observation.at", observation.at),
     cumulativeTokens: requireNonNegativeNumber(observation.cumulativeTokens)!,
   }));
@@ -448,6 +448,30 @@ export function estimateCapacityLinearPace(input: {
     projectedExhaustion: { state: "UNKNOWN", reason: "pace_unknown", projectedAt: null, limitTokens: null, basis: "" },
   };
 
+  const maxAgeMs = input.maxAgeMs ?? 7 * 24 * 60 * 60 * 1000;
+  if (!Number.isFinite(maxAgeMs) || maxAgeMs <= 0) throw new Error("capacity maxAgeMs must be positive");
+  const unknown = (reason: string): CapacityPaceObservationsResult => ({
+    ...base, observationCount: observations.length, reason,
+    projectedExhaustion: { ...base.projectedExhaustion, reason },
+  });
+  if (observations.some(row => Date.parse(row.at) > nowMs)) return unknown("future_observation");
+  const byTime = new Map<number, typeof observations[number]>();
+  for (const row of observations) {
+    const ms = Date.parse(row.at), prior = byTime.get(ms);
+    if (prior && prior.cumulativeTokens !== row.cumulativeTokens) return unknown("conflicting_same_time_observations");
+    byTime.set(ms, row);
+  }
+  observations = [...byTime].sort(([a], [b]) => a - b).map(([, row]) => row);
+  let resetIndex = 0;
+  for (let index = 1; index < observations.length; index++) {
+    if (observations[index]!.cumulativeTokens < observations[index - 1]!.cumulativeTokens) resetIndex = index;
+  }
+  if (resetIndex > 0) {
+    observations = observations.slice(resetIndex);
+    if (observations.length < minObservations) return unknown("quota_reset_detected_in_window: post_reset_sample_insufficient");
+  }
+  if (observations.length && nowMs - Date.parse(observations[observations.length - 1]!.at) > maxAgeMs) return unknown("pace_observations_stale");
+  base.observationCount = observations.length;
   if (observations.length < minObservations) {
     return {
       ...base,
@@ -470,22 +494,6 @@ export function estimateCapacityLinearPace(input: {
         reason: `elapsed_time_gate_not_met: ${elapsedMs}ms/${minElapsedMs}ms`,
       },
     };
-  }
-
-  // A cumulative counter that decreases anywhere inside the window means a
-  // quota reset happened mid-window; linear interpolation across the reset is
-  // meaningless and would return a bogus "valid" pace. Fail closed to UNKNOWN.
-  for (let index = 1; index < observations.length; index++) {
-    if (observations[index]!.cumulativeTokens < observations[index - 1]!.cumulativeTokens) {
-      const resetReason =
-        `quota_reset_detected_in_window: cumulative_tokens_decreased_between_` +
-        `${observations[index - 1]!.at}_and_${observations[index]!.at}`;
-      return {
-        ...base,
-        reason: resetReason,
-        projectedExhaustion: { ...base.projectedExhaustion, reason: resetReason },
-      };
-    }
   }
 
   const deltaTokens = last.cumulativeTokens - first.cumulativeTokens;

@@ -5,6 +5,17 @@ import type Database from "better-sqlite3";
 
 import type { SubscriptionConfig } from "./dashboard-api";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
+import {
+  FINANCE_COVERAGE_SOURCES,
+  ensureFinanceProvenanceSchema,
+  initializeFinanceSourceCoverage,
+  markFinancePublicationDirty,
+  recordFinanceCaptureActivity,
+  financeScanTimeIsCurrent,
+  type FinanceCoverageSource,
+  type FinanceSourceCoverageRow,
+} from "./history-coverage";
+import { projectionValidity, STATUS_MAX_AGE_MS } from "./projection-validity";
 
 export const DASHBOARD_SCHEMA_VERSION = 1;
 export const DASHBOARD_WINDOWS = [30, 90, 182, 365, 1825] as const;
@@ -15,14 +26,9 @@ const REPAIR_ROWS = 250;
 const COMPACT_GC_ITEMS = 1_000;
 const SESSION_REPAIR_ROWS = 1_000;
 const SESSION_REPAIR_BUDGET_MS = 50;
-/**
- * Issue #196: publication normally waits for a fully quiescent projection,
- * but under sustained ingestion some backlog is virtually always open, so a
- * strict gate can freeze the served snapshot indefinitely while facts keep
- * landing. Past this bound the read path republishes from current aggregates
- * instead of serving a frozen summary; the normal quiescent path is unchanged.
- */
-export const SNAPSHOT_MAX_STALENESS_MS = 15 * 60_000;
+/** Historical snapshots remain readable after expiry, with parity withdrawn. */
+export const SNAPSHOT_MAX_STALENESS_MS = STATUS_MAX_AGE_MS;
+const FINANCE_CAPTURE_FRESHNESS_MS = 86_400_000;
 const CANONICAL_SHA256 = /^sha256:[0-9a-f]{64}$/;
 const UNLINKED_REPO = "__unlinked__";
 const UNLINKED_ACCOUNT = "__unlinked_account__";
@@ -80,6 +86,11 @@ type RawProjectionRow = {
   machine: string | null;
   accountHash: string | null;
   suppressedFieldsJson: string;
+  privacyGeneration: string | null;
+  workspaceId: string | null;
+  installationEpochId: string | null;
+  projectKey: string | null;
+  costKind: "reported" | "estimated" | "unknown" | null;
 };
 
 type CompactProjectionItem = {
@@ -111,9 +122,16 @@ type ProjectionFact = {
   machineHash: string | null;
   accountHash: string | null;
   suppressed: number;
+  rawGeneration: string | null;
+  workspaceId: string | null;
+  installationEpochId: string | null;
+  observedAtMs: number | null;
+  projectKey: string | null;
+  costKind: "reported" | "estimated" | "unknown" | null;
 };
 
 type ProjectionControl = {
+  schemaVersion: number;
   backfillHighWater: number | null;
   backfillCursor: number;
   backfillComplete: number;
@@ -230,6 +248,20 @@ function canonicalLinkage(value: string | null | undefined) {
   return CANONICAL_SHA256.test(normalized) ? normalized : null;
 }
 
+function canonicalProjectKey(value: string | null | undefined) {
+  return canonicalLinkage(value);
+}
+
+function safeCostKind(value: string | null | undefined): "reported" | "estimated" | "unknown" | null {
+  return value === "reported" || value === "estimated" || value === "unknown" ? value : null;
+}
+
+function observedAtMilliseconds(value: string | null | undefined) {
+  if (!value) return null;
+  const parsed = Date.parse(value);
+  return Number.isSafeInteger(parsed) ? parsed : null;
+}
+
 function costNanos(value: number | null | undefined) {
   if (value === null || value === undefined || !Number.isFinite(value)) return null;
   return Math.round(value * 1_000_000_000);
@@ -298,6 +330,12 @@ function factFromRaw(row: RawProjectionRow, suppressUsage = false): ProjectionFa
     machineHash: safeHash(row.machine),
     accountHash: safeHash(row.accountHash),
     suppressed: row.suppressedFieldsJson !== "[]" ? 1 : 0,
+    rawGeneration: row.privacyGeneration,
+    workspaceId: row.workspaceId,
+    installationEpochId: row.installationEpochId,
+    observedAtMs: observedAtMilliseconds(row.observedAt),
+    projectKey: canonicalProjectKey(row.projectKey),
+    costKind: safeCostKind(row.costKind),
   };
 }
 
@@ -339,6 +377,12 @@ function factFromDb(row: Record<string, unknown>): ProjectionFact {
     machineHash: row.machineHash === null ? null : String(row.machineHash),
     accountHash: row.accountHash === null ? null : String(row.accountHash),
     suppressed: Number(row.suppressed),
+    rawGeneration: row.rawGeneration === null ? null : String(row.rawGeneration),
+    workspaceId: row.workspaceId === null ? null : String(row.workspaceId),
+    installationEpochId: row.installationEpochId === null ? null : String(row.installationEpochId),
+    observedAtMs: row.observedAtMs === null ? null : Number(row.observedAtMs),
+    projectKey: row.projectKey === null ? null : canonicalProjectKey(String(row.projectKey)),
+    costKind: row.costKind === null ? null : safeCostKind(String(row.costKind)),
   };
 }
 
@@ -354,11 +398,28 @@ export class DashboardProjectionStore {
   private failNextApply = false;
   private failNextCompactGcAfterRewrite = false;
 
+  private readonly captureStatements = new Map<string, Database.Statement>();
+
+  // Reuse the fixed capture SQL; each 128-record request used to compile the
+  // same aggregate/trigger statements hundreds of times on the listener.
+  private captureStatement(sql: string) {
+    let statement = this.captureStatements.get(sql);
+    if (!statement) {
+      statement = this.db.prepare(sql);
+      if (this.captureStatements.size >= 128) {
+        this.captureStatements.delete(this.captureStatements.keys().next().value!);
+      }
+      this.captureStatements.set(sql, statement);
+    }
+    return statement;
+  }
+
   constructor(
     private readonly db: Database.Database,
     options: { newLedger?: boolean; now?: Date } = {},
   ) {
     const now = options.now ?? new Date(Date.now());
+    ensureFinanceProvenanceSchema(this.db);
     this.createSchema(now, Boolean(options.newLedger));
     if (options.newLedger) this.publishSnapshots(now);
   }
@@ -440,7 +501,13 @@ export class DashboardProjectionStore {
         head_hash text,
         machine_hash text,
         account_hash text,
-        suppressed integer not null default 0
+        suppressed integer not null default 0,
+        raw_generation text,
+        workspace_id text,
+        installation_epoch_id text,
+        observed_at_ms integer,
+        project_key text,
+        cost_kind text check (cost_kind is null or cost_kind in ('reported','estimated','unknown'))
       );
       create index if not exists idx_dashboard_facts_observed
         on dashboard_event_facts (observed_at, projection_id);
@@ -726,6 +793,16 @@ export class DashboardProjectionStore {
       );
     `);
     this.ensureProjectionSchemaColumns();
+    this.db.exec(`
+      create index if not exists idx_dashboard_facts_finance_scope
+        on dashboard_event_facts (workspace_id, installation_epoch_id, observed_at_ms, projection_id);
+      create index if not exists idx_dashboard_facts_finance_epoch_workspace
+        on dashboard_event_facts (installation_epoch_id, workspace_id);
+      create index if not exists idx_dashboard_facts_finance_invalid_lineage
+        on dashboard_event_facts (installation_epoch_id)
+        where workspace_id is null or raw_generation is null
+          or length(raw_generation)=0 or observed_at_ms is null;
+    `);
     this.db.prepare(`insert or ignore into dashboard_lifetime_totals (singleton) values (1)`).run();
 
     this.db.prepare(
@@ -865,6 +942,32 @@ export class DashboardProjectionStore {
           degraded_reason=case when generation>0 then 'projection_repair_backlog' else degraded_reason end
         where singleton=1;
       end;
+      create trigger if not exists trg_finance_raw_insert
+      after insert on buffered_events
+      begin
+        update finance_publication_control
+        set dirty=1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        where singleton=1;
+      end;
+      create trigger if not exists trg_finance_raw_update
+      after update of source, event_type, observed_at, session_id, action_class, model,
+        input_tokens, output_tokens, cache_read_tokens, cache_creation_tokens, cost_usd,
+        repo_hash, branch_hash, head_sha, machine, account_hash, suppressed_fields_json,
+        data_mode, privacy_disposition, workspace_id, installation_epoch_id,
+        project_key, cost_kind, privacy_generation
+      on buffered_events
+      begin
+        update finance_publication_control
+        set dirty=1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        where singleton=1;
+      end;
+      create trigger if not exists trg_finance_raw_delete
+      after delete on buffered_events
+      begin
+        update finance_publication_control
+        set dirty=1, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        where singleton=1;
+      end;
       create trigger if not exists trg_dashboard_metric_insert
       after insert on metric_samples
       begin
@@ -969,6 +1072,22 @@ export class DashboardProjectionStore {
     }
     this.db.exec(`create index if not exists idx_dashboard_compact_cancellation_day
       on dashboard_compact_cancellations (bucket_day,raw_rowid)`);
+    const factColumns = new Set(
+      (this.db.pragma("table_info(dashboard_event_facts)") as Array<{ name: string }>).map(
+        (row) => row.name,
+      ),
+    );
+    for (const definition of [
+      "raw_generation text",
+      "workspace_id text",
+      "installation_epoch_id text",
+      "observed_at_ms integer",
+      "project_key text",
+      "cost_kind text check (cost_kind is null or cost_kind in ('reported','estimated','unknown'))",
+    ]) {
+      const name = definition.split(" ")[0]!;
+      if (!factColumns.has(name)) this.db.exec(`alter table dashboard_event_facts add column ${definition}`);
+    }
   }
 
   private ensureCompactSummaryMigration(now:Date){
@@ -1013,8 +1132,9 @@ export class DashboardProjectionStore {
   }
 
   private control(): ProjectionControl {
-    return this.db.prepare(
-      `select backfill_high_water as backfillHighWater,
+    return this.captureStatement(
+      `select schema_version as schemaVersion,
+        backfill_high_water as backfillHighWater,
         backfill_cursor as backfillCursor, backfill_complete as backfillComplete,
         parity_cursor as parityCursor,parity_complete as parityComplete,
         ready, parity_ready as parityReady, generation, dirty,
@@ -1052,7 +1172,7 @@ export class DashboardProjectionStore {
 
   private rawRow(rawRowid: number) {
     const privacyEligible = terminalPrivacyEligibilitySql(this.db, "buffered_events");
-    return this.db.prepare(
+    return this.captureStatement(
       `select rowid as rawRowid, id, source, event_type as eventType,
         case when ${privacyEligible} then 1 else 0 end as privacyEligible,
         observed_at as observedAt, session_id as sessionId, action_class as actionClass,
@@ -1060,34 +1180,43 @@ export class DashboardProjectionStore {
         cache_read_tokens as cacheReadTokens, cache_creation_tokens as cacheCreationTokens,
         cost_usd as costUsd, repo_hash as repoHash, branch_hash as branchHash,
         head_sha as headSha, machine, account_hash as accountHash,
-        suppressed_fields_json as suppressedFieldsJson
+        suppressed_fields_json as suppressedFieldsJson,
+        privacy_generation as privacyGeneration, workspace_id as workspaceId,
+        installation_epoch_id as installationEpochId, project_key as projectKey,
+        cost_kind as costKind
        from buffered_events where rowid = ?`,
     ).get(rawRowid) as RawProjectionRow | undefined;
   }
 
   private storedFact(projectionId: string) {
-    const row = this.db.prepare(
+    const row = this.captureStatement(
       `select projection_id as projectionId, raw_rowid as rawRowid, source,
         event_type as eventType, observed_at as observedAt, session_hash as sessionHash,
         action_class as actionClass, model, input_tokens as inputTokens,
         output_tokens as outputTokens, cache_read_tokens as cacheReadTokens,
         cache_creation_tokens as cacheCreationTokens, cost_nanos as costNanos,
         repo_hash as repoHash, branch_hash as branchHash, head_hash as headHash,
-        machine_hash as machineHash, account_hash as accountHash, suppressed
+        machine_hash as machineHash, account_hash as accountHash, suppressed,
+        raw_generation as rawGeneration, workspace_id as workspaceId,
+        installation_epoch_id as installationEpochId, observed_at_ms as observedAtMs,
+        project_key as projectKey, cost_kind as costKind
        from dashboard_event_facts where projection_id = ?`,
     ).get(projectionId) as Record<string, unknown> | undefined;
     return row ? factFromDb(row) : undefined;
   }
 
   private storedFactByRawRowid(rawRowid: number) {
-    const row = this.db.prepare(
+    const row = this.captureStatement(
       `select projection_id as projectionId, raw_rowid as rawRowid, source,
         event_type as eventType, observed_at as observedAt, session_hash as sessionHash,
         action_class as actionClass, model, input_tokens as inputTokens,
         output_tokens as outputTokens, cache_read_tokens as cacheReadTokens,
         cache_creation_tokens as cacheCreationTokens, cost_nanos as costNanos,
         repo_hash as repoHash, branch_hash as branchHash, head_hash as headHash,
-        machine_hash as machineHash, account_hash as accountHash, suppressed
+        machine_hash as machineHash, account_hash as accountHash, suppressed,
+        raw_generation as rawGeneration, workspace_id as workspaceId,
+        installation_epoch_id as installationEpochId, observed_at_ms as observedAtMs,
+        project_key as projectKey, cost_kind as costKind
        from dashboard_event_facts where raw_rowid = ?`,
     ).get(rawRowid) as Record<string, unknown> | undefined;
     return row ? factFromDb(row) : undefined;
@@ -1108,17 +1237,17 @@ export class DashboardProjectionStore {
         // one gzip segment per event and the published generation stays stale.
         if (compactable(row) && row.privacyEligible) return;
         this.applyProjectionRows([row], now);
-        this.db.prepare(`delete from dashboard_projection_repairs where raw_rowid = ?`).run(rawRowid);
+        this.captureStatement(`delete from dashboard_projection_repairs where raw_rowid = ?`).run(rawRowid);
       })();
       return true;
     } catch (error) {
       const at = now.toISOString();
-      this.db.prepare(
+      this.captureStatement(
         `insert into dashboard_projection_repairs (raw_rowid, reason, queued_at)
          values (?, 'projection_apply_failed', ?)
          on conflict(raw_rowid) do update set reason = excluded.reason, queued_at = excluded.queued_at`,
       ).run(rawRowid, at);
-      this.db.prepare(
+      this.captureStatement(
         `update dashboard_projection_control set dirty = 1,
           degraded_reason = 'projection_repair_backlog', last_error_at = ? where singleton = 1`,
       ).run(at);
@@ -1295,7 +1424,9 @@ export class DashboardProjectionStore {
       source:item.source,eventType:item.eventType,observedAt:item.observedAt,sessionHash:null,
       actionClass:item.actionClass,model:null,inputTokens:null,outputTokens:null,cacheReadTokens:null,
       cacheCreationTokens:null,costNanos:null,repoHash:null,branchHash:null,headHash:null,
-      machineHash:null,accountHash:null,suppressed:0};
+      machineHash:null,accountHash:null,suppressed:0,rawGeneration:null,workspaceId:null,
+      installationEpochId:null,observedAtMs:observedAtMilliseconds(item.observedAt),projectKey:null,
+      costKind:null};
     for(let bit=0;bit<INTERNAL_WINDOWS.length;bit++)if((item.windowMask&(1<<bit))&&
       DASHBOARD_WINDOWS.includes(INTERNAL_WINDOWS[bit] as typeof DASHBOARD_WINDOWS[number])){
       this.applyReferenceDelta(table,INTERNAL_WINDOWS[bit]!,fact,sign);
@@ -1376,12 +1507,13 @@ export class DashboardProjectionStore {
       (previous.inputTokens!==null&&sourceLatest.lastTokenAt===previous.observedAt)))this.refreshSourceLatest(previous.source);
     this.db.prepare(`update dashboard_projection_control set dirty=1,
       projection_rows_visited=projection_rows_visited+1,projection_rows_written=projection_rows_written+1 where singleton=1`).run();
+    markFinancePublicationDirty(this.db, now.toISOString());
   }
 
   private applyFact(next: ProjectionFact, now: Date) {
     const previous = this.storedFact(next.projectionId);
     if (previous && JSON.stringify(previous) === JSON.stringify(next)) return false;
-    const windows = this.db.prepare(
+    const windows = this.captureStatement(
       `select days, cutoff_at as cutoffAt,target_cutoff_at as targetCutoffAt,
         expiry_cursor_at as expiryCursorAt,expiry_cursor_id as expiryCursorId
        from dashboard_window_control`,
@@ -1420,20 +1552,22 @@ export class DashboardProjectionStore {
     }
     if (previous) this.applyLifetimeDelta(previous, -1);
     this.applyLifetimeDelta(next, 1);
-    const previousSourceLatest=previous?this.db.prepare(
+    const previousSourceLatest=previous?this.captureStatement(
       `select last_event_at as lastEventAt,last_token_event_at as lastTokenAt
        from dashboard_source_lifetime where source=?`,
     ).get(previous.source) as {lastEventAt:string|null;lastTokenAt:string|null}|undefined:undefined;
-    this.db.prepare(
+    this.captureStatement(
       `insert into dashboard_event_facts
        (projection_id, raw_rowid, source, event_type, observed_at, session_hash,
         action_class, model, input_tokens, output_tokens, cache_read_tokens,
         cache_creation_tokens, cost_nanos, repo_hash, branch_hash, head_hash,
-        machine_hash, account_hash, suppressed)
+        machine_hash, account_hash, suppressed, raw_generation, workspace_id,
+        installation_epoch_id, observed_at_ms, project_key, cost_kind)
        values (@projectionId, @rawRowid, @source, @eventType, @observedAt, @sessionHash,
         @actionClass, @model, @inputTokens, @outputTokens, @cacheReadTokens,
         @cacheCreationTokens, @costNanos, @repoHash, @branchHash, @headHash,
-        @machineHash, @accountHash, @suppressed)
+        @machineHash, @accountHash, @suppressed, @rawGeneration, @workspaceId,
+        @installationEpochId, @observedAtMs, @projectKey, @costKind)
        on conflict(projection_id) do update set
         raw_rowid=excluded.raw_rowid, source=excluded.source, event_type=excluded.event_type,
         observed_at=excluded.observed_at, session_hash=excluded.session_hash,
@@ -1444,7 +1578,10 @@ export class DashboardProjectionStore {
         cost_nanos=excluded.cost_nanos, repo_hash=excluded.repo_hash,
         branch_hash=excluded.branch_hash, head_hash=excluded.head_hash,
         machine_hash=excluded.machine_hash, account_hash=excluded.account_hash,
-        suppressed=excluded.suppressed`,
+        suppressed=excluded.suppressed, raw_generation=excluded.raw_generation,
+        workspace_id=excluded.workspace_id, installation_epoch_id=excluded.installation_epoch_id,
+        observed_at_ms=excluded.observed_at_ms, project_key=excluded.project_key,
+        cost_kind=excluded.cost_kind`,
     ).run(next);
     if(previous&&previousSourceLatest&&(previousSourceLatest.lastEventAt===previous.observedAt||
       (previous.inputTokens!==null&&previousSourceLatest.lastTokenAt===previous.observedAt))){
@@ -1452,7 +1589,7 @@ export class DashboardProjectionStore {
     }
     this.touchSourceLatest(next.source,next.observedAt,next.inputTokens!==null);
     if (previous && previous.observedAt !== next.observedAt) {
-      const bounds = this.db.prepare(
+      const bounds = this.captureStatement(
         `select oldest_observed_at as oldest,newest_observed_at as newest
          from dashboard_lifetime_totals where singleton=1`,
       ).get() as { oldest: string | null; newest: string | null };
@@ -1460,11 +1597,12 @@ export class DashboardProjectionStore {
         this.refreshLifetimeBounds();
       }
     }
-    this.db.prepare(
+    this.captureStatement(
       `update dashboard_projection_control set dirty = 1,
         projection_rows_visited = projection_rows_visited + ?,
         projection_rows_written = projection_rows_written + ? where singleton = 1`,
     ).run(previous ? 2 : 1, windows.length * (previous ? 2 : 1) + 1);
+    markFinancePublicationDirty(this.db, now.toISOString());
     return true;
   }
 
@@ -1483,7 +1621,7 @@ export class DashboardProjectionStore {
 
   private applyLifetimeDelta(fact: ProjectionFact, sign: 1 | -1) {
     const tokenEvent = fact.inputTokens !== null || fact.outputTokens !== null ? 1 : 0;
-    this.db.prepare(
+    this.captureStatement(
       `update dashboard_lifetime_totals set
         events=events+@events, token_events=token_events+@tokenEvents,
         input_tokens=input_tokens+@inputTokens, output_tokens=output_tokens+@outputTokens,
@@ -1512,7 +1650,7 @@ export class DashboardProjectionStore {
       cacheCreationTokens: sign * (fact.cacheCreationTokens ?? 0),
       costNanos: sign * (fact.costNanos ?? 0),
     };
-    this.db.prepare(
+    this.captureStatement(
       `insert into dashboard_window_totals
        (days, events, token_events, input_tokens, output_tokens,
         cache_read_tokens, cache_creation_tokens, cost_nanos)
@@ -1526,7 +1664,7 @@ export class DashboardProjectionStore {
         cache_creation_tokens=cache_creation_tokens+excluded.cache_creation_tokens,
         cost_nanos=cost_nanos+excluded.cost_nanos`,
     ).run(values);
-    this.db.prepare(
+    this.captureStatement(
       `insert into dashboard_source_window
        (days,source,events,token_events,input_tokens,output_tokens,cost_nanos)
        values (@days,@source,@events,@tokenEvents,@inputTokens,@outputTokens,@costNanos)
@@ -1536,7 +1674,7 @@ export class DashboardProjectionStore {
         output_tokens=output_tokens+excluded.output_tokens,
         cost_nanos=cost_nanos+excluded.cost_nanos`,
     ).run({ ...values, source: fact.source });
-    this.db.prepare(
+    this.captureStatement(
       `insert into dashboard_daily_window (days,day,events,cost_nanos,tokens)
        values (@days,@day,@events,@costNanos,@tokens)
        on conflict(days,day) do update set cost_nanos=cost_nanos+excluded.cost_nanos,
@@ -1546,7 +1684,7 @@ export class DashboardProjectionStore {
       fact.model &&
       (fact.inputTokens !== null || fact.outputTokens !== null || fact.costNanos !== null)
     ) {
-      this.db.prepare(
+      this.captureStatement(
         `insert into dashboard_model_window
          (days,model,calls,unpriced_calls,input_tokens,output_tokens,
           cache_read_tokens,cache_creation_tokens,cost_nanos)
@@ -1562,17 +1700,17 @@ export class DashboardProjectionStore {
       ).run({ ...values, model: fact.model, calls: sign, unpricedCalls: fact.costNanos === null ? sign : 0 });
     }
     if (fact.eventType === "tool_use" || fact.eventType === "tool_result") {
-      this.db.prepare(
+      this.captureStatement(
         `insert into dashboard_action_window (days,action_class,events)
          values (?,?,?) on conflict(days,action_class) do update set events=events+excluded.events`,
       ).run(days, fact.actionClass ?? "other", sign);
     }
     if (sign < 0) {
-      this.db.prepare(`delete from dashboard_source_window where days=? and source=? and events=0`).run(days,fact.source);
-      this.db.prepare(`delete from dashboard_daily_window where days=? and day=? and events=0`).run(days,day(fact.observedAt));
-      if (fact.model) this.db.prepare(`delete from dashboard_model_window where days=? and model=? and calls=0`).run(days,fact.model);
+      this.captureStatement(`delete from dashboard_source_window where days=? and source=? and events=0`).run(days,fact.source);
+      this.captureStatement(`delete from dashboard_daily_window where days=? and day=? and events=0`).run(days,day(fact.observedAt));
+      if (fact.model) this.captureStatement(`delete from dashboard_model_window where days=? and model=? and calls=0`).run(days,fact.model);
       if (fact.eventType === "tool_use" || fact.eventType === "tool_result") {
-        this.db.prepare(`delete from dashboard_action_window where days=? and action_class=? and events=0`).run(days,fact.actionClass??"other");
+        this.captureStatement(`delete from dashboard_action_window where days=? and action_class=? and events=0`).run(days,fact.actionClass??"other");
       }
     }
   }
@@ -1584,7 +1722,7 @@ export class DashboardProjectionStore {
     sign: 1 | -1,
   ) {
     const tokenEvent = fact.inputTokens !== null || fact.outputTokens !== null ? 1 : 0;
-    this.db.prepare(
+    this.captureStatement(
       `insert into ${table}
        (days,events,token_events,input_tokens,output_tokens,cache_read_tokens,
         cache_creation_tokens,cost_nanos)
@@ -1618,7 +1756,7 @@ export class DashboardProjectionStore {
         totalCostNanos+=fact.costNanos??0;
       }
       if(!events)continue;
-      this.db.prepare(
+      this.captureStatement(
         `update ${table} set events=events+?,token_events=token_events+?,
           input_tokens=input_tokens+?,output_tokens=output_tokens+?,
           cache_read_tokens=cache_read_tokens+?,cache_creation_tokens=cache_creation_tokens+?,
@@ -1888,6 +2026,7 @@ export class DashboardProjectionStore {
   }
 
   recordCaptureActivity(receipt: CaptureActivityReceipt) {
+    if (!financeScanTimeIsCurrent(this.db, receipt.lastScanAt)) return;
     const previous = this.db.prepare(
       `select last_activity_at as lastActivityAt,files_today as filesToday,
         discovery_entries as discoveryEntries,last_error_code as lastErrorCode,truncated
@@ -1903,6 +2042,13 @@ export class DashboardProjectionStore {
         last_scan_at=excluded.last_scan_at, last_error_code=excluded.last_error_code,
         truncated=excluded.truncated`,
     ).run({ ...receipt, errorCode, truncated: receipt.truncated ? 1 : 0 });
+    recordFinanceCaptureActivity(
+      this.db,
+      receipt.source,
+      receipt.lastScanAt,
+      !receipt.error && !receipt.truncated,
+      Boolean(receipt.truncated),
+    );
     this.invalidatePresentation();
     const meaningfulChange = !previous ||
       previous.lastActivityAt !== receipt.lastActivityAt ||
@@ -2240,7 +2386,10 @@ export class DashboardProjectionStore {
             cache_read_tokens as cacheReadTokens, cache_creation_tokens as cacheCreationTokens,
             cost_usd as costUsd, repo_hash as repoHash, branch_hash as branchHash,
             head_sha as headSha, machine, account_hash as accountHash,
-            suppressed_fields_json as suppressedFieldsJson
+            suppressed_fields_json as suppressedFieldsJson,
+            privacy_generation as privacyGeneration, workspace_id as workspaceId,
+            installation_epoch_id as installationEpochId, project_key as projectKey,
+            cost_kind as costKind
            from buffered_events where rowid > ? and rowid <= ? order by rowid limit ?`,
         ).all(control.backfillCursor, control.backfillHighWater ?? 0, BACKFILL_ROWS) as RawProjectionRow[];
         this.applyProjectionRows(rows,now);
@@ -2281,7 +2430,10 @@ export class DashboardProjectionStore {
           b.cache_read_tokens as cacheReadTokens,b.cache_creation_tokens as cacheCreationTokens,
           b.cost_usd as costUsd,b.repo_hash as repoHash,b.branch_hash as branchHash,
           b.head_sha as headSha,b.machine,b.account_hash as accountHash,
-          b.suppressed_fields_json as suppressedFieldsJson
+          b.suppressed_fields_json as suppressedFieldsJson,
+          b.privacy_generation as privacyGeneration, b.workspace_id as workspaceId,
+          b.installation_epoch_id as installationEpochId, b.project_key as projectKey,
+          b.cost_kind as costKind
          from dashboard_projection_repairs r left join buffered_events b on b.rowid=r.raw_rowid
          where r.reason!='raw_update' or not exists (
            select 1 from dashboard_compact_mutations m where m.raw_rowid=r.raw_rowid
@@ -2341,6 +2493,12 @@ export class DashboardProjectionStore {
         backlog.accountInvalidations === 0 && backlog.expiryWindows === 0 &&
         settled.degradedReason !== "projection_clock_rollback") {
         if (settled.dirty || !settled.ready) this.publishSnapshots(now);
+        else {
+          // A completed no-change pass verifies the current window without
+          // rebuilding aggregates. Quiet capture must still renew validity.
+          this.db.prepare(`update dashboard_projection_control
+            set parity_ready=1,last_success_at=? where singleton=1`).run(now.toISOString());
+        }
       } else {
         this.db.prepare(
           `update dashboard_projection_control set ready=case when generation>0 then 1 else 0 end,
@@ -2351,6 +2509,7 @@ export class DashboardProjectionStore {
               else 'projection_repair_backlog' end where singleton=1`,
         ).run();
       }
+      this.publishFinanceRevision(now);
     })();
     const control = this.control();
     return {
@@ -2387,7 +2546,10 @@ export class DashboardProjectionStore {
         output_tokens as outputTokens,cache_read_tokens as cacheReadTokens,
         cache_creation_tokens as cacheCreationTokens,cost_usd as costUsd,
         repo_hash as repoHash,branch_hash as branchHash,head_sha as headSha,machine,
-        account_hash as accountHash,suppressed_fields_json as suppressedFieldsJson
+        account_hash as accountHash,suppressed_fields_json as suppressedFieldsJson,
+        privacy_generation as privacyGeneration,workspace_id as workspaceId,
+        installation_epoch_id as installationEpochId,project_key as projectKey,
+        cost_kind as costKind
        from buffered_events where rowid>? and rowid<=? order by rowid limit ?`,
     ).all(control.parityCursor, control.backfillHighWater ?? 0, BACKFILL_ROWS) as RawProjectionRow[];
     const windows = this.db.prepare(
@@ -2578,17 +2740,151 @@ export class DashboardProjectionStore {
     };
   }
 
-  private publishSnapshots(now: Date, force=false) {
+  private publishFinanceRevision(now: Date): boolean {
+    ensureFinanceProvenanceSchema(this.db);
+    const binding = this.db.prepare(
+      `select current_workspace_id as workspaceId,
+         current_installation_epoch_id as installationEpochId,
+         current_installation_epoch_started_at as epochStartedAt
+       from collector_workspace_binding where singleton=1`,
+    ).get() as {
+      workspaceId: string;
+      installationEpochId: string | null;
+      epochStartedAt: string | null;
+    } | undefined;
+    if (!binding?.workspaceId || !binding.installationEpochId || !binding.epochStartedAt) return false;
+    const epochStartedAt = binding.epochStartedAt;
+    initializeFinanceSourceCoverage(
+      this.db,
+      binding.workspaceId,
+      binding.installationEpochId,
+      epochStartedAt,
+    );
+    const projection = this.control();
+    const settled = projection.schemaVersion === DASHBOARD_SCHEMA_VERSION &&
+      projection.ready === 1 && projection.parityReady === 1 &&
+      projection.dirty === 0 && projection.degradedReason === null &&
+      projection.backfillComplete === 1 && projection.parityComplete === 1 &&
+      projection.metricBackfillComplete === 1 && projection.repairBacklog === 0 &&
+      projection.dirtySessionBacklog === 0 && projection.accountInvalidationBacklog === 0 &&
+      projection.compactMutationBacklog === 0 && projection.compactGcBacklog === 0 &&
+      this.backlog().expiryWindows === 0;
+    if (!settled) return false;
+
+    // Negative validity checks must also be bounded on a large, valid ledger.
+    // The partial index contains only malformed rows; workspace disagreement
+    // uses two range seeks instead of a COUNT/OR scan through the current epoch.
+    const currentFactsWithoutLineage = this.db.prepare(
+      `select 1 from dashboard_event_facts indexed by idx_dashboard_facts_finance_invalid_lineage
+       where installation_epoch_id=? and (
+         workspace_id is null or
+         raw_generation is null or length(raw_generation)=0 or observed_at_ms is null
+       ) limit 1`,
+    ).get(binding.installationEpochId);
+    const earlierWorkspace = this.db.prepare(
+      `select 1 from dashboard_event_facts indexed by idx_dashboard_facts_finance_epoch_workspace
+       where installation_epoch_id=? and workspace_id<? limit 1`,
+    ).get(binding.installationEpochId, binding.workspaceId);
+    const laterWorkspace = this.db.prepare(
+      `select 1 from dashboard_event_facts indexed by idx_dashboard_facts_finance_epoch_workspace
+       where installation_epoch_id=? and workspace_id>? limit 1`,
+    ).get(binding.installationEpochId, binding.workspaceId);
+    if (currentFactsWithoutLineage || earlierWorkspace || laterWorkspace) return false;
+
+    const suppressionTable = this.db.prepare(
+      `select 1 as present from sqlite_master
+       where type='table' and name='repo_context_suppressions'`,
+    ).get();
+    if (suppressionTable && this.db.prepare(
+      `select 1 as pending from repo_context_suppressions
+       where cleanup_complete=0 limit 1`,
+    ).get()) return false;
+
+    const coverage = this.db.prepare(
+      `select source, retained_from as retainedFrom, covered_through as coveredThrough,
+         latest_full_complete as latestFullComplete, invalidated_at as invalidatedAt,
+         last_scan_at as lastScanAt, last_scan_ok as lastScanOk,
+         last_scan_truncated as lastScanTruncated,
+         state_revision as stateRevision, published_revision as publishedRevision
+       from finance_source_coverage
+       where workspace_id=? and installation_epoch_id=? order by source`,
+    ).all(binding.workspaceId, binding.installationEpochId) as Array<{
+      source: FinanceCoverageSource;
+      retainedFrom: string;
+      coveredThrough: string | null;
+      latestFullComplete: number;
+      invalidatedAt: string | null;
+      lastScanAt: string | null;
+      lastScanOk: number;
+      lastScanTruncated: number;
+      stateRevision: number;
+      publishedRevision: number;
+    }>;
+    const coverageBySource = new Map(coverage.map((row) => [row.source, row]));
+    // Publication is ledger-wide: every native source must have a settled
+    // structural receipt, even when a reader later requests a narrower set.
+    const structuralCoverageReady = FINANCE_COVERAGE_SOURCES.every((source) => {
+      const row = coverageBySource.get(source);
+      const retainedMs = row?.retainedFrom ? Date.parse(row.retainedFrom) : NaN;
+      const retainedCanonical = Number.isFinite(retainedMs) &&
+        new Date(retainedMs).toISOString() === row?.retainedFrom;
+      return Boolean(row && retainedCanonical &&
+        Number.isSafeInteger(row.stateRevision) && row.stateRevision >= 0 &&
+        Number.isSafeInteger(row.publishedRevision) && row.publishedRevision >= 0);
+    });
+    if (!structuralCoverageReady) return false;
+
+    const publication = this.db.prepare(
+      `select dirty, revision, workspace_id as workspaceId,
+         installation_epoch_id as installationEpochId,
+         projection_generation as projectionGeneration, published_at as publishedAt
+       from finance_publication_control where singleton=1`,
+    ).get() as {
+      dirty: number;
+      revision: number;
+      workspaceId: string | null;
+      installationEpochId: string | null;
+      projectionGeneration: number | null;
+      publishedAt: string | null;
+    } | undefined;
+    if (!publication) return false;
+    const alreadyPublished = publication.dirty === 0 && publication.revision > 0 &&
+      publication.workspaceId === binding.workspaceId &&
+      publication.installationEpochId === binding.installationEpochId &&
+      publication.projectionGeneration === projection.generation &&
+      publication.publishedAt !== null &&
+      FINANCE_COVERAGE_SOURCES.every((source) =>
+        coverageBySource.get(source)?.publishedRevision === publication.revision);
+    if (alreadyPublished) return false;
+
+    const revision = publication.revision + 1;
+    const publishedAt = now.toISOString();
+    this.db.prepare(
+      `update finance_source_coverage set published_revision=?
+       where workspace_id=? and installation_epoch_id=?`,
+    ).run(revision, binding.workspaceId, binding.installationEpochId);
+    this.db.prepare(
+      `update finance_publication_control set dirty=0, revision=?,
+         workspace_id=?, installation_epoch_id=?, projection_generation=?,
+         published_at=?, updated_at=? where singleton=1`,
+    ).run(
+      revision,
+      binding.workspaceId,
+      binding.installationEpochId,
+      projection.generation,
+      publishedAt,
+      publishedAt,
+    );
+    return true;
+  }
+
+  private publishSnapshots(now: Date) {
     const control = this.control();
     if (!control.backfillComplete||!control.metricBackfillComplete) return false;
-    // Issue #196: `force` skips only the backlog quiescence gate — the
-    // staleness-bounded read-path fallback publishes slightly-pre-repair
-    // aggregates rather than serving a frozen summary forever. Backfill
-    // completion stays mandatory so a first migration never publishes partials.
-    if (!force) {
-      const backlog = this.backlog();
-      if (backlog.repairs || backlog.compactMutations||backlog.compactGcDays||backlog.dirtySessions || backlog.accountInvalidations) return false;
-    }
+    const backlog = this.backlog();
+    if (!control.parityComplete || backlog.repairs || backlog.compactMutations ||
+        backlog.compactGcDays || backlog.dirtySessions || backlog.accountInvalidations ||
+        backlog.expiryWindows || control.degradedReason === "projection_clock_rollback") return false;
     const generation = control.generation + 1;
     let rowsVisited = 0;
     for (const days of DASHBOARD_WINDOWS) {
@@ -2877,35 +3173,40 @@ export class DashboardProjectionStore {
 
   readSnapshot(days:number,subscriptions:SubscriptionConfig[]=[]):SnapshotRead {
     if(!DASHBOARD_WINDOWS.includes(days as typeof DASHBOARD_WINDOWS[number])) return {kind:"unsupported",supportedDays:DASHBOARD_WINDOWS};
-    let control=this.control();
-    if(control.ready&&control.dirty&&control.lastSuccessAt&&
-      Date.now()-Date.parse(control.lastSuccessAt)>SNAPSHOT_MAX_STALENESS_MS){
-      // Issue #196 liveness fallback: bounded staleness beats an indefinite
-      // freeze. A forced republish that cannot take the writer (SQLITE_BUSY)
-      // falls through to the cached copy — availability never regresses.
-      try{ this.publishSnapshots(new Date(), true); }catch{}
-      control=this.control();
-    }
+    const control=this.control();
     const row=this.db.prepare(
       `select payload_json as payloadJson,generation from dashboard_snapshots where days=?`,
     ).get(days) as {payloadJson:string;generation:number}|undefined;
     if(!row||!control.ready)return {kind:"backfilling",status:this.status()};
     const snapshot=json<SnapshotCore>(row.payloadJson);
-    const cutoff=(this.db.prepare(`select cutoff_at as cutoffAt from dashboard_window_control where days=?`).get(days) as {cutoffAt:string}).cutoffAt;
-    snapshot.window.since=cutoff;
-    snapshot.summary.since=cutoff;
-    if(control.dirty||control.degradedReason){snapshot.projection.status="stale";snapshot.projection.degraded=true;
-      snapshot.projection.degradedReason=control.degradedReason??"projection_pending";}
+    const current = this.status();
+    // Only completed maintenance can attest a later, equivalent window for
+    // this generation. Pending work keeps the published historical cutoff.
+    if (control.parityReady && !control.dirty && !control.degradedReason &&
+        row.generation === control.generation && Object.values(current.backlog).every(n => n === 0)) {
+      const verifiedWindow = this.db.prepare(`select w.cutoff_at as cutoffAt
+        from dashboard_window_control w join dashboard_projection_control c on c.singleton=1
+        where w.days=? and w.target_cutoff_at is null and c.generation=?
+          and c.ready=1 and c.parity_ready=1 and c.dirty=0 and c.degraded_reason is null`
+      ).get(days, row.generation) as
+        {cutoffAt: string} | undefined;
+      if (verifiedWindow && verifiedWindow.cutoffAt >= snapshot.window.since) {
+        snapshot.window.since = verifiedWindow.cutoffAt;
+        snapshot.summary.since = verifiedWindow.cutoffAt;
+      }
+    }
+    const validity = projectionValidity({
+      ready: Boolean(control.ready), parityReady: Boolean(control.parityReady),
+      dirty: Boolean(control.dirty), degradedReason: control.degradedReason,
+      lastSuccessAt: control.lastSuccessAt,
+    });
+    Object.assign(snapshot.projection, validity);
+    snapshot.status.projection = { ...current, ...validity,
+      generation: row.generation, currentGeneration: control.generation };
     this.decoratePresentation(snapshot,subscriptions);
     snapshot.status.health = this.buildHealth(days, new Date(Date.now()));
-    // Issue #196: the cache-hit counter is telemetry, not correctness — under
-    // writer contention it must never turn a served read into SQLITE_BUSY
-    // (the intermittent dashboard 503/stall mode).
-    try{
-      this.db.prepare(`update dashboard_projection_control set snapshot_cache_hits=snapshot_cache_hits+1 where singleton=1`).run();
-    }catch{}
     const settings=(this.db.prepare(`select settings_version as version from dashboard_projection_control where singleton=1`).get() as {version:number}).version;
-    return {kind:"ready",snapshot,etagSeed:`${row.generation}-${settings}-${cutoff}`};
+    return {kind:"ready",snapshot,etagSeed:`${row.generation}-${settings}-${snapshot.window.since}-${validity.degradedReason ?? "current"}`};
   }
 
   private decoratePresentation(snapshot:SnapshotCore,subscriptions:SubscriptionConfig[]) {

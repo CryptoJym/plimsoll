@@ -1,3 +1,4 @@
+import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 /**
  * Issue #117 privacy-mode proof.
  *
@@ -353,7 +354,7 @@ async function main() {
   const upload = await uploadBufferedEvents(metadataConfig, captureBuffer, {
     fetchImpl: async (_input, init) => {
       uploadBodies.push(String(init?.body ?? ""));
-      return new Response(JSON.stringify({ accepted: 1 }), {
+      return new Response(JSON.stringify(acceptedFixtureDelivery(String(init?.body ?? ""), metadataConfig.installKey)), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -526,7 +527,7 @@ async function main() {
   const legacyUpload = await uploadBufferedEvents(metadataConfig, legacyBuffer, {
     fetchImpl: async (_input, init) => {
       legacyUploadBodies.push(String(init?.body ?? ""));
-      return new Response(JSON.stringify({ accepted: 1 }), {
+      return new Response(JSON.stringify(acceptedFixtureDelivery(String(init?.body ?? ""), metadataConfig.installKey)), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -563,7 +564,7 @@ async function main() {
     markUploaded: false,
     fetchImpl: async (_input, init) => {
       statelessBodies.push(String(init?.body ?? ""));
-      return new Response(JSON.stringify({ accepted: 1 }), {
+      return new Response(JSON.stringify(acceptedFixtureDelivery(String(init?.body ?? ""), metadataConfig.installKey)), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -578,7 +579,7 @@ async function main() {
   const reopenUpload = await uploadBufferedEvents(metadataConfig, legacyBuffer, {
     fetchImpl: async (_input, init) => {
       reopenUploadBodies.push(String(init?.body ?? ""));
-      return new Response(JSON.stringify({ accepted: 1 }), {
+      return new Response(JSON.stringify(acceptedFixtureDelivery(String(init?.body ?? ""), metadataConfig.installKey)), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -607,8 +608,7 @@ async function main() {
     log: (line) => historyLogs.push(line),
     fetchImpl: async (_input, init) => {
       historyBodies.push(String(init?.body ?? ""));
-      const body = JSON.parse(String(init?.body ?? "{}")) as { events?: unknown[] };
-      return new Response(JSON.stringify({ accepted: body.events?.length ?? 0 }), {
+      return new Response(JSON.stringify(acceptedFixtureDelivery(String(init?.body ?? ""), metadataConfig.installKey)), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -770,7 +770,7 @@ async function main() {
     log: () => undefined,
     fetchImpl: async (_input, init) => {
       terminalHistoryBodies.push(String(init?.body ?? ""));
-      return new Response(JSON.stringify({ accepted: 1 }), {
+      return new Response(JSON.stringify(acceptedFixtureDelivery(String(init?.body ?? ""), metadataConfig.installKey)), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -780,7 +780,7 @@ async function main() {
   const terminalDurable = await uploadBufferedEvents(metadataConfig, terminalBuffer, {
     fetchImpl: async (_input, init) => {
       terminalDurableBodies.push(String(init?.body ?? ""));
-      return new Response(JSON.stringify({ accepted: 1 }), {
+      return new Response(JSON.stringify(acceptedFixtureDelivery(String(init?.body ?? ""), metadataConfig.installKey)), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -934,7 +934,7 @@ async function main() {
   const recycledUpload = await uploadBufferedEvents(metadataConfig, recycledBuffer, {
     fetchImpl: async (_input, init) => {
       recycledBodies.push(String(init?.body ?? ""));
-      return new Response(JSON.stringify({ accepted: 1 }), {
+      return new Response(JSON.stringify(acceptedFixtureDelivery(String(init?.body ?? ""), metadataConfig.installKey)), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -965,7 +965,7 @@ async function main() {
   const recycledReopen = await uploadBufferedEvents(metadataConfig, recycledBuffer, {
     fetchImpl: async (_input, init) => {
       recycledReopenBodies.push(String(init?.body ?? ""));
-      return new Response(JSON.stringify({ accepted: 1 }), {
+      return new Response(JSON.stringify(acceptedFixtureDelivery(String(init?.body ?? ""), metadataConfig.installKey)), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -1032,7 +1032,7 @@ async function main() {
     },
     fetchImpl: async (_input, init) => {
       beforeRemoteBodies.push(String(init?.body ?? ""));
-      return new Response(JSON.stringify({ accepted: 1 }), {
+      return new Response(JSON.stringify(acceptedFixtureDelivery(String(init?.body ?? ""), metadataConfig.installKey)), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -1065,7 +1065,7 @@ async function main() {
     },
     fetchImpl: async (_input, init) => {
       afterRemoteBodies.push(String(init?.body ?? ""));
-      return new Response(JSON.stringify({ accepted: 1 }), {
+      return new Response(JSON.stringify(acceptedFixtureDelivery(String(init?.body ?? ""), metadataConfig.installKey)), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -1085,7 +1085,7 @@ async function main() {
   const raceReopenUpload = await uploadBufferedEvents(metadataConfig, raceBuffer, {
     fetchImpl: async (_input, init) => {
       raceReopenBodies.push(String(init?.body ?? ""));
-      return new Response(JSON.stringify({ accepted: 1 }), {
+      return new Response(JSON.stringify(acceptedFixtureDelivery(String(init?.body ?? ""), metadataConfig.installKey)), {
         status: 200,
         headers: { "content-type": "application/json" },
       });
@@ -1177,4 +1177,6 @@ main()
   })
   .finally(() => {
     fs.rmSync(root, { recursive: true, force: true });
+    // Cleanup first; a terminal failure must not leave fixture servers holding CI open.
+    if (process.exitCode) process.exit(Number(process.exitCode));
   });

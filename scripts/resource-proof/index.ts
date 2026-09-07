@@ -582,11 +582,12 @@ export function writeResourceReceiptAtomically(
   const tempName = `.${finalName}.${process.pid}.${randomUUID()}.tmp`;
   const modulePath = fileURLToPath(import.meta.url);
   const repoRoot = path.resolve(path.dirname(modulePath), "../..");
-  const tsxCli = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
+  const tsxLoader = path.join(repoRoot, "node_modules", "tsx", "dist", "loader.mjs");
   const run = spawnSync(
     process.execPath,
     [
-      tsxCli,
+      "--import",
+      tsxLoader,
       modulePath,
       "--atomic-receipt-child",
     ],
@@ -858,7 +859,10 @@ if (invokedAsScript) {
     main().catch((error) => {
       const errorClass = error instanceof Error ? error.name : "UnknownError";
       process.stderr.write(
-        `${JSON.stringify({ schema: RESOURCE_PROOF_SCHEMA, overall: "fail", error: errorClass })}\n`,
+        `${JSON.stringify({ schema: RESOURCE_PROOF_SCHEMA, overall: "fail", error: errorClass,
+          frames: error instanceof Error ? [...(error.stack ?? "").matchAll(/at ([A-Za-z0-9_.]+).*?\/(scenarios\.ts|bounded-capture\.ts|index\.ts):(\d+):\d+/g)]
+            .slice(0, 4).map((match) => ({ function: match[1], file: match[2], line: Number(match[3]) })) : [],
+        })}\n`,
       );
       process.exitCode = 1;
     });

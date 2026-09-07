@@ -73,6 +73,9 @@ function treeDigest(root: string) {
 function freshHome(sandbox: string, name: string) {
   const home = path.join(sandbox, name);
   fs.mkdirSync(home, { mode: 0o700 });
+  // macOS inherits /tmp's group and silently clears SGID for nonmembers.
+  // Give the disposable tree our group so special-mode fixtures really exist.
+  fs.chownSync(home, process.getuid!(), process.getgid!());
   temporaryHomes += 1;
   return home;
 }
@@ -349,6 +352,7 @@ function main() {
       const beforeBytes = fs.readFileSync(installed.plistPath);
       const beforeInode = fs.lstatSync(installed.plistPath).ino;
       fs.chmodSync(installed.plistPath, specialMode);
+      if (permissionMode(installed.plistPath) !== specialMode) throw new Error("special_mode_fixture_not_established");
       const beforeAttempt = treeDigest(home);
       const error = errorCode(() => installLaunchAgent(
         options(home, path.join(sandbox, `special-noop-${index}`)),
@@ -385,6 +389,7 @@ function main() {
             const prepared = hiddenFiles(parent, "plimsoll-prepared");
             if (prepared.length !== 1) throw new Error("prepared fixture missing");
             fs.chmodSync(path.join(parent, prepared[0]!), specialMode);
+            if (permissionMode(path.join(parent, prepared[0]!)) !== specialMode) throw new Error("special_mode_fixture_not_established");
           },
         },
       }));
@@ -415,7 +420,10 @@ function main() {
         const result = installLaunchAgent({
           ...options(home, path.join(sandbox, `special-postcondition-new-${index}`)),
           transactionHooks: {
-            afterCommit: () => fs.chmodSync(original.plistPath, specialMode),
+            afterCommit: () => {
+              fs.chmodSync(original.plistPath, specialMode);
+              if (permissionMode(original.plistPath) !== specialMode) throw new Error("special_mode_fixture_not_established");
+            },
           },
         });
         returned = Boolean(result);

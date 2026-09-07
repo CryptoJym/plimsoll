@@ -3,6 +3,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { bindCaptureInventory, appendRootObservation, inspectCaptureRoots, rootForFile, rootCursorKey, rootEventMetadata, validateCaptureRoots, type CaptureRoot, type CaptureRootCoverage } from "./capture-root-inventory";
+import { priceForModel } from "../../shared/src/pricing";
 import type { LocalEventBuffer } from "./buffer";
 import {
   attachRepoContextId,
@@ -74,6 +76,7 @@ import {
  */
 
 export type TranscriptScanResult = {
+  roots?: CaptureRootCoverage[];
   scope: "recent" | "full";
   exhaustive: boolean;
   discoveryErrors: number;
@@ -90,6 +93,7 @@ export type TranscriptScanResult = {
   sessionsSkippedLiveCovered: number;
   filesSkippedOutsideRecentWindow: number;
   eventsAppended: number;
+  enrollmentExcludedEvents?: number;
   tokensAppended: { input: number; cacheRead: number; output: number };
   parseErrors: number;
   unresolvedRecords: number;
@@ -305,6 +309,12 @@ function restoreResultMutationSnapshot(
 }
 
 export class TranscriptTailer {
+  private activeCaptureRoot: CaptureRoot | undefined;
+  private readonly captureRoots: CaptureRoot[];
+  private readonly inventoryConfigured: boolean;
+  private eligibleDirectories: string[] | null = null;
+  private get directories(): string[] { return this.eligibleDirectories ?? [this.projectsDir]; }
+  private cursorKey(file: string) { return rootCursorKey(this.captureRoots, file); }
   private activeBoundaryOptions: Pick<TranscriptScanOptions, "quarantine" | "onProgress"> = {};
   private baselineAttempt: {
     discovery: IncrementalJsonlDiscovery;
@@ -327,7 +337,11 @@ export class TranscriptTailer {
     private readonly buffer: LocalEventBuffer,
     private readonly projectsDir = path.join(os.homedir(), ".claude", "projects"),
     private readonly io: JsonlTailerIo = DEFAULT_JSONL_TAILER_IO,
+    captureRoots?: CaptureRoot[],
   ) {
+    this.inventoryConfigured = captureRoots !== undefined;
+    this.captureRoots = validateCaptureRoots(captureRoots ?? []);
+    if (this.captureRoots.some(root => root.source !== "claude_code")) throw new Error("capture_root_provider_mismatch");
     ensureJsonlScanState(this.buffer.database);
     this.buffer.database.exec(`
       create table if not exists transcript_usage_revision_state (
@@ -415,6 +429,19 @@ export class TranscriptTailer {
         truncated: false,
       },
     };
+    const rootCoverage = inspectCaptureRoots(this.captureRoots, scanNow);
+    result.roots = rootCoverage;
+    const rootErrors = rootCoverage.filter(root => root.state !== "ready").length;
+    this.eligibleDirectories = this.inventoryConfigured
+      ? this.captureRoots.filter(root => rootCoverage.some(status => status.rootId === root.rootId && status.state === "ready"))
+        .map(root => root.directory) : null;
+    result.discoveryErrors = rootErrors;
+    if (bindCaptureInventory(this.buffer.database, "claude_code", this.captureRoots, rootCoverage)) {
+      this.baselineAttempt?.discovery.close();
+      this.captureAttempt?.discovery.close();
+      this.baselineAttempt = null;
+      this.captureAttempt = null;
+    }
     if (options.deferredBeforeIo) {
       result.activity.truncated = true;
       result.deferredGenerations = 1;
@@ -436,7 +463,7 @@ export class TranscriptTailer {
       this.baselineAttempt = null;
       result.excludedGenerations = claudeBaseline.excludedGenerations;
       result.excludedBytes = claudeBaseline.currentExcludedBytes;
-      result.exhaustive = true;
+      result.exhaustive = rootErrors === 0;
       result.automaticBudget = automatic.budget.status();
       return result;
     }
@@ -620,7 +647,7 @@ export class TranscriptTailer {
       this.baselineAttempt = null;
       result.excludedGenerations = completed.excludedGenerations;
       result.excludedBytes = completed.currentExcludedBytes;
-      result.exhaustive = completed.status === "complete";
+      result.exhaustive = completed.status === "complete" && rootErrors === 0;
       result.automaticBudget = automatic.budget.status();
       return result;
     }
@@ -633,7 +660,7 @@ export class TranscriptTailer {
       ? automaticDiscovery.files
       : explicitDiscovery!.files.map((file) => ({ file }));
     result.activity.truncated = discovery.truncated;
-    result.discoveryErrors = discovery.errors;
+    result.discoveryErrors = discovery.errors + rootErrors;
     result.filesSeen = discovery.files.length;
     result.activity.discoveryEntries = discovery.files.length;
     const candidates: Array<{
@@ -722,7 +749,7 @@ export class TranscriptTailer {
       }
       const cursor = loadJsonlScanCursor<TranscriptParserState>(
         this.buffer.database,
-        file,
+        this.cursorKey(file),
         PARSER_KIND,
         CHECKPOINT_VERSION,
         validateTranscriptParserState,
@@ -835,13 +862,14 @@ export class TranscriptTailer {
               validationDeferred = true;
               throw new Error("maintenance_progress_budget_exhausted");
             }
+            this.activeCaptureRoot = rootForFile(this.captureRoots, candidate.file);
             const fallbackObservedAt = this.fallbackObservedAt(read.mtimeMs);
             read.assertStableForCommit();
             this.buffer.transactionWithRepoContextHandoffs(() => {
               if (read.unresolvedRecord) {
                 rememberJsonlScanCursor(
                   this.buffer.database,
-                  candidate.file,
+                  this.cursorKey(candidate.file),
                   PARSER_KIND,
                   CHECKPOINT_VERSION,
                   read,
@@ -863,7 +891,7 @@ export class TranscriptTailer {
               }
               rememberJsonlScanCursor(
                 this.buffer.database,
-                candidate.file,
+                this.cursorKey(candidate.file),
                 PARSER_KIND,
                 CHECKPOINT_VERSION,
                 read,
@@ -909,7 +937,7 @@ export class TranscriptTailer {
             automatic.budget.recordYield();
             candidate.cursor = loadJsonlScanCursor<TranscriptParserState>(
               this.buffer.database,
-              candidate.file,
+              this.cursorKey(candidate.file),
               PARSER_KIND,
               CHECKPOINT_VERSION,
               validateTranscriptParserState,
@@ -922,7 +950,7 @@ export class TranscriptTailer {
           result.lastYieldAt = new Date().toISOString();
           cursor = loadJsonlScanCursor<TranscriptParserState>(
             this.buffer.database,
-            candidate.file,
+            this.cursorKey(candidate.file),
             PARSER_KIND,
             CHECKPOINT_VERSION,
             validateTranscriptParserState,
@@ -940,7 +968,7 @@ export class TranscriptTailer {
     for (const candidate of candidates) {
       const cursor = loadJsonlScanCursor<TranscriptParserState>(
         this.buffer.database,
-        candidate.file,
+        this.cursorKey(candidate.file),
         PARSER_KIND,
         CHECKPOINT_VERSION,
         validateTranscriptParserState,
@@ -963,7 +991,7 @@ export class TranscriptTailer {
   }
 
   private recentDiscovery(limit?: number, _options?: TranscriptScanOptions) {
-    return new IncrementalJsonlDiscovery([this.projectsDir], {
+    return new IncrementalJsonlDiscovery(this.directories, {
       recursive: true,
       matches: (name) => name.endsWith(".jsonl"),
       maxEntries: Math.max(1, limit ?? 100_000),
@@ -1061,7 +1089,7 @@ export class TranscriptTailer {
     errors: number;
   } {
     const files: string[] = [];
-    const stack = [this.projectsDir];
+    const stack = [...this.directories];
     let seen = 0;
     let truncated = false;
     let errors = 0;
@@ -1072,7 +1100,7 @@ export class TranscriptTailer {
       try {
         entries = this.io.readDirents(dir);
       } catch (error) {
-        if (!(dir === this.projectsDir && (error as NodeJS.ErrnoException).code === "ENOENT")) {
+        if (!(this.directories.includes(dir) && (error as NodeJS.ErrnoException).code === "ENOENT")) {
           errors += 1;
         }
         continue;
@@ -1283,6 +1311,12 @@ export class TranscriptTailer {
       new Date().toISOString(),
     );
     if (delta.input === 0 && delta.output === 0 && delta.cacheRead === 0 && delta.cacheCreation === 0) return;
+    // Preserve the local revision counter above, but never synthesize a
+    // managed event timestamp from mtime or from the time the file arrived.
+    if (this.buffer.eventAdmissionReason(entry.observedAt, this.activeCaptureRoot?.installationEpochId)) {
+      result.enrollmentExcludedEvents = (result.enrollmentExcludedEvents ?? 0) + 1;
+      return;
+    }
     result.filesParsed += 1;
     const priced = estimateCostUsd({
       model: entry.model,
@@ -1291,8 +1325,15 @@ export class TranscriptTailer {
       cacheReadTokens: delta.cacheRead,
       cacheCreationTokens: delta.cacheCreation,
     });
-    const metadata: Record<string, unknown> = { usageSource: "transcript" };
-    if (priced) metadata.costEstimated = true;
+    const metadata: Record<string, unknown> = { ...rootEventMetadata(this.activeCaptureRoot, previous
+      ? deterministicEventId(["claude-transcript-revision", state.sessionId, entry.messageId, String(entry.input), String(entry.cacheRead), String(entry.cacheCreation), String(entry.output)])
+      : eventBaseId, entry.observedAt ?? fallbackObservedAt, state.sessionId), usageSource: "transcript" };
+    if (priced) {
+      metadata.costEstimated = true;
+      metadata.costKind = "estimated";
+      const rate = priceForModel(entry.model);
+      if (rate) { metadata.rateVersion = `catalog_${rate.asOf}`; metadata.rateObservedAt = `${rate.asOf}T00:00:00.000Z`; }
+    }
     const event: AiInteractionEvent = aiInteractionEventSchema.parse({
       id: previous
         ? deterministicEventId([
@@ -1311,6 +1352,7 @@ export class TranscriptTailer {
       eventType: "usage_transcript",
       observedAt: entry.observedAt ?? fallbackObservedAt,
       sessionId: state.sessionId,
+      actorId: typeof metadata.captureAccountHash === "string" ? metadata.captureAccountHash : undefined,
       model: entry.model,
       actionClass: "other",
       inputTokens: delta.input,
@@ -1318,6 +1360,7 @@ export class TranscriptTailer {
       cacheReadTokens: delta.cacheRead,
       cacheCreationTokens: delta.cacheCreation > 0 ? delta.cacheCreation : undefined,
       costUsd: priced?.costUsd,
+        ...(priced ? { costKind: "estimated" as const } : {}),
       metadata,
     });
     // The context id is path-free exclusion evidence even when terminally
@@ -1326,7 +1369,7 @@ export class TranscriptTailer {
     if (repoContextId && !attachRepoContextId(event, repoContextId)) {
       throw new Error("transcript_repo_context_binding_failed");
     }
-    const inserted = this.buffer.append(event, []);
+    const inserted = appendRootObservation(this.buffer, event, this.activeCaptureRoot);
     if (inserted) {
       result.eventsAppended += 1;
       result.tokensAppended.input += delta.input;

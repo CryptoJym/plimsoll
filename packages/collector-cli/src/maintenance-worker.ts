@@ -492,6 +492,7 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
           teardownMarginMs: 0,
           retentionDays: worker.retentionDays ?? 90,
           parityReady: true,
+          prune: (maxRows) => worker.buffer.prune(worker.retentionDays ?? 90, { maxRows }),
           onDurableCommit: reportJobProgress,
         });
       } catch (error) {

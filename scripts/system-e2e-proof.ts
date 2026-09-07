@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 
 /**
  * Source-only integrated release proof for issue #105.
@@ -31,7 +32,6 @@ import {
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import {
-  adaptToolInteractionEvent,
   buildTechniqueExposureFact,
   buildWorkEpisodeFact,
 } from "../packages/collector-cli/src/learning-facts";
@@ -80,7 +80,7 @@ type PhaseReceipt = {
 
 const SCHEMA = SYSTEM_E2E_SCHEMA;
 const repoRoot = path.resolve(import.meta.dirname, "..");
-const tsx = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
+const tsxLoader = path.join(repoRoot, "node_modules", "tsx", "dist", "loader.mjs");
 const proofRoot = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-system-e2e-"));
 const evidenceRoot = path.join(proofRoot, "evidence");
 const machineAHome = path.join(proofRoot, "machine-a", "home");
@@ -274,7 +274,7 @@ function runSupportingProof(options: {
 }): PhaseReceipt {
   const result = spawnSync(
     "/usr/bin/time",
-    ["-lp", process.execPath, tsx, path.join(repoRoot, options.script), ...(options.args ?? [])],
+    ["-lp", process.execPath, "--import", tsxLoader, path.join(repoRoot, options.script), ...(options.args ?? [])],
     {
       cwd: repoRoot,
       env: isolatedEnvironment(options.home, options.temp),
@@ -285,7 +285,11 @@ function runSupportingProof(options: {
   );
   assert.equal(result.error, undefined, `${options.name} could not start: ${String(result.error)}`);
   assert.equal(result.signal, null, `${options.name} terminated by ${String(result.signal)}`);
-  assert.equal(result.status, 0, `${options.name} failed: ${result.stderr.slice(-2_000)}`);
+  // Child line proofs print failed assertion names to stdout; time writes to
+  // stderr. Preserve the bounded check names when the phase exits nonzero.
+  const failedChecks = [...result.stdout.matchAll(/^FAIL ([a-z][a-z0-9_]{0,159})$/gm)]
+    .slice(0, 32).map((match) => match[1]);
+  assert.equal(result.status, 0, `${options.name} failed checks=${JSON.stringify(failedChecks)}: ${result.stderr.slice(-2_000)}`);
   for (const assertionName of options.requiredAssertions) {
     assert.ok(
       result.stdout.includes(assertionName),
@@ -409,6 +413,7 @@ function event(input: {
   costUsd?: number;
   projectKey?: string;
   git?: { remoteUrlHash: string; branchHash: string; headSha: string };
+  protocol?: { call_id?: string; "plimsoll.retry_of"?: string; otelHasError?: boolean; otelStatusCode?: "OK" };
 }) {
   return aiInteractionEventSchema.parse({
     id: input.id,
@@ -423,7 +428,8 @@ function event(input: {
     outputTokens: input.outputTokens,
     ...(input.costUsd === undefined ? {} : { costUsd: input.costUsd }),
     ...(input.projectKey ? { projectKey: input.projectKey } : {}),
-    metadata: input.git ? { git: input.git } : {},
+    // These fixtures represent normalized, collector-validated protocol signals.
+    metadata: { ...(input.git ? { git: input.git } : {}), ...input.protocol },
   });
 }
 
@@ -460,8 +466,11 @@ async function runSharedFlow() {
       now: () => new Date(FLOW_DELIVERY_CLOCK),
     },
     workspaceId: WORKSPACE_A,
+    enrollmentNow: () => new Date(FLOW_TIME.start),
   });
-  const bufferB = new LocalEventBuffer(machineBLedger, { workspaceId: WORKSPACE_B });
+  const bufferB = new LocalEventBuffer(machineBLedger, {
+    workspaceId: WORKSPACE_B, enrollmentNow: () => new Date(FLOW_TIME.start),
+  });
   const timelineStore = new OutcomeTimelineStore(timelineLedger);
   const sqliteChanges = () => {
     const count = (database: { prepare(sql: string): { get(): unknown } }) =>
@@ -471,6 +480,28 @@ async function runSharedFlow() {
   const sqliteChangesBefore = sqliteChanges();
 
   try {
+    // Seed the explicit episode before ingestion, using the session identity
+    // consumed by runtime promotion. Capture owns attempt creation thereafter.
+    const episodeA = buildWorkEpisodeFact({
+      source: "codex",
+      sessionId: SESSION_A,
+      sourceEpisodeKey: "session",
+      workClass: "implementation",
+      complexityBand: "medium",
+      startedAt: FLOW_TIME.start,
+      endedAt: FLOW_TIME.end,
+    });
+    const episodeB = buildWorkEpisodeFact({
+      source: "codex",
+      sessionId: SESSION_B,
+      sourceEpisodeKey: "session",
+      workClass: "implementation",
+      complexityBand: "medium",
+      startedAt: FLOW_TIME.start,
+      endedAt: FLOW_TIME.end,
+    });
+    bufferA.learningFacts.recordWorkEpisode(episodeA);
+    bufferB.learningFacts.recordWorkEpisode(episodeB);
     const events = [
       event({
         id: EVENT_IDS[0],
@@ -487,6 +518,7 @@ async function runSharedFlow() {
         id: EVENT_IDS[1],
         eventType: "tool_result",
         observedAt: FLOW_TIME.attempt1Result,
+        protocol: { call_id: EVENT_IDS[0], otelHasError: true },
         actionClass: "shell",
         inputTokens: 8,
         outputTokens: 2,
@@ -496,6 +528,7 @@ async function runSharedFlow() {
         id: EVENT_IDS[2],
         eventType: "tool_use",
         observedAt: FLOW_TIME.attempt2,
+        protocol: { "plimsoll.retry_of": EVENT_IDS[0] },
         actionClass: "test",
         inputTokens: 25,
         outputTokens: 5,
@@ -507,6 +540,7 @@ async function runSharedFlow() {
         id: EVENT_IDS[3],
         eventType: "tool_result",
         observedAt: FLOW_TIME.attempt2Result,
+        protocol: { call_id: EVENT_IDS[2], otelStatusCode: "OK" },
         actionClass: "test",
         inputTokens: 15,
         outputTokens: 5,
@@ -590,7 +624,7 @@ async function runSharedFlow() {
           });
         }
         accepted.push(...ids);
-        return new Response(JSON.stringify({ accepted: ids.length }), {
+        return new Response(JSON.stringify(acceptedFixtureDelivery(String(init?.body ?? ""), config.installKey)), {
           status: 200,
           headers: { "content-type": "application/json" },
         });
@@ -689,26 +723,6 @@ async function runSharedFlow() {
     assert.equal(outcome.reviewCorrections.length, 1, "review correction lineage is immutable");
     assert.equal(outcome.rework.filter((row) => row.inWindow).length, 1, "revert remains visible as rework");
 
-    const episodeA = buildWorkEpisodeFact({
-      source: "codex",
-      sessionId: SESSION_A,
-      sourceEpisodeKey: "shared-flow-treatment",
-      workClass: "implementation",
-      complexityBand: "medium",
-      startedAt: FLOW_TIME.start,
-      endedAt: FLOW_TIME.end,
-    });
-    const episodeB = buildWorkEpisodeFact({
-      source: "codex",
-      sessionId: SESSION_B,
-      sourceEpisodeKey: "shared-flow-control",
-      workClass: "implementation",
-      complexityBand: "medium",
-      startedAt: FLOW_TIME.start,
-      endedAt: FLOW_TIME.end,
-    });
-    bufferA.learningFacts.recordWorkEpisode(episodeA);
-    bufferB.learningFacts.recordWorkEpisode(episodeB);
     const exposureA = buildTechniqueExposureFact({
       episodeId: episodeA.episodeId,
       techniqueId: "bounded-retry-strategy",
@@ -734,13 +748,7 @@ async function runSharedFlow() {
     bufferA.learningFacts.recordTechniqueExposure(exposureA, { outcomeObservedAt: "2026-07-02T12:00:00.000Z" });
     bufferB.learningFacts.recordTechniqueExposure(exposureB, { outcomeObservedAt: "2026-07-02T12:00:00.000Z" });
 
-    const startOne = adaptToolInteractionEvent({ event: events[0], sourceOperationKey: EVENT_IDS[0], episodeId: episodeA.episodeId });
-    const resultOne = adaptToolInteractionEvent({ event: events[1], sourceOperationKey: EVENT_IDS[0], episodeId: episodeA.episodeId, resultStatus: "failure", errorCategory: "validation" });
-    const startTwo = adaptToolInteractionEvent({ event: events[2], sourceOperationKey: EVENT_IDS[2], retryOfSourceOperationKey: EVENT_IDS[0], episodeId: episodeA.episodeId });
-    const resultTwo = adaptToolInteractionEvent({ event: events[3], sourceOperationKey: EVENT_IDS[2], episodeId: episodeA.episodeId, resultStatus: "success" });
-    for (const signal of [startOne, resultOne, startTwo, resultTwo]) {
-      bufferA.learningFacts.recordToolSignal(signal);
-    }
+    // Assert facts promoted from the captured events; never rewrite immutable attempts.
     const attempts = bufferA.learningFacts.attempts();
     assert.equal(attempts.length, 2);
     assert.equal(attempts[0]?.resultStatus, "failure");
@@ -913,8 +921,8 @@ async function runSharedFlow() {
     const outcomeLineage = { ...outcomeMaterial, digest: digest(outcomeMaterial) };
     const learningFactMaterial = {
       episodeBindings: [
-        { sourceEpisodeKey: "shared-flow-treatment", fact: persistedEpisodeA },
-        { sourceEpisodeKey: "shared-flow-control", fact: persistedEpisodeB },
+        { sourceEpisodeKey: "session", fact: persistedEpisodeA },
+        { sourceEpisodeKey: "session", fact: persistedEpisodeB },
       ],
       attemptEventBindings: [
         { eventId: EVENT_IDS[0], sourceOperationKey: EVENT_IDS[0], signal: "start", operationId: attempts[0]!.operationId },

@@ -225,7 +225,8 @@ names only). Typed event fields:
 17. `cacheReadTokens` — number, optional.
 18. `cacheCreationTokens` — number, optional.
 19. `costUsd` — number, optional.
-20. `metadata` — record(string, unknown), optional.
+20. `costKind` — enum(reported | estimated | unknown), optional.
+21. `metadata` — record(string, unknown), optional.
 
 Free-form `metadata` crosses only when the outbound sealer admits each key;
 unknown keys default to local-only.

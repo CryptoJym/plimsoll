@@ -137,6 +137,7 @@ function resultReceipt(
 
 class FakeChild extends EventEmitter {
   readonly pid: number;
+  exitCode: number | null = null;
   connected = true;
   readonly sent: unknown[] = [];
   readonly signals: NodeJS.Signals[] = [];
@@ -881,7 +882,9 @@ async function busyWorkerGoneAfterKillProof() {
     killGraceMs: 5,
     fingerprint: async () => {
       fingerprintCalls += 1;
-      // Parent bind, TERM check, KILL check, then confirmed gone.
+      // Parent bind, TERM check, KILL check, then positive exit state for
+      // this child. A missing ps observation by itself is not exit proof.
+      if (fingerprintCalls >= 4) harness.children[0]!.exitCode = 0;
       return fingerprintCalls < 4 ? "busy-worker" : null;
     },
   });

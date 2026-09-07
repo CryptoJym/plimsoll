@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 
+import { acceptedFixtureDelivery } from "../lib/delivery-fixture";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -428,7 +429,7 @@ async function run(mode: WorkerMode, root: string, operatorHome: string): Promis
               : input.url;
         uploadTransportLoopbackOnly &&= target === "http://127.0.0.1/fake-ingest";
         uploadBodies.push(String(init?.body ?? ""));
-        return new Response(JSON.stringify({ accepted: 1 }), {
+        return new Response(JSON.stringify(acceptedFixtureDelivery(String(init?.body ?? ""), config.installKey)), {
           status: 200,
           headers: { "content-type": "application/json" },
         });

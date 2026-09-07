@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -841,7 +842,7 @@ async function main() {
     const uploaded = await uploadBufferedEvents(config, buffer, {
       fetchImpl: async (_input, init) => {
         uploadBodies.push(String(init?.body ?? ""));
-        return new Response(JSON.stringify({ accepted: 1 }), {
+        return new Response(JSON.stringify(acceptedFixtureDelivery(String(init?.body ?? ""), config.installKey)), {
           status: 200,
           headers: { "content-type": "application/json" },
         });
@@ -899,6 +900,7 @@ async function main() {
     // Stage 2 — that install later binds a MANAGED workspace.
     const legacyBuffer = new LocalEventBuffer(legacyLedger, {
       workspaceId: managedTenant,
+      enrollmentNow: () => new Date("2026-07-17T12:00:52.000Z"),
       delivery: { enabled: true },
     });
     // The rollback-compatible raw producer: no workspace column value at all.
@@ -939,7 +941,7 @@ async function main() {
     const legacyUploaded = await uploadBufferedEvents(managedConfig, legacyBuffer, {
       fetchImpl: async (_input, init) => {
         legacyBodies.push(String(init?.body ?? ""));
-        return new Response(JSON.stringify({ accepted: 1 }), {
+        return new Response(JSON.stringify(acceptedFixtureDelivery(String(init?.body ?? ""), managedConfig.installKey)), {
           status: 200,
           headers: { "content-type": "application/json" },
         });

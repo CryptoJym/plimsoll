@@ -1,16 +1,16 @@
 {
   "schema": "plimsoll.system-e2e-support-contract.v1",
-  "normalizationVersion": 6,
+  "normalizationVersion": 7,
   "phases": [
     {
       "name": "install_doctor",
       "kind": "json_result",
-      "expectedArtifactDigest": "sha256:a1c61d93224f4c6899cf0ae648bc72b1cc9b01d55f5d4aa025d3f006c1d52f67"
+      "expectedArtifactDigest": "sha256:c990c5560b1e01b28a632cd91db3e9b9cd7de5259c0a8c0b6eaddb578b0bca9d"
     },
     {
       "name": "transactional_join",
       "kind": "json_result",
-      "expectedArtifactDigest": "sha256:c91937713a5a8ec7688be9fc4bb3ddd5870cc24fffcbc3c20510773e3ae0faec"
+      "expectedArtifactDigest": "sha256:61e7a3604c77337aa10b32fe98da554c7ab3e27986c1eb68b5f7fd0bfdcc5471"
     },
     {
       "name": "metadata_only_privacy",
@@ -25,7 +25,7 @@
     {
       "name": "idle_dashboard_resources",
       "kind": "json_receipt",
-      "expectedArtifactDigest": "sha256:7750937c5c9e74cd10facb8d11bdf4257b917676f814593f1d6c41086bce3edd"
+      "expectedArtifactDigest": "sha256:589ef22fcef2c702e442a11760542dede81f2c04b5badbf91e63a649807da7f7"
     },
     {
       "name": "launch_agent_unload_terminal_truth",

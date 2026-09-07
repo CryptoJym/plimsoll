@@ -64,6 +64,25 @@ assert.throws(
   "outside-root declared path tamper did not fail",
 );
 
+// Real join receipts carry fresh device/epoch IDs for each disposable home.
+// Identity values may vary; their exact shape and reassignment binding may not.
+const workspaceBinding = (suffix: string) => ({
+  changedAt: "2026-09-07T12:00:00.000Z",
+  currentDeviceId: `dev_00000000-0000-4000-8000-${suffix}`,
+  previousDeviceId: `dev_00000000-0000-4000-8000-${suffix}`,
+  currentInstallationEpochId: `10000000-0000-4000-8000-${suffix}`,
+  currentInstallationEpochStartedAt: "2026-09-07T12:00:00.000Z",
+  currentWorkspaceId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+  previousWorkspaceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+});
+const normalizeBinding = (binding: unknown) => normalizeSupportingArtifact(
+  { workspaceBinding: binding }, { baseDirectory: repoRoot, roots: [] },
+);
+assert.deepEqual(normalizeBinding(workspaceBinding("000000000001")), normalizeBinding(workspaceBinding("000000000002")));
+assert.throws(() => normalizeBinding({ ...workspaceBinding("000000000001"), previousDeviceId: workspaceBinding("000000000002").previousDeviceId }), /workspace device identity changed/);
+assert.throws(() => normalizeBinding({ ...workspaceBinding("000000000001"), currentInstallationEpochId: "invalid" }), /workspace epoch identity invalid/);
+assert.throws(() => normalizeBinding({ ...workspaceBinding("000000000001"), previousWorkspaceId: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb" }), /previous workspace binding changed/);
+
 type ActualChildVariant = {
   artifact: unknown;
   context: SupportingNormalizationContext;
@@ -260,6 +279,8 @@ console.log(JSON.stringify({
   schema: fixture.schema,
   status: "pass",
   variants: normalized.length,
+  workspaceIdentityVariants: 2,
+  workspaceIdentityTamperCasesRejected: 3,
   semanticDigest: digest(normalized[0]),
   outsideRootTamperRejected: true,
   actualChildVariants: 2,
