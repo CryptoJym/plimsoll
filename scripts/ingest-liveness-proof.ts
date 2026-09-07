@@ -379,8 +379,7 @@ async function main() {
       },
     );
 
-    // B3. Past the staleness bound the same dirty read must republish and
-    // serve the event that landed during the freeze.
+    // B3. Expiry withdraws parity without publishing or clearing dirty state.
     buffer.database.prepare(
       `update dashboard_projection_control set last_success_at=? where singleton=1`,
     ).run(new Date(Date.now() - STALENESS_BOUND_MS - 60_000).toISOString());
@@ -388,12 +387,13 @@ async function main() {
     const staleSummary = staleRead.kind === "ready" ? staleRead.snapshot.summary : null;
     const afterForce = controlRow(buffer.database);
     check(
-      "stale_dirty_read_republishes_and_advances_newest",
+      "stale_dirty_read_preserves_historical_generation_and_withdraws_parity",
       staleRead.kind === "ready" && staleSummary !== null &&
-        (staleSummary as { totals?: { newest?: unknown } }).totals?.newest === firstNewObservedAt &&
-        afterForce.generation === settledControl.generation + 1 &&
-        afterForce.snapshotBuilds === readsAfterCached + 1 &&
-        afterForce.dirty === 0,
+        (staleSummary as { totals?: { newest?: unknown } }).totals?.newest !== firstNewObservedAt &&
+        afterForce.generation === settledControl.generation &&
+        afterForce.snapshotBuilds === readsAfterCached && afterForce.dirty === 1 &&
+        staleRead.snapshot.projection.parityReady === false &&
+        (staleRead.snapshot.status.projection as {parityReady:boolean}).parityReady === false,
       {
         kind: staleRead.kind,
         servedNewest: staleSummary ? (staleSummary as { totals?: { newest?: unknown } }).totals?.newest : null,
@@ -402,13 +402,12 @@ async function main() {
         previousGeneration: settledControl.generation,
         dirty: afterForce.dirty,
         buildsAfter: afterForce.snapshotBuilds,
-        buildsExpected: readsAfterCached + 1,
+        buildsExpected: readsAfterCached,
       },
     );
 
-    // B4. Production freeze mode: a permanently open backlog (sustained
-    // ingestion churn keeps dirty sessions queued) plus fresh staleness must
-    // STILL advance the surface — force bypasses only the backlog gate.
+    // B4. An open repair backlog stays visibly historical until maintenance
+    // actually commits the correction; a read cannot bypass that gate.
     buffer.append(liveEvent(new Date().toISOString(), "22222222-3333-4333-8444-666666666666"));
     buffer.database.prepare(
       `insert into dashboard_dirty_sessions (days,session_hash,reason,queued_at,revision,restart_revision)
@@ -425,9 +424,12 @@ async function main() {
     const wedgedRead = buffer.projection.readSnapshot(30, []);
     const wedgedSummary = wedgedRead.kind === "ready" ? wedgedRead.snapshot.summary : null;
     check(
-      "open_backlog_no_longer_freezes_summary_past_bound",
+      "open_backlog_remains_stale_until_bounded_maintenance",
       backlogBeforeStaleRead >= 1 && wedgedRead.kind === "ready" && wedgedSummary !== null &&
-        (wedgedSummary as { totals?: { newest?: unknown } }).totals?.newest === secondNewObservedAt,
+        (wedgedSummary as { totals?: { newest?: unknown } }).totals?.newest !== secondNewObservedAt &&
+        wedgedRead.snapshot.projection.parityReady === false &&
+        (wedgedRead.snapshot.status.projection as {parityReady:boolean}).parityReady === false &&
+        controlRow(buffer.database).snapshotBuilds === readsAfterCached,
       {
         dirtySessionBacklogAtRead: backlogBeforeStaleRead,
         kind: wedgedRead.kind,
@@ -436,9 +438,8 @@ async function main() {
       },
     );
 
-    // B5. Adversarial writer contention: forced republish fails open to the
-    // cached copy instead of erroring the read or corrupting state. The
-    // stale/dirty control state is written BEFORE the exclusive lock is taken.
+    // B5. Writer contention cannot make read-only historical access wait for
+    // the writer. Stale/dirty state is committed before the lock is taken.
     buffer.database.prepare(
       `update dashboard_projection_control set dirty=1,last_success_at=? where singleton=1`,
     ).run(new Date(Date.now() - STALENESS_BOUND_MS - 60_000).toISOString());
@@ -453,7 +454,7 @@ async function main() {
       contendedRead = buffer.projection.readSnapshot(30, []);
       const contendedControl = controlRow(buffer.database);
       check(
-        "contended_writer_fails_open_to_cached_copy",
+        "contended_writer_preserves_read_only_historical_copy",
         contendedRead.kind === "ready" &&
           contendedControl.generation === generationBeforeContention,
         {

@@ -1,3 +1,5 @@
+import { createProofCompletion } from "./lib/proof-completion";
+const completion = createProofCompletion("packaged-runtime", 35);
 /**
  * Issue #155 proof: packaged runtime provenance, exact direct-Node
  * LaunchAgent ProgramArguments, and truthful memory-probe status.
@@ -7,12 +9,12 @@
  * code, adversarial refusal of every nonconforming argument shape, and the
  * development-chain regression guard.
  *
- * Tier-2 (recorded, non-blocking): whether the REAL approved source builds
+ * Tier-2 (required): whether the REAL approved source builds
  * today, and the resident-memory probe of the packaged daemon. On a tree
  * where `packages/collector-cli/src/cli.ts` cannot bundle, these are
- * reported as failed/not_run with verbatim errors instead of being skipped
+ * reported as failed with bounded errors instead of being skipped
  * silently. Every executed check runs against real files; nothing here
- * touches a real LaunchAgent, the operator home, or the network.
+ * touches a loaded LaunchAgent, the operator home, or the network.
  */
 import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -51,12 +53,9 @@ const receiptPath = path.join(evidenceDir, "packaged-runtime-proof.json");
 
 function check(name: string, condition: unknown, detail?: unknown): void {
   const passed = Boolean(condition);
+  completion.check(name, passed);
   checks.push({ name, status: passed ? "passed" : "failed", ...(passed ? {} : { detail }) });
   if (!passed) throw new Error(`${name}: ${JSON.stringify(detail ?? null)}`);
-}
-
-function observe(name: string, detail: unknown): void {
-  checks.push({ name, status: "not_run", detail });
 }
 
 function sandbox(label: string): string {
@@ -280,7 +279,7 @@ async function main() {
       const verified = verifyRuntime(realManifestPath);
       check("real_source_builds_and_verifies", verified.ok, verified);
     } else {
-      observe("real_source_build_unavailable_on_this_tree", {
+      check("real_source_build_unavailable_on_this_tree", false, {
         exitStatus: realBuild.status,
         stderr: (realBuild.stderr ?? "").slice(0, 4000),
       });
@@ -506,7 +505,7 @@ async function main() {
     // ------------------------------------------------------------------
     const realArtifact = path.join(realDist, "cli.mjs");
     if (!fs.existsSync(realArtifact)) {
-      observe("packaged_memory_probe_not_run", {
+      check("packaged_memory_probe_not_run", false, {
         reason: "real_source_bundle_unbuildable",
         detail:
           "packages/collector-cli/src/cli.ts does not bundle on this tree; see real_source_build receipt",
@@ -534,6 +533,7 @@ async function main() {
   fs.writeFileSync(receiptPath, `${JSON.stringify(summary, null, 2)}\n`);
   console.log(JSON.stringify(summary.summary));
   if (summary.summary.failed.length > 0) process.exitCode = 1;
+  completion.complete();
 }
 
 async function measurePackagedDaemon(artifact: string): Promise<void> {
@@ -546,7 +546,9 @@ async function measurePackagedDaemon(artifact: string): Promise<void> {
     await new Promise<void>((resolve) => server.close(() => resolve()));
     return chosen;
   })();
-  const collectorHome = sandbox("memory-home");
+  const isolatedHome = sandbox("memory-home");
+  const collectorHome = path.join(isolatedHome, ".plimsoll");
+  fs.mkdirSync(collectorHome, { mode: 0o700 });
   fs.chmodSync(collectorHome, 0o700);
   fs.writeFileSync(
     path.join(collectorHome, "collector.config.json"),
@@ -554,12 +556,18 @@ async function measurePackagedDaemon(artifact: string): Promise<void> {
   );
   const daemon = spawn(process.execPath, [artifact, "start"], {
     env: {
+      HOME: isolatedHome,
+      USERPROFILE: isolatedHome,
+      CODEX_HOME: path.join(isolatedHome, ".codex"),
+      CLAUDE_CONFIG_DIR: path.join(isolatedHome, ".claude"),
+      TMPDIR: process.env.TMPDIR,
       PATH: "/usr/bin:/bin",
       PLIMSOLL_HOME: collectorHome,
       PLIMSOLL_COLLECTOR_DATA_MODE: "metadata",
     },
     stdio: ["ignore", "ignore", "pipe"],
   });
+  daemon.stderr?.resume();
   const startedAt = Date.now();
   let ready = false;
   while (Date.now() - startedAt < 15_000) {
@@ -570,16 +578,18 @@ async function measurePackagedDaemon(artifact: string): Promise<void> {
   }
   if (!ready) {
     daemon.kill("SIGTERM");
-    observe("packaged_memory_probe_not_run", { reason: "daemon_never_became_ready", port });
+    check("packaged_memory_probe_not_run", false, { reason: "daemon_never_became_ready", port });
     return;
   }
   const samples: Array<{ atMs: number; rows: ReturnType<typeof parsePsOutput> }> = [];
   while (Date.now() - startedAt < 20_000) {
-    const ps = spawnSync("/bin/ps", ["-axo", "pid=", "rss=", "command="], { encoding: "utf8" });
-    samples.push({
-      atMs: Date.now() - startedAt,
-      rows: parsePsOutput(ps.stdout ?? "").filter((row) => row.command.includes(artifact)),
-    });
+    const rows = readProcessRows();
+    const pids = new Set([daemon.pid]);
+    for (let changed = true; changed;) {
+      changed = false;
+      for (const row of rows) if (pids.has(row.ppid) && !pids.has(row.pid)) { pids.add(row.pid); changed = true; }
+    }
+    samples.push({ atMs: Date.now() - startedAt, rows: rows.filter(row => pids.has(row.pid)) });
     await new Promise((resolve) => setTimeout(resolve, 500));
   }
   daemon.kill("SIGTERM");
@@ -599,19 +609,15 @@ async function measurePackagedDaemon(artifact: string): Promise<void> {
   const wrapperRows = allRows.filter(
     (row) => classifyProcessCommand(row.command) === "wrapper_residue",
   );
-  const collectorRows = allRows.filter((row) => row.command.endsWith(" start"));
+  const collectorRows = allRows.filter((row) => row.pid === daemon.pid);
   const childRows = allRows.filter(
     (row) =>
-      classifyProcessCommand(row.command) === "direct_node" && !row.command.endsWith(" start"),
+      row.pid !== daemon.pid,
   );
   const peakRssMiB = (rows: typeof allRows) =>
     Number((rows.reduce((peak, row) => Math.max(peak, row.rssKb), 0) / 1024).toFixed(1));
-  const postExit = spawnSync("/bin/ps", ["-axo", "pid=", "rss=", "command="], {
-    encoding: "utf8",
-  });
-  const orphans = parsePsOutput(postExit.stdout ?? "").filter((row) =>
-    row.command.includes(artifact),
-  );
+  const observedPids = new Set(allRows.map(row => row.pid));
+  const orphans = readProcessRows().filter(row => observedPids.has(row.pid));
   check("packaged_daemon_shuts_down_within_deadline", exited, { pid: daemon.pid });
   check("packaged_chain_contains_zero_wrapper_processes", wrapperRows.length === 0, wrapperRows);
   check(
@@ -630,22 +636,32 @@ async function measurePackagedDaemon(artifact: string): Promise<void> {
       observationWindowMs: 20_000,
       samples: samples.length,
       collectorPeakRssMiB: peakRssMiB(collectorRows),
+      processTreePeakRssMiB: Math.max(...samples.map(sample => sample.rows.reduce((sum, row) => sum + row.rssKb, 0))) / 1024,
       maintenanceChildPeakRssMiB: childRows.length > 0 ? peakRssMiB(childRows) : null,
       maintenanceChildObserved: childRows.length > 0,
       wrapperProcessesObserved: wrapperRows.length,
       shutdownWithinDeadline: exited,
       orphanProcessesAfterShutdown: orphans.length,
       method:
-        "ps -axo pid=,rss=,command= sampled every 500ms for 20s; rows filtered by built-artifact path; RSS is resident set including shared pages",
+        "ps pid/ppid tree rooted at the owned daemon PID every 500ms for 20s; process titles may change; RSS sums include shared pages",
     }, null, 2)}\n`,
   );
   check("packaged_memory_receipt_written", fs.existsSync(path.join(evidenceDir, "packaged-runtime-memory.json")), {});
 }
 
+function readProcessRows() {
+  const ps = spawnSync("/bin/ps", ["-axo", "pid=,ppid=,rss=,command="], { encoding: "utf8" });
+  if (ps.status !== 0) throw new Error("process tree measurement unavailable");
+  return ps.stdout.split("\n").flatMap(line => {
+    const match = line.trim().match(/^(\d+)\s+(\d+)\s+(\d+)\s+(.+)$/);
+    return match ? [{ pid: Number(match[1]), ppid: Number(match[2]), rssKb: Number(match[3]), command: match[4]! }] : [];
+  });
+}
+
 function probeEndpoint(port: number): Promise<boolean> {
   return new Promise((resolve) => {
     const request = http.get(
-      { host: "127.0.0.1", port, path: "/api/summary", timeout: 1_000 },
+      { host: "127.0.0.1", port, path: "/healthz", timeout: 1_000 },
       (response) => {
         response.resume();
         resolve(response.statusCode === 200);

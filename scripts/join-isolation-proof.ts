@@ -22,10 +22,26 @@ import {
   JOIN_HANDSHAKE_DIRECTORY_PREFIX,
   finalizeActivatedPendingJoin,
   pendingJoinPath,
-  performJoin,
-  resumePendingJoin,
+  performJoin as rawPerformJoin,
+  resumePendingJoin as rawResumePendingJoin,
 } from "../packages/collector-cli/src/join";
-import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
+import { uploadBufferedEvents as rawUpload } from "../packages/collector-cli/src/upload";
+
+import { acknowledgingFetch } from "./fixtures/delivery-ack-fixture";
+import { deliveryAcknowledgement, deliveryExpectation } from "../packages/collector-cli/src/delivery-ack";
+const performJoin: typeof rawPerformJoin = options => rawPerformJoin({ ...options,
+  ...(options.fetchImpl ? { fetchImpl: acknowledgingFetch(options.fetchImpl) } : {}),
+});
+const resumePendingJoin: typeof rawResumePendingJoin = options => rawResumePendingJoin({ ...options,
+  ...(options?.fetchImpl ? { fetchImpl: acknowledgingFetch(options.fetchImpl) } : {}),
+});
+const uploadBufferedEvents: typeof rawUpload = (config, buffer, options = {}) => rawUpload(config, buffer, { ...options,
+  ...(options.fetchImpl ? { fetchImpl: acknowledgingFetch(options.fetchImpl) } : {}),
+});
+function successAck(body: string) {
+  const expected = deliveryExpectation(body, JSON.parse(body).installKey);
+  return { ok: true, accepted: expected.itemIds.length, ack: deliveryAcknowledgement(expected, expected.itemIds) };
+}
 
 type Check = { name: string; detail: Record<string, unknown> };
 type RequestRecord = { init?: RequestInit; url: string; body: Record<string, unknown> };
@@ -639,7 +655,7 @@ try {
           return responseJson({ ok: true, accepted: 0 }, 200);
         }) as typeof fetch,
       }),
-    /did not explicitly acknowledge exactly/i,
+    /remote_contract/i,
   );
   check(
     "two_xx_without_probe_acknowledgement_does_not_activate",
@@ -660,12 +676,13 @@ try {
         target: TOKEN,
         baseUrl: "http://workspace-b.example",
         homeDir: transportHome,
+        reassign: true,
         fetchImpl: (async () => {
           insecureCalls += 1;
           return responseJson({});
         }) as typeof fetch,
       }),
-    /must use HTTPS/i,
+    /insecure_url/i,
   );
   check(
     "external_http_rejected_before_network",
@@ -682,6 +699,7 @@ try {
         target: TOKEN,
         baseUrl: "https://workspace-b.example",
         homeDir: transportHome,
+        reassign: true,
         fetchImpl: (async (_input, init) => {
           redirectMode = init?.redirect;
           return new Response(null, {
@@ -690,7 +708,7 @@ try {
           });
         }) as typeof fetch,
       }),
-    /redirects are rejected/i,
+    /redirect_rejected/i,
   );
   check(
     "join_redirect_rejected_without_config_change",
@@ -705,6 +723,7 @@ try {
         target: TOKEN,
         baseUrl: "https://workspace-b.example",
         homeDir: transportHome,
+        reassign: true,
         fetchImpl: (async () => {
           crossOriginCalls += 1;
           return responseJson({
@@ -732,6 +751,7 @@ try {
         target: TOKEN,
         baseUrl: "https://workspace-b.example",
         homeDir: transportHome,
+        reassign: true,
         temporaryRoot: uploadRedirectTemp,
         fetchImpl: (async (input, init) => {
           uploadRedirectCalls += 1;
@@ -920,7 +940,7 @@ try {
         cliResumeRequests += 1;
         resumedProbeId = events[0]?.event?.id ?? "";
         response.writeHead(200, { "content-type": "application/json" });
-        response.end(JSON.stringify({ ok: true, accepted: 1 }));
+        response.end(JSON.stringify(successAck(body)));
         return;
       }
       heldHandshake = true;
@@ -939,6 +959,7 @@ try {
         "packages/collector-cli/src/cli.ts",
         "join",
         "--token-stdin",
+        "--reassign",
         "--url",
         `http://127.0.0.1:${address.port}`,
       ],
@@ -1046,7 +1067,7 @@ try {
         return;
       }
       response.writeHead(200, { "content-type": "application/json" });
-      response.end(JSON.stringify({ ok: true, accepted: 1 }));
+      response.end(JSON.stringify(successAck(body)));
     });
   });
   await new Promise<void>((resolve) => cliServer.listen(0, "127.0.0.1", resolve));

@@ -3,6 +3,7 @@ import crypto from "node:crypto";
 import {
   ANALYTICAL_METADATA_LIMITS,
   DEFAULT_POLICY,
+  admittedCost,
   GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
   admittedMetadataAttributes,
   actionClassSchema,
@@ -420,6 +421,8 @@ export function normalizeHookPayload(
     ...(options.gitContext ? { git: options.gitContext } : {}),
   };
 
+  const cost = admittedCost(sourceRecords);
+
   const event = aiInteractionEventSchema.parse({
     id: eventId,
     sessionId: stringFromRecords(sourceRecords, usageFieldKeys.sessionId),
@@ -443,7 +446,7 @@ export function normalizeHookPayload(
     outputTokens: numberFromRecords(sourceRecords, usageFieldKeys.outputTokens),
     cacheReadTokens: numberFromRecords(sourceRecords, usageFieldKeys.cacheReadTokens),
     cacheCreationTokens: numberFromRecords(sourceRecords, usageFieldKeys.cacheCreationTokens),
-    costUsd: numberFromRecords(sourceRecords, usageFieldKeys.costUsd),
+    ...(cost.value === undefined ? {} : { costUsd: cost.value, costKind: cost.kind }),
     metadata,
   });
 

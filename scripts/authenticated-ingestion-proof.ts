@@ -1,3 +1,5 @@
+import { createProofCompletion } from "./lib/proof-completion";
+const completion = createProofCompletion("authenticated-ingestion", 10);
 /**
  * Focused proof for the authenticated portion of issue #108 / 0059.
  *
@@ -35,6 +37,7 @@ const SENTINEL = "AUTH_PROOF_SECRET_MUST_NOT_LEAK";
 
 function check(name: string, passed: boolean, detail: unknown) {
   checks.push({ name, passed, detail });
+  completion.check(name, passed);
 }
 
 function request(
@@ -275,6 +278,7 @@ async function main() {
   const failed = checks.filter((result) => !result.passed);
   console.log(JSON.stringify({ checks: checks.length, passed: checks.length - failed.length, failed: failed.length }));
   if (failed.length > 0) process.exitCode = 1;
+  completion.complete();
 }
 
 main().catch((error) => {

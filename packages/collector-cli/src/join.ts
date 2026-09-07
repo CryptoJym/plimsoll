@@ -26,7 +26,7 @@ import {
   setDeviceStatus,
   type LocalDeviceIdentity,
 } from "./device-identity";
-import { assertNoRedirect, validatedTransportUrl } from "./http-transport";
+import { assertNoRedirect, postJson, validatedTransportUrl } from "./http-transport";
 
 /**
  * Fleet join is transactional: redeem into memory, prove only a fresh
@@ -775,9 +775,8 @@ export async function performJoin(options: {
     if (existingIdentity?.status === "revoked") {
       throw new Error("Join cannot activate a revoked device identity; reinstall to create a new device.");
     }
-    const response = await fetchImpl(joinUrl, {
-      method: "POST",
-      redirect: "manual",
+    const response = await postJson({
+      url: joinUrl.href, fetchImpl,
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         token,
@@ -785,13 +784,12 @@ export async function performJoin(options: {
         appVersion,
       }),
     });
-    assertNoRedirect(response, "Workspace join", joinUrl.origin);
-    const body = (await response.json().catch(() => ({}))) as Record<string, unknown>;
+    const body = (response.body ?? {}) as Record<string, unknown>;
 
     if (!response.ok) {
       // Never include an untrusted response body: it may contain token or grant
       // material. Refusals leave the active config byte-for-byte untouched.
-      const reason = typeof body.reason === "string" ? body.reason : "unknown_error";
+      const reason = typeof body.reason === "string" && Object.hasOwn(JOIN_REFUSAL_MESSAGES, body.reason) ? body.reason : "unknown_error";
       return {
         joined: false,
         reason,
@@ -803,7 +801,9 @@ export async function performJoin(options: {
       };
     }
 
-    const grant = joinGrantSchema.parse(body);
+    const parsedGrant = joinGrantSchema.safeParse(body);
+    if (!parsedGrant.success) throw new Error("Workspace join failed: invalid_response");
+    const grant = parsedGrant.data;
     if (
       isManagedOrUploadEnabled(existingConfig) &&
       existingConfig.tenantId !== grant.tenantId &&

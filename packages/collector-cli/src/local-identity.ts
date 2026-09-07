@@ -34,8 +34,8 @@ export type LocalIdentity = {
 };
 
 export type LocalIdentityPaths = {
-  claudeConfigPath?: string;
-  codexAuthPath?: string;
+  claudeConfigPath?: string | null;
+  codexAuthPath?: string | null;
 };
 
 function readJson(file: string): Record<string, unknown> | undefined {
@@ -61,13 +61,13 @@ function jwtClaims(token: unknown): Record<string, unknown> | undefined {
 export function readLocalIdentities(paths: LocalIdentityPaths = {}): LocalIdentity[] {
   const identities: LocalIdentity[] = [];
 
-  const claude = readJson(paths.claudeConfigPath ?? path.join(os.homedir(), ".claude.json"));
+  const claude = paths.claudeConfigPath === null ? undefined : readJson(paths.claudeConfigPath ?? path.join(os.homedir(), ".claude.json"));
   const oauth = (claude?.oauthAccount ?? {}) as Record<string, unknown>;
   if (typeof oauth.emailAddress === "string" && oauth.emailAddress.includes("@")) {
     identities.push({ source: "claude_code", email: oauth.emailAddress });
   }
 
-  const auth = readJson(paths.codexAuthPath ?? path.join(os.homedir(), ".codex", "auth.json"));
+  const auth = paths.codexAuthPath === null ? undefined : readJson(paths.codexAuthPath ?? path.join(os.homedir(), ".codex", "auth.json"));
   if (auth) {
     const tokens = (auth.tokens ?? {}) as Record<string, unknown>;
     const claims = jwtClaims(tokens.id_token) ?? {};
@@ -89,4 +89,21 @@ export function readLocalIdentities(paths: LocalIdentityPaths = {}): LocalIdenti
   }
 
   return identities;
+}
+
+/** Explicit enrollment inventory only. A missing configured file is not default-profile identity. */
+export function readProfileIdentities(profiles: Array<{
+  rootId: string; profileId: string; paths: LocalIdentityPaths;
+}>): Array<{ rootId: string; profileId: string; identities: LocalIdentity[]; state: "observed" | "unavailable" }> {
+  if (profiles.length > 64 || new Set(profiles.map(profile => profile.rootId)).size !== profiles.length) {
+    throw new Error("invalid_identity_inventory");
+  }
+  return profiles.map(profile => {
+    const identities = readLocalIdentities({
+      claudeConfigPath: profile.paths.claudeConfigPath ?? null,
+      codexAuthPath: profile.paths.codexAuthPath ?? null,
+    });
+    return { rootId: profile.rootId, profileId: profile.profileId, identities,
+      state: identities.length ? "observed" as const : "unavailable" as const };
+  });
 }

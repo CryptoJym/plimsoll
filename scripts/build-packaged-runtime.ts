@@ -171,7 +171,9 @@ export async function buildRuntime(options: {
   fs.rmSync(manifestPath, { force: true });
 
   const result = await build({
+    absWorkingDir: repoRoot,
     bundle: true,
+    metafile: true,
     entryPoints: [entry],
     external: [...EXTERNALS],
     format: "esm",
@@ -212,17 +214,23 @@ export async function buildRuntime(options: {
     ? { commit: options.sourceCommitOverride, dirty: false }
     : gitSourceCommit(repoRoot);
 
+  const epoch = process.env.SOURCE_DATE_EPOCH ?? spawnSync("git", ["show", "-s", "--format=%ct", "HEAD"], { cwd: repoRoot, encoding: "utf8" }).stdout.trim();
+  if (!/^\d+$/.test(epoch) || !Number.isFinite(Number(epoch)) || Number(epoch) > 8_640_000_000_000) fail("build_epoch_invalid", "set SOURCE_DATE_EPOCH to valid Unix seconds or build in a git checkout");
+  const inputs = Object.keys(result.metafile!.inputs).sort().map(name => ({
+    path: name, sha256: sha256File(path.resolve(repoRoot, name.replace(/ with \{.*\}$/, ""))).digest,
+  }));
+  const lock = path.join(repoRoot, "pnpm-lock.yaml");
   const manifest: RuntimeManifest = {
     schema: MANIFEST_SCHEMA,
     status: "built",
     artifact: { name: ARTIFACT_NAME, bytes: artifact.bytes, sha256: artifact.digest },
     companions,
     package: { name: pkg.name, version: pkg.version },
-    source: { commit: source.commit, dirty: source.dirty, entrypoint: entry },
+    source: { commit: source.commit, dirty: source.dirty, entrypoint: path.relative(repoRoot, entry) },
     nodeCompatibility: {
       engines: pkg.enginesNode,
       buildTarget: BUILD_TARGET,
-      runtime: { node: process.versions.node },
+      runtime: { node: process.versions.node, abi: process.versions.modules, platform: process.platform, arch: process.arch },
     },
     provenance: {
       builder: path.relative(repoRoot, SCRIPT_PATH) || SCRIPT_PATH,
@@ -231,7 +239,10 @@ export async function buildRuntime(options: {
       format: "esm",
       platform: `${process.platform}-${process.arch}`,
       external: [...EXTERNALS],
-      builtAt: new Date().toISOString(),
+      builtAt: new Date(Number(epoch) * 1000).toISOString(),
+      sourceDateEpoch: Number(epoch),
+      lockSha256: fs.existsSync(lock) ? sha256File(lock).digest : null,
+      inputsSha256: createHash("sha256").update(JSON.stringify(inputs)).digest("hex"),
     },
   };
   fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`, { mode: 0o644 });

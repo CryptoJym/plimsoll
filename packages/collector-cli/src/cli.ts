@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { AutomaticRetentionCadence } from "./retention-cadence";
 import Database from "better-sqlite3";
 import { spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
@@ -93,10 +94,10 @@ import {
   performJoin,
   resumePendingJoin,
 } from "./join";
-import { RolloutTailer } from "./rollout-tailer";
-import { TranscriptTailer } from "./transcript-tailer";
+import { createProfileCapture } from "./profile-capture";
 import {
   AutomaticMaintenanceCadence,
+  automaticRepairServiceStatus,
   CoalescingMaintenanceScheduler,
   CollectorMaintenance,
   automaticCaptureRuntimeStatus,
@@ -950,20 +951,23 @@ async function checkCollectorConnectivity(port: number, managementToken?: string
     const retentionPolicy = retention?.policy;
     const retentionLastPass = retention?.lastPass;
     const safeRetention = response.ok && body?.ok === true && retention &&
-      retention.inspection === "complete" &&
+      (retention.inspection === "complete" || retention.inspection === "bounded") &&
       retentionPolicy && typeof retentionPolicy === "object" && !Array.isArray(retentionPolicy) &&
       retentionStates && typeof retentionStates === "object" && !Array.isArray(retentionStates) &&
       retentionLastPass && typeof retentionLastPass === "object" && !Array.isArray(retentionLastPass)
       ? {
-          inspection: "complete" as const,
+          inspection: retention.inspection as "complete" | "bounded",
           policy: {
             retentionDays: Number((retentionPolicy as Record<string, unknown>).retentionDays),
             cutoffAt: String((retentionPolicy as Record<string, unknown>).cutoffAt),
           },
           states: {
-            retained: Number((retentionStates as Record<string, unknown>).retained),
-            pendingDelivery: Number((retentionStates as Record<string, unknown>).pendingDelivery),
-            quarantined: Number((retentionStates as Record<string, unknown>).quarantined),
+            retained: (retentionStates as Record<string, unknown>).retained === null ? null
+              : Number((retentionStates as Record<string, unknown>).retained),
+            pendingDelivery: (retentionStates as Record<string, unknown>).pendingDelivery === null ? null
+              : Number((retentionStates as Record<string, unknown>).pendingDelivery),
+            quarantined: (retentionStates as Record<string, unknown>).quarantined === null ? null
+              : Number((retentionStates as Record<string, unknown>).quarantined),
             expired: Number((retentionStates as Record<string, unknown>).expired),
             notInspected: Number((retentionStates as Record<string, unknown>).notInspected),
           },
@@ -1337,11 +1341,8 @@ async function main() {
           ms: Math.max(0, Math.round(performance.now() - startedAt)),
         }));
         startedAt = performance.now();
-        const workerMaintenance = new CollectorMaintenance(
-          workerBuffer,
-          new RolloutTailer(workerBuffer),
-          new TranscriptTailer(workerBuffer),
-        );
+        const capture = createProfileCapture(workerBuffer, workerConfig);
+        const workerMaintenance = new CollectorMaintenance(workerBuffer, capture.rollout, capture.transcript);
         console.error(JSON.stringify({
           warning: "maintenance_worker_stage", stage: "maintenance_constructed",
           ms: Math.max(0, Math.round(performance.now() - startedAt)),
@@ -1724,14 +1725,16 @@ async function main() {
     } catch {
       detectedIdentities = [];
     }
-    let refreshStatusSnapshot = () => false;
-    const starvationReceiptSnapshot = () => {
+    let refreshStatusSnapshot: (failure?: "maintenance_failed") => boolean = () => false;
+    let retentionCadence: AutomaticRetentionCadence | undefined;
+    const readStarvationReceipt = () => {
       try {
         return maintenanceStarvationReceipt(buffer.database);
       } catch {
         return null;
       }
     };
+    let cachedStarvationReceipt = readStarvationReceipt();
     const server = createCollectorServer(config, buffer, {
       runtimeIdentity,
       homeIdentityHash: collectorHomeIdentityHash(collectorHome()),
@@ -1742,12 +1745,17 @@ async function main() {
         boundary: maintenanceBoundary.status(),
         scheduler: scheduler?.status() ?? null,
         cadence: maintenanceCadence?.status() ?? null,
-        starvation: starvationReceiptSnapshot(),
+        retentionCadence: retentionCadence?.status() ?? null,
+        starvation: cachedStarvationReceipt,
       }),
       detectedIdentities: () => detectedIdentities,
       outcomePerformance: (days, asOf) => outcomeTimelineStore.performanceSummary(days, asOf),
       registerStatusRefresher: (refresh) => {
-        refreshStatusSnapshot = refresh;
+        refreshStatusSnapshot = (failure) => {
+          cachedStarvationReceipt = readStarvationReceipt();
+          try { cachedBaseline = captureBaselineStatus(buffer.database); } catch { /* retain last observation */ }
+          return refresh(failure);
+        };
       },
     });
     let ownsPidFile = false;
@@ -1755,22 +1763,6 @@ async function main() {
     const timers: NodeJS.Timeout[] = [];
     let syncFailureStreak = 0;
     let syncInFlight = false;
-
-    const runPrune = () => {
-      try {
-        const pruned = buffer.prune(config.retentionDays);
-        if (pruned.events > 0 || pruned.metricSamples > 0) {
-          console.log(JSON.stringify({ status: "pruned", ...pruned }));
-        }
-      } catch (error) {
-        console.warn(
-          JSON.stringify({
-            warning: "prune_failed",
-            message: error instanceof Error ? error.message : String(error),
-          }),
-        );
-      }
-    };
 
     let syncSkipUntil = 0;
     // Sessions whose snapshot push failed (or was interrupted) carry over to
@@ -1960,13 +1952,38 @@ async function main() {
       }
       return result;
     });
+    retentionCadence = new AutomaticRetentionCadence(
+      () => buffer.prune(config.retentionDays, { maxRows: 128 }),
+      {
+        canRun: () => !scheduler?.status().inFlight && !enrichmentScheduler?.status().inFlight,
+        onPass: (receipt) => {
+          if (receipt.events || receipt.metricSamples) console.log(JSON.stringify({ status: "pruned", ...receipt }));
+        },
+        onError: () => console.warn(JSON.stringify({ warning: "prune_failed" })),
+      },
+    );
     maintenanceCadence = new AutomaticMaintenanceCadence(
       scheduler,
       () => cachedBaseline,
       {
+        repairProgress: () => {
+          const projection = buffer.projection.status();
+          const repairs = automaticRepairServiceStatus(buffer.database);
+          return {
+            pending: Object.values(projection.backlog).some(n => n > 0) ||
+              !projection.backfill.complete || !projection.backfill.parityComplete || !projection.backfill.metricComplete,
+            units: Object.values(repairs.stages).reduce((sum, stage) => sum + stage.rowsVisited, 0) +
+              projection.counters.snapshotBuilds + projection.counters.expiryFacts + projection.counters.compactGcItemsVisited,
+          };
+        },
+        retryNotBefore: () => {
+          const at = maintenanceBoundary.status().circuit.openUntil;
+          return at ? Date.parse(at) : null;
+        },
         onError: (error) => {
           if (shuttingDown && error instanceof Error &&
             error.message === "maintenance_boundary_stopping") return;
+          refreshStatusSnapshot("maintenance_failed");
           console.warn(
             JSON.stringify({
               warning: "maintenance_failed",
@@ -2014,13 +2031,12 @@ async function main() {
       },
     });
 
-    runPrune();
+    retentionCadence.start();
     // Boot capture is deferred so the OTLP receiver binds first, but it uses
     // the exact same bounded recent-tail entrypoint as the interval. Historical
     // files are available only through the explicit scan commands below.
     maintenanceCadence.start();
     enrichmentCadence.start();
-    timers.push(setInterval(runPrune, 6 * 60 * 60 * 1000));
     if (config.uploadUrl) {
       timers.push(setInterval(() => void runSync(), config.syncIntervalSeconds * 1000));
     }
@@ -2028,6 +2044,7 @@ async function main() {
 
     const stopMaintenanceBeforeFatalExit = async () => {
       maintenanceCadence?.stop();
+      retentionCadence?.stop();
       enrichmentCadence?.stop();
       for (const timer of timers) clearInterval(timer);
       scheduler?.stopAccepting();
@@ -2072,6 +2089,7 @@ async function main() {
       shuttingDown = true;
       flushRejectionSummaries();
       maintenanceCadence?.stop();
+      retentionCadence?.stop();
       enrichmentCadence?.stop();
       for (const timer of timers) clearInterval(timer);
       scheduler?.stopAccepting();
@@ -2441,26 +2459,30 @@ async function main() {
 
   if (command === "scan-rollouts") {
     const buffer = openBuffer(config);
-    const result = await new RolloutTailer(buffer).scan({ scope: "full" });
+    const capture = createProfileCapture(buffer, config);
+    const result = await capture.rollout.scan({ scope: "full" });
     const historyCoverage = recordExplicitFullHistoryCoverage(
       buffer.database,
       "codex",
       result,
     );
     console.log(JSON.stringify({ ...result, historyCoverage }, null, 2));
+    capture.close();
     buffer.close();
     return;
   }
 
   if (command === "scan-transcripts") {
     const buffer = openBuffer(config);
-    const result = await new TranscriptTailer(buffer).scan({ scope: "full" });
+    const capture = createProfileCapture(buffer, config);
+    const result = await capture.transcript.scan({ scope: "full" });
     const historyCoverage = recordExplicitFullHistoryCoverage(
       buffer.database,
       "claude_code",
       result,
     );
     console.log(JSON.stringify({ ...result, historyCoverage }, null, 2));
+    capture.close();
     buffer.close();
     return;
   }

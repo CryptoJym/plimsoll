@@ -1,3 +1,5 @@
+import { createProofCompletion } from "./lib/proof-completion";
+const completion = process.env.PLIMSOLL_PROOF_CLOCK_CASE === "1" ? null : createProofCompletion("signal-fidelity", 107);
 /**
  * Signal-fidelity proof for the v2 collector capture path.
  *
@@ -151,6 +153,7 @@ type Check = { name: string; passed: boolean; detail: string };
 const checks: Check[] = [];
 function check(name: string, passed: boolean, detail: string | undefined) {
   checks.push({ name, passed, detail: detail ?? "(no detail)" });
+  completion?.check(name, passed);
 }
 
 function resolveDeferredRepoContexts(buffer: LocalEventBuffer) {
@@ -4020,6 +4023,7 @@ async function main() {
 
   console.log(JSON.stringify(artifact, null, 2));
   if (!passed) process.exitCode = 1;
+  completion!.complete();
 }
 
 if (process.env.PLIMSOLL_PROOF_CLOCK_CASE === "1") {

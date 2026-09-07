@@ -22,6 +22,20 @@ const REPO_BACKFILL_CURSOR_KEY = "repo_enrichment_backfill_cursor";
 const REPO_BACKFILL_COMPLETE_KEY = "repo_enrichment_backfill_complete";
 const AUTOMATIC_CAPTURE_SOURCE_TURN_KEY = "automatic_capture_source_turn";
 const AUTOMATIC_CAPTURE_RUNTIME_TABLE = "automatic_capture_runtime_state";
+const REPAIR_SERVICE_KEY = "automatic_repair_service_v1";
+const REPAIR_STAGES = ["projection", "reconciliation", "repricing", "repo_context_suppression"] as const;
+type RepairStage = typeof REPAIR_STAGES[number];
+type RepairService = { next: number; cycles: number; stages: Record<RepairStage, {
+  attempts: number; completed: number; failures: number; rowsVisited: number; lastSuccessAt: string | null;
+}> };
+
+export function automaticRepairServiceStatus(database: Database.Database): RepairService {
+  const stored = maintenanceState(database, REPAIR_SERVICE_KEY);
+  if (stored) return JSON.parse(stored) as RepairService;
+  return { next: 0, cycles: 0, stages: Object.fromEntries(REPAIR_STAGES.map(stage => [stage, {
+    attempts: 0, completed: 0, failures: 0, rowsVisited: 0, lastSuccessAt: null,
+  }])) as RepairService["stages"] };
+}
 
 function ensureAutomaticCaptureRuntimeState(database: Database.Database) {
   database.exec(`
@@ -269,9 +283,11 @@ export function runRepricingMaintenance(
     const apply = database.prepare(
       `update buffered_events set
          cost_usd = @costUsd,
+         cost_kind = 'estimated',
          payload_json = json_set(
            payload_json,
            '$.costUsd', @costUsd,
+           '$.costKind', 'estimated',
            '$.metadata.costEstimated', json('true')
          )
        where id = @id and cost_usd is null`,
@@ -556,6 +572,7 @@ export type CollectorMaintenanceRunResult = {
   projectionDrain?: ProjectionDrainResult;
   rawEventWrites: number;
   postCaptureDeferred?: string[];
+  repairService?: RepairService;
   stageTimings?: MaintenanceStageTimings;
 };
 
@@ -701,6 +718,85 @@ export class CollectorMaintenance {
     let codexCaptureMs = 0;
     let claudeCaptureMs = 0;
     const budget = new CaptureWorkBudget();
+    // Reserve service before capture can consume the shared 200ms allowance.
+    // Rotate the first bounded unit durably: even an overrun/failure cannot
+    // manufacture starvation across worker restarts. At most 75ms of new
+    // repair units are admitted; a synchronous unit retains its existing row
+    // bound and its actual duration remains part of the capture budget.
+    const repairService = automaticRepairServiceStatus(this.buffer.database);
+    const firstRepair = repairService.next % REPAIR_STAGES.length;
+    repairService.next = (firstRepair + 1) % REPAIR_STAGES.length;
+    repairService.cycles += 1;
+    const saveRepairService = () => setMaintenanceState(this.buffer.database,
+      REPAIR_SERVICE_KEY, JSON.stringify(repairService));
+    saveRepairService();
+    const postCaptureDeferred: string[] = ["enrichment"];
+    let reconciliation: CodexReconciliationResult = {
+      backfillComplete: false, legacyRowsVisited: 0, contextRowsVisited: 0,
+      candidateRowsVisited: 0, rowsVisited: 0, rowsChanged: 0, stitched: 0,
+      priced: 0, sliceDurationMs: 0, timeBudgetExhausted: true,
+    };
+    let repricing: RepricingMaintenanceResult = {
+      catalogFingerprint: pricingCatalogFingerprint(), catalogChanged: false,
+      backfillComplete: false, legacyRowsVisited: 0, candidateRowsVisited: 0,
+      rowsVisited: 0, repriced: 0,
+    };
+    const enrichment: RepoEnrichmentMaintenanceResult = {
+      backfillComplete: false, legacyRowsVisited: 0, sessionsVisited: 0,
+      candidateRowsVisited: 0, rowsVisited: 0, backward: 0, forward: 0,
+    };
+    let reconciliationMs = 0, repricingMs = 0, enrichmentMs = 0, projectionDrainMs = 0;
+    let drained: Awaited<ReturnType<typeof drainProjectionMigration>> | null = null;
+    const repairStarted = performance.now();
+    for (let offset = 0; offset < REPAIR_STAGES.length; offset += 1) {
+      const stage = REPAIR_STAGES[(firstRepair + offset) % REPAIR_STAGES.length];
+      if (this.signal?.aborted || (offset > 0 &&
+          (performance.now() - repairStarted >= 75 || !budget.canStart(5)))) {
+        postCaptureDeferred.push(stage);
+        continue;
+      }
+      const counter = repairService.stages[stage];
+      counter.attempts += 1;
+      saveRepairService();
+      const stageStarted = clock();
+      try {
+        let rows = 0;
+        switch (stage) {
+          case "projection":
+            drained = await drainProjectionMigration(this.buffer.projection, {
+              maxSlices: 1, maxActiveMs: 25, signal: this.signal,
+            });
+            rows = drained.receipt.repairRowsVisited + drained.receipt.backfillRowsVisited +
+              drained.receipt.parityRowsVisited + drained.receipt.metricRowsVisited +
+              drained.receipt.sessionRepairRowsVisited;
+            projectionDrainMs = Math.max(0, Math.round(clock() - stageStarted));
+            break;
+          case "reconciliation":
+            reconciliation = runCodexReconciliationMaintenance(this.buffer.database, {
+              legacyRowLimit: 64, legacyChunkLimit: 64, contextWindowLimit: 2,
+              contextRowLimit: 64, candidateLimit: 32, freshCandidateLimit: 16,
+              timeLimitMs: 25,
+            });
+            rows = reconciliation.rowsVisited;
+            reconciliationMs = Math.max(0, Math.round(clock() - stageStarted));
+            break;
+          case "repricing":
+            repricing = runRepricingMaintenance(this.buffer.database, { backfillLimit: 32, candidateLimit: 32 });
+            rows = repricing.rowsVisited;
+            repricingMs = Math.max(0, Math.round(clock() - stageStarted));
+            break;
+          case "repo_context_suppression":
+            rows = this.buffer.drainRepoContextSuppressions().rowsVisited;
+            break;
+        }
+        counter.completed += 1;
+        counter.rowsVisited += rows;
+        counter.lastSuccessAt = new Date(Date.now()).toISOString();
+      } catch (error) {
+        counter.failures += 1;
+        throw error;
+      } finally { saveRepairService(); }
+    }
     const baselineAtStart = captureBaselineStatus(this.buffer.database);
     // Completed source snapshots stay armed while a per-generation ambiguity
     // blocks aggregate readiness. Capture classification remains globally
@@ -796,80 +892,12 @@ export class CollectorMaintenance {
       this.current = null;
     }
     if (!rollout || !transcript) throw new Error("automatic_maintenance_result_missing");
-    const postCaptureDeferred: string[] = [];
-    if (!this.signal?.aborted && budget.canStart(5)) {
-      this.buffer.drainRepoContextSuppressions();
-    } else postCaptureDeferred.push("repo_context_suppression");
-    let reconciliation: CodexReconciliationResult = {
-      backfillComplete: false, legacyRowsVisited: 0, contextRowsVisited: 0,
-      candidateRowsVisited: 0, rowsVisited: 0, rowsChanged: 0, stitched: 0,
-      priced: 0, sliceDurationMs: 0, timeBudgetExhausted: true,
-    };
-    let reconciliationMs = 0;
-    if (!this.signal?.aborted && budget.canStart(15)) {
-      const stageStartedAtMs = clock();
-      try {
-        reconciliation = runCodexReconciliationMaintenance(this.buffer.database, {
-          legacyRowLimit: 64,
-          legacyChunkLimit: 64,
-          contextWindowLimit: 2,
-          contextRowLimit: 64,
-          candidateLimit: 32,
-          freshCandidateLimit: 16,
-          timeLimitMs: Math.max(1, Math.min(25, Math.floor(budget.remainingWallMs() - 5))),
-        });
-      } finally {
-        reconciliationMs = Math.max(0, Math.round(clock() - stageStartedAtMs));
-      }
-    } else postCaptureDeferred.push("reconciliation");
-    let repricing: RepricingMaintenanceResult = {
-      catalogFingerprint: pricingCatalogFingerprint(), catalogChanged: false,
-      backfillComplete: false, legacyRowsVisited: 0, candidateRowsVisited: 0,
-      rowsVisited: 0, repriced: 0,
-    };
-    let repricingMs = 0;
-    if (!this.signal?.aborted && budget.canStart(12)) {
-      const stageStartedAtMs = clock();
-      try {
-        repricing = runRepricingMaintenance(this.buffer.database, {
-          backfillLimit: 32,
-          candidateLimit: 32,
-        });
-      } finally {
-        repricingMs = Math.max(0, Math.round(clock() - stageStartedAtMs));
-      }
-    } else postCaptureDeferred.push("repricing");
-    let enrichment: RepoEnrichmentMaintenanceResult = {
-      backfillComplete: false, legacyRowsVisited: 0, sessionsVisited: 0,
-      candidateRowsVisited: 0, rowsVisited: 0, backward: 0, forward: 0,
-    };
-    let enrichmentMs = 0;
-    // Enrichment is intentionally not part of the automatic capture job. On
-    // a production-size ledger its synchronous candidate query measured about
-    // 29 seconds per row, so even one call can consume the entire boundary.
-    // The low-priority one-row enrichment job owns this queue instead.
-    postCaptureDeferred.push("enrichment");
-    if (rollout.activity && !this.signal?.aborted && budget.canStart(3)) {
+    if (rollout.activity && !this.signal?.aborted) {
       this.buffer.projection.recordCaptureActivity({ source: "codex", ...rollout.activity });
-    } else postCaptureDeferred.push("codex_activity");
-    if (transcript.activity && !this.signal?.aborted && budget.canStart(3)) {
+    }
+    if (transcript.activity && !this.signal?.aborted) {
       this.buffer.projection.recordCaptureActivity({ source: "claude_code", ...transcript.activity });
-    } else postCaptureDeferred.push("claude_activity");
-    let projectionDrainMs = 0;
-    const drained = !this.signal?.aborted && budget.canStart(10)
-      ? await (() => {
-          const stageStartedAtMs = clock();
-          return drainProjectionMigration(this.buffer.projection, {
-            maxSlices: 1,
-            maxActiveMs: Math.max(1, Math.min(25, Math.floor(budget.remainingWallMs() - 5))),
-            signal: this.signal,
-            budget,
-          }).finally(() => {
-            projectionDrainMs = Math.max(0, Math.round(clock() - stageStartedAtMs));
-          });
-        })()
-      : null;
-    if (!drained) postCaptureDeferred.push("projection");
+    }
     const errorCount =
       rollout.discoveryErrors + rollout.statErrors + rollout.readErrors + rollout.parseErrors + rollout.unresolvedRecords +
       transcript.discoveryErrors + transcript.statErrors + transcript.readErrors + transcript.parseErrors + transcript.unresolvedRecords;
@@ -899,6 +927,7 @@ export class CollectorMaintenance {
       ...(drained ? { projection: drained.receipt, projectionDrain: drained.drain } : {}),
       rawEventWrites: rollout.eventsAppended + transcript.eventsAppended,
       postCaptureDeferred,
+      repairService,
       stageTimings: {
         codexCaptureMs,
         claudeCaptureMs,
@@ -1089,7 +1118,7 @@ export const AUTOMATIC_MAINTENANCE_NORMAL_INTERVAL_MS = 60_000;
 export type AutomaticMaintenanceCadenceStatus = {
   accepting: boolean;
   inFlight: boolean;
-  retryClass: "boot" | "startup" | "normal" | null;
+  retryClass: "boot" | "startup" | "repair" | "circuit" | "normal" | null;
   nextRetryAt: string | null;
   startupIntervalMs: number;
   normalIntervalMs: number;
@@ -1118,7 +1147,7 @@ export class AutomaticMaintenanceCadence<
   private accepting = true;
   private inFlight = false;
   private timer: unknown | null = null;
-  private retryClass: "boot" | "startup" | "normal" | null = null;
+  private retryClass: "boot" | "startup" | "repair" | "circuit" | "normal" | null = null;
   private nextRetryAt: string | null = null;
   private triggerCount = 0;
   private failedTriggers = 0;
@@ -1130,6 +1159,8 @@ export class AutomaticMaintenanceCadence<
       startupIntervalMs?: number;
       normalIntervalMs?: number;
       activeBudgetMs?: number;
+      repairProgress?: () => { pending: boolean; units: number };
+      retryNotBefore?: () => number | null;
       onError?: (error: unknown) => void;
       timer?: AutomaticMaintenanceCadenceTimer;
     } = {},
@@ -1202,9 +1233,13 @@ export class AutomaticMaintenanceCadence<
     return after.state === "in_progress" && advanced ? "startup" : "normal";
   }
 
-  private schedule(retryClass: "boot" | "startup" | "normal") {
+  private schedule(retryClass: "boot" | "startup" | "repair" | "circuit" | "normal") {
     if (!this.accepting || this.timer) return;
-    const delay = retryClass === "normal" ? this.normalIntervalMs() : this.startupIntervalMs();
+    const now = this.timerApi().now();
+    const notBefore = this.options.retryNotBefore?.() ?? null;
+    const delay = notBefore !== null && notBefore > now ? notBefore - now
+      : retryClass === "normal" ? this.normalIntervalMs() : this.startupIntervalMs();
+    if (notBefore !== null && notBefore > now) retryClass = "circuit";
     this.retryClass = retryClass;
     const timerApi = this.timerApi();
     this.nextRetryAt = new Date(timerApi.now() + delay).toISOString();
@@ -1226,9 +1261,15 @@ export class AutomaticMaintenanceCadence<
     this.triggerCount += 1;
     let failed = false;
     let discoveryAdvanced = false;
-    const baselineBefore = this.baselineStatus().progress;
+    let baselineBefore: ReturnType<typeof captureBaselineStatus>["progress"] | null = null;
+    let repairBefore: { pending: boolean; units: number } | null = null;
+    let repairAdvanced = false;
     try {
+      baselineBefore = this.baselineStatus().progress;
+      repairBefore = this.options.repairProgress?.() ?? null;
       const results = await requestAutomaticRecentMaintenance(this.scheduler);
+      const repairAfter = this.options.repairProgress?.();
+      repairAdvanced = Boolean(repairAfter?.pending && repairAfter.units > (repairBefore?.units ?? 0));
       discoveryAdvanced = results.some(
         (result) =>
           !isMaintenancePartialOutcome(result) && (
@@ -1243,12 +1284,16 @@ export class AutomaticMaintenanceCadence<
     } finally {
       this.inFlight = false;
       if (this.accepting) {
-        const baselineAfter = this.baselineStatus().progress;
-        this.schedule(
-          failed
-            ? "normal"
-            : this.classifyRetry(baselineBefore, baselineAfter, discoveryAdvanced),
-        );
+        let retry: "normal" | "repair" | "startup" = "normal";
+        try {
+          const baselineAfter = this.baselineStatus().progress;
+          if (!failed && baselineBefore) retry = repairAdvanced ? "repair"
+            : this.classifyRetry(baselineBefore, baselineAfter, discoveryAdvanced);
+        } catch (error) {
+          this.failedTriggers += 1;
+          this.options.onError?.(error);
+        }
+        this.schedule(retry);
       }
     }
   }

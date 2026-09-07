@@ -12,3 +12,6 @@ dist/
 .oc-data/
 .p181-preserved/
 opencode.json
+
+# Also ignore a local dependency symlink used by isolated worktrees.
+/node_modules

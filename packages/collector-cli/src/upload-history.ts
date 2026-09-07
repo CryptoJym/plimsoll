@@ -4,6 +4,8 @@ import fs from "node:fs";
 import Database from "better-sqlite3";
 
 import type { CollectorConfig } from "./config";
+import { postDelivery } from "./delivery-post";
+import { TransportError, type JsonPostResult } from "./http-transport";
 import {
   assertCollectorPrivacyMode,
   collectorBufferPath,
@@ -542,6 +544,7 @@ export async function postHistoryBatch(input: {
   fetchImpl: typeof fetch;
   sleep: (ms: number) => Promise<void>;
   maxAttempts: number;
+  timeoutMs?: number;
   log: (line: string) => void;
 }): Promise<{
   accepted: number;
@@ -550,76 +553,37 @@ export async function postHistoryBatch(input: {
   updated: number | null;
   attempts: number;
 }> {
-  let lastError = "";
+  let lastError = "network_error";
   for (let attempt = 1; attempt <= input.maxAttempts; attempt += 1) {
-    const headers: Record<string, string> = {
-      "content-type": "application/json",
-      "x-plimsoll-install-key": input.installKey,
-    };
-    if (input.ingestKey) headers["x-plimsoll-ingest-key"] = input.ingestKey;
-    if (input.signingSecret) {
-      const timestamp = new Date().toISOString();
-      const digest = crypto
-        .createHmac("sha256", input.signingSecret)
-        .update(`${timestamp}.${input.body}`)
-        .digest("hex");
-      headers["x-plimsoll-upload-timestamp"] = timestamp;
-      headers["x-plimsoll-upload-signature"] = `sha256=${digest}`;
-    }
-
-    let response: Response | null = null;
+    let response: JsonPostResult | undefined;
     try {
-      response = await input.fetchImpl(input.url, { method: "POST", headers, body: input.body });
+      response = await postDelivery({ ...input, timeoutMs: input.timeoutMs });
     } catch (error) {
-      lastError = `network: ${error instanceof Error ? error.message : String(error)}`;
+      lastError = error instanceof TransportError ? error.code : "invalid_acknowledgement";
+      if (lastError !== "network_error" && lastError !== "deadline_exceeded") {
+        throw new FatalUploadError(`Workspace delivery deferred: ${lastError}. Resume state retained.`);
+      }
     }
-
     if (response?.ok) {
-      const body = (await response.json().catch(() => ({}))) as {
-        accepted?: unknown;
-        inserted?: unknown;
-        matched?: unknown;
-        updated?: unknown;
-      };
-      const accepted = typeof body.accepted === "number" ? body.accepted : 0;
-      // Additive field from the cloud's bulk-ingest fast lane (cloud PR #19):
-      // how many rows were genuinely new. Older servers omit it.
-      const inserted = typeof body.inserted === "number" ? body.inserted : null;
-      // Attribution-repair lane responses (issue 0036).
-      const matched = typeof body.matched === "number" ? body.matched : null;
-      const updated = typeof body.updated === "number" ? body.updated : null;
-      return { accepted, inserted, matched, updated, attempts: attempt };
+      const body = response.body as Record<string, unknown>;
+      const counter = (key: string) => typeof body[key] === "number" ? body[key] as number : null;
+      // The identity list, not an optional legacy count, authorizes progress.
+      const accepted = (body.ack as { acceptedIds: string[] }).acceptedIds.length;
+      return { accepted, inserted: counter("inserted"), matched: counter("matched"), updated: counter("updated"), attempts: attempt };
     }
-
-    if (response && response.status !== 429 && response.status < 500) {
-      // NB: ingest error bodies can echo request fields — surface only the
-      // server's error code, never the raw body (it can contain the install key).
-      const errorBody = (await response.json().catch(() => ({}))) as { error?: unknown };
-      const errorCode = typeof errorBody.error === "string" ? errorBody.error : "unknown_error";
-      throw new FatalUploadError(
-        `Workspace ingest refused the batch with HTTP ${response.status} (${errorCode}). ` +
-          (response.status === 401 || response.status === 403
-            ? "This is an auth/signature failure — check that this machine's join credentials (installKey / uploadSigningSecret in collector.config.json) still match the workspace. Failing closed; nothing further was uploaded."
-            : "The batch payload was rejected — schema drift between collector and cloud. Failing closed; nothing further was uploaded."),
-      );
+    if (response && response.status !== 408 && response.status !== 429 && response.status < 500) {
+      throw new FatalUploadError(`Workspace delivery deferred: remote_${response.status}. Resume state retained.`);
     }
-
-    if (response) {
-      lastError = `HTTP ${response.status}`;
-    }
+    if (response) lastError = `remote_${response.status}`;
     if (attempt < input.maxAttempts) {
       const retryAfterSeconds = Number(response?.headers.get("retry-after") ?? "");
-      const backoffMs =
-        Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
-          ? Math.min(120_000, retryAfterSeconds * 1000)
-          : Math.min(30_000, 1_000 * 2 ** (attempt - 1));
+      const backoffMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+        ? Math.min(120_000, retryAfterSeconds * 1000) : Math.min(30_000, 1_000 * 2 ** (attempt - 1));
       input.log(JSON.stringify({ status: "workspace_backfill_retry", attempt, backoffMs, error: lastError }));
       await input.sleep(backoffMs);
     }
   }
-  throw new FatalUploadError(
-    `Workspace ingest unreachable after ${input.maxAttempts} attempts (${lastError}). The resume watermark is saved; re-run to continue.`,
-  );
+  throw new FatalUploadError(`Workspace delivery deferred after ${input.maxAttempts} attempts: ${lastError}. Resume state retained.`);
 }
 
 /**
@@ -851,6 +815,7 @@ export async function runWorkspaceHistoryUpload(
           fetchImpl,
           sleep,
           maxAttempts,
+          timeoutMs: config.delivery.requestTimeoutSeconds * 1_000,
           log,
         });
         batchesSent += 1;
@@ -1214,6 +1179,7 @@ export async function runAttributionRepair(
           fetchImpl,
           sleep,
           maxAttempts,
+          timeoutMs: config.delivery.requestTimeoutSeconds * 1_000,
           log,
         });
         batches += 1;

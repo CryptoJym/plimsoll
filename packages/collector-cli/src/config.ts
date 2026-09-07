@@ -5,6 +5,7 @@ import path from "node:path";
 import { z } from "zod";
 
 import { DEFAULT_POLICY, LOCAL_TENANT_ID, policyConfigSchema } from "../../shared/src/index";
+import { captureRootSchema, validateCaptureRoots } from "./capture-root-inventory";
 import { resolveCollectorHome } from "./collector-home";
 
 export const DEFAULT_COLLECTOR_PORT = 48271;
@@ -61,6 +62,10 @@ export const collectorConfigSchema = z
     retentionDays: z.number().int().min(1).max(3650).default(90),
     startupWalCheckpointBytes: z.number().int().min(1).max(100 * 1024 * 1024 * 1024)
       .default(1024 * 1024 * 1024),
+    captureRoots: z.array(captureRootSchema).max(64).optional().superRefine((roots, ctx) => {
+      if (!roots) return;
+      try { validateCaptureRoots(roots); } catch { ctx.addIssue({ code: "custom", message: "Invalid or overlapping capture root inventory" }); }
+    }),
     subscriptions: z
       .array(
         z.object({

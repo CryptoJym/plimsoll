@@ -15,6 +15,8 @@ import { DeliveryOutbox, type DeliveryLimits } from "./outbox";
 import { DashboardProjectionStore } from "./dashboard-projection";
 import { LearningFactStore, type LearningFactLimits } from "./learning-facts";
 import { promoteRuntimeLearningFacts } from "./runtime-facts";
+import { ensureFinanceProvenanceSchema, initializeFinanceSourceCoverage, markFinancePublicationDirty,
+  advanceFinanceRetentionWatermarks, type FinanceCoverageMutationRow } from "./history-coverage";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import {
   canonicalRepoContextCwd,
@@ -98,6 +100,8 @@ const REPO_CONTEXT_COUNTER_LIMIT = 1_000_000_000;
 const REPO_CONTEXT_CONFLICT_ROW_LIMIT = 128;
 const REPO_CONTEXT_RESULT_LIMIT = 4_096;
 const REPO_CONTEXT_RESULT_GC_LIMIT = 128;
+const CANONICAL_PROJECT_KEY = /^sha256:[a-f0-9]{64}$/i;
+type CostKind = "reported" | "estimated" | "unknown";
 
 function sha256DigestHex(text: string) {
   return crypto.createHash("sha256").update(text).digest();
@@ -142,6 +146,20 @@ function gitField(event: AiInteractionEvent, key: string): string | null {
   return typeof value === "string" && value ? value : null;
 }
 
+function canonicalProjectKey(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const normalized = value.trim().toLowerCase();
+  return CANONICAL_PROJECT_KEY.test(normalized) ? normalized : null;
+}
+
+function admittedCostKind(event: AiInteractionEvent): CostKind | null {
+  if (event.costUsd === undefined) return null;
+  const candidate = (event as AiInteractionEvent & { costKind?: unknown }).costKind;
+  return candidate === "reported" || candidate === "estimated" || candidate === "unknown"
+    ? candidate
+    : "unknown";
+}
+
 const EVENT_COLUMNS = [
   "session_id text",
   "action_class text",
@@ -158,6 +176,9 @@ const EVENT_COLUMNS = [
   "machine text",
   "account_hash text",
   "workspace_id text",
+  "installation_epoch_id text",
+  "project_key text",
+  "cost_kind text check (cost_kind is null or cost_kind in ('reported','estimated','unknown'))",
   "device_id text",
   "privacy_generation text",
   "privacy_disposition text",
@@ -176,6 +197,7 @@ export class LocalEventBuffer {
   readonly delivery: DeliveryOutbox;
   readonly projection: DashboardProjectionStore;
   readonly learningFacts: LearningFactStore;
+  private insertEventStatement?: Database.Statement;
 
   constructor(
     path: string,
@@ -323,7 +345,9 @@ export class LocalEventBuffer {
         singleton integer primary key check (singleton = 1),
         current_workspace_id text not null,
         previous_workspace_id text,
-        changed_at text not null
+        changed_at text not null,
+        current_installation_epoch_id text,
+        current_installation_epoch_started_at text
       );
       create table if not exists session_usage_authority (
         source text not null,
@@ -447,6 +471,8 @@ export class LocalEventBuffer {
       this.recordRepoContextDrop("resolution_failed", discardedRepoContextResults);
     }
     this.migrateEventColumns();
+    this.migrateWorkspaceBindingColumns();
+    ensureFinanceProvenanceSchema(this.db);
     const bindingColumns = new Set(
       (this.db.pragma("table_info(collector_workspace_binding)") as Array<{ name: string }>)
         .map((column) => column.name),
@@ -477,6 +503,12 @@ export class LocalEventBuffer {
         and new.privacy_generation is not old.privacy_generation
       begin
         select raise(abort, 'privacy_generation_is_immutable');
+      end;
+      create trigger if not exists trg_events_installation_epoch_immutable
+      before update of installation_epoch_id on buffered_events
+      when new.installation_epoch_id is not old.installation_epoch_id
+      begin
+        select raise(abort, 'installation_epoch_id_is_immutable');
       end;
       create trigger if not exists trg_events_privacy_disposition_terminal
       before update of privacy_disposition on buffered_events
@@ -758,6 +790,7 @@ export class LocalEventBuffer {
             .run(requestedDevice, LOCAL_TENANT_ID);
         }
       }
+      this.ensureCurrentInstallationEpoch(requested);
       // Deliberately no backfill for managed workspaces here or in any later
       // selection: once a managed workspace is selected, unassigned history is
       // permanently ineligible for that audience (lease and list filters are
@@ -825,6 +858,9 @@ export class LocalEventBuffer {
            where singleton = 1`,
         )
         .run({ to, deviceId: requestedDevice, now: new Date().toISOString() });
+      this.db.prepare(`update collector_workspace_binding set
+        current_installation_epoch_id = null, current_installation_epoch_started_at = null where singleton = 1`).run();
+      this.ensureCurrentInstallationEpoch(to);
       // Auth/contract circuits describe the prior workspace endpoint and must
       // not block the newly authenticated audience after reassignment.
       this.delivery.clearCircuit();
@@ -837,6 +873,19 @@ export class LocalEventBuffer {
     return { fromWorkspaceId: from, toWorkspaceId: to, boundLegacyRows: 0 };
   }
 
+  private ensureCurrentInstallationEpoch(workspaceId: string) {
+    const row = this.db.prepare(`select current_installation_epoch_id as id,
+      current_installation_epoch_started_at as startedAt from collector_workspace_binding where singleton=1`).get() as
+      { id: string | null; startedAt: string | null };
+    if (!row.id) {
+      row.id = crypto.randomUUID(); row.startedAt = new Date().toISOString();
+      this.db.prepare(`update collector_workspace_binding set current_installation_epoch_id=?,
+        current_installation_epoch_started_at=? where singleton=1`).run(row.id,row.startedAt);
+      markFinancePublicationDirty(this.db);
+    }
+    initializeFinanceSourceCoverage(this.db,workspaceId,row.id,row.startedAt!);
+  }
+
   workspaceBinding() {
     const row = this.db
       .prepare(
@@ -844,7 +893,9 @@ export class LocalEventBuffer {
            previous_workspace_id as previousWorkspaceId,
            current_device_id as currentDeviceId,
            previous_device_id as previousDeviceId,
-           changed_at as changedAt
+           changed_at as changedAt,
+           current_installation_epoch_id as currentInstallationEpochId,
+           current_installation_epoch_started_at as currentInstallationEpochStartedAt
          from collector_workspace_binding where singleton = 1`,
       )
       .get() as
@@ -853,6 +904,8 @@ export class LocalEventBuffer {
           previousWorkspaceId: string | null;
           currentDeviceId: string | null;
           previousDeviceId: string | null;
+          currentInstallationEpochId: string | null;
+          currentInstallationEpochStartedAt: string | null;
           changedAt: string;
         }
       | undefined;
@@ -940,6 +993,21 @@ export class LocalEventBuffer {
       this.db.exec(
         `alter table metric_samples add column suppressed_fields_json text not null default '[]'`,
       );
+    }
+  }
+
+  private migrateWorkspaceBindingColumns() {
+    const existing = new Set(
+      (this.db.pragma("table_info(collector_workspace_binding)") as Array<{ name: string }>).map(
+        (column) => column.name,
+      ),
+    );
+    for (const definition of [
+      "current_installation_epoch_id text",
+      "current_installation_epoch_started_at text",
+    ]) {
+      const name = definition.split(" ")[0]!;
+      if (!existing.has(name)) this.db.exec(`alter table collector_workspace_binding add column ${definition}`);
     }
   }
 
@@ -1077,6 +1145,7 @@ export class LocalEventBuffer {
        values (?, 'transcript_context_conflict', ?, 0)
        on conflict(context_id) do nothing`,
     ).run(contextId, now).changes;
+    if (inserted > 0) markFinancePublicationDirty(this.db, now);
     const changes = scope.mode === "child_inflight"
       ? this.db.prepare(
           `delete from repo_context_inflight where context_id = ? and owner = 'child'`,
@@ -2131,7 +2200,7 @@ export class LocalEventBuffer {
     return inserted > 0 || !existing;
   }
 
-  private appendInCurrentTransaction(event: AiInteractionEvent, suppressedFields: string[] = []) {
+  private appendInCurrentTransaction(event: AiInteractionEvent, suppressedFields: string[] = [], project = true) {
     if (event.dataMode === "evidence") {
       throw new Error(
         "Raw evidence rows cannot be appended to the ordinary ledger; the encrypted evidence vault is not implemented.",
@@ -2159,21 +2228,26 @@ export class LocalEventBuffer {
     const headSha = gitField(event, "headSha") ??
       (repoContextConflict ? null : resolvedRepoContext.headSha);
     const privacyGeneration = crypto.randomUUID();
+    const currentBinding = this.workspaceBinding();
+    const workspaceId = currentBinding?.currentWorkspaceId ?? this.workspaceId;
+    const installationEpochId = currentBinding?.currentInstallationEpochId ?? null;
+    const projectKey = canonicalProjectKey(event.projectKey);
+    const costKind = admittedCostKind(event);
     const canonicalSuppressedFields = canonicalizeSuppressionReceipts(suppressedFields);
     const payloadJson = JSON.stringify(event);
-    const result = this.db
-      .prepare(
+    const insert = this.insertEventStatement ??= this.db.prepare(
         `insert or ignore into buffered_events
           (id, source, event_type, data_mode, observed_at, payload_json, suppressed_fields_json,
            created_at, session_id, action_class, model, input_tokens, output_tokens,
            cache_read_tokens, cache_creation_tokens, cost_usd, uploaded_at, repo_hash, branch_hash, head_sha,
-           machine, account_hash, workspace_id, device_id, privacy_generation)
+           machine, account_hash, workspace_id, device_id, installation_epoch_id, project_key, cost_kind, privacy_generation)
         values
           (@id, @source, @eventType, @dataMode, @observedAt, @payloadJson, @suppressedFieldsJson,
            @createdAt, @sessionId, @actionClass, @model, @inputTokens, @outputTokens,
            @cacheReadTokens, @cacheCreationTokens, @costUsd, null, @repoHash, @branchHash, @headSha,
-           @machine, @accountHash, @workspaceId, @deviceId, @privacyGeneration)`,
-      )
+           @machine, @accountHash, @workspaceId, @deviceId, @installationEpochId, @projectKey, @costKind, @privacyGeneration)`,
+      );
+    const result = insert
       .run({
         id: event.id,
         source: event.source,
@@ -2196,7 +2270,10 @@ export class LocalEventBuffer {
         headSha,
         machine: MACHINE,
         accountHash: event.actorId ?? null,
-        workspaceId: this.workspaceId,
+        workspaceId,
+        installationEpochId,
+        projectKey,
+        costKind,
         deviceId: this.deviceId,
         privacyGeneration,
       });
@@ -2245,7 +2322,9 @@ export class LocalEventBuffer {
       // The raw row, privacy-safe fact delta, and delivery envelope share the
       // caller's SQLite transaction. Projection failure is contained as a
       // durable repair receipt so capture remains available.
-      this.projection.tryApplyRawRow(Number(result.lastInsertRowid));
+      if (project) this.projection.tryApplyRawRow(Number(result.lastInsertRowid));
+      // Otherwise the insert trigger's durable repair receipt remains queued.
+      // Capture admission never depends on finishing all derived aggregates.
       // Runtime learning facts (#156) promote from the same durable moment.
       // The promoter is total (it records bounded drop receipts instead of
       // throwing); the guard keeps fact promotion structurally unable to
@@ -2430,7 +2509,9 @@ export class LocalEventBuffer {
     entries: Array<{ event: AiInteractionEvent; suppressedFields: string[] }>,
     metricSamples: MetricSample[] = [],
     admissionDrops: OtlpAdmissionDrop[] = [],
+    options: { projectionDeadlineMs?: number } = {},
   ) {
+    const projectionDeadlineMs = options.projectionDeadlineMs ?? performance.now() + 25;
     const appended: Array<ReturnType<LocalEventBuffer["appendInCurrentTransaction"]>> = [];
     const ownsHandoffs = this.activeRepoContextCommitScope === null;
     const handoffs = this.activeRepoContextCommitScope ?? this.newRepoContextHandoffBatch();
@@ -2440,7 +2521,7 @@ export class LocalEventBuffer {
     );
     const work = () => {
       for (const entry of entries) {
-        const result = this.appendInCurrentTransaction(entry.event, entry.suppressedFields);
+        const result = this.appendInCurrentTransaction(entry.event, entry.suppressedFields, performance.now() < projectionDeadlineMs);
         appended.push(result);
         const reserved = this.reserveRepoContextHandoff(result.repoContextRequest, handoffs);
         if (result.repoContextRequest && !reserved) {
@@ -2800,32 +2881,36 @@ export class LocalEventBuffer {
     const maxRows = Math.max(1, Math.min(requestedRows, 10_000));
     const now = options.now ?? new Date();
     const cutoff = new Date(now.getTime() - retentionDays * 24 * 60 * 60 * 1_000).toISOString();
-    // Delivery owns a bounded sanitized copy. Protect a legacy unuploaded row
-    // until migration has copied that body; once an outbox row exists, raw
-    // expiry is independent of upload acknowledgement. Local-only ledgers do
-    // not have that protection and therefore expire every old raw row.
+    // Seek through a bounded raw candidate page BEFORE checking migration.
+    // A protected prefix must neither cause a full scan nor hide later rows.
+    const scanKey = "raw_retention_scan_v1";
     const deliveryProtection = this.delivery.isEnabled()
-      ? `and (e.uploaded_at is not null or exists (
+      ? `case when e.uploaded_at is not null or exists (
            select 1 from upload_outbox o
            where o.raw_rowid = e.rowid and (o.raw_id is null or o.raw_id = e.id)
-         ))`
-      : "";
+         ) then 0 else 1 end`
+      : "0";
     const run = this.db.transaction(() => {
-      const candidates = this.db
-        .prepare(
-          `select e.rowid as rawRowid, e.id as eventId,
-             e.created_at as rawCreatedAt, e.privacy_generation as rawGeneration
-           from buffered_events e indexed by idx_events_retention
-           where e.created_at < ? ${deliveryProtection}
-           order by e.created_at, e.id
-           limit ?`,
-        )
-        .all(cutoff, maxRows) as Array<{
-        rawRowid: number;
-        eventId: string;
-        rawCreatedAt: string;
-        rawGeneration: string | null;
+      const stored = this.db.prepare(`select value from maintenance_state where key=?`).get(scanKey) as {value:string}|undefined;
+      const scan = stored ? JSON.parse(stored.value) as {at:string;id:string;metricsFirst:boolean} :
+        {at:"",id:"",metricsFirst:false};
+      const metricsPending = Boolean(this.db.prepare(
+        `select 1 from metric_samples indexed by idx_metrics_observed where created_at < ? limit 1`,
+      ).get(cutoff));
+      const rawLimit = !metricsPending ? maxRows : maxRows === 1 ? (scan.metricsFirst ? 0 : 1) : Math.ceil(maxRows / 2);
+      const candidates = rawLimit === 0 ? [] : this.db.prepare(
+        `select e.rowid as rawRowid, e.id as eventId,
+           e.created_at as rawCreatedAt, e.privacy_generation as rawGeneration,
+           e.source, e.workspace_id as workspaceId, e.installation_epoch_id as installationEpochId, e.observed_at as observedAt,
+           ${deliveryProtection} as migrationProtected
+         from buffered_events e indexed by idx_events_retention
+         where e.created_at < ? and (e.created_at,e.id) > (?,?)
+         order by e.created_at,e.id limit ?`,
+      ).all(cutoff,scan.at,scan.id,rawLimit) as Array<{
+        rawRowid:number;eventId:string;rawCreatedAt:string;rawGeneration:string|null;migrationProtected:number;
+        source:string;workspaceId:string|null;installationEpochId:string|null;observedAt:string;
       }>;
+      let migrationProtectedRows = 0;
       const recordExpiry = this.db.prepare(
         `insert or ignore into raw_retention_receipts
            (event_id, raw_rowid, raw_created_at, raw_generation, expired_at, reason)
@@ -2835,6 +2920,7 @@ export class LocalEventBuffer {
       const removeRaw = this.db.prepare(`delete from buffered_events where rowid = ?`);
       let events = 0;
       for (const row of candidates) {
+        if (row.migrationProtected) { migrationProtectedRows += 1; continue; }
         recordExpiry.run({
           eventId: row.eventId,
           rawRowid: row.rawRowid,
@@ -2844,6 +2930,7 @@ export class LocalEventBuffer {
         });
         events += removeRaw.run(row.rawRowid).changes;
       }
+      advanceFinanceRetentionWatermarks(this.db, candidates.filter(row => !row.migrationProtected) as FinanceCoverageMutationRow[], now.toISOString());
       const remainingBudget = Math.max(0, maxRows - candidates.length);
       const metricRows = remainingBudget === 0
         ? []
@@ -2854,7 +2941,16 @@ export class LocalEventBuffer {
       let metricSamples = 0;
       const removeMetric = this.db.prepare(`delete from metric_samples where rowid = ?`);
       for (const row of metricRows) metricSamples += removeMetric.run(row.rowid).changes;
-      const hasMore = candidates.length === maxRows || metricRows.length === remainingBudget;
+      // A full page is a conservative continuation, never an exact backlog count.
+      const rawHasMore = rawLimit === 0 || candidates.length === rawLimit;
+      const hasMore = rawHasMore || (remainingBudget > 0 && metricRows.length === remainingBudget);
+      const last = candidates.at(-1);
+      const next = rawLimit === 0 ? scan : rawHasMore && last
+        ? {at:last.rawCreatedAt,id:last.eventId,metricsFirst:scan.metricsFirst}
+        : {at:"",id:"",metricsFirst:scan.metricsFirst};
+      this.db.prepare(`insert into maintenance_state(key,value,updated_at) values (?,?,?)
+        on conflict(key) do update set value=excluded.value,updated_at=excluded.updated_at`)
+        .run(scanKey,JSON.stringify({...next,metricsFirst:!scan.metricsFirst,migrationProtectedRows}),now.toISOString());
       this.db.prepare(
         `update raw_retention_control set last_cutoff_at=?,last_run_at=?,
            last_rows_visited=?,last_rows_expired=?,last_has_more=?,
@@ -2870,6 +2966,7 @@ export class LocalEventBuffer {
       return {
         events,
         eventRowsVisited: candidates.length,
+        migrationProtectedRows,
         metricSamples,
         metricRowsVisited: metricRows.length,
         hasMore,
@@ -2880,8 +2977,27 @@ export class LocalEventBuffer {
       events: run.events,
       metricSamples: run.metricSamples,
       eventRowsVisited: run.eventRowsVisited,
+      migrationProtectedRows: run.migrationProtectedRows,
       metricRowsVisited: run.metricRowsVisited,
       hasMore: run.hasMore,
+    };
+  }
+
+  /** Constant-size maintenance receipt; never count the retained raw ledger. */
+  retentionProgressStatus(retentionDays = 90, now = new Date()) {
+    const pass = this.db.prepare(`select last_rows_visited as rowsVisited,
+      last_rows_expired as rowsExpired,last_has_more as hasMore,last_run_at as at,
+      expired_total as expired from raw_retention_control where singleton=1`).get() as {
+        rowsVisited:number;rowsExpired:number;hasMore:number;at:string|null;expired:number;
+      };
+    const scan = this.db.prepare(`select value from maintenance_state where key='raw_retention_scan_v1'`).get() as {value:string}|undefined;
+    return {
+      inspection: "bounded" as const,
+      policy: {retentionDays,cutoffAt:new Date(now.getTime()-retentionDays*86_400_000).toISOString()},
+      states: {retained:null,pendingDelivery:null,quarantined:null,expired:pass.expired,notInspected:1},
+      lastPass: {rowsVisited:pass.rowsVisited,rowsExpired:pass.rowsExpired,
+        hasMore:Boolean(pass.hasMore),at:pass.at,
+        migrationProtectedRows:scan ? Number(JSON.parse(scan.value).migrationProtectedRows ?? 0) : 0},
     };
   }
 

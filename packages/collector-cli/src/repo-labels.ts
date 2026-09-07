@@ -1,4 +1,4 @@
-import crypto from "node:crypto";
+import { authenticatedJsonPost } from "./http-transport";
 
 import Database from "better-sqlite3";
 
@@ -294,33 +294,25 @@ export async function pushRepoLabels(
         repositories: slice,
       }),
     );
-    const headers: Record<string, string> = {
-      "content-type": "application/json",
-      "x-plimsoll-install-key": config.installKey,
-    };
-    if (config.ingestKey) headers["x-plimsoll-ingest-key"] = config.ingestKey;
-    if (config.uploadSigningSecret) {
-      const timestamp = new Date().toISOString();
-      const digest = crypto
-        .createHmac("sha256", config.uploadSigningSecret)
-        .update(`${timestamp}.${body}`)
-        .digest("hex");
-      headers["x-plimsoll-upload-timestamp"] = timestamp;
-      headers["x-plimsoll-upload-signature"] = `sha256=${digest}`;
-    }
-
-    const response = await fetchImpl(url.toString(), { method: "POST", headers, body });
-    const responseBody = (await response.json().catch(() => ({}))) as {
-      error?: unknown;
-      created?: unknown;
-      updated?: unknown;
-    };
+    const response = await authenticatedJsonPost({ url: url.toString(), body,
+      installKey: config.installKey, ingestKey: config.ingestKey,
+      signingSecret: config.uploadSigningSecret, fetchImpl,
+      timeoutMs: config.delivery.requestTimeoutSeconds * 1_000 });
+    const responseBody = (
+      response.body !== null && typeof response.body === "object" && !Array.isArray(response.body)
+        ? response.body : {}
+    ) as { created?: unknown; updated?: unknown; ok?: unknown; error?: unknown };
     if (!response.ok) {
-      const errorCode = typeof responseBody.error === "string" ? responseBody.error : "unknown_error";
       throw new Error(
-        `Workspace refused the repo-labels batch with HTTP ${response.status} (${errorCode}). ` +
+        `Workspace refused the repo-labels batch with HTTP ${response.status} (remote_refusal). ` +
           "Nothing further was sent.",
       );
+    }
+    if ((responseBody.ok !== undefined && responseBody.ok !== true) || "error" in responseBody ||
+        !Number.isSafeInteger(responseBody.created) || !Number.isSafeInteger(responseBody.updated) ||
+        (responseBody.created as number) < 0 || (responseBody.updated as number) < 0 ||
+        (responseBody.created as number) + (responseBody.updated as number) !== slice.length) {
+      throw new Error("Workspace repo-labels deferred: invalid_response");
     }
     pushed += slice.length;
     created += typeof responseBody.created === "number" ? responseBody.created : 0;

@@ -1,3 +1,5 @@
+import { createProofCompletion } from "./lib/proof-completion";
+const completion = createProofCompletion("lifecycle-operator", 73);
 /**
  * Issue #103/#158 packaged lifecycle operator proof.
  *
@@ -53,14 +55,15 @@ const checks: Check[] = [];
 function check(name: string, condition: unknown, detail?: unknown) {
   const row = { name, passed: Boolean(condition), ...(detail !== undefined ? { detail } : {}) };
   checks.push(row);
+  completion.check(name, row.passed);
   console.log(`${row.passed ? "PASS" : "FAIL"} ${name}`);
   if (!row.passed) throw new Error(`${name}: ${JSON.stringify(detail ?? null)}`);
 }
 
 const REPO_ROOT = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
-const BUNDLE_PATH = path.join(REPO_ROOT, "packages", "collector-cli", "dist", "cli.mjs");
+const BUNDLE_PATH = process.env.PLIMSOLL_QUALIFICATION_ARTIFACT ?? path.join(REPO_ROOT, "packages", "collector-cli", "dist", "cli.mjs");
 const SOURCE_ENTRY = path.join(REPO_ROOT, "packages", "collector-cli", "src", "cli.ts");
-const TSX_ENTRY = path.join(REPO_ROOT, "node_modules", "tsx", "dist", "cli.mjs");
+const TSX_LOADER = path.join(REPO_ROOT, "node_modules", "tsx", "dist", "loader.mjs");
 
 const ARCHITECTURE = process.arch === "x64" ? "x64" as const : "arm64" as const;
 const NODE_MAJOR = Number(process.versions.node.split(".", 1)[0]);
@@ -83,6 +86,7 @@ fs.mkdirSync(stubBin, { mode: 0o700 });
 const launchctlLog = path.join(stubBin, "invocations.log");
 fs.writeFileSync(path.join(stubBin, "launchctl"), `#!/bin/sh\necho "$@" >> "${launchctlLog}"\nexit 3\n`, { mode: 0o700 });
 
+process.env.PLIMSOLL_HOME = path.join(fixtureHome, ".plimsoll");
 const LIFECYCLE_ROOT = path.join(collectorHome(fixtureHome), "lifecycle");
 const VERSIONS_ROOT = path.join(LIFECYCLE_ROOT, "versions");
 
@@ -91,13 +95,15 @@ const childEnv: NodeJS.ProcessEnv = {
   HOME: fixtureHome,
   PATH: `${stubBin}:${process.env.PATH ?? ""}`,
 };
-delete childEnv.PLIMSOLL_HOME;
+childEnv.PLIMSOLL_HOME = process.env.PLIMSOLL_HOME;
+childEnv.CODEX_HOME = path.join(fixtureHome, ".codex");
+childEnv.CLAUDE_CONFIG_DIR = path.join(fixtureHome, ".claude");
 delete childEnv.PLIMSOLL_COLLECTOR_DATA_MODE;
 
 type CliResult = { code: number | null; stdoutText: string; stderrText: string };
 
-function cli(args: readonly string[]): CliResult {
-  const result = spawnSync(process.execPath, [BUNDLE_PATH, ...args], {
+function cli(args: readonly string[], nodeArgs: readonly string[] = []): CliResult {
+  const result = spawnSync(process.execPath, [...nodeArgs, BUNDLE_PATH, ...args], {
     cwd: fixtureHome,
     env: childEnv,
     encoding: "utf8",
@@ -106,8 +112,8 @@ function cli(args: readonly string[]): CliResult {
   return { code: result.status, stdoutText: result.stdout ?? "", stderrText: result.stderr ?? "" };
 }
 
-function cliJson(args: readonly string[]): Record<string, unknown> {
-  const result = cli(args);
+function cliJson(args: readonly string[], nodeArgs: readonly string[] = []): Record<string, unknown> {
+  const result = cli(args, nodeArgs);
   if (result.code !== 0) {
     throw new Error(`lifecycle ${args.join(" ")} failed: ${result.stderrText.slice(0, 400)}`);
   }
@@ -143,7 +149,7 @@ async function main(): Promise<void> {
   try {
   // --- Build the real packaged bundle --------------------------------------
   fs.mkdirSync(path.dirname(BUNDLE_PATH), { recursive: true });
-  await build({
+  if (!process.env.PLIMSOLL_QUALIFICATION_ARTIFACT) await build({
     entryPoints: [SOURCE_ENTRY],
     bundle: true,
     platform: "node",
@@ -154,7 +160,7 @@ async function main(): Promise<void> {
     sourcemap: false,
     logLevel: "silent",
   });
-  fs.chmodSync(BUNDLE_PATH, 0o755);
+  if (!process.env.PLIMSOLL_QUALIFICATION_ARTIFACT) fs.chmodSync(BUNDLE_PATH, 0o755);
   check("bundle_built", fs.statSync(BUNDLE_PATH).size > 1024);
 
   // --- Seed durable state inside the fixture home ---------------------------
@@ -230,6 +236,41 @@ async function main(): Promise<void> {
     expectFailure(["lifecycle", "update", "--operation-id", "op-u1", "--artifact", "self"],
       /operationId was already completed/).matched);
   check("journal_cleared_after_completion",
+    !fs.existsSync(path.join(LIFECYCLE_ROOT, "journal.json")));
+
+  // Terminate the real packaged command after its durable switch journal write.
+  // The next invocation must recover using the existing journal and dead-owner fence.
+  const crashHook = path.join(fixtureHome, "interrupt-after-switch.mjs");
+  fs.writeFileSync(crashHook, `import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const rename = fs.renameSync;
+fs.renameSync = function (from, to) {
+  const result = rename.apply(this, arguments);
+  if (String(to) === ${JSON.stringify(path.join(LIFECYCLE_ROOT, "journal.json"))}) {
+    const journal = JSON.parse(fs.readFileSync(to, "utf8"));
+    if (journal.phase === "switched") process.exit(86);
+  }
+  return result;
+};
+syncBuiltinESMExports();
+`);
+  const interrupted = spawnSync(process.execPath, ["--import", crashHook, BUNDLE_PATH,
+    "lifecycle", "update", "--operation-id", "op-interrupted", "--artifact", "self"],
+    { cwd: fixtureHome, env: childEnv, encoding: "utf8", timeout: 120_000 });
+  check("packaged_update_interruption_occurs_after_durable_switch", interrupted.status === 86 &&
+    JSON.parse(fs.readFileSync(path.join(LIFECYCLE_ROOT, "journal.json"), "utf8")).phase === "switched");
+  const beforeExpiry = cli(["lifecycle", "update", "--operation-id", "op-interrupted", "--artifact", "self"]);
+  check("interrupted_update_cannot_bypass_unexpired_mutation_lease",
+    beforeExpiry.code !== 0 && /another lifecycle operation owns the lock/.test(beforeExpiry.stderrText));
+  const heldLease = new LifecycleMutationAuthority(defaultLifecycleAuthorityRoot(fixtureHome)).observe();
+  if (heldLease.kind !== "held") throw new Error("interrupted fixture must still hold its native mutation lease");
+  // Exercise natural lease expiry with an injected child clock. Do not edit or
+  // release another process's lease, and do not spend ten minutes sleeping in CI.
+  const recoveryClock = path.join(fixtureHome, "recovery-clock.mjs");
+  fs.writeFileSync(recoveryClock, `const clock = Date.now; const offset = ${heldLease.expiresAtMs} - clock() + 1; Date.now = () => clock() + offset;\n`);
+  const resumed = cliJson(["lifecycle", "update", "--operation-id", "op-interrupted", "--artifact", "self"], ["--import", recoveryClock]);
+  check("packaged_interrupted_update_recovers_without_replacement_operation",
+    (resumed.receipt as Record<string, unknown>).status === "completed" &&
     !fs.existsSync(path.join(LIFECYCLE_ROOT, "journal.json")));
 
   // --- Support bundle ---------------------------------------------------------
@@ -390,7 +431,7 @@ async function main(): Promise<void> {
       /purge exact confirmation missing|purge requires exact confirmation/).matched);
   const sourceRefusal = spawnSync(
     process.execPath,
-    [TSX_ENTRY, SOURCE_ENTRY, "lifecycle", "update", "--operation-id", "g5", "--artifact", "self"],
+    ["--import", TSX_LOADER, SOURCE_ENTRY, "lifecycle", "update", "--operation-id", "g5", "--artifact", "self"],
     { cwd: REPO_ROOT, env: childEnv, encoding: "utf8", timeout: 180_000 },
   );
   check("self_artifact_refused_from_source_checkout",
@@ -437,13 +478,18 @@ async function main(): Promise<void> {
 
     // Readiness matrix through the production service adapter.
     const matrixRoot = fs.mkdtempSync(path.join(TMP_ROOT, "plimsoll-operator-matrix-"));
+    const preMatrixHome = process.env.PLIMSOLL_HOME;
+    process.env.PLIMSOLL_HOME = path.join(matrixRoot, ".plimsoll");
     try {
       const lifecycleRoot = path.join(matrixRoot, "lifecycle");
       const matrixHome = matrixRoot;
       fs.mkdirSync(path.dirname(collectorConfigPath(matrixHome)), { recursive: true, mode: 0o700 });
       fs.writeFileSync(collectorConfigPath(matrixHome), `${JSON.stringify({})}\n`, { mode: 0o600 });
       const service = new LaunchAgentManifestLifecycleService({ homeDir: matrixHome, lifecycleRoot });
-      const readinessInput = { signal: new AbortController().signal, deadlineMs: 500 };
+      // This matrix checks immediate classifications. The real CLI scenarios
+      // above cover retry/deadline ownership in LifecycleManager. A direct
+      // adapter probe must not rely on loader handles to keep retries alive.
+      const readinessInput = { signal: new AbortController().signal, deadlineMs: 1 };
       const stagedForMatrix = path.join(lifecycleRoot, "versions", "1.0.0", `darwin-${ARCHITECTURE}`, "bin", "plimsoll.mjs");
 
       const noManifest = await service.readiness("1.0.0", readinessInput);
@@ -451,7 +497,7 @@ async function main(): Promise<void> {
         !noManifest.ready && noManifest.reason === "service_unready" && noManifest.runtimeVersion === null,
         noManifest);
 
-      const wrongExe = path.join(matrixRoot, "elsewhere", "cli.mjs");
+      const wrongExe = runtimeExecutablePath(path.join(lifecycleRoot, "versions"), "0.0.0-wrong");
       fs.mkdirSync(path.dirname(wrongExe), { recursive: true, mode: 0o700 });
       fs.writeFileSync(wrongExe, "// not plimsoll\n");
       await service.activate({ executablePath: wrongExe, version: "0.0.0-wrong" });
@@ -480,10 +526,12 @@ async function main(): Promise<void> {
       check("readiness_corrupt_ledger_detected",
         !badDatabase.ready && badDatabase.reason === "database_incompatible" && badDatabase.databaseCompatible === false);
     } finally {
+      process.env.PLIMSOLL_HOME = preMatrixHome;
       fs.rmSync(matrixRoot, { recursive: true, force: true });
     }
 
-    // Hostile artifact resolution.
+    // Hostile artifact resolution. The missing-closure case needs an existing bundle.
+    fs.writeFileSync(path.join(unitRoot, "lonely.mjs"), "// no native closure\n");
     let closureError: string | null = null;
     try {
       resolveArtifactFromBundle({ bundlePath: path.join(unitRoot, "lonely.mjs"), version: "1.0.0" });
@@ -556,7 +604,9 @@ async function main(): Promise<void> {
   console.log(`lifecycle-operator proof: ${checks.length} checks, all passed`);
 } finally {
     liveLedger?.close();
+    fs.rmSync(fixtureHome, { recursive: true, force: true });
   }
+  completion.complete();
 }
 
 main().catch((error: unknown) => {

@@ -73,7 +73,7 @@ function verifyProcess(pid: number, spawnNonce: string) {
     }, (error, stdout) => {
       const row = !error && typeof stdout === "string" ? stdout.trim().replace(/\s+/g, " ") : "";
       const parent = /^(\d+)\s+/.exec(row);
-      resolve(Boolean(parent && Number(parent[1]) === process.pid && row.includes(`__enrichment_worker ${spawnNonce}`)));
+      resolve(Boolean(parent && Number(parent[1]) === process.pid && new RegExp(`(?:^|\\s)__enrichment_worker ${spawnNonce}(?:\\s|$)`).test(row)));
     });
   });
 }
@@ -87,6 +87,8 @@ export class EnrichmentProcessBoundary {
   private killSignals = 0;
   private reapedChildren = 0;
   private orphanRisk = false;
+  private accepting = true;
+  private recoverChild: (() => Promise<boolean>) | null = null;
   private abortCurrent: (() => Promise<void>) | null = null;
   private idleWaiters: Array<() => void> = [];
 
@@ -105,7 +107,19 @@ export class EnrichmentProcessBoundary {
   }
 
   async run(options: { acceptPartial?: boolean } = {}): Promise<EnrichmentJobOutcome> {
+    if (!this.accepting) throw new Error("enrichment_boundary_stopping");
     if (this.running) throw new Error("enrichment_job_already_in_flight");
+    if ((this.orphanRisk || this.child) && this.recoverChild) {
+      // Reserve this boundary while recovery awaits process observation. A
+      // second caller must not recover and spawn concurrently.
+      this.running = true;
+      try { await this.recoverChild(); }
+      finally {
+        this.running = false;
+        for (const waiter of this.idleWaiters.splice(0)) waiter();
+      }
+    }
+    if (!this.accepting) throw new Error("enrichment_boundary_stopping");
     if (this.orphanRisk || this.child) throw new Error("enrichment_child_not_reaped");
     this.running = true;
     this.lastOutcome = null;
@@ -157,7 +171,7 @@ export class EnrichmentProcessBoundary {
         if (settled) return;
         settled = true;
         cleanupTimers();
-        detach();
+        if (this.child !== child) detach();
         this.running = false;
         this.abortCurrent = null;
         this.lastOutcome = outcome.outcome;
@@ -168,7 +182,9 @@ export class EnrichmentProcessBoundary {
         if (settled) return;
         settled = true;
         cleanupTimers();
-        detach();
+        // Keep observing a still-live child after a failed identity check.
+        // Detaching close here used to make recovery impossible until restart.
+        if (this.child !== child) detach();
         this.running = false;
         this.abortCurrent = null;
         this.lastOutcome = reason === "enrichment_deadline_exceeded" ? "timed_out" : "failed";
@@ -190,20 +206,21 @@ export class EnrichmentProcessBoundary {
           this.orphanRisk = this.child === child;
           return false;
         }
-        this.termSignals += 1;
-        child.kill("SIGTERM");
+        try { if (child.kill("SIGTERM")) this.termSignals += 1; }
+        catch { this.orphanRisk = this.child === child; return false; }
         if (await waitForClose(this.termGraceMs())) return true;
         const verifiedAgain = pid && await (this.options.verifyChild ?? verifyProcess)(pid, spawnNonce);
         if (!verifiedAgain || this.child !== child) {
           this.orphanRisk = this.child === child;
           return false;
         }
-        this.killSignals += 1;
-        child.kill("SIGKILL");
+        try { if (child.kill("SIGKILL")) this.killSignals += 1; }
+        catch { this.orphanRisk = this.child === child; return false; }
         const gone = await waitForClose(this.killGraceMs());
         this.orphanRisk = !gone;
         return gone;
       };
+      this.recoverChild = terminate;
       const timeout = async (reason: string) => {
         if (ending || settled) return;
         ending = true;
@@ -217,13 +234,16 @@ export class EnrichmentProcessBoundary {
       };
       this.abortCurrent = () => timeout("enrichment_boundary_stopping");
       const onMessage = (raw: unknown) => {
+        if (settled || ending || this.child !== child) return;
         if (!raw || typeof raw !== "object") return void timeout("enrichment_protocol_invalid");
         const row = raw as Record<string, unknown>;
         if (row.schema !== ENRICHMENT_PROTOCOL_SCHEMA) return void timeout("enrichment_protocol_invalid");
         if (row.type === "ready") {
           if (ready || row.spawnNonce !== spawnNonce) return void timeout("enrichment_ready_identity_mismatch");
           void (async () => {
-            if (!child.pid || !await (this.options.verifyChild ?? verifyProcess)(child.pid, spawnNonce)) {
+            const verified = child.pid && await (this.options.verifyChild ?? verifyProcess)(child.pid, spawnNonce);
+            if (settled || ending || this.child !== child) return;
+            if (!verified) {
               return timeout("enrichment_ready_pid_mismatch");
             }
             ready = true;
@@ -265,10 +285,13 @@ export class EnrichmentProcessBoundary {
       const onError = () => { if (!completed) void timeout("enrichment_worker_error"); };
       const onDisconnect = () => { if (!completed) void timeout("enrichment_worker_disconnected"); };
       const onClose = () => {
+        if (this.child !== child) { detach(); return; }
         this.child = null;
+        this.recoverChild = null;
         this.reapedChildren += 1;
         this.orphanRisk = false;
         closeWaiter?.();
+        if (settled) { detach(); return; }
         if (completed) finish({ outcome: "completed", ...completed });
       };
       child.on("message", onMessage);
@@ -286,8 +309,10 @@ export class EnrichmentProcessBoundary {
   }
 
   async shutdown() {
+    this.accepting = false;
     await this.abortCurrent?.();
     await this.waitForIdle();
+    if (this.child) await this.recoverChild?.();
     return this.child === null && !this.orphanRisk;
   }
 

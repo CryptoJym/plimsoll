@@ -1,6 +1,10 @@
 import type Database from "better-sqlite3";
 import { runRepoEnrichmentMaintenance } from "./maintenance";
 import type { RepoContextRequest, RepoContextResult } from "./repo-context";
+import {
+  advanceFinanceRetentionWatermarks,
+  type FinanceCoverageMutationRow,
+} from "./history-coverage";
 
 export const MAINTENANCE_STAGES = [
   "retention_deletion",
@@ -125,7 +129,8 @@ function advance(
 
 export function runRetentionDeletionStage(
   database: Database.Database,
-  options: TimedOptions & { retentionDays: number; parityReady: boolean; wallNow?: () => number },
+  options: TimedOptions & { retentionDays: number; parityReady: boolean; wallNow?: () => number;
+    prune?: (maxRows: number) => { events: number; metricSamples: number } },
 ): BoundedStageResult {
   ensureMaintenanceStageSchema(database);
   const timer = budget(options);
@@ -144,16 +149,26 @@ export function runRetentionDeletionStage(
   }
   const wallNow = options.wallNow?.() ?? Date.now();
   const cutoff = new Date(wallNow - Math.max(0, options.retentionDays) * 86_400_000).toISOString();
-  const rows = database.transaction(() => {
+  const rows = options.prune ? (() => {
+    const receipt = options.prune(adaptiveBatchSize);
+    return receipt.events + receipt.metricSamples;
+  })() : database.transaction(() => {
     let deleted = 0;
+    const deletedFinanceRows: FinanceCoverageMutationRow[] = [];
     if (options.parityReady) {
       const candidates = database.prepare(
-        `select id from buffered_events indexed by idx_events_observed
+        `select id, source, workspace_id as workspaceId,
+           installation_epoch_id as installationEpochId, observed_at as observedAt
+         from buffered_events indexed by idx_events_observed
          where observed_at < ? and uploaded_at is not null
          order by observed_at limit ?`,
-      ).all(cutoff, adaptiveBatchSize) as Array<{ id: string }>;
+      ).all(cutoff, adaptiveBatchSize) as Array<FinanceCoverageMutationRow & { id: string }>;
       const remove = database.prepare(`delete from buffered_events where id = ?`);
-      for (const candidate of candidates) deleted += remove.run(candidate.id).changes;
+      for (const candidate of candidates) {
+        const changed = remove.run(candidate.id).changes;
+        deleted += changed;
+        if (changed) deletedFinanceRows.push(candidate);
+      }
     }
     if (deleted < adaptiveBatchSize) {
       const candidates = database.prepare(
@@ -163,6 +178,7 @@ export function runRetentionDeletionStage(
       const remove = database.prepare(`delete from metric_samples where id = ?`);
       for (const candidate of candidates) deleted += remove.run(candidate.id).changes;
     }
+    advanceFinanceRetentionWatermarks(database, deletedFinanceRows, new Date().toISOString());
     return deleted;
   })();
   const result = timer.result(rows, adaptiveBatchSize);
@@ -289,6 +305,7 @@ export function runDeadlineMaintenanceStages(
     teardownMarginMs: number;
     retentionDays: number;
     parityReady: boolean;
+    prune?: (maxRows: number) => { events: number; metricSamples: number };
     now?: () => number;
     onDurableCommit?: (progress: {
       stage: "wal_checkpoint" | "retention" | "fill_pending_event_links";
@@ -312,7 +329,7 @@ export function runDeadlineMaintenanceStages(
   if (!emit("wal_checkpoint", checkpoint)) return { remainingMs: remaining(), stages };
   const retention = runRetentionDeletionStage(database, {
     remainingMs: Math.min(3_000, remaining()), batchSize: 64,
-    retentionDays: options.retentionDays, parityReady: options.parityReady, now,
+    retentionDays: options.retentionDays, parityReady: options.parityReady, now, prune: options.prune,
   });
   if (!emit("retention", retention)) return { remainingMs: remaining(), stages };
   const pending = runPendingEventLinkFillStage(database, {

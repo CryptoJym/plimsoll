@@ -9,7 +9,8 @@ import {
   type AiWorkIngestBatch,
 } from "../../shared/src/index";
 import { sealOutboundEnvelope } from "./outbound-envelope";
-import { assertNoRedirect, validatedTransportUrl } from "./http-transport";
+import { TransportError, validatedTransportUrl } from "./http-transport";
+import { postDelivery } from "./delivery-post";
 import { PLIMSOLL_VERSION } from "./version";
 
 /**
@@ -158,57 +159,25 @@ async function postItems(input: {
       requestBytes: bytes,
     };
   }
-  const headers: Record<string, string> = {
-    "content-type": "application/json",
-    "x-plimsoll-install-key": input.config.installKey,
-  };
-  if (input.ingestKey) headers["x-plimsoll-ingest-key"] = input.ingestKey;
-  if (input.signingSecret) {
-    const timestamp = input.now().toISOString();
-    const digest = crypto
-      .createHmac("sha256", input.signingSecret)
-      .update(`${timestamp}.${body}`)
-      .digest("hex");
-    headers["x-plimsoll-upload-timestamp"] = timestamp;
-    headers["x-plimsoll-upload-signature"] = `sha256=${digest}`;
-  }
-
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), input.timeoutSeconds * 1_000);
-  timeout.unref();
-  let response: Response;
   try {
-    response = await input.fetchImpl(input.url, {
-      method: "POST",
-      headers,
-      body,
-      signal: controller.signal,
-      redirect: "manual",
+    const response = await postDelivery({
+      url: input.url, body, installKey: input.config.installKey,
+      ingestKey: input.ingestKey, signingSecret: input.signingSecret,
+      fetchImpl: input.fetchImpl, now: input.now,
+      timeoutMs: input.timeoutSeconds * 1_000, maxRequestBytes: input.maxBytes,
     });
-  } catch {
-    return { ok: false, status: 0, statusClass: "network", summary: {}, requestBytes: bytes };
-  } finally {
-    clearTimeout(timeout);
-  }
-  assertNoRedirect(response, "Upload", new URL(input.url).origin);
-  if (!response.ok) {
-    await response.body?.cancel().catch(() => undefined);
     return {
-      ok: false,
-      status: response.status,
-      statusClass: statusClass(response.status),
-      summary: {},
-      requestBytes: bytes,
+      ok: response.ok, status: response.status, statusClass: statusClass(response.status),
+      summary: response.ok ? safeResponseSummary(response.body) : {}, requestBytes: bytes,
     };
+  } catch (error) {
+    const transient = error instanceof TransportError &&
+      (error.code === "network_error" || error.code === "deadline_exceeded");
+    const localBudget = error instanceof TransportError && error.code === "request_too_large";
+    return { ok: false, status: transient ? 0 : -1,
+      statusClass: localBudget ? "local_request_budget" : transient ? "network" : "remote_contract",
+      summary: {}, requestBytes: bytes };
   }
-  const parsed = await response.json().catch(() => ({}));
-  return {
-    ok: true,
-    status: response.status,
-    statusClass: statusClass(response.status),
-    summary: response.ok ? safeResponseSummary(parsed) : {},
-    requestBytes: bytes,
-  };
 }
 
 function failureForProbe(result: ProbeResult): Exclude<DeliveryFailureClass, "none"> {

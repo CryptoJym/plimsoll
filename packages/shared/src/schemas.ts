@@ -43,6 +43,12 @@ export const actionClassSchema = z.enum([
 ]);
 export type ActionClass = z.infer<typeof actionClassSchema>;
 
+/** Cost provenance carried with a cost-bearing event. */
+export const costKindSchema = z.enum(["reported", "estimated", "unknown"]);
+/** Descriptive alias for callers that need to distinguish event provenance. */
+export const eventCostKindSchema = costKindSchema;
+export type EventCostKind = z.infer<typeof costKindSchema>;
+
 export const rawContentCategorySchema = z.enum([
   "prompt",
   "output",
@@ -293,9 +299,17 @@ export const aiInteractionEventSchema = z
     cacheReadTokens: z.number().int().nonnegative().optional(),
     cacheCreationTokens: z.number().int().nonnegative().optional(),
     costUsd: z.number().nonnegative().optional(),
+    costKind: costKindSchema.optional(),
     metadata: metadataSchema,
   })
-  .strict();
+  .strict()
+  .refine(
+    (event) => event.costKind === undefined || event.costUsd !== undefined,
+    {
+      path: ["costKind"],
+      message: "costKind requires costUsd.",
+    },
+  );
 export type AiInteractionEvent = z.infer<typeof aiInteractionEventSchema>;
 
 export const aiWorkIngestEventSchema = z

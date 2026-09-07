@@ -2,6 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { bindCaptureInventory, appendRootObservation, inspectCaptureRoots, rootForFile, rootCursorKey, rootEventMetadata, validateCaptureRoots, type CaptureRoot, type CaptureRootCoverage } from "./capture-root-inventory";
+import { priceForModel } from "../../shared/src/pricing";
 import type { LocalEventBuffer } from "./buffer";
 import {
   attachRepoContextId,
@@ -84,6 +86,7 @@ import {
  */
 
 export type RolloutScanResult = {
+  roots?: CaptureRootCoverage[];
   scope: "recent" | "full";
   exhaustive: boolean;
   discoveryErrors: number;
@@ -359,6 +362,12 @@ function restoreResultMutationSnapshot(
 }
 
 export class RolloutTailer {
+  private activeCaptureRoot: CaptureRoot | undefined;
+  private readonly captureRoots: CaptureRoot[];
+  private readonly inventoryConfigured: boolean;
+  private eligibleDirectories: string[] | null = null;
+  private get directories(): string[] { return this.eligibleDirectories ?? [this.sessionsDir]; }
+  private cursorKey(file: string) { return rootCursorKey(this.captureRoots, file); }
   private activeBoundaryOptions: Pick<RolloutScanOptions, "quarantine" | "onProgress"> = {};
   private baselineAttempt: {
     discovery: IncrementalJsonlDiscovery;
@@ -382,7 +391,11 @@ export class RolloutTailer {
     private readonly sessionsDir = path.join(os.homedir(), ".codex", "sessions"),
     private readonly identityProvider: () => LocalIdentity[] = readLocalIdentities,
     private readonly io: JsonlTailerIo = DEFAULT_JSONL_TAILER_IO,
+    captureRoots?: CaptureRoot[],
   ) {
+    this.inventoryConfigured = captureRoots !== undefined;
+    this.captureRoots = validateCaptureRoots(captureRoots ?? []);
+    if (this.captureRoots.some(root => root.source !== "codex")) throw new Error("capture_root_provider_mismatch");
     ensureJsonlScanState(this.buffer.database);
   }
 
@@ -447,6 +460,19 @@ export class RolloutTailer {
         truncated: false,
       },
     };
+    const rootCoverage = inspectCaptureRoots(this.captureRoots, scanNow);
+    result.roots = rootCoverage;
+    const rootErrors = rootCoverage.filter(root => root.state !== "ready").length;
+    this.eligibleDirectories = this.inventoryConfigured
+      ? this.captureRoots.filter(root => rootCoverage.some(status => status.rootId === root.rootId && status.state === "ready"))
+        .map(root => root.directory) : null;
+    result.discoveryErrors = rootErrors;
+    if (bindCaptureInventory(this.buffer.database, "codex", this.captureRoots, rootCoverage)) {
+      this.baselineAttempt?.discovery.close();
+      this.captureAttempt?.discovery.close();
+      this.baselineAttempt = null;
+      this.captureAttempt = null;
+    }
     if (options.deferredBeforeIo) {
       result.activity.truncated = true;
       result.deferredGenerations = 1;
@@ -472,7 +498,7 @@ export class RolloutTailer {
       this.baselineAttempt = null;
       result.excludedGenerations = codexBaseline.excludedGenerations;
       result.excludedBytes = codexBaseline.currentExcludedBytes;
-      result.exhaustive = true;
+      result.exhaustive = rootErrors === 0;
       result.automaticBudget = automatic.budget.status();
       return result;
     }
@@ -656,7 +682,7 @@ export class RolloutTailer {
       this.baselineAttempt = null;
       result.excludedGenerations = completed.excludedGenerations;
       result.excludedBytes = completed.currentExcludedBytes;
-      result.exhaustive = completed.status === "complete";
+      result.exhaustive = completed.status === "complete" && rootErrors === 0;
       result.automaticBudget = automatic.budget.status();
       return result;
     }
@@ -670,7 +696,7 @@ export class RolloutTailer {
       ? automaticDiscovery.files
       : explicitDiscovery!.files.map((file) => ({ file }));
     result.activity.truncated = discovery.truncated;
-    result.discoveryErrors = discovery.errors;
+    result.discoveryErrors = discovery.errors + rootErrors;
     result.filesSeen = discovery.files.length;
     result.activity.discoveryEntries = discovery.files.length;
     const candidates: Array<{
@@ -755,7 +781,7 @@ export class RolloutTailer {
       }
       const cursor = loadJsonlScanCursor<RolloutParserState>(
         this.buffer.database,
-        file,
+        this.cursorKey(file),
         PARSER_KIND,
         CHECKPOINT_VERSION,
         validateRolloutParserState,
@@ -869,13 +895,14 @@ export class RolloutTailer {
               validationDeferred = true;
               throw new Error("maintenance_progress_budget_exhausted");
             }
+            this.activeCaptureRoot = rootForFile(this.captureRoots, candidate.file);
             const fallbackObservedAt = this.fallbackObservedAt(read.mtimeMs);
             read.assertStableForCommit();
             this.buffer.transactionWithRepoContextHandoffs(() => {
               if (read.unresolvedRecord) {
                 rememberJsonlScanCursor(
                   this.buffer.database,
-                  candidate.file,
+                  this.cursorKey(candidate.file),
                   PARSER_KIND,
                   CHECKPOINT_VERSION,
                   read,
@@ -897,7 +924,7 @@ export class RolloutTailer {
               }
               rememberJsonlScanCursor(
                 this.buffer.database,
-                candidate.file,
+                this.cursorKey(candidate.file),
                 PARSER_KIND,
                 CHECKPOINT_VERSION,
                 read,
@@ -945,7 +972,7 @@ export class RolloutTailer {
             automatic.budget.recordYield();
             candidate.cursor = loadJsonlScanCursor<RolloutParserState>(
               this.buffer.database,
-              candidate.file,
+              this.cursorKey(candidate.file),
               PARSER_KIND,
               CHECKPOINT_VERSION,
               validateRolloutParserState,
@@ -958,7 +985,7 @@ export class RolloutTailer {
           result.lastYieldAt = new Date().toISOString();
           cursor = loadJsonlScanCursor<RolloutParserState>(
             this.buffer.database,
-            candidate.file,
+            this.cursorKey(candidate.file),
             PARSER_KIND,
             CHECKPOINT_VERSION,
             validateRolloutParserState,
@@ -980,7 +1007,7 @@ export class RolloutTailer {
     for (const candidate of candidates) {
       const cursor = loadJsonlScanCursor<RolloutParserState>(
         this.buffer.database,
-        candidate.file,
+        this.cursorKey(candidate.file),
         PARSER_KIND,
         CHECKPOINT_VERSION,
         validateRolloutParserState,
@@ -1004,10 +1031,10 @@ export class RolloutTailer {
   }
 
   private recentDiscovery(now: Date, limit?: number, _options?: RolloutScanOptions) {
-    const roots = [0, 1].map((offset) => {
+    const roots = this.directories.flatMap(directory => [0, 1].map((offset) => {
       const day = new Date(now.getTime() - offset * 24 * 60 * 60 * 1000);
-      return path.join(this.sessionsDir, ...day.toISOString().slice(0, 10).split("-"));
-    });
+      return path.join(directory, ...day.toISOString().slice(0, 10).split("-"));
+    }));
     return new IncrementalJsonlDiscovery(roots, {
       recursive: false,
       matches: (name) => name.startsWith("rollout-") && name.endsWith(".jsonl"),
@@ -1119,19 +1146,21 @@ export class RolloutTailer {
         return [];
       }
     };
+    for (const directory of this.directories) {
     if (options.scope === "recent") {
       for (const offset of [0, 1]) {
         const day = new Date(now.getTime() - offset * 24 * 60 * 60 * 1000);
         const iso = day.toISOString().slice(0, 10);
-        dayDirs.push(path.join(this.sessionsDir, ...iso.split("-")));
+        dayDirs.push(path.join(directory, ...iso.split("-")));
       }
     } else {
       // Full walk: sessions/YYYY/MM/DD — three bounded levels.
-      for (const year of listDirs(this.sessionsDir, true)) {
+      for (const year of listDirs(directory, true)) {
         for (const month of listDirs(year)) {
           dayDirs.push(...listDirs(month));
         }
       }
+    }
     }
     for (const dir of dayDirs) {
       let entries: string[];
@@ -1326,7 +1355,7 @@ export class RolloutTailer {
     // Identity window: only sessions that started at/after the current
     // login's last_refresh provably ran under this account. History stays
     // unattributed rather than guessed (issue 0028).
-    const identity = this.codexIdentity;
+    const identity = this.captureRoots.length ? undefined : this.codexIdentity;
     const actorId =
       identity?.actorHash &&
       identity.validFrom &&
@@ -1349,6 +1378,7 @@ export class RolloutTailer {
             cacheReadTokens: entry.delta.cachedInput,
           });
       const metadata: Record<string, unknown> = {
+        ...rootEventMetadata(this.activeCaptureRoot, deterministicEventId(["codex-rollout", state.conversationId, String(entry.index)]), entry.observedAt ?? fallbackObservedAt, state.conversationId),
         usageSource: "rollout",
         turnIndex: entry.index,
       };
@@ -1364,7 +1394,12 @@ export class RolloutTailer {
       } else if (entry.delta.reasoningOutput > 0) {
         metadata.reasoningOutputTokens = entry.delta.reasoningOutput;
       }
-      if (priced) metadata.costEstimated = true;
+      if (priced) {
+      metadata.costEstimated = true;
+      metadata.costKind = "estimated";
+      const rate = priceForModel(entry.model);
+      if (rate) { metadata.rateVersion = `catalog_${rate.asOf}`; metadata.rateObservedAt = `${rate.asOf}T00:00:00.000Z`; }
+    }
 
       const event: AiInteractionEvent = aiInteractionEventSchema.parse({
         id: deterministicEventId(["codex-rollout", state.conversationId, String(entry.index)]),
@@ -1373,7 +1408,7 @@ export class RolloutTailer {
         dataMode: "metadata",
         eventType: "usage_rollout",
         observedAt: entry.observedAt ?? fallbackObservedAt,
-        actorId,
+        actorId: typeof metadata.captureAccountHash === "string" ? metadata.captureAccountHash : actorId,
         sessionId: state.conversationId,
         model: entry.model,
         actionClass: "other",
@@ -1381,6 +1416,7 @@ export class RolloutTailer {
         outputTokens: marginal.output,
         cacheReadTokens: marginal.cachedInput,
         costUsd: priced?.costUsd,
+        ...(priced ? { costKind: "estimated" as const } : {}),
         metadata,
       });
       const repoContextId = entry.repoContext?.kind === "persisted"
@@ -1391,7 +1427,7 @@ export class RolloutTailer {
       if (repoContextId && !attachRepoContextId(event, repoContextId)) {
         throw new Error("rollout_repo_context_binding_failed");
       }
-      const inserted = this.buffer.append(event, []);
+      const inserted = appendRootObservation(this.buffer, event, this.activeCaptureRoot);
       if (inserted) {
         result.eventsAppended += 1;
         result.tokensAppended.input += marginal.input;

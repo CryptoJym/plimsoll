@@ -3,6 +3,8 @@ import fs from "node:fs";
 import http from "node:http";
 
 import { LocalEventBuffer } from "./buffer";
+import { evidenceAge, projectionValidity, STATUS_MAX_AGE_MS } from "./projection-validity";
+import { automaticRepairServiceStatus } from "./maintenance";
 import {
   assertCollectorPrivacyMode,
   collectorPrivacyReadiness,
@@ -154,7 +156,7 @@ export function createCollectorServer(
     /** Local materialized outcome read model; no provider/network path. */
     outcomePerformance?: (days: number, asOf: string) => Record<string, unknown>;
     /** Registers a refresh callable for startup/child-receipt points only. */
-    registerStatusRefresher?: (refresh: () => boolean) => void;
+    registerStatusRefresher?: (refresh: (failure?: "maintenance_failed") => boolean) => void;
     /**
      * Injectable clock for rejection-diagnostics windows (proof fixtures).
      * Production defaults to wall-clock time.
@@ -195,7 +197,21 @@ export function createCollectorServer(
   const rejectionDiagnostics = createRejectionDiagnostics({
     nowMs: options.diagnosticsNowMs,
   });
-  const snapshotResponse = (days: number) => {
+  const invalidateStatus = (body: Record<string, unknown>, reason: string) => {
+    const projection = (body.projection ?? {}) as Record<string, unknown>;
+    body.projection = { ...projection, ...projectionValidity({
+      ready: projection.ready === true,
+      parityReady: projection.parityReady === true,
+      dirty: projection.dirty === true,
+      degradedReason: typeof projection.degradedReason === "string" ? projection.degradedReason : null,
+      lastSuccessAt: typeof projection.lastSuccessAt === "string" ? projection.lastSuccessAt : null,
+    }, Date.now(), reason) };
+    for (const field of ["health", "captureHealth"]) {
+      const health = (body[field] ?? {}) as Record<string, unknown>;
+      body[field] = { ...health, overall: "amber", reason };
+    }
+  };
+  const snapshotResponse = (days: number, refreshControl = false) => {
     const read = buffer.projection.readSnapshot(days, config.subscriptions);
     if (read.kind !== "ready") return read;
     // Keep dashboard transport to its one snapshot request. The performance
@@ -206,12 +222,15 @@ export function createCollectorServer(
     ).toISOString();
     const outcomePerformance = options.outcomePerformance?.(days, performanceAsOf) ?? null;
     (read.snapshot as Record<string, unknown>).outcomePerformance = outcomePerformance;
-    const delivery = buffer.delivery.status();
+    const cachedControl = lastCoherentStatus?.body;
+    const delivery = refreshControl ? buffer.delivery.status()
+      : cachedControl?.delivery as ReturnType<LocalEventBuffer["delivery"]["status"]> | undefined;
     const maintenance = options.maintenanceStatus?.() ?? null;
-    const historyCoverage = historyCoverageStatus(buffer.database);
+    const historyCoverage = refreshControl ? historyCoverageStatus(buffer.database)
+      : cachedControl?.historyCoverage as ReturnType<typeof historyCoverageStatus> | undefined;
     const status = read.snapshot.status as Record<string, unknown>;
     const stats = (status.stats ?? {}) as Record<string, unknown>;
-    stats.unuploadedCount = delivery.remainingDelivery;
+    stats.unuploadedCount = delivery?.remainingDelivery ?? null;
     Object.assign(status, {
       ok: true,
       runtimeIdentity: options.runtimeIdentity ?? null,
@@ -220,21 +239,28 @@ export function createCollectorServer(
       privacyMode: "metadata_only",
       privacy: collectorPrivacyReadiness(config),
       retentionDays: config.retentionDays,
-      retention: buffer.retentionStatus(config.retentionDays),
-      enrollment: buffer.enrollmentStatus(),
+      retention: refreshControl ? buffer.retentionProgressStatus(config.retentionDays) : cachedControl?.retention ?? null,
+      enrollment: { futureOnlyEnrollment: true, inspection: "not_inspected", quarantinedHistoryRows: null },
       stats,
       otlpAdmission: {
         counterLifetime: "durable",
-        dropped: buffer.otlpAdmissionCounters(),
+        dropped: refreshControl ? buffer.otlpAdmissionCounters() : (cachedControl?.otlpAdmission as {dropped?:unknown})?.dropped ?? null,
       },
-      ingestIntegrity: buffer.eventCollisionSummary(),
+      ingestIntegrity: refreshControl ? buffer.eventCollisionSummary() : cachedControl?.ingestIntegrity ?? null,
       delivery,
-      reconciliation: codexReconciliationStatus(buffer.database),
+      reconciliation: refreshControl ? codexReconciliationStatus(buffer.database) : cachedControl?.reconciliation ?? null,
       maintenance,
       captureHealth: status.health ?? null,
       historyCoverage,
-      captureBaseline: captureBaselineStatus(buffer.database),
+      captureBaseline: refreshControl ? captureBaselineStatus(buffer.database) : cachedControl?.captureBaseline ?? null,
     });
+    const cacheAge = evidenceAge(lastCoherentStatus?.cachedAt);
+    const invalidReason = refreshControl ? null : lastStatusRefreshError ??
+      (cacheAge === null || cacheAge > STATUS_MAX_AGE_MS ? "status_cache_expired" : null);
+    if (invalidReason) {
+      invalidateStatus(status, invalidReason);
+      Object.assign(read.snapshot.projection, status.projection);
+    }
     const maintenanceDigest = crypto
       .createHash("sha256")
       .update(JSON.stringify(maintenance))
@@ -245,7 +271,7 @@ export function createCollectorServer(
       : "none";
     return {
       ...read,
-      etagSeed: `${days}-${read.etagSeed}-${outcomeGeneration}-${delivery.remainingDelivery}-${delivery.receipts.dead}-${maintenanceDigest}-${historyCoverage.sources.map((source) => `${source.completedAt ?? "incomplete"}:${source.latestFullAttempt?.attemptedAt ?? "none"}:${source.latestFullAttempt?.status ?? "none"}`).join(":")}`,
+      etagSeed: `${days}-${read.etagSeed}-${invalidReason ?? "valid"}-${outcomeGeneration}-${delivery?.remainingDelivery ?? "unknown"}-${delivery?.receipts.dead ?? "unknown"}-${maintenanceDigest}-${historyCoverage?.sources.map((source) => `${source.completedAt ?? "incomplete"}:${source.latestFullAttempt?.attemptedAt ?? "none"}:${source.latestFullAttempt?.status ?? "none"}`).join(":") ?? "unknown"}`,
     };
   };
 
@@ -254,15 +280,17 @@ export function createCollectorServer(
     generation: number | null;
     cachedAt: string;
   } | null = null;
-  let lastStatusRefreshError: "database_busy" | "status_refresh_failed" | null = null;
+  let lastStatusRefreshError: "database_busy" | "status_refresh_failed" | "maintenance_failed" | null = null;
+  let lastGoodAt: string | null = null;
+  const statusRefreshCounters = { attempts: 0, failures: 0, expiredResponses: 0 };
   const currentStatus = () => {
-    const read = snapshotResponse(30);
+    const read = snapshotResponse(30, true);
     if (read.kind === "ready") {
       const body = read.snapshot.status as Record<string, unknown>;
       lastCoherentStatus = {
         body,
         generation: read.snapshot.generation,
-        cachedAt: new Date().toISOString(),
+        cachedAt: new Date(Date.now()).toISOString(),
       };
       return { body, generation: read.snapshot.generation };
     }
@@ -315,19 +343,27 @@ export function createCollectorServer(
         reason: "projection backfill has not published a coherent health snapshot",
       },
     };
-    lastCoherentStatus = { body, generation: null, cachedAt: new Date().toISOString() };
+    lastCoherentStatus = { body, generation: null, cachedAt: new Date(Date.now()).toISOString() };
     return { body, generation: null };
   };
 
   // Prime one coherent in-memory response before accepting requests. The
   // parent connection is fail-fast, so a rare startup writer collision falls
   // through to the bounded minimal status below rather than waiting seconds.
-  const refreshStatus = () => {
+  const refreshStatus = (failure?: "maintenance_failed") => {
+    statusRefreshCounters.attempts += 1;
     try {
       currentStatus();
-      lastStatusRefreshError = null;
+      if (lastCoherentStatus) lastCoherentStatus.body.repairService = automaticRepairServiceStatus(buffer.database);
+      lastStatusRefreshError = failure ?? null;
+      if (failure) statusRefreshCounters.failures += 1;
+      else if (lastCoherentStatus &&
+          (lastCoherentStatus.body.projection as { parityReady?: boolean })?.parityReady === true) {
+        lastGoodAt = lastCoherentStatus.cachedAt;
+      }
       return true;
     } catch (error) {
+      statusRefreshCounters.failures += 1;
       const code = error && typeof error === "object" && "code" in error
         ? String((error as { code?: unknown }).code ?? "")
         : "";
@@ -358,14 +394,19 @@ export function createCollectorServer(
           // Cache-only by construction: no SQLite or user-path filesystem call
           // executes on the availability endpoint.
           const cached = lastCoherentStatus;
-          const ageMs = cached ? Math.max(0, Date.now() - Date.parse(cached.cachedAt)) : null;
+          const ageMs = evidenceAge(cached?.cachedAt);
+          const expired = cached !== null && (ageMs === null || ageMs > STATUS_MAX_AGE_MS);
+          const invalidReason = lastStatusRefreshError ?? (expired ? "status_cache_expired" : null);
+          if (expired) statusRefreshCounters.expiredResponses += 1;
           const body: Record<string, unknown> = cached
             ? {
                 ...cached.body,
                 maintenance: options.maintenanceStatus?.() ?? null,
                 statusFreshness: {
-                  state: lastStatusRefreshError ? "last_coherent" : "coherent",
-                  reason: lastStatusRefreshError,
+                  state: expired ? "expired" : lastStatusRefreshError ? "last_coherent" : "coherent",
+                  reason: invalidReason,
+                  lastGoodAt,
+                  maxAgeMs: STATUS_MAX_AGE_MS,
                   cachedAt: cached.cachedAt,
                   ageMs,
                 },
@@ -422,11 +463,35 @@ export function createCollectorServer(
               state: "unavailable",
               reason: lastStatusRefreshError ?? "coherent_snapshot_not_established",
               cachedAt: null,
+              lastGoodAt,
+              maxAgeMs: STATUS_MAX_AGE_MS,
               ageMs: null,
             },
           };
           // In-memory monotonic admission counters by bounded reason class.
           // No ledger or filesystem work executes on this path.
+          if (invalidReason) invalidateStatus(body, invalidReason);
+          const captureHealth = body.captureHealth as { sources?: Array<{
+            source: string; lastEventAt?: string; activityState?: { lastScanAt?: string };
+          }> } | null;
+          const projection = body.projection as { parityReady?: boolean; lastSuccessAt?: string } | null;
+          body.evidenceWatermarks = {
+            capture: { state: !cached ? "unavailable" : invalidReason ? "stale" : "observed",
+              observedAt: cached?.cachedAt ?? null,
+              sources: (captureHealth?.sources ?? []).map((source) => ({
+                source: source.source, coveredThrough: source.lastEventAt ?? null,
+                scannedAt: source.activityState?.lastScanAt ?? null,
+              })) },
+            projection: { state: projection?.parityReady ? "current" : "stale",
+              generation: cached?.generation ?? null,
+              coveredThrough: projection?.lastSuccessAt ?? null },
+            attribution: { state: "unavailable", coveredThrough: null,
+              reason: "project_attribution_watermark_unavailable",
+              reconciliationThrough: (body.reconciliation as { lastSuccessAt?: string })?.lastSuccessAt ?? null },
+            outcomes: { state: "unavailable", coveredThrough: null,
+              reason: "outcome_coverage_watermark_unavailable" },
+          };
+          body.statusRefreshCounters = { ...statusRefreshCounters };
           body.httpAdmission = rejectionDiagnostics.counters();
           sendJson(response, body, 200, cached?.generation === null || cached?.generation === undefined ? {} : {
             "x-plimsoll-projection-generation": String(cached.generation),
@@ -461,7 +526,7 @@ export function createCollectorServer(
             detectedIdentities: options.detectedIdentities?.() ?? [],
             // Issue 0056 (#104): live ingest-integrity counts on the
             // credential-gated management surface. /status stays cache-only.
-            ingestIntegrity: buffer.eventCollisionSummary(),
+            ingestIntegrity: lastCoherentStatus?.body.ingestIntegrity ?? null,
           });
           return;
         }
@@ -724,11 +789,25 @@ export function createCollectorServer(
         ) {
           budget.checkpoint();
           for (const { hash, label } of repoLabels) buffer.recordRepoLabel(hash, label);
-          const integrity = buffer.appendMany(
-            exploded.events,
-            exploded.metricSamples,
-            exploded.admissionDrops,
-          );
+          // Admission is durable in small transactions. Yield between chunks
+          // so availability reads and other producers receive a turn. A retry
+          // after any partial commit retains the existing deterministic IDs.
+          const integrity = { deduplicatedCount: 0, collisionQuarantinedCount: 0 };
+          const projectionDeadlineMs = performance.now() + 25;
+          const chunks = Math.max(Math.ceil(exploded.events.length / 16),
+            Math.ceil(exploded.metricSamples.length / 16), 1);
+          for (let chunk = 0; chunk < chunks; chunk += 1) {
+            if (chunk > 0) await new Promise<void>(resolve => setImmediate(resolve));
+            budget.checkpoint();
+            const result = buffer.appendMany(
+              exploded.events.slice(chunk * 16, (chunk + 1) * 16),
+              exploded.metricSamples.slice(chunk * 16, (chunk + 1) * 16),
+              chunk === 0 ? exploded.admissionDrops : [],
+              { projectionDeadlineMs },
+            );
+            integrity.deduplicatedCount += result.deduplicatedCount;
+            integrity.collisionQuarantinedCount += result.collisionQuarantinedCount;
+          }
           rejectionDiagnostics.recordAccepted(source);
           response.writeHead(202, { "content-type": "application/json" });
           response.end(

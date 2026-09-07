@@ -1,5 +1,6 @@
 import {
   DEFAULT_POLICY,
+  admittedCost,
   GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
   ANALYTICAL_METADATA_LIMITS,
   admittedMetadataAttributes,
@@ -292,9 +293,11 @@ function buildLogEvent(
   const outputTokens = intTokens(numberField(attrs, [...usageFieldKeys.outputTokens]));
   const cacheReadTokens = intTokens(numberField(attrs, [...usageFieldKeys.cacheReadTokens]));
   const cacheCreationTokens = intTokens(numberField(attrs, [...usageFieldKeys.cacheCreationTokens]));
-  let costUsd = numberField(attrs, [...usageFieldKeys.costUsd]);
+  const capturedCost = admittedCost([attrs]);
+  let costUsd = capturedCost.value;
+  let costKind = capturedCost.kind;
   let costEstimated = false;
-  if (costUsd === undefined) {
+  if (costUsd === undefined && costKind === undefined) {
     const estimate = estimateCostUsd({
       model: stringField(attrs, [...usageFieldKeys.model]),
       inputTokens,
@@ -304,6 +307,7 @@ function buildLogEvent(
     });
     if (estimate) {
       costUsd = estimate.costUsd;
+      costKind = "estimated";
       costEstimated = true;
     }
   }
@@ -358,7 +362,7 @@ function buildLogEvent(
     outputTokens,
     cacheReadTokens,
     cacheCreationTokens,
-    costUsd: costUsd !== undefined && costUsd >= 0 ? costUsd : undefined,
+    ...(costUsd !== undefined && costUsd >= 0 ? { costUsd, costKind } : {}),
     metadata: {
       ...metadataAttrs.attrs,
       ...(otelEventName ? { otelEventName } : {}),
@@ -418,9 +422,11 @@ function buildSpanEvent(
   const outputTokens = intTokens(numberField(attrs, [...usageFieldKeys.outputTokens]));
   const cacheReadTokensSpan = intTokens(numberField(attrs, [...usageFieldKeys.cacheReadTokens]));
   const cacheCreationTokensSpan = intTokens(numberField(attrs, [...usageFieldKeys.cacheCreationTokens]));
-  let costUsd = numberField(attrs, [...usageFieldKeys.costUsd]);
+  const capturedCost = admittedCost([attrs]);
+  let costUsd = capturedCost.value;
+  let costKind = capturedCost.kind;
   let costEstimated = false;
-  if (costUsd === undefined) {
+  if (costUsd === undefined && costKind === undefined) {
     const estimate = estimateCostUsd({
       model: stringField(attrs, [...usageFieldKeys.model]),
       inputTokens,
@@ -430,6 +436,7 @@ function buildSpanEvent(
     });
     if (estimate) {
       costUsd = estimate.costUsd;
+      costKind = "estimated";
       costEstimated = true;
     }
   }
@@ -516,7 +523,7 @@ function buildSpanEvent(
     outputTokens,
     cacheReadTokens: cacheReadTokensSpan,
     cacheCreationTokens: cacheCreationTokensSpan,
-    costUsd: costUsd !== undefined && costUsd >= 0 ? costUsd : undefined,
+    ...(costUsd !== undefined && costUsd >= 0 ? { costUsd, costKind } : {}),
     metadata: {
       ...metadataAttrs.attrs,
       ...(costEstimated ? { costEstimated: true } : {}),
