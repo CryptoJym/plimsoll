@@ -858,7 +858,10 @@ if (invokedAsScript) {
     main().catch((error) => {
       const errorClass = error instanceof Error ? error.name : "UnknownError";
       process.stderr.write(
-        `${JSON.stringify({ schema: RESOURCE_PROOF_SCHEMA, overall: "fail", error: errorClass })}\n`,
+        `${JSON.stringify({ schema: RESOURCE_PROOF_SCHEMA, overall: "fail", error: errorClass,
+          frames: error instanceof Error ? [...(error.stack ?? "").matchAll(/at ([A-Za-z0-9_.]+).*?\/(scenarios\.ts|bounded-capture\.ts|index\.ts):(\d+):\d+/g)]
+            .slice(0, 4).map((match) => ({ function: match[1], file: match[2], line: Number(match[3]) })) : [],
+        })}\n`,
       );
       process.exitCode = 1;
     });

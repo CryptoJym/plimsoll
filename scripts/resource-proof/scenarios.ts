@@ -2193,6 +2193,8 @@ export async function runDashboardProjectionBudgetContract(
     const base = `http://127.0.0.1:${address.port}`;
     const before = buffer.projection.workCounters();
     const buildsBefore = before.snapshotBuilds;
+    const totalChanges = () => (buffer.database.prepare("select total_changes() as n").get() as { n: number }).n;
+    const writesBefore = totalChanges();
     const durations: number[] = [];
     let generation: number | null = null;
     let coherent = true;
@@ -2214,6 +2216,7 @@ export async function runDashboardProjectionBudgetContract(
       else if (generation !== body.generation) coherent = false;
       if (index >= 5) durations.push(performance.now() - requestStarted);
     }
+    const sqliteWritesDuringRefresh = totalChanges() - writesBefore;
     const after = buffer.projection.workCounters();
     const ordered = [...durations].sort((a, b) => a - b);
     const warmP95 = ordered[Math.ceil(ordered.length * 0.95) - 1] ?? Number.POSITIVE_INFINITY;
@@ -2230,6 +2233,7 @@ export async function runDashboardProjectionBudgetContract(
       counters.rawRowsScanned === 0 &&
       counters.filesystemEntriesScanned === 0 &&
       after.snapshotBuilds === buildsBefore &&
+      sqliteWritesDuringRefresh === 0 &&
       warmP95 <= 500;
     return {
       id: "dashboard_projection_budget",
@@ -2246,6 +2250,7 @@ export async function runDashboardProjectionBudgetContract(
         warmRequests: durations.length,
         warmP95Ms: Math.round(warmP95 * 100) / 100,
         snapshotBuildsDuringRefresh: after.snapshotBuilds - buildsBefore,
+        sqliteWritesDuringRefresh,
         snapshotCacheHits: after.snapshotCacheHits - before.snapshotCacheHits,
       },
     };
