@@ -570,6 +570,10 @@ function assertSafeString(value: string, code: string) {
 function validateOwnedManifest(source: string) {
   if (Buffer.byteLength(source) > MAX_MANIFEST_BYTES) fail("PLIST_TOO_LARGE");
   const plist = parsePlist(source);
+  // Older Plimsoll source installs declared Adaptive scheduling explicitly.
+  // Accept only that known value while retaining the exact-key allowlist.
+  const legacyProcessType = Object.hasOwn(plist, "ProcessType");
+  if (legacyProcessType && plist.ProcessType !== "Adaptive") fail("PLIST_PROCESS_TYPE_UNEXPECTED");
   exactKeys(plist, [
     "Label",
     "ProgramArguments",
@@ -580,6 +584,7 @@ function validateOwnedManifest(source: string) {
     "StandardOutPath",
     "StandardErrorPath",
     "EnvironmentVariables",
+    ...(legacyProcessType ? ["ProcessType"] : []),
   ], "PLIST_KEYS_UNEXPECTED");
   if (plist.Label !== LAUNCH_AGENT_LABEL) fail("PLIST_LABEL_UNOWNED");
   if (plist.RunAtLoad !== true || plist.ThrottleInterval !== 30) fail("PLIST_LIFECYCLE_UNEXPECTED");
