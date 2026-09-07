@@ -69,7 +69,7 @@ async function main() {
     check("two_builds_produce_identical_runtime_manifests", firstManifest.equals(fs.readFileSync(path.join(dist, "runtime-manifest.json"))));
     check("two_packs_produce_identical_tarball_bytes", sha(first) === sha(second));
     const manifest = JSON.parse(firstManifest.toString());
-    check("source_and_dependency_provenance_present", /^[a-f0-9]{40}$/.test(manifest.source.commit) &&
+    check("source_and_dependency_provenance_present", manifest.source.dirty === false && /^[a-f0-9]{40}$/.test(manifest.source.commit) &&
       /^[a-f0-9]{64}$/.test(manifest.provenance.lockSha256) && /^[a-f0-9]{64}$/.test(manifest.provenance.inputsSha256));
 
     const install = path.join(root, "install");

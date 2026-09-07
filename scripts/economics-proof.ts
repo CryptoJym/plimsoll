@@ -16,6 +16,8 @@ import { usageFactFromEvent } from "../packages/shared/src/economics/event-adapt
 import { aiInteractionEventSchema } from "../packages/shared/src/schemas";
 import { CaptureWorkBudget } from "../packages/collector-cli/src/capture-work-budget";
 import { createProfileCapture } from "../packages/collector-cli/src/profile-capture";
+import { createProofCompletion } from "./lib/proof-completion";
+const completion=createProofCompletion("economics",37);
 if(!process.env.PLIMSOLL_PROOF_HOME||process.env.HOME!==process.env.PLIMSOLL_PROOF_HOME||
   !process.env.PLIMSOLL_HOME?.startsWith(path.resolve(process.env.PLIMSOLL_PROOF_HOME)+path.sep)) {
   throw new Error("isolated_proof_home_required");
@@ -24,7 +26,7 @@ const results: Array<{
   name: string;
   passed: boolean;
 }>=[];
-function check(name: string,fn: () => void) { fn(); results.push({ name,passed: true }); }
+function check(name: string,fn: () => void) { fn(); results.push({ name,passed: true }); completion.check(name); }
 const tenant="tenant-fixture",start="2026-09-01T00:00:00.000Z",end="2026-09-07T00:00:00.000Z",now="2026-09-08T00:00:00.000Z";
 const period={ start,end },A=`sha256:${"a".repeat(64)}`,B=`sha256:${"b".repeat(64)}`;
 function event(id: string,projectKey: string|null,inputTokens=1,extra: Partial<UsageFact>={}): UsageFact {
@@ -361,4 +363,5 @@ captureProof().then(() => {
   console.log(JSON.stringify(receipt,null,2));
   if(process.env.ECONOMICS_RECEIPT)
     fs.writeFileSync(process.env.ECONOMICS_RECEIPT,JSON.stringify(receipt,null,2)+"\n");
+  completion.complete();
 }).catch(error => { console.error(error); process.exitCode=1; });

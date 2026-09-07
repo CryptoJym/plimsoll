@@ -149,6 +149,8 @@ try {
 
   {
     const buffer = new LocalEventBuffer(path.join(root, "status.sqlite"));
+    // HTTP status must use the bounded maintenance receipt, never count raw history.
+    buffer.retentionStatus = () => { throw new Error("status_must_not_inspect_full_retention"); };
     const server = createCollectorServer(collectorConfigSchema.parse({}), buffer);
     try {
       await new Promise<void>((resolve, reject) => {
@@ -164,10 +166,10 @@ try {
       };
       assert.equal(response.status, 200);
       assert.equal(body.enrollment?.futureOnlyEnrollment, true);
-      assert.ok(body.retention?.inspection === "complete" || body.retention?.inspection === "not_inspected");
-      assert.ok(body.retention?.states &&
-        ["retained", "pendingDelivery", "quarantined", "expired", "notInspected"]
-          .every((state) => state in body.retention!.states!));
+      assert.equal(body.retention?.inspection, "bounded");
+      assert.deepEqual(body.retention?.states, {
+        retained: null, pendingDelivery: null, quarantined: null, expired: 0, notInspected: 1,
+      });
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
       buffer.close();

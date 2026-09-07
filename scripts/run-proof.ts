@@ -11,7 +11,7 @@ const repoRoot = path.resolve(path.dirname(scriptPath), "..");
 const hash = (file: string) => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
 
 export function isolatedEnvironment(root: string): NodeJS.ProcessEnv {
-  const dirs = { HOME: "home", USERPROFILE: "home", PLIMSOLL_HOME: "home/.plimsoll",
+  const dirs = { HOME: "home", USERPROFILE: "home", PLIMSOLL_PROOF_HOME: "home", PLIMSOLL_HOME: "home/.plimsoll",
     CODEX_HOME: "home/.codex", CLAUDE_CONFIG_DIR: "home/.claude", XDG_CONFIG_HOME: "home/.config",
     XDG_CACHE_HOME: "home/.cache", XDG_STATE_HOME: "home/.local/state", TMPDIR: "tmp", TEMP: "tmp", TMP: "tmp" };
   const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, LANG: "en_US.UTF-8", TZ: "UTC",

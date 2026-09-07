@@ -5,7 +5,7 @@ import path from "node:path";
 import { createProofCompletion } from "./lib/proof-completion";
 import { runProof } from "./run-proof";
 
-const completion = createProofCompletion("proof-completion", 8);
+const completion = createProofCompletion("proof-completion", 10);
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "completion-canaries-"));
 const helper = path.resolve(import.meta.dirname, "lib/proof-completion.ts");
 const cases = [
@@ -17,6 +17,8 @@ const cases = [
   ["missing-receipt", 'process.exit(0);', "failed"],
   ["source-changed", 'const p = createProofCompletion("canary", 1); fs.appendFileSync(ENTRY, "// changed\\n"); p.check("done"); p.complete();', "failed"],
   ["unsafe-provider-root", 'process.env.CODEX_HOME = "/outside-proof-root"; createProofCompletion("canary", 1);', "failed"],
+  ["portable-proof-home", 'const p = createProofCompletion("canary", 1); p.check("explicit_home_marker", process.env.PLIMSOLL_PROOF_HOME === process.env.HOME); p.complete();', "passed"],
+  ["forged-home-marker", 'process.env.HOME = process.env.PLIMSOLL_PROOF_HOME = "/outside-proof-root"; process.env.PLIMSOLL_HOME = "/outside-proof-root/.plimsoll"; createProofCompletion("canary", 1);', "failed"],
 ] as const;
 async function main() {
 try {

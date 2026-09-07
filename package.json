@@ -28,7 +28,7 @@
     "proof:maintenance": "tsx scripts/maintenance-proof.ts",
     "proof:collector-reliability": "tsx scripts/collector-reliability-proof.ts",
     "proof:child-identity": "tsx scripts/child-identity-recovery-proof.ts",
-    "proof:economics": "tsx scripts/economics-proof.ts",
+    "proof:economics": "tsx scripts/run-proof.ts scripts/economics-proof.ts",
     "proof:finance-export": "tsx scripts/finance-project-usage-export.test.ts",
     "proof:finance-projection": "tsx scripts/finance-project-usage-projection.test.ts",
     "proof:delivery": "tsx scripts/delivery-transport-proof.ts",

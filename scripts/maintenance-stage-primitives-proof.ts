@@ -3,6 +3,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
+import { ensureFinanceProvenanceSchema } from "../packages/collector-cli/src/history-coverage";
 import {
   ensureMaintenanceStageSchema,
   readMaintenanceStageCursor,
@@ -18,6 +19,7 @@ function fixture() {
   database.exec(`
     create table buffered_events (
       id text primary key, created_at text not null, uploaded_at text,
+      source text not null default 'codex', workspace_id text, installation_epoch_id text,
       session_id text, observed_at text not null, repo_hash text,
       branch_hash text, head_sha text, input_tokens integer,
       output_tokens integer, cost_usd real, payload_json text not null default '{}'
@@ -44,6 +46,7 @@ function fixture() {
       queued_at text not null, updated_at text not null
     );
   `);
+  ensureFinanceProvenanceSchema(database);
   ensureMaintenanceStageSchema(database);
   ensureMaintenanceStageSchema(database);
   return database;
