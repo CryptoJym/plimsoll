@@ -851,7 +851,7 @@ export class RolloutTailer {
             break;
           }
           const limits = automatic
-            ? automatic.budget.remainingSlice()
+            ? automatic.budget.remainingSlice(cursor?.unresolvedRecord?.reason === "record_exceeds_byte_budget")
             : { maxBytes: 128 * 1024, maxRecords: 64 };
           if (!limits) break;
           let read: NonNullable<ReturnType<JsonlTailerIo["readTail"]>>;

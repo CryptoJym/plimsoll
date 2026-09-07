@@ -29,6 +29,7 @@
     "proof:maintenance": "tsx scripts/maintenance-proof.ts",
     "proof:collector-reliability": "tsx scripts/collector-reliability-proof.ts",
     "proof:collector-clock": "tsx scripts/collector-integrated-correction-proof.ts",
+    "proof:automatic-record-retry": "tsx scripts/automatic-record-retry-proof.ts",
     "proof:future-admission": "tsx scripts/future-admission-proof.ts",
     "proof:child-identity": "tsx scripts/child-identity-recovery-proof.ts",
     "proof:economics": "tsx scripts/run-proof.ts scripts/economics-proof.ts",
