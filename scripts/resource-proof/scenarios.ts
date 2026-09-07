@@ -1,3 +1,4 @@
+import { acceptedFixtureDelivery } from "../lib/delivery-fixture";
 import { spawn, spawnSync, type ChildProcessByStdio } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -994,7 +995,7 @@ export async function runPoisonContinuationContract(
           events: Array<{ event: { id: string } }>;
         };
         const ids = body.events.map((entry) => entry.event.id);
-        return new Response(JSON.stringify({ accepted: ids.length }), {
+        return new Response(JSON.stringify(ids.includes(poisonId) ? { accepted: 0 } : acceptedFixtureDelivery(String(init?.body ?? ""), config.installKey)), {
           status: ids.includes(poisonId) ? 422 : 200,
           headers: { "content-type": "application/json" },
         });
@@ -1379,7 +1380,13 @@ export async function runNoChangeConstantWorkContract(
     }
     const appendedRun = appendedRuns[0]!;
     const appendMutations = eventMutationDelta(appendBefore, eventMutationCounts(buffer));
-    const afterAppendRun = (await requestAutomaticRecentMaintenance(restartScheduler))[0];
+    // Capture returns before all four fair repair stages finish. Require the
+    // same zero-work receipt after at most one complete repair rotation.
+    let afterAppendRun: CollectorMaintenanceRunResult | undefined;
+    for (let stage = 0; stage < 4; stage += 1) {
+      afterAppendRun = (await requestAutomaticRecentMaintenance(restartScheduler))[0];
+      if (afterAppendRun && unchangedMaintenanceResult(afterAppendRun)) break;
+    }
     if (!appendedRun || !afterAppendRun) throw new Error("AppendMaintenanceResultMissing");
     const appendedExactlyOnce =
       appendedRuns.reduce((total, run) => total + run.rawEventWrites, 0) === 2 &&
@@ -1895,7 +1902,7 @@ export async function runNoChangeConstantWorkContract(
       status: passed ? "pass" : "fail",
       detail: passed
         ? "Metadata-only first boot excluded pre-install generations, coalesced without overlap, kept their growth excluded, captured only new generations exactly once, and left history import explicit and resumable."
-        : "Recent-first boot, durable receipt, restart, status, or explicit history coverage assertions failed.",
+        : `Recent-first boot, durable receipt, restart, status, or explicit history coverage assertions failed: ${JSON.stringify({ appendedWrites: appendedRuns.map((run) => ({ raw: run.rawEventWrites, rollout: run.rollout.eventsAppended, transcript: run.transcript.eventsAppended })), appendMutations, afterAppendRun })}`,
       durationMs: Math.round((performance.now() - started) * 100) / 100,
       counters,
       measurements: {

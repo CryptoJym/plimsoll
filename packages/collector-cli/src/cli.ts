@@ -1318,35 +1318,12 @@ async function main() {
     }
     runMaintenanceWorkerService({
       spawnNonce,
-      onStage: ({ stage, ms }) => {
-        console.error(JSON.stringify({ warning: "maintenance_worker_stage", stage, ms }));
-      },
       initialize: () => {
-        let startedAt = performance.now();
         const workerConfig = loadCollectorConfig();
-        console.error(JSON.stringify({
-          warning: "maintenance_worker_stage", stage: "config_loaded",
-          ms: Math.max(0, Math.round(performance.now() - startedAt)),
-        }));
-        startedAt = performance.now();
         assertCollectorPrivacyMode(workerConfig, "automatic maintenance worker");
-        console.error(JSON.stringify({
-          warning: "maintenance_worker_stage", stage: "privacy_checked",
-          ms: Math.max(0, Math.round(performance.now() - startedAt)),
-        }));
-        startedAt = performance.now();
         const workerBuffer = openBuffer(workerConfig, false, 900);
-        console.error(JSON.stringify({
-          warning: "maintenance_worker_stage", stage: "ledger_opened",
-          ms: Math.max(0, Math.round(performance.now() - startedAt)),
-        }));
-        startedAt = performance.now();
         const capture = createProfileCapture(workerBuffer, workerConfig);
         const workerMaintenance = new CollectorMaintenance(workerBuffer, capture.rollout, capture.transcript);
-        console.error(JSON.stringify({
-          warning: "maintenance_worker_stage", stage: "maintenance_constructed",
-          ms: Math.max(0, Math.round(performance.now() - startedAt)),
-        }));
         return {
           maintenance: workerMaintenance,
           buffer: workerBuffer,

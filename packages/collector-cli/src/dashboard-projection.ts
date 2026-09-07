@@ -2493,6 +2493,12 @@ export class DashboardProjectionStore {
         backlog.accountInvalidations === 0 && backlog.expiryWindows === 0 &&
         settled.degradedReason !== "projection_clock_rollback") {
         if (settled.dirty || !settled.ready) this.publishSnapshots(now);
+        else {
+          // A completed no-change pass verifies the current window without
+          // rebuilding aggregates. Quiet capture must still renew validity.
+          this.db.prepare(`update dashboard_projection_control
+            set parity_ready=1,last_success_at=? where singleton=1`).run(now.toISOString());
+        }
       } else {
         this.db.prepare(
           `update dashboard_projection_control set ready=case when generation>0 then 1 else 0 end,
@@ -3173,9 +3179,22 @@ export class DashboardProjectionStore {
     ).get(days) as {payloadJson:string;generation:number}|undefined;
     if(!row||!control.ready)return {kind:"backfilling",status:this.status()};
     const snapshot=json<SnapshotCore>(row.payloadJson);
-    // The payload and its window are one historical generation. Never relabel
-    // old totals with the current window-control cutoff or publish on a read.
     const current = this.status();
+    // Only completed maintenance can attest a later, equivalent window for
+    // this generation. Pending work keeps the published historical cutoff.
+    if (control.parityReady && !control.dirty && !control.degradedReason &&
+        row.generation === control.generation && Object.values(current.backlog).every(n => n === 0)) {
+      const verifiedWindow = this.db.prepare(`select w.cutoff_at as cutoffAt
+        from dashboard_window_control w join dashboard_projection_control c on c.singleton=1
+        where w.days=? and w.target_cutoff_at is null and c.generation=?
+          and c.ready=1 and c.parity_ready=1 and c.dirty=0 and c.degraded_reason is null`
+      ).get(days, row.generation) as
+        {cutoffAt: string} | undefined;
+      if (verifiedWindow && verifiedWindow.cutoffAt >= snapshot.window.since) {
+        snapshot.window.since = verifiedWindow.cutoffAt;
+        snapshot.summary.since = verifiedWindow.cutoffAt;
+      }
+    }
     const validity = projectionValidity({
       ready: Boolean(control.ready), parityReady: Boolean(control.parityReady),
       dirty: Boolean(control.dirty), degradedReason: control.degradedReason,

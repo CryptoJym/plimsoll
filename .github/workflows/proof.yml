@@ -8,7 +8,9 @@ on:
 jobs:
   proof:
     runs-on: macos-14
-    timeout-minutes: 10
+    # Allow the measured sequential artifact, repeated E2E and resource gates.
+    # Per-proof deadlines and acceptance thresholds remain unchanged.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
         with:
@@ -60,6 +62,7 @@ jobs:
       - name: Prove integrated capture, provenance, supervision and delivery
         run: |
           pnpm proof:collector-reliability
+          pnpm proof:collector-clock
           pnpm proof:child-identity
           pnpm proof:economics
           pnpm proof:finance-export

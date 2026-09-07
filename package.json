@@ -27,6 +27,7 @@
     "proof:lifecycle-operator": "tsx scripts/run-proof.ts scripts/lifecycle-operator-proof.ts",
     "proof:maintenance": "tsx scripts/maintenance-proof.ts",
     "proof:collector-reliability": "tsx scripts/collector-reliability-proof.ts",
+    "proof:collector-clock": "tsx scripts/collector-integrated-correction-proof.ts",
     "proof:child-identity": "tsx scripts/child-identity-recovery-proof.ts",
     "proof:economics": "tsx scripts/run-proof.ts scripts/economics-proof.ts",
     "proof:finance-export": "tsx scripts/finance-project-usage-export.test.ts",

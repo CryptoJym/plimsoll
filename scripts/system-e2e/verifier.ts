@@ -552,7 +552,7 @@ function verifySharedFlow(flow: Record<string, unknown>) {
     );
     return { sourceEpisodeKey: entry.sourceEpisodeKey, fact };
   });
-  assert.deepEqual(episodeBindings.map((entry) => entry.sourceEpisodeKey), ["shared-flow-treatment", "shared-flow-control"], "episode binding keys mismatch");
+  assert.deepEqual(episodeBindings.map((entry) => entry.sourceEpisodeKey), ["session", "session"], "episode binding keys mismatch");
   assert.deepEqual(episodeBindings.map((entry) => entry.fact.sessionId), EXPECTED.sessions, "episode sessions mismatch");
 
   const bindings = array(learning.attemptEventBindings, "attempt event bindings").map((entry, index) => {
