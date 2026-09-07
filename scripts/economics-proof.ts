@@ -323,7 +323,7 @@ async function captureProof() {
       fs.rmSync(automaticRoot,{ recursive: true,force: true });
     }
   }
-  const ledger=new LocalEventBuffer(":memory:",{ workspaceId: tenant });
+  const ledger=new LocalEventBuffer(":memory:",{ workspaceId: tenant,enrollmentNow: () => new Date(start) });
   try {
     const session="019e1111-2222-7333-8444-555555555555";
     for(const [index,repo,tokens] of [[1,A,1],[2,A,1],[3,B,100]] as const) {

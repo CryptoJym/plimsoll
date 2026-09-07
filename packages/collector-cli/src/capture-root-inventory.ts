@@ -148,6 +148,8 @@ function ensureRootObservationSchema(database: import("better-sqlite3").Database
 }
 /** Root sightings live beside immutable events; replay/failover never changes the first receipt. */
 export function appendRootObservation(buffer: import("./buffer").LocalEventBuffer,event: import("../../shared/src/schemas").AiInteractionEvent,root: CaptureRoot|undefined): boolean {
+  if (buffer.eventAdmissionReason(event.observedAt, root?.installationEpochId ?? event.metadata?.installationEpochId))
+    return false;
   if(!root)
     return buffer.append(event,[]);
   const database=buffer.database;
@@ -179,6 +181,9 @@ export function appendRootObservation(buffer: import("./buffer").LocalEventBuffe
   else
     same=priorSightings.length>0&&!priorConflict;
   const inserted=alreadyObserved? false:buffer.append(event,[]);
+  // Another connection may have enrolled between the first check and append.
+  if (!alreadyObserved && !inserted && buffer.eventAdmissionReason(event.observedAt, root?.installationEpochId))
+    return false;
   const state=priorConflict? "conflict":alreadyObserved? (same? "duplicate":"conflict"):inserted? "admitted":"conflict";
   database.prepare(`insert into capture_root_observations values(?,?,?,?,?)
     on conflict(root_digest,event_id) do update set state=case when payload_digest<>excluded.payload_digest then 'conflict' else state end`)

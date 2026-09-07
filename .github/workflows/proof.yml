@@ -67,6 +67,9 @@ jobs:
         run: |
           pnpm proof:collector-reliability
           pnpm proof:collector-clock
+          pnpm proof:lifecycle-manifest-rollback
+          pnpm proof:dashboard-cdp
+          pnpm proof:future-admission
           pnpm proof:child-identity
           pnpm proof:economics
           pnpm proof:finance-export

@@ -2,6 +2,8 @@ import crypto from "node:crypto";
 import os from "node:os";
 
 import Database from "better-sqlite3";
+import { z } from "zod";
+import { advanceCaptureBaselineEnrollment } from "./capture-baseline";
 
 import {
   canonicalizeSuppressionReceipts,
@@ -185,10 +187,15 @@ const EVENT_COLUMNS = [
   "privacy_disposed_at text",
 ] as const;
 
+const enrollmentTimestampSchema = z.string().datetime({ offset: true });
+const installationEpochIdSchema = z.string().uuid();
+
 export class LocalEventBuffer {
   private readonly db: Database.Database;
+  private readonly enrollmentNow: () => Date;
   private workspaceId: string | null = null;
   private deviceId: string | null = null;
+  private installationEpochId: string | null = null;
   private readonly repoContextQueue: RepoContextRequest[] = [];
   private readonly queuedRepoContextIds = new Set<string>();
   private activeRepoContextCommitScope: RepoContextHandoffBatch | null = null;
@@ -210,6 +217,8 @@ export class LocalEventBuffer {
       };
       workspaceId?: string;
       deviceId?: string;
+      /** Clock seam for deterministic enrollment fixtures; never replaces a persisted cutoff. */
+      enrollmentNow?: () => Date;
       learningFacts?: { limits?: Partial<LearningFactLimits> };
       /** HTTP collectors fail fast under child-writer contention; maintenance
        * workers may use a short bounded wait. The better-sqlite3 default is
@@ -217,6 +226,7 @@ export class LocalEventBuffer {
       databaseBusyTimeoutMs?: number;
     } = {},
   ) {
+    this.enrollmentNow = options.enrollmentNow ?? (() => new Date());
     const timeout = Math.max(0, Math.min(options.databaseBusyTimeoutMs ?? 5_000, 5_000));
     this.db = new Database(path, { timeout });
     this.db.pragma("journal_mode = WAL");
@@ -720,10 +730,11 @@ export class LocalEventBuffer {
    * returns. Binding ANY managed/joined workspace must never adopt
    * unassigned rows: that relabel is the exact leak class #163 quarantines.
    */
-  useWorkspace(workspaceId: string, deviceId = this.deviceId) {
+  useWorkspace(workspaceId: string, deviceId = this.deviceId, installationEpochId?: string) {
     const requested = workspaceId.trim();
     if (!requested) throw new Error("Workspace binding requires a non-empty workspace id.");
     let requestedDevice = deviceId?.trim() || null;
+    let selectedEpochId: string | null = null;
     const run = this.db.transaction(() => {
       const binding = this.db
         .prepare(
@@ -790,7 +801,7 @@ export class LocalEventBuffer {
             .run(requestedDevice, LOCAL_TENANT_ID);
         }
       }
-      this.ensureCurrentInstallationEpoch(requested);
+      selectedEpochId = this.ensureCurrentInstallationEpoch(requested, installationEpochId);
       // Deliberately no backfill for managed workspaces here or in any later
       // selection: once a managed workspace is selected, unassigned history is
       // permanently ineligible for that audience (lease and list filters are
@@ -799,6 +810,7 @@ export class LocalEventBuffer {
     run();
     this.workspaceId = requested;
     this.deviceId = requestedDevice;
+    this.installationEpochId = selectedEpochId;
     this.delivery.setWorkspace(requested);
     if (requestedDevice) this.delivery.setDevice(requestedDevice);
     return requested;
@@ -811,13 +823,14 @@ export class LocalEventBuffer {
    * rows stay unbound (local quarantine); only subsequent appends are labeled
    * for `toWorkspaceId`.
    */
-  transitionWorkspace(fromWorkspaceId: string, toWorkspaceId: string, deviceId = this.deviceId) {
+  transitionWorkspace(fromWorkspaceId: string, toWorkspaceId: string, deviceId = this.deviceId, installationEpochId?: string) {
     const from = fromWorkspaceId.trim();
     const to = toWorkspaceId.trim();
     if (!from || !to) throw new Error("Workspace transition requires non-empty ids.");
     let requestedDevice = deviceId?.trim() || null;
+    let selectedEpochId: string | null = null;
     if (from === to) {
-      this.useWorkspace(to, requestedDevice);
+      this.useWorkspace(to, requestedDevice, installationEpochId);
       return { fromWorkspaceId: from, toWorkspaceId: to, boundLegacyRows: 0 };
     }
     const run = this.db.transaction(() => {
@@ -858,9 +871,7 @@ export class LocalEventBuffer {
            where singleton = 1`,
         )
         .run({ to, deviceId: requestedDevice, now: new Date().toISOString() });
-      this.db.prepare(`update collector_workspace_binding set
-        current_installation_epoch_id = null, current_installation_epoch_started_at = null where singleton = 1`).run();
-      this.ensureCurrentInstallationEpoch(to);
+      selectedEpochId = this.ensureCurrentInstallationEpoch(to, installationEpochId ?? crypto.randomUUID());
       // Auth/contract circuits describe the prior workspace endpoint and must
       // not block the newly authenticated audience after reassignment.
       this.delivery.clearCircuit();
@@ -868,22 +879,54 @@ export class LocalEventBuffer {
     run();
     this.workspaceId = to;
     this.deviceId = requestedDevice;
+    this.installationEpochId = selectedEpochId;
     this.delivery.setWorkspace(to);
     if (requestedDevice) this.delivery.setDevice(requestedDevice);
     return { fromWorkspaceId: from, toWorkspaceId: to, boundLegacyRows: 0 };
   }
 
-  private ensureCurrentInstallationEpoch(workspaceId: string) {
+  private ensureCurrentInstallationEpoch(workspaceId: string, installationEpochId?: string) {
+    if (installationEpochId !== undefined && !installationEpochIdSchema.safeParse(installationEpochId).success) {
+      throw new Error("installation_epoch_id_invalid");
+    }
     const row = this.db.prepare(`select current_installation_epoch_id as id,
       current_installation_epoch_started_at as startedAt from collector_workspace_binding where singleton=1`).get() as
       { id: string | null; startedAt: string | null };
-    if (!row.id) {
-      row.id = crypto.randomUUID(); row.startedAt = new Date().toISOString();
+    if (!row.id || (installationEpochId !== undefined && row.id !== installationEpochId)) {
+      const startedAt = this.enrollmentNow().toISOString();
+      if (row.startedAt && Date.parse(startedAt) < Date.parse(row.startedAt)) {
+        throw new Error("installation_epoch_clock_regressed");
+      }
+      row.id = installationEpochId ?? crypto.randomUUID(); row.startedAt = startedAt;
       this.db.prepare(`update collector_workspace_binding set current_installation_epoch_id=?,
         current_installation_epoch_started_at=? where singleton=1`).run(row.id,row.startedAt);
       markFinancePublicationDirty(this.db);
+      if (workspaceId !== LOCAL_TENANT_ID) advanceCaptureBaselineEnrollment(this.db, row.startedAt);
+    }
+    if (!enrollmentTimestampSchema.safeParse(row.startedAt).success) {
+      throw new Error("installation_epoch_cutoff_invalid");
     }
     initializeFinanceSourceCoverage(this.db,workspaceId,row.id,row.startedAt!);
+    return row.id;
+  }
+
+  /** Managed admission uses the durable enrollment binding, never file mtime,
+   * observation arrival time, an account label, or a proposed profile epoch. */
+  eventAdmissionReason(observedAt: unknown, claimedInstallationEpochId?: unknown):
+    "stale_connection" | "enrollment_binding_invalid" | "invalid_timestamp" | "before_enrollment" | "epoch_mismatch" | null {
+    const binding = this.workspaceBinding();
+    if (binding && (binding.currentWorkspaceId !== this.workspaceId ||
+        binding.currentDeviceId !== this.deviceId || binding.currentInstallationEpochId !== this.installationEpochId))
+      return "stale_connection";
+    if (!binding || binding.currentWorkspaceId === LOCAL_TENANT_ID) return null;
+    if (!binding.currentInstallationEpochId || !binding.currentInstallationEpochStartedAt ||
+        !enrollmentTimestampSchema.safeParse(binding.currentInstallationEpochStartedAt).success)
+      return "enrollment_binding_invalid";
+    if (!enrollmentTimestampSchema.safeParse(observedAt).success) return "invalid_timestamp";
+    if (Date.parse(observedAt as string) < Date.parse(binding.currentInstallationEpochStartedAt)) return "before_enrollment";
+    if (claimedInstallationEpochId !== undefined && claimedInstallationEpochId !== binding.currentInstallationEpochId)
+      return "epoch_mismatch";
+    return null;
   }
 
   workspaceBinding() {
@@ -956,6 +999,8 @@ export class LocalEventBuffer {
       futureOnlyEnrollment: true as const,
       currentWorkspaceId,
       currentDeviceId,
+      currentInstallationEpochId: binding?.currentInstallationEpochId ?? null,
+      currentInstallationEpochStartedAt: binding?.currentInstallationEpochStartedAt ?? null,
       quarantinedHistoryRows: quarantinedEventRows + quarantinedOutboxRows,
       quarantinedEventRows,
       quarantinedOutboxRows,
@@ -2206,6 +2251,8 @@ export class LocalEventBuffer {
         "Raw evidence rows cannot be appended to the ordinary ledger; the encrypted evidence vault is not implemented.",
       );
     }
+    const enrollmentRejected = this.eventAdmissionReason(event.observedAt, event.metadata?.installationEpochId);
+    if (enrollmentRejected) return { appended: false, repoContextRequest: null, enrollmentRejected };
     const createdAt = new Date().toISOString();
     if (!this.claimSessionUsageAuthority(event, createdAt)) {
       return { appended: false, repoContextRequest: null };
@@ -2463,6 +2510,7 @@ export class LocalEventBuffer {
     appended: boolean;
     deduplicated?: true;
     collisionQuarantined?: true;
+    enrollmentRejected?: NonNullable<ReturnType<LocalEventBuffer["eventAdmissionReason"]>>;
   };
   append(
     event: AiInteractionEvent,
@@ -2502,6 +2550,7 @@ export class LocalEventBuffer {
       ...(result.collisionQuarantined
         ? { collisionQuarantined: true as const }
         : {}),
+      ...(result.enrollmentRejected ? { enrollmentRejected: result.enrollmentRejected } : {}),
     };
   }
 
@@ -2513,6 +2562,7 @@ export class LocalEventBuffer {
   ) {
     const projectionDeadlineMs = options.projectionDeadlineMs ?? performance.now() + 25;
     const appended: Array<ReturnType<LocalEventBuffer["appendInCurrentTransaction"]>> = [];
+    let enrollmentRejectedMetricCount = 0;
     const ownsHandoffs = this.activeRepoContextCommitScope === null;
     const handoffs = this.activeRepoContextCommitScope ?? this.newRepoContextHandoffBatch();
     const closeUnreservedLink = this.db.prepare(
@@ -2529,7 +2579,7 @@ export class LocalEventBuffer {
         }
       }
       for (const sample of metricSamples) {
-        this.appendMetricSample(sample);
+        if (!this.appendMetricSample(sample)) enrollmentRejectedMetricCount += 1;
       }
       const now = new Date().toISOString();
       for (const drop of admissionDrops) {
@@ -2552,6 +2602,8 @@ export class LocalEventBuffer {
     return {
       deduplicatedCount: appended.filter((entry) => entry.deduplicated).length,
       collisionQuarantinedCount: appended.filter((entry) => entry.collisionQuarantined).length,
+      enrollmentRejectedEventCount: appended.filter((entry) => entry.enrollmentRejected).length,
+      enrollmentRejectedMetricCount,
     };
   }
 
@@ -2729,35 +2781,40 @@ export class LocalEventBuffer {
   }
 
   appendMetricSample(sample: MetricSample) {
-    this.db
-      .prepare(
-        `insert into metric_samples
-          (id, source, metric_name, observed_at, session_id, model, sample_type, value, attrs_json,
-           suppressed_fields_json, created_at)
-        values
-          (@id, @source, @metricName, @observedAt, @sessionId, @model, @sampleType, @value, @attrsJson,
-           @suppressedFieldsJson, @createdAt)
-        on conflict(id) do update set source=excluded.source,metric_name=excluded.metric_name,
-          observed_at=excluded.observed_at,session_id=excluded.session_id,model=excluded.model,
-          sample_type=excluded.sample_type,value=excluded.value,attrs_json=excluded.attrs_json,
-          suppressed_fields_json=excluded.suppressed_fields_json,
-          created_at=excluded.created_at`,
-      )
-      .run({
-        id: sample.id,
-        source: sample.source,
-        metricName: sample.metricName,
-        observedAt: sample.observedAt,
-        sessionId: sample.sessionId ?? null,
-        model: sample.model ?? null,
-        sampleType: sample.sampleType ?? null,
-        value: sample.value,
-        attrsJson: JSON.stringify(sample.attrs ?? {}),
-        suppressedFieldsJson: JSON.stringify(
-          canonicalizeSuppressionReceipts(sample.suppressedFields ?? []),
-        ),
-        createdAt: new Date().toISOString(),
-      });
+    const run = () => {
+      if (this.eventAdmissionReason(sample.observedAt)) return false;
+      this.db
+        .prepare(
+          `insert into metric_samples
+            (id, source, metric_name, observed_at, session_id, model, sample_type, value, attrs_json,
+             suppressed_fields_json, created_at)
+          values
+            (@id, @source, @metricName, @observedAt, @sessionId, @model, @sampleType, @value, @attrsJson,
+             @suppressedFieldsJson, @createdAt)
+          on conflict(id) do update set source=excluded.source,metric_name=excluded.metric_name,
+            observed_at=excluded.observed_at,session_id=excluded.session_id,model=excluded.model,
+            sample_type=excluded.sample_type,value=excluded.value,attrs_json=excluded.attrs_json,
+            suppressed_fields_json=excluded.suppressed_fields_json,
+            created_at=excluded.created_at`,
+        )
+        .run({
+          id: sample.id,
+          source: sample.source,
+          metricName: sample.metricName,
+          observedAt: sample.observedAt,
+          sessionId: sample.sessionId ?? null,
+          model: sample.model ?? null,
+          sampleType: sample.sampleType ?? null,
+          value: sample.value,
+          attrsJson: JSON.stringify(sample.attrs ?? {}),
+          suppressedFieldsJson: JSON.stringify(
+            canonicalizeSuppressionReceipts(sample.suppressedFields ?? []),
+          ),
+          createdAt: new Date().toISOString(),
+        });
+      return true;
+    };
+    return this.db.inTransaction ? run() : this.db.transaction(run)();
   }
 
   private rowToBufferedEvent(row: {

@@ -1659,7 +1659,8 @@ async function policyResponseAndLegacyReadbackProof() {
   const cliRun = spawnSync(
     process.execPath,
     [
-      path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs"),
+      "--import",
+      path.join(process.cwd(), "node_modules", "tsx", "dist", "loader.mjs"),
       path.join(process.cwd(), "packages", "collector-cli", "src", "cli.ts"),
       "self-test-hook",
       "codex",

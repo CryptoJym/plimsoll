@@ -69,6 +69,7 @@ try {
   {
     const buffer = new LocalEventBuffer(path.join(root, "pending.sqlite"), {
       workspaceId: "tenant-retention-proof",
+      enrollmentNow: () => new Date(oldCreatedAt),
       delivery: { enabled: true },
     });
     const captured = event();

@@ -262,8 +262,8 @@ type TimeoutStage =
   | "debugger_startup"
   | "debugger_target";
 
-class ProofTimeoutError extends Error {
-  constructor(readonly stage: TimeoutStage, detail?: string) {
+export class ProofTimeoutError extends Error {
+  constructor(readonly stage: TimeoutStage, detail?: string, readonly elapsedMs?: number) {
     super(detail ? `proof_timeout:${stage}:${detail}` : `proof_timeout:${stage}`);
     this.name = "ProofTimeoutError";
   }
@@ -284,7 +284,10 @@ type CdpWaiter = {
   reject: (error: Error) => void;
 };
 
-class CdpClient {
+type CdpMethod = "Page.enable" | "Runtime.enable" | "Network.enable" | "Log.enable" |
+  "Emulation.setDeviceMetricsOverride" | "Page.navigate" | "Runtime.evaluate" | "Browser.close";
+
+export class CdpClient {
   private nextId = 1;
   private closed = false;
   private readonly pending = new Map<number, CdpWaiter>();
@@ -376,7 +379,7 @@ class CdpClient {
   }
 
   send<T = Record<string, unknown>>(
-    method: string,
+    method: CdpMethod,
     params: Record<string, unknown> = {},
     options: { timeoutMs?: number; signal?: AbortSignal | null } = {},
   ) {
@@ -386,6 +389,7 @@ class CdpClient {
     const id = this.nextId++;
     const timeoutMs = options.timeoutMs ?? CDP_COMMAND_MS;
     const signal = options.signal === undefined ? this.defaultSignal : options.signal ?? undefined;
+    const startedAt = performance.now();
     return new Promise<T>((resolve, reject) => {
       let settled = false;
       const cleanup = () => {
@@ -401,7 +405,9 @@ class CdpClient {
         else resolve(value as T);
       };
       const onAbort = () => finish(new ProofTimeoutError("browser_proof_overall"));
-      const timer = setTimeout(() => finish(new ProofTimeoutError("cdp_command")), timeoutMs);
+      const timer = setTimeout(() => finish(new ProofTimeoutError(
+        "cdp_command", method, Math.round(performance.now() - startedAt),
+      )), timeoutMs);
       this.pending.set(id, {
         resolve: (value) => finish(null, value),
         reject: (error) => finish(error),
@@ -531,7 +537,7 @@ async function proveBoundedSignalEscalation() {
   }
 }
 
-class NeverResolvingSocket implements CdpSocket {
+export class NeverResolvingSocket implements CdpSocket {
   private readonly listeners = new Map<string, Set<SocketListener>>();
   readyState: number;
   closed = false;
@@ -619,7 +625,7 @@ async function waitForChildReady(child: ChildProcess) {
   });
 }
 
-async function runNeverResolvingCdpScenario(fixtureRoot?: string) {
+export async function runNeverResolvingCdpScenario(fixtureRoot?: string) {
   const profile = fs.mkdtempSync(path.join(
     fixtureRoot ?? os.tmpdir(),
     "plimsoll-dashboard-never-cdp-",
@@ -628,7 +634,8 @@ async function runNeverResolvingCdpScenario(fixtureRoot?: string) {
   fs.writeFileSync(path.join(profile, "sentinel"), privateSentinel);
   const child = spawn(process.execPath, [
     "-e",
-    "process.on('SIGTERM',()=>{});process.stdout.write('ready\\n');setInterval(()=>{},1000)",
+    // Deliberately exceed the 50ms CDP watchdog during fixture startup.
+    "process.on('SIGTERM',()=>{});setTimeout(()=>process.stdout.write('ready\\n'),100);setInterval(()=>{},1000)",
   ], {
     env: { PATH: process.env.PATH ?? "/usr/bin:/bin", HOME: profile },
     stdio: ["ignore", "pipe", "ignore"],
@@ -654,8 +661,11 @@ async function runNeverResolvingCdpScenario(fixtureRoot?: string) {
   })();
 
   let timeoutError: unknown;
+  // The watchdog must exercise a pending CDP command in a ready, resistant
+  // child. Startup has its own unchanged, bounded readiness deadline.
+  try { await waitForChildReady(child); }
+  catch (error) { await cleanup(); throw error; }
   const operation = (async () => {
-    await waitForChildReady(child);
     await cdp.send("Runtime.evaluate", {}, { timeoutMs: 1_000 });
   })();
   try {
@@ -718,7 +728,7 @@ async function proveNeverResolvingCdpCleanup() {
   check(
     "cdp_command_timeout_settles_timer_pending_map_socket_and_listeners",
     commandError instanceof ProofTimeoutError &&
-      commandError.message === "proof_timeout:cdp_command" &&
+      commandError.message === "proof_timeout:cdp_command:Runtime.evaluate" &&
       commandClient.pendingCount === 0 &&
       commandSocket.closed &&
       commandSocket.listenerCount === 0,
@@ -741,6 +751,7 @@ async function proveNeverResolvingCdpCleanup() {
       childHasExited(scenario.child) &&
       !fs.existsSync(scenario.profile) &&
       scenario.cdp.pendingCount === 0 &&
+      scenario.socket.sends === 2 &&
       scenario.socket.closed &&
       scenario.socket.listenerCount === 0 &&
       scenario.operationSettlement.status === "settled" &&
@@ -751,6 +762,7 @@ async function proveNeverResolvingCdpCleanup() {
       processExited: childHasExited(scenario.child),
       profileRemoved: !fs.existsSync(scenario.profile),
       pendingCommands: scenario.cdp.pendingCount,
+      commandsSent: scenario.socket.sends,
       socketClosed: scenario.socket.closed,
       socketListeners: scenario.socket.listenerCount,
       operationSettlement: scenario.operationSettlement,
@@ -773,7 +785,7 @@ function proveTimeoutExitSurface() {
   try {
     const result = spawnSync(
       process.execPath,
-      [path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs"), scriptPath],
+      ["--import", path.join(repoRoot, "node_modules", "tsx", "dist", "loader.mjs"), scriptPath],
       {
         encoding: "utf8",
         env: {
@@ -963,6 +975,8 @@ async function browserProof(html: string) {
     "--disable-default-apps",
     "--disable-sync",
     "--metrics-recording-only",
+    // This synthetic profile must not wait on the macOS user's login keychain.
+    "--use-mock-keychain",
     "--remote-debugging-port=0",
     `--user-data-dir=${profile}`,
     "about:blank",
@@ -1089,9 +1103,12 @@ async function browserProof(html: string) {
       cleanup,
       timeoutMs: BROWSER_PROOF_WALL_MS,
     });
-  } finally {
-    await cleanup();
+  } catch (error) {
+    try { await cleanup(); }
+    catch { console.error(JSON.stringify({ proof: "dashboard-security", error: "browser_teardown_failed" })); }
+    throw error;
   }
+  await cleanup();
   check(
     "browser_process_bounded_teardown",
     shutdownReceipt?.exited === true &&
@@ -1145,7 +1162,7 @@ async function main() {
   if (failed.length) process.exitCode = 1;
 }
 
-main().catch((error) => {
+if (process.argv[1] && path.resolve(process.argv[1]) === scriptPath) main().catch((error) => {
   if (error instanceof ProofTimeoutError) {
     const stageDetail = error.message.split(":")[2];
     console.error(JSON.stringify({
@@ -1153,6 +1170,7 @@ main().catch((error) => {
       error: "proof_timeout",
       stage: error.stage,
       ...(stageDetail ? { detail: stageDetail } : {}),
+      ...(error.elapsedMs !== undefined ? { elapsedMs: error.elapsedMs } : {}),
     }));
   } else {
     console.error(error instanceof Error ? error.stack : String(error));

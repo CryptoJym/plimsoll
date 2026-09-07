@@ -900,6 +900,7 @@ async function main() {
     // Stage 2 — that install later binds a MANAGED workspace.
     const legacyBuffer = new LocalEventBuffer(legacyLedger, {
       workspaceId: managedTenant,
+      enrollmentNow: () => new Date("2026-07-17T12:00:52.000Z"),
       delivery: { enabled: true },
     });
     // The rollback-compatible raw producer: no workspace column value at all.

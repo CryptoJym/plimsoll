@@ -582,11 +582,12 @@ export function writeResourceReceiptAtomically(
   const tempName = `.${finalName}.${process.pid}.${randomUUID()}.tmp`;
   const modulePath = fileURLToPath(import.meta.url);
   const repoRoot = path.resolve(path.dirname(modulePath), "../..");
-  const tsxCli = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
+  const tsxLoader = path.join(repoRoot, "node_modules", "tsx", "dist", "loader.mjs");
   const run = spawnSync(
     process.execPath,
     [
-      tsxCli,
+      "--import",
+      tsxLoader,
       modulePath,
       "--atomic-receipt-child",
     ],

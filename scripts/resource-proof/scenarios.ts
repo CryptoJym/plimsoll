@@ -547,9 +547,9 @@ export function runExistingSignalFidelityProof(
     };
   }
   const started = performance.now();
-  const tsxCli = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
+  const tsxLoader = path.join(repoRoot, "node_modules", "tsx", "dist", "loader.mjs");
   const proof = path.join(repoRoot, "scripts", "signal-fidelity-proof.ts");
-  const result = spawnSync(process.execPath, [tsxCli, proof], {
+  const result = spawnSync(process.execPath, ["--import", tsxLoader, proof], {
     cwd: repoRoot,
     env: buildAllowlistedChildEnvironment(sandbox),
     encoding: "utf8",
@@ -585,9 +585,9 @@ export function runMaintenanceRegressionContract(
   sandbox: ResourceSandbox,
 ): ScenarioReceipt {
   const started = performance.now();
-  const tsxCli = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
+  const tsxLoader = path.join(repoRoot, "node_modules", "tsx", "dist", "loader.mjs");
   const proof = path.join(repoRoot, "scripts", "maintenance-proof.ts");
-  const result = spawnSync(process.execPath, [tsxCli, proof], {
+  const result = spawnSync(process.execPath, ["--import", tsxLoader, proof], {
     cwd: repoRoot,
     env: buildAllowlistedChildEnvironment(sandbox),
     encoding: "utf8",
@@ -2268,14 +2268,15 @@ function runIntegratedWorker(
   operatorHome: string,
 ) {
   const started = performance.now();
-  const tsxCli = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
+  const tsxLoader = path.join(repoRoot, "node_modules", "tsx", "dist", "loader.mjs");
   const worker = path.join(repoRoot, "scripts", "resource-proof", "integrated-worker.ts");
   const workerRoot = path.join(sandbox.root, `worker-${mode}`);
   fs.mkdirSync(workerRoot, { recursive: true, mode: 0o700 });
   const result = spawnSync(
     process.execPath,
     [
-      tsxCli,
+      "--import",
+      tsxLoader,
       worker,
       "--scenario",
       mode,
@@ -2311,7 +2312,7 @@ function runIntegratedWorker(
       typeof parsed.counters === "object" &&
       typeof parsed.measurements === "object",
   );
-  const childNode22 = parsed?.measurements.nodeMajor === 22;
+  const childNode22 = parsed?.measurements?.nodeMajor === 22;
   const passed = Boolean(
     result.status === 0 &&
       !result.error &&
@@ -2411,9 +2412,9 @@ export function runLearningFactPrivacyAndResourceContract(
   operatorHome: string,
 ): ScenarioReceipt {
   const started = performance.now();
-  const tsxCli = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
+  const tsxLoader = path.join(repoRoot, "node_modules", "tsx", "dist", "loader.mjs");
   const proof = path.join(repoRoot, "scripts", "learning-facts-proof.ts");
-  const result = spawnSync(process.execPath, [tsxCli, proof], {
+  const result = spawnSync(process.execPath, ["--import", tsxLoader, proof], {
     cwd: repoRoot,
     env: buildAllowlistedChildEnvironment(sandbox),
     encoding: "utf8",
@@ -2453,7 +2454,7 @@ export function runLearningFactPrivacyAndResourceContract(
       parsed.llmCalled === false,
   );
   const counters = emptyWorkCounters();
-  counters.learningFactRowsWritten = parsed?.measurements.learningFactRowsWritten ?? 0;
+  counters.learningFactRowsWritten = parsed?.measurements?.learningFactRowsWritten ?? 0;
   return {
     id: "learning_fact_privacy_and_resource_bounds",
     required: true,
@@ -2469,9 +2470,9 @@ export function runLearningFactPrivacyAndResourceContract(
       childOutputPrivacyLeaks: outputPrivacyLeaks,
       proofShapeValid: shapeValid,
       proofChecks: parsed?.checks ?? 0,
-      privacyLeaks: parsed?.measurements.privacyLeaks ?? -1,
-      uploadedFactRows: parsed?.measurements.uploadedFactRows ?? -1,
-      nodeMajor: parsed?.measurements.nodeMajor ?? -1,
+      privacyLeaks: parsed?.measurements?.privacyLeaks ?? -1,
+      uploadedFactRows: parsed?.measurements?.uploadedFactRows ?? -1,
+      nodeMajor: parsed?.measurements?.nodeMajor ?? -1,
       backgroundScansStarted: parsed?.backgroundScansStarted ?? true,
       llmCalled: parsed?.llmCalled ?? true,
     },

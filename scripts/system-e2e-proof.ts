@@ -80,7 +80,7 @@ type PhaseReceipt = {
 
 const SCHEMA = SYSTEM_E2E_SCHEMA;
 const repoRoot = path.resolve(import.meta.dirname, "..");
-const tsx = path.join(repoRoot, "node_modules", "tsx", "dist", "cli.mjs");
+const tsxLoader = path.join(repoRoot, "node_modules", "tsx", "dist", "loader.mjs");
 const proofRoot = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-system-e2e-"));
 const evidenceRoot = path.join(proofRoot, "evidence");
 const machineAHome = path.join(proofRoot, "machine-a", "home");
@@ -274,7 +274,7 @@ function runSupportingProof(options: {
 }): PhaseReceipt {
   const result = spawnSync(
     "/usr/bin/time",
-    ["-lp", process.execPath, tsx, path.join(repoRoot, options.script), ...(options.args ?? [])],
+    ["-lp", process.execPath, "--import", tsxLoader, path.join(repoRoot, options.script), ...(options.args ?? [])],
     {
       cwd: repoRoot,
       env: isolatedEnvironment(options.home, options.temp),
@@ -285,7 +285,11 @@ function runSupportingProof(options: {
   );
   assert.equal(result.error, undefined, `${options.name} could not start: ${String(result.error)}`);
   assert.equal(result.signal, null, `${options.name} terminated by ${String(result.signal)}`);
-  assert.equal(result.status, 0, `${options.name} failed: ${result.stderr.slice(-2_000)}`);
+  // Child line proofs print failed assertion names to stdout; time writes to
+  // stderr. Preserve the bounded check names when the phase exits nonzero.
+  const failedChecks = [...result.stdout.matchAll(/^FAIL ([a-z][a-z0-9_]{0,159})$/gm)]
+    .slice(0, 32).map((match) => match[1]);
+  assert.equal(result.status, 0, `${options.name} failed checks=${JSON.stringify(failedChecks)}: ${result.stderr.slice(-2_000)}`);
   for (const assertionName of options.requiredAssertions) {
     assert.ok(
       result.stdout.includes(assertionName),
@@ -462,8 +466,11 @@ async function runSharedFlow() {
       now: () => new Date(FLOW_DELIVERY_CLOCK),
     },
     workspaceId: WORKSPACE_A,
+    enrollmentNow: () => new Date(FLOW_TIME.start),
   });
-  const bufferB = new LocalEventBuffer(machineBLedger, { workspaceId: WORKSPACE_B });
+  const bufferB = new LocalEventBuffer(machineBLedger, {
+    workspaceId: WORKSPACE_B, enrollmentNow: () => new Date(FLOW_TIME.start),
+  });
   const timelineStore = new OutcomeTimelineStore(timelineLedger);
   const sqliteChanges = () => {
     const count = (database: { prepare(sql: string): { get(): unknown } }) =>

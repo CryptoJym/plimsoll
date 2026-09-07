@@ -790,12 +790,6 @@ try {
   // first-run ensureCollectorHome() would.
   fs.mkdirSync(dryRunHome, { mode: 0o700 });
   fs.mkdirSync(dryRunTemp);
-  // tsx initializes this empty launcher cache directory before application
-  // code runs even with transform caching disabled. Preseed it so the before
-  // snapshot isolates Plimsoll's filesystem behavior.
-  if (typeof process.getuid === "function") {
-    fs.mkdirSync(path.join(dryRunTemp, `tsx-${process.getuid()}`));
-  }
   const dryRunConfigPath = path.join(dryRunHome, "collector.config.json");
   const dryRunLedgerPath = path.join(dryRunHome, "work-ledger.sqlite");
   const dryRunStaleDirectory = path.join(
@@ -825,7 +819,8 @@ try {
     assert.ok(address && typeof address !== "string");
     const dryRun = await runChild(
       [
-        "node_modules/tsx/dist/cli.mjs",
+        "--import",
+        path.resolve("node_modules/tsx/dist/loader.mjs"),
         "packages/collector-cli/src/cli.ts",
         "join",
         "--dry-run",
@@ -843,7 +838,8 @@ try {
     );
     const unsupportedJoin = await runChild(
       [
-        "node_modules/tsx/dist/cli.mjs",
+        "--import",
+        path.resolve("node_modules/tsx/dist/loader.mjs"),
         "packages/collector-cli/src/cli.ts",
         "join",
         TOKEN,
@@ -955,7 +951,8 @@ try {
     const child = spawn(
       process.execPath,
       [
-        "node_modules/tsx/dist/cli.mjs",
+        "--import",
+        path.resolve("node_modules/tsx/dist/loader.mjs"),
         "packages/collector-cli/src/cli.ts",
         "join",
         "--token-stdin",
@@ -1005,7 +1002,8 @@ try {
     resumeMode = true;
     const cliResume = await runChild(
       [
-        "node_modules/tsx/dist/cli.mjs",
+        "--import",
+        path.resolve("node_modules/tsx/dist/loader.mjs"),
         "packages/collector-cli/src/cli.ts",
         "join",
         "--resume",
@@ -1076,7 +1074,8 @@ try {
     assert.ok(address && typeof address !== "string");
     const child = await runChild(
       [
-        "node_modules/tsx/dist/cli.mjs",
+        "--import",
+        path.resolve("node_modules/tsx/dist/loader.mjs"),
         "packages/collector-cli/src/cli.ts",
         "join",
         "--token-stdin",

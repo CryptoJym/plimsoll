@@ -93,6 +93,7 @@ export type TranscriptScanResult = {
   sessionsSkippedLiveCovered: number;
   filesSkippedOutsideRecentWindow: number;
   eventsAppended: number;
+  enrollmentExcludedEvents?: number;
   tokensAppended: { input: number; cacheRead: number; output: number };
   parseErrors: number;
   unresolvedRecords: number;
@@ -1310,6 +1311,12 @@ export class TranscriptTailer {
       new Date().toISOString(),
     );
     if (delta.input === 0 && delta.output === 0 && delta.cacheRead === 0 && delta.cacheCreation === 0) return;
+    // Preserve the local revision counter above, but never synthesize a
+    // managed event timestamp from mtime or from the time the file arrived.
+    if (this.buffer.eventAdmissionReason(entry.observedAt, this.activeCaptureRoot?.installationEpochId)) {
+      result.enrollmentExcludedEvents = (result.enrollmentExcludedEvents ?? 0) + 1;
+      return;
+    }
     result.filesParsed += 1;
     const priced = estimateCostUsd({
       model: entry.model,

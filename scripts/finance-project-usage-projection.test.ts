@@ -44,6 +44,13 @@ const now = "2026-09-04T21:00:00.000Z";
 const repoKey = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
 const secondRepoKey = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
+// Enrollment precedes the synthetic observation window; each new epoch moves
+// forward so stale scan receipts remain distinguishable without wall-clock use.
+function fixtureEnrollmentClock() {
+  let tick = Date.parse("2026-07-01T00:00:00.000Z");
+  return () => new Date(tick++);
+}
+
 let eventCounter = 1;
 
 function eventId(): string {
@@ -107,6 +114,7 @@ function healthyBuffer(events: readonly AiInteractionEvent[] = [
 ]): LocalEventBuffer {
   const buffer = new LocalEventBuffer(":memory:", {
     workspaceId: "workspace-a",
+    enrollmentNow: fixtureEnrollmentClock(),
     delivery: { enabled: false },
   });
   for (const item of events) buffer.append(item);
@@ -428,8 +436,9 @@ test("uses the native workspace epoch and fails closed on legacy lineage", () =>
     );
 
     buffer.transitionWorkspace("workspace-a", "workspace-b");
-    recordFinanceFullHistoryAttempt(database, "codex", snapshotAt, true);
-    recordFinanceCaptureActivity(database, "codex", snapshotAt, true, false);
+    const staleScanAt = new Date(Date.parse(buffer.workspaceBinding()!.currentInstallationEpochStartedAt!) - 1).toISOString();
+    recordFinanceFullHistoryAttempt(database, "codex", staleScanAt, true);
+    recordFinanceCaptureActivity(database, "codex", staleScanAt, true, false);
     const staleReceipt = database.prepare(
       `select covered_through as coveredThrough, latest_full_complete as latestFullComplete,
               last_scan_at as lastScanAt
@@ -695,6 +704,7 @@ test("every source-health gate produces a finite hold", () => {
 test("initializes coverage per epoch and preserves a prior watermark on failed scans", () => {
   const buffer = new LocalEventBuffer(":memory:", {
     workspaceId: "workspace-a",
+    enrollmentNow: fixtureEnrollmentClock(),
     delivery: { enabled: false },
   });
   try {
@@ -913,6 +923,7 @@ test("terminal suppression invalidates clean exports until bounded cleanup finis
 test("capture health does not advance historic coverage and retention advances exact deleted watermarks", () => {
   const buffer = new LocalEventBuffer(":memory:", {
     workspaceId: "workspace-a",
+    enrollmentNow: fixtureEnrollmentClock(),
     delivery: { enabled: false },
   });
   try {
@@ -1165,6 +1176,7 @@ test("captures cost provenance once and fails closed on ambiguous markers", () =
 test("defaults present legacy cost to unknown and reprices atomically as estimated", () => {
   const buffer = new LocalEventBuffer(":memory:", {
     workspaceId: "workspace-a",
+    enrollmentNow: fixtureEnrollmentClock(),
     delivery: { enabled: false },
   });
   try {
@@ -1204,6 +1216,7 @@ test("defaults present legacy cost to unknown and reprices atomically as estimat
 test("codex reconciliation writes estimated provenance with its repriced amount", () => {
   const buffer = new LocalEventBuffer(":memory:", {
     workspaceId: "workspace-a",
+    enrollmentNow: fixtureEnrollmentClock(),
     delivery: { enabled: false },
   });
   try {
@@ -1236,6 +1249,7 @@ test("local pricing tailers stamp estimated provenance at capture", async () => 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-cost-kind-"));
   const buffer = new LocalEventBuffer(":memory:", {
     workspaceId: "workspace-a",
+    enrollmentNow: fixtureEnrollmentClock(),
     delivery: { enabled: false },
   });
   const rolloutSession = "019e1111-2222-7333-8444-555555555555";

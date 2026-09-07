@@ -102,6 +102,7 @@ export type RolloutScanResult = {
   bytesDeferred: number;
   sessionsSkippedOtlpCovered: number;
   eventsAppended: number;
+  enrollmentExcludedEvents?: number;
   tokensAppended: { input: number; cachedInput: number; output: number };
   /**
    * Issue #153: rows whose token columns were zeroed because their first
@@ -1364,6 +1365,12 @@ export class RolloutTailer {
         ? identity.actorHash
         : undefined;
     for (const entry of pending) {
+      // Counter state already advanced: dropping old/undated observations must
+      // not charge their cumulative tokens to the next valid observation.
+      if (this.buffer.eventAdmissionReason(entry.observedAt, this.activeCaptureRoot?.installationEpochId)) {
+        result.enrollmentExcludedEvents = (result.enrollmentExcludedEvents ?? 0) + 1;
+        continue;
+      }
       const unvalidated = entry.lineageFirstUnknown !== undefined;
       // Validated marginal consumption excludes the unclassified first
       // counter entirely; the raw source observation is preserved in the
