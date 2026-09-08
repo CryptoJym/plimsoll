@@ -2,6 +2,9 @@ import { createHash } from "node:crypto";
 import { gzipSync, gunzipSync } from "node:zlib";
 
 import type Database from "better-sqlite3";
+import { ensureUuidEventId } from "./upload-history";
+import { readLiveUsageEventObservation } from "../../shared/src/live-usage-metadata";
+import { usageFactFromEvent } from "../../shared/src/economics/event-adapter";
 
 import type { SubscriptionConfig } from "./dashboard-api";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
@@ -33,7 +36,7 @@ const CANONICAL_SHA256 = /^sha256:[0-9a-f]{64}$/;
 const UNLINKED_REPO = "__unlinked__";
 const UNLINKED_ACCOUNT = "__unlinked_account__";
 const SAFE_SOURCES=new Set(["anthropic_admin","anthropic_usage","claude_code","codex","github","openai_usage","manual","unknown"]);
-const SAFE_EVENT_TYPES=new Set(["session_start","session_stop","user_prompt_submit","assistant_response","tool_use","tool_result","otel_span","usage_rollout","usage_transcript","unknown"]);
+const SAFE_EVENT_TYPES=new Set(["session_start","session_stop","user_prompt_submit","assistant_response","tool_use","tool_result","otel_span","usage_rollout","usage_transcript","usage_live","unknown"]);
 const SAFE_ACTIONS=new Set(["continue","validate","test","edit","read","write","shell","mcp","browser","review","other"]);
 /**
  * Usage authority between the two ingest paths that record the same work
@@ -91,6 +94,8 @@ type RawProjectionRow = {
   installationEpochId: string | null;
   projectKey: string | null;
   costKind: "reported" | "estimated" | "unknown" | null;
+  payloadJson: string;
+  createdAt: string;
 };
 
 type CompactProjectionItem = {
@@ -128,6 +133,9 @@ type ProjectionFact = {
   observedAtMs: number | null;
   projectKey: string | null;
   costKind: "reported" | "estimated" | "unknown" | null;
+  liveUsageJson: string | null;
+  liveUsageFactJson: string | null;
+  liveDeliveryId: string | null;
 };
 
 type ProjectionControl = {
@@ -310,6 +318,27 @@ function day(value: string) {
 }
 
 function factFromRaw(row: RawProjectionRow, suppressUsage = false): ProjectionFact {
+  let liveUsageJson: string | null = null;
+  let liveUsageFactJson: string | null = null;
+  let unresolvedInterval = row.eventType === "usage_live";
+  if (row.eventType === "usage_live") {
+    let liveMetadata: Record<string, unknown> = {};
+    try {
+      const payload: unknown = JSON.parse(row.payloadJson);
+      const metadata = payload && typeof payload === "object" && !Array.isArray(payload)
+        ? (payload as Record<string, unknown>).metadata : null;
+      if (metadata && typeof metadata === "object" && !Array.isArray(metadata)) liveMetadata = metadata as Record<string, unknown>;
+      const observation = readLiveUsageEventObservation({ ...row, metadata: liveMetadata });
+      if (observation) {
+        liveUsageJson = JSON.stringify(observation);
+        unresolvedInterval = observation.attributionState !== "qualified";
+      }
+    } catch { /* Preserve the event type even when interval evidence is missing. */ }
+    if (row.workspaceId) liveUsageFactJson = JSON.stringify(usageFactFromEvent({
+      ...row,tenantId:row.workspaceId,accountId:row.accountHash,receivedAt:row.createdAt,
+      metadata:{...liveMetadata,installationEpochId:row.installationEpochId},
+    }));
+  }
   return {
     projectionId: sha256(`event:${row.id}`),
     rawRowid: row.rawRowid,
@@ -318,29 +347,32 @@ function factFromRaw(row: RawProjectionRow, suppressUsage = false): ProjectionFa
     observedAt: row.observedAt,
     sessionHash: safeHash(row.sessionId),
     actionClass: safeClassification(row.actionClass,SAFE_ACTIONS,"other"),
-    model: safeModel(row.model),
+    model: row.eventType === "usage_live" ? null : safeModel(row.model),
     inputTokens: suppressUsage ? null : row.inputTokens,
     outputTokens: suppressUsage ? null : row.outputTokens,
     cacheReadTokens: suppressUsage ? null : row.cacheReadTokens,
     cacheCreationTokens: suppressUsage ? null : row.cacheCreationTokens,
-    costNanos: suppressUsage ? null : costNanos(row.costUsd),
-    repoHash: canonicalLinkage(row.repoHash),
-    branchHash: canonicalLinkage(row.branchHash),
-    headHash: safeHash(row.headSha),
+    costNanos: suppressUsage || row.eventType === "usage_live" ? null : costNanos(row.costUsd),
+    repoHash: unresolvedInterval ? null : canonicalLinkage(row.repoHash),
+    branchHash: unresolvedInterval ? null : canonicalLinkage(row.branchHash),
+    headHash: unresolvedInterval ? null : safeHash(row.headSha),
     machineHash: safeHash(row.machine),
-    accountHash: safeHash(row.accountHash),
+    accountHash: unresolvedInterval ? null : safeHash(row.accountHash),
     suppressed: row.suppressedFieldsJson !== "[]" ? 1 : 0,
     rawGeneration: row.privacyGeneration,
     workspaceId: row.workspaceId,
     installationEpochId: row.installationEpochId,
     observedAtMs: observedAtMilliseconds(row.observedAt),
-    projectKey: canonicalProjectKey(row.projectKey),
-    costKind: safeCostKind(row.costKind),
+    projectKey: unresolvedInterval ? null : canonicalProjectKey(row.projectKey),
+    costKind: row.eventType === "usage_live" ? "unknown" : safeCostKind(row.costKind),
+    liveUsageJson,
+    liveUsageFactJson,
+    liveDeliveryId: row.eventType === "usage_live" ? ensureUuidEventId(row.id).id : null,
   };
 }
 
 function compactable(row: RawProjectionRow) {
-  return SAFE_SOURCES.has(row.source)&&SAFE_EVENT_TYPES.has(row.eventType)&&
+  return row.eventType !== "usage_live"&&SAFE_SOURCES.has(row.source)&&SAFE_EVENT_TYPES.has(row.eventType)&&
     (row.actionClass===null||SAFE_ACTIONS.has(row.actionClass))&&
     row.sessionId === null && row.model === null && row.inputTokens === null &&
     row.outputTokens === null && row.cacheReadTokens === null &&
@@ -383,6 +415,9 @@ function factFromDb(row: Record<string, unknown>): ProjectionFact {
     observedAtMs: row.observedAtMs === null ? null : Number(row.observedAtMs),
     projectKey: row.projectKey === null ? null : canonicalProjectKey(String(row.projectKey)),
     costKind: row.costKind === null ? null : safeCostKind(String(row.costKind)),
+    liveUsageJson: typeof row.liveUsageJson === "string" ? row.liveUsageJson : null,
+    liveUsageFactJson: typeof row.liveUsageFactJson === "string" ? row.liveUsageFactJson : null,
+    liveDeliveryId: typeof row.liveDeliveryId === "string" ? row.liveDeliveryId : null,
   };
 }
 
@@ -507,8 +542,22 @@ export class DashboardProjectionStore {
         installation_epoch_id text,
         observed_at_ms integer,
         project_key text,
-        cost_kind text check (cost_kind is null or cost_kind in ('reported','estimated','unknown'))
+        cost_kind text check (cost_kind is null or cost_kind in ('reported','estimated','unknown')),
+        live_usage_json text,
+        live_usage_fact_json text,
+        live_delivery_id text
       );
+      create table if not exists dashboard_live_usage_retained (
+        event_id text primary key,
+        delivery_id text not null unique,
+        workspace_id text not null,
+        installation_epoch_id text not null,
+        observed_at_ms integer not null,
+        interval_start text,
+        usage_fact_json text not null
+      );
+      create index if not exists idx_dashboard_live_retained_scope
+        on dashboard_live_usage_retained (workspace_id, installation_epoch_id, observed_at_ms);
       create index if not exists idx_dashboard_facts_observed
         on dashboard_event_facts (observed_at, projection_id);
       create index if not exists idx_dashboard_facts_session
@@ -837,6 +886,23 @@ export class DashboardProjectionStore {
       }
     }
 
+    const deletedPrivacyEligible = terminalPrivacyEligibilitySql(this.db, "old");
+    const hasRetentionReceipts = Boolean(this.db.prepare(
+      `select 1 from sqlite_master where type='table' and name='raw_retention_receipts'`,
+    ).get());
+    const liveReceiptEligible = this.db.prepare(
+      `select 1 from sqlite_master where type='table' and name='upload_receipts'`,
+    ).get() ? `not exists (select 1 from upload_receipts receipt
+      where receipt.delivery_id=fact.live_delivery_id
+        and receipt.reason in ('local_evidence_quarantined','local_privacy_violation'))` : "1";
+    const retainedLiveFact = hasRetentionReceipts ? `old.event_type='usage_live'
+      and ${deletedPrivacyEligible}
+      and exists (select 1 from raw_retention_receipts receipt where receipt.event_id=old.id
+        and receipt.raw_rowid=old.rowid and receipt.raw_created_at=old.created_at
+        and receipt.raw_generation=old.privacy_generation and receipt.reason='retention_window_elapsed')
+      and exists (select 1 from dashboard_event_facts fact where fact.raw_rowid=old.rowid
+        and fact.raw_generation=old.privacy_generation and fact.event_type='usage_live')
+      and not exists (select 1 from dashboard_projection_repairs where raw_rowid=old.rowid)` : "0";
     this.db.exec(`
       create trigger if not exists trg_dashboard_raw_insert
       after insert on buffered_events
@@ -879,7 +945,7 @@ export class DashboardProjectionStore {
           strftime('%Y-%m-%dT%H:%M:%fZ','now')
         where old.session_id is null and old.model is null
           and old.source in ('anthropic_admin','anthropic_usage','claude_code','codex','github','openai_usage','manual','unknown')
-          and old.event_type in ('session_start','session_stop','user_prompt_submit','assistant_response','tool_use','tool_result','otel_span','usage_rollout','usage_transcript','unknown')
+          and old.event_type in ('session_start','session_stop','user_prompt_submit','assistant_response','tool_use','tool_result','otel_span','usage_rollout','usage_transcript','usage_live','unknown')
           and (old.action_class is null or old.action_class in ('continue','validate','test','edit','read','write','shell','mcp','browser','review','other'))
           and old.input_tokens is null and old.output_tokens is null
           and old.cache_read_tokens is null and old.cache_creation_tokens is null
@@ -912,17 +978,37 @@ export class DashboardProjectionStore {
           degraded_reason=case when generation>0 then 'projection_repair_backlog' else degraded_reason end
         where singleton=1;
       end;
+      create trigger if not exists trg_dashboard_live_interval_update
+      after update of payload_json on buffered_events
+      when old.event_type = 'usage_live' or new.event_type = 'usage_live'
+      begin
+        insert into dashboard_projection_repairs (raw_rowid, reason, queued_at)
+        values (new.rowid, 'live_interval_update', strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+        on conflict(raw_rowid) do update set reason=excluded.reason,queued_at=excluded.queued_at;
+        update dashboard_projection_control set dirty=1 where singleton=1;
+        update finance_publication_control set dirty=1 where singleton=1;
+      end;
       drop trigger if exists trg_dashboard_raw_delete;
       create trigger trg_dashboard_raw_delete
       after delete on buffered_events
       begin
+        insert or ignore into dashboard_live_usage_retained
+          (event_id,delivery_id,workspace_id,installation_epoch_id,observed_at_ms,interval_start,usage_fact_json)
+        select old.id,fact.live_delivery_id,fact.workspace_id,fact.installation_epoch_id,fact.observed_at_ms,
+          case when json_valid(fact.live_usage_json) then json_extract(fact.live_usage_json,'$.intervalStart') end,
+          fact.live_usage_fact_json
+        from dashboard_event_facts fact where fact.raw_rowid=old.rowid
+          and fact.live_usage_fact_json is not null and fact.live_delivery_id is not null and fact.workspace_id is not null
+          and fact.installation_epoch_id is not null and fact.observed_at_ms is not null
+          and ${liveReceiptEligible}
+          and ${retainedLiveFact};
         insert into dashboard_compact_mutations
           (raw_rowid,observed_at,source,event_type,action_class,queued_at)
         select old.rowid,old.observed_at,old.source,old.event_type,old.action_class,
           strftime('%Y-%m-%dT%H:%M:%fZ','now')
         where old.session_id is null and old.model is null
           and old.source in ('anthropic_admin','anthropic_usage','claude_code','codex','github','openai_usage','manual','unknown')
-          and old.event_type in ('session_start','session_stop','user_prompt_submit','assistant_response','tool_use','tool_result','otel_span','usage_rollout','usage_transcript','unknown')
+          and old.event_type in ('session_start','session_stop','user_prompt_submit','assistant_response','tool_use','tool_result','otel_span','usage_rollout','usage_transcript','usage_live','unknown')
           and (old.action_class is null or old.action_class in ('continue','validate','test','edit','read','write','shell','mcp','browser','review','other'))
           and old.input_tokens is null and old.output_tokens is null
           and old.cache_read_tokens is null and old.cache_creation_tokens is null
@@ -1045,6 +1131,18 @@ export class DashboardProjectionStore {
           where singleton=1;
       end;
     `);
+    if (this.db.prepare(`select 1 from sqlite_master where type='table' and name='upload_receipts'`).get()) {
+      for (const operation of ["insert", "update of reason"] as const) {
+        const suffix = operation === "insert" ? "insert" : "update";
+        this.db.exec(`create trigger if not exists trg_dashboard_live_retained_privacy_${suffix}
+          after ${operation} on upload_receipts
+          when new.reason in ('local_evidence_quarantined','local_privacy_violation')
+          begin
+            delete from dashboard_live_usage_retained where delivery_id=new.delivery_id;
+            update finance_publication_control set dirty=1 where singleton=1;
+          end`);
+      }
+    }
     this.ensureCompactSummaryMigration(now);
   }
 
@@ -1078,6 +1176,9 @@ export class DashboardProjectionStore {
       ),
     );
     for (const definition of [
+      "live_usage_json text",
+      "live_usage_fact_json text",
+      "live_delivery_id text",
       "raw_generation text",
       "workspace_id text",
       "installation_epoch_id text",
@@ -1183,7 +1284,7 @@ export class DashboardProjectionStore {
         suppressed_fields_json as suppressedFieldsJson,
         privacy_generation as privacyGeneration, workspace_id as workspaceId,
         installation_epoch_id as installationEpochId, project_key as projectKey,
-        cost_kind as costKind
+        case when event_type='usage_live' then payload_json else '{}' end as payloadJson, created_at as createdAt, cost_kind as costKind
        from buffered_events where rowid = ?`,
     ).get(rawRowid) as RawProjectionRow | undefined;
   }
@@ -1199,7 +1300,8 @@ export class DashboardProjectionStore {
         machine_hash as machineHash, account_hash as accountHash, suppressed,
         raw_generation as rawGeneration, workspace_id as workspaceId,
         installation_epoch_id as installationEpochId, observed_at_ms as observedAtMs,
-        project_key as projectKey, cost_kind as costKind
+        project_key as projectKey, cost_kind as costKind, live_usage_json as liveUsageJson,
+        live_usage_fact_json as liveUsageFactJson,live_delivery_id as liveDeliveryId
        from dashboard_event_facts where projection_id = ?`,
     ).get(projectionId) as Record<string, unknown> | undefined;
     return row ? factFromDb(row) : undefined;
@@ -1216,7 +1318,8 @@ export class DashboardProjectionStore {
         machine_hash as machineHash, account_hash as accountHash, suppressed,
         raw_generation as rawGeneration, workspace_id as workspaceId,
         installation_epoch_id as installationEpochId, observed_at_ms as observedAtMs,
-        project_key as projectKey, cost_kind as costKind
+        project_key as projectKey, cost_kind as costKind, live_usage_json as liveUsageJson,
+        live_usage_fact_json as liveUsageFactJson,live_delivery_id as liveDeliveryId
        from dashboard_event_facts where raw_rowid = ?`,
     ).get(rawRowid) as Record<string, unknown> | undefined;
     return row ? factFromDb(row) : undefined;
@@ -1268,6 +1371,14 @@ export class DashboardProjectionStore {
   private applyProjectionRows(rows: RawProjectionRow[], now: Date) {
     const compactRows: RawProjectionRow[] = [];
     for (const row of rows) {
+      // Raw rowids can be reused before a queued prune repair runs. The retained
+      // live fact already has independent event identity; release its old slot.
+      const formerLive = this.captureStatement(`select projection_id as id from dashboard_event_facts
+        where raw_rowid=? and event_type='usage_live'`).get(row.rawRowid) as {id:string}|undefined;
+      if(formerLive && formerLive.id !== sha256(`event:${row.id}`)) {
+        const former=this.storedFact(formerLive.id);
+        if(former)this.removeStoredFact(former,now);
+      }
       if (!row.privacyEligible) {
         const previous = this.storedFactByRawRowid(row.rawRowid);
         if (previous) this.removeStoredFact(previous, now);
@@ -1426,7 +1537,7 @@ export class DashboardProjectionStore {
       cacheCreationTokens:null,costNanos:null,repoHash:null,branchHash:null,headHash:null,
       machineHash:null,accountHash:null,suppressed:0,rawGeneration:null,workspaceId:null,
       installationEpochId:null,observedAtMs:observedAtMilliseconds(item.observedAt),projectKey:null,
-      costKind:null};
+      costKind:null,liveUsageJson:null,liveUsageFactJson:null,liveDeliveryId:null};
     for(let bit=0;bit<INTERNAL_WINDOWS.length;bit++)if((item.windowMask&(1<<bit))&&
       DASHBOARD_WINDOWS.includes(INTERNAL_WINDOWS[bit] as typeof DASHBOARD_WINDOWS[number])){
       this.applyReferenceDelta(table,INTERNAL_WINDOWS[bit]!,fact,sign);
@@ -1562,12 +1673,12 @@ export class DashboardProjectionStore {
         action_class, model, input_tokens, output_tokens, cache_read_tokens,
         cache_creation_tokens, cost_nanos, repo_hash, branch_hash, head_hash,
         machine_hash, account_hash, suppressed, raw_generation, workspace_id,
-        installation_epoch_id, observed_at_ms, project_key, cost_kind)
+        installation_epoch_id, observed_at_ms, project_key, cost_kind, live_usage_json, live_usage_fact_json, live_delivery_id)
        values (@projectionId, @rawRowid, @source, @eventType, @observedAt, @sessionHash,
         @actionClass, @model, @inputTokens, @outputTokens, @cacheReadTokens,
         @cacheCreationTokens, @costNanos, @repoHash, @branchHash, @headHash,
         @machineHash, @accountHash, @suppressed, @rawGeneration, @workspaceId,
-        @installationEpochId, @observedAtMs, @projectKey, @costKind)
+        @installationEpochId, @observedAtMs, @projectKey, @costKind, @liveUsageJson, @liveUsageFactJson, @liveDeliveryId)
        on conflict(projection_id) do update set
         raw_rowid=excluded.raw_rowid, source=excluded.source, event_type=excluded.event_type,
         observed_at=excluded.observed_at, session_hash=excluded.session_hash,
@@ -1581,7 +1692,8 @@ export class DashboardProjectionStore {
         suppressed=excluded.suppressed, raw_generation=excluded.raw_generation,
         workspace_id=excluded.workspace_id, installation_epoch_id=excluded.installation_epoch_id,
         observed_at_ms=excluded.observed_at_ms, project_key=excluded.project_key,
-        cost_kind=excluded.cost_kind`,
+        cost_kind=excluded.cost_kind, live_usage_json=excluded.live_usage_json,
+        live_usage_fact_json=excluded.live_usage_fact_json, live_delivery_id=excluded.live_delivery_id`,
     ).run(next);
     if(previous&&previousSourceLatest&&(previousSourceLatest.lastEventAt===previous.observedAt||
       (previous.inputTokens!==null&&previousSourceLatest.lastTokenAt===previous.observedAt))){
@@ -2389,7 +2501,7 @@ export class DashboardProjectionStore {
             suppressed_fields_json as suppressedFieldsJson,
             privacy_generation as privacyGeneration, workspace_id as workspaceId,
             installation_epoch_id as installationEpochId, project_key as projectKey,
-            cost_kind as costKind
+            case when event_type='usage_live' then payload_json else '{}' end as payloadJson, created_at as createdAt, cost_kind as costKind
            from buffered_events where rowid > ? and rowid <= ? order by rowid limit ?`,
         ).all(control.backfillCursor, control.backfillHighWater ?? 0, BACKFILL_ROWS) as RawProjectionRow[];
         this.applyProjectionRows(rows,now);
@@ -2433,7 +2545,7 @@ export class DashboardProjectionStore {
           b.suppressed_fields_json as suppressedFieldsJson,
           b.privacy_generation as privacyGeneration, b.workspace_id as workspaceId,
           b.installation_epoch_id as installationEpochId, b.project_key as projectKey,
-          b.cost_kind as costKind
+          case when b.event_type='usage_live' then b.payload_json else '{}' end as payloadJson, b.created_at as createdAt, b.cost_kind as costKind
          from dashboard_projection_repairs r left join buffered_events b on b.rowid=r.raw_rowid
          where r.reason!='raw_update' or not exists (
            select 1 from dashboard_compact_mutations m where m.raw_rowid=r.raw_rowid
@@ -2549,7 +2661,7 @@ export class DashboardProjectionStore {
         account_hash as accountHash,suppressed_fields_json as suppressedFieldsJson,
         privacy_generation as privacyGeneration,workspace_id as workspaceId,
         installation_epoch_id as installationEpochId,project_key as projectKey,
-        cost_kind as costKind
+        case when event_type='usage_live' then payload_json else '{}' end as payloadJson, created_at as createdAt, cost_kind as costKind
        from buffered_events where rowid>? and rowid<=? order by rowid limit ?`,
     ).all(control.parityCursor, control.backfillHighWater ?? 0, BACKFILL_ROWS) as RawProjectionRow[];
     const windows = this.db.prepare(

@@ -2,6 +2,7 @@ import { ECONOMICS_SCHEMA_VERSION,type AcceptanceFact,type CostSummary,type Econ
 import { allocateMinorUnits,reconcileFinance } from "./finance";
 import { evaluateExperiment,forecastWork } from "./decisions";
 import { assertTenant,count,digest,identifier,period,reject,timestamp } from "./validation";
+import { LIVE_USAGE_SOURCE_VERSION,readLiveUsageObservation,validLiveUsageCounters } from "../live-usage-metadata";
 const tokenKeys=["inputTokens","outputTokens","cacheReadTokens","cacheCreationTokens"] as const;
 const ZERO=BigInt(0);
 function nanos(value: number): bigint {
@@ -14,17 +15,25 @@ function signature(row: UsageFact) {
     payloadDigest: row.payloadDigest,source: row.source,observedAt: row.observedAt,model: row.model,
     inputTokens: row.inputTokens,outputTokens: row.outputTokens,cacheReadTokens: row.cacheReadTokens,cacheCreationTokens: row.cacheCreationTokens,
     costUsd: row.costUsd,costKind: row.costKind,projectKey: row.projectKey,companyRef: row.companyRef,workItemId: row.workItemId,
-    allocation: row.allocation??null
+    allocation: row.allocation??null,observedInterval: row.observedInterval??null
   });
 }
 /** Dedupe observations separately from logical consumption. Conflicts quarantine the whole key. */
 export function reconcileUsage(tenantId: string,events: UsageFact[],now: string) {
   const nowMs=timestamp(now),groups=new Map<string,UsageFact[]>(),observations=new Map<string,Set<string>>();
   const epochs=new Map<string,Set<string|null>>(),invalid=new Set<UsageFact>(),reasons=new Set<string>();
+  const quarantined: UsageFact[]=[];
   if(events.length>10000)
     reject("usage_limit");
   for(const row of events) {
     assertTenant(tenantId,row.tenantId);
+    // A damaged observer has no substitute native identity or packet digest.
+    // Quarantine it before the ordinary-fact validators require those fields.
+    if((row.sourceVersion===LIVE_USAGE_SOURCE_VERSION||row.observedInterval!==undefined)&&!row.observedInterval) {
+      quarantined.push(row);
+      reasons.add("observed_interval_evidence_missing");
+      continue;
+    }
     for(const v of [row.source,row.sourceEventId,row.sourceVersion,row.schemaVersion,row.evidenceRef])
       identifier(v);
     for(const v of [row.installationEpochId,row.attemptId,row.parentAttemptId,row.nativeSessionId,row.accountId,row.projectKey,row.companyRef,row.workItemId,row.acceptedOutcomeId,row.logicalEventId,row.identityEvidenceRef])
@@ -59,7 +68,7 @@ export function reconcileUsage(tenantId: string,events: UsageFact[],now: string)
     group.push(row);
     groups.set(key,group);
   }
-  const admitted: UsageFact[]=[],quarantined: UsageFact[]=[];
+  const admitted: UsageFact[]=[];
   let duplicateEvents=0;
   for(const group of groups.values()) {
     const conflict=group.some(row => invalid.has(row)||observations.get(JSON.stringify([row.source,row.installationEpochId,row.sourceEventId]))!.size>1);
@@ -138,11 +147,49 @@ export function buildWorkspaceEconomics(input: EconomicsInput): WorkspaceEconomi
   if(input.observedThrough!==null&&(timestamp(input.observedThrough)>nowMs||timestamp(input.observedThrough)<span.start))
     reject("usage_watermark");
   const reconciliation=reconcileUsage(input.tenantId,input.events,input.now);
-  const events=reconciliation.admitted.filter(row => timestamp(row.observedAt)>=span.start&&timestamp(row.observedAt)<span.end).map(row => {
+  const gaps=new Set(reconciliation.reasons);
+  let intervalCoverageIncomplete=false;
+  const isLive=(row: UsageFact) => row.sourceVersion===LIVE_USAGE_SOURCE_VERSION||row.observedInterval!==undefined;
+  const events=reconciliation.admitted.filter(row => {
+    if(!isLive(row))
+      return timestamp(row.observedAt)>=span.start&&timestamp(row.observedAt)<span.end;
+    const interval=row.observedInterval;
+    const valid=interval&&readLiveUsageObservation({
+      sourceVersion: LIVE_USAGE_SOURCE_VERSION,sourceIdentityEvidenceRef: "native_runtime_observed_interval_v1",
+      liveObservationKind: "observed_interval",liveFinanceEligibility: interval.financeEligibility,
+      liveIntervalStart: interval.intervalStart,liveIntervalEnd: interval.intervalEnd,
+      liveAttributionState: interval.attributionState,liveTotalTokens: interval.totalTokens,
+      liveReasoningOutputTokens: interval.reasoningOutputTokens
+    },row.observedAt);
+    if(!valid || !validLiveUsageCounters(row,valid)) {
+      gaps.add("observed_interval_evidence_missing");
+      intervalCoverageIncomplete=true;
+      return false;
+    }
+    const start=timestamp(interval.intervalStart),end=timestamp(interval.intervalEnd);
+    if(end<span.start||start>=span.end) return false;
+    gaps.add("observed_interval_partial_coverage");
+    intervalCoverageIncomplete=true;
+    // Preserve the source fact; do not prorate or assign its end to this period.
+    if(start<span.start||end>=span.end) {
+      gaps.add("observed_interval_crosses_period");
+      return false;
+    }
+    return true;
+  }).map(row => {
+    if(isLive(row)) {
+      row={ ...row,model:null,costUsd:null,costKind:"unknown",rateVersion:null,rateEffectiveAt:null };
+      if(row.observedInterval?.attributionState!=="qualified") {
+        gaps.add("observed_interval_attribution_unresolved");
+        return { ...row,projectKey:null,companyRef:null,workItemId:null,acceptedOutcomeId:null,
+          accountId:null,attributionSource:"unallocated" as const,allocation:undefined };
+      }
+    }
     if(row.attributionSource==="dispatch")
       return row;
     const mappings=(input.projectMappings??[]).filter(mapping => mapping.source==="registry"&&mapping.workItemId!==null&&mapping.workItemId===row.workItemId&&
-      timestamp(mapping.effectiveFrom)<=timestamp(row.observedAt)&&(mapping.effectiveTo===null||timestamp(row.observedAt)<timestamp(mapping.effectiveTo)));
+      timestamp(mapping.effectiveFrom)<=timestamp(row.observedInterval?.intervalStart??row.observedAt)&&
+      (mapping.effectiveTo===null||timestamp(row.observedInterval?.intervalEnd??row.observedAt)<timestamp(mapping.effectiveTo)));
     for(const mapping of mappings) {
       identifier(mapping.evidenceRef);
       identifier(mapping.projectKey);
@@ -152,8 +199,8 @@ export function buildWorkspaceEconomics(input: EconomicsInput): WorkspaceEconomi
     const mapping=mappings[0];
     return mapping? { ...row,projectKey: mapping.projectKey,companyRef: mapping.companyRef,attributionSource: "registry" as const }:row;
   });
-  const accepted=acceptancesFor(input),gaps=new Set(reconciliation.reasons);
-  const complete=input.complete&&!input.truncated&&input.observedThrough!==null&&timestamp(input.observedThrough)>=span.end&&!reconciliation.quarantined.length;
+  const accepted=acceptancesFor(input);
+  const complete=input.complete&&!input.truncated&&input.observedThrough!==null&&timestamp(input.observedThrough)>=span.end&&!reconciliation.quarantined.length&&!intervalCoverageIncomplete;
   if(!complete)
     gaps.add("usage_coverage_incomplete");
   if(events.some(row => !row.workItemId))

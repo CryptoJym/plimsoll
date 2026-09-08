@@ -1,3 +1,7 @@
+import { resolveCollectorHome } from "./collector-home";
+import { selectsLiveUsage, assertLiveRoute, authenticateLiveProducer, readLiveBody } from "./codex-live-usage-auth";
+import { canonicalJson, parseLivePacket, liveSha256, liveReceipt, hasLiveUsageClaim } from "./codex-live-usage-protocol";
+import { ingestLiveUsage } from "./codex-live-usage-ledger";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -170,6 +174,8 @@ export function createCollectorServer(
      * boundary applies unchanged.
      */
     localAuth?: LocalIngestAuth;
+    /** Private hash registry home; no provisioning occurs on the listener. */
+    liveProducerHome?: string;
     /** Proof-injectable per-source admission ceiling (defaults to the limit). */
     perSourceRequestLimit?: number;
   } = {},
@@ -380,6 +386,26 @@ export function createCollectorServer(
     const budget = createRequestBudget();
     try {
       assertAllowedHost(request);
+      if (selectsLiveUsage(request)) {
+        const selected = assertLiveRoute(request);
+        sourceRateLimiter.assertAdmissible("codex");
+        const home = options.liveProducerHome ?? resolveCollectorHome().home;
+        const authenticate = () => authenticateLiveProducer(home, buffer, config, selected.producerId, selected.token, localAuth);
+        const binding = authenticate();
+        const bytes = await readLiveBody(request, budget);
+        let packet: ReturnType<typeof parseLivePacket>;
+        try { packet = parseLivePacket(bytes); }
+        catch { throw new HttpBoundaryRejection("invalid_json", 400); }
+        const digest = liveSha256(bytes);
+        // Body identity never selects a dedupe scope. Echo failure has no ledger lookup.
+        const result = packet.producerId !== binding.binding.producerId || packet.credentialId !== binding.binding.credentialId
+          ? liveReceipt(packet, digest, "enrollment_rejected", false, null)
+          : ingestLiveUsage(buffer, packet, digest, authenticate);
+        response.writeHead(result.disposition === "retryable" ? 503 : result.disposition === "enrollment_rejected" ? 403 : 200,
+          { "content-type": "application/json", "cache-control": "no-store" });
+        response.end(canonicalJson(result));
+        return;
+      }
 
       // Issue 0056 (#104): the only unauthenticated surface. Minimal by
       // construction — no runtime identity, counters, delivery, or ledger
@@ -734,6 +760,7 @@ export function createCollectorServer(
         );
         const payload = parseBoundedJson(body.text);
         assertBoundedJsonNodes(payload);
+        if (hasLiveUsageClaim(payload)) throw new HttpBoundaryRejection("source_not_allowed", 403);
         budget.checkpoint();
         const normalized = appendForwardedHook(payload, {
           config,
@@ -773,6 +800,7 @@ export function createCollectorServer(
         );
         const parsedEnvelope = parseBoundedJson(body.text);
         assertBoundedOtlpCardinality(parsedEnvelope);
+        if (hasLiveUsageClaim(parsedEnvelope)) throw new HttpBoundaryRejection("source_not_allowed", 403);
 
         const repoLabels: Array<{ hash: string; label: string }> = [];
         const exploded = explodeOtlpPayload(parsedEnvelope, {

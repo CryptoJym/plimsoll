@@ -191,6 +191,7 @@ export type MetadataStringKind =
   | "trace"
   | "linkage"
   | "commit_sha"
+  | "sha256_digest"
   | "transport_path"
   | "http_method"
   | "timestamp";
@@ -245,6 +246,8 @@ const RECORD_ANALYTICAL_SCALARS = new Map<string, AnalyticalScalarKind>([
 ]);
 
 const GENERATED_ANALYTICAL_SCALARS = new Map<string, AnalyticalScalarKind>([
+  ["liveTotalTokens", "token_count"],
+  ["liveReasoningOutputTokens", "token_count"],
   ["otelStatusCode", "status_code"],
   ["turnIndex", "token_count"],
   ["costEstimated", "boolean"],
@@ -311,13 +314,6 @@ const RECORD_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
   ["attemptId", "identifier"],
   ["parentAttemptId", "identifier"],
   ["acceptedOutcomeId", "identifier"],
-  ["sourceEventId", "identifier"],
-  ["sourceVersion", "version"],
-  ["captureRootId", "identifier"],
-  ["captureProfileId", "identifier"],
-  ["installationEpochId", "identifier"],
-  ["logicalSourceEventId", "identifier"],
-  ["sourceIdentityEvidenceRef", "identifier"],
   ["captureAccountHash", "linkage"],
   ["accountEvidenceRef", "identifier"],
   ["costKind", "classification"],
@@ -349,6 +345,19 @@ const RESOURCE_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
 ];
 
 const GENERATED_STRING_KEYS: Array<readonly [string, MetadataStringKind]> = [
+  ["sourceVersion", "version"],
+  ["sourceEventId", "identifier"],
+  ["logicalSourceEventId", "identifier"],
+  ["sourceIdentityEvidenceRef", "identifier"],
+  ["captureRootId", "identifier"],
+  ["captureProfileId", "identifier"],
+  ["installationEpochId", "identifier"],
+  ["sourcePayloadDigest", "sha256_digest"],
+  ["liveObservationKind", "classification"],
+  ["liveIntervalStart", "timestamp"],
+  ["liveIntervalEnd", "timestamp"],
+  ["liveAttributionState", "classification"],
+  ["liveFinanceEligibility", "classification"],
   ["otelEventName", "signal"],
   ["otelSpanEndAt", "timestamp"],
   ["gen_ai.system", "component"],
@@ -622,6 +631,9 @@ export function safeMetadataStringAttribute(key: string, value: unknown) {
     if (typeof value !== "string" || hasUnsafeMetadataString(value)) return null;
     const match = value.trim().match(CANONICAL_LINKAGE);
     return match ? `sha256:${match[1].toLowerCase()}` : null;
+  }
+  if (kind === "sha256_digest") {
+    return typeof value === "string" && /^[a-f0-9]{64}$/.test(value) ? value : null;
   }
   if (kind === "commit_sha") {
     if (typeof value !== "string" || hasUnsafeMetadataString(value)) return null;

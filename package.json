@@ -35,6 +35,8 @@
     "proof:future-admission": "tsx scripts/future-admission-proof.ts",
     "proof:child-identity": "tsx scripts/child-identity-recovery-proof.ts",
     "proof:economics": "tsx scripts/run-proof.ts scripts/economics-proof.ts",
+    "proof:live-usage-metadata": "tsx scripts/live-usage-metadata-proof.ts",
+    "proof:live-usage-projection": "tsx scripts/run-proof.ts scripts/live-usage-projection-proof.ts",
     "proof:finance-export": "tsx scripts/finance-project-usage-export.test.ts",
     "proof:finance-projection": "tsx scripts/finance-project-usage-projection.test.ts",
     "proof:delivery": "tsx scripts/delivery-transport-proof.ts",
@@ -106,7 +108,10 @@
     "backfill": "tsx scripts/backfill-v1-archive.ts",
     "proof:completion": "tsx scripts/run-proof.ts scripts/proof-completion-proof.ts",
     "proof:install-artifact": "tsx scripts/run-proof.ts scripts/install-artifact-proof.ts",
-    "proof:automatic-capture-cadence": "tsx scripts/automatic-capture-cadence-proof.ts"
+    "proof:automatic-capture-cadence": "tsx scripts/automatic-capture-cadence-proof.ts",
+    "proof:oversized-continuation": "tsx scripts/run-proof.ts scripts/oversized-continuation-suite-proof.ts",
+    "proof:codex-live-usage": "tsx scripts/run-proof.ts scripts/codex-live-usage-proof.ts",
+    "proof:codex-live-reporting": "tsx scripts/run-proof.ts scripts/codex-live-reporting-proof.ts"
   },
   "dependencies": {
     "better-sqlite3": "^12.10.0",

@@ -5,12 +5,12 @@
     {
       "name": "install_doctor",
       "kind": "json_result",
-      "expectedArtifactDigest": "sha256:e752831190dad5dd3471d96390e6995f509b7abf52cea854a32a7387535bb4f0"
+      "expectedArtifactDigest": "sha256:01e142219283caea372f13d28cd89027fb95a10524fa826a0a845940fb340166"
     },
     {
       "name": "transactional_join",
       "kind": "json_result",
-      "expectedArtifactDigest": "sha256:c03f558409b10538a141ea6ebef5fac60fc52e8201c6e51345078967e26a6050"
+      "expectedArtifactDigest": "sha256:d7d0c36cbc4d0bf02b1d4e3e89a32cb6902bc6754ece87c813542ffb498123d4"
     },
     {
       "name": "metadata_only_privacy",
@@ -25,7 +25,7 @@
     {
       "name": "idle_dashboard_resources",
       "kind": "json_receipt",
-      "expectedArtifactDigest": "sha256:6c8636ccb2fddb97893f4522d7f3361f01e258a3c9f08f51f16fc0c5c9b07551"
+      "expectedArtifactDigest": "sha256:a8d5ae8b6ed475015e3229dc963fafa86e944dd757dc91ae99da3fbec44adeeb"
     },
     {
       "name": "launch_agent_unload_terminal_truth",

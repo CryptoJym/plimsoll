@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
+import { ensureUuidEventId } from "../packages/collector-cli/src/upload-history";
 
 import {
   buildFinanceProjectUsageExportFromProjection,
@@ -207,6 +208,38 @@ function close(buffer: LocalEventBuffer): void {
 function fixtureMaintenanceDate(): Date {
   return new Date(Date.now() + 1_000);
 }
+
+test("live observation facts stay excluded with valid or missing interval metadata",()=>{
+  const validInterval=JSON.stringify({intervalStart:period.start,intervalEnd:period.end,financeEligibility:"unqualified_observer"});
+  for(const [interval,observedAt] of [[null,"2026-08-31T12:00:00.000Z"],[validInterval,"2026-08-31T12:00:00.000Z"],[validInterval,period.end]] as const) {
+    const buffer=healthyBuffer([event("2026-08-31T12:00:00.000Z"),event("2026-08-31T13:00:00.000Z")]);
+    try {
+      buffer.database.prepare(`update dashboard_event_facts set event_type='usage_live',live_usage_json=?,observed_at_ms=?
+        where observed_at_ms=?`).run(interval,Date.parse(observedAt),Date.parse("2026-08-31T12:00:00.000Z"));
+      const result=readFinanceProjectUsageProjection(buffer.database,request());
+      assert.equal(result.input.source.records.length,1);
+      assert.ok(result.reasons.includes("OBSERVED_INTERVAL_UNQUALIFIED"));
+      assert.equal(result.input.envelope.coverage.complete,false);
+      assert.equal(result.input.envelope.coverage.coveredThrough,period.start);
+    } finally { close(buffer); }
+  }
+});
+
+test("retained live intervals cannot disappear from Finance coverage holds",()=>{
+  const buffer=healthyBuffer();
+  try {
+    buffer.database.prepare(`insert into dashboard_live_usage_retained
+      (event_id,delivery_id,workspace_id,installation_epoch_id,observed_at_ms,interval_start,usage_fact_json)
+      values ('retained-live',?,'workspace-a',?,?,?,'{}')`).run(ensureUuidEventId('retained-live').id,
+      buffer.workspaceBinding()?.currentInstallationEpochId,Date.parse(period.end),period.start,
+    );
+    const result=readFinanceProjectUsageProjection(buffer.database,request());
+    assert.equal(result.input.source.records.length,1);
+    assert.ok(result.reasons.includes("OBSERVED_INTERVAL_UNQUALIFIED"));
+    assert.equal(result.input.envelope.coverage.complete,false);
+    assert.equal(result.input.envelope.coverage.coveredThrough,period.start);
+  } finally { close(buffer); }
+});
 
 test("reads native facts for the exact period and keeps reported and estimated channels separate", () => {
   const buffer = healthyBuffer([

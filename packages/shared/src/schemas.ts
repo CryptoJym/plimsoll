@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { readLiveUsageEventObservation } from "./live-usage-metadata";
 
 export const LOCAL_TENANT_ID = "00000000-0000-4000-8000-000000000001";
 
@@ -285,6 +286,7 @@ export const aiInteractionEventSchema = z
       "otel_span",
       "usage_rollout",
       "usage_transcript",
+      "usage_live",
       "unknown",
     ]),
     observedAt: timestampSchema,
@@ -309,6 +311,15 @@ export const aiInteractionEventSchema = z
       path: ["costKind"],
       message: "costKind requires costUsd.",
     },
+  )
+  .refine(
+    (event) => event.eventType !== "usage_live" || (
+      event.source === "codex" && event.dataMode === "metadata" &&
+      event.sessionId !== undefined && event.actorId === undefined &&
+      event.model === undefined && event.costUsd === undefined && event.costKind === undefined &&
+      readLiveUsageEventObservation(event) !== null
+    ),
+    { message: "Live usage requires a validated, unpriced observed interval." },
   );
 export type AiInteractionEvent = z.infer<typeof aiInteractionEventSchema>;
 

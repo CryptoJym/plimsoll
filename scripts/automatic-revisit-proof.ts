@@ -1,6 +1,7 @@
 // Adapted from the accepted eco-6hoxj.3 0.7.2 pipeline-proof.ts: same real
 // filesystem baseline, 20 roots, 248 excluded files, SQLite and maintenance.
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -100,6 +101,8 @@ async function prove(source: CaptureRoot["source"]) {
   const cursor = (file: string) => buffer.database.prepare(`select committed_offset, deferred_bytes, unresolved_kind,
     unresolved_byte_budget, file_identity from rollout_scan_state where file = ?`)
     .get(jsonlScanStateKey(rootCursorKey(roots, file))) as any;
+  const continuation = (file: string) => buffer.database.prepare('select envelope_json from jsonl_continuations where provider=? and file_key=?')
+    .get(source === 'codex' ? 'codex' : 'claude', createHash('sha256').update(file).digest('hex')) as { envelope_json: string } | undefined;
   try {
     for (let turn = 0; turn < 64 && captureBaselineStatus(buffer.database).status !== "complete"; turn++) await run("baseline");
     check("both real filesystem baselines complete", captureBaselineStatus(buffer.database).status === "complete");
@@ -127,7 +130,9 @@ async function prove(source: CaptureRoot["source"]) {
     const encode = (lines: unknown[]) => lines.map(line => JSON.stringify(line)).join("\n") + "\n";
     // More than five cadence byte allowances makes partial retries observable
     // even on fast runners, without depending on the cooperative wall clock.
-    fs.writeFileSync(target, encode([...prefix(session), large(350 * 1024), ...Array.from({ length: 300 }, (_, i) => usage(i + 1, session, 8192))]));
+    // The first record exceeds a complete cadence, so its separate durable
+    // continuation is observable before restart even on a fast runner.
+    fs.writeFileSync(target, encode([...prefix(session), large(900 * 1024), ...Array.from({ length: 300 }, (_, i) => usage(i + 1, session, 8192))]));
     let sawUnresolved = false, sawLargerRetry = false, prior = 0, restartDone = false;
     const visits: Visit[] = [];
     let partialAppends = 0, pendingAppend: { offset: number; attempts: number } | null = null;
@@ -143,7 +148,7 @@ async function prove(source: CaptureRoot["source"]) {
       }
       if (result.filesRead > 0) visits.push({ cadence: turn, offset: c?.committed_offset ?? 0, deferred: c?.deferred_bytes ?? 0,
         retained: cadences.at(-1).pending.flat().some((p: any) => p.file === path.relative(base, target) && p.servicedCadences > 0) });
-      sawUnresolved ||= c?.unresolved_kind === "record_exceeds_byte_budget";
+      sawUnresolved ||= Boolean(continuation(target));
       sawLargerRetry ||= result.bytesRead > 65536;
       if (c) { assert(c.committed_offset >= prior); prior = c.committed_offset; }
       if (sawUnresolved && !restartDone) { restart(); restartDone = true; }
@@ -169,8 +174,9 @@ async function prove(source: CaptureRoot["source"]) {
     check("between-cadence appends to retained partial snapshots progress on first retry", partialAppends === 3 && appendRevisits.length === 3 &&
       appendRevisits.every(r => r.after > r.before && r.errors === 0));
     const stat = fs.lstatSync(target, { bigint: true });
-    check("real discovery records oversized line", sawUnresolved);
-    check("persisted retry clears after cold ledger restart", restartDone && sawLargerRetry && cursor(target)?.unresolved_kind === null);
+    check("real discovery saves oversized continuation separately", sawUnresolved);
+    check("persisted continuation completes after cold ledger restart", restartDone && sawLargerRetry &&
+      cursor(target)?.unresolved_kind === null && !continuation(target));
     check("finite future snapshot fully consumed", cursor(target)?.committed_offset === Number(stat.size) && cursor(target)?.deferred_bytes === 0);
     check("nanosecond physical identity preserved", cursor(target)?.file_identity === `${stat.dev}:${stat.ino}:${stat.birthtimeNs}`);
     // Finite growth is rediscovered through the real directory walk, then sliced normally.
@@ -223,16 +229,16 @@ async function prove(source: CaptureRoot["source"]) {
     let giantSentinel = "", giantCadences = 0;
     for (let turn = 0; turn < 80; turn++) {
       await run("giant");
-      if (cursor(giant)?.unresolved_byte_budget === 524288 && !giantSentinel) {
+      if (continuation(giant) && !giantSentinel) {
         giantSentinel = fileAt(providerRoots.at(-1)!, "ffffffff-ffff-4fff-8fff-ffffffffffff");
         fs.writeFileSync(giantSentinel, encode([...prefix("ffffffff-ffff-4fff-8fff-ffffffffffff"), usage(1, "ffffffff-ffff-4fff-8fff-ffffffffffff")]));
       }
       if (giantSentinel) giantCadences++;
-      if (cursor(giantSentinel)?.deferred_bytes === 0) break;
+      if (cursor(giantSentinel)?.deferred_bytes === 0 && cursor(giant)?.committed_offset === fs.statSync(giant).size) break;
     }
-    check("above-512KiB record remains truthfully unresolved", cursor(giant)?.committed_offset === 0 &&
-      cursor(giant)?.unresolved_kind === "record_exceeds_byte_budget" && cursor(giant)?.unresolved_byte_budget === 524288);
-    check("above-cap record releases discovery queue", Boolean(giantSentinel) && cursor(giantSentinel)?.deferred_bytes === 0 && giantCadences <= 32);
+    check("finite above-512KiB record completes across bounded cadences", cursor(giant)?.committed_offset === fs.statSync(giant).size &&
+      cursor(giant)?.deferred_bytes === 0 && cursor(giant)?.unresolved_kind === null && !continuation(giant));
+    check("oversized continuation releases discovery queue", Boolean(giantSentinel) && cursor(giantSentinel)?.deferred_bytes === 0 && giantCadences <= 32);
     check("pending metadata and all cooperative limits remain bounded", cadences.every(c => c.pending.every((p: any[]) => p.length <= 64)) &&
       JSON.stringify(AUTOMATIC_CAPTURE_LIMITS) === JSON.stringify({ maxBytes: 524288, maxRecords: 512, maxEvents: 512, maxWallMs: 200, sliceBytes: 65536, sliceRecords: 64 }));
     check("no excluded historical body reads attempted throughout capture", privateReadAttempts === 0);

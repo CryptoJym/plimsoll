@@ -1,0 +1,65 @@
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import {LocalEventBuffer} from '../packages/collector-cli/src/buffer';
+import {RolloutTailer} from '../packages/collector-cli/src/rollout-tailer';
+import {TranscriptTailer} from '../packages/collector-cli/src/transcript-tailer';
+import {DEFAULT_JSONL_TAILER_IO,loadJsonlScanCursor,jsonlScanStateKey} from '../packages/collector-cli/src/jsonl-byte-tailer';
+import {readJsonlContinuation} from '../packages/collector-cli/src/jsonl-continuation';
+const workspaceId='bbbbbbbb-cccc-4ddd-8eee-ffffffffffff';
+async function main(){
+ const dir=fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(),'oversized-transaction-'))),receipts=[];
+ for(const provider of ['codex','claude'] as const){
+   const root=path.join(dir,provider);fs.mkdirSync(root);const ledger=path.join(root,'product.sqlite'),controlLedger=path.join(root,'control.sqlite');
+   const buffer=new LocalEventBuffer(ledger,{workspaceId,delivery:{enabled:true}});
+   const now=new Date().toISOString(),id='aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee';
+   const leaf=path.join(root,...(provider==='codex'?now.slice(0,10).split('-'):['project']));fs.mkdirSync(leaf,{recursive:true});
+   const file=path.join(leaf,`rollout-${id}.jsonl`),key=jsonlScanStateKey(file),cwd=path.join(root,'no-git');fs.mkdirSync(cwd);
+   const make=(n:number,padding=0)=>provider==='codex'?{timestamp:now,type:'event_msg',payload:{padding:'X'.repeat(padding),type:'token_count',info:{total_token_usage:{input_tokens:n,cached_input_tokens:n/5,output_tokens:n/10,reasoning_output_tokens:0}}}}:
+     {timestamp:now,type:'assistant',sessionId:id,cwd,message:{content:'X'.repeat(padding),id:'m',model:'claude-sonnet-4-20250514',usage:{input_tokens:n,output_tokens:n/10,cache_read_input_tokens:n/5,cache_creation_input_tokens:n/10}}};
+   const prefix=(provider==='codex'?[{type:'session_meta',timestamp:now,payload:{id,cwd}},make(0),make(10)]:[make(10)]).map(x=>JSON.stringify(x)+'\n').join('');
+   fs.writeFileSync(file,prefix);
+   const makeTailer=(b:LocalEventBuffer)=>provider==='codex'?new RolloutTailer(b,root,()=>[]):new TranscriptTailer(b,root);
+   let tailer=makeTailer(buffer);let first=await tailer.scan({scope:'full'});assert.equal(first.readErrors,0);assert(first.eventsAppended>0);
+   const lease=buffer.delivery.lease();assert(lease.items.length>0,'actual outbox has an attempted sealed payload');
+   const attempted=()=>buffer.database.prepare('select delivery_id,sealed_envelope_json,sealed_bytes,attempt_count from upload_outbox where attempt_count>0 order by delivery_id').all();
+   const attemptedBefore=JSON.stringify(attempted()),oldCursor=JSON.stringify(buffer.database.prepare('select * from rollout_scan_state where file=?').get(key));
+   await buffer.database.backup(controlLedger);
+   fs.appendFileSync(file,JSON.stringify(make(100,850*1024)).replace(/"type"/g,'"t\\u0079pe"')+'\n');
+   buffer.database.exec("create trigger oversized_fail_completion before update on rollout_scan_state begin select raise(abort,'oversized_completion_failure'); end");
+   const failed=await tailer.scan({scope:'full'});assert(failed.readErrors>0);assert.equal(failed.eventsAppended,0);
+   assert.equal(JSON.stringify(buffer.database.prepare('select * from rollout_scan_state where file=?').get(key)),oldCursor);
+   assert.equal(JSON.stringify(attempted()),attemptedBefore);
+   const tables=['buffered_events','upload_outbox','jsonl_continuations','rollout_scan_state','maintenance_git_context_queue','transcript_usage_revision_state'];
+   const snapshot=()=>tables.map(table=>{const exists=buffer.database.prepare("select 1 from sqlite_master where type='table' and name=?").get(table);return [table,exists?buffer.database.prepare(`select * from ${table}`).all():null];});
+   const before=JSON.stringify(snapshot()),handoffs=JSON.stringify(buffer.repoContextQueueStatus());
+   const retryFailed=await tailer.scan({scope:'full'});assert(retryFailed.readErrors>0);assert.equal(retryFailed.eventsAppended,0);assert.equal(retryFailed.recordsCommitted,0);assert.equal(retryFailed.continuationBytesAdvanced??0,0);
+   assert.equal(JSON.stringify(snapshot()),before);assert.equal(JSON.stringify(buffer.repoContextQueueStatus()),handoffs);assert.equal(JSON.stringify(attempted()),attemptedBefore);
+   buffer.database.exec('drop trigger oversized_fail_completion');
+   const current=buffer.database.prepare('select * from rollout_scan_state where file=?').get(key) as any;
+   const staleCompletion=readJsonlContinuation(file,fs.statSync(file),loadJsonlScanCursor(buffer.database,file,current.parser_kind,current.checkpoint_version,x=>x as any),{maxBytes:65536,maxRecords:64},DEFAULT_JSONL_TAILER_IO,{database:buffer.database,provider,cursorKey:file,directory:root,deadline:performance.now()+200,eligible:()=>true})!;
+   assert.equal(staleCompletion.continuation?.action,'complete');
+   tailer.close();tailer=makeTailer(buffer);
+   const complete=await tailer.scan({scope:'full'});assert.equal(complete.readErrors,0);assert.equal(complete.recordsCommitted,1);assert(complete.eventsAppended>0);
+   assert.throws(()=>buffer.database.transaction(()=>staleCompletion.continuation!.remove())(),/stale_continuation/);staleCompletion.close();
+   assert.equal((buffer.database.prepare('select committed_offset from rollout_scan_state where file=?').get(key) as any).committed_offset,fs.statSync(file).size);
+   assert.equal((buffer.database.prepare('select count(*) as n from jsonl_continuations').get() as any).n,0);
+   assert.equal(JSON.stringify(attempted()),attemptedBefore,'attempted immutable outbox bytes remain unchanged after revision');
+   const productParser=JSON.parse((buffer.database.prepare('select parser_state_json from rollout_scan_state where file=?').get(key) as any).parser_state_json);
+   const events=(b:LocalEventBuffer)=>b.database.prepare('select id,source,session_id,event_type,observed_at,model,input_tokens,output_tokens,cache_read_tokens,cache_creation_tokens,payload_json from buffered_events order by id').all();
+   const productEvents=events(buffer);
+   tailer.close();
+   fs.writeFileSync(file,prefix+JSON.stringify(make(100))+'\n');
+   const control=new LocalEventBuffer(controlLedger,{workspaceId,delivery:{enabled:true}}),controlTailer=makeTailer(control);
+   const controlResult=await controlTailer.scan({scope:'full'});assert.equal(controlResult.readErrors,0);assert.equal(controlResult.eventsAppended,complete.eventsAppended);
+   assert.deepEqual(events(control),productEvents,'actual provider exact event IDs/lineage/revision/metadata match existing unpadded semantics');
+   const controlParser=JSON.parse((control.database.prepare('select parser_state_json from rollout_scan_state where file=?').get(key) as any).parser_state_json);assert.deepEqual(controlParser,productParser);
+   assert.equal(JSON.stringify(buffer.database.prepare('select sealed_envelope_json from upload_outbox where attempt_count>0').all()),JSON.stringify(control.database.prepare('select sealed_envelope_json from upload_outbox where attempt_count>0').all()));
+   const duplicate=await controlTailer.scan({scope:'full'});assert.equal(duplicate.eventsAppended,0);
+   receipts.push({provider,checks:['concurrent completion CAS rejects stale proposal','completion failure atomic','retry failure zero durable progress','provider state and repository handoffs restored','restart and escaped discriminator commit','exact prior attempted outbox bytes preserved','parser and exact event comparison with existing unpadded semantics','retry deduplicates'],events:productEvents.length,failed:failed.readErrors});
+   controlTailer.close();control.close();buffer.close();
+ }
+ console.log(JSON.stringify({status:'PASS',receipts,fixture:dir}));
+}
+main().catch(error=>{console.error(error);process.exitCode=1;});

@@ -1,0 +1,420 @@
+{
+  "schema": "plimsoll.live-usage-golden.v1",
+  "state": "R3_REVIEW_ONLY_NOT_NATIVE_PROOF",
+  "contractSha256": "dfb3ee604e9d4ecfe38547b19be392cbfe2e4e02451bdf85529056cb2891238c",
+  "attachmentDerivation": {
+    "input": [
+      "plimsoll.codex.attachment.v1",
+      "synthetic-conductor-profile-1",
+      "synthetic-credential-1",
+      "0123456789abcdef0123456789abcdef",
+      "11111111-1111-7111-8111-111111111111",
+      1
+    ],
+    "canonicalUtf8": "[\"plimsoll.codex.attachment.v1\",\"synthetic-conductor-profile-1\",\"synthetic-credential-1\",\"0123456789abcdef0123456789abcdef\",\"11111111-1111-7111-8111-111111111111\",1]",
+    "sha256": "efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092"
+  },
+  "vectors": [
+    {
+      "name": "zero-baseline",
+      "packet": {
+        "schema": "codex.app-server.usage.v1",
+        "kind": "usage",
+        "attachmentId": "efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092",
+        "observationSeq": 1,
+        "previousDigest": null,
+        "threadId": "11111111-1111-7111-8111-111111111111",
+        "turnId": "22222222-2222-7222-8222-222222222222",
+        "capturedAt": "2026-09-08T09:00:00.000Z",
+        "total": {
+          "inputTokens": 0,
+          "cachedInputTokens": 0,
+          "cacheWriteInputTokens": 0,
+          "outputTokens": 0,
+          "reasoningOutputTokens": 0,
+          "totalTokens": 0
+        },
+        "producerId": "synthetic-conductor-profile-1",
+        "credentialId": "synthetic-credential-1"
+      },
+      "canonicalUtf8": "{\"attachmentId\":\"efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092\",\"capturedAt\":\"2026-09-08T09:00:00.000Z\",\"credentialId\":\"synthetic-credential-1\",\"kind\":\"usage\",\"observationSeq\":1,\"previousDigest\":null,\"producerId\":\"synthetic-conductor-profile-1\",\"schema\":\"codex.app-server.usage.v1\",\"threadId\":\"11111111-1111-7111-8111-111111111111\",\"total\":{\"cacheWriteInputTokens\":0,\"cachedInputTokens\":0,\"inputTokens\":0,\"outputTokens\":0,\"reasoningOutputTokens\":0,\"totalTokens\":0},\"turnId\":\"22222222-2222-7222-8222-222222222222\"}",
+      "sha256": "89760230cc706cd8174d42197224c01c36b395d6e6a5eaec37a7991c3f15f215",
+      "bytes": 532,
+      "receipt": {
+        "schema": "codex.app-server.receipt.v1",
+        "producerId": "synthetic-conductor-profile-1",
+        "threadId": "11111111-1111-7111-8111-111111111111",
+        "attachmentId": "efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092",
+        "kind": "usage",
+        "packetDigest": "89760230cc706cd8174d42197224c01c36b395d6e6a5eaec37a7991c3f15f215",
+        "disposition": "baseline_only",
+        "replayed": false,
+        "committed": true,
+        "committedObservationSeq": 1,
+        "observationSeq": 1,
+        "credentialId": "synthetic-credential-1"
+      },
+      "receiptCanonicalUtf8": "{\"attachmentId\":\"efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092\",\"committed\":true,\"committedObservationSeq\":1,\"credentialId\":\"synthetic-credential-1\",\"disposition\":\"baseline_only\",\"kind\":\"usage\",\"observationSeq\":1,\"packetDigest\":\"89760230cc706cd8174d42197224c01c36b395d6e6a5eaec37a7991c3f15f215\",\"producerId\":\"synthetic-conductor-profile-1\",\"replayed\":false,\"schema\":\"codex.app-server.receipt.v1\",\"threadId\":\"11111111-1111-7111-8111-111111111111\"}",
+      "receiptSha256": "a94ba2094ff0c3fcc59be8d1ab972f5e3307531d0b32f1daccd7b9efa6f817eb"
+    },
+    {
+      "name": "positive-all-components",
+      "packet": {
+        "schema": "codex.app-server.usage.v1",
+        "kind": "usage",
+        "attachmentId": "efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092",
+        "observationSeq": 2,
+        "previousDigest": "89760230cc706cd8174d42197224c01c36b395d6e6a5eaec37a7991c3f15f215",
+        "threadId": "11111111-1111-7111-8111-111111111111",
+        "turnId": "22222222-2222-7222-8222-222222222222",
+        "capturedAt": "2026-09-08T09:00:05.000Z",
+        "total": {
+          "inputTokens": 100,
+          "cachedInputTokens": 40,
+          "cacheWriteInputTokens": 10,
+          "outputTokens": 20,
+          "reasoningOutputTokens": 5,
+          "totalTokens": 120
+        },
+        "producerId": "synthetic-conductor-profile-1",
+        "credentialId": "synthetic-credential-1"
+      },
+      "canonicalUtf8": "{\"attachmentId\":\"efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092\",\"capturedAt\":\"2026-09-08T09:00:05.000Z\",\"credentialId\":\"synthetic-credential-1\",\"kind\":\"usage\",\"observationSeq\":2,\"previousDigest\":\"89760230cc706cd8174d42197224c01c36b395d6e6a5eaec37a7991c3f15f215\",\"producerId\":\"synthetic-conductor-profile-1\",\"schema\":\"codex.app-server.usage.v1\",\"threadId\":\"11111111-1111-7111-8111-111111111111\",\"total\":{\"cacheWriteInputTokens\":10,\"cachedInputTokens\":40,\"inputTokens\":100,\"outputTokens\":20,\"reasoningOutputTokens\":5,\"totalTokens\":120},\"turnId\":\"22222222-2222-7222-8222-222222222222\"}",
+      "sha256": "86714253977e3bfee52bfa7358a3571ad7c2b6997f82ea9ffca827776232ccb3",
+      "bytes": 601,
+      "receipt": {
+        "schema": "codex.app-server.receipt.v1",
+        "producerId": "synthetic-conductor-profile-1",
+        "threadId": "11111111-1111-7111-8111-111111111111",
+        "attachmentId": "efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092",
+        "kind": "usage",
+        "packetDigest": "86714253977e3bfee52bfa7358a3571ad7c2b6997f82ea9ffca827776232ccb3",
+        "disposition": "stored",
+        "replayed": false,
+        "committed": true,
+        "committedObservationSeq": 2,
+        "observationSeq": 2,
+        "credentialId": "synthetic-credential-1"
+      },
+      "receiptCanonicalUtf8": "{\"attachmentId\":\"efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092\",\"committed\":true,\"committedObservationSeq\":2,\"credentialId\":\"synthetic-credential-1\",\"disposition\":\"stored\",\"kind\":\"usage\",\"observationSeq\":2,\"packetDigest\":\"86714253977e3bfee52bfa7358a3571ad7c2b6997f82ea9ffca827776232ccb3\",\"producerId\":\"synthetic-conductor-profile-1\",\"replayed\":false,\"schema\":\"codex.app-server.receipt.v1\",\"threadId\":\"11111111-1111-7111-8111-111111111111\"}",
+      "receiptSha256": "e1773d7c3e8394ad8c88f594993e55348c1be45af04ec5464699b8d7c0fd9ef1",
+      "expectedEventId": "codex-live:55c395c42ddb4d03309583cd364da331810414ce0474bee8b76d9c97f0b55ab6",
+      "expectedDelta": {
+        "inputTokens": 100,
+        "cachedInputTokens": 40,
+        "cacheWriteInputTokens": 10,
+        "outputTokens": 20,
+        "reasoningOutputTokens": 5,
+        "totalTokens": 120
+      }
+    },
+    {
+      "name": "equal-totals-observation",
+      "packet": {
+        "schema": "codex.app-server.usage.v1",
+        "kind": "usage",
+        "attachmentId": "efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092",
+        "observationSeq": 3,
+        "previousDigest": "86714253977e3bfee52bfa7358a3571ad7c2b6997f82ea9ffca827776232ccb3",
+        "threadId": "11111111-1111-7111-8111-111111111111",
+        "turnId": "22222222-2222-7222-8222-222222222222",
+        "capturedAt": "2026-09-08T09:00:10.000Z",
+        "total": {
+          "inputTokens": 100,
+          "cachedInputTokens": 40,
+          "cacheWriteInputTokens": 10,
+          "outputTokens": 20,
+          "reasoningOutputTokens": 5,
+          "totalTokens": 120
+        },
+        "producerId": "synthetic-conductor-profile-1",
+        "credentialId": "synthetic-credential-1"
+      },
+      "canonicalUtf8": "{\"attachmentId\":\"efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092\",\"capturedAt\":\"2026-09-08T09:00:10.000Z\",\"credentialId\":\"synthetic-credential-1\",\"kind\":\"usage\",\"observationSeq\":3,\"previousDigest\":\"86714253977e3bfee52bfa7358a3571ad7c2b6997f82ea9ffca827776232ccb3\",\"producerId\":\"synthetic-conductor-profile-1\",\"schema\":\"codex.app-server.usage.v1\",\"threadId\":\"11111111-1111-7111-8111-111111111111\",\"total\":{\"cacheWriteInputTokens\":10,\"cachedInputTokens\":40,\"inputTokens\":100,\"outputTokens\":20,\"reasoningOutputTokens\":5,\"totalTokens\":120},\"turnId\":\"22222222-2222-7222-8222-222222222222\"}",
+      "sha256": "60c452c26a2d30544bfdacfb86e4ae51439139b2971a5846e3e112a316d80f21",
+      "bytes": 601,
+      "receipt": {
+        "schema": "codex.app-server.receipt.v1",
+        "producerId": "synthetic-conductor-profile-1",
+        "threadId": "11111111-1111-7111-8111-111111111111",
+        "attachmentId": "efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092",
+        "kind": "usage",
+        "packetDigest": "60c452c26a2d30544bfdacfb86e4ae51439139b2971a5846e3e112a316d80f21",
+        "disposition": "stored",
+        "replayed": false,
+        "committed": true,
+        "committedObservationSeq": 3,
+        "observationSeq": 3,
+        "credentialId": "synthetic-credential-1"
+      },
+      "receiptCanonicalUtf8": "{\"attachmentId\":\"efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092\",\"committed\":true,\"committedObservationSeq\":3,\"credentialId\":\"synthetic-credential-1\",\"disposition\":\"stored\",\"kind\":\"usage\",\"observationSeq\":3,\"packetDigest\":\"60c452c26a2d30544bfdacfb86e4ae51439139b2971a5846e3e112a316d80f21\",\"producerId\":\"synthetic-conductor-profile-1\",\"replayed\":false,\"schema\":\"codex.app-server.receipt.v1\",\"threadId\":\"11111111-1111-7111-8111-111111111111\"}",
+      "receiptSha256": "127a2364fa9513b9e7794998b7bc4039f90c5a6876411e9012812d9efe498e92"
+    },
+    {
+      "name": "counter-reset",
+      "packet": {
+        "schema": "codex.app-server.usage.v1",
+        "kind": "usage",
+        "attachmentId": "efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092",
+        "observationSeq": 4,
+        "previousDigest": "60c452c26a2d30544bfdacfb86e4ae51439139b2971a5846e3e112a316d80f21",
+        "threadId": "11111111-1111-7111-8111-111111111111",
+        "turnId": "22222222-2222-7222-8222-222222222222",
+        "capturedAt": "2026-09-08T09:00:15.000Z",
+        "total": {
+          "inputTokens": 90,
+          "cachedInputTokens": 40,
+          "cacheWriteInputTokens": 10,
+          "outputTokens": 20,
+          "reasoningOutputTokens": 5,
+          "totalTokens": 110
+        },
+        "producerId": "synthetic-conductor-profile-1",
+        "credentialId": "synthetic-credential-1"
+      },
+      "canonicalUtf8": "{\"attachmentId\":\"efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092\",\"capturedAt\":\"2026-09-08T09:00:15.000Z\",\"credentialId\":\"synthetic-credential-1\",\"kind\":\"usage\",\"observationSeq\":4,\"previousDigest\":\"60c452c26a2d30544bfdacfb86e4ae51439139b2971a5846e3e112a316d80f21\",\"producerId\":\"synthetic-conductor-profile-1\",\"schema\":\"codex.app-server.usage.v1\",\"threadId\":\"11111111-1111-7111-8111-111111111111\",\"total\":{\"cacheWriteInputTokens\":10,\"cachedInputTokens\":40,\"inputTokens\":90,\"outputTokens\":20,\"reasoningOutputTokens\":5,\"totalTokens\":110},\"turnId\":\"22222222-2222-7222-8222-222222222222\"}",
+      "sha256": "d17f5de6e6f6bbf39710f985cccb4d3e91cd6c232a866e54de0b6ef75d6c11b9",
+      "bytes": 600,
+      "receipt": {
+        "schema": "codex.app-server.receipt.v1",
+        "producerId": "synthetic-conductor-profile-1",
+        "threadId": "11111111-1111-7111-8111-111111111111",
+        "attachmentId": "efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092",
+        "kind": "usage",
+        "packetDigest": "d17f5de6e6f6bbf39710f985cccb4d3e91cd6c232a866e54de0b6ef75d6c11b9",
+        "disposition": "counter_reset",
+        "replayed": false,
+        "committed": true,
+        "committedObservationSeq": 3,
+        "observationSeq": 4,
+        "credentialId": "synthetic-credential-1"
+      },
+      "receiptCanonicalUtf8": "{\"attachmentId\":\"efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092\",\"committed\":true,\"committedObservationSeq\":3,\"credentialId\":\"synthetic-credential-1\",\"disposition\":\"counter_reset\",\"kind\":\"usage\",\"observationSeq\":4,\"packetDigest\":\"d17f5de6e6f6bbf39710f985cccb4d3e91cd6c232a866e54de0b6ef75d6c11b9\",\"producerId\":\"synthetic-conductor-profile-1\",\"replayed\":false,\"schema\":\"codex.app-server.receipt.v1\",\"threadId\":\"11111111-1111-7111-8111-111111111111\"}",
+      "receiptSha256": "ab51dd93268ffe9fa25a1dad6aa6b18e3520bf39a847276119318781f391f8b0"
+    },
+    {
+      "name": "queue-gap-independent-case",
+      "packet": {
+        "schema": "codex.app-server.usage.v1",
+        "kind": "gap",
+        "attachmentId": "efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092",
+        "controlId": "4be7126d1820a75a3e507efe709e8b17ef3a68799a1f12153bb16dc47b6f453e",
+        "gapSeq": 1,
+        "lastObservedSeq": 3,
+        "threadId": "11111111-1111-7111-8111-111111111111",
+        "capturedAt": "2026-09-08T09:00:11.000Z",
+        "reason": "queue_overflow",
+        "producerId": "synthetic-conductor-profile-1",
+        "credentialId": "synthetic-credential-1"
+      },
+      "canonicalUtf8": "{\"attachmentId\":\"efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092\",\"capturedAt\":\"2026-09-08T09:00:11.000Z\",\"controlId\":\"4be7126d1820a75a3e507efe709e8b17ef3a68799a1f12153bb16dc47b6f453e\",\"credentialId\":\"synthetic-credential-1\",\"gapSeq\":1,\"kind\":\"gap\",\"lastObservedSeq\":3,\"producerId\":\"synthetic-conductor-profile-1\",\"reason\":\"queue_overflow\",\"schema\":\"codex.app-server.usage.v1\",\"threadId\":\"11111111-1111-7111-8111-111111111111\"}",
+      "sha256": "2a5ffabf0258821f109c353ca95d9de086d9aaba65079d97d941ce6fe46e34c5",
+      "bytes": 444,
+      "receipt": {
+        "schema": "codex.app-server.receipt.v1",
+        "producerId": "synthetic-conductor-profile-1",
+        "threadId": "11111111-1111-7111-8111-111111111111",
+        "attachmentId": "efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092",
+        "kind": "gap",
+        "packetDigest": "2a5ffabf0258821f109c353ca95d9de086d9aaba65079d97d941ce6fe46e34c5",
+        "disposition": "gap",
+        "replayed": false,
+        "committed": true,
+        "committedObservationSeq": 3,
+        "controlId": "4be7126d1820a75a3e507efe709e8b17ef3a68799a1f12153bb16dc47b6f453e",
+        "credentialId": "synthetic-credential-1"
+      },
+      "receiptCanonicalUtf8": "{\"attachmentId\":\"efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092\",\"committed\":true,\"committedObservationSeq\":3,\"controlId\":\"4be7126d1820a75a3e507efe709e8b17ef3a68799a1f12153bb16dc47b6f453e\",\"credentialId\":\"synthetic-credential-1\",\"disposition\":\"gap\",\"kind\":\"gap\",\"packetDigest\":\"2a5ffabf0258821f109c353ca95d9de086d9aaba65079d97d941ce6fe46e34c5\",\"producerId\":\"synthetic-conductor-profile-1\",\"replayed\":false,\"schema\":\"codex.app-server.receipt.v1\",\"threadId\":\"11111111-1111-7111-8111-111111111111\"}",
+      "receiptSha256": "6b1379601d7082aedaeeb8b7b312b86c6fd3ac80983e9c272d50e03f2693731a"
+    },
+    {
+      "name": "malformed-usable-thread-gap",
+      "packet": {
+        "schema": "codex.app-server.usage.v1",
+        "kind": "gap",
+        "attachmentId": "efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092",
+        "controlId": "4be7126d1820a75a3e507efe709e8b17ef3a68799a1f12153bb16dc47b6f453e",
+        "gapSeq": 1,
+        "lastObservedSeq": 4,
+        "threadId": "11111111-1111-7111-8111-111111111111",
+        "capturedAt": "2026-09-08T09:00:11.000Z",
+        "reason": "invalid_notification",
+        "producerId": "synthetic-conductor-profile-1",
+        "credentialId": "synthetic-credential-1"
+      },
+      "canonicalUtf8": "{\"attachmentId\":\"efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092\",\"capturedAt\":\"2026-09-08T09:00:11.000Z\",\"controlId\":\"4be7126d1820a75a3e507efe709e8b17ef3a68799a1f12153bb16dc47b6f453e\",\"credentialId\":\"synthetic-credential-1\",\"gapSeq\":1,\"kind\":\"gap\",\"lastObservedSeq\":4,\"producerId\":\"synthetic-conductor-profile-1\",\"reason\":\"invalid_notification\",\"schema\":\"codex.app-server.usage.v1\",\"threadId\":\"11111111-1111-7111-8111-111111111111\"}",
+      "sha256": "a62e1248d5491e9432adad840e14c1dae02dfdd2ef023b343693f27350991d26",
+      "bytes": 450,
+      "receipt": {
+        "schema": "codex.app-server.receipt.v1",
+        "producerId": "synthetic-conductor-profile-1",
+        "threadId": "11111111-1111-7111-8111-111111111111",
+        "attachmentId": "efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092",
+        "kind": "gap",
+        "packetDigest": "a62e1248d5491e9432adad840e14c1dae02dfdd2ef023b343693f27350991d26",
+        "disposition": "gap",
+        "replayed": false,
+        "committed": true,
+        "committedObservationSeq": 3,
+        "controlId": "4be7126d1820a75a3e507efe709e8b17ef3a68799a1f12153bb16dc47b6f453e",
+        "credentialId": "synthetic-credential-1"
+      },
+      "receiptCanonicalUtf8": "{\"attachmentId\":\"efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092\",\"committed\":true,\"committedObservationSeq\":3,\"controlId\":\"4be7126d1820a75a3e507efe709e8b17ef3a68799a1f12153bb16dc47b6f453e\",\"credentialId\":\"synthetic-credential-1\",\"disposition\":\"gap\",\"kind\":\"gap\",\"packetDigest\":\"a62e1248d5491e9432adad840e14c1dae02dfdd2ef023b343693f27350991d26\",\"producerId\":\"synthetic-conductor-profile-1\",\"replayed\":false,\"schema\":\"codex.app-server.receipt.v1\",\"threadId\":\"11111111-1111-7111-8111-111111111111\"}",
+      "receiptSha256": "06030f09c752414ace0f1e6936a310e7a38bede48e0e72df436c715f6306f7dc",
+      "note": "Independent receiver branch; do not append this control after a different control with the same identity."
+    },
+    {
+      "name": "failed-start-candidate-gap",
+      "packet": {
+        "schema": "codex.app-server.usage.v1",
+        "kind": "gap",
+        "attachmentId": "efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092",
+        "controlId": "4be7126d1820a75a3e507efe709e8b17ef3a68799a1f12153bb16dc47b6f453e",
+        "gapSeq": 1,
+        "lastObservedSeq": 1,
+        "threadId": "11111111-1111-7111-8111-111111111111",
+        "capturedAt": "2026-09-08T09:00:11.000Z",
+        "reason": "attachment_changed",
+        "producerId": "synthetic-conductor-profile-1",
+        "credentialId": "synthetic-credential-1"
+      },
+      "canonicalUtf8": "{\"attachmentId\":\"efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092\",\"capturedAt\":\"2026-09-08T09:00:11.000Z\",\"controlId\":\"4be7126d1820a75a3e507efe709e8b17ef3a68799a1f12153bb16dc47b6f453e\",\"credentialId\":\"synthetic-credential-1\",\"gapSeq\":1,\"kind\":\"gap\",\"lastObservedSeq\":1,\"producerId\":\"synthetic-conductor-profile-1\",\"reason\":\"attachment_changed\",\"schema\":\"codex.app-server.usage.v1\",\"threadId\":\"11111111-1111-7111-8111-111111111111\"}",
+      "sha256": "03742ab084ce1e0de43c2f5ff1cb1c366bb086753b6f434216c89daccfd7f30e",
+      "bytes": 448,
+      "receipt": {
+        "schema": "codex.app-server.receipt.v1",
+        "producerId": "synthetic-conductor-profile-1",
+        "threadId": "11111111-1111-7111-8111-111111111111",
+        "attachmentId": "efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092",
+        "kind": "gap",
+        "packetDigest": "03742ab084ce1e0de43c2f5ff1cb1c366bb086753b6f434216c89daccfd7f30e",
+        "disposition": "gap",
+        "replayed": false,
+        "committed": true,
+        "committedObservationSeq": 1,
+        "controlId": "4be7126d1820a75a3e507efe709e8b17ef3a68799a1f12153bb16dc47b6f453e",
+        "credentialId": "synthetic-credential-1"
+      },
+      "receiptCanonicalUtf8": "{\"attachmentId\":\"efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092\",\"committed\":true,\"committedObservationSeq\":1,\"controlId\":\"4be7126d1820a75a3e507efe709e8b17ef3a68799a1f12153bb16dc47b6f453e\",\"credentialId\":\"synthetic-credential-1\",\"disposition\":\"gap\",\"kind\":\"gap\",\"packetDigest\":\"03742ab084ce1e0de43c2f5ff1cb1c366bb086753b6f434216c89daccfd7f30e\",\"producerId\":\"synthetic-conductor-profile-1\",\"replayed\":false,\"schema\":\"codex.app-server.receipt.v1\",\"threadId\":\"11111111-1111-7111-8111-111111111111\"}",
+      "receiptSha256": "f9de41b6534f459e2f490c5ffbdfe8a87a80f3b586ae14d8e338233a7959de0a",
+      "note": "Independent receiver branch; do not append this control after a different control with the same identity."
+    },
+    {
+      "name": "whole-interval-crosses-authority-window",
+      "packet": {
+        "schema": "codex.app-server.usage.v1",
+        "kind": "usage",
+        "attachmentId": "efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092",
+        "observationSeq": 2,
+        "previousDigest": "89760230cc706cd8174d42197224c01c36b395d6e6a5eaec37a7991c3f15f215",
+        "threadId": "11111111-1111-7111-8111-111111111111",
+        "turnId": "22222222-2222-7222-8222-222222222222",
+        "capturedAt": "2026-09-08T09:00:05.000Z",
+        "total": {
+          "inputTokens": 100,
+          "cachedInputTokens": 40,
+          "cacheWriteInputTokens": 10,
+          "outputTokens": 20,
+          "reasoningOutputTokens": 5,
+          "totalTokens": 120
+        },
+        "producerId": "synthetic-conductor-profile-1",
+        "credentialId": "synthetic-credential-1"
+      },
+      "canonicalUtf8": "{\"attachmentId\":\"efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092\",\"capturedAt\":\"2026-09-08T09:00:05.000Z\",\"credentialId\":\"synthetic-credential-1\",\"kind\":\"usage\",\"observationSeq\":2,\"previousDigest\":\"89760230cc706cd8174d42197224c01c36b395d6e6a5eaec37a7991c3f15f215\",\"producerId\":\"synthetic-conductor-profile-1\",\"schema\":\"codex.app-server.usage.v1\",\"threadId\":\"11111111-1111-7111-8111-111111111111\",\"total\":{\"cacheWriteInputTokens\":10,\"cachedInputTokens\":40,\"inputTokens\":100,\"outputTokens\":20,\"reasoningOutputTokens\":5,\"totalTokens\":120},\"turnId\":\"22222222-2222-7222-8222-222222222222\"}",
+      "sha256": "86714253977e3bfee52bfa7358a3571ad7c2b6997f82ea9ffca827776232ccb3",
+      "bytes": 601,
+      "receipt": {
+        "schema": "codex.app-server.receipt.v1",
+        "producerId": "synthetic-conductor-profile-1",
+        "threadId": "11111111-1111-7111-8111-111111111111",
+        "attachmentId": "efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092",
+        "kind": "usage",
+        "packetDigest": "86714253977e3bfee52bfa7358a3571ad7c2b6997f82ea9ffca827776232ccb3",
+        "disposition": "stored",
+        "replayed": false,
+        "committed": true,
+        "committedObservationSeq": 2,
+        "observationSeq": 2,
+        "credentialId": "synthetic-credential-1"
+      },
+      "receiptCanonicalUtf8": "{\"attachmentId\":\"efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092\",\"committed\":true,\"committedObservationSeq\":2,\"credentialId\":\"synthetic-credential-1\",\"disposition\":\"stored\",\"kind\":\"usage\",\"observationSeq\":2,\"packetDigest\":\"86714253977e3bfee52bfa7358a3571ad7c2b6997f82ea9ffca827776232ccb3\",\"producerId\":\"synthetic-conductor-profile-1\",\"replayed\":false,\"schema\":\"codex.app-server.receipt.v1\",\"threadId\":\"11111111-1111-7111-8111-111111111111\"}",
+      "receiptSha256": "e1773d7c3e8394ad8c88f594993e55348c1be45af04ec5464699b8d7c0fd9ef1",
+      "expectedEventId": "codex-live:55c395c42ddb4d03309583cd364da331810414ce0474bee8b76d9c97f0b55ab6",
+      "expectedDelta": {
+        "inputTokens": 100,
+        "cachedInputTokens": 40,
+        "cacheWriteInputTokens": 10,
+        "outputTokens": 20,
+        "reasoningOutputTokens": 5,
+        "totalTokens": 120
+      },
+      "context": {
+        "predecessorCapturedAt": "2026-09-08T09:00:00.000Z",
+        "bindingA": {
+          "validFrom": "2026-09-08T08:00:00.000Z",
+          "validUntil": "2026-09-08T09:00:00.500Z"
+        },
+        "bindingB": {
+          "validFrom": "2026-09-08T09:00:00.500Z",
+          "validUntil": null
+        }
+      },
+      "expectedAttribution": "unresolved",
+      "expectedFinanceEligibility": "unqualified_observer",
+      "note": "Same packet in independent receiver state; no endpoint-only assignment to B."
+    },
+    {
+      "name": "old-credential-packet-under-new-credential",
+      "packet": {
+        "schema": "codex.app-server.usage.v1",
+        "kind": "usage",
+        "attachmentId": "efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092",
+        "observationSeq": 1,
+        "previousDigest": null,
+        "threadId": "11111111-1111-7111-8111-111111111111",
+        "turnId": "22222222-2222-7222-8222-222222222222",
+        "capturedAt": "2026-09-08T09:00:00.000Z",
+        "total": {
+          "inputTokens": 0,
+          "cachedInputTokens": 0,
+          "cacheWriteInputTokens": 0,
+          "outputTokens": 0,
+          "reasoningOutputTokens": 0,
+          "totalTokens": 0
+        },
+        "producerId": "synthetic-conductor-profile-1",
+        "credentialId": "synthetic-credential-1"
+      },
+      "canonicalUtf8": "{\"attachmentId\":\"efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092\",\"capturedAt\":\"2026-09-08T09:00:00.000Z\",\"credentialId\":\"synthetic-credential-1\",\"kind\":\"usage\",\"observationSeq\":1,\"previousDigest\":null,\"producerId\":\"synthetic-conductor-profile-1\",\"schema\":\"codex.app-server.usage.v1\",\"threadId\":\"11111111-1111-7111-8111-111111111111\",\"total\":{\"cacheWriteInputTokens\":0,\"cachedInputTokens\":0,\"inputTokens\":0,\"outputTokens\":0,\"reasoningOutputTokens\":0,\"totalTokens\":0},\"turnId\":\"22222222-2222-7222-8222-222222222222\"}",
+      "sha256": "89760230cc706cd8174d42197224c01c36b395d6e6a5eaec37a7991c3f15f215",
+      "bytes": 532,
+      "receipt": {
+        "schema": "codex.app-server.receipt.v1",
+        "producerId": "synthetic-conductor-profile-1",
+        "threadId": "11111111-1111-7111-8111-111111111111",
+        "attachmentId": "efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092",
+        "kind": "usage",
+        "packetDigest": "89760230cc706cd8174d42197224c01c36b395d6e6a5eaec37a7991c3f15f215",
+        "disposition": "enrollment_rejected",
+        "replayed": false,
+        "committed": false,
+        "committedObservationSeq": null,
+        "observationSeq": 1,
+        "credentialId": "synthetic-credential-1"
+      },
+      "receiptCanonicalUtf8": "{\"attachmentId\":\"efd56f333161aa936ce937acfd30df362ed1f967f778a3f5401930af6d370092\",\"committed\":false,\"committedObservationSeq\":null,\"credentialId\":\"synthetic-credential-1\",\"disposition\":\"enrollment_rejected\",\"kind\":\"usage\",\"observationSeq\":1,\"packetDigest\":\"89760230cc706cd8174d42197224c01c36b395d6e6a5eaec37a7991c3f15f215\",\"producerId\":\"synthetic-conductor-profile-1\",\"replayed\":false,\"schema\":\"codex.app-server.receipt.v1\",\"threadId\":\"11111111-1111-7111-8111-111111111111\"}",
+      "receiptSha256": "33bace0a7f867d87cccb969ab7f2ba8d9538c4aad0eeafcf4f6b627060b6827f",
+      "authenticatedContext": {
+        "producerId": "synthetic-conductor-profile-1",
+        "credentialId": "synthetic-credential-2"
+      },
+      "note": "No old-context checkpoint lookup or event under the replacement credential; echoed packet identity is a refusal only."
+    }
+  ],
+  "notes": [
+    "Synthetic only. Independent branches are explicitly named; repeated packet/control identity across independent cases is not an instruction to run them in one ledger.",
+    "Wire packets and receipts carry producerId and credentialId. A credential-only rotation preserves logical producer but starts fresh boot/attachment at idle restart.",
+    "Use these fixtures for canonicalization and protocol expectations, not as proof of callback, HTTP/SQLite, privacy, authentication or native behavior."
+  ]
+}

@@ -1,6 +1,6 @@
 import { buildWorkspaceEconomics } from "../../shared/src/economics/service";
 import { usageFactFromEvent } from "../../shared/src/economics/event-adapter";
-import type { Period } from "../../shared/src/economics/contracts";
+import type { Period,UsageFact } from "../../shared/src/economics/contracts";
 import Database from "better-sqlite3";
 
 import type { CollectorConfig } from "./config";
@@ -672,13 +672,13 @@ export function collectSessionProjectAllocations(ledger: Database.Database, inpu
   }
   const limit = Math.min(10000, input.limit ?? 10000);
   const columns = new Set((ledger.prepare("pragma table_info(dashboard_event_facts)").all() as Array<{name:string}>).map(row => row.name));
-  if (!["workspace_id", "raw_rowid", "raw_generation", "observed_at_ms", "project_key", "cost_kind"].every(name => columns.has(name))) {
+  if (!["workspace_id", "raw_rowid", "raw_generation", "observed_at_ms", "project_key", "cost_kind", "event_type", "live_usage_json"].every(name => columns.has(name))) {
     const unavailable = buildWorkspaceEconomics({ ...input, events: [], complete: false, observedThrough: null });
     unavailable.evidenceGaps.push("usage_projection_unavailable");
     return unavailable;
   }
   const eligibility = terminalPrivacyEligibilitySql(ledger, "e");
-  const rows = ledger.prepare(`select e.id, e.source, e.session_id as sessionId,
+  const rows = ledger.prepare(`select e.id, e.source, f.event_type as eventType, e.session_id as sessionId,
     f.observed_at_ms as observedAtMs, e.created_at as receivedAt, e.model,
     coalesce(f.project_key,f.repo_hash) as projectKey, e.account_hash as accountId,
     f.input_tokens as inputTokens, f.output_tokens as outputTokens,
@@ -687,10 +687,12 @@ export function collectSessionProjectAllocations(ledger: Database.Database, inpu
     from dashboard_event_facts f join buffered_events e
       on e.rowid = f.raw_rowid and e.privacy_generation = f.raw_generation
     where f.workspace_id = ? and e.workspace_id = ? and ${eligibility}
-      and f.observed_at_ms >= ? and f.observed_at_ms < ?
+      and f.observed_at_ms >= ? and (f.observed_at_ms < ? or
+        (f.event_type = 'usage_live' and case when json_valid(f.live_usage_json)
+          then json_extract(f.live_usage_json,'$.intervalStart') < ? else 0 end))
     order by f.observed_at_ms, f.projection_id limit ?`)
-    .all(input.tenantId, input.tenantId, Date.parse(input.period.start), Date.parse(input.period.end), limit + 1) as Array<{
-      id: string; source: string; sessionId: string | null; observedAtMs: number; receivedAt: string;
+    .all(input.tenantId, input.tenantId, Date.parse(input.period.start), Date.parse(input.period.end), input.period.end, limit + 1) as Array<{
+      id: string; source: string; eventType: string; sessionId: string | null; observedAtMs: number; receivedAt: string;
       model: string | null; projectKey: string | null; accountId: string | null;
       inputTokens: number | null; outputTokens: number | null; cacheReadTokens: number | null;
       cacheCreationTokens: number | null; costUsd: number | null; costKind: string | null; payload: string;
@@ -704,6 +706,15 @@ export function collectSessionProjectAllocations(ledger: Database.Database, inpu
       observedAt: new Date(row.observedAtMs).toISOString(), receivedAt: new Date(row.receivedAt).toISOString(),
       metadata: { ...metadata, ...(row.costKind ? { costKind: row.costKind } : {}) } });
   });
+  let retainedTruncated=false;
+  if(ledger.prepare(`select 1 from sqlite_master where type='table' and name='dashboard_live_usage_retained'`).get()) {
+    const retained=ledger.prepare(`select usage_fact_json as fact from dashboard_live_usage_retained
+      where workspace_id=? and observed_at_ms>=? and (observed_at_ms<? or interval_start<?)
+      order by observed_at_ms,event_id limit ?`).all(input.tenantId,Date.parse(input.period.start),
+      Date.parse(input.period.end),input.period.end,limit-events.length+1) as Array<{fact:string}>;
+    retainedTruncated=retained.length>limit-events.length;
+    for(const row of retained.slice(0,limit-events.length)) events.push(JSON.parse(row.fact) as UsageFact);
+  }
   // A bounded retained-raw view cannot prove the configured-root denominator.
-  return buildWorkspaceEconomics({ ...input, events, complete: false, observedThrough: null, truncated: rows.length > limit });
+  return buildWorkspaceEconomics({ ...input, events, complete: false, observedThrough: null, truncated: rows.length > limit||retainedTruncated });
 }

@@ -1,4 +1,5 @@
 /** Metadata-only economics boundary. Finance records enter only through an attested adapter. */
+import type { LiveUsageObservation } from "../live-usage-metadata";
 export const ECONOMICS_SCHEMA_VERSION="plimsoll.workspace-economics.v1" as const;
 export type Period={
   start: string;
@@ -20,6 +21,8 @@ export type UsageFact=UsageAmounts&{
   sourceVersion: string;
   schemaVersion: string;
   observedAt: string;
+  /** Entire cumulative-counter observation interval; never a completion timestamp. */
+  observedInterval?: LiveUsageObservation | null;
   receivedAt: string;
   timePrecision: "millisecond"|"second"|"unknown";
   nativeSessionId: string|null;

@@ -1,3 +1,4 @@
+import { ensureJsonlContinuationStore, readJsonlContinuation, ContinuationAdmission, retireJsonlContinuations } from "./jsonl-continuation";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -119,6 +120,12 @@ export type RolloutScanResult = {
   recordsParsed: number;
   /** Complete records included in successful cursor transactions. */
   recordsCommitted?: number;
+  continuationBytesAdvanced?: number;
+  prefixVerificationBytesRead?: number;
+  continuationRefusals?: number;
+  continuationReasons?: Record<string, number>;
+  insufficientBudgetCandidates?: number;
+  requiredMinimumBytes?: number;
   slicesCommitted: number;
   cooperativeYields: number;
   excludedGenerations: number;
@@ -401,6 +408,7 @@ export class RolloutTailer {
     this.captureRoots = validateCaptureRoots(captureRoots ?? []);
     if (this.captureRoots.some(root => root.source !== "codex")) throw new Error("capture_root_provider_mismatch");
     ensureJsonlScanState(this.buffer.database);
+    ensureJsonlContinuationStore(this.buffer.database);
   }
 
   close() {
@@ -465,6 +473,9 @@ export class RolloutTailer {
         truncated: false,
       },
     };
+    this.continuationAdmission.beginCadence();
+    retireJsonlContinuations(this.buffer.database, "codex", this.inventoryConfigured ? this.captureRoots : undefined,
+      performance.now() + Math.min(5, options.automatic?.budget.remainingWallMs() ?? 5));
     const rootCoverage = inspectCaptureRoots(this.captureRoots, scanNow);
     result.roots = rootCoverage;
     const rootErrors = rootCoverage.filter(root => root.state !== "ready").length;
@@ -853,6 +864,9 @@ export class RolloutTailer {
           queue = [];
           break;
         }
+        if (automatic && !this.continuationAdmission.allows(candidateHash)) {
+          consumeAutomaticFile(candidate.file); result.deferredGenerations += 1; continue;
+        }
         let cursor = candidate.cursor;
         let countedFile = candidate.countedFile;
         let pausedWithWork = false;
@@ -862,12 +876,25 @@ export class RolloutTailer {
             break;
           }
           const limits = automatic
-            ? automatic.budget.remainingSlice(cursor?.unresolvedRecord?.reason === "record_exceeds_byte_budget")
+            ? automatic.budget.remainingSlice()
             : { maxBytes: 128 * 1024, maxRecords: 64 };
           if (!limits) break;
           let read: NonNullable<ReturnType<JsonlTailerIo["readTail"]>>;
           try {
-            const next = this.io.readTail(candidate.file, candidate.stat, cursor, limits);
+            const root = rootForFile(this.captureRoots, candidate.file);
+            const next = readJsonlContinuation(candidate.file, candidate.stat, cursor, limits, this.io, {
+              database: this.buffer.database, provider: "codex", cursorKey: this.cursorKey(candidate.file), root: root ?? undefined,
+              directory: root?.directory ?? this.sessionsDir,
+              deadline: performance.now() + (automatic?.budget.remainingWallMs() ?? 200),
+              eligible: () => {
+                if (options.signal?.aborted) return false;
+                if (this.inventoryConfigured && !root) return false;
+                if (automatic?.phase !== "capture") return true;
+                const fresh = this.regularFileStat(candidate.file);
+                return classifyCaptureBaselineFile(this.buffer.database, "codex", baselineObservation(candidate.file, fresh),
+                  {mode:"automatic", observedAt:scanNow.toISOString()}).decision === "capture";
+              },
+            });
             if (!next) {
               // A stable no-more-data observation is terminal for this
               // discovery candidate even though no cursor write is needed.
@@ -882,7 +909,7 @@ export class RolloutTailer {
             consumeAutomaticFile(candidate.file);
             break;
           }
-          if (!countedFile) {
+          if (!countedFile && (read.continuation?.action !== "park" || read.bytesRead > 0)) {
             result.filesRead += 1;
             countedFile = true;
           }
@@ -892,14 +919,32 @@ export class RolloutTailer {
           if (read.legacyRebuild) result.legacyRebuilds += 1;
           if (read.checkpointRebuild) result.checkpointRebuilds += 1;
 
+          if (read.continuation?.reason) {
+            if (["malformed_json", "invalid_utf8", "newline_before_end"].includes(read.continuation.reason)) result.parseErrors += 1;
+            result.continuationReasons ??= {};
+            result.continuationReasons[read.continuation.reason] = (result.continuationReasons[read.continuation.reason] ?? 0) + 1;
+          }
+          result.prefixVerificationBytesRead = (result.prefixVerificationBytesRead ?? 0) + (read.continuation?.prefixBytesRead ?? 0);
+          if (read.continuation?.action === "park") {
+            result.continuationRefusals = (result.continuationRefusals ?? 0) + 1;
+            result.unresolvedRecords += 1;
+            if (read.continuation.reason === "insufficient_budget") {
+              if (automatic) this.continuationAdmission.park(candidateHash);
+              result.insufficientBudgetCandidates = (result.insufficientBudgetCandidates ?? 0) + 1;
+              result.requiredMinimumBytes = Math.max(result.requiredMinimumBytes ?? 0, read.continuation.requiredMinimumBytes ?? 0);
+            }
+            automatic?.budget.recordSlice({bytesRead:read.bytesRead, recordsParsed:0, eventsAppended:0});
+            read.close(); consumeAutomaticFile(candidate.file); break;
+          }
           const before = resultMutationSnapshot(result);
+          const activeRootBefore = this.activeCaptureRoot;
           let parseFailure = false;
           let committed = false;
           let validationDeferred = false;
           try {
             const initialState = read.reset || !cursor?.parserState
               ? this.initialParserState(candidate.file)
-              : cursor.parserState;
+              : structuredClone(cursor.parserState);
             // Git work is deferred until after capture. Validate the open
             // generation immediately before the event/cursor transaction so a
             // changed source never advances durable truth.
@@ -911,6 +956,13 @@ export class RolloutTailer {
             const fallbackObservedAt = this.fallbackObservedAt(read.mtimeMs);
             read.assertStableForCommit();
             this.buffer.transactionWithRepoContextHandoffs(() => {
+              if (read.continuation?.action === "checkpoint") {
+                read.continuation.applyCheckpoint();
+                return;
+              }
+              // Deletion and provider writes share this transaction. Failure
+              // restores the envelope as well as cursor/events/outbox/handoffs.
+              read.continuation?.remove();
               if (read.unresolvedRecord) {
                 rememberJsonlScanCursor(
                   this.buffer.database,
@@ -944,6 +996,12 @@ export class RolloutTailer {
               );
             });
             committed = true;
+            if (read.lines.length || read.continuation?.scanBytesAdvanced) this.continuationAdmission.progressed(candidateHash);
+            result.continuationBytesAdvanced = (result.continuationBytesAdvanced ?? 0) + (read.continuation?.scanBytesAdvanced ?? 0);
+            if (read.continuation?.reason) {
+              result.continuationRefusals = (result.continuationRefusals ?? 0) + 1;
+              result.unresolvedRecords += 1;
+            }
             if (automatic && (read.workRemaining ||
                 (read.unresolvedRecord?.reason === "record_exceeds_byte_budget" &&
                  read.unresolvedRecord.byteBudget < automatic.budget.status().maxBytes))) {
@@ -955,6 +1013,7 @@ export class RolloutTailer {
             result.slicesCommitted += 1;
             if (read.unresolvedRecord) result.unresolvedRecords += 1;
           } catch {
+            this.activeCaptureRoot = activeRootBefore;
             const parseErrors = result.parseErrors - before.parseErrors;
             restoreResultMutationSnapshot(result, before);
             if (parseFailure) {
@@ -977,7 +1036,8 @@ export class RolloutTailer {
           });
           if (committed) lastServedRotationKey = rotationKeyOf(candidate);
           const moreWork =
-            committed && !read.unresolvedRecord && !parseFailure && read.workRemaining;
+            committed && !read.unresolvedRecord && !parseFailure && read.workRemaining &&
+            (!read.continuation || read.continuation.action === "complete" || read.bytesRead > 0);
           if (!moreWork) break;
           if (automatic) {
             // One bounded slice is this generation's quantum for the turn.
@@ -1116,6 +1176,8 @@ export class RolloutTailer {
       this.captureAttempt = null;
     }
   }
+
+  private readonly continuationAdmission = new ContinuationAdmission();
 
   private regularFileStat(file: string) {
     const metadata = this.io.lstat(file);
