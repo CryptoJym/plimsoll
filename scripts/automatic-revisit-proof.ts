@@ -12,8 +12,9 @@ import { captureBaselineStatus } from "../packages/collector-cli/src/capture-bas
 import { AUTOMATIC_CAPTURE_LIMITS } from "../packages/collector-cli/src/capture-work-budget";
 import { DEFAULT_JSONL_TAILER_IO, jsonlScanStateKey, readJsonlTail } from "../packages/collector-cli/src/jsonl-byte-tailer";
 import { rootCursorKey, type CaptureRoot } from "../packages/collector-cli/src/capture-root-inventory";
+import { maintenanceCandidateHash } from "../packages/collector-cli/src/maintenance-progress";
 
-type Visit = { cadence: number; offset: number; deferred: number };
+type Visit = { cadence: number; offset: number; deferred: number; retained?: boolean };
 async function prove(source: CaptureRoot["source"]) {
   const base = fs.mkdtempSync(path.join(fs.realpathSync(process.env.PLIMSOLL_PROOF_HOME ?? os.tmpdir()), "revisit-"));
   const directories: Array<{ source: CaptureRoot["source"]; directory: string }> = [];
@@ -57,9 +58,11 @@ async function prove(source: CaptureRoot["source"]) {
   const restart = () => { maintenance.close(); buffer.close();
     buffer = new LocalEventBuffer(path.join(base, "ledger.sqlite"), bufferOptions); maintenance = make(); };
   const cadences: any[] = [];
+  let watchedCandidateHash: string | null = null;
   const run = async (phase: string) => {
     let frames = 0, lastKey = "";
     let sourceAdmission: { frames: number; remainingMs: number } | null = null;
+    const candidateAdmissions: Array<{ stage: string; admitted: boolean }> = [];
     const result = await maintenance.runRecent({
       onDurableCommit: () => frames < 120 ? (++frames, true) : false,
       onProgress: p => {
@@ -67,11 +70,16 @@ async function prove(source: CaptureRoot["source"]) {
           const budget = maintenance.status().budget!;
           sourceAdmission = { frames, remainingMs: budget.maxWallMs - budget.elapsedWallMs };
         }
-        const key = `${p.source}:${p.stage}:${p.candidateHash ?? "none"}`;
-        if (p.stage !== "git_context" && key === lastKey) return true;
-        if (p.stage === "jsonl_open" && frames >= 118) return false;
-        if (frames >= ((p.stage === "source_scan" || p.stage === "jsonl_validation") ? 120 : 112)) return false;
-        frames++; lastKey = key; return true;
+        const admitted = (() => {
+          const key = `${p.source}:${p.stage}:${p.candidateHash ?? "none"}`;
+          if (p.stage !== "git_context" && key === lastKey) return true;
+          if (p.stage === "jsonl_open" && frames >= 118) return false;
+          if (frames >= ((p.stage === "source_scan" || p.stage === "jsonl_validation") ? 120 : 112)) return false;
+          frames++; lastKey = key; return true;
+        })();
+        if (watchedCandidateHash !== null && p.candidateHash === watchedCandidateHash)
+          candidateAdmissions.push({ stage: p.stage, admitted });
+        return admitted;
       },
     });
     const summary = (r: typeof result.rollout | typeof result.transcript) => ({ bytesRead: r.bytesRead, recordsParsed: r.recordsParsed,
@@ -83,7 +91,7 @@ async function prove(source: CaptureRoot["source"]) {
     assert(pending.every(p => p.length <= 64));
     assert(budget.bytesRead <= 524288 && budget.recordsParsed <= 512 && budget.eventsAppended <= 512);
     assert(budget.maxWallMs === 200);
-    cadences.push({ phase, frames, sourceAdmission, pending, codex: summary(result.rollout),
+    cadences.push({ phase, frames, sourceAdmission, candidateAdmissions, pending, codex: summary(result.rollout),
       claude: summary(result.transcript), budget });
     return source === "codex" ? result.rollout : result.transcript;
   };
@@ -103,6 +111,7 @@ async function prove(source: CaptureRoot["source"]) {
     const fileAt = (root: CaptureRoot, name: string) => path.join(root.directory,
       ...(source === "codex" ? dateParts : ["project"]), `rollout-${name}.jsonl`);
     const target = fileAt(providerRoots.at(-1)!, session);
+    watchedCandidateHash = maintenanceCandidateHash(target);
     const usage = (tokens: number, id = session, padding = 0) => source === "codex"
       ? { type: "event_msg", timestamp: at, payload: { type: "token_count", info: {
         total_token_usage: { input_tokens: tokens, cached_input_tokens: 0, output_tokens: 0, reasoning_output_tokens: 0 },
@@ -116,7 +125,9 @@ async function prove(source: CaptureRoot["source"]) {
     const large = (bytes: number) => ({ type: "event_msg", timestamp: at, payload: {
       type: "user_message", message: "SYNTHETIC_BODY_" + "x".repeat(bytes) } });
     const encode = (lines: unknown[]) => lines.map(line => JSON.stringify(line)).join("\n") + "\n";
-    fs.writeFileSync(target, encode([...prefix(session), large(350 * 1024), ...Array.from({ length: 300 }, (_, i) => usage(i + 1))]));
+    // More than five cadence byte allowances makes partial retries observable
+    // even on fast runners, without depending on the cooperative wall clock.
+    fs.writeFileSync(target, encode([...prefix(session), large(350 * 1024), ...Array.from({ length: 300 }, (_, i) => usage(i + 1, session, 8192))]));
     let sawUnresolved = false, sawLargerRetry = false, prior = 0, restartDone = false;
     const visits: Visit[] = [];
     let partialAppends = 0, pendingAppend: { offset: number; attempts: number } | null = null;
@@ -130,7 +141,8 @@ async function prove(source: CaptureRoot["source"]) {
         appendRevisits.push({ before: pendingAppend.offset, after: c?.committed_offset ?? 0, errors: result.readErrors });
         pendingAppend = null;
       }
-      if (result.filesRead > 0) visits.push({ cadence: turn, offset: c?.committed_offset ?? 0, deferred: c?.deferred_bytes ?? 0 });
+      if (result.filesRead > 0) visits.push({ cadence: turn, offset: c?.committed_offset ?? 0, deferred: c?.deferred_bytes ?? 0,
+        retained: cadences.at(-1).pending.flat().some((p: any) => p.file === path.relative(base, target) && p.servicedCadences > 0) });
       sawUnresolved ||= c?.unresolved_kind === "record_exceeds_byte_budget";
       sawLargerRetry ||= result.bytesRead > 65536;
       if (c) { assert(c.committed_offset >= prior); prior = c.committed_offset; }
@@ -147,8 +159,13 @@ async function prove(source: CaptureRoot["source"]) {
       }
     }
     const advancing = visits.filter(v => v.offset > 1000);
-    check("eligible partial snapshot gets useful next-cadence progress", advancing.some((v, i) => i > 0 &&
-      advancing[i - 1]!.deferred > 0 && v.cadence === advancing[i - 1]!.cadence + 1 && v.offset > advancing[i - 1]!.offset));
+    const captureCadences = cadences.filter(c => c.phase === "capture");
+    const retainedPairs = advancing.slice(1).flatMap((next, i) =>
+      advancing[i]!.retained && advancing[i]!.deferred > 0 ? [{ prior: advancing[i]!, next }] : []);
+    check("eligible partial snapshot progresses at its next admitted cadence", retainedPairs.length >= 3 && retainedPairs.every(({ prior, next }) =>
+      next.offset > prior.offset && captureCadences.slice(prior.cadence + 1, next.cadence).every(c =>
+        c.candidateAdmissions.some((a: { admitted: boolean }) => !a.admitted) ||
+        (c.sourceAdmission === null && c.budget.exhausted))));
     check("between-cadence appends to retained partial snapshots progress on first retry", partialAppends === 3 && appendRevisits.length === 3 &&
       appendRevisits.every(r => r.after > r.before && r.errors === 0));
     const stat = fs.lstatSync(target, { bigint: true });
