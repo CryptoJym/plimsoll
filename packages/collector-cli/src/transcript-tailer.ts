@@ -99,6 +99,8 @@ export type TranscriptScanResult = {
   parseErrors: number;
   unresolvedRecords: number;
   recordsParsed: number;
+  /** Complete records included in successful cursor transactions. */
+  recordsCommitted?: number;
   slicesCommitted: number;
   cooperativeYields: number;
   excludedGenerations: number;
@@ -414,6 +416,7 @@ export class TranscriptTailer {
       parseErrors: 0,
       unresolvedRecords: 0,
       recordsParsed: 0,
+      recordsCommitted: 0,
       slicesCommitted: 0,
       cooperativeYields: 0,
       excludedGenerations: 0,
@@ -914,6 +917,7 @@ export class TranscriptTailer {
             } else {
               consumeAutomaticFile(candidate.file);
             }
+            result.recordsCommitted = (result.recordsCommitted ?? 0) + read.lines.length;
             result.slicesCommitted += 1;
             if (read.unresolvedRecord) result.unresolvedRecords += 1;
           } catch {

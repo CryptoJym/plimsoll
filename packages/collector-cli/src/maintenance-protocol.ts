@@ -347,6 +347,7 @@ export function projectMaintenanceResult(result: CollectorMaintenanceRunResult):
       rowsVisited: result.enrichment.rowsVisited,
     },
     rawEventWrites: result.rawEventWrites,
+    ...(typeof result.captureAdvanced === "boolean" ? { captureAdvanced: result.captureAdvanced } : {}),
     ...(result.stageTimings
       ? { stageTimings: projectMaintenanceStageTimings(result.stageTimings) }
       : {}),
@@ -364,9 +365,11 @@ function parseMaintenanceResult(value: unknown): MaintenanceRunOutcome | null {
       "repricing",
       "enrichment",
       "rawEventWrites",
+      ...(row.captureAdvanced === undefined ? [] : ["captureAdvanced"]),
       "stageTimings",
     ]) ||
-    row.recentOnly !== true || !count(row.rawEventWrites)) return null;
+    row.recentOnly !== true || !count(row.rawEventWrites) ||
+    (row.captureAdvanced !== undefined && typeof row.captureAdvanced !== "boolean")) return null;
   const stageTimings = parseMaintenanceStageTimings(row.stageTimings);
   if (!stageTimings) return null;
   const parseSource = (value: unknown) => {
@@ -399,6 +402,7 @@ function parseMaintenanceResult(value: unknown): MaintenanceRunOutcome | null {
     repricing: { repriced: Number(repricing.repriced), rowsVisited: Number(repricing.rowsVisited) },
     enrichment: { backward: Number(enrichment.backward), forward: Number(enrichment.forward), rowsVisited: Number(enrichment.rowsVisited) },
     rawEventWrites: Number(row.rawEventWrites),
+    ...(typeof row.captureAdvanced === "boolean" ? { captureAdvanced: row.captureAdvanced } : {}),
     stageTimings,
   };
 }
