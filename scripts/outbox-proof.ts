@@ -2755,10 +2755,11 @@ async function hookPromotionAdmissionProof() {
         .map((candidate) => fs.readFileSync(candidate)),
     ];
     // Recognized source/event literals are embedded in SQLite schema and
-    // projection SQL. Their supplied-value absence is already covered across
+    // projection SQL, including the retained-observer terminal privacy reasons.
+    // Their supplied-value absence is already covered across
     // all eight serialized surfaces; byte scans cover every distinctive term.
     const artifactValueTerms = valueTerms.filter(
-      (term) => !["openai_usage", "anthropic_usage", "manual", "assistant_response"].includes(term),
+      (term) => !["openai_usage", "anthropic_usage", "manual", "assistant_response", "evidence"].includes(term),
     );
     record(
       "production_hook_private_and_spoofed_authority_values_absent_from_ledger_artifacts",

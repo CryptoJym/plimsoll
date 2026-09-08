@@ -71,11 +71,16 @@ jobs:
           pnpm proof:dashboard-cdp
           pnpm proof:automatic-record-retry
           pnpm proof:automatic-revisit
+          pnpm proof:oversized-continuation
           PLIMSOLL_PROOF_HOME="$TMPDIR" pnpm proof:automatic-capture-cadence > evidence/automatic-capture-cadence-proof.json
           pnpm proof:automatic-retry-metadata
           pnpm proof:future-admission
           pnpm proof:child-identity
           pnpm proof:economics
+          pnpm proof:live-usage-metadata
+          pnpm proof:live-usage-projection
+          pnpm proof:codex-live-usage
+          pnpm proof:codex-live-reporting
           pnpm proof:finance-export
           pnpm proof:finance-projection
           pnpm proof:delivery

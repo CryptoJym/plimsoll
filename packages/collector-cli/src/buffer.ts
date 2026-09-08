@@ -1,3 +1,4 @@
+import { ensureCodexLiveUsageSchema, liveUsageAppendAllowed, liveUsageMetricAllowed } from "./codex-live-usage-ledger";
 import crypto from "node:crypto";
 import os from "node:os";
 
@@ -483,6 +484,7 @@ export class LocalEventBuffer {
     this.migrateEventColumns();
     this.migrateWorkspaceBindingColumns();
     ensureFinanceProvenanceSchema(this.db);
+    ensureCodexLiveUsageSchema(this.db);
     const bindingColumns = new Set(
       (this.db.pragma("table_info(collector_workspace_binding)") as Array<{ name: string }>)
         .map((column) => column.name),
@@ -2246,6 +2248,7 @@ export class LocalEventBuffer {
   }
 
   private appendInCurrentTransaction(event: AiInteractionEvent, suppressedFields: string[] = [], project = true) {
+    if (!liveUsageAppendAllowed(this.db, event)) return { appended: false, repoContextRequest: null };
     if (event.dataMode === "evidence") {
       throw new Error(
         "Raw evidence rows cannot be appended to the ordinary ledger; the encrypted evidence vault is not implemented.",
@@ -2782,6 +2785,7 @@ export class LocalEventBuffer {
 
   appendMetricSample(sample: MetricSample) {
     const run = () => {
+      if (!liveUsageMetricAllowed(this.db, sample)) return false;
       if (this.eventAdmissionReason(sample.observedAt)) return false;
       this.db
         .prepare(

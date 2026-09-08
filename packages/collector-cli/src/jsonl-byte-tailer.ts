@@ -41,6 +41,8 @@ export type JsonlUnresolvedRecord = {
 };
 
 export type JsonlTailReadLimits = {
+  beforeRead?(): void;
+  onBytesRead?(bytes: number): void;
   /** Total synchronous file-read budget, including bounded integrity probes. */
   maxBytes?: number;
   /** Maximum number of complete JSONL records returned in one slice. */
@@ -48,6 +50,7 @@ export type JsonlTailReadLimits = {
 };
 
 export type JsonlTailRead = {
+  continuation?: import("./jsonl-continuation").ContinuationProposal;
   lines: string[];
   observedSize: number;
   committedOffset: number;
@@ -499,6 +502,29 @@ export function readJsonlTail(
   let bytesRead = 0;
   let priorContinuity = Buffer.alloc(0);
   let headProbe = Buffer.alloc(0);
+  const assertStableForCommit = () => {
+    if (closed) throw new JsonlSnapshotChangedError();
+    let currentFd: fs.BigIntStats;
+    let currentPath: fs.BigIntStats;
+    try {
+      currentFd = fs.fstatSync(fd, { bigint: true });
+      currentPath = fs.lstatSync(file, { bigint: true });
+    } catch {
+      throw new JsonlSnapshotChangedError();
+    }
+    if (
+      currentPath.isSymbolicLink() ||
+      !currentPath.isFile() ||
+      !sameGenerationSnapshot(currentFd, snapshot) ||
+      !sameGenerationSnapshot(currentPath, snapshot)
+    ) {
+      throw new JsonlSnapshotChangedError();
+    }
+  };
+  const beforeSourceRead = () => {
+    limits.beforeRead?.();
+    assertStableForCommit();
+  };
   try {
     const opened = fs.fstatSync(fd);
     const openedPrecise = fs.fstatSync(fd, { bigint: true });
@@ -512,7 +538,7 @@ export function readJsonlTail(
       if (remaining < length) {
         throw new RangeError("maxBytes is too small for required JSONL integrity probes");
       }
-      const bytes = readAt(fd, length, position);
+      const bytes = readAt(fd, length, position, beforeSourceRead, limits.onBytesRead);
       bytesRead += bytes.length;
       return bytes;
     };
@@ -549,25 +575,6 @@ export function readJsonlTail(
         closed = true;
         fs.closeSync(fd);
       };
-      const assertStableForCommit = () => {
-        if (closed) throw new JsonlSnapshotChangedError();
-        let currentFd: fs.BigIntStats;
-        let currentPath: fs.BigIntStats;
-        try {
-          currentFd = fs.fstatSync(fd, { bigint: true });
-          currentPath = fs.lstatSync(file, { bigint: true });
-        } catch {
-          throw new JsonlSnapshotChangedError();
-        }
-        if (
-          currentPath.isSymbolicLink() ||
-          !currentPath.isFile() ||
-          !sameGenerationSnapshot(currentFd, snapshot) ||
-          !sameGenerationSnapshot(currentPath, snapshot)
-        ) {
-          throw new JsonlSnapshotChangedError();
-        }
-      };
       return {
         lines: [],
         observedSize,
@@ -599,7 +606,7 @@ export function readJsonlTail(
 
     const available = Math.max(0, observedSize - start);
     const contentBudget = Math.max(0, maxBytes - bytesRead);
-    const bytes = readAt(fd, Math.min(available, contentBudget), start);
+    const bytes = readAt(fd, Math.min(available, contentBudget), start, beforeSourceRead, limits.onBytesRead);
     bytesRead += bytes.length;
 
     const slice = truncateJsonlReadToCompleteRecords(bytes, maxRecords);
@@ -611,8 +618,7 @@ export function readJsonlTail(
     const lines =
       completeBytes.length === 0
         ? []
-        : completeBytes
-            .toString("utf8")
+        : new TextDecoder("utf-8", { fatal: true }).decode(completeBytes)
             .split("\n")
             .map((line) => (line.endsWith("\r") ? line.slice(0, -1) : line));
 
@@ -669,25 +675,6 @@ export function readJsonlTail(
       if (closed) return;
       closed = true;
       fs.closeSync(fd);
-    };
-    const assertStableForCommit = () => {
-      if (closed) throw new JsonlSnapshotChangedError();
-      let currentFd: fs.BigIntStats;
-      let currentPath: fs.BigIntStats;
-      try {
-        currentFd = fs.fstatSync(fd, { bigint: true });
-        currentPath = fs.lstatSync(file, { bigint: true });
-      } catch {
-        throw new JsonlSnapshotChangedError();
-      }
-      if (
-        currentPath.isSymbolicLink() ||
-        !currentPath.isFile() ||
-        !sameGenerationSnapshot(currentFd, snapshot) ||
-        !sameGenerationSnapshot(currentPath, snapshot)
-      ) {
-        throw new JsonlSnapshotChangedError();
-      }
     };
 
     return {
@@ -880,12 +867,14 @@ function newerScan(candidate: string, current: string) {
   return candidateTime > currentTime;
 }
 
-function readAt(fd: number, length: number, position: number) {
+function readAt(fd: number, length: number, position: number, beforeRead?: () => void, onBytesRead?: (bytes: number) => void) {
   if (length <= 0) return Buffer.alloc(0);
   const buffer = Buffer.allocUnsafe(length);
   let filled = 0;
   while (filled < length) {
+    beforeRead?.();
     const read = fs.readSync(fd, buffer, filled, length - filled, position + filled);
+    onBytesRead?.(read);
     if (read === 0) break;
     filled += read;
   }

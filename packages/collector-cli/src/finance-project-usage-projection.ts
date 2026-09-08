@@ -58,6 +58,7 @@ export type FinanceProjectionReason =
   | "INSTALLATION_SCOPE_UNPROVEN"
   | "UNSUPPORTED_REQUIRED_SOURCE"
   | "SOURCE_REVISION_UNBOUND"
+  | "OBSERVED_INTERVAL_UNQUALIFIED"
   | "CACHE_ONLY_USAGE_UNREPRESENTABLE"
   | "CACHE_USAGE_UNREPRESENTABLE"
   | "PROVENANCE_COVERAGE_UNAVAILABLE"
@@ -171,6 +172,7 @@ type ActivityRow = {
 };
 
 type ProjectionFactRow = {
+  eventType: string;
   projectionId: string;
   source: string;
   observedAtMs: unknown;
@@ -203,6 +205,7 @@ function addReason(reasons: Set<FinanceProjectionReason>, reason: FinanceProject
 }
 
 const COVERAGE_WATERMARK_BLOCKERS = new Set<FinanceProjectionReason>([
+  "OBSERVED_INTERVAL_UNQUALIFIED",
   "WORKSPACE_BINDING_UNPROVEN",
   "PROJECTION_SCHEMA_UNSUPPORTED",
   "PROJECTION_SNAPSHOT_UNAVAILABLE",
@@ -488,7 +491,7 @@ function readFacts(
 ): ProjectionFactRow[] {
   const placeholders = request.requiredSources.map(() => "?").join(",");
   const rows = database.prepare(
-    `select projection_id as projectionId, source,
+    `select projection_id as projectionId, source, event_type as eventType,
        observed_at_ms as observedAtMs, input_tokens as inputTokens,
        output_tokens as outputTokens, cache_read_tokens as cacheReadTokens,
        cache_creation_tokens as cacheCreationTokens, cost_nanos as costNanos,
@@ -498,7 +501,9 @@ function readFacts(
      from dashboard_event_facts
      where workspace_id = ? and installation_epoch_id = ?
        and source in (${placeholders})
-       and observed_at_ms >= ? and observed_at_ms < ?
+       and observed_at_ms >= ? and (observed_at_ms < ? or
+         (event_type='usage_live' and case when json_valid(live_usage_json)
+           then json_extract(live_usage_json,'$.intervalStart') < ? else 0 end))
        and (input_tokens is not null or output_tokens is not null
          or cache_read_tokens is not null or cache_creation_tokens is not null
          or cost_nanos is not null)
@@ -509,6 +514,7 @@ function readFacts(
     ...request.requiredSources,
     request.period.start.ms,
     request.period.end.ms,
+    request.period.end.iso,
   ) as ProjectionFactRow[];
   return rows;
 }
@@ -596,6 +602,12 @@ function recordFromFact(
   request: NormalizedRequest,
   reasons: Set<FinanceProjectionReason>,
 ): CostUsageRecord | null {
+  // This exclusion survives raw retention and missing or damaged interval markers.
+  // Observer deltas must never become synthetic one-millisecond Finance records.
+  if (row.eventType === "usage_live") {
+    addReason(reasons, "OBSERVED_INTERVAL_UNQUALIFIED");
+    return null;
+  }
   if (typeof row.projectionId !== "string" || !/^sha256:[a-f0-9]{64}$/.test(row.projectionId)) {
     reject("invalid_projection_identity");
   }
@@ -797,9 +809,9 @@ function readInTransaction(
     "singleton", "current_workspace_id", "current_installation_epoch_id",
   ]);
   const factSchema = hasColumns(database, "dashboard_event_facts", [
-    "projection_id", "source", "observed_at_ms", "input_tokens", "output_tokens",
+    "projection_id", "source", "event_type", "observed_at_ms", "input_tokens", "output_tokens",
     "cache_read_tokens", "cache_creation_tokens", "cost_nanos", "repo_hash", "project_key",
-    "cost_kind", "raw_generation", "workspace_id", "installation_epoch_id",
+    "cost_kind", "raw_generation", "workspace_id", "installation_epoch_id", "live_usage_json",
   ]);
   if (!bindingSchema || !factSchema) {
     addReason(reasons, "PROVENANCE_SCHEMA_UNSUPPORTED");
@@ -849,6 +861,18 @@ function readInTransaction(
     addReason(reasons, "UNSUPPORTED_REQUIRED_SOURCE");
   }
   readSourceHealth(database, request, control, reasons, sourceSnapshotParsed);
+  // Retained observations remain excluded even after their raw rows and ordinary
+  // dashboard facts expire. The native workspace/epoch scope is still required.
+  if (request.requiredSources.includes("codex") && request.nativeInstallationEpochId &&
+      hasColumns(database,"dashboard_live_usage_retained",["workspace_id","installation_epoch_id","observed_at_ms","interval_start"])) {
+    const retained=database.prepare(`select 1 from dashboard_live_usage_retained
+      where workspace_id=? and installation_epoch_id=? and observed_at_ms>=?
+        and (observed_at_ms<? or interval_start<?) limit 1`).get(
+      request.expectedWorkspaceId,request.nativeInstallationEpochId,request.period.start.ms,
+      request.period.end.ms,request.period.end.iso,
+    );
+    if(retained)addReason(reasons,"OBSERVED_INTERVAL_UNQUALIFIED");
+  }
 
   // Any current-workspace fact without its immutable privacy generation,
   // epoch, or millisecond timestamp makes the whole native result unusable.

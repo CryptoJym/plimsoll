@@ -930,7 +930,8 @@ export class CollectorMaintenance {
       enrichment,
       ...(drained ? { projection: drained.receipt, projectionDrain: drained.drain } : {}),
       rawEventWrites: rollout.eventsAppended + transcript.eventsAppended,
-      captureAdvanced: (rollout.recordsCommitted ?? 0) + (transcript.recordsCommitted ?? 0) > 0,
+      captureAdvanced: (rollout.recordsCommitted ?? 0) + (transcript.recordsCommitted ?? 0) +
+        (rollout.continuationBytesAdvanced ?? 0) + (transcript.continuationBytesAdvanced ?? 0) > 0,
       postCaptureDeferred,
       repairService,
       stageTimings: {
@@ -1279,7 +1280,8 @@ export class AutomaticMaintenanceCadence<
       repairBefore = this.options.repairProgress?.() ?? null;
       const results = await requestAutomaticRecentMaintenance(this.scheduler);
       // Preserve a short retry burst across discovery/frame deferrals. Only
-      // committed records renew it; idle, failed and oversized-only work stops.
+      // committed records or new durable scan bytes renew it; prefix rereads,
+      // refused/idle work and failed transactions cannot renew the burst.
       const captureAdvanced = results.some(result =>
         !isMaintenancePartialOutcome(result) && result.captureAdvanced === true);
       this.captureFollowups = captureAdvanced ? AUTOMATIC_CAPTURE_FOLLOWUPS
