@@ -37,6 +37,7 @@ import {
   rememberCaptureRotation,
   rotateAfterServed,
 } from "./capture-fairness";
+import { advanceAutomaticCaptureFiles, refreshAutomaticCaptureFile, type AutomaticCapturePendingFile } from "./automatic-capture-retry";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
 import { IncrementalJsonlDiscovery } from "./incremental-jsonl-discovery";
 import {
@@ -383,7 +384,7 @@ export class RolloutTailer {
   } | null = null;
   private captureAttempt: {
     discovery: IncrementalJsonlDiscovery;
-    pendingFiles: Array<{ file: string; stat: fs.Stats; precise: fs.BigIntStats }>;
+    pendingFiles: AutomaticCapturePendingFile[];
     discoveryDone: boolean;
   } | null = null;
 
@@ -693,7 +694,7 @@ export class RolloutTailer {
       : null;
     const explicitDiscovery = automatic ? null : this.discover(options);
     const discovery = automaticDiscovery ?? explicitDiscovery!;
-    const discoveredFiles: Array<{ file: string; stat?: fs.Stats; precise?: fs.BigIntStats }> = automaticDiscovery
+    const discoveredFiles: Array<{ file: string; stat?: fs.Stats; precise?: fs.BigIntStats; servicedCadences?: number }> = automaticDiscovery
       ? automaticDiscovery.files
       : explicitDiscovery!.files.map((file) => ({ file }));
     result.activity.truncated = discovery.truncated;
@@ -706,6 +707,7 @@ export class RolloutTailer {
       cursor: JsonlScanCursor<RolloutParserState> | undefined;
     }> = [];
     const automaticFilesConsumed = new Set<string>();
+    const automaticFilesPartial = new Set<string>();
     const consumeAutomaticFile = (file: string) => {
       if (automatic) automaticFilesConsumed.add(file);
     };
@@ -730,12 +732,18 @@ export class RolloutTailer {
         consumeAutomaticFile(file);
         continue;
       }
-      if (!discovered.stat && options.onProgress?.({ stage: "candidate_metadata", candidateHash }) === false) {
+      const refresh = Boolean(automatic && discovered.servicedCadences);
+      if ((!discovered.stat || refresh) && options.onProgress?.({ stage: "candidate_metadata", candidateHash }) === false) {
         result.deferredGenerations += discoveredFiles.length - index;
         break;
       }
       let stat: fs.Stats;
       try {
+        if (refresh && discovered.precise) {
+          const fresh = refreshAutomaticCaptureFile(file, discovered.precise, this.regularFileStat(file));
+          discovered.stat = fresh.stat;
+          discovered.precise = fresh.precise;
+        }
         stat = discovered.stat ?? this.regularFileStat(file);
       } catch {
         result.statErrors += 1;
@@ -933,9 +941,13 @@ export class RolloutTailer {
               );
             });
             committed = true;
-            // Only a durable cursor commit transfers ownership away from the
-            // active discovery attempt. Validation deferral keeps it pending.
-            consumeAutomaticFile(candidate.file);
+            if (automatic && (read.workRemaining ||
+                (read.unresolvedRecord?.reason === "record_exceeds_byte_budget" &&
+                 read.unresolvedRecord.byteBudget < automatic.budget.status().maxBytes))) {
+              automaticFilesPartial.add(candidate.file);
+            } else {
+              consumeAutomaticFile(candidate.file);
+            }
             result.slicesCommitted += 1;
             if (read.unresolvedRecord) result.unresolvedRecords += 1;
           } catch {
@@ -1000,7 +1012,7 @@ export class RolloutTailer {
     if (automatic && lastServedRotationKey) {
       rememberCaptureRotation(this.buffer.database, "codex", lastServedRotationKey);
     }
-    if (automatic) this.consumeAutomaticCaptureFiles(automaticFilesConsumed);
+    if (automatic) this.consumeAutomaticCaptureFiles(automaticFilesConsumed, automaticFilesPartial);
 
     // Deferred truth is computed once from durable cursors, never summed per
     // slice. Excluded generations are reported separately and are not fake
@@ -1069,10 +1081,13 @@ export class RolloutTailer {
     let entries = 0;
     let errors = 0;
     let truncated = false;
-    if (attempt.pendingFiles.length === 0 && !attempt.discoveryDone) {
+    // Unserviced candidates deferred by the progress gate must be admitted
+    // before more discovery can spend their next cadence's frame allowance.
+    if (attempt.pendingFiles.length < AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP && !attempt.discoveryDone &&
+        attempt.pendingFiles.every((file) => (file.servicedCadences ?? 0) > 0)) {
       const chunk = await attempt.discovery.collect(budget, {
         signal: options.signal,
-        maxFiles: AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP,
+        maxFiles: AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP - attempt.pendingFiles.length,
         maxEntries: AUTOMATIC_DISCOVERY_ENTRY_CAP,
         maxWallMs: AUTOMATIC_DISCOVERY_WALL_MS,
       });
@@ -1088,10 +1103,10 @@ export class RolloutTailer {
     return { files, errors, truncated: truncated || !done, discoveryEntries: entries };
   }
 
-  private consumeAutomaticCaptureFiles(files: ReadonlySet<string>) {
+  private consumeAutomaticCaptureFiles(files: ReadonlySet<string>, partial: ReadonlySet<string>) {
     const attempt = this.captureAttempt;
     if (!attempt) return;
-    attempt.pendingFiles = attempt.pendingFiles.filter((pending) => !files.has(pending.file));
+    attempt.pendingFiles = advanceAutomaticCaptureFiles(attempt.pendingFiles, files, partial);
     if (attempt.discoveryDone && attempt.pendingFiles.length === 0) {
       attempt.discovery.close();
       this.captureAttempt = null;

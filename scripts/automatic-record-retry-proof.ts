@@ -79,7 +79,10 @@ async function prove(source: CaptureRoot["source"], largeBytes: number) {
       budgets.push(budget.status());
       return result;
     };
-    await scan();
+    // A prefix transaction can exhaust the cooperative wall allowance before
+    // the oversized line. Observe its initial fixed-quantum marker on the next
+    // bounded cadence, before restarting; do not require two slices in 200ms.
+    for (let turn = 0; turn < 6 && cursor()?.unresolved_kind !== "record_exceeds_byte_budget"; turn++) await scan();
     const firstCursor = cursor();
     check(`${name}: initial fixed quantum records unresolved offset`,
       firstCursor?.unresolved_kind === "record_exceeds_byte_budget" &&
