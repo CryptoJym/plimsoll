@@ -70,6 +70,8 @@ jobs:
           pnpm proof:lifecycle-manifest-rollback
           pnpm proof:dashboard-cdp
           pnpm proof:automatic-record-retry
+          pnpm proof:automatic-revisit
+          pnpm proof:automatic-retry-metadata
           pnpm proof:future-admission
           pnpm proof:child-identity
           pnpm proof:economics
