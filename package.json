@@ -111,7 +111,8 @@
     "proof:automatic-capture-cadence": "tsx scripts/automatic-capture-cadence-proof.ts",
     "proof:oversized-continuation": "tsx scripts/run-proof.ts scripts/oversized-continuation-suite-proof.ts",
     "proof:codex-live-usage": "tsx scripts/run-proof.ts scripts/codex-live-usage-proof.ts",
-    "proof:codex-live-reporting": "tsx scripts/run-proof.ts scripts/codex-live-reporting-proof.ts"
+    "proof:codex-live-reporting": "tsx scripts/run-proof.ts scripts/codex-live-reporting-proof.ts",
+    "proof:legacy-privacy-parity": "tsx scripts/legacy-privacy-parity-proof.ts"
   },
   "dependencies": {
     "better-sqlite3": "^12.10.0",

@@ -2579,7 +2579,11 @@ export class DashboardProjectionStore {
       if(preGc.compactMutationBacklog===0&&preGc.repairBacklog===0){
         compactGc=this.runCompactGcSlice(now);
       }
-      parityRowsVisited = backfillRowsVisited === 0 ? this.runParitySlice() : 0;
+      // Legacy privacy migration queues rows that have not entered flat totals.
+      // Admit them before parity scans, or later repairs count them twice.
+      const cleanForParity = backfillRowsVisited === 0 &&
+        repairRowsVisited === 0 && this.control().repairBacklog === 0;
+      parityRowsVisited = cleanForParity ? this.runParitySlice() : 0;
       this.drainAccountInvalidations(now);
       expiryFacts = this.advanceExpiry(now);
 
