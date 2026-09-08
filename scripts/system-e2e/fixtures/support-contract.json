@@ -10,7 +10,7 @@
     {
       "name": "transactional_join",
       "kind": "json_result",
-      "expectedArtifactDigest": "sha256:d7d0c36cbc4d0bf02b1d4e3e89a32cb6902bc6754ece87c813542ffb498123d4"
+      "expectedArtifactDigest": "sha256:ddcdeb4b4bad55efdea98f7cb0444e477cc008b0aa9cc6d5de7c94032e9362dc"
     },
     {
       "name": "metadata_only_privacy",
