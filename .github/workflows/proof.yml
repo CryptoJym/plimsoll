@@ -169,6 +169,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dashboard
 
+      - name: Legacy privacy parity proof
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:legacy-privacy-parity
+
       - name: Prove shipped dashboard browser security
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dashboard-security
