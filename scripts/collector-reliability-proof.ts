@@ -14,13 +14,14 @@ import { AutomaticMaintenanceCadence, CoalescingMaintenanceScheduler, CollectorM
 import { captureBaselineStatus } from "../packages/collector-cli/src/capture-baseline";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
+import { MAINTENANCE_PROTOCOL_SCHEMA, parseMaintenanceWorkerReceipt } from "../packages/collector-cli/src/maintenance-protocol";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-reliability-"));
 const realNow = Date.now;
 const now = realNow();
 const checks: Array<{ name: string; passed: boolean; detail?: unknown; error?: string }> = [];
-const EXPECTED_CHECKS = 10;
+const EXPECTED_CHECKS = 11;
 let nextId = 0;
 function event() {
   return aiInteractionEventSchema.parse({
@@ -199,6 +200,56 @@ async function main() {
       cadence.stop(); assert.equal(pending.size, 0);
       return {calls, repairDelayMs: 5_000, circuitDelayMs: 30_000, stalledDelayMs: 60_000};
     } finally {cadence.stop(); buffer.close();}
+  });
+  await check("committed_capture_followups_are_bounded_and_fail_closed", async () => {
+    const buffer = fixture("capture-cadence-controls");
+    let tick = now, calls = 0, notBefore: number | null = null;
+    let pending: { callback: () => void; delay: number } | null = null;
+    const source = {filesRead: 0, parseErrors: 0, eventsAppended: 0, activity: {discoveryEntries: 0}};
+    const result: MaintenanceRunOutcome = {recentOnly: true, rollout: source, transcript: source,
+      reconciliation: {rowsChanged: 0, rowsVisited: 0}, repricing: {repriced: 0, rowsVisited: 0},
+      enrichment: {backward: 0, forward: 0, rowsVisited: 0}, rawEventWrites: 0,
+      stageTimings: {codexCaptureMs:0,claudeCaptureMs:0,reconciliationMs:0,repricingMs:0,enrichmentMs:0,projectionDrainMs:0,totalMs:0}};
+    const wire = (captureAdvanced?: unknown) => parseMaintenanceWorkerReceipt({
+      schema: MAINTENANCE_PROTOCOL_SCHEMA, type: "result", generation: 1,
+      nonce: "00000000-0000-4000-8000-000000000001", sequence: 1, repoContexts: [],
+      result: {...result, ...(captureAdvanced === undefined ? {} : {captureAdvanced})},
+    });
+    assert.equal(wire(true)?.type, "result");
+    assert.equal(wire()?.type, "result");
+    assert.equal(wire("true"), null, "IPC rejects an unvalidated progress hint");
+    const baseline = captureBaselineStatus(buffer.database);
+    const scheduler = new CoalescingMaintenanceScheduler(async () => {
+      calls++;
+      if (calls === 7) {notBefore = tick + 30_000; throw new Error("synthetic_capture_failure");}
+      if (calls === 3) return {outcome: "PARTIAL_OK" as const,
+        progress: {stage: "retention" as const, rows: 1, ms: 1, remaining: 1}};
+      return {...result, captureAdvanced: [1, 6, 9].includes(calls),
+        // Discovery and attempted reads alone must not renew the allowance.
+        rollout: {...source, filesRead: 1, activity: {discoveryEntries: 1}}};
+    });
+    const cadence = new AutomaticMaintenanceCadence(scheduler, () => ({...baseline,
+      progress: {...baseline.progress, state: "complete" as const}}), {
+      retryNotBefore: () => notBefore, onError: () => {}, timer: {
+        now: () => tick, setTimeout: (callback, delay) => {assert.equal(pending, null);pending={callback,delay};return 1;},
+        clearTimeout: () => {pending=null;},
+      },
+    });
+    const observed: Array<{retry: string | null; delay: number}> = [];
+    const advance = async () => {
+      assert(pending);const next=pending;pending=null;tick+=next.delay;next.callback();
+      for (let i=0;i<20&&!pending;i++) await new Promise<void>(resolve=>setImmediate(resolve));
+      assert(pending);observed.push({retry:cadence.status().retryClass,delay:(pending as {delay:number}).delay});
+    };
+    try {
+      cadence.start();for(let i=0;i<9;i++)await advance();
+      assert.deepEqual(observed.map(x=>x.delay),[5000,5000,5000,5000,60000,5000,30000,60000,5000]);
+      assert.equal(observed[6]!.retry,"circuit");
+      assert.equal(cadence.status().activeBudgetMs,200);
+      assert.equal(cadence.status().maximumStartupDutyCycle,0.04);
+      cadence.stop();assert.equal(pending,null);
+      return {observed, noProgressFollowups:4, invalidHintRejected:true, stopCancelsFollowup:true};
+    } finally {cadence.stop();buffer.close();}
   });
   await check("repair_progress_under_saturated_capture", async () => {
     const buffer = fixture("repair"); const item = event(); buffer.append(item); settle(buffer);

@@ -571,6 +571,8 @@ export type CollectorMaintenanceRunResult = {
   projection?: ReturnType<LocalEventBuffer["projection"]["runMaintenance"]>;
   projectionDrain?: ProjectionDrainResult;
   rawEventWrites: number;
+  /** Durable complete-record progress; attempted reads do not qualify. */
+  captureAdvanced?: boolean;
   postCaptureDeferred?: string[];
   repairService?: RepairService;
   stageTimings?: MaintenanceStageTimings;
@@ -595,6 +597,8 @@ export type MaintenanceRunOutcome = {
   repricing: { repriced: number; rowsVisited: number };
   enrichment: { backward: number; forward: number; rowsVisited: number };
   rawEventWrites: number;
+  /** Durable complete-record progress; attempted reads do not qualify. */
+  captureAdvanced?: boolean;
   stageTimings?: MaintenanceStageTimings;
 };
 
@@ -926,6 +930,7 @@ export class CollectorMaintenance {
       enrichment,
       ...(drained ? { projection: drained.receipt, projectionDrain: drained.drain } : {}),
       rawEventWrites: rollout.eventsAppended + transcript.eventsAppended,
+      captureAdvanced: (rollout.recordsCommitted ?? 0) + (transcript.recordsCommitted ?? 0) > 0,
       postCaptureDeferred,
       repairService,
       stageTimings: {
@@ -1114,11 +1119,12 @@ export function requestAutomaticRecentMaintenance<T extends MaintenanceAttemptOu
 
 export const AUTOMATIC_BASELINE_STARTUP_INTERVAL_MS = 5_000;
 export const AUTOMATIC_MAINTENANCE_NORMAL_INTERVAL_MS = 60_000;
+const AUTOMATIC_CAPTURE_FOLLOWUPS = 4;
 
 export type AutomaticMaintenanceCadenceStatus = {
   accepting: boolean;
   inFlight: boolean;
-  retryClass: "boot" | "startup" | "repair" | "circuit" | "normal" | null;
+  retryClass: "boot" | "startup" | "repair" | "capture" | "circuit" | "normal" | null;
   nextRetryAt: string | null;
   startupIntervalMs: number;
   normalIntervalMs: number;
@@ -1137,9 +1143,11 @@ export type AutomaticMaintenanceCadenceTimer = {
 /**
  * The daemon has one maintenance timer owner. Baseline follow-ups use the
  * fixed startup interval only after observable baseline progress. Stalled,
- * complete, failed, ambiguous and pre-start states fall back to the ordinary
- * cadence. Scheduling happens after the coalesced run drains, so callbacks do
- * not accumulate during a slow filesystem slice.
+ * failed, ambiguous and pre-start states fall back to the ordinary cadence.
+ * After baseline, committed records renew four short capture follow-ups;
+ * discovery-only and unresolved work cannot keep the fast cadence alive.
+ * Scheduling happens after the coalesced run drains, so callbacks do not
+ * accumulate during a slow filesystem slice.
  */
 export class AutomaticMaintenanceCadence<
   T extends MaintenanceAttemptOutcome = CollectorMaintenanceRunResult,
@@ -1147,10 +1155,11 @@ export class AutomaticMaintenanceCadence<
   private accepting = true;
   private inFlight = false;
   private timer: unknown | null = null;
-  private retryClass: "boot" | "startup" | "repair" | "circuit" | "normal" | null = null;
+  private retryClass: "boot" | "startup" | "repair" | "capture" | "circuit" | "normal" | null = null;
   private nextRetryAt: string | null = null;
   private triggerCount = 0;
   private failedTriggers = 0;
+  private captureFollowups = 0;
 
   constructor(
     private readonly scheduler: CoalescingMaintenanceScheduler<T>,
@@ -1177,6 +1186,7 @@ export class AutomaticMaintenanceCadence<
     this.timer = null;
     this.retryClass = null;
     this.nextRetryAt = null;
+    this.captureFollowups = 0;
   }
 
   status(): AutomaticMaintenanceCadenceStatus {
@@ -1233,7 +1243,7 @@ export class AutomaticMaintenanceCadence<
     return after.state === "in_progress" && advanced ? "startup" : "normal";
   }
 
-  private schedule(retryClass: "boot" | "startup" | "repair" | "circuit" | "normal") {
+  private schedule(retryClass: "boot" | "startup" | "repair" | "capture" | "circuit" | "normal") {
     if (!this.accepting || this.timer) return;
     const now = this.timerApi().now();
     const notBefore = this.options.retryNotBefore?.() ?? null;
@@ -1268,6 +1278,12 @@ export class AutomaticMaintenanceCadence<
       baselineBefore = this.baselineStatus().progress;
       repairBefore = this.options.repairProgress?.() ?? null;
       const results = await requestAutomaticRecentMaintenance(this.scheduler);
+      // Preserve a short retry burst across discovery/frame deferrals. Only
+      // committed records renew it; idle, failed and oversized-only work stops.
+      const captureAdvanced = results.some(result =>
+        !isMaintenancePartialOutcome(result) && result.captureAdvanced === true);
+      this.captureFollowups = captureAdvanced ? AUTOMATIC_CAPTURE_FOLLOWUPS
+        : Math.max(0, this.captureFollowups - 1);
       const repairAfter = this.options.repairProgress?.();
       repairAdvanced = Boolean(repairAfter?.pending && repairAfter.units > (repairBefore?.units ?? 0));
       discoveryAdvanced = results.some(
@@ -1279,17 +1295,20 @@ export class AutomaticMaintenanceCadence<
       );
     } catch (error) {
       failed = true;
+      this.captureFollowups = 0;
       this.failedTriggers += 1;
       this.options.onError?.(error);
     } finally {
       this.inFlight = false;
       if (this.accepting) {
-        let retry: "normal" | "repair" | "startup" = "normal";
+        let retry: "normal" | "repair" | "startup" | "capture" = "normal";
         try {
           const baselineAfter = this.baselineStatus().progress;
           if (!failed && baselineBefore) retry = repairAdvanced ? "repair"
-            : this.classifyRetry(baselineBefore, baselineAfter, discoveryAdvanced);
+            : baselineAfter.state === "complete" && this.captureFollowups > 0 ? "capture"
+              : this.classifyRetry(baselineBefore, baselineAfter, discoveryAdvanced);
         } catch (error) {
+          this.captureFollowups = 0;
           this.failedTriggers += 1;
           this.options.onError?.(error);
         }

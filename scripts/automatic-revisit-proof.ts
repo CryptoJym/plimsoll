@@ -165,7 +165,7 @@ async function prove(source: CaptureRoot["source"]) {
     check("eligible partial snapshot progresses at its next admitted cadence", retainedPairs.length >= 3 && retainedPairs.every(({ prior, next }) =>
       next.offset > prior.offset && captureCadences.slice(prior.cadence + 1, next.cadence).every(c =>
         c.candidateAdmissions.some((a: { admitted: boolean }) => !a.admitted) ||
-        (c.sourceAdmission === null && c.budget.exhausted))));
+        (c.candidateAdmissions.length === 0 && c.budget.exhausted))));
     check("between-cadence appends to retained partial snapshots progress on first retry", partialAppends === 3 && appendRevisits.length === 3 &&
       appendRevisits.every(r => r.after > r.before && r.errors === 0));
     const stat = fs.lstatSync(target, { bigint: true });
