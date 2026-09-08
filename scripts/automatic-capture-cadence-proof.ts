@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { LocalEventBuffer } from '../packages/collector-cli/src/buffer';
 import { CollectorMaintenance, AutomaticMaintenanceCadence, CoalescingMaintenanceScheduler, automaticRepairServiceStatus } from '../packages/collector-cli/src/maintenance';
 import { RolloutTailer } from '../packages/collector-cli/src/rollout-tailer';
@@ -118,18 +118,26 @@ async function prove(provider: CaptureRoot['source']) {
     const targetBytes=fs.statSync(target).size,targetResult=cursor(target),sentinelCaptured=cursor(sentinel)?.deferred_bytes===0;
     const normalPolicyWaitMs=capture.reduce((total,j,index)=>total+j.waitMs+(index>0&&capture[index-1].nextRetry==='capture'?55000:0),0);
     const activeWallMs=capture.reduce((total,j)=>total+j.jobWallMs,0),cpuMs=capture.reduce((total,j)=>total+j.cpuMs,0);
-    // Retire only this fixture's generated future files, then isolate the
-    // above-cap refusal without other useful work renewing the burst.
+    // Retire only this fixture's generated future files, then isolate finite
+    // oversized continuation and its return to normal cadence after completion.
     for(const r of roots) for(const name of fs.readdirSync(leaf(r))) {const file=path.join(leaf(r),name);if(!historical.has(file))fs.unlinkSync(file);}
     tailers.forEach(t=>t.close());
     const giant=path.join(leaf(ownRoots[0]!), 'rollout-giant.jsonl');fs.writeFileSync(giant,large(600*1024));
-    for(let i=0;i<80&&cursor(giant)?.unresolved_byte_budget!==524288;i++)await advance('giant');
+    const giantBytes=fs.statSync(giant).size;
+    const giantContinuation=()=>buffer.database.prepare('select envelope_json from jsonl_continuations where provider=? and file_key=?')
+      .get(provider==='codex'?'codex':'claude',createHash('sha256').update(giant).digest('hex')) as {envelope_json:string}|undefined;
+    let continuationObserved=false, cursorHeldDuringContinuation=true;
+    for(let i=0;i<80&&cursor(giant)?.committed_offset!==giantBytes;i++) {
+      await advance('giant');
+      if(giantContinuation()) {continuationObserved=true;const c=cursor(giant);cursorHeldDuringContinuation&&=!c||c.committed_offset===0;}
+    }
     const giantResult=cursor(giant);
     for(let i=0;i<6;i++)await advance('no-progress');
     const noProgress=jobs.filter(j=>j.phase==='no-progress');
-    checks.push({name:'above-ceiling record stays unresolved and cannot renew fast cadence',passed:giantResult?.committed_offset===0&&giantResult?.unresolved_kind==='record_exceeds_byte_budget'&&giantResult?.unresolved_byte_budget===524288&&noProgress.every(j=>j.source.recordsCommitted===0)&&noProgress.at(-1)?.nextRetry==='normal'});
+    checks.push({name:'finite oversized record resumes separately and commits its exact boundary',passed:continuationObserved&&cursorHeldDuringContinuation&&giantResult?.committed_offset===giantBytes&&giantResult?.deferred_bytes===0&&giantResult?.unresolved_kind===null&&giantResult?.unresolved_byte_budget===null&&!giantContinuation()&&jobs.filter(j=>j.phase==='giant').every(j=>j.budget.eventsAppended===0)});
+    checks.push({name:'completed oversized record cannot renew fast cadence without new progress',passed:noProgress.every(j=>j.source.recordsCommitted===0&&j.budget.bytesRead===0&&j.budget.eventsAppended===0)&&noProgress.at(-1)?.nextRetry==='normal'});
     const result={checks,passed:checks.every(c=>c.passed),provider,roots:roots.length,historicalFiles:historical.size,eligibleFiles:34,privateReads,maxReadRecords,
-      targetBytes,target:targetResult,targetVisits,sentinelCaptured,giant:giantResult,normalPolicyWaitMs,activeWallMs,cpuMs,
+      targetBytes,target:targetResult,targetVisits,sentinelCaptured,giant:giantResult,giantBytes,continuationObserved,cursorHeldDuringContinuation,normalPolicyWaitMs,activeWallMs,cpuMs,
       captureJobs:capture.length,positiveJobs:positive.length,zeroByteFrameBoundJobs:zeroFrames.length,
       scheduledWaitMs:capture.reduce((s,j)=>s+j.waitMs,0),normalAfterPositive:positive.filter(j=>j.nextRetry==='normal').length,
       retentionEveryJob:jobs.every(j=>j.stageCounts.retention===1&&j.stageCounts.wal_checkpoint===1&&j.stageCounts.fill_pending_event_links===1),jobs};

@@ -1508,6 +1508,9 @@ export async function runNoChangeConstantWorkContract(
       transcriptStatFailure,
     );
 
+    // A readTail failure is converted by the continuation boundary into a
+    // path-free source_changed refusal. Keep the target unchanged so this
+    // exercises the existing cursor/restart path without creating writes.
     const rolloutOpenFailure = await new RolloutTailer(
       buffer,
       sandbox.codexSessions,
@@ -1761,7 +1764,7 @@ export async function runNoChangeConstantWorkContract(
       transcriptStatFailure.statErrors === 1 &&
       !transcriptStatFailure.exhaustive &&
       !transcriptStatCoverage.promoted &&
-      rolloutOpenFailure.readErrors === 1 &&
+      rolloutOpenFailure.continuationReasons?.source_changed === 1 &&
       !rolloutOpenFailure.exhaustive &&
       !rolloutOpenCoverage.promoted;
     const failedAttemptDisclosedAfterComplete =
