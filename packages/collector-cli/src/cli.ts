@@ -52,6 +52,7 @@ const pidCleanupAttemptReceipt = (result: CollectorPidCleanupResult | null) =>
 import { LocalEventBuffer } from "./buffer";
 import {
   collectorHomeIdentityHash,
+  defaultCollectorHome,
   resolveCollectorHome,
 } from "./collector-home";
 import {
@@ -1202,6 +1203,13 @@ function readLaunchAgentState(plistPath: string) {
     const environment = plist.EnvironmentVariables && typeof plist.EnvironmentVariables === "object"
       ? plist.EnvironmentVariables as Record<string, unknown>
       : null;
+    // Keep read-only inspection aligned with launch-agent.ts's strict parser:
+    // an extra environment override (notably HOME) changes the daemon's
+    // os.homedir() boundary and cannot be treated as a default-home manifest.
+    const environmentKeys = environment ? Object.keys(environment).sort() : [];
+    const environmentKeysOk =
+      isDeepStrictEqual(environmentKeys, ["PATH", "PLIMSOLL_COLLECTOR_DATA_MODE"].sort()) ||
+      isDeepStrictEqual(environmentKeys, ["PATH", "PLIMSOLL_COLLECTOR_DATA_MODE", "PLIMSOLL_HOME"].sort());
     const launchAgentPath = typeof environment?.PATH === "string" ? environment.PATH : "";
     // Issue #135: compare the manifest's propagated collector home with the
     // home this command resolved, using path-free identity hashes only. The
@@ -1209,13 +1217,24 @@ function readLaunchAgentState(plistPath: string) {
     // when absent), so a mismatch here means setup/doctor/status would inspect
     // one home while launchd starts the daemon against another.
     const expectedHomeHash = collectorHomeIdentityHash(collectorHome());
-    const manifestHome = typeof environment?.PLIMSOLL_HOME === "string"
-      ? environment.PLIMSOLL_HOME
+    const manifestHomeValue = environment?.PLIMSOLL_HOME;
+    const manifestHomePresent = environment !== null &&
+      Object.hasOwn(environment, "PLIMSOLL_HOME");
+    const manifestHome = typeof manifestHomeValue === "string"
+      ? manifestHomeValue
       : null;
-    const observedHomeHash = manifestHome ? privatePathReceipt(manifestHome) : null;
+    const manifestHomeValid = manifestHome !== null &&
+      manifestHome.length > 0 &&
+      path.isAbsolute(manifestHome) &&
+      !/[\u0000-\u001f\u007f-\u009f]/.test(manifestHome);
+    const observedHomeHash = !manifestHomePresent
+      ? collectorHomeIdentityHash(defaultCollectorHome())
+      : manifestHomeValid
+        ? privatePathReceipt(manifestHome)
+        : null;
     const homeIdentity = {
       ok: observedHomeHash === expectedHomeHash,
-      manifestHomePresent: manifestHome !== null,
+      manifestHomePresent,
       expectedHash: expectedHomeHash,
       observedHash: observedHomeHash,
     };
@@ -1254,6 +1273,7 @@ function readLaunchAgentState(plistPath: string) {
       plist.StandardOutPath === collectorLogPath("collector.out.log") &&
       plist.StandardErrorPath === collectorLogPath("collector.err.log") &&
       environment?.PLIMSOLL_COLLECTOR_DATA_MODE === "metadata" &&
+      environmentKeysOk &&
       pathOk &&
       homeIdentity.ok,
     );
