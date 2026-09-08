@@ -10,7 +10,7 @@ import os from "node:os";
 import Database from "better-sqlite3";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
-import { DASHBOARD_WINDOWS } from "../packages/collector-cli/src/dashboard-projection";
+import { DASHBOARD_WINDOWS, type ProjectionMaintenanceReceipt } from "../packages/collector-cli/src/dashboard-projection";
 import { LOCAL_TENANT_ID } from "../packages/shared/src/index";
 
 const DAY_MS = 24 * 60 * 60 * 1_000;
@@ -232,7 +232,7 @@ try {
 
   let repairsDrained = false;
   for (let index = 0; index < 40; index += 1) {
-    const receipt = buffer.projection.runMaintenance(NOW);
+    const receipt: ProjectionMaintenanceReceipt = buffer.projection.runMaintenance(NOW);
     const current = phase(buffer, `settle-${index + 1}`, receipt.backfillRowsVisited, receipt.parityRowsVisited);
     phases.push(current);
     if (receipt.repairRowsVisited > 0 || current.repairs > 0) {
