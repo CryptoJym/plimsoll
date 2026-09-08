@@ -1,7 +1,8 @@
 /**
  * Focused proof for issue 0058 / GitHub #107.
  *
- * Every fixture uses a temporary HOME and PLIMSOLL_HOME. The proof stubs
+ * Every fixture uses a temporary HOME; custom-home cases pin PLIMSOLL_HOME and
+ * the default-home cases deliberately omit it. The proof stubs
  * launchctl and the installer's external commands; it never registers, loads,
  * unloads, or starts a real LaunchAgent and never reads the operator's tool
  * config, ledger, or credentials.
@@ -851,7 +852,7 @@ esac
   );
   fs.writeFileSync(plistPath, validPlist);
 
-  const beforeSignalDoctor = digestTree(sandbox);
+  const beforeSignalDoctor = digestTree(fixtureHome);
   const signalDoctor = await command(
     process.execPath,
     [tsx, cli, "doctor", "--read-only", "--json"],
@@ -867,9 +868,175 @@ esac
     signalReceipt,
   );
   check(
+    "configured_custom_home_manifest_matches",
+    signalReceipt.launchAgent.homeIdentity?.ok === true &&
+      signalReceipt.launchAgent.homeIdentity.manifestHomePresent === true &&
+      signalReceipt.launchAgent.homeIdentity.observedHash ===
+        signalReceipt.launchAgent.homeIdentity.expectedHash,
+    signalReceipt.launchAgent.homeIdentity,
+  );
+
+  // A packaged default-home LaunchAgent deliberately omits PLIMSOLL_HOME.
+  // Keep a complete, otherwise identical fixture so the doctor must attest
+  // that omission to the account's default collector home rather than
+  // treating it as an absent/unknown home.
+  const defaultHome = path.join(sandbox, "default-home");
+  const defaultPlimsoll = path.join(defaultHome, "Library", "Application Support", "Plimsoll");
+  const defaultLaunchAgents = path.join(defaultHome, "Library", "LaunchAgents");
+  fs.mkdirSync(defaultPlimsoll, { recursive: true, mode: 0o700 });
+  fs.cpSync(fixturePlimsoll, defaultPlimsoll, { recursive: true });
+  fs.chmodSync(defaultPlimsoll, 0o700);
+  for (const file of ["collector.config.json", "local-ingest-auth.json", "collector.pid"]) {
+    const target = path.join(defaultPlimsoll, file);
+    if (fs.existsSync(target)) fs.chmodSync(target, 0o600);
+  }
+  fs.cpSync(claudeDir, path.join(defaultHome, ".claude"), { recursive: true });
+  fs.cpSync(codexDir, path.join(defaultHome, ".codex"), { recursive: true });
+  fs.chmodSync(path.join(defaultHome, ".claude"), 0o700);
+  fs.chmodSync(path.join(defaultHome, ".codex"), 0o700);
+  fs.mkdirSync(defaultLaunchAgents, { recursive: true, mode: 0o700 });
+  const previousDefaultHome = process.env.HOME;
+  const previousDefaultPlimsollHome = process.env.PLIMSOLL_HOME;
+  let renderedDefaultPlist: string;
+  try {
+    process.env.HOME = defaultHome;
+    delete process.env.PLIMSOLL_HOME;
+    renderedDefaultPlist = renderLaunchAgentPlist({
+      homeDir: defaultHome,
+      repoRoot: "/neutral/plimsoll/source",
+      programArguments: [
+        process.execPath,
+        "/neutral/plimsoll/source/cli.mjs",
+        "start",
+      ],
+      workingDirectory: "/neutral/plimsoll/source",
+    });
+  } finally {
+    if (previousDefaultHome === undefined) delete process.env.HOME;
+    else process.env.HOME = previousDefaultHome;
+    if (previousDefaultPlimsollHome === undefined) delete process.env.PLIMSOLL_HOME;
+    else process.env.PLIMSOLL_HOME = previousDefaultPlimsollHome;
+  }
+  const defaultPlistPath = launchAgentPlistPath(defaultHome);
+  fs.writeFileSync(defaultPlistPath, renderedDefaultPlist!, { mode: 0o600 });
+  const defaultDoctorEnv: NodeJS.ProcessEnv = { ...fixtureEnv, HOME: defaultHome };
+  delete defaultDoctorEnv.PLIMSOLL_HOME;
+  const beforeDefaultDoctor = digestTree(defaultHome);
+  const defaultDoctor = await command(
+    process.execPath,
+    [tsx, cli, "doctor", "--read-only", "--json"],
+    { cwd: neutralCwd, env: defaultDoctorEnv },
+  );
+  const defaultReceipt = parseJson(defaultDoctor.stdout);
+  check(
+    "default_manifest_home_passes_and_doctor_is_byte_read_only",
+    defaultDoctor.code === 0 &&
+      defaultReceipt.ok === true &&
+      defaultReceipt.readiness === "signal_verified" &&
+      defaultReceipt.launchAgent.status === "valid" &&
+      defaultReceipt.launchAgent.homeIdentity?.ok === true &&
+      defaultReceipt.launchAgent.homeIdentity.manifestHomePresent === false &&
+      defaultReceipt.launchAgent.homeIdentity.observedHash ===
+        defaultReceipt.launchAgent.homeIdentity.expectedHash &&
+      digestTree(defaultHome) === beforeDefaultDoctor,
+    defaultReceipt,
+  );
+
+  // A manifest HOME override changes os.homedir() for the daemon even when
+  // PLIMSOLL_HOME is absent. The read-only inspector must reject that extra
+  // environment key instead of blessing the doctor's current default home.
+  const daemonHomeOverride = path.join(sandbox, "daemon-home-override");
+  fs.mkdirSync(daemonHomeOverride, { mode: 0o700 });
+  const defaultHomeOverridePlist = renderedDefaultPlist!.replace(
+    /(<key>PLIMSOLL_COLLECTOR_DATA_MODE<\/key>\s*<string>metadata<\/string>\s*)/,
+    `$1    <key>HOME</key>\n    <string>${daemonHomeOverride}</string>\n`,
+  );
+  check(
+    "proof_builds_default_home_override_manifest",
+    defaultHomeOverridePlist !== renderedDefaultPlist,
+    defaultPlistPath,
+  );
+  fs.writeFileSync(defaultPlistPath, defaultHomeOverridePlist, { mode: 0o600 });
+  const beforeDefaultHomeOverrideDoctor = digestTree(defaultHome);
+  const defaultHomeOverrideDoctor = await command(
+    process.execPath,
+    [tsx, cli, "doctor", "--read-only", "--json"],
+    { cwd: neutralCwd, env: defaultDoctorEnv },
+  );
+  const defaultHomeOverrideReceipt = parseJson(defaultHomeOverrideDoctor.stdout);
+  check(
+    "default_home_override_fails_closed_and_is_byte_read_only",
+    defaultHomeOverrideDoctor.code !== 0 &&
+      defaultHomeOverrideReceipt.ok === false &&
+      defaultHomeOverrideReceipt.readiness === "configured" &&
+      defaultHomeOverrideReceipt.launchAgent.status === "conflicted" &&
+      defaultHomeOverrideReceipt.launchAgent.homeIdentity?.manifestHomePresent === false &&
+      digestTree(defaultHome) === beforeDefaultHomeOverrideDoctor,
+    defaultHomeOverrideReceipt,
+  );
+  fs.writeFileSync(defaultPlistPath, renderedDefaultPlist!, { mode: 0o600 });
+
+  // Presence of a malformed PLIMSOLL_HOME key is not the same as omission:
+  // a default-home fallback must never bless a plist whose explicit value has
+  // the wrong type.
+  const validDefaultPlist = fs.readFileSync(defaultPlistPath, "utf8");
+  const malformedDefaultPlist = validDefaultPlist.replace(
+    /(<key>PLIMSOLL_COLLECTOR_DATA_MODE<\/key>\s*<string>metadata<\/string>\s*)/,
+    "$1    <key>PLIMSOLL_HOME</key>\n    <integer>7</integer>\n",
+  );
+  check("proof_builds_malformed_default_home_manifest", malformedDefaultPlist !== validDefaultPlist, defaultPlistPath);
+  fs.writeFileSync(defaultPlistPath, malformedDefaultPlist, { mode: 0o600 });
+  const beforeMalformedDefaultDoctor = digestTree(defaultHome);
+  const malformedDefaultDoctor = await command(
+    process.execPath,
+    [tsx, cli, "doctor", "--read-only", "--json"],
+    { cwd: neutralCwd, env: defaultDoctorEnv },
+  );
+  const malformedDefaultReceipt = parseJson(malformedDefaultDoctor.stdout);
+  check(
+    "malformed_default_manifest_home_fails_closed_and_is_byte_read_only",
+    malformedDefaultDoctor.code !== 0 &&
+      malformedDefaultReceipt.ok === false &&
+      malformedDefaultReceipt.readiness === "configured" &&
+      malformedDefaultReceipt.launchAgent.status === "conflicted" &&
+      malformedDefaultReceipt.launchAgent.homeIdentity?.ok === false &&
+      malformedDefaultReceipt.launchAgent.homeIdentity.manifestHomePresent === true &&
+      malformedDefaultReceipt.launchAgent.homeIdentity.observedHash === null &&
+      digestTree(defaultHome) === beforeMalformedDefaultDoctor,
+    malformedDefaultReceipt,
+  );
+  fs.writeFileSync(defaultPlistPath, validDefaultPlist, { mode: 0o600 });
+
+  const conflictingPlimsoll = path.join(sandbox, "conflicting-plimsoll");
+  fs.mkdirSync(conflictingPlimsoll, { mode: 0o700 });
+  const replaceManifestHome = (value: string) => validPlist.replace(
+    /(<key>PLIMSOLL_HOME<\/key>\s*<string>)[\s\S]*?(<\/string>)/,
+    `$1${value}$2`,
+  );
+  fs.writeFileSync(plistPath, replaceManifestHome(conflictingPlimsoll), { mode: 0o600 });
+  const beforeConflictingDoctor = digestTree(sandbox);
+  const conflictingDoctor = await command(
+    process.execPath,
+    [tsx, cli, "doctor", "--read-only", "--json"],
+    { cwd: neutralCwd, env: fixtureEnv },
+  );
+  const conflictingReceipt = parseJson(conflictingDoctor.stdout);
+  check(
+    "conflicting_manifest_home_fails_closed_and_is_byte_read_only",
+    conflictingDoctor.code !== 0 &&
+      conflictingReceipt.ok === false &&
+      conflictingReceipt.readiness === "configured" &&
+      conflictingReceipt.launchAgent.status === "conflicted" &&
+      conflictingReceipt.launchAgent.homeIdentity?.ok === false &&
+      conflictingReceipt.launchAgent.homeIdentity.manifestHomePresent === true &&
+      digestTree(sandbox) === beforeConflictingDoctor,
+    conflictingReceipt,
+  );
+  fs.writeFileSync(plistPath, validPlist, { mode: 0o600 });
+  check(
     "signal_verified_doctor_is_byte_read_only",
-    digestTree(sandbox) === beforeSignalDoctor,
-    { before: beforeSignalDoctor, after: digestTree(sandbox) },
+    digestTree(fixtureHome) === beforeSignalDoctor,
+    { before: beforeSignalDoctor, after: digestTree(fixtureHome) },
   );
   const beforePackagedSignalDoctor = digestTree(sandbox);
   const packagedSignalDoctor = await command(
