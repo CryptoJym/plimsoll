@@ -24,7 +24,7 @@ import path from "node:path";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { sealOutboundEvent } from "../packages/collector-cli/src/outbound-envelope";
-import { aiInteractionEventSchema } from "../packages/shared/src/index";
+import { admittedMetadataAttributes, aiInteractionEventSchema } from "../packages/shared/src/index";
 
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-token-lineage-proof-"));
 
@@ -159,7 +159,24 @@ async function main() {
         { inputTokens: 10_000, outputTokens: 100 },
       );
       assert.equal(metadata(row).counterLineage, undefined);
+      // A validated rollout marginal must survive the actual outbound gate.
+      // Studio0's native rows had this value locally, but upload dropped it.
+      const event = aiInteractionEventSchema.parse(JSON.parse(row.payloadJson));
+      assert.equal(event.metadata.reasoningOutputTokens, 10);
+      const outbound = sealOutboundEvent(event);
+      assert.equal(outbound.ok, true);
+      if (outbound.ok) assert.equal(outbound.event.metadata.reasoningOutputTokens, 10);
     }
+
+    const marginal = aiInteractionEventSchema.parse(JSON.parse(second!.payloadJson));
+    for (const invalid of [-1, 1.5, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1,
+      "private-sentinel", "1.5", true, {}, []]) {
+      const rejected = sealOutboundEvent({ ...marginal,
+        metadata: { ...marginal.metadata, reasoningOutputTokens: invalid } });
+      assert.equal(rejected.ok, false, "reasoning metadata must retain token-count validation");
+    }
+    // This generated field is not a new arbitrary OTLP input surface.
+    assert.equal(admittedMetadataAttributes({ reasoningOutputTokens: 10 }).attributes.reasoningOutputTokens, undefined);
 
     // Rescan idempotency: counters must not double-report the exclusion.
     const rescan = await new RolloutTailer(buffer, root, () => []).scan({ scope: "full" });
