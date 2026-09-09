@@ -1782,7 +1782,9 @@ async function main() {
         let batches = 0;
         let uploaded = 0;
         while (batches < config.delivery.maxBatchesPerCycle) {
-          const result = await uploadBufferedEvents(config, buffer, {});
+          const result = await uploadBufferedEvents(config, buffer, {
+            includeLegacyRemainingUnuploaded: false,
+          });
           if (result.uploadedEvents === 0) break;
           uploadedBatches.push(result.batch);
           uploaded += result.uploadedEvents;
