@@ -209,6 +209,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:outbox
 
+      - name: Prove bounded daemon upload timer returns
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:upload-timer-bounds
+
       - name: Prove managed metadata-only privacy mode
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:privacy-mode --receipt evidence/privacy-mode-proof.json
