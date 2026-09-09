@@ -65,6 +65,7 @@
     "proof:device-registry": "tsx scripts/device-registry-proof.ts",
     "proof:enrollment-privacy": "tsx scripts/enrollment-privacy-proof.ts",
     "proof:outbox": "tsx scripts/outbox-proof.ts",
+    "proof:upload-timer-bounds": "tsx scripts/upload-timer-bounds-proof.ts",
     "proof:codex-config-apply": "tsx scripts/codex-config-apply-proof.ts",
     "proof:claude-config-apply": "tsx scripts/claude-config-apply-proof.ts",
     "proof:install-doctor": "tsx scripts/install-doctor-proof.ts",

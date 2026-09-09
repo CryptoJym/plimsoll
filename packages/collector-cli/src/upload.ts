@@ -287,6 +287,8 @@ export type UploadOptions = {
   now?: () => Date;
   leaseId?: string;
   maxProbes?: number;
+  /** Include the exact legacy raw-ledger census in durable result metadata. */
+  includeLegacyRemainingUnuploaded?: boolean;
   /** Test-only race seam before authoritative lease revalidation and HTTP. */
   beforeRemote?: () => void;
   /** Test-only crash seam after HTTP effects but before local acknowledgement. */
@@ -304,6 +306,10 @@ export async function uploadBufferedEvents(
   const url = validatedUploadUrl(config, options.url);
   buffer.useWorkspace(config.tenantId, config.deviceId);
   if (options.markUploaded === false) return uploadStateless(config, buffer, options);
+  const legacyRemainingUnuploaded = () =>
+    options.includeLegacyRemainingUnuploaded === false
+      ? null
+      : buffer.stats().unuploadedCount;
 
   buffer.delivery.configure({ enabled: true, limits: config.delivery });
   const nowFn = options.now ?? (() => new Date());
@@ -361,7 +367,7 @@ export async function uploadBufferedEvents(
       return {
         batch: null,
         markedUploaded: 0,
-        remainingUnuploaded: buffer.stats().unuploadedCount,
+        remainingUnuploaded: legacyRemainingUnuploaded(),
         remainingDelivery: status.remainingDelivery,
         response: witnessResult.summary,
         signedUpload: Boolean(options.signingSecret ?? config.uploadSigningSecret),
@@ -394,7 +400,7 @@ export async function uploadBufferedEvents(
     return {
       batch: null,
       markedUploaded: 0,
-      remainingUnuploaded: buffer.stats().unuploadedCount,
+      remainingUnuploaded: legacyRemainingUnuploaded(),
       remainingDelivery: statusBefore.remainingDelivery,
       response:
         lease.blockedBy === "none"
@@ -636,7 +642,7 @@ export async function uploadBufferedEvents(
     // acknowledged in this cycle, never unresolved or dead-lettered leases.
     batch: acknowledgedBatch,
     markedUploaded: acknowledged.markedUploaded,
-    remainingUnuploaded: buffer.stats().unuploadedCount,
+    remainingUnuploaded: legacyRemainingUnuploaded(),
     remainingDelivery: deliveryStatus.remainingDelivery,
     response:
       effectiveFailure === null
