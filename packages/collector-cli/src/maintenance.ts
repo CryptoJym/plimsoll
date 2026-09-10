@@ -722,15 +722,18 @@ export class CollectorMaintenance {
     let codexCaptureMs = 0;
     let claudeCaptureMs = 0;
     const budget = new CaptureWorkBudget();
-    // Reserve service before capture can consume the shared 200ms allowance.
-    // Rotate the first bounded unit durably: even an overrun/failure cannot
-    // manufacture starvation across worker restarts. At most 75ms of new
-    // repair units are admitted; a synchronous unit retains its existing row
-    // bound and its actual duration remains part of the capture budget.
+    // Alternate the order of the two consumers of the shared 200ms allowance.
+    // Odd cadences run bounded repairs first (at most 75ms of admitted units);
+    // even cadences are capture-first, so one synchronous repair unit that
+    // overruns the allowance cannot exhaust every cadence before any tailer
+    // reads. Repairs on a capture-first cadence use only what capture leaves.
+    // Persist the choice before work; neither restarts nor busy sources may
+    // starve either consumer on the intervening turns.
     const repairService = automaticRepairServiceStatus(this.buffer.database);
     const firstRepair = repairService.next % REPAIR_STAGES.length;
-    repairService.next = (firstRepair + 1) % REPAIR_STAGES.length;
     repairService.cycles += 1;
+    const captureFirst = repairService.cycles % 2 === 0;
+    let repairTurnAdvanced = false;
     const saveRepairService = () => setMaintenanceState(this.buffer.database,
       REPAIR_SERVICE_KEY, JSON.stringify(repairService));
     saveRepairService();
@@ -750,57 +753,67 @@ export class CollectorMaintenance {
       candidateRowsVisited: 0, rowsVisited: 0, backward: 0, forward: 0,
     };
     let reconciliationMs = 0, repricingMs = 0, enrichmentMs = 0, projectionDrainMs = 0;
-    let drained: Awaited<ReturnType<typeof drainProjectionMigration>> | null = null;
-    const repairStarted = performance.now();
-    for (let offset = 0; offset < REPAIR_STAGES.length; offset += 1) {
-      const stage = REPAIR_STAGES[(firstRepair + offset) % REPAIR_STAGES.length];
-      if (this.signal?.aborted || (offset > 0 &&
-          (performance.now() - repairStarted >= 75 || !budget.canStart(5)))) {
-        postCaptureDeferred.push(stage);
-        continue;
-      }
-      const counter = repairService.stages[stage];
-      counter.attempts += 1;
-      saveRepairService();
-      const stageStarted = clock();
-      try {
-        let rows = 0;
-        switch (stage) {
-          case "projection":
-            drained = await drainProjectionMigration(this.buffer.projection, {
-              maxSlices: 1, maxActiveMs: 25, signal: this.signal,
-            });
-            rows = drained.receipt.repairRowsVisited + drained.receipt.backfillRowsVisited +
-              drained.receipt.parityRowsVisited + drained.receipt.metricRowsVisited +
-              drained.receipt.sessionRepairRowsVisited;
-            projectionDrainMs = Math.max(0, Math.round(clock() - stageStarted));
-            break;
-          case "reconciliation":
-            reconciliation = runCodexReconciliationMaintenance(this.buffer.database, {
-              legacyRowLimit: 64, legacyChunkLimit: 64, contextWindowLimit: 2,
-              contextRowLimit: 64, candidateLimit: 32, freshCandidateLimit: 16,
-              timeLimitMs: 25,
-            });
-            rows = reconciliation.rowsVisited;
-            reconciliationMs = Math.max(0, Math.round(clock() - stageStarted));
-            break;
-          case "repricing":
-            repricing = runRepricingMaintenance(this.buffer.database, { backfillLimit: 32, candidateLimit: 32 });
-            rows = repricing.rowsVisited;
-            repricingMs = Math.max(0, Math.round(clock() - stageStarted));
-            break;
-          case "repo_context_suppression":
-            rows = this.buffer.drainRepoContextSuppressions().rowsVisited;
-            break;
+    // Assigned inside the runRepairs closure below; the typed null initializer keeps
+    // the declared union so control-flow narrowing does not reduce it to null.
+    let drained = null as Awaited<ReturnType<typeof drainProjectionMigration>> | null;
+    const runRepairs = async () => {
+      const repairStarted = performance.now();
+      for (let offset = 0; offset < REPAIR_STAGES.length; offset += 1) {
+        const stage = REPAIR_STAGES[(firstRepair + offset) % REPAIR_STAGES.length];
+        if (this.signal?.aborted || !budget.canStart(5) ||
+            (offset > 0 && performance.now() - repairStarted >= 75)) {
+          postCaptureDeferred.push(stage);
+          continue;
         }
-        counter.completed += 1;
-        counter.rowsVisited += rows;
-        counter.lastSuccessAt = new Date(Date.now()).toISOString();
-      } catch (error) {
-        counter.failures += 1;
-        throw error;
-      } finally { saveRepairService(); }
-    }
+        const counter = repairService.stages[stage];
+        counter.attempts += 1;
+        // Rotate only admitted repair turns, avoiding a parity lock on stages.
+        if (!repairTurnAdvanced) {
+          repairService.next = (firstRepair + 1) % REPAIR_STAGES.length;
+          repairTurnAdvanced = true;
+        }
+        saveRepairService();
+        const stageStarted = clock();
+        try {
+          let rows = 0;
+          switch (stage) {
+            case "projection":
+              drained = await drainProjectionMigration(this.buffer.projection, {
+                maxSlices: 1, maxActiveMs: 25, signal: this.signal,
+              });
+              rows = drained.receipt.repairRowsVisited + drained.receipt.backfillRowsVisited +
+                drained.receipt.parityRowsVisited + drained.receipt.metricRowsVisited +
+                drained.receipt.sessionRepairRowsVisited;
+              projectionDrainMs = Math.max(0, Math.round(clock() - stageStarted));
+              break;
+            case "reconciliation":
+              reconciliation = runCodexReconciliationMaintenance(this.buffer.database, {
+                legacyRowLimit: 64, legacyChunkLimit: 64, contextWindowLimit: 2,
+                contextRowLimit: 64, candidateLimit: 32, freshCandidateLimit: 16,
+                timeLimitMs: 25,
+              });
+              rows = reconciliation.rowsVisited;
+              reconciliationMs = Math.max(0, Math.round(clock() - stageStarted));
+              break;
+            case "repricing":
+              repricing = runRepricingMaintenance(this.buffer.database, { backfillLimit: 32, candidateLimit: 32 });
+              rows = repricing.rowsVisited;
+              repricingMs = Math.max(0, Math.round(clock() - stageStarted));
+              break;
+            case "repo_context_suppression":
+              rows = this.buffer.drainRepoContextSuppressions().rowsVisited;
+              break;
+          }
+          counter.completed += 1;
+          counter.rowsVisited += rows;
+          counter.lastSuccessAt = new Date(Date.now()).toISOString();
+        } catch (error) {
+          counter.failures += 1;
+          throw error;
+        } finally { saveRepairService(); }
+      }
+    };
+    if (!captureFirst) await runRepairs();
     const baselineAtStart = captureBaselineStatus(this.buffer.database);
     // Completed source snapshots stay armed while a per-generation ambiguity
     // blocks aggregate readiness. Capture classification remains globally
@@ -810,14 +823,13 @@ export class CollectorMaintenance {
     const phase = baselineAtStart.sources.every((source) => source.status === "complete")
       ? "capture" as const
       : "baseline" as const;
-    // Advance the turn before work starts. If this process dies in a slow
-    // source, the next process begins with the other source instead of
-    // manufacturing starvation across restarts.
+    // Advance before admitted capture, including a possible slow-source kill.
+    // An exhausted repair turn cannot spend the next source's turn.
     const firstSource = maintenanceState(
       this.buffer.database,
       AUTOMATIC_CAPTURE_SOURCE_TURN_KEY,
     ) === "claude_code" ? "claude_code" as const : "codex" as const;
-    setMaintenanceState(
+    if (budget.canContinue()) setMaintenanceState(
       this.buffer.database,
       AUTOMATIC_CAPTURE_SOURCE_TURN_KEY,
       firstSource === "codex" ? "claude_code" : "codex",
@@ -842,7 +854,7 @@ export class CollectorMaintenance {
           ? { stage: options.quarantine.stage, candidateHash: options.quarantine.candidateHash }
           : undefined,
         onProgress: (progress) => options.onProgress?.({ source: "codex", ...progress }) ?? true,
-        deferredBeforeIo: !sourceAccepted ||
+        deferredBeforeIo: !budget.canContinue() || !sourceAccepted ||
           (options.quarantine?.source === "codex" && options.quarantine.stage === "source_scan"),
       }).finally(() => {
         codexCaptureMs = Math.max(0, Math.round(clock() - scanStartedAtMs));
@@ -865,7 +877,7 @@ export class CollectorMaintenance {
           ? { stage: options.quarantine.stage, candidateHash: options.quarantine.candidateHash }
           : undefined,
         onProgress: (progress) => options.onProgress?.({ source: "claude_code", ...progress }) ?? true,
-        deferredBeforeIo: !sourceAccepted ||
+        deferredBeforeIo: !budget.canContinue() || !sourceAccepted ||
           (options.quarantine?.source === "claude_code" && options.quarantine.stage === "source_scan"),
       }).finally(() => {
         claudeCaptureMs = Math.max(0, Math.round(clock() - scanStartedAtMs));
@@ -901,6 +913,11 @@ export class CollectorMaintenance {
     }
     if (transcript.activity && !this.signal?.aborted) {
       this.buffer.projection.recordCaptureActivity({ source: "claude_code", ...transcript.activity });
+    }
+    // Capture-first cadence: repair units take only the allowance capture left.
+    if (captureFirst) {
+      await runRepairs();
+      this.lastBudget = budget.status();
     }
     const errorCount =
       rollout.discoveryErrors + rollout.statErrors + rollout.readErrors + rollout.parseErrors + rollout.unresolvedRecords +

@@ -152,6 +152,14 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-fairness
 
+      - name: Prove capture budget reservation under repair backlog
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-budget
+
+      - name: Prove maintenance lock conflict rolls back for retry
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:sqlite-lock
+
       - name: Prove local HTTP trust boundary
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:http-boundary
