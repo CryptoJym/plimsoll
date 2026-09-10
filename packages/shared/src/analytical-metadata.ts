@@ -246,6 +246,7 @@ const RECORD_ANALYTICAL_SCALARS = new Map<string, AnalyticalScalarKind>([
 ]);
 
 const GENERATED_ANALYTICAL_SCALARS = new Map<string, AnalyticalScalarKind>([
+  ["reasoningOutputTokens", "token_count"],
   ["liveTotalTokens", "token_count"],
   ["liveReasoningOutputTokens", "token_count"],
   ["otelStatusCode", "status_code"],

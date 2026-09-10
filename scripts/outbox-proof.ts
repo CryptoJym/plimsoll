@@ -3434,7 +3434,7 @@ async function hostilePrivacyAndLinkageProof() {
       invalidSent?.metadata.cache_creation_tokens === 4 &&
       invalidSent !== undefined && !("cacheWhateverTokens" in invalidSent.metadata) &&
       invalidSent?.metadata["gen_ai.usage.output_tokens"] === 6 &&
-      !("reasoningOutputTokens" in invalidSent.metadata) &&
+      invalidSent?.metadata.reasoningOutputTokens === 7 &&
       sent.events
         .find((entry) => entry.event.id === invalidLinkageId)
         ?.suppressedFields.includes(GENERIC_SUPPRESSION_RECEIPT) === true &&
