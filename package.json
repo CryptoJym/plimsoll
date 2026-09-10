@@ -13,6 +13,7 @@
     "node": ">=20 <25"
   },
   "scripts": {
+    "typecheck": "tsc --noEmit",
     "collector": "tsx packages/collector-cli/src/cli.ts",
     "proof": "tsx scripts/run-proof.ts scripts/signal-fidelity-proof.ts",
     "proof:gemini-adapter": "tsx scripts/gemini-adapter-proof.ts",
@@ -52,6 +53,8 @@
     "proof:startup-wal-self-heal": "tsx scripts/run-proof.ts --direct-node scripts/startup-wal-self-heal-proof.ts",
     "proof:incremental-capture": "tsx scripts/incremental-capture-proof.ts",
     "proof:capture-fairness": "tsx scripts/capture-fairness-proof.ts",
+    "proof:capture-budget": "tsx scripts/capture-budget-proof.ts",
+    "proof:sqlite-lock": "tsx scripts/sqlite-lock-proof.ts",
     "proof:token-lineage": "tsx scripts/token-lineage-proof.ts",
     "proof:git-context": "tsx scripts/git-context-proof.ts",
     "proof:repo-context": "tsx scripts/repo-context-proof.ts",
