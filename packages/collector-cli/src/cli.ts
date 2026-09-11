@@ -1615,8 +1615,11 @@ async function main() {
       signingSecret: config.uploadSigningSecret,
       endpointUrl: config.accountActorSaltEndpoint,
     });
-    console.log(JSON.stringify({ status: result.synced ? "account_salt_synced" : "account_salt_unallocated",
+    const status = result.reason === "synced" ? "account_salt_synced" :
+      result.reason === "unallocated" ? "account_salt_unallocated" : "account_salt_refused";
+    console.log(JSON.stringify({ status,
       tenantId: result.tenantId, saltVersion: result.saltVersion, synced: result.synced }, null, 2));
+    if (result.reason === "refused") process.exitCode = 1;
     return;
   }
 

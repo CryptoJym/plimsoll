@@ -160,11 +160,22 @@ async function main() {
     let cliCalls = 0;
     const server = http.createServer((request, result) => {
       cliCalls += 1;
-      assert.equal(request.url, "/custom-account-salt");
       assert.equal(request.headers["x-plimsoll-install-key"], INSTALL_KEY);
       request.resume();
+      if (request.url === "/forbidden-account-salt") {
+        result.writeHead(403, { "content-type": "application/json" });
+        result.end(JSON.stringify({ ok: false }));
+        return;
+      }
+      if (request.url === "/unallocated-account-salt") {
+        result.writeHead(404, { "content-type": "application/json" });
+        result.end(JSON.stringify({ ok: false }));
+        return;
+      }
       result.writeHead(200, { "content-type": "application/json" });
-      result.end(JSON.stringify(saltBody()));
+      result.end(JSON.stringify(request.url === "/mismatched-account-salt"
+        ? { ...saltBody(), tenantId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" }
+        : saltBody()));
     });
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
@@ -173,28 +184,43 @@ async function main() {
     try {
       const address = server.address();
       assert.ok(address && typeof address === "object");
-      const config = collectorConfigSchema.parse({
-        managed: true,
-        tenantId: TENANT_ID,
-        deviceId: DEVICE_ID,
-        installKey: INSTALL_KEY,
-        uploadUrl: `http://127.0.0.1:${address.port}/api/work-intelligence/ingest`,
-        accountActorSaltEndpoint: `http://127.0.0.1:${address.port}/custom-account-salt`,
-      });
-      fs.writeFileSync(path.join(cliHome, "collector.config.json"), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
-      const run = await child([
-        path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs"),
-        path.join(process.cwd(), "packages", "collector-cli", "src", "cli.ts"),
-        "sync-account-salt",
-      ], { ...process.env, PLIMSOLL_HOME: cliHome });
+      const runSyncCommand = async (endpointPath: string) => {
+        const config = collectorConfigSchema.parse({
+          managed: true,
+          tenantId: TENANT_ID,
+          deviceId: DEVICE_ID,
+          installKey: INSTALL_KEY,
+          uploadUrl: `http://127.0.0.1:${address.port}/api/work-intelligence/ingest`,
+          accountActorSaltEndpoint: `http://127.0.0.1:${address.port}${endpointPath}`,
+        });
+        fs.writeFileSync(path.join(cliHome, "collector.config.json"), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
+        return child([
+          path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs"),
+          path.join(process.cwd(), "packages", "collector-cli", "src", "cli.ts"),
+          "sync-account-salt",
+        ], { ...process.env, PLIMSOLL_HOME: cliHome });
+      };
+      const run = await runSyncCommand("/custom-account-salt");
       assert.equal(run.exitCode, 0, run.stderr);
       const receipt = JSON.parse(run.stdout) as Record<string, unknown>;
       assert.equal(receipt.status, "account_salt_synced");
       assert.equal(receipt.saltVersion, "salt-v1");
-      assert.equal(cliCalls, 1);
       assert.equal(run.stdout.includes(SALT_V1.toString("base64")), false);
       assert.equal(run.stderr.includes(SALT_V1.toString("base64")), false);
       assert.ok(readAccountAssertionSaltForTenant(cliHome, TENANT_ID));
+
+      const forbidden = await runSyncCommand("/forbidden-account-salt");
+      assert.notEqual(forbidden.exitCode, 0);
+      assert.equal(JSON.parse(forbidden.stdout).status, "account_salt_refused");
+
+      const unallocated = await runSyncCommand("/unallocated-account-salt");
+      assert.equal(unallocated.exitCode, 0, unallocated.stderr);
+      assert.equal(JSON.parse(unallocated.stdout).status, "account_salt_unallocated");
+
+      const mismatched = await runSyncCommand("/mismatched-account-salt");
+      assert.notEqual(mismatched.exitCode, 0);
+      assert.equal(JSON.parse(mismatched.stdout).status, "account_salt_refused");
+      assert.equal(cliCalls, 4);
     } finally {
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     }
@@ -209,6 +235,7 @@ async function main() {
         versionedRotationFailClosed: true,
         joinFetchesOnceAfterHandshake: true,
         syncCommandForJoinedDevice: true,
+        refusalDistinctFromUnallocated: true,
         saltAbsentFromReceipts: true,
       },
     }));

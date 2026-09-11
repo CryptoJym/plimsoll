@@ -4,6 +4,7 @@
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 
@@ -11,6 +12,8 @@ import {
   ACCOUNT_ASSERTION_SALT_FILE,
   ACCOUNT_ASSERTION_SALT_META_FILE,
   ACCOUNT_ASSERTION_STATE_KEY,
+  CODEX_AUTH_OPENID_CONFIGURATION_URL,
+  accountAssertionForBinding,
   accountAssertionV1Schema,
   codexAccountAssertionAt,
   deriveAccountActorHash,
@@ -18,7 +21,6 @@ import {
   loadCodexNativeAccountBinding,
   persistCodexAccountAssertion,
   readAccountAssertionAdapterState,
-  resolveCodexSignedNativeEvidence,
   setAccountAssertionAdapterEnabled,
   storeAccountAssertionSalt,
 } from "../packages/collector-cli/src/account-assertion";
@@ -48,24 +50,36 @@ const AFTER_SECOND = "2026-09-10T21:00:01.000Z";
 const TAILER_SESSION = "019f0000-1111-7222-8333-444444444444";
 const FLEET_SALT = Buffer.from("0123456789abcdef0123456789abcdef", "utf8");
 const RAW_EMAIL = "account-assertion-proof@example.invalid";
-const PROOF_SIGNING_KEYS = crypto.generateKeyPairSync("ed25519");
+const PROOF_SIGNING_KEYS = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+const WRONG_SIGNING_KEYS = crypto.generateKeyPairSync("rsa", { modulusLength: 2048 });
+const PROOF_JWK = {
+  ...(PROOF_SIGNING_KEYS.publicKey.export({ format: "jwk" }) as crypto.JsonWebKey),
+  alg: "RS256",
+  kid: "proof-key",
+  use: "sig",
+};
 
 type Fixture = ReturnType<typeof fixture>;
 
-function signedCodexAuth(accountId: string) {
+function signedCodexAuth(accountId: string, options: {
+  issuer?: string;
+  expiresAt?: string;
+  signingKey?: crypto.KeyObject;
+} = {}) {
   const encoded = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
   const signedBytes = [
-    encoded({ alg: "EdDSA", typ: "JWT", kid: "proof-key" }),
+    encoded({ alg: "RS256", typ: "JWT", kid: "proof-key" }),
     encoded({
-      iss: "https://auth.openai.com",
+      iss: options.issuer ?? "https://auth.openai.com",
+      exp: Math.floor(Date.parse(options.expiresAt ?? "2027-01-01T00:00:00.000Z") / 1000),
       "https://api.openai.com/auth": {
         chatgpt_account_id: accountId,
         chatgpt_plan_type: "pro",
       },
     }),
   ].join(".");
-  const signature = crypto.sign(null, Buffer.from(signedBytes, "utf8"), PROOF_SIGNING_KEYS.privateKey);
-  assert.equal(crypto.verify(null, Buffer.from(signedBytes, "utf8"), PROOF_SIGNING_KEYS.publicKey, signature), true);
+  const signature = crypto.sign("RSA-SHA256", Buffer.from(signedBytes, "utf8"),
+    options.signingKey ?? PROOF_SIGNING_KEYS.privateKey);
   const idToken = `${signedBytes}.${signature.toString("base64url")}`;
   return {
     record: { email: RAW_EMAIL, tokens: { id_token: idToken } },
@@ -74,14 +88,28 @@ function signedCodexAuth(accountId: string) {
   };
 }
 
-function readNativeCodexAuth(record: Record<string, unknown>) {
-  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-native-codex-auth-"));
-  fs.chmodSync(directory, 0o700);
+function bogusCodexAuth(accountId: string) {
+  const encoded = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
+  const idToken = [
+    encoded({ alg: "BOGUS", typ: "JWT", kid: "attacker-key" }),
+    encoded({
+      iss: "https://auth.openai.com",
+      exp: Math.floor(Date.parse("2027-01-01T00:00:00.000Z") / 1000),
+      "https://api.openai.com/auth": { chatgpt_account_id: accountId },
+    }),
+    Buffer.from("not-a-provider-signature", "utf8").toString("base64url"),
+  ].join(".");
+  return { email: RAW_EMAIL, tokens: { id_token: idToken } };
+}
+
+async function readNativeCodexAuth(record: Record<string, unknown>, enrolledAt = FIRST_AT) {
+  const directory = process.env.CODEX_HOME;
+  assert.ok(directory && path.isAbsolute(directory));
   const file = path.join(directory, "auth.json");
   fs.writeFileSync(file, JSON.stringify(record), { mode: 0o600 });
   fs.chmodSync(file, 0o600);
-  try { return loadCodexNativeAccountBinding(file); }
-  finally { fs.unlinkSync(file); fs.rmdirSync(directory); }
+  try { return await loadCodexNativeAccountBinding({ enrolledAt }); }
+  finally { fs.unlinkSync(file); }
 }
 
 function fixture(label: string, options: { salt?: boolean } = {}) {
@@ -114,7 +142,7 @@ function fixture(label: string, options: { salt?: boolean } = {}) {
   return { home, buffer, root, config, localAuth, setNow(value: string) { now = value; } };
 }
 
-function provision(subject: Fixture, producerId: string, credentialId: string, at: string, accountId: string,
+async function provision(subject: Fixture, producerId: string, credentialId: string, at: string, accountId: string,
   extra: Record<string, unknown> = {}) {
   subject.setNow(at);
   const native = signedCodexAuth(accountId);
@@ -126,7 +154,7 @@ function provision(subject: Fixture, producerId: string, credentialId: string, a
     credentialId,
     captureRootId: subject.root.rootId,
     enrolledAt: at,
-    accountBinding: readNativeCodexAuth(native.record),
+    accountBinding: await readNativeCodexAuth(native.record, at),
     ...extra,
   } as Parameters<typeof provisionLiveProducer>[0]);
   return { ...value, native };
@@ -134,6 +162,11 @@ function provision(subject: Fixture, producerId: string, credentialId: string, a
 
 function errorMessage(action: () => unknown) {
   try { action(); } catch (error) { return error instanceof Error ? error.message : String(error); }
+  return "";
+}
+
+async function rejectedMessage(action: () => Promise<unknown>) {
+  try { await action(); } catch (error) { return error instanceof Error ? error.message : String(error); }
   return "";
 }
 
@@ -189,6 +222,48 @@ function tokenCountLine(timestamp: string, input: number, output: number) {
 
 const opened: Fixture[] = [];
 async function main() {
+const originalCodexHome = process.env.CODEX_HOME;
+const originalFetch = globalThis.fetch;
+const codexHome = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "plimsoll-proof-codex-home-"));
+fs.chmodSync(codexHome, 0o700);
+process.env.CODEX_HOME = codexHome;
+let jwksAvailable = false;
+let jwksRequests = 0;
+const jwksServer = http.createServer((request, response) => {
+  jwksRequests += 1;
+  assert.equal(request.method, "GET");
+  request.resume();
+  if (!jwksAvailable) {
+    response.writeHead(503, { "content-type": "application/json" });
+    response.end(JSON.stringify({ ok: false }));
+    return;
+  }
+  assert.ok(request.url === "/openid" || request.url === "/jwks");
+  response.writeHead(200, { "content-type": "application/json" });
+  response.end(JSON.stringify(request.url === "/openid" ? {
+    issuer: "https://auth.openai.com",
+    jwks_uri: "https://auth.openai.com/.well-known/jwks.json",
+    id_token_signing_alg_values_supported: ["RS256"],
+  } : { keys: [PROOF_JWK] }));
+});
+await new Promise<void>((resolve, reject) => {
+  jwksServer.once("error", reject);
+  jwksServer.listen(0, "127.0.0.1", resolve);
+});
+const jwksAddress = jwksServer.address();
+assert.ok(jwksAddress && typeof jwksAddress === "object");
+globalThis.fetch = (async (input, init) => {
+  const requested = String(input);
+  assert.ok(requested === CODEX_AUTH_OPENID_CONFIGURATION_URL ||
+    requested === "https://auth.openai.com/.well-known/jwks.json");
+  assert.equal(init?.redirect, "manual");
+  const route = requested === CODEX_AUTH_OPENID_CONFIGURATION_URL ? "/openid" : "/jwks";
+  const loopbackResponse = await originalFetch(`http://127.0.0.1:${jwksAddress.port}${route}`, {
+    ...init, redirect: "manual",
+  });
+  const bytes = await loopbackResponse.arrayBuffer();
+  return new Response(bytes, { status: loopbackResponse.status, headers: loopbackResponse.headers });
+}) as typeof fetch;
 try {
   const primary = fixture("primary");
   opened.push(primary);
@@ -198,20 +273,91 @@ try {
 
   // P1 evidence: only the real Codex auth.json field is accepted. The
   // evidence reference is the digest of the exact signed id-token bytes.
-  assert.equal(resolveCodexSignedNativeEvidence(nativeA.record), null);
-  const nativeDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-native-codex-reread-"));
-  fs.chmodSync(nativeDirectory, 0o700);
-  const nativeFile = path.join(nativeDirectory, "auth.json");
-  fs.writeFileSync(nativeFile, JSON.stringify(nativeA.record), { mode: 0o600 });
-  fs.chmodSync(nativeFile, 0o600);
-  const resolvedA = resolveCodexSignedNativeEvidence(loadCodexNativeAccountBinding(nativeFile));
-  assert.deepEqual(resolvedA, { identity: accountA, evidenceRef: nativeA.evidenceRef });
-  assert.deepEqual(resolveCodexSignedNativeEvidence(loadCodexNativeAccountBinding(nativeFile)), resolvedA);
-  fs.unlinkSync(nativeFile);
-  fs.rmdirSync(nativeDirectory);
-  assert.equal(resolveCodexSignedNativeEvidence({ providerAccountId: accountA, credentialId: "routing-only" }), null);
+  assert.throws(() => accountAssertionForBinding({
+    source: "codex", binding: nativeA.record, collectorHome: primary.home,
+    tenantId: TENANT_ID, validFrom: FIRST_AT,
+  }), /account_signed_evidence_unavailable/);
+  const attackerDirectory = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "plimsoll-attacker-codex-auth-"));
+  fs.chmodSync(attackerDirectory, 0o700);
+  const attackerFile = path.join(attackerDirectory, "auth.json");
+  fs.writeFileSync(attackerFile, JSON.stringify(bogusCodexAuth(accountA)), { mode: 0o600 });
+  fs.chmodSync(attackerFile, 0o600);
+  let attackerBinding: unknown;
+  try {
+    attackerBinding = await (loadCodexNativeAccountBinding as unknown as
+      (legacyArbitraryFile: string) => Promise<unknown>)(attackerFile);
+  } catch {}
+  fs.unlinkSync(attackerFile);
+  fs.rmdirSync(attackerDirectory);
+  assert.equal(attackerBinding === undefined, true);
 
-  const enrollmentA = provision(primary, "proof-producer", "credential-a", FIRST_AT, accountA);
+  let bogusBinding;
+  const bogusFailure = await rejectedMessage(async () => {
+    bogusBinding = await readNativeCodexAuth(bogusCodexAuth(accountA));
+  });
+  assert.match(bogusFailure, /account_signed_evidence_unavailable/);
+  assert.equal(bogusBinding, undefined);
+  assert.equal(jwksRequests, 0);
+  const bogusFixture = fixture("bogus-evidence");
+  opened.push(bogusFixture);
+  const bogusEnrollment = provisionLiveProducer({
+    home: bogusFixture.home, buffer: bogusFixture.buffer, config: bogusFixture.config,
+    producerId: "bogus-producer", credentialId: "bogus-credential",
+    captureRootId: bogusFixture.root.rootId, enrolledAt: FIRST_AT,
+    accountBinding: bogusBinding,
+  });
+  assert.equal(bogusEnrollment.accountAssertion, null);
+
+  let unavailableBinding;
+  const unavailableFailure = await rejectedMessage(async () => {
+    unavailableBinding = await readNativeCodexAuth(nativeA.record);
+  });
+  assert.match(unavailableFailure, /account_signed_evidence_unavailable/);
+  assert.equal(unavailableBinding === undefined, true);
+  assert.equal(jwksRequests, 1);
+  const unavailableFixture = fixture("unavailable-jwks");
+  opened.push(unavailableFixture);
+  const unavailableEnrollment = provisionLiveProducer({
+    home: unavailableFixture.home, buffer: unavailableFixture.buffer, config: unavailableFixture.config,
+    producerId: "unavailable-producer", credentialId: "unavailable-credential",
+    captureRootId: unavailableFixture.root.rootId, enrolledAt: FIRST_AT,
+    accountBinding: unavailableBinding,
+  });
+  assert.equal(unavailableEnrollment.accountAssertion, null);
+
+  jwksAvailable = true;
+  const verifiedA = await readNativeCodexAuth(nativeA.record);
+  const resolvedA = accountAssertionForBinding({
+    source: "codex", binding: verifiedA, collectorHome: primary.home,
+    tenantId: TENANT_ID, validFrom: FIRST_AT,
+  });
+  assert.equal(resolvedA.evidenceRef, nativeA.evidenceRef);
+  assert.equal(resolvedA.actorHash, deriveAccountActorHash(accountA, FLEET_SALT));
+  assert.equal(jwksRequests, 3);
+  const rereadA = accountAssertionForBinding({
+    source: "codex", binding: await readNativeCodexAuth(nativeA.record), collectorHome: primary.home,
+    tenantId: TENANT_ID, validFrom: FIRST_AT,
+  });
+  assert.equal(rereadA.evidenceRef, resolvedA.evidenceRef);
+  assert.equal(rereadA.actorHash, resolvedA.actorHash);
+  assert.equal(jwksRequests, 3);
+
+  const wrongSignature = signedCodexAuth(accountA, { signingKey: WRONG_SIGNING_KEYS.privateKey });
+  assert.match(await rejectedMessage(() => readNativeCodexAuth(wrongSignature.record)),
+    /account_signed_evidence_unavailable/);
+  const wrongIssuer = signedCodexAuth(accountA, { issuer: "https://attacker.invalid" });
+  assert.match(await rejectedMessage(() => readNativeCodexAuth(wrongIssuer.record)),
+    /account_signed_evidence_unavailable/);
+  const expired = signedCodexAuth(accountA, { expiresAt: "2026-09-10T19:59:59.000Z" });
+  assert.match(await rejectedMessage(() => readNativeCodexAuth(expired.record)),
+    /account_signed_evidence_unavailable/);
+  assert.equal(jwksRequests, 3);
+  assert.throws(() => accountAssertionForBinding({
+    source: "codex", binding: { providerAccountId: accountA, credentialId: "routing-only" },
+    collectorHome: primary.home, tenantId: TENANT_ID, validFrom: FIRST_AT,
+  }), /account_signed_evidence_unavailable/);
+
+  const enrollmentA = await provision(primary, "proof-producer", "credential-a", FIRST_AT, accountA);
   assert.ok(enrollmentA.accountAssertion);
   const assertionA = accountAssertionV1Schema.parse(enrollmentA.accountAssertion);
   assert.equal(assertionA.evidenceRef, nativeA.evidenceRef);
@@ -233,12 +379,12 @@ try {
   // explicitly unallocated and creates no local fallback salt.
   const peer = fixture("peer");
   opened.push(peer);
-  const peerEnrollment = provision(peer, "peer-producer", "peer-credential", FIRST_AT, accountA);
+  const peerEnrollment = await provision(peer, "peer-producer", "peer-credential", FIRST_AT, accountA);
   assert.equal(peerEnrollment.accountAssertion?.actorHash, assertionA.actorHash);
   assert.equal(deriveAccountActorHash(accountA, FLEET_SALT), assertionA.actorHash);
   const unsalted = fixture("unsalted", { salt: false });
   opened.push(unsalted);
-  const unsaltedEnrollment = provision(unsalted, "unsalted-producer", "unsalted-credential", FIRST_AT, accountA);
+  const unsaltedEnrollment = await provision(unsalted, "unsalted-producer", "unsalted-credential", FIRST_AT, accountA);
   assert.equal(unsaltedEnrollment.accountAssertion, null);
   assert.equal(fs.existsSync(path.join(unsalted.home, ACCOUNT_ASSERTION_SALT_FILE)), false);
   assert.equal(fs.existsSync(path.join(unsalted.home, ACCOUNT_ASSERTION_SALT_META_FILE)), false);
@@ -297,7 +443,7 @@ try {
 
   // P1 failover: all immutable windows hydrate, delayed pre-failover events
   // resolve A, post-failover live events resolve B, and B has a new epoch.
-  const enrollmentB = provision(primary, "proof-producer", "credential-b", SECOND_AT, accountB);
+  const enrollmentB = await provision(primary, "proof-producer", "credential-b", SECOND_AT, accountB);
   const assertionB = accountAssertionV1Schema.parse(enrollmentB.accountAssertion);
   assert.notEqual(enrollmentB.binding.installationEpochId, enrollmentA.binding.installationEpochId);
   assert.notEqual(assertionB.actorHash, assertionA.actorHash);
@@ -368,8 +514,8 @@ try {
   const multi = fixture("multi");
   opened.push(multi);
   const multiWorkspaceEpoch = multi.buffer.workspaceBinding()!.currentInstallationEpochId;
-  const multiA = provision(multi, "multi-producer-a", "multi-credential-a", FIRST_AT, accountA);
-  const multiB = provision(multi, "multi-producer-b", "multi-credential-b", SECOND_AT, accountB);
+  const multiA = await provision(multi, "multi-producer-a", "multi-credential-a", FIRST_AT, accountA);
+  const multiB = await provision(multi, "multi-producer-b", "multi-credential-b", SECOND_AT, accountB);
   assert.notEqual(multiA.binding.installationEpochId, multiB.binding.installationEpochId);
   assert.equal(multi.buffer.workspaceBinding()!.currentInstallationEpochId, multiWorkspaceEpoch);
   for (const [producerId, enrollment] of [["multi-producer-a", multiA], ["multi-producer-b", multiB]] as const) {
@@ -382,7 +528,7 @@ try {
   // assertion. The refusal leaves the additive maintenance record unchanged.
   const overlap = fixture("overlap");
   opened.push(overlap);
-  const overlapEnrollment = provision(overlap, "overlap-producer", "overlap-credential", FIRST_AT, accountA);
+  const overlapEnrollment = await provision(overlap, "overlap-producer", "overlap-credential", FIRST_AT, accountA);
   (setAccountAssertionAdapterEnabled as unknown as (
     db: typeof overlap.buffer.database, source: "codex", enabled: boolean, at?: string,
   ) => unknown)(overlap.buffer.database, "codex", false, SECOND_AT);
@@ -400,7 +546,7 @@ try {
   // active prior window, registry bytes, or live credential rows.
   const capacity = fixture("capacity");
   opened.push(capacity);
-  provision(capacity, "existing-producer", "existing-credential", FIRST_AT, accountA);
+  await provision(capacity, "existing-producer", "existing-credential", FIRST_AT, accountA);
   const capacityFile = path.join(capacity.home, LIVE_BINDINGS_FILE);
   fs.writeFileSync(capacityFile, JSON.stringify(capacityRegistry(capacity)), { mode: 0o600 });
   fs.chmodSync(capacityFile, 0o600);
@@ -410,7 +556,7 @@ try {
     registry: fs.readFileSync(capacityFile, "utf8"),
     liveBindings: capacity.buffer.database.prepare("select count(*) as count from codex_live_bindings").get(),
   };
-  const capacityFailure = errorMessage(() => provision(capacity, "overflow-producer", "overflow-credential",
+  const capacityFailure = await rejectedMessage(() => provision(capacity, "overflow-producer", "overflow-credential",
     SECOND_AT, accountB));
   assert.match(capacityFailure, /live_registry_capacity/);
   assert.equal(databaseState(capacity), capacityBefore.state);
@@ -426,7 +572,7 @@ try {
   // rather than an artificial throw inside the transaction.
   const registration = fixture("registration");
   opened.push(registration);
-  provision(registration, "registration-producer", "registration-a", FIRST_AT, accountA);
+  await provision(registration, "registration-producer", "registration-a", FIRST_AT, accountA);
   const secondRoot: CaptureRoot = {
     ...registration.root,
     rootId: "registration-second-root",
@@ -444,11 +590,12 @@ try {
     liveBindings: registration.buffer.database.prepare("select count(*) as count from codex_live_bindings").get(),
   };
   const registrationNative = signedCodexAuth(accountB);
+  const registrationBinding = await readNativeCodexAuth(registrationNative.record, SECOND_AT);
   const registrationFailure = errorMessage(() => provisionLiveProducer({
     home: registration.home, buffer: registration.buffer, config: secondConfig,
     producerId: "registration-producer", credentialId: "registration-b",
     captureRootId: secondRoot.rootId, enrolledAt: SECOND_AT,
-    accountBinding: readNativeCodexAuth(registrationNative.record),
+    accountBinding: registrationBinding,
   }));
   assert.match(registrationFailure, /live_producer_rebinding_forbidden/);
   assert.equal(databaseState(registration), registrationBefore.state);
@@ -461,7 +608,7 @@ try {
   // SQLite/workspace state exactly.
   const publication = fixture("publication");
   opened.push(publication);
-  const publishedA = provision(publication, "publication-producer", "publication-a", FIRST_AT, accountA);
+  const publishedA = await provision(publication, "publication-producer", "publication-a", FIRST_AT, accountA);
   const publicationRegistry = path.join(publication.home, LIVE_BINDINGS_FILE);
   const publicationBefore = {
     state: databaseState(publication),
@@ -471,7 +618,7 @@ try {
     liveBindings: publication.buffer.database.prepare("select count(*) as count from codex_live_bindings").get(),
   };
   let publicationCalls = 0;
-  const publicationFailure = errorMessage(() => provision(publication, "publication-producer", "publication-b",
+  const publicationFailure = await rejectedMessage(() => provision(publication, "publication-producer", "publication-b",
     SECOND_AT, accountB, {
       afterFilePublication: (kind: string) => {
         publicationCalls += 1;
@@ -487,7 +634,7 @@ try {
   assert.deepEqual(publication.buffer.database.prepare("select count(*) as count from codex_live_bindings").get(),
     publicationBefore.liveBindings);
 
-  const tokenFailure = errorMessage(() => provision(publication, "publication-producer", "publication-c",
+  const tokenFailure = await rejectedMessage(() => provision(publication, "publication-producer", "publication-c",
     SECOND_AT, accountB, {
       beforeFilePublication: (kind: string) => {
         if (kind === "credential") throw new Error("proof_credential_publication_failure");
@@ -567,6 +714,12 @@ try {
       provisioningPublicationCompensated: true,
       activeStateCapacityFailClosed: true,
       fleetSaltNoLocalFallback: true,
+      canonicalCodexAuthPathOnly: true,
+      unsupportedAlgorithmRejected: true,
+      wrongSignatureRejected: true,
+      issuerAndEnrollmentExpiryVerified: true,
+      jwksUnavailableUnallocated: true,
+      boundedCachedProviderJwks: true,
       signedNativeEvidenceStable: true,
       canonicalisationBudgetsControlled: true,
       hashOnlyPrivacy: true,
@@ -579,6 +732,11 @@ try {
   console.log(proofOutput);
 } finally {
   for (const subject of opened) subject.buffer.close();
+  globalThis.fetch = originalFetch;
+  await new Promise<void>((resolve, reject) => jwksServer.close(error => error ? reject(error) : resolve()));
+  fs.rmSync(codexHome, { recursive: true, force: true });
+  if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
+  else process.env.CODEX_HOME = originalCodexHome;
 }
 }
 

@@ -46,21 +46,33 @@ export async function syncAccountActorSalt(options: {
   fetchImpl?: typeof fetch;
   endpointUrl?: string;
 }): Promise<AccountSaltSyncResult> {
-  const origin = validatedTransportUrl(options.uploadUrl, "account salt channel").origin;
-  const url = options.endpointUrl ? validatedTransportUrl(options.endpointUrl, "account salt endpoint").href :
-    new URL(CLOUD_ACCOUNT_SALT_PATH, origin).href;
-  if (new URL(url).origin !== origin) throw new Error("account_salt_origin_mismatch");
-  const body = JSON.stringify({ schema: "account-actor-salt-request/v1", tenantId: options.tenantId, deviceId: options.deviceId });
-  const response = await authenticatedJsonPost({
-    url, body, fetchImpl: options.fetchImpl, installKey: options.installKey,
-    ingestKey: options.ingestKey, signingSecret: options.signingSecret,
-    maxRequestBytes: 4 * 1024, maxResponseBytes: 4 * 1024,
+  const refused = (): AccountSaltSyncResult => ({
+    synced: false, tenantId: options.tenantId, saltVersion: null, reason: "refused",
   });
+  let response: Awaited<ReturnType<typeof authenticatedJsonPost>>;
+  try {
+    const origin = validatedTransportUrl(options.uploadUrl, "account salt channel").origin;
+    const url = options.endpointUrl ? validatedTransportUrl(options.endpointUrl, "account salt endpoint").href :
+      new URL(CLOUD_ACCOUNT_SALT_PATH, origin).href;
+    if (new URL(url).origin !== origin) throw new Error("account_salt_origin_mismatch");
+    const body = JSON.stringify({ schema: "account-actor-salt-request/v1", tenantId: options.tenantId, deviceId: options.deviceId });
+    response = await authenticatedJsonPost({
+      url, body, fetchImpl: options.fetchImpl, installKey: options.installKey,
+      ingestKey: options.ingestKey, signingSecret: options.signingSecret,
+      maxRequestBytes: 4 * 1024, maxResponseBytes: 4 * 1024,
+    });
+  } catch {
+    // Remote URL, transport, redirect, size, deadline and JSON failures are
+    // refusals. Keep their diagnostics value-blind and never create a salt.
+    return refused();
+  }
   if (!response.ok) return { synced: false, tenantId: options.tenantId, saltVersion: null,
     reason: response.status === 404 ? "unallocated" : "refused" };
   const parsed = responseSchema.safeParse(response.body);
-  if (!parsed.success || parsed.data.tenantId !== options.tenantId) throw new Error("account_salt_response_invalid");
-  const bytes = saltBytes(parsed.data.salt);
+  if (!parsed.success || parsed.data.tenantId !== options.tenantId) return refused();
+  let bytes: Buffer;
+  try { bytes = saltBytes(parsed.data.salt); }
+  catch { return refused(); }
   storeAccountAssertionSalt(options.collectorHome, bytes, { tenantId: options.tenantId, version: parsed.data.saltVersion });
   // Maintenance state is additive and records only tenant/version metadata.
   const ledgerPath = path.join(options.collectorHome, "work-ledger.sqlite");

@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import type Database from "better-sqlite3";
 import { z } from "zod";
@@ -41,9 +42,9 @@ export const accountAssertionSchema = accountAssertionV1Schema;
 
 declare const CODEX_NATIVE_AUTH_BINDING: unique symbol;
 /** Capability returned only by an owner-only native auth.json read. */
-export type CodexNativeAuthBinding = Readonly<Record<string, unknown>> & {
+export type CodexNativeAuthBinding = Readonly<{
   readonly [CODEX_NATIVE_AUTH_BINDING]: true;
-};
+}>;
 
 export type AccountAssertionAdapterState = {
   schema: "account-assertion-adapters/v1";
@@ -417,13 +418,145 @@ function decodeBase64UrlJson(value: string): Record<string, unknown> | null {
 
 type CodexSignedNativeEvidence = Readonly<{ identity: string; evidenceRef: string }>;
 const codexNativeEvidenceCapabilities = new WeakMap<object, CodexSignedNativeEvidence>();
+export const CODEX_AUTH_PROVIDER_ORIGIN = "https://auth.openai.com" as const;
+export const CODEX_AUTH_OPENID_CONFIGURATION_URL =
+  `${CODEX_AUTH_PROVIDER_ORIGIN}/.well-known/openid-configuration` as const;
+export const CODEX_ID_TOKEN_ALGORITHMS = ["RS256"] as const;
+const CODEX_ID_TOKEN_ALGORITHM_SET = new Set<string>(CODEX_ID_TOKEN_ALGORITHMS);
+const CODEX_JWKS_TIMEOUT_MS = 5_000;
+const CODEX_JWKS_MAX_BYTES = 256 * 1024;
+const CODEX_JWKS_CACHE_MS = 5 * 60_000;
+const openIdConfigurationSchema = z.object({
+  issuer: z.string().url(),
+  jwks_uri: z.string().url(),
+  id_token_signing_alg_values_supported: z.array(z.string()).max(16),
+}).passthrough();
+const jwksSchema = z.object({
+  keys: z.array(z.record(z.string(), z.unknown())).max(64),
+}).passthrough();
+type CodexVerificationMaterial = {
+  issuer: string;
+  algorithms: ReadonlySet<string>;
+  keys: Record<string, unknown>[];
+};
+let cachedCodexVerificationMaterial: (CodexVerificationMaterial & { expiresAt: number }) | null = null;
+
+async function boundedProviderJson(url: string, expectedOrigin: string): Promise<unknown> {
+  const target = new URL(url);
+  if (target.origin !== expectedOrigin || target.protocol !== "https:" || target.username || target.password) {
+    throw new Error("account_signed_evidence_unavailable");
+  }
+  const controller = new AbortController();
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+  let timer: ReturnType<typeof setTimeout>;
+  const deadline = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error("account_signed_evidence_unavailable"));
+    }, CODEX_JWKS_TIMEOUT_MS);
+  });
+  const read = async () => {
+    const response = await fetch(target.href, {
+      method: "GET",
+      redirect: "manual",
+      signal: controller.signal,
+      headers: { accept: "application/json" },
+    });
+    if (controller.signal.aborted || response.redirected ||
+        (response.status >= 300 && response.status < 400) || response.status !== 200 ||
+        (response.url && new URL(response.url).origin !== expectedOrigin) ||
+        !(response.headers.get("content-type") ?? "").toLowerCase().includes("json")) {
+      void response.body?.cancel().catch(() => undefined);
+      throw new Error("account_signed_evidence_unavailable");
+    }
+    const declaredLength = Number(response.headers.get("content-length"));
+    if (declaredLength > CODEX_JWKS_MAX_BYTES) {
+      void response.body?.cancel().catch(() => undefined);
+      throw new Error("account_signed_evidence_unavailable");
+    }
+    reader = response.body?.getReader();
+    if (!reader) throw new Error("account_signed_evidence_unavailable");
+    const chunks: Uint8Array[] = [];
+    let bytes = 0;
+    while (true) {
+      const chunk = await reader.read();
+      if (chunk.done) break;
+      bytes += chunk.value.byteLength;
+      if (bytes > CODEX_JWKS_MAX_BYTES) throw new Error("account_signed_evidence_unavailable");
+      chunks.push(chunk.value);
+    }
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks));
+    return JSON.parse(text) as unknown;
+  };
+  try {
+    return await Promise.race([read(), deadline]);
+  } catch {
+    throw new Error("account_signed_evidence_unavailable");
+  } finally {
+    clearTimeout(timer!);
+    controller.abort();
+    if (reader) {
+      void reader.cancel().catch(() => undefined);
+      try { reader.releaseLock(); } catch {}
+    }
+  }
+}
+
+async function codexVerificationMaterial(forceRefresh = false): Promise<CodexVerificationMaterial> {
+  if (!forceRefresh && cachedCodexVerificationMaterial && cachedCodexVerificationMaterial.expiresAt > Date.now()) {
+    return cachedCodexVerificationMaterial;
+  }
+  const providerOrigin = new URL(CODEX_AUTH_PROVIDER_ORIGIN).origin;
+  const configuration = openIdConfigurationSchema.safeParse(
+    await boundedProviderJson(CODEX_AUTH_OPENID_CONFIGURATION_URL, providerOrigin),
+  );
+  if (!configuration.success) throw new Error("account_signed_evidence_unavailable");
+  const issuer = new URL(configuration.data.issuer);
+  const jwks = new URL(configuration.data.jwks_uri);
+  if ((issuer.href !== providerOrigin && issuer.href !== `${providerOrigin}/`) ||
+      issuer.protocol !== "https:" || issuer.username || issuer.password ||
+      jwks.origin !== providerOrigin || jwks.protocol !== "https:" || jwks.username || jwks.password) {
+    throw new Error("account_signed_evidence_unavailable");
+  }
+  const algorithms = new Set(configuration.data.id_token_signing_alg_values_supported
+    .filter(algorithm => CODEX_ID_TOKEN_ALGORITHM_SET.has(algorithm)));
+  if (algorithms.size === 0) throw new Error("account_signed_evidence_unavailable");
+  const keySet = jwksSchema.safeParse(await boundedProviderJson(jwks.href, providerOrigin));
+  if (!keySet.success) throw new Error("account_signed_evidence_unavailable");
+  cachedCodexVerificationMaterial = {
+    issuer: configuration.data.issuer,
+    algorithms,
+    keys: keySet.data.keys,
+    expiresAt: Date.now() + CODEX_JWKS_CACHE_MS,
+  };
+  return cachedCodexVerificationMaterial;
+}
+
+function canonicalBase64Url(value: unknown, maxLength: number) {
+  if (typeof value !== "string" || !value || value.length > maxLength || !/^[A-Za-z0-9_-]+$/.test(value)) return false;
+  try { return Buffer.from(value, "base64url").toString("base64url") === value; }
+  catch { return false; }
+}
+
+function providerVerificationKey(keys: readonly Record<string, unknown>[], kid: string, algorithm: string) {
+  const matches = keys.filter(key => key.kid === kid && key.kty === "RSA" &&
+    (key.alg === undefined || key.alg === algorithm) && (key.use === undefined || key.use === "sig") &&
+    (key.key_ops === undefined || (Array.isArray(key.key_ops) && key.key_ops.includes("verify"))) &&
+    canonicalBase64Url(key.n, 2048) && canonicalBase64Url(key.e, 16) &&
+    !["d", "p", "q", "dp", "dq", "qi", "oth", "k"].some(field => field in key));
+  if (matches.length !== 1) return null;
+  try {
+    const key = crypto.createPublicKey({ key: matches[0] as crypto.JsonWebKey, format: "jwk" });
+    const bits = key.asymmetricKeyDetails?.modulusLength;
+    return key.asymmetricKeyType === "rsa" && bits !== undefined && bits >= 2048 && bits <= 8192 ? key : null;
+  } catch { return null; }
+}
 
 /**
- * Parse the exact signed field inside a native Codex auth record. Signature
- * authenticity is inherited from the owner-only native-file boundary; the
- * collector deliberately does not invent a provider JWKS/network dependency.
+ * Parse and verify the exact signed field inside a native Codex auth record.
+ * The identity exists only long enough to derive the hash-only assertion.
  */
-function parseCodexSignedNativeEvidence(binding: unknown): CodexSignedNativeEvidence | null {
+async function parseCodexSignedNativeEvidence(binding: unknown, enrolledAt: string): Promise<CodexSignedNativeEvidence | null> {
   if (!binding || typeof binding !== "object") return null;
   const root = binding as Record<string, unknown>;
   const tokens = root.tokens;
@@ -436,13 +569,34 @@ function parseCodexSignedNativeEvidence(binding: unknown): CodexSignedNativeEvid
   const claims = decodeBase64UrlJson(parts[1]);
   let signature: Buffer;
   try { signature = Buffer.from(parts[2], "base64url"); } catch { return null; }
-  if (!header || !claims || typeof header.alg !== "string" || header.alg.toLowerCase() === "none" ||
-      signature.length === 0 || signature.toString("base64url") !== parts[2]) return null;
+  if (!header || !claims || !CODEX_ID_TOKEN_ALGORITHM_SET.has(String(header.alg)) ||
+      typeof header.kid !== "string" || !/^[A-Za-z0-9._:-]{1,256}$/.test(header.kid) ||
+      header.crit !== undefined || signature.length === 0 || signature.length > 1024 ||
+      signature.toString("base64url") !== parts[2]) return null;
+  let material = await codexVerificationMaterial();
+  if (!material.algorithms.has(String(header.alg))) return null;
+  let key = providerVerificationKey(material.keys, header.kid, String(header.alg));
+  if (!key) {
+    material = await codexVerificationMaterial(true);
+    if (!material.algorithms.has(String(header.alg))) return null;
+    key = providerVerificationKey(material.keys, header.kid, String(header.alg));
+  }
+  if (!key || !crypto.verify("RSA-SHA256", Buffer.from(`${parts[0]}.${parts[1]}`, "utf8"), key, signature)) return null;
+  const enrollmentMillis = Date.parse(enrolledAt);
+  if (claims.iss !== material.issuer || !Number.isSafeInteger(claims.exp) ||
+      !Number.isFinite(enrollmentMillis) || Number(claims.exp) <= enrollmentMillis / 1000) return null;
   const apiClaims = claims["https://api.openai.com/auth"];
   if (!apiClaims || typeof apiClaims !== "object" || Array.isArray(apiClaims)) return null;
   const identity = safeIdentity((apiClaims as Record<string, unknown>).chatgpt_account_id);
   if (!identity) return null;
   return { identity, evidenceRef: `sha256:${crypto.createHash("sha256").update(idToken, "utf8").digest("hex")}` };
+}
+
+function canonicalCodexAuthPath() {
+  const configured = process.env.CODEX_HOME?.trim();
+  const directory = path.resolve(configured || path.join(os.homedir(), ".codex"));
+  if (!path.isAbsolute(configured || directory)) throw new Error("codex_native_auth_path_invalid");
+  return { directory, file: path.join(directory, "auth.json") };
 }
 
 /**
@@ -451,20 +605,30 @@ function parseCodexSignedNativeEvidence(binding: unknown): CodexSignedNativeEvid
  * returned object carries an in-process capability whose value is derived
  * while the verified file descriptor is open.
  */
-export function loadCodexNativeAccountBinding(file: string): CodexNativeAuthBinding {
-  if (!path.isAbsolute(file) || path.basename(file) !== "auth.json") throw new Error("codex_native_auth_path_invalid");
-  const directory = fs.lstatSync(path.dirname(file));
-  if (directory.isSymbolicLink() || !directory.isDirectory() || (directory.mode & 0o7077) !== 0 ||
-      (typeof process.getuid === "function" && directory.uid !== process.getuid())) {
+export async function loadCodexNativeAccountBinding(options: { enrolledAt: string }): Promise<CodexNativeAuthBinding> {
+  if (!options || typeof options !== "object" || !timestamp.safeParse(options.enrolledAt).success) {
+    throw new Error("codex_native_auth_path_invalid");
+  }
+  const { directory, file } = canonicalCodexAuthPath();
+  let directoryStat: fs.Stats;
+  try { directoryStat = fs.lstatSync(directory); }
+  catch { throw new Error("codex_native_auth_directory_unsafe"); }
+  if (directoryStat.isSymbolicLink() || !directoryStat.isDirectory() || fs.realpathSync(directory) !== directory ||
+      (directoryStat.mode & 0o7077) !== 0 ||
+      (typeof process.getuid === "function" && directoryStat.uid !== process.getuid())) {
     throw new Error("codex_native_auth_directory_unsafe");
   }
-  const before = fs.lstatSync(file);
+  let before: fs.Stats;
+  try { before = fs.lstatSync(file); }
+  catch { throw new Error("codex_native_auth_file_unsafe"); }
   if (before.isSymbolicLink() || !before.isFile() || before.size <= 0 || before.size > 512 * 1024 ||
       (before.mode & 0o7077) !== 0 ||
       (typeof process.getuid === "function" && before.uid !== process.getuid())) {
     throw new Error("codex_native_auth_file_unsafe");
   }
-  const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  let descriptor: number;
+  try { descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW); }
+  catch { throw new Error("codex_native_auth_file_unsafe"); }
   let bytes: string;
   try {
     const opened = fs.fstatSync(descriptor);
@@ -475,7 +639,9 @@ export function loadCodexNativeAccountBinding(file: string): CodexNativeAuthBind
     }
     const raw = fs.readFileSync(descriptor);
     const after = fs.fstatSync(descriptor);
-    const current = fs.lstatSync(file);
+    let current: fs.Stats;
+    try { current = fs.lstatSync(file); }
+    catch { throw new Error("codex_native_auth_file_changed"); }
     if (raw.length !== opened.size || after.size !== opened.size || after.mtimeMs !== opened.mtimeMs ||
         after.ctimeMs !== opened.ctimeMs || current.isSymbolicLink() || current.dev !== opened.dev ||
         current.ino !== opened.ino || current.size !== opened.size) {
@@ -489,21 +655,19 @@ export function loadCodexNativeAccountBinding(file: string): CodexNativeAuthBind
   let parsed: unknown;
   try { parsed = JSON.parse(bytes); } catch { throw new Error("codex_native_auth_record_invalid"); }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("codex_native_auth_record_invalid");
-  const evidence = parseCodexSignedNativeEvidence(parsed);
+  let evidence: CodexSignedNativeEvidence | null;
+  try { evidence = await parseCodexSignedNativeEvidence(parsed, options.enrolledAt); }
+  catch { evidence = null; }
   if (!evidence) throw new Error("account_signed_evidence_unavailable");
-  codexNativeEvidenceCapabilities.set(parsed, Object.freeze({ ...evidence }));
-  return parsed as CodexNativeAuthBinding;
+  const capability = Object.freeze({}) as CodexNativeAuthBinding;
+  codexNativeEvidenceCapabilities.set(capability, Object.freeze({ ...evidence }));
+  return capability;
 }
 
-/** Resolve evidence only from the verified native-file capability above. */
-export function resolveCodexSignedNativeEvidence(binding: unknown): CodexSignedNativeEvidence | null {
+/** Resolve evidence only inside this module from the verified capability. */
+function resolveCodexSignedNativeEvidence(binding: unknown): CodexSignedNativeEvidence | null {
   if (!binding || typeof binding !== "object") return null;
   return codexNativeEvidenceCapabilities.get(binding) ?? null;
-}
-
-/** Resolve only a stable identity from signed native claims. */
-export function resolveCodexAccountIdentity(binding: unknown): string | null {
-  return resolveCodexSignedNativeEvidence(binding)?.identity ?? null;
 }
 
 export function accountAssertionForBinding(options: {
