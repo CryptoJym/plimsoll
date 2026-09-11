@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import Database from "better-sqlite3";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -21,7 +22,7 @@ const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-reliability-"));
 const realNow = Date.now;
 const now = realNow();
 const checks: Array<{ name: string; passed: boolean; detail?: unknown; error?: string }> = [];
-const EXPECTED_CHECKS = 11;
+const EXPECTED_CHECKS = 12;
 let nextId = 0;
 function event() {
   return aiInteractionEventSchema.parse({
@@ -123,7 +124,7 @@ async function main() {
       return { failedRefreshes: failed.statusRefreshCounters.failures, clockRollback: "stale" };
     } finally { await http.close(); buffer.close(); }
   });
-  await check("partial_ingest_retry_and_deferred_projection_conserve_exact_totals", async () => {
+  await check("partial_ingest_retries_in_process_and_conserves_exact_totals", async () => {
     const buffer = fixture("partial-ingest"); settle(buffer);
     const http = await serve(buffer);
     const original = buffer.appendMany.bind(buffer);
@@ -142,12 +143,8 @@ async function main() {
     const post = () => fetch(http.base + "/v1/logs", {method: "POST", body,
       headers: {"content-type": "application/json", "x-plimsoll-source": "codex"}});
     try {
-      const interrupted = await post();
-      assert.equal(interrupted.status, 503);
-      assert.equal((await interrupted.json() as {reason:string}).reason, "storage_busy_retry");
-      assert.equal((buffer.database.prepare("select count(*) as n from buffered_events").get() as {n:number}).n, 16);
-      buffer.appendMany = (events, metrics, drops) => original(events, metrics, drops, {projectionDeadlineMs: 0});
       assert.equal((await post()).status, 202);
+      assert.equal((buffer.database.prepare("select count(*) as n from buffered_events").get() as {n:number}).n, 40);
       assert.equal((await post()).status, 202);
       const raw = buffer.database.prepare("select count(*) as events,sum(input_tokens) as input,sum(output_tokens) as output from buffered_events").get();
       assert.deepEqual(raw, {events: 40, input: 40, output: 80});
@@ -159,8 +156,55 @@ async function main() {
         assert.equal((read.snapshot.summary.totals as any).inputTokens, 40);
         assert.equal((read.snapshot.summary.totals as any).outputTokens, 80);
       }
-      return {partialCommitted: 16, final: raw, projectionSettled: true};
+      return {partialCommittedBeforeRetry: 16, final: raw, projectionSettled: true, appendCalls: calls};
     } finally {await http.close(); buffer.close();}
+  });
+  await check("hook_append_waits_for_maintenance_writer_without_blocking_event_loop", async () => {
+    const ledgerPath = path.join(root, "hook-maintenance-writer.sqlite");
+    const buffer = new LocalEventBuffer(ledgerPath, { databaseBusyTimeoutMs: 0 });
+    const maintenance = new Database(ledgerPath, { timeout: 0 });
+    maintenance.pragma("journal_mode = WAL");
+    const http = await serve(buffer);
+    const body = JSON.stringify({
+      id: "00000000-0000-4000-8000-000000000099",
+      event_type: "Stop",
+      timestamp: new Date(now).toISOString(),
+      session_id: "maintenance-contention-hook",
+    });
+    let release: ReturnType<typeof setTimeout> | null = null;
+    try {
+      maintenance.exec("begin immediate");
+      const waitStarted = performance.now();
+      const eventLoopTick = new Promise<number>((resolve) => {
+        setTimeout(() => resolve(performance.now() - waitStarted), 10);
+      });
+      release = setTimeout(() => maintenance.exec("commit"), 120);
+      const responsePromise = fetch(http.base + "/hooks/codex", {
+        method: "POST",
+        body,
+        headers: {"content-type": "application/json", "x-plimsoll-source": "codex"},
+      });
+      const [response, eventLoopDelayMs] = await Promise.all([responsePromise, eventLoopTick]);
+      const elapsedMs = performance.now() - waitStarted;
+      const receipt = await response.json() as { accepted?: boolean; eventId?: string };
+      assert.equal(response.status, 202);
+      assert.equal(receipt.accepted, true);
+      assert.ok(receipt.eventId);
+      assert.ok(elapsedMs >= 100 && elapsedMs < 1_000, `hook retry elapsed ${elapsedMs}ms`);
+      assert.ok(eventLoopDelayMs < 100, `event loop timer delayed ${eventLoopDelayMs}ms`);
+      assert.equal(
+        (buffer.database.prepare("select count(*) as n from buffered_events where id = ?")
+          .get(receipt.eventId) as { n: number }).n,
+        1,
+      );
+      return { elapsedMs, eventLoopDelayMs, status: response.status, durableRows: 1 };
+    } finally {
+      if (release) clearTimeout(release);
+      if (maintenance.inTransaction) maintenance.exec("rollback");
+      await http.close();
+      maintenance.close();
+      buffer.close();
+    }
   });
   await check("repair_followup_respects_circuit_and_stalled_backoff", async () => {
     const buffer = fixture("repair-cadence");

@@ -43,6 +43,7 @@ import {
   parseBoundedJson,
   readBoundedRequestBody,
   requireOtlpSource,
+  retryStorageBusy,
   type LocalProducerSource,
 } from "./http-boundary";
 import {
@@ -762,11 +763,13 @@ export function createCollectorServer(
         assertBoundedJsonNodes(payload);
         if (hasLiveUsageClaim(payload)) throw new HttpBoundaryRejection("source_not_allowed", 403);
         budget.checkpoint();
-        const normalized = appendForwardedHook(payload, {
-          config,
-          buffer,
-          source,
-        });
+        const normalized = await retryStorageBusy(budget, () =>
+          appendForwardedHook(payload, {
+            config,
+            buffer,
+            source,
+          })
+        );
         rejectionDiagnostics.recordAccepted(source);
         response.writeHead(202, { "content-type": "application/json" });
         response.end(
@@ -816,7 +819,9 @@ export function createCollectorServer(
           exploded.droppedEventCount > 0
         ) {
           budget.checkpoint();
-          for (const { hash, label } of repoLabels) buffer.recordRepoLabel(hash, label);
+          for (const { hash, label } of repoLabels) {
+            await retryStorageBusy(budget, () => buffer.recordRepoLabel(hash, label));
+          }
           // Admission is durable in small transactions. Yield between chunks
           // so availability reads and other producers receive a turn. A retry
           // after any partial commit retains the existing deterministic IDs.
@@ -827,11 +832,14 @@ export function createCollectorServer(
           for (let chunk = 0; chunk < chunks; chunk += 1) {
             if (chunk > 0) await new Promise<void>(resolve => setImmediate(resolve));
             budget.checkpoint();
-            const result = buffer.appendMany(
-              exploded.events.slice(chunk * 16, (chunk + 1) * 16),
-              exploded.metricSamples.slice(chunk * 16, (chunk + 1) * 16),
-              chunk === 0 ? exploded.admissionDrops : [],
-              { projectionDeadlineMs },
+            const result = await retryStorageBusy(
+              budget,
+              () => buffer.appendMany(
+                exploded.events.slice(chunk * 16, (chunk + 1) * 16),
+                exploded.metricSamples.slice(chunk * 16, (chunk + 1) * 16),
+                chunk === 0 ? exploded.admissionDrops : [],
+                { projectionDeadlineMs },
+              ),
             );
             integrity.deduplicatedCount += result.deduplicatedCount;
             integrity.collisionQuarantinedCount += result.collisionQuarantinedCount;
@@ -873,12 +881,14 @@ export function createCollectorServer(
           content_encoding: body.contentEncoding,
         };
         budget.checkpoint();
-        const normalized = appendForwardedHook(fallbackPayload, {
-          config,
-          buffer,
-          source,
-          transportPath: canonicalOtlpTransportPath(request.url),
-        });
+        const normalized = await retryStorageBusy(budget, () =>
+          appendForwardedHook(fallbackPayload, {
+            config,
+            buffer,
+            source,
+            transportPath: canonicalOtlpTransportPath(request.url),
+          })
+        );
         rejectionDiagnostics.recordAccepted(source);
         response.writeHead(202, { "content-type": "application/json" });
         response.end(

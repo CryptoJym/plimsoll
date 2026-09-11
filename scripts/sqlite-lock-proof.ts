@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { runDeadlineMaintenanceStages } from "../packages/collector-cli/src/maintenance-stage-primitives";
+import { aiInteractionEventSchema } from "../packages/shared/src/index";
 
 const require = createRequire(path.resolve("package.json"));
 const Database = require("better-sqlite3");
@@ -18,6 +19,7 @@ const largePendingRows = 4_096;
 
 type InjectionStage = "retention" | "fill_pending_event_links";
 type InjectionOutcome = "committed" | string;
+type RemainingStage = "projection" | "repo_context_fill" | "capture";
 
 try {
   assert.equal(maintenance.pragma("journal_mode", { simple: true }), "wal");
@@ -113,6 +115,95 @@ try {
     (maintenance as any).prepare = originalPrepare;
   }
 
+  assert.equal(maintenance.inTransaction, false);
+  assert.equal(capture.inTransaction, false);
+
+  const remainingOutcomes = new Map<RemainingStage, InjectionOutcome>();
+  let activeStage: RemainingStage | null = null;
+  const competeRemaining = (stage: RemainingStage) => {
+    if (activeStage !== stage || remainingOutcomes.has(stage)) return;
+    try {
+      capture.prepare("update fixture_capture_writer set n=n+1").run();
+      remainingOutcomes.set(stage, "committed");
+    } catch (error: any) {
+      remainingOutcomes.set(stage, error.code ?? error.name);
+    }
+  };
+  const probePrepare = maintenance.prepare.bind(maintenance);
+  (maintenance as any).prepare = (sql: string) => {
+    const statement = probePrepare(sql);
+    if (
+      sql.includes("from repo_context_results r") &&
+      sql.includes("idx_repo_context_event_links_pending_context")
+    ) {
+      const all = statement.all.bind(statement);
+      (statement as any).all = (...args: any[]) => {
+        const rows = all(...args);
+        competeRemaining("repo_context_fill");
+        return rows;
+      };
+    }
+    if (sql.includes("from codex_live_pins")) {
+      const get = statement.get.bind(statement);
+      (statement as any).get = (...args: any[]) => {
+        const row = get(...args);
+        competeRemaining("capture");
+        return row;
+      };
+    }
+    return statement;
+  };
+  const projection = buffer.projection as any;
+  const originalControl = projection.control.bind(projection);
+  projection.control = (...args: any[]) => {
+    const row = originalControl(...args);
+    if (maintenance.inTransaction) competeRemaining("projection");
+    return row;
+  };
+  const errors = new Map<RemainingStage, string | null>();
+  const values = new Map<RemainingStage, unknown>();
+  const probe = (stage: RemainingStage, run: () => unknown) => {
+    activeStage = stage;
+    try {
+      values.set(stage, run());
+      errors.set(stage, null);
+    } catch (error: any) {
+      errors.set(stage, error.code ?? error.name);
+    } finally {
+      activeStage = null;
+    }
+  };
+  try {
+    probe("projection", () => buffer.projection.runMaintenance(new Date(recent)));
+    probe("repo_context_fill", () => buffer.drainRepoContextFills(1));
+    const captureEvent = aiInteractionEventSchema.parse({
+      id: "00000000-0000-4000-8000-000000000001",
+      source: "codex",
+      dataMode: "metadata",
+      eventType: "usage_rollout",
+      observedAt: recent,
+      sessionId: "sqlite-lock-proof-session",
+      inputTokens: 1,
+      outputTokens: 1,
+    });
+    probe("capture", () =>
+      buffer.transactionWithRepoContextHandoffs(() => buffer.append(captureEvent))
+    );
+  } finally {
+    projection.control = originalControl;
+    (maintenance as any).prepare = probePrepare;
+  }
+
+  assert.deepEqual(Object.fromEntries(errors), {
+    projection: null,
+    repo_context_fill: null,
+    capture: null,
+  });
+  assert.deepEqual(Object.fromEntries(remainingOutcomes), {
+    projection: "SQLITE_BUSY",
+    repo_context_fill: "SQLITE_BUSY",
+    capture: "SQLITE_BUSY",
+  });
   assert.equal(
     deadlineError,
     null,
@@ -128,11 +219,11 @@ try {
     "fill_pending_event_links",
   ]);
   assert.equal(result?.stages.at(-1)?.rows, 256);
+  assert.equal((values.get("repo_context_fill") as { rowsVisited: number }).rowsVisited, 1);
+  assert.equal(values.get("capture"), true);
   assert.equal(maintenance.inTransaction, false);
   assert.equal(capture.inTransaction, false);
-  assert.equal(capture.prepare("select n from fixture_capture_writer").pluck().get(), 1);
   capture.prepare("update fixture_capture_writer set n=n+1").run();
-  assert.equal(capture.prepare("select n from fixture_capture_writer").pluck().get(), 2);
 
   console.log(JSON.stringify({
     proof: "sqlite_lock",
@@ -141,12 +232,19 @@ try {
     legacyDeferredCode,
     deadlineStages: result?.stages.map(({ stage, rows }) => ({ stage, rows })),
     competingWritesDuringMaintenance: Object.fromEntries(outcomes),
+    remainingWorkerTransactions: {
+      errors: Object.fromEntries(errors),
+      competingWrites: Object.fromEntries(remainingOutcomes),
+    },
     checks: {
       walConnections: 2,
       staleSnapshotRaceReproduced: true,
       largeTableDeadlinePathExercised: true,
       retentionWriterClaimedBeforeRead: true,
       pendingFillWriterClaimedBeforeRead: true,
+      projectionWriterClaimedBeforeRead: true,
+      repoContextFillWriterClaimedBeforeRead: true,
+      captureWriterClaimedBeforeRead: true,
       deadlineMaintenanceSucceeded: true,
       competingWriterSucceededAfterMaintenance: true,
     },

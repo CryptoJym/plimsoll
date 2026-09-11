@@ -318,7 +318,7 @@ export function runRepricingMaintenance(
       rowsVisited: legacyRowsVisited + candidates.length,
       repriced,
     };
-  })();
+  }).immediate();
 }
 
 export type RepoEnrichmentMaintenanceResult = {
@@ -543,7 +543,7 @@ export function runRepoEnrichmentMaintenance(
       backward,
       forward,
     };
-  })();
+  }).immediate();
 }
 
 /**

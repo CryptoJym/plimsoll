@@ -24,6 +24,11 @@ export const LOCAL_HTTP_LIMITS = Object.freeze({
   otlpAttributesPerContainer: 128,
   otlpAttributesTotal: 16_384,
   requestDeadlineMs: 1_500,
+  // A maintenance writer may briefly own WAL. Retry durable hook/OTLP appends
+  // with timer yields for at most half the request deadline, leaving the
+  // event loop responsive and ample time to return inside curl's 2 s cap.
+  storageBusyRetryBudgetMs: 750,
+  storageBusyRetryDelayMs: 25,
   // Issue 0056 (#104): per-source admission ceiling before any body decode or
   // ledger work. Generous for real tool cadence (hooks + periodic OTLP
   // exports), yet bounds a flood so it cannot monopolize the event loop.
@@ -79,12 +84,20 @@ export class HttpBoundaryRejection extends Error {
   }
 }
 
-export function asHttpBoundaryRejection(error: unknown) {
-  if (error instanceof HttpBoundaryRejection) return error;
-  const code = error && typeof error === "object" && "code" in error
+function sqliteErrorCode(error: unknown) {
+  return error && typeof error === "object" && "code" in error
     ? String((error as { code?: unknown }).code ?? "")
     : "";
-  return code === "SQLITE_BUSY" || code === "SQLITE_LOCKED"
+}
+
+function isStorageBusy(error: unknown) {
+  const code = sqliteErrorCode(error);
+  return code.startsWith("SQLITE_BUSY") || code.startsWith("SQLITE_LOCKED");
+}
+
+export function asHttpBoundaryRejection(error: unknown) {
+  if (error instanceof HttpBoundaryRejection) return error;
+  return isStorageBusy(error)
     ? new HttpBoundaryRejection("storage_busy_retry", 503)
     : new HttpBoundaryRejection("internal_rejection", 400);
 }
@@ -212,6 +225,38 @@ export function createRequestBudget(): RequestBudget {
       }
     },
   };
+}
+
+/**
+ * Retry a synchronous durable append after a competing WAL writer releases.
+ * SQLite remains fail-fast (busy timeout 0); timer waits yield to every other
+ * request and never extend past the request deadline or the 750 ms retry cap.
+ */
+export async function retryStorageBusy<T>(budget: RequestBudget, append: () => T | Promise<T>) {
+  let retryDeadlineAt: number | null = null;
+  let lastBusy: unknown;
+  for (;;) {
+    if (retryDeadlineAt !== null && performance.now() >= retryDeadlineAt) throw lastBusy;
+    budget.checkpoint();
+    try {
+      return await append();
+    } catch (error) {
+      if (!isStorageBusy(error)) throw error;
+      lastBusy = error;
+      const now = performance.now();
+      retryDeadlineAt ??= now + Math.min(
+        LOCAL_HTTP_LIMITS.storageBusyRetryBudgetMs,
+        Math.max(0, budget.remainingMs() - 1),
+      );
+      const waitMs = Math.min(
+        LOCAL_HTTP_LIMITS.storageBusyRetryDelayMs,
+        retryDeadlineAt - now,
+        Math.max(0, budget.remainingMs() - 1),
+      );
+      if (waitMs <= 0) throw error;
+      await new Promise<void>((resolve) => setTimeout(resolve, Math.ceil(waitMs)));
+    }
+  }
 }
 
 export function readBoundedRequestBody(

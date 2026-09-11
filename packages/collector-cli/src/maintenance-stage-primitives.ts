@@ -272,7 +272,7 @@ export function runEnrichmentStage(
     });
     advance(database, "enrichment", slice.rowsVisited, null);
     return slice;
-  })();
+  }).immediate();
   return timer.result(result.rowsVisited);
 }
 
