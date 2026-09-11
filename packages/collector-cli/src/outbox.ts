@@ -28,6 +28,8 @@ export const DEFAULT_DELIVERY_LIMITS = {
   maxProbesPerCycle: 31,
 } as const;
 
+const REMOTE_REJECTED_MAX_ATTEMPTS = 5;
+
 export type DeliveryLimits = {
   [Key in keyof typeof DEFAULT_DELIVERY_LIMITS]: number;
 };
@@ -42,6 +44,7 @@ export type DeliveryFailureClass =
   | "remote_validation"
   | "remote_auth"
   | "remote_transient"
+  | "remote_rejected"
   | "remote_contract";
 
 export type DeliveryCircuit = "none" | "auth_blocked" | "contract_blocked";
@@ -52,6 +55,7 @@ export type DeliveryReceiptReason =
   | "local_schema_invalid"
   | "local_privacy_violation"
   | "local_item_oversize"
+  | "remote_rejected_exhausted"
   | "remote_validation_rejected";
 
 function isTerminalPrivacyReason(
@@ -71,6 +75,7 @@ export type DeliveryStatus = {
     | "pressure_byte_budget"
     | "pressure_age_budget"
     | "migration_slice_budget"
+    | "remote_rejected"
     | "auth_circuit"
     | "contract_circuit"
   >;
@@ -278,6 +283,7 @@ function attachFillOnlyLinkage(
 
 function terminalStatusClass(reason: DeliveryReceiptReason) {
   if (reason === "remote_acknowledged") return "remote_2xx";
+  if (reason === "remote_rejected_exhausted") return "remote_rejected";
   if (reason === "remote_validation_rejected") return "remote_validation";
   return "local_validation";
 }
@@ -455,6 +461,7 @@ export class DeliveryOutbox {
         migration_last_at text,
         privacy_migration_version integer not null default 0,
         validation_probe_rows integer not null default 0,
+        active_remote_rejected integer not null default 0,
         updated_at text not null
       );
       insert or ignore into upload_control (singleton, updated_at)
@@ -555,6 +562,37 @@ export class DeliveryOutbox {
          add column privacy_migration_version integer not null default 0`,
       );
     }
+    if (!controlColumns.some((column) => column.name === "active_remote_rejected")) {
+      this.db.exec(
+        `alter table upload_control
+         add column active_remote_rejected integer not null default 0`,
+      );
+    }
+    this.db.exec(`
+      create trigger if not exists trg_upload_remote_rejected_gauge_insert
+      after insert on upload_outbox
+      when new.last_failure_class = 'remote_rejected'
+      begin
+        update upload_control set active_remote_rejected = active_remote_rejected + 1
+        where singleton = 1;
+      end;
+      create trigger if not exists trg_upload_remote_rejected_gauge_delete
+      after delete on upload_outbox
+      when old.last_failure_class = 'remote_rejected'
+      begin
+        update upload_control set active_remote_rejected = active_remote_rejected - 1
+        where singleton = 1;
+      end;
+      create trigger if not exists trg_upload_remote_rejected_gauge_update
+      after update of last_failure_class on upload_outbox
+      when old.last_failure_class <> new.last_failure_class
+      begin
+        update upload_control set active_remote_rejected = active_remote_rejected
+          - case when old.last_failure_class = 'remote_rejected' then 1 else 0 end
+          + case when new.last_failure_class = 'remote_rejected' then 1 else 0 end
+        where singleton = 1;
+      end;
+    `);
     const outboxColumns = this.db
       .prepare(`pragma table_info(upload_outbox)`)
       .all() as Array<{ name: string }>;
@@ -991,7 +1029,7 @@ export class DeliveryOutbox {
                  select 1 from upload_validation_candidates c
                  where c.delivery_id = upload_outbox.delivery_id
                ) then 2
-               when last_failure_class in ('remote_validation', 'local_request_budget') then 1
+               when last_failure_class in ('remote_validation', 'remote_rejected', 'local_request_budget') then 1
                else 0
              end,
              next_attempt_at, created_at, delivery_id
@@ -1434,6 +1472,52 @@ export class DeliveryOutbox {
     return run();
   }
 
+  settleRemoteRejections(leaseId: string, items: LeasedDeliveryItem[], at = new Date()) {
+    const terminalAt = at.toISOString();
+    const get = this.db.prepare(
+      `select attempt_count as attemptCount, created_at as createdAt
+       from upload_outbox where delivery_id = ? and state = 'in_flight' and lease_id = ?`,
+    );
+    const retry = this.db.prepare(
+      `update upload_outbox set state = 'retry', next_attempt_at = @nextAttemptAt,
+         lease_id = null, lease_expires_at = null,
+         last_failure_class = 'remote_rejected', updated_at = @now
+       where delivery_id = @deliveryId and state = 'in_flight' and lease_id = @leaseId`,
+    );
+    const remove = this.db.prepare(
+      `delete from upload_outbox where delivery_id = ? and state = 'in_flight' and lease_id = ?`,
+    );
+    return this.db.transaction(() => {
+      let retried = 0;
+      let dead = 0;
+      for (const item of items) {
+        const row = get.get(item.deliveryId, leaseId) as
+          | { attemptCount: number; createdAt: string }
+          | undefined;
+        if (!row) continue;
+        if (row.attemptCount >= REMOTE_REJECTED_MAX_ATTEMPTS) {
+          dead += this.writeReceipt({
+            deliveryId: item.deliveryId,
+            state: "dead",
+            reason: "remote_rejected_exhausted",
+            attemptCount: row.attemptCount,
+            createdAt: row.createdAt,
+            terminalAt,
+          });
+          remove.run(item.deliveryId, leaseId);
+          continue;
+        }
+        retried += retry.run({
+          deliveryId: item.deliveryId,
+          leaseId,
+          nextAttemptAt: this.nextAttemptAt(item.deliveryId, row.attemptCount, at),
+          now: terminalAt,
+        }).changes;
+      }
+      return { retried, dead };
+    })();
+  }
+
   openCircuit(kind: Exclude<DeliveryCircuit, "none">, at = new Date()) {
     const until = new Date(at.getTime() + this.limits.maxBackoffSeconds * 1_000).toISOString();
     this.db
@@ -1471,7 +1555,8 @@ export class DeliveryOutbox {
            migration_last_enqueued as lastEnqueued,
            migration_last_dead as lastDead,
            migration_last_skipped_uploaded as lastSkippedUploaded,
-           migration_last_at as lastAt
+           migration_last_at as lastAt,
+           active_remote_rejected as activeRemoteRejected
          from upload_control where singleton = 1`,
       )
       .get() as {
@@ -1496,6 +1581,7 @@ export class DeliveryOutbox {
       lastDead: number;
       lastSkippedUploaded: number;
       lastAt: string | null;
+      activeRemoteRejected: number;
     };
     const active = {
       pending: control.pending,
@@ -1523,6 +1609,7 @@ export class DeliveryOutbox {
     );
     if (control.circuitKind === "auth_blocked") degradedReasons.push("auth_circuit");
     if (control.circuitKind === "contract_blocked") degradedReasons.push("contract_circuit");
+    if (control.activeRemoteRejected > 0) degradedReasons.push("remote_rejected");
     if (control.pausedReason === "slice_budget_too_small") {
       degradedReasons.push("migration_slice_budget");
     }

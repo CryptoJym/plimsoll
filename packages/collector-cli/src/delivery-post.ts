@@ -10,6 +10,8 @@ export async function postDelivery(input: JsonPostOptions & {
   if (Buffer.byteLength(input.body) > MAX_POST_BYTES) throw new TransportError("request_too_large");
   const expected = deliveryExpectation(input.body, input.installKey);
   const response = await authenticatedJsonPost({ ...input, headers: { ...input.headers, [DELIVERY_ACK_HEADER]: "1" } });
-  if (response.ok) validateDeliveryAcknowledgement(response.body, expected);
-  return response;
+  const acknowledgement = response.ok
+    ? validateDeliveryAcknowledgement(response.body, expected)
+    : null;
+  return { ...response, acknowledgement };
 }

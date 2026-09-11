@@ -15,6 +15,7 @@ import {
 import { sealOutboundEnvelope } from "./outbound-envelope";
 import { TransportError, validatedTransportUrl } from "./http-transport";
 import { postDelivery } from "./delivery-post";
+import { deliveryExpectation } from "./delivery-ack";
 import { PLIMSOLL_VERSION } from "./version";
 import type { SyncStorageRetryController } from "./sqlite-contention";
 
@@ -94,6 +95,8 @@ type ProbeResult = {
   statusClass: string;
   summary: SafeResponseSummary;
   requestBytes: number;
+  acceptedItems: LeasedDeliveryItem[];
+  rejectedItems: LeasedDeliveryItem[];
 };
 
 const CLOUD_DEVICE_ID_RECONCILE_DEFERRED_INTERVAL_MS = 5 * 60 * 1_000;
@@ -176,6 +179,8 @@ async function postItems(input: {
       statusClass: "local_request_budget",
       summary: {},
       requestBytes: bytes,
+      acceptedItems: [],
+      rejectedItems: [],
     };
   }
   let response: Awaited<ReturnType<typeof postDelivery>>;
@@ -192,7 +197,7 @@ async function postItems(input: {
     const localBudget = error instanceof TransportError && error.code === "request_too_large";
     return { ok: false, status: transient ? 0 : -1,
       statusClass: localBudget ? "local_request_budget" : transient ? "network" : "remote_contract",
-      summary: {}, requestBytes: bytes };
+      summary: {}, requestBytes: bytes, acceptedItems: [], rejectedItems: [] };
   }
   const responseDeviceId = response.ok && response.body && typeof response.body === "object" &&
     !Array.isArray(response.body)
@@ -209,9 +214,18 @@ async function postItems(input: {
       reportCloudDeviceIdReconcileDeferred(input.now());
     }
   }
+  const acceptedIds = new Set(response.acknowledgement?.acceptedIds ?? []);
+  const rejectedIds = new Set(response.acknowledgement?.rejectedIds ?? []);
+  const expectation = deliveryExpectation(body, input.config.installKey);
   return {
     ok: response.ok, status: response.status, statusClass: statusClass(response.status),
     summary: response.ok ? safeResponseSummary(response.body) : {}, requestBytes: bytes,
+    acceptedItems: response.ok
+      ? input.items.filter((_item, index) => acceptedIds.has(expectation.itemIds[index]!))
+      : [],
+    rejectedItems: response.ok
+      ? input.items.filter((_item, index) => rejectedIds.has(expectation.itemIds[index]!))
+      : [],
   };
 }
 
@@ -469,6 +483,7 @@ export async function uploadBufferedEvents(
   let probes = 0;
   let lastSummary: SafeResponseSummary = {};
   const succeeded = new Map<string, LeasedDeliveryItem>();
+  const remoteRejected = new Map<string, LeasedDeliveryItem>();
   const validationSingletons = new Map<string, LeasedDeliveryItem>();
   const requestBudgetItems = new Map<string, LeasedDeliveryItem>();
   const unresolved = new Map<string, LeasedDeliveryItem>();
@@ -507,7 +522,8 @@ export async function uploadBufferedEvents(
     });
     if (result.ok) {
       lastSummary = result.summary;
-      for (const item of group) succeeded.set(item.deliveryId, item);
+      for (const item of result.acceptedItems) succeeded.set(item.deliveryId, item);
+      for (const item of result.rejectedItems) remoteRejected.set(item.deliveryId, item);
       continue;
     }
     if (result.statusClass === "local_request_budget") {
@@ -632,6 +648,12 @@ export async function uploadBufferedEvents(
     options.afterSiblingAcknowledgement?.();
   }
   let deadLetters = locallyDead;
+  const rejectedSettlement = await storage(() => buffer.delivery.settleRemoteRejections(
+    lease.leaseId,
+    [...remoteRejected.values()],
+    nowFn(),
+  ));
+  deadLetters += rejectedSettlement.dead;
   if ((succeeded.size > 0 || validationWitnessProven) && validationSingletons.size > 0) {
     deadLetters += await storage(() => buffer.delivery.deadLetterRemote(
       lease.leaseId,
@@ -663,7 +685,7 @@ export async function uploadBufferedEvents(
     if (failure === "remote_contract") {
       await storage(() => buffer.delivery.openCircuit("contract_blocked", nowFn()));
     }
-  } else if (succeeded.size > 0) {
+  } else if (succeeded.size > 0 || remoteRejected.size > 0) {
     await storage(() => buffer.delivery.clearCircuit(nowFn()));
   }
   if (requestBudgetItems.size > 0) {
@@ -684,7 +706,11 @@ export async function uploadBufferedEvents(
   }
 
   const effectiveFailure = failure ??
-    (requestBudgetItems.size > 0 ? "local_request_budget" as const : null);
+    (requestBudgetItems.size > 0
+      ? "local_request_budget" as const
+      : remoteRejected.size > 0
+        ? "remote_rejected" as const
+        : null);
 
   const deliveryStatus = buffer.delivery.status(nowFn());
   const acknowledgedBatch =
@@ -712,7 +738,7 @@ export async function uploadBufferedEvents(
       rootLeaseEvents: lease.items.length,
     },
   };
-  if (effectiveFailure && succeeded.size === 0) {
+  if (effectiveFailure && (failure || requestBudgetItems.size > 0) && succeeded.size === 0) {
     throw new DeliveryUploadError(
       effectiveFailure,
       fatal?.statusClass ?? effectiveFailure,
