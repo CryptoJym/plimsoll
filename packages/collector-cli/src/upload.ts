@@ -171,10 +171,14 @@ async function postItems(input: {
       fetchImpl: input.fetchImpl, now: input.now,
       timeoutMs: input.timeoutSeconds * 1_000, maxRequestBytes: input.maxBytes,
     });
-    if (response.ok && response.body && typeof response.body === "object" && !Array.isArray(response.body)) {
+    const responseDeviceId = response.ok && response.body && typeof response.body === "object" &&
+      !Array.isArray(response.body)
+      ? (response.body as Record<string, unknown>).deviceId
+      : undefined;
+    if (typeof responseDeviceId === "string") {
       reconcileCloudDeviceIdFromIngest(
         input.config,
-        (response.body as Record<string, unknown>).deviceId,
+        responseDeviceId,
         { now: input.now() },
       );
     }
