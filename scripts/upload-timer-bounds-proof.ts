@@ -224,7 +224,7 @@ async function main() {
     }
   });
 
-  await check("daemon_run_sync_passes_bounded_result_option", () => {
+  await check("daemon_run_sync_passes_bounded_result_and_storage_retry_options", () => {
     const source = fs.readFileSync(
       new URL("../packages/collector-cli/src/cli.ts", import.meta.url),
       "utf8",
@@ -236,7 +236,7 @@ async function main() {
     const runSync = source.slice(start, end);
     assert.match(
       runSync,
-      /await uploadBufferedEvents\(\s*config,\s*buffer,\s*\{\s*includeLegacyRemainingUnuploaded:\s*false,?\s*\}\s*\)/,
+      /await uploadBufferedEvents\(\s*config,\s*buffer,\s*\{\s*includeLegacyRemainingUnuploaded:\s*false,\s*storageRetry,\s*\}\s*\)/,
     );
     const manualStart = source.indexOf('  if (command === "upload") {');
     const manualEnd = source.indexOf('  if (command === "upload-history") {', manualStart);
@@ -244,7 +244,7 @@ async function main() {
     assert.notEqual(manualEnd, -1);
     assert.doesNotMatch(
       source.slice(manualStart, manualEnd),
-      /includeLegacyRemainingUnuploaded/,
+      /includeLegacyRemainingUnuploaded|storageRetry/,
     );
   });
 
