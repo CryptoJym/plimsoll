@@ -68,6 +68,23 @@ async function main() {
     ['contradictory_error',{...valid(),error:'fixture-secret'}],['negative_inserted',{...valid(),inserted:-1}],
     ['fractional_inserted',{...valid(),inserted:0.5}],['excess_inserted',{...valid(),inserted:3}],
   ];
+  await check('well_formed_partial_acknowledgement_returns_partition',()=>{
+    const acknowledgement=deliveryAcknowledgement(expected,expected.itemIds.slice(0,1));
+    const partition=validateDeliveryAcknowledgement({ok:true,accepted:1,inserted:1,ack:acknowledgement},expected);
+    assert.deepEqual(partition,{acceptedIds:expected.itemIds.slice(0,1),rejectedIds:expected.itemIds.slice(1)});
+  });
+  await check('post_delivery_returns_partial_partition',async()=>{
+    const acknowledgement=deliveryAcknowledgement(expected,expected.itemIds.slice(0,1));
+    const result=await postDelivery({...options,fetchImpl:fake({ok:true,accepted:1,inserted:1,ack:acknowledgement})});
+    assert.deepEqual(result.acknowledgement,{acceptedIds:expected.itemIds.slice(0,1),rejectedIds:expected.itemIds.slice(1)});
+  });
+  await check('history_retains_well_formed_partial_acknowledgement',async()=>{
+    const acknowledgement=deliveryAcknowledgement(expected,expected.itemIds.slice(0,1));
+    await assert.rejects(
+      postHistoryBatch({...options,fetchImpl:fake({ok:true,accepted:1,inserted:1,ack:acknowledgement}),sleep:async()=>{},maxAttempts:1,log:()=>{}}),
+      /remote_rejected/,
+    );
+  });
   for (const [name,body] of invalid) await check(`history_rejects_${name}`, async()=>{
     await assert.rejects(postHistoryBatch({...options,fetchImpl:fake(body),sleep:async()=>{},maxAttempts:1,log:()=>{}}));
   });

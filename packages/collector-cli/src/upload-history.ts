@@ -5,7 +5,7 @@ import Database from "better-sqlite3";
 
 import type { CollectorConfig } from "./config";
 import { postDelivery } from "./delivery-post";
-import { TransportError, type JsonPostResult } from "./http-transport";
+import { TransportError } from "./http-transport";
 import {
   assertCollectorPrivacyMode,
   collectorBufferPath,
@@ -555,7 +555,7 @@ export async function postHistoryBatch(input: {
 }> {
   let lastError = "network_error";
   for (let attempt = 1; attempt <= input.maxAttempts; attempt += 1) {
-    let response: JsonPostResult | undefined;
+    let response: Awaited<ReturnType<typeof postDelivery>> | undefined;
     try {
       response = await postDelivery({ ...input, timeoutMs: input.timeoutMs });
     } catch (error) {
@@ -565,10 +565,17 @@ export async function postHistoryBatch(input: {
       }
     }
     if (response?.ok) {
+      const acknowledgement = response.acknowledgement;
+      if (!acknowledgement) {
+        throw new FatalUploadError("Workspace delivery deferred: invalid_acknowledgement. Resume state retained.");
+      }
+      if (acknowledgement.rejectedIds.length > 0) {
+        throw new FatalUploadError("Workspace delivery deferred: remote_rejected. Resume state retained.");
+      }
       const body = response.body as Record<string, unknown>;
       const counter = (key: string) => typeof body[key] === "number" ? body[key] as number : null;
       // The identity list, not an optional legacy count, authorizes progress.
-      const accepted = (body.ack as { acceptedIds: string[] }).acceptedIds.length;
+      const accepted = acknowledgement.acceptedIds.length;
       return { accepted, inserted: counter("inserted"), matched: counter("matched"), updated: counter("updated"), attempts: attempt };
     }
     if (response && response.status !== 408 && response.status !== 429 && response.status < 500) {

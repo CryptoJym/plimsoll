@@ -9,6 +9,7 @@ import { normalizeHookPayload } from "../packages/collector-cli/src/normalizer";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { sealOutboundEnvelope } from "../packages/collector-cli/src/outbound-envelope";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
+import { deliveryAcknowledgement, deliveryExpectation } from "../packages/collector-cli/src/delivery-ack";
 import { DeliveryUploadError, uploadBufferedEvents as uploadWithProtocol } from "../packages/collector-cli/src/upload";
 import {
   GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
@@ -1049,6 +1050,158 @@ async function retryAndCrashProof() {
     );
     const status = buffer.delivery.status(instant(500));
     record("network_failure_retryable_without_circuit", failed && status.active.retry === 1 && status.circuit.kind === "none", { failed, retry: status.active.retry, circuit: status.circuit.kind });
+    buffer.close();
+  }
+}
+
+async function partialAcknowledgementProof() {
+  const partialResponse = (init: RequestInit | undefined, rejectedEventIds: Set<string>) => {
+    const rawBody = String(init?.body ?? "");
+    const payload = JSON.parse(rawBody) as { events: Array<{ event: { id: string } }> };
+    const expected = deliveryExpectation(rawBody, "proof-install");
+    const acceptedIds = expected.itemIds.filter((_id, index) =>
+      !rejectedEventIds.has(payload.events[index]!.event.id));
+    return response(200, {
+      ok: true,
+      accepted: acceptedIds.length,
+      inserted: acceptedIds.length,
+      ack: deliveryAcknowledgement(expected, acceptedIds),
+    });
+  };
+
+  {
+    const { buffer, cfg } = enabledBuffer();
+    const acceptedId = uuid(2_500);
+    const rejectedId = uuid(2_501);
+    buffer.append(event(2_500));
+    buffer.append(event(2_501));
+    let requests = 0;
+    const fetchImpl: typeof fetch = async (_input, init) => {
+      requests += 1;
+      return partialResponse(init, new Set([rejectedId]));
+    };
+    const first = await uploadWithProtocol(cfg, buffer, {
+      fetchImpl,
+      now: () => instant(5_000),
+    });
+    const retryRow = buffer.database
+      .prepare(
+        `select state, attempt_count as attemptCount,
+           last_failure_class as failure, next_attempt_at as nextAttemptAt
+         from upload_outbox where delivery_id = ?`,
+      )
+      .get(rejectedId) as {
+        state: string;
+        attemptCount: number;
+        failure: string;
+        nextAttemptAt: string;
+      };
+    const acceptedReceipt = buffer.database
+      .prepare(`select terminal_state as state, reason from upload_receipts where delivery_id = ?`)
+      .get(acceptedId) as { state: string; reason: string };
+    const rawSettlement = buffer.database
+      .prepare(`select id, uploaded_at as uploadedAt from buffered_events where id in (?, ?) order by id`)
+      .all(acceptedId, rejectedId) as Array<{ id: string; uploadedAt: string | null }>;
+    const partialStatus = buffer.delivery.status(instant(5_000));
+    record(
+      "partial_ack_settles_accepted_and_retries_rejected_without_circuit",
+      first.uploadedEvents === 1 &&
+        requests === 1 &&
+        acceptedReceipt.state === "acknowledged" &&
+        acceptedReceipt.reason === "remote_acknowledged" &&
+        rawSettlement.find((row) => row.id === acceptedId)?.uploadedAt !== null &&
+        rawSettlement.find((row) => row.id === rejectedId)?.uploadedAt === null &&
+        retryRow.state === "retry" &&
+        retryRow.attemptCount === 1 &&
+        retryRow.failure === "remote_rejected" &&
+        Date.parse(retryRow.nextAttemptAt) > instant(5_000).getTime() &&
+        partialStatus.active.retry === 1 &&
+        partialStatus.receipts.acknowledged === 1 &&
+        partialStatus.receipts.dead === 0 &&
+        partialStatus.degraded &&
+        partialStatus.circuit.kind === "none" &&
+        partialStatus.degradedReasons.includes("remote_rejected"),
+      { first, requests, acceptedReceipt, rawSettlement, retryRow, partialStatus },
+    );
+
+    for (let attempt = 2; attempt <= 5; attempt += 1) {
+      await uploadWithProtocol(cfg, buffer, {
+        fetchImpl,
+        now: () => instant(5_000 + attempt * 100),
+      });
+    }
+    const exhaustedStatus = buffer.delivery.status(instant(5_600));
+    const exhaustedReceipt = buffer.database
+      .prepare(
+        `select terminal_state as state, reason, status_class as statusClass,
+           attempt_count as attemptCount
+         from upload_receipts where delivery_id = ?`,
+      )
+      .get(rejectedId) as {
+        state: string;
+        reason: string;
+        statusClass: string;
+        attemptCount: number;
+      };
+    buffer.delivery.migrateLegacy({ maxRows: 500, now: instant(5_700) });
+    const afterExhaustion = await uploadWithProtocol(cfg, buffer, {
+      fetchImpl,
+      now: () => instant(5_800),
+    });
+    record(
+      "repeated_remote_rejection_dead_letters_at_five_without_releasing_again",
+      requests === 5 &&
+        exhaustedReceipt.state === "dead" &&
+        exhaustedReceipt.reason === "remote_rejected_exhausted" &&
+        exhaustedReceipt.statusClass === "remote_rejected" &&
+        exhaustedReceipt.attemptCount === 5 &&
+        exhaustedStatus.active.retry === 0 &&
+        exhaustedStatus.receipts.acknowledged === 1 &&
+        exhaustedStatus.receipts.dead === 1 &&
+        exhaustedStatus.remainingDelivery === 0 &&
+        exhaustedStatus.circuit.kind === "none" &&
+        afterExhaustion.uploadedEvents === 0 &&
+        afterExhaustion.delivery.attempts === 0 &&
+        requests === 5,
+      { requests, exhaustedReceipt, exhaustedStatus, afterExhaustion },
+    );
+    buffer.close();
+  }
+
+  {
+    const { buffer, cfg } = enabledBuffer();
+    buffer.append(event(2_510));
+    buffer.append(event(2_511));
+    const failed = await expectDeliveryError(
+      () => uploadWithProtocol(cfg, buffer, {
+        fetchImpl: async (_input, init) => {
+          const rawBody = String(init?.body ?? "");
+          const expected = deliveryExpectation(rawBody, cfg.installKey);
+          return response(200, {
+            ok: true,
+            accepted: 1,
+            inserted: 1,
+            ack: {
+              ...deliveryAcknowledgement(expected, expected.itemIds),
+              acceptedIds: expected.itemIds.slice(0, 1),
+              rejectedIds: [],
+            },
+          });
+        },
+        now: () => instant(6_000),
+      }),
+      "remote_contract",
+    );
+    const malformedStatus = buffer.delivery.status(instant(6_000));
+    record(
+      "malformed_uncovered_acknowledgement_retains_batch_and_opens_contract_circuit",
+      failed &&
+        malformedStatus.active.retry === 2 &&
+        malformedStatus.receipts.acknowledged === 0 &&
+        malformedStatus.receipts.dead === 0 &&
+        malformedStatus.circuit.kind === "contract_blocked",
+      { failed, malformedStatus },
+    );
     buffer.close();
   }
 }
@@ -3842,6 +3995,7 @@ async function main() {
     await crashBetweenSiblingAckAndQuarantineProof();
     await globalContractAndAuthProof();
     await retryAndCrashProof();
+    await partialAcknowledgementProof();
     await linkageAndRetentionProof();
     await noMarkPressureAndPrivacyProof();
     await hostilePrivacyAndLinkageProof();

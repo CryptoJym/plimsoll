@@ -13,7 +13,9 @@ export const deliveryItemId = (type: string, id: string) => digest(JSON.stringif
 export type DeliveryExpectation = {
   version: 1; kind: string; requestDigest: string; scopeDigest: string;
   tenantId: string; installKey: string; itemIds: string[]; counts: Record<string, number>;
+  itemTypes: Record<string, string>;
 };
+export type DeliveryAcknowledgement = { acceptedIds: string[]; rejectedIds: string[] };
 
 export function deliveryExpectation(rawBody: string, installKey: string): DeliveryExpectation {
   let payload: Record<string, unknown>;
@@ -23,13 +25,16 @@ export function deliveryExpectation(rawBody: string, installKey: string): Delive
   let kind: string;
   const itemIds: string[] = [];
   const counts: Record<string, number> = {};
+  const itemTypes: Record<string, string> = {};
   const add = (type: string, rows: unknown, nested?: string) => {
     if (!Array.isArray(rows)) throw new DeliveryAcknowledgementError();
     counts[type] = rows.length;
     for (const row of rows) {
       const value = nested ? record(record(row)[nested]) : record(row);
       if (typeof value.id !== "string" || !value.id) throw new DeliveryAcknowledgementError();
-      itemIds.push(deliveryItemId(type, value.id));
+      const itemId = deliveryItemId(type, value.id);
+      itemIds.push(itemId);
+      itemTypes[itemId] = type;
     }
   };
   if (payload.kind === "session_sync") { kind = "sessions"; add("session", payload.sessions, "session"); }
@@ -39,7 +44,7 @@ export function deliveryExpectation(rawBody: string, installKey: string): Delive
   else throw new DeliveryAcknowledgementError();
   if (itemIds.length === 0 || itemIds.length > 1500 || new Set(itemIds).size !== itemIds.length) throw new DeliveryAcknowledgementError();
   return { version: 1, kind, requestDigest: digest(rawBody), scopeDigest: digest(JSON.stringify([payload.tenantId, installKey])),
-    tenantId: payload.tenantId, installKey, itemIds, counts };
+    tenantId: payload.tenantId, installKey, itemIds, counts, itemTypes };
 }
 
 /** acceptedIds must come from completed tenant-scoped storage, including held
@@ -52,7 +57,10 @@ export function deliveryAcknowledgement(expected: DeliveryExpectation, acceptedI
     acceptedIds, rejectedIds: expected.itemIds.filter(id => !accepted.has(id)) };
 }
 
-export function validateDeliveryAcknowledgement(body: unknown, expected: DeliveryExpectation) {
+export function validateDeliveryAcknowledgement(
+  body: unknown,
+  expected: DeliveryExpectation,
+): DeliveryAcknowledgement {
   const response = record(body);
   const ack = record(response.ack);
   const fail = () => { throw new DeliveryAcknowledgementError(); };
@@ -60,19 +68,29 @@ export function validateDeliveryAcknowledgement(body: unknown, expected: Deliver
       (response.tenantId !== undefined && response.tenantId !== expected.tenantId) ||
       (response.installKey !== undefined && response.installKey !== expected.installKey) ||
       ack.version !== 1 || ack.kind !== expected.kind || ack.requestDigest !== expected.requestDigest || ack.scopeDigest !== expected.scopeDigest ||
-      !Array.isArray(ack.acceptedIds) || !Array.isArray(ack.rejectedIds) || ack.rejectedIds.length !== 0) fail();
-  const ids = ack.acceptedIds as unknown[];
-  if (ids.length !== expected.itemIds.length || new Set(ids).size !== ids.length || ids.some(id => typeof id !== "string" || !expected.itemIds.includes(id))) fail();
-  const count = expected.itemIds.length;
+      !Array.isArray(ack.acceptedIds) || !Array.isArray(ack.rejectedIds)) fail();
+  const acceptedIds = ack.acceptedIds as unknown[];
+  const rejectedIds = ack.rejectedIds as unknown[];
+  const ids = [...acceptedIds, ...rejectedIds];
+  if (ids.length !== expected.itemIds.length || new Set(ids).size !== ids.length ||
+      ids.some(id => typeof id !== "string" || !expected.itemIds.includes(id))) fail();
+  const acceptedCount = acceptedIds.length;
   const counter = (name: string, max: number, exact = false) => {
     const value = response[name];
     if (value !== undefined && (typeof value !== "number" || !Number.isSafeInteger(value) || value < 0 || (exact ? value !== max : value > max))) fail();
   };
-  for (const name of ["accepted", "inserted", "matched", "updated", "skippedStale"]) counter(name, count, name === "accepted" || name === "matched");
-  counter("acceptedArtifacts", expected.counts.artifact ?? 0, true);
-  counter("acceptedOutcomes", expected.counts.outcome ?? 0, true);
-  for (const name of ["detachedActorRefs", "detachedSessionRefs"]) counter(name, count);
-  if (typeof response.inserted === "number" && typeof response.updated === "number" && response.inserted + response.updated > count) fail();
-  if (typeof response.inserted === "number" && typeof response.updated === "number" && typeof response.skippedStale === "number" && response.inserted + response.updated + response.skippedStale !== count) fail();
-  return count;
+  for (const name of ["accepted", "inserted", "matched", "updated", "skippedStale"]) {
+    counter(name, acceptedCount, name === "accepted" || name === "matched");
+  }
+  const acceptedTypeCount = (type: string) =>
+    acceptedIds.filter(id => typeof id === "string" && expected.itemTypes[id] === type).length;
+  counter("acceptedArtifacts", acceptedTypeCount("artifact"), true);
+  counter("acceptedOutcomes", acceptedTypeCount("outcome"), true);
+  for (const name of ["detachedActorRefs", "detachedSessionRefs"]) counter(name, acceptedCount);
+  if (typeof response.inserted === "number" && typeof response.updated === "number" && response.inserted + response.updated > acceptedCount) fail();
+  if (typeof response.inserted === "number" && typeof response.updated === "number" && typeof response.skippedStale === "number" && response.inserted + response.updated + response.skippedStale !== acceptedCount) fail();
+  return {
+    acceptedIds: acceptedIds as string[],
+    rejectedIds: rejectedIds as string[],
+  };
 }
