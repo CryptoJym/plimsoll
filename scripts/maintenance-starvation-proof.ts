@@ -48,6 +48,7 @@ import {
   recordMaintenanceDeadlineBlame,
   recordMaintenanceDeadlineKill,
 } from "../packages/collector-cli/src/maintenance-starvation";
+import { runEnrichmentMaintenanceJob } from "../packages/collector-cli/src/maintenance-stage-primitives";
 import {
   boundRepoContextCarryOver,
   gitContextBudgetMs,
@@ -346,11 +347,23 @@ async function resumableBatchProgressProof(root: string) {
     new TranscriptTailer(buffer, emptyRoot),
   );
 
+  const recent = await maintenance.runRecent();
+  assert.equal(recent.enrichment.backward + recent.enrichment.forward, 0,
+    "recent capture must leave enrichment to the separate worker");
+  assert.ok(recent.postCaptureDeferred?.includes("enrichment"),
+    "recent capture must report enrichment as deferred");
+
   const stitchedPerRun: number[] = [];
   const stitchedSessionsPerRun: string[][] = [];
   let previouslyStitched = new Set<string>();
-  for (let run = 0; run < 4; run += 1) {
-    const result = await maintenance.runRecent();
+  const dirtyCount = () => (buffer.database.prepare(
+    `select count(*) as n from repo_enrichment_dirty`,
+  ).get() as { n: number }).n;
+  const maxRuns = sessions.length * 3;
+  for (let run = 0; dirtyCount() > 0 && run < maxRuns; run += 1) {
+    const result = runEnrichmentMaintenanceJob(buffer.database, { remainingMs: 29_000 });
+    assert.equal(result.skipped, false, "enrichment worker must be admitted");
+    assert.equal(result.timedOut, false, "fixture enrichment worker must finish in budget");
     const ids = buffer.database.prepare(
       `select session_id as sessionId from buffered_events
        where id like 'resume-token-%' and repo_hash is not null`,
@@ -361,10 +374,12 @@ async function resumableBatchProgressProof(root: string) {
       .map((row) => row.sessionId)
       .filter((sessionId) => !previouslyStitched.has(sessionId))
       .sort();
-    stitchedPerRun.push(result.enrichment.backward + result.enrichment.forward);
+    stitchedPerRun.push(newlyStitched.length);
     stitchedSessionsPerRun.push(newlyStitched);
     previouslyStitched = new Set(ids.map((row) => row.sessionId));
   }
+  assert.equal(dirtyCount(), 0,
+    `separate enrichment worker must drain within ${maxRuns} bounded runs`);
   const totalStitched = stitchedPerRun.reduce((total, value) => total + value, 0);
   assert.equal(totalStitched, sessions.length, "every seeded token row must stitch");
 
