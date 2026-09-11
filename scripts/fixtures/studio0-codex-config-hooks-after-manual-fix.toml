@@ -36,4 +36,3 @@ trusted_hash = "sha256:a937792a008cb5b1644c7a94cbeae1c6394a55814e7b3125e14f9660e
 
 [hooks.state."/Users/HOST_USER/.codex/config.toml:post_tool_use:1:0"]
 trusted_hash = "sha256:93dfa90da9cc5363db334476f3e757dff53a9668d79928fea7e816e777755a19"
-
