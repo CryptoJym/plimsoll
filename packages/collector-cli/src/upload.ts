@@ -1,7 +1,11 @@
 import crypto from "node:crypto";
 
 import type { BufferedEventRow, LocalEventBuffer } from "./buffer";
-import { assertCollectorPrivacyMode, type CollectorConfig } from "./config";
+import {
+  assertCollectorPrivacyMode,
+  reconcileCloudDeviceIdFromIngest,
+  type CollectorConfig,
+} from "./config";
 import type { LeasedDeliveryItem, DeliveryFailureClass } from "./outbox";
 import {
   aiWorkIngestBatchSchema,
@@ -167,6 +171,13 @@ async function postItems(input: {
       fetchImpl: input.fetchImpl, now: input.now,
       timeoutMs: input.timeoutSeconds * 1_000, maxRequestBytes: input.maxBytes,
     });
+    if (response.ok && response.body && typeof response.body === "object" && !Array.isArray(response.body)) {
+      reconcileCloudDeviceIdFromIngest(
+        input.config,
+        (response.body as Record<string, unknown>).deviceId,
+        { now: input.now() },
+      );
+    }
     return {
       ok: response.ok, status: response.status, statusClass: statusClass(response.status),
       summary: response.ok ? safeResponseSummary(response.body) : {}, requestBytes: bytes,

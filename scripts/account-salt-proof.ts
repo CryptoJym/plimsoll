@@ -19,10 +19,13 @@ import { CLOUD_ACCOUNT_SALT_PATH, syncAccountActorSalt } from "../packages/colle
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema, collectorHome } from "../packages/collector-cli/src/config";
 import { performJoin } from "../packages/collector-cli/src/join";
+import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
+import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import { acknowledgingFetch } from "./fixtures/delivery-ack-fixture";
 
 const TENANT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const DEVICE_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const CONFLICTING_DEVICE_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const INSTALL_KEY = "pli_account_salt_proof_install";
 const INGEST_KEY = "account-salt-proof-ingest";
 const SIGNING_SECRET = "account-salt-proof-signing-secret-0123456789";
@@ -69,6 +72,9 @@ async function main() {
     workspaceId: TENANT_ID, deviceId: DEVICE_ID,
   });
   try {
+    assert.equal(collectorConfigSchema.parse({ cloudDeviceId: DEVICE_ID }).cloudDeviceId, DEVICE_ID);
+    assert.throws(() => collectorConfigSchema.parse({ cloudDeviceId: "dev_not_a_cloud_uuid" }));
+
     const requests: Array<{ url: string; headers: Headers; body: Record<string, unknown> }> = [];
     const fetchSalt = (salt: Buffer, version: string): typeof fetch => async (input, init) => {
       const headers = new Headers(init?.headers);
@@ -79,7 +85,7 @@ async function main() {
     const sync = (home: string, salt = SALT_V1, version = "salt-v1") => syncAccountActorSalt({
       collectorHome: home,
       tenantId: TENANT_ID,
-      deviceId: DEVICE_ID,
+      cloudDeviceId: DEVICE_ID,
       uploadUrl: "https://tenant.example/api/work-intelligence/ingest",
       installKey: INSTALL_KEY,
       ingestKey: INGEST_KEY,
@@ -119,6 +125,26 @@ async function main() {
     assert.deepEqual(readAccountAssertionAdapterState(directLedger.database).salt,
       { tenantId: TENANT_ID, version: "salt-v2" });
 
+    let unboundCalls = 0;
+    const unbound = await syncAccountActorSalt({
+      collectorHome: directA,
+      tenantId: TENANT_ID,
+      cloudDeviceId: undefined,
+      uploadUrl: "https://tenant.example/api/work-intelligence/ingest",
+      installKey: INSTALL_KEY,
+      fetchImpl: async () => {
+        unboundCalls += 1;
+        return response(saltBody());
+      },
+    });
+    assert.deepEqual(unbound, {
+      synced: false,
+      tenantId: TENANT_ID,
+      saltVersion: null,
+      reason: "unbound",
+    });
+    assert.equal(unboundCalls, 0);
+
     // Join fetches exactly once after the authenticated handshake and stores
     // into the canonical collector home, not the caller's OS home.
     const joinHome = privateHome("join-os-home");
@@ -130,6 +156,7 @@ async function main() {
         return response({
           ok: true,
           tenantId: TENANT_ID,
+          deviceId: DEVICE_ID,
           installKey: INSTALL_KEY,
           uploadUrl: "https://tenant.example/api/work-intelligence/ingest",
           accountActorSaltEndpoint: `https://tenant.example${CLOUD_ACCOUNT_SALT_PATH}`,
@@ -151,31 +178,148 @@ async function main() {
     assert.equal(joinRequests.filter(value => value === CLOUD_ACCOUNT_SALT_PATH).length, 1);
     assert.equal(joined.joined && JSON.parse(fs.readFileSync(joined.configPath, "utf8")).accountActorSaltEndpoint,
       `https://tenant.example${CLOUD_ACCOUNT_SALT_PATH}`);
+    const joinedConfig = JSON.parse(fs.readFileSync(joined.joined ? joined.configPath : "", "utf8")) as Record<string, unknown>;
+    assert.equal(joinedConfig.cloudDeviceId, DEVICE_ID);
+    assert.match(String(joinedConfig.deviceId), /^dev_[0-9a-f-]{36}$/i);
+    assert.notEqual(joinedConfig.deviceId, joinedConfig.cloudDeviceId);
     assert.ok(readAccountAssertionSaltForTenant(collectorHome(joinHome), TENANT_ID));
     assert.equal(fs.existsSync(path.join(joinHome, ACCOUNT_ASSERTION_SALT_FILE)), false);
+
+    // Older grants remain valid and do not synthesize a cloud device id.
+    const legacyJoinHome = privateHome("legacy-join-os-home");
+    const legacyJoined = await performJoin({
+      target: "pljt_account-salt-proof-legacy-token",
+      baseUrl: "https://tenant.example",
+      homeDir: legacyJoinHome,
+      temporaryRoot: path.join(legacyJoinHome, "temporary"),
+      fetchImpl: acknowledgingFetch(async (input, init) => {
+        if (new URL(String(input)).pathname.endsWith("/join")) {
+          return response({
+            ok: true,
+            tenantId: TENANT_ID,
+            installKey: INSTALL_KEY,
+            uploadUrl: "https://tenant.example/api/work-intelligence/ingest",
+          }, 201);
+        }
+        const uploaded = JSON.parse(String(init?.body ?? "{}")) as { events?: unknown[] };
+        return response({ ok: true, accepted: uploaded.events?.length ?? 0 });
+      }),
+    });
+    assert.equal(legacyJoined.joined, true);
+    const legacyJoinConfig = JSON.parse(fs.readFileSync(legacyJoined.joined ? legacyJoined.configPath : "", "utf8"));
+    assert.equal(Object.hasOwn(legacyJoinConfig, "cloudDeviceId"), false);
+
+    // A pre-v1.1 config learns the cloud UUID from the first acknowledged
+    // ingest response. Equal echoes do not rewrite it; conflicts preserve the
+    // stored UUID and emit one rate-limited, identifier-free diagnostic.
+    const backfillHome = privateHome("ingest-backfill");
+    process.env.PLIMSOLL_HOME = backfillHome;
+    const backfillConfig = collectorConfigSchema.parse({
+      managed: true,
+      tenantId: TENANT_ID,
+      deviceId: "dev_11111111-1111-4111-8111-111111111111",
+      installKey: INSTALL_KEY,
+      uploadUrl: "https://tenant.example/api/work-intelligence/ingest",
+    });
+    const backfillConfigPath = path.join(backfillHome, "collector.config.json");
+    fs.writeFileSync(backfillConfigPath, `${JSON.stringify(backfillConfig, null, 2)}\n`, { mode: 0o600 });
+    const backfillBuffer = new LocalEventBuffer(path.join(backfillHome, "work-ledger.sqlite"), {
+      workspaceId: TENANT_ID,
+      deviceId: backfillConfig.deviceId,
+      enrollmentNow: () => new Date("2026-09-11T10:59:00.000Z"),
+      delivery: { enabled: true, limits: backfillConfig.delivery },
+    });
+    const appendBackfillEvent = (id: string) => backfillBuffer.append(aiInteractionEventSchema.parse({
+      id,
+      sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      source: "codex",
+      dataMode: "metadata",
+      eventType: "assistant_response",
+      observedAt: "2026-09-11T11:00:00.000Z",
+      actionClass: "other",
+      inputTokens: 1,
+      outputTokens: 1,
+      metadata: { proof: true },
+    }));
+    const echoed = (deviceId: string): typeof fetch => {
+      const acknowledged = acknowledgingFetch(async (_input, init) => {
+        const uploaded = JSON.parse(String(init?.body ?? "{}")) as { events?: unknown[] };
+        return response({ ok: true, accepted: uploaded.events?.length ?? 0, deviceId });
+      });
+      return async (input, init) => {
+        const result = await acknowledged(input, init);
+        assert.equal((await result.clone().json() as Record<string, unknown>).deviceId, deviceId);
+        return result;
+      };
+    };
+    try {
+      appendBackfillEvent("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee1");
+      const firstBackfill = await uploadBufferedEvents(backfillConfig, backfillBuffer, {
+        fetchImpl: echoed(DEVICE_ID),
+      });
+      assert.equal(firstBackfill.uploadedEvents, 1);
+      assert.equal(JSON.parse(fs.readFileSync(backfillConfigPath, "utf8")).cloudDeviceId, DEVICE_ID);
+      assert.equal(JSON.stringify(firstBackfill.response).includes(DEVICE_ID), false);
+      const afterFirst = fs.statSync(backfillConfigPath, { bigint: true });
+
+      appendBackfillEvent("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee2");
+      await uploadBufferedEvents(backfillConfig, backfillBuffer, { fetchImpl: echoed(DEVICE_ID) });
+      const afterEqual = fs.statSync(backfillConfigPath, { bigint: true });
+      assert.equal(afterEqual.ino, afterFirst.ino);
+      assert.equal(afterEqual.mtimeNs, afterFirst.mtimeNs);
+
+      const diagnostics: string[] = [];
+      const originalWarn = console.warn;
+      console.warn = (...values: unknown[]) => { diagnostics.push(values.map(String).join(" ")); };
+      try {
+        for (const suffix of ["3", "4"]) {
+          appendBackfillEvent(`eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee${suffix}`);
+          await uploadBufferedEvents(backfillConfig, backfillBuffer, {
+            fetchImpl: echoed(CONFLICTING_DEVICE_ID),
+          });
+        }
+      } finally {
+        console.warn = originalWarn;
+      }
+      assert.equal(JSON.parse(fs.readFileSync(backfillConfigPath, "utf8")).cloudDeviceId, DEVICE_ID);
+      assert.deepEqual(diagnostics, [JSON.stringify({ status: "cloud_device_id_conflict" })]);
+      assert.equal(diagnostics[0].includes(DEVICE_ID), false);
+      assert.equal(diagnostics[0].includes(CONFLICTING_DEVICE_ID), false);
+      const afterConflict = fs.statSync(backfillConfigPath, { bigint: true });
+      assert.equal(afterConflict.ino, afterFirst.ino);
+      assert.equal(afterConflict.mtimeNs, afterFirst.mtimeNs);
+    } finally {
+      backfillBuffer.close();
+      delete process.env.PLIMSOLL_HOME;
+    }
 
     // An already joined collector can run the shipped CLI command against the
     // same authenticated channel. The receipt exposes version only.
     const cliHome = privateHome("cli");
     let cliCalls = 0;
+    const cliDeviceIds: unknown[] = [];
     const server = http.createServer((request, result) => {
       cliCalls += 1;
       assert.equal(request.headers["x-plimsoll-install-key"], INSTALL_KEY);
-      request.resume();
-      if (request.url === "/forbidden-account-salt") {
-        result.writeHead(403, { "content-type": "application/json" });
-        result.end(JSON.stringify({ ok: false }));
-        return;
-      }
-      if (request.url === "/unallocated-account-salt") {
-        result.writeHead(404, { "content-type": "application/json" });
-        result.end(JSON.stringify({ ok: false }));
-        return;
-      }
-      result.writeHead(200, { "content-type": "application/json" });
-      result.end(JSON.stringify(request.url === "/mismatched-account-salt"
-        ? { ...saltBody(), tenantId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" }
-        : saltBody()));
+      const chunks: Buffer[] = [];
+      request.on("data", chunk => { chunks.push(Buffer.from(chunk)); });
+      request.on("end", () => {
+        cliDeviceIds.push((JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>).deviceId);
+        if (request.url === "/forbidden-account-salt") {
+          result.writeHead(403, { "content-type": "application/json" });
+          result.end(JSON.stringify({ ok: false }));
+          return;
+        }
+        if (request.url === "/unallocated-account-salt") {
+          result.writeHead(404, { "content-type": "application/json" });
+          result.end(JSON.stringify({ ok: false }));
+          return;
+        }
+        result.writeHead(200, { "content-type": "application/json" });
+        result.end(JSON.stringify(request.url === "/mismatched-account-salt"
+          ? { ...saltBody(), tenantId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" }
+          : saltBody()));
+      });
     });
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
@@ -184,11 +328,12 @@ async function main() {
     try {
       const address = server.address();
       assert.ok(address && typeof address === "object");
-      const runSyncCommand = async (endpointPath: string) => {
+      const runSyncCommand = async (endpointPath: string, includeCloudDeviceId = true) => {
         const config = collectorConfigSchema.parse({
           managed: true,
           tenantId: TENANT_ID,
-          deviceId: DEVICE_ID,
+          deviceId: "dev_22222222-2222-4222-8222-222222222222",
+          ...(includeCloudDeviceId ? { cloudDeviceId: DEVICE_ID } : {}),
           installKey: INSTALL_KEY,
           uploadUrl: `http://127.0.0.1:${address.port}/api/work-intelligence/ingest`,
           accountActorSaltEndpoint: `http://127.0.0.1:${address.port}${endpointPath}`,
@@ -204,6 +349,7 @@ async function main() {
       assert.equal(run.exitCode, 0, run.stderr);
       const receipt = JSON.parse(run.stdout) as Record<string, unknown>;
       assert.equal(receipt.status, "account_salt_synced");
+      assert.equal(cliDeviceIds[0], DEVICE_ID);
       assert.equal(receipt.saltVersion, "salt-v1");
       assert.equal(run.stdout.includes(SALT_V1.toString("base64")), false);
       assert.equal(run.stderr.includes(SALT_V1.toString("base64")), false);
@@ -221,6 +367,17 @@ async function main() {
       assert.notEqual(mismatched.exitCode, 0);
       assert.equal(JSON.parse(mismatched.stdout).status, "account_salt_refused");
       assert.equal(cliCalls, 4);
+
+      const unboundCli = await runSyncCommand("/must-not-be-called", false);
+      assert.equal(unboundCli.exitCode, 1, unboundCli.stderr);
+      assert.deepEqual(JSON.parse(unboundCli.stdout), {
+        status: "account_salt_device_unbound",
+        tenantId: TENANT_ID,
+        saltVersion: null,
+        synced: false,
+        action: "upload once with delivery enabled, or rejoin",
+      });
+      assert.equal(cliCalls, 4);
     } finally {
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     }
@@ -235,6 +392,12 @@ async function main() {
         versionedRotationFailClosed: true,
         joinFetchesOnceAfterHandshake: true,
         syncCommandForJoinedDevice: true,
+        unboundSkipsEndpoint: true,
+        joinPersistsCloudDeviceId: true,
+        legacyJoinLeavesCloudDeviceIdAbsent: true,
+        acknowledgedIngestBackfillsOnce: true,
+        conflictingEchoPreservesStoredId: true,
+        conflictDiagnosticRateLimitedAndIdentifierFree: true,
         refusalDistinctFromUnallocated: true,
         saltAbsentFromReceipts: true,
       },

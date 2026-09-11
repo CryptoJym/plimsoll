@@ -15,6 +15,7 @@ import {
   collectorConfigSchema,
   collectorHome,
   isManagedOrUploadEnabled,
+  writeCollectorConfigTransactionally,
   type CollectorConfig,
 } from "./config";
 import { appendForwardedHook } from "./forwarder";
@@ -66,6 +67,7 @@ export function parseJoinTarget(raw: string, explicitBaseUrl?: string): JoinTarg
 const joinGrantSchema = z.object({
   ok: z.literal(true),
   tenantId: z.string().trim().min(1),
+  deviceId: z.string().uuid().optional(),
   installKey: z.string().trim().min(1),
   uploadUrl: z.string().url(),
   ingestKey: z.string().trim().min(1).optional(),
@@ -211,6 +213,7 @@ function stageGrant(
     uploadUrl: _staleUploadUrl,
     accountActorSaltEndpoint: _staleAccountActorSaltEndpoint,
     deviceId: _staleDeviceId,
+    cloudDeviceId: _staleCloudDeviceId,
     keyId: _staleKeyId,
     ...localSettings
   } = existing;
@@ -219,6 +222,7 @@ function stageGrant(
     managed: true,
     tenantId: grant.tenantId,
     deviceId: identity.deviceId,
+    ...(grant.deviceId ? { cloudDeviceId: grant.deviceId } : {}),
     keyId: grant.keyId ?? identity.keyId,
     installKey: grant.installKey,
     uploadUrl: grant.uploadUrl,
@@ -231,24 +235,6 @@ function stageGrant(
       ? { uploadSigningSecret: grant.uploadSigningSecret }
       : {}),
   });
-}
-
-function activateConfigAtomically(config: CollectorConfig, configPath: string) {
-  const directory = path.dirname(configPath);
-  fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const temporaryPath = path.join(
-    directory,
-    `.collector.config.join-${process.pid}-${crypto.randomUUID()}.tmp`,
-  );
-  try {
-    fs.writeFileSync(temporaryPath, `${JSON.stringify(config, null, 2)}\n`, {
-      flag: "wx",
-      mode: 0o600,
-    });
-    fs.renameSync(temporaryPath, configPath);
-  } finally {
-    fs.rmSync(temporaryPath, { force: true });
-  }
 }
 
 function inputUrl(input: Parameters<typeof fetch>[0]) {
@@ -659,7 +645,7 @@ async function activatePendingJoin(
       setDeviceKey(options.homeDir, pending.stagedConfig.keyId);
     }
     setDeviceStatus(options.homeDir, "active");
-    activateConfigAtomically(pending.stagedConfig, activeConfigPath);
+    writeCollectorConfigTransactionally(pending.stagedConfig, activeConfigPath);
     const enrollment = readEnrollmentStatus(options.homeDir);
     activeConfigActivated = true;
     options.afterConfigActivation?.();
@@ -671,7 +657,8 @@ async function activatePendingJoin(
       try {
         const salt = await syncAccountActorSalt({
           collectorHome: collectorHome(options.homeDir), tenantId: pending.stagedConfig.tenantId,
-          deviceId: identity.deviceId, uploadUrl: pending.stagedConfig.uploadUrl ?? "",
+          cloudDeviceId: pending.stagedConfig.cloudDeviceId,
+          uploadUrl: pending.stagedConfig.uploadUrl ?? "",
           installKey: pending.stagedConfig.installKey ?? "", ingestKey: pending.stagedConfig.ingestKey,
           signingSecret: pending.stagedConfig.uploadSigningSecret,
           endpointUrl: pending.accountActorSaltEndpoint, fetchImpl: options.fetchImpl,

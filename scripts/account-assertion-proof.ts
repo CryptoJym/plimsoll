@@ -119,7 +119,12 @@ async function readNativeCodexAuth(record: Record<string, unknown>, enrolledAt =
   return withNativeCodexAuth(record, () => loadCodexNativeAccountBinding({ enrolledAt }));
 }
 
-function fixture(label: string, options: { salt?: boolean; deviceId?: string } = {}) {
+function fixture(label: string, options: {
+  salt?: boolean;
+  deviceId?: string;
+  joined?: boolean;
+  cloudDeviceId?: string;
+} = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), `plimsoll-account-r2-${label}-`));
   fs.chmodSync(home, 0o700);
   let now = FIRST_AT;
@@ -141,6 +146,12 @@ function fixture(label: string, options: { salt?: boolean; deviceId?: string } =
   const config = collectorConfigSchema.parse({
     tenantId: TENANT_ID,
     deviceId,
+    ...(options.joined ? {
+      managed: true,
+      uploadUrl: "https://tenant.example/api/work-intelligence/ingest",
+      installKey: "pli_account_assertion_proof_install",
+    } : {}),
+    ...(options.cloudDeviceId ? { cloudDeviceId: options.cloudDeviceId } : {}),
     captureRoots: [root],
   });
   const localAuth = loadOrCreateLocalIngestAuth(home);
@@ -436,8 +447,13 @@ try {
   assert.match(JSON.parse(cliEnrollment.stdout).installationEpochId,
     /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
 
-  const unsalted = fixture("unsalted", { salt: false });
+  // A pre-v1.1 joined collector has no cloudDeviceId. With no tenant salt,
+  // owner enrollment must follow the same assertion-free path as an allocated
+  // device whose tenant salt is not yet available.
+  const unsalted = fixture("unsalted", { salt: false, joined: true });
   opened.push(unsalted);
+  assert.equal(unsalted.config.managed, true);
+  assert.equal(unsalted.config.cloudDeviceId, undefined);
   const unsaltedNative = signedCodexAuth(accountA, {
     kid: "unsalted-unknown-key", signingKey: WRONG_SIGNING_KEYS.privateKey,
   });
@@ -782,6 +798,7 @@ try {
       provisioningPublicationCompensated: true,
       activeStateCapacityFailClosed: true,
       fleetSaltNoLocalFallback: true,
+      cloudDeviceUnboundEnrollmentSucceedsWithoutAssertion: true,
       canonicalCodexAuthPathOnly: true,
       unsupportedAlgorithmRejected: true,
       wrongSignatureRejected: true,
