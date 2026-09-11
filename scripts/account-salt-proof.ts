@@ -17,7 +17,11 @@ import {
 } from "../packages/collector-cli/src/account-assertion";
 import { CLOUD_ACCOUNT_SALT_PATH, syncAccountActorSalt } from "../packages/collector-cli/src/account-salt";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
-import { collectorConfigSchema, collectorHome } from "../packages/collector-cli/src/config";
+import {
+  collectorConfigSchema,
+  collectorHome,
+  reconcileCloudDeviceIdFromIngest,
+} from "../packages/collector-cli/src/config";
 import { performJoin } from "../packages/collector-cli/src/join";
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
@@ -61,6 +65,59 @@ async function child(args: string[], env: NodeJS.ProcessEnv) {
     proc.once("exit", resolve);
   });
   return { exitCode, stdout, stderr };
+}
+
+function startChild(args: string[], env: NodeJS.ProcessEnv) {
+  const proc = spawn(process.execPath, args, { cwd: process.cwd(), env, stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  proc.stdout.setEncoding("utf8");
+  proc.stderr.setEncoding("utf8");
+  proc.stdout.on("data", (chunk: string) => { stdout += chunk; });
+  proc.stderr.on("data", (chunk: string) => { stderr += chunk; });
+  return new Promise<{ exitCode: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+    proc.once("error", reject);
+    proc.once("exit", exitCode => resolve({ exitCode, stdout, stderr }));
+  });
+}
+
+const waitState = new Int32Array(new SharedArrayBuffer(4));
+function waitForFile(file: string, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  while (!fs.existsSync(file) && Date.now() < deadline) Atomics.wait(waitState, 0, 0, 10);
+  return fs.existsSync(file);
+}
+
+function waitForAnyFile(files: string[], timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  while (!files.some(file => fs.existsSync(file)) && Date.now() < deadline) {
+    Atomics.wait(waitState, 0, 0, 10);
+  }
+  return files.some(file => fs.existsSync(file));
+}
+
+async function cloudDeviceIdRaceWorker() {
+  const [home, deviceId, ready, release] = process.argv.slice(3);
+  assert.ok(home && deviceId && ready && release);
+  const configPath = path.join(home, "collector.config.json");
+  const originalRename = fs.renameSync.bind(fs);
+  Object.defineProperty(fs, "renameSync", {
+    configurable: true,
+    value: (oldPath: fs.PathLike, newPath: fs.PathLike) => {
+      if (path.resolve(String(newPath)) === path.resolve(configPath)) {
+        fs.writeFileSync(ready, "ready\n", { flag: "wx", mode: 0o600 });
+        if (!waitForFile(release, 10_000)) throw new Error("cloud_device_id_race_barrier_timeout");
+      }
+      return originalRename(oldPath, newPath);
+    },
+  });
+  try {
+    const config = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
+    const result = reconcileCloudDeviceIdFromIngest(config, deviceId, { homeDir: home });
+    process.stdout.write(`${JSON.stringify({ result })}\n`);
+  } finally {
+    Object.defineProperty(fs, "renameSync", { configurable: true, value: originalRename });
+  }
 }
 
 async function main() {
@@ -293,6 +350,52 @@ async function main() {
       delete process.env.PLIMSOLL_HOME;
     }
 
+    // Interprocess reconciliation is one mutation: exactly one concurrent
+    // writer stores its echo and the other observes that authoritative value.
+    const raceHome = privateHome("ingest-backfill-race");
+    const raceConfigPath = path.join(raceHome, "collector.config.json");
+    const raceSeed = { ...backfillConfig };
+    delete raceSeed.cloudDeviceId;
+    fs.writeFileSync(raceConfigPath, `${JSON.stringify(raceSeed, null, 2)}\n`, { mode: 0o600 });
+    const raceRelease = path.join(raceHome, "release");
+    const raceReady = [path.join(raceHome, "ready-a"), path.join(raceHome, "ready-b")];
+    const tsx = path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
+    const script = path.join(process.cwd(), "scripts", "account-salt-proof.ts");
+    const raceValues = [DEVICE_ID, CONFLICTING_DEVICE_ID];
+    const racers = raceValues.map((deviceId, index) => startChild([
+      tsx,
+      script,
+      "--cloud-device-id-race-worker",
+      raceHome,
+      deviceId,
+      raceReady[index],
+      raceRelease,
+    ], { ...process.env, PLIMSOLL_HOME: raceHome }));
+    if (!waitForAnyFile(raceReady, 10_000)) {
+      assert.fail(`race workers did not reach publication: ${JSON.stringify(await Promise.all(racers))}`);
+    }
+    const secondReadyDeadline = Date.now() + 2_000;
+    while (!raceReady.every(file => fs.existsSync(file)) && Date.now() < secondReadyDeadline) {
+      Atomics.wait(waitState, 0, 0, 10);
+    }
+    fs.writeFileSync(raceRelease, "release\n", { flag: "wx", mode: 0o600 });
+    const raceResults = await Promise.all(racers);
+    for (const result of raceResults) assert.equal(result.exitCode, 0, result.stderr);
+    const dispositions = raceResults.map(result =>
+      (JSON.parse(result.stdout) as { result: string }).result,
+    );
+    assert.equal(dispositions.filter(value => value === "stored").length, 1);
+    assert.equal(dispositions.filter(value => value === "conflict").length, 1);
+    const storedIndex = dispositions.indexOf("stored");
+    const finalRaceConfig = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(raceConfigPath, "utf8")));
+    assert.equal(finalRaceConfig.cloudDeviceId, raceValues[storedIndex]);
+    const raceDiagnostics = raceResults.map(result => result.stderr.trim()).filter(Boolean);
+    assert.deepEqual(raceDiagnostics, [JSON.stringify({ status: "cloud_device_id_conflict" })]);
+    assert.equal(raceDiagnostics.some(line => raceValues.some(value => line.includes(value))), false);
+    assert.equal(fs.statSync(raceConfigPath).mode & 0o777, 0o600);
+    assert.equal(fs.readdirSync(raceHome).some(name => name.startsWith(".collector.config-")), false);
+    assert.equal(fs.readdirSync(raceHome).some(name => name.endsWith(".mutation.lock")), false);
+
     // An already joined collector can run the shipped CLI command against the
     // same authenticated channel. The receipt exposes version only.
     const cliHome = privateHome("cli");
@@ -398,6 +501,7 @@ async function main() {
         acknowledgedIngestBackfillsOnce: true,
         conflictingEchoPreservesStoredId: true,
         conflictDiagnosticRateLimitedAndIdentifierFree: true,
+        concurrentBackfillStoresExactlyOnce: true,
         refusalDistinctFromUnallocated: true,
         saltAbsentFromReceipts: true,
       },
@@ -409,7 +513,11 @@ async function main() {
   }
 }
 
-main().catch(error => {
+const operation = process.argv[2] === "--cloud-device-id-race-worker"
+  ? cloudDeviceIdRaceWorker()
+  : main();
+
+operation.catch(error => {
   console.error(error instanceof Error ? error.stack : String(error));
   process.exitCode = 1;
 });

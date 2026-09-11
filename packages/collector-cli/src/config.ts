@@ -124,7 +124,10 @@ export const collectorConfigSchema = z
 export type CollectorConfig = z.infer<typeof collectorConfigSchema>;
 
 const CLOUD_DEVICE_ID_CONFLICT_INTERVAL_MS = 5 * 60 * 1_000;
+const CONFIG_MUTATION_LOCK_WAIT_MS = 5_000;
+const CONFIG_MUTATION_LOCK_POLL_MS = 10;
 const cloudDeviceIdConflictAt = new Map<string, number>();
+const configMutationWaitState = new Int32Array(new SharedArrayBuffer(4));
 
 export function isManagedOrUploadEnabled(config: CollectorConfig) {
   return (
@@ -230,15 +233,47 @@ export function saveCollectorConfig(config: CollectorConfig, homeDir = os.homedi
   return writeCollectorConfigTransactionally(config, collectorConfigPath(homeDir));
 }
 
-/** Validate and atomically publish a complete collector config. */
-export function writeCollectorConfigTransactionally(
-  config: CollectorConfig,
-  configPath = collectorConfigPath(),
-) {
-  const validated = collectorConfigSchema.parse(config);
-  assertCollectorPrivacyMode(validated, "config write");
+function withCollectorConfigMutationLock<T>(configPath: string, action: () => T) {
   const directory = path.dirname(configPath);
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const lockPath = path.join(directory, `.${path.basename(configPath)}.mutation.lock`);
+  const deadline = Date.now() + CONFIG_MUTATION_LOCK_WAIT_MS;
+  let lockDescriptor: number | undefined;
+  while (lockDescriptor === undefined) {
+    try {
+      lockDescriptor = fs.openSync(lockPath, "wx", 0o600);
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+      if (Date.now() >= deadline) {
+        throw new Error("collector_config_mutation_lock_timeout");
+      }
+      Atomics.wait(configMutationWaitState, 0, 0, CONFIG_MUTATION_LOCK_POLL_MS);
+    }
+  }
+  try {
+    return action();
+  } finally {
+    try {
+      const held = fs.fstatSync(lockDescriptor);
+      try {
+        const current = fs.lstatSync(lockPath);
+        if (current.dev === held.dev && current.ino === held.ino) {
+          fs.rmSync(lockPath, { force: true });
+        }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+      }
+    } finally {
+      fs.closeSync(lockDescriptor);
+    }
+  }
+}
+
+function writeCollectorConfigTransactionallyUnlocked(
+  validated: CollectorConfig,
+  configPath: string,
+) {
+  const directory = path.dirname(configPath);
   const temporaryPath = path.join(
     directory,
     `.collector.config-${process.pid}-${crypto.randomUUID()}.tmp`,
@@ -260,6 +295,18 @@ export function writeCollectorConfigTransactionally(
   return validated;
 }
 
+/** Validate and atomically publish a complete collector config under its mutation lock. */
+export function writeCollectorConfigTransactionally(
+  config: CollectorConfig,
+  configPath = collectorConfigPath(),
+) {
+  const validated = collectorConfigSchema.parse(config);
+  assertCollectorPrivacyMode(validated, "config write");
+  return withCollectorConfigMutationLock(configPath, () =>
+    writeCollectorConfigTransactionallyUnlocked(validated, configPath),
+  );
+}
+
 /**
  * Learn the hosted DeviceInstall UUID only from a validated ingest
  * acknowledgement. The active config file is authoritative: equal echoes are
@@ -272,28 +319,30 @@ export function reconcileCloudDeviceIdFromIngest(
 ) {
   const parsed = z.string().uuid().safeParse(responseDeviceId);
   if (!parsed.success) return "ignored" as const;
-  const current = readCollectorConfig(options.homeDir);
-  if (current.status !== "valid") return "ignored" as const;
-  const stored = current.config.cloudDeviceId;
-  if (stored === parsed.data) {
-    config.cloudDeviceId = stored;
-    return "unchanged" as const;
-  }
-  if (stored) {
-    const now = (options.now ?? new Date()).getTime();
-    const last = cloudDeviceIdConflictAt.get(current.path) ?? Number.NEGATIVE_INFINITY;
-    if (now - last >= CLOUD_DEVICE_ID_CONFLICT_INTERVAL_MS) {
-      cloudDeviceIdConflictAt.set(current.path, now);
-      console.warn(JSON.stringify({ status: "cloud_device_id_conflict" }));
+  const configPath = collectorConfigPath(options.homeDir);
+  return withCollectorConfigMutationLock(configPath, () => {
+    const current = readCollectorConfig(options.homeDir);
+    if (current.status !== "valid") return "ignored" as const;
+    const stored = current.config.cloudDeviceId;
+    if (stored === parsed.data) {
+      config.cloudDeviceId = stored;
+      return "unchanged" as const;
     }
-    return "conflict" as const;
-  }
-  const updated = writeCollectorConfigTransactionally(
-    { ...current.config, cloudDeviceId: parsed.data },
-    current.path,
-  );
-  config.cloudDeviceId = updated.cloudDeviceId;
-  return "stored" as const;
+    if (stored) {
+      const now = (options.now ?? new Date()).getTime();
+      const last = cloudDeviceIdConflictAt.get(current.path) ?? Number.NEGATIVE_INFINITY;
+      if (now - last >= CLOUD_DEVICE_ID_CONFLICT_INTERVAL_MS) {
+        cloudDeviceIdConflictAt.set(current.path, now);
+        console.warn(JSON.stringify({ status: "cloud_device_id_conflict" }));
+      }
+      return "conflict" as const;
+    }
+    const updated = collectorConfigSchema.parse({ ...current.config, cloudDeviceId: parsed.data });
+    assertCollectorPrivacyMode(updated, "config write");
+    writeCollectorConfigTransactionallyUnlocked(updated, current.path);
+    config.cloudDeviceId = updated.cloudDeviceId;
+    return "stored" as const;
+  });
 }
 
 /**
