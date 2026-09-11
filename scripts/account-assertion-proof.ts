@@ -200,6 +200,21 @@ try {
   assert.equal(unsaltedEnrollment.accountAssertion, null);
   assert.equal(fs.existsSync(path.join(unsalted.home, ACCOUNT_ASSERTION_SALT_FILE)), false);
   assert.equal(fs.existsSync(path.join(unsalted.home, ACCOUNT_ASSERTION_SALT_META_FILE)), false);
+  // A versioned assertion copied into static config is not authority.  If the
+  // hosted salt is absent and enrollment is explicitly unallocated, neither
+  // live authentication nor profile capture may revive that stale assertion.
+  const staleUnsaltedRoot = unsalted.config.captureRoots![0];
+  staleUnsaltedRoot.account = assertionA;
+  const unsaltedToken = fs.readFileSync(unsaltedEnrollment.credentialFile, "utf8");
+  const unsaltedAuth = authenticateLiveProducer(unsalted.home, unsalted.buffer, unsalted.config,
+    "unsalted-producer", unsaltedToken, unsalted.localAuth);
+  assert.equal(unsaltedAuth.root.account, undefined);
+  assert.equal(unsaltedAuth.root.accountAssertions, undefined);
+  const unsaltedCapture = createProfileCapture(unsalted.buffer, { captureRoots: [staleUnsaltedRoot] });
+  const unsaltedRoots = (unsaltedCapture.rollout as unknown as { captureRoots: CaptureRoot[] }).captureRoots;
+  assert.equal(unsaltedRoots[0]?.account, undefined);
+  assert.equal(unsaltedRoots[0]?.accountAssertions, undefined);
+  unsaltedCapture.close();
 
   // P1 disable: an already authenticated producer loses the assertion
   // immediately. Disabling closes the old interval; re-enable alone cannot

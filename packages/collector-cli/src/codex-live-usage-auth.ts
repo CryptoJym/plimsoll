@@ -138,12 +138,13 @@ export function currentLiveContext(buffer: LocalEventBuffer, config: CollectorCo
   const persistedIntervals = adapterEnabled
     ? (options.accountAssertions ?? codexAccountAssertionIntervals(buffer.database, binding.captureRootId))
     : [];
+  const rootHasVersionedAssertion = Boolean(root.account && accountAssertionV1Schema.safeParse(root.account).success);
   const persistedAssertion = !adapterEnabled ? null : explicitAssertion
     ? options.accountAssertion
-    : (codexAccountAssertionAt(buffer.database, binding.captureRootId, binding.enrolledAt) ??
-      (root.account && accountAssertionV1Schema.safeParse(root.account).success ? root.account : null));
+    : codexAccountAssertionAt(buffer.database, binding.captureRootId, binding.enrolledAt);
   let effectiveRoot = root;
-  if (!adapterEnabled || (explicitAssertion && (persistedAssertion === null || persistedAssertion === undefined))) {
+  if (!adapterEnabled || ((persistedAssertion === null || persistedAssertion === undefined) &&
+      (explicitAssertion || rootHasVersionedAssertion))) {
     const { account: _discardedAccount, accountAssertions: _discardedIntervals, ...withoutAssertion } = root;
     effectiveRoot = withoutAssertion;
   }

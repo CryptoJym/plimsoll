@@ -26,7 +26,11 @@ export function createProfileCapture(buffer: LocalEventBuffer,config: Pick<Colle
     const isVersioned = root.account ? accountAssertionV1Schema.safeParse(root.account).success : false;
     if (root.account && !isVersioned) return root;
     const assertions = codexAccountAssertionIntervals(buffer.database, root.rootId);
-    if (!assertions.length) return root;
+    if (!assertions.length) {
+      if (!isVersioned) return root;
+      const { account: _discardedAccount, accountAssertions: _discardedIntervals, ...withoutAssertion } = root;
+      return withoutAssertion;
+    }
     return { ...root, account: assertions[assertions.length - 1], accountAssertions: assertions };
   });
   const codex=hydratedRoots?.filter(root => root.source==="codex"),claude=hydratedRoots?.filter(root => root.source==="claude_code");
