@@ -21,6 +21,7 @@ import {
   collectorConfigSchema,
   collectorHome,
   reconcileCloudDeviceIdFromIngest,
+  writeCollectorConfigTransactionally,
 } from "../packages/collector-cli/src/config";
 import { performJoin } from "../packages/collector-cli/src/join";
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
@@ -67,7 +68,7 @@ async function child(args: string[], env: NodeJS.ProcessEnv) {
   return { exitCode, stdout, stderr };
 }
 
-function startChild(args: string[], env: NodeJS.ProcessEnv) {
+function startManagedChild(args: string[], env: NodeJS.ProcessEnv) {
   const proc = spawn(process.execPath, args, { cwd: process.cwd(), env, stdio: ["ignore", "pipe", "pipe"] });
   let stdout = "";
   let stderr = "";
@@ -75,10 +76,20 @@ function startChild(args: string[], env: NodeJS.ProcessEnv) {
   proc.stderr.setEncoding("utf8");
   proc.stdout.on("data", (chunk: string) => { stdout += chunk; });
   proc.stderr.on("data", (chunk: string) => { stderr += chunk; });
-  return new Promise<{ exitCode: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+  const completion = new Promise<{
+    exitCode: number | null;
+    signal: NodeJS.Signals | null;
+    stdout: string;
+    stderr: string;
+  }>((resolve, reject) => {
     proc.once("error", reject);
-    proc.once("exit", exitCode => resolve({ exitCode, stdout, stderr }));
+    proc.once("exit", (exitCode, signal) => resolve({ exitCode, signal, stdout, stderr }));
   });
+  return { proc, completion };
+}
+
+function startChild(args: string[], env: NodeJS.ProcessEnv) {
+  return startManagedChild(args, env).completion;
 }
 
 const waitState = new Int32Array(new SharedArrayBuffer(4));
@@ -117,6 +128,59 @@ async function cloudDeviceIdRaceWorker() {
     process.stdout.write(`${JSON.stringify({ result })}\n`);
   } finally {
     Object.defineProperty(fs, "renameSync", { configurable: true, value: originalRename });
+  }
+}
+
+async function collectorConfigLockHolderWorker() {
+  const [home, ready, release, portText] = process.argv.slice(3);
+  assert.ok(home && ready && release && portText);
+  const configPath = path.join(home, "collector.config.json");
+  const originalRename = fs.renameSync.bind(fs);
+  Object.defineProperty(fs, "renameSync", {
+    configurable: true,
+    value: (oldPath: fs.PathLike, newPath: fs.PathLike) => {
+      if (path.resolve(String(newPath)) === path.resolve(configPath)) {
+        fs.writeFileSync(ready, "ready\n", { flag: "wx", mode: 0o600 });
+        if (!waitForFile(release, 60_000)) throw new Error("config_lock_holder_barrier_timeout");
+      }
+      return originalRename(oldPath, newPath);
+    },
+  });
+  try {
+    const config = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
+    writeCollectorConfigTransactionally({ ...config, port: Number(portText) }, configPath);
+    process.stdout.write(`${JSON.stringify({ result: "written" })}\n`);
+  } finally {
+    Object.defineProperty(fs, "renameSync", { configurable: true, value: originalRename });
+  }
+}
+
+async function collectorConfigLockWaiterWorker() {
+  const [home, observed, portText] = process.argv.slice(3);
+  assert.ok(home && observed && portText);
+  const configPath = path.join(home, "collector.config.json");
+  const lockPath = path.join(home, ".collector.config.json.mutation.lock");
+  const originalOpen = fs.openSync.bind(fs);
+  Object.defineProperty(fs, "openSync", {
+    configurable: true,
+    value: (file: fs.PathLike, flags: fs.OpenMode, mode?: fs.Mode) => {
+      try {
+        return originalOpen(file, flags, mode);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "EEXIST" &&
+          path.resolve(String(file)) === path.resolve(lockPath) && !fs.existsSync(observed)) {
+          fs.writeFileSync(observed, "observed\n", { flag: "wx", mode: 0o600 });
+        }
+        throw error;
+      }
+    },
+  });
+  try {
+    const config = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
+    writeCollectorConfigTransactionally({ ...config, port: Number(portText) }, configPath);
+    process.stdout.write(`${JSON.stringify({ result: "written" })}\n`);
+  } finally {
+    Object.defineProperty(fs, "openSync", { configurable: true, value: originalOpen });
   }
 }
 
@@ -350,6 +414,160 @@ async function main() {
       delete process.env.PLIMSOLL_HOME;
     }
 
+    // A successfully acknowledged delivery stays acknowledged even if the
+    // local config reconciliation must be deferred. It is neither retried nor
+    // allowed to open the remote-contract circuit.
+    const deferredHome = privateHome("ingest-reconcile-deferred");
+    const deferredConfig = collectorConfigSchema.parse({ ...backfillConfig });
+    delete deferredConfig.cloudDeviceId;
+    fs.writeFileSync(
+      path.join(deferredHome, "collector.config.json"),
+      `${JSON.stringify(deferredConfig, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+    const deferredBuffer = new LocalEventBuffer(path.join(deferredHome, "work-ledger.sqlite"), {
+      workspaceId: TENANT_ID,
+      deviceId: deferredConfig.deviceId,
+      enrollmentNow: () => new Date("2026-09-11T11:04:00.000Z"),
+      delivery: { enabled: true, limits: deferredConfig.delivery },
+    });
+    deferredBuffer.append(aiInteractionEventSchema.parse({
+      id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee5",
+      sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      source: "codex",
+      dataMode: "metadata",
+      eventType: "assistant_response",
+      observedAt: "2026-09-11T11:05:00.000Z",
+      actionClass: "other",
+      inputTokens: 1,
+      outputTokens: 1,
+      metadata: { proof: true },
+    }));
+    const deferredDiagnostics: string[] = [];
+    const deferredOriginalWarn = console.warn;
+    let deferredFetchCalls = 0;
+    process.env.PLIMSOLL_HOME = deferredHome;
+    console.warn = (...values: unknown[]) => { deferredDiagnostics.push(values.map(String).join(" ")); };
+    try {
+      const deferredFetch = acknowledgingFetch(async (_input, init) => {
+        deferredFetchCalls += 1;
+        process.env.PLIMSOLL_HOME = "relative-home-that-forces-reconcile-failure";
+        const uploaded = JSON.parse(String(init?.body ?? "{}")) as { events?: unknown[] };
+        return response({ ok: true, accepted: uploaded.events?.length ?? 0, deviceId: DEVICE_ID });
+      });
+      const deferred = await uploadBufferedEvents(deferredConfig, deferredBuffer, {
+        fetchImpl: deferredFetch,
+      });
+      process.env.PLIMSOLL_HOME = deferredHome;
+      assert.equal(deferred.uploadedEvents, 1);
+      assert.equal(deferred.remainingDelivery, 0);
+      assert.equal("circuit" in deferred.delivery && deferred.delivery.circuit, "none");
+      assert.equal(deferredBuffer.delivery.status().circuit.kind, "none");
+      const noResend = await uploadBufferedEvents(deferredConfig, deferredBuffer, {
+        fetchImpl: deferredFetch,
+      });
+      assert.equal(noResend.uploadedEvents, 0);
+      assert.equal(noResend.delivery.attempts, 0);
+      assert.equal(deferredFetchCalls, 1);
+      assert.deepEqual(deferredDiagnostics, [JSON.stringify({ status: "cloud_device_id_reconcile_deferred" })]);
+      assert.equal(deferredDiagnostics[0].includes(DEVICE_ID), false);
+    } finally {
+      process.env.PLIMSOLL_HOME = deferredHome;
+      console.warn = deferredOriginalWarn;
+      deferredBuffer.close();
+      delete process.env.PLIMSOLL_HOME;
+    }
+
+    const tsx = path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
+    const script = path.join(process.cwd(), "scripts", "account-salt-proof.ts");
+
+    // A writer killed while holding the real mutation lock cannot strand all
+    // later writers. Recovery does not require deleting the lock by hand.
+    const killedHolderHome = privateHome("config-lock-killed-holder");
+    const killedHolderConfigPath = path.join(killedHolderHome, "collector.config.json");
+    const killedHolderReady = path.join(killedHolderHome, "holder-ready");
+    const killedHolderRelease = path.join(killedHolderHome, "holder-release");
+    fs.writeFileSync(
+      killedHolderConfigPath,
+      `${JSON.stringify({ ...backfillConfig, port: 4201 }, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+    const killedHolder = startManagedChild([
+      tsx,
+      script,
+      "--collector-config-lock-holder-worker",
+      killedHolderHome,
+      killedHolderReady,
+      killedHolderRelease,
+      "4202",
+    ], { ...process.env, PLIMSOLL_HOME: killedHolderHome });
+    assert.equal(waitForFile(killedHolderReady, 10_000), true, "lock holder did not reach rename boundary");
+    const killedHolderLockPath = path.join(killedHolderHome, ".collector.config.json.mutation.lock");
+    assert.equal(fs.statSync(killedHolderLockPath).mode & 0o777, 0o600);
+    const killedHolderMetadata = JSON.parse(fs.readFileSync(killedHolderLockPath, "utf8")) as { pid: number };
+    assert.ok(Number.isSafeInteger(killedHolderMetadata.pid) && killedHolderMetadata.pid > 0);
+    process.kill(killedHolderMetadata.pid, "SIGKILL");
+    const killedHolderResult = await killedHolder.completion;
+    assert.notEqual(killedHolderResult.exitCode, 0, killedHolderResult.stderr);
+    const killedRecoveryStarted = performance.now();
+    writeCollectorConfigTransactionally(
+      collectorConfigSchema.parse({ ...backfillConfig, port: 4203 }),
+      killedHolderConfigPath,
+    );
+    const killedRecoveryMs = performance.now() - killedRecoveryStarted;
+    assert.ok(killedRecoveryMs < 5_000, `stale lock recovery took ${killedRecoveryMs.toFixed(1)}ms`);
+    assert.equal(JSON.parse(fs.readFileSync(killedHolderConfigPath, "utf8")).port, 4203);
+    assert.equal(fs.existsSync(killedHolderLockPath), false);
+
+    // A live owner is not reclaimed: a second writer observes contention and
+    // publishes only after the holder explicitly leaves its rename boundary.
+    const liveHolderHome = privateHome("config-lock-live-holder");
+    const liveHolderConfigPath = path.join(liveHolderHome, "collector.config.json");
+    const liveHolderReady = path.join(liveHolderHome, "holder-ready");
+    const liveHolderRelease = path.join(liveHolderHome, "holder-release");
+    const liveHolderObserved = path.join(liveHolderHome, "waiter-observed");
+    fs.writeFileSync(
+      liveHolderConfigPath,
+      `${JSON.stringify({ ...backfillConfig, port: 4210 }, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+    const liveHolder = startChild([
+      tsx, script, "--collector-config-lock-holder-worker", liveHolderHome,
+      liveHolderReady, liveHolderRelease, "4211",
+    ], { ...process.env, PLIMSOLL_HOME: liveHolderHome });
+    assert.equal(waitForFile(liveHolderReady, 10_000), true, "live lock holder did not reach rename boundary");
+    const liveWaiter = startChild([
+      tsx, script, "--collector-config-lock-waiter-worker", liveHolderHome,
+      liveHolderObserved, "4212",
+    ], { ...process.env, PLIMSOLL_HOME: liveHolderHome });
+    assert.equal(waitForFile(liveHolderObserved, 10_000), true, "waiter did not observe live owner");
+    assert.equal(JSON.parse(fs.readFileSync(liveHolderConfigPath, "utf8")).port, 4210);
+    fs.writeFileSync(liveHolderRelease, "release\n", { flag: "wx", mode: 0o600 });
+    const [liveHolderResult, liveWaiterResult] = await Promise.all([liveHolder, liveWaiter]);
+    assert.equal(liveHolderResult.exitCode, 0, liveHolderResult.stderr);
+    assert.equal(liveWaiterResult.exitCode, 0, liveWaiterResult.stderr);
+    assert.equal(JSON.parse(fs.readFileSync(liveHolderConfigPath, "utf8")).port, 4212);
+    assert.equal(fs.existsSync(path.join(liveHolderHome, ".collector.config.json.mutation.lock")), false);
+
+    // A malformed legacy lock has no trustworthy owner. Once older than twice
+    // the wait window it is reclaimed through the same inode-checked path.
+    const garbageLockHome = privateHome("config-lock-garbage");
+    const garbageConfigPath = path.join(garbageLockHome, "collector.config.json");
+    const garbageLockPath = path.join(garbageLockHome, ".collector.config.json.mutation.lock");
+    fs.writeFileSync(garbageConfigPath, `${JSON.stringify({ ...backfillConfig, port: 4220 }, null, 2)}\n`, { mode: 0o600 });
+    fs.writeFileSync(garbageLockPath, "not-json\n", { mode: 0o600 });
+    const oldLockTime = new Date(Date.now() - 2 * 5_000 - 1_000);
+    fs.utimesSync(garbageLockPath, oldLockTime, oldLockTime);
+    const garbageRecoveryStarted = performance.now();
+    writeCollectorConfigTransactionally(
+      collectorConfigSchema.parse({ ...backfillConfig, port: 4221 }),
+      garbageConfigPath,
+    );
+    const garbageRecoveryMs = performance.now() - garbageRecoveryStarted;
+    assert.ok(garbageRecoveryMs < 5_000, `garbage lock recovery took ${garbageRecoveryMs.toFixed(1)}ms`);
+    assert.equal(JSON.parse(fs.readFileSync(garbageConfigPath, "utf8")).port, 4221);
+    assert.equal(fs.existsSync(garbageLockPath), false);
+
     // Interprocess reconciliation is one mutation: exactly one concurrent
     // writer stores its echo and the other observes that authoritative value.
     const raceHome = privateHome("ingest-backfill-race");
@@ -359,8 +577,6 @@ async function main() {
     fs.writeFileSync(raceConfigPath, `${JSON.stringify(raceSeed, null, 2)}\n`, { mode: 0o600 });
     const raceRelease = path.join(raceHome, "release");
     const raceReady = [path.join(raceHome, "ready-a"), path.join(raceHome, "ready-b")];
-    const tsx = path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
-    const script = path.join(process.cwd(), "scripts", "account-salt-proof.ts");
     const raceValues = [DEVICE_ID, CONFLICTING_DEVICE_ID];
     const racers = raceValues.map((deviceId, index) => startChild([
       tsx,
@@ -499,11 +715,19 @@ async function main() {
         joinPersistsCloudDeviceId: true,
         legacyJoinLeavesCloudDeviceIdAbsent: true,
         acknowledgedIngestBackfillsOnce: true,
+        acknowledgedUploadSurvivesDeferredReconciliation: true,
         conflictingEchoPreservesStoredId: true,
         conflictDiagnosticRateLimitedAndIdentifierFree: true,
+        killedLockOwnerRecoveredWithoutManualCleanup: true,
+        liveLockOwnerRespectedUntilRelease: true,
+        agedGarbageLockRecoveredAtomically: true,
         concurrentBackfillStoresExactlyOnce: true,
         refusalDistinctFromUnallocated: true,
         saltAbsentFromReceipts: true,
+      },
+      timings: {
+        killedHolderRecoveryMs: Number(killedRecoveryMs.toFixed(1)),
+        garbageLockRecoveryMs: Number(garbageRecoveryMs.toFixed(1)),
       },
     }));
   } finally {
@@ -515,7 +739,11 @@ async function main() {
 
 const operation = process.argv[2] === "--cloud-device-id-race-worker"
   ? cloudDeviceIdRaceWorker()
-  : main();
+  : process.argv[2] === "--collector-config-lock-holder-worker"
+    ? collectorConfigLockHolderWorker()
+    : process.argv[2] === "--collector-config-lock-waiter-worker"
+      ? collectorConfigLockWaiterWorker()
+    : main();
 
 operation.catch(error => {
   console.error(error instanceof Error ? error.stack : String(error));

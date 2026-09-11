@@ -96,6 +96,20 @@ type ProbeResult = {
   requestBytes: number;
 };
 
+const CLOUD_DEVICE_ID_RECONCILE_DEFERRED_INTERVAL_MS = 5 * 60 * 1_000;
+let cloudDeviceIdReconcileDeferredAt: number | null = null;
+
+function reportCloudDeviceIdReconcileDeferred(now: Date) {
+  const timestamp = now.getTime();
+  if (cloudDeviceIdReconcileDeferredAt !== null &&
+    timestamp >= cloudDeviceIdReconcileDeferredAt &&
+    timestamp - cloudDeviceIdReconcileDeferredAt < CLOUD_DEVICE_ID_RECONCILE_DEFERRED_INTERVAL_MS) {
+    return;
+  }
+  cloudDeviceIdReconcileDeferredAt = timestamp;
+  console.warn(JSON.stringify({ status: "cloud_device_id_reconcile_deferred" }));
+}
+
 function safeResponseSummary(value: unknown): SafeResponseSummary {
   if (!value || typeof value !== "object" || Array.isArray(value)) return {};
   const source = value as Record<string, unknown>;
@@ -164,28 +178,14 @@ async function postItems(input: {
       requestBytes: bytes,
     };
   }
+  let response: Awaited<ReturnType<typeof postDelivery>>;
   try {
-    const response = await postDelivery({
+    response = await postDelivery({
       url: input.url, body, installKey: input.config.installKey,
       ingestKey: input.ingestKey, signingSecret: input.signingSecret,
       fetchImpl: input.fetchImpl, now: input.now,
       timeoutMs: input.timeoutSeconds * 1_000, maxRequestBytes: input.maxBytes,
     });
-    const responseDeviceId = response.ok && response.body && typeof response.body === "object" &&
-      !Array.isArray(response.body)
-      ? (response.body as Record<string, unknown>).deviceId
-      : undefined;
-    if (typeof responseDeviceId === "string") {
-      reconcileCloudDeviceIdFromIngest(
-        input.config,
-        responseDeviceId,
-        { now: input.now() },
-      );
-    }
-    return {
-      ok: response.ok, status: response.status, statusClass: statusClass(response.status),
-      summary: response.ok ? safeResponseSummary(response.body) : {}, requestBytes: bytes,
-    };
   } catch (error) {
     const transient = error instanceof TransportError &&
       (error.code === "network_error" || error.code === "deadline_exceeded");
@@ -194,6 +194,25 @@ async function postItems(input: {
       statusClass: localBudget ? "local_request_budget" : transient ? "network" : "remote_contract",
       summary: {}, requestBytes: bytes };
   }
+  const responseDeviceId = response.ok && response.body && typeof response.body === "object" &&
+    !Array.isArray(response.body)
+    ? (response.body as Record<string, unknown>).deviceId
+    : undefined;
+  if (typeof responseDeviceId === "string") {
+    try {
+      reconcileCloudDeviceIdFromIngest(
+        input.config,
+        responseDeviceId,
+        { now: input.now() },
+      );
+    } catch {
+      reportCloudDeviceIdReconcileDeferred(input.now());
+    }
+  }
+  return {
+    ok: response.ok, status: response.status, statusClass: statusClass(response.status),
+    summary: response.ok ? safeResponseSummary(response.body) : {}, requestBytes: bytes,
+  };
 }
 
 function failureForProbe(result: ProbeResult): Exclude<DeliveryFailureClass, "none"> {
