@@ -1,0 +1,38 @@
+[hooks]
+Stop= [{ hooks = [{ command = "curl -s --max-time 2 -X POST -H 'Content-Type: application/json' -H 'x-plimsoll-token: PLACEHOLDER_CODEX_PRODUCER_TOKEN' --data-binary @- http://127.0.0.1:48271/hooks/codex || true", statusMessage = "Recording AI session metadata", timeout = 5, type = "command" }] }, { hooks = [{ type = "command", command = "env MEM0_FLEET_TOKEN_FILE=/Users/HOST_USER/Library/Memory/mem0/data/mcp-token MEM0_FLEET_ENDPOINT=http://127.0.0.1:8765/mcp MEM0_MACHINE=studio0 MEM0_HARNESS=codex /Users/HOST_USER/Library/Memory/mem0/bin/mem0-fleet-hook end", timeout = 3 }] }]
+SessionEnd= [{ hooks = [{ type = "command", command = "env MEM0_FLEET_TOKEN_FILE=/Users/HOST_USER/Library/Memory/mem0/data/mcp-token MEM0_FLEET_ENDPOINT=http://127.0.0.1:8765/mcp MEM0_MACHINE=studio0 MEM0_HARNESS=codex /Users/HOST_USER/Library/Memory/mem0/bin/mem0-fleet-hook end", timeout = 3 }] }]
+UserPromptSubmit= [{ hooks = [{ command = "curl -s --max-time 2 -X POST -H 'Content-Type: application/json' -H 'x-plimsoll-token: PLACEHOLDER_CODEX_PRODUCER_TOKEN' --data-binary @- http://127.0.0.1:48271/hooks/codex || true", statusMessage = "Recording AI work metadata", timeout = 5, type = "command" }] }, { hooks = [{ additionalContextLimit = 900, command = "/Users/HOST_USER/Library/Memory/mem0/bin/mem0-codex-hook-env start", statusMessage = "Loading scoped memory candidates", timeout = 15, type = "command" }] }, { hooks = [{ type = "command", timeout = 8, additionalContextLimit = 24576, command = "python3 /Users/HOST_USER/.local/share/agent-inbox/releases/20260907-eco-v201l-refinements-v1/comms/bin/inbox-native --runtime codex --machine studio0 --config /Users/HOST_USER/.local/state/agent-inbox/clients/studio0-codex-136b48657f.json --phase checkpoint" }] }]
+SessionStart= [{ matcher = "startup|resume|clear|compact", hooks = [{ command = "/Users/HOST_USER/Library/Memory/mem0/bin/mem0-codex-hook-env prime", statusMessage = "Preparing scoped memory recall", timeout = 3, type = "command" }] }, { hooks = [{ type = "command", timeout = 8, additionalContextLimit = 24576, command = "python3 /Users/HOST_USER/.local/share/agent-inbox/releases/20260907-eco-v201l-refinements-v1/comms/bin/inbox-native --runtime codex --machine studio0 --config /Users/HOST_USER/.local/state/agent-inbox/clients/studio0-codex-136b48657f.json --phase start" }] }]
+PostToolUse= [{ matcher = ".*", hooks = [{ command = "curl -s --max-time 2 -X POST -H 'Content-Type: application/json' -H 'x-plimsoll-token: PLACEHOLDER_CODEX_PRODUCER_TOKEN' --data-binary @- http://127.0.0.1:48271/hooks/codex || true", statusMessage = "Recording AI tool metadata", timeout = 5, type = "command" }] }, { hooks = [{ type = "command", command = "python3 /Users/HOST_USER/.local/share/agent-inbox/releases/20260907-eco-v201l-refinements-v1/comms/bin/inbox-native --runtime codex --machine studio0 --config /Users/HOST_USER/.local/state/agent-inbox/clients/studio0-codex-136b48657f.json --phase checkpoint --active --lease-seconds 180", timeout = 8, additionalContextLimit = 24576 }] }]
+
+[hooks.state]
+
+[hooks.state."/Users/HOST_USER/.codex/config.toml:post_tool_use:0:0"]
+trusted_hash = "sha256:3c2a04128649ae7386d18463e60bea9a596f7f546130ff2da2dd96c985a0463c"
+
+[hooks.state."/Users/HOST_USER/.codex/config.toml:stop:0:0"]
+trusted_hash = "sha256:f9bf353ee7ae4b2a1b4c5179c1d087b3d27ad375354c9a91563dc4fc61ad9e0c"
+
+[hooks.state."/Users/HOST_USER/.codex/config.toml:user_prompt_submit:0:0"]
+trusted_hash = "sha256:12c10c40c8818829a8adafaa139bba2107fd812a38b35cfd70d94ef400a25975"
+
+[hooks.state."/Users/HOST_USER/.codex/config.toml:session_start:1:0"]
+trusted_hash = "sha256:de09c1cc59708603800c9f42a677952c1538ff3a37350146bfe071a29b50c5af"
+
+[hooks.state."/Users/HOST_USER/.codex/config.toml:user_prompt_submit:2:0"]
+trusted_hash = "sha256:fc8b3334efbaaf2a6f63231e02460d6adc9eb11d22cb3c35df442bb2550305e6"
+
+[hooks.state."/Users/HOST_USER/.codex/config.toml:session_start:0:0"]
+trusted_hash = "sha256:596cb65974eaebd16bec43327a381400095b1dc775ad949be9828ed8ff7eb64b"
+
+[hooks.state."/Users/HOST_USER/.codex/config.toml:user_prompt_submit:1:0"]
+trusted_hash = "sha256:19699033cbde6dbae7a0e1f3df64de606f80a68dee0abc4982147a8d240aaa99"
+
+[hooks.state."/Users/HOST_USER/.codex/config.toml:stop:1:0"]
+trusted_hash = "sha256:9b0f13cb9745c96fbbdc7eb53547eef51101d4928e1c7c6375b8fb561d46bc29"
+
+[hooks.state."/Users/HOST_USER/.codex/config.toml:session_end:0:0"]
+trusted_hash = "sha256:a937792a008cb5b1644c7a94cbeae1c6394a55814e7b3125e14f9660e0cb3dae"
+
+[hooks.state."/Users/HOST_USER/.codex/config.toml:post_tool_use:1:0"]
+trusted_hash = "sha256:93dfa90da9cc5363db334476f3e757dff53a9668d79928fea7e816e777755a19"

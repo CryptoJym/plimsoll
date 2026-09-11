@@ -147,6 +147,7 @@ import { PLIMSOLL_VERSION } from "./version";
 import {
   applyClaudeSettings,
   applyCodexConfig,
+  applyGeminiSettings,
   generateClaudeCodeSettings,
   generateCodexConfigToml,
   generateGeminiCliSettings,
@@ -231,7 +232,8 @@ Commands:
   forward-hook SOURCE   Read hook JSON from stdin and append it without requiring the receiver
   self-test-hook SOURCE Emit one synthetic hook event into the local buffer
   generate-config TOOL  Print Claude Code, Codex, or Gemini CLI config for metadata collection
-  setup                 APPLY the Claude Code + Codex telemetry config (idempotent; --yes, --dry-run)
+  setup                 APPLY Claude Code, Gemini CLI, and Codex telemetry independently
+                        (idempotent; --yes, --dry-run)
   upload                Drain un-uploaded events to the tenant ingest API (marks rows, keeps local copies)
   upload-history        Workspace backfill: push the FULL ledger history to the joined
                         workspace, idempotently, then print a reconciliation audit.
@@ -2543,6 +2545,7 @@ async function main() {
     const yes = process.argv.includes("--yes");
     const dryRun = process.argv.includes("--dry-run");
     const claudeFile = argValue("--claude-settings") ?? path.join(os.homedir(), ".claude", "settings.json");
+    const geminiFile = argValue("--gemini-settings") ?? path.join(os.homedir(), ".gemini", "settings.json");
     const codexFile = argValue("--codex-config") ?? path.join(os.homedir(), ".codex", "config.toml");
     // Setup is the installer: it provisions the Plimsoll-local credentials so
     // generated tool configs bind each producer to its own source-bound token.
@@ -2558,27 +2561,75 @@ async function main() {
       codexProducerToken: localAuth.codexProducer,
       geminiCliProducerToken: localAuth.geminiCliProducer,
     };
-    const claudeGenerated = generateClaudeCodeSettings(toolOptions);
-    const codexToml = generateCodexConfigToml(toolOptions);
-
-    const planClaude = applyClaudeSettings(claudeFile, claudeGenerated, { dryRun: true });
-    const planCodex = applyCodexConfig(codexFile, codexToml, { dryRun: true });
-    for (const plan of [planClaude, planCodex]) {
-      for (const change of plan.changes) console.log(`${plan.path}: ${change}`);
-      if (plan.conflict) console.warn(`${plan.path}: ${plan.conflict}`);
+    type SetupTargetName = "claude" | "gemini" | "codex";
+    type SetupTarget = {
+      name: SetupTargetName;
+      path: string;
+      run: (options: typeof toolOptions, dryRun: boolean) => ReturnType<typeof applyCodexConfig>;
+    };
+    type SetupTargetState = {
+      target: SetupTarget;
+      plan?: ReturnType<typeof applyCodexConfig>;
+      refusal?: string;
+    };
+    const targets: SetupTarget[] = [
+      {
+        name: "claude",
+        path: claudeFile,
+        run: (options, preview) =>
+          applyClaudeSettings(claudeFile, generateClaudeCodeSettings(options), { dryRun: preview }),
+      },
+      {
+        name: "gemini",
+        path: geminiFile,
+        run: (options, preview) =>
+          applyGeminiSettings(geminiFile, generateGeminiCliSettings(options), { dryRun: preview }),
+      },
+      {
+        name: "codex",
+        path: codexFile,
+        run: (options, preview) =>
+          applyCodexConfig(codexFile, generateCodexConfigToml(options), { dryRun: preview }),
+      },
+    ];
+    const planned: SetupTargetState[] = targets.map((target) => {
+      try {
+        const plan = target.run(toolOptions, true);
+        return plan.conflict ? { target, plan, refusal: plan.conflict } : { target, plan };
+      } catch (error) {
+        return { target, refusal: error instanceof Error ? error.message : String(error) };
+      }
+    });
+    for (const state of planned) {
+      for (const entry of state.plan?.plan ?? []) {
+        console.log(`${state.target.path}: ${entry.key} ${entry.action}`);
+      }
+      if (state.refusal) console.log(`${state.target.path}: target refused: ${state.refusal}`);
     }
-    if (planCodex.conflict) {
-      console.error("Codex config conflict blocks setup; no config was written.");
-      process.exitCode = 1;
-      return;
-    }
-    if (!planClaude.changed && !planCodex.changed) {
-      if (!dryRun && configRead?.status === "missing") loadCollectorConfig();
-      console.log(JSON.stringify({ status: "setup_noop", claude: claudeFile, codex: codexFile, conflict: planCodex.conflict ?? null }));
-      return;
-    }
+    const summarize = (
+      states: SetupTargetState[],
+      changedStatus: "would_apply" | "applied",
+    ) => Object.fromEntries(states.map((state) => [
+      state.target.name,
+      state.refusal
+        ? { path: state.target.path, status: "refused", reason: state.refusal }
+        : {
+            path: state.target.path,
+            status: state.plan?.changed ? changedStatus : "unchanged",
+            ...(changedStatus === "applied" ? { backup: state.plan?.backupPath ?? null } : {}),
+          },
+    ]));
+    const hasRefusal = planned.some((state) => Boolean(state.refusal));
+    const hasChange = planned.some((state) => !state.refusal && state.plan?.changed);
     if (dryRun) {
-      console.log(JSON.stringify({ status: "setup_dry_run", wouldChange: [planClaude, planCodex].filter((plan) => plan.changed).map((plan) => plan.path) }));
+      console.log(JSON.stringify({ status: "setup_dry_run", targets: summarize(planned, "would_apply") }));
+      if (hasRefusal) process.exitCode = 1;
+      return;
+    }
+    if (!hasChange) {
+      if (!hasRefusal && configRead?.status === "missing") loadCollectorConfig();
+      console.log(JSON.stringify({ status: "setup_noop", targets: summarize(planned, "applied") }));
+      if (hasRefusal) process.exitCode = 1;
       return;
     }
     if (!yes) {
@@ -2603,31 +2654,37 @@ async function main() {
       geminiCliProducerToken: appliedAuth.geminiCliProducer,
     };
     if (configRead?.status === "missing") loadCollectorConfig();
-    const resultClaude = applyClaudeSettings(
-      claudeFile,
-      generateClaudeCodeSettings(appliedToolOptions),
-    );
-    const resultCodex = applyCodexConfig(
-      codexFile,
-      generateCodexConfigToml(appliedToolOptions),
-    );
+    const applied: SetupTargetState[] = planned.map((state) => {
+      if (state.refusal) return state;
+      try {
+        const result = state.target.run(appliedToolOptions, false);
+        return result.conflict
+          ? { target: state.target, plan: result, refusal: result.conflict }
+          : { target: state.target, plan: result };
+      } catch (error) {
+        return {
+          target: state.target,
+          refusal: error instanceof Error ? error.message : String(error),
+        };
+      }
+    });
     console.log(
       JSON.stringify(
         {
           status: "setup_applied",
           privacyMode: "metadata_only",
-          claude: { path: resultClaude.path, changed: resultClaude.changed, backup: resultClaude.backupPath ?? null },
-          codex: { path: resultCodex.path, changed: resultCodex.changed, backup: resultCodex.backupPath ?? null, conflict: resultCodex.conflict ?? null },
+          ...summarize(applied, "applied"),
           nextSteps: [
             "plimsoll install-launch-agent && plimsoll load-launch-agent",
             "open http://127.0.0.1:" + config.port + "/",
-            "restart any running Claude Code / Codex sessions so they pick up telemetry",
+            "restart any running Claude Code / Gemini CLI / Codex sessions so they pick up telemetry",
           ],
         },
         null,
         2,
       ),
     );
+    if (applied.some((state) => Boolean(state.refusal))) process.exitCode = 1;
     return;
   }
 

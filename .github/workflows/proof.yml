@@ -124,6 +124,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-config-apply
 
+      - name: Prove desktop TOML reconciliation and independent setup targets
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:setup-toml-reconcile
+
       - name: Prove atomic Claude config reconciliation
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:claude-config-apply

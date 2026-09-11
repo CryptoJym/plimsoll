@@ -497,7 +497,7 @@ function main() {
     check(
       "foreign_otel_remains_a_precise_no_write_conflict",
       !foreignResult.changed &&
-        Boolean(foreignResult.conflict?.includes("without this Plimsoll collector endpoint")) &&
+        Boolean(foreignResult.conflict?.includes("otel.exporter.otlp-http")) &&
         fs.readFileSync(foreign, "utf8") === foreignSource &&
         backupFiles(foreignDir).length === 0,
       foreignResult,

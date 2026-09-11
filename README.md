@@ -2,7 +2,7 @@
 
 **The load line for your AI spend.**
 
-Plimsoll is a local-first telemetry collector for AI coding agents (Claude Code and Codex today) that answers the question every team is guessing at:
+Plimsoll is a local-first telemetry collector for AI coding agents (Claude Code, Gemini CLI, and Codex today) that answers the question every team is guessing at:
 
 > **What did we actually get for those tokens?**
 
@@ -60,7 +60,8 @@ The outcome join uses **linkage keys**: both Plimsoll and the GitHub side hash t
 Requirements: macOS, Node >=20 <25.
 
 ```bash
-# wire Claude Code + Codex telemetry (idempotent, takes backups; --dry-run to preview)
+# wire Claude Code, Gemini CLI, and Codex telemetry (independent targets;
+# idempotent, takes backups; --dry-run to preview)
 npx -y @plimsoll/cli setup
 
 # run the collector + dashboard → http://127.0.0.1:48271
@@ -216,7 +217,7 @@ The hosted product (separate, commercial) is the **comparative and prescriptive*
 
 ## Roadmap
 
-1. **v0.1 — Open release** (now): macOS collector, Claude Code + Codex, local efficiency reports, signal-fidelity CI. ([issue 0001](issues/0001-v0.1-release-readiness.md))
+1. **v0.1 — Open release** (now): macOS collector, Claude Code + Gemini CLI + Codex, local efficiency reports, signal-fidelity CI. ([issue 0001](issues/0001-v0.1-release-readiness.md))
 2. **v0.2 — Coverage**: codex live verification, per-event repo attribution for multi-repo sessions, rework-window detection for true Validated Delivery Yield, Linux support.
 3. **v0.3 — Reach**: adapters for more agents (Cursor, Gemini CLI, Copilot CLI), npx one-line install, menubar app, signed standalone binary.
 4. **Hosted beta** (commercial, separate repo): team rollups, benchmarks, Efficiency Brief.
