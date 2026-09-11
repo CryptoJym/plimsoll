@@ -60,6 +60,7 @@
     "proof:token-lineage": "tsx scripts/token-lineage-proof.ts",
     "proof:git-context": "tsx scripts/git-context-proof.ts",
     "proof:repo-context": "tsx scripts/repo-context-proof.ts",
+    "proof:repo-context-drain": "tsx scripts/repo-context-drain-proof.ts",
     "proof:codex-reconciliation": "tsx scripts/codex-reconciliation-proof.ts",
     "proof:resource-concurrency": "tsx scripts/resource-proof/concurrency-proof.ts",
     "proof:resource": "tsx scripts/resource-proof/index.ts",
