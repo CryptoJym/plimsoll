@@ -74,7 +74,7 @@ export function ensureCodexLiveUsageSchema(db: DB) {
 
 /** Provisioning changes credential activity, never a logical source context or session pin. */
 export function registerLiveCredential(db: DB, auth: LiveAuthenticatedBinding) {
-  db.transaction(() => {
+  const work = () => {
     const existing = db.prepare(`select context_digest from codex_live_producers where producer_id=?`)
       .get(auth.context.producerId) as { context_digest: string } | undefined;
     if (existing && existing.context_digest !== auth.contextDigest) throw new Error("live_producer_rebinding_forbidden");
@@ -87,7 +87,9 @@ export function registerLiveCredential(db: DB, auth: LiveAuthenticatedBinding) {
     db.prepare(`insert into codex_live_bindings values(?,?,?,?,?,?,0)`)
       .run(auth.context.producerId, auth.binding.credentialId, auth.scopeDigest, auth.contextDigest,
         auth.binding.tokenSha256, auth.binding.enrolledAt);
-  }).immediate();
+  };
+  if (db.inTransaction) return work();
+  db.transaction(work).immediate();
 }
 export function revokeLiveProducer(db: DB, producerId: string) {
   db.transaction(() => {
@@ -102,8 +104,11 @@ function readPin(db: DB, sessionId: string) {
     .get(sessionId) as Pin | undefined;
 }
 function pinMatches(pin: Pin | undefined, auth: LiveAuthenticatedBinding) {
-  return Boolean(pin && pin.producer_id === auth.context.producerId && pin.context_digest === auth.contextDigest &&
-    pin.context_json === canonicalJson(auth.context));
+  // The logical producer digest deliberately excludes installation epoch.
+  // A required failover epoch therefore starts a new packet/dedupe scope but
+  // retains the same session authority instead of conflicting with its own
+  // immutable pre-failover pin (whose context_json records the old epoch).
+  return Boolean(pin && pin.producer_id === auth.context.producerId && pin.context_digest === auth.contextDigest);
 }
 const liveEventCapabilities = new WeakMap<AiInteractionEvent, { database: DB; auth: LiveAuthenticatedBinding }>();
 export function liveUsageMetricAllowed(db: DB, sample: MetricSample) {
@@ -137,7 +142,12 @@ function contains(at: string, window: { validFrom: string; validUntil: string | 
   return Date.parse(window.validFrom) <= Date.parse(at) && (!window.validUntil || Date.parse(at) < Date.parse(window.validUntil));
 }
 function snapshot(auth: LiveAuthenticatedBinding, p: LiveUsagePacket): Snapshot {
-  const account = auth.root.account && contains(p.capturedAt, auth.root.account) ? { ...auth.root.account } : null;
+  const accountCandidates = [...new Map(
+    [ ...(auth.root.accountAssertions ?? []), ...(auth.root.account ? [auth.root.account] : []) ]
+      .map(account => [`${account.validFrom}\u0000${account.evidenceRef}`, account] as const),
+  ).values()];
+  const matchingAccounts = accountCandidates.filter(candidate => contains(p.capturedAt, candidate));
+  const account = matchingAccounts.length === 1 ? { ...matchingAccounts[0] } : null;
   const matches = (auth.root.dispatch ?? []).filter(w => w.sessionId === p.threadId && contains(p.capturedAt, w));
   const work = matches.length === 1 ? { ...matches[0] } : null;
   return { at: p.capturedAt, contextDigest: auth.contextDigest, account, work,

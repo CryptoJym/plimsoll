@@ -162,7 +162,9 @@ jobs:
 
       - name: Prove Codex account assertions and privacy boundary
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
-        run: pnpm proof:account-assertion
+        run: |
+          pnpm proof:account-assertion
+          pnpm proof:account-salt
 
       - name: Prove local HTTP trust boundary
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

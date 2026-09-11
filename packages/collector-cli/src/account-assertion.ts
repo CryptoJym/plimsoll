@@ -8,12 +8,15 @@ import { z } from "zod";
  * Versioned account continuity contract.
  *
  * The value in an assertion is deliberately an actor hash, never the native
- * provider account id.  The salt is installation-local and is not part of an
- * event, receipt, or upload.
+ * provider account id.  The salt is issued by the hosted tenant and is not
+ * part of an event, receipt, or upload.  A device with no tenant salt is
+ * deliberately unallocated; it must never silently fall back to a local
+ * random salt (which would make cross-host grouping impossible).
  */
 export const ACCOUNT_ASSERTION_SCHEMA = "account-assertion/v1" as const;
 export const ACCOUNT_ASSERTION_STATE_KEY = "account_assertion_adapters_v1" as const;
 export const ACCOUNT_ASSERTION_SALT_FILE = "account-assertion.salt" as const;
+export const ACCOUNT_ASSERTION_SALT_META_FILE = "account-assertion.salt.meta.json" as const;
 export const ACCOUNT_ASSERTION_SOURCES = ["codex", "claude_code", "conductor"] as const;
 export type AccountAssertionSource = (typeof ACCOUNT_ASSERTION_SOURCES)[number];
 
@@ -45,6 +48,7 @@ export type AccountAssertionAdapterState = {
   }>;
   /** Enrollment records live in the same maintenance key, not the event ledger. */
   bindings: Record<AccountAssertionSource, AccountAssertionBindingState[]>;
+  salt?: { tenantId: string; version: string };
 };
 
 export type AccountAssertionBindingState = {
@@ -74,24 +78,18 @@ const stateSchema = z.object({
   schema: z.literal("account-assertion-adapters/v1"),
   adapters: z.record(z.string(), adapterStateSchema),
   bindings: z.record(z.string(), z.array(bindingStateSchema).max(1024)).optional(),
+  salt: z.object({ tenantId: z.string().min(1), version: z.string().min(1) }).optional(),
 }).strict();
 
 const SOURCE_SET = new Set<string>(ACCOUNT_ASSERTION_SOURCES);
 const HASH = /^sha256:[a-f0-9]{64}$/;
 const HEX_DIGEST = /^[a-f0-9]{64}$/;
-const IDENTITY_FIELDS = [
-  "providerAccountId",
-  "provider_account_id",
-  "chatgptAccountId",
-  "chatgpt_account_id",
-  "codexAccountId",
-  "accountUuid",
-  "account_uuid",
-  "accountId",
-  "account_id",
-  "id",
-  "credentialId",
-] as const;
+const saltMetadataSchema = z.object({
+  schema: z.literal("account-actor-salt/v1"),
+  tenantId: z.string().min(1),
+  version: z.string().min(1),
+  saltDigest: digest,
+}).strict();
 
 function privateDirectory(directory: string) {
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
@@ -112,49 +110,131 @@ function privateSalt(file: string) {
   }
 }
 
-function writePrivateSalt(file: string, value: Buffer) {
-  const directory = path.dirname(file);
-  privateDirectory(directory);
-  let fd: number | undefined;
-  try {
-    // O_EXCL makes the first enrollment the sole salt writer; a concurrent
-    // enrollment re-reads the winner instead of replacing its salt.
-    fd = fs.openSync(file, "wx", 0o600);
-    fs.writeFileSync(fd, value);
-    fs.fsyncSync(fd);
-    fs.closeSync(fd);
-    fd = undefined;
-    const directoryFd = fs.openSync(directory, "r");
-    try { fs.fsyncSync(directoryFd); } finally { fs.closeSync(directoryFd); }
-  } finally {
-    if (fd !== undefined) fs.closeSync(fd);
-  }
-}
-
-/** Return the installation-local salt, creating it with owner-only mode once. */
-export function ensureAccountAssertionSalt(collectorHome: string): Buffer {
+/** Read an already provisioned tenant salt.  This function never creates one. */
+export function readAccountAssertionSalt(collectorHome: string): Buffer | null {
   privateDirectory(collectorHome);
   const file = path.join(collectorHome, ACCOUNT_ASSERTION_SALT_FILE);
-  if (fs.existsSync(file)) {
-    privateSalt(file);
-    const value = fs.readFileSync(file);
-    if (value.length !== 32) throw new Error("account_assertion_salt_invalid");
-    return value;
-  }
-  const value = crypto.randomBytes(32);
-  try {
-    writePrivateSalt(file, value);
-  } catch (error) {
-    // A concurrent enrollment may have won the create race.  Re-read only
-    // after checking the winner's permissions and exact size.
-    if (!fs.existsSync(file)) throw error;
-    privateSalt(file);
-  }
+  if (!fs.existsSync(file)) return null;
   privateSalt(file);
-  return fs.readFileSync(file);
+  const value = fs.readFileSync(file);
+  if (value.length !== 32) throw new Error("account_assertion_salt_invalid");
+  return value;
 }
 
-export const readAccountAssertionSalt = ensureAccountAssertionSalt;
+function readAccountAssertionSaltMetadata(collectorHome: string) {
+  const file = path.join(collectorHome, ACCOUNT_ASSERTION_SALT_META_FILE);
+  if (!fs.existsSync(file)) return null;
+  const stat = fs.lstatSync(file);
+  if (stat.isSymbolicLink() || !stat.isFile() || stat.size > 4 * 1024 || (stat.mode & 0o7077) !== 0 ||
+      (typeof process.getuid === "function" && stat.uid !== process.getuid())) {
+    throw new Error("account_assertion_salt_metadata_unsafe");
+  }
+  try { return saltMetadataSchema.parse(JSON.parse(fs.readFileSync(file, "utf8"))); }
+  catch { throw new Error("account_assertion_salt_metadata_invalid"); }
+}
+
+function privateTemporaryFile(file: string, bytes: Buffer | string) {
+  const temporary = `${file}.${crypto.randomBytes(8).toString("hex")}.tmp`;
+  let descriptor: number | undefined;
+  try {
+    descriptor = fs.openSync(temporary, "wx", 0o600);
+    fs.writeFileSync(descriptor, bytes);
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+    return temporary;
+  } catch (error) {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+    if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+    throw error;
+  }
+}
+
+function syncDirectory(directory: string) {
+  const descriptor = fs.openSync(directory, "r");
+  try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
+}
+
+/**
+ * Install a tenant-issued salt after an authenticated join/sync.  The binary
+ * value is owner-only and published atomically; the sidecar carries only the
+ * tenant/version binding needed to reject a stale salt after reassignment.
+ */
+export function storeAccountAssertionSalt(collectorHome: string, value: Buffer | Uint8Array,
+  metadata: { tenantId: string; version: string }) {
+  privateDirectory(collectorHome);
+  const salt = Buffer.from(value);
+  const tenantId = metadata.tenantId.trim();
+  const version = metadata.version.trim();
+  if (salt.length !== 32) throw new Error("account_assertion_salt_invalid");
+  if (!tenantId || !version) throw new Error("account_assertion_salt_metadata_invalid");
+  const file = path.join(collectorHome, ACCOUNT_ASSERTION_SALT_FILE);
+  const metaFile = path.join(collectorHome, ACCOUNT_ASSERTION_SALT_META_FILE);
+  const existing = readAccountAssertionSalt(collectorHome);
+  const existingMetadata = readAccountAssertionSaltMetadata(collectorHome);
+  const saltDigest = `sha256:${crypto.createHash("sha256").update(salt).digest("hex")}`;
+  if (existingMetadata?.tenantId === tenantId && existingMetadata.version === version) {
+    if (!existing || existingMetadata.saltDigest !== saltDigest || !crypto.timingSafeEqual(existing, salt)) {
+      throw new Error("account_assertion_salt_version_conflict");
+    }
+    return false;
+  }
+  const nextMetadata = `${JSON.stringify({
+    schema: "account-actor-salt/v1", tenantId, version, saltDigest,
+  })}\n`;
+  const priorSaltBytes = existing ? Buffer.from(existing) : null;
+  const priorMetadataBytes = fs.existsSync(metaFile) ? fs.readFileSync(metaFile) : null;
+  const saltTemporary = privateTemporaryFile(file, salt);
+  let metadataTemporary: string | null = null;
+  try {
+    metadataTemporary = privateTemporaryFile(metaFile, nextMetadata);
+    // The salt publishes first and metadata last. A crash between renames is
+    // fail-closed because readers require the sidecar digest to match.
+    fs.renameSync(saltTemporary, file);
+    fs.renameSync(metadataTemporary, metaFile);
+    syncDirectory(collectorHome);
+  } catch (error) {
+    // Restore the prior coherent pair on an observed publication failure. If
+    // the process itself dies between renames, the digest check still makes
+    // the half-published pair unusable rather than deriving the wrong actor.
+    try {
+      if (priorSaltBytes !== null) {
+        const restoreSalt = privateTemporaryFile(file, priorSaltBytes);
+        fs.renameSync(restoreSalt, file);
+      } else if (fs.existsSync(file)) fs.unlinkSync(file);
+      if (priorMetadataBytes !== null) {
+        const restoreMetadata = privateTemporaryFile(metaFile, priorMetadataBytes);
+        fs.renameSync(restoreMetadata, metaFile);
+      } else if (fs.existsSync(metaFile)) fs.unlinkSync(metaFile);
+      syncDirectory(collectorHome);
+    } catch (compensation) {
+      throw new Error(`account_assertion_salt_compensation_failed:${compensation instanceof Error ? compensation.message : String(compensation)}`, { cause: error });
+    }
+    throw error;
+  } finally {
+    if (fs.existsSync(saltTemporary)) fs.unlinkSync(saltTemporary);
+    if (metadataTemporary && fs.existsSync(metadataTemporary)) fs.unlinkSync(metadataTemporary);
+  }
+  privateSalt(file);
+  return true;
+}
+
+/** Compatibility name retained for callers; unlike r1 it fails closed. */
+export function ensureAccountAssertionSalt(collectorHome: string): Buffer {
+  const value = readAccountAssertionSalt(collectorHome);
+  if (!value) throw new Error("account_assertion_salt_unavailable");
+  return value;
+}
+
+export function readAccountAssertionSaltForTenant(collectorHome: string, tenantId?: string): Buffer | null {
+  const value = readAccountAssertionSalt(collectorHome);
+  if (!value || !tenantId) return value;
+  let metadata: z.infer<typeof saltMetadataSchema> | null;
+  try { metadata = readAccountAssertionSaltMetadata(collectorHome); } catch { return null; }
+  if (!metadata || metadata.tenantId !== tenantId) return null;
+  const actualDigest = `sha256:${crypto.createHash("sha256").update(value).digest("hex")}`;
+  return metadata.saltDigest === actualDigest ? value : null;
+}
 
 function saltBytes(value: Buffer | Uint8Array | string): Buffer {
   if (Buffer.isBuffer(value)) return Buffer.from(value);
@@ -176,31 +256,47 @@ export function deriveAccountActorHash(identity: string, salt: Buffer | Uint8Arr
 export const hashAccountIdentity = deriveAccountActorHash;
 export const stableAccountActorHash = deriveAccountActorHash;
 
-function canonical(value: unknown, seen = new WeakSet<object>()): string {
-  if (value === undefined) return "null";
+export const ACCOUNT_ASSERTION_CANONICAL_BUDGETS = {
+  maxDepth: 256,
+  maxNodes: 10_000,
+  maxBytes: 16 * 1024,
+} as const;
+
+/** Controlled canonicalisation: hostile depth/width is rejected before the JS
+ * call stack can overflow and before an unbounded string is built. */
+function canonical(value: unknown, seen = new WeakSet<object>(), depth = 0,
+  budget = ACCOUNT_ASSERTION_CANONICAL_BUDGETS, counter = { nodes: 0, bytes: 0 }): string {
+  if (depth > budget.maxDepth) throw new Error("account_binding_record_depth_exceeded");
+  counter.nodes += 1;
+  if (counter.nodes > budget.maxNodes) throw new Error("account_binding_record_node_budget_exceeded");
+  const emit = (text: string) => {
+    counter.bytes += Buffer.byteLength(text, "utf8");
+    if (counter.bytes > budget.maxBytes) throw new Error("account_binding_record_too_large");
+    return text;
+  };
+  if (value === undefined) return emit("null");
   if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-    return JSON.stringify(value);
+    return emit(JSON.stringify(value));
   }
   if (typeof value === "object") {
     if (seen.has(value)) throw new Error("account_binding_record_cyclic");
     seen.add(value);
+    let result: string;
     if (Array.isArray(value)) {
-      const result = `[${value.map(item => canonical(item, seen)).join(",")}]`;
-      seen.delete(value);
-      return result;
+      result = `[${value.map(item => canonical(item, seen, depth + 1, budget, counter)).join(",")}]`;
+    } else {
+      const record = value as Record<string, unknown>;
+      result = `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${canonical(record[key], seen, depth + 1, budget, counter)}`).join(",")}}`;
     }
-    const record = value as Record<string, unknown>;
-    const result = `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${canonical(record[key], seen)}`).join(",")}}`;
     seen.delete(value);
-    return result;
+    return emit(result);
   }
-  return JSON.stringify(null);
+  return emit("null");
 }
 
 /** Hash a bounded, non-secret binding receipt; only the digest is persisted. */
-export function hashBindingRecord(record: unknown): string {
-  const encoded = canonical(record);
-  if (Buffer.byteLength(encoded, "utf8") > 16 * 1024) throw new Error("account_binding_record_too_large");
+export function hashBindingRecord(record: unknown, budgets?: Partial<typeof ACCOUNT_ASSERTION_CANONICAL_BUDGETS>): string {
+  const encoded = canonical(record, new WeakSet<object>(), 0, { ...ACCOUNT_ASSERTION_CANONICAL_BUDGETS, ...budgets });
   return `sha256:${crypto.createHash("sha256").update(encoded, "utf8").digest("hex")}`;
 }
 export const bindingEvidenceRef = hashBindingRecord;
@@ -253,35 +349,54 @@ export function validateAccountAssertionWindow(assertion: Pick<AccountAssertionV
   return true;
 }
 
-function identityFromBinding(binding: unknown, seen = new WeakSet<object>()): { field: string; value: string } | null {
-  if (!binding || typeof binding !== "object") return null;
-  if (seen.has(binding)) return null;
-  seen.add(binding);
-  const record = binding as Record<string, unknown>;
-  for (const field of IDENTITY_FIELDS) {
-    const value = record[field];
-    // Email addresses and token-looking values are not provider account
-    // identities.  Skip them rather than allowing a caller to accidentally
-    // turn a PII field into the actor input.
-    if (typeof value === "string" && value.trim() && !value.includes("@") &&
-        !/^(?:sk-|tok_|bearer\s|eyJ[A-Za-z0-9_-]+\.)/i.test(value.trim())) return { field, value: value.trim() };
-  }
-  // Native profile adapters may nest the stable provider id under account or
-  // a binding/identity envelope.  These are still caller-supplied records;
-  // no neighboring credential store is opened here.
-  for (const key of ["account", "binding", "identity", "profile"] as const) {
-    const nested = record[key];
-    if (nested && typeof nested === "object") {
-      const resolved = identityFromBinding(nested, seen);
-      if (resolved) return resolved;
-    }
-  }
-  return null;
+function safeIdentity(value: unknown): string | null {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  if (!trimmed || trimmed.length > 512 || trimmed.includes("@") ||
+      /^(?:sk-|tok_|bearer\s|eyJ[A-Za-z0-9_-]+\.)/i.test(trimmed)) return null;
+  return trimmed;
 }
 
-/** Resolve only a stable binding id; token, email, and adjacent credential values are ignored. */
+function decodeBase64UrlJson(value: string): Record<string, unknown> | null {
+  if (!value || value.length > 192 * 1024 || !/^[A-Za-z0-9_-]+$/.test(value)) return null;
+  try {
+    const bytes = Buffer.from(value, "base64url");
+    if (bytes.toString("base64url") !== value) return null;
+    const parsed: unknown = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(bytes));
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed as Record<string, unknown> : null;
+  } catch { return null; }
+}
+
+/**
+ * Accept only the signed native Codex auth record.  Routing fields,
+ * credentialId, caller-provided digests, and arbitrary profile objects are
+ * intentionally not identity/evidence sources.
+ */
+export function resolveCodexSignedNativeEvidence(binding: unknown): { identity: string; evidenceRef: string } | null {
+  if (!binding || typeof binding !== "object") return null;
+  const root = binding as Record<string, unknown>;
+  const tokens = root.tokens;
+  if (!tokens || typeof tokens !== "object" || Array.isArray(tokens)) return null;
+  const idToken = (tokens as Record<string, unknown>).id_token;
+  if (typeof idToken !== "string" || idToken.length === 0 || idToken.length > 256 * 1024) return null;
+  const parts = idToken.split(".");
+  if (parts.length !== 3 || parts.some(part => !part || !/^[A-Za-z0-9_-]+$/.test(part))) return null;
+  const header = decodeBase64UrlJson(parts[0]);
+  const claims = decodeBase64UrlJson(parts[1]);
+  let signature: Buffer;
+  try { signature = Buffer.from(parts[2], "base64url"); } catch { return null; }
+  if (!header || !claims || typeof header.alg !== "string" || header.alg.toLowerCase() === "none" ||
+      signature.length === 0 || signature.toString("base64url") !== parts[2]) return null;
+  const apiClaims = claims["https://api.openai.com/auth"];
+  if (!apiClaims || typeof apiClaims !== "object" || Array.isArray(apiClaims)) return null;
+  const identity = safeIdentity((apiClaims as Record<string, unknown>).chatgpt_account_id);
+  if (!identity) return null;
+  return { identity, evidenceRef: `sha256:${crypto.createHash("sha256").update(idToken, "utf8").digest("hex")}` };
+}
+
+/** Resolve only a stable identity from signed native claims. */
 export function resolveCodexAccountIdentity(binding: unknown): string | null {
-  return identityFromBinding(binding)?.value ?? null;
+  return resolveCodexSignedNativeEvidence(binding)?.identity ?? null;
 }
 
 export function accountAssertionForBinding(options: {
@@ -293,6 +408,8 @@ export function accountAssertionForBinding(options: {
   chatgptAccountId?: string;
   accountId?: string;
   accountUuid?: string;
+  /** Hosted tenant whose private salt must already be installed. */
+  tenantId?: string;
   collectorHome: string;
   validFrom: string;
   validUntil?: string | null;
@@ -309,12 +426,19 @@ export function accountAssertionForBinding(options: {
       (binding as { source: string }).source !== source) {
     throw new Error("account_assertion_source_mismatch");
   }
-  const identity = identityFromBinding(binding);
-  if (!identity) throw new Error("account_identity_unavailable");
-  const evidenceRef = options.evidenceRef ?? hashBindingRecord(binding);
-  if (!HASH.test(evidenceRef)) throw new Error("account_evidence_ref_invalid");
+  const native = source === "codex" ? resolveCodexSignedNativeEvidence(binding) : null;
+  const identity = native?.identity ?? (source === "codex" ? null : safeIdentity(options.accountIdentity ?? options.providerAccountId ??
+    options.chatgptAccountId ?? options.accountId ?? options.accountUuid));
+  if (!identity) throw new Error("account_signed_evidence_unavailable");
+  // A caller-supplied evidenceRef is accepted only as a consistency check
+  // against the exact signed bytes; it can never create evidence by itself.
+  const evidenceRef = native?.evidenceRef ?? null;
+  if (!evidenceRef || (options.evidenceRef !== undefined && options.evidenceRef !== evidenceRef))
+    throw new Error("account_signed_evidence_invalid");
+  const salt = options.tenantId ? readAccountAssertionSaltForTenant(options.collectorHome, options.tenantId) : null;
+  if (!salt) throw new Error("account_assertion_salt_unavailable");
   const assertion = {
-    actorHash: deriveAccountActorHash(identity.value, options.collectorHome),
+    actorHash: deriveAccountActorHash(identity, salt),
     validFrom: options.validFrom,
     validUntil: options.validUntil ?? null,
     evidenceRef,
@@ -362,6 +486,7 @@ function parseState(value: string | null | undefined): AccountAssertionAdapterSt
       assertion: accountAssertionV1Schema.parse(binding.assertion),
     }));
   }
+  if (parsed.data.salt) defaults.salt = { ...parsed.data.salt };
   return defaults;
 }
 
@@ -384,10 +509,22 @@ function writeState(db: DB, state: AccountAssertionAdapterState) {
 }
 
 /** Toggle one adapter and touch no root, event, receipt, or other state key. */
-export function setAccountAssertionAdapterEnabled(db: DB, source: AccountAssertionSource, enabled: boolean) {
+export function setAccountAssertionAdapterEnabled(db: DB, source: AccountAssertionSource, enabled: boolean,
+  at = new Date().toISOString()) {
   if (!SOURCE_SET.has(source)) throw new Error("account_assertion_source_invalid");
+  if (!timestamp.safeParse(at).success) throw new Error("account_assertion_time_invalid");
   const update = db.transaction(() => {
     const state = readAccountAssertionAdapterState(db);
+    if (!enabled) {
+      for (const binding of state.bindings[source]) {
+        if (!binding.active) continue;
+        if (Date.parse(at) <= Date.parse(binding.assertion.validFrom)) {
+          throw new Error("account_assertion_disable_time_regression");
+        }
+        binding.assertion = closeAccountAssertionWindow(binding.assertion, at);
+        binding.active = false;
+      }
+    }
     state.adapters[source].enabled = enabled;
     writeState(db, state);
     return state;
@@ -400,6 +537,24 @@ export const setAccountAssertionAdapterState = setAccountAssertionAdapterEnabled
 export function accountAssertionAdapterEnabled(db: DB, source: AccountAssertionSource) {
   if (!SOURCE_SET.has(source)) throw new Error("account_assertion_source_invalid");
   return readAccountAssertionAdapterState(db).adapters[source].enabled;
+}
+
+/** Persist the tenant salt binding in the additive maintenance record. */
+export function recordAccountAssertionSalt(db: DB, tenantId: string, version: string) {
+  if (!tenantId.trim() || !version.trim()) throw new Error("account_assertion_salt_metadata_invalid");
+  const update = db.transaction(() => {
+    const state = readAccountAssertionAdapterState(db);
+    state.salt = { tenantId: tenantId.trim(), version: version.trim() };
+    writeState(db, state);
+    return state;
+  });
+  return update.immediate();
+}
+
+export function accountAssertionSaltForTenant(db: DB, collectorHome: string, tenantId: string): Buffer | null {
+  const state = readAccountAssertionAdapterState(db);
+  if (!state.salt || state.salt.tenantId !== tenantId) return null;
+  return readAccountAssertionSaltForTenant(collectorHome, tenantId);
 }
 
 function recordAccountAssertionInTransaction(db: DB, source: AccountAssertionSource, rootDigest: string, at: string) {
@@ -468,11 +623,12 @@ export function enrollCodexAccountAssertion(options: {
   collectorHome: string;
   validFrom: string;
   validUntil?: string | null;
+  tenantId?: string;
 }): AccountAssertionV1 | null {
   if (options.db && !accountAssertionAdapterEnabled(options.db, "codex")) return null;
   const assertion = accountAssertionForBinding({
     source: "codex", binding: options.binding, collectorHome: options.collectorHome,
-    validFrom: options.validFrom, validUntil: options.validUntil,
+    validFrom: options.validFrom, validUntil: options.validUntil, tenantId: options.tenantId,
   });
   if (!options.db) return assertion;
   persistCodexAccountAssertion(options.db, options.rootId, options.rootDigest, assertion);
@@ -496,13 +652,13 @@ function closePriorCodexAssertions(state: AccountAssertionAdapterState, rootId: 
 /** Close an open Codex window when a replacement binding is enrolled without an assertion. */
 export function closeCodexAccountAssertionWindow(db: DB, rootId: string, validUntil: string) {
   if (!ROOT_ID.test(rootId) || !timestamp.safeParse(validUntil).success) throw new Error("account_assertion_window_invalid");
-  const close = db.transaction(() => {
+  const work = () => {
     const state = readAccountAssertionAdapterState(db);
     if (!closePriorCodexAssertions(state, rootId, validUntil)) return false;
     writeState(db, state);
     return true;
-  });
-  return close.immediate();
+  };
+  return db.inTransaction ? work() : db.transaction(work).immediate();
 }
 
 /** Persist one assertion and close the prior open window for this root. */
@@ -517,14 +673,15 @@ export function persistCodexAccountAssertion(db: DB, rootId: string, rootDigest:
   // same native binding.  The evidence reference remains the native-record
   // digest exposed to events; this private key excludes the mutable window
   // close and contains no raw identity.
-  const bindingDigest = assertionBindingDigest(assertion);
-  const enroll = db.transaction(() => {
+  const bindingDigest = hashBindingRecord({ assertion: assertionBindingDigest(assertion), bindingKey: bindingKey ?? null });
+  const work = () => {
     const state = readAccountAssertionAdapterState(db);
     // Recheck inside the write transaction so a concurrent maintenance toggle
     // cannot sneak one more assertion in after the adapter was disabled.
     if (!state.adapters.codex.enabled) throw new Error("account_assertion_adapter_disabled");
     const bindings = state.bindings.codex;
-    const activePrior = bindings.find(row => row.rootId === rootId && row.active);
+    const activePrior = bindings.filter(row => row.rootId === rootId && row.active)
+      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
     if (activePrior && Date.parse(assertion.validFrom) <= Date.parse(activePrior.assertion.validFrom)) {
       throw new Error("account_assertion_time_regression");
     }
@@ -540,8 +697,8 @@ export function persistCodexAccountAssertion(db: DB, rootId: string, rootDigest:
     const normalizedRootDigest = HASH.test(rootDigest) ? rootDigest : `sha256:${rootDigest}`;
     adapter.rootDigests = [normalizedRootDigest, ...adapter.rootDigests.filter(value => value !== normalizedRootDigest)].slice(0, 1024);
     writeState(db, state);
-  });
-  enroll.immediate();
+  };
+  if (db.inTransaction) work(); else db.transaction(work).immediate();
   return assertion;
 }
 
@@ -555,11 +712,13 @@ export function attachCodexAccountAssertion<TRoot extends { source: string; acco
     collectorHome: string;
     validFrom: string;
     validUntil?: string | null;
+    tenantId?: string;
   },
 ): TRoot & { account: AccountAssertionV1 } {
   if (root.source !== "codex") throw new Error("account_assertion_source_invalid");
   const assertion = accountAssertionForBinding({ source: "codex", binding: options.binding,
-    collectorHome: options.collectorHome, validFrom: options.validFrom, validUntil: options.validUntil });
+    collectorHome: options.collectorHome, validFrom: options.validFrom, validUntil: options.validUntil,
+    tenantId: options.tenantId });
   return { ...root, account: assertion } as TRoot & { account: AccountAssertionV1 };
 }
 
@@ -574,4 +733,20 @@ export function activeCodexAccountAssertion(db: DB, rootId: string, bindingKey?:
   if (!parsed.success) return null;
   try { validateAccountAssertionWindow(parsed.data); } catch { return null; }
   return parsed.data;
+}
+
+/** Every immutable interval, including closed failover windows. */
+export function codexAccountAssertionIntervals(db: DB, rootId: string): AccountAssertionV1[] {
+  const state = readAccountAssertionAdapterState(db);
+  return state.bindings.codex
+    .filter(binding => binding.rootId === rootId)
+    .sort((a, b) => Date.parse(a.assertion.validFrom) - Date.parse(b.assertion.validFrom))
+    .map(binding => accountAssertionV1Schema.safeParse(binding.assertion))
+    .filter((parsed): parsed is { success: true; data: AccountAssertionV1 } => parsed.success)
+    .map(parsed => parsed.data);
+}
+
+export function codexAccountAssertionAt(db: DB, rootId: string, at: string): AccountAssertionV1 | null {
+  const matches = codexAccountAssertionIntervals(db, rootId).filter(assertion => accountAssertionContains(assertion, at));
+  return matches.length === 1 ? matches[0] : null;
 }

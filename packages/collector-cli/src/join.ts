@@ -13,6 +13,7 @@ import {
   collectorBufferPath,
   collectorConfigPath,
   collectorConfigSchema,
+  collectorHome,
   isManagedOrUploadEnabled,
   type CollectorConfig,
 } from "./config";
@@ -27,6 +28,7 @@ import {
   type LocalDeviceIdentity,
 } from "./device-identity";
 import { assertNoRedirect, postJson, validatedTransportUrl } from "./http-transport";
+import { syncAccountActorSalt } from "./account-salt";
 
 /**
  * Fleet join is transactional: redeem into memory, prove only a fresh
@@ -70,6 +72,8 @@ const joinGrantSchema = z.object({
   uploadSigningSecret: z.string().trim().min(16).optional(),
   keyId: z.string().trim().regex(JOIN_KEY_ID_PATTERN).optional(),
   policyVersion: z.string().trim().min(1).optional(),
+  /** Optional capability advertised by newer hosted tenants. */
+  accountActorSaltEndpoint: z.string().url().optional(),
 });
 
 const pendingJoinSchema = z.object({
@@ -84,6 +88,7 @@ const pendingJoinSchema = z.object({
   installationEpochId: z.string().uuid().optional(),
   handshakeEventId: z.string().trim().min(1).optional(),
   stagedConfig: collectorConfigSchema,
+  accountActorSaltEndpoint: z.string().url().optional(),
 });
 type PendingJoin = z.infer<typeof pendingJoinSchema>;
 
@@ -131,6 +136,7 @@ export type JoinResult =
         signedUpload: boolean;
         response: unknown;
       };
+      accountSaltSynced?: boolean;
     }
   | {
       joined: false;
@@ -655,6 +661,24 @@ async function activatePendingJoin(
     const enrollment = readEnrollmentStatus(options.homeDir);
     activeConfigActivated = true;
     options.afterConfigActivation?.();
+    // Newer cloud grants advertise the authenticated salt endpoint.  Salt
+    // retrieval is best-effort so an older tenant keeps joining successfully,
+    // but the adapter remains explicitly unallocated until a salt is present.
+    let accountSaltSynced = false;
+    if (pending.accountActorSaltEndpoint) {
+      try {
+        const salt = await syncAccountActorSalt({
+          collectorHome: collectorHome(options.homeDir), tenantId: pending.stagedConfig.tenantId,
+          deviceId: identity.deviceId, uploadUrl: pending.stagedConfig.uploadUrl ?? "",
+          installKey: pending.stagedConfig.installKey ?? "", ingestKey: pending.stagedConfig.ingestKey,
+          signingSecret: pending.stagedConfig.uploadSigningSecret,
+          endpointUrl: pending.accountActorSaltEndpoint, fetchImpl: options.fetchImpl,
+        });
+        accountSaltSynced = salt.synced;
+      } catch {
+        accountSaltSynced = false;
+      }
+    }
     fs.rmSync(options.pendingFile, { force: true });
     return {
       joined: true,
@@ -679,6 +703,7 @@ async function activatePendingJoin(
         signedUpload: uploaded.signedUpload,
         response: uploaded.response,
       },
+      accountSaltSynced,
     };
   } catch (error) {
     if (!activeConfigActivated) {
@@ -834,6 +859,9 @@ export async function performJoin(options: {
     if (uploadUrl.origin !== joinUrl.origin) {
       throw new Error("Granted upload URL must use the same origin as the workspace join URL.");
     }
+    if (grant.accountActorSaltEndpoint && new URL(grant.accountActorSaltEndpoint).origin !== joinUrl.origin) {
+      throw new Error("Granted account salt endpoint must use the same origin as the workspace join URL.");
+    }
     const identity = loadOrCreateDeviceIdentity(homeDir, {
       seed: { deviceId: existingConfig.deviceId, keyId: existingConfig.keyId },
     });
@@ -848,6 +876,7 @@ export async function performJoin(options: {
       probeSourceId: crypto.randomUUID(),
       installationEpochId: crypto.randomUUID(),
       stagedConfig,
+      ...(grant.accountActorSaltEndpoint ? { accountActorSaltEndpoint: grant.accountActorSaltEndpoint } : {}),
     });
     writePendingJoin(pending, pendingFile);
     return await activatePendingJoin(pending, {

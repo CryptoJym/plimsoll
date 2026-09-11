@@ -403,6 +403,7 @@ export class RolloutTailer {
     private readonly identityProvider: () => LocalIdentity[] = readLocalIdentities,
     private readonly io: JsonlTailerIo = DEFAULT_JSONL_TAILER_IO,
     captureRoots?: CaptureRoot[],
+    private readonly accountAttributionEnabled: () => boolean = () => true,
   ) {
     this.inventoryConfigured = captureRoots !== undefined;
     this.captureRoots = validateCaptureRoots(captureRoots ?? []);
@@ -1466,7 +1467,8 @@ export class RolloutTailer {
             cacheReadTokens: entry.delta.cachedInput,
           });
       const metadata: Record<string, unknown> = {
-        ...rootEventMetadata(this.activeCaptureRoot, deterministicEventId(["codex-rollout", state.conversationId, String(entry.index)]), entry.observedAt ?? fallbackObservedAt, state.conversationId),
+        ...rootEventMetadata(this.activeCaptureRoot, deterministicEventId(["codex-rollout", state.conversationId, String(entry.index)]), entry.observedAt ?? fallbackObservedAt, state.conversationId,
+          this.accountAttributionEnabled()),
         usageSource: "rollout",
         turnIndex: entry.index,
       };

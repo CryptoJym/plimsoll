@@ -173,6 +173,7 @@ import {
   setAccountAssertionAdapterEnabled,
   type AccountAssertionSource,
 } from "./account-assertion";
+import { syncAccountActorSalt } from "./account-salt";
 import {
   acquireCollectorStartOwnership,
   classifyProcessIdentity,
@@ -218,6 +219,8 @@ Commands:
   join TOKEN|URL        Join a hosted workspace: redeem the admin's single-use
                         token, write sync credentials, verify with a handshake
                         (use --reassign for an explicit workspace change)
+  sync-account-salt     Refresh the tenant-scoped actor salt over the
+                        authenticated device channel (no raw salt is printed)
   doctor --read-only --json
                         Read-only readiness check; never creates config, ledger, plist, logs, or directories
   export                Print buffered events as JSON
@@ -1588,6 +1591,7 @@ async function main() {
           syncConfigured: true,
           privacyMode: "metadata_only",
           handshake: result.handshake,
+          accountSaltSynced: result.accountSaltSynced ?? false,
           nextSteps: [
             "plimsoll status   # syncConfigured: true; existing history was not part of the handshake",
             "restart a running collector (or: plimsoll install-launch-agent && plimsoll load-launch-agent) so the daemon picks up sync",
@@ -1597,6 +1601,21 @@ async function main() {
         2,
       ),
     );
+    return;
+  }
+
+  if (command === "sync-account-salt") {
+    const config = loadCollectorConfig();
+    if (!config.uploadUrl || !config.installKey || !config.tenantId || !config.deviceId) {
+      throw new Error("Account salt sync requires an active joined workspace.");
+    }
+    const result = await syncAccountActorSalt({
+      collectorHome: collectorHome(), tenantId: config.tenantId, deviceId: config.deviceId,
+      uploadUrl: config.uploadUrl, installKey: config.installKey, ingestKey: config.ingestKey,
+      signingSecret: config.uploadSigningSecret,
+    });
+    console.log(JSON.stringify({ status: result.synced ? "account_salt_synced" : "account_salt_unallocated",
+      tenantId: result.tenantId, saltVersion: result.saltVersion, synced: result.synced }, null, 2));
     return;
   }
 

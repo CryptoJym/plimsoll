@@ -19,6 +19,8 @@ export const captureRootSchema=z.object({
   }).strict()).max(1000).optional(),
   /** Legacy account rows remain accepted; new enrollments use the additive V1 contract. */
   account: z.union([legacyAccountSchema,accountAssertionV1Schema]).optional(),
+  /** Immutable historical account windows hydrated from the maintenance key. */
+  accountAssertions: z.array(accountAssertionV1Schema).max(1024).optional(),
 }).strict();
 export type CaptureRoot=z.infer<typeof captureRootSchema>;
 export type CaptureRootAccount=NonNullable<CaptureRoot["account"]>;
@@ -49,6 +51,15 @@ export function validateCaptureRoots(input: unknown): CaptureRoot[] {
       throw new Error("capture_account_source_mismatch");
     if(root.account?.validUntil&&Date.parse(root.account.validUntil)<=Date.parse(root.account.validFrom))
       throw new Error("capture_identity_window_invalid");
+    const assertions = root.accountAssertions ?? [];
+    for (const assertion of assertions) {
+      if (assertion.source !== root.source || (assertion.validUntil !== null && Date.parse(assertion.validUntil) <= Date.parse(assertion.validFrom)))
+        throw new Error("capture_identity_window_invalid");
+    }
+    for (let i = 1; i < assertions.length; i += 1) {
+      if (Date.parse(assertions[i - 1].validFrom) >= Date.parse(assertions[i].validFrom))
+        throw new Error("capture_identity_window_invalid");
+    }
     for(const binding of root.dispatch??[]) {
       if(binding.validUntil&&Date.parse(binding.validUntil)<=Date.parse(binding.validFrom)) {
         throw new Error("capture_dispatch_window_invalid");
@@ -95,11 +106,17 @@ export function rootCursorKey(roots: readonly CaptureRoot[],file: string): strin
   const root=rootForFile(roots,file);
   return root? `${file}\u0000${captureRootDigest(root)}`:file;
 }
-export function rootEventMetadata(root: CaptureRoot|undefined,sourceEventId: string,observedAt: string,sessionId?: string) {
+export function rootEventMetadata(root: CaptureRoot|undefined,sourceEventId: string,observedAt: string,sessionId?: string,
+  accountAttributionEnabled=true): Record<string, unknown> {
   if(!root)
     return {};
-  const account=root.account,at=Date.parse(observedAt);
-  const actor=account&&at>=Date.parse(account.validFrom)&&(!account.validUntil||at<Date.parse(account.validUntil));
+  const at=Date.parse(observedAt);
+  const accountCandidates = accountAttributionEnabled ? [...new Map(
+    [ ...(root.accountAssertions ?? []), ...(root.account ? [root.account] : []) ]
+      .map(account => [`${account.validFrom}\u0000${account.evidenceRef}`, account] as const),
+  ).values()] : [];
+  const matchingAccounts = accountCandidates.filter(account => at>=Date.parse(account.validFrom)&&(!account.validUntil||at<Date.parse(account.validUntil)));
+  const account = matchingAccounts.length === 1 ? matchingAccounts[0] : null;
   const bindings=(root.dispatch??[]).filter(binding => binding.sessionId===sessionId&&at>=Date.parse(binding.validFrom)&&(!binding.validUntil||at<Date.parse(binding.validUntil)));
   const binding=bindings.length===1? bindings[0]:null;
   return {
@@ -112,7 +129,8 @@ export function rootEventMetadata(root: CaptureRoot|undefined,sourceEventId: str
     }:{}),...(bindings.length>1? { workAttributionState: "conflict" }:{}),
     captureRootId: root.rootId,captureProfileId: root.profileId,installationEpochId: root.installationEpochId,
     logicalSourceEventId: sourceEventId,sourceIdentityEvidenceRef: "native_runtime_event_v1",
-    ...(actor? { captureAccountHash: account.actorHash,accountEvidenceRef: account.evidenceRef }:{})
+    ...(account ? { captureAccountHash: account.actorHash,accountEvidenceRef: account.evidenceRef } : {}),
+    ...(matchingAccounts.length > 1 ? { accountAttributionState: "conflict" } : {})
   };
 }
 /** Reopen the existing provider baseline at its original cutoff when the inventory changes.
