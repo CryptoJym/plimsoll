@@ -37,6 +37,9 @@ type TimedOptions = {
   now?: () => number;
 };
 
+const PENDING_EVENT_LINK_CONTEXT_LIMIT = 8;
+const PENDING_EVENT_LINK_ROW_LIMIT = 256;
+
 function boundedBatchSize(value: number) {
   return Math.max(1, Math.min(Math.trunc(value) || 1, 25_000));
 }
@@ -218,22 +221,42 @@ export function runPendingEventLinkFillStage(
   database: Database.Database,
   options: TimedOptions,
 ): BoundedStageResult {
-  ensureMaintenanceStageSchema(database);
   const timer = budget(options);
   if (!timer.canStart()) return timer.result(0);
-  const limit = boundedBatchSize(options.batchSize);
+  const limit = Math.min(boundedBatchSize(options.batchSize), PENDING_EVENT_LINK_ROW_LIMIT);
+  const contextIds = (database.prepare(
+    `select r.context_id as contextId
+     from repo_context_results r
+     where not exists (
+       select 1 from repo_context_suppressions s where s.context_id = r.context_id
+     ) and exists (
+       select 1
+       from repo_context_event_links l indexed by idx_repo_context_event_links_pending_context
+       where l.context_id = r.context_id
+         and l.fill_pending = 1 and l.context_conflict = 0
+     )
+     order by r.accepted_at, r.context_id
+     limit ?`,
+  ).all(PENDING_EVENT_LINK_CONTEXT_LIMIT) as Array<{ contextId: string }>).map(
+    (row) => row.contextId,
+  );
+  if (contextIds.length === 0) return timer.result(0);
+
+  ensureMaintenanceStageSchema(database);
+  const contextFilter = contextIds.map(() => "?").join(",");
   const rows = database.transaction(() => {
     const pending = database.prepare(
       `select l.event_id as eventId, l.context_id as contextId, e.rowid,
          e.repo_hash as existingRepoHash, r.repo_hash as repoHash,
          r.branch_hash as branchHash, r.head_sha as headSha
-       from repo_context_event_links l
+       from repo_context_event_links l indexed by idx_repo_context_event_links_pending_context
        join buffered_events e on e.id = l.event_id
        join repo_context_results r on r.context_id = l.context_id
        where l.fill_pending = 1 and l.context_conflict = 0
+         and l.context_id in (${contextFilter})
          and not exists (select 1 from repo_context_suppressions s where s.context_id = l.context_id)
        order by l.event_id limit ?`,
-    ).all(limit) as Array<Record<string, unknown> & { eventId: string; contextId: string; existingRepoHash: string | null; repoHash: string }>;
+    ).all(...contextIds, limit) as Array<Record<string, unknown> & { eventId: string; contextId: string; existingRepoHash: string | null; repoHash: string }>;
     const fill = database.prepare(
       `update buffered_events set repo_hash = coalesce(repo_hash, @repoHash),
        branch_hash = coalesce(branch_hash, @branchHash), head_sha = coalesce(head_sha, @headSha)
