@@ -1,9 +1,10 @@
 /** Focused producer, setup, boundary, and capture-root proof for Grok Build. */
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import type http from "node:http";
+import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
@@ -38,6 +39,9 @@ import { toolSourceSchema } from "../packages/shared/src/index";
 
 type Check = { name: string; passed: true; detail: Record<string, unknown> };
 const checks: Check[] = [];
+const repoRoot = path.resolve(import.meta.dirname, "..");
+const cli = path.join(repoRoot, "packages", "collector-cli", "src", "cli.ts");
+const loader = path.join(repoRoot, "node_modules", "tsx", "dist", "loader.mjs");
 
 function check(name: string, condition: unknown, detail: Record<string, unknown> = {}) {
   assert.ok(condition, `${name}: ${JSON.stringify(detail)}`);
@@ -93,6 +97,33 @@ async function dispatchRequest(server: http.Server, incoming: http.IncomingMessa
   });
 }
 
+function runCommand(
+  executable: string,
+  args: string[],
+  input: string,
+  env: NodeJS.ProcessEnv,
+) {
+  return new Promise<{ status: number | null; stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn(executable, args, {
+      env,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.setEncoding("utf8");
+    child.stderr.setEncoding("utf8");
+    child.stdout.on("data", (chunk: string) => { stdout += chunk; });
+    child.stderr.on("data", (chunk: string) => { stderr += chunk; });
+    child.once("error", reject);
+    child.once("close", (status) => resolve({ status, stdout, stderr }));
+    child.stdin.end(input);
+  });
+}
+
+function runShellCommand(command: string, input: string, env: NodeJS.ProcessEnv) {
+  return runCommand("/bin/sh", ["-c", command], input, env);
+}
+
 async function main() {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-grok-source-proof-"));
   try {
@@ -102,12 +133,39 @@ async function main() {
     fs.mkdirSync(path.dirname(foreignHook), { recursive: true, mode: 0o700 });
     fs.writeFileSync(foreignHook, foreignBytes, { mode: 0o600 });
 
-    const token = "g".repeat(43);
+    const commandAuth = loadOrCreateLocalIngestAuth(path.join(sandbox, "command-auth"));
+    const token = commandAuth.grokProducer;
+    assert.ok(token, "current fixture auth must include the Grok producer audience");
+    const fakeBin = path.join(sandbox, "fake-bin");
+    const fakeCurl = path.join(fakeBin, "curl");
+    const childArgvFile = path.join(sandbox, "hook-child-argv.txt");
+    const headerDigestFile = path.join(sandbox, "hook-header-digest.txt");
+    fs.mkdirSync(fakeBin, { mode: 0o700 });
+    fs.writeFileSync(
+      fakeCurl,
+      `#!/bin/sh
+printf '%s\\n' "$@" > "$PLIMSOLL_FAKE_ARGV"
+exec 4<&0
+IFS= read -r header <&3
+printf '%s' "$header" | /usr/bin/shasum -a 256 > "$PLIMSOLL_FAKE_HEADER_DIGEST"
+printf '%s\\n' "$header" | /usr/bin/curl "$@" 3<&0 0<&4
+`,
+      { mode: 0o700 },
+    );
+    const commandConfig = collectorConfigSchema.parse({ port: 48271 });
+    const commandBuffer = new LocalEventBuffer(path.join(sandbox, "command-ledger.sqlite"));
+    const commandServer = createCollectorServer(commandConfig, commandBuffer, { localAuth: commandAuth });
+    await new Promise<void>((resolve, reject) => {
+      commandServer.once("error", reject);
+      commandServer.listen(0, "127.0.0.1", resolve);
+    });
+    const commandPort = (commandServer.address() as AddressInfo).port;
     const generated = generateGrokHookSettings({
       repoRoot: "/synthetic/plimsoll",
-      port: 49321,
+      port: commandPort,
       dataMode: "metadata",
       grokProducerToken: token,
+      grokCurlCommand: fakeCurl,
     });
     const events = Object.keys(generated.hooks).sort();
     const commands = Object.values(generated.hooks)
@@ -119,44 +177,122 @@ async function main() {
       JSON.stringify(events) === JSON.stringify(["PostToolUse", "Stop", "UserPromptSubmit"]) &&
         commands.length === 3 && commands.every((command) =>
           command.includes("GROK_HOOK_EVENT") &&
-          command.includes("forward-hook-http grok")),
+          command.includes(`http://127.0.0.1:${commandPort}/hooks/grok`) &&
+          command.includes("3<&0 0<&4") &&
+          command.includes("4<&0 || true") &&
+          !command.includes("pnpm") &&
+          !command.includes("--dir") &&
+          !command.includes("/synthetic/plimsoll")),
       { events, commands },
     );
-
-    const fakeBin = path.join(sandbox, "fake-bin");
-    const childArgvFile = path.join(sandbox, "hook-child-argv.txt");
-    fs.mkdirSync(fakeBin, { mode: 0o700 });
-    for (const executable of ["curl", "pnpm"]) {
-      const fakeExecutable = path.join(fakeBin, executable);
-      fs.writeFileSync(
-        fakeExecutable,
-        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$PLIMSOLL_FAKE_ARGV\"\nprintf 'synthetic-child-stdout'\nprintf 'synthetic-child-stderr' >&2\n",
-        { mode: 0o700 },
-      );
-    }
-    const hookExecution = spawnSync("/bin/sh", ["-c", commands[0] ?? ""], {
-      input: "{}",
-      encoding: "utf8",
-      env: {
-        ...process.env,
-        GROK_HOOK_EVENT: "UserPromptSubmit",
-        PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
-        PLIMSOLL_FAKE_ARGV: childArgvFile,
-      },
+    const hookPayload = JSON.stringify({
+      hookEventName: "user_prompt_submit",
+      sessionId: "b03567bc-f454-43af-86f9-747625a4376e",
+      timestamp: "2026-09-11T18:00:00.000Z",
+    });
+    const hookExecution = await runShellCommand(commands[0] ?? "", hookPayload, {
+      ...process.env,
+      GROK_HOOK_EVENT: "UserPromptSubmit",
+      PATH: "/usr/bin:/bin",
+      PLIMSOLL_FAKE_ARGV: childArgvFile,
+      PLIMSOLL_FAKE_HEADER_DIGEST: headerDigestFile,
     });
     const childArgv = fs.existsSync(childArgvFile) ? fs.readFileSync(childArgvFile, "utf8") : "";
+    const headerDigest = fs.existsSync(headerDigestFile)
+      ? fs.readFileSync(headerDigestFile, "utf8").trim().split(/\s+/)[0]
+      : "";
+    const admitted = commandBuffer.database.prepare(
+      "select source, event_type as eventType from buffered_events",
+    ).get() as { source?: string; eventType?: string } | undefined;
     check(
-      "grok_managed_hook_keeps_token_out_of_command_child_argv_stdout_and_stderr",
-      hookExecution.status === 0 && commands.every((command) => !command.includes(token)) &&
+      "grok_managed_hook_runs_in_posix_sh_without_pnpm_and_keeps_token_out_of_curl_argv",
+      hookExecution.status === 0 && commands.every((command) => command.includes(token)) &&
         !childArgv.includes(token) && !hookExecution.stdout.includes(token) &&
-        !hookExecution.stderr.includes(token),
+        !hookExecution.stderr.includes(token) &&
+        headerDigest === sha256(`x-plimsoll-token: ${token}`) &&
+        admitted?.source === "grok" && admitted.eventType === "user_prompt_submit",
       {
         status: hookExecution.status,
-        commandTokenFree: commands.every((command) => !command.includes(token)),
+        shell: "/bin/sh -c",
+        pathHasPnpm: false,
+        commandUsesAbsoluteExecutable: commands.every((command) => command.includes(fakeCurl)),
         childArgvTokenFree: !childArgv.includes(token),
         stdoutTokenFree: !hookExecution.stdout.includes(token),
         stderrTokenFree: !hookExecution.stderr.includes(token),
+        headerDigestMatched: headerDigest === sha256(`x-plimsoll-token: ${token}`),
+        admitted,
       },
+    );
+
+    const nonExecutableCurl = path.join(sandbox, "non-executable-curl");
+    fs.writeFileSync(nonExecutableCurl, "synthetic fixture\n", { mode: 0o600 });
+    const unresolvableGrokCases = [
+      { name: "relative", executable: "curl" },
+      { name: "missing", executable: "/definitely/missing/curl" },
+      { name: "not_executable", executable: nonExecutableCurl },
+    ];
+    const unresolvableGrokResults = [];
+    for (const fixture of unresolvableGrokCases) {
+      const fixtureHome = path.join(sandbox, `grok-command-${fixture.name}-home`);
+      const fixturePlimsoll = path.join(sandbox, `grok-command-${fixture.name}-plimsoll`);
+      const fixtureGrokHome = path.join(fixtureHome, ".grok");
+      const fixtureHook = path.join(fixtureGrokHome, "hooks", "plimsoll.json");
+      fs.mkdirSync(path.dirname(fixtureHook), { recursive: true, mode: 0o700 });
+      fs.mkdirSync(fixturePlimsoll, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(
+        fixtureHook,
+        `${JSON.stringify(generateGrokHookSettings({
+          repoRoot: "/synthetic/plimsoll",
+          port: commandPort,
+          dataMode: "metadata",
+          grokProducerToken: token,
+          grokCurlCommand: fixture.executable,
+        }), null, 2)}\n`,
+        { mode: 0o600 },
+      );
+      fs.writeFileSync(
+        path.join(fixturePlimsoll, "collector.config.json"),
+        `${JSON.stringify(collectorConfigSchema.parse({ port: commandPort }), null, 2)}\n`,
+        { mode: 0o600 },
+      );
+      const hookDigest = sha256(fs.readFileSync(fixtureHook));
+      const configDigest = sha256(fs.readFileSync(path.join(fixturePlimsoll, "collector.config.json")));
+      const result = await runCommand(
+        process.execPath,
+        ["--import", loader, cli, "doctor", "--read-only", "--json"],
+        "",
+        {
+          ...process.env,
+          HOME: fixtureHome,
+          GROK_HOME: fixtureGrokHome,
+          PATH: "/usr/bin:/bin",
+          PLIMSOLL_HOME: fixturePlimsoll,
+          PLIMSOLL_COLLECTOR_DOCTOR_TIMEOUT_MS: "200",
+        },
+      );
+      const receipt = JSON.parse(result.stdout) as Record<string, any>;
+      unresolvableGrokResults.push({
+        name: fixture.name,
+        exitCode: result.status,
+        diagnosticCode: receipt.grokHookCommand?.code,
+        reason: receipt.grokHookCommand?.reason,
+        readiness: receipt.readiness,
+        byteReadOnly:
+          sha256(fs.readFileSync(fixtureHook)) === hookDigest &&
+          sha256(fs.readFileSync(path.join(fixturePlimsoll, "collector.config.json"))) === configDigest,
+      });
+    }
+    await new Promise<void>((resolve, reject) => commandServer.close((error) => error ? reject(error) : resolve()));
+    commandBuffer.close();
+    check(
+      "doctor_fails_closed_for_relative_missing_and_non_executable_managed_grok_commands",
+      unresolvableGrokResults.every((result) =>
+        result.exitCode !== 0 &&
+        result.diagnosticCode === "grok_hook_command_unresolvable" &&
+        result.reason === result.name &&
+        result.readiness === "not_installed" &&
+        result.byteReadOnly),
+      { results: unresolvableGrokResults },
     );
 
     const beforeForeign = sha256(fs.readFileSync(foreignHook));
@@ -241,9 +377,6 @@ async function main() {
       { malformedError, symlinkError },
     );
 
-    const repoRoot = path.resolve(import.meta.dirname, "..");
-    const cli = path.join(repoRoot, "packages", "collector-cli", "src", "cli.ts");
-    const loader = path.join(repoRoot, "node_modules", "tsx", "dist", "loader.mjs");
     const dryHome = path.join(sandbox, "dry-home");
     const dryPlimsollHome = path.join(sandbox, "dry-plimsoll-home");
     const dryGrokHome = path.join(sandbox, "dry-grok-home");

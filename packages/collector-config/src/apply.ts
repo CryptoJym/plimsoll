@@ -916,6 +916,12 @@ export function applyGeminiSettings(
 const GROK_MANAGED_EVENTS = ["UserPromptSubmit", "PostToolUse", "Stop"] as const;
 const LEGACY_GROK_COMMAND_PATTERN = /^if \[ -n "\$\{GROK_HOOK_EVENT:-\}" \]; then curl -s --max-time 2 -X POST -H 'Content-Type: application\/json' -H 'x-plimsoll-source: grok'(?: -H 'x-plimsoll-token: [A-Za-z0-9_-]{43}')? --data-binary @- http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/hooks\/grok \|\| true; fi$/;
 const VALUE_BLIND_GROK_COMMAND_PATTERN = /^if \[ -n "\$\{GROK_HOOK_EVENT:-\}" \]; then (?:[a-zA-Z0-9_./:@=-]+|'(?:[^']|'\\'')*') --dir (?:[a-zA-Z0-9_./:@=-]+|'(?:[^']|'\\'')*') collector forward-hook-http grok \|\| true; fi$/;
+const GROK_SHELL_WORD_PATTERN = String.raw`(?:[a-zA-Z0-9_./:@=-]+|'(?:[^']|'\\'')*')`;
+const DIRECT_GROK_COMMAND_PATTERN = new RegExp(
+  String.raw`^if \[ -n "\$\{GROK_HOOK_EVENT:-\}" \]; then (?:` +
+    String.raw`\{ printf '%s\\n' 'x-plimsoll-token: [A-Za-z0-9_-]{43}' \| ${GROK_SHELL_WORD_PATTERN} -s --max-time 2 -X POST -H 'Content-Type: application/json' -H @/dev/fd/3 --data-binary @- http://127\.0\.0\.1:[1-9][0-9]{0,4}/hooks/grok 3<&0 0<&4; \} 4<&0 \|\| true` +
+    String.raw`|${GROK_SHELL_WORD_PATTERN} -s --max-time 2 -X POST -H 'Content-Type: application/json' --data-binary @- http://127\.0\.0\.1:[1-9][0-9]{0,4}/hooks/grok \|\| true); fi$`,
+);
 
 function isManagedGrokGroup(event: string, value: unknown) {
   if (!isJsonRecord(value)) return false;
@@ -929,7 +935,8 @@ function isManagedGrokGroup(event: string, value: unknown) {
     handler.type === "command" && handler.timeout === 5 &&
     typeof handler.command === "string" &&
     (LEGACY_GROK_COMMAND_PATTERN.test(handler.command) ||
-      VALUE_BLIND_GROK_COMMAND_PATTERN.test(handler.command));
+      VALUE_BLIND_GROK_COMMAND_PATTERN.test(handler.command) ||
+      DIRECT_GROK_COMMAND_PATTERN.test(handler.command));
 }
 
 function isManagedGrokDocument(value: unknown) {
@@ -943,6 +950,56 @@ function isManagedGrokDocument(value: unknown) {
     const groups = (value.hooks as Record<string, unknown>)[event];
     return Array.isArray(groups) && groups.length === 1 && isManagedGrokGroup(event, groups[0]);
   });
+}
+
+export type GrokHookCommandDiagnostic = {
+  ok: false;
+  code: "grok_hook_command_unresolvable";
+  reason: "relative" | "missing" | "not_executable";
+};
+
+function unquoteGrokShellWord(word: string) {
+  return word.startsWith("'")
+    ? word.slice(1, -1).split("'\\''").join("'")
+    : word;
+}
+
+function managedGrokExecutable(command: string) {
+  const direct = command.match(new RegExp(String.raw`\| (${GROK_SHELL_WORD_PATTERN}) -s`));
+  const forwarded = command.match(new RegExp(String.raw`then (${GROK_SHELL_WORD_PATTERN}) --dir`));
+  const legacy = command.match(new RegExp(String.raw`then (${GROK_SHELL_WORD_PATTERN}) -s`));
+  const word = direct?.[1] ?? forwarded?.[1] ?? legacy?.[1];
+  return word ? unquoteGrokShellWord(word) : undefined;
+}
+
+/** Read-only diagnostic for the executable owned by a recognized Grok hook fragment. */
+export function diagnoseManagedGrokHookCommand(file: string): GrokHookCommandDiagnostic | null {
+  const { snapshot, current } = readClaudePreimage(file);
+  if (!snapshot.exists) return null;
+  const document = parseClaudeDocument(current);
+  if (!isManagedGrokDocument(document)) return null;
+  const executables = hookCommands(document).map(managedGrokExecutable);
+  if (executables.length !== GROK_MANAGED_EVENTS.length ||
+    executables.some((executable) => !executable || !path.isAbsolute(executable))) {
+    return { ok: false, code: "grok_hook_command_unresolvable", reason: "relative" };
+  }
+  for (const executable of executables as string[]) {
+    try {
+      const stat = fs.statSync(executable);
+      fs.accessSync(executable, fs.constants.X_OK);
+      if (!stat.isFile()) {
+        return { ok: false, code: "grok_hook_command_unresolvable", reason: "not_executable" };
+      }
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      return {
+        ok: false,
+        code: "grok_hook_command_unresolvable",
+        reason: code === "ENOENT" ? "missing" : "not_executable",
+      };
+    }
+  }
+  return null;
 }
 
 /**

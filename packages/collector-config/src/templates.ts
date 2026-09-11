@@ -8,6 +8,8 @@ export type ToolConfigOptions = {
   dataMode?: DataMode;
   confirmEvidence?: boolean;
   pnpmCommand?: string;
+  /** Absolute curl executable used by the managed Grok command. */
+  grokCurlCommand?: string;
   /**
    * Issue 0056 (#104): Plimsoll-local producer credentials. When provided,
    * generated configs bind each tool's exporter/hook traffic to its own
@@ -41,13 +43,24 @@ function tomlString(value: string) {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
-function hookForwardCommand(options: ToolConfigOptions, source: "claude-code" | "codex") {
+function hookForwardCommand(options: ToolConfigOptions, source: "claude-code" | "codex" | "grok") {
   // curl into the local receiver keeps per-event overhead at ~10ms; spawning
   // pnpm/node per hook event costs 1-2s per tool call across the whole fleet.
-  const tokenHeader = options.codexProducerToken
-    ? ` -H ${shellQuote(`x-plimsoll-token: ${options.codexProducerToken}`)}`
+  const token = source === "grok" ? options.grokProducerToken : options.codexProducerToken;
+  const curlCommand = source === "grok"
+    ? shellQuote(options.grokCurlCommand ?? "/usr/bin/curl")
+    : "curl";
+  if (source === "grok" && token) {
+    if (!/^[A-Za-z0-9_-]{43}$/.test(token)) {
+      throw new Error("Grok producer token must be a 43-character URL-safe value.");
+    }
+    const header = shellQuote(`x-plimsoll-token: ${token}`);
+    return `{ printf '%s\\n' ${header} | ${curlCommand} -s --max-time 2 -X POST -H 'Content-Type: application/json' -H @/dev/fd/3 --data-binary @- http://127.0.0.1:${port(options)}/hooks/grok 3<&0 0<&4; } 4<&0 || true`;
+  }
+  const tokenHeader = token
+    ? ` -H ${shellQuote(`x-plimsoll-token: ${token}`)}`
     : "";
-  return `curl -s --max-time 2 -X POST -H 'Content-Type: application/json'${tokenHeader} --data-binary @- http://127.0.0.1:${port(options)}/hooks/${source} || true`;
+  return `${curlCommand} -s --max-time 2 -X POST -H 'Content-Type: application/json'${tokenHeader} --data-binary @- http://127.0.0.1:${port(options)}/hooks/${source} || true`;
 }
 
 function port(options: ToolConfigOptions) {
@@ -215,7 +228,7 @@ export const generateGeminiSettings = generateGeminiCliSettings;
 /** Grok Build reads Claude-compatible command hooks from ~/.grok/hooks/*.json. */
 export function generateGrokHookSettings(options: ToolConfigOptions) {
   assertSupportedDataMode(options);
-  const command = `if [ -n "\${GROK_HOOK_EVENT:-}" ]; then ${shellQuote(options.pnpmCommand ?? "pnpm")} --dir ${shellQuote(options.repoRoot)} collector forward-hook-http grok || true; fi`;
+  const command = `if [ -n "\${GROK_HOOK_EVENT:-}" ]; then ${hookForwardCommand(options, "grok")}; fi`;
   const handler = { type: "command", command, timeout: 5 };
   return {
     hooks: {
