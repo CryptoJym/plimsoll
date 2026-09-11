@@ -1,7 +1,12 @@
 import type http from "node:http";
 
-import { HTTP_BOUNDARY_REASONS } from "./http-boundary";
-import type { HttpBoundaryReason, LocalProducerSource } from "./http-boundary";
+import { HTTP_BOUNDARY_REASONS, OTLP_RECORD_ARRAY_KEYS } from "./http-boundary";
+import type {
+  HttpBoundaryReason,
+  LocalProducerSource,
+  OtlpRecordArrayKey,
+  OtlpRecordRejectionDiagnostic,
+} from "./http-boundary";
 
 export { HTTP_BOUNDARY_REASONS } from "./http-boundary";
 export type { HttpBoundaryReason } from "./http-boundary";
@@ -14,6 +19,13 @@ export type { HttpBoundaryReason } from "./http-boundary";
  * boundary or on shutdown flush).
  */
 export const REJECTION_SUMMARY_INTERVAL_MS = 60_000;
+
+/**
+ * Fixed maximum for a serialized summary, including both last/max maps with
+ * every closed record-array key and saturated lifetime counters. Record and
+ * byte values originate behind the 100,000-node and 2 MiB decoded ceilings.
+ */
+export const REJECTION_SUMMARY_LINE_MAX_BYTES = 640;
 
 /**
  * Hard saturation bound for every monotonic counter. At the bound counting
@@ -91,6 +103,12 @@ export type RejectionSummaryLine = {
   suppressed: number;
   intervalMs: number;
   action: string;
+  recordCountLast?: number;
+  recordCountMax?: number;
+  recordArraysLast?: Partial<Record<OtlpRecordArrayKey, number>>;
+  recordArraysMax?: Partial<Record<OtlpRecordArrayKey, number>>;
+  decodedBytesLast?: number;
+  decodedBytesMax?: number;
 };
 
 export type RejectionObservation = {
@@ -127,7 +145,17 @@ export type RejectionDiagnosticsCounters = {
   reasons: RejectionCounterRow[];
 };
 
-type WindowState = { firstAtMs: number; count: number; suppressed: number };
+type RecordWindowStats = {
+  last: OtlpRecordRejectionDiagnostic;
+  max: OtlpRecordRejectionDiagnostic;
+};
+
+type WindowState = {
+  firstAtMs: number;
+  count: number;
+  suppressed: number;
+  recordStats?: RecordWindowStats;
+};
 
 type ReasonState = {
   reason: HttpBoundaryReason;
@@ -149,6 +177,43 @@ export type SeedReasonState = {
 
 function nextCount(current: number) {
   return current >= REJECTION_COUNTER_CAP ? REJECTION_COUNTER_CAP : current + 1;
+}
+
+function copyRecordDiagnostic(
+  diagnostic: OtlpRecordRejectionDiagnostic,
+): OtlpRecordRejectionDiagnostic {
+  const recordArrays: Partial<Record<OtlpRecordArrayKey, number>> = {};
+  for (const key of OTLP_RECORD_ARRAY_KEYS) {
+    const count = diagnostic.recordArrays[key];
+    if (typeof count === "number" && count > 0) recordArrays[key] = count;
+  }
+  return {
+    recordCount: diagnostic.recordCount,
+    recordArrays,
+    decodedBytes: diagnostic.decodedBytes,
+  };
+}
+
+function updateRecordStats(
+  stats: RecordWindowStats | undefined,
+  diagnostic: OtlpRecordRejectionDiagnostic | undefined,
+) {
+  if (!diagnostic) return stats;
+  const last = copyRecordDiagnostic(diagnostic);
+  if (!stats) return { last, max: copyRecordDiagnostic(diagnostic) };
+  const maxArrays: Partial<Record<OtlpRecordArrayKey, number>> = {};
+  for (const key of OTLP_RECORD_ARRAY_KEYS) {
+    const max = Math.max(stats.max.recordArrays[key] ?? 0, diagnostic.recordArrays[key] ?? 0);
+    if (max > 0) maxArrays[key] = max;
+  }
+  return {
+    last,
+    max: {
+      recordCount: Math.max(stats.max.recordCount, diagnostic.recordCount),
+      recordArrays: maxArrays,
+      decodedBytes: Math.max(stats.max.decodedBytes, diagnostic.decodedBytes),
+    },
+  };
 }
 
 export function createRejectionDiagnostics(options: {
@@ -210,6 +275,16 @@ export function createRejectionDiagnostics(options: {
       suppressed: window.suppressed,
       intervalMs: REJECTION_SUMMARY_INTERVAL_MS,
       action: HTTP_REJECTION_NEXT_ACTIONS[state.reason],
+      ...(window.recordStats
+        ? {
+            recordCountLast: window.recordStats.last.recordCount,
+            recordCountMax: window.recordStats.max.recordCount,
+            recordArraysLast: window.recordStats.last.recordArrays,
+            recordArraysMax: window.recordStats.max.recordArrays,
+            decodedBytesLast: window.recordStats.last.decodedBytes,
+            decodedBytesMax: window.recordStats.max.decodedBytes,
+          }
+        : {}),
     };
   };
 
@@ -217,6 +292,7 @@ export function createRejectionDiagnostics(options: {
     observeRejection(
       reason: HttpBoundaryReason,
       clientClass: RejectionClientClass = "unknown",
+      recordDiagnostic?: OtlpRecordRejectionDiagnostic,
     ): RejectionObservation {
       const now = nowMs();
       const summaries: RejectionSummaryLine[] = [];
@@ -236,7 +312,12 @@ export function createRejectionDiagnostics(options: {
       }
 
       if (state.window === null) {
-        state.window = { firstAtMs: now, count: 1, suppressed: 0 };
+        state.window = {
+          firstAtMs: now,
+          count: 1,
+          suppressed: 0,
+          recordStats: updateRecordStats(undefined, recordDiagnostic),
+        };
         state.rejected = nextCount(state.rejected);
         state.emittedFirst = nextCount(state.emittedFirst);
         return { first: true, summaries };
@@ -244,6 +325,7 @@ export function createRejectionDiagnostics(options: {
 
       state.window.count = nextCount(state.window.count);
       state.window.suppressed = nextCount(state.window.suppressed);
+      state.window.recordStats = updateRecordStats(state.window.recordStats, recordDiagnostic);
       state.rejected = nextCount(state.rejected);
       state.suppressed = nextCount(state.suppressed);
       return { first: false, summaries };

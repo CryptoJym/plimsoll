@@ -280,6 +280,90 @@ async function unitChecks() {
     { identityFirst, identityBoundary },
   );
 
+  const recordShapeAgg = mod.createRejectionDiagnostics({ nowMs: () => identityNow });
+  const firstRecordShape = recordShapeAgg.observeRejection(
+    "otlp_record_limit_exceeded",
+    "codex",
+    {
+      recordCount: 640,
+      recordArrays: { logRecords: 512, spans: 120, events: 8 },
+      decodedBytes: 701_234,
+    },
+  );
+  const suppressedRecordShape = recordShapeAgg.observeRejection(
+    "otlp_record_limit_exceeded",
+    "codex",
+    {
+      recordCount: 2_048,
+      recordArrays: { logRecords: 1_024, spans: 1_000, events: 24 },
+      decodedBytes: 1_901_111,
+    },
+  );
+  const lastRecordShape = recordShapeAgg.observeRejection(
+    "otlp_record_limit_exceeded",
+    "codex",
+    {
+      recordCount: 1_024,
+      recordArrays: { logRecords: 900, spans: 100, events: 24 },
+      decodedBytes: 1_201_111,
+    },
+  );
+  const recordShapeSummary = recordShapeAgg.flush()[0];
+  check(
+    "record_limit_summary_keeps_value_free_last_and_max_shape_by_closed_array_key",
+    firstRecordShape.first === true &&
+      suppressedRecordShape.first === false &&
+      lastRecordShape.first === false &&
+      recordShapeSummary?.reason === "otlp_record_limit_exceeded" &&
+      recordShapeSummary.clientClass === "codex" &&
+      recordShapeSummary.recordCountLast === 1_024 &&
+      recordShapeSummary.recordCountMax === 2_048 &&
+      recordShapeSummary.decodedBytesLast === 1_201_111 &&
+      recordShapeSummary.decodedBytesMax === 1_901_111 &&
+      JSON.stringify(recordShapeSummary.recordArraysLast) ===
+        JSON.stringify({ logRecords: 900, spans: 100, events: 24 }) &&
+      JSON.stringify(recordShapeSummary.recordArraysMax) ===
+        JSON.stringify({ logRecords: 1_024, spans: 1_000, events: 24 }) &&
+      !JSON.stringify(recordShapeSummary).includes(SENTINEL_SOURCE) &&
+      Buffer.byteLength(JSON.stringify(recordShapeSummary)) <=
+        mod.REJECTION_SUMMARY_LINE_MAX_BYTES,
+    { firstRecordShape, suppressedRecordShape, lastRecordShape, recordShapeSummary },
+  );
+
+  const allRecordArrays = {
+    logRecords: 100_000,
+    spans: 100_000,
+    metrics: 100_000,
+    dataPoints: 100_000,
+    events: 100_000,
+    links: 100_000,
+    exemplars: 100_000,
+  };
+  const fullKeyAgg = mod.createRejectionDiagnostics({ nowMs: () => identityNow });
+  fullKeyAgg.observeRejection("otlp_record_limit_exceeded", "otlp_exporter", {
+    recordCount: 100_000,
+    recordArrays: allRecordArrays,
+    decodedBytes: 2_097_152,
+  });
+  const fullKeySummary = fullKeyAgg.flush()[0];
+  const worstCounterFullKeySummary = {
+    ...fullKeySummary,
+    count: Number.MAX_SAFE_INTEGER,
+    suppressed: Number.MAX_SAFE_INTEGER,
+  };
+  check(
+    "record_limit_summary_all_closed_keys_stay_inside_explicit_byte_ceiling",
+    mod.REJECTION_SUMMARY_LINE_MAX_BYTES === 640 &&
+      JSON.stringify(fullKeySummary?.recordArraysLast) === JSON.stringify(allRecordArrays) &&
+      JSON.stringify(fullKeySummary?.recordArraysMax) === JSON.stringify(allRecordArrays) &&
+      Buffer.byteLength(JSON.stringify(worstCounterFullKeySummary)) <=
+        mod.REJECTION_SUMMARY_LINE_MAX_BYTES,
+    {
+      fixedByteCeiling: mod.REJECTION_SUMMARY_LINE_MAX_BYTES,
+      worstLineBytes: Buffer.byteLength(JSON.stringify(worstCounterFullKeySummary)),
+    },
+  );
+
   // Every bounded reason must have a compile-time symbolic next action.
   const reasonEnumValues = Object.values(mod.HTTP_BOUNDARY_REASONS);
   const actionMap = mod.HTTP_REJECTION_NEXT_ACTIONS as Record<string, string>;
