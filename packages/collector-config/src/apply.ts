@@ -1515,10 +1515,13 @@ function generatedAssignment(
   return matches[0]!;
 }
 
-function splitInlineTable(value: string): string[] | null {
-  const trimmed = value.trim();
-  if (!trimmed.startsWith("{") || !trimmed.endsWith("}")) return null;
-  const inner = trimmed.slice(1, -1);
+function splitInlineTable(value: string) {
+  let open = 0;
+  while (open < value.length && /\s/.test(value[open]!)) open += 1;
+  let close = value.length;
+  while (close > open && /\s/.test(value[close - 1]!)) close -= 1;
+  if (value[open] !== "{" || value[close - 1] !== "}") return null;
+  const inner = value.slice(open + 1, close - 1);
   const entries: string[] = [];
   let start = 0;
   let quote: "single" | "double" | null = null;
@@ -1544,30 +1547,52 @@ function splitInlineTable(value: string): string[] | null {
     else if (char === "[") brackets += 1;
     else if (char === "]") brackets -= 1;
     else if (char === "," && braces === 0 && brackets === 0) {
-      entries.push(inner.slice(start, index).trim());
+      entries.push(inner.slice(start, index));
       start = index + 1;
     }
+    if (braces < 0 || brackets < 0) return null;
   }
-  const tail = inner.slice(start).trim();
-  if (tail) entries.push(tail);
-  if (entries.some((entry) => !entry || topLevelEquals(entry) === -1)) return null;
-  return entries;
+  if (quote || braces !== 0 || brackets !== 0) return null;
+  const tail = inner.slice(start);
+  if (tail.trim()) entries.push(tail);
+  if (entries.some((entry) => !entry.trim() || topLevelEquals(entry) === -1)) return null;
+  return {
+    prefix: value.slice(0, open + 1),
+    entries,
+    emptyInner: entries.length === 0 ? inner : "",
+    suffix: value.slice(close - 1),
+  };
 }
 
-function reconcileHeaders(file: string, raw: string, generatedRaw: string) {
-  const entries = splitInlineTable(raw);
-  const generatedEntries = splitInlineTable(generatedRaw);
-  if (!entries || !generatedEntries) {
-    throw new Error(`${file}: managed exporter headers use an unsupported layout; refusing to write or create a backup.`);
+function reconcileHeaders(file: string, managedKey: string, raw: string, generatedRaw: string) {
+  const table = splitInlineTable(raw);
+  const generatedTable = splitInlineTable(generatedRaw);
+  if (!table || !generatedTable) {
+    throw new Error(`${file}: ${managedKey} uses an unsupported layout; refusing to write or create a backup.`);
   }
-  const kept: string[] = [];
-  let foundPlimsoll = false;
-  let removedLegacy = false;
-  for (const entry of entries) {
+  const parsed = table.entries.map((entry, index) => {
     const equals = topLevelEquals(entry);
     const key = equals === -1 ? null : parseDottedKey(entry.slice(0, equals).trim());
+    return { entry, index, key };
+  });
+  const generated = generatedTable.entries.flatMap((entry) => {
+    const equals = topLevelEquals(entry);
+    const key = equals === -1 ? null : parseDottedKey(entry.slice(0, equals).trim());
+    if (!key || key.length !== 1) return [];
+    return [{ entry: entry.trim(), folded: key[0]!.toLowerCase() }];
+  });
+  const generatedSource = generated.find((entry) => entry.folded === PLIMSOLL_HEADER);
+  const generatedToken = generated.find((entry) => entry.folded === PLIMSOLL_TOKEN_HEADER);
+  if (!generatedSource) {
+    throw new Error(`${file}: generated Codex TOML is missing ${managedKey}.${PLIMSOLL_HEADER}.`);
+  }
+
+  const sourceIndexes: number[] = [];
+  const tokenIndexes: number[] = [];
+  let foundPlimsoll = false;
+  let removedLegacy = false;
+  for (const { key, index } of parsed) {
     if (!key || key.length !== 1) {
-      kept.push(entry);
       continue;
     }
     const header = key[0]!;
@@ -1580,24 +1605,45 @@ function reconcileHeaders(file: string, raw: string, generatedRaw: string) {
     const folded = header.toLowerCase();
     if (folded === LEGACY_PLIMSOLL_HEADER) {
       removedLegacy = true;
+      sourceIndexes.push(index);
       continue;
     }
     if (folded === PLIMSOLL_HEADER) {
       foundPlimsoll = true;
+      sourceIndexes.push(index);
       continue;
     }
-    if (folded === PLIMSOLL_TOKEN_HEADER) continue;
-    kept.push(entry);
+    if (folded === PLIMSOLL_TOKEN_HEADER) tokenIndexes.push(index);
   }
-  kept.push(...generatedEntries.filter((entry) => {
-    const equals = topLevelEquals(entry);
-    const key = equals === -1 ? null : parseDottedKey(entry.slice(0, equals).trim());
-    if (!key || key.length !== 1) return false;
-    const folded = key[0]!.toLowerCase();
-    return folded === PLIMSOLL_HEADER || folded === PLIMSOLL_TOKEN_HEADER;
-  }));
+  if (sourceIndexes.length > 1 || tokenIndexes.length > 1) {
+    throw new Error(
+      `${file}: ${managedKey} contains duplicate Plimsoll-owned headers; refusing to write or create a backup.`,
+    );
+  }
+
+  const entries = [...table.entries];
+  const replaceEntry = (index: number, replacement: string) => {
+    const original = entries[index]!;
+    const leading = original.match(/^\s*/)?.[0] ?? "";
+    const trailing = original.match(/\s*$/)?.[0] ?? "";
+    entries[index] = `${leading}${replacement}${trailing}`;
+  };
+  const appended: string[] = [];
+  if (sourceIndexes.length === 1) replaceEntry(sourceIndexes[0]!, generatedSource.entry);
+  else appended.push(generatedSource.entry);
+  if (generatedToken) {
+    if (tokenIndexes.length === 1) replaceEntry(tokenIndexes[0]!, generatedToken.entry);
+    else appended.push(generatedToken.entry);
+  } else if (tokenIndexes.length === 1) {
+    entries.splice(tokenIndexes[0]!, 1);
+  }
+
+  let inner = entries.length > 0 ? entries.join(",") : table.emptyInner;
+  if (appended.length > 0) {
+    inner += `${inner.trim() ? ", " : ""}${appended.join(", ")}`;
+  }
   return {
-    value: `{ ${kept.join(", ")} }`,
+    value: `${table.prefix}${inner}${table.suffix}`,
     action: removedLegacy
       ? `replace legacy x-cfo-one-source with ${PLIMSOLL_HEADER}`
       : foundPlimsoll
@@ -1729,6 +1775,81 @@ function splitInlineArray(value: string): string[] | null {
   return entries.every((entry) => entry.trim()) ? entries : null;
 }
 
+function replaceOwnedNestedHook(
+  file: string,
+  event: string,
+  raw: string,
+  expectedEntry: TomlRecord,
+) {
+  const expectedHooks = expectedEntry.hooks;
+  if (!Array.isArray(expectedHooks) || expectedHooks.length !== 1 || !isRecord(expectedHooks[0])) {
+    throw new Error(`${file}: generated Codex TOML has an unsupported hooks.${event} nested hook layout.`);
+  }
+
+  const trimmed = raw.trim();
+  const fields = trimmed.startsWith("{") && trimmed.endsWith("}")
+    ? splitInlineArray(`[${trimmed.slice(1, -1)}]`)
+    : null;
+  if (!fields) {
+    throw new Error(
+      `${file}: hooks.${event} contains an unsupported inline array entry; refusing to write or create a backup.`,
+    );
+  }
+  const hooksFields = fields.flatMap((field, index) => {
+    const equals = topLevelEquals(field);
+    const key = equals === -1 ? null : parseDottedKey(field.slice(0, equals).trim());
+    return key && key.length === 1 && key[0] === "hooks" ? [{ field, index, equals }] : [];
+  });
+  if (hooksFields.length !== 1) {
+    throw new Error(
+      `${file}: hooks.${event} cannot safely update its Plimsoll hook in place; refusing to write or create a backup.`,
+    );
+  }
+
+  const hooksField = hooksFields[0]!;
+  let valueStart = hooksField.equals + 1;
+  while (valueStart < hooksField.field.length && /\s/.test(hooksField.field[valueStart]!)) valueStart += 1;
+  let valueEnd = hooksField.field.length;
+  while (valueEnd > valueStart && /\s/.test(hooksField.field[valueEnd - 1]!)) valueEnd -= 1;
+  const hookEntries = splitInlineArray(hooksField.field.slice(valueStart, valueEnd));
+  if (!hookEntries) {
+    throw new Error(
+      `${file}: hooks.${event} cannot safely update its Plimsoll hook in place; refusing to write or create a backup.`,
+    );
+  }
+  const parsedHooks = hookEntries.map((entry) => parseInlineHookEntry(file, event, entry));
+  const ownedHooks = parsedHooks.flatMap((entry, index) =>
+    hookCommands(entry).filter(isPlimsollHookPath).map(() => ({ entry, index }))
+  );
+  if (ownedHooks.length !== 1) {
+    throw new Error(
+      `${file}: hooks.${event} cannot safely update its Plimsoll hook in place; refusing to write or create a backup.`,
+    );
+  }
+  const ownedHook = ownedHooks[0]!;
+  const expectedHook = expectedHooks[0];
+  if (Object.keys(ownedHook.entry).some((key) => !Object.hasOwn(expectedHook, key))) {
+    throw new Error(
+      `${file}: hooks.${event} cannot safely update its Plimsoll hook in place; refusing to write or create a backup.`,
+    );
+  }
+
+  const originalHook = hookEntries[ownedHook.index]!;
+  const leading = originalHook.match(/^\s*/)?.[0] ?? "";
+  const trailing = originalHook.match(/\s*$/)?.[0] ?? "";
+  hookEntries[ownedHook.index] = `${leading}${tomlInlineValue(expectedHook)}${trailing}`;
+  const nextHooks = `[${hookEntries.join(",")}]`;
+  fields[hooksField.index] =
+    `${hooksField.field.slice(0, valueStart)}${nextHooks}${hooksField.field.slice(valueEnd)}`;
+  const next = `{${fields.join(",")}}`;
+  if (!containsExpected(parseInlineHookEntry(file, event, next), expectedEntry)) {
+    throw new Error(
+      `${file}: hooks.${event} cannot safely update its Plimsoll hook in place; refusing to write or create a backup.`,
+    );
+  }
+  return next;
+}
+
 function tomlInlineKey(key: string) {
   return /^[A-Za-z0-9_-]+$/.test(key) ? key : JSON.stringify(key);
 }
@@ -1792,7 +1913,8 @@ function reconcileInlineHookArray(
     const original = entries[ownedIndex]!;
     const leading = original.match(/^\s*/)?.[0] ?? "";
     const trailing = original.match(/\s*$/)?.[0] ?? "";
-    entries[ownedIndex] = `${leading}${tomlInlineValue(expectedEntry)}${trailing}`;
+    entries[ownedIndex] =
+      `${leading}${replaceOwnedNestedHook(file, event, original.trim(), expectedEntry)}${trailing}`;
     return { value: `[${entries.join(",")}]`, action: "updated" as const };
   }
   const canonical = tomlInlineValue(expectedEntry);
@@ -1897,7 +2019,7 @@ function reconcileCodexToml(file: string, current: string, generatedToml: string
       let nextValue = generated.valueRaw;
       let action = "replace with generated Plimsoll value";
       if (key === "headers" && isRecord(currentValue)) {
-        const reconciled = reconcileHeaders(file, assignment.valueRaw, generated.valueRaw);
+        const reconciled = reconcileHeaders(file, managedKey, assignment.valueRaw, generated.valueRaw);
         nextValue = reconciled.value;
         action = reconciled.action;
       }

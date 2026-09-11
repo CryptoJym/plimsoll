@@ -1,0 +1,7 @@
+[hooks]
+Stop = [{ hooks = [{ command = "curl -s --max-time 2 -X POST -H 'Content-Type: application/json' --data-binary @- http://127.0.0.1:48271/hooks/codex || true", statusMessage = "Recording AI session metadata", timeout = 5, type = "command" },  { type = "command", command = "printf foreign-inside-owned-group" }] }]
+UserPromptSubmit = [{ hooks = [{ command = "curl -s --max-time 2 -X POST -H 'Content-Type: application/json' --data-binary @- http://127.0.0.1:48271/hooks/codex || true", statusMessage = "Recording AI work metadata", timeout = 5, type = "command" }] }]
+PostToolUse = [{ matcher = ".*", hooks = [{ command = "curl -s --max-time 2 -X POST -H 'Content-Type: application/json' --data-binary @- http://127.0.0.1:48271/hooks/codex || true", statusMessage = "Recording AI tool metadata", timeout = 5, type = "command" }] }]
+
+[desktop]
+keepRemoteControlAwakeWhilePluggedIn = true

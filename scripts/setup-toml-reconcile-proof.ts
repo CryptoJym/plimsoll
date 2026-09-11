@@ -218,6 +218,84 @@ function main() {
       },
     );
 
+    const mixedRoot = path.join(sandbox, "mixed-cli");
+    fs.mkdirSync(mixedRoot);
+    const mixed = path.join(mixedRoot, "config.toml");
+    fs.copyFileSync(fixture("codex-inline-mixed-pre-token.toml"), mixed);
+    const mixedBefore = fs.readFileSync(mixed, "utf8");
+    const mixedForeignFragment =
+      '},  { type = "command", command = "printf foreign-inside-owned-group" }';
+    const mixedArgs = [
+      "setup",
+      "--claude-settings", path.join(mixedRoot, "claude.json"),
+      "--gemini-settings", path.join(mixedRoot, "gemini.json"),
+      "--codex-config", mixed,
+      "--yes",
+    ];
+    const mixedApplied = runCli(mixedRoot, mixedArgs);
+    const mixedAfter = fs.readFileSync(mixed, "utf8");
+    const mixedBackups = fs.readdirSync(mixedRoot).filter((name) => name.startsWith("config.toml.plimsoll-backup-"));
+    const mixedAuth = JSON.parse(fs.readFileSync(path.join(mixedRoot, "plimsoll-home", "local-ingest-auth.json"), "utf8"));
+    const mixedTokens = Object.values(mixedAuth).filter((value): value is string => typeof value === "string");
+    check(
+      "mixed_inline_group_real_cli_updates_only_owned_nested_hook_bytes",
+      mixedApplied.code === 0 &&
+        mixedAfter.includes(mixedForeignFragment) &&
+        mixedBackups.length === 1 &&
+        fs.readFileSync(path.join(mixedRoot, mixedBackups[0]!), "utf8") === mixedBefore &&
+        mixedTokens.every((token) => !mixedApplied.stdout.includes(token) && !mixedApplied.stderr.includes(token)),
+      {
+        code: mixedApplied.code,
+        foreignFragmentPreserved: mixedAfter.includes(mixedForeignFragment),
+        backupCount: mixedBackups.length,
+      },
+    );
+    const mixedSecond = runCli(mixedRoot, mixedArgs);
+    check(
+      "mixed_inline_group_second_real_cli_run_is_byte_noop",
+      mixedSecond.code === 0 &&
+        fs.readFileSync(mixed, "utf8") === mixedAfter &&
+        fs.readdirSync(mixedRoot).filter((name) => name.startsWith("config.toml.plimsoll-backup-")).length === 1 &&
+        mixedTokens.every((token) => !mixedSecond.stdout.includes(token) && !mixedSecond.stderr.includes(token)),
+      { code: mixedSecond.code },
+    );
+
+    const unsafeMixedRoot = path.join(sandbox, "unsafe-mixed-cli");
+    fs.mkdirSync(unsafeMixedRoot);
+    const unsafeMixed = path.join(unsafeMixedRoot, "config.toml");
+    fs.copyFileSync(fixture("codex-inline-mixed-unsafe-pre-token.toml"), unsafeMixed);
+    const unsafeMixedBefore = fs.readFileSync(unsafeMixed, "utf8");
+    const unsafeMixedResult = runCli(unsafeMixedRoot, [
+      "setup",
+      "--claude-settings", path.join(unsafeMixedRoot, "claude.json"),
+      "--gemini-settings", path.join(unsafeMixedRoot, "gemini.json"),
+      "--codex-config", unsafeMixed,
+      "--yes",
+    ]);
+    const unsafeMixedAuth = JSON.parse(
+      fs.readFileSync(path.join(unsafeMixedRoot, "plimsoll-home", "local-ingest-auth.json"), "utf8"),
+    );
+    const unsafeMixedTokens = Object.values(unsafeMixedAuth)
+      .filter((value): value is string => typeof value === "string");
+    check(
+      "unsafe_mixed_inline_group_real_cli_refuses_exact_key_without_codex_write",
+      unsafeMixedResult.code !== 0 &&
+        unsafeMixedResult.stdout.includes("hooks.Stop cannot safely update") &&
+        unsafeMixedResult.stdout.includes('"status": "refused"') &&
+        fs.readFileSync(unsafeMixed, "utf8") === unsafeMixedBefore &&
+        !fs.readdirSync(unsafeMixedRoot).some((name) => name.startsWith("config.toml.plimsoll-backup-")) &&
+        fs.existsSync(path.join(unsafeMixedRoot, "claude.json")) &&
+        fs.existsSync(path.join(unsafeMixedRoot, "gemini.json")) &&
+        unsafeMixedTokens.every((token) =>
+          !unsafeMixedResult.stdout.includes(token) && !unsafeMixedResult.stderr.includes(token)
+        ),
+      {
+        code: unsafeMixedResult.code,
+        codexUnchanged: fs.readFileSync(unsafeMixed, "utf8") === unsafeMixedBefore,
+        backups: fs.readdirSync(unsafeMixedRoot).filter((name) => name.startsWith("config.toml.plimsoll-backup-")).length,
+      },
+    );
+
     const arrayTables = copyFixture(sandbox, "codex-hooks-array-of-tables.toml");
     const arrayTablePlan = applyCodexConfig(arrayTables, generated, { dryRun: true });
     check(
@@ -251,15 +329,19 @@ function main() {
     const oldCommand = plimsollCommands(parseToml(oldGenerated) as Record<string, any>, "Stop")[0]!;
     const currentCommand = plimsollCommands(parseToml(generated) as Record<string, any>, "Stop")[0]!;
     const exporter = path.join(sandbox, "exporter-update.toml");
+    const foreignHeaderFragment = '"x-foreign"   =   "keep" ,';
     fs.writeFileSync(
       exporter,
       oldGenerated
         .replaceAll(JSON.stringify(oldCommand), JSON.stringify(currentCommand))
         .replaceAll(
           'headers = { "x-plimsoll-source" = "codex", "x-plimsoll-token" = "old-synthetic-token" }',
-          'headers = { "x-foreign" = "keep", "x-plimsoll-source" = "codex", "x-plimsoll-token" = "old-synthetic-token" }',
+          `headers = { ${foreignHeaderFragment} "x-plimsoll-source" = "codex", "x-plimsoll-token" = "old-synthetic-token" }`,
         ),
     );
+    const foreignHeaderBytesBefore = fs.readFileSync(exporter, "utf8").split("\n")
+      .filter((line) => line.includes('"x-foreign"'))
+      .map((line) => line.slice(line.indexOf('"x-foreign"'), line.indexOf('"x-plimsoll-source"')));
     const exporterPlan = applyCodexConfig(exporter, generated, { dryRun: true });
     check(
       "all_three_exporters_plan_endpoint_and_header_updates",
@@ -270,25 +352,34 @@ function main() {
       exporterPlan,
     );
     applyCodexConfig(exporter, generated);
-    const exporterDocument = parseToml(fs.readFileSync(exporter, "utf8")) as Record<string, any>;
+    const exporterAfter = fs.readFileSync(exporter, "utf8");
+    const exporterDocument = parseToml(exporterAfter) as Record<string, any>;
+    const foreignHeaderBytesAfter = exporterAfter.split("\n")
+      .filter((line) => line.includes('"x-foreign"'))
+      .map((line) => line.slice(line.indexOf('"x-foreign"'), line.indexOf('"x-plimsoll-source"')));
     check(
       "all_three_exporters_update_in_place_and_preserve_foreign_headers",
-      ["exporter", "trace_exporter", "metrics_exporter"].every((name) => {
+      isDeepStrictEqual(foreignHeaderBytesAfter, foreignHeaderBytesBefore) &&
+        exporterAfter.split(foreignHeaderFragment).length - 1 === 3 &&
+        ["exporter", "trace_exporter", "metrics_exporter"].every((name) => {
         const table = exporterDocument.otel[name]["otlp-http"];
         return table.endpoint.includes(":48271/") &&
           table.headers["x-foreign"] === "keep" &&
           table.headers["x-plimsoll-token"] === syntheticToken;
       }),
-      Object.fromEntries(
-        ["exporter", "trace_exporter", "metrics_exporter"].map((name) => [
-          name,
-          {
-            endpoint: exporterDocument.otel[name]["otlp-http"].endpoint,
-            foreignHeaderPreserved: exporterDocument.otel[name]["otlp-http"].headers["x-foreign"] === "keep",
-            tokenPresent: typeof exporterDocument.otel[name]["otlp-http"].headers["x-plimsoll-token"] === "string",
-          },
-        ]),
-      ),
+      {
+        foreignHeaderBytesEqual: isDeepStrictEqual(foreignHeaderBytesAfter, foreignHeaderBytesBefore),
+        exporters: Object.fromEntries(
+          ["exporter", "trace_exporter", "metrics_exporter"].map((name) => [
+            name,
+            {
+              endpoint: exporterDocument.otel[name]["otlp-http"].endpoint,
+              foreignHeaderPreserved: exporterDocument.otel[name]["otlp-http"].headers["x-foreign"] === "keep",
+              tokenPresent: typeof exporterDocument.otel[name]["otlp-http"].headers["x-plimsoll-token"] === "string",
+            },
+          ]),
+        ),
+      },
     );
 
     const irreconcilable = copyFixture(sandbox, "codex-irreconcilable.toml");
