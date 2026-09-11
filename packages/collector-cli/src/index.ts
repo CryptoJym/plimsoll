@@ -1,4 +1,6 @@
 export * from "./buffer";
+export * from "./account-assertion";
+export * from "./account-salt";
 export * from "./config";
 export * from "./device-identity";
 export * from "./http-transport";

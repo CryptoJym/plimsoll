@@ -1,10 +1,12 @@
-import { ensureCodexLiveUsageSchema, liveUsageAppendAllowed, liveUsageMetricAllowed } from "./codex-live-usage-ledger";
+import { ensureCodexLiveUsageSchema, liveUsageAppendAllowed, liveUsageInstallationEpoch,
+  liveUsageMetricAllowed } from "./codex-live-usage-ledger";
 import crypto from "node:crypto";
 import os from "node:os";
 
 import Database from "better-sqlite3";
 import { z } from "zod";
 import { advanceCaptureBaselineEnrollment } from "./capture-baseline";
+import { captureRootEventInstallationEpoch } from "./capture-root-inventory";
 
 import {
   canonicalizeSuppressionReceipts,
@@ -914,7 +916,7 @@ export class LocalEventBuffer {
 
   /** Managed admission uses the durable enrollment binding, never file mtime,
    * observation arrival time, an account label, or a proposed profile epoch. */
-  eventAdmissionReason(observedAt: unknown, claimedInstallationEpochId?: unknown):
+  eventAdmissionReason(observedAt: unknown, claimedInstallationEpochId?: unknown, trustedInstallationEpochId?: unknown):
     "stale_connection" | "enrollment_binding_invalid" | "invalid_timestamp" | "before_enrollment" | "epoch_mismatch" | null {
     const binding = this.workspaceBinding();
     if (binding && (binding.currentWorkspaceId !== this.workspaceId ||
@@ -925,6 +927,15 @@ export class LocalEventBuffer {
         !enrollmentTimestampSchema.safeParse(binding.currentInstallationEpochStartedAt).success)
       return "enrollment_binding_invalid";
     if (!enrollmentTimestampSchema.safeParse(observedAt).success) return "invalid_timestamp";
+    // Authenticated live bindings and account-assertion capture roots carry an
+    // unforgeable in-process sidecar. That capability permits a source epoch
+    // distinct from the workspace-enrollment epoch, including a delayed event
+    // from a closed pre-failover interval.
+    if (trustedInstallationEpochId !== undefined) {
+      if (!installationEpochIdSchema.safeParse(trustedInstallationEpochId).success ||
+          claimedInstallationEpochId !== trustedInstallationEpochId) return "epoch_mismatch";
+      return null;
+    }
     if (Date.parse(observedAt as string) < Date.parse(binding.currentInstallationEpochStartedAt)) return "before_enrollment";
     if (claimedInstallationEpochId !== undefined && claimedInstallationEpochId !== binding.currentInstallationEpochId)
       return "epoch_mismatch";
@@ -2254,7 +2265,10 @@ export class LocalEventBuffer {
         "Raw evidence rows cannot be appended to the ordinary ledger; the encrypted evidence vault is not implemented.",
       );
     }
-    const enrollmentRejected = this.eventAdmissionReason(event.observedAt, event.metadata?.installationEpochId);
+    const trustedInstallationEpochId = liveUsageInstallationEpoch(this.db, event) ??
+      captureRootEventInstallationEpoch(event);
+    const enrollmentRejected = this.eventAdmissionReason(event.observedAt, event.metadata?.installationEpochId,
+      trustedInstallationEpochId);
     if (enrollmentRejected) return { appended: false, repoContextRequest: null, enrollmentRejected };
     const createdAt = new Date().toISOString();
     if (!this.claimSessionUsageAuthority(event, createdAt)) {
@@ -2280,7 +2294,7 @@ export class LocalEventBuffer {
     const privacyGeneration = crypto.randomUUID();
     const currentBinding = this.workspaceBinding();
     const workspaceId = currentBinding?.currentWorkspaceId ?? this.workspaceId;
-    const installationEpochId = currentBinding?.currentInstallationEpochId ?? null;
+    const installationEpochId = trustedInstallationEpochId ?? currentBinding?.currentInstallationEpochId ?? null;
     const projectKey = canonicalProjectKey(event.projectKey);
     const costKind = admittedCostKind(event);
     const canonicalSuppressedFields = canonicalizeSuppressionReceipts(suppressedFields);

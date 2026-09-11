@@ -51,6 +51,7 @@ export const collectorConfigSchema = z
     ingestKey: z.string().trim().min(1).optional(),
     uploadSigningSecret: z.string().trim().min(16).optional(),
     uploadUrl: z.string().url().optional(),
+    accountActorSaltEndpoint: z.string().url().optional(),
     tenantId: z.string().trim().min(1).default(LOCAL_TENANT_ID),
     installKey: z.string().trim().min(1).default("local-dev"),
     /** Stable local identity metadata; these are identifiers, not secrets. */
