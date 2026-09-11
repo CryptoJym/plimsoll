@@ -18,10 +18,10 @@ export const LOCAL_HTTP_LIMITS = Object.freeze({
   // Availability ceiling: the full synchronous normalize + durable append
   // path remains comfortably inside the fixed 1.5 s request deadline on the
   // supported canary hardware. Limit + 1 is rejected before normalization.
-  // One HTTP batch must fit the exact deferred-context ownership window. This
-  // keeps listener admission below the status-availability budget and makes
-  // 129+ a pre-write rejection rather than post-capture overflow work.
-  otlpRecords: 128,
+  // Codex's OpenTelemetry SDK can export 512 log records or spans in one HTTP
+  // request. Durable appends remain chunked below; the independent 128-entry
+  // deferred-context handoff window stays bounded in LocalEventBuffer.
+  otlpRecords: 512,
   otlpAttributesPerContainer: 128,
   otlpAttributesTotal: 16_384,
   requestDeadlineMs: 1_500,

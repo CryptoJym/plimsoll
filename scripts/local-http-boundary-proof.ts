@@ -41,6 +41,13 @@ const SENTINELS = [
   "BODY_VALUE_MUST_NOT_LEAK",
 ];
 
+// Codex 0.148.0 wires the OpenTelemetry Rust 0.31 batch log processor with
+// its default configuration. That SDK exports up to 512 log records per
+// request. The 21 attributes below mirror the populated `codex.sse_event`
+// completion fields plus Codex's shared session metadata.
+const CODEX_OTEL_EXPORT_BATCH_RECORDS = 512;
+const DEFERRED_CONTEXT_OWNERSHIP_RECORDS = 128;
+
 function check(name: string, passed: boolean, detail: unknown) {
   checks.push({ name, passed, detail });
 }
@@ -282,7 +289,7 @@ function maxRecordBody(cwdSentinel: string) {
   return JSON.stringify({
     resourceLogs: [{
       scopeLogs: [{
-        logRecords: Array.from({ length: LOCAL_HTTP_LIMITS.otlpRecords }, (_, index) => ({
+        logRecords: Array.from({ length: DEFERRED_CONTEXT_OWNERSHIP_RECORDS }, (_, index) => ({
           timeUnixNano: String(1_760_000_000_000_000_000n + BigInt(index)),
           attributes: [
             { key: "cwd", value: { stringValue: `${cwdSentinel}/${index}` } },
@@ -290,6 +297,55 @@ function maxRecordBody(cwdSentinel: string) {
             { key: "gen_ai.usage.output_tokens", value: { intValue: "2" } },
           ],
         })),
+      }],
+    }],
+  });
+}
+
+function representativeCodexBatchBody() {
+  return JSON.stringify({
+    resourceLogs: [{
+      resource: {
+        attributes: [
+          { key: "service.name", value: { stringValue: "codex-cli" } },
+          { key: "service.version", value: { stringValue: "0.148.0" } },
+          { key: "env", value: { stringValue: "plimsoll-local" } },
+          { key: "host.name", value: { stringValue: "synthetic-canary" } },
+        ],
+      },
+      scopeLogs: [{
+        scope: { name: "codex_otel" },
+        logRecords: Array.from({ length: CODEX_OTEL_EXPORT_BATCH_RECORDS }, (_, index) => {
+          const timestamp = new Date(Date.UTC(2026, 8, 11, 17, 0, 0, index)).toISOString();
+          return {
+            timeUnixNano: String(1_760_000_000_000_000_000n + BigInt(index)),
+            observedTimeUnixNano: String(1_760_000_000_100_000_000n + BigInt(index)),
+            severityNumber: 9,
+            attributes: [
+              { key: "event.name", value: { stringValue: "codex.sse_event" } },
+              { key: "event.kind", value: { stringValue: "response.completed" } },
+              { key: "input_token_count", value: { intValue: "100" } },
+              { key: "output_token_count", value: { intValue: "20" } },
+              { key: "cached_token_count", value: { intValue: "40" } },
+              { key: "cache_write_token_count", value: { intValue: "0" } },
+              { key: "reasoning_token_count", value: { intValue: "5" } },
+              { key: "tool_token_count", value: { intValue: "120" } },
+              { key: "ttft_ms", value: { intValue: "250" } },
+              { key: "service_tier", value: { stringValue: "default" } },
+              { key: "model_reasoning_effort", value: { stringValue: "high" } },
+              { key: "event.timestamp", value: { stringValue: timestamp } },
+              { key: "conversation.id", value: { stringValue: "11111111-2222-4333-8444-555555555555" } },
+              { key: "app.version", value: { stringValue: "0.148.0" } },
+              { key: "auth_mode", value: { stringValue: "chatgpt" } },
+              { key: "originator", value: { stringValue: "codex_cli_rs" } },
+              { key: "user.account_id", value: { stringValue: "synthetic-account" } },
+              { key: "user.email", value: { stringValue: "synthetic@example.invalid" } },
+              { key: "terminal.type", value: { stringValue: "ghostty" } },
+              { key: "model", value: { stringValue: "gpt-6-astra" } },
+              { key: "slug", value: { stringValue: "gpt-6-astra" } },
+            ],
+          };
+        }),
       }],
     }],
   });
@@ -894,13 +950,13 @@ async function main() {
       "maximum_128_record_http_path_is_exact_durable_and_concurrently_available",
       Buffer.byteLength(maxBody) <= LOCAL_HTTP_LIMITS.compressedBodyBytes &&
         maxAccepted.status === 202 && maxAccepted.body.accepted === true &&
-        maxAccepted.body.events === LOCAL_HTTP_LIMITS.otlpRecords &&
-        maxAccepted.body.recordCount === LOCAL_HTTP_LIMITS.otlpRecords &&
+        maxAccepted.body.events === DEFERRED_CONTEXT_OWNERSHIP_RECORDS &&
+        maxAccepted.body.recordCount === DEFERRED_CONTEXT_OWNERSHIP_RECORDS &&
         maxAccepted.elapsedMs <= 500 &&
-        maxFacts.count === LOCAL_HTTP_LIMITS.otlpRecords &&
-        maxFacts.contexts === LOCAL_HTTP_LIMITS.otlpRecords &&
-        maxFacts.inputTokens === LOCAL_HTTP_LIMITS.otlpRecords &&
-        maxFacts.outputTokens === LOCAL_HTTP_LIMITS.otlpRecords * 2 &&
+        maxFacts.count === DEFERRED_CONTEXT_OWNERSHIP_RECORDS &&
+        maxFacts.contexts === DEFERRED_CONTEXT_OWNERSHIP_RECORDS &&
+        maxFacts.inputTokens === DEFERRED_CONTEXT_OWNERSHIP_RECORDS &&
+        maxFacts.outputTokens === DEFERRED_CONTEXT_OWNERSHIP_RECORDS * 2 &&
         maxFacts.rawCwdMatches === 0 &&
         buffer.repoContextQueueStatus().queued === 128 &&
         maxHandoffs === 128 &&
@@ -935,20 +991,45 @@ async function main() {
       "ten_isolated_max128_runs_preserve_status_and_exact_capture_budgets",
       isolatedMaxRuns.length === 10 && isolatedMaxRuns.every((run) =>
         run.acceptedStatus === 202 && run.accepted === true &&
-        run.acceptedEvents === LOCAL_HTTP_LIMITS.otlpRecords &&
-        run.acceptedRecordCount === LOCAL_HTTP_LIMITS.otlpRecords &&
+        run.acceptedEvents === DEFERRED_CONTEXT_OWNERSHIP_RECORDS &&
+        run.acceptedRecordCount === DEFERRED_CONTEXT_OWNERSHIP_RECORDS &&
         run.acceptedMs <= 500 &&
         run.statusCode === 200 && run.statusMs <= 250 &&
-        run.facts.events === LOCAL_HTTP_LIMITS.otlpRecords &&
-        run.facts.inputTokens === LOCAL_HTTP_LIMITS.otlpRecords &&
-        run.facts.outputTokens === LOCAL_HTTP_LIMITS.otlpRecords * 2 &&
+        run.facts.events === DEFERRED_CONTEXT_OWNERSHIP_RECORDS &&
+        run.facts.inputTokens === DEFERRED_CONTEXT_OWNERSHIP_RECORDS &&
+        run.facts.outputTokens === DEFERRED_CONTEXT_OWNERSHIP_RECORDS * 2 &&
         run.facts.rawCwdMatches === 0 &&
-        run.contexts === LOCAL_HTTP_LIMITS.otlpRecords &&
-        run.pending === LOCAL_HTTP_LIMITS.otlpRecords &&
-        run.handoffs === LOCAL_HTTP_LIMITS.otlpRecords &&
+        run.contexts === DEFERRED_CONTEXT_OWNERSHIP_RECORDS &&
+        run.pending === DEFERRED_CONTEXT_OWNERSHIP_RECORDS &&
+        run.handoffs === DEFERRED_CONTEXT_OWNERSHIP_RECORDS &&
         run.overflow === 0 && run.signal === 1
       ),
       isolatedMaxRuns,
+    );
+
+    const representativeCodexBatch = representativeCodexBatchBody();
+    const representativeCodexResult = await request(
+      port,
+      "/v1/logs",
+      representativeCodexBatch,
+      { "x-plimsoll-source": "codex" },
+    );
+    check(
+      "codex_default_512_record_export_batch_is_admitted_inside_request_deadline",
+      Buffer.byteLength(representativeCodexBatch) <= LOCAL_HTTP_LIMITS.decodedBodyBytes &&
+        representativeCodexResult.status === 202 &&
+        representativeCodexResult.body.accepted === true &&
+        representativeCodexResult.body.events === CODEX_OTEL_EXPORT_BATCH_RECORDS &&
+        representativeCodexResult.body.recordCount === CODEX_OTEL_EXPORT_BATCH_RECORDS &&
+        representativeCodexResult.elapsedMs < LOCAL_HTTP_LIMITS.requestDeadlineMs,
+      {
+        records: CODEX_OTEL_EXPORT_BATCH_RECORDS,
+        attributesPerRecord: 21,
+        bodyBytes: Buffer.byteLength(representativeCodexBatch),
+        status: representativeCodexResult.status,
+        reason: representativeCodexResult.body.reason,
+        elapsedMs: Math.round(representativeCodexResult.elapsedMs * 100) / 100,
+      },
     );
 
     const accepted = await request(
