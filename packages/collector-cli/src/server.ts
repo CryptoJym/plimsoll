@@ -816,7 +816,7 @@ export function createCollectorServer(
           await readBoundedRequestBody(request, budget),
         );
         const parsedEnvelope = parseBoundedJson(body.text);
-        assertBoundedOtlpCardinality(parsedEnvelope);
+        assertBoundedOtlpCardinality(parsedEnvelope, body.decodedBytes);
         if (hasLiveUsageClaim(parsedEnvelope)) throw new HttpBoundaryRejection("source_not_allowed", 403);
 
         const repoLabels: Array<{ hash: string; label: string }> = [];
@@ -924,11 +924,22 @@ export function createCollectorServer(
         error: "collector_request_rejected",
         reason: failure.reason,
       };
-      const diagnosticRejection = { ...rejection, clientClass };
+      const recordDiagnostic = failure.reason === "otlp_record_limit_exceeded"
+        ? failure.diagnostic
+        : undefined;
+      const diagnosticRejection = {
+        ...rejection,
+        clientClass,
+        ...(recordDiagnostic ?? {}),
+      };
       // Aggregate identical rejections: emit the first occurrence of a
       // bounded reason promptly plus any window summaries it just closed.
       // The HTTP response below stays byte-for-byte unchanged.
-      const observed = rejectionDiagnostics.observeRejection(failure.reason, clientClass);
+      const observed = rejectionDiagnostics.observeRejection(
+        failure.reason,
+        clientClass,
+        recordDiagnostic,
+      );
       for (const line of observed.summaries) console.warn(JSON.stringify(line));
       if (observed.first) console.warn(JSON.stringify(diagnosticRejection));
       if (!response.headersSent) {

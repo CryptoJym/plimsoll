@@ -75,10 +75,27 @@ export const HTTP_BOUNDARY_REASONS = [
 
 export type HttpBoundaryReason = (typeof HTTP_BOUNDARY_REASONS)[number];
 
+export const OTLP_RECORD_ARRAY_KEYS = [
+  "logRecords",
+  "spans",
+  "metrics",
+  "dataPoints",
+  "events",
+  "links",
+  "exemplars",
+] as const;
+export type OtlpRecordArrayKey = (typeof OTLP_RECORD_ARRAY_KEYS)[number];
+export type OtlpRecordRejectionDiagnostic = {
+  recordCount: number;
+  recordArrays: Partial<Record<OtlpRecordArrayKey, number>>;
+  decodedBytes: number;
+};
+
 export class HttpBoundaryRejection extends Error {
   constructor(
     readonly reason: HttpBoundaryReason,
     readonly status: number,
+    readonly diagnostic?: OtlpRecordRejectionDiagnostic,
   ) {
     super(reason);
     this.name = "HttpBoundaryRejection";
@@ -418,15 +435,7 @@ export function parseBoundedJson(text: string) {
 
 const RESOURCE_ARRAYS = new Set(["resourceLogs", "resourceSpans", "resourceMetrics"]);
 const SCOPE_ARRAYS = new Set(["scopeLogs", "scopeSpans", "scopeMetrics"]);
-const RECORD_ARRAYS = new Set([
-  "logRecords",
-  "spans",
-  "metrics",
-  "dataPoints",
-  "events",
-  "links",
-  "exemplars",
-]);
+const RECORD_ARRAYS = new Set<string>(OTLP_RECORD_ARRAY_KEYS);
 
 export function assertBoundedJsonNodes(root: unknown) {
   const stack: unknown[] = [root];
@@ -446,12 +455,21 @@ export function assertBoundedJsonNodes(root: unknown) {
   }
 }
 
-export function assertBoundedOtlpCardinality(root: unknown) {
+export function assertBoundedOtlpCardinality(root: unknown, decodedBytes: number) {
   assertBoundedJsonNodes(root);
   const stack: unknown[] = [root];
   let resources = 0;
   let scopes = 0;
   let records = 0;
+  const recordArrayCounts: Record<OtlpRecordArrayKey, number> = {
+    logRecords: 0,
+    spans: 0,
+    metrics: 0,
+    dataPoints: 0,
+    events: 0,
+    links: 0,
+    exemplars: 0,
+  };
   let attributes = 0;
 
   while (stack.length > 0) {
@@ -478,9 +496,7 @@ export function assertBoundedOtlpCardinality(root: unknown) {
         }
         if (RECORD_ARRAYS.has(key)) {
           records += entry.length;
-          if (records > LOCAL_HTTP_LIMITS.otlpRecords) {
-            throw new HttpBoundaryRejection("otlp_record_limit_exceeded", 413);
-          }
+          recordArrayCounts[key as OtlpRecordArrayKey] += entry.length;
         }
         if (key === "attributes") {
           if (entry.length > LOCAL_HTTP_LIMITS.otlpAttributesPerContainer) {
@@ -494,6 +510,19 @@ export function assertBoundedOtlpCardinality(root: unknown) {
       }
       stack.push(entry);
     }
+  }
+
+  if (records > LOCAL_HTTP_LIMITS.otlpRecords) {
+    const recordArrays: Partial<Record<OtlpRecordArrayKey, number>> = {};
+    for (const key of OTLP_RECORD_ARRAY_KEYS) {
+      const count = recordArrayCounts[key];
+      if (count > 0) recordArrays[key] = count;
+    }
+    throw new HttpBoundaryRejection("otlp_record_limit_exceeded", 413, {
+      recordCount: records,
+      recordArrays,
+      decodedBytes,
+    });
   }
 }
 

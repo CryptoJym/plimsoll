@@ -41,10 +41,12 @@ const SENTINELS = [
   "BODY_VALUE_MUST_NOT_LEAK",
 ];
 
-// Codex 0.148.0 wires the OpenTelemetry Rust 0.31 batch log processor with
-// its default configuration. That SDK exports up to 512 log records per
-// request. The 21 attributes below mirror the populated `codex.sse_event`
-// completion fields plus Codex's shared session metadata.
+// Codex 0.153.4 wires the OpenTelemetry Rust 0.31 batch log processor with
+// environment-overridable batch configuration. The embedded runtime's exact
+// value is not source-bound. This 512-record default shape retains the prior
+// representative performance control; separate attribute-cap measurements
+// size the raised collector ceiling. The 21 attributes below mirror the
+// populated `codex.sse_event` completion fields plus shared session metadata.
 const CODEX_OTEL_EXPORT_BATCH_RECORDS = 512;
 const DEFERRED_CONTEXT_OWNERSHIP_RECORDS = 128;
 
@@ -709,16 +711,22 @@ async function main() {
     );
 
     const changesBeforeHighRecords = totalChanges(buffer);
+    const highLogRecords = LOCAL_HTTP_LIMITS.otlpRecords - 112;
     const highRecordEnvelope = {
-      resourceLogs: [
-        {
-          scopeLogs: [
-            { logRecords: Array.from({ length: LOCAL_HTTP_LIMITS.otlpRecords + 1 }, () => ({})) },
+      resourceLogs: [{
+        scopeLogs: [{ logRecords: Array.from({ length: highLogRecords }, () => ({})) }],
+      }],
+      resourceSpans: [{
+        scopeSpans: [{
+          spans: [
+            { events: Array.from({ length: 13 }, () => ({})) },
+            ...Array.from({ length: 99 }, () => ({})),
           ],
-        },
-      ],
+        }],
+      }],
     };
-    const highRecords = await request(port, "/v1/logs", JSON.stringify(highRecordEnvelope), {
+    const highRecordBody = JSON.stringify(highRecordEnvelope);
+    const highRecords = await request(port, "/v1/logs", highRecordBody, {
       "x-plimsoll-source": "codex",
     });
     const changesAfterHighRecords = totalChanges(buffer);
@@ -735,6 +743,28 @@ async function main() {
         changesBefore: changesBeforeHighRecords,
         changesAfter: changesAfterHighRecords,
       },
+    );
+
+    const recordLimitDiagnostic = warnings
+      .map((warning) => {
+        try {
+          return JSON.parse(warning) as Record<string, unknown>;
+        } catch {
+          return null;
+        }
+      })
+      .find((line) => line?.error === "collector_request_rejected" &&
+        line.reason === "otlp_record_limit_exceeded");
+    check(
+      "record_limit_rejection_observation_has_exact_value_free_shape_and_client_class",
+      recordLimitDiagnostic?.clientClass === "codex" &&
+        recordLimitDiagnostic.recordCount === LOCAL_HTTP_LIMITS.otlpRecords + 1 &&
+        recordLimitDiagnostic.decodedBytes === Buffer.byteLength(highRecordBody) &&
+        JSON.stringify(recordLimitDiagnostic.recordArrays) ===
+          JSON.stringify({ logRecords: highLogRecords, spans: 100, events: 13 }) &&
+        SENTINELS.every((sentinel) => !JSON.stringify(recordLimitDiagnostic).includes(sentinel)) &&
+        Buffer.byteLength(JSON.stringify(recordLimitDiagnostic)) <= 384,
+      { recordLimitDiagnostic, expectedDecodedBytes: Buffer.byteLength(highRecordBody) },
     );
 
     const highAttributeEnvelope = {
@@ -803,7 +833,8 @@ async function main() {
         // The first-line receipt carries a bounded client class label
         // ("codex", "claude", ...) since the admission diagnostics landed; it is
         // a fixed-cardinality tag, not request content, so it stays value-free.
-        const keys = Object.keys(parsed).filter((key) => key !== "clientClass");
+        const diagnosticKeys = ["clientClass", "recordCount", "recordArrays", "decodedBytes"];
+        const keys = Object.keys(parsed).filter((key) => !diagnosticKeys.includes(key));
         const clientClassValid =
           parsed.clientClass === undefined ||
           (typeof parsed.clientClass === "string" && /^[a-z_]{1,16}$/.test(parsed.clientClass));
@@ -811,7 +842,12 @@ async function main() {
           parsed.error !== "collector_request_rejected" ||
           typeof parsed.reason !== "string" ||
           keys.length !== 2 ||
-          !clientClassValid
+          !clientClassValid ||
+          (parsed.reason === "otlp_record_limit_exceeded" &&
+            (typeof parsed.recordCount !== "number" ||
+              typeof parsed.decodedBytes !== "number" ||
+              parsed.recordArrays === null ||
+              typeof parsed.recordArrays !== "object"))
         ) {
           warningShapesValid = false;
         } else {
@@ -873,7 +909,10 @@ async function main() {
         [...firstLinePairCounts.values()].every((count) => count === 1) &&
         counterRowsMatchRejections &&
         conservationIdentity(counters) &&
-        warnings.every((warning) => Buffer.byteLength(warning) <= 128) &&
+        warnings.every((warning) =>
+          Buffer.byteLength(warning) <=
+            (warning.includes('"reason":"otlp_record_limit_exceeded"') ? 384 : 128)
+        ) &&
         SENTINELS.every((sentinel) => !warningText.includes(sentinel)),
       {
         distinctRejectedReasons: rejectedReasonCounts.size,
