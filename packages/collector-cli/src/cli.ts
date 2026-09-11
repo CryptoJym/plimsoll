@@ -54,6 +54,7 @@ import {
   collectorHomeIdentityHash,
   defaultCollectorHome,
   resolveCollectorHome,
+  resolveGrokHome,
 } from "./collector-home";
 import {
   assertCollectorPrivacyMode,
@@ -69,6 +70,7 @@ import {
   type CollectorConfig,
 } from "./config";
 import { appendForwardedHook } from "./forwarder";
+import { forwardHookOverLoopback } from "./local-hook-client";
 import {
   loadOrCreateLocalIngestAuth,
   readLocalIngestAuth,
@@ -155,7 +157,6 @@ import {
   generateGrokHookSettings,
   generateSetupInstructions,
 } from "../../collector-config/src/index";
-import type { ToolSource } from "../../shared/src/index";
 import { runOutcomesSync } from "./outcomes-sync";
 import {
   GitHubRestOutcomeTimelineAdapter,
@@ -233,6 +234,8 @@ Commands:
                         Read-only readiness check; never creates config, ledger, plist, logs, or directories
   export                Print buffered events as JSON
   forward-hook SOURCE   Read hook JSON from stdin and append it without requiring the receiver
+  forward-hook-http SOURCE
+                        Forward stdin to the authenticated loopback hook boundary without argv secrets
   self-test-hook SOURCE Emit one synthetic hook event into the local buffer
   generate-config TOOL  Print Claude Code, Codex, Gemini CLI, or Grok config for metadata collection
   setup                 APPLY Claude Code, Gemini CLI, Grok, and Codex telemetry independently
@@ -428,7 +431,9 @@ function accountAssertionMutationFromArgs() {
   return { enabled: enableIndex !== -1, source, yes, dryRun };
 }
 
-function collectorSourceFromArg(value: string | undefined): ToolSource {
+function collectorSourceFromArg(
+  value: string | undefined,
+): "claude_code" | "codex" | "grok" {
   if (value === "claude-code") return "claude_code";
   if (value === "codex") return "codex";
   if (value === "grok") return "grok";
@@ -2574,9 +2579,7 @@ async function main() {
     const claudeFile = argValue("--claude-settings") ?? path.join(os.homedir(), ".claude", "settings.json");
     const geminiFile = argValue("--gemini-settings") ?? path.join(os.homedir(), ".gemini", "settings.json");
     const codexFile = argValue("--codex-config") ?? path.join(os.homedir(), ".codex", "config.toml");
-    const grokHome = process.env.GROK_HOME
-      ? path.resolve(process.env.GROK_HOME)
-      : path.join(os.homedir(), ".grok");
+    const grokHome = resolveGrokHome().home;
     const grokFile = argValue("--grok-hooks") ?? path.join(grokHome, "hooks", "plimsoll.json");
     // Setup is the installer: it provisions the Plimsoll-local credentials so
     // generated tool configs bind each producer to its own source-bound token.
@@ -3338,6 +3341,18 @@ async function main() {
     } finally {
       buffer.close();
     }
+    return;
+  }
+
+  if (command === "forward-hook-http") {
+    const source = collectorSourceFromArg(process.argv[3]);
+    const body = await readStdin();
+    const auth = loadOrCreateLocalIngestAuth(collectorHome());
+    await forwardHookOverLoopback(body, {
+      source,
+      port: config.port,
+      auth,
+    });
     return;
   }
 

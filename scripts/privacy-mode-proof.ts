@@ -395,6 +395,121 @@ async function main() {
     },
   );
 
+  const producerHome = path.join(root, "producer-route-home");
+  fs.mkdirSync(producerHome, { recursive: true, mode: 0o700 });
+  const producerLedger = path.join(producerHome, "work-ledger.sqlite");
+  const producerBuffer = new LocalEventBuffer(producerLedger, {
+    delivery: { enabled: true, limits: metadataConfig.delivery },
+  });
+  const producerServer = createCollectorServer(metadataConfig, producerBuffer);
+  const producerPort = await listen(producerServer);
+  const expectedProducerMetadataKeys = [
+    "cacheReadTokens",
+    "costUsd",
+    "inputTokens",
+    "model",
+    "otelAttributes",
+    "outputTokens",
+    "permissionMode",
+    "projectKey",
+    "sessionId",
+    "toolInputTruncated",
+    "toolName",
+    "toolUseId",
+    "workspaceRoot",
+  ];
+  const producerPayload = (id: string) => ({
+    id,
+    event_type: "PostToolUse",
+    sessionId: "b03567bc-f454-43af-86f9-747625a4376e",
+    workspaceRoot: `/workspace/${fixture.sentinels.absolutePath}`,
+    permissionMode: "default",
+    toolName: "Bash",
+    toolUseId: "tool-1",
+    toolInputTruncated: false,
+    timestamp: "2026-09-11T18:00:00.000Z",
+    inputTokens: 7,
+    outputTokens: 5,
+    cacheReadTokens: 3,
+    costUsd: 0.01,
+    model: "fixture-model",
+    projectKey: `sha256:${"a".repeat(64)}`,
+    inputText: fixture.sentinels.prompt,
+    input_text: fixture.sentinels.prompt,
+    text: fixture.sentinels.prompt,
+    description: fixture.sentinels.response,
+    prompt: fixture.sentinels.prompt,
+    content: fixture.sentinels.multibyte,
+    message: fixture.sentinels.response,
+    body: fixture.sentinels.response,
+    output: fixture.sentinels.response,
+    stdout: fixture.sentinels.response,
+    stderr: fixture.sentinels.response,
+    command: fixture.sentinels.toolArguments,
+    args: [fixture.sentinels.toolArguments],
+  });
+  const producerResponses = await Promise.all([
+    fetch(`http://127.0.0.1:${producerPort}/hooks/claude-code`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-plimsoll-source": "claude_code" },
+      body: JSON.stringify(producerPayload("11711711-1111-4111-8111-111111111121")),
+    }),
+    fetch(`http://127.0.0.1:${producerPort}/hooks/codex`, {
+      method: "POST",
+      headers: { "content-type": "application/json", "x-plimsoll-source": "codex" },
+      body: JSON.stringify(producerPayload("11711711-1111-4111-8111-111111111122")),
+    }),
+  ]);
+  const producerResponseBodies = await Promise.all(producerResponses.map((response) => response.text()));
+  const producerRows = producerBuffer.database.prepare(
+    "select source, payload_json as payloadJson from buffered_events order by source",
+  ).all() as Array<{ source: string; payloadJson: string }>;
+  const producerInventories = Object.fromEntries(producerRows.map((row) => [
+    row.source,
+    Object.keys((JSON.parse(row.payloadJson) as { metadata: Record<string, unknown> }).metadata).sort(),
+  ]));
+  const producerUploadBodies: string[] = [];
+  const producerUpload = await uploadBufferedEvents(metadataConfig, producerBuffer, {
+    fetchImpl: async (_input, init) => {
+      producerUploadBodies.push(String(init?.body ?? ""));
+      return new Response(JSON.stringify(acceptedFixtureDelivery(String(init?.body ?? ""), metadataConfig.installKey)), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    },
+  });
+  const producerOpenLedgerFiles = fileSurfaces(producerLedger);
+  await close(producerServer);
+  producerBuffer.close();
+  const producerClosedLedgerFiles = fileSurfaces(producerLedger);
+  const producerSurfaces: Array<string | Buffer> = [
+    ...producerResponseBodies,
+    ...producerUploadBodies,
+    ...producerOpenLedgerFiles,
+    ...producerClosedLedgerFiles,
+  ];
+  const producerInventoryDiff = Object.fromEntries(["claude_code", "codex"].map((source) => {
+    const actual = producerInventories[source] ?? [];
+    return [source, {
+      added: actual.filter((key: string) => !expectedProducerMetadataKeys.includes(key)),
+      removed: expectedProducerMetadataKeys.filter((key) => !actual.includes(key)),
+    }];
+  }));
+  record(
+    "claude_and_codex_hook_routes_drop_unknown_text_and_preserve_r1_admitted_key_inventory",
+    producerResponses.every((response) => response.status === 202) &&
+      producerRows.length === 2 && producerUpload.uploadedEvents === 2 &&
+      producerSurfaces.every((surface) => !hasPrivateTerm(surface)) &&
+      Object.values(producerInventoryDiff).every((diff) =>
+        diff.added.length === 0 && diff.removed.length === 0),
+    {
+      responseStatuses: producerResponses.map((response) => response.status),
+      admittedKeyInventories: producerInventories,
+      inventoryDiff: producerInventoryDiff,
+      surfacesScanned: producerSurfaces.length,
+    },
+  );
+
   const legacyHome = path.join(root, "legacy-home");
   fs.mkdirSync(legacyHome, { recursive: true, mode: 0o700 });
   const legacyLedger = path.join(legacyHome, "work-ledger.sqlite");

@@ -8,6 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { Readable } from "node:stream";
 
+import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 import {
   applyGrokHookFile,
   generateGrokHookSettings,
@@ -24,12 +25,15 @@ import {
 import { discoverGrokSessionSummaries } from "../packages/collector-cli/src/grok-session-discovery";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
+import * as collectorHomeModule from "../packages/collector-cli/src/collector-home";
+import { forwardHookOverLoopback } from "../packages/collector-cli/src/local-hook-client";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 import {
   classifyRejectionClient,
   createRejectionDiagnostics,
 } from "../packages/collector-cli/src/rejection-diagnostics";
 import { inferSource } from "../packages/collector-cli/src/normalizer";
+import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import { toolSourceSchema } from "../packages/shared/src/index";
 
 type Check = { name: string; passed: true; detail: Record<string, unknown> };
@@ -115,10 +119,44 @@ async function main() {
       JSON.stringify(events) === JSON.stringify(["PostToolUse", "Stop", "UserPromptSubmit"]) &&
         commands.length === 3 && commands.every((command) =>
           command.includes("GROK_HOOK_EVENT") &&
-          command.includes("/hooks/grok") &&
-          command.includes("x-plimsoll-source: grok") &&
-          command.includes(`x-plimsoll-token: ${token}`)),
-      { events, commands: commands.map((command) => command.replace(token, "<redacted>")) },
+          command.includes("forward-hook-http grok")),
+      { events, commands },
+    );
+
+    const fakeBin = path.join(sandbox, "fake-bin");
+    const childArgvFile = path.join(sandbox, "hook-child-argv.txt");
+    fs.mkdirSync(fakeBin, { mode: 0o700 });
+    for (const executable of ["curl", "pnpm"]) {
+      const fakeExecutable = path.join(fakeBin, executable);
+      fs.writeFileSync(
+        fakeExecutable,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$PLIMSOLL_FAKE_ARGV\"\nprintf 'synthetic-child-stdout'\nprintf 'synthetic-child-stderr' >&2\n",
+        { mode: 0o700 },
+      );
+    }
+    const hookExecution = spawnSync("/bin/sh", ["-c", commands[0] ?? ""], {
+      input: "{}",
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        GROK_HOOK_EVENT: "UserPromptSubmit",
+        PATH: `${fakeBin}:${process.env.PATH ?? ""}`,
+        PLIMSOLL_FAKE_ARGV: childArgvFile,
+      },
+    });
+    const childArgv = fs.existsSync(childArgvFile) ? fs.readFileSync(childArgvFile, "utf8") : "";
+    check(
+      "grok_managed_hook_keeps_token_out_of_command_child_argv_stdout_and_stderr",
+      hookExecution.status === 0 && commands.every((command) => !command.includes(token)) &&
+        !childArgv.includes(token) && !hookExecution.stdout.includes(token) &&
+        !hookExecution.stderr.includes(token),
+      {
+        status: hookExecution.status,
+        commandTokenFree: commands.every((command) => !command.includes(token)),
+        childArgvTokenFree: !childArgv.includes(token),
+        stdoutTokenFree: !hookExecution.stdout.includes(token),
+        stderrTokenFree: !hookExecution.stderr.includes(token),
+      },
     );
 
     const beforeForeign = sha256(fs.readFileSync(foreignHook));
@@ -144,6 +182,35 @@ async function main() {
       !repeated.changed && fs.readFileSync(hookFile).equals(firstBytes) &&
         fs.readdirSync(path.dirname(hookFile)).every((name) => !name.includes(".plimsoll-backup-")),
       { changed: repeated.changed },
+    );
+
+    const publicManagedFile = path.join(sandbox, "public-managed", "plimsoll.json");
+    fs.mkdirSync(path.dirname(publicManagedFile), { recursive: true, mode: 0o700 });
+    const legacyToken = "o".repeat(43);
+    const legacyCommand = `if [ -n "\${GROK_HOOK_EVENT:-}" ]; then curl -s --max-time 2 -X POST -H 'Content-Type: application/json' -H 'x-plimsoll-source: grok' -H 'x-plimsoll-token: ${legacyToken}' --data-binary @- http://127.0.0.1:49321/hooks/grok || true; fi`;
+    const priorManaged = {
+      hooks: {
+        UserPromptSubmit: [{ hooks: [{ type: "command", command: legacyCommand, timeout: 5 }] }],
+        PostToolUse: [{ matcher: ".*", hooks: [{ type: "command", command: legacyCommand, timeout: 5 }] }],
+        Stop: [{ hooks: [{ type: "command", command: legacyCommand, timeout: 5 }] }],
+      },
+    };
+    fs.writeFileSync(publicManagedFile, `${JSON.stringify(priorManaged, null, 2)}\n`, { mode: 0o644 });
+    fs.chmodSync(publicManagedFile, 0o644);
+    const privateUpdate = applyGrokHookFile(publicManagedFile, generated);
+    const privateBackupMode = privateUpdate.backupPath
+      ? fs.statSync(privateUpdate.backupPath).mode & 0o777
+      : undefined;
+    check(
+      "grok_reconcile_forces_private_target_and_backup_from_0644_preimage",
+      privateUpdate.changed && Boolean(privateUpdate.backupPath) &&
+        (fs.statSync(publicManagedFile).mode & 0o777) === 0o600 && privateBackupMode === 0o600 &&
+        !fs.readFileSync(publicManagedFile, "utf8").includes(legacyToken),
+      {
+        changed: privateUpdate.changed,
+        targetMode: fs.statSync(publicManagedFile).mode & 0o777,
+        backupMode: privateBackupMode,
+      },
     );
 
     const conflictFile = path.join(sandbox, "conflict", "plimsoll.json");
@@ -207,6 +274,55 @@ async function main() {
       },
     );
 
+    const guardMarker = path.join(sandbox, "grok-home-guard.marker");
+    fs.writeFileSync(guardMarker, "guard-bytes\n", { mode: 0o600 });
+    const invalidHomeCases = [
+      { value: "", receipt: "grok_home_ambiguous" },
+      { value: "relative-grok-home", receipt: "grok_home_not_absolute" },
+      { value: `${dryGrokHome}/../normalization-unsafe`, receipt: "grok_home_not_normalized" },
+      { value: `${dryGrokHome}\nunsafe`, receipt: "grok_home_control_characters" },
+    ];
+    const invalidHomeResults = invalidHomeCases.map(({ value, receipt }) => {
+      const before = sha256(fs.readFileSync(guardMarker));
+      const result = spawnSync(
+        process.execPath,
+        ["--import", loader, cli, "setup", "--dry-run"],
+        {
+          cwd: repoRoot,
+          env: {
+            ...process.env,
+            HOME: dryHome,
+            PLIMSOLL_HOME: dryPlimsollHome,
+            GROK_HOME: value,
+          },
+          encoding: "utf8",
+        },
+      );
+      return {
+        receipt,
+        status: result.status,
+        exactReceipt: result.stderr.includes(receipt),
+        bytesUnchanged: sha256(fs.readFileSync(guardMarker)) === before &&
+          !fs.existsSync(dryHome) && !fs.existsSync(dryPlimsollHome),
+      };
+    });
+    const resolveGrokHome = (
+      collectorHomeModule as unknown as {
+        resolveGrokHome?: (options: { env: NodeJS.ProcessEnv; homeDir: string }) => unknown;
+      }
+    ).resolveGrokHome;
+    const nulReceipt = errorMessage(() => {
+      if (!resolveGrokHome) throw new Error("resolveGrokHome_missing");
+      resolveGrokHome({ env: { GROK_HOME: `${dryGrokHome}\0unsafe` }, homeDir: dryHome });
+    });
+    check(
+      "setup_rejects_ambiguous_relative_unnormalized_and_control_grok_home_before_planning",
+      invalidHomeResults.every((result) =>
+        result.status === 1 && result.exactReceipt && result.bytesUnchanged) &&
+        nulReceipt.includes("grok_home_control_characters"),
+      { invalidHomeResults, nulReceipt },
+    );
+
     const authHome = path.join(sandbox, "auth");
     const auth = loadOrCreateLocalIngestAuth(authHome);
     check(
@@ -221,6 +337,28 @@ async function main() {
         ]).size === 5 &&
         (fs.statSync(path.join(authHome, "local-ingest-auth.json")).mode & 0o777) === 0o600,
       { distinctAudiences: 5 },
+    );
+    let internalForward: { url: string; tokenMatched: boolean; sourceMatched: boolean; bodyMatched: boolean } | undefined;
+    await forwardHookOverLoopback('{"hookEventName":"user_prompt_submit"}', {
+      source: "grok",
+      port: 49321,
+      auth,
+      fetchImpl: async (input, init) => {
+        const headers = new Headers(init?.headers);
+        internalForward = {
+          url: String(input),
+          tokenMatched: headers.get("x-plimsoll-token") === auth.grokProducer,
+          sourceMatched: headers.get("x-plimsoll-source") === "grok",
+          bodyMatched: init?.body === '{"hookEventName":"user_prompt_submit"}',
+        };
+        return new Response("", { status: 202 });
+      },
+    });
+    check(
+      "value_blind_forwarder_loads_the_grok_audience_inside_the_trusted_client",
+      internalForward?.url === "http://127.0.0.1:49321/hooks/grok" &&
+        internalForward.tokenMatched && internalForward.sourceMatched && internalForward.bodyMatched,
+      { internalForward },
     );
     const migrationHome = path.join(sandbox, "auth-migration");
     fs.mkdirSync(migrationHome, { mode: 0o700 });
@@ -290,20 +428,67 @@ async function main() {
 
     const ledgerHome = path.join(sandbox, "ledger");
     fs.mkdirSync(ledgerHome, { mode: 0o700 });
-    const buffer = new LocalEventBuffer(path.join(ledgerHome, "ledger.sqlite"));
-    const server = createCollectorServer(collectorConfigSchema.parse({}), buffer, { localAuth: auth });
+    const ledgerConfig = collectorConfigSchema.parse({
+      managed: true,
+      uploadUrl: "http://127.0.0.1/fake-ingest",
+      installKey: "grok-source-proof-install",
+    });
+    const buffer = new LocalEventBuffer(path.join(ledgerHome, "ledger.sqlite"), {
+      delivery: { enabled: true, limits: ledgerConfig.delivery },
+    });
+    const server = createCollectorServer(ledgerConfig, buffer, { localAuth: auth });
     const contentSentinel = "GROK_CONTENT_MUST_NOT_PERSIST";
     const payload = {
-      hookEventName: "UserPromptSubmit",
-      hook_event_name: "UserPromptSubmit",
+      hookEventName: "post_tool_use",
+      hook_event_name: "PostToolUse",
       sessionId: "b03567bc-f454-43af-86f9-747625a4376e",
       cwd: `/private/${contentSentinel}`,
       workspaceRoot: `/workspace/${contentSentinel}`,
+      permissionMode: "default",
+      promptId: "prompt-1",
+      toolName: "Bash",
+      toolUseId: "tool-1",
+      toolInputTruncated: false,
+      toolResultTruncated: false,
       timestamp: "2026-09-11T18:00:00.000Z",
+      inputTokens: 7,
+      outputTokens: 5,
+      cacheReadTokens: 3,
+      costUsd: 0.01,
+      model: "fixture-model",
+      projectKey: `sha256:${"a".repeat(64)}`,
       prompt: contentSentinel,
       toolInput: { command: contentSentinel },
       toolResult: contentSentinel,
+      tool_response: contentSentinel,
+      stopHookActive: false,
       lastAssistantMessage: contentSentinel,
+      backgroundTasks: [{
+        id: "background-1",
+        type: "monitor",
+        status: "running",
+        command: contentSentinel,
+        description: contentSentinel,
+        agentType: "fixture-agent",
+      }],
+      sessionCrons: [{
+        id: "cron-1",
+        schedule: "every_5_minutes",
+        recurring: true,
+        prompt: contentSentinel,
+      }],
+      inputText: contentSentinel,
+      input_text: contentSentinel,
+      text: contentSentinel,
+      description: contentSentinel,
+      content: contentSentinel,
+      message: contentSentinel,
+      body: contentSentinel,
+      output: contentSentinel,
+      stdout: contentSentinel,
+      stderr: contentSentinel,
+      command: contentSentinel,
+      args: [contentSentinel],
     };
     const serverRequest = Object.assign(Readable.from([JSON.stringify(payload)]), {
       method: "POST",
@@ -321,13 +506,72 @@ async function main() {
       const stored = buffer.database.prepare(
         "select source, event_type as eventType, session_id as sessionId, payload_json as payloadJson from buffered_events",
       ).get() as Record<string, unknown> | undefined;
+      const uploadBodies: string[] = [];
+      const upload = await uploadBufferedEvents(ledgerConfig, buffer, {
+        fetchImpl: async (_input, init) => {
+          uploadBodies.push(String(init?.body ?? ""));
+          return new Response(
+            JSON.stringify(acceptedFixtureDelivery(String(init?.body ?? ""), ledgerConfig.installKey)),
+            { status: 200, headers: { "content-type": "application/json" } },
+          );
+        },
+      });
+      const storedPayload = stored?.payloadJson ? JSON.parse(String(stored.payloadJson)) as {
+        metadata?: Record<string, unknown>;
+      } : undefined;
+      const admittedMetadataKeys = Object.keys(storedPayload?.metadata ?? {}).sort();
+      const expectedMetadataKeys = [
+        "cacheReadTokens",
+        "costUsd",
+        "inputTokens",
+        "model",
+        "otelAttributes",
+        "outputTokens",
+        "permissionMode",
+        "projectKey",
+        "promptId",
+        "sessionId",
+        "stopHookActive",
+        "toolInputTruncated",
+        "toolName",
+        "toolResultTruncated",
+        "toolUseId",
+        "workspaceRoot",
+      ];
+      const r1AdmittedMetadataKeys = [
+        "backgroundTasks",
+        "cacheReadTokens",
+        "costUsd",
+        "description",
+        "inputText",
+        "inputTokens",
+        "input_text",
+        "model",
+        "otelAttributes",
+        "outputTokens",
+        "permissionMode",
+        "projectKey",
+        "sessionCrons",
+        "sessionId",
+        "stopHookActive",
+        "text",
+        "toolInputTruncated",
+        "toolName",
+        "toolResultTruncated",
+        "toolUseId",
+        "workspaceRoot",
+      ];
       check(
-        "grok_authenticated_hook_reaches_the_metadata_only_ledger",
+        "grok_documented_and_plausible_text_fields_never_reach_ledger_or_upload",
         response.statusCode === 202 && JSON.parse(response.body).accepted === true &&
-          stored?.source === "grok" && stored.eventType === "user_prompt_submit" &&
+          stored?.source === "grok" && stored.eventType === "tool_result" &&
           stored.sessionId === payload.sessionId &&
           !String(stored.payloadJson).includes(contentSentinel) &&
-          !String(stored.payloadJson).includes(String(auth.grokProducer)),
+          !String(stored.payloadJson).includes(String(auth.grokProducer)) &&
+          upload.uploadedEvents === 1 && uploadBodies.length === 1 &&
+          uploadBodies.every((body) =>
+            !body.includes(contentSentinel) && !body.includes(String(auth.grokProducer))) &&
+          JSON.stringify(admittedMetadataKeys) === JSON.stringify(expectedMetadataKeys),
         {
           statusCode: response.statusCode,
           source: stored?.source,
@@ -335,6 +579,16 @@ async function main() {
           sessionId: stored?.sessionId,
           contentAbsent: !String(stored?.payloadJson).includes(contentSentinel),
           tokenAbsent: !String(stored?.payloadJson).includes(String(auth.grokProducer)),
+          uploadContentAbsent: uploadBodies.every((body) => !body.includes(contentSentinel)),
+          admittedMetadataKeys,
+          r1InventoryDiff: {
+            added: admittedMetadataKeys.filter((key) => !r1AdmittedMetadataKeys.includes(key)),
+            removed: r1AdmittedMetadataKeys.filter((key) => !admittedMetadataKeys.includes(key)),
+          },
+          expectedInventoryDiff: {
+            added: admittedMetadataKeys.filter((key) => !expectedMetadataKeys.includes(key)),
+            removed: expectedMetadataKeys.filter((key) => !admittedMetadataKeys.includes(key)),
+          },
         },
       );
     } finally {

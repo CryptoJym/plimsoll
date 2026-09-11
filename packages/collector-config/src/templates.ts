@@ -17,6 +17,7 @@ export type ToolConfigOptions = {
   claudeCodeProducerToken?: string;
   codexProducerToken?: string;
   geminiCliProducerToken?: string;
+  /** Provisioned alongside the hook, but intentionally never rendered into it. */
   grokProducerToken?: string;
 };
 
@@ -214,10 +215,7 @@ export const generateGeminiSettings = generateGeminiCliSettings;
 /** Grok Build reads Claude-compatible command hooks from ~/.grok/hooks/*.json. */
 export function generateGrokHookSettings(options: ToolConfigOptions) {
   assertSupportedDataMode(options);
-  const tokenHeader = options.grokProducerToken
-    ? ` -H ${shellQuote(`x-plimsoll-token: ${options.grokProducerToken}`)}`
-    : "";
-  const command = `if [ -n "\${GROK_HOOK_EVENT:-}" ]; then curl -s --max-time 2 -X POST -H 'Content-Type: application/json' -H 'x-plimsoll-source: grok'${tokenHeader} --data-binary @- http://127.0.0.1:${port(options)}/hooks/grok || true; fi`;
+  const command = `if [ -n "\${GROK_HOOK_EVENT:-}" ]; then ${shellQuote(options.pnpmCommand ?? "pnpm")} --dir ${shellQuote(options.repoRoot)} collector forward-hook-http grok || true; fi`;
   const handler = { type: "command", command, timeout: 5 };
   return {
     hooks: {

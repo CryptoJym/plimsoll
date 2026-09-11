@@ -5,6 +5,7 @@ export * from "./config";
 export * from "./device-identity";
 export * from "./http-transport";
 export * from "./grok-session-discovery";
+export * from "./local-hook-client";
 export * from "./learning-facts";
 export * from "./lifecycle";
 export * from "./lifecycle-command";
