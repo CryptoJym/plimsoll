@@ -73,6 +73,7 @@ import {
   loadOrCreateLocalIngestAuth,
   readLocalIngestAuth,
 } from "./local-auth";
+import { enrollCodexLiveProducer } from "./codex-live-usage-auth";
 import {
   installLaunchAgent,
   inspectLaunchAgentManifest,
@@ -221,6 +222,9 @@ Commands:
                         (use --reassign for an explicit workspace change)
   sync-account-salt     Refresh the tenant-scoped actor salt over the
                         authenticated device channel (no raw salt is printed)
+  enroll-codex-live-producer --producer-id ID --credential-id ID --capture-root-id ID
+                        Provision a same-user Codex live producer; account
+                        assertion discovery is best-effort and never printed
   doctor --read-only --json
                         Read-only readiness check; never creates config, ledger, plist, logs, or directories
   export                Print buffered events as JSON
@@ -1696,6 +1700,48 @@ async function main() {
   assertCollectorPrivacyMode(config, command, {
     willEnableUpload: command === "join" || Boolean(optionValue("--url")),
   });
+
+  if (command === "enroll-codex-live-producer") {
+    const optionNames = new Set(["--producer-id", "--credential-id", "--capture-root-id"]);
+    const seen = new Set<string>();
+    for (let index = 3; index < process.argv.length; index += 2) {
+      const name = process.argv[index] ?? "";
+      const value = process.argv[index + 1];
+      if (!optionNames.has(name) || seen.has(name) || !value || value.startsWith("--")) {
+        throw new Error(
+          "Usage: plimsoll enroll-codex-live-producer --producer-id ID --credential-id ID --capture-root-id ID",
+        );
+      }
+      seen.add(name);
+    }
+    if (seen.size !== optionNames.size) {
+      throw new Error(
+        "Usage: plimsoll enroll-codex-live-producer --producer-id ID --credential-id ID --capture-root-id ID",
+      );
+    }
+    const buffer = openBuffer(config);
+    try {
+      const enrollment = await enrollCodexLiveProducer({
+        home: collectorHome(),
+        buffer,
+        config,
+        producerId: optionValue("--producer-id")!,
+        credentialId: optionValue("--credential-id")!,
+        captureRootId: optionValue("--capture-root-id")!,
+      });
+      console.log(JSON.stringify({
+        status: "codex_live_producer_enrolled",
+        producerId: enrollment.producerId,
+        credentialId: enrollment.credentialId,
+        captureRootId: enrollment.binding.captureRootId,
+        installationEpochId: enrollment.binding.installationEpochId,
+        accountAssertionAttached: enrollment.accountAssertionAttached,
+      }));
+    } finally {
+      buffer.close();
+    }
+    return;
+  }
 
   if (command === "start") {
     let pidPath = "";
