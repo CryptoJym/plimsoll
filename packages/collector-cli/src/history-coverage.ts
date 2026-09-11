@@ -144,7 +144,7 @@ export function initializeFinanceSourceCoverage(
 
 function withFinanceMutationTransaction<T>(database: Database.Database, run: () => T): T {
   if (database.inTransaction) return run();
-  return database.transaction(run)();
+  return database.transaction(run).immediate();
 }
 
 function financeCoverageRow(

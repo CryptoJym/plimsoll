@@ -1033,7 +1033,7 @@ export function stageAutomaticCaptureBaselineObservation(
       source,
       input.runId,
     );
-  })();
+  }).immediate();
   return insertedGeneration;
 }
 

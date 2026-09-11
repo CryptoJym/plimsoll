@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import Database from "better-sqlite3";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -21,7 +22,7 @@ const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-reliability-"));
 const realNow = Date.now;
 const now = realNow();
 const checks: Array<{ name: string; passed: boolean; detail?: unknown; error?: string }> = [];
-const EXPECTED_CHECKS = 11;
+const EXPECTED_CHECKS = 12;
 let nextId = 0;
 function event() {
   return aiInteractionEventSchema.parse({
@@ -123,34 +124,57 @@ async function main() {
       return { failedRefreshes: failed.statusRefreshCounters.failures, clockRollback: "stale" };
     } finally { await http.close(); buffer.close(); }
   });
-  await check("partial_ingest_retry_and_deferred_projection_conserve_exact_totals", async () => {
-    const buffer = fixture("partial-ingest"); settle(buffer);
+  await check("partial_ingest_retries_in_process_and_conserves_exact_totals", async () => {
+    const ledgerPath = path.join(root, "partial-ingest.sqlite");
+    const buffer = new LocalEventBuffer(ledgerPath, { databaseBusyTimeoutMs: 0 });
+    settle(buffer);
+    const maintenance = new Database(ledgerPath, { timeout: 0 });
+    maintenance.pragma("journal_mode = WAL");
     const http = await serve(buffer);
     const original = buffer.appendMany.bind(buffer);
-    let calls = 0;
+    let calls = 0, busyErrors = 0;
+    let release: ReturnType<typeof setTimeout> | null = null;
     buffer.appendMany = (...args) => {
-      if (++calls === 2) throw Object.assign(new Error("synthetic_second_chunk_busy"), {code: "SQLITE_BUSY"});
-      return original(args[0], args[1], args[2], {projectionDeadlineMs: 0});
+      calls += 1;
+      if (calls === 2) {
+        maintenance.exec("begin immediate");
+        release = setTimeout(() => maintenance.exec("commit"), 120);
+      }
+      try {
+        return original(args[0], args[1], args[2], {projectionDeadlineMs: 0});
+      } catch (error) {
+        const code = error && typeof error === "object" && "code" in error
+          ? String(error.code)
+          : "";
+        if (code.startsWith("SQLITE_BUSY")) busyErrors += 1;
+        throw error;
+      }
     };
     const body = JSON.stringify({resourceLogs: [{scopeLogs: [{logRecords: Array.from({length: 40}, (_, index) => ({
       timeUnixNano: String(BigInt(now - 1_000) * 1_000_000n + BigInt(index)),
       attributes: [
         {key: "gen_ai.usage.input_tokens", value: {intValue: "1"}},
         {key: "gen_ai.usage.output_tokens", value: {intValue: "2"}},
+        ...(index === 16 ? [{key: "cwd", value: {stringValue: root}}] : []),
       ],
     }))}]}]});
     const post = () => fetch(http.base + "/v1/logs", {method: "POST", body,
       headers: {"content-type": "application/json", "x-plimsoll-source": "codex"}});
     try {
-      const interrupted = await post();
-      assert.equal(interrupted.status, 503);
-      assert.equal((await interrupted.json() as {reason:string}).reason, "storage_busy_retry");
-      assert.equal((buffer.database.prepare("select count(*) as n from buffered_events").get() as {n:number}).n, 16);
-      buffer.appendMany = (events, metrics, drops) => original(events, metrics, drops, {projectionDeadlineMs: 0});
       assert.equal((await post()).status, 202);
+      assert.equal((buffer.database.prepare("select count(*) as n from buffered_events").get() as {n:number}).n, 40);
       assert.equal((await post()).status, 202);
       const raw = buffer.database.prepare("select count(*) as events,sum(input_tokens) as input,sum(output_tokens) as output from buffered_events").get();
       assert.deepEqual(raw, {events: 40, input: 40, output: 80});
+      assert.ok(busyErrors >= 1);
+      assert.deepEqual(
+        buffer.database.prepare(
+          `select
+             (select count(*) from repo_context_event_links) as links,
+             (select count(*) from repo_context_handoffs) as handoffs`,
+        ).get(),
+        { links: 1, handoffs: 1 },
+      );
       assert.ok(buffer.projection.status().backlog.repairs > 0);
       settle(buffer);
       const read = buffer.projection.readSnapshot(30);
@@ -159,8 +183,94 @@ async function main() {
         assert.equal((read.snapshot.summary.totals as any).inputTokens, 40);
         assert.equal((read.snapshot.summary.totals as any).outputTokens, 80);
       }
-      return {partialCommitted: 16, final: raw, projectionSettled: true};
-    } finally {await http.close(); buffer.close();}
+      return {
+        partialCommittedBeforeRetry: 16,
+        final: raw,
+        projectionSettled: true,
+        appendCalls: calls,
+        busyErrors,
+        contextLinks: 1,
+        durableHandoffs: 1,
+      };
+    } finally {
+      if (release) clearTimeout(release);
+      if (maintenance.inTransaction) maintenance.exec("rollback");
+      await http.close();
+      maintenance.close();
+      buffer.close();
+    }
+  });
+  await check("hook_append_waits_for_maintenance_writer_without_blocking_event_loop", async () => {
+    const ledgerPath = path.join(root, "hook-maintenance-writer.sqlite");
+    const buffer = new LocalEventBuffer(ledgerPath, { databaseBusyTimeoutMs: 0 });
+    const maintenance = new Database(ledgerPath, { timeout: 0 });
+    maintenance.pragma("journal_mode = WAL");
+    const http = await serve(buffer);
+    const body = JSON.stringify({
+      id: "00000000-0000-4000-8000-000000000099",
+      event_type: "Stop",
+      timestamp: new Date(now).toISOString(),
+      session_id: "maintenance-contention-hook",
+    });
+    let release: ReturnType<typeof setTimeout> | null = null;
+    let busyAttempts = 0;
+    let busyObservedResolve: (() => void) | null = null;
+    const busyObserved = new Promise<void>((resolve) => { busyObservedResolve = resolve; });
+    let busyObservedAt = 0;
+    let eventLoopTick: Promise<number> | null = null;
+    const originalAppend = buffer.append.bind(buffer);
+    (buffer as any).append = (...args: unknown[]) => {
+      try {
+        return (originalAppend as any)(...args);
+      } catch (error) {
+        const code = error && typeof error === "object" && "code" in error
+          ? String(error.code)
+          : "";
+        if (code.startsWith("SQLITE_BUSY")) {
+          busyAttempts += 1;
+          if (busyObservedAt === 0) {
+            busyObservedAt = performance.now();
+            eventLoopTick = new Promise<number>((resolve) => {
+              setTimeout(() => resolve(performance.now() - busyObservedAt), 10);
+            });
+            release = setTimeout(() => maintenance.exec("commit"), 120);
+            busyObservedResolve?.();
+          }
+        }
+        throw error;
+      }
+    };
+    try {
+      maintenance.exec("begin immediate");
+      const responsePromise = fetch(http.base + "/hooks/codex", {
+        method: "POST",
+        body,
+        headers: {"content-type": "application/json", "x-plimsoll-source": "codex"},
+      });
+      await busyObserved;
+      assert.ok(eventLoopTick);
+      const [response, eventLoopDelayMs] = await Promise.all([responsePromise, eventLoopTick]);
+      const elapsedMs = performance.now() - busyObservedAt;
+      const receipt = await response.json() as { accepted?: boolean; eventId?: string };
+      assert.equal(response.status, 202);
+      assert.equal(receipt.accepted, true);
+      assert.ok(receipt.eventId);
+      assert.ok(busyAttempts >= 1);
+      assert.ok(elapsedMs >= 100 && elapsedMs < 1_000, `hook retry elapsed ${elapsedMs}ms`);
+      assert.ok(eventLoopDelayMs < 100, `event loop timer delayed ${eventLoopDelayMs}ms`);
+      assert.equal(
+        (buffer.database.prepare("select count(*) as n from buffered_events where id = ?")
+          .get(receipt.eventId) as { n: number }).n,
+        1,
+      );
+      return { elapsedMs, eventLoopDelayMs, busyAttempts, status: response.status, durableRows: 1 };
+    } finally {
+      if (release) clearTimeout(release);
+      if (maintenance.inTransaction) maintenance.exec("rollback");
+      await http.close();
+      maintenance.close();
+      buffer.close();
+    }
   });
   await check("repair_followup_respects_circuit_and_stalled_backoff", async () => {
     const buffer = fixture("repair-cadence");

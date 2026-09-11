@@ -908,7 +908,7 @@ export function runCodexReconciliationMaintenance(
         sliceDurationMs,
         timeBudgetExhausted,
       };
-    })();
+    }).immediate();
   } catch (error) {
     database
       .prepare(

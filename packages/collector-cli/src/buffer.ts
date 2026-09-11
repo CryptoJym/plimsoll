@@ -809,7 +809,7 @@ export class LocalEventBuffer {
       // permanently ineligible for that audience (lease and list filters are
       // workspace-scoped), which is the quarantine contract.
     });
-    run();
+    run.immediate();
     this.workspaceId = requested;
     this.deviceId = requestedDevice;
     this.installationEpochId = selectedEpochId;
@@ -1262,7 +1262,7 @@ export class LocalEventBuffer {
           this.recordRepoContextDrop("queue_overflow", handoffs.overflowCount);
         }
         return value;
-      })();
+      }).immediate();
       this.activeRepoContextCommitScope = null;
       this.finalizeRepoContextHandoffs(handoffs);
       return result;
@@ -1863,7 +1863,7 @@ export class LocalEventBuffer {
   drainRepoContextSuppressions(limit = REPO_CONTEXT_FILL_LIMIT) {
     return this.db.transaction(() =>
       this.drainRepoContextSuppressionsInCurrentTransaction(limit)
-    )();
+    ).immediate();
   }
 
   private fillRepoContextRowsInCurrentTransaction(
@@ -1966,7 +1966,7 @@ export class LocalEventBuffer {
   /** One fixed maintenance slice over the new-only sidecar work index. Legacy
    * event history is never searched for context work. */
   drainRepoContextFills(limit = REPO_CONTEXT_FILL_LIMIT) {
-    return this.db.transaction(() => this.fillRepoContextRowsInCurrentTransaction(limit))();
+    return this.db.transaction(() => this.fillRepoContextRowsInCurrentTransaction(limit)).immediate();
   }
 
   applyRepoContextResults(
@@ -2113,7 +2113,7 @@ export class LocalEventBuffer {
       receipt.rowsVisited += fill.rowsVisited;
       receipt.rowsFilled += fill.rowsFilled;
       return receipt;
-    })();
+    }).immediate();
   }
 
   private recordRepoContextConflict(result: RepoContextResult) {
@@ -2540,7 +2540,7 @@ export class LocalEventBuffer {
         }
         return appended;
       };
-      result = ownsHandoffs ? this.db.transaction(run)() : run();
+      result = ownsHandoffs ? this.db.transaction(run).immediate() : run();
     } finally {
       takeRepoContextSidecar(event);
       takeRepoContextId(event);
@@ -2572,7 +2572,9 @@ export class LocalEventBuffer {
       `update repo_context_event_links set fill_pending = 0
        where event_id = ? and context_id = ? and fill_pending = 1`,
     );
+    let workStarted = false;
     const work = () => {
+      workStarted = true;
       for (const entry of entries) {
         const result = this.appendInCurrentTransaction(entry.event, entry.suppressedFields, performance.now() < projectionDeadlineMs);
         appended.push(result);
@@ -2593,12 +2595,16 @@ export class LocalEventBuffer {
       }
     };
     try {
-      if (ownsHandoffs) this.db.transaction(work)();
+      if (ownsHandoffs) this.db.transaction(work).immediate();
       else work();
     } finally {
-      for (const entry of entries) {
-        takeRepoContextSidecar(entry.event);
-        takeRepoContextId(entry.event);
+      // BEGIN IMMEDIATE can lose to maintenance before the callback starts.
+      // Preserve sidecars for the listener's bounded retry in that case.
+      if (!ownsHandoffs || workStarted) {
+        for (const entry of entries) {
+          takeRepoContextSidecar(entry.event);
+          takeRepoContextId(entry.event);
+        }
       }
     }
     if (ownsHandoffs) this.finalizeRepoContextHandoffs(handoffs);
@@ -3032,7 +3038,7 @@ export class LocalEventBuffer {
         metricRowsVisited: metricRows.length,
         hasMore,
       };
-    })();
+    }).immediate();
     return {
       cutoff,
       events: run.events,

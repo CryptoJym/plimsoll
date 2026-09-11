@@ -1229,7 +1229,7 @@ export class DashboardProjectionStore {
            where singleton=1`,
         ).run();
       }
-    })();
+    }).immediate();
   }
 
   private control(): ProjectionControl {
@@ -2626,7 +2626,7 @@ export class DashboardProjectionStore {
         ).run();
       }
       this.publishFinanceRevision(now);
-    })();
+    }).immediate();
     const control = this.control();
     return {
       backfillRowsVisited,

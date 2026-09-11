@@ -229,7 +229,7 @@ export function ensureJsonlScanState(database: Database.Database) {
     }
     return rows.length > migrationLimit;
   });
-  while (migratePathKeys()) {
+  while (migratePathKeys.immediate()) {
     // Continue with another bounded transaction. This is startup preflight,
     // never an automatic capture cadence or background polling loop.
   }
