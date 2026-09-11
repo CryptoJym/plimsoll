@@ -1,3 +1,4 @@
+import path from "node:path";
 import type { DataMode } from "../../shared/src/index";
 
 const DEFAULT_PORT = 48271;
@@ -10,6 +11,8 @@ export type ToolConfigOptions = {
   pnpmCommand?: string;
   /** Absolute curl executable used by the managed Grok command. */
   grokCurlCommand?: string;
+  /** Absolute managed curl header file used by the managed Grok command. */
+  grokHeaderFile?: string;
   /**
    * Issue 0056 (#104): Plimsoll-local producer credentials. When provided,
    * generated configs bind each tool's exporter/hook traffic to its own
@@ -46,16 +49,15 @@ function tomlString(value: string) {
 function hookForwardCommand(options: ToolConfigOptions, source: "claude-code" | "codex" | "grok") {
   // curl into the local receiver keeps per-event overhead at ~10ms; spawning
   // pnpm/node per hook event costs 1-2s per tool call across the whole fleet.
-  const token = source === "grok" ? options.grokProducerToken : options.codexProducerToken;
+  const token = options.codexProducerToken;
   const curlCommand = source === "grok"
     ? shellQuote(options.grokCurlCommand ?? "/usr/bin/curl")
     : "curl";
-  if (source === "grok" && token) {
-    if (!/^[A-Za-z0-9_-]{43}$/.test(token)) {
-      throw new Error("Grok producer token must be a 43-character URL-safe value.");
+  if (source === "grok") {
+    if (!options.grokHeaderFile || !path.isAbsolute(options.grokHeaderFile)) {
+      throw new Error("Grok managed header file must be an absolute path.");
     }
-    const header = shellQuote(`x-plimsoll-token: ${token}`);
-    return `{ printf '%s\\n' ${header} | ${curlCommand} -s --max-time 2 -X POST -H 'Content-Type: application/json' -H @/dev/fd/3 --data-binary @- http://127.0.0.1:${port(options)}/hooks/grok 3<&0 0<&4; } 4<&0 || true`;
+    return `${curlCommand} -s --max-time 2 -X POST -H 'Content-Type: application/json' -H ${shellQuote(`@${options.grokHeaderFile}`)} --data-binary @- http://127.0.0.1:${port(options)}/hooks/grok || true`;
   }
   const tokenHeader = token
     ? ` -H ${shellQuote(`x-plimsoll-token: ${token}`)}`
@@ -239,6 +241,15 @@ export function generateGrokHookSettings(options: ToolConfigOptions) {
   };
 }
 
+/** Curl header file kept separate so Grok's /bin/sh -c argv is secret-free. */
+export function generateGrokHookHeader(options: ToolConfigOptions) {
+  assertSupportedDataMode(options);
+  if (!options.grokProducerToken || !/^[A-Za-z0-9_-]{43}$/.test(options.grokProducerToken)) {
+    throw new Error("Grok producer token must be a 43-character URL-safe value.");
+  }
+  return `x-plimsoll-token: ${options.grokProducerToken}\n`;
+}
+
 export function generateSetupInstructions(options: ToolConfigOptions) {
   assertSupportedDataMode(options);
 
@@ -249,6 +260,7 @@ export function generateSetupInstructions(options: ToolConfigOptions) {
       "~/.codex/config.toml, project .codex/config.toml, or managed requirements.toml with managed_dir",
     geminiCliSettingsPath: "~/.gemini/settings.json or project .gemini/settings.json",
     grokHookSettingsPath: "${GROK_HOME:-~/.grok}/hooks/plimsoll.json",
+    grokHookHeaderPath: "${GROK_HOME:-~/.grok}/hooks/plimsoll.headers",
     collectorStartCommand: `${shellQuote(options.pnpmCommand ?? "pnpm")} --dir ${shellQuote(options.repoRoot)} collector start`,
     collectorDoctorCommand: `${shellQuote(options.pnpmCommand ?? "pnpm")} --dir ${shellQuote(options.repoRoot)} collector doctor`,
     privacyDefaults: {

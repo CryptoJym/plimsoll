@@ -917,9 +917,11 @@ const GROK_MANAGED_EVENTS = ["UserPromptSubmit", "PostToolUse", "Stop"] as const
 const LEGACY_GROK_COMMAND_PATTERN = /^if \[ -n "\$\{GROK_HOOK_EVENT:-\}" \]; then curl -s --max-time 2 -X POST -H 'Content-Type: application\/json' -H 'x-plimsoll-source: grok'(?: -H 'x-plimsoll-token: [A-Za-z0-9_-]{43}')? --data-binary @- http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/hooks\/grok \|\| true; fi$/;
 const VALUE_BLIND_GROK_COMMAND_PATTERN = /^if \[ -n "\$\{GROK_HOOK_EVENT:-\}" \]; then (?:[a-zA-Z0-9_./:@=-]+|'(?:[^']|'\\'')*') --dir (?:[a-zA-Z0-9_./:@=-]+|'(?:[^']|'\\'')*') collector forward-hook-http grok \|\| true; fi$/;
 const GROK_SHELL_WORD_PATTERN = String.raw`(?:[a-zA-Z0-9_./:@=-]+|'(?:[^']|'\\'')*')`;
+const GROK_HEADER_FILE_WORD_PATTERN = String.raw`(?:@[a-zA-Z0-9_./:@=-]+|'@(?:[^']|'\\'')*')`;
 const DIRECT_GROK_COMMAND_PATTERN = new RegExp(
   String.raw`^if \[ -n "\$\{GROK_HOOK_EVENT:-\}" \]; then (?:` +
     String.raw`\{ printf '%s\\n' 'x-plimsoll-token: [A-Za-z0-9_-]{43}' \| ${GROK_SHELL_WORD_PATTERN} -s --max-time 2 -X POST -H 'Content-Type: application/json' -H @/dev/fd/3 --data-binary @- http://127\.0\.0\.1:[1-9][0-9]{0,4}/hooks/grok 3<&0 0<&4; \} 4<&0 \|\| true` +
+    String.raw`|${GROK_SHELL_WORD_PATTERN} -s --max-time 2 -X POST -H 'Content-Type: application/json' -H ${GROK_HEADER_FILE_WORD_PATTERN} --data-binary @- http://127\.0\.0\.1:[1-9][0-9]{0,4}/hooks/grok \|\| true` +
     String.raw`|${GROK_SHELL_WORD_PATTERN} -s --max-time 2 -X POST -H 'Content-Type: application/json' --data-binary @- http://127\.0\.0\.1:[1-9][0-9]{0,4}/hooks/grok \|\| true); fi$`,
 );
 
@@ -952,11 +954,17 @@ function isManagedGrokDocument(value: unknown) {
   });
 }
 
-export type GrokHookCommandDiagnostic = {
-  ok: false;
-  code: "grok_hook_command_unresolvable";
-  reason: "relative" | "missing" | "not_executable";
-};
+export type GrokHookCommandDiagnostic =
+  | {
+      ok: false;
+      code: "grok_hook_command_unresolvable";
+      reason: "relative" | "missing" | "not_executable";
+    }
+  | {
+      ok: false;
+      code: "grok_hook_header_file_unresolvable";
+      reason: "missing_reference" | "relative" | "missing" | "not_private" | "inconsistent";
+    };
 
 function unquoteGrokShellWord(word: string) {
   return word.startsWith("'")
@@ -970,6 +978,14 @@ function managedGrokExecutable(command: string) {
   const legacy = command.match(new RegExp(String.raw`then (${GROK_SHELL_WORD_PATTERN}) -s`));
   const word = direct?.[1] ?? forwarded?.[1] ?? legacy?.[1];
   return word ? unquoteGrokShellWord(word) : undefined;
+}
+
+function managedGrokHeaderFile(command: string) {
+  const match = command.match(new RegExp(
+    String.raw` -H (${GROK_SHELL_WORD_PATTERN}) --data-binary @-`,
+  ));
+  const word = match?.[1] ? unquoteGrokShellWord(match[1]) : undefined;
+  return word?.startsWith("@") ? word.slice(1) : undefined;
 }
 
 /** Read-only diagnostic for the executable owned by a recognized Grok hook fragment. */
@@ -998,6 +1014,29 @@ export function diagnoseManagedGrokHookCommand(file: string): GrokHookCommandDia
         reason: code === "ENOENT" ? "missing" : "not_executable",
       };
     }
+  }
+  const headerFiles = hookCommands(document).map(managedGrokHeaderFile);
+  if (headerFiles.some((file) => file === undefined)) {
+    return { ok: false, code: "grok_hook_header_file_unresolvable", reason: "missing_reference" };
+  }
+  if (headerFiles.some((file) => !path.isAbsolute(file!))) {
+    return { ok: false, code: "grok_hook_header_file_unresolvable", reason: "relative" };
+  }
+  if (new Set(headerFiles).size !== 1) {
+    return { ok: false, code: "grok_hook_header_file_unresolvable", reason: "inconsistent" };
+  }
+  const headerFile = headerFiles[0]!;
+  try {
+    const stat = fs.lstatSync(headerFile);
+    if (stat.isSymbolicLink() || !stat.isFile() || (stat.mode & 0o777) !== 0o600) {
+      return { ok: false, code: "grok_hook_header_file_unresolvable", reason: "not_private" };
+    }
+  } catch (error) {
+    return {
+      ok: false,
+      code: "grok_hook_header_file_unresolvable",
+      reason: (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "not_private",
+    };
   }
   return null;
 }
@@ -1053,6 +1092,53 @@ export function applyGrokHookFile(
     }
     const next = `${JSON.stringify(generated, null, 2)}\n`;
     const backupPath = writeClaudePlan(snapshot, current, next, options.transactionHooks, 0o600);
+    return { path: file, changed: true, changes, plan, backupPath };
+  } catch (error) {
+    if (error instanceof ClaudeConfigError) {
+      throw new Error(error.message.replace(/^CLAUDE_CONFIG_/, "GROK_CONFIG_"));
+    }
+    throw error;
+  }
+}
+
+const GROK_MANAGED_HEADER_PATTERN = /^x-plimsoll-token: [A-Za-z0-9_-]{43}\n$/;
+
+/** Reconcile the private curl header consumed by the managed Grok hook. */
+export function applyGrokHookHeaderFile(
+  file: string,
+  generated: string,
+  options: ClaudeApplyOptions = {},
+): ApplyResult {
+  try {
+    if (!GROK_MANAGED_HEADER_PATTERN.test(generated)) {
+      throw new Error(`${file}: generated Grok header file is invalid.`);
+    }
+    const { snapshot, current } = readClaudePreimage(file);
+    if (snapshot.exists && !GROK_MANAGED_HEADER_PATTERN.test(current)) {
+      return {
+        path: file,
+        changed: false,
+        changes: [],
+        plan: [],
+        conflict: `${file}: existing file is not a Plimsoll-managed Grok header file; refusing this target.`,
+      };
+    }
+    const plan: ApplyPlanEntry[] = [{
+      key: "grok.headers.token",
+      action: !snapshot.exists ? "added" : current === generated ? "unchanged" : "updated",
+    }];
+    if (snapshot.exists && snapshot.leaf && (snapshot.leaf.mode & 0o777) !== 0o600) {
+      plan.push({ key: "grok.headers.fileMode", action: "updated" });
+    }
+    const changes = plan
+      .filter((entry) => entry.action !== "unchanged")
+      .map((entry) => `${entry.key}.reconcile`);
+    if (changes.length === 0 || options.dryRun) {
+      if (snapshot.exists && snapshot.leaf) assertVisibleClaudeContent(snapshot, snapshot.leaf, current);
+      else assertStableClaudePath(snapshot);
+      return { path: file, changed: changes.length > 0, changes, plan };
+    }
+    const backupPath = writeClaudePlan(snapshot, current, generated, options.transactionHooks, 0o600);
     return { path: file, changed: true, changes, plan, backupPath };
   } catch (error) {
     if (error instanceof ClaudeConfigError) {

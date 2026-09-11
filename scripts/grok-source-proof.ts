@@ -12,8 +12,10 @@ import { Readable } from "node:stream";
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 import {
   applyGrokHookFile,
+  diagnoseManagedGrokHookCommand,
   generateGrokHookSettings,
 } from "../packages/collector-config/src/index";
+import * as collectorConfigModule from "../packages/collector-config/src/index";
 import {
   HttpBoundaryRejection,
   assertHookSource,
@@ -136,19 +138,51 @@ async function main() {
     const commandAuth = loadOrCreateLocalIngestAuth(path.join(sandbox, "command-auth"));
     const token = commandAuth.grokProducer;
     assert.ok(token, "current fixture auth must include the Grok producer audience");
+    const headerApi = collectorConfigModule as typeof collectorConfigModule & {
+      applyGrokHookHeaderFile?: (file: string, generated: string, options?: { dryRun?: boolean }) => {
+        path: string;
+        changed: boolean;
+        changes: string[];
+        plan?: Array<{ key: string; action: string }>;
+        backupPath?: string;
+        conflict?: string;
+      };
+      generateGrokHookHeader?: (options: { repoRoot: string; grokProducerToken?: string }) => string;
+    };
+    check(
+      "grok_managed_header_file_api_is_available",
+      typeof headerApi.applyGrokHookHeaderFile === "function" &&
+        typeof headerApi.generateGrokHookHeader === "function",
+    );
+    const headerFile = path.join(sandbox, ".grok", "hooks", "plimsoll.headers");
+    const generatedHeader = headerApi.generateGrokHookHeader!({
+      repoRoot: "/synthetic/plimsoll",
+      grokProducerToken: token,
+    });
+    const headerPreview = headerApi.applyGrokHookHeaderFile!(headerFile, generatedHeader, { dryRun: true });
+    check(
+      "grok_header_fresh_dry_run_reports_its_own_target_without_writing",
+      headerPreview.changed && headerPreview.path === headerFile && !fs.existsSync(headerFile) &&
+        headerPreview.plan?.length === 1 && headerPreview.plan[0]?.key === "grok.headers.token",
+      { changed: headerPreview.changed, path: headerPreview.path, plan: headerPreview.plan },
+    );
+    const headerApplied = headerApi.applyGrokHookHeaderFile!(headerFile, generatedHeader);
+    check(
+      "grok_header_fresh_apply_is_mode_0600_and_contains_the_only_command_secret",
+      headerApplied.changed && !headerApplied.backupPath &&
+        (fs.statSync(headerFile).mode & 0o777) === 0o600 &&
+        fs.readFileSync(headerFile, "utf8") === `x-plimsoll-token: ${token}\n`,
+      { changed: headerApplied.changed, mode: fs.statSync(headerFile).mode & 0o777 },
+    );
     const fakeBin = path.join(sandbox, "fake-bin");
     const fakeCurl = path.join(fakeBin, "curl");
     const childArgvFile = path.join(sandbox, "hook-child-argv.txt");
-    const headerDigestFile = path.join(sandbox, "hook-header-digest.txt");
     fs.mkdirSync(fakeBin, { mode: 0o700 });
     fs.writeFileSync(
       fakeCurl,
       `#!/bin/sh
 printf '%s\\n' "$@" > "$PLIMSOLL_FAKE_ARGV"
-exec 4<&0
-IFS= read -r header <&3
-printf '%s' "$header" | /usr/bin/shasum -a 256 > "$PLIMSOLL_FAKE_HEADER_DIGEST"
-printf '%s\\n' "$header" | /usr/bin/curl "$@" 3<&0 0<&4
+exec /usr/bin/curl "$@"
 `,
       { mode: 0o700 },
     );
@@ -166,6 +200,7 @@ printf '%s\\n' "$header" | /usr/bin/curl "$@" 3<&0 0<&4
       dataMode: "metadata",
       grokProducerToken: token,
       grokCurlCommand: fakeCurl,
+      grokHeaderFile: headerFile,
     });
     const events = Object.keys(generated.hooks).sort();
     const commands = Object.values(generated.hooks)
@@ -178,8 +213,9 @@ printf '%s\\n' "$header" | /usr/bin/curl "$@" 3<&0 0<&4
         commands.length === 3 && commands.every((command) =>
           command.includes("GROK_HOOK_EVENT") &&
           command.includes(`http://127.0.0.1:${commandPort}/hooks/grok`) &&
-          command.includes("3<&0 0<&4") &&
-          command.includes("4<&0 || true") &&
+          command.includes(`-H @${headerFile}`) &&
+          command.includes("|| true") &&
+          !command.includes(token) &&
           !command.includes("pnpm") &&
           !command.includes("--dir") &&
           !command.includes("/synthetic/plimsoll")),
@@ -195,33 +231,67 @@ printf '%s\\n' "$header" | /usr/bin/curl "$@" 3<&0 0<&4
       GROK_HOOK_EVENT: "UserPromptSubmit",
       PATH: "/usr/bin:/bin",
       PLIMSOLL_FAKE_ARGV: childArgvFile,
-      PLIMSOLL_FAKE_HEADER_DIGEST: headerDigestFile,
     });
     const childArgv = fs.existsSync(childArgvFile) ? fs.readFileSync(childArgvFile, "utf8") : "";
-    const headerDigest = fs.existsSync(headerDigestFile)
-      ? fs.readFileSync(headerDigestFile, "utf8").trim().split(/\s+/)[0]
-      : "";
+    const headerBytes = fs.readFileSync(headerFile);
     const admitted = commandBuffer.database.prepare(
       "select source, event_type as eventType from buffered_events",
     ).get() as { source?: string; eventType?: string } | undefined;
     check(
       "grok_managed_hook_runs_in_posix_sh_without_pnpm_and_keeps_token_out_of_curl_argv",
-      hookExecution.status === 0 && commands.every((command) => command.includes(token)) &&
+      hookExecution.status === 0 && commands.every((command) => !command.includes(token)) &&
+        !JSON.stringify(["/bin/sh", "-c", commands[0] ?? ""]).includes(token) &&
         !childArgv.includes(token) && !hookExecution.stdout.includes(token) &&
         !hookExecution.stderr.includes(token) &&
-        headerDigest === sha256(`x-plimsoll-token: ${token}`) &&
+        headerBytes.equals(Buffer.from(`x-plimsoll-token: ${token}\n`)) &&
+        (fs.statSync(headerFile).mode & 0o777) === 0o600 &&
         admitted?.source === "grok" && admitted.eventType === "user_prompt_submit",
       {
         status: hookExecution.status,
         shell: "/bin/sh -c",
         pathHasPnpm: false,
         commandUsesAbsoluteExecutable: commands.every((command) => command.includes(fakeCurl)),
+        commandTokenFree: commands.every((command) => !command.includes(token)),
+        shellArgvTokenFree: !JSON.stringify(["/bin/sh", "-c", commands[0] ?? ""]).includes(token),
         childArgvTokenFree: !childArgv.includes(token),
         stdoutTokenFree: !hookExecution.stdout.includes(token),
         stderrTokenFree: !hookExecution.stderr.includes(token),
-        headerDigestMatched: headerDigest === sha256(`x-plimsoll-token: ${token}`),
+        headerMode: fs.statSync(headerFile).mode & 0o777,
+        headerSha256: sha256(headerBytes),
         admitted,
       },
+    );
+    const guardEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      PATH: "/usr/bin:/bin",
+      PLIMSOLL_FAKE_ARGV: childArgvFile,
+    };
+    delete guardEnv.GROK_HOOK_EVENT;
+    const bufferedEventCount = () => Number((commandBuffer.database.prepare(
+      "select count(*) as count from buffered_events",
+    ).get() as { count: number }).count);
+    const eventsBeforeGuard = bufferedEventCount();
+    const guardExecution = await runShellCommand(commands[0] ?? "", hookPayload, guardEnv);
+    const eventsAfterGuard = bufferedEventCount();
+    check(
+      "grok_managed_hook_sends_nothing_without_guard_event",
+      guardExecution.status === 0 && eventsAfterGuard === eventsBeforeGuard,
+      { status: guardExecution.status, eventsBeforeGuard, eventsAfterGuard },
+    );
+    await new Promise<void>((resolve, reject) => commandServer.close((error) => error ? reject(error) : resolve()));
+    const downStarted = performance.now();
+    const downExecution = await runShellCommand(commands[0] ?? "", hookPayload, {
+      ...process.env,
+      GROK_HOOK_EVENT: "UserPromptSubmit",
+      PATH: "/usr/bin:/bin",
+      PLIMSOLL_FAKE_ARGV: childArgvFile,
+    });
+    const downElapsedMs = performance.now() - downStarted;
+    commandBuffer.close();
+    check(
+      "grok_managed_hook_exits_zero_with_collector_down",
+      downExecution.status === 0 && downElapsedMs < 2_500,
+      { status: downExecution.status, elapsedMs: downElapsedMs },
     );
 
     const nonExecutableCurl = path.join(sandbox, "non-executable-curl");
@@ -247,7 +317,13 @@ printf '%s\\n' "$header" | /usr/bin/curl "$@" 3<&0 0<&4
           dataMode: "metadata",
           grokProducerToken: token,
           grokCurlCommand: fixture.executable,
+          grokHeaderFile: path.join(fixtureGrokHome, "hooks", "plimsoll.headers"),
         }), null, 2)}\n`,
+        { mode: 0o600 },
+      );
+      fs.writeFileSync(
+        path.join(fixtureGrokHome, "hooks", "plimsoll.headers"),
+        `x-plimsoll-token: ${token}\n`,
         { mode: 0o600 },
       );
       fs.writeFileSync(
@@ -282,8 +358,6 @@ printf '%s\\n' "$header" | /usr/bin/curl "$@" 3<&0 0<&4
           sha256(fs.readFileSync(path.join(fixturePlimsoll, "collector.config.json"))) === configDigest,
       });
     }
-    await new Promise<void>((resolve, reject) => commandServer.close((error) => error ? reject(error) : resolve()));
-    commandBuffer.close();
     check(
       "doctor_fails_closed_for_relative_missing_and_non_executable_managed_grok_commands",
       unresolvableGrokResults.every((result) =>
@@ -293,6 +367,91 @@ printf '%s\\n' "$header" | /usr/bin/curl "$@" 3<&0 0<&4
         result.readiness === "not_installed" &&
         result.byteReadOnly),
       { results: unresolvableGrokResults },
+    );
+
+    const unresolvableHeaderCases = [
+      { name: "relative", reference: "relative.headers", mode: undefined },
+      { name: "missing", reference: undefined, mode: undefined },
+      { name: "not_private", reference: undefined, mode: 0o644 },
+    ];
+    const unresolvableHeaderResults = [];
+    for (const fixture of unresolvableHeaderCases) {
+      const fixtureHome = path.join(sandbox, `grok-header-${fixture.name}-home`);
+      const fixturePlimsoll = path.join(sandbox, `grok-header-${fixture.name}-plimsoll`);
+      const fixtureGrokHome = path.join(fixtureHome, ".grok");
+      const fixtureHook = path.join(fixtureGrokHome, "hooks", "plimsoll.json");
+      const fixtureHeader = path.join(fixtureGrokHome, "hooks", "plimsoll.headers");
+      const headerReference = fixture.reference ?? fixtureHeader;
+      fs.mkdirSync(path.dirname(fixtureHook), { recursive: true, mode: 0o700 });
+      fs.mkdirSync(fixturePlimsoll, { recursive: true, mode: 0o700 });
+      const fixtureDocument = generateGrokHookSettings({
+        repoRoot: "/synthetic/plimsoll",
+        port: commandPort,
+        dataMode: "metadata",
+        grokCurlCommand: fakeCurl,
+        grokHeaderFile: fixtureHeader,
+      });
+      for (const groups of Object.values(fixtureDocument.hooks)) {
+        for (const group of groups) {
+          for (const hook of group.hooks) {
+            hook.command = hook.command.replace(`@${fixtureHeader}`, `@${headerReference}`);
+          }
+        }
+      }
+      fs.writeFileSync(fixtureHook, `${JSON.stringify(fixtureDocument, null, 2)}\n`, { mode: 0o600 });
+      if (fixture.mode !== undefined) {
+        fs.writeFileSync(fixtureHeader, generatedHeader, { mode: fixture.mode });
+        fs.chmodSync(fixtureHeader, fixture.mode);
+      }
+      const configFile = path.join(fixturePlimsoll, "collector.config.json");
+      fs.writeFileSync(
+        configFile,
+        `${JSON.stringify(collectorConfigSchema.parse({ port: commandPort }), null, 2)}\n`,
+        { mode: 0o600 },
+      );
+      const hookDigest = sha256(fs.readFileSync(fixtureHook));
+      const configDigest = sha256(fs.readFileSync(configFile));
+      const headerDigest = fs.existsSync(fixtureHeader) ? sha256(fs.readFileSync(fixtureHeader)) : undefined;
+      const result = await runCommand(
+        process.execPath,
+        ["--import", loader, cli, "doctor", "--read-only", "--json"],
+        "",
+        {
+          ...process.env,
+          HOME: fixtureHome,
+          GROK_HOME: fixtureGrokHome,
+          PATH: "/usr/bin:/bin",
+          PLIMSOLL_HOME: fixturePlimsoll,
+          PLIMSOLL_COLLECTOR_DOCTOR_TIMEOUT_MS: "200",
+        },
+      );
+      const receipt = JSON.parse(result.stdout) as Record<string, any>;
+      unresolvableHeaderResults.push({
+        name: fixture.name,
+        exitCode: result.status,
+        diagnosticCode: receipt.grokHookCommand?.code,
+        reason: receipt.grokHookCommand?.reason,
+        readiness: receipt.readiness,
+        byteReadOnly:
+          sha256(fs.readFileSync(fixtureHook)) === hookDigest &&
+          sha256(fs.readFileSync(configFile)) === configDigest &&
+          (headerDigest === undefined || sha256(fs.readFileSync(fixtureHeader)) === headerDigest),
+      });
+    }
+    check(
+      "doctor_fails_closed_for_relative_missing_and_non_private_managed_grok_headers",
+      unresolvableHeaderResults.every((result) =>
+        result.exitCode !== 0 &&
+        result.diagnosticCode === "grok_hook_header_file_unresolvable" &&
+        result.reason === result.name &&
+        result.readiness === "not_installed" &&
+        result.byteReadOnly),
+      { results: unresolvableHeaderResults },
+    );
+    check(
+      "doctor_keeps_absent_and_healthy_managed_grok_diagnostics_unchanged",
+      diagnoseManagedGrokHookCommand(path.join(sandbox, "absent-grok", "plimsoll.json")) === null &&
+        diagnoseManagedGrokHookCommand(hookFile) === null,
     );
 
     const beforeForeign = sha256(fs.readFileSync(foreignHook));
@@ -313,11 +472,46 @@ printf '%s\\n' "$header" | /usr/bin/curl "$@" 3<&0 0<&4
       { mode: fs.statSync(hookFile).mode & 0o777, foreignHash: beforeForeign },
     );
     const repeated = applyGrokHookFile(hookFile, generated);
+    const repeatedHeader = headerApi.applyGrokHookHeaderFile!(headerFile, generatedHeader);
     check(
       "grok_reconcile_is_byte_idempotent_without_backup_churn",
-      !repeated.changed && fs.readFileSync(hookFile).equals(firstBytes) &&
+      !repeated.changed && !repeatedHeader.changed && fs.readFileSync(hookFile).equals(firstBytes) &&
         fs.readdirSync(path.dirname(hookFile)).every((name) => !name.includes(".plimsoll-backup-")),
-      { changed: repeated.changed },
+      { hookChanged: repeated.changed, headerChanged: repeatedHeader.changed },
+    );
+
+    const publicHeaderFile = path.join(sandbox, "public-managed", "plimsoll.headers");
+    const priorHeaderBytes = Buffer.from(`x-plimsoll-token: ${"p".repeat(43)}\n`);
+    fs.mkdirSync(path.dirname(publicHeaderFile), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(publicHeaderFile, priorHeaderBytes, { mode: 0o644 });
+    fs.chmodSync(publicHeaderFile, 0o644);
+    const privateHeaderUpdate = headerApi.applyGrokHookHeaderFile!(publicHeaderFile, generatedHeader);
+    const privateHeaderBackup = privateHeaderUpdate.backupPath
+      ? fs.readFileSync(privateHeaderUpdate.backupPath)
+      : Buffer.alloc(0);
+    check(
+      "grok_header_replacement_has_private_target_and_byte_exact_private_backup",
+      privateHeaderUpdate.changed && Boolean(privateHeaderUpdate.backupPath) &&
+        (fs.statSync(publicHeaderFile).mode & 0o777) === 0o600 &&
+        (fs.statSync(privateHeaderUpdate.backupPath!).mode & 0o777) === 0o600 &&
+        privateHeaderBackup.equals(priorHeaderBytes),
+      {
+        targetMode: fs.statSync(publicHeaderFile).mode & 0o777,
+        backupMode: fs.statSync(privateHeaderUpdate.backupPath!).mode & 0o777,
+        backupSha256: sha256(privateHeaderBackup),
+      },
+    );
+    const foreignHeaderFile = path.join(sandbox, "foreign-header", "plimsoll.headers");
+    fs.mkdirSync(path.dirname(foreignHeaderFile), { recursive: true, mode: 0o700 });
+    const foreignHeaderBytes = Buffer.from("Authorization: operator-owned\n");
+    fs.writeFileSync(foreignHeaderFile, foreignHeaderBytes, { mode: 0o600 });
+    const foreignHeaderResult = headerApi.applyGrokHookHeaderFile!(foreignHeaderFile, generatedHeader);
+    check(
+      "grok_foreign_header_file_is_refused_without_mutation_or_backup",
+      !foreignHeaderResult.changed && Boolean(foreignHeaderResult.conflict) &&
+        fs.readFileSync(foreignHeaderFile).equals(foreignHeaderBytes) &&
+        fs.readdirSync(path.dirname(foreignHeaderFile)).length === 1,
+      { changed: foreignHeaderResult.changed, conflict: Boolean(foreignHeaderResult.conflict) },
     );
 
     const publicManagedFile = path.join(sandbox, "public-managed", "plimsoll.json");
@@ -346,6 +540,42 @@ printf '%s\\n' "$header" | /usr/bin/curl "$@" 3<&0 0<&4
         changed: privateUpdate.changed,
         targetMode: fs.statSync(publicManagedFile).mode & 0o777,
         backupMode: privateBackupMode,
+      },
+    );
+
+    const blockedHome = path.join(sandbox, "blocked-setup-home");
+    const blockedGrokHome = path.join(blockedHome, ".grok");
+    const blockedPlimsollHome = path.join(sandbox, "blocked-setup-plimsoll");
+    const blockedHookFile = path.join(blockedGrokHome, "hooks", "plimsoll.json");
+    const blockedHeaderFile = path.join(blockedGrokHome, "hooks", "plimsoll.headers");
+    fs.mkdirSync(path.dirname(blockedHookFile), { recursive: true, mode: 0o700 });
+    const blockedHookBytes = Buffer.from(`${JSON.stringify(priorManaged, null, 2)}\n`);
+    const blockedHeaderBytes = Buffer.from("Authorization: operator-owned\n");
+    fs.writeFileSync(blockedHookFile, blockedHookBytes, { mode: 0o600 });
+    fs.writeFileSync(blockedHeaderFile, blockedHeaderBytes, { mode: 0o600 });
+    const blockedSetup = spawnSync(
+      process.execPath,
+      ["--import", loader, cli, "setup", "--yes"],
+      {
+        cwd: repoRoot,
+        env: {
+          ...process.env,
+          HOME: blockedHome,
+          GROK_HOME: blockedGrokHome,
+          PLIMSOLL_HOME: blockedPlimsollHome,
+        },
+        encoding: "utf8",
+      },
+    );
+    check(
+      "setup_header_refusal_blocks_the_dependent_grok_hook_update",
+      blockedSetup.status === 1 &&
+        fs.readFileSync(blockedHookFile).equals(blockedHookBytes) &&
+        fs.readFileSync(blockedHeaderFile).equals(blockedHeaderBytes),
+      {
+        status: blockedSetup.status,
+        hookUnchanged: fs.readFileSync(blockedHookFile).equals(blockedHookBytes),
+        headerUnchanged: fs.readFileSync(blockedHeaderFile).equals(blockedHeaderBytes),
       },
     );
 
@@ -398,11 +628,14 @@ printf '%s\\n' "$header" | /usr/bin/curl "$@" 3<&0 0<&4
       "setup_dry_run_reports_grok_target_without_creating_any_home",
       drySetup.status === 0 && drySetup.stdout.includes('"status":"setup_dry_run"') &&
         drySetup.stdout.includes('"grok":{"path":') &&
+        drySetup.stdout.includes('"grokHeaders":{"path":') &&
         drySetup.stdout.includes(path.join(dryGrokHome, "hooks", "plimsoll.json")) &&
+        drySetup.stdout.includes(path.join(dryGrokHome, "hooks", "plimsoll.headers")) &&
         !fs.existsSync(dryHome) && !fs.existsSync(dryPlimsollHome) && !fs.existsSync(dryGrokHome),
       {
         status: drySetup.status,
         grokTargetReported: drySetup.stdout.includes('"grok":{"path":'),
+        grokHeaderTargetReported: drySetup.stdout.includes('"grokHeaders":{"path":'),
         homesAbsent: !fs.existsSync(dryHome) && !fs.existsSync(dryPlimsollHome) && !fs.existsSync(dryGrokHome),
       },
     );
