@@ -160,6 +160,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:sqlite-lock
 
+      - name: Prove Codex account assertions and privacy boundary
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:account-assertion
+
       - name: Prove local HTTP trust boundary
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:http-boundary

@@ -2,7 +2,12 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
+import { accountAssertionV1Schema, type AccountAssertionV1 } from "./account-assertion";
 const id=z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
+const legacyAccountSchema=z.object({
+  actorHash: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+  validFrom: z.iso.datetime(),validUntil: z.iso.datetime().nullable(),evidenceRef: id
+}).strict();
 export const captureRootSchema=z.object({
   rootId: id,profileId: id,installationEpochId: id,
   source: z.enum(["codex","claude_code"]),directory: z.string().min(1),
@@ -12,12 +17,13 @@ export const captureRootSchema=z.object({
     companyRef: id.nullable(),attemptId: id,parentAttemptId: id.nullable(),acceptedOutcomeId: id.nullable(),
     validFrom: z.iso.datetime(),validUntil: z.iso.datetime().nullable(),evidenceRef: id,
   }).strict()).max(1000).optional(),
-  account: z.object({
-    actorHash: z.string().regex(/^sha256:[a-f0-9]{64}$/),
-    validFrom: z.iso.datetime(),validUntil: z.iso.datetime().nullable(),evidenceRef: id
-  }).strict().optional(),
+  /** Legacy account rows remain accepted; new enrollments use the additive V1 contract. */
+  account: z.union([legacyAccountSchema,accountAssertionV1Schema]).optional(),
 }).strict();
 export type CaptureRoot=z.infer<typeof captureRootSchema>;
+export type CaptureRootAccount=NonNullable<CaptureRoot["account"]>;
+export { accountAssertionV1Schema };
+export type { AccountAssertionV1 };
 export type CaptureRootCoverage={
   rootId: string;
   profileId: string;
@@ -38,6 +44,9 @@ export function validateCaptureRoots(input: unknown): CaptureRoot[] {
     if(ids.has(root.rootId))
       throw new Error("capture_root_duplicate_id");
     ids.add(root.rootId);
+    if (root.account && "schema" in root.account && root.account.schema === "account-assertion/v1" &&
+        root.account.source !== root.source)
+      throw new Error("capture_account_source_mismatch");
     if(root.account?.validUntil&&Date.parse(root.account.validUntil)<=Date.parse(root.account.validFrom))
       throw new Error("capture_identity_window_invalid");
     for(const binding of root.dispatch??[]) {

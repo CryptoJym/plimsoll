@@ -27,6 +27,12 @@ import { codexReconciliationStatus } from "./codex-reconciliation";
 import { historyCoverageStatus } from "./history-coverage";
 import { captureBaselineStatus } from "./capture-baseline";
 import {
+  accountAssertionStatus,
+  defaultAccountAssertionStatus,
+  formatAccountAssertionStatusLine,
+  formatAccountAssertionStatusRows,
+} from "./account-assertion";
+import {
   HttpBoundaryRejection,
   LOCAL_HTTP_LIMITS,
   asHttpBoundaryRejection,
@@ -238,6 +244,7 @@ export function createCollectorServer(
     const status = read.snapshot.status as Record<string, unknown>;
     const stats = (status.stats ?? {}) as Record<string, unknown>;
     stats.unuploadedCount = delivery?.remainingDelivery ?? null;
+    const accountAssertions = refreshControl ? accountAssertionStatus(buffer.database) : cachedControl?.accountAssertions ?? null;
     Object.assign(status, {
       ok: true,
       runtimeIdentity: options.runtimeIdentity ?? null,
@@ -260,6 +267,12 @@ export function createCollectorServer(
       captureHealth: status.health ?? null,
       historyCoverage,
       captureBaseline: refreshControl ? captureBaselineStatus(buffer.database) : cachedControl?.captureBaseline ?? null,
+      accountAssertions,
+      accountAssertionAdapters: refreshControl ? accountAssertions : cachedControl?.accountAssertionAdapters ?? null,
+      accountAssertionStatusLine: refreshControl ? formatAccountAssertionStatusLine(buffer.database)
+        : cachedControl?.accountAssertionStatusLine ?? null,
+      accountLabelCompatibility:
+        "label account <sha256:hash> remains a local-only display label; it never changes assertions or history",
     });
     const cacheAge = evidenceAge(lastCoherentStatus?.cachedAt);
     const invalidReason = refreshControl ? null : lastStatusRefreshError ??
@@ -301,6 +314,7 @@ export function createCollectorServer(
       };
       return { body, generation: read.snapshot.generation };
     }
+    const accountAssertions = accountAssertionStatus(buffer.database);
     const body: Record<string, unknown> = {
       ok: true,
       runtimeIdentity: options.runtimeIdentity ?? null,
@@ -332,6 +346,11 @@ export function createCollectorServer(
       maintenance: options.maintenanceStatus?.() ?? null,
       historyCoverage: historyCoverageStatus(buffer.database),
       captureBaseline: captureBaselineStatus(buffer.database),
+      accountAssertions,
+      accountAssertionAdapters: accountAssertions,
+      accountAssertionStatusLine: formatAccountAssertionStatusLine(buffer.database),
+      accountLabelCompatibility:
+        "label account <sha256:hash> remains a local-only display label; it never changes assertions or history",
       projection: read.kind === "backfilling" ? read.status : {
         ready: false,
         degraded: true,
@@ -469,6 +488,11 @@ export function createCollectorServer(
             maintenance: options.maintenanceStatus?.() ?? null,
             historyCoverage: null,
             captureBaseline: null,
+            accountAssertions: defaultAccountAssertionStatus(),
+            accountAssertionAdapters: defaultAccountAssertionStatus(),
+            accountAssertionStatusLine: formatAccountAssertionStatusRows(defaultAccountAssertionStatus()),
+            accountLabelCompatibility:
+              "label account <sha256:hash> remains a local-only display label; it never changes assertions or history",
             projection: {
               ready: false,
               degraded: true,

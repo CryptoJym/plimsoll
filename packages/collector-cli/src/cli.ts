@@ -166,6 +166,14 @@ import { runSessionSync, sessionIdsFromBatches } from "./session-sync";
 import { uploadBufferedEvents } from "./upload";
 import { runAttributionRepair, runWorkspaceHistoryUpload } from "./upload-history";
 import {
+  ACCOUNT_ASSERTION_SOURCES,
+  accountAssertionStatus,
+  formatAccountAssertionStatusLine,
+  readAccountAssertionAdapterState,
+  setAccountAssertionAdapterEnabled,
+  type AccountAssertionSource,
+} from "./account-assertion";
+import {
   acquireCollectorStartOwnership,
   classifyProcessIdentity,
   CollectorStartOwnershipError,
@@ -201,6 +209,12 @@ function printHelp() {
 Commands:
   start                 Start the local hook/OTLP receiver in the foreground
   status                Print local buffer and policy status
+  maintenance --disable-account-assertion SOURCE --yes
+                        Toggle one adapter; writes only account assertion state
+  --disable-account-assertion SOURCE
+                        Disable one account assertion adapter (requires --yes)
+  --enable-account-assertion SOURCE
+                        Enable one account assertion adapter (requires --yes)
   join TOKEN|URL        Join a hosted workspace: redeem the admin's single-use
                         token, write sync credentials, verify with a handshake
                         (use --reassign for an explicit workspace change)
@@ -360,6 +374,46 @@ function optionValue(name: string) {
   const index = process.argv.indexOf(name);
   if (index === -1) return undefined;
   return process.argv[index + 1];
+}
+
+function accountAssertionSourceFromArg(value: string | undefined): AccountAssertionSource {
+  const normalized = value?.trim().toLowerCase().replace(/-/g, "_");
+  if (normalized && (ACCOUNT_ASSERTION_SOURCES as readonly string[]).includes(normalized)) {
+    return normalized as AccountAssertionSource;
+  }
+  throw new Error("Expected account assertion source codex, claude_code, or conductor.");
+}
+
+function accountAssertionMutationFromArgs() {
+  const direct = process.argv[2] === "--disable-account-assertion" || process.argv[2] === "--enable-account-assertion" ||
+    process.argv[2]?.startsWith("--disable-account-assertion=") || process.argv[2]?.startsWith("--enable-account-assertion=");
+  const maintenance = process.argv[2] === "maintenance";
+  if (!direct && !maintenance) return null;
+  const inlineDisable = process.argv.findIndex(argument => argument.startsWith("--disable-account-assertion="));
+  const inlineEnable = process.argv.findIndex(argument => argument.startsWith("--enable-account-assertion="));
+  const disableIndex = inlineDisable >= 0 ? inlineDisable : process.argv.indexOf("--disable-account-assertion");
+  const enableIndex = inlineEnable >= 0 ? inlineEnable : process.argv.indexOf("--enable-account-assertion");
+  const actionCount = process.argv.filter(argument => argument === "--disable-account-assertion" ||
+    argument === "--enable-account-assertion" || argument.startsWith("--disable-account-assertion=") ||
+    argument.startsWith("--enable-account-assertion=")).length;
+  if (actionCount > 1) throw new Error("Choose only one account assertion adapter action.");
+  if (disableIndex !== -1 && enableIndex !== -1) throw new Error("Choose only one account assertion adapter action.");
+  const index = disableIndex !== -1 ? disableIndex : enableIndex;
+  if (index === -1) throw new Error("Usage: plimsoll maintenance --disable-account-assertion <source> --yes");
+  const action = process.argv[index] ?? "";
+  const inlineSource = action.includes("=") ? action.slice(action.indexOf("=") + 1) : undefined;
+  const source = accountAssertionSourceFromArg(inlineSource ?? process.argv[index + 1]);
+  if (!inlineSource && process.argv[index + 1]?.startsWith("--")) throw new Error("Account assertion source is required.");
+  const allowed = new Set(["--yes", "--dry-run"]);
+  for (const argument of process.argv.slice(3)) {
+    if (argument === process.argv[index + 1] || argument === action || allowed.has(argument)) continue;
+    if (argument === "--disable-account-assertion" || argument === "--enable-account-assertion") continue;
+    throw new Error(`Unsupported account assertion maintenance option: ${argument}`);
+  }
+  const yes = flag("--yes");
+  const dryRun = flag("--dry-run");
+  if (yes && dryRun) throw new Error("Choose either --yes or --dry-run, not both.");
+  return { enabled: enableIndex !== -1, source, yes, dryRun };
 }
 
 function collectorSourceFromArg(value: string | undefined): ToolSource {
@@ -1546,6 +1600,52 @@ async function main() {
     return;
   }
 
+  const accountAssertionMutation = accountAssertionMutationFromArgs();
+  if (accountAssertionMutation) {
+    if (!accountAssertionMutation.yes && !accountAssertionMutation.dryRun) {
+      throw new Error("Account assertion adapter changes require --yes (or use --dry-run).");
+    }
+    const databasePath = collectorBufferPath();
+    let database: Database.Database | null = null;
+    try {
+      if (accountAssertionMutation.yes) {
+        ensureCollectorHome();
+        database = new Database(databasePath, { timeout: 5_000 });
+        const state = setAccountAssertionAdapterEnabled(database, accountAssertionMutation.source, accountAssertionMutation.enabled);
+        console.log(JSON.stringify({
+          status: "account_assertion_adapter_updated",
+          source: accountAssertionMutation.source,
+          enabled: state.adapters[accountAssertionMutation.source].enabled,
+          stateKey: "account_assertion_adapters_v1",
+        }, null, 2));
+      } else if (fs.existsSync(databasePath)) {
+        database = new Database(databasePath, { readonly: true, timeout: 5_000 });
+        const hasState = Boolean(database.prepare("select 1 from sqlite_master where type='table' and name='maintenance_state'").get());
+        const state = hasState ? readAccountAssertionAdapterState(database) : null;
+        console.log(JSON.stringify({
+          status: "account_assertion_adapter_preview",
+          source: accountAssertionMutation.source,
+          enabled: accountAssertionMutation.enabled,
+          currentEnabled: state?.adapters[accountAssertionMutation.source].enabled ?? true,
+          stateKey: "account_assertion_adapters_v1",
+          dryRun: true,
+        }, null, 2));
+      } else {
+        console.log(JSON.stringify({
+          status: "account_assertion_adapter_preview",
+          source: accountAssertionMutation.source,
+          enabled: accountAssertionMutation.enabled,
+          currentEnabled: true,
+          stateKey: "account_assertion_adapters_v1",
+          dryRun: true,
+        }, null, 2));
+      }
+    } finally {
+      database?.close();
+    }
+    return;
+  }
+
   if (command === "start") {
     cleanupStaleJoinHandshakeDirectories();
     finalizeActivatedPendingJoin();
@@ -2297,6 +2397,7 @@ async function main() {
 
   if (command === "status") {
     const buffer = openBuffer(config);
+    const accountAssertions = accountAssertionStatus(buffer.database);
     const device = readDeviceIdentity();
     const bufferPath = collectorBufferPath();
     const resolvedHome = resolveCollectorHome();
@@ -2348,6 +2449,11 @@ async function main() {
           enrollment: buffer.enrollmentStatus(),
           captureBaseline: captureBaselineStatus(buffer.database),
           automaticCapture: automaticCaptureRuntimeStatus(buffer.database),
+          accountAssertions,
+          accountAssertionAdapters: accountAssertions,
+          accountAssertionStatusLine: formatAccountAssertionStatusLine(buffer.database),
+          accountLabelCompatibility:
+            "label account <sha256:hash> \"<display name>\" remains a local-only compatibility label; it never changes assertions or history",
         },
         null,
         2,
@@ -3336,7 +3442,13 @@ async function main() {
     }
     const buffer = openBuffer(config);
     buffer.setAccountLabel(hash, name);
-    console.log(JSON.stringify({ labeled: true, accountHash: hash, label: name }, null, 2));
+    console.log(JSON.stringify({
+      labeled: true,
+      accountHash: hash,
+      label: name,
+      compatibilityNote:
+        "Account labels are local-only presentation mappings; they never rewrite assertions or event history.",
+    }, null, 2));
     buffer.close();
     return;
   }

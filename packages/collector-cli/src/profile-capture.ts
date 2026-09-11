@@ -1,6 +1,7 @@
 import type { LocalEventBuffer } from "./buffer";
 import type { CollectorConfig } from "./config";
 import { validateCaptureRoots } from "./capture-root-inventory";
+import { accountAssertionV1Schema, activeCodexAccountAssertion } from "./account-assertion";
 import { RolloutTailer } from "./rollout-tailer";
 import { TranscriptTailer } from "./transcript-tailer";
 import { beginAutomaticCaptureBaseline,captureBaselineStatus,completeAutomaticCaptureBaseline } from "./capture-baseline";
@@ -8,7 +9,19 @@ import { beginAutomaticCaptureBaseline,captureBaselineStatus,completeAutomaticCa
  * An explicitly empty provider inventory disables that fallback reader. */
 export function createProfileCapture(buffer: LocalEventBuffer,config: Pick<CollectorConfig,"captureRoots">) {
   const roots=config.captureRoots===undefined? null:validateCaptureRoots(config.captureRoots);
-  const codex=roots?.filter(root => root.source==="codex"),claude=roots?.filter(root => root.source==="claude_code");
+  // Live enrollment persists the assertion beside the binding.  Rehydrate it
+  // into the in-memory root inventory so rollout events and live intervals use
+  // the same window without reading a provider auth store.
+  const hydratedRoots = roots?.map(root => {
+    if (root.source !== "codex") return root;
+    // A persisted binding wins over a stale V1 manifest entry after a
+    // failover. Legacy account objects remain untouched for compatibility.
+    const isVersioned = root.account ? accountAssertionV1Schema.safeParse(root.account).success : false;
+    if (root.account && !isVersioned) return root;
+    const assertion = activeCodexAccountAssertion(buffer.database, root.rootId);
+    return assertion ? { ...root, account: assertion } : root;
+  });
+  const codex=hydratedRoots?.filter(root => root.source==="codex"),claude=hydratedRoots?.filter(root => root.source==="claude_code");
   if(roots!==null) {
     // An explicitly empty provider inventory has no authorized roots to walk.
     // Establish only an absent fence; preserve previous failures/pending work.

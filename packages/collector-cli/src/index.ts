@@ -1,4 +1,5 @@
 export * from "./buffer";
+export * from "./account-assertion";
 export * from "./config";
 export * from "./device-identity";
 export * from "./http-transport";

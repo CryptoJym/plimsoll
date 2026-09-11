@@ -52,6 +52,7 @@
     "proof:maintenance-worker-ready": "tsx scripts/maintenance-worker-ready-proof.ts",
     "proof:startup-wal-self-heal": "tsx scripts/run-proof.ts --direct-node scripts/startup-wal-self-heal-proof.ts",
     "proof:incremental-capture": "tsx scripts/incremental-capture-proof.ts",
+    "proof:account-assertion": "tsx scripts/account-assertion-proof.ts",
     "proof:capture-fairness": "tsx scripts/capture-fairness-proof.ts",
     "proof:capture-budget": "tsx scripts/capture-budget-proof.ts",
     "proof:sqlite-lock": "tsx scripts/sqlite-lock-proof.ts",
