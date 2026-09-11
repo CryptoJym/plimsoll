@@ -257,8 +257,8 @@ export function provisionLiveProducer(options: { home: string; buffer: LocalEven
   const installationEpochId = rotating ? crypto.randomUUID() : (currentWorkspace?.currentInstallationEpochId ?? root.installationEpochId);
   const accountBinding = options.accountBinding;
   const adapterEnabled = accountAssertionAdapterEnabled(buffer.database, "codex");
-  // Missing signed native evidence or the fleet salt means explicit
-  // unallocated enrollment.  Never synthesize identity from credentialId or
+  // Missing signed native evidence or the fleet salt means explicit unbound or
+  // unallocated enrollment. Never synthesize identity from credentialId or
   // routing fields, and never create an installation-local salt.
   let assertion: ReturnType<typeof accountAssertionForBinding> | null = null;
   if (adapterEnabled) {

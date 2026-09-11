@@ -7,6 +7,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
+import Database from "better-sqlite3";
 
 import {
   ACCOUNT_ASSERTION_SALT_FILE,
@@ -17,12 +18,20 @@ import {
 } from "../packages/collector-cli/src/account-assertion";
 import { CLOUD_ACCOUNT_SALT_PATH, syncAccountActorSalt } from "../packages/collector-cli/src/account-salt";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
-import { collectorConfigSchema, collectorHome } from "../packages/collector-cli/src/config";
+import {
+  collectorConfigSchema,
+  collectorHome,
+  reconcileCloudDeviceIdFromIngest,
+  writeCollectorConfigTransactionally,
+} from "../packages/collector-cli/src/config";
 import { performJoin } from "../packages/collector-cli/src/join";
+import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
+import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import { acknowledgingFetch } from "./fixtures/delivery-ack-fixture";
 
 const TENANT_ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const DEVICE_ID = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+const CONFLICTING_DEVICE_ID = "cccccccc-cccc-4ccc-8ccc-cccccccccccc";
 const INSTALL_KEY = "pli_account_salt_proof_install";
 const INGEST_KEY = "account-salt-proof-ingest";
 const SIGNING_SECRET = "account-salt-proof-signing-secret-0123456789";
@@ -60,6 +69,134 @@ async function child(args: string[], env: NodeJS.ProcessEnv) {
   return { exitCode, stdout, stderr };
 }
 
+function startManagedChild(args: string[], env: NodeJS.ProcessEnv) {
+  const proc = spawn(process.execPath, args, { cwd: process.cwd(), env, stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  proc.stdout.setEncoding("utf8");
+  proc.stderr.setEncoding("utf8");
+  proc.stdout.on("data", (chunk: string) => { stdout += chunk; });
+  proc.stderr.on("data", (chunk: string) => { stderr += chunk; });
+  const completion = new Promise<{
+    exitCode: number | null;
+    signal: NodeJS.Signals | null;
+    stdout: string;
+    stderr: string;
+  }>((resolve, reject) => {
+    proc.once("error", reject);
+    proc.once("exit", (exitCode, signal) => resolve({ exitCode, signal, stdout, stderr }));
+  });
+  return { proc, completion };
+}
+
+function startChild(args: string[], env: NodeJS.ProcessEnv) {
+  return startManagedChild(args, env).completion;
+}
+
+const waitState = new Int32Array(new SharedArrayBuffer(4));
+function waitForFile(file: string, timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  while (!fs.existsSync(file) && Date.now() < deadline) Atomics.wait(waitState, 0, 0, 10);
+  return fs.existsSync(file);
+}
+
+function waitForAnyFile(files: string[], timeoutMs: number) {
+  const deadline = Date.now() + timeoutMs;
+  while (!files.some(file => fs.existsSync(file)) && Date.now() < deadline) {
+    Atomics.wait(waitState, 0, 0, 10);
+  }
+  return files.some(file => fs.existsSync(file));
+}
+
+function assertSqliteConfigLockBusy(lockPath: string) {
+  assert.equal(fs.existsSync(lockPath), true, "SQLite config lock database is missing");
+  assert.equal(fs.statSync(lockPath).mode & 0o777, 0o600);
+  const probe = new Database(lockPath, { timeout: 0 });
+  try {
+    probe.pragma("busy_timeout = 0");
+    assert.equal(probe.pragma("journal_mode", { simple: true }), "delete");
+    assert.throws(
+      () => probe.exec("BEGIN IMMEDIATE"),
+      (error: unknown) => (error as { code?: string }).code === "SQLITE_BUSY",
+    );
+  } finally {
+    probe.close();
+  }
+}
+
+async function cloudDeviceIdRaceWorker() {
+  const [home, deviceId, ready, release] = process.argv.slice(3);
+  assert.ok(home && deviceId && ready && release);
+  const configPath = path.join(home, "collector.config.json");
+  const originalRename = fs.renameSync.bind(fs);
+  Object.defineProperty(fs, "renameSync", {
+    configurable: true,
+    value: (oldPath: fs.PathLike, newPath: fs.PathLike) => {
+      if (path.resolve(String(newPath)) === path.resolve(configPath)) {
+        fs.writeFileSync(ready, "ready\n", { flag: "wx", mode: 0o600 });
+        if (!waitForFile(release, 10_000)) throw new Error("cloud_device_id_race_barrier_timeout");
+      }
+      return originalRename(oldPath, newPath);
+    },
+  });
+  try {
+    const config = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
+    const result = reconcileCloudDeviceIdFromIngest(config, deviceId, { homeDir: home });
+    process.stdout.write(`${JSON.stringify({ result })}\n`);
+  } finally {
+    Object.defineProperty(fs, "renameSync", { configurable: true, value: originalRename });
+  }
+}
+
+async function collectorConfigLockHolderWorker() {
+  const [home, ready, release, portText] = process.argv.slice(3);
+  assert.ok(home && ready && release && portText);
+  const configPath = path.join(home, "collector.config.json");
+  const originalRename = fs.renameSync.bind(fs);
+  Object.defineProperty(fs, "renameSync", {
+    configurable: true,
+    value: (oldPath: fs.PathLike, newPath: fs.PathLike) => {
+      if (path.resolve(String(newPath)) === path.resolve(configPath)) {
+        fs.writeFileSync(ready, `${JSON.stringify({ pid: process.pid })}\n`, { flag: "wx", mode: 0o600 });
+        if (!waitForFile(release, 60_000)) throw new Error("config_lock_holder_barrier_timeout");
+      }
+      return originalRename(oldPath, newPath);
+    },
+  });
+  try {
+    const config = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
+    writeCollectorConfigTransactionally({ ...config, port: Number(portText) }, configPath);
+    process.stdout.write(`${JSON.stringify({ result: "written" })}\n`);
+  } finally {
+    Object.defineProperty(fs, "renameSync", { configurable: true, value: originalRename });
+  }
+}
+
+async function collectorConfigQueuedWriterWorker() {
+  const [home, attempted, entered, release, portText] = process.argv.slice(3);
+  assert.ok(home && attempted && entered && release && portText);
+  const configPath = path.join(home, "collector.config.json");
+  const originalRename = fs.renameSync.bind(fs);
+  Object.defineProperty(fs, "renameSync", {
+    configurable: true,
+    value: (oldPath: fs.PathLike, newPath: fs.PathLike) => {
+      if (path.resolve(String(newPath)) === path.resolve(configPath)) {
+        fs.writeFileSync(entered, `${JSON.stringify({ pid: process.pid })}\n`, { flag: "wx", mode: 0o600 });
+        if (!waitForFile(release, 60_000)) throw new Error("config_lock_writer_barrier_timeout");
+      }
+      return originalRename(oldPath, newPath);
+    },
+  });
+  try {
+    const config = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
+    fs.writeFileSync(attempted, "attempted\n", { flag: "wx", mode: 0o600 });
+    writeCollectorConfigTransactionally({ ...config, port: Number(portText) }, configPath);
+    process.stdout.write(`${JSON.stringify({ result: "written" })}\n`);
+  } finally {
+    Object.defineProperty(fs, "renameSync", { configurable: true, value: originalRename });
+  }
+}
+
 async function main() {
   const originalPlimsollHome = process.env.PLIMSOLL_HOME;
   delete process.env.PLIMSOLL_HOME;
@@ -69,6 +206,9 @@ async function main() {
     workspaceId: TENANT_ID, deviceId: DEVICE_ID,
   });
   try {
+    assert.equal(collectorConfigSchema.parse({ cloudDeviceId: DEVICE_ID }).cloudDeviceId, DEVICE_ID);
+    assert.throws(() => collectorConfigSchema.parse({ cloudDeviceId: "dev_not_a_cloud_uuid" }));
+
     const requests: Array<{ url: string; headers: Headers; body: Record<string, unknown> }> = [];
     const fetchSalt = (salt: Buffer, version: string): typeof fetch => async (input, init) => {
       const headers = new Headers(init?.headers);
@@ -79,7 +219,7 @@ async function main() {
     const sync = (home: string, salt = SALT_V1, version = "salt-v1") => syncAccountActorSalt({
       collectorHome: home,
       tenantId: TENANT_ID,
-      deviceId: DEVICE_ID,
+      cloudDeviceId: DEVICE_ID,
       uploadUrl: "https://tenant.example/api/work-intelligence/ingest",
       installKey: INSTALL_KEY,
       ingestKey: INGEST_KEY,
@@ -119,6 +259,26 @@ async function main() {
     assert.deepEqual(readAccountAssertionAdapterState(directLedger.database).salt,
       { tenantId: TENANT_ID, version: "salt-v2" });
 
+    let unboundCalls = 0;
+    const unbound = await syncAccountActorSalt({
+      collectorHome: directA,
+      tenantId: TENANT_ID,
+      cloudDeviceId: undefined,
+      uploadUrl: "https://tenant.example/api/work-intelligence/ingest",
+      installKey: INSTALL_KEY,
+      fetchImpl: async () => {
+        unboundCalls += 1;
+        return response(saltBody());
+      },
+    });
+    assert.deepEqual(unbound, {
+      synced: false,
+      tenantId: TENANT_ID,
+      saltVersion: null,
+      reason: "unbound",
+    });
+    assert.equal(unboundCalls, 0);
+
     // Join fetches exactly once after the authenticated handshake and stores
     // into the canonical collector home, not the caller's OS home.
     const joinHome = privateHome("join-os-home");
@@ -130,6 +290,7 @@ async function main() {
         return response({
           ok: true,
           tenantId: TENANT_ID,
+          deviceId: DEVICE_ID,
           installKey: INSTALL_KEY,
           uploadUrl: "https://tenant.example/api/work-intelligence/ingest",
           accountActorSaltEndpoint: `https://tenant.example${CLOUD_ACCOUNT_SALT_PATH}`,
@@ -151,31 +312,422 @@ async function main() {
     assert.equal(joinRequests.filter(value => value === CLOUD_ACCOUNT_SALT_PATH).length, 1);
     assert.equal(joined.joined && JSON.parse(fs.readFileSync(joined.configPath, "utf8")).accountActorSaltEndpoint,
       `https://tenant.example${CLOUD_ACCOUNT_SALT_PATH}`);
+    const joinedConfig = JSON.parse(fs.readFileSync(joined.joined ? joined.configPath : "", "utf8")) as Record<string, unknown>;
+    assert.equal(joinedConfig.cloudDeviceId, DEVICE_ID);
+    assert.match(String(joinedConfig.deviceId), /^dev_[0-9a-f-]{36}$/i);
+    assert.notEqual(joinedConfig.deviceId, joinedConfig.cloudDeviceId);
     assert.ok(readAccountAssertionSaltForTenant(collectorHome(joinHome), TENANT_ID));
     assert.equal(fs.existsSync(path.join(joinHome, ACCOUNT_ASSERTION_SALT_FILE)), false);
+
+    // Older grants remain valid and do not synthesize a cloud device id.
+    const legacyJoinHome = privateHome("legacy-join-os-home");
+    const legacyJoined = await performJoin({
+      target: "pljt_account-salt-proof-legacy-token",
+      baseUrl: "https://tenant.example",
+      homeDir: legacyJoinHome,
+      temporaryRoot: path.join(legacyJoinHome, "temporary"),
+      fetchImpl: acknowledgingFetch(async (input, init) => {
+        if (new URL(String(input)).pathname.endsWith("/join")) {
+          return response({
+            ok: true,
+            tenantId: TENANT_ID,
+            installKey: INSTALL_KEY,
+            uploadUrl: "https://tenant.example/api/work-intelligence/ingest",
+          }, 201);
+        }
+        const uploaded = JSON.parse(String(init?.body ?? "{}")) as { events?: unknown[] };
+        return response({ ok: true, accepted: uploaded.events?.length ?? 0 });
+      }),
+    });
+    assert.equal(legacyJoined.joined, true);
+    const legacyJoinConfig = JSON.parse(fs.readFileSync(legacyJoined.joined ? legacyJoined.configPath : "", "utf8"));
+    assert.equal(Object.hasOwn(legacyJoinConfig, "cloudDeviceId"), false);
+
+    // A pre-v1.1 config learns the cloud UUID from the first acknowledged
+    // ingest response. Equal echoes do not rewrite it; conflicts preserve the
+    // stored UUID and emit one rate-limited, identifier-free diagnostic.
+    const backfillHome = privateHome("ingest-backfill");
+    process.env.PLIMSOLL_HOME = backfillHome;
+    const backfillConfig = collectorConfigSchema.parse({
+      managed: true,
+      tenantId: TENANT_ID,
+      deviceId: "dev_11111111-1111-4111-8111-111111111111",
+      installKey: INSTALL_KEY,
+      uploadUrl: "https://tenant.example/api/work-intelligence/ingest",
+    });
+    const backfillConfigPath = path.join(backfillHome, "collector.config.json");
+    fs.writeFileSync(backfillConfigPath, `${JSON.stringify(backfillConfig, null, 2)}\n`, { mode: 0o600 });
+    const backfillBuffer = new LocalEventBuffer(path.join(backfillHome, "work-ledger.sqlite"), {
+      workspaceId: TENANT_ID,
+      deviceId: backfillConfig.deviceId,
+      enrollmentNow: () => new Date("2026-09-11T10:59:00.000Z"),
+      delivery: { enabled: true, limits: backfillConfig.delivery },
+    });
+    const appendBackfillEvent = (id: string) => backfillBuffer.append(aiInteractionEventSchema.parse({
+      id,
+      sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      source: "codex",
+      dataMode: "metadata",
+      eventType: "assistant_response",
+      observedAt: "2026-09-11T11:00:00.000Z",
+      actionClass: "other",
+      inputTokens: 1,
+      outputTokens: 1,
+      metadata: { proof: true },
+    }));
+    const echoed = (deviceId: string): typeof fetch => {
+      const acknowledged = acknowledgingFetch(async (_input, init) => {
+        const uploaded = JSON.parse(String(init?.body ?? "{}")) as { events?: unknown[] };
+        return response({ ok: true, accepted: uploaded.events?.length ?? 0, deviceId });
+      });
+      return async (input, init) => {
+        const result = await acknowledged(input, init);
+        assert.equal((await result.clone().json() as Record<string, unknown>).deviceId, deviceId);
+        return result;
+      };
+    };
+    try {
+      appendBackfillEvent("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee1");
+      const firstBackfill = await uploadBufferedEvents(backfillConfig, backfillBuffer, {
+        fetchImpl: echoed(DEVICE_ID),
+      });
+      assert.equal(firstBackfill.uploadedEvents, 1);
+      assert.equal(JSON.parse(fs.readFileSync(backfillConfigPath, "utf8")).cloudDeviceId, DEVICE_ID);
+      assert.equal(JSON.stringify(firstBackfill.response).includes(DEVICE_ID), false);
+      const afterFirst = fs.statSync(backfillConfigPath, { bigint: true });
+
+      appendBackfillEvent("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee2");
+      await uploadBufferedEvents(backfillConfig, backfillBuffer, { fetchImpl: echoed(DEVICE_ID) });
+      const afterEqual = fs.statSync(backfillConfigPath, { bigint: true });
+      assert.equal(afterEqual.ino, afterFirst.ino);
+      assert.equal(afterEqual.mtimeNs, afterFirst.mtimeNs);
+
+      const diagnostics: string[] = [];
+      const originalWarn = console.warn;
+      console.warn = (...values: unknown[]) => { diagnostics.push(values.map(String).join(" ")); };
+      try {
+        for (const suffix of ["3", "4"]) {
+          appendBackfillEvent(`eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee${suffix}`);
+          await uploadBufferedEvents(backfillConfig, backfillBuffer, {
+            fetchImpl: echoed(CONFLICTING_DEVICE_ID),
+          });
+        }
+      } finally {
+        console.warn = originalWarn;
+      }
+      assert.equal(JSON.parse(fs.readFileSync(backfillConfigPath, "utf8")).cloudDeviceId, DEVICE_ID);
+      assert.deepEqual(diagnostics, [JSON.stringify({ status: "cloud_device_id_conflict" })]);
+      assert.equal(diagnostics[0].includes(DEVICE_ID), false);
+      assert.equal(diagnostics[0].includes(CONFLICTING_DEVICE_ID), false);
+      const afterConflict = fs.statSync(backfillConfigPath, { bigint: true });
+      assert.equal(afterConflict.ino, afterFirst.ino);
+      assert.equal(afterConflict.mtimeNs, afterFirst.mtimeNs);
+    } finally {
+      backfillBuffer.close();
+      delete process.env.PLIMSOLL_HOME;
+    }
+
+    // A successfully acknowledged delivery stays acknowledged even if the
+    // local config reconciliation must be deferred. It is neither retried nor
+    // allowed to open the remote-contract circuit.
+    const deferredHome = privateHome("ingest-reconcile-deferred");
+    const deferredConfig = collectorConfigSchema.parse({ ...backfillConfig });
+    delete deferredConfig.cloudDeviceId;
+    fs.writeFileSync(
+      path.join(deferredHome, "collector.config.json"),
+      `${JSON.stringify(deferredConfig, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+    const deferredBuffer = new LocalEventBuffer(path.join(deferredHome, "work-ledger.sqlite"), {
+      workspaceId: TENANT_ID,
+      deviceId: deferredConfig.deviceId,
+      enrollmentNow: () => new Date("2026-09-11T11:04:00.000Z"),
+      delivery: { enabled: true, limits: deferredConfig.delivery },
+    });
+    deferredBuffer.append(aiInteractionEventSchema.parse({
+      id: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeee5",
+      sessionId: "dddddddd-dddd-4ddd-8ddd-dddddddddddd",
+      source: "codex",
+      dataMode: "metadata",
+      eventType: "assistant_response",
+      observedAt: "2026-09-11T11:05:00.000Z",
+      actionClass: "other",
+      inputTokens: 1,
+      outputTokens: 1,
+      metadata: { proof: true },
+    }));
+    const deferredDiagnostics: string[] = [];
+    const deferredOriginalWarn = console.warn;
+    let deferredFetchCalls = 0;
+    process.env.PLIMSOLL_HOME = deferredHome;
+    console.warn = (...values: unknown[]) => { deferredDiagnostics.push(values.map(String).join(" ")); };
+    try {
+      const deferredFetch = acknowledgingFetch(async (_input, init) => {
+        deferredFetchCalls += 1;
+        process.env.PLIMSOLL_HOME = "relative-home-that-forces-reconcile-failure";
+        const uploaded = JSON.parse(String(init?.body ?? "{}")) as { events?: unknown[] };
+        return response({ ok: true, accepted: uploaded.events?.length ?? 0, deviceId: DEVICE_ID });
+      });
+      const deferred = await uploadBufferedEvents(deferredConfig, deferredBuffer, {
+        fetchImpl: deferredFetch,
+      });
+      process.env.PLIMSOLL_HOME = deferredHome;
+      assert.equal(deferred.uploadedEvents, 1);
+      assert.equal(deferred.remainingDelivery, 0);
+      assert.equal("circuit" in deferred.delivery && deferred.delivery.circuit, "none");
+      assert.equal(deferredBuffer.delivery.status().circuit.kind, "none");
+      const noResend = await uploadBufferedEvents(deferredConfig, deferredBuffer, {
+        fetchImpl: deferredFetch,
+      });
+      assert.equal(noResend.uploadedEvents, 0);
+      assert.equal(noResend.delivery.attempts, 0);
+      assert.equal(deferredFetchCalls, 1);
+      assert.deepEqual(deferredDiagnostics, [JSON.stringify({ status: "cloud_device_id_reconcile_deferred" })]);
+      assert.equal(deferredDiagnostics[0].includes(DEVICE_ID), false);
+    } finally {
+      process.env.PLIMSOLL_HOME = deferredHome;
+      console.warn = deferredOriginalWarn;
+      deferredBuffer.close();
+      delete process.env.PLIMSOLL_HOME;
+    }
+
+    const tsx = path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
+    const script = path.join(process.cwd(), "scripts", "account-salt-proof.ts");
+
+    // A killed holder releases the kernel-owned SQLite lock. Both a subsequent
+    // writer and ingest reconciliation proceed without deleting lock state.
+    const killedHolderHome = privateHome("config-lock-killed-holder");
+    const killedHolderConfigPath = path.join(killedHolderHome, "collector.config.json");
+    const killedHolderReady = path.join(killedHolderHome, "holder-ready");
+    const killedHolderRelease = path.join(killedHolderHome, "holder-release");
+    const killedHolderSeed = { ...backfillConfig };
+    delete killedHolderSeed.cloudDeviceId;
+    fs.writeFileSync(
+      killedHolderConfigPath,
+      `${JSON.stringify({ ...killedHolderSeed, port: 4201 }, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+    const killedHolder = startManagedChild([
+      tsx,
+      script,
+      "--collector-config-lock-holder-worker",
+      killedHolderHome,
+      killedHolderReady,
+      killedHolderRelease,
+      "4202",
+    ], { ...process.env, PLIMSOLL_HOME: killedHolderHome });
+    assert.equal(waitForFile(killedHolderReady, 10_000), true, "lock holder did not reach rename boundary");
+    const killedHolderLockPath = path.join(killedHolderHome, ".collector.config.json.mutation.lock.sqlite");
+    assertSqliteConfigLockBusy(killedHolderLockPath);
+    const killedHolderPid = (JSON.parse(fs.readFileSync(killedHolderReady, "utf8")) as { pid: number }).pid;
+    assert.ok(Number.isSafeInteger(killedHolderPid) && killedHolderPid > 0);
+    process.kill(killedHolderPid, "SIGKILL");
+    const killedHolderResult = await killedHolder.completion;
+    assert.notEqual(killedHolderResult.exitCode, 0, killedHolderResult.stderr);
+    const killedRecoveryStarted = performance.now();
+    writeCollectorConfigTransactionally(
+      collectorConfigSchema.parse({ ...killedHolderSeed, port: 4203 }),
+      killedHolderConfigPath,
+    );
+    const killedRecoveryMs = performance.now() - killedRecoveryStarted;
+    assert.ok(killedRecoveryMs < 5_000, `killed lock recovery took ${killedRecoveryMs.toFixed(1)}ms`);
+    const killedRecoveredConfig = collectorConfigSchema.parse(
+      JSON.parse(fs.readFileSync(killedHolderConfigPath, "utf8")),
+    );
+    process.env.PLIMSOLL_HOME = killedHolderHome;
+    const killedReconciliationStarted = performance.now();
+    const killedReconciliation = reconcileCloudDeviceIdFromIngest(killedRecoveredConfig, DEVICE_ID);
+    const killedReconciliationMs = performance.now() - killedReconciliationStarted;
+    delete process.env.PLIMSOLL_HOME;
+    assert.equal(killedReconciliation, "stored");
+    assert.equal(JSON.parse(fs.readFileSync(killedHolderConfigPath, "utf8")).cloudDeviceId, DEVICE_ID);
+    assert.ok(killedReconciliationMs < 5_000);
+    assert.equal(fs.existsSync(killedHolderLockPath), true);
+
+    // A live kernel lock blocks the queued writer until holder release.
+    const liveHolderHome = privateHome("config-lock-live-holder");
+    const liveHolderConfigPath = path.join(liveHolderHome, "collector.config.json");
+    const liveHolderReady = path.join(liveHolderHome, "holder-ready");
+    const liveHolderRelease = path.join(liveHolderHome, "holder-release");
+    const liveWaiterAttempted = path.join(liveHolderHome, "waiter-attempted");
+    const liveWaiterEntered = path.join(liveHolderHome, "waiter-entered");
+    const liveWaiterRelease = path.join(liveHolderHome, "waiter-release");
+    fs.writeFileSync(
+      liveHolderConfigPath,
+      `${JSON.stringify({ ...backfillConfig, port: 4210 }, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+    const liveHolder = startChild([
+      tsx, script, "--collector-config-lock-holder-worker", liveHolderHome,
+      liveHolderReady, liveHolderRelease, "4211",
+    ], { ...process.env, PLIMSOLL_HOME: liveHolderHome });
+    assert.equal(waitForFile(liveHolderReady, 10_000), true, "live lock holder did not reach rename boundary");
+    const liveLockPath = path.join(liveHolderHome, ".collector.config.json.mutation.lock.sqlite");
+    assertSqliteConfigLockBusy(liveLockPath);
+    fs.writeFileSync(liveWaiterRelease, "release\n", { flag: "wx", mode: 0o600 });
+    const liveWaiter = startChild([
+      tsx, script, "--collector-config-queued-writer-worker", liveHolderHome,
+      liveWaiterAttempted, liveWaiterEntered, liveWaiterRelease, "4212",
+    ], { ...process.env, PLIMSOLL_HOME: liveHolderHome });
+    assert.equal(waitForFile(liveWaiterAttempted, 10_000), true, "waiter did not attempt live lock");
+    assertSqliteConfigLockBusy(liveLockPath);
+    assert.equal(fs.existsSync(liveWaiterEntered), false);
+    assert.equal(JSON.parse(fs.readFileSync(liveHolderConfigPath, "utf8")).port, 4210);
+    const liveReleaseStarted = performance.now();
+    fs.writeFileSync(liveHolderRelease, "release\n", { flag: "wx", mode: 0o600 });
+    const [liveHolderResult, liveWaiterResult] = await Promise.all([liveHolder, liveWaiter]);
+    const liveReleaseMs = performance.now() - liveReleaseStarted;
+    assert.equal(liveHolderResult.exitCode, 0, liveHolderResult.stderr);
+    assert.equal(liveWaiterResult.exitCode, 0, liveWaiterResult.stderr);
+    assert.ok(liveReleaseMs < 5_000, `queued writer took ${liveReleaseMs.toFixed(1)}ms after release`);
+    assert.equal(JSON.parse(fs.readFileSync(liveHolderConfigPath, "utf8")).port, 4212);
+    assert.equal(fs.existsSync(liveLockPath), true);
+
+    // Three queued processes serialize at the kernel mutex. Each entered
+    // marker is written inside the config critical section at rename time.
+    const tripleHome = privateHome("config-lock-three-writers");
+    const tripleConfigPath = path.join(tripleHome, "collector.config.json");
+    fs.writeFileSync(tripleConfigPath, `${JSON.stringify({ ...backfillConfig, port: 4400 }, null, 2)}\n`, { mode: 0o600 });
+    const tripleEntered = ["a", "b", "c"].map(label => path.join(tripleHome, `entered-${label}`));
+    const tripleAttempted = ["b", "c"].map(label => path.join(tripleHome, `attempted-${label}`));
+    const tripleRelease = ["a", "b", "c"].map(label => path.join(tripleHome, `release-${label}`));
+    const tripleA = startChild([
+      tsx, script, "--collector-config-lock-holder-worker", tripleHome,
+      tripleEntered[0], tripleRelease[0], "4401",
+    ], { ...process.env, PLIMSOLL_HOME: tripleHome });
+    assert.equal(waitForFile(tripleEntered[0], 10_000), true, "first writer did not enter");
+    const tripleQueued = [1, 2].map(index => startChild([
+      tsx, script, "--collector-config-queued-writer-worker", tripleHome,
+      tripleAttempted[index - 1], tripleEntered[index], tripleRelease[index], String(4401 + index),
+    ], { ...process.env, PLIMSOLL_HOME: tripleHome }));
+    assert.equal(tripleAttempted.every(file => waitForFile(file, 10_000)), true);
+    const tripleLockPath = path.join(tripleHome, ".collector.config.json.mutation.lock.sqlite");
+    assertSqliteConfigLockBusy(tripleLockPath);
+    assert.equal(tripleEntered.slice(1).some(file => fs.existsSync(file)), false);
+    assert.equal(JSON.parse(fs.readFileSync(tripleConfigPath, "utf8")).port, 4400);
+    const tripleReleaseStarted = performance.now();
+    fs.writeFileSync(tripleRelease[0], "release\n", { flag: "wx", mode: 0o600 });
+    assert.equal(waitForAnyFile(tripleEntered.slice(1), 10_000), true, "no queued writer entered");
+    const firstQueuedIndex = fs.existsSync(tripleEntered[1]) ? 1 : 2;
+    const lastQueuedIndex = firstQueuedIndex === 1 ? 2 : 1;
+    assert.equal(fs.existsSync(tripleEntered[lastQueuedIndex]), false);
+    assertSqliteConfigLockBusy(tripleLockPath);
+    assert.equal(JSON.parse(fs.readFileSync(tripleConfigPath, "utf8")).port, 4401);
+    fs.writeFileSync(tripleRelease[firstQueuedIndex], "release\n", { flag: "wx", mode: 0o600 });
+    assert.equal(waitForFile(tripleEntered[lastQueuedIndex], 10_000), true, "last writer did not enter");
+    assertSqliteConfigLockBusy(tripleLockPath);
+    assert.equal(
+      JSON.parse(fs.readFileSync(tripleConfigPath, "utf8")).port,
+      4401 + firstQueuedIndex,
+    );
+    fs.writeFileSync(tripleRelease[lastQueuedIndex], "release\n", { flag: "wx", mode: 0o600 });
+    const tripleResults = await Promise.all([tripleA, ...tripleQueued]);
+    const tripleCompletionMs = performance.now() - tripleReleaseStarted;
+    for (const result of tripleResults) assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(JSON.parse(fs.readFileSync(tripleConfigPath, "utf8")).port, 4401 + lastQueuedIndex);
+    assert.ok(tripleCompletionMs < 2 * 5_000);
+
+    // A holder that is not released exercises the bounded timeout path.
+    const timeoutHome = privateHome("config-lock-timeout");
+    const timeoutConfigPath = path.join(timeoutHome, "collector.config.json");
+    const timeoutEntered = path.join(timeoutHome, "holder-entered");
+    const timeoutRelease = path.join(timeoutHome, "holder-release");
+    fs.writeFileSync(timeoutConfigPath, `${JSON.stringify({ ...backfillConfig, port: 4500 }, null, 2)}\n`, { mode: 0o600 });
+    const timeoutHolder = startManagedChild([
+      tsx, script, "--collector-config-lock-holder-worker", timeoutHome,
+      timeoutEntered, timeoutRelease, "4501",
+    ], { ...process.env, PLIMSOLL_HOME: timeoutHome });
+    assert.equal(waitForFile(timeoutEntered, 10_000), true, "timeout holder did not enter");
+    assertSqliteConfigLockBusy(path.join(timeoutHome, ".collector.config.json.mutation.lock.sqlite"));
+    const timeoutStarted = performance.now();
+    assert.throws(
+      () => writeCollectorConfigTransactionally(
+        collectorConfigSchema.parse({ ...backfillConfig, port: 4502 }),
+        timeoutConfigPath,
+      ),
+      /collector_config_mutation_lock_timeout/,
+    );
+    const timeoutMs = performance.now() - timeoutStarted;
+    // SQLite's configured 5 s busy budget may be visited by more than one
+    // rollback-journal lock phase on this VFS; it must remain bounded.
+    assert.ok(timeoutMs >= 4_500 && timeoutMs < 20_000, `lock timeout took ${timeoutMs.toFixed(1)}ms`);
+    assert.equal(JSON.parse(fs.readFileSync(timeoutConfigPath, "utf8")).port, 4500);
+    const timeoutHolderPid = (JSON.parse(fs.readFileSync(timeoutEntered, "utf8")) as { pid: number }).pid;
+    process.kill(timeoutHolderPid, "SIGKILL");
+    const timeoutHolderResult = await timeoutHolder.completion;
+    assert.notEqual(timeoutHolderResult.exitCode, 0, timeoutHolderResult.stderr);
+
+    // Interprocess reconciliation is one mutation: exactly one concurrent
+    // writer stores its echo and the other observes that authoritative value.
+    const raceHome = privateHome("ingest-backfill-race");
+    const raceConfigPath = path.join(raceHome, "collector.config.json");
+    const raceSeed = { ...backfillConfig };
+    delete raceSeed.cloudDeviceId;
+    fs.writeFileSync(raceConfigPath, `${JSON.stringify(raceSeed, null, 2)}\n`, { mode: 0o600 });
+    const raceRelease = path.join(raceHome, "release");
+    const raceReady = [path.join(raceHome, "ready-a"), path.join(raceHome, "ready-b")];
+    const raceValues = [DEVICE_ID, CONFLICTING_DEVICE_ID];
+    const racers = raceValues.map((deviceId, index) => startChild([
+      tsx,
+      script,
+      "--cloud-device-id-race-worker",
+      raceHome,
+      deviceId,
+      raceReady[index],
+      raceRelease,
+    ], { ...process.env, PLIMSOLL_HOME: raceHome }));
+    if (!waitForAnyFile(raceReady, 10_000)) {
+      assert.fail(`race workers did not reach publication: ${JSON.stringify(await Promise.all(racers))}`);
+    }
+    const secondReadyDeadline = Date.now() + 2_000;
+    while (!raceReady.every(file => fs.existsSync(file)) && Date.now() < secondReadyDeadline) {
+      Atomics.wait(waitState, 0, 0, 10);
+    }
+    fs.writeFileSync(raceRelease, "release\n", { flag: "wx", mode: 0o600 });
+    const raceResults = await Promise.all(racers);
+    for (const result of raceResults) assert.equal(result.exitCode, 0, result.stderr);
+    const dispositions = raceResults.map(result =>
+      (JSON.parse(result.stdout) as { result: string }).result,
+    );
+    assert.equal(dispositions.filter(value => value === "stored").length, 1);
+    assert.equal(dispositions.filter(value => value === "conflict").length, 1);
+    const storedIndex = dispositions.indexOf("stored");
+    const finalRaceConfig = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(raceConfigPath, "utf8")));
+    assert.equal(finalRaceConfig.cloudDeviceId, raceValues[storedIndex]);
+    const raceDiagnostics = raceResults.map(result => result.stderr.trim()).filter(Boolean);
+    assert.deepEqual(raceDiagnostics, [JSON.stringify({ status: "cloud_device_id_conflict" })]);
+    assert.equal(raceDiagnostics.some(line => raceValues.some(value => line.includes(value))), false);
+    assert.equal(fs.statSync(raceConfigPath).mode & 0o777, 0o600);
+    assert.equal(fs.readdirSync(raceHome).some(name => name.startsWith(".collector.config-")), false);
+    assert.equal(fs.readdirSync(raceHome).some(name => name.endsWith(".mutation.lock")), false);
 
     // An already joined collector can run the shipped CLI command against the
     // same authenticated channel. The receipt exposes version only.
     const cliHome = privateHome("cli");
     let cliCalls = 0;
+    const cliDeviceIds: unknown[] = [];
     const server = http.createServer((request, result) => {
       cliCalls += 1;
       assert.equal(request.headers["x-plimsoll-install-key"], INSTALL_KEY);
-      request.resume();
-      if (request.url === "/forbidden-account-salt") {
-        result.writeHead(403, { "content-type": "application/json" });
-        result.end(JSON.stringify({ ok: false }));
-        return;
-      }
-      if (request.url === "/unallocated-account-salt") {
-        result.writeHead(404, { "content-type": "application/json" });
-        result.end(JSON.stringify({ ok: false }));
-        return;
-      }
-      result.writeHead(200, { "content-type": "application/json" });
-      result.end(JSON.stringify(request.url === "/mismatched-account-salt"
-        ? { ...saltBody(), tenantId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" }
-        : saltBody()));
+      const chunks: Buffer[] = [];
+      request.on("data", chunk => { chunks.push(Buffer.from(chunk)); });
+      request.on("end", () => {
+        cliDeviceIds.push((JSON.parse(Buffer.concat(chunks).toString("utf8")) as Record<string, unknown>).deviceId);
+        if (request.url === "/forbidden-account-salt") {
+          result.writeHead(403, { "content-type": "application/json" });
+          result.end(JSON.stringify({ ok: false }));
+          return;
+        }
+        if (request.url === "/unallocated-account-salt") {
+          result.writeHead(404, { "content-type": "application/json" });
+          result.end(JSON.stringify({ ok: false }));
+          return;
+        }
+        result.writeHead(200, { "content-type": "application/json" });
+        result.end(JSON.stringify(request.url === "/mismatched-account-salt"
+          ? { ...saltBody(), tenantId: "cccccccc-cccc-4ccc-8ccc-cccccccccccc" }
+          : saltBody()));
+      });
     });
     await new Promise<void>((resolve, reject) => {
       server.once("error", reject);
@@ -184,11 +736,12 @@ async function main() {
     try {
       const address = server.address();
       assert.ok(address && typeof address === "object");
-      const runSyncCommand = async (endpointPath: string) => {
+      const runSyncCommand = async (endpointPath: string, includeCloudDeviceId = true) => {
         const config = collectorConfigSchema.parse({
           managed: true,
           tenantId: TENANT_ID,
-          deviceId: DEVICE_ID,
+          deviceId: "dev_22222222-2222-4222-8222-222222222222",
+          ...(includeCloudDeviceId ? { cloudDeviceId: DEVICE_ID } : {}),
           installKey: INSTALL_KEY,
           uploadUrl: `http://127.0.0.1:${address.port}/api/work-intelligence/ingest`,
           accountActorSaltEndpoint: `http://127.0.0.1:${address.port}${endpointPath}`,
@@ -204,6 +757,7 @@ async function main() {
       assert.equal(run.exitCode, 0, run.stderr);
       const receipt = JSON.parse(run.stdout) as Record<string, unknown>;
       assert.equal(receipt.status, "account_salt_synced");
+      assert.equal(cliDeviceIds[0], DEVICE_ID);
       assert.equal(receipt.saltVersion, "salt-v1");
       assert.equal(run.stdout.includes(SALT_V1.toString("base64")), false);
       assert.equal(run.stderr.includes(SALT_V1.toString("base64")), false);
@@ -221,6 +775,17 @@ async function main() {
       assert.notEqual(mismatched.exitCode, 0);
       assert.equal(JSON.parse(mismatched.stdout).status, "account_salt_refused");
       assert.equal(cliCalls, 4);
+
+      const unboundCli = await runSyncCommand("/must-not-be-called", false);
+      assert.equal(unboundCli.exitCode, 1, unboundCli.stderr);
+      assert.deepEqual(JSON.parse(unboundCli.stdout), {
+        status: "account_salt_device_unbound",
+        tenantId: TENANT_ID,
+        saltVersion: null,
+        synced: false,
+        action: "upload once with delivery enabled, or rejoin",
+      });
+      assert.equal(cliCalls, 4);
     } finally {
       await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     }
@@ -235,8 +800,27 @@ async function main() {
         versionedRotationFailClosed: true,
         joinFetchesOnceAfterHandshake: true,
         syncCommandForJoinedDevice: true,
+        unboundSkipsEndpoint: true,
+        joinPersistsCloudDeviceId: true,
+        legacyJoinLeavesCloudDeviceIdAbsent: true,
+        acknowledgedIngestBackfillsOnce: true,
+        acknowledgedUploadSurvivesDeferredReconciliation: true,
+        conflictingEchoPreservesStoredId: true,
+        conflictDiagnosticRateLimitedAndIdentifierFree: true,
+        killedLockOwnerReleasesWriterAndReconciliation: true,
+        liveLockOwnerRespectedUntilRelease: true,
+        threeConcurrentWritersRemainMutuallyExclusive: true,
+        liveLockTimeoutIsBoundedAndNonMutating: true,
+        concurrentBackfillStoresExactlyOnce: true,
         refusalDistinctFromUnallocated: true,
         saltAbsentFromReceipts: true,
+      },
+      timings: {
+        killedHolderRecoveryMs: Number(killedRecoveryMs.toFixed(1)),
+        killedHolderReconciliationMs: Number(killedReconciliationMs.toFixed(1)),
+        liveReleaseMs: Number(liveReleaseMs.toFixed(1)),
+        tripleCompletionMs: Number(tripleCompletionMs.toFixed(1)),
+        timeoutMs: Number(timeoutMs.toFixed(1)),
       },
     }));
   } finally {
@@ -246,7 +830,15 @@ async function main() {
   }
 }
 
-main().catch(error => {
+const operation = process.argv[2] === "--cloud-device-id-race-worker"
+  ? cloudDeviceIdRaceWorker()
+  : process.argv[2] === "--collector-config-lock-holder-worker"
+    ? collectorConfigLockHolderWorker()
+    : process.argv[2] === "--collector-config-queued-writer-worker"
+      ? collectorConfigQueuedWriterWorker()
+    : main();
+
+operation.catch(error => {
   console.error(error instanceof Error ? error.stack : String(error));
   process.exitCode = 1;
 });

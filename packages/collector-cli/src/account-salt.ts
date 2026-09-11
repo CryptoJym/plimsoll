@@ -20,7 +20,7 @@ export type AccountSaltSyncResult = {
   synced: boolean;
   tenantId: string;
   saltVersion: string | null;
-  reason: "synced" | "unallocated" | "refused";
+  reason: "synced" | "unallocated" | "unbound" | "refused";
 };
 
 function saltBytes(encoded: string) {
@@ -38,7 +38,7 @@ function saltBytes(encoded: string) {
 export async function syncAccountActorSalt(options: {
   collectorHome: string;
   tenantId: string;
-  deviceId: string;
+  cloudDeviceId?: string;
   uploadUrl: string;
   installKey: string;
   ingestKey?: string;
@@ -46,6 +46,9 @@ export async function syncAccountActorSalt(options: {
   fetchImpl?: typeof fetch;
   endpointUrl?: string;
 }): Promise<AccountSaltSyncResult> {
+  if (!options.cloudDeviceId) {
+    return { synced: false, tenantId: options.tenantId, saltVersion: null, reason: "unbound" };
+  }
   const refused = (): AccountSaltSyncResult => ({
     synced: false, tenantId: options.tenantId, saltVersion: null, reason: "refused",
   });
@@ -55,7 +58,8 @@ export async function syncAccountActorSalt(options: {
     const url = options.endpointUrl ? validatedTransportUrl(options.endpointUrl, "account salt endpoint").href :
       new URL(CLOUD_ACCOUNT_SALT_PATH, origin).href;
     if (new URL(url).origin !== origin) throw new Error("account_salt_origin_mismatch");
-    const body = JSON.stringify({ schema: "account-actor-salt-request/v1", tenantId: options.tenantId, deviceId: options.deviceId });
+    const body = JSON.stringify({ schema: "account-actor-salt-request/v1", tenantId: options.tenantId,
+      deviceId: options.cloudDeviceId });
     response = await authenticatedJsonPost({
       url, body, fetchImpl: options.fetchImpl, installKey: options.installKey,
       ingestKey: options.ingestKey, signingSecret: options.signingSecret,

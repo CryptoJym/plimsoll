@@ -1617,16 +1617,22 @@ async function main() {
       throw new Error("Account salt sync requires an active joined workspace.");
     }
     const result = await syncAccountActorSalt({
-      collectorHome: collectorHome(), tenantId: config.tenantId, deviceId: config.deviceId,
+      collectorHome: collectorHome(), tenantId: config.tenantId,
+      cloudDeviceId: config.cloudDeviceId,
       uploadUrl: config.uploadUrl, installKey: config.installKey, ingestKey: config.ingestKey,
       signingSecret: config.uploadSigningSecret,
       endpointUrl: config.accountActorSaltEndpoint,
     });
     const status = result.reason === "synced" ? "account_salt_synced" :
-      result.reason === "unallocated" ? "account_salt_unallocated" : "account_salt_refused";
+      result.reason === "unallocated" ? "account_salt_unallocated" :
+      result.reason === "unbound" ? "account_salt_device_unbound" : "account_salt_refused";
     console.log(JSON.stringify({ status,
-      tenantId: result.tenantId, saltVersion: result.saltVersion, synced: result.synced }, null, 2));
-    if (result.reason === "refused") process.exitCode = 1;
+      tenantId: result.tenantId, saltVersion: result.saltVersion, synced: result.synced,
+      ...(result.reason === "unbound"
+        ? { action: "upload once with delivery enabled, or rejoin" }
+        : {}),
+    }, null, 2));
+    if (result.reason === "refused" || result.reason === "unbound") process.exitCode = 1;
     return;
   }
 
