@@ -2,6 +2,7 @@
 
 /** Adversarial, local-only proof for the Codex account assertion boundary. */
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -118,13 +119,14 @@ async function readNativeCodexAuth(record: Record<string, unknown>, enrolledAt =
   return withNativeCodexAuth(record, () => loadCodexNativeAccountBinding({ enrolledAt }));
 }
 
-function fixture(label: string, options: { salt?: boolean } = {}) {
+function fixture(label: string, options: { salt?: boolean; deviceId?: string } = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), `plimsoll-account-r2-${label}-`));
   fs.chmodSync(home, 0o700);
   let now = FIRST_AT;
+  const deviceId = options.deviceId ?? DEVICE_ID;
   const buffer = new LocalEventBuffer(path.join(home, "work-ledger.sqlite"), {
     workspaceId: TENANT_ID,
-    deviceId: DEVICE_ID,
+    deviceId,
     enrollmentNow: () => new Date(now),
   });
   const root: CaptureRoot = {
@@ -138,7 +140,7 @@ function fixture(label: string, options: { salt?: boolean } = {}) {
   root.directory = fs.realpathSync(root.directory);
   const config = collectorConfigSchema.parse({
     tenantId: TENANT_ID,
-    deviceId: DEVICE_ID,
+    deviceId,
     captureRoots: [root],
   });
   const localAuth = loadOrCreateLocalIngestAuth(home);
@@ -402,6 +404,37 @@ try {
   }));
   assert.equal(disabledEnrollment.accountAssertion, null);
   assert.equal(jwksRequests, requestsBeforeDisabledEnrollment);
+
+  const cliEnrollmentFixture = fixture("cli-enrollment", { deviceId: "dev_cli-proof-device" });
+  opened.push(cliEnrollmentFixture);
+  setAccountAssertionAdapterEnabled(cliEnrollmentFixture.buffer.database, "codex", false, FIRST_AT);
+  fs.writeFileSync(path.join(cliEnrollmentFixture.home, "collector.config.json"),
+    `${JSON.stringify(cliEnrollmentFixture.config, null, 2)}\n`, { mode: 0o600 });
+  const cliEnrollment = spawnSync(process.execPath, [
+    "node_modules/tsx/dist/cli.mjs", "packages/collector-cli/src/cli.ts",
+    "enroll-codex-live-producer",
+    "--producer-id", "cli-proof-producer",
+    "--credential-id", "cli-proof-credential",
+    "--capture-root-id", cliEnrollmentFixture.root.rootId,
+  ], {
+    cwd: process.cwd(),
+    encoding: "utf8",
+    timeout: 30_000,
+    env: { ...process.env, PLIMSOLL_HOME: cliEnrollmentFixture.home,
+      CODEX_HOME: path.join(cliEnrollmentFixture.home, "missing-codex-home") },
+  });
+  assert.equal(cliEnrollment.status, 0, cliEnrollment.stderr);
+  assert.equal(cliEnrollment.stderr, "");
+  assert.deepEqual(JSON.parse(cliEnrollment.stdout), {
+    status: "codex_live_producer_enrolled",
+    producerId: "cli-proof-producer",
+    credentialId: "cli-proof-credential",
+    captureRootId: cliEnrollmentFixture.root.rootId,
+    installationEpochId: JSON.parse(cliEnrollment.stdout).installationEpochId,
+    accountAssertionAttached: false,
+  });
+  assert.match(JSON.parse(cliEnrollment.stdout).installationEpochId,
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i);
 
   const unsalted = fixture("unsalted", { salt: false });
   opened.push(unsalted);
@@ -731,6 +764,8 @@ try {
     disabledNative.idToken, unsaltedNative.idToken, enrollmentA.native.idToken, enrollmentB.native.idToken];
   for (const sentinel of privateSentinels) {
     assert.equal(durableText.includes(sentinel), false);
+    assert.equal(cliEnrollment.stdout.includes(sentinel), false);
+    assert.equal(cliEnrollment.stderr.includes(sentinel), false);
   }
 
   const proof = {
@@ -757,6 +792,7 @@ try {
       canonicalisationBudgetsControlled: true,
       hashOnlyPrivacy: true,
       firstPartyOwnerEnrollment: true,
+      firstPartyCliEnrollment: true,
     },
   };
   const proofOutput = JSON.stringify(proof);
