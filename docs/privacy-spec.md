@@ -68,10 +68,11 @@ names only, never values.
 | 36 | `tool_arguments` |
 | 37 | `tool_input` |
 | 38 | `tool_output` |
-| 39 | `tool_response` |
-| 40 | `user_prompt` |
+| 39 | `tool_result` |
+| 40 | `tool_response` |
+| 41 | `user_prompt` |
 
-Count: **40** — source: `packages/shared/src/schemas.ts :: forbiddenRawContentFieldNames`.
+Count: **41** — source: `packages/shared/src/schemas.ts :: forbiddenRawContentFieldNames`.
 Named sentinel checks enforcing this section:
 
 - `raw_command_and_path_suppressed` — `scripts/signal-fidelity-proof.ts`
@@ -128,10 +129,11 @@ evidence vault implemented (ADR-0004).
 | 30 | `stdin` |
 | 31 | `stdout` |
 | 32 | `tool_arguments` |
-| 33 | `tool_response` |
-| 34 | `user_prompt` |
+| 33 | `tool_result` |
+| 34 | `tool_response` |
+| 35 | `user_prompt` |
 
-Count: **34** — source: `computed from forbiddenRawContentFieldNames minus rawContentCategorySchema`.
+Count: **35** — source: `computed from forbiddenRawContentFieldNames minus rawContentCategorySchema`.
 Named sentinel checks enforcing this section:
 
 - `managed_config_write_rejects_evidence_before_filesystem_write` — `scripts/privacy-mode-proof.ts`
@@ -173,15 +175,16 @@ SHA-256 digest. Example (deterministic):
 | 19 | `workdir` |
 | 20 | `working_directory` |
 | 21 | `workspace_path` |
-| 22 | `user.account_id` |
-| 23 | `user.account_uuid` |
-| 24 | `user.email` |
-| 25 | `user.id` |
-| 26 | `user_email` |
-| 27 | `user_id` |
-| 28 | `username` |
+| 22 | `workspace_root` |
+| 23 | `user.account_id` |
+| 24 | `user.account_uuid` |
+| 25 | `user.email` |
+| 26 | `user.id` |
+| 27 | `user_email` |
+| 28 | `user_id` |
+| 29 | `username` |
 
-Count: **28** — source: `packages/shared/src/policy.ts :: protectedMetadataFieldNames`.
+Count: **29** — source: `packages/shared/src/policy.ts :: protectedMetadataFieldNames`.
 Named sentinel checks enforcing this section:
 
 - `account_email_never_uploaded` — `scripts/signal-fidelity-proof.ts`
@@ -210,7 +213,7 @@ names only). Typed event fields:
 2. `sessionId` — string, optional.
 3. `tenantId` — string, optional.
 4. `actorId` — string, optional — normalized name also appears in `protectedMetadataFieldNames`; inside free-form metadata such keys are value-hashed (see *Collected hashed*), and as a typed field it crosses under the outbound identifier contract.
-5. `source` — enum(anthropic_admin | anthropic_usage | claude_code | codex | gemini_cli | github | openai_usage | manual | unknown), required.
+5. `source` — enum(anthropic_admin | anthropic_usage | claude_code | codex | gemini_cli | grok | github | openai_usage | manual | unknown), required.
 6. `dataMode` — enum(metadata | event_detail | evidence), optional.
 7. `eventType` — enum(session_start | session_stop | user_prompt_submit | assistant_response | tool_use | tool_result | otel_span | usage_rollout | usage_transcript | usage_live | unknown), required.
 8. `observedAt` — string, required.
