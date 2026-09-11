@@ -21,7 +21,10 @@ const require = createRequire(path.resolve("package.json"));
 const Database = require("better-sqlite3");
 const directory = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-sqlite-lock-proof-"));
 const ledgerPath = path.join(directory, "ledger.sqlite");
-const buffer = new LocalEventBuffer(ledgerPath, { databaseBusyTimeoutMs: 900 });
+const buffer = new LocalEventBuffer(ledgerPath, {
+  databaseBusyTimeoutMs: 900,
+  workspaceId: "local",
+});
 const maintenance = buffer.database;
 const capture = new Database(ledgerPath, { timeout: 0 });
 const largePendingRows = 4_096;
@@ -35,7 +38,8 @@ type RemainingStage =
   | "baseline_observation"
   | "capture_inventory"
   | "jsonl_path_migration"
-  | "workspace_binding";
+  | "workspace_binding"
+  | "finance_capture_activity";
 
 try {
   assert.equal(maintenance.pragma("journal_mode", { simple: true }), "wal");
@@ -215,6 +219,14 @@ try {
         return row;
       };
     }
+    if (/from\s+collector_workspace_binding\s+where\s+singleton\s*=\s*1/.test(sql)) {
+      const get = statement.get.bind(statement);
+      (statement as any).get = (...args: any[]) => {
+        const row = get(...args);
+        if (maintenance.inTransaction) competeRemaining("finance_capture_activity");
+        return row;
+      };
+    }
     return statement;
   };
   const projection = buffer.projection as any;
@@ -279,6 +291,13 @@ try {
     );
     probe("jsonl_path_migration", () => ensureJsonlScanState(maintenance));
     probe("workspace_binding", () => buffer.useWorkspace("local"));
+    probe("finance_capture_activity", () => buffer.projection.recordCaptureActivity({
+      source: "codex",
+      lastActivityAt: null,
+      filesToday: 0,
+      discoveryEntries: 0,
+      lastScanAt: new Date().toISOString(),
+    }));
   } finally {
     projection.control = originalControl;
     (maintenance as any).prepare = probePrepare;
@@ -292,6 +311,7 @@ try {
     capture_inventory: null,
     jsonl_path_migration: null,
     workspace_binding: null,
+    finance_capture_activity: null,
   });
   assert.deepEqual(Object.fromEntries(remainingOutcomes), {
     projection: "SQLITE_BUSY",
@@ -301,6 +321,7 @@ try {
     capture_inventory: "SQLITE_BUSY",
     jsonl_path_migration: "SQLITE_BUSY",
     workspace_binding: "SQLITE_BUSY",
+    finance_capture_activity: "SQLITE_BUSY",
   });
   assert.equal(
     deadlineError,
@@ -357,6 +378,7 @@ try {
       captureInventoryWriterClaimedBeforeRead: true,
       jsonlPathMigrationWriterClaimedBeforeRead: true,
       workspaceBindingWriterClaimedBeforeRead: true,
+      financeCaptureActivityWriterClaimedBeforeRead: true,
       deadlineMaintenanceSucceeded: true,
       competingWriterSucceededAfterMaintenance: true,
     },
