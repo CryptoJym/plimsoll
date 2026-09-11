@@ -4,12 +4,12 @@ import {
   ANALYTICAL_METADATA_LIMITS,
   DEFAULT_POLICY,
   admittedCost,
+  admittedHookMetadata,
   GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
   admittedMetadataAttributes,
   actionClassSchema,
   aiInteractionEventSchema,
   canonicalizeSuppressionReceipts,
-  metadataKeyDisposition,
   sanitizeForPolicy,
   suppressionReceiptForAttributeKey,
   usageFieldKeys,
@@ -246,6 +246,10 @@ export function inferSource(payload: Record<string, unknown>, fallback?: ToolSou
     return "gemini_cli";
   }
 
+  if (source?.toLowerCase().includes("grok")) {
+    return "grok";
+  }
+
   return fallback ?? "unknown";
 }
 
@@ -312,7 +316,7 @@ function inferEventType(
   payload: Record<string, unknown>,
   otelNames: string[] = [],
 ): AiInteractionEvent["eventType"] {
-  const rawType = stringField(payload, ["eventType", "event_type", "hook_event_name", "type", "name"]);
+  const rawType = stringField(payload, ["eventType", "event_type", "hookEventName", "hook_event_name", "type", "name"]);
   const otelName = stringField(payload, ["name", "span_name", "body"]);
   const rawClass = classifyEventType(rawType);
   if (rawClass && rawClass !== "otel_span") return rawClass;
@@ -402,13 +406,8 @@ export function normalizeHookPayload(
   // Authority-like aliases were partitioned before this copy. This routine
   // view can contain analytical metadata, never caller claims for transport,
   // tenant, data mode, resolver linkage, event identity/time/type or action.
-  const metadataBase: Record<string, unknown> = { ...topLevelAuthority.metadata };
-  for (const key of Object.keys(metadataBase)) {
-    if (metadataKeyDisposition(key)) delete metadataBase[key];
-  }
-  delete metadataBase.attributes;
-  delete metadataBase.otelAttributes;
-  Object.assign(metadataBase, admittedTopLevel.attributes);
+  const admittedRoutine = admittedHookMetadata(topLevelAuthority.metadata);
+  const metadataBase: Record<string, unknown> = { ...admittedRoutine.attributes };
 
   const metadata = {
     ...metadataBase,
@@ -455,8 +454,8 @@ export function normalizeHookPayload(
     suppressedFields: canonicalizeSuppressionReceipts([
       ...sanitized.evaluation.suppressedFields,
       ...rejectedAttributeReceipts(
-        safe,
-        admittedTopLevel.rejectedKeys.filter((key) => metadataKeyDisposition(key) !== undefined),
+        topLevelAuthority.metadata,
+        admittedRoutine.rejectedKeys,
       ),
       ...rejectedAttributeReceipts(otelSignals.attributes, admittedOtel.rejectedKeys),
       ...admittedNames.rejected,

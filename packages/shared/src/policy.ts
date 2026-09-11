@@ -12,7 +12,10 @@ import {
   isSafeSuppressionSourceKey,
   suppressionReceiptForAttributeKey,
 } from "./suppression-receipt";
-import { isSensitiveMetadataSemanticKey } from "./analytical-metadata";
+import {
+  admittedMetadataAttributes,
+  isSensitiveMetadataSemanticKey,
+} from "./analytical-metadata";
 
 export const DEFAULT_POLICY: PolicyConfig = policyConfigSchema.parse({
   id: "default-policy",
@@ -67,6 +70,7 @@ export const protectedMetadataFieldNames = [
   "workdir",
   "working_directory",
   "workspace_path",
+  "workspace_root",
   "user.account_id",
   "user.account_uuid",
   "user.email",
@@ -86,6 +90,32 @@ function normalizeFieldName(field: string) {
 
 export function isProtectedMetadataFieldName(field: string) {
   return protectedMetadataFields.has(normalizeFieldName(field));
+}
+
+const PROTECTED_METADATA_HASH = /^sha256:[a-f0-9]{16}$/;
+
+/**
+ * Fail-closed admission for ordinary hook metadata. Exact analytical fields
+ * use the shared validators; protected path/identity fields survive only as
+ * hashes already produced by `sanitizeForPolicy`. Every unknown key drops.
+ */
+export function admittedHookMetadata(input: Record<string, unknown>) {
+  const validated = admittedMetadataAttributes(input, "record");
+  const attributes: Record<string, unknown> = { ...validated.attributes };
+  const rejectedKeys: string[] = [];
+  for (const [key, value] of Object.entries(input)) {
+    if (Object.hasOwn(attributes, key)) continue;
+    if (
+      isProtectedMetadataFieldName(key) &&
+      typeof value === "string" &&
+      PROTECTED_METADATA_HASH.test(value)
+    ) {
+      attributes[key] = value;
+      continue;
+    }
+    rejectedKeys.push(key);
+  }
+  return { attributes, rejectedKeys };
 }
 
 export function hashProtectedValue(value: unknown) {

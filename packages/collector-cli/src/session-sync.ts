@@ -206,7 +206,7 @@ export function buildSessionSyncRow(snapshot: SessionSnapshot): NormalizedSessio
   const sealed = sealOutboundSessionRow(candidate);
   if (!sealed.ok) {
     const sourceValid = [
-      "anthropic_admin", "anthropic_usage", "claude_code", "codex",
+      "anthropic_admin", "anthropic_usage", "claude_code", "codex", "grok",
       "github", "openai_usage", "manual", "unknown",
     ].includes(snapshot.source);
     const reason: SessionSkipReason = !sourceValid

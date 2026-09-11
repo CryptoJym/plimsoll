@@ -17,6 +17,8 @@ export type ToolConfigOptions = {
   claudeCodeProducerToken?: string;
   codexProducerToken?: string;
   geminiCliProducerToken?: string;
+  /** Provisioned alongside the hook, but intentionally never rendered into it. */
+  grokProducerToken?: string;
 };
 
 function assertSupportedDataMode(options: ToolConfigOptions) {
@@ -210,6 +212,20 @@ export function generateGeminiCliSettings(options: ToolConfigOptions) {
 
 export const generateGeminiSettings = generateGeminiCliSettings;
 
+/** Grok Build reads Claude-compatible command hooks from ~/.grok/hooks/*.json. */
+export function generateGrokHookSettings(options: ToolConfigOptions) {
+  assertSupportedDataMode(options);
+  const command = `if [ -n "\${GROK_HOOK_EVENT:-}" ]; then ${shellQuote(options.pnpmCommand ?? "pnpm")} --dir ${shellQuote(options.repoRoot)} collector forward-hook-http grok || true; fi`;
+  const handler = { type: "command", command, timeout: 5 };
+  return {
+    hooks: {
+      UserPromptSubmit: [{ hooks: [{ ...handler }] }],
+      PostToolUse: [{ matcher: ".*", hooks: [{ ...handler }] }],
+      Stop: [{ hooks: [{ ...handler }] }],
+    },
+  };
+}
+
 export function generateSetupInstructions(options: ToolConfigOptions) {
   assertSupportedDataMode(options);
 
@@ -219,6 +235,7 @@ export function generateSetupInstructions(options: ToolConfigOptions) {
     codexConfigPath:
       "~/.codex/config.toml, project .codex/config.toml, or managed requirements.toml with managed_dir",
     geminiCliSettingsPath: "~/.gemini/settings.json or project .gemini/settings.json",
+    grokHookSettingsPath: "${GROK_HOME:-~/.grok}/hooks/plimsoll.json",
     collectorStartCommand: `${shellQuote(options.pnpmCommand ?? "pnpm")} --dir ${shellQuote(options.repoRoot)} collector start`,
     collectorDoctorCommand: `${shellQuote(options.pnpmCommand ?? "pnpm")} --dir ${shellQuote(options.repoRoot)} collector doctor`,
     privacyDefaults: {

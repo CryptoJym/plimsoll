@@ -12,6 +12,7 @@ export const toolSourceSchema = z.enum([
   "claude_code",
   "codex",
   "gemini_cli",
+  "grok",
   "github",
   "openai_usage",
   "manual",
@@ -122,6 +123,7 @@ export const forbiddenRawContentFieldNames = [
   "tool_arguments",
   "tool_input",
   "tool_output",
+  "tool_result",
   "tool_response",
   "user_prompt",
 ] as const;

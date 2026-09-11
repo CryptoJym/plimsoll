@@ -379,7 +379,7 @@ function unlinkClaudeObject(file: string, identity: ClaudeFileIdentity | undefin
   }
 }
 
-function prepareClaudeFile(snapshot: ClaudePathSnapshot, next: string) {
+function prepareClaudeFile(snapshot: ClaudePathSnapshot, next: string, modeOverride?: number) {
   const tempPath = path.join(
     path.dirname(snapshot.absolutePath),
     `.${path.basename(snapshot.absolutePath)}.plimsoll-tmp-${randomUUID()}`,
@@ -391,7 +391,7 @@ function prepareClaudeFile(snapshot: ClaudePathSnapshot, next: string) {
   const identity = claudeIdentity(fs.fstatSync(descriptor));
   try {
     if (identity.links !== 1) claudeFail("PREPARED_LINK_COUNT");
-    const mode = snapshot.leaf ? snapshot.leaf.mode & 0o777 : 0o600;
+    const mode = modeOverride ?? (snapshot.leaf ? snapshot.leaf.mode & 0o777 : 0o600);
     fs.fchmodSync(descriptor, mode);
     claudeWriteDescriptor(descriptor, next);
   } catch (error) {
@@ -402,7 +402,11 @@ function prepareClaudeFile(snapshot: ClaudePathSnapshot, next: string) {
   }
   assertVisibleClaudeContent(
     { ...snapshot, absolutePath: tempPath, exists: true, leaf: identity },
-    { ...identity, mode: (identity.mode & ~0o777) | (snapshot.leaf ? snapshot.leaf.mode & 0o777 : 0o600) },
+    {
+      ...identity,
+      mode: (identity.mode & ~0o777) |
+        (modeOverride ?? (snapshot.leaf ? snapshot.leaf.mode & 0o777 : 0o600)),
+    },
     next,
   );
   return {
@@ -415,6 +419,7 @@ function backupClaudePreimage(
   snapshot: ClaudePathSnapshot,
   current: string,
   boundDescriptor: number,
+  modeOverride?: number,
 ) {
   if (!snapshot.leaf) claudeFail("MISSING_PREIMAGE_IDENTITY");
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
@@ -428,7 +433,7 @@ function backupClaudePreimage(
     if (created.links !== 1) claudeFail("BACKUP_LINK_COUNT");
     assertClaudeBoundContent(boundDescriptor, snapshot.leaf, current);
     assertVisibleClaudeContent(snapshot, snapshot.leaf, current);
-    fs.fchmodSync(descriptor, snapshot.leaf.mode & 0o777);
+    fs.fchmodSync(descriptor, modeOverride ?? (snapshot.leaf.mode & 0o777));
     claudeWriteDescriptor(descriptor, current);
     created = claudeIdentity(fs.fstatSync(descriptor));
     assertClaudeBoundContent(descriptor, created, current);
@@ -505,6 +510,7 @@ function writeClaudePlan(
   current: string,
   next: string,
   hooks: NonNullable<ClaudeApplyOptions["transactionHooks"]> = {},
+  modeOverride?: number,
 ) {
   const snapshot = ensureClaudeParent(initial, hooks.afterParentCreate);
   assertStableClaudePath(snapshot);
@@ -520,7 +526,7 @@ function writeClaudePlan(
       assertVisibleClaudeContent(snapshot, snapshot.leaf, current);
     }
 
-    prepared = prepareClaudeFile(snapshot, next);
+    prepared = prepareClaudeFile(snapshot, next, modeOverride);
     runClaudeHook(hooks.afterPrepare);
     assertStableClaudePath(snapshot);
     assertVisibleClaudeContent(
@@ -530,7 +536,7 @@ function writeClaudePlan(
     );
 
     const backup = snapshot.exists
-      ? backupClaudePreimage(snapshot, current, boundDescriptor!)
+      ? backupClaudePreimage(snapshot, current, boundDescriptor!, modeOverride)
       : undefined;
     runClaudeHook(hooks.afterBackup);
     if (backup) assertClaudeBackup(snapshot, backup, current);
@@ -902,6 +908,98 @@ export function applyGeminiSettings(
   } catch (error) {
     if (error instanceof ClaudeConfigError) {
       throw new Error(error.message.replace(/^CLAUDE_CONFIG_/, "GEMINI_CONFIG_"));
+    }
+    throw error;
+  }
+}
+
+const GROK_MANAGED_EVENTS = ["UserPromptSubmit", "PostToolUse", "Stop"] as const;
+const LEGACY_GROK_COMMAND_PATTERN = /^if \[ -n "\$\{GROK_HOOK_EVENT:-\}" \]; then curl -s --max-time 2 -X POST -H 'Content-Type: application\/json' -H 'x-plimsoll-source: grok'(?: -H 'x-plimsoll-token: [A-Za-z0-9_-]{43}')? --data-binary @- http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/hooks\/grok \|\| true; fi$/;
+const VALUE_BLIND_GROK_COMMAND_PATTERN = /^if \[ -n "\$\{GROK_HOOK_EVENT:-\}" \]; then (?:[a-zA-Z0-9_./:@=-]+|'(?:[^']|'\\'')*') --dir (?:[a-zA-Z0-9_./:@=-]+|'(?:[^']|'\\'')*') collector forward-hook-http grok \|\| true; fi$/;
+
+function isManagedGrokGroup(event: string, value: unknown) {
+  if (!isJsonRecord(value)) return false;
+  const expectedKeys = event === "PostToolUse" ? ["hooks", "matcher"] : ["hooks"];
+  if (Object.keys(value).sort().join(",") !== expectedKeys.sort().join(",")) return false;
+  if (event === "PostToolUse" && value.matcher !== ".*") return false;
+  if (!Array.isArray(value.hooks) || value.hooks.length !== 1) return false;
+  const handler = value.hooks[0];
+  return isJsonRecord(handler) &&
+    Object.keys(handler).sort().join(",") === "command,timeout,type" &&
+    handler.type === "command" && handler.timeout === 5 &&
+    typeof handler.command === "string" &&
+    (LEGACY_GROK_COMMAND_PATTERN.test(handler.command) ||
+      VALUE_BLIND_GROK_COMMAND_PATTERN.test(handler.command));
+}
+
+function isManagedGrokDocument(value: unknown) {
+  if (!isJsonRecord(value) || Object.keys(value).join(",") !== "hooks" || !isJsonRecord(value.hooks)) {
+    return false;
+  }
+  if (Object.keys(value.hooks).sort().join(",") !== [...GROK_MANAGED_EVENTS].sort().join(",")) {
+    return false;
+  }
+  return GROK_MANAGED_EVENTS.every((event) => {
+    const groups = (value.hooks as Record<string, unknown>)[event];
+    return Array.isArray(groups) && groups.length === 1 && isManagedGrokGroup(event, groups[0]);
+  });
+}
+
+/**
+ * Reconcile Plimsoll's one owned Grok hook fragment. Grok merges sibling
+ * files itself, so this function deliberately never enumerates or opens them.
+ */
+export function applyGrokHookFile(
+  file: string,
+  generated: { hooks: Record<string, unknown[]> },
+  options: ClaudeApplyOptions = {},
+): ApplyResult {
+  try {
+    if (!isManagedGrokDocument(generated)) {
+      throw new Error(`${file}: generated Grok hook document is invalid.`);
+    }
+    const { snapshot, current } = readClaudePreimage(file);
+    let currentDocument: Record<string, unknown> | undefined;
+    if (snapshot.exists) {
+      currentDocument = parseClaudeDocument(current);
+      if (!isManagedGrokDocument(currentDocument)) {
+        return {
+          path: file,
+          changed: false,
+          changes: [],
+          plan: [],
+          conflict: `${file}: existing file is not a Plimsoll-managed Grok hook fragment; refusing this target.`,
+        };
+      }
+    }
+
+    const currentHooks = currentDocument?.hooks as Record<string, unknown> | undefined;
+    const plan: ApplyPlanEntry[] = GROK_MANAGED_EVENTS.map((event) => ({
+      key: `grok.hooks.${event}`,
+      action: currentHooks === undefined
+        ? "added"
+        : isDeepStrictEqual(currentHooks[event], generated.hooks[event]) ? "unchanged" : "updated",
+    }));
+    const requiresPrivateMode = Boolean(
+      snapshot.exists && snapshot.leaf && (snapshot.leaf.mode & 0o777) !== 0o600,
+    );
+    if (requiresPrivateMode) {
+      plan.push({ key: "grok.fileMode", action: "updated" });
+    }
+    const changes = plan
+      .filter((entry) => entry.action !== "unchanged")
+      .map((entry) => `${entry.key}.reconcile`);
+    if (changes.length === 0 || options.dryRun) {
+      if (snapshot.exists && snapshot.leaf) assertVisibleClaudeContent(snapshot, snapshot.leaf, current);
+      else assertStableClaudePath(snapshot);
+      return { path: file, changed: changes.length > 0, changes, plan };
+    }
+    const next = `${JSON.stringify(generated, null, 2)}\n`;
+    const backupPath = writeClaudePlan(snapshot, current, next, options.transactionHooks, 0o600);
+    return { path: file, changed: true, changes, plan, backupPath };
+  } catch (error) {
+    if (error instanceof ClaudeConfigError) {
+      throw new Error(error.message.replace(/^CLAUDE_CONFIG_/, "GROK_CONFIG_"));
     }
     throw error;
   }

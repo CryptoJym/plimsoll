@@ -2,7 +2,7 @@
 
 **The load line for your AI spend.**
 
-Plimsoll is a local-first telemetry collector for AI coding agents (Claude Code, Gemini CLI, and Codex today) that answers the question every team is guessing at:
+Plimsoll is a local-first telemetry collector for AI coding agents (Claude Code, Gemini CLI, Grok, and Codex today) that answers the question every team is guessing at:
 
 > **What did we actually get for those tokens?**
 
@@ -60,7 +60,7 @@ The outcome join uses **linkage keys**: both Plimsoll and the GitHub side hash t
 Requirements: macOS, Node >=20 <25.
 
 ```bash
-# wire Claude Code, Gemini CLI, and Codex telemetry (independent targets;
+# wire Claude Code, Gemini CLI, Grok, and Codex telemetry (independent targets;
 # idempotent, takes backups; --dry-run to preview)
 npx -y @plimsoll/cli setup
 
@@ -118,12 +118,13 @@ pnpm report -- --repository your-org/your-repo   # after a few sessions: the eco
 
 `setup` applies the tool configs for you (idempotent, takes backups,
 `--dry-run` to preview); `generate-config` prints exactly what to add to
-`~/.claude/settings.json` and `~/.codex/config.toml` if you'd rather paste
-by hand — hooks plus OTLP exporters pointed at `127.0.0.1:48271`. Nothing
-is configured behind your back.
+`~/.claude/settings.json`, `~/.gemini/settings.json`,
+`${GROK_HOME:-~/.grok}/hooks/plimsoll.json`, and `~/.codex/config.toml` if
+you'd rather paste by hand. Managed hooks/exporters point only at
+`127.0.0.1:48271`. Nothing is configured behind your back.
 
 The source install script's `--dry-run` does not clone, install dependencies,
-write Claude/Codex or Plimsoll files, register a LaunchAgent, or start a
+write Claude/Gemini/Grok/Codex or Plimsoll files, register a LaunchAgent, or start a
 collector. The real install fails closed if the final doctor gate is below
 `signal_verified`; the JSON report names the incomplete readiness level and
 each missing/conflicted requirement.

@@ -37,7 +37,7 @@ export const LOCAL_HTTP_LIMITS = Object.freeze({
   perSourceRateWindowMs: 60_000,
 });
 
-export type LocalProducerSource = "claude_code" | "codex" | "gemini_cli";
+export type LocalProducerSource = "claude_code" | "codex" | "gemini_cli" | "grok";
 
 /**
  * The complete closed set of admission rejection reasons. Aggregation,
@@ -140,7 +140,7 @@ function producerSourceHeader(request: http.IncomingMessage) {
 }
 
 function parsedProducerSource(value: string | undefined): LocalProducerSource | undefined {
-  if (value === "claude_code" || value === "codex" || value === "gemini_cli") return value;
+  if (value === "claude_code" || value === "codex" || value === "gemini_cli" || value === "grok") return value;
   return undefined;
 }
 
@@ -197,6 +197,19 @@ export function assertHookSource(
   const parsed = parsedProducerSource(claimed.value);
   if (!parsed) throw new HttpBoundaryRejection("source_not_allowed", 401);
   if (parsed !== pathSource) throw new HttpBoundaryRejection("source_mismatch", 401);
+}
+
+/** Resolve only the closed set of local hook endpoints before body decode. */
+export function hookSourceFromPath(rawUrl: string | undefined): LocalProducerSource | undefined {
+  try {
+    const pathname = new URL(rawUrl ?? "", "http://127.0.0.1").pathname;
+    if (pathname === "/hooks/claude-code") return "claude_code";
+    if (pathname === "/hooks/codex") return "codex";
+    if (pathname === "/hooks/grok") return "grok";
+  } catch {
+    return undefined;
+  }
+  return undefined;
 }
 
 export type RequestBudget = {

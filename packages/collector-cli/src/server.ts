@@ -45,6 +45,7 @@ import {
   createRequestBudget,
   createSourceRateLimiter,
   decodeBoundedRequestBody,
+  hookSourceFromPath,
   isOtlpPath,
   parseBoundedJson,
   readBoundedRequestBody,
@@ -127,17 +128,6 @@ function firstHeader(value: string | string[] | undefined) {
 
 function requestUrl(request: http.IncomingMessage) {
   return new URL(request.url ?? "/", "http://127.0.0.1");
-}
-
-function hookSourceFromPath(rawUrl: string | undefined): LocalProducerSource | undefined {
-  try {
-    const pathname = new URL(rawUrl ?? "", "http://127.0.0.1").pathname;
-    if (pathname === "/hooks/claude-code") return "claude_code";
-    if (pathname === "/hooks/codex") return "codex";
-  } catch {
-    return undefined;
-  }
-  return undefined;
 }
 
 /**

@@ -10,7 +10,7 @@ dashboard you can read from the dock.
 ## Quickstart
 
 ```sh
-npx @plimsoll/cli setup     # wire Claude Code + Codex telemetry (idempotent, takes backups; --dry-run to preview)
+npx @plimsoll/cli setup     # wire Claude Code + Gemini CLI + Grok + Codex telemetry (idempotent; --dry-run to preview)
 npx @plimsoll/cli start     # run the local collector + dashboard
 ```
 
@@ -69,7 +69,7 @@ separate purge may remove.
 
 | Command | What it does |
 | --- | --- |
-| `setup` | Apply Claude Code + Codex telemetry config (idempotent; `--yes`, `--dry-run`) |
+| `setup` | Apply Claude Code, Gemini CLI, Grok, and Codex telemetry config (idempotent; `--yes`, `--dry-run`) |
 | `start` / `stop` | Run / stop the local hook + OTLP receiver |
 | `status` | Print local buffer and policy status |
 | `doctor --read-only --json` | Verify Node, collector/tool config, LaunchAgent, runtime identity, connectivity, and token signal without writing |

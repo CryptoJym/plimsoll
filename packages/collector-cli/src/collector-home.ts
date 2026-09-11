@@ -38,8 +38,66 @@ export type ResolvedCollectorHome = {
   source: "default" | "env";
 };
 
+export class GrokHomeError extends Error {
+  constructor(
+    readonly code:
+      | "grok_home_ambiguous"
+      | "grok_home_control_characters"
+      | "grok_home_not_absolute"
+      | "grok_home_not_normalized",
+    detail: string,
+  ) {
+    super(`${code}: ${detail}`);
+    this.name = "GrokHomeError";
+  }
+}
+
+export type ResolvedGrokHome = {
+  home: string;
+  source: "default" | "env";
+};
+
 export function defaultCollectorHome(homeDir = os.homedir()) {
   return path.join(homeDir, "Library", "Application Support", "Plimsoll");
+}
+
+/** Validate a caller-supplied Grok root before setup derives any target. */
+export function resolveGrokHome(
+  options: { env?: NodeJS.ProcessEnv; homeDir?: string } = {},
+): ResolvedGrokHome {
+  const env = options.env ?? process.env;
+  if (!Object.hasOwn(env, "GROK_HOME")) {
+    return { home: path.join(options.homeDir ?? os.homedir(), ".grok"), source: "default" };
+  }
+  const raw = env.GROK_HOME;
+  if (typeof raw !== "string" || raw.length === 0 || raw.trim() !== raw) {
+    throw new GrokHomeError(
+      "grok_home_ambiguous",
+      "GROK_HOME must be a non-empty path without surrounding whitespace.",
+    );
+  }
+  if (/[\u0000-\u001f\u007f-\u009f]/.test(raw)) {
+    throw new GrokHomeError("grok_home_control_characters", "GROK_HOME contains control characters.");
+  }
+  if (!path.isAbsolute(raw)) {
+    throw new GrokHomeError(
+      "grok_home_not_absolute",
+      `GROK_HOME=${JSON.stringify(raw)} is relative.`,
+    );
+  }
+  const normalized = path.normalize(raw);
+  if (
+    normalized !== raw ||
+    path.resolve(raw) !== raw ||
+    raw.normalize("NFC") !== raw ||
+    raw === path.parse(raw).root
+  ) {
+    throw new GrokHomeError(
+      "grok_home_not_normalized",
+      `GROK_HOME=${JSON.stringify(raw)} is not a safe normalized root.`,
+    );
+  }
+  return { home: raw, source: "env" };
 }
 
 function lstatSafe(file: string): fs.Stats | null {

@@ -80,7 +80,7 @@ export const HOOK_AUTHORITY_CONTRACT: Record<HookAuthorityField, HookAuthorityRu
     receipt: "hook.authority.event_id",
   },
   eventType: {
-    aliases: ["eventType", "event_type", "hook_event_name", "type"],
+    aliases: ["eventType", "event_type", "hookEventName", "hook_event_name", "type"],
     owner: "validated_hook",
     receipt: "hook.authority.event_type",
   },

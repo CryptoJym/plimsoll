@@ -26,6 +26,7 @@ export const REJECTION_COUNTER_CAP = Number.MAX_SAFE_INTEGER;
 export const REJECTION_CLIENT_CLASSES = [
   "codex",
   "claude_code",
+  "grok",
   "otlp_exporter",
   "unknown",
 ] as const;
@@ -38,7 +39,7 @@ export function classifyRejectionClient(request: {
 }): RejectionClientClass {
   const source = request.headers["x-plimsoll-source"];
   const firstSource = Array.isArray(source) ? source[0] : source;
-  if (firstSource === "codex" || firstSource === "claude_code") return firstSource;
+  if (firstSource === "codex" || firstSource === "claude_code" || firstSource === "grok") return firstSource;
   const agent = request.headers["user-agent"];
   const firstAgent = (Array.isArray(agent) ? agent[0] : agent)?.toLowerCase() ?? "";
   if (/\b(?:otel|opentelemetry|otlp)[\s/_-]/.test(firstAgent)) return "otlp_exporter";
@@ -164,6 +165,7 @@ export function createRejectionDiagnostics(options: {
     claude_code: 0,
     codex: 0,
     gemini_cli: 0,
+    grok: 0,
   };
   if (options.initialByReason) {
     for (const [reason, seed] of Object.entries(options.initialByReason)) {
