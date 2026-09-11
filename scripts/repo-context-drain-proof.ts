@@ -8,7 +8,10 @@ import path from "node:path";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
-import { runRepoContextDrainStage } from "../packages/collector-cli/src/repo-context-drain";
+import {
+  runConfiguredRepoContextDrainStage,
+  runRepoContextDrainStage,
+} from "../packages/collector-cli/src/repo-context-drain";
 import { remainingRepoContextDrainLookupMs } from "../packages/collector-cli/src/maintenance-worker";
 import {
   ensureRepoContextLinkDispositionSchema,
@@ -62,6 +65,36 @@ assert.equal(collectorConfigSchema.safeParse({
 assert.equal(collectorConfigSchema.safeParse({
   repoContextDrain: { expireLinksPerRun: 257 },
 }).success, false);
+
+const noConfigScratch = path.join(process.cwd(), "scratch");
+fs.mkdirSync(noConfigScratch, { recursive: true });
+const noConfigRoot = fs.mkdtempSync(path.join(noConfigScratch, "repo-context-drain-no-config-"));
+const noConfigHome = path.join(noConfigRoot, "missing-plimsoll-home");
+const noConfigBuffer = new LocalEventBuffer(path.join(noConfigRoot, "ledger.sqlite"));
+const priorPlimsollHome = process.env.PLIMSOLL_HOME;
+const priorDataMode = process.env.PLIMSOLL_DATA_MODE;
+process.env.PLIMSOLL_HOME = noConfigHome;
+process.env.PLIMSOLL_DATA_MODE = "evidence";
+try {
+  const noConfigReceipt = runConfiguredRepoContextDrainStage(noConfigBuffer, {
+    captureElapsedMs: 0,
+    freshContextsUsed: 0,
+    freshDeferred: 0,
+    remainingJobMs: 29_000,
+    remainingLookupMs: 10_000,
+  });
+  assert.equal(noConfigReceipt.status, "disabled");
+  assert.equal(fs.existsSync(path.join(noConfigHome, "collector.config.json")), false);
+  assert.equal(fs.existsSync(noConfigHome), false,
+    "configured drain entry must not create the collector home when runtime config is absent");
+} finally {
+  if (priorPlimsollHome === undefined) delete process.env.PLIMSOLL_HOME;
+  else process.env.PLIMSOLL_HOME = priorPlimsollHome;
+  if (priorDataMode === undefined) delete process.env.PLIMSOLL_DATA_MODE;
+  else process.env.PLIMSOLL_DATA_MODE = priorDataMode;
+  noConfigBuffer.close();
+  fs.rmSync(noConfigRoot, { recursive: true, force: true });
+}
 assert.equal(remainingRepoContextDrainLookupMs({
   gitBudgetMs: 10_000,
   remainingJobMs: 29_000,
@@ -880,8 +913,9 @@ fs.rmSync(budgetRoot, { recursive: true, force: true });
 
 console.log(JSON.stringify({
   proof: "repo_context_drain",
-  checks: 111,
-  passed: 111,
+  checks: 114,
+  passed: 114,
+  noConfigSideEffects: { status: "disabled", collectorHomeCreated: false },
   oversizedRecord: {
     hardCapBytes: REPO_CONTEXT_REPLAY_MAX_RECORD_BYTES,
     grownRecordBytes: Buffer.byteLength(oversizedRecord),

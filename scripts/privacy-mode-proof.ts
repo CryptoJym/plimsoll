@@ -160,16 +160,26 @@ async function main() {
   const schemaRejected = !collectorConfigSchema.safeParse(evidenceConfig).success;
 
   const saveHome = path.join(root, "config-write-home");
+  const ambientPlimsollHome = process.env.PLIMSOLL_HOME;
   let saveRejected = false;
+  let configWritten = false;
   try {
+    // The canonical resolver intentionally gives PLIMSOLL_HOME precedence over
+    // an explicit homeDir. Pin the in-process probe to its own fixture so a
+    // file left by an earlier job step can never masquerade as this write.
+    process.env.PLIMSOLL_HOME = saveHome;
     saveCollectorConfig(evidenceConfig, saveHome);
   } catch (error) {
     saveRejected = /vault is not implemented|evidence/i.test(String(error));
+  } finally {
+    configWritten = fs.existsSync(collectorConfigPath(saveHome));
+    if (ambientPlimsollHome === undefined) delete process.env.PLIMSOLL_HOME;
+    else process.env.PLIMSOLL_HOME = ambientPlimsollHome;
   }
   record(
     "managed_config_write_rejects_evidence_before_filesystem_write",
-    schemaRejected && saveRejected && !fs.existsSync(collectorConfigPath(saveHome)),
-    { schemaRejected, configWritten: fs.existsSync(collectorConfigPath(saveHome)) },
+    schemaRejected && saveRejected && !configWritten,
+    { schemaRejected, configWritten },
   );
 
   const envHome = path.join(root, "env-home");
