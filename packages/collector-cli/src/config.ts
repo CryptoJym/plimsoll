@@ -110,6 +110,25 @@ export const collectorConfigSchema = z
         maxProbesPerCycle: 31,
       }),
     policy: policyConfigSchema.default(DEFAULT_POLICY),
+    repoContextDrain: z
+      .object({
+        enabled: z.boolean().default(false),
+        scanSliceMs: z.number().int().min(1).max(50).default(50),
+        maxContextsPerRun: z.number().int().min(1).max(64).default(64),
+        maxDistinctCwdsPerRun: z.number().int().min(1).max(8).default(8),
+        expireEnabled: z.boolean().default(false),
+        expireAfterCompletePasses: z.number().int().min(2).max(64).default(2),
+        expireLinksPerRun: z.number().int().min(1).max(256).default(256),
+      })
+      .default({
+        enabled: false,
+        scanSliceMs: 50,
+        maxContextsPerRun: 64,
+        maxDistinctCwdsPerRun: 8,
+        expireEnabled: false,
+        expireAfterCompletePasses: 2,
+        expireLinksPerRun: 256,
+      }),
   })
   .superRefine((config, context) => {
     if (config.policy.dataMode === "evidence") {

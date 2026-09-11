@@ -14,6 +14,10 @@ import { maintenanceCandidateHash, type MaintenanceProgress } from "./maintenanc
 import { recordGitContextBatchProgress } from "./maintenance-starvation";
 import { runDeadlineMaintenanceStages } from "./maintenance-stage-primitives";
 import {
+  runConfiguredRepoContextDrainStage,
+  type RepoContextDrainRuntimeConfig,
+} from "./repo-context-drain";
+import {
   REPO_CONTEXT_RESOLVER_VERSION,
   resolveRepoContextRequests,
   type RepoContextRequest,
@@ -23,10 +27,12 @@ import {
 export type MaintenanceWorkerServiceInput = {
   maintenance?: CollectorMaintenance;
   buffer?: LocalEventBuffer;
+  repoContextDrain?: RepoContextDrainRuntimeConfig;
   initialize?: () => {
     maintenance: CollectorMaintenance;
     buffer: LocalEventBuffer;
     retentionDays?: number;
+    repoContextDrain?: RepoContextDrainRuntimeConfig;
   };
   spawnNonce: string;
   transport?: MaintenanceWorkerTransport;
@@ -106,6 +112,18 @@ export function gitContextBudgetMs(deadlineMs: number) {
     1,
     Math.min(Math.floor(bounded * GIT_CONTEXT_BUDGET_SHARE), GIT_CONTEXT_MAX_BUDGET_MS),
   );
+}
+
+export function remainingRepoContextDrainLookupMs(input: {
+  gitBudgetMs: number;
+  remainingJobMs: number;
+  childFreshElapsedMs: number;
+  parentFreshElapsedMs: number;
+}) {
+  const sharedGitRemaining = Math.max(0,
+    input.gitBudgetMs - Math.max(0, input.childFreshElapsedMs) -
+      Math.max(0, input.parentFreshElapsedMs));
+  return Math.max(0, Math.min(Math.max(0, input.remainingJobMs), sharedGitRemaining));
 }
 
 export type MaintenanceRepoContextBatch = {
@@ -268,8 +286,13 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
     on: (event, listener) => process.on(event, listener),
     disconnect: () => process.disconnect?.(),
   };
-  let runtime: { maintenance: CollectorMaintenance; buffer: LocalEventBuffer; retentionDays?: number } | null = input.maintenance && input.buffer
-    ? { maintenance: input.maintenance, buffer: input.buffer }
+  let runtime: {
+    maintenance: CollectorMaintenance;
+    buffer: LocalEventBuffer;
+    retentionDays?: number;
+    repoContextDrain?: RepoContextDrainRuntimeConfig;
+  } | null = input.maintenance && input.buffer
+    ? { maintenance: input.maintenance, buffer: input.buffer, repoContextDrain: input.repoContextDrain }
     : null;
   const reportStage = (stage: string, startedAt = serviceStartedAt) => {
     try {
@@ -577,7 +600,21 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
             ms: Math.max(0, Math.round(performance.now() - gitContextStartedAt)),
             remaining: remainingJobMs(),
           });
+          const parentFreshStartedAt = performance.now();
           repoContexts = resolveWithProgress(request.repoContexts);
+          const parentFreshElapsedMs = Math.max(0, performance.now() - parentFreshStartedAt);
+          runConfiguredRepoContextDrainStage(worker.buffer, {
+            captureElapsedMs: result.stageTimings?.totalMs ?? 200,
+            freshContextsUsed: Math.min(8, childBatch.resolved + request.repoContexts.length),
+            freshDeferred: childBatch.deferred.length,
+            remainingJobMs: remainingJobMs(),
+            remainingLookupMs: remainingRepoContextDrainLookupMs({
+              gitBudgetMs: gitContextBudgetMs(request.deadlineMs),
+              remainingJobMs: remainingJobMs(),
+              childFreshElapsedMs: childBatch.elapsedMs,
+              parentFreshElapsedMs,
+            }),
+          }, worker.repoContextDrain);
         } catch (error) {
           try {
             worker.buffer.abandonChildRepoContextRun();

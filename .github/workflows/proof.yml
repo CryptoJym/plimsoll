@@ -148,6 +148,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:repo-context
 
+      - name: Prove bounded historical repository context replay and expiry
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:repo-context-drain
+
       - name: Prove incremental tailer context and cursor semantics
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:incremental-capture
