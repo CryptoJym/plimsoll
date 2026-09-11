@@ -149,6 +149,8 @@ async function main() {
     assert.equal(joined.joined, true);
     assert.equal(joined.joined && joined.accountSaltSynced, true);
     assert.equal(joinRequests.filter(value => value === CLOUD_ACCOUNT_SALT_PATH).length, 1);
+    assert.equal(joined.joined && JSON.parse(fs.readFileSync(joined.configPath, "utf8")).accountActorSaltEndpoint,
+      `https://tenant.example${CLOUD_ACCOUNT_SALT_PATH}`);
     assert.ok(readAccountAssertionSaltForTenant(collectorHome(joinHome), TENANT_ID));
     assert.equal(fs.existsSync(path.join(joinHome, ACCOUNT_ASSERTION_SALT_FILE)), false);
 
@@ -158,7 +160,7 @@ async function main() {
     let cliCalls = 0;
     const server = http.createServer((request, result) => {
       cliCalls += 1;
-      assert.equal(request.url, CLOUD_ACCOUNT_SALT_PATH);
+      assert.equal(request.url, "/custom-account-salt");
       assert.equal(request.headers["x-plimsoll-install-key"], INSTALL_KEY);
       request.resume();
       result.writeHead(200, { "content-type": "application/json" });
@@ -177,6 +179,7 @@ async function main() {
         deviceId: DEVICE_ID,
         installKey: INSTALL_KEY,
         uploadUrl: `http://127.0.0.1:${address.port}/api/work-intelligence/ingest`,
+        accountActorSaltEndpoint: `http://127.0.0.1:${address.port}/custom-account-salt`,
       });
       fs.writeFileSync(path.join(cliHome, "collector.config.json"), `${JSON.stringify(config, null, 2)}\n`, { mode: 0o600 });
       const run = await child([

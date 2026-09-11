@@ -209,6 +209,7 @@ function stageGrant(
     tenantId: _staleTenantId,
     uploadSigningSecret: _staleSigningSecret,
     uploadUrl: _staleUploadUrl,
+    accountActorSaltEndpoint: _staleAccountActorSaltEndpoint,
     deviceId: _staleDeviceId,
     keyId: _staleKeyId,
     ...localSettings
@@ -221,6 +222,7 @@ function stageGrant(
     keyId: grant.keyId ?? identity.keyId,
     installKey: grant.installKey,
     uploadUrl: grant.uploadUrl,
+    ...(grant.accountActorSaltEndpoint ? { accountActorSaltEndpoint: grant.accountActorSaltEndpoint } : {}),
     policy: grant.policyVersion
       ? { ...existing.policy, tenantId: grant.tenantId, version: grant.policyVersion }
       : { ...existing.policy, tenantId: grant.tenantId, version: DEFAULT_POLICY.version },

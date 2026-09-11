@@ -39,6 +39,12 @@ export const accountAssertionV1Schema = z.object({
 export type AccountAssertionV1 = z.infer<typeof accountAssertionV1Schema>;
 export const accountAssertionSchema = accountAssertionV1Schema;
 
+declare const CODEX_NATIVE_AUTH_BINDING: unique symbol;
+/** Capability returned only by an owner-only native auth.json read. */
+export type CodexNativeAuthBinding = Readonly<Record<string, unknown>> & {
+  readonly [CODEX_NATIVE_AUTH_BINDING]: true;
+};
+
 export type AccountAssertionAdapterState = {
   schema: "account-assertion-adapters/v1";
   adapters: Record<AccountAssertionSource, {
@@ -56,6 +62,8 @@ export type AccountAssertionBindingState = {
   bindingDigest: string;
   /** Digest of the stable Codex binding epoch; no provider credential value. */
   bindingKey?: string;
+  /** Source-binding epoch used for event-time failover and hosted dedupe. */
+  installationEpochId?: string;
   assertion: AccountAssertionV1;
   active: boolean;
   createdAt: string;
@@ -70,6 +78,7 @@ const bindingStateSchema = z.object({
   rootId: z.string().regex(ROOT_ID),
   bindingDigest: digest,
   bindingKey: digest.optional(),
+  installationEpochId: z.string().uuid().optional(),
   assertion: accountAssertionV1Schema,
   active: z.boolean(),
   createdAt: timestamp,
@@ -264,39 +273,78 @@ export const ACCOUNT_ASSERTION_CANONICAL_BUDGETS = {
 
 /** Controlled canonicalisation: hostile depth/width is rejected before the JS
  * call stack can overflow and before an unbounded string is built. */
-function canonical(value: unknown, seen = new WeakSet<object>(), depth = 0,
-  budget = ACCOUNT_ASSERTION_CANONICAL_BUDGETS, counter = { nodes: 0, bytes: 0 }): string {
-  if (depth > budget.maxDepth) throw new Error("account_binding_record_depth_exceeded");
-  counter.nodes += 1;
-  if (counter.nodes > budget.maxNodes) throw new Error("account_binding_record_node_budget_exceeded");
+function canonical(value: unknown, budget = ACCOUNT_ASSERTION_CANONICAL_BUDGETS): string {
+  const seen = new WeakSet<object>();
+  const counter = { nodes: 0, bytes: 0 };
+  const chunks: string[] = [];
   const emit = (text: string) => {
     counter.bytes += Buffer.byteLength(text, "utf8");
     if (counter.bytes > budget.maxBytes) throw new Error("account_binding_record_too_large");
-    return text;
+    chunks.push(text);
   };
-  if (value === undefined) return emit("null");
-  if (value === null || typeof value === "string" || typeof value === "number" || typeof value === "boolean") {
-    return emit(JSON.stringify(value));
-  }
-  if (typeof value === "object") {
-    if (seen.has(value)) throw new Error("account_binding_record_cyclic");
-    seen.add(value);
-    let result: string;
-    if (Array.isArray(value)) {
-      result = `[${value.map(item => canonical(item, seen, depth + 1, budget, counter)).join(",")}]`;
-    } else {
-      const record = value as Record<string, unknown>;
-      result = `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${canonical(record[key], seen, depth + 1, budget, counter)}`).join(",")}}`;
+  const emitJsonString = (value: string) => {
+    emit("\"");
+    for (let offset = 0; offset < value.length;) {
+      let end = Math.min(value.length, offset + 1024);
+      // Keep a surrogate pair in one bounded chunk so the result remains
+      // byte-for-byte identical to JSON.stringify without allocating the full
+      // escaped value first.
+      if (end < value.length && end > offset && /[\uD800-\uDBFF]/.test(value[end - 1]) &&
+          /[\uDC00-\uDFFF]/.test(value[end])) end -= 1;
+      const encoded = JSON.stringify(value.slice(offset, end));
+      emit(encoded.slice(1, -1));
+      offset = end;
     }
-    seen.delete(value);
-    return emit(result);
-  }
-  return emit("null");
+    emit("\"");
+  };
+  const visit = (candidate: unknown, depth: number): void => {
+    if (depth > budget.maxDepth) throw new Error("account_binding_record_depth_exceeded");
+    counter.nodes += 1;
+    if (counter.nodes > budget.maxNodes) throw new Error("account_binding_record_node_budget_exceeded");
+    if (candidate === undefined) { emit("null"); return; }
+    if (candidate === null || typeof candidate === "number" || typeof candidate === "boolean") {
+      emit(JSON.stringify(candidate)); return;
+    }
+    if (typeof candidate === "string") {
+      emitJsonString(candidate); return;
+    }
+    if (typeof candidate !== "object") { emit("null"); return; }
+    if (seen.has(candidate)) throw new Error("account_binding_record_cyclic");
+    seen.add(candidate);
+    if (Array.isArray(candidate)) {
+      if (candidate.length > budget.maxNodes - counter.nodes) throw new Error("account_binding_record_node_budget_exceeded");
+      emit("[");
+      for (let index = 0; index < candidate.length; index += 1) {
+        if (index) emit(",");
+        visit(candidate[index], depth + 1);
+      }
+      emit("]");
+    } else {
+      const record = candidate as Record<string, unknown>;
+      const keys: string[] = [];
+      for (const key in record) {
+        if (!Object.prototype.hasOwnProperty.call(record, key)) continue;
+        if (keys.length >= budget.maxNodes - counter.nodes) throw new Error("account_binding_record_node_budget_exceeded");
+        keys.push(key);
+      }
+      keys.sort();
+      emit("{");
+      for (let index = 0; index < keys.length; index += 1) {
+        if (index) emit(",");
+        const key = keys[index];
+        emitJsonString(key); emit(":"); visit(record[key], depth + 1);
+      }
+      emit("}");
+    }
+    seen.delete(candidate);
+  };
+  visit(value, 0);
+  return chunks.join("");
 }
 
 /** Hash a bounded, non-secret binding receipt; only the digest is persisted. */
 export function hashBindingRecord(record: unknown, budgets?: Partial<typeof ACCOUNT_ASSERTION_CANONICAL_BUDGETS>): string {
-  const encoded = canonical(record, new WeakSet<object>(), 0, { ...ACCOUNT_ASSERTION_CANONICAL_BUDGETS, ...budgets });
+  const encoded = canonical(record, { ...ACCOUNT_ASSERTION_CANONICAL_BUDGETS, ...budgets });
   return `sha256:${crypto.createHash("sha256").update(encoded, "utf8").digest("hex")}`;
 }
 export const bindingEvidenceRef = hashBindingRecord;
@@ -367,12 +415,15 @@ function decodeBase64UrlJson(value: string): Record<string, unknown> | null {
   } catch { return null; }
 }
 
+type CodexSignedNativeEvidence = Readonly<{ identity: string; evidenceRef: string }>;
+const codexNativeEvidenceCapabilities = new WeakMap<object, CodexSignedNativeEvidence>();
+
 /**
- * Accept only the signed native Codex auth record.  Routing fields,
- * credentialId, caller-provided digests, and arbitrary profile objects are
- * intentionally not identity/evidence sources.
+ * Parse the exact signed field inside a native Codex auth record. Signature
+ * authenticity is inherited from the owner-only native-file boundary; the
+ * collector deliberately does not invent a provider JWKS/network dependency.
  */
-export function resolveCodexSignedNativeEvidence(binding: unknown): { identity: string; evidenceRef: string } | null {
+function parseCodexSignedNativeEvidence(binding: unknown): CodexSignedNativeEvidence | null {
   if (!binding || typeof binding !== "object") return null;
   const root = binding as Record<string, unknown>;
   const tokens = root.tokens;
@@ -392,6 +443,62 @@ export function resolveCodexSignedNativeEvidence(binding: unknown): { identity: 
   const identity = safeIdentity((apiClaims as Record<string, unknown>).chatgpt_account_id);
   if (!identity) return null;
   return { identity, evidenceRef: `sha256:${crypto.createHash("sha256").update(idToken, "utf8").digest("hex")}` };
+}
+
+/**
+ * Read the native Codex auth.json through a no-follow, owner-only boundary.
+ * Callers cannot mint evidence by constructing a JWT-shaped object: the
+ * returned object carries an in-process capability whose value is derived
+ * while the verified file descriptor is open.
+ */
+export function loadCodexNativeAccountBinding(file: string): CodexNativeAuthBinding {
+  if (!path.isAbsolute(file) || path.basename(file) !== "auth.json") throw new Error("codex_native_auth_path_invalid");
+  const directory = fs.lstatSync(path.dirname(file));
+  if (directory.isSymbolicLink() || !directory.isDirectory() || (directory.mode & 0o7077) !== 0 ||
+      (typeof process.getuid === "function" && directory.uid !== process.getuid())) {
+    throw new Error("codex_native_auth_directory_unsafe");
+  }
+  const before = fs.lstatSync(file);
+  if (before.isSymbolicLink() || !before.isFile() || before.size <= 0 || before.size > 512 * 1024 ||
+      (before.mode & 0o7077) !== 0 ||
+      (typeof process.getuid === "function" && before.uid !== process.getuid())) {
+    throw new Error("codex_native_auth_file_unsafe");
+  }
+  const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  let bytes: string;
+  try {
+    const opened = fs.fstatSync(descriptor);
+    if (!opened.isFile() || opened.dev !== before.dev || opened.ino !== before.ino ||
+        opened.size <= 0 || opened.size > 512 * 1024 || (opened.mode & 0o7077) !== 0 ||
+        (typeof process.getuid === "function" && opened.uid !== process.getuid())) {
+      throw new Error("codex_native_auth_file_unsafe");
+    }
+    const raw = fs.readFileSync(descriptor);
+    const after = fs.fstatSync(descriptor);
+    const current = fs.lstatSync(file);
+    if (raw.length !== opened.size || after.size !== opened.size || after.mtimeMs !== opened.mtimeMs ||
+        after.ctimeMs !== opened.ctimeMs || current.isSymbolicLink() || current.dev !== opened.dev ||
+        current.ino !== opened.ino || current.size !== opened.size) {
+      throw new Error("codex_native_auth_file_changed");
+    }
+    try { bytes = new TextDecoder("utf-8", { fatal: true }).decode(raw); }
+    catch { throw new Error("codex_native_auth_record_invalid"); }
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  let parsed: unknown;
+  try { parsed = JSON.parse(bytes); } catch { throw new Error("codex_native_auth_record_invalid"); }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("codex_native_auth_record_invalid");
+  const evidence = parseCodexSignedNativeEvidence(parsed);
+  if (!evidence) throw new Error("account_signed_evidence_unavailable");
+  codexNativeEvidenceCapabilities.set(parsed, Object.freeze({ ...evidence }));
+  return parsed as CodexNativeAuthBinding;
+}
+
+/** Resolve evidence only from the verified native-file capability above. */
+export function resolveCodexSignedNativeEvidence(binding: unknown): CodexSignedNativeEvidence | null {
+  if (!binding || typeof binding !== "object") return null;
+  return codexNativeEvidenceCapabilities.get(binding) ?? null;
 }
 
 /** Resolve only a stable identity from signed native claims. */
@@ -417,10 +524,10 @@ export function accountAssertionForBinding(options: {
 }): AccountAssertionV1 {
   const source = options.source ?? "codex";
   if (!SOURCE_SET.has(source)) throw new Error("account_assertion_source_invalid");
-  const binding = options.binding ?? {
+  const binding = options.binding ?? (source === "codex" ? undefined : {
     providerAccountId: options.accountIdentity ?? options.providerAccountId ?? options.chatgptAccountId ??
       options.accountId ?? options.accountUuid,
-  };
+  });
   if (binding && typeof binding === "object" && "source" in binding &&
       typeof (binding as { source?: unknown }).source === "string" &&
       (binding as { source: string }).source !== source) {
@@ -619,7 +726,7 @@ export function enrollCodexAccountAssertion(options: {
   db?: DB;
   rootId: string;
   rootDigest: string;
-  binding: unknown;
+  binding: CodexNativeAuthBinding;
   collectorHome: string;
   validFrom: string;
   validUntil?: string | null;
@@ -663,12 +770,14 @@ export function closeCodexAccountAssertionWindow(db: DB, rootId: string, validUn
 
 /** Persist one assertion and close the prior open window for this root. */
 export function persistCodexAccountAssertion(db: DB, rootId: string, rootDigest: string, assertion: AccountAssertionV1,
-  bindingKey?: string) {
+  bindingKey?: string, installationEpochId?: string) {
   if (assertion.source !== "codex") throw new Error("account_assertion_source_invalid");
   if (!ROOT_ID.test(rootId)) throw new Error("account_root_id_invalid");
   validateAccountAssertionWindow(assertion);
   if (!HASH.test(rootDigest) && !HEX_DIGEST.test(rootDigest)) throw new Error("account_root_digest_invalid");
   if (bindingKey !== undefined && !HASH.test(bindingKey)) throw new Error("account_binding_key_invalid");
+  if (installationEpochId !== undefined && !z.string().uuid().safeParse(installationEpochId).success)
+    throw new Error("installation_epoch_id_invalid");
   // Keep each assertion epoch distinct even when a provider re-enrolls the
   // same native binding.  The evidence reference remains the native-record
   // digest exposed to events; this private key excludes the mutable window
@@ -680,16 +789,33 @@ export function persistCodexAccountAssertion(db: DB, rootId: string, rootDigest:
     // cannot sneak one more assertion in after the adapter was disabled.
     if (!state.adapters.codex.enabled) throw new Error("account_assertion_adapter_disabled");
     const bindings = state.bindings.codex;
-    const activePrior = bindings.filter(row => row.rootId === rootId && row.active)
-      .sort((a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt))[0];
+    const rootBindings = bindings.filter(row => row.rootId === rootId);
+    const activeBindings = rootBindings.filter(row => row.active);
+    if (activeBindings.length > 1) throw new Error("account_assertion_state_conflict");
+    const activePrior = activeBindings[0];
     if (activePrior && Date.parse(assertion.validFrom) <= Date.parse(activePrior.assertion.validFrom)) {
       throw new Error("account_assertion_time_regression");
     }
+    const nextFrom = Date.parse(assertion.validFrom);
+    const nextUntil = assertion.validUntil === null ? Number.POSITIVE_INFINITY : Date.parse(assertion.validUntil);
+    if (rootBindings.some(row => !row.active &&
+        nextFrom < (row.assertion.validUntil === null ? Number.POSITIVE_INFINITY : Date.parse(row.assertion.validUntil)) &&
+        Date.parse(row.assertion.validFrom) < nextUntil)) {
+      throw new Error("account_assertion_window_overlap");
+    }
     closePriorCodexAssertions(state, rootId, assertion.validFrom);
     const next: AccountAssertionBindingState = {
-      rootId, bindingDigest, ...(bindingKey ? { bindingKey } : {}), assertion, active: true, createdAt: assertion.validFrom,
+      rootId, bindingDigest, ...(bindingKey ? { bindingKey } : {}),
+      ...(installationEpochId ? { installationEpochId } : {}), assertion, active: true, createdAt: assertion.validFrom,
     };
-    state.bindings.codex = [next, ...bindings.filter(row => row.bindingDigest !== bindingDigest)].slice(0, 1024);
+    const candidates = [next, ...bindings.filter(row => row.bindingDigest !== bindingDigest)];
+    // Never let churn on one root evict an active interval for another root.
+    // If active state alone exceeds the bounded maintenance record, refuse the
+    // mutation and leave the transaction unchanged.
+    const active = candidates.filter(row => row.active);
+    if (active.length > 1024) throw new Error("account_assertion_state_capacity");
+    const inactive = candidates.filter(row => !row.active);
+    state.bindings.codex = [...active, ...inactive.slice(0, 1024 - active.length)];
     const adapter = state.adapters.codex;
     if (!adapter.lastAssertionAt || Date.parse(assertion.validFrom) >= Date.parse(adapter.lastAssertionAt)) {
       adapter.lastAssertionAt = assertion.validFrom;
@@ -708,7 +834,7 @@ export const enrollCodexCaptureRoot = enrollCodexAccountAssertion;
 export function attachCodexAccountAssertion<TRoot extends { source: string; account?: unknown }>(
   root: TRoot,
   options: {
-    binding: unknown;
+    binding: CodexNativeAuthBinding;
     collectorHome: string;
     validFrom: string;
     validUntil?: string | null;
@@ -736,14 +862,15 @@ export function activeCodexAccountAssertion(db: DB, rootId: string, bindingKey?:
 }
 
 /** Every immutable interval, including closed failover windows. */
-export function codexAccountAssertionIntervals(db: DB, rootId: string): AccountAssertionV1[] {
-  const state = readAccountAssertionAdapterState(db);
-  return state.bindings.codex
+export function codexAccountAssertionBindings(db: DB, rootId: string): AccountAssertionBindingState[] {
+  return readAccountAssertionAdapterState(db).bindings.codex
     .filter(binding => binding.rootId === rootId)
     .sort((a, b) => Date.parse(a.assertion.validFrom) - Date.parse(b.assertion.validFrom))
-    .map(binding => accountAssertionV1Schema.safeParse(binding.assertion))
-    .filter((parsed): parsed is { success: true; data: AccountAssertionV1 } => parsed.success)
-    .map(parsed => parsed.data);
+    .map(binding => ({ ...binding, assertion: accountAssertionV1Schema.parse(binding.assertion) }));
+}
+
+export function codexAccountAssertionIntervals(db: DB, rootId: string): AccountAssertionV1[] {
+  return codexAccountAssertionBindings(db, rootId).map(binding => binding.assertion);
 }
 
 export function codexAccountAssertionAt(db: DB, rootId: string, at: string): AccountAssertionV1 | null {

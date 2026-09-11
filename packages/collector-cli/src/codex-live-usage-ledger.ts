@@ -111,6 +111,11 @@ function pinMatches(pin: Pin | undefined, auth: LiveAuthenticatedBinding) {
   return Boolean(pin && pin.producer_id === auth.context.producerId && pin.context_digest === auth.contextDigest);
 }
 const liveEventCapabilities = new WeakMap<AiInteractionEvent, { database: DB; auth: LiveAuthenticatedBinding }>();
+/** Read-only source-epoch sidecar; request JSON cannot manufacture it. */
+export function liveUsageInstallationEpoch(db: DB, event: AiInteractionEvent) {
+  const capability = liveEventCapabilities.get(event);
+  return capability?.database === db ? capability.auth.context.installationEpochId : undefined;
+}
 export function liveUsageMetricAllowed(db: DB, sample: MetricSample) {
   return !hasLiveUsageClaim(sample.attrs) && !(sample.source === "codex" && sample.sessionId &&
     /token/i.test(sample.metricName) && readPin(db, sample.sessionId));
@@ -203,7 +208,8 @@ export function ingestLiveUsage(buffer: LocalEventBuffer, packet: LivePacket, di
       if (!isAuthenticatedLiveBinding(auth)) throw new HttpBoundaryRejection("producer_token_invalid", 403);
       // Echo checks always precede any scoped lookup, including a known retry.
       if (packet.producerId !== auth.binding.producerId || packet.credentialId !== auth.binding.credentialId ||
-          packet.capturedAt < auth.binding.enrolledAt || buffer.eventAdmissionReason(packet.capturedAt, auth.context.installationEpochId))
+          packet.capturedAt < auth.binding.enrolledAt ||
+          buffer.eventAdmissionReason(packet.capturedAt, auth.context.installationEpochId, auth.context.installationEpochId))
         return liveReceipt(packet, digest, "enrollment_rejected", false, null);
       const key = packet.kind === "usage" ? String(packet.observationSeq) : packet.controlId;
       const identity = [auth.scopeDigest, packet.kind, packet.attachmentId, key];

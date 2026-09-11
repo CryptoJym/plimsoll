@@ -1613,6 +1613,7 @@ async function main() {
       collectorHome: collectorHome(), tenantId: config.tenantId, deviceId: config.deviceId,
       uploadUrl: config.uploadUrl, installKey: config.installKey, ingestKey: config.ingestKey,
       signingSecret: config.uploadSigningSecret,
+      endpointUrl: config.accountActorSaltEndpoint,
     });
     console.log(JSON.stringify({ status: result.synced ? "account_salt_synced" : "account_salt_unallocated",
       tenantId: result.tenantId, saltVersion: result.saltVersion, synced: result.synced }, null, 2));

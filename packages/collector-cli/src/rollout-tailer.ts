@@ -404,6 +404,7 @@ export class RolloutTailer {
     private readonly io: JsonlTailerIo = DEFAULT_JSONL_TAILER_IO,
     captureRoots?: CaptureRoot[],
     private readonly accountAttributionEnabled: () => boolean = () => true,
+    private readonly captureRootAt: (root: CaptureRoot | undefined, observedAt: string) => CaptureRoot | undefined = root => root,
   ) {
     this.inventoryConfigured = captureRoots !== undefined;
     this.captureRoots = validateCaptureRoots(captureRoots ?? []);
@@ -1447,9 +1448,12 @@ export class RolloutTailer {
         ? identity.actorHash
         : undefined;
     for (const entry of pending) {
+      const observedAt = entry.observedAt ?? fallbackObservedAt;
+      const activeCaptureRoot = this.captureRootAt(this.activeCaptureRoot, observedAt);
       // Counter state already advanced: dropping old/undated observations must
       // not charge their cumulative tokens to the next valid observation.
-      if (this.buffer.eventAdmissionReason(entry.observedAt, this.activeCaptureRoot?.installationEpochId)) {
+      if (this.buffer.eventAdmissionReason(observedAt, activeCaptureRoot?.installationEpochId,
+          activeCaptureRoot?.account && "schema" in activeCaptureRoot.account ? activeCaptureRoot.installationEpochId : undefined)) {
         result.enrollmentExcludedEvents = (result.enrollmentExcludedEvents ?? 0) + 1;
         continue;
       }
@@ -1467,7 +1471,7 @@ export class RolloutTailer {
             cacheReadTokens: entry.delta.cachedInput,
           });
       const metadata: Record<string, unknown> = {
-        ...rootEventMetadata(this.activeCaptureRoot, deterministicEventId(["codex-rollout", state.conversationId, String(entry.index)]), entry.observedAt ?? fallbackObservedAt, state.conversationId,
+        ...rootEventMetadata(activeCaptureRoot, deterministicEventId(["codex-rollout", state.conversationId, String(entry.index)]), observedAt, state.conversationId,
           this.accountAttributionEnabled()),
         usageSource: "rollout",
         turnIndex: entry.index,
@@ -1497,7 +1501,7 @@ export class RolloutTailer {
         source: "codex",
         dataMode: "metadata",
         eventType: "usage_rollout",
-        observedAt: entry.observedAt ?? fallbackObservedAt,
+        observedAt,
         actorId: typeof metadata.captureAccountHash === "string" ? metadata.captureAccountHash : actorId,
         sessionId: state.conversationId,
         model: entry.model,
@@ -1517,7 +1521,7 @@ export class RolloutTailer {
       if (repoContextId && !attachRepoContextId(event, repoContextId)) {
         throw new Error("rollout_repo_context_binding_failed");
       }
-      const inserted = appendRootObservation(this.buffer, event, this.activeCaptureRoot);
+      const inserted = appendRootObservation(this.buffer, event, activeCaptureRoot);
       if (inserted) {
         result.eventsAppended += 1;
         result.tokensAppended.input += marginal.input;

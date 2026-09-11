@@ -10,10 +10,13 @@ import path from "node:path";
 import {
   ACCOUNT_ASSERTION_SALT_FILE,
   ACCOUNT_ASSERTION_SALT_META_FILE,
+  ACCOUNT_ASSERTION_STATE_KEY,
   accountAssertionV1Schema,
   codexAccountAssertionAt,
   deriveAccountActorHash,
   hashBindingRecord,
+  loadCodexNativeAccountBinding,
+  persistCodexAccountAssertion,
   readAccountAssertionAdapterState,
   resolveCodexSignedNativeEvidence,
   setAccountAssertionAdapterEnabled,
@@ -42,15 +45,17 @@ const DELAYED_AT = "2026-09-10T20:15:00.000Z";
 const DISABLED_AT = "2026-09-10T20:30:00.000Z";
 const SECOND_AT = "2026-09-10T21:00:00.000Z";
 const AFTER_SECOND = "2026-09-10T21:00:01.000Z";
+const TAILER_SESSION = "019f0000-1111-7222-8333-444444444444";
 const FLEET_SALT = Buffer.from("0123456789abcdef0123456789abcdef", "utf8");
 const RAW_EMAIL = "account-assertion-proof@example.invalid";
+const PROOF_SIGNING_KEYS = crypto.generateKeyPairSync("ed25519");
 
 type Fixture = ReturnType<typeof fixture>;
 
 function signedCodexAuth(accountId: string) {
   const encoded = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
-  const idToken = [
-    encoded({ alg: "RS256", typ: "JWT", kid: "proof-key" }),
+  const signedBytes = [
+    encoded({ alg: "EdDSA", typ: "JWT", kid: "proof-key" }),
     encoded({
       iss: "https://auth.openai.com",
       "https://api.openai.com/auth": {
@@ -58,13 +63,25 @@ function signedCodexAuth(accountId: string) {
         chatgpt_plan_type: "pro",
       },
     }),
-    Buffer.from("provider-signature-proof").toString("base64url"),
   ].join(".");
+  const signature = crypto.sign(null, Buffer.from(signedBytes, "utf8"), PROOF_SIGNING_KEYS.privateKey);
+  assert.equal(crypto.verify(null, Buffer.from(signedBytes, "utf8"), PROOF_SIGNING_KEYS.publicKey, signature), true);
+  const idToken = `${signedBytes}.${signature.toString("base64url")}`;
   return {
     record: { email: RAW_EMAIL, tokens: { id_token: idToken } },
     idToken,
     evidenceRef: `sha256:${crypto.createHash("sha256").update(idToken, "utf8").digest("hex")}`,
   };
+}
+
+function readNativeCodexAuth(record: Record<string, unknown>) {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-native-codex-auth-"));
+  fs.chmodSync(directory, 0o700);
+  const file = path.join(directory, "auth.json");
+  fs.writeFileSync(file, JSON.stringify(record), { mode: 0o600 });
+  fs.chmodSync(file, 0o600);
+  try { return loadCodexNativeAccountBinding(file); }
+  finally { fs.unlinkSync(file); fs.rmdirSync(directory); }
 }
 
 function fixture(label: string, options: { salt?: boolean } = {}) {
@@ -84,6 +101,7 @@ function fixture(label: string, options: { salt?: boolean } = {}) {
     directory: path.join(home, "codex-root"),
   };
   fs.mkdirSync(root.directory, { mode: 0o700 });
+  root.directory = fs.realpathSync(root.directory);
   const config = collectorConfigSchema.parse({
     tenantId: TENANT_ID,
     deviceId: DEVICE_ID,
@@ -108,7 +126,7 @@ function provision(subject: Fixture, producerId: string, credentialId: string, a
     credentialId,
     captureRootId: subject.root.rootId,
     enrolledAt: at,
-    accountBinding: native.record,
+    accountBinding: readNativeCodexAuth(native.record),
     ...extra,
   } as Parameters<typeof provisionLiveProducer>[0]);
   return { ...value, native };
@@ -154,7 +172,23 @@ function capacityRegistry(subject: Fixture) {
   };
 }
 
+function rolloutLine(timestamp: string, type: string, payload: Record<string, unknown>) {
+  return JSON.stringify({ timestamp, type, payload });
+}
+
+function tokenCountLine(timestamp: string, input: number, output: number) {
+  return rolloutLine(timestamp, "event_msg", {
+    type: "token_count",
+    info: { total_token_usage: {
+      input_tokens: input, cached_input_tokens: 0, output_tokens: output,
+      reasoning_output_tokens: 0, total_tokens: input + output,
+    } },
+    rate_limits: { plan_type: "pro" },
+  });
+}
+
 const opened: Fixture[] = [];
+async function main() {
 try {
   const primary = fixture("primary");
   opened.push(primary);
@@ -164,9 +198,17 @@ try {
 
   // P1 evidence: only the real Codex auth.json field is accepted. The
   // evidence reference is the digest of the exact signed id-token bytes.
-  const resolvedA = resolveCodexSignedNativeEvidence(nativeA.record);
+  assert.equal(resolveCodexSignedNativeEvidence(nativeA.record), null);
+  const nativeDirectory = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-native-codex-reread-"));
+  fs.chmodSync(nativeDirectory, 0o700);
+  const nativeFile = path.join(nativeDirectory, "auth.json");
+  fs.writeFileSync(nativeFile, JSON.stringify(nativeA.record), { mode: 0o600 });
+  fs.chmodSync(nativeFile, 0o600);
+  const resolvedA = resolveCodexSignedNativeEvidence(loadCodexNativeAccountBinding(nativeFile));
   assert.deepEqual(resolvedA, { identity: accountA, evidenceRef: nativeA.evidenceRef });
-  assert.deepEqual(resolveCodexSignedNativeEvidence(JSON.parse(JSON.stringify(nativeA.record))), resolvedA);
+  assert.deepEqual(resolveCodexSignedNativeEvidence(loadCodexNativeAccountBinding(nativeFile)), resolvedA);
+  fs.unlinkSync(nativeFile);
+  fs.rmdirSync(nativeDirectory);
   assert.equal(resolveCodexSignedNativeEvidence({ providerAccountId: accountA, credentialId: "routing-only" }), null);
 
   const enrollmentA = provision(primary, "proof-producer", "credential-a", FIRST_AT, accountA);
@@ -215,6 +257,17 @@ try {
   assert.equal(unsaltedRoots[0]?.account, undefined);
   assert.equal(unsaltedRoots[0]?.accountAssertions, undefined);
   unsaltedCapture.close();
+  delete staleUnsaltedRoot.account;
+  staleUnsaltedRoot.accountAssertions = [assertionA];
+  const unsaltedIntervalAuth = authenticateLiveProducer(unsalted.home, unsalted.buffer, unsalted.config,
+    "unsalted-producer", unsaltedToken, unsalted.localAuth);
+  assert.equal(unsaltedIntervalAuth.root.account, undefined);
+  assert.equal(unsaltedIntervalAuth.root.accountAssertions, undefined);
+  const unsaltedIntervalCapture = createProfileCapture(unsalted.buffer, { captureRoots: [staleUnsaltedRoot] });
+  const unsaltedIntervalRoots = (unsaltedIntervalCapture.rollout as unknown as { captureRoots: CaptureRoot[] }).captureRoots;
+  assert.equal(unsaltedIntervalRoots[0]?.account, undefined);
+  assert.equal(unsaltedIntervalRoots[0]?.accountAssertions, undefined);
+  unsaltedIntervalCapture.close();
 
   // P1 disable: an already authenticated producer loses the assertion
   // immediately. Disabling closes the old interval; re-enable alone cannot
@@ -225,7 +278,6 @@ try {
   assert.equal(runningRollout.accountAttributionEnabled(), false);
   assert.equal(rootEventMetadata(runningRollout.captureRoots[0], "after-disable", DELAYED_AT, undefined,
     runningRollout.accountAttributionEnabled()).captureAccountHash, undefined);
-  captureStartedBeforeDisable.close();
   const disabledAuth = authenticateLiveProducer(primary.home, primary.buffer, primary.config,
     "proof-producer", tokenA, primary.localAuth);
   assert.equal(disabledAuth.root.account, undefined);
@@ -238,6 +290,10 @@ try {
   const afterDisable = readAccountAssertionAdapterState(primary.buffer.database).bindings.codex;
   assert.equal(afterDisable.find(row => row.assertion.actorHash === assertionA.actorHash)?.assertion.validUntil, DISABLED_AT);
   setAccountAssertionAdapterEnabled(primary.buffer.database, "codex", true);
+  const reenabledOldAuth = authenticateLiveProducer(primary.home, primary.buffer, primary.config,
+    "proof-producer", tokenA, primary.localAuth);
+  assert.equal(reenabledOldAuth.root.account, undefined);
+  assert.equal(reenabledOldAuth.root.accountAssertions, undefined);
 
   // P1 failover: all immutable windows hydrate, delayed pre-failover events
   // resolve A, post-failover live events resolve B, and B has a new epoch.
@@ -275,6 +331,70 @@ try {
   assert.equal(new Set(bindingScopes.map(row => row.scope_digest)).size, 2);
   assert.equal(new Set(history.map(row => row.bindingKey)).size, 2);
 
+  // Drive the already-running tailer through its real append/admission path.
+  // The delayed event stays in A's epoch; the post-failover event uses B's
+  // epoch, and both immutable populations reach the ledger exactly once.
+  const rolloutDay = path.join(primary.root.directory, "2026", "09", "10");
+  fs.mkdirSync(rolloutDay, { recursive: true });
+  const rolloutFile = path.join(rolloutDay, `rollout-2026-09-10T20-14-58-${TAILER_SESSION}.jsonl`);
+  fs.writeFileSync(rolloutFile, [
+    rolloutLine("2026-09-10T20:14:58.000Z", "session_meta", {
+      id: TAILER_SESSION, cwd: primary.root.directory, originator: "proof",
+    }),
+    rolloutLine("2026-09-10T20:14:59.000Z", "turn_context", {
+      model: "gpt-5.5", cwd: primary.root.directory,
+    }),
+    tokenCountLine(DELAYED_AT, 10, 2),
+    tokenCountLine(AFTER_SECOND, 20, 4),
+  ].join("\n") + "\n");
+  const failoverScan = await captureStartedBeforeDisable.rollout.scan({ scope: "full", now: new Date(AFTER_SECOND) });
+  assert.equal(failoverScan.eventsAppended, 2, JSON.stringify(failoverScan));
+  const failoverRows = primary.buffer.database.prepare(`select payload_json as payload,
+    installation_epoch_id as epoch from buffered_events where session_id=? order by observed_at`).all(TAILER_SESSION) as
+    Array<{ payload: string; epoch: string }>;
+  assert.equal(failoverRows.length, 2);
+  const failoverEvents = failoverRows.map(row => ({ payload: JSON.parse(row.payload) as {
+    metadata: Record<string, unknown>; actorId?: string;
+  }, epoch: row.epoch }));
+  assert.deepEqual(failoverEvents.map(event => event.payload.actorId), [assertionA.actorHash, assertionB.actorHash]);
+  assert.deepEqual(failoverEvents.map(event => event.payload.metadata.installationEpochId),
+    [enrollmentA.binding.installationEpochId, enrollmentB.binding.installationEpochId]);
+  assert.deepEqual(failoverEvents.map(event => event.epoch),
+    [enrollmentA.binding.installationEpochId, enrollmentB.binding.installationEpochId]);
+  captureStartedBeforeDisable.close();
+
+  // Source-binding epochs are per binding. Enrolling another producer cannot
+  // rotate the workspace out from under an existing producer.
+  const multi = fixture("multi");
+  opened.push(multi);
+  const multiWorkspaceEpoch = multi.buffer.workspaceBinding()!.currentInstallationEpochId;
+  const multiA = provision(multi, "multi-producer-a", "multi-credential-a", FIRST_AT, accountA);
+  const multiB = provision(multi, "multi-producer-b", "multi-credential-b", SECOND_AT, accountB);
+  assert.notEqual(multiA.binding.installationEpochId, multiB.binding.installationEpochId);
+  assert.equal(multi.buffer.workspaceBinding()!.currentInstallationEpochId, multiWorkspaceEpoch);
+  for (const [producerId, enrollment] of [["multi-producer-a", multiA], ["multi-producer-b", multiB]] as const) {
+    const credential = fs.readFileSync(enrollment.credentialFile, "utf8");
+    assert.equal(authenticateLiveProducer(multi.home, multi.buffer, multi.config,
+      producerId, credential, multi.localAuth).binding.installationEpochId, enrollment.binding.installationEpochId);
+  }
+
+  // Once closed, a historical interval can never be overlapped by a backdated
+  // assertion. The refusal leaves the additive maintenance record unchanged.
+  const overlap = fixture("overlap");
+  opened.push(overlap);
+  const overlapEnrollment = provision(overlap, "overlap-producer", "overlap-credential", FIRST_AT, accountA);
+  (setAccountAssertionAdapterEnabled as unknown as (
+    db: typeof overlap.buffer.database, source: "codex", enabled: boolean, at?: string,
+  ) => unknown)(overlap.buffer.database, "codex", false, SECOND_AT);
+  setAccountAssertionAdapterEnabled(overlap.buffer.database, "codex", true);
+  const overlapBefore = databaseState(overlap);
+  const overlapFailure = errorMessage(() => persistCodexAccountAssertion(overlap.buffer.database,
+    overlap.root.rootId, captureRootDigest(overlap.root), {
+      ...accountAssertionV1Schema.parse(overlapEnrollment.accountAssertion), validFrom: DELAYED_AT, validUntil: null,
+    }, `sha256:${"b".repeat(64)}`, crypto.randomUUID()));
+  assert.match(overlapFailure, /account_assertion_window_overlap/);
+  assert.equal(databaseState(overlap), overlapBefore);
+
   // P1 atomicity (reviewer's capacity probe): a full valid registry rejects a
   // 65th producer without changing workspace epoch, assertion history, the
   // active prior window, registry bytes, or live credential rows.
@@ -301,6 +421,41 @@ try {
   assert.equal(fs.existsSync(path.join(capacity.home,
     `live-producer-${liveSha256("overflow-producer").slice(0, 32)}.token`)), false);
 
+  // A registration-layer refusal occurs before publication and rolls back the
+  // candidate assertion. This reproduces the real context-rebinding guard,
+  // rather than an artificial throw inside the transaction.
+  const registration = fixture("registration");
+  opened.push(registration);
+  provision(registration, "registration-producer", "registration-a", FIRST_AT, accountA);
+  const secondRoot: CaptureRoot = {
+    ...registration.root,
+    rootId: "registration-second-root",
+    profileId: "registration-second-profile",
+    directory: path.join(registration.home, "codex-second-root"),
+  };
+  fs.mkdirSync(secondRoot.directory, { mode: 0o700 });
+  secondRoot.directory = fs.realpathSync(secondRoot.directory);
+  const secondConfig = collectorConfigSchema.parse({
+    ...registration.config, captureRoots: [registration.root, secondRoot],
+  });
+  const registrationBefore = {
+    state: databaseState(registration),
+    registry: fs.readFileSync(path.join(registration.home, LIVE_BINDINGS_FILE), "utf8"),
+    liveBindings: registration.buffer.database.prepare("select count(*) as count from codex_live_bindings").get(),
+  };
+  const registrationNative = signedCodexAuth(accountB);
+  const registrationFailure = errorMessage(() => provisionLiveProducer({
+    home: registration.home, buffer: registration.buffer, config: secondConfig,
+    producerId: "registration-producer", credentialId: "registration-b",
+    captureRootId: secondRoot.rootId, enrolledAt: SECOND_AT,
+    accountBinding: readNativeCodexAuth(registrationNative.record),
+  }));
+  assert.match(registrationFailure, /live_producer_rebinding_forbidden/);
+  assert.equal(databaseState(registration), registrationBefore.state);
+  assert.equal(fs.readFileSync(path.join(registration.home, LIVE_BINDINGS_FILE), "utf8"), registrationBefore.registry);
+  assert.deepEqual(registration.buffer.database.prepare("select count(*) as count from codex_live_bindings").get(),
+    registrationBefore.liveBindings);
+
   // P1 atomicity (publication probe): fail after credential publication but
   // before registry publication; compensation restores both files and the
   // SQLite/workspace state exactly.
@@ -318,12 +473,12 @@ try {
   let publicationCalls = 0;
   const publicationFailure = errorMessage(() => provision(publication, "publication-producer", "publication-b",
     SECOND_AT, accountB, {
-      beforeFilePublication: (kind: string) => {
+      afterFilePublication: (kind: string) => {
         publicationCalls += 1;
-        if (kind === "registry") throw new Error("proof_registry_publication_failure");
+        if (kind === "registry") throw new Error("proof_registry_post_fsync_failure");
       },
     }));
-  assert.match(publicationFailure, /proof_registry_publication_failure/);
+  assert.match(publicationFailure, /proof_registry_post_fsync_failure/);
   assert.equal(publicationCalls, 2);
   assert.equal(databaseState(publication), publicationBefore.state);
   assert.equal(workspaceState(publication), publicationBefore.workspace);
@@ -331,6 +486,43 @@ try {
   assert.equal(fs.readFileSync(publishedA.credentialFile, "utf8"), publicationBefore.credential);
   assert.deepEqual(publication.buffer.database.prepare("select count(*) as count from codex_live_bindings").get(),
     publicationBefore.liveBindings);
+
+  const tokenFailure = errorMessage(() => provision(publication, "publication-producer", "publication-c",
+    SECOND_AT, accountB, {
+      beforeFilePublication: (kind: string) => {
+        if (kind === "credential") throw new Error("proof_credential_publication_failure");
+      },
+    }));
+  assert.match(tokenFailure, /proof_credential_publication_failure/);
+  assert.equal(databaseState(publication), publicationBefore.state);
+  assert.equal(fs.readFileSync(publicationRegistry, "utf8"), publicationBefore.registry);
+  assert.equal(fs.readFileSync(publishedA.credentialFile, "utf8"), publicationBefore.credential);
+
+  // The bounded maintenance record refuses a 1,025th active root instead of
+  // evicting an unrelated root's active assertion.
+  const stateCapacity = fixture("state-capacity");
+  opened.push(stateCapacity);
+  const fullState = readAccountAssertionAdapterState(stateCapacity.buffer.database);
+  const seededAssertion = accountAssertionV1Schema.parse({
+    ...assertionA, validFrom: FIRST_AT, validUntil: null,
+  });
+  fullState.bindings.codex = Array.from({ length: 1024 }, (_, index) => ({
+    rootId: `state-root-${index}`,
+    bindingDigest: `sha256:${index.toString(16).padStart(64, "0")}`,
+    assertion: seededAssertion, active: true, createdAt: FIRST_AT,
+  }));
+  stateCapacity.buffer.database.exec(`create table if not exists maintenance_state (
+    key text primary key, value text not null, updated_at text not null)`);
+  stateCapacity.buffer.database.prepare(`insert into maintenance_state(key,value,updated_at) values(?,?,?)
+    on conflict(key) do update set value=excluded.value,updated_at=excluded.updated_at`)
+    .run(ACCOUNT_ASSERTION_STATE_KEY, JSON.stringify(fullState), FIRST_AT);
+  const fullStateBefore = databaseState(stateCapacity);
+  const stateCapacityFailure = errorMessage(() => persistCodexAccountAssertion(stateCapacity.buffer.database,
+    "state-overflow-root", captureRootDigest(stateCapacity.root), {
+      ...seededAssertion, validFrom: SECOND_AT,
+    }, `sha256:${"c".repeat(64)}`, crypto.randomUUID()));
+  assert.match(stateCapacityFailure, /account_assertion_state_capacity/);
+  assert.equal(databaseState(stateCapacity), fullStateBefore);
 
   // P2 canonicalisation: depth, width, byte, and cycle attacks all fail with
   // controlled contract errors rather than RangeError/stack overflow.
@@ -342,6 +534,9 @@ try {
     { maxBytes: 1024 * 1024 },
   ));
   const bytesFailure = errorMessage(() => hashBindingRecord("x".repeat(20_000)));
+  const escapedValue = `quoted \" slash \\ newline\n ${"a".repeat(1_015)}😀tail`;
+  assert.equal(hashBindingRecord({ escapedValue }), `sha256:${crypto.createHash("sha256")
+    .update(JSON.stringify({ escapedValue }), "utf8").digest("hex")}`);
   const cyclic: { self?: unknown } = {};
   cyclic.self = cyclic;
   const cycleFailure = errorMessage(() => hashBindingRecord(cyclic));
@@ -364,8 +559,13 @@ try {
     checks: {
       disableAuthoritativeAndFreshReenable: true,
       eventTimeFailoverAndNewEpoch: true,
+      actualTailerFailoverAndEpochDedupe: true,
+      multiProducerEpochIsolation: true,
+      overlapRejected: true,
       provisioningCapacityAtomic: true,
+      provisioningRegistrationAtomic: true,
       provisioningPublicationCompensated: true,
+      activeStateCapacityFailClosed: true,
       fleetSaltNoLocalFallback: true,
       signedNativeEvidenceStable: true,
       canonicalisationBudgetsControlled: true,
@@ -380,3 +580,9 @@ try {
 } finally {
   for (const subject of opened) subject.buffer.close();
 }
+}
+
+void main().catch(error => {
+  console.error(error);
+  process.exitCode = 1;
+});

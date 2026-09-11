@@ -2,11 +2,17 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
-import { accountAssertionV1Schema, type AccountAssertionV1 } from "./account-assertion";
+import { accountAssertionContains, accountAssertionV1Schema, type AccountAssertionV1 } from "./account-assertion";
 const id=z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
 const legacyAccountSchema=z.object({
   actorHash: z.string().regex(/^sha256:[a-f0-9]{64}$/),
   validFrom: z.iso.datetime(),validUntil: z.iso.datetime().nullable(),evidenceRef: id
+}).strict();
+const accountAssertionEpochSchema=z.object({
+  actorHash: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+  validFrom: z.iso.datetime(),
+  evidenceRef: z.string().regex(/^sha256:[a-f0-9]{64}$/),
+  installationEpochId: z.string().uuid(),
 }).strict();
 export const captureRootSchema=z.object({
   rootId: id,profileId: id,installationEpochId: id,
@@ -21,6 +27,8 @@ export const captureRootSchema=z.object({
   account: z.union([legacyAccountSchema,accountAssertionV1Schema]).optional(),
   /** Immutable historical account windows hydrated from the maintenance key. */
   accountAssertions: z.array(accountAssertionV1Schema).max(1024).optional(),
+  /** Hash-only mapping from each assertion window to its source-binding epoch. */
+  accountAssertionEpochs: z.array(accountAssertionEpochSchema).max(1024).optional(),
 }).strict();
 export type CaptureRoot=z.infer<typeof captureRootSchema>;
 export type CaptureRootAccount=NonNullable<CaptureRoot["account"]>;
@@ -57,8 +65,20 @@ export function validateCaptureRoots(input: unknown): CaptureRoot[] {
         throw new Error("capture_identity_window_invalid");
     }
     for (let i = 1; i < assertions.length; i += 1) {
-      if (Date.parse(assertions[i - 1].validFrom) >= Date.parse(assertions[i].validFrom))
+      const previous = assertions[i - 1];
+      if (Date.parse(previous.validFrom) >= Date.parse(assertions[i].validFrom) ||
+          previous.validUntil === null ||
+          Date.parse(previous.validUntil) > Date.parse(assertions[i].validFrom))
         throw new Error("capture_identity_window_invalid");
+    }
+    const epochKeys = new Set<string>();
+    for (const epoch of root.accountAssertionEpochs ?? []) {
+      const key = `${epoch.actorHash}\u0000${epoch.validFrom}\u0000${epoch.evidenceRef}`;
+      if (epochKeys.has(key) || !assertions.some(assertion => assertion.actorHash === epoch.actorHash &&
+          assertion.validFrom === epoch.validFrom && assertion.evidenceRef === epoch.evidenceRef)) {
+        throw new Error("capture_identity_epoch_invalid");
+      }
+      epochKeys.add(key);
     }
     for(const binding of root.dispatch??[]) {
       if(binding.validUntil&&Date.parse(binding.validUntil)<=Date.parse(binding.validFrom)) {
@@ -113,10 +133,13 @@ export function rootEventMetadata(root: CaptureRoot|undefined,sourceEventId: str
   const at=Date.parse(observedAt);
   const accountCandidates = accountAttributionEnabled ? [...new Map(
     [ ...(root.accountAssertions ?? []), ...(root.account ? [root.account] : []) ]
-      .map(account => [`${account.validFrom}\u0000${account.evidenceRef}`, account] as const),
+      .map(account => [JSON.stringify([account.actorHash,account.validFrom,account.validUntil,account.evidenceRef]), account] as const),
   ).values()] : [];
   const matchingAccounts = accountCandidates.filter(account => at>=Date.parse(account.validFrom)&&(!account.validUntil||at<Date.parse(account.validUntil)));
   const account = matchingAccounts.length === 1 ? matchingAccounts[0] : null;
+  const accountEpochs = account ? (root.accountAssertionEpochs ?? []).filter(epoch =>
+    epoch.actorHash===account.actorHash&&epoch.validFrom===account.validFrom&&epoch.evidenceRef===account.evidenceRef) : [];
+  const installationEpochId = accountEpochs.length===1 ? accountEpochs[0].installationEpochId : root.installationEpochId;
   const bindings=(root.dispatch??[]).filter(binding => binding.sessionId===sessionId&&at>=Date.parse(binding.validFrom)&&(!binding.validUntil||at<Date.parse(binding.validUntil)));
   const binding=bindings.length===1? bindings[0]:null;
   return {
@@ -127,10 +150,10 @@ export function rootEventMetadata(root: CaptureRoot|undefined,sourceEventId: str
       ...(binding.companyRef? { companyRef: binding.companyRef }:{}),
       ...(binding.acceptedOutcomeId? { acceptedOutcomeId: binding.acceptedOutcomeId }:{}),
     }:{}),...(bindings.length>1? { workAttributionState: "conflict" }:{}),
-    captureRootId: root.rootId,captureProfileId: root.profileId,installationEpochId: root.installationEpochId,
+    captureRootId: root.rootId,captureProfileId: root.profileId,installationEpochId,
     logicalSourceEventId: sourceEventId,sourceIdentityEvidenceRef: "native_runtime_event_v1",
     ...(account ? { captureAccountHash: account.actorHash,accountEvidenceRef: account.evidenceRef } : {}),
-    ...(matchingAccounts.length > 1 ? { accountAttributionState: "conflict" } : {})
+    ...(matchingAccounts.length > 1 || accountEpochs.length > 1 ? { accountAttributionState: "conflict" } : {})
   };
 }
 /** Reopen the existing provider baseline at its original cutoff when the inventory changes.
@@ -161,6 +184,11 @@ export function bindCaptureInventory(database: import("better-sqlite3").Database
   return true;
 }
 const initializedObservationDatabases=new WeakSet<object>();
+const captureRootEpochCapabilities=new WeakMap<object,string>();
+/** Read-only sidecar used by LocalEventBuffer; JSON cannot mint this capability. */
+export function captureRootEventInstallationEpoch(event: object) {
+  return captureRootEpochCapabilities.get(event);
+}
 function ensureRootObservationSchema(database: import("better-sqlite3").Database) {
   if(initializedObservationDatabases.has(database))
     return;
@@ -175,7 +203,10 @@ function ensureRootObservationSchema(database: import("better-sqlite3").Database
 }
 /** Root sightings live beside immutable events; replay/failover never changes the first receipt. */
 export function appendRootObservation(buffer: import("./buffer").LocalEventBuffer,event: import("../../shared/src/schemas").AiInteractionEvent,root: CaptureRoot|undefined): boolean {
-  if (buffer.eventAdmissionReason(event.observedAt, root?.installationEpochId ?? event.metadata?.installationEpochId))
+  const parsedAccount = root?.account ? accountAssertionV1Schema.safeParse(root.account) : null;
+  const trustedEpoch = root && parsedAccount?.success && accountAssertionContains(parsedAccount.data, event.observedAt) &&
+    event.metadata?.installationEpochId===root.installationEpochId ? root.installationEpochId : undefined;
+  if (buffer.eventAdmissionReason(event.observedAt, root?.installationEpochId ?? event.metadata?.installationEpochId, trustedEpoch))
     return false;
   if(!root)
     return buffer.append(event,[]);
@@ -207,9 +238,14 @@ export function appendRootObservation(buffer: import("./buffer").LocalEventBuffe
   }
   else
     same=priorSightings.length>0&&!priorConflict;
-  const inserted=alreadyObserved? false:buffer.append(event,[]);
+  let inserted=false;
+  if(!alreadyObserved) {
+    if(trustedEpoch) captureRootEpochCapabilities.set(event,trustedEpoch);
+    try { inserted=buffer.append(event,[]); }
+    finally { captureRootEpochCapabilities.delete(event); }
+  }
   // Another connection may have enrolled between the first check and append.
-  if (!alreadyObserved && !inserted && buffer.eventAdmissionReason(event.observedAt, root?.installationEpochId))
+  if (!alreadyObserved && !inserted && buffer.eventAdmissionReason(event.observedAt, root?.installationEpochId, trustedEpoch))
     return false;
   const state=priorConflict? "conflict":alreadyObserved? (same? "duplicate":"conflict"):inserted? "admitted":"conflict";
   database.prepare(`insert into capture_root_observations values(?,?,?,?,?)

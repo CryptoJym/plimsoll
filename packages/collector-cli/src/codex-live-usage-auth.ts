@@ -15,10 +15,12 @@ import {
   accountAssertionContains,
   accountAssertionAdapterEnabled,
   accountAssertionForBinding,
-  codexAccountAssertionAt,
+  activeCodexAccountAssertion,
   codexAccountAssertionIntervals,
   codexBindingEpochDigest,
+  closeAccountAssertionWindow,
   closeCodexAccountAssertionWindow,
+  type CodexNativeAuthBinding,
   persistCodexAccountAssertion,
   validateAccountAssertionWindow,
 } from "./account-assertion";
@@ -129,24 +131,27 @@ export function currentLiveContext(buffer: LocalEventBuffer, config: CollectorCo
       root.source !== "codex" || root.profileId !== binding.profileId ||
       captureRootDigest(root) !== binding.captureRootDigest ||
       !current?.currentInstallationEpochId || !current.currentDeviceId ||
-      current.currentInstallationEpochId !== binding.installationEpochId ||
       current.currentWorkspaceId !== config.tenantId || current.currentDeviceId !== config.deviceId ||
-      buffer.currentDeviceId !== current.currentDeviceId || buffer.eventAdmissionReason(binding.enrolledAt, binding.installationEpochId))
+      buffer.currentDeviceId !== current.currentDeviceId || buffer.eventAdmissionReason(binding.enrolledAt))
     throw new HttpBoundaryRejection("source_not_allowed", 403);
   const adapterEnabled = accountAssertionAdapterEnabled(buffer.database, "codex");
   const explicitAssertion = Object.prototype.hasOwnProperty.call(options, "accountAssertion");
   const persistedIntervals = adapterEnabled
     ? (options.accountAssertions ?? codexAccountAssertionIntervals(buffer.database, binding.captureRootId))
     : [];
-  const rootHasVersionedAssertion = Boolean(root.account && accountAssertionV1Schema.safeParse(root.account).success);
+  const rootAccountIsVersioned = Boolean(root.account && accountAssertionV1Schema.safeParse(root.account).success);
+  const rootHasVersionedAssertion = rootAccountIsVersioned || Boolean(root.accountAssertions?.length);
   const persistedAssertion = !adapterEnabled ? null : explicitAssertion
     ? options.accountAssertion
-    : codexAccountAssertionAt(buffer.database, binding.captureRootId, binding.enrolledAt);
+    : activeCodexAccountAssertion(buffer.database, binding.captureRootId, codexBindingEpochDigest(binding));
   let effectiveRoot = root;
   if (!adapterEnabled || ((persistedAssertion === null || persistedAssertion === undefined) &&
       (explicitAssertion || rootHasVersionedAssertion))) {
-    const { account: _discardedAccount, accountAssertions: _discardedIntervals, ...withoutAssertion } = root;
-    effectiveRoot = withoutAssertion;
+    const { account: configuredAccount, accountAssertions: _discardedIntervals,
+      accountAssertionEpochs: _discardedEpochs, ...withoutAssertion } = root;
+    effectiveRoot = adapterEnabled && configuredAccount && !rootAccountIsVersioned
+      ? { ...withoutAssertion, account: configuredAccount }
+      : withoutAssertion;
   }
   if (adapterEnabled && persistedAssertion !== null && persistedAssertion !== undefined) {
     const parsed = accountAssertionV1Schema.safeParse(persistedAssertion);
@@ -155,7 +160,9 @@ export function currentLiveContext(buffer: LocalEventBuffer, config: CollectorCo
     validateAccountAssertionWindow(parsed.data);
     if (!accountAssertionContains(parsed.data, binding.enrolledAt))
       throw new HttpBoundaryRejection("source_not_allowed", 403);
-    effectiveRoot = { ...root, account: parsed.data, ...(persistedIntervals.length ? { accountAssertions: persistedIntervals } : {}) };
+    const { accountAssertions: _configuredIntervals, accountAssertionEpochs: _configuredEpochs, ...withoutStaticIntervals } = root;
+    effectiveRoot = { ...withoutStaticIntervals, account: parsed.data,
+      ...(persistedIntervals.length ? { accountAssertions: persistedIntervals } : {}) };
   }
   if (effectiveRoot.account && accountAssertionV1Schema.safeParse(effectiveRoot.account).success &&
       (effectiveRoot.account as { source: string }).source !== "codex")
@@ -190,7 +197,7 @@ export function authenticateLiveProducer(home: string, buffer: LocalEventBuffer,
   // Claude Code/conductor state remains untouched.
   const adapterEnabled = accountAssertionAdapterEnabled(buffer.database, "codex");
   const assertionOption = adapterEnabled
-    ? (codexAccountAssertionAt(buffer.database, binding.captureRootId, binding.enrolledAt) ?? undefined)
+    ? (activeCodexAccountAssertion(buffer.database, binding.captureRootId, codexBindingEpochDigest(binding)) ?? undefined)
     : null;
   const authenticated = currentLiveContext(buffer, config, binding,
     adapterEnabled ? (assertionOption === undefined ? {} : { accountAssertion: assertionOption }) : { accountAssertion: null });
@@ -211,18 +218,23 @@ function atomicPrivateWrite(file: string, bytes: string) {
     const directory = fs.openSync(home, "r"); try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
   } finally { if (fd !== undefined) fs.closeSync(fd); if (fs.existsSync(tmp)) fs.unlinkSync(tmp); }
 }
+function unlinkPrivateFile(file: string) {
+  fs.unlinkSync(file);
+  const directory = fs.openSync(path.dirname(file), "r");
+  try { fs.fsyncSync(directory); } finally { fs.closeSync(directory); }
+}
 /** Same-user owner API. No HTTP provisioning route; returns no token and never prints. */
 export function provisionLiveProducer(options: { home: string; buffer: LocalEventBuffer; config: CollectorConfig;
   producerId: string; credentialId: string; captureRootId: string; enrolledAt?: string;
   /** Native signed Codex binding record; no routing/credential fallback is allowed. */
   accountIdentity?: string; providerAccountId?: string; chatgptAccountId?: string;
   accountId?: string; accountUuid?: string;
-  accountBinding?: Record<string, unknown>;
-  signedNativeEvidence?: unknown;
+  accountBinding?: CodexNativeAuthBinding;
   /** Digest is accepted only as a consistency check against signed bytes. */
   evidenceRef?: string; accountEvidenceRef?: string;
   /** Proof seam: fail one private-file publication without monkey-patching fs. */
-  beforeFilePublication?: (kind: "credential" | "registry") => void }) {
+  beforeFilePublication?: (kind: "credential" | "registry") => void;
+  afterFilePublication?: (kind: "credential" | "registry") => void }) {
   const { home, buffer, config, producerId, credentialId } = options;
   privateStat(home, true);
   if (![producerId, credentialId, options.captureRootId].every(v => LIVE_ID.test(v))) throw new Error("live_binding_invalid");
@@ -241,8 +253,7 @@ export function provisionLiveProducer(options: { home: string; buffer: LocalEven
   // identity while each live credential epoch is independently dedupable.
   const currentWorkspace = buffer.workspaceBinding();
   const installationEpochId = rotating ? crypto.randomUUID() : (currentWorkspace?.currentInstallationEpochId ?? root.installationEpochId);
-  const accountBinding = { ...(options.accountBinding ?? {}),
-    ...(options.signedNativeEvidence !== undefined ? { signedNativeEvidence: options.signedNativeEvidence } : {}) };
+  const accountBinding = options.accountBinding;
   const adapterEnabled = accountAssertionAdapterEnabled(buffer.database, "codex");
   // Missing signed native evidence or the fleet salt means explicit
   // unallocated enrollment.  Never synthesize identity from credentialId or
@@ -258,10 +269,15 @@ export function provisionLiveProducer(options: { home: string; buffer: LocalEven
       if (!code.includes("signed_evidence") && !code.includes("salt_unavailable")) throw error;
     }
   }
-  const intervalAssertions = [...priorIntervals, ...(assertion ? [assertion] : [])];
+  const intervalAssertions = [
+    ...priorIntervals.map(prior => prior.validUntil === null ? closeAccountAssertionWindow(prior, enrolledAt) : prior),
+    ...(assertion ? [assertion] : []),
+  ];
+  const { account: _configuredAccount, accountAssertions: _configuredAssertions,
+    accountAssertionEpochs: _configuredEpochs, ...rootWithoutAssertion } = root;
   const enrolledRoot = assertion
-    ? { ...root, account: assertion, accountAssertions: intervalAssertions }
-    : (() => { const { account: _discardedAccount, accountAssertions: _discardedIntervals, ...withoutAssertion } = root; return withoutAssertion; })();
+    ? { ...rootWithoutAssertion, account: assertion, accountAssertions: intervalAssertions }
+    : rootWithoutAssertion;
   const enrolledConfig = { ...config, captureRoots: (config.captureRoots ?? []).map(candidate =>
     candidate.rootId === root.rootId ? enrolledRoot : candidate) };
   const binding: LiveProducerBinding = { producerId, credentialId, source: "codex", captureRootId: root.rootId,
@@ -279,18 +295,14 @@ export function provisionLiveProducer(options: { home: string; buffer: LocalEven
   const credentialFile = path.join(home, `live-producer-${liveSha256(producerId).slice(0, 32)}.token`);
   const priorCredentialBytes = fs.existsSync(credentialFile) ? fs.readFileSync(credentialFile) : null;
   const priorRegistryBytes = fs.existsSync(file) ? fs.readFileSync(file) : null;
-  const priorWorkspaceEpoch = currentWorkspace?.currentInstallationEpochId;
-  let workspaceEpochChanged = false;
   try {
-    // One SQLite transaction owns epoch selection, credential registration,
-    // and assertion-window state. Private files are compensating resources:
+    // One SQLite transaction owns credential registration and assertion-window
+    // state. Source-binding epochs are per binding; rotating one producer must
+    // not mutate the workspace epoch or invalidate another producer. Files are
+    // compensating resources:
     // either publication failure rolls SQLite back and the catch restores the
     // exact previous files plus the buffer's in-memory epoch selection.
     buffer.database.transaction(() => {
-      if (installationEpochId !== priorWorkspaceEpoch) {
-        buffer.useWorkspace(config.tenantId, config.deviceId, installationEpochId);
-        workspaceEpochChanged = true;
-      }
       const context = currentLiveContext(buffer, enrolledConfig, binding,
         adapterEnabled
           ? { accountAssertion: assertion, accountAssertions: intervalAssertions }
@@ -298,22 +310,23 @@ export function provisionLiveProducer(options: { home: string; buffer: LocalEven
       registerLiveCredential(buffer.database, context);
       options.beforeFilePublication?.("credential");
       atomicPrivateWrite(credentialFile, token);
+      options.afterFilePublication?.("credential");
       options.beforeFilePublication?.("registry");
       atomicPrivateWrite(file, canonicalJson(registry));
+      options.afterFilePublication?.("registry");
       if (assertion) persistCodexAccountAssertion(buffer.database, root.rootId,
-        `sha256:${binding.captureRootDigest}`, assertion, codexBindingEpochDigest(binding));
+        `sha256:${binding.captureRootDigest}`, assertion, codexBindingEpochDigest(binding), binding.installationEpochId);
       else closeCodexAccountAssertionWindow(buffer.database, root.rootId, enrolledAt);
     }).immediate();
   } catch (error) {
     // Explicit compensation restores both private publications and the
-    // workspace epoch.  The SQLite transaction above rolls back registration
-    // and assertion state together when either fails.
+    // SQLite transaction above rolls back registration and assertion state
+    // together when either publication fails.
     try {
       if (priorCredentialBytes !== null) atomicPrivateWrite(credentialFile, priorCredentialBytes.toString("utf8"));
-      else if (fs.existsSync(credentialFile)) fs.unlinkSync(credentialFile);
+      else if (fs.existsSync(credentialFile)) unlinkPrivateFile(credentialFile);
       if (priorRegistryBytes !== null) atomicPrivateWrite(file, priorRegistryBytes.toString("utf8"));
-      else if (fs.existsSync(file)) fs.unlinkSync(file);
-      if (workspaceEpochChanged && priorWorkspaceEpoch) buffer.useWorkspace(config.tenantId, config.deviceId, priorWorkspaceEpoch);
+      else if (fs.existsSync(file)) unlinkPrivateFile(file);
     } catch (compensation) {
       throw new Error(`account_assertion_provision_compensation_failed:${compensation instanceof Error ? compensation.message : String(compensation)}`, { cause: error });
     }
