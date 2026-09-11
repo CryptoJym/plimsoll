@@ -3,6 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import Database from "better-sqlite3";
 import { z } from "zod";
 
 import { DEFAULT_POLICY, LOCAL_TENANT_ID, policyConfigSchema } from "../../shared/src/index";
@@ -125,10 +126,7 @@ export type CollectorConfig = z.infer<typeof collectorConfigSchema>;
 
 const CLOUD_DEVICE_ID_CONFLICT_INTERVAL_MS = 5 * 60 * 1_000;
 const CONFIG_MUTATION_LOCK_WAIT_MS = 5_000;
-const CONFIG_MUTATION_LOCK_POLL_MS = 10;
-const CONFIG_MUTATION_LOCK_GARBAGE_MAX_AGE_MS = 2 * CONFIG_MUTATION_LOCK_WAIT_MS;
 const cloudDeviceIdConflictAt = new Map<string, number>();
-const configMutationWaitState = new Int32Array(new SharedArrayBuffer(4));
 
 export function isManagedOrUploadEnabled(config: CollectorConfig) {
   return (
@@ -234,118 +232,39 @@ export function saveCollectorConfig(config: CollectorConfig, homeDir = os.homedi
   return writeCollectorConfigTransactionally(config, collectorConfigPath(homeDir));
 }
 
-function sameFileIdentity(left: fs.Stats, right: fs.Stats) {
-  return left.dev === right.dev && left.ino === right.ino;
-}
-
-function collectorConfigMutationLockIsStale(lockPath: string, lock: fs.Stats) {
-  try {
-    const metadata = JSON.parse(fs.readFileSync(lockPath, "utf8")) as Record<string, unknown>;
-    if (!Number.isSafeInteger(metadata.pid) || Number(metadata.pid) <= 0) {
-      throw new Error("invalid lock owner");
-    }
-    try {
-      process.kill(Number(metadata.pid), 0);
-      return false;
-    } catch (error) {
-      return (error as NodeJS.ErrnoException).code === "ESRCH";
-    }
-  } catch {
-    return Date.now() - lock.mtimeMs > CONFIG_MUTATION_LOCK_GARBAGE_MAX_AGE_MS;
-  }
-}
-
-function reclaimStaleCollectorConfigMutationLock(lockPath: string) {
-  let observed: fs.Stats;
-  try {
-    observed = fs.lstatSync(lockPath);
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return true;
-    throw error;
-  }
-  if (!observed.isFile() || !collectorConfigMutationLockIsStale(lockPath, observed)) return false;
-
-  // The hard-link claim admits one reclaimer and pins the observed inode. The
-  // rename then removes only that inode from the lock name; a replacement lock
-  // created afterward is never truncated or unlinked by this process.
-  const claimPath = `${lockPath}.reclaim`;
-  const stalePath = `${lockPath}.stale-${process.pid}-${crypto.randomUUID()}`;
-  try {
-    try {
-      fs.linkSync(lockPath, claimPath);
-    } catch (error) {
-      const code = (error as NodeJS.ErrnoException).code;
-      if (code === "EEXIST" || code === "ENOENT") return false;
-      throw error;
-    }
-    const claimed = fs.lstatSync(claimPath);
-    const current = fs.lstatSync(lockPath);
-    if (!sameFileIdentity(observed, claimed) || !sameFileIdentity(claimed, current) ||
-      !collectorConfigMutationLockIsStale(claimPath, claimed)) {
-      return false;
-    }
-    fs.renameSync(lockPath, stalePath);
-    const moved = fs.lstatSync(stalePath);
-    if (!sameFileIdentity(claimed, moved)) {
-      throw new Error("collector_config_mutation_lock_takeover_mismatch");
-    }
-    return true;
-  } finally {
-    fs.rmSync(stalePath, { force: true });
-    fs.rmSync(claimPath, { force: true });
-  }
-}
-
 function withCollectorConfigMutationLock<T>(configPath: string, action: () => T) {
   const directory = path.dirname(configPath);
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
-  const lockPath = path.join(directory, `.${path.basename(configPath)}.mutation.lock`);
-  const deadline = Date.now() + CONFIG_MUTATION_LOCK_WAIT_MS;
-  let lockDescriptor: number | undefined;
-  while (lockDescriptor === undefined) {
+  const lockPath = path.join(directory, `.${path.basename(configPath)}.mutation.lock.sqlite`);
+  try {
+    fs.closeSync(fs.openSync(lockPath, "wx", 0o600));
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+  }
+  const lockDatabase = new Database(lockPath, { timeout: CONFIG_MUTATION_LOCK_WAIT_MS });
+  try {
+    fs.chmodSync(lockPath, 0o600);
+    lockDatabase.pragma(`busy_timeout = ${CONFIG_MUTATION_LOCK_WAIT_MS}`);
     try {
-      const descriptor = fs.openSync(lockPath, "wx", 0o600);
-      try {
-        fs.writeFileSync(descriptor, `${JSON.stringify({ pid: process.pid })}\n`);
-        fs.fsyncSync(descriptor);
-        lockDescriptor = descriptor;
-      } catch (error) {
-        const held = fs.fstatSync(descriptor);
-        try {
-          const current = fs.lstatSync(lockPath);
-          if (sameFileIdentity(current, held)) fs.rmSync(lockPath, { force: true });
-        } catch (statError) {
-          if ((statError as NodeJS.ErrnoException).code !== "ENOENT") throw statError;
-        } finally {
-          fs.closeSync(descriptor);
-        }
-        throw error;
-      }
+      lockDatabase.exec("BEGIN IMMEDIATE");
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-      if (reclaimStaleCollectorConfigMutationLock(lockPath)) continue;
-      if (Date.now() >= deadline) {
+      if ((error as { code?: string }).code === "SQLITE_BUSY") {
         throw new Error("collector_config_mutation_lock_timeout");
       }
-      Atomics.wait(configMutationWaitState, 0, 0, CONFIG_MUTATION_LOCK_POLL_MS);
+      throw error;
     }
-  }
-  try {
-    return action();
-  } finally {
+    let commit = false;
     try {
-      const held = fs.fstatSync(lockDescriptor);
-      try {
-        const current = fs.lstatSync(lockPath);
-        if (sameFileIdentity(current, held)) {
-          fs.rmSync(lockPath, { force: true });
-        }
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
-      }
+      const result = action();
+      commit = true;
+      return result;
     } finally {
-      fs.closeSync(lockDescriptor);
+      if (lockDatabase.inTransaction) {
+        lockDatabase.exec(commit ? "COMMIT" : "ROLLBACK");
+      }
     }
+  } finally {
+    lockDatabase.close();
   }
 }
 

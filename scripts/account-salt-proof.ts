@@ -7,6 +7,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
+import Database from "better-sqlite3";
 
 import {
   ACCOUNT_ASSERTION_SALT_FILE,
@@ -107,6 +108,22 @@ function waitForAnyFile(files: string[], timeoutMs: number) {
   return files.some(file => fs.existsSync(file));
 }
 
+function assertSqliteConfigLockBusy(lockPath: string) {
+  assert.equal(fs.existsSync(lockPath), true, "SQLite config lock database is missing");
+  assert.equal(fs.statSync(lockPath).mode & 0o777, 0o600);
+  const probe = new Database(lockPath, { timeout: 0 });
+  try {
+    probe.pragma("busy_timeout = 0");
+    assert.equal(probe.pragma("journal_mode", { simple: true }), "delete");
+    assert.throws(
+      () => probe.exec("BEGIN IMMEDIATE"),
+      (error: unknown) => (error as { code?: string }).code === "SQLITE_BUSY",
+    );
+  } finally {
+    probe.close();
+  }
+}
+
 async function cloudDeviceIdRaceWorker() {
   const [home, deviceId, ready, release] = process.argv.slice(3);
   assert.ok(home && deviceId && ready && release);
@@ -140,7 +157,7 @@ async function collectorConfigLockHolderWorker() {
     configurable: true,
     value: (oldPath: fs.PathLike, newPath: fs.PathLike) => {
       if (path.resolve(String(newPath)) === path.resolve(configPath)) {
-        fs.writeFileSync(ready, "ready\n", { flag: "wx", mode: 0o600 });
+        fs.writeFileSync(ready, `${JSON.stringify({ pid: process.pid })}\n`, { flag: "wx", mode: 0o600 });
         if (!waitForFile(release, 60_000)) throw new Error("config_lock_holder_barrier_timeout");
       }
       return originalRename(oldPath, newPath);
@@ -155,32 +172,28 @@ async function collectorConfigLockHolderWorker() {
   }
 }
 
-async function collectorConfigLockWaiterWorker() {
-  const [home, observed, portText] = process.argv.slice(3);
-  assert.ok(home && observed && portText);
+async function collectorConfigQueuedWriterWorker() {
+  const [home, attempted, entered, release, portText] = process.argv.slice(3);
+  assert.ok(home && attempted && entered && release && portText);
   const configPath = path.join(home, "collector.config.json");
-  const lockPath = path.join(home, ".collector.config.json.mutation.lock");
-  const originalOpen = fs.openSync.bind(fs);
-  Object.defineProperty(fs, "openSync", {
+  const originalRename = fs.renameSync.bind(fs);
+  Object.defineProperty(fs, "renameSync", {
     configurable: true,
-    value: (file: fs.PathLike, flags: fs.OpenMode, mode?: fs.Mode) => {
-      try {
-        return originalOpen(file, flags, mode);
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "EEXIST" &&
-          path.resolve(String(file)) === path.resolve(lockPath) && !fs.existsSync(observed)) {
-          fs.writeFileSync(observed, "observed\n", { flag: "wx", mode: 0o600 });
-        }
-        throw error;
+    value: (oldPath: fs.PathLike, newPath: fs.PathLike) => {
+      if (path.resolve(String(newPath)) === path.resolve(configPath)) {
+        fs.writeFileSync(entered, `${JSON.stringify({ pid: process.pid })}\n`, { flag: "wx", mode: 0o600 });
+        if (!waitForFile(release, 60_000)) throw new Error("config_lock_writer_barrier_timeout");
       }
+      return originalRename(oldPath, newPath);
     },
   });
   try {
     const config = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configPath, "utf8")));
+    fs.writeFileSync(attempted, "attempted\n", { flag: "wx", mode: 0o600 });
     writeCollectorConfigTransactionally({ ...config, port: Number(portText) }, configPath);
     process.stdout.write(`${JSON.stringify({ result: "written" })}\n`);
   } finally {
-    Object.defineProperty(fs, "openSync", { configurable: true, value: originalOpen });
+    Object.defineProperty(fs, "renameSync", { configurable: true, value: originalRename });
   }
 }
 
@@ -481,15 +494,17 @@ async function main() {
     const tsx = path.join(process.cwd(), "node_modules", "tsx", "dist", "cli.mjs");
     const script = path.join(process.cwd(), "scripts", "account-salt-proof.ts");
 
-    // A writer killed while holding the real mutation lock cannot strand all
-    // later writers. Recovery does not require deleting the lock by hand.
+    // A killed holder releases the kernel-owned SQLite lock. Both a subsequent
+    // writer and ingest reconciliation proceed without deleting lock state.
     const killedHolderHome = privateHome("config-lock-killed-holder");
     const killedHolderConfigPath = path.join(killedHolderHome, "collector.config.json");
     const killedHolderReady = path.join(killedHolderHome, "holder-ready");
     const killedHolderRelease = path.join(killedHolderHome, "holder-release");
+    const killedHolderSeed = { ...backfillConfig };
+    delete killedHolderSeed.cloudDeviceId;
     fs.writeFileSync(
       killedHolderConfigPath,
-      `${JSON.stringify({ ...backfillConfig, port: 4201 }, null, 2)}\n`,
+      `${JSON.stringify({ ...killedHolderSeed, port: 4201 }, null, 2)}\n`,
       { mode: 0o600 },
     );
     const killedHolder = startManagedChild([
@@ -502,30 +517,41 @@ async function main() {
       "4202",
     ], { ...process.env, PLIMSOLL_HOME: killedHolderHome });
     assert.equal(waitForFile(killedHolderReady, 10_000), true, "lock holder did not reach rename boundary");
-    const killedHolderLockPath = path.join(killedHolderHome, ".collector.config.json.mutation.lock");
-    assert.equal(fs.statSync(killedHolderLockPath).mode & 0o777, 0o600);
-    const killedHolderMetadata = JSON.parse(fs.readFileSync(killedHolderLockPath, "utf8")) as { pid: number };
-    assert.ok(Number.isSafeInteger(killedHolderMetadata.pid) && killedHolderMetadata.pid > 0);
-    process.kill(killedHolderMetadata.pid, "SIGKILL");
+    const killedHolderLockPath = path.join(killedHolderHome, ".collector.config.json.mutation.lock.sqlite");
+    assertSqliteConfigLockBusy(killedHolderLockPath);
+    const killedHolderPid = (JSON.parse(fs.readFileSync(killedHolderReady, "utf8")) as { pid: number }).pid;
+    assert.ok(Number.isSafeInteger(killedHolderPid) && killedHolderPid > 0);
+    process.kill(killedHolderPid, "SIGKILL");
     const killedHolderResult = await killedHolder.completion;
     assert.notEqual(killedHolderResult.exitCode, 0, killedHolderResult.stderr);
     const killedRecoveryStarted = performance.now();
     writeCollectorConfigTransactionally(
-      collectorConfigSchema.parse({ ...backfillConfig, port: 4203 }),
+      collectorConfigSchema.parse({ ...killedHolderSeed, port: 4203 }),
       killedHolderConfigPath,
     );
     const killedRecoveryMs = performance.now() - killedRecoveryStarted;
-    assert.ok(killedRecoveryMs < 5_000, `stale lock recovery took ${killedRecoveryMs.toFixed(1)}ms`);
-    assert.equal(JSON.parse(fs.readFileSync(killedHolderConfigPath, "utf8")).port, 4203);
-    assert.equal(fs.existsSync(killedHolderLockPath), false);
+    assert.ok(killedRecoveryMs < 5_000, `killed lock recovery took ${killedRecoveryMs.toFixed(1)}ms`);
+    const killedRecoveredConfig = collectorConfigSchema.parse(
+      JSON.parse(fs.readFileSync(killedHolderConfigPath, "utf8")),
+    );
+    process.env.PLIMSOLL_HOME = killedHolderHome;
+    const killedReconciliationStarted = performance.now();
+    const killedReconciliation = reconcileCloudDeviceIdFromIngest(killedRecoveredConfig, DEVICE_ID);
+    const killedReconciliationMs = performance.now() - killedReconciliationStarted;
+    delete process.env.PLIMSOLL_HOME;
+    assert.equal(killedReconciliation, "stored");
+    assert.equal(JSON.parse(fs.readFileSync(killedHolderConfigPath, "utf8")).cloudDeviceId, DEVICE_ID);
+    assert.ok(killedReconciliationMs < 5_000);
+    assert.equal(fs.existsSync(killedHolderLockPath), true);
 
-    // A live owner is not reclaimed: a second writer observes contention and
-    // publishes only after the holder explicitly leaves its rename boundary.
+    // A live kernel lock blocks the queued writer until holder release.
     const liveHolderHome = privateHome("config-lock-live-holder");
     const liveHolderConfigPath = path.join(liveHolderHome, "collector.config.json");
     const liveHolderReady = path.join(liveHolderHome, "holder-ready");
     const liveHolderRelease = path.join(liveHolderHome, "holder-release");
-    const liveHolderObserved = path.join(liveHolderHome, "waiter-observed");
+    const liveWaiterAttempted = path.join(liveHolderHome, "waiter-attempted");
+    const liveWaiterEntered = path.join(liveHolderHome, "waiter-entered");
+    const liveWaiterRelease = path.join(liveHolderHome, "waiter-release");
     fs.writeFileSync(
       liveHolderConfigPath,
       `${JSON.stringify({ ...backfillConfig, port: 4210 }, null, 2)}\n`,
@@ -536,37 +562,100 @@ async function main() {
       liveHolderReady, liveHolderRelease, "4211",
     ], { ...process.env, PLIMSOLL_HOME: liveHolderHome });
     assert.equal(waitForFile(liveHolderReady, 10_000), true, "live lock holder did not reach rename boundary");
+    const liveLockPath = path.join(liveHolderHome, ".collector.config.json.mutation.lock.sqlite");
+    assertSqliteConfigLockBusy(liveLockPath);
+    fs.writeFileSync(liveWaiterRelease, "release\n", { flag: "wx", mode: 0o600 });
     const liveWaiter = startChild([
-      tsx, script, "--collector-config-lock-waiter-worker", liveHolderHome,
-      liveHolderObserved, "4212",
+      tsx, script, "--collector-config-queued-writer-worker", liveHolderHome,
+      liveWaiterAttempted, liveWaiterEntered, liveWaiterRelease, "4212",
     ], { ...process.env, PLIMSOLL_HOME: liveHolderHome });
-    assert.equal(waitForFile(liveHolderObserved, 10_000), true, "waiter did not observe live owner");
+    assert.equal(waitForFile(liveWaiterAttempted, 10_000), true, "waiter did not attempt live lock");
+    assertSqliteConfigLockBusy(liveLockPath);
+    assert.equal(fs.existsSync(liveWaiterEntered), false);
     assert.equal(JSON.parse(fs.readFileSync(liveHolderConfigPath, "utf8")).port, 4210);
+    const liveReleaseStarted = performance.now();
     fs.writeFileSync(liveHolderRelease, "release\n", { flag: "wx", mode: 0o600 });
     const [liveHolderResult, liveWaiterResult] = await Promise.all([liveHolder, liveWaiter]);
+    const liveReleaseMs = performance.now() - liveReleaseStarted;
     assert.equal(liveHolderResult.exitCode, 0, liveHolderResult.stderr);
     assert.equal(liveWaiterResult.exitCode, 0, liveWaiterResult.stderr);
+    assert.ok(liveReleaseMs < 5_000, `queued writer took ${liveReleaseMs.toFixed(1)}ms after release`);
     assert.equal(JSON.parse(fs.readFileSync(liveHolderConfigPath, "utf8")).port, 4212);
-    assert.equal(fs.existsSync(path.join(liveHolderHome, ".collector.config.json.mutation.lock")), false);
+    assert.equal(fs.existsSync(liveLockPath), true);
 
-    // A malformed legacy lock has no trustworthy owner. Once older than twice
-    // the wait window it is reclaimed through the same inode-checked path.
-    const garbageLockHome = privateHome("config-lock-garbage");
-    const garbageConfigPath = path.join(garbageLockHome, "collector.config.json");
-    const garbageLockPath = path.join(garbageLockHome, ".collector.config.json.mutation.lock");
-    fs.writeFileSync(garbageConfigPath, `${JSON.stringify({ ...backfillConfig, port: 4220 }, null, 2)}\n`, { mode: 0o600 });
-    fs.writeFileSync(garbageLockPath, "not-json\n", { mode: 0o600 });
-    const oldLockTime = new Date(Date.now() - 2 * 5_000 - 1_000);
-    fs.utimesSync(garbageLockPath, oldLockTime, oldLockTime);
-    const garbageRecoveryStarted = performance.now();
-    writeCollectorConfigTransactionally(
-      collectorConfigSchema.parse({ ...backfillConfig, port: 4221 }),
-      garbageConfigPath,
+    // Three queued processes serialize at the kernel mutex. Each entered
+    // marker is written inside the config critical section at rename time.
+    const tripleHome = privateHome("config-lock-three-writers");
+    const tripleConfigPath = path.join(tripleHome, "collector.config.json");
+    fs.writeFileSync(tripleConfigPath, `${JSON.stringify({ ...backfillConfig, port: 4400 }, null, 2)}\n`, { mode: 0o600 });
+    const tripleEntered = ["a", "b", "c"].map(label => path.join(tripleHome, `entered-${label}`));
+    const tripleAttempted = ["b", "c"].map(label => path.join(tripleHome, `attempted-${label}`));
+    const tripleRelease = ["a", "b", "c"].map(label => path.join(tripleHome, `release-${label}`));
+    const tripleA = startChild([
+      tsx, script, "--collector-config-lock-holder-worker", tripleHome,
+      tripleEntered[0], tripleRelease[0], "4401",
+    ], { ...process.env, PLIMSOLL_HOME: tripleHome });
+    assert.equal(waitForFile(tripleEntered[0], 10_000), true, "first writer did not enter");
+    const tripleQueued = [1, 2].map(index => startChild([
+      tsx, script, "--collector-config-queued-writer-worker", tripleHome,
+      tripleAttempted[index - 1], tripleEntered[index], tripleRelease[index], String(4401 + index),
+    ], { ...process.env, PLIMSOLL_HOME: tripleHome }));
+    assert.equal(tripleAttempted.every(file => waitForFile(file, 10_000)), true);
+    const tripleLockPath = path.join(tripleHome, ".collector.config.json.mutation.lock.sqlite");
+    assertSqliteConfigLockBusy(tripleLockPath);
+    assert.equal(tripleEntered.slice(1).some(file => fs.existsSync(file)), false);
+    assert.equal(JSON.parse(fs.readFileSync(tripleConfigPath, "utf8")).port, 4400);
+    const tripleReleaseStarted = performance.now();
+    fs.writeFileSync(tripleRelease[0], "release\n", { flag: "wx", mode: 0o600 });
+    assert.equal(waitForAnyFile(tripleEntered.slice(1), 10_000), true, "no queued writer entered");
+    const firstQueuedIndex = fs.existsSync(tripleEntered[1]) ? 1 : 2;
+    const lastQueuedIndex = firstQueuedIndex === 1 ? 2 : 1;
+    assert.equal(fs.existsSync(tripleEntered[lastQueuedIndex]), false);
+    assertSqliteConfigLockBusy(tripleLockPath);
+    assert.equal(JSON.parse(fs.readFileSync(tripleConfigPath, "utf8")).port, 4401);
+    fs.writeFileSync(tripleRelease[firstQueuedIndex], "release\n", { flag: "wx", mode: 0o600 });
+    assert.equal(waitForFile(tripleEntered[lastQueuedIndex], 10_000), true, "last writer did not enter");
+    assertSqliteConfigLockBusy(tripleLockPath);
+    assert.equal(
+      JSON.parse(fs.readFileSync(tripleConfigPath, "utf8")).port,
+      4401 + firstQueuedIndex,
     );
-    const garbageRecoveryMs = performance.now() - garbageRecoveryStarted;
-    assert.ok(garbageRecoveryMs < 5_000, `garbage lock recovery took ${garbageRecoveryMs.toFixed(1)}ms`);
-    assert.equal(JSON.parse(fs.readFileSync(garbageConfigPath, "utf8")).port, 4221);
-    assert.equal(fs.existsSync(garbageLockPath), false);
+    fs.writeFileSync(tripleRelease[lastQueuedIndex], "release\n", { flag: "wx", mode: 0o600 });
+    const tripleResults = await Promise.all([tripleA, ...tripleQueued]);
+    const tripleCompletionMs = performance.now() - tripleReleaseStarted;
+    for (const result of tripleResults) assert.equal(result.exitCode, 0, result.stderr);
+    assert.equal(JSON.parse(fs.readFileSync(tripleConfigPath, "utf8")).port, 4401 + lastQueuedIndex);
+    assert.ok(tripleCompletionMs < 2 * 5_000);
+
+    // A holder that is not released exercises the bounded timeout path.
+    const timeoutHome = privateHome("config-lock-timeout");
+    const timeoutConfigPath = path.join(timeoutHome, "collector.config.json");
+    const timeoutEntered = path.join(timeoutHome, "holder-entered");
+    const timeoutRelease = path.join(timeoutHome, "holder-release");
+    fs.writeFileSync(timeoutConfigPath, `${JSON.stringify({ ...backfillConfig, port: 4500 }, null, 2)}\n`, { mode: 0o600 });
+    const timeoutHolder = startManagedChild([
+      tsx, script, "--collector-config-lock-holder-worker", timeoutHome,
+      timeoutEntered, timeoutRelease, "4501",
+    ], { ...process.env, PLIMSOLL_HOME: timeoutHome });
+    assert.equal(waitForFile(timeoutEntered, 10_000), true, "timeout holder did not enter");
+    assertSqliteConfigLockBusy(path.join(timeoutHome, ".collector.config.json.mutation.lock.sqlite"));
+    const timeoutStarted = performance.now();
+    assert.throws(
+      () => writeCollectorConfigTransactionally(
+        collectorConfigSchema.parse({ ...backfillConfig, port: 4502 }),
+        timeoutConfigPath,
+      ),
+      /collector_config_mutation_lock_timeout/,
+    );
+    const timeoutMs = performance.now() - timeoutStarted;
+    // SQLite's configured 5 s busy budget may be visited by more than one
+    // rollback-journal lock phase on this VFS; it must remain bounded.
+    assert.ok(timeoutMs >= 4_500 && timeoutMs < 20_000, `lock timeout took ${timeoutMs.toFixed(1)}ms`);
+    assert.equal(JSON.parse(fs.readFileSync(timeoutConfigPath, "utf8")).port, 4500);
+    const timeoutHolderPid = (JSON.parse(fs.readFileSync(timeoutEntered, "utf8")) as { pid: number }).pid;
+    process.kill(timeoutHolderPid, "SIGKILL");
+    const timeoutHolderResult = await timeoutHolder.completion;
+    assert.notEqual(timeoutHolderResult.exitCode, 0, timeoutHolderResult.stderr);
 
     // Interprocess reconciliation is one mutation: exactly one concurrent
     // writer stores its echo and the other observes that authoritative value.
@@ -718,16 +807,20 @@ async function main() {
         acknowledgedUploadSurvivesDeferredReconciliation: true,
         conflictingEchoPreservesStoredId: true,
         conflictDiagnosticRateLimitedAndIdentifierFree: true,
-        killedLockOwnerRecoveredWithoutManualCleanup: true,
+        killedLockOwnerReleasesWriterAndReconciliation: true,
         liveLockOwnerRespectedUntilRelease: true,
-        agedGarbageLockRecoveredAtomically: true,
+        threeConcurrentWritersRemainMutuallyExclusive: true,
+        liveLockTimeoutIsBoundedAndNonMutating: true,
         concurrentBackfillStoresExactlyOnce: true,
         refusalDistinctFromUnallocated: true,
         saltAbsentFromReceipts: true,
       },
       timings: {
         killedHolderRecoveryMs: Number(killedRecoveryMs.toFixed(1)),
-        garbageLockRecoveryMs: Number(garbageRecoveryMs.toFixed(1)),
+        killedHolderReconciliationMs: Number(killedReconciliationMs.toFixed(1)),
+        liveReleaseMs: Number(liveReleaseMs.toFixed(1)),
+        tripleCompletionMs: Number(tripleCompletionMs.toFixed(1)),
+        timeoutMs: Number(timeoutMs.toFixed(1)),
       },
     }));
   } finally {
@@ -741,8 +834,8 @@ const operation = process.argv[2] === "--cloud-device-id-race-worker"
   ? cloudDeviceIdRaceWorker()
   : process.argv[2] === "--collector-config-lock-holder-worker"
     ? collectorConfigLockHolderWorker()
-    : process.argv[2] === "--collector-config-lock-waiter-worker"
-      ? collectorConfigLockWaiterWorker()
+    : process.argv[2] === "--collector-config-queued-writer-worker"
+      ? collectorConfigQueuedWriterWorker()
     : main();
 
 operation.catch(error => {
