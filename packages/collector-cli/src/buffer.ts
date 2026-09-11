@@ -809,7 +809,7 @@ export class LocalEventBuffer {
       // permanently ineligible for that audience (lease and list filters are
       // workspace-scoped), which is the quarantine contract.
     });
-    run();
+    run.immediate();
     this.workspaceId = requested;
     this.deviceId = requestedDevice;
     this.installationEpochId = selectedEpochId;

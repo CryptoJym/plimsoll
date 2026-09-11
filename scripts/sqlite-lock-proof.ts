@@ -5,6 +5,15 @@ import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
+import {
+  beginAutomaticCaptureBaseline,
+  stageAutomaticCaptureBaselineObservation,
+} from "../packages/collector-cli/src/capture-baseline";
+import { bindCaptureInventory } from "../packages/collector-cli/src/capture-root-inventory";
+import {
+  ensureJsonlScanState,
+  jsonlScanStateKey,
+} from "../packages/collector-cli/src/jsonl-byte-tailer";
 import { runDeadlineMaintenanceStages } from "../packages/collector-cli/src/maintenance-stage-primitives";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 
@@ -19,7 +28,14 @@ const largePendingRows = 4_096;
 
 type InjectionStage = "retention" | "fill_pending_event_links";
 type InjectionOutcome = "committed" | string;
-type RemainingStage = "projection" | "repo_context_fill" | "capture";
+type RemainingStage =
+  | "projection"
+  | "repo_context_fill"
+  | "capture"
+  | "baseline_observation"
+  | "capture_inventory"
+  | "jsonl_path_migration"
+  | "workspace_binding";
 
 try {
   assert.equal(maintenance.pragma("journal_mode", { simple: true }), "wal");
@@ -66,6 +82,22 @@ try {
   assert.equal(legacyDeferredCode, "SQLITE_BUSY_SNAPSHOT");
   assert.equal(maintenance.inTransaction, false);
   assert.equal(capture.inTransaction, false);
+
+  const baseline = beginAutomaticCaptureBaseline(maintenance, "codex", {
+    startedAt: recent,
+    filesDiscovered: 1,
+    runId: "sqlite-lock-proof-baseline",
+  });
+  assert.ok(baseline.latestRun);
+  maintenance.exec(`create table if not exists rollout_scan_state (
+    file text primary key,
+    size integer not null,
+    scanned_at text not null
+  )`);
+  const legacyPath = path.join(directory, "legacy-rollout.jsonl");
+  maintenance.prepare(
+    `insert into rollout_scan_state (file, size, scanned_at) values (?, 0, ?)`,
+  ).run(legacyPath, recent);
 
   const outcomes = new Map<InjectionStage, InjectionOutcome>();
   const compete = (stage: InjectionStage) => {
@@ -151,6 +183,38 @@ try {
         return row;
       };
     }
+    if (sql.includes("select schema_version as version") && sql.includes("automatic_capture_baseline_state")) {
+      const get = statement.get.bind(statement);
+      (statement as any).get = (...args: any[]) => {
+        const row = get(...args);
+        if (maintenance.inTransaction) competeRemaining("baseline_observation");
+        return row;
+      };
+    }
+    if (sql.includes("from sqlite_master") && sql.includes("automatic_capture_baseline_state")) {
+      const get = statement.get.bind(statement);
+      (statement as any).get = (...args: any[]) => {
+        const row = get(...args);
+        if (maintenance.inTransaction) competeRemaining("capture_inventory");
+        return row;
+      };
+    }
+    if (sql.includes("where length(file) != 64") && sql.includes("order by file limit")) {
+      const all = statement.all.bind(statement);
+      (statement as any).all = (...args: any[]) => {
+        const rows = all(...args);
+        if (maintenance.inTransaction) competeRemaining("jsonl_path_migration");
+        return rows;
+      };
+    }
+    if (sql.includes("select current_workspace_id as currentWorkspaceId") && sql.includes("previous_workspace_id")) {
+      const get = statement.get.bind(statement);
+      (statement as any).get = (...args: any[]) => {
+        const row = get(...args);
+        if (maintenance.inTransaction) competeRemaining("workspace_binding");
+        return row;
+      };
+    }
     return statement;
   };
   const projection = buffer.projection as any;
@@ -189,6 +253,32 @@ try {
     probe("capture", () =>
       buffer.transactionWithRepoContextHandoffs(() => buffer.append(captureEvent))
     );
+    probe("baseline_observation", () =>
+      stageAutomaticCaptureBaselineObservation(maintenance, "codex", {
+        runId: baseline.latestRun!.runId,
+        observedAt: recent,
+        observation: {
+          path: path.join(directory, "baseline-rollout.jsonl"),
+          device: 1,
+          inode: 1,
+          size: 0,
+          birthtimeNs: 1n,
+        },
+        filesDiscovered: 1,
+        filesValidated: 1,
+      })
+    );
+    probe("capture_inventory", () =>
+      bindCaptureInventory(maintenance, "codex", [{
+        rootId: "sqlite-lock-proof-root",
+        profileId: "sqlite-lock-proof-profile",
+        installationEpochId: "sqlite-lock-proof-epoch",
+        source: "codex",
+        directory,
+      }])
+    );
+    probe("jsonl_path_migration", () => ensureJsonlScanState(maintenance));
+    probe("workspace_binding", () => buffer.useWorkspace("local"));
   } finally {
     projection.control = originalControl;
     (maintenance as any).prepare = probePrepare;
@@ -198,11 +288,19 @@ try {
     projection: null,
     repo_context_fill: null,
     capture: null,
+    baseline_observation: null,
+    capture_inventory: null,
+    jsonl_path_migration: null,
+    workspace_binding: null,
   });
   assert.deepEqual(Object.fromEntries(remainingOutcomes), {
     projection: "SQLITE_BUSY",
     repo_context_fill: "SQLITE_BUSY",
     capture: "SQLITE_BUSY",
+    baseline_observation: "SQLITE_BUSY",
+    capture_inventory: "SQLITE_BUSY",
+    jsonl_path_migration: "SQLITE_BUSY",
+    workspace_binding: "SQLITE_BUSY",
   });
   assert.equal(
     deadlineError,
@@ -221,6 +319,16 @@ try {
   assert.equal(result?.stages.at(-1)?.rows, 256);
   assert.equal((values.get("repo_context_fill") as { rowsVisited: number }).rowsVisited, 1);
   assert.equal(values.get("capture"), true);
+  assert.equal(values.get("baseline_observation"), true);
+  assert.equal(values.get("capture_inventory"), true);
+  assert.equal(values.get("jsonl_path_migration"), undefined);
+  assert.equal(values.get("workspace_binding"), "local");
+  assert.equal(
+    maintenance.prepare("select 1 from rollout_scan_state where file = ?").pluck().get(
+      jsonlScanStateKey(legacyPath),
+    ),
+    1,
+  );
   assert.equal(maintenance.inTransaction, false);
   assert.equal(capture.inTransaction, false);
   capture.prepare("update fixture_capture_writer set n=n+1").run();
@@ -245,6 +353,10 @@ try {
       projectionWriterClaimedBeforeRead: true,
       repoContextFillWriterClaimedBeforeRead: true,
       captureWriterClaimedBeforeRead: true,
+      baselineObservationWriterClaimedBeforeRead: true,
+      captureInventoryWriterClaimedBeforeRead: true,
+      jsonlPathMigrationWriterClaimedBeforeRead: true,
+      workspaceBindingWriterClaimedBeforeRead: true,
       deadlineMaintenanceSucceeded: true,
       competingWriterSucceededAfterMaintenance: true,
     },

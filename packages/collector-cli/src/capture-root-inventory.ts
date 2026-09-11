@@ -130,7 +130,7 @@ export function bindCaptureInventory(database: import("better-sqlite3").Database
     database.prepare(`insert into capture_root_inventory_bindings(source,inventory_digest,updated_at) values(?,?,?)
       on conflict(source) do update set inventory_digest=excluded.inventory_digest,updated_at=excluded.updated_at`)
       .run(source,inventoryDigest,new Date().toISOString());
-  })();
+  }).immediate();
   return true;
 }
 const initializedObservationDatabases=new WeakSet<object>();
