@@ -151,6 +151,7 @@ import {
   applyCodexConfig,
   applyGeminiSettings,
   applyGrokHookFile,
+  diagnoseManagedGrokHookCommand,
   generateClaudeCodeSettings,
   generateCodexConfigToml,
   generateGeminiCliSettings,
@@ -2804,6 +2805,7 @@ async function main() {
     const pidPath = collectorLogPath("collector.pid");
     const claudePath = path.join(os.homedir(), ".claude", "settings.json");
     const codexPath = path.join(os.homedir(), ".codex", "config.toml");
+    const grokHookPath = path.join(resolveGrokHome().home, "hooks", "plimsoll.json");
     // Doctor is read-only: it compares against provisioned credentials when
     // they exist and never creates the credential file as a side effect.
     const localAuth = readLocalIngestAuth(collectorHome());
@@ -2822,6 +2824,7 @@ async function main() {
     };
     const claude = readClaudeTelemetryConfig(claudePath, generateClaudeCodeSettings(toolOptions));
     const codex = readCodexTelemetryConfig(codexPath, generateCodexConfigToml(toolOptions));
+    const grokHookCommand = diagnoseManagedGrokHookCommand(grokHookPath);
     const launchAgent = readLaunchAgentState(plistPath);
     const connectivity = await checkCollectorConnectivity(
       config.port,
@@ -2879,7 +2882,8 @@ async function main() {
       node.supported &&
       configRead?.status === "valid" &&
       claude.ok &&
-      codex.ok,
+      codex.ok &&
+      grokHookCommand === null,
     );
     // Issue #135: an explicit daemon-reported home drift (not merely an
     // unattested daemon) blocks service readiness — doctor must never bless a
@@ -2922,6 +2926,7 @@ async function main() {
             claude,
             codex,
           },
+          ...(grokHookCommand ? { grokHookCommand } : {}),
           launchAgent,
           runtime,
           connectivity,
