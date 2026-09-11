@@ -3032,7 +3032,7 @@ export class LocalEventBuffer {
         metricRowsVisited: metricRows.length,
         hasMore,
       };
-    })();
+    }).immediate();
     return {
       cutoff,
       events: run.events,

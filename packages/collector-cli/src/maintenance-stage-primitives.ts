@@ -251,7 +251,7 @@ export function runPendingEventLinkFillStage(
     }
     advance(database, "pending_event_link_fill", pending.length, pending.at(-1)?.eventId ?? null);
     return pending.length;
-  })();
+  }).immediate();
   return timer.result(rows);
 }
 
