@@ -1,5 +1,6 @@
 import type http from "node:http";
 import zlib from "node:zlib";
+import { isSqliteContentionError } from "./sqlite-contention";
 
 export const LOCAL_HTTP_LIMITS = Object.freeze({
   // Issue #196: the wire ceiling equals the decoded ceiling, so any body whose
@@ -84,20 +85,9 @@ export class HttpBoundaryRejection extends Error {
   }
 }
 
-function sqliteErrorCode(error: unknown) {
-  return error && typeof error === "object" && "code" in error
-    ? String((error as { code?: unknown }).code ?? "")
-    : "";
-}
-
-function isStorageBusy(error: unknown) {
-  const code = sqliteErrorCode(error);
-  return code.startsWith("SQLITE_BUSY") || code.startsWith("SQLITE_LOCKED");
-}
-
 export function asHttpBoundaryRejection(error: unknown) {
   if (error instanceof HttpBoundaryRejection) return error;
-  return isStorageBusy(error)
+  return isSqliteContentionError(error)
     ? new HttpBoundaryRejection("storage_busy_retry", 503)
     : new HttpBoundaryRejection("internal_rejection", 400);
 }
@@ -241,7 +231,7 @@ export async function retryStorageBusy<T>(budget: RequestBudget, append: () => T
     try {
       return await append();
     } catch (error) {
-      if (!isStorageBusy(error)) throw error;
+      if (!isSqliteContentionError(error)) throw error;
       lastBusy = error;
       const now = performance.now();
       retryDeadlineAt ??= now + Math.min(

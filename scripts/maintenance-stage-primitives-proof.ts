@@ -14,8 +14,9 @@ import {
   runWalCheckpointStage,
 } from "../packages/collector-cli/src/maintenance-stage-primitives";
 
-function fixture() {
-  const database = new Database(":memory:");
+function fixture(path = ":memory:") {
+  const database = new Database(path, { timeout: 0 });
+  if (path !== ":memory:") database.pragma("journal_mode = WAL");
   database.exec(`
     create table buffered_events (
       id text primary key, created_at text not null, uploaded_at text,
@@ -41,6 +42,10 @@ function fixture() {
       context_id text primary key, reason text not null, suppressed_at text not null,
       cleanup_complete integer not null default 0
     );
+    create index idx_repo_context_event_links_pending_context
+      on repo_context_event_links (context_id, event_id) where fill_pending = 1;
+    create index idx_repo_context_results_gc
+      on repo_context_results (accepted_at, context_id);
     create table repo_enrichment_dirty (
       session_id text primary key, cursor_rowid integer not null default 0,
       queued_at text not null, updated_at text not null
@@ -90,6 +95,188 @@ const recent = "2099-01-01T00:00:00.000Z";
   assert.equal(result.rows, 2);
   assert.equal((database.prepare(`select count(*) as n from repo_context_event_links where fill_pending = 1`).get() as { n: number }).n, 3);
   assert.equal(readMaintenanceStageCursor(database, "pending_event_link_fill").rowsTotal, 2);
+  database.close();
+}
+
+{
+  const directory = mkdtempSync(join(tmpdir(), "plimsoll-fill-unfillable-proof-"));
+  const path = join(directory, "ledger.sqlite");
+  const database = fixture(path);
+  const insertResult = database.prepare(
+    `insert into repo_context_results values (?, 'repo', null, null, ?, 'v1', ?)`,
+  );
+  const insertLink = database.prepare(
+    `insert into repo_context_event_links values (?, ?, 1, 0, 0)`,
+  );
+  database.transaction(() => {
+    for (let index = 0; index < 689; index += 1) {
+      const contextId = `result-${index.toString().padStart(4, "0")}`;
+      insertResult.run(contextId, recent, recent);
+    }
+    for (let index = 0; index < 196_000; index += 1) {
+      insertLink.run(
+        `unfillable-${index.toString().padStart(6, "0")}`,
+        `missing-${index.toString().padStart(6, "0")}`,
+      );
+    }
+  })();
+  const cursorBefore = database.prepare(
+    `select cursor, rows_total as rowsTotal, updated_at as updatedAt
+     from maintenance_stage_cursors where stage = 'pending_event_link_fill'`,
+  ).get();
+  const originalPrepare = database.prepare.bind(database);
+  let precheckSql: string | null = null;
+  (database as any).prepare = (sql: string) => {
+    if (
+      sql.includes("from repo_context_results r") &&
+      sql.includes("idx_repo_context_event_links_pending_context")
+    ) precheckSql = sql;
+    return originalPrepare(sql);
+  };
+  const originalTransaction = database.transaction.bind(database);
+  let transactionRuns = 0;
+  (database as any).transaction = (fn: (...args: any[]) => unknown) => {
+    const transaction = originalTransaction(fn) as any;
+    const wrap = (run: (...args: any[]) => unknown) => (...args: any[]) => {
+      transactionRuns += 1;
+      return run(...args);
+    };
+    const callable = wrap(transaction) as any;
+    callable.deferred = wrap(transaction.deferred);
+    callable.immediate = wrap(transaction.immediate);
+    callable.exclusive = wrap(transaction.exclusive);
+    return callable;
+  };
+  const startedAt = performance.now();
+  const result = runPendingEventLinkFillStage(database, { remainingMs: 1_000, batchSize: 256 });
+  const elapsedMs = performance.now() - startedAt;
+  (database as any).prepare = originalPrepare;
+  (database as any).transaction = originalTransaction;
+  assert.equal(result.rows, 0);
+  assert.equal(transactionRuns, 0, "an unfillable stage must not enter any transaction");
+  assert.deepEqual(
+    database.prepare(
+      `select cursor, rows_total as rowsTotal, updated_at as updatedAt
+       from maintenance_stage_cursors where stage = 'pending_event_link_fill'`,
+    ).get(),
+    cursorBefore,
+    "zero work must not write the cursor",
+  );
+  assert.ok(precheckSql, "the fill stage must start from bounded results");
+  const plan = database.prepare(`explain query plan ${precheckSql}`).all(8) as Array<{ detail: string }>;
+  assert.equal(
+    plan.some((row) => /\bSCAN (?:main\.)?(?:l|repo_context_event_links)\b/i.test(row.detail)),
+    false,
+    JSON.stringify(plan),
+  );
+  database.close();
+  rmSync(directory, { recursive: true });
+  console.log(JSON.stringify({
+    check: "unfillable_196k_uses_result_precheck_without_writer",
+    pendingLinks: 196_000,
+    retainedResults: 689,
+    rows: result.rows,
+    transactionRuns,
+    elapsedMs: Number(elapsedMs.toFixed(3)),
+    plan: plan.map((row) => row.detail),
+  }));
+}
+
+{
+  const database = fixture();
+  const insertEvent = database.prepare(
+    `insert into buffered_events (id, created_at, observed_at, repo_hash) values (?, ?, ?, ?)`,
+  );
+  const insertResult = database.prepare(
+    `insert into repo_context_results values (?, ?, null, null, ?, 'v1', ?)`,
+  );
+  const insertLink = database.prepare(
+    `insert into repo_context_event_links values (?, ?, 1, ?, 0)`,
+  );
+  database.transaction(() => {
+    for (let contextIndex = 0; contextIndex < 9; contextIndex += 1) {
+      const contextId = `context-${contextIndex}`;
+      insertResult.run(
+        contextId,
+        `repo-${contextIndex}`,
+        recent,
+        `2026-01-${String(contextIndex + 1).padStart(2, "0")}T00:00:00.000Z`,
+      );
+      for (let rowIndex = 0; rowIndex < 40; rowIndex += 1) {
+        const eventId = `${contextIndex === 8 ? "000" : "100"}-${contextIndex}-${String(rowIndex).padStart(3, "0")}`;
+        const isDiscoveredConflict = contextIndex === 0 && rowIndex === 0;
+        const isExistingConflict = contextIndex === 1 && rowIndex === 0;
+        insertEvent.run(eventId, recent, recent, isDiscoveredConflict ? "other-repo" : null);
+        insertLink.run(eventId, contextId, isExistingConflict ? 1 : 0);
+      }
+    }
+    insertResult.run("context-suppressed", "repo-suppressed", recent, "2025-01-01T00:00:00.000Z");
+    insertEvent.run("suppressed-event", recent, recent, null);
+    insertLink.run("suppressed-event", "context-suppressed", 0);
+    database.prepare(
+      `insert into repo_context_suppressions values ('context-suppressed', 'proof', ?, 0)`,
+    ).run(recent);
+  })();
+
+  const result = runPendingEventLinkFillStage(database, { remainingMs: 1_000, batchSize: 1_000 });
+  assert.equal(result.rows, 256);
+  assert.equal(
+    (database.prepare(
+      `select count(*) as n from repo_context_event_links where context_id = 'context-8' and fill_pending = 0`,
+    ).get() as { n: number }).n,
+    0,
+    "the ninth result context must wait for the next bounded slice",
+  );
+  assert.deepEqual(
+    database.prepare(
+      `select l.fill_pending as fillPending, l.context_conflict as contextConflict,
+         e.repo_hash as repoHash
+       from repo_context_event_links l join buffered_events e on e.id = l.event_id
+       where l.event_id = 'suppressed-event'`,
+    ).get(),
+    { fillPending: 1, contextConflict: 0, repoHash: null },
+  );
+  assert.deepEqual(
+    database.prepare(
+      `select fill_pending as fillPending, context_conflict as contextConflict
+       from repo_context_event_links where event_id = '100-1-000'`,
+    ).get(),
+    { fillPending: 1, contextConflict: 1 },
+  );
+  assert.deepEqual(
+    database.prepare(
+      `select fill_pending as fillPending, context_conflict as contextConflict
+       from repo_context_event_links where event_id = '100-0-000'`,
+    ).get(),
+    { fillPending: 0, contextConflict: 1 },
+  );
+
+  const atomic = fixture();
+  for (let index = 0; index < 2; index += 1) {
+    atomic.prepare(`insert into buffered_events (id, created_at, observed_at) values (?, ?, ?)`)
+      .run(`atomic-${index}`, recent, recent);
+    atomic.prepare(`insert into repo_context_results values (?, 'repo', null, null, ?, 'v1', ?)`)
+      .run(`atomic-context-${index}`, recent, recent);
+    atomic.prepare(`insert into repo_context_event_links values (?, ?, 1, 0, 0)`)
+      .run(`atomic-${index}`, `atomic-context-${index}`);
+  }
+  atomic.exec(`
+    create trigger abort_fill before update on buffered_events
+    when new.id = 'atomic-1' begin select raise(abort, 'proof_abort_fill'); end;
+  `);
+  assert.throws(
+    () => runPendingEventLinkFillStage(atomic, { remainingMs: 1_000, batchSize: 256 }),
+    /proof_abort_fill/,
+  );
+  assert.deepEqual(
+    atomic.prepare(
+      `select count(*) as pending,
+         sum(case when e.repo_hash is not null then 1 else 0 end) as filled
+       from repo_context_event_links l join buffered_events e on e.id = l.event_id`,
+    ).get(),
+    { pending: 2, filled: 0 },
+  );
+  atomic.close();
   database.close();
 }
 
@@ -146,4 +333,4 @@ const recent = "2099-01-01T00:00:00.000Z";
   database.close();
 }
 
-console.log(JSON.stringify({ proof: "maintenance_stage_primitives", checks: 5, passed: 5 }));
+console.log(JSON.stringify({ proof: "maintenance_stage_primitives", checks: 7, passed: 7 }));

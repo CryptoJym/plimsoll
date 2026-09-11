@@ -70,6 +70,7 @@
     "proof:device-registry": "tsx scripts/device-registry-proof.ts",
     "proof:enrollment-privacy": "tsx scripts/enrollment-privacy-proof.ts",
     "proof:outbox": "tsx scripts/outbox-proof.ts",
+    "proof:sync-storage-retry": "tsx scripts/sync-storage-retry-proof.ts",
     "proof:upload-timer-bounds": "tsx scripts/upload-timer-bounds-proof.ts",
     "proof:codex-config-apply": "tsx scripts/codex-config-apply-proof.ts",
     "proof:setup-toml-reconcile": "tsx scripts/setup-toml-reconcile-proof.ts",

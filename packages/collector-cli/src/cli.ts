@@ -166,6 +166,7 @@ import { runLearningMaterialization } from "./learning-materializer";
 import { prepareRepoLabelsPush, pushRepoLabels } from "./repo-labels";
 import { runSessionSync, sessionIdsFromBatches } from "./session-sync";
 import { uploadBufferedEvents } from "./upload";
+import { SyncStorageBusyError, SyncStorageRetryController } from "./sqlite-contention";
 import { runAttributionRepair, runWorkspaceHistoryUpload } from "./upload-history";
 import {
   ACCOUNT_ASSERTION_SOURCES,
@@ -1943,6 +1944,7 @@ async function main() {
       if (!config.uploadUrl || syncInFlight || shuttingDown) return;
       if (Date.now() < syncSkipUntil) return;
       syncInFlight = true;
+      const storageRetry = new SyncStorageRetryController();
       const uploadedBatches: Array<Awaited<ReturnType<typeof uploadBufferedEvents>>["batch"]> = [];
       const carrySessions = () => {
         pendingSessionIds = [
@@ -1955,6 +1957,7 @@ async function main() {
         while (batches < config.delivery.maxBatchesPerCycle) {
           const result = await uploadBufferedEvents(config, buffer, {
             includeLegacyRemainingUnuploaded: false,
+            storageRetry,
           });
           if (result.uploadedEvents === 0) break;
           uploadedBatches.push(result.batch);
@@ -2024,6 +2027,17 @@ async function main() {
         }
       } catch (error) {
         carrySessions();
+        if (error instanceof SyncStorageBusyError) {
+          syncSkipUntil = 0;
+          console.warn(
+            JSON.stringify({
+              warning: "sync_storage_busy",
+              waitMs: error.waitMs,
+              retries: error.retries,
+            }),
+          );
+          return;
+        }
         syncFailureStreak += 1;
         const backoffMs = Math.min(
           config.syncIntervalSeconds * 1000 * 2 ** Math.min(syncFailureStreak, 4),

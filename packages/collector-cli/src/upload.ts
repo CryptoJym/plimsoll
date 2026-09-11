@@ -12,6 +12,7 @@ import { sealOutboundEnvelope } from "./outbound-envelope";
 import { TransportError, validatedTransportUrl } from "./http-transport";
 import { postDelivery } from "./delivery-post";
 import { PLIMSOLL_VERSION } from "./version";
+import type { SyncStorageRetryController } from "./sqlite-contention";
 
 /**
  * Project attribution parity (issue 0036): the ledger's per-event repo
@@ -287,6 +288,8 @@ export type UploadOptions = {
   now?: () => Date;
   leaseId?: string;
   maxProbes?: number;
+  /** Opt-in SQLite contention retry shared across one daemon sync cycle. */
+  storageRetry?: SyncStorageRetryController;
   /** Include the exact legacy raw-ledger census in durable result metadata. */
   includeLegacyRemainingUnuploaded?: boolean;
   /** Test-only race seam before authoritative lease revalidation and HTTP. */
@@ -304,16 +307,21 @@ export async function uploadBufferedEvents(
 ) {
   assertCollectorPrivacyMode(config, "upload");
   const url = validatedUploadUrl(config, options.url);
-  buffer.useWorkspace(config.tenantId, config.deviceId);
-  if (options.markUploaded === false) return uploadStateless(config, buffer, options);
+  if (options.markUploaded === false) {
+    buffer.useWorkspace(config.tenantId, config.deviceId);
+    return uploadStateless(config, buffer, options);
+  }
+  const storage = <T>(operation: () => T | Promise<T>) =>
+    options.storageRetry ? options.storageRetry.run(operation) : operation();
+  await storage(() => buffer.useWorkspace(config.tenantId, config.deviceId));
   const legacyRemainingUnuploaded = () =>
     options.includeLegacyRemainingUnuploaded === false
       ? null
       : buffer.stats().unuploadedCount;
 
-  buffer.delivery.configure({ enabled: true, limits: config.delivery });
+  await storage(() => buffer.delivery.configure({ enabled: true, limits: config.delivery }));
   const nowFn = options.now ?? (() => new Date());
-  buffer.delivery.migrateLegacy({ now: nowFn() });
+  await storage(() => buffer.delivery.migrateLegacy({ now: nowFn() }));
   const appVersion = options.appVersion ?? PLIMSOLL_VERSION;
   const contractHash = uploadContractHash(config, url, appVersion);
   const outputLimit = Math.max(
@@ -327,10 +335,11 @@ export async function uploadBufferedEvents(
     1,
     Math.min(options.maxProbes ?? config.delivery.maxProbesPerCycle, config.delivery.maxProbesPerCycle),
   );
-  const provenDead = buffer.delivery.settleProvenValidationCandidates(contractHash, {
-    maxRows: outputLimit,
-    now: nowFn(),
-  });
+  const provenDead = await storage(() =>
+    buffer.delivery.settleProvenValidationCandidates(contractHash, {
+      maxRows: outputLimit,
+      now: nowFn(),
+    }));
   const maxRequestBytes = Math.max(1, Math.trunc(options.maxBytes ?? 1_500_000));
 
   // A poison item can be the final due row. With maxProbes=1 there is then no
@@ -357,12 +366,14 @@ export async function uploadBufferedEvents(
     });
     options.afterRemote?.();
     if (witnessResult.ok) {
-      buffer.delivery.refreshValidationWitness(contractHash, witnessReprobe.item, nowFn());
-      const newlyDead = buffer.delivery.settleProvenValidationCandidates(contractHash, {
-        maxRows: outputLimit,
-        now: nowFn(),
-      });
-      buffer.delivery.clearCircuit(nowFn());
+      await storage(() =>
+        buffer.delivery.refreshValidationWitness(contractHash, witnessReprobe.item, nowFn()));
+      const newlyDead = await storage(() =>
+        buffer.delivery.settleProvenValidationCandidates(contractHash, {
+          maxRows: outputLimit,
+          now: nowFn(),
+        }));
+      await storage(() => buffer.delivery.clearCircuit(nowFn()));
       const status = buffer.delivery.status(nowFn());
       return {
         batch: null,
@@ -384,17 +395,21 @@ export async function uploadBufferedEvents(
     const witnessFailure = witnessResult.status === 400 || witnessResult.status === 422
       ? "remote_contract" as const
       : failureForProbe(witnessResult);
-    if (witnessFailure === "remote_auth") buffer.delivery.openCircuit("auth_blocked", nowFn());
-    if (witnessFailure === "remote_contract") buffer.delivery.openCircuit("contract_blocked", nowFn());
+    if (witnessFailure === "remote_auth") {
+      await storage(() => buffer.delivery.openCircuit("auth_blocked", nowFn()));
+    }
+    if (witnessFailure === "remote_contract") {
+      await storage(() => buffer.delivery.openCircuit("contract_blocked", nowFn()));
+    }
     throw new DeliveryUploadError(witnessFailure, witnessResult.statusClass);
   }
 
-  const lease = buffer.delivery.lease({
+  const lease = await storage(() => buffer.delivery.lease({
     maxRows: buffer.delivery.validationLeaseRows(outputLimit),
     maxBytes: options.maxBytes,
     now: nowFn(),
     leaseId: options.leaseId,
-  });
+  }));
   const statusBefore = buffer.delivery.status(nowFn());
   if (lease.items.length === 0) {
     return {
@@ -434,11 +449,11 @@ export async function uploadBufferedEvents(
   while (queue.length > 0 && probes < maxProbes && !fatal) {
     const leasedGroup = queue.shift()!;
     options.beforeRemote?.();
-    const revalidated = buffer.delivery.revalidateLeaseItems(
+    const revalidated = await storage(() => buffer.delivery.revalidateLeaseItems(
       lease.leaseId,
       leasedGroup,
       nowFn(),
-    );
+    ));
     locallyDead += revalidated.locallyDead;
     if (revalidated.items.length === 0) continue;
     const group = revalidated.items;
@@ -472,12 +487,12 @@ export async function uploadBufferedEvents(
       } else {
         requestBudgetItems.set(group[0].deliveryId, group[0]);
         if (queue.length === 0 && succeeded.size < outputLimit) {
-          const lookahead = buffer.delivery.lease({
+          const lookahead = await storage(() => buffer.delivery.lease({
             maxRows: Math.max(1, outputLimit - succeeded.size),
             maxBytes: options.maxBytes,
             now: nowFn(),
             leaseId: lease.leaseId,
-          });
+          }));
           locallyDead += lookahead.locallyDead;
           if (lookahead.items.length > 0) queue.push(lookahead.items);
         }
@@ -488,24 +503,24 @@ export async function uploadBufferedEvents(
       sawValidationFailure = true;
       if (group.length === 1) {
         validationSingletons.set(group[0].deliveryId, group[0]);
-        buffer.delivery.markValidationCandidate(
+        await storage(() => buffer.delivery.markValidationCandidate(
           lease.leaseId,
           group[0].deliveryId,
           contractHash,
           nowFn(),
-        );
+        ));
         // A singleton validation response is ambiguous until a sibling proves
         // the endpoint contract. When the caller's output limit is one, lease
         // one bounded lookahead under the same lease and probe it without ever
         // acknowledging more than that limit. If there is no active lookahead,
         // re-probe the one durable sanitized witness from the same contract.
         if (queue.length === 0 && succeeded.size === 0 && probes < maxProbes) {
-          const lookahead = buffer.delivery.lease({
+          const lookahead = await storage(() => buffer.delivery.lease({
             maxRows: Math.max(1, outputLimit - succeeded.size),
             maxBytes: options.maxBytes,
             now: nowFn(),
             leaseId: lease.leaseId,
-          });
+          }));
           locallyDead += lookahead.locallyDead;
           if (lookahead.items.length > 0) {
             queue.push(lookahead.items);
@@ -552,10 +567,10 @@ export async function uploadBufferedEvents(
   }
   const validationIsolationIncomplete = !fatal && sawValidationFailure && queue.length > 0;
   if (validationIsolationIncomplete) {
-    buffer.delivery.boundValidationLeaseRows(
+    await storage(() => buffer.delivery.boundValidationLeaseRows(
       Math.max(1, Math.min(...queue.map((group) => group.length))),
       nowFn(),
-    );
+    ));
   }
   for (const group of queue) {
     for (const item of group) {
@@ -566,14 +581,14 @@ export async function uploadBufferedEvents(
 
   options.afterRemote?.();
 
-  const acknowledged = buffer.delivery.acknowledge(
+  const acknowledged = await storage(() => buffer.delivery.acknowledge(
     lease.leaseId,
     [...succeeded.keys()],
     nowFn(),
     succeeded.size > 0
       ? { contractHash, item: [...succeeded.values()][0] }
       : undefined,
-  );
+  ));
   locallyDead += acknowledged.locallyDead;
   const acknowledgedIds = new Set(acknowledged.acknowledgedIds);
   for (const id of succeeded.keys()) {
@@ -584,11 +599,11 @@ export async function uploadBufferedEvents(
   }
   let deadLetters = locallyDead;
   if ((succeeded.size > 0 || validationWitnessProven) && validationSingletons.size > 0) {
-    deadLetters += buffer.delivery.deadLetterRemote(
+    deadLetters += await storage(() => buffer.delivery.deadLetterRemote(
       lease.leaseId,
       [...validationSingletons.keys()],
       nowFn(),
-    );
+    ));
   } else {
     for (const item of validationSingletons.values()) unresolved.set(item.deliveryId, item);
   }
@@ -606,19 +621,24 @@ export async function uploadBufferedEvents(
   }
 
   if (failure && unresolved.size > 0) {
-    buffer.delivery.retry(lease.leaseId, [...unresolved.values()], failure, nowFn());
-    if (failure === "remote_auth") buffer.delivery.openCircuit("auth_blocked", nowFn());
-    if (failure === "remote_contract") buffer.delivery.openCircuit("contract_blocked", nowFn());
+    await storage(() =>
+      buffer.delivery.retry(lease.leaseId, [...unresolved.values()], failure, nowFn()));
+    if (failure === "remote_auth") {
+      await storage(() => buffer.delivery.openCircuit("auth_blocked", nowFn()));
+    }
+    if (failure === "remote_contract") {
+      await storage(() => buffer.delivery.openCircuit("contract_blocked", nowFn()));
+    }
   } else if (succeeded.size > 0) {
-    buffer.delivery.clearCircuit(nowFn());
+    await storage(() => buffer.delivery.clearCircuit(nowFn()));
   }
   if (requestBudgetItems.size > 0) {
-    buffer.delivery.retry(
+    await storage(() => buffer.delivery.retry(
       lease.leaseId,
       [...requestBudgetItems.values()],
       "local_request_budget",
       nowFn(),
-    );
+    ));
   }
   if (
     succeeded.size > 0 &&
@@ -626,7 +646,7 @@ export async function uploadBufferedEvents(
     requestBudgetItems.size === 0 &&
     !sawValidationFailure
   ) {
-    buffer.delivery.growValidationLeaseRows(outputLimit, nowFn());
+    await storage(() => buffer.delivery.growValidationLeaseRows(outputLimit, nowFn()));
   }
 
   const effectiveFailure = failure ??

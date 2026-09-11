@@ -164,6 +164,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:sqlite-lock
 
+      - name: Prove sync storage contention retry boundaries
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:sync-storage-retry
+
       - name: Prove Codex account assertions and privacy boundary
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: |
