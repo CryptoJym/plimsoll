@@ -13,6 +13,7 @@ import {
 import { maintenanceCandidateHash, type MaintenanceProgress } from "./maintenance-progress";
 import { recordGitContextBatchProgress } from "./maintenance-starvation";
 import { runDeadlineMaintenanceStages } from "./maintenance-stage-primitives";
+import { runConfiguredRepoContextDrainStage } from "./repo-context-drain";
 import {
   REPO_CONTEXT_RESOLVER_VERSION,
   resolveRepoContextRequests,
@@ -578,6 +579,16 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
             remaining: remainingJobMs(),
           });
           repoContexts = resolveWithProgress(request.repoContexts);
+          runConfiguredRepoContextDrainStage(worker.buffer, {
+            captureElapsedMs: result.stageTimings?.totalMs ?? 200,
+            freshContextsUsed: Math.min(8, childBatch.resolved + request.repoContexts.length),
+            freshDeferred: childBatch.deferred.length,
+            remainingJobMs: remainingJobMs(),
+            remainingLookupMs: Math.max(
+              0,
+              Math.min(gitContextBudgetMs(request.deadlineMs), remainingJobMs()) - childBatch.elapsedMs,
+            ),
+          });
         } catch (error) {
           try {
             worker.buffer.abandonChildRepoContextRun();

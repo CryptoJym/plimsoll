@@ -10,6 +10,7 @@ import {
   ensureRepoContextLinkDispositionSchema,
   expireRepoContextLinks,
   recordRepoContextFailureDispositions,
+  recoverStartedRepoContextReplayAttempts,
   reResolveExpiredRepoContextLinks,
 } from "./repo-context-link-dispositions";
 import {
@@ -205,6 +206,10 @@ export function runRepoContextDrainStage(
     receipt.lookupBudgetExhausted = lookupSlots === 0 || options.remainingLookupMs <= 0;
     return writeReceipt(buffer.database, receipt, now, started);
   }
+  receipt.unresolvedContexts.worker_crash += recoverStartedRepoContextReplayAttempts(
+    buffer.database,
+    options.config.maxContextsPerRun,
+  );
   const scanAllowance = Math.max(0, Math.min(
     options.config.scanSliceMs,
     AUTOMATIC_CAPTURE_LIMITS.maxWallMs - Math.max(0, options.captureElapsedMs),

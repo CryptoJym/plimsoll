@@ -88,6 +88,40 @@ export function recordRepoContextFailureDispositions(
   }).immediate();
 }
 
+export function recoverStartedRepoContextReplayAttempts(
+  database: Database.Database,
+  limit = 64,
+) {
+  ensureRepoContextLinkDispositionSchema(database);
+  const bounded = Math.max(1, Math.min(Math.trunc(limit), 64));
+  const rows = database.prepare(
+    `select distinct context_id as contextId
+     from repo_context_replay_attempts
+     where outcome = 'started'
+     order by attempted_at, context_id limit ?`,
+  ).all(bounded) as Array<{ contextId: string }>;
+  const retire = database.prepare(
+    `update repo_context_replay_attempts
+     set outcome = 'worker_crash', attempted_at = ?
+     where context_id = ? and outcome = 'started'`,
+  );
+  const clear = database.prepare(
+    `delete from repo_context_inflight where context_id = ? and owner = 'child'`,
+  );
+  for (const row of rows) {
+    recordRepoContextFailureDispositions(database, {
+      contextId: row.contextId,
+      reason: "worker_crash",
+    });
+    const at = new Date().toISOString();
+    database.transaction(() => {
+      retire.run(at, row.contextId);
+      clear.run(row.contextId);
+    }).immediate();
+  }
+  return rows.length;
+}
+
 export function expireRepoContextLinks(
   database: Database.Database,
   input: {

@@ -277,7 +277,11 @@ export function recordRepoContextReplayAttempt(
        (source_key, source_digest, position, context_id, pass_id, outcome, attempted_at)
      values (@sourceKey, @sourceDigest, @position, @contextId, @passId, @outcome, @at)
      on conflict(source_key, source_digest, position, context_id, pass_id) do update set
-       outcome = excluded.outcome,
+       outcome = case
+         when repo_context_replay_attempts.outcome = 'success'
+           then repo_context_replay_attempts.outcome
+         else excluded.outcome
+       end,
        attempted_at = excluded.attempted_at`,
   ).run({ ...input, at: input.at ?? new Date().toISOString() });
 }
