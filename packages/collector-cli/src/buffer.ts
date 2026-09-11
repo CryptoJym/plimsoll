@@ -23,6 +23,7 @@ import { promoteRuntimeLearningFacts } from "./runtime-facts";
 import { ensureFinanceProvenanceSchema, initializeFinanceSourceCoverage, markFinancePublicationDirty,
   advanceFinanceRetentionWatermarks, type FinanceCoverageMutationRow } from "./history-coverage";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
+import { ensureRepoContextLinkDispositionSchema } from "./repo-context-link-dispositions";
 import {
   canonicalRepoContextCwd,
   peekRepoContextSidecar,
@@ -487,6 +488,7 @@ export class LocalEventBuffer {
     this.migrateWorkspaceBindingColumns();
     ensureFinanceProvenanceSchema(this.db);
     ensureCodexLiveUsageSchema(this.db);
+    ensureRepoContextLinkDispositionSchema(this.db);
     const bindingColumns = new Set(
       (this.db.pragma("table_info(collector_workspace_binding)") as Array<{ name: string }>)
         .map((column) => column.name),

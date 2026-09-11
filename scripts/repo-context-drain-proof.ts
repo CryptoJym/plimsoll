@@ -10,6 +10,11 @@ import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { runRepoContextDrainStage } from "../packages/collector-cli/src/repo-context-drain";
 import {
+  ensureRepoContextLinkDispositionSchema,
+  reResolveExpiredRepoContextLinks,
+  rollbackRepoContextLinkDispositionMigration,
+} from "../packages/collector-cli/src/repo-context-link-dispositions";
+import {
   attachRepoContextSidecar,
   REPO_CONTEXT_RESOLVER_VERSION,
 } from "../packages/collector-cli/src/repo-context";
@@ -150,6 +155,24 @@ for (let index = 1; index <= 64; index += 1) {
   assert.equal(attachRepoContextSidecar(event, occurrence, groupedCwd), true);
   assert.equal(buffer.append(event), true);
 }
+const missingContextIds: string[] = [];
+for (let index = 0; index < 3; index += 1) {
+  const occurrence = `missing-source-${index}`;
+  const event = aiInteractionEventSchema.parse({
+    id: `missing-event-${index}`,
+    tenantId: "local",
+    source: "codex",
+    dataMode: "metadata",
+    eventType: "tool_use",
+    observedAt: `2026-09-11T02:0${index}:00.000Z`,
+    sessionId: groupedSession,
+    actionClass: "shell",
+    metadata: {},
+  });
+  assert.equal(attachRepoContextSidecar(event, occurrence, groupedCwd), true);
+  assert.equal(buffer.append(event), true);
+  missingContextIds.push(buffer.repoContextOccurrenceRequest("codex", occurrence, groupedCwd)!.contextId);
+}
 buffer.database.prepare(`delete from repo_context_handoffs`).run();
 let lookups = 0;
 const enabledConfig = collectorConfigSchema.parse({
@@ -184,7 +207,63 @@ assert.equal((buffer.database.prepare(
 ).get() as { n: number }).n, 64);
 assert.equal((buffer.database.prepare(`select count(*) as n from repo_context_results`).get() as { n: number }).n, 64);
 assert.ok(drain.elapsedMs <= 200);
+
+const expiringConfig = collectorConfigSchema.parse({
+  repoContextDrain: { enabled: true, expireEnabled: true },
+}).repoContextDrain;
+const expiryPass = runRepoContextDrainStage(buffer, {
+  config: expiringConfig,
+  captureRoots: roots,
+  captureElapsedMs: 0,
+  freshContextsUsed: 0,
+  freshDeferred: 0,
+  remainingJobMs: 29_000,
+  remainingLookupMs: 10_000,
+  resolve: () => { throw new Error("resolved rows must not be looked up again"); },
+});
+assert.equal(expiryPass.expiredLinks, 3, "expiry requires two complete replay passes");
+const dispositions = buffer.database.prepare(
+  `select event_id as eventId, reason, expired_at as expiredAt, re_resolved_at as reResolvedAt
+   from repo_context_link_dispositions order by event_id`,
+).all() as Array<{ eventId: string; reason: string; expiredAt: string | null; reResolvedAt: string | null }>;
+assert.equal(dispositions.length, 3);
+assert.ok(dispositions.every((row) => row.reason === "source_unavailable" && row.expiredAt && !row.reResolvedAt));
+assert.equal((buffer.database.prepare(
+  `select count(*) as n from repo_context_event_links where event_id like 'missing-event-%' and fill_pending = 1`,
+).get() as { n: number }).n, 0);
+
+const restored = {
+  contextId: missingContextIds[0]!,
+  repoHash: `sha256:${"d".repeat(64)}`,
+  branchHash: `sha256:${"e".repeat(64)}`,
+  headSha: "f".repeat(40),
+  resolvedAt: new Date().toISOString(),
+  resolverVersion: REPO_CONTEXT_RESOLVER_VERSION,
+};
+buffer.database.prepare(
+  `insert into repo_context_inflight (context_id, started_at, owner) values (?, ?, 'child')`,
+).run(restored.contextId, new Date().toISOString());
+buffer.applyRepoContextResults([restored]);
+assert.equal(reResolveExpiredRepoContextLinks(buffer.database, restored), 1);
+const reversed = buffer.database.prepare(
+  `select expired_at as expiredAt, re_resolved_at as reResolvedAt
+   from repo_context_link_dispositions where context_id = ?`,
+).get(restored.contextId) as { expiredAt: string | null; reResolvedAt: string | null };
+assert.ok(reversed.expiredAt, "original expiry evidence must be retained");
+assert.ok(reversed.reResolvedAt, "re-resolution must clear the operational expiry state");
+assert.equal((buffer.database.prepare(
+  `select fill_pending as fillPending from repo_context_event_links where context_id = ?`,
+).get(restored.contextId) as { fillPending: number }).fillPending, 0,
+"re-resolution must not reopen the monotonic 0-to-1 link transition");
+
+ensureRepoContextLinkDispositionSchema(buffer.database);
+ensureRepoContextLinkDispositionSchema(buffer.database);
+rollbackRepoContextLinkDispositionMigration(buffer.database);
+assert.equal((buffer.database.prepare(
+  `select count(*) as n from sqlite_master where type = 'table' and name = 'repo_context_link_dispositions'`,
+).get() as { n: number }).n, 0);
+ensureRepoContextLinkDispositionSchema(buffer.database);
 buffer.close();
 fs.rmSync(root, { recursive: true, force: true });
 
-console.log(JSON.stringify({ proof: "repo_context_drain", checks: 30, passed: 30 }));
+console.log(JSON.stringify({ proof: "repo_context_drain", checks: 43, passed: 43 }));

@@ -7,6 +7,12 @@ import { AUTOMATIC_CAPTURE_LIMITS } from "./capture-work-budget";
 import type { CaptureRoot } from "./capture-root-inventory";
 import { loadCollectorConfig, type CollectorConfig } from "./config";
 import {
+  ensureRepoContextLinkDispositionSchema,
+  expireRepoContextLinks,
+  recordRepoContextFailureDispositions,
+  reResolveExpiredRepoContextLinks,
+} from "./repo-context-link-dispositions";
+import {
   REPO_CONTEXT_RESOLVER_VERSION,
   resolveRepoContextRequests,
   type RepoContextRequest,
@@ -16,8 +22,8 @@ import {
   advanceRepoContextReplayCursor,
   beginRepoContextReplayPass,
   completeRepoContextReplayPass,
+  completedRepoContextReplayPasses,
   disabledRepoContextDrainReceipt,
-  emptyRepoContextReplayReasons,
   ensureRepoContextReplaySchema,
   recordRepoContextReplayAttempt,
   repoContextReplayCursor,
@@ -75,9 +81,17 @@ function writeReceipt(
 function activePendingContext(database: LocalEventBuffer["database"], contextId: string) {
   return Boolean(database.prepare(
     `select 1
-     from repo_context_event_links l indexed by idx_repo_context_event_links_pending_context
-     where l.context_id = ? and l.fill_pending = 1 and l.context_conflict = 0
-       and not exists (select 1 from repo_context_results r where r.context_id = l.context_id)
+     from repo_context_event_links l
+     where l.context_id = ? and l.context_conflict = 0
+       and (
+         (l.fill_pending = 1 and not exists (
+           select 1 from repo_context_results r where r.context_id = l.context_id
+         )) or exists (
+           select 1 from repo_context_link_dispositions d
+           where d.event_id = l.event_id and d.context_id = l.context_id
+             and d.expired_at is not null and d.re_resolved_at is null
+         )
+       )
        and not exists (select 1 from repo_context_suppressions s where s.context_id = l.context_id)
        and not exists (select 1 from repo_context_inflight i where i.context_id = l.context_id)
        and not exists (select 1 from repo_context_handoffs h where h.context_id = l.context_id)
@@ -115,14 +129,22 @@ function reserveCandidates(
        and not exists (select 1 from repo_context_inflight where context_id = @contextId)
        and not exists (select 1 from repo_context_handoffs where context_id = @contextId)
        and exists (
-         select 1 from repo_context_event_links
-         where context_id = @contextId and fill_pending = 1 and context_conflict = 0
+         select 1 from repo_context_event_links l
+         where l.context_id = @contextId and l.fill_pending = 1 and l.context_conflict = 0
        )`,
   );
   return database.transaction(() => candidates.filter((candidate) => {
     const at = new Date().toISOString();
     const inserted = reserve.run({ contextId: candidate.request.contextId, at }).changes;
-    if (inserted === 0) return false;
+    const replayingExpired = inserted === 0 && Boolean(database.prepare(
+      `select 1 from repo_context_results r
+       where r.context_id = ? and exists (
+         select 1 from repo_context_link_dispositions d
+         where d.context_id = r.context_id and d.expired_at is not null
+           and d.re_resolved_at is null
+       )`,
+    ).get(candidate.request.contextId));
+    if (inserted === 0 && !replayingExpired) return false;
     recordRepoContextReplayAttempt(database, {
       sourceKey: candidate.sourceKey,
       sourceDigest: candidate.sourceDigest,
@@ -150,6 +172,10 @@ function applyGroup(
   for (let offset = 0; offset < results.length; offset += 8) {
     buffer.applyRepoContextResults(results.slice(offset, offset + 8));
   }
+  return results.reduce(
+    (total, item) => total + reResolveExpiredRepoContextLinks(buffer.database, item),
+    0,
+  );
 }
 
 export function runRepoContextDrainStage(
@@ -157,6 +183,7 @@ export function runRepoContextDrainStage(
   options: RepoContextDrainStageOptions,
 ): RepoContextDrainReceipt {
   ensureRepoContextReplaySchema(buffer.database);
+  ensureRepoContextLinkDispositionSchema(buffer.database);
   if (!options.config.enabled) {
     const disabled = disabledRepoContextDrainReceipt();
     writeRepoContextDrainReceipt(buffer.database, disabled);
@@ -196,6 +223,19 @@ export function runRepoContextDrainStage(
   if (discovery.sources.length === 0) {
     receipt.status = "no_sources";
     receipt.scanBudgetExhausted = !discovery.complete;
+    if (discovery.complete) {
+      const inventoryDigest = digest([]);
+      const pass = beginRepoContextReplayPass(buffer.database, inventoryDigest);
+      receipt.replayPassId = pass.passId;
+      completeRepoContextReplayPass(buffer.database, pass.passId);
+      if (options.config.expireEnabled) {
+        receipt.expiredLinks = expireRepoContextLinks(buffer.database, {
+          completedPasses: completedRepoContextReplayPasses(buffer.database, inventoryDigest),
+          expireAfterCompletePasses: options.config.expireAfterCompletePasses,
+          limit: options.config.expireLinksPerRun,
+        });
+      }
+    }
     return writeReceipt(buffer.database, receipt, now, started);
   }
   if (!discovery.complete) {
@@ -297,13 +337,22 @@ export function runRepoContextDrainStage(
         resolverVersion: REPO_CONTEXT_RESOLVER_VERSION,
       };
     }
-    applyGroup(buffer, reserved, result);
+    receipt.reResolvedExpiredLinks += applyGroup(buffer, reserved, result);
     const outcome = result.repoHash ? "success" : "resolution_failed";
     for (const candidate of reserved) {
       recordCandidateOutcome(buffer.database, candidate, pass.passId, outcome);
     }
     if (result.repoHash) receipt.successfulContexts += reserved.length;
-    else receipt.unresolvedContexts.resolution_failed += reserved.length;
+    else {
+      receipt.unresolvedContexts.resolution_failed += reserved.length;
+      for (const candidate of reserved) {
+        recordRepoContextFailureDispositions(buffer.database, {
+          contextId: candidate.request.contextId,
+          reason: "resolution_failed",
+          resolverVersion: REPO_CONTEXT_RESOLVER_VERSION,
+        });
+      }
+    }
   }
   buffer.drainRepoContextFills(256);
 
@@ -343,7 +392,16 @@ export function runRepoContextDrainStage(
       sourceDigest: source.sourceDigest,
       passId: pass.passId,
     })?.status === "complete");
-  if (allComplete) completeRepoContextReplayPass(buffer.database, pass.passId);
+  if (allComplete) {
+    completeRepoContextReplayPass(buffer.database, pass.passId);
+    if (options.config.expireEnabled) {
+      receipt.expiredLinks = expireRepoContextLinks(buffer.database, {
+        completedPasses: completedRepoContextReplayPasses(buffer.database, inventoryDigest),
+        expireAfterCompletePasses: options.config.expireAfterCompletePasses,
+        limit: options.config.expireLinksPerRun,
+      });
+    }
+  }
   return writeReceipt(buffer.database, receipt, now, started);
 }
 
