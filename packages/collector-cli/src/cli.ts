@@ -1412,6 +1412,10 @@ async function main() {
           maintenance: workerMaintenance,
           buffer: workerBuffer,
           retentionDays: workerConfig.retentionDays,
+          repoContextDrain: {
+            config: workerConfig.repoContextDrain,
+            captureRoots: workerConfig.captureRoots,
+          },
         };
       },
     });

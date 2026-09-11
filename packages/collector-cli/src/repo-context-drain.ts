@@ -5,7 +5,7 @@ import path from "node:path";
 import type { LocalEventBuffer } from "./buffer";
 import { AUTOMATIC_CAPTURE_LIMITS } from "./capture-work-budget";
 import type { CaptureRoot } from "./capture-root-inventory";
-import { loadCollectorConfig, type CollectorConfig } from "./config";
+import { collectorConfigSchema, type CollectorConfig } from "./config";
 import {
   ensureRepoContextLinkDispositionSchema,
   expireRepoContextLinks,
@@ -40,6 +40,13 @@ import {
 
 type DrainConfig = CollectorConfig["repoContextDrain"];
 type Resolver = (request: RepoContextRequest) => RepoContextResult;
+
+export type RepoContextDrainRuntimeConfig = {
+  config: DrainConfig;
+  captureRoots?: readonly CaptureRoot[];
+};
+
+const DEFAULT_REPO_CONTEXT_DRAIN_CONFIG = collectorConfigSchema.parse({}).repoContextDrain;
 
 export type RepoContextDrainStageOptions = {
   config: DrainConfig;
@@ -447,11 +454,11 @@ function defaultCaptureRoots(): CaptureRoot[] {
 export function runConfiguredRepoContextDrainStage(
   buffer: LocalEventBuffer,
   runtime: Omit<RepoContextDrainStageOptions, "config" | "captureRoots" | "resolve">,
+  configured?: RepoContextDrainRuntimeConfig,
 ) {
-  const config = loadCollectorConfig();
   return runRepoContextDrainStage(buffer, {
     ...runtime,
-    config: config.repoContextDrain,
-    captureRoots: config.captureRoots ?? defaultCaptureRoots(),
+    config: configured?.config ?? DEFAULT_REPO_CONTEXT_DRAIN_CONFIG,
+    captureRoots: configured?.captureRoots ?? defaultCaptureRoots(),
   });
 }

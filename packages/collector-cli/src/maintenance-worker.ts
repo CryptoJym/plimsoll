@@ -13,7 +13,10 @@ import {
 import { maintenanceCandidateHash, type MaintenanceProgress } from "./maintenance-progress";
 import { recordGitContextBatchProgress } from "./maintenance-starvation";
 import { runDeadlineMaintenanceStages } from "./maintenance-stage-primitives";
-import { runConfiguredRepoContextDrainStage } from "./repo-context-drain";
+import {
+  runConfiguredRepoContextDrainStage,
+  type RepoContextDrainRuntimeConfig,
+} from "./repo-context-drain";
 import {
   REPO_CONTEXT_RESOLVER_VERSION,
   resolveRepoContextRequests,
@@ -24,10 +27,12 @@ import {
 export type MaintenanceWorkerServiceInput = {
   maintenance?: CollectorMaintenance;
   buffer?: LocalEventBuffer;
+  repoContextDrain?: RepoContextDrainRuntimeConfig;
   initialize?: () => {
     maintenance: CollectorMaintenance;
     buffer: LocalEventBuffer;
     retentionDays?: number;
+    repoContextDrain?: RepoContextDrainRuntimeConfig;
   };
   spawnNonce: string;
   transport?: MaintenanceWorkerTransport;
@@ -281,8 +286,13 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
     on: (event, listener) => process.on(event, listener),
     disconnect: () => process.disconnect?.(),
   };
-  let runtime: { maintenance: CollectorMaintenance; buffer: LocalEventBuffer; retentionDays?: number } | null = input.maintenance && input.buffer
-    ? { maintenance: input.maintenance, buffer: input.buffer }
+  let runtime: {
+    maintenance: CollectorMaintenance;
+    buffer: LocalEventBuffer;
+    retentionDays?: number;
+    repoContextDrain?: RepoContextDrainRuntimeConfig;
+  } | null = input.maintenance && input.buffer
+    ? { maintenance: input.maintenance, buffer: input.buffer, repoContextDrain: input.repoContextDrain }
     : null;
   const reportStage = (stage: string, startedAt = serviceStartedAt) => {
     try {
@@ -604,7 +614,7 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
               childFreshElapsedMs: childBatch.elapsedMs,
               parentFreshElapsedMs,
             }),
-          });
+          }, worker.repoContextDrain);
         } catch (error) {
           try {
             worker.buffer.abandonChildRepoContextRun();
