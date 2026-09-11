@@ -1,0 +1,7 @@
+[otel]
+exporter = "operator-owned-scalar"
+
+[hooks]
+Stop = []
+UserPromptSubmit = []
+PostToolUse = []

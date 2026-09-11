@@ -1,0 +1,17 @@
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "printf foreign-stop"
+timeout = 5
+
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "printf foreign-prompt"
+timeout = 5
+
+[[hooks.PostToolUse]]
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "printf foreign-tool"
+timeout = 5

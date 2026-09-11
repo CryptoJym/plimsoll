@@ -1,0 +1,61 @@
+[projects."/Users/HOST_USER/Documents/Codex/2026-08-28/i-n"]
+trust_level = "trusted"
+
+[projects."/Users/HOST_USER/Documents/Codex/2026-08-28/u"]
+trust_level = "trusted"
+
+[hooks]
+SessionStart= [{ matcher = "startup|resume|clear|compact", hooks = [{ command = "env MEM0_MACHINE=macbook MEM0_HARNESS=codex /Users/HOST_USER/Library/Memory/mem0/bin/mem0-fleet-hook prime", statusMessage = "Preparing scoped memory recall", timeout = 3, type = "command" }] }, { hooks = [{ type = "command", timeout = 8, additionalContextLimit = 24576, command = "python3 /Users/HOST_USER/.local/share/agent-inbox/releases/20260907-eco-v201l-refinements-v1/comms/bin/inbox-native --runtime codex --machine jamess-macbook-pro-2 --config /Users/HOST_USER/.local/state/agent-inbox/clients/jamess-macbook-pro-2-codex-1146d0881c.json --phase start" }] }]
+Stop= [{ hooks = [{ type = "command", command = "env MEM0_FLEET_TOKEN_FILE=/Users/HOST_USER/Library/Memory/mem0/data/fleet-token MEM0_FLEET_ENDPOINT_FILE=/Users/HOST_USER/Library/Memory/mem0/data/fleet-endpoint MEM0_MACHINE=macbook MEM0_HARNESS=codex /Users/HOST_USER/Library/Memory/mem0/bin/mem0-fleet-hook end", timeout = 3 }] }]
+SessionEnd= [{ hooks = [{ type = "command", command = "env MEM0_FLEET_TOKEN_FILE=/Users/HOST_USER/Library/Memory/mem0/data/fleet-token MEM0_FLEET_ENDPOINT_FILE=/Users/HOST_USER/Library/Memory/mem0/data/fleet-endpoint MEM0_MACHINE=macbook MEM0_HARNESS=codex /Users/HOST_USER/Library/Memory/mem0/bin/mem0-fleet-hook end", timeout = 3 }] }]
+UserPromptSubmit= [{ hooks = [{ additionalContextLimit = 900, command = "env MEM0_MACHINE=macbook MEM0_HARNESS=codex /Users/HOST_USER/Library/Memory/mem0/bin/mem0-fleet-hook start", statusMessage = "Loading scoped memory candidates", timeout = 20, type = "command" }] }, { hooks = [{ type = "command", timeout = 8, additionalContextLimit = 24576, command = "python3 /Users/HOST_USER/.local/share/agent-inbox/releases/20260907-eco-v201l-refinements-v1/comms/bin/inbox-native --runtime codex --machine jamess-macbook-pro-2 --config /Users/HOST_USER/.local/state/agent-inbox/clients/jamess-macbook-pro-2-codex-1146d0881c.json --phase checkpoint" }] }]
+PostToolUse = [{ hooks = [{ type = "command", command = "python3 /Users/HOST_USER/.local/share/agent-inbox/releases/20260907-eco-v201l-refinements-v1/comms/bin/inbox-native --runtime codex --machine jamess-macbook-pro-2 --config /Users/HOST_USER/.local/state/agent-inbox/clients/jamess-macbook-pro-2-codex-1146d0881c.json --phase checkpoint --active --lease-seconds 180", timeout = 8, additionalContextLimit = 24576 }] }]
+
+[hooks.state]
+
+[hooks.state."/Users/HOST_USER/.codex/hooks.json:pre_tool_use:0:0"]
+trusted_hash = "sha256:fe4fe16702f7b4659bcd33700643064a47f1d95721a375d24d0519f4c031c68b"
+
+[hooks.state."/Users/HOST_USER/.codex/hooks.json:post_tool_use:0:0"]
+trusted_hash = "sha256:84420710d6a9e236b7e6d1818f76d54c49b6a305efc45421c44e35cec1bde2c2"
+
+[hooks.state."/Users/HOST_USER/.codex/hooks.json:session_start:0:0"]
+trusted_hash = "sha256:cea02cd812b33ce00894abb04ae763427b3ffdbcffcc30b68f962f75cd9d427d"
+
+[hooks.state."/Users/HOST_USER/.codex/config.toml:session_start:1:0"]
+trusted_hash = "sha256:0b03dce03c1693f090fa69dfdabb326f93ca70619d25cb5afe3e7119088d90da"
+
+[hooks.state."/Users/HOST_USER/.codex/config.toml:user_prompt_submit:1:0"]
+trusted_hash = "sha256:de73cfad18989cc4fcf8729def1f12f90c11bcc69ad0f53f30623175ce357324"
+
+[hooks.state."/Users/HOST_USER/.codex/config.toml:session_start:0:0"]
+trusted_hash = "sha256:c8635a135ba6e626b8e497517dfedb1cf5b2c5a6d25c46b3e0f204b7fdf6a780"
+
+[hooks.state."/Users/HOST_USER/.codex/config.toml:user_prompt_submit:0:0"]
+trusted_hash = "sha256:932ad92307e5ffb13e1cd0c53a196929562a7136266d5d67345872dc0bdea5f3"
+
+[hooks.state."/Users/HOST_USER/.codex/config.toml:stop:0:0"]
+trusted_hash = "sha256:1ae0b1a422e181abe7bb42f7c07aa702264623162f790bd33ba66788f10ed149"
+
+[hooks.state."/Users/HOST_USER/.codex/config.toml:session_end:0:0"]
+trusted_hash = "sha256:0a08e95c1fba437eee5b07ff906cd39d9a3b52785dc6267eb55c91c2daaa21f8"
+
+[hooks.state."/Users/HOST_USER/.codex/config.toml:post_tool_use:0:0"]
+trusted_hash = "sha256:3d91c44bf99d7f28317865fc044057613c5013ec50eb783df03940ddcc4d18d5"
+
+[desktop]
+keepRemoteControlAwakeWhilePluggedIn = true
+preventSleepWhileRunning = true
+dock-icon-preference = "codex-system"
+selected-avatar-id = "custom:lumi-3d"
+followUpQueueMode = "queue"
+realtimeVoiceScreenContextEnabled = true
+
+[desktop.open-in-target-preferences]
+global = "fileManager"
+
+[desktop.open-in-target-preferences.perPath]
+"/Users/HOST_USER/Documents/White Dove" = "fileManager"
+
+[plugins."github@openai-curated"]
+enabled = true

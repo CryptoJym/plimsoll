@@ -124,6 +124,7 @@ async function main() {
     "pnpm proof:install-doctor",
     "pnpm proof:launch-agent",
     "pnpm proof:codex-config-apply",
+    "pnpm proof:setup-toml-reconcile",
     "pnpm proof:claude-config-apply",
     "pnpm proof:git-context",
     "pnpm proof:http-boundary",
@@ -420,6 +421,7 @@ esac
   const rejectedSetupPlimsoll = path.join(sandbox, "rejected-setup-plimsoll");
   const rejectedToolDir = path.join(sandbox, "rejected-tool-config");
   const rejectedClaude = path.join(rejectedToolDir, "settings.json");
+  const rejectedGemini = path.join(rejectedToolDir, "gemini.json");
   const rejectedCodex = path.join(rejectedToolDir, "config.toml");
   fs.mkdirSync(rejectedToolDir);
   const malformedCodex = '[otel]\nenvironment = "first"\n[otel]\nenvironment = "duplicate"\n';
@@ -433,6 +435,8 @@ esac
       "--yes",
       "--claude-settings",
       rejectedClaude,
+      "--gemini-settings",
+      rejectedGemini,
       "--codex-config",
       rejectedCodex,
     ],
@@ -446,12 +450,15 @@ esac
     },
   );
   check(
-    "invalid_plan_blocks_default_config_and_all_tool_writes",
+    "invalid_codex_plan_refuses_only_codex_and_applies_other_targets",
     rejectedSetup.code !== 0 &&
-      rejectedSetup.stderr.includes("existing Codex config.toml is invalid") &&
+      rejectedSetup.stdout.includes("existing Codex config.toml is invalid") &&
+      rejectedSetup.stdout.includes('"status": "refused"') &&
       !fs.existsSync(rejectedSetupHome) &&
-      !fs.existsSync(rejectedSetupPlimsoll) &&
-      !fs.existsSync(rejectedClaude) &&
+      fs.existsSync(path.join(rejectedSetupPlimsoll, "collector.config.json")) &&
+      fs.existsSync(path.join(rejectedSetupPlimsoll, "local-ingest-auth.json")) &&
+      fs.existsSync(rejectedClaude) &&
+      fs.existsSync(rejectedGemini) &&
       fs.readFileSync(rejectedCodex, "utf8") === malformedCodex &&
       backupCount(rejectedToolDir) === 0,
     {
@@ -465,6 +472,7 @@ esac
   const freshApplyPlimsoll = path.join(sandbox, "fresh-apply-plimsoll");
   const freshToolDir = path.join(sandbox, "fresh-tool-config");
   const freshClaude = path.join(freshToolDir, "settings.json");
+  const freshGemini = path.join(freshToolDir, "gemini.json");
   const freshCodex = path.join(freshToolDir, "config.toml");
   fs.mkdirSync(freshToolDir);
   const freshApply = await command(
@@ -476,6 +484,8 @@ esac
       "--yes",
       "--claude-settings",
       freshClaude,
+      "--gemini-settings",
+      freshGemini,
       "--codex-config",
       freshCodex,
     ],
@@ -494,6 +504,7 @@ esac
       freshApply.stdout.includes('"status": "setup_applied"') &&
       fs.existsSync(path.join(freshApplyPlimsoll, "collector.config.json")) &&
       fs.existsSync(freshClaude) &&
+      fs.existsSync(freshGemini) &&
       fs.existsSync(freshCodex) &&
       !fs.existsSync(freshApplyHome),
     {

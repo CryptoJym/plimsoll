@@ -16,9 +16,16 @@ export type ApplyResult = {
   path: string;
   changed: boolean;
   changes: string[];
+  /** Secret-free, exhaustive plan for the managed keys owned by this target. */
+  plan?: ApplyPlanEntry[];
   backupPath?: string;
   /** Set when an existing conflicting config blocks a safe merge. */
   conflict?: string;
+};
+
+export type ApplyPlanEntry = {
+  key: string;
+  action: "added" | "updated" | "unchanged";
 };
 
 type ClaudeFileIdentity = {
@@ -733,10 +740,14 @@ function reconcileClaudeDocument(
   rejectManagedAliases(Object.keys(currentEnv), generatedEnvKeys, "ENV_KEY_ALIAS");
   const env = { ...currentEnv };
   const changes: string[] = [];
+  const plan: ApplyPlanEntry[] = [];
   for (const [key, value] of Object.entries(generated.env)) {
     if (!Object.hasOwn(env, key) || env[key] !== value) {
+      plan.push({ key: `claude.env.${key}`, action: Object.hasOwn(env, key) ? "updated" : "added" });
       env[key] = value;
       changes.push(`claude.env.${key}.set`);
+    } else {
+      plan.push({ key: `claude.env.${key}`, action: "unchanged" });
     }
   }
 
@@ -771,6 +782,9 @@ function reconcileClaudeDocument(
     if (!isDeepStrictEqual(existing, desired)) {
       hooks[event] = desired;
       changes.push(`claude.hooks.${event}.reconcile`);
+      plan.push({ key: `claude.hooks.${event}`, action: existingValue === undefined ? "added" : "updated" });
+    } else {
+      plan.push({ key: `claude.hooks.${event}`, action: "unchanged" });
     }
   }
 
@@ -796,13 +810,16 @@ function reconcileClaudeDocument(
     if (!isDeepStrictEqual(current.statusLine, generated.statusLine)) {
       next.statusLine = generated.statusLine;
       changes.push("claude.statusLine.set");
+      plan.push({ key: "claude.statusLine", action: current.statusLine === undefined ? "added" : "updated" });
+    } else {
+      plan.push({ key: "claude.statusLine", action: "unchanged" });
     }
   }
   const reparsed = JSON.parse(`${JSON.stringify(next, null, 2)}\n`) as unknown;
   if (!isJsonRecord(reparsed) || !isDeepStrictEqual(reparsed, next)) {
     claudeFail("INVALID_PLAN");
   }
-  return { next: `${JSON.stringify(next, null, 2)}\n`, changes };
+  return { next: `${JSON.stringify(next, null, 2)}\n`, changes, plan };
 }
 
 /** Merge generated env + hooks (+ optional managed statusLine) into Claude Code settings.json. */
@@ -824,14 +841,69 @@ export function applyClaudeSettings(
       } else {
         assertStableClaudePath(snapshot);
       }
-      if (plan.changes.length === 0) return { path: file, changed: false, changes: [] };
-      return { path: file, changed: true, changes: plan.changes };
+      if (plan.changes.length === 0) return { path: file, changed: false, changes: [], plan: plan.plan };
+      return { path: file, changed: true, changes: plan.changes, plan: plan.plan };
     }
     const backupPath = writeClaudePlan(snapshot, current, plan.next, options.transactionHooks);
-    return { path: file, changed: true, changes: plan.changes, backupPath };
+    return { path: file, changed: true, changes: plan.changes, plan: plan.plan, backupPath };
   } catch (error) {
     if (error instanceof ClaudeConfigError) throw error;
     claudeFail("IO_FAILURE");
+  }
+}
+
+/** Merge Gemini CLI's managed telemetry object without replacing foreign JSON keys. */
+export function applyGeminiSettings(
+  file: string,
+  generated: { telemetry: Record<string, unknown> },
+  options: ClaudeApplyOptions = {},
+): ApplyResult {
+  try {
+    const { snapshot, current } = readClaudePreimage(file);
+    const document = parseClaudeDocument(current);
+    if (!isJsonRecord(generated) || !isJsonRecord(generated.telemetry)) {
+      throw new Error(`${file}: generated Gemini settings telemetry is invalid.`);
+    }
+    if (document.telemetry !== undefined && !isJsonRecord(document.telemetry)) {
+      return {
+        path: file,
+        changed: false,
+        changes: [],
+        plan: [],
+        conflict: `${file}: gemini.telemetry is not an object; refusing this target.`,
+      };
+    }
+    const currentTelemetry = (document.telemetry ?? {}) as Record<string, unknown>;
+    const telemetry = { ...currentTelemetry };
+    const changes: string[] = [];
+    const plan: ApplyPlanEntry[] = [];
+    for (const [key, value] of Object.entries(generated.telemetry)) {
+      const managedKey = `gemini.telemetry.${key}`;
+      if (!Object.hasOwn(currentTelemetry, key)) {
+        telemetry[key] = value;
+        changes.push(`${managedKey}.set`);
+        plan.push({ key: managedKey, action: "added" });
+      } else if (!isDeepStrictEqual(currentTelemetry[key], value)) {
+        telemetry[key] = value;
+        changes.push(`${managedKey}.set`);
+        plan.push({ key: managedKey, action: "updated" });
+      } else {
+        plan.push({ key: managedKey, action: "unchanged" });
+      }
+    }
+    const next = `${JSON.stringify({ ...document, telemetry }, null, 2)}\n`;
+    if (changes.length === 0 || options.dryRun) {
+      if (snapshot.exists && snapshot.leaf) assertVisibleClaudeContent(snapshot, snapshot.leaf, current);
+      else assertStableClaudePath(snapshot);
+      return { path: file, changed: changes.length > 0, changes, plan };
+    }
+    const backupPath = writeClaudePlan(snapshot, current, next, options.transactionHooks);
+    return { path: file, changed: true, changes, plan, backupPath };
+  } catch (error) {
+    if (error instanceof ClaudeConfigError) {
+      throw new Error(error.message.replace(/^CLAUDE_CONFIG_/, "GEMINI_CONFIG_"));
+    }
+    throw error;
   }
 }
 
@@ -1547,6 +1619,20 @@ function headersNeedReconciliation(headers: TomlRecord) {
   return canonicalCount !== 1;
 }
 
+function managedHeadersMatch(current: TomlRecord, expected: unknown) {
+  if (!isRecord(expected) || headersNeedReconciliation(current)) return false;
+  const currentOwned = Object.entries(current).filter(([name]) => {
+    const folded = name.toLowerCase();
+    return folded === PLIMSOLL_HEADER || folded === PLIMSOLL_TOKEN_HEADER;
+  });
+  const expectedOwned = Object.entries(expected).filter(([name]) => {
+    const folded = name.toLowerCase();
+    return folded === PLIMSOLL_HEADER || folded === PLIMSOLL_TOKEN_HEADER;
+  });
+  return currentOwned.length === expectedOwned.length &&
+    expectedOwned.every(([name, value]) => current[name] === value);
+}
+
 function hasOwnedHeaderDrift(document: TomlRecord) {
   return MANAGED_TABLES.some((table) => {
     if (!table.keys.includes("headers")) return false;
@@ -1603,37 +1689,126 @@ function generatedHookBlock(file: string, generatedLines: string[], event: strin
   return generatedLines.slice(startHeader.index, end);
 }
 
+function splitInlineArray(value: string): string[] | null {
+  const trimmed = value.trim();
+  if (!trimmed.startsWith("[") || !trimmed.endsWith("]")) return null;
+  const inner = trimmed.slice(1, -1);
+  if (!inner.trim()) return [];
+  const entries: string[] = [];
+  let start = 0;
+  let quote: "single" | "double" | null = null;
+  let escaped = false;
+  let braces = 0;
+  let brackets = 0;
+  for (let index = 0; index < inner.length; index += 1) {
+    const char = inner[index];
+    if (quote === "double") {
+      if (escaped) escaped = false;
+      else if (char === "\\") escaped = true;
+      else if (char === '"') quote = null;
+      continue;
+    }
+    if (quote === "single") {
+      if (char === "'") quote = null;
+      continue;
+    }
+    if (char === '"') quote = "double";
+    else if (char === "'") quote = "single";
+    else if (char === "{") braces += 1;
+    else if (char === "}") braces -= 1;
+    else if (char === "[") brackets += 1;
+    else if (char === "]") brackets -= 1;
+    else if (char === "," && braces === 0 && brackets === 0) {
+      entries.push(inner.slice(start, index));
+      start = index + 1;
+    }
+    if (braces < 0 || brackets < 0) return null;
+  }
+  if (quote || braces !== 0 || brackets !== 0) return null;
+  entries.push(inner.slice(start));
+  return entries.every((entry) => entry.trim()) ? entries : null;
+}
+
+function tomlInlineKey(key: string) {
+  return /^[A-Za-z0-9_-]+$/.test(key) ? key : JSON.stringify(key);
+}
+
+function tomlInlineValue(value: unknown): string {
+  if (typeof value === "string") return JSON.stringify(value);
+  if (typeof value === "number" || typeof value === "boolean") return String(value);
+  if (Array.isArray(value)) return `[${value.map(tomlInlineValue).join(", ")}]`;
+  if (isRecord(value)) {
+    return `{ ${Object.entries(value).map(([key, entry]) =>
+      `${tomlInlineKey(key)} = ${tomlInlineValue(entry)}`
+    ).join(", ")} }`;
+  }
+  throw new Error("generated Codex hook contains a value that cannot be rendered inline");
+}
+
+function parseInlineHookEntry(file: string, event: string, raw: string): TomlRecord {
+  try {
+    const parsed = parseToml(`entry = ${raw.trim()}\n`) as TomlRecord;
+    const entry = parsed.entry;
+    if (!isRecord(entry)) throw new Error("not a table");
+    return entry;
+  } catch {
+    throw new Error(
+      `${file}: hooks.${event} contains an unsupported inline array entry; refusing to write or create a backup.`,
+    );
+  }
+}
+
+function reconcileInlineHookArray(
+  file: string,
+  event: string,
+  raw: string,
+  expectedEntry: TomlRecord,
+) {
+  const entries = splitInlineArray(raw);
+  if (!entries) {
+    throw new Error(
+      `${file}: hooks.${event} uses an unsupported inline array layout; refusing to write or create a backup.`,
+    );
+  }
+  const parsed = entries.map((entry) => parseInlineHookEntry(file, event, entry));
+  const owned = parsed.flatMap((entry, index) =>
+    hookCommands(entry).filter(isPlimsollHookPath).map((command) => ({ index, command }))
+  );
+  if (owned.length > 1 || new Set(owned.map((entry) => entry.index)).size > 1) {
+    throw new Error(
+      `${file}: hooks.${event} contains more than one Plimsoll Codex hook; refusing to write or create a backup.`,
+    );
+  }
+  if (owned.some(({ command }) => !command.includes("/hooks/codex"))) {
+    throw new Error(
+      `${file}: hooks.${event} contains a non-canonical owned alias; refusing to write or create a backup.`,
+    );
+  }
+  if (owned.length === 1) {
+    const ownedIndex = owned[0]!.index;
+    if (containsExpected(parsed[ownedIndex], expectedEntry)) {
+      return { value: raw, action: "unchanged" as const };
+    }
+    const original = entries[ownedIndex]!;
+    const leading = original.match(/^\s*/)?.[0] ?? "";
+    const trailing = original.match(/\s*$/)?.[0] ?? "";
+    entries[ownedIndex] = `${leading}${tomlInlineValue(expectedEntry)}${trailing}`;
+    return { value: `[${entries.join(",")}]`, action: "updated" as const };
+  }
+  const canonical = tomlInlineValue(expectedEntry);
+  if (entries.length === 0) return { value: `[${canonical}]`, action: "added" as const };
+  return { value: `[${entries.join(",")}, ${canonical}]`, action: "added" as const };
+}
+
 function reconcileCodexToml(file: string, current: string, generatedToml: string) {
   const document = parseDocument(file, current);
   const expected = parseDocument(file, generatedToml, true);
-  if (
-    containsExpected(document, expected) &&
-    !hasOwnedHeaderDrift(document) &&
-    !hasOwnedHookDrift(document, expected)
-  ) {
-    return { next: current, changes: [] as string[] };
-  }
-
-  const expectedEndpointPaths = MANAGED_TABLES
-    .filter((table) => table.keys.includes("endpoint"))
-    .map((table) => [...table.path, "endpoint"]);
-  const hasExpectedEndpoint = expectedEndpointPaths.some((parts) =>
-    isDeepStrictEqual(getPath(document, parts), getPath(expected, parts))
-  );
-  if (getPath(document, ["otel"]) !== undefined && !hasExpectedEndpoint) {
-    return {
-      next: current,
-      changes: [] as string[],
-      conflict:
-        "config.toml already has an [otel] configuration without this Plimsoll collector endpoint — not touching it. " +
-        "Remove or repoint it manually, then re-run.",
-    };
-  }
 
   const lineEnding = detectLineEnding(file, current);
   const lines = current.split(/\r?\n/);
   const generatedLines = generatedToml.split("\n");
   const changes: string[] = [];
+  const plan: ApplyPlanEntry[] = [];
 
   for (const table of MANAGED_TABLES) {
     const scan = scanToml(lines);
@@ -1648,10 +1823,25 @@ function reconcileCodexToml(file: string, current: string, generatedToml: string
     }));
 
     if (headers.length === 0) {
+      for (let depth = 1; depth < table.path.length; depth += 1) {
+        const parentPath = table.path.slice(0, depth);
+        const parentValue = getPath(document, parentPath);
+        if (parentValue !== undefined && !isRecord(parentValue)) {
+          return {
+            next: current,
+            changes: [] as string[],
+            plan,
+            conflict:
+              `${file}: ${displayPath(table.path)} cannot be created because ${displayPath(parentPath)} ` +
+              "is not a table; refusing this target.",
+          };
+        }
+      }
       const represented = desired.filter(({ key }) => getPath(document, [...table.path, key]) !== undefined);
       if (represented.length > 0) {
+        const blocked = [...table.path, represented[0]!.key];
         throw new Error(
-          `${file}: ${displayPath(table.path)} uses dotted, inline, or implicit managed keys without a writable table; ` +
+          `${file}: ${displayPath(blocked)} uses dotted, inline, or implicit managed keys without a writable table; ` +
           "refusing to write or create a backup.",
         );
       }
@@ -1659,7 +1849,11 @@ function reconcileCodexToml(file: string, current: string, generatedToml: string
         `[${table.path.map((part) => (/^[A-Za-z0-9_-]+$/.test(part) ? part : JSON.stringify(part))).join(".")}]`,
         ...desired.map(({ key, generated }) => `${key} = ${generated.valueRaw}`),
       ]);
-      for (const { key } of desired) changes.push(`${displayPath([...table.path, key])} + generated Plimsoll value`);
+      for (const { key } of desired) {
+        const managedKey = displayPath([...table.path, key]);
+        changes.push(`${managedKey} + generated Plimsoll value`);
+        plan.push({ key: managedKey, action: "added" });
+      }
       continue;
     }
 
@@ -1679,7 +1873,14 @@ function reconcileCodexToml(file: string, current: string, generatedToml: string
       const assignment = assignments.find((entry) => entry.keyPath[0] === key);
       const ownedHeaderDrift = key === "headers" && isRecord(currentValue) &&
         headersNeedReconciliation(currentValue);
-      if (isDeepStrictEqual(currentValue, value) && !ownedHeaderDrift) continue;
+      const managedKey = displayPath([...table.path, key]);
+      const managedValueMatches = key === "headers" && isRecord(currentValue)
+        ? managedHeadersMatch(currentValue, value)
+        : isDeepStrictEqual(currentValue, value);
+      if (managedValueMatches && !ownedHeaderDrift) {
+        plan.push({ key: managedKey, action: "unchanged" });
+        continue;
+      }
       if (currentValue !== undefined && !assignment) {
         throw new Error(
           `${file}: ${displayPath([...table.path, key])} uses an unsupported dotted or inline layout; ` +
@@ -1688,7 +1889,8 @@ function reconcileCodexToml(file: string, current: string, generatedToml: string
       }
       if (!assignment) {
         additions.push(`${key} = ${generated.valueRaw}`);
-        changes.push(`${displayPath([...table.path, key])} + generated Plimsoll value`);
+        changes.push(`${managedKey} + generated Plimsoll value`);
+        plan.push({ key: managedKey, action: "added" });
         continue;
       }
 
@@ -1701,7 +1903,8 @@ function reconcileCodexToml(file: string, current: string, generatedToml: string
       }
       const line = lines[assignment.index]!;
       lines[assignment.index] = `${line.slice(0, assignment.valueStart)}${nextValue}${line.slice(assignment.valueEnd)}`;
-      changes.push(`${displayPath([...table.path, key])} ${action}`);
+      changes.push(`${managedKey} ${action}`);
+      plan.push({ key: managedKey, action: "updated" });
     }
     if (additions.length > 0) {
       const insertion = assignments.length > 0
@@ -1722,6 +1925,36 @@ function reconcileCodexToml(file: string, current: string, generatedToml: string
     if (expectedOwnedCommands.length !== 1) {
       throw new Error(`${file}: generated Codex TOML has an unsupported hooks.${event} command layout.`);
     }
+    const expectedEntry = expectedEntries[0];
+    if (!isRecord(expectedEntry)) {
+      throw new Error(`${file}: generated Codex TOML has an unsupported hooks.${event} entry.`);
+    }
+    const currentScan = scanToml(lines);
+    const inlineAssignments = currentScan.assignments.filter((entry) =>
+      entry.tableKind === "table" &&
+      samePath(entry.tablePath, ["hooks"]) &&
+      entry.keyPath.length === 1 &&
+      entry.keyPath[0] === event
+    );
+    if (inlineAssignments.length > 1) {
+      throw new Error(
+        `${file}: hooks.${event} is declared more than once; refusing to write or create a backup.`,
+      );
+    }
+    if (inlineAssignments.length === 1) {
+      const assignment = inlineAssignments[0]!;
+      const reconciledInline = reconcileInlineHookArray(file, event, assignment.valueRaw, expectedEntry);
+      plan.push({ key: `hooks.${event}`, action: reconciledInline.action });
+      if (reconciledInline.action !== "unchanged") {
+        const line = lines[assignment.index]!;
+        lines[assignment.index] =
+          `${line.slice(0, assignment.valueStart)}${reconciledInline.value}${line.slice(assignment.valueEnd)}`;
+        changes.push(
+          `hooks.${event} ${reconciledInline.action === "added" ? "+ generated Plimsoll command hook" : "update generated Plimsoll command hook"}`,
+        );
+      }
+      continue;
+    }
     const currentOwnedCommands = hookCommands(currentEntries).filter(isPlimsollHookPath);
     const containsCanonicalEntry = containsExpected(currentEntries, expectedEntries);
     if (currentOwnedCommands.length > 0 && hookOwnershipDrift(currentEntries, expectedEntries)) {
@@ -1730,9 +1963,13 @@ function reconcileCodexToml(file: string, current: string, generatedToml: string
         "refusing to write or create a backup.",
       );
     }
-    if (containsCanonicalEntry) continue;
+    if (containsCanonicalEntry) {
+      plan.push({ key: `hooks.${event}`, action: "unchanged" });
+      continue;
+    }
     hookBlocks.push(...generatedHookBlock(file, generatedLines, event), "");
     changes.push(`hooks.${event} + generated Plimsoll command hook`);
+    plan.push({ key: `hooks.${event}`, action: "added" });
   }
   if (hookBlocks.length > 0) {
     const hasHooksTable = scanToml(lines).headers.some((entry) =>
@@ -1758,7 +1995,7 @@ function reconcileCodexToml(file: string, current: string, generatedToml: string
   ) {
     throw new Error(`${file}: Codex reconciliation did not produce the complete generated subset; refusing to write or create a backup.`);
   }
-  return { next, changes };
+  return { next, changes, plan };
 }
 
 /** Reconcile Plimsoll's generated subset into an existing Codex config.toml. */
@@ -1770,13 +2007,13 @@ export function applyCodexConfig(
   const { snapshot, current } = readCodexPreimage(file);
   const plan = reconcileCodexToml(file, current, generatedToml);
   if (plan.conflict) {
-    return { path: file, changed: false, changes: [], conflict: plan.conflict };
+    return { path: file, changed: false, changes: [], plan: plan.plan, conflict: plan.conflict };
   }
   const changes = plan.changes;
-  if (changes.length === 0) return { path: file, changed: false, changes: [] };
+  if (changes.length === 0) return { path: file, changed: false, changes: [], plan: plan.plan };
   if (options.dryRun) {
-    return { path: file, changed: true, changes };
+    return { path: file, changed: true, changes, plan: plan.plan };
   }
   const backupPath = writeCodexPlan(file, snapshot, current, plan.next, options.transactionHooks);
-  return { path: file, changed: true, changes, backupPath };
+  return { path: file, changed: true, changes, plan: plan.plan, backupPath };
 }
