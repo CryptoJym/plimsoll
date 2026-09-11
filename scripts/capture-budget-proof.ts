@@ -21,7 +21,7 @@ import type { CaptureRoot } from '../packages/collector-cli/src/capture-root-inv
 
 const require = createRequire(path.resolve('package.json'));
 const Database = require('better-sqlite3');
-const base = fs.mkdtempSync(path.join(os.tmpdir(),'plimsoll-capture-budget-proof-'));
+const base = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()),'plimsoll-capture-budget-proof-'));
 const mode = process.argv[2] ?? 'fixed';
 const checks: Array<{name:string;passed:boolean;detail?:unknown}> = [];
 function check(name:string, passed:boolean, detail?:unknown) { checks.push({name,passed,...(detail===undefined?{}:{detail})}); }
