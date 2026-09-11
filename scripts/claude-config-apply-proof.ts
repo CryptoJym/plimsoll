@@ -173,6 +173,20 @@ function main() {
         reconciled.hooks.UserPromptSubmit[1].hooks[0].timeout === 5,
       { changes: result.changes.length, ownedHooks: reconciled.hooks.UserPromptSubmit.length - 1 },
     );
+    check(
+      "apply_reconciles_source_header_for_both_claude_otlp_exporters",
+      reconciled.env.OTEL_EXPORTER_OTLP_HEADERS === "x-plimsoll-source=claude_code" &&
+        reconciled.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT === "http://127.0.0.1:49130/v1/logs" &&
+        reconciled.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT === "http://127.0.0.1:49130/v1/metrics",
+      {
+        headerNames: String(reconciled.env.OTEL_EXPORTER_OTLP_HEADERS)
+          .split(",")
+          .map((entry: string) => entry.split("=", 1)[0])
+          .sort(),
+        logsEndpoint: reconciled.env.OTEL_EXPORTER_OTLP_LOGS_ENDPOINT,
+        metricsEndpoint: reconciled.env.OTEL_EXPORTER_OTLP_METRICS_ENDPOINT,
+      },
+    );
     const backupPath = result.backupPath!;
     check(
       "apply_backs_up_exact_preimage_once_and_atomically_replaces_destination",

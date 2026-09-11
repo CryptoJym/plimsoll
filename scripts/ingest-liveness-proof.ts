@@ -36,6 +36,10 @@ import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 
 const OLD_WIRE_CAP_BYTES = 256 * 1024;
+// This proof owns the compressed-body availability boundary, not the OTLP
+// export-batch ceiling. Keep its high-entropy payload inside the independent
+// 2 MiB decoded/wire caps as the record ceiling evolves.
+const STORM_BATCH_RECORDS = 128;
 // Tolerate running against pre-fix sources (the exported bound is absent).
 const STALENESS_BOUND_MS = (SNAPSHOT_MAX_STALENESS_MS as number | undefined) ?? 15 * 60_000;
 const checks: Array<{ name: string; passed: boolean; detail: unknown }> = [];
@@ -237,7 +241,8 @@ async function main() {
     // A1. Storm-sized gzip batch: wire bytes between the old 256 KiB cap and
     // the new cap, decoded well under the unchanged decoded ceiling. This is
     // the exact production rejection shape (compressed_body_too_large).
-    const stormBody = zlib.gzipSync(otlpLogBatch(LOCAL_HTTP_LIMITS.otlpRecords, 4_608, true));
+    assert.ok(STORM_BATCH_RECORDS <= LOCAL_HTTP_LIMITS.otlpRecords);
+    const stormBody = zlib.gzipSync(otlpLogBatch(STORM_BATCH_RECORDS, 4_608, true));
     check(
       "storm_batch_wire_size_between_old_and_new_cap",
       stormBody.length > OLD_WIRE_CAP_BYTES &&
@@ -255,9 +260,9 @@ async function main() {
     check(
       "storm_sized_gzip_batch_ingests_end_to_end",
       stormAccepted.status === 202 && stormAccepted.body.accepted === true &&
-        stormAccepted.body.events === LOCAL_HTTP_LIMITS.otlpRecords &&
-        stormFacts.count === LOCAL_HTTP_LIMITS.otlpRecords &&
-        stormFacts.inputTokens === LOCAL_HTTP_LIMITS.otlpRecords * 3,
+        stormAccepted.body.events === STORM_BATCH_RECORDS &&
+        stormFacts.count === STORM_BATCH_RECORDS &&
+        stormFacts.inputTokens === STORM_BATCH_RECORDS * 3,
       { status: stormAccepted.status, body: stormAccepted.body, facts: stormFacts },
     );
 
