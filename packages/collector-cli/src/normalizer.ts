@@ -246,6 +246,10 @@ export function inferSource(payload: Record<string, unknown>, fallback?: ToolSou
     return "gemini_cli";
   }
 
+  if (source?.toLowerCase().includes("grok")) {
+    return "grok";
+  }
+
   return fallback ?? "unknown";
 }
 
@@ -312,7 +316,7 @@ function inferEventType(
   payload: Record<string, unknown>,
   otelNames: string[] = [],
 ): AiInteractionEvent["eventType"] {
-  const rawType = stringField(payload, ["eventType", "event_type", "hook_event_name", "type", "name"]);
+  const rawType = stringField(payload, ["eventType", "event_type", "hookEventName", "hook_event_name", "type", "name"]);
   const otelName = stringField(payload, ["name", "span_name", "body"]);
   const rawClass = classifyEventType(rawType);
   if (rawClass && rawClass !== "otel_span") return rawClass;

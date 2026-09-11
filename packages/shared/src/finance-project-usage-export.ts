@@ -32,6 +32,7 @@ const TOOL_SOURCES = [
   "claude_code",
   "codex",
   "gemini_cli",
+  "grok",
   "github",
   "openai_usage",
   "manual",

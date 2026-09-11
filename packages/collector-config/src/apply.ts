@@ -907,6 +907,89 @@ export function applyGeminiSettings(
   }
 }
 
+const GROK_MANAGED_EVENTS = ["UserPromptSubmit", "PostToolUse", "Stop"] as const;
+const GROK_COMMAND_PATTERN = /^if \[ -n "\$\{GROK_HOOK_EVENT:-\}" \]; then curl -s --max-time 2 -X POST -H 'Content-Type: application\/json' -H 'x-plimsoll-source: grok'(?: -H 'x-plimsoll-token: [A-Za-z0-9_-]{43}')? --data-binary @- http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/hooks\/grok \|\| true; fi$/;
+
+function isManagedGrokGroup(event: string, value: unknown) {
+  if (!isJsonRecord(value)) return false;
+  const expectedKeys = event === "PostToolUse" ? ["hooks", "matcher"] : ["hooks"];
+  if (Object.keys(value).sort().join(",") !== expectedKeys.sort().join(",")) return false;
+  if (event === "PostToolUse" && value.matcher !== ".*") return false;
+  if (!Array.isArray(value.hooks) || value.hooks.length !== 1) return false;
+  const handler = value.hooks[0];
+  return isJsonRecord(handler) &&
+    Object.keys(handler).sort().join(",") === "command,timeout,type" &&
+    handler.type === "command" && handler.timeout === 5 &&
+    typeof handler.command === "string" && GROK_COMMAND_PATTERN.test(handler.command);
+}
+
+function isManagedGrokDocument(value: unknown) {
+  if (!isJsonRecord(value) || Object.keys(value).join(",") !== "hooks" || !isJsonRecord(value.hooks)) {
+    return false;
+  }
+  if (Object.keys(value.hooks).sort().join(",") !== [...GROK_MANAGED_EVENTS].sort().join(",")) {
+    return false;
+  }
+  return GROK_MANAGED_EVENTS.every((event) => {
+    const groups = (value.hooks as Record<string, unknown>)[event];
+    return Array.isArray(groups) && groups.length === 1 && isManagedGrokGroup(event, groups[0]);
+  });
+}
+
+/**
+ * Reconcile Plimsoll's one owned Grok hook fragment. Grok merges sibling
+ * files itself, so this function deliberately never enumerates or opens them.
+ */
+export function applyGrokHookFile(
+  file: string,
+  generated: { hooks: Record<string, unknown[]> },
+  options: ClaudeApplyOptions = {},
+): ApplyResult {
+  try {
+    if (!isManagedGrokDocument(generated)) {
+      throw new Error(`${file}: generated Grok hook document is invalid.`);
+    }
+    const { snapshot, current } = readClaudePreimage(file);
+    let currentDocument: Record<string, unknown> | undefined;
+    if (snapshot.exists) {
+      currentDocument = parseClaudeDocument(current);
+      if (!isManagedGrokDocument(currentDocument)) {
+        return {
+          path: file,
+          changed: false,
+          changes: [],
+          plan: [],
+          conflict: `${file}: existing file is not a Plimsoll-managed Grok hook fragment; refusing this target.`,
+        };
+      }
+    }
+
+    const currentHooks = currentDocument?.hooks as Record<string, unknown> | undefined;
+    const plan: ApplyPlanEntry[] = GROK_MANAGED_EVENTS.map((event) => ({
+      key: `grok.hooks.${event}`,
+      action: currentHooks === undefined
+        ? "added"
+        : isDeepStrictEqual(currentHooks[event], generated.hooks[event]) ? "unchanged" : "updated",
+    }));
+    const changes = plan
+      .filter((entry) => entry.action !== "unchanged")
+      .map((entry) => `${entry.key}.reconcile`);
+    if (changes.length === 0 || options.dryRun) {
+      if (snapshot.exists && snapshot.leaf) assertVisibleClaudeContent(snapshot, snapshot.leaf, current);
+      else assertStableClaudePath(snapshot);
+      return { path: file, changed: changes.length > 0, changes, plan };
+    }
+    const next = `${JSON.stringify(generated, null, 2)}\n`;
+    const backupPath = writeClaudePlan(snapshot, current, next, options.transactionHooks);
+    return { path: file, changed: true, changes, plan, backupPath };
+  } catch (error) {
+    if (error instanceof ClaudeConfigError) {
+      throw new Error(error.message.replace(/^CLAUDE_CONFIG_/, "GROK_CONFIG_"));
+    }
+    throw error;
+  }
+}
+
 type TomlRecord = Record<string, unknown>;
 
 type TomlHeader = {

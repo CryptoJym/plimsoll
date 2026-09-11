@@ -17,6 +17,7 @@
     "collector": "tsx packages/collector-cli/src/cli.ts",
     "proof": "tsx scripts/run-proof.ts scripts/signal-fidelity-proof.ts",
     "proof:gemini-adapter": "tsx scripts/gemini-adapter-proof.ts",
+    "proof:grok-source": "tsx scripts/grok-source-proof.ts",
     "runtime:build": "tsx scripts/build-packaged-runtime.ts",
     "runtime:verify": "tsx scripts/build-packaged-runtime.ts --verify",
     "proof:packaged-runtime": "tsx scripts/run-proof.ts scripts/packaged-runtime-proof.ts",

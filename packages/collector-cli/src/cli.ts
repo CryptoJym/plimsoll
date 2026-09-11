@@ -148,9 +148,11 @@ import {
   applyClaudeSettings,
   applyCodexConfig,
   applyGeminiSettings,
+  applyGrokHookFile,
   generateClaudeCodeSettings,
   generateCodexConfigToml,
   generateGeminiCliSettings,
+  generateGrokHookSettings,
   generateSetupInstructions,
 } from "../../collector-config/src/index";
 import type { ToolSource } from "../../shared/src/index";
@@ -232,8 +234,8 @@ Commands:
   export                Print buffered events as JSON
   forward-hook SOURCE   Read hook JSON from stdin and append it without requiring the receiver
   self-test-hook SOURCE Emit one synthetic hook event into the local buffer
-  generate-config TOOL  Print Claude Code, Codex, or Gemini CLI config for metadata collection
-  setup                 APPLY Claude Code, Gemini CLI, and Codex telemetry independently
+  generate-config TOOL  Print Claude Code, Codex, Gemini CLI, or Grok config for metadata collection
+  setup                 APPLY Claude Code, Gemini CLI, Grok, and Codex telemetry independently
                         (idempotent; --yes, --dry-run)
   upload                Drain un-uploaded events to the tenant ingest API (marks rows, keeps local copies)
   upload-history        Workspace backfill: push the FULL ledger history to the joined
@@ -283,7 +285,7 @@ Config tools:
       Prefer --token-prompt, --token-stdin, --token-fd, or join - so the single-use secret never enters
       shell history or process arguments. Workspace URL env: PLIMSOLL_CLOUD_URL.
       join --dry-run is unsupported and fails before token, network, or local-state mutation.
-  generate-config claude-code|codex|gemini-cli|all   (metadata-only; encrypted evidence vault not implemented)
+  generate-config claude-code|codex|gemini-cli|grok|all   (metadata-only; encrypted evidence vault not implemented)
   upload [--url URL --limit 500] [--ingest-key KEY] [--signing-secret SECRET] [--no-mark] [--max-batches 20]
   upload-history [--dry-run] [--full] [--until ISO] [--limit N] [--batch-size 500] [--concurrency 1..8] [--delay-ms 250] [--url URL]
       Default resumes from the local watermark (workspace-backfill-state.json) and scopes
@@ -429,7 +431,8 @@ function accountAssertionMutationFromArgs() {
 function collectorSourceFromArg(value: string | undefined): ToolSource {
   if (value === "claude-code") return "claude_code";
   if (value === "codex") return "codex";
-  throw new Error("Expected source to be claude-code or codex.");
+  if (value === "grok") return "grok";
+  throw new Error("Expected source to be claude-code, codex, or grok.");
 }
 
 async function readStdin() {
@@ -2571,6 +2574,10 @@ async function main() {
     const claudeFile = argValue("--claude-settings") ?? path.join(os.homedir(), ".claude", "settings.json");
     const geminiFile = argValue("--gemini-settings") ?? path.join(os.homedir(), ".gemini", "settings.json");
     const codexFile = argValue("--codex-config") ?? path.join(os.homedir(), ".codex", "config.toml");
+    const grokHome = process.env.GROK_HOME
+      ? path.resolve(process.env.GROK_HOME)
+      : path.join(os.homedir(), ".grok");
+    const grokFile = argValue("--grok-hooks") ?? path.join(grokHome, "hooks", "plimsoll.json");
     // Setup is the installer: it provisions the Plimsoll-local credentials so
     // generated tool configs bind each producer to its own source-bound token.
     // Planning may need producer tokens, but provisioning them belongs only
@@ -2584,8 +2591,9 @@ async function main() {
       claudeCodeProducerToken: localAuth.claudeCodeProducer,
       codexProducerToken: localAuth.codexProducer,
       geminiCliProducerToken: localAuth.geminiCliProducer,
+      grokProducerToken: localAuth.grokProducer,
     };
-    type SetupTargetName = "claude" | "gemini" | "codex";
+    type SetupTargetName = "claude" | "gemini" | "grok" | "codex";
     type SetupTarget = {
       name: SetupTargetName;
       path: string;
@@ -2608,6 +2616,12 @@ async function main() {
         path: geminiFile,
         run: (options, preview) =>
           applyGeminiSettings(geminiFile, generateGeminiCliSettings(options), { dryRun: preview }),
+      },
+      {
+        name: "grok",
+        path: grokFile,
+        run: (options, preview) =>
+          applyGrokHookFile(grokFile, generateGrokHookSettings(options), { dryRun: preview }),
       },
       {
         name: "codex",
@@ -2676,6 +2690,7 @@ async function main() {
       claudeCodeProducerToken: appliedAuth.claudeCodeProducer,
       codexProducerToken: appliedAuth.codexProducer,
       geminiCliProducerToken: appliedAuth.geminiCliProducer,
+      grokProducerToken: appliedAuth.grokProducer,
     };
     if (configRead?.status === "missing") loadCollectorConfig();
     const applied: SetupTargetState[] = planned.map((state) => {
@@ -2701,7 +2716,7 @@ async function main() {
           nextSteps: [
             "plimsoll install-launch-agent && plimsoll load-launch-agent",
             "open http://127.0.0.1:" + config.port + "/",
-            "restart any running Claude Code / Gemini CLI / Codex sessions so they pick up telemetry",
+            "restart any running Claude Code / Gemini CLI / Grok / Codex sessions so they pick up telemetry",
           ],
         },
         null,
@@ -2798,6 +2813,7 @@ async function main() {
             claudeCodeProducerToken: localAuth.claudeCodeProducer,
             codexProducerToken: localAuth.codexProducer,
             geminiCliProducerToken: localAuth.geminiCliProducer,
+            grokProducerToken: localAuth.grokProducer,
           }
         : {}),
     };
@@ -3368,6 +3384,7 @@ async function main() {
             claudeCodeProducerToken: localAuth.claudeCodeProducer,
             codexProducerToken: localAuth.codexProducer,
             geminiCliProducerToken: localAuth.geminiCliProducer,
+            grokProducerToken: localAuth.grokProducer,
           }
         : {}),
     };
@@ -3387,6 +3404,11 @@ async function main() {
       return;
     }
 
+    if (tool === "grok") {
+      console.log(JSON.stringify(generateGrokHookSettings(options), null, 2));
+      return;
+    }
+
     if (tool === "all") {
       console.log(
         JSON.stringify(
@@ -3395,6 +3417,7 @@ async function main() {
             claudeCodeSettings: generateClaudeCodeSettings(options),
             codexConfigToml: generateCodexConfigToml(options),
             geminiCliSettings: generateGeminiCliSettings(options),
+            grokHookSettings: generateGrokHookSettings(options),
           },
           null,
           2,
@@ -3403,7 +3426,7 @@ async function main() {
       return;
     }
 
-    throw new Error("Expected tool to be claude-code, codex, gemini-cli, or all.");
+    throw new Error("Expected tool to be claude-code, codex, gemini-cli, grok, or all.");
   }
 
   if (command === "lifecycle") {

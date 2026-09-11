@@ -136,11 +136,12 @@ function eventSourceFor(attrs: Record<string, unknown>, fallback: ToolSource | u
   // Transport authentication is authoritative. A producer-controlled
   // service.name must never turn an authenticated Codex batch into Claude
   // events (or vice versa); only legacy/unknown callers may infer a source.
-  if (fallback === "claude_code" || fallback === "codex" || fallback === "gemini_cli") return fallback;
+  if (fallback === "claude_code" || fallback === "codex" || fallback === "gemini_cli" || fallback === "grok") return fallback;
   const service = (serviceName ?? "").toLowerCase();
   if (service.includes("claude")) return "claude_code";
   if (service.includes("codex")) return "codex";
   if (service.includes("gemini")) return "gemini_cli";
+  if (service.includes("grok")) return "grok";
   return fallback ?? "unknown";
 }
 

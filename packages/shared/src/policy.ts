@@ -67,6 +67,7 @@ export const protectedMetadataFieldNames = [
   "workdir",
   "working_directory",
   "workspace_path",
+  "workspace_root",
   "user.account_id",
   "user.account_uuid",
   "user.email",

@@ -422,6 +422,7 @@ esac
   const rejectedToolDir = path.join(sandbox, "rejected-tool-config");
   const rejectedClaude = path.join(rejectedToolDir, "settings.json");
   const rejectedGemini = path.join(rejectedToolDir, "gemini.json");
+  const rejectedGrok = path.join(rejectedToolDir, "grok-hooks.json");
   const rejectedCodex = path.join(rejectedToolDir, "config.toml");
   fs.mkdirSync(rejectedToolDir);
   const malformedCodex = '[otel]\nenvironment = "first"\n[otel]\nenvironment = "duplicate"\n';
@@ -437,6 +438,8 @@ esac
       rejectedClaude,
       "--gemini-settings",
       rejectedGemini,
+      "--grok-hooks",
+      rejectedGrok,
       "--codex-config",
       rejectedCodex,
     ],
@@ -459,6 +462,7 @@ esac
       fs.existsSync(path.join(rejectedSetupPlimsoll, "local-ingest-auth.json")) &&
       fs.existsSync(rejectedClaude) &&
       fs.existsSync(rejectedGemini) &&
+      fs.existsSync(rejectedGrok) &&
       fs.readFileSync(rejectedCodex, "utf8") === malformedCodex &&
       backupCount(rejectedToolDir) === 0,
     {
@@ -473,6 +477,7 @@ esac
   const freshToolDir = path.join(sandbox, "fresh-tool-config");
   const freshClaude = path.join(freshToolDir, "settings.json");
   const freshGemini = path.join(freshToolDir, "gemini.json");
+  const freshGrok = path.join(freshToolDir, "grok-hooks.json");
   const freshCodex = path.join(freshToolDir, "config.toml");
   fs.mkdirSync(freshToolDir);
   const freshApply = await command(
@@ -486,6 +491,8 @@ esac
       freshClaude,
       "--gemini-settings",
       freshGemini,
+      "--grok-hooks",
+      freshGrok,
       "--codex-config",
       freshCodex,
     ],
@@ -505,6 +512,7 @@ esac
       fs.existsSync(path.join(freshApplyPlimsoll, "collector.config.json")) &&
       fs.existsSync(freshClaude) &&
       fs.existsSync(freshGemini) &&
+      fs.existsSync(freshGrok) &&
       fs.existsSync(freshCodex) &&
       !fs.existsSync(freshApplyHome),
     {
