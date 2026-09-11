@@ -20,6 +20,8 @@ import {
   codexBindingEpochDigest,
   closeAccountAssertionWindow,
   closeCodexAccountAssertionWindow,
+  loadCodexNativeAccountBinding,
+  readAccountAssertionSaltForTenant,
   type CodexNativeAuthBinding,
   persistCodexAccountAssertion,
   validateAccountAssertionWindow,
@@ -335,6 +337,33 @@ export function provisionLiveProducer(options: { home: string; buffer: LocalEven
   return { producerId, credentialId, credentialFile, binding,
     accountAssertionAttached: Boolean(assertion), accountAssertion: assertion };
 }
+
+type CodexLiveProducerEnrollmentOptions = Omit<Parameters<typeof provisionLiveProducer>[0],
+  "accountIdentity" | "providerAccountId" | "chatgptAccountId" | "accountId" | "accountUuid" |
+  "accountBinding" | "evidenceRef" | "accountEvidenceRef">;
+
+/**
+ * Same-user owner enrollment path. Native account evidence is best-effort:
+ * attribution may add its bounded discovery/JWKS wait, but it cannot prevent
+ * producer enrollment and is never retried here.
+ */
+export async function enrollCodexLiveProducer(options: CodexLiveProducerEnrollmentOptions) {
+  const enrolledAt = options.enrolledAt ?? new Date().toISOString();
+  let accountBinding: CodexNativeAuthBinding | undefined;
+  if (accountAssertionAdapterEnabled(options.buffer.database, "codex")) {
+    let saltPresent = false;
+    try {
+      saltPresent = readAccountAssertionSaltForTenant(options.home, options.config.tenantId) !== null;
+    } catch {}
+    if (saltPresent) {
+      try {
+        accountBinding = await loadCodexNativeAccountBinding({ enrolledAt });
+      } catch {}
+    }
+  }
+  return provisionLiveProducer({ ...options, enrolledAt, accountBinding });
+}
+
 export function disableLiveProducer(home: string, buffer: LocalEventBuffer, producerId: string) {
   const registry = readLiveProducerBindings(home);
   revokeLiveProducer(buffer.database, producerId);

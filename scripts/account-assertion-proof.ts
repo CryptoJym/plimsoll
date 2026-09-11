@@ -34,6 +34,7 @@ import {
 import {
   LIVE_BINDINGS_FILE,
   authenticateLiveProducer,
+  enrollCodexLiveProducer,
   provisionLiveProducer,
 } from "../packages/collector-cli/src/codex-live-usage-auth";
 import { liveSha256 } from "../packages/collector-cli/src/codex-live-usage-protocol";
@@ -64,11 +65,12 @@ type Fixture = ReturnType<typeof fixture>;
 function signedCodexAuth(accountId: string, options: {
   issuer?: string;
   expiresAt?: string;
+  kid?: string;
   signingKey?: crypto.KeyObject;
 } = {}) {
   const encoded = (value: unknown) => Buffer.from(JSON.stringify(value)).toString("base64url");
   const signedBytes = [
-    encoded({ alg: "RS256", typ: "JWT", kid: "proof-key" }),
+    encoded({ alg: "RS256", typ: "JWT", kid: options.kid ?? "proof-key" }),
     encoded({
       iss: options.issuer ?? "https://auth.openai.com",
       exp: Math.floor(Date.parse(options.expiresAt ?? "2027-01-01T00:00:00.000Z") / 1000),
@@ -102,14 +104,18 @@ function bogusCodexAuth(accountId: string) {
   return { email: RAW_EMAIL, tokens: { id_token: idToken } };
 }
 
-async function readNativeCodexAuth(record: Record<string, unknown>, enrolledAt = FIRST_AT) {
+async function withNativeCodexAuth<T>(record: Record<string, unknown>, action: () => Promise<T>) {
   const directory = process.env.CODEX_HOME;
   assert.ok(directory && path.isAbsolute(directory));
   const file = path.join(directory, "auth.json");
   fs.writeFileSync(file, JSON.stringify(record), { mode: 0o600 });
   fs.chmodSync(file, 0o600);
-  try { return await loadCodexNativeAccountBinding({ enrolledAt }); }
+  try { return await action(); }
   finally { fs.unlinkSync(file); }
+}
+
+async function readNativeCodexAuth(record: Record<string, unknown>, enrolledAt = FIRST_AT) {
+  return withNativeCodexAuth(record, () => loadCodexNativeAccountBinding({ enrolledAt }));
 }
 
 function fixture(label: string, options: { salt?: boolean } = {}) {
@@ -146,7 +152,7 @@ async function provision(subject: Fixture, producerId: string, credentialId: str
   extra: Record<string, unknown> = {}) {
   subject.setNow(at);
   const native = signedCodexAuth(accountId);
-  const value = provisionLiveProducer({
+  const value = await withNativeCodexAuth(native.record, () => enrollCodexLiveProducer({
     home: subject.home,
     buffer: subject.buffer,
     config: subject.config,
@@ -154,9 +160,8 @@ async function provision(subject: Fixture, producerId: string, credentialId: str
     credentialId,
     captureRootId: subject.root.rootId,
     enrolledAt: at,
-    accountBinding: await readNativeCodexAuth(native.record, at),
     ...extra,
-  } as Parameters<typeof provisionLiveProducer>[0]);
+  } as Parameters<typeof enrollCodexLiveProducer>[0]));
   return { ...value, native };
 }
 
@@ -300,12 +305,11 @@ try {
   assert.equal(jwksRequests, 0);
   const bogusFixture = fixture("bogus-evidence");
   opened.push(bogusFixture);
-  const bogusEnrollment = provisionLiveProducer({
+  const bogusEnrollment = await withNativeCodexAuth(bogusCodexAuth(accountA), () => enrollCodexLiveProducer({
     home: bogusFixture.home, buffer: bogusFixture.buffer, config: bogusFixture.config,
     producerId: "bogus-producer", credentialId: "bogus-credential",
     captureRootId: bogusFixture.root.rootId, enrolledAt: FIRST_AT,
-    accountBinding: bogusBinding,
-  });
+  }));
   assert.equal(bogusEnrollment.accountAssertion, null);
 
   let unavailableBinding;
@@ -317,13 +321,14 @@ try {
   assert.equal(jwksRequests, 1);
   const unavailableFixture = fixture("unavailable-jwks");
   opened.push(unavailableFixture);
-  const unavailableEnrollment = provisionLiveProducer({
+  const requestsBeforeUnavailableEnrollment = jwksRequests;
+  const unavailableEnrollment = await withNativeCodexAuth(nativeA.record, () => enrollCodexLiveProducer({
     home: unavailableFixture.home, buffer: unavailableFixture.buffer, config: unavailableFixture.config,
     producerId: "unavailable-producer", credentialId: "unavailable-credential",
     captureRootId: unavailableFixture.root.rootId, enrolledAt: FIRST_AT,
-    accountBinding: unavailableBinding,
-  });
+  }));
   assert.equal(unavailableEnrollment.accountAssertion, null);
+  assert.equal(jwksRequests, requestsBeforeUnavailableEnrollment + 1);
 
   jwksAvailable = true;
   const verifiedA = await readNativeCodexAuth(nativeA.record);
@@ -333,14 +338,14 @@ try {
   });
   assert.equal(resolvedA.evidenceRef, nativeA.evidenceRef);
   assert.equal(resolvedA.actorHash, deriveAccountActorHash(accountA, FLEET_SALT));
-  assert.equal(jwksRequests, 3);
+  assert.equal(jwksRequests, 4);
   const rereadA = accountAssertionForBinding({
     source: "codex", binding: await readNativeCodexAuth(nativeA.record), collectorHome: primary.home,
     tenantId: TENANT_ID, validFrom: FIRST_AT,
   });
   assert.equal(rereadA.evidenceRef, resolvedA.evidenceRef);
   assert.equal(rereadA.actorHash, resolvedA.actorHash);
-  assert.equal(jwksRequests, 3);
+  assert.equal(jwksRequests, 4);
 
   const wrongSignature = signedCodexAuth(accountA, { signingKey: WRONG_SIGNING_KEYS.privateKey });
   assert.match(await rejectedMessage(() => readNativeCodexAuth(wrongSignature.record)),
@@ -351,7 +356,7 @@ try {
   const expired = signedCodexAuth(accountA, { expiresAt: "2026-09-10T19:59:59.000Z" });
   assert.match(await rejectedMessage(() => readNativeCodexAuth(expired.record)),
     /account_signed_evidence_unavailable/);
-  assert.equal(jwksRequests, 3);
+  assert.equal(jwksRequests, 4);
   assert.throws(() => accountAssertionForBinding({
     source: "codex", binding: { providerAccountId: accountA, credentialId: "routing-only" },
     collectorHome: primary.home, tenantId: TENANT_ID, validFrom: FIRST_AT,
@@ -382,10 +387,35 @@ try {
   const peerEnrollment = await provision(peer, "peer-producer", "peer-credential", FIRST_AT, accountA);
   assert.equal(peerEnrollment.accountAssertion?.actorHash, assertionA.actorHash);
   assert.equal(deriveAccountActorHash(accountA, FLEET_SALT), assertionA.actorHash);
+  const disabledEnrollmentFixture = fixture("disabled-enrollment");
+  opened.push(disabledEnrollmentFixture);
+  setAccountAssertionAdapterEnabled(disabledEnrollmentFixture.buffer.database, "codex", false, FIRST_AT);
+  const disabledNative = signedCodexAuth(accountA, {
+    kid: "disabled-unknown-key", signingKey: WRONG_SIGNING_KEYS.privateKey,
+  });
+  const requestsBeforeDisabledEnrollment = jwksRequests;
+  const disabledEnrollment = await withNativeCodexAuth(disabledNative.record, () => enrollCodexLiveProducer({
+    home: disabledEnrollmentFixture.home, buffer: disabledEnrollmentFixture.buffer,
+    config: disabledEnrollmentFixture.config, producerId: "disabled-producer",
+    credentialId: "disabled-credential", captureRootId: disabledEnrollmentFixture.root.rootId,
+    enrolledAt: FIRST_AT,
+  }));
+  assert.equal(disabledEnrollment.accountAssertion, null);
+  assert.equal(jwksRequests, requestsBeforeDisabledEnrollment);
+
   const unsalted = fixture("unsalted", { salt: false });
   opened.push(unsalted);
-  const unsaltedEnrollment = await provision(unsalted, "unsalted-producer", "unsalted-credential", FIRST_AT, accountA);
+  const unsaltedNative = signedCodexAuth(accountA, {
+    kid: "unsalted-unknown-key", signingKey: WRONG_SIGNING_KEYS.privateKey,
+  });
+  const requestsBeforeUnsaltedEnrollment = jwksRequests;
+  const unsaltedEnrollment = await withNativeCodexAuth(unsaltedNative.record, () => enrollCodexLiveProducer({
+    home: unsalted.home, buffer: unsalted.buffer, config: unsalted.config,
+    producerId: "unsalted-producer", credentialId: "unsalted-credential",
+    captureRootId: unsalted.root.rootId, enrolledAt: FIRST_AT,
+  }));
   assert.equal(unsaltedEnrollment.accountAssertion, null);
+  assert.equal(jwksRequests, requestsBeforeUnsaltedEnrollment);
   assert.equal(fs.existsSync(path.join(unsalted.home, ACCOUNT_ASSERTION_SALT_FILE)), false);
   assert.equal(fs.existsSync(path.join(unsalted.home, ACCOUNT_ASSERTION_SALT_META_FILE)), false);
   // A versioned assertion copied into static config is not authority.  If the
@@ -695,8 +725,11 @@ try {
 
   // Hash-only privacy: neither account identity, email, nor the signed token
   // is present in the ledger, registry, credentials, receipts, or stdout.
-  const durableText = privateTreeFiles(primary.home).map(file => fs.readFileSync(file).toString("utf8")).join("\n");
-  for (const sentinel of [accountA, accountB, RAW_EMAIL, enrollmentA.native.idToken, enrollmentB.native.idToken]) {
+  const durableText = opened.flatMap(subject => privateTreeFiles(subject.home))
+    .map(file => fs.readFileSync(file).toString("utf8")).join("\n");
+  const privateSentinels = [accountA, accountB, RAW_EMAIL, nativeA.idToken,
+    disabledNative.idToken, unsaltedNative.idToken, enrollmentA.native.idToken, enrollmentB.native.idToken];
+  for (const sentinel of privateSentinels) {
     assert.equal(durableText.includes(sentinel), false);
   }
 
@@ -723,10 +756,11 @@ try {
       signedNativeEvidenceStable: true,
       canonicalisationBudgetsControlled: true,
       hashOnlyPrivacy: true,
+      firstPartyOwnerEnrollment: true,
     },
   };
   const proofOutput = JSON.stringify(proof);
-  for (const sentinel of [accountA, accountB, RAW_EMAIL, enrollmentA.native.idToken, enrollmentB.native.idToken]) {
+  for (const sentinel of privateSentinels) {
     assert.equal(proofOutput.includes(sentinel), false);
   }
   console.log(proofOutput);
