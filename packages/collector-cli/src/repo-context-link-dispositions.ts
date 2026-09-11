@@ -11,6 +11,27 @@ const DISPOSITION_REASONS = new Set<RepoContextReplayReason>([
   "replay_exhausted",
 ]);
 
+export const REPO_CONTEXT_EXPIRY_SELECTION_SQL = `
+  with pending_slice(event_id, context_id) as materialized (
+    select l.event_id, l.context_id
+    from repo_context_event_links l indexed by idx_repo_context_event_links_pending_context
+    where l.fill_pending = 1 and l.context_conflict = 0 and l.context_id >= ''
+    order by l.context_id, l.event_id
+    limit ?
+  )
+  select p.event_id as eventId, p.context_id as contextId,
+    coalesce(d.reason, 'source_unavailable') as reason,
+    coalesce(d.attempt_count, 0) as attemptCount,
+    d.context_id as dispositionContextId
+  from pending_slice p
+  left join repo_context_link_dispositions d on d.event_id = p.event_id
+  where not exists (select 1 from repo_context_results r where r.context_id = p.context_id)
+    and not exists (select 1 from repo_context_suppressions s where s.context_id = p.context_id)
+    and not exists (select 1 from repo_context_inflight i where i.context_id = p.context_id)
+    and not exists (select 1 from repo_context_handoffs h where h.context_id = p.context_id)
+    and (d.event_id is null or d.expired_at is null)
+  order by p.context_id, p.event_id`;
+
 export function ensureRepoContextLinkDispositionSchema(database: Database.Database) {
   database.exec(`
     create table if not exists repo_context_link_dispositions (
@@ -136,22 +157,7 @@ export function expireRepoContextLinks(
   if (input.completedPasses < threshold) return 0;
   const limit = Math.max(1, Math.min(Math.trunc(input.limit), 256));
   const at = input.at ?? new Date().toISOString();
-  const rows = database.prepare(
-    `select l.event_id as eventId, l.context_id as contextId,
-       coalesce(d.reason, 'source_unavailable') as reason,
-       coalesce(d.attempt_count, 0) as attemptCount,
-       d.context_id as dispositionContextId
-     from repo_context_event_links l
-     left join repo_context_link_dispositions d on d.event_id = l.event_id
-     where l.fill_pending = 1 and l.context_conflict = 0
-       and not exists (select 1 from repo_context_results r where r.context_id = l.context_id)
-       and not exists (select 1 from repo_context_suppressions s where s.context_id = l.context_id)
-       and not exists (select 1 from repo_context_inflight i where i.context_id = l.context_id)
-       and not exists (select 1 from repo_context_handoffs h where h.context_id = l.context_id)
-       and (d.event_id is null or d.expired_at is null)
-     order by l.event_id
-     limit ?`,
-  ).all(limit) as Array<{
+  const rows = database.prepare(REPO_CONTEXT_EXPIRY_SELECTION_SQL).all(limit) as Array<{
     eventId: string;
     contextId: string;
     reason: RepoContextReplayReason;

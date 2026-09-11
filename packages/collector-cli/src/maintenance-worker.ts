@@ -109,6 +109,18 @@ export function gitContextBudgetMs(deadlineMs: number) {
   );
 }
 
+export function remainingRepoContextDrainLookupMs(input: {
+  gitBudgetMs: number;
+  remainingJobMs: number;
+  childFreshElapsedMs: number;
+  parentFreshElapsedMs: number;
+}) {
+  const sharedGitRemaining = Math.max(0,
+    input.gitBudgetMs - Math.max(0, input.childFreshElapsedMs) -
+      Math.max(0, input.parentFreshElapsedMs));
+  return Math.max(0, Math.min(Math.max(0, input.remainingJobMs), sharedGitRemaining));
+}
+
 export type MaintenanceRepoContextBatch = {
   results: RepoContextResult[];
   /** Contexts this pass actually resolved (committed when `commit` is given). */
@@ -578,16 +590,20 @@ export function runMaintenanceWorkerService(input: MaintenanceWorkerServiceInput
             ms: Math.max(0, Math.round(performance.now() - gitContextStartedAt)),
             remaining: remainingJobMs(),
           });
+          const parentFreshStartedAt = performance.now();
           repoContexts = resolveWithProgress(request.repoContexts);
+          const parentFreshElapsedMs = Math.max(0, performance.now() - parentFreshStartedAt);
           runConfiguredRepoContextDrainStage(worker.buffer, {
             captureElapsedMs: result.stageTimings?.totalMs ?? 200,
             freshContextsUsed: Math.min(8, childBatch.resolved + request.repoContexts.length),
             freshDeferred: childBatch.deferred.length,
             remainingJobMs: remainingJobMs(),
-            remainingLookupMs: Math.max(
-              0,
-              Math.min(gitContextBudgetMs(request.deadlineMs), remainingJobMs()) - childBatch.elapsedMs,
-            ),
+            remainingLookupMs: remainingRepoContextDrainLookupMs({
+              gitBudgetMs: gitContextBudgetMs(request.deadlineMs),
+              remainingJobMs: remainingJobMs(),
+              childFreshElapsedMs: childBatch.elapsedMs,
+              parentFreshElapsedMs,
+            }),
           });
         } catch (error) {
           try {

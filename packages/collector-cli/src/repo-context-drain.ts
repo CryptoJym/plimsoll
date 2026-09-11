@@ -74,7 +74,8 @@ function writeReceipt(
 ) {
   receipt.elapsedMs = Math.max(0, now() - started);
   receipt.sliceCutShort = receipt.scanBudgetExhausted || receipt.lookupBudgetExhausted ||
-    receipt.contextBudgetExhausted || receipt.cwdBudgetExhausted;
+    receipt.contextBudgetExhausted || receipt.cwdBudgetExhausted ||
+    receipt.status === "inventory_incomplete";
   writeRepoContextDrainReceipt(database, receipt);
   return receipt;
 }
@@ -224,7 +225,13 @@ export function runRepoContextDrainStage(
     now,
   });
   receipt.rowsInspected = 0;
-  receipt.unresolvedContexts.source_unavailable += discovery.unavailableRoots;
+  receipt.unavailableSourceRoots = discovery.unavailableRoots;
+  receipt.unavailableSourceEntries = discovery.unavailableEntries;
+  if (discovery.unavailableRoots > 0 || discovery.unavailableEntries > 0) {
+    receipt.status = "inventory_incomplete";
+    receipt.scanBudgetExhausted = discovery.budgetExhausted;
+    return writeReceipt(buffer.database, receipt, now, started);
+  }
   if (discovery.sources.length === 0) {
     receipt.status = "no_sources";
     receipt.scanBudgetExhausted = !discovery.complete;
@@ -274,6 +281,24 @@ export function runRepoContextDrainStage(
     const slice = readRepoContextReplaySlice(buffer, source, prior?.position ?? null, {
       maxContexts: Math.max(1, maxContexts - candidates.length),
     });
+    if (slice.generationChanged) {
+      receipt.sourceGenerationsChanged += 1;
+      receipt.scanBudgetExhausted = true;
+      break;
+    }
+    for (const terminal of slice.terminalRecords) {
+      recordRepoContextReplayAttempt(buffer.database, {
+        sourceKey: source.sourceKey,
+        sourceDigest: source.sourceDigest,
+        position: terminal.position,
+        contextId: `record:v1:${digest([
+          source.sourceKey, source.sourceDigest, terminal.position,
+        ])}`,
+        passId: pass.passId,
+        outcome: terminal.outcome,
+      });
+      receipt.oversizedSourceRecords += 1;
+    }
     const sourceCandidates = slice.candidates.map((candidate) => ({ ...candidate, source }));
     slices.push({ source, nextPosition: slice.nextPosition, complete: slice.complete,
       candidates: sourceCandidates });
@@ -304,7 +329,7 @@ export function runRepoContextDrainStage(
         source: source.source,
         position: slice.nextPosition,
         passId: pass.passId,
-        status: "active",
+        status: slice.complete ? "complete" : "active",
       });
       sourceCursor(receipt, source, slice.nextPosition);
       receipt.scanBudgetExhausted = true;

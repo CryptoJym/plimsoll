@@ -11,7 +11,7 @@ import {
 import type { RepoContextRequest } from "./repo-context";
 
 const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[8989][0-9a-f]{3}-[0-9a-f]{12}/i;
-const MAX_REPLAY_READ_BYTES = 512 * 1024;
+export const REPO_CONTEXT_REPLAY_MAX_RECORD_BYTES = 512 * 1024;
 const MAX_DISCOVERED_SOURCES = 4_096;
 const HEAD_PROBE_BYTES = 512;
 
@@ -35,10 +35,18 @@ export type RepoContextReplayCandidate = {
   request: RepoContextRequest;
 };
 
+export type RepoContextReplayTerminalRecord = {
+  position: string;
+  nextPosition: string;
+  outcome: "record_too_large";
+};
+
 export type RepoContextReplayDiscovery = {
   sources: RepoContextReplaySource[];
   complete: boolean;
+  budgetExhausted: boolean;
   unavailableRoots: number;
+  unavailableEntries: number;
   elapsedMs: number;
 };
 
@@ -48,20 +56,33 @@ function safeSize(value: bigint) {
   return size;
 }
 
-export function repoContextReplayFileIdentity(file: string) {
-  const stat = fs.lstatSync(file, { bigint: true });
-  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("repo_context_replay_source_unsafe");
+function openReplaySource(file: string) {
+  return fs.openSync(file, fs.constants.O_RDONLY | (fs.constants.O_NOFOLLOW ?? 0));
+}
+
+function fileIdentity(stat: fs.BigIntStats) {
   return `${String(stat.dev)}:${String(stat.ino)}:${String(stat.birthtimeNs)}`;
 }
 
+export function repoContextReplayFileIdentity(file: string) {
+  const descriptor = openReplaySource(file);
+  try {
+    const stat = fs.fstatSync(descriptor, { bigint: true });
+    if (!stat.isFile()) throw new Error("repo_context_replay_source_unsafe");
+    return fileIdentity(stat);
+  } finally { fs.closeSync(descriptor); }
+}
+
 function sourceFromFile(root: CaptureRoot, file: string): RepoContextReplaySource {
-  const stat = fs.lstatSync(file, { bigint: true });
-  if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("repo_context_replay_source_unsafe");
-  const fileIdentity = `${String(stat.dev)}:${String(stat.ino)}:${String(stat.birthtimeNs)}`;
-  const size = safeSize(stat.size);
-  const descriptor = fs.openSync(file, "r");
+  const descriptor = openReplaySource(file);
+  let sourceIdentity: string;
+  let size: number;
   let head: Buffer;
   try {
+    const stat = fs.fstatSync(descriptor, { bigint: true });
+    if (!stat.isFile()) throw new Error("repo_context_replay_source_unsafe");
+    sourceIdentity = fileIdentity(stat);
+    size = safeSize(stat.size);
     head = Buffer.alloc(Math.min(size, HEAD_PROBE_BYTES));
     const read = fs.readSync(descriptor, head, 0, head.length, 0);
     head = head.subarray(0, read);
@@ -72,9 +93,9 @@ function sourceFromFile(root: CaptureRoot, file: string): RepoContextReplaySourc
   return {
     source: root.source,
     sourceKey: sha256(JSON.stringify([captureRootDigest(root), relative])),
-    sourceDigest: sha256(JSON.stringify([root.source, fileIdentity, sha256(head)])),
+    sourceDigest: sha256(JSON.stringify([root.source, sourceIdentity, size, sha256(head)])),
     file,
-    fileIdentity,
+    fileIdentity: sourceIdentity,
     size,
   };
 }
@@ -96,6 +117,7 @@ export function discoverRepoContextReplaySources(
   const sources: RepoContextReplaySource[] = [];
   let complete = allowed > 0;
   let unavailableRoots = 0;
+  let unavailableEntries = 0;
   for (const root of roots) {
     if (now() - started >= allowed) { complete = false; break; }
     let rootStat: fs.Stats;
@@ -121,7 +143,7 @@ export function discoverRepoContextReplaySources(
         entries = fs.readdirSync(directory, { withFileTypes: true })
           .sort((left, right) => left.name.localeCompare(right.name));
       } catch {
-        unavailableRoots += 1;
+        unavailableEntries += 1;
         continue;
       }
       for (const entry of entries) {
@@ -134,7 +156,7 @@ export function discoverRepoContextReplaySources(
           pending.push(candidate);
         } else if (entry.isFile() && eligibleFile(root.source, entry.name)) {
           try { sources.push(sourceFromFile(root, candidate)); }
-          catch { unavailableRoots += 1; }
+          catch { unavailableEntries += 1; }
         }
       }
       if (!complete) break;
@@ -144,27 +166,63 @@ export function discoverRepoContextReplaySources(
   sources.sort((left, right) => left.sourceKey.localeCompare(right.sourceKey));
   return {
     sources,
-    complete,
+    complete: complete && unavailableRoots === 0 && unavailableEntries === 0,
+    budgetExhausted: !complete,
     unavailableRoots,
+    unavailableEntries,
     elapsedMs: Math.max(0, now() - started),
   };
 }
 
-type Position = { offset: number; contextIndex: number };
+type Position = { offset: number; contextIndex: number; skippingOversized?: boolean };
 
 export function encodeRepoContextReplayPosition(position: Position) {
-  return `${position.offset}:${position.contextIndex}`;
+  return `${position.offset}:${position.contextIndex}${position.skippingOversized ? ":s" : ""}`;
 }
 
 export function decodeRepoContextReplayPosition(value: string | null): Position {
   if (!value) return { offset: 0, contextIndex: -1 };
-  const match = /^(\d+):(-?\d+)$/.exec(value);
+  const match = /^(\d+):(-?\d+)(:s)?$/.exec(value);
   if (!match) return { offset: 0, contextIndex: -1 };
   const offset = Number(match[1]);
   const contextIndex = Number(match[2]);
   return Number.isSafeInteger(offset) && offset >= 0 && Number.isSafeInteger(contextIndex) && contextIndex >= -1
-    ? { offset, contextIndex }
+    ? { offset, contextIndex, ...(match[3] ? { skippingOversized: true } : {}) }
     : { offset: 0, contextIndex: -1 };
+}
+
+function skipOversizedRecord(
+  descriptor: number,
+  sourceSize: number,
+  start: Position,
+) {
+  let offset = start.offset;
+  let inspected = 0;
+  const chunkBytes = 64 * 1024;
+  while (offset < sourceSize && inspected < REPO_CONTEXT_REPLAY_MAX_RECORD_BYTES) {
+    const length = Math.min(chunkBytes, sourceSize - offset,
+      REPO_CONTEXT_REPLAY_MAX_RECORD_BYTES - inspected);
+    const bytes = Buffer.alloc(length);
+    const read = fs.readSync(descriptor, bytes, 0, length, offset);
+    if (read <= 0) break;
+    const newline = bytes.subarray(0, read).indexOf(0x0a);
+    if (newline >= 0) {
+      return {
+        next: { offset: offset + newline + 1, contextIndex: start.contextIndex },
+        complete: offset + newline + 1 >= sourceSize,
+      };
+    }
+    offset += read;
+    inspected += read;
+  }
+  return {
+    next: {
+      offset,
+      contextIndex: start.contextIndex,
+      ...(offset < sourceSize ? { skippingOversized: true } : {}),
+    },
+    complete: offset >= sourceSize,
+  };
 }
 
 export function readRepoContextReplaySlice(
@@ -174,20 +232,96 @@ export function readRepoContextReplaySlice(
   options: { maxContexts: number; maxBytes?: number },
 ) {
   const start = decodeRepoContextReplayPosition(cursor);
-  if (start.offset >= source.size) {
-    return { candidates: [] as RepoContextReplayCandidate[], rowsInspected: 0,
-      nextPosition: encodeRepoContextReplayPosition(start), complete: true, cutShort: false };
-  }
   const maxContexts = Math.max(1, Math.min(Math.trunc(options.maxContexts), 64));
-  const maxBytes = Math.max(1, Math.min(Math.trunc(options.maxBytes ?? 64 * 1024), MAX_REPLAY_READ_BYTES));
-  const length = Math.min(maxBytes, source.size - start.offset);
-  const bytes = Buffer.alloc(length);
-  const descriptor = fs.openSync(source.file, "r");
-  let read = 0;
-  try { read = fs.readSync(descriptor, bytes, 0, length, start.offset); }
-  finally { fs.closeSync(descriptor); }
-  const view = bytes.subarray(0, read);
-  const atEof = start.offset + read >= source.size;
+  const maxBytes = Math.max(1, Math.min(
+    Math.trunc(options.maxBytes ?? 64 * 1024), REPO_CONTEXT_REPLAY_MAX_RECORD_BYTES,
+  ));
+  let descriptor: number;
+  try { descriptor = openReplaySource(source.file); }
+  catch {
+    return {
+      candidates: [] as RepoContextReplayCandidate[],
+      terminalRecords: [] as RepoContextReplayTerminalRecord[],
+      rowsInspected: 0,
+      nextPosition: encodeRepoContextReplayPosition(start),
+      complete: false,
+      cutShort: true,
+      generationChanged: true,
+    };
+  }
+  let view = Buffer.alloc(0);
+  let atEof = false;
+  try {
+    const liveStat = fs.fstatSync(descriptor, { bigint: true });
+    const liveSize = safeSize(liveStat.size);
+    if (!liveStat.isFile() || fileIdentity(liveStat) !== source.fileIdentity || liveSize !== source.size) {
+      return {
+        candidates: [] as RepoContextReplayCandidate[],
+        terminalRecords: [] as RepoContextReplayTerminalRecord[],
+        rowsInspected: 0,
+        nextPosition: encodeRepoContextReplayPosition(start),
+        complete: false,
+        cutShort: true,
+        generationChanged: true,
+      };
+    }
+    if (start.offset >= source.size) {
+      return {
+        candidates: [] as RepoContextReplayCandidate[],
+        terminalRecords: [] as RepoContextReplayTerminalRecord[],
+        rowsInspected: 0,
+        nextPosition: encodeRepoContextReplayPosition(start),
+        complete: true,
+        cutShort: false,
+        generationChanged: false,
+      };
+    }
+    if (start.skippingOversized) {
+      const skipped = skipOversizedRecord(descriptor, source.size, start);
+      return {
+        candidates: [] as RepoContextReplayCandidate[],
+        terminalRecords: [] as RepoContextReplayTerminalRecord[],
+        rowsInspected: 0,
+        nextPosition: encodeRepoContextReplayPosition(skipped.next),
+        complete: skipped.complete,
+        cutShort: !skipped.complete,
+        generationChanged: false,
+      };
+    }
+    let length = Math.min(maxBytes, source.size - start.offset);
+    while (true) {
+      const bytes = Buffer.alloc(length);
+      const read = fs.readSync(descriptor, bytes, 0, length, start.offset);
+      view = bytes.subarray(0, read);
+      atEof = start.offset + read >= source.size;
+      if (view.includes(0x0a) || atEof || length >= REPO_CONTEXT_REPLAY_MAX_RECORD_BYTES) break;
+      length = Math.min(
+        REPO_CONTEXT_REPLAY_MAX_RECORD_BYTES,
+        source.size - start.offset,
+        Math.max(length + 1, length * 2),
+      );
+    }
+    if (!atEof && !view.includes(0x0a) && view.length >= REPO_CONTEXT_REPLAY_MAX_RECORD_BYTES) {
+      const skipped = skipOversizedRecord(descriptor, source.size, {
+        offset: start.offset + view.length,
+        contextIndex: start.contextIndex,
+      });
+      const nextPosition = encodeRepoContextReplayPosition(skipped.next);
+      return {
+        candidates: [] as RepoContextReplayCandidate[],
+        terminalRecords: [{
+          position: encodeRepoContextReplayPosition(start),
+          nextPosition,
+          outcome: "record_too_large" as const,
+        }],
+        rowsInspected: 1,
+        nextPosition,
+        complete: skipped.complete,
+        cutShort: !skipped.complete,
+        generationChanged: false,
+      };
+    }
+  } finally { fs.closeSync(descriptor); }
   const candidates: RepoContextReplayCandidate[] = [];
   let relativeOffset = 0;
   let rowsInspected = 0;
@@ -253,9 +387,11 @@ export function readRepoContextReplaySlice(
   const complete = next.offset >= source.size;
   return {
     candidates,
+    terminalRecords: [] as RepoContextReplayTerminalRecord[],
     rowsInspected,
     nextPosition: encodeRepoContextReplayPosition(next),
     complete,
     cutShort: !complete,
+    generationChanged: false,
   };
 }

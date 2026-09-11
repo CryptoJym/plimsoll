@@ -13,7 +13,7 @@ export type RepoContextReplayReason =
 export type RepoContextDrainReceipt = {
   schema: "repo-context-drain-receipt/v1";
   runId: string;
-  status: "disabled" | "ran" | "yielded_fresh" | "no_sources";
+  status: "disabled" | "ran" | "yielded_fresh" | "no_sources" | "inventory_incomplete";
   replayPassId: string | null;
   sourceCursor: {
     sourceKey: string;
@@ -24,6 +24,10 @@ export type RepoContextDrainReceipt = {
   candidateContexts: number;
   distinctCwdGroups: number;
   successfulContexts: number;
+  oversizedSourceRecords: number;
+  unavailableSourceRoots: number;
+  unavailableSourceEntries: number;
+  sourceGenerationsChanged: number;
   unresolvedContexts: Record<RepoContextReplayReason, number>;
   expiredLinks: number;
   reResolvedExpiredLinks: number;
@@ -54,6 +58,10 @@ export function disabledRepoContextDrainReceipt(): RepoContextDrainReceipt {
     candidateContexts: 0,
     distinctCwdGroups: 0,
     successfulContexts: 0,
+    oversizedSourceRecords: 0,
+    unavailableSourceRoots: 0,
+    unavailableSourceEntries: 0,
+    sourceGenerationsChanged: 0,
     unresolvedContexts: zeroReasons(),
     expiredLinks: 0,
     reResolvedExpiredLinks: 0,
@@ -105,7 +113,7 @@ export function ensureRepoContextReplaySchema(database: Database.Database) {
       pass_id text not null,
       outcome text not null check (outcome in (
         'started', 'not_pending', 'success', 'boundary_unavailable',
-        'resolution_failed', 'worker_crash', 'replay_exhausted'
+        'resolution_failed', 'worker_crash', 'replay_exhausted', 'record_too_large'
       )),
       attempted_at text not null,
       primary key (source_key, source_digest, position, context_id, pass_id)
@@ -122,6 +130,38 @@ export function ensureRepoContextReplaySchema(database: Database.Database) {
     create index if not exists idx_repo_context_drain_runs_completed
       on repo_context_drain_runs (completed_at, run_id);
   `);
+  const attemptsSql = database.prepare(
+    `select sql from sqlite_master where type = 'table' and name = 'repo_context_replay_attempts'`,
+  ).pluck().get() as string | undefined;
+  if (attemptsSql && !attemptsSql.includes("'record_too_large'")) {
+    database.transaction(() => {
+      database.exec(`
+        alter table repo_context_replay_attempts rename to repo_context_replay_attempts_legacy;
+        create table repo_context_replay_attempts (
+          source_key text not null,
+          source_digest text not null,
+          position text not null,
+          context_id text not null,
+          pass_id text not null,
+          outcome text not null check (outcome in (
+            'started', 'not_pending', 'success', 'boundary_unavailable',
+            'resolution_failed', 'worker_crash', 'replay_exhausted', 'record_too_large'
+          )),
+          attempted_at text not null,
+          primary key (source_key, source_digest, position, context_id, pass_id)
+        ) without rowid;
+        insert into repo_context_replay_attempts
+          (source_key, source_digest, position, context_id, pass_id, outcome, attempted_at)
+        select source_key, source_digest, position, context_id, pass_id, outcome, attempted_at
+        from repo_context_replay_attempts_legacy;
+        drop table repo_context_replay_attempts_legacy;
+      `);
+    }).immediate();
+    database.exec(`
+      create index if not exists idx_repo_context_replay_attempts_started
+        on repo_context_replay_attempts (outcome, attempted_at, context_id);
+    `);
+  }
 }
 
 export function writeRepoContextDrainReceipt(
@@ -267,7 +307,7 @@ export function recordRepoContextReplayAttempt(
     contextId: string;
     passId: string;
     outcome: "started" | "not_pending" | "success" | "boundary_unavailable" |
-      "resolution_failed" | "worker_crash" | "replay_exhausted";
+      "resolution_failed" | "worker_crash" | "replay_exhausted" | "record_too_large";
     at?: string;
   },
 ) {
