@@ -11,7 +11,10 @@ export function requireIsolatedProofEnvironment() {
   if (marker.schema !== "plimsoll.disposable-proof.v1" || marker.runId !== process.env.PLIMSOLL_PROOF_RUN_ID) {
     throw new Error("proof root was not created for this run");
   }
-  for (const key of ["HOME", "USERPROFILE", "PLIMSOLL_HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR",
+  if (process.env.PLIMSOLL_FIXTURE_ROOT !== root) {
+    throw new Error("proof isolation missing or unsafe: PLIMSOLL_FIXTURE_ROOT");
+  }
+  for (const key of ["HOME", "USERPROFILE", "PLIMSOLL_HOME", "CODEX_HOME", "GROK_HOME", "CLAUDE_CONFIG_DIR",
     "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "TMPDIR", "PLIMSOLL_PROOF_RECEIPT"]) {
     const value = process.env[key];
     const relative = value && path.relative(root, value);

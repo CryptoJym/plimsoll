@@ -10,6 +10,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { useFixtureRoot } from "./lib/fixture-root";
 import {
   applyClaudeSettings,
   generateClaudeCodeSettings,
@@ -60,9 +61,10 @@ function main() {
   });
 
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-claude-config-proof-"));
+  // Declare the fixture root before the first apply: every target below is
+  // inside the sandbox and the guard refuses anything that is not.
+  const fixture = useFixtureRoot(sandbox, { home: path.join(sandbox, "must-remain-absent-operator-home") });
   const syntheticHome = path.join(sandbox, "synthetic-home");
-  const operatorHome = process.env.HOME;
-  process.env.HOME = path.join(sandbox, "must-remain-absent-operator-home");
   const generated = generateClaudeCodeSettings({
     repoRoot: "/synthetic/plimsoll/source",
     port: 49130,
@@ -592,8 +594,7 @@ function main() {
     );
     console.log(JSON.stringify({ issue: 130, ok: true, checks }, null, 2));
   } finally {
-    if (operatorHome === undefined) delete process.env.HOME;
-    else process.env.HOME = operatorHome;
+    fixture.restore();
     fs.rmSync(sandbox, { recursive: true, force: true });
   }
 }

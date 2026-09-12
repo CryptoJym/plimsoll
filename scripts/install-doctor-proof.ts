@@ -26,6 +26,7 @@ import {
   readUtcProcessStartFingerprint,
   UTC_PROCESS_START_ALGORITHM,
 } from "../packages/collector-cli/src/runtime-ownership";
+import { useFixtureRoot } from "./lib/fixture-root";
 
 type CommandResult = {
   code: number | null;
@@ -126,6 +127,7 @@ async function main() {
     "pnpm proof:codex-config-apply",
     "pnpm proof:setup-toml-reconcile",
     "pnpm proof:claude-config-apply",
+    "pnpm proof:fixture-root-guard",
     "pnpm proof:git-context",
     "pnpm proof:http-boundary",
     "pnpm proof:dashboard",
@@ -150,6 +152,9 @@ async function main() {
   );
 
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-install-doctor-proof-"));
+  // Every child env below spreads process.env, so declaring the fixture root
+  // here carries the managed-config contract into each spawned `setup`.
+  const guardFixture = useFixtureRoot(sandbox, { home: path.join(sandbox, "guard-fixture-home") });
   const packagedCli = path.join(root, "packages", "collector-cli", "dist", "install-doctor-proof-cli.mjs");
   let server: http.Server | undefined;
 
@@ -327,6 +332,7 @@ esac
   const doctorBaseEnv = {
     ...process.env,
     HOME: blankHome,
+    GROK_HOME: path.join(blankHome, ".grok"),
     PATH: isolatedPath,
     PLIMSOLL_HOME: blankPlimsoll,
     PLIMSOLL_COLLECTOR_DOCTOR_TIMEOUT_MS: "100",
@@ -400,6 +406,7 @@ esac
       env: {
         ...doctorBaseEnv,
         HOME: cleanSetupHome,
+        GROK_HOME: path.join(cleanSetupHome, ".grok"),
         PLIMSOLL_HOME: cleanSetupPlimsoll,
       },
     },
@@ -448,6 +455,7 @@ esac
       env: {
         ...doctorBaseEnv,
         HOME: rejectedSetupHome,
+        GROK_HOME: path.join(rejectedSetupHome, ".grok"),
         PLIMSOLL_HOME: rejectedSetupPlimsoll,
       },
     },
@@ -501,6 +509,7 @@ esac
       env: {
         ...doctorBaseEnv,
         HOME: freshApplyHome,
+        GROK_HOME: path.join(freshApplyHome, ".grok"),
         PLIMSOLL_HOME: freshApplyPlimsoll,
       },
     },
@@ -553,6 +562,7 @@ esac
   const fixtureEnv = {
     ...process.env,
     HOME: fixtureHome,
+    GROK_HOME: path.join(fixtureHome, ".grok"),
     PATH: isolatedPath,
     PLIMSOLL_HOME: fixturePlimsoll,
     PLIMSOLL_COLLECTOR_DOCTOR_TIMEOUT_MS: "500",
@@ -1100,6 +1110,7 @@ esac
     if (server) {
       await new Promise<void>((resolve) => server!.close(() => resolve()));
     }
+    guardFixture.restore();
     fs.rmSync(packagedCli, { force: true });
     fs.rmSync(sandbox, { recursive: true, force: true });
   }

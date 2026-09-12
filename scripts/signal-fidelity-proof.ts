@@ -148,6 +148,7 @@ import {
   generateClaudeCodeSettings,
   generateCodexConfigToml,
 } from "../packages/collector-config/src/index";
+import { useFixtureRoot } from "./lib/fixture-root";
 
 type Check = { name: string; passed: boolean; detail: string };
 
@@ -569,7 +570,9 @@ async function main() {
   proofClockMatrix();
   const restoreProofDateNow = installProofDateNow();
   const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "wi-signal-fidelity-"));
-  process.env.PLIMSOLL_HOME = tempDir; // keep config writes off the real machine
+  // Keep config writes off the real machine and declare the fixture root the
+  // managed-config apply guard enforces for the section 13 applies below.
+  useFixtureRoot(tempDir, { plimsollHome: tempDir });
   const bufferPath = path.join(tempDir, "work-ledger.sqlite");
   const buffer = new LocalEventBuffer(bufferPath);
   const config = collectorConfigSchema.parse({});
@@ -1774,7 +1777,7 @@ async function main() {
   fs.rmSync(rolloutDir, { recursive: true, force: true });
 
   // 13. Config apply mode (issue 0003): surgical, backed-up, idempotent.
-  const setupDir = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-setup-"));
+  const setupDir = fs.mkdtempSync(path.join(tempDir, "plimsoll-setup-"));
   const claudeSettingsPath = path.join(setupDir, "settings.json");
   fs.writeFileSync(
     claudeSettingsPath,

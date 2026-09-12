@@ -6,6 +6,7 @@ import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { parse as parseToml } from "smol-toml";
 
+import { useFixtureRoot } from "./lib/fixture-root";
 import {
   applyCodexConfig,
   generateCodexConfigToml,
@@ -14,6 +15,10 @@ import {
 type Check = { name: string; passed: true; detail: unknown };
 
 const root = path.resolve(import.meta.dirname, "..");
+// Per-run fixture root: every apply target, spawned CLI home and Plimsoll home
+// below lives inside it, and the guard refuses anything that does not.
+const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-setup-toml-reconcile-"));
+const fixtureRoot = useFixtureRoot(sandbox);
 const fixture = (name: string) => path.join(root, "scripts", "fixtures", name);
 const checks: Check[] = [];
 const syntheticToken = "synthetic-codex-producer-token";
@@ -58,14 +63,21 @@ function operation(result: ReturnType<typeof applyCodexConfig>, key: string) {
 function runCli(home: string, args: string[]) {
   const cli = path.join(root, "packages", "collector-cli", "src", "cli.ts");
   const loader = path.join(root, "node_modules", "tsx", "dist", "loader.mjs");
+  const childHome = path.join(home, "operator-home-must-remain-absent");
   const result = spawnSync(process.execPath, ["--import", loader, cli, ...args], {
     cwd: root,
     env: {
       PATH: process.env.PATH,
       LANG: "en_US.UTF-8",
       TZ: "UTC",
-      HOME: path.join(home, "operator-home-must-remain-absent"),
+      HOME: childHome,
       PLIMSOLL_HOME: path.join(home, "plimsoll-home"),
+      // Same paths the child would derive from HOME, declared so the fixture
+      // contract travels with the child and no apply can reach a real root.
+      CODEX_HOME: path.join(childHome, ".codex"),
+      GROK_HOME: path.join(childHome, ".grok"),
+      CLAUDE_CONFIG_DIR: path.join(childHome, ".claude"),
+      PLIMSOLL_FIXTURE_ROOT: fixtureRoot.root,
     },
     encoding: "utf8",
     timeout: 120_000,
@@ -75,7 +87,6 @@ function runCli(home: string, args: string[]) {
 
 function main() {
   check("proof_runs_on_node_22", Number(process.versions.node.split(".")[0]) === 22, process.versions.node);
-  const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-setup-toml-reconcile-"));
   try {
     const macbook = copyFixture(sandbox, "macbook-codex-config-hooks-desktop-layout.toml");
     const macbookBefore = fs.readFileSync(macbook, "utf8");
@@ -431,6 +442,7 @@ function main() {
 
     console.log(JSON.stringify({ ok: true, checks }, null, 2));
   } finally {
+    fixtureRoot.restore();
     fs.rmSync(sandbox, { recursive: true, force: true });
   }
 }

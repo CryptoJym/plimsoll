@@ -1,4 +1,5 @@
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
+import { useFixtureRoot } from "./lib/fixture-root";
 /**
  * Issue #117 privacy-mode proof.
  *
@@ -53,6 +54,10 @@ type SentinelFixture = {
 const startedAt = Date.now();
 const repoRoot = process.cwd();
 const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-privacy-mode-proof-"));
+// runCli inherits process.env, and `setup` derives its Gemini and Grok targets
+// from HOME/GROK_HOME. Pin both inside the fixture root before any CLI runs so
+// no managed apply can reach the operator's real tool config.
+const guardFixture = useFixtureRoot(root);
 const checks: Check[] = [];
 const cliSource = path.join(repoRoot, "packages", "collector-cli", "src", "cli.ts");
 const fixture = JSON.parse(
@@ -1301,6 +1306,7 @@ main()
     process.exitCode = 1;
   })
   .finally(() => {
+    guardFixture.restore();
     fs.rmSync(root, { recursive: true, force: true });
     // Cleanup first; a terminal failure must not leave fixture servers holding CI open.
     if (process.exitCode) process.exit(Number(process.exitCode));
