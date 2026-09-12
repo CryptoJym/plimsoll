@@ -236,23 +236,37 @@ function settledAuth(existing: LocalIngestAuth, now: number) {
 
 /**
  * Provision once and return the same values on every subsequent call. A load
- * also settles the stored file: missing producer audiences are filled and
- * rotation windows that have already closed are dropped, so a restart never
- * re-reads a superseded token.
+ * drops rotation windows that have already closed, so a restart never carries
+ * a superseded token forward -- but it drops them in memory only. The stored
+ * file belongs to `rotateLocalProducerToken`, which composes its own live
+ * rotations on the write that supersedes a token. The single write left here
+ * fills producer audiences a legacy file is missing; it abandons that write
+ * when the file moved on underneath it, and never crashes the caller when the
+ * home cannot be written.
  */
 export function loadOrCreateLocalIngestAuth(
   home: string,
   options: { dryRun?: boolean } = {},
 ): LocalIngestAuth {
   const now = Date.now();
+  const stamp = localIngestAuthStamp(home);
   const existing = readLocalIngestAuth(home);
   if (existing) {
-    if (existing.geminiCliProducer && existing.grokProducer &&
-      closedRotationCount(existing, now) === 0) {
-      return existing;
+    const live = withoutClosedRotations(existing, now);
+    if (live.geminiCliProducer && live.grokProducer) return Object.freeze(live);
+    const settled = Object.freeze(settledAuth(existing, now));
+    if (options.dryRun) return settled;
+    // Abandon on drift: a write landed between the read above and here, so
+    // that file is the newer one and this copy must not be renamed over it.
+    if (localIngestAuthStamp(home) !== stamp) return settled;
+    try {
+      return writeAuth(home, settled, true);
+    } catch {
+      // A home this process cannot write must not turn a load into a crash on
+      // the path that feeds ingestion. The returned authority already carries
+      // the filled audiences; doctor reports the stored file's own state.
+      return settled;
     }
-    const settled = settledAuth(existing, now);
-    return options.dryRun ? Object.freeze(settled) : writeAuth(home, settled, true);
   }
   if (authFileExists(home)) throw new Error("local_ingest_auth_invalid");
   return options.dryRun ? newAuth() : writeNewAuth(home, false);
@@ -327,33 +341,29 @@ export function rotateLocalProducerToken(
 }
 
 /**
- * Drop every rotation window whose deadline has passed and rewrite the file
- * when a row goes away. A superseded token must not outlive its deadline on
- * disk: after the window closes, a restart, a later reload, or a clock moved
- * backwards must not be able to resurrect it. Returns the authority now on
- * disk, or null when the file is missing or malformed, in which case callers
- * keep whatever authority they already hold.
+ * The stored authority with every rotation window whose deadline has passed
+ * dropped in memory, so a reload can never carry a superseded token forward
+ * even if the clock moved backwards afterwards.
+ *
+ * Deliberately read-only. A reader that rewrote the credential file would
+ * race `rotateLocalProducerToken`: inside the reader's read -> rename window
+ * the rotation renames its new file into place, the reader then renames its
+ * pruned copy of the *old* file over it, and the token the operator just
+ * revoked is live again as `current` with no deadline. Closed rows leave the
+ * disk on the next rotation, which composes its own live rotations; until
+ * then this prune and the deadline check in `assertProducerToken` both keep
+ * the superseded token out, and doctor reports the row as expired.
+ *
+ * Null when the file is missing or malformed, in which case callers keep
+ * whatever authority they already hold.
  */
-export function pruneExpiredProducerRotations(
+export function readLiveProducerAuth(
   home: string,
   now = Date.now(),
 ): LocalIngestAuth | null {
-  const stamp = localIngestAuthStamp(home);
   const existing = readLocalIngestAuth(home);
   if (!existing) return null;
-  const live = withoutClosedRotations(existing, now);
-  if (live === existing) return existing;
-  // A write that landed between the read above and here owns the newer file
-  // and already dropped its own closed windows; never clobber it.
-  if (localIngestAuthStamp(home) !== stamp) return readLocalIngestAuth(home);
-  try {
-    return Object.freeze(writeAuth(home, live, true));
-  } catch {
-    // A home this process cannot write must not turn every request that calls
-    // this into an error. The returned authority is already pruned, so the
-    // closed window stops admitting its token either way.
-    return Object.freeze(live);
-  }
+  return Object.freeze(withoutClosedRotations(existing, now));
 }
 
 /**

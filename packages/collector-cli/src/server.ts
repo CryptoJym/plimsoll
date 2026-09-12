@@ -57,7 +57,7 @@ import {
   assertManagementCredential,
   assertProducerToken,
   localIngestAuthStamp,
-  pruneExpiredProducerRotations,
+  readLiveProducerAuth,
   type LocalIngestAuth,
 } from "./local-auth";
 import {
@@ -209,6 +209,12 @@ export function createCollectorServer(
   // superseded token outlives its deadline and the new one is locked out.
   let producerAuth = localAuth;
   let producerAuthStamp = options.localAuthHome ? localIngestAuthStamp(options.localAuthHome) : null;
+  // Stamp of a credential file that failed to load. An operator can leave the
+  // file truncated, malformed, or no longer private for as long as they like;
+  // re-reading and re-parsing it on every request buys nothing, because
+  // admission keeps using the installed authority either way. The stat still
+  // runs, so the repaired file is picked up on the first request after it moves.
+  let unreadableAuthStamp: string | null = null;
   const graceWindowClosed = (auth: LocalIngestAuth) => {
     const now = Date.now();
     return Object.values(auth.rotations ?? {}).some((rotation) => rotation.expiresAt <= now);
@@ -220,15 +226,21 @@ export function createCollectorServer(
     // No readable credential file: the authority this daemon started with
     // stays in force rather than admitting or rejecting on a guess.
     if (stamp === null) return loaded;
+    if (stamp === unreadableAuthStamp) return loaded;
     if (stamp === producerAuthStamp && !graceWindowClosed(loaded)) return loaded;
     // One load per observed change, plus one more once a window has closed so
-    // the expired row also leaves the disk. The stamp advances only after the
-    // load succeeded: a half-written or malformed file must not retire a token
-    // the next request still has to honour.
-    const reloaded = pruneExpiredProducerRotations(home);
-    if (!reloaded) return loaded;
+    // the closed row also leaves the authority in memory. The read never
+    // writes: the credential file belongs to `rotate-producer-token`. The
+    // stamp advances only after the load succeeded, and it is the stamp read
+    // *before* the load, so a file that changed mid-read is re-read next time.
+    const reloaded = readLiveProducerAuth(home);
+    if (!reloaded) {
+      unreadableAuthStamp = stamp;
+      return loaded;
+    }
+    unreadableAuthStamp = null;
     producerAuth = reloaded;
-    producerAuthStamp = localIngestAuthStamp(home) ?? stamp;
+    producerAuthStamp = stamp;
     return reloaded;
   };
   const assertProducer = (request: http.IncomingMessage, source: LocalProducerSource) => {

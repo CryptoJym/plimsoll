@@ -16,6 +16,7 @@ import type http from "node:http";
 import type { AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
+import readline from "node:readline";
 import { parse as parseToml } from "smol-toml";
 
 import {
@@ -28,8 +29,10 @@ import {
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { HttpBoundaryRejection } from "../packages/collector-cli/src/http-boundary";
+import type { LocalIngestAuth } from "../packages/collector-cli/src/local-auth";
 import {
   assertProducerToken,
+  LOCAL_INGEST_AUTH_FILE,
   loadOrCreateLocalIngestAuth,
   producerRotationState,
   readLocalIngestAuth,
@@ -59,6 +62,15 @@ function errorMessage(action: () => unknown) {
     return "";
   } catch (error) {
     return error instanceof Error ? error.message : String(error);
+  }
+}
+
+/** A load that fails soft: the authority it returned, or the message it threw. */
+function tryLoadAuth(home: string): { auth: LocalIngestAuth | null; error: string } {
+  try {
+    return { auth: loadOrCreateLocalIngestAuth(home), error: "" };
+  } catch (error) {
+    return { auth: null, error: error instanceof Error ? error.message : String(error) };
   }
 }
 
@@ -129,6 +141,60 @@ function sleep(ms: number) {
 /** Value-blind: how many rotation rows the stored credential file still has. */
 function storedRotationRows(home: string) {
   return Object.keys(readLocalIngestAuth(home)?.rotations ?? {}).length;
+}
+
+function authFile(home: string) {
+  return path.join(home, LOCAL_INGEST_AUTH_FILE);
+}
+
+/** Byte-level identity of the stored credential file; changes on any write. */
+function credentialStamp(home: string) {
+  try {
+    const stat = fs.statSync(authFile(home));
+    return `${stat.size}:${stat.mtimeMs}:${sha256(fs.readFileSync(authFile(home)))}`;
+  } catch {
+    return "absent";
+  }
+}
+
+/**
+ * Count the credential-file syscalls a scenario makes. The contract under
+ * proof is that no read path writes the file, so this wraps `node:fs` for the
+ * duration of one scenario and restores it afterwards. `write` counts intent,
+ * not success: entering `writeAuth` at all is enough to fail the assertion.
+ */
+function countAuthFileSyscalls(...homes: string[]) {
+  const counts = { stat: 0, read: 0, write: 0 };
+  const inHome = (value: unknown) =>
+    typeof value === "string" &&
+    homes.some((home) => value === home || value.startsWith(`${home}${path.sep}`));
+  const mutable = fs as unknown as Record<string, (...args: any[]) => any>;
+  const original = { ...mutable };
+  const wrap = (name: string, kind: "stat" | "read" | "write", targets = 1) => {
+    const inner = original[name]!;
+    mutable[name] = (...args: any[]) => {
+      if (args.slice(0, targets).some(inHome)) counts[kind] += 1;
+      return inner(...args);
+    };
+  };
+  wrap("lstatSync", "stat");
+  wrap("statSync", "stat");
+  wrap("readFileSync", "read");
+  wrap("openSync", "write");
+  wrap("writeFileSync", "write");
+  wrap("mkdirSync", "write");
+  wrap("unlinkSync", "write");
+  wrap("renameSync", "write", 2);
+  wrap("linkSync", "write", 2);
+  return {
+    counts,
+    restore() {
+      for (const name of ["lstatSync", "statSync", "readFileSync", "openSync",
+        "writeFileSync", "mkdirSync", "unlinkSync", "renameSync", "linkSync"]) {
+        mutable[name] = original[name]!;
+      }
+    },
+  };
 }
 
 function exporterHeaders(toml: string) {
@@ -603,14 +669,21 @@ async function main() {
     // daemon follows a rotation whatever it was probed with first. Each case
     // below gets its own credential home and its own listener; every request
     // goes to a collector that loaded its authority *before* the rotation.
-    const startRotationCollector = async (label: string, authorityHome: string) => {
-      fs.mkdirSync(authorityHome, { recursive: true, mode: 0o700 });
-      const authority = loadOrCreateLocalIngestAuth(authorityHome);
+    const startRotationCollector = async (
+      label: string,
+      authorityHome: string,
+      options: { authority?: LocalIngestAuth; perSourceRequestLimit?: number } = {},
+    ) => {
+      if (!options.authority) fs.mkdirSync(authorityHome, { recursive: true, mode: 0o700 });
+      const authority = options.authority ?? loadOrCreateLocalIngestAuth(authorityHome);
       const ledger = new LocalEventBuffer(path.join(sandbox, `${label}-ledger.sqlite`));
       rotationBuffers.push(ledger);
       const server = createCollectorServer(collectorConfigSchema.parse({ port: 48271 }), ledger, {
         localAuth: authority,
         localAuthHome: authorityHome,
+        ...(options.perSourceRequestLimit === undefined
+          ? {}
+          : { perSourceRequestLimit: options.perSourceRequestLimit }),
       });
       rotationServers.push(server);
       await new Promise<void>((resolve, reject) => {
@@ -640,6 +713,7 @@ async function main() {
     const retireBeforeRotation = await retire.post(retire.authority.codexProducer);
     const retired = rotateLocalProducerToken(retireHome, "codex", { graceMs: 1 });
     const retireRowsAfterRotation = storedRotationRows(retireHome);
+    const retireStampAfterRotation = credentialStamp(retireHome);
     await sleep(50);
     const retireOldFirst = await retire.post(retire.authority.codexProducer);
     const retireForeign = await retire.post("y".repeat(43));
@@ -657,15 +731,25 @@ async function main() {
         newAfterMisses: retireNewLast,
       },
     );
+    // The closed window is retired in memory, on every load. The stored file
+    // stays exactly as `rotate-producer-token` wrote it: a read path that
+    // rewrote it could rename its copy of the pre-rotation file over a
+    // concurrent rotation and put the superseded token back as `current`.
     check(
-      "closed_rotation_window_is_pruned_from_the_credential_file",
-      retireRowsAfterRotation === 1 && storedRotationRows(retireHome) === 0 &&
-        (fs.statSync(path.join(retireHome, "local-ingest-auth.json")).mode & 0o777) === 0o600 &&
-        readLocalIngestAuth(retireHome)!.codexProducer === retired.auth.codexProducer,
+      "closed_rotation_window_is_retired_without_a_read_path_write",
+      retireRowsAfterRotation === 1 && storedRotationRows(retireHome) === 1 &&
+        credentialStamp(retireHome) === retireStampAfterRotation &&
+        (fs.statSync(authFile(retireHome)).mode & 0o777) === 0o600 &&
+        readLocalIngestAuth(retireHome)!.codexProducer === retired.auth.codexProducer &&
+        producerRotationState(readLocalIngestAuth(retireHome), "codex").state === "expired" &&
+        loadOrCreateLocalIngestAuth(retireHome).rotations === undefined,
       {
         rowsAfterRotation: retireRowsAfterRotation,
         rowsAfterExpiry: storedRotationRows(retireHome),
-        mode: fs.statSync(path.join(retireHome, "local-ingest-auth.json")).mode & 0o777,
+        storedFileUnchanged: credentialStamp(retireHome) === retireStampAfterRotation,
+        doctorState: producerRotationState(readLocalIngestAuth(retireHome), "codex").state,
+        loadedRows: Object.keys(loadOrCreateLocalIngestAuth(retireHome).rotations ?? {}).length,
+        mode: fs.statSync(authFile(retireHome)).mode & 0o777,
       },
     );
 
@@ -676,17 +760,21 @@ async function main() {
     const onlyOld = await startRotationCollector("window", windowHome);
     const windowBeforeRotation = await onlyOld.post(onlyOld.authority.codexProducer);
     const windowRotated = rotateLocalProducerToken(windowHome, "codex", { graceMs: windowGraceMs });
+    const windowStampAfterRotation = credentialStamp(windowHome);
     const windowOldInside = await onlyOld.post(onlyOld.authority.codexProducer);
     await sleep(Math.max(windowRotated.expiresAt - Date.now(), 0) + 50);
     const windowOldOutside = await onlyOld.post(onlyOld.authority.codexProducer);
     check(
       "old_token_only_traffic_is_cut_off_when_the_window_closes",
       windowBeforeRotation === 202 && windowOldInside === 202 && windowOldOutside === 401 &&
-        storedRotationRows(windowHome) === 0,
+        storedRotationRows(windowHome) === 1 &&
+        credentialStamp(windowHome) === windowStampAfterRotation,
       {
         beforeRotation: windowBeforeRotation,
         insideWindow: windowOldInside,
         afterWindow: windowOldOutside,
+        rowsLeftOnDisk: storedRotationRows(windowHome),
+        storedFileUnchanged: credentialStamp(windowHome) === windowStampAfterRotation,
         graceMs: windowGraceMs,
       },
     );
@@ -711,8 +799,8 @@ async function main() {
       },
     );
 
-    // 4. Pruning happens on the request path, so a credential home the daemon
-    //    cannot write must still decide the request instead of erroring.
+    // 4. The request path decides freshness from a file it only ever reads, so
+    //    a credential home the daemon cannot write still retires the token.
     const sealedHome = path.join(sandbox, "sealed-auth");
     const sealed = await startRotationCollector("sealed", sealedHome);
     const sealedBeforeRotation = await sealed.post(sealed.authority.codexProducer);
@@ -739,7 +827,269 @@ async function main() {
       },
     );
 
-    // 4. CI must keep running this proof: install-doctor's standalone gate list
+    // 5. Syscall assertion: a full expiry cycle driven by producer requests
+    //    only. After the rotation's own write the credential file is byte-frozen
+    //    -- zero writes from the read path -- while the superseded token still
+    //    stops at its deadline and the new token is admitted throughout.
+    const writeFreeHome = path.join(sandbox, "write-free-auth");
+    const writeFree = await startRotationCollector("write-free", writeFreeHome);
+    const writeFreeBefore = await writeFree.post(writeFree.authority.codexProducer);
+    const writeFreeRotated = rotateLocalProducerToken(writeFreeHome, "codex", { graceMs: 400 });
+    const writeFreeStamp = credentialStamp(writeFreeHome);
+    const writeFreeSyscalls = countAuthFileSyscalls(writeFreeHome);
+    const writeFreeInside: number[] = [];
+    const writeFreeAfter: number[] = [];
+    try {
+      writeFreeInside.push(await writeFree.post(writeFree.authority.codexProducer));
+      writeFreeInside.push(await writeFree.post(writeFreeRotated.auth.codexProducer));
+      await sleep(Math.max(writeFreeRotated.expiresAt - Date.now(), 0) + 50);
+      for (let round = 0; round < 10; round += 1) {
+        writeFreeAfter.push(await writeFree.post(writeFree.authority.codexProducer));
+        writeFreeAfter.push(await writeFree.post(writeFreeRotated.auth.codexProducer));
+      }
+    } finally {
+      writeFreeSyscalls.restore();
+    }
+    check(
+      "producer_read_path_never_writes_the_credential_file",
+      writeFreeSyscalls.counts.write === 0 &&
+        credentialStamp(writeFreeHome) === writeFreeStamp &&
+        storedRotationRows(writeFreeHome) === 1 &&
+        writeFreeBefore === 202 &&
+        writeFreeInside.every((status) => status === 202) &&
+        writeFreeAfter.every((status, index) => status === (index % 2 === 0 ? 401 : 202)) &&
+        writeFreeSyscalls.counts.read >= 1 && writeFreeSyscalls.counts.read <= 2,
+      {
+        writes: writeFreeSyscalls.counts.write,
+        reads: writeFreeSyscalls.counts.read,
+        stats: writeFreeSyscalls.counts.stat,
+        requests: 1 + writeFreeInside.length + writeFreeAfter.length,
+        beforeRotation: writeFreeBefore,
+        insideWindow: writeFreeInside,
+        afterWindowOld: writeFreeAfter.filter((_, index) => index % 2 === 0),
+        afterWindowNew: writeFreeAfter.filter((_, index) => index % 2 === 1),
+        storedFileUnchanged: credentialStamp(writeFreeHome) === writeFreeStamp,
+      },
+    );
+
+    // 6. Concurrency: a rotation fired from another process at the exact
+    //    instant a grace window closes, against a spin loop of producer
+    //    requests crossing that instant. The read path writes nothing, so
+    //    nothing can rename a pre-rotation copy over the rotation and put the
+    //    superseded token back as `current` with no deadline.
+    const raceHome = path.join(sandbox, "race-auth");
+    const race = await startRotationCollector("race", raceHome, {
+      perSourceRequestLimit: 1_000_000,
+    });
+    const rotatorScript = path.join(sandbox, "rotate-at-instant.mts");
+    fs.writeFileSync(rotatorScript, [
+      'import crypto from "node:crypto";',
+      'import readline from "node:readline";',
+      `import { rotateLocalProducerToken } from ${JSON.stringify(path.join(repoRoot, "packages", "collector-cli", "src", "local-auth.ts"))};`,
+      'const lines = readline.createInterface({ input: process.stdin });',
+      'let chain = Promise.resolve();',
+      'lines.on("line", (line) => {',
+      '  if (!line) return;',
+      '  chain = chain.then(async () => {',
+      '    const job = JSON.parse(line) as { home: string; at: number; graceMs: number };',
+      '    const lead = job.at - Date.now() - 3;',
+      '    if (lead > 0) await new Promise((resolve) => setTimeout(resolve, lead));',
+      '    while (Date.now() < job.at) { /* land on the instant, not after it */ }',
+      '    const rotated = rotateLocalProducerToken(job.home, "codex", { graceMs: job.graceMs });',
+      '    process.stdout.write(`${JSON.stringify({',
+      '      digest: crypto.createHash("sha256").update(rotated.auth.codexProducer).digest("hex"),',
+      '      expiresAt: rotated.expiresAt,',
+      '    })}\\n`);',
+      '  });',
+      '});',
+      "",
+    ].join("\n"), { mode: 0o600 });
+    const rotator = spawn(process.execPath, ["--import", loader, rotatorScript], {
+      cwd: repoRoot,
+      env: { ...process.env },
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    let rotatorErrors = "";
+    rotator.stderr.setEncoding("utf8");
+    rotator.stderr.on("data", (chunk: string) => { rotatorErrors += chunk; });
+    let rotatorExit: number | null = null;
+    const rotatorLines = readline.createInterface({ input: rotator.stdout });
+    const pendingRotations: Array<(value: { digest: string; expiresAt: number }) => void> = [];
+    const rotatorReplies: Array<{ digest: string; expiresAt: number }> = [];
+    rotatorLines.on("line", (line) => {
+      const reply = JSON.parse(line) as { digest: string; expiresAt: number };
+      const waiting = pendingRotations.shift();
+      if (waiting) waiting(reply);
+      else rotatorReplies.push(reply);
+    });
+    const nextRotation = () => new Promise<{ digest: string; expiresAt: number }>((resolve) => {
+      const ready = rotatorReplies.shift();
+      if (ready) resolve(ready);
+      else pendingRotations.push(resolve);
+    });
+    const raceIterations = 40;
+    const raceGraceMs = 60;
+    const raceStatuses = new Set<number>();
+    let raceRequests = 0;
+    let raceLostRotations = 0;
+    let raceSupersededOnDisk = 0;
+    for (let iteration = 0; iteration < raceIterations; iteration += 1) {
+      // Seed a window that closes at `expiresAt`; the rotator supersedes this
+      // token at that same instant, while requests cross it in this process.
+      const seed = rotateLocalProducerToken(raceHome, "codex", { graceMs: raceGraceMs });
+      rotator.stdin.write(`${JSON.stringify({
+        home: raceHome,
+        at: seed.expiresAt,
+        graceMs: raceGraceMs,
+      })}\n`);
+      const spinUntil = seed.expiresAt + 25;
+      while (Date.now() < seed.expiresAt - 20) await sleep(1);
+      while (Date.now() < spinUntil) {
+        raceStatuses.add(await race.post(seed.auth.codexProducer));
+        raceRequests += 1;
+      }
+      const rotated = await nextRotation();
+      const onDisk = readLocalIngestAuth(raceHome)!;
+      if (sha256(onDisk.codexProducer) !== rotated.digest) raceLostRotations += 1;
+      if (onDisk.codexProducer === seed.auth.codexProducer) raceSupersededOnDisk += 1;
+    }
+    rotator.stdin.end();
+    rotatorLines.close();
+    await new Promise<void>((resolve) => {
+      rotator.once("close", (status) => { rotatorExit = status; resolve(); });
+    });
+    check(
+      "a_rotation_at_the_expiry_instant_is_never_lost_to_the_read_path",
+      raceIterations === 40 && raceLostRotations === 0 && raceSupersededOnDisk === 0 &&
+        raceRequests >= raceIterations && rotatorExit === 0 &&
+        raceStatuses.size === 1 && raceStatuses.has(202),
+      {
+        iterations: raceIterations,
+        graceMs: raceGraceMs,
+        producerRequestsAcrossTheInstant: raceRequests,
+        rotationsLost: raceLostRotations,
+        diskIsTheSupersededToken: raceSupersededOnDisk > 0,
+        rotatorExit,
+        rotatorStderrClean: rotatorErrors.trim() === "",
+        statuses: [...raceStatuses].sort(),
+      },
+    );
+
+    // 7. A credential file an operator left half-written must not be re-read
+    //    and re-parsed on every request. Admission keeps using the installed
+    //    authority; the stat still runs, so a repair is picked up at once.
+    const malformedHome = path.join(sandbox, "malformed-auth");
+    const malformed = await startRotationCollector("malformed", malformedHome);
+    const malformedBefore = await malformed.post(malformed.authority.codexProducer);
+    const intactBytes = fs.readFileSync(authFile(malformedHome));
+    fs.truncateSync(authFile(malformedHome), Math.floor(intactBytes.length / 2));
+    const malformedStamp = credentialStamp(malformedHome);
+    const malformedSyscalls = countAuthFileSyscalls(malformedHome);
+    const malformedStatuses: number[] = [];
+    try {
+      for (let request = 0; request < 20; request += 1) {
+        malformedStatuses.push(await malformed.post(malformed.authority.codexProducer));
+      }
+    } finally {
+      malformedSyscalls.restore();
+    }
+    const malformedReads = malformedSyscalls.counts.read;
+    await sleep(5);
+    const restoreTemporary = `${authFile(malformedHome)}.restore`;
+    fs.writeFileSync(restoreTemporary, intactBytes, { mode: 0o600 });
+    fs.renameSync(restoreTemporary, authFile(malformedHome));
+    const repairedSyscalls = countAuthFileSyscalls(malformedHome);
+    const repairedFirst = await malformed.post(malformed.authority.codexProducer);
+    const repairedSecond = await malformed.post(malformed.authority.codexProducer);
+    repairedSyscalls.restore();
+    check(
+      "a_malformed_credential_file_is_read_once_until_its_stamp_changes",
+      malformedBefore === 202 && malformedStatuses.length === 20 &&
+        malformedStatuses.every((status) => status === 202) &&
+        malformedReads <= 1 && malformedSyscalls.counts.write === 0 &&
+        malformedSyscalls.counts.stat >= 20 && malformedSyscalls.counts.stat <= 22 &&
+        credentialStamp(malformedHome) !== malformedStamp &&
+        repairedSyscalls.counts.read === 1 && repairedSyscalls.counts.write === 0 &&
+        repairedFirst === 202 && repairedSecond === 202,
+      {
+        requestsWhileMalformed: malformedStatuses.length,
+        readsWhileMalformed: malformedReads,
+        statsWhileMalformed: malformedSyscalls.counts.stat,
+        writesWhileMalformed: malformedSyscalls.counts.write,
+        statusesWhileMalformed: [...new Set(malformedStatuses)],
+        readsAfterRepair: repairedSyscalls.counts.read,
+        afterRepair: [repairedFirst, repairedSecond],
+      },
+    );
+
+    // 8. A load is a read. With a closed row in a home this process cannot
+    //    write, it returns the pruned authority instead of throwing past the
+    //    caller that feeds ingestion, and it writes nothing. Filling a legacy
+    //    file's missing audiences is the one write left on this path, and it
+    //    fails soft the same way.
+    const sealedLoadHome = path.join(sandbox, "sealed-load-auth");
+    fs.mkdirSync(sealedLoadHome, { recursive: true, mode: 0o700 });
+    const sealedLoadBefore = loadOrCreateLocalIngestAuth(sealedLoadHome);
+    const sealedLoadRotated = rotateLocalProducerToken(sealedLoadHome, "codex", { graceMs: 1 });
+    const legacyHome = path.join(sandbox, "sealed-legacy-auth");
+    fs.mkdirSync(legacyHome, { recursive: true, mode: 0o700 });
+    const legacySeed = loadOrCreateLocalIngestAuth(legacyHome);
+    const legacyBytes = `${JSON.stringify({
+      version: 1,
+      claudeCodeProducer: legacySeed.claudeCodeProducer,
+      codexProducer: legacySeed.codexProducer,
+      managementRead: legacySeed.managementRead,
+    })}\n`;
+    fs.writeFileSync(authFile(legacyHome), legacyBytes, { mode: 0o600 });
+    await sleep(20);
+    fs.chmodSync(sealedLoadHome, 0o500);
+    fs.chmodSync(legacyHome, 0o500);
+    const sealedLoadSyscalls = countAuthFileSyscalls(sealedLoadHome);
+    let sealedLoad: { auth: LocalIngestAuth | null; error: string } = { auth: null, error: "" };
+    let legacyLoad: { auth: LocalIngestAuth | null; error: string } = { auth: null, error: "" };
+    let sealedLoadOld = 0;
+    let sealedLoadNew = 0;
+    try {
+      sealedLoad = tryLoadAuth(sealedLoadHome);
+      sealedLoadSyscalls.restore();
+      legacyLoad = tryLoadAuth(legacyHome);
+      const sealedLoadCollector = await startRotationCollector("sealed-load", sealedLoadHome, {
+        authority: sealedLoad.auth ?? sealedLoadRotated.auth,
+      });
+      sealedLoadOld = await sealedLoadCollector.post(sealedLoadBefore.codexProducer);
+      sealedLoadNew = await sealedLoadCollector.post(sealedLoadRotated.auth.codexProducer);
+    } finally {
+      sealedLoadSyscalls.restore();
+      fs.chmodSync(sealedLoadHome, 0o700);
+      fs.chmodSync(legacyHome, 0o700);
+    }
+    check(
+      "a_closed_row_in_an_unwritable_home_loads_pruned_without_a_write",
+      sealedLoad.error === "" && sealedLoad.auth !== null &&
+        sealedLoad.auth.rotations === undefined &&
+        sealedLoad.auth.codexProducer === sealedLoadRotated.auth.codexProducer &&
+        sealedLoadSyscalls.counts.write === 0 &&
+        storedRotationRows(sealedLoadHome) === 1 &&
+        sealedLoadOld === 401 && sealedLoadNew === 202 &&
+        legacyLoad.error === "" && legacyLoad.auth !== null &&
+        typeof legacyLoad.auth.geminiCliProducer === "string" &&
+        typeof legacyLoad.auth.grokProducer === "string" &&
+        fs.readFileSync(authFile(legacyHome), "utf8") === legacyBytes,
+      {
+        loadThrew: sealedLoad.error,
+        loadedRows: Object.keys(sealedLoad.auth?.rotations ?? {}).length,
+        writesOnLoad: sealedLoadSyscalls.counts.write,
+        rowsLeftOnDisk: storedRotationRows(sealedLoadHome),
+        oldAfterExpiry: sealedLoadOld,
+        newAfterExpiry: sealedLoadNew,
+        legacyLoadThrew: legacyLoad.error,
+        legacyAudiencesFilledInMemory: typeof legacyLoad.auth?.geminiCliProducer === "string" &&
+          typeof legacyLoad.auth?.grokProducer === "string",
+        legacyFileUnchanged: fs.readFileSync(authFile(legacyHome), "utf8") === legacyBytes,
+      },
+    );
+
+    // 9. CI must keep running this proof: install-doctor's standalone gate list
     //    is what stops the workflow step from being dropped silently.
     const gateCommand = "pnpm proof:codex-producer-token";
     const installDoctorProof = fs.readFileSync(
