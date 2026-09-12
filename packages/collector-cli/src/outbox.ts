@@ -58,6 +58,39 @@ export type DeliveryReceiptReason =
   | "remote_rejected_exhausted"
   | "remote_validation_rejected";
 
+/** Remote terminal reasons are the only replayable dead letters (bead .46):
+ * the cloud rejected an envelope the collector prepared correctly, so a fixed
+ * remote contract makes the delivery viable again. Local privacy, quarantine,
+ * oversize and schema receipts are decisions about the row itself and stay
+ * final — replaying them would re-run the same local refusal. */
+export const REPLAYABLE_RECEIPT_REASONS: readonly DeliveryReceiptReason[] = [
+  "remote_validation_rejected",
+  "remote_rejected_exhausted",
+];
+
+export function isReplayableReceiptReason(
+  reason: string,
+): reason is DeliveryReceiptReason {
+  return REPLAYABLE_RECEIPT_REASONS.includes(reason as DeliveryReceiptReason);
+}
+
+export type DeliveryReplaySummary = {
+  reason: string;
+  selected: number;
+  requeued: number;
+  skipped: {
+    alreadyActive: number;
+    alreadyAcknowledged: number;
+    missingRaw: number;
+    privacyDisposed: number;
+  };
+  dryRun: boolean;
+};
+
+/** Bounded like the migration scan: the replay transaction never waits longer
+ * than this for a competing writer before rolling back for a later retry. */
+const REPLAY_BUSY_TIMEOUT_MS = 5_000;
+
 function isTerminalPrivacyReason(
   reason: DeliveryReceiptReason,
 ): reason is TerminalPrivacyReason {
@@ -436,6 +469,17 @@ export class DeliveryOutbox {
         contract_hash text not null,
         failed_at text not null
       );
+      -- Bead .46: a dead letter written for a remote reason is only terminal
+      -- while the remote contract that rejected it is unchanged. upload-replay
+      -- supersedes that receipt and records the supersession here, so a second
+      -- replay of the same delivery is a counted no-op rather than a duplicate.
+      create table if not exists upload_replays (
+        delivery_id text primary key,
+        reason text not null,
+        original_terminal_at text not null,
+        replayed_at text not null,
+        replay_count integer not null default 1
+      );
       create table if not exists upload_control (
         singleton integer primary key check (singleton = 1),
         migration_cursor_rowid integer not null default 0,
@@ -776,6 +820,202 @@ export class DeliveryOutbox {
       )
       .get(rawId) as RawDeliveryRow | undefined;
     return row ? this.enqueueRaw(row) : { enqueued: 0, dead: 0 };
+  }
+
+  /** Replay dead letters written for a remote terminal reason (bead .46).
+   *
+   * The cloud rejecting an envelope is a statement about the *remote* contract,
+   * not about the row: once that contract is fixed the delivery is viable
+   * again, but `enqueueRaw` (:720-805) refuses any delivery id that already
+   * carries a receipt. Replay makes the supersession explicit — it removes the
+   * dead receipt, keeps `upload_control.receipt_dead` exact (the receipt gauge
+   * trigger at :583-591 only counts inserts), records the supersession in
+   * `upload_replays`, and hands the raw row back to the ordinary enqueue path.
+   * Nothing is uploaded here; delivery still happens on normal `upload` cycles,
+   * so this is safe to run while a circuit is open.
+   *
+   * Bounded exactly like the migration scan: rows, raw bytes and busy_timeout.
+   */
+  replayDeadLetters(options: {
+    reason: string;
+    since?: string;
+    limit?: number;
+    maxBytes?: number;
+    dryRun?: boolean;
+    now?: Date;
+  }): DeliveryReplaySummary {
+    const reason = options.reason;
+    const dryRun = Boolean(options.dryRun);
+    const summary: DeliveryReplaySummary = {
+      reason,
+      selected: 0,
+      requeued: 0,
+      skipped: {
+        alreadyActive: 0,
+        alreadyAcknowledged: 0,
+        missingRaw: 0,
+        privacyDisposed: 0,
+      },
+      dryRun,
+    };
+    if (!isReplayableReceiptReason(reason)) {
+      throw new Error(
+        `upload-replay refuses reason '${reason}': only remote terminal reasons are replayable ` +
+          `(${REPLAYABLE_RECEIPT_REASONS.join(", ")}). Local privacy, quarantine, oversize and ` +
+          `schema dead letters are decisions about the row itself and stay final.`,
+      );
+    }
+    if (!this.enabled) return summary;
+    const limit = Math.max(1, Math.min(Math.trunc(options.limit ?? 500), 5_000));
+    const maxBytes = Math.max(1, Math.trunc(options.maxBytes ?? this.limits.migrationBatchBytes));
+    let sinceIso: string | null = null;
+    if (options.since !== undefined) {
+      const parsed = new Date(options.since);
+      if (Number.isNaN(parsed.getTime())) {
+        throw new Error(`upload-replay --since expects an ISO-8601 timestamp, got: ${options.since}`);
+      }
+      sinceIso = parsed.toISOString();
+    }
+    const nowIso = (options.now ?? this.clock()).toISOString();
+    // Fixed internal enum, never caller input: safe to inline as a SQL list.
+    const replayableList = REPLAYABLE_RECEIPT_REASONS.map((value) => `'${value}'`).join(", ");
+
+    const priorBusyTimeout = this.db.pragma("busy_timeout", { simple: true }) as number;
+    this.db.pragma(`busy_timeout = ${REPLAY_BUSY_TIMEOUT_MS}`);
+    try {
+      // A delivery already replayed no longer has a dead receipt, so the
+      // replay ledger is the second half of the candidate set: a repeat run
+      // must still see it and count it as skipped rather than report nothing.
+      const candidates = this.db
+        .prepare(
+          `select deliveryId, diedAt from (
+             select delivery_id as deliveryId, terminal_at as diedAt
+               from upload_receipts
+              where terminal_state = 'dead' and reason = @reason
+                and (@since is null or terminal_at >= @since)
+             union
+             select p.delivery_id as deliveryId, p.original_terminal_at as diedAt
+               from upload_replays p
+              where p.reason = @reason
+                and (@since is null or p.original_terminal_at >= @since)
+                and not exists (
+                  select 1 from upload_receipts r
+                   where r.delivery_id = p.delivery_id and r.terminal_state = 'dead'
+                     and r.reason not in (${replayableList})
+                )
+           )
+           order by diedAt, deliveryId
+           limit @limit`,
+        )
+        .all({ reason, since: sinceIso, limit }) as Array<{
+          deliveryId: string;
+          diedAt: string;
+        }>;
+
+      const activeStatement = this.db.prepare(
+        `select 1 as active from upload_outbox where delivery_id = ?`,
+      );
+      const receiptStatement = this.db.prepare(
+        `select terminal_state as state from upload_receipts where delivery_id = ?`,
+      );
+      // The delivery id is the normalized event id, which for a captured row is
+      // its ledger id. A delivery whose id was derived from a non-UUID raw id
+      // (upload-history backfill) cannot be resolved back and is reported as
+      // missingRaw rather than guessed at.
+      const rawStatement = this.db.prepare(
+        `select rowid as rawRowid, id as rawId, created_at as createdAt,
+           data_mode as dataMode, uploaded_at as uploadedAt,
+           payload_json as payloadJson, suppressed_fields_json as suppressedFieldsJson,
+           repo_hash as repoHash, branch_hash as branchHash,
+           workspace_id as workspaceId, device_id as deviceId,
+           privacy_generation as privacyGeneration, privacy_disposition as privacyDisposition,
+           length(cast(payload_json as blob)) +
+             length(cast(suppressed_fields_json as blob)) as rowBytes
+         from buffered_events where id = ?`,
+      );
+
+      const classifyAndRequeue = () => {
+        let bytes = 0;
+        for (const candidate of candidates) {
+          if (bytes >= maxBytes) break;
+          summary.selected += 1;
+          if (activeStatement.get(candidate.deliveryId)) {
+            summary.skipped.alreadyActive += 1;
+            continue;
+          }
+          const receipt = receiptStatement.get(candidate.deliveryId) as
+            | { state: string }
+            | undefined;
+          if (receipt?.state === "acknowledged") {
+            summary.skipped.alreadyAcknowledged += 1;
+            continue;
+          }
+          const raw = rawStatement.get(candidate.deliveryId) as
+            | (RawDeliveryRow & { rowBytes: number })
+            | undefined;
+          if (!raw) {
+            summary.skipped.missingRaw += 1;
+            continue;
+          }
+          if (raw.privacyDisposition) {
+            summary.skipped.privacyDisposed += 1;
+            continue;
+          }
+          if (raw.uploadedAt) {
+            summary.skipped.alreadyAcknowledged += 1;
+            continue;
+          }
+          bytes += raw.rowBytes;
+          if (dryRun) {
+            summary.requeued += 1;
+            continue;
+          }
+          this.supersedeDeadReceipt(candidate.deliveryId, reason, candidate.diedAt, nowIso);
+          const outcome = this.enqueueRaw(raw);
+          if (outcome.enqueued > 0) summary.requeued += 1;
+          else if (outcome.dead > 0) summary.skipped.privacyDisposed += 1;
+          else summary.skipped.missingRaw += 1;
+        }
+      };
+      // A dry run must leave the ledger byte-identical, so it never opens a
+      // write transaction.
+      if (dryRun) classifyAndRequeue();
+      else this.db.transaction(classifyAndRequeue)();
+    } finally {
+      this.db.pragma(`busy_timeout = ${priorBusyTimeout}`);
+    }
+    return summary;
+  }
+
+  private supersedeDeadReceipt(
+    deliveryId: string,
+    reason: string,
+    diedAt: string,
+    nowIso: string,
+  ) {
+    const removed = this.db
+      .prepare(`delete from upload_receipts where delivery_id = ? and terminal_state = 'dead'`)
+      .run(deliveryId).changes;
+    if (removed > 0) {
+      this.db
+        .prepare(
+          `update upload_control set receipt_dead = max(0, receipt_dead - @removed),
+             updated_at = @now
+           where singleton = 1`,
+        )
+        .run({ removed, now: nowIso });
+    }
+    this.db
+      .prepare(
+        `insert into upload_replays
+           (delivery_id, reason, original_terminal_at, replayed_at, replay_count)
+         values (@deliveryId, @reason, @diedAt, @now, 1)
+         on conflict(delivery_id) do update set
+           reason = excluded.reason,
+           replayed_at = excluded.replayed_at,
+           replay_count = upload_replays.replay_count + 1`,
+      )
+      .run({ deliveryId, reason, diedAt, now: nowIso });
   }
 
   fillLinkageForRawRow(rawRowid: number, repoHash: string | null, branchHash: string | null) {

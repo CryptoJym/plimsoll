@@ -37,4 +37,69 @@ Every collector authenticated POST, including join and repo labels, uses the sha
 2. Deploy the strict collector after the server receipt. Verify one new event and its exact replay, plus history, session and outcome acknowledgements.
 3. Preserve the outbox, history watermark and installation identity across rollback. Rolling the server back while strict clients run will defer deliveries; restoring v1 service permits replay after the existing circuit/backoff. Do not clear local work to make delivery look healthy.
 
-`delivery-ack.ts` is intentionally byte-identical in the two separately versioned repositories. Keep both copies and contract fixtures aligned. Collector proofs are `scripts/delivery-transport-proof.ts`, `scripts/outbox-proof.ts`, and `scripts/join-isolation-proof.ts`. Cloud `scripts/delivery-ack-proof.ts` requires `PLIMSOLL_DELIVERY_FIXTURE=1` and a disposable loopback database named `plimsoll_delivery_fixture`. Hosted deployment, independent integration review and fleet acceptance remain release-owner work.
+### One source's validation rejections do not open the host circuit
+
+The wire contract is unchanged — no new remote fields — but the collector's
+reading of a rejection is scoped, because a 400/422 names one envelope, not the
+endpoint.
+
+A cycle that ends with zero acceptances and only singleton validation
+rejections used to be read as a broken contract and opened the whole-host
+`contract_blocked` circuit. On 2026-09-12 a hosted cloud whose `AiToolSource`
+enum had no `GROK` rejected every Grok envelope per item; studio4 bisected one
+cycle down to 16 Grok singletons, inferred a broken contract, and held 33
+deliverable `claude_code` events for an hour.
+
+That inference is now gated on the durable validation witness — a previously
+acknowledged sanitized envelope under the current contract hash
+(`upload_validation_witness`):
+
+- **Witness accepted (2xx).** The contract is proven, so the singletons are
+  proven candidates: they are dead-lettered per delivery with
+  `remote_validation_rejected`, the circuit stays `none`, and every other item
+  remains deliverable in this or the next cycle.
+- **Witness rejected (400/422).** Global contract evidence: `contract_blocked`
+  opens exactly as before, with zero dead letters.
+- **Witness probe does not fit the cycle's `delivery.maxProbesPerCycle`
+  budget.** The inference is deferred — the cycle retries with
+  `remote_validation` and does not open the circuit. The next cycle's
+  start-of-cycle witness reprobe settles it. The budget is never exceeded.
+- **No witness.** A host that has never had an acknowledgement under this
+  contract hash has nothing that proves the contract, so the conservative
+  `contract_blocked` behaviour stands.
+
+### Replaying dead letters after a contract fix
+
+A dead letter written for a *remote* reason records the cloud rejecting an
+envelope the collector prepared correctly. Once that contract is fixed the
+delivery is viable again, but `enqueueRaw` refuses any delivery id that already
+carries a receipt, so those receipts were terminal.
+
+```
+plimsoll upload-replay --reason <receipt reason> [--since <ISO-8601>] [--limit N] [--dry-run]
+```
+
+Replayable reasons are the remote terminal ones — `remote_validation_rejected`
+and `remote_rejected_exhausted`. Local privacy, quarantine, oversize and schema
+receipts are decisions about the row itself and are refused with a clear error.
+
+The command selects dead receipts with that reason whose raw row still exists in
+`buffered_events` and carries no privacy disposition, supersedes the dead
+receipt (recorded in `upload_replays` with a `replay_count`, with
+`upload_control.receipt_dead` kept exact), and re-enqueues the raw row through
+the ordinary enqueue path. It never uploads: delivery happens on the normal
+`upload` cycles, so it is safe to run while a circuit is open. A replayed
+delivery that is later acknowledged ends with exactly one `upload_receipts` row
+in state `acknowledged`; a second replay of the same delivery is a counted
+no-op. `--limit` defaults to 500 and is capped at 5000, and the transaction is
+bounded by rows, raw bytes and `busy_timeout` like the migration scan.
+
+Output is one JSON object:
+
+```json
+{ "reason": "...", "selected": 0, "requeued": 0,
+  "skipped": { "alreadyActive": 0, "alreadyAcknowledged": 0, "missingRaw": 0, "privacyDisposed": 0 },
+  "dryRun": false }
+```
+
+`delivery-ack.ts` is intentionally byte-identical in the two separately versioned repositories. Keep both copies and contract fixtures aligned. Collector proofs are `scripts/delivery-transport-proof.ts`, `scripts/outbox-proof.ts`, `scripts/upload-replay-proof.ts`, and `scripts/join-isolation-proof.ts`. Cloud `scripts/delivery-ack-proof.ts` requires `PLIMSOLL_DELIVERY_FIXTURE=1` and a disposable loopback database named `plimsoll_delivery_fixture`. Hosted deployment, independent integration review and fleet acceptance remain release-owner work.

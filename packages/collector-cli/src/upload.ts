@@ -491,6 +491,7 @@ export async function uploadBufferedEvents(
   let fatal: ProbeResult | null = null;
   let validationWitnessProven = false;
   let validationWitnessRejected = false;
+  let validationWitnessDeferred = false;
   let sawValidationFailure = false;
   let locallyDead = provenDead + lease.locallyDead;
   const queue: LeasedDeliveryItem[][] = [lease.items];
@@ -629,6 +630,65 @@ export async function uploadBufferedEvents(
     }
   }
 
+  // Bead .46. A cycle that ends with zero acceptances and only singleton
+  // validation rejections used to be read as "everything we sent was
+  // rejected, so the contract is broken" (the `remote_contract` inference
+  // below). That is wrong when every item in the cycle merely shares one
+  // rejected source: on 2026-09-12 a hosted cloud without `grok` in its source
+  // enum rejected 16 Grok singletons per item and studio4 opened the whole-host
+  // `contract_blocked` circuit for an hour, holding 33 deliverable claude_code
+  // events. The in-loop probe at :575-610 only reaches the witness when the
+  // bounded lookahead is empty, and a full bisection of 16 poison rows spends
+  // the entire probe budget before it gets there.
+  //
+  // The durable validation witness settles it: a previously acknowledged
+  // sanitized envelope under this contract hash. A witness 2xx proves the
+  // contract, which makes these singletons proven candidates (dead-lettered
+  // per delivery, circuit untouched); a witness 400/422 is global contract
+  // evidence and keeps today's behaviour. With no probe budget left the
+  // inference is deferred to the next cycle, where the cycle-start reprobe
+  // at :398-450 resolves it from the marked candidates. With no witness at all
+  // (a host that has never had an acknowledgement under this contract hash)
+  // nothing is proven and today's conservative inference stands.
+  if (
+    !fatal &&
+    succeeded.size === 0 &&
+    validationSingletons.size > 0 &&
+    !validationWitnessProven &&
+    !validationWitnessRejected
+  ) {
+    const witness = buffer.delivery.validationWitness(contractHash);
+    if (witness && probes >= maxProbes) {
+      validationWitnessDeferred = true;
+    } else if (witness) {
+      probes += 1;
+      const witnessResult = await postItems({
+        config,
+        items: [witness.item],
+        appVersion,
+        url,
+        ingestKey: options.ingestKey ?? config.ingestKey,
+        signingSecret: options.signingSecret ?? config.uploadSigningSecret,
+        fetchImpl: options.fetchImpl ?? fetch,
+        timeoutSeconds: config.delivery.requestTimeoutSeconds,
+        now: nowFn,
+        maxBytes: maxRequestBytes,
+      });
+      if (witnessResult.ok) {
+        validationWitnessProven = true;
+      } else if (witnessResult.status === 400 || witnessResult.status === 422) {
+        validationWitnessRejected = true;
+      } else if (witnessResult.statusClass === "local_request_budget") {
+        // A local preflight failure consumes no remote probe and proves
+        // nothing either way; defer rather than infer.
+        probes -= 1;
+        validationWitnessDeferred = true;
+      } else {
+        fatal = witnessResult;
+      }
+    }
+  }
+
   options.afterRemote?.();
 
   const acknowledged = await storage(() => buffer.delivery.acknowledge(
@@ -669,6 +729,8 @@ export async function uploadBufferedEvents(
     failure = failureForProbe(fatal);
   } else if (succeeded.size === 0 && unresolved.size > 0) {
     failure = validationIsolationIncomplete ||
+      validationWitnessProven ||
+      validationWitnessDeferred ||
       (validationSingletons.size > 0 && attemptedActive.size < 2 && !validationWitnessRejected)
       ? "remote_validation"
       : "remote_contract";

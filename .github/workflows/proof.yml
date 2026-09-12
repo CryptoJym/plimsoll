@@ -243,6 +243,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:outbox
 
+      - name: Prove source-scoped validation rejections and replayable dead letters
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:upload-replay
+
       - name: Prove bounded daemon upload timer returns
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:upload-timer-bounds
