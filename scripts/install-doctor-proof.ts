@@ -125,6 +125,7 @@ async function main() {
     "pnpm proof:install-doctor",
     "pnpm proof:launch-agent",
     "pnpm proof:codex-config-apply",
+    "pnpm proof:codex-producer-token",
     "pnpm proof:setup-toml-reconcile",
     "pnpm proof:claude-config-apply",
     "pnpm proof:fixture-root-guard",
@@ -429,9 +430,12 @@ esac
   const rejectedToolDir = path.join(sandbox, "rejected-tool-config");
   const rejectedClaude = path.join(rejectedToolDir, "settings.json");
   const rejectedGemini = path.join(rejectedToolDir, "gemini.json");
-  const rejectedGrok = path.join(rejectedToolDir, "grok-hooks.json");
+  // Grok and Codex keep separate directories, as they do in a real home: each
+  // source owns its own plimsoll.headers beside its own config.
+  const rejectedGrok = path.join(rejectedToolDir, "grok", "grok-hooks.json");
   const rejectedCodex = path.join(rejectedToolDir, "config.toml");
   fs.mkdirSync(rejectedToolDir);
+  fs.mkdirSync(path.dirname(rejectedGrok));
   const malformedCodex = '[otel]\nenvironment = "first"\n[otel]\nenvironment = "duplicate"\n';
   fs.writeFileSync(rejectedCodex, malformedCodex);
   const rejectedSetup = await command(
@@ -485,9 +489,10 @@ esac
   const freshToolDir = path.join(sandbox, "fresh-tool-config");
   const freshClaude = path.join(freshToolDir, "settings.json");
   const freshGemini = path.join(freshToolDir, "gemini.json");
-  const freshGrok = path.join(freshToolDir, "grok-hooks.json");
+  const freshGrok = path.join(freshToolDir, "grok", "grok-hooks.json");
   const freshCodex = path.join(freshToolDir, "config.toml");
   fs.mkdirSync(freshToolDir);
+  fs.mkdirSync(path.dirname(freshGrok));
   const freshApply = await command(
     process.execPath,
     [
@@ -921,6 +926,14 @@ esac
   }
   fs.cpSync(claudeDir, path.join(defaultHome, ".claude"), { recursive: true });
   fs.cpSync(codexDir, path.join(defaultHome, ".codex"), { recursive: true });
+  // The managed hook command carries an absolute header-file path, so a config
+  // copied into a second home must point at that home's own header file —
+  // exactly the bytes `setup` would have written there.
+  const defaultCodexConfig = path.join(defaultHome, ".codex", "config.toml");
+  fs.writeFileSync(
+    defaultCodexConfig,
+    fs.readFileSync(defaultCodexConfig, "utf8").replaceAll(codexDir, path.join(defaultHome, ".codex")),
+  );
   fs.chmodSync(path.join(defaultHome, ".claude"), 0o700);
   fs.chmodSync(path.join(defaultHome, ".codex"), 0o700);
   fs.mkdirSync(defaultLaunchAgents, { recursive: true, mode: 0o700 });

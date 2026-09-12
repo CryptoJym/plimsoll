@@ -131,6 +131,7 @@ async function main() {
     repoRoot: "/proof/repo",
     claudeCodeProducerToken: rotated.claudeCodeProducer,
     codexProducerToken: rotated.codexProducer,
+    codexHeaderFile: path.join(home, "codex-home", "plimsoll.headers"),
   });
   const claudeJson = JSON.stringify(claude);
   check(

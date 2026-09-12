@@ -56,6 +56,8 @@ import {
 import {
   assertManagementCredential,
   assertProducerToken,
+  localIngestAuthStamp,
+  readLiveProducerAuth,
   type LocalIngestAuth,
 } from "./local-auth";
 import {
@@ -171,6 +173,14 @@ export function createCollectorServer(
      * boundary applies unchanged.
      */
     localAuth?: LocalIngestAuth;
+    /**
+     * Plimsoll home backing `localAuth`. When set, every producer request first
+     * stats the credential file and re-reads it when it has moved on, so
+     * `rotate-producer-token` takes effect on a running daemon without a
+     * restart and a closed grace window stops admitting the superseded token.
+     * Absent, the cached authority is final.
+     */
+    localAuthHome?: string;
     /** Private hash registry home; no provisioning occurs on the listener. */
     liveProducerHome?: string;
     /** Proof-injectable per-source admission ceiling (defaults to the limit). */
@@ -191,6 +201,52 @@ export function createCollectorServer(
   const assertManagementRead = (request: http.IncomingMessage) => {
     if (!authEnforced || !localAuth) return;
     assertManagementCredential(request, localAuth, requestUrl(request));
+  };
+  // Rotation reload seam. Management credentials deliberately keep using the
+  // authority loaded at start; only the producer audiences follow a rotation.
+  // Freshness is decided before the admission decision, never after a miss: a
+  // rejection must not be the only thing that can install a rotation, or the
+  // superseded token outlives its deadline and the new one is locked out.
+  let producerAuth = localAuth;
+  let producerAuthStamp = options.localAuthHome ? localIngestAuthStamp(options.localAuthHome) : null;
+  // Stamp of a credential file that failed to load. An operator can leave the
+  // file truncated, malformed, or no longer private for as long as they like;
+  // re-reading and re-parsing it on every request buys nothing, because
+  // admission keeps using the installed authority either way. The stat still
+  // runs, so the repaired file is picked up on the first request after it moves.
+  let unreadableAuthStamp: string | null = null;
+  const graceWindowClosed = (auth: LocalIngestAuth) => {
+    const now = Date.now();
+    return Object.values(auth.rotations ?? {}).some((rotation) => rotation.expiresAt <= now);
+  };
+  const refreshProducerAuth = (loaded: LocalIngestAuth) => {
+    const home = options.localAuthHome;
+    if (!home) return loaded;
+    const stamp = localIngestAuthStamp(home);
+    // No readable credential file: the authority this daemon started with
+    // stays in force rather than admitting or rejecting on a guess.
+    if (stamp === null) return loaded;
+    if (stamp === unreadableAuthStamp) return loaded;
+    if (stamp === producerAuthStamp && !graceWindowClosed(loaded)) return loaded;
+    // One load per observed change, plus one more once a window has closed so
+    // the closed row also leaves the authority in memory. The read never
+    // writes: the credential file belongs to `rotate-producer-token`. The
+    // stamp advances only after the load succeeded, and it is the stamp read
+    // *before* the load, so a file that changed mid-read is re-read next time.
+    const reloaded = readLiveProducerAuth(home);
+    if (!reloaded) {
+      unreadableAuthStamp = stamp;
+      return loaded;
+    }
+    unreadableAuthStamp = null;
+    producerAuth = reloaded;
+    producerAuthStamp = stamp;
+    return reloaded;
+  };
+  const assertProducer = (request: http.IncomingMessage, source: LocalProducerSource) => {
+    const loaded = producerAuth;
+    if (!loaded) return;
+    assertProducerToken(request, refreshProducerAuth(loaded), source, requestUrl(request));
   };
 
   // Issue #0075 (#144): repeated identical admission rejections are
@@ -766,9 +822,7 @@ export function createCollectorServer(
         if (!source) throw new HttpBoundaryRejection("source_not_allowed", 401);
         assertHookSource(request, source);
         assertSourceAdmission(source);
-        if (localAuth) {
-          assertProducerToken(request, localAuth, source, requestUrl(request));
-        }
+        assertProducer(request, source);
         const body = decodeBoundedRequestBody(
           request,
           await readBoundedRequestBody(request, budget),
@@ -808,9 +862,7 @@ export function createCollectorServer(
         assertNoBrowserOrigin(request);
         const source = requireOtlpSource(request);
         assertSourceAdmission(source);
-        if (localAuth) {
-          assertProducerToken(request, localAuth, source, requestUrl(request));
-        }
+        assertProducer(request, source);
         const body = decodeBoundedRequestBody(
           request,
           await readBoundedRequestBody(request, budget),

@@ -124,6 +124,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-config-apply
 
+      - name: Prove the Codex producer token stays off the config surface and rotates
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-producer-token
+
       - name: Prove desktop TOML reconciliation and independent setup targets
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:setup-toml-reconcile

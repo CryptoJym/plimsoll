@@ -920,13 +920,13 @@ export function applyGeminiSettings(
 const GROK_MANAGED_EVENTS = ["UserPromptSubmit", "PostToolUse", "Stop"] as const;
 const LEGACY_GROK_COMMAND_PATTERN = /^if \[ -n "\$\{GROK_HOOK_EVENT:-\}" \]; then curl -s --max-time 2 -X POST -H 'Content-Type: application\/json' -H 'x-plimsoll-source: grok'(?: -H 'x-plimsoll-token: [A-Za-z0-9_-]{43}')? --data-binary @- http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/hooks\/grok \|\| true; fi$/;
 const VALUE_BLIND_GROK_COMMAND_PATTERN = /^if \[ -n "\$\{GROK_HOOK_EVENT:-\}" \]; then (?:[a-zA-Z0-9_./:@=-]+|'(?:[^']|'\\'')*') --dir (?:[a-zA-Z0-9_./:@=-]+|'(?:[^']|'\\'')*') collector forward-hook-http grok \|\| true; fi$/;
-const GROK_SHELL_WORD_PATTERN = String.raw`(?:[a-zA-Z0-9_./:@=-]+|'(?:[^']|'\\'')*')`;
+const SHELL_WORD_PATTERN = String.raw`(?:[a-zA-Z0-9_./:@=-]+|'(?:[^']|'\\'')*')`;
 const GROK_HEADER_FILE_WORD_PATTERN = String.raw`(?:@[a-zA-Z0-9_./:@=-]+|'@(?:[^']|'\\'')*')`;
 const DIRECT_GROK_COMMAND_PATTERN = new RegExp(
   String.raw`^if \[ -n "\$\{GROK_HOOK_EVENT:-\}" \]; then (?:` +
-    String.raw`\{ printf '%s\\n' 'x-plimsoll-token: [A-Za-z0-9_-]{43}' \| ${GROK_SHELL_WORD_PATTERN} -s --max-time 2 -X POST -H 'Content-Type: application/json' -H @/dev/fd/3 --data-binary @- http://127\.0\.0\.1:[1-9][0-9]{0,4}/hooks/grok 3<&0 0<&4; \} 4<&0 \|\| true` +
-    String.raw`|${GROK_SHELL_WORD_PATTERN} -s --max-time 2 -X POST -H 'Content-Type: application/json' -H ${GROK_HEADER_FILE_WORD_PATTERN} --data-binary @- http://127\.0\.0\.1:[1-9][0-9]{0,4}/hooks/grok \|\| true` +
-    String.raw`|${GROK_SHELL_WORD_PATTERN} -s --max-time 2 -X POST -H 'Content-Type: application/json' --data-binary @- http://127\.0\.0\.1:[1-9][0-9]{0,4}/hooks/grok \|\| true); fi$`,
+    String.raw`\{ printf '%s\\n' 'x-plimsoll-token: [A-Za-z0-9_-]{43}' \| ${SHELL_WORD_PATTERN} -s --max-time 2 -X POST -H 'Content-Type: application/json' -H @/dev/fd/3 --data-binary @- http://127\.0\.0\.1:[1-9][0-9]{0,4}/hooks/grok 3<&0 0<&4; \} 4<&0 \|\| true` +
+    String.raw`|${SHELL_WORD_PATTERN} -s --max-time 2 -X POST -H 'Content-Type: application/json' -H ${GROK_HEADER_FILE_WORD_PATTERN} --data-binary @- http://127\.0\.0\.1:[1-9][0-9]{0,4}/hooks/grok \|\| true` +
+    String.raw`|${SHELL_WORD_PATTERN} -s --max-time 2 -X POST -H 'Content-Type: application/json' --data-binary @- http://127\.0\.0\.1:[1-9][0-9]{0,4}/hooks/grok \|\| true); fi$`,
 );
 
 function isManagedGrokGroup(event: string, value: unknown) {
@@ -970,25 +970,58 @@ export type GrokHookCommandDiagnostic =
       reason: "missing_reference" | "relative" | "missing" | "not_private" | "inconsistent";
     };
 
-function unquoteGrokShellWord(word: string) {
+function unquoteShellWord(word: string) {
   return word.startsWith("'")
     ? word.slice(1, -1).split("'\\''").join("'")
     : word;
 }
 
 function managedGrokExecutable(command: string) {
-  const direct = command.match(new RegExp(String.raw`\| (${GROK_SHELL_WORD_PATTERN}) -s`));
-  const forwarded = command.match(new RegExp(String.raw`then (${GROK_SHELL_WORD_PATTERN}) --dir`));
-  const legacy = command.match(new RegExp(String.raw`then (${GROK_SHELL_WORD_PATTERN}) -s`));
+  const direct = command.match(new RegExp(String.raw`\| (${SHELL_WORD_PATTERN}) -s`));
+  const forwarded = command.match(new RegExp(String.raw`then (${SHELL_WORD_PATTERN}) --dir`));
+  const legacy = command.match(new RegExp(String.raw`then (${SHELL_WORD_PATTERN}) -s`));
   const word = direct?.[1] ?? forwarded?.[1] ?? legacy?.[1];
-  return word ? unquoteGrokShellWord(word) : undefined;
+  return word ? unquoteShellWord(word) : undefined;
 }
 
-function managedGrokHeaderFile(command: string) {
+export type ManagedHeaderFileReason =
+  | "missing_reference"
+  | "relative"
+  | "missing"
+  | "not_private"
+  | "inconsistent";
+
+/**
+ * Shared read-only check for the `-H @<file>` reference every managed hook
+ * command carries. One resolved, absolute, 0600 regular file must back all of
+ * a source's commands; anything else fails closed with a named reason.
+ */
+function diagnoseManagedHeaderFileReferences(
+  references: Array<string | undefined>,
+): ManagedHeaderFileReason | null {
+  if (references.length === 0 || references.some((reference) => reference === undefined)) {
+    return "missing_reference";
+  }
+  if (references.some((reference) => !path.isAbsolute(reference!))) return "relative";
+  if (new Set(references).size !== 1) return "inconsistent";
+  const headerFile = references[0]!;
+  try {
+    const stat = fs.lstatSync(headerFile);
+    if (stat.isSymbolicLink() || !stat.isFile() || (stat.mode & 0o777) !== 0o600) {
+      return "not_private";
+    }
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "not_private";
+  }
+  return null;
+}
+
+/** The `-H @<file>` word a managed hook command carries, if it has one. */
+function managedHeaderFileReference(command: string) {
   const match = command.match(new RegExp(
-    String.raw` -H (${GROK_SHELL_WORD_PATTERN}) --data-binary @-`,
+    String.raw` -H (${SHELL_WORD_PATTERN}) --data-binary @-`,
   ));
-  const word = match?.[1] ? unquoteGrokShellWord(match[1]) : undefined;
+  const word = match?.[1] ? unquoteShellWord(match[1]) : undefined;
   return word?.startsWith("@") ? word.slice(1) : undefined;
 }
 
@@ -1019,28 +1052,11 @@ export function diagnoseManagedGrokHookCommand(file: string): GrokHookCommandDia
       };
     }
   }
-  const headerFiles = hookCommands(document).map(managedGrokHeaderFile);
-  if (headerFiles.some((file) => file === undefined)) {
-    return { ok: false, code: "grok_hook_header_file_unresolvable", reason: "missing_reference" };
-  }
-  if (headerFiles.some((file) => !path.isAbsolute(file!))) {
-    return { ok: false, code: "grok_hook_header_file_unresolvable", reason: "relative" };
-  }
-  if (new Set(headerFiles).size !== 1) {
-    return { ok: false, code: "grok_hook_header_file_unresolvable", reason: "inconsistent" };
-  }
-  const headerFile = headerFiles[0]!;
-  try {
-    const stat = fs.lstatSync(headerFile);
-    if (stat.isSymbolicLink() || !stat.isFile() || (stat.mode & 0o777) !== 0o600) {
-      return { ok: false, code: "grok_hook_header_file_unresolvable", reason: "not_private" };
-    }
-  } catch (error) {
-    return {
-      ok: false,
-      code: "grok_hook_header_file_unresolvable",
-      reason: (error as NodeJS.ErrnoException).code === "ENOENT" ? "missing" : "not_private",
-    };
+  const headerReason = diagnoseManagedHeaderFileReferences(
+    hookCommands(document).map(managedHeaderFileReference),
+  );
+  if (headerReason) {
+    return { ok: false, code: "grok_hook_header_file_unresolvable", reason: headerReason };
   }
   return null;
 }
@@ -1106,35 +1122,41 @@ export function applyGrokHookFile(
   }
 }
 
-const GROK_MANAGED_HEADER_PATTERN = /^x-plimsoll-token: [A-Za-z0-9_-]{43}\n$/;
+const MANAGED_HEADER_FILE_PATTERN = /^x-plimsoll-token: [A-Za-z0-9_-]{43}\n$/;
 
-/** Reconcile the private curl header consumed by the managed Grok hook. */
-export function applyGrokHookHeaderFile(
+/**
+ * Reconcile the private curl header file consumed by a managed command hook.
+ * One implementation serves every source so the 0600 mode, the managed-content
+ * refusal, and the backup convention cannot drift apart between them.
+ */
+function applyManagedHookHeaderFile(
+  source: "grok" | "codex",
+  label: string,
   file: string,
   generated: string,
-  options: ClaudeApplyOptions = {},
+  options: ClaudeApplyOptions,
 ): ApplyResult {
   assertManagedConfigTarget(file);
   try {
-    if (!GROK_MANAGED_HEADER_PATTERN.test(generated)) {
-      throw new Error(`${file}: generated Grok header file is invalid.`);
+    if (!MANAGED_HEADER_FILE_PATTERN.test(generated)) {
+      throw new Error(`${file}: generated ${label} header file is invalid.`);
     }
     const { snapshot, current } = readClaudePreimage(file);
-    if (snapshot.exists && !GROK_MANAGED_HEADER_PATTERN.test(current)) {
+    if (snapshot.exists && !MANAGED_HEADER_FILE_PATTERN.test(current)) {
       return {
         path: file,
         changed: false,
         changes: [],
         plan: [],
-        conflict: `${file}: existing file is not a Plimsoll-managed Grok header file; refusing this target.`,
+        conflict: `${file}: existing file is not a Plimsoll-managed ${label} header file; refusing this target.`,
       };
     }
     const plan: ApplyPlanEntry[] = [{
-      key: "grok.headers.token",
+      key: `${source}.headers.token`,
       action: !snapshot.exists ? "added" : current === generated ? "unchanged" : "updated",
     }];
     if (snapshot.exists && snapshot.leaf && (snapshot.leaf.mode & 0o777) !== 0o600) {
-      plan.push({ key: "grok.headers.fileMode", action: "updated" });
+      plan.push({ key: `${source}.headers.fileMode`, action: "updated" });
     }
     const changes = plan
       .filter((entry) => entry.action !== "unchanged")
@@ -1148,10 +1170,30 @@ export function applyGrokHookHeaderFile(
     return { path: file, changed: true, changes, plan, backupPath };
   } catch (error) {
     if (error instanceof ClaudeConfigError) {
-      throw new Error(error.message.replace(/^CLAUDE_CONFIG_/, "GROK_CONFIG_"));
+      throw new Error(
+        error.message.replace(/^CLAUDE_CONFIG_/, `${source.toUpperCase()}_CONFIG_`),
+      );
     }
     throw error;
   }
+}
+
+/** Reconcile the private curl header consumed by the managed Grok hook. */
+export function applyGrokHookHeaderFile(
+  file: string,
+  generated: string,
+  options: ClaudeApplyOptions = {},
+): ApplyResult {
+  return applyManagedHookHeaderFile("grok", "Grok", file, generated, options);
+}
+
+/** Reconcile the private curl header consumed by the managed Codex hooks. */
+export function applyCodexHookHeaderFile(
+  file: string,
+  generated: string,
+  options: ClaudeApplyOptions = {},
+): ApplyResult {
+  return applyManagedHookHeaderFile("codex", "Codex", file, generated, options);
 }
 
 type TomlRecord = Record<string, unknown>;
@@ -1572,6 +1614,14 @@ function containsExpected(actual: unknown, expected: unknown): boolean {
     );
   }
   return isDeepStrictEqual(actual, expected);
+}
+
+function parsedTomlValue(raw: string): unknown {
+  try {
+    return (parseToml(`value = ${raw.trim()}\n`) as TomlRecord).value;
+  } catch {
+    return undefined;
+  }
 }
 
 function parseDocument(file: string, source: string, generated = false): TomlRecord {
@@ -2324,16 +2374,55 @@ function reconcileCodexToml(file: string, current: string, generatedToml: string
       }
       continue;
     }
-    const currentOwnedCommands = hookCommands(currentEntries).filter(isPlimsollHookPath);
-    const containsCanonicalEntry = containsExpected(currentEntries, expectedEntries);
-    if (currentOwnedCommands.length > 0 && hookOwnershipDrift(currentEntries, expectedEntries)) {
+    // The array-of-tables layout owns exactly one `command = "..."` byte range
+    // per event. Rewriting it in place is what migrates a legacy inline-token
+    // command — and what lets a rotated token land — without disturbing the
+    // operator's own hooks, ordering, or comments.
+    let eventEntries = currentEntries;
+    let commandUpdated = false;
+    const ownedNow = hookCommands(eventEntries).filter(isPlimsollHookPath);
+    if (ownedNow.length === 1 && ownedNow[0] !== expectedOwnedCommands[0]) {
+      const ownedAssignments = scanToml(lines).assignments.filter((entry) =>
+        entry.tableKind === "array" &&
+        entry.tablePath.length >= 2 &&
+        entry.tablePath[0] === "hooks" &&
+        entry.tablePath[1] === event &&
+        entry.keyPath.length === 1 &&
+        entry.keyPath[0] === "command" &&
+        parsedTomlValue(entry.valueRaw) === ownedNow[0]
+      );
+      if (ownedAssignments.length === 1) {
+        const assignment = ownedAssignments[0]!;
+        const line = lines[assignment.index]!;
+        const candidate = [...lines];
+        candidate[assignment.index] =
+          `${line.slice(0, assignment.valueStart)}${JSON.stringify(expectedOwnedCommands[0])}${line.slice(assignment.valueEnd)}`;
+        let candidateEntries: unknown;
+        try {
+          candidateEntries = getPath(parseToml(candidate.join(lineEnding)) as TomlRecord, ["hooks", event]);
+        } catch {
+          candidateEntries = undefined;
+        }
+        if (candidateEntries !== undefined) {
+          lines[assignment.index] = candidate[assignment.index]!;
+          eventEntries = candidateEntries;
+          commandUpdated = true;
+        }
+      }
+    }
+    const containsCanonicalEntry = containsExpected(eventEntries, expectedEntries);
+    if (hookCommands(eventEntries).filter(isPlimsollHookPath).length > 0 &&
+      hookOwnershipDrift(eventEntries, expectedEntries)) {
       throw new Error(
         `${file}: hooks.${event} already contains a different Plimsoll Codex hook or a non-canonical owned alias; ` +
         "refusing to write or create a backup.",
       );
     }
     if (containsCanonicalEntry) {
-      plan.push({ key: `hooks.${event}`, action: "unchanged" });
+      if (commandUpdated) {
+        changes.push(`hooks.${event} update generated Plimsoll command hook`);
+      }
+      plan.push({ key: `hooks.${event}`, action: commandUpdated ? "updated" : "unchanged" });
       continue;
     }
     hookBlocks.push(...generatedHookBlock(file, generatedLines, event), "");
@@ -2386,4 +2475,31 @@ export function applyCodexConfig(
   }
   const backupPath = writeCodexPlan(file, snapshot, current, plan.next, options.transactionHooks);
   return { path: file, changed: true, changes, plan: plan.plan, backupPath };
+}
+
+export type CodexHookCommandDiagnostic = {
+  ok: false;
+  code: "codex_hook_header_file_unresolvable";
+  reason: ManagedHeaderFileReason;
+};
+
+/**
+ * Read-only diagnostic for the private header file the managed Codex hooks
+ * reference. A legacy inline-token command resolves no reference at all and is
+ * reported as `missing_reference`; `setup` migrates it on the next run.
+ */
+export function diagnoseManagedCodexHookCommand(file: string): CodexHookCommandDiagnostic | null {
+  let document: TomlRecord;
+  try {
+    if (!fs.existsSync(file)) return null;
+    document = parseDocument(file, fs.readFileSync(file, "utf8"));
+  } catch {
+    // An unreadable or invalid config is already reported by the telemetry
+    // readiness check; this diagnostic owns only the header reference.
+    return null;
+  }
+  const owned = hookCommands(document).filter(isPlimsollHookPath);
+  if (owned.length === 0) return null;
+  const reason = diagnoseManagedHeaderFileReferences(owned.map(managedHeaderFileReference));
+  return reason ? { ok: false, code: "codex_hook_header_file_unresolvable", reason } : null;
 }

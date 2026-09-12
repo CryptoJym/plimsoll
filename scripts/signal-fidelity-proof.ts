@@ -1785,7 +1785,12 @@ async function main() {
   );
   const codexConfigPath = path.join(setupDir, "config.toml");
   fs.writeFileSync(codexConfigPath, 'model = "gpt-5.5"\n');
-  const applyOptions = { repoRoot: tempDir, port: 49999, dataMode: "metadata" as const };
+  const applyOptions = {
+    repoRoot: tempDir,
+    port: 49999,
+    dataMode: "metadata" as const,
+    codexHeaderFile: path.join(setupDir, "plimsoll.headers"),
+  };
   const generatedClaude = generateClaudeCodeSettings(applyOptions);
   const generatedToml = generateCodexConfigToml(applyOptions);
   const firstApply = applyClaudeSettings(claudeSettingsPath, generatedClaude);
