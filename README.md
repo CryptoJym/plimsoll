@@ -162,10 +162,16 @@ token from a mode-0600 `plimsoll.headers` file beside its own config
 so a config search or a pasted command string never exposes the token. Codex's
 own OTLP exporter has no file or environment source for a header value, so
 `[otel.*_exporter."otlp-http"] headers` keeps the token inline; rotate it with
-`plimsoll rotate-producer-token --source codex`, which rewrites the header file
-and `config.toml` with backups and accepts the superseded token only until the
-grace window closes (`--grace-seconds`, default 900). `plimsoll doctor` reports
-the rotation deadline and never prints a token.
+`plimsoll rotate-producer-token --source codex`, which rewrites the header file,
+`config.toml` and every discovered `~/.codex-profiles/<slug>/config.toml` that
+already carries the managed block — with a backup per file, inside the same
+grace window — and accepts the superseded token only until that window closes
+(`--grace-seconds`, default 900). A profile without the managed block is left
+untouched (`setup` owns provisioning it) and a malformed one is reported under
+`profilesSkipped` and never rewritten, neither of them failing the rotation.
+`--dry-run` lists the `codexProfile[<slug>].otel.<exporter>.headers updated`
+lines it would write. `plimsoll doctor` reports the rotation deadline and never
+prints a token.
 
 The source install script's `--dry-run` does not clone, install dependencies,
 write Claude/Gemini/Grok/Codex or Plimsoll files, register a LaunchAgent, or start a
