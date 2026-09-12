@@ -319,6 +319,26 @@ each missing/conflicted requirement.
 
 > **Codex note:** Codex records token usage on *trace spans* (`gen_ai.usage.*`), not log events. The generated config enables logs, traces, and metrics — if you disable the trace exporter, codex token attribution silently drops to zero. We learned this the hard way (see "The audit story" below).
 
+**Zero-value span admission.** Codex's `codex-app-server` exports its whole
+internal tracing tree over OTLP: on one conductor host that was 95,739 of
+106,668 ingested events in a single hour, spread over 147 span names
+(`realtime_conversation.running_state`, `environments.snapshot`,
+`mcp.runtime.refresh_wait`, …) that carry no tokens, no cost, no tool name and
+no session or actor linkage. Plimsoll discards those spans at admission,
+*before* the ledger write, so neither the local buffer nor the upload queue
+grows from them. An app-server span that does carry a retained dimension —
+usage, an error or exception, an explicit action class, a tool name, or
+analytical linkage (session, actor, project, customer, workflow, git, request
+or call id) — is admitted exactly as before; a model name with no usage is not
+a retained dimension, because it joins to nothing. The typed Codex events the
+reports are built from (`user_prompt_submit`, `assistant_response`, `tool_use`,
+`tool_result`, `session_*`, usage events) are never `otel_span` and are
+untouched, and every other service and source still fails open. Each drop is
+counted durably in the ledger by source and reason and is readable on the
+collector's local status endpoint under `otlpAdmission.dropped`
+(`reason: "app_server_internal_span"`, alongside the older
+`generic_zero_value_span`).
+
 ## Local outcome performance
 
 `backfill-outcome-timeline` remains the explicit, bounded GitHub collection

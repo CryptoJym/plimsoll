@@ -149,13 +149,108 @@ const spanMatrix = {
         },
       ],
     },
+  ],
+};
+
+/**
+ * Transport authentication is authoritative for `source` (a producer-set
+ * `service.name` can never relabel an authenticated batch), so the
+ * "same name, other source" case must arrive on its own authenticated post.
+ * The measured deny set is Codex-specific; the same name elsewhere fails open.
+ */
+const foreignSourceSpanMatrix = {
+  resourceSpans: [
     {
       resource: { attributes: [attr("service.name", "claude-code")] },
       scopeSpans: [
         {
           scope: { name: "vendor_otel" },
-          // The measured deny set is Codex-specific; the same name elsewhere fails open.
           spans: [span("handle_responses", 30)],
+        },
+      ],
+    },
+  ],
+};
+
+/**
+ * eco-6hoxj.60: `codex-app-server` 0.153.x exports its whole internal tracing
+ * tree. These are the highest-volume names from the 2026-09-12 Studio0 census
+ * (95,739 of 106,668 events in one hour). None carries a product signal.
+ */
+const APP_SERVER_FLOOD_SPANS = [
+  "realtime_conversation.running_state",
+  "send_raw_response_items",
+  "record_conversation_items",
+  "environments.snapshot",
+  "mcp.runtime.refresh_wait",
+  "codex.hooks.command",
+  "recommended_plugins_mode_for_config",
+] as const;
+
+const APP_SERVER_MODEL_ONLY_SPAN = "model_client.stream_responses_websocket";
+const APP_SERVER_UNKNOWN_ELSEWHERE_SPAN = "realtime_conversation.running_state";
+
+const appServerMatrix = {
+  resourceSpans: [
+    {
+      // The measured flood: one service, 147 names, no retained dimension.
+      resource: { attributes: [attr("service.name", "codex-app-server")] },
+      scopeSpans: [
+        {
+          scope: { name: "codex_otel" },
+          spans: [
+            ...APP_SERVER_FLOOD_SPANS.map((name, index) => span(name, 60 + index)),
+            // A model with no usage joins to no session, actor, cost or
+            // outcome: still zero-value, still dropped.
+            span(APP_SERVER_MODEL_ONLY_SPAN, 67, [attr("gen_ai.request.model", "gpt-5.5-codex")]),
+            // Every retained dimension still wins over the service rule.
+            span("realtime_conversation.running_state", 68, [
+              attr("conversation.id", LINKED_SESSION),
+            ]),
+            span("send_raw_response_items", 69, [attr("gen_ai.usage.input_tokens", 512)]),
+            span("handle_tool_call_with_source", 70, [attr("tool_name", "apply_patch")]),
+            span("environments.wait_until_ready", 71, [], {
+              status: { code: 2, message: "do not persist" },
+            }),
+          ],
+        },
+      ],
+    },
+    {
+      // Same Codex source, a different service: an unknown name fails open.
+      resource: { attributes: [attr("service.name", "codex_exec")] },
+      scopeSpans: [
+        {
+          scope: { name: "codex_otel" },
+          spans: [span(APP_SERVER_UNKNOWN_ELSEWHERE_SPAN, 72)],
+        },
+      ],
+    },
+    {
+      // The service match is trimmed and case-insensitive.
+      resource: { attributes: [attr("service.name", "  Codex-App-Server  ")] },
+      scopeSpans: [
+        {
+          scope: { name: "codex_otel" },
+          spans: [span("environments.snapshot", 73)],
+        },
+      ],
+    },
+  ],
+};
+
+// Every flood name, plus the model-only span and the case/whitespace variant.
+const APP_SERVER_DROPPED = APP_SERVER_FLOOD_SPANS.length + 2;
+
+/** The rule is Codex-scoped: the same envelope from Claude Code fails open. */
+const appServerForeignSourceMatrix = {
+  resourceSpans: [
+    {
+      resource: { attributes: [attr("service.name", "codex-app-server")] },
+      scopeSpans: [
+        {
+          scope: { name: "vendor_otel" },
+          spans: [span("realtime_conversation.running_state", 74)],
         },
       ],
     },
@@ -451,7 +546,15 @@ async function main() {
 
   try {
     buffer = new LocalEventBuffer(ledgerPath);
-    const server = createCollectorServer(collectorConfigSchema.parse({}), buffer);
+    // `/status` is cache-only by construction: it never touches SQLite. The
+    // daemon refreshes the cached body through this hook, so the proof must
+    // drive the same hook to read counters written after startup.
+    let refreshStatus: ((failure?: "maintenance_failed") => boolean) | undefined;
+    const server = createCollectorServer(collectorConfigSchema.parse({}), buffer, {
+      registerStatusRefresher: (refresh) => {
+        refreshStatus = refresh;
+      },
+    });
     await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
     const port = (server.address() as AddressInfo).port;
 
@@ -459,10 +562,18 @@ async function main() {
     check(
       "adversarial_span_matrix",
       traces.status === 202 &&
-        traces.body.recordCount === 32 &&
-        traces.body.events === 16 &&
+        traces.body.recordCount === 31 &&
+        traces.body.events === 15 &&
         traces.body.droppedEvents === GENERIC_CONTROL_SPANS.length,
       traces,
+    );
+    const foreignTraces = await post(port, "/v1/traces", foreignSourceSpanMatrix, "claude_code");
+    check(
+      "generic_name_fails_open_on_another_authenticated_source",
+      foreignTraces.status === 202 &&
+        foreignTraces.body.events === 1 &&
+        foreignTraces.body.droppedEvents === 0,
+      foreignTraces,
     );
     check(
       "drop_reason_transparent",
@@ -474,6 +585,107 @@ async function main() {
             row.count === GENERIC_CONTROL_SPANS.length,
         ),
       traces.body.droppedByReason,
+    );
+
+    const appServer = await post(port, "/v1/traces", appServerMatrix, "codex");
+    check(
+      "app_server_internal_spans_dropped_by_service",
+      appServer.status === 202 &&
+        appServer.body.recordCount === 14 &&
+        appServer.body.events === 5 &&
+        appServer.body.droppedEvents === APP_SERVER_DROPPED &&
+        Array.isArray(appServer.body.droppedByReason) &&
+        (appServer.body.droppedByReason as Array<Record<string, unknown>>).some(
+          (row) =>
+            row.source === "codex" &&
+            row.reason === "app_server_internal_span" &&
+            row.count === APP_SERVER_DROPPED,
+        ),
+      appServer,
+    );
+
+    const appServerForeign = await post(
+      port,
+      "/v1/traces",
+      appServerForeignSourceMatrix,
+      "claude_code",
+    );
+    check(
+      "app_server_rule_is_source_scoped",
+      appServerForeign.status === 202 &&
+        appServerForeign.body.events === 1 &&
+        appServerForeign.body.droppedEvents === 0,
+      appServerForeign,
+    );
+
+    const appServerRows = buffer.list(400).map((row) => row.payload);
+    const appServerNamed = (name: string, source: string) =>
+      appServerRows.filter(
+        (event) =>
+          event.source === source &&
+          (event.metadata as Record<string, unknown>).otelEventName === name,
+      );
+    // Two flood names are deliberately reused by the retained-dimension spans
+    // (and one by the other-service fail-open probe), so the expectation is a
+    // per-name count, not "absent": the rule drops the shape, not the string.
+    const APP_SERVER_EXPECTED_PERSISTED: Record<string, number> = {
+      [APP_SERVER_UNKNOWN_ELSEWHERE_SPAN]: 2,
+      send_raw_response_items: 1,
+    };
+    check(
+      "app_server_flood_names_not_persisted",
+      APP_SERVER_FLOOD_SPANS.every(
+        (name) =>
+          appServerNamed(name, "codex").length ===
+          (APP_SERVER_EXPECTED_PERSISTED[name] ?? 0),
+      ),
+      APP_SERVER_FLOOD_SPANS.map((name) => [name, appServerNamed(name, "codex").length]),
+    );
+    check(
+      "app_server_model_without_usage_is_zero_value",
+      appServerNamed(APP_SERVER_MODEL_ONLY_SPAN, "codex").length === 0,
+      appServerNamed(APP_SERVER_MODEL_ONLY_SPAN, "codex").length,
+    );
+    check(
+      "app_server_retained_dimensions_admitted",
+      appServerRows.some(
+        (event) =>
+          event.sessionId === LINKED_SESSION &&
+          (event.metadata as Record<string, unknown>).serviceName === "codex-app-server",
+      ) &&
+        appServerRows.some(
+          (event) =>
+            event.inputTokens === 512 &&
+            (event.metadata as Record<string, unknown>).serviceName === "codex-app-server",
+        ) &&
+        appServerRows.some(
+          (event) => (event.metadata as Record<string, unknown>).toolName === "apply_patch",
+        ) &&
+        appServerRows.some(
+          (event) =>
+            (event.metadata as Record<string, unknown>).otelEventName ===
+              "environments.wait_until_ready" &&
+            (event.metadata as Record<string, unknown>).otelHasError === true,
+        ),
+      appServerRows
+        .filter(
+          (event) =>
+            (event.metadata as Record<string, unknown>).serviceName === "codex-app-server",
+        )
+        .map((event) => (event.metadata as Record<string, unknown>).otelEventName),
+    );
+    check(
+      "app_server_rule_is_service_scoped",
+      appServerNamed(APP_SERVER_UNKNOWN_ELSEWHERE_SPAN, "codex").some(
+        (event) => (event.metadata as Record<string, unknown>).serviceName === "codex_exec",
+      ) &&
+        appServerNamed(APP_SERVER_UNKNOWN_ELSEWHERE_SPAN, "claude_code").length === 1,
+      {
+        codexOtherService: appServerNamed(APP_SERVER_UNKNOWN_ELSEWHERE_SPAN, "codex").map(
+          (event) => (event.metadata as Record<string, unknown>).serviceName,
+        ),
+        claudeCode: appServerNamed(APP_SERVER_UNKNOWN_ELSEWHERE_SPAN, "claude_code").length,
+      },
     );
 
     const logs = await post(port, "/v1/logs", logEnvelope, "claude_code");
@@ -723,6 +935,7 @@ async function main() {
       },
     );
 
+    refreshStatus?.();
     const statusResponse = await fetch(`http://127.0.0.1:${port}/status`);
     const status = (await statusResponse.json()) as {
       otlpAdmission?: {
@@ -730,13 +943,19 @@ async function main() {
         dropped?: Array<{ source: string; reason: string; droppedCount: number }>;
       };
     };
+    const droppedCountFor = (
+      rows: Array<{ source: string; reason: string; droppedCount: number }> | undefined,
+      reason: string,
+    ) => rows?.find((row) => row.source === "codex" && row.reason === reason)?.droppedCount;
     check(
-      "status_exposes_durable_bounded_counter",
+      "status_exposes_durable_bounded_counter_aggregated_by_reason",
       status.otlpAdmission?.counterLifetime === "durable" &&
-        status.otlpAdmission.dropped?.length === 1 &&
-        status.otlpAdmission.dropped[0]?.source === "codex" &&
-        status.otlpAdmission.dropped[0]?.reason === "generic_zero_value_span" &&
-        status.otlpAdmission.dropped[0]?.droppedCount === GENERIC_CONTROL_SPANS.length,
+        status.otlpAdmission.dropped?.length === 2 &&
+        status.otlpAdmission.dropped.every((row) => row.source === "codex") &&
+        droppedCountFor(status.otlpAdmission.dropped, "generic_zero_value_span") ===
+          GENERIC_CONTROL_SPANS.length &&
+        droppedCountFor(status.otlpAdmission.dropped, "app_server_internal_span") ===
+          APP_SERVER_DROPPED,
       status.otlpAdmission,
     );
 
@@ -774,10 +993,15 @@ async function main() {
       },
     );
     buffer = new LocalEventBuffer(ledgerPath);
+    const restarted = buffer.otlpAdmissionCounters();
     check(
       "drop_counter_survives_restart",
-      buffer.otlpAdmissionCounters()[0]?.droppedCount === GENERIC_CONTROL_SPANS.length,
-      buffer.otlpAdmissionCounters(),
+      restarted.length === 2 &&
+        restarted.find((row) => row.reason === "generic_zero_value_span")?.droppedCount ===
+          GENERIC_CONTROL_SPANS.length &&
+        restarted.find((row) => row.reason === "app_server_internal_span")?.droppedCount ===
+          APP_SERVER_DROPPED,
+      restarted,
     );
   } finally {
     buffer?.close();
