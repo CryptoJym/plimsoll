@@ -12,10 +12,11 @@ import { Readable } from "node:stream";
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 import {
   applyGrokHookFile,
+  applyGrokHookHeaderFile,
   diagnoseManagedGrokHookCommand,
+  generateGrokHookHeader,
   generateGrokHookSettings,
 } from "../packages/collector-config/src/index";
-import * as collectorConfigModule from "../packages/collector-config/src/index";
 import {
   HttpBoundaryRejection,
   assertHookSource,
@@ -138,35 +139,24 @@ async function main() {
     const commandAuth = loadOrCreateLocalIngestAuth(path.join(sandbox, "command-auth"));
     const token = commandAuth.grokProducer;
     assert.ok(token, "current fixture auth must include the Grok producer audience");
-    const headerApi = collectorConfigModule as typeof collectorConfigModule & {
-      applyGrokHookHeaderFile?: (file: string, generated: string, options?: { dryRun?: boolean }) => {
-        path: string;
-        changed: boolean;
-        changes: string[];
-        plan?: Array<{ key: string; action: string }>;
-        backupPath?: string;
-        conflict?: string;
-      };
-      generateGrokHookHeader?: (options: { repoRoot: string; grokProducerToken?: string }) => string;
-    };
     check(
       "grok_managed_header_file_api_is_available",
-      typeof headerApi.applyGrokHookHeaderFile === "function" &&
-        typeof headerApi.generateGrokHookHeader === "function",
+      typeof applyGrokHookHeaderFile === "function" &&
+        typeof generateGrokHookHeader === "function",
     );
     const headerFile = path.join(sandbox, ".grok", "hooks", "plimsoll.headers");
-    const generatedHeader = headerApi.generateGrokHookHeader!({
+    const generatedHeader = generateGrokHookHeader({
       repoRoot: "/synthetic/plimsoll",
       grokProducerToken: token,
     });
-    const headerPreview = headerApi.applyGrokHookHeaderFile!(headerFile, generatedHeader, { dryRun: true });
+    const headerPreview = applyGrokHookHeaderFile(headerFile, generatedHeader, { dryRun: true });
     check(
       "grok_header_fresh_dry_run_reports_its_own_target_without_writing",
       headerPreview.changed && headerPreview.path === headerFile && !fs.existsSync(headerFile) &&
         headerPreview.plan?.length === 1 && headerPreview.plan[0]?.key === "grok.headers.token",
       { changed: headerPreview.changed, path: headerPreview.path, plan: headerPreview.plan },
     );
-    const headerApplied = headerApi.applyGrokHookHeaderFile!(headerFile, generatedHeader);
+    const headerApplied = applyGrokHookHeaderFile(headerFile, generatedHeader);
     check(
       "grok_header_fresh_apply_is_mode_0600_and_contains_the_only_command_secret",
       headerApplied.changed && !headerApplied.backupPath &&
@@ -472,7 +462,7 @@ exec /usr/bin/curl "$@"
       { mode: fs.statSync(hookFile).mode & 0o777, foreignHash: beforeForeign },
     );
     const repeated = applyGrokHookFile(hookFile, generated);
-    const repeatedHeader = headerApi.applyGrokHookHeaderFile!(headerFile, generatedHeader);
+    const repeatedHeader = applyGrokHookHeaderFile(headerFile, generatedHeader);
     check(
       "grok_reconcile_is_byte_idempotent_without_backup_churn",
       !repeated.changed && !repeatedHeader.changed && fs.readFileSync(hookFile).equals(firstBytes) &&
@@ -485,7 +475,7 @@ exec /usr/bin/curl "$@"
     fs.mkdirSync(path.dirname(publicHeaderFile), { recursive: true, mode: 0o700 });
     fs.writeFileSync(publicHeaderFile, priorHeaderBytes, { mode: 0o644 });
     fs.chmodSync(publicHeaderFile, 0o644);
-    const privateHeaderUpdate = headerApi.applyGrokHookHeaderFile!(publicHeaderFile, generatedHeader);
+    const privateHeaderUpdate = applyGrokHookHeaderFile(publicHeaderFile, generatedHeader);
     const privateHeaderBackup = privateHeaderUpdate.backupPath
       ? fs.readFileSync(privateHeaderUpdate.backupPath)
       : Buffer.alloc(0);
@@ -505,7 +495,7 @@ exec /usr/bin/curl "$@"
     fs.mkdirSync(path.dirname(foreignHeaderFile), { recursive: true, mode: 0o700 });
     const foreignHeaderBytes = Buffer.from("Authorization: operator-owned\n");
     fs.writeFileSync(foreignHeaderFile, foreignHeaderBytes, { mode: 0o600 });
-    const foreignHeaderResult = headerApi.applyGrokHookHeaderFile!(foreignHeaderFile, generatedHeader);
+    const foreignHeaderResult = applyGrokHookHeaderFile(foreignHeaderFile, generatedHeader);
     check(
       "grok_foreign_header_file_is_refused_without_mutation_or_backup",
       !foreignHeaderResult.changed && Boolean(foreignHeaderResult.conflict) &&
