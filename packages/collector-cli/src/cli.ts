@@ -72,8 +72,13 @@ import {
 import { appendForwardedHook } from "./forwarder";
 import { forwardHookOverLoopback } from "./local-hook-client";
 import {
+  DEFAULT_PRODUCER_ROTATION_GRACE_MS,
+  MAX_PRODUCER_ROTATION_GRACE_MS,
   loadOrCreateLocalIngestAuth,
+  producerRotationState,
   readLocalIngestAuth,
+  rotateLocalProducerToken,
+  type LocalIngestAuth,
 } from "./local-auth";
 import { enrollCodexLiveProducer } from "./codex-live-usage-auth";
 import {
@@ -149,12 +154,15 @@ import { PLIMSOLL_VERSION } from "./version";
 import {
   applyClaudeSettings,
   applyCodexConfig,
+  applyCodexHookHeaderFile,
   applyGeminiSettings,
   applyGrokHookHeaderFile,
   applyGrokHookFile,
+  diagnoseManagedCodexHookCommand,
   diagnoseManagedGrokHookCommand,
   generateClaudeCodeSettings,
   generateCodexConfigToml,
+  generateCodexHookHeader,
   generateGeminiCliSettings,
   generateGrokHookHeader,
   generateGrokHookSettings,
@@ -243,6 +251,10 @@ Commands:
   generate-config TOOL  Print Claude Code, Codex, Gemini CLI, or Grok config for metadata collection
   setup                 APPLY Claude Code, Gemini CLI, Grok, and Codex telemetry independently
                         (idempotent; --yes, --dry-run)
+  rotate-producer-token --source codex
+                        Mint a new Codex producer token, rewrite the managed header file and
+                        config.toml with backups, and accept the superseded token only until
+                        the grace window closes (--grace-seconds, --dry-run)
   upload                Drain un-uploaded events to the tenant ingest API (marks rows, keeps local copies)
   upload-history        Workspace backfill: push the FULL ledger history to the joined
                         workspace, idempotently, then print a reconciliation audit.
@@ -1139,6 +1151,16 @@ function readClaudeTelemetryConfig(file: string, expected: ReturnType<typeof gen
   }
 }
 
+/** Value-blind rotation receipt for doctor: state and deadline, never a token. */
+function producerTokenRotationReceipt(auth: LocalIngestAuth | null) {
+  return Object.fromEntries(
+    (["claude_code", "codex", "gemini_cli", "grok"] as const).map((source) => [
+      source,
+      producerRotationState(auth, source),
+    ]),
+  );
+}
+
 function readCodexTelemetryConfig(file: string, expectedToml: string) {
   if (!fs.existsSync(file)) {
     return { ok: false, status: "missing" as const, path: file, missing: ["config file"] };
@@ -1931,6 +1953,7 @@ async function main() {
       // Issue 0056 (#104): the daemon provisions (first start) or loads the
       // Plimsoll-local producer/management credentials and enforces them.
       localAuth: loadOrCreateLocalIngestAuth(collectorHome()),
+      localAuthHome: collectorHome(),
       maintenanceStatus: () => ({
         boundary: maintenanceBoundary.status(),
         scheduler: scheduler?.status() ?? null,
@@ -2585,6 +2608,7 @@ async function main() {
     const grokHome = resolveGrokHome().home;
     const grokFile = argValue("--grok-hooks") ?? path.join(grokHome, "hooks", "plimsoll.json");
     const grokHeaderFile = path.join(path.dirname(grokFile), "plimsoll.headers");
+    const codexHeaderFile = path.join(path.dirname(codexFile), "plimsoll.headers");
     // Setup is the installer: it provisions the Plimsoll-local credentials so
     // generated tool configs bind each producer to its own source-bound token.
     // Planning may need producer tokens, but provisioning them belongs only
@@ -2600,8 +2624,9 @@ async function main() {
       geminiCliProducerToken: localAuth.geminiCliProducer,
       grokProducerToken: localAuth.grokProducer,
       grokHeaderFile,
+      codexHeaderFile,
     };
-    type SetupTargetName = "claude" | "gemini" | "grokHeaders" | "grok" | "codex";
+    type SetupTargetName = "claude" | "gemini" | "grokHeaders" | "grok" | "codexHeaders" | "codex";
     type SetupTarget = {
       name: SetupTargetName;
       path: string;
@@ -2638,13 +2663,43 @@ async function main() {
           applyGrokHookFile(grokFile, generateGrokHookSettings(options), { dryRun: preview }),
       },
       {
+        name: "codexHeaders",
+        path: codexHeaderFile,
+        run: (options, preview) =>
+          applyCodexHookHeaderFile(codexHeaderFile, generateCodexHookHeader(options), { dryRun: preview }),
+      },
+      {
         name: "codex",
         path: codexFile,
         run: (options, preview) =>
           applyCodexConfig(codexFile, generateCodexConfigToml(options), { dryRun: preview }),
       },
     ];
+    // A hook command that references a header file Plimsoll could not write
+    // would post without its producer token, so the config target is refused
+    // with its header target rather than left pointing at a missing secret.
+    const headerDependencies: ReadonlyArray<{ header: SetupTargetName; dependent: SetupTargetName }> = [
+      { header: "grokHeaders", dependent: "grok" },
+      { header: "codexHeaders", dependent: "codex" },
+    ];
+    // Two sources must never share one header file: each source's hook would
+    // then send the other's token, collapsing the per-source audience boundary
+    // that makes a producer token unable to impersonate another tool.
+    const headerTargetPaths = headerDependencies.map(({ header }) =>
+      targets.find((target) => target.name === header)!.path);
+    const collidingHeaderPaths = new Set(
+      headerTargetPaths.filter((value, index) => headerTargetPaths.indexOf(value) !== index),
+    );
     const planned: SetupTargetState[] = targets.map((target) => {
+      if (
+        collidingHeaderPaths.has(target.path) &&
+        headerDependencies.some((entry) => entry.header === target.name)
+      ) {
+        return {
+          target,
+          refusal: `${target.path}: two managed sources resolve to the same header file; refusing this target.`,
+        };
+      }
       try {
         const plan = target.run(toolOptions, true);
         return plan.conflict ? { target, plan, refusal: plan.conflict } : { target, plan };
@@ -2652,10 +2707,12 @@ async function main() {
         return { target, refusal: error instanceof Error ? error.message : String(error) };
       }
     });
-    const plannedGrokHeaders = planned.find((state) => state.target.name === "grokHeaders");
-    const plannedGrokHook = planned.find((state) => state.target.name === "grok");
-    if (plannedGrokHeaders?.refusal && plannedGrokHook && !plannedGrokHook.refusal) {
-      plannedGrokHook.refusal = `${grokFile}: dependent managed header target was refused.`;
+    for (const { header, dependent } of headerDependencies) {
+      const plannedHeader = planned.find((state) => state.target.name === header);
+      const plannedDependent = planned.find((state) => state.target.name === dependent);
+      if (plannedHeader?.refusal && plannedDependent && !plannedDependent.refusal) {
+        plannedDependent.refusal = `${plannedDependent.target.path}: dependent managed header target was refused.`;
+      }
     }
     for (const state of planned) {
       for (const entry of state.plan?.plan ?? []) {
@@ -2712,23 +2769,28 @@ async function main() {
       grokProducerToken: appliedAuth.grokProducer,
     };
     if (configRead?.status === "missing") loadCollectorConfig();
-    let grokHeadersApplied = true;
+    const refusedHeaderTargets = new Set<SetupTargetName>();
     const applied: SetupTargetState[] = planned.map((state) => {
-      if (state.target.name === "grok" && !grokHeadersApplied) {
-        return { target: state.target, refusal: `${grokFile}: dependent managed header target was refused.` };
+      const dependency = headerDependencies.find((entry) => entry.dependent === state.target.name);
+      if (dependency && refusedHeaderTargets.has(dependency.header)) {
+        return {
+          target: state.target,
+          refusal: `${state.target.path}: dependent managed header target was refused.`,
+        };
       }
+      const isHeaderTarget = headerDependencies.some((entry) => entry.header === state.target.name);
       if (state.refusal) {
-        if (state.target.name === "grokHeaders") grokHeadersApplied = false;
+        if (isHeaderTarget) refusedHeaderTargets.add(state.target.name);
         return state;
       }
       try {
         const result = state.target.run(appliedToolOptions, false);
-        if (state.target.name === "grokHeaders" && result.conflict) grokHeadersApplied = false;
+        if (isHeaderTarget && result.conflict) refusedHeaderTargets.add(state.target.name);
         return result.conflict
           ? { target: state.target, plan: result, refusal: result.conflict }
           : { target: state.target, plan: result };
       } catch (error) {
-        if (state.target.name === "grokHeaders") grokHeadersApplied = false;
+        if (isHeaderTarget) refusedHeaderTargets.add(state.target.name);
         return {
           target: state.target,
           refusal: error instanceof Error ? error.message : String(error),
@@ -2752,6 +2814,155 @@ async function main() {
       ),
     );
     if (applied.some((state) => Boolean(state.refusal))) process.exitCode = 1;
+    return;
+  }
+
+  if (command === "rotate-producer-token") {
+    // Explicit operator boundary: mint a new Codex producer token, rewrite the
+    // managed header file and config.toml with the backup convention setup
+    // already uses, and keep the superseded token acceptable for a bounded
+    // grace window so an already-running Codex keeps reporting until restart.
+    const argValue = (name: string) => {
+      const index = process.argv.indexOf(name);
+      return index === -1 ? undefined : process.argv[index + 1];
+    };
+    const rotateSource = argValue("--source");
+    if (rotateSource !== "codex") {
+      console.error("Usage: plimsoll rotate-producer-token --source codex [--grace-seconds N] [--dry-run]");
+      process.exitCode = 1;
+      return;
+    }
+    const graceArgument = argValue("--grace-seconds");
+    const graceSeconds = graceArgument === undefined
+      ? DEFAULT_PRODUCER_ROTATION_GRACE_MS / 1000
+      : Number(graceArgument);
+    const maxGraceSeconds = MAX_PRODUCER_ROTATION_GRACE_MS / 1000;
+    if (!Number.isSafeInteger(graceSeconds) || graceSeconds <= 0 || graceSeconds > maxGraceSeconds) {
+      console.error(`Expected --grace-seconds to be a whole number between 1 and ${maxGraceSeconds}.`);
+      process.exitCode = 1;
+      return;
+    }
+    const rotateDryRun = process.argv.includes("--dry-run");
+    const rotateCodexFile = argValue("--codex-config") ?? path.join(os.homedir(), ".codex", "config.toml");
+    const rotateHeaderFile = path.join(path.dirname(rotateCodexFile), "plimsoll.headers");
+    // Rotation never provisions. Without existing credentials there is nothing
+    // to supersede, and minting here would add a second provisioning boundary.
+    const currentAuth = readLocalIngestAuth(collectorHome());
+    if (!currentAuth) {
+      console.error("No Plimsoll-local credentials to rotate. Run `plimsoll setup --yes` first.");
+      process.exitCode = 1;
+      return;
+    }
+    const rotateOptions = {
+      repoRoot: process.cwd(),
+      port: config.port,
+      dataMode: config.policy.dataMode,
+      claudeCodeProducerToken: currentAuth.claudeCodeProducer,
+      codexProducerToken: currentAuth.codexProducer,
+      geminiCliProducerToken: currentAuth.geminiCliProducer,
+      grokProducerToken: currentAuth.grokProducer,
+      codexHeaderFile: rotateHeaderFile,
+    };
+    const rotateTargets = [
+      {
+        path: rotateHeaderFile,
+        run: (options: typeof rotateOptions, preview: boolean) =>
+          applyCodexHookHeaderFile(rotateHeaderFile, generateCodexHookHeader(options), { dryRun: preview }),
+      },
+      {
+        path: rotateCodexFile,
+        run: (options: typeof rotateOptions, preview: boolean) =>
+          applyCodexConfig(rotateCodexFile, generateCodexConfigToml(options), { dryRun: preview }),
+      },
+    ];
+    // Preflight against the CURRENT token. A refusal here leaves the credential
+    // file untouched, so an installed config is never left holding a token the
+    // collector has already superseded.
+    const preflight = rotateTargets.map((target) => {
+      try {
+        return { path: target.path, refusal: target.run(rotateOptions, true).conflict };
+      } catch (error) {
+        return { path: target.path, refusal: error instanceof Error ? error.message : String(error) };
+      }
+    });
+    const refusedTargets = preflight.filter((entry) => entry.refusal);
+    if (refusedTargets.length > 0) {
+      console.log(JSON.stringify({
+        status: "rotation_refused",
+        source: "codex",
+        rotated: false,
+        targets: refusedTargets.map((entry) => ({
+          path: entry.path,
+          status: "refused",
+          reason: entry.refusal,
+        })),
+      }, null, 2));
+      process.exitCode = 1;
+      return;
+    }
+    if (rotateDryRun) {
+      console.log(JSON.stringify({
+        status: "rotation_dry_run",
+        source: "codex",
+        rotated: false,
+        graceSeconds,
+        targets: rotateTargets.map((target) => ({ path: target.path, status: "would_rotate" })),
+      }, null, 2));
+      return;
+    }
+    // Order matters: the credential file accepts the old and the new token
+    // before either config file changes, so no producer is locked out mid-run.
+    const rotation = rotateLocalProducerToken(collectorHome(), "codex", {
+      graceMs: graceSeconds * 1000,
+    });
+    const rotatedOptions = { ...rotateOptions, codexProducerToken: rotation.auth.codexProducer };
+    const rotateResults: Array<{ path: string; status: string; backup: string | null; reason?: string }> = [];
+    let rotateFailure = false;
+    for (const target of rotateTargets) {
+      if (rotateFailure) {
+        rotateResults.push({ path: target.path, status: "not_attempted", backup: null });
+        continue;
+      }
+      try {
+        const result = target.run(rotatedOptions, false);
+        if (result.conflict) {
+          rotateFailure = true;
+          rotateResults.push({ path: target.path, status: "refused", backup: null, reason: result.conflict });
+          continue;
+        }
+        rotateResults.push({
+          path: target.path,
+          status: result.changed ? "rotated" : "unchanged",
+          backup: result.backupPath ?? null,
+        });
+      } catch (error) {
+        rotateFailure = true;
+        rotateResults.push({
+          path: target.path,
+          status: "failed",
+          backup: null,
+          reason: error instanceof Error ? error.message : String(error),
+        });
+      }
+    }
+    console.log(JSON.stringify({
+      status: rotateFailure ? "rotation_incomplete" : "rotation_applied",
+      source: "codex",
+      rotated: true,
+      graceSeconds,
+      previousTokenExpiresAt: new Date(rotation.expiresAt).toISOString(),
+      targets: rotateResults,
+      nextSteps: rotateFailure
+        ? [
+            "the new token is already provisioned; re-run rotate-producer-token after resolving the refusal",
+            "the superseded token keeps working only until previousTokenExpiresAt",
+          ]
+        : [
+            "restart any running Codex sessions before previousTokenExpiresAt",
+            "plimsoll doctor --read-only --json   # producerTokenRotation.codex reports the deadline",
+          ],
+    }, null, 2));
+    if (rotateFailure) process.exitCode = 1;
     return;
   }
 
@@ -2831,6 +3042,7 @@ async function main() {
     const codexPath = path.join(os.homedir(), ".codex", "config.toml");
     const grokHookPath = path.join(resolveGrokHome().home, "hooks", "plimsoll.json");
     const grokHeaderPath = path.join(path.dirname(grokHookPath), "plimsoll.headers");
+    const codexHeaderPath = path.join(path.dirname(codexPath), "plimsoll.headers");
     // Doctor is read-only: it compares against provisioned credentials when
     // they exist and never creates the credential file as a side effect.
     const localAuth = readLocalIngestAuth(collectorHome());
@@ -2844,13 +3056,15 @@ async function main() {
             codexProducerToken: localAuth.codexProducer,
             geminiCliProducerToken: localAuth.geminiCliProducer,
             grokProducerToken: localAuth.grokProducer,
-            grokHeaderFile: grokHeaderPath,
           }
         : {}),
+      grokHeaderFile: grokHeaderPath,
+      codexHeaderFile: codexHeaderPath,
     };
     const claude = readClaudeTelemetryConfig(claudePath, generateClaudeCodeSettings(toolOptions));
     const codex = readCodexTelemetryConfig(codexPath, generateCodexConfigToml(toolOptions));
     const grokHookCommand = diagnoseManagedGrokHookCommand(grokHookPath);
+    const codexHookCommand = diagnoseManagedCodexHookCommand(codexPath);
     const launchAgent = readLaunchAgentState(plistPath);
     const connectivity = await checkCollectorConnectivity(
       config.port,
@@ -2909,7 +3123,8 @@ async function main() {
       configRead?.status === "valid" &&
       claude.ok &&
       codex.ok &&
-      grokHookCommand === null,
+      grokHookCommand === null &&
+      codexHookCommand === null,
     );
     // Issue #135: an explicit daemon-reported home drift (not merely an
     // unattested daemon) blocks service readiness — doctor must never bless a
@@ -2953,6 +3168,8 @@ async function main() {
             codex,
           },
           ...(grokHookCommand ? { grokHookCommand } : {}),
+          ...(codexHookCommand ? { codexHookCommand } : {}),
+          producerTokenRotation: producerTokenRotationReceipt(localAuth),
           launchAgent,
           runtime,
           connectivity,
@@ -3420,6 +3637,7 @@ async function main() {
     // Printing stays side-effect free: tokens appear only when provisioned.
     const localAuth = readLocalIngestAuth(collectorHome());
     const grokHeaderFile = path.join(resolveGrokHome().home, "hooks", "plimsoll.headers");
+    const codexHeaderFile = path.join(os.homedir(), ".codex", "plimsoll.headers");
     const options = {
       repoRoot: optionValue("--repo-root") ?? process.cwd(),
       port: config.port,
@@ -3427,6 +3645,7 @@ async function main() {
       confirmEvidence: flag("--confirm-evidence"),
       pnpmCommand: optionValue("--pnpm") ?? "pnpm",
       grokHeaderFile,
+      codexHeaderFile,
       ...(localAuth
         ? {
             claudeCodeProducerToken: localAuth.claudeCodeProducer,

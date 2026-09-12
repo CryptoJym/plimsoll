@@ -22,12 +22,35 @@ export type LocalIngestAuth = {
   /** Added for the Grok hook source; absent only in legacy files. */
   grokProducer?: string;
   managementRead: string;
+  /**
+   * Bounded rotation grace windows keyed by producer audience. A rotation
+   * cannot atomically restart every already-running producer, so the
+   * superseded token stays acceptable until `expiresAt` and then stops. Only
+   * producer audiences are covered; the management credential has no window.
+   */
+  rotations?: Partial<Record<LocalProducerSource, LocalProducerRotation>>;
+};
+
+export type LocalProducerRotation = {
+  /** Superseded producer token; never equal to a current token. */
+  token: string;
+  /** Epoch milliseconds at which the superseded token stops being accepted. */
+  expiresAt: number;
 };
 
 export const LOCAL_INGEST_AUTH_FILE = "local-ingest-auth.json";
+/** Default grace window: long enough to restart a tool, short enough to matter. */
+export const DEFAULT_PRODUCER_ROTATION_GRACE_MS = 15 * 60 * 1000;
+export const MAX_PRODUCER_ROTATION_GRACE_MS = 24 * 60 * 60 * 1000;
 const LOCAL_INGEST_AUTH_VERSION = 1;
 const TOKEN_BYTES = 32;
 const TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const PRODUCER_TOKEN_FIELDS = {
+  claude_code: "claudeCodeProducer",
+  codex: "codexProducer",
+  gemini_cli: "geminiCliProducer",
+  grok: "grokProducer",
+} as const satisfies Record<LocalProducerSource, keyof LocalIngestAuth>;
 
 function authPath(home: string) {
   return path.join(home, LOCAL_INGEST_AUTH_FILE);
@@ -48,6 +71,24 @@ function newAuth(): LocalIngestAuth {
   });
 }
 
+function validRotations(value: unknown, currentTokens: string[]): boolean {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length === 0) return false;
+  return entries.every(([source, rotation]) => {
+    if (!Object.hasOwn(PRODUCER_TOKEN_FIELDS, source)) return false;
+    if (!rotation || typeof rotation !== "object" || Array.isArray(rotation)) return false;
+    const record = rotation as Record<string, unknown>;
+    if (Object.keys(record).sort().join(",") !== "expiresAt,token") return false;
+    return typeof record.token === "string" &&
+      TOKEN_PATTERN.test(record.token) &&
+      !currentTokens.includes(record.token) &&
+      typeof record.expiresAt === "number" &&
+      Number.isSafeInteger(record.expiresAt) &&
+      record.expiresAt > 0;
+  });
+}
+
 function validAuth(value: unknown): value is LocalIngestAuth {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const record = value as Record<string, unknown>;
@@ -55,7 +96,18 @@ function validAuth(value: unknown): value is LocalIngestAuth {
   const legacyKeys = "claudeCodeProducer,codexProducer,managementRead,version";
   const geminiKeys = "claudeCodeProducer,codexProducer,geminiCliProducer,managementRead,version";
   const currentKeys = "claudeCodeProducer,codexProducer,geminiCliProducer,grokProducer,managementRead,version";
-  if (keys.join(",") !== legacyKeys && keys.join(",") !== geminiKeys && keys.join(",") !== currentKeys) {
+  const rotatedKeys = "claudeCodeProducer,codexProducer,geminiCliProducer,grokProducer,managementRead,rotations,version";
+  if (keys.join(",") !== legacyKeys && keys.join(",") !== geminiKeys &&
+    keys.join(",") !== currentKeys && keys.join(",") !== rotatedKeys) {
+    return false;
+  }
+  if (keys.join(",") === rotatedKeys && !validRotations(record.rotations, [
+    record.claudeCodeProducer,
+    record.codexProducer,
+    record.geminiCliProducer,
+    record.grokProducer,
+    record.managementRead,
+  ].filter((token): token is string => typeof token === "string"))) {
     return false;
   }
   const geminiValid = record.geminiCliProducer === undefined ||
@@ -207,6 +259,84 @@ export function rotateLocalIngestAuth(home: string): LocalIngestAuth {
   return writeNewAuth(home, true);
 }
 
+function liveRotations(auth: LocalIngestAuth, now: number) {
+  return Object.fromEntries(
+    Object.entries(auth.rotations ?? {}).filter(([, rotation]) => rotation.expiresAt > now),
+  ) as Partial<Record<LocalProducerSource, LocalProducerRotation>>;
+}
+
+/**
+ * Mint a new producer token for one source and keep the superseded value
+ * acceptable for a bounded window. Expired windows for every source are
+ * dropped in the same write so a stale token can never be resurrected.
+ */
+export function rotateLocalProducerToken(
+  home: string,
+  source: LocalProducerSource,
+  options: { graceMs?: number; now?: number } = {},
+): { auth: LocalIngestAuth; expiresAt: number } {
+  const graceMs = options.graceMs ?? DEFAULT_PRODUCER_ROTATION_GRACE_MS;
+  if (!Number.isSafeInteger(graceMs) || graceMs <= 0 || graceMs > MAX_PRODUCER_ROTATION_GRACE_MS) {
+    throw new Error("local_ingest_auth_rotation_grace_invalid");
+  }
+  const existing = readLocalIngestAuth(home);
+  if (!existing) {
+    throw new Error(
+      authFileExists(home) ? "local_ingest_auth_invalid" : "local_ingest_auth_missing",
+    );
+  }
+  const field = PRODUCER_TOKEN_FIELDS[source];
+  const superseded = existing[field];
+  if (typeof superseded !== "string") throw new Error("local_ingest_auth_source_unprovisioned");
+  const now = options.now ?? Date.now();
+  const expiresAt = now + graceMs;
+  let replacement = newToken();
+  while (replacement === superseded) replacement = newToken();
+  const rotations = { ...liveRotations(existing, now), [source]: { token: superseded, expiresAt } };
+  const next = {
+    version: LOCAL_INGEST_AUTH_VERSION,
+    claudeCodeProducer: existing.claudeCodeProducer,
+    codexProducer: existing.codexProducer,
+    geminiCliProducer: existing.geminiCliProducer ?? newToken(),
+    grokProducer: existing.grokProducer ?? newToken(),
+    managementRead: existing.managementRead,
+    [field]: replacement,
+    rotations,
+  } as LocalIngestAuth;
+  return { auth: writeAuth(home, next, true), expiresAt };
+}
+
+/**
+ * Cheap change stamp for the credential file. The collector caches the
+ * authority it loaded at start, so a rotation is only observable to a running
+ * daemon if it can tell the file moved on without re-reading it every request.
+ */
+export function localIngestAuthStamp(home: string): string | null {
+  try {
+    const stat = fs.lstatSync(authPath(home));
+    return `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}`;
+  } catch {
+    return null;
+  }
+}
+
+/** Value-blind rotation state for doctor; never returns or hashes a token. */
+export function producerRotationState(
+  auth: LocalIngestAuth | null,
+  source: LocalProducerSource,
+  now = Date.now(),
+): { state: "none" | "active" | "expired"; expiresAt: string | null; secondsRemaining: number | null } {
+  const rotation = auth?.rotations?.[source];
+  if (!rotation) return { state: "none", expiresAt: null, secondsRemaining: null };
+  const expiresAt = new Date(rotation.expiresAt).toISOString();
+  if (rotation.expiresAt <= now) return { state: "expired", expiresAt, secondsRemaining: 0 };
+  return {
+    state: "active",
+    expiresAt,
+    secondsRemaining: Math.ceil((rotation.expiresAt - now) / 1000),
+  };
+}
+
 function suppliedToken(request: http.IncomingMessage) {
   const value = request.headers["x-plimsoll-token"];
   return Array.isArray(value) ? undefined : value;
@@ -264,7 +394,13 @@ export function assertProducerToken(
         ? auth.geminiCliProducer
         : auth.grokProducer;
   if (!expected) throw new HttpBoundaryRejection("producer_token_invalid", 401);
-  if (!tokenMatches(supplied, expected)) {
-    throw new HttpBoundaryRejection("producer_token_invalid", 401);
+  if (tokenMatches(supplied, expected)) return;
+  // Rotation grace: the superseded token stays acceptable only until its
+  // recorded expiry, so a producer that has not been restarted yet keeps
+  // reporting and a leaked old token still stops working on a fixed deadline.
+  const rotation = auth.rotations?.[source];
+  if (rotation && rotation.expiresAt > Date.now() && tokenMatches(supplied, rotation.token)) {
+    return;
   }
+  throw new HttpBoundaryRejection("producer_token_invalid", 401);
 }

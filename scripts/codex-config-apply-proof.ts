@@ -81,6 +81,7 @@ function main() {
       repoRoot: "/synthetic/plimsoll/source",
       port,
       dataMode: "metadata",
+      codexHeaderFile: path.join(sandbox, "codex-home", "plimsoll.headers"),
     });
     const partial = fs.readFileSync(fixturePath, "utf8").replaceAll("__PLIMSOLL_PORT__", String(port));
     const config = path.join(sandbox, "partial", "config.toml");

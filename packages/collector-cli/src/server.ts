@@ -56,6 +56,8 @@ import {
 import {
   assertManagementCredential,
   assertProducerToken,
+  localIngestAuthStamp,
+  readLocalIngestAuth,
   type LocalIngestAuth,
 } from "./local-auth";
 import {
@@ -171,6 +173,13 @@ export function createCollectorServer(
      * boundary applies unchanged.
      */
     localAuth?: LocalIngestAuth;
+    /**
+     * Plimsoll home backing `localAuth`. When set, a producer token that misses
+     * the cached authority re-reads the credential file once — and only once
+     * per observed file change — so `rotate-producer-token` takes effect on a
+     * running daemon without a restart. Absent, the cached authority is final.
+     */
+    localAuthHome?: string;
     /** Private hash registry home; no provisioning occurs on the listener. */
     liveProducerHome?: string;
     /** Proof-injectable per-source admission ceiling (defaults to the limit). */
@@ -191,6 +200,29 @@ export function createCollectorServer(
   const assertManagementRead = (request: http.IncomingMessage) => {
     if (!authEnforced || !localAuth) return;
     assertManagementCredential(request, localAuth, requestUrl(request));
+  };
+  // Rotation reload seam. Management credentials deliberately keep using the
+  // authority loaded at start; only the producer audiences follow a rotation.
+  let producerAuth = localAuth;
+  let producerAuthStamp = options.localAuthHome ? localIngestAuthStamp(options.localAuthHome) : null;
+  const assertProducer = (request: http.IncomingMessage, source: LocalProducerSource) => {
+    if (!producerAuth) return;
+    try {
+      assertProducerToken(request, producerAuth, source, requestUrl(request));
+    } catch (error) {
+      const home = options.localAuthHome;
+      if (!home || !(error instanceof HttpBoundaryRejection) ||
+        error.reason !== "producer_token_invalid") {
+        throw error;
+      }
+      const stamp = localIngestAuthStamp(home);
+      if (stamp === null || stamp === producerAuthStamp) throw error;
+      producerAuthStamp = stamp;
+      const reloaded = readLocalIngestAuth(home);
+      if (!reloaded) throw error;
+      assertProducerToken(request, reloaded, source, requestUrl(request));
+      producerAuth = reloaded;
+    }
   };
 
   // Issue #0075 (#144): repeated identical admission rejections are
@@ -766,9 +798,7 @@ export function createCollectorServer(
         if (!source) throw new HttpBoundaryRejection("source_not_allowed", 401);
         assertHookSource(request, source);
         assertSourceAdmission(source);
-        if (localAuth) {
-          assertProducerToken(request, localAuth, source, requestUrl(request));
-        }
+        assertProducer(request, source);
         const body = decodeBoundedRequestBody(
           request,
           await readBoundedRequestBody(request, budget),
@@ -808,9 +838,7 @@ export function createCollectorServer(
         assertNoBrowserOrigin(request);
         const source = requireOtlpSource(request);
         assertSourceAdmission(source);
-        if (localAuth) {
-          assertProducerToken(request, localAuth, source, requestUrl(request));
-        }
+        assertProducer(request, source);
         const body = decodeBoundedRequestBody(
           request,
           await readBoundedRequestBody(request, budget),

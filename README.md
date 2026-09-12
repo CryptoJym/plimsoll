@@ -123,6 +123,17 @@ pnpm report -- --repository your-org/your-repo   # after a few sessions: the eco
 you'd rather paste by hand. Managed hooks/exporters point only at
 `127.0.0.1:48271`. Nothing is configured behind your back.
 
+The Grok and Codex hook commands carry no secret: each reads its producer
+token from a mode-0600 `plimsoll.headers` file beside its own config
+(`${GROK_HOME:-~/.grok}/hooks/plimsoll.headers` and `~/.codex/plimsoll.headers`),
+so a config search or a pasted command string never exposes the token. Codex's
+own OTLP exporter has no file or environment source for a header value, so
+`[otel.*_exporter."otlp-http"] headers` keeps the token inline; rotate it with
+`plimsoll rotate-producer-token --source codex`, which rewrites the header file
+and `config.toml` with backups and accepts the superseded token only until the
+grace window closes (`--grace-seconds`, default 900). `plimsoll doctor` reports
+the rotation deadline and never prints a token.
+
 The source install script's `--dry-run` does not clone, install dependencies,
 write Claude/Gemini/Grok/Codex or Plimsoll files, register a LaunchAgent, or start a
 collector. The real install fails closed if the final doctor gate is below

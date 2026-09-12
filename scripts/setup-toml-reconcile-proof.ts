@@ -22,11 +22,13 @@ const fixtureRoot = useFixtureRoot(sandbox);
 const fixture = (name: string) => path.join(root, "scripts", "fixtures", name);
 const checks: Check[] = [];
 const syntheticToken = "synthetic-codex-producer-token";
+const syntheticHeaderFile = "/synthetic/codex-home/plimsoll.headers";
 const generated = generateCodexConfigToml({
   repoRoot: root,
   port: 48271,
   dataMode: "metadata",
   codexProducerToken: syntheticToken,
+  codexHeaderFile: syntheticHeaderFile,
 });
 
 function check(name: string, condition: unknown, detail: unknown) {
@@ -180,6 +182,9 @@ function main() {
       { code: macbookCliPlan.code, actualCodexPlan, stderr: macbookCliPlan.stderr },
     );
 
+    // The Studio0 fixture is the real inline-token shape the trigger exposed:
+    // three managed commands carrying the producer token, interleaved with
+    // foreign mem0/inbox hooks. `setup` must migrate only the owned commands.
     const studioFixture = fs.readFileSync(
       fixture("studio0-codex-config-hooks-after-manual-fix.toml"),
       "utf8",
@@ -190,13 +195,35 @@ function main() {
     const studioBefore = fs.readFileSync(studio, "utf8");
     const studioPlan = applyCodexConfig(studio, generated, { dryRun: true });
     check(
-      "studio0_post_fix_shape_is_recognized_unchanged",
-      !studioPlan.changed &&
+      "studio0_legacy_inline_token_hooks_plan_migrates_without_writing",
+      studioPlan.changed &&
         ["Stop", "UserPromptSubmit", "PostToolUse"].every((event) =>
-          operation(studioPlan, `hooks.${event}`) === "unchanged"
+          operation(studioPlan, `hooks.${event}`) === "updated"
         ) &&
         fs.readFileSync(studio, "utf8") === studioBefore,
       studioPlan,
+    );
+    applyCodexConfig(studio, generated);
+    const studioAfter = fs.readFileSync(studio, "utf8");
+    const studioDocument = parseToml(studioAfter) as Record<string, any>;
+    const studioIdempotent = applyCodexConfig(studio, generated, { dryRun: true });
+    const expectedManagedCommand =
+      `curl -s --max-time 2 -X POST -H 'Content-Type: application/json' -H @${syntheticHeaderFile} --data-binary @- http://127.0.0.1:48271/hooks/codex || true`;
+    check(
+      "studio0_migrated_commands_are_token_free_foreign_preserving_and_idempotent",
+      !studioIdempotent.changed &&
+        !studioAfter.includes(`x-plimsoll-token: ${syntheticToken}`) &&
+        studioAfter.includes("mem0-fleet-hook end") &&
+        studioAfter.includes("inbox-native") &&
+        ["Stop", "UserPromptSubmit", "PostToolUse"].every((event) =>
+          plimsollCommands(studioDocument, event).length === 1 &&
+          plimsollCommands(studioDocument, event)[0] === expectedManagedCommand
+        ),
+      {
+        idempotent: !studioIdempotent.changed,
+        commandCarriesToken: studioAfter.includes(`x-plimsoll-token: ${syntheticToken}`),
+        foreignHooksPreserved: studioAfter.includes("mem0-fleet-hook end") && studioAfter.includes("inbox-native"),
+      },
     );
 
     const preToken = copyFixture(sandbox, "codex-inline-pre-token.toml");
@@ -216,7 +243,8 @@ function main() {
       preTokenAfter.includes("printf foreign-stop") &&
         ["Stop", "UserPromptSubmit", "PostToolUse"].every((event) =>
           plimsollCommands(preTokenDocument, event).length === 1 &&
-          plimsollCommands(preTokenDocument, event)[0]?.includes("x-plimsoll-token")
+          plimsollCommands(preTokenDocument, event)[0]?.includes(`-H @${syntheticHeaderFile} `) &&
+          !plimsollCommands(preTokenDocument, event)[0]?.includes("x-plimsoll-token")
         ),
       {
         foreignStopPreserved: preTokenAfter.includes("printf foreign-stop"),
@@ -336,6 +364,7 @@ function main() {
       port: 49999,
       dataMode: "metadata",
       codexProducerToken: "old-synthetic-token",
+      codexHeaderFile: "/synthetic/codex-home/old-plimsoll.headers",
     });
     const oldCommand = plimsollCommands(parseToml(oldGenerated) as Record<string, any>, "Stop")[0]!;
     const currentCommand = plimsollCommands(parseToml(generated) as Record<string, any>, "Stop")[0]!;

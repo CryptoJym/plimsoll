@@ -13,6 +13,8 @@ export type ToolConfigOptions = {
   grokCurlCommand?: string;
   /** Absolute managed curl header file used by the managed Grok command. */
   grokHeaderFile?: string;
+  /** Absolute managed curl header file used by the managed Codex hook command. */
+  codexHeaderFile?: string;
   /**
    * Issue 0056 (#104): Plimsoll-local producer credentials. When provided,
    * generated configs bind each tool's exporter/hook traffic to its own
@@ -46,23 +48,21 @@ function tomlString(value: string) {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
-function hookForwardCommand(options: ToolConfigOptions, source: "claude-code" | "codex" | "grok") {
+function hookForwardCommand(options: ToolConfigOptions, source: "codex" | "grok") {
   // curl into the local receiver keeps per-event overhead at ~10ms; spawning
   // pnpm/node per hook event costs 1-2s per tool call across the whole fleet.
-  const token = options.codexProducerToken;
+  // The producer token lives only in a private 0600 header file, so neither the
+  // stored command string nor the argv it becomes ever carries the secret.
   const curlCommand = source === "grok"
     ? shellQuote(options.grokCurlCommand ?? "/usr/bin/curl")
     : "curl";
-  if (source === "grok") {
-    if (!options.grokHeaderFile || !path.isAbsolute(options.grokHeaderFile)) {
-      throw new Error("Grok managed header file must be an absolute path.");
-    }
-    return `${curlCommand} -s --max-time 2 -X POST -H 'Content-Type: application/json' -H ${shellQuote(`@${options.grokHeaderFile}`)} --data-binary @- http://127.0.0.1:${port(options)}/hooks/grok || true`;
+  const headerFile = source === "grok" ? options.grokHeaderFile : options.codexHeaderFile;
+  if (!headerFile || !path.isAbsolute(headerFile)) {
+    throw new Error(
+      `${source === "grok" ? "Grok" : "Codex"} managed header file must be an absolute path.`,
+    );
   }
-  const tokenHeader = token
-    ? ` -H ${shellQuote(`x-plimsoll-token: ${token}`)}`
-    : "";
-  return `${curlCommand} -s --max-time 2 -X POST -H 'Content-Type: application/json'${tokenHeader} --data-binary @- http://127.0.0.1:${port(options)}/hooks/${source} || true`;
+  return `${curlCommand} -s --max-time 2 -X POST -H 'Content-Type: application/json' -H ${shellQuote(`@${headerFile}`)} --data-binary @- http://127.0.0.1:${port(options)}/hooks/${source} || true`;
 }
 
 function port(options: ToolConfigOptions) {
@@ -250,6 +250,20 @@ export function generateGrokHookHeader(options: ToolConfigOptions) {
   return `x-plimsoll-token: ${options.grokProducerToken}\n`;
 }
 
+/**
+ * Curl header file kept separate so the Codex hook command stored in
+ * config.toml — a file every agent and config search reads — is secret-free.
+ * Codex's own OTLP exporter cannot read a header from a file, so the exporter
+ * tables keep the inline token; see docs/adapters.md.
+ */
+export function generateCodexHookHeader(options: ToolConfigOptions) {
+  assertSupportedDataMode(options);
+  if (!options.codexProducerToken || !/^[A-Za-z0-9_-]{43}$/.test(options.codexProducerToken)) {
+    throw new Error("Codex producer token must be a 43-character URL-safe value.");
+  }
+  return `x-plimsoll-token: ${options.codexProducerToken}\n`;
+}
+
 export function generateSetupInstructions(options: ToolConfigOptions) {
   assertSupportedDataMode(options);
 
@@ -261,6 +275,7 @@ export function generateSetupInstructions(options: ToolConfigOptions) {
     geminiCliSettingsPath: "~/.gemini/settings.json or project .gemini/settings.json",
     grokHookSettingsPath: "${GROK_HOME:-~/.grok}/hooks/plimsoll.json",
     grokHookHeaderPath: "${GROK_HOME:-~/.grok}/hooks/plimsoll.headers",
+    codexHookHeaderPath: "~/.codex/plimsoll.headers (beside the applied config.toml)",
     collectorStartCommand: `${shellQuote(options.pnpmCommand ?? "pnpm")} --dir ${shellQuote(options.repoRoot)} collector start`,
     collectorDoctorCommand: `${shellQuote(options.pnpmCommand ?? "pnpm")} --dir ${shellQuote(options.repoRoot)} collector doctor`,
     privacyDefaults: {
