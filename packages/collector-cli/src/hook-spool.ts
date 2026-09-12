@@ -29,6 +29,20 @@ import { resolveCollectorHome } from "./collector-home";
  * bound is hit the client falls back to throwing, so the loss stays visible
  * rather than becoming a silently growing directory.
  *
+ * TWO writers put files here, with one rule, one directory and one set of
+ * bounds (round r5):
+ *   - the hook client (`local-hook-client.ts`), for a host whose hook runs
+ *     `plimsoll forward-hook-http <source>`;
+ *   - the collector's OWN INTAKE (`server.ts`), for the managed hooks the
+ *     fleet actually installs — Claude Code's `http` hook and the Codex/Grok
+ *     `curl` commands post straight to `/hooks/<source>` and never run the CLI,
+ *     so a 503 on that path used to lose the event outright. An authorized,
+ *     admitted post whose ledger write stays busy past the retry budget is
+ *     written here and answered `202 {"status":"hook_spooled"}`, after the
+ *     rename and never before it. Everything the client's spool refuses to
+ *     hold, the intake's refuses too: it is the same `writeHookSpoolFile` with
+ *     the same `blankForbiddenRawContent` in front of it.
+ *
  * What is on disk is NOT the original body. `docs/privacy-spec.md` holds raw
  * content and private/path metadata out of every local write, and the spool is
  * a local write that happens BEFORE the collector's suppression can run. So the
@@ -149,10 +163,11 @@ export type HookSpoolEnvelope = {
   v: 1;
   source: HookSpoolSource;
   /**
-   * When the HOOK process decided to spool, stamped by that process before the
-   * file is written. The drain hands this to the route as the event's
-   * `observedAt` default (review r2, F1), so a recovered event carries the time
-   * the hook fired rather than the time the drain got to it.
+   * When the event arrived, stamped before the file is written: the hook
+   * process's own time when the client spooled it, the daemon's request
+   * receive time when the intake spooled it. The drain hands this to the route
+   * as the event's `observedAt` default (review r2, F1), so a recovered event
+   * carries the time it arrived rather than the time the drain got to it.
    */
   receivedAt: string;
   /** How many values `blankForbiddenRawContent` emptied before the write. */
@@ -483,6 +498,13 @@ export type HookSpoolCounters = {
   recovered: number;
   rejected: number;
   deferred: number;
+  /**
+   * Events the COLLECTOR'S OWN INTAKE spooled (bead eco-6hoxj.61, round r5):
+   * an authorized, admitted `/hooks/<source>` post whose ledger write stayed
+   * busy past the retry budget. Owned by the intake; the drain never changes
+   * it, it only carries the value it just read forward (`server.ts`).
+   */
+  spooledAtIntake: number;
   lastDrainAt: string | null;
 };
 
@@ -490,6 +512,7 @@ export const EMPTY_HOOK_SPOOL_COUNTERS: HookSpoolCounters = Object.freeze({
   recovered: 0,
   rejected: 0,
   deferred: 0,
+  spooledAtIntake: 0,
   lastDrainAt: null,
 });
 
@@ -510,11 +533,35 @@ export function readHookSpoolCounters(home: string): HookSpoolCounters {
       recovered: counterValue(parsed.recovered),
       rejected: counterValue(parsed.rejected),
       deferred: counterValue(parsed.deferred),
+      spooledAtIntake: counterValue(parsed.spooledAtIntake),
       lastDrainAt: typeof parsed.lastDrainAt === "string" ? parsed.lastDrainAt : null,
     };
   } catch {
     return { ...EMPTY_HOOK_SPOOL_COUNTERS };
   }
+}
+
+/**
+ * Count one event the collector's own intake just spooled.
+ *
+ * Read-modify-write of the counters file, synchronous from read to rename, so
+ * it cannot interleave with the drain's own counter write inside the daemon's
+ * single thread. The two writers own disjoint fields: the drain owns
+ * `recovered`/`rejected`/`deferred`/`lastDrainAt` and carries `spooledAtIntake`
+ * forward from the file, the intake owns `spooledAtIntake` and carries the
+ * drain's fields forward from the file.
+ *
+ * Never called before the spool file's rename succeeded: the counter is a
+ * receipt for a durable event, not an intention.
+ */
+export function recordHookSpoolIntake(home: string) {
+  const counters = readHookSpoolCounters(home);
+  const next: HookSpoolCounters = {
+    ...counters,
+    spooledAtIntake: counters.spooledAtIntake + 1,
+  };
+  writeHookSpoolCounters(home, next);
+  return next;
 }
 
 export function writeHookSpoolCounters(home: string, counters: HookSpoolCounters) {

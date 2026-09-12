@@ -56,26 +56,51 @@ Codex ──────── OTLP logs/traces/metrics ─┤
 The outcome join uses **linkage keys**: both Plimsoll and the GitHub side hash the same normalized inputs (remote URL, branch name), so sessions and pull requests join by construction while the raw strings never leave your machine. Commit shas stay plain — they're already public on GitHub.
 
 A hook event the collector cannot accept right now is **spooled, not dropped**.
-When the local ledger is busy past its retry budget (HTTP 503), when the
-collector gives up reading the request (HTTP 408, `request_deadline_exceeded`),
-or when it is restarting for a managed update (connection refused), the hook
-writes the event to `hook-spool/` under the Plimsoll home — one private file per
-event, carrying no credentials — and the collector drains it back through the
-ordinary hook path every five seconds once the ledger is free, so a recovered
+The spool is one private file per event under `hook-spool/` in the Plimsoll
+home, carrying no credentials, which the collector drains back through the
+ordinary hook path every five seconds once the ledger is free — so a recovered
 event lands in the ledger attributed exactly like a live one.
 
-The spool is **at-most-once**: every one of those outcomes proves the collector
-stored nothing, so a spooled event is never a duplicate. The window it does not
-close is the collector dying mid-request — a connection reset or a closed socket
-after the body was sent may mean the row was already written, so that event
-still fails loudly and is lost rather than risk double-counting it in cost and
-usage. Closing that window needs idempotent replay (a client-minted event id)
-and is tracked separately.
+Spooling happens in **two** places, because hooks reach the collector in two
+ways:
 
-What is on disk is **not** the raw body. Before the file is written, the hook
-process applies the collector's own pre-write suppression rule to it: every key
-the collector would strip — raw prompt, output and tool content, credential-like
-names, file and transcript paths — keeps its name and loses its value. So
+- **The collector's own intake**, for every hook path. The managed hooks post
+  straight to `http://127.0.0.1:<port>/hooks/<source>` — Claude Code's is an
+  `http` hook, the Codex and Grok hooks are `curl` commands — and never run a
+  Plimsoll command. When such a post is authorized and admitted but the local
+  ledger stays busy past its retry budget, the collector writes the spool file
+  itself and answers `202 {"status":"hook_spooled"}` instead of the old
+  `503 storage_busy_retry`. It answers 202 only after the file is durably
+  renamed into place; if the spool cannot be written (its bounds are reached,
+  the disk refuses, or `PLIMSOLL_HOOK_SPOOL=off`), the answer stays exactly
+  today's 503 so the loss stays visible.
+- **The `forward-hook-http` client**, for a host whose hook runs that command.
+  It spools when the collector answers 503, answers 408
+  (`request_deadline_exceeded`), or is not listening at all (connection refused
+  during a managed update window).
+
+What is still lost: a request whose **body never finished arriving** (the 408 —
+there is nothing whole to spool), and, for the `http`/`curl` hooks, a post that
+never reaches a listening collector at all (connection refused — the collector
+is not there to spool it, and those hooks have no Plimsoll process of their own
+to do it for them; `forward-hook-http` hosts do spool that case).
+
+The spool is **at-most-once**: every one of those outcomes proves the collector
+stored nothing, so a spooled event is never a duplicate. At the intake, the 503
+class is raised only when the ledger write did not commit — the durable append
+runs in a single `BEGIN IMMEDIATE` transaction that SQLite has rolled back by
+the time the busy error escapes it — and it is the only outcome that is spooled
+there. The window the spool does not close is the collector dying mid-request —
+a connection reset or a closed socket after the body was sent may mean the row
+was already written, so that event still fails loudly and is lost rather than
+risk double-counting it in cost and usage. Closing that window needs idempotent
+replay (a client-minted event id) and is tracked separately.
+
+What is on disk is **not** the raw body. Before the file is written — by either
+writer, through the same function — the collector's own pre-write suppression
+rule is applied to it: every key the collector would strip — raw prompt, output
+and tool content, credential-like names, file and transcript paths — keeps its
+name and loses its value. So
 `hook-spool/` holds no more than the local ledger is allowed to hold, and the
 collector's own suppression produces exactly the same receipts when the event is
 replayed. The deliberate exceptions are two short lists of keys. The first
@@ -92,17 +117,20 @@ is listed by name, with the reason, in
 [docs/privacy-spec.md](docs/privacy-spec.md) under *Where captured data rests on
 disk*, which is generated from the code that enforces it.
 
-A recovered event carries the time the **hook** fired, not the time the drain
-got to it: the hook process stamps the file when it spools, and the drain hands
-that stamp to the collector as the event's timestamp, so a spooled event lands
-in the same cost and usage window it would have live. A body that carries a
+A recovered event carries the time it **arrived**, not the time the drain got to
+it: the file is stamped when it is spooled — with the hook process's own time
+when the client spools it, with the daemon's request receive time when the
+intake spools it — and the drain hands that stamp to the collector as the
+event's timestamp, so a spooled event lands in the same cost and usage window
+it would have live. A body that carries a
 timestamp the collector can actually use keeps it, untouched — usable is the
 collector's own test, so a numeric epoch, an empty string or a future-dated
 time is not a timestamp for this purpose and the hook's stamp is used instead,
 exactly as it would be live.
 
-The counters (`recovered`, `rejected`, `deferred`, pending files and their age)
-are in `plimsoll status`, `plimsoll doctor`, and the collector's `/status` under
+The counters (`recovered`, `rejected`, `deferred`, `spooledAtIntake` — how many
+events the collector's own intake spooled — pending files and their age) are in
+`plimsoll status`, `plimsoll doctor`, and the collector's `/status` under
 `hookSpool`; `enabled` there is the running collector's kill-switch state, read
 from the collector itself — `plimsoll status` asks the daemon for it in one
 request bounded by `PLIMSOLL_COLLECTOR_DOCTOR_TIMEOUT_MS` (3 s by default), and
@@ -114,12 +142,17 @@ that collector is updated. Doctor says so plainly if anything has been pending
 for more than ten minutes. The counters are written once per drain tick, after
 the tick has applied its files, so `status`/`doctor` can lag the ledger by the
 remainder of a 5 s tick: an event can be queryable in the ledger a moment before
-`recovered` counts it. Contract rejections are
-**not** spooled: a body the collector refuses on its merits (4xx other than 408)
+`recovered` counts it. Contract rejections are **not** spooled: a body the collector refuses on its merits (4xx other than 408)
 still fails the hook loudly, and a spooled file the drain cannot apply is
-quarantined under `hook-spool/rejected/` rather than retried forever. Set
+quarantined under `hook-spool/rejected/` rather than retried forever. An
+operator watching `collector.err.log` sees intake spooling happen without any
+body: the first spool in each minute prints `hook_spooled_at_intake` with its
+source and client class, and the rest of that minute is reported by one
+`hook_spooled_at_intake_summary` line with the count — while the
+`storage_busy_retry` rejection summary now counts only the posts that were
+really refused, the ones whose spool write failed. Set
 `PLIMSOLL_HOOK_SPOOL=off` in the collector's environment to restore the previous
-drop-and-log behaviour.
+drop-and-log behaviour on both paths.
 
 Residual behaviour worth knowing:
 
@@ -133,7 +166,12 @@ Residual behaviour worth knowing:
   live (403) but admitted on replay, because the string is inside the value the
   spool blanked. No live-usage figure is ever admitted — only the event.
 - Spool counters in `status`/`doctor` can lag the ledger by the remainder of a
-  5 s drain tick, as above.
+  5 s drain tick, as above. `spooledAtIntake` is written to the counters file
+  the moment the intake spools, so `plimsoll status`/`doctor`, which read that
+  file, are immediate; the collector's own `/status` serves the drain's cached
+  snapshot and so lags by the same tick.
+- An `http`/`curl` hook whose post never reaches a listening collector is still
+  lost: there is no Plimsoll process on that path to spool it.
 
 ## Quickstart
 

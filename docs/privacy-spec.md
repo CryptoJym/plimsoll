@@ -247,7 +247,11 @@ Named sentinel checks enforcing this section:
 Captured data rests in two places on the machine, both inside the one
 resolved Plimsoll home, both private to the running user (0700 directories,
 0600 files). The rules above are written for the first one. The second
-applies the ledger's DROP rule before its write: every key the sanitizer
+has two writers — the hook process, and the collector's own intake, which
+spools a hook post it cannot write to the ledger right now rather than
+refusing it — writing through the same function, into the same directory,
+under the same bounds. Either writer applies the ledger's DROP rule before
+the write: every key the sanitizer
 removes outright is emptied there too, keeping only the key name, so
 nothing from *Never collected* rests there. It does not apply the ledger's
 other two steps. The keys of *Collected hashed* are not hashed before the
@@ -260,7 +264,7 @@ though the ledger never stores it.
 | # | Location | What rests there | Suppression applied before the write |
 |---|---|---|---|
 | 1 | `work-ledger.sqlite` (the local ledger) | Normalized events and their suppression receipts. | `sanitizeForPolicy` / `evaluatePolicyInput` (`packages/shared/src/policy.ts`), then metadata admission. |
-| 2 | `hook-spool/` (hook events the collector could not accept yet; bead eco-6hoxj.61) | One JSON envelope per event, written by the hook process, deleted as soon as the collector applies it. A file the collector cannot apply is quarantined under `hook-spool/rejected/` for up to 7 days. | `blankForbiddenRawContent` (`packages/collector-cli/src/hook-spool.ts`) empties the value of every key `sanitizeRoutineMetadata` drops outright — the local write's own DROP rule, imported — keeping only the key name. The declared derivation inputs below keep their value. |
+| 2 | `hook-spool/` (hook events the collector could not accept yet; bead eco-6hoxj.61) | One JSON envelope per event, written either by the hook process or by the collector's own intake when a busy ledger cannot take the post, deleted as soon as the collector applies it. Bounded for both writers at 5000 files and 64 MiB. A file the collector cannot apply is quarantined under `hook-spool/rejected/` for up to 7 days. | `blankForbiddenRawContent` (`packages/collector-cli/src/hook-spool.ts`) empties the value of every key `sanitizeRoutineMetadata` drops outright — the local write's own DROP rule, imported — keeping only the key name, whichever writer writes the file. The declared derivation inputs below keep their value. |
 
 So the spool holds values the ledger's own bytes do not, and this is the
 whole of that list: the keys the collector reads from the raw body BEFORE
@@ -302,6 +306,8 @@ Named sentinel checks enforcing this section:
 - `r_every_protected_identity_name_is_blanked_or_declared` — `scripts/hook-spool-proof.ts`
 - `r_a_declared_protected_identity_is_raw_in_the_spool_and_hashed_identically_in_both_rows` — `scripts/hook-spool-proof.ts`
 - `r_blanking_a_declared_protected_identity_would_change_what_the_ledger_persists` — `scripts/hook-spool-proof.ts`
+- `z_the_intake_spool_file_holds_only_the_allowlisted_path_value` — `scripts/hook-spool-proof.ts`
+- `w_the_intake_wrote_the_same_envelope_the_client_writes` — `scripts/hook-spool-proof.ts`
 
 ## Regeneration
 

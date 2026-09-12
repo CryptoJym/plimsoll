@@ -68,6 +68,9 @@ export type PrivacySpecModel = {
   spoolDirectory: string;
   spoolDerivationInputs: SpoolDerivationInputDisclosure[];
   spoolRejectedRetentionDays: number;
+  /** The bound both spool writers — the hook client and the collector's intake — share. */
+  spoolMaxFiles: number;
+  spoolMaxBytesMiB: number;
 };
 
 type ProofCheckRef = {
@@ -139,6 +142,8 @@ export const PROOF_CHECKS: Record<string, ProofCheckRef> = {
       "r_every_protected_identity_name_is_blanked_or_declared",
       "r_a_declared_protected_identity_is_raw_in_the_spool_and_hashed_identically_in_both_rows",
       "r_blanking_a_declared_protected_identity_would_change_what_the_ledger_persists",
+      "z_the_intake_spool_file_holds_only_the_allowlisted_path_value",
+      "w_the_intake_wrote_the_same_envelope_the_client_writes",
     ],
   },
 };
@@ -232,6 +237,8 @@ export function collectPrivacySpecModel(): PrivacySpecModel {
     spoolDirectory: HOOK_SPOOL_DIRECTORY,
     spoolDerivationInputs: [...SPOOL_DERIVATION_INPUT_DISCLOSURE],
     spoolRejectedRetentionDays: HOOK_SPOOL_LIMITS.rejectedMaxAgeMs / (24 * 60 * 60 * 1000),
+    spoolMaxFiles: HOOK_SPOOL_LIMITS.maxFiles,
+    spoolMaxBytesMiB: HOOK_SPOOL_LIMITS.maxBytes / (1024 * 1024),
   };
 }
 
@@ -416,7 +423,11 @@ export function renderPrivacySpec(model: PrivacySpecModel): string {
   lines.push(`Captured data rests in two places on the machine, both inside the one`);
   lines.push(`resolved Plimsoll home, both private to the running user (0700 directories,`);
   lines.push(`0600 files). The rules above are written for the first one. The second`);
-  lines.push(`applies the ledger's DROP rule before its write: every key the sanitizer`);
+  lines.push(`has two writers — the hook process, and the collector's own intake, which`);
+  lines.push(`spools a hook post it cannot write to the ledger right now rather than`);
+  lines.push(`refusing it — writing through the same function, into the same directory,`);
+  lines.push(`under the same bounds. Either writer applies the ledger's DROP rule before`);
+  lines.push(`the write: every key the sanitizer`);
   lines.push(`removes outright is emptied there too, keeping only the key name, so`);
   lines.push(`nothing from *Never collected* rests there. It does not apply the ledger's`);
   lines.push(`other two steps. The keys of *Collected hashed* are not hashed before the`);
@@ -429,7 +440,7 @@ export function renderPrivacySpec(model: PrivacySpecModel): string {
   lines.push(`| # | Location | What rests there | Suppression applied before the write |`);
   lines.push(`|---|---|---|---|`);
   lines.push(`| 1 | \`work-ledger.sqlite\` (the local ledger) | Normalized events and their suppression receipts. | \`sanitizeForPolicy\` / \`evaluatePolicyInput\` (\`${SOURCE_POLICY}\`), then metadata admission. |`);
-  lines.push(`| 2 | \`${model.spoolDirectory}/\` (hook events the collector could not accept yet; bead eco-6hoxj.61) | One JSON envelope per event, written by the hook process, deleted as soon as the collector applies it. A file the collector cannot apply is quarantined under \`${model.spoolDirectory}/rejected/\` for up to ${model.spoolRejectedRetentionDays} days. | \`blankForbiddenRawContent\` (\`${SOURCE_HOOK_SPOOL}\`) empties the value of every key \`sanitizeRoutineMetadata\` drops outright — the local write's own DROP rule, imported — keeping only the key name. The declared derivation inputs below keep their value. |`);
+  lines.push(`| 2 | \`${model.spoolDirectory}/\` (hook events the collector could not accept yet; bead eco-6hoxj.61) | One JSON envelope per event, written either by the hook process or by the collector's own intake when a busy ledger cannot take the post, deleted as soon as the collector applies it. Bounded for both writers at ${model.spoolMaxFiles} files and ${model.spoolMaxBytesMiB} MiB. A file the collector cannot apply is quarantined under \`${model.spoolDirectory}/rejected/\` for up to ${model.spoolRejectedRetentionDays} days. | \`blankForbiddenRawContent\` (\`${SOURCE_HOOK_SPOOL}\`) empties the value of every key \`sanitizeRoutineMetadata\` drops outright — the local write's own DROP rule, imported — keeping only the key name, whichever writer writes the file. The declared derivation inputs below keep their value. |`);
   lines.push(``);
   lines.push(`So the spool holds values the ledger's own bytes do not, and this is the`);
   lines.push(`whole of that list: the keys the collector reads from the raw body BEFORE`);

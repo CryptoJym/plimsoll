@@ -56,6 +56,7 @@ import {
   writeHookSpoolFile,
 } from "../packages/collector-cli/src/hook-spool";
 import { forwardHookOverLoopback } from "../packages/collector-cli/src/local-hook-client";
+import { REJECTION_SUMMARY_INTERVAL_MS } from "../packages/collector-cli/src/rejection-diagnostics";
 import { extractRepoContextCwd } from "../packages/collector-cli/src/repo-context";
 import {
   DEFAULT_POLICY,
@@ -122,7 +123,15 @@ type Collector = {
   close: () => Promise<void>;
 };
 
-async function startCollector(home: string): Promise<Collector> {
+async function startCollector(
+  home: string,
+  /**
+   * Proof-injectable server options. The intake spool's home is deliberately
+   * NOT injected by default: the collector resolves it exactly as the daemon
+   * does, so the case proves the post lands in the home this daemon drains.
+   */
+  serverOptions: Partial<Parameters<typeof createCollectorServer>[2]> = {},
+): Promise<Collector> {
   const ledgerPath = path.join(home, "work-ledger.sqlite");
   // Fail-fast busy handling is what the listener uses in production reasoning
   // ("the better-sqlite3 default is never appropriate on the listener event
@@ -136,6 +145,7 @@ async function startCollector(home: string): Promise<Collector> {
     localAuth: auth,
     localAuthHome: home,
     hookSpoolStatus: () => drain?.status() ?? null,
+    ...serverOptions,
   });
   drain = createHookSpoolDrain(config, buffer, { home });
   await new Promise<void>((resolve, reject) => {
@@ -158,6 +168,20 @@ async function startCollector(home: string): Promise<Collector> {
     },
   };
 }
+
+/**
+ * Round r5: a collector whose OWN intake cannot spool.
+ *
+ * From 0.7.23 the daemon spools an authorized, admitted hook post itself when
+ * the ledger is busy and answers 202 `hook_spooled` (cases `w`-`z` below), so a
+ * 503 reaches a hook CLIENT only when the intake could not write the envelope:
+ * its directory is at a bound, unwritable, or the daemon predates the intake
+ * spool. Every client-side case below is about that client, so its collector is
+ * put in exactly that state — the spool bound the intake writes under is zero,
+ * so `writeHookSpoolFile` returns null there and the answer stays today's 503.
+ * The client's own spool bounds are untouched and still its own.
+ */
+const INTAKE_SPOOL_EXHAUSTED = { hookSpoolLimits: { maxFiles: 0 } } as const;
 
 function getJson(port: number, route: string, managementToken: string) {
   return new Promise<Record<string, unknown>>((resolve, reject) => {
@@ -323,6 +347,7 @@ const HOOK_SPOOL_STATUS_FIELDS = [
   "recovered",
   "rejected",
   "deferred",
+  "spooledAtIntake",
   "pendingFiles",
   "pendingBytes",
   "oldestPendingAgeSeconds",
@@ -458,7 +483,7 @@ function codexHookBody(sessionId: string) {
 
 async function caseLockedLedgerRecovers() {
   const { root, home } = fixtureHome("a");
-  const collector = await startCollector(home);
+  const collector = await startCollector(home, INTAKE_SPOOL_EXHAUSTED);
   // The child hook command reads the port from the home's collector config.
   saveCollectorConfig(collectorConfigSchema.parse({ port: collector.port }));
   const lock = holdWriteLock(collector.ledgerPath);
@@ -807,7 +832,7 @@ async function caseUntrustedFilesAreQuarantined() {
 
 async function caseDirectoryBoundKeepsLossVisible() {
   const { home } = fixtureHome("f");
-  const collector = await startCollector(home);
+  const collector = await startCollector(home, INTAKE_SPOOL_EXHAUSTED);
   const lock = holdWriteLock(collector.ledgerPath);
   try {
     const limits = { maxFiles: 2 };
@@ -1396,7 +1421,7 @@ function comparableRow(row: Record<string, unknown>) {
  */
 async function casePrivacyBlankingKeepsTheLedgerIdentical() {
   const { home } = fixtureHome("p");
-  const collector = await startCollector(home);
+  const collector = await startCollector(home, INTAKE_SPOOL_EXHAUSTED);
   const session = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee1";
   const body = canaryHookBody(session);
   try {
@@ -1601,7 +1626,7 @@ async function liveThenSpool(collector: Collector, body: string, source: "claude
  */
 async function caseRecoveredEventsKeepTheHooksTime() {
   const { home } = fixtureHome("q");
-  const collector = await startCollector(home);
+  const collector = await startCollector(home, INTAKE_SPOOL_EXHAUSTED);
   /** Longer than the 5 s drain interval, so a drain clock cannot pass for a hook clock. */
   const SPOOL_LATENCY_MS = 6_000;
   const table: Record<string, unknown>[] = [];
@@ -1765,7 +1790,7 @@ function postToolUseBodyWithPaths(sessionId: string) {
  */
 async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
   const { home } = fixtureHome("r");
-  const collector = await startCollector(home);
+  const collector = await startCollector(home, INTAKE_SPOOL_EXHAUSTED);
   const session = "22223333-4444-4555-8666-777788889991";
   try {
     const outcome = await liveThenSpool(collector, postToolUseBodyWithPaths(session), "claude_code");
@@ -2051,7 +2076,7 @@ const USABLE_BODY_TIME = "2026-09-01T00:00:00.000Z";
 
 async function caseAnUnusableBodyTimeStillGetsTheHooksTime() {
   const { home } = fixtureHome("u");
-  const collector = await startCollector(home);
+  const collector = await startCollector(home, INTAKE_SPOOL_EXHAUSTED);
   /** Longer than the 5 s drain interval, so a drain clock cannot pass for a hook clock. */
   const SPOOL_LATENCY_MS = 6_000;
   const table: Record<string, unknown>[] = [];
@@ -2146,7 +2171,7 @@ async function caseAnUnusableBodyTimeStillGetsTheHooksTime() {
  */
 async function caseAnArgsNestedCwdIsADocumentedDivergence() {
   const { home } = fixtureHome("v");
-  const collector = await startCollector(home);
+  const collector = await startCollector(home, INTAKE_SPOOL_EXHAUSTED);
   const session = "44445555-6666-4777-8888-999900001112";
   try {
     const body = JSON.stringify({
@@ -2332,6 +2357,706 @@ function caseDrainingIsFalseWhenNothingCanDrain() {
 }
 
 
+/* ------------------------------------------------------------------------ *
+ * Round r5: the spool at the collector's own intake.
+ *
+ * No managed hook the fleet installs runs `forward-hook-http`. `setup` writes
+ * the Claude Code hook as an `http` hook (Claude Code POSTs straight to
+ * `http://127.0.0.1:<port>/hooks/claude-code` with the producer token in a
+ * header), and the managed Codex and Grok hooks are `curl -s --max-time 2 -X
+ * POST -H 'Content-Type: application/json' -H @<0600 header file>
+ * --data-binary @-` commands posting straight to `/hooks/<source>`. Those
+ * posts never touch the client spool, so a busy ledger answered them 503 and
+ * the event was gone. These cases drive the real wire shapes — no CLI, no
+ * client helper — against a real collector holding a real write lock.
+ * ------------------------------------------------------------------------ */
+
+/** One POST on the wire, with exactly the headers the caller names. */
+function postHookOverHttp(
+  port: number,
+  route: string,
+  headers: Record<string, string>,
+  body: string,
+  options: { chunked?: boolean } = {},
+) {
+  return new Promise<{ status: number; json: Record<string, unknown> | null; text: string }>(
+    (resolve, reject) => {
+      const request = http.request(
+        {
+          host: "127.0.0.1",
+          port,
+          path: route,
+          method: "POST",
+          headers: {
+            ...headers,
+            // `--data-binary @-` streams a body of unknown length, so curl
+            // sends it chunked; Claude Code's http hook sends a measured body.
+            ...(options.chunked ? {} : { "content-length": String(Buffer.byteLength(body)) }),
+            connection: "close",
+          },
+        },
+        (response) => {
+          const chunks: Buffer[] = [];
+          response.on("data", (chunk) => chunks.push(Buffer.from(chunk)));
+          response.on("end", () => {
+            const text = Buffer.concat(chunks).toString("utf8");
+            let json: Record<string, unknown> | null = null;
+            try {
+              json = JSON.parse(text) as Record<string, unknown>;
+            } catch {
+              json = null;
+            }
+            resolve({ status: response.statusCode ?? 0, json, text });
+          });
+        },
+      );
+      request.on("error", reject);
+      request.end(body);
+    },
+  );
+}
+
+/**
+ * Collect what the collector wrote to the operator log (stderr) while `run`
+ * ran. The proof process IS the collector, so this is the real log stream.
+ */
+async function captureWarnings<T>(run: () => Promise<T>) {
+  const lines: string[] = [];
+  const original = console.warn;
+  console.warn = (...args: unknown[]) => {
+    lines.push(args.map((argument) => String(argument)).join(" "));
+  };
+  try {
+    const result = await run();
+    return { result, lines };
+  } finally {
+    console.warn = original;
+  }
+}
+
+function parsedWarnings(lines: string[]) {
+  return lines
+    .map((line) => {
+      try {
+        return JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        return null;
+      }
+    })
+    .filter((line): line is Record<string, unknown> => line !== null);
+}
+
+/** The `observed_at` the ledger persisted for one session, newest row last. */
+function observedAtOf(buffer: LocalEventBuffer, sessionId: string) {
+  const row = buffer.database
+    .prepare("select observed_at as observedAt from buffered_events where session_id = ? order by rowid desc")
+    .get(sessionId) as { observedAt?: string } | undefined;
+  return row?.observedAt;
+}
+
+/**
+ * A hook body with NO time of its own — the shape a real Claude Code hook
+ * sends. The drain then supplies the envelope's `receivedAt`, which for an
+ * intake-spooled event is the daemon's own request receive time.
+ */
+function claudeHttpHookBody(sessionId: string, prompt: string) {
+  return JSON.stringify({
+    hook_event_name: "UserPromptSubmit",
+    session_id: sessionId,
+    cwd: "/Users/proof/workspace/plimsoll",
+    prompt,
+  });
+}
+
+function codexCurlHookBody(sessionId: string) {
+  return JSON.stringify({
+    hook_event_name: "PostToolUse",
+    session_id: sessionId,
+    cwd: "/Users/proof/workspace/plimsoll",
+    tool_name: "shell",
+    tool_input: { command: "git status --porcelain" },
+  });
+}
+
+const SESSION_INTAKE_CLAUDE = "f1e2d3c4-b5a6-4978-8899-0a1b2c3d4e5f";
+const SESSION_INTAKE_CODEX = "0a9b8c7d-6e5f-4a3b-8c2d-1e0f9a8b7c6d";
+const SESSION_INTAKE_UNAUTHORIZED = "1b2c3d4e-5f60-4718-8293-a4b5c6d7e8f9";
+const SESSION_INTAKE_KILLED = "2c3d4e5f-6071-4829-83a4-b5c6d7e8f9a0";
+const SESSION_INTAKE_BOUNDED = "3d4e5f60-7182-493a-84b5-c6d7e8f9a0b1";
+const INTAKE_PROMPT_CANARY = "RAW_PROMPT_MUST_NOT_REACH_DISK_AT_INTAKE";
+
+/**
+ * (a) The Claude Code `http` hook's own wire shape, refused by a busy ledger.
+ */
+async function caseTheIntakeSpoolsAnHttpHookPost() {
+  const { root, home } = fixtureHome("w");
+  const collector = await startCollector(home);
+  // The child `plimsoll status`/`doctor` read the port from this home's config.
+  saveCollectorConfig(collectorConfigSchema.parse({ port: collector.port }));
+  const lock = holdWriteLock(collector.ledgerPath);
+  try {
+    const body = claudeHttpHookBody(SESSION_INTAKE_CLAUDE, `${INTAKE_PROMPT_CANARY} please`);
+    const beforeMs = Date.now();
+    const captured = await captureWarnings(() =>
+      postHookOverHttp(
+        collector.port,
+        "/hooks/claude-code",
+        {
+          "content-type": "application/json",
+          // Exactly what `generateClaudeCodeSettings` puts in the hook's
+          // `headers`: the source-bound producer token and nothing else. No
+          // `x-plimsoll-source` — the path carries the source.
+          "x-plimsoll-token": collector.auth.claudeCodeProducer!,
+          "user-agent": "claude-code/1.0",
+        },
+        body,
+      ),
+    );
+    const afterMs = Date.now();
+    const posted = captured.result;
+    const spooled = listHookSpoolFiles(home);
+    const counters = readHookSpoolCounters(home);
+    check(
+      "w_an_http_style_hook_post_on_a_busy_ledger_is_spooled_at_intake",
+      posted.status === 202 &&
+        posted.json?.status === "hook_spooled" &&
+        posted.json?.source === "claude_code" &&
+        spooled.length === 1 &&
+        sessionRows(collector.buffer, SESSION_INTAKE_CLAUDE) === 0 &&
+        counters.spooledAtIntake === 1 &&
+        counters.recovered === 0,
+      {
+        status: posted.status,
+        body: posted.json,
+        pending: spooled.length,
+        ledgerRows: sessionRows(collector.buffer, SESSION_INTAKE_CLAUDE),
+        counters,
+      },
+    );
+
+    const bytes = spooled.length === 1 ? fs.readFileSync(spooled[0]!.path, "utf8") : "";
+    const envelope = spooled.length === 1
+      ? (JSON.parse(bytes) as Record<string, unknown>)
+      : null;
+    const blanked = blankForbiddenRawContent(body)!;
+    const receivedAtMs = typeof envelope?.receivedAt === "string"
+      ? Date.parse(envelope.receivedAt)
+      : Number.NaN;
+    const tokens = [
+      collector.auth.claudeCodeProducer,
+      collector.auth.codexProducer,
+      collector.auth.grokProducer,
+      collector.auth.geminiCliProducer,
+      collector.auth.managementRead,
+    ].filter((token): token is string => typeof token === "string");
+    const fileMode = spooled.length === 1 ? fs.statSync(spooled[0]!.path).mode & 0o777 : -1;
+    // -1 when the directory is absent: a control that removes the intake spool
+    // must report a failing check, not crash the case before the later ones run.
+    const directoryMode = (() => {
+      try {
+        return fs.statSync(hookSpoolDirectory(home)).mode & 0o777;
+      } catch {
+        return -1;
+      }
+    })();
+    check(
+      "w_the_intake_wrote_the_same_envelope_the_client_writes",
+      envelope?.v === 1 &&
+        envelope?.source === "claude_code" &&
+        envelope?.blanked === 1 &&
+        envelope?.body === blanked.text &&
+        // The daemon's request receive time, not the drain's clock.
+        receivedAtMs >= beforeMs &&
+        receivedAtMs <= afterMs &&
+        !bytes.includes(INTAKE_PROMPT_CANARY) &&
+        tokens.length === 5 &&
+        tokens.every((token) => !bytes.includes(token)) &&
+        fileMode === 0o600 &&
+        directoryMode === 0o700,
+      {
+        v: envelope?.v,
+        source: envelope?.source,
+        blanked: envelope?.blanked,
+        bodyMatchesBlanked: envelope?.body === blanked.text,
+        receivedAt: envelope?.receivedAt,
+        receiveWindowMs: afterMs - beforeMs,
+        promptOnDisk: bytes.includes(INTAKE_PROMPT_CANARY),
+        fileMode: fileMode.toString(8),
+        directoryMode: directoryMode.toString(8),
+      },
+    );
+
+    // (h) The operator sees the spool happen, and does NOT see a rejection
+    // summary claiming the event was refused.
+    const warnings = parsedWarnings(captured.lines);
+    const spoolLines = warnings.filter((line) => line.status === "hook_spooled_at_intake");
+    const busyRejections = warnings.filter(
+      (line) =>
+        line.reason === "storage_busy_retry" &&
+        (line.error === "collector_request_rejected" ||
+          line.error === "collector_request_rejected_summary"),
+    );
+    check(
+      "w_the_operator_log_names_the_intake_spool_and_no_storage_busy_rejection",
+      spoolLines.length === 1 &&
+        spoolLines[0]!.source === "claude_code" &&
+        typeof spoolLines[0]!.clientClass === "string" &&
+        busyRejections.length === 0 &&
+        // Never a body, never a path, never a token.
+        !captured.lines.join("\n").includes(INTAKE_PROMPT_CANARY) &&
+        tokens.every((token) => !captured.lines.join("\n").includes(token)),
+      { spoolLines, busyRejections, lines: captured.lines },
+    );
+
+    lock.release();
+    collector.drain.start();
+    const drained = await waitForDrainedCounters(home, 1);
+    check(
+      "w_the_released_lock_recovers_the_intake_spooled_event_inside_15s",
+      drained.settled &&
+        drained.elapsedMs <= RECOVERY_DEADLINE_MS &&
+        sessionRows(collector.buffer, SESSION_INTAKE_CLAUDE) === 1 &&
+        listHookSpoolFiles(home).length === 0 &&
+        drained.counters.recovered === 1 &&
+        drained.counters.spooledAtIntake === 1 &&
+        drained.counters.rejected === 0,
+      {
+        elapsedMs: drained.elapsedMs,
+        budgetMs: RECOVERY_DEADLINE_MS,
+        rows: sessionRows(collector.buffer, SESSION_INTAKE_CLAUDE),
+        counters: drained.counters,
+      },
+    );
+
+    const observedAt = observedAtOf(collector.buffer, SESSION_INTAKE_CLAUDE);
+    const stampSkewMs = observedAt && typeof envelope?.receivedAt === "string"
+      ? Date.parse(observedAt) - Date.parse(envelope.receivedAt)
+      : Number.NaN;
+    const distanceFromDrainClockMs = observedAt ? Date.now() - Date.parse(observedAt) : Number.NaN;
+    check(
+      "w_the_recovered_row_carries_the_daemons_receive_time",
+      stampSkewMs === 0 && distanceFromDrainClockMs > 0,
+      {
+        observedAt,
+        envelopeReceivedAt: envelope?.receivedAt,
+        stampSkewFromEnvelopeMs: stampSkewMs,
+        distanceFromDrainClockMs,
+      },
+    );
+
+    const status = await collector.statusBody();
+    const httpHookSpool = status.hookSpool as Record<string, unknown> | null;
+    const statusCli = await runCli(home, root, ["status"]);
+    const cliHookSpool = parseJsonStdout(statusCli.stdout)?.hookSpool as
+      Record<string, unknown> | undefined;
+    const doctorCli = await runCli(home, root, ["doctor", "--read-only", "--json"]);
+    const doctorHookSpool = parseJsonStdout(doctorCli.stdout)?.hookSpool as
+      Record<string, unknown> | undefined;
+    check(
+      "w_status_and_doctor_report_the_intake_spool_counter",
+      hasHookSpoolFields(httpHookSpool) &&
+        httpHookSpool?.spooledAtIntake === 1 &&
+        httpHookSpool?.recovered === 1 &&
+        statusCli.status === 0 &&
+        hasHookSpoolFields(cliHookSpool) &&
+        cliHookSpool?.spooledAtIntake === 1 &&
+        cliHookSpool?.recovered === 1 &&
+        hasHookSpoolFields(doctorHookSpool) &&
+        doctorHookSpool?.spooledAtIntake === 1 &&
+        doctorHookSpool?.draining === true,
+      { http: httpHookSpool, status: cliHookSpool, doctor: doctorHookSpool },
+    );
+  } finally {
+    lock.release();
+    await collector.close();
+  }
+}
+
+/**
+ * (b) The managed Codex hook's own wire shape: a chunked `curl --data-binary @-`
+ * POST whose only credential is the `x-plimsoll-token` line curl read from the
+ * private 0600 header file, and no source header at all.
+ */
+async function caseTheIntakeSpoolsACurlShapedCodexPost() {
+  const { root, home } = fixtureHome("x");
+  const collector = await startCollector(home);
+  saveCollectorConfig(collectorConfigSchema.parse({ port: collector.port }));
+  const lock = holdWriteLock(collector.ledgerPath);
+  try {
+    const body = codexCurlHookBody(SESSION_INTAKE_CODEX);
+    const beforeMs = Date.now();
+    const posted = await postHookOverHttp(
+      collector.port,
+      "/hooks/codex",
+      {
+        "content-type": "application/json",
+        // The one line the managed header file holds (`x-plimsoll-token: …`),
+        // as curl would send it. No `x-plimsoll-source`.
+        "x-plimsoll-token": collector.auth.codexProducer!,
+        "user-agent": "curl/8.7.1",
+        accept: "*/*",
+      },
+      body,
+      { chunked: true },
+    );
+    const afterMs = Date.now();
+    const spooled = listHookSpoolFiles(home);
+    const bytes = spooled.length === 1 ? fs.readFileSync(spooled[0]!.path, "utf8") : "";
+    const envelope = spooled.length === 1
+      ? (JSON.parse(bytes) as Record<string, unknown>)
+      : null;
+    const receivedAtMs = typeof envelope?.receivedAt === "string"
+      ? Date.parse(envelope.receivedAt)
+      : Number.NaN;
+    check(
+      "x_a_curl_shaped_codex_post_on_a_busy_ledger_is_spooled_at_intake",
+      posted.status === 202 &&
+        posted.json?.status === "hook_spooled" &&
+        posted.json?.source === "codex" &&
+        spooled.length === 1 &&
+        envelope?.source === "codex" &&
+        envelope?.body === blankForbiddenRawContent(body)!.text &&
+        envelope?.blanked === 1 &&
+        receivedAtMs >= beforeMs &&
+        receivedAtMs <= afterMs &&
+        sessionRows(collector.buffer, SESSION_INTAKE_CODEX) === 0 &&
+        readHookSpoolCounters(home).spooledAtIntake === 1,
+      {
+        status: posted.status,
+        body: posted.json,
+        source: envelope?.source,
+        blanked: envelope?.blanked,
+        receivedAt: envelope?.receivedAt,
+        counters: readHookSpoolCounters(home),
+      },
+    );
+
+    lock.release();
+    collector.drain.start();
+    const drained = await waitForDrainedCounters(home, 1);
+    const observedAt = observedAtOf(collector.buffer, SESSION_INTAKE_CODEX);
+    const stampSkewMs = observedAt && typeof envelope?.receivedAt === "string"
+      ? Date.parse(observedAt) - Date.parse(envelope.receivedAt)
+      : Number.NaN;
+    check(
+      "x_the_codex_event_recovers_inside_15s_with_the_daemons_receive_time",
+      drained.settled &&
+        drained.elapsedMs <= RECOVERY_DEADLINE_MS &&
+        sessionRows(collector.buffer, SESSION_INTAKE_CODEX) === 1 &&
+        listHookSpoolFiles(home).length === 0 &&
+        drained.counters.recovered === 1 &&
+        drained.counters.spooledAtIntake === 1 &&
+        stampSkewMs === 0,
+      {
+        elapsedMs: drained.elapsedMs,
+        budgetMs: RECOVERY_DEADLINE_MS,
+        rows: sessionRows(collector.buffer, SESSION_INTAKE_CODEX),
+        counters: drained.counters,
+        observedAt,
+        envelopeReceivedAt: envelope?.receivedAt,
+        stampSkewFromEnvelopeMs: stampSkewMs,
+      },
+    );
+
+    const row = collector.buffer.database
+      .prepare("select source, event_type as eventType from buffered_events where session_id = ?")
+      .get(SESSION_INTAKE_CODEX) as { source?: string; eventType?: string } | undefined;
+    const doctorCli = await runCli(home, root, ["doctor", "--read-only", "--json"]);
+    const doctorHookSpool = parseJsonStdout(doctorCli.stdout)?.hookSpool as
+      Record<string, unknown> | undefined;
+    check(
+      "x_the_recovered_codex_row_is_attributed_and_the_counter_reaches_doctor",
+      row?.source === "codex" &&
+        hasHookSpoolFields(doctorHookSpool) &&
+        doctorHookSpool?.spooledAtIntake === 1 &&
+        doctorHookSpool?.recovered === 1,
+      { row, doctor: doctorHookSpool },
+    );
+  } finally {
+    lock.release();
+    await collector.close();
+  }
+}
+
+/**
+ * (c)–(f) Everything the intake must NOT spool, each against a real collector.
+ */
+async function caseTheIntakeSpoolsNothingElse() {
+  // (c) 408 while the body is still arriving: there is nothing whole to spool.
+  {
+    const { home } = fixtureHome("y1");
+    const collector = await startCollector(home);
+    const lock = holdWriteLock(collector.ledgerPath);
+    try {
+      const raw = await postNeverFinishedBody(collector.port, collector.auth.claudeCodeProducer!);
+      check(
+        "y_a_408_while_the_body_is_still_arriving_is_not_spooled_at_intake",
+        raw.startsWith("HTTP/1.1 408") &&
+          raw.includes("request_deadline_exceeded") &&
+          listHookSpoolFiles(home).length === 0 &&
+          !fs.existsSync(hookSpoolDirectory(home)) &&
+          readHookSpoolCounters(home).spooledAtIntake === 0,
+        {
+          statusLine: raw.split("\r\n")[0],
+          pending: listHookSpoolFiles(home).length,
+          spoolDirectoryCreated: fs.existsSync(hookSpoolDirectory(home)),
+        },
+      );
+    } finally {
+      lock.release();
+      await collector.close();
+    }
+  }
+
+  // (d) An unauthorized post while the ledger is busy: refused before the
+  // ledger is ever touched, so there is nothing to spool and nothing is.
+  {
+    const { home } = fixtureHome("y2");
+    const collector = await startCollector(home);
+    const lock = holdWriteLock(collector.ledgerPath);
+    try {
+      const posted = await postHookOverHttp(
+        collector.port,
+        "/hooks/claude-code",
+        {
+          "content-type": "application/json",
+          "x-plimsoll-token": crypto.randomBytes(32).toString("base64url"),
+        },
+        claudeHttpHookBody(SESSION_INTAKE_UNAUTHORIZED, "unauthorized"),
+      );
+      check(
+        "y_an_unauthorized_post_on_a_busy_ledger_is_refused_and_spools_nothing",
+        (posted.status === 401 || posted.status === 403) &&
+          posted.json?.error === "collector_request_rejected" &&
+          listHookSpoolFiles(home).length === 0 &&
+          !fs.existsSync(hookSpoolDirectory(home)) &&
+          sessionRows(collector.buffer, SESSION_INTAKE_UNAUTHORIZED) === 0,
+        {
+          status: posted.status,
+          body: posted.json,
+          spoolDirectoryCreated: fs.existsSync(hookSpoolDirectory(home)),
+        },
+      );
+    } finally {
+      lock.release();
+      await collector.close();
+    }
+  }
+
+  // (e) The kill switch: the intake answers exactly what it answers today.
+  {
+    const { home } = fixtureHome("y3");
+    setEnv("PLIMSOLL_HOOK_SPOOL", "off");
+    const collector = await startCollector(home);
+    const lock = holdWriteLock(collector.ledgerPath);
+    try {
+      const posted = await postHookOverHttp(
+        collector.port,
+        "/hooks/claude-code",
+        {
+          "content-type": "application/json",
+          "x-plimsoll-token": collector.auth.claudeCodeProducer!,
+        },
+        claudeHttpHookBody(SESSION_INTAKE_KILLED, "kill switch"),
+      );
+      check(
+        "y_the_kill_switch_leaves_the_intake_answering_503_storage_busy_retry",
+        posted.status === 503 &&
+          posted.json?.error === "collector_request_rejected" &&
+          posted.json?.reason === "storage_busy_retry" &&
+          !fs.existsSync(hookSpoolDirectory(home)) &&
+          collector.drain.status().enabled === false,
+        {
+          status: posted.status,
+          body: posted.json,
+          spoolDirectoryCreated: fs.existsSync(hookSpoolDirectory(home)),
+        },
+      );
+    } finally {
+      lock.release();
+      await collector.close();
+      setEnv("PLIMSOLL_HOOK_SPOOL", undefined);
+    }
+  }
+
+  // (f) Bounds exhausted: the spool write fails, so the answer is today's 503
+  // and the loss stays visible — the directory does not grow past its bound.
+  {
+    const { home } = fixtureHome("y4");
+    const collector = await startCollector(home, { hookSpoolLimits: { maxFiles: 1 } });
+    const lock = holdWriteLock(collector.ledgerPath);
+    try {
+      const captured = await captureWarnings(async () => {
+        const first = await postHookOverHttp(
+          collector.port,
+          "/hooks/claude-code",
+          {
+            "content-type": "application/json",
+            "x-plimsoll-token": collector.auth.claudeCodeProducer!,
+          },
+          claudeHttpHookBody(SESSION_INTAKE_BOUNDED, "first"),
+        );
+        const second = await postHookOverHttp(
+          collector.port,
+          "/hooks/claude-code",
+          {
+            "content-type": "application/json",
+            "x-plimsoll-token": collector.auth.claudeCodeProducer!,
+          },
+          claudeHttpHookBody("4e5f6071-8293-4a4b-85c6-d7e8f9a0b1c2", "second"),
+        );
+        return { first, second };
+      });
+      const warnings = parsedWarnings(captured.lines);
+      const busyRejection = warnings.find(
+        (line) =>
+          line.error === "collector_request_rejected" && line.reason === "storage_busy_retry",
+      );
+      check(
+        "y_an_exhausted_spool_bound_leaves_the_intake_answering_503_storage_busy_retry",
+        captured.result.first.status === 202 &&
+          captured.result.first.json?.status === "hook_spooled" &&
+          captured.result.second.status === 503 &&
+          captured.result.second.json?.reason === "storage_busy_retry" &&
+          listHookSpoolFiles(home).length === 1 &&
+          readHookSpoolCounters(home).spooledAtIntake === 1 &&
+          spoolFileNames(hookSpoolDirectory(home)).every((name) => !name.endsWith(".tmp")) &&
+          // The rejection the operator sees is the real one: the post that
+          // could not be spooled, and only it.
+          busyRejection !== undefined &&
+          warnings.filter((line) => line.status === "hook_spooled_at_intake").length === 1,
+        {
+          first: captured.result.first.status,
+          second: captured.result.second,
+          pending: listHookSpoolFiles(home).length,
+          counters: readHookSpoolCounters(home),
+          names: spoolFileNames(hookSpoolDirectory(home)),
+          busyRejection,
+        },
+      );
+    } finally {
+      lock.release();
+      await collector.close();
+    }
+  }
+}
+
+/**
+ * (g) The blanking, through the intake path: the review r2 F2 body, posted on
+ * the wire, must leave the same file the client's spool would have left.
+ * (h) The per-interval summary an operator reads in `collector.err.log`.
+ */
+async function caseTheIntakeBlanksAndSummarizes() {
+  const { home } = fixtureHome("z");
+  // The intake's summary window is the rejection aggregator's own 60 s window;
+  // the injectable clock is how this case crosses it without waiting a minute.
+  let diagnosticsNowMs = Date.now();
+  const collector = await startCollector(home, { diagnosticsNowMs: () => diagnosticsNowMs });
+  const session = "5f607182-93a4-4b5c-86d7-e8f9a0b1c2d3";
+  const lock = holdWriteLock(collector.ledgerPath);
+  try {
+    const body = postToolUseBodyWithPaths(session);
+    const captured = await captureWarnings(async () => {
+      const first = await postHookOverHttp(
+        collector.port,
+        "/hooks/claude-code",
+        {
+          "content-type": "application/json",
+          "x-plimsoll-token": collector.auth.claudeCodeProducer!,
+        },
+        body,
+      );
+      // Same window: counted, not announced.
+      const second = await postHookOverHttp(
+        collector.port,
+        "/hooks/claude-code",
+        {
+          "content-type": "application/json",
+          "x-plimsoll-token": collector.auth.claudeCodeProducer!,
+        },
+        claudeHttpHookBody("60718293-a4b5-4c6d-87e8-f9a0b1c2d3e4", "second in window"),
+      );
+      // One interval later: the closed window is summarized, a new one opens.
+      diagnosticsNowMs += REJECTION_SUMMARY_INTERVAL_MS + 1;
+      const third = await postHookOverHttp(
+        collector.port,
+        "/hooks/claude-code",
+        {
+          "content-type": "application/json",
+          "x-plimsoll-token": collector.auth.claudeCodeProducer!,
+        },
+        claudeHttpHookBody("718293a4-b5c6-4d7e-88f9-a0b1c2d3e4f5", "next window"),
+      );
+      return { first, second, third };
+    });
+
+    const spooled = listHookSpoolFiles(home);
+    const firstFile = spooled[0];
+    const bytes = firstFile ? fs.readFileSync(firstFile.path, "utf8") : "";
+    const envelope = firstFile ? (JSON.parse(bytes) as Record<string, unknown>) : null;
+    const spooledBody = typeof envelope?.body === "string"
+      ? (JSON.parse(envelope.body) as Record<string, unknown>)
+      : null;
+    // Everything the paths disclose, and the one place it is allowed to appear.
+    const withoutAllowlisted = bytes.split(JSON.stringify(WORKING_DIRECTORY).slice(1, -1)).join("");
+    const leaked = [ACCOUNT_NAME, CLIENT_DIRECTORY, EDITED_FILE, TRANSCRIPT_FILE, PROMPT_CANARY]
+      .filter((needle) => withoutAllowlisted.includes(needle));
+    check(
+      "z_the_intake_spool_file_holds_only_the_allowlisted_path_value",
+      captured.result.first.status === 202 &&
+        spooled.length === 3 &&
+        spooledBody !== null &&
+        spooledBody.transcript_path === "" &&
+        spooledBody.tool_input === "" &&
+        spooledBody.prompt === "" &&
+        spooledBody.cwd === WORKING_DIRECTORY &&
+        spooledBody.tool_name === "Edit" &&
+        envelope?.blanked === 3 &&
+        leaked.length === 0 &&
+        // The same rule the client's spool applies, byte for byte.
+        envelope?.body === blankForbiddenRawContent(body)!.text,
+      {
+        blanked: envelope?.blanked,
+        keptCwd: spooledBody?.cwd,
+        blankedValues: {
+          transcript_path: spooledBody?.transcript_path,
+          tool_input: spooledBody?.tool_input,
+          prompt: spooledBody?.prompt,
+        },
+        leakedOutsideTheAllowlistedValue: leaked,
+        pending: spooled.length,
+      },
+    );
+
+    const warnings = parsedWarnings(captured.lines);
+    const firsts = warnings.filter((line) => line.status === "hook_spooled_at_intake");
+    const summaries = warnings.filter((line) => line.status === "hook_spooled_at_intake_summary");
+    const bodyNeedles = [ACCOUNT_NAME, CLIENT_DIRECTORY, EDITED_FILE, TRANSCRIPT_FILE, PROMPT_CANARY];
+    check(
+      "z_the_intake_summary_line_carries_the_interval_count_and_client_class",
+      // Two windows, two announced firsts, one closed-window summary.
+      firsts.length === 2 &&
+        summaries.length === 1 &&
+        summaries[0]!.count === 2 &&
+        summaries[0]!.suppressed === 1 &&
+        summaries[0]!.intervalMs === REJECTION_SUMMARY_INTERVAL_MS &&
+        typeof summaries[0]!.clientClass === "string" &&
+        readHookSpoolCounters(home).spooledAtIntake === 3 &&
+        // Counts and a class, never a body and never a path.
+        bodyNeedles.every((needle) => !captured.lines.join("\n").includes(needle)),
+      {
+        firsts,
+        summaries,
+        counters: readHookSpoolCounters(home),
+        lines: captured.lines,
+      },
+    );
+  } finally {
+    lock.release();
+    await collector.close();
+  }
+}
+
 async function main() {
   // Stage markers on stderr: a hosted-runner hang has to name the case it hung
   // in without waiting for the final report.
@@ -2381,6 +3106,14 @@ async function main() {
     await caseACollectorTooOldToDrainSaysSo();
     stage("t_draining_needs_a_drain");
     caseDrainingIsFalseWhenNothingCanDrain();
+    stage("w_intake_http_hook");
+    await caseTheIntakeSpoolsAnHttpHookPost();
+    stage("x_intake_curl_codex_hook");
+    await caseTheIntakeSpoolsACurlShapedCodexPost();
+    stage("y_intake_spools_nothing_else");
+    await caseTheIntakeSpoolsNothingElse();
+    stage("z_intake_blanking_and_summary");
+    await caseTheIntakeBlanksAndSummarizes();
     stage("report");
   } finally {
     for (const [key, value] of previousEnv) {
