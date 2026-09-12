@@ -76,9 +76,10 @@ delivery is viable again, but `enqueueRaw` refuses any delivery id that already
 carries a receipt, so those receipts were terminal.
 
 This command is the compensating control for the one-way door above: a proven
-witness dead-letters every delivery of the rejected source in a single cycle
-rather than holding them behind a host-wide circuit, and `upload-replay` is the
-recovery path that brings them back once the cloud contract is fixed.
+witness dead-letters every delivery of the rejected source that the cycle
+isolates, with the rest deferred to the next cycle, instead of the whole host
+being held by a circuit — and `upload-replay` is the recovery path that brings
+them back once the cloud contract is fixed.
 
 ```
 plimsoll upload-replay --reason <receipt reason> [--since <ISO-8601>] [--limit N] [--dry-run]
@@ -100,7 +101,11 @@ no-op. `--limit` defaults to 500 and is capped at 5000, and the transaction is
 bounded by rows, raw bytes and `busy_timeout` like the migration scan. The row
 limit is a budget for work: an already-replayed delivery is still reported as
 skipped, but it never consumes a slot, so a host with a lifetime of replays
-still re-queues the dead letters written today. When a full `--limit` of
+still re-queues the dead letters written today. The skip report is not bounded
+by `--limit` either — the inert arm is selected unbounded (two primary-key
+lookups per row), so 3 already-replayed rows are reported as 3 at `--limit 1`.
+A delivery that was replayed and then died again is one pool row, not two, so it
+costs one slot and is counted once. When a full `--limit` of *actionable*
 candidates re-queues nothing, the JSON carries a `hint` naming `--since`.
 
 Output is one JSON object:
@@ -111,10 +116,12 @@ Output is one JSON object:
   "dryRun": false }
 ```
 
-`hint` appears only when `requeued` is 0 and `selected` reached `--limit`:
+`hint` appears only when `requeued` is 0 and the *actionable* arm of the
+selection reached `--limit` — never because inert already-replayed rows filled
+it, since neither `--since` nor a larger `--limit` could change that result:
 
 ```json
-{ "hint": "selected 500 candidates and re-queued none at --limit 500: narrow the window with --since <ISO-8601> or raise --limit. Already-replayed deliveries are reported as skipped but never consume the limit." }
+{ "hint": "selected 500 actionable candidates and re-queued none at --limit 500: narrow the window with --since <ISO-8601> or raise --limit. Already-replayed deliveries are reported as skipped but never consume the limit." }
 ```
 
 `delivery-ack.ts` is intentionally byte-identical in the two separately versioned repositories. Keep both copies and contract fixtures aligned. Collector proofs are `scripts/delivery-transport-proof.ts`, `scripts/outbox-proof.ts`, `scripts/upload-replay-proof.ts`, and `scripts/join-isolation-proof.ts`. Cloud `scripts/delivery-ack-proof.ts` requires `PLIMSOLL_DELIVERY_FIXTURE=1` and a disposable loopback database named `plimsoll_delivery_fixture`. Hosted deployment, independent integration review and fleet acceptance remain release-owner work.

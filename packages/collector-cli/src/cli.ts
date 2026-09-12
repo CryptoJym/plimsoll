@@ -268,8 +268,9 @@ Commands:
                         is safe to run while the upload circuit is open. This is the
                         recovery path for the one-way door in the upload cycle: once a
                         durable validation witness proves the endpoint contract, every
-                        delivery of the rejected source is dead-lettered in that one
-                        cycle instead of being held by a host-wide circuit.
+                        delivery of the rejected source that the cycle isolates is
+                        dead-lettered per delivery and the rest are deferred to the next
+                        cycle, instead of the whole host being held by a circuit.
   push-repo-labels      Disclose repo display names to the joined workspace so dashboards
                         show github.com/owner/name instead of sha256 hashes. Previews the
                         exact payload first; --dry-run to only preview.
@@ -336,10 +337,11 @@ Config tools:
       Local reasons are refused. --limit defaults to 500 and is capped at 5000; --since
       filters on when the delivery died. A delivery already re-queued or already
       acknowledged is counted as skipped, so re-running is a no-op — and an
-      already-replayed row never consumes a slot of --limit, so a lifetime of replays
-      can never crowd out a dead letter written today. When a full --limit re-queues
-      nothing the JSON carries a hint naming --since. --dry-run classifies with zero
-      writes.
+      already-replayed row never consumes a slot of --limit and is never truncated by
+      it, so a lifetime of replays can never crowd out or hide a dead letter written
+      today. When a full --limit of ACTIONABLE candidates re-queues nothing the JSON
+      carries a hint naming --since; inert skips alone never raise it. --dry-run
+      classifies with zero writes.
   push-repo-labels [--dry-run] [--yes] [--url URL]
   sync-outcomes --repository owner/repo [--since-days 30] [--rework-window-days 14] [--until ISO] [--dry-run] [--url URL]
       Same fetch surface as the local efficiency report (pull list, check-runs and
