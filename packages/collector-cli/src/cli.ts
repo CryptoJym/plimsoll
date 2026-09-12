@@ -150,11 +150,13 @@ import {
   applyClaudeSettings,
   applyCodexConfig,
   applyGeminiSettings,
+  applyGrokHookHeaderFile,
   applyGrokHookFile,
   diagnoseManagedGrokHookCommand,
   generateClaudeCodeSettings,
   generateCodexConfigToml,
   generateGeminiCliSettings,
+  generateGrokHookHeader,
   generateGrokHookSettings,
   generateSetupInstructions,
 } from "../../collector-config/src/index";
@@ -2582,6 +2584,7 @@ async function main() {
     const codexFile = argValue("--codex-config") ?? path.join(os.homedir(), ".codex", "config.toml");
     const grokHome = resolveGrokHome().home;
     const grokFile = argValue("--grok-hooks") ?? path.join(grokHome, "hooks", "plimsoll.json");
+    const grokHeaderFile = path.join(path.dirname(grokFile), "plimsoll.headers");
     // Setup is the installer: it provisions the Plimsoll-local credentials so
     // generated tool configs bind each producer to its own source-bound token.
     // Planning may need producer tokens, but provisioning them belongs only
@@ -2596,8 +2599,9 @@ async function main() {
       codexProducerToken: localAuth.codexProducer,
       geminiCliProducerToken: localAuth.geminiCliProducer,
       grokProducerToken: localAuth.grokProducer,
+      grokHeaderFile,
     };
-    type SetupTargetName = "claude" | "gemini" | "grok" | "codex";
+    type SetupTargetName = "claude" | "gemini" | "grokHeaders" | "grok" | "codex";
     type SetupTarget = {
       name: SetupTargetName;
       path: string;
@@ -2622,6 +2626,12 @@ async function main() {
           applyGeminiSettings(geminiFile, generateGeminiCliSettings(options), { dryRun: preview }),
       },
       {
+        name: "grokHeaders",
+        path: grokHeaderFile,
+        run: (options, preview) =>
+          applyGrokHookHeaderFile(grokHeaderFile, generateGrokHookHeader(options), { dryRun: preview }),
+      },
+      {
         name: "grok",
         path: grokFile,
         run: (options, preview) =>
@@ -2642,6 +2652,11 @@ async function main() {
         return { target, refusal: error instanceof Error ? error.message : String(error) };
       }
     });
+    const plannedGrokHeaders = planned.find((state) => state.target.name === "grokHeaders");
+    const plannedGrokHook = planned.find((state) => state.target.name === "grok");
+    if (plannedGrokHeaders?.refusal && plannedGrokHook && !plannedGrokHook.refusal) {
+      plannedGrokHook.refusal = `${grokFile}: dependent managed header target was refused.`;
+    }
     for (const state of planned) {
       for (const entry of state.plan?.plan ?? []) {
         console.log(`${state.target.path}: ${entry.key} ${entry.action}`);
@@ -2697,14 +2712,23 @@ async function main() {
       grokProducerToken: appliedAuth.grokProducer,
     };
     if (configRead?.status === "missing") loadCollectorConfig();
+    let grokHeadersApplied = true;
     const applied: SetupTargetState[] = planned.map((state) => {
-      if (state.refusal) return state;
+      if (state.target.name === "grok" && !grokHeadersApplied) {
+        return { target: state.target, refusal: `${grokFile}: dependent managed header target was refused.` };
+      }
+      if (state.refusal) {
+        if (state.target.name === "grokHeaders") grokHeadersApplied = false;
+        return state;
+      }
       try {
         const result = state.target.run(appliedToolOptions, false);
+        if (state.target.name === "grokHeaders" && result.conflict) grokHeadersApplied = false;
         return result.conflict
           ? { target: state.target, plan: result, refusal: result.conflict }
           : { target: state.target, plan: result };
       } catch (error) {
+        if (state.target.name === "grokHeaders") grokHeadersApplied = false;
         return {
           target: state.target,
           refusal: error instanceof Error ? error.message : String(error),
@@ -2806,6 +2830,7 @@ async function main() {
     const claudePath = path.join(os.homedir(), ".claude", "settings.json");
     const codexPath = path.join(os.homedir(), ".codex", "config.toml");
     const grokHookPath = path.join(resolveGrokHome().home, "hooks", "plimsoll.json");
+    const grokHeaderPath = path.join(path.dirname(grokHookPath), "plimsoll.headers");
     // Doctor is read-only: it compares against provisioned credentials when
     // they exist and never creates the credential file as a side effect.
     const localAuth = readLocalIngestAuth(collectorHome());
@@ -2819,6 +2844,7 @@ async function main() {
             codexProducerToken: localAuth.codexProducer,
             geminiCliProducerToken: localAuth.geminiCliProducer,
             grokProducerToken: localAuth.grokProducer,
+            grokHeaderFile: grokHeaderPath,
           }
         : {}),
     };
@@ -3393,12 +3419,14 @@ async function main() {
     const tool = process.argv[3] ?? "all";
     // Printing stays side-effect free: tokens appear only when provisioned.
     const localAuth = readLocalIngestAuth(collectorHome());
+    const grokHeaderFile = path.join(resolveGrokHome().home, "hooks", "plimsoll.headers");
     const options = {
       repoRoot: optionValue("--repo-root") ?? process.cwd(),
       port: config.port,
       dataMode: flag("--evidence") ? "evidence" as const : config.policy.dataMode,
       confirmEvidence: flag("--confirm-evidence"),
       pnpmCommand: optionValue("--pnpm") ?? "pnpm",
+      grokHeaderFile,
       ...(localAuth
         ? {
             claudeCodeProducerToken: localAuth.claudeCodeProducer,
