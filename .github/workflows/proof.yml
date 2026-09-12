@@ -140,6 +140,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:claude-seats-apply
 
+      - name: Prove managed Codex seat profile reconciliation (eco-6hoxj.52)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-profiles-apply
+
       - name: Prove managed-config apply fails closed outside a fixture root
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:fixture-root-guard

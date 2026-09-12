@@ -3,6 +3,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { CLAUDE_SEATS_DIRECTORY } from "./claude-seats";
+import { CODEX_PROFILES_DIRECTORY } from "./codex-profiles";
 
 /**
  * Fixture-root contract (issue 0071): managed-config apply always takes an
@@ -22,6 +23,10 @@ export const FIXTURE_ROOT_ENV = "PLIMSOLL_FIXTURE_ROOT";
 const MANAGED_HOME_DIRECTORIES = [
   ".grok",
   ".codex",
+  // Fleet Codex seat profiles: `setup` now merges the managed hooks and the
+  // [otel] fragment into every ~/.codex-profiles/<slug>/config.toml, so a proof
+  // must be refused there for the same reason it is refused in ~/.codex.
+  CODEX_PROFILES_DIRECTORY,
   ".claude",
   // Fleet Claude seat homes: `setup` now merges managed telemetry into every
   // ~/.claude-seats/<slug>/settings.json, so a proof must be refused there for
