@@ -143,6 +143,9 @@ jobs:
       - name: Prove managed Codex seat profile reconciliation (eco-6hoxj.52)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-profiles-apply
+      - name: Prove append-only capture-root registration (eco-6hoxj.53)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:capture-roots-add
 
       - name: Prove producer-token rotation covers the Codex seat profiles (eco-6hoxj.54)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

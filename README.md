@@ -156,6 +156,66 @@ fails `setup`, whose own declared targets still decide the exit code.
 `telemetry.codexProfiles` and flags an unmanaged or unreadable one with
 `codex_profile_config_unmanaged`, again without changing the readiness verdict.
 
+Telemetry `setup` manages a seat's *config*; what the collector *captures* from
+is its capture-root inventory (`collector.config.json` → `captureRoots[]`),
+which is minted once, at enrollment. A host that gains a native root later — a
+new Claude seat's `projects/`, a new Codex profile's `sessions/`, or a
+`~/.claude/projects` an older enrollment never registered — keeps emitting
+spans while its transcripts and rollouts go uncaptured. `capture-roots` closes
+that gap without touching enrollment:
+
+```bash
+# what native roots exist under $HOME, and which are already registered
+plimsoll capture-roots discover --json     # state: registered | candidate | missing
+
+# preview, then append one (repeat --directory to add several at once)
+plimsoll capture-roots add --source claude_code --directory ~/.claude/projects \
+  --machine <fleet label> --dry-run
+plimsoll capture-roots add --source claude_code --directory ~/.claude/projects \
+  --machine <fleet label>
+```
+
+`add` is append-only. It derives the new root's identity exactly as the
+enrolled roots' identities derive, and refuses — with a reason code and no
+write — a duplicate directory or id, a path that is not a physical directory,
+a path outside `$HOME`, an unknown source, a new directory whose contents
+cannot be enumerated unambiguously (`capture_root_scan_ambiguous`), a config
+that would lose a top-level field this schema does not know
+(`append_only_violation`), or a config whose existing roots do not reproduce
+their own ids under the label given (`identity_derivation_mismatch`).
+
+The identity is derived from the host's **fleet machine label**, which is
+stored nowhere — only its digests are. It is not derived from the hostname, so
+on a fleet host **`--machine <fleet label>` is the expected form**: `add`
+recovers the label from the roots already configured only when a hostname
+candidate happens to reproduce their ids, and otherwise refuses
+`identity_machine_unresolved` (distinct from `identity_derivation_mismatch`,
+which means a label *was* given and this config contradicts it).
+
+A real run stops the collector through the same path as `unload-launch-agent`,
+writes a timestamped backup, fences the new root by recording the files it
+already holds as pre-existing generations — so those transcripts and rollouts
+are excluded rather than replayed as today's work — writes the config
+transactionally, starts the collector again and verifies it, then writes a
+receipt (before/after config sha256, the roots added, the generations fenced,
+restart result) under `<collector home>/receipts/`. The fence is scoped to the
+new directory: the provider's baseline cutoff is **not** moved, so every root
+already registered keeps capturing exactly what it was capturing. Top-level
+config fields this schema does not know are carried through the write
+untouched and listed in the receipt as `carriedUnknownKeys`.
+
+Nothing is left half-applied. Whatever fails after the collector is stopped,
+`add` starts it again, records the failed step and the resulting state in the
+receipt (`recovery` is either `config_unchanged_restored_state_matches_backup`
+— the file is byte-identical to the backup — or
+`config_applied_collector_restarted`), and exits 1. A restart or daemon
+verification that does not come back also exits 1 with the failed step named.
+Without an installed LaunchAgent the restart is skipped and the receipt says
+so. Existing roots, the installation epoch and every other enrollment field
+are never changed. `plimsoll doctor --read-only --json` reports what is still
+unregistered under `captureRoots.unregisteredCandidates` — like the seat
+diagnostic, it does not change doctor's readiness verdict.
+
 The Grok and Codex hook commands carry no secret: each reads its producer
 token from a mode-0600 `plimsoll.headers` file beside its own config
 (`${GROK_HOME:-~/.grok}/hooks/plimsoll.headers` and `~/.codex/plimsoll.headers`),

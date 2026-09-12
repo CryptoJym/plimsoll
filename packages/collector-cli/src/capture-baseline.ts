@@ -107,6 +107,18 @@ export type CaptureBaselineStatus = {
   sources: CaptureBaselineSourceStatus[];
 };
 
+/** Receipt of a per-root generation fence (bead eco-6hoxj.53). */
+export type CaptureBaselineSealResult = {
+  source: HistoryCoverageSource;
+  /** True only when at least one generation row was actually written. */
+  sealed: boolean;
+  runId: string | null;
+  filesObserved: number;
+  generationsSealed: number;
+  observationsRejected: number;
+  reason: "baseline_not_complete" | null;
+};
+
 export type BeginCaptureBaselineInput = {
   startedAt: string;
   filesDiscovered: number;
@@ -593,6 +605,100 @@ export function advanceCaptureBaselineEnrollment(database: Database.Database, st
   database.prepare(`update ${STATE_TABLE} set
     status = case when status = 'complete' then 'in_progress' else status end,
     started_at = ?, updated_at = ?, completed_at = null`).run(startedAt, startedAt);
+}
+
+/**
+ * Fence exactly the files a newly registered capture root already holds
+ * (bead eco-6hoxj.53), without touching the provider's baseline cutoff.
+ *
+ * Registering one root must not move `started_at`: that cutoff is keyed by
+ * source alone, so advancing it re-fences every root the provider already
+ * captures and silently stops their current sessions. Instead the new
+ * directory's present generations are inserted straight into the source's
+ * live run namespace, which is the state `classifyCaptureBaselineFile`
+ * reports as `exclude/preexisting_generation`. Every other root keeps
+ * capturing, and a file born in the new directory after this call has no row
+ * and is captured.
+ *
+ * The state row's counters move with the rows so the
+ * `filesBaselined === excludedGenerations` invariant `sourceStatus` enforces
+ * still holds. A source whose baseline is not complete is left alone: the
+ * tailer has not established its fence yet and will do so at first start,
+ * which already excludes everything present by then.
+ */
+export function sealCaptureBaselineGenerations(
+  database: Database.Database,
+  source: HistoryCoverageSource,
+  observations: readonly CaptureBaselineFileObservation[],
+  observedAt: string,
+): CaptureBaselineSealResult {
+  ensureCaptureBaselineSchema(database);
+  if (!validTimestamp(observedAt)) throw new Error("capture_baseline_invalid_observation_time");
+  const row = stateRow(database, source);
+  if (!row || !stateIsValid(row) || row.status !== "complete") {
+    return {
+      source,
+      sealed: false,
+      runId: null,
+      filesObserved: observations.length,
+      generationsSealed: 0,
+      observationsRejected: 0,
+      reason: "baseline_not_complete",
+    };
+  }
+  const runId = row.runId;
+  let generationsSealed = 0;
+  let observationsRejected = 0;
+  database.transaction(() => {
+    const current = stateRow(database, source);
+    if (!current || !stateIsValid(current) || current.status !== "complete" || current.runId !== runId) {
+      throw new Error("capture_baseline_seal_run_mismatch");
+    }
+    const insert = database.prepare(
+      `insert into ${GENERATION_TABLE} (
+         source, run_id, path_key, generation_key, baseline_size,
+         last_observed_size, history_covered_size, baselined_at,
+         last_observed_at, growth_observed_at, history_covered_at
+       ) values (?, ?, ?, ?, ?, ?, ?, ?, ?, null, null)
+       on conflict(source, run_id, generation_key) do nothing`,
+    );
+    for (const observation of observations) {
+      const normalized = normalizeObservation(observation);
+      // An unreadable or ambiguous stat is not fenced here. Classification
+      // blocks such a file on its own (`capture_baseline_stat_ambiguous`), so
+      // skipping it never opens a pre-existing transcript.
+      if (!normalized) { observationsRejected += 1; continue; }
+      generationsSealed += insert.run(
+        source,
+        runId,
+        normalized.pathKey,
+        normalized.generationKey,
+        normalized.size,
+        normalized.size,
+        normalized.size,
+        observedAt,
+        observedAt,
+      ).changes;
+    }
+    if (generationsSealed === 0) return;
+    database.prepare(
+      `update ${STATE_TABLE}
+       set updated_at = ?,
+         files_discovered = files_discovered + ?,
+         files_validated = files_validated + ?,
+         files_baselined = files_baselined + ?
+       where source = ? and run_id = ? and status = 'complete'`,
+    ).run(observedAt, generationsSealed, generationsSealed, generationsSealed, source, runId);
+  }).immediate();
+  return {
+    source,
+    sealed: generationsSealed > 0,
+    runId,
+    filesObserved: observations.length,
+    generationsSealed,
+    observationsRejected,
+    reason: null,
+  };
 }
 
 export function beginAutomaticCaptureBaseline(
