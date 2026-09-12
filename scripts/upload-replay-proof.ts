@@ -711,9 +711,10 @@ async function replayLimitCountsOnlyActionableProof() {
     (row) => freshIds.includes(row.id) && row.state === "dead",
   ).length;
 
-  // Nothing actionable is left, so a full `--limit` of inert rows re-queues
-  // nothing: the JSON must point the operator at `--since` rather than being
-  // a silent no-op.
+  // Nothing actionable is left. The run must still report every inert row it
+  // skipped — unbounded, not truncated to `--limit` (review r2, finding 2) —
+  // and must NOT raise the hint, whose advice cannot help here (finding 1,
+  // proven as its own check below).
   const stalled = buffer.delivery.replayDeadLetters({
     reason: "remote_validation_rejected",
     limit: 2,
@@ -722,7 +723,7 @@ async function replayLimitCountsOnlyActionableProof() {
   });
 
   record(
-    "replay_limit_counts_only_actionable_rows_and_hints_when_stalled",
+    "replay_limit_counts_only_actionable_rows_and_reports_every_inert_skip",
     firstReplay.requeued === 3 &&
       settled.uploadedEvents === 3 &&
       deadBefore.length === 2 &&
@@ -737,10 +738,13 @@ async function replayLimitCountsOnlyActionableProof() {
       limited.hint === undefined &&
       freshLive === 2 &&
       freshStillDead === 0 &&
-      stalled.selected === 2 &&
+      // 3 acknowledged + the 2 just re-queued: all five inert rows reported
+      // at `--limit 2`, and no hint, because nothing actionable saturated.
+      stalled.selected === 5 &&
       stalled.requeued === 0 &&
-      typeof stalled.hint === "string" &&
-      /--since/.test(stalled.hint ?? ""),
+      stalled.skipped.alreadyAcknowledged === 3 &&
+      stalled.skipped.alreadyActive === 2 &&
+      stalled.hint === undefined,
     {
       firstReplay,
       settledUploads: settled.uploadedEvents,
@@ -750,6 +754,228 @@ async function replayLimitCountsOnlyActionableProof() {
       freshStillDead,
       stalled,
     },
+  );
+  buffer.close();
+}
+
+// 8. Review r2, finding 1 (probe G): the hint's advice — narrow with --since,
+//    or raise --limit — can only help when the ACTIONABLE arm saturated the
+//    row budget. A host whose dead letters were all replayed and acknowledged
+//    has nothing actionable at any limit, so it must get no hint; the true
+//    positive, where a larger --limit really would reach a re-queueable row,
+//    must still raise it.
+async function replayHintGatesOnActionableSaturationProof() {
+  // Probe G: 3 lifetime replays, all acknowledged, nothing dead. --limit 2.
+  const settledHost = enabledBuffer();
+  await seedWitness(settledHost.cfg, settledHost.buffer, 200, 900);
+  const settledIds = [uuid(201), uuid(202), uuid(203)];
+  for (const n of [201, 202, 203]) settledHost.buffer.append(event(n, { source: "grok" }));
+  await uploadBufferedEvents(settledHost.cfg, settledHost.buffer, {
+    fetchImpl: sourceRejectingCloud(new Set(settledIds)),
+    now: () => instant(901),
+  });
+  const settledReplay = settledHost.buffer.delivery.replayDeadLetters({
+    reason: "remote_validation_rejected",
+    now: instant(902),
+  });
+  const acknowledged = await uploadBufferedEvents(settledHost.cfg, settledHost.buffer, {
+    fetchImpl: acceptingCloud(),
+    now: () => instant(903),
+  });
+  const steadyState = settledHost.buffer.delivery.replayDeadLetters({
+    reason: "remote_validation_rejected",
+    limit: 2,
+    dryRun: true,
+    now: instant(904),
+  });
+  settledHost.buffer.close();
+
+  // The true positive, on its own ledger: three dead letters, the two OLDEST
+  // of which lost their raw rows. --limit 2 selects exactly those two, so the
+  // run saturates the work budget and re-queues nothing — and raising the
+  // limit really does reach a re-queueable row, which the next run proves.
+  const stalledHost = enabledBuffer();
+  await seedWitness(stalledHost.cfg, stalledHost.buffer, 210, 920);
+  const stalledIds = [uuid(211), uuid(212), uuid(213)];
+  for (const n of [211, 212, 213]) stalledHost.buffer.append(event(n, { source: "grok" }));
+  await uploadBufferedEvents(stalledHost.cfg, stalledHost.buffer, {
+    fetchImpl: sourceRejectingCloud(new Set(stalledIds)),
+    now: () => instant(921),
+  });
+  // Deaths share a cycle timestamp, so `order by diedAt, deliveryId` makes the
+  // two oldest deterministic: uuid(211) and uuid(212).
+  for (const id of [stalledIds[0], stalledIds[1]]) {
+    stalledHost.buffer.database.prepare(`delete from buffered_events where id = ?`).run(id);
+  }
+  const saturated = stalledHost.buffer.delivery.replayDeadLetters({
+    reason: "remote_validation_rejected",
+    limit: 2,
+    dryRun: true,
+    now: instant(922),
+  });
+  const raised = stalledHost.buffer.delivery.replayDeadLetters({
+    reason: "remote_validation_rejected",
+    limit: 3,
+    dryRun: true,
+    now: instant(923),
+  });
+  stalledHost.buffer.close();
+
+  record(
+    "replay_hint_gates_on_actionable_saturation_not_inert_rows",
+    settledReplay.requeued === 3 &&
+      acknowledged.uploadedEvents === 3 &&
+      // Probe G: the limit is full of inert rows, so no hint.
+      steadyState.selected === 3 &&
+      steadyState.requeued === 0 &&
+      steadyState.skipped.alreadyAcknowledged === 3 &&
+      steadyState.hint === undefined &&
+      // True positive preserved: 2 actionable rows saturate --limit 2 and
+      // re-queue nothing, so --since / a larger --limit is real advice.
+      saturated.selected === 2 &&
+      saturated.requeued === 0 &&
+      saturated.skipped.missingRaw === 2 &&
+      typeof saturated.hint === "string" &&
+      /2 actionable candidates/.test(saturated.hint ?? "") &&
+      /--since/.test(saturated.hint ?? "") &&
+      // and raising it does reach the third row, so the hint told the truth.
+      raised.requeued === 1 &&
+      raised.hint === undefined,
+    { settledReplay, acknowledged: acknowledged.uploadedEvents, steadyState, saturated, raised },
+  );
+}
+
+// 9. Review r2, finding 2 (probe B): --limit is a budget for WORK, so it binds
+//    what is re-queued and never truncates the skip report. Three inert rows
+//    and two actionable ones at --limit 1: one re-queue, all three skips.
+async function replayReportsInertSkipsUnboundedProof() {
+  const { buffer, cfg } = enabledBuffer();
+  await seedWitness(cfg, buffer, 220, 940);
+  const inertIds = [uuid(221), uuid(222), uuid(223)];
+  for (const n of [221, 222, 223]) buffer.append(event(n, { source: "grok" }));
+  await uploadBufferedEvents(cfg, buffer, {
+    fetchImpl: sourceRejectingCloud(new Set(inertIds)),
+    now: () => instant(941),
+  });
+  buffer.delivery.replayDeadLetters({ reason: "remote_validation_rejected", now: instant(942) });
+  const settled = await uploadBufferedEvents(cfg, buffer, {
+    fetchImpl: acceptingCloud(),
+    now: () => instant(943),
+  });
+
+  const freshIds = [uuid(224), uuid(225)];
+  for (const n of [224, 225]) buffer.append(event(n, { source: "grok" }));
+  await uploadBufferedEvents(cfg, buffer, {
+    fetchImpl: sourceRejectingCloud(new Set(freshIds)),
+    now: () => instant(944),
+  });
+
+  const first = buffer.delivery.replayDeadLetters({
+    reason: "remote_validation_rejected",
+    limit: 1,
+    now: instant(945),
+  });
+  // The limit really did bind the work: the second actionable row is still
+  // dead and the next --limit 1 run re-queues it.
+  const second = buffer.delivery.replayDeadLetters({
+    reason: "remote_validation_rejected",
+    limit: 1,
+    now: instant(946),
+  });
+  const stillDead = receipts(buffer).filter(
+    (row) => freshIds.includes(row.id) && row.state === "dead",
+  ).length;
+
+  record(
+    "replay_reports_every_inert_skip_unbounded_by_limit",
+    settled.uploadedEvents === 3 &&
+      // 1 actionable slot + 3 inert rows reported in full, not truncated to 1.
+      first.selected === 4 &&
+      first.requeued === 1 &&
+      first.skipped.alreadyAcknowledged === 3 &&
+      first.skipped.alreadyActive === 0 &&
+      first.hint === undefined &&
+      // Second run: the first re-queue is now inert too (live in the outbox).
+      second.selected === 5 &&
+      second.requeued === 1 &&
+      second.skipped.alreadyAcknowledged === 3 &&
+      second.skipped.alreadyActive === 1 &&
+      stillDead === 0,
+    { settled: settled.uploadedEvents, first, second, stillDead },
+  );
+  buffer.close();
+}
+
+// 10. Review r2, note 4 (probe F): a delivery replayed and then dead again
+//     under the same reason carries BOTH an upload_replays.original_terminal_at
+//     and a fresh upload_receipts.terminal_at, so the raw union yields it
+//     twice. The pool groups by delivery id and keeps the first death, so it
+//     costs one slot of --limit and is counted once.
+async function replayCountsReDiedDeliveryOnceProof() {
+  const { buffer, cfg } = enabledBuffer();
+  await seedWitness(cfg, buffer, 230, 960);
+  const rejected = new Set([uuid(231)]);
+  buffer.append(event(231, { source: "grok" }));
+  await uploadBufferedEvents(cfg, buffer, {
+    fetchImpl: sourceRejectingCloud(rejected),
+    now: () => instant(961),
+  });
+  const firstDeath = (buffer.database
+    .prepare(`select terminal_at as at from upload_receipts where delivery_id = ?`)
+    .get(uuid(231)) as { at: string }).at;
+  buffer.delivery.replayDeadLetters({ reason: "remote_validation_rejected", now: instant(962) });
+  // The contract is still broken, so the same delivery dies a second time.
+  await uploadBufferedEvents(cfg, buffer, {
+    fetchImpl: sourceRejectingCloud(rejected),
+    now: () => instant(970),
+  });
+  const secondDeath = (buffer.database
+    .prepare(`select terminal_at as at from upload_receipts where delivery_id = ?`)
+    .get(uuid(231)) as { at: string }).at;
+
+  // The raw union the pool is built from — two rows, one delivery.
+  const unionRows = buffer.database
+    .prepare(
+      `select delivery_id as id, terminal_at as diedAt from upload_receipts
+        where terminal_state = 'dead' and reason = @reason
+       union all
+       select delivery_id as id, original_terminal_at as diedAt from upload_replays
+        where reason = @reason`,
+    )
+    .all({ reason: "remote_validation_rejected" }) as Array<{ id: string; diedAt: string }>;
+
+  const replayed = buffer.delivery.replayDeadLetters({
+    reason: "remote_validation_rejected",
+    limit: 5,
+    now: instant(971),
+  });
+  const ledgerRow = buffer.database
+    .prepare(
+      `select original_terminal_at as diedAt, replay_count as count from upload_replays
+        where delivery_id = ?`,
+    )
+    .get(uuid(231)) as { diedAt: string; count: number };
+  const live = (buffer.database
+    .prepare(`select count(*) as n from upload_outbox where delivery_id = ?`)
+    .get(uuid(231)) as { n: number }).n;
+
+  record(
+    "replay_counts_a_replayed_then_re_died_delivery_once",
+    firstDeath < secondDeath &&
+      // Two raw rows for one delivery is the shape being collapsed.
+      unionRows.length === 2 &&
+      new Set(unionRows.map((row) => row.id)).size === 1 &&
+      // One pool row: one slot spent, one re-queue, no phantom alreadyActive.
+      replayed.selected === 1 &&
+      replayed.requeued === 1 &&
+      replayed.skipped.alreadyActive === 0 &&
+      replayed.skipped.alreadyAcknowledged === 0 &&
+      replayed.hint === undefined &&
+      // The retained death is the FIRST one, and the row was replayed twice.
+      ledgerRow.diedAt === firstDeath &&
+      ledgerRow.count === 2 &&
+      live === 1,
+    { firstDeath, secondDeath, unionRows, replayed, ledgerRow, live },
   );
   buffer.close();
 }
@@ -862,6 +1088,9 @@ async function main() {
     await replayProof();
     await replayBoundsProof();
     await replayLimitCountsOnlyActionableProof();
+    await replayHintGatesOnActionableSaturationProof();
+    await replayReportsInertSkipsUnboundedProof();
+    await replayCountsReDiedDeliveryOnceProof();
     cliSurfaceProof();
     // Last: the post-loop witness gate is the only check that discriminates
     // the `validationWitnessProven` assignment at upload.ts:678, so a negative

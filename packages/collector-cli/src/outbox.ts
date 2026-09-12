@@ -884,6 +884,10 @@ export class DeliveryOutbox {
     // Fixed internal enum, never caller input: safe to inline as a SQL list.
     const replayableList = REPLAYABLE_RECEIPT_REASONS.map((value) => `'${value}'`).join(", ");
 
+    // How many actionable rows the selection returned: the hint gates on this
+    // arm saturating the row budget, never on the inert skip report.
+    let candidatesSelected = 0;
+
     const priorBusyTimeout = this.db.pragma("busy_timeout", { simple: true }) as number;
     this.db.pragma(`busy_timeout = ${REPLAY_BUSY_TIMEOUT_MS}`);
     try {
@@ -896,26 +900,38 @@ export class DeliveryOutbox {
       // by their *first* death, so charging them against the row limit let a
       // lifetime of replays crowd out a dead letter written today and the
       // recovery tool reported a full `selected` while re-queueing nothing
-      // (review r1, finding 2). The limit is a budget for work: actionable
-      // candidates and inert ones are selected separately, each bounded by it,
-      // so a skip is always reported and never consumes a slot.
+      // (review r1, finding 2). The limit is a budget for work: only the
+      // actionable arm is bounded by it. The inert arm is selected unbounded —
+      // it costs two primary-key lookups per row and nothing else — so the
+      // skip report is the whole truth rather than a number that silently
+      // shrinks with --limit (review r2, finding 2).
+      //
+      // A delivery that was replayed and then died again under the same reason
+      // carries both an `upload_replays.original_terminal_at` and a fresh
+      // `upload_receipts.terminal_at`, so the union yields it twice. Grouping
+      // the pool by delivery id and keeping the FIRST death collapses it to
+      // one row: it costs one slot of the work budget and is counted once
+      // (review r2, note 4).
       const rows = this.db
         .prepare(
           `with pool as (
-             select delivery_id as deliveryId, terminal_at as diedAt
-               from upload_receipts
-              where terminal_state = 'dead' and reason = @reason
-                and (@since is null or terminal_at >= @since)
-             union
-             select p.delivery_id as deliveryId, p.original_terminal_at as diedAt
-               from upload_replays p
-              where p.reason = @reason
-                and (@since is null or p.original_terminal_at >= @since)
-                and not exists (
-                  select 1 from upload_receipts r
-                   where r.delivery_id = p.delivery_id and r.terminal_state = 'dead'
-                     and r.reason not in (${replayableList})
-                )
+             select deliveryId, min(diedAt) as diedAt from (
+               select delivery_id as deliveryId, terminal_at as diedAt
+                 from upload_receipts
+                where terminal_state = 'dead' and reason = @reason
+                  and (@since is null or terminal_at >= @since)
+               union all
+               select p.delivery_id as deliveryId, p.original_terminal_at as diedAt
+                 from upload_replays p
+                where p.reason = @reason
+                  and (@since is null or p.original_terminal_at >= @since)
+                  and not exists (
+                    select 1 from upload_receipts r
+                     where r.delivery_id = p.delivery_id and r.terminal_state = 'dead'
+                       and r.reason not in (${replayableList})
+                  )
+             )
+             group by deliveryId
            ),
            classified as (
              select deliveryId, diedAt,
@@ -937,10 +953,8 @@ export class DeliveryOutbox {
               where actionable = 1 order by diedAt, deliveryId limit @limit
            )
            union all
-           select deliveryId, diedAt, actionable from (
-             select deliveryId, diedAt, actionable from classified
-              where actionable = 0 order by diedAt, deliveryId limit @limit
-           )`,
+           select deliveryId, diedAt, actionable from classified
+            where actionable = 0 order by diedAt, deliveryId`,
         )
         .all({ reason, since: sinceIso, limit }) as Array<{
           deliveryId: string;
@@ -949,6 +963,7 @@ export class DeliveryOutbox {
         }>;
       const candidates = rows.filter((row) => row.actionable === 1);
       const inert = rows.filter((row) => row.actionable === 0);
+      candidatesSelected = candidates.length;
 
       const activeStatement = this.db.prepare(
         `select 1 as active from upload_outbox where delivery_id = ?`,
@@ -1029,11 +1044,17 @@ export class DeliveryOutbox {
     } finally {
       this.db.pragma(`busy_timeout = ${priorBusyTimeout}`);
     }
-    if (summary.requeued === 0 && summary.selected >= limit) {
+    // The hint's advice — narrow with --since, or raise --limit — can only help
+    // when the *actionable* arm saturated the row budget, so that a different
+    // window or a larger limit would reach rows this run could not. Gating on
+    // `selected` instead fired it in the healthy steady state, where the limit
+    // was filled by inert rows that the same sentence says never consume it
+    // (review r2, finding 1).
+    if (summary.requeued === 0 && candidatesSelected >= limit) {
       summary.hint =
-        `selected ${summary.selected} candidates and re-queued none at --limit ${limit}: ` +
-        "narrow the window with --since <ISO-8601> or raise --limit. Already-replayed " +
-        "deliveries are reported as skipped but never consume the limit.";
+        `selected ${candidatesSelected} actionable candidates and re-queued none at ` +
+        `--limit ${limit}: narrow the window with --since <ISO-8601> or raise --limit. ` +
+        "Already-replayed deliveries are reported as skipped but never consume the limit.";
     }
     return summary;
   }
