@@ -36,6 +36,7 @@ import {
   rotateLocalProducerToken,
 } from "../packages/collector-cli/src/local-auth";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
+import { useFixtureRoot } from "./lib/fixture-root";
 
 type Check = { name: string; passed: true; detail: Record<string, unknown> };
 const checks: Check[] = [];
@@ -132,7 +133,12 @@ async function main() {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-codex-producer-token-proof-"));
   const operatorHome = process.env.HOME;
   const syntheticHome = path.join(sandbox, "must-remain-absent-home");
-  process.env.HOME = syntheticHome;
+  // Declare the fixture-root contract (eco-6hoxj.43): every managed apply in
+  // this proof, in-process or in a child `setup`/`rotate`, targets the sandbox.
+  const fixture = useFixtureRoot(sandbox, {
+    home: syntheticHome,
+    plimsollHome: path.join(sandbox, "fixture-plimsoll-home"),
+  });
   let commandServer: http.Server | undefined;
   let commandBuffer: LocalEventBuffer | undefined;
   try {
@@ -647,6 +653,7 @@ async function main() {
       await new Promise<void>((resolve) => commandServer!.close(() => resolve()));
     }
     commandBuffer?.close();
+    fixture.restore();
     if (operatorHome === undefined) delete process.env.HOME;
     else process.env.HOME = operatorHome;
     fs.rmSync(sandbox, { recursive: true, force: true });

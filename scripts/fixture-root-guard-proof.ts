@@ -30,10 +30,12 @@ import {
   applyCodexConfig,
   applyGeminiSettings,
   applyGrokHookFile,
+  applyCodexHookHeaderFile,
   applyGrokHookHeaderFile,
   generateClaudeCodeSettings,
   generateCodexConfigToml,
   generateGeminiCliSettings,
+  generateCodexHookHeader,
   generateGrokHookHeader,
   generateGrokHookSettings,
   managedConfigProofContext,
@@ -85,18 +87,21 @@ function refusal(run: () => unknown) {
 // Synthetic, never a real credential: the header template requires a
 // 43-character URL-safe producer token and this proof never prints it.
 const syntheticGrokToken = `fixture-root-guard-synthetic-grok-token${"-".repeat(4)}`;
+const syntheticCodexToken = `fixture-root-guard-synthetic-codex-token${"-".repeat(3)}`;
 
 const options = {
   repoRoot: "/synthetic/plimsoll/source",
   port: 49171,
   dataMode: "metadata" as const,
   grokProducerToken: syntheticGrokToken,
+  codexProducerToken: syntheticCodexToken,
 };
 
 /** Every managed target a `setup` run owns, keyed by the entry that applies it. */
 function managedTargets(home: string) {
   const grokHeaderFile = path.join(home, ".grok", "hooks", "plimsoll.headers");
-  const generated = { ...options, grokHeaderFile };
+  const codexHeaderFile = path.join(home, ".codex", "plimsoll.headers");
+  const generated = { ...options, grokHeaderFile, codexHeaderFile };
   return [
     {
       name: "claude",
@@ -117,6 +122,11 @@ function managedTargets(home: string) {
       name: "grok",
       file: path.join(home, ".grok", "hooks", "plimsoll.json"),
       apply: (file: string) => applyGrokHookFile(file, generateGrokHookSettings(generated)),
+    },
+    {
+      name: "codexHeaders",
+      file: codexHeaderFile,
+      apply: (file: string) => applyCodexHookHeaderFile(file, generateCodexHookHeader(generated)),
     },
     {
       name: "codex",
