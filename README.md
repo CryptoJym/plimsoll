@@ -123,6 +123,21 @@ pnpm report -- --repository your-org/your-repo   # after a few sessions: the eco
 you'd rather paste by hand. Managed hooks/exporters point only at
 `127.0.0.1:48271`. Nothing is configured behind your back.
 
+Claude Code can also run against a separate config home
+(`CLAUDE_CONFIG_DIR=~/.claude-seats/<slug>`), which fleet lanes use to keep one
+seat per account. Those sessions read the seat's own `settings.json`, not
+`~/.claude/settings.json`, so `setup` manages each of them as its own target,
+reported as `claudeSeat[<slug>]`: it discovers every
+`~/.claude-seats/*/settings.json` and merges exactly the same exporter
+environment and Plimsoll hooks it merges into `~/.claude/settings.json`, with
+the same additive merge, the same backups and the same second-run no-op. Your
+seat's own hooks and keys are preserved byte-for-byte, a seat directory without
+a `settings.json` is skipped rather than created, and a seat added later is
+picked up by the next `setup` run. `plimsoll doctor --read-only --json` lists
+each discovered seat under `telemetry.claudeSeats` and flags an unmanaged one
+with `claude_seat_settings_unmanaged` — a coverage diagnostic that does not
+change doctor's readiness verdict.
+
 The Grok and Codex hook commands carry no secret: each reads its producer
 token from a mode-0600 `plimsoll.headers` file beside its own config
 (`${GROK_HOME:-~/.grok}/hooks/plimsoll.headers` and `~/.codex/plimsoll.headers`),

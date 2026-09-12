@@ -2,6 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
+import { CLAUDE_SEATS_DIRECTORY } from "./claude-seats";
+
 /**
  * Fixture-root contract (issue 0071): managed-config apply always takes an
  * explicit target path — nothing here resolves a home for the caller. What
@@ -17,7 +19,17 @@ import path from "node:path";
 export const FIXTURE_ROOT_ENV = "PLIMSOLL_FIXTURE_ROOT";
 
 /** Managed tool roots a proof must never write inside the operator's real home. */
-const MANAGED_HOME_DIRECTORIES = [".grok", ".codex", ".claude", ".gemini", ".plimsoll"];
+const MANAGED_HOME_DIRECTORIES = [
+  ".grok",
+  ".codex",
+  ".claude",
+  // Fleet Claude seat homes: `setup` now merges managed telemetry into every
+  // ~/.claude-seats/<slug>/settings.json, so a proof must be refused there for
+  // the same reason it is refused in ~/.claude.
+  CLAUDE_SEATS_DIRECTORY,
+  ".gemini",
+  ".plimsoll",
+];
 
 export type ManagedConfigTargetCode =
   | "FIXTURE_ROOT_REQUIRED"

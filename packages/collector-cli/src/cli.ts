@@ -161,6 +161,7 @@ import {
   applyGrokHookFile,
   diagnoseManagedCodexHookCommand,
   diagnoseManagedGrokHookCommand,
+  discoverClaudeSeats,
   generateClaudeCodeSettings,
   generateCodexConfigToml,
   generateCodexHookHeader,
@@ -2667,10 +2668,23 @@ async function main() {
       grokHeaderFile,
       codexHeaderFile,
     };
-    type SetupTargetName = "claude" | "gemini" | "grokHeaders" | "grok" | "codexHeaders" | "codex";
+    // Seat discovery is a plain read of the process home: the seat tooling
+    // owns ~/.claude-seats/<slug>, so setup manages what is already there and
+    // a seat created later is picked up by the next run.
+    const claudeSeats = discoverClaudeSeats(os.homedir()).filter((seat) => seat.hasSettings);
+    type SetupTargetName =
+      | "claude"
+      | `claudeSeat[${string}]`
+      | "gemini"
+      | "grokHeaders"
+      | "grok"
+      | "codexHeaders"
+      | "codex";
     type SetupTarget = {
       name: SetupTargetName;
       path: string;
+      /** True for a target found on disk rather than declared by Plimsoll. */
+      discovered?: true;
       run: (options: typeof toolOptions, dryRun: boolean) => ReturnType<typeof applyCodexConfig>;
     };
     type SetupTargetState = {
@@ -2685,6 +2699,23 @@ async function main() {
         run: (options, preview) =>
           applyClaudeSettings(claudeFile, generateClaudeCodeSettings(options), { dryRun: preview }),
       },
+      // Fleet Claude seats (bead eco-6hoxj.48): every lane launched with
+      // CLAUDE_CONFIG_DIR=~/.claude-seats/<slug> reads that seat's
+      // settings.json instead of ~/.claude/settings.json, so it got no
+      // exporter and no hooks. Each discovered seat is its own target with the
+      // same managed content and the same additive merge as the `claude`
+      // target; the seat's own hooks and unknown keys survive untouched, and a
+      // seat directory without settings.json is skipped rather than created.
+      ...claudeSeats.map((seat): SetupTarget => ({
+        name: `claudeSeat[${seat.slug}]`,
+        path: seat.path,
+        discovered: true,
+        run: (options, preview) =>
+          applyClaudeSettings(seat.path, generateClaudeCodeSettings(options), {
+            dryRun: preview,
+            managedTarget: `claudeSeat[${seat.slug}]`,
+          }),
+      })),
       {
         name: "gemini",
         path: geminiFile,
@@ -2774,17 +2805,26 @@ async function main() {
             ...(changedStatus === "applied" ? { backup: state.plan?.backupPath ?? null } : {}),
           },
     ]));
-    const hasRefusal = planned.some((state) => Boolean(state.refusal));
+    // A discovered target is not Plimsoll's to own: the seat tooling writes
+    // ~/.claude-seats/<slug>/settings.json, so a seat file that is malformed or
+    // unreadable is reported in the JSON like any other refusal but never sets
+    // the exit code and never counts as a failed target. An installer or CI step
+    // that runs `plimsoll setup --yes` must not fail because another tool left
+    // one of N seats half-written; the six declared targets keep deciding the
+    // outcome exactly as before.
+    const ownedRefusal = (states: SetupTargetState[]) =>
+      states.some((state) => Boolean(state.refusal) && !state.target.discovered);
+    const hasOwnedRefusal = ownedRefusal(planned);
     const hasChange = planned.some((state) => !state.refusal && state.plan?.changed);
     if (dryRun) {
       console.log(JSON.stringify({ status: "setup_dry_run", targets: summarize(planned, "would_apply") }));
-      if (hasRefusal) process.exitCode = 1;
+      if (hasOwnedRefusal) process.exitCode = 1;
       return;
     }
     if (!hasChange) {
-      if (!hasRefusal && configRead?.status === "missing") loadCollectorConfig();
+      if (!hasOwnedRefusal && configRead?.status === "missing") loadCollectorConfig();
       console.log(JSON.stringify({ status: "setup_noop", targets: summarize(planned, "applied") }));
-      if (hasRefusal) process.exitCode = 1;
+      if (hasOwnedRefusal) process.exitCode = 1;
       return;
     }
     if (!yes) {
@@ -2854,7 +2894,7 @@ async function main() {
         2,
       ),
     );
-    if (applied.some((state) => Boolean(state.refusal))) process.exitCode = 1;
+    if (ownedRefusal(applied)) process.exitCode = 1;
     return;
   }
 
@@ -3103,6 +3143,27 @@ async function main() {
       codexHeaderFile: codexHeaderPath,
     };
     const claude = readClaudeTelemetryConfig(claudePath, generateClaudeCodeSettings(toolOptions));
+    // Fleet Claude seat coverage (bead eco-6hoxj.48). A seat whose settings.json
+    // carries no managed exporter or hooks emits transcript rows only, so it is
+    // reported here as a coverage diagnostic — slug and managed key names, never
+    // a value — without changing `ok`, which stays a health verdict.
+    const claudeSeats = discoverClaudeSeats(os.homedir()).map((seat) => {
+      if (!seat.hasSettings) {
+        return { slug: seat.slug, path: seat.path, status: "skipped" as const, missing: [] as string[] };
+      }
+      const read = readClaudeTelemetryConfig(seat.path, generateClaudeCodeSettings(toolOptions));
+      return {
+        slug: seat.slug,
+        path: seat.path,
+        // A seat file Plimsoll cannot parse or read is seat-tooling state, and
+        // `setup` deliberately does not fail on it, so doctor is where it has to
+        // show up: named `unreadable`, with the same coverage diagnostic and
+        // still never a value.
+        status: read.status === "invalid" ? ("unreadable" as const) : read.status,
+        missing: read.missing,
+        ...(read.ok ? {} : { diagnostic: "claude_seat_settings_unmanaged" }),
+      };
+    });
     const codex = readCodexTelemetryConfig(codexPath, generateCodexConfigToml(toolOptions));
     const grokHookCommand = diagnoseManagedGrokHookCommand(grokHookPath);
     const codexHookCommand = diagnoseManagedCodexHookCommand(codexPath);
@@ -3207,6 +3268,7 @@ async function main() {
             ok: claude.ok && codex.ok,
             claude,
             codex,
+            claudeSeats,
           },
           ...(grokHookCommand ? { grokHookCommand } : {}),
           ...(codexHookCommand ? { codexHookCommand } : {}),
