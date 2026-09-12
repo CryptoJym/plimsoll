@@ -62,17 +62,24 @@ import { HOOK_AUTHORITY_CONTRACT } from "./hook-authority";
 import { otelScalar, unixNanoToIso } from "./normalizer";
 import {
   HOOK_SPOOL_LIMITS,
+  blankForbiddenRawContent,
   hookSpoolDirectory,
   hookSpoolEnabled,
   hookSpoolEntryTrusted,
   hookSpoolPending,
+  isHookSpoolSource,
   listHookSpoolFiles,
   pruneHookSpoolRejected,
   readHookSpoolCounters,
   readHookSpoolFile,
   reapHookSpoolTemporaries,
+  recordHookSpoolIntake,
   rejectHookSpoolFile,
+  resolveHookSpoolHome,
   writeHookSpoolCounters,
+  writeHookSpoolFile,
+  type HookSpoolBounds,
+  type HookSpoolSource,
   type HookSpoolStatus,
 } from "./hook-spool";
 import {
@@ -83,9 +90,11 @@ import {
   type LocalIngestAuth,
 } from "./local-auth";
 import {
+  REJECTION_SUMMARY_INTERVAL_MS,
   classifyRejectionClient,
   createRejectionDiagnostics,
   type CollectorServer,
+  type RejectionClientClass,
 } from "./rejection-diagnostics";
 
 let dashboardHtml: string | undefined;
@@ -452,10 +461,16 @@ export function createHookSpoolDrain(
       // OTLP receiver and must never hold it for a whole tick.
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
+    // `spooledAtIntake` belongs to the intake, which read-modify-writes this
+    // same file whenever it spools (`recordHookSpoolIntake`). Read it here and
+    // write it back unchanged: this read and the write below are one
+    // synchronous span, so the daemon's single thread cannot interleave a
+    // spool between them and lose an increment.
     counters = {
       recovered: counters.recovered + result.recovered,
       rejected: counters.rejected + result.rejected,
       deferred: counters.deferred + result.deferred,
+      spooledAtIntake: readHookSpoolCounters(options.home).spooledAtIntake,
       lastDrainAt: new Date(nowMs()).toISOString(),
     };
     try {
@@ -580,6 +595,20 @@ export function createCollectorServer(
      * never stats the spool directory on the request path.
      */
     hookSpoolStatus?: () => HookSpoolStatus | null;
+    /**
+     * Environment the intake spool reads its kill switch and its home from.
+     * Production is `process.env`, exactly as the drain's is.
+     */
+    env?: NodeJS.ProcessEnv;
+    /**
+     * Proof-injectable spool home. Absent, the intake resolves the SAME
+     * canonical Plimsoll home the drain is armed with (`resolveHookSpoolHome`
+     * -> `resolveCollectorHome`, the resolver `collectorHome()` calls), so a
+     * spooled post lands in the directory this daemon drains.
+     */
+    hookSpoolHome?: string;
+    /** Proof-injectable directory bounds. Production uses HOOK_SPOOL_LIMITS. */
+    hookSpoolLimits?: Partial<HookSpoolBounds>;
   } = {},
 ) {
   assertCollectorPrivacyMode(config, "collector server");
@@ -651,6 +680,125 @@ export function createCollectorServer(
   const rejectionDiagnostics = createRejectionDiagnostics({
     nowMs: options.diagnosticsNowMs,
   });
+
+  // ---------------------------------------------------------------------
+  // Intake spool (bead eco-6hoxj.61, round r5).
+  //
+  // The managed hooks the fleet installs do not run `forward-hook-http`:
+  // Claude Code's is an `http` hook posting straight to
+  // /hooks/claude-code, and the Codex/Grok hooks are `curl` commands posting
+  // straight to /hooks/codex and /hooks/grok. So the client-side spool never
+  // sees their events, and on a busy ledger they were answered 503 and lost.
+  // The spool goes where those posts actually arrive: here.
+  // ---------------------------------------------------------------------
+  const spoolEnv = options.env ?? process.env;
+  // Read once, like the drain reads it once when it starts: the kill switch
+  // belongs to the daemon's environment (review r1, F5), and the intake and
+  // the drain must never disagree about whether this home is spooling.
+  const hookSpoolIntakeEnabled = hookSpoolEnabled(spoolEnv);
+  // Resolved on first use and cached: a CollectorHomeError must not change
+  // start-up behaviour, it must simply leave the 503 exactly as it is today.
+  let hookSpoolIntakeHome: string | null | undefined;
+  const intakeSpoolHome = () => {
+    if (hookSpoolIntakeHome !== undefined) return hookSpoolIntakeHome;
+    if (options.hookSpoolHome !== undefined) {
+      hookSpoolIntakeHome = options.hookSpoolHome;
+      return hookSpoolIntakeHome;
+    }
+    try {
+      hookSpoolIntakeHome = resolveHookSpoolHome(spoolEnv);
+    } catch {
+      hookSpoolIntakeHome = null;
+    }
+    return hookSpoolIntakeHome;
+  };
+  const spoolSummaryNowMs = options.diagnosticsNowMs ?? Date.now;
+  /**
+   * Per-interval aggregation for the intake's own log line, on exactly the
+   * shape and cadence `rejection-diagnostics.ts` uses for a rejection: the
+   * first spool of a window is announced immediately, the rest are counted and
+   * reported by one summary when the window closes. Counts and a client class,
+   * never a body, never a path, never a token.
+   */
+  const spoolWindows = new Map<
+    RejectionClientClass,
+    { firstAtMs: number; count: number; suppressed: number }
+  >();
+  const closeSpoolWindows = (nowMs: number, all: boolean) => {
+    const lines: Array<Record<string, unknown>> = [];
+    for (const [clientClass, window] of spoolWindows) {
+      if (!all && nowMs - window.firstAtMs < REJECTION_SUMMARY_INTERVAL_MS) continue;
+      spoolWindows.delete(clientClass);
+      lines.push({
+        status: "hook_spooled_at_intake_summary",
+        clientClass,
+        count: window.count,
+        suppressed: window.suppressed,
+        intervalMs: REJECTION_SUMMARY_INTERVAL_MS,
+      });
+    }
+    return lines;
+  };
+  const observeIntakeSpool = (source: HookSpoolSource, clientClass: RejectionClientClass) => {
+    const nowMs = spoolSummaryNowMs();
+    for (const line of closeSpoolWindows(nowMs, false)) console.warn(JSON.stringify(line));
+    const window = spoolWindows.get(clientClass);
+    if (!window) {
+      spoolWindows.set(clientClass, { firstAtMs: nowMs, count: 1, suppressed: 0 });
+      console.warn(JSON.stringify({ status: "hook_spooled_at_intake", source, clientClass }));
+      return;
+    }
+    window.count += 1;
+    window.suppressed += 1;
+  };
+  /**
+   * Write the refused post to the spool, or answer null so the caller keeps
+   * today's 503 exactly as it is. Same envelope, same blanking, same bounds,
+   * same write-temporary-then-rename durability as the client's spool —
+   * literally the same `writeHookSpoolFile` — and the caller answers 202 only
+   * after that rename returned.
+   */
+  const spoolHookAtIntake = (
+    source: LocalProducerSource,
+    bodyText: string,
+    receivedAtMs: number,
+  ) => {
+    if (!hookSpoolIntakeEnabled) return null;
+    // `/hooks/<source>` resolves only the three hook sources, so this is a
+    // type narrowing rather than a filter; a source the spool cannot name is
+    // refused rather than guessed.
+    if (!isHookSpoolSource(source)) return null;
+    // Suppressed BEFORE the write, with the collector's own DROP rule, exactly
+    // as the client spool suppresses it: the spool is a local write that
+    // happens before the collector's suppression can run.
+    const blanked = blankForbiddenRawContent(bodyText);
+    if (!blanked) return null;
+    const home = intakeSpoolHome();
+    if (home === null) return null;
+    const written = writeHookSpoolFile({
+      home,
+      source,
+      body: blanked.text,
+      blanked: blanked.blanked,
+      // The daemon's request receive time, so the drain replays the event with
+      // the time it ARRIVED rather than the time the ledger freed up.
+      nowMs: receivedAtMs,
+      limits: options.hookSpoolLimits,
+    });
+    if (!written) return null;
+    try {
+      recordHookSpoolIntake(home);
+    } catch (error) {
+      // The event is already durable; a counters write that failed is a
+      // reporting gap, not a loss. Code only, never the path it failed on.
+      console.warn(JSON.stringify({
+        warning: "hook_spool_counters_write_failed",
+        code: errorCodeOnly(error),
+      }));
+    }
+    return { path: written.path, source };
+  };
+
   const invalidateStatus = (body: Record<string, unknown>, reason: string) => {
     const projection = (body.projection ?? {}) as Record<string, unknown>;
     body.projection = { ...projection, ...projectionValidity({
@@ -848,6 +996,10 @@ export function createCollectorServer(
 
   const httpServer = http.createServer(async (request, response) => {
     const budget = createRequestBudget();
+    // The daemon's request receive time. A hook post the intake has to spool
+    // carries this into the envelope's `receivedAt`, so the drain replays the
+    // event with the time it arrived here (bead eco-6hoxj.61).
+    const receivedAtMs = Date.now();
     try {
       assertAllowedHost(request);
       if (selectsLiveUsage(request)) {
@@ -1226,7 +1378,42 @@ export function createCollectorServer(
           request,
           await readBoundedRequestBody(request, budget),
         );
-        const normalized = await admitHookBody(body.text, source, { config, buffer, budget });
+        let normalized: Awaited<ReturnType<typeof admitHookBody>>;
+        try {
+          normalized = await admitHookBody(body.text, source, { config, buffer, budget });
+        } catch (error) {
+          // The ONE outcome that is spooled here: the busy class that answers
+          // 503 `storage_busy_retry` today. It is raised only when the ledger
+          // write did not commit — `admitHookBody`'s `retryStorageBusy`
+          // (`http-boundary.ts:265`) rethrows the SQLite contention error its
+          // retry budget could not get past, `asHttpBoundaryRejection`
+          // (`http-boundary.ts:117-118`) is the only place that turns one into
+          // this rejection, and the contention error can only escape
+          // `LocalEventBuffer.append`'s `db.transaction(run).immediate()`
+          // (`buffer.ts:2559`), which SQLite has rolled back by the time it
+          // throws. Everything after that commit is in-memory handoff
+          // bookkeeping that catches its own failures (`buffer.ts:1466`), so
+          // there is no committed-then-timed-out outcome to be ambiguous about.
+          //
+          // Not spooled: 408 `request_deadline_exceeded` (the body is
+          // incomplete — there is nothing whole to spool), authorization
+          // failures and admission rejections (they never reached the ledger
+          // on their merits and must stay visible), and every other 5xx.
+          const failure = asHttpBoundaryRejection(error);
+          const spooled =
+            failure.reason === "storage_busy_retry" && failure.status === 503
+              ? spoolHookAtIntake(source, body.text, receivedAtMs)
+              : null;
+          // A spool that could not be written — bounds exhausted, disk, EACCES,
+          // kill switch — keeps today's answer exactly: the loss stays visible.
+          if (!spooled) throw error;
+          observeIntakeSpool(spooled.source, classifyRejectionClient(request));
+          // 202 only after the rename returned. The event is on disk, private
+          // and blanked, and the drain applies it through this same callable.
+          response.writeHead(202, { "content-type": "application/json" });
+          response.end(JSON.stringify({ status: "hook_spooled", source }));
+          return;
+        }
         rejectionDiagnostics.recordAccepted(source);
         response.writeHead(202, { "content-type": "application/json" });
         response.end(
@@ -1407,7 +1594,15 @@ export function createCollectorServer(
   httpServer.keepAliveTimeout = 0;
   const server = httpServer as CollectorServer;
   server.plimsollHttpDiagnostics = {
-    flush: () => rejectionDiagnostics.flush(),
+    // Shutdown flush closes the intake-spool window too, so a daemon going
+    // down does not take an open count with it. Its line shape is not a
+    // rejection summary, so it is printed here rather than returned.
+    flush: () => {
+      for (const line of closeSpoolWindows(spoolSummaryNowMs(), true)) {
+        console.warn(JSON.stringify(line));
+      }
+      return rejectionDiagnostics.flush();
+    },
     counters: () => rejectionDiagnostics.counters(),
   };
   return server;
