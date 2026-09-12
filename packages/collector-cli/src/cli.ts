@@ -173,7 +173,6 @@ import {
 import { PURGE_CONFIRMATION } from "./lifecycle";
 import { PLIMSOLL_VERSION } from "./version";
 import {
-  applyClaudeSettings,
   applyCodexConfig,
   applyCodexHookHeaderFile,
   applyGeminiSettings,
@@ -193,6 +192,18 @@ import {
   generateGrokHookSettings,
   generateSetupInstructions,
 } from "../../collector-config/src/index";
+import {
+  DEFAULT_MANAGED_CONFIG_RECONCILE_INTERVAL_SECONDS,
+  type ManagedConfigReadback,
+  type ManagedConfigTarget,
+  composeManagedClaudeTargets,
+  composeManagedCodexTargets,
+  decideManagedConfigReconcile,
+  managedConfigDriftReport,
+  managedConfigReconcileDoctorSection,
+  readManagedConfigReconcileState,
+  runManagedConfigReconcile,
+} from "./managed-config-reconcile";
 import { runOutcomesSync } from "./outcomes-sync";
 import {
   GitHubRestOutcomeTimelineAdapter,
@@ -1306,6 +1317,89 @@ function readCodexTelemetryConfig(file: string, expectedToml: string) {
   } catch {
     return { ok: false, status: "invalid" as const, path: file, missing: ["valid TOML"] };
   }
+}
+
+/**
+ * Doctor's readback for one managed-config target (bead eco-6hoxj.50). The
+ * self-healing cadence decides from exactly the same readback that produces the
+ * `claude_seat_settings_unmanaged` / `codex_profile_config_unmanaged`
+ * diagnostics, so a healthy doctor payload and a zero-write cadence are the
+ * same fact.
+ */
+function managedConfigTargetReadback(
+  target: ManagedConfigTarget,
+  options: Parameters<typeof generateClaudeCodeSettings>[0],
+): ManagedConfigReadback {
+  return target.family === "claude"
+    ? readClaudeTelemetryConfig(target.path, generateClaudeCodeSettings(options))
+    : readCodexTelemetryConfig(target.path, generateCodexConfigToml(options));
+}
+
+/**
+ * One self-healing reconcile tick for the running collector (bead eco-6hoxj.50).
+ *
+ * Composed from the same targets `setup` manages and gated by
+ * `decideManagedConfigReconcile`, so the kill-switch is honoured before any
+ * clock read and the drift readback is performed only when the cadence is
+ * actually due. A host with no Plimsoll-local credentials, or whose managed
+ * Codex header file is absent, has nothing this cadence may write: reconcile
+ * re-applies what `setup --yes` installed and never provisions.
+ *
+ * `repoRoot` is the daemon's cwd exactly as doctor uses it; neither generated
+ * Claude settings nor the generated Codex config reads it, so the managed
+ * content a cadence plans is byte-identical to the content setup plans.
+ */
+function runManagedConfigReconcileTick(
+  config: CollectorConfig,
+  options: { now?: number } = {},
+): {
+  decision: ReturnType<typeof decideManagedConfigReconcile>;
+  result: ReturnType<typeof runManagedConfigReconcile> | null;
+} {
+  const now = options.now ?? Date.now();
+  const home = collectorHome();
+  const claudeFile = path.join(os.homedir(), ".claude", "settings.json");
+  const codexFile = path.join(os.homedir(), ".codex", "config.toml");
+  const codexHeaderFile = path.join(path.dirname(codexFile), "plimsoll.headers");
+  const auth = readLocalIngestAuth(home);
+  const toolOptions = {
+    repoRoot: process.cwd(),
+    port: config.port,
+    dataMode: config.policy.dataMode,
+    codexHeaderFile,
+    grokHeaderFile: path.join(resolveGrokHome().home, "hooks", "plimsoll.headers"),
+    ...(auth
+      ? {
+          claudeCodeProducerToken: auth.claudeCodeProducer,
+          codexProducerToken: auth.codexProducer,
+          geminiCliProducerToken: auth.geminiCliProducer,
+          grokProducerToken: auth.grokProducer,
+        }
+      : {}),
+  };
+  const targets: ManagedConfigTarget[] = auth === null
+    ? []
+    : [
+        ...composeManagedClaudeTargets(claudeFile, os.homedir()),
+        ...(fs.existsSync(codexHeaderFile) ? composeManagedCodexTargets(codexFile, os.homedir()) : []),
+      ];
+  const state = readManagedConfigReconcileState(home);
+  const lastRunAt = state.lastRunAt ? Date.parse(state.lastRunAt) : null;
+  const decision = decideManagedConfigReconcile({
+    enabled: config.managedConfig.reconcile.enabled,
+    intervalSeconds: config.managedConfig.reconcile.intervalSeconds,
+    now,
+    lastRunAt: Number.isFinite(lastRunAt) ? lastRunAt : null,
+    drift: () =>
+      targets.length === 0
+        ? 0
+        : managedConfigDriftReport(targets, toolOptions, managedConfigTargetReadback).drifted,
+  });
+  if (!decision.run) return { decision, result: null };
+  return {
+    decision,
+    result: runManagedConfigReconcile({ collectorHome: home, targets, toolOptions, now: () => now }),
+  };
 }
 
 /**
@@ -2468,6 +2562,44 @@ async function main() {
     if (config.uploadUrl) {
       timers.push(setInterval(() => void runSync(), config.syncIntervalSeconds * 1000));
     }
+    // Self-healing managed-config reconcile (bead eco-6hoxj.50). The fleet's
+    // seat and conductor tooling rewrites ~/.claude-seats/<slug>/settings.json
+    // and ~/.codex-profiles/<slug>/config.toml whenever a seat or profile
+    // churns, and the rewritten file silently loses the managed block. The tick
+    // is a decision first: disabled by config, or not yet due, and it touches
+    // no managed file at all; due but with no drifted target, and it plans
+    // nothing. Only a drifted target makes it re-apply the managed keys, and
+    // only where the plan says added|updated.
+    if (config.managedConfig.reconcile.enabled) {
+      let managedConfigReconcileInFlight = false;
+      timers.push(setInterval(() => {
+        if (managedConfigReconcileInFlight || shuttingDown) return;
+        managedConfigReconcileInFlight = true;
+        try {
+          const { decision, result } = runManagedConfigReconcileTick(config);
+          if (result && (result.applied > 0 || result.refused > 0)) {
+            console.log(JSON.stringify({
+              status: result.status,
+              trigger: decision.reason,
+              applied: result.applied,
+              unchanged: result.unchanged,
+              skipped: result.skipped,
+              refused: result.refused,
+              receiptPath: result.receiptPath,
+            }));
+          }
+        } catch (error) {
+          // Managed config is never load-bearing for capture: a failed tick is
+          // reported and the next one re-plans from the files as they are.
+          console.warn(JSON.stringify({
+            warning: "managed_config_reconcile_failed",
+            message: error instanceof Error ? error.message : String(error),
+          }));
+        } finally {
+          managedConfigReconcileInFlight = false;
+        }
+      }, config.managedConfig.reconcile.intervalSeconds * 1000));
+    }
     for (const timer of timers) timer.unref();
 
     const stopMaintenanceBeforeFatalExit = async () => {
@@ -2828,12 +2960,16 @@ async function main() {
     };
     // Seat discovery is a plain read of the process home: the seat tooling
     // owns ~/.claude-seats/<slug>, so setup manages what is already there and
-    // a seat created later is picked up by the next run.
-    const claudeSeats = discoverClaudeSeats(os.homedir()).filter((seat) => seat.hasSettings);
-    // Codex seat profiles are discovered the same way (bead eco-6hoxj.52): the
-    // fleet conductor owns ~/.codex-profiles/<slug>, so setup manages the
-    // config.toml that is already there and never provisions one.
-    const codexProfiles = discoverCodexProfiles(os.homedir()).filter((profile) => profile.hasConfig);
+    // a seat created later is picked up by the next run. Codex seat profiles
+    // are discovered the same way (bead eco-6hoxj.52) under
+    // ~/.codex-profiles/<slug>, and neither family is ever provisioned.
+    //
+    // Both families are composed by managed-config-reconcile.ts (bead
+    // eco-6hoxj.50) so that `setup --yes`, `setup --reconcile` and the
+    // collector's self-healing maintenance cadence all manage exactly the same
+    // target set from one definition.
+    const managedClaudeTargets = composeManagedClaudeTargets(claudeFile, os.homedir());
+    const managedCodexTargets = composeManagedCodexTargets(codexFile, os.homedir());
     type SetupTargetName =
       | "claude"
       | `claudeSeat[${string}]`
@@ -2856,29 +2992,14 @@ async function main() {
       refusal?: string;
     };
     const targets: SetupTarget[] = [
-      {
-        name: "claude",
-        path: claudeFile,
-        run: (options, preview) =>
-          applyClaudeSettings(claudeFile, generateClaudeCodeSettings(options), { dryRun: preview }),
-      },
-      // Fleet Claude seats (bead eco-6hoxj.48): every lane launched with
-      // CLAUDE_CONFIG_DIR=~/.claude-seats/<slug> reads that seat's
-      // settings.json instead of ~/.claude/settings.json, so it got no
-      // exporter and no hooks. Each discovered seat is its own target with the
-      // same managed content and the same additive merge as the `claude`
+      // The `claude` target plus every fleet Claude seat (bead eco-6hoxj.48):
+      // a lane launched with CLAUDE_CONFIG_DIR=~/.claude-seats/<slug> reads
+      // that seat's settings.json instead of ~/.claude/settings.json, so it got
+      // no exporter and no hooks. Each discovered seat is its own target with
+      // the same managed content and the same additive merge as the `claude`
       // target; the seat's own hooks and unknown keys survive untouched, and a
       // seat directory without settings.json is skipped rather than created.
-      ...claudeSeats.map((seat): SetupTarget => ({
-        name: `claudeSeat[${seat.slug}]`,
-        path: seat.path,
-        discovered: true,
-        run: (options, preview) =>
-          applyClaudeSettings(seat.path, generateClaudeCodeSettings(options), {
-            dryRun: preview,
-            managedTarget: `claudeSeat[${seat.slug}]`,
-          }),
-      })),
+      ...managedClaudeTargets,
       {
         name: "gemini",
         path: geminiFile,
@@ -2903,32 +3024,80 @@ async function main() {
         run: (options, preview) =>
           applyCodexHookHeaderFile(codexHeaderFile, generateCodexHookHeader(options), { dryRun: preview }),
       },
-      {
-        name: "codex",
-        path: codexFile,
-        run: (options, preview) =>
-          applyCodexConfig(codexFile, generateCodexConfigToml(options), { dryRun: preview }),
-      },
-      // Fleet Codex seat profiles (bead eco-6hoxj.52): every lane launched with
-      // CODEX_HOME=~/.codex-profiles/<slug> reads that profile's config.toml
-      // instead of ~/.codex/config.toml, so it ran with no [otel] exporters and
-      // no Plimsoll hooks — captured only by the rollout scanner. Each
-      // discovered profile is its own target with the same generated content
-      // and the same additive TOML merge as the `codex` target: the fleet's own
-      // hooks and every unknown key survive untouched, the hook command stays
-      // token-free by pointing at the same per-user header file, and a profile
-      // directory without config.toml is skipped rather than created.
-      ...codexProfiles.map((profile): SetupTarget => ({
-        name: `codexProfile[${profile.slug}]`,
-        path: profile.path,
-        discovered: true,
-        run: (options, preview) =>
-          applyCodexConfig(profile.path, generateCodexConfigToml(options), {
-            dryRun: preview,
-            managedTarget: `codexProfile[${profile.slug}]`,
-          }),
-      })),
+      // The `codex` target plus every fleet Codex seat profile (bead
+      // eco-6hoxj.52): a lane launched with CODEX_HOME=~/.codex-profiles/<slug>
+      // reads that profile's config.toml instead of ~/.codex/config.toml, so it
+      // ran with no [otel] exporters and no Plimsoll hooks — captured only by
+      // the rollout scanner. Each discovered profile is its own target with the
+      // same generated content and the same additive TOML merge as the `codex`
+      // target: the fleet's own hooks and every unknown key survive untouched,
+      // the hook command stays token-free by pointing at the same per-user
+      // header file, and a profile directory without config.toml is skipped
+      // rather than created.
+      ...managedCodexTargets,
     ];
+    // Self-healing reconcile (bead eco-6hoxj.50). `--reconcile` is a mode of
+    // `setup` rather than a second command because everything it needs is
+    // already composed here: the same managed Claude/Codex target set, the same
+    // --claude-settings/--codex-config overrides, and the same
+    // owned-vs-discovered exit-code rule. It is strictly weaker than a setup
+    // run — it never provisions a file, never mints a credential, and writes
+    // only where the plan says added|updated — so it is safe to run on a
+    // cadence against files the fleet tooling owns.
+    if (process.argv.includes("--reconcile")) {
+      // Reconcile re-applies what setup installed; it is not an installer, so
+      // a host without Plimsoll-local producer credentials has nothing to
+      // reconcile and says so instead of provisioning them.
+      const configured = readLocalIngestAuth(collectorHome()) !== null;
+      // The Codex hook command points at the per-user header file. Writing a
+      // Codex target while that file is absent would leave a hook referencing a
+      // secret that does not exist, which is exactly what setup's header
+      // dependency refuses; provisioning it belongs to `setup --yes`, so the
+      // Codex family stands down for this run instead.
+      const codexHeaderPresent = fs.existsSync(codexHeaderFile);
+      const result = configured
+        ? runManagedConfigReconcile({
+            collectorHome: collectorHome(),
+            targets: [
+              ...managedClaudeTargets,
+              ...(codexHeaderPresent ? managedCodexTargets : []),
+            ],
+            toolOptions,
+            dryRun,
+          })
+        : null;
+      for (const target of result?.targets ?? []) {
+        for (const entry of target.plan ?? []) {
+          console.log(`${target.path}: ${entry.key} ${entry.action}`);
+        }
+        if (target.status !== "unchanged") {
+          console.log(
+            `${target.path}: target ${target.status}${target.reason ? `: ${target.reason}` : ""}`,
+          );
+        }
+      }
+      console.log(
+        JSON.stringify(
+          result
+            ? { ...result, codexHeaderFilePresent: codexHeaderPresent }
+            : {
+                status: "managed_config_not_configured",
+                reason: "no Plimsoll-local producer credentials on this host; run `plimsoll setup --yes` first.",
+                applied: 0,
+                unchanged: 0,
+                skipped: 0,
+                refused: 0,
+                ownedRefusal: false,
+                targets: [],
+                receiptPath: null,
+              },
+          null,
+          2,
+        ),
+      );
+      if (result?.ownedRefusal) process.exitCode = 1;
+      return;
+    }
     // A hook command that references a header file Plimsoll could not write
     // would post without its producer token, so the config target is refused
     // with its header target rather than left pointing at a missing secret.
@@ -2938,10 +3107,12 @@ async function main() {
       // A profile's hooks reference the same per-user header file as the
       // default Codex target, so they share its fate rather than pointing at a
       // secret Plimsoll could not write.
-      ...codexProfiles.map((profile) => ({
-        header: "codexHeaders" as const,
-        dependent: `codexProfile[${profile.slug}]` as SetupTargetName,
-      })),
+      ...managedCodexTargets
+        .filter((target) => target.discovered)
+        .map((target) => ({
+          header: "codexHeaders" as const,
+          dependent: target.name as SetupTargetName,
+        })),
     ];
     // Two sources must never share one header file: each source's hook would
     // then send the other's token, collapsing the per-source audience boundary
@@ -3569,6 +3740,16 @@ async function main() {
             codex,
             claudeSeats,
             codexProfiles,
+          },
+          // Self-healing reconcile of the managed Claude/Codex config (bead
+          // eco-6hoxj.50): whether the collector's cadence is armed, when it
+          // last ran, and how many targets that run applied or refused. Counts
+          // and stamps only — never a managed value and never a path.
+          managedConfig: {
+            reconcile: managedConfigReconcileDoctorSection(collectorHome(), {
+              enabled: config.managedConfig.reconcile.enabled,
+              intervalSeconds: config.managedConfig.reconcile.intervalSeconds,
+            }),
           },
           ...(grokHookCommand ? { grokHookCommand } : {}),
           ...(codexHookCommand ? { codexHookCommand } : {}),

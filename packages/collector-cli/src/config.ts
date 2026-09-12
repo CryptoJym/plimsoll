@@ -109,6 +109,24 @@ export const collectorConfigSchema = z
         maxBackoffSeconds: 3600,
         maxProbesPerCycle: 31,
       }),
+    /**
+     * Self-healing reconcile of the managed Claude and Codex config (bead
+     * eco-6hoxj.50). The collector re-applies the managed block to the home
+     * targets and every discovered seat/profile that the fleet's seat and
+     * conductor tooling rewrote, at a bounded cadence and only when doctor's
+     * readback reports drift. `enabled: false` is the kill-switch: the
+     * maintenance loop then performs no managed-config read or write at all.
+     */
+    managedConfig: z
+      .object({
+        reconcile: z
+          .object({
+            enabled: z.boolean().default(true),
+            intervalSeconds: z.number().int().min(60).max(86400).default(600),
+          })
+          .default({ enabled: true, intervalSeconds: 600 }),
+      })
+      .default({ reconcile: { enabled: true, intervalSeconds: 600 } }),
     policy: policyConfigSchema.default(DEFAULT_POLICY),
     repoContextDrain: z
       .object({

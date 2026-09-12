@@ -156,6 +156,27 @@ fails `setup`, whose own declared targets still decide the exit code.
 `telemetry.codexProfiles` and flags an unmanaged or unreadable one with
 `codex_profile_config_unmanaged`, again without changing the readiness verdict.
 
+The seat and conductor tooling rewrites those files whenever a seat or profile
+churns, and a rewritten file silently loses the managed block. As of 0.7.21 the
+collector heals that itself: `plimsoll setup --reconcile` re-runs exactly the
+Claude and Codex half of setup's target composition — `~/.claude/settings.json`,
+`~/.codex/config.toml` and every discovered seat and profile — and applies only
+where the plan says `added` or `updated`. It is strictly weaker than
+`setup --yes`: it never creates a file that is not there, never mints a
+credential, never rewrites a file it cannot parse, and stands down on any file
+another writer changes while the plan is being computed. A run that applied or
+refused something writes `<collector home>/receipts/managed-config-reconcile-<ts>.json`
+with the per-target status, plan lines and backups; a healthy home plans every
+target `unchanged` and writes nothing at all. The running collector calls the
+same reconcile in-process every `managedConfig.reconcile.intervalSeconds`
+(default 600), and only when its own doctor readback reports at least one
+drifted target, so a healthy host does zero writes; a refused or malformed file
+is not retried for an hour. Set `managedConfig.reconcile.enabled` to `false` in
+`collector.config.json` to turn the schedule off — the collector then performs
+no managed-config read or write of its own. `plimsoll doctor --read-only --json`
+reports the schedule under `managedConfig.reconcile` (`enabled`,
+`intervalSeconds`, `lastRunAt`, `lastApplied`, `lastRefused`, `nextEligibleAt`).
+
 Telemetry `setup` manages a seat's *config*; what the collector *captures* from
 is its capture-root inventory (`collector.config.json` → `captureRoots[]`),
 which is minted once, at enrollment. A host that gains a native root later — a
