@@ -269,7 +269,16 @@ export function saveCollectorConfig(config: CollectorConfig, homeDir = os.homedi
   return writeCollectorConfigTransactionally(config, collectorConfigPath(homeDir));
 }
 
-function withCollectorConfigMutationLock<T>(configPath: string, action: () => T) {
+/**
+ * Serialize a read-modify-write of a collector-home file across processes.
+ *
+ * Exported for the managed-config reconcile (review r2, R4): the daemon
+ * cadence and an operator's `setup --reconcile` are separate processes over the
+ * same home, and the reconcile state file is read-modify-written exactly like
+ * the config file is. It takes the path of the file being mutated and holds a
+ * sibling `.<basename>.mutation.lock.sqlite` beside it.
+ */
+export function withCollectorConfigMutationLock<T>(configPath: string, action: () => T) {
   const directory = path.dirname(configPath);
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const lockPath = path.join(directory, `.${path.basename(configPath)}.mutation.lock.sqlite`);

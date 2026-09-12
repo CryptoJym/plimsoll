@@ -1430,6 +1430,10 @@ async function runManagedConfigReconcileTick(
       absent: drift.report
         ? drift.report.targets.filter((entry) => entry.status === "missing").length
         : 0,
+      // A host with no Plimsoll-local credentials manages nothing at all, so it
+      // must not stamp the same `unchanged` a healthy host stamps
+      // (review r2, R6).
+      ...(auth === null ? { result: "unavailable" as const } : {}),
     });
     return { decision, result: null, settings };
   }

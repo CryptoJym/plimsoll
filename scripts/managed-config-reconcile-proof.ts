@@ -57,6 +57,7 @@ import {
   composeManagedCodexTargets,
   decideManagedConfigReconcile,
   isManagedConfigConcurrencyFailure,
+  managedConfigReconcileDoctorSection,
   managedConfigReconcileStatePath,
   readManagedConfigReconcileSettings,
   readManagedConfigReconcileState,
@@ -951,6 +952,302 @@ function applyRaceChecks(fixtureRoot: string) {
 }
 
 /**
+ * review r2, R1: the plan is a real read of the managed file — `applyCodexConfig`
+ * binds the preimage *before* its dry-run early return — so a writer that
+ * replaces the file inside that window throws the same transactional
+ * concurrency failure the apply throws. It must be the same outcome: skipped
+ * for this tick, no backoff. Before this round the plan-path catch refused and
+ * armed the hour, which made the README's "losing a race with another writer is
+ * not a refusal and arms no backoff" false one window earlier than F4's.
+ */
+function planRaceChecks(fixtureRoot: string) {
+  const seats = path.join(fixtureRoot, "plan-race-seats");
+  const seatFile = writeSeatSettings(seats, CHURNED_SEAT, fleetSeatDocument("plan-race"));
+  const toolOptions = {
+    repoRoot,
+    port: 49176,
+    dataMode: "metadata" as const,
+    claudeCodeProducerToken: "synthetic-claude-producer-token-plan-race-00",
+  };
+  // The exact strings apply.ts throws out of its preimage reads:
+  // `unsafePath(file, "config.toml was replaced while opening it")` at
+  // apply.ts:1379 for Codex, and `claudeFail("LEAF_CHANGED")` inside
+  // `readClaudePreimage` for Claude.
+  const codexRace = `${seatFile}: config.toml was replaced while opening it; refusing to read through a link or create a backup/write.`;
+  const claudeRace = "CLAUDE_CONFIG_LEAF_CHANGED";
+  const planRacingTarget = (message: string): ManagedConfigTarget => ({
+    name: `claudeSeat[${CHURNED_SEAT}]`,
+    path: seatFile,
+    family: "claude",
+    discovered: true,
+    run: (_options, dryRun) => {
+      // The plan itself loses the race, so the apply is never reached.
+      if (dryRun) throw new Error(message);
+      throw new Error("unreachable: the plan never handed this target to an apply");
+    },
+  });
+  const raced = [codexRace, claudeRace].map((message, index) => {
+    const collectorHome = path.join(fixtureRoot, `plan-race-home-${index}`);
+    fs.mkdirSync(collectorHome, { recursive: true, mode: 0o700 });
+    const result = runManagedConfigReconcile({
+      collectorHome,
+      targets: [planRacingTarget(message)],
+      toolOptions,
+    });
+    return { result, state: readManagedConfigReconcileState(collectorHome) };
+  });
+  check(
+    "a_plan_that_loses_a_race_is_skipped_for_this_tick_and_arms_no_backoff",
+    raced.every(
+      ({ result, state }) =>
+        result.targets[0]?.status === "skipped" &&
+        result.targets[0]?.reason === "changed_during_plan" &&
+        result.targets[0]?.nextEligibleAt === undefined &&
+        result.refused === 0 &&
+        result.skipped === 1 &&
+        Object.keys(state.backoff).length === 0 &&
+        state.lastResult === "skipped" &&
+        result.receiptPath === null,
+    ) && backups(seatFile).length === 0,
+    { messages: [codexRace, claudeRace], entries: raced.map(({ result }) => result.targets[0]) },
+  );
+
+  const refusedHome = path.join(fixtureRoot, "plan-race-refusal-home");
+  fs.mkdirSync(refusedHome, { recursive: true, mode: 0o700 });
+  const refused = runManagedConfigReconcile({
+    collectorHome: refusedHome,
+    targets: [planRacingTarget("CLAUDE_CONFIG_MALFORMED_JSON")],
+    toolOptions,
+  });
+  const refusedState = readManagedConfigReconcileState(refusedHome);
+  check(
+    "a_plan_that_fails_for_any_other_reason_is_still_a_refusal_that_arms_the_hour",
+    refused.targets[0]?.status === "refused" &&
+      refused.refused === 1 &&
+      typeof refused.targets[0]?.nextEligibleAt === "string" &&
+      Object.keys(refusedState.backoff).length === 1 &&
+      refusedState.lastResult === "refused",
+    { entry: refused.targets[0] },
+  );
+}
+
+/**
+ * review r2, R3 and R4: the run stamp, the backoff map and the backup record
+ * are read-modify-written by two processes (the daemon cadence and an
+ * operator's `setup --reconcile`) over one collector home, and the daemon's
+ * receipts reported `durationMs: 0` because the duration was read from the
+ * fixed clock the tick passes for its deadlines.
+ */
+function stateIntegrityChecks(fixtureRoot: string) {
+  const collectorHome = path.join(fixtureRoot, "state-integrity-home");
+  fs.mkdirSync(collectorHome, { recursive: true, mode: 0o700 });
+  const seats = path.join(fixtureRoot, "state-integrity-seats");
+  const absent = path.join(fixtureRoot, "state-integrity-absent");
+  const toolOptions = {
+    repoRoot,
+    port: 49177,
+    dataMode: "metadata" as const,
+    claudeCodeProducerToken: "synthetic-claude-producer-token-state-0000000",
+  };
+  const seatTarget = (slug: string): ManagedConfigTarget => {
+    const file = writeSeatSettings(seats, slug, fleetSeatDocument(slug));
+    const composed = composeManagedClaudeTargets(file, absent)[0]!;
+    return { ...composed, name: `claudeSeat[${slug}]`, path: file, discovered: true };
+  };
+
+  // R3: a fixed run clock (what the daemon passes so every deadline in one tick
+  // comes from one instant) must not flatten the receipt's duration.
+  const fixedNow = Date.parse("2026-09-12T14:00:00.000Z");
+  let monotonicReads = 0;
+  const timed = runManagedConfigReconcile({
+    collectorHome,
+    targets: [seatTarget("timed-seat")],
+    toolOptions,
+    now: () => fixedNow,
+    monotonicNow: () => (monotonicReads++ === 0 ? 1_000 : 1_250),
+  });
+  const timedReceipt = JSON.parse(fs.readFileSync(timed.receiptPath!, "utf8")) as Record<string, unknown>;
+  check(
+    "a_receipt_reports_real_wall_time_even_when_the_run_clock_is_fixed",
+    timed.applied === 1 &&
+      timed.startedAt === new Date(fixedNow).toISOString() &&
+      timed.durationMs === 250 &&
+      timedReceipt.durationMs === 250,
+    { durationMs: timed.durationMs, receiptDurationMs: timedReceipt.durationMs },
+  );
+
+  // R4: run A (the operator) refuses a target and finishes *after* run B (the
+  // daemon tick) has already written its own stamp and backup record from a
+  // snapshot that predates A's refusal. Nothing either run decided may be lost.
+  const refusingTarget: ManagedConfigTarget = {
+    name: "claudeSeat[refused-seat]",
+    path: writeSeatSettings(seats, "refused-seat", fleetSeatDocument("refused")),
+    family: "claude",
+    discovered: true,
+    run: () => {
+      throw new Error("CLAUDE_CONFIG_MALFORMED_JSON");
+    },
+  };
+  const interleavedTarget = seatTarget("interleaved-seat");
+  const runA = { at: Date.parse("2026-09-12T15:00:00.000Z") };
+  const runB = { at: Date.parse("2026-09-12T15:00:01.000Z") };
+  let innerRuns = 0;
+  const outer = runManagedConfigReconcile({
+    collectorHome,
+    targets: [refusingTarget, seatTarget("outer-seat")],
+    toolOptions,
+    now: () => runA.at,
+    // The seam fires between the last target's plan and its apply: the second
+    // process's whole run lands inside this one's window.
+    onPlanned: () => {
+      if (innerRuns++ > 0) return;
+      runManagedConfigReconcile({
+        collectorHome,
+        targets: [interleavedTarget],
+        toolOptions,
+        now: () => runB.at,
+      });
+    },
+  });
+  const merged = readManagedConfigReconcileState(collectorHome);
+  check(
+    "two_interleaved_runs_keep_both_the_armed_backoff_and_the_newer_run_stamp",
+    outer.refused === 1 &&
+      // The run that finished last started first: its stamp must not walk the
+      // cadence backwards, and the interleaved run's applied count survives.
+      merged.lastRunAt === new Date(runB.at).toISOString() &&
+      merged.lastApplied === 1 &&
+      // The refusal the last writer never saw is still armed.
+      merged.backoff["claudeSeat[refused-seat]"] !== undefined &&
+      Object.keys(merged.backoff).length === 1 &&
+      // Both runs' backup records survive one another's write.
+      merged.backups["claudeSeat[interleaved-seat]"]?.names.length === 1 &&
+      merged.backups["claudeSeat[outer-seat]"]?.names.length === 1,
+    {
+      lastRunAt: merged.lastRunAt,
+      backoff: Object.keys(merged.backoff),
+      backups: Object.keys(merged.backups),
+    },
+  );
+
+  // R6: a host with no Plimsoll-local credentials manages nothing at all.
+  const unavailableHome = path.join(fixtureRoot, "state-unavailable-home");
+  fs.mkdirSync(unavailableHome, { recursive: true, mode: 0o700 });
+  const at = "2026-09-12T16:00:00.000Z";
+  const stamped = stampManagedConfigReconcileDecision(
+    unavailableHome,
+    { run: false, reason: "no_drift", nextEligibleAt: at },
+    { at, result: "unavailable" },
+  );
+  const unavailable = managedConfigReconcileDoctorSection(unavailableHome, {
+    enabled: true,
+    intervalSeconds: 600,
+  });
+  check(
+    "a_tick_with_no_local_credentials_stamps_unavailable_rather_than_unchanged",
+    stamped === true &&
+      unavailable.lastResult === "unavailable" &&
+      unavailable.lastRunAt === at &&
+      unavailable.nextEligibleAt === "2026-09-12T16:10:00.000Z",
+    { doctor: unavailable },
+  );
+}
+
+/**
+ * review r2, R2: `setup --yes` writes into the same
+ * `<basename>.plimsoll-backup-*` namespace the cadence prunes, so matching the
+ * namespace let the cadence delete the installer's pre-install backup — the
+ * only copy of the host's pre-Plimsoll bytes. The reviewer's arm: one 11-day
+ * old installer backup plus six older-than-24h cadence backups, then one more
+ * apply.
+ */
+function setupBackupChecks(fixtureRoot: string) {
+  const home = path.join(fixtureRoot, "setup-backup-home");
+  const collectorHome = path.join(fixtureRoot, "setup-backup-plimsoll-home");
+  fs.mkdirSync(collectorHome, { recursive: true, mode: 0o700 });
+  const claudeFile = path.join(home, ".claude", "settings.json");
+  fs.mkdirSync(path.dirname(claudeFile), { recursive: true, mode: 0o700 });
+  const toolOptions = {
+    repoRoot,
+    port: 49178,
+    dataMode: "metadata" as const,
+    claudeCodeProducerToken: "synthetic-claude-producer-token-setup-bak-00",
+  };
+  const churn = (round: number, prune: Record<string, number> | undefined) => {
+    fs.writeFileSync(claudeFile, `${JSON.stringify(fleetSeatDocument(`setup-backup-${round}`), null, 2)}\n`, {
+      mode: 0o600,
+    });
+    return runManagedConfigReconcile({
+      collectorHome,
+      targets: composeManagedClaudeTargets(claudeFile, path.join(fixtureRoot, "setup-backup-absent")),
+      toolOptions,
+      ...(prune ? { prune } : {}),
+    });
+  };
+  const age = (file: string, ms: number) => {
+    const when = (Date.now() - ms) / 1000;
+    fs.utimesSync(file, when, when);
+  };
+
+  // What `setup --yes` leaves behind: the pre-install copy, in the same
+  // namespace, written by a code path this change never touches.
+  const setupBackup = `${claudeFile}.plimsoll-backup-2026-09-01T00-00-00-000Z`;
+  fs.writeFileSync(setupBackup, '{"preInstall":"synthetic pre-plimsoll bytes"}\n', { mode: 0o600 });
+  age(setupBackup, 11 * 24 * 60 * 60 * 1000);
+
+  // Six cadence backups, every one of them older than the 24 h floor and all
+  // newer than the installer's.
+  for (let round = 0; round < 6; round += 1) churn(round, { backupsPerFile: 99, minBackupAgeMs: 0 });
+  const cadenceBackups = backups(claudeFile).filter((name) => !setupBackup.endsWith(name));
+  for (const [index, name] of cadenceBackups.entries()) {
+    age(path.join(path.dirname(claudeFile), name), (7 - index) * 25 * 60 * 60 * 1000);
+  }
+  const before = backups(claudeFile);
+  const beforeState = readManagedConfigReconcileState(collectorHome);
+
+  churn(6, undefined);
+  const after = backups(claudeFile);
+  const state = readManagedConfigReconcileState(collectorHome);
+  const record = state.backups["claude"]?.names ?? [];
+  const setupBackupName = path.basename(setupBackup);
+  check(
+    "the_installers_own_pre_install_backup_is_never_pruned_by_the_cadence",
+    before.length === 7 &&
+      before.includes(setupBackupName) &&
+      after.includes(setupBackupName) &&
+      fs.readFileSync(setupBackup, "utf8").includes("pre-plimsoll") &&
+      // The cadence's own set is still bounded, and the installer's backup was
+      // never in the record the prune works from.
+      after.filter((name) => name !== setupBackupName).length === MANAGED_CONFIG_BACKUPS_KEPT_PER_FILE &&
+      !record.includes(setupBackupName) &&
+      record.length === MANAGED_CONFIG_BACKUPS_KEPT_PER_FILE &&
+      (beforeState.backups["claude"]?.names.length ?? 0) === 6,
+    { before: before.length, after: after.length, recorded: record.length },
+  );
+
+  // A backup the cadence did not write is not a candidate even when it is the
+  // only thing left: an operator who clears the state file cannot make the
+  // installer's copy prunable.
+  fs.rmSync(managedConfigReconcileStatePath(collectorHome));
+  // keep 0 with the age floor lifted: every backup on disk would be a candidate
+  // under the old namespace rule. With an empty record the only thing this run
+  // may prune is the backup it just wrote itself.
+  churn(7, { backupsPerFile: 0, minBackupAgeMs: 0 });
+  const unrecorded = backups(claudeFile);
+  check(
+    "a_backup_the_cadence_did_not_record_is_never_a_pruning_candidate",
+    // Every backup that was there before this run is still there; the only one
+    // this run could have pruned is the one it wrote itself, and that one is
+    // newer than the run's own start so the age floor holds it too.
+    after.every((name) => unrecorded.includes(name)) &&
+      unrecorded.includes(setupBackupName) &&
+      unrecorded.length === after.length + 1 &&
+      (readManagedConfigReconcileState(collectorHome).backups["claude"]?.names.length ?? 0) === 1,
+    { backups: unrecorded.length, survived: after.length },
+  );
+}
+
+/**
  * review r1, F5: backups are written *beside* the managed file — inside the
  * fleet-owned seat and profile directories — and receipts accumulate in the
  * collector home. Nothing pruned either.
@@ -987,26 +1284,33 @@ function pruneChecks(fixtureRoot: string) {
     { backups: youngBackups },
   );
 
-  // The same churn with the age floor lifted: the count bound takes over.
+  // The same churn with the age floor lifted: the count bound takes over. The
+  // oldest backup this file has is never a candidate (review r2, R2), so the
+  // surviving set is the five newest *plus* that first one.
+  const oldestBackup = backups(claudeFile)[0];
   const pruned = churn(8, { minBackupAgeMs: 0 });
+  const survivors = backups(claudeFile);
   check(
-    "at_most_five_backups_per_managed_file_survive_once_they_are_old_enough_to_prune",
-    backups(claudeFile).length === MANAGED_CONFIG_BACKUPS_KEPT_PER_FILE &&
+    "at_most_five_prunable_backups_survive_plus_the_oldest_backup_which_is_never_pruned",
+    survivors.length === MANAGED_CONFIG_BACKUPS_KEPT_PER_FILE + 1 &&
+      survivors[0] === oldestBackup &&
       pruned.applied === 1 &&
       // The survivors are the newest, and the file itself is untouched by the prune.
-      backups(claudeFile).sort().slice(-1)[0] === backups(claudeFile).sort().slice(-1)[0] &&
+      survivors.slice(1).join(",") ===
+        backups(claudeFile).slice(-MANAGED_CONFIG_BACKUPS_KEPT_PER_FILE).join(",") &&
       fs.existsSync(claudeFile),
-    { backups: backups(claudeFile).length },
+    { backups: survivors.length, oldestKept: survivors[0] === oldestBackup },
   );
 
   for (let round = 9; round < 9 + MANAGED_CONFIG_RECEIPTS_KEPT + 6; round += 1) {
     churn(round, { minBackupAgeMs: 0 });
   }
+  setupBackupChecks(fixtureRoot);
   const kept = receipts(collectorHome);
   check(
     "at_most_twenty_reconcile_receipts_survive_and_the_newest_are_the_survivors",
     kept.length === MANAGED_CONFIG_RECEIPTS_KEPT &&
-      backups(claudeFile).length === MANAGED_CONFIG_BACKUPS_KEPT_PER_FILE &&
+      backups(claudeFile).length === MANAGED_CONFIG_BACKUPS_KEPT_PER_FILE + 1 &&
       kept.join(",") === [...kept].sort().join(","),
     { receipts: kept.length, backups: backups(claudeFile).length },
   );
@@ -1232,6 +1536,8 @@ async function main() {
     commandChecks(fixture.root);
     concurrentWriterChecks(fixture.root);
     applyRaceChecks(fixture.root);
+    planRaceChecks(fixture.root);
+    stateIntegrityChecks(fixture.root);
     liveSettingsChecks(fixture.root);
     decisionStampChecks(fixture.root);
     pruneChecks(fixture.root);

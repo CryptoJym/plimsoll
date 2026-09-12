@@ -1,7 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
+import { performance } from "node:perf_hooks";
 
-import { collectorConfigSchema } from "./config";
+import { collectorConfigSchema, withCollectorConfigMutationLock } from "./config";
 import {
   type ApplyPlanEntry,
   type ApplyResult,
@@ -320,9 +321,21 @@ export const DEFAULT_MANAGED_CONFIG_RECONCILE_INTERVAL_SECONDS = 600;
  * home; nothing pruned them, so a writer that drops the managed block on a
  * schedule shorter than the cadence littered both directories without bound.
  *
- * Only the reconcile prunes, and only the files Plimsoll itself wrote:
- * `setup --yes` keeps its existing backup policy (it has never pruned) so the
- * installer's rollback material is untouched by this change.
+ * Only the reconcile prunes, and only the backups it wrote itself (review r2,
+ * R2). `setup --yes` writes into the same `<basename>.plimsoll-backup-*`
+ * namespace, so matching the namespace was not enough: the cadence could delete
+ * the installer's pre-install backup — the only copy of a host's pre-Plimsoll
+ * bytes. Two rules keep that safe:
+ *
+ *   - the reconcile prunes only the backup paths it recorded in its own state
+ *     file when it wrote them, so a backup `setup --yes` (or anything else)
+ *     wrote is never a candidate;
+ *   - the oldest backup of a managed file is never deleted, whoever wrote it.
+ *     A state file lost or hand-cleared cannot turn the pre-Plimsoll copy into
+ *     a pruning candidate.
+ *
+ * `setup --yes` therefore keeps its existing backup policy (it has never
+ * pruned) and its rollback material is untouched by this change.
  */
 export const MANAGED_CONFIG_BACKUPS_KEPT_PER_FILE = 5;
 export const MANAGED_CONFIG_RECEIPTS_KEPT = 20;
@@ -335,8 +348,19 @@ export type ManagedConfigReconcilePruneOptions = {
   minBackupAgeMs?: number;
 };
 
-/** What the last run did, for doctor (review r1, F2). */
-export type ManagedConfigReconcileLastResult = "unchanged" | "applied" | "refused" | "skipped";
+/**
+ * What the last run did, for doctor (review r1, F2).
+ *
+ * `unavailable` is the tick that could not manage anything at all because the
+ * host has no Plimsoll-local credentials yet, so its target list is empty
+ * (review r2, R6). Without it that host reads exactly like a healthy one.
+ */
+export type ManagedConfigReconcileLastResult =
+  | "unchanged"
+  | "applied"
+  | "refused"
+  | "skipped"
+  | "unavailable";
 
 /** Per-target refusal backoff, with the file identity the refusal was about. */
 type ManagedConfigBackoffEntry = {
@@ -344,6 +368,12 @@ type ManagedConfigBackoffEntry = {
   /** The refused file's identity; a different identity means the file was fixed. */
   witness: FileWitness | null;
 };
+
+/**
+ * The backups this cadence wrote beside one managed file, newest last
+ * (review r2, R2). Only these are pruning candidates.
+ */
+type ManagedConfigBackupRecord = { file: string; names: string[] };
 
 type ManagedConfigReconcileState = {
   version: 1;
@@ -353,6 +383,8 @@ type ManagedConfigReconcileState = {
   lastRefused: number;
   lastAbsent: number;
   backoff: Record<string, ManagedConfigBackoffEntry>;
+  /** Per target: the backup files this reconcile created and may prune. */
+  backups: Record<string, ManagedConfigBackupRecord>;
 };
 
 const EMPTY_STATE: ManagedConfigReconcileState = {
@@ -363,6 +395,7 @@ const EMPTY_STATE: ManagedConfigReconcileState = {
   lastRefused: 0,
   lastAbsent: 0,
   backoff: {},
+  backups: {},
 };
 
 const LAST_RESULTS: readonly ManagedConfigReconcileLastResult[] = [
@@ -370,6 +403,7 @@ const LAST_RESULTS: readonly ManagedConfigReconcileLastResult[] = [
   "applied",
   "refused",
   "skipped",
+  "unavailable",
 ];
 
 export function managedConfigReconcileStatePath(collectorHome: string) {
@@ -394,6 +428,13 @@ export function readManagedConfigReconcileState(collectorHome: string): ManagedC
         witness: typeof entry === "string" ? null : readWitness((entry as ManagedConfigBackoffEntry)?.witness),
       };
     }
+    const backups: Record<string, ManagedConfigBackupRecord> = {};
+    for (const [name, entry] of Object.entries(parsed.backups ?? {})) {
+      const record = entry as Partial<ManagedConfigBackupRecord> | null;
+      if (!record || typeof record.file !== "string" || !Array.isArray(record.names)) continue;
+      const names = record.names.filter((value): value is string => typeof value === "string");
+      backups[name] = { file: record.file, names };
+    }
     const lastResult = parsed.lastResult;
     return {
       version: 1,
@@ -406,6 +447,7 @@ export function readManagedConfigReconcileState(collectorHome: string): ManagedC
       lastRefused: Number.isSafeInteger(parsed.lastRefused) ? (parsed.lastRefused as number) : 0,
       lastAbsent: Number.isSafeInteger(parsed.lastAbsent) ? (parsed.lastAbsent as number) : 0,
       backoff,
+      backups,
     };
   } catch {
     // No state yet, or state this build cannot read: the reconcile is
@@ -423,6 +465,42 @@ function writeManagedConfigReconcileState(
   const temporary = `${file}.tmp`;
   fs.writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
   fs.renameSync(temporary, file);
+}
+
+/**
+ * Read-modify-write the state file under a cross-process lock (review r2, R4).
+ *
+ * The daemon cadence and an operator's `plimsoll setup --reconcile` are two
+ * processes over the same collector home. Both snapshot the state, work, and
+ * write the whole file back, so without a lock whichever finished last silently
+ * dropped the other's backoff entries, backup record and run stamp — a file
+ * that had just been refused would be re-planned on the very next tick.
+ *
+ * This is the same SQLite mutation lock the collector config file uses, held on
+ * a sibling lock file beside the state file. The critical section is the
+ * read-modify-write itself (and the prune it authorises), never a whole
+ * reconcile run: an operator must not be able to block the cadence, or the
+ * cadence the operator, for the length of a fleet-scale apply.
+ */
+function updateManagedConfigReconcileState<T>(
+  collectorHome: string,
+  update: (current: ManagedConfigReconcileState) => { next: ManagedConfigReconcileState; result: T },
+): T {
+  fs.mkdirSync(collectorHome, { recursive: true, mode: 0o700 });
+  return withCollectorConfigMutationLock(managedConfigReconcileStatePath(collectorHome), () => {
+    const { next, result } = update(readManagedConfigReconcileState(collectorHome));
+    writeManagedConfigReconcileState(collectorHome, next);
+    return result;
+  });
+}
+
+/** Whether `candidate` is at least as new as the stamp already on disk. */
+function stampIsNotOlder(candidate: string, recorded: string | null): boolean {
+  if (recorded === null) return true;
+  const left = Date.parse(candidate);
+  const right = Date.parse(recorded);
+  if (!Number.isFinite(left) || !Number.isFinite(right)) return true;
+  return left >= right;
 }
 
 /**
@@ -448,15 +526,21 @@ export function stampManagedConfigReconcileRun(
     absent?: number;
   },
 ) {
-  const state = readManagedConfigReconcileState(collectorHome);
-  writeManagedConfigReconcileState(collectorHome, {
-    ...state,
-    lastRunAt: stamp.at,
-    lastResult: stamp.result,
-    lastApplied: stamp.applied ?? 0,
-    lastRefused: stamp.refused ?? 0,
-    lastAbsent: stamp.absent ?? 0,
-  });
+  updateManagedConfigReconcileState(collectorHome, (state) => ({
+    // A run that started earlier but finished later must not walk `lastRunAt`
+    // backwards and hand the cadence a free early tick (review r2, R4).
+    next: stampIsNotOlder(stamp.at, state.lastRunAt)
+      ? {
+          ...state,
+          lastRunAt: stamp.at,
+          lastResult: stamp.result,
+          lastApplied: stamp.applied ?? 0,
+          lastRefused: stamp.refused ?? 0,
+          lastAbsent: stamp.absent ?? 0,
+        }
+      : state,
+    result: undefined,
+  }));
 }
 
 /**
@@ -470,17 +554,22 @@ export function stampManagedConfigReconcileRun(
  * they read nothing, and advancing `lastRunAt` on them would push
  * `nextEligibleAt` forward forever and make the interval gate inert.
  *
+ * `result` lets the caller say *why* there was nothing to do: a host with no
+ * Plimsoll-local credentials manages no targets at all and stamps
+ * `unavailable`, so doctor no longer reads exactly like a healthy host
+ * (review r2, R6).
+ *
  * Returns whether it stamped.
  */
 export function stampManagedConfigReconcileDecision(
   collectorHome: string,
   decision: ManagedConfigReconcileDecision,
-  stamp: { at: string; absent?: number },
+  stamp: { at: string; absent?: number; result?: "unchanged" | "unavailable" },
 ): boolean {
   if (decision.run || decision.reason !== "no_drift") return false;
   stampManagedConfigReconcileRun(collectorHome, {
     at: stamp.at,
-    result: "unchanged",
+    result: stamp.result ?? "unchanged",
     absent: stamp.absent,
   });
   return true;
@@ -694,6 +783,13 @@ export type ManagedConfigReconcileOptions = {
   /** Plan only: report what would be applied and write nothing at all. */
   dryRun?: boolean;
   now?: () => number;
+  /**
+   * Monotonic milliseconds, for `durationMs` only (review r2, R3). The daemon
+   * passes a *fixed* `now` so every deadline in one tick is computed from one
+   * instant; reading the duration from that clock made every receipt the daemon
+   * wrote say `durationMs: 0`.
+   */
+  monotonicNow?: () => number;
   /** Deterministic proof seam: runs after a target's plan, before its apply. */
   onPlanned?: (target: ManagedConfigTarget) => void;
   /** Litter bounds; defaults are the exported constants. */
@@ -702,18 +798,32 @@ export type ManagedConfigReconcileOptions = {
 
 type ReconcileRun = {
   startedAtMs: number;
+  /** Monotonic reading taken at the same instant; only `durationMs` uses it. */
+  startedAtMonotonicMs: number;
   startedAt: string;
   backoff: Record<string, ManagedConfigBackoffEntry>;
+  /**
+   * Targets whose backoff this run decided about, armed or released. Only these
+   * are merged over the state on disk, so a concurrent run's decisions about
+   * *other* targets survive (review r2, R4).
+   */
+  backoffDecided: Set<string>;
+  /** Backups this run wrote, by target: `{file, name}` per applied target. */
+  createdBackups: { name: string; file: string; backup: string }[];
   reports: ManagedConfigReconcileTargetReport[];
 };
 
 function beginReconcile(options: ManagedConfigReconcileOptions): ReconcileRun {
   const now = options.now ?? (() => Date.now());
+  const monotonicNow = options.monotonicNow ?? (() => performance.now());
   const startedAtMs = now();
   return {
     startedAtMs,
+    startedAtMonotonicMs: monotonicNow(),
     startedAt: new Date(startedAtMs).toISOString(),
     backoff: { ...readManagedConfigReconcileState(options.collectorHome).backoff },
+    backoffDecided: new Set<string>(),
+    createdBackups: [],
     reports: [],
   };
 }
@@ -758,6 +868,7 @@ function reconcileOneTarget(
       return;
     }
     delete run.backoff[target.name];
+    run.backoffDecided.add(target.name);
   }
   const before = witness(target.path);
   if (before === null) {
@@ -773,20 +884,48 @@ function reconcileOneTarget(
   const refuse = (reason: string, plan?: ApplyPlanEntry[]) => {
     const until = new Date(run.startedAtMs + MANAGED_CONFIG_REFUSAL_BACKOFF_MS).toISOString();
     run.backoff[target.name] = { until, witness: witness(target.path) };
+    run.backoffDecided.add(target.name);
     run.reports.push({ ...base, status: "refused", ...(plan ? { plan } : {}), reason, nextEligibleAt: until });
+  };
+  const lostTheRace = (reason: ManagedConfigReconcileSkipReason, entries?: ApplyPlanEntry[]) => {
+    // Another writer landed inside this run's own window. That is not a file
+    // Plimsoll cannot manage, so it is skipped for this tick and arms no
+    // backoff: the next tick plans the file as the other writer left it
+    // (review r1, F4 for the apply window; review r2, R1 for the plan window).
+    run.reports.push({
+      ...base,
+      status: "skipped",
+      ...(entries ? { plan: entries } : {}),
+      reason,
+    });
   };
   let plan: ApplyResult;
   try {
     plan = target.run(options.toolOptions, true);
   } catch (error) {
-    refuse(errorMessage(error));
+    // The plan is a real read of the managed file: `applyCodexConfig` binds the
+    // preimage before its dry-run early return, so a writer that replaces the
+    // file inside that read window throws the same transactional concurrency
+    // failure the apply throws. Classify it the way the apply path does, or a
+    // lost race one window earlier silently arms the hour (review r2, R1).
+    const reason = errorMessage(error);
+    if (isManagedConfigConcurrencyFailure(reason)) {
+      lostTheRace("changed_during_plan");
+      return;
+    }
+    refuse(reason);
     return;
   }
   if (plan.conflict) {
+    if (isManagedConfigConcurrencyFailure(plan.conflict)) {
+      lostTheRace("changed_during_plan", plan.plan);
+      return;
+    }
     refuse(plan.conflict, plan.plan);
     return;
   }
   delete run.backoff[target.name];
+  run.backoffDecided.add(target.name);
   if (!plan.changed) {
     run.reports.push({ ...base, status: "unchanged", plan: plan.plan });
     return;
@@ -801,34 +940,23 @@ function reconcileOneTarget(
     // Another writer owns this file right now. The plan was computed against
     // content that no longer exists, so this run stands down; the next one
     // plans the file as it is.
-    run.reports.push({
-      ...base,
-      status: "skipped",
-      plan: plan.plan,
-      reason: "changed_during_plan" satisfies ManagedConfigReconcileSkipReason,
-    });
+    lostTheRace("changed_during_plan", plan.plan);
     return;
   }
-  const lostTheRace = (entries: ApplyPlanEntry[] | undefined) => {
-    // The transactional apply fails closed when another writer lands inside
-    // it. That is the same fact as `changed_during_plan`, one window later:
-    // skip this tick, arm no backoff (review r1, F4).
-    run.reports.push({
-      ...base,
-      status: "skipped",
-      ...(entries ? { plan: entries } : {}),
-      reason: "changed_during_apply" satisfies ManagedConfigReconcileSkipReason,
-    });
-  };
   try {
     const applied = target.run(options.toolOptions, false);
     if (applied.conflict) {
       if (isManagedConfigConcurrencyFailure(applied.conflict)) {
-        lostTheRace(applied.plan ?? plan.plan);
+        lostTheRace("changed_during_apply", applied.plan ?? plan.plan);
         return;
       }
       refuse(applied.conflict, applied.plan ?? plan.plan);
       return;
+    }
+    if (applied.backupPath) {
+      // Recorded so the prune can tell this cadence's backups from
+      // `setup --yes`'s pre-install copy (review r2, R2).
+      run.createdBackups.push({ name: target.name, file: target.path, backup: applied.backupPath });
     }
     run.reports.push({
       ...base,
@@ -839,7 +967,7 @@ function reconcileOneTarget(
   } catch (error) {
     const reason = errorMessage(error);
     if (isManagedConfigConcurrencyFailure(reason)) {
-      lostTheRace(plan.plan);
+      lostTheRace("changed_during_apply", plan.plan);
       return;
     }
     refuse(reason, plan.plan);
@@ -867,23 +995,35 @@ function lastResultOf(result: {
 }
 
 /**
- * Keep at most `keep` `.plimsoll-backup-*` files beside one managed file,
- * oldest first, and never delete one younger than `minAgeMs` (review r1, F5).
+ * Keep at most `keep` of the backups *this cadence wrote* beside one managed
+ * file, oldest first, never deleting one younger than `minAgeMs` (review r1,
+ * F5) and never deleting the oldest backup the file has (review r2, R2).
  *
- * The backup name carries an ISO stamp, but the file's own mtime is what the
- * age rule reads: a backup Plimsoll wrote a minute ago is live rollback
- * material whatever the count says.
+ * `created` is the cadence's own record from the state file. A backup written
+ * by `setup --yes` — the copy of the host's pre-Plimsoll bytes — is not in it
+ * and is therefore never a candidate; the oldest-backup rule holds that copy
+ * even if the record is lost. The backup name carries an ISO stamp, but the
+ * file's own mtime is what the age rule reads: a backup Plimsoll wrote a
+ * minute ago is live rollback material whatever the count says.
+ *
+ * Returns the record to keep: the cadence's own backups that still exist.
  */
-function pruneBackups(file: string, keep: number, minAgeMs: number, nowMs: number): string[] {
+function pruneBackups(
+  file: string,
+  created: readonly string[],
+  keep: number,
+  minAgeMs: number,
+  nowMs: number,
+): { survivors: string[]; removed: string[] } {
   const directory = path.dirname(file);
   const prefix = `${path.basename(file)}.plimsoll-backup-`;
   let entries: string[];
   try {
     entries = fs.readdirSync(directory).filter((name) => name.startsWith(prefix));
   } catch {
-    return [];
+    return { survivors: [...created], removed: [] };
   }
-  const withAge = entries
+  const onDisk = entries
     .map((name) => {
       const full = path.join(directory, name);
       try {
@@ -896,8 +1036,14 @@ function pruneBackups(file: string, keep: number, minAgeMs: number, nowMs: numbe
     .filter((entry): entry is { full: string; mtimeMs: number; name: string } => entry !== null)
     // Newest first: everything past `keep` is a pruning candidate.
     .sort((left, right) => right.mtimeMs - left.mtimeMs || right.name.localeCompare(left.name));
+  // Whoever wrote it, the file's oldest backup is its pre-Plimsoll bytes as far
+  // as this host can tell. It is never a candidate.
+  const oldest = onDisk[onDisk.length - 1]?.name;
+  const mine = new Set(created);
+  const ours = onDisk.filter((entry) => mine.has(entry.name));
   const removed: string[] = [];
-  for (const entry of withAge.slice(Math.max(0, keep))) {
+  for (const entry of ours.slice(Math.max(0, keep))) {
+    if (entry.name === oldest) continue;
     if (nowMs - entry.mtimeMs < minAgeMs) continue;
     try {
       fs.unlinkSync(entry.full);
@@ -906,7 +1052,13 @@ function pruneBackups(file: string, keep: number, minAgeMs: number, nowMs: numbe
       // Another writer owns it now; the next run re-counts.
     }
   }
-  return removed;
+  const gone = new Set(removed.map((full) => path.basename(full)));
+  // Oldest last, matching the on-disk order, and dropping anything that is no
+  // longer there so the record cannot grow past the litter it tracks.
+  return {
+    survivors: ours.filter((entry) => !gone.has(entry.name)).map((entry) => entry.name).reverse(),
+    removed,
+  };
 }
 
 /** Keep at most `keep` reconcile receipts, oldest first. Only this cadence's own receipts. */
@@ -937,7 +1089,7 @@ function finishReconcile(
   run: ReconcileRun,
   options: ManagedConfigReconcileOptions,
 ): ManagedConfigReconcileResult {
-  const now = options.now ?? (() => Date.now());
+  const monotonicNow = options.monotonicNow ?? (() => performance.now());
   const count = (status: ManagedConfigReconcileTargetStatus) =>
     run.reports.filter((report) => report.status === status).length;
   const applied = count("applied");
@@ -948,7 +1100,9 @@ function finishReconcile(
   const result: ManagedConfigReconcileResult = {
     status: applied > 0 ? "managed_config_reconciled" : "managed_config_unchanged",
     startedAt: run.startedAt,
-    durationMs: now() - run.startedAtMs,
+    // Wall time from a monotonic clock, never from the run's fixed `now`
+    // (review r2, R3).
+    durationMs: Math.max(0, Math.round(monotonicNow() - run.startedAtMonotonicMs)),
     applied,
     unchanged: count("unchanged"),
     skipped,
@@ -960,22 +1114,57 @@ function finishReconcile(
   };
   if (options.dryRun) return result;
 
-  writeManagedConfigReconcileState(options.collectorHome, {
-    version: 1,
-    lastRunAt: run.startedAt,
-    lastResult: lastResultOf({ applied, refused, skipped: skipped - absent }),
-    lastApplied: applied,
-    lastRefused: refused,
-    lastAbsent: absent,
-    backoff: run.backoff,
-  });
   const keepBackups = options.prune?.backupsPerFile ?? MANAGED_CONFIG_BACKUPS_KEPT_PER_FILE;
   const minBackupAgeMs = options.prune?.minBackupAgeMs ?? MANAGED_CONFIG_BACKUP_MIN_AGE_MS;
-  for (const report of run.reports) {
-    if (report.status === "applied" && report.backup) {
-      pruneBackups(report.path, keepBackups, minBackupAgeMs, run.startedAtMs);
+  // One critical section: merge this run's decisions over whatever the other
+  // process left on disk, prune only the backups the merged record owns, and
+  // write the result (review r2, R4). Merging rather than overwriting is what
+  // keeps a concurrent run's backoff entries and backup record alive.
+  updateManagedConfigReconcileState(options.collectorHome, (current) => {
+    const backoff = { ...current.backoff };
+    for (const name of run.backoffDecided) {
+      const entry = run.backoff[name];
+      if (entry) backoff[name] = entry;
+      else delete backoff[name];
     }
-  }
+    const backups = { ...current.backups };
+    for (const created of run.createdBackups) {
+      const record = backups[created.name];
+      const names = record && record.file === created.file ? [...record.names] : [];
+      names.push(path.basename(created.backup));
+      backups[created.name] = { file: created.file, names };
+    }
+    for (const report of run.reports) {
+      if (report.status !== "applied" || !report.backup) continue;
+      const record = backups[report.name];
+      if (!record) continue;
+      const { survivors } = pruneBackups(
+        record.file,
+        record.names,
+        keepBackups,
+        minBackupAgeMs,
+        run.startedAtMs,
+      );
+      if (survivors.length === 0) delete backups[report.name];
+      else backups[report.name] = { file: record.file, names: survivors };
+    }
+    const stamp = stampIsNotOlder(run.startedAt, current.lastRunAt)
+      ? {
+          lastRunAt: run.startedAt,
+          lastResult: lastResultOf({ applied, refused, skipped: skipped - absent }),
+          lastApplied: applied,
+          lastRefused: refused,
+          lastAbsent: absent,
+        }
+      : {
+          lastRunAt: current.lastRunAt,
+          lastResult: current.lastResult,
+          lastApplied: current.lastApplied,
+          lastRefused: current.lastRefused,
+          lastAbsent: current.lastAbsent,
+        };
+    return { next: { version: 1, ...stamp, backoff, backups }, result: undefined };
+  });
   if (applied === 0 && refused === 0) return result;
   const receiptsDirectory = path.join(options.collectorHome, "receipts");
   fs.mkdirSync(receiptsDirectory, { recursive: true, mode: 0o700 });

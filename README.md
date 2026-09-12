@@ -157,8 +157,8 @@ fails `setup`, whose own declared targets still decide the exit code.
 `codex_profile_config_unmanaged`, again without changing the readiness verdict.
 
 The seat and conductor tooling rewrites those files whenever a seat or profile
-churns, and a rewritten file silently loses the managed block. As of 0.7.21 the
-collector heals that itself: `plimsoll setup --reconcile` re-runs exactly the
+churns, and a rewritten file silently loses the managed block. The collector
+heals that itself: `plimsoll setup --reconcile` re-runs exactly the
 Claude and Codex half of setup's target composition — `~/.claude/settings.json`,
 `~/.codex/config.toml` and every discovered seat and profile — and applies only
 where the plan says `added` or `updated`. It is strictly weaker than
@@ -181,9 +181,15 @@ target on the next tick rather than after the hour. Losing a race with another
 writer is not a refusal and arms no backoff.
 
 The cadence keeps its own litter bounded: at most five `.plimsoll-backup-*`
-files per managed file (never deleting one less than 24 hours old) and at most
-twenty reconcile receipts, oldest first. `setup --yes` keeps its existing backup
-policy and prunes nothing.
+files per managed file and at most twenty reconcile receipts, oldest first. It
+prunes only the backups it wrote itself — each one is recorded in its state file
+when it is written — and it never deletes the oldest backup a managed file has,
+so the copy of a host's pre-Plimsoll bytes that `setup --yes` wrote is never a
+pruning candidate. `setup --yes` keeps its existing backup policy and prunes
+nothing. The count bound binds only once a backup is more than 24 hours old: a
+younger one is live rollback material and is kept whatever the count says, so a
+file some other writer churns every tick carries the five older backups plus one
+day of young ones rather than five in total.
 
 Set `managedConfig.reconcile.enabled` to `false` in `collector.config.json` to
 turn the schedule off — the collector re-reads that flag and the interval from
@@ -194,7 +200,12 @@ disabled collector then performs no managed-config read or write of its own.
 `lastResult`, `lastApplied`, `lastRefused`, `lastAbsent`, `nextEligibleAt`).
 `lastRunAt` advances on every tick that ran its readback, including one that
 found nothing to do (`lastResult: "unchanged"`), so a clean cadence is
-distinguishable from one that never ran.
+distinguishable from one that never ran. A host with no Plimsoll-local
+credentials manages no targets at all and stamps `lastResult: "unavailable"`
+instead, so it does not read as a healthy host. The state file is read and
+written under the same cross-process mutation lock the collector config uses, so
+an operator's `setup --reconcile` and a daemon tick cannot drop each other's
+backoff entries or run stamp.
 
 Telemetry `setup` manages a seat's *config*; what the collector *captures* from
 is its capture-root inventory (`collector.config.json` → `captureRoots[]`),
