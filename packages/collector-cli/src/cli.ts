@@ -78,6 +78,7 @@ import {
   producerRotationState,
   readLocalIngestAuth,
   rotateLocalProducerToken,
+  unpersistedProducerAudiences,
   type LocalIngestAuth,
 } from "./local-auth";
 import { enrollCodexLiveProducer } from "./codex-live-usage-auth";
@@ -1168,6 +1169,25 @@ function readClaudeTelemetryConfig(file: string, expected: ReturnType<typeof gen
   } catch {
     return { ok: false, status: "invalid" as const, path: file, missing: ["readable JSON"] };
   }
+}
+
+/**
+ * Value-blind fill receipt for doctor: the producer audiences a legacy
+ * credential file is missing and cannot be given, because the credential home
+ * refuses the fill write. The collector serves those audiences from memory, so
+ * no config on this host can hold them and those sources are refused after a
+ * restart. Reported only when the condition holds, so a healthy doctor payload
+ * is byte-identical to before; readiness is unchanged (see REPORT).
+ */
+function producerAudienceFillReceipt(home: string) {
+  const audiences = unpersistedProducerAudiences(home);
+  if (audiences.length === 0) return {};
+  return {
+    producerAudiencesUnpersisted: {
+      code: "local_ingest_auth_audiences_unpersisted",
+      audiences,
+    },
+  };
 }
 
 /** Value-blind rotation receipt for doctor: state and deadline, never a token. */
@@ -3189,6 +3209,7 @@ async function main() {
           ...(grokHookCommand ? { grokHookCommand } : {}),
           ...(codexHookCommand ? { codexHookCommand } : {}),
           producerTokenRotation: producerTokenRotationReceipt(localAuth),
+          ...producerAudienceFillReceipt(collectorHome()),
           launchAgent,
           runtime,
           connectivity,
