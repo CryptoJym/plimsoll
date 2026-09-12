@@ -21,6 +21,7 @@ import {
 } from "../packages/collector-cli/src/http-boundary";
 import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { generateGeminiCliSettings } from "../packages/collector-config/src/templates";
+import { useFixtureRoot } from "./lib/fixture-root";
 import {
   DEFAULT_POLICY,
   findForbiddenRawContentFields,
@@ -83,6 +84,12 @@ async function dispatchRequest(server: http.Server, request: http.IncomingMessag
 }
 
 async function main() {
+  // Generates managed Gemini settings: run under a per-run fixture root so no
+  // managed path can resolve to the operator's real home.
+  const guardFixture = useFixtureRoot(
+    fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-gemini-adapter-fixture-")),
+  );
+  try {
   const fixturePath = path.join(
     import.meta.dirname,
     "../packages/shared/fixtures/otel-inputs/gemini-cli-api-response.json",
@@ -276,6 +283,10 @@ async function main() {
   const failed = checks.filter((result) => !result.passed);
   console.log(JSON.stringify({ checks: checks.length, passed: checks.length - failed.length, failed: failed.length }));
   if (failed.length > 0) process.exitCode = 1;
+  } finally {
+    guardFixture.restore();
+    fs.rmSync(guardFixture.root, { recursive: true, force: true });
+  }
 }
 
 void main();

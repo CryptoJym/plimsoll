@@ -10,6 +10,7 @@ import path from "node:path";
 import { Readable } from "node:stream";
 
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
+import { useFixtureRoot } from "./lib/fixture-root";
 import {
   applyGrokHookFile,
   applyGrokHookHeaderFile,
@@ -129,6 +130,10 @@ function runShellCommand(command: string, input: string, env: NodeJS.ProcessEnv)
 
 async function main() {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-grok-source-proof-"));
+  // Declare the fixture root before the first apply. Every spawned child below
+  // inherits process.env, so the contract travels with them and no managed
+  // apply — in-process or in a child CLI — can reach the operator's ~/.grok.
+  const fixtureRoot = useFixtureRoot(sandbox);
   try {
     const hookFile = path.join(sandbox, ".grok", "hooks", "plimsoll.json");
     const foreignHook = path.join(sandbox, ".grok", "hooks", "operator-memory.json");
@@ -991,6 +996,7 @@ exec /usr/bin/curl "$@"
 
     console.log(JSON.stringify({ ok: true, checks: checks.length, results: checks }, null, 2));
   } finally {
+    fixtureRoot.restore();
     fs.rmSync(sandbox, { recursive: true, force: true });
   }
 }

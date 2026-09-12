@@ -4,6 +4,8 @@ import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { parse as parseToml } from "smol-toml";
 
+import { assertManagedConfigTarget } from "./fixture-root";
+
 /**
  * Config APPLY mode (issue 0003): idempotent, surgical merges of Plimsoll's
  * telemetry settings into the user's existing tool configs. Never clobbers:
@@ -838,6 +840,7 @@ export function applyClaudeSettings(
   },
   options: ClaudeApplyOptions = {},
 ): ApplyResult {
+  assertManagedConfigTarget(file);
   try {
     const { snapshot, current } = readClaudePreimage(file);
     const plan = reconcileClaudeDocument(current, generated);
@@ -864,6 +867,7 @@ export function applyGeminiSettings(
   generated: { telemetry: Record<string, unknown> },
   options: ClaudeApplyOptions = {},
 ): ApplyResult {
+  assertManagedConfigTarget(file);
   try {
     const { snapshot, current } = readClaudePreimage(file);
     const document = parseClaudeDocument(current);
@@ -1050,6 +1054,7 @@ export function applyGrokHookFile(
   generated: { hooks: Record<string, unknown[]> },
   options: ClaudeApplyOptions = {},
 ): ApplyResult {
+  assertManagedConfigTarget(file);
   try {
     if (!isManagedGrokDocument(generated)) {
       throw new Error(`${file}: generated Grok hook document is invalid.`);
@@ -1109,6 +1114,7 @@ export function applyGrokHookHeaderFile(
   generated: string,
   options: ClaudeApplyOptions = {},
 ): ApplyResult {
+  assertManagedConfigTarget(file);
   try {
     if (!GROK_MANAGED_HEADER_PATTERN.test(generated)) {
       throw new Error(`${file}: generated Grok header file is invalid.`);
@@ -2367,6 +2373,7 @@ export function applyCodexConfig(
   generatedToml: string,
   options: CodexApplyOptions = {},
 ): ApplyResult {
+  assertManagedConfigTarget(file);
   const { snapshot, current } = readCodexPreimage(file);
   const plan = reconcileCodexToml(file, current, generatedToml);
   if (plan.conflict) {

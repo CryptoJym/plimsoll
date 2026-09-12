@@ -12,10 +12,13 @@ const hash = (file: string) => createHash("sha256").update(fs.readFileSync(file)
 
 export function isolatedEnvironment(root: string): NodeJS.ProcessEnv {
   const dirs = { HOME: "home", USERPROFILE: "home", PLIMSOLL_PROOF_HOME: "home", PLIMSOLL_HOME: "home/.plimsoll",
-    CODEX_HOME: "home/.codex", CLAUDE_CONFIG_DIR: "home/.claude", XDG_CONFIG_HOME: "home/.config",
+    CODEX_HOME: "home/.codex", GROK_HOME: "home/.grok", CLAUDE_CONFIG_DIR: "home/.claude", XDG_CONFIG_HOME: "home/.config",
     XDG_CACHE_HOME: "home/.cache", XDG_STATE_HOME: "home/.local/state", TMPDIR: "tmp", TEMP: "tmp", TMP: "tmp" };
+  // PLIMSOLL_FIXTURE_ROOT is the managed-config apply contract: every apply in
+  // a proof must land inside this disposable root or fail closed.
   const env: NodeJS.ProcessEnv = { PATH: process.env.PATH, LANG: "en_US.UTF-8", TZ: "UTC",
     PLIMSOLL_PROOF_ROOT: root, PLIMSOLL_PROOF_RUN_ID: randomUUID(),
+    PLIMSOLL_FIXTURE_ROOT: root,
     PLIMSOLL_PROOF_RECEIPT: path.join(root, "completion.json") };
   fs.writeFileSync(path.join(root, ".proof-root.json"), JSON.stringify({
     schema: "plimsoll.disposable-proof.v1", runId: env.PLIMSOLL_PROOF_RUN_ID,

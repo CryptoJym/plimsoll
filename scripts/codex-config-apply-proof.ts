@@ -11,6 +11,7 @@ import path from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { parse as parseToml } from "smol-toml";
 
+import { useFixtureRoot } from "./lib/fixture-root";
 import {
   applyCodexConfig,
   generateCodexConfigToml,
@@ -71,9 +72,9 @@ function ownedHeaderNames(headers: Record<string, unknown>) {
 function main() {
   check("proof_runs_on_node_22", Number(process.versions.node.split(".")[0]) === 22, process.versions.node);
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-codex-config-proof-"));
-  const operatorHome = process.env.HOME;
   const syntheticHome = path.join(sandbox, "must-remain-absent-home");
-  process.env.HOME = syntheticHome;
+  // Declare the fixture root before the first apply; every target is inside it.
+  const fixture = useFixtureRoot(sandbox, { home: syntheticHome });
   try {
     const port = 49123;
     const generated = generateCodexConfigToml({
@@ -516,8 +517,7 @@ function main() {
 
     console.log(JSON.stringify({ issue: 123, ok: true, fixture: path.relative(root, fixturePath), checks }, null, 2));
   } finally {
-    if (operatorHome === undefined) delete process.env.HOME;
-    else process.env.HOME = operatorHome;
+    fixture.restore();
     fs.rmSync(sandbox, { recursive: true, force: true });
   }
 }
