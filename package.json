@@ -79,6 +79,7 @@
     "proof:codex-producer-token": "tsx scripts/codex-producer-token-proof.ts",
     "proof:setup-toml-reconcile": "tsx scripts/setup-toml-reconcile-proof.ts",
     "proof:claude-config-apply": "tsx scripts/claude-config-apply-proof.ts",
+    "proof:claude-seats-apply": "tsx scripts/claude-seats-apply-proof.ts",
     "proof:fixture-root-guard": "tsx scripts/fixture-root-guard-proof.ts",
     "proof:install-doctor": "tsx scripts/install-doctor-proof.ts",
     "proof:launch-agent": "tsx scripts/launch-agent-transaction-proof.ts",

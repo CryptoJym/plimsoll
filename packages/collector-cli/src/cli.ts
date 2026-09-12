@@ -161,6 +161,7 @@ import {
   applyGrokHookFile,
   diagnoseManagedCodexHookCommand,
   diagnoseManagedGrokHookCommand,
+  discoverClaudeSeats,
   generateClaudeCodeSettings,
   generateCodexConfigToml,
   generateCodexHookHeader,
@@ -2667,7 +2668,18 @@ async function main() {
       grokHeaderFile,
       codexHeaderFile,
     };
-    type SetupTargetName = "claude" | "gemini" | "grokHeaders" | "grok" | "codexHeaders" | "codex";
+    // Seat discovery is a plain read of the process home: the seat tooling
+    // owns ~/.claude-seats/<slug>, so setup manages what is already there and
+    // a seat created later is picked up by the next run.
+    const claudeSeats = discoverClaudeSeats(os.homedir()).filter((seat) => seat.hasSettings);
+    type SetupTargetName =
+      | "claude"
+      | `claudeSeat[${string}]`
+      | "gemini"
+      | "grokHeaders"
+      | "grok"
+      | "codexHeaders"
+      | "codex";
     type SetupTarget = {
       name: SetupTargetName;
       path: string;
@@ -2685,6 +2697,22 @@ async function main() {
         run: (options, preview) =>
           applyClaudeSettings(claudeFile, generateClaudeCodeSettings(options), { dryRun: preview }),
       },
+      // Fleet Claude seats (bead eco-6hoxj.48): every lane launched with
+      // CLAUDE_CONFIG_DIR=~/.claude-seats/<slug> reads that seat's
+      // settings.json instead of ~/.claude/settings.json, so it got no
+      // exporter and no hooks. Each discovered seat is its own target with the
+      // same managed content and the same additive merge as the `claude`
+      // target; the seat's own hooks and unknown keys survive untouched, and a
+      // seat directory without settings.json is skipped rather than created.
+      ...claudeSeats.map((seat): SetupTarget => ({
+        name: `claudeSeat[${seat.slug}]`,
+        path: seat.path,
+        run: (options, preview) =>
+          applyClaudeSettings(seat.path, generateClaudeCodeSettings(options), {
+            dryRun: preview,
+            managedTarget: `claudeSeat[${seat.slug}]`,
+          }),
+      })),
       {
         name: "gemini",
         path: geminiFile,
@@ -3103,6 +3131,23 @@ async function main() {
       codexHeaderFile: codexHeaderPath,
     };
     const claude = readClaudeTelemetryConfig(claudePath, generateClaudeCodeSettings(toolOptions));
+    // Fleet Claude seat coverage (bead eco-6hoxj.48). A seat whose settings.json
+    // carries no managed exporter or hooks emits transcript rows only, so it is
+    // reported here as a coverage diagnostic — slug and managed key names, never
+    // a value — without changing `ok`, which stays a health verdict.
+    const claudeSeats = discoverClaudeSeats(os.homedir()).map((seat) => {
+      if (!seat.hasSettings) {
+        return { slug: seat.slug, path: seat.path, status: "skipped" as const, missing: [] as string[] };
+      }
+      const read = readClaudeTelemetryConfig(seat.path, generateClaudeCodeSettings(toolOptions));
+      return {
+        slug: seat.slug,
+        path: seat.path,
+        status: read.status,
+        missing: read.missing,
+        ...(read.ok ? {} : { diagnostic: "claude_seat_settings_unmanaged" }),
+      };
+    });
     const codex = readCodexTelemetryConfig(codexPath, generateCodexConfigToml(toolOptions));
     const grokHookCommand = diagnoseManagedGrokHookCommand(grokHookPath);
     const codexHookCommand = diagnoseManagedCodexHookCommand(codexPath);
@@ -3207,6 +3252,7 @@ async function main() {
             ok: claude.ok && codex.ok,
             claude,
             codex,
+            claudeSeats,
           },
           ...(grokHookCommand ? { grokHookCommand } : {}),
           ...(codexHookCommand ? { codexHookCommand } : {}),

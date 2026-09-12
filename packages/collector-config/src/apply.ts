@@ -59,6 +59,16 @@ export type ClaudeApplyOptions = {
   };
 };
 
+/**
+ * Claude settings.json apply. `managedTarget` names the setup target the plan
+ * belongs to: the default `claude` target owns ~/.claude/settings.json, while a
+ * fleet seat (bead eco-6hoxj.48) owns ~/.claude-seats/<slug>/settings.json and
+ * reports `claudeSeat[<slug>].*` for exactly the same managed content.
+ */
+export type ClaudeSettingsApplyOptions = ClaudeApplyOptions & {
+  managedTarget?: string;
+};
+
 export class ClaudeConfigError extends Error {
   constructor(readonly code: string) {
     super(`CLAUDE_CONFIG_${code}`);
@@ -725,6 +735,7 @@ function reconcileClaudeDocument(
     /** Optional managed statusLine entry (issue #169). Strictly owned shape. */
     statusLine?: Record<string, unknown>;
   },
+  target = "claude",
 ) {
   const current = parseClaudeDocument(currentSource);
   if (!isJsonRecord(generated) || !isJsonRecord(generated.env)) claudeFail("INVALID_GENERATED_ENV");
@@ -751,11 +762,11 @@ function reconcileClaudeDocument(
   const plan: ApplyPlanEntry[] = [];
   for (const [key, value] of Object.entries(generated.env)) {
     if (!Object.hasOwn(env, key) || env[key] !== value) {
-      plan.push({ key: `claude.env.${key}`, action: Object.hasOwn(env, key) ? "updated" : "added" });
+      plan.push({ key: `${target}.env.${key}`, action: Object.hasOwn(env, key) ? "updated" : "added" });
       env[key] = value;
-      changes.push(`claude.env.${key}.set`);
+      changes.push(`${target}.env.${key}.set`);
     } else {
-      plan.push({ key: `claude.env.${key}`, action: "unchanged" });
+      plan.push({ key: `${target}.env.${key}`, action: "unchanged" });
     }
   }
 
@@ -789,10 +800,10 @@ function reconcileClaudeDocument(
     desired.push(...expectedEntries);
     if (!isDeepStrictEqual(existing, desired)) {
       hooks[event] = desired;
-      changes.push(`claude.hooks.${event}.reconcile`);
-      plan.push({ key: `claude.hooks.${event}`, action: existingValue === undefined ? "added" : "updated" });
+      changes.push(`${target}.hooks.${event}.reconcile`);
+      plan.push({ key: `${target}.hooks.${event}`, action: existingValue === undefined ? "added" : "updated" });
     } else {
-      plan.push({ key: `claude.hooks.${event}`, action: "unchanged" });
+      plan.push({ key: `${target}.hooks.${event}`, action: "unchanged" });
     }
   }
 
@@ -817,10 +828,10 @@ function reconcileClaudeDocument(
     }
     if (!isDeepStrictEqual(current.statusLine, generated.statusLine)) {
       next.statusLine = generated.statusLine;
-      changes.push("claude.statusLine.set");
-      plan.push({ key: "claude.statusLine", action: current.statusLine === undefined ? "added" : "updated" });
+      changes.push(`${target}.statusLine.set`);
+      plan.push({ key: `${target}.statusLine`, action: current.statusLine === undefined ? "added" : "updated" });
     } else {
-      plan.push({ key: "claude.statusLine", action: "unchanged" });
+      plan.push({ key: `${target}.statusLine`, action: "unchanged" });
     }
   }
   const reparsed = JSON.parse(`${JSON.stringify(next, null, 2)}\n`) as unknown;
@@ -838,12 +849,12 @@ export function applyClaudeSettings(
     hooks?: Record<string, unknown[]>;
     statusLine?: Record<string, unknown>;
   },
-  options: ClaudeApplyOptions = {},
+  options: ClaudeSettingsApplyOptions = {},
 ): ApplyResult {
   assertManagedConfigTarget(file);
   try {
     const { snapshot, current } = readClaudePreimage(file);
-    const plan = reconcileClaudeDocument(current, generated);
+    const plan = reconcileClaudeDocument(current, generated, options.managedTarget);
     if (plan.changes.length === 0 || options.dryRun) {
       if (snapshot.exists && snapshot.leaf) {
         assertVisibleClaudeContent(snapshot, snapshot.leaf, current);

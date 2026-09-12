@@ -136,6 +136,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:claude-config-apply
 
+      - name: Prove managed Claude seat settings reconciliation (eco-6hoxj.48)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:claude-seats-apply
+
       - name: Prove managed-config apply fails closed outside a fixture root
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:fixture-root-guard
