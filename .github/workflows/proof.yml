@@ -144,6 +144,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-profiles-apply
 
+      - name: Prove producer-token rotation covers the Codex seat profiles (eco-6hoxj.54)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-rotation-profiles
+
       - name: Prove managed-config apply fails closed outside a fixture root
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:fixture-root-guard

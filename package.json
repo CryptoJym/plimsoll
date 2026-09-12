@@ -77,6 +77,7 @@
     "proof:upload-timer-bounds": "tsx scripts/upload-timer-bounds-proof.ts",
     "proof:codex-config-apply": "tsx scripts/codex-config-apply-proof.ts",
     "proof:codex-producer-token": "tsx scripts/codex-producer-token-proof.ts",
+    "proof:codex-rotation-profiles": "tsx scripts/codex-rotation-profiles-proof.ts",
     "proof:setup-toml-reconcile": "tsx scripts/setup-toml-reconcile-proof.ts",
     "proof:claude-config-apply": "tsx scripts/claude-config-apply-proof.ts",
     "proof:claude-seats-apply": "tsx scripts/claude-seats-apply-proof.ts",

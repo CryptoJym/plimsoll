@@ -159,6 +159,8 @@ import {
   applyGeminiSettings,
   applyGrokHookHeaderFile,
   applyGrokHookFile,
+  claudeSeatsRoot,
+  codexProfilesRoot,
   diagnoseManagedCodexHookCommand,
   diagnoseManagedGrokHookCommand,
   discoverClaudeSeats,
@@ -1271,6 +1273,101 @@ function readCodexTelemetryConfig(file: string, expectedToml: string) {
   } catch {
     return { ok: false, status: "invalid" as const, path: file, missing: ["valid TOML"] };
   }
+}
+
+/**
+ * A dry run mints nothing, so the rotation plan for a discovered profile is
+ * previewed against this placeholder instead of a real successor token. It is
+ * never written (the preview is a dry-run apply), never printed, and is not a
+ * credential: it only makes the reconciler report the managed exporter header
+ * tables a real rotation would rewrite.
+ */
+const ROTATION_PREVIEW_TOKEN = "plimsoll-rotation-preview-placeholder";
+
+const CODEX_MANAGED_EXPORTERS = ["exporter", "trace_exporter", "metrics_exporter"] as const;
+
+/**
+ * Whether a discovered Codex seat profile is an authenticated consumer of the
+ * codex producer token (bead eco-6hoxj.54).
+ *
+ * `managed` means the file already carries the managed token header in at least
+ * one `[otel]` exporter table, whatever its value, so a profile that missed an
+ * earlier rotation is still rotated back into service rather than left holding
+ * a dead token. `unmanaged` means the fleet conductor's own config was never
+ * given the managed block: rotation supersedes credentials, it never
+ * provisions, so that profile is left byte-identical for the next
+ * `setup --yes`. `malformed` is fleet-conductor state that Plimsoll cannot
+ * parse; it is reported and never rewritten, exactly as `setup` reports it
+ * without failing the run.
+ */
+function codexProfileTokenState(file: string): "managed" | "unmanaged" | "malformed" {
+  const record = (value: unknown) =>
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : undefined;
+  let parsed: Record<string, unknown> | undefined;
+  try {
+    parsed = record(parseToml(fs.readFileSync(file, "utf8")));
+  } catch {
+    return "malformed";
+  }
+  const otel = record(parsed?.otel);
+  const carriesToken = CODEX_MANAGED_EXPORTERS.some((exporter) => {
+    const headers = record(record(record(otel?.[exporter])?.["otlp-http"])?.headers);
+    return headers !== undefined && Object.hasOwn(headers, "x-plimsoll-token");
+  });
+  return carriesToken ? "managed" : "unmanaged";
+}
+
+/**
+ * Value-blind receipt for the discovered profiles a rotation did not rewrite:
+ * slug, path and reason, never a token and never a malformed byte. Omitted
+ * entirely when there is nothing to report, so a host without fleet profiles
+ * prints exactly the payload it printed before this bead.
+ */
+function skippedProfilesReceipt(
+  skipped: ReadonlyArray<{ profile: { slug: string; path: string }; state: string }>,
+) {
+  if (skipped.length === 0) return {};
+  return {
+    profilesSkipped: skipped.map(({ profile, state }) => ({
+      slug: profile.slug,
+      path: profile.path,
+      status: "skipped" as const,
+      reason: state === "malformed"
+        ? "codex_profile_config_unreadable"
+        : "codex_profile_config_unmanaged",
+    })),
+  };
+}
+
+/**
+ * A doctor-reportable path for a discovered seat or profile: never an absolute
+ * path outside `$HOME` (bead eco-6hoxj.54, review r1 finding 3).
+ *
+ * Discovery deliberately reports a symlinked seat/profile at its resolved path
+ * so the managed-config guard and every apply receipt name the file actually
+ * written (claude-seats.ts / codex-profiles.ts). For a seat the tooling
+ * relocated to shared storage that resolved path is outside the home, and a
+ * doctor receipt shipped off-box would then carry a filesystem layout that is
+ * none of Plimsoll's business. The link path under `$HOME` names the same seat
+ * without it, so that is what doctor reports, with `outsideHome: true` so the
+ * receipt still says the file is not where it looks. Nothing else changes: a
+ * seat that lives under the home is reported exactly as before.
+ */
+function homeScopedDiscoveredPath(resolved: string, linkPath: string, home: string) {
+  return isInsideHome(resolved, home) ? { path: resolved } : { path: linkPath, outsideHome: true as const };
+}
+
+/** True when `file` is the home or sits under it, before or after the home itself resolves. */
+function isInsideHome(file: string, home: string) {
+  const roots = new Set([path.resolve(home)]);
+  try {
+    roots.add(fs.realpathSync(home));
+  } catch {
+    // An unreadable home cannot widen the boundary; the literal path still holds.
+  }
+  return [...roots].some((root) => file === root || file.startsWith(root + path.sep));
 }
 
 function readLaunchAgentState(plistPath: string) {
@@ -2977,7 +3074,26 @@ async function main() {
       grokProducerToken: currentAuth.grokProducer,
       codexHeaderFile: rotateHeaderFile,
     };
-    const rotateTargets = [
+    // Fleet Codex seat profiles (bead eco-6hoxj.54). Since eco-6hoxj.52 every
+    // discovered ~/.codex-profiles/<slug>/config.toml carries this producer
+    // token inline in its managed [otel] exporter headers, so a rotation that
+    // rewrote only ~/.codex left every profile lane posting a superseded token
+    // the moment the grace window closed. Each managed profile is rotated as
+    // its own target with the same backup-and-commit discipline the default
+    // target uses. A profile without the managed token is not an authenticated
+    // consumer and is never provisioned here — `setup` owns that — and one the
+    // conductor left unparseable is reported rather than rewritten.
+    const rotateProfiles = discoverCodexProfiles(os.homedir())
+      .filter((profile) => profile.hasConfig)
+      .map((profile) => ({ profile, state: codexProfileTokenState(profile.path) }));
+    const rotateProfilesSkipped = rotateProfiles.filter((entry) => entry.state !== "managed");
+    type RotateTarget = {
+      path: string;
+      /** True for a target found on disk rather than declared by Plimsoll. */
+      discovered?: true;
+      run: (options: typeof rotateOptions, preview: boolean) => ReturnType<typeof applyCodexConfig>;
+    };
+    const rotateTargets: RotateTarget[] = [
       {
         path: rotateHeaderFile,
         run: (options: typeof rotateOptions, preview: boolean) =>
@@ -2988,18 +3104,35 @@ async function main() {
         run: (options: typeof rotateOptions, preview: boolean) =>
           applyCodexConfig(rotateCodexFile, generateCodexConfigToml(options), { dryRun: preview }),
       },
+      ...rotateProfiles
+        .filter((entry) => entry.state === "managed")
+        .map(({ profile }): RotateTarget => ({
+          path: profile.path,
+          discovered: true,
+          run: (options: typeof rotateOptions, preview: boolean) =>
+            applyCodexConfig(profile.path, generateCodexConfigToml(options), {
+              dryRun: preview,
+              managedTarget: `codexProfile[${profile.slug}]`,
+            }),
+        })),
     ];
     // Preflight against the CURRENT token. A refusal here leaves the credential
     // file untouched, so an installed config is never left holding a token the
     // collector has already superseded.
     const preflight = rotateTargets.map((target) => {
       try {
-        return { path: target.path, refusal: target.run(rotateOptions, true).conflict };
+        return { target, refusal: target.run(rotateOptions, true).conflict };
       } catch (error) {
-        return { path: target.path, refusal: error instanceof Error ? error.message : String(error) };
+        return { target, refusal: error instanceof Error ? error.message : String(error) };
       }
     });
-    const refusedTargets = preflight.filter((entry) => entry.refusal);
+    // A discovered profile is the fleet conductor's file, not Plimsoll's, so it
+    // refuses alone: one half-written profile must not block the rotation of
+    // ~/.codex or of the other profiles, exactly as `setup` refuses a discovered
+    // target without failing the run (see ownedRefusal above).
+    const refusedTargets = preflight
+      .filter((entry) => entry.refusal && !entry.target.discovered)
+      .map((entry) => ({ path: entry.target.path, refusal: entry.refusal }));
     if (refusedTargets.length > 0) {
       console.log(JSON.stringify({
         status: "rotation_refused",
@@ -3015,12 +3148,28 @@ async function main() {
       return;
     }
     if (rotateDryRun) {
+      // A dry run mints nothing, so the plan lines for the discovered profiles
+      // are previewed against a placeholder that is never written and never
+      // printed: it only makes the reconciler report the managed exporter
+      // headers a real rotation would rewrite.
+      for (const target of rotateTargets.filter((entry) => entry.discovered)) {
+        let preview: ReturnType<typeof applyCodexConfig> | undefined;
+        try {
+          preview = target.run({ ...rotateOptions, codexProducerToken: ROTATION_PREVIEW_TOKEN }, true);
+        } catch {
+          preview = undefined;
+        }
+        for (const entry of preview?.plan ?? []) {
+          console.log(`${target.path}: ${entry.key} ${entry.action}`);
+        }
+      }
       console.log(JSON.stringify({
         status: "rotation_dry_run",
         source: "codex",
         rotated: false,
         graceSeconds,
         targets: rotateTargets.map((target) => ({ path: target.path, status: "would_rotate" })),
+        ...skippedProfilesReceipt(rotateProfilesSkipped),
       }, null, 2));
       return;
     }
@@ -3037,10 +3186,16 @@ async function main() {
         rotateResults.push({ path: target.path, status: "not_attempted", backup: null });
         continue;
       }
+      const preflightRefusal = preflight.find((entry) => entry.target === target)?.refusal;
+      if (preflightRefusal) {
+        // Only a discovered target reaches here: an owned refusal returned above.
+        rotateResults.push({ path: target.path, status: "refused", backup: null, reason: preflightRefusal });
+        continue;
+      }
       try {
         const result = target.run(rotatedOptions, false);
         if (result.conflict) {
-          rotateFailure = true;
+          if (!target.discovered) rotateFailure = true;
           rotateResults.push({ path: target.path, status: "refused", backup: null, reason: result.conflict });
           continue;
         }
@@ -3050,7 +3205,7 @@ async function main() {
           backup: result.backupPath ?? null,
         });
       } catch (error) {
-        rotateFailure = true;
+        if (!target.discovered) rotateFailure = true;
         rotateResults.push({
           path: target.path,
           status: "failed",
@@ -3066,6 +3221,7 @@ async function main() {
       graceSeconds,
       previousTokenExpiresAt: new Date(rotation.expiresAt).toISOString(),
       targets: rotateResults,
+      ...skippedProfilesReceipt(rotateProfilesSkipped),
       nextSteps: rotateFailure
         ? [
             "the new token is already provisioned; re-run rotate-producer-token after resolving the refusal",
@@ -3073,6 +3229,13 @@ async function main() {
           ]
         : [
             "restart any running Codex sessions before previousTokenExpiresAt",
+            // A discovered profile that refused keeps the superseded token, so
+            // the operator is told how to repair it while the window is open.
+            ...(rotateResults.some((entry) =>
+              entry.status === "refused" || entry.status === "failed"
+            )
+              ? ["plimsoll setup --yes   # a discovered Codex seat profile refused the rotation"]
+              : []),
             "plimsoll doctor --read-only --json   # producerTokenRotation.codex reports the deadline",
           ],
     }, null, 2));
@@ -3181,13 +3344,21 @@ async function main() {
     // reported here as a coverage diagnostic — slug and managed key names, never
     // a value — without changing `ok`, which stays a health verdict.
     const claudeSeats = discoverClaudeSeats(os.homedir()).map((seat) => {
+      // The same path hygiene the Codex profiles get below: a seat relocated
+      // out of the home is named by its link under the home, never by an
+      // absolute path outside it.
+      const seatPath = homeScopedDiscoveredPath(
+        seat.path,
+        path.join(claudeSeatsRoot(os.homedir()), seat.slug, "settings.json"),
+        os.homedir(),
+      );
       if (!seat.hasSettings) {
-        return { slug: seat.slug, path: seat.path, status: "skipped" as const, missing: [] as string[] };
+        return { slug: seat.slug, ...seatPath, status: "skipped" as const, missing: [] as string[] };
       }
       const read = readClaudeTelemetryConfig(seat.path, generateClaudeCodeSettings(toolOptions));
       return {
         slug: seat.slug,
-        path: seat.path,
+        ...seatPath,
         // A seat file Plimsoll cannot parse or read is seat-tooling state, and
         // `setup` deliberately does not fail on it, so doctor is where it has to
         // show up: named `unreadable`, with the same coverage diagnostic and
@@ -3204,13 +3375,21 @@ async function main() {
     // coverage diagnostic — slug and managed key names, never a value — without
     // changing `ok`, which stays a health verdict.
     const codexProfiles = discoverCodexProfiles(os.homedir()).map((profile) => {
+      // A profile the conductor relocated to shared storage resolves outside
+      // the home; the receipt names its link under ~/.codex-profiles instead,
+      // so no doctor payload ever carries a filesystem layout outside $HOME.
+      const profilePath = homeScopedDiscoveredPath(
+        profile.path,
+        path.join(codexProfilesRoot(os.homedir()), profile.slug, "config.toml"),
+        os.homedir(),
+      );
       if (!profile.hasConfig) {
-        return { slug: profile.slug, path: profile.path, status: "skipped" as const, missing: [] as string[] };
+        return { slug: profile.slug, ...profilePath, status: "skipped" as const, missing: [] as string[] };
       }
       const read = readCodexTelemetryConfig(profile.path, generateCodexConfigToml(toolOptions));
       return {
         slug: profile.slug,
-        path: profile.path,
+        ...profilePath,
         // A profile file Plimsoll cannot parse or read is fleet-conductor
         // state, and `setup` deliberately does not fail on it, so doctor is
         // where it has to show up: named `unreadable`, with the same coverage

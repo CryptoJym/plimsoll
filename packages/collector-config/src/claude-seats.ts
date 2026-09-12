@@ -1,5 +1,6 @@
-import fs from "node:fs";
 import path from "node:path";
+
+import { discoverHomeDirectories } from "./discovered-homes";
 
 /**
  * Fleet Claude seats (bead eco-6hoxj.48). Conductor and lead lanes run Claude
@@ -9,10 +10,11 @@ import path from "node:path";
  * events, while a default-home session produced ~20 events.
  *
  * Discovery is the simplest contract that covers the fleet — one flat level of
- * seat directories under the process home — and it never provisions: a seat
- * directory without settings.json is reported and skipped, never created. Seat
- * homes outside ~/.claude-seats are out of scope; the seat tooling owns that
- * layout.
+ * seat directories under the process home, the walk the Codex seat profiles
+ * share since bead eco-6hoxj.54 (see discovered-homes.ts) — and it never
+ * provisions: a seat directory without settings.json is reported and skipped,
+ * never created. Seat homes outside ~/.claude-seats are out of scope; the seat
+ * tooling owns that layout.
  */
 export const CLAUDE_SEATS_DIRECTORY = ".claude-seats";
 
@@ -31,49 +33,6 @@ export function claudeSeatsRoot(home: string) {
 
 /** Every seat directory under `<home>/.claude-seats`, slug-ordered. */
 export function discoverClaudeSeats(home: string): ClaudeSeat[] {
-  const root = claudeSeatsRoot(home);
-  let entries: fs.Dirent[];
-  try {
-    entries = fs.readdirSync(root, { withFileTypes: true });
-  } catch {
-    // No seats on this host: not an error, there is simply nothing to manage.
-    return [];
-  }
-  const seats: ClaudeSeat[] = [];
-  for (const entry of entries) {
-    const directory = seatDirectory(root, entry);
-    if (directory === undefined) continue;
-    const file = path.join(directory, "settings.json");
-    seats.push({ slug: entry.name, path: file, hasSettings: isExistingFile(file) });
-  }
-  return seats.sort((left, right) => (left.slug < right.slug ? -1 : left.slug > right.slug ? 1 : 0));
-}
-
-/**
- * The directory a seats-root entry names, or undefined when the entry is not a
- * seat. readdirSync does not follow links, so a seat the tooling relocated to
- * shared storage and symlinked into ~/.claude-seats would otherwise be
- * invisible to both setup and doctor — the exact gap this bead exists to close.
- * A link is reported at its resolved path so the managed-config guard and every
- * receipt name the file actually written rather than the link; a dangling link
- * stays visible as a seat without settings.json instead of disappearing.
- */
-function seatDirectory(root: string, entry: fs.Dirent) {
-  const entryPath = path.join(root, entry.name);
-  if (entry.isDirectory()) return entryPath;
-  if (!entry.isSymbolicLink()) return undefined;
-  try {
-    const resolved = fs.realpathSync(entryPath);
-    return fs.statSync(resolved).isDirectory() ? resolved : undefined;
-  } catch {
-    return entryPath;
-  }
-}
-
-function isExistingFile(file: string) {
-  try {
-    return fs.statSync(file).isFile();
-  } catch {
-    return false;
-  }
+  return discoverHomeDirectories(home, CLAUDE_SEATS_DIRECTORY, "settings.json")
+    .map(({ slug, path: file, exists }) => ({ slug, path: file, hasSettings: exists }));
 }
