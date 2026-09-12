@@ -3,6 +3,7 @@ export * from "./account-assertion";
 export * from "./account-salt";
 export * from "./config";
 export * from "./device-identity";
+export * from "./hook-spool";
 export * from "./http-transport";
 export * from "./grok-session-discovery";
 export * from "./local-hook-client";

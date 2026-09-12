@@ -212,6 +212,9 @@ jobs:
       - name: Prove zero-value OTLP span admission (eco-6hoxj.60)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:otlp-admission
+      - name: Prove hook events survive collector 503/refused via the per-home spool (eco-6hoxj.61)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:hook-spool
       - name: Prove bounded admission-rejection diagnostics (runner-scaled)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:rejection-aggregation
