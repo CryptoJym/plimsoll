@@ -261,6 +261,15 @@ Commands:
                         Ledger is opened read-only; rows are never marked uploaded.
                         Safe alongside the live 5-minute sync: the cloud dedupes by
                         event id, so overlap deduplicates instead of duplicating.
+  upload-replay         Re-queue dead-lettered deliveries after the remote contract that
+                        rejected them was fixed (remote reasons only; local privacy,
+                        quarantine, oversize and schema receipts stay final). Only
+                        re-queues — delivery happens on the normal upload cycles, so it
+                        is safe to run while the upload circuit is open. This is the
+                        recovery path for the one-way door in the upload cycle: once a
+                        durable validation witness proves the endpoint contract, every
+                        delivery of the rejected source is dead-lettered in that one
+                        cycle instead of being held by a host-wide circuit.
   push-repo-labels      Disclose repo display names to the joined workspace so dashboards
                         show github.com/owner/name instead of sha256 hashes. Previews the
                         exact payload first; --dry-run to only preview.
@@ -321,6 +330,16 @@ Config tools:
       grow-only by deterministic session id — re-running over the same --until
       changes nothing. The daemon refreshes touched sessions after each 5-minute
       sync; this command is the full backfill and the post-restart recovery tool.
+  upload-replay --reason <receipt reason> [--since ISO-8601] [--limit N] [--dry-run]
+      Supersede dead upload receipts whose reason is remote (remote_validation_rejected,
+      remote_rejected_exhausted) and hand their raw rows back to the normal enqueue path.
+      Local reasons are refused. --limit defaults to 500 and is capped at 5000; --since
+      filters on when the delivery died. A delivery already re-queued or already
+      acknowledged is counted as skipped, so re-running is a no-op — and an
+      already-replayed row never consumes a slot of --limit, so a lifetime of replays
+      can never crowd out a dead letter written today. When a full --limit re-queues
+      nothing the JSON carries a hint naming --since. --dry-run classifies with zero
+      writes.
   push-repo-labels [--dry-run] [--yes] [--url URL]
   sync-outcomes --repository owner/repo [--since-days 30] [--rework-window-days 14] [--until ISO] [--dry-run] [--url URL]
       Same fetch surface as the local efficiency report (pull list, check-runs and
@@ -3347,6 +3366,45 @@ async function main() {
       url: optionValue("--url"),
     });
     if (!result.ok) process.exitCode = 1;
+    return;
+  }
+
+  if (command === "upload-replay") {
+    // Bead .46: a dead letter written for a remote reason records the cloud
+    // rejecting an envelope, not a decision about the row. Once that contract
+    // is fixed the delivery is viable again, so replay supersedes the dead
+    // receipt and re-queues the raw row. It never uploads: delivery happens on
+    // the ordinary `upload` cycles, which keeps it safe to run while the
+    // upload circuit is open.
+    const reason = optionValue("--reason");
+    if (!reason) {
+      throw new Error(
+        "upload-replay requires --reason <receipt reason>, e.g. --reason remote_validation_rejected",
+      );
+    }
+    const limitRaw = optionValue("--limit");
+    let limit: number | undefined;
+    if (limitRaw !== undefined) {
+      limit = Number(limitRaw);
+      if (!Number.isFinite(limit) || Math.trunc(limit) < 1) {
+        throw new Error(`upload-replay --limit expects a positive number, got: ${limitRaw}`);
+      }
+    }
+    // Replay is a recovery tool: it must work on a host whose upload URL is
+    // not configured in this invocation, so delivery bookkeeping is enabled
+    // explicitly rather than inferred from the config.
+    const buffer = openBuffer(config, true);
+    try {
+      const summary = buffer.delivery.replayDeadLetters({
+        reason,
+        since: optionValue("--since"),
+        limit,
+        dryRun: flag("--dry-run"),
+      });
+      console.log(JSON.stringify(summary, null, 2));
+    } finally {
+      buffer.close();
+    }
     return;
   }
 
