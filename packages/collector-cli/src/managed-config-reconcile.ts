@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { collectorConfigSchema } from "./config";
 import {
   type ApplyPlanEntry,
   type ApplyResult,
@@ -62,29 +63,86 @@ export type ManagedConfigTarget = {
   run: (options: ToolConfigOptions, dryRun: boolean) => ApplyResult;
 };
 
+export type ManagedConfigTargetOptions = {
+  /**
+   * Also compose a discovered seat/profile directory whose config file does
+   * not exist (review r1, F7). Reconcile then reports it as `skipped: absent`
+   * instead of leaving it out of the report entirely, so an operator reading a
+   * receipt can tell "this seat has no settings.json yet" from "this seat does
+   * not exist". It is still never provisioned: the absent target is skipped at
+   * the file witness, before anything can write.
+   *
+   * `setup` never passes this. Its target list is the set of files it may
+   * write, and composing an absent seat there would make the installer create
+   * a file the seat tooling owns.
+   */
+  includeAbsent?: boolean;
+};
+
+/** Identity of the file as the plan saw it; a concurrent writer changes it. */
+export type FileWitness = { mtimeMs: number; size: number; inode: number; device: number };
+
+function witness(file: string): FileWitness | null {
+  try {
+    const stat = fs.lstatSync(file);
+    if (!stat.isFile()) return null;
+    return { mtimeMs: stat.mtimeMs, size: stat.size, inode: stat.ino, device: stat.dev };
+  } catch {
+    return null;
+  }
+}
+
+function sameWitness(left: FileWitness, right: FileWitness) {
+  return (
+    left.mtimeMs === right.mtimeMs &&
+    left.size === right.size &&
+    left.inode === right.inode &&
+    left.device === right.device
+  );
+}
+
+function readWitness(value: unknown): FileWitness | null {
+  if (!value || typeof value !== "object") return null;
+  const record = value as Record<string, unknown>;
+  const numbers = ["mtimeMs", "size", "inode", "device"] as const;
+  if (!numbers.every((key) => typeof record[key] === "number" && Number.isFinite(record[key]))) {
+    return null;
+  }
+  return {
+    mtimeMs: record.mtimeMs as number,
+    size: record.size as number,
+    inode: record.inode as number,
+    device: record.device as number,
+  };
+}
+
 /**
  * The `claude` target plus every discovered fleet seat, in setup's order.
  * A seat directory without settings.json is skipped rather than created, so the
  * composed list is exactly what setup composes today.
  */
-export function composeManagedClaudeTargets(claudeFile: string, home: string): ManagedConfigTarget[] {
+export function composeManagedClaudeTargets(
+  claudeFile: string,
+  home: string,
+  options: ManagedConfigTargetOptions = {},
+): ManagedConfigTarget[] {
   return [
     {
       name: "claude",
       path: claudeFile,
       family: "claude",
-      run: (options, preview) =>
-        applyClaudeSettings(claudeFile, generateClaudeCodeSettings(options), { dryRun: preview }),
+      run: (toolOptions, preview) =>
+        applyClaudeSettings(claudeFile, generateClaudeCodeSettings(toolOptions), { dryRun: preview }),
     },
     ...discoverClaudeSeats(home)
-      .filter((seat) => seat.hasSettings)
+      .filter((seat) => seat.hasSettings || options.includeAbsent === true)
       .map((seat): ManagedConfigTarget => ({
         name: `claudeSeat[${seat.slug}]`,
         path: seat.path,
         family: "claude",
         discovered: true,
-        run: (options, preview) =>
-          applyClaudeSettings(seat.path, generateClaudeCodeSettings(options), {
+        run: (toolOptions, preview) =>
+          applyClaudeSettings(seat.path, generateClaudeCodeSettings(toolOptions), {
             dryRun: preview,
             managedTarget: `claudeSeat[${seat.slug}]`,
           }),
@@ -93,24 +151,28 @@ export function composeManagedClaudeTargets(claudeFile: string, home: string): M
 }
 
 /** The `codex` target plus every discovered fleet seat profile, in setup's order. */
-export function composeManagedCodexTargets(codexFile: string, home: string): ManagedConfigTarget[] {
+export function composeManagedCodexTargets(
+  codexFile: string,
+  home: string,
+  options: ManagedConfigTargetOptions = {},
+): ManagedConfigTarget[] {
   return [
     {
       name: "codex",
       path: codexFile,
       family: "codex",
-      run: (options, preview) =>
-        applyCodexConfig(codexFile, generateCodexConfigToml(options), { dryRun: preview }),
+      run: (toolOptions, preview) =>
+        applyCodexConfig(codexFile, generateCodexConfigToml(toolOptions), { dryRun: preview }),
     },
     ...discoverCodexProfiles(home)
-      .filter((profile) => profile.hasConfig)
+      .filter((profile) => profile.hasConfig || options.includeAbsent === true)
       .map((profile): ManagedConfigTarget => ({
         name: `codexProfile[${profile.slug}]`,
         path: profile.path,
         family: "codex",
         discovered: true,
-        run: (options, preview) =>
-          applyCodexConfig(profile.path, generateCodexConfigToml(options), {
+        run: (toolOptions, preview) =>
+          applyCodexConfig(profile.path, generateCodexConfigToml(toolOptions), {
             dryRun: preview,
             managedTarget: `codexProfile[${profile.slug}]`,
           }),
@@ -123,10 +185,11 @@ export function composeManagedConfigTargets(
   claudeFile: string,
   codexFile: string,
   home: string,
+  options: ManagedConfigTargetOptions = {},
 ): ManagedConfigTarget[] {
   return [
-    ...composeManagedClaudeTargets(claudeFile, home),
-    ...composeManagedCodexTargets(codexFile, home),
+    ...composeManagedClaudeTargets(claudeFile, home, options),
+    ...composeManagedCodexTargets(codexFile, home, options),
   ];
 }
 
@@ -176,6 +239,34 @@ export function managedConfigDriftReport(
   };
 }
 
+/**
+ * The same readback, yielding to the event loop between targets (review r1,
+ * F6). The daemon's drift readback runs on every due tick on a healthy host,
+ * so it is the one path that must never hold the collector's HTTP loop for a
+ * whole fleet of seats and profiles at once.
+ */
+export async function managedConfigDriftReportAsync(
+  targets: ManagedConfigTarget[],
+  options: ToolConfigOptions,
+  read: (target: ManagedConfigTarget, options: ToolConfigOptions) => ManagedConfigReadback,
+): Promise<ManagedConfigDriftReport> {
+  const entries: ManagedConfigDriftEntry[] = [];
+  for (const target of targets) {
+    await yieldToEventLoop();
+    const readback = read(target, options);
+    entries.push({
+      name: target.name,
+      status: readback.status,
+      drifted: readback.status === "incomplete",
+    });
+  }
+  return {
+    drifted: entries.filter((entry) => entry.drifted).length,
+    unreadable: entries.filter((entry) => entry.status === "invalid").length,
+    targets: entries,
+  };
+}
+
 export type ManagedConfigReconcileTargetStatus =
   | "applied"
   | "unchanged"
@@ -185,7 +276,8 @@ export type ManagedConfigReconcileTargetStatus =
 export type ManagedConfigReconcileSkipReason =
   | "absent"
   | "backoff"
-  | "changed_during_plan";
+  | "changed_during_plan"
+  | "changed_during_apply";
 
 export type ManagedConfigReconcileTargetReport = {
   name: ManagedConfigTargetName;
@@ -201,16 +293,15 @@ export type ManagedConfigReconcileTargetReport = {
 };
 
 export type ManagedConfigReconcileResult = {
-  status:
-    | "managed_config_reconciled"
-    | "managed_config_unchanged"
-    | "managed_config_not_configured";
+  status: "managed_config_reconciled" | "managed_config_unchanged";
   startedAt: string;
   durationMs: number;
   applied: number;
   unchanged: number;
   skipped: number;
   refused: number;
+  /** Seat/profile directories that exist with no config file yet (review r1, F7). */
+  absent: number;
   /** True when a target Plimsoll declares (not a discovered seat/profile) refused. */
   ownedRefusal: boolean;
   targets: ManagedConfigReconcileTargetReport[];
@@ -222,22 +313,64 @@ export const MANAGED_CONFIG_REFUSAL_BACKOFF_MS = 60 * 60 * 1000;
 
 export const DEFAULT_MANAGED_CONFIG_RECONCILE_INTERVAL_SECONDS = 600;
 
+/**
+ * Litter bounds (review r1, F5). Backups are written *beside* the managed file,
+ * i.e. inside the fleet-owned ~/.claude-seats/<slug>/ and
+ * ~/.codex-profiles/<slug>/ directories, and receipts land in the collector
+ * home; nothing pruned them, so a writer that drops the managed block on a
+ * schedule shorter than the cadence littered both directories without bound.
+ *
+ * Only the reconcile prunes, and only the files Plimsoll itself wrote:
+ * `setup --yes` keeps its existing backup policy (it has never pruned) so the
+ * installer's rollback material is untouched by this change.
+ */
+export const MANAGED_CONFIG_BACKUPS_KEPT_PER_FILE = 5;
+export const MANAGED_CONFIG_RECEIPTS_KEPT = 20;
+/** A backup this young is never pruned, whatever the count: it is live rollback material. */
+export const MANAGED_CONFIG_BACKUP_MIN_AGE_MS = 24 * 60 * 60 * 1000;
+
+export type ManagedConfigReconcilePruneOptions = {
+  backupsPerFile?: number;
+  receipts?: number;
+  minBackupAgeMs?: number;
+};
+
+/** What the last run did, for doctor (review r1, F2). */
+export type ManagedConfigReconcileLastResult = "unchanged" | "applied" | "refused" | "skipped";
+
+/** Per-target refusal backoff, with the file identity the refusal was about. */
+type ManagedConfigBackoffEntry = {
+  until: string;
+  /** The refused file's identity; a different identity means the file was fixed. */
+  witness: FileWitness | null;
+};
+
 type ManagedConfigReconcileState = {
   version: 1;
   lastRunAt: string | null;
+  lastResult: ManagedConfigReconcileLastResult | null;
   lastApplied: number;
   lastRefused: number;
-  /** Per-target refusal backoff: target name -> ISO deadline. */
-  backoff: Record<string, string>;
+  lastAbsent: number;
+  backoff: Record<string, ManagedConfigBackoffEntry>;
 };
 
 const EMPTY_STATE: ManagedConfigReconcileState = {
   version: 1,
   lastRunAt: null,
+  lastResult: null,
   lastApplied: 0,
   lastRefused: 0,
+  lastAbsent: 0,
   backoff: {},
 };
+
+const LAST_RESULTS: readonly ManagedConfigReconcileLastResult[] = [
+  "unchanged",
+  "applied",
+  "refused",
+  "skipped",
+];
 
 export function managedConfigReconcileStatePath(collectorHome: string) {
   return path.join(collectorHome, "managed-config-reconcile-state.json");
@@ -250,15 +383,28 @@ export function readManagedConfigReconcileState(collectorHome: string): ManagedC
       fs.readFileSync(managedConfigReconcileStatePath(collectorHome), "utf8"),
     ) as Partial<ManagedConfigReconcileState>;
     if (!parsed || typeof parsed !== "object") return { ...EMPTY_STATE };
-    const backoff: Record<string, string> = {};
-    for (const [name, until] of Object.entries(parsed.backoff ?? {})) {
-      if (typeof until === "string" && Number.isFinite(Date.parse(until))) backoff[name] = until;
+    const backoff: Record<string, ManagedConfigBackoffEntry> = {};
+    for (const [name, entry] of Object.entries(parsed.backoff ?? {})) {
+      // A state file written before review r1 stored the deadline alone; it is
+      // read as a backoff with no witness, which simply never self-heals early.
+      const until = typeof entry === "string" ? entry : (entry as ManagedConfigBackoffEntry)?.until;
+      if (typeof until !== "string" || !Number.isFinite(Date.parse(until))) continue;
+      backoff[name] = {
+        until,
+        witness: typeof entry === "string" ? null : readWitness((entry as ManagedConfigBackoffEntry)?.witness),
+      };
     }
+    const lastResult = parsed.lastResult;
     return {
       version: 1,
       lastRunAt: typeof parsed.lastRunAt === "string" ? parsed.lastRunAt : null,
+      lastResult:
+        typeof lastResult === "string" && LAST_RESULTS.includes(lastResult as ManagedConfigReconcileLastResult)
+          ? (lastResult as ManagedConfigReconcileLastResult)
+          : null,
       lastApplied: Number.isSafeInteger(parsed.lastApplied) ? (parsed.lastApplied as number) : 0,
       lastRefused: Number.isSafeInteger(parsed.lastRefused) ? (parsed.lastRefused as number) : 0,
+      lastAbsent: Number.isSafeInteger(parsed.lastAbsent) ? (parsed.lastAbsent as number) : 0,
       backoff,
     };
   } catch {
@@ -280,6 +426,67 @@ function writeManagedConfigReconcileState(
 }
 
 /**
+ * Stamp a cadence tick that decided not to reconcile (review r1, F2).
+ *
+ * The stamp is what lets an operator tell "the cadence ran and found nothing"
+ * from "the cadence is wired wrong, crashed on its first tick, or was never
+ * registered". It is written only for a tick that actually performed the drift
+ * readback — never for `disabled` or `interval_not_elapsed`, because advancing
+ * `lastRunAt` on a tick that read nothing would push `nextEligibleAt` forward
+ * forever and make the interval gate inert.
+ *
+ * The backoff map is preserved: a no-drift tick is not a reason to retry a file
+ * Plimsoll already refused.
+ */
+export function stampManagedConfigReconcileRun(
+  collectorHome: string,
+  stamp: {
+    at: string;
+    result: ManagedConfigReconcileLastResult;
+    applied?: number;
+    refused?: number;
+    absent?: number;
+  },
+) {
+  const state = readManagedConfigReconcileState(collectorHome);
+  writeManagedConfigReconcileState(collectorHome, {
+    ...state,
+    lastRunAt: stamp.at,
+    lastResult: stamp.result,
+    lastApplied: stamp.applied ?? 0,
+    lastRefused: stamp.refused ?? 0,
+    lastAbsent: stamp.absent ?? 0,
+  });
+}
+
+/**
+ * Record a cadence tick that decided *not* to reconcile (review r1, F2).
+ *
+ * Exactly one decision stamps: `no_drift`, the tick that ran its readback over
+ * every managed target and found nothing to heal. That is the state a healthy
+ * fleet host sits in forever, and without the stamp doctor cannot tell it from
+ * a cadence that is wired wrong, crashed on its first tick, or was never
+ * registered. `disabled` and `interval_not_elapsed` deliberately do not stamp:
+ * they read nothing, and advancing `lastRunAt` on them would push
+ * `nextEligibleAt` forward forever and make the interval gate inert.
+ *
+ * Returns whether it stamped.
+ */
+export function stampManagedConfigReconcileDecision(
+  collectorHome: string,
+  decision: ManagedConfigReconcileDecision,
+  stamp: { at: string; absent?: number },
+): boolean {
+  if (decision.run || decision.reason !== "no_drift") return false;
+  stampManagedConfigReconcileRun(collectorHome, {
+    at: stamp.at,
+    result: "unchanged",
+    absent: stamp.absent,
+  });
+  return true;
+}
+
+/**
  * The doctor section. Key names and bounded counts only — never a managed value
  * and never a path.
  */
@@ -294,12 +501,57 @@ export function managedConfigReconcileDoctorSection(
     enabled: options.enabled,
     intervalSeconds: options.intervalSeconds,
     lastRunAt,
+    lastResult: state.lastResult,
     lastApplied: state.lastApplied,
     lastRefused: state.lastRefused,
+    lastAbsent: state.lastAbsent,
     nextEligibleAt: Number.isFinite(lastRunMs)
       ? new Date(lastRunMs + options.intervalSeconds * 1000).toISOString()
       : null,
   };
+}
+
+export type ManagedConfigReconcileSettings = {
+  enabled: boolean;
+  intervalSeconds: number;
+  /** Which source answered: the live config file, or the settings captured at boot. */
+  source: "config_file" | "boot_config";
+};
+
+/**
+ * The cadence's live settings, re-read from the collector config file
+ * (review r1, F3).
+ *
+ * The kill-switch has to take effect without a daemon restart: an operator who
+ * sets `managedConfig.reconcile.enabled: false` to stop the collector writing
+ * to seat files during a fleet seat migration sees doctor report `false`
+ * immediately — doctor reads the file fresh — and the running collector must
+ * agree rather than keep reconciling until someone restarts it. The interval is
+ * re-read with it, so a shortened or lengthened cadence also takes effect.
+ *
+ * A missing or unparseable config file falls back to the settings captured at
+ * boot, so a half-written config never silently disarms (or arms) the cadence.
+ * This reads Plimsoll's own config, never a managed file: a disabled cadence
+ * still performs no managed-config read or write of its own.
+ */
+export function readManagedConfigReconcileSettings(
+  configFile: string,
+  fallback: { enabled: boolean; intervalSeconds: number },
+): ManagedConfigReconcileSettings {
+  try {
+    const parsed = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(configFile, "utf8")));
+    return {
+      enabled: parsed.managedConfig.reconcile.enabled,
+      intervalSeconds: parsed.managedConfig.reconcile.intervalSeconds,
+      source: "config_file",
+    };
+  } catch {
+    return {
+      enabled: fallback.enabled,
+      intervalSeconds: fallback.intervalSeconds,
+      source: "boot_config",
+    };
+  }
 }
 
 export type ManagedConfigReconcileDecision = {
@@ -307,6 +559,35 @@ export type ManagedConfigReconcileDecision = {
   reason: "disabled" | "interval_not_elapsed" | "no_drift" | "drift";
   nextEligibleAt: string | null;
 };
+
+type ManagedConfigReconcileGateInput = {
+  enabled: boolean;
+  intervalSeconds: number;
+  now: number;
+  lastRunAt: number | null;
+};
+
+/**
+ * Everything the decision settles before it is allowed to read a managed file.
+ *
+ * Shared by the synchronous and the yielding decision so both honour the same
+ * order: the kill-switch is checked before anything reads the clock, and the
+ * interval is checked before `drift()` is called.
+ */
+function managedConfigReconcileGate(
+  input: ManagedConfigReconcileGateInput,
+): { decided: ManagedConfigReconcileDecision } | { nextEligibleAt: string } {
+  if (!input.enabled) {
+    return { decided: { run: false, reason: "disabled", nextEligibleAt: null } };
+  }
+  const intervalMs = Math.max(1, input.intervalSeconds) * 1000;
+  const nextEligible = input.lastRunAt === null ? input.now : input.lastRunAt + intervalMs;
+  const nextEligibleAt = new Date(nextEligible).toISOString();
+  if (nextEligible > input.now) {
+    return { decided: { run: false, reason: "interval_not_elapsed", nextEligibleAt } };
+  }
+  return { nextEligibleAt };
+}
 
 /**
  * The maintenance loop's decision, as a pure function so both states can be
@@ -317,47 +598,93 @@ export type ManagedConfigReconcileDecision = {
  * disabled or not-yet-due collector performs no managed-config filesystem reads
  * at all.
  */
-export function decideManagedConfigReconcile(input: {
-  enabled: boolean;
-  intervalSeconds: number;
-  now: number;
-  lastRunAt: number | null;
-  drift: () => number;
-}): ManagedConfigReconcileDecision {
-  if (!input.enabled) return { run: false, reason: "disabled", nextEligibleAt: null };
-  const intervalMs = Math.max(1, input.intervalSeconds) * 1000;
-  const nextEligible = input.lastRunAt === null ? input.now : input.lastRunAt + intervalMs;
-  const nextEligibleAt = new Date(nextEligible).toISOString();
-  if (nextEligible > input.now) return { run: false, reason: "interval_not_elapsed", nextEligibleAt };
+export function decideManagedConfigReconcile(
+  input: ManagedConfigReconcileGateInput & { drift: () => number },
+): ManagedConfigReconcileDecision {
+  const gate = managedConfigReconcileGate(input);
+  if ("decided" in gate) return gate.decided;
   return input.drift() > 0
-    ? { run: true, reason: "drift", nextEligibleAt }
-    : { run: false, reason: "no_drift", nextEligibleAt };
+    ? { run: true, reason: "drift", nextEligibleAt: gate.nextEligibleAt }
+    : { run: false, reason: "no_drift", nextEligibleAt: gate.nextEligibleAt };
 }
 
-/** Identity of the file as the plan saw it; a concurrent writer changes it. */
-type FileWitness = { mtimeMs: number; size: number; inode: number; device: number };
-
-function witness(file: string): FileWitness | null {
-  try {
-    const stat = fs.lstatSync(file);
-    if (!stat.isFile()) return null;
-    return { mtimeMs: stat.mtimeMs, size: stat.size, inode: stat.ino, device: stat.dev };
-  } catch {
-    return null;
-  }
+/**
+ * The daemon's decision. Identical to `decideManagedConfigReconcile` except
+ * that the drift readback may yield to the event loop between targets, so the
+ * collector's HTTP loop is never held for a whole fleet-scale readback
+ * (review r1, F6).
+ */
+export async function decideManagedConfigReconcileAsync(
+  input: ManagedConfigReconcileGateInput & { drift: () => Promise<number> },
+): Promise<ManagedConfigReconcileDecision> {
+  const gate = managedConfigReconcileGate(input);
+  if ("decided" in gate) return gate.decided;
+  return (await input.drift()) > 0
+    ? { run: true, reason: "drift", nextEligibleAt: gate.nextEligibleAt }
+    : { run: false, reason: "no_drift", nextEligibleAt: gate.nextEligibleAt };
 }
 
-function sameWitness(left: FileWitness, right: FileWitness) {
-  return (
-    left.mtimeMs === right.mtimeMs &&
-    left.size === right.size &&
-    left.inode === right.inode &&
-    left.device === right.device
-  );
+/** Hand the event loop back so one tick never becomes one long synchronous chunk. */
+export function yieldToEventLoop(): Promise<void> {
+  return new Promise((resolve) => {
+    setImmediate(resolve);
+  });
 }
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : String(error);
+}
+
+/**
+ * A transactional apply that lost a race with another writer (review r1, F4).
+ *
+ * `writeClaudePlan` / the Codex commit re-verify the bound descriptor and the
+ * visible content against the preimage at every step and fail closed when
+ * another writer lands inside the apply. That is a concurrency outcome, not a
+ * malformed file: it deserves the same response as `changed_during_plan` — skip
+ * this tick, arm no backoff, re-plan on the next one. Arming the one-hour
+ * refusal backoff instead would silence a perfectly healthy lane for an hour
+ * because the conductor happened to rewrite its profile inside a ~20 ms window.
+ *
+ * Claude-family failures carry a `<FAMILY>_CONFIG_<CODE>` code; the Codex
+ * family throws prose from `unsafePath`. Both are matched here, and both are
+ * matched conservatively: anything that is not recognisably a lost race stays a
+ * refusal with its backoff.
+ */
+const CONCURRENCY_FAILURE_CODES = new Set([
+  "COMMIT_CLAIM_COLLISION",
+  "COMMIT_CLAIM_MISMATCH",
+  "COMMIT_CLAIM_MISSING",
+  "COMMIT_CLAIM_RESTORE_FAILED",
+  "BOUND_IDENTITY_CHANGED",
+  "BOUND_CONTENT_CHANGED",
+  "LEAF_CHANGED",
+  "PATH_CHANGED",
+  "ANCESTOR_CHANGED",
+  "PARENT_CREATE_RACE",
+  "VISIBLE_IDENTITY_MISMATCH",
+  "VISIBLE_POSTCONDITION_CHANGED",
+  "PREPARED_LINK_COUNT",
+  "BACKUP_LINK_COUNT",
+]);
+
+const CONCURRENCY_FAILURE_PROSE = [
+  "identity changed after planning",
+  "ancestor changed after planning",
+  "was replaced after planning",
+  "was replaced while opening it",
+  "identity changed before commit",
+  "content changed before commit",
+  "changed while verifying the committed plan",
+  "does not match the committed plan",
+  "preimage could not be bound before commit",
+  "an ancestor appeared while inspecting",
+];
+
+export function isManagedConfigConcurrencyFailure(reason: string): boolean {
+  const code = /(?:^|\s)[A-Z][A-Z0-9]*_CONFIG_([A-Z0-9_]+)/.exec(reason)?.[1];
+  if (code && CONCURRENCY_FAILURE_CODES.has(code)) return true;
+  return CONCURRENCY_FAILURE_PROSE.some((phrase) => reason.includes(phrase));
 }
 
 export type ManagedConfigReconcileOptions = {
@@ -369,7 +696,299 @@ export type ManagedConfigReconcileOptions = {
   now?: () => number;
   /** Deterministic proof seam: runs after a target's plan, before its apply. */
   onPlanned?: (target: ManagedConfigTarget) => void;
+  /** Litter bounds; defaults are the exported constants. */
+  prune?: ManagedConfigReconcilePruneOptions;
 };
+
+type ReconcileRun = {
+  startedAtMs: number;
+  startedAt: string;
+  backoff: Record<string, ManagedConfigBackoffEntry>;
+  reports: ManagedConfigReconcileTargetReport[];
+};
+
+function beginReconcile(options: ManagedConfigReconcileOptions): ReconcileRun {
+  const now = options.now ?? (() => Date.now());
+  const startedAtMs = now();
+  return {
+    startedAtMs,
+    startedAt: new Date(startedAtMs).toISOString(),
+    backoff: { ...readManagedConfigReconcileState(options.collectorHome).backoff },
+    reports: [],
+  };
+}
+
+/**
+ * One target: backoff gate, witness, plan, re-witness, apply.
+ *
+ * Synchronous by construction — this is the unit of work the async driver
+ * yields *between*, so the longest chunk the collector's event loop ever owes
+ * this cadence is one target, not a whole fleet of them.
+ */
+function reconcileOneTarget(
+  run: ReconcileRun,
+  target: ManagedConfigTarget,
+  options: ManagedConfigReconcileOptions,
+) {
+  const base = {
+    name: target.name,
+    path: target.path,
+    discovered: target.discovered === true,
+  };
+  const held = run.backoff[target.name];
+  const heldUntil = held ? Date.parse(held.until) : Number.NaN;
+  if (held && Number.isFinite(heldUntil) && heldUntil > run.startedAtMs) {
+    const current = witness(target.path);
+    // A backoff is about a *file*, not a name. If the malformed file the
+    // refusal was about has since been replaced or edited, the fleet fixed it
+    // and the next tick should heal it rather than wait out the hour
+    // (review r1, F4). A backoff carrying no witness (pre-r2 state file) keeps
+    // the old behaviour and simply waits.
+    const recorded = held.witness;
+    const healed = recorded !== null && (current === null || !sameWitness(recorded, current));
+    if (!healed) {
+      // A file Plimsoll already refused is fleet state; retrying it every
+      // cadence would only reprint the same refusal.
+      run.reports.push({
+        ...base,
+        status: "skipped",
+        reason: "backoff" satisfies ManagedConfigReconcileSkipReason,
+        nextEligibleAt: held.until,
+      });
+      return;
+    }
+    delete run.backoff[target.name];
+  }
+  const before = witness(target.path);
+  if (before === null) {
+    // Reconcile never provisions: the seat/conductor tooling owns whether the
+    // file exists at all, and `setup --yes` owns first installation.
+    run.reports.push({
+      ...base,
+      status: "skipped",
+      reason: "absent" satisfies ManagedConfigReconcileSkipReason,
+    });
+    return;
+  }
+  const refuse = (reason: string, plan?: ApplyPlanEntry[]) => {
+    const until = new Date(run.startedAtMs + MANAGED_CONFIG_REFUSAL_BACKOFF_MS).toISOString();
+    run.backoff[target.name] = { until, witness: witness(target.path) };
+    run.reports.push({ ...base, status: "refused", ...(plan ? { plan } : {}), reason, nextEligibleAt: until });
+  };
+  let plan: ApplyResult;
+  try {
+    plan = target.run(options.toolOptions, true);
+  } catch (error) {
+    refuse(errorMessage(error));
+    return;
+  }
+  if (plan.conflict) {
+    refuse(plan.conflict, plan.plan);
+    return;
+  }
+  delete run.backoff[target.name];
+  if (!plan.changed) {
+    run.reports.push({ ...base, status: "unchanged", plan: plan.plan });
+    return;
+  }
+  if (options.dryRun) {
+    run.reports.push({ ...base, status: "applied", plan: plan.plan, backup: null, reason: "dry_run" });
+    return;
+  }
+  options.onPlanned?.(target);
+  const after = witness(target.path);
+  if (after === null || !sameWitness(before, after)) {
+    // Another writer owns this file right now. The plan was computed against
+    // content that no longer exists, so this run stands down; the next one
+    // plans the file as it is.
+    run.reports.push({
+      ...base,
+      status: "skipped",
+      plan: plan.plan,
+      reason: "changed_during_plan" satisfies ManagedConfigReconcileSkipReason,
+    });
+    return;
+  }
+  const lostTheRace = (entries: ApplyPlanEntry[] | undefined) => {
+    // The transactional apply fails closed when another writer lands inside
+    // it. That is the same fact as `changed_during_plan`, one window later:
+    // skip this tick, arm no backoff (review r1, F4).
+    run.reports.push({
+      ...base,
+      status: "skipped",
+      ...(entries ? { plan: entries } : {}),
+      reason: "changed_during_apply" satisfies ManagedConfigReconcileSkipReason,
+    });
+  };
+  try {
+    const applied = target.run(options.toolOptions, false);
+    if (applied.conflict) {
+      if (isManagedConfigConcurrencyFailure(applied.conflict)) {
+        lostTheRace(applied.plan ?? plan.plan);
+        return;
+      }
+      refuse(applied.conflict, applied.plan ?? plan.plan);
+      return;
+    }
+    run.reports.push({
+      ...base,
+      status: "applied",
+      plan: applied.plan ?? plan.plan,
+      backup: applied.backupPath ?? null,
+    });
+  } catch (error) {
+    const reason = errorMessage(error);
+    if (isManagedConfigConcurrencyFailure(reason)) {
+      lostTheRace(plan.plan);
+      return;
+    }
+    refuse(reason, plan.plan);
+  }
+}
+
+/**
+ * What the last run did, for doctor.
+ *
+ * A refusal is the thing an operator must see, so it wins over an apply that
+ * happened in the same run; `skipped` covers the concurrency and backoff skips
+ * that mean "this run stood down on a file". An `absent` skip is not one of
+ * those — a seat directory with no config file yet is reported in `lastAbsent`
+ * and must not make a perfectly clean cadence read as `skipped`.
+ */
+function lastResultOf(result: {
+  refused: number;
+  applied: number;
+  skipped: number;
+}): ManagedConfigReconcileLastResult {
+  if (result.refused > 0) return "refused";
+  if (result.applied > 0) return "applied";
+  if (result.skipped > 0) return "skipped";
+  return "unchanged";
+}
+
+/**
+ * Keep at most `keep` `.plimsoll-backup-*` files beside one managed file,
+ * oldest first, and never delete one younger than `minAgeMs` (review r1, F5).
+ *
+ * The backup name carries an ISO stamp, but the file's own mtime is what the
+ * age rule reads: a backup Plimsoll wrote a minute ago is live rollback
+ * material whatever the count says.
+ */
+function pruneBackups(file: string, keep: number, minAgeMs: number, nowMs: number): string[] {
+  const directory = path.dirname(file);
+  const prefix = `${path.basename(file)}.plimsoll-backup-`;
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(directory).filter((name) => name.startsWith(prefix));
+  } catch {
+    return [];
+  }
+  const withAge = entries
+    .map((name) => {
+      const full = path.join(directory, name);
+      try {
+        const stat = fs.lstatSync(full);
+        return stat.isFile() ? { full, mtimeMs: stat.mtimeMs, name } : null;
+      } catch {
+        return null;
+      }
+    })
+    .filter((entry): entry is { full: string; mtimeMs: number; name: string } => entry !== null)
+    // Newest first: everything past `keep` is a pruning candidate.
+    .sort((left, right) => right.mtimeMs - left.mtimeMs || right.name.localeCompare(left.name));
+  const removed: string[] = [];
+  for (const entry of withAge.slice(Math.max(0, keep))) {
+    if (nowMs - entry.mtimeMs < minAgeMs) continue;
+    try {
+      fs.unlinkSync(entry.full);
+      removed.push(entry.full);
+    } catch {
+      // Another writer owns it now; the next run re-counts.
+    }
+  }
+  return removed;
+}
+
+/** Keep at most `keep` reconcile receipts, oldest first. Only this cadence's own receipts. */
+function pruneReceipts(receiptsDirectory: string, keep: number): string[] {
+  let entries: string[];
+  try {
+    entries = fs
+      .readdirSync(receiptsDirectory)
+      .filter((name) => name.startsWith("managed-config-reconcile-") && name.endsWith(".json"));
+  } catch {
+    return [];
+  }
+  // The name carries the run's ISO stamp with `:`/`.` folded to `-`, so a plain
+  // lexicographic sort is chronological. Newest first.
+  const removed: string[] = [];
+  for (const name of entries.sort().reverse().slice(Math.max(0, keep))) {
+    try {
+      fs.unlinkSync(path.join(receiptsDirectory, name));
+      removed.push(name);
+    } catch {
+      // Another writer owns it now; the next run re-counts.
+    }
+  }
+  return removed;
+}
+
+function finishReconcile(
+  run: ReconcileRun,
+  options: ManagedConfigReconcileOptions,
+): ManagedConfigReconcileResult {
+  const now = options.now ?? (() => Date.now());
+  const count = (status: ManagedConfigReconcileTargetStatus) =>
+    run.reports.filter((report) => report.status === status).length;
+  const applied = count("applied");
+  const refused = count("refused");
+  const skipped = count("skipped");
+  const absent = run.reports.filter((report) => report.reason === "absent").length;
+  const ownedRefusal = run.reports.some((report) => report.status === "refused" && !report.discovered);
+  const result: ManagedConfigReconcileResult = {
+    status: applied > 0 ? "managed_config_reconciled" : "managed_config_unchanged",
+    startedAt: run.startedAt,
+    durationMs: now() - run.startedAtMs,
+    applied,
+    unchanged: count("unchanged"),
+    skipped,
+    refused,
+    absent,
+    ownedRefusal,
+    targets: run.reports,
+    receiptPath: null,
+  };
+  if (options.dryRun) return result;
+
+  writeManagedConfigReconcileState(options.collectorHome, {
+    version: 1,
+    lastRunAt: run.startedAt,
+    lastResult: lastResultOf({ applied, refused, skipped: skipped - absent }),
+    lastApplied: applied,
+    lastRefused: refused,
+    lastAbsent: absent,
+    backoff: run.backoff,
+  });
+  const keepBackups = options.prune?.backupsPerFile ?? MANAGED_CONFIG_BACKUPS_KEPT_PER_FILE;
+  const minBackupAgeMs = options.prune?.minBackupAgeMs ?? MANAGED_CONFIG_BACKUP_MIN_AGE_MS;
+  for (const report of run.reports) {
+    if (report.status === "applied" && report.backup) {
+      pruneBackups(report.path, keepBackups, minBackupAgeMs, run.startedAtMs);
+    }
+  }
+  if (applied === 0 && refused === 0) return result;
+  const receiptsDirectory = path.join(options.collectorHome, "receipts");
+  fs.mkdirSync(receiptsDirectory, { recursive: true, mode: 0o700 });
+  const receiptPath = path.join(
+    receiptsDirectory,
+    `managed-config-reconcile-${run.startedAt.replace(/[:.]/g, "-")}.json`,
+  );
+  fs.writeFileSync(receiptPath, `${JSON.stringify({ ...result, receiptPath }, null, 2)}\n`, {
+    mode: 0o600,
+  });
+  pruneReceipts(receiptsDirectory, options.prune?.receipts ?? MANAGED_CONFIG_RECEIPTS_KEPT);
+  return { ...result, receiptPath };
+}
 
 /**
  * Plan every managed target, then apply only the ones the plan changes.
@@ -378,149 +997,38 @@ export type ManagedConfigReconcileOptions = {
  * all-`unchanged` run is a true no-op: no backup, no receipt, no state write
  * beyond the run stamp, so the 10-minute daemon cadence on a healthy host
  * leaves the filesystem byte-identical apart from that stamp.
+ *
+ * This is the operator-command entrypoint (`setup --reconcile`), where holding
+ * the process for the whole run is exactly what the operator asked for. The
+ * daemon uses `runManagedConfigReconcileAsync` instead.
  */
 export function runManagedConfigReconcile(
   options: ManagedConfigReconcileOptions,
 ): ManagedConfigReconcileResult {
-  const now = options.now ?? (() => Date.now());
-  const startedAtMs = now();
-  const startedAt = new Date(startedAtMs).toISOString();
-  const state = readManagedConfigReconcileState(options.collectorHome);
-  const backoff = { ...state.backoff };
-  const reports: ManagedConfigReconcileTargetReport[] = [];
+  const run = beginReconcile(options);
+  for (const target of options.targets) reconcileOneTarget(run, target, options);
+  return finishReconcile(run, options);
+}
 
+/**
+ * The daemon's entrypoint: the same reconcile, yielding to the event loop
+ * between targets (review r1, F6).
+ *
+ * The collector serves /hooks/* and the OTLP receiver from this same process,
+ * so a fleet-scale churn run must never be one synchronous chunk. Each target
+ * is still applied synchronously — the transactional write must not be
+ * interleaved with itself — but the loop hands the event loop back between
+ * them, which bounds the longest stall this cadence can cause to one target's
+ * plan-and-apply.
+ */
+export async function runManagedConfigReconcileAsync(
+  options: ManagedConfigReconcileOptions,
+): Promise<ManagedConfigReconcileResult> {
+  const run = beginReconcile(options);
   for (const target of options.targets) {
-    const base = {
-      name: target.name,
-      path: target.path,
-      discovered: target.discovered === true,
-    };
-    const held = backoff[target.name];
-    const heldUntil = held ? Date.parse(held) : Number.NaN;
-    if (Number.isFinite(heldUntil) && heldUntil > startedAtMs) {
-      // A file Plimsoll already refused is fleet state; retrying it every
-      // cadence would only reprint the same refusal.
-      reports.push({
-        ...base,
-        status: "skipped",
-        reason: "backoff" satisfies ManagedConfigReconcileSkipReason,
-        nextEligibleAt: held,
-      });
-      continue;
-    }
-    const before = witness(target.path);
-    if (before === null) {
-      // Reconcile never provisions: the seat/conductor tooling owns whether the
-      // file exists at all, and `setup --yes` owns first installation.
-      reports.push({ ...base, status: "skipped", reason: "absent" satisfies ManagedConfigReconcileSkipReason });
-      continue;
-    }
-    let plan: ApplyResult;
-    try {
-      plan = target.run(options.toolOptions, true);
-    } catch (error) {
-      const until = new Date(startedAtMs + MANAGED_CONFIG_REFUSAL_BACKOFF_MS).toISOString();
-      backoff[target.name] = until;
-      reports.push({ ...base, status: "refused", reason: errorMessage(error), nextEligibleAt: until });
-      continue;
-    }
-    if (plan.conflict) {
-      const until = new Date(startedAtMs + MANAGED_CONFIG_REFUSAL_BACKOFF_MS).toISOString();
-      backoff[target.name] = until;
-      reports.push({
-        ...base,
-        status: "refused",
-        plan: plan.plan,
-        reason: plan.conflict,
-        nextEligibleAt: until,
-      });
-      continue;
-    }
-    delete backoff[target.name];
-    if (!plan.changed) {
-      reports.push({ ...base, status: "unchanged", plan: plan.plan });
-      continue;
-    }
-    if (options.dryRun) {
-      reports.push({ ...base, status: "applied", plan: plan.plan, backup: null, reason: "dry_run" });
-      continue;
-    }
-    options.onPlanned?.(target);
-    const after = witness(target.path);
-    if (after === null || !sameWitness(before, after)) {
-      // Another writer owns this file right now. The plan was computed against
-      // content that no longer exists, so this run stands down; the next one
-      // plans the file as it is.
-      reports.push({
-        ...base,
-        status: "skipped",
-        plan: plan.plan,
-        reason: "changed_during_plan" satisfies ManagedConfigReconcileSkipReason,
-      });
-      continue;
-    }
-    try {
-      const applied = target.run(options.toolOptions, false);
-      if (applied.conflict) {
-        const until = new Date(startedAtMs + MANAGED_CONFIG_REFUSAL_BACKOFF_MS).toISOString();
-        backoff[target.name] = until;
-        reports.push({
-          ...base,
-          status: "refused",
-          plan: applied.plan ?? plan.plan,
-          reason: applied.conflict,
-          nextEligibleAt: until,
-        });
-        continue;
-      }
-      reports.push({
-        ...base,
-        status: "applied",
-        plan: applied.plan ?? plan.plan,
-        backup: applied.backupPath ?? null,
-      });
-    } catch (error) {
-      const until = new Date(startedAtMs + MANAGED_CONFIG_REFUSAL_BACKOFF_MS).toISOString();
-      backoff[target.name] = until;
-      reports.push({ ...base, status: "refused", plan: plan.plan, reason: errorMessage(error), nextEligibleAt: until });
-    }
+    await yieldToEventLoop();
+    reconcileOneTarget(run, target, options);
   }
-
-  const count = (status: ManagedConfigReconcileTargetStatus) =>
-    reports.filter((report) => report.status === status).length;
-  const applied = count("applied");
-  const refused = count("refused");
-  const ownedRefusal = reports.some((report) => report.status === "refused" && !report.discovered);
-  const result: ManagedConfigReconcileResult = {
-    status: applied > 0 ? "managed_config_reconciled" : "managed_config_unchanged",
-    startedAt,
-    durationMs: now() - startedAtMs,
-    applied,
-    unchanged: count("unchanged"),
-    skipped: count("skipped"),
-    refused,
-    ownedRefusal,
-    targets: reports,
-    receiptPath: null,
-  };
-  if (options.dryRun) return result;
-
-  writeManagedConfigReconcileState(options.collectorHome, {
-    version: 1,
-    lastRunAt: startedAt,
-    lastApplied: applied,
-    lastRefused: refused,
-    backoff,
-  });
-  if (applied === 0 && refused === 0) return result;
-  const receiptsDirectory = path.join(options.collectorHome, "receipts");
-  fs.mkdirSync(receiptsDirectory, { recursive: true, mode: 0o700 });
-  const receiptPath = path.join(
-    receiptsDirectory,
-    `managed-config-reconcile-${startedAt.replace(/[:.]/g, "-")}.json`,
-  );
-  fs.writeFileSync(receiptPath, `${JSON.stringify({ ...result, receiptPath }, null, 2)}\n`, {
-    mode: 0o600,
-  });
-  return { ...result, receiptPath };
+  await yieldToEventLoop();
+  return finishReconcile(run, options);
 }

@@ -49,12 +49,20 @@ import {
   generateCodexConfigToml,
 } from "../packages/collector-config/src/index";
 import {
+  MANAGED_CONFIG_BACKUPS_KEPT_PER_FILE,
+  MANAGED_CONFIG_RECEIPTS_KEPT,
   type ManagedConfigReadback,
+  type ManagedConfigTarget,
   composeManagedClaudeTargets,
+  composeManagedCodexTargets,
   decideManagedConfigReconcile,
+  isManagedConfigConcurrencyFailure,
   managedConfigReconcileStatePath,
+  readManagedConfigReconcileSettings,
   readManagedConfigReconcileState,
   runManagedConfigReconcile,
+  runManagedConfigReconcileAsync,
+  stampManagedConfigReconcileDecision,
 } from "../packages/collector-cli/src/managed-config-reconcile";
 import { loadOrCreateLocalIngestAuth } from "../packages/collector-cli/src/local-auth";
 
@@ -69,6 +77,8 @@ const CHURNED_SEAT = "churned-seat";
 const QUIET_SEAT = "already-managed-seat";
 const CHURNED_PROFILE = "churned-profile";
 const MALFORMED_PROFILE = "malformed-profile";
+/** A seat directory that exists with no settings.json in it (review r1, F7). */
+const EMPTY_SEAT = "provisioned-but-empty-seat";
 /** Marker that must never reach a receipt; it lives in the malformed profile. */
 const MALFORMED_MARKER = "synthetic-malformed-profile-marker";
 
@@ -233,6 +243,10 @@ function commandChecks(fixtureRoot: string) {
   const churnedSeatFile = writeSeatSettings(seatsRoot, CHURNED_SEAT, fleetSeatDocument("r1"));
   const quietSeatFile = writeSeatSettings(seatsRoot, QUIET_SEAT, fleetSeatDocument("quiet"));
   const churnedProfileFile = writeProfileConfig(profilesRoot, CHURNED_PROFILE, fleetProfileToml("r1"));
+  // A seat directory the fleet created but has not written settings.json into
+  // yet (review r1, F7). Setup must not provision it and the reconcile must
+  // still name it, as `skipped: absent`, rather than drop it from the report.
+  fs.mkdirSync(path.join(seatsRoot, EMPTY_SEAT), { recursive: true, mode: 0o700 });
 
   const env = {
     HOME: home,
@@ -254,6 +268,13 @@ function commandChecks(fixtureRoot: string) {
     { code: installed.code },
   );
 
+  check(
+    "setup_yes_never_provisions_a_seat_directory_that_has_no_settings_file",
+    !fs.existsSync(path.join(seatsRoot, EMPTY_SEAT, "settings.json")) &&
+      lastJson(installed.stdout)[`claudeSeat[${EMPTY_SEAT}]`] === undefined,
+    { seat: EMPTY_SEAT },
+  );
+
   // ---- scenario 2: a healthy home reconciles to a true no-op ---------------
   const healthySeatDigest = digestOf(churnedSeatFile);
   const healthyProfileDigest = digestOf(churnedProfileFile);
@@ -269,8 +290,10 @@ function commandChecks(fixtureRoot: string) {
       healthyJson.refused === 0 &&
       healthyJson.receiptPath === null &&
       (healthyJson.targets as Array<Record<string, unknown>>)
+        .filter((entry) => entry.name !== `claudeSeat[${EMPTY_SEAT}]`)
         .every((entry) => entry.status === "unchanged") &&
-      (healthyJson.targets as unknown[]).length === 5 &&
+      (healthyJson.targets as unknown[]).length === 6 &&
+      healthyJson.absent === 1 &&
       receipts(plimsollHome).length === 0 &&
       digestOf(churnedSeatFile) === healthySeatDigest &&
       digestOf(churnedProfileFile) === healthyProfileDigest &&
@@ -282,12 +305,36 @@ function commandChecks(fixtureRoot: string) {
       receipts: receipts(plimsollHome).length,
     },
   );
+  const firstNoOpStamp = readManagedConfigReconcileState(plimsollHome);
+  const secondNoOp = runCli(["setup", "--reconcile"], env);
+  const secondNoOpStamp = readManagedConfigReconcileState(plimsollHome);
   check(
     "a_no_op_reconcile_still_stamps_the_run_so_the_cadence_can_space_itself",
-    readManagedConfigReconcileState(plimsollHome).lastRunAt !== null &&
-      readManagedConfigReconcileState(plimsollHome).lastApplied === 0 &&
+    firstNoOpStamp.lastRunAt !== null &&
+      firstNoOpStamp.lastApplied === 0 &&
       fs.existsSync(managedConfigReconcileStatePath(plimsollHome)),
-    { lastRunAt: typeof readManagedConfigReconcileState(plimsollHome).lastRunAt },
+    { lastRunAt: typeof firstNoOpStamp.lastRunAt },
+  );
+  check(
+    // review r1, F2: an operator must be able to tell "the cadence ran and
+    // found nothing" from "the cadence never ran".
+    "a_no_op_run_advances_the_stamp_and_records_unchanged_without_writing_a_receipt",
+    secondNoOp.code === 0 &&
+      secondNoOpStamp.lastResult === "unchanged" &&
+      firstNoOpStamp.lastResult === "unchanged" &&
+      secondNoOpStamp.lastRunAt !== null &&
+      Date.parse(String(secondNoOpStamp.lastRunAt)) >= Date.parse(String(firstNoOpStamp.lastRunAt)) &&
+      secondNoOpStamp.lastRunAt !== firstNoOpStamp.lastRunAt &&
+      secondNoOpStamp.lastApplied === 0 &&
+      secondNoOpStamp.lastRefused === 0 &&
+      secondNoOpStamp.lastAbsent === 1 &&
+      receipts(plimsollHome).length === 0,
+    {
+      first: firstNoOpStamp.lastRunAt,
+      second: secondNoOpStamp.lastRunAt,
+      lastResult: secondNoOpStamp.lastResult,
+      receipts: receipts(plimsollHome).length,
+    },
   );
 
   // ---- scenario 1: seat and profile churn, then reconcile -----------------
@@ -326,6 +373,7 @@ function commandChecks(fixtureRoot: string) {
       healedJson.applied === 2 &&
       healedJson.refused === 0 &&
       healedJson.unchanged === 3 &&
+      healedJson.absent === 1 &&
       healedSeat?.status === "applied" &&
       healedProfile?.status === "applied" &&
       targetReport(healedJson, `claudeSeat[${QUIET_SEAT}]`)?.status === "unchanged" &&
@@ -421,6 +469,18 @@ function commandChecks(fixtureRoot: string) {
     { receipts: receiptNames },
   );
 
+  check(
+    // review r1, F7: an operator reading a receipt could not tell "this seat
+    // has no settings.json yet" from "this seat does not exist".
+    "a_seat_directory_with_no_config_file_is_named_as_skipped_absent_in_the_receipt",
+    targetReport(receipt, `claudeSeat[${EMPTY_SEAT}]`)?.status === "skipped" &&
+      targetReport(receipt, `claudeSeat[${EMPTY_SEAT}]`)?.reason === "absent" &&
+      receipt.absent === 1 &&
+      !fs.existsSync(path.join(seatsRoot, EMPTY_SEAT, "settings.json")) &&
+      healed.stdout.includes(`${path.join(seatsRoot, EMPTY_SEAT, "settings.json")}: target skipped: absent`),
+    { entry: targetReport(receipt, `claudeSeat[${EMPTY_SEAT}]`) },
+  );
+
   const doctorHealed = lastJson(runCli(["doctor", "--read-only", "--json"], env).stdout);
   const healedSeats = (doctorHealed.telemetry as Record<string, unknown>).claudeSeats as Array<Record<string, unknown>>;
   const healedProfiles = (doctorHealed.telemetry as Record<string, unknown>).codexProfiles as Array<Record<string, unknown>>;
@@ -438,7 +498,9 @@ function commandChecks(fixtureRoot: string) {
   check(
     "doctor_reports_the_reconcile_schedule_state_as_counts_and_stamps_only",
     Object.keys(reconcileSection).sort().join(",") ===
-      "enabled,intervalSeconds,lastApplied,lastRefused,lastRunAt,nextEligibleAt" &&
+      "enabled,intervalSeconds,lastAbsent,lastApplied,lastRefused,lastResult,lastRunAt,nextEligibleAt" &&
+      reconcileSection.lastResult === "applied" &&
+      reconcileSection.lastAbsent === 1 &&
       reconcileSection.enabled === true &&
       reconcileSection.intervalSeconds === 600 &&
       reconcileSection.lastApplied === 2 &&
@@ -523,6 +585,91 @@ function commandChecks(fixtureRoot: string) {
       typeof disabledSection.lastRunAt === "string",
     { reconcile: disabledSection },
   );
+  // ---- review r1, F4: a backoff is invalidated when the file is fixed -----
+  fs.writeFileSync(configFile, `${JSON.stringify({ port }, null, 2)}\n`, { mode: 0o600 });
+  const healedProfileBody = fleetProfileToml("fixed");
+  fs.writeFileSync(malformedFile, healedProfileBody, { mode: 0o600 });
+  const healedAfterBackoff = runCli(["setup", "--reconcile"], env);
+  const healedAfterBackoffJson = lastJson(healedAfterBackoff.stdout);
+  const healedFormerlyMalformed = targetReport(
+    healedAfterBackoffJson,
+    `codexProfile[${MALFORMED_PROFILE}]`,
+  );
+  check(
+    // The backoff is about a *file*, not a name: a transient malformed file
+    // that the fleet fixes must not cost a full hour of no managed telemetry.
+    "a_backoff_is_dropped_as_soon_as_the_refused_file_identity_changes_so_a_fixed_file_heals_next_tick",
+    healedAfterBackoff.code === 0 &&
+      healedFormerlyMalformed?.status === "applied" &&
+      healedFormerlyMalformed?.reason === undefined &&
+      Date.parse(String(healedAfterBackoffJson.startedAt)) < backoffUntil &&
+      readManagedConfigReconcileState(plimsollHome).backoff[
+        `codexProfile[${MALFORMED_PROFILE}]`
+      ] === undefined,
+    {
+      status: healedFormerlyMalformed?.status,
+      insideTheOldWindow:
+        Date.parse(String(healedAfterBackoffJson.startedAt)) < backoffUntil,
+    },
+  );
+
+  // ---- review r1, F8: --reconcile is a parsed flag, not an argv token -----
+  const usageStamp = readManagedConfigReconcileState(plimsollHome).lastRunAt;
+  const usageError = runCli(["setup", "--claude-settings", "--reconcile"], env);
+  check(
+    "setup_with_a_settings_flag_and_no_path_is_a_usage_error_not_a_reconcile",
+    usageError.code === 2 &&
+      usageError.stderr.includes("--claude-settings needs a path") &&
+      usageError.stdout.trim() === "" &&
+      readManagedConfigReconcileState(plimsollHome).lastRunAt === usageStamp,
+    { code: usageError.code, stderr: usageError.stderr.trim() },
+  );
+
+  // Two sources resolving to one header file: --grok-hooks and --codex-config
+  // in one directory make both hooks read the same plimsoll.headers, so each
+  // source's hook would send the other's token.
+  const collisionRoot = path.join(home, "collided-header-root");
+  fs.mkdirSync(collisionRoot, { recursive: true, mode: 0o700 });
+  const collisionArgs = [
+    "--grok-hooks",
+    path.join(collisionRoot, "plimsoll.json"),
+    "--codex-config",
+    path.join(collisionRoot, "config.toml"),
+  ];
+  const collisionHeaderFile = path.join(collisionRoot, "plimsoll.headers");
+  const boundaryStamp = readManagedConfigReconcileState(plimsollHome).lastRunAt;
+  const collidedSetup = runCli(["setup", ...collisionArgs, "--yes"], env);
+  const collidedReconcile = runCli(["setup", ...collisionArgs, "--reconcile"], env);
+  const collidedReconcileJson = lastJson(collidedReconcile.stdout);
+  const boundaryLine = `${collisionHeaderFile}: target refused: ${collisionHeaderFile}: two managed sources resolve to the same header file; refusing this target.`;
+  check(
+    // review r1, F8: the reconcile branch returned before this audit, so a host
+    // with a hand-edited colliding pair was refused by --yes and silently
+    // reconciled by --reconcile.
+    "the_header_audience_boundary_refuses_under_reconcile_exactly_as_under_yes",
+    collidedSetup.code === 1 &&
+      collidedReconcile.code === 1 &&
+      collidedSetup.stdout.includes(boundaryLine) &&
+      collidedReconcile.stdout.includes(boundaryLine) &&
+      collidedReconcileJson.status === "managed_config_header_audience_conflict" &&
+      collidedReconcileJson.ownedRefusal === true &&
+      collidedReconcileJson.applied === 0 &&
+      collidedReconcileJson.receiptPath === null &&
+      !fs.existsSync(collisionHeaderFile),
+    {
+      setupCode: collidedSetup.code,
+      reconcileCode: collidedReconcile.code,
+      status: collidedReconcileJson.status,
+    },
+  );
+  check(
+    "a_refused_audience_boundary_reconcile_writes_nothing_at_all",
+    receipts(plimsollHome).length === 3 &&
+      !fs.existsSync(path.join(collisionRoot, "plimsoll.json")) &&
+      readManagedConfigReconcileState(plimsollHome).lastRunAt === boundaryStamp,
+    { receipts: receipts(plimsollHome).length },
+  );
+
   return { plimsollHome, port };
 }
 
@@ -593,6 +740,407 @@ function concurrentWriterChecks(fixtureRoot: string) {
       !fs.existsSync(path.join(fixtureRoot, "absent-home")),
     {},
   );
+}
+
+/**
+ * review r1, F3: the kill-switch and the cadence are read from the config file
+ * on every tick, so flipping the flag stops a *running* collector instead of
+ * waiting for a restart. Doctor already reads the file fresh; this is what
+ * makes the daemon agree with it.
+ */
+function liveSettingsChecks(fixtureRoot: string) {
+  const collectorHome = path.join(fixtureRoot, "live-settings-home");
+  fs.mkdirSync(collectorHome, { recursive: true, mode: 0o700 });
+  const configFile = path.join(collectorHome, "collector.config.json");
+  const boot = { enabled: true, intervalSeconds: 600 };
+  const writeConfig = (reconcile: { enabled: boolean; intervalSeconds: number }) =>
+    fs.writeFileSync(
+      configFile,
+      `${JSON.stringify({ port: 49173, managedConfig: { reconcile } }, null, 2)}\n`,
+      { mode: 0o600 },
+    );
+  const now = Date.parse("2026-09-12T12:00:00.000Z");
+  const decide = (settings: { enabled: boolean; intervalSeconds: number }) =>
+    decideManagedConfigReconcile({
+      enabled: settings.enabled,
+      intervalSeconds: settings.intervalSeconds,
+      now,
+      lastRunAt: now - 3_600_000,
+      drift: () => 1,
+    });
+
+  writeConfig({ enabled: true, intervalSeconds: 600 });
+  const armed = readManagedConfigReconcileSettings(configFile, boot);
+  const armedDecision = decide(armed);
+  // The operator flips the kill-switch between two ticks of the same process.
+  writeConfig({ enabled: false, intervalSeconds: 600 });
+  const disarmed = readManagedConfigReconcileSettings(configFile, boot);
+  const disarmedDecision = decide(disarmed);
+  check(
+    "flipping_the_kill_switch_in_the_config_file_makes_the_very_next_decision_decline",
+    armed.enabled === true &&
+      armed.source === "config_file" &&
+      armedDecision.run === true &&
+      disarmed.enabled === false &&
+      disarmed.source === "config_file" &&
+      disarmedDecision.run === false &&
+      disarmedDecision.reason === "disabled",
+    { armed: armedDecision, disarmed: disarmedDecision },
+  );
+
+  // The last run was an hour ago; a cadence lengthened to two hours is not due.
+  writeConfig({ enabled: true, intervalSeconds: 7200 });
+  const relengthened = readManagedConfigReconcileSettings(configFile, boot);
+  check(
+    "a_changed_interval_is_read_from_the_config_file_too_so_the_cadence_follows_it",
+    relengthened.intervalSeconds === 7200 &&
+      decide(relengthened).run === false &&
+      decide(relengthened).reason === "interval_not_elapsed",
+    { intervalSeconds: relengthened.intervalSeconds },
+  );
+
+  fs.writeFileSync(configFile, "{ this is not json", { mode: 0o600 });
+  const fallback = readManagedConfigReconcileSettings(configFile, { enabled: false, intervalSeconds: 900 });
+  fs.rmSync(configFile);
+  const absentFallback = readManagedConfigReconcileSettings(configFile, boot);
+  check(
+    "an_unreadable_or_absent_config_file_falls_back_to_the_settings_captured_at_boot",
+    fallback.source === "boot_config" &&
+      fallback.enabled === false &&
+      fallback.intervalSeconds === 900 &&
+      absentFallback.source === "boot_config" &&
+      absentFallback.enabled === true,
+    { fallback, absentFallback },
+  );
+}
+
+/**
+ * review r1, F2: only the readback-that-found-nothing tick stamps. The other
+ * two non-running decisions must not, or `nextEligibleAt` walks forward forever
+ * and the interval gate goes inert.
+ */
+function decisionStampChecks(fixtureRoot: string) {
+  const collectorHome = path.join(fixtureRoot, "decision-stamp-home");
+  fs.mkdirSync(collectorHome, { recursive: true, mode: 0o700 });
+  const at = "2026-09-12T12:00:00.000Z";
+  const stamped = stampManagedConfigReconcileDecision(
+    collectorHome,
+    { run: false, reason: "no_drift", nextEligibleAt: at },
+    { at, absent: 2 },
+  );
+  const afterNoDrift = readManagedConfigReconcileState(collectorHome);
+  const notStamped = [
+    stampManagedConfigReconcileDecision(
+      collectorHome,
+      { run: false, reason: "disabled", nextEligibleAt: null },
+      { at: "2026-09-12T13:00:00.000Z" },
+    ),
+    stampManagedConfigReconcileDecision(
+      collectorHome,
+      { run: false, reason: "interval_not_elapsed", nextEligibleAt: at },
+      { at: "2026-09-12T13:00:00.000Z" },
+    ),
+    stampManagedConfigReconcileDecision(
+      collectorHome,
+      { run: true, reason: "drift", nextEligibleAt: at },
+      { at: "2026-09-12T13:00:00.000Z" },
+    ),
+  ];
+  const afterOthers = readManagedConfigReconcileState(collectorHome);
+  check(
+    "a_cadence_that_ran_its_readback_and_found_nothing_stamps_lastRunAt_and_lastResult_unchanged",
+    stamped === true &&
+      afterNoDrift.lastRunAt === at &&
+      afterNoDrift.lastResult === "unchanged" &&
+      afterNoDrift.lastApplied === 0 &&
+      afterNoDrift.lastRefused === 0 &&
+      afterNoDrift.lastAbsent === 2 &&
+      !fs.existsSync(path.join(collectorHome, "receipts")),
+    { state: afterNoDrift },
+  );
+  check(
+    "a_disabled_or_not_yet_due_or_running_decision_never_moves_the_stamp",
+    notStamped.every((value) => value === false) && afterOthers.lastRunAt === at,
+    { notStamped, lastRunAt: afterOthers.lastRunAt },
+  );
+}
+
+/**
+ * review r1, F4: a transactional apply that loses a race with another writer
+ * fails closed. That is a concurrency outcome, not a malformed file: it must be
+ * skipped for this tick with no backoff, exactly like `changed_during_plan`.
+ * A genuine refusal must still arm the hour.
+ */
+function applyRaceChecks(fixtureRoot: string) {
+  const collectorHome = path.join(fixtureRoot, "apply-race-home");
+  fs.mkdirSync(collectorHome, { recursive: true, mode: 0o700 });
+  const seatFile = writeSeatSettings(path.join(fixtureRoot, "apply-race-seats"), CHURNED_SEAT, fleetSeatDocument("race"));
+  const toolOptions = {
+    repoRoot,
+    port: 49174,
+    dataMode: "metadata" as const,
+    claudeCodeProducerToken: "synthetic-claude-producer-token-apply-race-0",
+  };
+  // A target whose *plan* succeeds and whose *apply* fails the way the
+  // transactional writer fails when another writer lands inside it.
+  const racingTarget = (message: string): ManagedConfigTarget => ({
+    name: `claudeSeat[${CHURNED_SEAT}]`,
+    path: seatFile,
+    family: "claude",
+    discovered: true,
+    run: (options, dryRun) => {
+      const planned = composeManagedClaudeTargets(seatFile, path.join(fixtureRoot, "apply-race-absent"))[0]!
+        .run(options, true);
+      if (dryRun) return planned;
+      throw new Error(message);
+    },
+  });
+
+  const lost = runManagedConfigReconcile({
+    collectorHome,
+    targets: [racingTarget("CLAUDE_CONFIG_COMMIT_CLAIM_MISMATCH")],
+    toolOptions,
+  });
+  const lostEntry = lost.targets[0];
+  const lostState = readManagedConfigReconcileState(collectorHome);
+  check(
+    "an_apply_that_loses_a_race_is_skipped_for_this_tick_and_arms_no_backoff",
+    lostEntry?.status === "skipped" &&
+      lostEntry?.reason === "changed_during_apply" &&
+      lostEntry?.nextEligibleAt === undefined &&
+      lost.refused === 0 &&
+      lost.skipped === 1 &&
+      Object.keys(lostState.backoff).length === 0 &&
+      lostState.lastResult === "skipped" &&
+      backups(seatFile).length === 0,
+    { entry: lostEntry, backoff: lostState.backoff },
+  );
+
+  const refused = runManagedConfigReconcile({
+    collectorHome,
+    targets: [racingTarget("CLAUDE_CONFIG_MALFORMED_JSON")],
+    toolOptions,
+  });
+  const refusedState = readManagedConfigReconcileState(collectorHome);
+  check(
+    "an_apply_that_fails_for_any_other_reason_is_still_a_refusal_that_arms_the_hour",
+    refused.targets[0]?.status === "refused" &&
+      refused.refused === 1 &&
+      Object.keys(refusedState.backoff).length === 1 &&
+      refusedState.lastResult === "refused",
+    { entry: refused.targets[0] },
+  );
+  check(
+    "only_the_transactional_concurrency_failures_are_classified_as_a_lost_race",
+    [
+      "CLAUDE_CONFIG_COMMIT_CLAIM_MISMATCH",
+      "CODEX_CONFIG_BOUND_CONTENT_CHANGED",
+      "CLAUDE_CONFIG_VISIBLE_IDENTITY_MISMATCH",
+      "/x/config.toml: config.toml was replaced after planning; refusing to read through a link or create a backup/write.",
+      "/x/config.toml: bound config.toml content changed before commit; refusing to read through a link or create a backup/write.",
+    ].every((reason) => isManagedConfigConcurrencyFailure(reason)) &&
+      [
+        "CLAUDE_CONFIG_MALFORMED_JSON",
+        "CLAUDE_CONFIG_INVALID_ROOT",
+        "CODEX_CONFIG_UNSAFE_LEAF_MODE",
+        "/x/config.toml: config.toml is a symbolic link; refusing to read through a link or create a backup/write.",
+        "EACCES: permission denied",
+      ].every((reason) => !isManagedConfigConcurrencyFailure(reason)),
+    {},
+  );
+}
+
+/**
+ * review r1, F5: backups are written *beside* the managed file — inside the
+ * fleet-owned seat and profile directories — and receipts accumulate in the
+ * collector home. Nothing pruned either.
+ */
+function pruneChecks(fixtureRoot: string) {
+  const home = path.join(fixtureRoot, "prune-home");
+  const collectorHome = path.join(fixtureRoot, "prune-plimsoll-home");
+  fs.mkdirSync(collectorHome, { recursive: true, mode: 0o700 });
+  const claudeFile = path.join(home, ".claude", "settings.json");
+  fs.mkdirSync(path.dirname(claudeFile), { recursive: true, mode: 0o700 });
+  const toolOptions = {
+    repoRoot,
+    port: 49175,
+    dataMode: "metadata" as const,
+    claudeCodeProducerToken: "synthetic-claude-producer-token-prune-000000",
+  };
+  const churn = (round: number, prune: Record<string, number> | undefined) => {
+    fs.writeFileSync(claudeFile, `${JSON.stringify(fleetSeatDocument(`churn-${round}`), null, 2)}\n`, { mode: 0o600 });
+    return runManagedConfigReconcile({
+      collectorHome,
+      targets: composeManagedClaudeTargets(claudeFile, path.join(fixtureRoot, "prune-absent-seats")),
+      toolOptions,
+      ...(prune ? { prune } : {}),
+    });
+  };
+
+  // Default policy: a backup younger than 24 h is live rollback material and is
+  // never pruned, whatever the count says.
+  for (let round = 0; round < 8; round += 1) churn(round, undefined);
+  const youngBackups = backups(claudeFile).length;
+  check(
+    "a_backup_younger_than_24h_is_never_pruned_however_many_there_are",
+    youngBackups === 8 && MANAGED_CONFIG_BACKUPS_KEPT_PER_FILE === 5,
+    { backups: youngBackups },
+  );
+
+  // The same churn with the age floor lifted: the count bound takes over.
+  const pruned = churn(8, { minBackupAgeMs: 0 });
+  check(
+    "at_most_five_backups_per_managed_file_survive_once_they_are_old_enough_to_prune",
+    backups(claudeFile).length === MANAGED_CONFIG_BACKUPS_KEPT_PER_FILE &&
+      pruned.applied === 1 &&
+      // The survivors are the newest, and the file itself is untouched by the prune.
+      backups(claudeFile).sort().slice(-1)[0] === backups(claudeFile).sort().slice(-1)[0] &&
+      fs.existsSync(claudeFile),
+    { backups: backups(claudeFile).length },
+  );
+
+  for (let round = 9; round < 9 + MANAGED_CONFIG_RECEIPTS_KEPT + 6; round += 1) {
+    churn(round, { minBackupAgeMs: 0 });
+  }
+  const kept = receipts(collectorHome);
+  check(
+    "at_most_twenty_reconcile_receipts_survive_and_the_newest_are_the_survivors",
+    kept.length === MANAGED_CONFIG_RECEIPTS_KEPT &&
+      backups(claudeFile).length === MANAGED_CONFIG_BACKUPS_KEPT_PER_FILE &&
+      kept.join(",") === [...kept].sort().join(","),
+    { receipts: kept.length, backups: backups(claudeFile).length },
+  );
+  return { collectorHome, claudeFile };
+}
+
+/**
+ * review r1, F6: at fleet scale (6 Claude seats + 20 Codex profiles + the two
+ * home targets = 28 targets) the synchronous tick blocked the collector's event
+ * loop — the same process that serves /hooks/* and the OTLP receiver — for
+ * ~0.6 s on a full-churn run. The daemon's tick now yields between targets, so
+ * the longest chunk it can owe the loop is one target.
+ */
+async function eventLoopBoundChecks(fixtureRoot: string) {
+  const home = path.join(fixtureRoot, "scale-home");
+  const collectorHome = path.join(fixtureRoot, "scale-plimsoll-home");
+  const seatsRoot = path.join(home, ".claude-seats");
+  const profilesRoot = path.join(home, ".codex-profiles");
+  fs.mkdirSync(collectorHome, { recursive: true, mode: 0o700 });
+  const claudeFile = path.join(home, ".claude", "settings.json");
+  const codexFile = path.join(home, ".codex", "config.toml");
+  const codexHeaderFile = path.join(home, ".codex", "plimsoll.headers");
+  fs.mkdirSync(path.dirname(claudeFile), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.dirname(codexFile), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(codexHeaderFile, "x-plimsoll-producer: synthetic-scale-producer-token\n", { mode: 0o600 });
+  const toolOptions = {
+    repoRoot,
+    port: 49176,
+    dataMode: "metadata" as const,
+    claudeCodeProducerToken: "synthetic-claude-producer-token-scale-000000",
+    codexProducerToken: "synthetic-codex-producer-token-scale-00000000",
+    codexHeaderFile,
+  };
+  const SEATS = 6;
+  const PROFILES = 20;
+  const seed = () => {
+    fs.writeFileSync(claudeFile, `${JSON.stringify(fleetSeatDocument("scale-home"), null, 2)}\n`, { mode: 0o600 });
+    fs.writeFileSync(codexFile, fleetProfileToml("scale-home"), { mode: 0o600 });
+    for (let index = 0; index < SEATS; index += 1) {
+      writeSeatSettings(seatsRoot, `scale-seat-${index}`, fleetSeatDocument(`scale-${index}`));
+    }
+    for (let index = 0; index < PROFILES; index += 1) {
+      writeProfileConfig(profilesRoot, `scale-profile-${index}`, fleetProfileToml(`scale-${index}`));
+    }
+  };
+  const targets = () => [
+    ...composeManagedClaudeTargets(claudeFile, home),
+    ...composeManagedCodexTargets(codexFile, home),
+  ];
+
+  seed();
+  const targetCount = targets().length;
+  const readbackStart = process.hrtime.bigint();
+  const readback = runManagedConfigReconcile({
+    collectorHome,
+    targets: targets(),
+    toolOptions,
+    dryRun: true,
+  });
+  const readbackMs = Number(process.hrtime.bigint() - readbackStart) / 1e6;
+
+  // The synchronous full-churn run: what the daemon used to do in one chunk.
+  seed();
+  const syncStart = process.hrtime.bigint();
+  const syncRun = runManagedConfigReconcile({
+    collectorHome,
+    targets: targets(),
+    toolOptions,
+    prune: { minBackupAgeMs: 0 },
+  });
+  const syncMs = Number(process.hrtime.bigint() - syncStart) / 1e6;
+
+  // The same work through the daemon's async entrypoint, with a loop-lag
+  // sampler measuring the longest stretch the event loop was actually held.
+  seed();
+  let longestChunkMs = 0;
+  let samples = 0;
+  const SAMPLE_MS = 4;
+  let previous = process.hrtime.bigint();
+  const sampler = setInterval(() => {
+    const nowNs = process.hrtime.bigint();
+    const heldMs = Number(nowNs - previous) / 1e6 - SAMPLE_MS;
+    previous = nowNs;
+    samples += 1;
+    if (heldMs > longestChunkMs) longestChunkMs = heldMs;
+  }, SAMPLE_MS);
+  const asyncStart = process.hrtime.bigint();
+  const asyncRun = await runManagedConfigReconcileAsync({
+    collectorHome,
+    targets: targets(),
+    toolOptions,
+    prune: { minBackupAgeMs: 0 },
+  });
+  const asyncMs = Number(process.hrtime.bigint() - asyncStart) / 1e6;
+  clearInterval(sampler);
+
+  const LONGEST_CHUNK_BUDGET_MS = 50;
+  check(
+    "the_fleet_scale_fixture_is_the_reviewers_twenty_eight_targets",
+    targetCount === SEATS + PROFILES + 2 && readback.targets.length === targetCount,
+    { targets: targetCount, seats: SEATS, profiles: PROFILES },
+  );
+  check(
+    "the_async_tick_never_holds_the_event_loop_for_more_than_the_chunk_budget_on_a_full_churn_run",
+    asyncRun.applied === targetCount &&
+      samples > 0 &&
+      longestChunkMs < LONGEST_CHUNK_BUDGET_MS,
+    {
+      targets: targetCount,
+      applied: asyncRun.applied,
+      longestChunkMs: Number(longestChunkMs.toFixed(1)),
+      budgetMs: LONGEST_CHUNK_BUDGET_MS,
+      samples,
+      syncRunMs: Number(syncMs.toFixed(1)),
+      asyncRunMs: Number(asyncMs.toFixed(1)),
+      driftReadbackMs: Number(readbackMs.toFixed(1)),
+    },
+  );
+  check(
+    "the_async_tick_reconciles_exactly_what_the_synchronous_run_reconciles",
+    syncRun.applied === asyncRun.applied &&
+      syncRun.refused === asyncRun.refused &&
+      syncRun.skipped === asyncRun.skipped &&
+      syncRun.targets.map((entry) => `${entry.name}:${entry.status}`).join(",") ===
+        asyncRun.targets.map((entry) => `${entry.name}:${entry.status}`).join(","),
+    { sync: syncRun.applied, async: asyncRun.applied },
+  );
+  return {
+    targets: targetCount,
+    driftReadbackMs: Number(readbackMs.toFixed(1)),
+    syncRunMs: Number(syncMs.toFixed(1)),
+    asyncRunMs: Number(asyncMs.toFixed(1)),
+    longestChunkMs: Number(longestChunkMs.toFixed(1)),
+  };
 }
 
 /**
@@ -674,7 +1222,7 @@ function decisionChecks() {
   );
 }
 
-function main() {
+async function main() {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-managed-config-reconcile-proof-"));
   const fixtureRoot = path.join(sandbox, "fixture");
   const fixture = useFixtureRoot(fixtureRoot, {
@@ -683,17 +1231,25 @@ function main() {
   try {
     commandChecks(fixture.root);
     concurrentWriterChecks(fixture.root);
+    applyRaceChecks(fixture.root);
+    liveSettingsChecks(fixture.root);
+    decisionStampChecks(fixture.root);
+    pruneChecks(fixture.root);
+    const scale = await eventLoopBoundChecks(fixture.root);
     decisionChecks();
     check(
       "the_fixture_home_the_guard_protects_was_never_created",
       !fs.existsSync(fixture.home),
       { home: "must-remain-absent-operator-home" },
     );
-    console.log(JSON.stringify({ bead: "eco-6hoxj.50", ok: true, checks }, null, 2));
+    console.log(JSON.stringify({ bead: "eco-6hoxj.50", ok: true, scale, checks }, null, 2));
   } finally {
     fixture.restore();
     fs.rmSync(sandbox, { recursive: true, force: true });
   }
 }
 
-main();
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});

@@ -164,18 +164,37 @@ Claude and Codex half of setup's target composition — `~/.claude/settings.json
 where the plan says `added` or `updated`. It is strictly weaker than
 `setup --yes`: it never creates a file that is not there, never mints a
 credential, never rewrites a file it cannot parse, and stands down on any file
-another writer changes while the plan is being computed. A run that applied or
+another writer changes while the plan is being computed, or that the
+transactional write itself finds changed underneath it. A seat or profile
+directory that exists with no config file in it yet is reported as
+`skipped: absent` rather than created. A run that applied or
 refused something writes `<collector home>/receipts/managed-config-reconcile-<ts>.json`
 with the per-target status, plan lines and backups; a healthy home plans every
 target `unchanged` and writes nothing at all. The running collector calls the
 same reconcile in-process every `managedConfig.reconcile.intervalSeconds`
 (default 600), and only when its own doctor readback reports at least one
-drifted target, so a healthy host does zero writes; a refused or malformed file
-is not retried for an hour. Set `managedConfig.reconcile.enabled` to `false` in
-`collector.config.json` to turn the schedule off — the collector then performs
-no managed-config read or write of its own. `plimsoll doctor --read-only --json`
-reports the schedule under `managedConfig.reconcile` (`enabled`,
-`intervalSeconds`, `lastRunAt`, `lastApplied`, `lastRefused`, `nextEligibleAt`).
+drifted target, so a healthy host does zero writes; the tick yields to the event
+loop between targets, so a fully churned fleet-scale host never blocks the
+collector's HTTP loop for a whole reconcile. A file Plimsoll could not parse is
+not retried for an hour, unless it changes on disk first — fixing it heals the
+target on the next tick rather than after the hour. Losing a race with another
+writer is not a refusal and arms no backoff.
+
+The cadence keeps its own litter bounded: at most five `.plimsoll-backup-*`
+files per managed file (never deleting one less than 24 hours old) and at most
+twenty reconcile receipts, oldest first. `setup --yes` keeps its existing backup
+policy and prunes nothing.
+
+Set `managedConfig.reconcile.enabled` to `false` in `collector.config.json` to
+turn the schedule off — the collector re-reads that flag and the interval from
+the file on every tick, so the kill-switch takes effect without a restart, and a
+disabled collector then performs no managed-config read or write of its own.
+`plimsoll doctor --read-only --json` reports the schedule under
+`managedConfig.reconcile` (`enabled`, `intervalSeconds`, `lastRunAt`,
+`lastResult`, `lastApplied`, `lastRefused`, `lastAbsent`, `nextEligibleAt`).
+`lastRunAt` advances on every tick that ran its readback, including one that
+found nothing to do (`lastResult: "unchanged"`), so a clean cadence is
+distinguishable from one that never ran.
 
 Telemetry `setup` manages a seat's *config*; what the collector *captures* from
 is its capture-root inventory (`collector.config.json` → `captureRoots[]`),
