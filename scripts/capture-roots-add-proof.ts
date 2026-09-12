@@ -13,7 +13,7 @@
  * here reads or writes an operator home, and no LaunchAgent is ever installed,
  * loaded or unloaded.
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
@@ -201,6 +201,30 @@ async function main() {
       } finally {
         database.close();
       }
+    };
+
+    const generationRows = (source: "codex" | "claude_code") => {
+      const database = new Database(ledgerPath, { readonly: true, fileMustExist: true });
+      try {
+        return (database
+          .prepare("select count(*) as rows from automatic_capture_baseline_generations where source = ?")
+          .get(source) as { rows: number }).rows;
+      } finally {
+        database.close();
+      }
+    };
+    // Real macOS file immutability, the reviewer's own injection: the
+    // transactional config write's atomic rename fails with EPERM.
+    const chflags = (file: string, flagValue: "uchg" | "nouchg") => {
+      const result = spawnSync("/usr/bin/chflags", [flagValue, file], { stdio: ["ignore", "pipe", "pipe"] });
+      if (result.status !== 0) throw new Error(`chflags ${flagValue} failed: ${result.stderr?.toString() ?? ""}`);
+    };
+    // A fixture-only SQLite trigger: a real refusal of exactly the rollback
+    // statement, so the "the fence could not be removed" branch is measured
+    // rather than asserted.
+    const ledgerExec = (statement: string) => {
+      const database = new Database(ledgerPath, { fileMustExist: true });
+      try { database.exec(statement); } finally { database.close(); }
     };
 
     const stubBin = path.join(sandbox, "stub-bin");
@@ -496,6 +520,26 @@ async function main() {
       linkedAdd,
     );
 
+    // A real (non-dry-run) add through that same symlinked home is refused
+    // before anything is written: the LaunchAgent manifest inspection this
+    // command must do first walks the home with no-follow semantics and
+    // refuses a `$HOME` that is a symlink (`LAUNCH_AGENT_UNSAFE_HOME`). That
+    // guard is repo-wide and is deliberately not scoped for this command
+    // (r1 finding 2 remainder); it is documented in README instead.
+    const linkedRealAdd = await command([
+      "capture-roots", "add", "--source", "codex", "--directory", linkedDirectory,
+      "--machine", MACHINE, "--json",
+    ], linkedEnv, neutralCwd);
+    check(
+      "a_real_add_through_a_symlinked_home_refuses_before_writing_anything",
+      linkedRealAdd.code === 1 &&
+        parse(linkedRealAdd).status === "capture_roots_add_refused" &&
+        parse(linkedRealAdd).reason === "launch_agent_manifest_invalid" &&
+        String(parse(linkedRealAdd).detail).includes("UNSAFE_HOME") &&
+        sha256(configPath) === appliedSha && backups(plimsollHome).length === 1,
+      linkedRealAdd,
+    );
+
     // ---- an unknown top-level config field (review r1, finding 3) -------
     // `collectorConfigSchema` strips keys it does not know, and `captureRoots`
     // is written by fleet enrollment tooling outside this repository. The key
@@ -566,6 +610,224 @@ async function main() {
       baselineState().claude_code.status === "complete" &&
         baselineState().claude_code.startedAt === BASELINE_BEFORE,
       baselineState(),
+    );
+
+    // ---- N5: an ambiguous walk, refused by default and overridable -------
+    // A symlinked `.jsonl` inside the target directory is the tailer's own
+    // error class. The refusal stays the default (the fence would not be
+    // provable), but it now names the entries, and `--allow-scan-errors`
+    // registers the root and leaves exactly those entries unfenced.
+    const ambiguousRoot = path.join(home, ".claude-seats", "seat-ambiguous", "projects");
+    fs.mkdirSync(ambiguousRoot, { recursive: true, mode: 0o700 });
+    const ambiguousPlain = path.join(ambiguousRoot, "plain.jsonl");
+    fs.writeFileSync(ambiguousPlain, "{}\n", { mode: 0o600 });
+    const ambiguousLink = path.join(ambiguousRoot, "linked.jsonl");
+    fs.symlinkSync(ambiguousPlain, ambiguousLink);
+    const beforeAmbiguousSha = sha256(configPath);
+    const ambiguousRefused = await run([
+      "capture-roots", "add", "--source", "claude_code", "--directory", ambiguousRoot,
+      "--machine", MACHINE, "--json",
+    ]);
+    const ambiguousRefusal = parse(ambiguousRefused);
+    check(
+      "add_refuses_an_ambiguous_scan_by_default_and_names_the_entries",
+      ambiguousRefused.code === 1 &&
+        ambiguousRefusal.reason === "capture_root_scan_ambiguous" &&
+        ambiguousRefusal.errors === 1 &&
+        ambiguousRefusal.entries.length === 1 &&
+        ambiguousRefusal.entries[0].path === path.relative(home, ambiguousLink) &&
+        ambiguousRefusal.entries[0].reason === "not_a_regular_file" &&
+        sha256(configPath) === beforeAmbiguousSha,
+      ambiguousRefusal,
+    );
+    const allowed = await run([
+      "capture-roots", "add", "--source", "claude_code", "--directory", ambiguousRoot,
+      "--machine", MACHINE, "--allow-scan-errors", "--json",
+    ]);
+    const allowedReceipt = parse(allowed);
+    check(
+      "allow_scan_errors_registers_the_root_and_names_what_it_left_unfenced",
+      allowed.code === 0 && allowedReceipt.applied === true &&
+        allowedReceipt.allowScanErrors === true &&
+        allowedReceipt.scanAmbiguities.length === 1 &&
+        allowedReceipt.scanAmbiguities[0].directory === path.relative(home, ambiguousRoot) &&
+        allowedReceipt.scanAmbiguities[0].entries[0].path === path.relative(home, ambiguousLink) &&
+        allowedReceipt.addedRoots[0].ambiguousEntries === 1 &&
+        allowedReceipt.addedRoots[0].preexistingFiles === 1 &&
+        allowedReceipt.baseline.generationsSealed === 1,
+      { code: allowed.code, ambiguities: allowedReceipt.scanAmbiguities, added: allowedReceipt.addedRoots },
+    );
+    check(
+      "allow_scan_errors_fences_the_resolvable_file_and_leaves_the_ambiguous_one_capturable",
+      classify("claude_code", ambiguousPlain, "2026-09-12T10:00:00.000Z") === "exclude/preexisting_generation" &&
+        classify("claude_code", ambiguousLink, "2026-09-12T10:00:00.000Z").startsWith("capture/"),
+      {
+        plain: classify("claude_code", ambiguousPlain, "2026-09-12T10:00:00.000Z"),
+        linked: classify("claude_code", ambiguousLink, "2026-09-12T10:00:00.000Z"),
+      },
+    );
+
+    // ---- N1: a failure at the config write rolls the fence back ----------
+    // The reviewer's reproduction: `chflags uchg` on the config makes the
+    // transactional write's atomic rename fail with EPERM, after the fence
+    // has already been committed. Nothing may stay fenced for a directory
+    // the config does not name, and `recovery` may not claim a rollback that
+    // did not happen.
+    const seatC = path.join(home, ".claude-seats", "seat-c", "projects");
+    fs.mkdirSync(seatC, { recursive: true, mode: 0o700 });
+    const seatCTranscript = path.join(seatC, "seat-c.jsonl");
+    fs.writeFileSync(seatCTranscript, "{}\n", { mode: 0o600 });
+    const beforeWriteFailureSha = sha256(configPath);
+    const rowsBeforeWriteFailure = generationRows("claude_code");
+    chflags(configPath, "uchg");
+    const writeFailed = await run([
+      "capture-roots", "add", "--source", "claude_code", "--directory", seatC,
+      "--machine", MACHINE, "--json",
+    ]);
+    chflags(configPath, "nouchg");
+    const writeFailedReceipt = parse(writeFailed);
+    check(
+      "a_config_write_failure_exits_1_and_names_the_step",
+      writeFailed.code === 1 && writeFailedReceipt.status === "capture_roots_add_failed" &&
+        writeFailedReceipt.applied === false && writeFailedReceipt.failure?.step === "config_write" &&
+        sha256(configPath) === beforeWriteFailureSha,
+      { code: writeFailed.code, failure: writeFailedReceipt.failure, config: sha256(configPath) },
+    );
+    check(
+      "a_config_write_failure_rolls_the_fence_back_and_says_so",
+      writeFailedReceipt.recovery === "config_unchanged_fence_rolled_back" &&
+        writeFailedReceipt.fenceRollback?.attempted === true &&
+        writeFailedReceipt.fenceRollback?.complete === true &&
+        writeFailedReceipt.fenceRollback?.generationsSealed === 1 &&
+        writeFailedReceipt.fenceRollback?.generationsRemoved === 1 &&
+        writeFailedReceipt.fenceRollback?.retainedFiles.length === 0,
+      { recovery: writeFailedReceipt.recovery, rollback: writeFailedReceipt.fenceRollback },
+    );
+    check(
+      "a_config_write_failure_leaves_zero_generation_rows_from_this_run",
+      generationRows("claude_code") === rowsBeforeWriteFailure &&
+        classify("claude_code", seatCTranscript, "2026-09-12T10:05:00.000Z") === "capture/generation_not_baselined" &&
+        baselineState().claude_code.status === "complete",
+      {
+        rows: generationRows("claude_code"),
+        before: rowsBeforeWriteFailure,
+        classified: classify("claude_code", seatCTranscript, "2026-09-12T10:05:00.000Z"),
+      },
+    );
+    const retried = await run([
+      "capture-roots", "add", "--source", "claude_code", "--directory", seatC,
+      "--machine", MACHINE, "--json",
+    ]);
+    const retriedReceipt = parse(retried);
+    check(
+      "the_retry_after_the_config_write_failure_succeeds_and_seals_exactly_once",
+      retried.code === 0 && retriedReceipt.applied === true &&
+        retriedReceipt.baseline.generationsSealed === 1 &&
+        retriedReceipt.baseline.generationsAlreadySealed === 0 &&
+        retriedReceipt.baseline.seededAt === retriedReceipt.appendedAt &&
+        generationRows("claude_code") === rowsBeforeWriteFailure + 1 &&
+        classify("claude_code", seatCTranscript, "2026-09-12T10:10:00.000Z") === "exclude/preexisting_generation",
+      { code: retried.code, baseline: retriedReceipt.baseline, rows: generationRows("claude_code") },
+    );
+
+    // ---- N1/N3: a rollback that cannot run, and the retry after it -------
+    // A `before delete` trigger on the generation table is a real SQLite
+    // refusal of exactly the rollback statement, so the fence survives a
+    // config-write failure. The receipt must then say `ledger_fence_retained`
+    // and name the files still fenced — never a clean rollback. The retry
+    // that follows finds its rows already in place and must report that,
+    // not a seeding time it did not produce (review N3).
+    const seatD = path.join(home, ".claude-seats", "seat-d", "projects");
+    fs.mkdirSync(seatD, { recursive: true, mode: 0o700 });
+    const seatDTranscript = path.join(seatD, "seat-d.jsonl");
+    fs.writeFileSync(seatDTranscript, "{}\n", { mode: 0o600 });
+    const beforeRetainedSha = sha256(configPath);
+    const rowsBeforeRetained = generationRows("claude_code");
+    ledgerExec(
+      "create trigger fixture_block_generation_delete before delete on " +
+      "automatic_capture_baseline_generations begin select raise(abort, 'fixture_blocked_delete'); end",
+    );
+    chflags(configPath, "uchg");
+    const retained = await run([
+      "capture-roots", "add", "--source", "claude_code", "--directory", seatD,
+      "--machine", MACHINE, "--json",
+    ]);
+    chflags(configPath, "nouchg");
+    ledgerExec("drop trigger fixture_block_generation_delete");
+    const retainedReceipt = parse(retained);
+    check(
+      "a_fence_that_cannot_be_rolled_back_is_reported_as_retained_with_its_files",
+      retained.code === 1 && retainedReceipt.applied === false &&
+        retainedReceipt.failure?.step === "config_write" &&
+        retainedReceipt.recovery === "ledger_fence_retained" &&
+        retainedReceipt.fenceRollback?.complete === false &&
+        retainedReceipt.fenceRollback?.generationsRemoved === 0 &&
+        retainedReceipt.fenceRollback?.retainedFiles.includes(path.relative(home, seatDTranscript)) &&
+        sha256(configPath) === beforeRetainedSha &&
+        generationRows("claude_code") === rowsBeforeRetained + 1,
+      { code: retained.code, recovery: retainedReceipt.recovery, rollback: retainedReceipt.fenceRollback },
+    );
+    check(
+      "the_retained_fence_is_the_real_state_of_the_ledger",
+      classify("claude_code", seatDTranscript, "2026-09-12T10:15:00.000Z") === "exclude/preexisting_generation",
+      classify("claude_code", seatDTranscript, "2026-09-12T10:15:00.000Z"),
+    );
+    const retriedRetained = await run([
+      "capture-roots", "add", "--source", "claude_code", "--directory", seatD,
+      "--machine", MACHINE, "--json",
+    ]);
+    const retriedRetainedReceipt = parse(retriedRetained);
+    check(
+      "a_retry_whose_fence_is_already_in_place_reports_already_sealed_and_no_seeded_at",
+      retriedRetained.code === 0 && retriedRetainedReceipt.applied === true &&
+        retriedRetainedReceipt.baseline.seededAt === null &&
+        retriedRetainedReceipt.baseline.generationsSealed === 0 &&
+        retriedRetainedReceipt.baseline.generationsAlreadySealed === 1 &&
+        retriedRetainedReceipt.baseline.seals[0].sealed === false &&
+        retriedRetainedReceipt.baseline.seals[0].reason === "already_sealed" &&
+        retriedRetainedReceipt.baseline.seals[0].generationsAlreadySealed === 1 &&
+        generationRows("claude_code") === rowsBeforeRetained + 1,
+      { code: retriedRetained.code, baseline: retriedRetainedReceipt.baseline },
+    );
+
+    // ---- N2: a backup that was never created is never published ----------
+    // The config's own directory is made read-only, so the backup's `wx`
+    // open fails before anything else runs. The receipt may not name a
+    // backup path a recovery script would hash to ENOENT.
+    const seatE = path.join(home, ".claude-seats", "seat-e", "projects");
+    fs.mkdirSync(seatE, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(seatE, "seat-e.jsonl"), "{}\n", { mode: 0o600 });
+    const beforeBackupFailureSha = sha256(configPath);
+    const backupsBeforeBackupFailure = backups(plimsollHome).length;
+    fs.chmodSync(plimsollHome, 0o500);
+    const backupFailed = await run([
+      "capture-roots", "add", "--source", "claude_code", "--directory", seatE,
+      "--machine", MACHINE, "--json",
+    ]);
+    fs.chmodSync(plimsollHome, 0o700);
+    const backupFailedReceipt = parse(backupFailed);
+    check(
+      "a_backup_failure_publishes_no_backup_path_and_names_the_backup_step",
+      backupFailed.code === 1 && backupFailedReceipt.status === "capture_roots_add_failed" &&
+        backupFailedReceipt.failure?.step === "backup" &&
+        backupFailedReceipt.applied === false &&
+        backupFailedReceipt.backupPath === null &&
+        backupFailedReceipt.backupWritten === false &&
+        backupFailedReceipt.recovery === "config_unchanged_no_backup_written",
+      {
+        code: backupFailed.code,
+        failure: backupFailedReceipt.failure,
+        backupPath: backupFailedReceipt.backupPath,
+        recovery: backupFailedReceipt.recovery,
+      },
+    );
+    check(
+      "a_backup_failure_leaves_no_backup_file_and_no_generation_row_behind",
+      backups(plimsollHome).length === backupsBeforeBackupFailure &&
+        sha256(configPath) === beforeBackupFailureSha &&
+        generationRows("claude_code") === rowsBeforeRetained + 1 &&
+        backupFailedReceipt.fenceRollback === null,
+      { backups: backups(plimsollHome).length, before: backupsBeforeBackupFailure },
     );
 
     // A config whose roots do not reproduce their own ids under any candidate
@@ -707,6 +969,145 @@ async function main() {
     } finally {
       restartFixture.restore();
       fs.rmSync(restartSandbox, { recursive: true, force: true });
+    }
+
+    // ---- N4: a failure after the bootout still reaches the restart -------
+    // The bootout is the point the collector goes down. Everything the
+    // unload does after it — the terminal-state observation, the PID
+    // reconciler, the fence release — runs while it is down, and r2 left
+    // that whole region outside the restart discipline: a throw, or a
+    // terminal state that cannot be proven stopped, returned with no load
+    // attempted and the collector stopped.
+    //
+    // Injection: a stub `launchctl` whose `print` keeps reporting a live pid.
+    // The prior state is therefore "reported" (so a real bootout is issued),
+    // the bootout succeeds, and the post-bootout observation can never prove
+    // the job stopped. `bootstrap` then fails, so nothing on this host is
+    // ever cycled and the load failure is deterministic.
+    const bootoutSandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-capture-roots-bootout-")));
+    const bootoutFixture = useFixtureRoot(bootoutSandbox, { home: path.join(bootoutSandbox, "home") });
+    try {
+      const bootoutHome = bootoutFixture.home;
+      const bootoutPlimsollHome = path.join(bootoutSandbox, "plimsoll-home");
+      const bootoutConfigPath = path.join(bootoutPlimsollHome, "collector.config.json");
+      const bootoutLedgerPath = path.join(bootoutPlimsollHome, "work-ledger.sqlite");
+      const bootoutCodex = path.join(bootoutHome, ".codex", "sessions");
+      const bootoutClaude = path.join(bootoutHome, ".claude", "projects");
+      for (const directory of [bootoutCodex, bootoutClaude, bootoutPlimsollHome]) {
+        fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+      }
+      fs.writeFileSync(path.join(bootoutClaude, "bootout.jsonl"), "{}\n", { mode: 0o600 });
+      const bootoutBuffer = new LocalEventBuffer(bootoutLedgerPath, { workspaceId: WORKSPACE, deviceId: DEVICE });
+      let bootoutEpoch: string;
+      try {
+        bootoutEpoch = bootoutBuffer.workspaceBinding()!.currentInstallationEpochId!;
+        for (const source of ["codex", "claude_code"] as const) {
+          const begun = beginAutomaticCaptureBaseline(bootoutBuffer.database, source, {
+            startedAt: BASELINE_BEFORE, filesDiscovered: 0,
+          });
+          completeAutomaticCaptureBaseline(bootoutBuffer.database, source, {
+            runId: begun.latestRun!.runId, completedAt: BASELINE_BEFORE,
+          });
+        }
+      } finally {
+        bootoutBuffer.close();
+      }
+      const bootoutEnrolled = collectorConfigSchema.parse({
+        port: 48997, tenantId: WORKSPACE, deviceId: DEVICE, installKey: "fixture-install-key",
+        managed: true, captureRoots: [fixtureRoot("codex", bootoutCodex, bootoutEpoch)],
+      });
+      const bootoutBytes = `${JSON.stringify(bootoutEnrolled, null, 2)}\n`;
+      fs.writeFileSync(bootoutConfigPath, bootoutBytes, { mode: 0o600 });
+
+      const bootoutBin = path.join(bootoutSandbox, "stub-bin");
+      fs.mkdirSync(bootoutBin, { recursive: true });
+      fs.symlinkSync(process.execPath, path.join(bootoutBin, "node"));
+      // `print` answers with this proof's own live pid: a job launchd still
+      // reports. `bootout` succeeds silently (its stdio is inherited, so it
+      // must print nothing), everything else fails.
+      fs.writeFileSync(
+        path.join(bootoutBin, "launchctl"),
+        '#!/bin/sh\n' +
+        'if [ "$1" = "print" ]; then\n' +
+        `  echo "	pid = ${process.pid}"\n` +
+        '  exit 0\n' +
+        'fi\n' +
+        'if [ "$1" = "bootout" ]; then\n' +
+        '  exit 0\n' +
+        'fi\n' +
+        'exit 113\n',
+        { mode: 0o700 },
+      );
+      const syntheticBootoutPnpm = path.join(bootoutSandbox, "pnpm");
+      fs.writeFileSync(syntheticBootoutPnpm, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+      const bootoutInstalled = installLaunchAgent({
+        homeDir: bootoutHome,
+        repoRoot: path.join(bootoutSandbox, "repo"),
+        pnpmPath: syntheticBootoutPnpm,
+        mutationAuthority: new LifecycleMutationAuthority(path.join(bootoutSandbox, "install-authority")),
+      });
+      check(
+        "bootout_fixture_has_an_owned_manifest_written_without_launchctl",
+        bootoutInstalled.receipt.status === "installed" && fs.existsSync(bootoutInstalled.plistPath),
+        bootoutInstalled.receipt.status,
+      );
+
+      const bootoutResult = await command([
+        "capture-roots", "add", "--source", "claude_code", "--directory", bootoutClaude,
+        "--machine", MACHINE, "--json",
+      ], {
+        ...env,
+        ...bootoutFixture.env,
+        HOME: bootoutHome,
+        USERPROFILE: bootoutHome,
+        PLIMSOLL_HOME: bootoutPlimsollHome,
+        CLAUDE_CONFIG_DIR: path.join(bootoutHome, ".claude"),
+        CODEX_HOME: path.join(bootoutHome, ".codex"),
+        GROK_HOME: path.join(bootoutHome, ".grok"),
+        PATH: `${bootoutBin}:/usr/bin:/bin`,
+      }, neutralCwd);
+      const bootoutReceipt = parse(bootoutResult);
+      check(
+        "a_failure_after_the_bootout_still_takes_the_restart_path",
+        bootoutResult.code === 1 && bootoutReceipt.status === "capture_roots_add_failed" &&
+          bootoutReceipt.failure?.step === "unload" &&
+          bootoutReceipt.restart.attempted === true &&
+          bootoutReceipt.restart.skipped === false &&
+          bootoutReceipt.restart.unload?.bootoutAttempted === true &&
+          bootoutReceipt.restart.load !== undefined &&
+          bootoutReceipt.restart.verified === false,
+        {
+          code: bootoutResult.code,
+          failure: bootoutReceipt.failure,
+          restart: {
+            attempted: bootoutReceipt.restart?.attempted,
+            load: bootoutReceipt.restart?.load?.loaded,
+            unload: bootoutReceipt.restart?.unload?.status,
+          },
+        },
+      );
+      check(
+        "a_failure_after_the_bootout_changes_no_config_and_writes_no_backup",
+        bootoutReceipt.applied === false &&
+          bootoutReceipt.backupPath === null &&
+          bootoutReceipt.backupWritten === false &&
+          bootoutReceipt.recovery === "config_unchanged_no_backup_written" &&
+          bootoutReceipt.fenceRollback === null &&
+          fs.readFileSync(bootoutConfigPath, "utf8") === bootoutBytes &&
+          backups(bootoutPlimsollHome).length === 0,
+        {
+          applied: bootoutReceipt.applied,
+          recovery: bootoutReceipt.recovery,
+          backups: backups(bootoutPlimsollHome),
+        },
+      );
+      uninstallLaunchAgent({
+        homeDir: bootoutHome,
+        mutationAuthority: new LifecycleMutationAuthority(path.join(bootoutSandbox, "install-authority")),
+      });
+    } finally {
+      bootoutFixture.restore();
+      fs.rmSync(bootoutSandbox, { recursive: true, force: true });
     }
 
     console.log(JSON.stringify({

@@ -446,6 +446,16 @@ export function discoverCaptureRoots(
   return entries;
 }
 
+/**
+ * One entry the baseline walk could not resolve unambiguously. The count was
+ * always reported; the entries are listed as well (bead eco-6hoxj.55, review
+ * N5) so `--allow-scan-errors` can name exactly what it is leaving unfenced.
+ */
+export type CaptureRootScanError = {
+  path: string;
+  reason: "directory_unreadable" | "not_a_regular_file" | "stat_failed";
+};
+
 /** Every file the `source` tailer would discover under a capture root.
  *
  * Mirrors `IncrementalJsonlDiscovery`'s predicates so the set fenced at
@@ -457,40 +467,46 @@ export function discoverCaptureRoots(
 export function captureRootBaselineFiles(
   source: CaptureRoot["source"],
   directory: string,
-): { files: string[]; errors: number } {
+): { files: string[]; errors: number; errorEntries: CaptureRootScanError[] } {
   const matches = source === "codex"
     ? (name: string) => name.startsWith("rollout-") && name.endsWith(".jsonl")
     : (name: string) => name.endsWith(".jsonl");
   const files: string[] = [];
-  let errors = 0;
+  const errorEntries: CaptureRootScanError[] = [];
   const walk = (current: string) => {
     let entries: fs.Dirent[];
     try { entries = fs.readdirSync(current, { withFileTypes: true }); }
-    catch { errors += 1; return; }
+    catch { errorEntries.push({ path: current, reason: "directory_unreadable" }); return; }
     for (const entry of entries) {
       const candidate = path.join(current, entry.name);
       if (entry.isDirectory()) { walk(candidate); continue; }
       if (!matches(entry.name)) continue;
       // A symlinked or non-regular candidate is the discovery's own error
       // class: one physical generation must never be fenced under an alias.
-      if (entry.isSymbolicLink() || !entry.isFile()) { errors += 1; continue; }
+      if (entry.isSymbolicLink() || !entry.isFile()) {
+        errorEntries.push({ path: candidate, reason: "not_a_regular_file" });
+        continue;
+      }
       files.push(candidate);
     }
   };
   walk(directory);
-  return { files: files.sort(), errors };
+  return { files: files.sort(), errors: errorEntries.length, errorEntries };
 }
 
 /** One stat-only observation per file, as the tailers build theirs. */
 export function captureRootBaselineObservations(
   files: readonly string[],
-): { observations: CaptureBaselineFileObservation[]; errors: number } {
+): { observations: CaptureBaselineFileObservation[]; errors: number; errorEntries: CaptureRootScanError[] } {
   const observations: CaptureBaselineFileObservation[] = [];
-  let errors = 0;
+  const errorEntries: CaptureRootScanError[] = [];
   for (const file of files) {
     try {
       const identity = fs.lstatSync(file, { bigint: true });
-      if (identity.isSymbolicLink() || !identity.isFile()) { errors += 1; continue; }
+      if (identity.isSymbolicLink() || !identity.isFile()) {
+        errorEntries.push({ path: file, reason: "not_a_regular_file" });
+        continue;
+      }
       observations.push({
         path: file,
         device: identity.dev,
@@ -498,7 +514,7 @@ export function captureRootBaselineObservations(
         size: identity.size,
         birthtimeNs: identity.birthtimeNs,
       });
-    } catch { errors += 1; }
+    } catch { errorEntries.push({ path: file, reason: "stat_failed" }); }
   }
-  return { observations, errors };
+  return { observations, errors: errorEntries.length, errorEntries };
 }
