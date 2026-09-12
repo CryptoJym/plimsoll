@@ -162,6 +162,7 @@ import {
   diagnoseManagedCodexHookCommand,
   diagnoseManagedGrokHookCommand,
   discoverClaudeSeats,
+  discoverCodexProfiles,
   generateClaudeCodeSettings,
   generateCodexConfigToml,
   generateCodexHookHeader,
@@ -2672,6 +2673,10 @@ async function main() {
     // owns ~/.claude-seats/<slug>, so setup manages what is already there and
     // a seat created later is picked up by the next run.
     const claudeSeats = discoverClaudeSeats(os.homedir()).filter((seat) => seat.hasSettings);
+    // Codex seat profiles are discovered the same way (bead eco-6hoxj.52): the
+    // fleet conductor owns ~/.codex-profiles/<slug>, so setup manages the
+    // config.toml that is already there and never provisions one.
+    const codexProfiles = discoverCodexProfiles(os.homedir()).filter((profile) => profile.hasConfig);
     type SetupTargetName =
       | "claude"
       | `claudeSeat[${string}]`
@@ -2679,7 +2684,8 @@ async function main() {
       | "grokHeaders"
       | "grok"
       | "codexHeaders"
-      | "codex";
+      | "codex"
+      | `codexProfile[${string}]`;
     type SetupTarget = {
       name: SetupTargetName;
       path: string;
@@ -2746,6 +2752,25 @@ async function main() {
         run: (options, preview) =>
           applyCodexConfig(codexFile, generateCodexConfigToml(options), { dryRun: preview }),
       },
+      // Fleet Codex seat profiles (bead eco-6hoxj.52): every lane launched with
+      // CODEX_HOME=~/.codex-profiles/<slug> reads that profile's config.toml
+      // instead of ~/.codex/config.toml, so it ran with no [otel] exporters and
+      // no Plimsoll hooks — captured only by the rollout scanner. Each
+      // discovered profile is its own target with the same generated content
+      // and the same additive TOML merge as the `codex` target: the fleet's own
+      // hooks and every unknown key survive untouched, the hook command stays
+      // token-free by pointing at the same per-user header file, and a profile
+      // directory without config.toml is skipped rather than created.
+      ...codexProfiles.map((profile): SetupTarget => ({
+        name: `codexProfile[${profile.slug}]`,
+        path: profile.path,
+        discovered: true,
+        run: (options, preview) =>
+          applyCodexConfig(profile.path, generateCodexConfigToml(options), {
+            dryRun: preview,
+            managedTarget: `codexProfile[${profile.slug}]`,
+          }),
+      })),
     ];
     // A hook command that references a header file Plimsoll could not write
     // would post without its producer token, so the config target is refused
@@ -2753,12 +2778,20 @@ async function main() {
     const headerDependencies: ReadonlyArray<{ header: SetupTargetName; dependent: SetupTargetName }> = [
       { header: "grokHeaders", dependent: "grok" },
       { header: "codexHeaders", dependent: "codex" },
+      // A profile's hooks reference the same per-user header file as the
+      // default Codex target, so they share its fate rather than pointing at a
+      // secret Plimsoll could not write.
+      ...codexProfiles.map((profile) => ({
+        header: "codexHeaders" as const,
+        dependent: `codexProfile[${profile.slug}]` as SetupTargetName,
+      })),
     ];
     // Two sources must never share one header file: each source's hook would
     // then send the other's token, collapsing the per-source audience boundary
     // that makes a producer token unable to impersonate another tool.
-    const headerTargetPaths = headerDependencies.map(({ header }) =>
-      targets.find((target) => target.name === header)!.path);
+    const headerTargetPaths = [...new Set(headerDependencies.map(({ header }) => header))].map(
+      (header) => targets.find((target) => target.name === header)!.path,
+    );
     const collidingHeaderPaths = new Set(
       headerTargetPaths.filter((value, index) => headerTargetPaths.indexOf(value) !== index),
     );
@@ -3165,6 +3198,28 @@ async function main() {
       };
     });
     const codex = readCodexTelemetryConfig(codexPath, generateCodexConfigToml(toolOptions));
+    // Fleet Codex seat profile coverage (bead eco-6hoxj.52). A profile whose
+    // config.toml carries no managed [otel] exporters and no Plimsoll hooks is
+    // captured by the rollout scanner only, so it is reported here as a
+    // coverage diagnostic — slug and managed key names, never a value — without
+    // changing `ok`, which stays a health verdict.
+    const codexProfiles = discoverCodexProfiles(os.homedir()).map((profile) => {
+      if (!profile.hasConfig) {
+        return { slug: profile.slug, path: profile.path, status: "skipped" as const, missing: [] as string[] };
+      }
+      const read = readCodexTelemetryConfig(profile.path, generateCodexConfigToml(toolOptions));
+      return {
+        slug: profile.slug,
+        path: profile.path,
+        // A profile file Plimsoll cannot parse or read is fleet-conductor
+        // state, and `setup` deliberately does not fail on it, so doctor is
+        // where it has to show up: named `unreadable`, with the same coverage
+        // diagnostic and still never a value.
+        status: read.status === "invalid" ? ("unreadable" as const) : read.status,
+        missing: read.missing,
+        ...(read.ok ? {} : { diagnostic: "codex_profile_config_unmanaged" }),
+      };
+    });
     const grokHookCommand = diagnoseManagedGrokHookCommand(grokHookPath);
     const codexHookCommand = diagnoseManagedCodexHookCommand(codexPath);
     const launchAgent = readLaunchAgentState(plistPath);
@@ -3269,6 +3324,7 @@ async function main() {
             claude,
             codex,
             claudeSeats,
+            codexProfiles,
           },
           ...(grokHookCommand ? { grokHookCommand } : {}),
           ...(codexHookCommand ? { codexHookCommand } : {}),

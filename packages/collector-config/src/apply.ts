@@ -1252,8 +1252,16 @@ type CodexPathSnapshot = {
   leaf?: FileIdentity;
 };
 
+/**
+ * `managedTarget` names the setup target the plan belongs to: the default
+ * `codex` target owns ~/.codex/config.toml and reports bare managed keys, while
+ * a fleet Codex seat profile (bead eco-6hoxj.52) owns
+ * ~/.codex-profiles/<slug>/config.toml and reports `codexProfile[<slug>].*` for
+ * exactly the same managed content and the same merge.
+ */
 export type CodexApplyOptions = {
   dryRun?: boolean;
+  managedTarget?: string;
   /** Deterministic synthetic-proof seam; production callers must leave this unset. */
   transactionHooks?: {
     afterBackup?: () => void;
@@ -2476,16 +2484,23 @@ export function applyCodexConfig(
   assertManagedConfigTarget(file);
   const { snapshot, current } = readCodexPreimage(file);
   const plan = reconcileCodexToml(file, current, generatedToml);
+  // The reconciler names the managed keys; the target owns the prefix, so a
+  // discovered profile reports `codexProfile[<slug>].otel...` for the same keys
+  // the default target reports bare.
+  const target = options.managedTarget;
+  const entries = target
+    ? plan.plan.map((entry) => ({ ...entry, key: `${target}.${entry.key}` }))
+    : plan.plan;
   if (plan.conflict) {
-    return { path: file, changed: false, changes: [], plan: plan.plan, conflict: plan.conflict };
+    return { path: file, changed: false, changes: [], plan: entries, conflict: plan.conflict };
   }
   const changes = plan.changes;
-  if (changes.length === 0) return { path: file, changed: false, changes: [], plan: plan.plan };
+  if (changes.length === 0) return { path: file, changed: false, changes: [], plan: entries };
   if (options.dryRun) {
-    return { path: file, changed: true, changes, plan: plan.plan };
+    return { path: file, changed: true, changes, plan: entries };
   }
   const backupPath = writeCodexPlan(file, snapshot, current, plan.next, options.transactionHooks);
-  return { path: file, changed: true, changes, plan: plan.plan, backupPath };
+  return { path: file, changed: true, changes, plan: entries, backupPath };
 }
 
 export type CodexHookCommandDiagnostic = {

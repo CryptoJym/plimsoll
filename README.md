@@ -138,6 +138,24 @@ each discovered seat under `telemetry.claudeSeats` and flags an unmanaged one
 with `claude_seat_settings_unmanaged` — a coverage diagnostic that does not
 change doctor's readiness verdict.
 
+Codex has the same split: fleet lanes run with
+`CODEX_HOME=~/.codex-profiles/<slug>`, so those sessions read the profile's own
+`config.toml` and got neither the `[otel]` exporters nor the Plimsoll hooks. As
+of 0.7.20 `setup` manages each discovered `~/.codex-profiles/*/config.toml` as
+its own target, reported as `codexProfile[<slug>]`, merging exactly the content
+it merges into `~/.codex/config.toml` through the same additive TOML
+reconciliation: your own hooks, tables, comments and unknown keys stay
+byte-identical, backups are written before any change, and the second run is a
+no-op. The profile's hook commands reference the same mode-0600
+`~/.codex/plimsoll.headers` file the default target references, so no profile
+config carries a token in a hook command, and no per-profile header file is
+created. A profile directory without a `config.toml` is skipped rather than
+created, and a malformed profile config is reported and left alone — it never
+fails `setup`, whose own declared targets still decide the exit code.
+`plimsoll doctor --read-only --json` lists each discovered profile under
+`telemetry.codexProfiles` and flags an unmanaged or unreadable one with
+`codex_profile_config_unmanaged`, again without changing the readiness verdict.
+
 The Grok and Codex hook commands carry no secret: each reads its producer
 token from a mode-0600 `plimsoll.headers` file beside its own config
 (`${GROK_HOME:-~/.grok}/hooks/plimsoll.headers` and `~/.codex/plimsoll.headers`),
