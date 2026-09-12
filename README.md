@@ -184,6 +184,20 @@ that would lose a top-level field this schema does not know
 (`append_only_violation`), or a config whose existing roots do not reproduce
 their own ids under the label given (`identity_derivation_mismatch`).
 
+`capture_root_scan_ambiguous` names the entries it could not resolve — a
+symlinked or non-regular `.jsonl`, an unreadable subdirectory — because the
+fence would not be provable over them. `--allow-scan-errors` registers the
+root anyway: the same entries are listed in the receipt under
+`scanAmbiguities` and simply left out of the fence, which means they are
+**not** excluded and the tailer will capture them like any other file it
+finds. Use it when the ambiguous entries are files you are content to have
+captured; without it the default refusal is unchanged.
+
+A `$HOME` that is itself a symlink is refused by the repo-wide no-follow
+LaunchAgent path guard (`launch_agent_manifest_invalid`, detail
+`LAUNCH_AGENT_UNSAFE_HOME`) before anything is written — spell the directory
+through the physical home when adding a root.
+
 The identity is derived from the host's **fleet machine label**, which is
 stored nowhere — only its digests are. It is not derived from the hostname, so
 on a fleet host **`--machine <fleet label>` is the expected form**: `add`
@@ -204,14 +218,27 @@ already registered keeps capturing exactly what it was capturing. Top-level
 config fields this schema does not know are carried through the write
 untouched and listed in the receipt as `carriedUnknownKeys`.
 
-Nothing is left half-applied. Whatever fails after the collector is stopped,
-`add` starts it again, records the failed step and the resulting state in the
-receipt (`recovery` is either `config_unchanged_restored_state_matches_backup`
-— the file is byte-identical to the backup — or
-`config_applied_collector_restarted`), and exits 1. A restart or daemon
-verification that does not come back also exits 1 with the failed step named.
-Without an installed LaunchAgent the restart is skipped and the receipt says
-so. Existing roots, the installation epoch and every other enrollment field
+Nothing is left half-applied, and the receipt never claims a recovery that
+did not happen. Whatever fails from the unload onwards — including a throw
+after the bootout, when the daemon is already down — `add` starts the
+collector again, records the failed step and the resulting state, and exits 1.
+`recovery` is one of:
+
+| `recovery` | What it means |
+|---|---|
+| `config_applied_collector_restarted` | The write completed. The config names the new roots and the fence belongs to them. |
+| `config_unchanged_fence_rolled_back` | The config is byte-identical to the backup, and every generation row this run fenced was removed again. |
+| `ledger_fence_retained` | The config was **not** written, but the fence could not be rolled back. `fenceRollback.retainedFiles` lists the files this run fenced (a superset of what is still excluded if the rollback was partial) — remove their rows or re-run the add to register the root they belong to. |
+| `config_unchanged_no_backup_written` | Nothing was written at all: the failure was at or before the backup step. `backupPath` is then `null`. |
+| `config_unchanged_restored_state_matches_backup` | The config is byte-identical to the backup and this run fenced nothing. |
+
+`backupPath` is only ever a backup that exists on disk; `backupWritten` says
+whether the backup step completed. A retry whose fence is already in place
+reports `baseline.seals[].reason: "already_sealed"` with the count found and
+`baseline.seededAt: null` — the fence is real, this run did not write it. A
+restart or daemon verification that does not come back also exits 1 with the
+failed step named. Without an installed LaunchAgent the restart is skipped and
+the receipt says so. Existing roots, the installation epoch and every other enrollment field
 are never changed. `plimsoll doctor --read-only --json` reports what is still
 unregistered under `captureRoots.unregisteredCandidates` — like the seat
 diagnostic, it does not change doctor's readiness verdict.

@@ -115,8 +115,27 @@ export type CaptureBaselineSealResult = {
   runId: string | null;
   filesObserved: number;
   generationsSealed: number;
+  /**
+   * Observations whose generation row was already present in this run
+   * namespace — an earlier run of the same registration fenced them and the
+   * fence is still in place (bead eco-6hoxj.55, review N3). Nothing was
+   * written for these, so `sealed` stays false when they are all this call
+   * found, and the caller must not report a seeding time it did not produce.
+   */
+  generationsAlreadySealed: number;
   observationsRejected: number;
-  reason: "baseline_not_complete" | null;
+  /** The generation keys this call actually inserted, so a failure later in
+   * the same command can remove exactly them and nothing else. */
+  sealedGenerationKeys: string[];
+  reason: "baseline_not_complete" | "already_sealed" | null;
+};
+
+/** Receipt of rolling a fence back (bead eco-6hoxj.55, review N1). */
+export type CaptureBaselineUnsealResult = {
+  source: HistoryCoverageSource;
+  runId: string;
+  requested: number;
+  removed: number;
 };
 
 export type BeginCaptureBaselineInput = {
@@ -642,13 +661,17 @@ export function sealCaptureBaselineGenerations(
       runId: null,
       filesObserved: observations.length,
       generationsSealed: 0,
+      generationsAlreadySealed: 0,
       observationsRejected: 0,
+      sealedGenerationKeys: [],
       reason: "baseline_not_complete",
     };
   }
   const runId = row.runId;
   let generationsSealed = 0;
+  let generationsAlreadySealed = 0;
   let observationsRejected = 0;
+  const sealedGenerationKeys: string[] = [];
   database.transaction(() => {
     const current = stateRow(database, source);
     if (!current || !stateIsValid(current) || current.status !== "complete" || current.runId !== runId) {
@@ -668,7 +691,7 @@ export function sealCaptureBaselineGenerations(
       // blocks such a file on its own (`capture_baseline_stat_ambiguous`), so
       // skipping it never opens a pre-existing transcript.
       if (!normalized) { observationsRejected += 1; continue; }
-      generationsSealed += insert.run(
+      const inserted = insert.run(
         source,
         runId,
         normalized.pathKey,
@@ -679,6 +702,12 @@ export function sealCaptureBaselineGenerations(
         observedAt,
         observedAt,
       ).changes;
+      // `do nothing` on conflict: no change means this exact generation was
+      // already fenced in this run namespace — a real fence this call did not
+      // write, which the receipt must report as such rather than as nothing.
+      if (inserted === 0) { generationsAlreadySealed += 1; continue; }
+      generationsSealed += inserted;
+      sealedGenerationKeys.push(normalized.generationKey);
     }
     if (generationsSealed === 0) return;
     database.prepare(
@@ -696,9 +725,56 @@ export function sealCaptureBaselineGenerations(
     runId,
     filesObserved: observations.length,
     generationsSealed,
+    generationsAlreadySealed,
     observationsRejected,
-    reason: null,
+    sealedGenerationKeys,
+    reason: generationsSealed === 0 && generationsAlreadySealed > 0 ? "already_sealed" : null,
   };
+}
+
+/**
+ * Remove exactly the generation rows one `sealCaptureBaselineGenerations`
+ * call inserted (bead eco-6hoxj.55, review N1).
+ *
+ * `capture-roots add` commits the fence before it publishes the config that
+ * names the new root. A failure between the two would otherwise leave the
+ * files of an unregistered directory permanently excluded while the receipt
+ * claimed the run had been rolled back. Only the caller's own keys are
+ * deleted, in the run namespace they were written to, so a row another actor
+ * wrote — or a row from an earlier registration of the same files — is never
+ * touched. The state row's counters move back with them so the
+ * `filesBaselined === excludedGenerations` invariant `sourceStatus` enforces
+ * keeps holding; the counters are decremented regardless of the run's current
+ * status, because they count rows, not progress.
+ */
+export function unsealCaptureBaselineGenerations(
+  database: Database.Database,
+  source: HistoryCoverageSource,
+  runId: string,
+  generationKeys: readonly string[],
+  observedAt: string,
+): CaptureBaselineUnsealResult {
+  ensureCaptureBaselineSchema(database);
+  if (!validTimestamp(observedAt)) throw new Error("capture_baseline_invalid_observation_time");
+  if (!validRunId(runId)) throw new Error("capture_baseline_invalid_run_id");
+  const keys = [...new Set(generationKeys)];
+  let removed = 0;
+  database.transaction(() => {
+    const remove = database.prepare(
+      `delete from ${GENERATION_TABLE} where source = ? and run_id = ? and generation_key = ?`,
+    );
+    for (const key of keys) removed += remove.run(source, runId, key).changes;
+    if (removed === 0) return;
+    database.prepare(
+      `update ${STATE_TABLE}
+       set updated_at = ?,
+         files_discovered = max(0, files_discovered - ?),
+         files_validated = max(0, files_validated - ?),
+         files_baselined = max(0, files_baselined - ?)
+       where source = ? and run_id = ?`,
+    ).run(observedAt, removed, removed, removed, source, runId);
+  }).immediate();
+  return { source, runId, requested: keys.length, removed };
 }
 
 export function beginAutomaticCaptureBaseline(

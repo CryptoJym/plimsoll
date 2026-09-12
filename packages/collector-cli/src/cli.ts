@@ -123,6 +123,7 @@ import {
 import {
   captureBaselineStatus,
   sealCaptureBaselineGenerations,
+  unsealCaptureBaselineGenerations,
   type CaptureBaselineSealResult,
 } from "./capture-baseline";
 import {
@@ -269,12 +270,15 @@ Commands:
                         List native capture roots under $HOME with their state
                         (registered | candidate | missing); read-only
   capture-roots add --source codex|claude_code --directory DIR [--directory DIR]
-                        [--machine LABEL] [--dry-run] [--json]
+                        [--machine LABEL] [--allow-scan-errors] [--dry-run] [--json]
                         Append a newly discovered capture root: derives the
-                        enrolled identity, backs the config up, seeds the
-                        provider baseline at the append time, restarts the
+                        enrolled identity, backs the config up, fences the
+                        files the new root already holds, restarts the
                         collector and writes a receipt. Never changes an
-                        existing root, epoch or enrollment field
+                        existing root, epoch or enrollment field.
+                        --allow-scan-errors registers a root whose walk is
+                        ambiguous: the entries are named in the receipt and
+                        left unfenced (so they are captured, not excluded)
   doctor --read-only --json
                         Read-only readiness check; never creates config, ledger, plist, logs, or directories
   export                Print buffered events as JSON
@@ -3708,12 +3712,18 @@ async function main() {
     // directory discovery reports as a candidate is never refused
     // `path_outside_home` because a component of `$HOME` is a symlink.
     const resolvedHome = resolveDiscoveryHome(home);
+    // The fence is only provable when every candidate under the new root can
+    // be enumerated and stat-ed. `--allow-scan-errors` keeps the refusal's
+    // information and drops its veto: the entries are named in the receipt
+    // and left out of the seal.
+    const allowScanErrors = flag("--allow-scan-errors");
     const added: CaptureRoot[] = [];
     const preexisting: Array<{
       source: CaptureRoot["source"];
       directory: string;
       relative: string;
       observations: ReturnType<typeof captureRootBaselineObservations>["observations"];
+      ambiguous: Array<{ path: string; reason: string }>;
     }> = [];
     const seen = new Set(configuredRoots.map((root) => configuredCaptureRootDirectory(root)));
     const seenIds = new Set(configuredRoots.map((root) => root.rootId));
@@ -3784,29 +3794,31 @@ async function main() {
       // already holds, so the walk must be exhaustive before anything is
       // written. An entry the tailer's own discovery would count as an error
       // (a symlinked or non-regular `.jsonl`) makes it unprovable: refuse
-      // rather than register a root whose history would be replayed.
+      // rather than register a root whose history would be replayed —
+      // unless the operator accepts that consequence explicitly with
+      // `--allow-scan-errors`, in which case the ambiguous entries are named
+      // in the receipt and simply left unfenced (they are not excluded, so
+      // the tailer will capture them like any other file it later finds).
       const scan = captureRootBaselineFiles(source, directory);
-      if (scan.errors > 0) {
-        refuse("capture_root_scan_ambiguous", {
-          directory: relative,
-          files: scan.files.length,
-          errors: scan.errors,
-        });
-        return;
-      }
       const observed = captureRootBaselineObservations(scan.files);
-      if (observed.errors > 0) {
+      const ambiguous = [...scan.errorEntries, ...observed.errorEntries].map((entry) => ({
+        path: path.relative(resolvedHome, entry.path),
+        reason: entry.reason,
+      }));
+      if (ambiguous.length > 0 && !allowScanErrors) {
         refuse("capture_root_scan_ambiguous", {
           directory: relative,
           files: scan.files.length,
-          errors: observed.errors,
+          errors: ambiguous.length,
+          entries: ambiguous,
+          hint: "re-run with --allow-scan-errors to register the root and leave these entries unfenced",
         });
         return;
       }
       seen.add(directory);
       seenIds.add(identity.rootId);
       added.push({ ...identity, installationEpochId, source, directory });
-      preexisting.push({ source, directory, relative, observations: observed.observations });
+      preexisting.push({ source, directory, relative, observations: observed.observations, ambiguous });
     }
 
     const beforeBytes = fs.readFileSync(configPath);
@@ -3881,6 +3893,11 @@ async function main() {
       ),
       /** Top-level fields this schema does not know, written through as-is. */
       carriedUnknownKeys,
+      /** `--allow-scan-errors`: entries left unfenced, named, never silent. */
+      allowScanErrors,
+      scanAmbiguities: preexisting
+        .filter((entry) => entry.ambiguous.length > 0)
+        .map((entry) => ({ directory: entry.relative, entries: entry.ambiguous })),
       machine,
       installationEpochId,
       rootCountBefore: configuredRoots.length,
@@ -3893,6 +3910,8 @@ async function main() {
         directory: path.relative(resolvedHome, root.directory),
         /** Files already present, fenced as pre-existing generations. */
         preexistingFiles: preexisting[index]!.observations.length,
+        /** Entries the walk could not resolve, left unfenced (N5). */
+        ambiguousEntries: preexisting[index]!.ambiguous.length,
       })),
     };
     if (flag("--dry-run")) {
@@ -3924,31 +3943,61 @@ async function main() {
       skipped: true,
       reason: "launch_agent_not_installed",
     };
+    const backupPath = `${configPath}.plimsoll-backup-${appendedAt.replace(/[:.]/g, "-")}`;
+    let failure: { step: string; error: string } | null = null;
+    let configApplied = false;
+    let backupWritten = false;
+    let writtenSha256: string | null = null;
+    let baseline: Record<string, unknown> | null = null;
+    let step = "unload";
+    // The unload is inside the failure discipline too (bead eco-6hoxj.55,
+    // review N4): its bootout is the point the daemon goes down, and every
+    // step after that — the terminal-state observation, the PID reconciler,
+    // the fence release — runs while it is down. A throw there, or a
+    // terminal state that cannot be proven stopped after a bootout was
+    // issued, must still reach the restart block below rather than return
+    // and leave the collector stopped.
     if (installed) {
-      const unload = await executeLaunchAgentUnload(config.port, authority);
-      if (!unload.unloaded) {
-        console.log(JSON.stringify({
-          status: "capture_roots_add_refused",
-          reason: "restart_unload_failed",
-          unload: launchAgentUnloadReceipt(unload),
-        }, null, 2));
-        process.exitCode = 1;
-        return;
+      try {
+        const unload = await executeLaunchAgentUnload(config.port, authority);
+        restart = { attempted: true, skipped: false, unload: launchAgentUnloadReceipt(unload) };
+        if (!unload.unloaded) {
+          if (!unload.bootoutAttempted) {
+            // Nothing was stopped — a busy fence or a refusal before the
+            // bootout. There is no service to bring back, and the inventory
+            // stays exactly as it is.
+            console.log(JSON.stringify({
+              status: "capture_roots_add_refused",
+              reason: "restart_unload_failed",
+              unload: launchAgentUnloadReceipt(unload),
+            }, null, 2));
+            process.exitCode = 1;
+            return;
+          }
+          failure = { step, error: `unload_not_proven:${unload.reason ?? unload.status}` };
+        }
+      } catch (error) {
+        restart = { attempted: true, skipped: false, unloadThrew: true };
+        failure = { step, error: error instanceof Error ? error.message.slice(0, 200) : "failed" };
       }
-      restart = { attempted: true, skipped: false, unload: launchAgentUnloadReceipt(unload) };
     }
 
     // From here the collector is stopped, so every remaining step runs under
     // one failure path: whatever throws, the agent is loaded again, the
     // receipt says which step failed and what state the config is in, and the
     // command exits non-zero. Leaving the collector down was the r1 failure.
-    const backupPath = `${configPath}.plimsoll-backup-${appendedAt.replace(/[:.]/g, "-")}`;
-    let failure: { step: string; error: string } | null = null;
-    let configApplied = false;
-    let writtenSha256: string | null = null;
-    let baseline: Record<string, unknown> | null = null;
-    let step = "backup";
+    //
+    // The ledger connection is held open across the config write so a failure
+    // after the fence is committed can remove exactly the generation rows
+    // this run inserted (review N1). Nothing else runs between them.
+    let buffer: ReturnType<typeof openBuffer> | null = null;
+    let sealedThisRun: Array<{ source: CaptureRoot["source"]; runId: string; keys: string[] }> = [];
+    let fenceRollback: Record<string, unknown> | null = null;
     try {
+      // A failed unload has already recorded its step: skip every remaining
+      // step, touch nothing, and let the restart block below run.
+      if (failure) throw new Error("unload_step_failed");
+      step = "backup";
       const backupDescriptor = fs.openSync(backupPath, "wx", 0o600);
       try {
         fs.writeFileSync(backupDescriptor, beforeBytes);
@@ -3956,6 +4005,7 @@ async function main() {
       } finally {
         fs.closeSync(backupDescriptor);
       }
+      backupWritten = true;
 
       // Fence exactly the new roots, before the config names them: the files
       // already sitting in each new directory are recorded as pre-existing
@@ -3966,42 +4016,47 @@ async function main() {
       // their current sessions. Sealing first also means a failure here
       // leaves the inventory exactly as it was.
       step = "baseline_seed";
-      const buffer = openBuffer(config);
-      try {
-        const baselineSources = [...new Set(added.map((root) => root.source))];
-        const statusFor = () => Object.fromEntries(
-          captureBaselineStatus(buffer.database).sources
-            .filter((row) => baselineSources.includes(row.source))
-            .map((row) => [row.source, { status: row.status, startedAt: row.latestRun?.startedAt ?? null }]),
-        );
-        const before = statusFor();
-        const seals: CaptureBaselineSealResult[] = baselineSources.map((baselineSource) =>
-          sealCaptureBaselineGenerations(
-            buffer.database,
-            baselineSource,
-            preexisting
-              .filter((entry) => entry.source === baselineSource)
-              .flatMap((entry) => entry.observations),
-            appendedAt,
-          ));
-        const generationsSealed = seals.reduce((total, seal) => total + seal.generationsSealed, 0);
-        baseline = {
-          // Only ever a time a generation row was actually written. A source
-          // whose baseline is not yet complete reports the true state: the
-          // tailer establishes its fence at first start, which already
-          // excludes everything present by then.
-          seededAt: generationsSealed > 0 ? appendedAt : null,
-          sources: baselineSources,
-          providerCutoffMoved: false,
-          generationsSealed,
-          filesFenced: preexisting.reduce((total, entry) => total + entry.observations.length, 0),
-          seals,
-          before,
-          after: statusFor(),
-        };
-      } finally {
-        buffer.close();
-      }
+      buffer = openBuffer(config);
+      const baselineSources = [...new Set(added.map((root) => root.source))];
+      const statusFor = () => Object.fromEntries(
+        captureBaselineStatus(buffer!.database).sources
+          .filter((row) => baselineSources.includes(row.source))
+          .map((row) => [row.source, { status: row.status, startedAt: row.latestRun?.startedAt ?? null }]),
+      );
+      const before = statusFor();
+      const seals: CaptureBaselineSealResult[] = baselineSources.map((baselineSource) =>
+        sealCaptureBaselineGenerations(
+          buffer!.database,
+          baselineSource,
+          preexisting
+            .filter((entry) => entry.source === baselineSource)
+            .flatMap((entry) => entry.observations),
+          appendedAt,
+        ));
+      // Exactly what this run inserted, keyed as the ledger keys it, so the
+      // failure path below can remove those rows and only those rows.
+      sealedThisRun = seals
+        .filter((seal) => seal.runId !== null && seal.sealedGenerationKeys.length > 0)
+        .map((seal) => ({ source: seal.source, runId: seal.runId!, keys: seal.sealedGenerationKeys }));
+      const generationsSealed = seals.reduce((total, seal) => total + seal.generationsSealed, 0);
+      baseline = {
+        // Only ever a time a generation row was actually written. A source
+        // whose baseline is not yet complete reports the true state: the
+        // tailer establishes its fence at first start, which already
+        // excludes everything present by then. A retry whose rows are
+        // already in place reports `already_sealed` with the count found and
+        // no seeding time (review N3) — the fence is real, this run did not
+        // write it.
+        seededAt: generationsSealed > 0 ? appendedAt : null,
+        sources: baselineSources,
+        providerCutoffMoved: false,
+        generationsSealed,
+        generationsAlreadySealed: seals.reduce((total, seal) => total + seal.generationsAlreadySealed, 0),
+        filesFenced: preexisting.reduce((total, entry) => total + entry.observations.length, 0),
+        seals,
+        before,
+        after: statusFor(),
+      };
 
       step = "config_write";
       writeCollectorConfigTransactionally(carried, configPath, { preserveUnknownFields });
@@ -4009,7 +4064,62 @@ async function main() {
       step = "config_readback";
       writtenSha256 = digest(fs.readFileSync(configPath));
     } catch (error) {
-      failure = { step, error: error instanceof Error ? error.message.slice(0, 200) : "failed" };
+      failure = failure ?? { step, error: error instanceof Error ? error.message.slice(0, 200) : "failed" };
+      // A backup step that did not complete leaves no backup to compare
+      // against: remove a partial file rather than publish a path that says
+      // "byte-identical to the config" and is not (review N2).
+      if (!backupWritten) {
+        try { fs.rmSync(backupPath, { force: true }); } catch { /* reported below */ }
+      }
+      // The fence is committed before the config names the root. If the
+      // config was never published, those rows fence files in a directory
+      // nothing registered — remove exactly them (review N1). If that cannot
+      // be done, the receipt says so and names the files still fenced; it
+      // never claims a rollback that did not happen.
+      const sealedCount = sealedThisRun.reduce((total, entry) => total + entry.keys.length, 0);
+      if (!configApplied && sealedCount > 0) {
+        let removed = 0;
+        let rollbackError: string | null = null;
+        try {
+          if (!buffer) throw new Error("ledger_unavailable");
+          for (const entry of sealedThisRun) {
+            removed += unsealCaptureBaselineGenerations(
+              buffer.database,
+              entry.source,
+              entry.runId,
+              entry.keys,
+              new Date().toISOString(),
+            ).removed;
+          }
+        } catch (rollback) {
+          rollbackError = rollback instanceof Error ? rollback.message.slice(0, 200) : "failed";
+        }
+        const complete = rollbackError === null && removed === sealedCount;
+        fenceRollback = {
+          attempted: true,
+          generationsSealed: sealedCount,
+          generationsRemoved: removed,
+          complete,
+          error: rollbackError,
+          // The files this run fenced under the new roots: the operator's
+          // list for a manual repair when the rollback did not complete. A
+          // partial rollback makes it a superset of what is still fenced.
+          retainedFiles: complete
+            ? []
+            : preexisting.flatMap((entry) =>
+              entry.observations.map((observation) => path.relative(resolvedHome, observation.path))),
+        };
+      }
+    } finally {
+      if (buffer) {
+        // A close that throws must not escape past the restart block either.
+        try { buffer.close(); } catch (error) {
+          failure = failure ?? {
+            step: "ledger_close",
+            error: error instanceof Error ? error.message.slice(0, 200) : "failed",
+          };
+        }
+      }
     }
 
     if (restart.attempted) {
@@ -4042,6 +4152,9 @@ async function main() {
     }
 
     const restartFailed = restart.attempted === true && restart.verified !== true;
+    const backupOnDisk = backupWritten && (() => {
+      try { return fs.existsSync(backupPath); } catch { return false; }
+    })();
     const receipt = {
       status: failure || restartFailed ? "capture_roots_add_failed" : "capture_roots_added",
       applied: configApplied,
@@ -4050,17 +4163,36 @@ async function main() {
       durationMs: Date.now() - startedAt,
       ...plan,
       writtenSha256,
-      backupPath,
+      // Only ever a backup that exists: a failed backup step publishes null
+      // rather than a path a recovery script would hash to ENOENT (N2).
+      backupPath: backupOnDisk ? backupPath : null,
+      backupWritten,
       failure,
-      // The config is never left half-published: either the write never
-      // happened and the file is byte-identical to the backup, or it
-      // completed and the collector was restarted on it (or the restart was
-      // skipped with the reason below).
+      // What an operator can rely on after a failure, enumerated:
+      //   config_applied_collector_restarted        the write completed; the
+      //     config names the new roots and the fence belongs to them.
+      //   ledger_fence_retained                     the config was NOT
+      //     written but the fence could not be rolled back; `fenceRollback
+      //     .retainedFiles` lists exactly the files still excluded.
+      //   config_unchanged_fence_rolled_back        the config is
+      //     byte-identical to the backup and every generation row this run
+      //     sealed was removed.
+      //   config_unchanged_no_backup_written        nothing was written at
+      //     all — the failure was at or before the backup step.
+      //   config_unchanged_restored_state_matches_backup   the config is
+      //     byte-identical to the backup and this run sealed nothing.
       recovery: failure
         ? configApplied
           ? "config_applied_collector_restarted"
-          : "config_unchanged_restored_state_matches_backup"
+          : fenceRollback && fenceRollback.complete !== true
+            ? "ledger_fence_retained"
+            : !backupWritten
+              ? "config_unchanged_no_backup_written"
+              : fenceRollback
+                ? "config_unchanged_fence_rolled_back"
+                : "config_unchanged_restored_state_matches_backup"
         : null,
+      fenceRollback,
       baseline,
       restart,
     };
