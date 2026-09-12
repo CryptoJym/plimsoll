@@ -143,6 +143,11 @@ jobs:
       - name: Prove managed Codex seat profile reconciliation (eco-6hoxj.52)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-profiles-apply
+
+      - name: Prove self-healing managed Claude/Codex config reconcile (eco-6hoxj.50)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:managed-config-reconcile
+
       - name: Prove append-only capture-root registration (eco-6hoxj.53)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capture-roots-add
