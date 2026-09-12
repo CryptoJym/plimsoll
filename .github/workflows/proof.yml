@@ -209,6 +209,9 @@ jobs:
       - name: Prove local HTTP trust boundary
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:http-boundary
+      - name: Prove zero-value OTLP span admission (eco-6hoxj.60)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:otlp-admission
       - name: Prove bounded admission-rejection diagnostics (runner-scaled)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:rejection-aggregation
