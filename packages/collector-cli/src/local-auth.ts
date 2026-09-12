@@ -183,7 +183,30 @@ function authFileExists(home: string) {
   }
 }
 
-function writeAuth(home: string, auth: LocalIngestAuth, overwrite: boolean) {
+/**
+ * Internal: the fill write found the credential file had moved on while it was
+ * being written, so it abandoned rather than rename a stale copy over it.
+ */
+class LocalIngestAuthDrift extends Error {
+  constructor() {
+    super("local_ingest_auth_drift");
+  }
+}
+
+type WriteAuthOptions = {
+  /**
+   * Abandon the write instead of renaming when the credential file no longer
+   * carries this stamp. Omitted means write unconditionally.
+   */
+  abandonUnlessStamp?: string | null;
+};
+
+function writeAuth(
+  home: string,
+  auth: LocalIngestAuth,
+  overwrite: boolean,
+  options: WriteAuthOptions = {},
+) {
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
   if (!isPrivateDirectory(home)) throw new Error("local_ingest_auth_home_unsafe");
   const file = authPath(home);
@@ -208,6 +231,17 @@ function writeAuth(home: string, auth: LocalIngestAuth, overwrite: boolean) {
         throw new Error("local_ingest_auth_invalid");
       }
     } else {
+      // The drift guard belongs here, not before the write: `mkdirSync` ->
+      // `openSync` -> `writeFileSync` -> `fsyncSync` is a real fsync latency,
+      // and a rotation that renames its file into place inside it would be
+      // overwritten by a copy of the file this write started from -- putting
+      // the operator-revoked token back as `current` with no deadline. Checked
+      // immediately before the rename, the only window left is the rename
+      // itself, with no syscall in between to widen it.
+      if (options.abandonUnlessStamp !== undefined &&
+        localIngestAuthStamp(home) !== options.abandonUnlessStamp) {
+        throw new LocalIngestAuthDrift();
+      }
       fs.renameSync(temporary, file);
     }
     return auth;
@@ -225,13 +259,82 @@ function writeNewAuth(home: string, overwrite: boolean) {
   return writeAuth(home, newAuth(), overwrite);
 }
 
-function settledAuth(existing: LocalIngestAuth, now: number) {
+/**
+ * Producer audiences this process minted for a legacy credential file whose
+ * fill write could not land, keyed by resolved credential home. Without it a
+ * load in an unwritable home hands out a different gemini/grok token on every
+ * call, so a producer configured against one of them is refused by the next
+ * one. Process-lifetime only: the stored file, once writable again, wins.
+ */
+const unpersistedFills = new Map<string, UnpersistedFill>();
+
+type UnpersistedFill = {
+  geminiCliProducer: string;
+  grokProducer: string;
+  /** The audiences the stored file was actually missing. */
+  audiences: LocalProducerSource[];
+};
+
+function homeKey(home: string) {
+  return path.resolve(home);
+}
+
+/** Value-blind: which producer audiences the stored authority is missing. */
+function missingProducerAudiences(auth: LocalIngestAuth): LocalProducerSource[] {
+  const missing: LocalProducerSource[] = [];
+  if (!auth.geminiCliProducer) missing.push("gemini_cli");
+  if (!auth.grokProducer) missing.push("grok");
+  return missing;
+}
+
+function settledAuth(existing: LocalIngestAuth, now: number, home: string) {
   const live = withoutClosedRotations(existing, now);
+  const minted = unpersistedFills.get(homeKey(home));
   return {
     ...live,
-    geminiCliProducer: live.geminiCliProducer ?? newToken(),
-    grokProducer: live.grokProducer ?? newToken(),
+    geminiCliProducer: live.geminiCliProducer ?? minted?.geminiCliProducer ?? newToken(),
+    grokProducer: live.grokProducer ?? minted?.grokProducer ?? newToken(),
   };
+}
+
+/**
+ * The authority to return when the fill write was abandoned. The writer that
+ * won the race fills both producer audiences on its own write, so re-reading
+ * costs one read and hands back the values that are actually on disk instead
+ * of this process's discarded copy.
+ */
+function authAfterDrift(home: string, now: number, abandoned: LocalIngestAuth): LocalIngestAuth {
+  const reread = readLocalIngestAuth(home);
+  if (!reread) return abandoned;
+  const live = withoutClosedRotations(reread, now);
+  return live.geminiCliProducer && live.grokProducer ? Object.freeze(live) : abandoned;
+}
+
+function homeAcceptsAFillWrite(home: string) {
+  try {
+    fs.accessSync(home, fs.constants.W_OK | fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Value-blind: the producer audiences this host is serving from memory because
+ * a legacy credential file is missing them and the fill write cannot land. In
+ * the process that took the fail-soft load these are the audiences it actually
+ * minted; in a separate read-only process (doctor) the condition is derived
+ * from the stored file plus the home's write permission, so it is reportable
+ * without a write of any kind. Never returns or hashes a token.
+ */
+export function unpersistedProducerAudiences(home: string): LocalProducerSource[] {
+  const minted = unpersistedFills.get(homeKey(home));
+  if (minted) return [...minted.audiences];
+  const existing = readLocalIngestAuth(home);
+  if (!existing) return [];
+  const missing = missingProducerAudiences(existing);
+  if (missing.length === 0 || homeAcceptsAFillWrite(home)) return [];
+  return missing;
 }
 
 /**
@@ -241,8 +344,11 @@ function settledAuth(existing: LocalIngestAuth, now: number) {
  * file belongs to `rotateLocalProducerToken`, which composes its own live
  * rotations on the write that supersedes a token. The single write left here
  * fills producer audiences a legacy file is missing; it abandons that write
- * when the file moved on underneath it, and never crashes the caller when the
- * home cannot be written.
+ * when the file moved on underneath it -- re-checked immediately before the
+ * rename, not merely before the write -- and never crashes the caller when the
+ * home cannot be written. A fill that cannot land is remembered per home, so
+ * the authority this process serves stays the same on every later call, and
+ * `unpersistedProducerAudiences` names the audiences that are not on disk.
  */
 export function loadOrCreateLocalIngestAuth(
   home: string,
@@ -253,18 +359,35 @@ export function loadOrCreateLocalIngestAuth(
   const existing = readLocalIngestAuth(home);
   if (existing) {
     const live = withoutClosedRotations(existing, now);
-    if (live.geminiCliProducer && live.grokProducer) return Object.freeze(live);
-    const settled = Object.freeze(settledAuth(existing, now));
+    if (live.geminiCliProducer && live.grokProducer) {
+      // The stored file carries both audiences, so nothing is held in memory
+      // for this home any more and doctor must stop reporting it.
+      unpersistedFills.delete(homeKey(home));
+      return Object.freeze(live);
+    }
+    const missing = missingProducerAudiences(live);
+    const settled = Object.freeze(settledAuth(existing, now, home));
     if (options.dryRun) return settled;
     // Abandon on drift: a write landed between the read above and here, so
     // that file is the newer one and this copy must not be renamed over it.
-    if (localIngestAuthStamp(home) !== stamp) return settled;
+    if (localIngestAuthStamp(home) !== stamp) return authAfterDrift(home, now, settled);
     try {
-      return writeAuth(home, settled, true);
-    } catch {
+      const written = writeAuth(home, settled, true, { abandonUnlessStamp: stamp });
+      unpersistedFills.delete(homeKey(home));
+      return written;
+    } catch (error) {
+      // The same abandon-on-drift decision, taken inside the write where the
+      // rename actually happens.
+      if (error instanceof LocalIngestAuthDrift) return authAfterDrift(home, now, settled);
       // A home this process cannot write must not turn a load into a crash on
-      // the path that feeds ingestion. The returned authority already carries
-      // the filled audiences; doctor reports the stored file's own state.
+      // the path that feeds ingestion. Remember exactly what was minted so the
+      // authority this host serves is stable for the life of the process, and
+      // so doctor can report which audiences are not on disk.
+      unpersistedFills.set(homeKey(home), {
+        geminiCliProducer: settled.geminiCliProducer!,
+        grokProducer: settled.grokProducer!,
+        audiences: missing,
+      });
       return settled;
     }
   }

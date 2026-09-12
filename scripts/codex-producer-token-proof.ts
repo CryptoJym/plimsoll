@@ -138,6 +138,14 @@ function sleep(ms: number) {
   return new Promise<void>((resolve) => { setTimeout(resolve, ms); });
 }
 
+/** Value-blind: which producer audiences the stored file is still missing. */
+function missingStoredAudiences(auth: LocalIngestAuth) {
+  return [
+    ...(auth.geminiCliProducer === undefined ? ["gemini_cli"] : []),
+    ...(auth.grokProducer === undefined ? ["grok"] : []),
+  ];
+}
+
 /** Value-blind: how many rotation rows the stored credential file still has. */
 function storedRotationRows(home: string) {
   return Object.keys(readLocalIngestAuth(home)?.rotations ?? {}).length;
@@ -1160,6 +1168,182 @@ async function main() {
         unprovisioned: unprovisioned.status,
         badSource: badSource.status,
         badGrace: badGrace.status,
+      },
+    );
+
+    // ---- D. The legacy audience fill is the second writer -----------------
+    // `loadOrCreateLocalIngestAuth` fills the gemini/grok audiences a legacy
+    // three-audience file is missing, so it -- not only
+    // `rotate-producer-token` -- renames a file into the credential home.
+
+    /** A pre-gemini/grok credential file, the only shape that takes the fill. */
+    const writeLegacyAuthFile = (home: string) => {
+      fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+      const legacy = {
+        version: 1,
+        claudeCodeProducer: crypto.randomBytes(32).toString("base64url"),
+        codexProducer: crypto.randomBytes(32).toString("base64url"),
+        managementRead: crypto.randomBytes(32).toString("base64url"),
+      };
+      fs.writeFileSync(authFile(home), `${JSON.stringify(legacy)}\n`, { mode: 0o600 });
+      return legacy;
+    };
+
+    // 1. Reviewer probe G: a rotation from a separate process that lands
+    //    *inside* the fill write. The fill's drift check sits immediately
+    //    before its rename, so it abandons rather than rename a copy of the
+    //    pre-rotation file over the rotation and put the operator-revoked
+    //    token back as `current` with no deadline. The window is widened here
+    //    by running the rotator to completion inside a patched `fs.openSync`;
+    //    the ordering being exercised is the shipped ordering, unwidened.
+    const fillRaceHome = path.join(sandbox, "legacy-fill-race");
+    const fillRaceLegacy = writeLegacyAuthFile(fillRaceHome);
+    const fillRotatorScript = path.join(sandbox, "rotate-inside-the-fill.mts");
+    fs.writeFileSync(fillRotatorScript, [
+      'import crypto from "node:crypto";',
+      `import { rotateLocalProducerToken } from ${JSON.stringify(path.join(repoRoot, "packages", "collector-cli", "src", "local-auth.ts"))};`,
+      'const rotated = rotateLocalProducerToken(process.argv[2]!, "codex", { graceMs: 60_000 });',
+      'process.stdout.write(`${JSON.stringify({',
+      '  digest: crypto.createHash("sha256").update(rotated.auth.codexProducer).digest("hex"),',
+      '  supersededDigest: crypto.createHash("sha256").update(rotated.auth.rotations!.codex!.token).digest("hex"),',
+      '  expiresAt: rotated.expiresAt,',
+      '})}\n`);',
+      "",
+    ].join("\n"), { mode: 0o600 });
+    const fillRaceTemporaryPrefix = `${authFile(fillRaceHome)}.`;
+    const mutableFs = fs as unknown as Record<string, (...args: any[]) => any>;
+    const realOpenSync = mutableFs.openSync!;
+    let fillRaceRotator: ReturnType<typeof spawnSync> | null = null;
+    mutableFs.openSync = (...args: any[]) => {
+      const descriptor = realOpenSync(...args);
+      const target = args[0];
+      if (fillRaceRotator === null && typeof target === "string" &&
+        target.startsWith(fillRaceTemporaryPrefix) && target.endsWith(".tmp")) {
+        // Inside the fill write: after its `openSync`, before its rename.
+        fillRaceRotator = spawnSync(
+          process.execPath,
+          ["--import", loader, fillRotatorScript, fillRaceHome],
+          { cwd: repoRoot, env: { ...process.env }, encoding: "utf8" },
+        );
+      }
+      return descriptor;
+    };
+    let fillRaceLoaded: LocalIngestAuth;
+    try {
+      fillRaceLoaded = loadOrCreateLocalIngestAuth(fillRaceHome);
+    } finally {
+      mutableFs.openSync = realOpenSync;
+    }
+    const fillRaceRotation = fillRaceRotator === null
+      ? null
+      : JSON.parse((fillRaceRotator as { stdout: string }).stdout) as {
+        digest: string;
+        supersededDigest: string;
+        expiresAt: number;
+      };
+    const fillRaceOnDisk = readLocalIngestAuth(fillRaceHome)!;
+    const fillRaceTemporaries = fs.readdirSync(fillRaceHome)
+      .filter((name) => name.endsWith(".tmp"));
+    check(
+      "a_rotation_inside_the_legacy_fill_write_is_never_lost",
+      fillRaceRotation !== null &&
+        (fillRaceRotator as unknown as { status: number }).status === 0 &&
+        sha256(fillRaceOnDisk.codexProducer) === fillRaceRotation.digest &&
+        fillRaceOnDisk.codexProducer !== fillRaceLegacy.codexProducer &&
+        storedRotationRows(fillRaceHome) === 1 &&
+        sha256(fillRaceOnDisk.rotations!.codex!.token) === fillRaceRotation.supersededDigest &&
+        fillRaceOnDisk.rotations!.codex!.expiresAt === fillRaceRotation.expiresAt &&
+        // The abandoned load hands back the winner's authority, not its own
+        // discarded copy, so this process cannot serve an audience no file has.
+        fillRaceLoaded.codexProducer === fillRaceOnDisk.codexProducer &&
+        fillRaceLoaded.geminiCliProducer === fillRaceOnDisk.geminiCliProducer &&
+        fillRaceLoaded.grokProducer === fillRaceOnDisk.grokProducer &&
+        Boolean(fillRaceOnDisk.geminiCliProducer && fillRaceOnDisk.grokProducer) &&
+        fillRaceTemporaries.length === 0,
+      {
+        rotatorFiredInsideTheWriteWindow: fillRaceRotator !== null,
+        rotatorExit: (fillRaceRotator as unknown as { status: number } | null)?.status ?? null,
+        diskIsThePreRotationToken:
+          fillRaceOnDisk.codexProducer === fillRaceLegacy.codexProducer,
+        diskIsTheRotatedToken: fillRaceRotation !== null &&
+          sha256(fillRaceOnDisk.codexProducer) === fillRaceRotation.digest,
+        rotationRowSurvived: storedRotationRows(fillRaceHome) === 1,
+        loadReturnedTheDiskAuthority:
+          fillRaceLoaded.codexProducer === fillRaceOnDisk.codexProducer,
+        audiencesOnDisk: Boolean(
+          fillRaceOnDisk.geminiCliProducer && fillRaceOnDisk.grokProducer,
+        ),
+        temporariesLeftBehind: fillRaceTemporaries,
+      },
+    );
+
+    // 2. Reviewer probe F: the same legacy file in a home that refuses the
+    //    fill write. The load must not throw on the path that feeds ingestion,
+    //    must hand back one stable authority for the life of the process
+    //    instead of a fresh token per call, and the condition must be
+    //    reportable read-only.
+    const sealedFillHome = path.join(sandbox, "legacy-fill-sealed");
+    const sealedFillLegacy = writeLegacyAuthFile(sealedFillHome);
+    const sealedFillStamp = credentialStamp(sealedFillHome);
+    const sealedFillHomeEnv = path.join(sandbox, "legacy-fill-sealed-home");
+    fs.mkdirSync(path.join(sealedFillHomeEnv, ".codex"), { recursive: true, mode: 0o700 });
+    let sealedFillLoads: LocalIngestAuth[] = [];
+    let sealedFillError = "";
+    let sealedFillDoctor: ReturnType<typeof runCli>;
+    fs.chmodSync(sealedFillHome, 0o500);
+    try {
+      for (let load = 0; load < 3; load += 1) {
+        const attempt = tryLoadAuth(sealedFillHome);
+        if (attempt.auth) sealedFillLoads.push(attempt.auth);
+        else sealedFillError = attempt.error;
+      }
+      sealedFillDoctor = runCli(["doctor", "--read-only", "--json"], {
+        HOME: sealedFillHomeEnv,
+        GROK_HOME: path.join(sealedFillHomeEnv, ".grok"),
+        PLIMSOLL_HOME: sealedFillHome,
+        PLIMSOLL_COLLECTOR_DOCTOR_TIMEOUT_MS: "200",
+      });
+    } finally {
+      fs.chmodSync(sealedFillHome, 0o700);
+    }
+    const sealedFillReceipt = JSON.parse(sealedFillDoctor.stdout) as Record<string, any>;
+    const distinctGeminiTokens = new Set(sealedFillLoads.map((auth) => auth.geminiCliProducer)).size;
+    const distinctGrokTokens = new Set(sealedFillLoads.map((auth) => auth.grokProducer)).size;
+    const sealedFillStored = readLocalIngestAuth(sealedFillHome)!;
+    check(
+      "an_unwritable_legacy_home_holds_one_authority_and_doctor_names_the_unpersisted_audiences",
+      sealedFillLoads.length === 3 && sealedFillError === "" &&
+        distinctGeminiTokens === 1 && distinctGrokTokens === 1 &&
+        new Set(sealedFillLoads.map((auth) => auth.codexProducer)).size === 1 &&
+        sealedFillLoads[0]!.codexProducer === sealedFillLegacy.codexProducer &&
+        // Nothing landed: the stored file is byte-identical and still legacy.
+        credentialStamp(sealedFillHome) === sealedFillStamp &&
+        sealedFillStored.geminiCliProducer === undefined &&
+        sealedFillStored.grokProducer === undefined &&
+        // Read-only, value-free diagnostic naming exactly the two audiences.
+        sealedFillReceipt.producerAudiencesUnpersisted?.code ===
+          "local_ingest_auth_audiences_unpersisted" &&
+        JSON.stringify(sealedFillReceipt.producerAudiencesUnpersisted?.audiences) ===
+          JSON.stringify(["gemini_cli", "grok"]) &&
+        sealedFillReceipt.readOnly === true &&
+        [sealedFillLoads[0]!.geminiCliProducer!, sealedFillLoads[0]!.grokProducer!,
+          sealedFillLegacy.codexProducer, sealedFillLegacy.managementRead]
+          .every((value) => !sealedFillDoctor.stdout.includes(value) &&
+            !sealedFillDoctor.stderr.includes(value)) &&
+        // A healthy home keeps the payload it always had: no diagnostic key.
+        rotatedReceipt.producerAudiencesUnpersisted === undefined,
+      {
+        loads: sealedFillLoads.length,
+        threw: sealedFillError,
+        distinctGeminiTokens,
+        distinctGrokTokens,
+        distinctCodexTokens: new Set(sealedFillLoads.map((auth) => auth.codexProducer)).size,
+        homeMode: "0500",
+        storedFileUnchanged: credentialStamp(sealedFillHome) === sealedFillStamp,
+        storedAudiences: missingStoredAudiences(sealedFillStored),
+        doctorUnpersisted: sealedFillReceipt.producerAudiencesUnpersisted ?? null,
+        doctorLeaksToken: false,
+        healthyHomeReportsNothing: rotatedReceipt.producerAudiencesUnpersisted === undefined,
       },
     );
 
