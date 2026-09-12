@@ -15,9 +15,11 @@ import {
   type CollectorConfig,
 } from "./config";
 import {
+  ANALYTICAL_METADATA_LIMITS,
   canonicalizeSuppressionReceipts,
   normalizeGitRemote,
   remoteLinkageHash,
+  validatedMetadataAttribute,
 } from "../../shared/src/index";
 import { appendForwardedHook } from "./forwarder";
 import { explodeOtlpPayload } from "./otlp";
@@ -52,7 +54,27 @@ import {
   requireOtlpSource,
   retryStorageBusy,
   type LocalProducerSource,
+  type RequestBudget,
 } from "./http-boundary";
+import { HOOK_AUTHORITY_CONTRACT } from "./hook-authority";
+// The drain reuses the normalizer's own readers rather than re-implementing
+// them, so the two cannot drift on what counts as a usable time (review r3, N2).
+import { otelScalar, unixNanoToIso } from "./normalizer";
+import {
+  HOOK_SPOOL_LIMITS,
+  hookSpoolDirectory,
+  hookSpoolEnabled,
+  hookSpoolEntryTrusted,
+  hookSpoolPending,
+  listHookSpoolFiles,
+  pruneHookSpoolRejected,
+  readHookSpoolCounters,
+  readHookSpoolFile,
+  reapHookSpoolTemporaries,
+  rejectHookSpoolFile,
+  writeHookSpoolCounters,
+  type HookSpoolStatus,
+} from "./hook-spool";
 import {
   assertManagementCredential,
   assertProducerToken,
@@ -128,6 +150,373 @@ function firstHeader(value: string | string[] | undefined) {
   return Array.isArray(value) ? value[0] : value;
 }
 
+/**
+ * Everything the `/hooks/<source>` route does after producer-token
+ * authentication: parse, bound, refuse a live-usage claim, and durably append
+ * with the storage-busy retry. The spool drain (bead eco-6hoxj.61) replays a
+ * recovered body through this exact callable, so a recovered row is normalized,
+ * validated, deduplicated and attributed identically to a live one — there is
+ * no second ingest path to keep in step.
+ */
+function admitHookBody(
+  bodyText: string,
+  source: LocalProducerSource,
+  context: { config: CollectorConfig; buffer: LocalEventBuffer; budget: RequestBudget },
+) {
+  const payload = parseBoundedJson(bodyText);
+  assertBoundedJsonNodes(payload);
+  if (hasLiveUsageClaim(payload)) throw new HttpBoundaryRejection("source_not_allowed", 403);
+  context.budget.checkpoint();
+  return retryStorageBusy(context.budget, () =>
+    appendForwardedHook(payload, {
+      config: context.config,
+      buffer: context.buffer,
+      source,
+    }),
+  );
+}
+
+/**
+ * The time aliases `normalizeHookPayload` honours, taken from the contract
+ * itself so this cannot drift from it: `observedAt`, `observed_at`,
+ * `event.timestamp`, `timestamp`, `time`
+ * (`hook-authority.ts`, `HOOK_AUTHORITY_CONTRACT.observedAt`).
+ */
+const OBSERVED_AT_ALIASES = new Set<string>(HOOK_AUTHORITY_CONTRACT.observedAt.aliases);
+
+/**
+ * The OTLP time keys `normalizer.ts` reads as its second-choice timestamp
+ * (`collectOtelSignals`), before it gives up and stamps the clock.
+ */
+const OTEL_TIME_KEYS = ["timeUnixNano", "observedTimeUnixNano", "startTimeUnixNano"] as const;
+
+/**
+ * True when the normalizer would actually SELECT this value as the event's
+ * time. Its own acceptance test, not a weaker one: `validatedMetadataAttribute`
+ * admitting the value as a STRING for that alias, which is literally what the
+ * `observedAt` selection in `normalizeHookPayload` calls. A numeric epoch, an
+ * empty string, `null`, a boolean, an object and an unparseable or future-dated
+ * string are all rejected there, so none of them counts here either.
+ */
+function usableObservedAtValue(key: string, value: unknown) {
+  const validated = validatedMetadataAttribute(key, value);
+  return validated.accepted && typeof validated.value === "string";
+}
+
+/**
+ * True when a unix-nano value survives the filter `collectOtelSignals` puts it
+ * through before it can reach `otelSignals.timestamps[0]`: it parses
+ * (`unixNanoToIso`, imported from the normalizer rather than re-implemented)
+ * and it is not from the future. `timestampIsNotFromTheFuture` is
+ * module-private in `normalizer.ts` and this file may not edit that module, so
+ * its one condition is rebuilt from the same shared limit it reads.
+ */
+function usableOtelTime(value: unknown) {
+  if (typeof value !== "string" && typeof value !== "number") return false;
+  const timestamp = unixNanoToIso(value);
+  if (!timestamp) return false;
+  const parsedAt = Date.parse(timestamp);
+  return (
+    !Number.isNaN(parsedAt) &&
+    parsedAt <= Date.now() + ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs
+  );
+}
+
+type SpooledTimeSignals = {
+  /** Alias attributes, flattened last-one-wins exactly as `collectOtelSignals` flattens them. */
+  aliasAttributes: Record<string, unknown>;
+  /** How many unix-nano times would reach `otelSignals.timestamps`. */
+  usableOtelTimes: number;
+};
+
+/**
+ * The same traversal `collectOtelSignals` runs, narrowed to the two things that
+ * decide an event's time. Same pre-order, same flattening, so a body with two
+ * `timestamp` attributes is judged on the one the normalizer would end up with.
+ */
+function collectSpooledTimeSignals(value: unknown, signals: SpooledTimeSignals) {
+  if (!value || typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    for (const item of value) collectSpooledTimeSignals(item, signals);
+    return;
+  }
+  const record = value as Record<string, unknown>;
+  if (typeof record.key === "string" && "value" in record && OBSERVED_AT_ALIASES.has(record.key)) {
+    signals.aliasAttributes[record.key] = otelScalar(record.value);
+  }
+  for (const key of OTEL_TIME_KEYS) {
+    if (usableOtelTime(record[key])) signals.usableOtelTimes += 1;
+  }
+  for (const nested of Object.values(record)) collectSpooledTimeSignals(nested, signals);
+}
+
+/**
+ * True when this body already carries a time the normalizer will USE, so the
+ * drain must not supply one (review r3, N2).
+ *
+ * Presence is not usability. r3 asked only whether an alias KEY was there, so a
+ * body whose `timestamp` held a millisecond epoch — an ordinary producer
+ * convention — or an empty string, `null`, a boolean or an object opted itself
+ * out of the fix and was stamped with the recovery clock again: the exact r2
+ * defect, reached by a different door. This decides the way the normalizer
+ * decides:
+ *   - a TOP-LEVEL alias counts only when `validatedMetadataAttribute` accepts
+ *     its value as a string (the `observedAt` selection runs over the RAW
+ *     top-level partition);
+ *   - an OTLP `{key, value}` attribute alias counts only when its scalar
+ *     (`otelScalar` — i.e. a usable `stringValue`) is accepted the same way;
+ *   - a `timeUnixNano`/`observedTimeUnixNano`/`startTimeUnixNano` counts only
+ *     when it parses and is not from the future.
+ * When the body's own time is unusable this is false and the drain supplies the
+ * envelope's `receivedAt` as a top-level `observedAt`. That is safe precisely
+ * because the normalizer's own precedence then ignores the unusable field — it
+ * rejects it live for the same reason.
+ */
+function bodyCarriesItsOwnTime(payload: Record<string, unknown>) {
+  for (const alias of OBSERVED_AT_ALIASES) {
+    if (alias in payload && usableObservedAtValue(alias, payload[alias])) return true;
+  }
+  const signals: SpooledTimeSignals = { aliasAttributes: {}, usableOtelTimes: 0 };
+  collectSpooledTimeSignals(payload, signals);
+  for (const [key, value] of Object.entries(signals.aliasAttributes)) {
+    if (usableObservedAtValue(key, value)) return true;
+  }
+  return signals.usableOtelTimes > 0;
+}
+
+/**
+ * Give a recovered event the time the HOOK fired, not the time the drain got to
+ * it (review r2, F1).
+ *
+ * `normalizeHookPayload` falls back to `new Date()` for a body with no time of
+ * its own, and no real hook body carries one — so before r3 every recovered
+ * event was stamped with the recovery clock, skewed by the whole spool latency
+ * (a managed-update restart, a deferred tick, up to doctor's 600 s stall
+ * threshold). `observed_at` drives retention cutoffs and every cost/usage time
+ * bucket, so that skew moved real spend into the wrong window.
+ *
+ * The envelope's `receivedAt` is the hook process's own stamp, written before
+ * the file (`writeHookSpoolFile`), so it is the right answer and it is already
+ * on disk. It is supplied as a DEFAULT: a body that carries any time the
+ * normalizer honours keeps it, untouched.
+ */
+export function spooledBodyWithHookTime(bodyText: string, receivedAt: string) {
+  const receivedAtMs = Date.parse(receivedAt);
+  if (!Number.isFinite(receivedAtMs)) return bodyText;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bodyText);
+  } catch {
+    // Not JSON: hand it over unchanged and let the route reject it exactly as
+    // it would have. The drain does not decide what is admissible.
+    return bodyText;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return bodyText;
+  const payload = parsed as Record<string, unknown>;
+  if (bodyCarriesItsOwnTime(payload)) return bodyText;
+  try {
+    return JSON.stringify({ ...payload, observedAt: new Date(receivedAtMs).toISOString() });
+  } catch {
+    return bodyText;
+  }
+}
+
+/**
+ * A receipt-safe error label: the `code` an fs/system error carries, never its
+ * message, which embeds the absolute path it failed on.
+ */
+function errorCodeOnly(error: unknown) {
+  const code = (error as { code?: unknown } | null)?.code;
+  return typeof code === "string" ? code : "unknown";
+}
+
+export type HookSpoolDrainTick = {
+  recovered: number;
+  rejected: number;
+  deferred: number;
+  /** True when a busy ledger stopped this tick before the queue was empty. */
+  deferredTick: boolean;
+  attempted: number;
+};
+
+export type HookSpoolDrain = {
+  start: () => void;
+  stop: () => void;
+  /** Cached snapshot; no filesystem or SQLite work runs on the request path. */
+  status: () => HookSpoolStatus;
+  /** One drain pass. Exported for the proof and for the startup pass. */
+  tick: () => Promise<HookSpoolDrainTick>;
+};
+
+/**
+ * The collector side of the hook spool: every 5 s, apply the oldest spooled
+ * events through the hook route's own callable.
+ *
+ * Three outcomes per file and no fourth. Applied -> unlink and count
+ * `recovered`. The ledger is busy again -> the file stays exactly where it is,
+ * this tick stops (there is no point walking 200 files into the same lock),
+ * and `deferred` counts the wait; there is no attempt cap, because a busy
+ * ledger is a wait, not a verdict. The route would answer 4xx -> the file is
+ * quarantined under `rejected/` and counted, because replaying a body the
+ * contract refuses forever is the failure mode this bead exists to avoid.
+ */
+export function createHookSpoolDrain(
+  config: CollectorConfig,
+  buffer: LocalEventBuffer,
+  options: {
+    home: string;
+    env?: NodeJS.ProcessEnv;
+    intervalMs?: number;
+    maxFilesPerTick?: number;
+    nowMs?: () => number;
+    onWarning?: (line: Record<string, unknown>) => void;
+  },
+): HookSpoolDrain {
+  const env = options.env ?? process.env;
+  const nowMs = options.nowMs ?? (() => Date.now());
+  const intervalMs = options.intervalMs ?? HOOK_SPOOL_LIMITS.drainIntervalMs;
+  const maxFilesPerTick = options.maxFilesPerTick ?? HOOK_SPOOL_LIMITS.maxFilesPerTick;
+  const warn = options.onWarning ?? ((line) => console.warn(JSON.stringify(line)));
+  const enabled = hookSpoolEnabled(env);
+  let counters = readHookSpoolCounters(options.home);
+  let pending = hookSpoolPending(options.home, nowMs());
+  let timer: NodeJS.Timeout | undefined;
+  let inFlight = false;
+  let ticks = 0;
+
+  const snapshot = (): HookSpoolStatus => ({ enabled, ...counters, ...pending });
+
+  const tick = async (): Promise<HookSpoolDrainTick> => {
+    const result: HookSpoolDrainTick = {
+      recovered: 0,
+      rejected: 0,
+      deferred: 0,
+      deferredTick: false,
+      attempted: 0,
+    };
+    if (!enabled) return result;
+    ticks += 1;
+    // Retention and orphan reaping run on the tick's own cadence, not on the
+    // arrival of a new rejection (review r1, F3/F4): a quiet spool used to keep
+    // quarantined files past their age bound forever, and nothing ever deleted
+    // a `*.json.tmp` left by a crashed hook process.
+    if (ticks % HOOK_SPOOL_LIMITS.rejectedPruneEveryTicks === 0) {
+      pruneHookSpoolRejected(options.home, nowMs());
+    }
+    reapHookSpoolTemporaries(options.home, nowMs());
+    const files = listHookSpoolFiles(options.home, maxFilesPerTick);
+    if (files.length === 0) {
+      pending = hookSpoolPending(options.home, nowMs());
+      return result;
+    }
+    // The trust boundary is the directory first: a spool directory this uid
+    // does not privately own is never replayed, whatever it holds.
+    const directoryTrusted = hookSpoolEntryTrusted(hookSpoolDirectory(options.home), "directory");
+    for (const file of files) {
+      result.attempted += 1;
+      if (!directoryTrusted || !hookSpoolEntryTrusted(file.path, "file")) {
+        rejectHookSpoolFile(options.home, file, "spool_untrusted");
+        result.rejected += 1;
+        continue;
+      }
+      const read = readHookSpoolFile(file.path);
+      if (!read.ok) {
+        rejectHookSpoolFile(options.home, file, read.reason);
+        result.rejected += 1;
+        continue;
+      }
+      try {
+        // The hook's own time, not the drain's (review r2, F1).
+        await admitHookBody(
+          spooledBodyWithHookTime(read.envelope.body, read.envelope.receivedAt),
+          read.envelope.source,
+          { config, buffer, budget: createRequestBudget() },
+        );
+        try {
+          fs.unlinkSync(file.path);
+        } catch {
+          /* already gone; the counter still reflects the applied event */
+        }
+        result.recovered += 1;
+      } catch (error) {
+        const failure = asHttpBoundaryRejection(error);
+        if (failure.status === 503) {
+          result.deferred += 1;
+          result.deferredTick = true;
+          break;
+        }
+        rejectHookSpoolFile(options.home, file, failure.reason);
+        result.rejected += 1;
+      }
+      // Yield between files: the drain shares this loop with /hooks/* and the
+      // OTLP receiver and must never hold it for a whole tick.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+    }
+    counters = {
+      recovered: counters.recovered + result.recovered,
+      rejected: counters.rejected + result.rejected,
+      deferred: counters.deferred + result.deferred,
+      lastDrainAt: new Date(nowMs()).toISOString(),
+    };
+    try {
+      writeHookSpoolCounters(options.home, counters);
+    } catch (error) {
+      // The code and nothing else (review r1, F7): an fs failure message
+      // embeds the absolute path it failed on, and home paths stay out of
+      // receipts everywhere else in this code base.
+      warn({
+        warning: "hook_spool_counters_write_failed",
+        code: errorCodeOnly(error),
+      });
+    }
+    if (result.rejected > 0) pruneHookSpoolRejected(options.home, nowMs());
+    pending = hookSpoolPending(options.home, nowMs());
+    if (result.recovered > 0 || result.rejected > 0) {
+      console.log(
+        JSON.stringify({
+          status: "hook_spool_drain",
+          recovered: result.recovered,
+          rejected: result.rejected,
+          deferred: result.deferred,
+          pendingFiles: pending.pendingFiles,
+        }),
+      );
+    }
+    return result;
+  };
+
+  return {
+    start() {
+      if (!enabled || timer) return;
+      // Start-up prune: a host that rejected a burst and then went quiet (or
+      // was restarted) must still lose its quarantine at the age bound.
+      pruneHookSpoolRejected(options.home, nowMs());
+      reapHookSpoolTemporaries(options.home, nowMs());
+      timer = setInterval(() => {
+        if (inFlight) return;
+        inFlight = true;
+        void tick()
+          .catch((error) => {
+            warn({
+              warning: "hook_spool_drain_failed",
+              message: error instanceof Error ? error.message : String(error),
+            });
+          })
+          .finally(() => {
+            inFlight = false;
+          });
+      }, intervalMs);
+      timer.unref();
+    },
+    stop() {
+      if (timer) clearInterval(timer);
+      timer = undefined;
+    },
+    status: snapshot,
+    tick,
+  };
+}
+
 function requestUrl(request: http.IncomingMessage) {
   return new URL(request.url ?? "/", "http://127.0.0.1");
 }
@@ -185,6 +574,12 @@ export function createCollectorServer(
     liveProducerHome?: string;
     /** Proof-injectable per-source admission ceiling (defaults to the limit). */
     perSourceRequestLimit?: number;
+    /**
+     * Cached hook-spool snapshot (bead eco-6hoxj.61), supplied by the drain the
+     * daemon arms. Reading it is in-memory only: /status stays cache-only and
+     * never stats the spool directory on the request path.
+     */
+    hookSpoolStatus?: () => HookSpoolStatus | null;
   } = {},
 ) {
   assertCollectorPrivacyMode(config, "collector server");
@@ -306,6 +701,9 @@ export function createCollectorServer(
         counterLifetime: "durable",
         dropped: refreshControl ? buffer.otlpAdmissionCounters() : (cachedControl?.otlpAdmission as {dropped?:unknown})?.dropped ?? null,
       },
+      // Bead eco-6hoxj.61: hook events the collector refused with 503 or could
+      // not receive at all, and what the drain has since done with them.
+      hookSpool: options.hookSpoolStatus?.() ?? null,
       ingestIntegrity: refreshControl ? buffer.eventCollisionSummary() : cachedControl?.ingestIntegrity ?? null,
       delivery,
       reconciliation: refreshControl ? codexReconciliationStatus(buffer.database) : cachedControl?.reconciliation ?? null,
@@ -590,6 +988,7 @@ export function createCollectorServer(
           };
           body.statusRefreshCounters = { ...statusRefreshCounters };
           body.httpAdmission = rejectionDiagnostics.counters();
+          body.hookSpool = options.hookSpoolStatus?.() ?? null;
           sendJson(response, body, 200, cached?.generation === null || cached?.generation === undefined ? {} : {
             "x-plimsoll-projection-generation": String(cached.generation),
           });
@@ -827,17 +1226,7 @@ export function createCollectorServer(
           request,
           await readBoundedRequestBody(request, budget),
         );
-        const payload = parseBoundedJson(body.text);
-        assertBoundedJsonNodes(payload);
-        if (hasLiveUsageClaim(payload)) throw new HttpBoundaryRejection("source_not_allowed", 403);
-        budget.checkpoint();
-        const normalized = await retryStorageBusy(budget, () =>
-          appendForwardedHook(payload, {
-            config,
-            buffer,
-            source,
-          })
-        );
+        const normalized = await admitHookBody(body.text, source, { config, buffer, budget });
         rejectionDiagnostics.recordAccepted(source);
         response.writeHead(202, { "content-type": "application/json" });
         response.end(

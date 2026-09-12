@@ -8,6 +8,7 @@
  *   - aiWorkIngestBatchSchema         packages/shared/src/schemas.ts
  *   - protectedMetadataFieldNames     packages/shared/src/policy.ts
  *   - hashProtectedValue, DEFAULT_POLICY packages/shared/src/policy.ts
+ *   - SPOOL_DERIVATION_INPUT_DISCLOSURE, HOOK_SPOOL_* packages/collector-cli/src/hook-spool.ts
  *
  * Every behavioral claim in the rendered page points at a named sentinel
  * check; this script verifies each referenced check name still exists in
@@ -32,12 +33,19 @@ import {
   isProtectedMetadataFieldName,
   protectedMetadataFieldNames,
 } from "../packages/shared/src/policy";
+import {
+  HOOK_SPOOL_DIRECTORY,
+  HOOK_SPOOL_LIMITS,
+  SPOOL_DERIVATION_INPUT_DISCLOSURE,
+  type SpoolDerivationInputDisclosure,
+} from "../packages/collector-cli/src/hook-spool";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const docPath = path.join(repoRoot, "docs", "privacy-spec.md");
 const scriptsDir = path.join(repoRoot, "scripts");
 const SOURCE_SCHEMAS = "packages/shared/src/schemas.ts";
 const SOURCE_POLICY = "packages/shared/src/policy.ts";
+const SOURCE_HOOK_SPOOL = "packages/collector-cli/src/hook-spool.ts";
 
 type FieldNote = {
   name: string;
@@ -57,6 +65,9 @@ export type PrivacySpecModel = {
   batchEnvelopeFields: FieldNote[];
   eventFields: FieldNote[];
   suppressedReceiptFieldName: string;
+  spoolDirectory: string;
+  spoolDerivationInputs: SpoolDerivationInputDisclosure[];
+  spoolRejectedRetentionDays: number;
 };
 
 type ProofCheckRef = {
@@ -116,6 +127,18 @@ export const PROOF_CHECKS: Record<string, ProofCheckRef> = {
       "suppression_receipt_private_values_absent_from_closed_ledger_artifacts",
       "suppression_receipts_survive_capture_reopen_seal_and_upload_with_exact_parity",
       "proof_receipt_contains_no_private_sentinel",
+    ],
+  },
+  at_rest: {
+    checks: [
+      "p_the_spool_file_keeps_the_forbidden_keys_and_none_of_their_content",
+      "r_the_spool_file_holds_only_the_allowlisted_path_value",
+      "r_the_widened_blanking_leaves_the_ledger_row_unchanged",
+      "r_the_suppression_receipts_are_identical_live_and_recovered",
+      "r_the_ledger_never_held_the_paths_either",
+      "r_every_protected_identity_name_is_blanked_or_declared",
+      "r_a_declared_protected_identity_is_raw_in_the_spool_and_hashed_identically_in_both_rows",
+      "r_blanking_a_declared_protected_identity_would_change_what_the_ledger_persists",
     ],
   },
 };
@@ -206,6 +229,9 @@ export function collectPrivacySpecModel(): PrivacySpecModel {
     suppressedReceiptFieldName: Object.keys(eventWrapper.shape).find(
       (key) => key !== "event",
     ) as string,
+    spoolDirectory: HOOK_SPOOL_DIRECTORY,
+    spoolDerivationInputs: [...SPOOL_DERIVATION_INPUT_DISCLOSURE],
+    spoolRejectedRetentionDays: HOOK_SPOOL_LIMITS.rejectedMaxAgeMs / (24 * 60 * 60 * 1000),
   };
 }
 
@@ -214,6 +240,19 @@ function listTable(items: readonly string[], sourceLabel: string): string[] {
     `| # | Field name |`,
     `|---|---|`,
     ...items.map((item, index) => `| ${index + 1} | \`${item}\` |`),
+    ``,
+    `Count: **${items.length}** — source: \`${sourceLabel}\`.`,
+  ];
+}
+
+function reasonTable(
+  items: readonly SpoolDerivationInputDisclosure[],
+  sourceLabel: string,
+): string[] {
+  return [
+    `| # | Field name | Why the spool keeps its value |`,
+    `|---|---|---|`,
+    ...items.map((item, index) => `| ${index + 1} | \`${item.key}\` | ${item.reason} |`),
     ``,
     `Count: **${items.length}** — source: \`${sourceLabel}\`.`,
   ];
@@ -372,6 +411,38 @@ export function renderPrivacySpec(model: PrivacySpecModel): string {
   lines.push(`unknown keys default to local-only.`);
   lines.push(``);
   lines.push(...renderGuaranteesSection(["plain_envelope"], found));
+  lines.push(`## Where captured data rests on disk`);
+  lines.push(``);
+  lines.push(`Captured data rests in two places on the machine, both inside the one`);
+  lines.push(`resolved Plimsoll home, both private to the running user (0700 directories,`);
+  lines.push(`0600 files). The rules above are written for the first one. The second`);
+  lines.push(`applies the ledger's DROP rule before its write: every key the sanitizer`);
+  lines.push(`removes outright is emptied there too, keeping only the key name, so`);
+  lines.push(`nothing from *Never collected* rests there. It does not apply the ledger's`);
+  lines.push(`other two steps. The keys of *Collected hashed* are not hashed before the`);
+  lines.push(`write — their raw value is a declared exemption below, because the ledger`);
+  lines.push(`persists the hash OF that value and an emptied one would hash to the digest`);
+  lines.push(`of \`""\`. And a value under a key the sanitizer keeps but the metadata`);
+  lines.push(`admission later discards as unknown can rest in a spool file, briefly,`);
+  lines.push(`though the ledger never stores it.`);
+  lines.push(``);
+  lines.push(`| # | Location | What rests there | Suppression applied before the write |`);
+  lines.push(`|---|---|---|---|`);
+  lines.push(`| 1 | \`work-ledger.sqlite\` (the local ledger) | Normalized events and their suppression receipts. | \`sanitizeForPolicy\` / \`evaluatePolicyInput\` (\`${SOURCE_POLICY}\`), then metadata admission. |`);
+  lines.push(`| 2 | \`${model.spoolDirectory}/\` (hook events the collector could not accept yet; bead eco-6hoxj.61) | One JSON envelope per event, written by the hook process, deleted as soon as the collector applies it. A file the collector cannot apply is quarantined under \`${model.spoolDirectory}/rejected/\` for up to ${model.spoolRejectedRetentionDays} days. | \`blankForbiddenRawContent\` (\`${SOURCE_HOOK_SPOOL}\`) empties the value of every key \`sanitizeRoutineMetadata\` drops outright — the local write's own DROP rule, imported — keeping only the key name. The declared derivation inputs below keep their value. |`);
+  lines.push(``);
+  lines.push(`So the spool holds values the ledger's own bytes do not, and this is the`);
+  lines.push(`whole of that list: the keys the collector reads from the raw body BEFORE`);
+  lines.push(`suppressing them to derive something it persists`);
+  lines.push(`(\`SPOOL_DERIVATION_INPUT_KEYS\`), and the protected identity names whose`);
+  lines.push(`hash the ledger keeps (\`SPOOL_PROTECTED_IDENTITY_KEYS\`, derived from`);
+  lines.push(`\`protectedMetadataFieldNames\`). Blanking either would silently make a`);
+  lines.push(`recovered event worse than a live one — a lost repository linkage, or an`);
+  lines.push(`identity hash computed from nothing — so they are exempt, by exact key name`);
+  lines.push(`(\`${SOURCE_HOOK_SPOOL}\`):`);
+  lines.push(``);
+  lines.push(...reasonTable(model.spoolDerivationInputs, `${SOURCE_HOOK_SPOOL} :: SPOOL_DERIVATION_INPUT_DISCLOSURE`));
+  lines.push(...renderGuaranteesSection(["at_rest"], found));
   lines.push(`## Regeneration`);
   lines.push(``);
   lines.push(`    pnpm docs:privacy          # regenerate this page`);

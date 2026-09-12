@@ -242,6 +242,67 @@ Named sentinel checks enforcing this section:
 - `allowed_metadata_and_top_level_string_value_matrix_fails_closed` — `scripts/outbox-proof.ts`
 - `upload_watermark_drains` — `scripts/signal-fidelity-proof.ts`
 
+## Where captured data rests on disk
+
+Captured data rests in two places on the machine, both inside the one
+resolved Plimsoll home, both private to the running user (0700 directories,
+0600 files). The rules above are written for the first one. The second
+applies the ledger's DROP rule before its write: every key the sanitizer
+removes outright is emptied there too, keeping only the key name, so
+nothing from *Never collected* rests there. It does not apply the ledger's
+other two steps. The keys of *Collected hashed* are not hashed before the
+write — their raw value is a declared exemption below, because the ledger
+persists the hash OF that value and an emptied one would hash to the digest
+of `""`. And a value under a key the sanitizer keeps but the metadata
+admission later discards as unknown can rest in a spool file, briefly,
+though the ledger never stores it.
+
+| # | Location | What rests there | Suppression applied before the write |
+|---|---|---|---|
+| 1 | `work-ledger.sqlite` (the local ledger) | Normalized events and their suppression receipts. | `sanitizeForPolicy` / `evaluatePolicyInput` (`packages/shared/src/policy.ts`), then metadata admission. |
+| 2 | `hook-spool/` (hook events the collector could not accept yet; bead eco-6hoxj.61) | One JSON envelope per event, written by the hook process, deleted as soon as the collector applies it. A file the collector cannot apply is quarantined under `hook-spool/rejected/` for up to 7 days. | `blankForbiddenRawContent` (`packages/collector-cli/src/hook-spool.ts`) empties the value of every key `sanitizeRoutineMetadata` drops outright — the local write's own DROP rule, imported — keeping only the key name. The declared derivation inputs below keep their value. |
+
+So the spool holds values the ledger's own bytes do not, and this is the
+whole of that list: the keys the collector reads from the raw body BEFORE
+suppressing them to derive something it persists
+(`SPOOL_DERIVATION_INPUT_KEYS`), and the protected identity names whose
+hash the ledger keeps (`SPOOL_PROTECTED_IDENTITY_KEYS`, derived from
+`protectedMetadataFieldNames`). Blanking either would silently make a
+recovered event worse than a live one — a lost repository linkage, or an
+identity hash computed from nothing — so they are exempt, by exact key name
+(`packages/collector-cli/src/hook-spool.ts`):
+
+| # | Field name | Why the spool keeps its value |
+|---|---|---|
+| 1 | `cwd` | `extractRepoContextCwd` reads this value from the raw body and the ledger turns it into the event's repository linkage |
+| 2 | `current_working_directory` | `extractRepoContextCwd` reads this value from the raw body and the ledger turns it into the event's repository linkage |
+| 3 | `workdir` | `extractRepoContextCwd` reads this value from the raw body and the ledger turns it into the event's repository linkage |
+| 4 | `working_directory` | `extractRepoContextCwd` reads this value from the raw body and the ledger turns it into the event's repository linkage |
+| 5 | `hookEventName` | the normalizer selects the event's type from this value in the raw body |
+| 6 | `account_id` | the ledger stores the protected hash of this value |
+| 7 | `account_uuid` | the ledger stores the protected hash of this value |
+| 8 | `actor_id` | the ledger stores the protected hash of this value |
+| 9 | `organization_id` | the ledger stores the protected hash of this value |
+| 10 | `org_id` | the ledger stores the protected hash of this value |
+| 11 | `workspace_root` | the ledger stores the protected hash of this value |
+| 12 | `user.account_id` | the ledger stores the protected hash of this value |
+| 13 | `user.account_uuid` | the ledger stores the protected hash of this value |
+| 14 | `user.id` | the ledger stores the protected hash of this value |
+| 15 | `user_id` | the ledger stores the protected hash of this value |
+| 16 | `username` | the ledger stores the protected hash of this value |
+
+Count: **16** — source: `packages/collector-cli/src/hook-spool.ts :: SPOOL_DERIVATION_INPUT_DISCLOSURE`.
+Named sentinel checks enforcing this section:
+
+- `p_the_spool_file_keeps_the_forbidden_keys_and_none_of_their_content` — `scripts/hook-spool-proof.ts`
+- `r_the_spool_file_holds_only_the_allowlisted_path_value` — `scripts/hook-spool-proof.ts`
+- `r_the_widened_blanking_leaves_the_ledger_row_unchanged` — `scripts/hook-spool-proof.ts`
+- `r_the_suppression_receipts_are_identical_live_and_recovered` — `scripts/hook-spool-proof.ts`
+- `r_the_ledger_never_held_the_paths_either` — `scripts/hook-spool-proof.ts`
+- `r_every_protected_identity_name_is_blanked_or_declared` — `scripts/hook-spool-proof.ts`
+- `r_a_declared_protected_identity_is_raw_in_the_spool_and_hashed_identically_in_both_rows` — `scripts/hook-spool-proof.ts`
+- `r_blanking_a_declared_protected_identity_would_change_what_the_ledger_persists` — `scripts/hook-spool-proof.ts`
+
 ## Regeneration
 
     pnpm docs:privacy          # regenerate this page

@@ -140,7 +140,15 @@ import {
   validateCaptureRoots,
   type CaptureRoot,
 } from "./capture-root-inventory";
-import { createCollectorServer } from "./server";
+import { createCollectorServer, createHookSpoolDrain, type HookSpoolDrain } from "./server";
+import {
+  HOOK_SPOOL_COLLECTOR_TOO_OLD,
+  HOOK_SPOOL_COLLECTOR_UNREACHABLE,
+  hookSpoolDaemonEnabled,
+  hookSpoolDoctorSection,
+  hookSpoolOperatorStatus,
+  type HookSpoolDaemonReading,
+} from "./hook-spool";
 import { MaintenanceFailureError, MaintenanceProcessBoundary } from "./maintenance-boundary";
 import { checkpointWalInBoundedChild, runStartupWalSelfHeal } from "./startup-wal-self-heal";
 import {
@@ -1045,10 +1053,82 @@ function launchAgentUnloadReceipt(
   };
 }
 
+/**
+ * The one bound every local read of the daemon uses: `plimsoll doctor`'s
+ * connectivity timeout, default 3 s. `plimsoll status` is otherwise a purely
+ * local read, so the single request it makes has to be explicitly bounded —
+ * the state an operator runs `status` in is often a collector that is hung
+ * rather than down (review r2, F4).
+ */
+const COLLECTOR_STATUS_TIMEOUT_DEFAULT_MS = 3_000;
+
+function collectorStatusTimeoutMs() {
+  const configured = Number(process.env.PLIMSOLL_COLLECTOR_DOCTOR_TIMEOUT_MS ?? "");
+  return Number.isFinite(configured) && configured > 0
+    ? configured
+    : COLLECTOR_STATUS_TIMEOUT_DEFAULT_MS;
+}
+
+/**
+ * Read the hook-spool kill switch out of a daemon's own `/status` body.
+ *
+ * Three answers, not two (review r2, F3). A `hookSpool.enabled` boolean is the
+ * daemon speaking. A healthy body (`ok: true`) with no `hookSpool` section at
+ * all is a collector older than 0.7.22 — reachable, fine, and simply without a
+ * drain; saying "unreachable" there is wrong in exactly the mixed-version
+ * window an operator is asking about. Anything else is unreachable.
+ */
+function hookSpoolReadingFromStatusBody(
+  body: Record<string, unknown> | null,
+  ok: boolean,
+): HookSpoolDaemonReading {
+  if (!ok) return HOOK_SPOOL_COLLECTOR_UNREACHABLE;
+  const section = body?.hookSpool;
+  if (section && typeof section === "object" && !Array.isArray(section)) {
+    const enabled = (section as Record<string, unknown>).enabled;
+    if (typeof enabled === "boolean") return hookSpoolDaemonEnabled(enabled);
+  }
+  if (body?.ok === true && section === undefined) return HOOK_SPOOL_COLLECTOR_TOO_OLD;
+  return HOOK_SPOOL_COLLECTOR_UNREACHABLE;
+}
+
+/**
+ * The daemon's hook-spool kill switch, from the daemon (bead eco-6hoxj.61,
+ * review r1 F5). `plimsoll status` is otherwise a local read, so this is its
+ * only request; it is bounded by the same timeout doctor uses and never
+ * guesses from this shell's environment.
+ */
+async function readDaemonHookSpool(
+  port: number,
+  managementToken?: string,
+): Promise<HookSpoolDaemonReading> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), collectorStatusTimeoutMs());
+  try {
+    const response = await fetch(`http://127.0.0.1:${port}/status`, {
+      signal: controller.signal,
+      headers: managementToken ? { "x-plimsoll-token": managementToken } : {},
+    });
+    let body: Record<string, unknown> | null = null;
+    try {
+      const candidate = await response.json();
+      if (candidate && typeof candidate === "object" && !Array.isArray(candidate)) {
+        body = candidate as Record<string, unknown>;
+      }
+    } catch {
+      // Not a Plimsoll-ready service's answer.
+    }
+    return hookSpoolReadingFromStatusBody(body, response.ok);
+  } catch {
+    return HOOK_SPOOL_COLLECTOR_UNREACHABLE;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function checkCollectorConnectivity(port: number, managementToken?: string) {
   const controller = new AbortController();
-  const timeoutMs = Number(process.env.PLIMSOLL_COLLECTOR_DOCTOR_TIMEOUT_MS ?? "3000");
-  const timeout = setTimeout(() => controller.abort(), Number.isFinite(timeoutMs) ? timeoutMs : 3000);
+  const timeout = setTimeout(() => controller.abort(), collectorStatusTimeoutMs());
 
   try {
     const response = await fetch(`http://127.0.0.1:${port}/status`, {
@@ -1086,6 +1166,13 @@ async function checkCollectorConnectivity(port: number, managementToken?: string
       typeof daemonHomeHash === "string" && /^sha256:[0-9a-f]{64}$/.test(daemonHomeHash)
         ? daemonHomeHash
         : null;
+    // Bead eco-6hoxj.61 (review r1, F5): the daemon's own kill-switch state,
+    // captured by its drain at start. The invoking shell's PLIMSOLL_HOOK_SPOOL
+    // says nothing about the daemon, so it is never used here. When the daemon
+    // did not say, the reading distinguishes "nobody answered" from "answered,
+    // but predates the field" (review r2, F3) instead of collapsing both into
+    // unreachable. Doctor reuses this request rather than making a second one.
+    const hookSpool = hookSpoolReadingFromStatusBody(body, response.ok);
     const health = body?.health && typeof body.health === "object"
       ? (body.health as { sources?: unknown })
       : null;
@@ -1163,6 +1250,7 @@ async function checkCollectorConnectivity(port: number, managementToken?: string
       reachable: response.ok && body?.ok === true,
       status: response.status,
       statusUrl: `http://127.0.0.1:${port}/status`,
+      hookSpool,
       runtimeIdentity,
       homeIdentityHash,
       retention: safeRetention,
@@ -1181,6 +1269,7 @@ async function checkCollectorConnectivity(port: number, managementToken?: string
       reachable: false,
       error: error instanceof Error ? error.name : String(error),
       statusUrl: `http://127.0.0.1:${port}/status`,
+      hookSpool: HOOK_SPOOL_COLLECTOR_UNREACHABLE,
       runtimeIdentity: null,
       homeIdentityHash: null,
       retention: null,
@@ -2288,7 +2377,11 @@ async function main() {
       }
     };
     let cachedStarvationReceipt = readStarvationReceipt();
+    // Bead eco-6hoxj.61. Created before the listener so /status can read its
+    // cached snapshot, armed with the other cadences below.
+    let hookSpoolDrain: HookSpoolDrain | undefined;
     const server = createCollectorServer(config, buffer, {
+      hookSpoolStatus: () => hookSpoolDrain?.status() ?? null,
       runtimeIdentity,
       homeIdentityHash: collectorHomeIdentityHash(collectorHome()),
       // Issue 0056 (#104): the daemon provisions (first start) or loads the
@@ -2670,6 +2763,12 @@ async function main() {
       }
     };
     scheduleManagedConfigReconcile(managedConfigReconcilePeriodMs());
+    // Hook-spool drain (bead eco-6hoxj.61). Every 5 s it applies the events a
+    // busy ledger or a restarting collector could not take, through the hook
+    // route's own callable. It never runs when PLIMSOLL_HOOK_SPOOL=off, and it
+    // holds no timer at all in that case.
+    hookSpoolDrain = createHookSpoolDrain(config, buffer, { home: collectorHome() });
+    hookSpoolDrain.start();
     for (const timer of timers) timer.unref();
 
     const stopMaintenanceBeforeFatalExit = async () => {
@@ -2678,6 +2777,7 @@ async function main() {
       enrichmentCadence?.stop();
       for (const timer of timers) clearInterval(timer);
       if (managedConfigReconcileTimer) clearTimeout(managedConfigReconcileTimer);
+      hookSpoolDrain?.stop();
       scheduler?.stopAccepting();
       enrichmentScheduler?.stopAccepting();
       ownership.release();
@@ -2724,6 +2824,7 @@ async function main() {
       enrichmentCadence?.stop();
       for (const timer of timers) clearInterval(timer);
       if (managedConfigReconcileTimer) clearTimeout(managedConfigReconcileTimer);
+      hookSpoolDrain?.stop();
       scheduler?.stopAccepting();
       enrichmentScheduler?.stopAccepting();
       ownership.release();
@@ -2930,6 +3031,12 @@ async function main() {
 
   if (command === "status") {
     const buffer = openBuffer(config);
+    // Bead eco-6hoxj.61 (review r1, F5): the hook spool's kill switch belongs
+    // to the daemon, which reads it once when its drain starts. Ask the daemon.
+    const daemonHookSpool = await readDaemonHookSpool(
+      config.port,
+      readLocalIngestAuth(collectorHome())?.managementRead,
+    );
     const accountAssertions = accountAssertionStatus(buffer.database);
     const device = readDeviceIdentity();
     const bufferPath = collectorBufferPath();
@@ -2970,6 +3077,9 @@ async function main() {
           reconciliation: codexReconciliationStatus(buffer.database),
           stats: projectedStatus?.stats ?? null,
           retention: buffer.retentionStatus(config.retentionDays),
+          // Hook events the collector could not accept live, and what the
+          // drain has recovered since (bead eco-6hoxj.61).
+          hookSpool: hookSpoolOperatorStatus(collectorHome(), daemonHookSpool),
           delivery: buffer.delivery.status(),
           projection: buffer.projection.status(),
           captureHealth: projectedStatus?.health ?? {
@@ -3933,6 +4043,12 @@ async function main() {
               intervalSeconds: config.managedConfig.reconcile.intervalSeconds,
             }),
           },
+          // Hook spool (bead eco-6hoxj.61): counts and stamps only, never a
+          // body and never a path. A spool that is still holding events ten
+          // minutes on says so in `diagnostic`/`note` — it is a capture
+          // diagnostic, so like the other coverage sections it does not change
+          // `ok`, which stays a service-health verdict.
+          hookSpool: hookSpoolDoctorSection(collectorHome(), connectivity.hookSpool),
           ...(grokHookCommand ? { grokHookCommand } : {}),
           ...(codexHookCommand ? { codexHookCommand } : {}),
           // Hosts that gained a native root after enrollment (bead
@@ -4974,11 +5090,17 @@ async function main() {
     const source = collectorSourceFromArg(process.argv[3]);
     const body = await readStdin();
     const auth = loadOrCreateLocalIngestAuth(collectorHome());
-    await forwardHookOverLoopback(body, {
+    const forwarded = await forwardHookOverLoopback(body, {
       source,
       port: config.port,
       auth,
     });
+    // A spooled event is a successful capture, not a silent one. stdout stays
+    // empty because the hosting tool reads it; the receipt goes to stderr and
+    // carries no body and no path.
+    if ("spooled" in forwarded) {
+      console.error(JSON.stringify({ status: "hook_spooled", source }));
+    }
     return;
   }
 

@@ -55,6 +55,86 @@ Codex ──────── OTLP logs/traces/metrics ─┤
 
 The outcome join uses **linkage keys**: both Plimsoll and the GitHub side hash the same normalized inputs (remote URL, branch name), so sessions and pull requests join by construction while the raw strings never leave your machine. Commit shas stay plain — they're already public on GitHub.
 
+A hook event the collector cannot accept right now is **spooled, not dropped**.
+When the local ledger is busy past its retry budget (HTTP 503), when the
+collector gives up reading the request (HTTP 408, `request_deadline_exceeded`),
+or when it is restarting for a managed update (connection refused), the hook
+writes the event to `hook-spool/` under the Plimsoll home — one private file per
+event, carrying no credentials — and the collector drains it back through the
+ordinary hook path every five seconds once the ledger is free, so a recovered
+event lands in the ledger attributed exactly like a live one.
+
+The spool is **at-most-once**: every one of those outcomes proves the collector
+stored nothing, so a spooled event is never a duplicate. The window it does not
+close is the collector dying mid-request — a connection reset or a closed socket
+after the body was sent may mean the row was already written, so that event
+still fails loudly and is lost rather than risk double-counting it in cost and
+usage. Closing that window needs idempotent replay (a client-minted event id)
+and is tracked separately.
+
+What is on disk is **not** the raw body. Before the file is written, the hook
+process applies the collector's own pre-write suppression rule to it: every key
+the collector would strip — raw prompt, output and tool content, credential-like
+names, file and transcript paths — keeps its name and loses its value. So
+`hook-spool/` holds no more than the local ledger is allowed to hold, and the
+collector's own suppression produces exactly the same receipts when the event is
+replayed. The deliberate exceptions are two short lists of keys. The first
+is what the collector reads *before* suppressing it to derive something it
+stores — the working directory it turns into repository linkage, and the hook
+event name it turns into the event type. The second is the protected identity
+names (`username`, `user_id`, `account_id`, `user.id`, `workspace_root`, …):
+the ledger keeps the *hash* of those values rather than dropping them, so an
+emptied one would persist the hash of an empty string instead of the hash of the
+real identity — the spool file holds the raw value until the collector applies
+the event, and holds it for that reason. Blanking either list would quietly make
+a recovered event worse than a live one, so their values stay; every one of them
+is listed by name, with the reason, in
+[docs/privacy-spec.md](docs/privacy-spec.md) under *Where captured data rests on
+disk*, which is generated from the code that enforces it.
+
+A recovered event carries the time the **hook** fired, not the time the drain
+got to it: the hook process stamps the file when it spools, and the drain hands
+that stamp to the collector as the event's timestamp, so a spooled event lands
+in the same cost and usage window it would have live. A body that carries a
+timestamp the collector can actually use keeps it, untouched — usable is the
+collector's own test, so a numeric epoch, an empty string or a future-dated
+time is not a timestamp for this purpose and the hook's stamp is used instead,
+exactly as it would be live.
+
+The counters (`recovered`, `rejected`, `deferred`, pending files and their age)
+are in `plimsoll status`, `plimsoll doctor`, and the collector's `/status` under
+`hookSpool`; `enabled` there is the running collector's kill-switch state, read
+from the collector itself — `plimsoll status` asks the daemon for it in one
+request bounded by `PLIMSOLL_COLLECTOR_DOCTOR_TIMEOUT_MS` (3 s by default), and
+is otherwise a purely local read. It reads `null` with `enabledSource:
+"collector_unreachable"` when the collector cannot be asked, and `null` with
+`enabledSource: "collector_too_old"` when a collector older than 0.7.22 answers
+— reachable and healthy, but with no drain, so the spool holds its events until
+that collector is updated. Doctor says so plainly if anything has been pending
+for more than ten minutes. The counters are written once per drain tick, after
+the tick has applied its files, so `status`/`doctor` can lag the ledger by the
+remainder of a 5 s tick: an event can be queryable in the ledger a moment before
+`recovered` counts it. Contract rejections are
+**not** spooled: a body the collector refuses on its merits (4xx other than 408)
+still fails the hook loudly, and a spooled file the drain cannot apply is
+quarantined under `hook-spool/rejected/` rather than retried forever. Set
+`PLIMSOLL_HOOK_SPOOL=off` in the collector's environment to restore the previous
+drop-and-log behaviour.
+
+Residual behaviour worth knowing:
+
+- A working directory reported **only** inside `args`/`arguments`/`tool_arguments`
+  is not recovered: those keys are raw command content and are blanked before the
+  write, so such an event replays without repository linkage. The event itself is
+  not lost. Report the working directory at the top level (`cwd`) to keep it.
+  `pnpm proof:hook-spool` measures this divergence on every run rather than
+  leaving it to be discovered.
+- A body carrying a live-usage protocol string under a suppressed key is refused
+  live (403) but admitted on replay, because the string is inside the value the
+  spool blanked. No live-usage figure is ever admitted — only the event.
+- Spool counters in `status`/`doctor` can lag the ledger by the remainder of a
+  5 s drain tick, as above.
+
 ## Quickstart
 
 Requirements: macOS, Node >=20 <25.
