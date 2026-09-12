@@ -313,15 +313,27 @@ function writeCollectorConfigTransactionallyUnlocked(
   return validated;
 }
 
-/** Validate and atomically publish a complete collector config under its mutation lock. */
+/** Validate and atomically publish a complete collector config under its mutation lock.
+ *
+ * `collectorConfigSchema` is a plain object schema, so it strips top-level
+ * fields it does not know. `captureRoots` and its neighbours are written by
+ * fleet enrollment tooling outside this repository, whose config shape is not
+ * guaranteed to be a subset of this schema, so a caller that read such a field
+ * off disk can hand it back through `preserveUnknownFields` and have it
+ * republished verbatim instead of silently deleted (bead eco-6hoxj.53). A
+ * validated field always wins over a preserved one of the same name. */
 export function writeCollectorConfigTransactionally(
   config: CollectorConfig,
   configPath = collectorConfigPath(),
+  options: { preserveUnknownFields?: Record<string, unknown> } = {},
 ) {
   const validated = collectorConfigSchema.parse(config);
   assertCollectorPrivacyMode(validated, "config write");
+  const published = options.preserveUnknownFields
+    ? { ...options.preserveUnknownFields, ...validated } as CollectorConfig
+    : validated;
   return withCollectorConfigMutationLock(configPath, () =>
-    writeCollectorConfigTransactionallyUnlocked(validated, configPath),
+    writeCollectorConfigTransactionallyUnlocked(published, configPath),
   );
 }
 

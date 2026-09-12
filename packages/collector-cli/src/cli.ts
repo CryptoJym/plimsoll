@@ -120,14 +120,22 @@ import {
   historyCoverageStatus,
   recordExplicitFullHistoryCoverage,
 } from "./history-coverage";
-import { advanceCaptureBaselineEnrollment, captureBaselineStatus } from "./capture-baseline";
 import {
+  captureBaselineStatus,
+  sealCaptureBaselineGenerations,
+  type CaptureBaselineSealResult,
+} from "./capture-baseline";
+import {
+  captureRootBaselineFiles,
+  captureRootBaselineObservations,
+  captureRootsDeriveFrom,
   configuredCaptureRootDirectory,
   deriveCaptureRootIdentity,
   discoverCaptureRootCandidates,
   discoverCaptureRoots,
   physicalCaptureRootDirectory,
   resolveCaptureRootMachineLabel,
+  resolveDiscoveryHome,
   validateCaptureRoots,
   type CaptureRoot,
 } from "./capture-root-inventory";
@@ -3695,26 +3703,52 @@ async function main() {
     }
 
     // Every path is resolved to the physical directory that will be captured,
-    // the same identity `inspectCaptureRoots` requires of a configured root.
-    const resolvedHome = path.resolve(home);
+    // the same identity `inspectCaptureRoots` requires of a configured root —
+    // and the home is resolved exactly as `discover` resolves it, so a
+    // directory discovery reports as a candidate is never refused
+    // `path_outside_home` because a component of `$HOME` is a symlink.
+    const resolvedHome = resolveDiscoveryHome(home);
     const added: CaptureRoot[] = [];
+    const preexisting: Array<{
+      source: CaptureRoot["source"];
+      directory: string;
+      relative: string;
+      observations: ReturnType<typeof captureRootBaselineObservations>["observations"];
+    }> = [];
     const seen = new Set(configuredRoots.map((root) => configuredCaptureRootDirectory(root)));
     const seenIds = new Set(configuredRoots.map((root) => root.rootId));
+    // The machine label is a fleet label, not a hostname, and it is stored
+    // nowhere — only its digests are. On this fleet no hostname candidate
+    // reproduces it, so `--machine LABEL` is the expected form and the two
+    // failures are reported apart: a label the operator gave that the config
+    // contradicts is `identity_derivation_mismatch` (a tampered or foreign
+    // config); no label at all with nothing to recover one from is
+    // `identity_machine_unresolved` (pass `--machine`).
     const machineArgument = optionValue("--machine");
     const machineCandidates = machineArgument
       ? [machineArgument]
-      : [process.env.PLIMSOLL_MACHINE ?? "", os.hostname(), os.hostname().split(".")[0] ?? ""];
-    const machine = resolveCaptureRootMachineLabel(configuredRoots, machineCandidates);
-    if (machine === null) {
-      // Either the config carries no root to check a label against, or no
-      // candidate reproduces the ids it already holds. Both are the r3
-      // helper's `identity_derivation_mismatch` guard: never append a root
-      // under a derivation this config does not already use.
-      refuse(configuredRoots.length ? "identity_derivation_mismatch" : "identity_machine_unresolved", {
-        configuredRoots: configuredRoots.length,
-        machineCandidates: machineArgument ? machineCandidates : machineCandidates.filter(Boolean).length,
-      });
-      return;
+      : [os.hostname(), os.hostname().split(".")[0] ?? ""].filter((value) => value.length > 0);
+    let machine: string;
+    if (machineArgument) {
+      if (configuredRoots.length && !captureRootsDeriveFrom(configuredRoots, machineArgument)) {
+        refuse("identity_derivation_mismatch", {
+          configuredRoots: configuredRoots.length,
+          machine: machineArgument,
+        });
+        return;
+      }
+      machine = machineArgument;
+    } else {
+      const recovered = resolveCaptureRootMachineLabel(configuredRoots, machineCandidates);
+      if (recovered === null) {
+        refuse("identity_machine_unresolved", {
+          configuredRoots: configuredRoots.length,
+          machineCandidates,
+          hint: "pass --machine <fleet label>",
+        });
+        return;
+      }
+      machine = recovered;
     }
 
     const installationEpochId = readInstallationEpochId(configuredRoots);
@@ -3746,9 +3780,33 @@ async function main() {
         refuse("duplicate_root_id", { directory: relative, rootId: identity.rootId });
         return;
       }
+      // The fence this command publishes is exactly the files this directory
+      // already holds, so the walk must be exhaustive before anything is
+      // written. An entry the tailer's own discovery would count as an error
+      // (a symlinked or non-regular `.jsonl`) makes it unprovable: refuse
+      // rather than register a root whose history would be replayed.
+      const scan = captureRootBaselineFiles(source, directory);
+      if (scan.errors > 0) {
+        refuse("capture_root_scan_ambiguous", {
+          directory: relative,
+          files: scan.files.length,
+          errors: scan.errors,
+        });
+        return;
+      }
+      const observed = captureRootBaselineObservations(scan.files);
+      if (observed.errors > 0) {
+        refuse("capture_root_scan_ambiguous", {
+          directory: relative,
+          files: scan.files.length,
+          errors: observed.errors,
+        });
+        return;
+      }
       seen.add(directory);
       seenIds.add(identity.rootId);
       added.push({ ...identity, installationEpochId, source, directory });
+      preexisting.push({ source, directory, relative, observations: observed.observations });
     }
 
     const beforeBytes = fs.readFileSync(configPath);
@@ -3774,7 +3832,41 @@ async function main() {
       refuse("append_only_violation");
       return;
     }
-    const afterBytes = Buffer.from(`${JSON.stringify(validated, null, 2)}\n`);
+    // `collectorConfigSchema` is a plain `z.object`, so it strips top-level
+    // keys it does not know — and `captureRoots` is written by fleet
+    // enrollment tooling outside this repository, whose config shape is not
+    // guaranteed to be a subset of this schema. The write is therefore
+    // composed on the raw parsed object, with the validated values layered
+    // over it, so an unknown field survives untouched; the raw key sets are
+    // then compared and a field this writer would still drop refuses before
+    // any byte is published.
+    let rawConfigObject: Record<string, unknown>;
+    try {
+      const parsedRaw: unknown = JSON.parse(beforeBytes.toString("utf8"));
+      if (!parsedRaw || typeof parsedRaw !== "object" || Array.isArray(parsedRaw)) {
+        throw new Error("collector_config_not_an_object");
+      }
+      rawConfigObject = parsedRaw as Record<string, unknown>;
+    } catch (error) {
+      refuse("config_not_valid", {
+        config: { status: "unreadable", path: configPath },
+        detail: error instanceof Error ? error.message.slice(0, 200) : "invalid",
+      });
+      return;
+    }
+    const preserveUnknownFields = Object.fromEntries(
+      Object.entries(rawConfigObject).filter(([key]) => !(key in validated)),
+    );
+    const carried = { ...preserveUnknownFields, ...validated } as CollectorConfig;
+    const afterBytes = Buffer.from(`${JSON.stringify(carried, null, 2)}\n`);
+    const beforeKeys = Object.keys(rawConfigObject).sort();
+    const afterKeys = new Set(Object.keys(JSON.parse(afterBytes.toString("utf8")) as Record<string, unknown>));
+    const droppedKeys = beforeKeys.filter((key) => !afterKeys.has(key));
+    if (droppedKeys.length) {
+      refuse("append_only_violation", { droppedKeys });
+      return;
+    }
+    const carriedUnknownKeys = Object.keys(preserveUnknownFields);
     const digest = (value: Buffer) => createHash("sha256").update(value).digest("hex");
     const plan = {
       configPath,
@@ -3782,20 +3874,25 @@ async function main() {
       afterSha256: digest(afterBytes),
       // A config written by an older helper can carry byte-level formatting
       // this writer would normalize; the receipt discloses it rather than
-      // blocking a repair, because append-only is proved above on the values.
+      // blocking a repair, because append-only is proved above on the values
+      // and on the raw key set.
       configCanonicalBefore: beforeBytes.equals(
-        Buffer.from(`${JSON.stringify(collectorConfigSchema.parse(config), null, 2)}\n`),
+        Buffer.from(`${JSON.stringify({ ...preserveUnknownFields, ...collectorConfigSchema.parse(config) }, null, 2)}\n`),
       ),
+      /** Top-level fields this schema does not know, written through as-is. */
+      carriedUnknownKeys,
       machine,
       installationEpochId,
       rootCountBefore: configuredRoots.length,
       rootCountAfter: (validated.captureRoots ?? []).length,
-      addedRoots: added.map((root) => ({
+      addedRoots: added.map((root, index) => ({
         rootId: root.rootId,
         profileId: root.profileId,
         installationEpochId: root.installationEpochId,
         source: root.source,
         directory: path.relative(resolvedHome, root.directory),
+        /** Files already present, fenced as pre-existing generations. */
+        preexistingFiles: preexisting[index]!.observations.length,
       })),
     };
     if (flag("--dry-run")) {
@@ -3841,35 +3938,78 @@ async function main() {
       restart = { attempted: true, skipped: false, unload: launchAgentUnloadReceipt(unload) };
     }
 
+    // From here the collector is stopped, so every remaining step runs under
+    // one failure path: whatever throws, the agent is loaded again, the
+    // receipt says which step failed and what state the config is in, and the
+    // command exits non-zero. Leaving the collector down was the r1 failure.
     const backupPath = `${configPath}.plimsoll-backup-${appendedAt.replace(/[:.]/g, "-")}`;
-    const backupDescriptor = fs.openSync(backupPath, "wx", 0o600);
+    let failure: { step: string; error: string } | null = null;
+    let configApplied = false;
+    let writtenSha256: string | null = null;
+    let baseline: Record<string, unknown> | null = null;
+    let step = "backup";
     try {
-      fs.writeFileSync(backupDescriptor, beforeBytes);
-      fs.fsyncSync(backupDescriptor);
-    } finally {
-      fs.closeSync(backupDescriptor);
-    }
-    writeCollectorConfigTransactionally(validated, configPath);
-    const writtenSha256 = digest(fs.readFileSync(configPath));
+      const backupDescriptor = fs.openSync(backupPath, "wx", 0o600);
+      try {
+        fs.writeFileSync(backupDescriptor, beforeBytes);
+        fs.fsyncSync(backupDescriptor);
+      } finally {
+        fs.closeSync(backupDescriptor);
+      }
 
-    // Fence the new roots' provider at the append time so the transcripts and
-    // rollouts already sitting in the new directory are excluded instead of
-    // replayed as today's work. The provider this add did not touch keeps its
-    // own baseline.
-    const buffer = openBuffer(config);
-    let baseline: Record<string, unknown>;
-    try {
-      const baselineSources = [...new Set(added.map((root) => root.source))];
-      const statusFor = () => Object.fromEntries(
-        captureBaselineStatus(buffer.database).sources
-          .filter((row) => baselineSources.includes(row.source))
-          .map((row) => [row.source, { status: row.status, startedAt: row.latestRun?.startedAt ?? null }]),
-      );
-      const before = statusFor();
-      advanceCaptureBaselineEnrollment(buffer.database, appendedAt, baselineSources);
-      baseline = { seededAt: appendedAt, sources: baselineSources, before, after: statusFor() };
-    } finally {
-      buffer.close();
+      // Fence exactly the new roots, before the config names them: the files
+      // already sitting in each new directory are recorded as pre-existing
+      // generations in the provider's live baseline run, so they are excluded
+      // instead of replayed. The provider's `started_at` is deliberately NOT
+      // moved — that cutoff is keyed by source alone, so advancing it would
+      // re-fence every root the provider already captures and silently stop
+      // their current sessions. Sealing first also means a failure here
+      // leaves the inventory exactly as it was.
+      step = "baseline_seed";
+      const buffer = openBuffer(config);
+      try {
+        const baselineSources = [...new Set(added.map((root) => root.source))];
+        const statusFor = () => Object.fromEntries(
+          captureBaselineStatus(buffer.database).sources
+            .filter((row) => baselineSources.includes(row.source))
+            .map((row) => [row.source, { status: row.status, startedAt: row.latestRun?.startedAt ?? null }]),
+        );
+        const before = statusFor();
+        const seals: CaptureBaselineSealResult[] = baselineSources.map((baselineSource) =>
+          sealCaptureBaselineGenerations(
+            buffer.database,
+            baselineSource,
+            preexisting
+              .filter((entry) => entry.source === baselineSource)
+              .flatMap((entry) => entry.observations),
+            appendedAt,
+          ));
+        const generationsSealed = seals.reduce((total, seal) => total + seal.generationsSealed, 0);
+        baseline = {
+          // Only ever a time a generation row was actually written. A source
+          // whose baseline is not yet complete reports the true state: the
+          // tailer establishes its fence at first start, which already
+          // excludes everything present by then.
+          seededAt: generationsSealed > 0 ? appendedAt : null,
+          sources: baselineSources,
+          providerCutoffMoved: false,
+          generationsSealed,
+          filesFenced: preexisting.reduce((total, entry) => total + entry.observations.length, 0),
+          seals,
+          before,
+          after: statusFor(),
+        };
+      } finally {
+        buffer.close();
+      }
+
+      step = "config_write";
+      writeCollectorConfigTransactionally(carried, configPath, { preserveUnknownFields });
+      configApplied = true;
+      step = "config_readback";
+      writtenSha256 = digest(fs.readFileSync(configPath));
+    } catch (error) {
+      failure = { step, error: error instanceof Error ? error.message.slice(0, 200) : "failed" };
     }
 
     if (restart.attempted) {
@@ -3880,32 +4020,47 @@ async function main() {
       );
       const pidRead = readCollectorPidFile(collectorLogPath("collector.pid"), LAUNCH_AGENT_LABEL);
       const pidRecord = pidRead.kind === "current" ? pidRead.record : null;
-      restart = {
-        ...restart,
-        load,
-        daemon: {
-          reachable: connectivity.reachable,
-          processLive: pidRecord ? processIdentityIsLive(pidRecord) : false,
-          runtimeIdentityMatches: pidRecord
-            ? runtimeIdentityMatches(pidRecord, connectivity.runtimeIdentity)
-            : false,
-          homeIdentityHash: connectivity.homeIdentityHash,
-          homeMatches: connectivity.homeIdentityHash === null
-            ? null
-            : connectivity.homeIdentityHash === collectorHomeIdentityHash(collectorHome()),
-        },
+      const daemon = {
+        reachable: connectivity.reachable,
+        processLive: pidRecord ? processIdentityIsLive(pidRecord) : false,
+        runtimeIdentityMatches: pidRecord
+          ? runtimeIdentityMatches(pidRecord, connectivity.runtimeIdentity)
+          : false,
+        homeIdentityHash: connectivity.homeIdentityHash,
+        homeMatches: connectivity.homeIdentityHash === null
+          ? null
+          : connectivity.homeIdentityHash === collectorHomeIdentityHash(collectorHome()),
       };
+      // A collector that did not come back is a failure of this command, not
+      // a note in a receipt an operator may never read.
+      const failedStep = !load.loaded
+        ? "load"
+        : !(daemon.reachable && daemon.processLive && daemon.runtimeIdentityMatches)
+          ? "daemon_verification"
+          : null;
+      restart = { ...restart, load, daemon, verified: failedStep === null, failedStep };
     }
 
+    const restartFailed = restart.attempted === true && restart.verified !== true;
     const receipt = {
-      status: "capture_roots_added",
-      applied: true,
+      status: failure || restartFailed ? "capture_roots_add_failed" : "capture_roots_added",
+      applied: configApplied,
       version: PLIMSOLL_VERSION,
       appendedAt,
       durationMs: Date.now() - startedAt,
       ...plan,
       writtenSha256,
       backupPath,
+      failure,
+      // The config is never left half-published: either the write never
+      // happened and the file is byte-identical to the backup, or it
+      // completed and the collector was restarted on it (or the restart was
+      // skipped with the reason below).
+      recovery: failure
+        ? configApplied
+          ? "config_applied_collector_restarted"
+          : "config_unchanged_restored_state_matches_backup"
+        : null,
       baseline,
       restart,
     };
@@ -3917,7 +4072,7 @@ async function main() {
     );
     fs.writeFileSync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
     console.log(JSON.stringify({ ...receipt, receiptPath }, null, 2));
-    if (writtenSha256 !== plan.afterSha256) process.exitCode = 1;
+    process.exitCode = failure || restartFailed || writtenSha256 !== plan.afterSha256 ? 1 : 0;
     return;
   }
 

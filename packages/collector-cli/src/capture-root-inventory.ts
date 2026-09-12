@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { z } from "zod";
 import { accountAssertionContains, accountAssertionV1Schema, type AccountAssertionV1 } from "./account-assertion";
+import type { CaptureBaselineFileObservation } from "./capture-baseline";
 const id=z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/);
 const legacyAccountSchema=z.object({
   actorHash: z.string().regex(/^sha256:[a-f0-9]{64}$/),
@@ -343,8 +344,13 @@ export function resolveCaptureRootMachineLabel(
   return candidates.find((candidate) => candidate.length > 0 && captureRootsDeriveFrom(roots, candidate)) ?? null;
 }
 
-/** The home a discovery runs against, resolved the way a physical root is. */
-function resolveDiscoveryHome(home: string): string {
+/**
+ * The home a discovery runs against, resolved the way a physical root is.
+ * `add` resolves the home through this too: a directory `discover` reports as
+ * a candidate must never be refused `path_outside_home` merely because a
+ * component of `$HOME` is a symlink.
+ */
+export function resolveDiscoveryHome(home: string): string {
   try { return fs.realpathSync(path.resolve(home)); }
   catch { return path.resolve(home); }
 }
@@ -438,4 +444,61 @@ export function discoverCaptureRoots(
     });
   }
   return entries;
+}
+
+/** Every file the `source` tailer would discover under a capture root.
+ *
+ * Mirrors `IncrementalJsonlDiscovery`'s predicates so the set fenced at
+ * registration is the set that would otherwise be replayed: a recursive walk
+ * matching `*.jsonl` for Claude transcripts and `rollout-*.jsonl` for Codex
+ * rollouts, never following a symlinked candidate. Anything the walk cannot
+ * resolve is counted, never guessed: the caller refuses rather than publish a
+ * fence it cannot prove exhaustive. */
+export function captureRootBaselineFiles(
+  source: CaptureRoot["source"],
+  directory: string,
+): { files: string[]; errors: number } {
+  const matches = source === "codex"
+    ? (name: string) => name.startsWith("rollout-") && name.endsWith(".jsonl")
+    : (name: string) => name.endsWith(".jsonl");
+  const files: string[] = [];
+  let errors = 0;
+  const walk = (current: string) => {
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(current, { withFileTypes: true }); }
+    catch { errors += 1; return; }
+    for (const entry of entries) {
+      const candidate = path.join(current, entry.name);
+      if (entry.isDirectory()) { walk(candidate); continue; }
+      if (!matches(entry.name)) continue;
+      // A symlinked or non-regular candidate is the discovery's own error
+      // class: one physical generation must never be fenced under an alias.
+      if (entry.isSymbolicLink() || !entry.isFile()) { errors += 1; continue; }
+      files.push(candidate);
+    }
+  };
+  walk(directory);
+  return { files: files.sort(), errors };
+}
+
+/** One stat-only observation per file, as the tailers build theirs. */
+export function captureRootBaselineObservations(
+  files: readonly string[],
+): { observations: CaptureBaselineFileObservation[]; errors: number } {
+  const observations: CaptureBaselineFileObservation[] = [];
+  let errors = 0;
+  for (const file of files) {
+    try {
+      const identity = fs.lstatSync(file, { bigint: true });
+      if (identity.isSymbolicLink() || !identity.isFile()) { errors += 1; continue; }
+      observations.push({
+        path: file,
+        device: identity.dev,
+        inode: identity.ino,
+        size: identity.size,
+        birthtimeNs: identity.birthtimeNs,
+      });
+    } catch { errors += 1; }
+  }
+  return { observations, errors };
 }

@@ -24,9 +24,12 @@ import Database from "better-sqlite3";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import {
   beginAutomaticCaptureBaseline,
+  classifyCaptureBaselineFile,
   completeAutomaticCaptureBaseline,
 } from "../packages/collector-cli/src/capture-baseline";
 import { deriveCaptureRootIdentity } from "../packages/collector-cli/src/capture-root-inventory";
+import { installLaunchAgent, uninstallLaunchAgent } from "../packages/collector-cli/src/launch-agent";
+import { LifecycleMutationAuthority } from "../packages/collector-cli/src/lifecycle-authority";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { useFixtureRoot } from "./lib/fixture-root";
 
@@ -117,6 +120,11 @@ async function main() {
     }
     fs.mkdirSync(plimsollHome, { recursive: true, mode: 0o700 });
     fs.writeFileSync(path.join(claudeProjects, "history.jsonl"), "{}\n", { mode: 0o600 });
+    // A transcript in a root that is ALREADY registered, born long after the
+    // enrollment baseline at BASELINE_BEFORE. Registering another root must
+    // not flip this file from capturable to excluded (review r1, finding 1).
+    const seatTranscript = path.join(seatProjects, "live-session.jsonl");
+    fs.writeFileSync(seatTranscript, "{}\n", { mode: 0o600 });
     fs.writeFileSync(notADirectory, "not a directory\n", { mode: 0o600 });
     // A dangling seat link must never be reported as a candidate.
     fs.symlinkSync(path.join(home, ".claude-seats", "absent"), path.join(home, ".claude-seats", "dangling"));
@@ -176,12 +184,43 @@ async function main() {
       baselineState(),
     );
 
+    // The tailer's own classification branch, reproduced with the repo's own
+    // export, on a stat-only observation — exactly how a live scan decides.
+    const classify = (source: "codex" | "claude_code", file: string, observedAt: string) => {
+      const database = new Database(ledgerPath, { fileMustExist: true });
+      try {
+        const identity = fs.lstatSync(file, { bigint: true });
+        const decision = classifyCaptureBaselineFile(database, source, {
+          path: file,
+          device: identity.dev,
+          inode: identity.ino,
+          size: identity.size,
+          birthtimeNs: identity.birthtimeNs,
+        }, { mode: "automatic", observedAt });
+        return `${decision.decision}/${decision.reason}`;
+      } finally {
+        database.close();
+      }
+    };
+
     const stubBin = path.join(sandbox, "stub-bin");
     fs.mkdirSync(stubBin, { recursive: true });
     fs.symlinkSync(process.execPath, path.join(stubBin, "node"));
-    // launchctl must never be reachable from this proof; the fixture has no
-    // LaunchAgent, so the command must skip the restart on its own.
-    fs.writeFileSync(path.join(stubBin, "launchctl"), "#!/bin/sh\nexit 113\n", { mode: 0o700 });
+    // The only launchctl this proof can reach is a stub that refuses every
+    // subcommand. The main fixture has no LaunchAgent at all, so the command
+    // skips the restart without ever invoking it; the restart-failure arm at
+    // the end uses its own fixture home, where `print` answers exactly as
+    // launchd answers for an unknown label and `bootstrap` fails.
+    fs.writeFileSync(
+      path.join(stubBin, "launchctl"),
+      '#!/bin/sh\n' +
+      'if [ "$1" = "print" ]; then\n' +
+      '  echo "Could not find service \\"com.plimsoll.collector\\" in domain for user gui: $(/usr/bin/id -u)" >&2\n' +
+      '  exit 113\n' +
+      'fi\n' +
+      'exit 113\n',
+      { mode: 0o700 },
+    );
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       ...fixture.env,
@@ -284,6 +323,20 @@ async function main() {
       baselineState(),
     );
 
+    // ---- classification before the add ----------------------------------
+    // The reviewer's measured table, reproduced here so a regression to a
+    // provider-wide fence fails this proof rather than a later review.
+    const classifiedBefore = {
+      registeredRoot: classify("claude_code", seatTranscript, "2026-09-12T09:00:00.000Z"),
+      newRootExisting: classify("claude_code", path.join(claudeProjects, "history.jsonl"), "2026-09-12T09:00:00.000Z"),
+    };
+    check(
+      "classification_before_add_captures_both_transcripts",
+      classifiedBefore.registeredRoot === "capture/generation_not_baselined" &&
+        classifiedBefore.newRootExisting === "capture/generation_not_baselined",
+      classifiedBefore,
+    );
+
     // ---- apply ----------------------------------------------------------
     const applied = await run([
       "capture-roots", "add", "--source", "claude_code", "--directory", claudeProjects,
@@ -322,17 +375,53 @@ async function main() {
     );
     const seeded = baselineState();
     check(
-      "add_seeds_only_the_new_root_provider_baseline_at_the_append_time",
-      seeded.claude_code.startedAt === receipt.appendedAt && seeded.claude_code.status === "in_progress" &&
+      "add_leaves_every_provider_baseline_cutoff_untouched",
+      seeded.claude_code.startedAt === BASELINE_BEFORE && seeded.claude_code.status === "complete" &&
         seeded.codex.startedAt === BASELINE_BEFORE && seeded.codex.status === "complete",
       seeded,
     );
     check(
-      "add_receipt_records_the_baseline_it_moved",
+      "add_receipt_records_the_generations_it_fenced_not_a_moved_cutoff",
       receipt.baseline.sources.length === 1 && receipt.baseline.sources[0] === "claude_code" &&
+        receipt.baseline.providerCutoffMoved === false &&
+        receipt.baseline.seededAt === receipt.appendedAt &&
+        receipt.baseline.generationsSealed === 1 && receipt.baseline.filesFenced === 1 &&
         receipt.baseline.before.claude_code.startedAt === BASELINE_BEFORE &&
-        receipt.baseline.after.claude_code.startedAt === receipt.appendedAt,
+        receipt.baseline.after.claude_code.startedAt === BASELINE_BEFORE &&
+        receipt.baseline.after.claude_code.status === "complete" &&
+        receipt.addedRoots[0].preexistingFiles === 1,
       receipt.baseline,
+    );
+
+    // ---- classification after the add (review r1, finding 1) -------------
+    const newRootAfterAdd = path.join(claudeProjects, "session-after-add.jsonl");
+    fs.writeFileSync(newRootAfterAdd, "{}\n", { mode: 0o600 });
+    const classifiedAfter = {
+      registeredRoot: classify("claude_code", seatTranscript, "2026-09-12T09:30:00.000Z"),
+      newRootExisting: classify("claude_code", path.join(claudeProjects, "history.jsonl"), "2026-09-12T09:30:00.000Z"),
+      newRootAfterAdd: classify("claude_code", newRootAfterAdd, "2026-09-12T09:30:00.000Z"),
+    };
+    check(
+      "add_does_not_re_fence_a_file_in_an_already_registered_root",
+      classifiedBefore.registeredRoot === "capture/generation_not_baselined" &&
+        classifiedAfter.registeredRoot === "capture/generation_not_baselined",
+      classifiedAfter,
+    );
+    check(
+      "add_fences_the_files_already_present_in_the_new_root",
+      classifiedBefore.newRootExisting === "capture/generation_not_baselined" &&
+        classifiedAfter.newRootExisting === "exclude/preexisting_generation",
+      classifiedAfter,
+    );
+    check(
+      "add_still_captures_a_file_created_in_the_new_root_afterwards",
+      classifiedAfter.newRootAfterAdd === "capture/generation_not_baselined",
+      classifiedAfter,
+    );
+    check(
+      "baseline_state_stays_valid_after_the_fence",
+      baselineState().claude_code.status === "complete" && baselineState().codex.status === "complete",
+      baselineState(),
     );
     check(
       "add_skips_the_restart_with_a_reason_when_no_launch_agent_is_installed",
@@ -376,15 +465,120 @@ async function main() {
       { backups: backups(plimsollHome), receipts: fs.readdirSync(path.join(plimsollHome, "receipts")) },
     );
 
+    // ---- $HOME with a symlinked component (review r1, finding 2) --------
+    // `discover` resolves the home through realpath; `add` must resolve it the
+    // same way, or it refuses `path_outside_home` for the exact directory
+    // discovery just listed. The sandbox is realpathed up front, so the
+    // condition is created deliberately here rather than stepped around.
+    const linkedHome = path.join(sandbox, "home-link");
+    fs.symlinkSync(home, linkedHome);
+    const linkedEnv = { ...env, HOME: linkedHome, USERPROFILE: linkedHome,
+      CLAUDE_CONFIG_DIR: path.join(linkedHome, ".claude"),
+      CODEX_HOME: path.join(linkedHome, ".codex"),
+      GROK_HOME: path.join(linkedHome, ".grok") };
+    const linkedDirectory = path.join(linkedHome, ".codex-profiles", "profile-a", "sessions");
+    const linkedDiscovery = parse(await command(["capture-roots", "discover", "--json"], linkedEnv, neutralCwd));
+    check(
+      "discover_lists_the_candidate_under_a_symlinked_home",
+      linkedDiscovery.roots.some((entry: any) =>
+        entry.directory === path.relative(home, codexProfileSessions) && entry.state === "candidate"),
+      linkedDiscovery.roots,
+    );
+    const linkedAdd = await command([
+      "capture-roots", "add", "--source", "codex", "--directory", linkedDirectory,
+      "--machine", MACHINE, "--dry-run", "--json",
+    ], linkedEnv, neutralCwd);
+    check(
+      "add_accepts_a_candidate_under_a_symlinked_home",
+      linkedAdd.code === 0 && parse(linkedAdd).status === "capture_roots_add_plan" &&
+        parse(linkedAdd).addedRoots[0].directory === path.relative(home, codexProfileSessions) &&
+        sha256(configPath) === appliedSha,
+      linkedAdd,
+    );
+
+    // ---- an unknown top-level config field (review r1, finding 3) -------
+    // `collectorConfigSchema` strips keys it does not know, and `captureRoots`
+    // is written by fleet enrollment tooling outside this repository. The key
+    // must survive the write untouched.
+    const withUnknown = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    withUnknown.futureEnrollmentField = { minted: "2026-09-12T00:00:00.000Z", by: "fleet-enrollment" };
+    fs.writeFileSync(configPath, `${JSON.stringify(withUnknown, null, 2)}\n`, { mode: 0o600 });
+    const carriedAdd = await run([
+      "capture-roots", "add", "--source", "codex", "--directory", codexProfileSessions,
+      "--machine", MACHINE, "--json",
+    ]);
+    const afterUnknown = JSON.parse(fs.readFileSync(configPath, "utf8"));
+    check(
+      "add_carries_an_unknown_top_level_config_field_through_the_write",
+      carriedAdd.code === 0 &&
+        JSON.stringify(afterUnknown.futureEnrollmentField) === JSON.stringify(withUnknown.futureEnrollmentField) &&
+        parse(carriedAdd).carriedUnknownKeys.includes("futureEnrollmentField") &&
+        Object.keys(withUnknown).every((key) => key in afterUnknown),
+      {
+        before: Object.keys(withUnknown).sort(),
+        after: Object.keys(afterUnknown).sort(),
+        carried: parse(carriedAdd).carriedUnknownKeys,
+      },
+    );
+
+    // ---- a failure between the unload and the load (review r1, finding 4)
+    // The ledger the fence is written to is made unopenable, so the command
+    // throws after the collector would have been stopped and after the backup
+    // exists, but before the config is written. Nothing may be left half
+    // applied and nothing may be left stopped.
+    const seatB = path.join(home, ".claude-seats", "seat-b", "projects");
+    fs.mkdirSync(seatB, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(path.join(seatB, "seat-b.jsonl"), "{}\n", { mode: 0o600 });
+    const beforeFailureSha = sha256(configPath);
+    const backupsBeforeFailure = backups(plimsollHome).length;
+    fs.chmodSync(ledgerPath, 0o000);
+    const injected = await run([
+      "capture-roots", "add", "--source", "claude_code", "--directory", seatB,
+      "--machine", MACHINE, "--json",
+    ]);
+    fs.chmodSync(ledgerPath, 0o600);
+    const injectedReceipt = parse(injected);
+    const failureBackup = backups(plimsollHome).sort().at(-1)!;
+    check(
+      "a_failure_after_the_unload_exits_1_and_reports_the_failed_step",
+      injected.code === 1 && injectedReceipt.status === "capture_roots_add_failed" &&
+        injectedReceipt.applied === false && injectedReceipt.failure?.step === "baseline_seed" &&
+        injectedReceipt.recovery === "config_unchanged_restored_state_matches_backup",
+      { code: injected.code, failure: injectedReceipt.failure, recovery: injectedReceipt.recovery },
+    );
+    check(
+      "a_failure_after_the_unload_leaves_the_config_byte_identical_to_the_backup",
+      sha256(configPath) === beforeFailureSha &&
+        backups(plimsollHome).length === backupsBeforeFailure + 1 &&
+        createHash("sha256").update(fs.readFileSync(path.join(plimsollHome, failureBackup)))
+          .digest("hex") === beforeFailureSha,
+      { config: sha256(configPath), backup: failureBackup },
+    );
+    check(
+      "a_failure_after_the_unload_still_takes_the_restart_path",
+      injectedReceipt.restart.attempted === false && injectedReceipt.restart.skipped === true &&
+        injectedReceipt.restart.reason === "launch_agent_not_installed" &&
+        fs.existsSync(path.join(plimsollHome, "receipts", path.basename(injectedReceipt.receiptPath))),
+      injectedReceipt.restart,
+    );
+    check(
+      "a_failure_after_the_unload_wrote_no_generation_rows",
+      baselineState().claude_code.status === "complete" &&
+        baselineState().claude_code.startedAt === BASELINE_BEFORE,
+      baselineState(),
+    );
+
     // A config whose roots do not reproduce their own ids under any candidate
     // label is the r3 helper's identity guard: refuse rather than append under
     // a derivation this host does not use.
+    const codexSessionsSpare = path.join(home, ".codex-profiles", "profile-b", "sessions");
+    fs.mkdirSync(codexSessionsSpare, { recursive: true, mode: 0o700 });
     const tampered = JSON.parse(fs.readFileSync(configPath, "utf8"));
     tampered.captureRoots[0].rootId = "root-000000000000000000000000";
     fs.writeFileSync(configPath, `${JSON.stringify(tampered, null, 2)}\n`, { mode: 0o600 });
     const tamperedSha = sha256(configPath);
     const mismatch = await run([
-      "capture-roots", "add", "--source", "codex", "--directory", codexProfileSessions,
+      "capture-roots", "add", "--source", "codex", "--directory", codexSessionsSpare,
       "--machine", MACHINE, "--json",
     ]);
     check(
@@ -394,13 +588,25 @@ async function main() {
       mismatch,
     );
     const unresolved = await run([
-      "capture-roots", "add", "--source", "codex", "--directory", codexProfileSessions, "--json",
+      "capture-roots", "add", "--source", "codex", "--directory", codexSessionsSpare, "--json",
     ]);
+    // Finding 6: no `--machine` and nothing to recover a label from is a
+    // different operator problem from a label the config contradicts, and the
+    // candidates actually tried are named.
     check(
-      "add_refuses_when_no_candidate_label_reproduces_the_configured_ids",
-      unresolved.code === 1 && parse(unresolved).reason === "identity_derivation_mismatch" &&
+      "add_refuses_identity_machine_unresolved_when_no_machine_was_given",
+      unresolved.code === 1 && parse(unresolved).reason === "identity_machine_unresolved" &&
+        Array.isArray(parse(unresolved).machineCandidates) &&
+        parse(unresolved).machineCandidates.length > 0 &&
+        !parse(unresolved).machineCandidates.includes("") &&
         sha256(configPath) === tamperedSha,
       unresolved,
+    );
+    check(
+      "plimsoll_machine_is_not_an_undocumented_candidate",
+      !fs.readFileSync(path.join(root, "packages", "collector-cli", "src", "cli.ts"), "utf8")
+        .includes("PLIMSOLL_MACHINE"),
+      "PLIMSOLL_MACHINE",
     );
 
     check(
@@ -408,6 +614,100 @@ async function main() {
       !fs.existsSync(path.join(home, "Library", "LaunchAgents")),
       path.join(home, "Library", "LaunchAgents"),
     );
+
+    // ---- a restart that does not come back (review r1, finding 5) -------
+    // An entirely separate fixture home so the check above stays literally
+    // true of the home every other arm used. The manifest is written by this
+    // repository's own installer (no launchctl), and the only launchctl on
+    // PATH is the stub that fails every subcommand, so `load` fails
+    // deterministically and nothing on this host is ever cycled.
+    const restartSandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-capture-roots-restart-")));
+    const restartFixture = useFixtureRoot(restartSandbox, { home: path.join(restartSandbox, "home") });
+    try {
+      const restartHome = restartFixture.home;
+      const restartPlimsollHome = path.join(restartSandbox, "plimsoll-home");
+      const restartConfigPath = path.join(restartPlimsollHome, "collector.config.json");
+      const restartLedgerPath = path.join(restartPlimsollHome, "work-ledger.sqlite");
+      const restartCodex = path.join(restartHome, ".codex", "sessions");
+      const restartClaude = path.join(restartHome, ".claude", "projects");
+      for (const directory of [restartCodex, restartClaude, restartPlimsollHome]) {
+        fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+      }
+      const restartBuffer = new LocalEventBuffer(restartLedgerPath, { workspaceId: WORKSPACE, deviceId: DEVICE });
+      let restartEpoch: string;
+      try {
+        restartEpoch = restartBuffer.workspaceBinding()!.currentInstallationEpochId!;
+        for (const source of ["codex", "claude_code"] as const) {
+          const begun = beginAutomaticCaptureBaseline(restartBuffer.database, source, {
+            startedAt: BASELINE_BEFORE, filesDiscovered: 0,
+          });
+          completeAutomaticCaptureBaseline(restartBuffer.database, source, {
+            runId: begun.latestRun!.runId, completedAt: BASELINE_BEFORE,
+          });
+        }
+      } finally {
+        restartBuffer.close();
+      }
+      const restartEnrolled = collectorConfigSchema.parse({
+        port: 48998, tenantId: WORKSPACE, deviceId: DEVICE, installKey: "fixture-install-key",
+        managed: true, captureRoots: [fixtureRoot("codex", restartCodex, restartEpoch)],
+      });
+      fs.writeFileSync(restartConfigPath, `${JSON.stringify(restartEnrolled, null, 2)}\n`, { mode: 0o600 });
+
+      const syntheticPnpm = path.join(restartSandbox, "pnpm");
+      fs.writeFileSync(syntheticPnpm, "#!/bin/sh\nexit 0\n", { mode: 0o700 });
+      const installed = installLaunchAgent({
+        homeDir: restartHome,
+        repoRoot: path.join(restartSandbox, "repo"),
+        pnpmPath: syntheticPnpm,
+        mutationAuthority: new LifecycleMutationAuthority(path.join(restartSandbox, "install-authority")),
+      });
+      check(
+        "restart_fixture_has_an_owned_manifest_written_without_launchctl",
+        installed.receipt.status === "installed" && fs.existsSync(installed.plistPath),
+        installed.receipt.status,
+      );
+
+      const restartResult = await command([
+        "capture-roots", "add", "--source", "claude_code", "--directory", restartClaude,
+        "--machine", MACHINE, "--json",
+      ], {
+        ...env,
+        ...restartFixture.env,
+        HOME: restartHome,
+        USERPROFILE: restartHome,
+        PLIMSOLL_HOME: restartPlimsollHome,
+        CLAUDE_CONFIG_DIR: path.join(restartHome, ".claude"),
+        CODEX_HOME: path.join(restartHome, ".codex"),
+        GROK_HOME: path.join(restartHome, ".grok"),
+      }, neutralCwd);
+      const restartReceipt = parse(restartResult);
+      check(
+        "a_failed_restart_exits_1_and_names_the_step_that_failed",
+        restartResult.code === 1 && restartReceipt.status === "capture_roots_add_failed" &&
+          restartReceipt.restart.attempted === true && restartReceipt.restart.verified === false &&
+          ["load", "daemon_verification"].includes(restartReceipt.restart.failedStep),
+        { code: restartResult.code, status: restartReceipt.status, reason: restartReceipt.reason,
+          failedStep: restartReceipt.restart?.failedStep, load: restartReceipt.restart?.load?.status,
+          unload: restartReceipt.unload?.status ?? restartReceipt.restart?.unload?.status },
+      );
+      check(
+        "a_failed_restart_still_leaves_the_config_fully_applied_with_its_fence",
+        restartReceipt.applied === true &&
+          restartReceipt.writtenSha256 === sha256(restartConfigPath) &&
+          restartReceipt.writtenSha256 === restartReceipt.afterSha256 &&
+          collectorConfigSchema.parse(JSON.parse(fs.readFileSync(restartConfigPath, "utf8")))
+            .captureRoots!.length === 2,
+        { applied: restartReceipt.applied, written: restartReceipt.writtenSha256 },
+      );
+      uninstallLaunchAgent({
+        homeDir: restartHome,
+        mutationAuthority: new LifecycleMutationAuthority(path.join(restartSandbox, "install-authority")),
+      });
+    } finally {
+      restartFixture.restore();
+      fs.rmSync(restartSandbox, { recursive: true, force: true });
+    }
 
     console.log(JSON.stringify({
       proof: "capture-roots-add",
