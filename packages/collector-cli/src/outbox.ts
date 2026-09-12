@@ -85,6 +85,10 @@ export type DeliveryReplaySummary = {
     privacyDisposed: number;
   };
   dryRun: boolean;
+  /** Set only when a full `--limit` of candidates re-queued nothing, so an
+   * operator reading the JSON is pointed at the narrowing option instead of
+   * having to infer it from a large `selected` with `requeued: 0`. */
+  hint?: string;
 };
 
 /** Bounded like the migration scan: the replay transaction never waits longer
@@ -886,9 +890,18 @@ export class DeliveryOutbox {
       // A delivery already replayed no longer has a dead receipt, so the
       // replay ledger is the second half of the candidate set: a repeat run
       // must still see it and count it as skipped rather than report nothing.
-      const candidates = this.db
+      //
+      // Those already-replayed rows are inert by construction — the delivery
+      // is either acknowledged or already live in the outbox — and they sort
+      // by their *first* death, so charging them against the row limit let a
+      // lifetime of replays crowd out a dead letter written today and the
+      // recovery tool reported a full `selected` while re-queueing nothing
+      // (review r1, finding 2). The limit is a budget for work: actionable
+      // candidates and inert ones are selected separately, each bounded by it,
+      // so a skip is always reported and never consumes a slot.
+      const rows = this.db
         .prepare(
-          `select deliveryId, diedAt from (
+          `with pool as (
              select delivery_id as deliveryId, terminal_at as diedAt
                from upload_receipts
               where terminal_state = 'dead' and reason = @reason
@@ -903,14 +916,39 @@ export class DeliveryOutbox {
                    where r.delivery_id = p.delivery_id and r.terminal_state = 'dead'
                      and r.reason not in (${replayableList})
                 )
+           ),
+           classified as (
+             select deliveryId, diedAt,
+               case
+                 when exists (
+                   select 1 from upload_outbox o where o.delivery_id = pool.deliveryId
+                 ) then 0
+                 when exists (
+                   select 1 from upload_receipts r
+                    where r.delivery_id = pool.deliveryId
+                      and r.terminal_state = 'acknowledged'
+                 ) then 0
+                 else 1
+               end as actionable
+             from pool
            )
-           order by diedAt, deliveryId
-           limit @limit`,
+           select deliveryId, diedAt, actionable from (
+             select deliveryId, diedAt, actionable from classified
+              where actionable = 1 order by diedAt, deliveryId limit @limit
+           )
+           union all
+           select deliveryId, diedAt, actionable from (
+             select deliveryId, diedAt, actionable from classified
+              where actionable = 0 order by diedAt, deliveryId limit @limit
+           )`,
         )
         .all({ reason, since: sinceIso, limit }) as Array<{
           deliveryId: string;
           diedAt: string;
+          actionable: number;
         }>;
+      const candidates = rows.filter((row) => row.actionable === 1);
+      const inert = rows.filter((row) => row.actionable === 0);
 
       const activeStatement = this.db.prepare(
         `select 1 as active from upload_outbox where delivery_id = ?`,
@@ -976,6 +1014,13 @@ export class DeliveryOutbox {
           else if (outcome.dead > 0) summary.skipped.privacyDisposed += 1;
           else summary.skipped.missingRaw += 1;
         }
+        // Reported so a repeat run is never silent; classified against live
+        // state rather than trusting the selection's flag.
+        for (const candidate of inert) {
+          summary.selected += 1;
+          if (activeStatement.get(candidate.deliveryId)) summary.skipped.alreadyActive += 1;
+          else summary.skipped.alreadyAcknowledged += 1;
+        }
       };
       // A dry run must leave the ledger byte-identical, so it never opens a
       // write transaction.
@@ -983,6 +1028,12 @@ export class DeliveryOutbox {
       else this.db.transaction(classifyAndRequeue)();
     } finally {
       this.db.pragma(`busy_timeout = ${priorBusyTimeout}`);
+    }
+    if (summary.requeued === 0 && summary.selected >= limit) {
+      summary.hint =
+        `selected ${summary.selected} candidates and re-queued none at --limit ${limit}: ` +
+        "narrow the window with --since <ISO-8601> or raise --limit. Already-replayed " +
+        "deliveries are reported as skipped but never consume the limit.";
     }
     return summary;
   }

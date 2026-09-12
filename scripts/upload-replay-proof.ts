@@ -660,6 +660,199 @@ function cliSurfaceProof() {
   }
 }
 
+// 7. Review r1, finding 2: the row limit is a budget for work. A host with a
+//    lifetime of already-replayed deliveries must still re-queue the dead
+//    letters written today — the replay ledger sorts by the FIRST death, so
+//    before the fix those inert rows filled `--limit` and the recovery tool
+//    reported a full `selected` while re-queueing nothing.
+async function replayLimitCountsOnlyActionableProof() {
+  const { buffer, cfg } = enabledBuffer();
+  await seedWitness(cfg, buffer, 90, 700);
+
+  // Three deliveries that died early, were replayed, and were then delivered:
+  // their `upload_replays` rows keep that early `original_terminal_at` forever.
+  const oldIds = [uuid(91), uuid(92), uuid(93)];
+  for (const n of [91, 92, 93]) buffer.append(event(n, { source: "grok" }));
+  await uploadBufferedEvents(cfg, buffer, {
+    fetchImpl: sourceRejectingCloud(new Set(oldIds)),
+    now: () => instant(710),
+  });
+  const firstReplay = buffer.delivery.replayDeadLetters({
+    reason: "remote_validation_rejected",
+    now: instant(720),
+  });
+  const settled = await uploadBufferedEvents(cfg, buffer, {
+    fetchImpl: acceptingCloud(),
+    now: () => instant(730),
+  });
+
+  // Later, two fresh dead letters under the same reason.
+  const freshIds = [uuid(94), uuid(95)];
+  for (const n of [94, 95]) buffer.append(event(n, { source: "grok" }));
+  await uploadBufferedEvents(cfg, buffer, {
+    fetchImpl: sourceRejectingCloud(new Set(freshIds)),
+    now: () => instant(760),
+  });
+  const deadBefore = receipts(buffer)
+    .filter((row) => row.state === "dead" && row.reason === "remote_validation_rejected")
+    .map((row) => row.id);
+
+  // The reviewer's reproduction: 3 old replayed-and-acknowledged deliveries,
+  // 2 fresh dead letters, `--limit 3`.
+  const limited = buffer.delivery.replayDeadLetters({
+    reason: "remote_validation_rejected",
+    limit: 3,
+    now: instant(770),
+  });
+  const freshLive = (buffer.database
+    .prepare(`select count(*) as n from upload_outbox where delivery_id in (?, ?)`)
+    .get(freshIds[0], freshIds[1]) as { n: number }).n;
+  const freshStillDead = receipts(buffer).filter(
+    (row) => freshIds.includes(row.id) && row.state === "dead",
+  ).length;
+
+  // Nothing actionable is left, so a full `--limit` of inert rows re-queues
+  // nothing: the JSON must point the operator at `--since` rather than being
+  // a silent no-op.
+  const stalled = buffer.delivery.replayDeadLetters({
+    reason: "remote_validation_rejected",
+    limit: 2,
+    dryRun: true,
+    now: instant(780),
+  });
+
+  record(
+    "replay_limit_counts_only_actionable_rows_and_hints_when_stalled",
+    firstReplay.requeued === 3 &&
+      settled.uploadedEvents === 3 &&
+      deadBefore.length === 2 &&
+      freshIds.every((id) => deadBefore.includes(id)) &&
+      // 2 actionable + 3 inert: the skips are reported, never charged.
+      limited.selected === 5 &&
+      limited.requeued === 2 &&
+      limited.skipped.alreadyAcknowledged === 3 &&
+      limited.skipped.alreadyActive === 0 &&
+      limited.skipped.missingRaw === 0 &&
+      limited.skipped.privacyDisposed === 0 &&
+      limited.hint === undefined &&
+      freshLive === 2 &&
+      freshStillDead === 0 &&
+      stalled.selected === 2 &&
+      stalled.requeued === 0 &&
+      typeof stalled.hint === "string" &&
+      /--since/.test(stalled.hint ?? ""),
+    {
+      firstReplay,
+      settledUploads: settled.uploadedEvents,
+      deadBefore,
+      limited,
+      freshLive,
+      freshStillDead,
+      stalled,
+    },
+  );
+  buffer.close();
+}
+
+// 8. Review r1, finding 3: a regression guard for the POST-LOOP witness gate.
+//    Check 2a reaches the witness through the pre-existing in-loop probe at
+//    upload.ts:575-610, which needs `queue.length === 0` at the singleton.
+//    Here the last queue entry is still pending when the poison singleton is
+//    rejected, and that entry then revalidates to zero items (a privacy sweep
+//    disposed its raw rows mid-cycle), so the loop exits with probe budget
+//    left having never taken the in-loop branch. Only the post-loop gate can
+//    prove the contract, and the singleton must be dead-lettered with the
+//    circuit at `none`.
+async function postLoopWitnessGateProof() {
+  const { buffer, cfg } = enabledBuffer(ledger(), { maxProbesPerCycle: 12 });
+  const seed = await seedWitness(cfg, buffer, 80, 800);
+  const poisonIds = [uuid(81), uuid(82), uuid(83)];
+  for (const n of [81, 82, 83]) buffer.append(event(n, { source: "grok" }));
+
+  const requests: string[][] = [];
+  const rejecting = sourceRejectingCloud(new Set(poisonIds), requests);
+  let disposed: string[] = [];
+  const fetchImpl = async (input: RequestInfo | URL, init?: RequestInit) => {
+    const ids = requestIds(init);
+    const result = await rejecting(input, init);
+    // On the singleton probe, dispose the raw rows of the group still queued
+    // behind it. The loop shifts that group next, revalidates it to zero
+    // deliverable items and exits — with the in-loop witness branch never
+    // reachable, because `queue.length` was 1 at the singleton.
+    if (ids.length === 1 && poisonIds.includes(ids[0]) && disposed.length === 0) {
+      disposed = poisonIds.filter((id) => id !== ids[0]);
+      for (const id of disposed) {
+        buffer.database
+          .prepare(
+            `update buffered_events set privacy_disposition = 'local_privacy_violation' where id = ?`,
+          )
+          .run(id);
+      }
+    }
+    return result;
+  };
+
+  // Without the post-loop gate this shape infers a broken contract and throws
+  // remote_contract, so the throw is caught and reported as a failed check
+  // rather than an opaque stack trace.
+  let threw: string | null = null;
+  let outcome: UploadOutcome | null = null;
+  try {
+    outcome = await uploadBufferedEvents(cfg, buffer, {
+      fetchImpl,
+      now: () => instant(810),
+    });
+  } catch (error) {
+    threw = error instanceof DeliveryUploadError ? error.failureClass : String(error);
+  }
+  const cycle = outcome;
+  const status = buffer.delivery.status(instant(810));
+  const rows = receipts(buffer);
+  const singletonId = requests[1]?.[0] ?? "";
+  const singleton = rows.find((row) => row.id === singletonId);
+  const disposedRows = rows.filter(
+    (row) => disposed.includes(row.id) && row.state === "dead" && row.reason === "local_privacy_violation",
+  );
+
+  record(
+    "post_loop_witness_gate_proves_contract_and_dead_letters_without_circuit",
+    seed.witnessRows === 1 &&
+      // probe sizes 3 (whole lease), 1 (poison singleton), 1 (the witness)
+      requests.length === 3 &&
+      requests[0].length === 3 &&
+      requests[1].length === 1 &&
+      requests[2].length === 1 &&
+      requests[2][0] === uuid(80) &&
+      disposed.length === 2 &&
+      singleton?.state === "dead" &&
+      singleton?.reason === "remote_validation_rejected" &&
+      disposedRows.length === 2 &&
+      status.circuit.kind === "none" &&
+      threw === null &&
+      cycle !== null &&
+      cycle.uploadedEvents === 0 &&
+      circuitOf(cycle) === "none" &&
+      cycle.delivery.attempts === 3 &&
+      cycle.delivery.attempts <= cfg.delivery.maxProbesPerCycle &&
+      requests.length <= cfg.delivery.maxProbesPerCycle &&
+      status.remainingDelivery === 0,
+    {
+      probes: requests.map((ids) => ids.length),
+      witnessProbeIsWitness: requests[2]?.[0] === uuid(80),
+      disposedMidCycle: disposed,
+      singleton: singleton ?? null,
+      disposedDeadLetters: disposedRows.length,
+      circuit: status.circuit.kind,
+      threw,
+      reportedAttempts: cycle?.delivery.attempts ?? null,
+      maxProbes: cfg.delivery.maxProbesPerCycle,
+      deadLetters: cycle?.delivery.deadLetters ?? null,
+      remaining: status.remainingDelivery,
+    },
+  );
+  buffer.close();
+}
+
 async function main() {
   try {
     await mixedSourceProof();
@@ -668,7 +861,12 @@ async function main() {
     await contractBlockedStillOpensProof();
     await replayProof();
     await replayBoundsProof();
+    await replayLimitCountsOnlyActionableProof();
     cliSurfaceProof();
+    // Last: the post-loop witness gate is the only check that discriminates
+    // the `validationWitnessProven` assignment at upload.ts:678, so a negative
+    // control that deletes it must fail here with every other check green.
+    await postLoopWitnessGateProof();
     const failed = checks.filter((check) => !check.passed);
     console.log(
       JSON.stringify(
