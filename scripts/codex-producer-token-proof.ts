@@ -122,6 +122,15 @@ function managedCommands(toml: string) {
   return commands;
 }
 
+function sleep(ms: number) {
+  return new Promise<void>((resolve) => { setTimeout(resolve, ms); });
+}
+
+/** Value-blind: how many rotation rows the stored credential file still has. */
+function storedRotationRows(home: string) {
+  return Object.keys(readLocalIngestAuth(home)?.rotations ?? {}).length;
+}
+
 function exporterHeaders(toml: string) {
   const document = parseToml(toml) as Record<string, any>;
   return ["exporter", "trace_exporter", "metrics_exporter"].map((table) =>
@@ -141,6 +150,8 @@ async function main() {
   });
   let commandServer: http.Server | undefined;
   let commandBuffer: LocalEventBuffer | undefined;
+  const rotationServers: http.Server[] = [];
+  const rotationBuffers: LocalEventBuffer[] = [];
   try {
     const authHome = path.join(sandbox, "command-auth");
     const auth = loadOrCreateLocalIngestAuth(authHome);
@@ -588,6 +599,166 @@ async function main() {
       { newTokenStatus, oldTokenStatus, foreignTokenStatus },
     );
 
+    // The reload seam is decided before the admission decision, so a running
+    // daemon follows a rotation whatever it was probed with first. Each case
+    // below gets its own credential home and its own listener; every request
+    // goes to a collector that loaded its authority *before* the rotation.
+    const startRotationCollector = async (label: string, authorityHome: string) => {
+      fs.mkdirSync(authorityHome, { recursive: true, mode: 0o700 });
+      const authority = loadOrCreateLocalIngestAuth(authorityHome);
+      const ledger = new LocalEventBuffer(path.join(sandbox, `${label}-ledger.sqlite`));
+      rotationBuffers.push(ledger);
+      const server = createCollectorServer(collectorConfigSchema.parse({ port: 48271 }), ledger, {
+        localAuth: authority,
+        localAuthHome: authorityHome,
+      });
+      rotationServers.push(server);
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+      });
+      const listenPort = (server.address() as AddressInfo).port;
+      const post = async (headerToken: string) => {
+        const response = await fetch(`http://127.0.0.1:${listenPort}/hooks/codex`, {
+          method: "POST",
+          headers: { "content-type": "application/json", "x-plimsoll-token": headerToken },
+          body: JSON.stringify({
+            hookEventName: "stop",
+            sessionId: "8c1d6a20-4f3e-4c0a-9c1e-7b2d5a9f3e10",
+            timestamp: "2026-09-12T02:06:00.000Z",
+          }),
+        });
+        return response.status;
+      };
+      return { authority, post };
+    };
+
+    // 1. The reviewer's adversarial order: a foreign miss before the new token
+    //    must not consume the reload, and the expired token must stay out.
+    const retireHome = path.join(sandbox, "retire-auth");
+    const retire = await startRotationCollector("retire", retireHome);
+    const retireBeforeRotation = await retire.post(retire.authority.codexProducer);
+    const retired = rotateLocalProducerToken(retireHome, "codex", { graceMs: 1 });
+    const retireRowsAfterRotation = storedRotationRows(retireHome);
+    await sleep(50);
+    const retireOldFirst = await retire.post(retire.authority.codexProducer);
+    const retireForeign = await retire.post("y".repeat(43));
+    const retireOldAfterForeign = await retire.post(retire.authority.codexProducer);
+    const retireNewLast = await retire.post(retired.auth.codexProducer);
+    check(
+      "expired_token_is_refused_and_the_rotated_token_admitted_in_any_probe_order",
+      retireBeforeRotation === 202 && retireOldFirst === 401 && retireForeign === 401 &&
+        retireOldAfterForeign === 401 && retireNewLast === 202,
+      {
+        beforeRotation: retireBeforeRotation,
+        oldAfterExpiry: retireOldFirst,
+        foreign: retireForeign,
+        oldAfterForeignMiss: retireOldAfterForeign,
+        newAfterMisses: retireNewLast,
+      },
+    );
+    check(
+      "closed_rotation_window_is_pruned_from_the_credential_file",
+      retireRowsAfterRotation === 1 && storedRotationRows(retireHome) === 0 &&
+        (fs.statSync(path.join(retireHome, "local-ingest-auth.json")).mode & 0o777) === 0o600 &&
+        readLocalIngestAuth(retireHome)!.codexProducer === retired.auth.codexProducer,
+      {
+        rowsAfterRotation: retireRowsAfterRotation,
+        rowsAfterExpiry: storedRotationRows(retireHome),
+        mode: fs.statSync(path.join(retireHome, "local-ingest-auth.json")).mode & 0o777,
+      },
+    );
+
+    // 2. A client that only ever presents the old token never misses, so the
+    //    window has to close on its own schedule, not on a rejection.
+    const windowHome = path.join(sandbox, "window-auth");
+    const windowGraceMs = 1_500;
+    const onlyOld = await startRotationCollector("window", windowHome);
+    const windowBeforeRotation = await onlyOld.post(onlyOld.authority.codexProducer);
+    const windowRotated = rotateLocalProducerToken(windowHome, "codex", { graceMs: windowGraceMs });
+    const windowOldInside = await onlyOld.post(onlyOld.authority.codexProducer);
+    await sleep(Math.max(windowRotated.expiresAt - Date.now(), 0) + 50);
+    const windowOldOutside = await onlyOld.post(onlyOld.authority.codexProducer);
+    check(
+      "old_token_only_traffic_is_cut_off_when_the_window_closes",
+      windowBeforeRotation === 202 && windowOldInside === 202 && windowOldOutside === 401 &&
+        storedRotationRows(windowHome) === 0,
+      {
+        beforeRotation: windowBeforeRotation,
+        insideWindow: windowOldInside,
+        afterWindow: windowOldOutside,
+        graceMs: windowGraceMs,
+      },
+    );
+
+    // 3. No preceding rejection anywhere: the first request that carries the
+    //    rotated token is admitted.
+    const firstHome = path.join(sandbox, "first-request-auth");
+    const first = await startRotationCollector("first-request", firstHome);
+    const firstBeforeRotation = await first.post(first.authority.codexProducer);
+    const firstRotated = rotateLocalProducerToken(firstHome, "codex", { graceMs: 60_000 });
+    const firstNewToken = await first.post(firstRotated.auth.codexProducer);
+    const firstOldInsideGrace = await first.post(first.authority.codexProducer);
+    check(
+      "rotated_token_is_admitted_on_its_first_request_without_a_preceding_miss",
+      firstBeforeRotation === 202 && firstNewToken === 202 && firstOldInsideGrace === 202 &&
+        storedRotationRows(firstHome) === 1,
+      {
+        beforeRotation: firstBeforeRotation,
+        firstNewToken,
+        oldInsideGrace: firstOldInsideGrace,
+        rows: storedRotationRows(firstHome),
+      },
+    );
+
+    // 4. Pruning happens on the request path, so a credential home the daemon
+    //    cannot write must still decide the request instead of erroring.
+    const sealedHome = path.join(sandbox, "sealed-auth");
+    const sealed = await startRotationCollector("sealed", sealedHome);
+    const sealedBeforeRotation = await sealed.post(sealed.authority.codexProducer);
+    const sealedRotated = rotateLocalProducerToken(sealedHome, "codex", { graceMs: 1 });
+    await sleep(50);
+    fs.chmodSync(sealedHome, 0o500);
+    let sealedOld = 0;
+    let sealedNew = 0;
+    try {
+      sealedOld = await sealed.post(sealed.authority.codexProducer);
+      sealedNew = await sealed.post(sealedRotated.auth.codexProducer);
+    } finally {
+      fs.chmodSync(sealedHome, 0o700);
+    }
+    check(
+      "an_unwritable_credential_home_still_retires_the_expired_token",
+      sealedBeforeRotation === 202 && sealedOld === 401 && sealedNew === 202 &&
+        storedRotationRows(sealedHome) === 1,
+      {
+        beforeRotation: sealedBeforeRotation,
+        oldAfterExpiry: sealedOld,
+        newAfterExpiry: sealedNew,
+        rowsLeftOnDisk: storedRotationRows(sealedHome),
+      },
+    );
+
+    // 4. CI must keep running this proof: install-doctor's standalone gate list
+    //    is what stops the workflow step from being dropped silently.
+    const gateCommand = "pnpm proof:codex-producer-token";
+    const installDoctorProof = fs.readFileSync(
+      path.join(repoRoot, "scripts", "install-doctor-proof.ts"),
+      "utf8",
+    );
+    const gateList = installDoctorProof.slice(
+      installDoctorProof.indexOf("const requiredStandaloneGates = ["),
+    ).split("];")[0] ?? "";
+    const workflowRuns = [
+      ...fs.readFileSync(path.join(repoRoot, ".github", "workflows", "proof.yml"), "utf8")
+        .matchAll(/^\s+run:\s*(.+?)\s*$/gm),
+    ].filter((match) => match[1] === gateCommand).length;
+    check(
+      "ci_gate_list_locks_this_proof_into_the_workflow",
+      gateList.includes(`"${gateCommand}"`) && workflowRuns === 1,
+      { gateListed: gateList.includes(`"${gateCommand}"`), workflowRuns },
+    );
+
     // ---- C. Rotation fails closed ----------------------------------------
     const refuseHome = path.join(sandbox, "refuse-home");
     const refuseCodex = path.join(refuseHome, ".codex");
@@ -652,7 +823,11 @@ async function main() {
     if (commandServer) {
       await new Promise<void>((resolve) => commandServer!.close(() => resolve()));
     }
+    for (const server of rotationServers) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
     commandBuffer?.close();
+    for (const buffer of rotationBuffers) buffer.close();
     fixture.restore();
     if (operatorHome === undefined) delete process.env.HOME;
     else process.env.HOME = operatorHome;

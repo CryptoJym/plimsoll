@@ -225,30 +225,34 @@ function writeNewAuth(home: string, overwrite: boolean) {
   return writeAuth(home, newAuth(), overwrite);
 }
 
-function migrateLegacyAuth(home: string, existing: LocalIngestAuth) {
-  return writeAuth(home, {
-    ...existing,
-    geminiCliProducer: existing.geminiCliProducer ?? newToken(),
-    grokProducer: existing.grokProducer ?? newToken(),
-  }, true);
+function settledAuth(existing: LocalIngestAuth, now: number) {
+  const live = withoutClosedRotations(existing, now);
+  return {
+    ...live,
+    geminiCliProducer: live.geminiCliProducer ?? newToken(),
+    grokProducer: live.grokProducer ?? newToken(),
+  };
 }
 
-/** Provision once and return the same values on every subsequent call. */
+/**
+ * Provision once and return the same values on every subsequent call. A load
+ * also settles the stored file: missing producer audiences are filled and
+ * rotation windows that have already closed are dropped, so a restart never
+ * re-reads a superseded token.
+ */
 export function loadOrCreateLocalIngestAuth(
   home: string,
   options: { dryRun?: boolean } = {},
 ): LocalIngestAuth {
+  const now = Date.now();
   const existing = readLocalIngestAuth(home);
   if (existing) {
-    if (existing.geminiCliProducer && existing.grokProducer) return existing;
-    if (options.dryRun) {
-      return Object.freeze({
-        ...existing,
-        geminiCliProducer: existing.geminiCliProducer ?? newToken(),
-        grokProducer: existing.grokProducer ?? newToken(),
-      });
+    if (existing.geminiCliProducer && existing.grokProducer &&
+      closedRotationCount(existing, now) === 0) {
+      return existing;
     }
-    return migrateLegacyAuth(home, existing);
+    const settled = settledAuth(existing, now);
+    return options.dryRun ? Object.freeze(settled) : writeAuth(home, settled, true);
   }
   if (authFileExists(home)) throw new Error("local_ingest_auth_invalid");
   return options.dryRun ? newAuth() : writeNewAuth(home, false);
@@ -263,6 +267,22 @@ function liveRotations(auth: LocalIngestAuth, now: number) {
   return Object.fromEntries(
     Object.entries(auth.rotations ?? {}).filter(([, rotation]) => rotation.expiresAt > now),
   ) as Partial<Record<LocalProducerSource, LocalProducerRotation>>;
+}
+
+function closedRotationCount(auth: LocalIngestAuth, now: number) {
+  return Object.values(auth.rotations ?? {}).filter((rotation) => rotation.expiresAt <= now).length;
+}
+
+/**
+ * The same authority with every closed rotation window removed. The key is
+ * dropped entirely when nothing is left, because an empty `rotations` object
+ * is not a valid stored shape.
+ */
+function withoutClosedRotations(auth: LocalIngestAuth, now: number): LocalIngestAuth {
+  if (closedRotationCount(auth, now) === 0) return auth;
+  const live = liveRotations(auth, now);
+  const { rotations: _closed, ...rest } = auth;
+  return Object.keys(live).length === 0 ? { ...rest } : { ...rest, rotations: live };
 }
 
 /**
@@ -304,6 +324,36 @@ export function rotateLocalProducerToken(
     rotations,
   } as LocalIngestAuth;
   return { auth: writeAuth(home, next, true), expiresAt };
+}
+
+/**
+ * Drop every rotation window whose deadline has passed and rewrite the file
+ * when a row goes away. A superseded token must not outlive its deadline on
+ * disk: after the window closes, a restart, a later reload, or a clock moved
+ * backwards must not be able to resurrect it. Returns the authority now on
+ * disk, or null when the file is missing or malformed, in which case callers
+ * keep whatever authority they already hold.
+ */
+export function pruneExpiredProducerRotations(
+  home: string,
+  now = Date.now(),
+): LocalIngestAuth | null {
+  const stamp = localIngestAuthStamp(home);
+  const existing = readLocalIngestAuth(home);
+  if (!existing) return null;
+  const live = withoutClosedRotations(existing, now);
+  if (live === existing) return existing;
+  // A write that landed between the read above and here owns the newer file
+  // and already dropped its own closed windows; never clobber it.
+  if (localIngestAuthStamp(home) !== stamp) return readLocalIngestAuth(home);
+  try {
+    return Object.freeze(writeAuth(home, live, true));
+  } catch {
+    // A home this process cannot write must not turn every request that calls
+    // this into an error. The returned authority is already pruned, so the
+    // closed window stops admitting its token either way.
+    return Object.freeze(live);
+  }
 }
 
 /**

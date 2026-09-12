@@ -125,6 +125,7 @@ async function main() {
     "pnpm proof:install-doctor",
     "pnpm proof:launch-agent",
     "pnpm proof:codex-config-apply",
+    "pnpm proof:codex-producer-token",
     "pnpm proof:setup-toml-reconcile",
     "pnpm proof:claude-config-apply",
     "pnpm proof:fixture-root-guard",

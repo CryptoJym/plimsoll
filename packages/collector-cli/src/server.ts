@@ -57,7 +57,7 @@ import {
   assertManagementCredential,
   assertProducerToken,
   localIngestAuthStamp,
-  readLocalIngestAuth,
+  pruneExpiredProducerRotations,
   type LocalIngestAuth,
 } from "./local-auth";
 import {
@@ -174,10 +174,11 @@ export function createCollectorServer(
      */
     localAuth?: LocalIngestAuth;
     /**
-     * Plimsoll home backing `localAuth`. When set, a producer token that misses
-     * the cached authority re-reads the credential file once — and only once
-     * per observed file change — so `rotate-producer-token` takes effect on a
-     * running daemon without a restart. Absent, the cached authority is final.
+     * Plimsoll home backing `localAuth`. When set, every producer request first
+     * stats the credential file and re-reads it when it has moved on, so
+     * `rotate-producer-token` takes effect on a running daemon without a
+     * restart and a closed grace window stops admitting the superseded token.
+     * Absent, the cached authority is final.
      */
     localAuthHome?: string;
     /** Private hash registry home; no provisioning occurs on the listener. */
@@ -203,26 +204,37 @@ export function createCollectorServer(
   };
   // Rotation reload seam. Management credentials deliberately keep using the
   // authority loaded at start; only the producer audiences follow a rotation.
+  // Freshness is decided before the admission decision, never after a miss: a
+  // rejection must not be the only thing that can install a rotation, or the
+  // superseded token outlives its deadline and the new one is locked out.
   let producerAuth = localAuth;
   let producerAuthStamp = options.localAuthHome ? localIngestAuthStamp(options.localAuthHome) : null;
+  const graceWindowClosed = (auth: LocalIngestAuth) => {
+    const now = Date.now();
+    return Object.values(auth.rotations ?? {}).some((rotation) => rotation.expiresAt <= now);
+  };
+  const refreshProducerAuth = (loaded: LocalIngestAuth) => {
+    const home = options.localAuthHome;
+    if (!home) return loaded;
+    const stamp = localIngestAuthStamp(home);
+    // No readable credential file: the authority this daemon started with
+    // stays in force rather than admitting or rejecting on a guess.
+    if (stamp === null) return loaded;
+    if (stamp === producerAuthStamp && !graceWindowClosed(loaded)) return loaded;
+    // One load per observed change, plus one more once a window has closed so
+    // the expired row also leaves the disk. The stamp advances only after the
+    // load succeeded: a half-written or malformed file must not retire a token
+    // the next request still has to honour.
+    const reloaded = pruneExpiredProducerRotations(home);
+    if (!reloaded) return loaded;
+    producerAuth = reloaded;
+    producerAuthStamp = localIngestAuthStamp(home) ?? stamp;
+    return reloaded;
+  };
   const assertProducer = (request: http.IncomingMessage, source: LocalProducerSource) => {
-    if (!producerAuth) return;
-    try {
-      assertProducerToken(request, producerAuth, source, requestUrl(request));
-    } catch (error) {
-      const home = options.localAuthHome;
-      if (!home || !(error instanceof HttpBoundaryRejection) ||
-        error.reason !== "producer_token_invalid") {
-        throw error;
-      }
-      const stamp = localIngestAuthStamp(home);
-      if (stamp === null || stamp === producerAuthStamp) throw error;
-      producerAuthStamp = stamp;
-      const reloaded = readLocalIngestAuth(home);
-      if (!reloaded) throw error;
-      assertProducerToken(request, reloaded, source, requestUrl(request));
-      producerAuth = reloaded;
-    }
+    const loaded = producerAuth;
+    if (!loaded) return;
+    assertProducerToken(request, refreshProducerAuth(loaded), source, requestUrl(request));
   };
 
   // Issue #0075 (#144): repeated identical admission rejections are
