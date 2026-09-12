@@ -255,3 +255,187 @@ export function appendRootObservation(buffer: import("./buffer").LocalEventBuffe
     throw new Error("capture_logical_source_conflict");
   return inserted;
 }
+
+/**
+ * Additive root registration (bead eco-6hoxj.53).
+ *
+ * A host that later gains a native root — a new Claude seat's `projects/`, a
+ * new Codex profile's `sessions/`, or the main `~/.claude/projects` an older
+ * enrollment never registered — has had no product path to register it:
+ * capture roots are minted at enrollment, which lives outside this repository,
+ * and the gap has been repaired by host-sealed one-off scripts. The helpers
+ * below carry the reviewed semantics of those scripts: the same identity
+ * derivation, the same standard shapes, and the same refusal to change
+ * anything that already exists.
+ */
+
+/** Directory shapes a native root takes under the operator home. */
+export const CAPTURE_ROOT_SHAPES = [
+  { shape: "claude_home", source: "claude_code" as const, segments: [".claude", "projects"] },
+  { shape: "claude_seat", source: "claude_code" as const, parent: ".claude-seats", leaf: "projects" },
+  { shape: "codex_home", source: "codex" as const, segments: [".codex", "sessions"] },
+  { shape: "codex_profile", source: "codex" as const, parent: ".codex-profiles", leaf: "sessions" },
+] as const;
+
+export type CaptureRootCandidate = {
+  shape: string;
+  source: CaptureRoot["source"];
+  /** Absolute physical directory. */
+  directory: string;
+  /** Directory relative to the operator home; a candidate never leaves it. */
+  relativeDirectory: string;
+};
+
+export type CaptureRootDiscoveryEntry = {
+  source: CaptureRoot["source"];
+  state: "registered" | "candidate" | "missing";
+  /** Relative to the operator home, or null for a configured root outside it. */
+  directory: string | null;
+  outsideHome: boolean;
+  shape: string | null;
+  rootId: string | null;
+};
+
+/**
+ * Python `json.dumps(value, sort_keys=True, separators=(",", ":"),
+ * ensure_ascii=True)` for the one shape this derivation uses — an array of
+ * strings — so a root added here derives byte-identically to one the sealed
+ * helpers appended.
+ */
+function canonicalAscii(value: readonly string[]): string {
+  return JSON.stringify(value).replace(/[^ -~]/g, (character) =>
+    `\\u${character.charCodeAt(0).toString(16).padStart(4, "0")}`);
+}
+
+/**
+ * Root identity as the sealed enrollment helpers derive it:
+ * `root-<sha256(canonical([machine, source, directory]))[:24]>`, with the same
+ * digest behind `profile-`. The machine label is the fleet label, not a
+ * hostname, so callers resolve it from the roots already in the config.
+ */
+export function deriveCaptureRootIdentity(
+  machine: string,
+  source: CaptureRoot["source"],
+  directory: string,
+): { rootId: string; profileId: string } {
+  const digest = crypto.createHash("sha256")
+    .update(canonicalAscii([machine, source, directory])).digest("hex").slice(0, 24);
+  return { rootId: `root-${digest}`, profileId: `profile-${digest}` };
+}
+
+/** True when every configured root reproduces its own rootId under `machine`. */
+export function captureRootsDeriveFrom(roots: readonly CaptureRoot[], machine: string): boolean {
+  return roots.every((root) =>
+    deriveCaptureRootIdentity(machine, root.source, root.directory).rootId === root.rootId);
+}
+
+/**
+ * The machine label the config was enrolled under. It is stored nowhere — only
+ * its digests are — so it is recovered by checking candidate labels against the
+ * roots that already exist. A host with no roots yet has nothing to check
+ * against, and the caller must state the label explicitly.
+ */
+export function resolveCaptureRootMachineLabel(
+  roots: readonly CaptureRoot[],
+  candidates: readonly string[],
+): string | null {
+  if (!roots.length) return null;
+  return candidates.find((candidate) => candidate.length > 0 && captureRootsDeriveFrom(roots, candidate)) ?? null;
+}
+
+/** The home a discovery runs against, resolved the way a physical root is. */
+function resolveDiscoveryHome(home: string): string {
+  try { return fs.realpathSync(path.resolve(home)); }
+  catch { return path.resolve(home); }
+}
+
+/** The physical directory a configured root captures from. */
+export function configuredCaptureRootDirectory(root: Pick<CaptureRoot, "directory">): string {
+  return physicalCaptureRootDirectory(root.directory) ?? path.resolve(root.directory);
+}
+
+/** The physical directory an entry names, following a link; undefined when it is neither. */
+export function physicalCaptureRootDirectory(entry: string): string | undefined {
+  try {
+    const resolved = fs.realpathSync(entry);
+    return fs.statSync(resolved).isDirectory() ? resolved : undefined;
+  } catch {
+    // A dangling link or an unreadable entry is skipped, never reported.
+    return undefined;
+  }
+}
+
+/**
+ * Candidate directories in the standard shapes under `home`. Read-only: it
+ * stats directories, never opens a file, and never leaves the home.
+ */
+export function discoverCaptureRootCandidates(home: string): CaptureRootCandidate[] {
+  const resolvedHome = resolveDiscoveryHome(home);
+  const found: CaptureRootCandidate[] = [];
+  const add = (shape: string, source: CaptureRoot["source"], entry: string) => {
+    const directory = physicalCaptureRootDirectory(entry);
+    if (directory === undefined) return;
+    const relativeDirectory = path.relative(resolvedHome, directory);
+    // A seat relocated to shared storage and symlinked in resolves outside the
+    // home; that is the seat tooling's root to register, not a home candidate.
+    if (relativeDirectory.startsWith("..") || path.isAbsolute(relativeDirectory)) return;
+    found.push({ shape, source, directory, relativeDirectory });
+  };
+  for (const shape of CAPTURE_ROOT_SHAPES) {
+    if ("segments" in shape) {
+      add(shape.shape, shape.source, path.join(resolvedHome, ...shape.segments));
+      continue;
+    }
+    const parent = path.join(resolvedHome, shape.parent);
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(parent, { withFileTypes: true }); }
+    catch { continue; }
+    for (const entry of [...entries].sort((left, right) => left.name < right.name ? -1 : left.name > right.name ? 1 : 0)) {
+      if (entry.name.startsWith(".")) continue;
+      add(shape.shape, shape.source, path.join(parent, entry.name, shape.leaf));
+    }
+  }
+  return found;
+}
+
+/**
+ * Every configured root plus every unregistered candidate, as one list. A
+ * configured root outside the home keeps its identity but not its path, and is
+ * never stat-ed: discovery stays inside the home.
+ */
+export function discoverCaptureRoots(
+  home: string,
+  roots: readonly CaptureRoot[],
+): CaptureRootDiscoveryEntry[] {
+  const resolvedHome = resolveDiscoveryHome(home);
+  const candidates = discoverCaptureRootCandidates(resolvedHome);
+  const shapes = new Map(candidates.map((candidate) => [candidate.directory, candidate.shape]));
+  const configured = new Set(roots.map((root) => configuredCaptureRootDirectory(root)));
+  const entries: CaptureRootDiscoveryEntry[] = roots.map((root) => {
+    const directory = configuredCaptureRootDirectory(root);
+    const relative = path.relative(resolvedHome, directory);
+    const outsideHome = relative.startsWith("..") || path.isAbsolute(relative);
+    return {
+      source: root.source,
+      state: outsideHome || physicalCaptureRootDirectory(root.directory) !== undefined
+        ? "registered" as const
+        : "missing" as const,
+      directory: outsideHome ? null : relative,
+      outsideHome,
+      shape: outsideHome ? null : shapes.get(directory) ?? null,
+      rootId: root.rootId,
+    };
+  });
+  for (const candidate of candidates) {
+    if (configured.has(candidate.directory)) continue;
+    entries.push({
+      source: candidate.source,
+      state: "candidate",
+      directory: candidate.relativeDirectory,
+      outsideHome: false,
+      shape: candidate.shape,
+      rootId: null,
+    });
+  }
+  return entries;
+}

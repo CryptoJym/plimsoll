@@ -67,6 +67,7 @@ import {
   ensureCollectorHome,
   loadCollectorConfig,
   readCollectorConfig,
+  writeCollectorConfigTransactionally,
   type CollectorConfig,
 } from "./config";
 import { appendForwardedHook } from "./forwarder";
@@ -119,7 +120,17 @@ import {
   historyCoverageStatus,
   recordExplicitFullHistoryCoverage,
 } from "./history-coverage";
-import { captureBaselineStatus } from "./capture-baseline";
+import { advanceCaptureBaselineEnrollment, captureBaselineStatus } from "./capture-baseline";
+import {
+  configuredCaptureRootDirectory,
+  deriveCaptureRootIdentity,
+  discoverCaptureRootCandidates,
+  discoverCaptureRoots,
+  physicalCaptureRootDirectory,
+  resolveCaptureRootMachineLabel,
+  validateCaptureRoots,
+  type CaptureRoot,
+} from "./capture-root-inventory";
 import { createCollectorServer } from "./server";
 import { MaintenanceFailureError, MaintenanceProcessBoundary } from "./maintenance-boundary";
 import { checkpointWalInBoundedChild, runStartupWalSelfHeal } from "./startup-wal-self-heal";
@@ -246,6 +257,16 @@ Commands:
   enroll-codex-live-producer --producer-id ID --credential-id ID --capture-root-id ID
                         Provision a same-user Codex live producer; account
                         assertion discovery is best-effort and never printed
+  capture-roots discover [--json]
+                        List native capture roots under $HOME with their state
+                        (registered | candidate | missing); read-only
+  capture-roots add --source codex|claude_code --directory DIR [--directory DIR]
+                        [--machine LABEL] [--dry-run] [--json]
+                        Append a newly discovered capture root: derives the
+                        enrolled identity, backs the config up, seeds the
+                        provider baseline at the append time, restarts the
+                        collector and writes a receipt. Never changes an
+                        existing root, epoch or enrollment field
   doctor --read-only --json
                         Read-only readiness check; never creates config, ledger, plist, logs, or directories
   export                Print buffered events as JSON
@@ -1556,6 +1577,32 @@ function collectorPidRecord(runtimeIdentity: CollectorRuntimeIdentity): Collecto
   };
 }
 
+/**
+ * The installation epoch a newly registered capture root joins (bead
+ * eco-6hoxj.53). The ledger binding is authoritative; a config whose roots all
+ * carry one epoch answers for an install whose ledger cannot be read.
+ */
+function readInstallationEpochId(roots: readonly CaptureRoot[]): string | null {
+  const bufferPath = collectorBufferPath();
+  if (fs.existsSync(bufferPath)) {
+    try {
+      const database = new Database(bufferPath, { readonly: true, fileMustExist: true });
+      try {
+        const row = database
+          .prepare("select current_installation_epoch_id as epoch from collector_workspace_binding where singleton = 1")
+          .get() as { epoch: string | null } | undefined;
+        if (row?.epoch) return row.epoch;
+      } finally {
+        database.close();
+      }
+    } catch {
+      // An absent or unreadable binding falls through to the configured roots.
+    }
+  }
+  const epochs = new Set(roots.map((root) => root.installationEpochId));
+  return epochs.size === 1 ? [...epochs][0] : null;
+}
+
 async function main() {
   if (command === "help" || command === "--help" || command === "-h") {
     printHelp();
@@ -1865,6 +1912,7 @@ async function main() {
   }
 
   const noCreateConfigCommands = new Set([
+    "capture-roots",
     "doctor",
     "setup",
     "install-launch-agent",
@@ -3480,6 +3528,11 @@ async function main() {
           ? "configured"
           : "not_installed";
     const ok = readiness === "signal_verified";
+    const configuredRootDirectories = new Set(
+      (config.captureRoots ?? []).map((root) => configuredCaptureRootDirectory(root)),
+    );
+    const unregisteredCaptureRootCandidates = discoverCaptureRootCandidates(os.homedir())
+      .filter((candidate) => !configuredRootDirectories.has(candidate.directory));
     const bufferPath = collectorBufferPath();
     console.log(
       JSON.stringify(
@@ -3507,6 +3560,17 @@ async function main() {
           },
           ...(grokHookCommand ? { grokHookCommand } : {}),
           ...(codexHookCommand ? { codexHookCommand } : {}),
+          // Hosts that gained a native root after enrollment (bead
+          // eco-6hoxj.53): the lead needs to see which ones still need
+          // `capture-roots add`. A coverage diagnostic only — never a value,
+          // never a path outside $HOME, and never part of `ok`.
+          captureRoots: {
+            configured: (config.captureRoots ?? []).length,
+            unregisteredCandidates: {
+              count: unregisteredCaptureRootCandidates.length,
+              directories: unregisteredCaptureRootCandidates.map((candidate) => candidate.relativeDirectory),
+            },
+          },
           producerTokenRotation: producerTokenRotationReceipt(localAuth),
           ...producerAudienceFillReceipt(collectorHome()),
           launchAgent,
@@ -3568,6 +3632,292 @@ async function main() {
       ),
     );
     if (!ok) process.exitCode = 1;
+    return;
+  }
+
+  // Append-only registration of a native capture root a host gained after
+  // enrollment (bead eco-6hoxj.53). Enrollment mints roots; nothing until now
+  // registered one that appeared later, so a new Claude seat, a new Codex
+  // profile, or a `~/.claude/projects` an older enrollment skipped stayed
+  // invisible and was repaired by host-sealed one-off scripts. This command is
+  // those scripts' reviewed semantics: derive the same identity, append, never
+  // change an existing root, epoch or enrollment field.
+  if (command === "capture-roots") {
+    const action = process.argv[3] ?? "";
+    if (!["discover", "add"].includes(action)) {
+      throw new Error("Expected capture-roots discover|add");
+    }
+    const home = os.homedir();
+    const configuredRoots = configRead?.status === "valid" ? config.captureRoots ?? [] : [];
+    const refuse = (reason: string, detail: Record<string, unknown> = {}) => {
+      console.log(JSON.stringify({ status: "capture_roots_add_refused", reason, ...detail }, null, 2));
+      process.exitCode = 1;
+    };
+
+    if (action === "discover") {
+      const entries = discoverCaptureRoots(home, configuredRoots);
+      console.log(
+        JSON.stringify(
+          {
+            status: "capture_roots_discovered",
+            readOnly: true,
+            config: { status: configRead?.status ?? "invalid", path: configPath },
+            counts: {
+              registered: entries.filter((entry) => entry.state === "registered").length,
+              candidate: entries.filter((entry) => entry.state === "candidate").length,
+              missing: entries.filter((entry) => entry.state === "missing").length,
+            },
+            roots: entries,
+          },
+          null,
+          2,
+        ),
+      );
+      return;
+    }
+
+    if (configRead?.status !== "valid") {
+      refuse("config_not_valid", { config: { status: configRead?.status ?? "invalid", path: configPath } });
+      return;
+    }
+    const sourceArgument = optionValue("--source");
+    if (sourceArgument !== "codex" && sourceArgument !== "claude_code") {
+      refuse("unknown_source", { source: sourceArgument ?? null });
+      return;
+    }
+    const source = sourceArgument;
+    const requested = process.argv
+      .map((argument, index) => (argument === "--directory" ? process.argv[index + 1] : undefined))
+      .filter((value): value is string => typeof value === "string" && !value.startsWith("--"));
+    if (!requested.length) {
+      refuse("directory_required");
+      return;
+    }
+
+    // Every path is resolved to the physical directory that will be captured,
+    // the same identity `inspectCaptureRoots` requires of a configured root.
+    const resolvedHome = path.resolve(home);
+    const added: CaptureRoot[] = [];
+    const seen = new Set(configuredRoots.map((root) => configuredCaptureRootDirectory(root)));
+    const seenIds = new Set(configuredRoots.map((root) => root.rootId));
+    const machineArgument = optionValue("--machine");
+    const machineCandidates = machineArgument
+      ? [machineArgument]
+      : [process.env.PLIMSOLL_MACHINE ?? "", os.hostname(), os.hostname().split(".")[0] ?? ""];
+    const machine = resolveCaptureRootMachineLabel(configuredRoots, machineCandidates);
+    if (machine === null) {
+      // Either the config carries no root to check a label against, or no
+      // candidate reproduces the ids it already holds. Both are the r3
+      // helper's `identity_derivation_mismatch` guard: never append a root
+      // under a derivation this config does not already use.
+      refuse(configuredRoots.length ? "identity_derivation_mismatch" : "identity_machine_unresolved", {
+        configuredRoots: configuredRoots.length,
+        machineCandidates: machineArgument ? machineCandidates : machineCandidates.filter(Boolean).length,
+      });
+      return;
+    }
+
+    const installationEpochId = readInstallationEpochId(configuredRoots);
+    if (installationEpochId === null) {
+      refuse("installation_epoch_unavailable");
+      return;
+    }
+
+    for (const candidate of requested) {
+      const requestedPath = path.resolve(candidate);
+      const directory = physicalCaptureRootDirectory(requestedPath);
+      if (directory === undefined) {
+        refuse(fs.existsSync(requestedPath) ? "not_a_directory" : "directory_missing", {
+          directory: privatePathReceipt(requestedPath),
+        });
+        return;
+      }
+      const relative = path.relative(resolvedHome, directory);
+      if (relative === "" || relative.startsWith("..") || path.isAbsolute(relative)) {
+        refuse("path_outside_home", { directory: privatePathReceipt(directory) });
+        return;
+      }
+      if (seen.has(directory)) {
+        refuse("duplicate_directory", { directory: relative });
+        return;
+      }
+      const identity = deriveCaptureRootIdentity(machine, source, directory);
+      if (seenIds.has(identity.rootId)) {
+        refuse("duplicate_root_id", { directory: relative, rootId: identity.rootId });
+        return;
+      }
+      seen.add(directory);
+      seenIds.add(identity.rootId);
+      added.push({ ...identity, installationEpochId, source, directory });
+    }
+
+    const beforeBytes = fs.readFileSync(configPath);
+    const next = { ...config, captureRoots: [...configuredRoots, ...added] };
+    let validated: CollectorConfig;
+    try {
+      validated = collectorConfigSchema.parse(next);
+      validateCaptureRoots(validated.captureRoots ?? []);
+    } catch (error) {
+      refuse("capture_root_inventory_rejected", {
+        detail: error instanceof Error ? error.message.slice(0, 200) : "invalid",
+      });
+      return;
+    }
+    // Append-only, proved on the exact object that will be written: the
+    // existing roots keep their bytes and every other enrollment field is the
+    // one already on disk.
+    const withoutRoots = (value: CollectorConfig) => ({ ...value, captureRoots: undefined });
+    if (
+      !isDeepStrictEqual(withoutRoots(validated), withoutRoots(config)) ||
+      !isDeepStrictEqual((validated.captureRoots ?? []).slice(0, configuredRoots.length), configuredRoots)
+    ) {
+      refuse("append_only_violation");
+      return;
+    }
+    const afterBytes = Buffer.from(`${JSON.stringify(validated, null, 2)}\n`);
+    const digest = (value: Buffer) => createHash("sha256").update(value).digest("hex");
+    const plan = {
+      configPath,
+      beforeSha256: digest(beforeBytes),
+      afterSha256: digest(afterBytes),
+      // A config written by an older helper can carry byte-level formatting
+      // this writer would normalize; the receipt discloses it rather than
+      // blocking a repair, because append-only is proved above on the values.
+      configCanonicalBefore: beforeBytes.equals(
+        Buffer.from(`${JSON.stringify(collectorConfigSchema.parse(config), null, 2)}\n`),
+      ),
+      machine,
+      installationEpochId,
+      rootCountBefore: configuredRoots.length,
+      rootCountAfter: (validated.captureRoots ?? []).length,
+      addedRoots: added.map((root) => ({
+        rootId: root.rootId,
+        profileId: root.profileId,
+        installationEpochId: root.installationEpochId,
+        source: root.source,
+        directory: path.relative(resolvedHome, root.directory),
+      })),
+    };
+    if (flag("--dry-run")) {
+      console.log(JSON.stringify({ status: "capture_roots_add_plan", applied: false, ...plan }, null, 2));
+      return;
+    }
+
+    const startedAt = Date.now();
+    const appendedAt = new Date().toISOString();
+    // Stop before the write and start after it, through the same lifecycle
+    // code paths `unload-launch-agent` and `load-launch-agent` use, so a
+    // running collector never reads a half-published inventory. A host with no
+    // LaunchAgent (development) has no service to cycle.
+    let manifest: ReturnType<typeof inspectLaunchAgentManifest> | null = null;
+    try {
+      manifest = inspectLaunchAgentManifest();
+    } catch (error) {
+      // A plist that exists but is not the owned manifest means a service this
+      // command cannot safely cycle; the inventory stays as it is.
+      refuse("launch_agent_manifest_invalid", {
+        detail: error instanceof Error ? error.message.slice(0, 200) : "invalid",
+      });
+      return;
+    }
+    const installed = manifest.ok && manifest.status === "valid";
+    const authority = installed ? launchAgentMutationAuthority() : undefined;
+    let restart: Record<string, unknown> = {
+      attempted: false,
+      skipped: true,
+      reason: "launch_agent_not_installed",
+    };
+    if (installed) {
+      const unload = await executeLaunchAgentUnload(config.port, authority);
+      if (!unload.unloaded) {
+        console.log(JSON.stringify({
+          status: "capture_roots_add_refused",
+          reason: "restart_unload_failed",
+          unload: launchAgentUnloadReceipt(unload),
+        }, null, 2));
+        process.exitCode = 1;
+        return;
+      }
+      restart = { attempted: true, skipped: false, unload: launchAgentUnloadReceipt(unload) };
+    }
+
+    const backupPath = `${configPath}.plimsoll-backup-${appendedAt.replace(/[:.]/g, "-")}`;
+    const backupDescriptor = fs.openSync(backupPath, "wx", 0o600);
+    try {
+      fs.writeFileSync(backupDescriptor, beforeBytes);
+      fs.fsyncSync(backupDescriptor);
+    } finally {
+      fs.closeSync(backupDescriptor);
+    }
+    writeCollectorConfigTransactionally(validated, configPath);
+    const writtenSha256 = digest(fs.readFileSync(configPath));
+
+    // Fence the new roots' provider at the append time so the transcripts and
+    // rollouts already sitting in the new directory are excluded instead of
+    // replayed as today's work. The provider this add did not touch keeps its
+    // own baseline.
+    const buffer = openBuffer(config);
+    let baseline: Record<string, unknown>;
+    try {
+      const baselineSources = [...new Set(added.map((root) => root.source))];
+      const statusFor = () => Object.fromEntries(
+        captureBaselineStatus(buffer.database).sources
+          .filter((row) => baselineSources.includes(row.source))
+          .map((row) => [row.source, { status: row.status, startedAt: row.latestRun?.startedAt ?? null }]),
+      );
+      const before = statusFor();
+      advanceCaptureBaselineEnrollment(buffer.database, appendedAt, baselineSources);
+      baseline = { seededAt: appendedAt, sources: baselineSources, before, after: statusFor() };
+    } finally {
+      buffer.close();
+    }
+
+    if (restart.attempted) {
+      const load = await loadVisibleLaunchAgent(manifest.plistPath, config.port, false, authority);
+      const connectivity = await checkCollectorConnectivity(
+        config.port,
+        readLocalIngestAuth(collectorHome())?.managementRead,
+      );
+      const pidRead = readCollectorPidFile(collectorLogPath("collector.pid"), LAUNCH_AGENT_LABEL);
+      const pidRecord = pidRead.kind === "current" ? pidRead.record : null;
+      restart = {
+        ...restart,
+        load,
+        daemon: {
+          reachable: connectivity.reachable,
+          processLive: pidRecord ? processIdentityIsLive(pidRecord) : false,
+          runtimeIdentityMatches: pidRecord
+            ? runtimeIdentityMatches(pidRecord, connectivity.runtimeIdentity)
+            : false,
+          homeIdentityHash: connectivity.homeIdentityHash,
+          homeMatches: connectivity.homeIdentityHash === null
+            ? null
+            : connectivity.homeIdentityHash === collectorHomeIdentityHash(collectorHome()),
+        },
+      };
+    }
+
+    const receipt = {
+      status: "capture_roots_added",
+      applied: true,
+      version: PLIMSOLL_VERSION,
+      appendedAt,
+      durationMs: Date.now() - startedAt,
+      ...plan,
+      writtenSha256,
+      backupPath,
+      baseline,
+      restart,
+    };
+    const receiptsDirectory = path.join(collectorHome(), "receipts");
+    fs.mkdirSync(receiptsDirectory, { recursive: true, mode: 0o700 });
+    const receiptPath = path.join(
+      receiptsDirectory,
+      `capture-roots-add-${appendedAt.replace(/[:.]/g, "-")}.json`,
+    );
+    fs.writeFileSync(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`, { mode: 0o600 });
+    console.log(JSON.stringify({ ...receipt, receiptPath }, null, 2));
+    if (writtenSha256 !== plan.afterSha256) process.exitCode = 1;
     return;
   }
 

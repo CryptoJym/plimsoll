@@ -156,6 +156,43 @@ fails `setup`, whose own declared targets still decide the exit code.
 `telemetry.codexProfiles` and flags an unmanaged or unreadable one with
 `codex_profile_config_unmanaged`, again without changing the readiness verdict.
 
+Telemetry `setup` manages a seat's *config*; what the collector *captures* from
+is its capture-root inventory (`collector.config.json` → `captureRoots[]`),
+which is minted once, at enrollment. A host that gains a native root later — a
+new Claude seat's `projects/`, a new Codex profile's `sessions/`, or a
+`~/.claude/projects` an older enrollment never registered — keeps emitting
+spans while its transcripts and rollouts go uncaptured. `capture-roots` closes
+that gap without touching enrollment:
+
+```bash
+# what native roots exist under $HOME, and which are already registered
+plimsoll capture-roots discover --json     # state: registered | candidate | missing
+
+# preview, then append one (repeat --directory to add several at once)
+plimsoll capture-roots add --source claude_code --directory ~/.claude/projects --dry-run
+plimsoll capture-roots add --source claude_code --directory ~/.claude/projects
+```
+
+`add` is append-only. It derives the new root's identity exactly as the
+enrolled roots' identities derive, and refuses — with a reason code and no
+write — a duplicate directory or id, a path that is not a physical directory,
+a path outside `$HOME`, an unknown source, or a config whose existing roots do
+not reproduce their own ids (`identity_derivation_mismatch`). The identity is
+derived from the host's fleet machine label, which is recovered from the roots
+already configured; pass `--machine LABEL` when the host has none yet. A real
+run stops the collector through the same path as `unload-launch-agent`, writes
+the config transactionally beside a timestamped backup, fences the new root's
+provider capture baseline at the append time so the transcripts already sitting
+in that directory are excluded rather than replayed as today's work, starts the
+collector again and verifies it, then writes a receipt (before/after config
+sha256, the roots added, baseline timestamps, restart result) under
+`<collector home>/receipts/`. Without an installed LaunchAgent the restart is
+skipped and the receipt says so. Existing roots, the installation epoch and
+every other enrollment field are never changed. `plimsoll doctor --read-only
+--json` reports what is still unregistered under
+`captureRoots.unregisteredCandidates` — like the seat diagnostic, it does not
+change doctor's readiness verdict.
+
 The Grok and Codex hook commands carry no secret: each reads its producer
 token from a mode-0600 `plimsoll.headers` file beside its own config
 (`${GROK_HOME:-~/.grok}/hooks/plimsoll.headers` and `~/.codex/plimsoll.headers`),

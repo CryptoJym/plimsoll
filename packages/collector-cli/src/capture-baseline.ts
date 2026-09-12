@@ -586,13 +586,23 @@ export function captureBaselineStatus(database: Database.Database): CaptureBasel
 /** A new native enrollment extends the metadata-only exclusion boundary.
  * Retain generation receipts, cursors and pending metadata; restart of the
  * same epoch does not call this. Absent provider baselines stay absent so an
- * explicitly disabled provider can still establish its empty fence. */
-export function advanceCaptureBaselineEnrollment(database: Database.Database, startedAt: string): void {
+ * explicitly disabled provider can still establish its empty fence.
+ * `sources` scopes the advance to the providers the enrollment actually
+ * changed — registering one new capture root (bead eco-6hoxj.53) must not
+ * re-fence the provider it did not touch. Omitted means every provider, which
+ * is what a workspace/epoch change means. */
+export function advanceCaptureBaselineEnrollment(
+  database: Database.Database,
+  startedAt: string,
+  sources?: readonly HistoryCoverageSource[],
+): void {
   ensureCaptureBaselineSchema(database);
   if (!validTimestamp(startedAt)) throw new Error("capture_baseline_invalid_enrollment_cutoff");
+  if (sources && sources.length === 0) return;
+  const scope = sources ? ` where source in (${sources.map(() => "?").join(",")})` : "";
   database.prepare(`update ${STATE_TABLE} set
     status = case when status = 'complete' then 'in_progress' else status end,
-    started_at = ?, updated_at = ?, completed_at = null`).run(startedAt, startedAt);
+    started_at = ?, updated_at = ?, completed_at = null${scope}`).run(startedAt, startedAt, ...(sources ?? []));
 }
 
 export function beginAutomaticCaptureBaseline(
