@@ -17,10 +17,20 @@
  *   b) command: `setup --dry-run`, `setup --yes` and `doctor --read-only --json`
  *      report the same seats — doctor names the unmanaged seat before setup and
  *      none after, the settings-less seat is skipped and reported and is never
- *      created, and a second `setup --yes` is a no-op.
+ *      created, and a second `setup --yes` is a no-op;
+ *   c) symlinks: a seat directory reached through a link is managed like a real
+ *      one, a dangling link is reported `skipped`, and a link that resolves out
+ *      of the declared fixture root is a seat only in as much as the guard lets
+ *      it be — the apply is refused on the resolved path;
+ *   d) ownership of the exit code: a seat file Plimsoll does not own (malformed
+ *      JSON, mode 0000) is reported refused but never fails `setup`, whose six
+ *      declared targets still apply, and doctor names such a seat `unreadable`
+ *      without printing a byte of it.
  *
- * Every path is synthetic and below a per-run fixture root. Tokens are fixture
- * credentials minted into the fixture Plimsoll home; nothing here prints one.
+ * Every path is synthetic and below a per-run sandbox. The simulated foreign
+ * home in (c) sits beside the declared fixture root on purpose: it is what the
+ * guard has to refuse. Tokens are fixture credentials minted into the fixture
+ * Plimsoll home; nothing here prints one.
  */
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
@@ -49,6 +59,16 @@ const checks: Check[] = [];
 const FLEET_SEAT = "fleet-hooks-only-seat";
 const MANAGED_SEAT = "already-managed-seat";
 const BARE_SEAT = "no-settings-seat";
+const LINKED_SEAT = "relocated-link-seat";
+const DANGLING_SEAT = "dangling-link-seat";
+const FOREIGN_SEAT = "foreign-home-link-seat";
+const MALFORMED_SEAT = "malformed-json-seat";
+const UNREADABLE_SEAT = "mode-0000-seat";
+/** Markers that must never reach a receipt; both live in unreadable seat files. */
+const MALFORMED_MARKER = "synthetic-malformed-seat-marker";
+const UNREADABLE_MARKER = "synthetic-unreadable-seat-marker";
+/** The six targets Plimsoll declares; only these may decide `setup`'s exit code. */
+const OWNED_TARGETS = ["claude", "gemini", "grokHeaders", "grok", "codexHeaders", "codex"] as const;
 
 function check(name: string, condition: unknown, detail: Record<string, unknown> = {}) {
   assert.ok(condition, `${name}: ${JSON.stringify(detail)}`);
@@ -482,14 +502,245 @@ function commandChecks(fixtureRoot: string) {
   );
 }
 
+/**
+ * A fixture home wired for the CLI: fixture collector config, fixture producer
+ * credentials, and the environment overlay every child run gets. Used by the
+ * symlink and unowned-seat halves below; the original command half keeps its
+ * own inline setup.
+ */
+function commandHome(fixtureRoot: string, name: string, port: number) {
+  const home = path.join(fixtureRoot, name);
+  const plimsollHome = path.join(home, ".plimsoll");
+  const seatsRoot = path.join(home, ".claude-seats");
+  fs.mkdirSync(plimsollHome, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(plimsollHome, "collector.config.json"),
+    `${JSON.stringify({ port }, null, 2)}\n`, { mode: 0o600 });
+  const auth = loadOrCreateLocalIngestAuth(plimsollHome);
+  const generated = generateClaudeCodeSettings({
+    repoRoot: "/synthetic/plimsoll/source",
+    port,
+    dataMode: "metadata",
+    claudeCodeProducerToken: auth.claudeCodeProducer,
+  });
+  const env = {
+    HOME: home,
+    USERPROFILE: home,
+    PLIMSOLL_HOME: plimsollHome,
+    CODEX_HOME: path.join(home, ".codex"),
+    GROK_HOME: path.join(home, ".grok"),
+    CLAUDE_CONFIG_DIR: path.join(home, ".claude"),
+    PLIMSOLL_FIXTURE_ROOT: fixtureRoot,
+  };
+  return { home, plimsollHome, seatsRoot, auth, generated, env };
+}
+
+/** Every declared target's entry in a setup summary, by target name. */
+function ownedStatuses(targets: Record<string, Record<string, unknown> | undefined>) {
+  return Object.fromEntries(OWNED_TARGETS.map((name) => [name, targets[name]?.status ?? "absent"]));
+}
+
+/**
+ * Symlinked seats (review r1, finding 2). readdirSync does not follow links, so
+ * a relocated seat used to be invisible to setup and doctor alike. Discovery now
+ * resolves the link — which also hands the managed-config guard the real target,
+ * so a link out of the fixture root is refused on the path it actually names.
+ */
+function symlinkSeatChecks(sandbox: string, fixtureRoot: string) {
+  const { seatsRoot, generated, env } = commandHome(fixtureRoot, "symlink-home", 49150);
+  const relocated = path.join(fixtureRoot, "relocated-seats");
+  // A seat the tooling moved to another directory and linked into place.
+  const linkedTarget = path.join(relocated, "linked-target");
+  writeSeatSettings(relocated, "linked-target", fleetSeatDocument());
+  // "Another user's home": a real directory beside the declared fixture root,
+  // which is exactly what the guard exists to refuse.
+  const foreignHome = path.join(sandbox, "foreign-home");
+  const foreignTarget = path.join(foreignHome, ".claude-seats", FOREIGN_SEAT);
+  writeSeatSettings(path.join(foreignHome, ".claude-seats"), FOREIGN_SEAT, fleetSeatDocument());
+  const danglingTarget = path.join(relocated, "never-created-target");
+
+  fs.mkdirSync(seatsRoot, { recursive: true, mode: 0o700 });
+  writeSeatSettings(seatsRoot, MANAGED_SEAT, managedSeatDocument(generated));
+  fs.symlinkSync(linkedTarget, path.join(seatsRoot, LINKED_SEAT));
+  fs.symlinkSync(foreignTarget, path.join(seatsRoot, FOREIGN_SEAT));
+  fs.symlinkSync(danglingTarget, path.join(seatsRoot, DANGLING_SEAT));
+  // A link to a file is not a seat, exactly like the plain README file.
+  fs.writeFileSync(path.join(seatsRoot, "README"), "synthetic\n", { mode: 0o600 });
+  fs.symlinkSync(path.join(seatsRoot, "README"), path.join(seatsRoot, "readme-link"));
+
+  const discovered = discoverClaudeSeats(path.dirname(seatsRoot));
+  const seat = (slug: string) => discovered.find((entry) => entry.slug === slug);
+  check(
+    "a_symlinked_seat_directory_is_discovered_at_its_resolved_path",
+    discovered.map((entry) => entry.slug).join(",") ===
+      [MANAGED_SEAT, LINKED_SEAT, FOREIGN_SEAT, DANGLING_SEAT].sort().join(",") &&
+      seat(LINKED_SEAT)?.path === path.join(fs.realpathSync(linkedTarget), "settings.json") &&
+      seat(LINKED_SEAT)?.hasSettings === true &&
+      seat(FOREIGN_SEAT)?.path === path.join(fs.realpathSync(foreignTarget), "settings.json") &&
+      seat(DANGLING_SEAT)?.hasSettings === false,
+    {
+      seats: discovered.map((entry) => ({ slug: entry.slug, hasSettings: entry.hasSettings })),
+      notSeats: ["README", "readme-link"],
+    },
+  );
+
+  const linkedFile = seat(LINKED_SEAT)!.path;
+  const foreignFile = seat(FOREIGN_SEAT)!.path;
+  const foreignBefore = digestOf(foreignFile);
+  const applyRun = runCli(["setup", "--yes"], env);
+  const applied = lastJson(applyRun.stdout) as Record<string, Record<string, unknown> | undefined>;
+  check(
+    "a_symlinked_seat_is_managed_like_a_real_seat_directory",
+    applyRun.code === 0 &&
+      applied[`claudeSeat[${LINKED_SEAT}]`]?.status === "applied" &&
+      applied[`claudeSeat[${LINKED_SEAT}]`]?.path === linkedFile &&
+      isDeepStrictEqual(readJson(linkedFile), readJson(path.join(seatsRoot, MANAGED_SEAT, "settings.json"))) &&
+      OWNED_TARGETS.every((name) => applied[name]?.status === "applied"),
+    { linked: applied[`claudeSeat[${LINKED_SEAT}]`]?.status, owned: ownedStatuses(applied) },
+  );
+  check(
+    "a_seat_link_out_of_the_fixture_root_is_refused_on_its_resolved_path",
+    applyRun.code === 0 &&
+      applied[`claudeSeat[${FOREIGN_SEAT}]`]?.status === "refused" &&
+      String(applied[`claudeSeat[${FOREIGN_SEAT}]`]?.reason ?? "")
+        .includes("MANAGED_CONFIG_TARGET_OUTSIDE_FIXTURE_ROOT") &&
+      String(applied[`claudeSeat[${FOREIGN_SEAT}]`]?.reason ?? "").includes(foreignFile) &&
+      digestOf(foreignFile) === foreignBefore,
+    {
+      status: applied[`claudeSeat[${FOREIGN_SEAT}]`]?.status,
+      resolvedTargetUnchanged: digestOf(foreignFile) === foreignBefore,
+    },
+  );
+
+  const doctorRun = runCli(["doctor", "--read-only", "--json"], env);
+  const seats = (lastJson(doctorRun.stdout).telemetry as Record<string, unknown>)
+    .claudeSeats as Array<Record<string, unknown>>;
+  const reported = (slug: string) => seats.find((entry) => entry.slug === slug);
+  check(
+    "a_dangling_seat_link_is_reported_skipped_and_never_created",
+    reported(DANGLING_SEAT)?.status === "skipped" &&
+      reported(DANGLING_SEAT)?.diagnostic === undefined &&
+      !fs.existsSync(danglingTarget) &&
+      reported(LINKED_SEAT)?.status === "valid" &&
+      reported(LINKED_SEAT)?.diagnostic === undefined,
+    {
+      seats: seats.map((entry) => ({ slug: entry.slug, status: entry.status })),
+      danglingTargetCreated: fs.existsSync(danglingTarget),
+    },
+  );
+}
+
+/**
+ * Seat files Plimsoll does not own (review r1, finding 1). A malformed or
+ * unreadable seat settings.json belongs to the seat tooling: `setup` reports the
+ * refusal and keeps going, its own six targets decide the exit code, and doctor
+ * is where the seat shows up — as `unreadable`, never as bytes.
+ */
+function unownedSeatChecks(fixtureRoot: string) {
+  const { seatsRoot, generated, auth, env } = commandHome(fixtureRoot, "unowned-home", 49151);
+  const fleetSeatFile = writeSeatSettings(seatsRoot, FLEET_SEAT, fleetSeatDocument());
+  const malformedFile = path.join(seatsRoot, MALFORMED_SEAT, "settings.json");
+  fs.mkdirSync(path.dirname(malformedFile), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(malformedFile, `{ ${MALFORMED_MARKER} this is not json `, { mode: 0o600 });
+  const unreadableFile = writeSeatSettings(seatsRoot, UNREADABLE_SEAT, { marker: UNREADABLE_MARKER });
+  fs.chmodSync(unreadableFile, 0o000);
+  const malformedBefore = digestOf(malformedFile);
+
+  const malformedTarget = `claudeSeat[${MALFORMED_SEAT}]`;
+  const unreadableTarget = `claudeSeat[${UNREADABLE_SEAT}]`;
+  const dryRun = runCli(["setup", "--dry-run"], env);
+  const dryTargets = lastJson(dryRun.stdout).targets as Record<string, Record<string, unknown> | undefined>;
+  check(
+    "a_refused_seat_never_sets_the_exit_code_of_setup_dry_run",
+    dryRun.code === 0 &&
+      dryTargets[malformedTarget]?.status === "refused" &&
+      String(dryTargets[malformedTarget]?.reason ?? "").includes("CLAUDE_CONFIG_MALFORMED_JSON") &&
+      dryTargets[unreadableTarget]?.status === "refused" &&
+      dryTargets[`claudeSeat[${FLEET_SEAT}]`]?.status === "would_apply" &&
+      OWNED_TARGETS.every((name) => dryTargets[name]?.status === "would_apply"),
+    {
+      code: dryRun.code,
+      refused: [malformedTarget, unreadableTarget].map((name) => dryTargets[name]?.status),
+      owned: ownedStatuses(dryTargets),
+    },
+  );
+
+  const applyRun = runCli(["setup", "--yes"], env);
+  const applied = lastJson(applyRun.stdout) as Record<string, Record<string, unknown> | undefined>;
+  check(
+    "a_refused_seat_never_sets_the_exit_code_of_setup_yes",
+    applyRun.code === 0 &&
+      (applied.status as unknown) === "setup_applied" &&
+      applied[malformedTarget]?.status === "refused" &&
+      applied[unreadableTarget]?.status === "refused" &&
+      applied[`claudeSeat[${FLEET_SEAT}]`]?.status === "applied" &&
+      OWNED_TARGETS.every((name) => applied[name]?.status === "applied") &&
+      digestOf(malformedFile) === malformedBefore &&
+      (fs.statSync(unreadableFile).mode & 0o777) === 0o000,
+    {
+      code: applyRun.code,
+      owned: ownedStatuses(applied),
+      seatBytesStable: digestOf(malformedFile) === malformedBefore,
+    },
+  );
+
+  const doctorRun = runCli(["doctor", "--read-only", "--json"], env);
+  const seats = (lastJson(doctorRun.stdout).telemetry as Record<string, unknown>)
+    .claudeSeats as Array<Record<string, unknown>>;
+  const reported = (slug: string) => seats.find((entry) => entry.slug === slug);
+  check(
+    "doctor_reports_an_unreadable_seat_without_printing_a_byte_of_it",
+    reported(MALFORMED_SEAT)?.status === "unreadable" &&
+      reported(MALFORMED_SEAT)?.diagnostic === "claude_seat_settings_unmanaged" &&
+      reported(UNREADABLE_SEAT)?.status === "unreadable" &&
+      reported(UNREADABLE_SEAT)?.diagnostic === "claude_seat_settings_unmanaged" &&
+      isDeepStrictEqual(reported(MALFORMED_SEAT)?.missing, ["readable JSON"]) &&
+      reported(FLEET_SEAT)?.status === "valid" &&
+      !doctorRun.stdout.includes(MALFORMED_MARKER) &&
+      !doctorRun.stdout.includes(UNREADABLE_MARKER) &&
+      !doctorRun.stdout.includes(auth.claudeCodeProducer) &&
+      !doctorRun.stdout.includes(generated.env.OTEL_EXPORTER_OTLP_HEADERS),
+    {
+      seats: seats.map((entry) => ({ slug: entry.slug, status: entry.status })),
+      markersPrinted: false,
+      appliedSeat: path.basename(path.dirname(fleetSeatFile)),
+    },
+  );
+  // Leave the sandbox removable: a 0000 file needs no chmod to unlink, but the
+  // proof should not depend on that.
+  fs.chmodSync(unreadableFile, 0o600);
+
+  // The other half of the same rule: a target Plimsoll does declare still fails
+  // the run. Same malformed document, this time in ~/.claude/settings.json.
+  const owned = commandHome(fixtureRoot, "owned-refusal-home", 49152);
+  const ownedClaudeFile = path.join(owned.home, ".claude", "settings.json");
+  fs.mkdirSync(path.dirname(ownedClaudeFile), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(ownedClaudeFile, `{ ${MALFORMED_MARKER} this is not json `, { mode: 0o600 });
+  const ownedDryRun = runCli(["setup", "--dry-run"], owned.env);
+  const ownedTargets = lastJson(ownedDryRun.stdout).targets as Record<string, Record<string, unknown> | undefined>;
+  check(
+    "a_refused_owned_target_still_sets_the_exit_code",
+    ownedDryRun.code === 1 &&
+      ownedTargets.claude?.status === "refused" &&
+      String(ownedTargets.claude?.reason ?? "").includes("CLAUDE_CONFIG_MALFORMED_JSON"),
+    { code: ownedDryRun.code, claude: ownedTargets.claude?.status },
+  );
+}
+
 function main() {
   const sandbox = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-claude-seats-proof-"));
   // Declare the fixture root before the first apply: every seat below lives
-  // inside it and the guard refuses anything that does not.
-  const fixture = useFixtureRoot(sandbox, { home: path.join(sandbox, "must-remain-absent-operator-home") });
+  // inside it and the guard refuses anything that does not. The root is a child
+  // of the sandbox so the symlink half can put a simulated foreign home beside
+  // it — outside the root, still disposable with everything else.
+  const fixtureRoot = path.join(sandbox, "fixture");
+  const fixture = useFixtureRoot(fixtureRoot, {
+    home: path.join(fixtureRoot, "must-remain-absent-operator-home"),
+  });
   try {
     libraryChecks(fixture.root);
     commandChecks(fixture.root);
+    symlinkSeatChecks(sandbox, fixture.root);
+    unownedSeatChecks(fixture.root);
     check(
       "the_fixture_home_the_guard_protects_was_never_created",
       !fs.existsSync(fixture.home),

@@ -31,20 +31,43 @@ export function claudeSeatsRoot(home: string) {
 
 /** Every seat directory under `<home>/.claude-seats`, slug-ordered. */
 export function discoverClaudeSeats(home: string): ClaudeSeat[] {
+  const root = claudeSeatsRoot(home);
   let entries: fs.Dirent[];
   try {
-    entries = fs.readdirSync(claudeSeatsRoot(home), { withFileTypes: true });
+    entries = fs.readdirSync(root, { withFileTypes: true });
   } catch {
     // No seats on this host: not an error, there is simply nothing to manage.
     return [];
   }
   const seats: ClaudeSeat[] = [];
   for (const entry of entries) {
-    if (!entry.isDirectory()) continue;
-    const file = path.join(claudeSeatsRoot(home), entry.name, "settings.json");
+    const directory = seatDirectory(root, entry);
+    if (directory === undefined) continue;
+    const file = path.join(directory, "settings.json");
     seats.push({ slug: entry.name, path: file, hasSettings: isExistingFile(file) });
   }
   return seats.sort((left, right) => (left.slug < right.slug ? -1 : left.slug > right.slug ? 1 : 0));
+}
+
+/**
+ * The directory a seats-root entry names, or undefined when the entry is not a
+ * seat. readdirSync does not follow links, so a seat the tooling relocated to
+ * shared storage and symlinked into ~/.claude-seats would otherwise be
+ * invisible to both setup and doctor — the exact gap this bead exists to close.
+ * A link is reported at its resolved path so the managed-config guard and every
+ * receipt name the file actually written rather than the link; a dangling link
+ * stays visible as a seat without settings.json instead of disappearing.
+ */
+function seatDirectory(root: string, entry: fs.Dirent) {
+  const entryPath = path.join(root, entry.name);
+  if (entry.isDirectory()) return entryPath;
+  if (!entry.isSymbolicLink()) return undefined;
+  try {
+    const resolved = fs.realpathSync(entryPath);
+    return fs.statSync(resolved).isDirectory() ? resolved : undefined;
+  } catch {
+    return entryPath;
+  }
 }
 
 function isExistingFile(file: string) {

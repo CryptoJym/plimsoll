@@ -2683,6 +2683,8 @@ async function main() {
     type SetupTarget = {
       name: SetupTargetName;
       path: string;
+      /** True for a target found on disk rather than declared by Plimsoll. */
+      discovered?: true;
       run: (options: typeof toolOptions, dryRun: boolean) => ReturnType<typeof applyCodexConfig>;
     };
     type SetupTargetState = {
@@ -2707,6 +2709,7 @@ async function main() {
       ...claudeSeats.map((seat): SetupTarget => ({
         name: `claudeSeat[${seat.slug}]`,
         path: seat.path,
+        discovered: true,
         run: (options, preview) =>
           applyClaudeSettings(seat.path, generateClaudeCodeSettings(options), {
             dryRun: preview,
@@ -2802,17 +2805,26 @@ async function main() {
             ...(changedStatus === "applied" ? { backup: state.plan?.backupPath ?? null } : {}),
           },
     ]));
-    const hasRefusal = planned.some((state) => Boolean(state.refusal));
+    // A discovered target is not Plimsoll's to own: the seat tooling writes
+    // ~/.claude-seats/<slug>/settings.json, so a seat file that is malformed or
+    // unreadable is reported in the JSON like any other refusal but never sets
+    // the exit code and never counts as a failed target. An installer or CI step
+    // that runs `plimsoll setup --yes` must not fail because another tool left
+    // one of N seats half-written; the six declared targets keep deciding the
+    // outcome exactly as before.
+    const ownedRefusal = (states: SetupTargetState[]) =>
+      states.some((state) => Boolean(state.refusal) && !state.target.discovered);
+    const hasOwnedRefusal = ownedRefusal(planned);
     const hasChange = planned.some((state) => !state.refusal && state.plan?.changed);
     if (dryRun) {
       console.log(JSON.stringify({ status: "setup_dry_run", targets: summarize(planned, "would_apply") }));
-      if (hasRefusal) process.exitCode = 1;
+      if (hasOwnedRefusal) process.exitCode = 1;
       return;
     }
     if (!hasChange) {
-      if (!hasRefusal && configRead?.status === "missing") loadCollectorConfig();
+      if (!hasOwnedRefusal && configRead?.status === "missing") loadCollectorConfig();
       console.log(JSON.stringify({ status: "setup_noop", targets: summarize(planned, "applied") }));
-      if (hasRefusal) process.exitCode = 1;
+      if (hasOwnedRefusal) process.exitCode = 1;
       return;
     }
     if (!yes) {
@@ -2882,7 +2894,7 @@ async function main() {
         2,
       ),
     );
-    if (applied.some((state) => Boolean(state.refusal))) process.exitCode = 1;
+    if (ownedRefusal(applied)) process.exitCode = 1;
     return;
   }
 
@@ -3143,7 +3155,11 @@ async function main() {
       return {
         slug: seat.slug,
         path: seat.path,
-        status: read.status,
+        // A seat file Plimsoll cannot parse or read is seat-tooling state, and
+        // `setup` deliberately does not fail on it, so doctor is where it has to
+        // show up: named `unreadable`, with the same coverage diagnostic and
+        // still never a value.
+        status: read.status === "invalid" ? ("unreadable" as const) : read.status,
         missing: read.missing,
         ...(read.ok ? {} : { diagnostic: "claude_seat_settings_unmanaged" }),
       };
