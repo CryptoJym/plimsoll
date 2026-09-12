@@ -304,6 +304,51 @@ function maxRecordBody(cwdSentinel: string) {
   });
 }
 
+// The 0.7.15 Studio0 readback: a full Codex span export is 512 spans plus a
+// handful of span events (1–13 observed), ~1.2 MB decoded. Counting the nested
+// events as records rejected every such batch with 413.
+const CODEX_SPAN_EVENTS_IN_FULL_EXPORT = 13;
+
+function codexFullSpanExportBody() {
+  return JSON.stringify({
+    resourceSpans: [{
+      resource: {
+        attributes: [
+          { key: "service.name", value: { stringValue: "codex-cli" } },
+          { key: "service.version", value: { stringValue: "0.148.0" } },
+          { key: "env", value: { stringValue: "plimsoll-local" } },
+          { key: "host.name", value: { stringValue: "synthetic-canary" } },
+        ],
+      },
+      scopeSpans: [{
+        scope: { name: "codex_otel" },
+        spans: Array.from({ length: CODEX_OTEL_EXPORT_BATCH_RECORDS }, (_, index) => ({
+          traceId: (0x1000_0000_0000_0000n + BigInt(index)).toString(16).padStart(32, "0"),
+          spanId: (0x2000_0000n + BigInt(index)).toString(16).padStart(16, "0"),
+          name: index % 2 === 0 ? "codex.tool_call" : "codex.model_request",
+          kind: 1,
+          startTimeUnixNano: String(1_760_000_000_000_000_000n + BigInt(index) * 1_000_000n),
+          endTimeUnixNano: String(1_760_000_000_500_000_000n + BigInt(index) * 1_000_000n),
+          attributes: [
+            { key: "conversation.id", value: { stringValue: "synthetic-conversation" } },
+            { key: "gen_ai.usage.input_tokens", value: { intValue: "3" } },
+            { key: "gen_ai.usage.output_tokens", value: { intValue: "5" } },
+          ],
+          ...(index < CODEX_SPAN_EVENTS_IN_FULL_EXPORT
+            ? {
+              events: [{
+                timeUnixNano: String(1_760_000_000_250_000_000n + BigInt(index) * 1_000_000n),
+                name: "codex.tool_result",
+                attributes: [{ key: "status", value: { stringValue: "ok" } }],
+              }],
+            }
+            : {}),
+        })),
+      }],
+    }],
+  });
+}
+
 function representativeCodexBatchBody() {
   return JSON.stringify({
     resourceLogs: [{
@@ -711,7 +756,9 @@ async function main() {
     );
 
     const changesBeforeHighRecords = totalChanges(buffer);
-    const highLogRecords = LOCAL_HTTP_LIMITS.otlpRecords - 112;
+    // Top-level records only: 413 log records + 100 spans = limit + 1. The 13
+    // nested span events are reported in the diagnostic but do not count.
+    const highLogRecords = LOCAL_HTTP_LIMITS.otlpRecords - 99;
     const highRecordEnvelope = {
       resourceLogs: [{
         scopeLogs: [{ logRecords: Array.from({ length: highLogRecords }, () => ({})) }],
@@ -765,6 +812,34 @@ async function main() {
         SENTINELS.every((sentinel) => !JSON.stringify(recordLimitDiagnostic).includes(sentinel)) &&
         Buffer.byteLength(JSON.stringify(recordLimitDiagnostic)) <= 384,
       { recordLimitDiagnostic, expectedDecodedBytes: Buffer.byteLength(highRecordBody) },
+    );
+
+    const changesBeforeHighNested = totalChanges(buffer);
+    const highNestedEnvelope = {
+      resourceSpans: [{
+        scopeSpans: [{
+          spans: [
+            { events: Array.from({ length: LOCAL_HTTP_LIMITS.otlpNestedRecords + 1 }, () => ({})) },
+          ],
+        }],
+      }],
+    };
+    const highNestedBody = JSON.stringify(highNestedEnvelope);
+    const highNested = await request(port, "/v1/traces", highNestedBody, {
+      "x-plimsoll-source": "codex",
+    });
+    check(
+      "otlp_nested_record_cardinality_rejected_before_write",
+      stableRejection(highNested, "otlp_record_limit_exceeded", 413) &&
+        highNested.elapsedMs < 50 &&
+        totalChanges(buffer) === changesBeforeHighNested &&
+        buffer.repoContextQueueStatus().queued === 0,
+      {
+        status: highNested.status,
+        reason: highNested.body.reason,
+        elapsedMs: highNested.elapsedMs,
+        nestedRecords: LOCAL_HTTP_LIMITS.otlpNestedRecords + 1,
+      },
     );
 
     const highAttributeEnvelope = {
@@ -877,6 +952,7 @@ async function main() {
       deep,
       highNodes,
       highRecords,
+      highNested,
       highAttributes,
       deadline,
     ]) {
@@ -1068,6 +1144,32 @@ async function main() {
         status: representativeCodexResult.status,
         reason: representativeCodexResult.body.reason,
         elapsedMs: Math.round(representativeCodexResult.elapsedMs * 100) / 100,
+      },
+    );
+
+    const fullSpanBatch = codexFullSpanExportBody();
+    const fullSpanBatchResult = await request(
+      port,
+      "/v1/traces",
+      fullSpanBatch,
+      { "x-plimsoll-source": "codex" },
+    );
+    check(
+      "codex_full_512_span_export_with_span_events_is_admitted",
+      Buffer.byteLength(fullSpanBatch) <= LOCAL_HTTP_LIMITS.decodedBodyBytes &&
+        fullSpanBatchResult.status === 202 &&
+        fullSpanBatchResult.body.accepted === true &&
+        fullSpanBatchResult.body.recordCount === CODEX_OTEL_EXPORT_BATCH_RECORDS &&
+        fullSpanBatchResult.elapsedMs < LOCAL_HTTP_LIMITS.requestDeadlineMs,
+      {
+        spans: CODEX_OTEL_EXPORT_BATCH_RECORDS,
+        spanEvents: CODEX_SPAN_EVENTS_IN_FULL_EXPORT,
+        bodyBytes: Buffer.byteLength(fullSpanBatch),
+        status: fullSpanBatchResult.status,
+        reason: fullSpanBatchResult.body.reason,
+        events: fullSpanBatchResult.body.events,
+        recordCount: fullSpanBatchResult.body.recordCount,
+        elapsedMs: Math.round(fullSpanBatchResult.elapsedMs * 100) / 100,
       },
     );
 

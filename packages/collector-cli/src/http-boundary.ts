@@ -19,9 +19,17 @@ export const LOCAL_HTTP_LIMITS = Object.freeze({
   // path remains comfortably inside the fixed 1.5 s request deadline on the
   // supported canary hardware. Limit + 1 is rejected before normalization.
   // Codex's OpenTelemetry SDK can export 512 log records or spans in one HTTP
-  // request. Durable appends remain chunked below; the independent 128-entry
-  // deferred-context handoff window stays bounded in LocalEventBuffer.
+  // request. Only top-level records (logRecords, spans, metrics, dataPoints)
+  // count here: a full 512-span export routinely carries a few span events,
+  // and counting those nested arrays rejected 513–525-record Codex batches
+  // (~5.6 per minute on the 0.7.15 Studio0 readback). Durable appends remain
+  // chunked below; the independent 128-entry deferred-context handoff window
+  // stays bounded in LocalEventBuffer.
   otlpRecords: 512,
+  // Nested arrays (span events, span links, metric exemplars) get their own
+  // ceiling so a record-count-conformant batch cannot smuggle unbounded work;
+  // the per-container and total attribute ceilings below still bound each one.
+  otlpNestedRecords: 4_096,
   otlpAttributesPerContainer: 128,
   otlpAttributesTotal: 16_384,
   requestDeadlineMs: 1_500,
@@ -75,14 +83,16 @@ export const HTTP_BOUNDARY_REASONS = [
 
 export type HttpBoundaryReason = (typeof HTTP_BOUNDARY_REASONS)[number];
 
-export const OTLP_RECORD_ARRAY_KEYS = [
+export const OTLP_TOP_LEVEL_RECORD_ARRAY_KEYS = [
   "logRecords",
   "spans",
   "metrics",
   "dataPoints",
-  "events",
-  "links",
-  "exemplars",
+] as const;
+export const OTLP_NESTED_RECORD_ARRAY_KEYS = ["events", "links", "exemplars"] as const;
+export const OTLP_RECORD_ARRAY_KEYS = [
+  ...OTLP_TOP_LEVEL_RECORD_ARRAY_KEYS,
+  ...OTLP_NESTED_RECORD_ARRAY_KEYS,
 ] as const;
 export type OtlpRecordArrayKey = (typeof OTLP_RECORD_ARRAY_KEYS)[number];
 export type OtlpRecordRejectionDiagnostic = {
@@ -436,6 +446,7 @@ export function parseBoundedJson(text: string) {
 const RESOURCE_ARRAYS = new Set(["resourceLogs", "resourceSpans", "resourceMetrics"]);
 const SCOPE_ARRAYS = new Set(["scopeLogs", "scopeSpans", "scopeMetrics"]);
 const RECORD_ARRAYS = new Set<string>(OTLP_RECORD_ARRAY_KEYS);
+const NESTED_RECORD_ARRAYS = new Set<string>(OTLP_NESTED_RECORD_ARRAY_KEYS);
 
 export function assertBoundedJsonNodes(root: unknown) {
   const stack: unknown[] = [root];
@@ -461,6 +472,7 @@ export function assertBoundedOtlpCardinality(root: unknown, decodedBytes: number
   let resources = 0;
   let scopes = 0;
   let records = 0;
+  let nestedRecords = 0;
   const recordArrayCounts: Record<OtlpRecordArrayKey, number> = {
     logRecords: 0,
     spans: 0,
@@ -495,7 +507,8 @@ export function assertBoundedOtlpCardinality(root: unknown, decodedBytes: number
           }
         }
         if (RECORD_ARRAYS.has(key)) {
-          records += entry.length;
+          if (NESTED_RECORD_ARRAYS.has(key)) nestedRecords += entry.length;
+          else records += entry.length;
           recordArrayCounts[key as OtlpRecordArrayKey] += entry.length;
         }
         if (key === "attributes") {
@@ -512,7 +525,10 @@ export function assertBoundedOtlpCardinality(root: unknown, decodedBytes: number
     }
   }
 
-  if (records > LOCAL_HTTP_LIMITS.otlpRecords) {
+  if (
+    records > LOCAL_HTTP_LIMITS.otlpRecords ||
+    nestedRecords > LOCAL_HTTP_LIMITS.otlpNestedRecords
+  ) {
     const recordArrays: Partial<Record<OtlpRecordArrayKey, number>> = {};
     for (const key of OTLP_RECORD_ARRAY_KEYS) {
       const count = recordArrayCounts[key];
