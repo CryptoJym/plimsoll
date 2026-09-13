@@ -259,7 +259,8 @@ export function sealOutboundEnvelope(input: unknown): OutboundEnvelopeOutcome {
 }
 
 /** Session snapshots use the same outbound boundary as events. Only typed
- * counters plus canonical linkage and a privacy-safe actor alias may cross. */
+ * counters plus canonical linkage, a privacy-safe actor alias, and a bounded
+ * safe historical session join key may cross. */
 export function sealOutboundSessionRow(input: unknown): OutboundSessionRowOutcome {
   const parsed = aiWorkSessionSyncRowSchema.safeParse(input);
   if (!parsed.success) return { ok: false, reason: "schema" };
@@ -292,6 +293,11 @@ export function sealOutboundSessionRow(input: unknown): OutboundSessionRowOutcom
 
   const metadataSource = session.metadata as Record<string, unknown>;
   const metadata: Record<string, string> = {};
+  if (metadataSource.externalSessionId !== undefined) {
+    const externalSessionId = safeOutboundIdentifier(metadataSource.externalSessionId);
+    if (!externalSessionId) return { ok: false, reason: "privacy" };
+    metadata.externalSessionId = externalSessionId;
+  }
   if (metadataSource.branchHash !== undefined) {
     const branchHash = typeof metadataSource.branchHash === "string"
       ? canonicalLinkage(metadataSource.branchHash)
