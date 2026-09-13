@@ -21,8 +21,11 @@ import {
 } from "./jsonl-byte-tailer";
 import {
   AUTOMATIC_DISCOVERY_ENTRY_CAP,
+  AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP,
   AUTOMATIC_DISCOVERY_WALL_MS,
   AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP,
+  captureScanProgress,
+  type CaptureScanProgress,
   beginAutomaticCaptureBaseline,
   captureBaselineStatus,
   classifyCaptureBaselineFile,
@@ -141,6 +144,8 @@ export type RolloutScanResult = {
     discoveryEntries: number;
     lastScanAt: string;
     truncated: boolean;
+    /** Why an incomplete sweep is incomplete, and against which budget. */
+    scan?: CaptureScanProgress;
   };
 };
 
@@ -429,7 +434,41 @@ export class RolloutTailer {
    * files keeps the dashboard responsive while a scan runs (owner-reported
    * freeze, sounding 0026).
    */
+  /**
+   * One cadence of the bounded activity scan.
+   *
+   * Bead eco-6hoxj.73: every return path publishes the enumeration progress
+   * behind `activity.truncated`, so capture health can report an unfinished
+   * sweep as a named diagnostic instead of a permanent, unexplained amber.
+   */
   async scan(options: RolloutScanOptions): Promise<RolloutScanResult> {
+    const result = await this.runScan(options);
+    // The baseline sweep is a live cursor too. Reading only `captureAttempt`
+    // published zeros and a false `sweepComplete` for every cadence of the
+    // baseline phase — the long sweep an operator most needs to read.
+    const attempt = this.captureAttempt ?? this.baselineAttempt;
+    result.activity.scan = captureScanProgress({
+      discovery: attempt?.discovery.progress() ?? null,
+      configuredRoots: this.configuredRootCount,
+      eligibleRoots: this.directories.length,
+      pendingFiles: attempt?.pendingFiles.length ?? 0,
+      entriesThisTick: result.activity.discoveryEntries,
+      deferredBeforeIo: options.deferredBeforeIo === true,
+      lifetimeEntryLimit: this.lifetimeEntryLimit(options.discoveryLimit),
+    });
+    return result;
+  }
+
+  /** Roots `plimsoll status` reports for this source, ready or not. */
+  private get configuredRootCount(): number {
+    return this.inventoryConfigured ? this.captureRoots.length : 1;
+  }
+
+  private lifetimeEntryLimit(limit?: number) {
+    return Math.max(1, limit ?? AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP);
+  }
+
+  private async runScan(options: RolloutScanOptions): Promise<RolloutScanResult> {
     this.activeBoundaryOptions = {
       quarantine: options.quarantine,
       onProgress: options.onProgress,
@@ -1117,7 +1156,7 @@ export class RolloutTailer {
     return new IncrementalJsonlDiscovery(roots, {
       recursive: false,
       matches: (name) => name.startsWith("rollout-") && name.endsWith(".jsonl"),
-      maxEntries: Math.max(1, limit ?? 100_000),
+      maxEntries: this.lifetimeEntryLimit(limit),
       missingRootsAreEmpty: true,
       isCandidateQuarantined: (candidateHash) => {
         const quarantine = this.activeBoundaryOptions.quarantine;

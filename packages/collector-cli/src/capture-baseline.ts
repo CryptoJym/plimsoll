@@ -3,6 +3,7 @@ import path from "node:path";
 
 import type Database from "better-sqlite3";
 
+import type { DiscoveryProgress } from "./incremental-jsonl-discovery";
 import {
   invalidateHistoryCoverageForExcludedGrowth,
   type HistoryCoverageSource,
@@ -19,6 +20,83 @@ const initializedDatabases = new WeakSet<object>();
 export const AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP = 64;
 export const AUTOMATIC_DISCOVERY_ENTRY_CAP = 256;
 export const AUTOMATIC_DISCOVERY_WALL_MS = 50;
+/** Entries one discovery cursor may visit before it restarts instead of resuming. */
+export const AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP = 100_000;
+
+/**
+ * The enumeration receipt behind one activity-scan cadence (bead eco-6hoxj.73).
+ *
+ * `truncated` on the activity receipt only says "this cadence did not finish
+ * enumerating", which on a host with many capture roots is the normal steady
+ * state of a bounded sweep. Capture health needs to tell that apart from a
+ * sweep that cannot converge, and needs the exact roots, entries and budget so
+ * an amber reason is actionable instead of a permanent "directional" label.
+ */
+export type CaptureScanProgress = {
+  /** A live cursor will resume on the next cadence: not finished, not restarting. */
+  converging: boolean;
+  /**
+   * This cadence's cursor finished a full sweep of every eligible root. A
+   * cadence holding no cursor reports false — it cannot tell a drained sweep
+   * from one that never started, and claiming completion there is what made
+   * the whole baseline phase publish `sweepComplete: true`. `truncated` and
+   * `scanState` remain the fields that say whether a cadence finished.
+   */
+  sweepComplete: boolean;
+  /** Capture roots configured for this source, as `plimsoll status` counts them. */
+  rootsTotal: number;
+  /** Of those, the roots this sweep may enumerate: the rest are not `ready`. */
+  rootsEligible: number;
+  rootsStarted: number;
+  /** Directory entries visited since this sweep began, and in this cadence. */
+  entriesThisSweep: number;
+  entriesThisTick: number;
+  /** Candidates discovered and still awaiting metadata or read admission. */
+  pendingFiles: number;
+  entryBudgetPerTick: number;
+  wallBudgetMsPerTick: number;
+  lifetimeEntryLimit: number;
+  /** The lifetime entry limit was hit: the sweep restarts, it cannot resume. */
+  limitReached: boolean;
+  /** The cadence was deferred before any filesystem work. */
+  deferredBeforeIo: boolean;
+};
+
+/** Build one scan receipt from the live discovery cursor and this cadence. */
+export function captureScanProgress(input: {
+  discovery: DiscoveryProgress | null;
+  /** Capture roots configured for this source, ready or not. */
+  configuredRoots: number;
+  /** Roots a sweep may enumerate right now (the `ready` ones). */
+  eligibleRoots: number;
+  pendingFiles: number;
+  entriesThisTick: number;
+  deferredBeforeIo: boolean;
+  /** The lifetime entry limit a cursor is given, for cadences that have none. */
+  lifetimeEntryLimit: number;
+}): CaptureScanProgress {
+  const discovery = input.discovery;
+  return {
+    // A cursor that has neither finished nor hit its lifetime limit resumes on
+    // the next cadence — including a cadence deferred before filesystem work,
+    // which keeps the cursor untouched.
+    converging: discovery !== null && !discovery.limitReached && !discovery.finished,
+    // Only a live cursor can report a finished sweep: no cursor is no receipt,
+    // which is exactly the state of every cadence of the baseline phase.
+    sweepComplete: discovery !== null && discovery.finished,
+    rootsTotal: input.configuredRoots,
+    rootsEligible: discovery?.rootsTotal ?? input.eligibleRoots,
+    rootsStarted: discovery?.rootsStarted ?? 0,
+    entriesThisSweep: discovery?.entriesVisited ?? 0,
+    entriesThisTick: input.entriesThisTick,
+    pendingFiles: input.pendingFiles,
+    entryBudgetPerTick: AUTOMATIC_DISCOVERY_ENTRY_CAP,
+    wallBudgetMsPerTick: AUTOMATIC_DISCOVERY_WALL_MS,
+    lifetimeEntryLimit: discovery?.lifetimeEntryLimit ?? input.lifetimeEntryLimit,
+    limitReached: discovery?.limitReached ?? false,
+    deferredBeforeIo: input.deferredBeforeIo,
+  };
+}
 
 export const CAPTURE_BASELINE_NOT_ESTABLISHED =
   "capture_baseline_not_established" as const;
