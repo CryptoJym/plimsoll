@@ -198,9 +198,11 @@ jobs:
 
       - name: Prove sync storage contention retry boundaries
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
-        run: |
-          pnpm proof:sync-storage-retry
-          pnpm proof:sync-backoff
+        run: pnpm proof:sync-storage-retry
+
+      - name: Prove partial-success sync backoff and server cooldowns (eco-6hoxj.67)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:sync-backoff
 
       - name: Prove Codex account assertions and privacy boundary
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

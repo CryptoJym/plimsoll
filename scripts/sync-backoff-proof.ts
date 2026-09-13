@@ -22,7 +22,10 @@ const t0 = Math.ceil(Date.now() / 1_000) * 1_000 + 60_000, interval = 300_000;
 let sequence = 0, database = 0;
 const config = collectorConfigSchema.parse({ uploadUrl: "http://127.0.0.1:1/ingest",
   tenantId: "00000000-0000-4000-8000-000000000001", installKey: "sync-backoff-fixture",
-  delivery: { maxOldestAgeDays: 3650, maxBackoffSeconds: 30, requestTimeoutSeconds: 1, maxProbesPerCycle: 16 },
+  // The ledger ceiling the durable floor is clamped to (review r1, F2). The
+  // existing 900 s floor cases below sit exactly at it, so they still assert a
+  // fully honoured server cooldown; the new cases probe above it.
+  delivery: { maxOldestAgeDays: 3650, maxBackoffSeconds: 900, requestTimeoutSeconds: 1, maxProbesPerCycle: 16 },
 });
 function open(file = path.join(fixture.root, `ledger-${++database}.sqlite`)) {
   return { file, buffer: new LocalEventBuffer(file, { workspaceId: config.tenantId, delivery: { enabled: true, limits: config.delivery } }) };
@@ -154,6 +157,62 @@ async function main() {
       assert.equal((await uploadBufferedEvents(socketConfig,buffer,opts)).uploadedEvents,0);assert.equal(calls,1);
       now=t0+900_000;assert.equal((await uploadBufferedEvents(socketConfig,buffer,opts)).uploadedEvents,1);assert.equal(calls,2);
     }finally{upstream.closeAllConnections();await new Promise<void>(resolve=>upstream.close(()=>resolve()));buffer.close();}
+  });
+  // Review r1, F2. A malformed-but-parsable `Retry-After` is honoured only up
+  // to a named ceiling on each path: the scheduler's own hour, and the ledger's
+  // configured `maxBackoffSeconds`. Without both clamps one 503 parks leased
+  // rows until 2033 and stops the uploader for the process lifetime.
+  const schedulerCeilingMs=3_600_000,ledgerCeilingMs=config.delivery.maxBackoffSeconds*1_000;
+  for(const seconds of [200_000_000,2_147_483_647,86_400]) {
+    const retryAfterMs=seconds*1_000;
+    await check(`server_retry_after_${seconds}_cannot_park_the_scheduler_past_the_hour_ceiling`,()=>{
+      assert.equal(retryAfterMilliseconds(String(seconds),t0),retryAfterMs);
+      const deferred=new SyncBackoff(interval);deferred.arm(t0);
+      const result=deferred.failure(new DeliveryUploadError("remote_transient","remote_transient",retryAfterMs),0,t0);
+      assert.ok(result.backoffMs<=schedulerCeilingMs,`backoffMs ${result.backoffMs}`);
+      const deferredNotBefore=deferred.status(false,t0).notBefore;
+      assert.ok(deferredNotBefore!==null&&Date.parse(deferredNotBefore)<=t0+schedulerCeilingMs,`notBefore ${deferredNotBefore}`);
+      assert.equal(deferred.ready(t0+schedulerCeilingMs),true);
+      const partial=new SyncBackoff(interval);partial.arm(t0);partial.success(1,retryAfterMs,t0);
+      const partialNotBefore=partial.status(false,t0).notBefore;
+      assert.ok(partialNotBefore!==null&&Date.parse(partialNotBefore)<=t0+schedulerCeilingMs,`notBefore ${partialNotBefore}`);
+      assert.equal(partial.ready(t0+schedulerCeilingMs),true);
+      assert.equal(partial.status(false,t0).lastError,null);
+    });
+    await check(`server_retry_after_${seconds}_cannot_park_the_ledger_past_max_backoff_seconds`,async()=>{
+      const {buffer}=open();let now=t0,calls=0;append(buffer);
+      const fetchImpl=acknowledgingFetch(async()=>{calls++;return calls===1?json(503,String(seconds)):json(200);});
+      const opts={limit:1,fetchImpl,now:()=>new Date(now),includeLegacyRemainingUnuploaded:false};
+      try {
+        await assert.rejects(uploadBufferedEvents(config,buffer,opts),error=>{assert.ok(error instanceof DeliveryUploadError);assert.equal(error.retryAfterMs,retryAfterMs);return true;});
+        const parked=buffer.database.prepare("select max(next_attempt_at) as due from upload_outbox where state = 'retry'").get() as {due:string|null};
+        assert.ok(parked.due!==null,"no deferred row");
+        assert.ok(Date.parse(parked.due)<=now+ledgerCeilingMs,`next_attempt_at ${parked.due} > ceiling ${new Date(now+ledgerCeilingMs).toISOString()}`);
+        now=t0+ledgerCeilingMs;
+        assert.equal((await uploadBufferedEvents(config,buffer,opts)).uploadedEvents,1);assert.equal(calls,2);
+      } finally {buffer.close();}
+    });
+  }
+  // Review r1, F3. The date form names an instant on the SERVER's clock, so a
+  // collector that is an hour behind must still read a ten-minute wait as ten
+  // minutes rather than persist seventy.
+  await check("http_date_retry_after_is_measured_against_the_response_date_header",()=>{
+    const sentAtMs=t0,sentAt=new Date(sentAtMs).toUTCString(),due=new Date(sentAtMs+600_000).toUTCString();
+    assert.equal(retryAfterMilliseconds(due,sentAtMs-3_600_000,sentAt),600_000);
+    assert.equal(retryAfterMilliseconds(due,sentAtMs-3_600_000),4_200_000);
+    assert.equal(retryAfterMilliseconds(due,sentAtMs+3_600_000,sentAt),600_000);
+    assert.equal(retryAfterMilliseconds(due,sentAtMs,sentAt),600_000);
+    assert.equal(retryAfterMilliseconds(due,sentAtMs,"not a date"),600_000);
+    assert.equal(retryAfterMilliseconds(due,sentAtMs,null),600_000);
+    assert.equal(retryAfterMilliseconds("600",sentAtMs-3_600_000,sentAt),600_000);
+  });
+  // Review r1, F4. The block HTTP /status carries is the one an operator needs
+  // when delivery is paused, read from the daemon that owns it.
+  await check("plimsoll_status_reports_the_daemon_owned_sync_block",()=>{
+    const source=fs.readFileSync(path.resolve("packages/collector-cli/src/cli.ts"),"utf8");
+    assert.match(source,/const daemonState = await readDaemonState\(/);
+    assert.ok(source.includes("sync: {\n            source: daemonState.sync.source,\n            ...(daemonState.sync.scheduler ?? {}),\n          },"));
+    assert.match(source,/warning: "sync_failed",[\s\S]{0,240}?message: error instanceof Error \? error\.message : String\(error\),/);
   });
   await check("session_followups_are_carried_during_server_cooldown",()=>{
     const source=fs.readFileSync(path.resolve("packages/collector-cli/src/cli.ts"),"utf8");

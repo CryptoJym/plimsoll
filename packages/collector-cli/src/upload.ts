@@ -226,7 +226,7 @@ async function postItems(input: {
   return {
     ok: response.ok, status: response.status, statusClass: statusClass(response.status),
     retryAfterMs: [408, 429].includes(response.status) || response.status >= 500
-      ? retryAfterMilliseconds(response.headers.get("retry-after"), input.now().getTime()) : 0,
+      ? retryAfterMilliseconds(response.headers.get("retry-after"), input.now().getTime(), response.headers.get("date")) : 0,
     summary: response.ok ? safeResponseSummary(response.body) : {}, requestBytes: bytes,
     acceptedItems: response.ok
       ? input.items.filter((_item, index) => acceptedIds.has(expectation.itemIds[index]!))

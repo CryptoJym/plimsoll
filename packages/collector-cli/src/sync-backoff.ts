@@ -5,6 +5,16 @@ const MAX_DELAY_MS = 60 * 60 * 1_000;
 const NETWORK_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "AbortError", "deadline_exceeded"]);
 const STATUS_CLASSES = new Set(["network", "remote_transient", "remote_auth", "remote_contract", "remote_validation", "local_request_budget"]);
 
+/**
+ * A server-directed wait is honoured, never trusted without a bound: a single
+ * malformed-but-parsable `Retry-After` must not park the uploader for years
+ * (review r1, F2). The durable floor is clamped separately, by the outbox, to
+ * its own configured `maxBackoffSeconds`.
+ */
+function serverDelayMs(retryAfterMs: number) {
+  return Number.isFinite(retryAfterMs) ? Math.min(Math.max(0, retryAfterMs), MAX_DELAY_MS) : 0;
+}
+
 /** Process-local scheduling only. Durable retry identities and floors live in the outbox. */
 export class SyncBackoff {
   private streak = 0;
@@ -21,15 +31,19 @@ export class SyncBackoff {
   success(uploaded: number, retryAfterMs = 0, now = Date.now()) {
     this.uploaded = uploaded;
     this.streak = 0;
-    this.blockedUntil = now + Math.max(0, retryAfterMs);
-    this.lastError = retryAfterMs > 0 ? { at: new Date(now).toISOString(), code: "retry_after", failureClass: "remote_transient" } : null;
+    this.blockedUntil = now + serverDelayMs(retryAfterMs);
+    // A cycle that acknowledged work is not a failure. The server-directed
+    // wait is reported through `notBefore` alone (review r1, F6).
+    this.lastError = null;
   }
   failure(error: unknown, uploaded: number, now = Date.now(), maintenanceCircuitOpen = false) {
-    const storageBusy = error instanceof SyncStorageBusyError || isSqliteContentionError(error) ||
-      (error instanceof Error && error.message === "maintenance_circuit_open");
+    // The maintenance circuit is learned from the 4th argument, not from an
+    // error message: `maintenance_circuit_open` is thrown and caught inside the
+    // maintenance cadence and never reaches runSync's catch (review r1, F5).
+    const storageBusy = error instanceof SyncStorageBusyError || isSqliteContentionError(error);
     const delivery = error instanceof DeliveryUploadError ? error : null;
     const local = storageBusy || (maintenanceCircuitOpen && delivery?.httpStatusClass === "network");
-    const serverDelay = delivery && Number.isFinite(delivery.retryAfterMs) ? Math.max(0, delivery.retryAfterMs) : 0;
+    const serverDelay = delivery ? serverDelayMs(delivery.retryAfterMs) : 0;
     // Actual acknowledged progress and local storage pressure do not justify a
     // host-wide exponential pause. Per-item retry policy is left authoritative.
     this.streak = uploaded > 0 || local ? 0 : Math.min(this.streak + 1, 32);

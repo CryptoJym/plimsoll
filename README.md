@@ -193,11 +193,19 @@ early. A partly accepted lease can report both its acknowledged siblings and the
 remaining server-directed delay. Session follow-ups to that same endpoint are
 carried to a later cycle rather than sent inside the cooldown. Malformed delays
 are ignored; valid server
-cooldowns are not shortened to the normal cadence. Witness-only probes have no
-leased event row: their extra scheduler cooldown remains process-local.
+cooldowns are not shortened to the normal cadence. A server delay is honoured
+only up to a ceiling: the scheduler waits at most one hour, and the persisted
+outbox floor never exceeds the configured `delivery.maxBackoffSeconds`, so a
+single overlong or mistyped `Retry-After` cannot park delivery indefinitely. The
+HTTP-date form is measured against the response's own `Date` header when it has
+one, so a skewed local clock does not inflate the wait. Witness-only probes have
+no leased event row: their extra scheduler cooldown remains process-local.
 
 Authenticated `/status` exposes `sync.failureStreak`, `sync.nextAttemptAt`,
-`sync.notBefore`, `sync.lastError` and `sync.lastCycleUploadedEvents`. The next
+`sync.notBefore`, `sync.lastError` and `sync.lastCycleUploadedEvents`, and
+`plimsoll status` prints the same block by asking the daemon that owns it. A
+cycle that acknowledged work is not a failure: its server-directed wait is
+reported through `sync.notBefore`, with `sync.lastError` null. The next
 attempt is the earliest eligible cadence tick, not a promise of network traffic:
 per-item retry dates, open circuits, shutdown and an in-flight cycle still apply.
 The scheduling snapshot is process-local; only outbox retry dates survive a restart.

@@ -1094,15 +1094,55 @@ function hookSpoolReadingFromStatusBody(
 }
 
 /**
- * The daemon's hook-spool kill switch, from the daemon (bead eco-6hoxj.61,
- * review r1 F5). `plimsoll status` is otherwise a local read, so this is its
- * only request; it is bounded by the same timeout doctor uses and never
+ * The uploader's scheduling snapshot, from the daemon (bead eco-6hoxj.67,
+ * review r1 F4), read out of the same `/status` body as the hook-spool switch.
+ *
+ * It is process-local state living in the running daemon, so the same three
+ * answers apply as for the kill switch: the daemon's own `sync` section, a
+ * healthy body without one (a collector older than this change), or a daemon
+ * that could not be asked. `plimsoll status` prints `scheduler: null` rather
+ * than invent a streak the operator's shell cannot know.
+ */
+function syncReadingFromStatusBody(
+  body: Record<string, unknown> | null,
+  ok: boolean,
+): DaemonSyncReading {
+  if (!ok) return SYNC_COLLECTOR_UNREACHABLE;
+  const section = body?.sync;
+  if (section && typeof section === "object" && !Array.isArray(section)) {
+    return { scheduler: section as Record<string, unknown>, source: "collector" };
+  }
+  if (body?.ok === true && section === undefined) return SYNC_COLLECTOR_TOO_OLD;
+  return SYNC_COLLECTOR_UNREACHABLE;
+}
+
+type DaemonSyncReading = {
+  scheduler: Record<string, unknown> | null;
+  source: "collector" | "collector_too_old" | "collector_unreachable";
+};
+
+const SYNC_COLLECTOR_UNREACHABLE: DaemonSyncReading = Object.freeze({
+  scheduler: null,
+  source: "collector_unreachable",
+});
+
+const SYNC_COLLECTOR_TOO_OLD: DaemonSyncReading = Object.freeze({
+  scheduler: null,
+  source: "collector_too_old",
+});
+
+/**
+ * The daemon-owned state `plimsoll status` cannot read locally: the hook-spool
+ * kill switch (bead eco-6hoxj.61, review r1 F5) and the uploader's scheduling
+ * snapshot (bead eco-6hoxj.67, review r1 F4). `plimsoll status` is otherwise a
+ * local read, so this stays its ONE request — both readings come out of the
+ * same `/status` body — bounded by the same timeout doctor uses, and neither
  * guesses from this shell's environment.
  */
-async function readDaemonHookSpool(
+async function readDaemonState(
   port: number,
   managementToken?: string,
-): Promise<HookSpoolDaemonReading> {
+): Promise<{ hookSpool: HookSpoolDaemonReading; sync: DaemonSyncReading }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), collectorStatusTimeoutMs());
   try {
@@ -1119,9 +1159,12 @@ async function readDaemonHookSpool(
     } catch {
       // Not a Plimsoll-ready service's answer.
     }
-    return hookSpoolReadingFromStatusBody(body, response.ok);
+    return {
+      hookSpool: hookSpoolReadingFromStatusBody(body, response.ok),
+      sync: syncReadingFromStatusBody(body, response.ok),
+    };
   } catch {
-    return HOOK_SPOOL_COLLECTOR_UNREACHABLE;
+    return { hookSpool: HOOK_SPOOL_COLLECTOR_UNREACHABLE, sync: SYNC_COLLECTOR_UNREACHABLE };
   } finally {
     clearTimeout(timeout);
   }
@@ -2530,6 +2573,9 @@ async function main() {
           JSON.stringify({
             warning: "sync_failed",
             ...scheduling,
+            // An "unclassified" failure has no code to go on, so the log line
+            // stays the only place it can be diagnosed (review r1, F4).
+            message: error instanceof Error ? error.message : String(error),
           }),
         );
       } finally {
@@ -3034,7 +3080,7 @@ async function main() {
     const buffer = openBuffer(config);
     // Bead eco-6hoxj.61 (review r1, F5): the hook spool's kill switch belongs
     // to the daemon, which reads it once when its drain starts. Ask the daemon.
-    const daemonHookSpool = await readDaemonHookSpool(
+    const daemonState = await readDaemonState(
       config.port,
       readLocalIngestAuth(collectorHome())?.managementRead,
     );
@@ -3080,7 +3126,14 @@ async function main() {
           retention: buffer.retentionStatus(config.retentionDays),
           // Hook events the collector could not accept live, and what the
           // drain has recovered since (bead eco-6hoxj.61).
-          hookSpool: hookSpoolOperatorStatus(collectorHome(), daemonHookSpool),
+          hookSpool: hookSpoolOperatorStatus(collectorHome(), daemonState.hookSpool),
+          // Why delivery is paused, next to what is waiting: the daemon's own
+          // scheduling snapshot, the same block HTTP /status carries
+          // (bead eco-6hoxj.67, review r1 F4).
+          sync: {
+            source: daemonState.sync.source,
+            ...(daemonState.sync.scheduler ?? {}),
+          },
           delivery: buffer.delivery.status(),
           projection: buffer.projection.status(),
           captureHealth: projectedStatus?.health ?? {
