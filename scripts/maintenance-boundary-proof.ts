@@ -57,9 +57,19 @@ type RequestResult = { status: number; elapsedMs: number; body: Record<string, u
 
 const checks: Check[] = [];
 const PRIVATE_PATH_SENTINEL = "maintenance-boundary-private-path-sentinel";
+// 2026-09-13: a fixed status p95 budget refused comment-only trees on loaded
+// hosts (CI measured 118.0ms where an idle host measures ~25ms). The budget is
+// now sized against a same-run idle wave: the floor keeps the old bar on a fast
+// host, and the ceiling stays below statusMaxMs so a slow baseline can never
+// excuse a status endpoint that is actually unavailable.
+const STATUS_P95_FLOOR_MS = 100;
+const STATUS_P95_RELATIVE_FACTOR = 3;
+const STATUS_P95_CEILING_MS = 400;
 const FIFO_AVAILABILITY_BUDGETS = {
   waveConcurrency: 100,
-  statusP95Ms: 100,
+  statusP95FloorMs: STATUS_P95_FLOOR_MS,
+  statusP95RelativeFactor: STATUS_P95_RELATIVE_FACTOR,
+  statusP95CeilingMs: STATUS_P95_CEILING_MS,
   statusMaxMs: 500,
   hookP95Ms: 750,
   hookMaxMs: 1_200,
@@ -338,6 +348,9 @@ async function fifoAvailabilityProof() {
   });
   const waveConcurrency = FIFO_AVAILABILITY_BUDGETS.waveConcurrency;
   const agent = new http.Agent({ keepAlive: true, maxSockets: waveConcurrency });
+  // The baseline wave gets its own sockets so the measured wave still pays the
+  // same cold keep-alive setup it paid before the baseline existed.
+  const idleAgent = new http.Agent({ keepAlive: true, maxSockets: waveConcurrency });
   let runPromise: Promise<MaintenanceRunOutcome> | null = null;
   try {
     await new Promise<void>((resolve, reject) => {
@@ -349,14 +362,28 @@ async function fifoAvailabilityProof() {
       "select count(*) as n from buffered_events",
     ).get() as { n: number }).n);
 
+    const statusWave = (waveAgent: http.Agent) => Promise.all(
+      Array.from({ length: waveConcurrency }, () => request(waveAgent, port, "GET", "/status")),
+    );
+    // The identical wave against the same server with nothing blocked. It runs
+    // before the child is started, so it measures this host and this run only.
+    const idleStatuses = await statusWave(idleAgent);
+    assert.ok(
+      idleStatuses.every((row) => row.status === 200),
+      "all idle baseline status requests must return 200",
+    );
+    const idleStatusP95 = percentile(idleStatuses.map((row) => row.elapsedMs), 0.95);
+    const statusP95Bound = Math.max(
+      STATUS_P95_FLOOR_MS,
+      STATUS_P95_RELATIVE_FACTOR * idleStatusP95,
+    );
+
     const runStartedAt = performance.now();
     runPromise = boundary.run();
     void runPromise.catch(() => undefined);
     await waitFor(() => fs.existsSync(markerPath), "fifo_child_block_marker");
 
-    const statuses = await Promise.all(Array.from({ length: waveConcurrency }, () => (
-      request(agent, port, "GET", "/status")
-    )));
+    const statuses = await statusWave(agent);
     assert.ok(statuses.every((row) => row.status === 200), "all status requests must return 200");
 
     const hooks = await Promise.all(Array.from({ length: waveConcurrency }, (_, index) => request(
@@ -378,8 +405,15 @@ async function fifoAvailabilityProof() {
     const hookP95 = percentile(hooks.map((row) => row.elapsedMs), 0.95);
     const hookMax = Math.max(...hooks.map((row) => row.elapsedMs));
     assert.ok(
-      statusP95 <= FIFO_AVAILABILITY_BUDGETS.statusP95Ms,
-      `status p95 ${statusP95.toFixed(1)}ms exceeded ${FIFO_AVAILABILITY_BUDGETS.statusP95Ms}ms`,
+      statusP95 <= statusP95Bound,
+      `status p95 ${statusP95.toFixed(1)}ms exceeded ${statusP95Bound.toFixed(1)}ms ` +
+        `(idle p95 ${idleStatusP95.toFixed(1)}ms x${STATUS_P95_RELATIVE_FACTOR}, ` +
+        `floor ${STATUS_P95_FLOOR_MS}ms)`,
+    );
+    assert.ok(
+      statusP95 <= STATUS_P95_CEILING_MS,
+      `status p95 ${statusP95.toFixed(1)}ms exceeded the ${STATUS_P95_CEILING_MS}ms ceiling ` +
+        `(idle p95 ${idleStatusP95.toFixed(1)}ms, relative bound ${statusP95Bound.toFixed(1)}ms)`,
     );
     assert.ok(
       statusMax <= FIFO_AVAILABILITY_BUDGETS.statusMaxMs,
@@ -429,6 +463,9 @@ async function fifoAvailabilityProof() {
       agentMaxSockets: waveConcurrency,
       budgets: FIFO_AVAILABILITY_BUDGETS,
       statusP95Ms: Number(statusP95.toFixed(3)),
+      idleStatusP95Ms: Number(idleStatusP95.toFixed(3)),
+      statusP95BoundMs: Number(statusP95Bound.toFixed(3)),
+      statusP95CeilingMs: STATUS_P95_CEILING_MS,
       statusMaxMs: Number(statusMax.toFixed(3)),
       hookP95Ms: Number(hookP95.toFixed(3)),
       hookMaxMs: Number(hookMax.toFixed(3)),
@@ -441,6 +478,7 @@ async function fifoAvailabilityProof() {
   } finally {
     runPromise?.catch(() => undefined);
     agent.destroy();
+    idleAgent.destroy();
     await new Promise<void>((resolve) => server.close(() => resolve()));
     await boundary.shutdown();
     buffer.close();
