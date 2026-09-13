@@ -23,6 +23,7 @@ import {
 } from "../packages/collector-cli/src/dashboard-api";
 import { historyCoverageStatus } from "../packages/collector-cli/src/history-coverage";
 import { CaptureWorkBudget } from "../packages/collector-cli/src/capture-work-budget";
+import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
@@ -1809,6 +1810,143 @@ async function main() {
       cursorless.rootsTotal === 25 && cursorless.rootsEligible === 22,
       { cursorless });
     cursorlessTailer.close();
+
+    // Bead eco-6hoxj.73 r3, findings 1 and 2: the same receipt from the other
+    // tailer. `RolloutTailer` sweeps day partitions, not roots, so before this
+    // check its cursor published two "eligible" roots per configured root and
+    // the reason read `10/44 eligible of 22 configured` on every codex host.
+    const codexRoot = path.join(root, "codex-sweep");
+    const codexDay = (directory: string, files: number) => {
+      for (const offset of [0, 1]) {
+        const day = new Date(NOW.getTime() - offset * DAY_MS);
+        const partition = path.join(directory, ...day.toISOString().slice(0, 10).split("-"));
+        fs.mkdirSync(partition, { recursive: true });
+        for (let file = 0; file < files; file += 1) {
+          fs.writeFileSync(path.join(partition, `rollout-${file}.jsonl`), "{}\n");
+        }
+      }
+    };
+    const codexRoots = (count: number, ready: number, label: string, files = 20) =>
+      Array.from({ length: count }, (_, index) => {
+        const directory = path.join(codexRoot, label, `root-${String(index).padStart(2, "0")}`);
+        if (index < ready) codexDay(directory, files);
+        return { rootId: `${label}-root-${index}`, profileId: `${label}-profile-${index}`,
+          installationEpochId: "epoch-codex", source: "codex" as const, directory };
+      });
+    const codexBuffer = new LocalEventBuffer(path.join(root, "capture-health-codex.sqlite"));
+    codexBuffer.append(event({
+      source: "codex", eventType: "usage_rollout", sessionId: uuid(930_002),
+      observedAt: new Date(NOW.getTime() - 3 * 60 * 60_000).toISOString(),
+      inputTokens: 1_200, outputTokens: 340, costUsd: 0.004,
+    }));
+    settle(codexBuffer, NOW, 30);
+    const partialRoots = codexRoots(25, 22, "partial");
+    const codexTailer = new RolloutTailer(
+      codexBuffer, partialRoots[0]!.directory, () => [], undefined, partialRoots);
+    const codexTick = async () => (await codexTailer.scan({
+      scope: "recent", now: NOW,
+      automatic: { phase: "baseline", budget: new CaptureWorkBudget() },
+    })).activity.scan!;
+    const codexFirst = await codexTick();
+    const codexSecond = await codexTick();
+    check("rollout_baseline_cadence_publishes_the_live_sweep_receipt_in_root_units",
+      codexFirst.rootsStarted > 0 && codexSecond.rootsStarted >= codexFirst.rootsStarted &&
+      codexFirst.entriesThisSweep > 0 && codexSecond.entriesThisSweep > codexFirst.entriesThisSweep &&
+      codexFirst.rootsTotal === 25 && codexSecond.rootsTotal === 25 &&
+      codexFirst.rootsEligible === 22 && codexSecond.rootsEligible === 22 &&
+      codexFirst.rootsStarted <= codexFirst.rootsEligible &&
+      codexSecond.rootsStarted <= codexSecond.rootsEligible &&
+      codexFirst.lifetimeEntryLimit === 100_000 && codexSecond.lifetimeEntryLimit === 100_000 &&
+      codexFirst.sweepComplete === false && codexSecond.sweepComplete === false &&
+      codexFirst.converging === true,
+      { first: codexFirst, second: codexSecond });
+    codexBuffer.projection.recordCaptureActivity({
+      source: "codex",
+      lastActivityAt: null,
+      filesToday: 0,
+      discoveryEntries: codexSecond.entriesThisTick,
+      lastScanAt: new Date(NOW.getTime() - 30_000).toISOString(),
+      truncated: true,
+      scan: codexSecond,
+    });
+    settle(codexBuffer, NOW, 30);
+    const codexHealth = (readySnapshot(codexBuffer, 30).status.health as {
+      sources: Array<{ source: string; status: string; reason: string;
+        activityState: { scanState: string; scan: Record<string, unknown> | null } }>;
+    }).sources.find((row) => row.source === "codex")!;
+    check("rollout_baseline_amber_reason_names_the_real_sweep_numbers_in_root_units",
+      codexHealth.status === "amber" &&
+      codexHealth.reason.includes("activity scan still sweeping") &&
+      codexHealth.reason.includes(
+        `${codexSecond.rootsStarted}/22 eligible of 25 configured capture root(s) enumerated`) &&
+      codexHealth.reason.includes(`${codexSecond.entriesThisSweep} entr(ies) this sweep`) &&
+      codexHealth.reason.includes("lifetime limit 100000") &&
+      !codexHealth.reason.includes("0 entr(ies) this sweep") &&
+      !codexHealth.reason.includes("/44 eligible") &&
+      codexHealth.activityState.scanState === "in_progress" &&
+      codexHealth.activityState.scan?.sweepComplete === false,
+      { status: codexHealth.status, reason: codexHealth.reason });
+    codexTailer.close();
+
+    // The stock and fully-ready codex shapes: eligible equals configured, so the
+    // reason keeps the plain wording and can never read more eligible roots than
+    // the host has. Before r3 these printed `10/44 eligible of 22 configured` and
+    // `1/2 eligible of 1 configured`.
+    const readyRoots = codexRoots(22, 22, "ready");
+    const readyTailer = new RolloutTailer(
+      codexBuffer, readyRoots[0]!.directory, () => [], undefined, readyRoots);
+    const readyTick = async () => (await readyTailer.scan({
+      scope: "recent", now: NOW,
+      automatic: { phase: "baseline", budget: new CaptureWorkBudget() },
+    })).activity.scan!;
+    await readyTick(); await readyTick();
+    const readyScan = await readyTick();
+    readyTailer.close();
+    const stockDir = path.join(codexRoot, "stock", "sessions");
+    codexDay(stockDir, 200);
+    const stockTailer = new RolloutTailer(codexBuffer, stockDir, () => []);
+    const stockTick = async () => (await stockTailer.scan({
+      scope: "recent", now: NOW,
+      automatic: { phase: "baseline", budget: new CaptureWorkBudget() },
+    })).activity.scan!;
+    await stockTick(); await stockTick();
+    const stockScan = await stockTick();
+    stockTailer.close();
+    check("rollout_sweep_never_reports_more_eligible_roots_than_the_host_configures",
+      readyScan.rootsTotal === 22 && readyScan.rootsEligible === 22 &&
+      readyScan.rootsStarted > 0 && readyScan.rootsStarted <= 22 &&
+      readyScan.entriesThisSweep > 0 &&
+      stockScan.rootsTotal === 1 && stockScan.rootsEligible === 1 &&
+      stockScan.rootsStarted === 1 && stockScan.entriesThisSweep > 0,
+      { ready: readyScan, stock: stockScan });
+
+    // Finding 3: a cadence that consumes its last candidate — or finishes and
+    // restarts its sweep — retires the cursor inside the cadence. It must still
+    // report the sweep it ran, never a zero receipt on a sweeping reason.
+    const drainRoots = codexRoots(1, 1, "drain", 2);
+    const drainTailer = new RolloutTailer(
+      codexBuffer, drainRoots[0]!.directory, () => [], undefined, drainRoots);
+    const drained = (await drainTailer.scan({
+      scope: "recent", now: NOW,
+      automatic: { phase: "capture", budget: new CaptureWorkBudget() },
+    })).activity.scan!;
+    drainTailer.close();
+    const restartRoots = codexRoots(1, 1, "restart", 20);
+    const restartTailer = new RolloutTailer(
+      codexBuffer, restartRoots[0]!.directory, () => [], undefined, restartRoots);
+    const restarted = (await restartTailer.scan({
+      scope: "recent", now: NOW,
+      automatic: { phase: "baseline", budget: new CaptureWorkBudget() },
+    })).activity.scan!;
+    restartTailer.close();
+    check("a_cadence_that_retires_its_cursor_reports_the_sweep_it_ran",
+      drained.rootsStarted === 1 && drained.entriesThisSweep > 0 &&
+      drained.converging === false && drained.sweepComplete === true &&
+      drained.lifetimeEntryLimit === 100_000 &&
+      restarted.rootsStarted === 1 && restarted.entriesThisSweep > 0 &&
+      restarted.converging === false && restarted.sweepComplete === true,
+      { drained, restarted });
+    codexBuffer.close();
 
     const healthServer = createCollectorServer(collectorConfigSchema.parse({ subscriptions }), live.fixture);
     const healthPort = await listen(healthServer);

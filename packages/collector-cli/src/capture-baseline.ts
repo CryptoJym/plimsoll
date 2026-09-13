@@ -36,11 +36,15 @@ export type CaptureScanProgress = {
   /** A live cursor will resume on the next cadence: not finished, not restarting. */
   converging: boolean;
   /**
-   * This cadence's cursor finished a full sweep of every eligible root. A
-   * cadence holding no cursor reports false — it cannot tell a drained sweep
-   * from one that never started, and claiming completion there is what made
-   * the whole baseline phase publish `sweepComplete: true`. `truncated` and
-   * `scanState` remain the fields that say whether a cadence finished.
+   * This cadence's cursor finished a full sweep of every eligible root —
+   * including a cursor the cadence retired the moment it finished, which is
+   * how a completed sweep normally ends. A cadence holding no cursor at all
+   * reports false: it cannot tell a drained sweep from one that never
+   * started, and claiming completion there is what made the whole baseline
+   * phase publish `sweepComplete: true`. A cursor that hit its lifetime entry
+   * limit reports false however it was closed — it restarts, it did not
+   * finish. `truncated` and `scanState` remain the fields that say whether a
+   * cadence finished.
    */
   sweepComplete: boolean;
   /** Capture roots configured for this source, as `plimsoll status` counts them. */
@@ -74,19 +78,39 @@ export function captureScanProgress(input: {
   deferredBeforeIo: boolean;
   /** The lifetime entry limit a cursor is given, for cadences that have none. */
   lifetimeEntryLimit: number;
+  /**
+   * `discovery` came from a cursor this cadence retired: it reports the sweep
+   * it actually ran, but it will not resume on the next cadence.
+   */
+  cursorRetired?: boolean;
+  /**
+   * Cursor roots per capture root. `RolloutTailer` sweeps day partitions, so
+   * its cursor holds several roots per capture root; every root number this
+   * receipt publishes is converted back to capture roots so the numerator,
+   * `rootsEligible` and `rootsTotal` are all in the unit the reason prints.
+   */
+  cursorRootsPerCaptureRoot?: number;
 }): CaptureScanProgress {
   const discovery = input.discovery;
+  const retired = input.cursorRetired === true;
+  const cursorRootsPerRoot = Math.max(1, Math.trunc(input.cursorRootsPerCaptureRoot ?? 1));
   return {
     // A cursor that has neither finished nor hit its lifetime limit resumes on
     // the next cadence — including a cadence deferred before filesystem work,
     // which keeps the cursor untouched.
-    converging: discovery !== null && !discovery.limitReached && !discovery.finished,
-    // Only a live cursor can report a finished sweep: no cursor is no receipt,
-    // which is exactly the state of every cadence of the baseline phase.
-    sweepComplete: discovery !== null && discovery.finished,
+    converging: !retired && discovery !== null && !discovery.limitReached && !discovery.finished,
+    // Only a cursor can report a finished sweep: no cursor is no receipt,
+    // which is exactly the state of every cadence of the baseline phase. A
+    // cursor closed short of its roots reports `finished` too, so a sweep that
+    // ended at the lifetime limit is never counted as complete.
+    sweepComplete: discovery !== null && discovery.finished && !discovery.limitReached,
     rootsTotal: input.configuredRoots,
-    rootsEligible: discovery?.rootsTotal ?? input.eligibleRoots,
-    rootsStarted: discovery?.rootsStarted ?? 0,
+    // Never the cursor's own root count: on `RolloutTailer` that is the day
+    // partitions, which would print more eligible roots than exist.
+    rootsEligible: input.eligibleRoots,
+    rootsStarted: discovery
+      ? Math.min(input.eligibleRoots, Math.ceil(discovery.rootsStarted / cursorRootsPerRoot))
+      : 0,
     entriesThisSweep: discovery?.entriesVisited ?? 0,
     entriesThisTick: input.entriesThisTick,
     pendingFiles: input.pendingFiles,

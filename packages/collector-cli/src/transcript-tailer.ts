@@ -44,7 +44,10 @@ import {
 } from "./capture-fairness";
 import { advanceAutomaticCaptureFiles, refreshAutomaticCaptureFile, type AutomaticCapturePendingFile } from "./automatic-capture-retry";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
-import { IncrementalJsonlDiscovery } from "./incremental-jsonl-discovery";
+import {
+  IncrementalJsonlDiscovery,
+  type DiscoveryProgress,
+} from "./incremental-jsonl-discovery";
 import {
   maintenanceCandidateHash,
   type MaintenanceProgressStage,
@@ -409,13 +412,20 @@ export class TranscriptTailer {
    * sweep as a named diagnostic instead of a permanent, unexplained amber.
    */
   async scan(options: TranscriptScanOptions): Promise<TranscriptScanResult> {
+    this.retiredProgress = null;
     const result = await this.runScan(options);
     // The baseline sweep is a live cursor too. Reading only `captureAttempt`
     // published zeros and a false `sweepComplete` for every cadence of the
     // baseline phase — the long sweep an operator most needs to read.
     const attempt = this.captureAttempt ?? this.baselineAttempt;
+    // A cadence that drained, errored out or restarted its sweep no longer
+    // holds the cursor that did the work, and the attempt it left behind is
+    // either gone or a fresh replacement that has enumerated nothing. Publish
+    // the sweep this cadence actually ran, not those zeros.
+    const retired = this.retiredProgress;
     result.activity.scan = captureScanProgress({
-      discovery: attempt?.discovery.progress() ?? null,
+      discovery: retired ?? attempt?.discovery.progress() ?? null,
+      cursorRetired: retired !== null,
       configuredRoots: this.configuredRootCount,
       eligibleRoots: this.directories.length,
       pendingFiles: attempt?.pendingFiles.length ?? 0,
@@ -424,6 +434,19 @@ export class TranscriptTailer {
       lifetimeEntryLimit: this.lifetimeEntryLimit(options.discoveryLimit),
     });
     return result;
+  }
+
+  /**
+   * The final progress of the cursor this cadence retired, read before it was
+   * closed — `close()` marks a cursor finished, so a snapshot taken after it
+   * could not tell a completed sweep from an abandoned one.
+   */
+  private retiredProgress: DiscoveryProgress | null = null;
+
+  /** Close a cursor, keeping the sweep it ran for this cadence's receipt. */
+  private retire(discovery: IncrementalJsonlDiscovery) {
+    this.retiredProgress = discovery.progress();
+    discovery.close();
   }
 
   /** Roots `plimsoll status` reports for this source, ready or not. */
@@ -491,6 +514,8 @@ export class TranscriptTailer {
         .map(root => root.directory) : null;
     result.discoveryErrors = rootErrors;
     if (bindCaptureInventory(this.buffer.database, "claude_code", this.captureRoots, rootCoverage)) {
+      // A rebind replaces the root set: the sweep in flight counted roots
+      // that no longer describe this source, so it is discarded, not reported.
       this.baselineAttempt?.discovery.close();
       this.captureAttempt?.discovery.close();
       this.baselineAttempt = null;
@@ -634,7 +659,7 @@ export class TranscriptTailer {
             filesValidated: attempt.filesValidated,
             statErrors: result.statErrors,
           });
-          attempt.discovery.close();
+          this.retire(attempt.discovery);
           this.baselineAttempt = null;
           result.exhaustive = false;
           result.automaticBudget = automatic.budget.status();
@@ -650,7 +675,7 @@ export class TranscriptTailer {
           filesValidated: attempt.filesValidated,
           discoveryErrors: result.discoveryErrors || 1,
         });
-        attempt.discovery.close();
+        this.retire(attempt.discovery);
         this.baselineAttempt = null;
         result.activity.truncated = true;
         result.automaticBudget = automatic.budget.status();
@@ -672,7 +697,7 @@ export class TranscriptTailer {
       }
 
       if (attempt.capacityDeferredThisSweep) {
-        attempt.discovery.close();
+        this.retire(attempt.discovery);
         attempt.discovery = this.recentDiscovery(options.discoveryLimit, options);
         attempt.capacityDeferredThisSweep = false;
         attempt.newGenerationsThisSweep = 0;
@@ -684,7 +709,7 @@ export class TranscriptTailer {
 
       attempt.sweepsCompleted += 1;
       if (attempt.sweepsCompleted < 2 || attempt.newGenerationsThisSweep > 0) {
-        attempt.discovery.close();
+        this.retire(attempt.discovery);
         attempt.discovery = this.recentDiscovery(options.discoveryLimit, options);
         attempt.newGenerationsThisSweep = 0;
         result.activity.truncated = true;
@@ -697,7 +722,7 @@ export class TranscriptTailer {
         runId: attempt.runId,
         completedAt: new Date().toISOString(),
       });
-      attempt.discovery.close();
+      this.retire(attempt.discovery);
       this.baselineAttempt = null;
       result.excludedGenerations = completed.excludedGenerations;
       result.excludedBytes = completed.currentExcludedBytes;
@@ -1171,7 +1196,7 @@ export class TranscriptTailer {
     if (!attempt) return;
     attempt.pendingFiles = advanceAutomaticCaptureFiles(attempt.pendingFiles, files, partial);
     if (attempt.discoveryDone && attempt.pendingFiles.length === 0) {
-      attempt.discovery.close();
+      this.retire(attempt.discovery);
       this.captureAttempt = null;
     }
   }

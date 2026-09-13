@@ -43,7 +43,10 @@ import {
 } from "./capture-fairness";
 import { advanceAutomaticCaptureFiles, refreshAutomaticCaptureFile, type AutomaticCapturePendingFile } from "./automatic-capture-retry";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
-import { IncrementalJsonlDiscovery } from "./incremental-jsonl-discovery";
+import {
+  IncrementalJsonlDiscovery,
+  type DiscoveryProgress,
+} from "./incremental-jsonl-discovery";
 import {
   maintenanceCandidateHash,
   type MaintenanceProgressStage,
@@ -180,6 +183,11 @@ type RolloutParserState = {
   activeRepoContextId?: string;
 };
 
+/**
+ * `scope=recent` sweeps today and yesterday (UTC) under every capture root, so
+ * one discovery cursor holds this many roots per capture root.
+ */
+const ROLLOUT_DISCOVERY_DAYS = 2;
 const PARSER_KIND = "codex-rollout-v2";
 const CHECKPOINT_VERSION = 2;
 
@@ -442,21 +450,44 @@ export class RolloutTailer {
    * sweep as a named diagnostic instead of a permanent, unexplained amber.
    */
   async scan(options: RolloutScanOptions): Promise<RolloutScanResult> {
+    this.retiredProgress = null;
     const result = await this.runScan(options);
     // The baseline sweep is a live cursor too. Reading only `captureAttempt`
     // published zeros and a false `sweepComplete` for every cadence of the
     // baseline phase — the long sweep an operator most needs to read.
     const attempt = this.captureAttempt ?? this.baselineAttempt;
+    // A cadence that drained, errored out or restarted its sweep no longer
+    // holds the cursor that did the work, and the attempt it left behind is
+    // either gone or a fresh replacement that has enumerated nothing. Publish
+    // the sweep this cadence actually ran, not those zeros.
+    const retired = this.retiredProgress;
     result.activity.scan = captureScanProgress({
-      discovery: attempt?.discovery.progress() ?? null,
+      discovery: retired ?? attempt?.discovery.progress() ?? null,
+      cursorRetired: retired !== null,
       configuredRoots: this.configuredRootCount,
       eligibleRoots: this.directories.length,
+      // This tailer's cursor enumerates one day partition per root per day
+      // swept, so its root numbers are converted back to capture roots.
+      cursorRootsPerCaptureRoot: ROLLOUT_DISCOVERY_DAYS,
       pendingFiles: attempt?.pendingFiles.length ?? 0,
       entriesThisTick: result.activity.discoveryEntries,
       deferredBeforeIo: options.deferredBeforeIo === true,
       lifetimeEntryLimit: this.lifetimeEntryLimit(options.discoveryLimit),
     });
     return result;
+  }
+
+  /**
+   * The final progress of the cursor this cadence retired, read before it was
+   * closed — `close()` marks a cursor finished, so a snapshot taken after it
+   * could not tell a completed sweep from an abandoned one.
+   */
+  private retiredProgress: DiscoveryProgress | null = null;
+
+  /** Close a cursor, keeping the sweep it ran for this cadence's receipt. */
+  private retire(discovery: IncrementalJsonlDiscovery) {
+    this.retiredProgress = discovery.progress();
+    discovery.close();
   }
 
   /** Roots `plimsoll status` reports for this source, ready or not. */
@@ -525,6 +556,8 @@ export class RolloutTailer {
         .map(root => root.directory) : null;
     result.discoveryErrors = rootErrors;
     if (bindCaptureInventory(this.buffer.database, "codex", this.captureRoots, rootCoverage)) {
+      // A rebind replaces the root set: the sweep in flight counted roots
+      // that no longer describe this source, so it is discarded, not reported.
       this.baselineAttempt?.discovery.close();
       this.captureAttempt?.discovery.close();
       this.baselineAttempt = null;
@@ -672,7 +705,7 @@ export class RolloutTailer {
             filesValidated: attempt.filesValidated,
             statErrors: result.statErrors,
           });
-          attempt.discovery.close();
+          this.retire(attempt.discovery);
           this.baselineAttempt = null;
           result.exhaustive = false;
           result.automaticBudget = automatic.budget.status();
@@ -688,7 +721,7 @@ export class RolloutTailer {
           filesValidated: attempt.filesValidated,
           discoveryErrors: result.discoveryErrors || 1,
         });
-        attempt.discovery.close();
+        this.retire(attempt.discovery);
         this.baselineAttempt = null;
         result.activity.truncated = true;
         result.automaticBudget = automatic.budget.status();
@@ -710,7 +743,7 @@ export class RolloutTailer {
       }
 
       if (attempt.capacityDeferredThisSweep) {
-        attempt.discovery.close();
+        this.retire(attempt.discovery);
         attempt.discovery = this.recentDiscovery(scanNow, options.discoveryLimit, options);
         attempt.capacityDeferredThisSweep = false;
         attempt.newGenerationsThisSweep = 0;
@@ -722,7 +755,7 @@ export class RolloutTailer {
 
       attempt.sweepsCompleted += 1;
       if (attempt.sweepsCompleted < 2 || attempt.newGenerationsThisSweep > 0) {
-        attempt.discovery.close();
+        this.retire(attempt.discovery);
         attempt.discovery = this.recentDiscovery(scanNow, options.discoveryLimit, options);
         attempt.newGenerationsThisSweep = 0;
         result.activity.truncated = true;
@@ -735,7 +768,7 @@ export class RolloutTailer {
         runId: attempt.runId,
         completedAt: new Date().toISOString(),
       });
-      attempt.discovery.close();
+      this.retire(attempt.discovery);
       this.baselineAttempt = null;
       result.excludedGenerations = completed.excludedGenerations;
       result.excludedBytes = completed.currentExcludedBytes;
@@ -1149,10 +1182,11 @@ export class RolloutTailer {
   }
 
   private recentDiscovery(now: Date, limit?: number, _options?: RolloutScanOptions) {
-    const roots = this.directories.flatMap(directory => [0, 1].map((offset) => {
-      const day = new Date(now.getTime() - offset * 24 * 60 * 60 * 1000);
-      return path.join(directory, ...day.toISOString().slice(0, 10).split("-"));
-    }));
+    const roots = this.directories.flatMap(directory =>
+      Array.from({ length: ROLLOUT_DISCOVERY_DAYS }, (_, offset) => {
+        const day = new Date(now.getTime() - offset * 24 * 60 * 60 * 1000);
+        return path.join(directory, ...day.toISOString().slice(0, 10).split("-"));
+      }));
     return new IncrementalJsonlDiscovery(roots, {
       recursive: false,
       matches: (name) => name.startsWith("rollout-") && name.endsWith(".jsonl"),
@@ -1213,7 +1247,7 @@ export class RolloutTailer {
     if (!attempt) return;
     attempt.pendingFiles = advanceAutomaticCaptureFiles(attempt.pendingFiles, files, partial);
     if (attempt.discoveryDone && attempt.pendingFiles.length === 0) {
-      attempt.discovery.close();
+      this.retire(attempt.discovery);
       this.captureAttempt = null;
     }
   }

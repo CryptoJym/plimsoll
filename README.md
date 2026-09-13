@@ -225,7 +225,11 @@ consumed by the label:
 - `rootsTotal` / `rootsEligible` / `rootsStarted` — capture roots configured for
   the source (the count `plimsoll status` reports for roots elsewhere), how many
   of them are currently `ready` and so eligible for a sweep, and how many this
-  sweep has begun. When the two totals differ the reason says so explicitly
+  sweep has begun. All three are capture roots: the codex sweep enumerates a day
+  partition per root per day, and those are converted back before they are
+  published, so `rootsStarted` can never exceed `rootsEligible` and
+  `rootsEligible` can never exceed `rootsTotal`. When the two totals differ the
+  reason says so explicitly
   (`4/22 eligible of 25 configured capture root(s) enumerated`).
 - `entriesThisSweep` / `entriesThisTick` / `pendingFiles` — enumeration progress
   since the sweep began and in this cadence, and the candidates still awaiting
@@ -235,10 +239,14 @@ consumed by the label:
   may visit before it restarts instead of resuming (100000).
 - `converging` — a cursor exists and will resume on the next cadence; it stays
   true for a cadence deferred before any filesystem work, which keeps its cursor.
-  False once the sweep finished or hit `limitReached`.
+  False once the sweep finished, hit `limitReached`, or was retired inside the
+  cadence that reported it.
 - `sweepComplete` — this cadence's cursor finished a full sweep of every eligible
-  root. A cadence with no cursor at all (the baseline phase between sweeps)
-  reports false: no cursor is no receipt.
+  root. A sweep normally ends by being retired the moment it finishes — drained,
+  restarted or closed — and the receipt reports the numbers that cursor held
+  when it was retired, so a completed sweep is reported as complete. A cadence
+  with no cursor at all reports false: no cursor is no receipt. A cursor that
+  hit `limitReached` also reports false — it restarts, it did not finish.
 - `limitReached` / `deferredBeforeIo` — why the cadence ended, when it was not
   the per-tick budget.
 
