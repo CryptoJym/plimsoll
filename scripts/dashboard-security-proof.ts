@@ -1057,22 +1057,37 @@ function activeTimerCount() {
 // them can move a count unless the code itself changed. The audit parses the
 // whole proof file, finds fetchDebuggerPageTarget by name in the tree rather
 // than by a text anchor, and counts syntax nodes inside it: catch clauses with
-// and without a binding, ProofTimeoutError guards in their instanceof and
-// name-string forms, and the one condition-less for loop the retry lives in. A
-// file that will not parse and a function that cannot be found are both red
-// audits; neither can produce a green one.
+// and without a binding, ProofTimeoutError guards, the rejection callbacks the
+// function hands to .catch and .then, and the one endless loop the retry lives
+// in. A file that will not parse and a function that cannot be found are both
+// red audits; neither can produce a green one.
 //
-// What it cannot see: a guard anywhere in this function that binds its error
-// from a callback parameter instead of a catch clause (.catch(rethrowIfTimeout),
-// .catch(error => ...)), a guard that tests ProofTimeoutError identity without
-// naming it (a prototype comparison, an aliased import), a ProofTimeoutError
-// re-raised by a function declared elsewhere and invoked from here, and any
-// shape assembled at run time through eval or new Function. No behavioural check
-// backs the audit up for those: the guard it exists to refuse is dead by
-// construction, so it changes nothing a behavioural check could observe. This is
-// a shape check on one function body and claims nothing past it. The loop form
-// is load-bearing too: the retry must stay a for statement with no condition;
-// a while (true) or do/while rewrite reds the audit with no defect present.
+// Counting catch clauses alone left the error bound somewhere else: a callback
+// parameter. So a guard counts wherever it sits in this function, and every
+// .catch argument and .then rejection handler in it is followed to the body it
+// names — an inline function or arrow, or an identifier resolved to the one
+// function of that name in this file — and that body is counted too. A handler
+// this file cannot resolve is refused rather than read: an unread handler
+// cannot be shown to be guard-free, so it reds the audit. And a guard counts
+// whether or not it spells the class: instanceof and the name string as before,
+// plus a prototype identity test, a constructor identity test, and the class
+// reached through an aliased import or a local alias, resolved to a fixpoint.
+//
+// The retry loop may be a for with no condition, a while (true) or a
+// do { } while (true). They are one loop written three ways, and a maintainer
+// or a linter rewriting one into another is not a defect, so all three are
+// accepted; what stays load-bearing is that there is exactly one endless loop
+// and exactly one bindless try/catch inside it. The receipt names every loop
+// form found in the function, so a red over the loop count reports the shape it
+// found instead of leaving the reader to infer it.
+//
+// What it cannot see: a ProofTimeoutError re-raised by a function this one
+// invokes rather than hands over as a callback, a handler passed to something
+// other than .catch or .then, and any shape assembled at run time through eval
+// or new Function. No behavioural check backs the audit up for those: the guard
+// it exists to refuse is dead by construction, so it changes nothing a
+// behavioural check could observe. This is a shape check on one function body
+// and claims nothing past it.
 const FETCH_TARGET_NAME = "fetchDebuggerPageTarget";
 const TIMEOUT_ERROR_NAME = "ProofTimeoutError";
 
@@ -1086,43 +1101,148 @@ function collectNodes<T extends ts.Node>(root: ts.Node, match: (node: ts.Node) =
   return found;
 }
 
-function isEndlessFor(node: ts.Node): node is ts.ForStatement {
-  return ts.isForStatement(node) && node.condition === undefined;
+function isLoop(node: ts.Node): node is ts.IterationStatement {
+  return ts.isForStatement(node) || ts.isWhileStatement(node) || ts.isDoStatement(node)
+    || ts.isForOfStatement(node) || ts.isForInStatement(node);
 }
 
-// instanceof ProofTimeoutError, name === "ProofTimeoutError", and the same name
-// reached through a switch all count as a guard: each one lets the catch decide
-// it is holding a timeout and rethrow it.
-function isTimeoutGuard(node: ts.Node): node is ts.BinaryExpression | ts.CaseClause {
+// for (;;), while (true) and do { } while (true) are the same endless loop.
+function isEndlessLoop(node: ts.Node): node is ts.IterationStatement {
+  if (ts.isForStatement(node)) return node.condition === undefined;
+  if (ts.isWhileStatement(node) || ts.isDoStatement(node)) {
+    return node.expression.kind === ts.SyntaxKind.TrueKeyword;
+  }
+  return false;
+}
+
+// Named, not counted, so a red over the loop count says which loops are in the
+// function rather than only which one it wanted.
+function describeLoops(root: ts.Node) {
+  return collectNodes(root, isLoop).map((loop) => {
+    if (ts.isForOfStatement(loop)) return "for-of";
+    if (ts.isForInStatement(loop)) return "for-in";
+    const endless = isEndlessLoop(loop);
+    if (ts.isForStatement(loop)) return endless ? "for(;;)" : "for(condition)";
+    if (ts.isWhileStatement(loop)) return endless ? "while(true)" : "while(condition)";
+    return endless ? "do-while(true)" : "do-while(condition)";
+  });
+}
+
+// Every name this file can use to reach the class: the class itself, an import
+// specifier renaming it, and a binding assigned from one of those. Resolved to
+// a fixpoint so a chain of renames still lands on the same class.
+function timeoutErrorNames(sourceFile: ts.SourceFile) {
+  const names = new Set([TIMEOUT_ERROR_NAME]);
+  const specifiers = collectNodes(sourceFile, ts.isImportSpecifier);
+  const rebindings = collectNodes(sourceFile, (node): node is ts.VariableDeclaration =>
+    ts.isVariableDeclaration(node)
+      && ts.isIdentifier(node.name)
+      && node.initializer !== undefined
+      && ts.isIdentifier(node.initializer));
+  let grew = true;
+  while (grew) {
+    grew = false;
+    const add = (name: string) => {
+      if (!names.has(name)) {
+        names.add(name);
+        grew = true;
+      }
+    };
+    for (const specifier of specifiers) {
+      if (names.has((specifier.propertyName ?? specifier.name).text)) add(specifier.name.text);
+    }
+    for (const rebinding of rebindings) {
+      if (names.has((rebinding.initializer as ts.Identifier).text)) add((rebinding.name as ts.Identifier).text);
+    }
+  }
+  return names;
+}
+
+// instanceof ProofTimeoutError, name === "ProofTimeoutError", the same name
+// reached through a switch, and the two identity tests that never spell the
+// class — a prototype comparison and a constructor comparison — all count as
+// a guard: each one lets the handler decide it is holding a timeout and rethrow
+// it. Any name resolved to the class above stands in for the class here.
+function timeoutGuardMatcher(names: Set<string>) {
+  const namesTheClass = (expression: ts.Expression) =>
+    (ts.isIdentifier(expression) && names.has(expression.text))
+      || (ts.isPropertyAccessExpression(expression) && names.has(expression.name.text));
   const namesTheError = (expression: ts.Expression) =>
     ts.isStringLiteralLike(expression) && expression.text === TIMEOUT_ERROR_NAME;
-  if (ts.isCaseClause(node)) return namesTheError(node.expression);
-  if (!ts.isBinaryExpression(node)) return false;
-  const operator = node.operatorToken.kind;
-  if (operator === ts.SyntaxKind.InstanceOfKeyword) {
-    return (ts.isIdentifier(node.right) && node.right.text === TIMEOUT_ERROR_NAME)
-      || (ts.isPropertyAccessExpression(node.right) && node.right.name.text === TIMEOUT_ERROR_NAME);
-  }
-  const isEquality = operator === ts.SyntaxKind.EqualsEqualsEqualsToken
-    || operator === ts.SyntaxKind.EqualsEqualsToken
-    || operator === ts.SyntaxKind.ExclamationEqualsEqualsToken
-    || operator === ts.SyntaxKind.ExclamationEqualsToken;
-  return isEquality && (namesTheError(node.left) || namesTheError(node.right));
+  const readsThePrototype = (expression: ts.Expression) =>
+    ts.isPropertyAccessExpression(expression)
+      && expression.name.text === "prototype"
+      && namesTheClass(expression.expression);
+  const readsAConstructor = (expression: ts.Expression) =>
+    ts.isPropertyAccessExpression(expression) && expression.name.text === "constructor";
+  return (node: ts.Node): node is ts.BinaryExpression | ts.CaseClause => {
+    if (ts.isCaseClause(node)) return namesTheError(node.expression);
+    if (!ts.isBinaryExpression(node)) return false;
+    const operator = node.operatorToken.kind;
+    if (operator === ts.SyntaxKind.InstanceOfKeyword) return namesTheClass(node.right);
+    const isEquality = operator === ts.SyntaxKind.EqualsEqualsEqualsToken
+      || operator === ts.SyntaxKind.EqualsEqualsToken
+      || operator === ts.SyntaxKind.ExclamationEqualsEqualsToken
+      || operator === ts.SyntaxKind.ExclamationEqualsToken;
+    if (!isEquality) return false;
+    if (namesTheError(node.left) || namesTheError(node.right)) return true;
+    if (readsThePrototype(node.left) || readsThePrototype(node.right)) return true;
+    return (readsAConstructor(node.left) && namesTheClass(node.right))
+      || (readsAConstructor(node.right) && namesTheClass(node.left));
+  };
 }
 
 // By name in the tree, both as a declaration and as a function assigned to that
 // name, so moving the function or renaming around it reds the audit instead of
-// silently auditing nothing.
-function findFetchFunction(sourceFile: ts.SourceFile): ts.Node[] {
+// silently auditing nothing. One name can only resolve to one function here:
+// two is a shadow the audit refuses rather than picks between.
+function findFunctionsNamed(sourceFile: ts.SourceFile, name: string): ts.Node[] {
   const declared = collectNodes(sourceFile, (node): node is ts.FunctionDeclaration =>
-    ts.isFunctionDeclaration(node) && node.name?.text === FETCH_TARGET_NAME);
+    ts.isFunctionDeclaration(node) && node.name?.text === name);
   const assigned = collectNodes(sourceFile, (node): node is ts.VariableDeclaration =>
     ts.isVariableDeclaration(node)
       && ts.isIdentifier(node.name)
-      && node.name.text === FETCH_TARGET_NAME
+      && node.name.text === name
       && node.initializer !== undefined
       && (ts.isFunctionExpression(node.initializer) || ts.isArrowFunction(node.initializer)));
   return [...declared, ...assigned.map((declaration) => declaration.initializer as ts.Node)];
+}
+
+function findFetchFunction(sourceFile: ts.SourceFile): ts.Node[] {
+  return findFunctionsNamed(sourceFile, FETCH_TARGET_NAME);
+}
+
+// The rejection handlers the audited function hands to a promise: the argument
+// of .catch and the second argument of .then. An inline function or arrow is
+// its own body; a bare identifier is resolved to the one function of that name
+// in this file. Anything else — an imported handler, a shadowed name, a
+// handler built from an expression — is unresolved, and an unresolved handler
+// reds the audit because its body cannot be read here at all.
+function scanRejectionHandlers(root: ts.Node, sourceFile: ts.SourceFile, isTimeoutGuard: (node: ts.Node) => node is ts.BinaryExpression | ts.CaseClause) {
+  const handlers: ts.Expression[] = [];
+  for (const call of collectNodes(root, ts.isCallExpression)) {
+    if (!ts.isPropertyAccessExpression(call.expression)) continue;
+    const method = call.expression.name.text;
+    if (method === "catch" && call.arguments.length > 0) handlers.push(call.arguments[0]);
+    if (method === "then" && call.arguments.length > 1) handlers.push(call.arguments[1]);
+  }
+  let guards = 0;
+  let unresolved = 0;
+  for (const handler of handlers) {
+    let body: ts.Node | undefined;
+    if (ts.isFunctionExpression(handler) || ts.isArrowFunction(handler)) {
+      body = handler;
+    } else if (ts.isIdentifier(handler)) {
+      const resolved = findFunctionsNamed(sourceFile, handler.text);
+      body = resolved.length === 1 ? resolved[0] : undefined;
+    }
+    if (!body) {
+      unresolved += 1;
+      continue;
+    }
+    if (collectNodes(body, isTimeoutGuard).length > 0) guards += 1;
+  }
+  return { handlers: handlers.length, guards, unresolved };
 }
 
 function auditFetchSource(fileText: string) {
@@ -1133,7 +1253,11 @@ function auditFetchSource(fileText: string) {
     catchBindings: 0,
     bindlessCatches: 0,
     timeoutGuards: 0,
+    rejectionHandlers: 0,
+    callbackGuards: 0,
+    unresolvedHandlers: 0,
     forEver: 0,
+    loopForms: [] as string[],
     retryLoopBindless: false,
     diagnostic: "",
     clean: false,
@@ -1154,11 +1278,13 @@ function auditFetchSource(fileText: string) {
   if (matches.length !== 1) {
     return { ...red, parsed: true, found: matches.length, diagnostic: `expected exactly one ${FETCH_TARGET_NAME}, found ${matches.length}` };
   }
+  const isTimeoutGuard = timeoutGuardMatcher(timeoutErrorNames(sourceFile));
   const catchClauses = collectNodes(matches[0], ts.isCatchClause);
   const catchBindings = catchClauses.filter((clause) => clause.variableDeclaration !== undefined).length;
   const bindlessCatches = catchClauses.length - catchBindings;
   const timeoutGuards = collectNodes(matches[0], isTimeoutGuard).length;
-  const endless = collectNodes(matches[0], isEndlessFor);
+  const rejection = scanRejectionHandlers(matches[0], sourceFile, isTimeoutGuard);
+  const endless = collectNodes(matches[0], isEndlessLoop);
   const retryTries = endless.length === 1 ? collectNodes(endless[0].statement, ts.isTryStatement) : [];
   const retryLoopBindless = retryTries.length === 1
     && retryTries[0].catchClause !== undefined
@@ -1170,39 +1296,72 @@ function auditFetchSource(fileText: string) {
     catchBindings,
     bindlessCatches,
     timeoutGuards,
+    rejectionHandlers: rejection.handlers,
+    callbackGuards: rejection.guards,
+    unresolvedHandlers: rejection.unresolved,
     forEver: endless.length,
+    loopForms: describeLoops(matches[0]),
     retryLoopBindless,
     diagnostic: "",
     clean: catchBindings === 0
       && bindlessCatches === 1
       && timeoutGuards === 0
+      && rejection.guards === 0
+      && rejection.unresolved === 0
       && endless.length === 1
       && retryLoopBindless,
   };
 }
 
 type SourceEdit = { start: number; end: number; text: string };
-type FetchSourceAnchors = { beforeTry: number; catchHeadStart: number; catchHeadEnd: number; afterTry: number };
+type FetchSourceAnchors = {
+  beforeFunction: number;
+  beforeTry: number;
+  catchHeadStart: number;
+  catchHeadEnd: number;
+  afterTry: number;
+  loopHeadStart: number;
+  loopBodyStart: number;
+  loopBodyEnd: number;
+  fetchCallEnd: number;
+  bodyCatchArgStart: number;
+  bodyCatchArgEnd: number;
+};
 
 // Probe sources are spliced at the parser's own node offsets. The probes this
 // replaces mutated whichever "} catch {" String.replace found first, so a
 // literal spelling that text earlier in the function would have retargeted them
 // silently; an offset taken from the catch clause itself cannot be retargeted.
+// The same holds for the rest: the loop header, the fetch call and the handler
+// the body read already hands to .catch are all located in the tree, so a probe
+// that rewrites one of them rewrites the node it named or nothing at all.
 function fetchSourceAnchors(fileText: string): FetchSourceAnchors | undefined {
   const sourceFile = ts.createSourceFile(scriptPath, fileText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const matches = findFetchFunction(sourceFile);
   if (matches.length !== 1) return undefined;
-  const endless = collectNodes(matches[0], isEndlessFor);
+  const endless = collectNodes(matches[0], isEndlessLoop);
   if (endless.length !== 1) return undefined;
   const tries = collectNodes(endless[0].statement, ts.isTryStatement);
   if (tries.length !== 1) return undefined;
   const clause = tries[0].catchClause;
   if (!clause || clause.variableDeclaration) return undefined;
+  const calls = collectNodes(tries[0].tryBlock, ts.isCallExpression);
+  const fetchCalls = calls.filter((call) => ts.isIdentifier(call.expression) && call.expression.text === "fetch");
+  const bodyCatches = calls.filter((call) =>
+    ts.isPropertyAccessExpression(call.expression) && call.expression.name.text === "catch");
+  if (fetchCalls.length !== 1 || bodyCatches.length !== 1 || bodyCatches[0].arguments.length !== 1) return undefined;
   return {
+    beforeFunction: matches[0].getStart(sourceFile),
     beforeTry: tries[0].getStart(sourceFile),
     catchHeadStart: tries[0].tryBlock.getEnd() - 1,
     catchHeadEnd: clause.block.getStart(sourceFile) + 1,
     afterTry: tries[0].getEnd(),
+    loopHeadStart: endless[0].getStart(sourceFile),
+    loopBodyStart: endless[0].statement.getStart(sourceFile),
+    loopBodyEnd: endless[0].statement.getEnd(),
+    fetchCallEnd: fetchCalls[0].getEnd(),
+    bodyCatchArgStart: bodyCatches[0].arguments[0].getStart(sourceFile),
+    bodyCatchArgEnd: bodyCatches[0].arguments[0].getEnd(),
   };
 }
 
@@ -1214,7 +1373,16 @@ function proveFetchSourceAudit(proofSource: string) {
   const checkName = "debugger_target_source_audit_ignores_comments_and_spacing_but_still_catches_a_binding_or_a_guard";
   const anchors = fetchSourceAnchors(proofSource);
   if (!anchors) {
-    check(checkName, false, JSON.stringify({ method: "typescript-ast", error: "retry_catch_anchors_not_found" }));
+    // The anchors go missing exactly when a sabotage lands, so the receipt that
+    // reports it carries the primary audit of the same source: the run that
+    // fails says which counts moved instead of only that the probes were
+    // skipped.
+    check(checkName, false, JSON.stringify({
+      method: "typescript-ast",
+      error: "retry_catch_anchors_not_found",
+      probes: 0,
+      audit: auditFetchSource(proofSource),
+    }));
     return;
   }
   const applyEdits = (edits: SourceEdit[]) => [...edits]
@@ -1224,7 +1392,15 @@ function proveFetchSourceAudit(proofSource: string) {
   const head = (text: string): SourceEdit => ({ start: anchors.catchHeadStart, end: anchors.catchHeadEnd, text });
   const body = (text: string): SourceEdit => ({ start: anchors.catchHeadEnd, end: anchors.catchHeadEnd, text });
   const after = (text: string): SourceEdit => ({ start: anchors.afterTry, end: anchors.afterTry, text });
+  const outside = (text: string): SourceEdit => ({ start: anchors.beforeFunction, end: anchors.beforeFunction, text });
+  const onFetch = (text: string): SourceEdit => ({ start: anchors.fetchCallEnd, end: anchors.fetchCallEnd, text });
+  const bodyHandler = (text: string): SourceEdit => ({ start: anchors.bodyCatchArgStart, end: anchors.bodyCatchArgEnd, text });
+  const loopHead = (text: string): SourceEdit => ({ start: anchors.loopHeadStart, end: anchors.loopBodyStart, text });
+  const beforeLoop = (text: string): SourceEdit => ({ start: anchors.loopHeadStart, end: anchors.loopHeadStart, text });
+  const afterLoopBody = (text: string): SourceEdit => ({ start: anchors.loopBodyEnd, end: anchors.loopBodyEnd, text });
   const guardStatement = "\n        if (error instanceof ProofTimeoutError) throw error;";
+  const rethrowHelper = "function rethrowIfTimeout(error: unknown): never {\n  if (error instanceof ProofTimeoutError) throw error;\n  throw error as Error;\n}\n";
+  const silentHelper = "function ignoreRejection(error: unknown): void {\n  void error;\n}\n";
   const unescapedRegexOpener = "const slashy = /[/*]/;\n      if (slashy.test(url)) attempts += 0;\n      ";
   const named = [
     { name: "unmodified", source: proofSource, expected: true },
@@ -1261,6 +1437,38 @@ function proveFetchSourceAudit(proofSource: string) {
     { name: "nested_looking_block_comment", source: applyEdits([before("/* /* */\n      ")]), expected: true },
     { name: "guard_named_in_a_string_literal", source: applyEdits([before("const prose = \"instanceof ProofTimeoutError\";\n      if (prose.length) attempts += 0;\n      ")]), expected: true },
     { name: "odd_spacing_and_tabs_around_the_catch", source: applyEdits([head("}  \t catch \t {")]), expected: true },
+    // A guard bound by a callback parameter instead of a catch clause, in every
+    // way the rejection path of this function can hand one over, and an
+    // identity test that never spells the class. The catch clause is untouched
+    // in all of them: these are the shapes that audited clean while a live
+    // timeout guard sat in the same rejection path.
+    { name: "callback_guard_through_a_helper_declared_outside_the_function", source: applyEdits([outside(rethrowHelper), onFetch(".catch(rethrowIfTimeout)")]), expected: false },
+    { name: "callback_guard_in_an_inline_arrow_by_prototype_identity", source: applyEdits([onFetch(".catch((error) => { if (Object.getPrototypeOf(error) === ProofTimeoutError.prototype) throw error; throw error; })")]), expected: false },
+    { name: "callback_guard_in_an_inline_arrow_by_constructor_identity", source: applyEdits([onFetch(".catch((error) => { if ((error as Error).constructor === ProofTimeoutError) throw error; throw error; })")]), expected: false },
+    { name: "callback_guard_in_a_function_expression", source: applyEdits([onFetch(".catch(function (error) { if (error instanceof ProofTimeoutError) throw error; throw error; })")]), expected: false },
+    { name: "callback_guard_against_a_local_alias_of_the_class", source: applyEdits([outside("const PTE_ALIAS = ProofTimeoutError;\n"), onFetch(".catch((error) => { if (error instanceof PTE_ALIAS) throw error; throw error; })")]), expected: false },
+    { name: "callback_guard_against_an_aliased_import_of_the_class", source: applyEdits([outside("import { ProofTimeoutError as PTE_IMPORTED } from \"./dashboard-security-proof\";\n"), onFetch(".catch((error) => { if (error instanceof PTE_IMPORTED) throw error; throw error; })")]), expected: false },
+    { name: "callback_guard_on_the_body_cancel_handler", source: applyEdits([bodyHandler("(error) => { if (error instanceof ProofTimeoutError) throw error; }")]), expected: false },
+    { name: "callback_guard_as_a_then_rejection_handler", source: applyEdits([outside(rethrowHelper), onFetch(".then((settled) => settled, rethrowIfTimeout)")]), expected: false },
+    { name: "callback_handler_this_file_cannot_resolve", source: applyEdits([onFetch(".catch(importedRethrow)")]), expected: false },
+    { name: "callback_handler_resolving_to_two_functions", source: applyEdits([outside(rethrowHelper), outside(silentHelper.replace("ignoreRejection", "rethrowIfTimeout")), onFetch(".catch(rethrowIfTimeout)")]), expected: false },
+    { name: "prototype_identity_guard_in_the_bindless_catch", source: applyEdits([body("\n        if (Object.getPrototypeOf(error) === ProofTimeoutError.prototype) throw error;")]), expected: false },
+    { name: "constructor_identity_guard_in_the_bindless_catch", source: applyEdits([body("\n        if ((error as Error).constructor === ProofTimeoutError) throw error;")]), expected: false },
+    { name: "aliased_instanceof_guard_in_the_bindless_catch", source: applyEdits([outside("const PTE_ALIAS = ProofTimeoutError;\n"), body("\n        if (error instanceof PTE_ALIAS) throw error;")]), expected: false },
+    // The same rejection path carrying no guard stays green: reading handlers
+    // must not make a handler a defect.
+    { name: "benign_inline_handler_without_a_guard", source: applyEdits([onFetch(".catch(() => { throw new Error(\"transient\") })")]), expected: true },
+    { name: "benign_handler_through_a_resolved_helper", source: applyEdits([outside(silentHelper), onFetch(".catch(ignoreRejection)")]), expected: true },
+    { name: "benign_handler_naming_the_class_in_a_string", source: applyEdits([onFetch(".catch(() => { const prose = \"instanceof ProofTimeoutError\"; throw new Error(prose) })")]), expected: true },
+    // The endless retry loop, in each form that is the same loop, and in the
+    // forms that are not.
+    { name: "retry_loop_rewritten_as_while_true", source: applyEdits([loopHead("while (true) ")]), expected: true },
+    { name: "retry_loop_rewritten_as_do_while_true", source: applyEdits([loopHead("do "), afterLoopBody(" while (true);")]), expected: true },
+    { name: "retry_loop_with_an_initializer_and_no_condition", source: applyEdits([loopHead("for (let round = 0; ; round += 1) ")]), expected: true },
+    { name: "retry_loop_behind_a_label", source: applyEdits([beforeLoop("retry: ")]), expected: true },
+    { name: "retry_loop_given_a_real_while_condition", source: applyEdits([loopHead("while (attempts < 3) ")]), expected: false },
+    { name: "retry_loop_given_a_real_do_while_condition", source: applyEdits([loopHead("do "), afterLoopBody(" while (attempts < 3);")]), expected: false },
+    { name: "second_endless_loop_around_the_retry", source: applyEdits([beforeLoop("while (true) ")]), expected: false },
   ];
   // Every literal opener that defeated the lexical strip, crossed with every
   // closer it was paired with and with the two sabotages they were used to
@@ -1303,7 +1511,10 @@ function proveFetchSourceAudit(proofSource: string) {
       catchBindings: audit.catchBindings,
       bindlessCatches: audit.bindlessCatches,
       timeoutGuards: audit.timeoutGuards,
+      callbackGuards: audit.callbackGuards,
+      unresolvedHandlers: audit.unresolvedHandlers,
       forEver: audit.forEver,
+      loopForms: audit.loopForms,
       ...(audit.diagnostic ? { diagnostic: audit.diagnostic } : {}),
     };
   });
@@ -1312,7 +1523,7 @@ function proveFetchSourceAudit(proofSource: string) {
   const benign = results.filter((result) => result.expected);
   check(
     checkName,
-    named.length === 34 && matrix.length === 60 && results.length === 94 && mismatches.length === 0,
+    named.length === 57 && matrix.length === 60 && results.length === 117 && mismatches.length === 0,
     JSON.stringify({
       method: "typescript-ast",
       probes: results.length,
