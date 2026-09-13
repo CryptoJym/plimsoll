@@ -1408,8 +1408,8 @@ export function createCollectorServer(
           // kill switch — keeps today's answer exactly: the loss stays visible.
           if (!spooled) throw error;
           observeIntakeSpool(spooled.source, classifyRejectionClient(request));
-          // 202 only after the rename returned. The event is on disk, private
-          // and blanked, and the drain applies it through this same callable.
+          // 202 only after the file and directory flushes returned. The event
+          // is private and blanked; the drain uses this same admission callable.
           response.writeHead(202, { "content-type": "application/json" });
           response.end(JSON.stringify({ status: "hook_spooled", source }));
           return;

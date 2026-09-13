@@ -23,6 +23,7 @@
  * Run: pnpm proof:hook-spool
  */
 import { spawn } from "node:child_process";
+import { hookSpoolDurabilityChecks } from "./lib/hook-spool-durability-checks";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -3057,6 +3058,28 @@ async function caseTheIntakeBlanksAndSummarizes() {
   }
 }
 
+async function caseDeferredCountsAttempts() {
+  const { home } = fixtureHome("deferred-attempts");
+  const collector = await startCollector(home);
+  const lock = holdWriteLock(collector.ledgerPath);
+  try {
+    const saved = writeHookSpoolFile({ home, source: "codex", body: JSON.stringify({
+      id: crypto.randomUUID(), session_id: crypto.randomUUID(), event_type: "session_stop",
+    }) });
+    await collector.drain.tick();
+    await collector.drain.tick();
+    const held = collector.drain.status();
+    check("spool_deferred_counts_attempts_not_distinct_files", saved !== null && held.deferred === 2 && held.pendingFiles === 1 && held.recovered === 0, { deferred: held.deferred, pending: held.pendingFiles, recovered: held.recovered });
+    lock.release();
+    await collector.drain.tick();
+    const drained = collector.drain.status();
+    check("spool_deferred_history_remains_after_recovery", drained.deferred === 2 && drained.pendingFiles === 0 && drained.recovered === 1, { deferred: drained.deferred, pending: drained.pendingFiles, recovered: drained.recovered });
+  } finally {
+    lock.release();
+    await collector.close();
+  }
+}
+
 async function main() {
   // Stage markers on stderr: a hosted-runner hang has to name the case it hung
   // in without waiting for the final report.
@@ -3114,6 +3137,10 @@ async function main() {
     await caseTheIntakeSpoolsNothingElse();
     stage("z_intake_blanking_and_summary");
     await caseTheIntakeBlanksAndSummarizes();
+    stage("durability_flush_and_faults");
+    for (const result of hookSpoolDurabilityChecks(fixtureHome)) check(result.name, result.passed, result.detail);
+    stage("deferred_means_attempts");
+    await caseDeferredCountsAttempts();
     stage("report");
   } finally {
     for (const [key, value] of previousEnv) {
