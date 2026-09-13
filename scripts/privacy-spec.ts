@@ -40,6 +40,10 @@ import {
   SPOOL_PROTECTED_IDENTITY_VARIANT_EXAMPLES,
   type SpoolDerivationInputDisclosure,
 } from "../packages/collector-cli/src/hook-spool";
+import {
+  SPOOL_UNSPLIT_PROTECTED_SPELLINGS,
+  SPOOL_WORD_SPLIT_DROPPED_SPELLINGS,
+} from "./lib/spool-spelling-corpus";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const docPath = path.join(repoRoot, "docs", "privacy-spec.md");
@@ -47,6 +51,7 @@ const scriptsDir = path.join(repoRoot, "scripts");
 const SOURCE_SCHEMAS = "packages/shared/src/schemas.ts";
 const SOURCE_POLICY = "packages/shared/src/policy.ts";
 const SOURCE_HOOK_SPOOL = "packages/collector-cli/src/hook-spool.ts";
+const SOURCE_SPELLING_CORPUS = "scripts/lib/spool-spelling-corpus.ts";
 
 type FieldNote = {
   name: string;
@@ -73,6 +78,13 @@ export type PrivacySpecModel = {
    * covers anyway, so the page names what an operator will actually find.
    */
   spoolProtectedIdentityVariants: string[];
+  /**
+   * Review r1 (r2 round), F1 — the two classes the collector's two rules cut a
+   * protected name into, so the page can state the precedence as a measured
+   * fact instead of the false "every spelling" it carried before.
+   */
+  spoolWordSplitDroppedSpellings: string[];
+  spoolUnsplitProtectedSpellings: string[];
   spoolRejectedRetentionDays: number;
   /** The bound both spool writers — the hook client and the collector's intake — share. */
   spoolMaxFiles: number;
@@ -146,7 +158,7 @@ export const PROOF_CHECKS: Record<string, ProofCheckRef> = {
       "r_the_suppression_receipts_are_identical_live_and_recovered",
       "r_the_ledger_never_held_the_paths_either",
       "r_every_protected_identity_name_is_blanked_or_declared",
-      "r_a_protected_name_the_drop_rule_strips_is_blanked_in_every_spelling",
+      "r_every_spelling_mirrors_the_ledger_except_the_declared_derivation_inputs",
       "r_a_declared_protected_identity_is_raw_in_the_spool_and_hashed_identically_in_both_rows",
       "r_blanking_a_declared_protected_identity_would_change_what_the_ledger_persists",
       "z_the_intake_spool_file_holds_only_the_allowlisted_path_value",
@@ -244,6 +256,8 @@ export function collectPrivacySpecModel(): PrivacySpecModel {
     spoolDirectory: HOOK_SPOOL_DIRECTORY,
     spoolDerivationInputs: [...SPOOL_DERIVATION_INPUT_DISCLOSURE],
     spoolProtectedIdentityVariants: [...SPOOL_PROTECTED_IDENTITY_VARIANT_EXAMPLES],
+    spoolWordSplitDroppedSpellings: [...SPOOL_WORD_SPLIT_DROPPED_SPELLINGS],
+    spoolUnsplitProtectedSpellings: [...SPOOL_UNSPLIT_PROTECTED_SPELLINGS],
     spoolRejectedRetentionDays: HOOK_SPOOL_LIMITS.rejectedMaxAgeMs / (24 * 60 * 60 * 1000),
     spoolMaxFiles: HOOK_SPOOL_LIMITS.maxFiles,
     spoolMaxBytesMiB: HOOK_SPOOL_LIMITS.maxBytes / (1024 * 1024),
@@ -464,8 +478,13 @@ export function renderPrivacySpec(model: PrivacySpecModel): string {
   lines.push(`   collector reads from the raw body BEFORE suppressing them, to derive`);
   lines.push(`   something it persists. Exact on purpose — the readers that derive from`);
   lines.push(`   them match exact names too, so a case or separator variant of one of`);
-  lines.push(`   these is not a derivation input and is emptied like any other`);
-  lines.push(`   sensitive key.`);
+  lines.push(`   these is NOT a derivation input under this rule. It is then judged by`);
+  lines.push(`   the DROP rule and by rule 2 like any other key, and which way it lands`);
+  lines.push(`   is measured rather than assumed: \`CWD\` and \`WORKDIR\` are emptied,`);
+  lines.push(`   because the DROP rule's word split still finds \`cwd\` and \`workdir\``);
+  lines.push(`   inside them, while \`cWd\`, \`workingdirectory\` and`);
+  lines.push(`   \`CURRENTWORKINGDIRECTORY\` are not emptied — no word split reaches`);
+  lines.push(`   inside those, so rule 2 keeps them for the reason it gives next.`);
   lines.push(`2. **By the ledger's own rule over NORMALIZED names**`);
   lines.push(`   (\`spoolKeepsProtectedIdentityRaw\`): a key whose name, with every`);
   lines.push(`   non-alphanumeric character removed and then lowercased, matches a`);
@@ -474,11 +493,49 @@ export function renderPrivacySpec(model: PrivacySpecModel): string {
   lines.push(`   DROP rule above does not already strip, keeps its raw value. This is a`);
   lines.push(`   rule, not a list of spellings: ${model.spoolProtectedIdentityVariants.slice(0, 3).map((key) => `\`${key}\``).join(", ")}`);
   lines.push(`   and \`${model.spoolProtectedIdentityVariants.at(-1)}\` are exempt exactly as \`account_id\` is, rest raw`);
-  lines.push(`   for the same reason, and are covered by this disclosure. The DROP rule`);
-  lines.push(`   runs FIRST here exactly as it runs first in the ledger, so a protected`);
-  lines.push(`   name the sanitizer strips outright — \`user.email\`, \`transcript_path\`,`);
-  lines.push(`   \`file_path\`, and every spelling of them — is still emptied, never`);
-  lines.push(`   exempt.`);
+  lines.push(`   for the same reason, and are covered by this disclosure.`);
+  lines.push(``);
+  lines.push(`**Which rule wins, exactly.** The DROP rule runs FIRST here exactly as it`);
+  lines.push(`runs first in the ledger, so it wins wherever it FIRES — but it fires on the`);
+  lines.push(`spelling, not on the name. \`isSensitiveMetadataSemanticKey\` splits a key`);
+  lines.push(`into words (\`user.email\` → \`user\`, \`email\`) and matches a word; rule 2`);
+  lines.push(`deletes the separators instead. The two rules therefore cut the same name`);
+  lines.push(`differently, and a protected name lands on either side of the precedence`);
+  lines.push(`depending on how it is spelled.`);
+  lines.push(``);
+  lines.push(`- A spelling the word split REACHES is emptied, and emptying it loses`);
+  lines.push(`  nothing: the ledger drops that key outright and stores nothing derived`);
+  lines.push(`  from it. The ${model.spoolWordSplitDroppedSpellings.length} measured spellings of this case are`);
+  lines.push(`  \`${model.spoolWordSplitDroppedSpellings.join("`, `")}\``);
+  lines.push(`  (\`SPOOL_WORD_SPLIT_DROPPED_SPELLINGS\`, \`${SOURCE_SPELLING_CORPUS}\`).`);
+  lines.push(`- A spelling the word split CANNOT reach is NOT emptied. It normalizes`);
+  lines.push(`  onto a protected identity name, so the ledger HASHES it instead of`);
+  lines.push(`  dropping it, and rule 2 then keeps its raw value for exactly the reason`);
+  lines.push(`  it keeps \`account_id\`'s — an emptied value would make the recovered row`);
+  lines.push(`  carry the hash of \`""\` instead of the hash of the identity. So an email`);
+  lines.push(`  address CAN rest raw in a spool file, under a spelling the ledger`);
+  lines.push(`  hashes, until the drain applies the file. The ${model.spoolUnsplitProtectedSpellings.length} measured spellings of`);
+  lines.push(`  this case are \`${model.spoolUnsplitProtectedSpellings.join("`, `")}\``);
+  lines.push(`  (\`SPOOL_UNSPLIT_PROTECTED_SPELLINGS\`, \`${SOURCE_SPELLING_CORPUS}\`).`);
+  lines.push(``);
+  lines.push(`One rule covers both cases and is the one to read this section by: the`);
+  lines.push(`spool empties a value exactly when the ledger drops the key — never more,`);
+  lines.push(`never less — with rule 1's exact derivation-input names as the single`);
+  lines.push(`declared exception, where the spool deliberately keeps a value the ledger`);
+  lines.push(`deliberately drops.`);
+  lines.push(`\`r_every_spelling_mirrors_the_ledger_except_the_declared_derivation_inputs\``);
+  lines.push(`drives \`sanitizeForPolicy\` itself over every spelling named here, in both`);
+  lines.push(`the top-level and the OTLP \`{key, value}\` attribute shape, and fails`);
+  lines.push(`naming any spelling where the two disagree.`);
+  lines.push(``);
+  lines.push(`One limit on what rule 2 buys, in the OTLP \`{key, value}\` attribute shape:`);
+  lines.push(`the spool cannot know which attributes the ledger's metadata admission will`);
+  lines.push(`later accept. A variant the sanitizer hashes but the admission then`);
+  lines.push(`discards as unknown — \`organization.id\` as a resource attribute, measured —`);
+  lines.push(`rests raw in the spool file until the drain applies it while the ledger`);
+  lines.push(`stores nothing derived from it, so in that shape the raw hold buys no`);
+  lines.push(`fidelity. It is the same class as the kept-then-discarded value disclosed`);
+  lines.push(`above, reached through a key the ledger hashed rather than kept.`);
   lines.push(``);
   lines.push(`The table below is the canonical spelling of each exempt name with its`);
   lines.push(`reason. For rule 2 it is the canonical column, not the extent: every`);

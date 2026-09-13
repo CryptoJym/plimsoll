@@ -275,8 +275,13 @@ a lost repository linkage, or an identity hash computed from nothing.
    collector reads from the raw body BEFORE suppressing them, to derive
    something it persists. Exact on purpose — the readers that derive from
    them match exact names too, so a case or separator variant of one of
-   these is not a derivation input and is emptied like any other
-   sensitive key.
+   these is NOT a derivation input under this rule. It is then judged by
+   the DROP rule and by rule 2 like any other key, and which way it lands
+   is measured rather than assumed: `CWD` and `WORKDIR` are emptied,
+   because the DROP rule's word split still finds `cwd` and `workdir`
+   inside them, while `cWd`, `workingdirectory` and
+   `CURRENTWORKINGDIRECTORY` are not emptied — no word split reaches
+   inside those, so rule 2 keeps them for the reason it gives next.
 2. **By the ledger's own rule over NORMALIZED names**
    (`spoolKeepsProtectedIdentityRaw`): a key whose name, with every
    non-alphanumeric character removed and then lowercased, matches a
@@ -285,11 +290,49 @@ a lost repository linkage, or an identity hash computed from nothing.
    DROP rule above does not already strip, keeps its raw value. This is a
    rule, not a list of spellings: `organization.id`, `account.id`, `account.uuid`
    and `ACCOUNT_ID` are exempt exactly as `account_id` is, rest raw
-   for the same reason, and are covered by this disclosure. The DROP rule
-   runs FIRST here exactly as it runs first in the ledger, so a protected
-   name the sanitizer strips outright — `user.email`, `transcript_path`,
-   `file_path`, and every spelling of them — is still emptied, never
-   exempt.
+   for the same reason, and are covered by this disclosure.
+
+**Which rule wins, exactly.** The DROP rule runs FIRST here exactly as it
+runs first in the ledger, so it wins wherever it FIRES — but it fires on the
+spelling, not on the name. `isSensitiveMetadataSemanticKey` splits a key
+into words (`user.email` → `user`, `email`) and matches a word; rule 2
+deletes the separators instead. The two rules therefore cut the same name
+differently, and a protected name lands on either side of the precedence
+depending on how it is spelled.
+
+- A spelling the word split REACHES is emptied, and emptying it loses
+  nothing: the ledger drops that key outright and stores nothing derived
+  from it. The 27 measured spellings of this case are
+  `user.email`, `userEmail`, `user_email`, `EMAIL`, `email_address`, `emailAddress`, `account_email`, `accountEmail`, `actor_email`, `actorEmail`, `owner_email`, `ownerEmail`, `transcript_path`, `transcriptPath`, `file_path`, `filePath`, `FILE_PATH`, `full_path`, `fullPath`, `project_path`, `projectPath`, `repo_path`, `repoPath`, `repository_url`, `repositoryUrl`, `workspace_path`, `workspacePath`
+  (`SPOOL_WORD_SPLIT_DROPPED_SPELLINGS`, `scripts/lib/spool-spelling-corpus.ts`).
+- A spelling the word split CANNOT reach is NOT emptied. It normalizes
+  onto a protected identity name, so the ledger HASHES it instead of
+  dropping it, and rule 2 then keeps its raw value for exactly the reason
+  it keeps `account_id`'s — an emptied value would make the recovered row
+  carry the hash of `""` instead of the hash of the identity. So an email
+  address CAN rest raw in a spool file, under a spelling the ledger
+  hashes, until the drain applies the file. The 15 measured spellings of
+  this case are `USEREMAIL`, `useremail`, `e_mail`, `EMAILADDRESS`, `ACCOUNTEMAIL`, `OWNEREMAIL`, `TRANSCRIPTPATH`, `transcriptpath`, `FULLPATH`, `PROJECTPATH`, `REPOPATH`, `WORKSPACEPATH`, `REPOSITORYURL`, `repositoryurl`, `cWd`
+  (`SPOOL_UNSPLIT_PROTECTED_SPELLINGS`, `scripts/lib/spool-spelling-corpus.ts`).
+
+One rule covers both cases and is the one to read this section by: the
+spool empties a value exactly when the ledger drops the key — never more,
+never less — with rule 1's exact derivation-input names as the single
+declared exception, where the spool deliberately keeps a value the ledger
+deliberately drops.
+`r_every_spelling_mirrors_the_ledger_except_the_declared_derivation_inputs`
+drives `sanitizeForPolicy` itself over every spelling named here, in both
+the top-level and the OTLP `{key, value}` attribute shape, and fails
+naming any spelling where the two disagree.
+
+One limit on what rule 2 buys, in the OTLP `{key, value}` attribute shape:
+the spool cannot know which attributes the ledger's metadata admission will
+later accept. A variant the sanitizer hashes but the admission then
+discards as unknown — `organization.id` as a resource attribute, measured —
+rests raw in the spool file until the drain applies it while the ledger
+stores nothing derived from it, so in that shape the raw hold buys no
+fidelity. It is the same class as the kept-then-discarded value disclosed
+above, reached through a key the ledger hashed rather than kept.
 
 The table below is the canonical spelling of each exempt name with its
 reason. For rule 2 it is the canonical column, not the extent: every
@@ -327,7 +370,7 @@ Named sentinel checks enforcing this section:
 - `r_the_suppression_receipts_are_identical_live_and_recovered` — `scripts/hook-spool-proof.ts`
 - `r_the_ledger_never_held_the_paths_either` — `scripts/hook-spool-proof.ts`
 - `r_every_protected_identity_name_is_blanked_or_declared` — `scripts/hook-spool-proof.ts`
-- `r_a_protected_name_the_drop_rule_strips_is_blanked_in_every_spelling` — `scripts/hook-spool-proof.ts`
+- `r_every_spelling_mirrors_the_ledger_except_the_declared_derivation_inputs` — `scripts/hook-spool-proof.ts`
 - `r_a_declared_protected_identity_is_raw_in_the_spool_and_hashed_identically_in_both_rows` — `scripts/hook-spool-proof.ts`
 - `r_blanking_a_declared_protected_identity_would_change_what_the_ledger_persists` — `scripts/hook-spool-proof.ts`
 - `z_the_intake_spool_file_holds_only_the_allowlisted_path_value` — `scripts/hook-spool-proof.ts`

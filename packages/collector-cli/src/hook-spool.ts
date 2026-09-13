@@ -257,10 +257,30 @@ function collectorStripsKeyOutright(key: string) {
  *
  * The ORDER is the ledger's order and is the whole safety of the rule: the DROP
  * branches run first there, so a protected name the sanitizer strips outright
- * never reaches its hash branch. `user.email`, `transcript_path`, `file_path`
- * and every spelling of them are protected names AND dropped names; they stay
- * blanked here. Dropping the conjunction would turn fourteen path/email names
- * raw in the spool — the opposite of this fix.
+ * never reaches its hash branch. But the DROP rule fires on the SPELLING, not
+ * on the name — `isSensitiveMetadataSemanticKey` splits a key into WORDS and
+ * matches a word, while `isProtectedMetadataFieldName` deletes the separators —
+ * so the two rules cut the same name differently and this conjunction follows
+ * the ledger either way rather than overruling it in one direction.
+ *
+ * A spelling the word split REACHES is both a protected name and a dropped
+ * name, and stays blanked here: `user.email`, `transcript_path`, `file_path`
+ * and the 27 spellings of them measured. A spelling the word split CANNOT
+ * reach is a protected name the sanitizer does NOT strip — `useremail`,
+ * `e_mail`, `TRANSCRIPTPATH`, `cWd`, 15 measured — so the ledger HASHES it and
+ * this function keeps it raw for the same fidelity reason it keeps
+ * `account_id`. An email address can therefore rest raw in a spool file under
+ * one of those spellings. Review r1 (r2 round), F1: the comment and the
+ * privacy spec used to claim "every spelling of them is emptied", which was
+ * false for those 15 and contradicted the rule stated just above.
+ *
+ * Both directions are measured against `sanitizeForPolicy` itself by
+ * `r_every_spelling_mirrors_the_ledger_except_the_declared_derivation_inputs`
+ * (`scripts/hook-spool-proof.ts`), whose property is the one worth stating:
+ * the spool empties a value exactly when the ledger drops the key, never more
+ * and never less, outside the exact-name derivation inputs above. Dropping the
+ * conjunction would turn fourteen canonical path/email names raw in the spool
+ * — the opposite of this fix.
  */
 export function spoolKeepsProtectedIdentityRaw(key: string) {
   return !collectorStripsKeyOutright(key) && isProtectedMetadataFieldName(key);

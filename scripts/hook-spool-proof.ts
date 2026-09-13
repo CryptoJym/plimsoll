@@ -24,6 +24,13 @@
  */
 import { spawn } from "node:child_process";
 import { hookSpoolDurabilityChecks } from "./lib/hook-spool-durability-checks";
+import {
+  SPOOL_MIRROR_PROBE_SPELLINGS,
+  SPOOL_RULE_TWO_DISCLOSED_CANONICAL_NAMES,
+  SPOOL_UNSPLIT_PROTECTED_SPELLINGS,
+  SPOOL_WORD_SPLIT_DROPPED_SPELLINGS,
+  normalizedSpelling,
+} from "./lib/spool-spelling-corpus";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -1980,9 +1987,9 @@ async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
     { blanked: blanked?.blanked, body: blankedBody },
   );
 
-  // Review r3, N3 and review r4, F1 — completeness, in the only direction that
-  // matters: no protected name may keep its raw value in a spool file WITHOUT
-  // being declared, IN ANY SPELLING.
+  // Review r3, N3; review r4, F1; review r1 (r2 round), F2 — completeness, in
+  // the only direction that matters: no protected name may keep its raw value
+  // in a spool file WITHOUT a human having declared it, IN ANY SPELLING.
   //
   // The corpus is the shared list itself — so a name added to
   // `protectedMetadataFieldNames` later fails here until it is blanked or
@@ -1992,17 +1999,28 @@ async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
   // measured in BOTH shapes the blanker judges: a top-level key, and an OTLP
   // `{key, value}` attribute, which is how a real exporter emits them.
   //
-  // The declaration test is the RULE the privacy spec now states — the
-  // exact-name group, or `spoolKeepsProtectedIdentityRaw` — not membership of
-  // the table. Keyed on the table, this check passes on a literal list while
-  // thirteen measured spellings rest raw beside it, which is the defect.
+  // WHAT COUNTS AS DECLARED, and why r1's answer was worthless: r1 tested it
+  // with `spoolKeepsProtectedIdentityRaw` — the same predicate that decides
+  // whether the value rests raw. "Rests raw" and "is declared" were then the
+  // same sentence, `undeclaredRaw` could not be non-empty whatever the code
+  // did, and the reviewer proved it by adding `tenant_operator_id` to
+  // `protectedMetadataFieldNames`: 121/121 passed while a brand-new identity
+  // name rested raw and self-declared. Declaration is now membership of
+  // `SPOOL_RULE_TWO_DISCLOSED_CANONICAL_NAMES`, which is typed by hand and
+  // derived from nothing, matched the way the ledger matches — normalized, so
+  // one hand-written canonical name covers every spelling of it. A protected
+  // identity name that nobody has written down fails here, and regenerating
+  // the page does not make the failure go away.
   const declaredByExactName = new Set(
     SPOOL_DERIVATION_INPUT_DISCLOSURE.filter((entry) => entry.match === "exact_name").map(
       (entry) => entry.key,
     ),
   );
+  const disclosedRuleTwoNormalized = new Set(
+    SPOOL_RULE_TWO_DISCLOSED_CANONICAL_NAMES.map((name) => normalizedSpelling(name)),
+  );
   const declaredBySpec = (key: string) =>
-    declaredByExactName.has(key) || spoolKeepsProtectedIdentityRaw(key);
+    declaredByExactName.has(key) || disclosedRuleTwoNormalized.has(normalizedSpelling(key));
   const spoolTreatmentOf = (key: string) => {
     const classify = (value: unknown, raw: unknown) =>
       value === "" ? "blanked" : JSON.stringify(value) === JSON.stringify(raw) ? "raw" : "neither";
@@ -2041,6 +2059,38 @@ async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
   const shapesDisagree = protectedOutcomes.filter(
     (outcome) => outcome.topLevel !== outcome.otlpAttribute,
   );
+  // ...and the other half of review r1's F2: the canonical column the privacy
+  // spec renders is DERIVED (`protectedMetadataFieldNames` filtered by the
+  // predicate), so the page and the predicate move together and neither is a
+  // decision. Pin both to the hand-written list, in both directions — a name
+  // the predicate exempts that nobody wrote down is undisclosed, and a name
+  // written down that the predicate no longer exempts is a stale disclosure.
+  const derivedRuleTwoNames = [...SPOOL_PROTECTED_IDENTITY_KEYS].sort();
+  const disclosedRuleTwoNames = [...SPOOL_RULE_TWO_DISCLOSED_CANONICAL_NAMES].sort();
+  const renderedRuleTwoRows = SPOOL_DERIVATION_INPUT_DISCLOSURE.filter(
+    (entry) => entry.match === "normalized_name",
+  )
+    .map((entry) => entry.key)
+    .sort();
+  const ruleTwoUndisclosed = derivedRuleTwoNames.filter(
+    (name) => !disclosedRuleTwoNames.includes(name),
+  );
+  const ruleTwoStaleDisclosure = disclosedRuleTwoNames.filter(
+    (name) => !derivedRuleTwoNames.includes(name),
+  );
+  // The hand list is matched with a COPY of the ledger's normalizer, because
+  // the real one is not exported. Hold the copy to the real thing over every
+  // name measured here, so the copy cannot drift into declaring more than a
+  // person agreed to.
+  const normalizerCopyDisagrees = protectedOutcomes
+    .map((outcome) => outcome.name)
+    .filter(
+      (name) =>
+        isProtectedMetadataFieldName(name) !==
+        protectedMetadataFieldNames.some(
+          (canonical) => normalizedSpelling(canonical) === normalizedSpelling(name),
+        ),
+    );
   check(
     "r_every_protected_identity_name_is_blanked_or_declared",
     protectedOutcomes.length ===
@@ -2048,6 +2098,10 @@ async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
       SPOOL_PROTECTED_IDENTITY_VARIANT_EXAMPLES.length > 0 &&
       undeclaredRaw.length === 0 &&
       shapesDisagree.length === 0 &&
+      ruleTwoUndisclosed.length === 0 &&
+      ruleTwoStaleDisclosure.length === 0 &&
+      normalizerCopyDisagrees.length === 0 &&
+      JSON.stringify(renderedRuleTwoRows) === JSON.stringify(disclosedRuleTwoNames) &&
       protectedOutcomes.every(
         (outcome) => outcome.topLevel === "blanked" || outcome.topLevel === "raw",
       ),
@@ -2066,67 +2120,148 @@ async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
         otlpAttribute: outcome.otlpAttribute,
       })),
       shapesDisagree: shapesDisagree.map((outcome) => outcome.name),
+      ruleTwoDisclosedByHand: disclosedRuleTwoNames.length,
+      ruleTwoRenderedRows: renderedRuleTwoRows.length,
+      ruleTwoUndisclosed,
+      ruleTwoStaleDisclosure,
+      normalizerCopyDisagrees,
     },
   );
 
-  // The other direction, and the whole safety of keying the exemption on a
-  // normalizer: the DROP branches run FIRST here exactly as they run first in
-  // `sanitizeRoutineMetadata`, so a protected name the sanitizer strips
-  // outright stays blanked in every spelling. `isProtectedMetadataFieldName`
-  // alone — without the `!collectorStripsKeyOutright` conjunction — would have
-  // turned every one of these raw in the spool, which is the opposite of the
-  // fix it is part of.
-  const droppedProtectedSpellings = [
-    "user.email",
-    "userEmail",
-    "user_email",
-    "EMAIL",
-    "email_address",
-    "emailAddress",
-    "account_email",
-    "accountEmail",
-    "actor_email",
-    "actorEmail",
-    "owner_email",
-    "ownerEmail",
-    "transcript_path",
-    "transcriptPath",
-    "file_path",
-    "filePath",
-    "FILE_PATH",
-    "full_path",
-    "fullPath",
-    "project_path",
-    "projectPath",
-    "repo_path",
-    "repoPath",
-    "repository_url",
-    "repositoryUrl",
-    "workspace_path",
-    "workspacePath",
-  ];
-  const droppedOutcomes = droppedProtectedSpellings.map((name) => ({
-    name,
-    protectedByTheLedgersRule: isProtectedMetadataFieldName(name),
-    ...spoolTreatmentOf(name),
-  }));
+  // Review r1 (r2 round), F1 — this replaces
+  // `r_a_protected_name_the_drop_rule_strips_is_blanked_in_every_spelling`,
+  // which asserted something FALSE over a corpus that could not show it. Its
+  // 27 spellings were all separator-bearing, so the DROP rule's word split
+  // reached every one of them and the check passed forever — while
+  // `useremail`, `TRANSCRIPTPATH` and `cWd` were protected names the DROP rule
+  // does NOT strip, which the ledger HASHES and the spool therefore holds raw.
+  // An email address can rest in a spool file. The old name denied it.
+  //
+  // The true property is a MIRROR, and it is the one worth proving in both
+  // directions: the spool empties a value exactly when the ledger drops the
+  // key, in both shapes. Blanking more than the ledger drops would make a
+  // recovered row carry the hash of `""` in place of an identity; blanking
+  // less would hold on disk what the ledger refuses to store.
+  //
+  // The oracle is `sanitizeForPolicy` itself, driven here over the same key in
+  // the same two shapes — never a table of expected outcomes. A hand-written
+  // table is exactly how r1 shipped a check that agreed with a false sentence.
+  //
+  // The corpus carries BOTH classes plus adversarial probes: the 27
+  // word-splittable spellings, the 15 separator-less ones review r1 measured,
+  // 13 of this round's own (case variants of the derivation inputs, unusual
+  // separators, near-misses the ledger keeps PLAIN), and the shared list and
+  // its variant examples. `scripts/lib/spool-spelling-corpus.ts` holds them so
+  // the privacy spec prints the same spellings this check measures.
+  //
+  // ONE exception, and it is rule 1 rather than a leak: the exact-name
+  // derivation inputs are values the collector reads from the raw body before
+  // the ledger drops the key, so there the spool deliberately holds what the
+  // ledger deliberately drops. That divergence is allowed in ONE direction
+  // only — the spool may never blank a key the ledger keeps or hashes, for any
+  // key at all — and the diverging names are printed.
+  const ledgerTreatmentOf = (key: string) => {
+    const top = sanitizeForPolicy({ [key]: IDENTITY_CANARY }, DEFAULT_POLICY).value as Record<
+      string,
+      unknown
+    >;
+    const attribute = { stringValue: IDENTITY_CANARY };
+    const otlp = sanitizeForPolicy(
+      { resource: { attributes: [{ key, value: attribute }] } },
+      DEFAULT_POLICY,
+    ).value as { resource?: { attributes?: Array<Record<string, unknown>> } };
+    const attributes = otlp.resource?.attributes ?? [];
+    return {
+      ledgerTopLevel: !(key in top)
+        ? "dropped"
+        : top[key] === IDENTITY_CANARY
+          ? "kept"
+          : "hashed",
+      ledgerOtlpAttribute:
+        attributes.length === 0
+          ? "dropped"
+          : JSON.stringify(attributes[0]?.value) === JSON.stringify(attribute)
+            ? "kept"
+            : "hashed",
+    };
+  };
+  const exactNameDerivationInputs = new Set<string>(SPOOL_DERIVATION_INPUT_KEYS);
+  const mirrorCorpusSources = {
+    canonical: [...protectedMetadataFieldNames],
+    variantExamples: [...SPOOL_PROTECTED_IDENTITY_VARIANT_EXAMPLES],
+    wordSplitDropped: [...SPOOL_WORD_SPLIT_DROPPED_SPELLINGS],
+    unsplitProtected: [...SPOOL_UNSPLIT_PROTECTED_SPELLINGS],
+    mirrorProbes: [...SPOOL_MIRROR_PROBE_SPELLINGS],
+  };
+  const mirrorCorpus = [...new Set(Object.values(mirrorCorpusSources).flat())];
+  const mirrorRows = mirrorCorpus.map((key) => {
+    const spool = spoolTreatmentOf(key);
+    const ledger = ledgerTreatmentOf(key);
+    return {
+      key,
+      derivationInput: exactNameDerivationInputs.has(key),
+      exemptByRuleTwo: spoolKeepsProtectedIdentityRaw(key),
+      spoolTopLevel: spool.topLevel,
+      spoolOtlpAttribute: spool.otlpAttribute,
+      ...ledger,
+      mirrorsTopLevel: (spool.topLevel === "blanked") === (ledger.ledgerTopLevel === "dropped"),
+      mirrorsOtlpAttribute:
+        (spool.otlpAttribute === "blanked") === (ledger.ledgerOtlpAttribute === "dropped"),
+    };
+  });
+  const mirrorBreaks = mirrorRows.filter(
+    (row) => !row.derivationInput && !(row.mirrorsTopLevel && row.mirrorsOtlpAttribute),
+  );
+  // The direction that is never allowed, for ANY key including rule 1's: the
+  // spool emptying a value the ledger would have kept or hashed.
+  const spoolBlanksWhatTheLedgerPersists = mirrorRows.filter(
+    (row) =>
+      (row.spoolTopLevel === "blanked" && row.ledgerTopLevel !== "dropped") ||
+      (row.spoolOtlpAttribute === "blanked" && row.ledgerOtlpAttribute !== "dropped"),
+  );
+  const declaredDivergences = mirrorRows.filter(
+    (row) => row.derivationInput && !(row.mirrorsTopLevel && row.mirrorsOtlpAttribute),
+  );
+  // A corpus that had drifted to one class would pass this vacuously, which is
+  // the r1 defect. Require every outcome the two rules can produce to be
+  // present: a key the ledger drops, one it hashes, one it keeps plain, and
+  // both spool outcomes.
+  const ledgerOutcomesCovered = [...new Set(mirrorRows.map((row) => row.ledgerTopLevel))].sort();
+  const spoolOutcomesCovered = [...new Set(mirrorRows.map((row) => row.spoolTopLevel))].sort();
   check(
-    "r_a_protected_name_the_drop_rule_strips_is_blanked_in_every_spelling",
-    droppedOutcomes.length > 0 &&
-      droppedOutcomes.every(
-        (outcome) =>
-          outcome.protectedByTheLedgersRule &&
-          outcome.topLevel === "blanked" &&
-          outcome.otlpAttribute === "blanked",
-      ),
+    "r_every_spelling_mirrors_the_ledger_except_the_declared_derivation_inputs",
+    mirrorRows.length > 0 &&
+      Object.values(mirrorCorpusSources).every(
+        (source) => source.length > 0 && source.every((key) => mirrorCorpus.includes(key)),
+      ) &&
+      mirrorRows.every(
+        (row) =>
+          (row.spoolTopLevel === "blanked" || row.spoolTopLevel === "raw") &&
+          (row.spoolOtlpAttribute === "blanked" || row.spoolOtlpAttribute === "raw"),
+      ) &&
+      mirrorBreaks.length === 0 &&
+      spoolBlanksWhatTheLedgerPersists.length === 0 &&
+      declaredDivergences.every((row) => exactNameDerivationInputs.has(row.key)) &&
+      JSON.stringify(ledgerOutcomesCovered) === JSON.stringify(["dropped", "hashed", "kept"]) &&
+      JSON.stringify(spoolOutcomesCovered) === JSON.stringify(["blanked", "raw"]),
     {
-      spellings: droppedOutcomes.length,
-      notBlanked: droppedOutcomes
-        .filter((outcome) => outcome.topLevel !== "blanked" || outcome.otlpAttribute !== "blanked")
-        .map((outcome) => outcome.name),
-      notProtectedByTheLedgersRule: droppedOutcomes
-        .filter((outcome) => !outcome.protectedByTheLedgersRule)
-        .map((outcome) => outcome.name),
+      spellings: mirrorRows.length,
+      corpus: Object.fromEntries(
+        Object.entries(mirrorCorpusSources).map(([name, keys]) => [name, keys.length]),
+      ),
+      blankedBecauseTheLedgerDrops: mirrorRows.filter((row) => row.spoolTopLevel === "blanked")
+        .length,
+      rawBecauseTheLedgerHashesOrKeeps: mirrorRows.filter(
+        (row) => row.spoolTopLevel === "raw" && !row.derivationInput,
+      ).length,
+      ledgerOutcomesCovered,
+      mirrorBreaks: mirrorBreaks.map((row) => ({
+        key: row.key,
+        spool: [row.spoolTopLevel, row.spoolOtlpAttribute],
+        ledger: [row.ledgerTopLevel, row.ledgerOtlpAttribute],
+      })),
+      spoolBlanksWhatTheLedgerPersists: spoolBlanksWhatTheLedgerPersists.map((row) => row.key),
+      declaredDivergences: declaredDivergences.map((row) => row.key),
     },
   );
 
@@ -2179,6 +2314,16 @@ async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
       proof: "hook_spool",
       table: "spool_protected_identity_variant_spellings",
       rows: protectedOutcomes.filter((outcome) => outcome.spelling === "variant"),
+    }),
+  );
+  // ...and the whole mirror, spelling by spelling, so the claim "the spool
+  // empties a value exactly when the ledger drops the key" is readable as a
+  // measurement rather than taken from a check name.
+  console.log(
+    JSON.stringify({
+      proof: "hook_spool",
+      table: "spool_ledger_mirror_by_spelling",
+      rows: mirrorRows,
     }),
   );
 }
