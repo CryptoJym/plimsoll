@@ -135,7 +135,7 @@ file can add one on multiple ticks. Use `pendingFiles` and its age for the
 current backlog. The counter is cumulative and does not reset when it drains.
 
 File/directory synchronization uses the same OS primitives as the other durable
-local writers. This is not a hardware power-cut certification. If publication's
+local writers. The primitive is `fsync(2)` (Node's `fs.fsyncSync`), which on macOS does not make the drive flush its own volatile write cache — only `fcntl(F_FULLFSYNC)` does, and Node's `fs` cannot issue it without a native addon this package does not take — so the process-crash window is closed and the power-loss one is only narrowed, which matters most on external or virtualised volumes with a writeback cache. This is not a hardware power-cut certification. If publication's
 directory flush fails, the writer tries to hide its unacknowledged envelope as a
 bounded orphan temporary and returns failure. If the filesystem also refuses
 that rollback, a visible unacknowledged file can remain; no universal exactly-once

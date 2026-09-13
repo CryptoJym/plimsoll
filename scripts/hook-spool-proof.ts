@@ -349,6 +349,7 @@ const HOOK_SPOOL_STATUS_FIELDS = [
   "rejected",
   "deferred",
   "spooledAtIntake",
+  "refused",
   "pendingFiles",
   "pendingBytes",
   "oldestPendingAgeSeconds",
@@ -3058,6 +3059,259 @@ async function caseTheIntakeBlanksAndSummarizes() {
   }
 }
 
+/**
+ * Fault injection for ONE disposable fixture home: the envelope's own flush
+ * fails, exactly the class the reviewer injected, so `writeHookSpoolEnvelope`
+ * refuses after touching the filesystem. Only a `*.json.tmp` under this home's
+ * spool directory is failed; every other flush in the process is untouched.
+ */
+function injectSpoolFlushFailure(home: string) {
+  const directory = hookSpoolDirectory(home);
+  const original = { open: fs.openSync, close: fs.closeSync, sync: fs.fsyncSync };
+  const descriptors = new Map<number, string>();
+  let injected = false;
+  fs.openSync = ((...args: Parameters<typeof fs.openSync>) => {
+    const descriptor = original.open(...args);
+    descriptors.set(descriptor, String(args[0]));
+    return descriptor;
+  }) as typeof fs.openSync;
+  fs.closeSync = (descriptor: number) => {
+    original.close(descriptor);
+    descriptors.delete(descriptor);
+  };
+  fs.fsyncSync = (descriptor: number) => {
+    const file = descriptors.get(descriptor);
+    if (!injected && file?.startsWith(directory + path.sep) && file.endsWith(".json.tmp")) {
+      injected = true;
+      throw Object.assign(new Error("fixture_sync_failure"), { code: "EIO" });
+    }
+    original.sync(descriptor);
+  };
+  return {
+    fired: () => injected,
+    restore() {
+      fs.openSync = original.open;
+      fs.closeSync = original.close;
+      fs.fsyncSync = original.sync;
+    },
+  };
+}
+
+const REFUSED_SESSION_BOUNDED = "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d";
+const REFUSED_SESSION_FLUSH = "8b9c0d1e-2f3a-4b4c-8d5e-6f7a8b9c0d1e";
+const REFUSED_SESSION_DISABLED = "9c0d1e2f-3a4b-4c5d-8e6f-7a8b9c0d1e2f";
+
+/**
+ * Review r1 of PR #321, finding N3 and the bead's route-diagnostics note: a
+ * refused intake spool must MOVE A COUNTER and NAME ITSELF, so a host whose
+ * spool is failing is distinguishable from a host with no busy events at all.
+ *
+ * It is also this proof's "202 on refusal" control, named (finding N5): if the
+ * intake ever acknowledges an event it did not spool, the first check below
+ * fails by name here, before a later case aborts the suite on a file that is
+ * not there.
+ */
+async function caseARefusedIntakeSpoolIsCountedAndNamed() {
+  // (a) Bounds exhausted: the refusal is decided after the directory pass, so
+  // the write was attempted and the client keeps today's 503.
+  {
+    const { home } = fixtureHome("aa1");
+    const collector = await startCollector(home, INTAKE_SPOOL_EXHAUSTED);
+    const lock = holdWriteLock(collector.ledgerPath);
+    try {
+      const captured = await captureWarnings(() =>
+        postHookOverHttp(
+          collector.port,
+          "/hooks/claude-code",
+          {
+            "content-type": "application/json",
+            "x-plimsoll-token": collector.auth.claudeCodeProducer!,
+          },
+          claudeHttpHookBody(REFUSED_SESSION_BOUNDED, "bounded"),
+        ),
+      );
+      const posted = captured.result;
+      const counters = readHookSpoolCounters(home);
+      check(
+        "aa_a_refused_intake_spool_counts_refused_and_still_answers_503",
+        posted.status === 503 &&
+          posted.json?.error === "collector_request_rejected" &&
+          posted.json?.reason === "storage_busy_retry" &&
+          counters.refused === 1 &&
+          // The event was lost, not kept and not quarantined: `refused` is the
+          // only counter that may move here.
+          counters.spooledAtIntake === 0 &&
+          counters.rejected === 0 &&
+          counters.recovered === 0 &&
+          counters.deferred === 0 &&
+          listHookSpoolFiles(home).length === 0 &&
+          sessionRows(collector.buffer, REFUSED_SESSION_BOUNDED) === 0,
+        {
+          status: posted.status,
+          body: posted.json,
+          counters,
+          pending: listHookSpoolFiles(home).length,
+        },
+      );
+      const warnings = parsedWarnings(captured.lines);
+      const busy = warnings.find(
+        (line) =>
+          line.error === "collector_request_rejected" && line.reason === "storage_busy_retry",
+      );
+      check(
+        "aa_the_busy_rejection_line_names_the_route_client_and_refused_spool",
+        busy !== undefined &&
+          busy.route === "/hooks/claude-code" &&
+          typeof busy.clientClass === "string" &&
+          busy.spoolAttempted === true &&
+          busy.spoolRefused === true &&
+          busy.spoolRefusedReason === "spool_bounds" &&
+          // Counts, a class and a route class — never a body, never a path.
+          !captured.lines.join("\n").includes("bounded") &&
+          !captured.lines.join("\n").includes(home),
+        { busy, lines: captured.lines },
+      );
+      const operator = hookSpoolOperatorStatus(home, hookSpoolDaemonEnabled(true));
+      const doctor = hookSpoolDoctorSection(home, hookSpoolDaemonEnabled(true));
+      const statusBody = await collector.statusBody();
+      const daemonSpool = (statusBody.hookSpool ?? {}) as Record<string, unknown>;
+      check(
+        "aa_the_operator_surfaces_carry_the_refused_counter",
+        operator.refused === 1 &&
+          doctor.refused === 1 &&
+          // `/status` reports the drain's snapshot, which carries the field
+          // beside the others it already carries.
+          "refused" in daemonSpool &&
+          hasOperatorHookSpoolFields(operator) &&
+          hasHookSpoolFields(daemonSpool),
+        { operator, doctorRefused: doctor.refused, daemonSpool },
+      );
+      // The drain owns the file the intake just wrote into. Its next counter
+      // write must carry `refused` forward exactly as it carries
+      // `spooledAtIntake`, or a working drain erases the evidence that this
+      // host lost an event.
+      lock.release();
+      writeHookSpoolFile({
+        home,
+        source: "claude_code",
+        body: claudeHttpHookBody(REFUSED_SESSION_BOUNDED, "carried forward"),
+      });
+      await collector.drain.tick();
+      const afterDrain = readHookSpoolCounters(home);
+      check(
+        "aa_a_drain_tick_carries_the_refused_counter_forward",
+        afterDrain.refused === 1 && afterDrain.recovered === 1 && afterDrain.rejected === 0,
+        { afterDrain },
+      );
+    } finally {
+      lock.release();
+      await collector.close();
+    }
+  }
+
+  // (b) The envelope's own flush fails: attempted, refused, counted, and no
+  // visible envelope is left behind for the drain to replay.
+  {
+    const { home } = fixtureHome("aa2");
+    const collector = await startCollector(home);
+    const lock = holdWriteLock(collector.ledgerPath);
+    const fault = injectSpoolFlushFailure(home);
+    try {
+      const captured = await captureWarnings(() =>
+        postHookOverHttp(
+          collector.port,
+          "/hooks/claude-code",
+          {
+            "content-type": "application/json",
+            "x-plimsoll-token": collector.auth.claudeCodeProducer!,
+          },
+          claudeHttpHookBody(REFUSED_SESSION_FLUSH, "flush fault"),
+        ),
+      );
+      fault.restore();
+      const posted = captured.result;
+      const counters = readHookSpoolCounters(home);
+      const busy = parsedWarnings(captured.lines).find(
+        (line) =>
+          line.error === "collector_request_rejected" && line.reason === "storage_busy_retry",
+      );
+      check(
+        "aa_an_injected_spool_flush_failure_counts_refused_and_names_the_write",
+        fault.fired() &&
+          posted.status === 503 &&
+          posted.json?.reason === "storage_busy_retry" &&
+          counters.refused === 1 &&
+          counters.spooledAtIntake === 0 &&
+          counters.rejected === 0 &&
+          listHookSpoolFiles(home).length === 0 &&
+          busy?.spoolAttempted === true &&
+          busy?.spoolRefused === true &&
+          busy?.spoolRefusedReason === "spool_write_failed",
+        {
+          injected: fault.fired(),
+          status: posted.status,
+          counters,
+          pending: listHookSpoolFiles(home).length,
+          busy,
+        },
+      );
+    } finally {
+      fault.restore();
+      lock.release();
+      await collector.close();
+    }
+  }
+
+  // (c) The kill switch: refused before the filesystem is touched, so the line
+  // says which refusal it was and NOTHING is written — no counter, and no
+  // spool directory the operator never asked for.
+  {
+    const { home } = fixtureHome("aa3");
+    setEnv("PLIMSOLL_HOOK_SPOOL", "off");
+    const collector = await startCollector(home);
+    const lock = holdWriteLock(collector.ledgerPath);
+    try {
+      const captured = await captureWarnings(() =>
+        postHookOverHttp(
+          collector.port,
+          "/hooks/claude-code",
+          {
+            "content-type": "application/json",
+            "x-plimsoll-token": collector.auth.claudeCodeProducer!,
+          },
+          claudeHttpHookBody(REFUSED_SESSION_DISABLED, "kill switch"),
+        ),
+      );
+      const posted = captured.result;
+      const busy = parsedWarnings(captured.lines).find(
+        (line) =>
+          line.error === "collector_request_rejected" && line.reason === "storage_busy_retry",
+      );
+      check(
+        "aa_a_disabled_spool_names_itself_without_counting_or_creating_a_directory",
+        posted.status === 503 &&
+          busy?.route === "/hooks/claude-code" &&
+          busy?.spoolAttempted === false &&
+          busy?.spoolRefused === true &&
+          busy?.spoolRefusedReason === "spool_disabled" &&
+          !fs.existsSync(hookSpoolDirectory(home)) &&
+          !fs.existsSync(hookSpoolCountersPath(home)) &&
+          readHookSpoolCounters(home).refused === 0,
+        {
+          status: posted.status,
+          busy,
+          spoolDirectoryCreated: fs.existsSync(hookSpoolDirectory(home)),
+          counters: readHookSpoolCounters(home),
+        },
+      );
+    } finally {
+      lock.release();
+      await collector.close();
+      setEnv("PLIMSOLL_HOOK_SPOOL", undefined);
+    }
+  }
+}
+
 async function caseDeferredCountsAttempts() {
   const { home } = fixtureHome("deferred-attempts");
   const collector = await startCollector(home);
@@ -3085,6 +3339,17 @@ async function main() {
   // in without waiting for the final report.
   const stage = (name: string) => console.error(JSON.stringify({ proof: "hook_spool", stage: name }));
   try {
+    // The two defect classes that used to abort this suite as a stack trace
+    // run FIRST (review r1 of PR #321, finding N5): acknowledging before
+    // publication used to surface as an `ENOENT: chmod` inside
+    // `e_untrusted_files`, and answering 202 for an event the spool refused
+    // used to surface as a `SyntaxError` on an undefined body much later. Both
+    // are named checks now, and a named verdict is reported before any
+    // downstream case can crash on the state they leave.
+    stage("durability_flush_and_faults");
+    for (const result of hookSpoolDurabilityChecks(fixtureHome)) check(result.name, result.passed, result.detail);
+    stage("aa_refused_intake_spool");
+    await caseARefusedIntakeSpoolIsCountedAndNamed();
     stage("a_locked_ledger");
     await caseLockedLedgerRecovers();
     stage("b_refused_connection");
@@ -3137,8 +3402,6 @@ async function main() {
     await caseTheIntakeSpoolsNothingElse();
     stage("z_intake_blanking_and_summary");
     await caseTheIntakeBlanksAndSummarizes();
-    stage("durability_flush_and_faults");
-    for (const result of hookSpoolDurabilityChecks(fixtureHome)) check(result.name, result.passed, result.detail);
     stage("deferred_means_attempts");
     await caseDeferredCountsAttempts();
     stage("report");
@@ -3150,6 +3413,20 @@ async function main() {
     for (const root of roots) fs.rmSync(root, { recursive: true, force: true });
   }
 
+  reportChecks();
+}
+
+/**
+ * The verdict, printed once, whether main() finished or a case threw (review
+ * r1 of PR #321, finding N5). A defect that makes a later case crash on state
+ * it never created used to take every check already collected down with it, so
+ * CI named a stack frame instead of the defect; the checks that ran are
+ * reported either way now. Names, counts and the exit code are unchanged.
+ */
+let reported = false;
+function reportChecks() {
+  if (reported) return;
+  reported = true;
   for (const result of checks) {
     console.log(`${result.passed ? "PASS" : "FAIL"} ${result.name} ${JSON.stringify(result.detail)}`);
   }
@@ -3168,5 +3445,6 @@ async function main() {
 
 main().catch((error) => {
   console.error(error);
+  reportChecks();
   process.exitCode = 1;
 });
