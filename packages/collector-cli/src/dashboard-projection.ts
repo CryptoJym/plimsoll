@@ -52,10 +52,52 @@ const CAPTURE_HEALTH_SOURCES=[
 const CAPTURE_EVENT_CADENCE_MS=60*60_000;
 /** Local activity must reach the projected ledger within this lag. */
 const CAPTURE_LAG_LIMIT_MS=10*60_000;
+/** Count watermarks are independent of the local-activity capture-lag policy. */
+const SESSION_COUNT_MAX_LAG_MS=10*60_000;
 /** Only activity this recent demands fresh capture (older = session over). */
 const CAPTURE_ACTIVITY_LOOKBACK_MS=60*60_000;
 /** A scan receipt older than this cannot confirm local quiet. */
 const CAPTURE_SCAN_STALE_MS=3*60_000;
+
+function countLagLabel(lagMs:number) {
+  let seconds=Math.ceil(Math.abs(lagMs)/1_000);
+  const parts:string[]=[];
+  for(const [size,label] of [[86_400,"d"],[3_600,"h"],[60,"m"],[1,"s"]] as const){
+    const n=Math.floor(seconds/size);seconds%=size;
+    if(n)parts.push(`${n}${label}`);
+  }
+  return parts.join(" ")||"0s";
+}
+
+/** A watermark is evidence of freshness, never a claim of complete linkage. */
+function sessionCountFreshness(eventAt:string|null,sessionAt:string|null,count:number,
+  dayStartMs:number,nowMs:number,label:string){
+  const eventMs=eventAt===null?null:Date.parse(eventAt);
+  const sessionMs=sessionAt===null?null:Date.parse(sessionAt);
+  const invalid=(eventMs!==null&&(!Number.isFinite(eventMs)||eventMs>nowMs))||
+    (sessionMs!==null&&(!Number.isFinite(sessionMs)||sessionMs>nowMs));
+  // Keep the sign: clamping would turn an inconsistent pair into fresh evidence.
+  const lagMs=!invalid&&eventMs!==null&&sessionMs!==null?eventMs-sessionMs:null;
+  let state:"projected"|"lagging"|"unavailable"="projected";
+  let detail:string|null=null;
+  if(invalid){state="unavailable";detail=`${label} timestamps are invalid or in the future`;}
+  else if(lagMs!==null&&lagMs<0){
+    state="unavailable";detail=`${label} projection is ahead of its event watermark by ${countLagLabel(lagMs)}`;
+  }
+  else if(eventMs===null&&(sessionMs!==null||count>0)){
+    state="unavailable";detail=`${label} projection has no corresponding event timestamp`;
+  }
+  else if(eventMs!==null&&eventMs>=dayStartMs){
+    if(sessionMs===null){state="lagging";detail=`today's ${label} activity has no projected session`;}
+    else if(sessionMs<dayStartMs){
+      state="lagging";detail=`${label} projection has not reached the current UTC day (lag ${countLagLabel(lagMs!)})`;
+    }
+    else if(lagMs!==null&&lagMs>SESSION_COUNT_MAX_LAG_MS){
+      state="lagging";detail=`${label} projection lags by ${countLagLabel(lagMs)} (budget ${countLagLabel(SESSION_COUNT_MAX_LAG_MS)})`;
+    }
+  }
+  return {state,lagMs,detail};
+}
 
 type CaptureScanState="complete"|"in_progress"|"limit_reached"|"deferred"|"error"|"unknown"|"not_applicable";
 
@@ -3330,32 +3372,28 @@ export class DashboardProjectionStore {
       const sessions=this.db.prepare(
         `select count(case when ended_at>=? and ended_at<? then 1 end) as ledgerSessionsToday,
           coalesce(sum(case when ended_at>=? and ended_at<? and token_events>0 then 1 else 0 end),0) as tokenSessionsToday,
-          max(case when token_events>0 then ended_at end) as latestTokenSessionAt
+          max(case when token_events>0 then ended_at end) as latestTokenSessionAt,
+          max(ended_at) as latestSessionAt
          from dashboard_session_source_window where days=7 and source=?`,
       ).get(dayStart,dayEnd,dayStart,dayEnd,source) as {
-        ledgerSessionsToday:number;tokenSessionsToday:number;latestTokenSessionAt:string|null};
-      const tokenAtMs=latest.tokenAt===null?null:Date.parse(latest.tokenAt);
-      const sessionAtMs=sessions.latestTokenSessionAt===null?null:Date.parse(sessions.latestTokenSessionAt);
-      const invalidWatermark=(tokenAtMs!==null&&(!Number.isFinite(tokenAtMs)||tokenAtMs>now.getTime()))||
-        (sessionAtMs!==null&&(!Number.isFinite(sessionAtMs)||sessionAtMs>now.getTime()))||
-        (tokenAtMs===null&&sessions.tokenSessionsToday>0);
-      const tokenToday=tokenAtMs!==null&&Number.isFinite(tokenAtMs)&&
-        tokenAtMs>=Date.parse(dayStart)&&tokenAtMs<=now.getTime();
-      const sessionLagMs=!invalidWatermark&&tokenAtMs!==null&&sessionAtMs!==null
-        ?Math.max(0,tokenAtMs-sessionAtMs):null;
-      const countsLagging=tokenToday&&(sessionAtMs===null||sessionAtMs<Date.parse(dayStart)||
-        (sessionLagMs!==null&&sessionLagMs>CAPTURE_LAG_LIMIT_MS));
-      const countState=invalidWatermark?"unavailable":countsLagging?"lagging":"projected";
+        ledgerSessionsToday:number;tokenSessionsToday:number;latestTokenSessionAt:string|null;
+        latestSessionAt:string|null};
+      const tokenCount=sessionCountFreshness(latest.tokenAt,sessions.latestTokenSessionAt,
+        sessions.tokenSessionsToday,Date.parse(dayStart),now.getTime(),"token-session");
+      const ledgerCount=sessionCountFreshness(latest.lastEventAt,sessions.latestSessionAt,
+        sessions.ledgerSessionsToday,Date.parse(dayStart),now.getTime(),"ledger-session");
+      const countState=tokenCount.state==="unavailable"||ledgerCount.state==="unavailable"
+        ?"unavailable":tokenCount.state==="lagging"||ledgerCount.state==="lagging"?"lagging":"projected";
       const countsAvailable=countState==="projected";
-      const countWarning=invalidWatermark
-        ?"token-session count unavailable — projection/event timestamps are inconsistent or in the future"
-        :sessionLagMs!==null
-          ?`token-session count unavailable — latest projected token-bearing session trails token activity by ${minutesAgo(sessionLagMs)}`
-          :"token-session count unavailable — today's token activity has no projected token-bearing session (projection lag or unlinked events)";
+      const details=[tokenCount.detail,ledgerCount.detail].filter((v):v is string=>v!==null);
+      const countWarning=`session count unavailable — ${details.join("; ")}; `+
+        "a linkage fault cannot be distinguished from projection lag or unlinked events until the projection catches up";
       const countLabel=`${sessions.tokenSessionsToday} projected token-bearing session(s) ending today (UTC)`;
       const sessionCountProjection={state:countState,utcDate:today,
         latestTokenSessionAt:sessions.latestTokenSessionAt,latestTokenEventAt:latest.tokenAt,
-        lagMs:sessionLagMs,lagBudgetMs:CAPTURE_LAG_LIMIT_MS,
+        latestSessionAt:sessions.latestSessionAt,latestEventAt:latest.lastEventAt,
+        tokenState:tokenCount.state,ledgerState:ledgerCount.state,
+        lagMs:tokenCount.lagMs,ledgerLagMs:ledgerCount.lagMs,lagBudgetMs:SESSION_COUNT_MAX_LAG_MS,
         projectedTokenSessionsToday:sessions.tokenSessionsToday,
         projectedLedgerSessionsToday:sessions.ledgerSessionsToday};
       const scan=capture==="hook_only"

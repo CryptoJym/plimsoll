@@ -1729,7 +1729,8 @@ async function main() {
     type CountHealth = { source: string; status: string; reason: string;
       tokenSessionsToday: number | null; ledgerSessionsToday: number | null;
       sessionCountProjection: { state: string; latestTokenSessionAt: string | null;
-        lagMs: number | null; utcDate: string; projectedTokenSessionsToday: number } };
+        lagMs: number | null; utcDate: string; projectedTokenSessionsToday: number;
+        ledgerState: string; tokenState: string; ledgerLagMs: number | null } };
     const countFixture = captureHealthFixture("session-count-watermark", 5 * 60_000).fixture;
     const countRows = () => (readySnapshot(countFixture, 30).status.health as {
       sources: CountHealth[] }).sources;
@@ -1789,7 +1790,8 @@ async function main() {
       check("utc_rollover_does_not_reuse_yesterdays_count_as_todays_zero",
         midnightRows.every(row => row.tokenSessionsToday === null &&
           row.sessionCountProjection?.utcDate === "2026-07-16" &&
-          row.sessionCountProjection.state === "lagging" && row.sessionCountProjection.lagMs === 120_000),
+          row.sessionCountProjection.state === "lagging" && row.sessionCountProjection.lagMs === 120_000 &&
+          row.reason.includes("has not reached the current UTC day (lag 2m)")),
         { rows: midnightRows });
     } finally { Date.now = savedNow; }
     const noTokenCount=new LocalEventBuffer(path.join(root,"capture-health-no-token-count.sqlite"));
@@ -1801,6 +1803,22 @@ async function main() {
       noTokenRow.status==="green"&&noTokenRow.tokenSessionsToday===0&&
         noTokenRow.sessionCountProjection?.state==="projected"&&
         noTokenRow.reason.includes("0 projected token-bearing session(s)"),{row:noTokenRow});
+    noTokenCount.database.prepare(`update dashboard_session_source_window set ended_at=?
+      where days=7 and source='codex'`).run(oldEnd);
+    const staleNonToken=(readySnapshot(noTokenCount,30).status.health as {sources:CountHealth[]})
+      .sources.find(row=>row.source==="codex")!;
+    check("fresh_non_token_events_cannot_validate_a_stale_ledger_session_zero",
+      staleNonToken.status==="amber"&&staleNonToken.ledgerSessionsToday===null&&
+        staleNonToken.sessionCountProjection?.ledgerState==="lagging"&&
+        staleNonToken.sessionCountProjection.tokenState==="projected"&&
+        staleNonToken.reason.includes("ledger-session projection has not reached the current UTC day")&&
+        staleNonToken.reason.includes("3d 23h 55m"),{row:staleNonToken});
+    noTokenCount.database.prepare(`delete from dashboard_session_source_window where days=7`).run();
+    const missingNonToken=(readySnapshot(noTokenCount,30).status.health as {sources:CountHealth[]})
+      .sources.find(row=>row.source==="codex")!;
+    check("missing_session_projection_with_live_non_token_events_is_unknown_not_zero",
+      missingNonToken.ledgerSessionsToday===null&&missingNonToken.status==="amber"&&
+        missingNonToken.sessionCountProjection?.ledgerState==="lagging",{row:missingNonToken});
     noTokenCount.close();
     const unlinkedCount=new LocalEventBuffer(path.join(root,"capture-health-unlinked-token-count.sqlite"));
     unlinkedCount.append(event({source:"grok",observedAt:eventAt,inputTokens:10,outputTokens:1}));
@@ -1812,10 +1830,61 @@ async function main() {
         unlinkedRow.sessionCountProjection?.latestTokenSessionAt===null&&
         unlinkedRow.reason.includes("projection lag or unlinked events"),{row:unlinkedRow});
     unlinkedCount.close();
-    const countWork=countFixture.projection.status().counters;
+    countFixture.database.prepare(`update dashboard_source_lifetime
+      set last_event_at=?,last_token_event_at=?`).run(eventAt,eventAt);
+    setProjectedEnd(eventAt);
+    countFixture.database.prepare(`update dashboard_source_lifetime set last_token_event_at=?`)
+      .run(new Date(NOW.getTime()-3*DAY_MS).toISOString());
+    const negativeRows=countRows();
+    check("session_watermark_ahead_of_token_evidence_never_clamps_to_fresh_zero_lag",
+      negativeRows.every(row=>row.status==="amber"&&row.tokenSessionsToday===null&&
+        row.sessionCountProjection?.state==="unavailable"&&
+        Number(row.sessionCountProjection.lagMs)<0&&row.reason.includes("ahead of its event watermark")),
+      {rows:negativeRows});
+    countFixture.database.prepare(`update dashboard_source_lifetime set last_token_event_at=?`).run(eventAt);
+    setProjectedEnd(new Date(Date.parse(eventAt)-601_000).toISOString());
+    check("over_budget_count_reason_preserves_the_excess_second",
+      countRows().every(row=>row.reason.includes("lags by 10m 1s (budget 10m)")),{});
+    setProjectedEnd(eventAt);
+    countFixture.database.prepare(`update dashboard_source_lifetime set last_token_event_at=null`).run();
+    check("projected_token_sessions_without_event_timestamp_are_unavailable",
+      countRows().every(row=>row.tokenSessionsToday===null&&row.sessionCountProjection?.state==="unavailable"&&
+        row.reason.includes("has no corresponding event timestamp")),{});
+    countFixture.database.prepare(`update dashboard_source_lifetime set last_token_event_at=?`).run(eventAt);
+    setProjectedEnd(oldEnd);
+    check("ambiguous_count_failure_discloses_linkage_versus_projection_uncertainty",
+      countRows().every(row=>row.status==="amber"&&row.reason.includes("linkage fault cannot be distinguished")&&
+        row.reason.includes("until the projection catches up")),{});
+    // Trace the real read, not counters that have no writer. Every override
+    // is confined to this synchronous fixture callback and restored in finally.
+    const traceCountRead=(probe:()=>void)=>{
+      const queries:string[]=[],filesystem:string[]=[];
+      const db=countFixture.database,prepare=db.prepare;
+      const io=fs as unknown as Record<string,(...args:unknown[])=>unknown>;
+      const methods=["readFileSync","readdirSync","opendirSync","statSync","lstatSync","accessSync","openSync"];
+      const saved=new Map(methods.map(name=>[name,io[name]!]));
+      db.prepare=((sql:string)=>{queries.push(sql);return prepare.call(db,sql);}) as typeof db.prepare;
+      for(const name of methods)io[name]=(...args:unknown[])=>{
+        filesystem.push(name);return saved.get(name)!(...args);
+      };
+      try{probe();}finally{db.prepare=prepare;for(const [name,fn]of saved)io[name]=fn;}
+      return {queries,filesystem};
+    };
+    const readHasNoRawAccess=(trace:ReturnType<typeof traceCountRead>)=>
+      trace.queries.length>0&&trace.filesystem.length===0&&
+      !trace.queries.some(sql=>/\b(buffered_events|metric_samples)\b/i.test(sql));
+    const traced=traceCountRead(()=>{countRows();});
     check("count_freshness_uses_projection_tables_not_raw_ledger_or_filesystem_scans",
-      countWork.rawRowsScannedByDashboard === 0 && countWork.filesystemEntriesScannedByDashboard === 0,
-      { rawRows: countWork.rawRowsScannedByDashboard, fsEntries: countWork.filesystemEntriesScannedByDashboard });
+      readHasNoRawAccess(traced)&&
+        traced.queries.filter(sql=>sql.includes("from dashboard_session_source_window")).length===3&&
+        traced.queries.filter(sql=>sql.includes("from dashboard_source_lifetime")).length===3,
+      {preparedStatements:traced.queries.length,filesystemCalls:traced.filesystem.length,
+        sessionQueries:traced.queries.filter(sql=>sql.includes("from dashboard_session_source_window"))});
+    const rawControl=traceCountRead(()=>{countRows();countFixture.database.prepare("select count(*) from buffered_events").get();});
+    const fsControl=traceCountRead(()=>{countRows();fs.readdirSync(root);});
+    check("count_read_trace_detects_injected_raw_query_and_filesystem_scan",
+      !readHasNoRawAccess(rawControl)&&!readHasNoRawAccess(fsControl),
+      {rawQueries:rawControl.queries.filter(sql=>sql.includes("buffered_events")).length,filesystemCalls:fsControl.filesystem.length});
     countFixture.close();
 
     // Standing rule for this file pair: every tailer fix ships its twin check

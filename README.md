@@ -240,22 +240,35 @@ The status snapshot's session count is projection evidence, not a fresh raw-ledg
 count. `tokenSessionsToday` counts projected token-bearing sessions whose latest
 event falls inside the current **UTC day**; a token event may belong to an earlier
 day of that session. The label says "projected token-bearing sessions ending
-today (UTC)" accordingly. `sessionCountProjection` publishes the UTC date, the
-latest token-bearing session timestamp, the source's latest token-event timestamp,
-their lag, and the underlying projected counts. A recent non-token session cannot
-advance this token-session watermark.
+today (UTC)" accordingly. `sessionCountProjection` publishes the UTC date,
+separate ledger-session and token-session watermarks, their source-event
+watermarks, signed lags, and the underlying projected counts. A recent non-token
+session cannot advance the token-session watermark.
 
-When today's token evidence is more than the existing **10-minute capture-lag
-budget** ahead of that watermark, or the watermark has not reached today's UTC
-day, `tokenSessionsToday` and `ledgerSessionsToday` are **null**, not zero, and the
-label reports the gap as amber. Missing or inconsistent timestamps also withhold
-the count. The raw projected counts remain explicitly scoped in
-`sessionCountProjection`; even a `projected` state is not proof of complete
-session linkage. An absent session can reflect projection lag **or unlinked
-events**, and this diagnostic does not guess which. This read uses only the same
-materialized session range and source-lifetime tables, never a new ledger scan.
-A real local-activity capture gap stays red and future-event checks stay intact.
-The standalone ledger-side health query retains its existing meaning.
+Each count uses its corresponding source clock: `lastEventAt` for all sessions,
+`lastTokenEventAt` for token-bearing sessions. Today's source activity with no
+matching projected session, a prior-UTC-day watermark, or a lag greater than the
+**10-minute session-count budget** makes the exposed counts **null**, not zero.
+The count budget is separate from the local-activity capture-lag policy. The
+reason names the actual condition: missing projection, prior UTC day, or over
+budget; durations retain seconds and use hours/days rather than huge minute totals.
+
+Invalid/future timestamps, a projection ahead of its source clock, or projected
+session evidence without a corresponding source timestamp also withhold counts.
+Absent timestamps with no projected sessions and no current source activity do
+not invent a problem: zero remains distinguishable from unknown. A token-bearing
+session's end can advance due to a later non-token event; a resulting negative
+lag is withheld conservatively, not relabelled as zero lag or complete linkage.
+Underlying projected values remain visible with their freshness states.
+
+A count that is not vouched for cannot support a red assertion based on that
+count. That case becomes amber and explicitly says a linkage fault cannot yet
+be distinguished from projection lag or unlinked events. This does **not** clear
+the earlier red condition for recent local activity not reaching the event ledger;
+that event-recency check remains first. Future-event checks also remain intact.
+No additional raw-ledger query is made. The standalone ledger-side health query
+retains its existing meaning. Even a `projected` count is not proof that every
+event has a session link; this change does not repair the projection backlog.
 
 The local activity scan is **bounded**: one cadence enumerates at most 256
 directory entries within 50 ms, keeps its cursor, and resumes on the next tick.
