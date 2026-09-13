@@ -27,7 +27,23 @@ const BROWSER_SIGNAL_GRACE_MS = 1_500;
 const BROWSER_PROOF_WALL_MS = 30_000;
 const CDP_SOCKET_OPEN_MS = 2_000;
 const CDP_COMMAND_MS = 5_000;
-const DEBUGGER_TARGET_MS = 2_000;
+// Hosted macos-14 devtools readiness, from the CI logs recorded for this
+// change. The one failing run (34742541538) was still refused 4_648 ms into its
+// browser stage; the four passing runs (34745131093, 34745679177, 34746308701,
+// 34746588143) finished their whole browser stage — launch, targets, CDP,
+// navigation, DOM, teardown — in 5_056, 6_887, 10_583 and 7_722 ms. None of
+// those logs prints a line at Chrome launch or at the first answered
+// /json/list, so readiness is not separable from the stage and only the failing
+// run measures it directly; the deadline is that 4_648 ms with a 2.15x margin,
+// rounded to a whole second. The ceiling still fits the overall wall clock:
+// 10_000 ms plus the slowest observed stage (10_583 ms) stays under
+// BROWSER_PROOF_WALL_MS.
+const DEBUGGER_TARGET_DERIVATION = {
+  failingRunRefusedAfterMs: 4_648,
+  passingRunBrowserStageMs: [5_056, 6_887, 10_583, 7_722],
+  marginMultiple: 2.15,
+} as const;
+const DEBUGGER_TARGET_MS = 10_000;
 const DEBUGGER_TARGET_RETRY_MS = 100;
 const DASHBOARD_READY_MS = 8_000;
 const ABORT_SETTLE_MS = 500;
@@ -880,6 +896,18 @@ function debuggerRetryStep(ms: number, signal: AbortSignal) {
   });
 }
 
+// Chrome answers /json/list with a JSON array of targets. Anything else is a
+// body this step cannot interpret, not a readiness state.
+function parseDebuggerTargets(body: string) {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return undefined;
+  }
+  return Array.isArray(parsed) ? parsed as Array<{ type: string; webSocketDebuggerUrl: string }> : undefined;
+}
+
 async function fetchDebuggerTargets(url: string, signal: AbortSignal) {
   const controller = new AbortController();
   let timedOut = false;
@@ -892,20 +920,32 @@ async function fetchDebuggerTargets(url: string, signal: AbortSignal) {
   try {
     // Chrome can publish DevToolsActivePort before its devtools listener
     // accepts connections, so a refused or reset connection here is transient.
-    // Retry in small steps inside the same unchanged deadline; a genuinely
+    // Retry in small steps inside the deadline sized above; a genuinely
     // unavailable endpoint still fails as debugger_target when it expires.
     for (;;) {
+      let unparseableBody = false;
+      // This catch binds no error on purpose: only fetch and the body read can
+      // throw here, neither makes a ProofTimeoutError, and the outer abort and
+      // the deadline are decided from their own flags. A guard rethrowing a
+      // ProofTimeoutError from this position could never fire.
       try {
         const response = await fetch(url, { signal: controller.signal });
         if (response.ok) {
-          return await response.json() as Array<{ type: string; webSocketDebuggerUrl: string }>;
+          const targets = parseDebuggerTargets(await response.text());
+          if (targets) return targets;
+          unparseableBody = true;
+        } else {
+          await response.body?.cancel().catch(() => undefined);
         }
-        await response.body?.cancel().catch(() => undefined);
-      } catch (error) {
+      } catch {
         if (signal.aborted) throw new ProofTimeoutError("browser_proof_overall");
         if (timedOut) throw new ProofTimeoutError("debugger_target");
-        if (error instanceof ProofTimeoutError) throw error;
       }
+      // An OK response that is not a target list is a decided answer, so the
+      // step ends on it instead of refetching a body that will not change. It
+      // is thrown outside the catch above so a transient socket error stays the
+      // only thing that retries.
+      if (unparseableBody) throw new ProofTimeoutError("debugger_target");
       await debuggerRetryStep(DEBUGGER_TARGET_RETRY_MS, controller.signal);
       if (signal.aborted) throw new ProofTimeoutError("browser_proof_overall");
       if (timedOut) throw new ProofTimeoutError("debugger_target");
@@ -920,16 +960,62 @@ function activeTimerCount() {
   return process.getActiveResourcesInfo().filter((resource) => resource === "Timeout").length;
 }
 
-// A port that was bound and released, so every connection to it is refused.
+// A port held for the check's lifetime by a listener that destroys every
+// connection as it arrives, so connects fail the way a closed port does and no
+// other process can take the port while the check runs. Freeing the port and
+// assuming it stays refused would let another process bind it mid-check.
 async function reserveRefusingPort() {
-  const probe = http.createServer((_request, response) => response.end());
-  await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", () => resolve()));
-  const { port } = probe.address() as AddressInfo;
-  await closeFixtureServer(probe);
-  return port;
+  const holder = http.createServer();
+  holder.on("connection", (socket) => socket.destroy());
+  await new Promise<void>((resolve) => holder.listen(0, "127.0.0.1", () => resolve()));
+  const { port } = holder.address() as AddressInfo;
+  return { port, release: () => closeFixtureServer(holder) };
+}
+
+// What a second listener gets when it tries to take the same port.
+function bindOutcome(port: number) {
+  return new Promise<string>((resolve) => {
+    const contender = http.createServer();
+    contender.once("error", (error: NodeJS.ErrnoException) => resolve(error.code ?? "bind_error"));
+    contender.listen(port, "127.0.0.1", () => contender.close(() => resolve("bound")));
+  });
 }
 
 async function proveDebuggerTargetRetry() {
+  const derivedDeadlineMs =
+    Math.round(DEBUGGER_TARGET_DERIVATION.failingRunRefusedAfterMs * DEBUGGER_TARGET_DERIVATION.marginMultiple / 1_000) * 1_000;
+  const slowestStageMs = Math.max(...DEBUGGER_TARGET_DERIVATION.passingRunBrowserStageMs);
+  check(
+    "debugger_target_deadline_sized_from_hosted_readiness_measurement",
+    DEBUGGER_TARGET_MS === derivedDeadlineMs &&
+      DEBUGGER_TARGET_MS > DEBUGGER_TARGET_DERIVATION.failingRunRefusedAfterMs &&
+      DEBUGGER_TARGET_MS + slowestStageMs <= BROWSER_PROOF_WALL_MS &&
+      DEBUGGER_TARGET_MS / DEBUGGER_TARGET_RETRY_MS >= 50,
+    JSON.stringify({
+      deadlineMs: DEBUGGER_TARGET_MS,
+      derivedDeadlineMs,
+      ...DEBUGGER_TARGET_DERIVATION,
+      slowestStageMs,
+      wallMs: BROWSER_PROOF_WALL_MS,
+      retryStepMs: DEBUGGER_TARGET_RETRY_MS,
+    }),
+  );
+
+  const proofSource = fs.readFileSync(scriptPath, "utf8");
+  const fetchSource = proofSource.slice(
+    proofSource.indexOf("async function fetchDebuggerTargets"),
+    proofSource.indexOf("function activeTimerCount"),
+  );
+  // `}\s*catch\s*\(` is a catch clause that binds its error; a `.catch(` on a
+  // promise is not one.
+  const catchBindings = fetchSource.match(/\}\s*catch\s*\(/g)?.length ?? 0;
+  const timeoutGuards = fetchSource.match(/instanceof ProofTimeoutError/g)?.length ?? 0;
+  check(
+    "debugger_target_fetch_catch_binds_no_error_so_a_timeout_guard_cannot_live_there",
+    fetchSource.length > 0 && fetchSource.includes("} catch {") && catchBindings === 0 && timeoutGuards === 0,
+    JSON.stringify({ sourceBytes: fetchSource.length, catchBindings, timeoutGuards }),
+  );
+
   const pageTarget = { type: "page", webSocketDebuggerUrl: "ws://127.0.0.1/devtools/page/proof" };
   let connections = 0,requests = 0;
   const flaky = http.createServer((_request, response) => {
@@ -990,13 +1076,63 @@ async function proveDebuggerTargetRetry() {
     }),
   );
 
-  const refusingPort = await reserveRefusingPort();
+  // A 200 whose body is not a target list: the step must end on it, not refetch
+  // it until the deadline.
+  let bodyRequests = 0;
+  const unparseable = http.createServer((_request, response) => {
+    bodyRequests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end("devtools listener answered with prose");
+  });
+  await new Promise<void>((resolve) => unparseable.listen(0, "127.0.0.1", () => resolve()));
+  const unparseablePort = (unparseable.address() as AddressInfo).port;
+  const bodySignal = new AbortController().signal;
+  const bodyTimersBefore = activeTimerCount();
+  const bodyStartedAt = Date.now();
+  let bodyError: unknown;
+  try {
+    await fetchDebuggerTargets(`http://127.0.0.1:${unparseablePort}/json/list`, bodySignal);
+  } catch (error) {
+    bodyError = error;
+  }
+  const bodyElapsedMs = Date.now() - bodyStartedAt;
+  const bodyTimers = activeTimerCount();
+  const bodyListeners = getEventListeners(bodySignal, "abort").length;
+  const bodyMessage = bodyError instanceof Error ? bodyError.message : "missing";
+  const unparseableClosed = await closeFixtureServer(unparseable);
+  check(
+    "debugger_targets_unparseable_ok_body_fails_fast_content_free_without_leaks",
+    bodyError instanceof ProofTimeoutError &&
+      bodyMessage === "proof_timeout:debugger_target" &&
+      !bodyMessage.includes(String(unparseablePort)) &&
+      !bodyMessage.includes("127.0.0.1") &&
+      !bodyMessage.includes("prose") &&
+      bodyRequests === 1 &&
+      bodyElapsedMs < DEBUGGER_TARGET_MS / 4 &&
+      bodyTimers <= bodyTimersBefore &&
+      bodyListeners === 0 &&
+      unparseableClosed,
+    JSON.stringify({
+      error: bodyMessage,
+      requests: bodyRequests,
+      elapsedMs: bodyElapsedMs,
+      deadlineMs: DEBUGGER_TARGET_MS,
+      retryStepMs: DEBUGGER_TARGET_RETRY_MS,
+      timersBefore: bodyTimersBefore,
+      timersAfter: bodyTimers,
+      listeners: bodyListeners,
+      serverClosed: unparseableClosed,
+    }),
+  );
+
+  const refusing = await reserveRefusingPort();
+  const bindWhileHeld = await bindOutcome(refusing.port);
   const deadlineSignal = new AbortController().signal;
   const deadlineTimersBefore = activeTimerCount();
   const deadlineStartedAt = Date.now();
   let deadlineError: unknown;
   try {
-    await fetchDebuggerTargets(`http://127.0.0.1:${refusingPort}/json/list`, deadlineSignal);
+    await fetchDebuggerTargets(`http://127.0.0.1:${refusing.port}/json/list`, deadlineSignal);
   } catch (error) {
     deadlineError = error;
   }
@@ -1008,7 +1144,7 @@ async function proveDebuggerTargetRetry() {
     "debugger_targets_unreachable_endpoint_rejects_at_deadline_content_free_without_leaks",
     deadlineError instanceof ProofTimeoutError &&
       deadlineMessage === "proof_timeout:debugger_target" &&
-      !deadlineMessage.includes(String(refusingPort)) &&
+      !deadlineMessage.includes(String(refusing.port)) &&
       !deadlineMessage.includes("127.0.0.1") &&
       deadlineElapsedMs >= DEBUGGER_TARGET_MS &&
       deadlineElapsedMs < DEBUGGER_TARGET_MS + ABORT_SETTLE_MS &&
@@ -1021,6 +1157,21 @@ async function proveDebuggerTargetRetry() {
       timersBefore: deadlineTimersBefore,
       timersAfter: deadlineTimers,
       listeners: deadlineListeners,
+    }),
+  );
+
+  const refusingReleased = await refusing.release();
+  const bindAfterRelease = await bindOutcome(refusing.port);
+  check(
+    "debugger_target_refusing_port_held_against_a_competing_bind_and_released_after",
+    bindWhileHeld === "EADDRINUSE" &&
+      refusingReleased &&
+      bindAfterRelease === "bound",
+    JSON.stringify({
+      bindWhileHeld,
+      released: refusingReleased,
+      bindAfterRelease,
+      deadlineElapsedMs,
     }),
   );
 }
