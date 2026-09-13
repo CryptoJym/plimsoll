@@ -319,7 +319,7 @@ async function uploadStateless(
     now: options.now ?? (() => new Date()),
     maxBytes: maxRequestBytes,
   });
-  if (!result.ok) throw new DeliveryUploadError(failureForProbe(result), result.statusClass);
+  if (!result.ok) throw new DeliveryUploadError(failureForProbe(result), result.statusClass, result.retryAfterMs ?? 0, result.networkCode ?? null);
   return {
     batch: sentBatch,
     markedUploaded: 0,
@@ -445,6 +445,7 @@ export async function uploadBufferedEvents(
           deadLetters: provenDead + newlyDead,
           circuit: status.circuit.kind,
           rootLeaseEvents: 0,
+          retryAfterMs: 0,
         },
       };
     }
@@ -457,7 +458,7 @@ export async function uploadBufferedEvents(
     if (witnessFailure === "remote_contract") {
       await storage(() => buffer.delivery.openCircuit("contract_blocked", nowFn()));
     }
-    throw new DeliveryUploadError(witnessFailure, witnessResult.statusClass);
+    throw new DeliveryUploadError(witnessFailure, witnessResult.statusClass, witnessResult.retryAfterMs ?? 0, witnessResult.networkCode ?? null);
   }
 
   const lease = await storage(() => buffer.delivery.lease({
@@ -484,6 +485,8 @@ export async function uploadBufferedEvents(
         attempts: 0,
         deadLetters: provenDead + lease.locallyDead,
         circuit: lease.blockedBy,
+        rootLeaseEvents: 0,
+        retryAfterMs: 0,
       },
     };
   }

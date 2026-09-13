@@ -24,10 +24,11 @@ export class SyncBackoff {
     this.blockedUntil = now + Math.max(0, retryAfterMs);
     this.lastError = retryAfterMs > 0 ? { at: new Date(now).toISOString(), code: "retry_after", failureClass: "remote_transient" } : null;
   }
-  failure(error: unknown, uploaded: number, now = Date.now()) {
-    const local = error instanceof SyncStorageBusyError || isSqliteContentionError(error) ||
+  failure(error: unknown, uploaded: number, now = Date.now(), maintenanceCircuitOpen = false) {
+    const storageBusy = error instanceof SyncStorageBusyError || isSqliteContentionError(error) ||
       (error instanceof Error && error.message === "maintenance_circuit_open");
     const delivery = error instanceof DeliveryUploadError ? error : null;
+    const local = storageBusy || (maintenanceCircuitOpen && delivery?.httpStatusClass === "network");
     const serverDelay = delivery && Number.isFinite(delivery.retryAfterMs) ? Math.max(0, delivery.retryAfterMs) : 0;
     // Actual acknowledged progress and local storage pressure do not justify a
     // host-wide exponential pause. Per-item retry policy is left authoritative.
@@ -35,10 +36,10 @@ export class SyncBackoff {
     const delay = this.streak === 0 ? 0 : Math.min(this.intervalMs * 2 ** Math.min(this.streak, 4), MAX_DELAY_MS);
     this.blockedUntil = now + Math.max(delay, serverDelay);
     this.uploaded = uploaded;
-    const code = local ? "local_storage_busy" : delivery?.networkCode && NETWORK_CODES.has(delivery.networkCode)
+    const code = storageBusy ? "local_storage_busy" : delivery?.networkCode && NETWORK_CODES.has(delivery.networkCode)
       ? delivery.networkCode : delivery && STATUS_CLASSES.has(delivery.httpStatusClass) ? delivery.httpStatusClass : "unclassified";
-    this.lastError = { at: new Date(now).toISOString(), code, failureClass: local ? "local_storage_busy" : delivery?.failureClass ?? "unclassified" };
-    return { failureStreak: this.streak, backoffMs: Math.max(delay, serverDelay), uploadedEvents: uploaded, timestamp: new Date(now).toISOString(), error: this.lastError };
+    this.lastError = { at: new Date(now).toISOString(), code, failureClass: storageBusy ? "local_storage_busy" : delivery?.failureClass ?? "unclassified" };
+    return { failureStreak: this.streak, localPressure: local, backoffMs: Math.max(delay, serverDelay), uploadedEvents: uploaded, timestamp: new Date(now).toISOString(), error: this.lastError };
   }
   status(inFlight = false, now = Date.now()) {
     const tick = this.nextTickAt === null ? null : Math.max(now, this.nextTickAt);

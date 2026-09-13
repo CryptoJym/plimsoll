@@ -17,7 +17,8 @@ import { createCollectorServer } from "../packages/collector-cli/src/server";
 
 const fixture = useFixtureRoot(fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-sync-backoff-")));
 const checks: Array<{name: string; passed: boolean; detail?: string}> = [];
-const t0 = Date.parse("2026-09-12T12:00:00.000Z"), interval = 300_000;
+// The injected delivery clock must follow real SQLite insertion timestamps.
+const t0 = Math.ceil(Date.now() / 1_000) * 1_000 + 60_000, interval = 300_000;
 let sequence = 0, database = 0;
 const config = collectorConfigSchema.parse({ uploadUrl: "http://127.0.0.1:1/ingest",
   tenantId: "00000000-0000-4000-8000-000000000001", installKey: "sync-backoff-fixture",
@@ -28,10 +29,10 @@ function open(file = path.join(fixture.root, `ledger-${++database}.sqlite`)) {
 }
 function append(buffer: LocalEventBuffer) {
   const event = aiInteractionEventSchema.parse({ id: `00000000-0000-4000-8000-${String(++sequence).padStart(12,"0")}`,
-    source: "codex", dataMode: "metadata", eventType: "assistant_response", observedAt: new Date(t0).toISOString(), inputTokens: 1, outputTokens: 1, metadata: {} });
+    source: "codex", dataMode: "metadata", eventType: "assistant_response", observedAt: new Date(t0 - 60_000).toISOString(), inputTokens: 1, outputTokens: 1, metadata: {} });
   buffer.append(event); return event.id;
 }
-const json = (status: number, retry?: string) => new Response("{}", { status,
+const json = (status: number, retry?: string) => new Response(JSON.stringify(status === 200 ? { accepted: 1 } : {}), { status,
   headers: { "content-type": "application/json", ...(retry ? { "retry-after": retry } : {}) } });
 async function check(name: string, fn: () => unknown | Promise<unknown>) {
   try { await fn(); checks.push({ name, passed: true }); }
@@ -67,6 +68,17 @@ async function main() {
     const state=new SyncBackoff(interval);state.arm(t0);state.success(1,900_000,t0);
     assert.equal(state.ready(t0+interval),false);assert.equal(state.status(false,t0).notBefore,new Date(t0+900_000).toISOString());
   });
+  await check("network_timeout_during_maintenance_pressure_keeps_regular_cadence", () => {
+    const state=new SyncBackoff(interval);
+    const result=state.failure(new DeliveryUploadError("remote_transient","network",0,"ETIMEDOUT"),0,t0,true);
+    assert.equal(result.failureStreak,0);assert.equal(result.backoffMs,0);
+    assert.equal(result.localPressure,true);assert.equal(result.error.code,"ETIMEDOUT");
+  });
+  await check("real_server_refusal_is_not_dismissed_by_local_pressure", () => {
+    const state=new SyncBackoff(interval);
+    const result=state.failure(new DeliveryUploadError("remote_transient","remote_transient",900_000),0,t0,true);
+    assert.equal(result.failureStreak,1);assert.equal(result.backoffMs,900_000);assert.equal(result.localPressure,false);
+  });
   await check("status_has_no_raw_exception_message", () => {
     const state=new SyncBackoff(interval);state.failure(new Error("PRIVATE_URL_TOKEN_FIXTURE"),0,t0);
     assert.ok(!JSON.stringify(state.status(false,t0)).includes("PRIVATE_URL"));assert.equal(state.status(false,t0).lastError?.code,"unclassified");
@@ -87,7 +99,7 @@ async function main() {
         append(buffer);append(buffer);
         const fetchImpl=acknowledgingFetch(async()=>{calls++;if(calls%3===2)throw Object.assign(new Error("PRIVATE_NETWORK"),{cause:{code:"ECONNRESET"}});return json(200);});
         const opts={limit:1,fetchImpl,now:()=>new Date(now),includeLegacyRemainingUnuploaded:false};
-        const first=await uploadBufferedEvents(config,buffer,opts);assert.equal(first.uploadedEvents,1);
+        const first=await uploadBufferedEvents(config,buffer,opts);assert.equal(first.uploadedEvents,1,JSON.stringify({uploaded:first.uploadedEvents,response:first.response,delivery:first.delivery}));
         await assert.rejects(uploadBufferedEvents(config,buffer,opts),error=>{
           assert.ok(error instanceof DeliveryUploadError);assert.equal(error.networkCode,"ECONNRESET");
           assert.equal(state.failure(error,first.uploadedEvents,now).backoffMs,0);return true;
@@ -119,9 +131,39 @@ async function main() {
       assert.equal(early.uploadedEvents,0);assert.equal(calls,before);
     }finally{buffer.close();}
   });
+  await check("real_http_503_retry_after_blocks_reopened_ledger_until_due",async()=>{
+    let {buffer,file}=open();let now=t0,calls=0;append(buffer);
+    const adapter=acknowledgingFetch(async()=>{calls++;return calls===1?json(503,"900"):json(200);});
+    const upstream=http.createServer((request,response)=>{
+      const chunks:Buffer[]=[];
+      request.on("data",chunk=>chunks.push(Buffer.from(chunk)));
+      request.on("end",()=>{void (async()=>{
+        const reply=await adapter("http://127.0.0.1/fixture",{body:Buffer.concat(chunks).toString("utf8")});
+        response.writeHead(reply.status,Object.fromEntries(reply.headers));response.end(await reply.text());
+      })().catch(()=>{response.writeHead(500,{"content-type":"application/json"});response.end("{}");});});
+    });
+    try{
+      await new Promise<void>(resolve=>upstream.listen(0,"127.0.0.1",resolve));
+      const address=upstream.address() as AddressInfo;
+      const socketConfig={...config,uploadUrl:`http://127.0.0.1:${address.port}/ingest`};
+      const opts={limit:1,now:()=>new Date(now),includeLegacyRemainingUnuploaded:false};
+      await assert.rejects(uploadBufferedEvents(socketConfig,buffer,opts),error=>{
+        assert.ok(error instanceof DeliveryUploadError);assert.equal(error.retryAfterMs,900_000);return true;
+      });
+      buffer.close();buffer=open(file).buffer;now+=interval;
+      assert.equal((await uploadBufferedEvents(socketConfig,buffer,opts)).uploadedEvents,0);assert.equal(calls,1);
+      now=t0+900_000;assert.equal((await uploadBufferedEvents(socketConfig,buffer,opts)).uploadedEvents,1);assert.equal(calls,2);
+    }finally{upstream.closeAllConnections();await new Promise<void>(resolve=>upstream.close(()=>resolve()));buffer.close();}
+  });
+  await check("session_followups_are_carried_during_server_cooldown",()=>{
+    const source=fs.readFileSync(path.resolve("packages/collector-cli/src/cli.ts"),"utf8");
+    const guard="if (serverRetryAfterMs > 0) { carrySessions(); return; }";
+    assert.ok(source.includes(guard));
+    assert.ok(source.indexOf(guard)<source.indexOf("const touchedSessionIds ="));
+  });
   await check("native_runSync_uses_actual_progress_and_cache_only_status",()=>{
     const source=fs.readFileSync(path.resolve("packages/collector-cli/src/cli.ts"),"utf8");
-    assert.match(source,/syncBackoff\.failure\(error, uploaded\)/);assert.match(source,/let uploaded = 0;[\s\S]*?try \{[\s\S]*?uploaded \+= result\.uploadedEvents/);
+    assert.match(source,/syncBackoff\.failure\(error, uploaded, Date\.now\(\), maintenanceBoundary\.status\(\)\.state === "circuit_open"\)/);assert.match(source,/let uploaded = 0;[\s\S]*?try \{[\s\S]*?uploaded \+= result\.uploadedEvents/);
     assert.match(source,/syncStatus: \(\) => syncBackoff\.status\(syncInFlight\)/);
     assert.ok(!source.includes("syncFailureStreak += 1"));
   });

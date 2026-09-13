@@ -2460,6 +2460,9 @@ async function main() {
           );
         }
         syncBackoff.success(uploaded, serverRetryAfterMs);
+        // Session snapshots share the ingest endpoint. Carry their identities
+        // rather than issue another request inside a server-directed cooldown.
+        if (serverRetryAfterMs > 0) { carrySessions(); return; }
 
         // Session sync (issue 0037): the sessions whose events just crossed
         // get their snapshots refreshed — recomputed over the FULL ledger,
@@ -2510,7 +2513,7 @@ async function main() {
         }
       } catch (error) {
         carrySessions();
-        const scheduling = syncBackoff.failure(error, uploaded);
+        const scheduling = syncBackoff.failure(error, uploaded, Date.now(), maintenanceBoundary.status().state === "circuit_open");
         if (error instanceof SyncStorageBusyError) {
           console.warn(
             JSON.stringify({
