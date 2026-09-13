@@ -595,6 +595,8 @@ export function createCollectorServer(
      * never stats the spool directory on the request path.
      */
     hookSpoolStatus?: () => HookSpoolStatus | null;
+    /** Process-local upload scheduler state; no DB or filesystem work. */
+    syncStatus?: () => unknown;
     /**
      * Environment the intake spool reads its kill switch and its home from.
      * Production is `process.env`, exactly as the drain's is.
@@ -1141,6 +1143,7 @@ export function createCollectorServer(
           body.statusRefreshCounters = { ...statusRefreshCounters };
           body.httpAdmission = rejectionDiagnostics.counters();
           body.hookSpool = options.hookSpoolStatus?.() ?? null;
+          body.sync = options.syncStatus?.() ?? null;
           sendJson(response, body, 200, cached?.generation === null || cached?.generation === undefined ? {} : {
             "x-plimsoll-projection-generation": String(cached.generation),
           });
