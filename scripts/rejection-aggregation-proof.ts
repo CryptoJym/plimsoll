@@ -1236,6 +1236,8 @@ async function routeClassificationChecks() {
         "recordArraysMax", "decodedBytesLast", "decodedBytesMax"] as const;
       const hasNoRecordFields = (line: RejectionSummaryLine | undefined) =>
         line !== undefined && recordFields.every((key) => !Object.hasOwn(line, key));
+      const hasAllRecordFields = (line: RejectionSummaryLine | undefined) =>
+        line !== undefined && recordFields.every((key) => Object.hasOwn(line, key));
       const mixedAgg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
       for (const route of vocabulary) {
         mixedAgg.observeRejection("storage_busy_retry", "otlp_exporter", fullRecordDiagnostic, route);
@@ -1274,11 +1276,149 @@ async function routeClassificationChecks() {
           JSON.stringify(mixedSummary.routes) === JSON.stringify(Object.fromEntries(vocabulary.map((route) => [route, 1]))),
         { summary: mixedSummary },
       );
+      // The ceiling has to bound the worst line the emitter can really produce.
+      // Record-array maps and a route map are mutually exclusive by
+      // construction — ingest builds no record statistics for a
+      // route-classified reason and `closeWindow` strips them again — so the
+      // worst mixture of diagnostic payload and line strings is the longest
+      // reason/action pair that CAN carry record statistics, saturated across
+      // every closed array key. Derived from the exported vocabularies, not
+      // pinned to today's longest reason, so a longer one added later is
+      // measured here instead of silently breaching 640 B in production.
+      const nextActions = mod.HTTP_REJECTION_NEXT_ACTIONS as Record<string, string>;
+      const routeClassifiedReasons = mod.ROUTE_CLASSIFIED_REASONS as readonly string[];
+      const allReasons = mod.HTTP_BOUNDARY_REASONS as readonly string[];
+      const worstRecordReason = allReasons
+        .filter((reason) => !routeClassifiedReasons.includes(reason))
+        .sort(
+          (left, right) =>
+            right.length + (nextActions[right]?.length ?? 0) -
+              (left.length + (nextActions[left]?.length ?? 0)) || (left < right ? -1 : 1),
+        )[0] as never;
+      const worstRecordAgg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
+      // A route is offered too: a reason outside the route-classified set must
+      // ignore it, so this one line proves both directions of the exclusivity.
+      worstRecordAgg.observeRejection(worstRecordReason, "otlp_exporter", fullRecordDiagnostic, "otlp");
+      const worstRecordSummary = worstRecordAgg.flush()[0];
+      const saturatedRecordCarryingLine = {
+        ...worstRecordSummary,
+        count: Number.MAX_SAFE_INTEGER,
+        suppressed: Number.MAX_SAFE_INTEGER,
+      };
+      const saturatedRecordCarryingBytes = Buffer.byteLength(JSON.stringify(saturatedRecordCarryingLine));
+      // …and the exclusivity itself, swept over the whole reason vocabulary:
+      // record statistics are stripped for every route-classified reason and
+      // for no other, so no reason can carry both maps on one line.
+      const exclusivityByReason = allReasons.map((reason) => {
+        const agg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
+        agg.observeRejection(reason as never, "otlp_exporter", fullRecordDiagnostic, "otlp");
+        agg.observeRejection(reason as never, "otlp_exporter", fullRecordDiagnostic, "otlp");
+        const line = agg.flush()[0];
+        const routeClassified = routeClassifiedReasons.includes(reason);
+        return {
+          reason,
+          routeClassified,
+          recordStatsStripped: hasNoRecordFields(line),
+          carriesRoutes: line?.routes !== undefined,
+          lineBytes: Buffer.byteLength(JSON.stringify(line)),
+        };
+      });
+      const exclusivityHolds = exclusivityByReason.every(
+        (entry) =>
+          entry.recordStatsStripped === entry.routeClassified &&
+          entry.carriesRoutes === entry.routeClassified &&
+          entry.lineBytes <= mod.REJECTION_SUMMARY_LINE_MAX_BYTES,
+      );
       check(
         "mixed_diagnostic_saturated_summary_preserves_the_fixed_byte_ceiling",
         mod.REJECTION_SUMMARY_LINE_MAX_BYTES === 640 &&
-          Buffer.byteLength(JSON.stringify(saturatedMixedLine)) <= mod.REJECTION_SUMMARY_LINE_MAX_BYTES,
-        { lineBytes: Buffer.byteLength(JSON.stringify(saturatedMixedLine)), ceiling: mod.REJECTION_SUMMARY_LINE_MAX_BYTES },
+          // the subject really is a record-carrying line, not an empty one
+          hasAllRecordFields(worstRecordSummary) &&
+          worstRecordSummary?.recordCountMax === 100_000 &&
+          worstRecordSummary.decodedBytesMax === 2_097_152 &&
+          worstRecordSummary.routes === undefined &&
+          saturatedRecordCarryingBytes <= mod.REJECTION_SUMMARY_LINE_MAX_BYTES &&
+          exclusivityHolds &&
+          exclusivityByReason.some((entry) => entry.routeClassified) &&
+          exclusivityByReason.some((entry) => !entry.routeClassified),
+        {
+          worstRecordReason,
+          lineBytes: saturatedRecordCarryingBytes,
+          headroom: mod.REJECTION_SUMMARY_LINE_MAX_BYTES - saturatedRecordCarryingBytes,
+          ceiling: mod.REJECTION_SUMMARY_LINE_MAX_BYTES,
+          strippedReasons: exclusivityByReason.filter((entry) => entry.recordStatsStripped).map((entry) => entry.reason),
+          routeClassifiedReasons,
+          worstExclusivityLineBytes: Math.max(...exclusivityByReason.map((entry) => entry.lineBytes)),
+        },
+      );
+
+      // R2: a route-classified window can never emit record statistics, so it
+      // must not build them either. The probe diagnostic counts every property
+      // read `updateRecordStats`/`copyRecordDiagnostic` would make, so this
+      // asserts the work is gone, not merely that the line comes out clean —
+      // and the busy line is the no-diagnostic line plus one discard counter,
+      // so ten thousand dropped diagnostics are stated instead of silent.
+      const makeProbeDiagnostic = () => {
+        const probe = { reads: 0 };
+        const diagnostic = {
+          get recordCount() { probe.reads += 1; return 100_000; },
+          get recordArrays() {
+            probe.reads += 1;
+            return {
+              logRecords: 100_000, spans: 100_000, metrics: 100_000,
+              dataPoints: 100_000, events: 100_000, links: 100_000, exemplars: 100_000,
+            };
+          },
+          get decodedBytes() { probe.reads += 1; return 2_097_152; },
+        };
+        return { probe, diagnostic };
+      };
+      const BUSY_DIAGNOSTIC_FEED = 10_000;
+      const busyProbe = makeProbeDiagnostic();
+      const busyWorkAgg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
+      for (let index = 0; index < BUSY_DIAGNOSTIC_FEED; index += 1) {
+        busyWorkAgg.observeRejection("storage_busy_retry", "claude_code", busyProbe.diagnostic, "otlp");
+      }
+      const busyFedDiagnostics = busyWorkAgg.flush()[0];
+      const busyQuietAgg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
+      for (let index = 0; index < BUSY_DIAGNOSTIC_FEED; index += 1) {
+        busyQuietAgg.observeRejection("storage_busy_retry", "claude_code", undefined, "otlp");
+      }
+      const busyFedNone = busyQuietAgg.flush()[0];
+      // Control: the same probe on a reason that CAN emit record statistics is
+      // read on every observation, so zero reads above is the ingest gate and
+      // not a probe blind to the work.
+      const controlProbe = makeProbeDiagnostic();
+      const controlAgg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
+      const CONTROL_FEED = 100;
+      for (let index = 0; index < CONTROL_FEED; index += 1) {
+        controlAgg.observeRejection("otlp_record_limit_exceeded", "otlp_exporter", controlProbe.diagnostic);
+      }
+      const controlSummary = controlAgg.flush()[0];
+      const { recordDiagnosticsDiscarded, ...busyLineWithoutDiscardCounter } =
+        busyFedDiagnostics ?? ({} as RejectionSummaryLine);
+      check(
+        "busy_window_does_no_record_statistics_work_however_many_diagnostics_arrive",
+        busyProbe.probe.reads === 0 &&
+          controlProbe.probe.reads >= CONTROL_FEED &&
+          hasNoRecordFields(busyFedDiagnostics) &&
+          hasAllRecordFields(controlSummary) &&
+          busyFedDiagnostics?.count === BUSY_DIAGNOSTIC_FEED &&
+          recordDiagnosticsDiscarded === BUSY_DIAGNOSTIC_FEED &&
+          busyFedNone?.recordDiagnosticsDiscarded === undefined &&
+          // the only difference the discarded diagnostics make to the line
+          JSON.stringify(busyLineWithoutDiscardCounter) === JSON.stringify(busyFedNone) &&
+          Buffer.byteLength(JSON.stringify(busyFedDiagnostics)) <= mod.REJECTION_SUMMARY_LINE_MAX_BYTES &&
+          conservation(busyWorkAgg.counters()).ok,
+        {
+          fed: BUSY_DIAGNOSTIC_FEED,
+          busyDiagnosticReads: busyProbe.probe.reads,
+          controlDiagnosticReads: controlProbe.probe.reads,
+          readsPerControlObservation: controlProbe.probe.reads / CONTROL_FEED,
+          discarded: recordDiagnosticsDiscarded ?? null,
+          busyLineFedNone: JSON.stringify(busyFedNone),
+          busyLineFedDiagnostics: JSON.stringify(busyFedDiagnostics),
+        },
       );
       const edgeAgg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
       edgeAgg.observeRejection("storage_busy_retry", "codex", undefined, "otlp");

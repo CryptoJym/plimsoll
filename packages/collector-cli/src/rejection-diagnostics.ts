@@ -118,10 +118,11 @@ export const REJECTION_ROUTES = (Object.keys(REJECTION_ROUTE_ORDER) as Rejection
  * route diagnostics (`server.ts`): a busy 503 can arrive on a hook route the
  * intake spool covers or on OTLP, which it does not, and `clientClass` alone
  * cannot tell those apart for one producer. Bounding the breakdown to this one
- * reason lets `closeWindow` enforce exclusivity: it omits record statistics
- * for route-classified reasons even if a caller supplies both diagnostics.
- * Thus a summary contains record-array maps or a route map, never both, and
- * stays inside `REJECTION_SUMMARY_LINE_MAX_BYTES`.
+ * reason lets the window enforce exclusivity: ingest builds no record
+ * statistics for a route-classified reason (it counts the discarded
+ * diagnostics instead), and `closeWindow` omits them again even if a caller
+ * supplies both diagnostics. Thus a summary contains record-array maps or a
+ * route map, never both, and stays inside `REJECTION_SUMMARY_LINE_MAX_BYTES`.
  */
 export const ROUTE_CLASSIFIED_REASONS: readonly HttpBoundaryReason[] = ["storage_busy_retry"];
 
@@ -141,6 +142,14 @@ export type RejectionSummaryLine = {
   recordArraysMax?: Partial<Record<OtlpRecordArrayKey, number>>;
   decodedBytesLast?: number;
   decodedBytesMax?: number;
+  /**
+   * Record diagnostics this window was handed and could not report, because a
+   * route-classified reason carries a route map instead of record-array maps.
+   * Absent when none were discarded, which is every production window: the one
+   * production busy caller never attaches a record diagnostic. Present, it says
+   * the diagnostics were dropped by the emitter rather than never collected.
+   */
+  recordDiagnosticsDiscarded?: number;
   /**
    * Per-route split of `count`, emitted last so the rest of the line is the
    * byte-identical pre-0.7.27 line. Present only when the window holds a
@@ -195,6 +204,7 @@ type WindowState = {
   count: number;
   suppressed: number;
   recordStats?: RecordWindowStats;
+  recordDiagnosticsDiscarded?: number;
   routes?: Partial<Record<RejectionRoute, number>>;
 };
 
@@ -255,6 +265,29 @@ function updateRecordStats(
       decodedBytes: Math.max(stats.max.decodedBytes, diagnostic.decodedBytes),
     },
   };
+}
+
+/**
+ * Fold one observation's record diagnostic into its window. A route-classified
+ * window can never emit record statistics — `closeWindow` omits them — so it
+ * never builds them: it counts the discarded diagnostics instead of paying a
+ * copy and a `Math.max` over every closed record-array key per suppressed
+ * rejection for state that has no way out. `window.recordStats` stays
+ * undefined for those reasons, and the `closeWindow` guard is the second line
+ * of defence rather than the only one.
+ */
+function applyRecordDiagnostic(
+  window: WindowState,
+  routeClassified: boolean,
+  diagnostic: OtlpRecordRejectionDiagnostic | undefined,
+) {
+  if (!routeClassified) {
+    window.recordStats = updateRecordStats(window.recordStats, diagnostic);
+    return;
+  }
+  if (diagnostic) {
+    window.recordDiagnosticsDiscarded = nextCount(window.recordDiagnosticsDiscarded ?? 0);
+  }
 }
 
 /**
@@ -350,6 +383,11 @@ export function createRejectionDiagnostics(options: {
             decodedBytesMax: window.recordStats.max.decodedBytes,
           }
         : {}),
+      // Only ever set on a route-classified window, which production cannot
+      // give a record diagnostic, so no production line shape moves.
+      ...(window.recordDiagnosticsDiscarded
+        ? { recordDiagnosticsDiscarded: window.recordDiagnosticsDiscarded }
+        : {}),
       // Last, so a line that carries a breakdown is the byte-identical
       // pre-0.7.27 line with `,"routes":{…}` appended before the brace.
       ...(window.routes ? { routes: orderRoutes(window.routes) } : {}),
@@ -364,7 +402,8 @@ export function createRejectionDiagnostics(options: {
       route?: RejectionRoute,
     ): RejectionObservation {
       const now = nowMs();
-      const classifiedRoute = ROUTE_CLASSIFIED_REASONS.includes(reason) ? route : undefined;
+      const routeClassified = ROUTE_CLASSIFIED_REASONS.includes(reason);
+      const classifiedRoute = routeClassified ? route : undefined;
       const summaries: RejectionSummaryLine[] = [];
       for (const state of states.values()) {
         if (
@@ -386,9 +425,9 @@ export function createRejectionDiagnostics(options: {
           firstAtMs: now,
           count: 1,
           suppressed: 0,
-          recordStats: updateRecordStats(undefined, recordDiagnostic),
           routes: updateRoutes(undefined, classifiedRoute),
         };
+        applyRecordDiagnostic(state.window, routeClassified, recordDiagnostic);
         state.rejected = nextCount(state.rejected);
         state.emittedFirst = nextCount(state.emittedFirst);
         return { first: true, summaries };
@@ -396,7 +435,7 @@ export function createRejectionDiagnostics(options: {
 
       state.window.count = nextCount(state.window.count);
       state.window.suppressed = nextCount(state.window.suppressed);
-      state.window.recordStats = updateRecordStats(state.window.recordStats, recordDiagnostic);
+      applyRecordDiagnostic(state.window, routeClassified, recordDiagnostic);
       state.window.routes = updateRoutes(state.window.routes, classifiedRoute);
       state.rejected = nextCount(state.rejected);
       state.suppressed = nextCount(state.suppressed);
