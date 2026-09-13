@@ -21,6 +21,9 @@ import {
   renderLaunchAgentPlist,
 } from "../packages/collector-cli/src/launch-agent";
 import {
+  captureLaunchAgentUnloadPriorState,
+  observeLaunchAgentUnloadTerminalState,
+  readCollectorPidFile,
   readCollectorPidCleanupState,
   readUtcProcessStartFingerprint,
   removeCollectorPidFileIfOwnedDetailed,
@@ -183,6 +186,8 @@ function launchAgentCommand(
     initiallyLoaded?: boolean;
     printExit?: number;
     printStderr?: string;
+    /** Fixture-only: parent observed the owner close and its cleanup receipt. */
+    bootoutSettlementPath?: string;
   } = {},
 ) {
   const launchctlState = path.join(home, "launchctl.state");
@@ -203,6 +208,7 @@ function launchAgentCommand(
         PLIMSOLL_PROOF_LAUNCHCTL_NOT_FOUND:
           `Could not find service "${LAUNCH_AGENT_LABEL}" in domain for user gui: ${process.getuid?.() ?? "unknown"}`,
         ...(bootoutPid ? { PLIMSOLL_PROOF_BOOTOUT_PID: String(bootoutPid) } : {}),
+        ...(behavior.bootoutSettlementPath ? { PLIMSOLL_PROOF_BOOTOUT_SETTLED: behavior.bootoutSettlementPath } : {}),
       },
       stdio: ["ignore", "pipe", "pipe"],
     }),
@@ -218,6 +224,48 @@ async function stopOwner(watched: WatchedChild) {
     watched.child.kill("SIGTERM");
   }
   await waitForExit(watched.child);
+}
+
+/** Reproduce the read/remove race with injected observations, never wall time. */
+async function verifyCleanupRaceRemainsRefused(home: string, root: string) {
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  const owner = runtimeIdentity(process.pid);
+  writePidRecord(home, owner, root);
+  const pidPath = path.join(home, "collector.pid");
+  let pidRead = readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL);
+  const prior = await captureLaunchAgentUnloadPriorState({
+    label: LAUNCH_AGENT_LABEL, pidPath, port: 1,
+    observeLabel: () => ({ kind: "reported", processIdentity: owner }),
+    observeListener: async () => ({ kind: "collector", runtimeIdentity: owner }),
+    readPidFile: () => pidRead,
+  });
+  let clock = 0, removals = 0;
+  const outcome = await observeLaunchAgentUnloadTerminalState({
+    label: LAUNCH_AGENT_LABEL, pidPath, port: 1, prior, timeoutMs: 100, pollIntervalMs: 50,
+    observeLabel: () => ({ kind: "not_reported" }),
+    observeListener: async () => ({ kind: "absent" }),
+    classifyIdentity: () => "stale",
+    readPidFile: () => pidRead,
+    removePidFile: () => {
+      // The other cleanup actor removed the record after this observer's read.
+      // No actual process is signaled and the fixture file is left untouched.
+      pidRead = { kind: "missing" }; removals++;
+      return { removed: false, ambiguous: false, quarantined: false,
+        persistent: { ambiguous: false, markerState: "missing", claimCount: 0,
+          quarantineCount: 0, inventoryTruncated: false, unsafeArtifactCount: 0 },
+        disposition: "not_owned" };
+    },
+    now: () => clock,
+    poll: async milliseconds => { clock += milliseconds; },
+  });
+  check(removals === 1 && !outcome.stopped && outcome.state === "indeterminate" &&
+    outcome.pidCleanupAmbiguous && !outcome.pidCleaned &&
+    outcome.final.pidRecordState === "missing" && outcome.final.listenerState === "absent" &&
+    outcome.final.pidCleanupMarkerState === "missing" && !outcome.final.priorRuntimeLive &&
+    outcome.timing.observations === 4 && outcome.timing.finalObservationPerformed,
+    "Cleanup race control was promoted to stopped truth: " + JSON.stringify(outcome));
+  return { state: outcome.state, ambiguous: outcome.pidCleanupAmbiguous,
+    observations: outcome.timing.observations, virtualElapsedMs: outcome.timing.elapsedMs };
 }
 
 async function main() {
@@ -478,6 +526,19 @@ async function main() {
         '  if [ -n "${PLIMSOLL_PROOF_BOOTOUT_PID:-}" ]; then',
         '    kill -TERM "$PLIMSOLL_PROOF_BOOTOUT_PID"',
         "  fi",
+        // The successful-unload fixture isolates aggregate truth from the
+        // deliberately separate race control. A label's disappearance is not
+        // substituted for the owner having actually completed cleanup.
+        '  if [ -n "${PLIMSOLL_PROOF_BOOTOUT_SETTLED:-}" ]; then',
+        '    attempts=0',
+        '    limit="${PLIMSOLL_PROOF_BOOTOUT_WAIT_LIMIT:-600}"',
+        '    while [ ! -f "$PLIMSOLL_PROOF_BOOTOUT_SETTLED" ] && [ "$attempts" -lt "$limit" ]; do',
+        '      attempts=$((attempts + 1))',
+        '      sleep 0.05',
+        '    done',
+        '    [ -f "$PLIMSOLL_PROOF_BOOTOUT_SETTLED" ] || exit 75',
+        '    [ "$(cat "$PLIMSOLL_PROOF_BOOTOUT_SETTLED")" = "settled" ] || exit 76',
+        '  fi',
         '  rm -f "$state"',
         "  exit 0",
         "fi",
@@ -496,6 +557,20 @@ async function main() {
       "Unload fixture owner did not become active.",
     );
     check(unloadOwner.child.pid, "Unload fixture owner has no PID.");
+    const settlementPath = path.join(unloadHome, "proof-owner-settled");
+    let shutdownSettlement: Receipt | null = null;
+    unloadOwner.child.once("close", (code, signal) => {
+      // watch() registered first, so its receipt bytes have been fully drained.
+      const ready = statusReceipt(unloadOwner, "shutdown_ready");
+      const cleanup = readCollectorPidCleanupState(path.join(unloadHome,"collector.pid"), LAUNCH_AGENT_LABEL);
+      const pidMissing = !fs.existsSync(path.join(unloadHome,"collector.pid"));
+      const settled = code === 0 && signal === null && ready?.pidCleaned === true &&
+        ready.listenerClosed === true && pidMissing && !cleanup.ambiguous &&
+        cleanup.markerState === "missing" && cleanup.claimCount === 0 && cleanup.quarantineCount === 0;
+      shutdownSettlement = { settled, exitCode: code, signal, pidMissing,
+        shutdownReady: ready?.status === "shutdown_ready", cleanupAmbiguous: cleanup.ambiguous };
+      fs.writeFileSync(settlementPath, settled ? "settled\n" : "refused\n", { mode: 0o600 });
+    });
     const truthfulUnload = launchAgentCommand(
       cliPath,
       unloadHome,
@@ -504,6 +579,7 @@ async function main() {
       fakeBin,
       0,
       unloadOwner.child.pid,
+      { bootoutSettlementPath: settlementPath },
     );
     children.push(truthfulUnload);
     // Observe only after the command process has fully settled. Settled means
@@ -523,6 +599,29 @@ async function main() {
       "Unload did not report the aggregate terminal state: " + truthfulUnload.output,
     );
     check(truthfulUnloadExit.code === 0, "Truthful aggregate unload exited nonzero.");
+    check(shutdownSettlement !== null && (shutdownSettlement as Receipt).settled === true &&
+      fs.readFileSync(settlementPath,"utf8") === "settled\n",
+      "Mock bootout did not wait for the actual owner cleanup and close receipt.");
+    const cleanupRace = await verifyCleanupRaceRemainsRefused(path.join(tempRoot,"cleanup-race-control"), root);
+    // The marker barrier itself must refuse missing or explicitly failed evidence.
+    for (const failedSettlement of ["missing", "refused"] as const) {
+      const controlHome = path.join(tempRoot,`bootout-barrier-${failedSettlement}`);
+      fs.mkdirSync(controlHome, { mode: 0o700 });
+      const state = path.join(controlHome,"state"), marker=path.join(controlHome,"marker");
+      fs.writeFileSync(state,"fixture-only\n",{mode:0o600});
+      if(failedSettlement === "refused")fs.writeFileSync(marker,"refused\n",{mode:0o600});
+      const command=watch(spawn(path.join(fakeBin,"launchctl"),["bootout"],{
+        env:{...process.env,PLIMSOLL_PROOF_LAUNCHCTL_STATE:state,
+          PLIMSOLL_PROOF_BOOTOUT_PID:"",PLIMSOLL_PROOF_LAUNCHCTL_EXIT:"0",
+          PLIMSOLL_PROOF_BOOTOUT_SETTLED:marker,PLIMSOLL_PROOF_BOOTOUT_WAIT_LIMIT:"2"},
+        stdio:["ignore","pipe","pipe"],
+      }));
+      children.push(command);
+      const exit=await waitForExit(command.child);
+      check(exit.code===(failedSettlement==="missing"?75:76)&&fs.existsSync(state),
+        `Mock bootout fabricated success for ${failedSettlement} owner evidence.`);
+    }
+
     await waitForExit(unloadOwner.child);
     const truthfulReceipt = truthfulUnload.receipts.find((receipt) => receipt.unloaded === true);
     check(
@@ -1114,6 +1213,8 @@ async function main() {
       JSON.stringify(
         {
           status: "passed",
+          fixtureEvidence: { shutdownSettlement, cleanupRace,
+            scope: "positive graceful handoff and negative cleanup race checked separately; production unchanged" },
           checks: [
             "concurrent starts converge without PID replacement",
             "packaged stop validates the recorded CLI path across working directories",
@@ -1122,6 +1223,9 @@ async function main() {
             "foreign exact-shape status cannot spoof collector ownership",
             "inert CLI-shaped and legacy processes cannot pass stop authorization",
             "unload records launchctl failure and requires aggregate terminal-state proof",
+            "positive mock bootout waits for actual owner cleanup and drained close",
+            "missing or refused owner settlement cannot make mock bootout succeed",
+            "cleanup read-remove race stays indeterminate under a deterministic clock",
             "only exact launchctl label-not-found output becomes not_reported",
             "unexpected launchctl exit codes and output remain query_failed",
             "unload receipts are path-free and legacy PID residue is retained",
