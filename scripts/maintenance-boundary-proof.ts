@@ -63,17 +63,40 @@ const PRIVATE_PATH_SENTINEL = "maintenance-boundary-private-path-sentinel";
 // host, and the ceiling stays below statusMaxMs so a slow baseline can never
 // excuse a status endpoint that is actually unavailable.
 const STATUS_P95_FLOOR_MS = 100;
-const STATUS_P95_RELATIVE_FACTOR = 3;
-const STATUS_P95_CEILING_MS = 400;
+// 2026-09-13 (eco-6hoxj.95): 3 -> 2. Under a uniform host slowdown the in-window
+// p95 tracks the idle p95 closely -- measured/idle was 0.86-1.01 over a five-point
+// stall sweep on a 10-core host and 0.80 on another -- so 2x leaves at least a 2x
+// margin at every operating point measured, and 3x was buying headroom nothing
+// needed. The factor only decides the bound for an idle p95 between 50ms and
+// 125ms; below that the floor wins and above it the ceiling does.
+const STATUS_P95_RELATIVE_FACTOR = 2;
+// 2026-09-13 (eco-6hoxj.95): the ceiling is the damping, so it is pinned to a
+// multiple of the floor instead of being a free-standing number. The baseline is
+// a single 100-request wave, so a spike inside it inflates the derived bound and
+// buys headroom for the rest of the run; this multiple is the most that spike can
+// ever buy. At 4x (the 400ms it used to be) a polluted baseline let a 343.7ms
+// in-window status p95 pass on a 10-core host where a clean baseline refuses the
+// same degradation at the floor; at 2.5x it refuses. The CI-class operating point
+// -- the in-window p95 a healthy but loaded runner actually produces -- measured
+// 110-122ms across two 10-core hosts and 118.0ms on the hosted runner, so 250ms
+// keeps at least 2x margin there.
+const STATUS_P95_CEILING_FLOOR_MULTIPLE = 2.5;
+const STATUS_P95_CEILING_MS = STATUS_P95_FLOOR_MS * STATUS_P95_CEILING_FLOOR_MULTIPLE;
+// Every wave uses one per-request client timeout, far above every budget below.
+// A runner slower than that fails here instead of at a budget, so the refusal has
+// to say so: see the proof_http_timeout message in request().
+const REQUEST_TIMEOUT_MS = 5_000;
 const FIFO_AVAILABILITY_BUDGETS = {
   waveConcurrency: 100,
   statusP95FloorMs: STATUS_P95_FLOOR_MS,
   statusP95RelativeFactor: STATUS_P95_RELATIVE_FACTOR,
+  statusP95CeilingFloorMultiple: STATUS_P95_CEILING_FLOOR_MULTIPLE,
   statusP95CeilingMs: STATUS_P95_CEILING_MS,
   statusMaxMs: 500,
   hookP95Ms: 750,
   hookMaxMs: 1_200,
   deadlineToReapMs: 2_500,
+  requestTimeoutMs: REQUEST_TIMEOUT_MS,
 } as const;
 
 function pass(name: string, detail: Record<string, unknown>) {
@@ -304,7 +327,12 @@ function request(
         });
       });
     });
-    client.setTimeout(5_000, () => client.destroy(new Error("proof_http_timeout")));
+    client.setTimeout(REQUEST_TIMEOUT_MS, () => client.destroy(new Error(
+      `proof_http_timeout after ${REQUEST_TIMEOUT_MS}ms: this runner is slower than the ` +
+      "per-request client timeout, so the run refuses here and no latency budget " +
+      `(status p95 ceiling ${STATUS_P95_CEILING_MS}ms, status max ` +
+      `${FIFO_AVAILABILITY_BUDGETS.statusMaxMs}ms) was evaluated`,
+    )));
     client.on("error", reject);
     client.end(body);
   });
@@ -349,7 +377,10 @@ async function fifoAvailabilityProof() {
   const waveConcurrency = FIFO_AVAILABILITY_BUDGETS.waveConcurrency;
   const agent = new http.Agent({ keepAlive: true, maxSockets: waveConcurrency });
   // The baseline wave gets its own sockets so the measured wave still pays the
-  // same cold keep-alive setup it paid before the baseline existed.
+  // same cold keep-alive setup it paid before the baseline existed. Sockets are
+  // all it preserves: the baseline also warms this server and the JIT, so the
+  // measured wave is now a warm-server wave where it used to be the cold first
+  // one. statusP95Ms is therefore not comparable across that change.
   const idleAgent = new http.Agent({ keepAlive: true, maxSockets: waveConcurrency });
   let runPromise: Promise<MaintenanceRunOutcome> | null = null;
   try {
@@ -408,12 +439,13 @@ async function fifoAvailabilityProof() {
       statusP95 <= statusP95Bound,
       `status p95 ${statusP95.toFixed(1)}ms exceeded ${statusP95Bound.toFixed(1)}ms ` +
         `(idle p95 ${idleStatusP95.toFixed(1)}ms x${STATUS_P95_RELATIVE_FACTOR}, ` +
-        `floor ${STATUS_P95_FLOOR_MS}ms)`,
+        `floor ${STATUS_P95_FLOOR_MS}ms, ceiling ${STATUS_P95_CEILING_MS}ms)`,
     );
     assert.ok(
       statusP95 <= STATUS_P95_CEILING_MS,
       `status p95 ${statusP95.toFixed(1)}ms exceeded the ${STATUS_P95_CEILING_MS}ms ceiling ` +
-        `(idle p95 ${idleStatusP95.toFixed(1)}ms, relative bound ${statusP95Bound.toFixed(1)}ms)`,
+        `(idle p95 ${idleStatusP95.toFixed(1)}ms, relative bound ${statusP95Bound.toFixed(1)}ms, ` +
+        `floor ${STATUS_P95_FLOOR_MS}ms x${STATUS_P95_CEILING_FLOOR_MULTIPLE})`,
     );
     assert.ok(
       statusMax <= FIFO_AVAILABILITY_BUDGETS.statusMaxMs,
@@ -1871,7 +1903,14 @@ async function main() {
   await pathFreeReceiptProof();
 
   const receipt = {
-    schemaVersion: 1,
+    // 2 (2026-09-13): the fifo_stall_preserves_local_http_and_reaps detail lost
+    // budgets.statusP95Ms (the fixed 100ms bar) in eco-6hoxj.90, which replaced it
+    // with budgets.statusP95FloorMs / statusP95RelativeFactor / statusP95CeilingMs
+    // and added idleStatusP95Ms, statusP95BoundMs and statusP95CeilingMs;
+    // eco-6hoxj.95 added budgets.statusP95CeilingFloorMultiple and
+    // budgets.requestTimeoutMs and moved statusP95CeilingMs 400 -> 250. A reader of
+    // an archived version 1 receipt must not expect budgets.statusP95Ms at 2.
+    schemaVersion: 2,
     proof: "maintenance_boundary",
     node: process.versions.node,
     checks,
