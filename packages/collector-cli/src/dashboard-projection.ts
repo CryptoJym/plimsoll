@@ -69,6 +69,19 @@ function parseCaptureScan(value:unknown):CaptureScanProgress|null{
 }
 
 function minutesAgo(ageMs:number){return `${Math.max(0,Math.round(ageMs/60_000))}m`;}
+/** A future-dated stamp, printed as the signed age `minutesAgo` would hide. */
+function minutesAhead(ageMs:number){return `${Math.round(-ageMs/60_000)}m`;}
+/**
+ * `rootsTotal` is the host's configured capture roots for the source; only the
+ * `ready` ones are eligible for a sweep. Name the difference when there is one
+ * so the denominator always matches the roots `plimsoll status` reports.
+ */
+function describeScanRoots(scan:CaptureScanProgress){
+  const eligible=typeof scan.rootsEligible==="number"?scan.rootsEligible:scan.rootsTotal;
+  return eligible===scan.rootsTotal
+    ?`${scan.rootsStarted}/${scan.rootsTotal} capture root(s) enumerated`
+    :`${scan.rootsStarted}/${eligible} eligible of ${scan.rootsTotal} configured capture root(s) enumerated`;
+}
 
 /**
  * Why an incomplete activity scan is incomplete, in terms an operator can act
@@ -82,7 +95,7 @@ function describeCaptureScan(local:Record<string,unknown>|undefined):
   const errorCode=local.lastErrorCode?String(local.lastErrorCode):null;
   if(!Number(local.truncated)&&!errorCode)return{state:"complete",summary:"activity scan complete",scan};
   const budget=scan
-    ?`${scan.rootsStarted}/${scan.rootsTotal} capture root(s) enumerated, `+
+    ?`${describeScanRoots(scan)}, `+
       `${scan.entriesThisSweep} entr(ies) this sweep, ${scan.entriesThisTick} this tick `+
       `(budget ${scan.entryBudgetPerTick} entries/${scan.wallBudgetMsPerTick}ms per tick, `+
       `lifetime limit ${scan.lifetimeEntryLimit}), ${scan.pendingFiles} candidate(s) pending`
@@ -3319,11 +3332,19 @@ export class DashboardProjectionStore {
           summary:"hook-delivered source — there is no local activity scan",scan:null}
         :describeCaptureScan(local);
       const eventAgeMs=latest.lastEventAt?now.getTime()-Date.parse(latest.lastEventAt):null;
-      const eventsFresh=eventAgeMs!==null&&eventAgeMs<=CAPTURE_EVENT_CADENCE_MS;
+      // `eventAgeMs` is signed and `last_event_at` is a monotone max, so a single
+      // future-dated event would otherwise hold the freshness credit — and the
+      // green label — for the whole skew interval, on a source that may be dead.
+      // A stamp ahead of the clock is not evidence of capture; say so instead.
+      const eventsFuture=eventAgeMs!==null&&eventAgeMs<0;
+      const eventsFresh=eventAgeMs!==null&&eventAgeMs>=0&&eventAgeMs<=CAPTURE_EVENT_CADENCE_MS;
+      const futureReason=()=>`newest event is ${minutesAhead(eventAgeMs!)} in the future — `+
+        `clock skew or a future-dated producer; capture state cannot be judged`;
       const neverCaptured=!latest.lastEventAt&&Number(sessions.ledgerSessionsToday??0)===0;
       let status:"green"|"amber"|"red"|"no_events"="green"; let reason="capture current";
       if(capture==="hook_only"){
         if(neverCaptured){status="no_events";reason="configured source with no events captured yet";}
+        else if(eventsFuture){status="amber";reason=futureReason();}
         else if(eventsFresh)reason=`capture current — ${sessions.tokenSessionsToday??0} session(s) with tokens today (hook-delivered)`;
         else{status="amber";
           reason=`no hook event for ${minutesAgo(eventAgeMs??0)} — hook delivery cannot be confirmed `+
@@ -3349,6 +3370,9 @@ export class DashboardProjectionStore {
         // The ledger's own freshness is capture truth too: a source whose newest
         // event is inside its expected cadence is demonstrably capturing, so it
         // reads green even while its bounded sweep is still enumerating roots.
+        // A future-dated newest event carries no such credit: it can neither
+        // confirm capture nor be corrected by a later event.
+        else if(eventsFuture){status="amber";reason=futureReason();}
         else if(eventsFresh)reason=`capture current — ${sessions.tokenSessionsToday??0} session(s) with tokens today`;
         // Only when capture truth is silent may local scan bookkeeping decide.
         else if(!local){status="amber";reason="local activity state unavailable — awaiting a tailer scan";}

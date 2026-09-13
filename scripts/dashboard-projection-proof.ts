@@ -22,6 +22,8 @@ import {
   type SubscriptionConfig,
 } from "../packages/collector-cli/src/dashboard-api";
 import { historyCoverageStatus } from "../packages/collector-cli/src/history-coverage";
+import { CaptureWorkBudget } from "../packages/collector-cli/src/capture-work-budget";
+import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 
@@ -1467,6 +1469,7 @@ async function main() {
       converging: true,
       sweepComplete: false,
       rootsTotal: 22,
+      rootsEligible: 22,
       rootsStarted: 8,
       entriesThisSweep: 3_412,
       entriesThisTick: 6,
@@ -1610,7 +1613,7 @@ async function main() {
         discoveryEntries: 12,
         lastScanAt: new Date(NOW.getTime() - 30_000).toISOString(),
         truncated: false,
-        scan: { ...MANY_ROOT_SCAN, converging: true, sweepComplete: true, rootsStarted: 22, pendingFiles: 0 },
+        scan: { ...MANY_ROOT_SCAN, converging: false, sweepComplete: true, rootsStarted: 22, pendingFiles: 0 },
       });
     }
     settle(empty, NOW, 30);
@@ -1629,6 +1632,183 @@ async function main() {
       emptyHealth.overall === "green",
       { sources: emptyHealth.sources.map((row) => `${row.source}:${row.status}`),
         overall: emptyHealth.overall });
+
+    // Bead eco-6hoxj.73 r2, finding 1: `lastEventAt` is a monotone max and the
+    // age behind the freshness credit is signed, so one future-dated event must
+    // never buy a green label — least of all on a hook-only source, where the
+    // ledger is the only truth and no later event can correct the stamp.
+    const futureDated = (label: string, sources: Array<{ source: "claude_code" | "codex" | "grok"; ageMs: number }>) => {
+      const fixture = new LocalEventBuffer(path.join(root, `capture-health-${label}.sqlite`));
+      sources.forEach(({ source, ageMs }, index) => {
+        fixture.append(event({
+          source,
+          sessionId: uuid(920_000 + index),
+          observedAt: new Date(NOW.getTime() - ageMs).toISOString(),
+          inputTokens: 1_200, outputTokens: 340, costUsd: 0.004,
+        }));
+      });
+      settle(fixture, NOW, 30);
+      return fixture;
+    };
+    const FUTURE_MS = -25 * 60 * 60_000;
+    // The other two sources capture normally, so `overall` can only be amber
+    // because of the skewed hook source.
+    const skewedGrok = futureDated("future-grok", [
+      { source: "grok", ageMs: FUTURE_MS },
+      { source: "claude_code", ageMs: 5 * 60_000 },
+      { source: "codex", ageMs: 5 * 60_000 },
+    ]);
+    for (const source of ["claude_code", "codex"] as const) {
+      skewedGrok.projection.recordCaptureActivity({
+        source,
+        lastActivityAt: new Date(NOW.getTime() - 6 * 60_000).toISOString(),
+        filesToday: 1,
+        discoveryEntries: 12,
+        lastScanAt: new Date(NOW.getTime() - 30_000).toISOString(),
+        truncated: false,
+        scan: { ...MANY_ROOT_SCAN, converging: false, sweepComplete: true, rootsStarted: 22, pendingFiles: 0 },
+      });
+    }
+    settle(skewedGrok, NOW, 30);
+    const skewedGrokHealth = (readySnapshot(skewedGrok, 30).status.health as {
+      overall: string;
+      sources: Array<{ source: string; status: string; reason: string; lastEventAgeMs: number | null }>;
+    });
+    const skewedGrokRow = skewedGrokHealth.sources.find((row) => row.source === "grok")!;
+    check("future_dated_hook_event_is_named_amber_not_capture_current",
+      skewedGrokRow.status === "amber" &&
+      skewedGrokRow.reason === "newest event is 1500m in the future — clock skew or a future-dated " +
+        "producer; capture state cannot be judged" &&
+      skewedGrokRow.lastEventAgeMs === FUTURE_MS &&
+      skewedGrokHealth.sources.filter((row) => row.status === "green").length === 2 &&
+      skewedGrokHealth.overall === "amber",
+      { status: skewedGrokRow.status, reason: skewedGrokRow.reason,
+        lastEventAgeMs: skewedGrokRow.lastEventAgeMs, overall: skewedGrokHealth.overall,
+        sources: skewedGrokHealth.sources.map((row) => `${row.source}:${row.status}`) });
+
+    // Capture demonstrably dead — last real event three days old, no local
+    // activity, a stale truncated sweep — plus one future-dated event.
+    const skewedDead = futureDated("future-dead", [
+      { source: "claude_code", ageMs: 3 * DAY_MS },
+      { source: "claude_code", ageMs: FUTURE_MS },
+    ]);
+    skewedDead.projection.recordCaptureActivity({
+      source: "claude_code",
+      lastActivityAt: null,
+      filesToday: 0,
+      discoveryEntries: MANY_ROOT_SCAN.entriesThisTick,
+      lastScanAt: new Date(NOW.getTime() - 4 * 60 * 60_000).toISOString(),
+      truncated: true,
+      scan: MANY_ROOT_SCAN,
+    });
+    settle(skewedDead, NOW, 30);
+    const skewedDeadClaude = (readySnapshot(skewedDead, 30).status.health as {
+      sources: Array<{ source: string; status: string; reason: string; lastEventAgeMs: number | null }>;
+    }).sources.find((row) => row.source === "claude_code")!;
+    check("future_dated_event_cannot_green_a_dead_local_capture",
+      skewedDeadClaude.status !== "green" && skewedDeadClaude.status === "amber" &&
+      skewedDeadClaude.reason.includes("1500m in the future") &&
+      skewedDeadClaude.reason.includes("capture state cannot be judged") &&
+      !skewedDeadClaude.reason.startsWith("capture current") &&
+      skewedDeadClaude.lastEventAgeMs === FUTURE_MS,
+      { status: skewedDeadClaude.status, reason: skewedDeadClaude.reason,
+        lastEventAgeMs: skewedDeadClaude.lastEventAgeMs });
+
+    // Bead eco-6hoxj.73 r2, finding 2: drive a real tailer through the baseline
+    // phase. The eight r1 checks read a hand-built receipt, so they could not
+    // see that the baseline cursor was never published. 22 readable roots and
+    // three configured-but-missing roots: more entries than one cadence's
+    // budget can enumerate, and an eligible count below the configured count.
+    const baselineRoot = path.join(root, "baseline-sweep");
+    const baselineRoots = Array.from({ length: 25 }, (_, index) => {
+      const directory = path.join(baselineRoot, `root-${String(index).padStart(2, "0")}`);
+      if (index < 22) {
+        fs.mkdirSync(directory, { recursive: true });
+        for (let file = 0; file < 20; file += 1) {
+          fs.writeFileSync(path.join(directory, `session-${file}.jsonl`), "{}\n");
+        }
+      }
+      return { rootId: `root-${index}`, profileId: `profile-${index}`,
+        installationEpochId: "epoch-baseline", source: "claude_code" as const, directory };
+    });
+    const baselineBuffer = new LocalEventBuffer(path.join(root, "capture-health-baseline.sqlite"));
+    baselineBuffer.append(event({
+      source: "claude_code", sessionId: uuid(930_001),
+      observedAt: new Date(NOW.getTime() - 3 * 60 * 60_000).toISOString(),
+      inputTokens: 1_200, outputTokens: 340, costUsd: 0.004,
+    }));
+    settle(baselineBuffer, NOW, 30);
+    const baselineTailer = new TranscriptTailer(
+      baselineBuffer, path.join(baselineRoot, "root-00"), undefined, baselineRoots);
+    const baselineTick = async (deferredBeforeIo = false) => (await baselineTailer.scan({
+      scope: "recent",
+      deferredBeforeIo,
+      automatic: { phase: "baseline", budget: new CaptureWorkBudget() },
+    })).activity.scan!;
+    const firstTick = await baselineTick();
+    const secondTick = await baselineTick();
+    check("baseline_phase_cadence_publishes_the_live_sweep_receipt",
+      firstTick.rootsStarted > 0 && secondTick.rootsStarted >= firstTick.rootsStarted &&
+      firstTick.entriesThisSweep > 0 && secondTick.entriesThisSweep > firstTick.entriesThisSweep &&
+      firstTick.lifetimeEntryLimit === 100_000 && secondTick.lifetimeEntryLimit === 100_000 &&
+      firstTick.sweepComplete === false && secondTick.sweepComplete === false &&
+      firstTick.converging === true &&
+      firstTick.rootsTotal === 25 && firstTick.rootsEligible === 22,
+      { first: firstTick, second: secondTick });
+
+    // The same receipt, read by the health ladder while capture truth is silent:
+    // the amber reason must name the real numbers, not a zero sweep on a zero
+    // budget. Local activity is left null so the ledger cannot answer.
+    baselineBuffer.projection.recordCaptureActivity({
+      source: "claude_code",
+      lastActivityAt: null,
+      filesToday: 0,
+      discoveryEntries: secondTick.entriesThisTick,
+      lastScanAt: new Date(NOW.getTime() - 30_000).toISOString(),
+      truncated: true,
+      scan: secondTick,
+    });
+    settle(baselineBuffer, NOW, 30);
+    const baselineClaude = (readySnapshot(baselineBuffer, 30).status.health as {
+      sources: Array<{ source: string; status: string; reason: string; diagnostics: string[];
+        activityState: { scanState: string; scan: Record<string, unknown> | null } }>;
+    }).sources.find((row) => row.source === "claude_code")!;
+    check("baseline_phase_amber_reason_names_the_real_sweep_numbers",
+      baselineClaude.status === "amber" &&
+      baselineClaude.reason.includes("activity scan still sweeping") &&
+      baselineClaude.reason.includes(
+        `${secondTick.rootsStarted}/22 eligible of 25 configured capture root(s) enumerated`) &&
+      baselineClaude.reason.includes(`${secondTick.entriesThisSweep} entr(ies) this sweep`) &&
+      baselineClaude.reason.includes("lifetime limit 100000") &&
+      !baselineClaude.reason.includes("0 entr(ies) this sweep") &&
+      !baselineClaude.reason.includes("lifetime limit 0") &&
+      baselineClaude.activityState.scanState === "in_progress" &&
+      baselineClaude.activityState.scan?.sweepComplete === false,
+      { status: baselineClaude.status, reason: baselineClaude.reason });
+
+    // Finding 4: a cadence deferred before any filesystem work keeps its cursor,
+    // so it is still converging, and a cadence with no cursor at all may not
+    // claim a complete sweep.
+    const deferredTick = await baselineTick(true);
+    check("deferred_cadence_keeps_its_cursor_and_reports_it_truthfully",
+      deferredTick.deferredBeforeIo === true && deferredTick.converging === true &&
+      deferredTick.sweepComplete === false &&
+      deferredTick.entriesThisSweep === secondTick.entriesThisSweep &&
+      deferredTick.rootsStarted === secondTick.rootsStarted,
+      { deferred: deferredTick, second: secondTick });
+    baselineTailer.close();
+    const cursorlessTailer = new TranscriptTailer(
+      baselineBuffer, path.join(baselineRoot, "root-00"), undefined, baselineRoots);
+    const cursorless = (await cursorlessTailer.scan({
+      scope: "recent", deferredBeforeIo: true,
+      automatic: { phase: "baseline", budget: new CaptureWorkBudget() },
+    })).activity.scan!;
+    check("a_cadence_with_no_discovery_cursor_never_claims_a_complete_sweep",
+      cursorless.sweepComplete === false && cursorless.converging === false &&
+      cursorless.entriesThisSweep === 0 && cursorless.lifetimeEntryLimit === 100_000 &&
+      cursorless.rootsTotal === 25 && cursorless.rootsEligible === 22,
+      { cursorless });
+    cursorlessTailer.close();
 
     const healthServer = createCollectorServer(collectorConfigSchema.parse({ subscriptions }), live.fixture);
     const healthPort = await listen(healthServer);
@@ -1649,6 +1829,9 @@ async function main() {
     live.fixture.close();
     staleEvents.fixture.close();
     empty.close();
+    skewedGrok.close();
+    skewedDead.close();
+    baselineBuffer.close();
 
     console.log(JSON.stringify({
       schema: "plimsoll.dashboard-projection-proof.v1",

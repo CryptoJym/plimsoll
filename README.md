@@ -194,11 +194,15 @@ and answers one question per source: *is what ran on this machine reaching the
 ledger?*
 
 - **green** — capture is current. Either the source's newest ledger event is
-  inside its expected cadence (60 minutes), or a completed local scan agrees
-  with what the ledger holds.
+  inside its expected cadence (60 minutes) and not ahead of the clock, or a
+  completed local scan agrees with what the ledger holds.
 - **amber** — capture cannot be confirmed, with the exact reason: local activity
-  that outran token attribution, a local activity scan that could not finish, or
-  a scan receipt too old to confirm quiet.
+  that outran token attribution, a local activity scan that could not finish, a
+  scan receipt too old to confirm quiet, or a newest event dated in the future.
+  A future-dated event never earns the freshness credit: `last_event_at` only
+  ever moves forward, so a clock-skewed or future-dated producer would otherwise
+  hold a dead source green for the whole skew interval. The reason carries the
+  signed age (`newest event is 1500m in the future …`), as does `lastEventAgeMs`.
 - **red** — local activity is demonstrably *not* reaching the ledger.
 - **no_events** — the source is configured and enumerated, and has captured
   nothing yet. It is never absent and never reads as healthy, and it does not
@@ -214,6 +218,29 @@ visited this sweep and this tick, the per-tick budget and the candidates still
 pending — and it only becomes the source's `reason` when capture truth cannot
 answer. A host whose events are flowing reads green with the sweep reported
 alongside it (bead eco-6hoxj.73).
+
+`activityState.scan` is an operator field set, published for reading rather than
+consumed by the label:
+
+- `rootsTotal` / `rootsEligible` / `rootsStarted` — capture roots configured for
+  the source (the count `plimsoll status` reports for roots elsewhere), how many
+  of them are currently `ready` and so eligible for a sweep, and how many this
+  sweep has begun. When the two totals differ the reason says so explicitly
+  (`4/22 eligible of 25 configured capture root(s) enumerated`).
+- `entriesThisSweep` / `entriesThisTick` / `pendingFiles` — enumeration progress
+  since the sweep began and in this cadence, and the candidates still awaiting
+  metadata. These advance during the first-install baseline sweep too.
+- `entryBudgetPerTick` / `wallBudgetMsPerTick` / `lifetimeEntryLimit` — the
+  budget that ended the cadence (256 entries, 50 ms) and the entries one cursor
+  may visit before it restarts instead of resuming (100000).
+- `converging` — a cursor exists and will resume on the next cadence; it stays
+  true for a cadence deferred before any filesystem work, which keeps its cursor.
+  False once the sweep finished or hit `limitReached`.
+- `sweepComplete` — this cadence's cursor finished a full sweep of every eligible
+  root. A cadence with no cursor at all (the baseline phase between sweeps)
+  reports false: no cursor is no receipt.
+- `limitReached` / `deferredBeforeIo` — why the cadence ended, when it was not
+  the per-tick budget.
 
 `historyCoverage` answers a different question — has an explicit full backfill
 covered this source's retained history? — and stays independent of capture

@@ -22,6 +22,7 @@ import {
 } from "./jsonl-byte-tailer";
 import {
   AUTOMATIC_DISCOVERY_ENTRY_CAP,
+  AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP,
   AUTOMATIC_DISCOVERY_WALL_MS,
   AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP,
   captureScanProgress,
@@ -409,14 +410,29 @@ export class TranscriptTailer {
    */
   async scan(options: TranscriptScanOptions): Promise<TranscriptScanResult> {
     const result = await this.runScan(options);
+    // The baseline sweep is a live cursor too. Reading only `captureAttempt`
+    // published zeros and a false `sweepComplete` for every cadence of the
+    // baseline phase — the long sweep an operator most needs to read.
+    const attempt = this.captureAttempt ?? this.baselineAttempt;
     result.activity.scan = captureScanProgress({
-      discovery: this.captureAttempt?.discovery.progress() ?? null,
-      configuredRoots: this.directories.length,
-      pendingFiles: this.captureAttempt?.pendingFiles.length ?? 0,
+      discovery: attempt?.discovery.progress() ?? null,
+      configuredRoots: this.configuredRootCount,
+      eligibleRoots: this.directories.length,
+      pendingFiles: attempt?.pendingFiles.length ?? 0,
       entriesThisTick: result.activity.discoveryEntries,
       deferredBeforeIo: options.deferredBeforeIo === true,
+      lifetimeEntryLimit: this.lifetimeEntryLimit(options.discoveryLimit),
     });
     return result;
+  }
+
+  /** Roots `plimsoll status` reports for this source, ready or not. */
+  private get configuredRootCount(): number {
+    return this.inventoryConfigured ? this.captureRoots.length : 1;
+  }
+
+  private lifetimeEntryLimit(limit?: number) {
+    return Math.max(1, limit ?? AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP);
   }
 
   private async runScan(options: TranscriptScanOptions): Promise<TranscriptScanResult> {
@@ -1095,7 +1111,7 @@ export class TranscriptTailer {
     return new IncrementalJsonlDiscovery(this.directories, {
       recursive: true,
       matches: (name) => name.endsWith(".jsonl"),
-      maxEntries: Math.max(1, limit ?? 100_000),
+      maxEntries: this.lifetimeEntryLimit(limit),
       missingRootsAreEmpty: true,
       isCandidateQuarantined: (candidateHash) => {
         const quarantine = this.activeBoundaryOptions.quarantine;
