@@ -135,7 +135,7 @@ file can add one on multiple ticks. Use `pendingFiles` and its age for the
 current backlog. The counter is cumulative and does not reset when it drains.
 
 File/directory synchronization uses the same OS primitives as the other durable
-local writers. The primitive is Node's `fs.fsyncSync`, which on macOS is not a plain `fsync(2)`: libuv's `uv_fs_fsync` asks for `fcntl(F_FULLFSYNC)` there and falls back to `F_BARRIERFSYNC`, then to `fsync(2)`, only when the filesystem refuses it. On a volume that honours `F_FULLFSYNC` — an internal APFS disk is the normal case — the drive is told to flush its own volatile write cache, so the power-loss window is closed as well as the process-crash one, with no native addon. Where the filesystem refuses it and libuv falls back, the process-crash window is still closed and the power-loss one is only narrowed; that is the case on external or virtualised volumes with a writeback cache. Either way this is not a hardware power-cut certification. If publication's
+local writers. The primitive is Node's `fs.fsyncSync`, which on macOS is not a plain `fsync(2)`: libuv's `uv_fs_fsync` asks for `fcntl(F_FULLFSYNC)` there and falls back to `F_BARRIERFSYNC`, then to `fsync(2)`, whenever that `fcntl` returns non-zero — a filesystem that refuses it, but also a transient error such as `EIO` or `EINTR` — with no signal to the caller that a weaker flush was used. On a volume that honours `F_FULLFSYNC` — an internal APFS disk is the normal case — the drive is told to flush its own volatile write cache, so the power-loss window is closed as well as the process-crash one, with no native addon. Where the filesystem refuses it and libuv falls back, the process-crash window is still closed and the power-loss one is only narrowed; that is the case on external or virtualised volumes with a writeback cache. Either way this is not a hardware power-cut certification. If publication's
 directory flush fails, the writer tries to hide its unacknowledged envelope as a
 bounded orphan temporary and returns failure. If the filesystem also refuses
 that rollback, a visible unacknowledged file can remain; no universal exactly-once
@@ -162,8 +162,9 @@ to drain, so a host whose spool is refusing every event (a refusal writes no
 file, so it gives the drain no work) still shows `refused` rising there, within
 that same one tick. Rolling back to a collector that predates `refused` (0.7.24
 and older) is safe — it ignores the key when it reads the counters file — but
-its first drain tick with work rewrites the file without it, so an accumulated
-refusal count is lost at that point; the other counters are unaffected.
+its first counters write — an intake spool or a drain tick with work — rewrites
+the file without it, so an accumulated refusal count is lost at that point; the
+other counters are unaffected.
 Contract rejections are **not** spooled: a body the collector refuses on its merits (4xx other than 408)
 still fails the hook loudly, and a spooled file the drain cannot apply is
 quarantined under `hook-spool/rejected/` rather than retried forever. An
