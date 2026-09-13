@@ -186,8 +186,14 @@ closing summary splits its total across every route it saw:
 `count` is still the window total for the `(reason, clientClass)` pair; in
 unseeded production windows the `routes` values sum to it (proof/recovery
 `initialByReason` counts have no route attribution and are excluded from that
-split), and `routes` is appended last, so every line the older collector
-printed is still there byte for byte in front of it. Route
+split), and `routes` follows every key the older collector printed, so every
+busy line production emits today is still the older collector's line byte for
+byte with `routes` appended. Route-classified windows never carry record
+statistics; if a caller ever hands a record diagnostic to a busy rejection (no
+production caller does today), its statistics are dropped at ingest and the drop
+is counted in `recordDiagnosticsDiscarded` — emitted only when non-zero,
+between `action` and `routes` — so parsers must treat that key as optional and
+not read the key set above as closed. Route
 names come from a closed vocabulary — `/hooks/claude-code`, `/hooks/codex`,
 `/hooks/grok`, `otlp`, `other` — computed from the request path alone, so no
 query string, path segment or header value ever reaches the log. Only the busy
