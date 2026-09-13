@@ -1068,10 +1068,17 @@ function activeTimerCount() {
 // names — an inline function or arrow, or an identifier resolved to the one
 // function of that name in this file — and that body is counted too. A handler
 // this file cannot resolve is refused rather than read: an unread handler
-// cannot be shown to be guard-free, so it reds the audit. And a guard counts
-// whether or not it spells the class: instanceof and the name string as before,
-// plus a prototype identity test, a constructor identity test, and the class
-// reached through an aliased import or a local alias, resolved to a fixpoint.
+// cannot be shown to be guard-free, so it reds the audit. That refusal is a
+// refusal, not a diagnosis: a const alias of a resolvable helper, a method
+// reference, a .bind() result and a parenthesised comma expression each count
+// as unresolved and red the audit with no defect present (REVIEW-89 N3). A
+// guard counts when it is a binary test or a case clause on the class's name:
+// instanceof and the name string as before, plus === <Class>.prototype on
+// either side, <expr>.constructor === <Class>, and the class reached through an
+// aliased import or a local alias, resolved to a fixpoint. It does NOT count a
+// call-form test (<Class>.prototype.isPrototypeOf(error)) or a class wrapped in
+// parentheses (instanceof (<Class>), === (<Class>).prototype): both audit clean
+// here, at this revision and at the one before it (REVIEW-89 N1).
 //
 // The retry loop may be a for with no condition, a while (true) or a
 // do { } while (true). They are one loop written three ways, and a maintainer
@@ -1082,9 +1089,13 @@ function activeTimerCount() {
 // found instead of leaving the reader to infer it.
 //
 // What it cannot see: a ProofTimeoutError re-raised by a function this one
-// invokes rather than hands over as a callback, a handler passed to something
-// other than .catch or .then, and any shape assembled at run time through eval
-// or new Function. No behavioural check backs the audit up for those: the guard
+// invokes rather than hands over as a callback; a handler reached other than
+// through a .catch or .then property access — a .finally() callback, an
+// element-access p["catch"](h), and a handler declared outside this function
+// and handed to Promise.allSettled(...).then(...) all audit clean (REVIEW-89
+// N4); the call-form and parenthesised identity tests above; and any shape
+// assembled at run time through eval or new Function. loopForms is emitted for
+// the reader and never asserted. No behavioural check backs the audit up for those: the guard
 // it exists to refuse is dead by construction, so it changes nothing a
 // behavioural check could observe. This is a shape check on one function body
 // and claims nothing past it.
@@ -1335,6 +1346,14 @@ type FetchSourceAnchors = {
 // The same holds for the rest: the loop header, the fetch call and the handler
 // the body read already hands to .catch are all located in the tree, so a probe
 // that rewrites one of them rewrites the node it named or nothing at all.
+//
+// The anchors also require exactly one fetch( call and exactly one
+// single-argument .catch( call inside the retry try, because the probes splice
+// at those two nodes. A benign refactor of the shipped function that adds a
+// second .catch( in the try, or moves fetch into a local helper, therefore
+// takes the anchor-miss path: the probe check reds with probes: 0 and carries
+// the primary audit, which still says clean (REVIEW-89 N2). That is a false
+// red that costs the next reader a look at the receipt, not an escape.
 function fetchSourceAnchors(fileText: string): FetchSourceAnchors | undefined {
   const sourceFile = ts.createSourceFile(scriptPath, fileText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const matches = findFetchFunction(sourceFile);
