@@ -186,6 +186,49 @@ Residual behaviour worth knowing:
 - An `http`/`curl` hook whose post never reaches a listening collector is still
   lost: there is no Plimsoll process on that path to spool it.
 
+## Delivery retry scheduling
+
+The daemon distinguishes a completely failed upload cycle from one that already
+acknowledged useful work. A later failed batch in a partly successful cycle no
+longer escalates the whole host into a 10–60-minute exponential pause. The next
+regular upload cadence can retry eligible work; the outbox still owns each
+item's identity, attempt count, retry time and acknowledgement checks.
+
+Completely failing remote cycles retain exponential backoff with a one-hour
+ceiling. Direct SQLite contention, or a network failure while the maintenance
+circuit is open, does not add an exponential pause. This is a scheduling decision,
+not proof that every network failure originated on the host. A real remote HTTP
+refusal is not dismissed because local maintenance is unhealthy.
+
+A valid `Retry-After` on a transient remote refusal is a lower bound. Deferred
+outbox rows persist that lower bound, so reopening the ledger does not retry them
+early. A partly accepted lease can report both its acknowledged siblings and the
+remaining server-directed delay. Session follow-ups to that same endpoint are
+carried to a later cycle rather than sent inside the cooldown. Malformed delays
+are ignored; valid server
+cooldowns are not shortened to the normal cadence. A server delay is honoured
+only up to a ceiling: the scheduler waits at most one hour, and the persisted
+outbox floor never exceeds the configured `delivery.maxBackoffSeconds`, so a
+single overlong or mistyped `Retry-After` cannot park delivery indefinitely. The
+HTTP-date form is measured against the response's own `Date` header when it has
+one, so a skewed local clock does not inflate the wait. Witness-only probes have
+no leased event row: their extra scheduler cooldown remains process-local.
+
+Authenticated `/status` exposes `sync.failureStreak`, `sync.nextAttemptAt`,
+`sync.notBefore`, `sync.lastError` and `sync.lastCycleUploadedEvents`, and
+`plimsoll status` prints the same block by asking the daemon that owns it. A
+cycle that acknowledged work is not a failure: its server-directed wait is
+reported through `sync.notBefore`, with `sync.lastError` null. The next
+attempt is the earliest eligible cadence tick, not a promise of network traffic:
+per-item retry dates, open circuits, shutdown and an in-flight cycle still apply.
+The scheduling snapshot is process-local; only outbox retry dates survive a restart.
+Failure logs include a timestamp and an allowlisted code such as `ETIMEDOUT` or
+`ECONNRESET`, not arbitrary exception text, URLs or credentials.
+
+`pnpm proof:sync-backoff` exercises partial cycles, genuine outages, local
+pressure, real loopback HTTP refusal, persistent cooldowns, and cache-only status.
+The existing delivery, outbox and storage-retry proofs remain required.
+
 ## Quickstart
 
 Requirements: macOS, Node >=20 <25.

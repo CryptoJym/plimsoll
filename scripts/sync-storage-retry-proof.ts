@@ -18,6 +18,7 @@ import {
   isSqliteContentionError,
 } from "../packages/collector-cli/src/sqlite-contention";
 import { DeliveryUploadError, uploadBufferedEvents } from "../packages/collector-cli/src/upload";
+import { SyncBackoff } from "../packages/collector-cli/src/sync-backoff";
 import { PLIMSOLL_VERSION } from "../packages/collector-cli/src/version";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 import { acknowledgingFetch } from "./fixtures/delivery-ack-fixture";
@@ -417,26 +418,48 @@ async function main() {
     }
   });
 
-  await check("daemon_classifies_storage_busy_without_failure_backoff", () => {
+  await check("daemon_classifies_storage_busy_without_failure_backoff", async () => {
     const source = fs.readFileSync(
-      new URL("../packages/collector-cli/src/cli.ts", import.meta.url),
-      "utf8",
+      new URL("../packages/collector-cli/src/cli.ts", import.meta.url), "utf8",
     );
     const start = source.indexOf("    const runSync = async () => {");
     const end = source.indexOf("\n    // First boot records", start);
-    assert.notEqual(start, -1);
-    assert.notEqual(end, -1);
+    assert.notEqual(start, -1); assert.notEqual(end, -1);
     const runSync = source.slice(start, end);
     assert.match(runSync, /new SyncStorageRetryController\(\)/);
     assert.match(runSync, /storageRetry/);
+    const scheduling = runSync.indexOf("syncBackoff.failure(error, uploaded,");
     const busyBranch = runSync.indexOf("error instanceof SyncStorageBusyError");
-    const failureIncrement = runSync.indexOf("syncFailureStreak += 1");
-    assert.ok(busyBranch >= 0 && busyBranch < failureIncrement);
-    assert.match(runSync.slice(busyBranch, failureIncrement), /warning:\s*"sync_storage_busy"/);
-    assert.match(runSync.slice(busyBranch, failureIncrement), /syncSkipUntil\s*=\s*0/);
-    assert.doesNotMatch(runSync.slice(busyBranch, failureIncrement), /syncFailureStreak\s*[+]?=/);
-    assert.match(runSync.slice(failureIncrement), /warning:\s*"sync_failed"/);
-    assert.match(runSync.slice(failureIncrement), /2 \*\* Math\.min\(syncFailureStreak, 4\)/);
+    const genericWarning = runSync.indexOf('warning: "sync_failed"');
+    assert.ok(scheduling >= 0 && scheduling < busyBranch && busyBranch < genericWarning);
+    const busyCode = runSync.slice(busyBranch, genericWarning);
+    assert.match(busyCode, /warning:\s*"sync_storage_busy"/);
+    assert.match(busyCode, /waitMs:\s*error\.waitMs/);
+    assert.match(busyCode, /retries:\s*error\.retries/);
+    assert.match(busyCode, /return;/);
+    assert.doesNotMatch(busyCode, /syncBackoff\.(?:failure|success)\(/);
+
+    // Prove the behavior through the real scheduler instead of pinning names
+    // of the inline variables it replaced. A prior outage must not leak into
+    // the distinct local-storage refusal, and remote failures still escalate.
+    const scheduler = new SyncBackoff(cfg.syncIntervalSeconds * 1_000);
+    const now = Date.now(); scheduler.arm(now);
+    for (let attempt = 0; attempt < 3; attempt++) {
+      scheduler.failure(new DeliveryUploadError("remote_transient", "network"), 0, now);
+    }
+    const retry = controller(50);
+    await assert.rejects(retry.run(() => { throw busy("SQLITE_BUSY_SNAPSHOT"); }), error => {
+      assert.ok(error instanceof SyncStorageBusyError);
+      const result = scheduler.failure(error, 0, now);
+      assert.equal(result.failureStreak, 0); assert.equal(result.backoffMs, 0);
+      assert.equal(result.error.code, "local_storage_busy");
+      assert.equal(scheduler.ready(now), true);
+      assert.equal(scheduler.status(false, now).nextAttemptAt, new Date(now + cfg.syncIntervalSeconds * 1_000).toISOString());
+      return true;
+    });
+    const remote = scheduler.failure(new DeliveryUploadError("remote_transient", "remote_transient"), 0, now);
+    assert.equal(remote.failureStreak, 1);
+    assert.equal(remote.backoffMs, cfg.syncIntervalSeconds * 2_000);
   });
 
   console.log(JSON.stringify({

@@ -7,10 +7,21 @@ export type TransportFailure =
 
 /** Only these symbolic diagnostics may leave the transport boundary. */
 export class TransportError extends Error {
-  constructor(readonly code: TransportFailure) {
+  constructor(readonly code: TransportFailure, readonly networkCode: string | null = null) {
     super(`Transport failed: ${code}`);
     this.name = "TransportError";
   }
+}
+
+const SAFE_NETWORK_CODES = new Set(["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EAI_AGAIN", "ENETUNREACH", "EHOSTUNREACH", "UND_ERR_SOCKET", "UND_ERR_CONNECT_TIMEOUT", "UND_ERR_HEADERS_TIMEOUT", "UND_ERR_BODY_TIMEOUT", "AbortError"]);
+function networkCode(error: unknown): string | null {
+  let current = error;
+  for (let depth = 0; depth < 3 && current && typeof current === "object"; depth++) {
+    const item = current as { code?: unknown; name?: unknown; cause?: unknown };
+    for (const value of [item.code, item.name]) if (typeof value === "string" && SAFE_NETWORK_CODES.has(value)) return value;
+    current = item.cause;
+  }
+  return null;
 }
 
 export function isLoopbackHostname(hostname: string) {
@@ -113,7 +124,7 @@ export async function postJson(input: JsonPostOptions): Promise<JsonPostResult> 
   try { return await Promise.race([read(), deadline]); }
   catch (error) {
     if (error instanceof TransportError) throw error;
-    throw new TransportError(controller.signal.aborted ? "deadline_exceeded" : "network_error");
+    throw new TransportError(controller.signal.aborted ? "deadline_exceeded" : "network_error", networkCode(error));
   } finally {
     clearTimeout(timer!);
     controller.abort();

@@ -1761,7 +1761,22 @@ export class DeliveryOutbox {
     return run();
   }
 
-  retry(leaseId: string, items: LeasedDeliveryItem[], failure: DeliveryFailureClass, at = new Date()) {
+  /**
+   * A caller-supplied `notBefore` raises the per-item retry date but can never
+   * exceed the ledger's own configured ceiling: a server-directed floor is
+   * honoured up to `maxBackoffSeconds` and no further, so one malformed
+   * `Retry-After` cannot park rows past the maximum this outbox already
+   * promised (review r1, F2).
+   */
+  private flooredAttemptAt(deliveryId: string, attemptCount: number, at: Date, notBefore?: Date) {
+    const normal = this.nextAttemptAt(deliveryId, attemptCount, at);
+    if (!notBefore || !Number.isFinite(notBefore.getTime())) return normal;
+    const ceiling = at.getTime() + this.limits.maxBackoffSeconds * 1_000;
+    const floor = Math.min(notBefore.getTime(), ceiling);
+    return new Date(Math.max(Date.parse(normal), floor)).toISOString();
+  }
+
+  retry(leaseId: string, items: LeasedDeliveryItem[], failure: DeliveryFailureClass, at = new Date(), notBefore?: Date) {
     const update = this.db.prepare(
       `update upload_outbox set state = 'retry', next_attempt_at = @nextAttemptAt,
          lease_id = null, lease_expires_at = null, last_failure_class = @failure,
@@ -1775,7 +1790,7 @@ export class DeliveryOutbox {
           deliveryId: item.deliveryId,
           leaseId,
           failure,
-          nextAttemptAt: this.nextAttemptAt(item.deliveryId, item.attemptCount, at),
+          nextAttemptAt: this.flooredAttemptAt(item.deliveryId, item.attemptCount, at, notBefore),
           now: at.toISOString(),
         }).changes;
       }
