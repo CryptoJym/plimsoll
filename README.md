@@ -221,10 +221,12 @@ ledger?*
 
 - **green** — capture is current. Either the source's newest ledger event is
   inside its expected cadence (60 minutes) and not ahead of the clock, or a
-  completed local scan agrees with what the ledger holds.
+  completed local scan agrees with what the ledger holds, and the session-count
+  projection does not show a conflicting watermark.
 - **amber** — capture cannot be confirmed, with the exact reason: local activity
   that outran token attribution, a local activity scan that could not finish, a
-  scan receipt too old to confirm quiet, or a newest event dated in the future.
+  scan receipt too old to confirm quiet, a lagging session-count projection,
+  or a newest event dated in the future.
   A future-dated event never earns the freshness credit: `last_event_at` only
   ever moves forward, so a clock-skewed or future-dated producer would otherwise
   hold a dead source green for the whole skew interval. The reason carries the
@@ -234,6 +236,27 @@ ledger?*
   nothing yet. It is never absent and never reads as healthy, and it does not
   make the overall label amber.
 
+The status snapshot's session count is projection evidence, not a fresh raw-ledger
+count. `tokenSessionsToday` counts projected token-bearing sessions whose latest
+event falls inside the current **UTC day**; a token event may belong to an earlier
+day of that session. The label says "projected token-bearing sessions ending
+today (UTC)" accordingly. `sessionCountProjection` publishes the UTC date, the
+latest token-bearing session timestamp, the source's latest token-event timestamp,
+their lag, and the underlying projected counts. A recent non-token session cannot
+advance this token-session watermark.
+
+When today's token evidence is more than the existing **10-minute capture-lag
+budget** ahead of that watermark, or the watermark has not reached today's UTC
+day, `tokenSessionsToday` and `ledgerSessionsToday` are **null**, not zero, and the
+label reports the gap as amber. Missing or inconsistent timestamps also withhold
+the count. The raw projected counts remain explicitly scoped in
+`sessionCountProjection`; even a `projected` state is not proof of complete
+session linkage. An absent session can reflect projection lag **or unlinked
+events**, and this diagnostic does not guess which. This read uses only the same
+materialized session range and source-lifetime tables, never a new ledger scan.
+A real local-activity capture gap stays red and future-event checks stay intact.
+The standalone ledger-side health query retains its existing meaning.
+
 The local activity scan is **bounded**: one cadence enumerates at most 256
 directory entries within 50 ms, keeps its cursor, and resumes on the next tick.
 On a host with many capture roots one sweep therefore spans many cadences, and
@@ -242,8 +265,8 @@ a converging scan, not a capture fault, so it is reported as a `diagnostics`
 entry and in `activityState.scan` — naming the roots enumerated, the entries
 visited this sweep and this tick, the per-tick budget and the candidates still
 pending — and it only becomes the source's `reason` when capture truth cannot
-answer. A host whose events are flowing reads green with the sweep reported
-alongside it (bead eco-6hoxj.73).
+answer. A host whose events are flowing and whose session-count projection is
+not lagging reads green with the sweep reported alongside it (bead eco-6hoxj.73).
 
 `activityState.scan` is an operator field set, published for reading rather than
 consumed by the label:

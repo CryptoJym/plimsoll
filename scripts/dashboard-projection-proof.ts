@@ -1723,6 +1723,101 @@ async function main() {
       { status: skewedDeadClaude.status, reason: skewedDeadClaude.reason,
         lastEventAgeMs: skewedDeadClaude.lastEventAgeMs });
 
+    // .80: session windows can trail the source lifetime clock by days. The
+    // status reader must expose that gap rather than convert SUM(NULL) to a
+    // confident zero. Only projection rows are changed in these fixtures.
+    type CountHealth = { source: string; status: string; reason: string;
+      tokenSessionsToday: number | null; ledgerSessionsToday: number | null;
+      sessionCountProjection: { state: string; latestTokenSessionAt: string | null;
+        lagMs: number | null; utcDate: string; projectedTokenSessionsToday: number } };
+    const countFixture = captureHealthFixture("session-count-watermark", 5 * 60_000).fixture;
+    const countRows = () => (readySnapshot(countFixture, 30).status.health as {
+      sources: CountHealth[] }).sources;
+    const setProjectedEnd = (at: string) => countFixture.database.prepare(
+      `update dashboard_session_source_window set started_at=?,ended_at=? where days=7`,
+    ).run(at, at);
+    const oldEnd = new Date(NOW.getTime() - 4 * DAY_MS).toISOString();
+    setProjectedEnd(oldEnd);
+    const oldRows = countRows();
+    check("old_session_projection_cannot_claim_zero_tokens_for_live_sources",
+      oldRows.every(row => row.status === "amber" && row.tokenSessionsToday === null &&
+        row.ledgerSessionsToday === null && row.sessionCountProjection?.state === "lagging" &&
+        row.sessionCountProjection.latestTokenSessionAt === oldEnd &&
+        Number(row.sessionCountProjection.lagMs) > 3 * DAY_MS &&
+        row.reason.includes("count unavailable") && !row.reason.includes("0 session")),
+      { rows: oldRows });
+    const eventAt = new Date(NOW.getTime() - 5 * 60_000).toISOString();
+    setProjectedEnd(eventAt);
+    const caughtUpRows = countRows();
+    check("caught_up_session_projection_restores_scoped_numeric_counts",
+      caughtUpRows.every(row => row.status === "green" &&
+        row.tokenSessionsToday === (row.source === "grok" ? 1 : 2) &&
+        row.sessionCountProjection?.state === "projected" && row.sessionCountProjection.lagMs === 0 &&
+        row.reason.includes("projected token-bearing session(s) ending today (UTC)")),
+      { rows: caughtUpRows });
+    setProjectedEnd(new Date(Date.parse(eventAt) - 10 * 60_000 - 1).toISOString());
+    check("positive_session_counts_are_withheld_beyond_projection_lag_budget",
+      countRows().every(row => row.tokenSessionsToday === null &&
+        row.sessionCountProjection?.projectedTokenSessionsToday === (row.source === "grok" ? 1 : 2) &&
+        row.sessionCountProjection.lagMs === 10 * 60_000 + 1), {});
+    setProjectedEnd(new Date(Date.parse(eventAt) - 10 * 60_000).toISOString());
+    check("session_count_projection_lag_boundary_is_inclusive",
+      countRows().every(row => row.tokenSessionsToday === (row.source === "grok" ? 1 : 2) &&
+        row.sessionCountProjection?.state === "projected"), {});
+    // A recent non-token session must not hide an older token-bearing window.
+    countFixture.database.prepare(`update dashboard_session_source_window set
+      ended_at=?,token_events=case when session_hash=(select min(session_hash)
+        from dashboard_session_source_window where days=7 and source='codex') then 0 else token_events end
+      where days=7 and source='codex'`).run(eventAt);
+    countFixture.database.prepare(`update dashboard_session_source_window set ended_at=?
+      where days=7 and source='codex' and token_events>0`).run(oldEnd);
+    check("fresh_non_token_session_cannot_mask_stale_token_session_counts",
+      countRows().find(row => row.source === "codex")?.tokenSessionsToday === null, {});
+    setProjectedEnd(new Date(NOW.getTime() + DAY_MS).toISOString());
+    check("future_session_projection_is_not_count_freshness_evidence",
+      countRows().every(row => row.tokenSessionsToday === null &&
+        row.sessionCountProjection?.state === "unavailable"), {});
+    // Midnight switches the count's UTC scope even inside the normal lag budget.
+    const savedNow = Date.now;
+    const midnight = new Date("2026-07-16T00:02:00.000Z");
+    Date.now = () => midnight.getTime();
+    try {
+      countFixture.database.prepare(`update dashboard_source_lifetime set
+        last_event_at='2026-07-16T00:01:00.000Z',last_token_event_at='2026-07-16T00:01:00.000Z'`).run();
+      setProjectedEnd("2026-07-15T23:59:00.000Z");
+      const midnightRows=countRows();
+      check("utc_rollover_does_not_reuse_yesterdays_count_as_todays_zero",
+        midnightRows.every(row => row.tokenSessionsToday === null &&
+          row.sessionCountProjection?.utcDate === "2026-07-16" &&
+          row.sessionCountProjection.state === "lagging" && row.sessionCountProjection.lagMs === 120_000),
+        { rows: midnightRows });
+    } finally { Date.now = savedNow; }
+    const noTokenCount=new LocalEventBuffer(path.join(root,"capture-health-no-token-count.sqlite"));
+    noTokenCount.append(event({source:"codex",sessionId:uuid(930_001),eventType:"tool_use",observedAt:eventAt}));
+    settle(noTokenCount,NOW,30);
+    const noTokenRow=(readySnapshot(noTokenCount,30).status.health as {sources:CountHealth[]})
+      .sources.find(row=>row.source==="codex")!;
+    check("observed_zero_token_projection_is_distinct_from_unknown_count",
+      noTokenRow.status==="green"&&noTokenRow.tokenSessionsToday===0&&
+        noTokenRow.sessionCountProjection?.state==="projected"&&
+        noTokenRow.reason.includes("0 projected token-bearing session(s)"),{row:noTokenRow});
+    noTokenCount.close();
+    const unlinkedCount=new LocalEventBuffer(path.join(root,"capture-health-unlinked-token-count.sqlite"));
+    unlinkedCount.append(event({source:"grok",observedAt:eventAt,inputTokens:10,outputTokens:1}));
+    settle(unlinkedCount,NOW,30);
+    const unlinkedRow=(readySnapshot(unlinkedCount,30).status.health as {sources:CountHealth[]})
+      .sources.find(row=>row.source==="grok")!;
+    check("unlinked_token_activity_does_not_fabricate_a_session_or_assert_no_activity",
+      unlinkedRow.status==="amber"&&unlinkedRow.tokenSessionsToday===null&&
+        unlinkedRow.sessionCountProjection?.latestTokenSessionAt===null&&
+        unlinkedRow.reason.includes("projection lag or unlinked events"),{row:unlinkedRow});
+    unlinkedCount.close();
+    const countWork=countFixture.projection.status().counters;
+    check("count_freshness_uses_projection_tables_not_raw_ledger_or_filesystem_scans",
+      countWork.rawRowsScannedByDashboard === 0 && countWork.filesystemEntriesScannedByDashboard === 0,
+      { rawRows: countWork.rawRowsScannedByDashboard, fsEntries: countWork.filesystemEntriesScannedByDashboard });
+    countFixture.close();
+
     // Standing rule for this file pair: every tailer fix ships its twin check
     // on the other tailer (r1/r2/r3 lesson of eco-6hoxj.73).
     // Bead eco-6hoxj.73 r2, finding 2: drive a real tailer through the baseline
