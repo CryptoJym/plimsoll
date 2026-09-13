@@ -1761,7 +1761,7 @@ export class DeliveryOutbox {
     return run();
   }
 
-  retry(leaseId: string, items: LeasedDeliveryItem[], failure: DeliveryFailureClass, at = new Date()) {
+  retry(leaseId: string, items: LeasedDeliveryItem[], failure: DeliveryFailureClass, at = new Date(), notBefore?: Date) {
     const update = this.db.prepare(
       `update upload_outbox set state = 'retry', next_attempt_at = @nextAttemptAt,
          lease_id = null, lease_expires_at = null, last_failure_class = @failure,
@@ -1775,7 +1775,9 @@ export class DeliveryOutbox {
           deliveryId: item.deliveryId,
           leaseId,
           failure,
-          nextAttemptAt: this.nextAttemptAt(item.deliveryId, item.attemptCount, at),
+          nextAttemptAt: notBefore && Number.isFinite(notBefore.getTime())
+            ? new Date(Math.max(Date.parse(this.nextAttemptAt(item.deliveryId, item.attemptCount, at)), notBefore.getTime())).toISOString()
+            : this.nextAttemptAt(item.deliveryId, item.attemptCount, at),
           now: at.toISOString(),
         }).changes;
       }

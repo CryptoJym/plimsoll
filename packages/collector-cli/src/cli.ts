@@ -72,6 +72,7 @@ import {
 } from "./config";
 import { appendForwardedHook } from "./forwarder";
 import { forwardHookOverLoopback } from "./local-hook-client";
+import { SyncBackoff } from "./sync-backoff";
 import {
   DEFAULT_PRODUCER_ROTATION_GRACE_MS,
   MAX_PRODUCER_ROTATION_GRACE_MS,
@@ -2380,8 +2381,10 @@ async function main() {
     // Bead eco-6hoxj.61. Created before the listener so /status can read its
     // cached snapshot, armed with the other cadences below.
     let hookSpoolDrain: HookSpoolDrain | undefined;
+    const syncBackoff = new SyncBackoff(config.syncIntervalSeconds * 1_000);
     const server = createCollectorServer(config, buffer, {
       hookSpoolStatus: () => hookSpoolDrain?.status() ?? null,
+      syncStatus: () => syncBackoff.status(syncInFlight),
       runtimeIdentity,
       homeIdentityHash: collectorHomeIdentityHash(collectorHome()),
       // Issue 0056 (#104): the daemon provisions (first start) or loads the
@@ -2410,10 +2413,8 @@ async function main() {
     const timers: NodeJS.Timeout[] = [];
     /** The managed-config reconcile cadence reschedules itself, so it owns one live handle. */
     let managedConfigReconcileTimer: NodeJS.Timeout | undefined;
-    let syncFailureStreak = 0;
     let syncInFlight = false;
 
-    let syncSkipUntil = 0;
     // Sessions whose snapshot push failed (or was interrupted) carry over to
     // the next cycle in memory. A daemon restart drops the set — the
     // `upload-history --sessions` backfill is the stateless recovery tool,
@@ -2422,7 +2423,7 @@ async function main() {
 
     const runSync = async () => {
       if (!config.uploadUrl || syncInFlight || shuttingDown) return;
-      if (Date.now() < syncSkipUntil) return;
+      if (!syncBackoff.ready()) return;
       syncInFlight = true;
       const storageRetry = new SyncStorageRetryController();
       const uploadedBatches: Array<Awaited<ReturnType<typeof uploadBufferedEvents>>["batch"]> = [];
@@ -2431,9 +2432,10 @@ async function main() {
           ...new Set([...pendingSessionIds, ...sessionIdsFromBatches(uploadedBatches)]),
         ];
       };
+      let uploaded = 0;
+      let serverRetryAfterMs = 0;
       try {
         let batches = 0;
-        let uploaded = 0;
         while (batches < config.delivery.maxBatchesPerCycle) {
           const result = await uploadBufferedEvents(config, buffer, {
             includeLegacyRemainingUnuploaded: false,
@@ -2443,7 +2445,9 @@ async function main() {
           uploadedBatches.push(result.batch);
           uploaded += result.uploadedEvents;
           batches += 1;
-          if (result.remainingDelivery === 0) break;
+          // A partial batch can both acknowledge siblings and ask us to wait.
+          serverRetryAfterMs = "retryAfterMs" in result.delivery ? Number(result.delivery.retryAfterMs) : 0;
+          if (serverRetryAfterMs > 0 || result.remainingDelivery === 0) break;
         }
         if (uploaded > 0) {
           console.log(
@@ -2455,8 +2459,7 @@ async function main() {
             }),
           );
         }
-        syncFailureStreak = 0;
-        syncSkipUntil = 0;
+        syncBackoff.success(uploaded, serverRetryAfterMs);
 
         // Session sync (issue 0037): the sessions whose events just crossed
         // get their snapshots refreshed — recomputed over the FULL ledger,
@@ -2507,29 +2510,23 @@ async function main() {
         }
       } catch (error) {
         carrySessions();
+        const scheduling = syncBackoff.failure(error, uploaded);
         if (error instanceof SyncStorageBusyError) {
-          syncSkipUntil = 0;
           console.warn(
             JSON.stringify({
               warning: "sync_storage_busy",
+              ...scheduling,
               waitMs: error.waitMs,
               retries: error.retries,
             }),
           );
           return;
         }
-        syncFailureStreak += 1;
-        const backoffMs = Math.min(
-          config.syncIntervalSeconds * 1000 * 2 ** Math.min(syncFailureStreak, 4),
-          60 * 60 * 1000,
-        );
-        syncSkipUntil = Date.now() + backoffMs;
+
         console.warn(
           JSON.stringify({
             warning: "sync_failed",
-            failureStreak: syncFailureStreak,
-            backoffMs,
-            message: error instanceof Error ? error.message : String(error),
+            ...scheduling,
           }),
         );
       } finally {
@@ -2702,7 +2699,8 @@ async function main() {
     maintenanceCadence.start();
     enrichmentCadence.start();
     if (config.uploadUrl) {
-      timers.push(setInterval(() => void runSync(), config.syncIntervalSeconds * 1000));
+      syncBackoff.arm();
+      timers.push(setInterval(() => { syncBackoff.tick(); void runSync(); }, config.syncIntervalSeconds * 1000));
     }
     // Self-healing managed-config reconcile (bead eco-6hoxj.50). The fleet's
     // seat and conductor tooling rewrites ~/.claude-seats/<slug>/settings.json

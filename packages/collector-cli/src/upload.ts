@@ -15,6 +15,7 @@ import {
 import { sealOutboundEnvelope } from "./outbound-envelope";
 import { TransportError, validatedTransportUrl } from "./http-transport";
 import { postDelivery } from "./delivery-post";
+import { retryAfterMilliseconds } from "./retry-after";
 import { deliveryExpectation } from "./delivery-ack";
 import { PLIMSOLL_VERSION } from "./version";
 import type { SyncStorageRetryController } from "./sqlite-contention";
@@ -76,6 +77,8 @@ export class DeliveryUploadError extends Error {
   constructor(
     readonly failureClass: Exclude<DeliveryFailureClass, "none">,
     readonly httpStatusClass: string,
+    readonly retryAfterMs: number = 0,
+    readonly networkCode: string | null = null,
   ) {
     super(`Upload deferred: ${failureClass} (${httpStatusClass})`);
     this.name = "DeliveryUploadError";
@@ -97,6 +100,8 @@ type ProbeResult = {
   requestBytes: number;
   acceptedItems: LeasedDeliveryItem[];
   rejectedItems: LeasedDeliveryItem[];
+  retryAfterMs?: number;
+  networkCode?: string | null;
 };
 
 const CLOUD_DEVICE_ID_RECONCILE_DEFERRED_INTERVAL_MS = 5 * 60 * 1_000;
@@ -197,7 +202,8 @@ async function postItems(input: {
     const localBudget = error instanceof TransportError && error.code === "request_too_large";
     return { ok: false, status: transient ? 0 : -1,
       statusClass: localBudget ? "local_request_budget" : transient ? "network" : "remote_contract",
-      summary: {}, requestBytes: bytes, acceptedItems: [], rejectedItems: [] };
+      summary: {}, requestBytes: bytes, acceptedItems: [], rejectedItems: [],
+      networkCode: error instanceof TransportError ? error.networkCode ?? error.code : null };
   }
   const responseDeviceId = response.ok && response.body && typeof response.body === "object" &&
     !Array.isArray(response.body)
@@ -219,6 +225,8 @@ async function postItems(input: {
   const expectation = deliveryExpectation(body, input.config.installKey);
   return {
     ok: response.ok, status: response.status, statusClass: statusClass(response.status),
+    retryAfterMs: [408, 429].includes(response.status) || response.status >= 500
+      ? retryAfterMilliseconds(response.headers.get("retry-after"), input.now().getTime()) : 0,
     summary: response.ok ? safeResponseSummary(response.body) : {}, requestBytes: bytes,
     acceptedItems: response.ok
       ? input.items.filter((_item, index) => acceptedIds.has(expectation.itemIds[index]!))
@@ -739,8 +747,10 @@ export async function uploadBufferedEvents(
   }
 
   if (failure && unresolved.size > 0) {
+    const retryAt = nowFn();
+    const retryNotBefore = fatal?.retryAfterMs ? new Date(retryAt.getTime() + fatal.retryAfterMs) : undefined;
     await storage(() =>
-      buffer.delivery.retry(lease.leaseId, [...unresolved.values()], failure, nowFn()));
+      buffer.delivery.retry(lease.leaseId, [...unresolved.values()], failure, retryAt, retryNotBefore));
     if (failure === "remote_auth") {
       await storage(() => buffer.delivery.openCircuit("auth_blocked", nowFn()));
     }
@@ -798,12 +808,15 @@ export async function uploadBufferedEvents(
       deadLetters,
       circuit: deliveryStatus.circuit.kind,
       rootLeaseEvents: lease.items.length,
+      retryAfterMs: fatal?.retryAfterMs ?? 0,
     },
   };
   if (effectiveFailure && (failure || requestBudgetItems.size > 0) && succeeded.size === 0) {
     throw new DeliveryUploadError(
       effectiveFailure,
       fatal?.statusClass ?? effectiveFailure,
+      fatal?.retryAfterMs ?? 0,
+      fatal?.networkCode ?? null,
     );
   }
   return result;

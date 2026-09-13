@@ -74,6 +74,7 @@
     "proof:outbox": "tsx scripts/outbox-proof.ts",
     "proof:upload-replay": "tsx scripts/upload-replay-proof.ts",
     "proof:sync-storage-retry": "tsx scripts/sync-storage-retry-proof.ts",
+    "proof:sync-backoff": "tsx scripts/sync-backoff-proof.ts",
     "proof:upload-timer-bounds": "tsx scripts/upload-timer-bounds-proof.ts",
     "proof:codex-config-apply": "tsx scripts/codex-config-apply-proof.ts",
     "proof:codex-producer-token": "tsx scripts/codex-producer-token-proof.ts",
