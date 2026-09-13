@@ -1062,11 +1062,17 @@ function activeTimerCount() {
 // file that will not parse and a function that cannot be found are both red
 // audits; neither can produce a green one.
 //
-// What it cannot see: a guard reached through a helper called from the catch, a
-// ProofTimeoutError re-raised by a function declared elsewhere and invoked from
-// here, and any shape assembled at run time through eval or new Function. Those
-// are behavioural, not syntactic. This is a shape check on one function body and
-// claims nothing past it.
+// What it cannot see: a guard anywhere in this function that binds its error
+// from a callback parameter instead of a catch clause (.catch(rethrowIfTimeout),
+// .catch(error => ...)), a guard that tests ProofTimeoutError identity without
+// naming it (a prototype comparison, an aliased import), a ProofTimeoutError
+// re-raised by a function declared elsewhere and invoked from here, and any
+// shape assembled at run time through eval or new Function. No behavioural check
+// backs the audit up for those: the guard it exists to refuse is dead by
+// construction, so it changes nothing a behavioural check could observe. This is
+// a shape check on one function body and claims nothing past it. The loop form
+// is load-bearing too: the retry must stay a for statement with no condition;
+// a while (true) or do/while rewrite reds the audit with no defect present.
 const FETCH_TARGET_NAME = "fetchDebuggerPageTarget";
 const TIMEOUT_ERROR_NAME = "ProofTimeoutError";
 
