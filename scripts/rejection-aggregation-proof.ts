@@ -24,6 +24,7 @@ import { createCollectorServer } from "../packages/collector-cli/src/server";
 import type {
   CollectorServer,
   RejectionDiagnosticsCounters,
+  RejectionSummaryLine,
 } from "../packages/collector-cli/src/rejection-diagnostics";
 
 type Check = { name: string; passed: boolean; detail: unknown };
@@ -1031,6 +1032,238 @@ async function integrationChecks() {
   }
 }
 
+
+// ---------------------------------------------------------------------------
+// Route classification of a measured window (bead eco-6hoxj.74.1, review F3)
+//
+// Its own home, ledger, port and fake clock so it cannot perturb the fixture
+// above. Everything runs through the real server code path: real loopback
+// HTTP, genuine SQLITE_BUSY contention from an exclusive writer, the real
+// emitter, and the real `plimsollHttpDiagnostics` surface. The hook route
+// answers 503 rather than spooling because this server's env sets the spool
+// kill switch, which is the shipped configuration in which an operator sees
+// busy 503s on a hook route at all.
+// ---------------------------------------------------------------------------
+
+const ROUTE_T0 = T0 + 900 * INTERVAL_MS;
+
+async function routeClassificationChecks() {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-rejection-route-"));
+  const ledgerPath = path.join(tempDir, "route-ledger.sqlite");
+  process.env.PLIMSOLL_HOME = tempDir;
+  const buffer = new LocalEventBuffer(ledgerPath);
+  const routeClock = { value: ROUTE_T0 };
+  const server = createCollectorServer(collectorConfigSchema.parse({}), buffer, {
+    diagnosticsNowMs: () => routeClock.value,
+    env: { ...process.env, PLIMSOLL_HOME: tempDir, PLIMSOLL_HOOK_SPOOL: "off" },
+  } as Parameters<typeof createCollectorServer>[2]);
+
+  const warnings: string[] = [];
+  const originalWarn = console.warn;
+  console.warn = (...values: unknown[]) => warnings.push(values.map(String).join(" "));
+
+  const parsedWarnings = () =>
+    warnings.map((line) => {
+      try {
+        return JSON.parse(line) as Record<string, unknown>;
+      } catch {
+        return { error: "unparseable", line } as Record<string, unknown>;
+      }
+    });
+  const firstLines = () =>
+    parsedWarnings().filter((entry) => entry.error === "collector_request_rejected");
+  const summaryLines = () =>
+    parsedWarnings().filter((entry) => entry.error === "collector_request_rejected_summary");
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      server.once("error", reject);
+      server.listen(0, "127.0.0.1", resolve);
+    });
+    const port = (server.address() as AddressInfo).port;
+
+    // Genuine contention: an exclusive writer holds the ledger for the phase,
+    // and the collector's busy handler waits the 1 ms floor per contended
+    // write so the phase stays fast.
+    const priorBusyTimeout = Number(
+      buffer.database.pragma("busy_timeout", { simple: true }) as number,
+    );
+    buffer.database.pragma("busy_timeout = 1");
+    const blocker = new Database(ledgerPath);
+    blocker.exec("BEGIN EXCLUSIVE");
+
+    const agent = makeAgent(4);
+    const busyPost = (route: string) =>
+      oneRequest(agent, port, {
+        route,
+        body: "{}",
+        headers: { "x-plimsoll-source": "claude_code" },
+      });
+
+    // One 60 s window, one source, three busy 503s across two routes: the
+    // exact shape the reviewer measured (F3) — hooks x2 then OTLP x1.
+    const windowResults = [
+      await busyPost("/hooks/claude-code"),
+      await busyPost("/hooks/claude-code"),
+      await busyPost("/v1/logs"),
+    ];
+    const allBusy = windowResults.every((result) =>
+      isLiteralRejection(result, "storage_busy_retry", 503),
+    );
+    const windowFirsts = firstLines();
+
+    // The observation past the boundary closes the window: its summary is
+    // printed by the real emitter, ahead of the new window's first line.
+    routeClock.value = ROUTE_T0 + INTERVAL_MS;
+    const nextWindowResult = await busyPost("/v1/logs");
+    const closed = summaryLines()[0] as unknown as RejectionSummaryLine | undefined;
+    const closedRoutes = (closed?.routes ?? {}) as Record<string, number>;
+    const routeSum = Object.values(closedRoutes).reduce((sum, value) => sum + value, 0);
+
+    check(
+      "busy_window_classifies_every_503_by_route_with_exact_per_route_counts",
+      allBusy &&
+        isLiteralRejection(nextWindowResult, "storage_busy_retry", 503) &&
+        closed !== undefined &&
+        closed.error === "collector_request_rejected_summary" &&
+        closed.reason === "storage_busy_retry" &&
+        closed.clientClass === "claude_code" &&
+        closed.count === 3 &&
+        closed.suppressed === 2 &&
+        closedRoutes["/hooks/claude-code"] === 2 &&
+        closedRoutes.otlp === 1 &&
+        Object.keys(closedRoutes).length === 2 &&
+        routeSum === closed.count,
+      { closed, routeSum, statuses: windowResults.map((result) => result.status) },
+    );
+
+    // The defect itself: one first line for the window, naming one route. The
+    // summary above is what classifies the other two 503s.
+    check(
+      "busy_window_prints_one_first_line_naming_one_route_and_the_summary_covers_the_rest",
+      windowFirsts.length === 1 &&
+        windowFirsts[0]?.route === "/hooks/claude-code" &&
+        windowFirsts[0]?.reason === "storage_busy_retry" &&
+        closed?.count === 3 &&
+        (closed?.routes?.otlp ?? 0) === 1,
+      { firstLines: windowFirsts, summaryRoutes: closed?.routes ?? null },
+    );
+
+    // The OTLP busy 503 is classified like the others rather than vanishing:
+    // its own single-route window keeps the pre-change key order exactly and
+    // appends `routes`.
+    routeClock.value = ROUTE_T0 + 2 * INTERVAL_MS;
+    const singleRoute = server.plimsollHttpDiagnostics.flush()[0];
+    const { routes: singleRouteBreakdown, ...singleRouteWithoutRoutes } = singleRoute ?? ({} as RejectionSummaryLine);
+    const preChangeLine = JSON.stringify(singleRouteWithoutRoutes);
+    const emittedLine = JSON.stringify(singleRoute);
+    check(
+      "single_route_busy_window_keeps_the_pre_change_line_and_appends_only_its_route_split",
+      singleRoute !== undefined &&
+        singleRoute.reason === "storage_busy_retry" &&
+        singleRoute.clientClass === "claude_code" &&
+        singleRoute.count === 1 &&
+        singleRoute.suppressed === 0 &&
+        JSON.stringify(singleRouteBreakdown) === JSON.stringify({ otlp: 1 }) &&
+        emittedLine === `${preChangeLine.slice(0, -1)},"routes":{"otlp":1}}` &&
+        JSON.stringify(Object.keys(singleRouteWithoutRoutes)) ===
+          JSON.stringify([
+            "error",
+            "reason",
+            "clientClass",
+            "count",
+            "suppressed",
+            "intervalMs",
+            "action",
+          ]),
+      { emittedLine, preChangeLine },
+    );
+
+    blocker.exec("ROLLBACK");
+    blocker.close();
+    buffer.database.pragma(`busy_timeout = ${priorBusyTimeout}`);
+    agent.destroy();
+
+    // Bounds and vocabulary, off the live server: a route is only ever one of
+    // the closed five, only the route-classified reasons carry a breakdown,
+    // and a saturated full-vocabulary breakdown still fits the fixed ceiling.
+    const mod = rejectionDiagnostics;
+    if (!mod) {
+      check("route_breakdown_is_bounded_by_the_closed_vocabulary_and_the_line_ceiling", false,
+        "rejection_diagnostics_module_missing");
+    } else {
+      let routeNow = ROUTE_T0;
+      // Read defensively so an aggregation that never exported the vocabulary
+      // FAILS this check instead of throwing and taking the run with it (the
+      // negative control runs exactly that aggregation).
+      const vocabulary = Array.isArray(mod.REJECTION_ROUTES) ? mod.REJECTION_ROUTES : [];
+      const vocabAgg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
+      for (const route of vocabulary) {
+        vocabAgg.observeRejection("storage_busy_retry", "claude_code", undefined, route);
+      }
+      const vocabSummary = vocabAgg.flush()[0];
+      const saturatedBreakdown = Object.fromEntries(
+        vocabulary.map((route) => [route, Number.MAX_SAFE_INTEGER]),
+      );
+      const worstRouteLine = {
+        ...vocabSummary,
+        reason: "otlp_attribute_limit_exceeded",
+        action: "reduce_envelope_cardinality",
+        count: Number.MAX_SAFE_INTEGER,
+        suppressed: Number.MAX_SAFE_INTEGER,
+        routes: saturatedBreakdown,
+      };
+      // A reason outside ROUTE_CLASSIFIED_REASONS never carries a breakdown,
+      // so the record-array maps and the route map are never on one line.
+      const nonBusyAgg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
+      nonBusyAgg.observeRejection("otlp_record_limit_exceeded", "otlp_exporter", {
+        recordCount: 100_000,
+        recordArrays: { logRecords: 100_000 },
+        decodedBytes: 2_097_152,
+      }, "otlp");
+      const nonBusySummary = nonBusyAgg.flush()[0];
+      check(
+        "route_breakdown_is_bounded_by_the_closed_vocabulary_and_the_line_ceiling",
+        JSON.stringify(vocabulary) ===
+          JSON.stringify(["/hooks/claude-code", "/hooks/codex", "/hooks/grok", "otlp", "other"]) &&
+          JSON.stringify(vocabSummary?.routes) ===
+            JSON.stringify(Object.fromEntries(vocabulary.map((route) => [route, 1]))) &&
+          JSON.stringify(mod.ROUTE_CLASSIFIED_REASONS) === JSON.stringify(["storage_busy_retry"]) &&
+          nonBusySummary?.routes === undefined &&
+          Buffer.byteLength(JSON.stringify(worstRouteLine)) <=
+            mod.REJECTION_SUMMARY_LINE_MAX_BYTES,
+        {
+          routes: vocabulary,
+          worstRouteLineBytes: Buffer.byteLength(JSON.stringify(worstRouteLine)),
+          ceiling: mod.REJECTION_SUMMARY_LINE_MAX_BYTES,
+        },
+      );
+    }
+
+    // Every line this phase printed stays inside the emitted-line ceiling the
+    // storm phase asserts, and carries no request content.
+    check(
+      "route_classified_lines_stay_inside_the_emitted_line_ceiling_and_value_free",
+      warnings.length > 0 &&
+        warnings.every((line) => Buffer.byteLength(line) <= 256) &&
+        SENTINELS_ABSENT(warnings.join("\n")) &&
+        summaryLines().length >= 1,
+      {
+        lines: warnings.length,
+        maxLineBytes: Math.max(...warnings.map((line) => Buffer.byteLength(line))),
+        sample: warnings.find((line) => line.includes("\"routes\"")) ?? null,
+      },
+    );
+  } finally {
+    console.warn = originalWarn;
+    if (server.listening) {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    buffer.close();
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
 function SENTINELS_ABSENT(text: string) {
   return ![SENTINEL_SOURCE, SENTINEL_BODY, SENTINEL_ORIGIN].some((sentinel) =>
     text.includes(sentinel),
@@ -1039,6 +1272,7 @@ function SENTINELS_ABSENT(text: string) {
 
 async function main() {
   await integrationChecks();
+  await routeClassificationChecks();
 
   for (const result of checks) {
     console.log(`${result.passed ? "PASS" : "FAIL"} ${result.name} ${JSON.stringify(result.detail)}`);

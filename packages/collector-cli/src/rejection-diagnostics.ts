@@ -6,10 +6,11 @@ import type {
   LocalProducerSource,
   OtlpRecordArrayKey,
   OtlpRecordRejectionDiagnostic,
+  RejectionRoute,
 } from "./http-boundary";
 
 export { HTTP_BOUNDARY_REASONS } from "./http-boundary";
-export type { HttpBoundaryReason } from "./http-boundary";
+export type { HttpBoundaryReason, RejectionRoute } from "./http-boundary";
 
 /**
  * Fixed suppression window for repeated identical admission rejections. The
@@ -93,6 +94,35 @@ export const HTTP_REJECTION_NEXT_ACTIONS: Record<HttpBoundaryReason, string> = {
   unsupported_content_encoding: "use_supported_content_encoding",
 };
 
+/**
+ * Emission order for the closed route vocabulary, so a window's breakdown
+ * serializes the same way whatever order the routes arrived in. Keyed by the
+ * route union: adding a route to `RejectionRoute` without ordering it here
+ * fails typecheck, the same way `HTTP_REJECTION_NEXT_ACTIONS` bounds reasons.
+ */
+const REJECTION_ROUTE_ORDER: Record<RejectionRoute, number> = {
+  "/hooks/claude-code": 0,
+  "/hooks/codex": 1,
+  "/hooks/grok": 2,
+  otlp: 3,
+  other: 4,
+};
+
+export const REJECTION_ROUTES = (Object.keys(REJECTION_ROUTE_ORDER) as RejectionRoute[]).sort(
+  (left, right) => REJECTION_ROUTE_ORDER[left] - REJECTION_ROUTE_ORDER[right],
+);
+
+/**
+ * The reasons whose window carries a per-route breakdown. Only the busy class
+ * does, matching the emitter rule that the busy class, and only it, carries
+ * route diagnostics (`server.ts`): a busy 503 can arrive on a hook route the
+ * intake spool covers or on OTLP, which it does not, and `clientClass` alone
+ * cannot tell those apart for one producer. Bounding the breakdown to this one
+ * reason also keeps the record-array maps and the route map off the same line,
+ * so every summary stays inside `REJECTION_SUMMARY_LINE_MAX_BYTES`.
+ */
+export const ROUTE_CLASSIFIED_REASONS: readonly HttpBoundaryReason[] = ["storage_busy_retry"];
+
 export type RejectionSummaryLine = {
   error: "collector_request_rejected_summary";
   reason: HttpBoundaryReason;
@@ -109,6 +139,13 @@ export type RejectionSummaryLine = {
   recordArraysMax?: Partial<Record<OtlpRecordArrayKey, number>>;
   decodedBytesLast?: number;
   decodedBytesMax?: number;
+  /**
+   * Per-route split of `count`, emitted last so the rest of the line is the
+   * byte-identical pre-0.7.27 line. Present only when the window holds a
+   * route-classified rejection; its values sum to `count`, which keeps its
+   * meaning as the window total for the `(reason, clientClass)` key.
+   */
+  routes?: Partial<Record<RejectionRoute, number>>;
 };
 
 export type RejectionObservation = {
@@ -155,6 +192,7 @@ type WindowState = {
   count: number;
   suppressed: number;
   recordStats?: RecordWindowStats;
+  routes?: Partial<Record<RejectionRoute, number>>;
 };
 
 type ReasonState = {
@@ -214,6 +252,30 @@ function updateRecordStats(
       decodedBytes: Math.max(stats.max.decodedBytes, diagnostic.decodedBytes),
     },
   };
+}
+
+/**
+ * Count one rejection against its route. Each route counter saturates with the
+ * same bound as the window count, so the values keep summing to `count`.
+ */
+function updateRoutes(
+  routes: Partial<Record<RejectionRoute, number>> | undefined,
+  route: RejectionRoute | undefined,
+) {
+  if (!route) return routes;
+  const next: Partial<Record<RejectionRoute, number>> = { ...(routes ?? {}) };
+  next[route] = nextCount(next[route] ?? 0);
+  return next;
+}
+
+/** Serialize a window's routes in the closed vocabulary's fixed order. */
+function orderRoutes(routes: Partial<Record<RejectionRoute, number>>) {
+  const ordered: Partial<Record<RejectionRoute, number>> = {};
+  for (const route of REJECTION_ROUTES) {
+    const count = routes[route];
+    if (typeof count === "number" && count > 0) ordered[route] = count;
+  }
+  return ordered;
 }
 
 export function createRejectionDiagnostics(options: {
@@ -285,6 +347,9 @@ export function createRejectionDiagnostics(options: {
             decodedBytesMax: window.recordStats.max.decodedBytes,
           }
         : {}),
+      // Last, so a line that carries a breakdown is the byte-identical
+      // pre-0.7.27 line with `,"routes":{…}` appended before the brace.
+      ...(window.routes ? { routes: orderRoutes(window.routes) } : {}),
     };
   };
 
@@ -293,8 +358,10 @@ export function createRejectionDiagnostics(options: {
       reason: HttpBoundaryReason,
       clientClass: RejectionClientClass = "unknown",
       recordDiagnostic?: OtlpRecordRejectionDiagnostic,
+      route?: RejectionRoute,
     ): RejectionObservation {
       const now = nowMs();
+      const classifiedRoute = ROUTE_CLASSIFIED_REASONS.includes(reason) ? route : undefined;
       const summaries: RejectionSummaryLine[] = [];
       for (const state of states.values()) {
         if (
@@ -317,6 +384,7 @@ export function createRejectionDiagnostics(options: {
           count: 1,
           suppressed: 0,
           recordStats: updateRecordStats(undefined, recordDiagnostic),
+          routes: updateRoutes(undefined, classifiedRoute),
         };
         state.rejected = nextCount(state.rejected);
         state.emittedFirst = nextCount(state.emittedFirst);
@@ -326,6 +394,7 @@ export function createRejectionDiagnostics(options: {
       state.window.count = nextCount(state.window.count);
       state.window.suppressed = nextCount(state.window.suppressed);
       state.window.recordStats = updateRecordStats(state.window.recordStats, recordDiagnostic);
+      state.window.routes = updateRoutes(state.window.routes, classifiedRoute);
       state.rejected = nextCount(state.rejected);
       state.suppressed = nextCount(state.suppressed);
       return { first: false, summaries };

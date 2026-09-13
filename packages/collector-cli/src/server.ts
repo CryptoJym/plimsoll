@@ -1655,10 +1655,14 @@ export function createCollectorServer(
       // A busy rejection on a route the intake never spools (OTLP, live usage)
       // says so rather than leaving the fields out, so a measured window can
       // classify every 503 it holds.
-      const busyRouteDiagnostic =
+      const busyRoute =
         failure.reason === "storage_busy_retry" && failure.status === 503
+          ? classifyRejectionRoute(request.url)
+          : undefined;
+      const busyRouteDiagnostic =
+        busyRoute !== undefined
           ? {
-              route: classifyRejectionRoute(request.url),
+              route: busyRoute,
               spoolAttempted: false,
               spoolRefused: false,
               spoolRefusedReason: "route_not_spooled",
@@ -1673,11 +1677,16 @@ export function createCollectorServer(
       };
       // Aggregate identical rejections: emit the first occurrence of a
       // bounded reason promptly plus any window summaries it just closed.
+      // The window keeps its `(reason, clientClass)` key; the route rides
+      // along so the closing summary can split its count per route, which is
+      // what lets a measured window classify every busy 503 it holds — the
+      // first line alone names only the route that opened the window.
       // The HTTP response below stays byte-for-byte unchanged.
       const observed = rejectionDiagnostics.observeRejection(
         failure.reason,
         clientClass,
         recordDiagnostic,
+        busyRoute,
       );
       for (const line of observed.summaries) console.warn(JSON.stringify(line));
       if (observed.first) console.warn(JSON.stringify(diagnosticRejection));

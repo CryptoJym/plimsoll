@@ -177,6 +177,20 @@ really refused, the ones whose spool write failed. Set
 `PLIMSOLL_HOOK_SPOOL=off` in the collector's environment to restore the previous
 drop-and-log behaviour on both paths.
 
+Busy rejections are classified by route inside that same minute. The first
+`storage_busy_retry` rejection of a 60 s window prints
+`{"error":"collector_request_rejected","reason":"storage_busy_retry","clientClass":"claude_code","route":"/hooks/claude-code","spoolAttempted":…,"spoolRefused":…,"spoolRefusedReason":…}`
+— one line, naming the one route that opened the window — and the window's
+closing summary splits its total across every route it saw:
+`{"error":"collector_request_rejected_summary","reason":"storage_busy_retry","clientClass":"claude_code","count":3,"suppressed":2,"intervalMs":60000,"action":"retry_after_backoff","routes":{"/hooks/claude-code":2,"otlp":1}}`.
+`count` is still the window total for the `(reason, clientClass)` pair, the
+`routes` values sum to it, and `routes` is appended last, so every line the
+older collector printed is still there byte for byte in front of it. Route
+names come from a closed vocabulary — `/hooks/claude-code`, `/hooks/codex`,
+`/hooks/grok`, `otlp`, `other` — computed from the request path alone, so no
+query string, path segment or header value ever reaches the log. Only the busy
+class carries `route`/`routes`; every other rejection line is unchanged.
+
 Residual behaviour worth knowing:
 
 - A working directory reported **only** inside `args`/`arguments`/`tool_arguments`
