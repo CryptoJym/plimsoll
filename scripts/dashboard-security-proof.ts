@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import { getEventListeners } from "node:events";
 import fs from "node:fs";
 import http from "node:http";
 import os from "node:os";
@@ -27,6 +28,7 @@ const BROWSER_PROOF_WALL_MS = 30_000;
 const CDP_SOCKET_OPEN_MS = 2_000;
 const CDP_COMMAND_MS = 5_000;
 const DEBUGGER_TARGET_MS = 2_000;
+const DEBUGGER_TARGET_RETRY_MS = 100;
 const DASHBOARD_READY_MS = 8_000;
 const ABORT_SETTLE_MS = 500;
 
@@ -863,6 +865,21 @@ async function waitForFile(file: string, process: ChildProcess, signal: AbortSig
   throw new ProofTimeoutError("debugger_startup");
 }
 
+// Resolves on the step or as soon as the deadline/outer abort fires, so the
+// caller re-checks its own deadline instead of inheriting a delay error.
+function debuggerRetryStep(ms: number, signal: AbortSignal) {
+  return new Promise<void>((resolve) => {
+    const finish = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", finish);
+      resolve();
+    };
+    const timer = setTimeout(finish, ms);
+    signal.addEventListener("abort", finish, { once: true });
+    if (signal.aborted) finish();
+  });
+}
+
 async function fetchDebuggerTargets(url: string, signal: AbortSignal) {
   const controller = new AbortController();
   let timedOut = false;
@@ -873,17 +890,139 @@ async function fetchDebuggerTargets(url: string, signal: AbortSignal) {
     controller.abort();
   }, DEBUGGER_TARGET_MS);
   try {
-    const response = await fetch(url, { signal: controller.signal });
-    if (!response.ok) throw new Error("debugger_target_unavailable");
-    return await response.json() as Array<{ type: string; webSocketDebuggerUrl: string }>;
-  } catch (error) {
-    if (signal.aborted) throw new ProofTimeoutError("browser_proof_overall");
-    if (timedOut) throw new ProofTimeoutError("debugger_target");
-    throw error instanceof ProofTimeoutError ? error : new Error("debugger_target_unavailable");
+    // Chrome can publish DevToolsActivePort before its devtools listener
+    // accepts connections, so a refused or reset connection here is transient.
+    // Retry in small steps inside the same unchanged deadline; a genuinely
+    // unavailable endpoint still fails as debugger_target when it expires.
+    for (;;) {
+      try {
+        const response = await fetch(url, { signal: controller.signal });
+        if (response.ok) {
+          return await response.json() as Array<{ type: string; webSocketDebuggerUrl: string }>;
+        }
+        await response.body?.cancel().catch(() => undefined);
+      } catch (error) {
+        if (signal.aborted) throw new ProofTimeoutError("browser_proof_overall");
+        if (timedOut) throw new ProofTimeoutError("debugger_target");
+        if (error instanceof ProofTimeoutError) throw error;
+      }
+      await debuggerRetryStep(DEBUGGER_TARGET_RETRY_MS, controller.signal);
+      if (signal.aborted) throw new ProofTimeoutError("browser_proof_overall");
+      if (timedOut) throw new ProofTimeoutError("debugger_target");
+    }
   } finally {
     clearTimeout(timer);
     signal.removeEventListener("abort", onAbort);
   }
+}
+
+function activeTimerCount() {
+  return process.getActiveResourcesInfo().filter((resource) => resource === "Timeout").length;
+}
+
+// A port that was bound and released, so every connection to it is refused.
+async function reserveRefusingPort() {
+  const probe = http.createServer((_request, response) => response.end());
+  await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", () => resolve()));
+  const { port } = probe.address() as AddressInfo;
+  await closeFixtureServer(probe);
+  return port;
+}
+
+async function proveDebuggerTargetRetry() {
+  const pageTarget = { type: "page", webSocketDebuggerUrl: "ws://127.0.0.1/devtools/page/proof" };
+  let connections = 0,requests = 0;
+  const flaky = http.createServer((_request, response) => {
+    requests += 1;
+    if (requests < 2) {
+      response.writeHead(503, { "content-type": "text/plain" });
+      response.end("devtools listener not ready");
+      return;
+    }
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify([
+      { type: "background_page", webSocketDebuggerUrl: "ws://127.0.0.1/devtools/page/background" },
+      pageTarget,
+    ]));
+  });
+  // The first connections are accepted then reset the way Chrome's listener
+  // behaves before it is ready; the first request it answers is non-OK.
+  flaky.on("connection", (socket) => {
+    connections += 1;
+    if (connections <= 2) socket.destroy();
+  });
+  await new Promise<void>((resolve) => flaky.listen(0, "127.0.0.1", () => resolve()));
+  const flakyPort = (flaky.address() as AddressInfo).port;
+  const retrySignal = new AbortController().signal;
+  const retryTimersBefore = activeTimerCount();
+  const retryStartedAt = Date.now();
+  let retryTargets: Array<{ type: string; webSocketDebuggerUrl: string }> | undefined;
+  let retryError: unknown;
+  try {
+    retryTargets = await fetchDebuggerTargets(`http://127.0.0.1:${flakyPort}/json/list`, retrySignal);
+  } catch (error) {
+    retryError = error;
+  }
+  const retryElapsedMs = Date.now() - retryStartedAt;
+  const retryTimers = activeTimerCount();
+  const retryListeners = getEventListeners(retrySignal, "abort").length;
+  const flakyClosed = await closeFixtureServer(flaky);
+  check(
+    "debugger_targets_retry_resolves_after_refused_connections_and_non_ok_responses",
+    retryError === undefined &&
+      retryTargets?.find((target) => target.type === "page")?.webSocketDebuggerUrl === pageTarget.webSocketDebuggerUrl &&
+      connections > 2 &&
+      requests > 1 &&
+      retryElapsedMs < DEBUGGER_TARGET_MS &&
+      retryTimers <= retryTimersBefore &&
+      retryListeners === 0 &&
+      flakyClosed,
+    JSON.stringify({
+      error: retryError instanceof Error ? retryError.message : "none",
+      targets: retryTargets?.length ?? 0,
+      connections,
+      requests,
+      elapsedMs: retryElapsedMs,
+      timersBefore: retryTimersBefore,
+      timersAfter: retryTimers,
+      listeners: retryListeners,
+      serverClosed: flakyClosed,
+    }),
+  );
+
+  const refusingPort = await reserveRefusingPort();
+  const deadlineSignal = new AbortController().signal;
+  const deadlineTimersBefore = activeTimerCount();
+  const deadlineStartedAt = Date.now();
+  let deadlineError: unknown;
+  try {
+    await fetchDebuggerTargets(`http://127.0.0.1:${refusingPort}/json/list`, deadlineSignal);
+  } catch (error) {
+    deadlineError = error;
+  }
+  const deadlineElapsedMs = Date.now() - deadlineStartedAt;
+  const deadlineTimers = activeTimerCount();
+  const deadlineListeners = getEventListeners(deadlineSignal, "abort").length;
+  const deadlineMessage = deadlineError instanceof Error ? deadlineError.message : "missing";
+  check(
+    "debugger_targets_unreachable_endpoint_rejects_at_deadline_content_free_without_leaks",
+    deadlineError instanceof ProofTimeoutError &&
+      deadlineMessage === "proof_timeout:debugger_target" &&
+      !deadlineMessage.includes(String(refusingPort)) &&
+      !deadlineMessage.includes("127.0.0.1") &&
+      deadlineElapsedMs >= DEBUGGER_TARGET_MS &&
+      deadlineElapsedMs < DEBUGGER_TARGET_MS + ABORT_SETTLE_MS &&
+      deadlineTimers <= deadlineTimersBefore &&
+      deadlineListeners === 0,
+    JSON.stringify({
+      error: deadlineMessage,
+      elapsedMs: deadlineElapsedMs,
+      deadlineMs: DEBUGGER_TARGET_MS,
+      timersBefore: deadlineTimersBefore,
+      timersAfter: deadlineTimers,
+      listeners: deadlineListeners,
+    }),
+  );
 }
 
 async function evaluate<T>(
@@ -1154,6 +1293,7 @@ async function main() {
   );
   await proveBoundedSignalEscalation();
   await proveNeverResolvingCdpCleanup();
+  await proveDebuggerTargetRetry();
   proveTimeoutExitSurface();
   await actualServerHeaderProof();
   await browserProof(html);
