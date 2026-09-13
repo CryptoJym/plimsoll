@@ -80,7 +80,6 @@ import {
   resolveHookSpoolHome,
   writeHookSpoolCounters,
   writeHookSpoolEnvelope,
-  writeHookSpoolFile,
   type HookSpoolBounds,
   type HookSpoolRefusal,
   type HookSpoolSource,
@@ -419,6 +418,26 @@ export function createHookSpoolDrain(
     reapHookSpoolTemporaries(options.home, nowMs());
     const files = listHookSpoolFiles(options.home, maxFilesPerTick);
     if (files.length === 0) {
+      // A refused intake writes NO file, so on a host whose spool refuses
+      // everything this branch is the only one that ever runs (review r1 of
+      // PR #325, F1). `counters` is the sole input to `snapshot()`, and
+      // therefore to the daemon's HTTP `/status`: without this read it would
+      // keep the value it was given at construction forever, and `/status`
+      // would report `refused: 0` on exactly the failing host the counter
+      // exists to expose. The two intake-owned fields are refreshed from the
+      // file their owner writes; the drain's own fields stay in memory, where
+      // this tick's (zero) work is already accounted for. One bounded read of
+      // one small file per quiet tick, beside the directory scan this branch
+      // already does, and `readHookSpoolCounters` answers with zeros instead
+      // of throwing when the file is missing or unreadable, so it cannot stop
+      // the drain. Nothing is written back: a tick with no work changes no
+      // counter.
+      const intakeOwned = readHookSpoolCounters(options.home);
+      counters = {
+        ...counters,
+        spooledAtIntake: intakeOwned.spooledAtIntake,
+        refused: intakeOwned.refused,
+      };
       pending = hookSpoolPending(options.home, nowMs());
       return result;
     }

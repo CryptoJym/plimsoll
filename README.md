@@ -135,14 +135,15 @@ file can add one on multiple ticks. Use `pendingFiles` and its age for the
 current backlog. The counter is cumulative and does not reset when it drains.
 
 File/directory synchronization uses the same OS primitives as the other durable
-local writers. The primitive is `fsync(2)` (Node's `fs.fsyncSync`), which on macOS does not make the drive flush its own volatile write cache — only `fcntl(F_FULLFSYNC)` does, and Node's `fs` cannot issue it without a native addon this package does not take — so the process-crash window is closed and the power-loss one is only narrowed, which matters most on external or virtualised volumes with a writeback cache. This is not a hardware power-cut certification. If publication's
+local writers. The primitive is Node's `fs.fsyncSync`, which on macOS is not a plain `fsync(2)`: libuv's `uv_fs_fsync` asks for `fcntl(F_FULLFSYNC)` there and falls back to `F_BARRIERFSYNC`, then to `fsync(2)`, only when the filesystem refuses it. On a volume that honours `F_FULLFSYNC` — an internal APFS disk is the normal case — the drive is told to flush its own volatile write cache, so the power-loss window is closed as well as the process-crash one, with no native addon. Where the filesystem refuses it and libuv falls back, the process-crash window is still closed and the power-loss one is only narrowed; that is the case on external or virtualised volumes with a writeback cache. Either way this is not a hardware power-cut certification. If publication's
 directory flush fails, the writer tries to hide its unacknowledged envelope as a
 bounded orphan temporary and returns failure. If the filesystem also refuses
 that rollback, a visible unacknowledged file can remain; no universal exactly-once
 claim is made for storage failures or interrupted delivery.
 
 The counters (`recovered`, `rejected`, `deferred`, `spooledAtIntake` — how many
-events the collector's own intake spooled — pending files and their age) are in
+events the collector's own intake spooled — `refused` — how many it tried to
+spool and could not — pending files and their age) are in
 `plimsoll status`, `plimsoll doctor`, and the collector's `/status` under
 `hookSpool`; `enabled` there is the running collector's kill-switch state, read
 from the collector itself — `plimsoll status` asks the daemon for it in one
@@ -155,7 +156,15 @@ that collector is updated. Doctor says so plainly if anything has been pending
 for more than ten minutes. The counters are written once per drain tick, after
 the tick has applied its files, so `status`/`doctor` can lag the ledger by the
 remainder of a 5 s tick: an event can be queryable in the ledger a moment before
-`recovered` counts it. Contract rejections are **not** spooled: a body the collector refuses on its merits (4xx other than 408)
+`recovered` counts it. The collector's `/status` answers from the drain's
+in-memory copy, which every tick refreshes — including a tick that found nothing
+to drain, so a host whose spool is refusing every event (a refusal writes no
+file, so it gives the drain no work) still shows `refused` rising there, within
+that same one tick. Rolling back to a collector that predates `refused` (0.7.24
+and older) is safe — it ignores the key when it reads the counters file — but
+its first drain tick with work rewrites the file without it, so an accumulated
+refusal count is lost at that point; the other counters are unaffected.
+Contract rejections are **not** spooled: a body the collector refuses on its merits (4xx other than 408)
 still fails the hook loudly, and a spooled file the drain cannot apply is
 quarantined under `hook-spool/rejected/` rather than retried forever. An
 operator watching `collector.err.log` sees intake spooling happen without any

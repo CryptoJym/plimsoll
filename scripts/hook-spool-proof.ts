@@ -54,6 +54,8 @@ import {
   hookSpoolRejectedDirectory,
   listHookSpoolFiles,
   readHookSpoolCounters,
+  recordHookSpoolIntake,
+  recordHookSpoolRefusal,
   writeHookSpoolFile,
 } from "../packages/collector-cli/src/hook-spool";
 import { forwardHookOverLoopback } from "../packages/collector-cli/src/local-hook-client";
@@ -3100,6 +3102,7 @@ function injectSpoolFlushFailure(home: string) {
 const REFUSED_SESSION_BOUNDED = "7a8b9c0d-1e2f-4a3b-8c4d-5e6f7a8b9c0d";
 const REFUSED_SESSION_FLUSH = "8b9c0d1e-2f3a-4b4c-8d5e-6f7a8b9c0d1e";
 const REFUSED_SESSION_DISABLED = "9c0d1e2f-3a4b-4c5d-8e6f-7a8b9c0d1e2f";
+const REFUSED_SESSION_QUIET = "0d1e2f3a-4b5c-4d6e-8f7a-8b9c0d1e2f3a";
 
 /**
  * Review r1 of PR #321, finding N3 and the bead's route-diagnostics note: a
@@ -3110,6 +3113,10 @@ const REFUSED_SESSION_DISABLED = "9c0d1e2f-3a4b-4c5d-8e6f-7a8b9c0d1e2f";
  * intake ever acknowledges an event it did not spool, the first check below
  * fails by name here, before a later case aborts the suite on a file that is
  * not there.
+ *
+ * Block (d) covers the surface the counter is most likely to be READ on
+ * (review r1 of PR #325, F1): the daemon's own `/status`, on a host quiet
+ * enough that the drain never has a file to work on.
  */
 async function caseARefusedIntakeSpoolIsCountedAndNamed() {
   // (a) Bounds exhausted: the refusal is decided after the directory pass, so
@@ -3308,6 +3315,91 @@ async function caseARefusedIntakeSpoolIsCountedAndNamed() {
       lock.release();
       await collector.close();
       setEnv("PLIMSOLL_HOOK_SPOOL", undefined);
+    }
+  }
+
+  // (d) A refusal writes no file, so on a host whose spool refuses everything
+  // the drain NEVER has work — and the daemon's `/status` answers from the
+  // drain's in-memory counters, read once when it was constructed. Before
+  // review r1 of PR #325 (F1) that surface reported `refused: 0` forever on
+  // exactly the failing host the counter exists to expose. One refusal and one
+  // quiet tick must be enough to move it.
+  {
+    const { home } = fixtureHome("aa4");
+    const collector = await startCollector(home, INTAKE_SPOOL_EXHAUSTED);
+    const lock = holdWriteLock(collector.ledgerPath);
+    try {
+      const before = ((await collector.statusBody()).hookSpool ?? {}) as Record<string, unknown>;
+      await captureWarnings(() =>
+        postHookOverHttp(
+          collector.port,
+          "/hooks/claude-code",
+          {
+            "content-type": "application/json",
+            "x-plimsoll-token": collector.auth.claudeCodeProducer!,
+          },
+          claudeHttpHookBody(REFUSED_SESSION_QUIET, "quiet tick"),
+        ),
+      );
+      const onDisk = readHookSpoolCounters(home);
+      const tick = await collector.drain.tick();
+      const after = ((await collector.statusBody()).hookSpool ?? {}) as Record<string, unknown>;
+      check(
+        "aa_a_quiet_drain_tick_refreshes_the_refused_counter_on_status",
+        onDisk.refused === 1 &&
+          // The tick that has to carry it is the one with nothing to do.
+          tick.attempted === 0 &&
+          listHookSpoolFiles(home).length === 0 &&
+          before.refused === 0 &&
+          after.refused === 1 &&
+          hasHookSpoolFields(after),
+        { before, onDisk, tick, after, pending: listHookSpoolFiles(home).length },
+      );
+    } finally {
+      lock.release();
+      await collector.close();
+    }
+  }
+
+  // The same hole applies to `spooledAtIntake`, the other field the intake
+  // owns. Here the two intake writers are called directly, so both counters
+  // move with no file for the drain to find, and the drain under test is
+  // constructed before either of them moves — exactly as the daemon's is. The
+  // refresh must take the intake's two fields and leave the drain's own
+  // in-memory work counters, and this tick must still write nothing back.
+  {
+    const { home } = fixtureHome("aa5");
+    const collector = await startCollector(home);
+    try {
+      const drain = createHookSpoolDrain(collectorConfigSchema.parse({}), collector.buffer, {
+        home,
+      });
+      const before = drain.status();
+      recordHookSpoolIntake(home);
+      recordHookSpoolRefusal(home);
+      recordHookSpoolRefusal(home);
+      const tick = await drain.tick();
+      const after = drain.status();
+      const onDisk = readHookSpoolCounters(home);
+      check(
+        "aa_a_quiet_drain_tick_refreshes_both_intake_owned_counters",
+        before.spooledAtIntake === 0 &&
+          before.refused === 0 &&
+          tick.attempted === 0 &&
+          listHookSpoolFiles(home).length === 0 &&
+          after.spooledAtIntake === 1 &&
+          after.refused === 2 &&
+          after.recovered === 0 &&
+          after.rejected === 0 &&
+          after.deferred === 0 &&
+          // A tick with no work counts nothing and writes nothing back.
+          onDisk.spooledAtIntake === 1 &&
+          onDisk.refused === 2 &&
+          onDisk.lastDrainAt === null,
+        { before, tick, after, onDisk },
+      );
+    } finally {
+      await collector.close();
     }
   }
 }

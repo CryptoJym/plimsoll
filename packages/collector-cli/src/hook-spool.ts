@@ -615,19 +615,27 @@ export function writeHookSpoolCounters(home: string, counters: HookSpoolCounters
 
 /**
  * The primitive by name, so the residual is visible here and not only in the
- * README (review r1 of PR #321, finding N1): `fs.fsyncSync` is `fsync(2)`.
+ * README (review r1 of PR #321, finding N1; its mechanism corrected by review
+ * r1 of PR #325, F2): on macOS `fs.fsyncSync` is NOT a plain `fsync(2)`.
+ * libuv's `uv_fs_fsync` (`src/unix/fs.c`, `uv__fs_fsync`) asks for
+ * `fcntl(fd, F_FULLFSYNC)` there, and falls back to `F_BARRIERFSYNC` and then
+ * to `fsync(2)` only when the filesystem refuses it.
  *
- * On macOS `fsync(2)` pushes the data to the device and returns; it does NOT
- * make the drive flush its own volatile write cache — only
- * `fcntl(fd, F_FULLFSYNC)` does. So every flush in this file fully closes the
- * PROCESS-CRASH window (a 202 implies the bytes and the directory entry left
- * this process) and only narrows the POWER-LOSS one: on an external or
+ * So on a volume that honours `F_FULLFSYNC` — an internal APFS disk is the
+ * normal case — the drive IS told to flush its own volatile write cache, and
+ * these flushes close the POWER-LOSS window as well as the PROCESS-CRASH one
+ * (a 202 implies the bytes and the directory entry left this process). No
+ * native addon is needed for that. Where the filesystem refuses
+ * `F_FULLFSYNC` and libuv falls back, the process-crash window is still
+ * closed and the power-loss one is only narrowed: on an external or
  * virtualised volume with a writeback cache, an acknowledged envelope can
- * still be in the drive's cache when the power goes. Node's `fs` exposes no
- * `F_FULLFSYNC` path, so closing that needs a native addon this package does
- * not take; the residual is documented rather than implemented, and the
- * measured cost of the flushes we do issue is ~10.5 ms per spooled envelope
- * (~0.23 ms before them), of which the home flush below is ~0.3-0.6 ms.
+ * still be in the drive's cache when the power goes. That residual is a
+ * property of the volume, not of this code, and either way no hardware
+ * power-cut certification is claimed.
+ *
+ * The price is a real cache flush: ~10.5 ms per spooled envelope (~0.23 ms
+ * before the flushes), dominated by the envelope file and spool directory
+ * flushes at ~3.7-3.9 ms each. The home flush below is ~0.002 ms — see there.
  */
 function syncHookSpoolDirectory(directory: string) {
   const descriptor = fs.openSync(directory, "r");
@@ -718,8 +726,10 @@ export function writeHookSpoolEnvelope(options: {
     // write (review r1 of PR #321, finding N4: `ensureSpoolDirectory` does not
     // report whether it created anything, so this call is unconditional) —
     // that way a newly created hook-spool directory is never the unflushed
-    // link in the chain. ~0.3-0.6 ms of the ~10.5 ms; an `fsync` on an
-    // unmodified directory is nearly free.
+    // link in the chain. ~0.002 ms of the ~10.5 ms (review r1 of PR #325,
+    // F4): the envelope goes into `hook-spool/`, so the canonical home is not
+    // modified by this write and its flush takes the unmodified-directory
+    // path — an `fsync` on an unmodified directory is nearly free.
     syncHookSpoolDirectory(options.home);
     fs.renameSync(temporary, target);
     published = true;
