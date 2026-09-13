@@ -57,7 +57,9 @@ const CDP_COMMAND_MS = 5_000;
 // pins the constant against an accidental edit and is not evidence that the
 // deadline was fitted to data.
 // browser_debugger_target_readiness_receipt_present_and_numeric prints the
-// governed interval on every run. Until hosted runs have accumulated it, the
+// governed interval from a finally, so a run that expires this deadline prints
+// it too, and that rejection carries the same elapsed interval and attempt
+// count to the process surface. Until hosted runs have accumulated it, the
 // hosted readiness this deadline is meant to cover stays unmeasured.
 const DEBUGGER_TARGET_DERIVATION = {
   measuredInterval: "spawn_to_devtools_active_port",
@@ -314,7 +316,7 @@ type TimeoutStage =
   | "debugger_target";
 
 export class ProofTimeoutError extends Error {
-  constructor(readonly stage: TimeoutStage, detail?: string, readonly elapsedMs?: number) {
+  constructor(readonly stage: TimeoutStage, detail?: string, readonly elapsedMs?: number, readonly attempts?: number) {
     super(detail ? `proof_timeout:${stage}:${detail}` : `proof_timeout:${stage}`);
     this.name = "ProofTimeoutError";
   }
@@ -934,6 +936,9 @@ function debuggerRetryStep(ms: number, signal: AbortSignal) {
 // target — is a body this step cannot interpret, not a readiness state. Only
 // type is required: a target that already has a debugger attached is published
 // without webSocketDebuggerUrl, and picking the page target handles that.
+// A well-shaped array that holds no page target is not a fault either: it is
+// what Chrome answers before its first page registers, so the caller treats it
+// as not ready rather than as a body it can decide on.
 function parseDebuggerTargets(body: string) {
   let parsed: unknown;
   try {
@@ -959,8 +964,9 @@ function resolveDebuggerDeadlineMs(options: DebuggerTargetOptions) {
   return options.deadlineMs ?? DEBUGGER_TARGET_MS;
 }
 
-async function fetchDebuggerTargets(url: string, signal: AbortSignal, options: DebuggerTargetOptions = {}) {
+async function fetchDebuggerPageTarget(url: string, signal: AbortSignal, options: DebuggerTargetOptions = {}) {
   const controller = new AbortController();
+  const startedAt = Date.now();
   let timedOut = false;
   let attempts = 0;
   const onAbort = () => controller.abort();
@@ -969,6 +975,11 @@ async function fetchDebuggerTargets(url: string, signal: AbortSignal, options: D
     timedOut = true;
     controller.abort();
   }, resolveDebuggerDeadlineMs(options));
+  // A rejection from this step carries the interval it governed and the
+  // attempts it made, so a run that fails reports the same two numbers a run
+  // that succeeds prints. Both are counters, so the message and the process
+  // surface stay content-free.
+  const expiredAt = () => new ProofTimeoutError("debugger_target", undefined, Date.now() - startedAt, attempts);
   try {
     // Chrome can publish DevToolsActivePort before its devtools listener
     // accepts connections, so a refused or reset connection here is transient.
@@ -985,14 +996,22 @@ async function fetchDebuggerTargets(url: string, signal: AbortSignal, options: D
         const response = await fetch(url, { signal: controller.signal });
         if (response.ok) {
           const targets = parseDebuggerTargets(await response.text());
-          if (targets) return targets;
-          unparseableBody = true;
+          if (targets) {
+            // A shaped list with no page target in it, the empty array
+            // included, is Chrome before its first page registers. That is a
+            // readiness state, so it retries inside the deadline like a
+            // refused connection instead of ending the step.
+            const page = targets.find((target) => target.type === "page");
+            if (page) return page;
+          } else {
+            unparseableBody = true;
+          }
         } else {
           await response.body?.cancel().catch(() => undefined);
         }
       } catch {
         if (signal.aborted) throw new ProofTimeoutError("browser_proof_overall");
-        if (timedOut) throw new ProofTimeoutError("debugger_target");
+        if (timedOut) throw expiredAt();
       }
       // An OK response that is not a target list is a decided answer, so the
       // step ends on it instead of refetching a body that will not change. It
@@ -1000,10 +1019,10 @@ async function fetchDebuggerTargets(url: string, signal: AbortSignal, options: D
       // only thing that retries. The payload detail keeps a broken endpoint
       // distinguishable from a slow one at the process surface, and stays
       // content-free: the stage and the word payload, nothing from the body.
-      if (unparseableBody) throw new ProofTimeoutError("debugger_target", "payload");
+      if (unparseableBody) throw new ProofTimeoutError("debugger_target", "payload", Date.now() - startedAt, attempts);
       await debuggerRetryStep(DEBUGGER_TARGET_RETRY_MS, controller.signal);
       if (signal.aborted) throw new ProofTimeoutError("browser_proof_overall");
-      if (timedOut) throw new ProofTimeoutError("debugger_target");
+      if (timedOut) throw expiredAt();
     }
   } finally {
     clearTimeout(timer);
@@ -1016,29 +1035,88 @@ function activeTimerCount() {
   return process.getActiveResourcesInfo().filter((resource) => resource === "Timeout").length;
 }
 
-// The catch inside fetchDebuggerTargets must bind no error and must carry no
+// A second, slower strip of the same slice, used only to bound the naive one
+// below. It walks the text once and knows a string literal from a comment, so
+// a slash pair inside a literal cannot open a comment for it. Regex literals
+// and template interpolation are out of scope: this slice contains neither,
+// and anything it does misread shows up as a disagreement, which reds the
+// audit rather than passing it.
+function scanFetchSource(source: string) {
+  let commentBytes = 0;
+  let code = "";
+  let index = 0;
+  while (index < source.length) {
+    const opener = source.slice(index, index + 2);
+    if (opener === "//" || opener === "/*") {
+      const closed = opener === "//" ? source.indexOf("\n", index) : source.indexOf("*/", index + 2);
+      const stop = closed === -1 ? source.length : closed + (opener === "//" ? 0 : 2);
+      commentBytes += stop - index;
+      code += " ";
+      index = stop;
+      continue;
+    }
+    const quote = source[index];
+    if (quote === "\"" || quote === "'" || quote === "`") {
+      index += 1;
+      while (index < source.length && source[index] !== quote) index += source[index] === "\\" ? 2 : 1;
+      code += " ";
+      index += 1;
+      continue;
+    }
+    code += source[index];
+    index += 1;
+  }
+  return { commentBytes, code };
+}
+
+// The catch inside fetchDebuggerPageTarget must bind no error and must carry no
 // ProofTimeoutError guard. Comments are stripped before matching so prose that
 // names a forbidden shape cannot red the check, and the patterns tolerate any
-// spacing so reformatting cannot either. Stripping is naive on purpose: that
-// function holds no string literal containing a slash pair.
+// spacing so reformatting cannot either. The stripping the patterns read is
+// naive, and a string literal holding a slash pair opens a comment for it, so
+// a wide enough pair can swallow the very catch they are counting. That is why
+// the naive result is not trusted alone: the audit is clean only if the
+// literal-aware scan above counts the same shapes, the tokens the patterns
+// depend on survived the strip, and the strip removed no more than real
+// comments occupy. Any of those failing is a red audit; none of them can
+// produce a green one.
 function auditFetchSource(source: string) {
   const code = source.replace(/\/\*[\s\S]*?\*\//g, " ").replace(/\/\/[^\n]*/g, " ");
-  const catchBindings = code.match(/\}\s*catch\s*\(/g)?.length ?? 0;
-  const bindlessCatches = code.match(/\}\s*catch\s*\{/g)?.length ?? 0;
-  const timeoutGuards = code.match(/instanceof\s+ProofTimeoutError/g)?.length ?? 0;
+  const countShapes = (text: string) => ({
+    catchBindings: text.match(/\}\s*catch\s*\(/g)?.length ?? 0,
+    bindlessCatches: text.match(/\}\s*catch\s*\{/g)?.length ?? 0,
+    timeoutGuards: text.match(/instanceof\s+ProofTimeoutError/g)?.length ?? 0,
+    catchKeywords: text.match(/\bcatch\b/g)?.length ?? 0,
+  });
+  const { catchBindings, bindlessCatches, timeoutGuards, catchKeywords } = countShapes(code);
+  const scan = scanFetchSource(source);
+  const scanned = countShapes(scan.code);
+  const structureSurvived =
+    code.includes("for (;;)") &&
+    code.includes("try {") &&
+    catchBindings === scanned.catchBindings &&
+    bindlessCatches === scanned.bindlessCatches &&
+    timeoutGuards === scanned.timeoutGuards &&
+    catchKeywords === scanned.catchKeywords &&
+    source.length - code.length <= scan.commentBytes;
   return {
     sourceBytes: source.length,
     codeBytes: code.length,
+    commentBytes: scan.commentBytes,
     catchBindings,
     bindlessCatches,
     timeoutGuards,
-    clean: source.length > 0 && bindlessCatches >= 1 && catchBindings === 0 && timeoutGuards === 0,
+    catchKeywords,
+    scanned,
+    structureSurvived,
+    clean: source.length > 0 && bindlessCatches >= 1 && catchBindings === 0 && timeoutGuards === 0 && structureSurvived,
   };
 }
 
-// Drives the real fetchDebuggerTargets against a server that answers 200 with a
-// fixed body, and reports a content-free receipt of what came back.
-async function probeDebuggerBody(body: string) {
+// Drives the real fetchDebuggerPageTarget against a server that answers 200
+// with a fixed body, and reports a content-free receipt of what came back. The
+// options ride through so a probe can hold a body against an injected deadline.
+async function probeDebuggerBody(body: string, options: DebuggerTargetOptions = {}) {
   let requests = 0;
   const server = http.createServer((_request, response) => {
     requests += 1;
@@ -1053,7 +1131,8 @@ async function probeDebuggerBody(body: string) {
   let attempts = 0;
   let error: unknown;
   try {
-    await fetchDebuggerTargets(`http://127.0.0.1:${port}/json/list`, signal, {
+    await fetchDebuggerPageTarget(`http://127.0.0.1:${port}/json/list`, signal, {
+      ...options,
       onAttempts: (count) => { attempts = count },
     });
   } catch (caught) {
@@ -1137,7 +1216,7 @@ async function proveDebuggerTargetRetry() {
 
   const proofSource = fs.readFileSync(scriptPath, "utf8");
   const fetchSource = proofSource.slice(
-    proofSource.indexOf("async function fetchDebuggerTargets"),
+    proofSource.indexOf("async function fetchDebuggerPageTarget"),
     proofSource.indexOf("function activeTimerCount"),
   );
   const fetchAudit = auditFetchSource(fetchSource);
@@ -1147,26 +1226,48 @@ async function proveDebuggerTargetRetry() {
     JSON.stringify(fetchAudit),
   );
 
-  // The audit itself, driven over mutated copies of that source: the four
-  // formatting and comment shapes that must stay green, and the two real
-  // regressions that must stay red.
+  // The audit itself, driven over mutated copies of that source: every
+  // formatting and comment shape that must stay green, and every real
+  // regression that must stay red.
   const bindlessCatch = "} catch {";
+  // The shape that defeats the naive strip on its own: a literal holding a
+  // slash pair before the catch and one holding its close after, with the
+  // catch re-bound in between. The strip eats the region, leaves a bindless
+  // catch behind in the surviving literal text, and the patterns alone read
+  // that as clean. The literal-aware scan counts the re-bound catch instead,
+  // and the disagreement is what reds it.
+  const slashPairSabotage = fetchSource
+    .replace("      try {", "      const opener = \"/*\";\n      try {")
+    .replace(bindlessCatch, "} catch (error) {")
+    .replace("      if (unparseableBody)", "      const closer = \"*/ } catch {\";\n      if (unparseableBody)");
   const auditProbes = [
     { name: "unmodified", source: fetchSource, expected: true },
     { name: "bindless_catch_without_spaces", source: fetchSource.replace(bindlessCatch, "}catch{"), expected: true },
     { name: "bindless_catch_with_extra_space", source: fetchSource.replace(bindlessCatch, "} catch  {"), expected: true },
+    { name: "bindless_catch_across_a_newline", source: fetchSource.replace(bindlessCatch, "} catch\n    {"), expected: true },
+    { name: "bindless_catch_with_tabs", source: fetchSource.replace(bindlessCatch, "}\tcatch\t{"), expected: true },
     { name: "binding_shape_named_in_a_line_comment", source: `${fetchSource}\n// A shape like } catch (error) { is forbidden here.\n`, expected: true },
     { name: "guard_named_in_a_block_comment", source: `${fetchSource}\n/* No instanceof ProofTimeoutError guard belongs here. */\n`, expected: true },
+    { name: "both_shapes_named_in_one_block_comment", source: `${fetchSource}\n/* Neither } catch (error) { nor instanceof ProofTimeoutError belongs here. */\n`, expected: true },
+    { name: "both_shapes_named_in_doubled_line_comments", source: `${fetchSource}\n// } catch (error) {\n// instanceof ProofTimeoutError\n`, expected: true },
+    { name: "binding_shape_commented_out_inside_the_function", source: fetchSource.replace(bindlessCatch, "// } catch (error) {\n      } catch {"), expected: true },
     { name: "catch_binds_an_error", source: fetchSource.replace(bindlessCatch, "} catch (error) {"), expected: false },
+    { name: "catch_binds_without_spaces", source: fetchSource.replace(bindlessCatch, "}catch(error){"), expected: false },
+    { name: "catch_binds_across_newlines", source: fetchSource.replace(bindlessCatch, "}\n catch\n (error)\n {"), expected: false },
+    { name: "catch_removed_entirely", source: fetchSource.replace(bindlessCatch, "{"), expected: false },
+    { name: "second_binding_catch_appended", source: `${fetchSource}\n} catch (error) {\n`, expected: false },
     { name: "timeout_guard_readded", source: fetchSource.replace(bindlessCatch, "} catch {\n        if (error instanceof ProofTimeoutError) throw error;"), expected: false },
+    { name: "timeout_guard_with_a_double_space", source: fetchSource.replace(bindlessCatch, "} catch {\n        if (error instanceof  ProofTimeoutError) throw error;"), expected: false },
+    { name: "slash_pair_literal_after_the_binding", source: fetchSource.replace(bindlessCatch, "} catch (error) {\n        const trailer = \"/*\";"), expected: false },
+    { name: "slash_pair_literals_around_a_rebound_catch", source: slashPairSabotage, expected: false },
   ];
   const auditResults = auditProbes.map((probe) => {
     const audit = auditFetchSource(probe.source);
-    return { name: probe.name, clean: audit.clean, expected: probe.expected, catchBindings: audit.catchBindings, bindlessCatches: audit.bindlessCatches, timeoutGuards: audit.timeoutGuards };
+    return { name: probe.name, clean: audit.clean, expected: probe.expected, catchBindings: audit.catchBindings, bindlessCatches: audit.bindlessCatches, timeoutGuards: audit.timeoutGuards, structureSurvived: audit.structureSurvived };
   });
   check(
     "debugger_target_source_audit_ignores_comments_and_spacing_but_still_catches_a_binding_or_a_guard",
-    auditResults.length === 7 && auditResults.every((result) => result.clean === result.expected),
+    auditResults.length === 19 && auditResults.every((result) => result.clean === result.expected),
     JSON.stringify(auditResults),
   );
 
@@ -1196,10 +1297,10 @@ async function proveDebuggerTargetRetry() {
   const retrySignal = new AbortController().signal;
   const retryTimersBefore = activeTimerCount();
   const retryStartedAt = Date.now();
-  let retryTargets: Array<{ type: string; webSocketDebuggerUrl: string }> | undefined;
+  let retryTarget: { type: string; webSocketDebuggerUrl: string } | undefined;
   let retryError: unknown;
   try {
-    retryTargets = await fetchDebuggerTargets(`http://127.0.0.1:${flakyPort}/json/list`, retrySignal);
+    retryTarget = await fetchDebuggerPageTarget(`http://127.0.0.1:${flakyPort}/json/list`, retrySignal);
   } catch (error) {
     retryError = error;
   }
@@ -1210,7 +1311,7 @@ async function proveDebuggerTargetRetry() {
   check(
     "debugger_targets_retry_resolves_after_refused_connections_and_non_ok_responses",
     retryError === undefined &&
-      retryTargets?.find((target) => target.type === "page")?.webSocketDebuggerUrl === pageTarget.webSocketDebuggerUrl &&
+      retryTarget?.webSocketDebuggerUrl === pageTarget.webSocketDebuggerUrl &&
       connections > 2 &&
       requests > 1 &&
       retryElapsedMs < DEBUGGER_TARGET_MS &&
@@ -1219,7 +1320,7 @@ async function proveDebuggerTargetRetry() {
       flakyClosed,
     JSON.stringify({
       error: retryError instanceof Error ? retryError.message : "none",
-      targets: retryTargets?.length ?? 0,
+      target: retryTarget?.type ?? "none",
       connections,
       requests,
       elapsedMs: retryElapsedMs,
@@ -1227,6 +1328,63 @@ async function proveDebuggerTargetRetry() {
       timersAfter: retryTimers,
       listeners: retryListeners,
       serverClosed: flakyClosed,
+    }),
+  );
+
+  // Chrome answers /json/list before its first page target registers. That
+  // answer is well shaped and holds no page target, so the step must poll
+  // through it and resolve when the page appears, inside the deadline.
+  const registeredTarget = { type: "page", webSocketDebuggerUrl: "ws://127.0.0.1/devtools/page/registered" };
+  const emptyAnswers = 3;
+  let registeringRequests = 0;
+  const registering = http.createServer((_request, response) => {
+    registeringRequests += 1;
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(
+      registeringRequests <= emptyAnswers ? [] : [{ type: "background_page" }, registeredTarget],
+    ));
+  });
+  await new Promise<void>((resolve) => registering.listen(0, "127.0.0.1", () => resolve()));
+  const registeringPort = (registering.address() as AddressInfo).port;
+  const registeringSignal = new AbortController().signal;
+  const registeringTimersBefore = activeTimerCount();
+  const registeringStartedAt = Date.now();
+  let registeringAttempts = 0;
+  let registeringTarget: { type: string; webSocketDebuggerUrl: string } | undefined;
+  let registeringError: unknown;
+  try {
+    registeringTarget = await fetchDebuggerPageTarget(`http://127.0.0.1:${registeringPort}/json/list`, registeringSignal, {
+      onAttempts: (attempts) => { registeringAttempts = attempts },
+    });
+  } catch (error) {
+    registeringError = error;
+  }
+  const registeringElapsedMs = Date.now() - registeringStartedAt;
+  const registeringTimers = activeTimerCount();
+  const registeringListeners = getEventListeners(registeringSignal, "abort").length;
+  const registeringClosed = await closeFixtureServer(registering);
+  check(
+    "debugger_target_empty_list_is_transient_and_retried_until_the_page_target_registers",
+    registeringError === undefined &&
+      registeringTarget?.webSocketDebuggerUrl === registeredTarget.webSocketDebuggerUrl &&
+      registeringAttempts === emptyAnswers + 1 &&
+      registeringRequests === emptyAnswers + 1 &&
+      registeringElapsedMs < DEBUGGER_TARGET_MS &&
+      registeringTimers <= registeringTimersBefore &&
+      registeringListeners === 0 &&
+      registeringClosed,
+    JSON.stringify({
+      error: registeringError instanceof Error ? registeringError.message : "none",
+      target: registeringTarget?.type ?? "none",
+      emptyAnswers,
+      requests: registeringRequests,
+      attempts: registeringAttempts,
+      elapsedMs: registeringElapsedMs,
+      deadlineMs: DEBUGGER_TARGET_MS,
+      timersBefore: registeringTimersBefore,
+      timersAfter: registeringTimers,
+      listeners: registeringListeners,
+      serverClosed: registeringClosed,
     }),
   );
 
@@ -1303,7 +1461,7 @@ async function proveDebuggerTargetRetry() {
   let deadlineAttempts = 0;
   let deadlineError: unknown;
   try {
-    await fetchDebuggerTargets(`http://127.0.0.1:${refusing.port}/json/list`, deadlineSignal, {
+    await fetchDebuggerPageTarget(`http://127.0.0.1:${refusing.port}/json/list`, deadlineSignal, {
       deadlineMs: NEVER_READY_DEADLINE_MS,
       onAttempts: (attempts) => { deadlineAttempts = attempts },
     });
@@ -1350,7 +1508,7 @@ async function proveDebuggerTargetRetry() {
   let refusedAttempts = 0;
   let refusedError: unknown;
   try {
-    await fetchDebuggerTargets(`http://127.0.0.1:${refusedPort}/json/list`, refusedSignal, {
+    await fetchDebuggerPageTarget(`http://127.0.0.1:${refusedPort}/json/list`, refusedSignal, {
       deadlineMs: NEVER_READY_DEADLINE_MS,
       onAttempts: (attempts) => { refusedAttempts = attempts },
     });
@@ -1382,11 +1540,45 @@ async function proveDebuggerTargetRetry() {
       attempts: refusedAttempts,
       elapsedMs: refusedElapsedMs,
       deadlineMs: NEVER_READY_DEADLINE_MS,
+      shippedDeadlineMs: DEBUGGER_TARGET_MS,
       listenerClosed: vacatedClosed,
       portStillFree: refusedPortStillFree,
       timersBefore: refusedTimersBefore,
       timersAfter: refusedTimers,
       listeners: refusedListeners,
+    }),
+  );
+
+  // The other end of the same readiness state: a page target that never
+  // registers must reach the deadline as the content-free debugger_target
+  // timeout, not as a decided payload fault and not as a raw error. Injected
+  // deadline, for the reason above.
+  const neverRegisters = await probeDebuggerBody("[]", { deadlineMs: NEVER_READY_DEADLINE_MS });
+  check(
+    "debugger_target_list_without_a_page_target_rejects_at_deadline_content_free_without_leaks",
+    neverRegisters.isTimeoutError &&
+      neverRegisters.message === "proof_timeout:debugger_target" &&
+      !neverRegisters.message.includes(String(neverRegisters.port)) &&
+      !neverRegisters.message.includes("127.0.0.1") &&
+      !neverRegisters.message.includes("json") &&
+      neverRegisters.attempts > 1 &&
+      neverRegisters.requests > 1 &&
+      neverRegisters.elapsedMs >= NEVER_READY_DEADLINE_MS &&
+      neverRegisters.elapsedMs < NEVER_READY_DEADLINE_MS + ABORT_SETTLE_MS &&
+      neverRegisters.timersAfter <= neverRegisters.timersBefore &&
+      neverRegisters.listeners === 0 &&
+      neverRegisters.serverClosed,
+    JSON.stringify({
+      error: neverRegisters.message,
+      requests: neverRegisters.requests,
+      attempts: neverRegisters.attempts,
+      elapsedMs: neverRegisters.elapsedMs,
+      deadlineMs: NEVER_READY_DEADLINE_MS,
+      shippedDeadlineMs: DEBUGGER_TARGET_MS,
+      timersBefore: neverRegisters.timersBefore,
+      timersAfter: neverRegisters.timersAfter,
+      listeners: neverRegisters.listeners,
+      serverClosed: neverRegisters.serverClosed,
     }),
   );
 
@@ -1537,32 +1729,41 @@ async function browserProof(html: string) {
     const activePort = path.join(profile, "DevToolsActivePort");
     await waitForFile(activePort, chrome, controller.signal);
     const [debugPort] = fs.readFileSync(activePort, "utf8").split("\n");
-    // The interval DEBUGGER_TARGET_MS actually governs. Printed on every run,
-    // numbers only, so hosted runs accumulate the distribution that record is
-    // still missing.
+    // The interval DEBUGGER_TARGET_MS actually governs, emitted from a finally
+    // so the run that expires the deadline prints it too. Numbers only, so
+    // hosted runs accumulate the distribution that record is still missing
+    // from their failures as well as from their successes; the rejection
+    // carries the same two numbers to the process surface.
     const readinessStartedAt = Date.now();
     let debuggerAttempts = 0;
-    const targets = await fetchDebuggerTargets(
-      `http://127.0.0.1:${debugPort}/json/list`,
-      controller.signal,
-      { onAttempts: (attempts) => { debuggerAttempts = attempts } },
-    );
-    const debuggerReadyMs = Date.now() - readinessStartedAt;
-    check(
-      "browser_debugger_target_readiness_receipt_present_and_numeric",
-      Number.isFinite(debuggerReadyMs) &&
-        debuggerReadyMs >= 0 &&
-        debuggerReadyMs < DEBUGGER_TARGET_MS &&
-        Number.isInteger(debuggerAttempts) &&
-        debuggerAttempts >= 1,
-      JSON.stringify({
-        devtoolsActivePortToTargetsMs: debuggerReadyMs,
-        attempts: debuggerAttempts,
-        deadlineMs: DEBUGGER_TARGET_MS,
-      }),
-    );
-    const page = targets.find((target) => target.type === "page");
-    if (!page) throw new Error("Chrome page target unavailable");
+    let debuggerResolved = false;
+    const page = await (async () => {
+      try {
+        const target = await fetchDebuggerPageTarget(
+          `http://127.0.0.1:${debugPort}/json/list`,
+          controller.signal,
+          { onAttempts: (attempts) => { debuggerAttempts = attempts } },
+        );
+        debuggerResolved = true;
+        return target;
+      } finally {
+        const debuggerReadyMs = Date.now() - readinessStartedAt;
+        check(
+          "browser_debugger_target_readiness_receipt_present_and_numeric",
+          Number.isFinite(debuggerReadyMs) &&
+            debuggerReadyMs >= 0 &&
+            Number.isInteger(debuggerAttempts) &&
+            debuggerAttempts >= 1 &&
+            (!debuggerResolved || debuggerReadyMs < DEBUGGER_TARGET_MS),
+          JSON.stringify({
+            devtoolsActivePortToTargetsMs: debuggerReadyMs,
+            attempts: debuggerAttempts,
+            resolved: debuggerResolved,
+            deadlineMs: DEBUGGER_TARGET_MS,
+          }),
+        );
+      }
+    })();
     cdp = await CdpClient.connect(page.webSocketDebuggerUrl, { signal: controller.signal });
     const pageErrors: string[] = [],consoleErrors: string[] = [],requests: string[] = [];
     cdp.on("Runtime.exceptionThrown", (params) => pageErrors.push(JSON.stringify(params)));
@@ -1730,6 +1931,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === scriptPath) main().catc
       stage: error.stage,
       ...(stageDetail ? { detail: stageDetail } : {}),
       ...(error.elapsedMs !== undefined ? { elapsedMs: error.elapsedMs } : {}),
+      ...(error.attempts !== undefined ? { attempts: error.attempts } : {}),
     }));
   } else {
     console.error(error instanceof Error ? error.stack : String(error));
