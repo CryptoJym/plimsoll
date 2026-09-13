@@ -23,6 +23,14 @@ import {
 } from "../packages/collector-cli/src/dashboard-api";
 import { historyCoverageStatus } from "../packages/collector-cli/src/history-coverage";
 import { CaptureWorkBudget } from "../packages/collector-cli/src/capture-work-budget";
+import {
+  AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP,
+  captureScanProgress,
+} from "../packages/collector-cli/src/capture-baseline";
+import {
+  IncrementalJsonlDiscovery,
+  type DiscoveryProgress,
+} from "../packages/collector-cli/src/incremental-jsonl-discovery";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
@@ -1928,18 +1936,32 @@ async function main() {
     const drainRoots = codexRoots(1, 1, "drain", 2);
     const drainTailer = new RolloutTailer(
       codexBuffer, drainRoots[0]!.directory, () => [], undefined, drainRoots);
-    const drained = (await drainTailer.scan({
+    const drainTick = async () => (await drainTailer.scan({
       scope: "recent", now: NOW,
       automatic: { phase: "capture", budget: new CaptureWorkBudget() },
     })).activity.scan!;
+    const drained = await drainTick();
+    // Bead eco-6hoxj.77 r2, review finding 1: the retirement snapshot must not
+    // outlive the cadence that took it. More files arrive, the next cadence
+    // opens a fresh cursor, and its receipt has to be that cursor's sweep — not
+    // a replay of the retired numbers. Without the `retiredProgress = null`
+    // reset at the top of `scan()` every later cadence republishes `drained`,
+    // so the receipt freezes on `sweepComplete: true` while the host sweeps.
+    codexRoots(1, 1, "drain", 300);
+    const drainedNext = await drainTick();
+    const drainedThird = await drainTick();
     drainTailer.close();
     const restartRoots = codexRoots(1, 1, "restart", 20);
     const restartTailer = new RolloutTailer(
       codexBuffer, restartRoots[0]!.directory, () => [], undefined, restartRoots);
-    const restarted = (await restartTailer.scan({
+    const restartTick = async () => (await restartTailer.scan({
       scope: "recent", now: NOW,
       automatic: { phase: "baseline", budget: new CaptureWorkBudget() },
     })).activity.scan!;
+    const restarted = await restartTick();
+    codexRoots(1, 1, "restart", 300);
+    const restartedNext = await restartTick();
+    const restartedThird = await restartTick();
     restartTailer.close();
     check("a_cadence_that_retires_its_cursor_reports_the_sweep_it_ran",
       drained.rootsStarted === 1 && drained.entriesThisSweep > 0 &&
@@ -1948,6 +1970,40 @@ async function main() {
       restarted.rootsStarted === 1 && restarted.entriesThisSweep > 0 &&
       restarted.converging === false && restarted.sweepComplete === true,
       { drained, restarted });
+    check("a_rollout_cadence_after_a_retirement_reports_the_new_sweep_not_the_retired_one",
+      drainedNext.converging === true && drainedNext.sweepComplete === false &&
+      drainedNext.limitReached === false && drainedNext.entriesThisSweep > 0 &&
+      drainedNext.entriesThisSweep !== drained.entriesThisSweep &&
+      drainedThird.converging === true && drainedThird.sweepComplete === false &&
+      drainedThird.entriesThisSweep > drainedNext.entriesThisSweep &&
+      restartedNext.converging === true && restartedNext.sweepComplete === false &&
+      restartedNext.limitReached === false && restartedNext.entriesThisSweep > 0 &&
+      restartedNext.entriesThisSweep !== restarted.entriesThisSweep &&
+      restartedThird.converging === true && restartedThird.sweepComplete === false &&
+      restartedThird.entriesThisSweep > restartedNext.entriesThisSweep,
+      { drained, drainedNext, drainedThird, restarted, restartedNext, restartedThird });
+
+    /**
+     * The r1 receipt as it rendered: a zero sweep under a sweeping reason. The
+     * digit boundary matters — `20 entr(ies) this sweep` contains
+     * `0 entr(ies) this sweep` as a substring — and so does the second roots
+     * wording: `describeScanRoots` prints `0/N eligible of K configured capture
+     * root(s) enumerated` the moment eligible roots differ from configured ones
+     * (r2, review finding 4).
+     */
+    const rendersTheR1ZeroSweep = (reason: string) =>
+      /(?<![0-9])0 entr\(ies\) this sweep/.test(reason) ||
+      /(?<![0-9])0\/[0-9]+ (?:eligible of [0-9]+ configured )?capture root\(s\) enumerated/
+        .test(reason);
+    check("the_r1_zero_sweep_detector_reads_both_capture_root_wordings",
+      rendersTheR1ZeroSweep("local activity scan still sweeping — 0/22 eligible of 25 " +
+        "configured capture root(s) enumerated, 40 entr(ies) this sweep, 24 this tick") === true &&
+      rendersTheR1ZeroSweep("local activity scan still sweeping — 0/1 capture root(s) " +
+        "enumerated, 40 entr(ies) this sweep, 24 this tick") === true &&
+      rendersTheR1ZeroSweep("local activity scan still sweeping — 3/22 eligible of 25 " +
+        "configured capture root(s) enumerated, 20 entr(ies) this sweep, 24 this tick") === false &&
+      rendersTheR1ZeroSweep("local activity scan still sweeping — 1/1 capture root(s) " +
+        "enumerated, 20 entr(ies) this sweep, 24 this tick") === false);
     // Bead eco-6hoxj.77 (r3 findings 1 and 2): the two halves of the r3 fix
     // that no check drove. Both of them reverted green under the whole
     // battery — the `!limitReached` term in `sweepComplete`, and the entire
@@ -2010,15 +2066,118 @@ async function main() {
       // The label and the reason are the r3 wording, unchanged by either half.
       codexLimitRow.activityState.scanState === "limit_reached" &&
       codexLimitRow.status === "amber" &&
-      codexLimitRow.reason === "local activity scan hit its lifetime entry limit and restarts " +
-        `instead of resuming — ${codexLimitBaseline.rootsStarted}/1 capture root(s) enumerated, ` +
-        `${LIFETIME_LIMIT} entr(ies) this sweep, ${codexLimitBaseline.entriesThisTick} this tick ` +
-        `(budget 256 entries/50ms per tick, lifetime limit ${LIFETIME_LIMIT}), ` +
-        "0 candidate(s) pending",
+      // r2, review finding 3: the distinctive clause plus the numbers, each
+      // asserted on its own. The `===` pin this replaces went red on any
+      // correct reword of a string this check is not about, and the cheapest
+      // repair then was to drop the pin entirely.
+      codexLimitRow.reason.startsWith("local activity scan hit its lifetime entry limit") &&
+      codexLimitRow.reason.includes(
+        "activity scan hit its lifetime entry limit and restarts instead of resuming") &&
+      codexLimitRow.reason.includes(
+        `${codexLimitBaseline.rootsStarted}/1 capture root(s) enumerated`) &&
+      codexLimitRow.reason.includes(`${LIFETIME_LIMIT} entr(ies) this sweep`) &&
+      codexLimitRow.reason.includes(`${codexLimitBaseline.entriesThisTick} this tick`) &&
+      codexLimitRow.reason.includes("budget 256 entries/50ms per tick") &&
+      codexLimitRow.reason.includes(`lifetime limit ${LIFETIME_LIMIT}`) &&
+      codexLimitRow.reason.includes("0 candidate(s) pending") &&
+      !codexLimitRow.reason.includes("activity scan still sweeping") &&
+      !codexLimitRow.reason.includes("activity scan complete") &&
+      rendersTheR1ZeroSweep(codexLimitRow.reason) === false &&
+      // The tick count the reason prints is interpolated from the receipt, so
+      // it is pinned by a number of its own (r2, review finding 6).
+      codexLimitBaseline.entriesThisTick === LIFETIME_LIMIT &&
+      codexLimitRow.activityState.scan?.entriesThisSweep === LIFETIME_LIMIT &&
+      codexLimitRow.activityState.scan?.lifetimeEntryLimit === LIFETIME_LIMIT,
       { baseline: codexLimitBaseline, capture: codexLimitCapture,
         scanState: codexLimitRow.activityState.scanState, status: codexLimitRow.status,
         reason: codexLimitRow.reason });
     limitCodexBuffer.close();
+
+    // Bead eco-6hoxj.77 r2, review finding 2(a): the check above reaches its
+    // limit inside a single tick, so `entriesThisSweep === entriesThisTick` and
+    // nothing separates "the limit ended this tick" from "the limit ended this
+    // sweep". A real host only ever reaches its limit across many cadences.
+    // 900 files against a 600-entry limit: the cursor crosses several 256-entry
+    // ticks, and the cadence that hits the limit still may not claim a sweep.
+    const MULTI_TICK_LIMIT = 600;
+    const MULTI_TICK_FILES = 900;
+    /** Cadence after cadence on one tailer until the sweep hits its limit. */
+    const sweepToItsLimit = async <T extends { limitReached: boolean }>(
+      tick: () => Promise<T>,
+    ) => {
+      let previous: T | null = null;
+      let scan: T | null = null;
+      for (let cadence = 1; cadence <= 64; cadence += 1) {
+        previous = scan;
+        scan = await tick();
+        if (scan.limitReached) return { cadences: cadence, previous, scan };
+      }
+      return { cadences: 64, previous, scan: scan! };
+    };
+    /** The receipt this cadence published, as the health ladder renders it. */
+    const codexScanRow = (fixture: LocalEventBuffer, scan: Record<string, unknown>) => {
+      fixture.projection.recordCaptureActivity({
+        source: "codex",
+        lastActivityAt: null,
+        filesToday: 0,
+        discoveryEntries: Number(scan.entriesThisTick),
+        lastScanAt: new Date(NOW.getTime() - 30_000).toISOString(),
+        truncated: true,
+        scan: scan as never,
+      });
+      settle(fixture, NOW, 30);
+      return (readySnapshot(fixture, 30).status.health as {
+        sources: Array<{ source: string; status: string; reason: string;
+          activityState: { scanState: string; scan: Record<string, unknown> | null } }>;
+      }).sources.find((row) => row.source === "codex")!;
+    };
+    const multiCodexRoots = codexRoots(1, 1, "limit-multi", MULTI_TICK_FILES / 2);
+    const multiCodexBuffer = new LocalEventBuffer(
+      path.join(root, "capture-health-codex-limit-multi.sqlite"));
+    multiCodexBuffer.append(event({
+      source: "codex", eventType: "usage_rollout", sessionId: uuid(930_005),
+      observedAt: new Date(NOW.getTime() - 3 * 60 * 60_000).toISOString(),
+      inputTokens: 1_200, outputTokens: 340, costUsd: 0.004,
+    }));
+    settle(multiCodexBuffer, NOW, 30);
+    const multiCodexTailer = new RolloutTailer(
+      multiCodexBuffer, multiCodexRoots[0]!.directory, () => [], undefined, multiCodexRoots);
+    const codexMultiLimit = await sweepToItsLimit(async () => (await multiCodexTailer.scan({
+      scope: "recent", now: NOW, discoveryLimit: MULTI_TICK_LIMIT,
+      automatic: { phase: "baseline", budget: new CaptureWorkBudget() },
+    })).activity.scan!);
+    multiCodexTailer.close();
+    const codexMultiRow = codexScanRow(multiCodexBuffer, codexMultiLimit.scan as never);
+    check("rollout_sweep_that_reaches_its_limit_across_cadences_never_reports_a_complete_sweep",
+      codexMultiLimit.cadences > 1 &&
+      codexMultiLimit.scan.limitReached === true &&
+      codexMultiLimit.scan.sweepComplete === false &&
+      codexMultiLimit.scan.converging === false &&
+      codexMultiLimit.scan.entriesThisSweep === MULTI_TICK_LIMIT &&
+      codexMultiLimit.scan.entriesThisTick > 0 &&
+      // The limit ended the sweep, not the tick: this cadence visited a small
+      // fraction of the entries the sweep has.
+      codexMultiLimit.scan.entriesThisSweep > codexMultiLimit.scan.entriesThisTick &&
+      codexMultiLimit.scan.lifetimeEntryLimit === MULTI_TICK_LIMIT &&
+      codexMultiLimit.previous !== null &&
+      codexMultiLimit.previous.limitReached === false &&
+      codexMultiLimit.previous.sweepComplete === false &&
+      codexMultiLimit.previous.converging === true &&
+      codexMultiLimit.previous.entriesThisSweep > 0 &&
+      codexMultiLimit.previous.entriesThisSweep < MULTI_TICK_LIMIT &&
+      codexMultiRow.status === "amber" &&
+      codexMultiRow.activityState.scanState === "limit_reached" &&
+      codexMultiRow.activityState.scan?.sweepComplete === false &&
+      codexMultiRow.activityState.scan?.limitReached === true &&
+      codexMultiRow.reason.includes(
+        "activity scan hit its lifetime entry limit and restarts instead of resuming") &&
+      codexMultiRow.reason.includes(`${MULTI_TICK_LIMIT} entr(ies) this sweep`) &&
+      codexMultiRow.reason.includes(`lifetime limit ${MULTI_TICK_LIMIT}`) &&
+      rendersTheR1ZeroSweep(codexMultiRow.reason) === false,
+      { cadences: codexMultiLimit.cadences, previous: codexMultiLimit.previous,
+        scan: codexMultiLimit.scan, scanState: codexMultiRow.activityState.scanState,
+        status: codexMultiRow.status, reason: codexMultiRow.reason });
+    multiCodexBuffer.close();
 
     // The same limit-exhausted cadence on the other tailer. `TranscriptTailer`
     // sweeps capture roots 1:1, so the receipt is the same shape with no
@@ -2096,37 +2255,141 @@ async function main() {
       claudeLimitRow.activityState.scan?.converging === false &&
       claudeLimitRow.activityState.scanState === "limit_reached" &&
       claudeLimitRow.status === "amber" &&
-      claudeLimitRow.reason === "local activity scan hit its lifetime entry limit and restarts " +
-        `instead of resuming — ${claudeLimitBaseline.rootsStarted}/1 capture root(s) enumerated, ` +
-        `${LIFETIME_LIMIT} entr(ies) this sweep, ${claudeLimitBaseline.entriesThisTick} this tick ` +
-        `(budget 256 entries/50ms per tick, lifetime limit ${LIFETIME_LIMIT}), ` +
-        "0 candidate(s) pending",
+      // The twin of the rollout pin above, reworded the same way (finding 3).
+      claudeLimitRow.reason.startsWith("local activity scan hit its lifetime entry limit") &&
+      claudeLimitRow.reason.includes(
+        "activity scan hit its lifetime entry limit and restarts instead of resuming") &&
+      claudeLimitRow.reason.includes(
+        `${claudeLimitBaseline.rootsStarted}/1 capture root(s) enumerated`) &&
+      claudeLimitRow.reason.includes(`${LIFETIME_LIMIT} entr(ies) this sweep`) &&
+      claudeLimitRow.reason.includes(`${claudeLimitBaseline.entriesThisTick} this tick`) &&
+      claudeLimitRow.reason.includes("budget 256 entries/50ms per tick") &&
+      claudeLimitRow.reason.includes(`lifetime limit ${LIFETIME_LIMIT}`) &&
+      claudeLimitRow.reason.includes("0 candidate(s) pending") &&
+      !claudeLimitRow.reason.includes("activity scan still sweeping") &&
+      !claudeLimitRow.reason.includes("activity scan complete") &&
+      rendersTheR1ZeroSweep(claudeLimitRow.reason) === false &&
+      claudeLimitBaseline.entriesThisTick === LIFETIME_LIMIT &&
+      claudeLimitRow.activityState.scan?.entriesThisSweep === LIFETIME_LIMIT &&
+      claudeLimitRow.activityState.scan?.lifetimeEntryLimit === LIFETIME_LIMIT,
       { baseline: claudeLimitBaseline, capture: claudeLimitCapture,
         scanState: claudeLimitRow.activityState.scanState, status: claudeLimitRow.status,
         reason: claudeLimitRow.reason });
     limitClaudeBuffer.close();
+
+    // The same many-tick limit sweep on the other tailer: 900 flat transcripts
+    // against the same 600-entry limit (finding 2(a)).
+    const multiClaudeRoots = claudeRoots(1, 1, "limit-multi", MULTI_TICK_FILES);
+    const multiClaudeBuffer = claudeFixture("claude-limit-multi");
+    const multiClaudeTailer = new TranscriptTailer(
+      multiClaudeBuffer, multiClaudeRoots[0]!.directory, undefined, multiClaudeRoots);
+    const claudeMultiLimit = await sweepToItsLimit(async () => (await multiClaudeTailer.scan({
+      scope: "recent", now: NOW, discoveryLimit: MULTI_TICK_LIMIT,
+      automatic: { phase: "baseline", budget: new CaptureWorkBudget() },
+    })).activity.scan!);
+    multiClaudeTailer.close();
+    const claudeMultiRow = claudeScanRow(multiClaudeBuffer, claudeMultiLimit.scan as never);
+    check("transcript_sweep_that_reaches_its_limit_across_cadences_never_reports_a_complete_sweep",
+      claudeMultiLimit.cadences > 1 &&
+      claudeMultiLimit.scan.limitReached === true &&
+      claudeMultiLimit.scan.sweepComplete === false &&
+      claudeMultiLimit.scan.converging === false &&
+      claudeMultiLimit.scan.entriesThisSweep === MULTI_TICK_LIMIT &&
+      claudeMultiLimit.scan.entriesThisTick > 0 &&
+      claudeMultiLimit.scan.entriesThisSweep > claudeMultiLimit.scan.entriesThisTick &&
+      claudeMultiLimit.scan.lifetimeEntryLimit === MULTI_TICK_LIMIT &&
+      claudeMultiLimit.previous !== null &&
+      claudeMultiLimit.previous.limitReached === false &&
+      claudeMultiLimit.previous.sweepComplete === false &&
+      claudeMultiLimit.previous.converging === true &&
+      claudeMultiLimit.previous.entriesThisSweep > 0 &&
+      claudeMultiLimit.previous.entriesThisSweep < MULTI_TICK_LIMIT &&
+      claudeMultiRow.status === "amber" &&
+      claudeMultiRow.activityState.scanState === "limit_reached" &&
+      claudeMultiRow.activityState.scan?.sweepComplete === false &&
+      claudeMultiRow.activityState.scan?.limitReached === true &&
+      claudeMultiRow.reason.includes(
+        "activity scan hit its lifetime entry limit and restarts instead of resuming") &&
+      claudeMultiRow.reason.includes(`${MULTI_TICK_LIMIT} entr(ies) this sweep`) &&
+      claudeMultiRow.reason.includes(`lifetime limit ${MULTI_TICK_LIMIT}`) &&
+      rendersTheR1ZeroSweep(claudeMultiRow.reason) === false,
+      { cadences: claudeMultiLimit.cadences, previous: claudeMultiLimit.previous,
+        scan: claudeMultiLimit.scan, scanState: claudeMultiRow.activityState.scanState,
+        status: claudeMultiRow.status, reason: claudeMultiRow.reason });
+
+    // Review finding 2(b): the production default. Every limit fixture in this
+    // file narrows the limit, so a `sweepComplete` guard that only holds while
+    // `lifetimeEntryLimit` is below the shipped cap passes all of them and is
+    // wrong on every host running the 100000 default. No proof can visit 100000
+    // entries, so drive a real cursor until it runs out of entries and move its
+    // two numbers to the cap: the receipt function must still refuse to call
+    // that sweep complete.
+    const exhaustedCursor = new IncrementalJsonlDiscovery(
+      [multiClaudeRoots[0]!.directory],
+      { recursive: true, matches: (name) => name.endsWith(".jsonl"), maxEntries: 8 },
+    );
+    for (let step = 0; step < 64 && !exhaustedCursor.progress().limitReached &&
+      !exhaustedCursor.progress().finished; step += 1) {
+      await exhaustedCursor.collect(new CaptureWorkBudget(), { maxEntries: 4 });
+    }
+    const exhausted = exhaustedCursor.progress();
+    const atTheDefaultCap: DiscoveryProgress = {
+      ...exhausted,
+      entriesVisited: AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP,
+      lifetimeEntryLimit: AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP,
+    };
+    const cappedReceipt = captureScanProgress({
+      discovery: atTheDefaultCap,
+      configuredRoots: 1,
+      eligibleRoots: 1,
+      pendingFiles: 0,
+      entriesThisTick: 24,
+      deferredBeforeIo: false,
+      lifetimeEntryLimit: AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP,
+    });
+    const cappedBuffer = claudeFixture("claude-cap");
+    const cappedRow = claudeScanRow(cappedBuffer, cappedReceipt as never);
+    check("a_sweep_that_exhausts_the_default_lifetime_cap_never_reports_a_complete_sweep",
+      AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP === 100_000 &&
+      exhausted.limitReached === true && exhausted.finished === true &&
+      atTheDefaultCap.lifetimeEntryLimit === 100_000 &&
+      cappedReceipt.limitReached === true &&
+      cappedReceipt.sweepComplete === false &&
+      cappedReceipt.converging === false &&
+      cappedReceipt.entriesThisSweep === 100_000 &&
+      cappedReceipt.lifetimeEntryLimit === 100_000 &&
+      cappedRow.status === "amber" &&
+      cappedRow.activityState.scanState === "limit_reached" &&
+      cappedRow.activityState.scan?.sweepComplete === false &&
+      cappedRow.activityState.scan?.limitReached === true &&
+      cappedRow.reason.includes(
+        "activity scan hit its lifetime entry limit and restarts instead of resuming") &&
+      cappedRow.reason.includes("lifetime limit 100000") &&
+      rendersTheR1ZeroSweep(cappedRow.reason) === false,
+      { exhausted, cappedReceipt, scanState: cappedRow.activityState.scanState,
+        status: cappedRow.status, reason: cappedRow.reason });
+    cappedBuffer.close();
+    multiClaudeBuffer.close();
 
     // The `TranscriptTailer` twins of `a_cadence_that_retires_its_cursor_
     // reports_the_sweep_it_ran`, shape for shape. Without the transcript half
     // of the retirement snapshot both of these publish the r1 receipt —
     // `0/1 capture root(s) enumerated, 0 entr(ies) this sweep` — which is the
     // original bead symptom on the claude_code host that filed it.
-    /**
-     * The r1 receipt as it rendered: a zero sweep under a sweeping reason. The
-     * digit boundary matters — `20 entr(ies) this sweep` contains
-     * `0 entr(ies) this sweep` as a substring.
-     */
-    const rendersTheR1ZeroSweep = (reason: string) =>
-      /(?<![0-9])0 entr\(ies\) this sweep/.test(reason) ||
-      /(?<![0-9])0\/[0-9]+ capture root\(s\) enumerated/.test(reason);
     const twinDrainRoots = claudeRoots(1, 1, "twin-drain", 2);
     const twinDrainBuffer = claudeFixture("claude-twin-drain");
     const twinDrainTailer = new TranscriptTailer(
       twinDrainBuffer, twinDrainRoots[0]!.directory, undefined, twinDrainRoots);
-    const transcriptDrained = (await twinDrainTailer.scan({
+    const twinDrainTick = async () => (await twinDrainTailer.scan({
       scope: "recent", now: NOW,
       automatic: { phase: "capture", budget: new CaptureWorkBudget() },
     })).activity.scan!;
+    const transcriptDrained = await twinDrainTick();
+    // The transcript half of finding 1: more transcripts arrive, the next
+    // cadence opens a fresh cursor, and the receipt must be that cursor's.
+    claudeRoots(1, 1, "twin-drain", 600);
+    const transcriptDrainedNext = await twinDrainTick();
+    const transcriptDrainedThird = await twinDrainTick();
     twinDrainTailer.close();
     const transcriptDrainedRow = claudeScanRow(twinDrainBuffer, transcriptDrained as never);
     check("a_transcript_cadence_that_retires_its_cursor_reports_the_sweep_it_ran",
@@ -2147,10 +2410,14 @@ async function main() {
     const twinRestartBuffer = claudeFixture("claude-twin-restart");
     const twinRestartTailer = new TranscriptTailer(
       twinRestartBuffer, twinRestartRoots[0]!.directory, undefined, twinRestartRoots);
-    const transcriptRestarted = (await twinRestartTailer.scan({
+    const twinRestartTick = async () => (await twinRestartTailer.scan({
       scope: "recent", now: NOW,
       automatic: { phase: "baseline", budget: new CaptureWorkBudget() },
     })).activity.scan!;
+    const transcriptRestarted = await twinRestartTick();
+    claudeRoots(1, 1, "twin-restart", 600);
+    const transcriptRestartedNext = await twinRestartTick();
+    const transcriptRestartedThird = await twinRestartTick();
     twinRestartTailer.close();
     const transcriptRestartedRow = claudeScanRow(twinRestartBuffer, transcriptRestarted as never);
     check("a_transcript_cadence_that_restarts_its_sweep_reports_the_sweep_it_ran",
@@ -2166,6 +2433,26 @@ async function main() {
         `${transcriptRestarted.entriesThisSweep} entr(ies) this sweep`) &&
       rendersTheR1ZeroSweep(transcriptRestartedRow.reason) === false,
       { restarted: transcriptRestarted, reason: transcriptRestartedRow.reason });
+    check("a_transcript_cadence_after_a_retirement_reports_the_new_sweep_not_the_retired_one",
+      transcriptDrainedNext.converging === true &&
+      transcriptDrainedNext.sweepComplete === false &&
+      transcriptDrainedNext.limitReached === false &&
+      transcriptDrainedNext.entriesThisSweep > 0 &&
+      transcriptDrainedNext.entriesThisSweep !== transcriptDrained.entriesThisSweep &&
+      transcriptDrainedThird.converging === true &&
+      transcriptDrainedThird.sweepComplete === false &&
+      transcriptDrainedThird.entriesThisSweep > transcriptDrainedNext.entriesThisSweep &&
+      transcriptRestartedNext.converging === true &&
+      transcriptRestartedNext.sweepComplete === false &&
+      transcriptRestartedNext.limitReached === false &&
+      transcriptRestartedNext.entriesThisSweep > 0 &&
+      transcriptRestartedNext.entriesThisSweep !== transcriptRestarted.entriesThisSweep &&
+      transcriptRestartedThird.converging === true &&
+      transcriptRestartedThird.sweepComplete === false &&
+      transcriptRestartedThird.entriesThisSweep > transcriptRestartedNext.entriesThisSweep,
+      { drained: transcriptDrained, drainedNext: transcriptDrainedNext,
+        drainedThird: transcriptDrainedThird, restarted: transcriptRestarted,
+        restartedNext: transcriptRestartedNext, restartedThird: transcriptRestartedThird });
     twinRestartBuffer.close();
 
     codexBuffer.close();
