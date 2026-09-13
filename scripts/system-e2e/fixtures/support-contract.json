@@ -5,12 +5,12 @@
     {
       "name": "install_doctor",
       "kind": "json_result",
-      "expectedArtifactDigest": "sha256:a63865948213aa1edc977cf51db35525170f8336066ff9ac22186c2738d0673b"
+      "expectedArtifactDigest": "sha256:00c0b62316812a90a36cc834919cf632bfe898b205a36a7d89b71fab77d0ff2a"
     },
     {
       "name": "transactional_join",
       "kind": "json_result",
-      "expectedArtifactDigest": "sha256:68d468be1208fe0894ea2860c913fdf9c9fe99562f48d317379f295f3aaea4f0"
+      "expectedArtifactDigest": "sha256:f8b800aaa7b1ff382fa41587b3dd0882584aae3d3a54328ee65333ca4c3d77bb"
     },
     {
       "name": "metadata_only_privacy",
