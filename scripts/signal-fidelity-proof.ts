@@ -1,6 +1,6 @@
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = process.env.PLIMSOLL_PROOF_CLOCK_CASE === "1" ? null : createProofCompletion("signal-fidelity", 107);
+const completion = process.env.PLIMSOLL_PROOF_CLOCK_CASE === "1" ? null : createProofCompletion("signal-fidelity", 108);
 /**
  * Signal-fidelity proof for the v2 collector capture path.
  *
@@ -2028,7 +2028,6 @@ async function main() {
   );
 
   // 8. Retention prune: raw rows age out even when they were never uploaded.
-  await new Promise((resolve) => setTimeout(resolve, 5));
   buffer.append(
     aiInteractionEventSchema.parse({
       id: "prune-survivor-0000",
@@ -2045,7 +2044,14 @@ async function main() {
     }),
     [],
   );
-  const pruned = buffer.prune(0);
+  // prune() derives its cutoff from `now` and selects `created_at < cutoff`, so with
+  // a zero-day window a row stamped in the prune call's own millisecond is not
+  // strictly older and is not expired. Read the row's stamp back and inject a cutoff
+  // one millisecond past it instead of hoping the wall clock ticks in between.
+  const survivorCreatedAt = (buffer.database
+    .prepare(`select created_at as createdAt from buffered_events where id = ?`)
+    .get("prune-survivor-0000") as { createdAt: string }).createdAt;
+  const pruned = buffer.prune(0, { now: new Date(Date.parse(survivorCreatedAt) + 1) });
   const survivor = buffer.database
     .prepare(`select count(*) as n from buffered_events where uploaded_at is null`)
     .get() as { n: number };
@@ -2055,7 +2061,58 @@ async function main() {
   check(
     "retention_prune_expires_unuploaded_history_with_receipt",
     pruned.events > 0 && survivor.n === 0 && expiryReceipt?.reason === "retention_window_elapsed",
-    JSON.stringify({ pruned: pruned.events, unuploadedSurvivors: survivor.n, expiryReceipt }),
+    JSON.stringify({
+      pruned: pruned.events,
+      unuploadedSurvivors: survivor.n,
+      survivorCreatedAt,
+      cutoff: pruned.cutoff,
+      expiryReceipt,
+    }),
+  );
+
+  // The control for the check above: the same-millisecond row the wall clock used to
+  // produce by luck, produced on purpose. A cutoff equal to the row's own stamp must
+  // leave it in place and write no receipt, which is what `<` means; if that ever
+  // becomes `<=`, this goes red instead of the check above going red one run in three.
+  buffer.append(
+    aiInteractionEventSchema.parse({
+      id: "prune-boundary-0000",
+      tenantId: "local",
+      source: "claude_code",
+      dataMode: "metadata",
+      eventType: "usage_transcript",
+      observedAt: "2020-01-01T00:00:00.000Z",
+      sessionId: "99990000-1111-4222-8333-444455557777",
+      actionClass: "other",
+      inputTokens: 1,
+      outputTokens: 1,
+      metadata: { usageSource: "transcript" },
+    }),
+    [],
+  );
+  const boundaryCreatedAt = (buffer.database
+    .prepare(`select created_at as createdAt from buffered_events where id = ?`)
+    .get("prune-boundary-0000") as { createdAt: string }).createdAt;
+  const boundaryPrune = buffer.prune(0, { now: new Date(boundaryCreatedAt) });
+  const boundarySurvivors = buffer.database
+    .prepare(`select count(*) as n from buffered_events where uploaded_at is null`)
+    .get() as { n: number };
+  const boundaryReceipt = buffer.database
+    .prepare(`select reason from raw_retention_receipts where event_id = ?`)
+    .get("prune-boundary-0000") as { reason: string } | undefined;
+  check(
+    "retention_prune_cutoff_is_strict_so_a_same_millisecond_row_survives",
+    boundaryPrune.cutoff === boundaryCreatedAt &&
+      boundaryPrune.events === 0 &&
+      boundarySurvivors.n === 1 &&
+      boundaryReceipt === undefined,
+    JSON.stringify({
+      pruned: boundaryPrune.events,
+      unuploadedSurvivors: boundarySurvivors.n,
+      rowCreatedAt: boundaryCreatedAt,
+      cutoff: boundaryPrune.cutoff,
+      expiryReceipt: boundaryReceipt ?? null,
+    }),
   );
 
   buffer.close();
