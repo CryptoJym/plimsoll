@@ -327,6 +327,17 @@ export type HistoryCoverageIncompleteReason =
 
 export type HistoryCoverageSource = "codex" | "claude_code";
 
+/**
+ * Bead eco-6hoxj.63: the status surface enumerates every configured source.
+ * Grok history is hook-delivered — there is no local transcript or rollout file
+ * to backfill — so it is reported with its own status rather than left absent,
+ * and it never participates in the file-backfill completeness verdict.
+ */
+export const HOOK_DELIVERED_COVERAGE_SOURCES = ["grok"] as const;
+export type HookDeliveredCoverageSource = (typeof HOOK_DELIVERED_COVERAGE_SOURCES)[number];
+export type HistoryCoverageStatusSource = HistoryCoverageSource | HookDeliveredCoverageSource;
+export const HISTORY_IS_HOOK_DELIVERED = "history_is_hook_delivered" as const;
+
 type FullScanCounters = {
   filesSeen: number;
   filesRead: number;
@@ -365,9 +376,9 @@ type PersistedHistoryCoverage = {
 };
 
 export type HistoryCoverageSourceStatus = {
-  source: HistoryCoverageSource;
-  status: "complete" | "incomplete";
-  reason: HistoryCoverageIncompleteReason | null;
+  source: HistoryCoverageStatusSource;
+  status: "complete" | "incomplete" | "hook_delivered";
+  reason: HistoryCoverageIncompleteReason | typeof HISTORY_IS_HOOK_DELIVERED | null;
   completedAt: string | null;
   invalidatedAt: string | null;
   lastFullScan: CompletedFullScan | null;
@@ -483,12 +494,15 @@ function readSourceCoverage(
  * creates this marker.
  */
 export function historyCoverageStatus(database: Database.Database): HistoryCoverageStatus {
-  const sources: HistoryCoverageSourceStatus[] = [
+  // The completeness verdict is the file-backfilled sources' verdict. A
+  // hook-delivered source has no full history scan to complete, so enumerating
+  // it must not turn every host's coverage incomplete (bead eco-6hoxj.63).
+  const backfilled: HistoryCoverageSourceStatus[] = [
     readSourceCoverage(database, "codex"),
     readSourceCoverage(database, "claude_code"),
   ];
-  const complete = sources.every((source) => source.status === "complete");
-  const missingCompletion = sources.some((source) => source.lastFullScan === null);
+  const complete = backfilled.every((source) => source.status === "complete");
+  const missingCompletion = backfilled.some((source) => source.lastFullScan === null);
   return {
     status: complete ? "complete" : "incomplete",
     reason: complete
@@ -496,7 +510,24 @@ export function historyCoverageStatus(database: Database.Database): HistoryCover
       : missingCompletion
         ? EXPLICIT_FULL_BACKFILL_NOT_COMPLETED
         : EXCLUDED_GENERATION_GROWTH_INVALIDATED,
-    sources,
+    sources: [
+      ...backfilled,
+      ...HOOK_DELIVERED_COVERAGE_SOURCES.map((source) => hookDeliveredCoverage(source)),
+    ],
+  };
+}
+
+function hookDeliveredCoverage(
+  source: HookDeliveredCoverageSource,
+): HistoryCoverageSourceStatus {
+  return {
+    source,
+    status: "hook_delivered",
+    reason: HISTORY_IS_HOOK_DELIVERED,
+    completedAt: null,
+    invalidatedAt: null,
+    lastFullScan: null,
+    latestFullAttempt: null,
   };
 }
 

@@ -8,6 +8,7 @@ import { usageFactFromEvent } from "../../shared/src/economics/event-adapter";
 
 import type { SubscriptionConfig } from "./dashboard-api";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
+import type { CaptureScanProgress } from "./capture-baseline";
 import {
   FINANCE_COVERAGE_SOURCES,
   ensureFinanceProvenanceSchema,
@@ -35,6 +36,78 @@ const FINANCE_CAPTURE_FRESHNESS_MS = 86_400_000;
 const CANONICAL_SHA256 = /^sha256:[0-9a-f]{64}$/;
 const UNLINKED_REPO = "__unlinked__";
 const UNLINKED_ACCOUNT = "__unlinked_account__";
+/**
+ * Sources the status surface always enumerates (bead eco-6hoxj.63: Claude Code,
+ * Codex and Grok — James 2026-09-11). A configured source is never absent: one
+ * with no events yet reports `no_events`, which can read neither as healthy nor
+ * as idle. `hook_only` sources have no local artifacts to scan; their capture
+ * truth is the ledger and their hook receipts.
+ */
+const CAPTURE_HEALTH_SOURCES=[
+  {source:"claude_code",capture:"local_scan"},
+  {source:"codex",capture:"local_scan"},
+  {source:"grok",capture:"hook_only"},
+] as const;
+/** A source whose newest ledger event is this recent is capturing right now. */
+const CAPTURE_EVENT_CADENCE_MS=60*60_000;
+/** Local activity must reach the projected ledger within this lag. */
+const CAPTURE_LAG_LIMIT_MS=10*60_000;
+/** Only activity this recent demands fresh capture (older = session over). */
+const CAPTURE_ACTIVITY_LOOKBACK_MS=60*60_000;
+/** A scan receipt older than this cannot confirm local quiet. */
+const CAPTURE_SCAN_STALE_MS=3*60_000;
+
+type CaptureScanState="complete"|"in_progress"|"limit_reached"|"deferred"|"error"|"unknown"|"not_applicable";
+
+function parseCaptureScan(value:unknown):CaptureScanProgress|null{
+  if(typeof value!=="string"||!value)return null;
+  try{
+    const parsed=JSON.parse(value) as Partial<CaptureScanProgress>;
+    return typeof parsed?.rootsTotal==="number"&&typeof parsed?.entriesThisSweep==="number"
+      ?parsed as CaptureScanProgress:null;
+  }catch{return null;}
+}
+
+function minutesAgo(ageMs:number){return `${Math.max(0,Math.round(ageMs/60_000))}m`;}
+/** A future-dated stamp, printed as the signed age `minutesAgo` would hide. */
+function minutesAhead(ageMs:number){return `${Math.round(-ageMs/60_000)}m`;}
+/**
+ * `rootsTotal` is the host's configured capture roots for the source; only the
+ * `ready` ones are eligible for a sweep. Name the difference when there is one
+ * so the denominator always matches the roots `plimsoll status` reports.
+ */
+function describeScanRoots(scan:CaptureScanProgress){
+  const eligible=typeof scan.rootsEligible==="number"?scan.rootsEligible:scan.rootsTotal;
+  return eligible===scan.rootsTotal
+    ?`${scan.rootsStarted}/${scan.rootsTotal} capture root(s) enumerated`
+    :`${scan.rootsStarted}/${eligible} eligible of ${scan.rootsTotal} configured capture root(s) enumerated`;
+}
+
+/**
+ * Why an incomplete activity scan is incomplete, in terms an operator can act
+ * on: the exact roots and entries enumerated against the exact budget that
+ * ended the cadence (bead eco-6hoxj.73).
+ */
+function describeCaptureScan(local:Record<string,unknown>|undefined):
+  {state:CaptureScanState;summary:string;scan:CaptureScanProgress|null}{
+  if(!local)return{state:"unknown",summary:"activity scan has not published a receipt yet",scan:null};
+  const scan=parseCaptureScan(local.scanJson);
+  const errorCode=local.lastErrorCode?String(local.lastErrorCode):null;
+  if(!Number(local.truncated)&&!errorCode)return{state:"complete",summary:"activity scan complete",scan};
+  const budget=scan
+    ?`${describeScanRoots(scan)}, `+
+      `${scan.entriesThisSweep} entr(ies) this sweep, ${scan.entriesThisTick} this tick `+
+      `(budget ${scan.entryBudgetPerTick} entries/${scan.wallBudgetMsPerTick}ms per tick, `+
+      `lifetime limit ${scan.lifetimeEntryLimit}), ${scan.pendingFiles} candidate(s) pending`
+    :`no scan budget receipt; ${Number(local.discoveryEntries??0)} entr(ies) this tick`;
+  if(errorCode)return{state:"error",summary:`activity scan error ${errorCode} — ${budget}`,scan};
+  if(scan?.limitReached)return{state:"limit_reached",
+    summary:`activity scan hit its lifetime entry limit and restarts instead of resuming — ${budget}`,scan};
+  if(scan?.deferredBeforeIo)return{state:"deferred",
+    summary:`activity scan deferred before filesystem work — ${budget}`,scan};
+  return{state:"in_progress",summary:`activity scan still sweeping — ${budget}`,scan};
+}
+
 const SAFE_SOURCES=new Set(["anthropic_admin","anthropic_usage","claude_code","codex","grok","github","openai_usage","manual","unknown"]);
 const SAFE_EVENT_TYPES=new Set(["session_start","session_stop","user_prompt_submit","assistant_response","tool_use","tool_result","otel_span","usage_rollout","usage_transcript","usage_live","unknown"]);
 const SAFE_ACTIONS=new Set(["continue","validate","test","edit","read","write","shell","mcp","browser","review","other"]);
@@ -212,6 +285,8 @@ export type CaptureActivityReceipt = {
   lastScanAt: string;
   error?: string | null;
   truncated?: boolean;
+  /** Bead eco-6hoxj.73: the budget and progress behind `truncated`. */
+  scan?: CaptureScanProgress | null;
 };
 
 type SnapshotCore = {
@@ -838,7 +913,8 @@ export class DashboardProjectionStore {
         discovery_entries integer not null default 0,
         last_scan_at text not null,
         last_error_code text,
-        truncated integer not null default 0
+        truncated integer not null default 0,
+        scan_json text
       );
     `);
     this.ensureProjectionSchemaColumns();
@@ -1170,6 +1246,14 @@ export class DashboardProjectionStore {
     }
     this.db.exec(`create index if not exists idx_dashboard_compact_cancellation_day
       on dashboard_compact_cancellations (bucket_day,raw_rowid)`);
+    const activityColumns = new Set(
+      (this.db.pragma("table_info(capture_activity_state)") as Array<{ name: string }>).map(
+        (row) => row.name,
+      ),
+    );
+    if (!activityColumns.has("scan_json")) {
+      this.db.exec(`alter table capture_activity_state add column scan_json text`);
+    }
     const factColumns = new Set(
       (this.db.pragma("table_info(dashboard_event_facts)") as Array<{ name: string }>).map(
         (row) => row.name,
@@ -2147,13 +2231,22 @@ export class DashboardProjectionStore {
     const errorCode = receipt.error ? sha256(`activity-error:${receipt.error}`).slice(0, 24) : null;
     this.db.prepare(
       `insert into capture_activity_state
-       (source,last_activity_at,files_today,discovery_entries,last_scan_at,last_error_code,truncated)
-       values (@source,@lastActivityAt,@filesToday,@discoveryEntries,@lastScanAt,@errorCode,@truncated)
+       (source,last_activity_at,files_today,discovery_entries,last_scan_at,last_error_code,truncated,scan_json)
+       values (@source,@lastActivityAt,@filesToday,@discoveryEntries,@lastScanAt,@errorCode,@truncated,@scanJson)
        on conflict(source) do update set last_activity_at=excluded.last_activity_at,
         files_today=excluded.files_today, discovery_entries=excluded.discovery_entries,
         last_scan_at=excluded.last_scan_at, last_error_code=excluded.last_error_code,
-        truncated=excluded.truncated`,
-    ).run({ ...receipt, errorCode, truncated: receipt.truncated ? 1 : 0 });
+        truncated=excluded.truncated, scan_json=excluded.scan_json`,
+    ).run({
+      source: receipt.source,
+      lastActivityAt: receipt.lastActivityAt,
+      filesToday: receipt.filesToday,
+      discoveryEntries: receipt.discoveryEntries,
+      lastScanAt: receipt.lastScanAt,
+      errorCode,
+      truncated: receipt.truncated ? 1 : 0,
+      scanJson: receipt.scan ? JSON.stringify(receipt.scan) : null,
+    });
     recordFinanceCaptureActivity(
       this.db,
       receipt.source,
@@ -3220,11 +3313,11 @@ export class DashboardProjectionStore {
     const activityRows=this.db.prepare(
       `select source,last_activity_at as lastActivityAt,files_today as filesToday,
         discovery_entries as discoveryEntries,last_scan_at as lastScanAt,
-        last_error_code as lastErrorCode,truncated from capture_activity_state`,
+        last_error_code as lastErrorCode,truncated,scan_json as scanJson from capture_activity_state`,
     ).all() as Array<Record<string,unknown>>;
     const activity=new Map(activityRows.map((row)=>[String(row.source),row]));
-    const sources=["claude_code","codex"].map((source)=>{
-      const local=activity.get(source);
+    const sources=CAPTURE_HEALTH_SOURCES.map(({source,capture})=>{
+      const local=capture==="local_scan"?activity.get(source):undefined;
       const latest=(this.db.prepare(
         `select last_event_at as lastEventAt,last_token_event_at as tokenAt
          from dashboard_source_lifetime where source=?`,
@@ -3234,25 +3327,80 @@ export class DashboardProjectionStore {
           sum(case when token_events>0 then 1 else 0 end) as tokenSessionsToday
          from dashboard_session_source_window where days=7 and source=? and ended_at>=?`,
       ).get(source,`${today}T00:00:00.000Z`) as {ledgerSessionsToday:number;tokenSessionsToday:number|null};
-      let status:"green"|"amber"|"red"="green"; let reason="capture current";
-      if(!local){status="amber";reason="local activity state unavailable — awaiting a tailer scan";}
-      else if(Number(local.truncated)||local.lastErrorCode){status="amber";reason="local activity scan incomplete — capture state is directional";}
-      else if(now.getTime()-Date.parse(String(local.lastScanAt))>3*60_000){status="amber";reason="local activity state is stale — quiet cannot be confirmed";}
-      else if(local.lastActivityAt){
-        const activityAge=now.getTime()-Date.parse(String(local.lastActivityAt));
-        const lag=latest.lastEventAt?Date.parse(String(local.lastActivityAt))-Date.parse(latest.lastEventAt):Infinity;
-        if(activityAge<=60*60_000&&lag>10*60_000){status="red";reason="recent local activity is not reaching the projected ledger";}
-        else if(Number(local.filesToday)>0&&(sessions.tokenSessionsToday??0)===0){status="red";reason=`${local.filesToday} local session file(s) today, 0 sessions captured with tokens`;}
-        else if(source==="codex"&&Number(local.filesToday)>0&&(sessions.tokenSessionsToday??0)*2<Number(local.filesToday)){status="amber";reason="rollout activity exceeds token-attributed capture";}
-        else reason=`capture current — ${sessions.tokenSessionsToday??0} session(s) with tokens today`;
-      } else reason="no local activity observed by the latest tailer scan";
-      return {source,lastEventAt:latest.lastEventAt,lastTokenEventAt:latest.tokenAt,
+      const scan=capture==="hook_only"
+        ?{state:"not_applicable" as CaptureScanState,
+          summary:"hook-delivered source — there is no local activity scan",scan:null}
+        :describeCaptureScan(local);
+      const eventAgeMs=latest.lastEventAt?now.getTime()-Date.parse(latest.lastEventAt):null;
+      // `eventAgeMs` is signed and `last_event_at` is a monotone max, so a single
+      // future-dated event would otherwise hold the freshness credit — and the
+      // green label — for the whole skew interval, on a source that may be dead.
+      // A stamp ahead of the clock is not evidence of capture; say so instead.
+      const eventsFuture=eventAgeMs!==null&&eventAgeMs<0;
+      const eventsFresh=eventAgeMs!==null&&eventAgeMs>=0&&eventAgeMs<=CAPTURE_EVENT_CADENCE_MS;
+      const futureReason=()=>`newest event is ${minutesAhead(eventAgeMs!)} in the future — `+
+        `clock skew or a future-dated producer; capture state cannot be judged`;
+      const neverCaptured=!latest.lastEventAt&&Number(sessions.ledgerSessionsToday??0)===0;
+      let status:"green"|"amber"|"red"|"no_events"="green"; let reason="capture current";
+      if(capture==="hook_only"){
+        if(neverCaptured){status="no_events";reason="configured source with no events captured yet";}
+        else if(eventsFuture){status="amber";reason=futureReason();}
+        else if(eventsFresh)reason=`capture current — ${sessions.tokenSessionsToday??0} session(s) with tokens today (hook-delivered)`;
+        else{status="amber";
+          reason=`no hook event for ${minutesAgo(eventAgeMs??0)} — hook delivery cannot be confirmed `+
+            `within the expected ${minutesAgo(CAPTURE_EVENT_CADENCE_MS)} cadence`;}
+      } else {
+        const activityAge=local?.lastActivityAt?now.getTime()-Date.parse(String(local.lastActivityAt)):null;
+        const lag=local?.lastActivityAt
+          ?(latest.lastEventAt?Date.parse(String(local.lastActivityAt))-Date.parse(latest.lastEventAt):Infinity)
+          :null;
+        // Capture truth first (bead eco-6hoxj.73). Local artifacts that are not
+        // reaching the ledger are the failure this label exists for, and a scan
+        // that is merely still sweeping must never mask or outrank them.
+        if(activityAge!==null&&activityAge<=CAPTURE_ACTIVITY_LOOKBACK_MS&&lag!==null&&lag>CAPTURE_LAG_LIMIT_MS){
+          status="red";reason="recent local activity is not reaching the projected ledger";
+        }
+        else if(Number(local?.filesToday??0)>0&&(sessions.tokenSessionsToday??0)===0){
+          status="red";reason=`${local!.filesToday} local session file(s) today, 0 sessions captured with tokens`;
+        }
+        else if(source==="codex"&&Number(local?.filesToday??0)>0&&
+          (sessions.tokenSessionsToday??0)*2<Number(local!.filesToday)){
+          status="amber";reason="rollout activity exceeds token-attributed capture";
+        }
+        // The ledger's own freshness is capture truth too: a source whose newest
+        // event is inside its expected cadence is demonstrably capturing, so it
+        // reads green even while its bounded sweep is still enumerating roots.
+        // A future-dated newest event carries no such credit: it can neither
+        // confirm capture nor be corrected by a later event.
+        else if(eventsFuture){status="amber";reason=futureReason();}
+        else if(eventsFresh)reason=`capture current — ${sessions.tokenSessionsToday??0} session(s) with tokens today`;
+        // Only when capture truth is silent may local scan bookkeeping decide.
+        else if(!local){status="amber";reason="local activity state unavailable — awaiting a tailer scan";}
+        else if(scan.state!=="complete"){status="amber";reason=`local ${scan.summary}`;}
+        else if(now.getTime()-Date.parse(String(local.lastScanAt))>CAPTURE_SCAN_STALE_MS){
+          status="amber";reason="local activity state is stale — quiet cannot be confirmed";
+        }
+        else if(local.lastActivityAt)reason=`capture current — ${sessions.tokenSessionsToday??0} session(s) with tokens today`;
+        else if(neverCaptured){status="no_events";reason="configured source with no events captured yet";}
+        else reason="no local activity observed by the latest tailer scan";
+      }
+      // An unfinished scan is always reported, and is only ever the reason when
+      // capture truth could not answer; it is never the overall amber reason.
+      const diagnostics=scan.state==="complete"||scan.state==="not_applicable"
+        ?[]:[`local ${scan.summary}`];
+      return {source,capture,lastEventAt:latest.lastEventAt,lastTokenEventAt:latest.tokenAt,
+        lastEventAgeMs:eventAgeMs,expectedEventCadenceMs:CAPTURE_EVENT_CADENCE_MS,
         localLastActivityAt:local?.lastActivityAt??null,localSessionsToday:Number(local?.filesToday??0),
         ledgerSessionsToday:sessions.ledgerSessionsToday,tokenSessionsToday:sessions.tokenSessionsToday??0,status,reason,
-        activityState:{lastScanAt:local?.lastScanAt??null,discoveryEntries:Number(local?.discoveryEntries??0),truncated:Boolean(local?.truncated)}};
+        diagnostics,
+        activityState:{lastScanAt:local?.lastScanAt??null,discoveryEntries:Number(local?.discoveryEntries??0),
+          truncated:Boolean(local?.truncated),scanState:scan.state,scan:scan.scan}};
     });
-    const rank={green:0,amber:1,red:2};
-    const overall=sources.reduce<"green"|"amber"|"red">((worst,row)=>rank[row.status]>rank[worst]?row.status:worst,"green");
+    // `no_events` is a distinct, visible status, not a degradation: an
+    // unconfigured or unused source must never make a capturing host amber.
+    const rank={green:0,no_events:0,amber:1,red:2};
+    const overall=sources.reduce<"green"|"amber"|"red">(
+      (worst,row)=>row.status!=="no_events"&&rank[row.status]>rank[worst]?row.status:worst,"green");
     return {generatedAt:now.toISOString(),overall,sources};
   }
 

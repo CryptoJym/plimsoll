@@ -195,6 +195,119 @@ Residual behaviour worth knowing:
 - An `http`/`curl` hook whose post never reaches a listening collector is still
   lost: there is no Plimsoll process on that path to spool it.
 
+### What the capture-health label means
+
+`captureHealth` in `plimsoll status --json`, the collector's `/status`, and
+`doctor` enumerates **every configured source** — Claude Code, Codex and Grok —
+and answers one question per source: *is what ran on this machine reaching the
+ledger?*
+
+- **green** — capture is current. Either the source's newest ledger event is
+  inside its expected cadence (60 minutes) and not ahead of the clock, or a
+  completed local scan agrees with what the ledger holds.
+- **amber** — capture cannot be confirmed, with the exact reason: local activity
+  that outran token attribution, a local activity scan that could not finish, a
+  scan receipt too old to confirm quiet, or a newest event dated in the future.
+  A future-dated event never earns the freshness credit: `last_event_at` only
+  ever moves forward, so a clock-skewed or future-dated producer would otherwise
+  hold a dead source green for the whole skew interval. The reason carries the
+  signed age (`newest event is 1500m in the future …`), as does `lastEventAgeMs`.
+- **red** — local activity is demonstrably *not* reaching the ledger.
+- **no_events** — the source is configured and enumerated, and has captured
+  nothing yet. It is never absent and never reads as healthy, and it does not
+  make the overall label amber.
+
+The local activity scan is **bounded**: one cadence enumerates at most 256
+directory entries within 50 ms, keeps its cursor, and resumes on the next tick.
+On a host with many capture roots one sweep therefore spans many cadences, and
+`activityState.truncated` stays true for all of them. That is the normal state of
+a converging scan, not a capture fault, so it is reported as a `diagnostics`
+entry and in `activityState.scan` — naming the roots enumerated, the entries
+visited this sweep and this tick, the per-tick budget and the candidates still
+pending — and it only becomes the source's `reason` when capture truth cannot
+answer. A host whose events are flowing reads green with the sweep reported
+alongside it (bead eco-6hoxj.73).
+
+`activityState.scan` is an operator field set, published for reading rather than
+consumed by the label:
+
+- `rootsTotal` / `rootsEligible` / `rootsStarted` — capture roots configured for
+  the source (the count `plimsoll status` reports for roots elsewhere), how many
+  of them are currently `ready` and so eligible for a sweep, and how many this
+  sweep has begun. All three are capture roots: the codex sweep enumerates a day
+  partition per root per day, and those are converted back before they are
+  published, so `rootsStarted` can never exceed `rootsEligible` and
+  `rootsEligible` can never exceed `rootsTotal`. When the two totals differ the
+  reason says so explicitly
+  (`4/22 eligible of 25 configured capture root(s) enumerated`).
+- `entriesThisSweep` / `entriesThisTick` / `pendingFiles` — enumeration progress
+  since the sweep began and in this cadence, and the candidates still awaiting
+  metadata. These advance during the first-install baseline sweep too.
+- `entryBudgetPerTick` / `wallBudgetMsPerTick` / `lifetimeEntryLimit` — the
+  budget that ended the cadence (256 entries, 50 ms) and the entries one cursor
+  may visit before it restarts instead of resuming (100000).
+- `converging` — a cursor exists and will resume on the next cadence; it stays
+  true for a cadence deferred before any filesystem work, which keeps its cursor.
+  False once the sweep finished, hit `limitReached`, or was retired inside the
+  cadence that reported it.
+- `sweepComplete` — this cadence's cursor finished a full sweep of every eligible
+  root. A sweep normally ends by being retired the moment it finishes — drained,
+  restarted or closed — and the receipt reports the numbers that cursor held
+  when it was retired, so a completed sweep is reported as complete. A cadence
+  with no cursor at all reports false: no cursor is no receipt. A cursor that
+  hit `limitReached` also reports false — it restarts, it did not finish.
+- `limitReached` / `deferredBeforeIo` — why the cadence ended, when it was not
+  the per-tick budget.
+
+`historyCoverage` answers a different question — has an explicit full backfill
+covered this source's retained history? — and stays independent of capture
+health. Grok is enumerated there with status `hook_delivered`: its history
+arrives by hook, so there is no local transcript to backfill, and it never
+participates in the completeness verdict.
+
+## Delivery retry scheduling
+
+The daemon distinguishes a completely failed upload cycle from one that already
+acknowledged useful work. A later failed batch in a partly successful cycle no
+longer escalates the whole host into a 10–60-minute exponential pause. The next
+regular upload cadence can retry eligible work; the outbox still owns each
+item's identity, attempt count, retry time and acknowledgement checks.
+
+Completely failing remote cycles retain exponential backoff with a one-hour
+ceiling. Direct SQLite contention, or a network failure while the maintenance
+circuit is open, does not add an exponential pause. This is a scheduling decision,
+not proof that every network failure originated on the host. A real remote HTTP
+refusal is not dismissed because local maintenance is unhealthy.
+
+A valid `Retry-After` on a transient remote refusal is a lower bound. Deferred
+outbox rows persist that lower bound, so reopening the ledger does not retry them
+early. A partly accepted lease can report both its acknowledged siblings and the
+remaining server-directed delay. Session follow-ups to that same endpoint are
+carried to a later cycle rather than sent inside the cooldown. Malformed delays
+are ignored; valid server
+cooldowns are not shortened to the normal cadence. A server delay is honoured
+only up to a ceiling: the scheduler waits at most one hour, and the persisted
+outbox floor never exceeds the configured `delivery.maxBackoffSeconds`, so a
+single overlong or mistyped `Retry-After` cannot park delivery indefinitely. The
+HTTP-date form is measured against the response's own `Date` header when it has
+one, so a skewed local clock does not inflate the wait. Witness-only probes have
+no leased event row: their extra scheduler cooldown remains process-local.
+
+Authenticated `/status` exposes `sync.failureStreak`, `sync.nextAttemptAt`,
+`sync.notBefore`, `sync.lastError` and `sync.lastCycleUploadedEvents`, and
+`plimsoll status` prints the same block by asking the daemon that owns it. A
+cycle that acknowledged work is not a failure: its server-directed wait is
+reported through `sync.notBefore`, with `sync.lastError` null. The next
+attempt is the earliest eligible cadence tick, not a promise of network traffic:
+per-item retry dates, open circuits, shutdown and an in-flight cycle still apply.
+The scheduling snapshot is process-local; only outbox retry dates survive a restart.
+Failure logs include a timestamp and an allowlisted code such as `ETIMEDOUT` or
+`ECONNRESET`, not arbitrary exception text, URLs or credentials.
+
+`pnpm proof:sync-backoff` exercises partial cycles, genuine outages, local
+pressure, real loopback HTTP refusal, persistent cooldowns, and cache-only status.
+The existing delivery, outbox and storage-retry proofs remain required.
+
 ## Quickstart
 
 Requirements: macOS, Node >=20 <25.
