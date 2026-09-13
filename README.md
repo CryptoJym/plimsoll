@@ -70,8 +70,10 @@ ways:
   Plimsoll command. When such a post is authorized and admitted but the local
   ledger stays busy past its retry budget, the collector writes the spool file
   itself and answers `202 {"status":"hook_spooled"}` instead of the old
-  `503 storage_busy_retry`. It answers 202 only after the file is durably
-  renamed into place; if the spool cannot be written (its bounds are reached,
+  `503 storage_busy_retry`. It answers 202 only after flushing the private
+  temporary file, publishing it by rename, and flushing the containing directory
+  (including the home entry for a newly created spool directory). A failed flush
+  is not acknowledged; if the spool cannot be written (its bounds are reached,
   the disk refuses, or `PLIMSOLL_HOOK_SPOOL=off`), the answer stays exactly
   today's 503 so the loss stays visible.
 - **The `forward-hook-http` client**, for a host whose hook runs that command.
@@ -127,6 +129,17 @@ timestamp the collector can actually use keeps it, untouched — usable is the
 collector's own test, so a numeric epoch, an empty string or a future-dated
 time is not a timestamp for this purpose and the hook's stamp is used instead,
 exactly as it would be live.
+
+`deferred` counts failed drain attempts, not unique events: the same queued
+file can add one on multiple ticks. Use `pendingFiles` and its age for the
+current backlog. The counter is cumulative and does not reset when it drains.
+
+File/directory synchronization uses the same OS primitives as the other durable
+local writers. This is not a hardware power-cut certification. If publication's
+directory flush fails, the writer tries to hide its unacknowledged envelope as a
+bounded orphan temporary and returns failure. If the filesystem also refuses
+that rollback, a visible unacknowledged file can remain; no universal exactly-once
+claim is made for storage failures or interrupted delivery.
 
 The counters (`recovered`, `rejected`, `deferred`, `spooledAtIntake` — how many
 events the collector's own intake spooled — pending files and their age) are in

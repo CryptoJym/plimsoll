@@ -39,7 +39,7 @@ import { resolveCollectorHome } from "./collector-home";
  *     so a 503 on that path used to lose the event outright. An authorized,
  *     admitted post whose ledger write stays busy past the retry budget is
  *     written here and answered `202 {"status":"hook_spooled"}`, after the
- *     rename and never before it. Everything the client's spool refuses to
+ *     file and directory flushes, never before them. Everything the client's spool refuses to
  *     hold, the intake's refuses too: it is the same `writeHookSpoolFile` with
  *     the same `blankForbiddenRawContent` in front of it.
  *
@@ -497,6 +497,7 @@ export function hookSpoolPending(home: string, nowMs = Date.now()): HookSpoolPen
 export type HookSpoolCounters = {
   recovered: number;
   rejected: number;
+  /** Failed drain attempts, not distinct files; use pendingFiles for backlog. */
   deferred: number;
   /**
    * Events the COLLECTOR'S OWN INTAKE spooled (bead eco-6hoxj.61, round r5):
@@ -551,8 +552,8 @@ export function readHookSpoolCounters(home: string): HookSpoolCounters {
  * forward from the file, the intake owns `spooledAtIntake` and carries the
  * drain's fields forward from the file.
  *
- * Never called before the spool file's rename succeeded: the counter is a
- * receipt for a durable event, not an intention.
+ * Never called before the spool file and directory flushes succeeded: the
+ * counter is a receipt for an accepted event, not an intention.
  */
 export function recordHookSpoolIntake(home: string) {
   const counters = readHookSpoolCounters(home);
@@ -572,6 +573,11 @@ export function writeHookSpoolCounters(home: string, counters: HookSpoolCounters
   fs.writeFileSync(temporary, `${JSON.stringify(counters)}\n`, { mode: 0o600 });
   fs.chmodSync(temporary, 0o600);
   fs.renameSync(temporary, target);
+}
+
+function syncHookSpoolDirectory(directory: string) {
+  const descriptor = fs.openSync(directory, "r");
+  try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
 }
 
 /**
@@ -601,6 +607,10 @@ export function writeHookSpoolFile(options: {
   };
   const content = JSON.stringify(envelope);
   const contentBytes = Buffer.byteLength(content);
+  let descriptor: number | undefined;
+  let temporary: string | undefined;
+  let target: string | undefined;
+  let published = false;
   try {
     const directory = hookSpoolDirectory(options.home);
     ensureSpoolDirectory(directory);
@@ -614,14 +624,35 @@ export function writeHookSpoolFile(options: {
       existing.reduce((total, file) => total + file.bytes, 0) + temporaries.remainingBytes;
     if (usedBytes + contentBytes > maxBytes) return null;
     const name = `${nowMs}-${process.pid}-${crypto.randomBytes(3).toString("hex")}.json`;
-    const target = path.join(directory, name);
-    const temporary = `${target}.tmp`;
-    fs.writeFileSync(temporary, content, { mode: 0o600 });
-    fs.chmodSync(temporary, 0o600);
+    target = path.join(directory, name);
+    temporary = `${target}.tmp`;
+    // Exclusive creation cannot truncate an existing temporary or follow a
+    // pre-existing symlink. Flush content and private mode before publication.
+    descriptor = fs.openSync(temporary, "wx", 0o600);
+    fs.writeFileSync(descriptor, content);
+    fs.fchmodSync(descriptor, 0o600);
+    fs.fsyncSync(descriptor);
+    fs.closeSync(descriptor);
+    descriptor = undefined;
+    // The canonical home already exists. Persist a newly created hook-spool
+    // directory's entry there as well as the envelope entry inside it.
+    syncHookSpoolDirectory(options.home);
     fs.renameSync(temporary, target);
+    published = true;
+    syncHookSpoolDirectory(directory);
     return { path: target };
   } catch {
+    // A failed directory flush is NOT durable acceptance. Hide this writer's
+    // unacknowledged envelope again when possible; the existing bounded orphan
+    // reaper owns its temporary. Never delete or overwrite another envelope.
+    if (published && target && temporary) {
+      try { fs.renameSync(target, temporary); } catch { /* I/O failure remains a refused write. */ }
+    }
     return null;
+  } finally {
+    if (descriptor !== undefined) {
+      try { fs.closeSync(descriptor); } catch { /* Preserve the refusal, not a cleanup exception. */ }
+    }
   }
 }
 
