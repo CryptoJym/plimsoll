@@ -506,6 +506,23 @@ export type HookSpoolCounters = {
    * it, it only carries the value it just read forward (`server.ts`).
    */
   spooledAtIntake: number;
+  /**
+   * Events the intake TRIED to spool and could not (review r1 of PR #321,
+   * finding N3): the same authorized, admitted, ledger-busy post, whose
+   * `writeHookSpoolFile` answered null because a directory bound was hit or
+   * the write itself failed. The event is lost and the client saw today's
+   * 503. Without it a host whose spool is broken reads exactly like a host
+   * with no busy events at all: every other counter stays 0.
+   *
+   * Counted only when the write was actually attempted. A refusal decided
+   * before the filesystem was touched — the kill switch is off above all —
+   * moves no counter and creates no directory; `enabled` already says that,
+   * and the `collector.err.log` rejection line names the reason either way.
+   *
+   * Owned by the intake, like `spooledAtIntake`: the drain only carries the
+   * value it just read forward.
+   */
+  refused: number;
   lastDrainAt: string | null;
 };
 
@@ -514,6 +531,7 @@ export const EMPTY_HOOK_SPOOL_COUNTERS: HookSpoolCounters = Object.freeze({
   rejected: 0,
   deferred: 0,
   spooledAtIntake: 0,
+  refused: 0,
   lastDrainAt: null,
 });
 
@@ -535,6 +553,7 @@ export function readHookSpoolCounters(home: string): HookSpoolCounters {
       rejected: counterValue(parsed.rejected),
       deferred: counterValue(parsed.deferred),
       spooledAtIntake: counterValue(parsed.spooledAtIntake),
+      refused: counterValue(parsed.refused),
       lastDrainAt: typeof parsed.lastDrainAt === "string" ? parsed.lastDrainAt : null,
     };
   } catch {
@@ -548,9 +567,9 @@ export function readHookSpoolCounters(home: string): HookSpoolCounters {
  * Read-modify-write of the counters file, synchronous from read to rename, so
  * it cannot interleave with the drain's own counter write inside the daemon's
  * single thread. The two writers own disjoint fields: the drain owns
- * `recovered`/`rejected`/`deferred`/`lastDrainAt` and carries `spooledAtIntake`
- * forward from the file, the intake owns `spooledAtIntake` and carries the
- * drain's fields forward from the file.
+ * `recovered`/`rejected`/`deferred`/`lastDrainAt` and carries the intake's
+ * `spooledAtIntake`/`refused` forward from the file, the intake owns
+ * `spooledAtIntake`/`refused` and carries the drain's fields forward.
  *
  * Never called before the spool file and directory flushes succeeded: the
  * counter is a receipt for an accepted event, not an intention.
@@ -560,6 +579,25 @@ export function recordHookSpoolIntake(home: string) {
   const next: HookSpoolCounters = {
     ...counters,
     spooledAtIntake: counters.spooledAtIntake + 1,
+  };
+  writeHookSpoolCounters(home, next);
+  return next;
+}
+
+/**
+ * Count one event the intake tried to spool and could not (finding N3).
+ *
+ * Same read-modify-write span and the same ownership rule as
+ * `recordHookSpoolIntake`, and the exact mirror of it: that one is the receipt
+ * for an event this host kept, this one is the receipt for an event this host
+ * lost after asking the spool to hold it. Only the caller that actually
+ * attempted the write calls this — see `HookSpoolCounters.refused`.
+ */
+export function recordHookSpoolRefusal(home: string) {
+  const counters = readHookSpoolCounters(home);
+  const next: HookSpoolCounters = {
+    ...counters,
+    refused: counters.refused + 1,
   };
   writeHookSpoolCounters(home, next);
   return next;
@@ -575,18 +613,68 @@ export function writeHookSpoolCounters(home: string, counters: HookSpoolCounters
   fs.renameSync(temporary, target);
 }
 
+/**
+ * The primitive by name, so the residual is visible here and not only in the
+ * README (review r1 of PR #321, finding N1; its mechanism corrected by review
+ * r1 of PR #325, F2): on macOS `fs.fsyncSync` is NOT a plain `fsync(2)`.
+ * libuv's `uv_fs_fsync` (`src/unix/fs.c`, `uv__fs_fsync`) asks for
+ * `fcntl(fd, F_FULLFSYNC)` there, and falls back to `F_BARRIERFSYNC` and then
+ * to `fsync(2)` only when the filesystem refuses it.
+ *
+ * So on a volume that honours `F_FULLFSYNC` — an internal APFS disk is the
+ * normal case — the drive IS told to flush its own volatile write cache, and
+ * these flushes close the POWER-LOSS window as well as the PROCESS-CRASH one
+ * (a 202 implies the bytes and the directory entry left this process). No
+ * native addon is needed for that. Where the filesystem refuses
+ * `F_FULLFSYNC` and libuv falls back, the process-crash window is still
+ * closed and the power-loss one is only narrowed: on an external or
+ * virtualised volume with a writeback cache, an acknowledged envelope can
+ * still be in the drive's cache when the power goes. That residual is a
+ * property of the volume, not of this code, and either way no hardware
+ * power-cut certification is claimed.
+ *
+ * The price is a real cache flush: ~10.5 ms per spooled envelope (~0.23 ms
+ * before the flushes), dominated by the envelope file and spool directory
+ * flushes at ~3.7-3.9 ms each. The home flush below is ~0.002 ms — see there.
+ */
 function syncHookSpoolDirectory(directory: string) {
   const descriptor = fs.openSync(directory, "r");
   try { fs.fsyncSync(descriptor); } finally { fs.closeSync(descriptor); }
 }
 
 /**
+ * Why a spool write was refused, for the operator log line only (finding N3):
+ *
+ *   spool_bounds        the directory is at its file or byte ceiling;
+ *   spool_write_failed  the filesystem refused a step of the durable write —
+ *                       create, write, chmod, flush or rename.
+ *
+ * A bounded vocabulary, never an `fs` message: those embed the absolute path
+ * they failed on, and home paths stay out of receipts everywhere else here.
+ */
+export type HookSpoolRefusal = "spool_bounds" | "spool_write_failed";
+
+export type HookSpoolWriteResult =
+  | { ok: true; path: string }
+  | { ok: false; refused: HookSpoolRefusal };
+
+/**
  * Write one event to the spool, or answer null when a directory bound is hit
  * or the write itself fails. Null means the caller keeps today's behaviour and
  * surfaces the rejection, so a full or broken spool is a visible loss rather
  * than a silent one.
+ *
+ * `writeHookSpoolEnvelope` is the same write, with the refusal named for the
+ * caller that reports it; this wrapper keeps the null answer every existing
+ * caller already branches on.
  */
-export function writeHookSpoolFile(options: {
+export function writeHookSpoolFile(options: Parameters<typeof writeHookSpoolEnvelope>[0]) {
+  const result = writeHookSpoolEnvelope(options);
+  return result.ok ? { path: result.path } : null;
+}
+
+/** The durable write itself. See `writeHookSpoolFile` for the contract. */
+export function writeHookSpoolEnvelope(options: {
   home: string;
   source: HookSpoolSource;
   body: string;
@@ -594,7 +682,7 @@ export function writeHookSpoolFile(options: {
   blanked?: number;
   nowMs?: number;
   limits?: Partial<HookSpoolBounds>;
-}): { path: string } | null {
+}): HookSpoolWriteResult {
   const maxFiles = options.limits?.maxFiles ?? HOOK_SPOOL_LIMITS.maxFiles;
   const maxBytes = options.limits?.maxBytes ?? HOOK_SPOOL_LIMITS.maxBytes;
   const nowMs = options.nowMs ?? Date.now();
@@ -619,10 +707,10 @@ export function writeHookSpoolFile(options: {
     // still in flight are charged to the byte ceiling (review r1, F4).
     const temporaries = reapHookSpoolTemporaries(options.home, nowMs);
     const existing = listHookSpoolFiles(options.home);
-    if (existing.length + 1 > maxFiles) return null;
+    if (existing.length + 1 > maxFiles) return { ok: false, refused: "spool_bounds" };
     const usedBytes =
       existing.reduce((total, file) => total + file.bytes, 0) + temporaries.remainingBytes;
-    if (usedBytes + contentBytes > maxBytes) return null;
+    if (usedBytes + contentBytes > maxBytes) return { ok: false, refused: "spool_bounds" };
     const name = `${nowMs}-${process.pid}-${crypto.randomBytes(3).toString("hex")}.json`;
     target = path.join(directory, name);
     temporary = `${target}.tmp`;
@@ -634,13 +722,19 @@ export function writeHookSpoolFile(options: {
     fs.fsyncSync(descriptor);
     fs.closeSync(descriptor);
     descriptor = undefined;
-    // The canonical home already exists. Persist a newly created hook-spool
-    // directory's entry there as well as the envelope entry inside it.
+    // The canonical home already exists, and its entry is flushed on EVERY
+    // write (review r1 of PR #321, finding N4: `ensureSpoolDirectory` does not
+    // report whether it created anything, so this call is unconditional) —
+    // that way a newly created hook-spool directory is never the unflushed
+    // link in the chain. ~0.002 ms of the ~10.5 ms (review r1 of PR #325,
+    // F4): the envelope goes into `hook-spool/`, so the canonical home is not
+    // modified by this write and its flush takes the unmodified-directory
+    // path — an `fsync` on an unmodified directory is nearly free.
     syncHookSpoolDirectory(options.home);
     fs.renameSync(temporary, target);
     published = true;
     syncHookSpoolDirectory(directory);
-    return { path: target };
+    return { ok: true, path: target };
   } catch {
     // A failed directory flush is NOT durable acceptance. Hide this writer's
     // unacknowledged envelope again when possible; the existing bounded orphan
@@ -648,7 +742,7 @@ export function writeHookSpoolFile(options: {
     if (published && target && temporary) {
       try { fs.renameSync(target, temporary); } catch { /* I/O failure remains a refused write. */ }
     }
-    return null;
+    return { ok: false, refused: "spool_write_failed" };
   } finally {
     if (descriptor !== undefined) {
       try { fs.closeSync(descriptor); } catch { /* Preserve the refusal, not a cleanup exception. */ }

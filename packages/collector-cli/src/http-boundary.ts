@@ -239,6 +239,25 @@ export function hookSourceFromPath(rawUrl: string | undefined): LocalProducerSou
   return undefined;
 }
 
+/**
+ * The route class an operator log line may name (review r1 of PR #321, the
+ * bead's route-diagnostics note). A CLOSED vocabulary computed from the
+ * request path and nothing else: the three hook endpoints by their literal
+ * path, `otlp` for every OTLP signal path including Gemini's source-qualified
+ * one, `other` for everything else. No part of a client-supplied URL — query,
+ * path segment or all of it — is ever carried into the log by this.
+ */
+export type RejectionRoute = "/hooks/claude-code" | "/hooks/codex" | "/hooks/grok" | "otlp" | "other";
+
+export function classifyRejectionRoute(rawUrl: string | undefined): RejectionRoute {
+  const source = hookSourceFromPath(rawUrl);
+  if (source === "claude_code") return "/hooks/claude-code";
+  if (source === "codex") return "/hooks/codex";
+  if (source === "grok") return "/hooks/grok";
+  if (isOtlpPath(rawUrl)) return "otlp";
+  return "other";
+}
+
 export type RequestBudget = {
   checkpoint: () => void;
   remainingMs: () => number;

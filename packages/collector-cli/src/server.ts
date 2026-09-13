@@ -44,6 +44,7 @@ import {
   assertHookSource,
   assertNoBrowserOrigin,
   canonicalOtlpTransportPath,
+  classifyRejectionRoute,
   createRequestBudget,
   createSourceRateLimiter,
   decodeBoundedRequestBody,
@@ -74,11 +75,13 @@ import {
   readHookSpoolFile,
   reapHookSpoolTemporaries,
   recordHookSpoolIntake,
+  recordHookSpoolRefusal,
   rejectHookSpoolFile,
   resolveHookSpoolHome,
   writeHookSpoolCounters,
-  writeHookSpoolFile,
+  writeHookSpoolEnvelope,
   type HookSpoolBounds,
+  type HookSpoolRefusal,
   type HookSpoolSource,
   type HookSpoolStatus,
 } from "./hook-spool";
@@ -415,6 +418,26 @@ export function createHookSpoolDrain(
     reapHookSpoolTemporaries(options.home, nowMs());
     const files = listHookSpoolFiles(options.home, maxFilesPerTick);
     if (files.length === 0) {
+      // A refused intake writes NO file, so on a host whose spool refuses
+      // everything this branch is the only one that ever runs (review r1 of
+      // PR #325, F1). `counters` is the sole input to `snapshot()`, and
+      // therefore to the daemon's HTTP `/status`: without this read it would
+      // keep the value it was given at construction forever, and `/status`
+      // would report `refused: 0` on exactly the failing host the counter
+      // exists to expose. The two intake-owned fields are refreshed from the
+      // file their owner writes; the drain's own fields stay in memory, where
+      // this tick's (zero) work is already accounted for. One bounded read of
+      // one small file per quiet tick, beside the directory scan this branch
+      // already does, and `readHookSpoolCounters` answers with zeros instead
+      // of throwing when the file is missing or unreadable, so it cannot stop
+      // the drain. Nothing is written back: a tick with no work changes no
+      // counter.
+      const intakeOwned = readHookSpoolCounters(options.home);
+      counters = {
+        ...counters,
+        spooledAtIntake: intakeOwned.spooledAtIntake,
+        refused: intakeOwned.refused,
+      };
       pending = hookSpoolPending(options.home, nowMs());
       return result;
     }
@@ -461,16 +484,19 @@ export function createHookSpoolDrain(
       // OTLP receiver and must never hold it for a whole tick.
       await new Promise<void>((resolve) => setImmediate(resolve));
     }
-    // `spooledAtIntake` belongs to the intake, which read-modify-writes this
-    // same file whenever it spools (`recordHookSpoolIntake`). Read it here and
-    // write it back unchanged: this read and the write below are one
+    // `spooledAtIntake` and `refused` belong to the intake, which
+    // read-modify-writes this same file whenever it spools or is refused
+    // (`recordHookSpoolIntake`, `recordHookSpoolRefusal`). Read them here and
+    // write them back unchanged: this read and the write below are one
     // synchronous span, so the daemon's single thread cannot interleave a
     // spool between them and lose an increment.
+    const intakeOwned = readHookSpoolCounters(options.home);
     counters = {
       recovered: counters.recovered + result.recovered,
       rejected: counters.rejected + result.rejected,
       deferred: counters.deferred + result.deferred,
-      spooledAtIntake: readHookSpoolCounters(options.home).spooledAtIntake,
+      spooledAtIntake: intakeOwned.spooledAtIntake,
+      refused: intakeOwned.refused,
       lastDrainAt: new Date(nowMs()).toISOString(),
     };
     try {
@@ -549,6 +575,30 @@ function isTrustedLocalWrite(request: http.IncomingMessage) {
     !origin || /^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin);
   return originOk && firstHeader(request.headers["x-plimsoll-local"]) === "1";
 }
+
+/**
+ * Why the intake did not spool a ledger-busy hook post (finding N3).
+ *
+ * `spool_bounds` and `spool_write_failed` come from the write itself and mean
+ * the filesystem was asked; the rest are decided before it, so `attempted` is
+ * false and no counter moves:
+ *
+ *   spool_disabled            PLIMSOLL_HOOK_SPOOL=off in the DAEMON's env;
+ *   spool_source_unsupported  a route source the spool cannot name;
+ *   spool_suppression_failed  the body did not survive pre-write blanking, so
+ *                             there is nothing this writer is allowed to keep;
+ *   spool_home_unresolved     no canonical home to write into.
+ */
+export type IntakeSpoolRefusal =
+  | HookSpoolRefusal
+  | "spool_disabled"
+  | "spool_source_unsupported"
+  | "spool_suppression_failed"
+  | "spool_home_unresolved";
+
+export type IntakeSpoolOutcome =
+  | { ok: true; path: string; source: HookSpoolSource }
+  | { ok: false; attempted: boolean; refused: IntakeSpoolRefusal };
 
 export function createCollectorServer(
   config: CollectorConfig,
@@ -752,30 +802,41 @@ export function createCollectorServer(
     window.suppressed += 1;
   };
   /**
-   * Write the refused post to the spool, or answer null so the caller keeps
-   * today's 503 exactly as it is. Same envelope, same blanking, same bounds,
-   * same write-temporary-then-rename durability as the client's spool —
-   * literally the same `writeHookSpoolFile` — and the caller answers 202 only
-   * after that rename returned.
+   * Write the refused post to the spool, or answer why it could not be
+   * written so the caller keeps today's 503 exactly as it is. Same envelope,
+   * same blanking, same bounds, same write-temporary-then-rename durability as
+   * the client's spool — literally the same write — and the caller answers 202
+   * only after that rename returned.
+   *
+   * A refusal now carries its reason and whether the filesystem was touched at
+   * all (review r1 of PR #321, finding N3): the counter below and the
+   * `collector.err.log` rejection line are the only two things that tell an
+   * operator a host is losing events rather than having none.
    */
   const spoolHookAtIntake = (
     source: LocalProducerSource,
     bodyText: string,
     receivedAtMs: number,
-  ) => {
-    if (!hookSpoolIntakeEnabled) return null;
+  ): IntakeSpoolOutcome => {
+    // The kill switch, the two pre-write refusals and an unresolvable home all
+    // answer before any byte is written, so none of them counts `refused` or
+    // creates a spool directory: `enabled` already reports the kill switch,
+    // and the rejection line names whichever one it was.
+    if (!hookSpoolIntakeEnabled) return { ok: false, attempted: false, refused: "spool_disabled" };
     // `/hooks/<source>` resolves only the three hook sources, so this is a
     // type narrowing rather than a filter; a source the spool cannot name is
     // refused rather than guessed.
-    if (!isHookSpoolSource(source)) return null;
+    if (!isHookSpoolSource(source)) {
+      return { ok: false, attempted: false, refused: "spool_source_unsupported" };
+    }
     // Suppressed BEFORE the write, with the collector's own DROP rule, exactly
     // as the client spool suppresses it: the spool is a local write that
     // happens before the collector's suppression can run.
     const blanked = blankForbiddenRawContent(bodyText);
-    if (!blanked) return null;
+    if (!blanked) return { ok: false, attempted: false, refused: "spool_suppression_failed" };
     const home = intakeSpoolHome();
-    if (home === null) return null;
-    const written = writeHookSpoolFile({
+    if (home === null) return { ok: false, attempted: false, refused: "spool_home_unresolved" };
+    const written = writeHookSpoolEnvelope({
       home,
       source,
       body: blanked.text,
@@ -785,7 +846,22 @@ export function createCollectorServer(
       nowMs: receivedAtMs,
       limits: options.hookSpoolLimits,
     });
-    if (!written) return null;
+    if (!written.ok) {
+      // The event is lost and the client is about to be told so. Count it in
+      // the same file the accepted ones are counted in — it survives exactly
+      // the situation that produced it, a ledger nobody can write — and treat
+      // a counters write that also failed the way an intake one is treated: a
+      // reporting gap, reported, never an extra loss.
+      try {
+        recordHookSpoolRefusal(home);
+      } catch (error) {
+        console.warn(JSON.stringify({
+          warning: "hook_spool_counters_write_failed",
+          code: errorCodeOnly(error),
+        }));
+      }
+      return { ok: false, attempted: true, refused: written.refused };
+    }
     try {
       recordHookSpoolIntake(home);
     } catch (error) {
@@ -796,7 +872,7 @@ export function createCollectorServer(
         code: errorCodeOnly(error),
       }));
     }
-    return { path: written.path, source };
+    return { ok: true, path: written.path, source };
   };
 
   const invalidateStatus = (body: Record<string, unknown>, reason: string) => {
@@ -1000,6 +1076,10 @@ export function createCollectorServer(
     // carries this into the envelope's `receivedAt`, so the drain replays the
     // event with the time it arrived here (bead eco-6hoxj.61).
     const receivedAtMs = Date.now();
+    // Set by the hook intake when it asked the spool to hold a ledger-busy
+    // post and the spool said no; read by this request's rejection line below.
+    // One request, one handler invocation, so this cannot cross requests.
+    let intakeSpoolDiagnostic: Record<string, unknown> | undefined;
     try {
       assertAllowedHost(request);
       if (selectsLiveUsage(request)) {
@@ -1406,7 +1486,17 @@ export function createCollectorServer(
               : null;
           // A spool that could not be written — bounds exhausted, disk, EACCES,
           // kill switch — keeps today's answer exactly: the loss stays visible.
-          if (!spooled) throw error;
+          // It is now also NAMED: the reason rides out on this request's
+          // rejection line in `collector.err.log` (finding N3), so a host whose
+          // spool is failing no longer reads like a host with no busy events.
+          if (spooled && !spooled.ok) {
+            intakeSpoolDiagnostic = {
+              spoolAttempted: spooled.attempted,
+              spoolRefused: true,
+              spoolRefusedReason: spooled.refused,
+            };
+          }
+          if (!spooled?.ok) throw error;
           observeIntakeSpool(spooled.source, classifyRejectionClient(request));
           // 202 only after the file and directory flushes returned. The event
           // is private and blanked; the drain uses this same admission callable.
@@ -1555,9 +1645,27 @@ export function createCollectorServer(
       const recordDiagnostic = failure.reason === "otlp_record_limit_exceeded"
         ? failure.diagnostic
         : undefined;
+      // The busy class, and only it, carries the route diagnostics (the bead's
+      // route-diagnostics note): which route produced the rejection, whether
+      // the intake spool was attempted for it, and whether it refused. Every
+      // other rejection line keeps the shape 0.7.24 printed, byte for byte.
+      // A busy rejection on a route the intake never spools (OTLP, live usage)
+      // says so rather than leaving the fields out, so a measured window can
+      // classify every 503 it holds.
+      const busyRouteDiagnostic =
+        failure.reason === "storage_busy_retry" && failure.status === 503
+          ? {
+              route: classifyRejectionRoute(request.url),
+              spoolAttempted: false,
+              spoolRefused: false,
+              spoolRefusedReason: "route_not_spooled",
+              ...(intakeSpoolDiagnostic ?? {}),
+            }
+          : undefined;
       const diagnosticRejection = {
         ...rejection,
         clientClass,
+        ...(busyRouteDiagnostic ?? {}),
         ...(recordDiagnostic ?? {}),
       };
       // Aggregate identical rejections: emit the first occurrence of a
