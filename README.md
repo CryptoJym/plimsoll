@@ -88,7 +88,7 @@ is not there to spool it, and those hooks have no Plimsoll process of their own
 to do it for them; `forward-hook-http` hosts do spool that case).
 
 The spool is **at-most-once**: every one of those outcomes proves the collector
-stored nothing, so a spooled event is never a duplicate. At the intake, the 503
+stored nothing, so a spooled event is never a duplicate — with one documented exception: if the publication flush fails and the rollback of the unacknowledged envelope is also refused (the double-fault residual described below), a visible envelope can remain behind a 503 and be replayed. At the intake, the 503
 class is raised only when the ledger write did not commit — the durable append
 runs in a single `BEGIN IMMEDIATE` transaction that SQLite has rolled back by
 the time the busy error escapes it — and it is the only outcome that is spooled
