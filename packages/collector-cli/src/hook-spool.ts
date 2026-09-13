@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
+  isProtectedMetadataFieldName,
   isSafeSuppressionSourceKey,
   isSensitiveMetadataSemanticKey,
   protectedMetadataFieldNames,
@@ -59,15 +60,16 @@ import { resolveCollectorHome } from "./collector-home";
  *     unknown metadata — the spool does not model that second step, so it can
  *     hold a value the ledger ends up discarding as unrecognised;
  *   - the values of the declared derivation inputs
- *     (`SPOOL_DERIVATION_INPUT_DISCLOSURE`): `SPOOL_DERIVATION_INPUT_KEYS`, the
- *     keys the collector reads BEFORE suppression to derive something it
- *     persists — a blanked `cwd` would silently cost the event its repository
- *     linkage — and `SPOOL_PROTECTED_IDENTITY_KEYS`, the protected identity
- *     names whose raw value the ledger hashes rather than drops, where blanking
- *     would make the ledger persist the hash of `""` instead of the hash of the
- *     real value. Those values are what the spool holds that the ledger's own
- *     bytes do not, and every one of them is in the privacy spec's exemption
- *     table with its reason.
+ *     (`SPOOL_DERIVATION_INPUT_DISCLOSURE`), under two rules, not one list:
+ *     `SPOOL_DERIVATION_INPUT_KEYS`, an exact-name set of keys the collector
+ *     reads BEFORE suppression to derive something it persists — a blanked
+ *     `cwd` would silently cost the event its repository linkage — and
+ *     `spoolKeepsProtectedIdentityRaw`, the ledger's own NORMALIZED rule for
+ *     the protected identity names whose raw value it hashes rather than drops,
+ *     where blanking would make the ledger persist the hash of `""` instead of
+ *     the hash of the real value. Those values are what the spool holds that
+ *     the ledger's own bytes do not, and the privacy spec discloses the first
+ *     as a table and the second as that rule, with its reason.
  * It never holds raw prompt/output/tool content, credential-like values, or
  * file/transcript paths.
  */
@@ -231,8 +233,8 @@ function collectorStripsKeyOutright(key: string) {
 }
 
 /**
- * The SECOND group of derivation inputs (review r3, N3): the protected identity
- * names.
+ * The SECOND group of derivation inputs (review r3, N3; review r4, F1): the
+ * protected identity names — as a RULE, not as a list of spellings.
  *
  * `sanitizeRoutineMetadata` has a third branch the two above do not cover —
  * `isProtectedMetadataFieldName` keeps the key and replaces its value with
@@ -242,35 +244,92 @@ function collectorStripsKeyOutright(key: string) {
  * of the defect. Blanking them instead would be worse, and measurably: the
  * ledger would then persist the hash of `""` (`sha256:e3b0c44298fc1c14`) in
  * place of the hash of the real value, so the recovered row would carry a
- * different identity from the live one. So the value stays and is DECLARED
- * here — that is what this constant is for.
+ * different identity from the live one. So the value stays and is DECLARED.
  *
- * Derived from the shared list, never typed by hand: every protected name that
- * the drop branches do not already strip. Typing the nine names a reviewer
- * happens to have measured would have missed two (`account_uuid`, `actor_id`)
- * that behave identically.
+ * The declaration has to be keyed the way the ledger is keyed, or it declares
+ * less than it holds. `isProtectedMetadataFieldName` (`policy.ts:91`) matches
+ * on `normalizeFieldName` — every non-alphanumeric character removed, then
+ * lowercased — so the ledger hashes `organization.id`, `accountId` and
+ * `ACCOUNT_ID` exactly as it hashes `account_id`, and this function keeps their
+ * values raw for exactly the same reason. r4 keyed the exemption on literal
+ * membership of `protectedMetadataFieldNames`, which held those 13 measured
+ * spellings raw by the same mechanism while naming none of them.
+ *
+ * The ORDER is the ledger's order and is the whole safety of the rule: the DROP
+ * branches run first there, so a protected name the sanitizer strips outright
+ * never reaches its hash branch. `user.email`, `transcript_path`, `file_path`
+ * and every spelling of them are protected names AND dropped names; they stay
+ * blanked here. Dropping the conjunction would turn fourteen path/email names
+ * raw in the spool — the opposite of this fix.
+ */
+export function spoolKeepsProtectedIdentityRaw(key: string) {
+  return !collectorStripsKeyOutright(key) && isProtectedMetadataFieldName(key);
+}
+
+/**
+ * The canonical spelling of every name the rule above covers: the shared list
+ * itself, filtered by the rule. Derived, never typed by hand — typing the nine
+ * names a reviewer happens to have measured would have missed two
+ * (`account_uuid`, `actor_id`) that behave identically.
+ *
+ * This is the disclosure's canonical column, NOT the extent of the exemption:
+ * the extent is `spoolKeepsProtectedIdentityRaw`, which covers every spelling
+ * that normalizes onto one of these.
  */
 export const SPOOL_PROTECTED_IDENTITY_KEYS: readonly string[] = protectedMetadataFieldNames.filter(
   (name) =>
-    !collectorStripsKeyOutright(name) &&
+    spoolKeepsProtectedIdentityRaw(name) &&
     !(SPOOL_DERIVATION_INPUT_KEYS as readonly string[]).includes(name),
 );
 
+/**
+ * Spellings that are NOT in `protectedMetadataFieldNames`, that the rule covers
+ * anyway, and that a real exporter emits — the thirteen review r4 measured, an
+ * OpenTelemetry `organization.id`/`user.id` span among them. They are examples
+ * of the rule, not the rule: the privacy spec prints them so an operator reads
+ * a name they will actually find in a spool file, and
+ * `r_every_protected_identity_name_is_blanked_or_declared`
+ * (`scripts/hook-spool-proof.ts`) measures each one in both the top-level and
+ * the OTLP `{key, value}` shape.
+ */
+export const SPOOL_PROTECTED_IDENTITY_VARIANT_EXAMPLES: readonly string[] = [
+  "organization.id",
+  "account.id",
+  "account.uuid",
+  "workspace.root",
+  "accountId",
+  "userId",
+  "userName",
+  "organizationId",
+  "orgId",
+  "workspaceRoot",
+  "actorId",
+  "accountUuid",
+  "ACCOUNT_ID",
+];
+
 export type SpoolDerivationInputDisclosure = {
-  /** The exact key name whose value survives the blanking. */
+  /** The key name whose value survives the blanking. */
   key: string;
+  /**
+   * How the exemption is keyed: `exact_name` matches this spelling and no
+   * other; `normalized_name` matches every spelling that normalizes onto it,
+   * exactly as the ledger's `isProtectedMetadataFieldName` does.
+   */
+  match: "exact_name" | "normalized_name";
   /** What the collector derives from that value, in one clause. */
   reason: string;
 };
 
 /**
- * The full disclosure, both groups with their reason, exported so
- * `scripts/privacy-spec.ts` renders the exemption table from the code that
- * enforces it and the page cannot drift from the rule.
+ * The full disclosure, both groups with their reason and how each is matched,
+ * exported so `scripts/privacy-spec.ts` renders the exemption from the code
+ * that enforces it and the page cannot drift from the rule.
  */
 export const SPOOL_DERIVATION_INPUT_DISCLOSURE: readonly SpoolDerivationInputDisclosure[] = [
   ...SPOOL_DERIVATION_INPUT_KEYS.map((key) => ({
     key: key as string,
+    match: "exact_name" as const,
     reason:
       key === "hookEventName"
         ? "the normalizer selects the event's type from this value in the raw body"
@@ -278,27 +337,34 @@ export const SPOOL_DERIVATION_INPUT_DISCLOSURE: readonly SpoolDerivationInputDis
   })),
   ...SPOOL_PROTECTED_IDENTITY_KEYS.map((key) => ({
     key,
+    match: "normalized_name" as const,
     reason: "the ledger stores the protected hash of this value",
   })),
 ];
 
-const derivationInputKeys = new Set<string>([
-  ...SPOOL_DERIVATION_INPUT_KEYS,
-  ...SPOOL_PROTECTED_IDENTITY_KEYS,
-]);
+const derivationInputKeys = new Set<string>(SPOOL_DERIVATION_INPUT_KEYS);
 
 /**
  * True when the collector would strip this key's value before the local
  * database write, so the spool must not hold it either.
  *
- * The exemption is a declaration, not a loophole: the first group names keys
- * the rule below WOULD strip and whose values a persisted derivation needs, and
- * the second names keys the rule never stripped in the first place (their
- * values are what the ledger hashes), so listing them changes nothing this
- * function returns. Both are disclosed in `SPOOL_DERIVATION_INPUT_DISCLOSURE`.
+ * The exemption is a declaration, not a loophole, and the two groups are not
+ * the same kind of thing:
+ *   - the first is an EXACT-NAME override of the rule below — keys it WOULD
+ *     strip, whose values a persisted derivation reads first. Exact on purpose:
+ *     the readers that derive from them match exact names too, so `CWD` and
+ *     `workingDirectory` are not derivation inputs and are blanked;
+ *   - the second is the ledger's own NORMALIZED rule over keys the rule below
+ *     never stripped in the first place (their values are what the ledger
+ *     hashes), so it changes nothing this function returns — it names what was
+ *     already happening, in every spelling, which is the point of review r4's
+ *     F1. Stated as a conjunction with `!collectorStripsKeyOutright`, it cannot
+ *     become an override of the DROP rule by accident.
+ * Both are disclosed in `SPOOL_DERIVATION_INPUT_DISCLOSURE`.
  */
 function spoolSuppressedKey(key: string) {
   if (derivationInputKeys.has(key)) return false;
+  if (spoolKeepsProtectedIdentityRaw(key)) return false;
   return collectorStripsKeyOutright(key);
 }
 

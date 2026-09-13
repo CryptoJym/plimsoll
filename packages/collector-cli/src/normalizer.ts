@@ -135,7 +135,14 @@ function collectOtelSignals(value: unknown, signals: OTelSignals) {
   }
 }
 
-function timestampIsNotFromTheFuture(value: string) {
+/**
+ * The one future-time test the normalizer applies before an OTLP timestamp can
+ * become the event's time. Exported so the collector's drain decides with THIS
+ * predicate rather than a copy of it (review r4, F2): a drain that judged a
+ * body to carry its own usable time while the normalizer then rejected that
+ * same time would silently stamp the recovery clock instead.
+ */
+export function timestampIsNotFromTheFuture(value: string) {
   const parsedAt = Date.parse(value);
   return !Number.isNaN(parsedAt) &&
     parsedAt <= Date.now() + ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs;

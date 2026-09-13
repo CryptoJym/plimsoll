@@ -15,7 +15,6 @@ import {
   type CollectorConfig,
 } from "./config";
 import {
-  ANALYTICAL_METADATA_LIMITS,
   canonicalizeSuppressionReceipts,
   normalizeGitRemote,
   remoteLinkageHash,
@@ -60,7 +59,7 @@ import {
 import { HOOK_AUTHORITY_CONTRACT } from "./hook-authority";
 // The drain reuses the normalizer's own readers rather than re-implementing
 // them, so the two cannot drift on what counts as a usable time (review r3, N2).
-import { otelScalar, unixNanoToIso } from "./normalizer";
+import { otelScalar, timestampIsNotFromTheFuture, unixNanoToIso } from "./normalizer";
 import {
   HOOK_SPOOL_LIMITS,
   blankForbiddenRawContent,
@@ -218,20 +217,22 @@ function usableObservedAtValue(key: string, value: unknown) {
 /**
  * True when a unix-nano value survives the filter `collectOtelSignals` puts it
  * through before it can reach `otelSignals.timestamps[0]`: it parses
- * (`unixNanoToIso`, imported from the normalizer rather than re-implemented)
- * and it is not from the future. `timestampIsNotFromTheFuture` is
- * module-private in `normalizer.ts` and this file may not edit that module, so
- * its one condition is rebuilt from the same shared limit it reads.
+ * (`unixNanoToIso`) and it is not from the future
+ * (`timestampIsNotFromTheFuture`). Both are the normalizer's own readers,
+ * imported rather than restated — r4 left the future test as a copy that read
+ * the same shared limit, and a copy can drift silently (review r4, F2).
+ * `u_the_drains_future_time_test_is_the_normalizers_own_over_every_boundary`
+ * (`scripts/hook-spool-proof.ts`) runs both over one frozen-clock table of
+ * boundary cases and is the guard that the reuse stays real.
+ *
+ * Exported for that check, which cannot otherwise reach a module-private
+ * predicate — the mistake this fix undoes.
  */
-function usableOtelTime(value: unknown) {
+export function usableOtelTime(value: unknown) {
   if (typeof value !== "string" && typeof value !== "number") return false;
   const timestamp = unixNanoToIso(value);
   if (!timestamp) return false;
-  const parsedAt = Date.parse(timestamp);
-  return (
-    !Number.isNaN(parsedAt) &&
-    parsedAt <= Date.now() + ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs
-  );
+  return timestampIsNotFromTheFuture(timestamp);
 }
 
 type SpooledTimeSignals = {

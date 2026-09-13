@@ -45,6 +45,7 @@ import {
   SPOOL_DERIVATION_INPUT_DISCLOSURE,
   SPOOL_DERIVATION_INPUT_KEYS,
   SPOOL_PROTECTED_IDENTITY_KEYS,
+  SPOOL_PROTECTED_IDENTITY_VARIANT_EXAMPLES,
   blankForbiddenRawContent,
   hookSpoolDaemonEnabled,
   hookSpoolCountersPath,
@@ -56,22 +57,27 @@ import {
   readHookSpoolCounters,
   recordHookSpoolIntake,
   recordHookSpoolRefusal,
+  spoolKeepsProtectedIdentityRaw,
   writeHookSpoolFile,
 } from "../packages/collector-cli/src/hook-spool";
 import { forwardHookOverLoopback } from "../packages/collector-cli/src/local-hook-client";
 import { REJECTION_SUMMARY_INTERVAL_MS } from "../packages/collector-cli/src/rejection-diagnostics";
 import { extractRepoContextCwd } from "../packages/collector-cli/src/repo-context";
 import {
+  ANALYTICAL_METADATA_LIMITS,
   DEFAULT_POLICY,
   hashProtectedValue,
+  isProtectedMetadataFieldName,
   isSensitiveMetadataSemanticKey,
   protectedMetadataFieldNames,
   sanitizeForPolicy,
 } from "../packages/shared/src/index";
 import { loadOrCreateLocalIngestAuth } from "../packages/collector-cli/src/local-auth";
+import { timestampIsNotFromTheFuture } from "../packages/collector-cli/src/normalizer";
 import {
   createCollectorServer,
   createHookSpoolDrain,
+  usableOtelTime,
   type HookSpoolDrain,
 } from "../packages/collector-cli/src/server";
 
@@ -1974,28 +1980,153 @@ async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
     { blanked: blanked?.blanked, body: blankedBody },
   );
 
-  // Review r3, N3 — completeness, in the only direction that matters: no
-  // protected name may keep its raw value in a spool file WITHOUT being
-  // declared. Run over the shared list itself, so a name added to
+  // Review r3, N3 and review r4, F1 — completeness, in the only direction that
+  // matters: no protected name may keep its raw value in a spool file WITHOUT
+  // being declared, IN ANY SPELLING.
+  //
+  // The corpus is the shared list itself — so a name added to
   // `protectedMetadataFieldNames` later fails here until it is blanked or
-  // disclosed, instead of resting undeclared on disk.
-  const declared = new Set(SPOOL_DERIVATION_INPUT_DISCLOSURE.map((entry) => entry.key));
-  const protectedOutcomes = protectedMetadataFieldNames.map((name) => {
-    const result = blankForbiddenRawContent(JSON.stringify({ [name]: IDENTITY_CANARY }));
-    const kept = result ? (JSON.parse(result.text) as Record<string, unknown>)[name] : undefined;
-    return { name, blanked: kept === "", declared: declared.has(name) };
-  });
+  // disclosed — PLUS the spellings the rule covers that are not on that list
+  // (`SPOOL_PROTECTED_IDENTITY_VARIANT_EXAMPLES`, the thirteen r4 measured
+  // resting raw and undeclared, `organization.id` among them). Every name is
+  // measured in BOTH shapes the blanker judges: a top-level key, and an OTLP
+  // `{key, value}` attribute, which is how a real exporter emits them.
+  //
+  // The declaration test is the RULE the privacy spec now states — the
+  // exact-name group, or `spoolKeepsProtectedIdentityRaw` — not membership of
+  // the table. Keyed on the table, this check passes on a literal list while
+  // thirteen measured spellings rest raw beside it, which is the defect.
+  const declaredByExactName = new Set(
+    SPOOL_DERIVATION_INPUT_DISCLOSURE.filter((entry) => entry.match === "exact_name").map(
+      (entry) => entry.key,
+    ),
+  );
+  const declaredBySpec = (key: string) =>
+    declaredByExactName.has(key) || spoolKeepsProtectedIdentityRaw(key);
+  const spoolTreatmentOf = (key: string) => {
+    const classify = (value: unknown, raw: unknown) =>
+      value === "" ? "blanked" : JSON.stringify(value) === JSON.stringify(raw) ? "raw" : "neither";
+    const top = blankForbiddenRawContent(JSON.stringify({ [key]: IDENTITY_CANARY }));
+    const topValue = top ? (JSON.parse(top.text) as Record<string, unknown>)[key] : undefined;
+    const attribute = { stringValue: IDENTITY_CANARY };
+    const otlp = blankForbiddenRawContent(
+      JSON.stringify({ resource: { attributes: [{ key, value: attribute }] } }),
+    );
+    const otlpValue = otlp
+      ? ((JSON.parse(otlp.text) as { resource: { attributes: Array<Record<string, unknown>> } })
+          .resource.attributes[0] as Record<string, unknown>).value
+      : undefined;
+    return {
+      topLevel: classify(topValue, IDENTITY_CANARY),
+      otlpAttribute: classify(otlpValue, attribute),
+    };
+  };
+  const protectedOutcomes = [
+    ...protectedMetadataFieldNames.map((name) => ({ name, spelling: "canonical" as const })),
+    ...SPOOL_PROTECTED_IDENTITY_VARIANT_EXAMPLES.map((name) => ({
+      name,
+      spelling: "variant" as const,
+    })),
+  ].map((entry) => ({
+    ...entry,
+    ...spoolTreatmentOf(entry.name),
+    declared: declaredBySpec(entry.name),
+  }));
   const undeclaredRaw = protectedOutcomes.filter(
-    (outcome) => !outcome.blanked && !outcome.declared,
+    (outcome) =>
+      (outcome.topLevel === "raw" || outcome.otlpAttribute === "raw") && !outcome.declared,
+  );
+  // A name the two shapes treat differently would be a disclosure hole of its
+  // own: declared at the top level, raw inside an attribute, or the reverse.
+  const shapesDisagree = protectedOutcomes.filter(
+    (outcome) => outcome.topLevel !== outcome.otlpAttribute,
   );
   check(
     "r_every_protected_identity_name_is_blanked_or_declared",
-    protectedOutcomes.length === protectedMetadataFieldNames.length && undeclaredRaw.length === 0,
+    protectedOutcomes.length ===
+      protectedMetadataFieldNames.length + SPOOL_PROTECTED_IDENTITY_VARIANT_EXAMPLES.length &&
+      SPOOL_PROTECTED_IDENTITY_VARIANT_EXAMPLES.length > 0 &&
+      undeclaredRaw.length === 0 &&
+      shapesDisagree.length === 0 &&
+      protectedOutcomes.every(
+        (outcome) => outcome.topLevel === "blanked" || outcome.topLevel === "raw",
+      ),
     {
-      protectedNames: protectedOutcomes.length,
-      blanked: protectedOutcomes.filter((outcome) => outcome.blanked).length,
-      declared: protectedOutcomes.filter((outcome) => !outcome.blanked && outcome.declared).length,
-      undeclaredRaw: undeclaredRaw.map((outcome) => outcome.name),
+      names: protectedOutcomes.length,
+      canonical: protectedMetadataFieldNames.length,
+      variantSpellings: SPOOL_PROTECTED_IDENTITY_VARIANT_EXAMPLES.length,
+      blanked: protectedOutcomes.filter((outcome) => outcome.topLevel === "blanked").length,
+      rawAndDeclared: protectedOutcomes.filter(
+        (outcome) => outcome.topLevel === "raw" && outcome.declared,
+      ).length,
+      undeclaredRaw: undeclaredRaw.map((outcome) => ({
+        name: outcome.name,
+        spelling: outcome.spelling,
+        topLevel: outcome.topLevel,
+        otlpAttribute: outcome.otlpAttribute,
+      })),
+      shapesDisagree: shapesDisagree.map((outcome) => outcome.name),
+    },
+  );
+
+  // The other direction, and the whole safety of keying the exemption on a
+  // normalizer: the DROP branches run FIRST here exactly as they run first in
+  // `sanitizeRoutineMetadata`, so a protected name the sanitizer strips
+  // outright stays blanked in every spelling. `isProtectedMetadataFieldName`
+  // alone — without the `!collectorStripsKeyOutright` conjunction — would have
+  // turned every one of these raw in the spool, which is the opposite of the
+  // fix it is part of.
+  const droppedProtectedSpellings = [
+    "user.email",
+    "userEmail",
+    "user_email",
+    "EMAIL",
+    "email_address",
+    "emailAddress",
+    "account_email",
+    "accountEmail",
+    "actor_email",
+    "actorEmail",
+    "owner_email",
+    "ownerEmail",
+    "transcript_path",
+    "transcriptPath",
+    "file_path",
+    "filePath",
+    "FILE_PATH",
+    "full_path",
+    "fullPath",
+    "project_path",
+    "projectPath",
+    "repo_path",
+    "repoPath",
+    "repository_url",
+    "repositoryUrl",
+    "workspace_path",
+    "workspacePath",
+  ];
+  const droppedOutcomes = droppedProtectedSpellings.map((name) => ({
+    name,
+    protectedByTheLedgersRule: isProtectedMetadataFieldName(name),
+    ...spoolTreatmentOf(name),
+  }));
+  check(
+    "r_a_protected_name_the_drop_rule_strips_is_blanked_in_every_spelling",
+    droppedOutcomes.length > 0 &&
+      droppedOutcomes.every(
+        (outcome) =>
+          outcome.protectedByTheLedgersRule &&
+          outcome.topLevel === "blanked" &&
+          outcome.otlpAttribute === "blanked",
+      ),
+    {
+      spellings: droppedOutcomes.length,
+      notBlanked: droppedOutcomes
+        .filter((outcome) => outcome.topLevel !== "blanked" || outcome.otlpAttribute !== "blanked")
+        .map((outcome) => outcome.name),
+      notProtectedByTheLedgersRule: droppedOutcomes
+        .filter((outcome) => !outcome.protectedByTheLedgersRule)
+        .map((outcome) => outcome.name),
     },
   );
 
@@ -2038,6 +2169,16 @@ async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
       proof: "hook_spool",
       table: "spool_derivation_input_disclosure",
       rows: SPOOL_DERIVATION_INPUT_DISCLOSURE,
+    }),
+  );
+  // ...and the spellings the rule covers that the table does not name, with
+  // what the spool actually does to each, so the operator-facing claim is
+  // printed as a measurement rather than asserted.
+  console.log(
+    JSON.stringify({
+      proof: "hook_spool",
+      table: "spool_protected_identity_variant_spellings",
+      rows: protectedOutcomes.filter((outcome) => outcome.spelling === "variant"),
     }),
   );
 }
@@ -2160,6 +2301,91 @@ async function caseAnUnusableBodyTimeStillGetsTheHooksTime() {
     );
     await collector.close();
   }
+}
+
+/**
+ * Review r4, F2 — one future-time predicate, not two that happen to agree.
+ *
+ * `usableOtelTime` (`server.ts`) decides whether a spooled body already carries
+ * its own usable time, so the drain leaves it alone; `timestampIsNotFromTheFuture`
+ * (`normalizer.ts`) decides whether the normalizer will actually take that time.
+ * r4 restated the second inside the first, because it was module-private. The
+ * two were faithful, but nothing asserted it: a later round tightening only the
+ * normalizer would have made the drain decline to stamp a time the normalizer
+ * then rejected, falling back to `new Date()` — the r2 defect again, silently,
+ * with no failing check.
+ *
+ * `usableOtelTime` now calls the exported predicate. This is the guard that the
+ * reuse stays real: both run over ONE table of boundary cases. The clock is
+ * FROZEN for each pair of calls, because a case one millisecond past the skew
+ * limit flips as soon as the wall clock advances — unfrozen, the boundary rows
+ * would be a coin toss rather than a measurement, and two calls could straddle
+ * the edge and "agree" by luck.
+ *
+ * The two columns are the same instant in the two representations the two
+ * predicates take: an ISO string for the normalizer's test, unix nanoseconds
+ * for the drain's, which converts with the normalizer's own `unixNanoToIso`.
+ * The last two rows are strings that are no instant at all in either.
+ */
+function caseTheFutureTimeTestsAgreeOnEveryBoundary() {
+  const skewMs = ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs;
+  const frozenNow = Date.parse("2026-09-13T12:00:00.000Z");
+  const atOffset = (slug: string, offsetMs: number, usable: boolean) => {
+    const milliseconds = frozenNow + offsetMs;
+    return {
+      slug,
+      usable,
+      iso: new Date(milliseconds).toISOString(),
+      unixNano: String(milliseconds * 1_000_000),
+    };
+  };
+  const table = [
+    atOffset("exactly_now", 0, true),
+    atOffset("one_ms_ahead", 1, true),
+    atOffset("the_skew_limit_exactly", skewMs, true),
+    atOffset("one_ms_past_the_skew_limit", skewMs + 1, false),
+    atOffset("far_in_the_past", -365 * 24 * 60 * 60 * 1_000, true),
+    { slug: "a_non_iso_string", usable: false, iso: "not-a-timestamp", unixNano: "not-a-number" },
+    { slug: "an_empty_string", usable: false, iso: "", unixNano: "" },
+  ];
+  const withFrozenClock = <T>(now: number, read: () => T): T => {
+    const wallClock = Date.now;
+    Date.now = () => now;
+    try {
+      return read();
+    } finally {
+      Date.now = wallClock;
+    }
+  };
+  const measured = table.map((row) => {
+    const normalizerAccepts = withFrozenClock(frozenNow, () => timestampIsNotFromTheFuture(row.iso));
+    const drainAccepts = withFrozenClock(frozenNow, () => usableOtelTime(row.unixNano));
+    return {
+      case: row.slug,
+      iso: row.iso,
+      unixNano: row.unixNano,
+      expected: row.usable,
+      normalizerAccepts,
+      drainAccepts,
+      agree: normalizerAccepts === drainAccepts,
+    };
+  });
+  const disagreeing = measured.filter((row) => !row.agree).map((row) => row.case);
+  const unexpected = measured
+    .filter((row) => row.normalizerAccepts !== row.expected)
+    .map((row) => row.case);
+  check(
+    "u_the_drains_future_time_test_is_the_normalizers_own_over_every_boundary",
+    measured.length === table.length && disagreeing.length === 0 && unexpected.length === 0,
+    { skewMs, frozenNow: new Date(frozenNow).toISOString(), disagreeing, unexpected, rows: measured },
+  );
+  console.log(
+    JSON.stringify({
+      proof: "hook_spool",
+      table: "future_time_predicates_over_one_boundary_table",
+      rows: measured,
+    }),
+  );
 }
 
 /**
@@ -3480,6 +3706,8 @@ async function main() {
     await caseTheSpoolHoldsNoMoreThanTheLedgerWould();
     stage("u_unusable_body_time");
     await caseAnUnusableBodyTimeStillGetsTheHooksTime();
+    stage("u_future_time_predicates");
+    caseTheFutureTimeTestsAgreeOnEveryBoundary();
     stage("v_args_nested_cwd");
     await caseAnArgsNestedCwdIsADocumentedDivergence();
     stage("s_collector_too_old");

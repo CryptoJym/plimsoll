@@ -37,6 +37,7 @@ import {
   HOOK_SPOOL_DIRECTORY,
   HOOK_SPOOL_LIMITS,
   SPOOL_DERIVATION_INPUT_DISCLOSURE,
+  SPOOL_PROTECTED_IDENTITY_VARIANT_EXAMPLES,
   type SpoolDerivationInputDisclosure,
 } from "../packages/collector-cli/src/hook-spool";
 
@@ -67,6 +68,11 @@ export type PrivacySpecModel = {
   suppressedReceiptFieldName: string;
   spoolDirectory: string;
   spoolDerivationInputs: SpoolDerivationInputDisclosure[];
+  /**
+   * Spellings outside `protectedMetadataFieldNames` that the normalized rule
+   * covers anyway, so the page names what an operator will actually find.
+   */
+  spoolProtectedIdentityVariants: string[];
   spoolRejectedRetentionDays: number;
   /** The bound both spool writers — the hook client and the collector's intake — share. */
   spoolMaxFiles: number;
@@ -140,6 +146,7 @@ export const PROOF_CHECKS: Record<string, ProofCheckRef> = {
       "r_the_suppression_receipts_are_identical_live_and_recovered",
       "r_the_ledger_never_held_the_paths_either",
       "r_every_protected_identity_name_is_blanked_or_declared",
+      "r_a_protected_name_the_drop_rule_strips_is_blanked_in_every_spelling",
       "r_a_declared_protected_identity_is_raw_in_the_spool_and_hashed_identically_in_both_rows",
       "r_blanking_a_declared_protected_identity_would_change_what_the_ledger_persists",
       "z_the_intake_spool_file_holds_only_the_allowlisted_path_value",
@@ -236,6 +243,7 @@ export function collectPrivacySpecModel(): PrivacySpecModel {
     ) as string,
     spoolDirectory: HOOK_SPOOL_DIRECTORY,
     spoolDerivationInputs: [...SPOOL_DERIVATION_INPUT_DISCLOSURE],
+    spoolProtectedIdentityVariants: [...SPOOL_PROTECTED_IDENTITY_VARIANT_EXAMPLES],
     spoolRejectedRetentionDays: HOOK_SPOOL_LIMITS.rejectedMaxAgeMs / (24 * 60 * 60 * 1000),
     spoolMaxFiles: HOOK_SPOOL_LIMITS.maxFiles,
     spoolMaxBytesMiB: HOOK_SPOOL_LIMITS.maxBytes / (1024 * 1024),
@@ -257,9 +265,14 @@ function reasonTable(
   sourceLabel: string,
 ): string[] {
   return [
-    `| # | Field name | Why the spool keeps its value |`,
-    `|---|---|---|`,
-    ...items.map((item, index) => `| ${index + 1} | \`${item.key}\` | ${item.reason} |`),
+    `| # | Field name | Matched by | Why the spool keeps its value |`,
+    `|---|---|---|---|`,
+    ...items.map(
+      (item, index) =>
+        `| ${index + 1} | \`${item.key}\` | ${
+          item.match === "exact_name" ? "this exact name" : "this name normalized, in any spelling"
+        } | ${item.reason} |`,
+    ),
     ``,
     `Count: **${items.length}** — source: \`${sourceLabel}\`.`,
   ];
@@ -442,15 +455,38 @@ export function renderPrivacySpec(model: PrivacySpecModel): string {
   lines.push(`| 1 | \`work-ledger.sqlite\` (the local ledger) | Normalized events and their suppression receipts. | \`sanitizeForPolicy\` / \`evaluatePolicyInput\` (\`${SOURCE_POLICY}\`), then metadata admission. |`);
   lines.push(`| 2 | \`${model.spoolDirectory}/\` (hook events the collector could not accept yet; bead eco-6hoxj.61) | One JSON envelope per event, written either by the hook process or by the collector's own intake when a busy ledger cannot take the post, deleted as soon as the collector applies it. Bounded for both writers at ${model.spoolMaxFiles} files and ${model.spoolMaxBytesMiB} MiB. A file the collector cannot apply is quarantined under \`${model.spoolDirectory}/rejected/\` for up to ${model.spoolRejectedRetentionDays} days. | \`blankForbiddenRawContent\` (\`${SOURCE_HOOK_SPOOL}\`) empties the value of every key \`sanitizeRoutineMetadata\` drops outright — the local write's own DROP rule, imported — keeping only the key name, whichever writer writes the file. The declared derivation inputs below keep their value. |`);
   lines.push(``);
-  lines.push(`So the spool holds values the ledger's own bytes do not, and this is the`);
-  lines.push(`whole of that list: the keys the collector reads from the raw body BEFORE`);
-  lines.push(`suppressing them to derive something it persists`);
-  lines.push(`(\`SPOOL_DERIVATION_INPUT_KEYS\`), and the protected identity names whose`);
-  lines.push(`hash the ledger keeps (\`SPOOL_PROTECTED_IDENTITY_KEYS\`, derived from`);
-  lines.push(`\`protectedMetadataFieldNames\`). Blanking either would silently make a`);
-  lines.push(`recovered event worse than a live one — a lost repository linkage, or an`);
-  lines.push(`identity hash computed from nothing — so they are exempt, by exact key name`);
-  lines.push(`(\`${SOURCE_HOOK_SPOOL}\`):`);
+  lines.push(`So the spool holds values the ledger's own bytes do not, and they are exempt`);
+  lines.push(`under two rules, not one list (\`${SOURCE_HOOK_SPOOL}\`). Blanking a value`);
+  lines.push(`under either would silently make a recovered event worse than a live one —`);
+  lines.push(`a lost repository linkage, or an identity hash computed from nothing.`);
+  lines.push(``);
+  lines.push(`1. **By exact key name** (\`SPOOL_DERIVATION_INPUT_KEYS\`): the keys the`);
+  lines.push(`   collector reads from the raw body BEFORE suppressing them, to derive`);
+  lines.push(`   something it persists. Exact on purpose — the readers that derive from`);
+  lines.push(`   them match exact names too, so a case or separator variant of one of`);
+  lines.push(`   these is not a derivation input and is emptied like any other`);
+  lines.push(`   sensitive key.`);
+  lines.push(`2. **By the ledger's own rule over NORMALIZED names**`);
+  lines.push(`   (\`spoolKeepsProtectedIdentityRaw\`): a key whose name, with every`);
+  lines.push(`   non-alphanumeric character removed and then lowercased, matches a`);
+  lines.push(`   protected identity name — \`isProtectedMetadataFieldName\`,`);
+  lines.push(`   \`${SOURCE_POLICY}\`, the same test the ledger hashes by — AND that the`);
+  lines.push(`   DROP rule above does not already strip, keeps its raw value. This is a`);
+  lines.push(`   rule, not a list of spellings: ${model.spoolProtectedIdentityVariants.slice(0, 3).map((key) => `\`${key}\``).join(", ")}`);
+  lines.push(`   and \`${model.spoolProtectedIdentityVariants.at(-1)}\` are exempt exactly as \`account_id\` is, rest raw`);
+  lines.push(`   for the same reason, and are covered by this disclosure. The DROP rule`);
+  lines.push(`   runs FIRST here exactly as it runs first in the ledger, so a protected`);
+  lines.push(`   name the sanitizer strips outright — \`user.email\`, \`transcript_path\`,`);
+  lines.push(`   \`file_path\`, and every spelling of them — is still emptied, never`);
+  lines.push(`   exempt.`);
+  lines.push(``);
+  lines.push(`The table below is the canonical spelling of each exempt name with its`);
+  lines.push(`reason. For rule 2 it is the canonical column, not the extent: every`);
+  lines.push(`spelling that normalizes onto one of those names is exempt too. The`);
+  lines.push(`${model.spoolProtectedIdentityVariants.length} measured spellings that are covered by rule 2 and are NOT in the`);
+  lines.push(`table are \`${model.spoolProtectedIdentityVariants.join("`, `")}\``);
+  lines.push(`(\`SPOOL_PROTECTED_IDENTITY_VARIANT_EXAMPLES\`), in both the top-level and`);
+  lines.push(`the OTLP \`{key, value}\` attribute shape.`);
   lines.push(``);
   lines.push(...reasonTable(model.spoolDerivationInputs, `${SOURCE_HOOK_SPOOL} :: SPOOL_DERIVATION_INPUT_DISCLOSURE`));
   lines.push(...renderGuaranteesSection(["at_rest"], found));
