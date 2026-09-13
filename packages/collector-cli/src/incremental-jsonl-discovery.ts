@@ -13,6 +13,22 @@ type Frame = {
   ctimeMs: number;
 };
 
+/**
+ * How far a bounded sweep has come, and against which lifetime limit. A scan
+ * that spans cadences must be able to say this: bead eco-6hoxj.73 saw capture
+ * health report a permanent amber because an incomplete sweep could not name
+ * its own progress or budget.
+ */
+export type DiscoveryProgress = {
+  rootsTotal: number;
+  rootsStarted: number;
+  openDirectories: number;
+  entriesVisited: number;
+  lifetimeEntryLimit: number;
+  limitReached: boolean;
+  finished: boolean;
+};
+
 export type DiscoveryChunk = {
   files: Array<{ file: string; stat: fs.Stats; precise: fs.BigIntStats }>;
   entriesVisited: number;
@@ -111,6 +127,19 @@ export class IncrementalJsonlDiscovery {
       limitReached: this.limitReached,
       yields,
       lastYieldAt,
+    };
+  }
+
+  /** Cumulative sweep progress; `entriesVisited` never resets within a sweep. */
+  progress(): DiscoveryProgress {
+    return {
+      rootsTotal: this.roots.length,
+      rootsStarted: this.rootIndex,
+      openDirectories: this.stack.length,
+      entriesVisited: this.visited,
+      lifetimeEntryLimit: this.options.maxEntries,
+      limitReached: this.limitReached,
+      finished: this.finished,
     };
   }
 

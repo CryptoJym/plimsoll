@@ -21,6 +21,7 @@ import {
   dashboardSummary,
   type SubscriptionConfig,
 } from "../packages/collector-cli/src/dashboard-api";
+import { historyCoverageStatus } from "../packages/collector-cli/src/history-coverage";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 
@@ -54,7 +55,7 @@ let eventSequence = 1;
 function event(input: {
   observedAt?: string;
   sessionId?: string;
-  source?: "claude_code" | "codex";
+  source?: "claude_code" | "codex" | "grok";
   eventType?: "assistant_response" | "tool_use" | "tool_result" | "usage_rollout";
   actionClass?: string;
   model?: string;
@@ -1455,6 +1456,199 @@ async function main() {
       legacy.projection.status().backfill.metricSampleCount===1_201,
       {metric:legacy.projection.status().backfill.metricSampleCount});
     legacy.close();
+
+    // ---------------------------------------------------------------------
+    // Bead eco-6hoxj.73 / .63: the capture-health label must tell the truth on
+    // a host with many capture roots, and must enumerate every configured
+    // source. Fixtures below use more roots and entries than one cadence's
+    // budget can enumerate, exactly as the MacBook (22 roots, 11 GB ledger) did.
+    // ---------------------------------------------------------------------
+    const MANY_ROOT_SCAN = {
+      converging: true,
+      sweepComplete: false,
+      rootsTotal: 22,
+      rootsStarted: 8,
+      entriesThisSweep: 3_412,
+      entriesThisTick: 6,
+      pendingFiles: 64,
+      entryBudgetPerTick: 256,
+      wallBudgetMsPerTick: 50,
+      lifetimeEntryLimit: 100_000,
+      limitReached: false,
+      deferredBeforeIo: false,
+    };
+
+    const captureHealthFixture = (label: string, eventAgeMs: number) => {
+      const fixture = new LocalEventBuffer(path.join(root, `capture-health-${label}.sqlite`));
+      for (const [source, sessions] of [["claude_code", 2], ["codex", 2], ["grok", 1]] as const) {
+        for (let index = 0; index < sessions; index += 1) {
+          fixture.append(event({
+            source,
+            sessionId: uuid(900_000 + index + (source === "codex" ? 10 : source === "grok" ? 20 : 0)),
+            observedAt: new Date(NOW.getTime() - eventAgeMs).toISOString(),
+            inputTokens: 1_200,
+            outputTokens: 340,
+            costUsd: 0.004,
+          }));
+        }
+      }
+      settle(fixture, NOW, 30);
+      // One bounded cadence of an unfinished sweep, as the tailers now publish it.
+      for (const [source, filesToday] of [["claude_code", 3], ["codex", 1]] as const) {
+        fixture.projection.recordCaptureActivity({
+          source,
+          lastActivityAt: new Date(NOW.getTime() - eventAgeMs - 60_000).toISOString(),
+          filesToday,
+          discoveryEntries: MANY_ROOT_SCAN.entriesThisTick,
+          lastScanAt: new Date(NOW.getTime() - 30_000).toISOString(),
+          truncated: true,
+          scan: MANY_ROOT_SCAN,
+        });
+      }
+      settle(fixture, NOW, 30);
+      const snapshot = readySnapshot(fixture, 30);
+      const health = snapshot.status.health as {
+        overall: string;
+        sources: Array<{
+          source: string; capture: string; status: string; reason: string;
+          diagnostics: string[]; lastEventAt: string | null;
+          activityState: { truncated: boolean; scanState: string; scan: Record<string, unknown> | null };
+        }>;
+      };
+      return { fixture, health };
+    };
+
+    const live = captureHealthFixture("live", 5 * 60_000);
+    const liveClaude = live.health.sources.find((row) => row.source === "claude_code")!;
+    const liveCodex = live.health.sources.find((row) => row.source === "codex")!;
+    check("many_root_truncated_scan_does_not_make_live_capture_amber",
+      live.health.overall === "green" && liveClaude.status === "green" && liveCodex.status === "green" &&
+      liveClaude.reason.startsWith("capture current") &&
+      !liveClaude.reason.includes("activity scan") &&
+      liveClaude.activityState.truncated === true &&
+      liveClaude.activityState.scanState === "in_progress",
+      { overall: live.health.overall, claude: liveClaude.status, claudeReason: liveClaude.reason,
+        codex: liveCodex.status, truncated: liveClaude.activityState.truncated });
+    check("unfinished_scan_is_reported_as_a_separate_named_diagnostic",
+      liveClaude.diagnostics.length === 1 &&
+      liveClaude.diagnostics[0]!.includes("8/22 capture root(s) enumerated") &&
+      liveClaude.diagnostics[0]!.includes("3412 entr(ies) this sweep") &&
+      liveClaude.diagnostics[0]!.includes("budget 256 entries/50ms per tick") &&
+      liveClaude.diagnostics[0]!.includes("64 candidate(s) pending") &&
+      liveClaude.activityState.scan?.rootsTotal === 22,
+      { diagnostics: liveClaude.diagnostics });
+
+    // Negative control: strip the only thing that made the label green — a
+    // lastEventAt inside the expected cadence — and the same truncated sweep
+    // must read amber with the exact roots, entries and budget behind it.
+    const staleEvents = captureHealthFixture("stale", 3 * 60 * 60_000);
+    const staleClaude = staleEvents.health.sources.find((row) => row.source === "claude_code")!;
+    check("stale_last_event_with_truncated_scan_reads_amber_with_the_exact_budget",
+      staleEvents.health.overall === "amber" && staleClaude.status === "amber" &&
+      staleClaude.reason.includes("activity scan still sweeping") &&
+      staleClaude.reason.includes("8/22 capture root(s) enumerated") &&
+      staleClaude.reason.includes("3412 entr(ies) this sweep, 6 this tick") &&
+      staleClaude.reason.includes("lifetime limit 100000") &&
+      !staleClaude.reason.includes("capture state is directional"),
+      { overall: staleEvents.health.overall, status: staleClaude.status, reason: staleClaude.reason });
+
+    // Local artifacts that are not reaching the ledger still outrank the scan.
+    staleEvents.fixture.projection.recordCaptureActivity({
+      source: "claude_code",
+      lastActivityAt: new Date(NOW.getTime() - 60_000).toISOString(),
+      filesToday: 3,
+      discoveryEntries: MANY_ROOT_SCAN.entriesThisTick,
+      lastScanAt: new Date(NOW.getTime() - 30_000).toISOString(),
+      truncated: true,
+      scan: MANY_ROOT_SCAN,
+    });
+    settle(staleEvents.fixture, NOW, 30);
+    const lagging = (readySnapshot(staleEvents.fixture, 30).status.health as {
+      sources: Array<{ source: string; status: string; reason: string; diagnostics: string[] }>;
+    }).sources.find((row) => row.source === "claude_code")!;
+    check("truncated_scan_never_masks_local_activity_missing_from_the_ledger",
+      lagging.status === "red" &&
+      lagging.reason === "recent local activity is not reaching the projected ledger" &&
+      lagging.diagnostics.length === 1,
+      { status: lagging.status, reason: lagging.reason });
+
+    const coverage = historyCoverageStatus(live.fixture.database);
+    check("status_surface_enumerates_claude_code_codex_and_grok",
+      live.health.sources.map((row) => row.source).join(",") === "claude_code,codex,grok" &&
+      coverage.sources.map((row) => row.source).join(",") === "codex,claude_code,grok" &&
+      coverage.sources.find((row) => row.source === "grok")?.status === "hook_delivered" &&
+      coverage.sources.find((row) => row.source === "grok")?.reason === "history_is_hook_delivered" &&
+      coverage.status === "incomplete",
+      { health: live.health.sources.map((row) => row.source),
+        coverage: coverage.sources.map((row) => `${row.source}:${row.status}`),
+        aggregate: coverage.status });
+
+    const liveGrok = live.health.sources.find((row) => row.source === "grok")!;
+    check("grok_is_a_first_class_capture_health_source_from_the_ledger",
+      liveGrok.capture === "hook_only" && liveGrok.status === "green" &&
+      liveGrok.lastEventAt === new Date(NOW.getTime() - 5 * 60_000).toISOString() &&
+      liveGrok.reason.includes("hook-delivered") &&
+      liveGrok.activityState.scanState === "not_applicable" &&
+      liveGrok.diagnostics.length === 0,
+      { grok: liveGrok });
+
+    // Negative control for .63: a configured source with no events reports a
+    // distinct no_events status instead of being absent or reading healthy.
+    const empty = new LocalEventBuffer(path.join(root, "capture-health-no-events.sqlite"));
+    empty.append(event({
+      source: "codex", sessionId: uuid(910_001),
+      observedAt: new Date(NOW.getTime() - 5 * 60_000).toISOString(),
+      inputTokens: 10, outputTokens: 5, costUsd: 0.001,
+    }));
+    // A completed sweep that found nothing local: the only remaining question
+    // is what the ledger holds for each configured source.
+    for (const source of ["claude_code", "codex"] as const) {
+      empty.projection.recordCaptureActivity({
+        source,
+        lastActivityAt: null,
+        filesToday: 0,
+        discoveryEntries: 12,
+        lastScanAt: new Date(NOW.getTime() - 30_000).toISOString(),
+        truncated: false,
+        scan: { ...MANY_ROOT_SCAN, converging: true, sweepComplete: true, rootsStarted: 22, pendingFiles: 0 },
+      });
+    }
+    settle(empty, NOW, 30);
+    const emptyHealth = readySnapshot(empty, 30).status.health as {
+      overall: string;
+      sources: Array<{ source: string; status: string; reason: string; lastEventAt: string | null }>;
+    };
+    const emptyGrok = emptyHealth.sources.find((row) => row.source === "grok")!;
+    const emptyClaude = emptyHealth.sources.find((row) => row.source === "claude_code")!;
+    check("configured_source_with_no_events_reports_no_events_not_absence",
+      emptyHealth.sources.length === 3 && emptyGrok.status === "no_events" &&
+      emptyGrok.lastEventAt === null &&
+      emptyGrok.reason === "configured source with no events captured yet" &&
+      emptyClaude.status === "no_events" && emptyClaude.lastEventAt === null &&
+      emptyHealth.sources.find((row) => row.source === "codex")?.status === "green" &&
+      emptyHealth.overall === "green",
+      { sources: emptyHealth.sources.map((row) => `${row.source}:${row.status}`),
+        overall: emptyHealth.overall });
+
+    const healthServer = createCollectorServer(collectorConfigSchema.parse({ subscriptions }), live.fixture);
+    const healthPort = await listen(healthServer);
+    try {
+      const httpStatus = await (await fetch(`http://127.0.0.1:${healthPort}/status`)).json() as {
+        captureHealth?: { sources?: Array<{ source: string; status: string; diagnostics?: string[] }> };
+        historyCoverage?: { sources?: Array<{ source: string }> };
+      };
+      check("http_status_publishes_the_three_source_capture_health_contract",
+        httpStatus.captureHealth?.sources?.map((row) => row.source).join(",") === "claude_code,codex,grok" &&
+        httpStatus.historyCoverage?.sources?.map((row) => row.source).join(",") === "codex,claude_code,grok" &&
+        httpStatus.captureHealth?.sources?.every((row) => Array.isArray(row.diagnostics)) === true,
+        { captureHealth: httpStatus.captureHealth?.sources?.map((row) => `${row.source}:${row.status}`),
+          historyCoverage: httpStatus.historyCoverage?.sources?.map((row) => row.source) });
+    } finally {
+      await closeServer(healthServer);
+    }
+    live.fixture.close();
+    staleEvents.fixture.close();
+    empty.close();
 
     console.log(JSON.stringify({
       schema: "plimsoll.dashboard-projection-proof.v1",

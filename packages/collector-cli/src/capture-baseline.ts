@@ -3,6 +3,7 @@ import path from "node:path";
 
 import type Database from "better-sqlite3";
 
+import type { DiscoveryProgress } from "./incremental-jsonl-discovery";
 import {
   invalidateHistoryCoverageForExcludedGrowth,
   type HistoryCoverageSource,
@@ -19,6 +20,62 @@ const initializedDatabases = new WeakSet<object>();
 export const AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP = 64;
 export const AUTOMATIC_DISCOVERY_ENTRY_CAP = 256;
 export const AUTOMATIC_DISCOVERY_WALL_MS = 50;
+
+/**
+ * The enumeration receipt behind one activity-scan cadence (bead eco-6hoxj.73).
+ *
+ * `truncated` on the activity receipt only says "this cadence did not finish
+ * enumerating", which on a host with many capture roots is the normal steady
+ * state of a bounded sweep. Capture health needs to tell that apart from a
+ * sweep that cannot converge, and needs the exact roots, entries and budget so
+ * an amber reason is actionable instead of a permanent "directional" label.
+ */
+export type CaptureScanProgress = {
+  /** The sweep kept its cursor and resumes on the next cadence. */
+  converging: boolean;
+  /** Discovery finished a full sweep of every root in this cadence. */
+  sweepComplete: boolean;
+  rootsTotal: number;
+  rootsStarted: number;
+  /** Directory entries visited since this sweep began, and in this cadence. */
+  entriesThisSweep: number;
+  entriesThisTick: number;
+  /** Candidates discovered and still awaiting metadata or read admission. */
+  pendingFiles: number;
+  entryBudgetPerTick: number;
+  wallBudgetMsPerTick: number;
+  lifetimeEntryLimit: number;
+  /** The lifetime entry limit was hit: the sweep restarts, it cannot resume. */
+  limitReached: boolean;
+  /** The cadence was deferred before any filesystem work. */
+  deferredBeforeIo: boolean;
+};
+
+/** Build one scan receipt from the live discovery cursor and this cadence. */
+export function captureScanProgress(input: {
+  discovery: DiscoveryProgress | null;
+  configuredRoots: number;
+  pendingFiles: number;
+  entriesThisTick: number;
+  deferredBeforeIo: boolean;
+}): CaptureScanProgress {
+  const discovery = input.discovery;
+  return {
+    converging: !input.deferredBeforeIo && !(discovery?.limitReached ?? false),
+    // A consumed cursor means the previous sweep finished and drained.
+    sweepComplete: discovery === null || discovery.finished,
+    rootsTotal: discovery?.rootsTotal ?? input.configuredRoots,
+    rootsStarted: discovery?.rootsStarted ?? 0,
+    entriesThisSweep: discovery?.entriesVisited ?? 0,
+    entriesThisTick: input.entriesThisTick,
+    pendingFiles: input.pendingFiles,
+    entryBudgetPerTick: AUTOMATIC_DISCOVERY_ENTRY_CAP,
+    wallBudgetMsPerTick: AUTOMATIC_DISCOVERY_WALL_MS,
+    lifetimeEntryLimit: discovery?.lifetimeEntryLimit ?? 0,
+    limitReached: discovery?.limitReached ?? false,
+    deferredBeforeIo: input.deferredBeforeIo,
+  };
+}
 
 export const CAPTURE_BASELINE_NOT_ESTABLISHED =
   "capture_baseline_not_established" as const;

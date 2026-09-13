@@ -23,6 +23,8 @@ import {
   AUTOMATIC_DISCOVERY_ENTRY_CAP,
   AUTOMATIC_DISCOVERY_WALL_MS,
   AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP,
+  captureScanProgress,
+  type CaptureScanProgress,
   beginAutomaticCaptureBaseline,
   captureBaselineStatus,
   classifyCaptureBaselineFile,
@@ -141,6 +143,8 @@ export type RolloutScanResult = {
     discoveryEntries: number;
     lastScanAt: string;
     truncated: boolean;
+    /** Why an incomplete sweep is incomplete, and against which budget. */
+    scan?: CaptureScanProgress;
   };
 };
 
@@ -429,7 +433,26 @@ export class RolloutTailer {
    * files keeps the dashboard responsive while a scan runs (owner-reported
    * freeze, sounding 0026).
    */
+  /**
+   * One cadence of the bounded activity scan.
+   *
+   * Bead eco-6hoxj.73: every return path publishes the enumeration progress
+   * behind `activity.truncated`, so capture health can report an unfinished
+   * sweep as a named diagnostic instead of a permanent, unexplained amber.
+   */
   async scan(options: RolloutScanOptions): Promise<RolloutScanResult> {
+    const result = await this.runScan(options);
+    result.activity.scan = captureScanProgress({
+      discovery: this.captureAttempt?.discovery.progress() ?? null,
+      configuredRoots: this.directories.length,
+      pendingFiles: this.captureAttempt?.pendingFiles.length ?? 0,
+      entriesThisTick: result.activity.discoveryEntries,
+      deferredBeforeIo: options.deferredBeforeIo === true,
+    });
+    return result;
+  }
+
+  private async runScan(options: RolloutScanOptions): Promise<RolloutScanResult> {
     this.activeBoundaryOptions = {
       quarantine: options.quarantine,
       onProgress: options.onProgress,

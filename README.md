@@ -186,6 +186,41 @@ Residual behaviour worth knowing:
 - An `http`/`curl` hook whose post never reaches a listening collector is still
   lost: there is no Plimsoll process on that path to spool it.
 
+### What the capture-health label means
+
+`captureHealth` in `plimsoll status --json`, the collector's `/status`, and
+`doctor` enumerates **every configured source** — Claude Code, Codex and Grok —
+and answers one question per source: *is what ran on this machine reaching the
+ledger?*
+
+- **green** — capture is current. Either the source's newest ledger event is
+  inside its expected cadence (60 minutes), or a completed local scan agrees
+  with what the ledger holds.
+- **amber** — capture cannot be confirmed, with the exact reason: local activity
+  that outran token attribution, a local activity scan that could not finish, or
+  a scan receipt too old to confirm quiet.
+- **red** — local activity is demonstrably *not* reaching the ledger.
+- **no_events** — the source is configured and enumerated, and has captured
+  nothing yet. It is never absent and never reads as healthy, and it does not
+  make the overall label amber.
+
+The local activity scan is **bounded**: one cadence enumerates at most 256
+directory entries within 50 ms, keeps its cursor, and resumes on the next tick.
+On a host with many capture roots one sweep therefore spans many cadences, and
+`activityState.truncated` stays true for all of them. That is the normal state of
+a converging scan, not a capture fault, so it is reported as a `diagnostics`
+entry and in `activityState.scan` — naming the roots enumerated, the entries
+visited this sweep and this tick, the per-tick budget and the candidates still
+pending — and it only becomes the source's `reason` when capture truth cannot
+answer. A host whose events are flowing reads green with the sweep reported
+alongside it (bead eco-6hoxj.73).
+
+`historyCoverage` answers a different question — has an explicit full backfill
+covered this source's retained history? — and stays independent of capture
+health. Grok is enumerated there with status `hook_delivered`: its history
+arrives by hook, so there is no local transcript to backfill, and it never
+participates in the completeness verdict.
+
 ## Quickstart
 
 Requirements: macOS, Node >=20 <25.

@@ -1177,14 +1177,24 @@ async function checkCollectorConnectivity(port: number, managementToken?: string
       ? (body.health as { sources?: unknown })
       : null;
     const healthSources = Array.isArray(health?.sources) ? health.sources : [];
+    // Bead eco-6hoxj.63: doctor reads every configured source the daemon
+    // reports — Claude Code, Codex and Grok — with its status and reason, so a
+    // source that is capturing (or one with no events yet) can never be absent
+    // from the human reading.
     const sources = healthSources.flatMap((candidate) => {
       if (!candidate || typeof candidate !== "object") return [];
       const source = (candidate as { source?: unknown }).source;
       const lastTokenEventAt = (candidate as { lastTokenEventAt?: unknown }).lastTokenEventAt;
-      if (source !== "claude_code" && source !== "codex") return [];
+      const status = (candidate as { status?: unknown }).status;
+      const reason = (candidate as { reason?: unknown }).reason;
+      if (source !== "claude_code" && source !== "codex" && source !== "grok") return [];
       return [{
         source,
         lastTokenEventAt: typeof lastTokenEventAt === "string" ? lastTokenEventAt : null,
+        status: status === "green" || status === "amber" || status === "red" || status === "no_events"
+          ? status
+          : null,
+        reason: typeof reason === "string" ? reason : null,
       }];
     });
     const stats = body?.stats && typeof body.stats === "object"
