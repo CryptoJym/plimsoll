@@ -118,8 +118,10 @@ export const REJECTION_ROUTES = (Object.keys(REJECTION_ROUTE_ORDER) as Rejection
  * route diagnostics (`server.ts`): a busy 503 can arrive on a hook route the
  * intake spool covers or on OTLP, which it does not, and `clientClass` alone
  * cannot tell those apart for one producer. Bounding the breakdown to this one
- * reason also keeps the record-array maps and the route map off the same line,
- * so every summary stays inside `REJECTION_SUMMARY_LINE_MAX_BYTES`.
+ * reason lets `closeWindow` enforce exclusivity: it omits record statistics
+ * for route-classified reasons even if a caller supplies both diagnostics.
+ * Thus a summary contains record-array maps or a route map, never both, and
+ * stays inside `REJECTION_SUMMARY_LINE_MAX_BYTES`.
  */
 export const ROUTE_CLASSIFIED_REASONS: readonly HttpBoundaryReason[] = ["storage_busy_retry"];
 
@@ -142,8 +144,9 @@ export type RejectionSummaryLine = {
   /**
    * Per-route split of `count`, emitted last so the rest of the line is the
    * byte-identical pre-0.7.27 line. Present only when the window holds a
-   * route-classified rejection; its values sum to `count`, which keeps its
-   * meaning as the window total for the `(reason, clientClass)` key.
+   * route-classified rejection. For unseeded production windows its values
+   * sum to `count`; proof/recovery seeds have no route attribution and are not
+   * included in this split. `count` remains the whole window total.
    */
   routes?: Partial<Record<RejectionRoute, number>>;
 };
@@ -337,7 +340,7 @@ export function createRejectionDiagnostics(options: {
       suppressed: window.suppressed,
       intervalMs: REJECTION_SUMMARY_INTERVAL_MS,
       action: HTTP_REJECTION_NEXT_ACTIONS[state.reason],
-      ...(window.recordStats
+      ...(window.recordStats && !ROUTE_CLASSIFIED_REASONS.includes(state.reason)
         ? {
             recordCountLast: window.recordStats.last.recordCount,
             recordCountMax: window.recordStats.max.recordCount,

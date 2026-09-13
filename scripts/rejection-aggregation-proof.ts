@@ -1222,6 +1222,31 @@ async function routeClassificationChecks() {
         decodedBytes: 2_097_152,
       }, "otlp");
       const nonBusySummary = nonBusyAgg.flush()[0];
+      // Reverse direction: even an incorrect caller cannot attach record maps
+      // to a busy summary. The emitter, not caller convention, owns the bound.
+      const fullRecordDiagnostic = {
+        recordCount: 100_000,
+        recordArrays: {
+          logRecords: 100_000, spans: 100_000, metrics: 100_000,
+          dataPoints: 100_000, events: 100_000, links: 100_000, exemplars: 100_000,
+        },
+        decodedBytes: 2_097_152,
+      };
+      const recordFields = ["recordCountLast", "recordCountMax", "recordArraysLast",
+        "recordArraysMax", "decodedBytesLast", "decodedBytesMax"] as const;
+      const hasNoRecordFields = (line: RejectionSummaryLine | undefined) =>
+        line !== undefined && recordFields.every((key) => !Object.hasOwn(line, key));
+      const mixedAgg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
+      for (const route of vocabulary) {
+        mixedAgg.observeRejection("storage_busy_retry", "otlp_exporter", fullRecordDiagnostic, route);
+      }
+      const mixedSummary = mixedAgg.flush()[0];
+      const saturatedMixedLine = {
+        ...mixedSummary,
+        count: Number.MAX_SAFE_INTEGER,
+        suppressed: Number.MAX_SAFE_INTEGER,
+        routes: saturatedBreakdown,
+      };
       check(
         "route_breakdown_is_bounded_by_the_closed_vocabulary_and_the_line_ceiling",
         JSON.stringify(vocabulary) ===
@@ -1230,13 +1255,58 @@ async function routeClassificationChecks() {
             JSON.stringify(Object.fromEntries(vocabulary.map((route) => [route, 1]))) &&
           JSON.stringify(mod.ROUTE_CLASSIFIED_REASONS) === JSON.stringify(["storage_busy_retry"]) &&
           nonBusySummary?.routes === undefined &&
+          nonBusySummary?.recordCountLast === 100_000 &&
+          hasNoRecordFields(mixedSummary) &&
           Buffer.byteLength(JSON.stringify(worstRouteLine)) <=
+            mod.REJECTION_SUMMARY_LINE_MAX_BYTES &&
+          Buffer.byteLength(JSON.stringify(saturatedMixedLine)) <=
             mod.REJECTION_SUMMARY_LINE_MAX_BYTES,
         {
           routes: vocabulary,
           worstRouteLineBytes: Buffer.byteLength(JSON.stringify(worstRouteLine)),
+          mixedLineBytes: Buffer.byteLength(JSON.stringify(saturatedMixedLine)),
           ceiling: mod.REJECTION_SUMMARY_LINE_MAX_BYTES,
         },
+      );
+      check(
+        "busy_summary_rejects_record_maps_even_when_the_caller_supplies_both",
+        hasNoRecordFields(mixedSummary) && mixedSummary?.count === vocabulary.length &&
+          JSON.stringify(mixedSummary.routes) === JSON.stringify(Object.fromEntries(vocabulary.map((route) => [route, 1]))),
+        { summary: mixedSummary },
+      );
+      check(
+        "mixed_diagnostic_saturated_summary_preserves_the_fixed_byte_ceiling",
+        mod.REJECTION_SUMMARY_LINE_MAX_BYTES === 640 &&
+          Buffer.byteLength(JSON.stringify(saturatedMixedLine)) <= mod.REJECTION_SUMMARY_LINE_MAX_BYTES,
+        { lineBytes: Buffer.byteLength(JSON.stringify(saturatedMixedLine)), ceiling: mod.REJECTION_SUMMARY_LINE_MAX_BYTES },
+      );
+      const edgeAgg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
+      edgeAgg.observeRejection("storage_busy_retry", "codex", undefined, "otlp");
+      edgeAgg.observeRejection("storage_busy_retry", "codex", fullRecordDiagnostic, "/hooks/codex");
+      routeNow += INTERVAL_MS;
+      const expiry = edgeAgg.observeRejection("storage_busy_retry", "codex", fullRecordDiagnostic, "/hooks/grok");
+      const final = edgeAgg.flush()[0];
+      check(
+        "busy_diagnostic_exclusivity_covers_suppressed_expiry_and_shutdown_paths",
+        expiry.summaries.length === 1 && hasNoRecordFields(expiry.summaries[0]) &&
+          expiry.summaries[0]?.count === 2 && expiry.summaries[0]?.suppressed === 1 &&
+          JSON.stringify(expiry.summaries[0]?.routes) === JSON.stringify({ "/hooks/codex": 1, otlp: 1 }) &&
+          hasNoRecordFields(final) && final?.count === 1 && final.routes?.["/hooks/grok"] === 1 &&
+          edgeAgg.flush().length === 0 && conservation(edgeAgg.counters()).ok,
+        { expiry: expiry.summaries, final },
+      );
+      const seeded = mod.createRejectionDiagnostics({ nowMs: () => routeNow,
+        initialByReason: { storage_busy_retry: { rejected: 3, suppressed: 2, emittedFirst: 1,
+          summarized: 0, openWindow: { count: 3, suppressed: 2 } } },
+      });
+      seeded.observeRejection("storage_busy_retry", "unknown", fullRecordDiagnostic, "otlp");
+      const seededSummary = seeded.flush()[0];
+      check(
+        "seeded_busy_counts_do_not_invent_routes_for_unattributed_history",
+        hasNoRecordFields(seededSummary) && seededSummary?.count === 4 &&
+          seededSummary.suppressed === 3 && JSON.stringify(seededSummary.routes) === JSON.stringify({ otlp: 1 }) &&
+          conservation(seeded.counters()).ok,
+        { summary: seededSummary, attribution: "three seeded observations have no route" },
       );
     }
 
