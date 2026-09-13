@@ -1064,21 +1064,27 @@ function activeTimerCount() {
 //
 // Counting catch clauses alone left the error bound somewhere else: a callback
 // parameter. So a guard counts wherever it sits in this function, and every
-// .catch argument and .then rejection handler in it is followed to the body it
-// names — an inline function or arrow, or an identifier resolved to the one
-// function of that name in this file — and that body is counted too. A handler
-// this file cannot resolve is refused rather than read: an unread handler
-// cannot be shown to be guard-free, so it reds the audit. That refusal is a
-// refusal, not a diagnosis: a const alias of a resolvable helper, a method
-// reference, a .bind() result and a parenthesised comma expression each count
-// as unresolved and red the audit with no defect present (REVIEW-89 N3). A
-// guard counts when it is a binary test or a case clause on the class's name:
-// instanceof and the name string as before, plus === <Class>.prototype on
-// either side, <expr>.constructor === <Class>, and the class reached through an
-// aliased import or a local alias, resolved to a fixpoint. It does NOT count a
-// call-form test (<Class>.prototype.isPrototypeOf(error)) or a class wrapped in
-// parentheses (instanceof (<Class>), === (<Class>).prototype): both audit clean
-// here, at this revision and at the one before it (REVIEW-89 N1).
+// callback this function hands to a promise is followed to the body it names:
+// the .catch and .finally argument, both .then arguments, and those three
+// reached through an element access (p["catch"](h)) as well as a property
+// access — whether the promise is the fetch's or a Promise.allSettled this
+// function only waits on (REVIEW-89 N4). An inline function or arrow, its own
+// parentheses included, is its own body; a bare identifier is resolved to the
+// one function of that name in this file; and that body is counted too. A
+// handler this file cannot resolve is refused rather than read: an unread
+// handler cannot be shown to be guard-free, so it reds the audit. That refusal
+// is a refusal, not a diagnosis, so the receipt names the spelling it refused
+// in unresolvedHandlerForms — const-alias, method-reference, bind-result,
+// comma-expression, call-result, shadowed-name, name-not-declared-in-this-file
+// or other — because every one of them can red the audit with no defect
+// present (REVIEW-89 N3). A guard counts when it is a binary test, a case
+// clause or an isPrototypeOf call on the class's name: instanceof and the name
+// string as before, plus === <Class>.prototype on either side,
+// <expr>.constructor === <Class>, <Class>.prototype.isPrototypeOf(error) and
+// the Object.prototype.isPrototypeOf.call(<Class>.prototype, error) spelling of
+// it, and the class reached through an aliased import or a local alias,
+// resolved to a fixpoint. Every operand is read through its parentheses, so
+// instanceof (<Class>) and === (<Class>).prototype count too (REVIEW-89 N1).
 //
 // The retry loop may be a for with no condition, a while (true) or a
 // do { } while (true). They are one loop written three ways, and a maintainer
@@ -1086,16 +1092,21 @@ function activeTimerCount() {
 // accepted; what stays load-bearing is that there is exactly one endless loop
 // and exactly one bindless try/catch inside it. The receipt names every loop
 // form found in the function, so a red over the loop count reports the shape it
-// found instead of leaving the reader to infer it.
+// found instead of leaving the reader to infer it. loopForms is asserted, but
+// only by count: exactly one of the forms it lists must be an endless one.
+// describeLoops and isEndlessLoop walk the function through two different
+// collections, so tying the field a reader reads to the count the audit decides
+// on is what makes a drift between them visible; asserting *which* form is
+// there would re-introduce the false red the three-form acceptance removed
+// (REVIEW-89 §9.10).
 //
 // What it cannot see: a ProofTimeoutError re-raised by a function this one
-// invokes rather than hands over as a callback; a handler reached other than
-// through a .catch or .then property access — a .finally() callback, an
-// element-access p["catch"](h), and a handler declared outside this function
-// and handed to Promise.allSettled(...).then(...) all audit clean (REVIEW-89
-// N4); the call-form and parenthesised identity tests above; and any shape
-// assembled at run time through eval or new Function. loopForms is emitted for
-// the reader and never asserted. No behavioural check backs the audit up for those: the guard
+// invokes rather than hands over as a callback; a handler named by anything but
+// an identifier this file declares a function for, which is refused rather than
+// read; a class or a handler that lives in another file; a guard whose class
+// operand is computed rather than named (instanceof (0, <Class>), which does
+// not compile here anyway); and any shape assembled at run time through eval or
+// new Function. No behavioural check backs the audit up for those: the guard
 // it exists to refuse is dead by construction, so it changes nothing a
 // behavioural check could observe. This is a shape check on one function body
 // and claims nothing past it.
@@ -1126,8 +1137,17 @@ function isEndlessLoop(node: ts.Node): node is ts.IterationStatement {
   return false;
 }
 
-// Named, not counted, so a red over the loop count says which loops are in the
-// function rather than only which one it wanted.
+// Parentheses carry no meaning of their own, so every operand below is read
+// through them: instanceof (<Class>) is instanceof <Class>. ts.skipParentheses
+// does exactly this but is not on the public TypeScript API surface, so this is
+// the same walk written against the types this build checks.
+function skipParentheses(expression: ts.Expression): ts.Expression {
+  let current = expression;
+  while (ts.isParenthesizedExpression(current)) current = current.expression;
+  return current;
+}
+
+// Named for the receipt, and counted only as "how many of these are endless".
 function describeLoops(root: ts.Node) {
   return collectNodes(root, isLoop).map((loop) => {
     if (ts.isForOfStatement(loop)) return "for-of";
@@ -1137,6 +1157,12 @@ function describeLoops(root: ts.Node) {
     if (ts.isWhileStatement(loop)) return endless ? "while(true)" : "while(condition)";
     return endless ? "do-while(true)" : "do-while(condition)";
   });
+}
+
+const ENDLESS_LOOP_FORMS = new Set(["for(;;)", "while(true)", "do-while(true)"]);
+
+function endlessLoopForms(forms: string[]) {
+  return forms.filter((form) => ENDLESS_LOOP_FORMS.has(form));
 }
 
 // Every name this file can use to reach the class: the class itself, an import
@@ -1169,25 +1195,52 @@ function timeoutErrorNames(sourceFile: ts.SourceFile) {
   return names;
 }
 
+type TimeoutGuard = ts.BinaryExpression | ts.CaseClause | ts.CallExpression;
+
 // instanceof ProofTimeoutError, name === "ProofTimeoutError", the same name
-// reached through a switch, and the two identity tests that never spell the
-// class — a prototype comparison and a constructor comparison — all count as
-// a guard: each one lets the handler decide it is holding a timeout and rethrow
-// it. Any name resolved to the class above stands in for the class here.
+// reached through a switch, and the three identity tests that never spell the
+// class — a prototype comparison, a constructor comparison and an isPrototypeOf
+// call — all count as a guard: each one lets the handler decide it is holding a
+// timeout and rethrow it. Any name resolved to the class above stands in for
+// the class here, and every operand is read through its parentheses.
 function timeoutGuardMatcher(names: Set<string>) {
-  const namesTheClass = (expression: ts.Expression) =>
-    (ts.isIdentifier(expression) && names.has(expression.text))
+  const namesTheClass = (operand: ts.Expression) => {
+    const expression = skipParentheses(operand);
+    return (ts.isIdentifier(expression) && names.has(expression.text))
       || (ts.isPropertyAccessExpression(expression) && names.has(expression.name.text));
-  const namesTheError = (expression: ts.Expression) =>
-    ts.isStringLiteralLike(expression) && expression.text === TIMEOUT_ERROR_NAME;
-  const readsThePrototype = (expression: ts.Expression) =>
-    ts.isPropertyAccessExpression(expression)
+  };
+  const namesTheError = (operand: ts.Expression) => {
+    const expression = skipParentheses(operand);
+    return ts.isStringLiteralLike(expression) && expression.text === TIMEOUT_ERROR_NAME;
+  };
+  const readsThePrototype = (operand: ts.Expression) => {
+    const expression = skipParentheses(operand);
+    return ts.isPropertyAccessExpression(expression)
       && expression.name.text === "prototype"
       && namesTheClass(expression.expression);
-  const readsAConstructor = (expression: ts.Expression) =>
-    ts.isPropertyAccessExpression(expression) && expression.name.text === "constructor";
-  return (node: ts.Node): node is ts.BinaryExpression | ts.CaseClause => {
+  };
+  const readsAConstructor = (operand: ts.Expression) => {
+    const expression = skipParentheses(operand);
+    return ts.isPropertyAccessExpression(expression) && expression.name.text === "constructor";
+  };
+  // <Class>.prototype.isPrototypeOf(error), and the same test spelled through
+  // Object.prototype.isPrototypeOf.call/apply(<Class>.prototype, error). Both
+  // decide "am I holding one of these" without ever writing instanceof, which
+  // is why a call is a guard shape here and not only a binary expression.
+  const testsThePrototypeByCall = (node: ts.CallExpression) => {
+    const callee = skipParentheses(node.expression);
+    if (!ts.isPropertyAccessExpression(callee)) return false;
+    if (callee.name.text === "isPrototypeOf") return readsThePrototype(callee.expression);
+    if (callee.name.text !== "call" && callee.name.text !== "apply") return false;
+    const method = skipParentheses(callee.expression);
+    return ts.isPropertyAccessExpression(method)
+      && method.name.text === "isPrototypeOf"
+      && node.arguments.length > 0
+      && readsThePrototype(node.arguments[0]);
+  };
+  return (node: ts.Node): node is TimeoutGuard => {
     if (ts.isCaseClause(node)) return namesTheError(node.expression);
+    if (ts.isCallExpression(node)) return testsThePrototypeByCall(node);
     if (!ts.isBinaryExpression(node)) return false;
     const operator = node.operatorToken.kind;
     if (operator === ts.SyntaxKind.InstanceOfKeyword) return namesTheClass(node.right);
@@ -1223,37 +1276,94 @@ function findFetchFunction(sourceFile: ts.SourceFile): ts.Node[] {
   return findFunctionsNamed(sourceFile, FETCH_TARGET_NAME);
 }
 
-// The rejection handlers the audited function hands to a promise: the argument
-// of .catch and the second argument of .then. An inline function or arrow is
-// its own body; a bare identifier is resolved to the one function of that name
-// in this file. Anything else — an imported handler, a shadowed name, a
-// handler built from an expression — is unresolved, and an unresolved handler
+// The three promise methods that take a callback this function never calls
+// itself. A guard can rethrow from any of them: .catch and .finally take one,
+// .then takes a fulfilment handler and a rejection handler, and a fulfilment
+// handler over Promise.allSettled sees every rejection the settle hid.
+const HANDLER_METHODS = new Set(["catch", "then", "finally"]);
+
+// p.catch(h) and p["catch"](h) are the same call. A computed name this file
+// cannot read as a literal is not a handler method here.
+function handlerMethodName(call: ts.CallExpression) {
+  const callee = skipParentheses(call.expression);
+  if (ts.isPropertyAccessExpression(callee)) return callee.name.text;
+  if (!ts.isElementAccessExpression(callee)) return undefined;
+  const name = skipParentheses(callee.argumentExpression);
+  return ts.isStringLiteralLike(name) ? name.text : undefined;
+}
+
+// undefined, null and void 0 in a handler position are the absence of a
+// handler — .then(undefined, h) is a .catch — not one this file failed to read.
+function isAbsentHandler(argument: ts.Expression) {
+  const expression = skipParentheses(argument);
+  return (ts.isIdentifier(expression) && expression.text === "undefined")
+    || expression.kind === ts.SyntaxKind.NullKeyword
+    || ts.isVoidExpression(expression);
+}
+
+// What a refused handler was written as, so the receipt names the spelling
+// instead of only the refusal.
+function describeHandlerForm(argument: ts.Expression, isConstAlias: (name: string) => boolean, resolved: number) {
+  const expression = skipParentheses(argument);
+  if (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) return "method-reference";
+  if (ts.isCallExpression(expression)) {
+    const callee = skipParentheses(expression.expression);
+    return ts.isPropertyAccessExpression(callee) && callee.name.text === "bind" ? "bind-result" : "call-result";
+  }
+  if (ts.isBinaryExpression(expression) && expression.operatorToken.kind === ts.SyntaxKind.CommaToken) return "comma-expression";
+  if (!ts.isIdentifier(expression)) return "other";
+  if (resolved > 1) return "shadowed-name";
+  return isConstAlias(expression.text) ? "const-alias" : "name-not-declared-in-this-file";
+}
+
+// The callbacks the audited function hands to a promise, by the methods above.
+// An inline function or arrow is its own body; a bare identifier is resolved to
+// the one function of that name in this file. Anything else — an imported
+// handler, a shadowed name, a const alias, a method reference, a .bind() result,
+// a handler built from an expression — is unresolved, and an unresolved handler
 // reds the audit because its body cannot be read here at all.
-function scanRejectionHandlers(root: ts.Node, sourceFile: ts.SourceFile, isTimeoutGuard: (node: ts.Node) => node is ts.BinaryExpression | ts.CaseClause) {
+function scanRejectionHandlers(root: ts.Node, sourceFile: ts.SourceFile, isTimeoutGuard: (node: ts.Node) => node is TimeoutGuard) {
   const handlers: ts.Expression[] = [];
   for (const call of collectNodes(root, ts.isCallExpression)) {
-    if (!ts.isPropertyAccessExpression(call.expression)) continue;
-    const method = call.expression.name.text;
-    if (method === "catch" && call.arguments.length > 0) handlers.push(call.arguments[0]);
-    if (method === "then" && call.arguments.length > 1) handlers.push(call.arguments[1]);
+    const method = handlerMethodName(call);
+    if (method === undefined || !HANDLER_METHODS.has(method)) continue;
+    const taken = method === "then" ? call.arguments.slice(0, 2) : call.arguments.slice(0, 1);
+    handlers.push(...taken.filter((argument) => !isAbsentHandler(argument)));
   }
+  // Built only when a handler is refused, so an audit with nothing to name does
+  // not pay for another walk of the file.
+  let aliasNames: Set<string> | undefined;
+  const isConstAlias = (name: string) => {
+    aliasNames ??= new Set(collectNodes(sourceFile, (node): node is ts.VariableDeclaration =>
+      ts.isVariableDeclaration(node)
+        && ts.isIdentifier(node.name)
+        && node.initializer !== undefined
+        && ts.isIdentifier(node.initializer))
+      .map((declaration) => (declaration.name as ts.Identifier).text));
+    return aliasNames.has(name);
+  };
   let guards = 0;
   let unresolved = 0;
+  const forms = new Set<string>();
   for (const handler of handlers) {
+    const expression = skipParentheses(handler);
     let body: ts.Node | undefined;
-    if (ts.isFunctionExpression(handler) || ts.isArrowFunction(handler)) {
-      body = handler;
-    } else if (ts.isIdentifier(handler)) {
-      const resolved = findFunctionsNamed(sourceFile, handler.text);
-      body = resolved.length === 1 ? resolved[0] : undefined;
+    let resolved = 0;
+    if (ts.isFunctionExpression(expression) || ts.isArrowFunction(expression)) {
+      body = expression;
+    } else if (ts.isIdentifier(expression)) {
+      const matches = findFunctionsNamed(sourceFile, expression.text);
+      resolved = matches.length;
+      body = matches.length === 1 ? matches[0] : undefined;
     }
     if (!body) {
       unresolved += 1;
+      forms.add(describeHandlerForm(handler, isConstAlias, resolved));
       continue;
     }
     if (collectNodes(body, isTimeoutGuard).length > 0) guards += 1;
   }
-  return { handlers: handlers.length, guards, unresolved };
+  return { handlers: handlers.length, guards, unresolved, forms: [...forms].sort() };
 }
 
 function auditFetchSource(fileText: string) {
@@ -1267,6 +1377,7 @@ function auditFetchSource(fileText: string) {
     rejectionHandlers: 0,
     callbackGuards: 0,
     unresolvedHandlers: 0,
+    unresolvedHandlerForms: [] as string[],
     forEver: 0,
     loopForms: [] as string[],
     retryLoopBindless: false,
@@ -1296,6 +1407,7 @@ function auditFetchSource(fileText: string) {
   const timeoutGuards = collectNodes(matches[0], isTimeoutGuard).length;
   const rejection = scanRejectionHandlers(matches[0], sourceFile, isTimeoutGuard);
   const endless = collectNodes(matches[0], isEndlessLoop);
+  const loopForms = describeLoops(matches[0]);
   const retryTries = endless.length === 1 ? collectNodes(endless[0].statement, ts.isTryStatement) : [];
   const retryLoopBindless = retryTries.length === 1
     && retryTries[0].catchClause !== undefined
@@ -1310,8 +1422,9 @@ function auditFetchSource(fileText: string) {
     rejectionHandlers: rejection.handlers,
     callbackGuards: rejection.guards,
     unresolvedHandlers: rejection.unresolved,
+    unresolvedHandlerForms: rejection.forms,
     forEver: endless.length,
-    loopForms: describeLoops(matches[0]),
+    loopForms,
     retryLoopBindless,
     diagnostic: "",
     clean: catchBindings === 0
@@ -1320,6 +1433,7 @@ function auditFetchSource(fileText: string) {
       && rejection.guards === 0
       && rejection.unresolved === 0
       && endless.length === 1
+      && endlessLoopForms(loopForms).length === 1
       && retryLoopBindless,
   };
 }
@@ -1334,6 +1448,7 @@ type FetchSourceAnchors = {
   loopHeadStart: number;
   loopBodyStart: number;
   loopBodyEnd: number;
+  loopEnd: number;
   fetchCallEnd: number;
   bodyCatchArgStart: number;
   bodyCatchArgEnd: number;
@@ -1351,24 +1466,54 @@ type FetchSourceAnchors = {
 // single-argument .catch( call inside the retry try, because the probes splice
 // at those two nodes. A benign refactor of the shipped function that adds a
 // second .catch( in the try, or moves fetch into a local helper, therefore
-// takes the anchor-miss path: the probe check reds with probes: 0 and carries
-// the primary audit, which still says clean (REVIEW-89 N2). That is a false
-// red that costs the next reader a look at the receipt, not an escape.
-function fetchSourceAnchors(fileText: string): FetchSourceAnchors | undefined {
+// takes the anchor-miss path (REVIEW-89 N2). Keeping the requirement strict is
+// the choice here: loosening it would mean guessing which of two .catch calls
+// is the body read's, which is the retargeting the parser offsets exist to
+// make impossible. So the refusal stays, and instead it says what it wanted —
+// every miss carries the requirement it failed and the number it measured, and
+// the receipt already carries the primary audit beside it, so a reader tells a
+// benign refactor (audit clean, one anchor requirement short) from a sabotage
+// (audit not clean) from the receipt alone.
+type AnchorMiss = { requirement: string; measured: Record<string, number> };
+
+function isAnchorMiss(located: FetchSourceAnchors | AnchorMiss): located is AnchorMiss {
+  return "requirement" in located;
+}
+
+function fetchSourceAnchors(fileText: string): FetchSourceAnchors | AnchorMiss {
   const sourceFile = ts.createSourceFile(scriptPath, fileText, ts.ScriptTarget.Latest, true, ts.ScriptKind.TS);
   const matches = findFetchFunction(sourceFile);
-  if (matches.length !== 1) return undefined;
+  if (matches.length !== 1) {
+    return { requirement: `exactly one ${FETCH_TARGET_NAME} in the file`, measured: { functions: matches.length } };
+  }
   const endless = collectNodes(matches[0], isEndlessLoop);
-  if (endless.length !== 1) return undefined;
+  if (endless.length !== 1) {
+    return { requirement: "exactly one endless loop in the function", measured: { endlessLoops: endless.length } };
+  }
   const tries = collectNodes(endless[0].statement, ts.isTryStatement);
-  if (tries.length !== 1) return undefined;
+  if (tries.length !== 1) {
+    return { requirement: "exactly one try in the endless loop", measured: { tries: tries.length } };
+  }
   const clause = tries[0].catchClause;
-  if (!clause || clause.variableDeclaration) return undefined;
+  if (!clause || clause.variableDeclaration) {
+    return {
+      requirement: "a bindless catch on the retry try",
+      measured: { catchClauses: clause ? 1 : 0, catchBindings: clause?.variableDeclaration ? 1 : 0 },
+    };
+  }
   const calls = collectNodes(tries[0].tryBlock, ts.isCallExpression);
   const fetchCalls = calls.filter((call) => ts.isIdentifier(call.expression) && call.expression.text === "fetch");
   const bodyCatches = calls.filter((call) =>
     ts.isPropertyAccessExpression(call.expression) && call.expression.name.text === "catch");
-  if (fetchCalls.length !== 1 || bodyCatches.length !== 1 || bodyCatches[0].arguments.length !== 1) return undefined;
+  if (fetchCalls.length !== 1) {
+    return { requirement: "exactly one fetch( call in the retry try", measured: { fetchCalls: fetchCalls.length } };
+  }
+  if (bodyCatches.length !== 1 || bodyCatches[0].arguments.length !== 1) {
+    return {
+      requirement: "exactly one single-argument .catch( call in the retry try",
+      measured: { catchCalls: bodyCatches.length, catchArguments: bodyCatches[0]?.arguments.length ?? 0 },
+    };
+  }
   return {
     beforeFunction: matches[0].getStart(sourceFile),
     beforeTry: tries[0].getStart(sourceFile),
@@ -1378,6 +1523,7 @@ function fetchSourceAnchors(fileText: string): FetchSourceAnchors | undefined {
     loopHeadStart: endless[0].getStart(sourceFile),
     loopBodyStart: endless[0].statement.getStart(sourceFile),
     loopBodyEnd: endless[0].statement.getEnd(),
+    loopEnd: endless[0].getEnd(),
     fetchCallEnd: fetchCalls[0].getEnd(),
     bodyCatchArgStart: bodyCatches[0].arguments[0].getStart(sourceFile),
     bodyCatchArgEnd: bodyCatches[0].arguments[0].getEnd(),
@@ -1390,20 +1536,24 @@ function fetchSourceAnchors(fileText: string): FetchSourceAnchors | undefined {
 // the lexical strip against the two sabotages they were used to hide.
 function proveFetchSourceAudit(proofSource: string) {
   const checkName = "debugger_target_source_audit_ignores_comments_and_spacing_but_still_catches_a_binding_or_a_guard";
-  const anchors = fetchSourceAnchors(proofSource);
-  if (!anchors) {
-    // The anchors go missing exactly when a sabotage lands, so the receipt that
-    // reports it carries the primary audit of the same source: the run that
-    // fails says which counts moved instead of only that the probes were
-    // skipped.
+  const located = fetchSourceAnchors(proofSource);
+  if (isAnchorMiss(located)) {
+    // The anchors go missing when a sabotage lands and when a benign refactor
+    // moves one of the nodes they name, so the receipt carries both halves of
+    // that question: which anchor requirement failed and what it measured, and
+    // the primary audit of the same source. A clean audit beside a missed
+    // anchor is a refactor; a red one is a sabotage.
     check(checkName, false, JSON.stringify({
       method: "typescript-ast",
       error: "retry_catch_anchors_not_found",
+      requirement: located.requirement,
+      measured: located.measured,
       probes: 0,
       audit: auditFetchSource(proofSource),
     }));
     return;
   }
+  const anchors = located;
   const applyEdits = (edits: SourceEdit[]) => [...edits]
     .sort((left, right) => right.start - left.start)
     .reduce((text, edit) => text.slice(0, edit.start) + edit.text + text.slice(edit.end), proofSource);
@@ -1414,12 +1564,24 @@ function proveFetchSourceAudit(proofSource: string) {
   const outside = (text: string): SourceEdit => ({ start: anchors.beforeFunction, end: anchors.beforeFunction, text });
   const onFetch = (text: string): SourceEdit => ({ start: anchors.fetchCallEnd, end: anchors.fetchCallEnd, text });
   const bodyHandler = (text: string): SourceEdit => ({ start: anchors.bodyCatchArgStart, end: anchors.bodyCatchArgEnd, text });
-  const loopHead = (text: string): SourceEdit => ({ start: anchors.loopHeadStart, end: anchors.loopBodyStart, text });
   const beforeLoop = (text: string): SourceEdit => ({ start: anchors.loopHeadStart, end: anchors.loopHeadStart, text });
-  const afterLoopBody = (text: string): SourceEdit => ({ start: anchors.loopBodyEnd, end: anchors.loopBodyEnd, text });
+  // A loop probe replaces the whole statement around the loop body: the header
+  // before it and, for a do-while, the trailing while after it. Rewriting only
+  // the header would leave the shipped loop's own tail behind and count a
+  // second loop, so the probe set said the right thing about the three
+  // accepted loop forms only while this file happened to ship the for one
+  // (REVIEW-89 §3). For a for or a while the tail is empty and this is the
+  // header edit it was before.
+  const loopAs = (head: string, tail: string): SourceEdit[] => [
+    { start: anchors.loopHeadStart, end: anchors.loopBodyStart, text: head },
+    { start: anchors.loopBodyEnd, end: anchors.loopEnd, text: tail },
+  ];
   const guardStatement = "\n        if (error instanceof ProofTimeoutError) throw error;";
   const rethrowHelper = "function rethrowIfTimeout(error: unknown): never {\n  if (error instanceof ProofTimeoutError) throw error;\n  throw error as Error;\n}\n";
   const silentHelper = "function ignoreRejection(error: unknown): void {\n  void error;\n}\n";
+  const aliasHelper = "const boundRethrow = rethrowIfTimeout;\n";
+  const holderHelper = "const rejectionGuards = { rethrow(error: unknown): never { if (error instanceof ProofTimeoutError) throw error; throw error as Error } };\n";
+  const settledHelper = "function inspectSettled(results: PromiseSettledResult<unknown>[]): void {\n  for (const result of results) {\n    if (result.status === \"rejected\" && result.reason instanceof ProofTimeoutError) throw result.reason;\n  }\n}\n";
   const unescapedRegexOpener = "const slashy = /[/*]/;\n      if (slashy.test(url)) attempts += 0;\n      ";
   const named = [
     { name: "unmodified", source: proofSource, expected: true },
@@ -1481,13 +1643,47 @@ function proveFetchSourceAudit(proofSource: string) {
     { name: "benign_handler_naming_the_class_in_a_string", source: applyEdits([onFetch(".catch(() => { const prose = \"instanceof ProofTimeoutError\"; throw new Error(prose) })")]), expected: true },
     // The endless retry loop, in each form that is the same loop, and in the
     // forms that are not.
-    { name: "retry_loop_rewritten_as_while_true", source: applyEdits([loopHead("while (true) ")]), expected: true },
-    { name: "retry_loop_rewritten_as_do_while_true", source: applyEdits([loopHead("do "), afterLoopBody(" while (true);")]), expected: true },
-    { name: "retry_loop_with_an_initializer_and_no_condition", source: applyEdits([loopHead("for (let round = 0; ; round += 1) ")]), expected: true },
+    { name: "retry_loop_rewritten_as_while_true", source: applyEdits(loopAs("while (true) ", "")), expected: true },
+    { name: "retry_loop_rewritten_as_do_while_true", source: applyEdits(loopAs("do ", " while (true);")), expected: true },
+    { name: "retry_loop_with_an_initializer_and_no_condition", source: applyEdits(loopAs("for (let round = 0; ; round += 1) ", "")), expected: true },
     { name: "retry_loop_behind_a_label", source: applyEdits([beforeLoop("retry: ")]), expected: true },
-    { name: "retry_loop_given_a_real_while_condition", source: applyEdits([loopHead("while (attempts < 3) ")]), expected: false },
-    { name: "retry_loop_given_a_real_do_while_condition", source: applyEdits([loopHead("do "), afterLoopBody(" while (attempts < 3);")]), expected: false },
+    { name: "retry_loop_given_a_real_while_condition", source: applyEdits(loopAs("while (attempts < 3) ", "")), expected: false },
+    { name: "retry_loop_given_a_real_do_while_condition", source: applyEdits(loopAs("do ", " while (attempts < 3);")), expected: false },
     { name: "second_endless_loop_around_the_retry", source: applyEdits([beforeLoop("while (true) ")]), expected: false },
+    // A live guard that decides it is holding a ProofTimeoutError without a
+    // binary test on a bare class name: the call form, the same call spelled
+    // through Object.prototype, and the class behind parentheses. All three
+    // audited clean at the revision before this one, in the position of the
+    // must-red probe two rows above (REVIEW-89 N1).
+    { name: "callback_guard_by_isprototypeof_on_the_body_cancel_handler", source: applyEdits([bodyHandler("(error) => { if (ProofTimeoutError.prototype.isPrototypeOf(error as object)) throw error; }")]), expected: false },
+    { name: "callback_guard_by_isprototypeof_through_object_prototype_call", source: applyEdits([bodyHandler("(error) => { if (Object.prototype.isPrototypeOf.call(ProofTimeoutError.prototype, error)) throw error; }")]), expected: false },
+    { name: "callback_guard_with_the_class_in_parentheses", source: applyEdits([bodyHandler("(error) => { if (error instanceof (ProofTimeoutError)) throw error; }")]), expected: false },
+    { name: "prototype_identity_guard_with_the_class_in_parentheses", source: applyEdits([bodyHandler("(error) => { if (Object.getPrototypeOf(error) === (ProofTimeoutError).prototype) throw error; }")]), expected: false },
+    { name: "isprototypeof_guard_in_the_bindless_catch", source: applyEdits([body("\n        if (ProofTimeoutError.prototype.isPrototypeOf(error as object)) throw error;")]), expected: false },
+    // The same two shapes against a class this audit says nothing about stay
+    // green: reading through parentheses and reading a prototype call must not
+    // make every type test a guard.
+    { name: "benign_isprototypeof_against_another_class", source: applyEdits([bodyHandler("(error) => { if (Error.prototype.isPrototypeOf(error as object)) throw error; }")]), expected: true },
+    { name: "benign_instanceof_another_class_in_parentheses", source: applyEdits([bodyHandler("(error) => { if (error instanceof (RangeError)) throw error; }")]), expected: true },
+    // A handler reached other than through a .catch/.then property access: the
+    // .finally callback, the element-access spellings of both, and a handler
+    // declared outside and handed to Promise.allSettled(...).then. All four
+    // audited clean at the revision before this one (REVIEW-89 N4).
+    { name: "callback_guard_in_a_finally_callback", source: applyEdits([outside(rethrowHelper), onFetch(".finally(rethrowIfTimeout)")]), expected: false },
+    { name: "callback_guard_through_an_element_access_catch", source: applyEdits([outside(rethrowHelper), onFetch("[\"catch\"](rethrowIfTimeout)")]), expected: false },
+    { name: "callback_guard_through_an_element_access_then", source: applyEdits([outside(rethrowHelper), onFetch("['then']((settled) => settled, rethrowIfTimeout)")]), expected: false },
+    { name: "callback_guard_in_a_settled_handler_declared_outside", source: applyEdits([outside(settledHelper), before("void Promise.allSettled([Promise.resolve(url)]).then(inspectSettled);\n      ")]), expected: false },
+    // The same three positions carrying no guard stay green.
+    { name: "benign_finally_callback_without_a_guard", source: applyEdits([onFetch(".finally(() => { attempts += 0 })")]), expected: true },
+    { name: "benign_then_fulfilment_handler_without_a_guard", source: applyEdits([onFetch(".then((settled) => settled)")]), expected: true },
+    { name: "benign_parenthesised_inline_handler_without_a_guard", source: applyEdits([onFetch(".catch(((error) => { void error; throw error as Error }))")]), expected: true },
+    // The four handler spellings the audit refuses rather than reads, each one
+    // named in unresolvedHandlerForms so the red says what it is looking at
+    // (REVIEW-89 N3).
+    { name: "callback_handler_const_alias_of_a_resolvable_helper", source: applyEdits([outside(rethrowHelper), outside(aliasHelper), onFetch(".catch(boundRethrow)")]), expected: false },
+    { name: "callback_handler_method_reference", source: applyEdits([outside(holderHelper), onFetch(".catch(rejectionGuards.rethrow)")]), expected: false },
+    { name: "callback_handler_bind_result", source: applyEdits([outside(rethrowHelper), onFetch(".catch(rethrowIfTimeout.bind(null))")]), expected: false },
+    { name: "callback_handler_comma_expression", source: applyEdits([outside(rethrowHelper), onFetch(".catch((0, rethrowIfTimeout))")]), expected: false },
   ];
   // Every literal opener that defeated the lexical strip, crossed with every
   // closer it was paired with and with the two sabotages they were used to
@@ -1534,6 +1730,7 @@ function proveFetchSourceAudit(proofSource: string) {
       unresolvedHandlers: audit.unresolvedHandlers,
       forEver: audit.forEver,
       loopForms: audit.loopForms,
+      ...(audit.unresolvedHandlerForms.length ? { unresolvedHandlerForms: audit.unresolvedHandlerForms } : {}),
       ...(audit.diagnostic ? { diagnostic: audit.diagnostic } : {}),
     };
   });
@@ -1542,7 +1739,7 @@ function proveFetchSourceAudit(proofSource: string) {
   const benign = results.filter((result) => result.expected);
   check(
     checkName,
-    named.length === 57 && matrix.length === 60 && results.length === 117 && mismatches.length === 0,
+    named.length === 75 && matrix.length === 60 && results.length === 135 && mismatches.length === 0,
     JSON.stringify({
       method: "typescript-ast",
       probes: results.length,
