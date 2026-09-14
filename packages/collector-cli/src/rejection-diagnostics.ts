@@ -125,15 +125,17 @@ export const REJECTION_ROUTES = (Object.keys(REJECTION_ROUTE_ORDER) as Rejection
  * cannot tell those apart for one producer. Bounding the breakdown to this one
  * reason lets the window enforce exclusivity: ingest builds no record
  * statistics for a route-classified reason (it counts the discarded
- * diagnostics instead), and `closeWindow` omits them again even if a caller
- * supplies both diagnostics. Thus a summary contains record-array maps or a
- * route map, never both, and stays inside `REJECTION_SUMMARY_LINE_MAX_BYTES`.
+ * diagnostics instead), so a summary contains record-array maps or a route
+ * map, never both, and stays inside `REJECTION_SUMMARY_LINE_MAX_BYTES`.
  *
- * Frozen, not merely `readonly`: both gates read it live, so a runtime push
- * between a window's open and its close would make the two disagree and strip
+ * The ingest gate is the only reader, and it reads the reason normalised with
+ * `String()` — the same value the window is keyed by and stores — so no caller
+ * can classify one way and land on a window classified the other way.
+ *
+ * Frozen, not merely `readonly`: a runtime push between a window's open and
+ * its close would widen the vocabulary under an already-open window and strip
  * that window's record diagnostics with no counter and no log. `Object.freeze`
- * makes that mutation a `TypeError` instead, and leaves `closeWindow`'s guard
- * covering only a caller that reaches the window past the reason type.
+ * makes that mutation a `TypeError` instead.
  */
 export const ROUTE_CLASSIFIED_REASONS: readonly HttpBoundaryReason[] = Object.freeze([
   "storage_busy_retry",
@@ -282,12 +284,12 @@ function updateRecordStats(
 
 /**
  * Fold one observation's record diagnostic into its window. A route-classified
- * window can never emit record statistics — `closeWindow` omits them — so it
- * never builds them: it counts the discarded diagnostics instead of paying a
- * copy and a `Math.max` over every closed record-array key per suppressed
- * rejection for state that has no way out. `window.recordStats` stays
- * undefined for those reasons, and the `closeWindow` guard is the second line
- * of defence rather than the only one.
+ * window can never emit record statistics, so it never builds them: it counts
+ * the discarded diagnostics instead of paying a copy and a `Math.max` over
+ * every closed record-array key per suppressed rejection for state that has no
+ * way out. `window.recordStats` stays undefined for those reasons, and because
+ * the gate reads the same normalised reason the window is keyed by, this is
+ * the only place the exclusivity has to be enforced.
  */
 function applyRecordDiagnostic(
   window: WindowState,
@@ -359,6 +361,10 @@ export function createRejectionDiagnostics(options: {
     }
   }
 
+  /**
+   * `reason` arrives normalised from `observeRejection`, so the window key and
+   * the reason this state stores are that one value and cannot disagree.
+   */
   const stateFor = (reason: HttpBoundaryReason, clientClass: RejectionClientClass): ReasonState => {
     const key = `${reason}:${clientClass}`;
     let state = states.get(key);
@@ -386,7 +392,7 @@ export function createRejectionDiagnostics(options: {
       suppressed: window.suppressed,
       intervalMs: REJECTION_SUMMARY_INTERVAL_MS,
       action: HTTP_REJECTION_NEXT_ACTIONS[state.reason],
-      ...(window.recordStats && !ROUTE_CLASSIFIED_REASONS.includes(state.reason)
+      ...(window.recordStats
         ? {
             recordCountLast: window.recordStats.last.recordCount,
             recordCountMax: window.recordStats.max.recordCount,
@@ -415,7 +421,18 @@ export function createRejectionDiagnostics(options: {
       route?: RejectionRoute,
     ): RejectionObservation {
       const now = nowMs();
-      const routeClassified = ROUTE_CLASSIFIED_REASONS.includes(reason);
+      // Normalise once, at the gate. `stateFor` keys a window by a template
+      // literal, which coerces; `Array.prototype.includes` compares with
+      // SameValueZero, which does not. A `String` object therefore used to
+      // classify as unclassified and still land on the route-classified
+      // window, building statistics that window could never emit. The gate,
+      // the window key and the stored reason all read this one value, so no
+      // reason shape can make them disagree; a boxed reason now takes the
+      // route-classified branch and its diagnostics are counted, not dropped
+      // silently. Coerced once, not three times: an object whose `toString`
+      // returns a different string per call cannot split them either.
+      const normalizedReason = String(reason) as HttpBoundaryReason;
+      const routeClassified = ROUTE_CLASSIFIED_REASONS.includes(normalizedReason);
       const classifiedRoute = routeClassified ? route : undefined;
       const summaries: RejectionSummaryLine[] = [];
       for (const state of states.values()) {
@@ -427,7 +444,7 @@ export function createRejectionDiagnostics(options: {
         }
       }
 
-      const state = stateFor(reason, clientClass);
+      const state = stateFor(normalizedReason, clientClass);
       // Saturated: keep decisions and HTTP behavior unchanged, freeze counting.
       if (state.rejected >= REJECTION_COUNTER_CAP) {
         return { first: false, summaries };

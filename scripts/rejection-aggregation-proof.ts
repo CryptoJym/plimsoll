@@ -1505,53 +1505,131 @@ async function routeClassificationChecks() {
         },
       );
 
-      // F4 (REVIEW-85 §3): `closeWindow` strips record statistics a
-      // route-classified window can never emit, and on one path it is the
-      // only defence. This pins it WITHOUT mutating the now-frozen vocabulary.
+      // eco-6hoxj.111 (REVIEW-99 §3, residual 11): the ingest gate normalises
+      // the reason, so the gate, the window key and the reason the window
+      // state stores are one value and cannot disagree.
       //
-      // A window is identified by `${reason}:${clientClass}`, but the ingest
-      // gate classifies the raw `reason` argument with `Array.prototype`
-      // `.includes` (SameValueZero). A caller that passes a String object
-      // instead of a string primitive therefore lands on the already-open
-      // route-classified window while the gate reads its reason as
-      // unclassified: ingest builds record statistics the window can never
-      // emit, and only the guard keeps them off the line. TypeScript forbids
-      // that caller — which is the point. The emitter, not caller convention,
-      // owns the bound, and this is the construction that shows it.
+      // A window is identified by `${reason}:${clientClass}`, a template
+      // literal, which coerces. The gate used to classify the RAW argument
+      // with `Array.prototype.includes` (SameValueZero), which does not. A
+      // caller passing a `String` object therefore landed on the already-open
+      // route-classified window while the gate read its reason as
+      // unclassified: ingest built record statistics that window could never
+      // emit, and `closeWindow`'s guard silently dropped them at the end.
+      // `observeRejection` now coerces once with `String()` and the gate, the
+      // key and the stored reason all read that one value, so the boxed
+      // caller takes the route-classified branch: no statistics are built and
+      // the discarded diagnostics are COUNTED. The guard that used to catch
+      // this is unreachable and is gone; this check replaces the pin on it.
+      //
+      // TypeScript forbids this caller — which is the point. The emitter, not
+      // caller convention, owns the bound, so the check constructs it anyway.
       const boxedReason = (reason: string) => new String(reason) as unknown as never;
-      const guardAgg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
-      guardAgg.observeRejection("storage_busy_retry", "otlp_exporter", undefined, "otlp");
-      guardAgg.observeRejection(boxedReason("storage_busy_retry"), "otlp_exporter", fullRecordDiagnostic);
-      const guardedSummary = guardAgg.flush()[0];
-      // Control: the same construction on a reason the guard does not cover
-      // must carry all six record fields, so a clean subject is the guard and
-      // not an injection that quietly built no record statistics at all.
-      const guardControlAgg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
-      guardControlAgg.observeRejection("otlp_record_limit_exceeded", "otlp_exporter", undefined);
-      guardControlAgg.observeRejection(boxedReason("otlp_record_limit_exceeded"), "otlp_exporter", fullRecordDiagnostic);
-      const guardControlSummary = guardControlAgg.flush()[0];
+      const BOXED_FEED = 3;
+      const boxedAgg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
+      boxedAgg.observeRejection("storage_busy_retry", "otlp_exporter", undefined, "otlp");
+      for (let index = 0; index < BOXED_FEED; index += 1) {
+        boxedAgg.observeRejection(boxedReason("storage_busy_retry"), "otlp_exporter", fullRecordDiagnostic);
+      }
+      const boxedCounters = boxedAgg.counters();
+      // The window state stores the NORMALISED reason: the counters row is the
+      // only place outside the summary that exposes it, and it must be the
+      // string primitive the window is keyed by, not the object handed in.
+      const boxedRow = boxedCounters.reasons.find(
+        (row) => String(row.reason) === "storage_busy_retry",
+      );
+      const boxedStoredReasonIsPrimitive =
+        boxedRow !== undefined &&
+        typeof boxedRow.reason === "string" &&
+        String(boxedRow.reason) === "storage_busy_retry" &&
+        boxedCounters.reasons.length === 1;
+      const boxedSummary = boxedAgg.flush()[0];
+      // Same feed, primitive reason: behaviour must be unchanged, which here
+      // means BYTE-IDENTICAL to the boxed line. That is the whole claim — the
+      // gate no longer distinguishes the two shapes.
+      const primitiveAgg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
+      primitiveAgg.observeRejection("storage_busy_retry", "otlp_exporter", undefined, "otlp");
+      for (let index = 0; index < BOXED_FEED; index += 1) {
+        primitiveAgg.observeRejection("storage_busy_retry", "otlp_exporter", fullRecordDiagnostic);
+      }
+      const primitiveSummary = primitiveAgg.flush()[0];
+      // Second arm: the boxed reason OPENS the window. `stateFor` is handed
+      // the coerced value, so the key and the reason the state stores are the
+      // same primitive. `counters()` is the only surface that exposes the
+      // stored reason unserialised — `JSON.stringify` renders a `String`
+      // object and a string primitive identically, `typeof` does not, so this
+      // is the assertion that catches a state that kept the raw argument.
+      const boxedFirstAgg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
+      for (let index = 0; index < BOXED_FEED; index += 1) {
+        boxedFirstAgg.observeRejection(boxedReason("storage_busy_retry"), "otlp_exporter", fullRecordDiagnostic, "otlp");
+      }
+      const boxedFirstCounters = boxedFirstAgg.counters();
+      const boxedFirstRow = boxedFirstCounters.reasons[0];
+      const boxedFirstStoredReasonIsPrimitive =
+        boxedFirstRow !== undefined &&
+        typeof boxedFirstRow.reason === "string" &&
+        String(boxedFirstRow.reason) === "storage_busy_retry" &&
+        boxedFirstCounters.reasons.length === 1 &&
+        conservation(boxedFirstCounters).ok;
+      const boxedFirstSummary = boxedFirstAgg.flush()[0];
+      const primitiveFirstAgg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
+      for (let index = 0; index < BOXED_FEED; index += 1) {
+        primitiveFirstAgg.observeRejection("storage_busy_retry", "otlp_exporter", fullRecordDiagnostic, "otlp");
+      }
+      const primitiveFirstSummary = primitiveFirstAgg.flush()[0];
+      // Control: the same boxed construction on a reason that is NOT
+      // route-classified still carries all six record fields, so a clean busy
+      // line is the gate classifying the boxed reason and not an injection
+      // that quietly built no record statistics at all.
+      const boxedControlAgg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
+      boxedControlAgg.observeRejection("otlp_record_limit_exceeded", "otlp_exporter", undefined);
+      boxedControlAgg.observeRejection(boxedReason("otlp_record_limit_exceeded"), "otlp_exporter", fullRecordDiagnostic);
+      const boxedControlSummary = boxedControlAgg.flush()[0];
       check(
-        "close_window_strips_record_statistics_a_route_classified_window_can_never_emit",
-        hasNoRecordFields(guardedSummary) &&
-          hasAllRecordFields(guardControlSummary) &&
-          guardedSummary?.count === 2 &&
-          guardedSummary.suppressed === 1 &&
-          JSON.stringify(guardedSummary.routes) === JSON.stringify({ otlp: 1 }) &&
-          // the drop is silent on this path: the counter is an ingest-side
-          // count and this caller never reached the ingest gate's busy branch
-          guardedSummary.recordDiagnosticsDiscarded === undefined &&
-          guardControlSummary?.recordCountMax === 100_000 &&
-          guardControlSummary.decodedBytesMax === 2_097_152 &&
-          guardControlSummary.routes === undefined &&
-          Buffer.byteLength(JSON.stringify(guardedSummary)) <=
+        "ingest_gate_normalises_the_reason_so_a_boxed_reason_is_classified_and_its_diagnostics_counted",
+        // classified: no record statistics were built for the busy window …
+        hasNoRecordFields(boxedSummary) &&
+          // … and every dropped diagnostic is counted, not silently discarded
+          boxedSummary?.recordDiagnosticsDiscarded === BOXED_FEED &&
+          boxedSummary.count === BOXED_FEED + 1 &&
+          boxedSummary.suppressed === BOXED_FEED &&
+          JSON.stringify(boxedSummary.routes) === JSON.stringify({ otlp: 1 }) &&
+          // the boxed observations landed on the ONE window the primitive
+          // opened, and that window stores the normalised reason
+          boxedStoredReasonIsPrimitive &&
+          // …and a window the boxed reason OPENED stores it normalised too,
+          // so the key and the stored reason agree whoever opened the window
+          boxedFirstStoredReasonIsPrimitive &&
+          hasNoRecordFields(boxedFirstSummary) &&
+          boxedFirstSummary?.recordDiagnosticsDiscarded === BOXED_FEED &&
+          JSON.stringify(boxedFirstSummary) === JSON.stringify(primitiveFirstSummary) &&
+          // primitive reason: unchanged, and byte-identical to the boxed line
+          JSON.stringify(primitiveSummary) === JSON.stringify(boxedSummary) &&
+          // an unclassified reason is untouched by the normalisation
+          hasAllRecordFields(boxedControlSummary) &&
+          boxedControlSummary?.recordCountMax === 100_000 &&
+          boxedControlSummary.decodedBytesMax === 2_097_152 &&
+          boxedControlSummary.routes === undefined &&
+          boxedControlSummary.recordDiagnosticsDiscarded === undefined &&
+          Buffer.byteLength(JSON.stringify(boxedSummary)) <=
             mod.REJECTION_SUMMARY_LINE_MAX_BYTES &&
-          conservation(guardAgg.counters()).ok,
+          conservation(boxedCounters).ok &&
+          conservation(boxedAgg.counters()).ok,
         {
-          guardedLine: JSON.stringify(guardedSummary),
-          guardedLineBytes: Buffer.byteLength(JSON.stringify(guardedSummary)),
-          controlLine: JSON.stringify(guardControlSummary),
-          controlLineBytes: Buffer.byteLength(JSON.stringify(guardControlSummary)),
-          stripped: hasNoRecordFields(guardedSummary),
+          fed: BOXED_FEED,
+          boxedLine: JSON.stringify(boxedSummary),
+          boxedLineBytes: Buffer.byteLength(JSON.stringify(boxedSummary)),
+          primitiveLine: JSON.stringify(primitiveSummary),
+          linesIdentical: JSON.stringify(primitiveSummary) === JSON.stringify(boxedSummary),
+          discarded: boxedSummary?.recordDiagnosticsDiscarded ?? null,
+          storedReasonType: boxedRow === undefined ? "missing" : typeof boxedRow.reason,
+          windowsOpened: boxedCounters.reasons.length,
+          boxedOpenedStoredReasonType:
+            boxedFirstRow === undefined ? "missing" : typeof boxedFirstRow.reason,
+          boxedOpenedLine: JSON.stringify(boxedFirstSummary),
+          primitiveOpenedLine: JSON.stringify(primitiveFirstSummary),
+          controlLine: JSON.stringify(boxedControlSummary),
+          controlLineBytes: Buffer.byteLength(JSON.stringify(boxedControlSummary)),
         },
       );
     }
