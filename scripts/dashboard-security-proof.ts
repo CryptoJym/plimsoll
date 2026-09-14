@@ -1075,16 +1075,32 @@ function activeTimerCount() {
 // handler cannot be shown to be guard-free, so it reds the audit. That refusal
 // is a refusal, not a diagnosis, so the receipt names the spelling it refused
 // in unresolvedHandlerForms — const-alias, method-reference, bind-result,
-// comma-expression, call-result, shadowed-name, name-not-declared-in-this-file
-// or other — because every one of them can red the audit with no defect
-// present (REVIEW-89 N3). A guard counts when it is a binary test, a case
-// clause or an isPrototypeOf call on the class's name: instanceof and the name
-// string as before, plus === <Class>.prototype on either side,
-// <expr>.constructor === <Class>, <Class>.prototype.isPrototypeOf(error) and
-// the Object.prototype.isPrototypeOf.call(<Class>.prototype, error) spelling of
-// it, and the class reached through an aliased import or a local alias,
-// resolved to a fixpoint. Every operand is read through its parentheses, so
-// instanceof (<Class>) and === (<Class>).prototype count too (REVIEW-89 N1).
+// comma-expression, call-result, shadowed-name, declaration-without-a-body,
+// name-not-declared-in-this-file or other — because every one of them can red
+// the audit with no defect present (REVIEW-89 N3). That refusal reaches every
+// position scanned here, the .finally callback and the .then fulfilment
+// argument included, and it does not wait for a guard: a cleanup callback that
+// tests nothing at all reds the audit as soon as this file cannot read its
+// body. That is the price of reading those two positions, and it is paid in the
+// safe direction (REVIEW-98 F3).
+//
+// A guard counts when it is a binary test, a case clause or a call that decides
+// the same thing: instanceof and the name string as before, plus
+// === <Class>.prototype on either side, <expr>.constructor === <Class>,
+// <Class>.prototype.isPrototypeOf(error), the
+// Object.prototype.isPrototypeOf.call(<Class>.prototype, error) spelling of it,
+// and <Class>[Symbol.hasInstance](error), which is the method instanceof
+// compiles to and runs (REVIEW-98 F1). The class may be reached through an
+// aliased import or a local alias, resolved to a fixpoint. Every operand is
+// read through its parentheses, so instanceof (<Class>) and
+// === (<Class>).prototype count too (REVIEW-89 N1). A call form is read as a
+// guard from the class it names and not from what it is handed: this function
+// has no single "the caught error" to compare an argument against — the error
+// can be a catch binding, a callback parameter, a settled result's reason or an
+// alias of any of them — so requiring the argument to name it would be a
+// binding analysis this audit does not do, and would reopen the escape the call
+// forms close. What a call form must have is an argument at all: an
+// isPrototypeOf with none tests nothing and is not a guard (REVIEW-98 F6).
 //
 // The retry loop may be a for with no condition, a while (true) or a
 // do { } while (true). They are one loop written three ways, and a maintainer
@@ -1092,20 +1108,32 @@ function activeTimerCount() {
 // accepted; what stays load-bearing is that there is exactly one endless loop
 // and exactly one bindless try/catch inside it. The receipt names every loop
 // form found in the function, so a red over the loop count reports the shape it
-// found instead of leaving the reader to infer it. loopForms is asserted, but
-// only by count: exactly one of the forms it lists must be an endless one.
-// describeLoops and isEndlessLoop walk the function through two different
-// collections, so tying the field a reader reads to the count the audit decides
-// on is what makes a drift between them visible; asserting *which* form is
-// there would re-introduce the false red the three-form acceptance removed
+// found instead of leaving the reader to infer it. loopForms is asserted
+// against the loops the audit decides on: the loops describeLoops named endless
+// must be the same nodes isEndlessLoop found, in the same order — not merely
+// the same number of them. Counting alone could not fail, because one endless
+// loop yields one endless form by construction, so the count asserted nothing a
+// reader could act on (REVIEW-98 F5); comparing the nodes can fail, and it
+// fails exactly when the two walks drift apart, which is the future edit this
+// guards against. No planted source shape can make it fire — only an edit to
+// describeLoops or isEndlessLoop can — and when it does the receipt's
+// diagnostic says which two walks disagreed. Asserting *which* form is there
+// would re-introduce the false red the three-form acceptance removed
 // (REVIEW-89 §9.10).
 //
 // What it cannot see: a ProofTimeoutError re-raised by a function this one
 // invokes rather than hands over as a callback; a handler named by anything but
-// an identifier this file declares a function for, which is refused rather than
-// read; a class or a handler that lives in another file; a guard whose class
-// operand is computed rather than named (instanceof (0, <Class>), which does
-// not compile here anyway); and any shape assembled at run time through eval or
+// an identifier this file declares a function with a body for, which is refused
+// rather than read; a class or a handler that lives in another file; a guard
+// whose class operand is computed rather than named (instanceof (0, <Class>),
+// which does not compile here anyway); a guard whose method is computed from
+// something this file cannot read as a literal, which is where the call forms
+// stop — <Class>[Symbol.hasInstance](error) and the
+// <Class>[Symbol["hasInstance"]](error) spelling of it are read, but a symbol
+// or a method name stashed in a variable first is not, and neither is
+// <Class>.prototype["isPrototypeOf"](error) or
+// Function.prototype[Symbol.hasInstance].call(<Class>, error), all of which
+// compile here; and any shape assembled at run time through eval or
 // new Function. No behavioural check backs the audit up for those: the guard
 // it exists to refuse is dead by construction, so it changes nothing a
 // behavioural check could observe. This is a shape check on one function body
@@ -1147,22 +1175,21 @@ function skipParentheses(expression: ts.Expression): ts.Expression {
   return current;
 }
 
-// Named for the receipt, and counted only as "how many of these are endless".
-function describeLoops(root: ts.Node) {
-  return collectNodes(root, isLoop).map((loop) => {
-    if (ts.isForOfStatement(loop)) return "for-of";
-    if (ts.isForInStatement(loop)) return "for-in";
-    const endless = isEndlessLoop(loop);
-    if (ts.isForStatement(loop)) return endless ? "for(;;)" : "for(condition)";
-    if (ts.isWhileStatement(loop)) return endless ? "while(true)" : "while(condition)";
-    return endless ? "do-while(true)" : "do-while(condition)";
-  });
-}
-
 const ENDLESS_LOOP_FORMS = new Set(["for(;;)", "while(true)", "do-while(true)"]);
 
-function endlessLoopForms(forms: string[]) {
-  return forms.filter((form) => ENDLESS_LOOP_FORMS.has(form));
+function loopForm(loop: ts.IterationStatement) {
+  if (ts.isForOfStatement(loop)) return "for-of";
+  if (ts.isForInStatement(loop)) return "for-in";
+  const endless = isEndlessLoop(loop);
+  if (ts.isForStatement(loop)) return endless ? "for(;;)" : "for(condition)";
+  if (ts.isWhileStatement(loop)) return endless ? "while(true)" : "while(condition)";
+  return endless ? "do-while(true)" : "do-while(condition)";
+}
+
+// Named for the receipt, and kept beside the node the name came from, so the
+// audit can hold this walk against isEndlessLoop's by node instead of by count.
+function describeLoops(root: ts.Node) {
+  return collectNodes(root, isLoop).map((loop) => ({ form: loopForm(loop), loop }));
 }
 
 // Every name this file can use to reach the class: the class itself, an import
@@ -1223,14 +1250,39 @@ function timeoutGuardMatcher(names: Set<string>) {
     const expression = skipParentheses(operand);
     return ts.isPropertyAccessExpression(expression) && expression.name.text === "constructor";
   };
-  // <Class>.prototype.isPrototypeOf(error), and the same test spelled through
-  // Object.prototype.isPrototypeOf.call/apply(<Class>.prototype, error). Both
-  // decide "am I holding one of these" without ever writing instanceof, which
-  // is why a call is a guard shape here and not only a binary expression.
+  // Symbol.hasInstance, written as a property access or with the property name
+  // as a literal. Both spellings compile under this tsconfig.
+  const namesHasInstance = (operand: ts.Expression) => {
+    const expression = skipParentheses(operand);
+    const onSymbol = (host: ts.Expression) => {
+      const target = skipParentheses(host);
+      return ts.isIdentifier(target) && target.text === "Symbol";
+    };
+    if (ts.isPropertyAccessExpression(expression)) {
+      return expression.name.text === "hasInstance" && onSymbol(expression.expression);
+    }
+    if (!ts.isElementAccessExpression(expression)) return false;
+    const property = skipParentheses(expression.argumentExpression);
+    return ts.isStringLiteralLike(property) && property.text === "hasInstance" && onSymbol(expression.expression);
+  };
+  // <Class>.prototype.isPrototypeOf(error), the same test spelled through
+  // Object.prototype.isPrototypeOf.call/apply(<Class>.prototype, error), and
+  // <Class>[Symbol.hasInstance](error), which is the method instanceof itself
+  // calls. All three decide "am I holding one of these" without ever writing
+  // instanceof, which is why a call is a guard shape here and not only a binary
+  // expression. Each must be handed something — a test with nothing to test is
+  // not a test — and none of them reads what it was handed (REVIEW-98 F1, F6).
   const testsThePrototypeByCall = (node: ts.CallExpression) => {
     const callee = skipParentheses(node.expression);
+    if (ts.isElementAccessExpression(callee)) {
+      return namesHasInstance(callee.argumentExpression)
+        && node.arguments.length > 0
+        && namesTheClass(callee.expression);
+    }
     if (!ts.isPropertyAccessExpression(callee)) return false;
-    if (callee.name.text === "isPrototypeOf") return readsThePrototype(callee.expression);
+    if (callee.name.text === "isPrototypeOf") {
+      return node.arguments.length > 0 && readsThePrototype(callee.expression);
+    }
     if (callee.name.text !== "call" && callee.name.text !== "apply") return false;
     const method = skipParentheses(callee.expression);
     return ts.isPropertyAccessExpression(method)
@@ -1259,10 +1311,14 @@ function timeoutGuardMatcher(names: Set<string>) {
 // By name in the tree, both as a declaration and as a function assigned to that
 // name, so moving the function or renaming around it reds the audit instead of
 // silently auditing nothing. One name can only resolve to one function here:
-// two is a shadow the audit refuses rather than picks between.
+// two is a shadow the audit refuses rather than picks between. A declaration
+// with no body — an ambient declare function, or an overload signature — is not
+// a function this file can read, so it is not a match: a handler that names one
+// is refused rather than read as guard-free, which is what a body-less
+// "function" made it before (REVIEW-98 F4).
 function findFunctionsNamed(sourceFile: ts.SourceFile, name: string): ts.Node[] {
   const declared = collectNodes(sourceFile, (node): node is ts.FunctionDeclaration =>
-    ts.isFunctionDeclaration(node) && node.name?.text === name);
+    ts.isFunctionDeclaration(node) && node.name?.text === name && node.body !== undefined);
   const assigned = collectNodes(sourceFile, (node): node is ts.VariableDeclaration =>
     ts.isVariableDeclaration(node)
       && ts.isIdentifier(node.name)
@@ -1303,7 +1359,12 @@ function isAbsentHandler(argument: ts.Expression) {
 
 // What a refused handler was written as, so the receipt names the spelling
 // instead of only the refusal.
-function describeHandlerForm(argument: ts.Expression, isConstAlias: (name: string) => boolean, resolved: number) {
+function describeHandlerForm(
+  argument: ts.Expression,
+  isConstAlias: (name: string) => boolean,
+  isDeclaredWithoutABody: (name: string) => boolean,
+  resolved: number,
+) {
   const expression = skipParentheses(argument);
   if (ts.isPropertyAccessExpression(expression) || ts.isElementAccessExpression(expression)) return "method-reference";
   if (ts.isCallExpression(expression)) {
@@ -1313,6 +1374,10 @@ function describeHandlerForm(argument: ts.Expression, isConstAlias: (name: strin
   if (ts.isBinaryExpression(expression) && expression.operatorToken.kind === ts.SyntaxKind.CommaToken) return "comma-expression";
   if (!ts.isIdentifier(expression)) return "other";
   if (resolved > 1) return "shadowed-name";
+  // A name this file declares only as a signature is declared here and still
+  // unreadable, so the receipt says that rather than "not declared in this
+  // file", which would be false.
+  if (isDeclaredWithoutABody(expression.text)) return "declaration-without-a-body";
   return isConstAlias(expression.text) ? "const-alias" : "name-not-declared-in-this-file";
 }
 
@@ -1342,6 +1407,15 @@ function scanRejectionHandlers(root: ts.Node, sourceFile: ts.SourceFile, isTimeo
       .map((declaration) => (declaration.name as ts.Identifier).text));
     return aliasNames.has(name);
   };
+  // The same lazy build for the other thing a refused name can be: a function
+  // this file declares without a body.
+  let bodilessNames: Set<string> | undefined;
+  const isDeclaredWithoutABody = (name: string) => {
+    bodilessNames ??= new Set(collectNodes(sourceFile, (node): node is ts.FunctionDeclaration =>
+      ts.isFunctionDeclaration(node) && node.body === undefined)
+      .flatMap((declaration) => (declaration.name ? [declaration.name.text] : [])));
+    return bodilessNames.has(name);
+  };
   let guards = 0;
   let unresolved = 0;
   const forms = new Set<string>();
@@ -1358,7 +1432,7 @@ function scanRejectionHandlers(root: ts.Node, sourceFile: ts.SourceFile, isTimeo
     }
     if (!body) {
       unresolved += 1;
-      forms.add(describeHandlerForm(handler, isConstAlias, resolved));
+      forms.add(describeHandlerForm(handler, isConstAlias, isDeclaredWithoutABody, resolved));
       continue;
     }
     if (collectNodes(body, isTimeoutGuard).length > 0) guards += 1;
@@ -1407,7 +1481,14 @@ function auditFetchSource(fileText: string) {
   const timeoutGuards = collectNodes(matches[0], isTimeoutGuard).length;
   const rejection = scanRejectionHandlers(matches[0], sourceFile, isTimeoutGuard);
   const endless = collectNodes(matches[0], isEndlessLoop);
-  const loopForms = describeLoops(matches[0]);
+  const described = describeLoops(matches[0]);
+  const loopForms = described.map((entry) => entry.form);
+  // The loops the receipt calls endless must be the loops the audit decided on:
+  // the same nodes, in the same order. Only an edit to describeLoops or
+  // isEndlessLoop can break this, which is the drift it exists to catch.
+  const namedEndless = described.filter((entry) => ENDLESS_LOOP_FORMS.has(entry.form));
+  const loopWalksAgree = namedEndless.length === endless.length
+    && namedEndless.every((entry, index) => entry.loop === endless[index]);
   const retryTries = endless.length === 1 ? collectNodes(endless[0].statement, ts.isTryStatement) : [];
   const retryLoopBindless = retryTries.length === 1
     && retryTries[0].catchClause !== undefined
@@ -1426,14 +1507,14 @@ function auditFetchSource(fileText: string) {
     forEver: endless.length,
     loopForms,
     retryLoopBindless,
-    diagnostic: "",
+    diagnostic: loopWalksAgree ? "" : "describeLoops and isEndlessLoop disagree about which loops are endless",
     clean: catchBindings === 0
       && bindlessCatches === 1
       && timeoutGuards === 0
       && rejection.guards === 0
       && rejection.unresolved === 0
       && endless.length === 1
-      && endlessLoopForms(loopForms).length === 1
+      && loopWalksAgree
       && retryLoopBindless,
   };
 }
@@ -1473,7 +1554,12 @@ type FetchSourceAnchors = {
 // every miss carries the requirement it failed and the number it measured, and
 // the receipt already carries the primary audit beside it, so a reader tells a
 // benign refactor (audit clean, one anchor requirement short) from a sabotage
-// (audit not clean) from the receipt alone.
+// (audit not clean) from the receipt alone — as far as this audit can see. The
+// reading is only ever as good as the audit beside it: a sabotage carrying a
+// guard shape this file cannot read prints the clean audit a benign refactor
+// prints, and the two receipts are then identical (REVIEW-98 F2). The run exits
+// 1 on both, so nothing ships either way; what the reader cannot do is tell
+// from the receipt alone which of the two it was holding.
 type AnchorMiss = { requirement: string; measured: Record<string, number> };
 
 function isAnchorMiss(located: FetchSourceAnchors | AnchorMiss): located is AnchorMiss {
@@ -1542,7 +1628,8 @@ function proveFetchSourceAudit(proofSource: string) {
     // moves one of the nodes they name, so the receipt carries both halves of
     // that question: which anchor requirement failed and what it measured, and
     // the primary audit of the same source. A clean audit beside a missed
-    // anchor is a refactor; a red one is a sabotage.
+    // anchor is a refactor as far as this audit can see; a red one is a
+    // sabotage.
     check(checkName, false, JSON.stringify({
       method: "typescript-ast",
       error: "retry_catch_anchors_not_found",
@@ -1684,6 +1771,26 @@ function proveFetchSourceAudit(proofSource: string) {
     { name: "callback_handler_method_reference", source: applyEdits([outside(holderHelper), onFetch(".catch(rejectionGuards.rethrow)")]), expected: false },
     { name: "callback_handler_bind_result", source: applyEdits([outside(rethrowHelper), onFetch(".catch(rethrowIfTimeout.bind(null))")]), expected: false },
     { name: "callback_handler_comma_expression", source: applyEdits([outside(rethrowHelper), onFetch(".catch((0, rethrowIfTimeout))")]), expected: false },
+    // instanceof written as the Symbol.hasInstance call it compiles to, in the
+    // body-cancel handler position and in the bindless catch and in both
+    // spellings of the symbol, and a handler resolved to a declaration this
+    // file gives no body. The first and the last of these audited clean at the
+    // revision before this one with a live guard, or an unreadable handler,
+    // sitting in the rejection path (REVIEW-98 F1, F4).
+    { name: "callback_guard_by_symbol_hasinstance_on_the_body_cancel_handler", source: applyEdits([bodyHandler("(error) => { if (ProofTimeoutError[Symbol.hasInstance](error)) throw error; }")]), expected: false },
+    { name: "callback_guard_by_symbol_hasinstance_with_the_property_as_a_literal", source: applyEdits([bodyHandler("(error) => { if (ProofTimeoutError[Symbol[\"hasInstance\"]](error)) throw error; }")]), expected: false },
+    { name: "symbol_hasinstance_guard_in_the_bindless_catch", source: applyEdits([body("\n        if (ProofTimeoutError[Symbol.hasInstance](error)) throw error;")]), expected: false },
+    { name: "callback_handler_resolved_to_a_declaration_without_a_body", source: applyEdits([outside("declare function rethrowIfTimeout(error: unknown): never;\n"), onFetch(".catch(rethrowIfTimeout)")]), expected: false },
+    // The same call forms that decide nothing stay green: the symbol call
+    // against a class this audit says nothing about, and an isPrototypeOf with
+    // no argument, which returns false whatever is thrown.
+    { name: "benign_symbol_hasinstance_against_another_class", source: applyEdits([bodyHandler("(error) => { if (RangeError[Symbol.hasInstance](error)) throw error; }")]), expected: true },
+    { name: "benign_isprototypeof_call_with_no_argument", source: applyEdits([bodyHandler("(error) => { if (ProofTimeoutError.prototype.isPrototypeOf()) throw error; }")]), expected: true },
+    // And the decision the call forms make on purpose: the class is read, the
+    // argument is not, so a prototype test against something that is not the
+    // caught error still counts. Erring red, and symmetrical with the binary
+    // forms, which read one operand and not the other (REVIEW-98 F6).
+    { name: "isprototypeof_guard_against_a_value_that_is_not_the_caught_error", source: applyEdits([bodyHandler("(error) => { if (ProofTimeoutError.prototype.isPrototypeOf(Object.create(null))) attempts += 0; throw error as Error }")]), expected: false },
   ];
   // Every literal opener that defeated the lexical strip, crossed with every
   // closer it was paired with and with the two sabotages they were used to
@@ -1739,7 +1846,7 @@ function proveFetchSourceAudit(proofSource: string) {
   const benign = results.filter((result) => result.expected);
   check(
     checkName,
-    named.length === 75 && matrix.length === 60 && results.length === 135 && mismatches.length === 0,
+    named.length === 82 && matrix.length === 60 && results.length === 142 && mismatches.length === 0,
     JSON.stringify({
       method: "typescript-ast",
       probes: results.length,
