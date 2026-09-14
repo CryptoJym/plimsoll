@@ -1246,12 +1246,15 @@ function activeTimerCount() {
 // access rather than the identifier this file reads, and following that back to
 // Object is dataflow rather than a spelling, the same line drawn on the two
 // hops above and an open family rather than one form. A type assertion is read
-// through on the two operands of the prototype comparison in the binary branch
-// and in the arguments-list count, and nowhere else: (<Class>.prototype as
-// object) and (Object.getPrototypeOf(new <Class>(...)) as object) are read
-// there, as are the satisfies and angle-bracket spellings of them, while the
-// same assertion one level in — on the new inside a reach, or on the receiver
-// of any isPrototypeOf hop — is not read, and compiles here and audits clean.
+// through on the two operands of the equality comparison in the binary branch
+// and in the arguments-list count, and nowhere else. Those two operands feed
+// two tests, and one skip serves both: the prototype comparison, where
+// (<Class>.prototype as object) and (Object.getPrototypeOf(new <Class>(...))
+// as object) are read, and the constructor/class pair below it, where
+// error.constructor === (<Class> as Function) is read and audits red. The
+// satisfies and angle-bracket spellings of either are the same skip. The same
+// assertion one level in — on the new inside a reach, or on the receiver of
+// any isPrototypeOf hop — is not read, and compiles here and audits clean.
 // And any shape assembled at run time
 // through eval or new Function. No behavioural check backs the audit up for
 // those: the guard it exists to refuse is dead by construction, so it changes
@@ -1643,9 +1646,15 @@ function timeoutGuardMatcher(names: Set<string>) {
     // clean until this bead — the spelled one since long before the reached
     // form was read here at all (REVIEW-131 F2). satisfies and the angle-
     // bracket spelling are the same skip, and it is the same skip the
-    // arguments-list count above already takes. This is the operand position
-    // and no other: an assertion on the new inside a reach, or on the receiver
-    // of an isPrototypeOf hop, is still not read.
+    // arguments-list count above already takes. These same two operands feed
+    // the constructor/class pair below as well as the prototype test above it,
+    // so the one skip reddens both: error.constructor === (<Class> as Function)
+    // and the mirror of it with the assertion on the constructor side
+    // compiled, ran and audited clean until this bead too, and are red now —
+    // named here and fenced by a must-green row on another class in the probe
+    // list (REVIEW-135 F1). This is the operand position and no other: an
+    // assertion on the new inside a reach, or on the receiver of an
+    // isPrototypeOf hop, is still not read.
     const left = skipAssertions(node.left);
     const right = skipAssertions(node.right);
     if (reachesThePrototype(left) || reachesThePrototype(right)) return true;
@@ -2433,21 +2442,46 @@ function proveFetchSourceAudit(proofSource: string) {
     { name: "benign_element_access_getprototypeof_on_a_reached_prototype_of_another_class", source: applyEdits([bodyHandler("(error) => { if (Reflect.apply(Object.prototype.isPrototypeOf, Object[\"getPrototypeOf\"](new RangeError(\"debugger_target\")), [error as object])) throw error as Error; }")]), expected: true },
     // And the same comparison with a type assertion on the operand that carries
     // the prototype. An assertion changes what an expression is typed as and
-    // not what it is, so each of these is the row above it one word longer —
-    // and each compiled, ran and audited clean until this bead, the spelled
-    // form since long before the reached form was read here at all, because the
-    // operands were read through their parentheses and not through their
-    // assertions (REVIEW-131 F2). The satisfies row is the third spelling of
-    // the same skip; the angle-bracket spelling is the fourth and is not given
-    // a row of its own, for the same reason the reversed operand order is not.
-    // The must-green controls are the same two comparisons built on a class
-    // this audit says nothing about, which is what keeps reading through an
-    // assertion from reddening every asserted prototype comparison in sight.
+    // not what it is, so each of these rows is its own unasserted counterpart
+    // one word longer — its counterpart, not the row printed above it. The
+    // asserted reached row and the satisfies row are both
+    // callback_guard_by_binary_comparison_against_a_reached_prototype one word
+    // longer, and the benign asserted reached row is
+    // benign_binary_comparison_against_a_reached_prototype_of_another_class one
+    // word longer. The two asserted spelled rows have no counterpart to
+    // lengthen at this planting position: the unasserted spelled comparisons in
+    // this list plant into an inline arrow and into the bindless catch rather
+    // than into the body cancel handler, and there is no unasserted benign
+    // spelled comparison row anywhere in the list (REVIEW-135 F2). Each of these compiled, ran and
+    // audited clean until this bead, the spelled form since long before the
+    // reached form was read here at all, because the operands were read through
+    // their parentheses and not through their assertions (REVIEW-131 F2). The
+    // satisfies row is the third spelling of the same skip; the angle-bracket
+    // spelling is the fourth and is not given a row of its own, for the same
+    // reason the reversed operand order is not. The must-green controls are the
+    // same comparisons built on a class this audit says nothing about, which is
+    // what keeps reading through an assertion from reddening every asserted
+    // comparison in sight.
     { name: "callback_guard_by_binary_comparison_against_an_asserted_reached_prototype", source: applyEdits([bodyHandler("(error) => { if (Object.getPrototypeOf(error) === (Object.getPrototypeOf(new ProofTimeoutError(\"debugger_target\")) as object)) throw error; }")]), expected: false },
     { name: "callback_guard_by_binary_comparison_against_an_asserted_spelled_prototype", source: applyEdits([bodyHandler("(error) => { if (Object.getPrototypeOf(error) === (ProofTimeoutError.prototype as object)) throw error; }")]), expected: false },
     { name: "callback_guard_by_binary_comparison_against_a_satisfies_asserted_reached_prototype", source: applyEdits([bodyHandler("(error) => { if (Object.getPrototypeOf(error) === (Object.getPrototypeOf(new ProofTimeoutError(\"debugger_target\")) satisfies object)) throw error; }")]), expected: false },
     { name: "benign_binary_comparison_against_an_asserted_reached_prototype_of_another_class", source: applyEdits([bodyHandler("(error) => { if (Object.getPrototypeOf(error) === (Object.getPrototypeOf(new RangeError(\"x\")) as object)) throw error as Error; }")]), expected: true },
     { name: "benign_binary_comparison_against_an_asserted_spelled_prototype_of_another_class", source: applyEdits([bodyHandler("(error) => { if (Object.getPrototypeOf(error) === (RangeError.prototype as object)) throw error as Error; }")]), expected: true },
+    // The other test those two skipped operands feed: the constructor/class
+    // pair, where error.constructor === (<Class> as Function) compiled, ran and
+    // audited clean until this bead and is red now, with the assertion on the
+    // class side rather than the prototype side. The control comes first here
+    // because the fence is what this family lacked: nothing else in this list
+    // is a benign comparison on .constructor, so it is the only row that reds
+    // if the class conjunct is ever dropped from the pair. The guard row after
+    // it is this branch's share of what greens if the operand skip is ever
+    // taken back off — the rows above it cover the prototype test only
+    // (REVIEW-135 F1). Neither has an unasserted counterpart at this planting
+    // position either: the two unasserted constructor comparisons in this list
+    // plant into the same inline arrow and bindless catch as the spelled
+    // prototype ones.
+    { name: "benign_binary_comparison_against_an_asserted_constructor_of_another_class", source: applyEdits([bodyHandler("(error) => { if (error.constructor === (RangeError as Function)) throw error as Error; }")]), expected: true },
+    { name: "callback_guard_by_binary_comparison_against_an_asserted_constructor", source: applyEdits([bodyHandler("(error) => { if (error.constructor === (ProofTimeoutError as Function)) throw error; }")]), expected: false },
   ];
   // Every literal opener that defeated the lexical strip, crossed with every
   // closer it was paired with and with the two sabotages they were used to
@@ -2566,7 +2600,7 @@ function proveFetchSourceAudit(proofSource: string) {
   const driftMismatches = driftResults.filter((result) => result.diagnostic !== result.expected || result.clean);
   check(
     checkName,
-    named.length === 135 && matrix.length === 60 && results.length === 195
+    named.length === 137 && matrix.length === 60 && results.length === 197
       && mismatches.length === 0 && drifts.length === 4 && driftMismatches.length === 0,
     JSON.stringify({
       method: "typescript-ast",
