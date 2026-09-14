@@ -1167,10 +1167,15 @@ function activeTimerCount() {
 // of a Reflect.apply is read, and so, because this file sees a spelling and
 // not a run-time hop, is a Proxy member or a getter that happens to be named
 // isPrototypeOf. The name is read written either way — as a property access or
-// with the name as a string literal, Object.prototype["isPrototypeOf"] and
+// with the name written out as a literal, Object.prototype["isPrototypeOf"] and
 // <Class>.prototype["isPrototypeOf"] being the same lookup — on the direct
 // callee and on all three hops, exactly as Symbol.hasInstance is read in both
-// of its spellings. The slots mean what they say. Where a form spells
+// of its spellings. Written out as a literal means a string literal or a
+// template literal with no substitutions, which TypeScript groups together and
+// this file does not tell apart: Object.prototype[`isPrototypeOf`] is read.
+// That is the safe direction — one more spelling read, never one fewer — and
+// it holds wherever this file reads a name out of an element access. The slots
+// mean what they say. Where a form spells
 // <any receiver> the receiver is not read at all: this file takes the class
 // from the lookup in front of the hop, while at run time it is the receiver
 // that decides, so the same hop aimed at another class is benign and is read
@@ -1183,12 +1188,21 @@ function activeTimerCount() {
 // read in exactly two spellings and no others: <Class>.prototype, and
 // Object.getPrototypeOf(new <Class>(...)) with any constructor arguments,
 // which is the same object at run time and is an ordinary expression rather
-// than an unusual spelling of anything. The value slot is a
-// requirement only in its count, and the count is taken past whatever the form
-// spends its leading arguments on: a direct call must hand over at least one
-// argument, each of the three .call/.apply hops at least one past the receiver
-// it puts in argument 0, and Reflect.apply — read for three method slots and
-// no others, <Class>[Symbol.hasInstance],
+// than an unusual spelling of anything. The getPrototypeOf lookup of that
+// second spelling is read written either way, as a property access or with the
+// name written out as a literal — Object["getPrototypeOf"](new <Class>(...))
+// and the template-literal spelling of it are the same lookup — for the same
+// reason the method name is read either way one slot over: the element-access
+// spelling is not a hop that moves anything, it is the same lookup written the
+// other way, and a file that reads Symbol["hasInstance"] and
+// Object.prototype["isPrototypeOf"] and then declined to read this one would
+// be inconsistent rather than restrained. It is the lookup that is read and
+// not what it returns, so the reach has to be written out where the form puts
+// it. The value slot is a requirement only in its count, and the count is
+// taken past whatever the form spends its leading arguments on: a direct call
+// must hand over at least one argument, each of the three .call/.apply hops
+// at least one past the receiver it puts in argument 0, and Reflect.apply —
+// read for three method slots and no others, <Class>[Symbol.hasInstance],
 // Function.prototype[Symbol.hasInstance] and Object.prototype.isPrototypeOf —
 // at least one past the method and the receiver it puts in arguments 0 and 1.
 // An inline empty arguments list hands over none. What is in the slot is never
@@ -1209,12 +1223,18 @@ function activeTimerCount() {
 // the hop itself is invisible to this file, and all it ever sees is the
 // spelling the method arrives under. A receiver reached any way other than the
 // two spellings named above is not read either: one held in a variable,
-// Reflect.getPrototypeOf(new <Class>(...)), __proto__, or
-// Object.getPrototypeOf(<any expression that is not a new of the class>). And
-// any shape assembled at run time through eval or new Function. No behavioural
-// check backs the audit up for those: the guard it exists to refuse is dead by
-// construction, so it changes nothing a behavioural check could observe. This
-// is a shape check on one function body and claims nothing past it.
+// Reflect.getPrototypeOf(new <Class>(...)), __proto__,
+// Object.getPrototypeOf(<any expression that is not a new of the class>), and
+// the getPrototypeOf lookup itself moved off Object — const reachFor =
+// Object.getPrototypeOf; reachFor(new <Class>(...)), or the name computed
+// rather than written out, const reachKey = "getPrototypeOf";
+// Object[reachKey](new <Class>(...)). Both of those compile here and audit
+// clean, and both are the variable hop this file declines everywhere else
+// rather than a spelling of the lookup. And any shape assembled at run time
+// through eval or new Function. No behavioural check backs the audit up for
+// those: the guard it exists to refuse is dead by construction, so it changes
+// nothing a behavioural check could observe. This is a shape check on one
+// function body and claims nothing past it.
 const FETCH_TARGET_NAME = "fetchDebuggerPageTarget";
 const TIMEOUT_ERROR_NAME = "ProofTimeoutError";
 
@@ -1364,26 +1384,46 @@ function timeoutGuardMatcher(names: Set<string>) {
       && expression.name.text === "prototype"
       && namesTheClass(expression.expression);
   };
-  // The receiver slot of an isPrototypeOf hop, where the class is the only
-  // thing the form names. <Class>.prototype spells it; so does
-  // Object.getPrototypeOf(new <Class>(...)), which is the same object at run
-  // time and needs no unusual spelling of anything — an ordinary expression in
-  // the receiver slot was a live escape until this bead (REVIEW-125 Finding 1,
-  // its Rc1). Those two spellings and no others: a receiver held in a variable,
-  // reached through Reflect.getPrototypeOf or __proto__, or taken off an
-  // Object.getPrototypeOf whose argument is not a new of the class, is a hop
-  // this file does not enumerate, like every other one in the disclosure above.
-  // This is the receiver of a call hop only; the prototype comparison in the
-  // binary branch below still reads the spelled <Class>.prototype, because
-  // there the two sides are compared rather than one being a receiver.
+  // Object.getPrototypeOf, written as a property access or with the method name
+  // as a literal — a string literal or a template literal with no
+  // substitutions, which are the same thing to the test below. Both spellings
+  // are the same lookup, so both are read here, exactly as namesHasInstance
+  // reads its symbol and readsIsPrototypeOf its method either way. What this
+  // test reads is the lookup and not what it returns, so the name moved off
+  // Object into a variable, or computed rather than written out, is a hop this
+  // file does not enumerate, like every other one in the disclosure above.
+  const readsGetPrototypeOf = (operand: ts.Expression) => {
+    const expression = skipParentheses(operand);
+    const onObject = (host: ts.Expression) => {
+      const target = skipParentheses(host);
+      return ts.isIdentifier(target) && target.text === "Object";
+    };
+    if (ts.isPropertyAccessExpression(expression)) {
+      return expression.name.text === "getPrototypeOf" && onObject(expression.expression);
+    }
+    if (!ts.isElementAccessExpression(expression)) return false;
+    const property = skipParentheses(expression.argumentExpression);
+    return ts.isStringLiteralLike(property) && property.text === "getPrototypeOf"
+      && onObject(expression.expression);
+  };
+  // The prototype of the class, reached rather than spelled. <Class>.prototype
+  // spells it; so does Object.getPrototypeOf(new <Class>(...)), which is the
+  // same object at run time and needs no unusual spelling of anything — an
+  // ordinary expression in the receiver slot was a live escape until the bead
+  // before this one (REVIEW-125 Finding 1, its Rc1). Those two spellings and no
+  // others: a prototype held in a variable, reached through
+  // Reflect.getPrototypeOf or __proto__, or taken off an Object.getPrototypeOf
+  // whose argument is not a new of the class, is a hop this file does not
+  // enumerate, like every other one in the disclosure above. This is the
+  // receiver slot of every isPrototypeOf hop and, since this bead, both
+  // operands of the prototype comparison in the binary branch below, which
+  // until now read only the spelled <Class>.prototype and so let the symmetric
+  // comparison of two reached prototypes through.
   const reachesThePrototype = (operand: ts.Expression) => {
     const expression = skipParentheses(operand);
     if (readsThePrototype(expression)) return true;
     if (!ts.isCallExpression(expression) || expression.arguments.length !== 1) return false;
-    const callee = skipParentheses(expression.expression);
-    if (!ts.isPropertyAccessExpression(callee) || callee.name.text !== "getPrototypeOf") return false;
-    const base = skipParentheses(callee.expression);
-    if (!ts.isIdentifier(base) || base.text !== "Object") return false;
+    if (!readsGetPrototypeOf(expression.expression)) return false;
     const target = skipParentheses(expression.arguments[0]);
     return ts.isNewExpression(target) && namesTheClass(target.expression);
   };
@@ -1392,7 +1432,9 @@ function timeoutGuardMatcher(names: Set<string>) {
     return ts.isPropertyAccessExpression(expression) && expression.name.text === "constructor";
   };
   // Symbol.hasInstance, written as a property access or with the property name
-  // as a literal. Both spellings compile under this tsconfig.
+  // as a literal — a string literal or a template literal with no
+  // substitutions, which are the same thing to the test below. Both spellings
+  // compile under this tsconfig.
   const namesHasInstance = (operand: ts.Expression) => {
     const expression = skipParentheses(operand);
     const onSymbol = (host: ts.Expression) => {
@@ -1431,16 +1473,17 @@ function timeoutGuardMatcher(names: Set<string>) {
     return ts.isIdentifier(base) && base.text === "Function";
   };
   // Object.prototype.isPrototypeOf, written as a property access or with the
-  // method name as a literal. Both spellings compile under this tsconfig and
-  // both are the same lookup, so both are read here, exactly as namesHasInstance
-  // reads its symbol either way. What this test reads is the NAME and nothing
-  // about the base: Object.prototype.isPrototypeOf and
-  // <Class>.prototype.isPrototypeOf reach the same function, and so does any
-  // other base that spells the name. Nothing in the lookup says which class, so
-  // the class is whatever the call hands it as its receiver, exactly as on
-  // Function.prototype[Symbol.hasInstance] — which is why every form that puts
-  // this method in the method slot reads its receiver slot, wherever that form
-  // keeps it.
+  // method name as a literal — a string literal or a template literal with no
+  // substitutions, which are the same thing to the test below. Both spellings
+  // compile under this tsconfig and both are the same lookup, so both are read
+  // here, exactly as namesHasInstance reads its symbol either way. What this
+  // test reads is the NAME and nothing about the base:
+  // Object.prototype.isPrototypeOf and <Class>.prototype.isPrototypeOf reach
+  // the same function, and so does any other base that spells the name. Nothing
+  // in the lookup says which class, so the class is whatever the call hands it
+  // as its receiver, exactly as on Function.prototype[Symbol.hasInstance] —
+  // which is why every form that puts this method in the method slot reads its
+  // receiver slot, wherever that form keeps it.
   const readsIsPrototypeOf = (operand: ts.Expression) => {
     const expression = skipParentheses(operand);
     if (ts.isPropertyAccessExpression(expression)) return expression.name.text === "isPrototypeOf";
@@ -1552,7 +1595,16 @@ function timeoutGuardMatcher(names: Set<string>) {
       || operator === ts.SyntaxKind.ExclamationEqualsToken;
     if (!isEquality) return false;
     if (namesTheError(node.left) || namesTheError(node.right)) return true;
-    if (readsThePrototype(node.left) || readsThePrototype(node.right)) return true;
+    // Either operand, and the prototype reached as well as spelled: the guard
+    // that compares Object.getPrototypeOf(error) against the class's prototype
+    // can write that second operand either way, and writing it the reached way
+    // on both sides was a guard this branch read as benign (REVIEW-127 F2).
+    // One test covers every spelling of it: the four equality operators are
+    // already one set above, so !== and == reach this line too, and the two
+    // operands are read by the same call, so the reversed order is the same
+    // test. Reading one operand and not the other stands — the other side is
+    // whatever the guard is testing, and is not read.
+    if (reachesThePrototype(node.left) || reachesThePrototype(node.right)) return true;
     return (readsAConstructor(node.left) && namesTheClass(node.right))
       || (readsAConstructor(node.right) && namesTheClass(node.left));
   };
@@ -2314,6 +2366,27 @@ function proveFetchSourceAudit(proofSource: string) {
     { name: "benign_isprototypeof_called_on_a_reached_prototype_of_another_class", source: applyEdits([bodyHandler("(error) => { if (Object.getPrototypeOf(new RangeError(\"debugger_target\")).isPrototypeOf(error as object)) throw error as Error; }")]), expected: true },
     { name: "benign_object_prototype_isprototypeof_through_a_call_on_a_reached_prototype_of_another_class", source: applyEdits([bodyHandler("(error) => { if (Object.prototype.isPrototypeOf.call(Object.getPrototypeOf(new RangeError(\"debugger_target\")), error as object)) throw error as Error; }")]), expected: true },
     { name: "benign_object_prototype_isprototypeof_through_reflect_apply_on_a_reached_prototype_of_another_class", source: applyEdits([bodyHandler("(error) => { if (Reflect.apply(Object.prototype.isPrototypeOf, Object.getPrototypeOf(new RangeError(\"debugger_target\")), [error as object])) throw error as Error; }")]), expected: true },
+    // The prototype comparison with the class's prototype reached on the other
+    // side instead of spelled. The row that spells <Class>.prototype in that
+    // same comparison has always been red; this one compiled, ran and
+    // audited clean until this bead, because the binary branch read only the
+    // spelled form on either operand (REVIEW-127 F2). The reversed operand
+    // order and the other three equality operators are the same line and are
+    // not given rows of their own. The must-green control is the same
+    // comparison built on a class this audit says nothing about, which is what
+    // keeps reading a reached prototype here from reddening every prototype
+    // comparison in sight.
+    { name: "callback_guard_by_binary_comparison_against_a_reached_prototype", source: applyEdits([bodyHandler("(error) => { if (Object.getPrototypeOf(error) === Object.getPrototypeOf(new ProofTimeoutError(\"debugger_target\"))) throw error; }")]), expected: false },
+    { name: "benign_binary_comparison_against_a_reached_prototype_of_another_class", source: applyEdits([bodyHandler("(error) => { if (Object.getPrototypeOf(error) === Object.getPrototypeOf(new RangeError(\"x\"))) throw error as Error; }")]), expected: true },
+    // And the reach itself written as an element access instead of a property
+    // access — the same lookup the other way round, and the same trick the bead
+    // before this one closed on the method slot one hop over (REVIEW-125
+    // Finding 1). It too compiled, ran and audited clean until this bead
+    // (REVIEW-127 F1). Its control is the same expression on another class,
+    // because the class conjunct is the only thing keeping the element-access
+    // spelling from accepting any reach at all.
+    { name: "callback_guard_by_element_access_getprototypeof_on_a_reached_prototype", source: applyEdits([bodyHandler("(error) => { if (Reflect.apply(Object.prototype.isPrototypeOf, Object[\"getPrototypeOf\"](new ProofTimeoutError(\"debugger_target\")), [error as object])) throw error; }")]), expected: false },
+    { name: "benign_element_access_getprototypeof_on_a_reached_prototype_of_another_class", source: applyEdits([bodyHandler("(error) => { if (Reflect.apply(Object.prototype.isPrototypeOf, Object[\"getPrototypeOf\"](new RangeError(\"debugger_target\")), [error as object])) throw error as Error; }")]), expected: true },
   ];
   // Every literal opener that defeated the lexical strip, crossed with every
   // closer it was paired with and with the two sabotages they were used to
@@ -2432,7 +2505,7 @@ function proveFetchSourceAudit(proofSource: string) {
   const driftMismatches = driftResults.filter((result) => result.diagnostic !== result.expected || result.clean);
   check(
     checkName,
-    named.length === 126 && matrix.length === 60 && results.length === 186
+    named.length === 130 && matrix.length === 60 && results.length === 190
       && mismatches.length === 0 && drifts.length === 4 && driftMismatches.length === 0,
     JSON.stringify({
       method: "typescript-ast",
