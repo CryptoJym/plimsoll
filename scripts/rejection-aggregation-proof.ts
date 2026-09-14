@@ -23,6 +23,7 @@ import { LOCAL_HTTP_LIMITS } from "../packages/collector-cli/src/http-boundary";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 import type {
   CollectorServer,
+  OtlpRecordRejectionDiagnostic,
   RejectionDiagnosticsCounters,
   RejectionSummaryLine,
 } from "../packages/collector-cli/src/rejection-diagnostics";
@@ -1224,12 +1225,27 @@ async function routeClassificationChecks() {
       const nonBusySummary = nonBusyAgg.flush()[0];
       // Reverse direction: even an incorrect caller cannot attach record maps
       // to a busy summary. The emitter, not caller convention, owns the bound.
-      const fullRecordDiagnostic = {
+      //
+      // The saturated diagnostic and the client class it is measured under are
+      // read off the exported vocabularies, not pinned to today's members, so
+      // an eighth record-array key or a longer client class grows the subject
+      // here instead of growing the real worst line unmeasured. Read
+      // defensively, so an aggregation that stopped exporting one of them
+      // FAILS this check instead of throwing and taking the run with it.
+      const recordArrayKeys = Array.isArray(mod.OTLP_RECORD_ARRAY_KEYS)
+        ? (mod.OTLP_RECORD_ARRAY_KEYS as readonly string[])
+        : [];
+      const clientClassVocabulary = Array.isArray(mod.REJECTION_CLIENT_CLASSES)
+        ? (mod.REJECTION_CLIENT_CLASSES as readonly string[])
+        : [];
+      // Longest first; equal lengths break on ascending lexical order, so the
+      // subject is one deterministic class however the vocabulary is written.
+      const worstClientClass = [...clientClassVocabulary].sort(
+        (left, right) => right.length - left.length || (left < right ? -1 : 1),
+      )[0] as never;
+      const fullRecordDiagnostic: OtlpRecordRejectionDiagnostic = {
         recordCount: 100_000,
-        recordArrays: {
-          logRecords: 100_000, spans: 100_000, metrics: 100_000,
-          dataPoints: 100_000, events: 100_000, links: 100_000, exemplars: 100_000,
-        },
+        recordArrays: Object.fromEntries(recordArrayKeys.map((key) => [key, 100_000])),
         decodedBytes: 2_097_152,
       };
       const recordFields = ["recordCountLast", "recordCountMax", "recordArraysLast",
@@ -1243,10 +1259,14 @@ async function routeClassificationChecks() {
         mixedAgg.observeRejection("storage_busy_retry", "otlp_exporter", fullRecordDiagnostic, route);
       }
       const mixedSummary = mixedAgg.flush()[0];
+      // Every counter on the busy branch's worst line is saturated, the
+      // discard counter included: it is the only key on that line whose width
+      // a future change can move without moving any other check's subject.
       const saturatedMixedLine = {
         ...mixedSummary,
         count: Number.MAX_SAFE_INTEGER,
         suppressed: Number.MAX_SAFE_INTEGER,
+        recordDiagnosticsDiscarded: Number.MAX_SAFE_INTEGER,
         routes: saturatedBreakdown,
       };
       check(
@@ -1298,7 +1318,7 @@ async function routeClassificationChecks() {
       const worstRecordAgg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
       // A route is offered too: a reason outside the route-classified set must
       // ignore it, so this one line proves both directions of the exclusivity.
-      worstRecordAgg.observeRejection(worstRecordReason, "otlp_exporter", fullRecordDiagnostic, "otlp");
+      worstRecordAgg.observeRejection(worstRecordReason, worstClientClass, fullRecordDiagnostic, "otlp");
       const worstRecordSummary = worstRecordAgg.flush()[0];
       const saturatedRecordCarryingLine = {
         ...worstRecordSummary,
@@ -1311,8 +1331,8 @@ async function routeClassificationChecks() {
       // for no other, so no reason can carry both maps on one line.
       const exclusivityByReason = allReasons.map((reason) => {
         const agg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
-        agg.observeRejection(reason as never, "otlp_exporter", fullRecordDiagnostic, "otlp");
-        agg.observeRejection(reason as never, "otlp_exporter", fullRecordDiagnostic, "otlp");
+        agg.observeRejection(reason as never, worstClientClass, fullRecordDiagnostic, "otlp");
+        agg.observeRejection(reason as never, worstClientClass, fullRecordDiagnostic, "otlp");
         const line = agg.flush()[0];
         const routeClassified = routeClassifiedReasons.includes(reason);
         return {
@@ -1343,6 +1363,8 @@ async function routeClassificationChecks() {
           exclusivityByReason.some((entry) => !entry.routeClassified),
         {
           worstRecordReason,
+          worstClientClass,
+          recordArrayKeys,
           lineBytes: saturatedRecordCarryingBytes,
           headroom: mod.REJECTION_SUMMARY_LINE_MAX_BYTES - saturatedRecordCarryingBytes,
           ceiling: mod.REJECTION_SUMMARY_LINE_MAX_BYTES,
@@ -1447,6 +1469,90 @@ async function routeClassificationChecks() {
           seededSummary.suppressed === 3 && JSON.stringify(seededSummary.routes) === JSON.stringify({ otlp: 1 }) &&
           conservation(seeded.counters()).ok,
         { summary: seededSummary, attribution: "three seeded observations have no route" },
+      );
+
+      // F3 (REVIEW-85): the exclusivity invariant's single source of truth is
+      // frozen, not merely `readonly` in the type. Both the ingest gate and
+      // the `closeWindow` guard read it live, so a runtime push between a
+      // window's open and its close used to make the two disagree and strip
+      // six record fields from that window with no counter and no log.
+      const vocabularyBeforeMutation = JSON.stringify(mod.ROUTE_CLASSIFIED_REASONS);
+      const mutableVocabulary = mod.ROUTE_CLASSIFIED_REASONS as unknown as string[];
+      let freezeMutationTook = false;
+      let freezeMutationError = "none";
+      try {
+        mutableVocabulary.push("otlp_record_limit_exceeded");
+        freezeMutationTook = true;
+      } catch (error) {
+        freezeMutationError = error instanceof TypeError ? "TypeError" : String(error);
+      }
+      // If the array was not frozen the push landed. Undo it, so this check is
+      // the only one that fails and every later check still measures the
+      // module it meant to rather than a vocabulary this check widened.
+      if (freezeMutationTook) mutableVocabulary.pop();
+      check(
+        "route_classified_reason_vocabulary_is_frozen_against_runtime_mutation",
+        Object.isFrozen(mod.ROUTE_CLASSIFIED_REASONS) &&
+          !freezeMutationTook &&
+          freezeMutationError === "TypeError" &&
+          JSON.stringify(mod.ROUTE_CLASSIFIED_REASONS) === vocabularyBeforeMutation &&
+          JSON.stringify(mod.ROUTE_CLASSIFIED_REASONS) === JSON.stringify(["storage_busy_retry"]),
+        {
+          isFrozen: Object.isFrozen(mod.ROUTE_CLASSIFIED_REASONS),
+          mutationTook: freezeMutationTook,
+          mutationError: freezeMutationError,
+          vocabulary: mod.ROUTE_CLASSIFIED_REASONS,
+        },
+      );
+
+      // F4 (REVIEW-85 §3): `closeWindow` strips record statistics a
+      // route-classified window can never emit, and on one path it is the
+      // only defence. This pins it WITHOUT mutating the now-frozen vocabulary.
+      //
+      // A window is identified by `${reason}:${clientClass}`, but the ingest
+      // gate classifies the raw `reason` argument with `Array.prototype`
+      // `.includes` (SameValueZero). A caller that passes a String object
+      // instead of a string primitive therefore lands on the already-open
+      // route-classified window while the gate reads its reason as
+      // unclassified: ingest builds record statistics the window can never
+      // emit, and only the guard keeps them off the line. TypeScript forbids
+      // that caller — which is the point. The emitter, not caller convention,
+      // owns the bound, and this is the construction that shows it.
+      const boxedReason = (reason: string) => new String(reason) as unknown as never;
+      const guardAgg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
+      guardAgg.observeRejection("storage_busy_retry", "otlp_exporter", undefined, "otlp");
+      guardAgg.observeRejection(boxedReason("storage_busy_retry"), "otlp_exporter", fullRecordDiagnostic);
+      const guardedSummary = guardAgg.flush()[0];
+      // Control: the same construction on a reason the guard does not cover
+      // must carry all six record fields, so a clean subject is the guard and
+      // not an injection that quietly built no record statistics at all.
+      const guardControlAgg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
+      guardControlAgg.observeRejection("otlp_record_limit_exceeded", "otlp_exporter", undefined);
+      guardControlAgg.observeRejection(boxedReason("otlp_record_limit_exceeded"), "otlp_exporter", fullRecordDiagnostic);
+      const guardControlSummary = guardControlAgg.flush()[0];
+      check(
+        "close_window_strips_record_statistics_a_route_classified_window_can_never_emit",
+        hasNoRecordFields(guardedSummary) &&
+          hasAllRecordFields(guardControlSummary) &&
+          guardedSummary?.count === 2 &&
+          guardedSummary.suppressed === 1 &&
+          JSON.stringify(guardedSummary.routes) === JSON.stringify({ otlp: 1 }) &&
+          // the drop is silent on this path: the counter is an ingest-side
+          // count and this caller never reached the ingest gate's busy branch
+          guardedSummary.recordDiagnosticsDiscarded === undefined &&
+          guardControlSummary?.recordCountMax === 100_000 &&
+          guardControlSummary.decodedBytesMax === 2_097_152 &&
+          guardControlSummary.routes === undefined &&
+          Buffer.byteLength(JSON.stringify(guardedSummary)) <=
+            mod.REJECTION_SUMMARY_LINE_MAX_BYTES &&
+          conservation(guardAgg.counters()).ok,
+        {
+          guardedLine: JSON.stringify(guardedSummary),
+          guardedLineBytes: Buffer.byteLength(JSON.stringify(guardedSummary)),
+          controlLine: JSON.stringify(guardControlSummary),
+          controlLineBytes: Buffer.byteLength(JSON.stringify(guardControlSummary)),
+          stripped: hasNoRecordFields(guardedSummary),
+        },
       );
     }
 

@@ -9,8 +9,13 @@ import type {
   RejectionRoute,
 } from "./http-boundary";
 
-export { HTTP_BOUNDARY_REASONS } from "./http-boundary";
-export type { HttpBoundaryReason, RejectionRoute } from "./http-boundary";
+export { HTTP_BOUNDARY_REASONS, OTLP_RECORD_ARRAY_KEYS } from "./http-boundary";
+export type {
+  HttpBoundaryReason,
+  OtlpRecordArrayKey,
+  OtlpRecordRejectionDiagnostic,
+  RejectionRoute,
+} from "./http-boundary";
 
 /**
  * Fixed suppression window for repeated identical admission rejections. The
@@ -123,8 +128,16 @@ export const REJECTION_ROUTES = (Object.keys(REJECTION_ROUTE_ORDER) as Rejection
  * diagnostics instead), and `closeWindow` omits them again even if a caller
  * supplies both diagnostics. Thus a summary contains record-array maps or a
  * route map, never both, and stays inside `REJECTION_SUMMARY_LINE_MAX_BYTES`.
+ *
+ * Frozen, not merely `readonly`: both gates read it live, so a runtime push
+ * between a window's open and its close would make the two disagree and strip
+ * that window's record diagnostics with no counter and no log. `Object.freeze`
+ * makes that mutation a `TypeError` instead, and leaves `closeWindow`'s guard
+ * covering only a caller that reaches the window past the reason type.
  */
-export const ROUTE_CLASSIFIED_REASONS: readonly HttpBoundaryReason[] = ["storage_busy_retry"];
+export const ROUTE_CLASSIFIED_REASONS: readonly HttpBoundaryReason[] = Object.freeze([
+  "storage_busy_retry",
+] as const);
 
 export type RejectionSummaryLine = {
   error: "collector_request_rejected_summary";
