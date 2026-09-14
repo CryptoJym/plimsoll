@@ -1130,7 +1130,12 @@ function activeTimerCount() {
 // (REVIEW-101 F2). This is not the same as asserting which form the retry loop
 // has: all three endless forms are still accepted, and all five non-endless
 // ones still audit exactly as before. It asserts only that the word matches the
-// loop it names. Neither this nor the walk comparison can be reached by a
+// loop it names: element-wise, not exhaustively. Neither assertion says that
+// every loop in the function is printed, so a walk that dropped a non-endless
+// loop would shorten loopForms with nothing to say so. That is a gap in the
+// inventory the receipt offers a reader, not in the verdict — forEver and
+// retryLoopBindless key off the independent isEndlessLoop walk (REVIEW-108
+// Finding 5). Neither this nor the walk comparison can be reached by a
 // planted source, so both are exercised in process instead, by the drift probes
 // in proveFetchSourceAudit, which patch the naming and the walk and expect the
 // diagnostic back (REVIEW-101 F5).
@@ -1149,18 +1154,31 @@ function activeTimerCount() {
 // symbol, the method name or the class away from the place the list looks for
 // it is not read. Read: <Class>[Symbol.hasInstance](error), the
 // <Class>[Symbol["hasInstance"]](error) spelling of it,
-// <Class>[Symbol.hasInstance].call(<Class>, error) and its .apply,
-// Reflect.apply(<Class>[Symbol.hasInstance], <Class>, [error]),
-// <Class>.prototype.isPrototypeOf(error), and
+// <Class>[Symbol.hasInstance].call(<any receiver>, error) and its .apply,
+// Reflect.apply(<Class>[Symbol.hasInstance], <any receiver>, [error]),
+// Function.prototype[Symbol.hasInstance].call(<Class>, error), its .apply and
+// its Reflect.apply spelling, <Class>.prototype.isPrototypeOf(error), and
 // Object.prototype.isPrototypeOf.call(<Class>.prototype, error) and its
-// .apply. Not read, all of which compile here: a symbol or a method name
+// .apply. The slots mean what they say. Where a form spells <any receiver> the
+// receiver is not read at all: this file takes the class from the lookup in
+// front of the hop, while at run time it is the receiver that decides, so the
+// same hop aimed at another class is benign and is read as a guard and reds
+// anyway — a false red this file accepts, symmetrical with the binary forms,
+// which read one operand and not the other (REVIEW-108 Finding 4). Where a
+// form spells <Class> in the receiver slot that receiver is read, because it
+// is the only place the class is named: the method taken off
+// Function.prototype, and the prototype handed to
+// Object.prototype.isPrototypeOf. The value slot is a
+// requirement only in its count — a call must hand over at least one argument
+// past the receiver, and an inline empty arguments list hands over none — and
+// what is in the slot is never read (REVIEW-98 F6, REVIEW-108 Finding 1).
+// Not read, all of which compile here: a symbol or a method name
 // stashed in a variable first (const key = Symbol.hasInstance;
 // <Class>[key](error)); <Class>.prototype["isPrototypeOf"](error), the method
-// name as a literal where this file looks for a property access;
-// Function.prototype[Symbol.hasInstance].call(<Class>, error), which takes the
-// class from the receiver argument rather than from the lookup the method was
-// read off; the same call forms with the method or the class spread out of an
-// array; and the same lookups hopped through any other reflection entry point
+// name as a literal where this file looks for a property access; the base
+// method reached by anything but the Function.prototype[Symbol.hasInstance]
+// lookup itself; the same call forms with the method or the class spread out
+// of an array; and the same lookups hopped through any other reflection entry
 // — Reflect.get, a Proxy, a getter. And any shape assembled at run time
 // through eval or new Function. No behavioural check backs the audit up for
 // those: the guard it exists to refuse is dead by construction, so it changes
@@ -1200,6 +1218,18 @@ function isEndlessLoop(node: ts.Node): node is ts.IterationStatement {
 function skipParentheses(expression: ts.Expression): ts.Expression {
   let current = expression;
   while (ts.isParenthesizedExpression(current)) current = current.expression;
+  return current;
+}
+
+// The same read, through the type assertions that change what an expression is
+// typed as and not what it is: [] as unknown as [unknown] is still the empty
+// array at run time. Only the arguments-list position below needs this, so it
+// stays separate from skipParentheses rather than widening every operand read.
+function skipAssertions(expression: ts.Expression): ts.Expression {
+  let current = skipParentheses(expression);
+  while (ts.isAsExpression(current) || ts.isSatisfiesExpression(current) || ts.isTypeAssertionExpression(current)) {
+    current = skipParentheses(current.expression);
+  }
   return current;
 }
 
@@ -1331,6 +1361,37 @@ function timeoutGuardMatcher(names: Set<string>) {
       && namesHasInstance(expression.argumentExpression)
       && namesTheClass(expression.expression);
   };
+  // Function.prototype[Symbol.hasInstance] — the same method, read off the base
+  // instead of off the class. Nothing in the lookup says which class, so the
+  // class is whatever the call hands it as its receiver, and the call decides
+  // the same question: .call(<Class>, error) is error instanceof <Class>
+  // (REVIEW-108 residual 22, adv101 R26). Only this one spelling of the base is
+  // read; a base reached any other way is a hop this file does not enumerate,
+  // like every other one in the disclosure above.
+  const readsHasInstanceOnFunctionPrototype = (operand: ts.Expression) => {
+    const expression = skipParentheses(operand);
+    if (!ts.isElementAccessExpression(expression) || !namesHasInstance(expression.argumentExpression)) return false;
+    const host = skipParentheses(expression.expression);
+    if (!ts.isPropertyAccessExpression(host) || host.name.text !== "prototype") return false;
+    const base = skipParentheses(host.expression);
+    return ts.isIdentifier(base) && base.text === "Function";
+  };
+  // An arguments list written inline says how many values the call hands over,
+  // and [] hands over none. Any other spelling of the list — a name bound to an
+  // array, a spread — is counted as handing something over, which errs in the
+  // same direction the rest of these branches do (REVIEW-108 Finding 1).
+  const handsOverAValue = (argumentsList: ts.Expression) => {
+    const expression = skipAssertions(argumentsList);
+    return !ts.isArrayLiteralExpression(expression) || expression.elements.length > 0;
+  };
+  // <method>.call(<receiver>, error) hands its values over one at a time from
+  // argument 1; <method>.apply(<receiver>, [error]) hands them over in the list
+  // at argument 1. Either way argument 0 is the receiver, which is not a value
+  // under test, so counting it was counting the wrong thing (REVIEW-108
+  // Finding 1, rev rows Xf2 and Xf3).
+  const callHandsOverAValue = (node: ts.CallExpression, spelling: string) =>
+    node.arguments.length > 1
+    && (spelling === "call" || handsOverAValue(node.arguments[1]));
   // <Class>.prototype.isPrototypeOf(error), the same test spelled through
   // Object.prototype.isPrototypeOf.call/apply(<Class>.prototype, error), and
   // <Class>[Symbol.hasInstance](error), which is the method instanceof itself
@@ -1341,8 +1402,14 @@ function timeoutGuardMatcher(names: Set<string>) {
   //
   // A call form that puts the symbol lookup one hop off the callee is the same
   // call and is read the same way: the class comes from the lookup and the
-  // argument is still not read (REVIEW-101 F1). What that does not cover is a
-  // hop that moves the class off the lookup as well — see the disclosure above.
+  // argument is still not read (REVIEW-101 F1). On those hop forms "handed
+  // something" is counted past the receiver, because the receiver is not a
+  // value under test: counting it refused an empty arguments list, which tests
+  // nothing and is not a guard (REVIEW-108 Finding 1). One hop does move the
+  // class off the lookup and is still read — the method taken off
+  // Function.prototype, where the receiver is the only place the class is
+  // named, so that one receiver is read. Every other hop is not; see the
+  // disclosure above.
   const testsThePrototypeByCall = (node: ts.CallExpression) => {
     const callee = skipParentheses(node.expression);
     if (ts.isElementAccessExpression(callee)) {
@@ -1360,11 +1427,18 @@ function timeoutGuardMatcher(names: Set<string>) {
     // argument that way. Handed something here means an argument past the
     // method.
     if (callee.name.text === "apply" && ts.isIdentifier(method) && method.text === "Reflect") {
-      return node.arguments.length > 1 && readsHasInstanceOnTheClass(node.arguments[0]);
+      if (node.arguments.length < 3 || !handsOverAValue(node.arguments[2])) return false;
+      return readsHasInstanceOnTheClass(node.arguments[0])
+        || (readsHasInstanceOnFunctionPrototype(node.arguments[0]) && namesTheClass(node.arguments[1]));
     }
     // <Class>[Symbol.hasInstance].call(<Class>, error) and its .apply: the
     // lookup the element-access callee branch above reads, one hop back.
-    if (readsHasInstanceOnTheClass(method)) return node.arguments.length > 0;
+    if (readsHasInstanceOnTheClass(method)) return callHandsOverAValue(node, callee.name.text);
+    // The same call with the method read off Function.prototype, where the
+    // receiver is the only place the class is named, so here it is read.
+    if (readsHasInstanceOnFunctionPrototype(method)) {
+      return callHandsOverAValue(node, callee.name.text) && namesTheClass(node.arguments[0]);
+    }
     return ts.isPropertyAccessExpression(method)
       && method.name.text === "isPrototypeOf"
       && node.arguments.length > 0
@@ -1503,13 +1577,29 @@ function scanRejectionHandlers(root: ts.Node, sourceFile: ts.SourceFile, isTimeo
   // isTimeoutPredicate: (error: unknown) => never is the second of those said
   // with a variable, and it is as declared in this file as the first, so it
   // gets the same form string rather than "not declared in this file", which
-  // would be false of it (REVIEW-101 F3). The declare modifier sits on the
-  // statement, two parents up from the declaration that carries the name.
+  // would be false of it (REVIEW-101 F3). The declare modifier usually sits on
+  // the statement, two parents up from the declaration that carries the name —
+  // but not always: declare global { const isTimeoutPredicate: … } and
+  // declare module "x" { … } put it on the module declaration and leave the
+  // statement inside bare, so reading only parent.parent called a name this
+  // file does declare undeclared here (REVIEW-108 Finding 2). The ancestors are
+  // asked instead, and a module block counts on its own: a name declared inside
+  // one with no initializer is as body-less as the ambient spellings, and the
+  // handler is refused either way — only which of the two true things the
+  // receipt says about it changes.
   const isAmbientDeclaration = (declaration: ts.VariableDeclaration) => {
-    const statement = declaration.parent?.parent;
-    return statement !== undefined
-      && ts.isVariableStatement(statement)
-      && (statement.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.DeclareKeyword) ?? false);
+    let node: ts.Node | undefined = declaration.parent;
+    while (node !== undefined && !ts.isSourceFile(node)) {
+      if (ts.isModuleBlock(node)) return true;
+      const modifiers = ts.isVariableStatement(node)
+        ? node.modifiers
+        : ts.isModuleDeclaration(node)
+          ? node.modifiers
+          : undefined;
+      if (modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.DeclareKeyword)) return true;
+      node = node.parent;
+    }
+    return false;
   };
   let bodilessNames: Set<string> | undefined;
   const isDeclaredWithoutABody = (name: string) => {
@@ -1971,6 +2061,45 @@ function proveFetchSourceAudit(proofSource: string) {
     // (REVIEW-101 F4).
     { name: "callback_handler_comma_expression_named_in_the_receipt", source: applyEdits([outside(rethrowHelper), onFetch(".catch((0,\n        rethrowIfTimeout))")]), expected: false, forms: ["comma-expression"], texts: ["(0, rethrowIfTimeout)"] },
     { name: "callback_handler_named_in_the_receipt_past_the_length_bound", source: applyEdits([outside(rethrowHelper), onFetch(`.catch(${longBoundHandler})`)]), expected: false, forms: ["bind-result"], texts: [`${longBoundHandler.slice(0, 200)}...`] },
+    // The same two hops handed nothing to test. A receiver is an argument and
+    // not a value under test, so counting it refused these three: each one
+    // evaluates undefined instanceof ProofTimeoutError, constantly false, a
+    // dead expression rather than a guard, and each one is what a benign
+    // refactor to an empty arguments list writes (REVIEW-108 Finding 1). The
+    // .call spelling of it is the one shape here that does not compile
+    // (TS2554); it is carried as a shape so the count clause has a probe.
+    { name: "benign_symbol_hasinstance_through_reflect_apply_with_an_empty_arguments_list", source: applyEdits([bodyHandler("(error) => { if (Reflect.apply(ProofTimeoutError[Symbol.hasInstance], ProofTimeoutError, [])) throw error as Error; }")]), expected: true },
+    { name: "benign_symbol_hasinstance_through_an_apply_on_the_lookup_with_an_empty_array", source: applyEdits([bodyHandler("(error) => { if (ProofTimeoutError[Symbol.hasInstance].apply(ProofTimeoutError, [] as unknown as [unknown])) throw error as Error; }")]), expected: true },
+    { name: "benign_symbol_hasinstance_through_a_call_on_the_lookup_with_no_value_to_test", source: applyEdits([bodyHandler("(error) => { if (ProofTimeoutError[Symbol.hasInstance].call(ProofTimeoutError)) throw error as Error; }")]), expected: true },
+    // And the same two hops handed something, which is the half the count is
+    // there to keep: the .apply the file claims to read, and an arguments list
+    // this file cannot look inside, which is counted as handing something over.
+    { name: "callback_guard_by_symbol_hasinstance_through_an_apply_on_the_lookup", source: applyEdits([bodyHandler("(error) => { if (ProofTimeoutError[Symbol.hasInstance].apply(ProofTimeoutError, [error])) throw error; }")]), expected: false },
+    { name: "callback_guard_by_symbol_hasinstance_through_reflect_apply_with_a_named_arguments_list", source: applyEdits([bodyHandler("(error) => { const passed: [unknown] = [error]; if (Reflect.apply(ProofTimeoutError[Symbol.hasInstance], ProofTimeoutError, passed)) throw error; }")]), expected: false },
+    // The same ambient const with the declare keyword on an ancestor rather
+    // than on the statement: inside a declare global block, and inside a
+    // declare module block, which is the same shape in a spelling that does not
+    // compile (TS2664). Both names are declared in this file and given no body,
+    // so both get the form string that says so (REVIEW-108 Finding 2).
+    { name: "callback_handler_resolved_to_an_ambient_const_in_a_declare_global_block", source: applyEdits([outside("declare global { const isTimeoutPredicate: (error: unknown) => never; }\n"), onFetch(".catch(isTimeoutPredicate)")]), expected: false, forms: ["declaration-without-a-body"] },
+    { name: "callback_handler_resolved_to_an_ambient_const_in_a_declare_module_block", source: applyEdits([outside("declare module \"x\" { const isTimeoutPredicate: (error: unknown) => never; }\n"), onFetch(".catch(isTimeoutPredicate)")]), expected: false, forms: ["declaration-without-a-body"] },
+    // And the name the ancestor walk must not reach: a plain let at the top
+    // level is ambient nowhere, so it keeps the string that says this file
+    // cannot resolve it, which is true of it (REVIEW-108 residual 24).
+    { name: "callback_handler_named_by_a_plain_let_outside_any_ambient_block", source: applyEdits([outside("let isTimeoutPredicate: (error: unknown) => never;\n"), onFetch(".catch(isTimeoutPredicate)")]), expected: false, forms: ["name-not-declared-in-this-file"] },
+    // The method read off Function.prototype rather than off the class, in all
+    // three call spellings. The lookup names no class, so the class is the
+    // receiver and the receiver is read: each of these is
+    // error instanceof ProofTimeoutError at run time, each compiles, and each
+    // audited clean at the revision before this one with a live guard sitting
+    // in the rejection path (REVIEW-108 residual 22, adv101 R26).
+    { name: "callback_guard_by_symbol_hasinstance_off_function_prototype_through_a_call", source: applyEdits([bodyHandler("(error) => { if (Function.prototype[Symbol.hasInstance].call(ProofTimeoutError, error)) throw error; }")]), expected: false },
+    { name: "callback_guard_by_symbol_hasinstance_off_function_prototype_through_an_apply", source: applyEdits([bodyHandler("(error) => { if (Function.prototype[Symbol.hasInstance].apply(ProofTimeoutError, [error])) throw error; }")]), expected: false },
+    { name: "callback_guard_by_symbol_hasinstance_off_function_prototype_through_reflect_apply", source: applyEdits([bodyHandler("(error) => { if (Reflect.apply(Function.prototype[Symbol.hasInstance], ProofTimeoutError, [error])) throw error; }")]), expected: false },
+    // And the same lookup deciding nothing stays green: aimed at a class this
+    // audit says nothing about, and handed nothing to test.
+    { name: "benign_symbol_hasinstance_off_function_prototype_against_another_class", source: applyEdits([bodyHandler("(error) => { if (Function.prototype[Symbol.hasInstance].call(RangeError, error)) throw error as Error; }")]), expected: true },
+    { name: "benign_symbol_hasinstance_off_function_prototype_with_an_empty_arguments_list", source: applyEdits([bodyHandler("(error) => { if (Reflect.apply(Function.prototype[Symbol.hasInstance], ProofTimeoutError, [])) throw error as Error; }")]), expected: true },
   ];
   // Every literal opener that defeated the lexical strip, crossed with every
   // closer it was paired with and with the two sabotages they were used to
@@ -2089,7 +2218,7 @@ function proveFetchSourceAudit(proofSource: string) {
   const driftMismatches = driftResults.filter((result) => result.diagnostic !== result.expected || result.clean);
   check(
     checkName,
-    named.length === 89 && matrix.length === 60 && results.length === 149
+    named.length === 102 && matrix.length === 60 && results.length === 162
       && mismatches.length === 0 && drifts.length === 4 && driftMismatches.length === 0,
     JSON.stringify({
       method: "typescript-ast",
