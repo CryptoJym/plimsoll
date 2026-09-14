@@ -1169,9 +1169,13 @@ function activeTimerCount() {
 // is the only place the class is named: the method taken off
 // Function.prototype, and the prototype handed to
 // Object.prototype.isPrototypeOf. The value slot is a
-// requirement only in its count — a call must hand over at least one argument
-// past the receiver, and an inline empty arguments list hands over none — and
-// what is in the slot is never read (REVIEW-98 F6, REVIEW-108 Finding 1).
+// requirement only in its count, and the count is taken past whatever the form
+// spends its leading arguments on: a direct call must hand over at least one
+// argument, each of the three .call/.apply hops at least one past the receiver
+// it puts in argument 0, and Reflect.apply at least one past the method and
+// the receiver it puts in arguments 0 and 1. An inline empty arguments list
+// hands over none. What is in the slot is never read (REVIEW-98 F6,
+// REVIEW-108 Finding 1, REVIEW-117 Finding 1).
 // Not read, all of which compile here: a symbol or a method name
 // stashed in a variable first (const key = Symbol.hasInstance;
 // <Class>[key](error)); <Class>.prototype["isPrototypeOf"](error), the method
@@ -1400,12 +1404,14 @@ function timeoutGuardMatcher(names: Set<string>) {
   // expression. Each must be handed something — a test with nothing to test is
   // not a test — and none of them reads what it was handed (REVIEW-98 F1, F6).
   //
-  // A call form that puts the symbol lookup one hop off the callee is the same
-  // call and is read the same way: the class comes from the lookup and the
-  // argument is still not read (REVIEW-101 F1). On those hop forms "handed
-  // something" is counted past the receiver, because the receiver is not a
-  // value under test: counting it refused an empty arguments list, which tests
-  // nothing and is not a guard (REVIEW-108 Finding 1). One hop does move the
+  // A call form that puts the lookup one hop off the callee is the same call
+  // and is read the same way: the class comes from the lookup and the
+  // argument is still not read (REVIEW-101 F1). On all three hop forms — the
+  // two off the Symbol.hasInstance lookup and the one off
+  // Object.prototype.isPrototypeOf — "handed something" is counted past the
+  // receiver, because the receiver is not a value under test: counting it
+  // refused an empty arguments list, which tests nothing and is not a guard
+  // (REVIEW-108 Finding 1, REVIEW-117 Finding 1). One hop does move the
   // class off the lookup and is still read — the method taken off
   // Function.prototype, where the receiver is the only place the class is
   // named, so that one receiver is read. Every other hop is not; see the
@@ -1439,9 +1445,15 @@ function timeoutGuardMatcher(names: Set<string>) {
     if (readsHasInstanceOnFunctionPrototype(method)) {
       return callHandsOverAValue(node, callee.name.text) && namesTheClass(node.arguments[0]);
     }
+    // Object.prototype.isPrototypeOf.call/apply(<Class>.prototype, error): the
+    // third hop, and the receiver is argument 0 here too, so the count is
+    // taken past it exactly as on the two above. Counting the receiver made
+    // .apply(<Class>.prototype, []) a guard, which is isPrototypeOf(undefined)
+    // at run time — constantly false, a dead expression, not a test
+    // (REVIEW-117 Finding 1).
     return ts.isPropertyAccessExpression(method)
       && method.name.text === "isPrototypeOf"
-      && node.arguments.length > 0
+      && callHandsOverAValue(node, callee.name.text)
       && readsThePrototype(node.arguments[0]);
   };
   return (node: ts.Node): node is TimeoutGuard => {
@@ -1584,10 +1596,10 @@ function scanRejectionHandlers(root: ts.Node, sourceFile: ts.SourceFile, isTimeo
   // statement inside bare, so reading only parent.parent called a name this
   // file does declare undeclared here (REVIEW-108 Finding 2). The ancestors are
   // asked instead, and a module block counts on its own: a name declared inside
-  // one with no initializer is as body-less as the ambient spellings, and the
-  // handler is refused either way — only which of the two true things the
-  // receipt says about it changes.
-  const isAmbientDeclaration = (declaration: ts.VariableDeclaration) => {
+  // one with no initializer is as body-less as the ambient spellings. Whether
+  // that body-less name is one this file declares is a second question, asked
+  // separately below.
+  const isAmbientDeclaration = (declaration: ts.Node) => {
     let node: ts.Node | undefined = declaration.parent;
     while (node !== undefined && !ts.isSourceFile(node)) {
       if (ts.isModuleBlock(node)) return true;
@@ -1601,17 +1613,43 @@ function scanRejectionHandlers(root: ts.Node, sourceFile: ts.SourceFile, isTimeo
     }
     return false;
   };
+  // Which of the two true strings is the more precise one depends on where the
+  // declaration sits, and "body-less" alone does not say. A bare name in a
+  // handler position resolves against this file's scope, and only two places
+  // put a name there: the file itself, and a declare global block, whose
+  // contents are declared globally and so are visible here (Y4). A name inside
+  // declare module "x" or inside a plain namespace M { } is declared in that
+  // module, not here, so "declaration-without-a-body" sent a reader looking for
+  // an ambient declaration at file scope that does not exist, where
+  // "name-not-declared-in-this-file" was the more precise of the two true
+  // statements about it (REVIEW-117 Finding 3). Both trees are refused and
+  // clean is false either way; only the receipt's word changes.
+  const isDeclaredInThisFilesScope = (declaration: ts.Node) => {
+    let node: ts.Node | undefined = declaration.parent;
+    while (node !== undefined && !ts.isSourceFile(node)) {
+      if (ts.isModuleBlock(node)) {
+        const module = node.parent;
+        if (!ts.isModuleDeclaration(module)
+          || (module.flags & ts.NodeFlags.GlobalAugmentation) === 0) return false;
+      }
+      node = node.parent;
+    }
+    return node !== undefined;
+  };
   let bodilessNames: Set<string> | undefined;
   const isDeclaredWithoutABody = (name: string) => {
     bodilessNames ??= new Set([
       ...collectNodes(sourceFile, (node): node is ts.FunctionDeclaration =>
-        ts.isFunctionDeclaration(node) && node.body === undefined)
+        ts.isFunctionDeclaration(node)
+          && node.body === undefined
+          && isDeclaredInThisFilesScope(node))
         .flatMap((declaration) => (declaration.name ? [declaration.name.text] : [])),
       ...collectNodes(sourceFile, (node): node is ts.VariableDeclaration =>
         ts.isVariableDeclaration(node)
           && ts.isIdentifier(node.name)
           && node.initializer === undefined
-          && isAmbientDeclaration(node))
+          && isAmbientDeclaration(node)
+          && isDeclaredInThisFilesScope(node))
         .map((declaration) => (declaration.name as ts.Identifier).text),
     ]);
     return bodilessNames.has(name);
@@ -2079,10 +2117,15 @@ function proveFetchSourceAudit(proofSource: string) {
     // The same ambient const with the declare keyword on an ancestor rather
     // than on the statement: inside a declare global block, and inside a
     // declare module block, which is the same shape in a spelling that does not
-    // compile (TS2664). Both names are declared in this file and given no body,
-    // so both get the form string that says so (REVIEW-108 Finding 2).
+    // compile (TS2664). Both names are given no body and both are refused. The
+    // declare global one is declared in this file's scope — that block's
+    // contents are global — so it gets the string that says body-less; the
+    // declare module one is declared in that module and not here, so it keeps
+    // the string that says this file cannot resolve the name, which is the
+    // more precise of the two true things about it (REVIEW-108 Finding 2,
+    // REVIEW-117 Finding 3).
     { name: "callback_handler_resolved_to_an_ambient_const_in_a_declare_global_block", source: applyEdits([outside("declare global { const isTimeoutPredicate: (error: unknown) => never; }\n"), onFetch(".catch(isTimeoutPredicate)")]), expected: false, forms: ["declaration-without-a-body"] },
-    { name: "callback_handler_resolved_to_an_ambient_const_in_a_declare_module_block", source: applyEdits([outside("declare module \"x\" { const isTimeoutPredicate: (error: unknown) => never; }\n"), onFetch(".catch(isTimeoutPredicate)")]), expected: false, forms: ["declaration-without-a-body"] },
+    { name: "callback_handler_resolved_to_an_ambient_const_in_a_declare_module_block", source: applyEdits([outside("declare module \"x\" { const isTimeoutPredicate: (error: unknown) => never; }\n"), onFetch(".catch(isTimeoutPredicate)")]), expected: false, forms: ["name-not-declared-in-this-file"] },
     // And the name the ancestor walk must not reach: a plain let at the top
     // level is ambient nowhere, so it keeps the string that says this file
     // cannot resolve it, which is true of it (REVIEW-108 residual 24).
@@ -2100,6 +2143,35 @@ function proveFetchSourceAudit(proofSource: string) {
     // audit says nothing about, and handed nothing to test.
     { name: "benign_symbol_hasinstance_off_function_prototype_against_another_class", source: applyEdits([bodyHandler("(error) => { if (Function.prototype[Symbol.hasInstance].call(RangeError, error)) throw error as Error; }")]), expected: true },
     { name: "benign_symbol_hasinstance_off_function_prototype_with_an_empty_arguments_list", source: applyEdits([bodyHandler("(error) => { if (Reflect.apply(Function.prototype[Symbol.hasInstance], ProofTimeoutError, [])) throw error as Error; }")]), expected: true },
+    // The third call hop, Object.prototype.isPrototypeOf.call/apply, handed
+    // nothing past its receiver. Counting the receiver made both of these a
+    // guard: each is isPrototypeOf(undefined) at run time, constantly false, a
+    // dead expression rather than a test, and the first is what a benign
+    // refactor to an empty arguments list writes. Both audited RED at the
+    // revision before this one with no guard anywhere in the rejection path
+    // (REVIEW-117 Finding 1, mine M15 and M16). The .call spelling does not
+    // compile (TS2554); it is carried as a shape so the count clause has a
+    // probe on this hop too, exactly as on the lookup hop above.
+    { name: "benign_object_prototype_isprototypeof_through_an_apply_with_an_empty_array", source: applyEdits([bodyHandler("(error) => { if (Object.prototype.isPrototypeOf.apply(ProofTimeoutError.prototype, [] as unknown as [object])) throw error as Error; }")]), expected: true },
+    { name: "benign_object_prototype_isprototypeof_through_a_call_with_no_value_to_test", source: applyEdits([bodyHandler("(error) => { if (Object.prototype.isPrototypeOf.call(ProofTimeoutError.prototype)) throw error as Error; }")]), expected: true },
+    // And the same hop handed something, which is the half the count is there
+    // to keep: the .apply the file claims to read, and an arguments list this
+    // file cannot look inside, which is counted as handing something over. The
+    // .call spelling handed a real value is the
+    // callback_guard_by_isprototypeof_through_object_prototype_call row, which
+    // has stood since REVIEW-98 F1.
+    { name: "callback_guard_by_object_prototype_isprototypeof_through_an_apply", source: applyEdits([bodyHandler("(error) => { if (Object.prototype.isPrototypeOf.apply(ProofTimeoutError.prototype, [error as object])) throw error; }")]), expected: false },
+    { name: "callback_guard_by_object_prototype_isprototypeof_with_a_named_arguments_list", source: applyEdits([bodyHandler("(error) => { const protoArgs: [object] = [error as object]; if (Object.prototype.isPrototypeOf.apply(ProofTimeoutError.prototype, protoArgs)) throw error; }")]), expected: false },
+    // A handler named inside a module block this file's scope does not reach:
+    // a plain namespace, the non-ambient half of REVIEW-117 Finding 3. The
+    // name is body-less and is not declared where a bare .catch(name) would
+    // find it, so the receipt says the more precise of the two true things
+    // about it rather than sending a reader looking for an ambient
+    // declaration at file scope. The declare module row above moved with it;
+    // the declare global row is the control that did not, because that block's
+    // contents ARE in scope here. The spelling does not compile (TS2304); it
+    // is carried as a shape.
+    { name: "callback_handler_named_by_a_let_inside_a_plain_namespace_block", source: applyEdits([outside("namespace M { let isTimeoutPredicate: (error: unknown) => never; void isTimeoutPredicate; }\n"), onFetch(".catch(isTimeoutPredicate)")]), expected: false, forms: ["name-not-declared-in-this-file"] },
   ];
   // Every literal opener that defeated the lexical strip, crossed with every
   // closer it was paired with and with the two sabotages they were used to
@@ -2218,7 +2290,7 @@ function proveFetchSourceAudit(proofSource: string) {
   const driftMismatches = driftResults.filter((result) => result.diagnostic !== result.expected || result.clean);
   check(
     checkName,
-    named.length === 102 && matrix.length === 60 && results.length === 162
+    named.length === 107 && matrix.length === 60 && results.length === 167
       && mismatches.length === 0 && drifts.length === 4 && driftMismatches.length === 0,
     JSON.stringify({
       method: "typescript-ast",

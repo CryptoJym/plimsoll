@@ -1586,6 +1586,44 @@ async function routeClassificationChecks() {
         primitiveFirstAgg.observeRejection("storage_busy_retry", "otlp_exporter", fullRecordDiagnostic, "otlp");
       }
       const primitiveFirstSummary = primitiveFirstAgg.flush()[0];
+      // Third arm (REVIEW-111 F1): the two arms above cannot see WHICH value
+      // the window is keyed by. `${new String("storage_busy_retry")}` and
+      // `${"storage_busy_retry"}` are the same key text, so a `stateFor` that
+      // re-derived the key from the RAW argument — gate and stored reason
+      // still normalised — passed both arms 34/34 while reintroducing exactly
+      // the gate/key disagreement this bead closed. Pin the key site with a
+      // reason whose coercion is NOT stable: it answers "storage_busy_retry"
+      // for as many coercions as the normalising gate spends — one per
+      // observation, which is what "coerced once, not three times" means — and
+      // a fresh string after that. One window opens iff every site that
+      // decides a window read that one normalised value; a second coercion
+      // anywhere lands on a key nothing else agrees with and opens another.
+      //
+      // TypeScript forbids this caller too; the emitter owns the bound, so the
+      // check constructs it anyway.
+      let varyingCoercions = 0;
+      const varyingReason = {
+        toString() {
+          varyingCoercions += 1;
+          return varyingCoercions <= BOXED_FEED
+            ? "storage_busy_retry"
+            : `unstable_coercion_${varyingCoercions}`;
+        },
+      } as unknown as never;
+      const varyingAgg = mod.createRejectionDiagnostics({ nowMs: () => routeNow });
+      for (let index = 0; index < BOXED_FEED; index += 1) {
+        varyingAgg.observeRejection(varyingReason, "otlp_exporter", fullRecordDiagnostic, "otlp");
+      }
+      const varyingCounters = varyingAgg.counters();
+      const varyingRow = varyingCounters.reasons[0];
+      const varyingLines = varyingAgg.flush();
+      const varyingKeyIsTheNormalisedReason =
+        varyingCounters.reasons.length === 1 &&
+        varyingRow !== undefined &&
+        typeof varyingRow.reason === "string" &&
+        varyingRow.reason === "storage_busy_retry" &&
+        varyingLines.length === 1 &&
+        JSON.stringify(varyingLines[0]) === JSON.stringify(primitiveFirstSummary);
       // Control: the same boxed construction on a reason that is NOT
       // route-classified still carries all six record fields, so a clean busy
       // line is the gate classifying the boxed reason and not an injection
@@ -1609,6 +1647,10 @@ async function routeClassificationChecks() {
           // …and a window the boxed reason OPENED stores it normalised too,
           // so the key and the stored reason agree whoever opened the window
           boxedFirstStoredReasonIsPrimitive &&
+          // …and the window KEY is that same normalised value and not the raw
+          // argument: an unstably coercing reason opens exactly one window and
+          // emits the line the primitive emits (REVIEW-111 F1)
+          varyingKeyIsTheNormalisedReason &&
           hasNoRecordFields(boxedFirstSummary) &&
           boxedFirstSummary?.recordDiagnosticsDiscarded === BOXED_FEED &&
           JSON.stringify(boxedFirstSummary) === JSON.stringify(primitiveFirstSummary) &&
@@ -1637,6 +1679,10 @@ async function routeClassificationChecks() {
             boxedFirstRow === undefined ? "missing" : typeof boxedFirstRow.reason,
           boxedOpenedLine: JSON.stringify(boxedFirstSummary),
           primitiveOpenedLine: JSON.stringify(primitiveFirstSummary),
+          varyingCoercions,
+          varyingWindowsOpened: varyingCounters.reasons.length,
+          varyingStoredReasons: varyingCounters.reasons.map((row) => String(row.reason)),
+          varyingLines: varyingLines.map((line) => JSON.stringify(line)),
           controlLine: JSON.stringify(boxedControlSummary),
           controlLineBytes: Buffer.byteLength(JSON.stringify(boxedControlSummary)),
         },
