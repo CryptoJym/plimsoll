@@ -1191,7 +1191,14 @@ function activeTimerCount() {
 // than an unusual spelling of anything. The getPrototypeOf lookup of that
 // second spelling is read written either way, as a property access or with the
 // name written out as a literal — Object["getPrototypeOf"](new <Class>(...))
-// and the template-literal spelling of it are the same lookup — for the same
+// and the template-literal spelling of it are the same lookup, written out as a
+// literal meaning here what it means one slot over, a string literal or a
+// template literal with no substitutions. The property-access half of that is
+// read whether it is written with a dot or with an optional chain:
+// Object?.getPrototypeOf(new <Class>(...)) is a property access like any other
+// to a file that reads a name and never asks about the question mark in front
+// of it, so it is read — one more spelling read, never one fewer, the direction
+// everything here errs in. Both spellings are read for the same
 // reason the method name is read either way one slot over: the element-access
 // spelling is not a hop that moves anything, it is the same lookup written the
 // other way, and a file that reads Symbol["hasInstance"] and
@@ -1230,7 +1237,22 @@ function activeTimerCount() {
 // rather than written out, const reachKey = "getPrototypeOf";
 // Object[reachKey](new <Class>(...)). Both of those compile here and audit
 // clean, and both are the variable hop this file declines everywhere else
-// rather than a spelling of the lookup. And any shape assembled at run time
+// rather than a spelling of the lookup. Nor is the Object that lookup is taken
+// off, where it is reached through a host object instead of named —
+// globalThis.Object, window.Object and self.Object, by property access or by
+// element access, with or without an assertion on the way, so
+// globalThis.Object.getPrototypeOf(new <Class>(...)) compiles here and audits
+// clean: the lookup is written out plainly, but what it sits on is a property
+// access rather than the identifier this file reads, and following that back to
+// Object is dataflow rather than a spelling, the same line drawn on the two
+// hops above and an open family rather than one form. A type assertion is read
+// through on the two operands of the prototype comparison in the binary branch
+// and in the arguments-list count, and nowhere else: (<Class>.prototype as
+// object) and (Object.getPrototypeOf(new <Class>(...)) as object) are read
+// there, as are the satisfies and angle-bracket spellings of them, while the
+// same assertion one level in — on the new inside a reach, or on the receiver
+// of any isPrototypeOf hop — is not read, and compiles here and audits clean.
+// And any shape assembled at run time
 // through eval or new Function. No behavioural check backs the audit up for
 // those: the guard it exists to refuse is dead by construction, so it changes
 // nothing a behavioural check could observe. This is a shape check on one
@@ -1274,8 +1296,11 @@ function skipParentheses(expression: ts.Expression): ts.Expression {
 
 // The same read, through the type assertions that change what an expression is
 // typed as and not what it is: [] as unknown as [unknown] is still the empty
-// array at run time. Only the arguments-list position below needs this, so it
-// stays separate from skipParentheses rather than widening every operand read.
+// array at run time, and (<Class>.prototype as object) is still that prototype.
+// Two positions below need this — the arguments-list count, and the two
+// operands of the prototype comparison, where an assertion would otherwise hide
+// an expression doing exactly what it appears to do. It stays separate from
+// skipParentheses rather than widening every operand read.
 function skipAssertions(expression: ts.Expression): ts.Expression {
   let current = skipParentheses(expression);
   while (ts.isAsExpression(current) || ts.isSatisfiesExpression(current) || ts.isTypeAssertionExpression(current)) {
@@ -1388,10 +1413,16 @@ function timeoutGuardMatcher(names: Set<string>) {
   // as a literal — a string literal or a template literal with no
   // substitutions, which are the same thing to the test below. Both spellings
   // are the same lookup, so both are read here, exactly as namesHasInstance
-  // reads its symbol and readsIsPrototypeOf its method either way. What this
+  // reads its symbol and readsIsPrototypeOf its method either way. The property
+  // access is read written with a dot and written with an optional chain alike:
+  // Object?.getPrototypeOf is a property access node the same as Object.get-
+  // PrototypeOf is, and the test below reads the name off it without ever
+  // asking about the question mark, so that spelling is read too. What this
   // test reads is the lookup and not what it returns, so the name moved off
   // Object into a variable, or computed rather than written out, is a hop this
-  // file does not enumerate, like every other one in the disclosure above.
+  // file does not enumerate, like every other one in the disclosure above — and
+  // so is the Object under the lookup reached through a host object, which is
+  // why globalThis.Object.getPrototypeOf(new <Class>(...)) is not read here.
   const readsGetPrototypeOf = (operand: ts.Expression) => {
     const expression = skipParentheses(operand);
     const onObject = (host: ts.Expression) => {
@@ -1603,10 +1634,23 @@ function timeoutGuardMatcher(names: Set<string>) {
     // already one set above, so !== and == reach this line too, and the two
     // operands are read by the same call, so the reversed order is the same
     // test. Reading one operand and not the other stands — the other side is
-    // whatever the guard is testing, and is not read.
-    if (reachesThePrototype(node.left) || reachesThePrototype(node.right)) return true;
-    return (readsAConstructor(node.left) && namesTheClass(node.right))
-      || (readsAConstructor(node.right) && namesTheClass(node.left));
+    // whatever the guard is testing, and is not read. Both operands are read
+    // through their type assertions as well as their parentheses, because an
+    // assertion changes what an expression is typed as and not what it is: the
+    // spelled (<Class>.prototype as object) and the reached
+    // (Object.getPrototypeOf(new <Class>(...)) as object) are these same two
+    // operands one word longer, and each of them compiled, ran and audited
+    // clean until this bead — the spelled one since long before the reached
+    // form was read here at all (REVIEW-131 F2). satisfies and the angle-
+    // bracket spelling are the same skip, and it is the same skip the
+    // arguments-list count above already takes. This is the operand position
+    // and no other: an assertion on the new inside a reach, or on the receiver
+    // of an isPrototypeOf hop, is still not read.
+    const left = skipAssertions(node.left);
+    const right = skipAssertions(node.right);
+    if (reachesThePrototype(left) || reachesThePrototype(right)) return true;
+    return (readsAConstructor(left) && namesTheClass(right))
+      || (readsAConstructor(right) && namesTheClass(left));
   };
 }
 
@@ -2387,6 +2431,23 @@ function proveFetchSourceAudit(proofSource: string) {
     // spelling from accepting any reach at all.
     { name: "callback_guard_by_element_access_getprototypeof_on_a_reached_prototype", source: applyEdits([bodyHandler("(error) => { if (Reflect.apply(Object.prototype.isPrototypeOf, Object[\"getPrototypeOf\"](new ProofTimeoutError(\"debugger_target\")), [error as object])) throw error; }")]), expected: false },
     { name: "benign_element_access_getprototypeof_on_a_reached_prototype_of_another_class", source: applyEdits([bodyHandler("(error) => { if (Reflect.apply(Object.prototype.isPrototypeOf, Object[\"getPrototypeOf\"](new RangeError(\"debugger_target\")), [error as object])) throw error as Error; }")]), expected: true },
+    // And the same comparison with a type assertion on the operand that carries
+    // the prototype. An assertion changes what an expression is typed as and
+    // not what it is, so each of these is the row above it one word longer —
+    // and each compiled, ran and audited clean until this bead, the spelled
+    // form since long before the reached form was read here at all, because the
+    // operands were read through their parentheses and not through their
+    // assertions (REVIEW-131 F2). The satisfies row is the third spelling of
+    // the same skip; the angle-bracket spelling is the fourth and is not given
+    // a row of its own, for the same reason the reversed operand order is not.
+    // The must-green controls are the same two comparisons built on a class
+    // this audit says nothing about, which is what keeps reading through an
+    // assertion from reddening every asserted prototype comparison in sight.
+    { name: "callback_guard_by_binary_comparison_against_an_asserted_reached_prototype", source: applyEdits([bodyHandler("(error) => { if (Object.getPrototypeOf(error) === (Object.getPrototypeOf(new ProofTimeoutError(\"debugger_target\")) as object)) throw error; }")]), expected: false },
+    { name: "callback_guard_by_binary_comparison_against_an_asserted_spelled_prototype", source: applyEdits([bodyHandler("(error) => { if (Object.getPrototypeOf(error) === (ProofTimeoutError.prototype as object)) throw error; }")]), expected: false },
+    { name: "callback_guard_by_binary_comparison_against_a_satisfies_asserted_reached_prototype", source: applyEdits([bodyHandler("(error) => { if (Object.getPrototypeOf(error) === (Object.getPrototypeOf(new ProofTimeoutError(\"debugger_target\")) satisfies object)) throw error; }")]), expected: false },
+    { name: "benign_binary_comparison_against_an_asserted_reached_prototype_of_another_class", source: applyEdits([bodyHandler("(error) => { if (Object.getPrototypeOf(error) === (Object.getPrototypeOf(new RangeError(\"x\")) as object)) throw error as Error; }")]), expected: true },
+    { name: "benign_binary_comparison_against_an_asserted_spelled_prototype_of_another_class", source: applyEdits([bodyHandler("(error) => { if (Object.getPrototypeOf(error) === (RangeError.prototype as object)) throw error as Error; }")]), expected: true },
   ];
   // Every literal opener that defeated the lexical strip, crossed with every
   // closer it was paired with and with the two sabotages they were used to
@@ -2505,7 +2566,7 @@ function proveFetchSourceAudit(proofSource: string) {
   const driftMismatches = driftResults.filter((result) => result.diagnostic !== result.expected || result.clean);
   check(
     checkName,
-    named.length === 130 && matrix.length === 60 && results.length === 190
+    named.length === 135 && matrix.length === 60 && results.length === 195
       && mismatches.length === 0 && drifts.length === 4 && driftMismatches.length === 0,
     JSON.stringify({
       method: "typescript-ast",
