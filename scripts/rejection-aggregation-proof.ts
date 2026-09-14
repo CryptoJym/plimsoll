@@ -1230,14 +1230,20 @@ async function routeClassificationChecks() {
       // read off the exported vocabularies, not pinned to today's members, so
       // an eighth record-array key or a longer client class grows the subject
       // here instead of growing the real worst line unmeasured. Read
-      // defensively, so an aggregation that stopped exporting one of them
-      // FAILS this check instead of throwing and taking the run with it.
+      // defensively, and an empty read is carried into the predicate below, so
+      // an aggregation that stopped exporting one of them FAILS this check
+      // with the missing export named, instead of either throwing and taking
+      // the run with it or passing on a collapsed subject.
       const recordArrayKeys = Array.isArray(mod.OTLP_RECORD_ARRAY_KEYS)
         ? (mod.OTLP_RECORD_ARRAY_KEYS as readonly string[])
         : [];
       const clientClassVocabulary = Array.isArray(mod.REJECTION_CLIENT_CLASSES)
         ? (mod.REJECTION_CLIENT_CLASSES as readonly string[])
         : [];
+      const missingVocabularyExports = [
+        ...(recordArrayKeys.length > 0 ? [] : ["OTLP_RECORD_ARRAY_KEYS"]),
+        ...(clientClassVocabulary.length > 0 ? [] : ["REJECTION_CLIENT_CLASSES"]),
+      ];
       // Longest first; equal lengths break on ascending lexical order, so the
       // subject is one deterministic class however the vocabulary is written.
       const worstClientClass = [...clientClassVocabulary].sort(
@@ -1351,7 +1357,8 @@ async function routeClassificationChecks() {
       );
       check(
         "mixed_diagnostic_saturated_summary_preserves_the_fixed_byte_ceiling",
-        mod.REJECTION_SUMMARY_LINE_MAX_BYTES === 640 &&
+        missingVocabularyExports.length === 0 &&
+          mod.REJECTION_SUMMARY_LINE_MAX_BYTES === 640 &&
           // the subject really is a record-carrying line, not an empty one
           hasAllRecordFields(worstRecordSummary) &&
           worstRecordSummary?.recordCountMax === 100_000 &&
@@ -1362,9 +1369,11 @@ async function routeClassificationChecks() {
           exclusivityByReason.some((entry) => entry.routeClassified) &&
           exclusivityByReason.some((entry) => !entry.routeClassified),
         {
+          missingVocabularyExports,
           worstRecordReason,
-          worstClientClass,
+          worstClientClass: (worstClientClass as string | undefined) ?? null,
           recordArrayKeys,
+          clientClassVocabulary,
           lineBytes: saturatedRecordCarryingBytes,
           headroom: mod.REJECTION_SUMMARY_LINE_MAX_BYTES - saturatedRecordCarryingBytes,
           ceiling: mod.REJECTION_SUMMARY_LINE_MAX_BYTES,
@@ -1600,7 +1609,16 @@ async function main() {
       passed: checks.length - failed.length,
       failed: failed.length,
       intervalMs: INTERVAL_MS,
-      digest: crypto.createHash("sha256").update(String(checks.length)).digest("hex").slice(0, 8),
+      // Content identity, not a count tag: the ordered check names and their
+      // verdicts. A renamed, removed, reordered or added check moves it, and
+      // so does any flipped verdict — a red run can no longer print the same
+      // digest as the green one. Scale-invariant, so a CI run under
+      // REJECTION_PROOF_SCALE prints the same digest as a full local run.
+      digest: crypto
+        .createHash("sha256")
+        .update(checks.map((result) => `${result.passed ? "PASS" : "FAIL"} ${result.name}`).join("\n"))
+        .digest("hex")
+        .slice(0, 8),
     }),
   );
   if (failed.length > 0) process.exitCode = 1;
