@@ -1157,9 +1157,11 @@ function activeTimerCount() {
 // <Class>[Symbol.hasInstance].call(<any receiver>, error) and its .apply,
 // Reflect.apply(<Class>[Symbol.hasInstance], <any receiver>, [error]),
 // Function.prototype[Symbol.hasInstance].call(<Class>, error), its .apply and
-// its Reflect.apply spelling, <Class>.prototype.isPrototypeOf(error), and
+// its Reflect.apply spelling, <Class>.prototype.isPrototypeOf(error),
 // Object.prototype.isPrototypeOf.call(<Class>.prototype, error) and its
-// .apply. The slots mean what they say. Where a form spells <any receiver> the
+// .apply, and the Reflect.apply spelling of that third hop,
+// Reflect.apply(Object.prototype.isPrototypeOf, <Class>.prototype, [error]).
+// The slots mean what they say. Where a form spells <any receiver> the
 // receiver is not read at all: this file takes the class from the lookup in
 // front of the hop, while at run time it is the receiver that decides, so the
 // same hop aimed at another class is benign and is read as a guard and reds
@@ -1172,13 +1174,18 @@ function activeTimerCount() {
 // requirement only in its count, and the count is taken past whatever the form
 // spends its leading arguments on: a direct call must hand over at least one
 // argument, each of the three .call/.apply hops at least one past the receiver
-// it puts in argument 0, and Reflect.apply at least one past the method and
-// the receiver it puts in arguments 0 and 1. An inline empty arguments list
-// hands over none. What is in the slot is never read (REVIEW-98 F6,
-// REVIEW-108 Finding 1, REVIEW-117 Finding 1).
+// it puts in argument 0, and Reflect.apply — read for three method slots and
+// no others, <Class>[Symbol.hasInstance],
+// Function.prototype[Symbol.hasInstance] and Object.prototype.isPrototypeOf —
+// at least one past the method and the receiver it puts in arguments 0 and 1.
+// An inline empty arguments list hands over none. What is in the slot is never
+// read (REVIEW-98 F6, REVIEW-108 Finding 1, REVIEW-117 Finding 1).
 // Not read, all of which compile here: a symbol or a method name
 // stashed in a variable first (const key = Symbol.hasInstance;
-// <Class>[key](error)); <Class>.prototype["isPrototypeOf"](error), the method
+// <Class>[key](error), and the same hop on the method slot this bead added,
+// const held = Object.prototype.isPrototypeOf;
+// Reflect.apply(held, <Class>.prototype, [error]), measured clean at this
+// revision); <Class>.prototype["isPrototypeOf"](error), the method
 // name as a literal where this file looks for a property access; the base
 // method reached by anything but the Function.prototype[Symbol.hasInstance]
 // lookup itself; the same call forms with the method or the class spread out
@@ -1380,6 +1387,16 @@ function timeoutGuardMatcher(names: Set<string>) {
     const base = skipParentheses(host.expression);
     return ts.isIdentifier(base) && base.text === "Function";
   };
+  // Object.prototype.isPrototypeOf, read off whatever base spells it: Object,
+  // or <Class>.prototype, which reaches the same function. Nothing in the
+  // lookup says which class, so the class is whatever the call hands it as its
+  // receiver, exactly as on Function.prototype[Symbol.hasInstance] — which is
+  // why every form that puts this method in the method slot reads its receiver
+  // slot, wherever that form keeps it.
+  const readsIsPrototypeOf = (operand: ts.Expression) => {
+    const expression = skipParentheses(operand);
+    return ts.isPropertyAccessExpression(expression) && expression.name.text === "isPrototypeOf";
+  };
   // An arguments list written inline says how many values the call hands over,
   // and [] hands over none. Any other spelling of the list — a name bound to an
   // array, a spread — is counted as handing something over, which errs in the
@@ -1435,7 +1452,17 @@ function timeoutGuardMatcher(names: Set<string>) {
     if (callee.name.text === "apply" && ts.isIdentifier(method) && method.text === "Reflect") {
       if (node.arguments.length < 3 || !handsOverAValue(node.arguments[2])) return false;
       return readsHasInstanceOnTheClass(node.arguments[0])
-        || (readsHasInstanceOnFunctionPrototype(node.arguments[0]) && namesTheClass(node.arguments[1]));
+        || (readsHasInstanceOnFunctionPrototype(node.arguments[0]) && namesTheClass(node.arguments[1]))
+        // The third hop through this same entry:
+        // Reflect.apply(Object.prototype.isPrototypeOf, <Class>.prototype,
+        // [error]) is <Class>.prototype.isPrototypeOf(error) at run time, the
+        // call the branch below reads, with the receiver moved from argument 0
+        // to argument 1. Until this bead only the two Symbol.hasInstance
+        // lookups were read out of this method slot, so that guard compiled,
+        // ran, and audited clean end to end (REVIEW-120 F-1). The receiver is
+        // read here for the same reason it is read on the .call/.apply
+        // spelling: it is the only place the class is named.
+        || (readsIsPrototypeOf(node.arguments[0]) && readsThePrototype(node.arguments[1]));
     }
     // <Class>[Symbol.hasInstance].call(<Class>, error) and its .apply: the
     // lookup the element-access callee branch above reads, one hop back.
@@ -1451,8 +1478,7 @@ function timeoutGuardMatcher(names: Set<string>) {
     // .apply(<Class>.prototype, []) a guard, which is isPrototypeOf(undefined)
     // at run time — constantly false, a dead expression, not a test
     // (REVIEW-117 Finding 1).
-    return ts.isPropertyAccessExpression(method)
-      && method.name.text === "isPrototypeOf"
+    return readsIsPrototypeOf(method)
       && callHandsOverAValue(node, callee.name.text)
       && readsThePrototype(node.arguments[0]);
   };
@@ -2172,6 +2198,18 @@ function proveFetchSourceAudit(proofSource: string) {
     // contents ARE in scope here. The spelling does not compile (TS2304); it
     // is carried as a shape.
     { name: "callback_handler_named_by_a_let_inside_a_plain_namespace_block", source: applyEdits([outside("namespace M { let isTimeoutPredicate: (error: unknown) => never; void isTimeoutPredicate; }\n"), onFetch(".catch(isTimeoutPredicate)")]), expected: false, forms: ["name-not-declared-in-this-file"] },
+    // The third call hop spelled through Reflect.apply, which carries the
+    // method in argument 0 and the receiver in argument 1. This one is a
+    // working guard: it is ProofTimeoutError.prototype.isPrototypeOf(error) at
+    // run time, it compiles with no error, and at the revision before this one
+    // it audited CLEAN end to end with that guard live in the rejection path,
+    // because only the two Symbol.hasInstance lookups were read out of that
+    // method slot (REVIEW-120 F-1, the reviewer's Q1b). The empty arguments
+    // list is the count clause on this hop, the same control the .call/.apply
+    // spelling above carries: isPrototypeOf handed nothing is constantly
+    // false, a dead expression rather than a test, so it must stay green.
+    { name: "callback_guard_by_object_prototype_isprototypeof_through_reflect_apply", source: applyEdits([bodyHandler("(error) => { if (Reflect.apply(Object.prototype.isPrototypeOf, ProofTimeoutError.prototype, [error as object])) throw error; }")]), expected: false },
+    { name: "benign_object_prototype_isprototypeof_through_reflect_apply_with_an_empty_array", source: applyEdits([bodyHandler("(error) => { if (Reflect.apply(Object.prototype.isPrototypeOf, ProofTimeoutError.prototype, [] as unknown as [object])) throw error as Error; }")]), expected: true },
   ];
   // Every literal opener that defeated the lexical strip, crossed with every
   // closer it was paired with and with the two sabotages they were used to
@@ -2290,7 +2328,7 @@ function proveFetchSourceAudit(proofSource: string) {
   const driftMismatches = driftResults.filter((result) => result.diagnostic !== result.expected || result.clean);
   check(
     checkName,
-    named.length === 107 && matrix.length === 60 && results.length === 167
+    named.length === 109 && matrix.length === 60 && results.length === 169
       && mismatches.length === 0 && drifts.length === 4 && driftMismatches.length === 0,
     JSON.stringify({
       method: "typescript-ast",

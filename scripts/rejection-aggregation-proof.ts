@@ -1617,6 +1617,28 @@ async function routeClassificationChecks() {
       const varyingCounters = varyingAgg.counters();
       const varyingRow = varyingCounters.reasons[0];
       const varyingLines = varyingAgg.flush();
+      // Which clause of this arm pins which mutant, measured by the .120
+      // reviewer and carried here because the .120 report argued it the other
+      // way (REVIEW-120 F-2). The BOXED_FEED budget only reaches a second
+      // coercion site that coerces on EVERY call: that one spends 6 coercions,
+      // crosses the budget, and opens 3 windows, so the window count and the
+      // stored reasons below both move. A second site that coerces once for
+      // the whole run — a memoised key cache keyed on the raw object, which is
+      // what a "don't re-coerce this" optimisation actually writes — spends 4
+      // and opens ONE, so varyingWindowsOpened, varyingCounters.reasons and
+      // varyingRow.reason are all still exactly the clean values and the
+      // budget is blind to it. The clause that catches it is the last one,
+      // byte-identity of the flushed line against the primitive's: the
+      // memoised key lands on a window whose line the primitive's does not
+      // match. Removing only that clause leaves the memoised mutant green at
+      // 34/34 while the per-call one still reds, so the line clause, not the
+      // budget, is the load-bearing pin on a single-coercion second site.
+      //
+      // That last clause is also why this arm is not silent on the older raw
+      // mutants: with the gate reading the raw argument the flushed line
+      // differs from the primitive's as well, so this flag is false and the
+      // arm fires there too. It is one more assertion about the same window,
+      // not a test that only the key site can ever trip.
       const varyingKeyIsTheNormalisedReason =
         varyingCounters.reasons.length === 1 &&
         varyingRow !== undefined &&
