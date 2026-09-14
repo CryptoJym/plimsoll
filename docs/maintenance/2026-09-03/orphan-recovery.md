@@ -78,6 +78,11 @@ Local commits:
 | NOT_RUN | Package `test` script | `pnpm --dir packages/collector-cli test` | package has no `test` script |
 | NOT_RUN | Package lint script | `pnpm --dir packages/collector-cli lint` | package has no `lint` script |
 
+Since `eco-6hoxj.95` the `proof_http_timeout` reason is a longer sentence that
+also names the 5000 ms per-request client timeout and both status budgets, so
+the failure JSON recorded above (kept as it was recorded) now matches a re-run
+by prefix only, not exactly.
+
 The two full-suite failures mean this lane is not wholly green. The focused
 regressions, typecheck, and bundle build are green; no claim is made that the
 unscaled suite passes on this machine in its current state.

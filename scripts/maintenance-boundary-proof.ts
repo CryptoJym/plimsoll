@@ -64,11 +64,15 @@ const PRIVATE_PATH_SENTINEL = "maintenance-boundary-private-path-sentinel";
 // excuse a status endpoint that is actually unavailable.
 const STATUS_P95_FLOOR_MS = 100;
 // 2026-09-13 (eco-6hoxj.95): 3 -> 2. Under a uniform host slowdown the in-window
-// p95 tracks the idle p95 closely -- measured/idle was 0.86-1.01 over a five-point
-// stall sweep on a 10-core host and 0.80 on another -- so 2x leaves at least a 2x
-// margin at every operating point measured, and 3x was buying headroom nothing
-// needed. The factor only decides the bound for an idle p95 between 50ms and
-// 125ms; below that the floor wins and above it the ceiling does.
+// p95 tracks the idle p95 closely. Over 52 points on one 10-core host -- four
+// 13-point stall sweeps, one in REVIEW-95 and three in eco-6hoxj.103 --
+// measured/idle ran 0.81 to 1.08. Every ratio above 1 landed at an idle p95 of
+// 210ms or more, where the ceiling already governs and the factor is irrelevant:
+// the factor only decides the bound for an idle p95 between 50ms and 125ms,
+// below that the floor wins and above it the ceiling does. Inside that band the
+// worst ratio measured was 0.934, so 2x keeps about 2.1x margin where it binds
+// and about 1.85x against the worst ratio measured anywhere. 3x was buying
+// headroom nothing needed.
 const STATUS_P95_RELATIVE_FACTOR = 2;
 // 2026-09-13 (eco-6hoxj.95): the ceiling is the damping, so it is pinned to a
 // multiple of the floor instead of being a free-standing number. The baseline is
@@ -1908,8 +1912,13 @@ async function main() {
     // with budgets.statusP95FloorMs / statusP95RelativeFactor / statusP95CeilingMs
     // and added idleStatusP95Ms, statusP95BoundMs and statusP95CeilingMs;
     // eco-6hoxj.95 added budgets.statusP95CeilingFloorMultiple and
-    // budgets.requestTimeoutMs and moved statusP95CeilingMs 400 -> 250. A reader of
-    // an archived version 1 receipt must not expect budgets.statusP95Ms at 2.
+    // budgets.requestTimeoutMs and moved statusP95CeilingMs 400 -> 250. Version 1
+    // therefore covers two incompatible budget shapes and this bump cannot fix the
+    // receipts already emitted: a pre-eco-6hoxj.90 receipt carries
+    // budgets.statusP95Ms and says schemaVersion 1, a .90 receipt (9ea648a1) omits
+    // that field and also says 1, and only eco-6hoxj.95-and-later receipts say 2.
+    // A reader of an archived version 1 receipt must probe for
+    // budgets.statusP95Ms rather than assume it is there.
     schemaVersion: 2,
     proof: "maintenance_boundary",
     node: process.versions.node,
