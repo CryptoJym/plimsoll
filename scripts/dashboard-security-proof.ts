@@ -1121,23 +1121,51 @@ function activeTimerCount() {
 // would re-introduce the false red the three-form acceptance removed
 // (REVIEW-89 §9.10).
 //
+// The strings themselves are asserted too, against the node each one was taken
+// from: "while(true)" must sit on an endless while statement, "for-in" on a
+// for-in, and so on. Holding the two walks against each other could not catch a
+// label that drifted inside the endless set — an endless for named
+// "while(true)" leaves both walks finding the same one node — so the receipt
+// field a reader actually reads could still be wrong with nothing to say so
+// (REVIEW-101 F2). This is not the same as asserting which form the retry loop
+// has: all three endless forms are still accepted, and all five non-endless
+// ones still audit exactly as before. It asserts only that the word matches the
+// loop it names. Neither this nor the walk comparison can be reached by a
+// planted source, so both are exercised in process instead, by the drift probes
+// in proveFetchSourceAudit, which patch the naming and the walk and expect the
+// diagnostic back (REVIEW-101 F5).
+//
 // What it cannot see: a ProofTimeoutError re-raised by a function this one
 // invokes rather than hands over as a callback; a handler named by anything but
 // an identifier this file declares a function with a body for, which is refused
 // rather than read; a class or a handler that lives in another file; a guard
 // whose class operand is computed rather than named (instanceof (0, <Class>),
-// which does not compile here anyway); a guard whose method is computed from
-// something this file cannot read as a literal, which is where the call forms
-// stop — <Class>[Symbol.hasInstance](error) and the
-// <Class>[Symbol["hasInstance"]](error) spelling of it are read, but a symbol
-// or a method name stashed in a variable first is not, and neither is
-// <Class>.prototype["isPrototypeOf"](error) or
-// Function.prototype[Symbol.hasInstance].call(<Class>, error), all of which
-// compile here; and any shape assembled at run time through eval or
-// new Function. No behavioural check backs the audit up for those: the guard
-// it exists to refuse is dead by construction, so it changes nothing a
-// behavioural check could observe. This is a shape check on one function body
-// and claims nothing past it.
+// which does not compile here anyway); and a call form written in a spelling
+// this file does not enumerate. That last one is the honest reason the call
+// forms stop where they do, and it is not "the method is computed": the method
+// name in <Class>.prototype["isPrototypeOf"](error) is a literal this file can
+// read perfectly well, it is simply not looked for in that position. The call
+// forms are a list of spellings, not an analysis, so any hop that moves the
+// symbol, the method name or the class away from the place the list looks for
+// it is not read. Read: <Class>[Symbol.hasInstance](error), the
+// <Class>[Symbol["hasInstance"]](error) spelling of it,
+// <Class>[Symbol.hasInstance].call(<Class>, error) and its .apply,
+// Reflect.apply(<Class>[Symbol.hasInstance], <Class>, [error]),
+// <Class>.prototype.isPrototypeOf(error), and
+// Object.prototype.isPrototypeOf.call(<Class>.prototype, error) and its
+// .apply. Not read, all of which compile here: a symbol or a method name
+// stashed in a variable first (const key = Symbol.hasInstance;
+// <Class>[key](error)); <Class>.prototype["isPrototypeOf"](error), the method
+// name as a literal where this file looks for a property access;
+// Function.prototype[Symbol.hasInstance].call(<Class>, error), which takes the
+// class from the receiver argument rather than from the lookup the method was
+// read off; the same call forms with the method or the class spread out of an
+// array; and the same lookups hopped through any other reflection entry point
+// — Reflect.get, a Proxy, a getter. And any shape assembled at run time
+// through eval or new Function. No behavioural check backs the audit up for
+// those: the guard it exists to refuse is dead by construction, so it changes
+// nothing a behavioural check could observe. This is a shape check on one
+// function body and claims nothing past it.
 const FETCH_TARGET_NAME = "fetchDebuggerPageTarget";
 const TIMEOUT_ERROR_NAME = "ProofTimeoutError";
 
@@ -1186,10 +1214,39 @@ function loopForm(loop: ts.IterationStatement) {
   return endless ? "do-while(true)" : "do-while(condition)";
 }
 
+// What each of those words claims about the loop it was taken from, written
+// out once so the claim can be checked instead of assumed. A form loopForm
+// could emit and this table does not name fails the check, so adding a word to
+// one without the other reds the audit rather than shipping an unasserted
+// string (REVIEW-101 F2).
+const LOOP_FORM_CLAIMS: Record<string, (loop: ts.IterationStatement) => boolean> = {
+  "for(;;)": (loop) => ts.isForStatement(loop) && isEndlessLoop(loop),
+  "for(condition)": (loop) => ts.isForStatement(loop) && !isEndlessLoop(loop),
+  "while(true)": (loop) => ts.isWhileStatement(loop) && isEndlessLoop(loop),
+  "while(condition)": (loop) => ts.isWhileStatement(loop) && !isEndlessLoop(loop),
+  "do-while(true)": (loop) => ts.isDoStatement(loop) && isEndlessLoop(loop),
+  "do-while(condition)": (loop) => ts.isDoStatement(loop) && !isEndlessLoop(loop),
+  "for-of": (loop) => ts.isForOfStatement(loop),
+  "for-in": (loop) => ts.isForInStatement(loop),
+};
+
+// The naming and the walk the audit's own loop assertions are about. No planted
+// source can change either, so they are the one thing this file takes as a
+// parameter: the drift probes hand in a naming that lies or a walk that wanders
+// and read the diagnostic back, which is the only way an assertion over this
+// file's own code has a check that ships (REVIEW-101 F5).
+type LoopDrift = {
+  nameLoop?: (loop: ts.IterationStatement) => string;
+  findLoops?: (root: ts.Node) => ts.IterationStatement[];
+};
+
 // Named for the receipt, and kept beside the node the name came from, so the
-// audit can hold this walk against isEndlessLoop's by node instead of by count.
-function describeLoops(root: ts.Node) {
-  return collectNodes(root, isLoop).map((loop) => ({ form: loopForm(loop), loop }));
+// audit can hold this walk against isEndlessLoop's by node instead of by count,
+// and each name against the loop it was taken from.
+function describeLoops(root: ts.Node, drift: LoopDrift = {}) {
+  const findLoops = drift.findLoops ?? ((node: ts.Node) => collectNodes(node, isLoop));
+  const nameLoop = drift.nameLoop ?? loopForm;
+  return findLoops(root).map((loop) => ({ form: nameLoop(loop), loop }));
 }
 
 // Every name this file can use to reach the class: the class itself, an import
@@ -1265,6 +1322,15 @@ function timeoutGuardMatcher(names: Set<string>) {
     const property = skipParentheses(expression.argumentExpression);
     return ts.isStringLiteralLike(property) && property.text === "hasInstance" && onSymbol(expression.expression);
   };
+  // <Class>[Symbol.hasInstance] — the method instanceof itself calls, read off
+  // the class. The lookup is the same wherever the call form puts it: in the
+  // callee, in front of a .call/.apply, or in Reflect.apply's first argument.
+  const readsHasInstanceOnTheClass = (operand: ts.Expression) => {
+    const expression = skipParentheses(operand);
+    return ts.isElementAccessExpression(expression)
+      && namesHasInstance(expression.argumentExpression)
+      && namesTheClass(expression.expression);
+  };
   // <Class>.prototype.isPrototypeOf(error), the same test spelled through
   // Object.prototype.isPrototypeOf.call/apply(<Class>.prototype, error), and
   // <Class>[Symbol.hasInstance](error), which is the method instanceof itself
@@ -1272,12 +1338,15 @@ function timeoutGuardMatcher(names: Set<string>) {
   // instanceof, which is why a call is a guard shape here and not only a binary
   // expression. Each must be handed something — a test with nothing to test is
   // not a test — and none of them reads what it was handed (REVIEW-98 F1, F6).
+  //
+  // A call form that puts the symbol lookup one hop off the callee is the same
+  // call and is read the same way: the class comes from the lookup and the
+  // argument is still not read (REVIEW-101 F1). What that does not cover is a
+  // hop that moves the class off the lookup as well — see the disclosure above.
   const testsThePrototypeByCall = (node: ts.CallExpression) => {
     const callee = skipParentheses(node.expression);
     if (ts.isElementAccessExpression(callee)) {
-      return namesHasInstance(callee.argumentExpression)
-        && node.arguments.length > 0
-        && namesTheClass(callee.expression);
+      return readsHasInstanceOnTheClass(callee) && node.arguments.length > 0;
     }
     if (!ts.isPropertyAccessExpression(callee)) return false;
     if (callee.name.text === "isPrototypeOf") {
@@ -1285,6 +1354,17 @@ function timeoutGuardMatcher(names: Set<string>) {
     }
     if (callee.name.text !== "call" && callee.name.text !== "apply") return false;
     const method = skipParentheses(callee.expression);
+    // Reflect.apply(<method>, <receiver>, [error]) carries the method in its
+    // first argument instead of in front of the .apply. Named rather than
+    // inferred: it is the one global whose apply reads a method out of an
+    // argument that way. Handed something here means an argument past the
+    // method.
+    if (callee.name.text === "apply" && ts.isIdentifier(method) && method.text === "Reflect") {
+      return node.arguments.length > 1 && readsHasInstanceOnTheClass(node.arguments[0]);
+    }
+    // <Class>[Symbol.hasInstance].call(<Class>, error) and its .apply: the
+    // lookup the element-access callee branch above reads, one hop back.
+    if (readsHasInstanceOnTheClass(method)) return node.arguments.length > 0;
     return ts.isPropertyAccessExpression(method)
       && method.name.text === "isPrototypeOf"
       && node.arguments.length > 0
@@ -1357,6 +1437,16 @@ function isAbsentHandler(argument: ts.Expression) {
     || ts.isVoidExpression(expression);
 }
 
+// What a refused handler was written as, verbatim, so the receipt names the
+// handler and not only its spelling: a red on ["declaration-without-a-body"]
+// is a false red about as often as a real one, and the reader should not have
+// to find which handler it was by eye (REVIEW-101 F4). Bounded and collapsed
+// because this is a source span whose size this file does not control.
+function describeHandlerText(argument: ts.Expression, sourceFile: ts.SourceFile) {
+  const text = argument.getText(sourceFile).replace(/\s+/g, " ").trim();
+  return text.length > 200 ? `${text.slice(0, 200)}...` : text;
+}
+
 // What a refused handler was written as, so the receipt names the spelling
 // instead of only the refusal.
 function describeHandlerForm(
@@ -1407,18 +1497,39 @@ function scanRejectionHandlers(root: ts.Node, sourceFile: ts.SourceFile, isTimeo
       .map((declaration) => (declaration.name as ts.Identifier).text));
     return aliasNames.has(name);
   };
-  // The same lazy build for the other thing a refused name can be: a function
-  // this file declares without a body.
+  // The same lazy build for the other thing a refused name can be: a name this
+  // file declares and gives no body — an ambient or overload function
+  // signature, or an ambient variable holding a function type. declare const
+  // isTimeoutPredicate: (error: unknown) => never is the second of those said
+  // with a variable, and it is as declared in this file as the first, so it
+  // gets the same form string rather than "not declared in this file", which
+  // would be false of it (REVIEW-101 F3). The declare modifier sits on the
+  // statement, two parents up from the declaration that carries the name.
+  const isAmbientDeclaration = (declaration: ts.VariableDeclaration) => {
+    const statement = declaration.parent?.parent;
+    return statement !== undefined
+      && ts.isVariableStatement(statement)
+      && (statement.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.DeclareKeyword) ?? false);
+  };
   let bodilessNames: Set<string> | undefined;
   const isDeclaredWithoutABody = (name: string) => {
-    bodilessNames ??= new Set(collectNodes(sourceFile, (node): node is ts.FunctionDeclaration =>
-      ts.isFunctionDeclaration(node) && node.body === undefined)
-      .flatMap((declaration) => (declaration.name ? [declaration.name.text] : [])));
+    bodilessNames ??= new Set([
+      ...collectNodes(sourceFile, (node): node is ts.FunctionDeclaration =>
+        ts.isFunctionDeclaration(node) && node.body === undefined)
+        .flatMap((declaration) => (declaration.name ? [declaration.name.text] : [])),
+      ...collectNodes(sourceFile, (node): node is ts.VariableDeclaration =>
+        ts.isVariableDeclaration(node)
+          && ts.isIdentifier(node.name)
+          && node.initializer === undefined
+          && isAmbientDeclaration(node))
+        .map((declaration) => (declaration.name as ts.Identifier).text),
+    ]);
     return bodilessNames.has(name);
   };
   let guards = 0;
   let unresolved = 0;
   const forms = new Set<string>();
+  const texts: string[] = [];
   for (const handler of handlers) {
     const expression = skipParentheses(handler);
     let body: ts.Node | undefined;
@@ -1433,14 +1544,41 @@ function scanRejectionHandlers(root: ts.Node, sourceFile: ts.SourceFile, isTimeo
     if (!body) {
       unresolved += 1;
       forms.add(describeHandlerForm(handler, isConstAlias, isDeclaredWithoutABody, resolved));
+      texts.push(describeHandlerText(handler, sourceFile));
       continue;
     }
     if (collectNodes(body, isTimeoutGuard).length > 0) guards += 1;
   }
-  return { handlers: handlers.length, guards, unresolved, forms: [...forms].sort() };
+  // forms is a set because the spelling is a vocabulary; texts is a list in
+  // handler order because each refusal is its own handler and the reader wants
+  // all of them.
+  return { handlers: handlers.length, guards, unresolved, forms: [...forms].sort(), texts };
 }
 
-function auditFetchSource(fileText: string) {
+// The receipt this audit prints, written out so every return path carries the
+// same fields. unresolvedHandlerTexts is the one optional: it is absent unless
+// a handler was refused, which keeps a clean receipt exactly the shape it was
+// before it existed (REVIEW-101 F4).
+type FetchSourceAudit = {
+  method: "typescript-ast";
+  parsed: boolean;
+  found: number;
+  catchBindings: number;
+  bindlessCatches: number;
+  timeoutGuards: number;
+  rejectionHandlers: number;
+  callbackGuards: number;
+  unresolvedHandlers: number;
+  unresolvedHandlerForms: string[];
+  unresolvedHandlerTexts?: string[];
+  forEver: number;
+  loopForms: string[];
+  retryLoopBindless: boolean;
+  diagnostic: string;
+  clean: boolean;
+};
+
+function auditFetchSource(fileText: string, drift: LoopDrift = {}): FetchSourceAudit {
   const red = {
     method: "typescript-ast" as const,
     parsed: false,
@@ -1481,7 +1619,7 @@ function auditFetchSource(fileText: string) {
   const timeoutGuards = collectNodes(matches[0], isTimeoutGuard).length;
   const rejection = scanRejectionHandlers(matches[0], sourceFile, isTimeoutGuard);
   const endless = collectNodes(matches[0], isEndlessLoop);
-  const described = describeLoops(matches[0]);
+  const described = describeLoops(matches[0], drift);
   const loopForms = described.map((entry) => entry.form);
   // The loops the receipt calls endless must be the loops the audit decided on:
   // the same nodes, in the same order. Only an edit to describeLoops or
@@ -1489,6 +1627,11 @@ function auditFetchSource(fileText: string) {
   const namedEndless = described.filter((entry) => ENDLESS_LOOP_FORMS.has(entry.form));
   const loopWalksAgree = namedEndless.length === endless.length
     && namedEndless.every((entry, index) => entry.loop === endless[index]);
+  // And every word in loopForms must be true of the loop it was taken from,
+  // which is the half the walk comparison cannot see: a label that drifts
+  // inside the endless set leaves both walks agreeing (REVIEW-101 F2).
+  const mislabelled = described.filter((entry) => LOOP_FORM_CLAIMS[entry.form]?.(entry.loop) !== true);
+  const loopLabelsFit = mislabelled.length === 0;
   const retryTries = endless.length === 1 ? collectNodes(endless[0].statement, ts.isTryStatement) : [];
   const retryLoopBindless = retryTries.length === 1
     && retryTries[0].catchClause !== undefined
@@ -1504,10 +1647,15 @@ function auditFetchSource(fileText: string) {
     callbackGuards: rejection.guards,
     unresolvedHandlers: rejection.unresolved,
     unresolvedHandlerForms: rejection.forms,
+    ...(rejection.texts.length ? { unresolvedHandlerTexts: rejection.texts } : {}),
     forEver: endless.length,
     loopForms,
     retryLoopBindless,
-    diagnostic: loopWalksAgree ? "" : "describeLoops and isEndlessLoop disagree about which loops are endless",
+    diagnostic: !loopWalksAgree
+      ? "describeLoops and isEndlessLoop disagree about which loops are endless"
+      : loopLabelsFit
+        ? ""
+        : `loopForms names a shape its loop is not: ${mislabelled.map((entry) => entry.form).join(", ")}`,
     clean: catchBindings === 0
       && bindlessCatches === 1
       && timeoutGuards === 0
@@ -1515,6 +1663,7 @@ function auditFetchSource(fileText: string) {
       && rejection.unresolved === 0
       && endless.length === 1
       && loopWalksAgree
+      && loopLabelsFit
       && retryLoopBindless,
   };
 }
@@ -1619,7 +1768,10 @@ function fetchSourceAnchors(fileText: string): FetchSourceAnchors | AnchorMiss {
 // The audit itself, driven over mutated copies of this file: every formatting,
 // comment and literal shape that must stay green, every real regression that
 // must stay red, and the full cross-product of the literal shapes that defeated
-// the lexical strip against the two sabotages they were used to hide.
+// the lexical strip against the two sabotages they were used to hide. And, at
+// the end, the drift probes: the audit run over an unmodified source with its
+// own loop naming or loop walk patched, which is the only way to exercise the
+// assertions no planted source can reach.
 function proveFetchSourceAudit(proofSource: string) {
   const checkName = "debugger_target_source_audit_ignores_comments_and_spacing_but_still_catches_a_binding_or_a_guard";
   const located = fetchSourceAnchors(proofSource);
@@ -1670,7 +1822,14 @@ function proveFetchSourceAudit(proofSource: string) {
   const holderHelper = "const rejectionGuards = { rethrow(error: unknown): never { if (error instanceof ProofTimeoutError) throw error; throw error as Error } };\n";
   const settledHelper = "function inspectSettled(results: PromiseSettledResult<unknown>[]): void {\n  for (const result of results) {\n    if (result.status === \"rejected\" && result.reason instanceof ProofTimeoutError) throw result.reason;\n  }\n}\n";
   const unescapedRegexOpener = "const slashy = /[/*]/;\n      if (slashy.test(url)) attempts += 0;\n      ";
-  const named = [
+  // forms and texts are stated only by the probes whose point is what the
+  // receipt says rather than whether it is clean. A refusal is red either way,
+  // so a probe watching only `clean` could not tell a right refusal from a
+  // wrong one — which is how a name this file does declare kept being refused
+  // as "not declared in this file" through two reviews (REVIEW-101 F3, F4).
+  type SourceProbe = { name: string; source: string; expected: boolean; forms?: string[]; texts?: string[] };
+  const longBoundHandler = `rethrowIfTimeout.bind(null, ${JSON.stringify("x".repeat(200))})`;
+  const named: SourceProbe[] = [
     { name: "unmodified", source: proofSource, expected: true },
     { name: "bindless_catch_without_spaces", source: applyEdits([head("}catch{")]), expected: true },
     { name: "bindless_catch_with_extra_space", source: applyEdits([head("} catch  {")]), expected: true },
@@ -1791,6 +1950,27 @@ function proveFetchSourceAudit(proofSource: string) {
     // caught error still counts. Erring red, and symmetrical with the binary
     // forms, which read one operand and not the other (REVIEW-98 F6).
     { name: "isprototypeof_guard_against_a_value_that_is_not_the_caught_error", source: applyEdits([bodyHandler("(error) => { if (ProofTimeoutError.prototype.isPrototypeOf(Object.create(null))) attempts += 0; throw error as Error }")]), expected: false },
+    // The same call with the symbol lookup one hop off the callee: handed to
+    // Reflect.apply, and called through .call on the lookup itself. Both are
+    // error instanceof ProofTimeoutError at run time, both compile, and both
+    // audited clean at the revision before this one with a live guard sitting
+    // in the rejection path (REVIEW-101 F1).
+    { name: "callback_guard_by_symbol_hasinstance_through_reflect_apply", source: applyEdits([bodyHandler("(error) => { if (Reflect.apply(ProofTimeoutError[Symbol.hasInstance], ProofTimeoutError, [error])) throw error; }")]), expected: false },
+    { name: "callback_guard_by_symbol_hasinstance_through_a_call_on_the_lookup", source: applyEdits([bodyHandler("(error) => { if (ProofTimeoutError[Symbol.hasInstance].call(ProofTimeoutError, error)) throw error; }")]), expected: false },
+    // The same two hops against a class this audit says nothing about stay
+    // green: reading a hop must not make every reflected call a guard.
+    { name: "benign_symbol_hasinstance_through_reflect_apply_against_another_class", source: applyEdits([bodyHandler("(error) => { if (Reflect.apply(RangeError[Symbol.hasInstance], RangeError, [error])) throw error as Error; }")]), expected: true },
+    { name: "benign_symbol_hasinstance_through_a_call_on_another_class_lookup", source: applyEdits([bodyHandler("(error) => { if (RangeError[Symbol.hasInstance].call(RangeError, error)) throw error as Error; }")]), expected: true },
+    // A handler named by an ambient variable: declared in this file, given no
+    // body, and refused with the form string that says so rather than the one
+    // that calls it undeclared here (REVIEW-101 F3).
+    { name: "callback_handler_resolved_to_an_ambient_const_without_a_body", source: applyEdits([outside("declare const isTimeoutPredicate: (error: unknown) => never;\n"), onFetch(".catch(isTimeoutPredicate)")]), expected: false, forms: ["declaration-without-a-body"] },
+    // And the handler a refusal was about, named in the receipt: collapsed, so
+    // the same handler written across lines reads the same, and cut at 200
+    // characters, because the span is as long as whoever wrote it made it
+    // (REVIEW-101 F4).
+    { name: "callback_handler_comma_expression_named_in_the_receipt", source: applyEdits([outside(rethrowHelper), onFetch(".catch((0,\n        rethrowIfTimeout))")]), expected: false, forms: ["comma-expression"], texts: ["(0, rethrowIfTimeout)"] },
+    { name: "callback_handler_named_in_the_receipt_past_the_length_bound", source: applyEdits([outside(rethrowHelper), onFetch(`.catch(${longBoundHandler})`)]), expected: false, forms: ["bind-result"], texts: [`${longBoundHandler.slice(0, 200)}...`] },
   ];
   // Every literal opener that defeated the lexical strip, crossed with every
   // closer it was paired with and with the two sabotages they were used to
@@ -1814,7 +1994,7 @@ function proveFetchSourceAudit(proofSource: string) {
     { key: "rebound_catch", expected: false, edits: [head("} catch (error) {")] },
     { key: "timeout_guard", expected: false, edits: [body(guardStatement)] },
   ];
-  const matrix = openers.flatMap((opener) => closers.flatMap((closer) => sabotages.map((sabotage) => ({
+  const matrix: SourceProbe[] = openers.flatMap((opener) => closers.flatMap((closer) => sabotages.map((sabotage) => ({
     name: `matrix__${opener.key}__${closer.key}__${sabotage.key}`,
     source: applyEdits([
       ...(opener.text ? [before(opener.text)] : []),
@@ -1823,30 +2003,94 @@ function proveFetchSourceAudit(proofSource: string) {
     ]),
     expected: sabotage.expected,
   }))));
-  const results = [...named, ...matrix].map((probe) => {
+  // A list a probe did not state is not asserted; one it did must match exactly.
+  const listsAgree = (stated: string[] | undefined, measured: string[]) =>
+    stated === undefined
+    || (stated.length === measured.length && stated.every((value, index) => value === measured[index]));
+  const graded = [...named, ...matrix].map((probe) => {
     const audit = auditFetchSource(probe.source);
+    return {
+      agrees: audit.clean === probe.expected
+        && listsAgree(probe.forms, audit.unresolvedHandlerForms)
+        && listsAgree(probe.texts, audit.unresolvedHandlerTexts ?? []),
+      result: {
+        name: probe.name,
+        expected: probe.expected,
+        clean: audit.clean,
+        parsed: audit.parsed,
+        catchBindings: audit.catchBindings,
+        bindlessCatches: audit.bindlessCatches,
+        timeoutGuards: audit.timeoutGuards,
+        callbackGuards: audit.callbackGuards,
+        unresolvedHandlers: audit.unresolvedHandlers,
+        forEver: audit.forEver,
+        loopForms: audit.loopForms,
+        ...(audit.unresolvedHandlerForms.length ? { unresolvedHandlerForms: audit.unresolvedHandlerForms } : {}),
+        ...(audit.diagnostic ? { diagnostic: audit.diagnostic } : {}),
+        ...(probe.forms ? { expectedForms: probe.forms, measuredForms: audit.unresolvedHandlerForms } : {}),
+        ...(probe.texts ? { expectedTexts: probe.texts, measuredTexts: audit.unresolvedHandlerTexts ?? [] } : {}),
+      },
+    };
+  });
+  const results = graded.map((entry) => entry.result);
+  const mismatches = graded.filter((entry) => !entry.agrees).map((entry) => entry.result);
+  const malicious = results.filter((result) => !result.expected);
+  const benign = results.filter((result) => result.expected);
+  // The two loop assertions are about this file's own walks, so no probe source
+  // above can reach them: a planted source can move loops around but it cannot
+  // make describeLoops lie about the ones it found. These drive the audit over
+  // an unchanged source with the naming or the walk drifted in process, and
+  // expect the receipt to say so. They are what a silent revert of either
+  // assertion trips — the label check on the first two, the walk comparison's
+  // node identity on the last, which a count comparison passes (REVIEW-101 F2,
+  // F5).
+  const drifts = [
+    {
+      name: "drift_the_endless_for_named_as_an_endless_while",
+      source: proofSource,
+      drift: { nameLoop: (loop: ts.IterationStatement) => (loopForm(loop) === "for(;;)" ? "while(true)" : loopForm(loop)) },
+      expected: "loopForms names a shape its loop is not: while(true)",
+    },
+    {
+      // Still inside the endless set, so both walks find the same one node and
+      // agree about it; only the word is wrong.
+      name: "drift_the_endless_for_named_as_an_endless_do_while",
+      source: proofSource,
+      drift: { nameLoop: () => "do-while(true)" },
+      expected: "loopForms names a shape its loop is not: do-while(true)",
+    },
+    {
+      name: "drift_the_endless_for_named_out_of_the_endless_forms",
+      source: proofSource,
+      drift: { nameLoop: (loop: ts.IterationStatement) => (loopForm(loop) === "for(;;)" ? "for(condition)" : loopForm(loop)) },
+      expected: "describeLoops and isEndlessLoop disagree about which loops are endless",
+    },
+    {
+      // Two endless loops, named correctly, walked in the other order: the
+      // counts still agree and the labels still fit, so only the node identity
+      // comparison can see it.
+      name: "drift_the_loop_walk_into_the_other_order",
+      source: applyEdits([before("while (true) { break }\n      ")]),
+      drift: { findLoops: (root: ts.Node) => collectNodes(root, isLoop).reverse() },
+      expected: "describeLoops and isEndlessLoop disagree about which loops are endless",
+    },
+  ];
+  const driftResults = drifts.map((probe) => {
+    const audit = auditFetchSource(probe.source, probe.drift);
     return {
       name: probe.name,
       expected: probe.expected,
+      diagnostic: audit.diagnostic,
       clean: audit.clean,
-      parsed: audit.parsed,
-      catchBindings: audit.catchBindings,
-      bindlessCatches: audit.bindlessCatches,
-      timeoutGuards: audit.timeoutGuards,
-      callbackGuards: audit.callbackGuards,
-      unresolvedHandlers: audit.unresolvedHandlers,
-      forEver: audit.forEver,
       loopForms: audit.loopForms,
-      ...(audit.unresolvedHandlerForms.length ? { unresolvedHandlerForms: audit.unresolvedHandlerForms } : {}),
-      ...(audit.diagnostic ? { diagnostic: audit.diagnostic } : {}),
+      forEver: audit.forEver,
     };
   });
-  const mismatches = results.filter((result) => result.clean !== result.expected);
-  const malicious = results.filter((result) => !result.expected);
-  const benign = results.filter((result) => result.expected);
+  const driftMismatches = driftResults.filter((result) => result.diagnostic !== result.expected || result.clean);
   check(
     checkName,
-    named.length === 82 && matrix.length === 60 && results.length === 142 && mismatches.length === 0,
+    named.length === 89 && matrix.length === 60 && results.length === 149
+      && mismatches.length === 0 && drifts.length === 4 && driftMismatches.length === 0,
     JSON.stringify({
       method: "typescript-ast",
       probes: results.length,
@@ -1854,6 +2098,7 @@ function proveFetchSourceAudit(proofSource: string) {
       benignGreen: `${benign.filter((result) => result.clean).length}/${benign.length}`,
       mismatches,
       matrix: { variants: matrix.length, openers: openers.length, closers: closers.length, sabotages: sabotages.length },
+      drifts: driftResults,
       named: results.slice(0, named.length),
     }),
   );
