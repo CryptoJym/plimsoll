@@ -18,6 +18,7 @@ import { createHash } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { pathToFileURL } from "node:url";
 
 import Database from "better-sqlite3";
 
@@ -1158,6 +1159,144 @@ async function main() {
     } finally {
       bootoutFixture.restore();
       fs.rmSync(bootoutSandbox, { recursive: true, force: true });
+    }
+
+    // ---- F1: `config_applied_collector_restarted` on a host with no
+    // LaunchAgent (bead eco-6hoxj.149). It is the one enumerated recovery
+    // value the .55 merge left unevidenced, and the only failure state that
+    // can reach it here is a failure *after* the config write: the write
+    // completed, so `applied` is true, and no LaunchAgent means the restart
+    // was skipped rather than attempted, so `restartFailed` is false. The
+    // receipt therefore carries the value with `restart.skipped: true`, and
+    // the operator-facing prose must be true of that sub-case too — a row
+    // that says the collector "came back verified" describes a restart this
+    // host never attempted.
+    //
+    // Injection: a preloaded module that lets the transactional write commit
+    // and then throws on the very next read of the config, which is exactly
+    // the `config_readback` step. Nothing in the command is stubbed and no
+    // runtime behaviour is changed.
+    const readbackSandbox = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-capture-roots-readback-")));
+    const readbackFixture = useFixtureRoot(readbackSandbox, { home: path.join(readbackSandbox, "home") });
+    try {
+      const readbackHome = readbackFixture.home;
+      const readbackPlimsollHome = path.join(readbackSandbox, "plimsoll-home");
+      const readbackConfigPath = path.join(readbackPlimsollHome, "collector.config.json");
+      const readbackLedgerPath = path.join(readbackPlimsollHome, "work-ledger.sqlite");
+      const readbackCodex = path.join(readbackHome, ".codex", "sessions");
+      const readbackClaude = path.join(readbackHome, ".claude", "projects");
+      for (const directory of [readbackCodex, readbackClaude, readbackPlimsollHome]) {
+        fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+      }
+      fs.writeFileSync(path.join(readbackClaude, "readback.jsonl"), "{}\n", { mode: 0o600 });
+      const readbackBuffer = new LocalEventBuffer(readbackLedgerPath, { workspaceId: WORKSPACE, deviceId: DEVICE });
+      let readbackEpoch: string;
+      try {
+        readbackEpoch = readbackBuffer.workspaceBinding()!.currentInstallationEpochId!;
+        for (const source of ["codex", "claude_code"] as const) {
+          const begun = beginAutomaticCaptureBaseline(readbackBuffer.database, source, {
+            startedAt: BASELINE_BEFORE, filesDiscovered: 0,
+          });
+          completeAutomaticCaptureBaseline(readbackBuffer.database, source, {
+            runId: begun.latestRun!.runId, completedAt: BASELINE_BEFORE,
+          });
+        }
+      } finally {
+        readbackBuffer.close();
+      }
+      const readbackEnrolled = collectorConfigSchema.parse({
+        port: 48996, tenantId: WORKSPACE, deviceId: DEVICE, installKey: "fixture-install-key",
+        managed: true, captureRoots: [fixtureRoot("codex", readbackCodex, readbackEpoch)],
+      });
+      fs.writeFileSync(readbackConfigPath, `${JSON.stringify(readbackEnrolled, null, 2)}\n`, { mode: 0o600 });
+
+      // Commit the write, then fail the first read of the published config.
+      const injector = path.join(readbackSandbox, "fail-config-readback.mjs");
+      fs.writeFileSync(injector, [
+        `import fs from "node:fs";`,
+        `const target = process.env.PLIMSOLL_PROOF_READBACK_TARGET;`,
+        `let published = false;`,
+        `const rename = fs.renameSync;`,
+        `fs.renameSync = (from, to) => { const result = rename(from, to);`,
+        `  if (to === target) published = true; return result; };`,
+        `const read = fs.readFileSync;`,
+        `fs.readFileSync = (file, ...rest) => {`,
+        `  if (published && file === target) {`,
+        `    published = false;`,
+        `    const error = new Error("EIO: injected config read-back failure");`,
+        `    error.code = "EIO";`,
+        `    throw error;`,
+        `  }`,
+        `  return read(file, ...rest);`,
+        `};`,
+        ``,
+      ].join("\n"), { mode: 0o600 });
+
+      const readbackResult = await command([
+        "capture-roots", "add", "--source", "claude_code", "--directory", readbackClaude,
+        "--machine", MACHINE, "--json",
+      ], {
+        ...env,
+        ...readbackFixture.env,
+        HOME: readbackHome,
+        USERPROFILE: readbackHome,
+        PLIMSOLL_HOME: readbackPlimsollHome,
+        CLAUDE_CONFIG_DIR: path.join(readbackHome, ".claude"),
+        CODEX_HOME: path.join(readbackHome, ".codex"),
+        GROK_HOME: path.join(readbackHome, ".grok"),
+        NODE_OPTIONS: `--import ${pathToFileURL(injector).href}`,
+        PLIMSOLL_PROOF_READBACK_TARGET: readbackConfigPath,
+      }, neutralCwd);
+      const readbackReceipt = parse(readbackResult);
+      const readbackConfig = collectorConfigSchema.parse(JSON.parse(fs.readFileSync(readbackConfigPath, "utf8")));
+      check(
+        "a_failure_after_the_config_write_with_no_launch_agent_evidences_the_restarted_recovery",
+        readbackResult.code === 1 && readbackReceipt.status === "capture_roots_add_failed" &&
+          readbackReceipt.applied === true && readbackReceipt.failure?.step === "config_readback" &&
+          readbackReceipt.recovery === "config_applied_collector_restarted" &&
+          readbackReceipt.restart.attempted === false &&
+          readbackReceipt.restart.skipped === true &&
+          readbackReceipt.restart.reason === "launch_agent_not_installed" &&
+          readbackReceipt.restart.verified === undefined &&
+          readbackConfig.captureRoots!.some((entry) => entry.directory === readbackClaude),
+        {
+          code: readbackResult.code,
+          failure: readbackReceipt.failure,
+          recovery: readbackReceipt.recovery,
+          restart: readbackReceipt.restart,
+          roots: readbackConfig.captureRoots!.map((entry) => entry.directory),
+        },
+      );
+      // The receipt is truthful; the prose that explains it must be too. Both
+      // the README row and the comment it mirrors have to hold for the
+      // skipped-restart sub-case this arm just produced, so neither may claim
+      // that the collector came back verified.
+      const readme = fs.readFileSync(path.join(root, "README.md"), "utf8");
+      const readmeRow = readme.split("\n")
+        .find((line) => line.startsWith("| `config_applied_collector_restarted` |")) ?? "";
+      const cliSource = fs.readFileSync(path.join(root, "packages", "collector-cli", "src", "cli.ts"), "utf8");
+      const cliComment = cliSource.slice(
+        cliSource.indexOf("//   config_applied_collector_restarted"),
+        cliSource.indexOf("//   config_applied_collector_not_running"),
+      ).replace(/\s+/g, " ");
+      const overclaims = (prose: string) => /the collector came back verified/.test(prose);
+      check(
+        "the_restarted_recovery_prose_is_true_of_the_skipped_restart_it_documents",
+        readbackReceipt.restart.skipped === true && readmeRow.length > 0 && cliComment.length > 0 &&
+          [readmeRow, cliComment].every((prose) =>
+            !overclaims(prose) &&
+            prose.includes("restart.skipped") &&
+            prose.includes("launch_agent_not_installed")),
+        { readmeRow, cliComment },
+      );
+      check(
+        "the_readback_fixture_installed_no_launch_agent",
+        !fs.existsSync(path.join(readbackHome, "Library", "LaunchAgents")),
+        path.join(readbackHome, "Library", "LaunchAgents"),
+      );
+    } finally {
+      readbackFixture.restore();
+      fs.rmSync(readbackSandbox, { recursive: true, force: true });
     }
 
     console.log(JSON.stringify({

@@ -4732,7 +4732,13 @@ async function main() {
       // restart used to carry none at all (review N1):
       //   config_applied_collector_restarted        the write completed; the
       //     config names the new roots, the fence belongs to them, and the
-      //     collector came back verified.
+      //     restart, where one was attempted, came back verified. On a host
+      //     with no LaunchAgent installed there is no service to cycle, so no
+      //     restart is attempted and the same value is emitted with
+      //     `restart.skipped: true` and
+      //     `reason: "launch_agent_not_installed"` — the write and the fence
+      //     are what this value speaks to, and `restart.skipped` /
+      //     `restart.verified` is the authority on the daemon.
       //   config_applied_collector_not_running      the write completed and
       //     the fence belongs to the new roots, but the collector this
       //     command stopped did not come back; `restart.failedStep` says
@@ -4751,7 +4757,8 @@ async function main() {
       //     byte-identical to the backup and no fence for these roots is in
       //     the ledger.
       // The three `config_unchanged_*` values speak to the config and the
-      // ledger only; `restart.verified` is the authority on the daemon.
+      // ledger only; `restart.skipped` / `restart.verified` is the authority
+      // on the daemon.
       recovery: failure || restartFailed
         ? configApplied
           ? restartFailed

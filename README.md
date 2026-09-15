@@ -610,7 +610,7 @@ Every failed receipt carries a `recovery`, which is one of:
 
 | `recovery` | What it means |
 |---|---|
-| `config_applied_collector_restarted` | The write completed. The config names the new roots, the fence belongs to them, and the collector came back verified. |
+| `config_applied_collector_restarted` | The write completed. The config names the new roots, the fence belongs to them, and the restart, where one was attempted, came back verified. On a host with no LaunchAgent installed there is no service to cycle, so no restart is attempted and the same value is emitted with `restart.skipped: true` and `reason: "launch_agent_not_installed"`: the write and the fence are what this value speaks to, and `restart.skipped` / `restart.verified` is the authority on the daemon. |
 | `config_applied_collector_not_running` | The write completed and the fence belongs to the new roots, but the collector this command stopped did not come back. `restart.failedStep` names where it stopped: start the daemon again. |
 | `config_unchanged_fence_rolled_back` | The config is byte-identical to the backup, and every generation row this run fenced was removed again. |
 | `ledger_fence_retained` | The config was **not** written and a fence for those roots is still in the ledger: either this run could not roll its own rows back, or an earlier run's rows are still in place and are not this run's to remove (`fenceRollback.generationsRetainedFromEarlierRun`). `fenceRollback.retainedFiles` lists the files fenced under the new roots (a superset of what is still excluded) — remove their rows or re-run the add to register the root they belong to. |
@@ -618,7 +618,8 @@ Every failed receipt carries a `recovery`, which is one of:
 | `config_unchanged_restored_state_matches_backup` | The config is byte-identical to the backup and no fence for these roots is in the ledger. |
 
 The three `config_unchanged_*` values speak to the config and the ledger only;
-`restart.verified` is the authority on whether the daemon came back.
+`restart.skipped` / `restart.verified` is the authority on whether the daemon
+came back — and on whether one was ever asked to.
 
 `backupPath` is only ever a backup that exists on disk; `backupWritten` says
 whether the backup step completed. A retry whose fence is already in place
