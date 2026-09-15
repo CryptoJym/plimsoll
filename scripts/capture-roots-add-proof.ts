@@ -772,6 +772,46 @@ async function main() {
       classify("claude_code", seatDTranscript, "2026-09-12T10:15:00.000Z") === "exclude/preexisting_generation",
       classify("claude_code", seatDTranscript, "2026-09-12T10:15:00.000Z"),
     );
+
+    // A retry that fails at the config write again must not report a clean
+    // ledger. `already_sealed` says this run wrote no generation row; it does
+    // not say nothing is fenced. The fence the first run retained is still in
+    // place for a root the config still does not name, so the recovery value
+    // is `ledger_fence_retained` — and those rows belong to the earlier run,
+    // so this run must not remove them (review N1/N3).
+    const rowsBeforeRetainedRetry = generationRows("claude_code");
+    chflags(configPath, "uchg");
+    const retainedRetry = await run([
+      "capture-roots", "add", "--source", "claude_code", "--directory", seatD,
+      "--machine", MACHINE, "--json",
+    ]);
+    chflags(configPath, "nouchg");
+    const retainedRetryReceipt = parse(retainedRetry);
+    check(
+      "a_second_write_failure_over_an_earlier_runs_fence_still_reports_it_retained",
+      retainedRetry.code === 1 && retainedRetryReceipt.applied === false &&
+        retainedRetryReceipt.failure?.step === "config_write" &&
+        retainedRetryReceipt.baseline.generationsSealed === 0 &&
+        retainedRetryReceipt.baseline.generationsAlreadySealed === 1 &&
+        retainedRetryReceipt.recovery === "ledger_fence_retained" &&
+        retainedRetryReceipt.fenceRollback?.generationsSealed === 0 &&
+        retainedRetryReceipt.fenceRollback?.generationsRetainedFromEarlierRun === 1 &&
+        retainedRetryReceipt.fenceRollback?.complete === false &&
+        retainedRetryReceipt.fenceRollback?.retainedFiles.includes(path.relative(home, seatDTranscript)),
+      {
+        code: retainedRetry.code,
+        recovery: retainedRetryReceipt.recovery,
+        rollback: retainedRetryReceipt.fenceRollback,
+        baseline: retainedRetryReceipt.baseline,
+      },
+    );
+    check(
+      "the_second_write_failure_removed_no_row_it_did_not_write",
+      generationRows("claude_code") === rowsBeforeRetainedRetry &&
+        sha256(configPath) === beforeRetainedSha &&
+        classify("claude_code", seatDTranscript, "2026-09-12T10:16:00.000Z") === "exclude/preexisting_generation",
+      { rows: generationRows("claude_code"), before: rowsBeforeRetainedRetry },
+    );
     const retriedRetained = await run([
       "capture-roots", "add", "--source", "claude_code", "--directory", seatD,
       "--machine", MACHINE, "--json",
@@ -961,6 +1001,16 @@ async function main() {
           collectorConfigSchema.parse(JSON.parse(fs.readFileSync(restartConfigPath, "utf8")))
             .captureRoots!.length === 2,
         { applied: restartReceipt.applied, written: restartReceipt.writtenSha256 },
+      );
+      // The add failed, so the receipt owes the operator the enumerated
+      // recovery value for the state it actually left: the config names the
+      // new roots and the fence belongs to them, but the collector this
+      // command stopped did not come back. A failed receipt whose `recovery`
+      // is null says nothing at all (review N1).
+      check(
+        "a_failed_restart_reports_the_config_applied_and_the_collector_down",
+        restartReceipt.recovery === "config_applied_collector_not_running",
+        { recovery: restartReceipt.recovery, failedStep: restartReceipt.restart?.failedStep },
       );
       uninstallLaunchAgent({
         homeDir: restartHome,

@@ -606,20 +606,26 @@ Nothing is left half-applied, and the receipt never claims a recovery that
 did not happen. Whatever fails from the unload onwards — including a throw
 after the bootout, when the daemon is already down — `add` starts the
 collector again, records the failed step and the resulting state, and exits 1.
-`recovery` is one of:
+Every failed receipt carries a `recovery`, which is one of:
 
 | `recovery` | What it means |
 |---|---|
-| `config_applied_collector_restarted` | The write completed. The config names the new roots and the fence belongs to them. |
+| `config_applied_collector_restarted` | The write completed. The config names the new roots, the fence belongs to them, and the collector came back verified. |
+| `config_applied_collector_not_running` | The write completed and the fence belongs to the new roots, but the collector this command stopped did not come back. `restart.failedStep` names where it stopped: start the daemon again. |
 | `config_unchanged_fence_rolled_back` | The config is byte-identical to the backup, and every generation row this run fenced was removed again. |
-| `ledger_fence_retained` | The config was **not** written, but the fence could not be rolled back. `fenceRollback.retainedFiles` lists the files this run fenced (a superset of what is still excluded if the rollback was partial) — remove their rows or re-run the add to register the root they belong to. |
+| `ledger_fence_retained` | The config was **not** written and a fence for those roots is still in the ledger: either this run could not roll its own rows back, or an earlier run's rows are still in place and are not this run's to remove (`fenceRollback.generationsRetainedFromEarlierRun`). `fenceRollback.retainedFiles` lists the files fenced under the new roots (a superset of what is still excluded) — remove their rows or re-run the add to register the root they belong to. |
 | `config_unchanged_no_backup_written` | Nothing was written at all: the failure was at or before the backup step. `backupPath` is then `null`. |
-| `config_unchanged_restored_state_matches_backup` | The config is byte-identical to the backup and this run fenced nothing. |
+| `config_unchanged_restored_state_matches_backup` | The config is byte-identical to the backup and no fence for these roots is in the ledger. |
+
+The three `config_unchanged_*` values speak to the config and the ledger only;
+`restart.verified` is the authority on whether the daemon came back.
 
 `backupPath` is only ever a backup that exists on disk; `backupWritten` says
 whether the backup step completed. A retry whose fence is already in place
 reports `baseline.seals[].reason: "already_sealed"` with the count found and
-`baseline.seededAt: null` — the fence is real, this run did not write it. A
+`baseline.seededAt: null` — the fence is real, this run did not write it, and
+if that retry fails at the write too the receipt still reports the fence as
+`ledger_fence_retained` rather than a clean ledger. A
 restart or daemon verification that does not come back also exits 1 with the
 failed step named. Without an installed LaunchAgent the restart is skipped and
 the receipt says so. Existing roots, the installation epoch and every other enrollment field

@@ -4535,6 +4535,11 @@ async function main() {
     // this run inserted (review N1). Nothing else runs between them.
     let buffer: ReturnType<typeof openBuffer> | null = null;
     let sealedThisRun: Array<{ source: CaptureRoot["source"]; runId: string; keys: string[] }> = [];
+    // Rows an earlier run of this same add already sealed and the ledger
+    // still holds. This run did not write them, so it must not remove them —
+    // but they are a real fence for a root the config does not yet name, so
+    // a failure below may not report the ledger as clean (review N1/N3).
+    let retainedFromEarlierRun = 0;
     let fenceRollback: Record<string, unknown> | null = null;
     try {
       // A failed unload has already recorded its step: skip every remaining
@@ -4581,6 +4586,7 @@ async function main() {
       sealedThisRun = seals
         .filter((seal) => seal.runId !== null && seal.sealedGenerationKeys.length > 0)
         .map((seal) => ({ source: seal.source, runId: seal.runId!, keys: seal.sealedGenerationKeys }));
+      retainedFromEarlierRun = seals.reduce((total, seal) => total + seal.generationsAlreadySealed, 0);
       const generationsSealed = seals.reduce((total, seal) => total + seal.generationsSealed, 0);
       baseline = {
         // Only ever a time a generation row was actually written. A source
@@ -4620,33 +4626,43 @@ async function main() {
       // be done, the receipt says so and names the files still fenced; it
       // never claims a rollback that did not happen.
       const sealedCount = sealedThisRun.reduce((total, entry) => total + entry.keys.length, 0);
-      if (!configApplied && sealedCount > 0) {
+      if (!configApplied && (sealedCount > 0 || retainedFromEarlierRun > 0)) {
         let removed = 0;
         let rollbackError: string | null = null;
-        try {
-          if (!buffer) throw new Error("ledger_unavailable");
-          for (const entry of sealedThisRun) {
-            removed += unsealCaptureBaselineGenerations(
-              buffer.database,
-              entry.source,
-              entry.runId,
-              entry.keys,
-              new Date().toISOString(),
-            ).removed;
+        if (sealedCount > 0) {
+          try {
+            if (!buffer) throw new Error("ledger_unavailable");
+            for (const entry of sealedThisRun) {
+              removed += unsealCaptureBaselineGenerations(
+                buffer.database,
+                entry.source,
+                entry.runId,
+                entry.keys,
+                new Date().toISOString(),
+              ).removed;
+            }
+          } catch (rollback) {
+            rollbackError = rollback instanceof Error ? rollback.message.slice(0, 200) : "failed";
           }
-        } catch (rollback) {
-          rollbackError = rollback instanceof Error ? rollback.message.slice(0, 200) : "failed";
         }
-        const complete = rollbackError === null && removed === sealedCount;
+        // Complete means the ledger holds no fence for these unregistered
+        // roots. Rows this run could not remove and rows an earlier run
+        // sealed and still holds both leave one behind.
+        const complete = rollbackError === null && removed === sealedCount && retainedFromEarlierRun === 0;
         fenceRollback = {
-          attempted: true,
+          attempted: sealedCount > 0,
           generationsSealed: sealedCount,
           generationsRemoved: removed,
+          /** Rows an earlier run sealed, still in place, not this run's to
+           * remove: a fence that survives even when nothing was rolled back
+           * because nothing was written this run (review N1/N3). */
+          generationsRetainedFromEarlierRun: retainedFromEarlierRun,
           complete,
           error: rollbackError,
-          // The files this run fenced under the new roots: the operator's
-          // list for a manual repair when the rollback did not complete. A
-          // partial rollback makes it a superset of what is still fenced.
+          // The files fenced under the new roots: the operator's list for a
+          // manual repair whenever a fence is still in place. A partial
+          // rollback, or a fence an earlier run wrote, makes it a superset of
+          // what is actually still excluded.
           retainedFiles: complete
             ? []
             : preexisting.flatMap((entry) =>
@@ -4711,22 +4727,36 @@ async function main() {
       backupPath: backupOnDisk ? backupPath : null,
       backupWritten,
       failure,
-      // What an operator can rely on after a failure, enumerated:
+      // What an operator can rely on after a failure, enumerated. Every
+      // failed receipt carries one — a failed add whose only failure was the
+      // restart used to carry none at all (review N1):
       //   config_applied_collector_restarted        the write completed; the
-      //     config names the new roots and the fence belongs to them.
+      //     config names the new roots, the fence belongs to them, and the
+      //     collector came back verified.
+      //   config_applied_collector_not_running      the write completed and
+      //     the fence belongs to the new roots, but the collector this
+      //     command stopped did not come back; `restart.failedStep` says
+      //     where it stopped and the daemon must be started again.
       //   ledger_fence_retained                     the config was NOT
-      //     written but the fence could not be rolled back; `fenceRollback
-      //     .retainedFiles` lists exactly the files still excluded.
+      //     written and a fence for those roots is still in the ledger —
+      //     this run could not roll its own rows back, or an earlier run's
+      //     rows are still in place and are not this run's to remove;
+      //     `fenceRollback.retainedFiles` lists the files still excluded.
       //   config_unchanged_fence_rolled_back        the config is
       //     byte-identical to the backup and every generation row this run
       //     sealed was removed.
       //   config_unchanged_no_backup_written        nothing was written at
       //     all — the failure was at or before the backup step.
       //   config_unchanged_restored_state_matches_backup   the config is
-      //     byte-identical to the backup and this run sealed nothing.
-      recovery: failure
+      //     byte-identical to the backup and no fence for these roots is in
+      //     the ledger.
+      // The three `config_unchanged_*` values speak to the config and the
+      // ledger only; `restart.verified` is the authority on the daemon.
+      recovery: failure || restartFailed
         ? configApplied
-          ? "config_applied_collector_restarted"
+          ? restartFailed
+            ? "config_applied_collector_not_running"
+            : "config_applied_collector_restarted"
           : fenceRollback && fenceRollback.complete !== true
             ? "ledger_fence_retained"
             : !backupWritten
