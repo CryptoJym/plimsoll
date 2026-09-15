@@ -1,0 +1,66 @@
+REVIEW-68-r2 N3 — comment-strip tool and digests
+bead eco-6hoxj.86 · lane/spool-proof-hygiene-86 · base 790147cfda1ef9e6f94cc2632566c0add99c4ded
+generated 2026-09-15T10:53:35Z · node v22.23.2 · typescript 5.9.3
+
+TOOL
+  BUILDER-EVIDENCE/strip-comments.mjs — TypeScript compiler API. Two independent
+  strips of the same parsed tree: 'code' is ts.createPrinter({removeComments:true})
+  .printFile(ast); 'spans' is the original text with every comment range from
+  ts.getLeadingCommentRanges/getTrailingCommentRanges cut out. Both digests are
+  taken over whitespace-normalized text, so a re-indent is not a code change.
+  sha256(tool) = 64793044493132c46a2f98a4529f744c55a83652b562d5a0cc3b92f766da09c1
+
+  REPLACED: the eco-6hoxj.68 lane's hand-rolled character state machine. It had
+  no regex-literal state, so a '/' opening a regex whose body contains '//' or
+  '/*' put it into comment state and it swallowed real code. Reconstructed as
+  BUILDER-EVIDENCE/strip-comments-naive.mjs (the original never reached this
+  tree) so the defect is reproducible.
+  sha256(naive reconstruction) = c8c9e5076a5f4a7f6a46a9d363fee2e3062c06bae58958cbc4f3c2ca741353d7
+
+COUNTEREXAMPLE — BUILDER-EVIDENCE/fixtures/regex-literal.ts
+  BUILDER-EVIDENCE/fixtures/regex-literal.ts
+    raw    af27f740b0f7f7bd524fd884f9efa9e97465a43368e137d4a95dee758a1fd58e
+    code   31e0ea168dcbcc9302717739c037e184db388b79523dbd30aa96e1ada4a3a1fc  (printer, removeComments)
+    spans  31e0ea168dcbcc9302717739c037e184db388b79523dbd30aa96e1ada4a3a1fc  (comment ranges cut)
+  BUILDER-EVIDENCE/fixtures/regex-literal.ts
+    naive  587721402166e13cd802058707f8b5e8b139fb59fd7d3ca07ad8d2e4d981bb6b
+  The naive digest differs from both robust digests because the naive strip
+  truncates two statements. Robust vs naive, first two code lines:
+    robust: export const httpsPrefix = /^https:\/\/example\.test\//;
+    naive : export const httpsPrefix = /^https:\/\/example\.test\
+    robust: export const blockCommentShape = /\/\*[\s\S]*?\*\//; 
+    naive : export const blockCommentShape = /\/\*[\s\S]*?\*\
+
+THE DELTA, base -> HEAD, comment-stripped with the robust tool
+
+  scripts/hook-spool-proof.ts @ base 790147cf
+    raw    6fa465c99e964bb7f432c7b382582b805a335f38eb629f71968d793a0a04ab71
+    code   b2b2eae54341362315bcef5b4fedd602766748bebc52183205880330c4d249ee  (printer, removeComments)
+    spans  2bef9f403e181b85415aa35a49d95b077b80a291e2962d28e46e01688103e9bf  (comment ranges cut)
+  scripts/hook-spool-proof.ts @ HEAD
+    raw    afef88cd70aaf09fc8a1d851b5d287710aa202f3d02e6a45117ad71b42e62335
+    code   59ae21ecae2797f0a421732b9498d2c8c26f4b9abc7f1753e1f4c5a04d90db9e  (printer, removeComments)
+    spans  54d52415e214a939682b8325a21d198c55e87cb04e9849e80b2367998f6290b5  (comment ranges cut)
+  VERDICT: code digests DIFFER — this change is NOT comment-only. It adds two
+  named checks, a page-table reader and one import. No file in this delta is
+  claimed comment-only, so no comment-only digest is asserted.
+
+  New files (no base side):
+  BUILDER-EVIDENCE/strip-comments.mjs
+    raw    64793044493132c46a2f98a4529f744c55a83652b562d5a0cc3b92f766da09c1
+    code   a3af120e464c26ebc8a1bd3d0e08dc6a3e5376f3874a73725e01e5c0fc8624fd  (printer, removeComments)
+    spans  f58d95db2403b836eed68b046668ced1f2d8632bbbc15c58573f09d87a66845a  (comment ranges cut)
+  BUILDER-EVIDENCE/strip-comments-naive.mjs
+    raw    c8c9e5076a5f4a7f6a46a9d363fee2e3062c06bae58958cbc4f3c2ca741353d7
+    code   f7d1a70a456d589d814d5ba1d1d566f5a2dee01013b009f6999954fe59329d9e  (printer, removeComments)
+    spans  aad49c1e17841f3ed2b6e561d4b2d084fc8e2717021c9813e955f7e02ea6f2ee  (comment ranges cut)
+  BUILDER-EVIDENCE/fixtures/regex-literal.ts
+    raw    af27f740b0f7f7bd524fd884f9efa9e97465a43368e137d4a95dee758a1fd58e
+    code   31e0ea168dcbcc9302717739c037e184db388b79523dbd30aa96e1ada4a3a1fc  (printer, removeComments)
+    spans  31e0ea168dcbcc9302717739c037e184db388b79523dbd30aa96e1ada4a3a1fc  (comment ranges cut)
+
+RUNTIME SOURCE — stronger than a comment-stripped digest: blob-identical.
+  IDENTICAL  packages/collector-cli/src/hook-spool.ts  git blob 7b8b0674417de7c64f6e2680c8324f98332c5170
+  IDENTICAL  packages/collector-cli/src/server.ts  git blob b9cbee19f7179d9fb437d9304f1328e45dab458e
+  IDENTICAL  packages/collector-cli/src/normalizer.ts  git blob ab2b14260da9fc3ea072dce2fc29b4fed156db39
+  No file under any packages/*/src/ appears in git diff 790147cf..HEAD.

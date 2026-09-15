@@ -1,0 +1,21 @@
+REVIEW-68-r2 N2 — the drain future-time control, under its own name
+
+bead eco-6hoxj.86 · lane/spool-proof-hygiene-86 · base 790147cfda1ef9e6f94cc2632566c0add99c4ded
+run 2026-09-15T10:53:48Z · node v22.23.2 · pnpm 10.25.0 · TMPDIR=/private/tmp/b86t · fixture homes only
+throwaway worktree, removed and pruned before the lane finished
+full unabridged run kept beside the lane as logs/raw-nc-drain-future-time.log
+
+This is the perturbation the .68 lane filed as `nc4-skewed-predicate.log`. It is
+a real and useful control; it was only mis-filed as the normalizer-copy control.
+Kept here so both pins are shown falsifiable.
+
+PERTURBATION (packages/collector-cli/src/server.ts, worktree only)
+  `usableOtelTime` grants 5 minutes of slack the normalizer does not:
+  -  return timestampIsNotFromTheFuture(timestamp);
+  +  return timestampIsNotFromTheFuture(new Date(Date.parse(timestamp) - 300_000).toISOString());
+
+RESULT — the drain/normalizer agreement check reds at the boundary row
+
+FAIL u_the_drains_future_time_test_is_the_normalizers_own_over_every_boundary {"skewMs":300000,"frozenNow":"2026-09-13T12:00:00.000Z","disagreeing":["one_ms_past_the_skew_limit"],"unexpected":[],"rows":[{"case":"exactly_now","iso":"2026-09-13T12:00:00.000Z","unixNano":"1789300800000000000","expected":true,"normalizerAccepts":true,"drainAccepts":true,"agree":true},{"case":"one_ms_ahead","iso":"2026-09-13T12:00:00.001Z","unixNano":"1789300800001000000","expected":true,"normalizerAccepts":true,"drainAccepts":true,"agree":true},{"case":"the_skew_limit_exactly","iso":"2026-09-13T12:05:00.000Z","unixNano":"1789301100000000000","expected":true,"normalizerAccepts":true,"drainAccepts":true,"agree":true},{"case":"one_ms_past_the_skew_limit","iso":"2026-09-13T12:05:00.001Z","unixNano":"1789301100001000000","expected":false,"normalizerAccepts":false,"drainAccepts":true,"agree":false},{"case":"far_in_the_past","iso":"2025-09-13T12:00:00.000Z","unixNano":"1757764800000000000","expected":true,"normalizerAccepts":true,"drainAccepts":true,"agree":true},{"case":"a_non_iso_string","iso":"not-a-timestamp","unixNano":"not-a-number","expected":false,"normalizerAccepts":false,"drainAccepts":false,"agree":true},{"case":"an_empty_string","iso":"","unixNano":"","expected":false,"normalizerAccepts":false,"drainAccepts":false,"agree":true}]}
+
+{"proof":"hook_spool","checks":123,"passed":122,"failed":1,"limits":{"maxFiles":5000,"maxBytes":67108864,"drainIntervalMs":5000,"maxFilesPerTick":200,"maxRejectedFiles":500,"rejectedMaxAgeMs":604800000,"rejectedPruneEveryTicks":60,"temporaryOrphanMs":60000,"stalePendingSeconds":600}}

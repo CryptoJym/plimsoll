@@ -1,0 +1,62 @@
+REVIEW-68-r2 N4 — the call-site line measured, and where the conjunction is
+actually load-bearing
+
+bead eco-6hoxj.86 · lane/spool-proof-hygiene-86 · base 790147cfda1ef9e6f94cc2632566c0add99c4ded
+run 2026-09-15T10:54:01Z · node v22.23.2 · pnpm 10.25.0 · TMPDIR=/private/tmp/b86t · fixture homes only
+throwaway worktrees, removed and pruned before the lane finished
+
+THE CLAIM UNDER TEST
+  `spoolSuppressedKey` (packages/collector-cli/src/hook-spool.ts) reads:
+
+      if (derivationInputKeys.has(key)) return false;
+      if (spoolKeepsProtectedIdentityRaw(key)) return false;   <-- this line
+      return collectorStripsKeyOutright(key);
+
+  and `spoolKeepsProtectedIdentityRaw(key)` is
+  `!collectorStripsKeyOutright(key) && isProtectedMetadataFieldName(key)`.
+  The guard line can only fire where `collectorStripsKeyOutright(key)` is
+  already false, and the final return answers `false` for exactly those keys.
+  It decides nothing.
+
+================================================================================
+MEASUREMENT — delete the line, nothing moves. NO RUNTIME CHANGE WAS MADE; this
+was done in a throwaway worktree and reverted.
+================================================================================
+  -  if (spoolKeepsProtectedIdentityRaw(key)) return false;
+
+  at BASE 790147cf (the count REVIEW-68-r2 quotes):
+    {"proof":"hook_spool","checks":121,"passed":121,"failed":0,"limits":{"maxFiles":5000,"maxBytes":67108864,"drainIntervalMs":5000,"maxFilesPerTick":200,"maxRejectedFiles":500,"rejectedMaxAgeMs":604800000,"rejectedPruneEveryTicks":60,"temporaryOrphanMs":60000,"stalePendingSeconds":600}}
+  at HEAD (this lane's proof, two checks added):
+    {"proof":"hook_spool","checks":123,"passed":123,"failed":0,"limits":{"maxFiles":5000,"maxBytes":67108864,"drainIntervalMs":5000,"maxFilesPerTick":200,"maxRejectedFiles":500,"rejectedMaxAgeMs":604800000,"rejectedPruneEveryTicks":60,"temporaryOrphanMs":60000,"stalePendingSeconds":600}}
+
+  The runtime in `repo/` is blob-identical to base; the removal is recorded as a
+  follow-up bead recommendation in SUMMARY-86.md, not done here.
+
+================================================================================
+WHERE THE CONJUNCTION IS LOAD-BEARING — remove it from INSIDE the predicate
+================================================================================
+PERTURBATION (worktree only):
+  -  return !collectorStripsKeyOutright(key) && isProtectedMetadataFieldName(key);
+  +  return isProtectedMetadataFieldName(key);
+
+  Rule 2 stops being a name for what already happened and becomes an override of
+  the DROP rule: `user.email`, `transcript_path`, `file_path` and eleven more
+  protected path/email names turn "exempt" and rest raw in a spool file.
+
+  The new check answers for it by name:
+FAIL r_rule_twos_exemption_never_covers_a_key_the_ledger_drops_outright {"exemptByRuleTwo":81,"droppedByTheLedger":38,"droppedAndProtected":37,"exemptYetDroppedByTheLedger":[{"key":"account_email","ledger":["dropped","dropped"]},{"key":"actor_email","ledger":["dropped","dropped"]},{"key":"cwd","ledger":["dropped","dropped"]},{"key":"current_working_directory","ledger":["dropped","dropped"]},{"key":"email","ledger":["dropped","dropped"]},{"key":"email_address","ledger":["dropped","dropped"]},{"key":"file_path","ledger":["dropped","dropped"]},{"key":"full_path","ledger":["dropped","dropped"]},{"key":"owner_email","ledger":["dropped","dropped"]},{"key":"project_path","ledger":["dropped","dropped"]},{"key":"repo_path","ledger":["dropped","dropped"]},{"key":"repository_url","ledger":["dropped","dropped"]},{"key":"transcript_path","ledger":["dropped","dropped"]},{"key":"workdir","ledger":["dropped","dropped"]},{"key":"working_directory","ledger":["dropped","dropped"]},{"key":"workspace_path","ledger":["dropped","dropped"]},{"key":"user.email","ledger":["dropped","dropped"]},{"key":"user_email","ledger":["dropped","dropped"]},{"key":"userEmail","ledger":["dropped","dropped"]},{"key":"EMAIL","ledger":["dropped","dropped"]},{"key":"emailAddress","ledger":["dropped","dropped"]},{"key":"accountEmail","ledger":["dropped","dropped"]},{"key":"actorEmail","ledger":["dropped","dropped"]},{"key":"ownerEmail","ledger":["dropped","dropped"]},{"key":"transcriptPath","ledger":["dropped","dropped"]},{"key":"filePath","ledger":["dropped","dropped"]},{"key":"FILE_PATH","ledger":["dropped","dropped"]},{"key":"fullPath","ledger":["dropped","dropped"]},{"key":"projectPath","ledger":["dropped","dropped"]},{"key":"repoPath","ledger":["dropped","dropped"]},{"key":"repositoryUrl","ledger":["dropped","dropped"]},{"key":"workspacePath","ledger":["dropped","dropped"]},{"key":"CWD","ledger":["dropped","dropped"]},{"key":"WORKDIR","ledger":["dropped","dropped"]},{"key":"u s e r n a m e","ledger":["dropped","dropped"]},{"key":"user@email","ledger":["dropped","dropped"]},{"key":"Transcript-Path","ledger":["dropped","dropped"]}],"callSiteGuardIsAMeasuredNoOp":"spoolSuppressedKey's `if (spoolKeepsProtectedIdentityRaw(key)) return false` returns false only where `return collectorStripsKeyOutright(key)` already would (121/121 with the line deleted); the conjunction inside the predicate is what decides, and this check is what answers for it"}
+
+  It is not the only check that reds — the mirror and allowlist checks red too,
+  and did at base. What it adds is the sentence: a key the ledger drops outright
+  is never exempt by rule 2. Full list of checks that red under this
+  perturbation:
+    FAIL r_the_spool_file_holds_only_the_allowlisted_path_value
+    FAIL r_a_path_key_outside_the_allowlist_is_blanked_and_an_allowlisted_one_is_not
+    FAIL r_every_protected_identity_name_is_blanked_or_declared
+    FAIL r_the_privacy_pages_rendered_rule_two_table_names_the_hand_list
+    FAIL r_every_spelling_mirrors_the_ledger_except_the_declared_derivation_inputs
+    FAIL r_rule_twos_exemption_never_covers_a_key_the_ledger_drops_outright
+    FAIL r_blanking_a_declared_protected_identity_would_change_what_the_ledger_persists
+    FAIL z_the_intake_spool_file_holds_only_the_allowlisted_path_value
+
+    {"proof":"hook_spool","checks":123,"passed":115,"failed":8,"limits":{"maxFiles":5000,"maxBytes":67108864,"drainIntervalMs":5000,"maxFilesPerTick":200,"maxRejectedFiles":500,"rejectedMaxAgeMs":604800000,"rejectedPruneEveryTicks":60,"temporaryOrphanMs":60000,"stalePendingSeconds":600}}

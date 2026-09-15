@@ -1,0 +1,4 @@
+# The repository root ignores `*.log` (build and run noise). The control logs in
+# this directory ARE the evidence for bead eco-6hoxj.86 and are named in
+# REVIEW-68-r2 §8, so re-include them here and nowhere else.
+!*.log

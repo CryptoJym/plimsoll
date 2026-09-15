@@ -1,0 +1,36 @@
+REVIEW-68-r2 N2 — negative control for the NORMALIZER-COPY pin
+
+bead eco-6hoxj.86 · lane/spool-proof-hygiene-86 · base 790147cfda1ef9e6f94cc2632566c0add99c4ded
+run 2026-09-15T10:53:48Z · node v22.23.2 · pnpm 10.25.0 · TMPDIR=/private/tmp/b86t · fixture homes only
+throwaway worktree, removed and pruned before the lane finished
+full unabridged run kept beside the lane as logs/raw-nc-normalizer-copy.log
+
+WHAT THIS REPLACES
+  The eco-6hoxj.68 lane filed `nc4-skewed-predicate.log` as the control for this
+  pin, but the perturbation it recorded was the DRAIN's future-time predicate
+  (`usableOtelTime`, `packages/collector-cli/src/server.ts`), which reds
+  `u_the_drains_future_time_test_is_the_normalizers_own_over_every_boundary` and
+  says nothing about the normalizer copy. There was therefore no evidence the
+  normalizer-copy pin could fail at all. The correctly-named drain control is
+  kept beside this file as `nc-drain-future-time.log`.
+
+WHAT THE PIN IS
+  `SPOOL_RULE_TWO_DISCLOSED_CANONICAL_NAMES` is matched against real key
+  spellings using `normalizedSpelling` (`scripts/lib/spool-spelling-corpus.ts`),
+  a COPY of the ledger's `normalizeFieldName`, which is not exported. Inside
+  `r_every_protected_identity_name_is_blanked_or_declared`, `normalizerCopyDisagrees`
+  holds the copy to `isProtectedMetadataFieldName`'s verdict over every name in
+  the corpus, so the copy cannot drift into declaring more than a person agreed
+  to.
+
+PERTURBATION (scripts/lib/spool-spelling-corpus.ts, worktree only)
+  -  return field.replace(/[^a-zA-Z0-9]/g, "").toLowerCase();
+  +  return field.replace(/[^a-zA-Z0-9]/g, "");
+  The copy stops lowercasing. The real normalizer still does, so the two
+  disagree on every mixed-case or upper-case spelling in the corpus.
+
+RESULT — the pin reds, and names the affected names
+
+FAIL r_every_protected_identity_name_is_blanked_or_declared {"names":42,"canonical":29,"variantSpellings":13,"blanked":14,"rawAndDeclared":19,"undeclaredRaw":[{"name":"accountId","spelling":"variant","topLevel":"raw","otlpAttribute":"raw"},{"name":"userId","spelling":"variant","topLevel":"raw","otlpAttribute":"raw"},{"name":"userName","spelling":"variant","topLevel":"raw","otlpAttribute":"raw"},{"name":"organizationId","spelling":"variant","topLevel":"raw","otlpAttribute":"raw"},{"name":"orgId","spelling":"variant","topLevel":"raw","otlpAttribute":"raw"},{"name":"workspaceRoot","spelling":"variant","topLevel":"raw","otlpAttribute":"raw"},{"name":"actorId","spelling":"variant","topLevel":"raw","otlpAttribute":"raw"},{"name":"accountUuid","spelling":"variant","topLevel":"raw","otlpAttribute":"raw"},{"name":"ACCOUNT_ID","spelling":"variant","topLevel":"raw","otlpAttribute":"raw"}],"shapesDisagree":[],"ruleTwoDisclosedByHand":11,"ruleTwoRenderedRows":11,"ruleTwoUndisclosed":[],"ruleTwoStaleDisclosure":[],"normalizerCopyDisagrees":["accountId","userId","userName","organizationId","orgId","workspaceRoot","actorId","accountUuid","ACCOUNT_ID"]}
+
+{"proof":"hook_spool","checks":123,"passed":122,"failed":1,"limits":{"maxFiles":5000,"maxBytes":67108864,"drainIntervalMs":5000,"maxFilesPerTick":200,"maxRejectedFiles":500,"rejectedMaxAgeMs":604800000,"rejectedPruneEveryTicks":60,"temporaryOrphanMs":60000,"stalePendingSeconds":600}}

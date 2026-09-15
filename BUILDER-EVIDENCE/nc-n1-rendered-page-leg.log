@@ -1,0 +1,82 @@
+REVIEW-68-r2 N1 — negative controls for the third, independent leg
+
+bead eco-6hoxj.86 · lane/spool-proof-hygiene-86 · base 790147cfda1ef9e6f94cc2632566c0add99c4ded
+run 2026-09-15T10:54:01Z · node v22.23.2 · pnpm 10.25.0 · TMPDIR=/private/tmp/b86t · fixture homes only
+throwaway worktrees, removed and pruned before the lane finished
+
+THE DEFECT
+  `renderedRuleTwoRows` is `SPOOL_DERIVATION_INPUT_DISCLOSURE` filtered by
+  `match === "normalized_name"`. That constant is built at
+  `packages/collector-cli/src/hook-spool.ts` by spreading
+  `SPOOL_PROTECTED_IDENTITY_KEYS` — the same array `derivedRuleTwoNames` is
+  `[...]`-copied from. So the "rendered == derived" leg of the three-way
+  equality is "derived == hand list" told a second time, and cannot red while
+  the first leg is green. Nothing in the proof read the PAGE the disclosure
+  exists to produce.
+
+THE NEW LEG
+  `r_the_privacy_pages_rendered_rule_two_table_names_the_hand_list`
+  reads the rule-2 names back out of the rendered markdown table, twice: from
+  `renderPrivacySpec(collectPrivacySpecModel())` — the exact call
+  `pnpm docs:privacy` makes — and from the committed `docs/privacy-spec.md`.
+  Both are compared with `SPOOL_RULE_TWO_DISCLOSED_CANONICAL_NAMES`, which is
+  typed by hand and derived from nothing.
+
+================================================================================
+NC-N1c — THE ONE THAT MATTERS: the generator changes and the page is regenerated,
+so every existing gate stays green
+================================================================================
+PERTURBATION (scripts/privacy-spec.ts, worktree only) — the table is built from
+a filtered list; the key array is untouched:
+  -    ...items.map(
+  +    ...items.filter((item) => item.match === "exact_name").map(
+then `pnpm docs:privacy` to regenerate the page (11 rows leave docs/privacy-spec.md).
+
+The existing gate, in both worktrees:
+  $ pnpm docs:privacy --check
+  docs/privacy-spec.md is fresh.          exit 0
+
+--- at BASE 790147cf (without the new leg): the disclosure loses eleven names and
+--- nothing notices. This is the hole.
+PASS r_every_protected_identity_name_is_blanked_or_declared {"names":42,"canonical":29,"variantSpellings":13,"blanked":14,"rawAndDeclared":28,"undeclaredRaw":[],"shapesDisagree":[],"ruleTwoDisclosedByHand":11,"ruleTwoRenderedRows":11,"ruleTwoUndisclosed":[],"ruleTwoStaleDisclosure":[],"normalizerCopyDisagrees":[]}
+{"proof":"hook_spool","checks":121,"passed":121,"failed":0,"limits":{"maxFiles":5000,"maxBytes":67108864,"drainIntervalMs":5000,"maxFilesPerTick":200,"maxRejectedFiles":500,"rejectedMaxAgeMs":604800000,"rejectedPruneEveryTicks":60,"temporaryOrphanMs":60000,"stalePendingSeconds":600}}
+
+--- at HEAD (with the new leg): red, and the restated leg still green, which is
+--- the proof that the new leg is not a restatement
+PASS r_every_protected_identity_name_is_blanked_or_declared {"names":42,"canonical":29,"variantSpellings":13,"blanked":14,"rawAndDeclared":28,"undeclaredRaw":[],"shapesDisagree":[],"ruleTwoDisclosedByHand":11,"ruleTwoRenderedRows":11,"ruleTwoUndisclosed":[],"ruleTwoStaleDisclosure":[],"normalizerCopyDisagrees":[]}
+FAIL r_the_privacy_pages_rendered_rule_two_table_names_the_hand_list {"source":"renderPrivacySpec(collectPrivacySpecModel()) + docs/privacy-spec.md","handList":["account_id","account_uuid","actor_id","org_id","organization_id","user.account_id","user.account_uuid","user.id","user_id","username","workspace_root"],"renderedRuleTwoNames":[],"committedRuleTwoNames":[],"renderedTableRows":5,"committedTableRows":5,"tableFound":{"rendered":true,"committed":true},"duplicateHeader":{"rendered":false,"committed":false},"unreadableRows":[],"independentOf":"SPOOL_PROTECTED_IDENTITY_KEYS / SPOOL_DERIVATION_INPUT_DISCLOSURE — these names come from the generator's own rendered table"}
+{"proof":"hook_spool","checks":123,"passed":122,"failed":1,"limits":{"maxFiles":5000,"maxBytes":67108864,"drainIntervalMs":5000,"maxFilesPerTick":200,"maxRejectedFiles":500,"rejectedMaxAgeMs":604800000,"rejectedPruneEveryTicks":60,"temporaryOrphanMs":60000,"stalePendingSeconds":600}}
+
+================================================================================
+NC-N1a — the generator's rendering alone (page not regenerated)
+================================================================================
+PERTURBATION: the same `reasonTable` filter, page left as committed.
+NOTE: this one, and NC-N1b below, would ALSO be caught by `pnpm docs:privacy
+--check`, because the generator and the committed page have been made to
+disagree. They are here to show each of the new leg's two sources is separately
+load-bearing. NC-N1c above is the case no existing gate catches.
+PASS r_every_protected_identity_name_is_blanked_or_declared {"names":42,"canonical":29,"variantSpellings":13,"blanked":14,"rawAndDeclared":28,"undeclaredRaw":[],"shapesDisagree":[],"ruleTwoDisclosedByHand":11,"ruleTwoRenderedRows":11,"ruleTwoUndisclosed":[],"ruleTwoStaleDisclosure":[],"normalizerCopyDisagrees":[]}
+FAIL r_the_privacy_pages_rendered_rule_two_table_names_the_hand_list {"source":"renderPrivacySpec(collectPrivacySpecModel()) + docs/privacy-spec.md","handList":["account_id","account_uuid","actor_id","org_id","organization_id","user.account_id","user.account_uuid","user.id","user_id","username","workspace_root"],"renderedRuleTwoNames":[],"committedRuleTwoNames":["account_id","account_uuid","actor_id","org_id","organization_id","user.account_id","user.account_uuid","user.id","user_id","username","workspace_root"],"renderedTableRows":5,"committedTableRows":16,"tableFound":{"rendered":true,"committed":true},"duplicateHeader":{"rendered":false,"committed":false},"unreadableRows":[],"independentOf":"SPOOL_PROTECTED_IDENTITY_KEYS / SPOOL_DERIVATION_INPUT_DISCLOSURE — these names come from the generator's own rendered table"}
+{"proof":"hook_spool","checks":123,"passed":122,"failed":1,"limits":{"maxFiles":5000,"maxBytes":67108864,"drainIntervalMs":5000,"maxFilesPerTick":200,"maxRejectedFiles":500,"rejectedMaxAgeMs":604800000,"rejectedPruneEveryTicks":60,"temporaryOrphanMs":60000,"stalePendingSeconds":600}}
+
+================================================================================
+NC-N1b — the committed page alone (a hand edit of the rendered table)
+================================================================================
+PERTURBATION (docs/privacy-spec.md, worktree only):
+  -  | 16 | `username` | this name normalized, in any spelling | ...
+  +  | 16 | `user_name` | this name normalized, in any spelling | ...
+PASS r_every_protected_identity_name_is_blanked_or_declared {"names":42,"canonical":29,"variantSpellings":13,"blanked":14,"rawAndDeclared":28,"undeclaredRaw":[],"shapesDisagree":[],"ruleTwoDisclosedByHand":11,"ruleTwoRenderedRows":11,"ruleTwoUndisclosed":[],"ruleTwoStaleDisclosure":[],"normalizerCopyDisagrees":[]}
+FAIL r_the_privacy_pages_rendered_rule_two_table_names_the_hand_list {"source":"renderPrivacySpec(collectPrivacySpecModel()) + docs/privacy-spec.md","handList":["account_id","account_uuid","actor_id","org_id","organization_id","user.account_id","user.account_uuid","user.id","user_id","username","workspace_root"],"renderedRuleTwoNames":["account_id","account_uuid","actor_id","org_id","organization_id","user.account_id","user.account_uuid","user.id","user_id","username","workspace_root"],"committedRuleTwoNames":["account_id","account_uuid","actor_id","org_id","organization_id","user.account_id","user.account_uuid","user.id","user_id","user_name","workspace_root"],"renderedTableRows":16,"committedTableRows":16,"tableFound":{"rendered":true,"committed":true},"duplicateHeader":{"rendered":false,"committed":false},"unreadableRows":[],"independentOf":"SPOOL_PROTECTED_IDENTITY_KEYS / SPOOL_DERIVATION_INPUT_DISCLOSURE — these names come from the generator's own rendered table"}
+{"proof":"hook_spool","checks":123,"passed":122,"failed":1,"limits":{"maxFiles":5000,"maxBytes":67108864,"drainIntervalMs":5000,"maxFilesPerTick":200,"maxRejectedFiles":500,"rejectedMaxAgeMs":604800000,"rejectedPruneEveryTicks":60,"temporaryOrphanMs":60000,"stalePendingSeconds":600}}
+
+================================================================================
+READING
+  In all three controls `r_every_protected_identity_name_is_blanked_or_declared`
+  stays GREEN with `ruleTwoRenderedRows: 11` — reporting eleven rows from the key
+  array while the page prints five or none. That is the restated leg being unable
+  to fail, measured. The new check is the only thing that reds.
+
+  `pnpm docs:privacy --check` is not a substitute. It answers "is the committed
+  page what the generator renders", which stays true whenever the page is
+  regenerated after a generator change — NC-N1c. It never compares the page with
+  the hand-written disclosure list. The new leg does, from both sides.
