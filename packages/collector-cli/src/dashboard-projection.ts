@@ -804,6 +804,7 @@ export class DashboardProjectionStore {
         token_events integer not null, input_tokens integer not null,
         output_tokens integer not null, cache_read_tokens integer not null,
         cache_creation_tokens integer not null, cost_nanos integer not null,
+        last_token_event_at text,
         primary key (days, session_hash, source)
       );
       create table if not exists dashboard_session_repair_repo (
@@ -902,6 +903,7 @@ export class DashboardProjectionStore {
         started_at text not null, ended_at text not null, events integer not null,
         token_events integer not null, input_tokens integer not null, output_tokens integer not null,
         cache_read_tokens integer not null, cache_creation_tokens integer not null, cost_nanos integer not null,
+        last_token_event_at text,
         primary key (days, session_hash, source)
       );
       create table if not exists dashboard_session_root_window (
@@ -1314,6 +1316,21 @@ export class DashboardProjectionStore {
     ]) {
       const name = definition.split(" ")[0]!;
       if (!factColumns.has(name)) this.db.exec(`alter table dashboard_event_facts add column ${definition}`);
+    }
+    // The token-session watermark compares token evidence with token evidence,
+    // so each session carries its own last token-event time. Rows written before
+    // the column exists keep whatever the facts still hold; a session whose facts
+    // have aged out stays null and falls back to its any-kind end, as before.
+    for (const table of ["dashboard_session_repair_source", "dashboard_session_source_window"]) {
+      const columns = new Set(
+        (this.db.pragma(`table_info(${table})`) as Array<{ name: string }>).map((row) => row.name),
+      );
+      if (columns.has("last_token_event_at")) continue;
+      this.db.exec(`alter table ${table} add column last_token_event_at text`);
+      this.db.exec(`update ${table} set last_token_event_at=(
+        select max(f.observed_at) from dashboard_event_facts f
+        where f.session_hash=${table}.session_hash and f.source=${table}.source
+          and f.input_tokens is not null) where token_events>0`);
     }
   }
 
@@ -2086,14 +2103,17 @@ export class DashboardProjectionStore {
     const upsertSource=this.db.prepare(
       `insert into dashboard_session_repair_source
        (days,session_hash,source,started_at,ended_at,events,token_events,input_tokens,output_tokens,
-        cache_read_tokens,cache_creation_tokens,cost_nanos) values (?,?,?,?,?,1,?,?,?,?,?,?)
+        cache_read_tokens,cache_creation_tokens,cost_nanos,last_token_event_at) values (?,?,?,?,?,1,?,?,?,?,?,?,?)
        on conflict(days,session_hash,source) do update set
         started_at=min(started_at,excluded.started_at),ended_at=max(ended_at,excluded.ended_at),
         events=events+1,token_events=token_events+excluded.token_events,
         input_tokens=input_tokens+excluded.input_tokens,output_tokens=output_tokens+excluded.output_tokens,
         cache_read_tokens=cache_read_tokens+excluded.cache_read_tokens,
         cache_creation_tokens=cache_creation_tokens+excluded.cache_creation_tokens,
-        cost_nanos=cost_nanos+excluded.cost_nanos`,
+        cost_nanos=cost_nanos+excluded.cost_nanos,
+        last_token_event_at=case when excluded.last_token_event_at is not null and
+          (last_token_event_at is null or excluded.last_token_event_at>last_token_event_at)
+          then excluded.last_token_event_at else last_token_event_at end`,
     );
     const upsertRepo=this.db.prepare(
       `insert into dashboard_session_repair_repo
@@ -2123,7 +2143,8 @@ export class DashboardProjectionStore {
         fact.repoHash?0:fact.costNanos??0,fact.branchHash,fact.branchHash,fact.branchHash,
         fact.source,fact.source,days,sessionHash);
       upsertSource.run(days,sessionHash,fact.source,fact.observedAt,fact.observedAt,tokenEvent,
-        fact.inputTokens??0,fact.outputTokens??0,fact.cacheReadTokens??0,fact.cacheCreationTokens??0,fact.costNanos??0);
+        fact.inputTokens??0,fact.outputTokens??0,fact.cacheReadTokens??0,fact.cacheCreationTokens??0,fact.costNanos??0,
+        tokenEvent?fact.observedAt:null);
       if(fact.repoHash)upsertRepo.run(days,sessionHash,fact.repoHash,fact.inputTokens??0,fact.outputTokens??0,fact.costNanos??0);
       if(fact.branchHash)upsertBranch.run(days,sessionHash,fact.repoHash??UNLINKED_REPO,fact.repoHash,fact.branchHash);
       if(fact.accountHash){const account=aliases.get(fact.accountHash)??fact.accountHash;upsertAccount.run(days,sessionHash,account,fact.costNanos??0);}
@@ -2171,8 +2192,10 @@ export class DashboardProjectionStore {
         job.cache_read_tokens,job.cache_creation_tokens,job.cost_nanos);
       this.db.prepare(
         `insert into dashboard_session_source_window
+         (days,session_hash,source,started_at,ended_at,events,token_events,input_tokens,
+          output_tokens,cache_read_tokens,cache_creation_tokens,cost_nanos,last_token_event_at)
          select days,session_hash,source,started_at,ended_at,events,token_events,input_tokens,
-          output_tokens,cache_read_tokens,cache_creation_tokens,cost_nanos
+          output_tokens,cache_read_tokens,cache_creation_tokens,cost_nanos,last_token_event_at
          from dashboard_session_repair_source where days=? and session_hash=?`,
       ).run(days,sessionHash);
       this.db.prepare(
@@ -3369,10 +3392,15 @@ export class DashboardProjectionStore {
       // The existing days/source projection range is visited once, as before.
       // Its newest token-bearing session is a watermark, not proof that every
       // event is linked: a recent non-token session must not hide a stale count.
+      // The token watermark reads each session's own last token event, because
+      // `ended_at` advances on any later event: a session that ends on a
+      // session_stop or a tool_use would otherwise sit permanently ahead of the
+      // source's last token event and withhold both counts on a healthy source.
+      // A row from before that column existed falls back to its any-kind end.
       const sessions=this.db.prepare(
         `select count(case when ended_at>=? and ended_at<? then 1 end) as ledgerSessionsToday,
           coalesce(sum(case when ended_at>=? and ended_at<? and token_events>0 then 1 else 0 end),0) as tokenSessionsToday,
-          max(case when token_events>0 then ended_at end) as latestTokenSessionAt,
+          max(case when token_events>0 then coalesce(last_token_event_at,ended_at) end) as latestTokenSessionAt,
           max(ended_at) as latestSessionAt
          from dashboard_session_source_window where days=7 and source=?`,
       ).get(dayStart,dayEnd,dayStart,dayEnd,source) as {
@@ -3386,8 +3414,14 @@ export class DashboardProjectionStore {
         ?"unavailable":tokenCount.state==="lagging"||ledgerCount.state==="lagging"?"lagging":"projected";
       const countsAvailable=countState==="projected";
       const details=[tokenCount.detail,ledgerCount.detail].filter((v):v is string=>v!==null);
-      const countWarning=`session count unavailable — ${details.join("; ")}; `+
-        "a linkage fault cannot be distinguished from projection lag or unlinked events until the projection catches up";
+      // The linkage-versus-lag disclosure answers a projection that is behind and
+      // may still catch up. An invalid, future, or projection-ahead pair raises
+      // no linkage question and will not resolve by waiting, so it is reported
+      // without that sentence.
+      const lagging=tokenCount.state==="lagging"||ledgerCount.state==="lagging";
+      const countWarning=`session count unavailable — ${details.join("; ")}`+(lagging
+        ?"; a linkage fault cannot be distinguished from projection lag or unlinked events until the projection catches up"
+        :"");
       const countLabel=`${sessions.tokenSessionsToday} projected token-bearing session(s) ending today (UTC)`;
       const sessionCountProjection={state:countState,utcDate:today,
         latestTokenSessionAt:sessions.latestTokenSessionAt,latestTokenEventAt:latest.tokenAt,

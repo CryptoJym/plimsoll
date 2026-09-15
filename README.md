@@ -262,14 +262,26 @@ budget; durations retain seconds and use hours/days rather than huge minute tota
 Invalid/future timestamps, a projection ahead of its source clock, or projected
 session evidence without a corresponding source timestamp also withhold counts.
 Absent timestamps with no projected sessions and no current source activity do
-not invent a problem: zero remains distinguishable from unknown. A token-bearing
-session's end can advance due to a later non-token event; a resulting negative
-lag is withheld conservatively, not relabelled as zero lag or complete linkage.
-Underlying projected values remain visible with their freshness states.
+not invent a problem: zero remains distinguishable from unknown. Underlying
+projected values remain visible with their freshness states.
+
+Each watermark is compared against the source clock that matches it. A session's
+end advances on its last event of **any** kind, and sessions ordinarily sign off
+with a non-token event, so the token-session watermark reads each session's own
+last token event rather than its end. `latestTokenSessionAt` is therefore token
+evidence: a healthy source whose newest token-bearing session ended on a
+`session_stop` or a tool call reads **green** with both counts published, and a
+negative token lag means the projection really does claim token evidence the
+event ledger does not hold. Such a pair is withheld with its sign intact, never
+relabelled as zero lag or complete linkage. A session row written before that
+per-session clock existed is filled from the facts still held when the ledger is
+opened, and falls back to the session's end only if those facts have aged out.
 
 A count that is not vouched for cannot support a red assertion based on that
-count. That case becomes amber and explicitly says a linkage fault cannot yet
-be distinguished from projection lag or unlinked events. This does **not** clear
+count. That case becomes amber and, **when the projection is lagging**, says a
+linkage fault cannot yet be distinguished from projection lag or unlinked events.
+An invalid, future, or projection-ahead pair raises no such question and will not
+resolve by waiting, so it is reported without that sentence. This does **not** clear
 the earlier red condition for recent local activity not reaching the event ledger;
 that event-recency check remains first. Future-event checks also remain intact.
 No additional raw-ledger query is made. The standalone ledger-side health query

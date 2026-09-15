@@ -1734,9 +1734,13 @@ async function main() {
     const countFixture = captureHealthFixture("session-count-watermark", 5 * 60_000).fixture;
     const countRows = () => (readySnapshot(countFixture, 30).status.health as {
       sources: CountHealth[] }).sources;
+    // A projected session that both starts and ends at `at` saw its last token
+    // event there too; moving only `ended_at` would fake a trailing non-token
+    // event, which is the benign shape these checks are not about.
     const setProjectedEnd = (at: string) => countFixture.database.prepare(
-      `update dashboard_session_source_window set started_at=?,ended_at=? where days=7`,
-    ).run(at, at);
+      `update dashboard_session_source_window set started_at=?,ended_at=?,
+        last_token_event_at=case when token_events>0 then ? end where days=7`,
+    ).run(at, at, at);
     const oldEnd = new Date(NOW.getTime() - 4 * DAY_MS).toISOString();
     setProjectedEnd(oldEnd);
     const oldRows = countRows();
@@ -1770,8 +1774,8 @@ async function main() {
       ended_at=?,token_events=case when session_hash=(select min(session_hash)
         from dashboard_session_source_window where days=7 and source='codex') then 0 else token_events end
       where days=7 and source='codex'`).run(eventAt);
-    countFixture.database.prepare(`update dashboard_session_source_window set ended_at=?
-      where days=7 and source='codex' and token_events>0`).run(oldEnd);
+    countFixture.database.prepare(`update dashboard_session_source_window set ended_at=?,
+      last_token_event_at=? where days=7 and source='codex' and token_events>0`).run(oldEnd, oldEnd);
     check("fresh_non_token_session_cannot_mask_stale_token_session_counts",
       countRows().find(row => row.source === "codex")?.tokenSessionsToday === null, {});
     setProjectedEnd(new Date(NOW.getTime() + DAY_MS).toISOString());
@@ -1828,11 +1832,15 @@ async function main() {
     check("unlinked_token_activity_does_not_fabricate_a_session_or_assert_no_activity",
       unlinkedRow.status==="amber"&&unlinkedRow.tokenSessionsToday===null&&
         unlinkedRow.sessionCountProjection?.latestTokenSessionAt===null&&
-        unlinkedRow.reason.includes("projection lag or unlinked events"),{row:unlinkedRow});
+        unlinkedRow.reason.includes("today's token-session activity has no projected session"),{row:unlinkedRow});
     unlinkedCount.close();
     countFixture.database.prepare(`update dashboard_source_lifetime
       set last_event_at=?,last_token_event_at=?`).run(eventAt,eventAt);
     setProjectedEnd(eventAt);
+    // Genuinely inconsistent, not merely a session that ended on a non-token
+    // event: `setProjectedEnd` moved each session's own token clock to `eventAt`,
+    // so the projection claims token evidence three days after the newest token
+    // event the source ledger holds. Token clock against token clock, negative.
     countFixture.database.prepare(`update dashboard_source_lifetime set last_token_event_at=?`)
       .run(new Date(NOW.getTime()-3*DAY_MS).toISOString());
     const negativeRows=countRows();
@@ -1886,6 +1894,64 @@ async function main() {
       !readHasNoRawAccess(rawControl)&&!readHasNoRawAccess(fsControl),
       {rawQueries:rawControl.queries.filter(sql=>sql.includes("buffered_events")).length,filesystemCalls:fsControl.filesystem.length});
     countFixture.close();
+
+    // A session's `ended_at` advances on its last event of any kind, and a
+    // session ordinarily signs off with a non-token event (session_stop, a
+    // tool_use, a tool_result). Reading that end as the token watermark made a
+    // healthy, fully caught-up source carry a structurally negative token lag
+    // and withhold both counts for good. The watermark reads token evidence.
+    const trailing=captureHealthFixture("trailing-non-token",5*60_000).fixture;
+    for(const [source,sessions] of [["claude_code",2],["codex",2],["grok",1]] as const){
+      trailing.append(event({source,eventType:"tool_use",
+        sessionId:uuid(900_000+(sessions-1)+(source==="codex"?10:source==="grok"?20:0)),
+        observedAt:new Date(NOW.getTime()-60_000).toISOString()}));
+    }
+    settle(trailing,NOW,30);
+    const trailingRows=(readySnapshot(trailing,30).status.health as {sources:CountHealth[]}).sources;
+    check("token_session_ending_on_a_non_token_event_still_publishes_counts",
+      trailingRows.every(row=>row.status==="green"&&
+        row.sessionCountProjection?.state==="projected"&&
+        row.sessionCountProjection.tokenState==="projected"&&
+        row.sessionCountProjection.ledgerState==="projected"&&
+        row.sessionCountProjection.lagMs===0&&row.sessionCountProjection.ledgerLagMs===0&&
+        row.tokenSessionsToday===(row.source==="grok"?1:2)&&
+        row.ledgerSessionsToday===(row.source==="grok"?1:2)&&
+        !row.reason.includes("ahead of its event watermark")),
+      {rows:trailingRows});
+    trailing.close();
+
+    // The per-session token clock is an additive column. An installed ledger
+    // written before it existed must gain it, and must be filled from the facts
+    // it still holds, or its newest token-bearing session would keep reading its
+    // any-kind end as token evidence and keep withholding the counts.
+    const upgradePath=path.join(root,"capture-health-token-clock-upgrade.sqlite");
+    const tokenEventAt=new Date(NOW.getTime()-5*60_000).toISOString();
+    const upgraded=new LocalEventBuffer(upgradePath);
+    upgraded.append(event({source:"grok",sessionId:uuid(930_010),observedAt:tokenEventAt,
+      inputTokens:1_200,outputTokens:340,costUsd:0.004}));
+    upgraded.append(event({source:"grok",sessionId:uuid(930_010),eventType:"tool_use",
+      observedAt:new Date(NOW.getTime()-60_000).toISOString()}));
+    settle(upgraded,NOW,30);
+    upgraded.close();
+    const legacyLedger=new Database(upgradePath);
+    for(const table of ["dashboard_session_repair_source","dashboard_session_source_window"]){
+      legacyLedger.exec(`alter table ${table} drop column last_token_event_at`);
+    }
+    legacyLedger.close();
+    const reopened=new LocalEventBuffer(upgradePath);
+    // Read before any maintenance: the open-time migration is what must fill it.
+    const backfilled=(reopened.database.prepare(
+      `select last_token_event_at as at from dashboard_session_source_window where days=7`,
+    ).get() as {at:string|null}).at;
+    settle(reopened,NOW,30);
+    const upgradedRow=(readySnapshot(reopened,30).status.health as {sources:CountHealth[]})
+      .sources.find(row=>row.source==="grok")!;
+    check("pre_existing_session_rows_gain_the_token_clock_on_upgrade",
+      backfilled===tokenEventAt&&upgradedRow.status==="green"&&upgradedRow.tokenSessionsToday===1&&
+        upgradedRow.sessionCountProjection?.state==="projected"&&
+        upgradedRow.sessionCountProjection.latestTokenSessionAt===tokenEventAt,
+      {backfilled,row:upgradedRow});
+    reopened.close();
 
     // Standing rule for this file pair: every tailer fix ships its twin check
     // on the other tailer (r1/r2/r3 lesson of eco-6hoxj.73).
