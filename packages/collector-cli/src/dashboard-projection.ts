@@ -52,10 +52,52 @@ const CAPTURE_HEALTH_SOURCES=[
 const CAPTURE_EVENT_CADENCE_MS=60*60_000;
 /** Local activity must reach the projected ledger within this lag. */
 const CAPTURE_LAG_LIMIT_MS=10*60_000;
+/** Count watermarks are independent of the local-activity capture-lag policy. */
+const SESSION_COUNT_MAX_LAG_MS=10*60_000;
 /** Only activity this recent demands fresh capture (older = session over). */
 const CAPTURE_ACTIVITY_LOOKBACK_MS=60*60_000;
 /** A scan receipt older than this cannot confirm local quiet. */
 const CAPTURE_SCAN_STALE_MS=3*60_000;
+
+function countLagLabel(lagMs:number) {
+  let seconds=Math.ceil(Math.abs(lagMs)/1_000);
+  const parts:string[]=[];
+  for(const [size,label] of [[86_400,"d"],[3_600,"h"],[60,"m"],[1,"s"]] as const){
+    const n=Math.floor(seconds/size);seconds%=size;
+    if(n)parts.push(`${n}${label}`);
+  }
+  return parts.join(" ")||"0s";
+}
+
+/** A watermark is evidence of freshness, never a claim of complete linkage. */
+function sessionCountFreshness(eventAt:string|null,sessionAt:string|null,count:number,
+  dayStartMs:number,nowMs:number,label:string){
+  const eventMs=eventAt===null?null:Date.parse(eventAt);
+  const sessionMs=sessionAt===null?null:Date.parse(sessionAt);
+  const invalid=(eventMs!==null&&(!Number.isFinite(eventMs)||eventMs>nowMs))||
+    (sessionMs!==null&&(!Number.isFinite(sessionMs)||sessionMs>nowMs));
+  // Keep the sign: clamping would turn an inconsistent pair into fresh evidence.
+  const lagMs=!invalid&&eventMs!==null&&sessionMs!==null?eventMs-sessionMs:null;
+  let state:"projected"|"lagging"|"unavailable"="projected";
+  let detail:string|null=null;
+  if(invalid){state="unavailable";detail=`${label} timestamps are invalid or in the future`;}
+  else if(lagMs!==null&&lagMs<0){
+    state="unavailable";detail=`${label} projection is ahead of its event watermark by ${countLagLabel(lagMs)}`;
+  }
+  else if(eventMs===null&&(sessionMs!==null||count>0)){
+    state="unavailable";detail=`${label} projection has no corresponding event timestamp`;
+  }
+  else if(eventMs!==null&&eventMs>=dayStartMs){
+    if(sessionMs===null){state="lagging";detail=`today's ${label} activity has no projected session`;}
+    else if(sessionMs<dayStartMs){
+      state="lagging";detail=`${label} projection has not reached the current UTC day (lag ${countLagLabel(lagMs!)})`;
+    }
+    else if(lagMs!==null&&lagMs>SESSION_COUNT_MAX_LAG_MS){
+      state="lagging";detail=`${label} projection lags by ${countLagLabel(lagMs)} (budget ${countLagLabel(SESSION_COUNT_MAX_LAG_MS)})`;
+    }
+  }
+  return {state,lagMs,detail};
+}
 
 type CaptureScanState="complete"|"in_progress"|"limit_reached"|"deferred"|"error"|"unknown"|"not_applicable";
 
@@ -3322,11 +3364,38 @@ export class DashboardProjectionStore {
         `select last_event_at as lastEventAt,last_token_event_at as tokenAt
          from dashboard_source_lifetime where source=?`,
       ).get(source) as {lastEventAt:string|null;tokenAt:string|null}|undefined)??{lastEventAt:null,tokenAt:null};
+      const dayStart=`${today}T00:00:00.000Z`;
+      const dayEnd=new Date(Date.parse(dayStart)+DAY_MS).toISOString();
+      // The existing days/source projection range is visited once, as before.
+      // Its newest token-bearing session is a watermark, not proof that every
+      // event is linked: a recent non-token session must not hide a stale count.
       const sessions=this.db.prepare(
-        `select count(*) as ledgerSessionsToday,
-          sum(case when token_events>0 then 1 else 0 end) as tokenSessionsToday
-         from dashboard_session_source_window where days=7 and source=? and ended_at>=?`,
-      ).get(source,`${today}T00:00:00.000Z`) as {ledgerSessionsToday:number;tokenSessionsToday:number|null};
+        `select count(case when ended_at>=? and ended_at<? then 1 end) as ledgerSessionsToday,
+          coalesce(sum(case when ended_at>=? and ended_at<? and token_events>0 then 1 else 0 end),0) as tokenSessionsToday,
+          max(case when token_events>0 then ended_at end) as latestTokenSessionAt,
+          max(ended_at) as latestSessionAt
+         from dashboard_session_source_window where days=7 and source=?`,
+      ).get(dayStart,dayEnd,dayStart,dayEnd,source) as {
+        ledgerSessionsToday:number;tokenSessionsToday:number;latestTokenSessionAt:string|null;
+        latestSessionAt:string|null};
+      const tokenCount=sessionCountFreshness(latest.tokenAt,sessions.latestTokenSessionAt,
+        sessions.tokenSessionsToday,Date.parse(dayStart),now.getTime(),"token-session");
+      const ledgerCount=sessionCountFreshness(latest.lastEventAt,sessions.latestSessionAt,
+        sessions.ledgerSessionsToday,Date.parse(dayStart),now.getTime(),"ledger-session");
+      const countState=tokenCount.state==="unavailable"||ledgerCount.state==="unavailable"
+        ?"unavailable":tokenCount.state==="lagging"||ledgerCount.state==="lagging"?"lagging":"projected";
+      const countsAvailable=countState==="projected";
+      const details=[tokenCount.detail,ledgerCount.detail].filter((v):v is string=>v!==null);
+      const countWarning=`session count unavailable — ${details.join("; ")}; `+
+        "a linkage fault cannot be distinguished from projection lag or unlinked events until the projection catches up";
+      const countLabel=`${sessions.tokenSessionsToday} projected token-bearing session(s) ending today (UTC)`;
+      const sessionCountProjection={state:countState,utcDate:today,
+        latestTokenSessionAt:sessions.latestTokenSessionAt,latestTokenEventAt:latest.tokenAt,
+        latestSessionAt:sessions.latestSessionAt,latestEventAt:latest.lastEventAt,
+        tokenState:tokenCount.state,ledgerState:ledgerCount.state,
+        lagMs:tokenCount.lagMs,ledgerLagMs:ledgerCount.lagMs,lagBudgetMs:SESSION_COUNT_MAX_LAG_MS,
+        projectedTokenSessionsToday:sessions.tokenSessionsToday,
+        projectedLedgerSessionsToday:sessions.ledgerSessionsToday};
       const scan=capture==="hook_only"
         ?{state:"not_applicable" as CaptureScanState,
           summary:"hook-delivered source — there is no local activity scan",scan:null}
@@ -3345,7 +3414,8 @@ export class DashboardProjectionStore {
       if(capture==="hook_only"){
         if(neverCaptured){status="no_events";reason="configured source with no events captured yet";}
         else if(eventsFuture){status="amber";reason=futureReason();}
-        else if(eventsFresh)reason=`capture current — ${sessions.tokenSessionsToday??0} session(s) with tokens today (hook-delivered)`;
+        else if(!countsAvailable){status="amber";reason=`${countWarning} (hook-delivered)`;}
+        else if(eventsFresh)reason=`capture current — ${countLabel} (hook-delivered)`;
         else{status="amber";
           reason=`no hook event for ${minutesAgo(eventAgeMs??0)} — hook delivery cannot be confirmed `+
             `within the expected ${minutesAgo(CAPTURE_EVENT_CADENCE_MS)} cadence`;}
@@ -3360,6 +3430,7 @@ export class DashboardProjectionStore {
         if(activityAge!==null&&activityAge<=CAPTURE_ACTIVITY_LOOKBACK_MS&&lag!==null&&lag>CAPTURE_LAG_LIMIT_MS){
           status="red";reason="recent local activity is not reaching the projected ledger";
         }
+        else if(!countsAvailable){status="amber";reason=eventsFuture?futureReason():countWarning;}
         else if(Number(local?.filesToday??0)>0&&(sessions.tokenSessionsToday??0)===0){
           status="red";reason=`${local!.filesToday} local session file(s) today, 0 sessions captured with tokens`;
         }
@@ -3373,14 +3444,14 @@ export class DashboardProjectionStore {
         // A future-dated newest event carries no such credit: it can neither
         // confirm capture nor be corrected by a later event.
         else if(eventsFuture){status="amber";reason=futureReason();}
-        else if(eventsFresh)reason=`capture current — ${sessions.tokenSessionsToday??0} session(s) with tokens today`;
+        else if(eventsFresh)reason=`capture current — ${countLabel}`;
         // Only when capture truth is silent may local scan bookkeeping decide.
         else if(!local){status="amber";reason="local activity state unavailable — awaiting a tailer scan";}
         else if(scan.state!=="complete"){status="amber";reason=`local ${scan.summary}`;}
         else if(now.getTime()-Date.parse(String(local.lastScanAt))>CAPTURE_SCAN_STALE_MS){
           status="amber";reason="local activity state is stale — quiet cannot be confirmed";
         }
-        else if(local.lastActivityAt)reason=`capture current — ${sessions.tokenSessionsToday??0} session(s) with tokens today`;
+        else if(local.lastActivityAt)reason=`capture current — ${countLabel}`;
         else if(neverCaptured){status="no_events";reason="configured source with no events captured yet";}
         else reason="no local activity observed by the latest tailer scan";
       }
@@ -3388,10 +3459,13 @@ export class DashboardProjectionStore {
       // capture truth could not answer; it is never the overall amber reason.
       const diagnostics=scan.state==="complete"||scan.state==="not_applicable"
         ?[]:[`local ${scan.summary}`];
+      if(!countsAvailable)diagnostics.push(countWarning);
       return {source,capture,lastEventAt:latest.lastEventAt,lastTokenEventAt:latest.tokenAt,
         lastEventAgeMs:eventAgeMs,expectedEventCadenceMs:CAPTURE_EVENT_CADENCE_MS,
         localLastActivityAt:local?.lastActivityAt??null,localSessionsToday:Number(local?.filesToday??0),
-        ledgerSessionsToday:sessions.ledgerSessionsToday,tokenSessionsToday:sessions.tokenSessionsToday??0,status,reason,
+        ledgerSessionsToday:countsAvailable?sessions.ledgerSessionsToday:null,
+        tokenSessionsToday:countsAvailable?sessions.tokenSessionsToday:null,
+        sessionCountProjection,status,reason,
         diagnostics,
         activityState:{lastScanAt:local?.lastScanAt??null,discoveryEntries:Number(local?.discoveryEntries??0),
           truncated:Boolean(local?.truncated),scanState:scan.state,scan:scan.scan}};
