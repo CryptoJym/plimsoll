@@ -313,20 +313,29 @@ consumed by the label:
   (`4/22 eligible of 25 configured capture root(s) enumerated`).
 - `entriesThisSweep` / `entriesThisTick` / `pendingFiles` — enumeration progress
   since the sweep began and in this cadence, and the candidates still awaiting
-  metadata. These advance during the first-install baseline sweep too.
+  metadata. The first two count directory *entries* stepped over, never the
+  files those entries matched; `pendingFiles` is the field that counts files.
+  These advance during the first-install baseline sweep too.
 - `entryBudgetPerTick` / `wallBudgetMsPerTick` / `lifetimeEntryLimit` — the
   budget that ended the cadence (256 entries, 50 ms) and the entries one cursor
   may visit before it restarts instead of resuming (100000).
 - `converging` — a cursor exists and will resume on the next cadence; it stays
-  true for a cadence deferred before any filesystem work, which keeps its cursor.
-  False once the sweep finished, hit `limitReached`, or was retired inside the
-  cadence that reported it.
+  true for a cadence deferred before any filesystem work, which keeps its cursor,
+  and for a cadence that retired a finished cursor and installed a successor on
+  the same attempt — that successor is the cursor that resumes. False once the
+  sweep finished, hit `limitReached`, or was retired leaving no cursor behind.
+  `converging: true` beside `sweepComplete: true` is therefore a same-cadence
+  restart, not a contradiction: this cadence's sweep finished and the next one
+  begins from the successor, which is what "still sweeping" in the reason says.
 - `sweepComplete` — this cadence's cursor finished a full sweep of every eligible
-  root. A sweep normally ends by being retired the moment it finishes — drained,
-  restarted or closed — and the receipt reports the numbers that cursor held
-  when it was retired, so a completed sweep is reported as complete. A cadence
-  with no cursor at all reports false: no cursor is no receipt. A cursor that
-  hit `limitReached` also reports false — it restarts, it did not finish.
+  root. A sweep normally ends by being retired the moment it finishes — drained
+  or restarted — and the receipt reports the numbers that cursor held when it
+  was retired, so a completed sweep is reported as complete. A cursor discarded
+  rather than retired publishes no receipt at all: `close()`, a capture-inventory
+  rebind and the "baseline already complete" early return each drop the cursor
+  without one. A cadence with no cursor at all reports false: no cursor is no
+  receipt. A cursor that hit `limitReached` also reports false — it restarts,
+  it did not finish.
 - `limitReached` / `deferredBeforeIo` — why the cadence ended, when it was not
   the per-tick budget.
 

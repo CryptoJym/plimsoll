@@ -24,8 +24,11 @@ import {
 import { historyCoverageStatus } from "../packages/collector-cli/src/history-coverage";
 import { CaptureWorkBudget } from "../packages/collector-cli/src/capture-work-budget";
 import {
+  AUTOMATIC_DISCOVERY_ENTRY_CAP,
   AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP,
+  AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP,
   captureScanProgress,
+  type CaptureScanProgress,
 } from "../packages/collector-cli/src/capture-baseline";
 import {
   IncrementalJsonlDiscovery,
@@ -2371,10 +2374,16 @@ async function main() {
     restartTailer.close();
     check("a_cadence_that_retires_its_cursor_reports_the_sweep_it_ran",
       drained.rootsStarted === 1 && drained.entriesThisSweep > 0 &&
+      // A drained capture cadence retires its cursor and leaves none behind:
+      // the next cadence opens a new one, so nothing is resuming right now.
       drained.converging === false && drained.sweepComplete === true &&
       drained.lifetimeEntryLimit === 100_000 &&
       restarted.rootsStarted === 1 && restarted.entriesThisSweep > 0 &&
-      restarted.converging === false && restarted.sweepComplete === true,
+      // Re-pinned by bead eco-6hoxj.78 (REVIEW-73-r3 finding 3): a restart
+      // installs a successor on the same attempt, so a cursor does exist and
+      // does resume. `converging: false` here was the field that disagreed
+      // with the "still sweeping" reason the same receipt renders.
+      restarted.converging === true && restarted.sweepComplete === true,
       { drained, restarted });
     check("a_rollout_cadence_after_a_retirement_reports_the_new_sweep_not_the_retired_one",
       drainedNext.converging === true && drainedNext.sweepComplete === false &&
@@ -2396,11 +2405,19 @@ async function main() {
      * wording: `describeScanRoots` prints `0/N eligible of K configured capture
      * root(s) enumerated` the moment eligible roots differ from configured ones
      * (r2, review finding 4).
+     *
+     * `describeCaptureScan` has a third rendering the first two never reach:
+     * with no parsable receipt it prints `no scan budget receipt; N entr(ies)
+     * this tick` and no sweep or roots clause at all. A zero there is the same
+     * empty receipt under the same sweeping reason, so the detector reads it
+     * too — the name says "the r1 zero sweep", not "the r1 zero sweep clause"
+     * (bead eco-6hoxj.78, REVIEW-77-r2 carry-in (c)).
      */
     const rendersTheR1ZeroSweep = (reason: string) =>
       /(?<![0-9])0 entr\(ies\) this sweep/.test(reason) ||
       /(?<![0-9])0\/[0-9]+ (?:eligible of [0-9]+ configured )?capture root\(s\) enumerated/
-        .test(reason);
+        .test(reason) ||
+      /no scan budget receipt; (?<![0-9])0 entr\(ies\) this tick/.test(reason);
     check("the_r1_zero_sweep_detector_reads_both_capture_root_wordings",
       rendersTheR1ZeroSweep("local activity scan still sweeping — 0/22 eligible of 25 " +
         "configured capture root(s) enumerated, 40 entr(ies) this sweep, 24 this tick") === true &&
@@ -2409,7 +2426,15 @@ async function main() {
       rendersTheR1ZeroSweep("local activity scan still sweeping — 3/22 eligible of 25 " +
         "configured capture root(s) enumerated, 20 entr(ies) this sweep, 24 this tick") === false &&
       rendersTheR1ZeroSweep("local activity scan still sweeping — 1/1 capture root(s) " +
-        "enumerated, 20 entr(ies) this sweep, 24 this tick") === false);
+        "enumerated, 20 entr(ies) this sweep, 24 this tick") === false &&
+      // The receipt-less branch, must-green and must-red rows.
+      rendersTheR1ZeroSweep(
+        "local activity scan still sweeping — no scan budget receipt; " +
+        "0 entr(ies) this tick") === true &&
+      rendersTheR1ZeroSweep(
+        "local activity scan still sweeping — no scan budget receipt; " +
+        "40 entr(ies) this tick") === false);
+
     // Bead eco-6hoxj.77 (r3 findings 1 and 2): the two halves of the r3 fix
     // that no check drove. Both of them reverted green under the whole
     // battery — the `!limitReached` term in `sweepComplete`, and the entire
@@ -2505,8 +2530,16 @@ async function main() {
     // sweep". A real host only ever reaches its limit across many cadences.
     // 900 files against a 600-entry limit: the cursor crosses several 256-entry
     // ticks, and the cadence that hits the limit still may not claim a sweep.
+    // The limit has to land inside a tick, not on a tick boundary: 600 divides
+    // by neither the 256-entry nor the 64-file per-tick cap, so the cadence
+    // that hits it is a partial tick and `entriesThisSweep === MULTI_TICK_LIMIT`
+    // is the lifetime limit's number rather than a multiple of the per-tick
+    // budget that would read the same either way (REVIEW-77-r2 carry-in (c)).
     const MULTI_TICK_LIMIT = 600;
     const MULTI_TICK_FILES = 900;
+    const limitLandsMidTick =
+      MULTI_TICK_LIMIT % AUTOMATIC_DISCOVERY_ENTRY_CAP !== 0 &&
+      MULTI_TICK_LIMIT % AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP !== 0;
     /** Cadence after cadence on one tailer until the sweep hits its limit. */
     const sweepToItsLimit = async <T extends { limitReached: boolean }>(
       tick: () => Promise<T>,
@@ -2555,6 +2588,7 @@ async function main() {
     multiCodexTailer.close();
     const codexMultiRow = codexScanRow(multiCodexBuffer, codexMultiLimit.scan as never);
     check("rollout_sweep_that_reaches_its_limit_across_cadences_never_reports_a_complete_sweep",
+      limitLandsMidTick &&
       codexMultiLimit.cadences > 1 &&
       codexMultiLimit.scan.limitReached === true &&
       codexMultiLimit.scan.sweepComplete === false &&
@@ -2696,6 +2730,7 @@ async function main() {
     multiClaudeTailer.close();
     const claudeMultiRow = claudeScanRow(multiClaudeBuffer, claudeMultiLimit.scan as never);
     check("transcript_sweep_that_reaches_its_limit_across_cadences_never_reports_a_complete_sweep",
+      limitLandsMidTick &&
       claudeMultiLimit.cadences > 1 &&
       claudeMultiLimit.scan.limitReached === true &&
       claudeMultiLimit.scan.sweepComplete === false &&
@@ -2730,9 +2765,11 @@ async function main() {
     // entries, so drive a real cursor until it runs out of entries and move its
     // two numbers to the cap: the receipt function must still refuse to call
     // that sweep complete.
+    const EXHAUST_LIMIT = 8;
     const exhaustedCursor = new IncrementalJsonlDiscovery(
       [multiClaudeRoots[0]!.directory],
-      { recursive: true, matches: (name) => name.endsWith(".jsonl"), maxEntries: 8 },
+      { recursive: true, matches: (name) => name.endsWith(".jsonl"),
+        maxEntries: EXHAUST_LIMIT },
     );
     for (let step = 0; step < 64 && !exhaustedCursor.progress().limitReached &&
       !exhaustedCursor.progress().finished; step += 1) {
@@ -2758,6 +2795,14 @@ async function main() {
     check("a_sweep_that_exhausts_the_default_lifetime_cap_never_reports_a_complete_sweep",
       AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP === 100_000 &&
       exhausted.limitReached === true && exhausted.finished === true &&
+      // The receipt below inherits `limitReached: true` from this cursor, so
+      // the cursor's own boundary is what has to be pinned: reaching the limit
+      // is `visited >= maxEntries`, declared at exactly the cap and never one
+      // entry past it. Without this a cursor that only noticed the cap after
+      // overshooting — or never — would be invisible to the check
+      // (REVIEW-77-r2 carry-in (c)).
+      exhausted.entriesVisited === EXHAUST_LIMIT &&
+      exhausted.entriesVisited === exhausted.lifetimeEntryLimit &&
       atTheDefaultCap.lifetimeEntryLimit === 100_000 &&
       cappedReceipt.limitReached === true &&
       cappedReceipt.sweepComplete === false &&
@@ -2828,7 +2873,8 @@ async function main() {
     const transcriptRestartedRow = claudeScanRow(twinRestartBuffer, transcriptRestarted as never);
     check("a_transcript_cadence_that_restarts_its_sweep_reports_the_sweep_it_ran",
       transcriptRestarted.rootsStarted === 1 && transcriptRestarted.entriesThisSweep > 0 &&
-      transcriptRestarted.converging === false && transcriptRestarted.sweepComplete === true &&
+      // Re-pinned with its rollout twin by bead eco-6hoxj.78 (finding 3).
+      transcriptRestarted.converging === true && transcriptRestarted.sweepComplete === true &&
       transcriptRestarted.limitReached === false &&
       transcriptRestarted.lifetimeEntryLimit === 100_000 &&
       transcriptRestarted.rootsTotal === 1 && transcriptRestarted.rootsEligible === 1 &&
@@ -2859,7 +2905,189 @@ async function main() {
       { drained: transcriptDrained, drainedNext: transcriptDrainedNext,
         drainedThird: transcriptDrainedThird, restarted: transcriptRestarted,
         restartedNext: transcriptRestartedNext, restartedThird: transcriptRestartedThird });
+
+    // Bead eco-6hoxj.78, REVIEW-73-r3 finding 3: on a same-cadence restart the
+    // three published fields must say the same thing. The cadence retires a
+    // finished cursor and installs a successor on the same attempt, so
+    // `sweepComplete` is true and the reason reads "still sweeping" because a
+    // cursor resumes next cadence — while `converging` read false, which by
+    // the README definition ("a cursor exists and will resume on the next
+    // cadence") claims the opposite of both.
+    /**
+     * The three fields agree when the completion flag, the convergence flag
+     * and the operator reason tell one story about the next cadence: this
+     * cursor finished, a successor resumes, so the scan is still sweeping.
+     */
+    const restartReceiptAgrees = (
+      scan: CaptureScanProgress,
+      row: { reason: string; activityState: { scanState: string } },
+    ) =>
+      scan.sweepComplete === true &&
+      scan.limitReached === false &&
+      scan.converging === true &&
+      row.activityState.scanState === "in_progress" &&
+      row.reason.includes("activity scan still sweeping");
+    const restartedRow = codexScanRow(codexBuffer, restarted as never);
+    check("a_rollout_same_cadence_restart_agrees_on_converging_sweep_complete_and_reason",
+      restartReceiptAgrees(restarted, restartedRow) === true &&
+      // The must-red row: the field as r3 published it. A cursor does resume,
+      // so "still sweeping" and `converging: false` cannot both be true.
+      restartReceiptAgrees({ ...restarted, converging: false }, restartedRow) === false &&
+      // The successor is real, not a flag flip: the next cadence resumes with
+      // a live cursor of its own, exactly what `converging` promised.
+      restartedNext.converging === true && restartedNext.entriesThisSweep > 0 &&
+      // And the contrast that keeps the flag meaningful: a drained cadence
+      // leaves no cursor behind, so it is not converging.
+      drained.sweepComplete === true && drained.converging === false,
+      { restarted, restartedNext, drained, reason: restartedRow.reason,
+        scanState: restartedRow.activityState.scanState });
+    check("a_transcript_same_cadence_restart_agrees_on_converging_sweep_complete_and_reason",
+      restartReceiptAgrees(transcriptRestarted, transcriptRestartedRow) === true &&
+      restartReceiptAgrees(
+        { ...transcriptRestarted, converging: false }, transcriptRestartedRow) === false &&
+      transcriptRestartedNext.converging === true &&
+      transcriptRestartedNext.entriesThisSweep > 0 &&
+      transcriptDrained.sweepComplete === true && transcriptDrained.converging === false,
+      { restarted: transcriptRestarted, restartedNext: transcriptRestartedNext,
+        drained: transcriptDrained, reason: transcriptRestartedRow.reason,
+        scanState: transcriptRestartedRow.activityState.scanState });
     twinRestartBuffer.close();
+    // The same branch driven through the real renderer, not a literal: a
+    // cadence that published activity with no scan receipt at all. Nothing
+    // upstream of this check produced that reason, so the detector's third
+    // arm had no live shape behind it (REVIEW-77-r2 carry-in (c)).
+    const receiptlessBuffer = claudeFixture("claude-receiptless");
+    receiptlessBuffer.projection.recordCaptureActivity({
+      source: "claude_code",
+      lastActivityAt: null,
+      filesToday: 0,
+      discoveryEntries: 0,
+      lastScanAt: new Date(NOW.getTime() - 30_000).toISOString(),
+      truncated: true,
+    });
+    settle(receiptlessBuffer, NOW, 30);
+    const receiptlessRow = (readySnapshot(receiptlessBuffer, 30).status.health as {
+      sources: Array<{ source: string; status: string; reason: string;
+        activityState: { scanState: string; scan: Record<string, unknown> | null } }>;
+    }).sources.find((row) => row.source === "claude_code")!;
+    check("a_cadence_with_no_scan_receipt_renders_the_receiptless_zero_tick_reason",
+      receiptlessRow.status === "amber" &&
+      receiptlessRow.activityState.scan === null &&
+      receiptlessRow.activityState.scanState === "in_progress" &&
+      receiptlessRow.reason.includes("activity scan still sweeping") &&
+      receiptlessRow.reason.includes("no scan budget receipt; 0 entr(ies) this tick") &&
+      !receiptlessRow.reason.includes("entr(ies) this sweep") &&
+      rendersTheR1ZeroSweep(receiptlessRow.reason) === true,
+      { status: receiptlessRow.status, reason: receiptlessRow.reason });
+    receiptlessBuffer.close();
+
+    // Bead eco-6hoxj.78, REVIEW-73-r3 finding 5: `entriesThisTick` is a count
+    // of directory entries, the same unit as `entriesThisSweep` beside it. The
+    // capture path published `discovery.files.length` into it — the pending
+    // *candidate* list — so a host printed "256 entr(ies) this sweep, 2 this
+    // tick" for a cadence that visited 256 entries and matched 2 files. Both
+    // fixtures below hold four times as many entries as matching files, so the
+    // two units can never be confused for one another.
+    const UNIT_ENTRIES = 80;
+    const UNIT_FILES = 20;
+    /**
+     * Must-green: the receipt reports entries visited. Must-red: the same
+     * receipt with the unit swapped back to the file count fails it.
+     */
+    const reportsEntriesNotFiles = (
+      scan: CaptureScanProgress,
+      expect: { entries: number; files: number },
+    ) =>
+      scan.entriesThisTick === expect.entries &&
+      scan.entriesThisSweep === expect.entries &&
+      scan.entriesThisTick !== expect.files;
+
+    const unitClaudeDir = path.join(claudeRoot, "unit", "root-00");
+    fs.mkdirSync(unitClaudeDir, { recursive: true });
+    for (let file = 0; file < UNIT_FILES; file += 1) {
+      fs.writeFileSync(path.join(unitClaudeDir, `session-${file}.jsonl`), "{}\n");
+    }
+    for (let other = 0; other < UNIT_ENTRIES - UNIT_FILES; other += 1) {
+      fs.writeFileSync(path.join(unitClaudeDir, `notes-${other}.md`), "not a transcript\n");
+    }
+    const unitClaudeRoots = [{ rootId: "unit-root-0", profileId: "unit-profile-0",
+      installationEpochId: "epoch-claude", source: "claude_code" as const,
+      directory: unitClaudeDir }];
+    const unitClaudeBuffer = claudeFixture("claude-unit");
+    const unitClaudeTailer = new TranscriptTailer(
+      unitClaudeBuffer, unitClaudeDir, undefined, unitClaudeRoots);
+    const unitClaudeResult = await unitClaudeTailer.scan({
+      scope: "recent", now: NOW,
+      automatic: { phase: "capture", budget: new CaptureWorkBudget() },
+    });
+    unitClaudeTailer.close();
+    const unitClaude = unitClaudeResult.activity.scan!;
+    const unitClaudeRow = claudeScanRow(unitClaudeBuffer, unitClaude as never);
+    const swappedClaude: CaptureScanProgress = { ...unitClaude,
+      entriesThisTick: unitClaudeResult.filesSeen, entriesThisSweep: unitClaudeResult.filesSeen };
+    const swappedClaudeRow = claudeScanRow(unitClaudeBuffer, swappedClaude as never);
+    check("transcript_entries_this_tick_counts_entries_visited_not_files_found",
+      unitClaudeResult.filesSeen === UNIT_FILES &&
+      reportsEntriesNotFiles(unitClaude, { entries: UNIT_ENTRIES, files: UNIT_FILES }) === true &&
+      // The negative control: swap the unit back to the file count and the
+      // same assertion must go red.
+      reportsEntriesNotFiles(swappedClaude, { entries: UNIT_ENTRIES, files: UNIT_FILES }) === false &&
+      // The rendered reason carries the same unit through to the operator.
+      unitClaudeRow.reason.includes(
+        `${UNIT_ENTRIES} entr(ies) this sweep, ${UNIT_ENTRIES} this tick`) &&
+      !unitClaudeRow.reason.includes(`${UNIT_FILES} entr(ies) this sweep`) &&
+      swappedClaudeRow.reason.includes(`${UNIT_FILES} entr(ies) this sweep`),
+      { scan: unitClaude, filesSeen: unitClaudeResult.filesSeen,
+        reason: unitClaudeRow.reason, swappedReason: swappedClaudeRow.reason });
+    unitClaudeBuffer.close();
+
+    // The twin on the other tailer: `RolloutTailer` matches `rollout-*.jsonl`
+    // inside a day partition, so everything else in that partition is an entry
+    // it visits and never counts as a file.
+    const unitCodexDir = path.join(codexRoot, "unit", "root-00");
+    for (const offset of [0, 1]) {
+      const day = new Date(NOW.getTime() - offset * DAY_MS);
+      const partition = path.join(unitCodexDir, ...day.toISOString().slice(0, 10).split("-"));
+      fs.mkdirSync(partition, { recursive: true });
+      for (let file = 0; file < UNIT_FILES / 2; file += 1) {
+        fs.writeFileSync(path.join(partition, `rollout-${file}.jsonl`), "{}\n");
+      }
+      for (let other = 0; other < (UNIT_ENTRIES - UNIT_FILES) / 2; other += 1) {
+        fs.writeFileSync(path.join(partition, `notes-${other}.md`), "not a rollout\n");
+      }
+    }
+    const unitCodexRoots = [{ rootId: "unit-codex-root-0", profileId: "unit-codex-profile-0",
+      installationEpochId: "epoch-codex", source: "codex" as const, directory: unitCodexDir }];
+    const unitCodexBuffer = new LocalEventBuffer(path.join(root, "capture-health-codex-unit.sqlite"));
+    unitCodexBuffer.append(event({
+      source: "codex", eventType: "usage_rollout", sessionId: uuid(930_006),
+      observedAt: new Date(NOW.getTime() - 3 * 60 * 60_000).toISOString(),
+      inputTokens: 1_200, outputTokens: 340, costUsd: 0.004,
+    }));
+    settle(unitCodexBuffer, NOW, 30);
+    const unitCodexTailer = new RolloutTailer(
+      unitCodexBuffer, unitCodexDir, () => [], undefined, unitCodexRoots);
+    const unitCodexResult = await unitCodexTailer.scan({
+      scope: "recent", now: NOW,
+      automatic: { phase: "capture", budget: new CaptureWorkBudget() },
+    });
+    unitCodexTailer.close();
+    const unitCodex = unitCodexResult.activity.scan!;
+    const unitCodexRow = codexScanRow(unitCodexBuffer, unitCodex as never);
+    const swappedCodex: CaptureScanProgress = { ...unitCodex,
+      entriesThisTick: unitCodexResult.filesSeen, entriesThisSweep: unitCodexResult.filesSeen };
+    const swappedCodexRow = codexScanRow(unitCodexBuffer, swappedCodex as never);
+    check("rollout_entries_this_tick_counts_entries_visited_not_files_found",
+      unitCodexResult.filesSeen === UNIT_FILES &&
+      reportsEntriesNotFiles(unitCodex, { entries: UNIT_ENTRIES, files: UNIT_FILES }) === true &&
+      reportsEntriesNotFiles(swappedCodex, { entries: UNIT_ENTRIES, files: UNIT_FILES }) === false &&
+      unitCodexRow.reason.includes(
+        `${UNIT_ENTRIES} entr(ies) this sweep, ${UNIT_ENTRIES} this tick`) &&
+      !unitCodexRow.reason.includes(`${UNIT_FILES} entr(ies) this sweep`) &&
+      swappedCodexRow.reason.includes(`${UNIT_FILES} entr(ies) this sweep`),
+      { scan: unitCodex, filesSeen: unitCodexResult.filesSeen,
+        reason: unitCodexRow.reason, swappedReason: swappedCodexRow.reason });
+    unitCodexBuffer.close();
 
     codexBuffer.close();
 

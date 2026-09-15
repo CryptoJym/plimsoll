@@ -33,7 +33,14 @@ export const AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP = 100_000;
  * an amber reason is actionable instead of a permanent "directional" label.
  */
 export type CaptureScanProgress = {
-  /** A live cursor will resume on the next cadence: not finished, not restarting. */
+  /**
+   * A cursor exists and will resume on the next cadence: not finished, not
+   * restarting. A cadence that retired its finished cursor and installed a
+   * successor on the same attempt is still converging — that successor is the
+   * cursor that resumes — so `converging: true` and `sweepComplete: true` are
+   * a coherent pair on a same-cadence restart, not a contradiction
+   * (bead eco-6hoxj.78, REVIEW-73-r3 finding 3).
+   */
   converging: boolean;
   /**
    * This cadence's cursor finished a full sweep of every eligible root —
@@ -52,7 +59,13 @@ export type CaptureScanProgress = {
   /** Of those, the roots this sweep may enumerate: the rest are not `ready`. */
   rootsEligible: number;
   rootsStarted: number;
-  /** Directory entries visited since this sweep began, and in this cadence. */
+  /**
+   * Directory entries visited since this sweep began, and in this cadence.
+   * Both are entries — `readdir` results stepped over — never the files those
+   * entries matched: a cadence that visits 256 entries and matches 2 files
+   * reports 256 and 256, not 256 and 2 (bead eco-6hoxj.78, REVIEW-73-r3
+   * finding 5). `pendingFiles` below is the field that counts files.
+   */
   entriesThisSweep: number;
   entriesThisTick: number;
   /** Candidates discovered and still awaiting metadata or read admission. */
@@ -84,6 +97,13 @@ export function captureScanProgress(input: {
    */
   cursorRetired?: boolean;
   /**
+   * The cadence retired its cursor and installed a fresh successor on the same
+   * attempt. The successor enumerated nothing yet, so the receipt still
+   * reports the retired cursor's sweep — but a cursor does exist and it does
+   * resume on the next cadence, which is what `converging` publishes.
+   */
+  successorInstalled?: boolean;
+  /**
    * Cursor roots per capture root. `RolloutTailer` sweeps day partitions, so
    * its cursor holds several roots per capture root; every root number this
    * receipt publishes is converted back to capture roots so the numerator,
@@ -97,8 +117,12 @@ export function captureScanProgress(input: {
   return {
     // A cursor that has neither finished nor hit its lifetime limit resumes on
     // the next cadence — including a cadence deferred before filesystem work,
-    // which keeps the cursor untouched.
-    converging: !retired && discovery !== null && !discovery.limitReached && !discovery.finished,
+    // which keeps the cursor untouched. A same-cadence restart also resumes:
+    // it retired the cursor that did the work and left a fresh successor
+    // behind, so the sweep is still converging even though this cadence's
+    // receipt reports a completed sweep.
+    converging: input.successorInstalled === true ||
+      (!retired && discovery !== null && !discovery.limitReached && !discovery.finished),
     // Only a cursor can report a finished sweep: no cursor is no receipt,
     // which is exactly the state of every cadence of the baseline phase. A
     // cursor closed short of its roots reports `finished` too, so a sweep that

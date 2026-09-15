@@ -416,9 +416,15 @@ export class TranscriptTailer {
    * Bead eco-6hoxj.73: every return path publishes the enumeration progress
    * behind `activity.truncated`, so capture health can report an unfinished
    * sweep as a named diagnostic instead of a permanent, unexplained amber.
+   *
+   * Standing rule for this receipt: every fix to one tailer's scan ships its
+   * twin fix and twin proof check on the other tailer (`RolloutTailer.scan`) —
+   * the r1/r2/r3 lesson of eco-6hoxj.73, stated in full in
+   * `scripts/dashboard-projection-proof.ts`.
    */
   async scan(options: TranscriptScanOptions): Promise<TranscriptScanResult> {
     this.retiredProgress = null;
+    this.successorInstalled = false;
     const result = await this.runScan(options);
     // The baseline sweep is a live cursor too. Reading only `captureAttempt`
     // published zeros and a false `sweepComplete` for every cadence of the
@@ -432,6 +438,7 @@ export class TranscriptTailer {
     result.activity.scan = captureScanProgress({
       discovery: retired ?? attempt?.discovery.progress() ?? null,
       cursorRetired: retired !== null,
+      successorInstalled: this.successorInstalled,
       configuredRoots: this.configuredRootCount,
       eligibleRoots: this.directories.length,
       pendingFiles: attempt?.pendingFiles.length ?? 0,
@@ -453,6 +460,24 @@ export class TranscriptTailer {
   private retire(discovery: IncrementalJsonlDiscovery) {
     this.retiredProgress = discovery.progress();
     discovery.close();
+  }
+
+  /**
+   * This cadence retired its cursor and left a successor on the same attempt.
+   * The receipt still reports the retired cursor's sweep, but the successor is
+   * a live cursor that resumes on the next cadence, so the cadence is still
+   * converging (bead eco-6hoxj.78, REVIEW-73-r3 finding 3).
+   */
+  private successorInstalled = false;
+
+  /** Retire the cursor this cadence finished with and install its successor. */
+  private restart(
+    attempt: { discovery: IncrementalJsonlDiscovery },
+    successor: IncrementalJsonlDiscovery,
+  ) {
+    this.retire(attempt.discovery);
+    attempt.discovery = successor;
+    this.successorInstalled = true;
   }
 
   /** Roots `plimsoll status` reports for this source, ready or not. */
@@ -703,8 +728,7 @@ export class TranscriptTailer {
       }
 
       if (attempt.capacityDeferredThisSweep) {
-        this.retire(attempt.discovery);
-        attempt.discovery = this.recentDiscovery(options.discoveryLimit, options);
+        this.restart(attempt, this.recentDiscovery(options.discoveryLimit, options));
         attempt.capacityDeferredThisSweep = false;
         attempt.newGenerationsThisSweep = 0;
         result.activity.truncated = true;
@@ -715,8 +739,7 @@ export class TranscriptTailer {
 
       attempt.sweepsCompleted += 1;
       if (attempt.sweepsCompleted < 2 || attempt.newGenerationsThisSweep > 0) {
-        this.retire(attempt.discovery);
-        attempt.discovery = this.recentDiscovery(options.discoveryLimit, options);
+        this.restart(attempt, this.recentDiscovery(options.discoveryLimit, options));
         attempt.newGenerationsThisSweep = 0;
         result.activity.truncated = true;
         result.deferredGenerations = 1;
@@ -747,7 +770,13 @@ export class TranscriptTailer {
     result.activity.truncated = discovery.truncated;
     result.discoveryErrors = discovery.errors + rootErrors;
     result.filesSeen = discovery.files.length;
-    result.activity.discoveryEntries = discovery.files.length;
+    // Directory entries visited this cadence, never the files they matched:
+    // this number is published as `entriesThisTick` beside `entriesThisSweep`,
+    // which counts entries too. `discovery.files` on the automatic path is the
+    // whole pending-candidate list, so a cadence that ran no discovery at all
+    // used to report the carried-over candidates as entries it had visited
+    // (bead eco-6hoxj.78, REVIEW-73-r3 finding 5).
+    result.activity.discoveryEntries = discovery.discoveryEntries;
     const candidates: Array<{
       file: string;
       stat: fs.Stats;
@@ -1240,6 +1269,8 @@ export class TranscriptTailer {
     files: string[];
     truncated: boolean;
     errors: number;
+    /** Directory entries stepped over, in the unit `entriesThisTick` publishes. */
+    discoveryEntries: number;
   } {
     const files: string[] = [];
     const stack = [...this.directories];
@@ -1270,7 +1301,7 @@ export class TranscriptTailer {
       }
       if (truncated) break;
     }
-    return { files: files.sort(), truncated, errors };
+    return { files: files.sort(), truncated, errors, discoveryEntries: seen };
   }
 
   private initialParserState(file: string): TranscriptParserState {

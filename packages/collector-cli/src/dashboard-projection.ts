@@ -129,6 +129,12 @@ function describeScanRoots(scan:CaptureScanProgress){
  * Why an incomplete activity scan is incomplete, in terms an operator can act
  * on: the exact roots and entries enumerated against the exact budget that
  * ended the cadence (bead eco-6hoxj.73).
+ *
+ * Every `entr(ies)` this prints — this sweep, this tick, and the receipt-less
+ * `discoveryEntries` fallback — is a count of directory entries stepped over,
+ * matching `CaptureScanProgress.entriesThisSweep`/`entriesThisTick`. Candidate
+ * *files* are printed only by the `candidate(s) pending` clause, so the two
+ * units never share a word (bead eco-6hoxj.78, REVIEW-73-r3 finding 5).
  */
 function describeCaptureScan(local:Record<string,unknown>|undefined):
   {state:CaptureScanState;summary:string;scan:CaptureScanProgress|null}{

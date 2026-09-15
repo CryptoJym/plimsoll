@@ -454,9 +454,15 @@ export class RolloutTailer {
    * Bead eco-6hoxj.73: every return path publishes the enumeration progress
    * behind `activity.truncated`, so capture health can report an unfinished
    * sweep as a named diagnostic instead of a permanent, unexplained amber.
+   *
+   * Standing rule for this receipt: every fix to one tailer's scan ships its
+   * twin fix and twin proof check on the other tailer
+   * (`TranscriptTailer.scan`) — the r1/r2/r3 lesson of eco-6hoxj.73, stated in
+   * full in `scripts/dashboard-projection-proof.ts`.
    */
   async scan(options: RolloutScanOptions): Promise<RolloutScanResult> {
     this.retiredProgress = null;
+    this.successorInstalled = false;
     const result = await this.runScan(options);
     // The baseline sweep is a live cursor too. Reading only `captureAttempt`
     // published zeros and a false `sweepComplete` for every cadence of the
@@ -470,6 +476,7 @@ export class RolloutTailer {
     result.activity.scan = captureScanProgress({
       discovery: retired ?? attempt?.discovery.progress() ?? null,
       cursorRetired: retired !== null,
+      successorInstalled: this.successorInstalled,
       configuredRoots: this.configuredRootCount,
       eligibleRoots: this.directories.length,
       // This tailer's cursor enumerates one day partition per root per day
@@ -494,6 +501,24 @@ export class RolloutTailer {
   private retire(discovery: IncrementalJsonlDiscovery) {
     this.retiredProgress = discovery.progress();
     discovery.close();
+  }
+
+  /**
+   * This cadence retired its cursor and left a successor on the same attempt.
+   * The receipt still reports the retired cursor's sweep, but the successor is
+   * a live cursor that resumes on the next cadence, so the cadence is still
+   * converging (bead eco-6hoxj.78, REVIEW-73-r3 finding 3).
+   */
+  private successorInstalled = false;
+
+  /** Retire the cursor this cadence finished with and install its successor. */
+  private restart(
+    attempt: { discovery: IncrementalJsonlDiscovery },
+    successor: IncrementalJsonlDiscovery,
+  ) {
+    this.retire(attempt.discovery);
+    attempt.discovery = successor;
+    this.successorInstalled = true;
   }
 
   /** Roots `plimsoll status` reports for this source, ready or not. */
@@ -749,8 +774,7 @@ export class RolloutTailer {
       }
 
       if (attempt.capacityDeferredThisSweep) {
-        this.retire(attempt.discovery);
-        attempt.discovery = this.recentDiscovery(scanNow, options.discoveryLimit, options);
+        this.restart(attempt, this.recentDiscovery(scanNow, options.discoveryLimit, options));
         attempt.capacityDeferredThisSweep = false;
         attempt.newGenerationsThisSweep = 0;
         result.activity.truncated = true;
@@ -761,8 +785,7 @@ export class RolloutTailer {
 
       attempt.sweepsCompleted += 1;
       if (attempt.sweepsCompleted < 2 || attempt.newGenerationsThisSweep > 0) {
-        this.retire(attempt.discovery);
-        attempt.discovery = this.recentDiscovery(scanNow, options.discoveryLimit, options);
+        this.restart(attempt, this.recentDiscovery(scanNow, options.discoveryLimit, options));
         attempt.newGenerationsThisSweep = 0;
         result.activity.truncated = true;
         result.deferredGenerations = 1;
@@ -794,7 +817,13 @@ export class RolloutTailer {
     result.activity.truncated = discovery.truncated;
     result.discoveryErrors = discovery.errors + rootErrors;
     result.filesSeen = discovery.files.length;
-    result.activity.discoveryEntries = discovery.files.length;
+    // Directory entries visited this cadence, never the files they matched:
+    // this number is published as `entriesThisTick` beside `entriesThisSweep`,
+    // which counts entries too. `discovery.files` on the automatic path is the
+    // whole pending-candidate list, so a cadence that ran no discovery at all
+    // used to report the carried-over candidates as entries it had visited
+    // (bead eco-6hoxj.78, REVIEW-73-r3 finding 5).
+    result.activity.discoveryEntries = discovery.discoveryEntries;
     const candidates: Array<{
       file: string;
       stat: fs.Stats;
@@ -1291,6 +1320,8 @@ export class RolloutTailer {
     files: string[];
     truncated: boolean;
     errors: number;
+    /** Directory entries stepped over, in the unit `entriesThisTick` publishes. */
+    discoveryEntries: number;
   } {
     const now = options.now ?? new Date();
     const files: string[] = [];
@@ -1298,6 +1329,7 @@ export class RolloutTailer {
     const limit = Math.max(1, options.discoveryLimit ?? Number.MAX_SAFE_INTEGER);
     let truncated = false;
     let errors = 0;
+    let entriesVisited = 0;
     const listDirs = (dir: string, root = false) => {
       try {
         return this.io
@@ -1344,6 +1376,7 @@ export class RolloutTailer {
         continue;
       }
       for (const entry of entries) {
+        entriesVisited += 1;
         if (entry.startsWith("rollout-") && entry.endsWith(".jsonl")) {
           if (files.length >= limit) {
             truncated = true;
@@ -1354,7 +1387,7 @@ export class RolloutTailer {
       }
       if (truncated) break;
     }
-    return { files: files.sort(), truncated, errors };
+    return { files: files.sort(), truncated, errors, discoveryEntries: entriesVisited };
   }
 
   private sessionHasNonRolloutTokens(sessionId: string) {
