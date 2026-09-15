@@ -34,7 +34,8 @@ import {
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
-import { aiInteractionEventSchema } from "../packages/shared/src/index";
+import { appendForwardedHook } from "../packages/collector-cli/src/forwarder";
+import { ANALYTICAL_METADATA_LIMITS, aiInteractionEventSchema } from "../packages/shared/src/index";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const NOW = new Date("2026-07-15T12:00:00.000Z");
@@ -1722,6 +1723,181 @@ async function main() {
       skewedDeadClaude.lastEventAgeMs === FUTURE_MS,
       { status: skewedDeadClaude.status, reason: skewedDeadClaude.reason,
         lastEventAgeMs: skewedDeadClaude.lastEventAgeMs });
+
+    // Bead eco-6hoxj.73.3: the two checks above are the last line of defence —
+    // they prove the LABEL stays honest once a future stamp is already in the
+    // ledger. These prove the stamp never gets there. The OTLP path has held the
+    // shared `maxFutureTimestampSkewMs` bound for a long time; the hook intake
+    // and the transcript/rollout record timestamps reached `observedAt` without
+    // it, and `last_event_at` is a monotone max, so one stamp from the future
+    // held the freshness credit forward for the whole skew interval on a source
+    // that may be dead — with no later event able to correct it on a hook-only
+    // source. Both intakes now clamp to the receive clock and say so.
+    const SKEW_MS = ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs;
+    const INTAKE_FUTURE_AT = new Date(NOW.getTime() + 25 * 60 * 60_000).toISOString();
+    const INTAKE_NEAR_AT = new Date(NOW.getTime() + 2 * 60_000).toISOString();
+    const lifetimeEventAt = (fixture: LocalEventBuffer, source: string) =>
+      (fixture.database.prepare(
+        `select last_event_at as at from dashboard_source_lifetime where source=?`,
+      ).get(source) as { at: string | null } | undefined)?.at ?? null;
+    const healthRow = (fixture: LocalEventBuffer, source: string) =>
+      (readySnapshot(fixture, 30).status.health as {
+        sources: Array<{ source: string; status: string; reason: string;
+          lastEventAgeMs: number | null }>;
+      }).sources.find((row) => row.source === source)!;
+
+    // `admitHookBody` (server.ts) parses, bounds and authenticates, then hands
+    // the body to exactly this callable; nothing between the socket and here
+    // touches a timestamp, so this IS the hook intake path for `observedAt`.
+    const hookConfig = collectorConfigSchema.parse({});
+    const hookFixture = new LocalEventBuffer(path.join(root, "intake-clamp-hook.sqlite"));
+    const postHook = (observedAt: string, session: number) => appendForwardedHook({
+      hook_event_name: "Stop",
+      session_id: uuid(session),
+      observedAt,
+      input_tokens: 1_200,
+      output_tokens: 340,
+    }, { config: hookConfig, buffer: hookFixture, source: "grok" });
+    postHook(new Date(NOW.getTime() - 10 * 60_000).toISOString(), 941_001);
+    settle(hookFixture, NOW, 30);
+    const hookBefore = lifetimeEventAt(hookFixture, "grok");
+    const hookBeforeRow = healthRow(hookFixture, "grok");
+    const clampedHook = postHook(INTAKE_FUTURE_AT, 941_002);
+    settle(hookFixture, NOW, 30);
+    const hookAfter = lifetimeEventAt(hookFixture, "grok");
+    const hookAfterRow = healthRow(hookFixture, "grok");
+    check("a_future_dated_hook_observed_at_is_clamped_at_intake_and_cannot_advance_last_event_at",
+      // The event is kept — the tokens are real — but stamped with the receive
+      // clock, flagged, and unable to move the lifetime watermark past it.
+      clampedHook.event.observedAt === NOW.toISOString() &&
+      clampedHook.event.metadata.observedAtFutureClamped === true &&
+      hookAfter !== INTAKE_FUTURE_AT &&
+      hookAfter !== null && Date.parse(hookAfter) <= NOW.getTime() + SKEW_MS &&
+      Date.parse(hookAfter) >= Date.parse(hookBefore!) &&
+      // ...and the label it would otherwise have bought is not on offer.
+      hookAfterRow.lastEventAgeMs !== null && hookAfterRow.lastEventAgeMs >= 0 &&
+      !hookAfterRow.reason.includes("in the future"),
+      { before: hookBefore, after: hookAfter, future: INTAKE_FUTURE_AT,
+        observedAt: clampedHook.event.observedAt,
+        clampedFlag: clampedHook.event.metadata.observedAtFutureClamped,
+        beforeStatus: hookBeforeRow.status, afterStatus: hookAfterRow.status,
+        afterReason: hookAfterRow.reason, afterAgeMs: hookAfterRow.lastEventAgeMs });
+
+    // The negative control on the same intake: a stamp inside the bound is a
+    // clock-skewed producer, not a poisoned one, and must still advance.
+    const nearHook = postHook(INTAKE_NEAR_AT, 941_003);
+    settle(hookFixture, NOW, 30);
+    check("a_hook_observed_at_inside_the_skew_bound_is_untouched_and_still_advances_last_event_at",
+      nearHook.event.observedAt === INTAKE_NEAR_AT &&
+      nearHook.event.metadata.observedAtFutureClamped === undefined &&
+      lifetimeEventAt(hookFixture, "grok") === INTAKE_NEAR_AT,
+      { observedAt: nearHook.event.observedAt, lifetime: lifetimeEventAt(hookFixture, "grok"),
+        near: INTAKE_NEAR_AT });
+    hookFixture.close();
+
+    // The other unguarded intake: a transcript/rollout RECORD timestamp, which
+    // no producer token and no OTLP validator ever sees.
+    const intakeTranscriptRoot = path.join(root, "intake-clamp-transcript");
+    const writeIntakeTranscript = (session: string, at: string, tokens: number) => {
+      const directory = path.join(intakeTranscriptRoot, "intake-project");
+      fs.mkdirSync(directory, { recursive: true });
+      fs.writeFileSync(path.join(directory, `${session}.jsonl`), `${JSON.stringify({
+        type: "assistant",
+        timestamp: at,
+        message: { id: `msg-${session}`, model: "claude-opus-5",
+          usage: { input_tokens: tokens, output_tokens: 0 } },
+      })}\n`);
+    };
+    const tailerFixture = new LocalEventBuffer(path.join(root, "intake-clamp-tailer.sqlite"));
+    const scanIntakeTranscripts = async () => {
+      const tailer = new TranscriptTailer(tailerFixture, intakeTranscriptRoot);
+      try { return await tailer.scan({ scope: "full" }); } finally { tailer.close(); }
+    };
+    writeIntakeTranscript(uuid(942_001), new Date(NOW.getTime() - 10 * 60_000).toISOString(), 100);
+    await scanIntakeTranscripts();
+    settle(tailerFixture, NOW, 30);
+    const tailerBefore = lifetimeEventAt(tailerFixture, "claude_code");
+    writeIntakeTranscript(uuid(942_002), INTAKE_FUTURE_AT, 150);
+    const clampedScan = await scanIntakeTranscripts();
+    settle(tailerFixture, NOW, 30);
+    const tailerAfter = lifetimeEventAt(tailerFixture, "claude_code");
+    const tailerAfterRow = healthRow(tailerFixture, "claude_code");
+    check("a_future_dated_transcript_record_is_clamped_at_intake_and_cannot_advance_last_event_at",
+      clampedScan.futureTimestampClampedEvents === 1 &&
+      clampedScan.eventsAppended === 1 &&
+      tailerAfter !== INTAKE_FUTURE_AT &&
+      tailerAfter !== null && Date.parse(tailerAfter) <= NOW.getTime() + SKEW_MS &&
+      Date.parse(tailerAfter) >= Date.parse(tailerBefore!) &&
+      tailerAfterRow.lastEventAgeMs !== null && tailerAfterRow.lastEventAgeMs >= 0 &&
+      !tailerAfterRow.reason.includes("in the future"),
+      { before: tailerBefore, after: tailerAfter, future: INTAKE_FUTURE_AT,
+        clamped: clampedScan.futureTimestampClampedEvents,
+        appended: clampedScan.eventsAppended,
+        afterReason: tailerAfterRow.reason, afterAgeMs: tailerAfterRow.lastEventAgeMs });
+
+    writeIntakeTranscript(uuid(942_003), INTAKE_NEAR_AT, 200);
+    const nearScan = await scanIntakeTranscripts();
+    settle(tailerFixture, NOW, 30);
+    check("a_transcript_record_inside_the_skew_bound_is_untouched_and_still_advances_last_event_at",
+      nearScan.futureTimestampClampedEvents === undefined &&
+      nearScan.eventsAppended === 1 &&
+      lifetimeEventAt(tailerFixture, "claude_code") === INTAKE_NEAR_AT,
+      { lifetime: lifetimeEventAt(tailerFixture, "claude_code"), near: INTAKE_NEAR_AT,
+        clamped: nearScan.futureTimestampClampedEvents });
+
+    // The same record-timestamp intake on the other tailer. Rollout totals are
+    // cumulative, so the leading zero `token_count` anchors the baseline and the
+    // record under test is a validated marginal.
+    const intakeRolloutRoot = path.join(root, "intake-clamp-rollout");
+    const writeIntakeRollout = (session: string, at: string, tokens: number) => {
+      const directory = path.join(intakeRolloutRoot, "2026", "07", "15");
+      fs.mkdirSync(directory, { recursive: true });
+      const anchorAt = new Date(NOW.getTime() - 60 * 60_000).toISOString();
+      const tokenCount = (timestamp: string, total: number) => ({
+        type: "event_msg", timestamp,
+        payload: { type: "token_count", info: { total_token_usage: {
+          input_tokens: total, cached_input_tokens: 0, output_tokens: 0,
+          reasoning_output_tokens: 0 } } },
+      });
+      fs.writeFileSync(path.join(directory, `rollout-${session}.jsonl`), [
+        { type: "session_meta", timestamp: anchorAt, payload: { id: session } },
+        { type: "turn_context", payload: { model: "gpt-5.5" } },
+        tokenCount(anchorAt, 0),
+        tokenCount(at, tokens),
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n");
+    };
+    const scanIntakeRollouts = async () => {
+      const tailer = new RolloutTailer(tailerFixture, intakeRolloutRoot, () => []);
+      try { return await tailer.scan({ scope: "full" }); } finally { tailer.close(); }
+    };
+    writeIntakeRollout(uuid(943_001), new Date(NOW.getTime() - 10 * 60_000).toISOString(), 100);
+    await scanIntakeRollouts();
+    settle(tailerFixture, NOW, 30);
+    const rolloutBefore = lifetimeEventAt(tailerFixture, "codex");
+    writeIntakeRollout(uuid(943_002), INTAKE_FUTURE_AT, 150);
+    const clampedRolloutScan = await scanIntakeRollouts();
+    settle(tailerFixture, NOW, 30);
+    const rolloutAfter = lifetimeEventAt(tailerFixture, "codex");
+    check("a_future_dated_rollout_record_is_clamped_at_intake_and_cannot_advance_last_event_at",
+      clampedRolloutScan.futureTimestampClampedEvents === 1 &&
+      clampedRolloutScan.eventsAppended === 1 &&
+      rolloutAfter !== INTAKE_FUTURE_AT &&
+      rolloutAfter !== null && Date.parse(rolloutAfter) <= NOW.getTime() + SKEW_MS &&
+      Date.parse(rolloutAfter) >= Date.parse(rolloutBefore!),
+      { before: rolloutBefore, after: rolloutAfter, future: INTAKE_FUTURE_AT,
+        clamped: clampedRolloutScan.futureTimestampClampedEvents,
+        appended: clampedRolloutScan.eventsAppended });
+
+    writeIntakeRollout(uuid(943_003), INTAKE_NEAR_AT, 200);
+    const nearRolloutScan = await scanIntakeRollouts();
+    settle(tailerFixture, NOW, 30);
+    check("a_rollout_record_inside_the_skew_bound_is_untouched_and_still_advances_last_event_at",
+      nearRolloutScan.futureTimestampClampedEvents === undefined &&
+      nearRolloutScan.eventsAppended === 1 &&
+      lifetimeEventAt(tailerFixture, "codex") === INTAKE_NEAR_AT,
+      { lifetime: lifetimeEventAt(tailerFixture, "codex"), near: INTAKE_NEAR_AT,
+        clamped: nearRolloutScan.futureTimestampClampedEvents });
+    tailerFixture.close();
 
     // .80: session windows can trail the source lifetime clock by days. The
     // status reader must expose that gap rather than convert SUM(NULL) to a

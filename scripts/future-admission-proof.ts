@@ -13,6 +13,7 @@ import { collectorBufferPath } from "../packages/collector-cli/src/config";
 import { deliveryAcknowledgement, deliveryExpectation } from "../packages/collector-cli/src/delivery-ack";
 import { createProfileCapture } from "../packages/collector-cli/src/profile-capture";
 import { CaptureWorkBudget } from "../packages/collector-cli/src/capture-work-budget";
+import { DEFAULT_JSONL_TAILER_IO } from "../packages/collector-cli/src/jsonl-byte-tailer";
 
 const root = fs.mkdtempSync(path.join(fs.realpathSync(process.env.PLIMSOLL_PROOF_HOME ?? os.tmpdir()), "future-admission-proof-"));
 const A = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", B = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
@@ -112,8 +113,13 @@ async function providerProof(source: "codex" | "claude_code") {
   const b = new LocalEventBuffer(filename, { workspaceId: A, enrollmentNow: () => new Date(T0) } as any);
   const capture: CaptureRoot = { rootId: source, profileId: source, source, directory: base,
     installationEpochId: b.workspaceBinding()!.currentInstallationEpochId! };
-  const makeTailer = () => source === "codex" ? new RolloutTailer(b, undefined, () => [], undefined, [capture])
-    : new TranscriptTailer(b, undefined, undefined, [capture]);
+  // This fixture time-travels the ledger clock to 2030 (`enrollmentNow`), so the
+  // tailers read the same clock. Otherwise the intake future-timestamp clamp
+  // (bead eco-6hoxj.73.3) measures these 2030 stamps against the real wall clock
+  // and rewrites every one of them to the run time.
+  const io = { ...DEFAULT_JSONL_TAILER_IO, now: () => Date.parse(T0) };
+  const makeTailer = () => source === "codex" ? new RolloutTailer(b, undefined, () => [], io, [capture])
+    : new TranscriptTailer(b, undefined, io, [capture]);
   let tailer = makeTailer();
   function write(session: string, records: Array<{ at?: string; tokens: number }>) {
     const file = source === "codex" ? path.join(base, "2030", "04", "02", `rollout-${session}.jsonl`)

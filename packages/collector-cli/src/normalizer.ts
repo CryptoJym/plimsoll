@@ -141,11 +141,63 @@ function collectOtelSignals(value: unknown, signals: OTelSignals) {
  * predicate rather than a copy of it (review r4, F2): a drain that judged a
  * body to carry its own usable time while the normalizer then rejected that
  * same time would silently stamp the recovery clock instead.
+ *
+ * `receivedAtMs` is the collector's receive-time wall clock and defaults to it.
+ * It is a parameter only so a caller that already holds the receive instant —
+ * the tailer intake clamp below, and a fixture that time-travels the ledger —
+ * measures every stamp in one scan against ONE clock instead of re-reading
+ * `Date.now()` per record.
  */
-export function timestampIsNotFromTheFuture(value: string) {
+export function timestampIsNotFromTheFuture(value: string, receivedAtMs = Date.now()) {
   const parsedAt = Date.parse(value);
   return !Number.isNaN(parsedAt) &&
-    parsedAt <= Date.now() + ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs;
+    parsedAt <= receivedAtMs + ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs;
+}
+
+/**
+ * An event timestamp the ledger can actually hold: parseable AND carrying a
+ * timezone, which is `timestampSchema`'s contract (`shared/src/schemas.ts`) and
+ * the buffer's admission test (`enrollmentTimestampSchema`). The clamp below
+ * only rewrites values of this shape; see its comment for why.
+ */
+function isUsableEventTimestamp(value: string) {
+  return !Number.isNaN(Date.parse(value)) && /(?:Z|[+-]\d{2}:\d{2})$/.test(value.trim());
+}
+
+/**
+ * The intake clamp for a producer- or transcript-supplied event time
+ * (bead eco-6hoxj.73.3). It applies the SAME bound as the OTLP path — the
+ * shared `maxFutureTimestampSkewMs`, through the predicate above — to the two
+ * intakes that reach the ledger without passing an OTLP timestamp:
+ * `normalizeHookPayload`'s `observedAt` aliases and the transcript/rollout
+ * record timestamps.
+ *
+ * It CLAMPS rather than quarantines: the event is kept and stamped with the
+ * receive time. `dashboard_source_lifetime.last_event_at` is a monotone max, so
+ * one stamp from the future holds the freshness credit — and the green capture
+ * label — forward for the whole skew interval on a source that may be dead, and
+ * a hook-only source has no later event to correct it. Dropping the event would
+ * lose real usage; keeping the stamp would need the projection ladder to
+ * distrust its own inputs. Stamping the receive time keeps the tokens, keeps
+ * `last_event_at` bounded by a time the collector actually observed, and leaves
+ * the ladder untouched.
+ *
+ * Only a value that is ALREADY a usable event timestamp is rewritten. An
+ * unparseable or timezone-free stamp keeps exactly the disposition it has today
+ * (refused by the buffer and by `timestampSchema`); replacing it with the
+ * receive clock would ADMIT a row the ledger deliberately refuses.
+ */
+export function clampFutureObservedAt(
+  observedAt: string | undefined,
+  receivedAtMs = Date.now(),
+): { observedAt: string | undefined; clamped: boolean } {
+  if (typeof observedAt !== "string" || !isUsableEventTimestamp(observedAt)) {
+    return { observedAt, clamped: false };
+  }
+  if (timestampIsNotFromTheFuture(observedAt, receivedAtMs)) {
+    return { observedAt, clamped: false };
+  }
+  return { observedAt: new Date(receivedAtMs).toISOString(), clamped: true };
 }
 
 function extractOtelSignals(payload: Record<string, unknown>): OTelSignals {
@@ -389,16 +441,32 @@ export function normalizeHookPayload(
     },
   );
   const explicitActionClass = actionSelection.value;
+  // The hook intake's own future-skew bound (bead eco-6hoxj.73.3). The alias
+  // validator already holds it — `validatedMetadataAttribute` refuses any
+  // `timestamp` key beyond the shared `maxFutureTimestampSkewMs` — but it
+  // refuses SILENTLY, indistinguishable from a malformed value, and the
+  // fallback below then stamps the receive clock. That fallback IS the clamp;
+  // naming it here is what turns it into evidence, so a poisoned
+  // `last_event_at` that never happened is legible instead of invisible.
+  let futureObservedAtRefused = false;
   const observedAtSelection = selectValidatedHookAuthority(
     authorityPartitions,
     "observedAt",
     (value, key) => {
       const validated = validatedMetadataAttribute(key, value);
-      return validated.accepted && typeof validated.value === "string"
-        ? new Date(validated.value).toISOString()
-        : undefined;
+      if (validated.accepted && typeof validated.value === "string") {
+        return new Date(validated.value).toISOString();
+      }
+      if (clampFutureObservedAt(typeof value === "string" ? value : undefined).clamped) {
+        futureObservedAtRefused = true;
+      }
+      return undefined;
     },
   );
+  // Only a refusal that actually decided the event's time is a clamp: a body
+  // that also carried a usable alias took that one and lost nothing.
+  const observedAtFutureClamped =
+    futureObservedAtRefused && observedAtSelection.value === undefined;
   const validatedTransportPath = options.transportPath === undefined
     ? undefined
     : validatedMetadataAttribute("transport_path", options.transportPath);
@@ -424,6 +492,7 @@ export function normalizeHookPayload(
     ...(toolName ? { toolName } : {}),
     ...(derived?.detail ? { toolClassDetail: derived.detail } : {}),
     ...(transportPath ? { transport_path: transportPath } : {}),
+    ...(observedAtFutureClamped ? { observedAtFutureClamped: true } : {}),
     ...(options.gitContext ? { git: options.gitContext } : {}),
   };
 
@@ -439,10 +508,14 @@ export function normalizeHookPayload(
     source: options.source ?? "unknown",
     dataMode: policy.dataMode,
     eventType,
+    // The receive clock is the last resort AND the clamp: a refused future
+    // stamp lands here. `Date.now()` rather than `new Date()` so the whole
+    // routine reads one clock — the same one `timestampIsNotFromTheFuture` and
+    // `clampFutureObservedAt` measure against.
     observedAt:
       observedAtSelection.value ??
       otelSignals.timestamps[0] ??
-      new Date().toISOString(),
+      new Date(Date.now()).toISOString(),
     model: stringFromRecords(sourceRecords, usageFieldKeys.model),
     projectKey: stringFromRecords(sourceRecords, ["projectKey", "project_key", "project", "plimsoll.project", "cfo_one.project"]),
     customerKey: stringFromRecords(sourceRecords, ["customerKey", "customer_key", "customer", "plimsoll.customer", "cfo_one.customer"]),

@@ -52,7 +52,7 @@ import {
   maintenanceCandidateHash,
   type MaintenanceProgressStage,
 } from "./maintenance-progress";
-import { deterministicEventId } from "./normalizer";
+import { clampFutureObservedAt, deterministicEventId } from "./normalizer";
 import {
   aiInteractionEventSchema,
   estimateCostUsd,
@@ -102,6 +102,12 @@ export type TranscriptScanResult = {
   filesSkippedOutsideRecentWindow: number;
   eventsAppended: number;
   enrollmentExcludedEvents?: number;
+  /**
+   * Rows whose transcript record timestamp sat beyond the shared future-skew
+   * bound and were therefore stamped with the receive time instead
+   * (bead eco-6hoxj.73.3, `clampFutureObservedAt`).
+   */
+  futureTimestampClampedEvents?: number;
   tokensAppended: { input: number; cacheRead: number; output: number };
   parseErrors: number;
   unresolvedRecords: number;
@@ -1275,11 +1281,20 @@ export class TranscriptTailer {
     };
   }
 
+  private get receivedAtMs() {
+    return this.io.now?.() ?? Date.now();
+  }
+
   private fallbackObservedAt(mtimeMs: number) {
     const observed = new Date(mtimeMs);
-    return Number.isFinite(mtimeMs) && !Number.isNaN(observed.getTime())
+    const receivedAtMs = this.receivedAtMs;
+    // A file mtime is as capable of sitting in the future as a record stamp is
+    // (a bad clock on the writing machine, a restored archive), so the same
+    // intake clamp applies to it.
+    const readAt = Number.isFinite(mtimeMs) && !Number.isNaN(observed.getTime())
       ? observed.toISOString()
-      : new Date().toISOString();
+      : new Date(receivedAtMs).toISOString();
+    return clampFutureObservedAt(readAt, receivedAtMs).observedAt ?? readAt;
   }
 
   private ingestLines(
@@ -1458,9 +1473,20 @@ export class TranscriptTailer {
       new Date().toISOString(),
     );
     if (delta.input === 0 && delta.output === 0 && delta.cacheRead === 0 && delta.cacheCreation === 0) return;
+    // Intake clamp (bead eco-6hoxj.73.3). A transcript record can carry any
+    // timestamp its writer put there; `last_event_at` is a monotone max, so one
+    // from the future would hold this source's freshness credit for the whole
+    // skew interval. `fallbackObservedAt` is already clamped at source. An
+    // absent stamp stays absent: it is the admission test's own refusal below,
+    // and the mtime fallback must not silently rescue it.
+    const clamped = clampFutureObservedAt(entry.observedAt, this.receivedAtMs);
+    if (clamped.clamped) {
+      result.futureTimestampClampedEvents = (result.futureTimestampClampedEvents ?? 0) + 1;
+    }
+    const observedAt = clamped.observedAt ?? fallbackObservedAt;
     // Preserve the local revision counter above, but never synthesize a
     // managed event timestamp from mtime or from the time the file arrived.
-    if (this.buffer.eventAdmissionReason(entry.observedAt, this.activeCaptureRoot?.installationEpochId)) {
+    if (this.buffer.eventAdmissionReason(clamped.observedAt, this.activeCaptureRoot?.installationEpochId)) {
       result.enrollmentExcludedEvents = (result.enrollmentExcludedEvents ?? 0) + 1;
       return;
     }
@@ -1474,7 +1500,7 @@ export class TranscriptTailer {
     });
     const metadata: Record<string, unknown> = { ...rootEventMetadata(this.activeCaptureRoot, previous
       ? deterministicEventId(["claude-transcript-revision", state.sessionId, entry.messageId, String(entry.input), String(entry.cacheRead), String(entry.cacheCreation), String(entry.output)])
-      : eventBaseId, entry.observedAt ?? fallbackObservedAt, state.sessionId), usageSource: "transcript" };
+      : eventBaseId, observedAt, state.sessionId), usageSource: "transcript" };
     if (priced) {
       metadata.costEstimated = true;
       metadata.costKind = "estimated";
@@ -1497,7 +1523,7 @@ export class TranscriptTailer {
       source: "claude_code",
       dataMode: "metadata",
       eventType: "usage_transcript",
-      observedAt: entry.observedAt ?? fallbackObservedAt,
+      observedAt,
       sessionId: state.sessionId,
       actorId: typeof metadata.captureAccountHash === "string" ? metadata.captureAccountHash : undefined,
       model: entry.model,

@@ -88,6 +88,15 @@ export type JsonlTailerIo = {
   stat(file: string): fs.Stats;
   lstat(file: string): fs.Stats;
   readTail: typeof readJsonlTail;
+  /**
+   * The collector's receive-time wall clock, defaulted to `Date.now` by every
+   * tailer. It sits on the io seam because it is the same kind of outside-world
+   * read as `stat`: the tailer's intake future-timestamp clamp measures a
+   * record's stamp against it (bead eco-6hoxj.73.3). A fixture that time-travels
+   * the ledger clock must set it, or the clamp judges the fixture's own times
+   * against the real wall clock and rewrites them.
+   */
+  now?(): number;
 };
 
 export const DEFAULT_JSONL_TAILER_IO: JsonlTailerIo = {
@@ -96,6 +105,7 @@ export const DEFAULT_JSONL_TAILER_IO: JsonlTailerIo = {
   stat: (file) => fs.statSync(file),
   lstat: (file) => fs.lstatSync(file),
   readTail: readJsonlTail,
+  now: () => Date.now(),
 };
 
 type RawCursorRow = {

@@ -52,7 +52,7 @@ import {
   type MaintenanceProgressStage,
 } from "./maintenance-progress";
 import { readLocalIdentities, type LocalIdentity, type LocalIdentityPaths } from "./local-identity";
-import { deterministicEventId } from "./normalizer";
+import { clampFutureObservedAt, deterministicEventId } from "./normalizer";
 import {
   aiInteractionEventSchema,
   estimateCostUsd,
@@ -111,6 +111,12 @@ export type RolloutScanResult = {
   sessionsSkippedOtlpCovered: number;
   eventsAppended: number;
   enrollmentExcludedEvents?: number;
+  /**
+   * Rows whose rollout record timestamp sat beyond the shared future-skew bound
+   * and were therefore stamped with the receive time instead
+   * (bead eco-6hoxj.73.3, `clampFutureObservedAt`).
+   */
+  futureTimestampClampedEvents?: number;
   tokensAppended: { input: number; cachedInput: number; output: number };
   /**
    * Issue #153: rows whose token columns were zeroed because their first
@@ -1366,11 +1372,20 @@ export class RolloutTailer {
     };
   }
 
+  private get receivedAtMs() {
+    return this.io.now?.() ?? Date.now();
+  }
+
   private fallbackObservedAt(mtimeMs: number) {
     const observed = new Date(mtimeMs);
-    return Number.isFinite(mtimeMs) && !Number.isNaN(observed.getTime())
+    const receivedAtMs = this.receivedAtMs;
+    // A file mtime is as capable of sitting in the future as a record stamp is
+    // (a bad clock on the writing machine, a restored archive), so the same
+    // intake clamp applies to it.
+    const readAt = Number.isFinite(mtimeMs) && !Number.isNaN(observed.getTime())
       ? observed.toISOString()
-      : new Date().toISOString();
+      : new Date(receivedAtMs).toISOString();
+    return clampFutureObservedAt(readAt, receivedAtMs).observedAt ?? readAt;
   }
 
   private ingestLines(
@@ -1521,7 +1536,15 @@ export class RolloutTailer {
         ? identity.actorHash
         : undefined;
     for (const entry of pending) {
-      const observedAt = entry.observedAt ?? fallbackObservedAt;
+      // Intake clamp (bead eco-6hoxj.73.3). A rollout record can carry any
+      // timestamp its writer put there; `last_event_at` is a monotone max, so
+      // one from the future would hold this source's freshness credit for the
+      // whole skew interval. `fallbackObservedAt` is already clamped at source.
+      const clamped = clampFutureObservedAt(entry.observedAt, this.receivedAtMs);
+      if (clamped.clamped) {
+        result.futureTimestampClampedEvents = (result.futureTimestampClampedEvents ?? 0) + 1;
+      }
+      const observedAt = clamped.observedAt ?? fallbackObservedAt;
       const activeCaptureRoot = this.captureRootAt(this.activeCaptureRoot, observedAt);
       // Counter state already advanced: dropping old/undated observations must
       // not charge their cumulative tokens to the next valid observation.

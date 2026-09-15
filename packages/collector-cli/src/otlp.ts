@@ -2,7 +2,6 @@ import {
   DEFAULT_POLICY,
   admittedCost,
   GENERIC_ATTRIBUTE_SUPPRESSION_RECEIPT,
-  ANALYTICAL_METADATA_LIMITS,
   admittedMetadataAttributes,
   aiInteractionEventSchema,
   canonicalizeSuppressionReceipts,
@@ -28,6 +27,7 @@ import {
   numberField,
   otelScalar,
   stringField,
+  timestampIsNotFromTheFuture,
   unixNanoToIso,
 } from "./normalizer";
 import {
@@ -119,12 +119,6 @@ function recordTimestamp(record: Record<string, unknown>, attrs: Record<string, 
   }
 
   return new Date().toISOString();
-}
-
-function timestampIsNotFromTheFuture(value: string) {
-  const parsedAt = Date.parse(value);
-  return !Number.isNaN(parsedAt) &&
-    parsedAt <= Date.now() + ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs;
 }
 
 function intTokens(value: number | undefined) {
