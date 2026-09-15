@@ -288,6 +288,39 @@ No additional raw-ledger query is made. The standalone ledger-side health query
 retains its existing meaning. Even a `projected` count is not proof that every
 event has a session link; this change does not repair the projection backlog.
 
+### Rolling the collector back: the projection schema version
+
+The derived dashboard projection carries a `schema_version`, and that version
+moves whenever the derived tables change shape. It exists for the **downgrade**
+direction: a collector that opens a projection written by a newer binary cannot
+know what the extra shape means, so it **fails closed** rather than half-read
+it. The projection is marked not ready with `degradedReason:
+"projection_schema_newer"`, maintenance does no derived work, and the status
+snapshot serves no session count at all. It never serves the last count it had.
+The stored version is left exactly as the newer binary published it, so
+re-installing that binary and restarting the collector is the whole recovery.
+
+That guard can only protect a rollback to a binary that carries it. A collector
+older than the guard reads no version, and one older than **#360**
+(eco-6hoxj.80 r3) also predates `last_token_event_at` on
+`dashboard_session_source_window` and `dashboard_session_repair_source`. Its
+positional session insert-select fails to compile against the wider tables —
+`table dashboard_session_source_window has 13 columns but 12 values were
+supplied` — on every maintenance tick, which is what made such a rollback go on
+serving a frozen, green session count. Rolling back that far is a manual
+operation. With the collector **stopped**, against the ledger
+(`~/.plimsoll/work-ledger.sqlite` unless `PLIMSOLL_HOME` moves it):
+
+```sql
+alter table dashboard_session_repair_source drop column last_token_event_at;
+alter table dashboard_session_source_window drop column last_token_event_at;
+```
+
+The columns are additive and the old binary re-derives everything it needs, so
+dropping them restores session materialization exactly. Re-upgrading adds them
+back on open and refills them from the facts the ledger still holds. Rebuilding
+the projection from the raw ledger is the equivalent heavier alternative.
+
 The local activity scan is **bounded**: one cadence enumerates at most 256
 directory entries within 50 ms, keeps its cursor, and resumes on the next tick.
 On a host with many capture roots one sweep therefore spans many cadences, and

@@ -11,6 +11,7 @@ import Database from "better-sqlite3";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import {
+  DASHBOARD_SCHEMA_VERSION,
   DASHBOARD_WINDOWS,
   DashboardProjectionStore,
 } from "../packages/collector-cli/src/dashboard-projection";
@@ -2131,6 +2132,141 @@ async function main() {
         upgradedRow.sessionCountProjection.latestTokenSessionAt===tokenEventAt,
       {backfilled,row:upgradedRow});
     reopened.close();
+
+    // ---- eco-6hoxj.145: the downgrade side of that same additive column ---
+    // #360 added `last_token_event_at` to two derived tables on open and left
+    // DASHBOARD_SCHEMA_VERSION at 1. A collector rolled back below it opened a
+    // ledger whose tables had gained a column, failed session materialization
+    // on every maintenance tick, and went on serving the last session count it
+    // had — frozen, and green: exactly the false confidence eco-6hoxj.80
+    // removed. The version now moves with the derived schema, and a projection
+    // written by a newer binary is refused rather than half-read.
+    const downgradeTokenAt=new Date(NOW.getTime()-5*60_000).toISOString();
+    const downgradePath=path.join(root,"projection-schema-downgrade.sqlite");
+    const newerBinary=new LocalEventBuffer(downgradePath);
+    newerBinary.append(event({source:"grok",sessionId:uuid(940_010),observedAt:downgradeTokenAt,
+      inputTokens:1_200,outputTokens:340,costUsd:0.004}));
+    settle(newerBinary,NOW,30);
+    const greenBefore=(readySnapshot(newerBinary,30).status.health as {sources:CountHealth[]})
+      .sources.find(row=>row.source==="grok")!;
+    check("downgrade_fixture_starts_from_a_green_published_session_count",
+      greenBefore.status==="green"&&greenBefore.tokenSessionsToday===1&&
+        greenBefore.sessionCountProjection?.state==="projected",
+      {row:greenBefore});
+    newerBinary.close();
+    // One version on, and the same kind of change #360 made: an additive column
+    // on a derived table this binary still writes with a positional
+    // insert-select. That statement is what stops compiling on the rollback.
+    const publishedByNewer=new Database(downgradePath);
+    publishedByNewer.prepare(
+      `update dashboard_projection_control set schema_version=? where singleton=1`,
+    ).run(DASHBOARD_SCHEMA_VERSION+1);
+    publishedByNewer.exec(`alter table dashboard_repo_session_window add column future_column text`);
+    publishedByNewer.close();
+
+    const rolledBack=new LocalEventBuffer(downgradePath);
+    const refusedStatus=rolledBack.projection.status();
+    const refusedRead=rolledBack.projection.readSnapshot(30);
+    // The frozen payload is still on disk: the count is withheld by the guard,
+    // not by an empty projection that had nothing to serve.
+    const frozenSnapshots=(rolledBack.database.prepare(
+      `select count(*) as n from dashboard_snapshots`).get() as {n:number}).n;
+    const refusedTick=rolledBack.projection.runMaintenance(NOW);
+    // Live capture keeps landing on a rolled-back host, and the raw-insert
+    // trigger rewrites `degraded_reason` to the repair backlog when it does.
+    // The refusal must survive that, or the operator loses the one line that
+    // says why the counts are gone.
+    rolledBack.append(event({source:"grok",sessionId:uuid(940_011),
+      observedAt:new Date(NOW.getTime()-60_000).toISOString(),inputTokens:10,outputTokens:5}));
+    const afterTickStatus=rolledBack.projection.status();
+    const afterTickRead=rolledBack.projection.readSnapshot(30);
+    const versionLeftAlone=(rolledBack.database.prepare(
+      `select schema_version as version from dashboard_projection_control where singleton=1`)
+      .get() as {version:number}).version;
+    check("a_projection_written_by_a_newer_schema_is_refused_not_served_frozen_green",
+      frozenSnapshots>0&&
+        refusedStatus.degradedReason==="projection_schema_newer"&&refusedStatus.ready===false&&
+        refusedRead.kind!=="ready"&&
+        refusedTick.ready===false&&refusedTick.degraded===true&&
+        afterTickStatus.degradedReason==="projection_schema_newer"&&afterTickStatus.ready===false&&
+        afterTickRead.kind!=="ready"&&
+        versionLeftAlone===DASHBOARD_SCHEMA_VERSION+1,
+      {frozenSnapshots,refusedReason:refusedStatus.degradedReason,refusedKind:refusedRead.kind,
+        tick:{ready:refusedTick.ready,degraded:refusedTick.degraded},
+        afterKind:afterTickRead.kind,afterReason:afterTickStatus.degradedReason,
+        storedVersion:versionLeftAlone,binaryVersion:DASHBOARD_SCHEMA_VERSION});
+    rolledBack.close();
+
+    // The forward half of the same guard. A projection written before the
+    // version moved must adopt it on open — every equality test against
+    // DASHBOARD_SCHEMA_VERSION, finance publication among them, would otherwise
+    // read a settled projection as unsettled for good.
+    const stampPath=path.join(root,"projection-schema-stamp.sqlite");
+    const stamped=new LocalEventBuffer(stampPath);
+    stamped.append(event({source:"grok",sessionId:uuid(940_020),observedAt:downgradeTokenAt,
+      inputTokens:900,outputTokens:120,costUsd:0.002}));
+    settle(stamped,NOW,30);
+    stamped.close();
+    const asPre360=new Database(stampPath);
+    asPre360.prepare(`update dashboard_projection_control set schema_version=1 where singleton=1`).run();
+    for(const table of ["dashboard_session_repair_source","dashboard_session_source_window"]){
+      asPre360.exec(`alter table ${table} drop column last_token_event_at`);
+    }
+    asPre360.close();
+    const stampReopened=new LocalEventBuffer(stampPath);
+    const adoptedVersion=(stampReopened.database.prepare(
+      `select schema_version as version from dashboard_projection_control where singleton=1`)
+      .get() as {version:number}).version;
+    settle(stampReopened,NOW,30);
+    const stampedRow=(readySnapshot(stampReopened,30).status.health as {sources:CountHealth[]})
+      .sources.find(row=>row.source==="grok")!;
+    // `> 1` is the bump itself: #360's additive columns are a derived-schema
+    // change, so a projection this binary writes must be distinguishable from
+    // one written before them. Leaving the version at 1 is what made the
+    // rollback undetectable in the first place.
+    check("a_pre_version_projection_adopts_the_current_schema_version_on_open",
+      DASHBOARD_SCHEMA_VERSION>1&&adoptedVersion===DASHBOARD_SCHEMA_VERSION&&
+        stampReopened.projection.status().degradedReason===null&&
+        stampedRow.status==="green"&&stampedRow.tokenSessionsToday===1,
+      {adoptedVersion,binaryVersion:DASHBOARD_SCHEMA_VERSION,row:stampedRow});
+    stampReopened.close();
+
+    // A binary older than this guard cannot read the version at all, so the
+    // rollback below it stays a manual operation and the release note has to
+    // name it. This is that documented rollback, run against the exact
+    // positional insert-select the pre-#360 collector compiled every tick.
+    const manualPath=path.join(root,"projection-manual-rollback.sqlite");
+    const manual=new LocalEventBuffer(manualPath);
+    manual.append(event({source:"grok",sessionId:uuid(940_030),observedAt:downgradeTokenAt,
+      inputTokens:700,outputTokens:90,costUsd:0.001}));
+    settle(manual,NOW,30);
+    manual.close();
+    const preGuardBinary=new Database(manualPath);
+    const pre360SessionInsert=`insert into dashboard_session_source_window
+       select days,session_hash,source,started_at,ended_at,events,token_events,input_tokens,
+        output_tokens,cache_read_tokens,cache_creation_tokens,cost_nanos
+       from dashboard_session_repair_source where days=? and session_hash=?`;
+    const compile=()=>{
+      try{preGuardBinary.prepare(pre360SessionInsert);return null;}
+      catch(error){return error instanceof Error?error.message:String(error);}
+    };
+    const brokenBeforeRollback=compile();
+    for(const table of ["dashboard_session_repair_source","dashboard_session_source_window"]){
+      preGuardBinary.exec(`alter table ${table} drop column last_token_event_at`);
+    }
+    const brokenAfterRollback=compile();
+    preGuardBinary.close();
+    check("the_documented_manual_rollback_restores_pre_360_session_materialization",
+      brokenBeforeRollback!==null&&/13 columns but 12 values/.test(brokenBeforeRollback)&&
+        brokenAfterRollback===null,
+      {brokenBeforeRollback,brokenAfterRollback});
+
+    const releaseNote=fs.readFileSync(path.join(import.meta.dirname,"..","README.md"),"utf8");
+    check("the_release_note_documents_the_schema_guard_and_the_manual_rollback",
+      releaseNote.includes("projection_schema_newer")&&
+        releaseNote.includes("alter table dashboard_session_source_window drop column last_token_event_at")&&
+        releaseNote.includes("alter table dashboard_session_repair_source drop column last_token_event_at"),
+      {});
 
     // Standing rule for this file pair: every tailer fix ships its twin check
     // on the other tailer (r1/r2/r3 lesson of eco-6hoxj.73).

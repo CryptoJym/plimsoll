@@ -12,6 +12,7 @@ import {
 } from "../packages/collector-cli/src/finance-project-usage-projection";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { runCodexReconciliationMaintenance } from "../packages/collector-cli/src/codex-reconciliation";
+import { DASHBOARD_SCHEMA_VERSION } from "../packages/collector-cli/src/dashboard-projection";
 import {
   invalidateFinanceSourceCoverage,
   recordFinanceCaptureActivity,
@@ -127,7 +128,7 @@ function healthyBuffer(events: readonly AiInteractionEvent[] = [
   const nativeScanAt = new Date().toISOString();
   database.prepare(
     `update dashboard_projection_control set
-       schema_version=1, ready=1, parity_ready=1, generation=7, dirty=0,
+       schema_version=${DASHBOARD_SCHEMA_VERSION}, ready=1, parity_ready=1, generation=7, dirty=0,
        degraded_reason=null, last_success_at=?, backfill_complete=1,
        parity_complete=1, metric_backfill_complete=1, repair_backlog=0,
        dirty_session_backlog=0, account_invalidation_backlog=0,
@@ -493,7 +494,7 @@ test("uses the native workspace epoch and fails closed on legacy lineage", () =>
     }
     database.prepare(
       `update dashboard_projection_control set
-       schema_version=1, ready=1, parity_ready=1, generation=8, dirty=0,
+       schema_version=${DASHBOARD_SCHEMA_VERSION}, ready=1, parity_ready=1, generation=8, dirty=0,
        degraded_reason=null, last_success_at=?, backfill_complete=1,
        parity_complete=1, metric_backfill_complete=1, repair_backlog=0,
        dirty_session_backlog=0, account_invalidation_backlog=0,
@@ -588,7 +589,7 @@ test("does not strand a current epoch after an A-B-A transition", () => {
     }
     database.prepare(
       `update dashboard_projection_control set
-       schema_version=1, ready=1, parity_ready=1, generation=9, dirty=0,
+       schema_version=${DASHBOARD_SCHEMA_VERSION}, ready=1, parity_ready=1, generation=9, dirty=0,
        degraded_reason=null, last_success_at=?, backfill_complete=1,
        parity_complete=1, metric_backfill_complete=1, repair_backlog=0,
        dirty_session_backlog=0, account_invalidation_backlog=0,

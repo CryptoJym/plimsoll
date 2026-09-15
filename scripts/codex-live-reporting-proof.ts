@@ -9,6 +9,7 @@ import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { loadOrCreateLocalIngestAuth } from "../packages/collector-cli/src/local-auth";
 import { provisionLiveProducer } from "../packages/collector-cli/src/codex-live-usage-auth";
 import { canonicalJson, liveEventId } from "../packages/collector-cli/src/codex-live-usage-protocol";
+import { DASHBOARD_SCHEMA_VERSION } from "../packages/collector-cli/src/dashboard-projection";
 import { collectSessionProjectAllocations } from "../packages/collector-cli/src/session-sync";
 import { readFinanceProjectUsageProjection, type FinanceProjectionRequest } from "../packages/collector-cli/src/finance-project-usage-projection";
 import { aiInteractionEventSchema } from "../packages/shared/src/schemas";
@@ -71,7 +72,7 @@ const request: FinanceProjectionRequest = {
 function publishFixtureCoverage() {
   const at = new Date().toISOString(), database = buffer.database;
   for (let i = 0; i < 4; i++) buffer.projection.runMaintenance(new Date(Date.now() + 1_000));
-  database.prepare(`update dashboard_projection_control set schema_version=1,ready=1,parity_ready=1,
+  database.prepare(`update dashboard_projection_control set schema_version=${DASHBOARD_SCHEMA_VERSION},ready=1,parity_ready=1,
     dirty=0,degraded_reason=null,last_success_at=?,backfill_complete=1,parity_complete=1,metric_backfill_complete=1,
     repair_backlog=0,dirty_session_backlog=0,account_invalidation_backlog=0,compact_mutation_backlog=0,compact_gc_backlog=0`).run(at);
   database.prepare("update dashboard_window_control set target_cutoff_at=null").run();

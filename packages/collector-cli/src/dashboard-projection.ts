@@ -21,7 +21,19 @@ import {
 } from "./history-coverage";
 import { projectionValidity, STATUS_MAX_AGE_MS } from "./projection-validity";
 
-export const DASHBOARD_SCHEMA_VERSION = 1;
+/** The version of the derived projection schema this binary writes and reads.
+ *
+ * It must move whenever the derived tables change shape, because it is the
+ * only thing a *downgraded* collector can read to learn that the projection in
+ * front of it was written by a binary it does not understand. #360
+ * (eco-6hoxj.80 r3) added `last_token_event_at` to two session tables on open
+ * and left this at 1, so a collector rolled back below #360 opened a ledger
+ * whose tables had gained a column, failed session materialization on every
+ * maintenance tick, and went on serving the last session count it had — frozen
+ * and green (bead eco-6hoxj.145). Version 2 is that migration. */
+export const DASHBOARD_SCHEMA_VERSION = 2;
+/** A projection written by a newer binary: refuse it rather than half-read it. */
+const PROJECTION_SCHEMA_NEWER = "projection_schema_newer";
 export const DASHBOARD_WINDOWS = [30, 90, 182, 365, 1825] as const;
 const INTERNAL_WINDOWS = [7, ...DASHBOARD_WINDOWS] as const;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -553,6 +565,8 @@ function json<T>(value: string): T {
 }
 
 export class DashboardProjectionStore {
+  /** Set at open when the stored schema version is newer than this binary's. */
+  private schemaNewerThanBinary = false;
   private failNextApply = false;
   private failNextCompactGcAfterRewrite = false;
 
@@ -583,6 +597,7 @@ export class DashboardProjectionStore {
   }
 
   private createSchema(now: Date, newLedger: boolean) {
+    const storedSchemaVersion = this.readStoredSchemaVersion();
     this.db.exec(`
       create table if not exists dashboard_projection_control (
         singleton integer primary key check (singleton = 1),
@@ -998,6 +1013,7 @@ export class DashboardProjectionStore {
       newLedger ? 1 : 0,
       newLedger ? 0 : null,
     );
+    this.reconcileSchemaVersion(storedSchemaVersion);
     for (const days of INTERNAL_WINDOWS) {
       this.db.prepare(
         `insert or ignore into dashboard_window_control (days, cutoff_at)
@@ -1270,6 +1286,49 @@ export class DashboardProjectionStore {
       }
     }
     this.ensureCompactSummaryMigration(now);
+  }
+
+  /** The version an already-installed projection was last written at, read
+   * before this open creates or migrates anything. A ledger with no projection
+   * yet has none. */
+  private readStoredSchemaVersion(): number | null {
+    if (!this.db.prepare(
+      `select 1 from sqlite_master where type='table' and name='dashboard_projection_control'`,
+    ).get()) return null;
+    const row = this.db.prepare(
+      `select schema_version as version from dashboard_projection_control where singleton=1`,
+    ).get() as { version: number } | undefined;
+    return row ? row.version : null;
+  }
+
+  /** Reconcile the stored derived-schema version with this binary's.
+   *
+   * Forward (stored older): the open-time column migrations above have already
+   * brought the derived tables up to this binary's shape, so the version moves
+   * with them. This is the only path an ordinary upgrade takes.
+   *
+   * Backward (stored newer): this binary is a rollback under a projection some
+   * later binary wrote. It cannot know what that schema means — the tables may
+   * carry columns whose writes it has no values for — so it fails closed:
+   * nothing is served and nothing is written, and the stored version is left
+   * exactly as the newer binary published it so re-upgrading is a plain
+   * restart. Refusing is the whole point: the alternative is the frozen green
+   * session count eco-6hoxj.80 was built to remove. `plimsoll` reports
+   * `projection_schema_newer`; the release note names the manual rollback. */
+  private reconcileSchemaVersion(stored: number | null) {
+    if (stored !== null && stored > DASHBOARD_SCHEMA_VERSION) {
+      this.schemaNewerThanBinary = true;
+      this.db.prepare(
+        `update dashboard_projection_control set ready=0, parity_ready=0, dirty=1,
+          degraded_reason=? where singleton=1`,
+      ).run(PROJECTION_SCHEMA_NEWER);
+      return;
+    }
+    if (stored !== null && stored < DASHBOARD_SCHEMA_VERSION) {
+      this.db.prepare(
+        `update dashboard_projection_control set schema_version=? where singleton=1`,
+      ).run(DASHBOARD_SCHEMA_VERSION);
+    }
   }
 
   private ensureProjectionSchemaColumns() {
@@ -2617,6 +2676,20 @@ export class DashboardProjectionStore {
   }
 
   runMaintenance(now = new Date(Date.now())): ProjectionMaintenanceReceipt {
+    // A projection written by a newer binary is not this binary's to advance.
+    // The refusal has to hold across ticks, or the first maintenance pass would
+    // publish snapshots again and restore exactly the green count the open-time
+    // guard withheld (bead eco-6hoxj.145).
+    if (this.schemaNewerThanBinary) {
+      return {
+        backfillRowsVisited: 0, parityRowsVisited: 0, repairRowsVisited: 0,
+        dirtySessionsVisited: 0, sessionRepairRowsVisited: 0, metricRowsVisited: 0,
+        expiryFacts: 0, compactSegmentsWritten: 0, compactGcItemsVisited: 0,
+        compactGcItemsRemoved: 0, compactGcSegmentsRewritten: 0, compactGcSegmentsDeleted: 0,
+        compactGcDaysCompleted: 0, compactGcRestarts: 0, compactGcDurationMs: 0,
+        snapshotBuilds: 0, ready: false, degraded: true, backlog: this.backlog(),
+      };
+    }
     let backfillRowsVisited = 0;
     let parityRowsVisited = 0;
     let repairRowsVisited = 0;
@@ -3536,9 +3609,13 @@ export class DashboardProjectionStore {
 
   status() {
     const c=this.control(); const backlog=this.backlog();
+    // The raw-insert triggers rewrite `degraded_reason` to the repair backlog
+    // whenever an event lands, so the refusal is reported from the guard
+    // itself rather than from a column a live capture can overwrite.
+    const degradedReason=this.schemaNewerThanBinary?PROJECTION_SCHEMA_NEWER:c.degradedReason;
     return {schemaVersion:DASHBOARD_SCHEMA_VERSION,generation:c.generation,
       ready:Boolean(c.ready),parityReady:Boolean(c.parityReady),dirty:Boolean(c.dirty),
-      degraded:Boolean(c.degradedReason),degradedReason:c.degradedReason,
+      degraded:Boolean(degradedReason),degradedReason,
       lastSuccessAt:c.lastSuccessAt,lastErrorAt:c.lastErrorAt,
       backfill:{highWater:c.backfillHighWater,cursor:c.backfillCursor,complete:Boolean(c.backfillComplete),
         parityCursor:c.parityCursor,parityComplete:Boolean(c.parityComplete),

@@ -10,12 +10,12 @@ import {
   type ProjectUsageSourceInput,
 } from "../../shared/src/finance-project-usage-export";
 import type { CostUsageRecord, ToolSource } from "../../shared/src/schemas";
+import { DASHBOARD_SCHEMA_VERSION } from "./dashboard-projection";
 import { historyCoverageStatus } from "./history-coverage";
 
 /** The only source version implemented by this offline projection adapter. */
 export const FINANCE_PROJECT_USAGE_SOURCE_VERSION = "finance_exact_period.v2" as const;
 
-const DASHBOARD_SCHEMA_VERSION = 1;
 const MAX_SOURCE_RECORDS = 10_000;
 const MAX_SAFE_BIGINT = BigInt(Number.MAX_SAFE_INTEGER);
 const NANOSECONDS_PER_MICRO = 1_000n;
