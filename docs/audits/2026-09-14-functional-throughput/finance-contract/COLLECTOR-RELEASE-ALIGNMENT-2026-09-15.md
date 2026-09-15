@@ -32,7 +32,7 @@ Local checks passed:
 - `pnpm test` — 214 passed, 14 skipped, 0 failed
 - `pnpm build`
 
-PR121 Vercel preview is deployed successfully. GitHub `build-and-proof` and `install-tenant-race-proof` both passed, and PR121 is merged into the PR120 UX branch at `c712b4c411fdfe8e723bf0df85a0b59f72b58dc6`. PR120 CI and preview are re-running on the integrated head; production release remains open until those checks and native readback complete.
+PR121 Vercel preview is deployed successfully. GitHub `build-and-proof` and `install-tenant-race-proof` both passed, and PR121 is merged into the PR120 UX branch at `c712b4c411fdfe8e723bf0df85a0b59f72b58dc6`. The integrated PR120 head is clean with `build-and-proof`, `install-tenant-race-proof`, and Vercel all passing. Preview: https://plimsoll-cloud-git-codex-plimsoll-ux-ui-slice-utlyze-2f74afdb.vercel.app. Production release remains open; no production deployment or Finance source mutation has occurred.
 
 ## Recovery
 
