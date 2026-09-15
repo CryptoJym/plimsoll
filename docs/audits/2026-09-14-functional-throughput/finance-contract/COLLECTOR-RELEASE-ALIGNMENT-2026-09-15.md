@@ -31,7 +31,7 @@ Local checks passed:
 - `pnpm test` — 214 passed, 14 skipped, 0 failed
 - `pnpm build`
 
-PR121 Vercel preview is deployed successfully. GitHub `build-and-proof` and `install-tenant-race-proof` were still pending at this readback; merge and production release remain open until those checks complete and the change is independently reviewed.
+PR121 Vercel preview is deployed successfully. GitHub `build-and-proof` and `install-tenant-race-proof` both passed. Merge and production release remain open until the stacked change is independently reviewed and integrated into the UX branch.
 
 ## Recovery
 
