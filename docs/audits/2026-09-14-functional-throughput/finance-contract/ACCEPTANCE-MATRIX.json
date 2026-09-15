@@ -1,0 +1,85 @@
+{
+  "schema": "plimsoll.finance-contract-qualification.v1",
+  "bead": "eco-6hoxj.124.2",
+  "status": "source_qualification_pending",
+  "recordedAt": "2026-09-15T17:06:25Z",
+  "adapter": "readFinanceSnapshot(tenantId, period) -> Promise<FinanceSnapshot|null>",
+  "sourceAuthority": {
+    "owner": "session-45e6ef0f8d8873be777467ee1ebcb83f",
+    "work": "nrf-j86.17.4.3",
+    "nativeReadback": "pending",
+    "artifact": "pending"
+  },
+  "qualifiedFields": [
+    "tenantId",
+    "companyRef",
+    "period.start",
+    "period.end",
+    "observedThrough",
+    "complete",
+    "manifestDigest",
+    "attestationRef",
+    "sourceLineId",
+    "sourceVersion",
+    "statementRef",
+    "evidenceRef",
+    "currency",
+    "exponent",
+    "amountMinor",
+    "kind",
+    "taxTreatment",
+    "allocationPolicyVersion",
+    "allocationGeneration",
+    "reversalOf"
+  ],
+  "checks": [
+    {
+      "id": "source_artifact_immutable",
+      "status": "observed_blocked_stale"
+    },
+    {
+      "id": "source_owner_native_readback",
+      "status": "pending"
+    },
+    {
+      "id": "tenant_company_scope",
+      "status": "contracted"
+    },
+    {
+      "id": "exact_period_and_watermark",
+      "status": "contracted"
+    },
+    {
+      "id": "statement_attestation_manifest_binding",
+      "status": "contracted"
+    },
+    {
+      "id": "duplicate_replay_identity",
+      "status": "contracted"
+    },
+    {
+      "id": "credit_reversal_conservation",
+      "status": "contracted"
+    },
+    {
+      "id": "allocation_remainder_conservation",
+      "status": "contracted"
+    },
+    {
+      "id": "missing_stale_failure_refusal",
+      "status": "contracted"
+    },
+    {
+      "id": "foreign_tenant_period_refusal",
+      "status": "contracted"
+    }
+  ],
+  "unknowns": [
+    "No qualified monetary publication has been read back for the requested workspace and period.",
+    "No source artifact/version or authorized statement/attestation references are available in this shared packet.",
+    "Recognition and cash-period mapping, allocation generation and reversal edition remain source-owner inputs.",
+    "No monetary amount is asserted by this contract packet.",
+    "The immutable edition has structurally complete import rows but is stale beyond the publisher 24-hour freshness limit and is classified UNKNOWN; it is not a recognized-expense publication."
+  ],
+  "nextAction": "Obtain a fresh source-owner edition and native qualification packet with legal company binding, recognition/cash policy, and FinanceSnapshot line/version evidence; do not open .124.3 from the health edition."
+}
