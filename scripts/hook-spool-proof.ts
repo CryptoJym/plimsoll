@@ -31,6 +31,7 @@ import {
   SPOOL_WORD_SPLIT_DROPPED_SPELLINGS,
   normalizedSpelling,
 } from "./lib/spool-spelling-corpus";
+import { collectPrivacySpecModel, renderPrivacySpec } from "./privacy-spec";
 import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
@@ -1805,6 +1806,70 @@ function postToolUseBodyWithPaths(sessionId: string) {
  * `SPOOL_DERIVATION_INPUT_KEYS`, the keys the collector reads from the raw body
  * BEFORE suppressing them, whose values it turns into something it persists.
  */
+/**
+ * The header of the one table on the generated privacy page that carries the
+ * spool's derivation-input disclosure, and the `Matched by` cell that marks a
+ * rule-2 row. Both are literals of the RENDERED page, not of the code that
+ * feeds it.
+ */
+const PRIVACY_PAGE_DISCLOSURE_TABLE_HEADER =
+  "| # | Field name | Matched by | Why the spool keeps its value |";
+const PRIVACY_PAGE_RULE_TWO_MATCHED_BY = "this name normalized, in any spelling";
+
+/**
+ * Review r2 (REVIEW-68-r2), N1 — the rule-2 names AS THE PRIVACY PAGE PRINTS
+ * THEM, read back out of the rendered markdown table rather than out of the
+ * array the table is built from.
+ *
+ * Why this exists: `renderedRuleTwoRows` in
+ * `r_every_protected_identity_name_is_blanked_or_declared` is
+ * `SPOOL_DERIVATION_INPUT_DISCLOSURE` filtered by `match`, and that constant is
+ * spread from `SPOOL_PROTECTED_IDENTITY_KEYS` — the same array
+ * `derivedRuleTwoNames` is built from. That leg restates "derived == hand list"
+ * in different words and cannot fail on its own. This one goes through
+ * `renderPrivacySpec`, the function that actually writes
+ * `docs/privacy-spec.md`, so a change to how the TABLE is built — a dropped or
+ * re-ordered row, a re-labelled `Matched by` cell, a key printed through
+ * anything other than `item.key` — moves these names while the key array stands
+ * still, and `r_the_privacy_pages_rendered_rule_two_table_names_the_hand_list`
+ * reds while the restated leg stays green.
+ *
+ * It fails closed. A table this reader cannot find, a second table wearing the
+ * same header, a row whose cells it cannot read: each yields a name list that
+ * cannot equal the hand list, rather than an empty pass.
+ */
+function ruleTwoNamesAsThePageRendersThem(page: string) {
+  const lines = page.split("\n");
+  const header = lines.indexOf(PRIVACY_PAGE_DISCLOSURE_TABLE_HEADER);
+  const duplicateHeader =
+    header >= 0 && lines.indexOf(PRIVACY_PAGE_DISCLOSURE_TABLE_HEADER, header + 1) >= 0;
+  if (header < 0 || duplicateHeader) {
+    return { found: false, duplicateHeader, names: [] as string[], rows: 0, unreadable: [] as string[] };
+  }
+  const names: string[] = [];
+  const unreadable: string[] = [];
+  let rows = 0;
+  // `header + 2` steps over the `|---|---|---|---|` alignment row.
+  for (let index = header + 2; index < lines.length; index += 1) {
+    const line = lines[index] ?? "";
+    if (!line.startsWith("|")) break;
+    rows += 1;
+    const cells = line.split("|").slice(1, -1).map((cell) => cell.trim());
+    if (cells.length !== 4) {
+      unreadable.push(line);
+      continue;
+    }
+    if (cells[2] !== PRIVACY_PAGE_RULE_TWO_MATCHED_BY) continue;
+    const printed = /^`([^`]+)`$/.exec(cells[1] ?? "");
+    if (!printed) {
+      unreadable.push(line);
+      continue;
+    }
+    names.push(printed[1] as string);
+  }
+  return { found: true, duplicateHeader, names: names.sort(), rows, unreadable };
+}
+
 async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
   const { home } = fixtureHome("r");
   const collector = await startCollector(home, INTAKE_SPOOL_EXHAUSTED);
@@ -2128,6 +2193,59 @@ async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
     },
   );
 
+  // Review r2 (REVIEW-68-r2), N1 — the THIRD leg, and the only one of the three
+  // that is independent.
+  //
+  // The two legs above are `SPOOL_PROTECTED_IDENTITY_KEYS` compared with the
+  // hand list, and `SPOOL_DERIVATION_INPUT_DISCLOSURE` filtered by `match`
+  // compared with the hand list. The second constant is spread FROM the first,
+  // so the second leg cannot red while the first is green: it is one fact told
+  // twice. Nothing in this proof read the page the disclosure exists to
+  // produce, so `reasonTable` could have stopped printing a rule-2 row, printed
+  // it under the exact-name label, or printed something other than `item.key`,
+  // and 121/121 would still have passed with an operator reading a short table.
+  //
+  // So take the names from the RENDERED page: `renderPrivacySpec` over
+  // `collectPrivacySpecModel`, which is the exact call `pnpm docs:privacy`
+  // makes, parsed back out of its markdown. And take them a second time from
+  // the COMMITTED `docs/privacy-spec.md`, so the page an operator actually
+  // opens is held to the same hand list even without the `docs:privacy --check`
+  // gate. Both are compared with `SPOOL_RULE_TWO_DISCLOSED_CANONICAL_NAMES`,
+  // which is typed by hand and derived from nothing.
+  const pageRendersRuleTwo = ruleTwoNamesAsThePageRendersThem(
+    renderPrivacySpec(collectPrivacySpecModel()),
+  );
+  const committedPageRuleTwo = ruleTwoNamesAsThePageRendersThem(
+    fs.readFileSync(path.join(repoRoot, "docs", "privacy-spec.md"), "utf8"),
+  );
+  check(
+    "r_the_privacy_pages_rendered_rule_two_table_names_the_hand_list",
+    disclosedRuleTwoNames.length > 0 &&
+      pageRendersRuleTwo.found &&
+      committedPageRuleTwo.found &&
+      pageRendersRuleTwo.unreadable.length === 0 &&
+      committedPageRuleTwo.unreadable.length === 0 &&
+      pageRendersRuleTwo.rows > pageRendersRuleTwo.names.length &&
+      JSON.stringify(pageRendersRuleTwo.names) === JSON.stringify(disclosedRuleTwoNames) &&
+      JSON.stringify(committedPageRuleTwo.names) === JSON.stringify(disclosedRuleTwoNames),
+    {
+      source: "renderPrivacySpec(collectPrivacySpecModel()) + docs/privacy-spec.md",
+      handList: disclosedRuleTwoNames,
+      renderedRuleTwoNames: pageRendersRuleTwo.names,
+      committedRuleTwoNames: committedPageRuleTwo.names,
+      renderedTableRows: pageRendersRuleTwo.rows,
+      committedTableRows: committedPageRuleTwo.rows,
+      tableFound: { rendered: pageRendersRuleTwo.found, committed: committedPageRuleTwo.found },
+      duplicateHeader: {
+        rendered: pageRendersRuleTwo.duplicateHeader,
+        committed: committedPageRuleTwo.duplicateHeader,
+      },
+      unreadableRows: [...pageRendersRuleTwo.unreadable, ...committedPageRuleTwo.unreadable],
+      independentOf:
+        "SPOOL_PROTECTED_IDENTITY_KEYS / SPOOL_DERIVATION_INPUT_DISCLOSURE — these names come from the generator's own rendered table",
+    },
+  );
+
   // Review r1 (r2 round), F1 — this replaces
   // `r_a_protected_name_the_drop_rule_strips_is_blanked_in_every_spelling`,
   // which asserted something FALSE over a corpus that could not show it. Its
@@ -2262,6 +2380,61 @@ async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
       })),
       spoolBlanksWhatTheLedgerPersists: spoolBlanksWhatTheLedgerPersists.map((row) => row.key),
       declaredDivergences: declaredDivergences.map((row) => row.key),
+    },
+  );
+
+  // Review r2 (REVIEW-68-r2), N4 — where rule 2's conjunction is load-bearing,
+  // and where it is not, measured rather than argued.
+  //
+  // `spoolSuppressedKey` (`packages/collector-cli/src/hook-spool.ts`) guards
+  // with `if (spoolKeepsProtectedIdentityRaw(key)) return false;` before its
+  // final `return collectorStripsKeyOutright(key)`. That guard LINE decides
+  // nothing. The predicate is `!collectorStripsKeyOutright(key) &&
+  // isProtectedMetadataFieldName(key)`, so it is only ever true for a key the
+  // collector does not strip outright, and the final return answers `false` for
+  // exactly those keys anyway. Measured on the .86 base: deleting the line
+  // leaves `pnpm proof:hook-spool` at 121/121. The line is kept because the
+  // runtime is frozen for this bead and it reads as a declaration; its removal
+  // is recorded as a follow-up, not done here.
+  //
+  // What IS load-bearing is the conjunction INSIDE the predicate. Drop
+  // `!collectorStripsKeyOutright(key) &&` and every protected path/email name
+  // the DROP rule strips — `user.email`, `transcript_path`, `file_path` — turns
+  // "exempt by rule 2", and rule 2 becomes an override of the DROP rule instead
+  // of a name for what was already happening. That is the edit NC2 makes, and
+  // this is the check that answers it: a key the ledger drops outright is never
+  // exempt by rule 2.
+  //
+  // `ledgerTopLevel === "dropped"` is `collectorStripsKeyOutright` seen from
+  // outside the module, which does not export it: `sanitizeRoutineMetadata`
+  // drops a key on `!isSafeSuppressionSourceKey(key) ||
+  // isSensitiveMetadataSemanticKey(key)`, which is that predicate entire.
+  const ruleTwoExemptRows = mirrorRows.filter((row) => row.exemptByRuleTwo);
+  const exemptYetDroppedByTheLedger = ruleTwoExemptRows.filter(
+    (row) => row.ledgerTopLevel === "dropped" || row.ledgerOtlpAttribute === "dropped",
+  );
+  const droppedByTheLedger = mirrorRows.filter((row) => row.ledgerTopLevel === "dropped");
+  check(
+    "r_rule_twos_exemption_never_covers_a_key_the_ledger_drops_outright",
+    ruleTwoExemptRows.length > 0 &&
+      // Non-vacuous in the direction that matters: the corpus really does hold
+      // protected names the DROP rule strips, so "none of them is exempt" is a
+      // measurement and not an empty set talking.
+      droppedByTheLedger.some((row) => isProtectedMetadataFieldName(row.key)) &&
+      exemptYetDroppedByTheLedger.length === 0 &&
+      ruleTwoExemptRows.every((row) => row.spoolTopLevel === "raw"),
+    {
+      exemptByRuleTwo: ruleTwoExemptRows.length,
+      droppedByTheLedger: droppedByTheLedger.length,
+      droppedAndProtected: droppedByTheLedger.filter((row) =>
+        isProtectedMetadataFieldName(row.key),
+      ).length,
+      exemptYetDroppedByTheLedger: exemptYetDroppedByTheLedger.map((row) => ({
+        key: row.key,
+        ledger: [row.ledgerTopLevel, row.ledgerOtlpAttribute],
+      })),
+      callSiteGuardIsAMeasuredNoOp:
+        "spoolSuppressedKey's `if (spoolKeepsProtectedIdentityRaw(key)) return false` returns false only where `return collectorStripsKeyOutright(key)` already would (121/121 with the line deleted); the conjunction inside the predicate is what decides, and this check is what answers for it",
     },
   );
 
