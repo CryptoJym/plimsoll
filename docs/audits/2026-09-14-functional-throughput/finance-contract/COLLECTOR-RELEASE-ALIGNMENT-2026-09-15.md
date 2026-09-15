@@ -20,6 +20,7 @@ The hosted enrollment command is being aligned from `plimsoll-cli` `v0.7.5` to t
 - Commit: `6f38b4f2b5c085e3abd7257792750d742001b719`
 - Base: PR120 UX commit `83a371b86cf9c7211ccd0abb733f84349f0e85c8`
 - Changed files: `src/lib/collector-release.ts`, `scripts/collector-release-proof.ts`
+- PR121 merge commit: `c712b4c411fdfe8e723bf0df85a0b59f72b58dc6`
 
 ## Checks
 
@@ -31,7 +32,7 @@ Local checks passed:
 - `pnpm test` — 214 passed, 14 skipped, 0 failed
 - `pnpm build`
 
-PR121 Vercel preview is deployed successfully. GitHub `build-and-proof` and `install-tenant-race-proof` both passed. Merge and production release remain open until the stacked change is independently reviewed and integrated into the UX branch.
+PR121 Vercel preview is deployed successfully. GitHub `build-and-proof` and `install-tenant-race-proof` both passed, and PR121 is merged into the PR120 UX branch at `c712b4c411fdfe8e723bf0df85a0b59f72b58dc6`. PR120 CI and preview are re-running on the integrated head; production release remains open until those checks and native readback complete.
 
 ## Recovery
 
