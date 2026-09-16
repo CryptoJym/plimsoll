@@ -37,8 +37,12 @@ does not transfer its sessions to a tailer.
   whose environment cannot be read is `unknown` and never stale, and no token,
   command line or path outside `$HOME` is printed.
 - While `source_required` or `producer_token_required` rejections are open,
-  `status` names the stale-producer count in the capture source's reason,
-  from a background scan cached for at most 60 seconds.
+  `status` names the stale-producer count in the capture source's reason and
+  in `captureHealth.staleProducers`, from a background scan cached for at most
+  60 seconds. When the environment or launchd read fails the scan is
+  `partial`, and doctor and status name the failed read and how many producers
+  were inspected instead of a zero count. A daemon admission body whose rows do
+  not have the expected shape skips the scan and says so; `status` still exits 0.
 
 ### Fixed
 

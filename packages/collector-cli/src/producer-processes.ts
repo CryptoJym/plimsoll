@@ -9,7 +9,7 @@ import {
   managedConfigProofContext,
 } from "../../collector-config/src/index";
 import type { LocalProducerSource } from "./http-boundary";
-import type { RejectionDiagnosticsCounters } from "./rejection-diagnostics";
+import type { RejectionCounterRow, RejectionDiagnosticsCounters } from "./rejection-diagnostics";
 
 /**
  * Producer processes older than their managed config (bead eco-6hoxj.153).
@@ -34,7 +34,9 @@ import type { RejectionDiagnosticsCounters } from "./rejection-diagnostics";
  *     rotation) leaves beside the file. Without either it falls back to the
  *     file mtime and says so;
  *   - a process whose environment cannot be read has home `unknown` and is
- *     never `staleConfig: true`;
+ *     never `staleConfig: true`; when the environment or launchd read itself
+ *     fails the scan is `partial` and every summary says so, never a bare
+ *     zero (review r1 F1);
  *   - nothing is printed from a command line or an environment except the pid,
  *     a home under $HOME, and a conductor seat or launchd label. Never a value.
  *
@@ -349,6 +351,11 @@ function managedAppliedAt(
   } catch {
     // No readable directory: fall through to the other records.
   }
+  // Provenance contract (review r1 F5): managedAppliedAt is the NEWER of the
+  // latest applied reconcile receipt and the newest apply backup (the receipt
+  // wins a tie), then the file mtime, always labelled by managedAppliedAtSource.
+  // Newest evidence wins so a later token-rotation backup is never hidden
+  // behind an older reconcile receipt.
   const fromReceipt = reconcileApplied.get(surface.name) ?? null;
   const fromBackup = newestIso(backups);
   if (fromReceipt !== null || fromBackup !== null) {
@@ -370,6 +377,8 @@ export type ProducerProcess = {
   /** `~/…`, `outside_home`, or `unknown` when the environment was not readable. */
   home: string;
   homeSource: "env" | "default" | "unreadable";
+  /** Why home is `unknown`: the environment read failed, or this pid's was not readable. */
+  reason?: "environment_read_timeout" | "environment_read_unavailable" | "environment_not_readable";
   startedAt: string | null;
   managedSurface: string | null;
   managedAppliedAt: string | null;
@@ -380,7 +389,8 @@ export type ProducerProcess = {
 };
 
 export type ProducerProcessScan = {
-  inspection: "complete" | "truncated" | "timeout" | "unavailable" | "not_inspected";
+  /** `partial`: the environment or launchd read failed, so some verdicts are missing. */
+  inspection: "complete" | "truncated" | "partial" | "timeout" | "unavailable" | "not_inspected";
   reason?: string;
   provider: "process_table" | "fixture" | null;
   scannedAt: string;
@@ -449,6 +459,24 @@ function resolveOwner(
     current = table.get(current.ppid);
   }
   return { owner: "other", hint: `restart pid ${row.pid} (${source}) where it was started` };
+}
+
+/**
+ * `stale-producer scan partial: environment read timeout — 0 of 3 producers
+ * inspected` when a read the verdicts depend on failed, else null.
+ */
+function partialLabel(scan: Pick<ProducerProcessScan, "environmentsRead" | "launchdServicesRead">, processes: ProducerProcess[]) {
+  const failures = [
+    scan.environmentsRead === "timeout" || scan.environmentsRead === "unavailable"
+      ? `environment read ${scan.environmentsRead}`
+      : null,
+    scan.launchdServicesRead === "timeout" || scan.launchdServicesRead === "unavailable"
+      ? `launchd services read ${scan.launchdServicesRead}`
+      : null,
+  ].filter((failure): failure is string => failure !== null);
+  if (failures.length === 0) return null;
+  const inspected = processes.filter((entry) => entry.homeSource !== "unreadable").length;
+  return `stale-producer scan partial: ${failures.join(" and ")} — ${inspected} of ${processes.length} producers inspected`;
 }
 
 function summaryLine(processes: ProducerProcess[]) {
@@ -543,6 +571,7 @@ export async function scanProducerProcesses(options: ProducerProcessScanOptions)
         source,
         home: "unknown",
         homeSource: "unreadable",
+        reason: environmentRead.ok ? "environment_not_readable" : `environment_read_${environmentRead.error}`,
         startedAt: row.startedAt,
         managedSurface: null,
         managedAppliedAt: null,
@@ -577,24 +606,55 @@ export async function scanProducerProcesses(options: ProducerProcessScanOptions)
     };
   });
   const staleCount = processes.filter((entry) => entry.staleConfig).length;
+  const reads = {
+    environmentsRead: environmentRead.ok ? "complete" as const : environmentRead.error,
+    launchdServicesRead: servicesRead.ok ? "complete" as const : servicesRead.error,
+  };
+  const partial = partialLabel(reads, processes);
+  const stale = summaryLine(processes);
   return {
-    inspection: truncated ? "truncated" : "complete",
+    inspection: partial ? "partial" : truncated ? "truncated" : "complete",
     provider: provider.kind,
     scannedAt: now().toISOString(),
     rowLimit: PRODUCER_PROCESS_ROW_LIMIT,
     producerRows,
     truncated,
-    environmentsRead: environmentRead.ok ? "complete" : environmentRead.error,
-    launchdServicesRead: servicesRead.ok ? "complete" : servicesRead.error,
+    ...reads,
     staleCount,
     processes,
-    summary: summaryLine(processes),
+    summary: partial ? [partial, stale].filter((line): line is string => line !== null).join("; ") : stale,
   };
 }
 
-/** Open rejection windows of the reasons a stale producer causes. */
-export function openStaleProducerWindows(counters: RejectionDiagnosticsCounters | null | undefined) {
-  return (counters?.reasons ?? []).filter((row) =>
+/** One admission row with the fields the stale-producer windows read (review r1 F2). */
+function isAdmissionRow(row: unknown): row is RejectionCounterRow {
+  if (!row || typeof row !== "object") return false;
+  const { reason, clientClass, openWindow } = row as Record<string, unknown>;
+  if (typeof reason !== "string" || typeof clientClass !== "string") return false;
+  if (openWindow === null) return true;
+  if (!openWindow || typeof openWindow !== "object") return false;
+  const { count } = openWindow as Record<string, unknown>;
+  return typeof count === "number" && Number.isFinite(count);
+}
+
+/**
+ * A daemon `/status` body's `httpAdmission`, checked at the boundary: null when
+ * absent, `"invalid"` when any row does not have the expected shape.
+ */
+export function readRejectionAdmission(value: unknown): RejectionDiagnosticsCounters | "invalid" | null {
+  if (value === undefined || value === null) return null;
+  if (typeof value !== "object" || Array.isArray(value)) return "invalid";
+  const reasons = (value as { reasons?: unknown }).reasons;
+  return Array.isArray(reasons) && reasons.every(isAdmissionRow) ? value as RejectionDiagnosticsCounters : "invalid";
+}
+
+export const STALE_PRODUCER_ADMISSION_INVALID = "stale-producer scan skipped: daemon admission shape invalid";
+
+/** Open rejection windows of the reasons a stale producer causes; invalid input has none. */
+export function openStaleProducerWindows(counters: unknown): RejectionCounterRow[] {
+  const reasons = counters && typeof counters === "object" ? (counters as { reasons?: unknown }).reasons : undefined;
+  return (Array.isArray(reasons) ? reasons : []).filter((row): row is RejectionCounterRow =>
+    isAdmissionRow(row) &&
     (STALE_PRODUCER_REJECTION_REASONS as readonly string[]).includes(row.reason) &&
     row.openWindow !== null &&
     row.openWindow.count > 0
@@ -604,37 +664,52 @@ export function openStaleProducerWindows(counters: RejectionDiagnosticsCounters 
 type CaptureHealthLike = { sources?: Array<{ source: string; reason: string } & Record<string, unknown>> } &
   Record<string, unknown>;
 
+function staleProducerText(scan: ProducerProcessScan | null, source: string | null) {
+  if (!scan) return "stale-producer scan pending";
+  if (scan.inspection !== "complete" && scan.inspection !== "truncated" && scan.inspection !== "partial") {
+    return `stale-producer scan ${scan.inspection}`;
+  }
+  const processes = source === null ? scan.processes : scan.processes.filter((process) => process.source === source);
+  const partial = partialLabel(scan, processes);
+  const inspected = processes.some((process) => process.homeSource !== "unreadable");
+  const count = partial && !inspected
+    ? null
+    : `${processes.filter((process) => process.staleConfig).length} ${source ?? ""}${source ? " " : ""}producer process(es) older than their managed config${scan.truncated ? " (scan truncated)" : ""}`;
+  return `${[partial, count].filter((part): part is string => part !== null).join("; ")} — plimsoll doctor --read-only --json names them`;
+}
+
 /**
  * Name the stale-producer count in the reason of every capture source a
  * `source_required` / `producer_token_required` window can belong to. Only the
- * `reason` text changes: status, overall and every counter stay as they were,
- * so this is a diagnostic, never a fault shape. A scan older than
- * STALE_PRODUCER_SCAN_MAX_AGE_MS is not used.
+ * `reason` text changes, plus one `staleProducers` line across all producers:
+ * status, overall and every counter stay as they were, so this is a
+ * diagnostic, never a fault shape. A scan older than
+ * STALE_PRODUCER_SCAN_MAX_AGE_MS is not used. Admission the daemon answered in
+ * an invalid shape skips the scan and says so.
  */
 export function annotateCaptureHealthWithStaleProducers<T>(
   value: T,
-  counters: RejectionDiagnosticsCounters | null | undefined,
+  counters: RejectionDiagnosticsCounters | "invalid" | null | undefined,
   scan: ProducerProcessScan | null,
   nowMs: number = Date.now(),
 ): T {
-  const windows = openStaleProducerWindows(counters);
   const captureHealth = value as unknown as CaptureHealthLike | null | undefined;
-  if (!captureHealth || !Array.isArray(captureHealth.sources) || windows.length === 0) return value;
+  if (!captureHealth || typeof captureHealth !== "object") return value;
+  if (counters === "invalid") return { ...captureHealth, staleProducers: STALE_PRODUCER_ADMISSION_INVALID } as T;
+  const windows = openStaleProducerWindows(counters);
+  if (windows.length === 0) return value;
   const fresh = scan && nowMs - Date.parse(scan.scannedAt) <= STALE_PRODUCER_SCAN_MAX_AGE_MS ? scan : null;
+  const staleProducers = staleProducerText(fresh, null);
+  if (!Array.isArray(captureHealth.sources)) return { ...captureHealth, staleProducers } as T;
   const sources = captureHealth.sources.map((entry) => {
     if (!(PRODUCER_SOURCES as readonly string[]).includes(entry.source)) return entry;
     const reasons = [...new Set(windows
       .filter((row) => row.clientClass === entry.source || row.clientClass === "otlp_exporter" || row.clientClass === "unknown")
       .map((row) => row.reason))];
     if (reasons.length === 0) return entry;
-    const scanText = !fresh
-      ? "stale-producer scan pending"
-      : fresh.inspection === "complete" || fresh.inspection === "truncated"
-        ? `${fresh.processes.filter((process) => process.source === entry.source && process.staleConfig).length} ${entry.source} producer process(es) older than their managed config${fresh.truncated ? " (scan truncated)" : ""} — plimsoll doctor --read-only --json names them`
-        : `stale-producer scan ${fresh.inspection}`;
-    return { ...entry, reason: `${entry.reason}; ${reasons.join("/")} rejections open: ${scanText}` };
+    return { ...entry, reason: `${entry.reason}; ${reasons.join("/")} rejections open: ${staleProducerText(fresh, entry.source)}` };
   });
-  return { ...captureHealth, sources } as T;
+  return { ...captureHealth, staleProducers, sources } as T;
 }
 
 /**

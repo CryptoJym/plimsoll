@@ -224,6 +224,7 @@ import type { RejectionDiagnosticsCounters } from "./rejection-diagnostics";
 import {
   annotateCaptureHealthWithStaleProducers,
   openStaleProducerWindows,
+  readRejectionAdmission,
   scanProducerProcesses,
 } from "./producer-processes";
 import { runOutcomesSync } from "./outcomes-sync";
@@ -1151,7 +1152,7 @@ async function readDaemonState(
 ): Promise<{
   hookSpool: HookSpoolDaemonReading;
   sync: DaemonSyncReading;
-  httpAdmission: RejectionDiagnosticsCounters | null;
+  httpAdmission: RejectionDiagnosticsCounters | "invalid" | null;
 }> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), collectorStatusTimeoutMs());
@@ -1169,14 +1170,12 @@ async function readDaemonState(
     } catch {
       // Not a Plimsoll-ready service's answer.
     }
-    const httpAdmission = body?.httpAdmission;
     return {
       hookSpool: hookSpoolReadingFromStatusBody(body, response.ok),
       sync: syncReadingFromStatusBody(body, response.ok),
-      httpAdmission: response.ok && httpAdmission && typeof httpAdmission === "object" &&
-          Array.isArray((httpAdmission as { reasons?: unknown }).reasons)
-        ? httpAdmission as RejectionDiagnosticsCounters
-        : null,
+      // Every row is checked here (review r1 F2): a malformed row is labelled
+      // invalid admission, never trusted as counters.
+      httpAdmission: response.ok ? readRejectionAdmission(body?.httpAdmission) : null,
     };
   } catch {
     return {

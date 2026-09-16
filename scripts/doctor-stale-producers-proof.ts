@@ -10,22 +10,28 @@
  * path is under a temporary directory.
  */
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 
+import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
+import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import {
   PRODUCER_PROCESS_FIXTURE_ENV,
-  PRODUCER_PROCESS_ROW_LIMIT,
   STALE_PRODUCER_SCAN_MAX_AGE_MS,
   annotateCaptureHealthWithStaleProducers,
   createStaleProducerScanCache,
+  openStaleProducerWindows,
+  readRejectionAdmission,
   resolveProducerProcessProvider,
   scanProducerProcesses,
+  type ProducerProcessProvider,
   type ProducerProcessScan,
 } from "../packages/collector-cli/src/producer-processes";
 import type { RejectionDiagnosticsCounters } from "../packages/collector-cli/src/rejection-diagnostics";
+import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { useFixtureRoot } from "./lib/fixture-root";
 
 type Check = { name: string; passed: boolean; detail: unknown };
@@ -43,6 +49,8 @@ const fixture = useFixtureRoot(sandbox);
 const home = fixture.home;
 const collectorHome = fixture.env.PLIMSOLL_HOME!;
 const CANARY = "plimsoll-proof-canary-token-7f3a";
+// A config home outside $HOME (review r1 F3): printed only as `outside_home`.
+const outsideCodexHome = path.join(sandbox, "outside-home-codex");
 const UID = 501;
 
 const DAYS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"];
@@ -140,6 +148,14 @@ const processes: FixtureProcess[] = [
     command: "/opt/homebrew/bin/claude",
     env: envLine({ HOME: home, CLAUDE_CONFIG_DIR: `${home}/.claude-seats/seat-a` }),
   },
+  // Fresh, config home outside $HOME: no managed surface, and never printed.
+  {
+    pid: 44000,
+    ppid: 1,
+    started: "2026-09-15T13:00:00.000Z",
+    command: "/opt/bin/codex exec --json",
+    env: envLine({ HOME: home, CODEX_HOME: outsideCodexHome }),
+  },
   // Environment not readable: started years before any managed config.
   { pid: 50002, ppid: 1, started: "2020-01-01T00:00:00.000Z", command: "/opt/bin/codex exec --json", env: null },
   // Not a producer.
@@ -163,13 +179,18 @@ const launchctl = [
   "}",
 ].join("\n");
 
-function writeFixture(name: string, rows: FixtureProcess[]) {
+type ReadFailure = { error: "timeout" | "unavailable" };
+function writeFixture(
+  name: string,
+  rows: FixtureProcess[],
+  failures: { environments?: ReadFailure; launchctl?: ReadFailure } = {},
+) {
   const file = path.join(sandbox, `${name}.json`);
   fs.writeFileSync(file, JSON.stringify({
     uid: UID,
     processTable: renderTable(rows),
-    environments: renderEnvironments(rows.filter((row) => producerLike(row.command))),
-    launchctl,
+    environments: failures.environments ?? renderEnvironments(rows.filter((row) => producerLike(row.command))),
+    launchctl: failures.launchctl ?? launchctl,
   }));
   return file;
 }
@@ -191,7 +212,7 @@ async function main() {
   check("fixture_provider_is_used", scan.provider === "fixture" && scan.inspection === "complete", scan.inspection);
   check(
     "non_producers_are_not_reported",
-    !byPid.has(1) && !byPid.has(38948) && !byPid.has(60000) && scan.producerRows === 7,
+    !byPid.has(1) && !byPid.has(38948) && !byPid.has(60000) && scan.producerRows === 8,
     [...byPid.keys()],
   );
 
@@ -247,11 +268,18 @@ async function main() {
     `launchctl kickstart -k gui/${UID}/com.jamesbrady.codex-profile.pro2; ` +
     "restart conductor seat support-utlyze through the conductor (not by killing pid 38970); " +
     "restart pid 43001 (claude_code) where it was started", scan.summary);
+  const outside = byPid.get(44000);
+  check("outside_home_config_is_printed_only_as_outside_home", outside?.home === "outside_home" &&
+    outside.homeSource === "env" &&
+    outside.staleConfig === false &&
+    !JSON.stringify(scan).includes(outsideCodexHome) &&
+    !JSON.stringify(scan).includes("outside-home-codex"), outside);
   check("no_token_or_command_line_in_scan", !JSON.stringify(scan).includes(CANARY) &&
     !JSON.stringify(scan).includes("app-server") && !JSON.stringify(scan).includes(sandbox), null);
 
-  // The 400-row bound.
-  const many: FixtureProcess[] = Array.from({ length: PRODUCER_PROCESS_ROW_LIMIT + 50 }, (_, index) => ({
+  // The 400-row bound (review r1 F4): 405 producers and literal numbers, never
+  // the implementation constant.
+  const many: FixtureProcess[] = Array.from({ length: 405 }, (_, index) => ({
     pid: 70000 + index,
     ppid: 1,
     started: "2026-09-16T00:00:00.000Z",
@@ -272,9 +300,11 @@ async function main() {
     },
   });
   check("row_bound_is_400_producer_rows", bounded.inspection === "truncated" && bounded.truncated === true &&
-    bounded.producerRows === PRODUCER_PROCESS_ROW_LIMIT + 50 &&
-    bounded.processes.length === PRODUCER_PROCESS_ROW_LIMIT &&
-    environmentPids === PRODUCER_PROCESS_ROW_LIMIT, {
+    bounded.rowLimit === 400 &&
+    bounded.producerRows === 405 &&
+    bounded.processes.length === 400 &&
+    environmentPids === 400, {
+    rowLimit: bounded.rowLimit,
     inspection: bounded.inspection,
     producerRows: bounded.producerRows,
     reported: bounded.processes.length,
@@ -288,6 +318,115 @@ async function main() {
   });
   check("process_table_timeout_is_reported_not_guessed", timedOut.inspection === "timeout" &&
     timedOut.processes.length === 0 && timedOut.summary === null, timedOut.inspection);
+
+  // Partial inspection (review r1 F1): a failed environment or launchd read is
+  // named, never read as zero stale producers.
+  const partialFixtures = {
+    env_timeout: writeFixture("partial-env-timeout", processes, { environments: { error: "timeout" } }),
+    env_unavailable: writeFixture("partial-env-unavailable", processes, { environments: { error: "unavailable" } }),
+    launchctl_unavailable: writeFixture("partial-launchctl-unavailable", processes, { launchctl: { error: "unavailable" } }),
+  };
+  const partialSummary = {
+    env_timeout: "stale-producer scan partial: environment read timeout — 0 of 8 producers inspected",
+    env_unavailable: "stale-producer scan partial: environment read unavailable — 0 of 8 producers inspected",
+    launchctl_unavailable: "stale-producer scan partial: launchd services read unavailable — 6 of 8 producers inspected; " +
+      "3 producer process(es) older than their managed config (1 judged by file mtime only, no managed-apply record)",
+  };
+  const partialScans = new Map<keyof typeof partialFixtures, ProducerProcessScan>();
+  for (const [variant, file] of Object.entries(partialFixtures) as Array<[keyof typeof partialFixtures, string]>) {
+    const partial = await scanProducerProcesses({ collectorHome, home, provider: providerFor(file) });
+    partialScans.set(variant, partial);
+    const environmentFailed = variant !== "launchctl_unavailable";
+    check(`${variant}_scan_is_partial_and_says_so`, partial.inspection === "partial" &&
+      partial.summary?.startsWith(partialSummary[variant]) &&
+      (environmentFailed
+        ? partial.staleCount === 0 && partial.processes.every((entry) => entry.home === "unknown" &&
+          entry.staleConfig === false &&
+          entry.reason === (variant === "env_timeout" ? "environment_read_timeout" : "environment_read_unavailable"))
+        : partial.staleCount === 3 && partial.launchdServicesRead === "unavailable"), {
+      inspection: partial.inspection,
+      summary: partial.summary,
+      reasons: partial.processes.map((entry) => entry.reason ?? null),
+    });
+  }
+  const bareZero = /(?:^|: )0 (?:codex |claude_code )?producer process\(es\)/;
+  const partialHealth = {
+    generatedAt: "2026-09-16T04:00:00.000Z",
+    overall: "green",
+    sources: [{ source: "codex", status: "green", reason: "capture current", rootsStarted: 1, rootsEligible: 1, rootsTotal: 1 }],
+  };
+  const openCounters = {
+    reasons: [{
+      reason: "source_required",
+      clientClass: "otlp_exporter",
+      rejected: 1,
+      suppressed: 0,
+      emittedFirst: 1,
+      summarized: 0,
+      openWindow: { count: 1, suppressed: 0 },
+    }],
+  } as RejectionDiagnosticsCounters;
+  const envTimeoutScan = partialScans.get("env_timeout")!;
+  const envTimeoutAnnotated = annotateCaptureHealthWithStaleProducers(
+    partialHealth, openCounters, envTimeoutScan, Date.parse(envTimeoutScan.scannedAt),
+  ) as typeof partialHealth & { staleProducers?: string };
+  check("partial_scan_status_reason_names_the_failed_read_never_a_bare_zero",
+    envTimeoutAnnotated.sources[0]!.reason === "capture current; source_required rejections open: " +
+      "stale-producer scan partial: environment read timeout — 0 of 5 producers inspected — plimsoll doctor --read-only --json names them" &&
+    envTimeoutAnnotated.staleProducers ===
+      "stale-producer scan partial: environment read timeout — 0 of 8 producers inspected — plimsoll doctor --read-only --json names them" &&
+    !bareZero.test(envTimeoutAnnotated.sources[0]!.reason), envTimeoutAnnotated);
+
+  // Admission rows are checked at the boundary (review r1 F2).
+  const malformedAdmissions: Record<string, unknown> = {
+    missing_open_window: { reasons: [{ reason: "source_required", clientClass: "otlp_exporter" }] },
+    null_row: { reasons: [null] },
+    non_numeric_count: { reasons: [{ reason: "source_required", clientClass: "otlp_exporter", openWindow: { count: "1", suppressed: 0 } }] },
+    reasons_not_an_array: { reasons: "source_required" },
+  };
+  check("malformed_admission_is_invalid_and_opens_no_window",
+    Object.values(malformedAdmissions).every((value) =>
+      readRejectionAdmission(value) === "invalid" && openStaleProducerWindows(value).length === 0) &&
+    openStaleProducerWindows([null]).length === 0 &&
+    readRejectionAdmission(undefined) === null &&
+    readRejectionAdmission(openCounters) === openCounters &&
+    (annotateCaptureHealthWithStaleProducers(partialHealth, "invalid", scan) as { staleProducers?: string }).staleProducers ===
+      "stale-producer scan skipped: daemon admission shape invalid", null);
+
+  // Provenance contract (review r1 F5): the NEWER of the latest applied
+  // reconcile receipt and the newest apply backup, the receipt winning a tie.
+  const provenanceHome = path.join(sandbox, "provenance-home");
+  const provenanceCollector = path.join(provenanceHome, ".plimsoll");
+  const provenanceConfig = path.join(provenanceHome, ".codex", "config.toml");
+  write(provenanceConfig, "# managed\n", "2026-01-01T00:00:00.000Z");
+  write(
+    path.join(provenanceCollector, "receipts", "managed-config-reconcile-2026-03-01T00-00-00-000Z.json"),
+    `${JSON.stringify({ startedAt: "2026-03-01T00:00:00.000Z", targets: [{ name: "codex", status: "applied" }] })}\n`,
+  );
+  const provenanceRow: FixtureProcess = {
+    pid: 900,
+    ppid: 1,
+    started: "2020-01-01T00:00:00.000Z",
+    command: "/opt/bin/codex app-server",
+    env: envLine({ HOME: provenanceHome }),
+  };
+  const provenanceProvider: ProducerProcessProvider = {
+    kind: "fixture",
+    uid: UID,
+    processTable: async () => ({ ok: true, stdout: renderTable([provenanceRow]) }),
+    environments: async () => ({ ok: true, stdout: renderEnvironments([provenanceRow]) }),
+    launchdServices: async () => ({ ok: true, stdout: "" }),
+  };
+  const aprilBackup = backupName(provenanceConfig, "2026-04-01T00:00:00.000Z");
+  write(aprilBackup, "# pre\n");
+  const newerBackup = (await scanProducerProcesses({ collectorHome: provenanceCollector, home: provenanceHome, provider: provenanceProvider })).processes[0];
+  fs.rmSync(aprilBackup);
+  write(backupName(provenanceConfig, "2026-03-01T00:00:00.000Z"), "# pre\n");
+  const tie = (await scanProducerProcesses({ collectorHome: provenanceCollector, home: provenanceHome, provider: provenanceProvider })).processes[0];
+  check("managed_applied_at_is_newest_receipt_or_backup_receipt_wins_tie",
+    newerBackup?.managedAppliedAt === "2026-04-01T00:00:00.000Z" && newerBackup.managedAppliedAtSource === "apply_backup" &&
+    tie?.managedAppliedAt === "2026-03-01T00:00:00.000Z" && tie.managedAppliedAtSource === "reconcile_receipt",
+  { newerBackup, tie });
 
   check("proof_context_never_reads_the_real_process_table", resolveProducerProcessProvider({ ...process.env,
     [PRODUCER_PROCESS_FIXTURE_ENV]: "" }) === null, null);
@@ -431,12 +570,138 @@ async function main() {
   check("doctor_output_carries_no_token", !doctorRun.stdout.includes(CANARY) && !doctorRun.stderr.includes(CANARY), null);
   const quiet = JSON.parse(doctor({ [PRODUCER_PROCESS_FIXTURE_ENV]: noStaleFixture }).stdout) as typeof receipt;
   check("doctor_has_no_summary_without_stale_producers", quiet.summary === undefined &&
-    quiet.producerProcesses.staleCount === 0 && quiet.producerProcesses.processes.length === 4, quiet.summary ?? null);
+    quiet.producerProcesses.staleCount === 0 && quiet.producerProcesses.processes.length === 5, quiet.summary ?? null);
+  check("doctor_prints_outside_home_never_the_path", receipt.producerProcesses.processes.find((entry) => entry.pid === 44000)?.home === "outside_home" &&
+    !doctorRun.stdout.includes(outsideCodexHome) && !doctorRun.stderr.includes(outsideCodexHome) &&
+    !doctorRun.stdout.includes("outside-home-codex"), null);
+  for (const [variant, file] of Object.entries(partialFixtures) as Array<[keyof typeof partialFixtures, string]>) {
+    const partialDoctor = JSON.parse(doctor({ [PRODUCER_PROCESS_FIXTURE_ENV]: file }).stdout) as typeof receipt;
+    check(`doctor_summary_names_${variant}_partial_scan`, partialDoctor.producerProcesses.inspection === "partial" &&
+      partialDoctor.readiness === receipt.readiness &&
+      Array.isArray(partialDoctor.summary) && partialDoctor.summary.length === 1 &&
+      partialDoctor.summary[0]!.startsWith(partialSummary[variant]) &&
+      !bareZero.test(partialDoctor.summary[0]!) &&
+      (variant === "launchctl_unavailable" ||
+        partialDoctor.producerProcesses.processes.find((entry) => entry.pid === 7539)?.reason ===
+          (variant === "env_timeout" ? "environment_read_timeout" : "environment_read_unavailable")),
+    partialDoctor.summary ?? null);
+  }
   const proofContext = JSON.parse(doctor({}).stdout) as typeof receipt;
   check("doctor_in_proof_context_without_fixture_is_not_inspected", proofContext.producerProcesses.inspection === "not_inspected" &&
     proofContext.producerProcesses.reason === "proof_context_without_process_fixture", proofContext.producerProcesses);
   check("doctor_never_ran_ps_or_launchctl", !fs.existsSync(stubLog), fs.existsSync(stubLog) ? fs.readFileSync(stubLog, "utf8") : null);
   check("doctor_stays_read_only", snapshot(sandbox) === before, null);
+
+  // Live daemon /status (review r1 F1/F3): the partial label reaches HTTP.
+  const daemonHealth = { ...health, sources: health.sources.map((entry) => ({ ...entry })) };
+  async function liveStatus(variant: string, fixtureFile: string) {
+    process.env[PRODUCER_PROCESS_FIXTURE_ENV] = fixtureFile;
+    const daemonDir = path.join(sandbox, `daemon-${variant}`);
+    fs.mkdirSync(daemonDir, { recursive: true, mode: 0o700 });
+    const buffer = new LocalEventBuffer(path.join(daemonDir, "ledger.sqlite"));
+    buffer.projection.readSnapshot = (() => ({
+      kind: "ready",
+      etagSeed: "fixture",
+      snapshot: {
+        generation: 1,
+        window: { since: "2026-08-17T00:00:00.000Z" },
+        projection: {},
+        status: { health: structuredClone(daemonHealth), projection: { ready: true, parityReady: true } },
+      },
+    })) as unknown as typeof buffer.projection.readSnapshot;
+    const server = createCollectorServer(collectorConfigSchema.parse({}), buffer);
+    const warn = console.warn;
+    console.warn = () => {};
+    try {
+      await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+      const url = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
+      const rejected = await fetch(`${url}/v1/logs`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+      let text = "";
+      for (let attempt = 0; attempt < 120; attempt += 1) {
+        text = await (await fetch(`${url}/status`)).text();
+        if (!text.includes("stale-producer scan pending")) break;
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      return { rejected: rejected.status, text, body: JSON.parse(text) as { captureHealth: typeof daemonHealth & { staleProducers?: string } } };
+    } finally {
+      console.warn = warn;
+      server.closeAllConnections();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+      buffer.close();
+      delete process.env[PRODUCER_PROCESS_FIXTURE_ENV];
+    }
+  }
+  const doctorHint = " — plimsoll doctor --read-only --json names them";
+  const liveExpected = {
+    env_timeout: "stale-producer scan partial: environment read timeout — 0 of 5 producers inspected" + doctorHint,
+    env_unavailable: "stale-producer scan partial: environment read unavailable — 0 of 5 producers inspected" + doctorHint,
+    launchctl_unavailable: "stale-producer scan partial: launchd services read unavailable — 4 of 5 producers inspected; " +
+      "2 codex producer process(es) older than their managed config" + doctorHint,
+  };
+  for (const [variant, file] of Object.entries(partialFixtures) as Array<[keyof typeof partialFixtures, string]>) {
+    const live = await liveStatus(variant, file);
+    const codexReason = live.body.captureHealth.sources[0]!.reason;
+    check(`live_daemon_status_names_${variant}_partial_scan`, live.rejected === 401 &&
+      codexReason === `${health.sources[0]!.reason}; source_required rejections open: ${liveExpected[variant]}` &&
+      live.body.captureHealth.staleProducers?.startsWith(partialSummary[variant].split("; ")[0]!) &&
+      !bareZero.test(codexReason) &&
+      !live.text.includes(outsideCodexHome) && !live.text.includes(CANARY), { rejected: live.rejected, codexReason });
+  }
+
+  // One-shot `plimsoll status` against a daemon answering a fixed body.
+  let statusBody: unknown = null;
+  const fakeDaemon = http.createServer((_request, response) => {
+    response.writeHead(200, { "content-type": "application/json" });
+    response.end(JSON.stringify(statusBody));
+  });
+  await new Promise<void>((resolve) => fakeDaemon.listen(0, "127.0.0.1", resolve));
+  fs.writeFileSync(path.join(collectorHome, "collector.config.json"),
+    JSON.stringify({ port: (fakeDaemon.address() as { port: number }).port }));
+  function oneShotStatus(admission: unknown, extraEnv: Record<string, string>) {
+    statusBody = { ok: true, httpAdmission: admission };
+    return new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+      const child = spawn(process.execPath, [tsx, cli, "status"], {
+        cwd: sandbox,
+        env: { ...process.env, ...fixture.env, PATH: `${stubBin}:${process.env.PATH ?? ""}`, ...extraEnv },
+      });
+      let stdout = "";
+      let stderr = "";
+      child.stdout.on("data", (chunk) => { stdout += chunk; });
+      child.stderr.on("data", (chunk) => { stderr += chunk; });
+      const timer = setTimeout(() => child.kill("SIGKILL"), 120_000);
+      child.on("close", (code) => {
+        clearTimeout(timer);
+        resolve({ code, stdout, stderr });
+      });
+    });
+  }
+  type StatusJson = { captureHealth: { staleProducers?: string } };
+  try {
+    const valid = await oneShotStatus(openCounters, { [PRODUCER_PROCESS_FIXTURE_ENV]: mainFixture });
+    const validJson = JSON.parse(valid.stdout) as StatusJson;
+    check("one_shot_status_names_the_stale_producer_count", valid.code === 0 &&
+      validJson.captureHealth.staleProducers === "3 producer process(es) older than their managed config" + doctorHint &&
+      !valid.stdout.includes(outsideCodexHome) && !valid.stdout.includes(CANARY), { code: valid.code, captureHealth: validJson.captureHealth });
+    for (const [variant, file] of Object.entries(partialFixtures) as Array<[keyof typeof partialFixtures, string]>) {
+      const run = await oneShotStatus(openCounters, { [PRODUCER_PROCESS_FIXTURE_ENV]: file });
+      const json = run.stdout.trim().startsWith("{") ? JSON.parse(run.stdout) as StatusJson : null;
+      check(`one_shot_status_names_${variant}_partial_scan`, run.code === 0 &&
+        json?.captureHealth.staleProducers?.startsWith(partialSummary[variant].split("; ")[0]!) &&
+        json.captureHealth.staleProducers.endsWith(doctorHint) &&
+        !bareZero.test(json.captureHealth.staleProducers), { code: run.code, captureHealth: json?.captureHealth ?? null });
+    }
+    for (const [variant, admission] of Object.entries(malformedAdmissions)) {
+      const run = await oneShotStatus(admission, { [PRODUCER_PROCESS_FIXTURE_ENV]: mainFixture });
+      const json = run.stdout.trim().startsWith("{") ? JSON.parse(run.stdout) as StatusJson : null;
+      check(`one_shot_status_survives_malformed_admission_${variant}`, run.code === 0 && json !== null &&
+        json.captureHealth.staleProducers === "stale-producer scan skipped: daemon admission shape invalid",
+      { code: run.code, stderr: run.stderr.slice(0, 500), captureHealth: json?.captureHealth ?? null });
+    }
+    check("status_never_ran_ps_or_launchctl", !fs.existsSync(stubLog), null);
+  } finally {
+    fakeDaemon.closeAllConnections();
+    await new Promise<void>((resolve) => fakeDaemon.close(() => resolve()));
+  }
 
   console.log(JSON.stringify({
     proof: "doctor-stale-producers",
