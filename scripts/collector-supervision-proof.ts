@@ -208,7 +208,14 @@ function launchAgentCommand(
         PLIMSOLL_PROOF_LAUNCHCTL_NOT_FOUND:
           `Could not find service "${LAUNCH_AGENT_LABEL}" in domain for user gui: ${process.getuid?.() ?? "unknown"}`,
         ...(bootoutPid ? { PLIMSOLL_PROOF_BOOTOUT_PID: String(bootoutPid) } : {}),
-        ...(behavior.bootoutSettlementPath ? { PLIMSOLL_PROOF_BOOTOUT_SETTLED: behavior.bootoutSettlementPath } : {}),
+        ...(behavior.bootoutSettlementPath
+          ? {
+              PLIMSOLL_PROOF_BOOTOUT_SETTLED: behavior.bootoutSettlementPath,
+              // Pin the positive-path wait so inherited ambient
+              // PLIMSOLL_PROOF_BOOTOUT_WAIT_LIMIT cannot shrink the barrier.
+              PLIMSOLL_PROOF_BOOTOUT_WAIT_LIMIT: "600",
+            }
+          : {}),
       },
       stdio: ["ignore", "pipe", "pipe"],
     }),
@@ -226,8 +233,54 @@ async function stopOwner(watched: WatchedChild) {
   await waitForExit(watched.child);
 }
 
+function writeSettlementMarker(settlementPath: string, body: string) {
+  const temporaryPath = settlementPath + ".tmp";
+  fs.writeFileSync(temporaryPath, body, { mode: 0o600 });
+  fs.renameSync(temporaryPath, settlementPath);
+}
+
+function settlementBarrierDiagnostic(input: {
+  settlementPath: string;
+  unloadOutput: string;
+  unloadErrors: string[];
+  unloadExit: { code: number | null; signal: NodeJS.Signals | null };
+}) {
+  const present = fs.existsSync(input.settlementPath);
+  const marker = present ? fs.readFileSync(input.settlementPath, "utf8") : "";
+  const inferred = !present ? 75 : marker.trim() === "settled" ? "not-barrier" : 76;
+  return (
+    "settlement barrier exit 75 (missing marker) or 76 (refused or empty marker); " +
+    "inferred=" +
+    inferred +
+    "; markerPresent=" +
+    present +
+    "; marker=" +
+    JSON.stringify(marker) +
+    "; unloadExit=" +
+    input.unloadExit.code +
+    "; stderr=" +
+    input.unloadErrors.join("") +
+    "; output=" +
+    input.unloadOutput
+  );
+}
+
+function fixtureCleanupResult() {
+  return {
+    removed: false, ambiguous: false, quarantined: false,
+    persistent: { ambiguous: false, markerState: "missing" as const, claimCount: 0,
+      quarantineCount: 0, inventoryTruncated: false, unsafeArtifactCount: 0 },
+    disposition: "not_owned" as const,
+  };
+}
+
 /** Reproduce the read/remove race with injected observations, never wall time. */
-async function verifyCleanupRaceRemainsRefused(home: string, root: string) {
+async function verifyCleanupRaceRemainsRefused(
+  home: string,
+  root: string,
+  timeoutMs = 100,
+  pollIntervalMs = 50,
+) {
   fs.mkdirSync(home, { recursive: true, mode: 0o700 });
   const owner = runtimeIdentity(process.pid);
   writePidRecord(home, owner, root);
@@ -240,8 +293,9 @@ async function verifyCleanupRaceRemainsRefused(home: string, root: string) {
     readPidFile: () => pidRead,
   });
   let clock = 0, removals = 0;
+  const expectedObservations = Math.floor(timeoutMs / pollIntervalMs) + 2;
   const outcome = await observeLaunchAgentUnloadTerminalState({
-    label: LAUNCH_AGENT_LABEL, pidPath, port: 1, prior, timeoutMs: 100, pollIntervalMs: 50,
+    label: LAUNCH_AGENT_LABEL, pidPath, port: 1, prior, timeoutMs, pollIntervalMs,
     observeLabel: () => ({ kind: "not_reported" }),
     observeListener: async () => ({ kind: "absent" }),
     classifyIdentity: () => "stale",
@@ -250,10 +304,7 @@ async function verifyCleanupRaceRemainsRefused(home: string, root: string) {
       // The other cleanup actor removed the record after this observer's read.
       // No actual process is signaled and the fixture file is left untouched.
       pidRead = { kind: "missing" }; removals++;
-      return { removed: false, ambiguous: false, quarantined: false,
-        persistent: { ambiguous: false, markerState: "missing", claimCount: 0,
-          quarantineCount: 0, inventoryTruncated: false, unsafeArtifactCount: 0 },
-        disposition: "not_owned" };
+      return fixtureCleanupResult();
     },
     now: () => clock,
     poll: async milliseconds => { clock += milliseconds; },
@@ -262,10 +313,51 @@ async function verifyCleanupRaceRemainsRefused(home: string, root: string) {
     outcome.pidCleanupAmbiguous && !outcome.pidCleaned &&
     outcome.final.pidRecordState === "missing" && outcome.final.listenerState === "absent" &&
     outcome.final.pidCleanupMarkerState === "missing" && !outcome.final.priorRuntimeLive &&
-    outcome.timing.observations === 4 && outcome.timing.finalObservationPerformed,
+    outcome.timing.observations === expectedObservations &&
+    outcome.timing.deadlineCrossed && outcome.timing.finalObservationPerformed,
     "Cleanup race control was promoted to stopped truth: " + JSON.stringify(outcome));
   return { state: outcome.state, ambiguous: outcome.pidCleanupAmbiguous,
-    observations: outcome.timing.observations, virtualElapsedMs: outcome.timing.elapsedMs };
+    observations: outcome.timing.observations, expectedObservations,
+    deadlineCrossed: outcome.timing.deadlineCrossed,
+    virtualElapsedMs: outcome.timing.elapsedMs, timeoutMs, pollIntervalMs };
+}
+
+/** Real launchctl bootout returns before the owner is gone; the observer polls. */
+async function verifyPollAndConverge(home: string, root: string) {
+  fs.mkdirSync(home, { recursive: true, mode: 0o700 });
+  const owner = runtimeIdentity(process.pid);
+  writePidRecord(home, owner, root);
+  const pidPath = path.join(home, "collector.pid");
+  const prior = await captureLaunchAgentUnloadPriorState({
+    label: LAUNCH_AGENT_LABEL, pidPath, port: 1,
+    observeLabel: () => ({ kind: "reported", processIdentity: owner }),
+    observeListener: async () => ({ kind: "collector", runtimeIdentity: owner }),
+    readPidFile: () => readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL),
+  });
+  let ticks = 0, clock = 0;
+  const outcome = await observeLaunchAgentUnloadTerminalState({
+    label: LAUNCH_AGENT_LABEL, pidPath, port: 1, prior, timeoutMs: 100, pollIntervalMs: 50,
+    observeLabel: () => ({ kind: "not_reported" }),
+    observeListener: async () => {
+      ticks += 1;
+      return ticks === 1
+        ? { kind: "collector" as const, runtimeIdentity: owner }
+        : { kind: "absent" as const };
+    },
+    classifyIdentity: () => "stale",
+    readPidFile: () => ticks <= 1
+      ? readCollectorPidFile(pidPath, LAUNCH_AGENT_LABEL)
+      : { kind: "missing" as const },
+    removePidFile: () => fixtureCleanupResult(),
+    now: () => clock,
+    poll: async milliseconds => { clock += milliseconds; },
+  });
+  check(outcome.stopped && outcome.state === "stopped" &&
+    outcome.timing.observations > 2 && !outcome.timing.deadlineCrossed &&
+    outcome.timing.finalObservationPerformed && ticks >= 3,
+    "Poll-and-converge fixture did not observe a delayed settlement: " + JSON.stringify(outcome));
+  return { state: outcome.state, observations: outcome.timing.observations,
+    ticks, deadlineCrossed: outcome.timing.deadlineCrossed };
 }
 
 async function main() {
@@ -536,8 +628,8 @@ async function main() {
         '      attempts=$((attempts + 1))',
         '      sleep 0.05',
         '    done',
-        '    [ -f "$PLIMSOLL_PROOF_BOOTOUT_SETTLED" ] || exit 75',
-        '    [ "$(cat "$PLIMSOLL_PROOF_BOOTOUT_SETTLED")" = "settled" ] || exit 76',
+        '    [ -f "$PLIMSOLL_PROOF_BOOTOUT_SETTLED" ] || { printf "settlement_barrier_exit=75\\n" >&2; exit 75; }',
+        '    [ "$(cat "$PLIMSOLL_PROOF_BOOTOUT_SETTLED")" = "settled" ] || { printf "settlement_barrier_exit=76\\n" >&2; exit 76; }',
         '  fi',
         '  rm -f "$state"',
         "  exit 0",
@@ -569,8 +661,10 @@ async function main() {
         cleanup.markerState === "missing" && cleanup.claimCount === 0 && cleanup.quarantineCount === 0;
       shutdownSettlement = { settled, exitCode: code, signal, pidMissing,
         shutdownReady: ready?.status === "shutdown_ready", cleanupAmbiguous: cleanup.ambiguous };
-      fs.writeFileSync(settlementPath, settled ? "settled\n" : "refused\n", { mode: 0o600 });
+      writeSettlementMarker(settlementPath, settled ? "settled\n" : "refused\n");
     });
+    const settlementExistedBeforeBootout = fs.existsSync(settlementPath);
+    const bootoutSpawnedAt = Date.now();
     const truthfulUnload = launchAgentCommand(
       cliPath,
       unloadHome,
@@ -582,11 +676,24 @@ async function main() {
       { bootoutSettlementPath: settlementPath },
     );
     children.push(truthfulUnload);
+    let bootoutClosedAt = 0;
+    truthfulUnload.child.once("close", () => {
+      bootoutClosedAt = Date.now();
+    });
     // Observe only after the command process has fully settled. Settled means
     // 'close', not 'exit': Node emits 'exit' at process reap while stdio may
     // still hold undrained receipt bytes; only 'close' guarantees the streams
     // are drained (issue #187 class 2 — the empty-aggregate false red).
     const truthfulUnloadExit = await waitForExit(truthfulUnload.child, 60_000);
+    check(
+      !truthfulUnload.receipts.some((receipt) => receipt.reason === "launchctl_failed"),
+      settlementBarrierDiagnostic({
+        settlementPath,
+        unloadOutput: truthfulUnload.output,
+        unloadErrors: truthfulUnload.errors,
+        unloadExit: truthfulUnloadExit,
+      }),
+    );
     check(
       truthfulUnload.receipts.some(
         (receipt) =>
@@ -599,17 +706,24 @@ async function main() {
       "Unload did not report the aggregate terminal state: " + truthfulUnload.output,
     );
     check(truthfulUnloadExit.code === 0, "Truthful aggregate unload exited nonzero.");
+    const settlementMarkerStat = fs.existsSync(settlementPath) ? fs.statSync(settlementPath) : null;
     check(shutdownSettlement !== null && (shutdownSettlement as Receipt).settled === true &&
-      fs.readFileSync(settlementPath,"utf8") === "settled\n",
+      fs.readFileSync(settlementPath,"utf8") === "settled\n" &&
+      settlementExistedBeforeBootout === false && settlementMarkerStat !== null &&
+      settlementMarkerStat.mtimeMs >= bootoutSpawnedAt &&
+      bootoutClosedAt >= Math.floor(settlementMarkerStat.mtimeMs),
       "Mock bootout did not wait for the actual owner cleanup and close receipt.");
     const cleanupRace = await verifyCleanupRaceRemainsRefused(path.join(tempRoot,"cleanup-race-control"), root);
+    const cleanupRaceRetuned = await verifyCleanupRaceRemainsRefused(
+      path.join(tempRoot,"cleanup-race-retune"), root, 200, 25);
+    const pollAndConverge = await verifyPollAndConverge(path.join(tempRoot,"poll-and-converge"), root);
     // The marker barrier itself must refuse missing or explicitly failed evidence.
     for (const failedSettlement of ["missing", "refused"] as const) {
       const controlHome = path.join(tempRoot,`bootout-barrier-${failedSettlement}`);
       fs.mkdirSync(controlHome, { mode: 0o700 });
       const state = path.join(controlHome,"state"), marker=path.join(controlHome,"marker");
       fs.writeFileSync(state,"fixture-only\n",{mode:0o600});
-      if(failedSettlement === "refused")fs.writeFileSync(marker,"refused\n",{mode:0o600});
+      if(failedSettlement === "refused")writeSettlementMarker(marker,"refused\n");
       const command=watch(spawn(path.join(fakeBin,"launchctl"),["bootout"],{
         env:{...process.env,PLIMSOLL_PROOF_LAUNCHCTL_STATE:state,
           PLIMSOLL_PROOF_BOOTOUT_PID:"",PLIMSOLL_PROOF_LAUNCHCTL_EXIT:"0",
@@ -618,8 +732,83 @@ async function main() {
       }));
       children.push(command);
       const exit=await waitForExit(command.child);
-      check(exit.code===(failedSettlement==="missing"?75:76)&&fs.existsSync(state),
-        `Mock bootout fabricated success for ${failedSettlement} owner evidence.`);
+      const barrierOutput = command.errors.join("") + command.output;
+      check(exit.code===(failedSettlement==="missing"?75:76)&&fs.existsSync(state)&&
+        barrierOutput.includes(failedSettlement==="missing"?"settlement_barrier_exit=75":"settlement_barrier_exit=76"),
+        `Mock bootout fabricated success for ${failedSettlement} owner evidence (settlement barrier exit 75 missing / 76 refused).`);
+    }
+    {
+      const tripped = settlementBarrierDiagnostic({
+        settlementPath: path.join(tempRoot, "no-such-settlement"),
+        unloadOutput: "launchctl_failed",
+        unloadErrors: [],
+        unloadExit: { code: 1, signal: null },
+      });
+      check(
+        tripped.includes("75") && tripped.includes("76"),
+        "Settlement barrier failure diagnostic omitted exit 75/76.",
+      );
+    }
+    {
+      const controlHome = path.join(tempRoot, "bootout-barrier-preexisting");
+      fs.mkdirSync(controlHome, { mode: 0o700 });
+      const state = path.join(controlHome, "state");
+      const marker = path.join(controlHome, "marker");
+      fs.writeFileSync(state, "fixture-only\n", { mode: 0o600 });
+      writeSettlementMarker(marker, "settled\n");
+      const past = new Date(Date.now() - 1_000);
+      fs.utimesSync(marker, past, past);
+      const preexistingMtime = fs.statSync(marker).mtimeMs;
+      const spawnedAt = Date.now();
+      const command = watch(spawn(path.join(fakeBin, "launchctl"), ["bootout"], {
+        env: {
+          ...process.env,
+          PLIMSOLL_PROOF_LAUNCHCTL_STATE: state,
+          PLIMSOLL_PROOF_BOOTOUT_PID: "",
+          PLIMSOLL_PROOF_LAUNCHCTL_EXIT: "0",
+          PLIMSOLL_PROOF_BOOTOUT_SETTLED: marker,
+          PLIMSOLL_PROOF_BOOTOUT_WAIT_LIMIT: "2",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      }));
+      children.push(command);
+      const exit = await waitForExit(command.child);
+      check(
+        exit.code === 0 && preexistingMtime < spawnedAt,
+        "F1 negative control: a pre-existing settled marker must fail the spawn-mtime barrier check.",
+      );
+    }
+    {
+      const controlHome = path.join(tempRoot, "bootout-barrier-disconnected");
+      fs.mkdirSync(controlHome, { mode: 0o700 });
+      const state = path.join(controlHome, "state");
+      const marker = path.join(controlHome, "marker");
+      fs.writeFileSync(state, "fixture-only\n", { mode: 0o600 });
+      const command = watch(spawn(path.join(fakeBin, "launchctl"), ["bootout"], {
+        env: {
+          ...process.env,
+          PLIMSOLL_PROOF_LAUNCHCTL_STATE: state,
+          PLIMSOLL_PROOF_BOOTOUT_PID: "",
+          PLIMSOLL_PROOF_LAUNCHCTL_EXIT: "0",
+        },
+        stdio: ["ignore", "pipe", "pipe"],
+      }));
+      children.push(command);
+      const exit = await waitForExit(command.child);
+      const markerMissingAtExit = !fs.existsSync(marker);
+      writeSettlementMarker(marker, "settled\n");
+      check(
+        exit.code === 0 && !fs.existsSync(state) && markerMissingAtExit,
+        "F1 negative control: disconnected bootout must finish without a settlement marker.",
+      );
+    }
+    {
+      const proofSource = fs.readFileSync(path.join(root, "scripts", "collector-supervision-proof.ts"), "utf8");
+      check(
+        proofSource.includes('settlementPath + ".tmp"') &&
+          proofSource.includes("renameSync(temporaryPath, settlementPath)"),
+        "Settlement marker write is not an atomic tmp+rename.",
+      );
     }
 
     await waitForExit(unloadOwner.child);
@@ -1213,8 +1402,8 @@ async function main() {
       JSON.stringify(
         {
           status: "passed",
-          fixtureEvidence: { shutdownSettlement, cleanupRace,
-            scope: "positive graceful handoff and negative cleanup race checked separately; production unchanged" },
+          fixtureEvidence: { shutdownSettlement, cleanupRace, cleanupRaceRetuned, pollAndConverge,
+            scope: "positive graceful handoff, poll-and-converge, and negative cleanup race checked separately; production unchanged" },
           checks: [
             "concurrent starts converge without PID replacement",
             "packaged stop validates the recorded CLI path across working directories",
@@ -1226,6 +1415,10 @@ async function main() {
             "positive mock bootout waits for actual owner cleanup and drained close",
             "missing or refused owner settlement cannot make mock bootout succeed",
             "cleanup read-remove race stays indeterminate under a deterministic clock",
+            "settlement barrier failure output names exit 75 and 76",
+            "pre-existing or disconnected settlement cannot satisfy the bootout wait",
+            "cleanup race observation count is derived from the timeout window",
+            "unload observer polls until the owner settles mid-window",
             "only exact launchctl label-not-found output becomes not_reported",
             "unexpected launchctl exit codes and output remain query_failed",
             "unload receipts are path-free and legacy PID residue is retained",

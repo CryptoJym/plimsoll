@@ -21,6 +21,12 @@ import {
   validatedMetadataAttribute,
 } from "../../shared/src/index";
 import { appendForwardedHook } from "./forwarder";
+import {
+  PRODUCER_EVENT_ID_HEADER,
+  appendProducerObservation,
+  classifyProducerOutcome,
+  readProducerEventIdHeader,
+} from "./producer-parity";
 import { explodeOtlpPayload } from "./otlp";
 import { saveCollectorConfig } from "./config";
 import type { CollectorRuntimeIdentity } from "./runtime-ownership";
@@ -59,7 +65,7 @@ import {
 import { HOOK_AUTHORITY_CONTRACT } from "./hook-authority";
 // The drain reuses the normalizer's own readers rather than re-implementing
 // them, so the two cannot drift on what counts as a usable time (review r3, N2).
-import { otelScalar, timestampIsNotFromTheFuture, unixNanoToIso } from "./normalizer";
+import { isUuid, otelScalar, timestampIsNotFromTheFuture, unixNanoToIso } from "./normalizer";
 import {
   HOOK_SPOOL_LIMITS,
   blankForbiddenRawContent,
@@ -178,7 +184,12 @@ function firstHeader(value: string | string[] | undefined) {
 function admitHookBody(
   bodyText: string,
   source: LocalProducerSource,
-  context: { config: CollectorConfig; buffer: LocalEventBuffer; budget: RequestBudget },
+  context: {
+    config: CollectorConfig;
+    buffer: LocalEventBuffer;
+    budget: RequestBudget;
+    producerEventId?: string;
+  },
 ) {
   const payload = parseBoundedJson(bodyText);
   assertBoundedJsonNodes(payload);
@@ -189,6 +200,7 @@ function admitHookBody(
       config: context.config,
       buffer: context.buffer,
       source,
+      producerEventId: context.producerEventId,
     }),
   );
 }
@@ -307,8 +319,8 @@ function bodyCarriesItsOwnTime(payload: Record<string, unknown>) {
  * Give a recovered event the time the HOOK fired, not the time the drain got to
  * it (review r2, F1).
  *
- * `normalizeHookPayload` falls back to `new Date()` for a body with no time of
- * its own, and no real hook body carries one — so before r3 every recovered
+ * `normalizeHookPayload` falls back to the injected receive clock for a body
+ * with no time of its own, and no real hook body carries one — so before r3 every recovered
  * event was stamped with the recovery clock, skewed by the whole spool latency
  * (a managed-update restart, a deferred tick, up to doctor's 600 s stall
  * threshold). `observed_at` drives retention cutoffs and every cost/usage time
@@ -642,6 +654,11 @@ export function createCollectorServer(
      * Absent, the cached authority is final.
      */
     localAuthHome?: string;
+    /**
+     * Injectable clock for the producer rotation grace deadline (proof
+     * fixtures). Production defaults to wall-clock time.
+     */
+    producerAuthNowMs?: () => number;
     /** Private hash registry home; no provisioning occurs on the listener. */
     liveProducerHome?: string;
     /** Proof-injectable per-source admission ceiling (defaults to the limit). */
@@ -698,8 +715,9 @@ export function createCollectorServer(
   // admission keeps using the installed authority either way. The stat still
   // runs, so the repaired file is picked up on the first request after it moves.
   let unreadableAuthStamp: string | null = null;
+  const producerAuthNowMs = options.producerAuthNowMs ?? Date.now;
   const graceWindowClosed = (auth: LocalIngestAuth) => {
-    const now = Date.now();
+    const now = producerAuthNowMs();
     return Object.values(auth.rotations ?? {}).some((rotation) => rotation.expiresAt <= now);
   };
   const refreshProducerAuth = (loaded: LocalIngestAuth) => {
@@ -716,7 +734,7 @@ export function createCollectorServer(
     // writes: the credential file belongs to `rotate-producer-token`. The
     // stamp advances only after the load succeeded, and it is the stamp read
     // *before* the load, so a file that changed mid-read is re-read next time.
-    const reloaded = readLiveProducerAuth(home);
+    const reloaded = readLiveProducerAuth(home, producerAuthNowMs());
     if (!reloaded) {
       unreadableAuthStamp = stamp;
       return loaded;
@@ -729,7 +747,7 @@ export function createCollectorServer(
   const assertProducer = (request: http.IncomingMessage, source: LocalProducerSource) => {
     const loaded = producerAuth;
     if (!loaded) return;
-    assertProducerToken(request, refreshProducerAuth(loaded), source, requestUrl(request));
+    assertProducerToken(request, refreshProducerAuth(loaded), source, requestUrl(request), producerAuthNowMs());
   };
 
   // Bead eco-6hoxj.153: the stale-producer scan /status names while a
@@ -744,6 +762,40 @@ export function createCollectorServer(
   const rejectionDiagnostics = createRejectionDiagnostics({
     nowMs: options.diagnosticsNowMs,
   });
+  const producerCounters = { accepted202: 0, busy503: 0, timeout: 0, retry: 0, drop: 0 };
+  const producerIdCounts = new Map<string, number>();
+  const recordHookObservation = (
+    source: LocalProducerSource,
+    http: string,
+    id?: string,
+  ) => {
+    const home = options.localAuthHome ?? options.hookSpoolHome;
+    const eventId = id && isUuid(id) ? id.toLowerCase() : undefined;
+    const prior = eventId ? producerIdCounts.get(eventId) ?? 0 : 0;
+    if (eventId) {
+      producerIdCounts.set(eventId, prior + 1);
+      if (producerIdCounts.size > 8_192) producerIdCounts.clear();
+    }
+    const outcome = classifyProducerOutcome(http, prior);
+    if (http === "202") producerCounters.accepted202 += 1;
+    if (http === "503") producerCounters.busy503 += 1;
+    if (http === "408" || http === "000") producerCounters.timeout += 1;
+    if (prior > 0) producerCounters.retry += 1;
+    if (outcome === "drop") producerCounters.drop += 1;
+    if (!home || !eventId) return;
+    try {
+      appendProducerObservation(home, {
+        id: eventId,
+        src: source,
+        http,
+        ts: new Date().toISOString(),
+        observer: "collector",
+        outcome,
+      });
+    } catch {
+      /* observation is evidence, never admission */
+    }
+  };
 
   // ---------------------------------------------------------------------
   // Intake spool (bead eco-6hoxj.61, round r5).
@@ -942,6 +994,7 @@ export function createCollectorServer(
       // Bead eco-6hoxj.61: hook events the collector refused with 503 or could
       // not receive at all, and what the drain has since done with them.
       hookSpool: options.hookSpoolStatus?.() ?? null,
+      producerParity: { counters: { ...producerCounters } },
       ingestIntegrity: refreshControl ? buffer.eventCollisionSummary() : cachedControl?.ingestIntegrity ?? null,
       delivery,
       reconciliation: refreshControl ? codexReconciliationStatus(buffer.database) : cachedControl?.reconciliation ?? null,
@@ -1117,9 +1170,10 @@ export function createCollectorServer(
         return;
       }
 
-      // Issue 0056 (#104): the only unauthenticated surface. Minimal by
-      // construction — no runtime identity, counters, delivery, or ledger
-      // state of any kind.
+      // Issue 0056 (#104) / eco-6hoxj.154: the only unauthenticated surface.
+      // Minimal by construction — no version, runtime identity, counters,
+      // delivery, or ledger state. Fleet liveness is this route; /status stays
+      // behind the management credential.
       if (request.method === "GET" && request.url === "/healthz") {
         sendJson(response, { ok: true });
         return;
@@ -1234,6 +1288,7 @@ export function createCollectorServer(
           };
           body.statusRefreshCounters = { ...statusRefreshCounters };
           body.httpAdmission = rejectionDiagnostics.counters();
+          body.producerParity = { counters: { ...producerCounters } };
           // Bead eco-6hoxj.153: an open `source_required` /
           // `producer_token_required` window names the stale-producer count
           // in the capture reason. The scan runs in the background and is
@@ -1485,9 +1540,15 @@ export function createCollectorServer(
           request,
           await readBoundedRequestBody(request, budget),
         );
+        const producerEventId = readProducerEventIdHeader(request.headers[PRODUCER_EVENT_ID_HEADER]);
         let normalized: Awaited<ReturnType<typeof admitHookBody>>;
         try {
-          normalized = await admitHookBody(body.text, source, { config, buffer, budget });
+          normalized = await admitHookBody(body.text, source, {
+            config,
+            buffer,
+            budget,
+            producerEventId,
+          });
         } catch (error) {
           // The ONE outcome that is spooled here: the busy class that answers
           // 503 `storage_busy_retry` today. It is raised only when the ledger
@@ -1525,6 +1586,7 @@ export function createCollectorServer(
           }
           if (!spooled?.ok) throw error;
           observeIntakeSpool(spooled.source, classifyRejectionClient(request));
+          recordHookObservation(source, "202", producerEventId);
           // 202 only after the file and directory flushes returned. The event
           // is private and blanked; the drain uses this same admission callable.
           response.writeHead(202, { "content-type": "application/json" });
@@ -1532,6 +1594,13 @@ export function createCollectorServer(
           return;
         }
         rejectionDiagnostics.recordAccepted(source);
+        recordHookObservation(source, "202", producerEventId ?? normalized.event.id);
+        if (normalized.futureTimestampClampedEvents) {
+          console.log(JSON.stringify({
+            status: "hook_capture",
+            futureTimestampClampedEvents: normalized.futureTimestampClampedEvents,
+          }));
+        }
         response.writeHead(202, { "content-type": "application/json" });
         response.end(
           JSON.stringify({
@@ -1539,6 +1608,9 @@ export function createCollectorServer(
             continue: true,
             eventId: normalized.event.id,
             suppressedFields: normalized.suppressedFields,
+            ...(normalized.futureTimestampClampedEvents
+              ? { futureTimestampClampedEvents: normalized.futureTimestampClampedEvents }
+              : {}),
             ...(normalized.deduplicated ? { deduplicated: true } : {}),
             ...(normalized.collisionQuarantined
               ? { collisionQuarantined: true }
@@ -1649,12 +1721,21 @@ export function createCollectorServer(
           })
         );
         rejectionDiagnostics.recordAccepted(source);
+        if (normalized.futureTimestampClampedEvents) {
+          console.log(JSON.stringify({
+            status: "hook_capture",
+            futureTimestampClampedEvents: normalized.futureTimestampClampedEvents,
+          }));
+        }
         response.writeHead(202, { "content-type": "application/json" });
         response.end(
           JSON.stringify({
             accepted: true,
             eventId: normalized.event.id,
             suppressedFields: normalized.suppressedFields,
+            ...(normalized.futureTimestampClampedEvents
+              ? { futureTimestampClampedEvents: normalized.futureTimestampClampedEvents }
+              : {}),
           }),
         );
         return;
@@ -1664,6 +1745,14 @@ export function createCollectorServer(
       response.end(JSON.stringify({ error: "not_found" }));
     } catch (error) {
       const failure = asHttpBoundaryRejection(error);
+      const hookSource = request.url?.startsWith("/hooks/") ? hookSourceFromPath(request.url) : undefined;
+      if (hookSource) {
+        recordHookObservation(
+          hookSource,
+          String(failure.status),
+          readProducerEventIdHeader(request.headers[PRODUCER_EVENT_ID_HEADER]),
+        );
+      }
       const clientClass = classifyRejectionClient(request);
       const rejection = {
         error: "collector_request_rejected",

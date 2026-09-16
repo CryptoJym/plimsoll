@@ -51,6 +51,7 @@ import {
   applyCodexConfig,
   discoverCodexProfiles,
   generateCodexConfigToml,
+  generateHookForwardCommand,
 } from "../packages/collector-config/src/index";
 import { loadOrCreateLocalIngestAuth } from "../packages/collector-cli/src/local-auth";
 
@@ -353,7 +354,12 @@ function libraryChecks(fixtureRoot: string) {
       allHookCommands(merged).every((command) => !command.includes(syntheticToken)) &&
       ["UserPromptSubmit", "PostToolUse", "Stop"].every((event) =>
         plimsollCommands(merged, event)[0] ===
-          `curl -s --max-time 2 -X POST -H 'Content-Type: application/json' -H @${headerFile} --data-binary @- http://127.0.0.1:${port}/hooks/codex || true`) &&
+          generateHookForwardCommand({
+            repoRoot: "/synthetic/plimsoll",
+            port,
+            dataMode: "metadata",
+            codexHeaderFile: headerFile,
+          }, "codex")) &&
       // The exporter tables keep the inline token: Codex's OTLP exporter has no
       // file or environment source for a header value, so a profile carries
       // exactly what the default target carries and nothing more.

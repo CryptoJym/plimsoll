@@ -563,6 +563,9 @@ function symlinkSeatChecks(sandbox: string, fixtureRoot: string) {
   fs.symlinkSync(linkedTarget, path.join(seatsRoot, LINKED_SEAT));
   fs.symlinkSync(foreignTarget, path.join(seatsRoot, FOREIGN_SEAT));
   fs.symlinkSync(danglingTarget, path.join(seatsRoot, DANGLING_SEAT));
+  // A cycle cannot be resolved: doctor must report it unresolved, not skipped.
+  fs.symlinkSync("loop-b", path.join(seatsRoot, "loop-a"));
+  fs.symlinkSync("loop-a", path.join(seatsRoot, "loop-b"));
   // A link to a file is not a seat, exactly like the plain README file.
   fs.writeFileSync(path.join(seatsRoot, "README"), "synthetic\n", { mode: 0o600 });
   fs.symlinkSync(path.join(seatsRoot, "README"), path.join(seatsRoot, "readme-link"));
@@ -572,11 +575,13 @@ function symlinkSeatChecks(sandbox: string, fixtureRoot: string) {
   check(
     "a_symlinked_seat_directory_is_discovered_at_its_resolved_path",
     discovered.map((entry) => entry.slug).join(",") ===
-      [MANAGED_SEAT, LINKED_SEAT, FOREIGN_SEAT, DANGLING_SEAT].sort().join(",") &&
+      [MANAGED_SEAT, LINKED_SEAT, FOREIGN_SEAT, DANGLING_SEAT, "loop-a", "loop-b"].sort().join(",") &&
       seat(LINKED_SEAT)?.path === path.join(fs.realpathSync(linkedTarget), "settings.json") &&
       seat(LINKED_SEAT)?.hasSettings === true &&
       seat(FOREIGN_SEAT)?.path === path.join(fs.realpathSync(foreignTarget), "settings.json") &&
-      seat(DANGLING_SEAT)?.hasSettings === false,
+      seat(DANGLING_SEAT)?.hasSettings === false &&
+      seat("loop-a")?.unresolved === "ELOOP" &&
+      seat("loop-b")?.unresolved === "ELOOP",
     {
       seats: discovered.map((entry) => ({ slug: entry.slug, hasSettings: entry.hasSettings })),
       notSeats: ["README", "readme-link"],
@@ -621,7 +626,11 @@ function symlinkSeatChecks(sandbox: string, fixtureRoot: string) {
       reported(DANGLING_SEAT)?.diagnostic === undefined &&
       !fs.existsSync(danglingTarget) &&
       reported(LINKED_SEAT)?.status === "valid" &&
-      reported(LINKED_SEAT)?.diagnostic === undefined,
+      reported(LINKED_SEAT)?.diagnostic === undefined &&
+      reported("loop-a")?.status === "unresolved" &&
+      reported("loop-a")?.diagnostic === "claude_seat_symlink_unresolvable" &&
+      reported("loop-a")?.reason === "ELOOP" &&
+      reported("loop-b")?.status === "unresolved",
     {
       seats: seats.map((entry) => ({ slug: entry.slug, status: entry.status })),
       danglingTargetCreated: fs.existsSync(danglingTarget),

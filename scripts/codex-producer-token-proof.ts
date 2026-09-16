@@ -25,7 +25,17 @@ import {
   diagnoseManagedCodexHookCommand,
   generateCodexConfigToml,
   generateCodexHookHeader,
+  generateHookForwardCommand,
 } from "../packages/collector-config/src/index";
+
+function generateCodexHookCommand(headerFile: string, port: number) {
+  return generateHookForwardCommand({
+    repoRoot: "/synthetic/plimsoll",
+    port,
+    dataMode: "metadata",
+    codexHeaderFile: headerFile,
+  }, "codex");
+}
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { HttpBoundaryRejection } from "../packages/collector-cli/src/http-boundary";
@@ -37,6 +47,7 @@ import {
   producerRotationState,
   readLocalIngestAuth,
   rotateLocalProducerToken,
+  unpersistedProducerAudiences,
 } from "../packages/collector-cli/src/local-auth";
 import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { useFixtureRoot } from "./lib/fixture-root";
@@ -173,9 +184,10 @@ function credentialStamp(home: string) {
  */
 function countAuthFileSyscalls(...homes: string[]) {
   const counts = { stat: 0, read: 0, write: 0 };
+  const authFiles = homes.map((home) => path.join(home, LOCAL_INGEST_AUTH_FILE));
   const inHome = (value: unknown) =>
     typeof value === "string" &&
-    homes.some((home) => value === home || value.startsWith(`${home}${path.sep}`));
+    authFiles.some((file) => value === file);
   const mutable = fs as unknown as Record<string, (...args: any[]) => any>;
   const original = { ...mutable };
   const wrap = (name: string, kind: "stat" | "read" | "write", targets = 1) => {
@@ -249,7 +261,10 @@ async function main() {
       "codex_hook_commands_reference_the_header_file_and_carry_no_token",
       commands.length === 3 &&
         commands.every((command) =>
-          command === `curl -s --max-time 2 -X POST -H 'Content-Type: application/json' -H @${headerFile} --data-binary @- http://127.0.0.1:48271/hooks/codex || true`
+          command === generateCodexHookCommand(headerFile, 48271) &&
+          command.includes("--fail") &&
+          command.includes("--retry-all-errors") &&
+          !command.includes("|| true")
         ) &&
         !generated.slice(generated.indexOf("[hooks]")).includes(token) &&
         generatedHeader === `x-plimsoll-token: ${token}\n`,
@@ -369,6 +384,8 @@ async function main() {
     });
     const hookExecution = await runShellCommand(liveCommand, hookPayload, {
       ...process.env,
+      HOME: sandbox,
+      PLIMSOLL_HOME: path.join(sandbox, ".plimsoll"),
       PATH: `${fakeBin}:/usr/bin:/bin`,
       PLIMSOLL_FAKE_ARGV: childArgvFile,
     });
@@ -399,11 +416,16 @@ async function main() {
     const rejected = await runShellCommand(
       liveCommand.replace(`@${liveHeaderFile}`, `@${unauthenticatedHeader}`),
       hookPayload,
-      { ...process.env, PATH: "/usr/bin:/bin" },
+      {
+        ...process.env,
+        HOME: sandbox,
+        PLIMSOLL_HOME: path.join(sandbox, ".plimsoll"),
+        PATH: "/usr/bin:/bin",
+      },
     );
     check(
       "codex_hook_with_a_foreign_header_file_is_rejected_and_buffers_nothing",
-      rejected.status === 0 &&
+      rejected.status !== 0 &&
         Number((commandBuffer.database.prepare(
           "select count(*) as count from buffered_events",
         ).get() as { count: number }).count) === beforeRejected,
@@ -615,6 +637,9 @@ async function main() {
       ...migrateEnv,
       PLIMSOLL_COLLECTOR_DOCTOR_TIMEOUT_MS: "200",
     });
+    if (!rotatedDoctor.stdout.trim()) {
+      throw new Error(`rotated doctor empty stdout status=${rotatedDoctor.status} stderr=${rotatedDoctor.stderr}`);
+    }
     const rotatedReceipt = JSON.parse(rotatedDoctor.stdout) as Record<string, any>;
     check(
       "doctor_reports_the_rotation_window_value_blind",
@@ -1161,7 +1186,7 @@ async function main() {
       "rotate_never_provisions_and_rejects_an_unknown_source_or_grace",
       unprovisioned.status === 1 &&
         !fs.existsSync(path.join(unprovisionedPlimsoll, "local-ingest-auth.json")) &&
-        badSource.status === 1 && badSource.stderr.includes("--source codex") &&
+        badSource.status === 1 && badSource.stderr.includes("--source <claude_code|codex|gemini_cli|grok>") &&
         badGrace.status === 1 && badGrace.stderr.includes("--grace-seconds") &&
         readLocalIngestAuth(migratePlimsoll)!.codexProducer === rotatedAuth.codexProducer,
       {
@@ -1344,6 +1369,89 @@ async function main() {
         doctorUnpersisted: sealedFillReceipt.producerAudiencesUnpersisted ?? null,
         doctorLeaksToken: false,
         healthyHomeReportsNothing: rotatedReceipt.producerAudiencesUnpersisted === undefined,
+      },
+    );
+
+    // 3. Review r1 note: when the fill abandons because the file moved on and
+    //    the winner is still a legacy file, the in-memory tokens this process
+    //    minted must be recorded so doctor can report them even though the
+    //    home is writable (without the memo, doctor would derive "nothing
+    //    unpersisted" from the stored file).
+    const incompleteWinnerHome = path.join(sandbox, "legacy-fill-incomplete-winner");
+    writeLegacyAuthFile(incompleteWinnerHome);
+    const incompleteWinnerPrefix = `${authFile(incompleteWinnerHome)}.`;
+    const incompleteWinnerOpen = mutableFs.openSync!;
+    let incompleteWinnerRewrote = false;
+    mutableFs.openSync = (...args: any[]) => {
+      const descriptor = incompleteWinnerOpen(...args);
+      const target = args[0];
+      if (!incompleteWinnerRewrote && typeof target === "string" &&
+        target.startsWith(incompleteWinnerPrefix) && target.endsWith(".tmp")) {
+        incompleteWinnerRewrote = true;
+        const current = fs.readFileSync(authFile(incompleteWinnerHome));
+        fs.writeFileSync(authFile(incompleteWinnerHome), current);
+        const later = Math.floor(Date.now() / 1000) + 2;
+        fs.utimesSync(authFile(incompleteWinnerHome), later, later);
+      }
+      return descriptor;
+    };
+    let incompleteWinnerLoaded: LocalIngestAuth;
+    try {
+      incompleteWinnerLoaded = loadOrCreateLocalIngestAuth(incompleteWinnerHome);
+    } finally {
+      mutableFs.openSync = incompleteWinnerOpen;
+    }
+    const incompleteWinnerStored = readLocalIngestAuth(incompleteWinnerHome)!;
+    check(
+      "a_drift_winner_that_is_still_legacy_is_recorded_as_unpersisted",
+      incompleteWinnerRewrote &&
+        incompleteWinnerStored.geminiCliProducer === undefined &&
+        incompleteWinnerStored.grokProducer === undefined &&
+        typeof incompleteWinnerLoaded.geminiCliProducer === "string" &&
+        typeof incompleteWinnerLoaded.grokProducer === "string" &&
+        JSON.stringify(unpersistedProducerAudiences(incompleteWinnerHome)) ===
+          JSON.stringify(["gemini_cli", "grok"]),
+      {
+        rewroteDuringFill: incompleteWinnerRewrote,
+        storedAudiences: missingStoredAudiences(incompleteWinnerStored),
+        unpersisted: unpersistedProducerAudiences(incompleteWinnerHome),
+      },
+    );
+
+    // 4. Review r1 note: two spellings of the same home (an ancestor symlink,
+    //    the macOS /var -> /private/var case) must share the memo. A home that
+    //    *is* a symlink is refused as unsafe; this is the spelling that still
+    //    loads.
+    const symlinkRealHome = path.join(sandbox, "legacy-fill-symlink-real");
+    const symlinkParent = path.join(sandbox, "legacy-fill-symlink-parent");
+    const symlinkLegacy = writeLegacyAuthFile(symlinkRealHome);
+    fs.symlinkSync(sandbox, symlinkParent);
+    const symlinkAliasHome = path.join(symlinkParent, "legacy-fill-symlink-real");
+    fs.chmodSync(symlinkRealHome, 0o500);
+    let symlinkLoads: LocalIngestAuth[] = [];
+    try {
+      const viaReal = tryLoadAuth(symlinkRealHome);
+      const viaAlias = tryLoadAuth(symlinkAliasHome);
+      if (viaReal.auth) symlinkLoads.push(viaReal.auth);
+      if (viaAlias.auth) symlinkLoads.push(viaAlias.auth);
+    } finally {
+      fs.chmodSync(symlinkRealHome, 0o700);
+    }
+    check(
+      "a_symlinked_home_shares_the_unpersisted_fill_memo",
+      symlinkLoads.length === 2 &&
+        symlinkLoads[0]!.geminiCliProducer === symlinkLoads[1]!.geminiCliProducer &&
+        symlinkLoads[0]!.grokProducer === symlinkLoads[1]!.grokProducer &&
+        symlinkLoads[0]!.codexProducer === symlinkLegacy.codexProducer &&
+        JSON.stringify(unpersistedProducerAudiences(symlinkRealHome)) ===
+          JSON.stringify(["gemini_cli", "grok"]) &&
+        JSON.stringify(unpersistedProducerAudiences(symlinkAliasHome)) ===
+          JSON.stringify(["gemini_cli", "grok"]),
+      {
+        loads: symlinkLoads.length,
+        sameGemini: symlinkLoads[0]?.geminiCliProducer === symlinkLoads[1]?.geminiCliProducer,
+        unpersistedViaReal: unpersistedProducerAudiences(symlinkRealHome),
+        unpersistedViaAlias: unpersistedProducerAudiences(symlinkAliasHome),
       },
     );
 

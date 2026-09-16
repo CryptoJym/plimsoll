@@ -1301,7 +1301,7 @@ function skipParentheses(expression: ts.Expression): ts.Expression {
 // typed as and not what it is: [] as unknown as [unknown] is still the empty
 // array at run time, and (<Class>.prototype as object) is still that prototype.
 // Two positions below need this — the arguments-list count, and the two
-// operands of the prototype comparison, where an assertion would otherwise hide
+// operands of the equality comparison, where an assertion would otherwise hide
 // an expression doing exactly what it appears to do. It stays separate from
 // skipParentheses rather than widening every operand read.
 function skipAssertions(expression: ts.Expression): ts.Expression {
@@ -1650,9 +1650,9 @@ function timeoutGuardMatcher(names: Set<string>) {
     // the constructor/class pair below as well as the prototype test above it,
     // so the one skip reddens both: error.constructor === (<Class> as Function)
     // and the mirror of it with the assertion on the constructor side
-    // compiled, ran and audited clean until this bead too, and are red now —
-    // named here and fenced by a must-green row on another class in the probe
-    // list (REVIEW-135 F1). This is the operand position and no other: an
+    // compiled, ran and audited clean until REVIEW-131 F2 too, and are red
+    // now — named here and fenced by a must-green row on another class in the
+    // probe list (REVIEW-135 F1). This is the operand position and no other: an
     // assertion on the new inside a reach, or on the receiver of an
     // isPrototypeOf hop, is still not read.
     const left = skipAssertions(node.left);
@@ -2444,18 +2444,20 @@ function proveFetchSourceAudit(proofSource: string) {
     // the prototype. An assertion changes what an expression is typed as and
     // not what it is, so each of these rows is its own unasserted counterpart
     // one word longer — its counterpart, not the row printed above it. The
-    // asserted reached row and the satisfies row are both
+    // asserted reached row is
     // callback_guard_by_binary_comparison_against_a_reached_prototype one word
-    // longer, and the benign asserted reached row is
+    // longer, the satisfies row is the same row two words longer, and the
+    // benign asserted reached row is
     // benign_binary_comparison_against_a_reached_prototype_of_another_class one
     // word longer. The two asserted spelled rows have no counterpart to
     // lengthen at this planting position: the unasserted spelled comparisons in
     // this list plant into an inline arrow and into the bindless catch rather
     // than into the body cancel handler, and there is no unasserted benign
-    // spelled comparison row anywhere in the list (REVIEW-135 F2). Each of these compiled, ran and
-    // audited clean until this bead, the spelled form since long before the
-    // reached form was read here at all, because the operands were read through
-    // their parentheses and not through their assertions (REVIEW-131 F2). The
+    // spelled comparison row anywhere in the list (REVIEW-135 F2). Each of
+    // these compiled, ran and audited clean until this bead, the spelled form
+    // since long before the reached form was read here at all, because the
+    // operands were read through their parentheses and not through their
+    // assertions (REVIEW-131 F2). The
     // satisfies row is the third spelling of the same skip; the angle-bracket
     // spelling is the fourth and is not given a row of its own, for the same
     // reason the reversed operand order is not. The must-green controls are the

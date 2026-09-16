@@ -145,6 +145,7 @@ function main() {
       },
     };
     writeJson(existing, preimage, 0o644);
+    fs.chmodSync(existing, 0o644);
     const preimageSource = fs.readFileSync(existing, "utf8");
     const preview = applyClaudeSettings(existing, generated, { dryRun: true });
     check(
@@ -172,7 +173,8 @@ function main() {
         reconciled.hooks.ForeignEvent[0].marker === secretSentinel &&
         reconciled.hooks.UserPromptSubmit.length === 2 &&
         reconciled.hooks.UserPromptSubmit[0].hooks[0].command === "synthetic-foreign-hook" &&
-        reconciled.hooks.UserPromptSubmit[1].hooks[0].timeout === 5,
+        reconciled.hooks.UserPromptSubmit[1].hooks[0].timeout === 5 &&
+        reconciled.hooks.UserPromptSubmit[1].hooks[0].retry === 2,
       { changes: result.changes.length, ownedHooks: reconciled.hooks.UserPromptSubmit.length - 1 },
     );
     check(

@@ -13,7 +13,10 @@ import path from "node:path";
  * directory without its config file reported and skipped rather than created,
  * and a symlinked directory reported at its resolved path so the managed-config
  * guard and every receipt name the file actually written. A dangling link stays
- * visible as a seat/profile whose config file does not exist.
+ * visible as a seat/profile whose config file does not exist. A link that
+ * cannot be resolved (ELOOP, EACCES, a detached volume) is still visible, with
+ * `unresolved` set to the errno, so doctor can report `unresolved` instead of
+ * pretending the seat was merely skipped.
  */
 export type DiscoveredHome = {
   /** Directory name, e.g. the slug the fleet tooling created. */
@@ -22,6 +25,8 @@ export type DiscoveredHome = {
   path: string;
   /** False when the directory carries no config file. */
   exists: boolean;
+  /** Errno when a directory symlink could not be resolved. */
+  unresolved?: string;
 };
 
 export function discoverHomeDirectories(
@@ -41,8 +46,13 @@ export function discoverHomeDirectories(
   for (const entry of entries) {
     const resolved = entryDirectory(root, entry);
     if (resolved === undefined) continue;
-    const file = path.join(resolved, fileName);
-    discovered.push({ slug: entry.name, path: file, exists: isExistingFile(file) });
+    const file = path.join(resolved.directory, fileName);
+    discovered.push({
+      slug: entry.name,
+      path: file,
+      exists: resolved.unresolved ? false : isExistingFile(file),
+      ...(resolved.unresolved ? { unresolved: resolved.unresolved } : {}),
+    });
   }
   return discovered.sort((left, right) => (left.slug < right.slug ? -1 : left.slug > right.slug ? 1 : 0));
 }
@@ -54,15 +64,19 @@ export function discoverHomeDirectories(
  * doctor alike. A link is reported at its resolved path; a dangling link keeps
  * the link path so it stays visible without its config file.
  */
-function entryDirectory(root: string, entry: fs.Dirent) {
+function entryDirectory(root: string, entry: fs.Dirent): { directory: string; unresolved?: string } | undefined {
   const entryPath = path.join(root, entry.name);
-  if (entry.isDirectory()) return entryPath;
+  if (entry.isDirectory()) return { directory: entryPath };
   if (!entry.isSymbolicLink()) return undefined;
   try {
     const resolved = fs.realpathSync(entryPath);
-    return fs.statSync(resolved).isDirectory() ? resolved : undefined;
-  } catch {
-    return entryPath;
+    return fs.statSync(resolved).isDirectory() ? { directory: resolved } : undefined;
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    // Dangling: ENOENT. Unresolvable: ELOOP / EACCES / ENOTDIR from a
+    // detached volume. The latter must not be reported as a skip.
+    if (code === "ENOENT") return { directory: entryPath };
+    return { directory: entryPath, unresolved: code ?? "unknown" };
   }
 }
 

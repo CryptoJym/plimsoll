@@ -46,9 +46,33 @@ does not transfer its sessions to a tailer.
   When a stale producer's config home is the default because its environment
   names no home variable, doctor's summary and status say how many were
   attributed that way, and status adds `captureHealth.staleProducerAttribution`.
+- Producer-to-ledger parity instrumentation (eco-6hoxj.29): managed Codex/Grok
+  curl hooks fail on HTTP errors and retry inside the hook timeout; Claude HTTP
+  hooks carry the matching timeout/retry contract; each post mints a stable
+  event id; `plimsoll producer-parity` joins those ids to the ledger; collector
+  `/status` exposes producer counters and circuit-open transition timestamps.
+
+### Changed
+
+- Local `GET /status` stays closed without the management credential.
+  Unauthenticated liveness remains `GET /healthz` (`{"ok":true}` only). Fleet
+  readers that used raw `/status` migrate to `/healthz` or `plimsoll status`
+  (`docs/runbooks/local-status-http.md`, `scripts/native-status-read.py`).
 
 ### Fixed
 
+- Capture-health names sub-minute future skew in seconds, never renders `NaNm`
+  for an unparseable `last_event_at` (fail-safe amber), and keeps future-amber
+  rather than lag-red when the ledger watermark is ahead of the clock
+  (REVIEW-73-r2 F5–F7).
+- A managed-config reconcile that loses the state-file lock still writes its
+  apply/refuse receipt; the stamp, backoff map and backup record retry on the
+  next tick. The event-loop chunk proof uses a CI-safe bound so a cold runner
+  cannot fail a yield that already holds.
+- Daemon session sync now converges without `upload-history --sessions`. A
+  failed or interrupted 5-minute refresh survives restart, and a ledger
+  catch-up covers sessions whose events were already uploaded so they never
+  re-entered the touched window.
 - Automatic maintenance now keeps committed progress across deadlines, bounds
   cursor and enrichment work, and reaps disposable workers before replacement.
 - Maintenance worker startup is separated from ledger initialization and has a

@@ -4,7 +4,7 @@
 - Hosted `AiWorkSession` was 0 rows while the ledger stitched sessions for every event — per-session and per-person analytics (cloud #24 Phase D3/D4) had nothing to stand on. Now the collector pushes one SNAPSHOT per stitched session (`kind: "session_sync"` on the existing ingest route) and the cloud upserts them grow-only by deterministic session id.
 - Live run on the real workspace: **4,185 sessions** (4,066 codex / 119 claude_code) created in 5.96s through the full signed HTTP path; idempotent re-run inserted 0 with a byte-identical content fingerprint; joins verified in all three id forms with token totals reconciling exactly.
 - The hosted admin "Sessions" KPI switches from the event-derived placeholder (733,923 — every sessionless event counted itself) to real rows (4,185), with the provenance labeled either way.
-- Two surfaces ship it: the daemon's 5-minute sync refreshes the sessions its uploads touched (zero new state — failure carries ids to the next cycle), and `upload-history --sessions` is the full backfill + post-restart recovery tool.
+- Two surfaces ship it: the daemon's 5-minute sync refreshes just-uploaded sessions plus a durable catch-up (pending ids and a ledger walk until the first full push is accepted, then sessions with `created_at` after that horizon), and `upload-history --sessions` remains the operator full-walk tool. A restart no longer drops unsent sessions (eco-6hoxj.70.1).
 
 ## Scope
 A session push lane in collector-cli (sibling of `upload-history --repair-attribution`): ledger session snapshots → workspace upsert → reconciliation audit. Cloud half (plimsoll-cloud `session-ingest` branch): the discriminated batch lane, the grow-only tenant-guarded upsert, the event-lane UUIDv7 session-id fix, dashboards preferring real rows. It does NOT backfill `session_id` onto already-uploaded event rows (those join via `metadata.externalSessionId` — see Notes), does NOT push sessionless events as sessions, and stays descriptive own-data sync (open/paid boundary).
@@ -37,7 +37,7 @@ Dashboard data path on the live DB: `counts = {totalEvents: 832886, sessions: 73
 - [x] Upsert is ONE set-based statement per batch, tenant-guarded, grow-only; stale replay and cross-tenant forge are no-ops (proof + live smoke on a `d1-` fixture tenant, cleaned after).
 - [x] Deterministic session ids: uuid-shaped pass through lowercased; non-uuid derive stably in a namespace distinct from event ids (proof-pinned).
 - [x] The join works for BOTH historical forms and the derived form, proven with live join queries; token totals reconcile exactly on fully-drained sessions.
-- [x] 5-minute sync pushes touched sessions; failure isolated from the event backoff; ids carry over in memory.
+- [x] 5-minute sync pushes touched sessions; failure isolated from the event backoff; ids carry over in memory and in `maintenance_state` so a restart still converges.
 - [x] `upload-history --sessions` full backfill with dry-run, `--until` scoping, reconciliation audit (unpriced never $0.00), skips itemized by reason.
 - [x] Idempotency: second run over the same `--until` reports inserted 0 and the cloud row content is unchanged (fingerprint-verified).
 - [x] `pnpm proof` green both repos with new checks: public 80 → 85, cloud 103 → 108.
@@ -45,7 +45,7 @@ Dashboard data path on the live DB: `counts = {totalEvents: 832886, sessions: 73
 ## Operational Boundaries
 - Ledger opened READ-ONLY (or the daemon's own live handle, reads only); the LaunchAgent daemon never stopped, restarted, or reconfigured. `collector.config.json` untouched; install key never printed.
 - Metadata mode only: hashes + counters cross, raw content never; client-side forbidden-field gate before send; cloud gate re-checks.
-- The daemon half activates on the next collector restart/release — until then `upload-history --sessions` covers new sessions (note: owner restart implication).
+- The daemon half activates on the next collector restart/release. After eco-6hoxj.70.1 the periodic path catch-up-walks until one full push is accepted, so a missed first refresh does not wait for `upload-history --sessions`.
 
 ## Notes For Future Agents
 - Pre-D1 codex event rows keep `session_id` NULL (events are immutable, first-writer-wins). Their join runs through `metadata.externalSessionId` — works, but unindexed. If D3/D4 want column-grade joins on history, build a session-id repair lane exactly like attribution repair (`{id, sessionId}` pairs, set-based fill-only) — the ledger has every pair.

@@ -72,6 +72,7 @@ import {
 } from "./config";
 import { appendForwardedHook } from "./forwarder";
 import { forwardHookOverLoopback } from "./local-hook-client";
+import { buildProducerParityReport } from "./producer-parity";
 import { SyncBackoff } from "./sync-backoff";
 import {
   DEFAULT_PRODUCER_ROTATION_GRACE_MS,
@@ -200,6 +201,12 @@ import {
   generateGrokHookHeader,
   generateGrokHookSettings,
   generateSetupInstructions,
+  isManagedGrokDocument,
+  managedGrokHeaderFileReferences,
+  readDiscoveredCodexConfig,
+  readDiscoveredConfigFile,
+  rotateGeminiSettingsToken,
+  type DiscoveredFileIdentity,
 } from "../../collector-config/src/index";
 import {
   DEFAULT_MANAGED_CONFIG_RECONCILE_INTERVAL_SECONDS,
@@ -237,7 +244,15 @@ import { OutcomeTimelineStore } from "./outcome-timeline-store";
 import { formatWeeklyPerformanceMarkdown } from "./performance-layer";
 import { runLearningMaterialization } from "./learning-materializer";
 import { prepareRepoLabelsPush, pushRepoLabels } from "./repo-labels";
-import { runSessionSync, sessionIdsFromBatches } from "./session-sync";
+import {
+  commitDaemonSessionSyncFailure,
+  commitDaemonSessionSyncSuccess,
+  loadDaemonSessionSyncState,
+  planDaemonSessionSync,
+  runSessionSync,
+  saveDaemonSessionSyncState,
+  sessionIdsFromBatches,
+} from "./session-sync";
 import { uploadBufferedEvents } from "./upload";
 import { SyncStorageBusyError, SyncStorageRetryController } from "./sqlite-contention";
 import { runAttributionRepair, runWorkspaceHistoryUpload } from "./upload-history";
@@ -285,7 +300,8 @@ function printHelp() {
 
 Commands:
   start                 Start the local hook/OTLP receiver in the foreground
-  status                Print local buffer and policy status
+  status                Print local buffer and policy status as JSON
+                        (credentialed daemon /status; liveness is GET /healthz)
   maintenance --disable-account-assertion SOURCE --yes
                         Toggle one adapter; writes only account assertion state
   --disable-account-assertion SOURCE
@@ -315,6 +331,9 @@ Commands:
                         left unfenced (so they are captured, not excluded)
   doctor --read-only --json
                         Read-only readiness check; never creates config, ledger, plist, logs, or directories
+  producer-parity [--hours 6]
+                        Read-only join of producer hook counters to collector
+                        admission and the local ledger for one window
   export                Print buffered events as JSON
   forward-hook SOURCE   Read hook JSON from stdin and append it without requiring the receiver
   forward-hook-http SOURCE
@@ -323,10 +342,12 @@ Commands:
   generate-config TOOL  Print Claude Code, Codex, Gemini CLI, or Grok config for metadata collection
   setup                 APPLY Claude Code, Gemini CLI, Grok, and Codex telemetry independently
                         (idempotent; --yes, --dry-run)
-  rotate-producer-token --source codex
-                        Mint a new Codex producer token, rewrite the managed header file and
-                        config.toml with backups, and accept the superseded token only until
-                        the grace window closes (--grace-seconds, --dry-run)
+  rotate-producer-token --source <claude_code|codex|gemini_cli|grok>
+                        Mint a new producer token for one source, rewrite that source's managed
+                        surfaces (Claude settings and seats; Codex header file, config.toml and
+                        profiles; Gemini settings; Grok header file and hook) with backups, and
+                        accept the superseded token only until the grace window closes
+                        (--grace-seconds, --dry-run)
   upload                Drain un-uploaded events to the tenant ingest API (marks rows, keeps local copies)
   upload-history        Workspace backfill: push the FULL ledger history to the joined
                         workspace, idempotently, then print a reconciliation audit.
@@ -401,8 +422,9 @@ Config tools:
       Push one snapshot per stitched ledger session (issue 0037) so the workspace
       holds REAL session rows that join to their events. The cloud upserts
       grow-only by deterministic session id — re-running over the same --until
-      changes nothing. The daemon refreshes touched sessions after each 5-minute
-      sync; this command is the full backfill and the post-restart recovery tool.
+      changes nothing. The daemon catch-up-walks until one full push is accepted,
+      then refreshes pending, just-uploaded, and later ledger sessions. This
+      command remains the operator full walk.
   upload-replay --reason <receipt reason> [--since ISO-8601] [--limit N] [--dry-run]
       Supersede dead upload receipts whose reason is remote (remote_validation_rejected,
       remote_rejected_exhausted) and hand their raw rows back to the normal enqueue path.
@@ -411,9 +433,9 @@ Config tools:
       acknowledged is counted as skipped, so re-running is a no-op — and an
       already-replayed row never consumes a slot of --limit and is never truncated by
       it, so a lifetime of replays can never crowd out or hide a dead letter written
-      today. When a full --limit of ACTIONABLE candidates re-queues nothing the JSON
-      carries a hint naming --since; inert skips alone never raise it. --dry-run
-      classifies with zero writes.
+      today. When more than --limit ACTIONABLE candidates exist and the run re-queues
+      nothing the JSON carries a hint naming --since; an exact --limit pool and inert
+      skips alone never raise it. --dry-run classifies with zero writes.
   push-repo-labels [--dry-run] [--yes] [--url URL]
   sync-outcomes --repository owner/repo [--since-days 30] [--rework-window-days 14] [--until ISO] [--dry-run] [--url URL]
       Same fetch surface as the local efficiency report (pull list, check-runs and
@@ -1622,6 +1644,17 @@ const ROTATION_PREVIEW_TOKEN = "plimsoll-rotation-preview-placeholder";
 const CODEX_MANAGED_EXPORTERS = ["exporter", "trace_exporter", "metrics_exporter"] as const;
 
 /**
+ * A discovered profile or seat is classified from bytes read through the
+ * guarded preimage its rewrite uses (review r3 G3), never from a path read.
+ * `refused` is a file that guard refuses to read (a symlink, a FIFO, a hard
+ * link, a replaced file): whether it carries the token is unknown, so it is
+ * listed with that reason, never rewritten, and the rotation is incomplete.
+ */
+type DiscoveredTokenState =
+  | { state: "managed" | "unmanaged" | "malformed" }
+  | { state: "refused"; reason: string };
+
+/**
  * Whether a discovered Codex seat profile is an authenticated consumer of the
  * codex producer token (bead eco-6hoxj.54).
  *
@@ -1635,43 +1668,106 @@ const CODEX_MANAGED_EXPORTERS = ["exporter", "trace_exporter", "metrics_exporter
  * parse; it is reported and never rewritten, exactly as `setup` reports it
  * without failing the run.
  */
-function codexProfileTokenState(file: string): "managed" | "unmanaged" | "malformed" {
+function codexProfileTokenState(file: string): DiscoveredTokenState {
   const record = (value: unknown) =>
     value && typeof value === "object" && !Array.isArray(value)
       ? (value as Record<string, unknown>)
       : undefined;
+  const read = readDiscoveredCodexConfig(file);
+  if (read.status === "refused") return { state: "refused", reason: read.reason };
+  if (read.status !== "read") return { state: "malformed" };
   let parsed: Record<string, unknown> | undefined;
   try {
-    parsed = record(parseToml(fs.readFileSync(file, "utf8")));
+    parsed = record(parseToml(read.content));
   } catch {
-    return "malformed";
+    return { state: "malformed" };
   }
   const otel = record(parsed?.otel);
   const carriesToken = CODEX_MANAGED_EXPORTERS.some((exporter) => {
     const headers = record(record(record(otel?.[exporter])?.["otlp-http"])?.headers);
     return headers !== undefined && Object.hasOwn(headers, "x-plimsoll-token");
   });
-  return carriesToken ? "managed" : "unmanaged";
+  return { state: carriesToken ? "managed" : "unmanaged" };
 }
 
 /**
- * Value-blind receipt for the discovered profiles a rotation did not rewrite:
- * slug, path and reason, never a token and never a malformed byte. Omitted
- * entirely when there is nothing to report, so a host without fleet profiles
- * prints exactly the payload it printed before this bead.
+ * Whether a discovered Claude seat is an authenticated consumer of the
+ * claude_code producer token (bead eco-6hoxj.152): the Claude counterpart of
+ * `codexProfileTokenState`, with the same three answers. `managed` means the
+ * seat's settings.json already carries the token, whatever its value, in the
+ * managed `OTEL_EXPORTER_OTLP_HEADERS` env value or in an http hook's
+ * `x-plimsoll-token` header. `unmanaged` seats are left for `setup`, and
+ * `malformed` ones are reported and never rewritten.
  */
-function skippedProfilesReceipt(
-  skipped: ReadonlyArray<{ profile: { slug: string; path: string }; state: string }>,
+function claudeSeatTokenState(file: string): DiscoveredTokenState {
+  const record = (value: unknown) =>
+    value && typeof value === "object" && !Array.isArray(value)
+      ? (value as Record<string, unknown>)
+      : undefined;
+  const read = readDiscoveredConfigFile(file, "claude");
+  if (read.status === "refused") return { state: "refused", reason: read.reason };
+  if (read.status !== "read") return { state: "malformed" };
+  let parsed: Record<string, unknown> | undefined;
+  try {
+    parsed = record(JSON.parse(read.content));
+  } catch {
+    return { state: "malformed" };
+  }
+  if (!parsed) return { state: "malformed" };
+  const otlpHeaders = record(parsed.env)?.OTEL_EXPORTER_OTLP_HEADERS;
+  if (typeof otlpHeaders === "string" &&
+    otlpHeaders.split(",").some((entry) => entry.trim().startsWith("x-plimsoll-token="))) {
+    return { state: "managed" };
+  }
+  const groups = Object.values(record(parsed.hooks) ?? {}).flatMap((value) => Array.isArray(value) ? value : []);
+  const carriesToken = groups.some((group) => {
+    const handlers = record(group)?.hooks;
+    return Array.isArray(handlers) && handlers.some((handler) => {
+      const headers = record(record(handler)?.headers);
+      return headers !== undefined && Object.hasOwn(headers, "x-plimsoll-token");
+    });
+  });
+  return { state: carriesToken ? "managed" : "unmanaged" };
+}
+
+/** Receipt key and reasons for the discovered targets each source can skip. */
+const SKIPPED_DISCOVERED_RECEIPTS = {
+  codex: {
+    key: "profilesSkipped",
+    unreadable: "codex_profile_config_unreadable",
+    unmanaged: "codex_profile_config_unmanaged",
+    unresolved: "codex_profile_symlink_unresolvable",
+    /** The config file's path through the link under `$HOME` (eco-6hoxj.51). */
+    linkPath: (home: string, slug: string) => path.join(codexProfilesRoot(home), slug, "config.toml"),
+  },
+  claude_code: {
+    key: "seatsSkipped",
+    unreadable: "claude_seat_settings_unreadable",
+    unmanaged: "claude_seat_settings_unmanaged",
+    unresolved: "claude_seat_symlink_unresolvable",
+    linkPath: (home: string, slug: string) => path.join(claudeSeatsRoot(home), slug, "settings.json"),
+  },
+} as const;
+
+/**
+ * Value-blind receipt for the discovered profiles (or Claude seats) a rotation
+ * did not rewrite: slug, path and reason, never a token and never a malformed
+ * byte. Omitted entirely when there is nothing to report, so a host without
+ * fleet profiles prints exactly the payload it printed before this bead.
+ */
+function skippedDiscoveredReceipt(
+  family: keyof typeof SKIPPED_DISCOVERED_RECEIPTS,
+  skipped: ReadonlyArray<{ slug: string; path: string; state: string }>,
+  home: string,
 ) {
   if (skipped.length === 0) return {};
+  const receipt = SKIPPED_DISCOVERED_RECEIPTS[family];
   return {
-    profilesSkipped: skipped.map(({ profile, state }) => ({
-      slug: profile.slug,
-      path: profile.path,
+    [receipt.key]: skipped.map(({ slug, path: file, state }) => ({
+      slug,
+      ...homeScopedDiscoveredPath(file, receipt.linkPath(home, slug), home),
       status: "skipped" as const,
-      reason: state === "malformed"
-        ? "codex_profile_config_unreadable"
-        : "codex_profile_config_unmanaged",
+      reason: state === "malformed" ? receipt.unreadable : receipt.unmanaged,
     })),
   };
 }
@@ -2486,11 +2582,12 @@ async function main() {
     let managedConfigReconcileTimer: NodeJS.Timeout | undefined;
     let syncInFlight = false;
 
-    // Sessions whose snapshot push failed (or was interrupted) carry over to
-    // the next cycle in memory. A daemon restart drops the set — the
-    // `upload-history --sessions` backfill is the stateless recovery tool,
-    // exactly as the event side's recovery is upload-history itself.
-    let pendingSessionIds: string[] = [];
+    // Sessions whose snapshot push failed (or was interrupted) carry over
+    // across cycles and restarts in maintenance_state. Until one full walk
+    // is accepted, each cycle catch-up-walks the ledger so a missed first
+    // refresh does not wait for `upload-history --sessions`.
+    let sessionSyncState = loadDaemonSessionSyncState(buffer.database);
+    let pendingSessionIds: string[] = sessionSyncState.pendingSessionIds;
 
     const runSync = async () => {
       if (!config.uploadUrl || syncInFlight || shuttingDown) return;
@@ -2498,10 +2595,19 @@ async function main() {
       syncInFlight = true;
       const storageRetry = new SyncStorageRetryController();
       const uploadedBatches: Array<Awaited<ReturnType<typeof uploadBufferedEvents>>["batch"]> = [];
+      const persistSessionCarry = () => {
+        sessionSyncState = { ...sessionSyncState, pendingSessionIds };
+        try {
+          saveDaemonSessionSyncState(buffer.database, sessionSyncState);
+        } catch {
+          sessionSyncState = { ...sessionSyncState, caughtUp: false };
+        }
+      };
       const carrySessions = () => {
         pendingSessionIds = [
           ...new Set([...pendingSessionIds, ...sessionIdsFromBatches(uploadedBatches)]),
         ];
+        persistSessionCarry();
       };
       let uploaded = 0;
       let serverRetryAfterMs = 0;
@@ -2535,23 +2641,39 @@ async function main() {
         // rather than issue another request inside a server-directed cooldown.
         if (serverRetryAfterMs > 0) { carrySessions(); return; }
 
-        // Session sync (issue 0037): the sessions whose events just crossed
-        // get their snapshots refreshed — recomputed over the FULL ledger,
-        // pushed as a kind:"session_sync" batch the cloud upserts grow-only.
-        // Isolated failure domain: events are already marked uploaded, so a
-        // session-push error must never look like a sync failure or trigger
-        // the event backoff; the ids simply carry to the next cycle.
+        // Session sync (issue 0037 / eco-6hoxj.70.1): just-uploaded batches
+        // plus durable pending, and a ledger catch-up until the first full
+        // walk is accepted. Isolated failure domain: events are already
+        // marked uploaded, so a session-push or planner error must never
+        // look like a sync failure or trigger the event backoff.
         const touchedSessionIds = [
           ...new Set([...pendingSessionIds, ...sessionIdsFromBatches(uploadedBatches)]),
         ];
-        if (touchedSessionIds.length > 0) {
-          try {
+        try {
+          const sessionPlan = planDaemonSessionSync({
+            db: buffer.database,
+            state: { ...sessionSyncState, pendingSessionIds },
+            uploadedBatches,
+            until: new Date().toISOString(),
+          });
+          sessionSyncState = sessionPlan.state;
+          pendingSessionIds = sessionPlan.state.pendingSessionIds;
+          persistSessionCarry();
+          if (!sessionPlan.skip) {
             const sessionResult = await runSessionSync(config, {
-              sessionIds: touchedSessionIds,
+              ...(sessionPlan.sessionIds !== undefined ? { sessionIds: sessionPlan.sessionIds } : {}),
+              until: sessionPlan.until,
               ledgerDb: buffer.database,
               log: () => undefined,
             });
-            pendingSessionIds = sessionResult.ok ? [] : touchedSessionIds;
+            if (sessionResult.ok) {
+              sessionSyncState = commitDaemonSessionSyncSuccess(sessionSyncState, sessionPlan.until);
+              pendingSessionIds = [];
+            } else {
+              sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, sessionPlan.sessionIds);
+              pendingSessionIds = sessionSyncState.pendingSessionIds;
+            }
+            persistSessionCarry();
             if (sessionResult.ok && sessionResult.sentSessions > 0) {
               console.log(
                 JSON.stringify({
@@ -2572,15 +2694,18 @@ async function main() {
                 JSON.stringify({ warning: "session_sync_failed", message: sessionResult.reason }),
               );
             }
-          } catch (error) {
-            pendingSessionIds = touchedSessionIds;
-            console.warn(
-              JSON.stringify({
-                warning: "session_sync_failed",
-                message: error instanceof Error ? error.message : String(error),
-              }),
-            );
           }
+        } catch (error) {
+          pendingSessionIds = touchedSessionIds;
+          console.warn(
+            JSON.stringify({
+              warning: "session_sync_failed",
+              message: error instanceof Error ? error.message : String(error),
+            }),
+          );
+          sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, touchedSessionIds);
+          pendingSessionIds = sessionSyncState.pendingSessionIds;
+          persistSessionCarry();
         }
       } catch (error) {
         carrySessions();
@@ -3172,6 +3297,13 @@ async function main() {
           // Hook events the collector could not accept live, and what the
           // drain has recovered since (bead eco-6hoxj.61).
           hookSpool: hookSpoolOperatorStatus(collectorHome(), daemonState.hookSpool),
+          producerParity: buildProducerParityReport({
+            home: collectorHome(),
+            windowHours: 6,
+            ledger: buffer.database.prepare(
+              `select id, created_at as createdAt, source from buffered_events`,
+            ).all() as Array<{ id: string; createdAt: string; source: string }>,
+          }),
           // Why delivery is paused, next to what is waiting: the daemon's own
           // scheduling snapshot, the same block HTTP /status carries
           // (bead eco-6hoxj.67, review r1 F4).
@@ -3206,6 +3338,26 @@ async function main() {
       ),
     );
     buffer.close();
+    return;
+  }
+
+  if (command === "producer-parity") {
+    const hours = Number(optionValue("--hours") ?? 6);
+    const windowHours = Number.isFinite(hours) && hours > 0 ? hours : 6;
+    const buffer = openBuffer(config);
+    try {
+      const report = buildProducerParityReport({
+        home: collectorHome(),
+        windowHours,
+        ledger: buffer.database.prepare(
+          `select id, created_at as createdAt, source from buffered_events`,
+        ).all() as Array<{ id: string; createdAt: string; source: string }>,
+      });
+      console.log(JSON.stringify(report, null, 2));
+      if (!report.parity) process.exitCode = 1;
+    } finally {
+      buffer.close();
+    }
     return;
   }
 
@@ -3655,20 +3807,49 @@ async function main() {
   }
 
   if (command === "rotate-producer-token") {
-    // Explicit operator boundary: mint a new Codex producer token, rewrite the
-    // managed header file and config.toml with the backup convention setup
+    // Explicit operator boundary: mint a new producer token for one source,
+    // rewrite that source's managed surfaces with the backup convention setup
     // already uses, and keep the superseded token acceptable for a bounded
-    // grace window so an already-running Codex keeps reporting until restart.
+    // grace window so an already-running producer keeps reporting until
+    // restart. Codex came first; Claude Code, Gemini CLI and Grok follow the
+    // same flow over their own managed targets (bead eco-6hoxj.152), so a
+    // token exposed for any source can be revoked on a fixed deadline.
     const argValue = (name: string) => {
       const index = process.argv.indexOf(name);
       return index === -1 ? undefined : process.argv[index + 1];
     };
-    const rotateSource = argValue("--source");
-    if (rotateSource !== "codex") {
-      console.error("Usage: plimsoll rotate-producer-token --source codex [--grace-seconds N] [--dry-run]");
+    const ROTATION_SOURCES = {
+      claude_code: {
+        label: "Claude Code",
+        tokenOption: "claudeCodeProducerToken",
+        authField: "claudeCodeProducer",
+      },
+      codex: {
+        label: "Codex",
+        tokenOption: "codexProducerToken",
+        authField: "codexProducer",
+      },
+      gemini_cli: {
+        label: "Gemini CLI",
+        tokenOption: "geminiCliProducerToken",
+        authField: "geminiCliProducer",
+      },
+      grok: {
+        label: "Grok",
+        tokenOption: "grokProducerToken",
+        authField: "grokProducer",
+      },
+    } as const;
+    const rotateSourceArgument = argValue("--source");
+    if (rotateSourceArgument === undefined || !Object.hasOwn(ROTATION_SOURCES, rotateSourceArgument)) {
+      console.error(
+        "Usage: plimsoll rotate-producer-token --source <claude_code|codex|gemini_cli|grok> [--grace-seconds N] [--dry-run]",
+      );
       process.exitCode = 1;
       return;
     }
+    const rotateSource = rotateSourceArgument as keyof typeof ROTATION_SOURCES;
+    const rotateSpec = ROTATION_SOURCES[rotateSource];
     const graceArgument = argValue("--grace-seconds");
     const graceSeconds = graceArgument === undefined
       ? DEFAULT_PRODUCER_ROTATION_GRACE_MS / 1000
@@ -3682,6 +3863,14 @@ async function main() {
     const rotateDryRun = process.argv.includes("--dry-run");
     const rotateCodexFile = argValue("--codex-config") ?? path.join(os.homedir(), ".codex", "config.toml");
     const rotateHeaderFile = path.join(path.dirname(rotateCodexFile), "plimsoll.headers");
+    // Grok's root is resolved (and validated) only when Grok is the source, so
+    // a malformed GROK_HOME cannot block the rotation of another source.
+    const rotateGrokFile = rotateSource === "grok"
+      ? argValue("--grok-hooks") ?? path.join(resolveGrokHome().home, "hooks", "plimsoll.json")
+      : undefined;
+    const rotateGrokHeaderFile = rotateGrokFile
+      ? path.join(path.dirname(rotateGrokFile), "plimsoll.headers")
+      : undefined;
     // Rotation never provisions. Without existing credentials there is nothing
     // to supersede, and minting here would add a second provisioning boundary.
     const currentAuth = readLocalIngestAuth(collectorHome());
@@ -3699,53 +3888,347 @@ async function main() {
       geminiCliProducerToken: currentAuth.geminiCliProducer,
       grokProducerToken: currentAuth.grokProducer,
       codexHeaderFile: rotateHeaderFile,
+      ...(rotateGrokHeaderFile ? { grokHeaderFile: rotateGrokHeaderFile } : {}),
     };
-    // Fleet Codex seat profiles (bead eco-6hoxj.54). Since eco-6hoxj.52 every
-    // discovered ~/.codex-profiles/<slug>/config.toml carries this producer
-    // token inline in its managed [otel] exporter headers, so a rotation that
-    // rewrote only ~/.codex left every profile lane posting a superseded token
-    // the moment the grace window closed. Each managed profile is rotated as
-    // its own target with the same backup-and-commit discipline the default
-    // target uses. A profile without the managed token is not an authenticated
-    // consumer and is never provisioned here — `setup` owns that — and one the
-    // conductor left unparseable is reported rather than rewritten.
-    const rotateProfiles = discoverCodexProfiles(os.homedir())
-      .filter((profile) => profile.hasConfig)
-      .map((profile) => ({ profile, state: codexProfileTokenState(profile.path) }));
-    const rotateProfilesSkipped = rotateProfiles.filter((entry) => entry.state !== "managed");
     type RotateTarget = {
       path: string;
+      slug?: string;
       /** True for a target found on disk rather than declared by Plimsoll. */
       discovered?: true;
+      /**
+       * A discovered file no other command manages (a Grok hooks/*.json beside
+       * plimsoll.json): `setup` cannot repair it, so its preflight refusal
+       * blocks the rotation before anything is minted.
+       */
+      manualRepair?: true;
+      /**
+       * A discovered file no other command manages whose refusal does not block
+       * the rotation (a private header file a Grok hook copy reads): it makes
+       * the rotation incomplete and is repaired by hand.
+       */
+      handRepair?: true;
+      /**
+       * Why this target is reported instead of rewritten. `absent`: a managed
+       * file this host does not have, which a rotation never creates.
+       * `unchanged`: a file that needs no rewrite because another target
+       * carries its token. `unresolved`: a discovered seat or profile whose
+       * directory link cannot be resolved; the rotation is incomplete.
+       */
+      notRewritten?:
+        | { status: "absent" }
+        | { status: "skipped" | "unchanged" | "unresolved"; reason: string };
       run: (options: typeof rotateOptions, preview: boolean) => ReturnType<typeof applyCodexConfig>;
     };
-    const rotateTargets: RotateTarget[] = [
-      {
-        path: rotateHeaderFile,
-        run: (options: typeof rotateOptions, preview: boolean) =>
-          applyCodexHookHeaderFile(rotateHeaderFile, generateCodexHookHeader(options), { dryRun: preview }),
-      },
-      {
-        path: rotateCodexFile,
-        run: (options: typeof rotateOptions, preview: boolean) =>
-          applyCodexConfig(rotateCodexFile, generateCodexConfigToml(options), { dryRun: preview }),
-      },
-      ...rotateProfiles
-        .filter((entry) => entry.state === "managed")
-        .map(({ profile }): RotateTarget => ({
-          path: profile.path,
+    /**
+     * A file Plimsoll manages for a source other than Codex. Codex keeps its
+     * pre-bead contract (its owned targets are always applied); the newer
+     * sources report a missing file as `absent` and never create it.
+     */
+    const ownedTarget = (file: string, run: RotateTarget["run"]): RotateTarget => ({
+      path: file,
+      ...(fs.existsSync(file) ? {} : { notRewritten: { status: "absent" as const } }),
+      run,
+    });
+    // Discovered seat and profile receipts name the file through its link under
+    // $HOME, never a resolved path outside it (eco-6hoxj.51).
+    const rotateHome = os.homedir();
+    const rotateTargetReceipt = (target: RotateTarget) =>
+      target.discovered && target.slug && (rotateSource === "codex" || rotateSource === "claude_code")
+        ? homeScopedDiscoveredPath(
+            target.path,
+            SKIPPED_DISCOVERED_RECEIPTS[rotateSource].linkPath(rotateHome, target.slug),
+            rotateHome,
+          )
+        : { path: target.path };
+    /**
+     * A discovered seat or profile whose directory link cannot be resolved
+     * (ELOOP, EACCES, a detached volume): it may carry the token but cannot be
+     * read, so it is listed `unresolved`, never rewritten, and the rotation is
+     * incomplete (eco-6hoxj.51 reports it honestly instead of as a skip).
+     */
+    const unresolvedTarget = (
+      family: "codex" | "claude_code",
+      target: { path: string; slug: string },
+    ): RotateTarget => ({
+      path: target.path,
+      slug: target.slug,
+      discovered: true,
+      notRewritten: { status: "unresolved", reason: SKIPPED_DISCOVERED_RECEIPTS[family].unresolved },
+      run: () => { throw new Error(`${target.path}: not rewritten`); },
+    });
+    const rotateTargets: RotateTarget[] = [];
+    let rotateSkipped: ReturnType<typeof skippedDiscoveredReceipt> = {};
+    if (rotateSource === "codex") {
+      // Fleet Codex seat profiles (bead eco-6hoxj.54). Since eco-6hoxj.52 every
+      // discovered ~/.codex-profiles/<slug>/config.toml carries this producer
+      // token inline in its managed [otel] exporter headers, so a rotation that
+      // rewrote only ~/.codex left every profile lane posting a superseded token
+      // the moment the grace window closed. Each managed profile is rotated as
+      // its own target with the same backup-and-commit discipline the default
+      // target uses. A profile without the managed token is not an authenticated
+      // consumer and is never provisioned here — `setup` owns that — and one the
+      // conductor left unparseable is reported rather than rewritten.
+      const discoveredProfiles = discoverCodexProfiles(rotateHome);
+      const rotateProfiles = discoveredProfiles
+        .filter((profile) => profile.hasConfig)
+        .map((profile) => ({ profile, token: codexProfileTokenState(profile.path) }));
+      rotateSkipped = skippedDiscoveredReceipt(
+        "codex",
+        rotateProfiles
+          .filter((entry) => entry.token.state === "unmanaged" || entry.token.state === "malformed")
+          .map(({ profile, token }) => ({ slug: profile.slug, path: profile.path, state: token.state })),
+        rotateHome,
+      );
+      rotateTargets.push(
+        {
+          path: rotateHeaderFile,
+          run: (options, preview) =>
+            applyCodexHookHeaderFile(rotateHeaderFile, generateCodexHookHeader(options), { dryRun: preview }),
+        },
+        {
+          path: rotateCodexFile,
+          run: (options, preview) =>
+            applyCodexConfig(rotateCodexFile, generateCodexConfigToml(options), { dryRun: preview }),
+        },
+        ...rotateProfiles
+          .filter((entry) => entry.token.state === "managed" || entry.token.state === "refused")
+          .map(({ profile, token }): RotateTarget => ({
+            path: profile.path,
+            slug: profile.slug,
+            discovered: true,
+            run: "reason" in token
+              ? () => { throw new Error(token.reason); }
+              : (options, preview) =>
+                applyCodexConfig(profile.path, generateCodexConfigToml(options), {
+                  dryRun: preview,
+                  managedTarget: `codexProfile[${profile.slug}]`,
+                }),
+          })),
+        ...discoveredProfiles
+          .filter((profile) => profile.unresolved)
+          .map((profile) => unresolvedTarget("codex", profile)),
+      );
+    } else if (rotateSource === "claude_code") {
+      // The token lives in `env.OTEL_EXPORTER_OTLP_HEADERS` and the http hook
+      // headers of ~/.claude/settings.json and of every fleet Claude seat
+      // (bead eco-6hoxj.48). The targets are the ones setup and the managed
+      // reconcile compose; a seat without the managed token is left for setup
+      // and a malformed one is reported, exactly like a Codex profile. A seat
+      // directory without settings.json is listed `absent` (the daemon
+      // reconcile includes it too) and never created.
+      const claudeFile = argValue("--claude-settings") ?? path.join(os.homedir(), ".claude", "settings.json");
+      const unresolvedSeats = new Set(
+        discoverClaudeSeats(rotateHome).filter((seat) => seat.unresolved).map((seat) => seat.slug),
+      );
+      const claudeTargets = composeManagedClaudeTargets(claudeFile, rotateHome, { includeAbsent: true })
+        .map((target) => ({ target, slug: target.name.slice("claudeSeat[".length, -1) }))
+        .map(({ target, slug }) => ({
+          target,
+          slug,
+          token: !target.discovered
+            ? { state: "managed" as const }
+            : unresolvedSeats.has(slug)
+              ? { state: "unresolved" as const }
+              : fs.existsSync(target.path) ? claudeSeatTokenState(target.path) : { state: "absent" as const },
+        }));
+      rotateSkipped = skippedDiscoveredReceipt(
+        "claude_code",
+        claudeTargets
+          .filter((entry) => entry.token.state === "unmanaged" || entry.token.state === "malformed")
+          .map(({ target, slug, token }) => ({ slug, path: target.path, state: token.state })),
+        rotateHome,
+      );
+      rotateTargets.push(
+        ...claudeTargets
+          .filter((entry) => entry.token.state !== "unmanaged" && entry.token.state !== "malformed")
+          .map(({ target, slug, token }): RotateTarget =>
+            !target.discovered
+              ? ownedTarget(target.path, target.run)
+              : token.state === "unresolved"
+                ? unresolvedTarget("claude_code", { path: target.path, slug })
+                : token.state === "absent"
+                  ? { path: target.path, slug, discovered: true, notRewritten: { status: "absent" }, run: target.run }
+                  : "reason" in token
+                    ? { path: target.path, slug, discovered: true, run: () => { throw new Error(token.reason); } }
+                    : { path: target.path, slug, discovered: true, run: target.run }
+          ),
+      );
+    } else if (rotateSource === "gemini_cli") {
+      // Gemini's exporter takes the token as the `x-plimsoll-token` query value
+      // of `telemetry.otlpEndpoint` in ~/.gemini/settings.json. Only that value
+      // changes: re-applying the generated telemetry object would also reset
+      // the operator's other telemetry settings (review r1 F1).
+      const geminiFile = argValue("--gemini-settings") ?? path.join(os.homedir(), ".gemini", "settings.json");
+      rotateTargets.push(
+        ownedTarget(geminiFile, (options, preview) =>
+          rotateGeminiSettingsToken(geminiFile, options.geminiCliProducerToken ?? "", { dryRun: preview })
+        ),
+      );
+    } else {
+      // Grok reads the token from the private header file; the hook fragment is
+      // re-applied too, which moves a legacy fragment that still embeds the
+      // token inline onto the header file. A fragment whose header file is
+      // absent is not rewritten: it would point at a secret nothing wrote.
+      const grokFile = rotateGrokFile!;
+      const grokHeaderFile = rotateGrokHeaderFile!;
+      const header = ownedTarget(grokHeaderFile, (options, preview) =>
+        applyGrokHookHeaderFile(grokHeaderFile, generateGrokHookHeader(options), { dryRun: preview })
+      );
+      const withHeader = (target: RotateTarget): RotateTarget =>
+        header.notRewritten && !target.notRewritten
+          ? { ...target, notRewritten: { status: "skipped", reason: "grok_header_file_absent" } }
+          : target;
+      const hook = ownedTarget(grokFile, (options, preview) =>
+        applyGrokHookFile(grokFile, generateGrokHookSettings(options), { dryRun: preview })
+      );
+      rotateTargets.push(header, withHeader(hook));
+      // Grok merges every hooks/*.json, so a copy of the managed fragment under
+      // another name still posts the token (review r1 F4). Each sibling, and
+      // each header file one names, is classified only from bytes read through
+      // the guarded preimage its rewrite uses (review r3 G3): ancestors checked
+      // before the open, the leaf opened no-follow and non-blocking, and its
+      // fstat bound to the lstat identity before any byte is read. A regular
+      // sibling file that is exactly a managed fragment is classified by where
+      // its token lives:
+      // - inline in the JSON (legacy form): rewritten like plimsoll.json;
+      // - in a header file its commands name with `-H @<file>` (review r2 G1):
+      //   the JSON is reported `unchanged`; the managed header is rotated above,
+      //   any other existing header file carrying the token is rotated as its
+      //   own target (bound to the identity whose bytes were classified), one
+      //   the guard refuses to read is listed `refused` with that reason, and
+      //   an absent one is reported `skipped`.
+      // One that carries the token but is not a managed fragment, a symlink
+      // (never read, so it may carry the token) and an unreadable one are
+      // reported `skipped`; one the guard refuses otherwise (a hard link, an
+      // unsafe mode or owner, a replaced file) blocks the rotation before
+      // minting. A directory or a FIFO is not a hook file and is never read.
+      const grokHooksDirectory = path.dirname(grokFile);
+      const siblingHooks = fs.existsSync(grokHooksDirectory)
+        ? fs.readdirSync(grokHooksDirectory)
+          .filter((name) => name.endsWith(".json"))
+          .map((name) => path.join(grokHooksDirectory, name))
+          .filter((file) => path.resolve(file) !== path.resolve(grokFile))
+          .sort()
+        : [];
+      const skippedSibling = (sibling: string, reason: string): RotateTarget => ({
+        path: sibling,
+        discovered: true,
+        manualRepair: true,
+        notRewritten: { status: "skipped", reason },
+        run: () => { throw new Error(`${sibling}: not rewritten`); },
+      });
+      const grokToken = currentAuth.grokProducer;
+      type HeaderFileState =
+        | { state: "unresolvable" | "managed" | "absent" | "unrelated" }
+        | { state: "private"; identity: DiscoveredFileIdentity }
+        | { state: "refused"; reason: string };
+      const headerFileState = (reference: string): HeaderFileState => {
+        if (!path.isAbsolute(reference)) return { state: "unresolvable" };
+        if (path.resolve(reference) === path.resolve(grokHeaderFile)) return { state: "managed" };
+        const read = readDiscoveredConfigFile(reference, "grok");
+        if (read.status === "absent") return { state: "absent" };
+        if (read.status === "refused") return { state: "refused", reason: read.reason };
+        if (read.status === "unreadable") return { state: "refused", reason: "GROK_CONFIG_IO_FAILURE" };
+        return grokToken && read.content.includes(grokToken)
+          ? { state: "private", identity: read.identity }
+          : { state: "unrelated" };
+      };
+      const listedHeaderFiles = new Set<string>();
+      for (const sibling of siblingHooks) {
+        const read = readDiscoveredConfigFile(sibling, "grok");
+        if (read.status === "absent" || (read.status === "refused" && read.reason === "GROK_CONFIG_UNSAFE_LEAF_TYPE")) {
+          continue;
+        }
+        if (read.status === "unreadable") {
+          rotateTargets.push(skippedSibling(sibling, "grok_hook_unreadable"));
+          continue;
+        }
+        if (read.status === "refused") {
+          if (read.reason === "GROK_CONFIG_UNSAFE_LEAF_SYMLINK") {
+            rotateTargets.push(skippedSibling(sibling, "grok_hook_symlink"));
+          } else {
+            rotateTargets.push({
+              path: sibling,
+              discovered: true,
+              manualRepair: true,
+              run: () => { throw new Error(read.reason); },
+            });
+          }
+          continue;
+        }
+        const text = read.content;
+        let managed = false;
+        let document: unknown;
+        try {
+          document = JSON.parse(text);
+          managed = isManagedGrokDocument(document);
+        } catch {
+          managed = false;
+        }
+        const inlineToken = Boolean(grokToken) && text.includes(grokToken!);
+        const headerFiles = managed && !inlineToken
+          ? managedGrokHeaderFileReferences(document)
+            .map((reference) => ({ reference, file: headerFileState(reference) }))
+            .filter((entry) => entry.file.state !== "unrelated")
+          : [];
+        if (!inlineToken && headerFiles.length === 0) continue;
+        if (!managed) {
+          rotateTargets.push(skippedSibling(sibling, "grok_hook_unmanaged_token_bearing"));
+          continue;
+        }
+        if (inlineToken) {
+          rotateTargets.push(withHeader({
+            path: sibling,
+            discovered: true,
+            manualRepair: true,
+            run: (options, preview) =>
+              applyGrokHookFile(sibling, generateGrokHookSettings(options), { dryRun: preview }),
+          }));
+          continue;
+        }
+        const states = new Set(headerFiles.map((entry) => entry.file.state));
+        rotateTargets.push({
+          path: sibling,
           discovered: true,
-          run: (options: typeof rotateOptions, preview: boolean) =>
-            applyCodexConfig(profile.path, generateCodexConfigToml(options), {
-              dryRun: preview,
-              managedTarget: `codexProfile[${profile.slug}]`,
-            }),
-        })),
-    ];
+          manualRepair: true,
+          notRewritten: states.has("unresolvable")
+            ? { status: "skipped", reason: "grok_hook_header_file_unresolvable" }
+            : states.has("absent")
+              ? { status: "skipped", reason: "grok_hook_header_file_absent" }
+              : states.has("managed") && header.notRewritten
+                ? { status: "skipped", reason: "grok_header_file_absent" }
+                : {
+                    status: "unchanged",
+                    reason: states.has("private") || states.has("refused")
+                      ? "grok_hook_reads_its_own_header_file_rotated_as_its_own_target"
+                      : "grok_hook_reads_the_managed_header_file_rotated_above",
+                  },
+          run: () => { throw new Error(`${sibling}: not rewritten`); },
+        });
+        for (const { reference, file } of headerFiles) {
+          if (file.state !== "private" && file.state !== "refused") continue;
+          if (listedHeaderFiles.has(path.resolve(reference))) continue;
+          listedHeaderFiles.add(path.resolve(reference));
+          rotateTargets.push({
+            path: reference,
+            discovered: true,
+            handRepair: true,
+            run: file.state === "refused"
+              ? () => { throw new Error(file.reason); }
+              : (options, preview) =>
+                applyGrokHookHeaderFile(reference, generateGrokHookHeader(options), {
+                  dryRun: preview,
+                  boundLeaf: file.identity,
+                }),
+          });
+        }
+      }
+    }
+    const rewritableTargets = rotateTargets.filter((target) => !target.notRewritten);
     // Preflight against the CURRENT token. A refusal here leaves the credential
     // file untouched, so an installed config is never left holding a token the
     // collector has already superseded.
-    const preflight = rotateTargets.map((target) => {
+    const preflight = rewritableTargets.map((target) => {
       try {
         return { target, refusal: target.run(rotateOptions, true).conflict };
       } catch (error) {
@@ -3757,18 +4240,27 @@ async function main() {
     // ~/.codex or of the other profiles, exactly as `setup` refuses a discovered
     // target without failing the run (see ownedRefusal above).
     const refusedTargets = preflight
-      .filter((entry) => entry.refusal && !entry.target.discovered)
-      .map((entry) => ({ path: entry.target.path, refusal: entry.refusal }));
+      .filter((entry) => entry.refusal && (!entry.target.discovered || entry.target.manualRepair))
+      .map((entry) => ({ path: entry.target.path, refusal: entry.refusal, manualRepair: entry.target.manualRepair }));
     if (refusedTargets.length > 0) {
       console.log(JSON.stringify({
         status: "rotation_refused",
-        source: "codex",
+        source: rotateSource,
         rotated: false,
         targets: refusedTargets.map((entry) => ({
           path: entry.path,
           status: "refused",
           reason: entry.refusal,
         })),
+        // Nothing was minted, so rotating again once the file is repaired is safe.
+        nextSteps: [
+          ...(refusedTargets.some((entry) => !entry.manualRepair)
+            ? ["plimsoll setup --yes   # repair the refused managed file, then rotate again"]
+            : []),
+          ...(refusedTargets.some((entry) => entry.manualRepair)
+            ? ["edit or remove each refused Grok hook file by hand (setup does not manage it), then rotate again"]
+            : []),
+        ],
       }, null, 2));
       process.exitCode = 1;
       return;
@@ -3777,95 +4269,136 @@ async function main() {
       // A dry run mints nothing, so the plan lines for the discovered profiles
       // are previewed against a placeholder that is never written and never
       // printed: it only makes the reconciler report the managed exporter
-      // headers a real rotation would rewrite.
-      for (const target of rotateTargets.filter((entry) => entry.discovered)) {
+      // headers a real rotation would rewrite. A discovered target that
+      // already refused preflight is would_refuse, not a plan line.
+      for (const target of rewritableTargets.filter((entry) => entry.discovered)) {
+        if (preflight.find((entry) => entry.target === target)?.refusal) continue;
         let preview: ReturnType<typeof applyCodexConfig> | undefined;
         try {
-          preview = target.run({ ...rotateOptions, codexProducerToken: ROTATION_PREVIEW_TOKEN }, true);
+          preview = target.run({ ...rotateOptions, [rotateSpec.tokenOption]: ROTATION_PREVIEW_TOKEN }, true);
         } catch {
           preview = undefined;
         }
+        const reportedPath = rotateTargetReceipt(target).path;
         for (const entry of preview?.plan ?? []) {
-          console.log(`${target.path}: ${entry.key} ${entry.action}`);
+          console.log(`${reportedPath}: ${entry.key} ${entry.action}`);
         }
       }
       console.log(JSON.stringify({
         status: "rotation_dry_run",
-        source: "codex",
+        source: rotateSource,
         rotated: false,
         graceSeconds,
-        targets: rotateTargets.map((target) => ({ path: target.path, status: "would_rotate" })),
-        ...skippedProfilesReceipt(rotateProfilesSkipped),
+        // A discovered target that already refuses is shown as would_refuse, so
+        // the dry run does not promise a rewrite the real run cannot make.
+        targets: rotateTargets.map((target) => {
+          const refusal = preflight.find((entry) => entry.target === target)?.refusal;
+          return {
+            ...rotateTargetReceipt(target),
+            status: target.notRewritten?.status ?? (refusal ? "would_refuse" : "would_rotate"),
+            ...(target.notRewritten && "reason" in target.notRewritten ? { reason: target.notRewritten.reason } : {}),
+            ...(refusal ? { reason: refusal } : {}),
+          };
+        }),
+        ...rotateSkipped,
       }, null, 2));
       return;
     }
     // Order matters: the credential file accepts the old and the new token
     // before either config file changes, so no producer is locked out mid-run.
-    const rotation = rotateLocalProducerToken(collectorHome(), "codex", {
+    const rotation = rotateLocalProducerToken(collectorHome(), rotateSource, {
       graceMs: graceSeconds * 1000,
     });
-    const rotatedOptions = { ...rotateOptions, codexProducerToken: rotation.auth.codexProducer };
-    const rotateResults: Array<{ path: string; status: string; backup: string | null; reason?: string }> = [];
+    const rotatedOptions = { ...rotateOptions, [rotateSpec.tokenOption]: rotation.auth[rotateSpec.authField] };
+    const rotateResults: Array<{ path: string; status: string; backup: string | null; reason?: string; outsideHome?: true }> = [];
+    // An owned target that refuses or fails halts the run (the targets after it
+    // depend on it). A discovered one that refuses or fails does not stop the
+    // other discovered targets, but the rotation is still incomplete: that
+    // surface keeps the superseded token and stops working at the deadline
+    // (review r1 F2). Explicit skips — unmanaged or unreadable seats and
+    // profiles, absent files — are not failures; an unresolvable seat or
+    // profile link is.
     let rotateFailure = false;
+    let rotateIncomplete = false;
     for (const target of rotateTargets) {
+      const reported = rotateTargetReceipt(target);
       if (rotateFailure) {
-        rotateResults.push({ path: target.path, status: "not_attempted", backup: null });
+        rotateResults.push({ ...reported, status: "not_attempted", backup: null });
+        continue;
+      }
+      if (target.notRewritten) {
+        if (target.notRewritten.status === "unresolved") rotateIncomplete = true;
+        rotateResults.push({
+          ...reported,
+          status: target.notRewritten.status,
+          backup: null,
+          ...("reason" in target.notRewritten ? { reason: target.notRewritten.reason } : {}),
+        });
         continue;
       }
       const preflightRefusal = preflight.find((entry) => entry.target === target)?.refusal;
       if (preflightRefusal) {
         // Only a discovered target reaches here: an owned refusal returned above.
-        rotateResults.push({ path: target.path, status: "refused", backup: null, reason: preflightRefusal });
+        rotateIncomplete = true;
+        rotateResults.push({ ...reported, status: "refused", backup: null, reason: preflightRefusal });
         continue;
       }
       try {
         const result = target.run(rotatedOptions, false);
         if (result.conflict) {
+          rotateIncomplete = true;
           if (!target.discovered) rotateFailure = true;
-          rotateResults.push({ path: target.path, status: "refused", backup: null, reason: result.conflict });
+          rotateResults.push({ ...reported, status: "refused", backup: null, reason: result.conflict });
           continue;
         }
         rotateResults.push({
-          path: target.path,
+          ...reported,
           status: result.changed ? "rotated" : "unchanged",
           backup: result.backupPath ?? null,
         });
       } catch (error) {
+        rotateIncomplete = true;
         if (!target.discovered) rotateFailure = true;
         rotateResults.push({
-          path: target.path,
+          ...reported,
           status: "failed",
           backup: null,
           reason: error instanceof Error ? error.message : String(error),
         });
       }
     }
+    const manualRepairPaths = new Set(
+      rotateTargets.filter((target) => target.manualRepair || target.handRepair).map((target) => target.path),
+    );
     console.log(JSON.stringify({
-      status: rotateFailure ? "rotation_incomplete" : "rotation_applied",
-      source: "codex",
+      status: rotateIncomplete ? "rotation_incomplete" : "rotation_applied",
+      source: rotateSource,
       rotated: true,
       graceSeconds,
       previousTokenExpiresAt: new Date(rotation.expiresAt).toISOString(),
       targets: rotateResults,
-      ...skippedProfilesReceipt(rotateProfilesSkipped),
-      nextSteps: rotateFailure
-        ? [
-            "the new token is already provisioned; re-run rotate-producer-token after resolving the refusal",
-            "the superseded token keeps working only until previousTokenExpiresAt",
-          ]
-        : [
-            "restart any running Codex sessions before previousTokenExpiresAt",
-            // A discovered profile that refused keeps the superseded token, so
-            // the operator is told how to repair it while the window is open.
-            ...(rotateResults.some((entry) =>
-              entry.status === "refused" || entry.status === "failed"
-            )
-              ? ["plimsoll setup --yes   # a discovered Codex seat profile refused the rotation"]
-              : []),
-            "plimsoll doctor --read-only --json   # producerTokenRotation.codex reports the deadline",
-          ],
+      ...rotateSkipped,
+      nextSteps: [
+        ...(rotateIncomplete
+          ? [
+              // Rotating again would mint a second token and supersede this one.
+              "the new token is already provisioned; fix each refused or failed target, then run `plimsoll setup --yes`, which re-applies the current token to every managed surface — do not run rotate-producer-token again",
+              "the superseded token keeps working only until previousTokenExpiresAt",
+            ]
+          : []),
+        `restart any running ${rotateSpec.label} sessions before previousTokenExpiresAt`,
+        ...(rotateResults.some((entry) => entry.reason === "grok_header_file_absent")
+          ? ["plimsoll setup --yes   # a managed file was absent, so its dependent target was not rewritten"]
+          : []),
+        ...(rotateResults.some((entry) =>
+          manualRepairPaths.has(entry.path) && entry.status !== "rotated" && entry.status !== "unchanged"
+        )
+          ? ["edit or remove by hand each Grok hook file beside plimsoll.json, or header file one reads, that was not rotated (setup does not manage it): one that still carries the superseded token stops working at previousTokenExpiresAt"]
+          : []),
+        `plimsoll doctor --read-only --json   # producerTokenRotation.${rotateSource} reports the deadline`,
+      ],
     }, null, 2));
-    if (rotateFailure) process.exitCode = 1;
+    if (rotateIncomplete) process.exitCode = 1;
     return;
   }
 
@@ -3978,6 +4511,16 @@ async function main() {
         path.join(claudeSeatsRoot(os.homedir()), seat.slug, "settings.json"),
         os.homedir(),
       );
+      if (seat.unresolved) {
+        return {
+          slug: seat.slug,
+          ...seatPath,
+          status: "unresolved" as const,
+          diagnostic: "claude_seat_symlink_unresolvable",
+          reason: seat.unresolved,
+          missing: [] as string[],
+        };
+      }
       if (!seat.hasSettings) {
         return { slug: seat.slug, ...seatPath, status: "skipped" as const, missing: [] as string[] };
       }
@@ -4009,6 +4552,16 @@ async function main() {
         path.join(codexProfilesRoot(os.homedir()), profile.slug, "config.toml"),
         os.homedir(),
       );
+      if (profile.unresolved) {
+        return {
+          slug: profile.slug,
+          ...profilePath,
+          status: "unresolved" as const,
+          diagnostic: "codex_profile_symlink_unresolvable",
+          reason: profile.unresolved,
+          missing: [] as string[],
+        };
+      }
       if (!profile.hasConfig) {
         return { slug: profile.slug, ...profilePath, status: "skipped" as const, missing: [] as string[] };
       }

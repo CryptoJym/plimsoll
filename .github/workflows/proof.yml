@@ -56,6 +56,7 @@ jobs:
           pnpm proof:completion
           pnpm proof:startup-wal-self-heal
           pnpm proof:authenticated-ingestion
+          pnpm proof:status-http-rollout
           pnpm proof:retention
 
       - name: Prove event allocation conservation
@@ -131,6 +132,15 @@ jobs:
       - name: Prove the Codex producer token stays off the config surface and rotates
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-producer-token
+
+      - name: Prove producer-token rotation for every source against a running collector (eco-6hoxj.152)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        # This proof's fixture-home guard refuses any sandbox that sits inside the runner account's
+        # password-database home (/Users/runner). The job's synthetic HOME and TMPDIR live there, so this
+        # one step gets a temp dir outside it; every fixture home the proof creates stays under that dir.
+        run: |
+          export TMPDIR="$(mktemp -d /private/tmp/plimsoll-rotation-proof.XXXXXX)"
+          pnpm proof:producer-token-rotation
 
       - name: Prove desktop TOML reconciliation and independent setup targets
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
@@ -208,6 +218,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:sync-backoff
 
+      - name: Prove daemon session sync catch-up without upload-history (eco-6hoxj.70.1)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-sync-daemon
+
       - name: Prove Codex account assertions and privacy boundary
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: |
@@ -223,6 +237,9 @@ jobs:
       - name: Prove hook events survive collector 503/refused via the per-home spool (eco-6hoxj.61)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:hook-spool
+      - name: Prove producer-to-ledger parity instrumentation (eco-6hoxj.29)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:producer-parity
       - name: Prove bounded admission-rejection diagnostics (runner-scaled)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:rejection-aggregation

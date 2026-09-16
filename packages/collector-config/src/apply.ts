@@ -5,6 +5,7 @@ import { isDeepStrictEqual } from "node:util";
 import { parse as parseToml } from "smol-toml";
 
 import { assertManagedConfigTarget } from "./fixture-root";
+import { generateGrokHookSettings, hookCommandHasRetryContract } from "./templates";
 
 /**
  * Config APPLY mode (issue 0003): idempotent, surgical merges of Plimsoll's
@@ -200,12 +201,17 @@ function assertStableClaudePath(expected: ClaudePathSnapshot) {
   }
 }
 
-function claudeOpenNoFollow(file: string, flags: number) {
+/**
+ * Every open is no-follow and non-blocking: a leaf swapped for a FIFO after its
+ * lstat returns a descriptor at once (and is refused by its fstat) instead of
+ * blocking the process (review r3 G3). libuv adds O_CLOEXEC to every open.
+ */
+function claudeOpenNoFollow(file: string, flags: number, symlinkCode = "UNSAFE_SYMLINK") {
   try {
-    return fs.openSync(file, flags | fs.constants.O_NOFOLLOW);
+    return fs.openSync(file, flags | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ELOOP" || code === "EMLINK") claudeFail("UNSAFE_SYMLINK");
+    if (code === "ELOOP" || code === "EMLINK") claudeFail(symlinkCode);
     throw error;
   }
 }
@@ -249,7 +255,7 @@ function assertClaudeBoundContent(
 function readClaudePreimage(file: string) {
   const snapshot = inspectClaudePath(file);
   if (!snapshot.exists) return { snapshot, current: "" };
-  const descriptor = claudeOpenNoFollow(snapshot.absolutePath, fs.constants.O_RDONLY);
+  const descriptor = claudeOpenNoFollow(snapshot.absolutePath, fs.constants.O_RDONLY, "UNSAFE_LEAF_SYMLINK");
   try {
     const opened = claudeIdentity(fs.fstatSync(descriptor));
     assertSafeClaudeLeaf(fs.fstatSync(descriptor));
@@ -260,6 +266,43 @@ function readClaudePreimage(file: string) {
     return { snapshot, current };
   } finally {
     fs.closeSync(descriptor);
+  }
+}
+
+export type DiscoveredFileIdentity = ClaudeFileIdentity;
+
+/**
+ * A file a producer-token rotation classifies before it decides what to rewrite:
+ * `read` carries bytes read through a verified descriptor, `refused` the
+ * rewrite's own value-blind reason, `unreadable` an I/O error such as EACCES.
+ */
+export type DiscoveredFileRead =
+  | { status: "absent" }
+  | { status: "read"; content: string; identity: DiscoveredFileIdentity }
+  | { status: "refused"; reason: string }
+  | { status: "unreadable" };
+
+/**
+ * Read a discovered Grok hook JSON, a header file one names, or a Claude seat's
+ * settings.json through the guarded preimage its rewrite uses (review r3 G3):
+ * every ancestor is checked (no symlink, owned by the user or root) before the
+ * leaf is opened `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`; the descriptor's fstat
+ * must be a regular, singly linked, user-owned file with the lstat's identity
+ * before any byte is read, and only bytes read through it are returned. A
+ * symlink, FIFO, directory or replaced file is refused with its
+ * `<SOURCE>_CONFIG_<CODE>` reason and its bytes are never returned.
+ */
+export function readDiscoveredConfigFile(file: string, source: "grok" | "claude"): DiscoveredFileRead {
+  try {
+    const { snapshot, current } = readClaudePreimage(file);
+    return snapshot.exists && snapshot.leaf
+      ? { status: "read", content: current, identity: snapshot.leaf }
+      : { status: "absent" };
+  } catch (error) {
+    if (error instanceof ClaudeConfigError) {
+      return { status: "refused", reason: `${source.toUpperCase()}_CONFIG_${error.code}` };
+    }
+    return { status: "unreadable" };
   }
 }
 
@@ -928,7 +971,125 @@ export function applyGeminiSettings(
   }
 }
 
+const PRODUCER_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const GEMINI_TOKEN_PARAMETER = "x-plimsoll-token=";
+
+/**
+ * Rotate the producer token in Gemini CLI settings without re-applying the
+ * generated telemetry object (bead eco-6hoxj.152, review r1 F1): only the
+ * `x-plimsoll-token` query value of the existing `telemetry.otlpEndpoint`
+ * changes. Scheme, host, path, other query parameters, the fragment and every
+ * other key keep their bytes; the write uses the same no-follow preimage,
+ * backup and transaction `applyGeminiSettings` uses. A file without that
+ * query value is not a rotation target (`gemini_settings_unmanaged`); an
+ * endpoint that does not parse, carries the parameter more than once or
+ * encoded, or whose token cannot be replaced in place is refused
+ * (`gemini_settings_malformed`). Both conflicts are value-blind, and both are
+ * returned by the dry run the rotation preflights with.
+ */
+export function rotateGeminiSettingsToken(
+  file: string,
+  token: string,
+  options: ClaudeApplyOptions = {},
+): ApplyResult {
+  assertManagedConfigTarget(file);
+  if (!PRODUCER_TOKEN_PATTERN.test(token)) {
+    throw new Error(`${file}: generated Gemini producer token is invalid.`);
+  }
+  const refuse = (conflict: "gemini_settings_unmanaged" | "gemini_settings_malformed"): ApplyResult => ({
+    path: file,
+    changed: false,
+    changes: [],
+    plan: [],
+    conflict,
+  });
+  try {
+    const { snapshot, current } = readClaudePreimage(file);
+    if (!snapshot.exists) return refuse("gemini_settings_unmanaged");
+    let document: Record<string, unknown>;
+    try {
+      document = parseClaudeDocument(current);
+    } catch {
+      return refuse("gemini_settings_malformed");
+    }
+    if (document.telemetry === undefined) return refuse("gemini_settings_unmanaged");
+    if (!isJsonRecord(document.telemetry)) return refuse("gemini_settings_malformed");
+    const endpoint = document.telemetry.otlpEndpoint;
+    if (endpoint === undefined) return refuse("gemini_settings_unmanaged");
+    if (typeof endpoint !== "string" || !URL.canParse(endpoint)) return refuse("gemini_settings_malformed");
+
+    // Edit the raw query rather than `URLSearchParams`, which re-encodes every
+    // other parameter it serializes.
+    const hashIndex = endpoint.indexOf("#");
+    const beforeHash = hashIndex === -1 ? endpoint : endpoint.slice(0, hashIndex);
+    const fragment = hashIndex === -1 ? "" : endpoint.slice(hashIndex);
+    const queryIndex = beforeHash.indexOf("?");
+    if (queryIndex === -1) return refuse("gemini_settings_unmanaged");
+    const parameters = beforeHash.slice(queryIndex + 1).split("&");
+    const tokenIndexes = parameters.flatMap((parameter, index) =>
+      parameter.startsWith(GEMINI_TOKEN_PARAMETER) ? [index] : []
+    );
+    if (tokenIndexes.length === 0) return refuse("gemini_settings_unmanaged");
+    if (tokenIndexes.length > 1) return refuse("gemini_settings_malformed");
+    const previousParameter = parameters[tokenIndexes[0]!]!;
+    // The raw parameter must be the only token value the exporter's URL parser
+    // sees; checked before the unchanged shortcut so the preflight catches it.
+    const parsedTokens = new URL(endpoint).searchParams.getAll("x-plimsoll-token");
+    if (parsedTokens.length !== 1 || parsedTokens[0] !== previousParameter.slice(GEMINI_TOKEN_PARAMETER.length)) {
+      return refuse("gemini_settings_malformed");
+    }
+    const managedKey = "gemini.telemetry.otlpEndpoint";
+    // Replace the parameter where it sits in the file so every other byte is
+    // kept: exactly one occurrence must yield the expected document. Otherwise
+    // (the parameter is JSON-escaped in the file) the target is refused rather
+    // than re-serialized, which could alter other values. This runs even when
+    // the token is unchanged — with a different probe value — so the preflight
+    // refuses such a file before anything is minted.
+    const replaceInPlace = (value: string) => {
+      const replacement = `${GEMINI_TOKEN_PARAMETER}${value}`;
+      const nextParameters = parameters.map((parameter, index) => index === tokenIndexes[0] ? replacement : parameter);
+      const nextEndpoint = `${beforeHash.slice(0, queryIndex + 1)}${nextParameters.join("&")}${fragment}`;
+      if (!URL.canParse(nextEndpoint) || new URL(nextEndpoint).searchParams.get("x-plimsoll-token") !== value) {
+        return undefined;
+      }
+      const expected = { ...document, telemetry: { ...document.telemetry as Record<string, unknown>, otlpEndpoint: nextEndpoint } };
+      const candidates: string[] = [];
+      for (let at = current.indexOf(previousParameter); at !== -1; at = current.indexOf(previousParameter, at + 1)) {
+        const candidate = `${current.slice(0, at)}${replacement}${current.slice(at + previousParameter.length)}`;
+        try {
+          if (isDeepStrictEqual(JSON.parse(candidate), expected)) candidates.push(candidate);
+        } catch {
+          // Not this occurrence.
+        }
+      }
+      return candidates.length === 1 ? candidates[0] : undefined;
+    };
+    const unchanged = previousParameter === `${GEMINI_TOKEN_PARAMETER}${token}`;
+    const probe = token === "A".repeat(43) ? "B".repeat(43) : "A".repeat(43);
+    const next = replaceInPlace(unchanged ? probe : token);
+    if (next === undefined) return refuse("gemini_settings_malformed");
+    if (unchanged) {
+      assertVisibleClaudeContent(snapshot, snapshot.leaf!, current);
+      return { path: file, changed: false, changes: [], plan: [{ key: managedKey, action: "unchanged" }] };
+    }
+    const changes = [`${managedKey}.token.set`];
+    const plan: ApplyPlanEntry[] = [{ key: managedKey, action: "updated" }];
+    if (options.dryRun) {
+      assertVisibleClaudeContent(snapshot, snapshot.leaf!, current);
+      return { path: file, changed: true, changes, plan };
+    }
+    const backupPath = writeClaudePlan(snapshot, current, next, options.transactionHooks);
+    return { path: file, changed: true, changes, plan, backupPath };
+  } catch (error) {
+    if (error instanceof ClaudeConfigError) {
+      throw new Error(error.message.replace(/^CLAUDE_CONFIG_/, "GEMINI_CONFIG_"));
+    }
+    throw error;
+  }
+}
+
 const GROK_MANAGED_EVENTS = ["UserPromptSubmit", "PostToolUse", "Stop"] as const;
+const GROK_COMMAND_PREFIX = 'if [ -n "${GROK_HOOK_EVENT:-}" ]; then ';
 const LEGACY_GROK_COMMAND_PATTERN = /^if \[ -n "\$\{GROK_HOOK_EVENT:-\}" \]; then curl -s --max-time 2 -X POST -H 'Content-Type: application\/json' -H 'x-plimsoll-source: grok'(?: -H 'x-plimsoll-token: [A-Za-z0-9_-]{43}')? --data-binary @- http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/hooks\/grok \|\| true; fi$/;
 const VALUE_BLIND_GROK_COMMAND_PATTERN = /^if \[ -n "\$\{GROK_HOOK_EVENT:-\}" \]; then (?:[a-zA-Z0-9_./:@=-]+|'(?:[^']|'\\'')*') --dir (?:[a-zA-Z0-9_./:@=-]+|'(?:[^']|'\\'')*') collector forward-hook-http grok \|\| true; fi$/;
 const SHELL_WORD_PATTERN = String.raw`(?:[a-zA-Z0-9_./:@=-]+|'(?:[^']|'\\'')*')`;
@@ -939,6 +1100,13 @@ const DIRECT_GROK_COMMAND_PATTERN = new RegExp(
     String.raw`|${SHELL_WORD_PATTERN} -s --max-time 2 -X POST -H 'Content-Type: application/json' -H ${GROK_HEADER_FILE_WORD_PATTERN} --data-binary @- http://127\.0\.0\.1:[1-9][0-9]{0,4}/hooks/grok \|\| true` +
     String.raw`|${SHELL_WORD_PATTERN} -s --max-time 2 -X POST -H 'Content-Type: application/json' --data-binary @- http://127\.0\.0\.1:[1-9][0-9]{0,4}/hooks/grok \|\| true); fi$`,
 );
+
+function isRetryingGrokCommand(command: string) {
+  if (!command.startsWith(GROK_COMMAND_PREFIX) || !command.endsWith("; fi")) return false;
+  const inner = command.slice(GROK_COMMAND_PREFIX.length, -"; fi".length);
+  return hookCommandHasRetryContract(inner) &&
+    /http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/hooks\/grok/.test(inner);
+}
 
 function isManagedGrokGroup(event: string, value: unknown) {
   if (!isJsonRecord(value)) return false;
@@ -953,10 +1121,56 @@ function isManagedGrokGroup(event: string, value: unknown) {
     typeof handler.command === "string" &&
     (LEGACY_GROK_COMMAND_PATTERN.test(handler.command) ||
       VALUE_BLIND_GROK_COMMAND_PATTERN.test(handler.command) ||
-      DIRECT_GROK_COMMAND_PATTERN.test(handler.command));
+      DIRECT_GROK_COMMAND_PATTERN.test(handler.command) ||
+      isRetryingGrokCommand(handler.command));
 }
 
-function isManagedGrokDocument(value: unknown) {
+const GROK_HEADER_FILE_COMMAND_PATTERN = new RegExp(
+  String.raw`^if \[ -n "\$\{GROK_HOOK_EVENT:-\}" \]; then ${SHELL_WORD_PATTERN} -s --max-time 2 -X POST -H 'Content-Type: application/json' -H (${GROK_HEADER_FILE_WORD_PATTERN}) --data-binary @- http://127\.0\.0\.1:[1-9][0-9]{0,4}/hooks/grok \|\| true; fi$`,
+);
+
+const RETRYING_GROK_HEADER_FILE_PLACEHOLDER = "/plimsoll-header-file";
+
+/**
+ * The `-H @<file>` word of a retrying (eco-6hoxj.29) managed Grok command,
+ * only when the command is byte-for-byte what the current generator renders
+ * for its own curl, port and header file, so this tracks the template.
+ */
+function retryingGrokHeaderFileWord(command: string) {
+  if (!isRetryingGrokCommand(command)) return undefined;
+  const word = new RegExp(String.raw` -H (${GROK_HEADER_FILE_WORD_PATTERN}) --data-binary @-`).exec(command)?.[1];
+  const grokCurlCommand = managedGrokExecutable(command);
+  const port = /http:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})\/hooks\/grok/.exec(command)?.[1];
+  if (!word || !grokCurlCommand || !port) return undefined;
+  const rendered = generateGrokHookSettings({
+    repoRoot: "",
+    port: Number(port),
+    grokCurlCommand,
+    grokHeaderFile: RETRYING_GROK_HEADER_FILE_PLACEHOLDER,
+  }).hooks.Stop[0]!.hooks[0]!.command;
+  const normalized = command.replace(
+    ` -H ${word} --data-binary @-`,
+    () => ` -H @${RETRYING_GROK_HEADER_FILE_PLACEHOLDER} --data-binary @-`,
+  );
+  return normalized === rendered ? word : undefined;
+}
+
+/**
+ * The distinct `-H @<file>` header files named by the header-file-form
+ * commands of a managed Grok hook fragment. Such a fragment carries no token
+ * itself: the token lives in the referenced file.
+ */
+export function managedGrokHeaderFileReferences(value: unknown): string[] {
+  if (!isManagedGrokDocument(value)) return [];
+  const references = hookCommands(value).flatMap((command) => {
+    const word = GROK_HEADER_FILE_COMMAND_PATTERN.exec(command)?.[1] ?? retryingGrokHeaderFileWord(command);
+    return word ? [unquoteShellWord(word).slice(1)] : [];
+  });
+  return [...new Set(references)];
+}
+
+/** Whether a parsed JSON document is exactly a Plimsoll-managed Grok hook fragment. */
+export function isManagedGrokDocument(value: unknown) {
   if (!isJsonRecord(value) || Object.keys(value).join(",") !== "hooks" || !isJsonRecord(value.hooks)) {
     return false;
   }
@@ -988,10 +1202,11 @@ function unquoteShellWord(word: string) {
 }
 
 function managedGrokExecutable(command: string) {
+  const retrying = command.match(new RegExp(String.raw`code=\$\((${SHELL_WORD_PATTERN}) -sS`));
   const direct = command.match(new RegExp(String.raw`\| (${SHELL_WORD_PATTERN}) -s`));
   const forwarded = command.match(new RegExp(String.raw`then (${SHELL_WORD_PATTERN}) --dir`));
   const legacy = command.match(new RegExp(String.raw`then (${SHELL_WORD_PATTERN}) -s`));
-  const word = direct?.[1] ?? forwarded?.[1] ?? legacy?.[1];
+  const word = retrying?.[1] ?? direct?.[1] ?? forwarded?.[1] ?? legacy?.[1];
   return word ? unquoteShellWord(word) : undefined;
 }
 
@@ -1135,6 +1350,15 @@ export function applyGrokHookFile(
 
 const MANAGED_HEADER_FILE_PATTERN = /^x-plimsoll-token: [A-Za-z0-9_-]{43}\n$/;
 
+export type HookHeaderFileApplyOptions = ClaudeApplyOptions & {
+  /**
+   * The identity `readDiscoveredConfigFile` returned for a header file a
+   * rotation classified from its bytes: the rewrite refuses (`LEAF_CHANGED`)
+   * unless the file is still that one (review r3 G3).
+   */
+  boundLeaf?: DiscoveredFileIdentity;
+};
+
 /**
  * Reconcile the private curl header file consumed by a managed command hook.
  * One implementation serves every source so the 0600 mode, the managed-content
@@ -1145,7 +1369,7 @@ function applyManagedHookHeaderFile(
   label: string,
   file: string,
   generated: string,
-  options: ClaudeApplyOptions,
+  options: HookHeaderFileApplyOptions,
 ): ApplyResult {
   assertManagedConfigTarget(file);
   try {
@@ -1153,6 +1377,9 @@ function applyManagedHookHeaderFile(
       throw new Error(`${file}: generated ${label} header file is invalid.`);
     }
     const { snapshot, current } = readClaudePreimage(file);
+    if (options.boundLeaf && (!snapshot.leaf || !sameClaudeIdentity(snapshot.leaf, options.boundLeaf))) {
+      claudeFail("LEAF_CHANGED");
+    }
     if (snapshot.exists && !MANAGED_HEADER_FILE_PATTERN.test(current)) {
       return {
         path: file,
@@ -1193,7 +1420,7 @@ function applyManagedHookHeaderFile(
 export function applyGrokHookHeaderFile(
   file: string,
   generated: string,
-  options: ClaudeApplyOptions = {},
+  options: HookHeaderFileApplyOptions = {},
 ): ApplyResult {
   return applyManagedHookHeaderFile("grok", "Grok", file, generated, options);
 }
@@ -1337,6 +1564,12 @@ function inspectCodexPath(file: string): CodexPathSnapshot {
   if (missingAncestor) unsafePath(file, "an ancestor appeared while inspecting config.toml");
   if (leafStat.isSymbolicLink()) unsafePath(file, "config.toml is a symbolic link");
   if (!leafStat.isFile()) unsafePath(file, "config.toml is not a regular file");
+  // The atomic rename replaces only this name, so another hard link would keep
+  // the old bytes while the apply reports success (review r2 G2). Refused the
+  // same way as a Claude leaf (CLAUDE_CONFIG_UNSAFE_LEAF_LINK_COUNT).
+  if (leafStat.nlink !== 1) {
+    unsafePath(file, "CODEX_CONFIG_UNSAFE_LEAF_LINK_COUNT: config.toml has more than one hard link");
+  }
   return { absolutePath, ancestors, exists: true, leaf: fileIdentity(leafStat) };
 }
 
@@ -1361,7 +1594,9 @@ function assertStableCodexPath(file: string, expected: CodexPathSnapshot) {
 
 function openNoFollow(file: string, flags: number) {
   try {
-    return fs.openSync(file, flags | fs.constants.O_NOFOLLOW);
+    // Non-blocking for the same reason as claudeOpenNoFollow: a FIFO swapped in
+    // after the lstat is opened at once and refused by its identity check.
+    return fs.openSync(file, flags | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ELOOP" || code === "EMLINK") unsafePath(file, "config.toml became a symbolic link");
@@ -1381,6 +1616,24 @@ function readCodexPreimage(file: string) {
     return { snapshot, current: fs.readFileSync(descriptor, "utf8") };
   } finally {
     fs.closeSync(descriptor);
+  }
+}
+
+/**
+ * Read a discovered Codex profile config.toml through the guarded preimage
+ * `applyCodexConfig` uses (review r3 G3): ancestors and leaf checked before the
+ * no-follow, non-blocking open, and the descriptor bound to the lstat identity
+ * before its bytes are read. The refusal reason is that apply's own message.
+ */
+export function readDiscoveredCodexConfig(
+  file: string,
+): Exclude<DiscoveredFileRead, { status: "read" }> | { status: "read"; content: string } {
+  try {
+    const { snapshot, current } = readCodexPreimage(file);
+    return snapshot.exists ? { status: "read", content: current } : { status: "absent" };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== undefined) return { status: "unreadable" };
+    return { status: "refused", reason: error instanceof Error ? error.message : String(error) };
   }
 }
 
@@ -1880,17 +2133,11 @@ function splitInlineTable(value: string) {
   };
 }
 
-function reconcileHeaders(file: string, managedKey: string, raw: string, generatedRaw: string) {
-  const table = splitInlineTable(raw);
+function generatedOwnedHeaderEntries(file: string, managedKey: string, generatedRaw: string) {
   const generatedTable = splitInlineTable(generatedRaw);
-  if (!table || !generatedTable) {
+  if (!generatedTable) {
     throw new Error(`${file}: ${managedKey} uses an unsupported layout; refusing to write or create a backup.`);
   }
-  const parsed = table.entries.map((entry, index) => {
-    const equals = topLevelEquals(entry);
-    const key = equals === -1 ? null : parseDottedKey(entry.slice(0, equals).trim());
-    return { entry, index, key };
-  });
   const generated = generatedTable.entries.flatMap((entry) => {
     const equals = topLevelEquals(entry);
     const key = equals === -1 ? null : parseDottedKey(entry.slice(0, equals).trim());
@@ -1902,6 +2149,28 @@ function reconcileHeaders(file: string, managedKey: string, raw: string, generat
   if (!generatedSource) {
     throw new Error(`${file}: generated Codex TOML is missing ${managedKey}.${PLIMSOLL_HEADER}.`);
   }
+  return { generatedSource, generatedToken };
+}
+
+function headerReconcileAction(removedLegacy: boolean, foundPlimsoll: boolean) {
+  return removedLegacy
+    ? `replace legacy x-cfo-one-source with ${PLIMSOLL_HEADER}`
+    : foundPlimsoll
+      ? `update ${PLIMSOLL_HEADER}`
+      : `add ${PLIMSOLL_HEADER}`;
+}
+
+function reconcileHeaders(file: string, managedKey: string, raw: string, generatedRaw: string) {
+  const table = splitInlineTable(raw);
+  if (!table) {
+    throw new Error(`${file}: ${managedKey} uses an unsupported layout; refusing to write or create a backup.`);
+  }
+  const { generatedSource, generatedToken } = generatedOwnedHeaderEntries(file, managedKey, generatedRaw);
+  const parsed = table.entries.map((entry, index) => {
+    const equals = topLevelEquals(entry);
+    const key = equals === -1 ? null : parseDottedKey(entry.slice(0, equals).trim());
+    return { entry, index, key };
+  });
 
   const sourceIndexes: number[] = [];
   const tokenIndexes: number[] = [];
@@ -1960,12 +2229,97 @@ function reconcileHeaders(file: string, managedKey: string, raw: string, generat
   }
   return {
     value: `${table.prefix}${inner}${table.suffix}`,
-    action: removedLegacy
-      ? `replace legacy x-cfo-one-source with ${PLIMSOLL_HEADER}`
-      : foundPlimsoll
-        ? `update ${PLIMSOLL_HEADER}`
-        : `add ${PLIMSOLL_HEADER}`,
+    action: headerReconcileAction(removedLegacy, foundPlimsoll),
   };
+}
+
+/**
+ * Heal `[otel.*."otlp-http".headers]` subtables. Codex's documented exporter
+ * layout uses that form; a seat template can therefore carry endpoints without
+ * x-plimsoll-source. The inline `headers = { ... }` path stays unchanged.
+ */
+function reconcileHeadersSubtable(
+  file: string,
+  managedKey: string,
+  lines: string[],
+  subtableHeader: TomlHeader,
+  generatedRaw: string,
+) {
+  const { generatedSource, generatedToken } = generatedOwnedHeaderEntries(file, managedKey, generatedRaw);
+  const scan = scanToml(lines);
+  const nextHeader = scan.headers.find((entry) => entry.index > subtableHeader.index);
+  const sectionEnd = nextHeader?.index ?? lines.length;
+  const assignments = scan.assignments.filter((entry) =>
+    entry.index > subtableHeader.index &&
+    entry.index < sectionEnd &&
+    entry.tableKind === "table" &&
+    samePath(entry.tablePath, subtableHeader.path) &&
+    entry.keyPath.length === 1
+  );
+  const parsed = assignments.map((assignment) => {
+    const header = assignment.keyPath[0]!;
+    return { assignment, header };
+  });
+  const sourceIndexes: number[] = [];
+  const tokenIndexes: number[] = [];
+  let foundPlimsoll = false;
+  let removedLegacy = false;
+  for (const [index, { header }] of parsed.entries()) {
+    if (!/^[\x00-\x7f]+$/.test(header)) {
+      throw new Error(
+        `${file}: managed exporter headers contain non-ASCII header name ${JSON.stringify(header)}; ` +
+        "refusing to write or create a backup.",
+      );
+    }
+    const folded = header.toLowerCase();
+    if (folded === LEGACY_PLIMSOLL_HEADER) {
+      removedLegacy = true;
+      sourceIndexes.push(index);
+      continue;
+    }
+    if (folded === PLIMSOLL_HEADER) {
+      foundPlimsoll = true;
+      sourceIndexes.push(index);
+      continue;
+    }
+    if (folded === PLIMSOLL_TOKEN_HEADER) tokenIndexes.push(index);
+  }
+  if (sourceIndexes.length > 1 || tokenIndexes.length > 1) {
+    throw new Error(
+      `${file}: ${managedKey} contains duplicate Plimsoll-owned headers; refusing to write or create a backup.`,
+    );
+  }
+
+  const replaceAssignment = (parsedIndex: number, replacement: string) => {
+    const assignment = parsed[parsedIndex]!.assignment;
+    const line = lines[assignment.index]!;
+    let keyStart = 0;
+    while (keyStart < line.length && /\s/.test(line[keyStart]!)) keyStart += 1;
+    lines[assignment.index] = `${line.slice(0, keyStart)}${replacement}${line.slice(assignment.valueEnd)}`;
+  };
+
+  const appended: string[] = [];
+  if (sourceIndexes.length === 1) replaceAssignment(sourceIndexes[0]!, generatedSource.entry);
+  else appended.push(generatedSource.entry);
+  if (generatedToken) {
+    if (tokenIndexes.length === 1) replaceAssignment(tokenIndexes[0]!, generatedToken.entry);
+    else appended.push(generatedToken.entry);
+  }
+  const removeToken = !generatedToken && tokenIndexes.length === 1;
+  const tokenLine = removeToken ? parsed[tokenIndexes[0]!]!.assignment.index : -1;
+  const indentSample = assignments[0] ? lines[assignments[0].index]! : "";
+  const indent = indentSample.match(/^\s*/)?.[0] ?? "";
+  let insertion = assignments.length > 0
+    ? Math.max(...assignments.map((entry) => entry.index)) + 1
+    : subtableHeader.index + 1;
+  if (removeToken) {
+    lines.splice(tokenLine, 1);
+    if (tokenLine < insertion) insertion -= 1;
+  }
+  if (appended.length > 0) {
+    lines.splice(insertion, 0, ...appended.map((entry) => `${indent}${entry}`));
+  }
+  return { action: headerReconcileAction(removedLegacy, foundPlimsoll) };
 }
 
 function headersNeedReconciliation(headers: TomlRecord) {
@@ -2309,14 +2663,42 @@ function reconcileCodexToml(file: string, current: string, generatedToml: string
     for (const { key, value, generated } of desired) {
       const currentValue = getPath(document, [...table.path, key]);
       const assignment = assignments.find((entry) => entry.keyPath[0] === key);
+      const headerSubtables = key === "headers"
+        ? scan.headers.filter((entry) =>
+          entry.kind === "table" && samePath(entry.path, [...table.path, "headers"])
+        )
+        : [];
       const ownedHeaderDrift = key === "headers" && isRecord(currentValue) &&
         headersNeedReconciliation(currentValue);
       const managedKey = displayPath([...table.path, key]);
+      if (headerSubtables.length > 1) {
+        throw new Error(
+          `${file}: ${managedKey} is declared more than once; refusing to write or create a backup.`,
+        );
+      }
+      if (assignment && headerSubtables.length > 0) {
+        throw new Error(
+          `${file}: ${managedKey} is declared as both an inline table and a subtable; ` +
+          "refusing to write or create a backup.",
+        );
+      }
       const managedValueMatches = key === "headers" && isRecord(currentValue)
         ? managedHeadersMatch(currentValue, value)
         : isDeepStrictEqual(currentValue, value);
       if (managedValueMatches && !ownedHeaderDrift) {
         plan.push({ key: managedKey, action: "unchanged" });
+        continue;
+      }
+      if (key === "headers" && isRecord(currentValue) && !assignment && headerSubtables.length === 1) {
+        const reconciled = reconcileHeadersSubtable(
+          file,
+          managedKey,
+          lines,
+          headerSubtables[0]!,
+          generated.valueRaw,
+        );
+        changes.push(`${managedKey} ${reconciled.action}`);
+        plan.push({ key: managedKey, action: "updated" });
         continue;
       }
       if (currentValue !== undefined && !assignment) {
@@ -2475,6 +2857,12 @@ function reconcileCodexToml(file: string, current: string, generatedToml: string
   return { next, changes, plan };
 }
 
+export function isCodexLayoutRefusal(message: string) {
+  return /unsupported .+ layout|dotted, inline, or implicit|dotted or inline layout|complete generated subset|ambiguous layout that cannot be reconciled|without a writable table/.test(
+    message,
+  );
+}
+
 /** Reconcile Plimsoll's generated subset into an existing Codex config.toml. */
 export function applyCodexConfig(
   file: string,
@@ -2501,6 +2889,108 @@ export function applyCodexConfig(
   }
   const backupPath = writeCodexPlan(file, snapshot, current, plan.next, options.transactionHooks);
   return { path: file, changed: true, changes, plan: entries, backupPath };
+}
+
+/**
+ * Bypass for interactive Codex TOML layouts that refuse a full OTEL merge
+ * (eco-6hoxj.29). Rewrites only Plimsoll-owned `command = "..."` values that
+ * already post to `/hooks/codex`, the same way token headers were moved out of
+ * the TOML instead of forcing a whole-file rewrite.
+ */
+export function applyCodexHookCommandsOnly(
+  file: string,
+  generatedToml: string,
+  options: CodexApplyOptions = {},
+): ApplyResult {
+  assertManagedConfigTarget(file);
+  const { snapshot, current } = readCodexPreimage(file);
+  if (!snapshot.exists) {
+    return {
+      path: file,
+      changed: false,
+      changes: [],
+      plan: [],
+      conflict: `${file}: Codex hook-command bypass requires an existing config.toml.`,
+    };
+  }
+  const expected = parseDocument(file, generatedToml, true);
+  const lineEnding = detectLineEnding(file, current);
+  const lines = current.split(lineEnding);
+  const changes: string[] = [];
+  const plan: ApplyPlanEntry[] = [];
+  for (const event of HOOK_EVENTS) {
+    const expectedEntries = getPath(expected, ["hooks", event]);
+    if (!Array.isArray(expectedEntries) || expectedEntries.length !== 1) {
+      throw new Error(`${file}: generated Codex TOML has an unsupported hooks.${event} layout.`);
+    }
+    const expectedOwnedCommands = hookCommands(expectedEntries).filter(isPlimsollHookPath);
+    if (expectedOwnedCommands.length !== 1) {
+      throw new Error(`${file}: generated Codex TOML has an unsupported hooks.${event} command layout.`);
+    }
+    const ownedAssignments = scanToml(lines).assignments.filter((entry) =>
+      entry.keyPath.length === 1 &&
+      entry.keyPath[0] === "command" &&
+      typeof parsedTomlValue(entry.valueRaw) === "string" &&
+      isPlimsollHookPath(parsedTomlValue(entry.valueRaw) as string) &&
+      (
+        (entry.tableKind === "array" &&
+          entry.tablePath.length >= 2 &&
+          entry.tablePath[0] === "hooks" &&
+          entry.tablePath[1] === event) ||
+        (entry.tableKind === "table" && samePath(entry.tablePath, ["hooks"]))
+      ),
+    );
+    if (ownedAssignments.length === 0) {
+      plan.push({ key: `hooks.${event}`, action: "unchanged" });
+      continue;
+    }
+    if (ownedAssignments.length > 1) {
+      return {
+        path: file,
+        changed: false,
+        changes: [],
+        plan,
+        conflict: `${file}: hooks.${event} has more than one Plimsoll Codex command; refusing hook-command bypass.`,
+      };
+    }
+    const assignment = ownedAssignments[0]!;
+    const currentCommand = parsedTomlValue(assignment.valueRaw);
+    if (currentCommand === expectedOwnedCommands[0]) {
+      plan.push({ key: `hooks.${event}`, action: "unchanged" });
+      continue;
+    }
+    const line = lines[assignment.index]!;
+    lines[assignment.index] =
+      `${line.slice(0, assignment.valueStart)}${JSON.stringify(expectedOwnedCommands[0])}${line.slice(assignment.valueEnd)}`;
+    changes.push(`hooks.${event} update generated Plimsoll command hook`);
+    plan.push({ key: `hooks.${event}`, action: "updated" });
+  }
+  const next = lines.join(lineEnding);
+  if (changes.length === 0) return { path: file, changed: false, changes: [], plan };
+  if (options.dryRun) return { path: file, changed: true, changes, plan };
+  const backupPath = writeCodexPlan(file, snapshot, current, next, options.transactionHooks);
+  return { path: file, changed: true, changes, plan, backupPath };
+}
+
+/** Full Codex apply, falling back to hook-command rewrite on a layout refusal. */
+export function applyCodexConfigOrHookCommands(
+  file: string,
+  generatedToml: string,
+  options: CodexApplyOptions = {},
+): ApplyResult {
+  try {
+    const result = applyCodexConfig(file, generatedToml, options);
+    if (result.conflict && isCodexLayoutRefusal(result.conflict)) {
+      return applyCodexHookCommandsOnly(file, generatedToml, options);
+    }
+    return result;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (isCodexLayoutRefusal(message)) {
+      return applyCodexHookCommandsOnly(file, generatedToml, options);
+    }
+    throw error;
+  }
 }
 
 export type CodexHookCommandDiagnostic = {

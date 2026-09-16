@@ -490,6 +490,81 @@ function main() {
       }
     }
 
+    const subtableFixturePath = path.join(root, "scripts", "fixtures", "codex-headers-subtable-missing-source.toml");
+    const unquotedSubtableFixturePath = path.join(
+      root,
+      "scripts",
+      "fixtures",
+      "codex-headers-subtable-unquoted-missing-source.toml",
+    );
+    const ambiguousHeadersFixturePath = path.join(
+      root,
+      "scripts",
+      "fixtures",
+      "codex-headers-inline-and-subtable.toml",
+    );
+    const proveSeatTemplateSubtable = (label: string, fixtureFile: string) => {
+      const dir = path.join(sandbox, label);
+      fs.mkdirSync(dir);
+      const config = path.join(dir, "config.toml");
+      const source = fs.readFileSync(fixtureFile, "utf8").replaceAll("__PLIMSOLL_PORT__", String(port));
+      fs.writeFileSync(config, source);
+      const before = applyCodexConfig(config, generated, { dryRun: true });
+      check(
+        `${label}_dry_run_plans_header_heal_without_write`,
+        before.changed &&
+          exporters.every((name) =>
+            before.plan?.some((entry) =>
+              entry.key === `otel.${name}.otlp-http.headers` && entry.action === "updated"
+            ),
+          ) &&
+          fs.readFileSync(config, "utf8") === source &&
+          backupFiles(dir).length === 0,
+        before,
+      );
+      const applied = applyCodexConfig(config, generated);
+      const after = fs.readFileSync(config, "utf8");
+      const document = parseToml(after) as Record<string, any>;
+      check(
+        `${label}_adds_source_preserves_foreign_header_and_keeps_subtable_layout`,
+        applied.changed &&
+          exporters.every((name) => {
+            const headers = document.otel[name]["otlp-http"].headers as Record<string, unknown>;
+            return headers["x-plimsoll-source"] === "codex" &&
+              headers["x-seat-template"] === "keep" &&
+              ownedHeaderNames(headers).length === 1;
+          }) &&
+          !/headers\s*=\s*\{/.test(after) &&
+          after.includes("[otel.exporter") &&
+          after.includes(".headers]"),
+        { changes: applied.changes, after },
+      );
+      const second = applyCodexConfig(config, generated);
+      check(
+        `${label}_second_apply_is_byte_noop`,
+        !second.changed &&
+          second.changes.length === 0 &&
+          fs.readFileSync(config, "utf8") === after,
+        second,
+      );
+    };
+
+    proveSeatTemplateSubtable("quoted-header-subtable", subtableFixturePath);
+    proveSeatTemplateSubtable("unquoted-header-subtable", unquotedSubtableFixturePath);
+
+    const ambiguousHeadersDir = path.join(sandbox, "ambiguous-headers");
+    fs.mkdirSync(ambiguousHeadersDir);
+    const ambiguousHeaders = path.join(ambiguousHeadersDir, "config.toml");
+    fs.writeFileSync(
+      ambiguousHeaders,
+      fs.readFileSync(ambiguousHeadersFixturePath, "utf8").replaceAll("__PLIMSOLL_PORT__", String(port)),
+    );
+    expectRejected(
+      ambiguousHeaders,
+      generated,
+      /inline table and a subtable|existing Codex config\.toml is invalid/,
+    );
+
     const foreignDir = path.join(sandbox, "foreign");
     fs.mkdirSync(foreignDir);
     const foreign = path.join(foreignDir, "foreign.toml");

@@ -145,7 +145,10 @@ The counters (`recovered`, `rejected`, `deferred`, `spooledAtIntake` — how man
 events the collector's own intake spooled — `refused` — how many it tried to
 spool and could not — pending files and their age) are in
 `plimsoll status`, `plimsoll doctor`, and the collector's `/status` under
-`hookSpool`; `enabled` there is the running collector's kill-switch state, read
+`hookSpool`. `plimsoll producer-parity --hours 6` joins producer-accepted hook
+ids to durable ledger ids for that window. Circuit-open transitions carry
+`openedAt` / `transitions` on `/status` `maintenance.boundary.circuit`.
+`enabled` there is the running collector's kill-switch state, read
 from the collector itself — `plimsoll status` asks the daemon for it in one
 request bounded by `PLIMSOLL_COLLECTOR_DOCTOR_TIMEOUT_MS` (3 s by default), and
 is otherwise a purely local read. It reads `null` with `enabledSource:
@@ -236,7 +239,12 @@ ledger?*
   A future-dated event never earns the freshness credit: `last_event_at` only
   ever moves forward, so a clock-skewed or future-dated producer would otherwise
   hold a dead source green for the whole skew interval. The reason carries the
-  signed age (`newest event is 1500m in the future …`), as does `lastEventAgeMs`.
+  signed age (`newest event is 1500m in the future …`, or seconds when the skew
+  is below one minute), as does `lastEventAgeMs`. An unparseable `last_event_at`
+  is fail-safe amber (`newest event timestamp is unparseable`) and never prints
+  `NaNm`. A future stamp makes lag (`lastActivityAt − lastEventAt`) negative, so
+  it cannot raise the capture-lag red; future amber is the signal. Far-future
+  producer stamps are clamped at intake (eco-6hoxj.73.3).
 - **red** — local activity is demonstrably *not* reaching the ledger.
 - **no_events** — the source is configured and enumerated, and has captured
   nothing yet. It is never absent and never reads as healthy, and it does not
@@ -319,7 +327,18 @@ alter table dashboard_session_source_window drop column last_token_event_at;
 The columns are additive and the old binary re-derives everything it needs, so
 dropping them restores session materialization exactly. Re-upgrading adds them
 back on open and refills them from the facts the ledger still holds. Rebuilding
-the projection from the raw ledger is the equivalent heavier alternative.
+the projection from the raw ledger is the equivalent heavier alternative: a
+loss-aware rebuild that can recover a host stuck on `projection_schema_newer`
+when the newer binary is gone. That rebuild is **owed work, not shipped** —
+see `issues/0177-loss-aware-projection-rebuild.md`. Until it exists, the only
+recovery on that path is re-installing a binary that understands the stored
+schema version.
+
+`dashboard_projection_control.degraded_reason` is the out-of-process stamp for
+the same refusal (`projection_schema_newer` or `projection_control_missing`).
+Repair-backlog writers leave those two values in place, so a support query
+against the column is not relabelled as `projection_repair_backlog`. A missing
+control row on an existing control table is not treated as a fresh install.
 
 The local activity scan is **bounded**: one cadence enumerates at most 256
 directory entries within 50 ms, keeps its cursor, and resumes on the next tick.
@@ -437,6 +456,14 @@ npx -y @plimsoll/cli start
 npx -y @plimsoll/cli doctor --read-only --json
 ```
 
+Loopback HTTP is credentialed except for liveness. `GET /healthz` answers
+`{"ok":true}` with no version, identity, or ledger state. `GET /status` requires
+the management credential (`management_credential_required` without it). Full
+operator status is `plimsoll status` (or `doctor --read-only --json`), which
+already presents that credential. Fleet monitors that used raw `/status` should
+switch to `/healthz` or the CLI — see
+[docs/runbooks/local-status-http.md](docs/runbooks/local-status-http.md).
+
 `doctor` is a diagnostic gate, not an installer and not capture proof by
 itself. Its readiness progresses through `not_installed` → `configured` →
 `service_ready` → `signal_verified`; only `signal_verified` returns `ok:true`
@@ -536,7 +563,10 @@ directory that exists with no config file in it yet is reported as
 `skipped: absent` rather than created. A run that applied or
 refused something writes `<collector home>/receipts/managed-config-reconcile-<ts>.json`
 with the per-target status, plan lines and backups; a healthy home plans every
-target `unchanged` and writes nothing at all. The running collector calls the
+target `unchanged` and writes nothing at all. The receipt is written before the
+state-file lock, so a lock timeout cannot swallow an apply that already
+happened — the stamp, backoff map and backup record retry on the next tick.
+The running collector calls the
 same reconcile in-process every `managedConfig.reconcile.intervalSeconds`
 (default 600), and only when its own doctor readback reports at least one
 drifted target, so a healthy host does zero writes; the tick yields to the event
@@ -571,7 +601,10 @@ credentials manages no targets at all and stamps `lastResult: "unavailable"`
 instead, so it does not read as a healthy host. The state file is read and
 written under the same cross-process mutation lock the collector config uses, so
 an operator's `setup --reconcile` and a daemon tick cannot drop each other's
-backoff entries or run stamp.
+backoff entries or run stamp. The lock covers that stamp write, not a whole
+run: a backoff another process arms while this run is already in flight can be
+planned once more than the hour implies, then the merged write keeps both
+decisions.
 
 Telemetry `setup` manages a seat's *config*; what the collector *captures* from
 is its capture-root inventory (`collector.config.json` → `captureRoots[]`),
@@ -672,17 +705,49 @@ token from a mode-0600 `plimsoll.headers` file beside its own config
 (`${GROK_HOME:-~/.grok}/hooks/plimsoll.headers` and `~/.codex/plimsoll.headers`),
 so a config search or a pasted command string never exposes the token. Codex's
 own OTLP exporter has no file or environment source for a header value, so
-`[otel.*_exporter."otlp-http"] headers` keeps the token inline; rotate it with
+`[otel.*_exporter."otlp-http"] headers` keeps the token inline. A seat profile
+that already uses Codex's documented `[otel.*."otlp-http".headers]` subtable
+without `x-plimsoll-source` is healed in place — setup does not refuse that
+layout. Rotate the token with
 `plimsoll rotate-producer-token --source codex`, which rewrites the header file,
 `config.toml` and every discovered `~/.codex-profiles/<slug>/config.toml` that
 already carries the managed block — with a backup per file, inside the same
 grace window — and accepts the superseded token only until that window closes
-(`--grace-seconds`, default 900). A profile without the managed block is left
+(`--grace-seconds`, default 900, at most 86400). A profile without the managed block is left
 untouched (`setup` owns provisioning it) and a malformed one is reported under
-`profilesSkipped` and never rewritten, neither of them failing the rotation.
+`profilesSkipped` and never rewritten, neither of them failing the rotation. A
+managed profile (or Claude seat) that refuses or fails the rewrite does fail it:
+the receipt says `rotation_incomplete` and the command exits 1, with the new
+token and the grace window already in place. Fix that file, then run
+`plimsoll setup --yes`, which re-applies the current token everywhere; running
+the rotation again would mint another token. A `config.toml` with more than one
+hard link is refused (`CODEX_CONFIG_UNSAFE_LEAF_LINK_COUNT`) by `setup`, the
+managed reconcile and the rotation alike, since the rewrite would leave the
+other link on the old bytes; a hardlinked `~/.codex/config.toml` refuses the
+rotation before anything is minted.
 `--dry-run` lists the `codexProfile[<slug>].otel.<exporter>.headers updated`
 lines it would write. `plimsoll doctor` reports the rotation deadline and never
 prints a token.
+
+Every other producer source rotates the same way, with the same receipt
+(`status`, `source`, `rotated`, `graceSeconds`, `previousTokenExpiresAt`,
+`targets[]`, `nextSteps`) and the deadline under
+`doctor.producerTokenRotation.<source>`:
+
+| `--source` | Managed surfaces rewritten |
+|---|---|
+| `claude_code` | `env.OTEL_EXPORTER_OTLP_HEADERS` and the hook headers in `~/.claude/settings.json` (`--claude-settings`) and in every `~/.claude-seats/<slug>/settings.json` that already carries the token; unmanaged or malformed seats are listed under `seatsSkipped`, and a seat without `settings.json` is listed `absent` |
+| `gemini_cli` | only the `x-plimsoll-token` query value of `telemetry.otlpEndpoint` in `~/.gemini/settings.json` (`--gemini-settings`); every other setting, query parameter and the fragment keep their bytes. Settings without that query value (`gemini_settings_unmanaged`) or with an endpoint whose token cannot be edited safely in place — unparseable, the parameter repeated or escaped (`gemini_settings_malformed`) — refuse the rotation before anything is minted; run `plimsoll setup --yes` first |
+| `grok` | `${GROK_HOME:-~/.grok}/hooks/plimsoll.headers`, the `plimsoll.json` hook fragment (`--grok-hooks`), which moves a legacy fragment that still embeds the token onto the header file, and any other regular `hooks/*.json` that carries the token and is exactly a managed fragment (`setup` does not manage these copies, so one the rewrite would refuse blocks the rotation before anything is minted). A managed copy in the header-file form carries no token itself: one that reads `plimsoll.headers` is reported `unchanged`, another existing header file one reads that is carrying the current token is rotated as its own target (a refusal there makes the rotation `rotation_incomplete`), and one whose header file is absent is reported `skipped`; a token-bearing one that is not a managed fragment or cannot be read is reported `skipped` and left as it is, and hook files without the token are never touched. Hook files and the header files they read are only ever read through a no-follow, non-blocking descriptor whose file matches the checked path: a symlinked `hooks/*.json` is never read and is reported `skipped`, a header file behind a symlinked directory or that is a symlink, FIFO, hard link or a replaced file is never read and is reported `refused` with that reason, and a header file replaced after it was read is refused rather than rewritten |
+
+For these sources a managed file the host does not have is reported as
+`absent` and never created, and a Grok hook fragment whose header file is
+absent is reported `skipped` rather than pointed at a secret nothing wrote.
+`--dry-run` reports a discovered seat, profile or hook copy that would refuse
+as `refused`, so the preview does not promise a rewrite the real run cannot make.
+A discovered seat or profile file that is a symlink, hard link or otherwise
+unsafe to read is not read to classify it: it is listed `refused` and the
+rotation is incomplete.
 
 The source install script's `--dry-run` does not clone, install dependencies,
 write Claude/Gemini/Grok/Codex or Plimsoll files, register a LaunchAgent, or start a
