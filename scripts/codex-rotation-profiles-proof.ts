@@ -32,6 +32,13 @@
  *   f) doctor path hygiene: a profile — and a Claude seat — symlinked to a
  *      directory outside $HOME is reported at its link path under $HOME with
  *      `outsideHome: true`, and no absolute outside path reaches the receipt.
+ *   g) home-scoped rotation receipts (eco-6hoxj.51 × .152 merge gap / .159):
+ *      dry-run, applied, skipped and preflight-refused entries for a profile
+ *      relocated outside $HOME name the link under $HOME; plan lines and
+ *      receipt paths never carry the resolved outside path; an unresolvable
+ *      profile link is `unresolved` and makes the rotation incomplete. The
+ *      same named checks run for Claude seats when `rotate-producer-token
+ *      --source claude_code` exists.
  *
  * Every path is synthetic and below a per-run sandbox; the tokens are fixture
  * credentials minted into the fixture Plimsoll home.
@@ -400,11 +407,236 @@ function rotationChecks(fixtureRoot: string) {
   );
 }
 
+function rotationSourceSupported(source: string, env: NodeJS.ProcessEnv) {
+  if (source === "codex") return true;
+  const probe = runCli(["rotate-producer-token", "--source", source, "--dry-run"], env);
+  const usage = `${probe.stderr}\n${probe.stdout}`;
+  return !/Usage: plimsoll rotate-producer-token --source codex\b/.test(usage);
+}
+
+function lastPayload(stdout: string) {
+  const start = stdout.lastIndexOf("\n{");
+  const body = start === -1 ? stdout.slice(stdout.indexOf("{")) : stdout.slice(start + 1);
+  let receipt: Record<string, any> = {};
+  try {
+    receipt = JSON.parse(body) as Record<string, any>;
+  } catch {
+    receipt = {};
+  }
+  const planLines = stdout.slice(0, start === -1 ? 0 : start).split("\n").filter((line) => line.includes(": "));
+  return { receipt, planLines };
+}
+
+function receiptEntry(receipt: Record<string, any>, key: string, needle: string) {
+  return ((receipt[key] ?? []) as Array<Record<string, any>>).find((entry) => String(entry.path).includes(needle));
+}
+
 /**
- * The default target on a host with no fleet profiles: the payload keys, the
- * two targets and the exit code are the ones `rotate-producer-token` printed
- * before this bead.
+ * Named checks equivalent to harvest-152-merge/battery/adhoc-merge-receipts.ts
+ * (bead eco-6hoxj.159). Each M1–M9 merge arm that drops home-scoped receipts,
+ * would_refuse, or unresolved-link reporting reds one of these names.
  */
+function homeScopedRotationReceiptChecks(fixtureRoot: string) {
+  const { home, plimsollHome, profilesRoot, seatsRoot, env } =
+    commandHome(fixtureRoot, "home-scoped-receipts-home", 49174);
+  const outputs: string[] = [];
+  const cli = (args: string[]) => {
+    const result = runCli(args, env);
+    outputs.push(result.stdout, result.stderr);
+    return { exit: result.code, ...lastPayload(result.stdout) };
+  };
+  const linked = (family: string, slug: string, file: string) => path.join(home, family, slug, file);
+  const outsideDir = (name: string) => {
+    const directory = path.join(fixtureRoot, "outside", name);
+    fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
+    return directory;
+  };
+
+  fs.mkdirSync(path.join(profilesRoot, "inside"), { recursive: true, mode: 0o700 });
+  fs.mkdirSync(path.join(seatsRoot, "inside"), { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(profilesRoot, "inside", "config.toml"), 'model = "synthetic"\n', { mode: 0o600 });
+  fs.writeFileSync(path.join(seatsRoot, "inside", "settings.json"), "{}\n", { mode: 0o600 });
+  const setup = cli(["setup", "--yes"]);
+  const managedToml = fs.readFileSync(path.join(profilesRoot, "inside", "config.toml"));
+  const managedJson = fs.readFileSync(path.join(seatsRoot, "inside", "settings.json"));
+  const place = (family: string, slug: string, file: string, bytes: Buffer | string) => {
+    const directory = outsideDir(`${family}-${slug}`);
+    fs.writeFileSync(path.join(directory, file), bytes, { mode: 0o600 });
+    fs.symlinkSync(directory, path.join(home, family, slug));
+  };
+  place(".codex-profiles", "out-managed", "config.toml", managedToml);
+  place(".codex-profiles", "out-unmanaged", "config.toml", 'model = "synthetic"\n');
+  place(".claude-seats", "out-managed", "settings.json", managedJson);
+  place(".claude-seats", "out-unmanaged", "settings.json", "{}\n");
+  check(
+    "fixture_setup_manages_inside_profile_and_seat",
+    setup.exit === 0 &&
+      managedToml.includes("x-plimsoll-token") &&
+      managedJson.includes("x-plimsoll-token"),
+    { exit: setup.exit },
+  );
+
+  const sources: Array<readonly [string, string, string, string]> = [
+    ["codex", ".codex-profiles", "config.toml", "profilesSkipped"],
+  ];
+  if (rotationSourceSupported("claude_code", env)) {
+    sources.push(["claude_code", ".claude-seats", "settings.json", "seatsSkipped"]);
+  }
+
+  for (const [source, family, file, skippedKey] of sources) {
+    const outsidePrefix = path.join(fixtureRoot, "outside");
+    const dry = cli(["rotate-producer-token", "--source", source, "--dry-run"]);
+    const dm = receiptEntry(dry.receipt, "targets", "out-managed");
+    const ds = receiptEntry(dry.receipt, skippedKey, "out-unmanaged");
+    check(
+      `${source}_dry_run_outside_home_target_reports_link_path`,
+      dry.exit === 0 &&
+        dm?.status === "would_rotate" &&
+        dm?.path === linked(family, "out-managed", file) &&
+        dm?.outsideHome === true,
+      { exit: dry.exit, entry: dm ?? null },
+    );
+    check(
+      `${source}_dry_run_plan_lines_never_name_a_path_outside_home`,
+      dry.planLines.length > 0 && dry.planLines.every((line) => !line.includes(outsidePrefix)),
+      {
+        planLines: dry.planLines.length,
+        outside: dry.planLines.filter((line) => line.includes(outsidePrefix)).length,
+      },
+    );
+    check(
+      `${source}_dry_run_skipped_outside_home_entry_reports_link_path`,
+      ds?.path === linked(family, "out-unmanaged", file) && ds?.outsideHome === true,
+      { entry: ds ?? null },
+    );
+    const run = cli(["rotate-producer-token", "--source", source, "--grace-seconds", "120"]);
+    const rm = receiptEntry(run.receipt, "targets", "out-managed");
+    const rs = receiptEntry(run.receipt, skippedKey, "out-unmanaged");
+    check(
+      `${source}_applied_outside_home_target_reports_link_path`,
+      run.exit === 0 &&
+        run.receipt.status === "rotation_applied" &&
+        rm?.status === "rotated" &&
+        rm?.path === linked(family, "out-managed", file) &&
+        rm?.outsideHome === true,
+      {
+        exit: run.exit,
+        status: run.receipt.status,
+        entry: rm ? { ...rm, backup: rm.backup ? "set" : null } : null,
+      },
+    );
+    check(
+      `${source}_applied_skipped_outside_home_entry_reports_link_path`,
+      rs?.path === linked(family, "out-unmanaged", file) && rs?.outsideHome === true,
+      { entry: rs ?? null },
+    );
+    check(
+      `${source}_applied_receipt_paths_never_name_a_path_outside_home`,
+      [...(run.receipt.targets ?? []), ...(run.receipt[skippedKey] ?? [])].every(
+        (entry: Record<string, any>) => !String(entry.path).startsWith(outsidePrefix),
+      ),
+      { entries: (run.receipt.targets ?? []).length + (run.receipt[skippedKey] ?? []).length },
+    );
+
+    // Preflight-refused outside-home discovered target: a managed copy that
+    // sits outside the fixture root (the apply guard refuses it) while the
+    // link lives under $HOME. A hard link of the in-root copy is tried first
+    // so the merged-tree Codex nlink guard still reds these names.
+    const refusedSlug = "out-refused";
+    const target = path.join(outsidePrefix, `${family}-out-managed`, file);
+    const hard = path.join(fixtureRoot, `hardlink-${source}`);
+    let usedHardLink = false;
+    try {
+      fs.linkSync(target, hard);
+      usedHardLink = true;
+    } catch {
+      usedHardLink = false;
+    }
+    let refusedNeedle = "out-managed";
+    let refusedLink = linked(family, "out-managed", file);
+    let rdry = cli(["rotate-producer-token", "--source", source, "--dry-run"]);
+    let rde = receiptEntry(rdry.receipt, "targets", refusedNeedle);
+    if (rde?.status !== "would_refuse") {
+      if (usedHardLink) fs.rmSync(hard, { force: true });
+      usedHardLink = false;
+      const outsideFixture = path.join(path.dirname(fixtureRoot), `outside-fixture-${source}`);
+      fs.mkdirSync(outsideFixture, { recursive: true, mode: 0o700 });
+      fs.writeFileSync(path.join(outsideFixture, file), fs.readFileSync(target), { mode: 0o600 });
+      fs.symlinkSync(outsideFixture, path.join(home, family, refusedSlug));
+      refusedNeedle = refusedSlug;
+      refusedLink = linked(family, refusedSlug, file);
+      rdry = cli(["rotate-producer-token", "--source", source, "--dry-run"]);
+      rde = receiptEntry(rdry.receipt, "targets", refusedNeedle);
+    }
+    check(
+      `${source}_dry_run_preflight_refused_outside_home_target_is_would_refuse_at_link_path`,
+      rdry.exit === 0 &&
+        rde?.status === "would_refuse" &&
+        rde?.path === refusedLink &&
+        rde?.outsideHome === true &&
+        !rdry.planLines.some((line) => line.includes(refusedNeedle)),
+      { exit: rdry.exit, entry: rde ?? null },
+    );
+    const rrun = cli(["rotate-producer-token", "--source", source, "--grace-seconds", "120"]);
+    const rre = receiptEntry(rrun.receipt, "targets", refusedNeedle);
+    const incomplete = rrun.exit === 1 && rrun.receipt.status === "rotation_incomplete";
+    const appliedWithRefusal = rrun.exit === 0 && rrun.receipt.status === "rotation_applied";
+    check(
+      `${source}_applied_preflight_refused_outside_home_target_reports_link_path`,
+      (incomplete || appliedWithRefusal) &&
+        rre?.status === "refused" &&
+        rre?.path === refusedLink &&
+        rre?.outsideHome === true,
+      {
+        exit: rrun.exit,
+        status: rrun.receipt.status,
+        entry: rre ? { path: rre.path, status: rre.status, outsideHome: rre.outsideHome } : null,
+      },
+    );
+    if (usedHardLink) fs.rmSync(hard, { force: true });
+  }
+
+  const unresolvedSources: Array<readonly [string, string, string, string]> = [
+    ["codex", ".codex-profiles", "config.toml", "codex_profile_symlink_unresolvable"],
+  ];
+  if (rotationSourceSupported("claude_code", env)) {
+    unresolvedSources.push(["claude_code", ".claude-seats", "settings.json", "claude_seat_symlink_unresolvable"]);
+  }
+  for (const [source, family, file, diagnostic] of unresolvedSources) {
+    fs.symlinkSync("loop-b", path.join(home, family, "loop-a"));
+    fs.symlinkSync("loop-a", path.join(home, family, "loop-b"));
+    const dry = cli(["rotate-producer-token", "--source", source, "--dry-run"]);
+    const run = cli(["rotate-producer-token", "--source", source, "--grace-seconds", "120"]);
+    const de = receiptEntry(dry.receipt, "targets", `${family}/loop-a/`);
+    const re = receiptEntry(run.receipt, "targets", `${family}/loop-a/`);
+    check(
+      `${source}_unresolvable_link_is_reported_unresolved_and_rotation_incomplete`,
+      dry.exit === 0 &&
+        de?.status === "unresolved" &&
+        de?.reason === diagnostic &&
+        run.exit === 1 &&
+        run.receipt.status === "rotation_incomplete" &&
+        re?.status === "unresolved" &&
+        re?.reason === diagnostic &&
+        re?.path === linked(family, "loop-a", file) &&
+        receiptEntry(run.receipt, "targets", `${family}/loop-b/`)?.status === "unresolved" &&
+        ((run.receipt.targets ?? []) as Array<Record<string, any>>).filter((target) => target.status === "rotated").length > 0,
+      { dry: de ?? null, run: re ?? null, exit: run.exit, status: run.receipt.status },
+    );
+    fs.rmSync(path.join(home, family, "loop-a"));
+    fs.rmSync(path.join(home, family, "loop-b"));
+  }
+
+  const auth = readLocalIngestAuth(plimsollHome)!;
+  const tokens = [auth.codexProducer, auth.claudeCodeProducer, ...Object.values(auth.rotations ?? {}).map((row: any) => row?.token)]
+    .filter((token): token is string => typeof token === "string" && token.length > 0);
+  check(
+    "no_token_value_in_any_output",
+    tokens.length > 0 && !outputs.some((output) => tokens.some((token) => output.includes(token))),
+    { tokens: tokens.length },
+  );
+}
+
 /**
  * Review r1 residual: a discovered profile that fails preflight must be
  * `would_refuse` on --dry-run (never `would_rotate`), and a relocated
@@ -447,6 +679,11 @@ function dryRunRefusedProfileChecks(fixtureRoot: string) {
   );
 }
 
+/**
+ * The default target on a host with no fleet profiles: the payload keys, the
+ * two targets and the exit code are the ones `rotate-producer-token` printed
+ * before this bead.
+ */
 function defaultTargetChecks(fixtureRoot: string) {
   const { plimsollHome, codexFile, headerFile, env } = commandHome(fixtureRoot, "no-profiles-home", 49171);
   const setup = runCli(["setup", "--yes"], env);
@@ -549,6 +786,7 @@ function main() {
     defaultTargetChecks(fixture.root);
     doctorPathChecks(fixture.root);
     dryRunRefusedProfileChecks(fixture.root);
+    homeScopedRotationReceiptChecks(fixture.root);
     check(
       "the_fixture_home_the_guard_protects_was_never_created",
       !fs.existsSync(fixture.home),

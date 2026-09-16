@@ -3745,10 +3745,15 @@ async function main() {
     // target uses. A profile without the managed token is not an authenticated
     // consumer and is never provisioned here — `setup` owns that — and one the
     // conductor left unparseable is reported rather than rewritten.
-    const rotateProfiles = discoverCodexProfiles(os.homedir())
+    const discoveredProfiles = discoverCodexProfiles(os.homedir());
+    const rotateProfiles = discoveredProfiles
       .filter((profile) => profile.hasConfig)
       .map((profile) => ({ profile, state: codexProfileTokenState(profile.path) }));
     const rotateProfilesSkipped = rotateProfiles.filter((entry) => entry.state !== "managed");
+    // A profile directory link that cannot be resolved may still carry the
+    // token but cannot be read, so it is listed unresolved rather than dropped
+    // by the hasConfig filter or reported as a skip (eco-6hoxj.51 / .159).
+    const unresolvedProfiles = discoveredProfiles.filter((profile) => profile.unresolved);
     type RotateTarget = {
       path: string;
       slug?: string;
@@ -3765,6 +3770,15 @@ async function main() {
             rotateHome,
           )
         : { path: target.path };
+    const unresolvedProfileReceipts = unresolvedProfiles.map((profile) => ({
+      ...homeScopedDiscoveredPath(
+        profile.path,
+        path.join(codexProfilesRoot(rotateHome), profile.slug, "config.toml"),
+        rotateHome,
+      ),
+      status: "unresolved" as const,
+      reason: "codex_profile_symlink_unresolvable",
+    }));
     const rotateTargets: RotateTarget[] = [
       {
         path: rotateHeaderFile,
@@ -3844,12 +3858,15 @@ async function main() {
         source: "codex",
         rotated: false,
         graceSeconds,
-        targets: rotateTargets.map((target) => {
-          const refusal = preflight.find((entry) => entry.target === target)?.refusal;
-          return refusal
-            ? { ...rotateTargetReceipt(target), status: "would_refuse", reason: refusal }
-            : { ...rotateTargetReceipt(target), status: "would_rotate" };
-        }),
+        targets: [
+          ...rotateTargets.map((target) => {
+            const refusal = preflight.find((entry) => entry.target === target)?.refusal;
+            return refusal
+              ? { ...rotateTargetReceipt(target), status: "would_refuse", reason: refusal }
+              : { ...rotateTargetReceipt(target), status: "would_rotate" };
+          }),
+          ...unresolvedProfileReceipts,
+        ],
         ...skippedProfilesReceipt(rotateProfilesSkipped, rotateHome),
       }, null, 2));
       return;
@@ -3896,6 +3913,10 @@ async function main() {
         });
       }
     }
+    for (const receipt of unresolvedProfileReceipts) {
+      rotateResults.push({ ...receipt, backup: null });
+    }
+    if (unresolvedProfiles.length > 0) rotateFailure = true;
     console.log(JSON.stringify({
       status: rotateFailure ? "rotation_incomplete" : "rotation_applied",
       source: "codex",
