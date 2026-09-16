@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("authenticated-ingestion", 10);
+const completion = createProofCompletion("authenticated-ingestion", 11);
 /**
  * Focused proof for the authenticated portion of issue #108 / 0059.
  *
@@ -256,6 +256,16 @@ async function main() {
     );
 
     const warningText = warnings.join("\n");
+    const parsedWarnings = warnings.flatMap((line) => {
+      try {
+        return [JSON.parse(line) as Record<string, unknown>];
+      } catch {
+        return [];
+      }
+    });
+    const missingTokenLine = parsedWarnings.find((line) => line.reason === "producer_token_required");
+    const wrongTokenLine = parsedWarnings.find((line) => line.reason === "producer_token_invalid" && line.route === "/hooks/claude-code");
+    const swappedLine = parsedWarnings.find((line) => line.reason === "producer_token_invalid" && line.route === "otlp");
     check(
       "auth_rejection_receipts_and_logs_are_bounded_and_secret_free",
       warnings.length >= 4 &&
@@ -265,6 +275,17 @@ async function main() {
         !warningText.includes(rotated.managementRead) &&
         [missingToken, wrongToken, sourceSwapped, originAttack].every((result) => Object.keys(result.body).length === 2),
       { warningCount: warnings.length, warningBytes: Buffer.byteLength(warningText) },
+    );
+    check(
+      "token_rejection_first_lines_name_hook_versus_otlp_route",
+      missingTokenLine?.route === "/hooks/claude-code" &&
+        wrongTokenLine?.route === "/hooks/claude-code" &&
+        swappedLine?.route === "otlp",
+      {
+        missingTokenRoute: missingTokenLine?.route,
+        wrongTokenRoute: wrongTokenLine?.route,
+        swappedRoute: swappedLine?.route,
+      },
     );
   } finally {
     console.warn = originalWarn;

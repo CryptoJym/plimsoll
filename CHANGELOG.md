@@ -61,6 +61,12 @@ does not transfer its sessions to a tailer.
 
 ### Fixed
 
+- Local producer admission restores two Studio0 rejection classes
+  (`eco-6hoxj.25`): identity-encoded bodies between 2 MiB and 4 MiB are no
+  longer `compressed_body_too_large`, Claude HTTP hooks always send
+  `x-plimsoll-source` (and the producer token when provisioned), and first-line
+  token/body rejections name the closed route so hook vs OTLP is visible
+  without a collector restart.
 - Capture-health names sub-minute future skew in seconds, never renders `NaNm`
   for an unparseable `last_event_at` (fail-safe amber), and keeps future-amber
   rather than lag-red when the ledger watermark is ahead of the clock

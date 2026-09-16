@@ -3,13 +3,15 @@ import zlib from "node:zlib";
 import { isSqliteContentionError } from "./sqlite-contention";
 
 export const LOCAL_HTTP_LIMITS = Object.freeze({
-  // Issue #196: the wire ceiling equals the decoded ceiling, so any body whose
-  // decoded form fits every downstream budget is admitted to decoding. The
-  // former standalone 256 KiB wire cap rejected entire production batches
-  // (compressed_body_too_large storms) that the decoded/ratio/node budgets
-  // were already sized to accept.
-  compressedBodyBytes: 2 * 1024 * 1024,
-  decodedBodyBytes: 2 * 1024 * 1024,
+  // Issue #196 raised the standalone 256 KiB wire cap to 2 MiB so gzip
+  // Codex batches could reach decoding. Identity-encoded JSON (Codex
+  // otlp-http protocol = "json", Claude HTTP hooks) still landed over that
+  // 2 MiB wire ceiling: Studio0 capture health counted compressed_body_too_large
+  // in the hundreds of thousands against tokened producers. 4 MiB equals the
+  // decoded ceiling and still sits inside the 1.5 s request deadline on the
+  // representative 512-record identity body (see proof:http-boundary).
+  compressedBodyBytes: 4 * 1024 * 1024,
+  decodedBodyBytes: 4 * 1024 * 1024,
   compressionRatio: 32,
   jsonDepth: 32,
   jsonNodes: 100_000,

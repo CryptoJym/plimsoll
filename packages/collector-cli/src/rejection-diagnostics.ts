@@ -29,7 +29,7 @@ export const REJECTION_SUMMARY_INTERVAL_MS = 60_000;
 /**
  * Fixed maximum for a serialized summary, including both last/max maps with
  * every closed record-array key and saturated lifetime counters. Record and
- * byte values originate behind the 100,000-node and 2 MiB decoded ceilings.
+ * byte values originate behind the 100,000-node and 4 MiB decoded ceilings.
  */
 export const REJECTION_SUMMARY_LINE_MAX_BYTES = 640;
 
