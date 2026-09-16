@@ -1880,17 +1880,11 @@ function splitInlineTable(value: string) {
   };
 }
 
-function reconcileHeaders(file: string, managedKey: string, raw: string, generatedRaw: string) {
-  const table = splitInlineTable(raw);
+function generatedOwnedHeaderEntries(file: string, managedKey: string, generatedRaw: string) {
   const generatedTable = splitInlineTable(generatedRaw);
-  if (!table || !generatedTable) {
+  if (!generatedTable) {
     throw new Error(`${file}: ${managedKey} uses an unsupported layout; refusing to write or create a backup.`);
   }
-  const parsed = table.entries.map((entry, index) => {
-    const equals = topLevelEquals(entry);
-    const key = equals === -1 ? null : parseDottedKey(entry.slice(0, equals).trim());
-    return { entry, index, key };
-  });
   const generated = generatedTable.entries.flatMap((entry) => {
     const equals = topLevelEquals(entry);
     const key = equals === -1 ? null : parseDottedKey(entry.slice(0, equals).trim());
@@ -1902,6 +1896,28 @@ function reconcileHeaders(file: string, managedKey: string, raw: string, generat
   if (!generatedSource) {
     throw new Error(`${file}: generated Codex TOML is missing ${managedKey}.${PLIMSOLL_HEADER}.`);
   }
+  return { generatedSource, generatedToken };
+}
+
+function headerReconcileAction(removedLegacy: boolean, foundPlimsoll: boolean) {
+  return removedLegacy
+    ? `replace legacy x-cfo-one-source with ${PLIMSOLL_HEADER}`
+    : foundPlimsoll
+      ? `update ${PLIMSOLL_HEADER}`
+      : `add ${PLIMSOLL_HEADER}`;
+}
+
+function reconcileHeaders(file: string, managedKey: string, raw: string, generatedRaw: string) {
+  const table = splitInlineTable(raw);
+  if (!table) {
+    throw new Error(`${file}: ${managedKey} uses an unsupported layout; refusing to write or create a backup.`);
+  }
+  const { generatedSource, generatedToken } = generatedOwnedHeaderEntries(file, managedKey, generatedRaw);
+  const parsed = table.entries.map((entry, index) => {
+    const equals = topLevelEquals(entry);
+    const key = equals === -1 ? null : parseDottedKey(entry.slice(0, equals).trim());
+    return { entry, index, key };
+  });
 
   const sourceIndexes: number[] = [];
   const tokenIndexes: number[] = [];
@@ -1960,12 +1976,97 @@ function reconcileHeaders(file: string, managedKey: string, raw: string, generat
   }
   return {
     value: `${table.prefix}${inner}${table.suffix}`,
-    action: removedLegacy
-      ? `replace legacy x-cfo-one-source with ${PLIMSOLL_HEADER}`
-      : foundPlimsoll
-        ? `update ${PLIMSOLL_HEADER}`
-        : `add ${PLIMSOLL_HEADER}`,
+    action: headerReconcileAction(removedLegacy, foundPlimsoll),
   };
+}
+
+/**
+ * Heal `[otel.*."otlp-http".headers]` subtables. Codex's documented exporter
+ * layout uses that form; a seat template can therefore carry endpoints without
+ * x-plimsoll-source. The inline `headers = { ... }` path stays unchanged.
+ */
+function reconcileHeadersSubtable(
+  file: string,
+  managedKey: string,
+  lines: string[],
+  subtableHeader: TomlHeader,
+  generatedRaw: string,
+) {
+  const { generatedSource, generatedToken } = generatedOwnedHeaderEntries(file, managedKey, generatedRaw);
+  const scan = scanToml(lines);
+  const nextHeader = scan.headers.find((entry) => entry.index > subtableHeader.index);
+  const sectionEnd = nextHeader?.index ?? lines.length;
+  const assignments = scan.assignments.filter((entry) =>
+    entry.index > subtableHeader.index &&
+    entry.index < sectionEnd &&
+    entry.tableKind === "table" &&
+    samePath(entry.tablePath, subtableHeader.path) &&
+    entry.keyPath.length === 1
+  );
+  const parsed = assignments.map((assignment) => {
+    const header = assignment.keyPath[0]!;
+    return { assignment, header };
+  });
+  const sourceIndexes: number[] = [];
+  const tokenIndexes: number[] = [];
+  let foundPlimsoll = false;
+  let removedLegacy = false;
+  for (const [index, { header }] of parsed.entries()) {
+    if (!/^[\x00-\x7f]+$/.test(header)) {
+      throw new Error(
+        `${file}: managed exporter headers contain non-ASCII header name ${JSON.stringify(header)}; ` +
+        "refusing to write or create a backup.",
+      );
+    }
+    const folded = header.toLowerCase();
+    if (folded === LEGACY_PLIMSOLL_HEADER) {
+      removedLegacy = true;
+      sourceIndexes.push(index);
+      continue;
+    }
+    if (folded === PLIMSOLL_HEADER) {
+      foundPlimsoll = true;
+      sourceIndexes.push(index);
+      continue;
+    }
+    if (folded === PLIMSOLL_TOKEN_HEADER) tokenIndexes.push(index);
+  }
+  if (sourceIndexes.length > 1 || tokenIndexes.length > 1) {
+    throw new Error(
+      `${file}: ${managedKey} contains duplicate Plimsoll-owned headers; refusing to write or create a backup.`,
+    );
+  }
+
+  const replaceAssignment = (parsedIndex: number, replacement: string) => {
+    const assignment = parsed[parsedIndex]!.assignment;
+    const line = lines[assignment.index]!;
+    let keyStart = 0;
+    while (keyStart < line.length && /\s/.test(line[keyStart]!)) keyStart += 1;
+    lines[assignment.index] = `${line.slice(0, keyStart)}${replacement}${line.slice(assignment.valueEnd)}`;
+  };
+
+  const appended: string[] = [];
+  if (sourceIndexes.length === 1) replaceAssignment(sourceIndexes[0]!, generatedSource.entry);
+  else appended.push(generatedSource.entry);
+  if (generatedToken) {
+    if (tokenIndexes.length === 1) replaceAssignment(tokenIndexes[0]!, generatedToken.entry);
+    else appended.push(generatedToken.entry);
+  }
+  const removeToken = !generatedToken && tokenIndexes.length === 1;
+  const tokenLine = removeToken ? parsed[tokenIndexes[0]!]!.assignment.index : -1;
+  const indentSample = assignments[0] ? lines[assignments[0].index]! : "";
+  const indent = indentSample.match(/^\s*/)?.[0] ?? "";
+  let insertion = assignments.length > 0
+    ? Math.max(...assignments.map((entry) => entry.index)) + 1
+    : subtableHeader.index + 1;
+  if (removeToken) {
+    lines.splice(tokenLine, 1);
+    if (tokenLine < insertion) insertion -= 1;
+  }
+  if (appended.length > 0) {
+    lines.splice(insertion, 0, ...appended.map((entry) => `${indent}${entry}`));
+  }
+  return { action: headerReconcileAction(removedLegacy, foundPlimsoll) };
 }
 
 function headersNeedReconciliation(headers: TomlRecord) {
@@ -2309,14 +2410,42 @@ function reconcileCodexToml(file: string, current: string, generatedToml: string
     for (const { key, value, generated } of desired) {
       const currentValue = getPath(document, [...table.path, key]);
       const assignment = assignments.find((entry) => entry.keyPath[0] === key);
+      const headerSubtables = key === "headers"
+        ? scan.headers.filter((entry) =>
+          entry.kind === "table" && samePath(entry.path, [...table.path, "headers"])
+        )
+        : [];
       const ownedHeaderDrift = key === "headers" && isRecord(currentValue) &&
         headersNeedReconciliation(currentValue);
       const managedKey = displayPath([...table.path, key]);
+      if (headerSubtables.length > 1) {
+        throw new Error(
+          `${file}: ${managedKey} is declared more than once; refusing to write or create a backup.`,
+        );
+      }
+      if (assignment && headerSubtables.length > 0) {
+        throw new Error(
+          `${file}: ${managedKey} is declared as both an inline table and a subtable; ` +
+          "refusing to write or create a backup.",
+        );
+      }
       const managedValueMatches = key === "headers" && isRecord(currentValue)
         ? managedHeadersMatch(currentValue, value)
         : isDeepStrictEqual(currentValue, value);
       if (managedValueMatches && !ownedHeaderDrift) {
         plan.push({ key: managedKey, action: "unchanged" });
+        continue;
+      }
+      if (key === "headers" && isRecord(currentValue) && !assignment && headerSubtables.length === 1) {
+        const reconciled = reconcileHeadersSubtable(
+          file,
+          managedKey,
+          lines,
+          headerSubtables[0]!,
+          generated.valueRaw,
+        );
+        changes.push(`${managedKey} ${reconciled.action}`);
+        plan.push({ key: managedKey, action: "updated" });
         continue;
       }
       if (currentValue !== undefined && !assignment) {

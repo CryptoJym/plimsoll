@@ -142,6 +142,9 @@ export function generateCodexConfigToml(options: ToolConfigOptions) {
 
   const command = hookForwardCommand(options, "codex");
   const basePort = port(options);
+  // Codex honors both this inline `headers = { ... }` form and a
+  // `[otel.*."otlp-http".headers]` subtable (the documented form). Setup writes
+  // the inline form; apply heals a seat-template subtable missing x-plimsoll-source.
   const exporterTable = (signalPath: string) => [
     `endpoint = ${tomlString(`http://127.0.0.1:${basePort}${signalPath}`)}`,
     'protocol = "json"',

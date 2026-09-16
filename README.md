@@ -672,7 +672,10 @@ token from a mode-0600 `plimsoll.headers` file beside its own config
 (`${GROK_HOME:-~/.grok}/hooks/plimsoll.headers` and `~/.codex/plimsoll.headers`),
 so a config search or a pasted command string never exposes the token. Codex's
 own OTLP exporter has no file or environment source for a header value, so
-`[otel.*_exporter."otlp-http"] headers` keeps the token inline; rotate it with
+`[otel.*_exporter."otlp-http"] headers` keeps the token inline. A seat profile
+that already uses Codex's documented `[otel.*."otlp-http".headers]` subtable
+without `x-plimsoll-source` is healed in place — setup does not refuse that
+layout. Rotate the token with
 `plimsoll rotate-producer-token --source codex`, which rewrites the header file,
 `config.toml` and every discovered `~/.codex-profiles/<slug>/config.toml` that
 already carries the managed block — with a backup per file, inside the same

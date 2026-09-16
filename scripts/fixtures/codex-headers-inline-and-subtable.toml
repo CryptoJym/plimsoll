@@ -1,0 +1,28 @@
+# Ambiguous exporter headers: inline table and subtable together. Setup must
+# refuse without a write or a backup.
+model = "synthetic-ambiguous-headers-model"
+
+[otel]
+environment = "plimsoll-local"
+log_user_prompt = false
+
+[otel.exporter."otlp-http"]
+endpoint = "http://127.0.0.1:__PLIMSOLL_PORT__/v1/logs"
+protocol = "json"
+headers = { "x-plimsoll-source" = "codex" }
+
+[otel.exporter."otlp-http".headers]
+"x-plimsoll-source" = "codex"
+
+[otel.trace_exporter."otlp-http"]
+endpoint = "http://127.0.0.1:__PLIMSOLL_PORT__/v1/traces"
+protocol = "json"
+headers = { "x-plimsoll-source" = "codex" }
+
+[otel.metrics_exporter."otlp-http"]
+endpoint = "http://127.0.0.1:__PLIMSOLL_PORT__/v1/metrics"
+protocol = "json"
+headers = { "x-plimsoll-source" = "codex" }
+
+[features]
+hooks = true

@@ -1,0 +1,31 @@
+# Same seat-template gap with unquoted `otlp-http` keys, the form fleet
+# profile apply currently writes. Foreign header values must survive.
+model = "synthetic-unquoted-seat-template-model"
+
+[otel]
+environment = "plimsoll-local"
+log_user_prompt = false
+
+[otel.exporter.otlp-http]
+endpoint = "http://127.0.0.1:__PLIMSOLL_PORT__/v1/logs"
+protocol = "json"
+
+[otel.exporter.otlp-http.headers]
+"x-seat-template" = "keep"
+
+[otel.trace_exporter.otlp-http]
+endpoint = "http://127.0.0.1:__PLIMSOLL_PORT__/v1/traces"
+protocol = "json"
+
+[otel.trace_exporter.otlp-http.headers]
+"x-seat-template" = "keep"
+
+[otel.metrics_exporter.otlp-http]
+endpoint = "http://127.0.0.1:__PLIMSOLL_PORT__/v1/metrics"
+protocol = "json"
+
+[otel.metrics_exporter.otlp-http.headers]
+"x-seat-template" = "keep"
+
+[features]
+hooks = true
