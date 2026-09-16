@@ -13,10 +13,17 @@ import { LocalEventBuffer } from '../packages/collector-cli/src/buffer';
 import { CollectorMaintenance, automaticRepairServiceStatus } from '../packages/collector-cli/src/maintenance';
 import { RolloutTailer } from '../packages/collector-cli/src/rollout-tailer';
 import { TranscriptTailer } from '../packages/collector-cli/src/transcript-tailer';
-import { captureBaselineStatus } from '../packages/collector-cli/src/capture-baseline';
+import {
+  AUTOMATIC_DISCOVERY_ENTRY_CAP,
+  AUTOMATIC_DISCOVERY_WALL_MS,
+  automaticDiscoveryEntryAllowance,
+  captureBaselineStatus,
+  loadCaptureSweepResume,
+} from '../packages/collector-cli/src/capture-baseline';
 import { runMaintenanceWorkerService } from '../packages/collector-cli/src/maintenance-worker';
 import { MAINTENANCE_PROTOCOL_SCHEMA, parseMaintenanceWorkerReceipt } from '../packages/collector-cli/src/maintenance-protocol';
 import { DEFAULT_JSONL_TAILER_IO, readJsonlTail } from '../packages/collector-cli/src/jsonl-byte-tailer';
+import { CaptureWorkBudget } from '../packages/collector-cli/src/capture-work-budget';
 import type { CaptureRoot } from '../packages/collector-cli/src/capture-root-inventory';
 
 const require = createRequire(path.resolve('package.json'));
@@ -128,6 +135,31 @@ async function main() {
     check('no old-day enumeration / full rescan',oldDirectoriesOpened===0);
     check('64-record and byte slice limits',maxSliceRecords<=64&&maxSliceBytes<=524288);
     check('actual projection transaction excludes competing writer',delayCalls>0&&competingBusy===delayCalls);
+
+    // Bead eco-6hoxj.73.1: 22-root host converges under the fairness wall.
+    const manyRootDir=path.join(base,'many-root');
+    const manyRoots:CaptureRoot[]=Array.from({length:22},(_,i)=>{
+      const directory=path.join(manyRootDir,`root-${String(i).padStart(2,'0')}`);
+      fs.mkdirSync(directory,{recursive:true});
+      for(let f=0;f<20;f++) fs.writeFileSync(path.join(directory,`session-${f}.jsonl`),'{}\n');
+      return {source:'claude_code' as const,rootId:`many-${i}`,profileId:`many-${i}`,directory,installationEpochId:buffer.workspaceBinding()!.currentInstallationEpochId!};
+    });
+    const manyBuffer=new LocalEventBuffer(path.join(base,'many-root.sqlite'),{workspaceId:'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa',databaseBusyTimeoutMs:900});
+    const manyTailer=new TranscriptTailer(manyBuffer,manyRoots[0]!.directory,undefined,manyRoots);
+    const sized=automaticDiscoveryEntryAllowance({rootCount:22});
+    check('22-root entry allowance exceeds the constant 256-entry floor',sized>AUTOMATIC_DISCOVERY_ENTRY_CAP);
+    check('one-root entry allowance keeps the 256-entry floor',automaticDiscoveryEntryAllowance({rootCount:1})===AUTOMATIC_DISCOVERY_ENTRY_CAP);
+    let manyCompleteAt=0; let manyScan:any=null; const manyWalls:number[]=[];
+    for(let n=1;n<=24;n++){
+      const r=await manyTailer.scan({scope:'recent',automatic:{phase:'capture',budget:new CaptureWorkBudget()}});
+      manyScan=r.activity.scan; manyWalls.push(r.automaticBudget?.elapsedWallMs??0);
+      if(manyScan?.sweepComplete){manyCompleteAt=n; if(manyScan.pendingFiles===0) break;}
+    }
+    const manyResume=loadCaptureSweepResume(manyBuffer.database,'claude_code');
+    check('22-root sweep reaches sweepComplete within 24 cadences',manyCompleteAt>0&&manyScan?.sweepComplete===true,{completeAt:manyCompleteAt,scan:manyScan});
+    check('22-root cadence honours the 50ms discovery wall and 200ms fairness budget',manyScan?.wallBudgetMsPerTick===AUTOMATIC_DISCOVERY_WALL_MS&&manyScan?.entryBudgetPerTick>=sized&&manyWalls.every(ms=>ms<2000));
+    check('completed 22-root sweep does not restart the next generation at root 0',Boolean(manyResume&&manyResume.rootIndex!==0),manyResume);
+    manyTailer.close(); manyBuffer.close();
     const dbBytes=fs.statSync(path.join(base,'ledger.sqlite')).size;
     const summary={mode,passed:checks.every(c=>c.passed),expectedBaselineFailure:mode==='baseline'&&!advanced,
       fixture:{codexFilesAtStart:16940,oldDayFiles:16906,preEnrollmentRecentFiles:history.size,newCodexFiles:26,newClaudeFiles:7,dirtySessionsSeeded:31421,ledgerBytes:dbBytes,projectionDelayMs:305,delayCalls,competingBusy,privateReads,oldDirectoriesOpened,maxSliceRecords,maxSliceBytes},

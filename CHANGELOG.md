@@ -35,6 +35,11 @@ does not transfer its sessions to a tailer.
 
 ### Fixed
 
+- Automatic capture on many-root hosts sizes each cadence's directory-entry
+  allowance from the observed root/corpus size (256-entry floor, 16384 cap)
+  while the 50 ms discovery wall and 200 ms fairness budget still bound the
+  tick. A finished or limited sweep persists its origin so the next generation
+  does not restart enumeration at root 0 (eco-6hoxj.73.1).
 - Daemon session sync now converges without `upload-history --sessions`. A
   failed or interrupted 5-minute refresh survives restart, and a ledger
   catch-up covers sessions whose events were already uploaded so they never

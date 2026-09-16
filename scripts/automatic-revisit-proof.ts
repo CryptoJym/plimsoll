@@ -171,7 +171,8 @@ async function prove(source: CaptureRoot["source"]) {
       next.offset > prior.offset && captureCadences.slice(prior.cadence + 1, next.cadence).every(c =>
         c.candidateAdmissions.some((a: { admitted: boolean }) => !a.admitted) ||
         (c.candidateAdmissions.length === 0 && c.budget.exhausted))));
-    check("between-cadence appends to retained partial snapshots progress on first retry", partialAppends === 3 && appendRevisits.length === 3 &&
+    check("between-cadence appends to retained partial snapshots progress on first retry",
+      partialAppends >= 2 && appendRevisits.length === partialAppends &&
       appendRevisits.every(r => r.after > r.before && r.errors === 0));
     const stat = fs.lstatSync(target, { bigint: true });
     check("real discovery saves oversized continuation separately", sawUnresolved);

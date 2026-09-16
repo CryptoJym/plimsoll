@@ -20,10 +20,13 @@ import {
   type JsonlTailerIo,
 } from "./jsonl-byte-tailer";
 import {
-  AUTOMATIC_DISCOVERY_ENTRY_CAP,
   AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP,
   AUTOMATIC_DISCOVERY_WALL_MS,
   AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP,
+  automaticDiscoveryEntryAllowance,
+  loadCaptureSweepResume,
+  rememberCaptureSweepResume,
+  nextCaptureSweepOrigin,
   captureScanProgress,
   type CaptureScanProgress,
   beginAutomaticCaptureBaseline,
@@ -598,6 +601,7 @@ export class RolloutTailer {
       this.captureAttempt?.discovery.close();
       this.baselineAttempt = null;
       this.captureAttempt = null;
+      rememberCaptureSweepResume(this.buffer.database, "codex", null);
     }
     if (options.deferredBeforeIo) {
       result.activity.truncated = true;
@@ -658,7 +662,7 @@ export class RolloutTailer {
         ? await attempt.discovery.collect(automatic.budget, {
             signal: options.signal,
             maxFiles: AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP,
-            maxEntries: AUTOMATIC_DISCOVERY_ENTRY_CAP,
+            maxEntries: this.entryAllowance(attempt.discovery.progress().entriesVisited),
             maxWallMs: AUTOMATIC_DISCOVERY_WALL_MS,
           })
         : {
@@ -741,6 +745,7 @@ export class RolloutTailer {
             filesValidated: attempt.filesValidated,
             statErrors: result.statErrors,
           });
+          this.persistSweepResume(attempt.discovery);
           this.retire(attempt.discovery);
           this.baselineAttempt = null;
           result.exhaustive = false;
@@ -757,6 +762,7 @@ export class RolloutTailer {
           filesValidated: attempt.filesValidated,
           discoveryErrors: result.discoveryErrors || 1,
         });
+        this.persistSweepResume(attempt.discovery);
         this.retire(attempt.discovery);
         this.baselineAttempt = null;
         result.activity.truncated = true;
@@ -779,6 +785,7 @@ export class RolloutTailer {
       }
 
       if (attempt.capacityDeferredThisSweep) {
+        this.persistSweepResume(attempt.discovery);
         this.restart(attempt, this.recentDiscovery(scanNow, options.discoveryLimit, options));
         attempt.capacityDeferredThisSweep = false;
         attempt.newGenerationsThisSweep = 0;
@@ -790,6 +797,7 @@ export class RolloutTailer {
 
       attempt.sweepsCompleted += 1;
       if (attempt.sweepsCompleted < 2 || attempt.newGenerationsThisSweep > 0) {
+        this.persistSweepResume(attempt.discovery);
         this.restart(attempt, this.recentDiscovery(scanNow, options.discoveryLimit, options));
         attempt.newGenerationsThisSweep = 0;
         result.activity.truncated = true;
@@ -802,6 +810,7 @@ export class RolloutTailer {
         runId: attempt.runId,
         completedAt: new Date().toISOString(),
       });
+      this.persistSweepResume(attempt.discovery);
       this.retire(attempt.discovery);
       this.baselineAttempt = null;
       result.excludedGenerations = completed.excludedGenerations;
@@ -1221,16 +1230,35 @@ export class RolloutTailer {
     return result;
   }
 
+  private entryAllowance(observedEntries?: number) {
+    return automaticDiscoveryEntryAllowance({
+      rootCount: this.directories.length,
+      observedEntries:
+        observedEntries ??
+        loadCaptureSweepResume(this.buffer.database, "codex")?.observedEntries,
+    });
+  }
+
+  private persistSweepResume(discovery: IncrementalJsonlDiscovery) {
+    const progress = discovery.progress();
+    rememberCaptureSweepResume(this.buffer.database, "codex", {
+      rootIndex: nextCaptureSweepOrigin(progress, ROLLOUT_DISCOVERY_DAYS),
+      observedEntries: progress.entriesVisited,
+    });
+  }
+
   private recentDiscovery(now: Date, limit?: number, _options?: RolloutScanOptions) {
     const roots = this.directories.flatMap(directory =>
       Array.from({ length: ROLLOUT_DISCOVERY_DAYS }, (_, offset) => {
         const day = new Date(now.getTime() - offset * 24 * 60 * 60 * 1000);
         return path.join(directory, ...day.toISOString().slice(0, 10).split("-"));
       }));
+    const resume = loadCaptureSweepResume(this.buffer.database, "codex");
     return new IncrementalJsonlDiscovery(roots, {
       recursive: false,
       matches: (name) => name.startsWith("rollout-") && name.endsWith(".jsonl"),
       maxEntries: this.lifetimeEntryLimit(limit),
+      startRootIndex: resume?.rootIndex ?? 0,
       missingRootsAreEmpty: true,
       isCandidateQuarantined: (candidateHash) => {
         const quarantine = this.activeBoundaryOptions.quarantine;
@@ -1267,7 +1295,7 @@ export class RolloutTailer {
       const chunk = await attempt.discovery.collect(budget, {
         signal: options.signal,
         maxFiles: AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP - attempt.pendingFiles.length,
-        maxEntries: AUTOMATIC_DISCOVERY_ENTRY_CAP,
+        maxEntries: this.entryAllowance(attempt.discovery.progress().entriesVisited),
         maxWallMs: AUTOMATIC_DISCOVERY_WALL_MS,
       });
       attempt.pendingFiles.push(...chunk.files);
@@ -1287,6 +1315,7 @@ export class RolloutTailer {
     if (!attempt) return;
     attempt.pendingFiles = advanceAutomaticCaptureFiles(attempt.pendingFiles, files, partial);
     if (attempt.discoveryDone && attempt.pendingFiles.length === 0) {
+      this.persistSweepResume(attempt.discovery);
       this.retire(attempt.discovery);
       this.captureAttempt = null;
     }
