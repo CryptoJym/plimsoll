@@ -1808,18 +1808,22 @@ function postToolUseBodyWithPaths(sessionId: string) {
  */
 /**
  * The header of the one table on the generated privacy page that carries the
- * spool's derivation-input disclosure, and the `Matched by` cell that marks a
- * rule-2 row. Both are literals of the RENDERED page, not of the code that
- * feeds it.
+ * spool's derivation-input disclosure, and the `Matched by` cells that mark a
+ * rule-2 row or an exact-name row. These are literals of the RENDERED page, not
+ * of the code that feeds it. Coupling them to `privacy-spec.ts` would destroy
+ * the leg's independence: a rename of the generator's copy would keep this
+ * reader green. A mismatch fails closed instead.
  */
 const PRIVACY_PAGE_DISCLOSURE_TABLE_HEADER =
   "| # | Field name | Matched by | Why the spool keeps its value |";
 const PRIVACY_PAGE_RULE_TWO_MATCHED_BY = "this name normalized, in any spelling";
+const PRIVACY_PAGE_EXACT_NAME_MATCHED_BY = "this exact name";
+const PRIVACY_PAGE_ALIGNMENT_ROW = /^\|(\s*-+\s*\|)+$/;
 
 /**
- * Review r2 (REVIEW-68-r2), N1 — the rule-2 names AS THE PRIVACY PAGE PRINTS
- * THEM, read back out of the rendered markdown table rather than out of the
- * array the table is built from.
+ * Review r2 (REVIEW-68-r2), N1, and REVIEW-86 follow-up — the disclosure-table
+ * names AS THE PRIVACY PAGE PRINTS THEM, read back out of the rendered markdown
+ * table rather than out of the array the table is built from.
  *
  * Why this exists: `renderedRuleTwoRows` in
  * `r_every_protected_identity_name_is_blanked_or_declared` is
@@ -1834,22 +1838,44 @@ const PRIVACY_PAGE_RULE_TWO_MATCHED_BY = "this name normalized, in any spelling"
  * still, and `r_the_privacy_pages_rendered_rule_two_table_names_the_hand_list`
  * reds while the restated leg stays green.
  *
+ * REVIEW-86: the same hole existed for the exact-name rows (cwd,
+ * current_working_directory, workdir, working_directory, hookEventName). A
+ * `reasonTable` change that dropped or mislabelled one still passed 123/123
+ * because this reader skipped every non-rule-2 row. Exact-name keys are now
+ * collected the same way and pinned to `SPOOL_DERIVATION_INPUT_KEYS`.
+ *
  * It fails closed. A table this reader cannot find, a second table wearing the
- * same header, a row whose cells it cannot read: each yields a name list that
- * cannot equal the hand list, rather than an empty pass.
+ * same header, a missing or non-alignment `header+1` row, a data row whose
+ * cells it cannot read, or a `Matched by` cell that is neither known label:
+ * each yields `unreadable` (or a name list that cannot equal the pin), rather
+ * than an empty pass. The alignment row is matched, not assumed: a fixed
+ * `header + 2` offset without that check consumed the first data row as
+ * alignment when the dashes were removed.
  */
-function ruleTwoNamesAsThePageRendersThem(page: string) {
+function disclosureTableAsThePageRendersThem(page: string) {
+  const empty = {
+    found: false,
+    duplicateHeader: false,
+    names: [] as string[],
+    exactNames: [] as string[],
+    rows: 0,
+    unreadable: [] as string[],
+  };
   const lines = page.split("\n");
   const header = lines.indexOf(PRIVACY_PAGE_DISCLOSURE_TABLE_HEADER);
   const duplicateHeader =
     header >= 0 && lines.indexOf(PRIVACY_PAGE_DISCLOSURE_TABLE_HEADER, header + 1) >= 0;
   if (header < 0 || duplicateHeader) {
-    return { found: false, duplicateHeader, names: [] as string[], rows: 0, unreadable: [] as string[] };
+    return { ...empty, duplicateHeader };
   }
   const names: string[] = [];
+  const exactNames: string[] = [];
   const unreadable: string[] = [];
   let rows = 0;
-  // `header + 2` steps over the `|---|---|---|---|` alignment row.
+  const alignment = lines[header + 1] ?? "";
+  if (!PRIVACY_PAGE_ALIGNMENT_ROW.test(alignment)) {
+    unreadable.push(alignment);
+  }
   for (let index = header + 2; index < lines.length; index += 1) {
     const line = lines[index] ?? "";
     if (!line.startsWith("|")) break;
@@ -1859,15 +1885,30 @@ function ruleTwoNamesAsThePageRendersThem(page: string) {
       unreadable.push(line);
       continue;
     }
-    if (cells[2] !== PRIVACY_PAGE_RULE_TWO_MATCHED_BY) continue;
     const printed = /^`([^`]+)`$/.exec(cells[1] ?? "");
     if (!printed) {
       unreadable.push(line);
       continue;
     }
-    names.push(printed[1] as string);
+    const matchedBy = cells[2] ?? "";
+    if (matchedBy === PRIVACY_PAGE_RULE_TWO_MATCHED_BY) {
+      names.push(printed[1] as string);
+      continue;
+    }
+    if (matchedBy === PRIVACY_PAGE_EXACT_NAME_MATCHED_BY) {
+      exactNames.push(printed[1] as string);
+      continue;
+    }
+    unreadable.push(line);
   }
-  return { found: true, duplicateHeader, names: names.sort(), rows, unreadable };
+  return {
+    found: true,
+    duplicateHeader,
+    names: names.sort(),
+    exactNames: exactNames.sort(),
+    rows,
+    unreadable,
+  };
 }
 
 async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
@@ -2194,7 +2235,9 @@ async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
   );
 
   // Review r2 (REVIEW-68-r2), N1 — the THIRD leg, and the only one of the three
-  // that is independent.
+  // that is independent. REVIEW-86 extends the same reader to the exact-name
+  // rows, which had the same hole: they were skipped, so a dropped or
+  // mislabelled derivation-input row still passed 123/123.
   //
   // The two legs above are `SPOOL_PROTECTED_IDENTITY_KEYS` compared with the
   // hand list, and `SPOOL_DERIVATION_INPUT_DISCLOSURE` filtered by `match`
@@ -2210,39 +2253,66 @@ async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
   // makes, parsed back out of its markdown. And take them a second time from
   // the COMMITTED `docs/privacy-spec.md`, so the page an operator actually
   // opens is held to the same hand list even without the `docs:privacy --check`
-  // gate. Both are compared with `SPOOL_RULE_TWO_DISCLOSED_CANONICAL_NAMES`,
-  // which is typed by hand and derived from nothing.
-  const pageRendersRuleTwo = ruleTwoNamesAsThePageRendersThem(
+  // gate. Rule-2 names are compared with `SPOOL_RULE_TWO_DISCLOSED_CANONICAL_NAMES`,
+  // which is typed by hand and derived from nothing. Exact-name names are
+  // compared with `SPOOL_DERIVATION_INPUT_KEYS`, the runtime allowlist the
+  // page exists to disclose.
+  const pageRendersDisclosure = disclosureTableAsThePageRendersThem(
     renderPrivacySpec(collectPrivacySpecModel()),
   );
-  const committedPageRuleTwo = ruleTwoNamesAsThePageRendersThem(
+  const committedPageDisclosure = disclosureTableAsThePageRendersThem(
     fs.readFileSync(path.join(repoRoot, "docs", "privacy-spec.md"), "utf8"),
   );
+  const disclosedExactNames = [...SPOOL_DERIVATION_INPUT_KEYS].sort();
+  const renderedPageReadable =
+    pageRendersDisclosure.found &&
+    committedPageDisclosure.found &&
+    pageRendersDisclosure.unreadable.length === 0 &&
+    committedPageDisclosure.unreadable.length === 0;
   check(
     "r_the_privacy_pages_rendered_rule_two_table_names_the_hand_list",
     disclosedRuleTwoNames.length > 0 &&
-      pageRendersRuleTwo.found &&
-      committedPageRuleTwo.found &&
-      pageRendersRuleTwo.unreadable.length === 0 &&
-      committedPageRuleTwo.unreadable.length === 0 &&
-      pageRendersRuleTwo.rows > pageRendersRuleTwo.names.length &&
-      JSON.stringify(pageRendersRuleTwo.names) === JSON.stringify(disclosedRuleTwoNames) &&
-      JSON.stringify(committedPageRuleTwo.names) === JSON.stringify(disclosedRuleTwoNames),
+      renderedPageReadable &&
+      pageRendersDisclosure.rows ===
+        pageRendersDisclosure.names.length + pageRendersDisclosure.exactNames.length &&
+      JSON.stringify(pageRendersDisclosure.names) === JSON.stringify(disclosedRuleTwoNames) &&
+      JSON.stringify(committedPageDisclosure.names) === JSON.stringify(disclosedRuleTwoNames),
     {
       source: "renderPrivacySpec(collectPrivacySpecModel()) + docs/privacy-spec.md",
       handList: disclosedRuleTwoNames,
-      renderedRuleTwoNames: pageRendersRuleTwo.names,
-      committedRuleTwoNames: committedPageRuleTwo.names,
-      renderedTableRows: pageRendersRuleTwo.rows,
-      committedTableRows: committedPageRuleTwo.rows,
-      tableFound: { rendered: pageRendersRuleTwo.found, committed: committedPageRuleTwo.found },
+      renderedRuleTwoNames: pageRendersDisclosure.names,
+      committedRuleTwoNames: committedPageDisclosure.names,
+      renderedTableRows: pageRendersDisclosure.rows,
+      committedTableRows: committedPageDisclosure.rows,
+      tableFound: { rendered: pageRendersDisclosure.found, committed: committedPageDisclosure.found },
       duplicateHeader: {
-        rendered: pageRendersRuleTwo.duplicateHeader,
-        committed: committedPageRuleTwo.duplicateHeader,
+        rendered: pageRendersDisclosure.duplicateHeader,
+        committed: committedPageDisclosure.duplicateHeader,
       },
-      unreadableRows: [...pageRendersRuleTwo.unreadable, ...committedPageRuleTwo.unreadable],
+      unreadableRows: [...pageRendersDisclosure.unreadable, ...committedPageDisclosure.unreadable],
       independentOf:
         "SPOOL_PROTECTED_IDENTITY_KEYS / SPOOL_DERIVATION_INPUT_DISCLOSURE — these names come from the generator's own rendered table",
+    },
+  );
+  check(
+    "r_the_privacy_pages_rendered_exact_name_table_names_the_derivation_inputs",
+    disclosedExactNames.length > 0 &&
+      renderedPageReadable &&
+      pageRendersDisclosure.rows ===
+        pageRendersDisclosure.names.length + pageRendersDisclosure.exactNames.length &&
+      JSON.stringify(pageRendersDisclosure.exactNames) === JSON.stringify(disclosedExactNames) &&
+      JSON.stringify(committedPageDisclosure.exactNames) === JSON.stringify(disclosedExactNames),
+    {
+      source: "renderPrivacySpec(collectPrivacySpecModel()) + docs/privacy-spec.md",
+      derivationInputs: disclosedExactNames,
+      renderedExactNames: pageRendersDisclosure.exactNames,
+      committedExactNames: committedPageDisclosure.exactNames,
+      renderedTableRows: pageRendersDisclosure.rows,
+      committedTableRows: committedPageDisclosure.rows,
+      tableFound: { rendered: pageRendersDisclosure.found, committed: committedPageDisclosure.found },
+      unreadableRows: [...pageRendersDisclosure.unreadable, ...committedPageDisclosure.unreadable],
+      independentOf:
+        "SPOOL_DERIVATION_INPUT_DISCLOSURE — exact-name keys come from the generator's own rendered table, pinned to SPOOL_DERIVATION_INPUT_KEYS",
     },
   );
 

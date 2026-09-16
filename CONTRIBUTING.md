@@ -44,6 +44,11 @@ pnpm collector help # explore the CLI
   `collector status` coverage diff from a real session).
 - Issues live in `issues/` as operating records — see ISSUE_GUIDE.md. Claiming
   one: comment on the GitHub issue mirror or open a draft PR referencing it.
+- Lane dumps stay off the product branch: root `evidence/` and `*.log` are
+  gitignored. The exception is `BUILDER-EVIDENCE/` — committed, inert
+  reproduction material for a proof-tool defect (signposted README, not
+  imported by proofs, outside the typecheck and runtime path). Unabridged run
+  output still lives in the lane directory. See `BUILDER-EVIDENCE/README.md`.
 
 ## Privacy review
 

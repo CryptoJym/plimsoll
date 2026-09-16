@@ -64,3 +64,13 @@ RUNTIME SOURCE — stronger than a comment-stripped digest: blob-identical.
   IDENTICAL  packages/collector-cli/src/server.ts  git blob b9cbee19f7179d9fb437d9304f1328e45dab458e
   IDENTICAL  packages/collector-cli/src/normalizer.ts  git blob ab2b14260da9fc3ea072dce2fc29b4fed156db39
   No file under any packages/*/src/ appears in git diff 790147cf..HEAD.
+
+REVIEW-86 follow-up (eco-6hoxj.148) — same fixture plus `/[/*]/` block-path case
+generated 2026-09-16 · node v22.15.0 · typescript 5.9.3
+  BUILDER-EVIDENCE/fixtures/regex-literal.ts
+    raw    18e9cfa945b4e74b40496fdeb76b58dea88ad169065f4e57c8c03836dccbf4da
+    code   921376d84edea7ef0ac3eeb531b314fe8f721fb9e9ecd17181b740c3357b9005  (printer, removeComments)
+    spans  921376d84edea7ef0ac3eeb531b314fe8f721fb9e9ecd17181b740c3357b9005  (comment ranges cut)
+    naive  e44dbf46cb8fa8a00483a1b54f771217b74f1cd5c84bc38c0b0c8e0c9fb31abd
+  Naive still diverges: line-comment path truncates the first two regexes;
+  block-comment path at `/[/*]/` swallows the statements through the next `*/`.
