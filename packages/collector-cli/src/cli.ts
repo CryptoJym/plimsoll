@@ -72,6 +72,7 @@ import {
 } from "./config";
 import { appendForwardedHook } from "./forwarder";
 import { forwardHookOverLoopback } from "./local-hook-client";
+import { buildProducerParityReport } from "./producer-parity";
 import { SyncBackoff } from "./sync-backoff";
 import {
   DEFAULT_PRODUCER_ROTATION_GRACE_MS,
@@ -323,6 +324,9 @@ Commands:
                         left unfenced (so they are captured, not excluded)
   doctor --read-only --json
                         Read-only readiness check; never creates config, ledger, plist, logs, or directories
+  producer-parity [--hours 6]
+                        Read-only join of producer hook counters to collector
+                        admission and the local ledger for one window
   export                Print buffered events as JSON
   forward-hook SOURCE   Read hook JSON from stdin and append it without requiring the receiver
   forward-hook-http SOURCE
@@ -3258,6 +3262,13 @@ async function main() {
           // Hook events the collector could not accept live, and what the
           // drain has recovered since (bead eco-6hoxj.61).
           hookSpool: hookSpoolOperatorStatus(collectorHome(), daemonState.hookSpool),
+          producerParity: buildProducerParityReport({
+            home: collectorHome(),
+            windowHours: 6,
+            ledger: buffer.database.prepare(
+              `select id, created_at as createdAt, source from buffered_events`,
+            ).all() as Array<{ id: string; createdAt: string; source: string }>,
+          }),
           // Why delivery is paused, next to what is waiting: the daemon's own
           // scheduling snapshot, the same block HTTP /status carries
           // (bead eco-6hoxj.67, review r1 F4).
@@ -3288,6 +3299,26 @@ async function main() {
       ),
     );
     buffer.close();
+    return;
+  }
+
+  if (command === "producer-parity") {
+    const hours = Number(optionValue("--hours") ?? 6);
+    const windowHours = Number.isFinite(hours) && hours > 0 ? hours : 6;
+    const buffer = openBuffer(config);
+    try {
+      const report = buildProducerParityReport({
+        home: collectorHome(),
+        windowHours,
+        ledger: buffer.database.prepare(
+          `select id, created_at as createdAt, source from buffered_events`,
+        ).all() as Array<{ id: string; createdAt: string; source: string }>,
+      });
+      console.log(JSON.stringify(report, null, 2));
+      if (!report.parity) process.exitCode = 1;
+    } finally {
+      buffer.close();
+    }
     return;
   }
 

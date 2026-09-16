@@ -2911,7 +2911,7 @@ function caseDrainingIsFalseWhenNothingCanDrain() {
  * No managed hook the fleet installs runs `forward-hook-http`. `setup` writes
  * the Claude Code hook as an `http` hook (Claude Code POSTs straight to
  * `http://127.0.0.1:<port>/hooks/claude-code` with the producer token in a
- * header), and the managed Codex and Grok hooks are `curl -s --max-time 2 -X
+ * header), and the managed Codex and Grok hooks are `curl -sS --fail --retry`
  * POST -H 'Content-Type: application/json' -H @<0600 header file>
  * --data-binary @-` commands posting straight to `/hooks/<source>`. Those
  * posts never touch the client spool, so a busy ledger answered them 503 and

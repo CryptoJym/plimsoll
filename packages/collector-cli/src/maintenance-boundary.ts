@@ -78,6 +78,9 @@ export type MaintenanceBoundaryStatus = {
   circuit: {
     failureCount: number;
     openUntil: string | null;
+    openedAt: string | null;
+    lastTransitionAt: string | null;
+    transitions: Array<{ at: string; to: "open" | "closed"; reason: string | null }>;
     skippedJobs: number;
     initialDelayMs: number;
     escalatedDelayMs: number;
@@ -309,6 +312,8 @@ export class MaintenanceProcessBoundary {
   private unknownBlames = 0;
   private failureCount = 0;
   private circuitOpenUntilMs: number | null = null;
+  private circuitOpenedAtMs: number | null = null;
+  private circuitTransitions: Array<{ at: string; to: "open" | "closed"; reason: string | null }> = [];
   private skippedJobs = 0;
   private invalidFrames = 0;
   private oversizedFrames = 0;
@@ -354,6 +359,9 @@ export class MaintenanceProcessBoundary {
       circuit: {
         failureCount: this.failureCount,
         openUntil: iso(this.circuitOpenUntilMs),
+        openedAt: iso(this.circuitOpenedAtMs),
+        lastTransitionAt: this.circuitTransitions.at(-1)?.at ?? null,
+        transitions: this.circuitTransitions.slice(-16),
         skippedJobs: this.skippedJobs,
         initialDelayMs: this.initialCircuitMs(),
         escalatedDelayMs: this.escalatedCircuitMs(),
@@ -403,7 +411,7 @@ export class MaintenanceProcessBoundary {
     }
     if (this.circuitOpenUntilMs !== null) {
       this.state = "recovering";
-      this.circuitOpenUntilMs = null;
+      this.markCircuitClosed();
     }
     if (this.quarantineUntilMs !== null && now >= this.quarantineUntilMs) {
       this.quarantineUntilMs = null;
@@ -719,7 +727,7 @@ export class MaintenanceProcessBoundary {
     this.lastFailure = null;
     this.recordOutcome("completed", completedAtMs);
     this.failureCount = 0;
-    this.circuitOpenUntilMs = null;
+    this.markCircuitClosed();
     this.state = "ready";
     this.stage = "idle";
     active.resolve(receipt.result);
@@ -925,7 +933,7 @@ export class MaintenanceProcessBoundary {
     await this.terminateChild(reason);
     if (partialOk) {
       this.failureCount = 0;
-      this.circuitOpenUntilMs = null;
+      this.markCircuitClosed();
       this.lastFailure = null;
       this.state = "ready";
       this.stage = "idle";
@@ -943,6 +951,23 @@ export class MaintenanceProcessBoundary {
     );
   }
 
+  private recordCircuitTransition(to: "open" | "closed", reason: string | null) {
+    const at = iso(this.now());
+    if (!at) return;
+    this.circuitTransitions.push({ at, to, reason });
+    if (this.circuitTransitions.length > 32) this.circuitTransitions.shift();
+  }
+
+  private markCircuitClosed() {
+    if (this.circuitOpenedAtMs === null && this.circuitOpenUntilMs === null) {
+      this.circuitOpenUntilMs = null;
+      return;
+    }
+    this.recordCircuitTransition("closed", this.lastFailure);
+    this.circuitOpenedAtMs = null;
+    this.circuitOpenUntilMs = null;
+  }
+
   private openCircuit(reason: string) {
     // Shutdown owns a monotonic terminal state. An older async failure may
     // finish termination after shutdown has already proved stopped/closed;
@@ -950,10 +975,13 @@ export class MaintenanceProcessBoundary {
     if (!this.accepting || this.state === "stopping" || this.state === "stopped") return;
     this.failureCount += 1;
     const delay = this.failureCount === 1 ? this.initialCircuitMs() : this.escalatedCircuitMs();
-    this.circuitOpenUntilMs = this.now() + delay;
+    const now = this.now();
+    if (this.circuitOpenedAtMs === null) this.circuitOpenedAtMs = now;
+    this.circuitOpenUntilMs = now + delay;
     this.lastFailure = reason;
     this.state = "circuit_open";
     this.stage = "idle";
+    this.recordCircuitTransition("open", reason);
   }
 
   private async terminateChild(_reason: string) {

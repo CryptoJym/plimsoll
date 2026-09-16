@@ -808,6 +808,10 @@ async function main() {
       const absentHeader = path.join(hooksDirectory, "synthetic-absent-copy.headers");
       const unrelatedFile = path.join(hooksDirectory, "synthetic-unrelated.json");
       const unrelatedBytes = `${JSON.stringify({ hooks: { Stop: [{ hooks: [{ type: "command", command: "true", timeout: 5 }] }] } })}\n`;
+      // Keeps the retry contract but is not what the generator renders, so its
+      // header-file reference is not trusted.
+      const nearMissFile = path.join(hooksDirectory, "synthetic-near-miss-header-copy.json");
+      const nearMissBytes = installed.split(" --fail ").join(" --fail --insecure ");
       const privateCopyBytes = installed.split(grokHeader).join(privateHeader);
       const absentCopyBytes = installed.split(grokHeader).join(absentHeader);
       fs.writeFileSync(sharedCopy, installed, { mode: 0o600 });
@@ -815,6 +819,7 @@ async function main() {
       fs.writeFileSync(privateCopy, privateCopyBytes, { mode: 0o600 });
       fs.writeFileSync(absentCopy, absentCopyBytes, { mode: 0o600 });
       fs.writeFileSync(unrelatedFile, unrelatedBytes, { mode: 0o600 });
+      fs.writeFileSync(nearMissFile, nearMissBytes, { mode: 0o600 });
       const run = runCli(["rotate-producer-token", "--source", "grok", "--grace-seconds", "60"], env);
       const receipt = lastJson(run.stdout);
       const after = readLocalIngestAuth(plimsollHome)!;
@@ -829,8 +834,10 @@ async function main() {
           }) &&
           fs.readFileSync(sharedCopy, "utf8") === installed &&
           byPath(grokHeader)?.status === "rotated" && headerFileToken(grokHeader) === next &&
-          fs.readFileSync(unrelatedFile, "utf8") === unrelatedBytes && byPath(unrelatedFile) === undefined && noToken,
-        { exit: run.code, status: receipt.status, shared: byPath(sharedCopy) ?? null });
+          fs.readFileSync(unrelatedFile, "utf8") === unrelatedBytes && byPath(unrelatedFile) === undefined &&
+          nearMissBytes !== installed && fs.readFileSync(nearMissFile, "utf8") === nearMissBytes &&
+          byPath(nearMissFile) === undefined && noToken,
+        { exit: run.code, status: receipt.status, shared: byPath(sharedCopy) ?? null, nearMiss: byPath(nearMissFile) ?? null });
       const admits = (token: string | undefined, now: number) => {
         try {
           assertProducerToken(
@@ -896,7 +903,7 @@ async function main() {
           readLocalIngestAuth(plimsollHome)!.grokProducer !== next &&
           (refusedReceipt.nextSteps ?? []).some((step: string) => step.includes("by hand")),
         { exit: refusedRun.code, status: refusedReceipt.status, header: refusedEntry ?? null });
-      for (const file of [headerHardlink, sharedCopy, privateCopy, privateHeader, unrelatedFile]) fs.rmSync(file, { force: true });
+      for (const file of [headerHardlink, sharedCopy, privateCopy, privateHeader, unrelatedFile, nearMissFile]) fs.rmSync(file, { force: true });
     }
 
     // ---- G3: header files are classified only through a guarded descriptor --

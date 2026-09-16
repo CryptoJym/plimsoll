@@ -10,6 +10,7 @@ import { useFixtureRoot } from "./lib/fixture-root";
 import {
   applyCodexConfig,
   generateCodexConfigToml,
+  generateHookForwardCommand,
 } from "../packages/collector-config/src/index";
 
 type Check = { name: string; passed: true; detail: unknown };
@@ -207,8 +208,12 @@ function main() {
     const studioAfter = fs.readFileSync(studio, "utf8");
     const studioDocument = parseToml(studioAfter) as Record<string, any>;
     const studioIdempotent = applyCodexConfig(studio, generated, { dryRun: true });
-    const expectedManagedCommand =
-      `curl -s --max-time 2 -X POST -H 'Content-Type: application/json' -H @${syntheticHeaderFile} --data-binary @- http://127.0.0.1:48271/hooks/codex || true`;
+    const expectedManagedCommand = generateHookForwardCommand({
+      repoRoot: "/synthetic/plimsoll",
+      port: 48271,
+      dataMode: "metadata",
+      codexHeaderFile: syntheticHeaderFile,
+    }, "codex");
     check(
       "studio0_migrated_commands_are_token_free_foreign_preserving_and_idempotent",
       !studioIdempotent.changed &&

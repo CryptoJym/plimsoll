@@ -684,10 +684,16 @@ async function spawnFailureAndConcurrentStartupProof() {
   assert.equal(failedStatus.childPresent, false);
   assert.equal(failedStatus.childReady, false);
   assert.equal(failedStatus.inFlight, false);
+  assert.ok(failedStatus.circuit.openedAt, "circuit-open transition must carry a timestamp");
+  assert.equal(failedStatus.circuit.transitions.at(-1)?.to, "open");
+  assert.equal(failedStatus.circuit.lastTransitionAt, failedStatus.circuit.openedAt);
   await rejectsWith(spawnFailure.boundary.run(), "maintenance_circuit_open");
   assert.equal(spawnFailure.spawnCount(), 1, "open circuit must not retry a throwing spawn");
   clock.advanceBy(50);
   assert.equal((await spawnFailure.boundary.run()).rawEventWrites, 4);
+  const recoveredStatus = spawnFailure.boundary.status();
+  assert.equal(recoveredStatus.circuit.openedAt, null);
+  assert.equal(recoveredStatus.circuit.transitions.at(-1)?.to, "closed");
   assert.equal(spawnFailure.spawnCount(), 2);
   assert.equal(await spawnFailure.boundary.shutdown(), true);
 

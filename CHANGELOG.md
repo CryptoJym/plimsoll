@@ -26,6 +26,14 @@ does not transfer its sessions to a tailer.
 
 ## Unreleased
 
+### Added
+
+- Producer-to-ledger parity instrumentation (eco-6hoxj.29): managed Codex/Grok
+  curl hooks fail on HTTP errors and retry inside the hook timeout; Claude HTTP
+  hooks carry the matching timeout/retry contract; each post mints a stable
+  event id; `plimsoll producer-parity` joins those ids to the ledger; collector
+  `/status` exposes producer counters and circuit-open transition timestamps.
+
 ### Changed
 
 - Local `GET /status` stays closed without the management credential.

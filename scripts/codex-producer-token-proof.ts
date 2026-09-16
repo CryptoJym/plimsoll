@@ -25,7 +25,17 @@ import {
   diagnoseManagedCodexHookCommand,
   generateCodexConfigToml,
   generateCodexHookHeader,
+  generateHookForwardCommand,
 } from "../packages/collector-config/src/index";
+
+function generateCodexHookCommand(headerFile: string, port: number) {
+  return generateHookForwardCommand({
+    repoRoot: "/synthetic/plimsoll",
+    port,
+    dataMode: "metadata",
+    codexHeaderFile: headerFile,
+  }, "codex");
+}
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import { HttpBoundaryRejection } from "../packages/collector-cli/src/http-boundary";
@@ -174,9 +184,10 @@ function credentialStamp(home: string) {
  */
 function countAuthFileSyscalls(...homes: string[]) {
   const counts = { stat: 0, read: 0, write: 0 };
+  const authFiles = homes.map((home) => path.join(home, LOCAL_INGEST_AUTH_FILE));
   const inHome = (value: unknown) =>
     typeof value === "string" &&
-    homes.some((home) => value === home || value.startsWith(`${home}${path.sep}`));
+    authFiles.some((file) => value === file);
   const mutable = fs as unknown as Record<string, (...args: any[]) => any>;
   const original = { ...mutable };
   const wrap = (name: string, kind: "stat" | "read" | "write", targets = 1) => {
@@ -250,7 +261,10 @@ async function main() {
       "codex_hook_commands_reference_the_header_file_and_carry_no_token",
       commands.length === 3 &&
         commands.every((command) =>
-          command === `curl -s --max-time 2 -X POST -H 'Content-Type: application/json' -H @${headerFile} --data-binary @- http://127.0.0.1:48271/hooks/codex || true`
+          command === generateCodexHookCommand(headerFile, 48271) &&
+          command.includes("--fail") &&
+          command.includes("--retry-all-errors") &&
+          !command.includes("|| true")
         ) &&
         !generated.slice(generated.indexOf("[hooks]")).includes(token) &&
         generatedHeader === `x-plimsoll-token: ${token}\n`,
@@ -370,6 +384,8 @@ async function main() {
     });
     const hookExecution = await runShellCommand(liveCommand, hookPayload, {
       ...process.env,
+      HOME: sandbox,
+      PLIMSOLL_HOME: path.join(sandbox, ".plimsoll"),
       PATH: `${fakeBin}:/usr/bin:/bin`,
       PLIMSOLL_FAKE_ARGV: childArgvFile,
     });
@@ -400,11 +416,16 @@ async function main() {
     const rejected = await runShellCommand(
       liveCommand.replace(`@${liveHeaderFile}`, `@${unauthenticatedHeader}`),
       hookPayload,
-      { ...process.env, PATH: "/usr/bin:/bin" },
+      {
+        ...process.env,
+        HOME: sandbox,
+        PLIMSOLL_HOME: path.join(sandbox, ".plimsoll"),
+        PATH: "/usr/bin:/bin",
+      },
     );
     check(
       "codex_hook_with_a_foreign_header_file_is_rejected_and_buffers_nothing",
-      rejected.status === 0 &&
+      rejected.status !== 0 &&
         Number((commandBuffer.database.prepare(
           "select count(*) as count from buffered_events",
         ).get() as { count: number }).count) === beforeRejected,
@@ -616,6 +637,9 @@ async function main() {
       ...migrateEnv,
       PLIMSOLL_COLLECTOR_DOCTOR_TIMEOUT_MS: "200",
     });
+    if (!rotatedDoctor.stdout.trim()) {
+      throw new Error(`rotated doctor empty stdout status=${rotatedDoctor.status} stderr=${rotatedDoctor.stderr}`);
+    }
     const rotatedReceipt = JSON.parse(rotatedDoctor.stdout) as Record<string, any>;
     check(
       "doctor_reports_the_rotation_window_value_blind",

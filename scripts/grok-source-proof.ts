@@ -12,6 +12,7 @@ import { Readable } from "node:stream";
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 import { useFixtureRoot } from "./lib/fixture-root";
 import {
+  HOOK_RETRY_CONTRACT,
   applyGrokHookFile,
   applyGrokHookHeaderFile,
   diagnoseManagedGrokHookCommand,
@@ -209,7 +210,9 @@ exec /usr/bin/curl "$@"
           command.includes("GROK_HOOK_EVENT") &&
           command.includes(`http://127.0.0.1:${commandPort}/hooks/grok`) &&
           command.includes(`-H @${headerFile}`) &&
-          command.includes("|| true") &&
+          command.includes("--fail") &&
+          command.includes("--retry-all-errors") &&
+          !command.includes("|| true") &&
           !command.includes(token) &&
           !command.includes("pnpm") &&
           !command.includes("--dir") &&
@@ -223,6 +226,8 @@ exec /usr/bin/curl "$@"
     });
     const hookExecution = await runShellCommand(commands[0] ?? "", hookPayload, {
       ...process.env,
+      HOME: sandbox,
+      PLIMSOLL_HOME: path.join(sandbox, ".plimsoll"),
       GROK_HOOK_EVENT: "UserPromptSubmit",
       PATH: "/usr/bin:/bin",
       PLIMSOLL_FAKE_ARGV: childArgvFile,
@@ -277,6 +282,8 @@ exec /usr/bin/curl "$@"
     const downStarted = performance.now();
     const downExecution = await runShellCommand(commands[0] ?? "", hookPayload, {
       ...process.env,
+      HOME: sandbox,
+      PLIMSOLL_HOME: path.join(sandbox, ".plimsoll"),
       GROK_HOOK_EVENT: "UserPromptSubmit",
       PATH: "/usr/bin:/bin",
       PLIMSOLL_FAKE_ARGV: childArgvFile,
@@ -284,8 +291,10 @@ exec /usr/bin/curl "$@"
     const downElapsedMs = performance.now() - downStarted;
     commandBuffer.close();
     check(
-      "grok_managed_hook_exits_zero_with_collector_down",
-      downExecution.status === 0 && downElapsedMs < 2_500,
+      "grok_managed_hook_fails_loudly_with_collector_down",
+      downExecution.status !== 0 &&
+        downElapsedMs < (HOOK_RETRY_CONTRACT.timeoutSeconds * 1000) &&
+        downElapsedMs >= 1_000,
       { status: downExecution.status, elapsedMs: downElapsedMs },
     );
 
@@ -341,6 +350,9 @@ exec /usr/bin/curl "$@"
           PLIMSOLL_COLLECTOR_DOCTOR_TIMEOUT_MS: "200",
         },
       );
+      if (!result.stdout.trim()) {
+        throw new Error(`grok doctor empty stdout name=${fixture.name} status=${result.status} stderr=${result.stderr}`);
+      }
       const receipt = JSON.parse(result.stdout) as Record<string, any>;
       unresolvableGrokResults.push({
         name: fixture.name,

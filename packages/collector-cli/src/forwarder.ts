@@ -16,6 +16,7 @@ export function appendForwardedHook(
     source: ToolSource;
     transportPath?: string;
     now?: () => number;
+    producerEventId?: string;
   },
 ) {
   assertCollectorPrivacyMode(options.config, "hook capture");
@@ -27,6 +28,7 @@ export function appendForwardedHook(
     source: options.source,
     transportPath: options.transportPath,
     now: options.now,
+    producerEventId: options.producerEventId,
   });
   // Successful hook/fallback responses are public proof surfaces before the
   // durable outbox runs. Include the same deterministic local-only omissions

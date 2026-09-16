@@ -32,6 +32,11 @@ type NormalizeOptions = {
   gitContext?: import("../../shared/src/index").GitLinkageContext;
   transportPath?: string;
   /**
+   * Producer-minted UUID from `x-plimsoll-event-id`. Wins over a body id so
+   * curl retries of the same hook post one ledger row.
+   */
+  producerEventId?: string;
+  /**
    * Collector receive-time wall clock, defaulted to `Date.now`. Same kind of
    * outside-world seam as `JsonlTailerIo.now`: the hook intake clamp measures
    * a producer stamp against it. A fixture that time-travels the ledger must
@@ -429,7 +434,10 @@ export function normalizeHookPayload(
     "eventId",
     (value) => typeof value === "string" && isUuid(value.trim()) ? value.trim() : undefined,
   );
-  const eventId = eventIdSelection.value ?? crypto.randomUUID();
+  const producerEventId = options.producerEventId && isUuid(options.producerEventId)
+    ? options.producerEventId.trim().toLowerCase()
+    : undefined;
+  const eventId = producerEventId ?? eventIdSelection.value ?? crypto.randomUUID();
   const eventTypeSelection = selectValidatedHookAuthority(
     authorityPartitions,
     "eventType",

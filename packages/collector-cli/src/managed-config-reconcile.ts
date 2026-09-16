@@ -9,6 +9,7 @@ import {
   type ToolConfigOptions,
   applyClaudeSettings,
   applyCodexConfig,
+  applyCodexConfigOrHookCommands,
   discoverClaudeSeats,
   discoverCodexProfiles,
   generateClaudeCodeSettings,
@@ -163,7 +164,7 @@ export function composeManagedCodexTargets(
       path: codexFile,
       family: "codex",
       run: (toolOptions, preview) =>
-        applyCodexConfig(codexFile, generateCodexConfigToml(toolOptions), { dryRun: preview }),
+        applyCodexConfigOrHookCommands(codexFile, generateCodexConfigToml(toolOptions), { dryRun: preview }),
     },
     ...discoverCodexProfiles(home)
       .filter((profile) => profile.hasConfig || options.includeAbsent === true)
@@ -173,7 +174,7 @@ export function composeManagedCodexTargets(
         family: "codex",
         discovered: true,
         run: (toolOptions, preview) =>
-          applyCodexConfig(profile.path, generateCodexConfigToml(toolOptions), {
+          applyCodexConfigOrHookCommands(profile.path, generateCodexConfigToml(toolOptions), {
             dryRun: preview,
             managedTarget: `codexProfile[${profile.slug}]`,
           }),

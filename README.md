@@ -145,7 +145,10 @@ The counters (`recovered`, `rejected`, `deferred`, `spooledAtIntake` — how man
 events the collector's own intake spooled — `refused` — how many it tried to
 spool and could not — pending files and their age) are in
 `plimsoll status`, `plimsoll doctor`, and the collector's `/status` under
-`hookSpool`; `enabled` there is the running collector's kill-switch state, read
+`hookSpool`. `plimsoll producer-parity --hours 6` joins producer-accepted hook
+ids to durable ledger ids for that window. Circuit-open transitions carry
+`openedAt` / `transitions` on `/status` `maintenance.boundary.circuit`.
+`enabled` there is the running collector's kill-switch state, read
 from the collector itself — `plimsoll status` asks the daemon for it in one
 request bounded by `PLIMSOLL_COLLECTOR_DOCTOR_TIMEOUT_MS` (3 s by default), and
 is otherwise a purely local read. It reads `null` with `enabledSource:
@@ -697,7 +700,10 @@ token from a mode-0600 `plimsoll.headers` file beside its own config
 (`${GROK_HOME:-~/.grok}/hooks/plimsoll.headers` and `~/.codex/plimsoll.headers`),
 so a config search or a pasted command string never exposes the token. Codex's
 own OTLP exporter has no file or environment source for a header value, so
-`[otel.*_exporter."otlp-http"] headers` keeps the token inline; rotate it with
+`[otel.*_exporter."otlp-http"] headers` keeps the token inline. A seat profile
+that already uses Codex's documented `[otel.*."otlp-http".headers]` subtable
+without `x-plimsoll-source` is healed in place — setup does not refuse that
+layout. Rotate the token with
 `plimsoll rotate-producer-token --source codex`, which rewrites the header file,
 `config.toml` and every discovered `~/.codex-profiles/<slug>/config.toml` that
 already carries the managed block — with a backup per file, inside the same

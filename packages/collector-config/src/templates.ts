@@ -48,7 +48,37 @@ function tomlString(value: string) {
   return `"${value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')}"`;
 }
 
-function hookForwardCommand(options: ToolConfigOptions, source: "codex" | "grok") {
+/**
+ * Shared producer retry/timeout contract (eco-6hoxj.29).
+ *
+ * Codex/Grok command hooks run curl. Claude Code HTTP hooks cannot take curl
+ * flags, so they carry the same timeout and retry count as native fields.
+ * `--retry-max-time` is strictly less than the hook timeout so curl cannot
+ * outlive the hosting tool's deadline.
+ */
+export const HOOK_RETRY_CONTRACT = Object.freeze({
+  timeoutSeconds: 5,
+  curlMaxTimeSeconds: 2,
+  curlRetry: 2,
+  curlRetryMaxTimeSeconds: 4,
+});
+
+export function hookCommandHasRetryContract(command: string) {
+  return command.includes("--fail") &&
+    command.includes("--retry-all-errors") &&
+    !command.includes("|| true") &&
+    command.includes(`--retry ${HOOK_RETRY_CONTRACT.curlRetry}`) &&
+    command.includes(`--retry-max-time ${HOOK_RETRY_CONTRACT.curlRetryMaxTimeSeconds}`) &&
+    HOOK_RETRY_CONTRACT.curlRetryMaxTimeSeconds <= HOOK_RETRY_CONTRACT.timeoutSeconds;
+}
+
+/**
+ * One curl invocation per hook event. A UUID is minted once, sent as
+ * `x-plimsoll-event-id` on every retry, and appended to the per-host producer
+ * log so accepted ids reconcile to ledger ids. Failures stay visible: there is
+ * no `|| true`.
+ */
+export function generateHookForwardCommand(options: ToolConfigOptions, source: "codex" | "grok") {
   // curl into the local receiver keeps per-event overhead at ~10ms; spawning
   // pnpm/node per hook event costs 1-2s per tool call across the whole fleet.
   // The producer token lives only in a private 0600 header file, so neither the
@@ -62,7 +92,41 @@ function hookForwardCommand(options: ToolConfigOptions, source: "codex" | "grok"
       `${source === "grok" ? "Grok" : "Codex"} managed header file must be an absolute path.`,
     );
   }
-  return `${curlCommand} -s --max-time 2 -X POST -H 'Content-Type: application/json' -H ${shellQuote(`@${headerFile}`)} --data-binary @- http://127.0.0.1:${port(options)}/hooks/${source} || true`;
+  const url = `http://127.0.0.1:${port(options)}/hooks/${source}`;
+  const retryFlags = [
+    "-sS",
+    "--fail",
+    `--retry ${HOOK_RETRY_CONTRACT.curlRetry}`,
+    "--retry-all-errors",
+    `--retry-max-time ${HOOK_RETRY_CONTRACT.curlRetryMaxTimeSeconds}`,
+    `--max-time ${HOOK_RETRY_CONTRACT.curlMaxTimeSeconds}`,
+  ].join(" ");
+  return [
+    "id=$(uuidgen | tr '[:upper:]' '[:lower:]')",
+    'log="${PLIMSOLL_HOME:-$HOME/.plimsoll}/producer-parity/hooks.jsonl"',
+    'mkdir -p "$(dirname "$log")"',
+    `code=$(${curlCommand} ${retryFlags} -X POST -H 'Content-Type: application/json' -H x-plimsoll-event-id:$id -H ${shellQuote(`@${headerFile}`)} --data-binary @- -o /dev/null -w '%{http_code}' ${url})`,
+    "st=$?",
+    `printf '{"v":1,"id":"%s","src":"${source}","http":"%s","exit":%s,"ts":"%s"}\\n' "$id" "$code" "$st" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$log"`,
+    '[ "$code" = 202 ]',
+  ].join("; ");
+}
+
+function hookForwardCommand(options: ToolConfigOptions, source: "codex" | "grok") {
+  return generateHookForwardCommand(options, source);
+}
+
+function claudeHttpHook(
+  hookUrl: string,
+  hookHeaders: Record<string, string> | undefined,
+) {
+  return {
+    type: "http" as const,
+    url: hookUrl,
+    ...(hookHeaders ? { headers: hookHeaders } : {}),
+    timeout: HOOK_RETRY_CONTRACT.timeoutSeconds,
+    retry: HOOK_RETRY_CONTRACT.curlRetry,
+  };
 }
 
 function port(options: ToolConfigOptions) {
@@ -98,39 +162,18 @@ export function generateClaudeCodeSettings(options: ToolConfigOptions) {
     hooks: {
       UserPromptSubmit: [
         {
-          hooks: [
-            {
-              type: "http",
-              url: hookUrl,
-              ...(hookHeaders ? { headers: hookHeaders } : {}),
-              timeout: 5,
-            },
-          ],
+          hooks: [claudeHttpHook(hookUrl, hookHeaders)],
         },
       ],
       PostToolUse: [
         {
           matcher: ".*",
-          hooks: [
-            {
-              type: "http",
-              url: hookUrl,
-              ...(hookHeaders ? { headers: hookHeaders } : {}),
-              timeout: 5,
-            },
-          ],
+          hooks: [claudeHttpHook(hookUrl, hookHeaders)],
         },
       ],
       Stop: [
         {
-          hooks: [
-            {
-              type: "http",
-              url: hookUrl,
-              ...(hookHeaders ? { headers: hookHeaders } : {}),
-              timeout: 5,
-            },
-          ],
+          hooks: [claudeHttpHook(hookUrl, hookHeaders)],
         },
       ],
     },
@@ -142,6 +185,9 @@ export function generateCodexConfigToml(options: ToolConfigOptions) {
 
   const command = hookForwardCommand(options, "codex");
   const basePort = port(options);
+  // Codex honors both this inline `headers = { ... }` form and a
+  // `[otel.*."otlp-http".headers]` subtable (the documented form). Setup writes
+  // the inline form; apply heals a seat-template subtable missing x-plimsoll-source.
   const exporterTable = (signalPath: string) => [
     `endpoint = ${tomlString(`http://127.0.0.1:${basePort}${signalPath}`)}`,
     'protocol = "json"',
@@ -178,7 +224,7 @@ export function generateCodexConfigToml(options: ToolConfigOptions) {
     "[[hooks.UserPromptSubmit.hooks]]",
     'type = "command"',
     `command = ${tomlString(command)}`,
-    "timeout = 5",
+    `timeout = ${HOOK_RETRY_CONTRACT.timeoutSeconds}`,
     'statusMessage = "Recording AI work metadata"',
     "",
     "[[hooks.PostToolUse]]",
@@ -186,14 +232,14 @@ export function generateCodexConfigToml(options: ToolConfigOptions) {
     "[[hooks.PostToolUse.hooks]]",
     'type = "command"',
     `command = ${tomlString(command)}`,
-    "timeout = 5",
+    `timeout = ${HOOK_RETRY_CONTRACT.timeoutSeconds}`,
     'statusMessage = "Recording AI tool metadata"',
     "",
     "[[hooks.Stop]]",
     "[[hooks.Stop.hooks]]",
     'type = "command"',
     `command = ${tomlString(command)}`,
-    "timeout = 5",
+    `timeout = ${HOOK_RETRY_CONTRACT.timeoutSeconds}`,
     'statusMessage = "Recording AI session metadata"',
     "",
   ].join("\n");
@@ -231,7 +277,7 @@ export const generateGeminiSettings = generateGeminiCliSettings;
 export function generateGrokHookSettings(options: ToolConfigOptions) {
   assertSupportedDataMode(options);
   const command = `if [ -n "\${GROK_HOOK_EVENT:-}" ]; then ${hookForwardCommand(options, "grok")}; fi`;
-  const handler = { type: "command", command, timeout: 5 };
+  const handler = { type: "command", command, timeout: HOOK_RETRY_CONTRACT.timeoutSeconds };
   return {
     hooks: {
       UserPromptSubmit: [{ hooks: [{ ...handler }] }],
