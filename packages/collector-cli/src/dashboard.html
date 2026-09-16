@@ -79,6 +79,7 @@ header.mast{
   box-shadow:0 0 8px var(--signal-red)}
 .lamp.ok i{background:var(--signal-green); box-shadow:0 0 8px var(--signal-green)}
 .lamp.warn i{background:var(--signal-amber); box-shadow:0 0 8px var(--signal-amber)}
+.lamp.quiet i{background:var(--waterline); box-shadow:0 0 8px var(--waterline)}
 .crumbs{font-size:10px; color:var(--foam-faint); letter-spacing:.1em; margin:6px 0 26px}
 .crumbs b{color:var(--foam-dim); font-weight:400}
 
@@ -230,6 +231,7 @@ tr.row:focus-visible{background:rgba(35,137,167,.12)}
 .watch-dot.green{background:var(--signal-green);box-shadow:0 0 6px var(--signal-green)}
 .watch-dot.amber{background:var(--signal-amber);box-shadow:0 0 6px var(--signal-amber)}
 .watch-dot.red{background:var(--signal-red);box-shadow:0 0 6px var(--signal-red)}
+.watch-dot.quiet{background:var(--waterline);box-shadow:0 0 6px var(--waterline)}
 .foam{color:var(--foam)}
 .foam-dim{color:var(--foam-dim)}
 .drawer-title{font-size:10px;letter-spacing:.24em;color:var(--foam-faint);text-transform:uppercase}
@@ -759,7 +761,8 @@ function renderWatch(health,projection,d){
   const target=clear($("#watch-rows"));
   const ago=value=>{if(!value)return"never";const minutes=Math.round((Date.now()-Date.parse(value))/60000);return minutes<1?"just now":minutes<60?minutes+"m ago":Math.round(minutes/60*10)/10+"h ago"};
   const addWatch=(status,name,reason)=>{
-    const row=node("span",null,"watch-row"),dot=node("i",null,"watch-dot "+(status==="green"?"green":status==="amber"?"amber":"red")),label=node("b",name,"foam");
+    const tone=status==="green"?"green":status==="amber"?"amber":status==="no_events"?"quiet":"red";
+    const row=node("span",null,"watch-row"),dot=node("i",null,"watch-dot "+tone),label=node("b",name,"foam");
     dot.setAttribute("aria-hidden","true");add(row,dot,label," — ",reason);target.appendChild(row);
   };
   for(const item of health.sources||[]){
@@ -775,9 +778,11 @@ function renderSnapshot(d){
   const days=Number(d.window?.days??s.days??30);
   $("#window-label").textContent=days>=1825?"all history":days>=365?"1 year":days>=182?"6 months":days+" days";
   const health=status.health||{overall:"green",sources:[]},projection=d.projection||{status:"stale",degraded:true};
-  const lampState=projection.degraded&&health.overall==="green"?"amber":health.overall;
-  $("#lamp").classList.toggle("ok",lampState==="green"&&!projection.degraded);$("#lamp").classList.toggle("warn",lampState==="amber");
-  const lampMsg=projection.status==="stale"?"projection stale — serving last coherent sounding":lampState==="green"?"collecting":"capture "+(lampState==="amber"?"degraded":"failure")+" — see capture watch";
+  const lampState=projection.degraded&&(health.overall==="green"||health.overall==="no_events")?"amber":health.overall;
+  $("#lamp").classList.toggle("ok",lampState==="green"&&!projection.degraded);
+  $("#lamp").classList.toggle("warn",lampState==="amber");
+  $("#lamp").classList.toggle("quiet",lampState==="no_events");
+  const lampMsg=projection.status==="stale"?"projection stale — serving last coherent sounding":lampState==="green"?"collecting":lampState==="no_events"?"no events captured yet":"capture "+(lampState==="amber"?"degraded":"failure")+" — see capture watch";
   if($("#lamp-text").textContent!==lampMsg)$("#lamp-text").textContent=lampMsg;
   renderWatch(health,projection,d);
   const t=s.totals||{},figure=clear($("#fig-cost")),cost=usd(t.costUsd);
@@ -867,7 +872,7 @@ async function refresh(redrawOnly=false){
     if(!dashboardCache)throw new Error("projection_backfilling");
     renderSnapshot(dashboardCache);
   }catch(e){
-    $("#lamp").classList.remove("ok"); $("#lamp").classList.add("warn");
+    $("#lamp").classList.remove("ok","quiet"); $("#lamp").classList.add("warn");
     $("#lamp-text").textContent=String(e&&e.message)==="projection_backfilling"?"projection backfilling":"collector unreachable";
   }
 }

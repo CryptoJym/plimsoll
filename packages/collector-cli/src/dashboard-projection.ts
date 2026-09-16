@@ -165,7 +165,7 @@ function sessionCountFreshness(eventAt:string|null,sessionAt:string|null,count:n
   return {state,lagMs,detail};
 }
 
-type CaptureScanState="complete"|"in_progress"|"limit_reached"|"deferred"|"error"|"unknown"|"not_applicable";
+type CaptureScanState="complete"|"in_progress"|"limit_reached"|"deferred"|"unknown"|"not_applicable";
 
 function parseCaptureScan(value:unknown):CaptureScanProgress|null{
   if(typeof value!=="string"||!value)return null;
@@ -201,20 +201,21 @@ function describeScanRoots(scan:CaptureScanProgress){
  * matching `CaptureScanProgress.entriesThisSweep`/`entriesThisTick`. Candidate
  * *files* are printed only by the `candidate(s) pending` clause, so the two
  * units never share a word (bead eco-6hoxj.78, REVIEW-73-r3 finding 5).
+ *
+ * `last_error_code` is not a scan state (bead eco-6hoxj.73.2, REVIEW-73 r1 F6).
+ * Tailers never published `receipt.error`; the previous `error` branch was dead.
  */
 function describeCaptureScan(local:Record<string,unknown>|undefined):
   {state:CaptureScanState;summary:string;scan:CaptureScanProgress|null}{
   if(!local)return{state:"unknown",summary:"activity scan has not published a receipt yet",scan:null};
   const scan=parseCaptureScan(local.scanJson);
-  const errorCode=local.lastErrorCode?String(local.lastErrorCode):null;
-  if(!Number(local.truncated)&&!errorCode)return{state:"complete",summary:"activity scan complete",scan};
+  if(!Number(local.truncated))return{state:"complete",summary:"activity scan complete",scan};
   const budget=scan
     ?`${describeScanRoots(scan)}, `+
       `${scan.entriesThisSweep} entr(ies) this sweep, ${scan.entriesThisTick} this tick `+
       `(budget ${scan.entryBudgetPerTick} entries/${scan.wallBudgetMsPerTick}ms per tick, `+
       `lifetime limit ${scan.lifetimeEntryLimit}), ${scan.pendingFiles} candidate(s) pending`
     :`no scan budget receipt; ${Number(local.discoveryEntries??0)} entr(ies) this tick`;
-  if(errorCode)return{state:"error",summary:`activity scan error ${errorCode} — ${budget}`,scan};
   if(scan?.limitReached)return{state:"limit_reached",
     summary:`activity scan hit its lifetime entry limit and restarts instead of resuming — ${budget}`,scan};
   if(scan?.deferredBeforeIo)return{state:"deferred",
@@ -3557,7 +3558,7 @@ export class DashboardProjectionStore {
     const activityRows=this.db.prepare(
       `select source,last_activity_at as lastActivityAt,files_today as filesToday,
         discovery_entries as discoveryEntries,last_scan_at as lastScanAt,
-        last_error_code as lastErrorCode,truncated,scan_json as scanJson from capture_activity_state`,
+        truncated,scan_json as scanJson from capture_activity_state`,
     ).all() as Array<Record<string,unknown>>;
     const activity=new Map(activityRows.map((row)=>[String(row.source),row]));
     const sources=CAPTURE_HEALTH_SOURCES.map(({source,capture})=>{
@@ -3684,9 +3685,12 @@ export class DashboardProjectionStore {
           truncated:Boolean(local?.truncated),scanState:scan.state,scan:scan.scan}};
     });
     // `no_events` is a distinct, visible status, not a degradation: an
-    // unconfigured or unused source must never make a capturing host amber.
+    // unused source must never make a capturing host amber. When every
+    // source is `no_events`, overall is `no_events` too — a green overall
+    // is a healthy host, not an empty one (bead eco-6hoxj.73.2, REVIEW-73 r1 F5).
     const rank={green:0,no_events:0,amber:1,red:2};
-    const overall=sources.reduce<"green"|"amber"|"red">(
+    const overall=sources.every((row)=>row.status==="no_events")?"no_events":
+      sources.reduce<"green"|"amber"|"red">(
       (worst,row)=>row.status!=="no_events"&&rank[row.status]>rank[worst]?row.status:worst,"green");
     return {generatedAt:now.toISOString(),overall,sources};
   }

@@ -43,6 +43,12 @@ does not transfer its sessions to a tailer.
 
 ### Fixed
 
+- Capture health `overall` is `no_events` when every configured source has
+  captured nothing yet, so a green lamp cannot hide an empty host. Mixed
+  unused sources still leave a capturing host green.
+- Activity-scan `error` / `lastErrorCode` is no longer a capture-health scan
+  state. Tailers never published it; `last_error_code` remains a finance
+  column only.
 - A managed-config reconcile that loses the state-file lock still writes its
   apply/refuse receipt; the stamp, backoff map and backup record retry on the
   next tick. The event-loop chunk proof uses a CI-safe bound so a cold runner

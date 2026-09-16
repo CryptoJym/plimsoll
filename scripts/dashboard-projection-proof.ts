@@ -1649,6 +1649,91 @@ async function main() {
       { sources: emptyHealth.sources.map((row) => `${row.source}:${row.status}`),
         overall: emptyHealth.overall });
 
+    // Bead eco-6hoxj.73.2, REVIEW-73 r1 F5: when every configured source is
+    // no_events, overall must not read as a healthy host. Mixed unused
+    // sources still leave overall green (check above).
+    const neverCaptured = new LocalEventBuffer(path.join(root, "capture-health-all-no-events.sqlite"));
+    for (const source of ["claude_code", "codex"] as const) {
+      neverCaptured.projection.recordCaptureActivity({
+        source,
+        lastActivityAt: null,
+        filesToday: 0,
+        discoveryEntries: 12,
+        lastScanAt: new Date(NOW.getTime() - 30_000).toISOString(),
+        truncated: false,
+        scan: { ...MANY_ROOT_SCAN, converging: false, sweepComplete: true, rootsStarted: 22, pendingFiles: 0 },
+      });
+    }
+    settle(neverCaptured, NOW, 30);
+    const neverCapturedHealth = readySnapshot(neverCaptured, 30).status.health as {
+      overall: string;
+      sources: Array<{ source: string; status: string; reason: string }>;
+    };
+    check("overall_is_no_events_when_every_configured_source_has_no_events",
+      neverCapturedHealth.sources.length === 3 &&
+      neverCapturedHealth.sources.every((row) => row.status === "no_events") === true &&
+      neverCapturedHealth.overall === "no_events",
+      { sources: neverCapturedHealth.sources.map((row) => `${row.source}:${row.status}`),
+        overall: neverCapturedHealth.overall });
+    check("overall_only_lamp_does_not_treat_no_events_as_healthy_or_failure",
+      html.includes('classList.toggle("quiet",lampState==="no_events")') &&
+      html.includes('lampState==="no_events"?"no events captured yet"') &&
+      html.includes(".lamp.quiet i") &&
+      html.includes('status==="no_events"?"quiet"'),
+      { lampQuiet: html.includes(".lamp.quiet i") });
+
+    // Bead eco-6hoxj.73.2, REVIEW-73 r1 F6: `receipt.error` still stamps
+    // `last_error_code` for finance, but it is not a capture-health scan state.
+    // Restoring the dead `describeCaptureScan` error branch fails both checks.
+    const errorScan = new LocalEventBuffer(path.join(root, "capture-health-scan-error.sqlite"));
+    errorScan.append(event({
+      source: "codex", sessionId: uuid(910_101),
+      observedAt: new Date(NOW.getTime() - 5 * 60_000).toISOString(),
+      inputTokens: 10, outputTokens: 5, costUsd: 0.001,
+    }));
+    errorScan.projection.recordCaptureActivity({
+      source: "codex",
+      lastActivityAt: new Date(NOW.getTime() - 6 * 60_000).toISOString(),
+      filesToday: 1,
+      discoveryEntries: 12,
+      lastScanAt: new Date(NOW.getTime() - 30_000).toISOString(),
+      truncated: false,
+      error: "scan failed",
+      scan: { ...MANY_ROOT_SCAN, converging: false, sweepComplete: true, rootsStarted: 22, pendingFiles: 0 },
+    });
+    settle(errorScan, NOW, 30);
+    const errorScanHealth = readySnapshot(errorScan, 30).status.health as {
+      overall: string;
+      sources: Array<{ source: string; status: string; activityState: { scanState: string; truncated: boolean } }>;
+    };
+    const errorScanCodex = errorScanHealth.sources.find((row) => row.source === "codex")!;
+    const storedErrorCode = errorScan.database.prepare(
+      `select last_error_code as lastErrorCode from capture_activity_state where source=?`,
+    ).get("codex") as { lastErrorCode: string | null };
+    check("receipt_error_stamps_last_error_code_without_scanstate_error",
+      typeof storedErrorCode.lastErrorCode === "string" && storedErrorCode.lastErrorCode.length > 0 &&
+      errorScanCodex.activityState.scanState === "complete" &&
+      errorScanCodex.status === "green",
+      { lastErrorCode: storedErrorCode.lastErrorCode, scanState: errorScanCodex.activityState.scanState,
+        status: errorScanCodex.status });
+    errorScan.projection.recordCaptureActivity({
+      source: "codex",
+      lastActivityAt: new Date(NOW.getTime() - 6 * 60_000).toISOString(),
+      filesToday: 1,
+      discoveryEntries: MANY_ROOT_SCAN.entriesThisTick,
+      lastScanAt: new Date(NOW.getTime() - 30_000).toISOString(),
+      truncated: true,
+      error: "scan failed",
+      scan: MANY_ROOT_SCAN,
+    });
+    settle(errorScan, NOW, 30);
+    const truncatedErrorCodex = (readySnapshot(errorScan, 30).status.health as {
+      sources: Array<{ source: string; activityState: { scanState: string } }>;
+    }).sources.find((row) => row.source === "codex")!;
+    check("receipt_error_does_not_outrank_truncated_scan_progress",
+      truncatedErrorCodex.activityState.scanState === "in_progress",
+      { scanState: truncatedErrorCodex.activityState.scanState });
+
     // Bead eco-6hoxj.73 r2, finding 1: `lastEventAt` is a monotone max and the
     // age behind the freshness credit is signed, so one future-dated event must
     // never buy a green label — least of all on a hook-only source, where the
@@ -3485,6 +3570,8 @@ async function main() {
     live.fixture.close();
     staleEvents.fixture.close();
     empty.close();
+    neverCaptured.close();
+    errorScan.close();
     skewedGrok.close();
     skewedDead.close();
     baselineBuffer.close();
