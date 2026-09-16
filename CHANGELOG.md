@@ -67,6 +67,12 @@ does not transfer its sessions to a tailer.
   `x-plimsoll-source` (and the producer token when provisioned), and first-line
   token/body rejections name the closed route so hook vs OTLP is visible
   without a collector restart.
+- `forward-hook-http` mints a stable event id before the first attempt so a
+  spool replay after a connection reset, a closed socket, or a request timeout
+  cannot double-count the event. The client now spools those unknown-outcome
+  classes as well as 503, 408, and ECONNREFUSED. A body that already carries a
+  UUID is unchanged; a body with no id still gets a fresh UUID on the
+  collector's own intake.
 - Capture-health names sub-minute future skew in seconds, never renders `NaNm`
   for an unparseable `last_event_at` (fail-safe amber), and keeps future-amber
   rather than lag-red when the ledger watermark is ahead of the clock

@@ -38,7 +38,7 @@ import {
   classifyRejectionClient,
   createRejectionDiagnostics,
 } from "../packages/collector-cli/src/rejection-diagnostics";
-import { inferSource } from "../packages/collector-cli/src/normalizer";
+import { inferSource, isUuid } from "../packages/collector-cli/src/normalizer";
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import { toolSourceSchema } from "../packages/shared/src/index";
 
@@ -722,7 +722,16 @@ exec /usr/bin/curl "$@"
           url: String(input),
           tokenMatched: headers.get("x-plimsoll-token") === auth.grokProducer,
           sourceMatched: headers.get("x-plimsoll-source") === "grok",
-          bodyMatched: init?.body === '{"hookEventName":"user_prompt_submit"}',
+          bodyMatched: typeof init?.body === "string" && (() => {
+            try {
+              const parsed = JSON.parse(init.body as string) as Record<string, unknown>;
+              return parsed.hookEventName === "user_prompt_submit" &&
+                typeof parsed.id === "string" &&
+                isUuid(parsed.id);
+            } catch {
+              return false;
+            }
+          })(),
         };
         return new Response("", { status: 202 });
       },

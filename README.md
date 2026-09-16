@@ -77,26 +77,30 @@ ways:
   the disk refuses, or `PLIMSOLL_HOOK_SPOOL=off`), the answer stays exactly
   today's 503 so the loss stays visible.
 - **The `forward-hook-http` client**, for a host whose hook runs that command.
-  It spools when the collector answers 503, answers 408
-  (`request_deadline_exceeded`), or is not listening at all (connection refused
-  during a managed update window).
+  It mints a stable event id before the first attempt and spools when the
+  collector answers 503, answers 408 (`request_deadline_exceeded`), is not
+  listening at all (connection refused during a managed update window), or
+  the socket dies after the request was sent (ECONNRESET, a closed socket,
+  request timeout). A replay of a request the collector already committed is
+  the same ledger row.
 
 What is still lost: a request whose **body never finished arriving** (the 408 —
 there is nothing whole to spool), and, for the `http`/`curl` hooks, a post that
 never reaches a listening collector at all (connection refused — the collector
 is not there to spool it, and those hooks have no Plimsoll process of their own
-to do it for them; `forward-hook-http` hosts do spool that case).
+to do it for them; `forward-hook-http` hosts do spool that case). Those managed
+hooks do not run the command, so they do not mint an id and they do not spool
+a reset.
 
-The spool is **at-most-once**: every one of those outcomes proves the collector
-stored nothing, so a spooled event is never a duplicate — with one documented exception: if the publication flush fails and the rollback of the unacknowledged envelope is also refused (the double-fault residual described below), a visible envelope can remain behind a 503 and be replayed. At the intake, the 503
-class is raised only when the ledger write did not commit — the durable append
-runs in a single `BEGIN IMMEDIATE` transaction that SQLite has rolled back by
-the time the busy error escapes it — and it is the only outcome that is spooled
-there. The window the spool does not close is the collector dying mid-request —
-a connection reset or a closed socket after the body was sent may mean the row
-was already written, so that event still fails loudly and is lost rather than
-risk double-counting it in cost and usage. Closing that window needs idempotent
-replay (a client-minted event id) and is tracked separately.
+The `forward-hook-http` spool is **exactly-once**: the command writes a UUID
+onto the body before the live POST, carries that same body in the spool file,
+and the ledger ignores a duplicate id on insert. That is what makes it safe to
+spool the unknown-outcome classes — a reset or closed socket after a committed
+202. The intake spool is still only the 503 class, which still proves the
+collector stored nothing. The documented exception on either path is the
+double-fault residual described below: if the publication flush fails and the
+rollback of the unacknowledged envelope is also refused, a visible envelope
+can remain behind a 503 and be replayed.
 
 What is on disk is **not** the raw body. Before the file is written — by either
 writer, through the same function — the collector's own pre-write suppression
