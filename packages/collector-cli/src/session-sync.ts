@@ -25,15 +25,12 @@ import {
  * fail-closed semantics) as a `kind: "session_sync"` batch.
  *
  * Invariants (the upload-history house rules):
- * - The ledger is opened strictly READ-ONLY (or borrowed from the daemon's
- *   live handle for the 5-minute-sync path — reads only). Nothing here marks
- *   rows or touches collector.config.json.
- * - Idempotency comes from deterministic session ids, not local state: the
- *   cloud upserts by id with a grow-only guard, so re-sending the same
- *   snapshots updates rows in place with identical values — run twice over
- *   the same --until, nothing changes (the cloud reports what it did:
- *   inserted/updated/skippedStale). No resume watermark: the whole walk is
- *   cheap (thousands of sessions, not hundreds of thousands of events).
+ * - Event rows are never marked. The daemon's live handle is borrowed for
+ *   snapshot reads; it also stores one `maintenance_state` horizon row so a
+ *   restart can catch up without `upload-history --sessions`.
+ * - Idempotency comes from deterministic session ids: the cloud upserts by
+ *   id with a grow-only guard, so re-sending the same snapshots updates rows
+ *   in place. The daemon horizon only remembers which local walk succeeded.
  * - Privacy parity: only canonical linkage hashes, privacy-safe actor aliases
  *   and typed counters cross. Raw non-UUID session ids are deterministically
  *   replaced and never leave the machine. The shared outbound sealer runs
@@ -101,8 +98,10 @@ export function collectSessionSnapshots(
   ledger: Database.Database,
   options: { until: string; sessionIds?: string[] },
 ): SessionSnapshot[] {
-  // SQLite caps bind variables (999 on conservative builds). A daemon cycle
-  // can touch up to 5×500 events; chunk the id filter well under the cap.
+  // An explicit empty id list is "send nothing", never an omitted filter
+  // (omitting sessionIds is the full walk). SQLite caps bind variables
+  // (999 on conservative builds); chunk well under that cap.
+  if (options.sessionIds && options.sessionIds.length === 0) return [];
   if (options.sessionIds && options.sessionIds.length > 400) {
     const out: SessionSnapshot[] = [];
     for (let start = 0; start < options.sessionIds.length; start += 400) {
@@ -236,6 +235,265 @@ export function sessionIdsFromBatches(batches: Array<AiWorkIngestBatch | null>):
     }
   }
   return [...ids];
+}
+
+/**
+ * Durable daemon session-sync horizon (eco-6hoxj.70.1).
+ *
+ * The 5-minute path used to refresh only session ids from just-uploaded
+ * event batches plus an in-memory pending set. A 503/budget failure that
+ * outlived the process, or a ledger session whose events were already
+ * marked uploaded, never entered a later touched window — hosted ingest
+ * then had to be repaired with `upload-history --sessions`.
+ *
+ * The planner keeps that fast path and adds a ledger catch-up: until one
+ * full walk succeeds, every cycle walks every eligible session; after that,
+ * a cycle sends pending ids, just-uploaded batch ids, and sessions with
+ * `created_at` after the last successful horizon. Restart reloads the row.
+ */
+export const DAEMON_SESSION_SYNC_STATE_KEY = "session_sync_daemon_v1";
+export const DAEMON_SESSION_SYNC_SCHEMA_VERSION = 1 as const;
+const MAX_PENDING_SESSION_IDS = 8_000;
+const MAX_SESSION_ID_CHARS = 128;
+
+export type DaemonSessionSyncState = {
+  schemaVersion: typeof DAEMON_SESSION_SYNC_SCHEMA_VERSION;
+  /** False until a full ledger walk has been accepted. */
+  caughtUp: boolean;
+  lastSuccessfulUntil: string | null;
+  pendingSessionIds: string[];
+};
+
+export type DaemonSessionSyncPlan = {
+  skip: boolean;
+  /** Omit (undefined) for a full walk; otherwise the incremental id set. */
+  sessionIds: string[] | undefined;
+  until: string;
+  reason: "full_catchup" | "incremental" | "skip";
+  state: DaemonSessionSyncState;
+};
+
+export function emptyDaemonSessionSyncState(): DaemonSessionSyncState {
+  return {
+    schemaVersion: DAEMON_SESSION_SYNC_SCHEMA_VERSION,
+    caughtUp: false,
+    lastSuccessfulUntil: null,
+    pendingSessionIds: [],
+  };
+}
+
+function ensureSessionSyncStateTable(db: Database.Database) {
+  db.exec(`
+    create table if not exists maintenance_state (
+      key text primary key,
+      value text not null,
+      updated_at text not null
+    );
+  `);
+}
+
+function sanitizeSessionIds(ids: unknown): string[] | null {
+  if (!Array.isArray(ids)) return null;
+  if (ids.length > MAX_PENDING_SESSION_IDS) return null;
+  const unique: string[] = [];
+  const seen = new Set<string>();
+  for (const value of ids) {
+    if (typeof value !== "string") return null;
+    const id = value.trim();
+    if (!id || id.length > MAX_SESSION_ID_CHARS) return null;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    unique.push(id);
+  }
+  return unique;
+}
+
+function mergeSessionIds(...groups: Array<Iterable<string>>): string[] {
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const group of groups) {
+    for (const value of group) {
+      const id = value.trim();
+      if (!id || id.length > MAX_SESSION_ID_CHARS || seen.has(id)) continue;
+      seen.add(id);
+      out.push(id);
+    }
+  }
+  return out;
+}
+
+export function loadDaemonSessionSyncState(db: Database.Database): DaemonSessionSyncState {
+  const empty = emptyDaemonSessionSyncState();
+  try {
+    ensureSessionSyncStateTable(db);
+    const row = db.prepare("select value from maintenance_state where key = ?").get(
+      DAEMON_SESSION_SYNC_STATE_KEY,
+    ) as { value?: unknown } | undefined;
+    if (!row || typeof row.value !== "string") return empty;
+    const parsed = JSON.parse(row.value) as {
+      schemaVersion?: unknown;
+      caughtUp?: unknown;
+      lastSuccessfulUntil?: unknown;
+      pendingSessionIds?: unknown;
+    };
+    const pendingSessionIds = sanitizeSessionIds(parsed.pendingSessionIds);
+    if (
+      parsed?.schemaVersion !== DAEMON_SESSION_SYNC_SCHEMA_VERSION ||
+      typeof parsed.caughtUp !== "boolean" ||
+      pendingSessionIds === null ||
+      !(parsed.lastSuccessfulUntil === null || typeof parsed.lastSuccessfulUntil === "string")
+    ) {
+      return empty;
+    }
+    if (
+      typeof parsed.lastSuccessfulUntil === "string" &&
+      Number.isNaN(Date.parse(parsed.lastSuccessfulUntil))
+    ) {
+      return empty;
+    }
+    return {
+      schemaVersion: DAEMON_SESSION_SYNC_SCHEMA_VERSION,
+      caughtUp: parsed.caughtUp,
+      lastSuccessfulUntil: parsed.lastSuccessfulUntil,
+      pendingSessionIds,
+    };
+  } catch {
+    return empty;
+  }
+}
+
+export function saveDaemonSessionSyncState(
+  db: Database.Database,
+  state: DaemonSessionSyncState,
+): void {
+  ensureSessionSyncStateTable(db);
+  const pendingSessionIds = sanitizeSessionIds(state.pendingSessionIds);
+  const record: DaemonSessionSyncState =
+    pendingSessionIds === null
+      ? emptyDaemonSessionSyncState()
+      : {
+          schemaVersion: DAEMON_SESSION_SYNC_SCHEMA_VERSION,
+          caughtUp: Boolean(state.caughtUp),
+          lastSuccessfulUntil: state.lastSuccessfulUntil,
+          pendingSessionIds,
+        };
+  db.prepare(
+    `insert into maintenance_state (key, value, updated_at) values (?, ?, ?)
+     on conflict(key) do update set value = excluded.value, updated_at = excluded.updated_at`,
+  ).run(DAEMON_SESSION_SYNC_STATE_KEY, JSON.stringify(record), new Date().toISOString());
+}
+
+/** Eligible ledger session ids, optionally only those with created_at after `since`. */
+export function listLedgerSessionIds(
+  ledger: Database.Database,
+  options: { until: string; since?: string | null; extraIds?: string[] },
+): string[] {
+  const eventPrivacyEligible = terminalPrivacyEligibilitySql(ledger, "e");
+  const filters: string[] = [
+    "e.session_id is not null",
+    eventPrivacyEligible,
+    "e.created_at <= @until",
+  ];
+  const params: Record<string, unknown> = { until: options.until };
+  if (options.since) {
+    filters.push("e.created_at > @since");
+    params.since = options.since;
+  }
+  const rows = ledger
+    .prepare(
+      `select distinct e.session_id as sessionId
+       from buffered_events e
+       where ${filters.join(" and ")}`,
+    )
+    .all(params) as Array<{ sessionId: string }>;
+  return mergeSessionIds(
+    rows.map((row) => row.sessionId),
+    options.extraIds ?? [],
+  );
+}
+
+/**
+ * Decide which sessions this daemon cycle must push. `sessionIds: undefined`
+ * means a full walk (the first catch-up). An empty incremental set skips.
+ */
+export function planDaemonSessionSync(input: {
+  db: Database.Database;
+  state: DaemonSessionSyncState;
+  uploadedBatches: Array<AiWorkIngestBatch | null>;
+  until: string;
+}): DaemonSessionSyncPlan {
+  const until = input.until;
+  const fromBatches = sessionIdsFromBatches(input.uploadedBatches);
+  const pending = mergeSessionIds(input.state.pendingSessionIds, fromBatches);
+  if (!input.state.caughtUp) {
+    return {
+      skip: false,
+      sessionIds: undefined,
+      until,
+      reason: "full_catchup",
+      state: { ...input.state, pendingSessionIds: pending },
+    };
+  }
+  const sessionIds = listLedgerSessionIds(input.db, {
+    until,
+    since: input.state.lastSuccessfulUntil,
+    extraIds: pending,
+  });
+  if (sessionIds.length === 0) {
+    return {
+      skip: true,
+      sessionIds: [],
+      until,
+      reason: "skip",
+      state: { ...input.state, pendingSessionIds: [] },
+    };
+  }
+  if (sessionIds.length > MAX_PENDING_SESSION_IDS) {
+    return {
+      skip: false,
+      sessionIds: undefined,
+      until,
+      reason: "full_catchup",
+      state: { ...input.state, caughtUp: false, pendingSessionIds: pending },
+    };
+  }
+  return {
+    skip: false,
+    sessionIds,
+    until,
+    reason: "incremental",
+    state: { ...input.state, pendingSessionIds: sessionIds },
+  };
+}
+
+export function commitDaemonSessionSyncSuccess(
+  _state: DaemonSessionSyncState,
+  until: string,
+): DaemonSessionSyncState {
+  return {
+    schemaVersion: DAEMON_SESSION_SYNC_SCHEMA_VERSION,
+    caughtUp: true,
+    lastSuccessfulUntil: until,
+    pendingSessionIds: [],
+  };
+}
+
+export function commitDaemonSessionSyncFailure(
+  state: DaemonSessionSyncState,
+  attemptedIds: string[] | undefined,
+): DaemonSessionSyncState {
+  if (!state.caughtUp || attemptedIds === undefined) {
+    return {
+      ...state,
+      caughtUp: false,
+      pendingSessionIds: mergeSessionIds(state.pendingSessionIds, attemptedIds ?? []),
+    };
+  }
+  const pendingSessionIds = mergeSessionIds(attemptedIds);
+  if (pendingSessionIds.length > MAX_PENDING_SESSION_IDS) {
+    return { ...state, caughtUp: false, pendingSessionIds: [] };
+  }
+  return { ...state, pendingSessionIds };
 }
 
 export type SessionAuditCell = {

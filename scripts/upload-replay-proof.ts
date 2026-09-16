@@ -845,6 +845,47 @@ async function replayHintGatesOnActionableSaturationProof() {
   );
 }
 
+// Review r1 residual: selecting exactly `--limit` actionable rows is the whole
+// pool, not saturation. A larger `--limit` cannot reach another row, so the
+// hint must stay off.
+async function replayHintDoesNotFireOnExactLimitProof() {
+  const { buffer, cfg } = enabledBuffer();
+  await seedWitness(cfg, buffer, 240, 980);
+  const ids = [uuid(241), uuid(242)];
+  for (const n of [241, 242]) buffer.append(event(n, { source: "grok" }));
+  await uploadBufferedEvents(cfg, buffer, {
+    fetchImpl: sourceRejectingCloud(new Set(ids)),
+    now: () => instant(981),
+  });
+  for (const id of ids) {
+    buffer.database.prepare(`delete from buffered_events where id = ?`).run(id);
+  }
+  const exact = buffer.delivery.replayDeadLetters({
+    reason: "remote_validation_rejected",
+    limit: 2,
+    dryRun: true,
+    now: instant(982),
+  });
+  const raised = buffer.delivery.replayDeadLetters({
+    reason: "remote_validation_rejected",
+    limit: 3,
+    dryRun: true,
+    now: instant(983),
+  });
+  record(
+    "replay_hint_does_not_fire_when_the_pool_is_exactly_limit",
+    exact.selected === 2 &&
+      exact.requeued === 0 &&
+      exact.skipped.missingRaw === 2 &&
+      exact.hint === undefined &&
+      raised.selected === 2 &&
+      raised.requeued === 0 &&
+      raised.hint === undefined,
+    { exact, raised },
+  );
+  buffer.close();
+}
+
 // 9. Review r2, finding 2 (probe B): --limit is a budget for WORK, so it binds
 //    what is re-queued and never truncates the skip report. Three inert rows
 //    and two actionable ones at --limit 1: one re-queue, all three skips.
@@ -1089,6 +1130,7 @@ async function main() {
     await replayBoundsProof();
     await replayLimitCountsOnlyActionableProof();
     await replayHintGatesOnActionableSaturationProof();
+    await replayHintDoesNotFireOnExactLimitProof();
     await replayReportsInertSkipsUnboundedProof();
     await replayCountsReDiedDeliveryOnceProof();
     cliSurfaceProof();

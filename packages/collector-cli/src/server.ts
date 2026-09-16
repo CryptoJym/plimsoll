@@ -301,8 +301,8 @@ function bodyCarriesItsOwnTime(payload: Record<string, unknown>) {
  * Give a recovered event the time the HOOK fired, not the time the drain got to
  * it (review r2, F1).
  *
- * `normalizeHookPayload` falls back to `new Date()` for a body with no time of
- * its own, and no real hook body carries one — so before r3 every recovered
+ * `normalizeHookPayload` falls back to the injected receive clock for a body
+ * with no time of its own, and no real hook body carries one — so before r3 every recovered
  * event was stamped with the recovery clock, skewed by the whole spool latency
  * (a managed-update restart, a deferred tick, up to doctor's 600 s stall
  * threshold). `observed_at` drives retention cutoffs and every cost/usage time
@@ -1112,9 +1112,10 @@ export function createCollectorServer(
         return;
       }
 
-      // Issue 0056 (#104): the only unauthenticated surface. Minimal by
-      // construction — no runtime identity, counters, delivery, or ledger
-      // state of any kind.
+      // Issue 0056 (#104) / eco-6hoxj.154: the only unauthenticated surface.
+      // Minimal by construction — no version, runtime identity, counters,
+      // delivery, or ledger state. Fleet liveness is this route; /status stays
+      // behind the management credential.
       if (request.method === "GET" && request.url === "/healthz") {
         sendJson(response, { ok: true });
         return;
@@ -1515,6 +1516,12 @@ export function createCollectorServer(
           return;
         }
         rejectionDiagnostics.recordAccepted(source);
+        if (normalized.futureTimestampClampedEvents) {
+          console.log(JSON.stringify({
+            status: "hook_capture",
+            futureTimestampClampedEvents: normalized.futureTimestampClampedEvents,
+          }));
+        }
         response.writeHead(202, { "content-type": "application/json" });
         response.end(
           JSON.stringify({
@@ -1522,6 +1529,9 @@ export function createCollectorServer(
             continue: true,
             eventId: normalized.event.id,
             suppressedFields: normalized.suppressedFields,
+            ...(normalized.futureTimestampClampedEvents
+              ? { futureTimestampClampedEvents: normalized.futureTimestampClampedEvents }
+              : {}),
             ...(normalized.deduplicated ? { deduplicated: true } : {}),
             ...(normalized.collisionQuarantined
               ? { collisionQuarantined: true }
@@ -1632,12 +1642,21 @@ export function createCollectorServer(
           })
         );
         rejectionDiagnostics.recordAccepted(source);
+        if (normalized.futureTimestampClampedEvents) {
+          console.log(JSON.stringify({
+            status: "hook_capture",
+            futureTimestampClampedEvents: normalized.futureTimestampClampedEvents,
+          }));
+        }
         response.writeHead(202, { "content-type": "application/json" });
         response.end(
           JSON.stringify({
             accepted: true,
             eventId: normalized.event.id,
             suppressedFields: normalized.suppressedFields,
+            ...(normalized.futureTimestampClampedEvents
+              ? { futureTimestampClampedEvents: normalized.futureTimestampClampedEvents }
+              : {}),
           }),
         );
         return;

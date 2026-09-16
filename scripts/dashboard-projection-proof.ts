@@ -11,9 +11,11 @@ import Database from "better-sqlite3";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import {
+  DASHBOARD_SCHEMA_SHAPE_DIGEST,
   DASHBOARD_SCHEMA_VERSION,
   DASHBOARD_WINDOWS,
   DashboardProjectionStore,
+  dashboardProjectionSchemaShapeDigest,
 } from "../packages/collector-cli/src/dashboard-projection";
 import {
   dashboardAccounts,
@@ -1730,13 +1732,13 @@ async function main() {
 
     // Bead eco-6hoxj.73.3: the two checks above are the last line of defence —
     // they prove the LABEL stays honest once a future stamp is already in the
-    // ledger. These prove the stamp never gets there. The OTLP path has held the
-    // shared `maxFutureTimestampSkewMs` bound for a long time; the hook intake
-    // and the transcript/rollout record timestamps reached `observedAt` without
-    // it, and `last_event_at` is a monotone max, so one stamp from the future
-    // held the freshness credit forward for the whole skew interval on a source
-    // that may be dead — with no later event able to correct it on a hook-only
-    // source. Both intakes now clamp to the receive clock and say so.
+    // ledger. These prove the stamp never gets there on the tailers. The OTLP
+    // path has held the shared `maxFutureTimestampSkewMs` bound for a long
+    // time; transcript/rollout record timestamps reached `observedAt` without
+    // it, and `last_event_at` is a monotone max. The hook intake's alias
+    // validator already refused far-future observedAt and fell to the receive
+    // clock, so the hook checks below guard the health LABEL and the clamp
+    // telemetry, not the watermark.
     const SKEW_MS = ANALYTICAL_METADATA_LIMITS.maxFutureTimestampSkewMs;
     const INTAKE_FUTURE_AT = new Date(NOW.getTime() + 25 * 60 * 60_000).toISOString();
     const INTAKE_NEAR_AT = new Date(NOW.getTime() + 2 * 60_000).toISOString();
@@ -1755,13 +1757,14 @@ async function main() {
     // touches a timestamp, so this IS the hook intake path for `observedAt`.
     const hookConfig = collectorConfigSchema.parse({});
     const hookFixture = new LocalEventBuffer(path.join(root, "intake-clamp-hook.sqlite"));
-    const postHook = (observedAt: string, session: number) => appendForwardedHook({
+    const hookNow = () => NOW.getTime();
+    const postHook = (observedAt: string, session: number, now = hookNow) => appendForwardedHook({
       hook_event_name: "Stop",
       session_id: uuid(session),
       observedAt,
       input_tokens: 1_200,
       output_tokens: 340,
-    }, { config: hookConfig, buffer: hookFixture, source: "grok" });
+    }, { config: hookConfig, buffer: hookFixture, source: "grok", now });
     postHook(new Date(NOW.getTime() - 10 * 60_000).toISOString(), 941_001);
     settle(hookFixture, NOW, 30);
     const hookBefore = lifetimeEventAt(hookFixture, "grok");
@@ -1770,22 +1773,39 @@ async function main() {
     settle(hookFixture, NOW, 30);
     const hookAfter = lifetimeEventAt(hookFixture, "grok");
     const hookAfterRow = healthRow(hookFixture, "grok");
-    check("a_future_dated_hook_observed_at_is_clamped_at_intake_and_cannot_advance_last_event_at",
-      // The event is kept — the tokens are real — but stamped with the receive
-      // clock, flagged, and unable to move the lifetime watermark past it.
+    check("a_future_dated_hook_observed_at_is_clamped_at_intake_and_cannot_buy_a_future_health_label",
+      // The alias validator already refused a far-future observedAt and fell
+      // to the receive clock, so this path was never watermark-vulnerable.
+      // The clamp's job is the LABEL: flag the rewrite, keep the event, and
+      // refuse the "in the future" health label a poisoned stamp would buy.
+      // `futureTimestampClampedEvents` is the operator-visible telemetry;
+      // `observedAtFutureClamped` stays local-only (stripped outbound).
       clampedHook.event.observedAt === NOW.toISOString() &&
       clampedHook.event.metadata.observedAtFutureClamped === true &&
+      clampedHook.futureTimestampClampedEvents === 1 &&
+      clampedHook.suppressedFields.includes("observedAtFutureClamped") &&
       hookAfter !== INTAKE_FUTURE_AT &&
-      hookAfter !== null && Date.parse(hookAfter) <= NOW.getTime() + SKEW_MS &&
-      Date.parse(hookAfter) >= Date.parse(hookBefore!) &&
-      // ...and the label it would otherwise have bought is not on offer.
       hookAfterRow.lastEventAgeMs !== null && hookAfterRow.lastEventAgeMs >= 0 &&
       !hookAfterRow.reason.includes("in the future"),
       { before: hookBefore, after: hookAfter, future: INTAKE_FUTURE_AT,
         observedAt: clampedHook.event.observedAt,
         clampedFlag: clampedHook.event.metadata.observedAtFutureClamped,
+        clampedEvents: clampedHook.futureTimestampClampedEvents,
+        suppressed: clampedHook.suppressedFields,
         beforeStatus: hookBeforeRow.status, afterStatus: hookAfterRow.status,
         afterReason: hookAfterRow.reason, afterAgeMs: hookAfterRow.lastEventAgeMs });
+
+    // The injected receive clock, not the proof's Date.now patch, is what the
+    // hook clamp measures against. A seam 45s ahead of NOW still clamps the
+    // +25h stamp onto that clock.
+    const seamNow = new Date(NOW.getTime() + 45_000);
+    const seamHook = postHook(INTAKE_FUTURE_AT, 941_010, () => seamNow.getTime());
+    check("a_future_dated_hook_observed_at_uses_the_injected_receive_clock_not_date_now",
+      seamHook.event.observedAt === seamNow.toISOString() &&
+      seamHook.futureTimestampClampedEvents === 1 &&
+      seamHook.event.metadata.observedAtFutureClamped === true,
+      { observedAt: seamHook.event.observedAt, seam: seamNow.toISOString(),
+        patchedNow: NOW.toISOString(), clamped: seamHook.futureTimestampClampedEvents });
 
     // The negative control on the same intake: a stamp inside the bound is a
     // clock-skewed producer, not a poisoned one, and must still advance.
@@ -1794,9 +1814,10 @@ async function main() {
     check("a_hook_observed_at_inside_the_skew_bound_is_untouched_and_still_advances_last_event_at",
       nearHook.event.observedAt === INTAKE_NEAR_AT &&
       nearHook.event.metadata.observedAtFutureClamped === undefined &&
+      nearHook.futureTimestampClampedEvents === undefined &&
       lifetimeEventAt(hookFixture, "grok") === INTAKE_NEAR_AT,
       { observedAt: nearHook.event.observedAt, lifetime: lifetimeEventAt(hookFixture, "grok"),
-        near: INTAKE_NEAR_AT });
+        near: INTAKE_NEAR_AT, clamped: nearHook.futureTimestampClampedEvents });
     hookFixture.close();
 
     // The other unguarded intake: a transcript/rollout RECORD timestamp, which
@@ -1902,6 +1923,137 @@ async function main() {
       { lifetime: lifetimeEventAt(tailerFixture, "codex"), near: INTAKE_NEAR_AT,
         clamped: nearRolloutScan.futureTimestampClampedEvents });
     tailerFixture.close();
+
+    // F4: a clamped rewrite that enrolment then refuses must not count.
+    // Enrolment starts 60s after the receive clock, so the clamped stamp is
+    // before_enrollment. eventsAppended stays 0; the counter must too.
+    const enrolledWorkspace = uuid(944_001);
+    const enrolledCutoff = new Date(NOW.getTime() + 60_000);
+    const writeEnrolledTranscript = (dir: string, session: string, at: string, tokens: number) => {
+      const directory = path.join(dir, "intake-project");
+      fs.mkdirSync(directory, { recursive: true });
+      fs.writeFileSync(path.join(directory, `${session}.jsonl`), `${JSON.stringify({
+        type: "assistant",
+        timestamp: at,
+        message: { id: `msg-${session}`, model: "claude-opus-5",
+          usage: { input_tokens: tokens, output_tokens: 0 } },
+      })}\n`);
+    };
+    const enrolledTranscriptRoot = path.join(root, "intake-clamp-enrolled-transcript");
+    const enrolledTranscript = new LocalEventBuffer(
+      path.join(root, "intake-clamp-enrolled-transcript.sqlite"),
+      { workspaceId: enrolledWorkspace, enrollmentNow: () => enrolledCutoff },
+    );
+    writeEnrolledTranscript(enrolledTranscriptRoot, uuid(944_002), INTAKE_FUTURE_AT, 150);
+    const enrolledTranscriptScan = await (async () => {
+      const tailer = new TranscriptTailer(enrolledTranscript, enrolledTranscriptRoot);
+      try { return await tailer.scan({ scope: "full" }); } finally { tailer.close(); }
+    })();
+    check("a_future_dated_transcript_refused_at_enrolment_does_not_count_as_a_clamp",
+      enrolledTranscriptScan.eventsAppended === 0 &&
+      enrolledTranscriptScan.futureTimestampClampedEvents === undefined &&
+      (enrolledTranscriptScan.enrollmentExcludedEvents ?? 0) >= 1,
+      { appended: enrolledTranscriptScan.eventsAppended,
+        clamped: enrolledTranscriptScan.futureTimestampClampedEvents,
+        excluded: enrolledTranscriptScan.enrollmentExcludedEvents });
+    enrolledTranscript.close();
+
+    const writeEnrolledRollout = (dir: string, session: string, at: string, tokens: number) => {
+      const directory = path.join(dir, "2026", "07", "15");
+      fs.mkdirSync(directory, { recursive: true });
+      const anchorAt = new Date(NOW.getTime() - 60 * 60_000).toISOString();
+      const tokenCount = (timestamp: string, total: number) => ({
+        type: "event_msg", timestamp,
+        payload: { type: "token_count", info: { total_token_usage: {
+          input_tokens: total, cached_input_tokens: 0, output_tokens: 0,
+          reasoning_output_tokens: 0 } } },
+      });
+      fs.writeFileSync(path.join(directory, `rollout-${session}.jsonl`), [
+        { type: "session_meta", timestamp: anchorAt, payload: { id: session } },
+        { type: "turn_context", payload: { model: "gpt-5.5" } },
+        tokenCount(anchorAt, 0),
+        tokenCount(at, tokens),
+      ].map((record) => JSON.stringify(record)).join("\n") + "\n");
+    };
+    const enrolledRolloutRoot = path.join(root, "intake-clamp-enrolled-rollout");
+    const enrolledRollout = new LocalEventBuffer(
+      path.join(root, "intake-clamp-enrolled-rollout.sqlite"),
+      { workspaceId: enrolledWorkspace, enrollmentNow: () => enrolledCutoff },
+    );
+    writeEnrolledRollout(enrolledRolloutRoot, uuid(944_003), INTAKE_FUTURE_AT, 150);
+    const enrolledRolloutScan = await (async () => {
+      const tailer = new RolloutTailer(enrolledRollout, enrolledRolloutRoot, () => []);
+      try { return await tailer.scan({ scope: "full" }); } finally { tailer.close(); }
+    })();
+    check("a_future_dated_rollout_refused_at_enrolment_does_not_count_as_a_clamp",
+      enrolledRolloutScan.eventsAppended === 0 &&
+      enrolledRolloutScan.futureTimestampClampedEvents === undefined &&
+      (enrolledRolloutScan.enrollmentExcludedEvents ?? 0) >= 1,
+      { appended: enrolledRolloutScan.eventsAppended,
+        clamped: enrolledRolloutScan.futureTimestampClampedEvents,
+        excluded: enrolledRolloutScan.enrollmentExcludedEvents });
+    enrolledRollout.close();
+
+    // F5: a missing record stamp that falls back to a future file mtime must
+    // count as a clamp, not rewrite silently.
+    const futureMtime = new Date(NOW.getTime() + 25 * 60 * 60_000);
+    const mtimeTranscriptRoot = path.join(root, "intake-clamp-mtime-transcript");
+    const mtimeTranscriptFile = path.join(mtimeTranscriptRoot, "intake-project", `${uuid(945_001)}.jsonl`);
+    fs.mkdirSync(path.dirname(mtimeTranscriptFile), { recursive: true });
+    fs.writeFileSync(mtimeTranscriptFile, `${JSON.stringify({
+      type: "assistant",
+      message: { id: `msg-${uuid(945_001)}`, model: "claude-opus-5",
+        usage: { input_tokens: 50, output_tokens: 0 } },
+    })}\n`);
+    fs.utimesSync(mtimeTranscriptFile, futureMtime, futureMtime);
+    const mtimeTranscript = new LocalEventBuffer(path.join(root, "intake-clamp-mtime-transcript.sqlite"));
+    const mtimeTranscriptScan = await (async () => {
+      const tailer = new TranscriptTailer(mtimeTranscript, mtimeTranscriptRoot);
+      try { return await tailer.scan({ scope: "full" }); } finally { tailer.close(); }
+    })();
+    const mtimeTranscriptAt = (mtimeTranscript.database.prepare(
+      `select observed_at as at from buffered_events`,
+    ).get() as { at: string } | undefined)?.at;
+    check("a_future_mtime_fallback_on_a_transcript_without_a_stamp_counts_as_a_clamp",
+      mtimeTranscriptScan.futureTimestampClampedEvents === 1 &&
+      mtimeTranscriptScan.eventsAppended === 1 &&
+      mtimeTranscriptAt === NOW.toISOString(),
+      { clamped: mtimeTranscriptScan.futureTimestampClampedEvents,
+        appended: mtimeTranscriptScan.eventsAppended, observedAt: mtimeTranscriptAt });
+    mtimeTranscript.close();
+
+    const mtimeRolloutRoot = path.join(root, "intake-clamp-mtime-rollout");
+    const mtimeRolloutFile = path.join(mtimeRolloutRoot, "2026", "07", "15", `rollout-${uuid(945_002)}.jsonl`);
+    fs.mkdirSync(path.dirname(mtimeRolloutFile), { recursive: true });
+    const mtimeAnchorAt = new Date(NOW.getTime() - 60 * 60_000).toISOString();
+    fs.writeFileSync(mtimeRolloutFile, [
+      { type: "session_meta", timestamp: mtimeAnchorAt, payload: { id: uuid(945_002) } },
+      { type: "turn_context", payload: { model: "gpt-5.5" } },
+      { type: "event_msg",
+        payload: { type: "token_count", info: { total_token_usage: {
+          input_tokens: 0, cached_input_tokens: 0, output_tokens: 0,
+          reasoning_output_tokens: 0 } } } },
+      { type: "event_msg",
+        payload: { type: "token_count", info: { total_token_usage: {
+          input_tokens: 50, cached_input_tokens: 0, output_tokens: 0,
+          reasoning_output_tokens: 0 } } } },
+    ].map((record) => JSON.stringify(record)).join("\n") + "\n");
+    fs.utimesSync(mtimeRolloutFile, futureMtime, futureMtime);
+    const mtimeRollout = new LocalEventBuffer(path.join(root, "intake-clamp-mtime-rollout.sqlite"));
+    const mtimeRolloutScan = await (async () => {
+      const tailer = new RolloutTailer(mtimeRollout, mtimeRolloutRoot, () => []);
+      try { return await tailer.scan({ scope: "full" }); } finally { tailer.close(); }
+    })();
+    const mtimeRolloutAt = (mtimeRollout.database.prepare(
+      `select observed_at as at from buffered_events order by observed_at desc`,
+    ).get() as { at: string } | undefined)?.at;
+    check("a_future_mtime_fallback_on_a_rollout_without_a_stamp_counts_as_a_clamp",
+      mtimeRolloutScan.futureTimestampClampedEvents === 1 &&
+      mtimeRolloutScan.eventsAppended === 1 &&
+      mtimeRolloutAt === NOW.toISOString(),
+      { clamped: mtimeRolloutScan.futureTimestampClampedEvents,
+        appended: mtimeRolloutScan.eventsAppended, observedAt: mtimeRolloutAt });
+    mtimeRollout.close();
 
     // .80: session windows can trail the source lifetime clock by days. The
     // status reader must expose that gap rather than convert SUM(NULL) to a
@@ -2181,8 +2333,9 @@ async function main() {
     const afterTickStatus=rolledBack.projection.status();
     const afterTickRead=rolledBack.projection.readSnapshot(30);
     const versionLeftAlone=(rolledBack.database.prepare(
-      `select schema_version as version from dashboard_projection_control where singleton=1`)
-      .get() as {version:number}).version;
+      `select schema_version as version, degraded_reason as reason
+       from dashboard_projection_control where singleton=1`)
+      .get() as {version:number;reason:string|null});
     check("a_projection_written_by_a_newer_schema_is_refused_not_served_frozen_green",
       frozenSnapshots>0&&
         refusedStatus.degradedReason==="projection_schema_newer"&&refusedStatus.ready===false&&
@@ -2190,11 +2343,13 @@ async function main() {
         refusedTick.ready===false&&refusedTick.degraded===true&&
         afterTickStatus.degradedReason==="projection_schema_newer"&&afterTickStatus.ready===false&&
         afterTickRead.kind!=="ready"&&
-        versionLeftAlone===DASHBOARD_SCHEMA_VERSION+1,
+        versionLeftAlone.version===DASHBOARD_SCHEMA_VERSION+1&&
+        versionLeftAlone.reason==="projection_schema_newer",
       {frozenSnapshots,refusedReason:refusedStatus.degradedReason,refusedKind:refusedRead.kind,
         tick:{ready:refusedTick.ready,degraded:refusedTick.degraded},
         afterKind:afterTickRead.kind,afterReason:afterTickStatus.degradedReason,
-        storedVersion:versionLeftAlone,binaryVersion:DASHBOARD_SCHEMA_VERSION});
+        storedVersion:versionLeftAlone.version,storedReason:versionLeftAlone.reason,
+        binaryVersion:DASHBOARD_SCHEMA_VERSION});
     rolledBack.close();
 
     // The forward half of the same guard. A projection written before the
@@ -2262,11 +2417,95 @@ async function main() {
       {brokenBeforeRollback,brokenAfterRollback});
 
     const releaseNote=fs.readFileSync(path.join(import.meta.dirname,"..","README.md"),"utf8");
+    const owedRebuild=fs.readFileSync(
+      path.join(import.meta.dirname,"..","issues","0177-loss-aware-projection-rebuild.md"),"utf8");
     check("the_release_note_documents_the_schema_guard_and_the_manual_rollback",
       releaseNote.includes("projection_schema_newer")&&
         releaseNote.includes("alter table dashboard_session_source_window drop column last_token_event_at")&&
         releaseNote.includes("alter table dashboard_session_repair_source drop column last_token_event_at"),
       {});
+    check("the_loss_aware_rebuild_is_filed_as_owed_work",
+      owedRebuild.includes("Loss-aware dashboard projection rebuild")&&
+        owedRebuild.includes("owed")&&
+        releaseNote.includes("issues/0177-loss-aware-projection-rebuild.md")&&
+        releaseNote.includes("owed work, not shipped"),
+      {});
+
+    const compactBacklogPath=path.join(root,"projection-schema-newer-compact-backlog.sqlite");
+    const compactBacklog=new LocalEventBuffer(compactBacklogPath);
+    compactBacklog.append(event({source:"grok",sessionId:uuid(940_040),observedAt:downgradeTokenAt,
+      inputTokens:400,outputTokens:50,costUsd:0.001}));
+    settle(compactBacklog,NOW,30);
+    compactBacklog.close();
+    const compactBacklogDb=new Database(compactBacklogPath);
+    compactBacklogDb.prepare(
+      `update dashboard_projection_control set schema_version=?, compact_summary_migration_complete=0
+       where singleton=1`,
+    ).run(DASHBOARD_SCHEMA_VERSION+1);
+    compactBacklogDb.exec(`insert or ignore into dashboard_compact_gc_days
+      (bucket_day,revision,processing_revision,high_water_segment,cursor_segment,
+       last_schedule,queued_at,updated_at)
+      values ('2026-07-01',1,0,null,0,0,'2026-07-15T12:00:00.000Z','2026-07-15T12:00:00.000Z')`);
+    compactBacklogDb.close();
+    const compactBacklogRefused=new LocalEventBuffer(compactBacklogPath);
+    const compactStored=(compactBacklogRefused.database.prepare(
+      `select degraded_reason as reason, compact_summary_migration_complete as complete
+       from dashboard_projection_control where singleton=1`)
+      .get() as {reason:string|null;complete:number});
+    compactBacklogRefused.append(event({source:"grok",sessionId:uuid(940_041),
+      observedAt:new Date(NOW.getTime()-60_000).toISOString(),inputTokens:10,outputTokens:5}));
+    const compactAfterInsert=(compactBacklogRefused.database.prepare(
+      `select degraded_reason as reason from dashboard_projection_control where singleton=1`)
+      .get() as {reason:string|null}).reason;
+    check("compact_summary_migration_does_not_relabel_projection_schema_newer_in_the_control_row",
+      compactStored.reason==="projection_schema_newer"&&compactStored.complete===0&&
+        compactBacklogRefused.projection.status().degradedReason==="projection_schema_newer"&&
+        compactAfterInsert==="projection_schema_newer",
+      {compactStored,compactAfterInsert});
+    compactBacklogRefused.close();
+
+    const missingRowPath=path.join(root,"projection-control-row-missing.sqlite");
+    const missingRow=new LocalEventBuffer(missingRowPath);
+    missingRow.append(event({source:"grok",sessionId:uuid(940_050),observedAt:downgradeTokenAt,
+      inputTokens:300,outputTokens:40,costUsd:0.001}));
+    settle(missingRow,NOW,30);
+    const greenBeforeMissing=(readySnapshot(missingRow,30).status.health as {sources:CountHealth[]})
+      .sources.find(row=>row.source==="grok")!;
+    check("control_row_missing_fixture_starts_from_a_green_published_session_count",
+      greenBeforeMissing.status==="green"&&greenBeforeMissing.tokenSessionsToday===1,
+      {row:greenBeforeMissing});
+    missingRow.close();
+    const missingRowDb=new Database(missingRowPath);
+    missingRowDb.exec(`delete from dashboard_projection_control`);
+    const tableStillThere=Boolean(missingRowDb.prepare(
+      `select 1 from sqlite_master where type='table' and name='dashboard_projection_control'`,
+    ).get());
+    missingRowDb.close();
+    const missingRowReopened=new LocalEventBuffer(missingRowPath);
+    const missingStatus=missingRowReopened.projection.status();
+    const missingStored=(missingRowReopened.database.prepare(
+      `select degraded_reason as reason, ready from dashboard_projection_control where singleton=1`)
+      .get() as {reason:string|null;ready:number});
+    const missingRead=missingRowReopened.projection.readSnapshot(30);
+    const missingTick=missingRowReopened.projection.runMaintenance(NOW);
+    check("a_control_table_without_its_row_is_refused_not_treated_as_fresh",
+      tableStillThere&&
+        missingStatus.degradedReason==="projection_control_missing"&&missingStatus.ready===false&&
+        missingStored.reason==="projection_control_missing"&&missingStored.ready===0&&
+        missingRead.kind!=="ready"&&
+        missingTick.ready===false&&missingTick.degraded===true,
+      {missingStatus,missingStored,missingKind:missingRead.kind,
+        tick:{ready:missingTick.ready,degraded:missingTick.degraded}});
+    missingRowReopened.close();
+
+    const shapeLedger=new LocalEventBuffer(path.join(root,"projection-schema-shape-pin.sqlite"));
+    const liveShapeDigest=dashboardProjectionSchemaShapeDigest(shapeLedger.database);
+    check("dashboard_schema_shape_digest_matches_the_version_pin",
+      liveShapeDigest===DASHBOARD_SCHEMA_SHAPE_DIGEST&&
+        /^sha256:[0-9a-f]{64}$/.test(DASHBOARD_SCHEMA_SHAPE_DIGEST),
+      {liveShapeDigest,pinned:DASHBOARD_SCHEMA_SHAPE_DIGEST,version:DASHBOARD_SCHEMA_VERSION,
+        hint:"If dashboard_* shape changed, bump DASHBOARD_SCHEMA_VERSION and DASHBOARD_SCHEMA_SHAPE_DIGEST together. Do not update the digest in place."});
+    shapeLedger.close();
 
     // Standing rule for this file pair: every tailer fix ships its twin check
     // on the other tailer (r1/r2/r3 lesson of eco-6hoxj.73).

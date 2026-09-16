@@ -39,6 +39,7 @@ import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 import crypto from "node:crypto";
 import fs from "node:fs";
+import { createRequire } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import { parse as parseToml } from "smol-toml";
@@ -1130,6 +1131,59 @@ function stateIntegrityChecks(fixtureRoot: string) {
     },
   );
 
+  // review r3, N2: a lock timeout after the apply used to drop the receipt.
+  // Hold the same sibling SQLite lock the cadence uses, then run an apply.
+  const lockHome = path.join(fixtureRoot, "lock-timeout-home");
+  fs.mkdirSync(lockHome, { recursive: true, mode: 0o700 });
+  const lockStatePath = managedConfigReconcileStatePath(lockHome);
+  const lockPath = path.join(lockHome, `.${path.basename(lockStatePath)}.mutation.lock.sqlite`);
+  const Sqlite = createRequire(path.join(repoRoot, "packages/collector-cli/src/config.ts"))(
+    "better-sqlite3",
+  ) as new (file: string) => {
+    pragma: (sql: string) => void;
+    exec: (sql: string) => void;
+    inTransaction: boolean;
+    close: () => void;
+  };
+  const lockHolder = new Sqlite(lockPath);
+  try {
+    fs.chmodSync(lockPath, 0o600);
+    lockHolder.pragma("busy_timeout = 0");
+    lockHolder.exec("BEGIN IMMEDIATE");
+    const timedOut = runManagedConfigReconcile({
+      collectorHome: lockHome,
+      targets: [seatTarget("lock-timeout-seat")],
+      toolOptions,
+    });
+    const timedOutState = readManagedConfigReconcileState(lockHome);
+    const timedOutReceipt =
+      timedOut.receiptPath !== null && fs.existsSync(timedOut.receiptPath)
+        ? (JSON.parse(fs.readFileSync(timedOut.receiptPath, "utf8")) as { applied?: number })
+        : null;
+    check(
+      "a_lock_timeout_still_writes_the_receipt_for_an_apply_that_happened",
+      timedOut.applied === 1 &&
+        timedOut.receiptPath !== null &&
+        timedOutReceipt?.applied === 1 &&
+        timedOutState.lastRunAt === null &&
+        typeof timedOut.targets[0]?.path === "string" &&
+        fs.existsSync(timedOut.targets[0]!.path),
+      {
+        applied: timedOut.applied,
+        receiptPath: timedOut.receiptPath,
+        lastRunAt: timedOutState.lastRunAt,
+        receipts: receipts(lockHome).length,
+      },
+    );
+  } finally {
+    try {
+      if (lockHolder.inTransaction) lockHolder.exec("ROLLBACK");
+    } catch {
+      // Holder already closed or rolled back.
+    }
+    lockHolder.close();
+  }
+
   // R6: a host with no Plimsoll-local credentials manages nothing at all.
   const unavailableHome = path.join(fixtureRoot, "state-unavailable-home");
   fs.mkdirSync(unavailableHome, { recursive: true, mode: 0o700 });
@@ -1407,7 +1461,11 @@ async function eventLoopBoundChecks(fixtureRoot: string) {
   const asyncMs = Number(process.hrtime.bigint() - asyncStart) / 1e6;
   clearInterval(sampler);
 
-  const LONGEST_CHUNK_BUDGET_MS = 50;
+  // review r3, N1: a 4 ms setInterval sampler on a cold CI runner measured
+  // 51.9 ms once against a 50 ms max. The product invariant is per-target
+  // yield, not a 50 ms wall-clock ceiling; 100 ms still fails a tick that
+  // stopped yielding (fleet-scale sync is several hundred ms).
+  const LONGEST_CHUNK_BUDGET_MS = 100;
   check(
     "the_fleet_scale_fixture_is_the_reviewers_twenty_eight_targets",
     targetCount === SEATS + PROFILES + 2 && readback.targets.length === targetCount,

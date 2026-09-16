@@ -622,7 +622,7 @@ async function main() {
         const dry = lastJson(runCli(["rotate-producer-token", "--source", source, "--dry-run"], env).stdout);
         const dryEntry = (dry.targets ?? []).find((candidate: any) => candidate.path === target);
         const dryMatches = expected.dryRunRefused
-          ? dryEntry?.status === "refused" && expected.reason(String(dryEntry.reason ?? ""))
+          ? dryEntry?.status === "would_refuse" && expected.reason(String(dryEntry.reason ?? ""))
           : dryEntry?.status === "would_rotate";
         const dryMintedNothing = readLocalIngestAuth(plimsollHome)![AUTH_FIELDS[source]] === beforeAuth[AUTH_FIELDS[source]];
         const run = runCli(["rotate-producer-token", "--source", source, "--grace-seconds", "120"], env);

@@ -97,16 +97,20 @@ the ordinary enqueue path. It never uploads: delivery happens on the normal
 `upload` cycles, so it is safe to run while a circuit is open. A replayed
 delivery that is later acknowledged ends with exactly one `upload_receipts` row
 in state `acknowledged`; a second replay of the same delivery is a counted
-no-op. `--limit` defaults to 500 and is capped at 5000, and the transaction is
-bounded by rows, raw bytes and `busy_timeout` like the migration scan. The row
-limit is a budget for work: an already-replayed delivery is still reported as
-skipped, but it never consumes a slot, so a host with a lifetime of replays
-still re-queues the dead letters written today. The skip report is not bounded
-by `--limit` either — the inert arm is selected unbounded (two primary-key
-lookups per row), so 3 already-replayed rows are reported as 3 at `--limit 1`.
+no-op. `--limit` defaults to 500 and is capped at 5000. The write transaction is
+bounded by raw bytes and `busy_timeout` like the migration scan; `--limit` is
+not a transaction bound. The row limit is a budget for work: an already-replayed
+delivery is still reported as skipped, but it never consumes a slot, so a host
+with a lifetime of replays still re-queues the dead letters written today. The
+skip report is not bounded by `--limit` either — the inert arm is selected
+unbounded (O(lifetime replays) at ≈2.6 µs/row, measured; four primary-key
+lookups per row because `classified` is referenced twice and is not
+materialized), so 3 already-replayed rows are reported as 3 at `--limit 1`.
 A delivery that was replayed and then died again is one pool row, not two, so it
-costs one slot and is counted once. When a full `--limit` of *actionable*
-candidates re-queues nothing, the JSON carries a `hint` naming `--since`.
+costs one slot and is counted once. When more than `--limit` *actionable*
+candidates exist and the run re-queues nothing, the JSON carries a `hint`
+naming `--since`. Selecting exactly `--limit` of `--limit` (the whole pool) is
+not saturation and does not raise it.
 
 Output is one JSON object:
 
@@ -117,8 +121,10 @@ Output is one JSON object:
 ```
 
 `hint` appears only when `requeued` is 0 and the *actionable* arm of the
-selection reached `--limit` — never because inert already-replayed rows filled
-it, since neither `--since` nor a larger `--limit` could change that result:
+selection overflowed `--limit` (the query asks for `limit + 1`) — never because
+inert already-replayed rows filled it, and never because the pool happened to
+contain exactly `--limit` actionable rows, since neither `--since` nor a larger
+`--limit` could change that result:
 
 ```json
 { "hint": "selected 500 actionable candidates and re-queued none at --limit 500: narrow the window with --since <ISO-8601> or raise --limit. Already-replayed deliveries are reported as skipped but never consume the limit." }

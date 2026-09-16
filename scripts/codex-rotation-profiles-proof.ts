@@ -405,6 +405,48 @@ function rotationChecks(fixtureRoot: string) {
  * two targets and the exit code are the ones `rotate-producer-token` printed
  * before this bead.
  */
+/**
+ * Review r1 residual: a discovered profile that fails preflight must be
+ * `would_refuse` on --dry-run (never `would_rotate`), and a relocated
+ * profile's receipt path is the link under $HOME, never the resolved
+ * outside-home path.
+ */
+function dryRunRefusedProfileChecks(fixtureRoot: string) {
+  const { home, plimsollHome, profilesRoot, env } = commandHome(fixtureRoot, "refuse-dry-home", 49173);
+  writeProfileConfig(profilesRoot, MANAGED_PROFILES[0], fleetProfileToml());
+  const setup = runCli(["setup", "--yes"], env);
+  const managedFile = path.join(profilesRoot, MANAGED_PROFILES[0], "config.toml");
+  const managedContent = fs.readFileSync(managedFile, "utf8");
+  const outsideDir = path.join(path.dirname(fixtureRoot), "outside-managed-profile");
+  fs.mkdirSync(outsideDir, { recursive: true, mode: 0o700 });
+  fs.writeFileSync(path.join(outsideDir, "config.toml"), managedContent, { mode: 0o600 });
+  fs.symlinkSync(outsideDir, path.join(profilesRoot, "linked-outside-managed"));
+  const credentialBefore = digestOf(path.join(plimsollHome, "local-ingest-auth.json"));
+  const dryRun = runCli(["rotate-producer-token", "--source", "codex", "--dry-run"], env);
+  const payload = lastJson(dryRun.stdout);
+  const targets = payload.targets as Array<Record<string, unknown>>;
+  const refused = targets.find((target) =>
+    String(target.path).includes("linked-outside-managed")
+  );
+  const linkPath = path.join(profilesRoot, "linked-outside-managed", "config.toml");
+  check(
+    "dry_run_reports_a_preflight_refused_discovered_profile_as_would_refuse",
+    setup.code === 0 &&
+      dryRun.code === 0 &&
+      payload.status === "rotation_dry_run" &&
+      refused?.status === "would_refuse" &&
+      String(refused?.reason ?? "").includes("MANAGED_CONFIG_TARGET_OUTSIDE_FIXTURE_ROOT") &&
+      refused?.path === linkPath &&
+      refused?.outsideHome === true &&
+      digestOf(path.join(plimsollHome, "local-ingest-auth.json")) === credentialBefore,
+    {
+      code: dryRun.code,
+      refused: { path: refused?.path, status: refused?.status, outsideHome: refused?.outsideHome },
+      home,
+    },
+  );
+}
+
 function defaultTargetChecks(fixtureRoot: string) {
   const { plimsollHome, codexFile, headerFile, env } = commandHome(fixtureRoot, "no-profiles-home", 49171);
   const setup = runCli(["setup", "--yes"], env);
@@ -506,6 +548,7 @@ function main() {
     rotationChecks(fixture.root);
     defaultTargetChecks(fixture.root);
     doctorPathChecks(fixture.root);
+    dryRunRefusedProfileChecks(fixture.root);
     check(
       "the_fixture_home_the_guard_protects_was_never_created",
       !fs.existsSync(fixture.home),

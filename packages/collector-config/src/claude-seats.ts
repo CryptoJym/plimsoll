@@ -25,6 +25,8 @@ export type ClaudeSeat = {
   path: string;
   /** False when the seat directory carries no settings.json. */
   hasSettings: boolean;
+  /** Errno when the seat directory symlink could not be resolved. */
+  unresolved?: string;
 };
 
 export function claudeSeatsRoot(home: string) {
@@ -34,5 +36,10 @@ export function claudeSeatsRoot(home: string) {
 /** Every seat directory under `<home>/.claude-seats`, slug-ordered. */
 export function discoverClaudeSeats(home: string): ClaudeSeat[] {
   return discoverHomeDirectories(home, CLAUDE_SEATS_DIRECTORY, "settings.json")
-    .map(({ slug, path: file, exists }) => ({ slug, path: file, hasSettings: exists }));
+    .map(({ slug, path: file, exists, unresolved }) => ({
+      slug,
+      path: file,
+      hasSettings: exists,
+      ...(unresolved ? { unresolved } : {}),
+    }));
 }

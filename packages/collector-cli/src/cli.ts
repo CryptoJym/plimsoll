@@ -236,7 +236,15 @@ import { OutcomeTimelineStore } from "./outcome-timeline-store";
 import { formatWeeklyPerformanceMarkdown } from "./performance-layer";
 import { runLearningMaterialization } from "./learning-materializer";
 import { prepareRepoLabelsPush, pushRepoLabels } from "./repo-labels";
-import { runSessionSync, sessionIdsFromBatches } from "./session-sync";
+import {
+  commitDaemonSessionSyncFailure,
+  commitDaemonSessionSyncSuccess,
+  loadDaemonSessionSyncState,
+  planDaemonSessionSync,
+  runSessionSync,
+  saveDaemonSessionSyncState,
+  sessionIdsFromBatches,
+} from "./session-sync";
 import { uploadBufferedEvents } from "./upload";
 import { SyncStorageBusyError, SyncStorageRetryController } from "./sqlite-contention";
 import { runAttributionRepair, runWorkspaceHistoryUpload } from "./upload-history";
@@ -284,7 +292,8 @@ function printHelp() {
 
 Commands:
   start                 Start the local hook/OTLP receiver in the foreground
-  status                Print local buffer and policy status
+  status                Print local buffer and policy status as JSON
+                        (credentialed daemon /status; liveness is GET /healthz)
   maintenance --disable-account-assertion SOURCE --yes
                         Toggle one adapter; writes only account assertion state
   --disable-account-assertion SOURCE
@@ -402,8 +411,9 @@ Config tools:
       Push one snapshot per stitched ledger session (issue 0037) so the workspace
       holds REAL session rows that join to their events. The cloud upserts
       grow-only by deterministic session id — re-running over the same --until
-      changes nothing. The daemon refreshes touched sessions after each 5-minute
-      sync; this command is the full backfill and the post-restart recovery tool.
+      changes nothing. The daemon catch-up-walks until one full push is accepted,
+      then refreshes pending, just-uploaded, and later ledger sessions. This
+      command remains the operator full walk.
   upload-replay --reason <receipt reason> [--since ISO-8601] [--limit N] [--dry-run]
       Supersede dead upload receipts whose reason is remote (remote_validation_rejected,
       remote_rejected_exhausted) and hand their raw rows back to the normal enqueue path.
@@ -412,9 +422,9 @@ Config tools:
       acknowledged is counted as skipped, so re-running is a no-op — and an
       already-replayed row never consumes a slot of --limit and is never truncated by
       it, so a lifetime of replays can never crowd out or hide a dead letter written
-      today. When a full --limit of ACTIONABLE candidates re-queues nothing the JSON
-      carries a hint naming --since; inert skips alone never raise it. --dry-run
-      classifies with zero writes.
+      today. When more than --limit ACTIONABLE candidates exist and the run re-queues
+      nothing the JSON carries a hint naming --since; an exact --limit pool and inert
+      skips alone never raise it. --dry-run classifies with zero writes.
   push-repo-labels [--dry-run] [--yes] [--url URL]
   sync-outcomes --repository owner/repo [--since-days 30] [--rework-window-days 14] [--until ISO] [--dry-run] [--url URL]
       Same fetch surface as the local efficiency report (pull list, check-runs and
@@ -1704,11 +1714,16 @@ const SKIPPED_DISCOVERED_RECEIPTS = {
     key: "profilesSkipped",
     unreadable: "codex_profile_config_unreadable",
     unmanaged: "codex_profile_config_unmanaged",
+    unresolved: "codex_profile_symlink_unresolvable",
+    /** The config file's path through the link under `$HOME` (eco-6hoxj.51). */
+    linkPath: (home: string, slug: string) => path.join(codexProfilesRoot(home), slug, "config.toml"),
   },
   claude_code: {
     key: "seatsSkipped",
     unreadable: "claude_seat_settings_unreadable",
     unmanaged: "claude_seat_settings_unmanaged",
+    unresolved: "claude_seat_symlink_unresolvable",
+    linkPath: (home: string, slug: string) => path.join(claudeSeatsRoot(home), slug, "settings.json"),
   },
 } as const;
 
@@ -1721,13 +1736,14 @@ const SKIPPED_DISCOVERED_RECEIPTS = {
 function skippedDiscoveredReceipt(
   family: keyof typeof SKIPPED_DISCOVERED_RECEIPTS,
   skipped: ReadonlyArray<{ slug: string; path: string; state: string }>,
+  home: string,
 ) {
   if (skipped.length === 0) return {};
   const receipt = SKIPPED_DISCOVERED_RECEIPTS[family];
   return {
     [receipt.key]: skipped.map(({ slug, path: file, state }) => ({
       slug,
-      path: file,
+      ...homeScopedDiscoveredPath(file, receipt.linkPath(home, slug), home),
       status: "skipped" as const,
       reason: state === "malformed" ? receipt.unreadable : receipt.unmanaged,
     })),
@@ -2544,11 +2560,12 @@ async function main() {
     let managedConfigReconcileTimer: NodeJS.Timeout | undefined;
     let syncInFlight = false;
 
-    // Sessions whose snapshot push failed (or was interrupted) carry over to
-    // the next cycle in memory. A daemon restart drops the set — the
-    // `upload-history --sessions` backfill is the stateless recovery tool,
-    // exactly as the event side's recovery is upload-history itself.
-    let pendingSessionIds: string[] = [];
+    // Sessions whose snapshot push failed (or was interrupted) carry over
+    // across cycles and restarts in maintenance_state. Until one full walk
+    // is accepted, each cycle catch-up-walks the ledger so a missed first
+    // refresh does not wait for `upload-history --sessions`.
+    let sessionSyncState = loadDaemonSessionSyncState(buffer.database);
+    let pendingSessionIds: string[] = sessionSyncState.pendingSessionIds;
 
     const runSync = async () => {
       if (!config.uploadUrl || syncInFlight || shuttingDown) return;
@@ -2556,10 +2573,19 @@ async function main() {
       syncInFlight = true;
       const storageRetry = new SyncStorageRetryController();
       const uploadedBatches: Array<Awaited<ReturnType<typeof uploadBufferedEvents>>["batch"]> = [];
+      const persistSessionCarry = () => {
+        sessionSyncState = { ...sessionSyncState, pendingSessionIds };
+        try {
+          saveDaemonSessionSyncState(buffer.database, sessionSyncState);
+        } catch {
+          sessionSyncState = { ...sessionSyncState, caughtUp: false };
+        }
+      };
       const carrySessions = () => {
         pendingSessionIds = [
           ...new Set([...pendingSessionIds, ...sessionIdsFromBatches(uploadedBatches)]),
         ];
+        persistSessionCarry();
       };
       let uploaded = 0;
       let serverRetryAfterMs = 0;
@@ -2593,23 +2619,39 @@ async function main() {
         // rather than issue another request inside a server-directed cooldown.
         if (serverRetryAfterMs > 0) { carrySessions(); return; }
 
-        // Session sync (issue 0037): the sessions whose events just crossed
-        // get their snapshots refreshed — recomputed over the FULL ledger,
-        // pushed as a kind:"session_sync" batch the cloud upserts grow-only.
-        // Isolated failure domain: events are already marked uploaded, so a
-        // session-push error must never look like a sync failure or trigger
-        // the event backoff; the ids simply carry to the next cycle.
+        // Session sync (issue 0037 / eco-6hoxj.70.1): just-uploaded batches
+        // plus durable pending, and a ledger catch-up until the first full
+        // walk is accepted. Isolated failure domain: events are already
+        // marked uploaded, so a session-push or planner error must never
+        // look like a sync failure or trigger the event backoff.
         const touchedSessionIds = [
           ...new Set([...pendingSessionIds, ...sessionIdsFromBatches(uploadedBatches)]),
         ];
-        if (touchedSessionIds.length > 0) {
-          try {
+        try {
+          const sessionPlan = planDaemonSessionSync({
+            db: buffer.database,
+            state: { ...sessionSyncState, pendingSessionIds },
+            uploadedBatches,
+            until: new Date().toISOString(),
+          });
+          sessionSyncState = sessionPlan.state;
+          pendingSessionIds = sessionPlan.state.pendingSessionIds;
+          persistSessionCarry();
+          if (!sessionPlan.skip) {
             const sessionResult = await runSessionSync(config, {
-              sessionIds: touchedSessionIds,
+              ...(sessionPlan.sessionIds !== undefined ? { sessionIds: sessionPlan.sessionIds } : {}),
+              until: sessionPlan.until,
               ledgerDb: buffer.database,
               log: () => undefined,
             });
-            pendingSessionIds = sessionResult.ok ? [] : touchedSessionIds;
+            if (sessionResult.ok) {
+              sessionSyncState = commitDaemonSessionSyncSuccess(sessionSyncState, sessionPlan.until);
+              pendingSessionIds = [];
+            } else {
+              sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, sessionPlan.sessionIds);
+              pendingSessionIds = sessionSyncState.pendingSessionIds;
+            }
+            persistSessionCarry();
             if (sessionResult.ok && sessionResult.sentSessions > 0) {
               console.log(
                 JSON.stringify({
@@ -2630,15 +2672,18 @@ async function main() {
                 JSON.stringify({ warning: "session_sync_failed", message: sessionResult.reason }),
               );
             }
-          } catch (error) {
-            pendingSessionIds = touchedSessionIds;
-            console.warn(
-              JSON.stringify({
-                warning: "session_sync_failed",
-                message: error instanceof Error ? error.message : String(error),
-              }),
-            );
           }
+        } catch (error) {
+          pendingSessionIds = touchedSessionIds;
+          console.warn(
+            JSON.stringify({
+              warning: "session_sync_failed",
+              message: error instanceof Error ? error.message : String(error),
+            }),
+          );
+          sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, touchedSessionIds);
+          pendingSessionIds = sessionSyncState.pendingSessionIds;
+          persistSessionCarry();
         }
       } catch (error) {
         carrySessions();
@@ -3777,6 +3822,7 @@ async function main() {
     };
     type RotateTarget = {
       path: string;
+      slug?: string;
       /** True for a target found on disk rather than declared by Plimsoll. */
       discovered?: true;
       /**
@@ -3795,11 +3841,12 @@ async function main() {
        * Why this target is reported instead of rewritten. `absent`: a managed
        * file this host does not have, which a rotation never creates.
        * `unchanged`: a file that needs no rewrite because another target
-       * carries its token.
+       * carries its token. `unresolved`: a discovered seat or profile whose
+       * directory link cannot be resolved; the rotation is incomplete.
        */
       notRewritten?:
         | { status: "absent" }
-        | { status: "skipped" | "unchanged"; reason: string };
+        | { status: "skipped" | "unchanged" | "unresolved"; reason: string };
       run: (options: typeof rotateOptions, preview: boolean) => ReturnType<typeof applyCodexConfig>;
     };
     /**
@@ -3811,6 +3858,33 @@ async function main() {
       path: file,
       ...(fs.existsSync(file) ? {} : { notRewritten: { status: "absent" as const } }),
       run,
+    });
+    // Discovered seat and profile receipts name the file through its link under
+    // $HOME, never a resolved path outside it (eco-6hoxj.51).
+    const rotateHome = os.homedir();
+    const rotateTargetReceipt = (target: RotateTarget) =>
+      target.discovered && target.slug && (rotateSource === "codex" || rotateSource === "claude_code")
+        ? homeScopedDiscoveredPath(
+            target.path,
+            SKIPPED_DISCOVERED_RECEIPTS[rotateSource].linkPath(rotateHome, target.slug),
+            rotateHome,
+          )
+        : { path: target.path };
+    /**
+     * A discovered seat or profile whose directory link cannot be resolved
+     * (ELOOP, EACCES, a detached volume): it may carry the token but cannot be
+     * read, so it is listed `unresolved`, never rewritten, and the rotation is
+     * incomplete (eco-6hoxj.51 reports it honestly instead of as a skip).
+     */
+    const unresolvedTarget = (
+      family: "codex" | "claude_code",
+      target: { path: string; slug: string },
+    ): RotateTarget => ({
+      path: target.path,
+      slug: target.slug,
+      discovered: true,
+      notRewritten: { status: "unresolved", reason: SKIPPED_DISCOVERED_RECEIPTS[family].unresolved },
+      run: () => { throw new Error(`${target.path}: not rewritten`); },
     });
     const rotateTargets: RotateTarget[] = [];
     let rotateSkipped: ReturnType<typeof skippedDiscoveredReceipt> = {};
@@ -3824,7 +3898,8 @@ async function main() {
       // target uses. A profile without the managed token is not an authenticated
       // consumer and is never provisioned here — `setup` owns that — and one the
       // conductor left unparseable is reported rather than rewritten.
-      const rotateProfiles = discoverCodexProfiles(os.homedir())
+      const discoveredProfiles = discoverCodexProfiles(rotateHome);
+      const rotateProfiles = discoveredProfiles
         .filter((profile) => profile.hasConfig)
         .map((profile) => ({ profile, token: codexProfileTokenState(profile.path) }));
       rotateSkipped = skippedDiscoveredReceipt(
@@ -3832,6 +3907,7 @@ async function main() {
         rotateProfiles
           .filter((entry) => entry.token.state === "unmanaged" || entry.token.state === "malformed")
           .map(({ profile, token }) => ({ slug: profile.slug, path: profile.path, state: token.state })),
+        rotateHome,
       );
       rotateTargets.push(
         {
@@ -3848,6 +3924,7 @@ async function main() {
           .filter((entry) => entry.token.state === "managed" || entry.token.state === "refused")
           .map(({ profile, token }): RotateTarget => ({
             path: profile.path,
+            slug: profile.slug,
             discovered: true,
             run: "reason" in token
               ? () => { throw new Error(token.reason); }
@@ -3857,6 +3934,9 @@ async function main() {
                   managedTarget: `codexProfile[${profile.slug}]`,
                 }),
           })),
+        ...discoveredProfiles
+          .filter((profile) => profile.unresolved)
+          .map((profile) => unresolvedTarget("codex", profile)),
       );
     } else if (rotateSource === "claude_code") {
       // The token lives in `env.OTEL_EXPORTER_OTLP_HEADERS` and the http hook
@@ -3867,30 +3947,40 @@ async function main() {
       // directory without settings.json is listed `absent` (the daemon
       // reconcile includes it too) and never created.
       const claudeFile = argValue("--claude-settings") ?? path.join(os.homedir(), ".claude", "settings.json");
-      const claudeTargets = composeManagedClaudeTargets(claudeFile, os.homedir(), { includeAbsent: true })
-        .map((target) => ({
+      const unresolvedSeats = new Set(
+        discoverClaudeSeats(rotateHome).filter((seat) => seat.unresolved).map((seat) => seat.slug),
+      );
+      const claudeTargets = composeManagedClaudeTargets(claudeFile, rotateHome, { includeAbsent: true })
+        .map((target) => ({ target, slug: target.name.slice("claudeSeat[".length, -1) }))
+        .map(({ target, slug }) => ({
           target,
+          slug,
           token: !target.discovered
             ? { state: "managed" as const }
-            : fs.existsSync(target.path) ? claudeSeatTokenState(target.path) : { state: "absent" as const },
+            : unresolvedSeats.has(slug)
+              ? { state: "unresolved" as const }
+              : fs.existsSync(target.path) ? claudeSeatTokenState(target.path) : { state: "absent" as const },
         }));
       rotateSkipped = skippedDiscoveredReceipt(
         "claude_code",
         claudeTargets
           .filter((entry) => entry.token.state === "unmanaged" || entry.token.state === "malformed")
-          .map(({ target, token }) => ({ slug: target.name.slice("claudeSeat[".length, -1), path: target.path, state: token.state })),
+          .map(({ target, slug, token }) => ({ slug, path: target.path, state: token.state })),
+        rotateHome,
       );
       rotateTargets.push(
         ...claudeTargets
-          .filter((entry) => entry.token.state === "managed" || entry.token.state === "absent" || entry.token.state === "refused")
-          .map(({ target, token }): RotateTarget =>
+          .filter((entry) => entry.token.state !== "unmanaged" && entry.token.state !== "malformed")
+          .map(({ target, slug, token }): RotateTarget =>
             !target.discovered
               ? ownedTarget(target.path, target.run)
-              : token.state === "absent"
-                ? { path: target.path, discovered: true, notRewritten: { status: "absent" }, run: target.run }
-                : "reason" in token
-                  ? { path: target.path, discovered: true, run: () => { throw new Error(token.reason); } }
-                  : { path: target.path, discovered: true, run: target.run }
+              : token.state === "unresolved"
+                ? unresolvedTarget("claude_code", { path: target.path, slug })
+                : token.state === "absent"
+                  ? { path: target.path, slug, discovered: true, notRewritten: { status: "absent" }, run: target.run }
+                  : "reason" in token
+                    ? { path: target.path, slug, discovered: true, run: () => { throw new Error(token.reason); } }
+                    : { path: target.path, slug, discovered: true, run: target.run }
           ),
       );
     } else if (rotateSource === "gemini_cli") {
@@ -4109,16 +4199,19 @@ async function main() {
       // A dry run mints nothing, so the plan lines for the discovered profiles
       // are previewed against a placeholder that is never written and never
       // printed: it only makes the reconciler report the managed exporter
-      // headers a real rotation would rewrite.
+      // headers a real rotation would rewrite. A discovered target that
+      // already refused preflight is would_refuse, not a plan line.
       for (const target of rewritableTargets.filter((entry) => entry.discovered)) {
+        if (preflight.find((entry) => entry.target === target)?.refusal) continue;
         let preview: ReturnType<typeof applyCodexConfig> | undefined;
         try {
           preview = target.run({ ...rotateOptions, [rotateSpec.tokenOption]: ROTATION_PREVIEW_TOKEN }, true);
         } catch {
           preview = undefined;
         }
+        const reportedPath = rotateTargetReceipt(target).path;
         for (const entry of preview?.plan ?? []) {
-          console.log(`${target.path}: ${entry.key} ${entry.action}`);
+          console.log(`${reportedPath}: ${entry.key} ${entry.action}`);
         }
       }
       console.log(JSON.stringify({
@@ -4126,13 +4219,13 @@ async function main() {
         source: rotateSource,
         rotated: false,
         graceSeconds,
-        // A discovered target that already refuses is shown as refused, so the
-        // dry run does not promise a rewrite the real run cannot make.
+        // A discovered target that already refuses is shown as would_refuse, so
+        // the dry run does not promise a rewrite the real run cannot make.
         targets: rotateTargets.map((target) => {
           const refusal = preflight.find((entry) => entry.target === target)?.refusal;
           return {
-            path: target.path,
-            status: target.notRewritten?.status ?? (refusal ? "refused" : "would_rotate"),
+            ...rotateTargetReceipt(target),
+            status: target.notRewritten?.status ?? (refusal ? "would_refuse" : "would_rotate"),
             ...(target.notRewritten && "reason" in target.notRewritten ? { reason: target.notRewritten.reason } : {}),
             ...(refusal ? { reason: refusal } : {}),
           };
@@ -4147,23 +4240,26 @@ async function main() {
       graceMs: graceSeconds * 1000,
     });
     const rotatedOptions = { ...rotateOptions, [rotateSpec.tokenOption]: rotation.auth[rotateSpec.authField] };
-    const rotateResults: Array<{ path: string; status: string; backup: string | null; reason?: string }> = [];
+    const rotateResults: Array<{ path: string; status: string; backup: string | null; reason?: string; outsideHome?: true }> = [];
     // An owned target that refuses or fails halts the run (the targets after it
     // depend on it). A discovered one that refuses or fails does not stop the
     // other discovered targets, but the rotation is still incomplete: that
     // surface keeps the superseded token and stops working at the deadline
     // (review r1 F2). Explicit skips — unmanaged or unreadable seats and
-    // profiles, absent files — are not failures.
+    // profiles, absent files — are not failures; an unresolvable seat or
+    // profile link is.
     let rotateFailure = false;
     let rotateIncomplete = false;
     for (const target of rotateTargets) {
+      const reported = rotateTargetReceipt(target);
       if (rotateFailure) {
-        rotateResults.push({ path: target.path, status: "not_attempted", backup: null });
+        rotateResults.push({ ...reported, status: "not_attempted", backup: null });
         continue;
       }
       if (target.notRewritten) {
+        if (target.notRewritten.status === "unresolved") rotateIncomplete = true;
         rotateResults.push({
-          path: target.path,
+          ...reported,
           status: target.notRewritten.status,
           backup: null,
           ...("reason" in target.notRewritten ? { reason: target.notRewritten.reason } : {}),
@@ -4174,7 +4270,7 @@ async function main() {
       if (preflightRefusal) {
         // Only a discovered target reaches here: an owned refusal returned above.
         rotateIncomplete = true;
-        rotateResults.push({ path: target.path, status: "refused", backup: null, reason: preflightRefusal });
+        rotateResults.push({ ...reported, status: "refused", backup: null, reason: preflightRefusal });
         continue;
       }
       try {
@@ -4182,11 +4278,11 @@ async function main() {
         if (result.conflict) {
           rotateIncomplete = true;
           if (!target.discovered) rotateFailure = true;
-          rotateResults.push({ path: target.path, status: "refused", backup: null, reason: result.conflict });
+          rotateResults.push({ ...reported, status: "refused", backup: null, reason: result.conflict });
           continue;
         }
         rotateResults.push({
-          path: target.path,
+          ...reported,
           status: result.changed ? "rotated" : "unchanged",
           backup: result.backupPath ?? null,
         });
@@ -4194,7 +4290,7 @@ async function main() {
         rotateIncomplete = true;
         if (!target.discovered) rotateFailure = true;
         rotateResults.push({
-          path: target.path,
+          ...reported,
           status: "failed",
           backup: null,
           reason: error instanceof Error ? error.message : String(error),
@@ -4345,6 +4441,16 @@ async function main() {
         path.join(claudeSeatsRoot(os.homedir()), seat.slug, "settings.json"),
         os.homedir(),
       );
+      if (seat.unresolved) {
+        return {
+          slug: seat.slug,
+          ...seatPath,
+          status: "unresolved" as const,
+          diagnostic: "claude_seat_symlink_unresolvable",
+          reason: seat.unresolved,
+          missing: [] as string[],
+        };
+      }
       if (!seat.hasSettings) {
         return { slug: seat.slug, ...seatPath, status: "skipped" as const, missing: [] as string[] };
       }
@@ -4376,6 +4482,16 @@ async function main() {
         path.join(codexProfilesRoot(os.homedir()), profile.slug, "config.toml"),
         os.homedir(),
       );
+      if (profile.unresolved) {
+        return {
+          slug: profile.slug,
+          ...profilePath,
+          status: "unresolved" as const,
+          diagnostic: "codex_profile_symlink_unresolvable",
+          reason: profile.unresolved,
+          missing: [] as string[],
+        };
+      }
       if (!profile.hasConfig) {
         return { slug: profile.slug, ...profilePath, status: "skipped" as const, missing: [] as string[] };
       }

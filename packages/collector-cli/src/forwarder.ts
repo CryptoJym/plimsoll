@@ -15,6 +15,7 @@ export function appendForwardedHook(
     buffer: LocalEventBuffer;
     source: ToolSource;
     transportPath?: string;
+    now?: () => number;
   },
 ) {
   assertCollectorPrivacyMode(options.config, "hook capture");
@@ -25,6 +26,7 @@ export function appendForwardedHook(
     policy: options.config.policy,
     source: options.source,
     transportPath: options.transportPath,
+    now: options.now,
   });
   // Successful hook/fallback responses are public proof surfaces before the
   // durable outbox runs. Include the same deterministic local-only omissions

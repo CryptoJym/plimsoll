@@ -319,7 +319,18 @@ alter table dashboard_session_source_window drop column last_token_event_at;
 The columns are additive and the old binary re-derives everything it needs, so
 dropping them restores session materialization exactly. Re-upgrading adds them
 back on open and refills them from the facts the ledger still holds. Rebuilding
-the projection from the raw ledger is the equivalent heavier alternative.
+the projection from the raw ledger is the equivalent heavier alternative: a
+loss-aware rebuild that can recover a host stuck on `projection_schema_newer`
+when the newer binary is gone. That rebuild is **owed work, not shipped** —
+see `issues/0177-loss-aware-projection-rebuild.md`. Until it exists, the only
+recovery on that path is re-installing a binary that understands the stored
+schema version.
+
+`dashboard_projection_control.degraded_reason` is the out-of-process stamp for
+the same refusal (`projection_schema_newer` or `projection_control_missing`).
+Repair-backlog writers leave those two values in place, so a support query
+against the column is not relabelled as `projection_repair_backlog`. A missing
+control row on an existing control table is not treated as a fresh install.
 
 The local activity scan is **bounded**: one cadence enumerates at most 256
 directory entries within 50 ms, keeps its cursor, and resumes on the next tick.
@@ -437,6 +448,14 @@ npx -y @plimsoll/cli start
 npx -y @plimsoll/cli doctor --read-only --json
 ```
 
+Loopback HTTP is credentialed except for liveness. `GET /healthz` answers
+`{"ok":true}` with no version, identity, or ledger state. `GET /status` requires
+the management credential (`management_credential_required` without it). Full
+operator status is `plimsoll status` (or `doctor --read-only --json`), which
+already presents that credential. Fleet monitors that used raw `/status` should
+switch to `/healthz` or the CLI — see
+[docs/runbooks/local-status-http.md](docs/runbooks/local-status-http.md).
+
 `doctor` is a diagnostic gate, not an installer and not capture proof by
 itself. Its readiness progresses through `not_installed` → `configured` →
 `service_ready` → `signal_verified`; only `signal_verified` returns `ok:true`
@@ -536,7 +555,10 @@ directory that exists with no config file in it yet is reported as
 `skipped: absent` rather than created. A run that applied or
 refused something writes `<collector home>/receipts/managed-config-reconcile-<ts>.json`
 with the per-target status, plan lines and backups; a healthy home plans every
-target `unchanged` and writes nothing at all. The running collector calls the
+target `unchanged` and writes nothing at all. The receipt is written before the
+state-file lock, so a lock timeout cannot swallow an apply that already
+happened — the stamp, backoff map and backup record retry on the next tick.
+The running collector calls the
 same reconcile in-process every `managedConfig.reconcile.intervalSeconds`
 (default 600), and only when its own doctor readback reports at least one
 drifted target, so a healthy host does zero writes; the tick yields to the event
@@ -571,7 +593,10 @@ credentials manages no targets at all and stamps `lastResult: "unavailable"`
 instead, so it does not read as a healthy host. The state file is read and
 written under the same cross-process mutation lock the collector config uses, so
 an operator's `setup --reconcile` and a daemon tick cannot drop each other's
-backoff entries or run stamp.
+backoff entries or run stamp. The lock covers that stamp write, not a whole
+run: a backoff another process arms while this run is already in flight can be
+planned once more than the hour implies, then the merged write keeps both
+decisions.
 
 Telemetry `setup` manages a seat's *config*; what the collector *captures* from
 is its capture-root inventory (`collector.config.json` → `captureRoots[]`),

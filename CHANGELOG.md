@@ -26,8 +26,23 @@ does not transfer its sessions to a tailer.
 
 ## Unreleased
 
+### Changed
+
+- Local `GET /status` stays closed without the management credential.
+  Unauthenticated liveness remains `GET /healthz` (`{"ok":true}` only). Fleet
+  readers that used raw `/status` migrate to `/healthz` or `plimsoll status`
+  (`docs/runbooks/local-status-http.md`, `scripts/native-status-read.py`).
+
 ### Fixed
 
+- A managed-config reconcile that loses the state-file lock still writes its
+  apply/refuse receipt; the stamp, backoff map and backup record retry on the
+  next tick. The event-loop chunk proof uses a CI-safe bound so a cold runner
+  cannot fail a yield that already holds.
+- Daemon session sync now converges without `upload-history --sessions`. A
+  failed or interrupted 5-minute refresh survives restart, and a ledger
+  catch-up covers sessions whose events were already uploaded so they never
+  re-entered the touched window.
 - Automatic maintenance now keeps committed progress across deadlines, bounds
   cursor and enrichment work, and reaps disposable workers before replacement.
 - Maintenance worker startup is separated from ledger initialization and has a

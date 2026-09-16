@@ -112,9 +112,10 @@ export type RolloutScanResult = {
   eventsAppended: number;
   enrollmentExcludedEvents?: number;
   /**
-   * Rows whose rollout record timestamp sat beyond the shared future-skew bound
-   * and were therefore stamped with the receive time instead
-   * (bead eco-6hoxj.73.3, `clampFutureObservedAt`).
+   * Admitted rewrites whose rollout record timestamp or file-mtime fallback sat
+   * beyond the shared future-skew bound and were stamped with the receive time
+   * instead (bead eco-6hoxj.73.3, `clampFutureObservedAt`). Counted only after
+   * enrolment admission, so a refused row cannot inflate the counter.
    */
   futureTimestampClampedEvents?: number;
   tokensAppended: { input: number; cachedInput: number; output: number };
@@ -375,6 +376,8 @@ function resultMutationSnapshot(result: RolloutScanResult) {
     tokens: { ...result.tokensAppended },
     unvalidatedFirstRows: result.unvalidatedFirstRows ?? 0,
     tokensUnvalidated: { ...(result.tokensUnvalidated ?? { input: 0, cachedInput: 0, output: 0 }) },
+    enrollmentExcludedEvents: result.enrollmentExcludedEvents,
+    futureTimestampClampedEvents: result.futureTimestampClampedEvents,
   };
 }
 
@@ -389,6 +392,8 @@ function restoreResultMutationSnapshot(
   result.tokensAppended = { ...snapshot.tokens };
   result.unvalidatedFirstRows = snapshot.unvalidatedFirstRows;
   result.tokensUnvalidated = { ...snapshot.tokensUnvalidated };
+  result.enrollmentExcludedEvents = snapshot.enrollmentExcludedEvents;
+  result.futureTimestampClampedEvents = snapshot.futureTimestampClampedEvents;
 }
 
 export class RolloutTailer {
@@ -1414,18 +1419,21 @@ export class RolloutTailer {
     const receivedAtMs = this.receivedAtMs;
     // A file mtime is as capable of sitting in the future as a record stamp is
     // (a bad clock on the writing machine, a restored archive), so the same
-    // intake clamp applies to it.
+    // intake clamp applies to it. The clamped flag must survive: a silent
+    // rewrite here reintroduces the "refuses silently" hole the record-stamp
+    // counter closed.
     const readAt = Number.isFinite(mtimeMs) && !Number.isNaN(observed.getTime())
       ? observed.toISOString()
       : new Date(receivedAtMs).toISOString();
-    return clampFutureObservedAt(readAt, receivedAtMs).observedAt ?? readAt;
+    const clamped = clampFutureObservedAt(readAt, receivedAtMs);
+    return { observedAt: clamped.observedAt ?? readAt, clamped: clamped.clamped };
   }
 
   private ingestLines(
     lines: string[],
     result: RolloutScanResult,
     state: RolloutParserState,
-    fallbackObservedAt: string,
+    fallbackObservedAt: { observedAt: string; clamped: boolean },
     fileIdentity: string,
   ) {
     type ActiveContext =
@@ -1572,12 +1580,11 @@ export class RolloutTailer {
       // Intake clamp (bead eco-6hoxj.73.3). A rollout record can carry any
       // timestamp its writer put there; `last_event_at` is a monotone max, so
       // one from the future would hold this source's freshness credit for the
-      // whole skew interval. `fallbackObservedAt` is already clamped at source.
+      // whole skew interval. Count the rewrite only after admission so a
+      // refused row cannot inflate the counter; the mtime fallback clamp is
+      // the same rewrite and is counted with it.
       const clamped = clampFutureObservedAt(entry.observedAt, this.receivedAtMs);
-      if (clamped.clamped) {
-        result.futureTimestampClampedEvents = (result.futureTimestampClampedEvents ?? 0) + 1;
-      }
-      const observedAt = clamped.observedAt ?? fallbackObservedAt;
+      const observedAt = clamped.observedAt ?? fallbackObservedAt.observedAt;
       const activeCaptureRoot = this.captureRootAt(this.activeCaptureRoot, observedAt);
       // Counter state already advanced: dropping old/undated observations must
       // not charge their cumulative tokens to the next valid observation.
@@ -1656,6 +1663,9 @@ export class RolloutTailer {
         result.tokensAppended.input += marginal.input;
         result.tokensAppended.cachedInput += marginal.cachedInput;
         result.tokensAppended.output += marginal.output;
+        if (clamped.clamped || (clamped.observedAt === undefined && fallbackObservedAt.clamped)) {
+          result.futureTimestampClampedEvents = (result.futureTimestampClampedEvents ?? 0) + 1;
+        }
         if (unvalidated) {
           result.unvalidatedFirstRows = (result.unvalidatedFirstRows ?? 0) + 1;
           result.tokensUnvalidated = {

@@ -821,6 +821,11 @@ function beginReconcile(options: ManagedConfigReconcileOptions): ReconcileRun {
     startedAtMs,
     startedAtMonotonicMs: monotonicNow(),
     startedAt: new Date(startedAtMs).toISOString(),
+    // Snapshot without the lock (review r3, N3): a backoff another process
+    // arms mid-run is invisible to this run, so that target can be planned
+    // once more than the hour implies. Bounded to one extra apply; the merged
+    // finish write keeps both decisions. Holding the lock across the run would
+    // let an operator block the cadence for a fleet-scale apply.
     backoff: { ...readManagedConfigReconcileState(options.collectorHome).backoff },
     backoffDecided: new Set<string>(),
     createdBackups: [],
@@ -1053,8 +1058,8 @@ function pruneBackups(
     }
   }
   const gone = new Set(removed.map((full) => path.basename(full)));
-  // Oldest last, matching the on-disk order, and dropping anything that is no
-  // longer there so the record cannot grow past the litter it tracks.
+  // Newest last, matching the record's append order, and dropping anything
+  // that is no longer there so the record cannot grow past the litter it tracks.
   return {
     survivors: ours.filter((entry) => !gone.has(entry.name)).map((entry) => entry.name).reverse(),
     removed,
@@ -1114,78 +1119,102 @@ function finishReconcile(
   };
   if (options.dryRun) return result;
 
+  // The receipt is the audit of *this* run's applies and refusals. It does not
+  // need the state lock, and writing it first is what keeps a lock timeout from
+  // swallowing an apply that already happened (review r3, N2). A healthy no-op
+  // still writes no receipt.
+  const recorded = writeReconcileReceipt(run, result, options);
+
   const keepBackups = options.prune?.backupsPerFile ?? MANAGED_CONFIG_BACKUPS_KEPT_PER_FILE;
   const minBackupAgeMs = options.prune?.minBackupAgeMs ?? MANAGED_CONFIG_BACKUP_MIN_AGE_MS;
   // One critical section: merge this run's decisions over whatever the other
   // process left on disk, prune only the backups the merged record owns, and
   // write the result (review r2, R4). Merging rather than overwriting is what
-  // keeps a concurrent run's backoff entries and backup record alive.
-  updateManagedConfigReconcileState(options.collectorHome, (current) => {
-    const backoff = { ...current.backoff };
-    for (const name of run.backoffDecided) {
-      const entry = run.backoff[name];
-      if (entry) backoff[name] = entry;
-      else delete backoff[name];
+  // keeps a concurrent run's backoff entries and backup record alive. A lock
+  // timeout costs this stamp, not the managed files and not the receipt.
+  try {
+    updateManagedConfigReconcileState(options.collectorHome, (current) => {
+      const backoff = { ...current.backoff };
+      for (const name of run.backoffDecided) {
+        const entry = run.backoff[name];
+        if (entry) backoff[name] = entry;
+        else delete backoff[name];
+      }
+      const backups = { ...current.backups };
+      for (const created of run.createdBackups) {
+        const record = backups[created.name];
+        const names = record && record.file === created.file ? [...record.names] : [];
+        names.push(path.basename(created.backup));
+        backups[created.name] = { file: created.file, names };
+      }
+      for (const report of run.reports) {
+        if (report.status !== "applied" || !report.backup) continue;
+        const record = backups[report.name];
+        if (!record) continue;
+        const { survivors } = pruneBackups(
+          record.file,
+          record.names,
+          keepBackups,
+          minBackupAgeMs,
+          run.startedAtMs,
+        );
+        if (survivors.length === 0) delete backups[report.name];
+        else backups[report.name] = { file: record.file, names: survivors };
+      }
+      const stamp = stampIsNotOlder(run.startedAt, current.lastRunAt)
+        ? {
+            lastRunAt: run.startedAt,
+            lastResult: lastResultOf({ applied, refused, skipped: skipped - absent }),
+            lastApplied: applied,
+            lastRefused: refused,
+            lastAbsent: absent,
+          }
+        : {
+            lastRunAt: current.lastRunAt,
+            lastResult: current.lastResult,
+            lastApplied: current.lastApplied,
+            lastRefused: current.lastRefused,
+            lastAbsent: current.lastAbsent,
+          };
+      return { next: { version: 1, ...stamp, backoff, backups }, result: undefined };
+    });
+  } catch (error) {
+    if (error instanceof Error && error.message === "collector_config_mutation_lock_timeout") {
+      return recorded;
     }
-    const backups = { ...current.backups };
-    for (const created of run.createdBackups) {
-      const record = backups[created.name];
-      const names = record && record.file === created.file ? [...record.names] : [];
-      names.push(path.basename(created.backup));
-      backups[created.name] = { file: created.file, names };
-    }
-    for (const report of run.reports) {
-      if (report.status !== "applied" || !report.backup) continue;
-      const record = backups[report.name];
-      if (!record) continue;
-      const { survivors } = pruneBackups(
-        record.file,
-        record.names,
-        keepBackups,
-        minBackupAgeMs,
-        run.startedAtMs,
-      );
-      if (survivors.length === 0) delete backups[report.name];
-      else backups[report.name] = { file: record.file, names: survivors };
-    }
-    const stamp = stampIsNotOlder(run.startedAt, current.lastRunAt)
-      ? {
-          lastRunAt: run.startedAt,
-          lastResult: lastResultOf({ applied, refused, skipped: skipped - absent }),
-          lastApplied: applied,
-          lastRefused: refused,
-          lastAbsent: absent,
-        }
-      : {
-          lastRunAt: current.lastRunAt,
-          lastResult: current.lastResult,
-          lastApplied: current.lastApplied,
-          lastRefused: current.lastRefused,
-          lastAbsent: current.lastAbsent,
-        };
-    return { next: { version: 1, ...stamp, backoff, backups }, result: undefined };
-  });
-  if (applied === 0 && refused === 0) return result;
+    throw error;
+  }
+  return recorded;
+}
+
+/** Persist the apply/refuse receipt before the state lock (review r3, N2). */
+function writeReconcileReceipt(
+  run: ReconcileRun,
+  result: ManagedConfigReconcileResult,
+  options: ManagedConfigReconcileOptions,
+): ManagedConfigReconcileResult {
+  if (result.applied === 0 && result.refused === 0) return result;
   const receiptsDirectory = path.join(options.collectorHome, "receipts");
   fs.mkdirSync(receiptsDirectory, { recursive: true, mode: 0o700 });
   const receiptPath = path.join(
     receiptsDirectory,
     `managed-config-reconcile-${run.startedAt.replace(/[:.]/g, "-")}.json`,
   );
-  fs.writeFileSync(receiptPath, `${JSON.stringify({ ...result, receiptPath }, null, 2)}\n`, {
-    mode: 0o600,
-  });
+  const recorded = { ...result, receiptPath };
+  fs.writeFileSync(receiptPath, `${JSON.stringify(recorded, null, 2)}\n`, { mode: 0o600 });
   pruneReceipts(receiptsDirectory, options.prune?.receipts ?? MANAGED_CONFIG_RECEIPTS_KEPT);
-  return { ...result, receiptPath };
+  return recorded;
 }
 
 /**
  * Plan every managed target, then apply only the ones the plan changes.
  *
- * A receipt is written only when the run applied or refused something. An
- * all-`unchanged` run is a true no-op: no backup, no receipt, no state write
- * beyond the run stamp, so the 10-minute daemon cadence on a healthy host
- * leaves the filesystem byte-identical apart from that stamp.
+ * A receipt is written only when the run applied or refused something, and it
+ * is written *before* the state-file lock so a lock timeout cannot swallow an
+ * apply that already happened (review r3, N2). An all-`unchanged` run is a
+ * true no-op: no backup, no receipt, no state write beyond the run stamp, so
+ * the 10-minute daemon cadence on a healthy host leaves the filesystem
+ * byte-identical apart from that stamp.
  *
  * This is the operator-command entrypoint (`setup --reconcile`), where holding
  * the process for the whole run is exactly what the operator asked for. The

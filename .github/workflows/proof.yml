@@ -56,6 +56,7 @@ jobs:
           pnpm proof:completion
           pnpm proof:startup-wal-self-heal
           pnpm proof:authenticated-ingestion
+          pnpm proof:status-http-rollout
           pnpm proof:retention
 
       - name: Prove event allocation conservation
@@ -212,6 +213,10 @@ jobs:
       - name: Prove partial-success sync backoff and server cooldowns (eco-6hoxj.67)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:sync-backoff
+
+      - name: Prove daemon session sync catch-up without upload-history (eco-6hoxj.70.1)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:session-sync-daemon
 
       - name: Prove Codex account assertions and privacy boundary
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

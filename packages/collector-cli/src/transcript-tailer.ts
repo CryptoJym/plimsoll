@@ -103,9 +103,10 @@ export type TranscriptScanResult = {
   eventsAppended: number;
   enrollmentExcludedEvents?: number;
   /**
-   * Rows whose transcript record timestamp sat beyond the shared future-skew
-   * bound and were therefore stamped with the receive time instead
-   * (bead eco-6hoxj.73.3, `clampFutureObservedAt`).
+   * Admitted rewrites whose transcript record timestamp or file-mtime fallback
+   * sat beyond the shared future-skew bound and were stamped with the receive
+   * time instead (bead eco-6hoxj.73.3, `clampFutureObservedAt`). Counted only
+   * after enrolment admission, so a refused row cannot inflate the counter.
    */
   futureTimestampClampedEvents?: number;
   tokensAppended: { input: number; cacheRead: number; output: number };
@@ -318,6 +319,8 @@ function resultMutationSnapshot(result: TranscriptScanResult) {
     filesParsed: result.filesParsed,
     sessionsSkippedLiveCovered: result.sessionsSkippedLiveCovered,
     tokens: { ...result.tokensAppended },
+    enrollmentExcludedEvents: result.enrollmentExcludedEvents,
+    futureTimestampClampedEvents: result.futureTimestampClampedEvents,
   };
 }
 
@@ -330,6 +333,8 @@ function restoreResultMutationSnapshot(
   result.filesParsed = snapshot.filesParsed;
   result.sessionsSkippedLiveCovered = snapshot.sessionsSkippedLiveCovered;
   result.tokensAppended = { ...snapshot.tokens };
+  result.enrollmentExcludedEvents = snapshot.enrollmentExcludedEvents;
+  result.futureTimestampClampedEvents = snapshot.futureTimestampClampedEvents;
 }
 
 export class TranscriptTailer {
@@ -1321,11 +1326,14 @@ export class TranscriptTailer {
     const receivedAtMs = this.receivedAtMs;
     // A file mtime is as capable of sitting in the future as a record stamp is
     // (a bad clock on the writing machine, a restored archive), so the same
-    // intake clamp applies to it.
+    // intake clamp applies to it. The clamped flag must survive: a silent
+    // rewrite here reintroduces the "refuses silently" hole the record-stamp
+    // counter closed.
     const readAt = Number.isFinite(mtimeMs) && !Number.isNaN(observed.getTime())
       ? observed.toISOString()
       : new Date(receivedAtMs).toISOString();
-    return clampFutureObservedAt(readAt, receivedAtMs).observedAt ?? readAt;
+    const clamped = clampFutureObservedAt(readAt, receivedAtMs);
+    return { observedAt: clamped.observedAt ?? readAt, clamped: clamped.clamped };
   }
 
   private ingestLines(
@@ -1333,7 +1341,7 @@ export class TranscriptTailer {
     result: TranscriptScanResult,
     state: TranscriptParserState,
     flushAtStableEof: boolean,
-    fallbackObservedAt: string,
+    fallbackObservedAt: { observedAt: string; clamped: boolean },
   ) {
     // Upgrade an old v3 pending snapshot into the durable revision model
     // before processing new bytes. This keeps existing cursors compatible.
@@ -1417,7 +1425,7 @@ export class TranscriptTailer {
     state: TranscriptParserState,
     entry: TranscriptPendingUsage,
     result: TranscriptScanResult,
-    fallbackObservedAt: string,
+    fallbackObservedAt: { observedAt: string; clamped: boolean },
     repoContextRequest?: RepoContextRequest,
     forceContextConflict = false,
   ) {
@@ -1507,14 +1515,12 @@ export class TranscriptTailer {
     // Intake clamp (bead eco-6hoxj.73.3). A transcript record can carry any
     // timestamp its writer put there; `last_event_at` is a monotone max, so one
     // from the future would hold this source's freshness credit for the whole
-    // skew interval. `fallbackObservedAt` is already clamped at source. An
-    // absent stamp stays absent: it is the admission test's own refusal below,
-    // and the mtime fallback must not silently rescue it.
+    // skew interval. An absent stamp stays absent for managed admission: it is
+    // the admission test's own refusal below, and the mtime fallback must not
+    // silently rescue an enrolled row. The local/unenrolled path may still use
+    // the fallback, and that rewrite is counted with the record-stamp clamp.
     const clamped = clampFutureObservedAt(entry.observedAt, this.receivedAtMs);
-    if (clamped.clamped) {
-      result.futureTimestampClampedEvents = (result.futureTimestampClampedEvents ?? 0) + 1;
-    }
-    const observedAt = clamped.observedAt ?? fallbackObservedAt;
+    const observedAt = clamped.observedAt ?? fallbackObservedAt.observedAt;
     // Preserve the local revision counter above, but never synthesize a
     // managed event timestamp from mtime or from the time the file arrived.
     if (this.buffer.eventAdmissionReason(clamped.observedAt, this.activeCaptureRoot?.installationEpochId)) {
@@ -1579,6 +1585,9 @@ export class TranscriptTailer {
       result.tokensAppended.input += delta.input;
       result.tokensAppended.cacheRead += delta.cacheRead;
       result.tokensAppended.output += delta.output;
+      if (clamped.clamped || (clamped.observedAt === undefined && fallbackObservedAt.clamped)) {
+        result.futureTimestampClampedEvents = (result.futureTimestampClampedEvents ?? 0) + 1;
+      }
     }
   }
 

@@ -31,6 +31,14 @@ type NormalizeOptions = {
   source?: ToolSource;
   gitContext?: import("../../shared/src/index").GitLinkageContext;
   transportPath?: string;
+  /**
+   * Collector receive-time wall clock, defaulted to `Date.now`. Same kind of
+   * outside-world seam as `JsonlTailerIo.now`: the hook intake clamp measures
+   * a producer stamp against it. A fixture that time-travels the ledger must
+   * set it; otherwise the clamp judges the fixture against the real wall clock
+   * and the proof has to patch `Date.now`.
+   */
+  now?: () => number;
 };
 
 type OTelSignals = {
@@ -395,9 +403,11 @@ export function normalizeHookPayload(
 ): {
   event: AiInteractionEvent;
   suppressedFields: string[];
+  futureTimestampClampedEvents?: number;
 } {
   const raw = asRecord(payload);
   const policy = options.policy ?? DEFAULT_POLICY;
+  const receivedAtMs = options.now?.() ?? Date.now();
   // Classify authority claims before the general sanitizer can collapse or
   // discard lookalike keys. Values remain in-memory only and can cross into an
   // event solely through the exact-alias validators below.
@@ -446,8 +456,9 @@ export function normalizeHookPayload(
   // `timestamp` key beyond the shared `maxFutureTimestampSkewMs` — but it
   // refuses SILENTLY, indistinguishable from a malformed value, and the
   // fallback below then stamps the receive clock. That fallback IS the clamp;
-  // naming it here is what turns it into evidence, so a poisoned
-  // `last_event_at` that never happened is legible instead of invisible.
+  // naming it here (local flag + `futureTimestampClampedEvents`) is what turns
+  // it into evidence, so the health label a poisoned stamp would buy is
+  // visible as a clamp instead of a silent receive-clock rewrite.
   let futureObservedAtRefused = false;
   const observedAtSelection = selectValidatedHookAuthority(
     authorityPartitions,
@@ -457,7 +468,7 @@ export function normalizeHookPayload(
       if (validated.accepted && typeof validated.value === "string") {
         return new Date(validated.value).toISOString();
       }
-      if (clampFutureObservedAt(typeof value === "string" ? value : undefined).clamped) {
+      if (clampFutureObservedAt(typeof value === "string" ? value : undefined, receivedAtMs).clamped) {
         futureObservedAtRefused = true;
       }
       return undefined;
@@ -509,13 +520,13 @@ export function normalizeHookPayload(
     dataMode: policy.dataMode,
     eventType,
     // The receive clock is the last resort AND the clamp: a refused future
-    // stamp lands here. `Date.now()` rather than `new Date()` so the whole
-    // routine reads one clock — the same one `timestampIsNotFromTheFuture` and
-    // `clampFutureObservedAt` measure against.
+    // stamp lands here. One injected clock, the same one
+    // `clampFutureObservedAt` measured against — never a second `Date.now()`
+    // read that a fixture cannot see.
     observedAt:
       observedAtSelection.value ??
       otelSignals.timestamps[0] ??
-      new Date(Date.now()).toISOString(),
+      new Date(receivedAtMs).toISOString(),
     model: stringFromRecords(sourceRecords, usageFieldKeys.model),
     projectKey: stringFromRecords(sourceRecords, ["projectKey", "project_key", "project", "plimsoll.project", "cfo_one.project"]),
     customerKey: stringFromRecords(sourceRecords, ["customerKey", "customer_key", "customer", "plimsoll.customer", "cfo_one.customer"]),
@@ -550,5 +561,9 @@ export function normalizeHookPayload(
       ...(eventTypeSelection.receiptRequired ? [hookAuthorityReceipt("eventType")] : []),
       ...(observedAtSelection.receiptRequired ? [hookAuthorityReceipt("observedAt")] : []),
     ]),
+    // Aggregate clamp signal for local telemetry. The per-event metadata flag
+    // is local-only and stripped outbound; this count is the operator-visible
+    // receipt, matching `futureTimestampClampedEvents` on the tailer scans.
+    ...(observedAtFutureClamped ? { futureTimestampClampedEvents: 1 } : {}),
   };
 }
