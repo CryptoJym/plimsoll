@@ -32,6 +32,7 @@ pnpm exec tsc --noEmit
 pnpm proof:completion
 pnpm proof:startup-wal-self-heal
 pnpm proof:authenticated-ingestion
+pnpm proof:status-http-rollout
 pnpm proof:retention
 pnpm proof:packaged-runtime
 pnpm proof:install-artifact

@@ -437,6 +437,14 @@ npx -y @plimsoll/cli start
 npx -y @plimsoll/cli doctor --read-only --json
 ```
 
+Loopback HTTP is credentialed except for liveness. `GET /healthz` answers
+`{"ok":true}` with no version, identity, or ledger state. `GET /status` requires
+the management credential (`management_credential_required` without it). Full
+operator status is `plimsoll status` (or `doctor --read-only --json`), which
+already presents that credential. Fleet monitors that used raw `/status` should
+switch to `/healthz` or the CLI — see
+[docs/runbooks/local-status-http.md](docs/runbooks/local-status-http.md).
+
 `doctor` is a diagnostic gate, not an installer and not capture proof by
 itself. Its readiness progresses through `not_installed` → `configured` →
 `service_ready` → `signal_verified`; only `signal_verified` returns `ok:true`

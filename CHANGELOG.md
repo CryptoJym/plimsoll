@@ -26,6 +26,13 @@ does not transfer its sessions to a tailer.
 
 ## Unreleased
 
+### Changed
+
+- Local `GET /status` stays closed without the management credential.
+  Unauthenticated liveness remains `GET /healthz` (`{"ok":true}` only). Fleet
+  readers that used raw `/status` migrate to `/healthz` or `plimsoll status`
+  (`docs/runbooks/local-status-http.md`, `scripts/native-status-read.py`).
+
 ### Fixed
 
 - Automatic maintenance now keeps committed progress across deadlines, bounds

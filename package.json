@@ -99,6 +99,7 @@
     "proof:otlp-admission": "tsx scripts/otlp-admission-proof.ts",
     "proof:hook-spool": "tsx scripts/hook-spool-proof.ts",
     "proof:authenticated-ingestion": "tsx scripts/run-proof.ts scripts/authenticated-ingestion-proof.ts",
+    "proof:status-http-rollout": "tsx scripts/run-proof.ts scripts/status-http-rollout-proof.ts",
     "proof:rejection-aggregation": "NODE_OPTIONS=--expose-gc tsx scripts/rejection-aggregation-proof.ts",
     "proof:ingest-liveness": "tsx scripts/ingest-liveness-proof.ts",
     "proof:privacy-mode": "tsx scripts/privacy-mode-proof.ts",

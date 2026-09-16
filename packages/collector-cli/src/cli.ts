@@ -278,7 +278,8 @@ function printHelp() {
 
 Commands:
   start                 Start the local hook/OTLP receiver in the foreground
-  status                Print local buffer and policy status
+  status                Print local buffer and policy status as JSON
+                        (credentialed daemon /status; liveness is GET /healthz)
   maintenance --disable-account-assertion SOURCE --yes
                         Toggle one adapter; writes only account assertion state
   --disable-account-assertion SOURCE

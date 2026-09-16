@@ -1106,9 +1106,10 @@ export function createCollectorServer(
         return;
       }
 
-      // Issue 0056 (#104): the only unauthenticated surface. Minimal by
-      // construction — no runtime identity, counters, delivery, or ledger
-      // state of any kind.
+      // Issue 0056 (#104) / eco-6hoxj.154: the only unauthenticated surface.
+      // Minimal by construction — no version, runtime identity, counters,
+      // delivery, or ledger state. Fleet liveness is this route; /status stays
+      // behind the management credential.
       if (request.method === "GET" && request.url === "/healthz") {
         sendJson(response, { ok: true });
         return;
