@@ -367,9 +367,13 @@ consumed by the label:
   since the sweep began and in this cadence, and the candidates still awaiting
   metadata. The first two count directory *entries* stepped over, never the
   files those entries matched; `pendingFiles` is the field that counts files.
-  These advance during the first-install baseline sweep too. A tick is a subset
-  of its sweep: a receipt never reports `0` this sweep beside a leftover
-  previous-cadence tick (bead eco-6hoxj.155).
+  Both explicit `discover()` walks use that same unit and the same cap
+  (increment after the limit test, so the entry that trips the limit is
+  uncounted). A full-walk rollout also counts the year/month/day directories
+  it steps through, not only the files inside a day partition. These advance
+  during the first-install baseline sweep too. A tick is a subset of its sweep:
+  a receipt never reports `0` this sweep beside a leftover previous-cadence tick
+  (bead eco-6hoxj.155).
 - `entryBudgetPerTick` / `wallBudgetMsPerTick` / `lifetimeEntryLimit` — the
   budget that ended the cadence (at least 256 entries, sized from the host's
   capture roots and last-sweep observation so a 22-root host is not stuck at
@@ -384,6 +388,10 @@ consumed by the label:
   `converging: true` beside `sweepComplete: true` is therefore a same-cadence
   restart, not a contradiction: this cadence's sweep finished and the next one
   begins from the successor, which is what "still sweeping" in the reason says.
+  A drained cadence is the other pair: `sweepComplete: true` with
+  `converging: false`, because the cursor was retired and nothing resumes. The
+  reason then says the cadence finished and left no cursor, not that a
+  successor is still sweeping. `converging` never pairs with `limitReached`.
 - `sweepComplete` — this cadence's cursor finished a full sweep of every eligible
   root. A sweep normally ends by being retired the moment it finishes — drained
   or restarted — and the receipt reports the numbers that cursor held when it

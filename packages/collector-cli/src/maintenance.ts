@@ -1305,6 +1305,10 @@ export class AutomaticMaintenanceCadence<
         : Math.max(0, this.captureFollowups - 1);
       const repairAfter = this.options.repairProgress?.();
       repairAdvanced = Boolean(repairAfter?.pending && repairAfter.units > (repairBefore?.units ?? 0));
+      // Entries actually visited this cadence, never pending candidates the
+      // capture path carried over the pending-metadata gate. A mixed turn
+      // (one source still baselining, the other gated) must not keep the
+      // startup retry class on a stale file count (REVIEW-78 N1).
       discoveryAdvanced = results.some(
         (result) =>
           !isMaintenancePartialOutcome(result) && (

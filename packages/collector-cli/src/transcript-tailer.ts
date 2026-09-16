@@ -454,6 +454,13 @@ export class TranscriptTailer {
       deferredBeforeIo: options.deferredBeforeIo === true,
       lifetimeEntryLimit: this.lifetimeEntryLimit(options.discoveryLimit),
     });
+    // Explicit full walks do not own an automatic sweep cursor. Their entry
+    // count is the completed walk itself, so preserve it instead of applying
+    // the automatic sweep-boundary clamp to a synthetic zero sweep.
+    if (!options.automatic && retired === null && attempt == null) {
+      scan.entriesThisSweep = result.activity.discoveryEntries;
+      scan.entriesThisTick = result.activity.discoveryEntries;
+    }
     result.activity.scan = scan;
     // Keep the activity column on the same cadence as the receipt so a
     // sweep-boundary clamp cannot leave discoveryEntries holding the
