@@ -65,6 +65,10 @@ export type CaptureScanProgress = {
    * entries matched: a cadence that visits 256 entries and matches 2 files
    * reports 256 and 256, not 256 and 2 (bead eco-6hoxj.78, REVIEW-73-r3
    * finding 5). `pendingFiles` below is the field that counts files.
+   *
+   * A tick is a subset of its sweep. At a sweep boundary the successor
+   * cursor starts at `entriesVisited=0`; a leftover previous-cadence tick
+   * is never published beside that 0 (bead eco-6hoxj.155).
    */
   entriesThisSweep: number;
   entriesThisTick: number;
@@ -114,6 +118,14 @@ export function captureScanProgress(input: {
   const discovery = input.discovery;
   const retired = input.cursorRetired === true;
   const cursorRootsPerRoot = Math.max(1, Math.trunc(input.cursorRootsPerCaptureRoot ?? 1));
+  const entriesThisSweep = discovery?.entriesVisited ?? 0;
+  // A tick cannot outrun its sweep. The first tick of a new sweep starts
+  // at entriesVisited=0; publishing the previous cadence's tick beside
+  // that 0 is the studio6 0.7.31 boundary lie (eco-6hoxj.155).
+  const requestedTick = Number.isFinite(input.entriesThisTick)
+    ? Math.max(0, Math.trunc(input.entriesThisTick))
+    : 0;
+  const entriesThisTick = Math.min(requestedTick, entriesThisSweep);
   return {
     // A cursor that has neither finished nor hit its lifetime limit resumes on
     // the next cadence — including a cadence deferred before filesystem work,
@@ -135,8 +147,8 @@ export function captureScanProgress(input: {
     rootsStarted: discovery
       ? Math.min(input.eligibleRoots, Math.ceil(discovery.rootsStarted / cursorRootsPerRoot))
       : 0,
-    entriesThisSweep: discovery?.entriesVisited ?? 0,
-    entriesThisTick: input.entriesThisTick,
+    entriesThisSweep,
+    entriesThisTick,
     pendingFiles: input.pendingFiles,
     entryBudgetPerTick: AUTOMATIC_DISCOVERY_ENTRY_CAP,
     wallBudgetMsPerTick: AUTOMATIC_DISCOVERY_WALL_MS,

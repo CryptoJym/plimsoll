@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("status-http-rollout", 5);
+const completion = createProofCompletion("status-http-rollout", 6);
 /**
  * eco-6hoxj.154: /status stays credential-gated; GET /healthz stays the only
  * unauthenticated liveness surface; the migrated fleet reader never opens the
@@ -146,6 +146,28 @@ async function main() {
         !readerSource.includes("`/status`") &&
         !/\bx-plimsoll-token\b/i.test(readerSource),
       { bytes: Buffer.byteLength(readerSource) },
+    );
+
+    const selfTest = await runPython([readerPath, "--self-test"]);
+    let selfTestBody: { status?: string; checks?: string[] } | null = null;
+    try {
+      selfTestBody = JSON.parse(selfTest.stdout.trim()) as { status?: string; checks?: string[] };
+    } catch {
+      selfTestBody = null;
+    }
+    check(
+      "sweep_tick_boundary_is_transient_unless_it_persists_10s",
+      selfTest.status === 0 &&
+        selfTestBody?.status === "pass" &&
+        Array.isArray(selfTestBody.checks) &&
+        selfTestBody.checks.includes("persisted_lie_is_check") &&
+        selfTestBody.checks.includes("single_lie_is_transient") &&
+        selfTestBody.checks.includes("boundary_then_progress_is_transient"),
+      {
+        exit: selfTest.status,
+        stderr: (selfTest.stderr ?? "").trim().slice(0, 240),
+        stdout: (selfTest.stdout ?? "").trim().slice(0, 240),
+      },
     );
 
     const python = await runPython([readerPath, "--liveness-only", "--port", String(port)]);

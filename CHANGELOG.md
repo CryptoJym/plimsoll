@@ -35,6 +35,10 @@ does not transfer its sessions to a tailer.
 
 ### Fixed
 
+- Capture-health receipts never publish `0` entries this sweep beside a leftover
+  previous-cadence `entriesThisTick`. Native status reads treat that pair as a
+  transient unless it persists across two reads at least 10 s apart
+  (eco-6hoxj.155).
 - Daemon session sync now converges without `upload-history --sessions`. A
   failed or interrupted 5-minute refresh survives restart, and a ledger
   catch-up covers sessions whose events were already uploaded so they never

@@ -440,7 +440,7 @@ export class TranscriptTailer {
     // either gone or a fresh replacement that has enumerated nothing. Publish
     // the sweep this cadence actually ran, not those zeros.
     const retired = this.retiredProgress;
-    result.activity.scan = captureScanProgress({
+    const scan = captureScanProgress({
       discovery: retired ?? attempt?.discovery.progress() ?? null,
       cursorRetired: retired !== null,
       successorInstalled: this.successorInstalled,
@@ -451,6 +451,11 @@ export class TranscriptTailer {
       deferredBeforeIo: options.deferredBeforeIo === true,
       lifetimeEntryLimit: this.lifetimeEntryLimit(options.discoveryLimit),
     });
+    result.activity.scan = scan;
+    // Keep the activity column on the same cadence as the receipt so a
+    // sweep-boundary clamp cannot leave discoveryEntries holding the
+    // previous tick (eco-6hoxj.155).
+    result.activity.discoveryEntries = scan.entriesThisTick;
     return result;
   }
 

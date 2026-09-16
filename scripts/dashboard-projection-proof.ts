@@ -319,7 +319,7 @@ function compactMutationRepairDependencyFixture(root:string,label:string,reopenA
 }
 
 async function main() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-projection-proof-"));
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-projection-proof-")));
   const dbPath = path.join(root, "ledger.sqlite");
   const buffer = new LocalEventBuffer(dbPath);
   const repoA = hash("a");
@@ -3037,7 +3037,8 @@ async function main() {
       settle(fixture, NOW, 30);
       return (readySnapshot(fixture, 30).status.health as {
         sources: Array<{ source: string; status: string; reason: string;
-          activityState: { scanState: string; scan: Record<string, unknown> | null } }>;
+          activityState: { scanState: string; discoveryEntries: number;
+            scan: Record<string, unknown> | null } }>;
       }).sources.find((row) => row.source === "claude_code")!;
     };
     const limitClaudeRoots = claudeRoots(1, 1, "limit", 20);
@@ -3463,6 +3464,85 @@ async function main() {
       { scan: unitCodex, filesSeen: unitCodexResult.filesSeen,
         reason: unitCodexRow.reason, swappedReason: swappedCodexRow.reason });
     unitCodexBuffer.close();
+
+    // Bead eco-6hoxj.155: at a sweep boundary the studio6 0.7.31 native
+    // acceptance single-read CHECK was `0 entr(ies) this sweep, N this tick`
+    // with converging=true — the successor cursor's zeros beside the previous
+    // cadence's tick. A tick is a subset of its sweep, so that pair is never
+    // published. Must-green: the leftover 33 is clamped to 0. Must-red: the
+    // unclamped lie fails the same predicate. A healthy mid-sweep (82, 33)
+    // and a first tick that actually visited (33, 33) are unchanged.
+    const scanEntriesAgree = (scan: CaptureScanProgress) =>
+      scan.entriesThisTick >= 0 &&
+      scan.entriesThisSweep >= 0 &&
+      scan.entriesThisTick <= scan.entriesThisSweep;
+    const boundaryCursor: DiscoveryProgress = {
+      rootsTotal: 6, rootsStarted: 0, openDirectories: 0,
+      entriesVisited: 0, lifetimeEntryLimit: AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP,
+      limitReached: false, finished: false,
+    };
+    const leftoverTick = captureScanProgress({
+      discovery: boundaryCursor,
+      configuredRoots: 6,
+      eligibleRoots: 6,
+      pendingFiles: 0,
+      entriesThisTick: 33,
+      deferredBeforeIo: false,
+      lifetimeEntryLimit: AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP,
+      successorInstalled: true,
+    });
+    const leftoverTickBuffer = claudeFixture("sweep-tick-boundary");
+    const leftoverTickRow = claudeScanRow(leftoverTickBuffer, leftoverTick as never);
+    const unclampedLie: CaptureScanProgress = { ...leftoverTick, entriesThisTick: 33 };
+    const midSweep = captureScanProgress({
+      discovery: { ...boundaryCursor, rootsStarted: 3, entriesVisited: 82 },
+      configuredRoots: 6,
+      eligibleRoots: 6,
+      pendingFiles: 0,
+      entriesThisTick: 33,
+      deferredBeforeIo: false,
+      lifetimeEntryLimit: AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP,
+    });
+    const firstTickOfNewSweep = captureScanProgress({
+      discovery: { ...boundaryCursor, rootsStarted: 1, entriesVisited: 33 },
+      configuredRoots: 6,
+      eligibleRoots: 6,
+      pendingFiles: 0,
+      entriesThisTick: 33,
+      deferredBeforeIo: false,
+      lifetimeEntryLimit: AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP,
+    });
+    check("a_new_sweep_receipt_never_carries_the_previous_cadence_tick",
+      leftoverTick.entriesThisSweep === 0 &&
+      leftoverTick.entriesThisTick === 0 &&
+      leftoverTick.converging === true &&
+      leftoverTick.sweepComplete === false &&
+      scanEntriesAgree(leftoverTick) === true &&
+      scanEntriesAgree(unclampedLie) === false &&
+      leftoverTickRow.reason.includes("0 entr(ies) this sweep, 0 this tick") &&
+      !leftoverTickRow.reason.includes("33 this tick") &&
+      leftoverTickRow.activityState.discoveryEntries === 0 &&
+      midSweep.entriesThisSweep === 82 && midSweep.entriesThisTick === 33 &&
+      scanEntriesAgree(midSweep) === true &&
+      firstTickOfNewSweep.entriesThisSweep === 33 &&
+      firstTickOfNewSweep.entriesThisTick === 33 &&
+      scanEntriesAgree(firstTickOfNewSweep) === true,
+      { leftoverTick, unclampedLie, midSweep, firstTickOfNewSweep,
+        reason: leftoverTickRow.reason });
+    leftoverTickBuffer.close();
+    check("a_cadence_after_a_retirement_publishes_agreeing_sweep_and_tick",
+      scanEntriesAgree(drainedNext) === true &&
+      scanEntriesAgree(drainedThird) === true &&
+      scanEntriesAgree(restartedNext) === true &&
+      scanEntriesAgree(restartedThird) === true &&
+      scanEntriesAgree(transcriptDrainedNext) === true &&
+      scanEntriesAgree(transcriptDrainedThird) === true &&
+      scanEntriesAgree(transcriptRestartedNext) === true &&
+      scanEntriesAgree(transcriptRestartedThird) === true &&
+      drainedNext.entriesThisSweep > 0 && restartedNext.entriesThisSweep > 0 &&
+      transcriptDrainedNext.entriesThisSweep > 0 &&
+      transcriptRestartedNext.entriesThisSweep > 0,
+      { drainedNext, restartedNext, transcriptDrainedNext, transcriptRestartedNext });
 
     codexBuffer.close();
 

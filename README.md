@@ -359,7 +359,9 @@ consumed by the label:
   since the sweep began and in this cadence, and the candidates still awaiting
   metadata. The first two count directory *entries* stepped over, never the
   files those entries matched; `pendingFiles` is the field that counts files.
-  These advance during the first-install baseline sweep too.
+  These advance during the first-install baseline sweep too. A tick is a subset
+  of its sweep: a receipt never reports `0` this sweep beside a leftover
+  previous-cadence tick (bead eco-6hoxj.155).
 - `entryBudgetPerTick` / `wallBudgetMsPerTick` / `lifetimeEntryLimit` — the
   budget that ended the cadence (256 entries, 50 ms) and the entries one cursor
   may visit before it restarts instead of resuming (100000).
