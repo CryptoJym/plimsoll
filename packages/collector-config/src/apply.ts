@@ -5,7 +5,7 @@ import { isDeepStrictEqual } from "node:util";
 import { parse as parseToml } from "smol-toml";
 
 import { assertManagedConfigTarget } from "./fixture-root";
-import { hookCommandHasRetryContract } from "./templates";
+import { generateGrokHookSettings, hookCommandHasRetryContract } from "./templates";
 
 /**
  * Config APPLY mode (issue 0003): idempotent, surgical merges of Plimsoll's
@@ -201,12 +201,17 @@ function assertStableClaudePath(expected: ClaudePathSnapshot) {
   }
 }
 
-function claudeOpenNoFollow(file: string, flags: number) {
+/**
+ * Every open is no-follow and non-blocking: a leaf swapped for a FIFO after its
+ * lstat returns a descriptor at once (and is refused by its fstat) instead of
+ * blocking the process (review r3 G3). libuv adds O_CLOEXEC to every open.
+ */
+function claudeOpenNoFollow(file: string, flags: number, symlinkCode = "UNSAFE_SYMLINK") {
   try {
-    return fs.openSync(file, flags | fs.constants.O_NOFOLLOW);
+    return fs.openSync(file, flags | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
-    if (code === "ELOOP" || code === "EMLINK") claudeFail("UNSAFE_SYMLINK");
+    if (code === "ELOOP" || code === "EMLINK") claudeFail(symlinkCode);
     throw error;
   }
 }
@@ -250,7 +255,7 @@ function assertClaudeBoundContent(
 function readClaudePreimage(file: string) {
   const snapshot = inspectClaudePath(file);
   if (!snapshot.exists) return { snapshot, current: "" };
-  const descriptor = claudeOpenNoFollow(snapshot.absolutePath, fs.constants.O_RDONLY);
+  const descriptor = claudeOpenNoFollow(snapshot.absolutePath, fs.constants.O_RDONLY, "UNSAFE_LEAF_SYMLINK");
   try {
     const opened = claudeIdentity(fs.fstatSync(descriptor));
     assertSafeClaudeLeaf(fs.fstatSync(descriptor));
@@ -261,6 +266,43 @@ function readClaudePreimage(file: string) {
     return { snapshot, current };
   } finally {
     fs.closeSync(descriptor);
+  }
+}
+
+export type DiscoveredFileIdentity = ClaudeFileIdentity;
+
+/**
+ * A file a producer-token rotation classifies before it decides what to rewrite:
+ * `read` carries bytes read through a verified descriptor, `refused` the
+ * rewrite's own value-blind reason, `unreadable` an I/O error such as EACCES.
+ */
+export type DiscoveredFileRead =
+  | { status: "absent" }
+  | { status: "read"; content: string; identity: DiscoveredFileIdentity }
+  | { status: "refused"; reason: string }
+  | { status: "unreadable" };
+
+/**
+ * Read a discovered Grok hook JSON, a header file one names, or a Claude seat's
+ * settings.json through the guarded preimage its rewrite uses (review r3 G3):
+ * every ancestor is checked (no symlink, owned by the user or root) before the
+ * leaf is opened `O_RDONLY | O_NOFOLLOW | O_NONBLOCK`; the descriptor's fstat
+ * must be a regular, singly linked, user-owned file with the lstat's identity
+ * before any byte is read, and only bytes read through it are returned. A
+ * symlink, FIFO, directory or replaced file is refused with its
+ * `<SOURCE>_CONFIG_<CODE>` reason and its bytes are never returned.
+ */
+export function readDiscoveredConfigFile(file: string, source: "grok" | "claude"): DiscoveredFileRead {
+  try {
+    const { snapshot, current } = readClaudePreimage(file);
+    return snapshot.exists && snapshot.leaf
+      ? { status: "read", content: current, identity: snapshot.leaf }
+      : { status: "absent" };
+  } catch (error) {
+    if (error instanceof ClaudeConfigError) {
+      return { status: "refused", reason: `${source.toUpperCase()}_CONFIG_${error.code}` };
+    }
+    return { status: "unreadable" };
   }
 }
 
@@ -929,6 +971,123 @@ export function applyGeminiSettings(
   }
 }
 
+const PRODUCER_TOKEN_PATTERN = /^[A-Za-z0-9_-]{43}$/;
+const GEMINI_TOKEN_PARAMETER = "x-plimsoll-token=";
+
+/**
+ * Rotate the producer token in Gemini CLI settings without re-applying the
+ * generated telemetry object (bead eco-6hoxj.152, review r1 F1): only the
+ * `x-plimsoll-token` query value of the existing `telemetry.otlpEndpoint`
+ * changes. Scheme, host, path, other query parameters, the fragment and every
+ * other key keep their bytes; the write uses the same no-follow preimage,
+ * backup and transaction `applyGeminiSettings` uses. A file without that
+ * query value is not a rotation target (`gemini_settings_unmanaged`); an
+ * endpoint that does not parse, carries the parameter more than once or
+ * encoded, or whose token cannot be replaced in place is refused
+ * (`gemini_settings_malformed`). Both conflicts are value-blind, and both are
+ * returned by the dry run the rotation preflights with.
+ */
+export function rotateGeminiSettingsToken(
+  file: string,
+  token: string,
+  options: ClaudeApplyOptions = {},
+): ApplyResult {
+  assertManagedConfigTarget(file);
+  if (!PRODUCER_TOKEN_PATTERN.test(token)) {
+    throw new Error(`${file}: generated Gemini producer token is invalid.`);
+  }
+  const refuse = (conflict: "gemini_settings_unmanaged" | "gemini_settings_malformed"): ApplyResult => ({
+    path: file,
+    changed: false,
+    changes: [],
+    plan: [],
+    conflict,
+  });
+  try {
+    const { snapshot, current } = readClaudePreimage(file);
+    if (!snapshot.exists) return refuse("gemini_settings_unmanaged");
+    let document: Record<string, unknown>;
+    try {
+      document = parseClaudeDocument(current);
+    } catch {
+      return refuse("gemini_settings_malformed");
+    }
+    if (document.telemetry === undefined) return refuse("gemini_settings_unmanaged");
+    if (!isJsonRecord(document.telemetry)) return refuse("gemini_settings_malformed");
+    const endpoint = document.telemetry.otlpEndpoint;
+    if (endpoint === undefined) return refuse("gemini_settings_unmanaged");
+    if (typeof endpoint !== "string" || !URL.canParse(endpoint)) return refuse("gemini_settings_malformed");
+
+    // Edit the raw query rather than `URLSearchParams`, which re-encodes every
+    // other parameter it serializes.
+    const hashIndex = endpoint.indexOf("#");
+    const beforeHash = hashIndex === -1 ? endpoint : endpoint.slice(0, hashIndex);
+    const fragment = hashIndex === -1 ? "" : endpoint.slice(hashIndex);
+    const queryIndex = beforeHash.indexOf("?");
+    if (queryIndex === -1) return refuse("gemini_settings_unmanaged");
+    const parameters = beforeHash.slice(queryIndex + 1).split("&");
+    const tokenIndexes = parameters.flatMap((parameter, index) =>
+      parameter.startsWith(GEMINI_TOKEN_PARAMETER) ? [index] : []
+    );
+    if (tokenIndexes.length === 0) return refuse("gemini_settings_unmanaged");
+    if (tokenIndexes.length > 1) return refuse("gemini_settings_malformed");
+    const previousParameter = parameters[tokenIndexes[0]!]!;
+    // The raw parameter must be the only token value the exporter's URL parser
+    // sees; checked before the unchanged shortcut so the preflight catches it.
+    const parsedTokens = new URL(endpoint).searchParams.getAll("x-plimsoll-token");
+    if (parsedTokens.length !== 1 || parsedTokens[0] !== previousParameter.slice(GEMINI_TOKEN_PARAMETER.length)) {
+      return refuse("gemini_settings_malformed");
+    }
+    const managedKey = "gemini.telemetry.otlpEndpoint";
+    // Replace the parameter where it sits in the file so every other byte is
+    // kept: exactly one occurrence must yield the expected document. Otherwise
+    // (the parameter is JSON-escaped in the file) the target is refused rather
+    // than re-serialized, which could alter other values. This runs even when
+    // the token is unchanged — with a different probe value — so the preflight
+    // refuses such a file before anything is minted.
+    const replaceInPlace = (value: string) => {
+      const replacement = `${GEMINI_TOKEN_PARAMETER}${value}`;
+      const nextParameters = parameters.map((parameter, index) => index === tokenIndexes[0] ? replacement : parameter);
+      const nextEndpoint = `${beforeHash.slice(0, queryIndex + 1)}${nextParameters.join("&")}${fragment}`;
+      if (!URL.canParse(nextEndpoint) || new URL(nextEndpoint).searchParams.get("x-plimsoll-token") !== value) {
+        return undefined;
+      }
+      const expected = { ...document, telemetry: { ...document.telemetry as Record<string, unknown>, otlpEndpoint: nextEndpoint } };
+      const candidates: string[] = [];
+      for (let at = current.indexOf(previousParameter); at !== -1; at = current.indexOf(previousParameter, at + 1)) {
+        const candidate = `${current.slice(0, at)}${replacement}${current.slice(at + previousParameter.length)}`;
+        try {
+          if (isDeepStrictEqual(JSON.parse(candidate), expected)) candidates.push(candidate);
+        } catch {
+          // Not this occurrence.
+        }
+      }
+      return candidates.length === 1 ? candidates[0] : undefined;
+    };
+    const unchanged = previousParameter === `${GEMINI_TOKEN_PARAMETER}${token}`;
+    const probe = token === "A".repeat(43) ? "B".repeat(43) : "A".repeat(43);
+    const next = replaceInPlace(unchanged ? probe : token);
+    if (next === undefined) return refuse("gemini_settings_malformed");
+    if (unchanged) {
+      assertVisibleClaudeContent(snapshot, snapshot.leaf!, current);
+      return { path: file, changed: false, changes: [], plan: [{ key: managedKey, action: "unchanged" }] };
+    }
+    const changes = [`${managedKey}.token.set`];
+    const plan: ApplyPlanEntry[] = [{ key: managedKey, action: "updated" }];
+    if (options.dryRun) {
+      assertVisibleClaudeContent(snapshot, snapshot.leaf!, current);
+      return { path: file, changed: true, changes, plan };
+    }
+    const backupPath = writeClaudePlan(snapshot, current, next, options.transactionHooks);
+    return { path: file, changed: true, changes, plan, backupPath };
+  } catch (error) {
+    if (error instanceof ClaudeConfigError) {
+      throw new Error(error.message.replace(/^CLAUDE_CONFIG_/, "GEMINI_CONFIG_"));
+    }
+    throw error;
+  }
+}
+
 const GROK_MANAGED_EVENTS = ["UserPromptSubmit", "PostToolUse", "Stop"] as const;
 const GROK_COMMAND_PREFIX = 'if [ -n "${GROK_HOOK_EVENT:-}" ]; then ';
 const LEGACY_GROK_COMMAND_PATTERN = /^if \[ -n "\$\{GROK_HOOK_EVENT:-\}" \]; then curl -s --max-time 2 -X POST -H 'Content-Type: application\/json' -H 'x-plimsoll-source: grok'(?: -H 'x-plimsoll-token: [A-Za-z0-9_-]{43}')? --data-binary @- http:\/\/127\.0\.0\.1:[1-9][0-9]{0,4}\/hooks\/grok \|\| true; fi$/;
@@ -966,7 +1125,52 @@ function isManagedGrokGroup(event: string, value: unknown) {
       isRetryingGrokCommand(handler.command));
 }
 
-function isManagedGrokDocument(value: unknown) {
+const GROK_HEADER_FILE_COMMAND_PATTERN = new RegExp(
+  String.raw`^if \[ -n "\$\{GROK_HOOK_EVENT:-\}" \]; then ${SHELL_WORD_PATTERN} -s --max-time 2 -X POST -H 'Content-Type: application/json' -H (${GROK_HEADER_FILE_WORD_PATTERN}) --data-binary @- http://127\.0\.0\.1:[1-9][0-9]{0,4}/hooks/grok \|\| true; fi$`,
+);
+
+const RETRYING_GROK_HEADER_FILE_PLACEHOLDER = "/plimsoll-header-file";
+
+/**
+ * The `-H @<file>` word of a retrying (eco-6hoxj.29) managed Grok command,
+ * only when the command is byte-for-byte what the current generator renders
+ * for its own curl, port and header file, so this tracks the template.
+ */
+function retryingGrokHeaderFileWord(command: string) {
+  if (!isRetryingGrokCommand(command)) return undefined;
+  const word = new RegExp(String.raw` -H (${GROK_HEADER_FILE_WORD_PATTERN}) --data-binary @-`).exec(command)?.[1];
+  const grokCurlCommand = managedGrokExecutable(command);
+  const port = /http:\/\/127\.0\.0\.1:([1-9][0-9]{0,4})\/hooks\/grok/.exec(command)?.[1];
+  if (!word || !grokCurlCommand || !port) return undefined;
+  const rendered = generateGrokHookSettings({
+    repoRoot: "",
+    port: Number(port),
+    grokCurlCommand,
+    grokHeaderFile: RETRYING_GROK_HEADER_FILE_PLACEHOLDER,
+  }).hooks.Stop[0]!.hooks[0]!.command;
+  const normalized = command.replace(
+    ` -H ${word} --data-binary @-`,
+    () => ` -H @${RETRYING_GROK_HEADER_FILE_PLACEHOLDER} --data-binary @-`,
+  );
+  return normalized === rendered ? word : undefined;
+}
+
+/**
+ * The distinct `-H @<file>` header files named by the header-file-form
+ * commands of a managed Grok hook fragment. Such a fragment carries no token
+ * itself: the token lives in the referenced file.
+ */
+export function managedGrokHeaderFileReferences(value: unknown): string[] {
+  if (!isManagedGrokDocument(value)) return [];
+  const references = hookCommands(value).flatMap((command) => {
+    const word = GROK_HEADER_FILE_COMMAND_PATTERN.exec(command)?.[1] ?? retryingGrokHeaderFileWord(command);
+    return word ? [unquoteShellWord(word).slice(1)] : [];
+  });
+  return [...new Set(references)];
+}
+
+/** Whether a parsed JSON document is exactly a Plimsoll-managed Grok hook fragment. */
+export function isManagedGrokDocument(value: unknown) {
   if (!isJsonRecord(value) || Object.keys(value).join(",") !== "hooks" || !isJsonRecord(value.hooks)) {
     return false;
   }
@@ -1146,6 +1350,15 @@ export function applyGrokHookFile(
 
 const MANAGED_HEADER_FILE_PATTERN = /^x-plimsoll-token: [A-Za-z0-9_-]{43}\n$/;
 
+export type HookHeaderFileApplyOptions = ClaudeApplyOptions & {
+  /**
+   * The identity `readDiscoveredConfigFile` returned for a header file a
+   * rotation classified from its bytes: the rewrite refuses (`LEAF_CHANGED`)
+   * unless the file is still that one (review r3 G3).
+   */
+  boundLeaf?: DiscoveredFileIdentity;
+};
+
 /**
  * Reconcile the private curl header file consumed by a managed command hook.
  * One implementation serves every source so the 0600 mode, the managed-content
@@ -1156,7 +1369,7 @@ function applyManagedHookHeaderFile(
   label: string,
   file: string,
   generated: string,
-  options: ClaudeApplyOptions,
+  options: HookHeaderFileApplyOptions,
 ): ApplyResult {
   assertManagedConfigTarget(file);
   try {
@@ -1164,6 +1377,9 @@ function applyManagedHookHeaderFile(
       throw new Error(`${file}: generated ${label} header file is invalid.`);
     }
     const { snapshot, current } = readClaudePreimage(file);
+    if (options.boundLeaf && (!snapshot.leaf || !sameClaudeIdentity(snapshot.leaf, options.boundLeaf))) {
+      claudeFail("LEAF_CHANGED");
+    }
     if (snapshot.exists && !MANAGED_HEADER_FILE_PATTERN.test(current)) {
       return {
         path: file,
@@ -1204,7 +1420,7 @@ function applyManagedHookHeaderFile(
 export function applyGrokHookHeaderFile(
   file: string,
   generated: string,
-  options: ClaudeApplyOptions = {},
+  options: HookHeaderFileApplyOptions = {},
 ): ApplyResult {
   return applyManagedHookHeaderFile("grok", "Grok", file, generated, options);
 }
@@ -1348,6 +1564,12 @@ function inspectCodexPath(file: string): CodexPathSnapshot {
   if (missingAncestor) unsafePath(file, "an ancestor appeared while inspecting config.toml");
   if (leafStat.isSymbolicLink()) unsafePath(file, "config.toml is a symbolic link");
   if (!leafStat.isFile()) unsafePath(file, "config.toml is not a regular file");
+  // The atomic rename replaces only this name, so another hard link would keep
+  // the old bytes while the apply reports success (review r2 G2). Refused the
+  // same way as a Claude leaf (CLAUDE_CONFIG_UNSAFE_LEAF_LINK_COUNT).
+  if (leafStat.nlink !== 1) {
+    unsafePath(file, "CODEX_CONFIG_UNSAFE_LEAF_LINK_COUNT: config.toml has more than one hard link");
+  }
   return { absolutePath, ancestors, exists: true, leaf: fileIdentity(leafStat) };
 }
 
@@ -1372,7 +1594,9 @@ function assertStableCodexPath(file: string, expected: CodexPathSnapshot) {
 
 function openNoFollow(file: string, flags: number) {
   try {
-    return fs.openSync(file, flags | fs.constants.O_NOFOLLOW);
+    // Non-blocking for the same reason as claudeOpenNoFollow: a FIFO swapped in
+    // after the lstat is opened at once and refused by its identity check.
+    return fs.openSync(file, flags | fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
   } catch (error) {
     const code = (error as NodeJS.ErrnoException).code;
     if (code === "ELOOP" || code === "EMLINK") unsafePath(file, "config.toml became a symbolic link");
@@ -1392,6 +1616,24 @@ function readCodexPreimage(file: string) {
     return { snapshot, current: fs.readFileSync(descriptor, "utf8") };
   } finally {
     fs.closeSync(descriptor);
+  }
+}
+
+/**
+ * Read a discovered Codex profile config.toml through the guarded preimage
+ * `applyCodexConfig` uses (review r3 G3): ancestors and leaf checked before the
+ * no-follow, non-blocking open, and the descriptor bound to the lstat identity
+ * before its bytes are read. The refusal reason is that apply's own message.
+ */
+export function readDiscoveredCodexConfig(
+  file: string,
+): Exclude<DiscoveredFileRead, { status: "read" }> | { status: "read"; content: string } {
+  try {
+    const { snapshot, current } = readCodexPreimage(file);
+    return snapshot.exists ? { status: "read", content: current } : { status: "absent" };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== undefined) return { status: "unreadable" };
+    return { status: "refused", reason: error instanceof Error ? error.message : String(error) };
   }
 }
 

@@ -713,7 +713,14 @@ esac
   const traceSection = fullCodexConfig.match(
     /\[otel\.trace_exporter\."otlp-http"\][\s\S]*?(?=\n\[otel\.metrics_exporter)/,
   )?.[0];
-  check("proof_finds_installed_trace_section", Boolean(traceSection), fullCodexConfig);
+  // The installed config carries a fixture producer token inline; report its
+  // digest, never its bytes. The detail stays one string, so the normalized
+  // support-contract artifact (a nonempty detail marker) does not move.
+  check(
+    "proof_finds_installed_trace_section",
+    Boolean(traceSection),
+    `codex config.toml sha256:${createHash("sha256").update(fullCodexConfig).digest("hex")}`,
+  );
   fs.writeFileSync(codexConfig, fullCodexConfig.replace(traceSection!, ""));
   const incompleteDoctor = await command(
     process.execPath,

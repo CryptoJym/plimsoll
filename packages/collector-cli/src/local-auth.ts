@@ -580,6 +580,7 @@ export function assertProducerToken(
   auth: LocalIngestAuth,
   source: LocalProducerSource,
   url: URL,
+  now = Date.now(),
 ) {
   assertCredentialRoute(url, "producer");
   const supplied = suppliedToken(request) ??
@@ -602,7 +603,7 @@ export function assertProducerToken(
   // recorded expiry, so a producer that has not been restarted yet keeps
   // reporting and a leaked old token still stops working on a fixed deadline.
   const rotation = auth.rotations?.[source];
-  if (rotation && rotation.expiresAt > Date.now() && tokenMatches(supplied, rotation.token)) {
+  if (rotation && rotation.expiresAt > now && tokenMatches(supplied, rotation.token)) {
     return;
   }
   throw new HttpBoundaryRejection("producer_token_invalid", 401);

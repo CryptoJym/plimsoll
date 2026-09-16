@@ -713,12 +713,41 @@ layout. Rotate the token with
 `config.toml` and every discovered `~/.codex-profiles/<slug>/config.toml` that
 already carries the managed block — with a backup per file, inside the same
 grace window — and accepts the superseded token only until that window closes
-(`--grace-seconds`, default 900). A profile without the managed block is left
+(`--grace-seconds`, default 900, at most 86400). A profile without the managed block is left
 untouched (`setup` owns provisioning it) and a malformed one is reported under
-`profilesSkipped` and never rewritten, neither of them failing the rotation.
+`profilesSkipped` and never rewritten, neither of them failing the rotation. A
+managed profile (or Claude seat) that refuses or fails the rewrite does fail it:
+the receipt says `rotation_incomplete` and the command exits 1, with the new
+token and the grace window already in place. Fix that file, then run
+`plimsoll setup --yes`, which re-applies the current token everywhere; running
+the rotation again would mint another token. A `config.toml` with more than one
+hard link is refused (`CODEX_CONFIG_UNSAFE_LEAF_LINK_COUNT`) by `setup`, the
+managed reconcile and the rotation alike, since the rewrite would leave the
+other link on the old bytes; a hardlinked `~/.codex/config.toml` refuses the
+rotation before anything is minted.
 `--dry-run` lists the `codexProfile[<slug>].otel.<exporter>.headers updated`
 lines it would write. `plimsoll doctor` reports the rotation deadline and never
 prints a token.
+
+Every other producer source rotates the same way, with the same receipt
+(`status`, `source`, `rotated`, `graceSeconds`, `previousTokenExpiresAt`,
+`targets[]`, `nextSteps`) and the deadline under
+`doctor.producerTokenRotation.<source>`:
+
+| `--source` | Managed surfaces rewritten |
+|---|---|
+| `claude_code` | `env.OTEL_EXPORTER_OTLP_HEADERS` and the hook headers in `~/.claude/settings.json` (`--claude-settings`) and in every `~/.claude-seats/<slug>/settings.json` that already carries the token; unmanaged or malformed seats are listed under `seatsSkipped`, and a seat without `settings.json` is listed `absent` |
+| `gemini_cli` | only the `x-plimsoll-token` query value of `telemetry.otlpEndpoint` in `~/.gemini/settings.json` (`--gemini-settings`); every other setting, query parameter and the fragment keep their bytes. Settings without that query value (`gemini_settings_unmanaged`) or with an endpoint whose token cannot be edited safely in place — unparseable, the parameter repeated or escaped (`gemini_settings_malformed`) — refuse the rotation before anything is minted; run `plimsoll setup --yes` first |
+| `grok` | `${GROK_HOME:-~/.grok}/hooks/plimsoll.headers`, the `plimsoll.json` hook fragment (`--grok-hooks`), which moves a legacy fragment that still embeds the token onto the header file, and any other regular `hooks/*.json` that carries the token and is exactly a managed fragment (`setup` does not manage these copies, so one the rewrite would refuse blocks the rotation before anything is minted). A managed copy in the header-file form carries no token itself: one that reads `plimsoll.headers` is reported `unchanged`, another existing header file one reads that is carrying the current token is rotated as its own target (a refusal there makes the rotation `rotation_incomplete`), and one whose header file is absent is reported `skipped`; a token-bearing one that is not a managed fragment or cannot be read is reported `skipped` and left as it is, and hook files without the token are never touched. Hook files and the header files they read are only ever read through a no-follow, non-blocking descriptor whose file matches the checked path: a symlinked `hooks/*.json` is never read and is reported `skipped`, a header file behind a symlinked directory or that is a symlink, FIFO, hard link or a replaced file is never read and is reported `refused` with that reason, and a header file replaced after it was read is refused rather than rewritten |
+
+For these sources a managed file the host does not have is reported as
+`absent` and never created, and a Grok hook fragment whose header file is
+absent is reported `skipped` rather than pointed at a secret nothing wrote.
+`--dry-run` reports a discovered seat, profile or hook copy that would refuse
+as `refused`, so the preview does not promise a rewrite the real run cannot make.
+A discovered seat or profile file that is a symlink, hard link or otherwise
+unsafe to read is not read to classify it: it is listed `refused` and the
+rotation is incomplete.
 
 The source install script's `--dry-run` does not clone, install dependencies,
 write Claude/Gemini/Grok/Codex or Plimsoll files, register a LaunchAgent, or start a
