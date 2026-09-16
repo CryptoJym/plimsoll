@@ -11,9 +11,11 @@ import Database from "better-sqlite3";
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
 import {
+  DASHBOARD_SCHEMA_SHAPE_DIGEST,
   DASHBOARD_SCHEMA_VERSION,
   DASHBOARD_WINDOWS,
   DashboardProjectionStore,
+  dashboardProjectionSchemaShapeDigest,
 } from "../packages/collector-cli/src/dashboard-projection";
 import {
   dashboardAccounts,
@@ -2181,8 +2183,9 @@ async function main() {
     const afterTickStatus=rolledBack.projection.status();
     const afterTickRead=rolledBack.projection.readSnapshot(30);
     const versionLeftAlone=(rolledBack.database.prepare(
-      `select schema_version as version from dashboard_projection_control where singleton=1`)
-      .get() as {version:number}).version;
+      `select schema_version as version, degraded_reason as reason
+       from dashboard_projection_control where singleton=1`)
+      .get() as {version:number;reason:string|null});
     check("a_projection_written_by_a_newer_schema_is_refused_not_served_frozen_green",
       frozenSnapshots>0&&
         refusedStatus.degradedReason==="projection_schema_newer"&&refusedStatus.ready===false&&
@@ -2190,11 +2193,13 @@ async function main() {
         refusedTick.ready===false&&refusedTick.degraded===true&&
         afterTickStatus.degradedReason==="projection_schema_newer"&&afterTickStatus.ready===false&&
         afterTickRead.kind!=="ready"&&
-        versionLeftAlone===DASHBOARD_SCHEMA_VERSION+1,
+        versionLeftAlone.version===DASHBOARD_SCHEMA_VERSION+1&&
+        versionLeftAlone.reason==="projection_schema_newer",
       {frozenSnapshots,refusedReason:refusedStatus.degradedReason,refusedKind:refusedRead.kind,
         tick:{ready:refusedTick.ready,degraded:refusedTick.degraded},
         afterKind:afterTickRead.kind,afterReason:afterTickStatus.degradedReason,
-        storedVersion:versionLeftAlone,binaryVersion:DASHBOARD_SCHEMA_VERSION});
+        storedVersion:versionLeftAlone.version,storedReason:versionLeftAlone.reason,
+        binaryVersion:DASHBOARD_SCHEMA_VERSION});
     rolledBack.close();
 
     // The forward half of the same guard. A projection written before the
@@ -2262,11 +2267,95 @@ async function main() {
       {brokenBeforeRollback,brokenAfterRollback});
 
     const releaseNote=fs.readFileSync(path.join(import.meta.dirname,"..","README.md"),"utf8");
+    const owedRebuild=fs.readFileSync(
+      path.join(import.meta.dirname,"..","issues","0177-loss-aware-projection-rebuild.md"),"utf8");
     check("the_release_note_documents_the_schema_guard_and_the_manual_rollback",
       releaseNote.includes("projection_schema_newer")&&
         releaseNote.includes("alter table dashboard_session_source_window drop column last_token_event_at")&&
         releaseNote.includes("alter table dashboard_session_repair_source drop column last_token_event_at"),
       {});
+    check("the_loss_aware_rebuild_is_filed_as_owed_work",
+      owedRebuild.includes("Loss-aware dashboard projection rebuild")&&
+        owedRebuild.includes("owed")&&
+        releaseNote.includes("issues/0177-loss-aware-projection-rebuild.md")&&
+        releaseNote.includes("owed work, not shipped"),
+      {});
+
+    const compactBacklogPath=path.join(root,"projection-schema-newer-compact-backlog.sqlite");
+    const compactBacklog=new LocalEventBuffer(compactBacklogPath);
+    compactBacklog.append(event({source:"grok",sessionId:uuid(940_040),observedAt:downgradeTokenAt,
+      inputTokens:400,outputTokens:50,costUsd:0.001}));
+    settle(compactBacklog,NOW,30);
+    compactBacklog.close();
+    const compactBacklogDb=new Database(compactBacklogPath);
+    compactBacklogDb.prepare(
+      `update dashboard_projection_control set schema_version=?, compact_summary_migration_complete=0
+       where singleton=1`,
+    ).run(DASHBOARD_SCHEMA_VERSION+1);
+    compactBacklogDb.exec(`insert or ignore into dashboard_compact_gc_days
+      (bucket_day,revision,processing_revision,high_water_segment,cursor_segment,
+       last_schedule,queued_at,updated_at)
+      values ('2026-07-01',1,0,null,0,0,'2026-07-15T12:00:00.000Z','2026-07-15T12:00:00.000Z')`);
+    compactBacklogDb.close();
+    const compactBacklogRefused=new LocalEventBuffer(compactBacklogPath);
+    const compactStored=(compactBacklogRefused.database.prepare(
+      `select degraded_reason as reason, compact_summary_migration_complete as complete
+       from dashboard_projection_control where singleton=1`)
+      .get() as {reason:string|null;complete:number});
+    compactBacklogRefused.append(event({source:"grok",sessionId:uuid(940_041),
+      observedAt:new Date(NOW.getTime()-60_000).toISOString(),inputTokens:10,outputTokens:5}));
+    const compactAfterInsert=(compactBacklogRefused.database.prepare(
+      `select degraded_reason as reason from dashboard_projection_control where singleton=1`)
+      .get() as {reason:string|null}).reason;
+    check("compact_summary_migration_does_not_relabel_projection_schema_newer_in_the_control_row",
+      compactStored.reason==="projection_schema_newer"&&compactStored.complete===0&&
+        compactBacklogRefused.projection.status().degradedReason==="projection_schema_newer"&&
+        compactAfterInsert==="projection_schema_newer",
+      {compactStored,compactAfterInsert});
+    compactBacklogRefused.close();
+
+    const missingRowPath=path.join(root,"projection-control-row-missing.sqlite");
+    const missingRow=new LocalEventBuffer(missingRowPath);
+    missingRow.append(event({source:"grok",sessionId:uuid(940_050),observedAt:downgradeTokenAt,
+      inputTokens:300,outputTokens:40,costUsd:0.001}));
+    settle(missingRow,NOW,30);
+    const greenBeforeMissing=(readySnapshot(missingRow,30).status.health as {sources:CountHealth[]})
+      .sources.find(row=>row.source==="grok")!;
+    check("control_row_missing_fixture_starts_from_a_green_published_session_count",
+      greenBeforeMissing.status==="green"&&greenBeforeMissing.tokenSessionsToday===1,
+      {row:greenBeforeMissing});
+    missingRow.close();
+    const missingRowDb=new Database(missingRowPath);
+    missingRowDb.exec(`delete from dashboard_projection_control`);
+    const tableStillThere=Boolean(missingRowDb.prepare(
+      `select 1 from sqlite_master where type='table' and name='dashboard_projection_control'`,
+    ).get());
+    missingRowDb.close();
+    const missingRowReopened=new LocalEventBuffer(missingRowPath);
+    const missingStatus=missingRowReopened.projection.status();
+    const missingStored=(missingRowReopened.database.prepare(
+      `select degraded_reason as reason, ready from dashboard_projection_control where singleton=1`)
+      .get() as {reason:string|null;ready:number});
+    const missingRead=missingRowReopened.projection.readSnapshot(30);
+    const missingTick=missingRowReopened.projection.runMaintenance(NOW);
+    check("a_control_table_without_its_row_is_refused_not_treated_as_fresh",
+      tableStillThere&&
+        missingStatus.degradedReason==="projection_control_missing"&&missingStatus.ready===false&&
+        missingStored.reason==="projection_control_missing"&&missingStored.ready===0&&
+        missingRead.kind!=="ready"&&
+        missingTick.ready===false&&missingTick.degraded===true,
+      {missingStatus,missingStored,missingKind:missingRead.kind,
+        tick:{ready:missingTick.ready,degraded:missingTick.degraded}});
+    missingRowReopened.close();
+
+    const shapeLedger=new LocalEventBuffer(path.join(root,"projection-schema-shape-pin.sqlite"));
+    const liveShapeDigest=dashboardProjectionSchemaShapeDigest(shapeLedger.database);
+    check("dashboard_schema_shape_digest_matches_the_version_pin",
+      liveShapeDigest===DASHBOARD_SCHEMA_SHAPE_DIGEST&&
+        /^sha256:[0-9a-f]{64}$/.test(DASHBOARD_SCHEMA_SHAPE_DIGEST),
+      {liveShapeDigest,pinned:DASHBOARD_SCHEMA_SHAPE_DIGEST,version:DASHBOARD_SCHEMA_VERSION,
+        hint:"If dashboard_* shape changed, bump DASHBOARD_SCHEMA_VERSION and DASHBOARD_SCHEMA_SHAPE_DIGEST together. Do not update the digest in place."});
+    shapeLedger.close();
 
     // Standing rule for this file pair: every tailer fix ships its twin check
     // on the other tailer (r1/r2/r3 lesson of eco-6hoxj.73).

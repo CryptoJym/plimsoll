@@ -30,10 +30,64 @@ import { projectionValidity, STATUS_MAX_AGE_MS } from "./projection-validity";
  * and left this at 1, so a collector rolled back below #360 opened a ledger
  * whose tables had gained a column, failed session materialization on every
  * maintenance tick, and went on serving the last session count it had — frozen
- * and green (bead eco-6hoxj.145). Version 2 is that migration. */
+ * and green (bead eco-6hoxj.145). Version 2 is that migration.
+ *
+ * `DASHBOARD_SCHEMA_SHAPE_DIGEST` is the mechanical twin: the dashboard
+ * projection proof fails when `dashboard_*` table shape moves without this
+ * constant. Update both together. A loss-aware rebuild that can recover a
+ * host stuck on `projection_schema_newer` without the newer binary is owed
+ * work (`issues/0177-loss-aware-projection-rebuild.md`); this binary only
+ * withholds. */
 export const DASHBOARD_SCHEMA_VERSION = 2;
+/** Canonical digest of `dashboard_*` table_info at `DASHBOARD_SCHEMA_VERSION`.
+ * Computed by `dashboardProjectionSchemaShapeDigest` on a freshly opened
+ * ledger. The proof pins the pair so a shape change cannot ship at the
+ * previous version. */
+export const DASHBOARD_SCHEMA_SHAPE_DIGEST =
+  "sha256:822d72a51d4d027c1e62ed8841ce781dcec61d3bac0e881866e793884bc955c8";
 /** A projection written by a newer binary: refuse it rather than half-read it. */
 const PROJECTION_SCHEMA_NEWER = "projection_schema_newer";
+/** Control table exists but its singleton row does not: not a fresh install. */
+const PROJECTION_CONTROL_MISSING = "projection_control_missing";
+/** Sticky open-refusal reasons: later repair/backlog writers must not relabel them. */
+const OPEN_REFUSAL_REASONS_SQL =
+  `'${PROJECTION_SCHEMA_NEWER}','${PROJECTION_CONTROL_MISSING}'`;
+const DEGRADED_REASON_ON_REPAIR_SQL = `case
+          when degraded_reason in (${OPEN_REFUSAL_REASONS_SQL}) then degraded_reason
+          when generation>0 then 'projection_repair_backlog'
+          else degraded_reason
+        end`;
+
+/** SHA-256 of canonical `dashboard_*` `table_info` (column order, names,
+ * types, nullability, primary-key flags, defaults). Indexes are not part of
+ * the pin: the #360 frozen-green defect was a derived-table *shape* change
+ * that a downgraded positional insert-select could not see. */
+export function dashboardProjectionSchemaShapeDigest(db: Database.Database): string {
+  const tables = db.prepare(
+    `select name from sqlite_master where type='table' and name glob 'dashboard_*' order by name`,
+  ).all() as Array<{ name: string }>;
+  const shape = tables.map((table) => {
+    const columns = (
+      db.pragma(`table_info(${table.name})`) as Array<{
+        cid: number;
+        name: string;
+        type: string;
+        notnull: number;
+        dflt_value: unknown;
+        pk: number;
+      }>
+    ).map((column) => ({
+      cid: column.cid,
+      name: column.name,
+      type: column.type,
+      notnull: column.notnull,
+      pk: column.pk,
+      dflt: column.dflt_value,
+    }));
+    return { table: table.name, columns };
+  });
+  return `sha256:${createHash("sha256").update(JSON.stringify(shape)).digest("hex")}`;
+}
 export const DASHBOARD_WINDOWS = [30, 90, 182, 365, 1825] as const;
 const INTERNAL_WINDOWS = [7, ...DASHBOARD_WINDOWS] as const;
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -567,6 +621,8 @@ function json<T>(value: string): T {
 export class DashboardProjectionStore {
   /** Set at open when the stored schema version is newer than this binary's. */
   private schemaNewerThanBinary = false;
+  /** Set at open when the control table exists but its singleton row does not. */
+  private schemaControlMissing = false;
   private failNextApply = false;
   private failNextCompactGcAfterRewrite = false;
 
@@ -1046,14 +1102,15 @@ export class DashboardProjectionStore {
         and fact.raw_generation=old.privacy_generation and fact.event_type='usage_live')
       and not exists (select 1 from dashboard_projection_repairs where raw_rowid=old.rowid)` : "0";
     this.db.exec(`
-      create trigger if not exists trg_dashboard_raw_insert
+      drop trigger if exists trg_dashboard_raw_insert;
+      create trigger trg_dashboard_raw_insert
       after insert on buffered_events
       begin
         insert into dashboard_projection_repairs (raw_rowid, reason, queued_at)
         values (new.rowid, 'raw_insert', strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         on conflict(raw_rowid) do update set reason = excluded.reason, queued_at = excluded.queued_at;
         update dashboard_projection_control set dirty=1,
-          degraded_reason=case when generation>0 then 'projection_repair_backlog' else degraded_reason end
+          degraded_reason=${DEGRADED_REASON_ON_REPAIR_SQL}
         where singleton=1;
       end;
       drop trigger if exists trg_dashboard_privacy_generation_ready;
@@ -1070,7 +1127,7 @@ export class DashboardProjectionStore {
             else excluded.reason end,
           queued_at=excluded.queued_at;
         update dashboard_projection_control set dirty=1,
-          degraded_reason=case when generation>0 then 'projection_repair_backlog' else degraded_reason end
+          degraded_reason=${DEGRADED_REASON_ON_REPAIR_SQL}
         where singleton=1;
       end;
       drop trigger if exists trg_dashboard_raw_update;
@@ -1117,7 +1174,7 @@ export class DashboardProjectionStore {
             else excluded.reason end,
           queued_at=excluded.queued_at;
         update dashboard_projection_control set dirty=1,
-          degraded_reason=case when generation>0 then 'projection_repair_backlog' else degraded_reason end
+          degraded_reason=${DEGRADED_REASON_ON_REPAIR_SQL}
         where singleton=1;
       end;
       create trigger if not exists trg_dashboard_live_interval_update
@@ -1167,7 +1224,7 @@ export class DashboardProjectionStore {
         values (old.rowid, 'raw_delete', strftime('%Y-%m-%dT%H:%M:%fZ','now'))
         on conflict(raw_rowid) do update set reason=excluded.reason,queued_at=excluded.queued_at;
         update dashboard_projection_control set dirty=1,
-          degraded_reason=case when generation>0 then 'projection_repair_backlog' else degraded_reason end
+          degraded_reason=${DEGRADED_REASON_ON_REPAIR_SQL}
         where singleton=1;
       end;
       create trigger if not exists trg_finance_raw_insert
@@ -1285,12 +1342,35 @@ export class DashboardProjectionStore {
           end`);
       }
     }
-    this.ensureCompactSummaryMigration(now);
+    if (this.projectionOpenRefused()) this.stampOpenRefusal();
+    else this.ensureCompactSummaryMigration(now);
+  }
+
+  private projectionOpenRefused() {
+    return this.schemaNewerThanBinary || this.schemaControlMissing;
+  }
+
+  private openRefusalReason() {
+    return this.schemaNewerThanBinary ? PROJECTION_SCHEMA_NEWER
+      : this.schemaControlMissing ? PROJECTION_CONTROL_MISSING
+      : null;
+  }
+
+  /** Stamp the control row last so later open-time writers cannot relabel an
+   * open-refusal as a repair backlog. Counts stay withheld either way. */
+  private stampOpenRefusal() {
+    const reason = this.openRefusalReason();
+    if (!reason) return;
+    this.db.prepare(
+      `update dashboard_projection_control set ready=0, parity_ready=0, dirty=1,
+        degraded_reason=? where singleton=1`,
+    ).run(reason);
   }
 
   /** The version an already-installed projection was last written at, read
    * before this open creates or migrates anything. A ledger with no projection
-   * yet has none. */
+   * table yet has none (fresh install). A table without its singleton row is
+   * not fresh: that is an anomalous ledger and the open is refused. */
   private readStoredSchemaVersion(): number | null {
     if (!this.db.prepare(
       `select 1 from sqlite_master where type='table' and name='dashboard_projection_control'`,
@@ -1298,7 +1378,11 @@ export class DashboardProjectionStore {
     const row = this.db.prepare(
       `select schema_version as version from dashboard_projection_control where singleton=1`,
     ).get() as { version: number } | undefined;
-    return row ? row.version : null;
+    if (!row) {
+      this.schemaControlMissing = true;
+      return null;
+    }
+    return row.version;
   }
 
   /** Reconcile the stored derived-schema version with this binary's.
@@ -1309,19 +1393,28 @@ export class DashboardProjectionStore {
    *
    * Backward (stored newer): this binary is a rollback under a projection some
    * later binary wrote. It cannot know what that schema means — the tables may
-   * carry columns whose writes it has no values for — so it fails closed:
-   * nothing is served and nothing is written, and the stored version is left
-   * exactly as the newer binary published it so re-upgrading is a plain
-   * restart. Refusing is the whole point: the alternative is the frozen green
-   * session count eco-6hoxj.80 was built to remove. `plimsoll` reports
-   * `projection_schema_newer`; the release note names the manual rollback. */
+   * carry columns whose writes it has no values for — so the open is refused:
+   * no count is served, the control row is stamped `projection_schema_newer`
+   * (ready=0, parity_ready=0, dirty=1), and the stored version is left exactly
+   * as the newer binary published it so re-upgrading is a plain restart.
+   * Compact-summary migration is skipped on this path so it cannot relabel
+   * that stamp. Refusing is the whole point: the alternative is the frozen
+   * green session count eco-6hoxj.80 was built to remove. `plimsoll` reports
+   * `projection_schema_newer`; the release note names the manual rollback.
+   * The loss-aware rebuild that would recover a host whose newer binary is
+   * gone is owed work, not this path.
+   *
+   * Anomalous (control table present, singleton row missing): not a fresh
+   * install. The open is refused with `projection_control_missing` rather
+   * than taking the forward path a null version would otherwise select. */
   private reconcileSchemaVersion(stored: number | null) {
+    if (this.schemaControlMissing) {
+      this.stampOpenRefusal();
+      return;
+    }
     if (stored !== null && stored > DASHBOARD_SCHEMA_VERSION) {
       this.schemaNewerThanBinary = true;
-      this.db.prepare(
-        `update dashboard_projection_control set ready=0, parity_ready=0, dirty=1,
-          degraded_reason=? where singleton=1`,
-      ).run(PROJECTION_SCHEMA_NEWER);
+      this.stampOpenRefusal();
       return;
     }
     if (stored !== null && stored < DASHBOARD_SCHEMA_VERSION) {
@@ -1426,7 +1519,9 @@ export class DashboardProjectionStore {
           `update dashboard_projection_control set
             compact_summary_migration_complete=1,compact_gc_backlog=?,
             dirty=case when ?>0 then 1 else dirty end,
-            degraded_reason=case when ?>0 then 'projection_repair_backlog'
+            degraded_reason=case
+              when degraded_reason in (${OPEN_REFUSAL_REASONS_SQL}) then degraded_reason
+              when ?>0 then 'projection_repair_backlog'
               else degraded_reason end
            where singleton=1`,
         ).run(backlog,backlog,backlog);
@@ -1535,6 +1630,7 @@ export class DashboardProjectionStore {
 
   /** Capture calls this inside its raw-event transaction. Failure is isolated and repair is durable. */
   tryApplyRawRow(rawRowid: number, now = new Date(Date.now())) {
+    if (this.projectionOpenRefused()) return true;
     try {
       this.db.transaction(() => {
         if (this.failNextApply) {
@@ -1560,7 +1656,10 @@ export class DashboardProjectionStore {
       ).run(rawRowid, at);
       this.captureStatement(
         `update dashboard_projection_control set dirty = 1,
-          degraded_reason = 'projection_repair_backlog', last_error_at = ? where singleton = 1`,
+          degraded_reason = case
+            when degraded_reason in (${OPEN_REFUSAL_REASONS_SQL}) then degraded_reason
+            else 'projection_repair_backlog' end,
+          last_error_at = ? where singleton = 1`,
       ).run(at);
       return false;
     }
@@ -2680,7 +2779,7 @@ export class DashboardProjectionStore {
     // The refusal has to hold across ticks, or the first maintenance pass would
     // publish snapshots again and restore exactly the green count the open-time
     // guard withheld (bead eco-6hoxj.145).
-    if (this.schemaNewerThanBinary) {
+    if (this.projectionOpenRefused()) {
       return {
         backfillRowsVisited: 0, parityRowsVisited: 0, repairRowsVisited: 0,
         dirtySessionsVisited: 0, sessionRepairRowsVisited: 0, metricRowsVisited: 0,
@@ -2857,6 +2956,7 @@ export class DashboardProjectionStore {
           `update dashboard_projection_control set ready=case when generation>0 then 1 else 0 end,
             parity_ready=0,
             degraded_reason=case
+              when degraded_reason in (${OPEN_REFUSAL_REASONS_SQL}) then degraded_reason
               when degraded_reason='projection_clock_rollback' then degraded_reason
               when backfill_complete=0 or metric_backfill_complete=0 then 'projection_backfilling'
               else 'projection_repair_backlog' end where singleton=1`,
@@ -3609,10 +3709,11 @@ export class DashboardProjectionStore {
 
   status() {
     const c=this.control(); const backlog=this.backlog();
-    // The raw-insert triggers rewrite `degraded_reason` to the repair backlog
-    // whenever an event lands, so the refusal is reported from the guard
-    // itself rather than from a column a live capture can overwrite.
-    const degradedReason=this.schemaNewerThanBinary?PROJECTION_SCHEMA_NEWER:c.degradedReason;
+    // Open-refusal reasons are sticky in the control row (triggers, compact
+    // migration, and apply-failure all preserve them). In-process status still
+    // derives the served reason from the open-time flag so a rolled-back host
+    // cannot lose the line that says why counts are withheld.
+    const degradedReason=this.openRefusalReason()??c.degradedReason;
     return {schemaVersion:DASHBOARD_SCHEMA_VERSION,generation:c.generation,
       ready:Boolean(c.ready),parityReady:Boolean(c.parityReady),dirty:Boolean(c.dirty),
       degraded:Boolean(degradedReason),degradedReason,

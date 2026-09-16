@@ -319,7 +319,18 @@ alter table dashboard_session_source_window drop column last_token_event_at;
 The columns are additive and the old binary re-derives everything it needs, so
 dropping them restores session materialization exactly. Re-upgrading adds them
 back on open and refills them from the facts the ledger still holds. Rebuilding
-the projection from the raw ledger is the equivalent heavier alternative.
+the projection from the raw ledger is the equivalent heavier alternative: a
+loss-aware rebuild that can recover a host stuck on `projection_schema_newer`
+when the newer binary is gone. That rebuild is **owed work, not shipped** —
+see `issues/0177-loss-aware-projection-rebuild.md`. Until it exists, the only
+recovery on that path is re-installing a binary that understands the stored
+schema version.
+
+`dashboard_projection_control.degraded_reason` is the out-of-process stamp for
+the same refusal (`projection_schema_newer` or `projection_control_missing`).
+Repair-backlog writers leave those two values in place, so a support query
+against the column is not relabelled as `projection_repair_backlog`. A missing
+control row on an existing control table is not treated as a fresh install.
 
 The local activity scan is **bounded**: one cadence enumerates at most 256
 directory entries within 50 ms, keeps its cursor, and resumes on the next tick.
