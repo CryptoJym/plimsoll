@@ -1335,34 +1335,55 @@ export class RolloutTailer {
     let truncated = false;
     let errors = 0;
     let entriesVisited = 0;
+    // Same cap as TranscriptTailer.discover: test first, then count, so the
+    // entry that trips the limit is uncounted (REVIEW-78 N2).
+    const visit = () => {
+      if (entriesVisited >= limit) {
+        truncated = true;
+        return false;
+      }
+      entriesVisited += 1;
+      return true;
+    };
     const listDirs = (dir: string, root = false) => {
       try {
-        return this.io
-          .readDirents(dir)
-          .filter((entry) => entry.isDirectory())
-          .map((entry) => path.join(dir, entry.name));
+        const dirs: string[] = [];
+        for (const entry of this.io.readDirents(dir)) {
+          if (!visit()) break;
+          if (entry.isDirectory()) dirs.push(path.join(dir, entry.name));
+        }
+        return dirs;
       } catch (error) {
         if (!(root && (error as NodeJS.ErrnoException).code === "ENOENT")) errors += 1;
         return [];
       }
     };
     for (const directory of this.directories) {
-    if (options.scope === "recent") {
-      for (const offset of [0, 1]) {
-        const day = new Date(now.getTime() - offset * 24 * 60 * 60 * 1000);
-        const iso = day.toISOString().slice(0, 10);
-        dayDirs.push(path.join(directory, ...iso.split("-")));
-      }
-    } else {
-      // Full walk: sessions/YYYY/MM/DD — three bounded levels.
-      for (const year of listDirs(directory, true)) {
-        for (const month of listDirs(year)) {
-          dayDirs.push(...listDirs(month));
+      if (truncated) break;
+      if (options.scope === "recent") {
+        for (const offset of [0, 1]) {
+          const day = new Date(now.getTime() - offset * 24 * 60 * 60 * 1000);
+          const iso = day.toISOString().slice(0, 10);
+          dayDirs.push(path.join(directory, ...iso.split("-")));
+        }
+      } else {
+        // Full walk: sessions/YYYY/MM/DD — three bounded levels. Year, month
+        // and day directory entries count toward discoveryEntries, matching
+        // the recursive transcript walk (REVIEW-78 N2).
+        yearLoop: for (const year of listDirs(directory, true)) {
+          if (truncated) break;
+          for (const month of listDirs(year)) {
+            if (truncated) break yearLoop;
+            for (const day of listDirs(month)) {
+              if (truncated) break yearLoop;
+              dayDirs.push(day);
+            }
+          }
         }
       }
     }
-    }
     for (const dir of dayDirs) {
+      if (truncated) break;
       let entries: string[];
       try {
         entries = this.io.readNames(dir);
@@ -1381,16 +1402,11 @@ export class RolloutTailer {
         continue;
       }
       for (const entry of entries) {
-        entriesVisited += 1;
+        if (!visit()) break;
         if (entry.startsWith("rollout-") && entry.endsWith(".jsonl")) {
-          if (files.length >= limit) {
-            truncated = true;
-            break;
-          }
           files.push(path.join(dir, entry));
         }
       }
-      if (truncated) break;
     }
     return { files: files.sort(), truncated, errors, discoveryEntries: entriesVisited };
   }

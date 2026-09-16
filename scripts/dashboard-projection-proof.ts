@@ -3194,6 +3194,36 @@ async function main() {
       rendersTheR1ZeroSweep(cappedRow.reason) === false,
       { exhausted, cappedReceipt, scanState: cappedRow.activityState.scanState,
         status: cappedRow.status, reason: cappedRow.reason });
+    // REVIEW-78 N4: the equality above is not uniquely load-bearing if the
+    // only mutation is deleting `limitReached = true` — the complete-sweep
+    // check goes red first. Pin the increment-after-test order in `step()`
+    // so swapping it (count past the cap, then notice) fails this check
+    // even when the receipt still says limitReached.
+    const discoverySource = fs.readFileSync(
+      path.join(process.cwd(), "packages/collector-cli/src/incremental-jsonl-discovery.ts"),
+      "utf8",
+    );
+    const stepStart = discoverySource.indexOf("private step()");
+    const stepEnd = discoverySource.indexOf("private processPendingEntry()");
+    const stepBody = stepStart >= 0 && stepEnd > stepStart
+      ? discoverySource.slice(stepStart, stepEnd) : "";
+    const limitTestAt = stepBody.indexOf("if (this.visited >= this.options.maxEntries)");
+    const incrementAt = stepBody.indexOf("this.visited += 1");
+    const swappedStep =
+      "this.visited += 1;\n    if (this.visited >= this.options.maxEntries) {";
+    const capTestBeforeIncrement = (body: string) => {
+      const test = body.indexOf("if (this.visited >= this.options.maxEntries)");
+      const inc = body.indexOf("this.visited += 1");
+      return test >= 0 && inc >= 0 && test < inc;
+    };
+    check("lifetime_cap_is_tested_before_the_entry_is_counted",
+      capTestBeforeIncrement(stepBody) === true &&
+      capTestBeforeIncrement(swappedStep) === false &&
+      limitTestAt >= 0 && incrementAt > limitTestAt &&
+      exhausted.entriesVisited === EXHAUST_LIMIT &&
+      exhausted.entriesVisited === exhausted.lifetimeEntryLimit,
+      { limitTestAt, incrementAt, visited: exhausted.entriesVisited,
+        lifetime: exhausted.lifetimeEntryLimit });
     cappedBuffer.close();
     multiClaudeBuffer.close();
 
@@ -3224,7 +3254,9 @@ async function main() {
       transcriptDrained.limitReached === false &&
       transcriptDrained.lifetimeEntryLimit === 100_000 &&
       transcriptDrained.rootsTotal === 1 && transcriptDrained.rootsEligible === 1 &&
-      transcriptDrainedRow.reason.includes("activity scan still sweeping") &&
+      transcriptDrainedRow.reason.includes(
+        "activity scan finished this cadence and left no cursor to resume") &&
+      !transcriptDrainedRow.reason.includes("activity scan still sweeping") &&
       transcriptDrainedRow.reason.includes("1/1 capture root(s) enumerated") &&
       transcriptDrainedRow.reason.includes(
         `${transcriptDrained.entriesThisSweep} entr(ies) this sweep`) &&
@@ -3303,6 +3335,23 @@ async function main() {
       row.activityState.scanState === "in_progress" &&
       row.reason.includes("activity scan still sweeping");
     const restartedRow = codexScanRow(codexBuffer, restarted as never);
+    const drainedRow = codexScanRow(codexBuffer, drained as never);
+    /**
+     * REVIEW-78 N3: a drained cadence is the other three-field shape. The
+     * cursor finished, nothing resumes, and the reason names that empty
+     * cursor instead of claiming a successor is still sweeping.
+     */
+    const drainReceiptAgrees = (
+      scan: CaptureScanProgress,
+      row: { reason: string; activityState: { scanState: string } },
+    ) =>
+      scan.sweepComplete === true &&
+      scan.limitReached === false &&
+      scan.converging === false &&
+      row.activityState.scanState === "in_progress" &&
+      row.reason.includes(
+        "activity scan finished this cadence and left no cursor to resume") &&
+      !row.reason.includes("activity scan still sweeping");
     check("a_rollout_same_cadence_restart_agrees_on_converging_sweep_complete_and_reason",
       restartReceiptAgrees(restarted, restartedRow) === true &&
       // The must-red row: the field as r3 published it. A cursor does resume,
@@ -3326,6 +3375,18 @@ async function main() {
       { restarted: transcriptRestarted, restartedNext: transcriptRestartedNext,
         drained: transcriptDrained, reason: transcriptRestartedRow.reason,
         scanState: transcriptRestartedRow.activityState.scanState });
+    check("a_rollout_drained_cadence_agrees_on_sweep_complete_without_converging",
+      drainReceiptAgrees(drained, drainedRow) === true &&
+      drainReceiptAgrees({ ...drained, converging: true }, drainedRow) === false &&
+      drainReceiptAgrees(restarted, restartedRow) === false,
+      { drained, reason: drainedRow.reason, scanState: drainedRow.activityState.scanState });
+    check("a_transcript_drained_cadence_agrees_on_sweep_complete_without_converging",
+      drainReceiptAgrees(transcriptDrained, transcriptDrainedRow) === true &&
+      drainReceiptAgrees(
+        { ...transcriptDrained, converging: true }, transcriptDrainedRow) === false &&
+      drainReceiptAgrees(transcriptRestarted, transcriptRestartedRow) === false,
+      { drained: transcriptDrained, reason: transcriptDrainedRow.reason,
+        scanState: transcriptDrainedRow.activityState.scanState });
     twinRestartBuffer.close();
     // The same branch driven through the real renderer, not a literal: a
     // cadence that published activity with no scan receipt at all. Nothing
@@ -3463,6 +3524,178 @@ async function main() {
       { scan: unitCodex, filesSeen: unitCodexResult.filesSeen,
         reason: unitCodexRow.reason, swappedReason: swappedCodexRow.reason });
     unitCodexBuffer.close();
+
+    // REVIEW-78 N2: the explicit discover() walks now share entry-cap
+    // semantics and the full-walk rollout counts year/month/day directories.
+    const explicitClaudeDir = path.join(claudeRoot, "explicit", "root-00");
+    fs.mkdirSync(explicitClaudeDir, { recursive: true });
+    const nestedClaude = path.join(explicitClaudeDir, "nested");
+    fs.mkdirSync(nestedClaude, { recursive: true });
+    fs.writeFileSync(path.join(explicitClaudeDir, "session-0.jsonl"), "{}\n");
+    fs.writeFileSync(path.join(explicitClaudeDir, "notes.md"), "not a transcript\n");
+    fs.writeFileSync(path.join(nestedClaude, "session-1.jsonl"), "{}\n");
+    const explicitClaudeRoots = [{ rootId: "explicit-claude-0", profileId: "explicit-claude-p",
+      installationEpochId: "epoch-claude", source: "claude_code" as const,
+      directory: explicitClaudeDir }];
+    const explicitClaudeBuffer = claudeFixture("claude-explicit");
+    const explicitClaudeTailer = new TranscriptTailer(
+      explicitClaudeBuffer, explicitClaudeDir, undefined, explicitClaudeRoots);
+    const explicitClaude = await explicitClaudeTailer.scan({ scope: "full" });
+    explicitClaudeTailer.close();
+    const explicitClaudeCappedTailer = new TranscriptTailer(
+      explicitClaudeBuffer, explicitClaudeDir, undefined, explicitClaudeRoots,
+    );
+    const explicitClaudeCapped = await explicitClaudeCappedTailer.scan({
+      scope: "full", discoveryLimit: 2,
+    });
+    explicitClaudeCappedTailer.close();
+    // Root dirents: nested/, session-0.jsonl, notes.md (3). Nested dirent:
+    // session-1.jsonl (1). Total 4. The cap-2 walk counts the first two
+    // dirents of the root and leaves the rest uncounted.
+    const explicitClaudeEntries = Number(explicitClaude.activity.discoveryEntries);
+    const explicitClaudeCappedEntries = Number(explicitClaudeCapped.activity.discoveryEntries);
+    check("transcript_explicit_discover_caps_entries_and_does_not_count_the_tripping_entry",
+      explicitClaudeEntries === 4 &&
+      explicitClaude.activity.truncated === false &&
+      explicitClaude.filesSeen === 2 &&
+      explicitClaudeCappedEntries === 2 &&
+      explicitClaudeCapped.activity.truncated === true &&
+      explicitClaudeCappedEntries < explicitClaudeEntries,
+      { uncapped: explicitClaude.activity, capped: explicitClaudeCapped.activity,
+        filesSeen: explicitClaude.filesSeen });
+    explicitClaudeBuffer.close();
+
+    const explicitCodexDir = path.join(codexRoot, "explicit", "root-00");
+    const explicitDay = path.join(explicitCodexDir, "2026", "07", "15");
+    fs.mkdirSync(explicitDay, { recursive: true });
+    fs.writeFileSync(path.join(explicitDay, "rollout-0.jsonl"), "{}\n");
+    fs.writeFileSync(path.join(explicitDay, "rollout-1.jsonl"), "{}\n");
+    fs.writeFileSync(path.join(explicitDay, "notes.md"), "not a rollout\n");
+    const explicitCodexRoots = [{ rootId: "explicit-codex-0", profileId: "explicit-codex-p",
+      installationEpochId: "epoch-codex", source: "codex" as const,
+      directory: explicitCodexDir }];
+    const explicitCodexBuffer = new LocalEventBuffer(
+      path.join(root, "capture-health-codex-explicit.sqlite"));
+    explicitCodexBuffer.append(event({
+      source: "codex", eventType: "usage_rollout", sessionId: uuid(930_007),
+      observedAt: new Date(NOW.getTime() - 3 * 60 * 60_000).toISOString(),
+      inputTokens: 1_200, outputTokens: 340, costUsd: 0.004,
+    }));
+    settle(explicitCodexBuffer, NOW, 30);
+    const explicitCodexTailer = new RolloutTailer(
+      explicitCodexBuffer, explicitCodexDir, () => [], undefined, explicitCodexRoots);
+    const explicitCodex = await explicitCodexTailer.scan({ scope: "full", now: NOW });
+    explicitCodexTailer.close();
+    const explicitCodexCappedTailer = new RolloutTailer(
+      explicitCodexBuffer, explicitCodexDir, () => [], undefined, explicitCodexRoots,
+    );
+    const explicitCodexCapped = await explicitCodexCappedTailer.scan({
+      scope: "full", now: NOW, discoveryLimit: 2,
+    });
+    explicitCodexCappedTailer.close();
+    // Year + month + day directory entries (3) plus three names in the day
+    // partition (2 rollouts + notes) = 6. A file-only counter would report 3.
+    const explicitCodexEntries = Number(explicitCodex.activity.discoveryEntries);
+    const explicitCodexCappedEntries = Number(explicitCodexCapped.activity.discoveryEntries);
+    check("rollout_explicit_discover_counts_dir_entries_and_caps_like_transcript",
+      explicitCodexEntries === 6 &&
+      explicitCodex.activity.truncated === false &&
+      explicitCodex.filesSeen === 2 &&
+      explicitCodexCappedEntries === 2 &&
+      explicitCodexCapped.activity.truncated === true &&
+      explicitCodexCappedEntries < explicitCodexEntries,
+      { uncapped: explicitCodex.activity, capped: explicitCodexCapped.activity,
+        filesSeen: explicitCodex.filesSeen });
+    explicitCodexBuffer.close();
+
+    // REVIEW-78 residual: limitReached returns above restart(), every
+    // restart() call site returns before another retire, successorInstalled
+    // resets at scan() start, and converging never pairs with limitReached.
+    const pinTailerOrdering = (source: string) => {
+      const scanAt = source.indexOf("async scan(");
+      const runScanAt = source.indexOf("private async runScan(");
+      const scanBody = scanAt >= 0 && runScanAt > scanAt
+        ? source.slice(scanAt, runScanAt) : "";
+      const resetAt = scanBody.indexOf("this.successorInstalled = false");
+      const runScanCallAt = scanBody.indexOf("this.runScan(");
+      const limitAt = source.indexOf("if (chunk.errors > 0 || chunk.limitReached)");
+      let restartAt = source.indexOf("this.restart(");
+      const firstRestart = restartAt;
+      const restartSites: string[] = [];
+      while (restartAt >= 0) {
+        const after = source.slice(restartAt, restartAt + 800);
+        const returnAt = after.indexOf("return result");
+        const retireAt = after.indexOf("this.retire(");
+        const nextRestart = after.indexOf("this.restart(", 1);
+        restartSites.push(after.slice(0, Math.max(returnAt, 0) + "return result".length));
+        if (returnAt < 0) return { ok: false, resetAt, runScanCallAt, limitAt, firstRestart,
+          restartReturns: false, retireBetween: true };
+        if (retireAt >= 0 && retireAt < returnAt) {
+          return { ok: false, resetAt, runScanCallAt, limitAt, firstRestart,
+            restartReturns: true, retireBetween: true };
+        }
+        if (nextRestart >= 0 && nextRestart < returnAt) {
+          return { ok: false, resetAt, runScanCallAt, limitAt, firstRestart,
+            restartReturns: false, retireBetween: false };
+        }
+        restartAt = source.indexOf("this.restart(", restartAt + 1);
+      }
+      return {
+        ok: resetAt >= 0 && runScanCallAt > resetAt &&
+          limitAt >= 0 && firstRestart > limitAt && restartSites.length >= 2,
+        resetAt, runScanCallAt, limitAt, firstRestart,
+        restartReturns: restartSites.length >= 2,
+        retireBetween: false,
+        restartSites: restartSites.length,
+      };
+    };
+    const transcriptSource = fs.readFileSync(
+      path.join(process.cwd(), "packages/collector-cli/src/transcript-tailer.ts"), "utf8");
+    const rolloutSource = fs.readFileSync(
+      path.join(process.cwd(), "packages/collector-cli/src/rollout-tailer.ts"), "utf8");
+    const transcriptOrder = pinTailerOrdering(transcriptSource);
+    const rolloutOrder = pinTailerOrdering(rolloutSource);
+    const reorderedProbe = pinTailerOrdering(
+      "async scan() {\n  const result = await this.runScan();\n  this.successorInstalled = false;\n}\n" +
+      "private async runScan() {\n  this.restart(attempt, next);\n  return result;\n" +
+      "  if (chunk.errors > 0 || chunk.limitReached) { return result; }\n}");
+    check("limit_reached_returns_above_restart_and_successor_resets_each_cadence",
+      transcriptOrder.ok === true && rolloutOrder.ok === true &&
+      reorderedProbe.ok === false,
+      { transcriptOrder, rolloutOrder, reorderedProbe });
+
+    const limitDiscovery: DiscoveryProgress = {
+      rootsTotal: 1, rootsStarted: 1, openDirectories: 0,
+      entriesVisited: 5, lifetimeEntryLimit: 5, limitReached: true, finished: true,
+    };
+    const successorAfterLimit = captureScanProgress({
+      discovery: limitDiscovery,
+      configuredRoots: 1,
+      eligibleRoots: 1,
+      pendingFiles: 0,
+      entriesThisTick: 5,
+      deferredBeforeIo: false,
+      lifetimeEntryLimit: 5,
+      cursorRetired: true,
+      successorInstalled: true,
+    });
+    const successorInstalled = true;
+    const retired = true;
+    const oldConverging = successorInstalled === true ||
+      (!retired && limitDiscovery !== null && !limitDiscovery.limitReached &&
+        !limitDiscovery.finished);
+    check("converging_never_pairs_with_limit_reached_even_if_a_successor_is_installed",
+      successorAfterLimit.limitReached === true &&
+      successorAfterLimit.converging === false &&
+      successorAfterLimit.sweepComplete === false &&
+      oldConverging === true &&
+      drained.converging === false && drained.limitReached === false &&
+      restarted.converging === true && restarted.limitReached === false &&
+      !(restarted.converging && restarted.limitReached) &&
+      !(drained.converging && drained.limitReached) &&
+      !(codexLimitBaseline.converging && codexLimitBaseline.limitReached) &&
+      !(claudeLimitBaseline.converging && claudeLimitBaseline.limitReached),
+      { successorAfterLimit, oldConverging, drained, restarted });
 
     codexBuffer.close();
 

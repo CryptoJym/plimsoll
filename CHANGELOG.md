@@ -35,6 +35,11 @@ does not transfer its sessions to a tailer.
 
 ### Fixed
 
+- Capture-health receipts count the same directory entries on both explicit
+  discover walks, name a drained cadence as finished with no cursor to resume,
+  and never pair `converging` with `limitReached`. Retry class follows
+  `discoveryEntries` visited this cadence, not pending files behind the
+  metadata gate (REVIEW-78).
 - Daemon session sync now converges without `upload-history --sessions`. A
   failed or interrupted 5-minute refresh survives restart, and a ledger
   catch-up covers sessions whose events were already uploaded so they never

@@ -120,9 +120,13 @@ export function captureScanProgress(input: {
     // which keeps the cursor untouched. A same-cadence restart also resumes:
     // it retired the cursor that did the work and left a fresh successor
     // behind, so the sweep is still converging even though this cadence's
-    // receipt reports a completed sweep.
-    converging: input.successorInstalled === true ||
-      (!retired && discovery !== null && !discovery.limitReached && !discovery.finished),
+    // receipt reports a completed sweep. A lifetime-limit cursor never
+    // resumes, so `successorInstalled` cannot pair `converging` with
+    // `limitReached` (REVIEW-78 residual, bead eco-6hoxj.147).
+    converging: discovery?.limitReached !== true && (
+      input.successorInstalled === true ||
+      (!retired && discovery !== null && !discovery.finished)
+    ),
     // Only a cursor can report a finished sweep: no cursor is no receipt,
     // which is exactly the state of every cadence of the baseline phase. A
     // cursor closed short of its roots reports `finished` too, so a sweep that

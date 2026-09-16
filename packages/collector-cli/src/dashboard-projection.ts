@@ -219,6 +219,12 @@ function describeCaptureScan(local:Record<string,unknown>|undefined):
     summary:`activity scan hit its lifetime entry limit and restarts instead of resuming — ${budget}`,scan};
   if(scan?.deferredBeforeIo)return{state:"deferred",
     summary:`activity scan deferred before filesystem work — ${budget}`,scan};
+  // A drained cadence finished this cursor and left none to resume. Truncated
+  // is still set (the attempt ended), so the scan stays in_progress and the
+  // health label is unchanged; the reason names the empty-cursor shape so it
+  // is not re-read as a same-cadence restart (REVIEW-78 N3).
+  if(scan?.sweepComplete&&scan.converging===false)return{state:"in_progress",
+    summary:`activity scan finished this cadence and left no cursor to resume — ${budget}`,scan};
   return{state:"in_progress",summary:`activity scan still sweeping — ${budget}`,scan};
 }
 
