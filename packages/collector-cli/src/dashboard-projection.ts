@@ -176,9 +176,24 @@ function parseCaptureScan(value:unknown):CaptureScanProgress|null{
   }catch{return null;}
 }
 
-function minutesAgo(ageMs:number){return `${Math.max(0,Math.round(ageMs/60_000))}m`;}
-/** A future-dated stamp, printed as the signed age `minutesAgo` would hide. */
-function minutesAhead(ageMs:number){return `${Math.round(-ageMs/60_000)}m`;}
+function parsedStampMs(value:string|null|undefined):number|null{
+  if(!value)return null;
+  const parsed=Date.parse(value);
+  return Number.isFinite(parsed)?parsed:null;
+}
+function minutesAgo(ageMs:number){
+  if(!Number.isFinite(ageMs))return "unknown";
+  return `${Math.max(0,Math.round(ageMs/60_000))}m`;
+}
+/** A future-dated stamp, printed as the signed age `minutesAgo` would hide.
+ * Below one minute, round to whole seconds: `Math.round(ms/60_000)` is `0m`
+ * for any skew under 30s (bead eco-6hoxj.73.4 / REVIEW-73-r2 F5). */
+function minutesAhead(ageMs:number){
+  if(!Number.isFinite(ageMs))return "unknown";
+  const aheadMs=Math.max(0,-ageMs);
+  if(aheadMs<60_000)return `${Math.max(1,Math.round(aheadMs/1_000))}s`;
+  return `${Math.round(aheadMs/60_000)}m`;
+}
 /**
  * `rootsTotal` is the host's configured capture roots for the source; only the
  * `ready` ones are eligible for a sweep. Name the difference when there is one
@@ -3613,19 +3628,26 @@ export class DashboardProjectionStore {
         ?{state:"not_applicable" as CaptureScanState,
           summary:"hook-delivered source — there is no local activity scan",scan:null}
         :describeCaptureScan(local);
-      const eventAgeMs=latest.lastEventAt?now.getTime()-Date.parse(latest.lastEventAt):null;
+      const eventAtMs=parsedStampMs(latest.lastEventAt);
+      const eventAgeMs=eventAtMs===null?null:now.getTime()-eventAtMs;
       // `eventAgeMs` is signed and `last_event_at` is a monotone max, so a single
       // future-dated event would otherwise hold the freshness credit — and the
       // green label — for the whole skew interval, on a source that may be dead.
       // A stamp ahead of the clock is not evidence of capture; say so instead.
+      // An unparseable stamp is the same class of non-evidence: Date.parse would
+      // make `eventAgeMs` NaN and `minutesAgo`/`minutesAhead` would print `NaNm`
+      // (bead eco-6hoxj.73.4 / REVIEW-73-r2 F6). Fail-safe amber; do not guess.
+      const eventStampUnusable=Boolean(latest.lastEventAt)&&eventAtMs===null;
       const eventsFuture=eventAgeMs!==null&&eventAgeMs<0;
       const eventsFresh=eventAgeMs!==null&&eventAgeMs>=0&&eventAgeMs<=CAPTURE_EVENT_CADENCE_MS;
       const futureReason=()=>`newest event is ${minutesAhead(eventAgeMs!)} in the future — `+
         `clock skew or a future-dated producer; capture state cannot be judged`;
+      const unusableReason=()=>`newest event timestamp is unparseable — capture state cannot be judged`;
       const neverCaptured=!latest.lastEventAt&&Number(sessions.ledgerSessionsToday??0)===0;
       let status:"green"|"amber"|"red"|"no_events"="green"; let reason="capture current";
       if(capture==="hook_only"){
         if(neverCaptured){status="no_events";reason="configured source with no events captured yet";}
+        else if(eventStampUnusable){status="amber";reason=unusableReason();}
         else if(eventsFuture){status="amber";reason=futureReason();}
         else if(!countsAvailable){status="amber";reason=`${countWarning} (hook-delivered)`;}
         else if(eventsFresh)reason=`capture current — ${countLabel} (hook-delivered)`;
@@ -3633,14 +3655,25 @@ export class DashboardProjectionStore {
           reason=`no hook event for ${minutesAgo(eventAgeMs??0)} — hook delivery cannot be confirmed `+
             `within the expected ${minutesAgo(CAPTURE_EVENT_CADENCE_MS)} cadence`;}
       } else {
-        const activityAge=local?.lastActivityAt?now.getTime()-Date.parse(String(local.lastActivityAt)):null;
-        const lag=local?.lastActivityAt
-          ?(latest.lastEventAt?Date.parse(String(local.lastActivityAt))-Date.parse(latest.lastEventAt):Infinity)
-          :null;
+        const activityAtMs=parsedStampMs(local?.lastActivityAt?String(local.lastActivityAt):null);
+        const activityAge=activityAtMs===null?null:now.getTime()-activityAtMs;
+        // Lag is lastActivityAt − lastEventAt. A newest event ahead of the clock
+        // makes lag negative, so this red cannot fire: the ledger watermark is
+        // already ahead of local activity. After eco-6hoxj.73.3, far-future stamps
+        // are clamped at intake; residual / in-bound skew is named as future amber
+        // (REVIEW-73-r2 F7). Do not substitute now for lastEventAt — that still
+        // yields a negative lag — and do not treat a future stamp as missing,
+        // which would false-red a capturing source with clock skew. An unparseable
+        // stamp is not a watermark: lag stays null so the fail-safe amber above
+        // lag-red can speak.
+        const lag=activityAtMs===null?null
+          :eventAtMs!==null?activityAtMs-eventAtMs
+          :latest.lastEventAt?null:Infinity;
         // Capture truth first (bead eco-6hoxj.73). Local artifacts that are not
         // reaching the ledger are the failure this label exists for, and a scan
         // that is merely still sweeping must never mask or outrank them.
-        if(activityAge!==null&&activityAge<=CAPTURE_ACTIVITY_LOOKBACK_MS&&lag!==null&&lag>CAPTURE_LAG_LIMIT_MS){
+        if(eventStampUnusable){status="amber";reason=unusableReason();}
+        else if(activityAge!==null&&activityAge<=CAPTURE_ACTIVITY_LOOKBACK_MS&&lag!==null&&lag>CAPTURE_LAG_LIMIT_MS){
           status="red";reason="recent local activity is not reaching the projected ledger";
         }
         else if(!countsAvailable){status="amber";reason=eventsFuture?futureReason():countWarning;}

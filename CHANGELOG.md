@@ -43,6 +43,10 @@ does not transfer its sessions to a tailer.
 
 ### Fixed
 
+- Capture-health names sub-minute future skew in seconds, never renders `NaNm`
+  for an unparseable `last_event_at` (fail-safe amber), and keeps future-amber
+  rather than lag-red when the ledger watermark is ahead of the clock
+  (REVIEW-73-r2 F5–F7).
 - A managed-config reconcile that loses the state-file lock still writes its
   apply/refuse receipt; the stamp, backoff map and backup record retry on the
   next tick. The event-loop chunk proof uses a CI-safe bound so a cold runner

@@ -239,7 +239,12 @@ ledger?*
   A future-dated event never earns the freshness credit: `last_event_at` only
   ever moves forward, so a clock-skewed or future-dated producer would otherwise
   hold a dead source green for the whole skew interval. The reason carries the
-  signed age (`newest event is 1500m in the future …`), as does `lastEventAgeMs`.
+  signed age (`newest event is 1500m in the future …`, or seconds when the skew
+  is below one minute), as does `lastEventAgeMs`. An unparseable `last_event_at`
+  is fail-safe amber (`newest event timestamp is unparseable`) and never prints
+  `NaNm`. A future stamp makes lag (`lastActivityAt − lastEventAt`) negative, so
+  it cannot raise the capture-lag red; future amber is the signal. Far-future
+  producer stamps are clamped at intake (eco-6hoxj.73.3).
 - **red** — local activity is demonstrably *not* reaching the ledger.
 - **no_events** — the source is configured and enumerated, and has captured
   nothing yet. It is never absent and never reads as healthy, and it does not

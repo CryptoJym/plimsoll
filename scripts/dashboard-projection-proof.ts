@@ -1730,6 +1730,99 @@ async function main() {
       { status: skewedDeadClaude.status, reason: skewedDeadClaude.reason,
         lastEventAgeMs: skewedDeadClaude.lastEventAgeMs });
 
+    // Bead eco-6hoxj.73.4 / REVIEW-73-r2 F5–F7. `minutesAhead` rounded a
+    // 20s future stamp to `0m`; an unparseable `last_event_at` became `NaNm`;
+    // lag = lastActivityAt − lastEventAt is negative under a future stamp, so
+    // lag-red cannot fire. After .73.3, far-future is clamped at intake;
+    // residual / in-bound skew is future-amber, not a false capture-lag red.
+    const SUB_MINUTE_FUTURE_MS = -20_000;
+    const subMinute = futureDated("future-sub-minute", [
+      { source: "grok", ageMs: SUB_MINUTE_FUTURE_MS },
+      { source: "claude_code", ageMs: 5 * 60_000 },
+      { source: "codex", ageMs: 5 * 60_000 },
+    ]);
+    settle(subMinute, NOW, 30);
+    const subMinuteGrok = (readySnapshot(subMinute, 30).status.health as {
+      sources: Array<{ source: string; status: string; reason: string; lastEventAgeMs: number | null }>;
+    }).sources.find((row) => row.source === "grok")!;
+    check("sub_minute_future_skew_is_named_in_seconds_not_zero_minutes",
+      subMinuteGrok.status === "amber" &&
+      subMinuteGrok.reason === "newest event is 20s in the future — clock skew or a future-dated " +
+        "producer; capture state cannot be judged" &&
+      !subMinuteGrok.reason.includes("0m") && !subMinuteGrok.reason.includes("NaN") &&
+      subMinuteGrok.lastEventAgeMs === SUB_MINUTE_FUTURE_MS,
+      { status: subMinuteGrok.status, reason: subMinuteGrok.reason,
+        lastEventAgeMs: subMinuteGrok.lastEventAgeMs });
+    subMinute.close();
+
+    const unparseable = futureDated("unparseable-stamp", [
+      { source: "grok", ageMs: 5 * 60_000 },
+      { source: "claude_code", ageMs: 5 * 60_000 },
+      { source: "codex", ageMs: 5 * 60_000 },
+    ]);
+    unparseable.database.prepare(
+      `update dashboard_source_lifetime set last_event_at=? where source=?`,
+    ).run("not-a-timestamp", "grok");
+    const unparseableGrok = (readySnapshot(unparseable, 30).status.health as {
+      sources: Array<{ source: string; status: string; reason: string; lastEventAgeMs: number | null }>;
+    }).sources.find((row) => row.source === "grok")!;
+    check("unparseable_last_event_at_is_fail_safe_amber_and_never_nanm",
+      unparseableGrok.status === "amber" &&
+      unparseableGrok.reason === "newest event timestamp is unparseable — capture state cannot be judged" &&
+      !unparseableGrok.reason.includes("NaN") && unparseableGrok.lastEventAgeMs === null,
+      { status: unparseableGrok.status, reason: unparseableGrok.reason,
+        lastEventAgeMs: unparseableGrok.lastEventAgeMs });
+
+    unparseable.projection.recordCaptureActivity({
+      source: "claude_code",
+      lastActivityAt: new Date(NOW.getTime() - 60_000).toISOString(),
+      filesToday: 3,
+      discoveryEntries: MANY_ROOT_SCAN.entriesThisTick,
+      lastScanAt: new Date(NOW.getTime() - 30_000).toISOString(),
+      truncated: true,
+      scan: MANY_ROOT_SCAN,
+    });
+    unparseable.database.prepare(
+      `update dashboard_source_lifetime set last_event_at=? where source=?`,
+    ).run("not-a-timestamp", "claude_code");
+    const unparseableClaude = (readySnapshot(unparseable, 30).status.health as {
+      sources: Array<{ source: string; status: string; reason: string; lastEventAgeMs: number | null }>;
+    }).sources.find((row) => row.source === "claude_code")!;
+    check("unparseable_last_event_at_with_recent_local_activity_is_amber_not_lag_red",
+      unparseableClaude.status === "amber" &&
+      unparseableClaude.reason === "newest event timestamp is unparseable — capture state cannot be judged" &&
+      !unparseableClaude.reason.includes("not reaching the projected ledger") &&
+      !unparseableClaude.reason.includes("NaN") && unparseableClaude.lastEventAgeMs === null,
+      { status: unparseableClaude.status, reason: unparseableClaude.reason,
+        lastEventAgeMs: unparseableClaude.lastEventAgeMs });
+    unparseable.close();
+
+    const futureLag = futureDated("future-lag", [
+      { source: "claude_code", ageMs: FUTURE_MS },
+    ]);
+    futureLag.projection.recordCaptureActivity({
+      source: "claude_code",
+      lastActivityAt: new Date(NOW.getTime() - 60_000).toISOString(),
+      filesToday: 3,
+      discoveryEntries: MANY_ROOT_SCAN.entriesThisTick,
+      lastScanAt: new Date(NOW.getTime() - 30_000).toISOString(),
+      truncated: true,
+      scan: MANY_ROOT_SCAN,
+    });
+    settle(futureLag, NOW, 30);
+    const futureLagClaude = (readySnapshot(futureLag, 30).status.health as {
+      sources: Array<{ source: string; status: string; reason: string; lastEventAgeMs: number | null }>;
+    }).sources.find((row) => row.source === "claude_code")!;
+    check("future_last_event_at_does_not_false_red_recent_local_activity_as_capture_lag",
+      futureLagClaude.status === "amber" &&
+      futureLagClaude.reason.includes("1500m in the future") &&
+      futureLagClaude.reason.includes("capture state cannot be judged") &&
+      futureLagClaude.reason !== "recent local activity is not reaching the projected ledger" &&
+      futureLagClaude.lastEventAgeMs === FUTURE_MS,
+      { status: futureLagClaude.status, reason: futureLagClaude.reason,
+        lastEventAgeMs: futureLagClaude.lastEventAgeMs });
+    futureLag.close();
+
     // Bead eco-6hoxj.73.3: the two checks above are the last line of defence —
     // they prove the LABEL stays honest once a future stamp is already in the
     // ledger. These prove the stamp never gets there on the tailers. The OTLP
