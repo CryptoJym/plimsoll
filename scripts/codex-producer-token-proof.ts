@@ -1161,7 +1161,7 @@ async function main() {
       "rotate_never_provisions_and_rejects_an_unknown_source_or_grace",
       unprovisioned.status === 1 &&
         !fs.existsSync(path.join(unprovisionedPlimsoll, "local-ingest-auth.json")) &&
-        badSource.status === 1 && badSource.stderr.includes("--source codex") &&
+        badSource.status === 1 && badSource.stderr.includes("--source <claude_code|codex|gemini_cli|grok>") &&
         badGrace.status === 1 && badGrace.stderr.includes("--grace-seconds") &&
         readLocalIngestAuth(migratePlimsoll)!.codexProducer === rotatedAuth.codexProducer,
       {

@@ -636,6 +636,11 @@ export function createCollectorServer(
      * Absent, the cached authority is final.
      */
     localAuthHome?: string;
+    /**
+     * Injectable clock for the producer rotation grace deadline (proof
+     * fixtures). Production defaults to wall-clock time.
+     */
+    producerAuthNowMs?: () => number;
     /** Private hash registry home; no provisioning occurs on the listener. */
     liveProducerHome?: string;
     /** Proof-injectable per-source admission ceiling (defaults to the limit). */
@@ -692,8 +697,9 @@ export function createCollectorServer(
   // admission keeps using the installed authority either way. The stat still
   // runs, so the repaired file is picked up on the first request after it moves.
   let unreadableAuthStamp: string | null = null;
+  const producerAuthNowMs = options.producerAuthNowMs ?? Date.now;
   const graceWindowClosed = (auth: LocalIngestAuth) => {
-    const now = Date.now();
+    const now = producerAuthNowMs();
     return Object.values(auth.rotations ?? {}).some((rotation) => rotation.expiresAt <= now);
   };
   const refreshProducerAuth = (loaded: LocalIngestAuth) => {
@@ -710,7 +716,7 @@ export function createCollectorServer(
     // writes: the credential file belongs to `rotate-producer-token`. The
     // stamp advances only after the load succeeded, and it is the stamp read
     // *before* the load, so a file that changed mid-read is re-read next time.
-    const reloaded = readLiveProducerAuth(home);
+    const reloaded = readLiveProducerAuth(home, producerAuthNowMs());
     if (!reloaded) {
       unreadableAuthStamp = stamp;
       return loaded;
@@ -723,7 +729,7 @@ export function createCollectorServer(
   const assertProducer = (request: http.IncomingMessage, source: LocalProducerSource) => {
     const loaded = producerAuth;
     if (!loaded) return;
-    assertProducerToken(request, refreshProducerAuth(loaded), source, requestUrl(request));
+    assertProducerToken(request, refreshProducerAuth(loaded), source, requestUrl(request), producerAuthNowMs());
   };
 
   // Issue #0075 (#144): repeated identical admission rejections are

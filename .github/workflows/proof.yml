@@ -128,6 +128,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:codex-producer-token
 
+      - name: Prove producer-token rotation for every source against a running collector (eco-6hoxj.152)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:producer-token-rotation
+
       - name: Prove desktop TOML reconciliation and independent setup targets
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:setup-toml-reconcile
