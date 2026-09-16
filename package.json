@@ -87,6 +87,7 @@
     "proof:capture-roots-add": "tsx scripts/capture-roots-add-proof.ts",
     "proof:fixture-root-guard": "tsx scripts/fixture-root-guard-proof.ts",
     "proof:install-doctor": "tsx scripts/install-doctor-proof.ts",
+    "proof:doctor-stale-producers": "tsx scripts/doctor-stale-producers-proof.ts",
     "proof:launch-agent": "tsx scripts/launch-agent-transaction-proof.ts",
     "proof:collector-home": "tsx scripts/collector-home-proof.ts",
     "proof:launch-agent-unload": "tsx scripts/launch-agent-unload-proof.ts",

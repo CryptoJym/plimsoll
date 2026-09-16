@@ -26,6 +26,20 @@ does not transfer its sessions to a tailer.
 
 ## Unreleased
 
+### Added
+
+- `doctor --read-only --json` reports `producerProcesses`: the local Codex,
+  Claude Code, Gemini CLI and Grok processes, each with its config home, start
+  time, managed surface, managed-apply time, `staleConfig`, owner (launchd
+  label, conductor seat, desktop app) and a restart hint. When any producer
+  started before its managed config was last applied, doctor adds one
+  `summary` line naming how to restart them. Readiness is unchanged, a process
+  whose environment cannot be read is `unknown` and never stale, and no token,
+  command line or path outside `$HOME` is printed.
+- While `source_required` or `producer_token_required` rejections are open,
+  `status` names the stale-producer count in the capture source's reason,
+  from a background scan cached for at most 60 seconds.
+
 ### Fixed
 
 - Automatic maintenance now keeps committed progress across deadlines, bounds
