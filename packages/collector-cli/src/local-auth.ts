@@ -237,7 +237,14 @@ function writeAuth(
       // overwritten by a copy of the file this write started from -- putting
       // the operator-revoked token back as `current` with no deadline. Checked
       // immediately before the rename, the only window left is the rename
-      // itself, with no syscall in between to widen it.
+      // itself (~5 µs p50 / 31 µs max, measured), with no syscall in between
+      // to widen it.
+      //
+      // No shared exclusive lock across fill and rotate: fill runs once
+      // against a pre-gemini/grok legacy file, then both audiences exist and
+      // the fill path is never taken again. A lock would serialize every
+      // later rotation for a one-shot migration. Abandon-on-drift already
+      // keeps the rotation that landed; the residual rename race is accepted.
       if (options.abandonUnlessStamp !== undefined &&
         localIngestAuthStamp(home) !== options.abandonUnlessStamp) {
         throw new LocalIngestAuthDrift();
@@ -261,7 +268,7 @@ function writeNewAuth(home: string, overwrite: boolean) {
 
 /**
  * Producer audiences this process minted for a legacy credential file whose
- * fill write could not land, keyed by resolved credential home. Without it a
+ * fill write could not land, keyed by realpath of the credential home. Without it a
  * load in an unwritable home hands out a different gemini/grok token on every
  * call, so a producer configured against one of them is refused by the next
  * one. Process-lifetime only: the stored file, once writable again, wins.
@@ -276,7 +283,11 @@ type UnpersistedFill = {
 };
 
 function homeKey(home: string) {
-  return path.resolve(home);
+  try {
+    return fs.realpathSync(home);
+  } catch {
+    return path.resolve(home);
+  }
 }
 
 /** Value-blind: which producer audiences the stored authority is missing. */
@@ -307,7 +318,16 @@ function authAfterDrift(home: string, now: number, abandoned: LocalIngestAuth): 
   const reread = readLocalIngestAuth(home);
   if (!reread) return abandoned;
   const live = withoutClosedRotations(reread, now);
-  return live.geminiCliProducer && live.grokProducer ? Object.freeze(live) : abandoned;
+  if (live.geminiCliProducer && live.grokProducer) return Object.freeze(live);
+  // Winner is still a legacy file: this process keeps serving the tokens it
+  // minted, so remember them. Without the memo, a writable home makes doctor
+  // derive "nothing unpersisted" from the stored file.
+  unpersistedFills.set(homeKey(home), {
+    geminiCliProducer: abandoned.geminiCliProducer!,
+    grokProducer: abandoned.grokProducer!,
+    audiences: missingProducerAudiences(live),
+  });
+  return abandoned;
 }
 
 function homeAcceptsAFillWrite(home: string) {

@@ -413,9 +413,9 @@ Config tools:
       acknowledged is counted as skipped, so re-running is a no-op — and an
       already-replayed row never consumes a slot of --limit and is never truncated by
       it, so a lifetime of replays can never crowd out or hide a dead letter written
-      today. When a full --limit of ACTIONABLE candidates re-queues nothing the JSON
-      carries a hint naming --since; inert skips alone never raise it. --dry-run
-      classifies with zero writes.
+      today. When more than --limit ACTIONABLE candidates exist and the run re-queues
+      nothing the JSON carries a hint naming --since; an exact --limit pool and inert
+      skips alone never raise it. --dry-run classifies with zero writes.
   push-repo-labels [--dry-run] [--yes] [--url URL]
   sync-outcomes --repository owner/repo [--since-days 30] [--rework-window-days 14] [--until ISO] [--dry-run] [--url URL]
       Same fetch surface as the local efficiency report (pull list, check-runs and
@@ -1653,12 +1653,17 @@ function codexProfileTokenState(file: string): "managed" | "unmanaged" | "malfor
  */
 function skippedProfilesReceipt(
   skipped: ReadonlyArray<{ profile: { slug: string; path: string }; state: string }>,
+  home: string,
 ) {
   if (skipped.length === 0) return {};
   return {
     profilesSkipped: skipped.map(({ profile, state }) => ({
       slug: profile.slug,
-      path: profile.path,
+      ...homeScopedDiscoveredPath(
+        profile.path,
+        path.join(codexProfilesRoot(home), profile.slug, "config.toml"),
+        home,
+      ),
       status: "skipped" as const,
       reason: state === "malformed"
         ? "codex_profile_config_unreadable"
@@ -3711,10 +3716,20 @@ async function main() {
     const rotateProfilesSkipped = rotateProfiles.filter((entry) => entry.state !== "managed");
     type RotateTarget = {
       path: string;
+      slug?: string;
       /** True for a target found on disk rather than declared by Plimsoll. */
       discovered?: true;
       run: (options: typeof rotateOptions, preview: boolean) => ReturnType<typeof applyCodexConfig>;
     };
+    const rotateHome = os.homedir();
+    const rotateTargetReceipt = (target: RotateTarget) =>
+      target.discovered && target.slug
+        ? homeScopedDiscoveredPath(
+            target.path,
+            path.join(codexProfilesRoot(rotateHome), target.slug, "config.toml"),
+            rotateHome,
+          )
+        : { path: target.path };
     const rotateTargets: RotateTarget[] = [
       {
         path: rotateHeaderFile,
@@ -3730,6 +3745,7 @@ async function main() {
         .filter((entry) => entry.state === "managed")
         .map(({ profile }): RotateTarget => ({
           path: profile.path,
+          slug: profile.slug,
           discovered: true,
           run: (options: typeof rotateOptions, preview: boolean) =>
             applyCodexConfig(profile.path, generateCodexConfigToml(options), {
@@ -3773,16 +3789,19 @@ async function main() {
       // A dry run mints nothing, so the plan lines for the discovered profiles
       // are previewed against a placeholder that is never written and never
       // printed: it only makes the reconciler report the managed exporter
-      // headers a real rotation would rewrite.
+      // headers a real rotation would rewrite. A discovered profile that
+      // already refused preflight is would_refuse, not a plan line.
       for (const target of rotateTargets.filter((entry) => entry.discovered)) {
+        if (preflight.find((entry) => entry.target === target)?.refusal) continue;
         let preview: ReturnType<typeof applyCodexConfig> | undefined;
         try {
           preview = target.run({ ...rotateOptions, codexProducerToken: ROTATION_PREVIEW_TOKEN }, true);
         } catch {
           preview = undefined;
         }
+        const reportedPath = rotateTargetReceipt(target).path;
         for (const entry of preview?.plan ?? []) {
-          console.log(`${target.path}: ${entry.key} ${entry.action}`);
+          console.log(`${reportedPath}: ${entry.key} ${entry.action}`);
         }
       }
       console.log(JSON.stringify({
@@ -3790,8 +3809,13 @@ async function main() {
         source: "codex",
         rotated: false,
         graceSeconds,
-        targets: rotateTargets.map((target) => ({ path: target.path, status: "would_rotate" })),
-        ...skippedProfilesReceipt(rotateProfilesSkipped),
+        targets: rotateTargets.map((target) => {
+          const refusal = preflight.find((entry) => entry.target === target)?.refusal;
+          return refusal
+            ? { ...rotateTargetReceipt(target), status: "would_refuse", reason: refusal }
+            : { ...rotateTargetReceipt(target), status: "would_rotate" };
+        }),
+        ...skippedProfilesReceipt(rotateProfilesSkipped, rotateHome),
       }, null, 2));
       return;
     }
@@ -3801,35 +3825,36 @@ async function main() {
       graceMs: graceSeconds * 1000,
     });
     const rotatedOptions = { ...rotateOptions, codexProducerToken: rotation.auth.codexProducer };
-    const rotateResults: Array<{ path: string; status: string; backup: string | null; reason?: string }> = [];
+    const rotateResults: Array<{ path: string; status: string; backup: string | null; reason?: string; outsideHome?: true }> = [];
     let rotateFailure = false;
     for (const target of rotateTargets) {
+      const reported = rotateTargetReceipt(target);
       if (rotateFailure) {
-        rotateResults.push({ path: target.path, status: "not_attempted", backup: null });
+        rotateResults.push({ ...reported, status: "not_attempted", backup: null });
         continue;
       }
       const preflightRefusal = preflight.find((entry) => entry.target === target)?.refusal;
       if (preflightRefusal) {
         // Only a discovered target reaches here: an owned refusal returned above.
-        rotateResults.push({ path: target.path, status: "refused", backup: null, reason: preflightRefusal });
+        rotateResults.push({ ...reported, status: "refused", backup: null, reason: preflightRefusal });
         continue;
       }
       try {
         const result = target.run(rotatedOptions, false);
         if (result.conflict) {
           if (!target.discovered) rotateFailure = true;
-          rotateResults.push({ path: target.path, status: "refused", backup: null, reason: result.conflict });
+          rotateResults.push({ ...reported, status: "refused", backup: null, reason: result.conflict });
           continue;
         }
         rotateResults.push({
-          path: target.path,
+          ...reported,
           status: result.changed ? "rotated" : "unchanged",
           backup: result.backupPath ?? null,
         });
       } catch (error) {
         if (!target.discovered) rotateFailure = true;
         rotateResults.push({
-          path: target.path,
+          ...reported,
           status: "failed",
           backup: null,
           reason: error instanceof Error ? error.message : String(error),
@@ -3843,7 +3868,7 @@ async function main() {
       graceSeconds,
       previousTokenExpiresAt: new Date(rotation.expiresAt).toISOString(),
       targets: rotateResults,
-      ...skippedProfilesReceipt(rotateProfilesSkipped),
+      ...skippedProfilesReceipt(rotateProfilesSkipped, rotateHome),
       nextSteps: rotateFailure
         ? [
             "the new token is already provisioned; re-run rotate-producer-token after resolving the refusal",
@@ -3974,6 +3999,16 @@ async function main() {
         path.join(claudeSeatsRoot(os.homedir()), seat.slug, "settings.json"),
         os.homedir(),
       );
+      if (seat.unresolved) {
+        return {
+          slug: seat.slug,
+          ...seatPath,
+          status: "unresolved" as const,
+          diagnostic: "claude_seat_symlink_unresolvable",
+          reason: seat.unresolved,
+          missing: [] as string[],
+        };
+      }
       if (!seat.hasSettings) {
         return { slug: seat.slug, ...seatPath, status: "skipped" as const, missing: [] as string[] };
       }
@@ -4005,6 +4040,16 @@ async function main() {
         path.join(codexProfilesRoot(os.homedir()), profile.slug, "config.toml"),
         os.homedir(),
       );
+      if (profile.unresolved) {
+        return {
+          slug: profile.slug,
+          ...profilePath,
+          status: "unresolved" as const,
+          diagnostic: "codex_profile_symlink_unresolvable",
+          reason: profile.unresolved,
+          missing: [] as string[],
+        };
+      }
       if (!profile.hasConfig) {
         return { slug: profile.slug, ...profilePath, status: "skipped" as const, missing: [] as string[] };
       }

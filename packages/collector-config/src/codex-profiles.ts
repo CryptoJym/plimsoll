@@ -25,6 +25,8 @@ export type CodexProfile = {
   path: string;
   /** False when the profile directory carries no config.toml. */
   hasConfig: boolean;
+  /** Errno when the profile directory symlink could not be resolved. */
+  unresolved?: string;
 };
 
 export function codexProfilesRoot(home: string) {
@@ -34,5 +36,10 @@ export function codexProfilesRoot(home: string) {
 /** Every profile directory under `<home>/.codex-profiles`, slug-ordered. */
 export function discoverCodexProfiles(home: string): CodexProfile[] {
   return discoverHomeDirectories(home, CODEX_PROFILES_DIRECTORY, "config.toml")
-    .map(({ slug, path: file, exists }) => ({ slug, path: file, hasConfig: exists }));
+    .map(({ slug, path: file, exists, unresolved }) => ({
+      slug,
+      path: file,
+      hasConfig: exists,
+      ...(unresolved ? { unresolved } : {}),
+    }));
 }

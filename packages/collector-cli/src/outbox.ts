@@ -838,7 +838,11 @@ export class DeliveryOutbox {
    * Nothing is uploaded here; delivery still happens on normal `upload` cycles,
    * so this is safe to run while a circuit is open.
    *
-   * Bounded exactly like the migration scan: rows, raw bytes and busy_timeout.
+   * The write transaction is bounded by raw bytes and busy_timeout, not by
+   * `--limit`. `--limit` is a budget for the actionable arm only. The inert
+   * skip report is unbounded: O(lifetime replays) at ≈2.6 µs/row (measured),
+   * four primary-key lookups per inert row (`classified` is referenced twice
+   * and SQLite does not materialize it).
    */
   replayDeadLetters(options: {
     reason: string;
@@ -884,9 +888,11 @@ export class DeliveryOutbox {
     // Fixed internal enum, never caller input: safe to inline as a SQL list.
     const replayableList = REPLAYABLE_RECEIPT_REASONS.map((value) => `'${value}'`).join(", ");
 
-    // How many actionable rows the selection returned: the hint gates on this
-    // arm saturating the row budget, never on the inert skip report.
+    // How many actionable rows the selection returned, and whether more exist
+    // than `--limit`. The hint gates on overflow, never on the inert skip
+    // report and never on a pool that is exactly `--limit` rows.
     let candidatesSelected = 0;
+    let overflow = false;
 
     const priorBusyTimeout = this.db.pragma("busy_timeout", { simple: true }) as number;
     this.db.pragma(`busy_timeout = ${REPLAY_BUSY_TIMEOUT_MS}`);
@@ -902,8 +908,9 @@ export class DeliveryOutbox {
       // recovery tool reported a full `selected` while re-queueing nothing
       // (review r1, finding 2). The limit is a budget for work: only the
       // actionable arm is bounded by it. The inert arm is selected unbounded —
-      // it costs two primary-key lookups per row and nothing else — so the
-      // skip report is the whole truth rather than a number that silently
+      // O(lifetime replays) at ≈2.6 µs/row, four primary-key lookups per row
+      // because `classified` is referenced twice and is not materialized — so
+      // the skip report is the whole truth rather than a number that silently
       // shrinks with --limit (review r2, finding 2).
       //
       // A delivery that was replayed and then died again under the same reason
@@ -956,12 +963,14 @@ export class DeliveryOutbox {
            select deliveryId, diedAt, actionable from classified
             where actionable = 0 order by diedAt, deliveryId`,
         )
-        .all({ reason, since: sinceIso, limit }) as Array<{
+        .all({ reason, since: sinceIso, limit: limit + 1 }) as Array<{
           deliveryId: string;
           diedAt: string;
           actionable: number;
         }>;
-      const candidates = rows.filter((row) => row.actionable === 1);
+      const selectedActionable = rows.filter((row) => row.actionable === 1);
+      overflow = selectedActionable.length > limit;
+      const candidates = overflow ? selectedActionable.slice(0, limit) : selectedActionable;
       const inert = rows.filter((row) => row.actionable === 0);
       candidatesSelected = candidates.length;
 
@@ -1045,12 +1054,13 @@ export class DeliveryOutbox {
       this.db.pragma(`busy_timeout = ${priorBusyTimeout}`);
     }
     // The hint's advice — narrow with --since, or raise --limit — can only help
-    // when the *actionable* arm saturated the row budget, so that a different
-    // window or a larger limit would reach rows this run could not. Gating on
-    // `selected` instead fired it in the healthy steady state, where the limit
-    // was filled by inert rows that the same sentence says never consume it
-    // (review r2, finding 1).
-    if (summary.requeued === 0 && candidatesSelected >= limit) {
+    // when the *actionable* arm saturated the row budget *and more rows exist*,
+    // so that a different window or a larger limit would reach rows this run
+    // could not. Selecting `--limit` of `--limit` (the whole pool) is not
+    // saturation. Gating on `selected` instead fired it in the healthy steady
+    // state, where the limit was filled by inert rows that the same sentence
+    // says never consume it (review r2, finding 1).
+    if (summary.requeued === 0 && overflow) {
       summary.hint =
         `selected ${candidatesSelected} actionable candidates and re-queued none at ` +
         `--limit ${limit}: narrow the window with --since <ISO-8601> or raise --limit. ` +
