@@ -369,8 +369,11 @@ consumed by the label:
   files those entries matched; `pendingFiles` is the field that counts files.
   These advance during the first-install baseline sweep too.
 - `entryBudgetPerTick` / `wallBudgetMsPerTick` / `lifetimeEntryLimit` — the
-  budget that ended the cadence (256 entries, 50 ms) and the entries one cursor
-  may visit before it restarts instead of resuming (100000).
+  budget that ended the cadence (at least 256 entries, sized from the host's
+  capture roots and last-sweep observation so a 22-root host is not stuck at
+  six entries a tick; 50 ms wall) and the entries one cursor may visit before
+  it restarts instead of resuming (100000). A finished or limited sweep
+  carries its origin, so the next generation does not restart at root 0.
 - `converging` — a cursor exists and will resume on the next cadence; it stays
   true for a cadence deferred before any filesystem work, which keeps its cursor,
   and for a cadence that retired a finished cursor and installed a successor on

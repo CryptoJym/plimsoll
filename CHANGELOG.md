@@ -61,6 +61,7 @@ does not transfer its sessions to a tailer.
 
 ### Fixed
 
+<<<<<<< HEAD
 - Capture-health names sub-minute future skew in seconds, never renders `NaNm`
   for an unparseable `last_event_at` (fail-safe amber), and keeps future-amber
   rather than lag-red when the ledger watermark is ahead of the clock
@@ -69,6 +70,13 @@ does not transfer its sessions to a tailer.
   apply/refuse receipt; the stamp, backoff map and backup record retry on the
   next tick. The event-loop chunk proof uses a CI-safe bound so a cold runner
   cannot fail a yield that already holds.
+=======
+- Automatic capture on many-root hosts sizes each cadence's directory-entry
+  allowance from the observed root/corpus size (256-entry floor, 16384 cap)
+  while the 50 ms discovery wall and 200 ms fairness budget still bound the
+  tick. A finished or limited sweep persists its origin so the next generation
+  does not restart enumeration at root 0 (eco-6hoxj.73.1).
+>>>>>>> d384a25 (fix(collector): size many-root discovery allowance and carry sweep origin (eco-6hoxj.73.1))
 - Daemon session sync now converges without `upload-history --sessions`. A
   failed or interrupted 5-minute refresh survives restart, and a ledger
   catch-up covers sessions whose events were already uploaded so they never
