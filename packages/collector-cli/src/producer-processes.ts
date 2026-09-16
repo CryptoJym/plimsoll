@@ -479,6 +479,15 @@ function partialLabel(scan: Pick<ProducerProcessScan, "environmentsRead" | "laun
   return `stale-producer scan partial: ${failures.join(" and ")} — ${inspected} of ${processes.length} producers inspected`;
 }
 
+/**
+ * Stale rows whose home came from the inspector's default, not the process's
+ * own environment (review r2b A15): status and the doctor summary say so.
+ */
+function defaultHomeNote(stale: ProducerProcess[]) {
+  const byDefault = stale.filter((entry) => entry.homeSource === "default").length;
+  return byDefault > 0 ? ` — ${byDefault} of ${stale.length} attributed by default home (see doctor producerProcesses)` : "";
+}
+
 function summaryLine(processes: ProducerProcess[]) {
   const stale = processes.filter((entry) => entry.staleConfig);
   if (stale.length === 0) return null;
@@ -487,7 +496,7 @@ function summaryLine(processes: ProducerProcess[]) {
   const more = hints.length > 5 ? `; and ${hints.length - 5} more (see producerProcesses)` : "";
   const byMtime = stale.filter((entry) => entry.managedAppliedAtSource === "file_mtime").length;
   const mtimeNote = byMtime > 0 ? ` (${byMtime} judged by file mtime only, no managed-apply record)` : "";
-  return `${stale.length} producer process(es) older than their managed config${mtimeNote} — they send stale headers; restart: ${shown}${more}`;
+  return `${stale.length} producer process(es) older than their managed config${mtimeNote}${defaultHomeNote(stale)} — they send stale headers; restart: ${shown}${more}`;
 }
 
 function emptyScan(
@@ -672,16 +681,26 @@ function staleProducerText(scan: ProducerProcessScan | null, source: string | nu
   const processes = source === null ? scan.processes : scan.processes.filter((process) => process.source === source);
   const partial = partialLabel(scan, processes);
   const inspected = processes.some((process) => process.homeSource !== "unreadable");
+  const stale = processes.filter((process) => process.staleConfig);
   const count = partial && !inspected
     ? null
-    : `${processes.filter((process) => process.staleConfig).length} ${source ?? ""}${source ? " " : ""}producer process(es) older than their managed config${scan.truncated ? " (scan truncated)" : ""}`;
+    : `${stale.length} ${source ?? ""}${source ? " " : ""}producer process(es) older than their managed config${scan.truncated ? " (scan truncated)" : ""}${defaultHomeNote(stale)}`;
   return `${[partial, count].filter((part): part is string => part !== null).join("; ")} — plimsoll doctor --read-only --json names them`;
+}
+
+/** The same default-home attribution as a field, present only when some stale row has it. */
+function staleProducerAttribution(scan: ProducerProcessScan | null) {
+  if (!scan) return {};
+  const stale = scan.processes.filter((process) => process.staleConfig);
+  const count = stale.filter((process) => process.homeSource === "default").length;
+  return count > 0 ? { staleProducerAttribution: { homeSource: "default" as const, count, of: stale.length } } : {};
 }
 
 /**
  * Name the stale-producer count in the reason of every capture source a
  * `source_required` / `producer_token_required` window can belong to. Only the
- * `reason` text changes, plus one `staleProducers` line across all producers:
+ * `reason` text changes, plus one `staleProducers` line across all producers
+ * and, when a stale row's home is the default, `staleProducerAttribution`:
  * status, overall and every counter stay as they were, so this is a
  * diagnostic, never a fault shape. A scan older than
  * STALE_PRODUCER_SCAN_MAX_AGE_MS is not used. Admission the daemon answered in
@@ -700,7 +719,8 @@ export function annotateCaptureHealthWithStaleProducers<T>(
   if (windows.length === 0) return value;
   const fresh = scan && nowMs - Date.parse(scan.scannedAt) <= STALE_PRODUCER_SCAN_MAX_AGE_MS ? scan : null;
   const staleProducers = staleProducerText(fresh, null);
-  if (!Array.isArray(captureHealth.sources)) return { ...captureHealth, staleProducers } as T;
+  const attribution = staleProducerAttribution(fresh);
+  if (!Array.isArray(captureHealth.sources)) return { ...captureHealth, staleProducers, ...attribution } as T;
   const sources = captureHealth.sources.map((entry) => {
     if (!(PRODUCER_SOURCES as readonly string[]).includes(entry.source)) return entry;
     const reasons = [...new Set(windows
@@ -709,7 +729,7 @@ export function annotateCaptureHealthWithStaleProducers<T>(
     if (reasons.length === 0) return entry;
     return { ...entry, reason: `${entry.reason}; ${reasons.join("/")} rejections open: ${staleProducerText(fresh, entry.source)}` };
   });
-  return { ...captureHealth, staleProducers, sources } as T;
+  return { ...captureHealth, staleProducers, ...attribution, sources } as T;
 }
 
 /**
@@ -728,7 +748,9 @@ export function createStaleProducerScanCache(scan: () => Promise<ProducerProcess
       if (inflight) return inflight;
       const current = latest();
       if (current) return Promise.resolve(current);
-      inflight = scan()
+      // A factory that throws synchronously is contained like a rejection
+      // (eco-6hoxj.157).
+      inflight = new Promise<ProducerProcessScan>((resolve) => resolve(scan()))
         .then((result) => {
           cached = result;
           return result;

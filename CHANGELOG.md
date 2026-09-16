@@ -43,6 +43,9 @@ does not transfer its sessions to a tailer.
   `partial`, and doctor and status name the failed read and how many producers
   were inspected instead of a zero count. A daemon admission body whose rows do
   not have the expected shape skips the scan and says so; `status` still exits 0.
+  When a stale producer's config home is the default because its environment
+  names no home variable, doctor's summary and status say how many were
+  attributed that way, and status adds `captureHealth.staleProducerAttribution`.
 
 ### Fixed
 

@@ -62,6 +62,11 @@ function lstart(date: Date) {
     `${two(date.getHours())}:${two(date.getMinutes())}:${two(date.getSeconds())} ${date.getFullYear()}`;
 }
 const at = (iso: string) => new Date(iso);
+// The default-home note (review r2b A15) is pinned only by the *_discloses_default_home_attribution
+// checks; the other exact-text checks compare without it.
+const defaultHomeNote = (stale: number, of: number) => ` — ${stale} of ${of} attributed by default home (see doctor producerProcesses)`;
+const withoutDefaultHomeNote = (text: string | null | undefined) =>
+  text?.replace(/ — \d+ of \d+ attributed by default home \(see doctor producerProcesses\)/g, "");
 const backupName = (file: string, iso: string) => `${file}.plimsoll-backup-${iso.replace(/[:.]/g, "-")}`;
 
 function write(file: string, body: string, mtimeIso?: string) {
@@ -263,7 +268,7 @@ async function main() {
     unreadable.restartHint === null, unreadable);
   check("node_hosted_claude_without_environment_is_unknown", node?.home === "unknown" && node.staleConfig === false, node);
 
-  check("stale_count_and_summary_line", scan.staleCount === 3 && scan.summary ===
+  check("stale_count_and_summary_line", scan.staleCount === 3 && withoutDefaultHomeNote(scan.summary) ===
     "3 producer process(es) older than their managed config (1 judged by file mtime only, no managed-apply record) — they send stale headers; restart: " +
     `launchctl kickstart -k gui/${UID}/com.jamesbrady.codex-profile.pro2; ` +
     "restart conductor seat support-utlyze through the conductor (not by killing pid 38970); " +
@@ -461,13 +466,23 @@ async function main() {
   };
   const scanNow = Date.parse(scan.scannedAt);
   const annotated = annotateCaptureHealthWithStaleProducers(health, openSourceRequired, scan, scanNow);
-  check("status_reason_names_the_stale_producer_count", annotated.sources[0]!.reason ===
+  const annotatedDefaultHome = {
+    codexReason: annotated.sources[0]!.reason,
+    claudeReason: annotated.sources[1]!.reason,
+    staleProducers: (annotated as { staleProducers?: string }).staleProducers,
+    staleProducerAttribution: (annotated as { staleProducerAttribution?: unknown }).staleProducerAttribution,
+  };
+  check("status_reason_names_the_stale_producer_count", withoutDefaultHomeNote(annotated.sources[0]!.reason) ===
     "capture current — 4 session(s) with tokens today; source_required rejections open: " +
     "2 codex producer process(es) older than their managed config — plimsoll doctor --read-only --json names them" &&
     annotated.sources[1]!.reason.endsWith("1 claude_code producer process(es) older than their managed config — plimsoll doctor --read-only --json names them"),
   annotated.sources.map((entry) => entry.reason));
   const withoutReason = (value: typeof health) => value.sources.map(({ reason: _reason, ...rest }) => rest);
+  const { staleProducers: _line, staleProducerAttribution: _attribution, sources: _sources, ...annotatedRest } =
+    annotated as typeof annotated & { staleProducers?: string; staleProducerAttribution?: unknown };
+  const { sources: _healthSources, ...healthRest } = health;
   check("status_reason_is_never_a_fault_shape", annotated.overall === health.overall &&
+    JSON.stringify(annotatedRest) === JSON.stringify(healthRest) &&
     JSON.stringify(withoutReason(annotated)) === JSON.stringify(withoutReason(health)) &&
     annotated.sources.every((entry) => entry.rootsStarted <= entry.rootsEligible && entry.rootsEligible <= entry.rootsTotal),
   annotated);
@@ -513,6 +528,28 @@ async function main() {
   check("failed_status_scan_is_cached_not_retried_per_read", failed.inspection === "unavailable" && failures === 1 &&
     annotateCaptureHealthWithStaleProducers(health, openSourceRequired, failing.latest(), clock)
       .sources[0]!.reason.endsWith("stale-producer scan unavailable"), { failures, inspection: failed.inspection });
+  // A non-async factory that throws before any promise exists (eco-6hoxj.157).
+  let syncFailures = 0;
+  const syncFailing = createStaleProducerScanCache((): Promise<ProducerProcessScan> => {
+    syncFailures += 1;
+    throw new Error("process table read failed synchronously");
+  }, () => clock);
+  let syncThrown: unknown = null;
+  const syncResults: ProducerProcessScan[] = [];
+  let syncSameFlight = false;
+  try {
+    const first = syncFailing.refresh();
+    const second = syncFailing.refresh();
+    syncSameFlight = first === second;
+    syncResults.push(...await Promise.all([first, second]), await syncFailing.refresh());
+  } catch (error) {
+    syncThrown = error instanceof Error ? error.message : String(error);
+  }
+  check("cache_contains_a_synchronous_factory_throw", syncThrown === null && syncSameFlight && syncFailures === 1 &&
+    syncResults.length === 3 &&
+    syncResults.every((entry) => entry.inspection === "unavailable" && entry.reason === "scan_failed") &&
+    syncFailing.latest()?.inspection === "unavailable",
+  { syncThrown, syncSameFlight, syncFailures, inspections: syncResults.map((entry) => entry.inspection) });
 
   // doctor --read-only --json end to end, against the fixture.
   const stubBin = path.join(sandbox, "stub-bin");
@@ -566,6 +603,12 @@ async function main() {
   check("doctor_summary_line_when_stale", Array.isArray(receipt.summary) && receipt.summary.length === 1 &&
     receipt.summary[0]!.startsWith("3 producer process(es) older than their managed config") &&
     receipt.summary[0]!.includes("they send stale headers; restart: "), receipt.summary);
+  check("doctor_summary_discloses_default_home_attribution", receipt.summary?.[0] === scan.summary &&
+    scan.summary?.startsWith(
+      "3 producer process(es) older than their managed config (1 judged by file mtime only, no managed-apply record)" +
+      defaultHomeNote(1, 3) + " — they send stale headers; restart: ",
+    ) &&
+    receipt.producerProcesses.processes.find((entry) => entry.pid === 38970)?.homeSource === "default", receipt.summary ?? null);
   check("doctor_readiness_is_not_changed_by_the_diagnostic", receipt.readiness === "not_installed", receipt.readiness);
   check("doctor_output_carries_no_token", !doctorRun.stdout.includes(CANARY) && !doctorRun.stderr.includes(CANARY), null);
   const quiet = JSON.parse(doctor({ [PRODUCER_PROCESS_FIXTURE_ENV]: noStaleFixture }).stdout) as typeof receipt;
@@ -642,11 +685,13 @@ async function main() {
     const live = await liveStatus(variant, file);
     const codexReason = live.body.captureHealth.sources[0]!.reason;
     check(`live_daemon_status_names_${variant}_partial_scan`, live.rejected === 401 &&
-      codexReason === `${health.sources[0]!.reason}; source_required rejections open: ${liveExpected[variant]}` &&
+      withoutDefaultHomeNote(codexReason) === `${health.sources[0]!.reason}; source_required rejections open: ${liveExpected[variant]}` &&
       live.body.captureHealth.staleProducers?.startsWith(partialSummary[variant].split("; ")[0]!) &&
       !bareZero.test(codexReason) &&
       !live.text.includes(outsideCodexHome) && !live.text.includes(CANARY), { rejected: live.rejected, codexReason });
   }
+
+  const liveDefaultHome = await liveStatus("default-home", mainFixture);
 
   // One-shot `plimsoll status` against a daemon answering a fixed body.
   let statusBody: unknown = null;
@@ -675,13 +720,28 @@ async function main() {
       });
     });
   }
-  type StatusJson = { captureHealth: { staleProducers?: string } };
+  type StatusJson = { captureHealth: { staleProducers?: string; staleProducerAttribution?: unknown } };
   try {
     const valid = await oneShotStatus(openCounters, { [PRODUCER_PROCESS_FIXTURE_ENV]: mainFixture });
     const validJson = JSON.parse(valid.stdout) as StatusJson;
     check("one_shot_status_names_the_stale_producer_count", valid.code === 0 &&
-      validJson.captureHealth.staleProducers === "3 producer process(es) older than their managed config" + doctorHint &&
+      withoutDefaultHomeNote(validJson.captureHealth.staleProducers) === "3 producer process(es) older than their managed config" + doctorHint &&
       !valid.stdout.includes(outsideCodexHome) && !valid.stdout.includes(CANARY), { code: valid.code, captureHealth: validJson.captureHealth });
+    const attribution = { homeSource: "default", count: 1, of: 3 };
+    const liveBody = liveDefaultHome.body.captureHealth as typeof liveDefaultHome.body.captureHealth & { staleProducerAttribution?: unknown };
+    check("status_reason_discloses_default_home_attribution",
+      annotatedDefaultHome.codexReason === `${health.sources[0]!.reason}; source_required rejections open: ` +
+        `2 codex producer process(es) older than their managed config${defaultHomeNote(1, 2)}${doctorHint}` &&
+      annotatedDefaultHome.claudeReason.endsWith("1 claude_code producer process(es) older than their managed config" + doctorHint) &&
+      annotatedDefaultHome.staleProducers === `3 producer process(es) older than their managed config${defaultHomeNote(1, 3)}${doctorHint}` &&
+      JSON.stringify(annotatedDefaultHome.staleProducerAttribution) === JSON.stringify(attribution) &&
+      validJson.captureHealth.staleProducers === annotatedDefaultHome.staleProducers &&
+      JSON.stringify(validJson.captureHealth.staleProducerAttribution) === JSON.stringify(attribution) &&
+      liveDefaultHome.rejected === 401 &&
+      liveBody.sources[0]!.reason === annotatedDefaultHome.codexReason &&
+      liveBody.staleProducers === annotatedDefaultHome.staleProducers &&
+      JSON.stringify(liveBody.staleProducerAttribution) === JSON.stringify(attribution),
+    { annotated: annotatedDefaultHome, oneShot: validJson.captureHealth, live: liveBody });
     for (const [variant, file] of Object.entries(partialFixtures) as Array<[keyof typeof partialFixtures, string]>) {
       const run = await oneShotStatus(openCounters, { [PRODUCER_PROCESS_FIXTURE_ENV]: file });
       const json = run.stdout.trim().startsWith("{") ? JSON.parse(run.stdout) as StatusJson : null;
