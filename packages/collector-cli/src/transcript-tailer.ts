@@ -21,10 +21,13 @@ import {
   type JsonlTailerIo,
 } from "./jsonl-byte-tailer";
 import {
-  AUTOMATIC_DISCOVERY_ENTRY_CAP,
   AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP,
   AUTOMATIC_DISCOVERY_WALL_MS,
   AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP,
+  automaticDiscoveryEntryAllowance,
+  loadCaptureSweepResume,
+  rememberCaptureSweepResume,
+  nextCaptureSweepOrigin,
   captureScanProgress,
   type CaptureScanProgress,
   beginAutomaticCaptureBaseline,
@@ -556,6 +559,7 @@ export class TranscriptTailer {
       this.captureAttempt?.discovery.close();
       this.baselineAttempt = null;
       this.captureAttempt = null;
+      rememberCaptureSweepResume(this.buffer.database, "claude_code", null);
     }
     if (options.deferredBeforeIo) {
       result.activity.truncated = true;
@@ -612,7 +616,7 @@ export class TranscriptTailer {
         ? await attempt.discovery.collect(automatic.budget, {
             signal: options.signal,
             maxFiles: AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP,
-            maxEntries: AUTOMATIC_DISCOVERY_ENTRY_CAP,
+            maxEntries: this.entryAllowance(attempt.discovery.progress().entriesVisited),
             maxWallMs: AUTOMATIC_DISCOVERY_WALL_MS,
           })
         : {
@@ -695,6 +699,7 @@ export class TranscriptTailer {
             filesValidated: attempt.filesValidated,
             statErrors: result.statErrors,
           });
+          this.persistSweepResume(attempt.discovery);
           this.retire(attempt.discovery);
           this.baselineAttempt = null;
           result.exhaustive = false;
@@ -711,6 +716,7 @@ export class TranscriptTailer {
           filesValidated: attempt.filesValidated,
           discoveryErrors: result.discoveryErrors || 1,
         });
+        this.persistSweepResume(attempt.discovery);
         this.retire(attempt.discovery);
         this.baselineAttempt = null;
         result.activity.truncated = true;
@@ -733,6 +739,7 @@ export class TranscriptTailer {
       }
 
       if (attempt.capacityDeferredThisSweep) {
+        this.persistSweepResume(attempt.discovery);
         this.restart(attempt, this.recentDiscovery(options.discoveryLimit, options));
         attempt.capacityDeferredThisSweep = false;
         attempt.newGenerationsThisSweep = 0;
@@ -744,6 +751,7 @@ export class TranscriptTailer {
 
       attempt.sweepsCompleted += 1;
       if (attempt.sweepsCompleted < 2 || attempt.newGenerationsThisSweep > 0) {
+        this.persistSweepResume(attempt.discovery);
         this.restart(attempt, this.recentDiscovery(options.discoveryLimit, options));
         attempt.newGenerationsThisSweep = 0;
         result.activity.truncated = true;
@@ -756,6 +764,7 @@ export class TranscriptTailer {
         runId: attempt.runId,
         completedAt: new Date().toISOString(),
       });
+      this.persistSweepResume(attempt.discovery);
       this.retire(attempt.discovery);
       this.baselineAttempt = null;
       result.excludedGenerations = completed.excludedGenerations;
@@ -1172,11 +1181,30 @@ export class TranscriptTailer {
     return result;
   }
 
+  private entryAllowance(observedEntries?: number) {
+    return automaticDiscoveryEntryAllowance({
+      rootCount: this.directories.length,
+      observedEntries:
+        observedEntries ??
+        loadCaptureSweepResume(this.buffer.database, "claude_code")?.observedEntries,
+    });
+  }
+
+  private persistSweepResume(discovery: IncrementalJsonlDiscovery) {
+    const progress = discovery.progress();
+    rememberCaptureSweepResume(this.buffer.database, "claude_code", {
+      rootIndex: nextCaptureSweepOrigin(progress, 1),
+      observedEntries: progress.entriesVisited,
+    });
+  }
+
   private recentDiscovery(limit?: number, _options?: TranscriptScanOptions) {
+    const resume = loadCaptureSweepResume(this.buffer.database, "claude_code");
     return new IncrementalJsonlDiscovery(this.directories, {
       recursive: true,
       matches: (name) => name.endsWith(".jsonl"),
       maxEntries: this.lifetimeEntryLimit(limit),
+      startRootIndex: resume?.rootIndex ?? 0,
       missingRootsAreEmpty: true,
       isCandidateQuarantined: (candidateHash) => {
         const quarantine = this.activeBoundaryOptions.quarantine;
@@ -1213,7 +1241,7 @@ export class TranscriptTailer {
       const chunk = await attempt.discovery.collect(budget, {
         signal: options.signal,
         maxFiles: AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP - attempt.pendingFiles.length,
-        maxEntries: AUTOMATIC_DISCOVERY_ENTRY_CAP,
+        maxEntries: this.entryAllowance(attempt.discovery.progress().entriesVisited),
         maxWallMs: AUTOMATIC_DISCOVERY_WALL_MS,
       });
       attempt.pendingFiles.push(...chunk.files);
@@ -1236,6 +1264,7 @@ export class TranscriptTailer {
     if (!attempt) return;
     attempt.pendingFiles = advanceAutomaticCaptureFiles(attempt.pendingFiles, files, partial);
     if (attempt.discoveryDone && attempt.pendingFiles.length === 0) {
+      this.persistSweepResume(attempt.discovery);
       this.retire(attempt.discovery);
       this.captureAttempt = null;
     }
