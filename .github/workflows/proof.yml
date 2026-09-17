@@ -91,6 +91,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:install-doctor
 
+      - name: Prove doctor names producer processes older than their managed config
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:doctor-stale-producers
+
       - name: Prove atomic no-follow LaunchAgent manifest lifecycle
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:launch-agent

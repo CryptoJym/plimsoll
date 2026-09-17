@@ -28,6 +28,24 @@ does not transfer its sessions to a tailer.
 
 ### Added
 
+- `doctor --read-only --json` reports `producerProcesses`: the local Codex,
+  Claude Code, Gemini CLI and Grok processes, each with its config home, start
+  time, managed surface, managed-apply time, `staleConfig`, owner (launchd
+  label, conductor seat, desktop app) and a restart hint. When any producer
+  started before its managed config was last applied, doctor adds one
+  `summary` line naming how to restart them. Readiness is unchanged, a process
+  whose environment cannot be read is `unknown` and never stale, and no token,
+  command line or path outside `$HOME` is printed.
+- While `source_required` or `producer_token_required` rejections are open,
+  `status` names the stale-producer count in the capture source's reason and
+  in `captureHealth.staleProducers`, from a background scan cached for at most
+  60 seconds. When the environment or launchd read fails the scan is
+  `partial`, and doctor and status name the failed read and how many producers
+  were inspected instead of a zero count. A daemon admission body whose rows do
+  not have the expected shape skips the scan and says so; `status` still exits 0.
+  When a stale producer's config home is the default because its environment
+  names no home variable, doctor's summary and status say how many were
+  attributed that way, and status adds `captureHealth.staleProducerAttribution`.
 - Producer-to-ledger parity instrumentation (eco-6hoxj.29): managed Codex/Grok
   curl hooks fail on HTTP errors and retry inside the hook timeout; Claude HTTP
   hooks carry the matching timeout/retry contract; each post mints a stable

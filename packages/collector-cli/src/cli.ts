@@ -227,6 +227,13 @@ import {
   runManagedConfigReconcileAsync,
   stampManagedConfigReconcileDecision,
 } from "./managed-config-reconcile";
+import type { RejectionDiagnosticsCounters } from "./rejection-diagnostics";
+import {
+  annotateCaptureHealthWithStaleProducers,
+  openStaleProducerWindows,
+  readRejectionAdmission,
+  scanProducerProcesses,
+} from "./producer-processes";
 import { runOutcomesSync } from "./outcomes-sync";
 import {
   GitHubRestOutcomeTimelineAdapter,
@@ -1164,7 +1171,11 @@ const SYNC_COLLECTOR_TOO_OLD: DaemonSyncReading = Object.freeze({
 async function readDaemonState(
   port: number,
   managementToken?: string,
-): Promise<{ hookSpool: HookSpoolDaemonReading; sync: DaemonSyncReading }> {
+): Promise<{
+  hookSpool: HookSpoolDaemonReading;
+  sync: DaemonSyncReading;
+  httpAdmission: RejectionDiagnosticsCounters | "invalid" | null;
+}> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), collectorStatusTimeoutMs());
   try {
@@ -1184,9 +1195,16 @@ async function readDaemonState(
     return {
       hookSpool: hookSpoolReadingFromStatusBody(body, response.ok),
       sync: syncReadingFromStatusBody(body, response.ok),
+      // Every row is checked here (review r1 F2): a malformed row is labelled
+      // invalid admission, never trusted as counters.
+      httpAdmission: response.ok ? readRejectionAdmission(body?.httpAdmission) : null,
     };
   } catch {
-    return { hookSpool: HOOK_SPOOL_COLLECTOR_UNREACHABLE, sync: SYNC_COLLECTOR_UNREACHABLE };
+    return {
+      hookSpool: HOOK_SPOOL_COLLECTOR_UNREACHABLE,
+      sync: SYNC_COLLECTOR_UNREACHABLE,
+      httpAdmission: null,
+    };
   } finally {
     clearTimeout(timeout);
   }
@@ -3225,6 +3243,23 @@ async function main() {
     const resolvedHome = resolveCollectorHome();
     const projected = buffer.projection.readSnapshot(30, config.subscriptions);
     const projectedStatus = projected.kind === "ready" ? projected.snapshot.status : null;
+    // Bead eco-6hoxj.153: while `source_required` / `producer_token_required`
+    // rejections are open, the capture reason names how many producer
+    // processes still run a config older than the managed one. This one-shot
+    // command scans at most once, and only when such a window is open.
+    const staleProducerScan = openStaleProducerWindows(daemonState.httpAdmission).length > 0
+      ? await scanProducerProcesses({
+        collectorHome: collectorHome(),
+        // A malformed GROK_HOME is doctor's to report; status keeps the default.
+        grokHome: (() => {
+          try {
+            return resolveGrokHome().home;
+          } catch {
+            return undefined;
+          }
+        })(),
+      })
+      : null;
     console.log(
       JSON.stringify(
         {
@@ -3278,12 +3313,16 @@ async function main() {
           },
           delivery: buffer.delivery.status(),
           projection: buffer.projection.status(),
-          captureHealth: projectedStatus?.health ?? {
-            generatedAt: new Date().toISOString(),
-            overall: "amber",
-            sources: [],
-            reason: "projection backfill has not published a coherent health snapshot",
-          },
+          captureHealth: annotateCaptureHealthWithStaleProducers(
+            projectedStatus?.health ?? {
+              generatedAt: new Date().toISOString(),
+              overall: "amber",
+              sources: [],
+              reason: "projection backfill has not published a coherent health snapshot",
+            },
+            daemonState.httpAdmission,
+            staleProducerScan,
+          ),
           historyCoverage: historyCoverageStatus(buffer.database),
           enrollment: buffer.enrollmentStatus(),
           captureBaseline: captureBaselineStatus(buffer.database),
@@ -4626,11 +4665,18 @@ async function main() {
     const unregisteredCaptureRootCandidates = discoverCaptureRootCandidates(os.homedir())
       .filter((candidate) => !configuredRootDirectories.has(candidate.directory));
     const bufferPath = collectorBufferPath();
+    // Producers that still run the config they read before the collector
+    // managed it (bead eco-6hoxj.153): a capture diagnostic, never part of `ok`.
+    const producerProcesses = await scanProducerProcesses({
+      collectorHome: collectorHome(),
+      grokHome: path.dirname(path.dirname(grokHookPath)),
+    });
     console.log(
       JSON.stringify(
         {
           ok,
           readiness,
+          ...(producerProcesses.summary ? { summary: [producerProcesses.summary] } : {}),
           version: PLIMSOLL_VERSION,
           readOnly: true,
           node,
@@ -4666,6 +4712,7 @@ async function main() {
           // diagnostic, so like the other coverage sections it does not change
           // `ok`, which stays a service-health verdict.
           hookSpool: hookSpoolDoctorSection(collectorHome(), connectivity.hookSpool),
+          producerProcesses,
           ...(grokHookCommand ? { grokHookCommand } : {}),
           ...(codexHookCommand ? { codexHookCommand } : {}),
           // Hosts that gained a native root after enrollment (bead

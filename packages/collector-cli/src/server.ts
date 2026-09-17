@@ -104,6 +104,12 @@ import {
   type CollectorServer,
   type RejectionClientClass,
 } from "./rejection-diagnostics";
+import {
+  annotateCaptureHealthWithStaleProducers,
+  createStaleProducerScanCache,
+  openStaleProducerWindows,
+  scanProducerProcesses,
+} from "./producer-processes";
 
 let dashboardHtml: string | undefined;
 function loadDashboardHtml() {
@@ -744,6 +750,11 @@ export function createCollectorServer(
     assertProducerToken(request, refreshProducerAuth(loaded), source, requestUrl(request), producerAuthNowMs());
   };
 
+  // Bead eco-6hoxj.153: the stale-producer scan /status names while a
+  // `source_required` / `producer_token_required` window is open.
+  const staleProducerScans = createStaleProducerScanCache(async () =>
+    scanProducerProcesses({ collectorHome: resolveCollectorHome().home }));
+
   // Issue #0075 (#144): repeated identical admission rejections are
   // aggregated. Decisions at the HTTP boundary stay fail-closed and their
   // responses stay byte-for-byte identical; only the terminal/log stream is
@@ -1278,6 +1289,18 @@ export function createCollectorServer(
           body.statusRefreshCounters = { ...statusRefreshCounters };
           body.httpAdmission = rejectionDiagnostics.counters();
           body.producerParity = { counters: { ...producerCounters } };
+          // Bead eco-6hoxj.153: an open `source_required` /
+          // `producer_token_required` window names the stale-producer count
+          // in the capture reason. The scan runs in the background and is
+          // cached for at most a minute; this path only reads the cache.
+          if (openStaleProducerWindows(body.httpAdmission as ReturnType<typeof rejectionDiagnostics.counters>).length > 0) {
+            void staleProducerScans.refresh();
+            body.captureHealth = annotateCaptureHealthWithStaleProducers(
+              body.captureHealth,
+              body.httpAdmission as ReturnType<typeof rejectionDiagnostics.counters>,
+              staleProducerScans.latest(),
+            );
+          }
           body.hookSpool = options.hookSpoolStatus?.() ?? null;
           body.sync = options.syncStatus?.() ?? null;
           sendJson(response, body, 200, cached?.generation === null || cached?.generation === undefined ? {} : {
