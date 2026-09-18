@@ -252,7 +252,9 @@ jobs:
 
       - name: Prove shipped dashboard projection truth
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
-        run: pnpm proof:dashboard
+        run: |
+          pnpm proof:dashboard
+          pnpm proof:jev-analysis
 
       - name: Legacy privacy parity proof
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

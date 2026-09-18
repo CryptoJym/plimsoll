@@ -253,6 +253,9 @@ tr.row:focus-visible{background:rgba(35,137,167,.12)}
 .outcome-stat small{display:block;color:var(--foam-faint);font-size:9px;letter-spacing:.14em;text-transform:uppercase;margin-bottom:5px}
 .outcome-stat b{font-size:18px;color:var(--foam);font-variant-numeric:tabular-nums;font-weight:400}
 .outcome-note{font-size:10px;color:var(--foam-faint);margin:8px 0 12px}
+.jev-finding{border-top:1px solid var(--line);padding:12px 0;overflow-wrap:anywhere}
+.jev-finding summary{cursor:pointer;color:var(--foam);line-height:1.6}
+.jev-finding p{color:var(--foam-dim);font-size:11px;line-height:1.7;margin:8px 0}
 @media(max-width:760px){.outcome-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
 [hidden]{display:none!important}
 @media (prefers-reduced-motion:reduce){
@@ -349,6 +352,13 @@ tr.row:focus-visible{background:rgba(35,137,167,.12)}
         <th scope="col">day</th><th class="num" scope="col">pulls</th><th class="num" scope="col">merged</th><th class="num" scope="col">first pass</th><th class="num" scope="col">failed</th><th class="num" scope="col">unknown</th><th class="num" scope="col">rework</th>
       </tr></thead><tbody></tbody></table>
       <div class="empty" id="e-outcomes" hidden>no materialized outcome timeline in this window — run the explicit outcome backfill</div>
+    </section>
+
+    <section class="plate span12" id="jev-plate">
+      <h2>Jev analysis <span class="plate-meta plain">this machine</span></h2>
+      <p class="outcome-note" id="jev-status" role="status">Reading recent advice…</p>
+      <div id="jev-findings"></div>
+      <p class="outcome-note">Agent actions are self-reported. Task ownership, verified completion and savings are not yet linked.</p>
     </section>
 
     <section class="plate span6">
@@ -848,9 +858,49 @@ function renderSnapshot(d){
   const crumbs=clear($("#crumbs"));add(crumbs,`127.0.0.1 · window ${fmt(s.days)}d · generation ${fmt(d.generation)} · `,node("b","nothing leaves this machine from this page"));
 }
 
+// This reads saved advice, including advice from automatic hooks. Refreshing
+// the dashboard cannot invoke Jev or change an agent's task or memory.
+function renderJevAnalysis(snapshot){
+  const box=clear($("#jev-findings")),status=$("#jev-status");
+  if(!snapshot||!["available","partial"].includes(snapshot.state)){
+    status.textContent=snapshot?.state==="not_installed"?"No Jev receipt store on this machine.":"Jev receipts unavailable. Coverage is unknown.";
+    return;
+  }
+  const findings=Array.isArray(snapshot.decisions)?snapshot.decisions:[];
+  const coverage=snapshot.coverage||{},overhead=snapshot.overhead||{};
+  const money=value=>typeof value==="number"?"$"+value.toFixed(6):"unknown";
+  status.textContent=`${findings.length} recent findings · last ${snapshot.windowDays} days · read ${new Date(snapshot.generatedAt).toLocaleTimeString()} · inference estimate ${money(overhead.estimatedCostUsd)} for ${overhead.uniqueRequests??0} distinct requests shown`;
+  if(snapshot.state==="partial")status.textContent+=` · partial coverage (${coverage.rejected??0} excluded${coverage.truncated?", recent 50 only":""})`;
+  if(!findings.length)add(box,emptyNode("No Jev decisions observed in this window. This does not establish whether hooks are active."));
+  for(const finding of findings){
+    const detail=node("details",null,"jev-finding"),native=finding.native||{},inference=finding.inference||{};
+    const actions=Array.isArray(finding.reportedActions)?finding.reportedActions:[];
+    const progress=actions.length?"owner reported: "+actions.map(value=>value.action).join(", "):finding.offeredAt?"prepared for agent · use unconfirmed":"no offer recorded";
+    const human=value=>String(value??"unknown").replace(/_/g," ");
+    add(detail,node("summary",`${human(finding.mode)} · ${human(finding.recommendation)} · ${progress}${finding.held?" · hold present":""}`));
+    add(detail,node("p",`${native.runtime??"unknown"} · observed ${new Date(finding.observedAt).toLocaleString()} · native event ${native.eventState??"unknown"}`));
+    add(detail,node("p",`Session: ${native.sessionId??"unknown"}`));
+    add(detail,node("p",`Inference: ${human(inference.state)} · ${inference.model??"model unknown"}${inference.requestedModel?" · requested "+inference.requestedModel:""} · input ${inference.inputTokens??"unknown"} / output ${inference.outputTokens??"unknown"} tokens · estimate ${money(inference.estimatedCostUsd)} · billed ${money(inference.billedCostUsd)}${inference.cacheHit===true?" · cache hit":""}`));
+    add(detail,node("p",`Decision: ${finding.id}\nEvent: ${native.eventId}\nInput: ${finding.inputHash}\nRequest: ${inference.requestHash??"none recorded"}\nWorkspace: ${native.workspaceHash}`,"hash"));
+    if(actions.length)add(detail,node("p",actions.map(value=>`${value.action} reported ${new Date(value.reportedAt).toLocaleString()}`).join(" · ")+(finding.outcomeRecordsTruncated?" · latest 10 reports shown":"")));
+    box.appendChild(detail);
+  }
+}
+let jevReadPending=false;
+async function refreshJev(){
+  if(jevReadPending)return;
+  jevReadPending=true;
+  try{
+    const days=Math.min(90,Number(localStorage.getItem("plimsoll-window")||"30"));
+    const response=await fetch("/api/jev-analysis?days="+days,{headers:authHeaders()});
+    if(!response.ok)throw new Error("jev_read_unavailable");
+    renderJevAnalysis(await response.json());
+  }catch{renderJevAnalysis(null)}finally{jevReadPending=false}
+}
 let dashboardCache=null;
 let dashboardEtag=null;
 async function refresh(redrawOnly=false){
+  if(!redrawOnly)void refreshJev();
   try{
     const days=Number(localStorage.getItem("plimsoll-window")||"30");
     const q="?days="+days;
@@ -947,7 +997,7 @@ $("#settings-close").addEventListener("click",closeDrawers);
 const winSel=$("#window-select");
 winSel.value=localStorage.getItem("plimsoll-window")||"30";
 winSel.addEventListener("change",()=>{localStorage.setItem("plimsoll-window",winSel.value);refresh()});
-window.__plimsollDashboardTest=Object.freeze({renderSnapshot,renderSessionDetail,renderRepoDetail,renderSettings,drawerError});
+window.__plimsollDashboardTest=Object.freeze({renderSnapshot,renderSessionDetail,renderRepoDetail,renderSettings,renderJevAnalysis,drawerError});
 refresh(); setInterval(refresh, 30000);
 window.addEventListener("resize",()=>refresh(true));
 </script>

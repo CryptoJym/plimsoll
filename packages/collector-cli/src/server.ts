@@ -7,6 +7,7 @@ import fs from "node:fs";
 import http from "node:http";
 
 import { LocalEventBuffer } from "./buffer";
+import { readJevAnalysis, type JevAnalysisSnapshot } from "./jev-analysis";
 import { evidenceAge, projectionValidity, STATUS_MAX_AGE_MS } from "./projection-validity";
 import { automaticRepairServiceStatus } from "./maintenance";
 import {
@@ -631,6 +632,8 @@ export function createCollectorServer(
     detectedIdentities?: () => Array<Record<string, unknown>>;
     /** Local materialized outcome read model; no provider/network path. */
     outcomePerformance?: (days: number, asOf: string) => Record<string, unknown>;
+    /** Existing local Jev receipts; read only, with no model or network call. */
+    jevDatabasePath?: string;
     /** Registers a refresh callable for startup/child-receipt points only. */
     registerStatusRefresher?: (refresh: (failure?: "maintenance_failed") => boolean) => void;
     /**
@@ -691,6 +694,8 @@ export function createCollectorServer(
 
   const localAuth = options.localAuth ?? null;
   const authEnforced = localAuth !== null;
+  // Keep one bounded read result, not another persistent ledger or worker.
+  let jevCache: { days: number; at: number; snapshot: JevAnalysisSnapshot } | null = null;
   const sourceRateLimiter = createSourceRateLimiter(
     options.perSourceRequestLimit ?? LOCAL_HTTP_LIMITS.perSourceRequestsPerWindow,
   );
@@ -1319,6 +1324,27 @@ export function createCollectorServer(
         assertManagementRead(request);
         const url = requestUrl(request);
         const days = Number(url.searchParams.get("days") ?? 30) || 30;
+        if (url.pathname === "/api/jev-analysis") {
+          // Native session identifiers require the provisioned management
+          // credential, even when legacy proof fixtures disable other auth.
+          if (!localAuth) {
+            sendJson(response, { error: "management_auth_required" }, 503);
+            return;
+          }
+          const jevDays = Number(url.searchParams.get("days") ?? 30);
+          if (!Number.isInteger(jevDays) || jevDays < 1 || jevDays > 90) {
+            sendJson(response, { error: "unsupported_jev_window", maxDays: 90 }, 400);
+            return;
+          }
+          const now = Date.now();
+          if (!jevCache || jevCache.days !== jevDays || now - jevCache.at >= 15_000) {
+            jevCache = { days: jevDays, at: now, snapshot: readJevAnalysis({
+              databasePath: options.jevDatabasePath, days: jevDays, nowMs: now,
+            }) };
+          }
+          sendJson(response, jevCache.snapshot, 200, { "cache-control": "no-store" });
+          return;
+        }
         if (url.pathname === "/api/settings") {
           const accounts = buffer.database
             .prepare(

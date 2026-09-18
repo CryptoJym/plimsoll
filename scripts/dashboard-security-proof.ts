@@ -94,6 +94,18 @@ const payloads = {
   unicode: `UNICODE:𝕻𝖑𝖎𝖒𝖘𝖔𝖑𝖑 e\u0301 \u202Etxt\u2066 <b>still text</b>`,
 } as const;
 
+const jevFixture = {
+  state: "partial", windowDays: 30, generatedAt: "2026-09-18T10:00:00Z",
+  coverage: { rejected: 1, truncated: true }, overhead: { uniqueRequests: 1, estimatedCostUsd: 0.0001 },
+  decisions: [{ id: payloads.html, observedAt: "2026-09-18T09:00:00Z", mode: "rescue",
+    recommendation: payloads.script, native: { runtime: "claude-code", sessionId: payloads.event,
+      eventId: payloads.svg, workspaceHash: payloads.url, eventState: "complete" },
+    inputHash: payloads.html, inference: { state: "returned_valid", model: payloads.unicode,
+      requestHash: payloads.svg, estimatedCostUsd: 0.0001, billedCostUsd: null },
+    offeredAt: "2026-09-18T09:00:01Z", reportedActions: [{ action: "used", reportedAt: "2026-09-18T09:00:02Z" }],
+  }],
+};
+
 const snapshotFixture = {
   window: { days: 30 },
   generation: 109,
@@ -3131,6 +3143,7 @@ function startFixtureServer(html: string, mutations: Array<{ route: string; body
       return;
     }
     const fixtures: Record<string, unknown> = {
+      "/api/jev-analysis": jevFixture,
       "/api/snapshot": snapshotFixture,
       "/api/settings": settingsFixture,
       "/api/session": sessionFixture,
@@ -3253,6 +3266,15 @@ async function browserProof(html: string) {
         JSON.stringify(readiness),
       );
       observations.push(await evaluate<string>(cdp, "document.body.textContent"));
+      await evaluate(cdp, "refreshJev()", true);
+      const jevText = await evaluate<string>(cdp, "document.querySelector('#jev-plate').textContent");
+      check(`browser_${viewport.name}_jev_evidence_is_text_and_partial_is_visible`,
+        Object.values(payloads).every(payload => jevText.includes(payload)) &&
+        jevText.includes("partial coverage") && jevText.includes("owner reported: used") &&
+        jevText.includes("verified completion and savings are not yet linked"),
+        JSON.stringify({ payloadsRendered: Object.values(payloads).every(payload => jevText.includes(payload)) }));
+      await evaluate(cdp, "document.querySelector('#jev-findings details').open=true");
+      observations.push(jevText);
       await evaluate(cdp, `openSession(${JSON.stringify(snapshotFixture.sessions[0].sessionId)})`, true);
       observations.push(await evaluate<string>(cdp, "document.querySelector('#d-body').textContent"));
       await evaluate(cdp, `openRepo(${JSON.stringify(snapshotFixture.repos[0].repoHash)})`, true);
