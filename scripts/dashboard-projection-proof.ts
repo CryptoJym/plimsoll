@@ -319,7 +319,9 @@ function compactMutationRepairDependencyFixture(root:string,label:string,reopenA
 }
 
 async function main() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-projection-proof-"));
+  // Capture roots reject symlinked ancestors. macOS os.tmpdir() can begin
+  // with /var, whose physical path is /private/var; keep fixtures physical.
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-projection-proof-")));
   const dbPath = path.join(root, "ledger.sqlite");
   const buffer = new LocalEventBuffer(dbPath);
   const repoA = hash("a");
