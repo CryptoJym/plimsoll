@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("lifecycle-operator", 73);
+const completion = createProofCompletion("lifecycle-operator", 79);
 /**
  * Issue #103/#158 packaged lifecycle operator proof.
  *
@@ -9,13 +9,14 @@ const completion = createProofCompletion("lifecycle-operator", 73);
  * manifest activation, failed-readiness auto-rollback over a LIVE WAL
  * ledger, preview-default uninstall/purge, support bundles, and the shared
  * mutation-authority fence. A stubbed `launchctl` on PATH counts invocations;
- * the contract asserts ZERO service-manager calls. No network, no live
- * collector, no credentials outside the fixture home.
+ * the contract asserts ZERO service-manager calls. Only an owned loopback
+ * listener is contacted; no live collector or credentials outside the fixture home.
  */
 import { build } from "esbuild";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 
@@ -160,7 +161,10 @@ async function main(): Promise<void> {
     sourcemap: false,
     logLevel: "silent",
   });
-  if (!process.env.PLIMSOLL_QUALIFICATION_ARTIFACT) fs.chmodSync(BUNDLE_PATH, 0o755);
+  if (!process.env.PLIMSOLL_QUALIFICATION_ARTIFACT) {
+    fs.chmodSync(BUNDLE_PATH, 0o755);
+    fs.copyFileSync(path.join(path.dirname(SOURCE_ENTRY), "dashboard.html"), path.join(path.dirname(BUNDLE_PATH), "dashboard.html"));
+  }
   check("bundle_built", fs.statSync(BUNDLE_PATH).size > 1024);
 
   // --- Seed durable state inside the fixture home ---------------------------
@@ -194,6 +198,67 @@ async function main(): Promise<void> {
   void immutableRuntimeRelativePath;
   check("staged_runtime_digest_matches_bundle",
     fs.readFileSync(stagedRuntime).equals(fs.readFileSync(BUNDLE_PATH)), stagedRuntime);
+
+  const dashboardSource = path.join(path.dirname(BUNDLE_PATH), "dashboard.html");
+  const stagedDashboard = path.join(path.dirname(stagedRuntime), "dashboard.html");
+  const resolved = resolveArtifactFromBundle({ bundlePath: BUNDLE_PATH, version: PLIMSOLL_VERSION });
+  check("dashboard_companion_digest_is_pinned", resolved.files?.some(file =>
+    file.relativePath === "bin/dashboard.html" && file.sha256 === sha256File(dashboardSource)));
+  check("dashboard_companion_is_staged_exactly", fs.existsSync(stagedDashboard) &&
+    fs.readFileSync(stagedDashboard).equals(fs.readFileSync(dashboardSource)));
+
+  // Exercise the actual lifecycle-installed executable, not the source server
+  // or the npm dist directory where the asset was already present.
+  const reservation = http.createServer();
+  await new Promise<void>(resolve => reservation.listen(0, "127.0.0.1", resolve));
+  const port = (reservation.address() as { port: number }).port;
+  await new Promise<void>(resolve => reservation.close(() => resolve()));
+  fs.writeFileSync(collectorConfigPath(fixtureHome), JSON.stringify({ port, privacyMode: "metadata_only" }), { mode: 0o600 });
+  const daemon = spawn(process.execPath, [stagedRuntime, "start"], {
+    cwd: fixtureHome, env: childEnv, stdio: "ignore",
+  });
+  try {
+    let served = false;
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline && daemon.exitCode === null) {
+      try {
+        const response = await fetch(`http://127.0.0.1:${port}/`, { signal: AbortSignal.timeout(500) });
+        const html = await response.text();
+        served = response.status === 200 && html === fs.readFileSync(dashboardSource, "utf8") &&
+          (response.headers.get("content-security-policy") ?? "").includes("script-src 'sha256-");
+        if (served) break;
+      } catch { /* The owned listener is not ready yet. */ }
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    check("lifecycle_installed_dashboard_serves_with_csp", served);
+  } finally {
+    if (daemon.exitCode === null && daemon.signalCode === null) daemon.kill("SIGTERM");
+    const deadline = Date.now() + 3_000;
+    while (daemon.exitCode === null && daemon.signalCode === null && Date.now() < deadline) {
+      await new Promise(resolve => setTimeout(resolve, 50));
+    }
+    if (daemon.exitCode === null && daemon.signalCode === null) {
+      daemon.kill("SIGKILL");
+      await new Promise<void>(resolve => daemon.once("exit", () => resolve()));
+    }
+  }
+
+  const assetFixture = fs.mkdtempSync(path.join(path.dirname(BUNDLE_PATH), "lifecycle-asset-"));
+  try {
+    const fixtureBundle = path.join(assetFixture, "cli.mjs");
+    const fixtureDashboard = path.join(assetFixture, "dashboard.html");
+    fs.copyFileSync(BUNDLE_PATH, fixtureBundle);
+    const refused = () => {
+      try { resolveArtifactFromBundle({ bundlePath: fixtureBundle, version: PLIMSOLL_VERSION }); return false; }
+      catch { return true; }
+    };
+    check("missing_dashboard_companion_refused", refused());
+    fs.symlinkSync(dashboardSource, fixtureDashboard);
+    check("symlink_dashboard_companion_refused", refused());
+    fs.unlinkSync(fixtureDashboard);
+    fs.writeFileSync(fixtureDashboard, ""); fs.truncateSync(fixtureDashboard, 4 * 1024 * 1024 + 1);
+    check("oversized_dashboard_companion_refused", refused());
+  } finally { fs.rmSync(assetFixture, { recursive: true, force: true }); }
 
   const nativeSource = (() => {
     let cursor = path.dirname(BUNDLE_PATH);

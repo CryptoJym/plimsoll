@@ -61,6 +61,7 @@ const BOUNDED_IDENTIFIER = /^[A-Za-z0-9][A-Za-z0-9._-]{0,95}$/;
 const SAFE_LOG_CODE = /^[a-z0-9][a-z0-9._-]{0,63}$/;
 
 const MAX_BUNDLE_BYTES = 64 * 1024 * 1024;
+const MAX_DASHBOARD_BYTES = 4 * 1024 * 1024;
 const MAX_STATE_JSON_BYTES = 4 * 1024;
 const MAX_LOG_TAIL_BYTES = 64 * 1024;
 const MAX_LOG_LINES_SCANNED = 4096;
@@ -227,6 +228,16 @@ export function resolveArtifactFromBundle(input: { bundlePath: string; version: 
   }
   const candidates: CompanionCandidate[] = [];
   const seenBytes = { value: 0 };
+  // The server resolves this file beside its executable. Keep it in the
+  // immutable runtime closure, including explicit rollback artifacts.
+  const dashboard = path.join(path.dirname(bundle), "dashboard.html");
+  const dashboardStat = fs.lstatSync(dashboard);
+  if (!dashboardStat.isFile() || dashboardStat.isSymbolicLink() ||
+      dashboardStat.size > MAX_DASHBOARD_BYTES) {
+    throw new Error("artifact dashboard must be a bounded regular file");
+  }
+  candidates.push({ relativePath: "bin/dashboard.html", sourcePath: dashboard });
+  seenBytes.value += dashboardStat.size;
   let betterSqlite3VirtualStore: string | null = null;
   for (const packageName of VENDORED_NATIVE_PACKAGES) {
     const searchPaths = [
