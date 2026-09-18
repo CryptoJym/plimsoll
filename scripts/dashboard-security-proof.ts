@@ -3266,6 +3266,8 @@ async function browserProof(html: string) {
         JSON.stringify(readiness),
       );
       observations.push(await evaluate<string>(cdp, "document.body.textContent"));
+      check(`browser_${viewport.name}_jev_refresh_shares_pending_read`,
+        await evaluate<boolean>(cdp, "(()=>{const pending=refreshJev();return pending===refreshJev()})()"), "same pending promise");
       await evaluate(cdp, "refreshJev()", true);
       const jevText = await evaluate<string>(cdp, "document.querySelector('#jev-plate').textContent");
       check(`browser_${viewport.name}_jev_evidence_is_text_and_partial_is_visible`,
@@ -3275,6 +3277,13 @@ async function browserProof(html: string) {
         JSON.stringify({ payloadsRendered: Object.values(payloads).every(payload => jevText.includes(payload)) }));
       await evaluate(cdp, "document.querySelector('#jev-findings details').open=true");
       observations.push(jevText);
+      await evaluate(cdp, "renderJevAnalysis({state:'partial',windowDays:30,coverage:{inspected:50,rejected:50},decisions:[]})");
+      check(`browser_${viewport.name}_rejected_records_are_not_reported_as_absent`,
+        await evaluate<boolean>(cdp, "document.querySelector('#jev-findings').textContent.includes('could not be validated')"), "excluded records stay explicit");
+      await evaluate(cdp, "renderJevAnalysis({state:'unavailable',reason:'source_outside_read_bounds'})");
+      check(`browser_${viewport.name}_source_read_bounds_are_explained`,
+        await evaluate<boolean>(cdp, "document.querySelector('#jev-status').textContent.includes('outside safe read limits')"), "read-bound reason shown");
+      await evaluate(cdp, "refreshJev()", true);
       await evaluate(cdp, `openSession(${JSON.stringify(snapshotFixture.sessions[0].sessionId)})`, true);
       observations.push(await evaluate<string>(cdp, "document.querySelector('#d-body').textContent"));
       await evaluate(cdp, `openRepo(${JSON.stringify(snapshotFixture.repos[0].repoHash)})`, true);

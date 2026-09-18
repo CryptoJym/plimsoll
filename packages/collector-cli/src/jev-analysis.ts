@@ -62,6 +62,7 @@ export type JevAnalysisDecision = {
   };
   offeredAt: string | null;
   reportedActions: Array<{ action: string; reportedAt: string }>;
+  outcomeRecordsRejected: number;
   outcomeRecordsTruncated: boolean;
   workAttribution: "unavailable";
   verifiedAcceptance: null;
@@ -75,8 +76,9 @@ export type JevAnalysisSnapshot = {
   reason: string | null;
   scope: "local_machine";
   windowDays: number;
-  coverage: { inspected: number; returned: number; rejected: number; truncated: boolean; limit: number };
+  coverage: { inspected: number; returned: number; rejected: number; rejectedOutcomes: number; truncated: boolean; limit: number };
   overhead: {
+    deterministicDecisions: number;
     uniqueRequests: number;
     estimatedCostUsd: number | null;
     requestsWithEstimate: number;
@@ -92,12 +94,16 @@ export function readJevAnalysis(options: { databasePath?: string; days?: number;
   const result: JevAnalysisSnapshot = {
     schema: "plimsoll.jev-analysis.v1", generatedAt: new Date(now).toISOString(),
     state: "unavailable", reason: null, scope: "local_machine", windowDays: days,
-    coverage: { inspected: 0, returned: 0, rejected: 0, truncated: false, limit: LIMIT },
-    overhead: { uniqueRequests: 0, estimatedCostUsd: null, requestsWithEstimate: 0, billedCostUsd: null, requestsWithBilling: 0 },
+    coverage: { inspected: 0, returned: 0, rejected: 0, rejectedOutcomes: 0, truncated: false, limit: LIMIT },
+    overhead: { deterministicDecisions: 0, uniqueRequests: 0, estimatedCostUsd: null, requestsWithEstimate: 0, billedCostUsd: null, requestsWithBilling: 0 },
     decisions: [],
   };
   if (!Number.isInteger(days) || days < 1 || days > 90) {
     result.reason = "unsupported_window";
+    return result;
+  }
+  if (process.env.PLIMSOLL_JEV_DISABLED === "1") {
+    result.reason = "disabled_by_operator";
     return result;
   }
   const databasePath = options.databasePath ?? process.env.PLIMSOLL_JEV_DB ??
@@ -109,10 +115,12 @@ export function readJevAnalysis(options: { databasePath?: string; days?: number;
       result.reason = "source_outside_read_bounds";
       return result;
     }
-    for (const suffix of ["-wal", "-shm"]) {
+    let sourceBytes = stat.size;
+    for (const suffix of ["-wal", "-shm", "-journal"]) {
       try {
         const sidecar = fs.lstatSync(databasePath + suffix);
-        if (!sidecar.isFile() || sidecar.isSymbolicLink() || stat.size + sidecar.size > MAX_DB_BYTES) {
+        sourceBytes += sidecar.size;
+        if (!sidecar.isFile() || sidecar.isSymbolicLink() || sourceBytes > MAX_DB_BYTES) {
           result.reason = "source_outside_read_bounds";
           return result;
         }
@@ -133,9 +141,22 @@ export function readJevAnalysis(options: { databasePath?: string; days?: number;
       CASE WHEN length(CAST(receipt AS BLOB)) <= ? THEN receipt ELSE NULL END AS receipt
       FROM auto_events WHERE id = ?`);
     const offerQuery = db.prepare("SELECT event_id, offered_at FROM auto_offers WHERE decision_id = ?");
-    const outcomeQuery = db.prepare(`SELECT created,
-      CASE WHEN length(CAST(record AS BLOB)) <= ? THEN record ELSE NULL END AS record
-      FROM auto_outcomes WHERE decision_id = ? ORDER BY created DESC, id LIMIT 11`);
+    // The source contract does not promise an outcome index. Read this table
+    // once, with at most eleven rows per displayed decision, not fifty scans.
+    const decisionIds = rows.slice(0, LIMIT).map(row => row.id);
+    const outcomesByDecision = new Map<string, Json[]>();
+    if (decisionIds.length) {
+      const outcomes = db.prepare(`SELECT decision_id, created, record FROM (
+        SELECT decision_id, created,
+          CASE WHEN length(CAST(record AS BLOB)) <= ? THEN record ELSE NULL END AS record,
+          row_number() OVER (PARTITION BY decision_id ORDER BY created DESC, id) AS position
+        FROM auto_outcomes WHERE decision_id IN (${decisionIds.map(() => "?").join(",")})
+      ) WHERE position <= 11 ORDER BY decision_id, position`).all(MAX_JSON, ...decisionIds) as Json[];
+      for (const outcome of outcomes) {
+        const id = outcome.decision_id as string;
+        outcomesByDecision.set(id, [...(outcomesByDecision.get(id) ?? []), outcome]);
+      }
+    }
     for (const row of rows.slice(0, LIMIT)) {
       result.coverage.inspected++;
       try {
@@ -167,16 +188,21 @@ export function readJevAnalysis(options: { databasePath?: string; days?: number;
           offeredAt = timestamp(offer.offered_at, now);
           if ((offer.offered_at as number) < (row.created as number)) throw new Error("invalid_offer_order");
         }
-        const outcomes = outcomeQuery.all(MAX_JSON, id) as Array<Json>;
-        const actions = outcomes.slice(0, 10).map(outcome => {
+        const outcomes = outcomesByDecision.get(id) ?? [];
+        const actions: JevAnalysisDecision["reportedActions"] = [];
+        let outcomeRecordsRejected = 0;
+        for (const outcome of outcomes.slice(0, 10)) {
+          try {
           const record = parse(outcome.record);
           if (record.decision_id !== id || !ACTIONS.includes(record.action as string) ||
             typeof record.evidence_ref !== "string" || !record.evidence_ref.trim()) throw new Error("invalid_outcome");
           if ((outcome.created as number) < (row.created as number)) throw new Error("invalid_outcome_order");
           // Evidence refs can be arbitrary paths or private URLs. Do not expose
           // them or mistake an owner's report for independently verified work.
-          return { action: record.action as string, reportedAt: timestamp(outcome.created, now) };
-        });
+          actions.push({ action: record.action as string, reportedAt: timestamp(outcome.created, now) });
+          } catch { outcomeRecordsRejected++; }
+        }
+        result.coverage.rejectedOutcomes += outcomeRecordsRejected;
         result.decisions.push({
           id, observedAt, mode: row.mode as string, recommendation, held: saved.holds.length > 0,
           native: { runtime, sessionId: session, workspaceHash: workspace, eventId, eventState: event.state as string }, inputHash,
@@ -186,7 +212,7 @@ export function readJevAnalysis(options: { databasePath?: string; days?: number;
             inputTokens: count(usage.input_tokens), outputTokens: count(usage.output_tokens),
             latencyMs: number(inference.latency_ms), estimatedCostUsd: number(inference.estimated_cost_usd),
             billedCostUsd: number(inference.billed_cost_usd) },
-          offeredAt, reportedActions: actions, outcomeRecordsTruncated: outcomes.length > 10,
+          offeredAt, reportedActions: actions, outcomeRecordsRejected, outcomeRecordsTruncated: outcomes.length > 10,
           workAttribution: "unavailable", verifiedAcceptance: null, measuredSavingsUsd: null,
         });
       } catch {
@@ -203,22 +229,23 @@ export function readJevAnalysis(options: { databasePath?: string; days?: number;
       if (key) requests.set(key, [...(requests.get(key) ?? []), decision.inference]);
     }
     result.overhead.uniqueRequests = requests.size;
-    for (const [field, count] of [["estimatedCostUsd", "requestsWithEstimate"], ["billedCostUsd", "requestsWithBilling"]] as const) {
+    result.overhead.deterministicDecisions = result.decisions.filter(decision => decision.inference.state === "deterministic").length;
+    for (const [field, covered] of [["estimatedCostUsd", "requestsWithEstimate"], ["billedCostUsd", "requestsWithBilling"]] as const) {
       let sum = 0;
       for (const entries of requests.values()) {
         const values = new Set(entries.map(item => item[field]).filter(value => value !== null));
-        if (values.size === 1) { sum += [...values][0]!; result.overhead[count]++; }
+        if (values.size === 1) { sum += [...values][0]!; result.overhead[covered]++; }
       }
-      result.overhead[field] = requests.size > 0 && result.overhead[count] === requests.size && Number.isFinite(sum) ? sum : null;
+      result.overhead[field] = requests.size > 0 && result.overhead[covered] === requests.size && Number.isFinite(sum) ? sum : null;
     }
-    result.state = result.coverage.rejected > 0 || result.coverage.truncated ? "partial" : "available";
-    result.reason = result.coverage.rejected > 0 ? "invalid_records_excluded" : result.coverage.truncated ? "recent_decision_limit" : null;
+    result.state = result.coverage.rejected > 0 || result.coverage.rejectedOutcomes > 0 || result.coverage.truncated ? "partial" : "available";
+    result.reason = result.coverage.rejected > 0 || result.coverage.rejectedOutcomes > 0 ? "invalid_records_excluded" : result.coverage.truncated ? "recent_decision_limit" : null;
   } catch (error) {
     result.decisions = [];
-    result.coverage.returned = 0;
+    result.coverage = { inspected: 0, returned: 0, rejected: 0, rejectedOutcomes: 0, truncated: false, limit: LIMIT };
     const code = (error as { code?: string }).code;
     result.state = code === "ENOENT" ? "not_installed" : "unavailable";
-    result.reason = code === "ENOENT" ? "receipt_store_missing" : "receipt_store_unreadable_or_unsupported";
+    result.reason = code === "ENOENT" ? "receipt_store_missing" : code === "SQLITE_BUSY" || code === "SQLITE_LOCKED" ? "receipt_store_busy" : "receipt_store_unreadable_or_unsupported";
   } finally {
     db?.close();
   }

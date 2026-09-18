@@ -110,8 +110,10 @@ try {
       if (kind === "order") db.prepare("UPDATE auto_events SET created=? WHERE id=?").run(seconds + 1, record.eventId);
       const snapshot = read();
       assert.equal(snapshot.state, "partial");
-      assert.equal(snapshot.coverage.rejected, 1);
-      assert.equal(snapshot.decisions.length, 2);
+      assert.equal(snapshot.coverage.rejected, kind === "outcome" ? 0 : 1);
+      assert.equal(snapshot.coverage.rejectedOutcomes, kind === "outcome" ? 1 : 0);
+      assert.equal(snapshot.decisions.length, kind === "outcome" ? 3 : 2);
+      if (kind === "outcome") assert.equal(snapshot.decisions.find(item => item.id === record.id)?.reportedActions.length, 0);
       db.prepare("DELETE FROM auto_decisions WHERE id=?").run(record.id);
     });
   }
@@ -148,6 +150,7 @@ try {
     try {
       const snapshot = read();
       assert.equal(snapshot.state, "unavailable");
+      assert.equal(snapshot.reason, "receipt_store_busy");
       assert.equal(snapshot.decisions.length, 0);
       assert(performance.now() - started < 2_000);
     } finally { db.exec("ROLLBACK"); }
@@ -182,6 +185,14 @@ try {
     });
     const invalid = await fetch(origin + "/api/jev-analysis?days=0", { headers: { "x-plimsoll-token": auth.managementRead } });
     check("unsupported_window_is_not_silently_defaulted", () => assert.equal(invalid.status, 400));
+    const changed = await fetch(origin + "/api/jev-analysis?days=90", { headers: { "x-plimsoll-token": auth.managementRead } });
+    const changedBody = await changed.json();
+    check("changing_window_does_not_bypass_source_read_interval", () => {
+      assert.equal(changed.status, 503);
+      assert.equal(changedBody.error, "jev_refresh_pending");
+      assert(Number(changed.headers.get("retry-after")) <= 15);
+      assert(!("decisions" in changedBody));
+    });
     const html = await (await fetch(origin)).text();
     check("dashboard_uses_existing_text_only_rendering_and_csp", () => {
       assert(html.includes('id="jev-plate"'));
@@ -191,6 +202,20 @@ try {
   } finally {
     await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     buffer.close();
+  }
+  const legacyBuffer = new LocalEventBuffer(path.join(root, "legacy.sqlite"));
+  const legacy = createCollectorServer(collectorConfigSchema.parse({}), legacyBuffer, { jevDatabasePath: databasePath });
+  await new Promise<void>(resolve => legacy.listen(0, "127.0.0.1", resolve));
+  try {
+    const response = await fetch(`http://127.0.0.1:${(legacy.address() as AddressInfo).port}/api/jev-analysis`);
+    const body = await response.json();
+    check("legacy_no_auth_install_never_discloses_native_session", () => {
+      assert.equal(response.status, 503);
+      assert.deepEqual(body, { error: "management_auth_required" });
+    });
+  } finally {
+    await new Promise<void>(resolve => legacy.close(() => resolve()));
+    legacyBuffer.close();
   }
   console.log(JSON.stringify({ proof: "jev-analysis", passed: checks, failed: 0 }));
 } finally {

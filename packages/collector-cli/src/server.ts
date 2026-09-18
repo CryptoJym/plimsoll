@@ -1337,6 +1337,15 @@ export function createCollectorServer(
             return;
           }
           const now = Date.now();
+          // Changing the requested window cannot defeat the scan interval.
+          // Return an explicit retry state rather than a different window.
+          if (jevCache && jevCache.days !== jevDays && now - jevCache.at < 15_000) {
+            sendJson(response, { error: "jev_refresh_pending" }, 503, {
+              "retry-after": String(Math.max(1, Math.ceil((15_000 - (now - jevCache.at)) / 1000))),
+              "cache-control": "no-store",
+            });
+            return;
+          }
           if (!jevCache || jevCache.days !== jevDays || now - jevCache.at >= 15_000) {
             jevCache = { days: jevDays, at: now, snapshot: readJevAnalysis({
               databasePath: options.jevDatabasePath, days: jevDays, nowMs: now,
