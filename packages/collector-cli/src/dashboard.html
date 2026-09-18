@@ -860,8 +860,9 @@ function renderSnapshot(d){
 
 // This reads saved advice, including advice from automatic hooks. Refreshing
 // the dashboard cannot invoke Jev or change an agent's task or memory.
+let jevLastReadSummary="";
 function renderJevAnalysis(snapshot){
-  const box=clear($("#jev-findings")),status=$("#jev-status");
+  const box=$("#jev-findings"),status=$("#jev-status");
   if(!snapshot||!["available","partial"].includes(snapshot.state)){
     const reasons={
       receipt_store_missing:"No Jev receipt store on this machine.",
@@ -877,20 +878,27 @@ function renderJevAnalysis(snapshot){
       unsupported_jev_window:"This Jev time window is unsupported.",
     };
     status.textContent=reasons[snapshot?.reason]||"Jev receipts unavailable. Coverage is unknown.";
+    if(["receipt_store_busy","jev_refresh_pending"].includes(snapshot?.reason)&&box.childNodes.length){
+      status.textContent+=" Previously loaded results remain below: "+jevLastReadSummary;
+    }else clear(box);
     return;
   }
+  const expanded=new Set([...box.querySelectorAll("details[open]")].map(item=>item.dataset.decisionId));
+  clear(box);
   const findings=Array.isArray(snapshot.decisions)?snapshot.decisions:[];
   const coverage=snapshot.coverage||{},overhead=snapshot.overhead||{};
   const money=value=>typeof value==="number"?"$"+value.toFixed(6):"unknown";
   status.textContent=`${findings.length} recent findings · last ${snapshot.windowDays} days · read ${new Date(snapshot.generatedAt).toLocaleTimeString()} · ${overhead.deterministicDecisions??0} deterministic · inference estimate ${money(overhead.estimatedCostUsd)} for ${overhead.uniqueRequests??0} distinct requests shown`;
   if(snapshot.state==="partial")status.textContent+=` · partial coverage (${coverage.rejected??0} findings and ${coverage.rejectedOutcomes??0} outcome records excluded${coverage.truncated?", recent "+coverage.limit+" only":""})`;
+  jevLastReadSummary=status.textContent;
   if(!findings.length)add(box,emptyNode(coverage.inspected>0?"Saved Jev records could not be validated. No usable findings can be shown.":"No Jev decisions observed in this window. This does not establish whether hooks are active."));
   for(const finding of findings){
     const detail=node("details",null,"jev-finding"),native=finding.native||{},inference=finding.inference||{};
+    detail.dataset.decisionId=String(finding.id);detail.open=expanded.has(String(finding.id));
     const actions=Array.isArray(finding.reportedActions)?finding.reportedActions:[];
-    const progress=actions.length?"owner reported: "+actions[0].action+(actions.length>1?" (latest)":""):finding.offeredAt?"prepared for agent · use unconfirmed":"no offer recorded";
+    const progress=actions.length?"owner reported: "+actions[0].action+(actions.length>1||finding.outcomeRecordsRejected?" (latest valid record)":""):finding.offeredAt?"prepared for agent · use unconfirmed":"no offer recorded";
     const human=value=>String(value??"unknown").replace(/_/g," ");
-    add(detail,node("summary",`${human(finding.mode)} · ${human(finding.recommendation)} · ${progress}${finding.held?" · hold present":""}`));
+    add(detail,node("summary",`${human(finding.mode)} · ${human(finding.recommendation)} · ${progress}${finding.held?" · hold present":""}${finding.outcomeRecordsRejected?" · outcome evidence incomplete":""}`));
     add(detail,node("p",`${native.runtime??"unknown"} · observed ${new Date(finding.observedAt).toLocaleString()} · native event ${native.eventState??"unknown"}`));
     add(detail,node("p",`Session: ${native.sessionId??"unknown"}`));
     add(detail,node("p",`Inference: ${human(inference.state)} · recorded model: ${inference.model??"unknown"}${inference.requestedModel?" · requested "+inference.requestedModel:""} · input ${inference.inputTokens??"unknown"} / output ${inference.outputTokens??"unknown"} tokens · estimate ${money(inference.estimatedCostUsd)} · billed ${money(inference.billedCostUsd)}${inference.cacheHit===true?" · cache hit":""}`));
@@ -909,7 +917,7 @@ function refreshJev(){
     const days=Number.isInteger(stored)&&stored>0?Math.min(90,stored):30;
     const response=await fetch("/api/jev-analysis?days="+days,{headers:authHeaders()});
     const payload=await response.json();
-    renderJevAnalysis(response.ok?payload:{state:"unavailable",reason:payload.error});
+    renderJevAnalysis(response.ok?payload:{state:"unavailable",reason:payload.reason??payload.error});
   }catch{renderJevAnalysis(null)}finally{jevReadPending=null}
   })();
   return jevReadPending;

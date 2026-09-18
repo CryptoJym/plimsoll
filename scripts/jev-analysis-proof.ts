@@ -113,7 +113,11 @@ try {
       assert.equal(snapshot.coverage.rejected, kind === "outcome" ? 0 : 1);
       assert.equal(snapshot.coverage.rejectedOutcomes, kind === "outcome" ? 1 : 0);
       assert.equal(snapshot.decisions.length, kind === "outcome" ? 3 : 2);
-      if (kind === "outcome") assert.equal(snapshot.decisions.find(item => item.id === record.id)?.reportedActions.length, 0);
+      if (kind === "outcome") {
+        const finding = snapshot.decisions.find(item => item.id === record.id)!;
+        assert.equal(finding.reportedActions.length, 0);
+        assert.equal(finding.outcomeRecordsRejected, 1);
+      }
       db.prepare("DELETE FROM auto_decisions WHERE id=?").run(record.id);
     });
   }
@@ -125,6 +129,13 @@ try {
     assert.equal(readJevAnalysis({ databasePath: large }).reason, "source_outside_read_bounds");
     const link = path.join(root, "linked.sqlite3"); fs.symlinkSync(databasePath, link);
     assert.equal(readJevAnalysis({ databasePath: link }).reason, "source_outside_read_bounds");
+  });
+  check("operator_opt_out_takes_precedence_over_source_discovery", () => {
+    const snapshot = readJevAnalysis({ env: { PLIMSOLL_JEV_DISABLED: "1", PLIMSOLL_JEV_DB: path.join(root, "absent") } });
+    assert.equal(snapshot.reason, "disabled_by_operator");
+    assert.equal(snapshot.state, "unavailable");
+    assert.equal(snapshot.coverage.inspected, 0);
+    assert.equal(snapshot.decisions.length, 0);
   });
   check("bounded_recent_decisions_and_outcomes_report_truncation", () => {
     for (let index = 0; index < 55; index++) add("limit-" + index);
@@ -170,9 +181,12 @@ try {
   try {
     const unauthenticated = await fetch(origin + "/api/jev-analysis");
     const producer = await fetch(origin + "/api/jev-analysis", { headers: { "x-plimsoll-token": auth.codexProducer } });
+    const unauthenticatedBody = await unauthenticated.json(), producerBody = await producer.json();
     check("only_management_credential_can_read_native_jev_sessions", () => {
       assert.equal(unauthenticated.status, 401);
       assert.equal(producer.status, 401);
+      assert.equal(unauthenticatedBody.reason, "management_credential_required");
+      assert.equal(producerBody.reason, "management_credential_invalid");
     });
     const response = await fetch(origin + "/api/jev-analysis", { headers: { "x-plimsoll-token": auth.managementRead } });
     const snapshot = await response.json();

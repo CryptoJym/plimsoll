@@ -88,9 +88,10 @@ export type JevAnalysisSnapshot = {
   decisions: JevAnalysisDecision[];
 };
 
-export function readJevAnalysis(options: { databasePath?: string; days?: number; nowMs?: number } = {}): JevAnalysisSnapshot {
+export function readJevAnalysis(options: { databasePath?: string; days?: number; nowMs?: number; env?: NodeJS.ProcessEnv } = {}): JevAnalysisSnapshot {
   const now = options.nowMs ?? Date.now();
   const days = options.days ?? 30;
+  const env = options.env ?? process.env;
   const result: JevAnalysisSnapshot = {
     schema: "plimsoll.jev-analysis.v1", generatedAt: new Date(now).toISOString(),
     state: "unavailable", reason: null, scope: "local_machine", windowDays: days,
@@ -102,11 +103,11 @@ export function readJevAnalysis(options: { databasePath?: string; days?: number;
     result.reason = "unsupported_window";
     return result;
   }
-  if (process.env.PLIMSOLL_JEV_DISABLED === "1") {
+  if (env.PLIMSOLL_JEV_DISABLED === "1") {
     result.reason = "disabled_by_operator";
     return result;
   }
-  const databasePath = options.databasePath ?? process.env.PLIMSOLL_JEV_DB ??
+  const databasePath = options.databasePath ?? env.PLIMSOLL_JEV_DB ??
     path.join(os.homedir(), ".local", "state", "jev-decisions", "inference.sqlite3");
   let db: Database.Database | undefined;
   try {

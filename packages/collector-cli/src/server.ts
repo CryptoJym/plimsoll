@@ -1348,7 +1348,7 @@ export function createCollectorServer(
           }
           if (!jevCache || jevCache.days !== jevDays || now - jevCache.at >= 15_000) {
             jevCache = { days: jevDays, at: now, snapshot: readJevAnalysis({
-              databasePath: options.jevDatabasePath, days: jevDays, nowMs: now,
+              databasePath: options.jevDatabasePath, days: jevDays, nowMs: now, env: options.env,
             }) };
           }
           sendJson(response, jevCache.snapshot, 200, { "cache-control": "no-store" });

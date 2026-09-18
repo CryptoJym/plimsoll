@@ -3267,7 +3267,7 @@ async function browserProof(html: string) {
       );
       observations.push(await evaluate<string>(cdp, "document.body.textContent"));
       check(`browser_${viewport.name}_jev_refresh_shares_pending_read`,
-        await evaluate<boolean>(cdp, "(()=>{const pending=refreshJev();return pending===refreshJev()})()"), "same pending promise");
+        await evaluate<boolean>(cdp, "(()=>{const pending=refreshJev();return typeof pending?.then==='function'&&pending===refreshJev()})()"), "same pending promise");
       await evaluate(cdp, "refreshJev()", true);
       const jevText = await evaluate<string>(cdp, "document.querySelector('#jev-plate').textContent");
       check(`browser_${viewport.name}_jev_evidence_is_text_and_partial_is_visible`,
@@ -3277,6 +3277,12 @@ async function browserProof(html: string) {
         JSON.stringify({ payloadsRendered: Object.values(payloads).every(payload => jevText.includes(payload)) }));
       await evaluate(cdp, "document.querySelector('#jev-findings details').open=true");
       observations.push(jevText);
+      await evaluate(cdp, "renderJevAnalysis({state:'unavailable',reason:'jev_refresh_pending'})");
+      check(`browser_${viewport.name}_temporary_read_failure_keeps_labeled_previous_results`,
+        await evaluate<boolean>(cdp, "Boolean(document.querySelector('#jev-findings details[open]'))&&document.querySelector('#jev-status').textContent.includes('Previously loaded results')"), "previous results remain explicitly labeled");
+      await evaluate(cdp, "refreshJev()", true);
+      check(`browser_${viewport.name}_refresh_keeps_expanded_finding`,
+        await evaluate<boolean>(cdp, "Boolean(document.querySelector('#jev-findings details[open]'))"), "expanded finding preserved");
       await evaluate(cdp, "renderJevAnalysis({state:'partial',windowDays:30,coverage:{inspected:50,rejected:50},decisions:[]})");
       check(`browser_${viewport.name}_rejected_records_are_not_reported_as_absent`,
         await evaluate<boolean>(cdp, "document.querySelector('#jev-findings').textContent.includes('could not be validated')"), "excluded records stay explicit");
