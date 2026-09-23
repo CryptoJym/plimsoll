@@ -2749,6 +2749,7 @@ async function main() {
               ? await listLedgerSessionIdsOffThread(buffer.database, {
                   until: sessionUntil,
                   since: sessionSyncState.lastSuccessfulUntil,
+                  excludedIds: sessionSyncState.blockedSessionIds,
                 })
               : undefined,
           });
@@ -2758,13 +2759,18 @@ async function main() {
           if (!sessionPlan.skip) {
             const sessionResult = await runSessionSync(config, {
               ...(sessionPlan.sessionIds !== undefined ? { sessionIds: sessionPlan.sessionIds } : {}),
+              excludedSessionIds: sessionPlan.state.blockedSessionIds,
               until: sessionPlan.until,
               ledgerDb: buffer.database,
               log: () => undefined,
             });
             if (sessionResult.ok) {
-              sessionSyncState = commitDaemonSessionSyncSuccess(sessionSyncState, sessionPlan.until);
-              pendingSessionIds = [];
+              sessionSyncState = commitDaemonSessionSyncSuccess(
+                sessionSyncState,
+                sessionPlan.until,
+                sessionResult.rejectedSessionIds,
+              );
+              pendingSessionIds = sessionSyncState.pendingSessionIds;
             } else {
               sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, sessionPlan.sessionIds);
               pendingSessionIds = sessionSyncState.pendingSessionIds;
@@ -2775,14 +2781,11 @@ async function main() {
                 JSON.stringify({
                   status: "session_sync",
                   sessions: sessionResult.sentSessions,
+                  accepted: sessionResult.acceptedSessions,
+                  rejected: sessionResult.rejectedSessionIds.length,
                   inserted: sessionResult.insertedSessions,
                   updated: sessionResult.updatedSessions,
-                  skippedStale:
-                    sessionResult.insertedSessions === null || sessionResult.updatedSessions === null
-                      ? null
-                      : sessionResult.acceptedSessions -
-                        sessionResult.insertedSessions -
-                        sessionResult.updatedSessions,
+                  skippedStale: sessionResult.skippedStaleSessions,
                 }),
               );
             } else if (!sessionResult.ok) {

@@ -568,12 +568,18 @@ export async function postHistoryBatch(input: {
   sleep: (ms: number) => Promise<void>;
   maxAttempts: number;
   timeoutMs?: number;
+  /** Session snapshots can receive an explicit accepted/rejected partition.
+   * History/outcome callers keep the strict all-accepted behavior. */
+  allowPartial?: boolean;
   log: (line: string) => void;
 }): Promise<{
   accepted: number;
+  acceptedItemIds: string[];
+  rejectedItemIds: string[];
   inserted: number | null;
   matched: number | null;
   updated: number | null;
+  skippedStale: number | null;
   attempts: number;
 }> {
   let lastError = "network_error";
@@ -592,14 +598,23 @@ export async function postHistoryBatch(input: {
       if (!acknowledgement) {
         throw new FatalUploadError("Workspace delivery deferred: invalid_acknowledgement. Resume state retained.");
       }
-      if (acknowledgement.rejectedIds.length > 0) {
+      if (acknowledgement.rejectedIds.length > 0 && !input.allowPartial) {
         throw new FatalUploadError("Workspace delivery deferred: remote_rejected. Resume state retained.");
       }
       const body = response.body as Record<string, unknown>;
       const counter = (key: string) => typeof body[key] === "number" ? body[key] as number : null;
       // The identity list, not an optional legacy count, authorizes progress.
       const accepted = acknowledgement.acceptedIds.length;
-      return { accepted, inserted: counter("inserted"), matched: counter("matched"), updated: counter("updated"), attempts: attempt };
+      return {
+        accepted,
+        acceptedItemIds: acknowledgement.acceptedIds,
+        rejectedItemIds: acknowledgement.rejectedIds,
+        inserted: counter("inserted"),
+        matched: counter("matched"),
+        updated: counter("updated"),
+        skippedStale: counter("skippedStale"),
+        attempts: attempt,
+      };
     }
     if (response && response.status !== 408 && response.status !== 429 && response.status < 500) {
       throw new FatalUploadError(`Workspace delivery deferred: remote_${response.status}. Resume state retained.`);

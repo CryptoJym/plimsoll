@@ -15,11 +15,6 @@ import {
   runSessionSync,
   saveDaemonSessionSyncState,
 } from "../packages/collector-cli/src/session-sync";
-import {
-  deliveryItemId,
-  deliveryAcknowledgement,
-  deliveryExpectation,
-} from "../packages/collector-cli/src/delivery-ack";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 
 /**
@@ -63,10 +58,25 @@ type Receipt = {
     rejectedSessions: number;
     insertedSessions: number | null;
     updatedSessions: number | null;
+    skippedStaleSessions: number | null;
   };
   result: { ok: boolean; reason: string | null };
   state: { caughtUp: boolean; pendingSessionIds: string[]; blockedSessionIds?: string[] };
   exactFailure?: string;
+};
+
+type CloudAckModule = {
+  deliveryExpectation: (rawBody: string, installKey: string) => {
+    kind: string;
+    itemIds: string[];
+    [key: string]: unknown;
+  };
+  deliveryAcknowledgement: (expected: { itemIds: string[]; [key: string]: unknown }, acceptedIds: string[]) => {
+    acceptedIds: string[];
+    rejectedIds: string[];
+    [key: string]: unknown;
+  };
+  deliveryItemId: (type: string, id: string) => string;
 };
 
 function uuid(n: number) {
@@ -135,21 +145,22 @@ async function createV074Ledger() {
   }
 }
 
-function cloudRoute(fetchState: {
-  requests: Array<{ expected: ReturnType<typeof deliveryExpectation>; body: Record<string, unknown> }>;
-}) {
+function cloudRoute(
+  fetchState: { requests: Array<{ expected: ReturnType<CloudAckModule["deliveryExpectation"]>; body: Record<string, unknown> }> },
+  cloudAck: CloudAckModule,
+) {
   return (async (_input: RequestInfo | URL, init?: RequestInit) => {
     const rawBody = String(init?.body ?? "");
     const body = JSON.parse(rawBody) as Record<string, unknown> & {
       sessions: Array<{ session: { id: string } }>;
     };
-    const expected = deliveryExpectation(rawBody, installKey);
+    const expected = cloudAck.deliveryExpectation(rawBody, installKey);
     const acceptedIds = body.sessions
       .filter((row) => row.session.id.toLowerCase() !== conflictSessionId)
-      .map((row) => deliveryItemId("session", row.session.id));
+      .map((row) => cloudAck.deliveryItemId("session", row.session.id));
     const inserted = acceptedIds.length;
     const skippedStale = body.sessions.length - inserted;
-    const ack = deliveryAcknowledgement(expected, acceptedIds);
+    const ack = cloudAck.deliveryAcknowledgement(expected, acceptedIds);
     fetchState.requests.push({ expected, body });
     return new Response(JSON.stringify({
       ok: true,
@@ -164,6 +175,10 @@ function cloudRoute(fetchState: {
 
 async function main() {
   const fixture = await createV074Ledger();
+  const cloudRoot = process.env.PLIMSOLL_CLOUD_ROOT ?? path.resolve(process.cwd(), "../plimsoll-cloud");
+  const cloudAck = await import(
+    pathToFileURL(path.join(cloudRoot, "src/lib/delivery-ack.ts")).href,
+  ) as unknown as CloudAckModule;
   const db = new Database(ledgerPath);
   const config = collectorConfigSchema.parse({
     uploadUrl: "http://127.0.0.1:1/ingest",
@@ -172,11 +187,11 @@ async function main() {
     deviceId: deviceInstallId,
     uploadSigningSecret: "session-sync-upgrade-proof-secret",
   });
-  const requests: Array<{ expected: ReturnType<typeof deliveryExpectation>; body: Record<string, unknown> }> = [];
+  const requests: Array<{ expected: ReturnType<CloudAckModule["deliveryExpectation"]>; body: Record<string, unknown> }> = [];
   const result = await runSessionSync(config, {
     until,
     ledgerDb: db,
-    fetchImpl: cloudRoute({ requests }),
+    fetchImpl: cloudRoute({ requests }, cloudAck),
     sleep: async () => undefined,
     delayMs: 0,
     maxAttemptsPerBatch: 1,
@@ -200,9 +215,16 @@ async function main() {
     result.sentSessions === 317 && result.acceptedSessions === 316 &&
     rejectedSessionIds.length === 1 && rejectedSessionIds[0] === conflictSessionId &&
     result.insertedSessions === 316 && result.updatedSessions === 0 &&
+    result.skippedStaleSessions === 1 &&
     state.caughtUp && state.pendingSessionIds.length === 0 &&
     state.blockedSessionIds?.includes(conflictSessionId) === true &&
-    requests.length === 1 && requests[0]!.body.kind === "session_sync";
+    requests.length === 1 && requests[0]!.body.kind === "session_sync" &&
+    planDaemonSessionSync({
+      db,
+      state,
+      uploadedBatches: [],
+      until,
+    }).skip === true;
   const red = !result.ok && result.reason?.includes("invalid_acknowledgement") === true &&
     result.sentSessions === 0 && result.acceptedSessions === 0 && requests.length === 1;
   const passed = expected === "green" ? green : red;
@@ -217,6 +239,7 @@ async function main() {
       rejectedSessions: rejectedSessionIds.length,
       insertedSessions: result.insertedSessions,
       updatedSessions: result.updatedSessions,
+      skippedStaleSessions: result.skippedStaleSessions,
     },
     result: { ok: result.ok, reason: result.reason },
     state: {

@@ -11,6 +11,7 @@ import { deterministicEventId } from "./normalizer";
 import { hasUnsafeOutboundString, sealOutboundSessionRow } from "./outbound-envelope";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import { chunkHistoryEnvelopes, postHistoryBatch } from "./upload-history";
+import { deliveryItemId } from "./delivery-ack";
 import {
   aiWorkSessionSyncBatchSchema,
   type AiWorkIngestBatch,
@@ -322,6 +323,9 @@ export type DaemonSessionSyncState = {
   caughtUp: boolean;
   lastSuccessfulUntil: string | null;
   pendingSessionIds: string[];
+  /** Explicit cloud rejections are retained locally and excluded from the
+   * next automatic walk. They are not counted as acknowledged progress. */
+  blockedSessionIds?: string[];
 };
 
 export type DaemonSessionSyncPlan = {
@@ -339,6 +343,7 @@ export function emptyDaemonSessionSyncState(): DaemonSessionSyncState {
     caughtUp: false,
     lastSuccessfulUntil: null,
     pendingSessionIds: [],
+    blockedSessionIds: [],
   };
 }
 
@@ -395,12 +400,17 @@ export function loadDaemonSessionSyncState(db: Database.Database): DaemonSession
       caughtUp?: unknown;
       lastSuccessfulUntil?: unknown;
       pendingSessionIds?: unknown;
+      blockedSessionIds?: unknown;
     };
     const pendingSessionIds = sanitizeSessionIds(parsed.pendingSessionIds);
+    const blockedSessionIds = parsed.blockedSessionIds === undefined
+      ? []
+      : sanitizeSessionIds(parsed.blockedSessionIds);
     if (
       parsed?.schemaVersion !== DAEMON_SESSION_SYNC_SCHEMA_VERSION ||
       typeof parsed.caughtUp !== "boolean" ||
       pendingSessionIds === null ||
+      blockedSessionIds === null ||
       !(parsed.lastSuccessfulUntil === null || typeof parsed.lastSuccessfulUntil === "string")
     ) {
       return empty;
@@ -416,6 +426,7 @@ export function loadDaemonSessionSyncState(db: Database.Database): DaemonSession
       caughtUp: parsed.caughtUp,
       lastSuccessfulUntil: parsed.lastSuccessfulUntil,
       pendingSessionIds,
+      blockedSessionIds,
     };
   } catch {
     return empty;
@@ -428,14 +439,16 @@ export function saveDaemonSessionSyncState(
 ): void {
   ensureSessionSyncStateTable(db);
   const pendingSessionIds = sanitizeSessionIds(state.pendingSessionIds);
+  const blockedSessionIds = sanitizeSessionIds(state.blockedSessionIds ?? []);
   const record: DaemonSessionSyncState =
-    pendingSessionIds === null
+    pendingSessionIds === null || blockedSessionIds === null
       ? emptyDaemonSessionSyncState()
       : {
           schemaVersion: DAEMON_SESSION_SYNC_SCHEMA_VERSION,
           caughtUp: Boolean(state.caughtUp),
           lastSuccessfulUntil: state.lastSuccessfulUntil,
           pendingSessionIds,
+          blockedSessionIds,
         };
   db.prepare(
     `insert into maintenance_state (key, value, updated_at) values (?, ?, ?)
@@ -446,11 +459,13 @@ export function saveDaemonSessionSyncState(
 /** Eligible ledger session ids, optionally only those with created_at after `since`. */
 export function listLedgerSessionIds(
   ledger: Database.Database,
-  options: { until: string; since?: string | null; extraIds?: string[] },
+  options: { until: string; since?: string | null; extraIds?: string[]; excludedIds?: string[] },
 ): string[] {
   const query = ledgerSessionIdsQuery(ledger, options);
   const rows = ledger.prepare(query.sql).all(query.params) as Array<{ sessionId: string }>;
-  return mergeSessionIds(rows.map(row => row.sessionId), options.extraIds ?? []);
+  const excluded = new Set(options.excludedIds ?? []);
+  return mergeSessionIds(rows.map(row => row.sessionId), options.extraIds ?? [])
+    .filter((id) => !excluded.has(id));
 }
 
 function ledgerSessionIdsQuery(
@@ -490,26 +505,37 @@ export function planDaemonSessionSync(input: {
 }): DaemonSessionSyncPlan {
   const until = input.until;
   const fromBatches = sessionIdsFromBatches(input.uploadedBatches);
-  const pending = mergeSessionIds(input.state.pendingSessionIds, fromBatches);
+  const blocked = mergeSessionIds(input.state.blockedSessionIds ?? []);
+  const blockedSet = new Set(blocked);
+  const pending = mergeSessionIds(input.state.pendingSessionIds, fromBatches)
+    .filter((id) => !blockedSet.has(id));
   if (!input.state.caughtUp) {
     return {
       skip: false,
+      // Keep the full snapshot walk off the intake thread. runSessionSync
+      // filters blocked sessions from the worker result before any payload
+      // is sent, so a blocked id never becomes acknowledged progress.
       sessionIds: undefined,
       until,
       reason: "full_catchup",
-      state: { ...input.state, pendingSessionIds: pending },
+      state: { ...input.state, pendingSessionIds: pending, blockedSessionIds: blocked },
     };
   }
   const sessionIds = input.ledgerSessionIds === undefined
-    ? listLedgerSessionIds(input.db, { until, since: input.state.lastSuccessfulUntil, extraIds: pending })
-    : mergeSessionIds(input.ledgerSessionIds, pending);
+    ? listLedgerSessionIds(input.db, {
+        until,
+        since: input.state.lastSuccessfulUntil,
+        extraIds: pending,
+        excludedIds: blocked,
+      })
+    : mergeSessionIds(input.ledgerSessionIds, pending).filter((id) => !blockedSet.has(id));
   if (sessionIds.length === 0) {
     return {
       skip: true,
       sessionIds: [],
       until,
       reason: "skip",
-      state: { ...input.state, pendingSessionIds: [] },
+      state: { ...input.state, pendingSessionIds: [], blockedSessionIds: blocked },
     };
   }
   if (sessionIds.length > MAX_PENDING_SESSION_IDS) {
@@ -518,7 +544,7 @@ export function planDaemonSessionSync(input: {
       sessionIds: undefined,
       until,
       reason: "full_catchup",
-      state: { ...input.state, caughtUp: false, pendingSessionIds: pending },
+      state: { ...input.state, caughtUp: false, pendingSessionIds: pending, blockedSessionIds: blocked },
     };
   }
   return {
@@ -526,14 +552,14 @@ export function planDaemonSessionSync(input: {
     sessionIds,
     until,
     reason: "incremental",
-    state: { ...input.state, pendingSessionIds: sessionIds },
+    state: { ...input.state, pendingSessionIds: sessionIds, blockedSessionIds: blocked },
   };
 }
 
 /** Daemon planner's distinct-id scan, without blocking HTTP intake. */
 export async function listLedgerSessionIdsOffThread(
   ledger: Database.Database,
-  options: { until: string; since?: string | null },
+  options: { until: string; since?: string | null; excludedIds?: string[] },
 ): Promise<string[]> {
   const query = ledgerSessionIdsQuery(ledger, options);
   // The planner switches to a full walk above this count. No later id can
@@ -541,18 +567,25 @@ export async function listLedgerSessionIdsOffThread(
   // onto the request event loop.
   query.sql += ` limit ${MAX_PENDING_SESSION_IDS + 1}`;
   const rows = await readSessionsOffThread<{ sessionId: string }>(ledger, [query]);
-  return rows.map(row => row.sessionId);
+  const excluded = new Set(options.excludedIds ?? []);
+  return rows.map(row => row.sessionId).filter((id) => !excluded.has(id));
 }
 
 export function commitDaemonSessionSyncSuccess(
-  _state: DaemonSessionSyncState,
+  state: DaemonSessionSyncState,
   until: string,
+  newlyBlockedSessionIds: string[] = [],
 ): DaemonSessionSyncState {
+  const blockedSessionIds = mergeSessionIds(
+    state.blockedSessionIds ?? [],
+    newlyBlockedSessionIds,
+  );
   return {
     schemaVersion: DAEMON_SESSION_SYNC_SCHEMA_VERSION,
     caughtUp: true,
     lastSuccessfulUntil: until,
     pendingSessionIds: [],
+    blockedSessionIds,
   };
 }
 
@@ -560,18 +593,21 @@ export function commitDaemonSessionSyncFailure(
   state: DaemonSessionSyncState,
   attemptedIds: string[] | undefined,
 ): DaemonSessionSyncState {
+  const blocked = new Set(state.blockedSessionIds ?? []);
   if (!state.caughtUp || attemptedIds === undefined) {
     return {
       ...state,
       caughtUp: false,
-      pendingSessionIds: mergeSessionIds(state.pendingSessionIds, attemptedIds ?? []),
+      pendingSessionIds: mergeSessionIds(state.pendingSessionIds, attemptedIds ?? [])
+        .filter((id) => !blocked.has(id)),
+      blockedSessionIds: [...blocked],
     };
   }
-  const pendingSessionIds = mergeSessionIds(attemptedIds);
+  const pendingSessionIds = mergeSessionIds(attemptedIds).filter((id) => !blocked.has(id));
   if (pendingSessionIds.length > MAX_PENDING_SESSION_IDS) {
-    return { ...state, caughtUp: false, pendingSessionIds: [] };
+    return { ...state, caughtUp: false, pendingSessionIds: [], blockedSessionIds: [...blocked] };
   }
-  return { ...state, pendingSessionIds };
+  return { ...state, pendingSessionIds, blockedSessionIds: [...blocked] };
 }
 
 export type SessionAuditCell = {
@@ -629,11 +665,15 @@ export function recordSessionOutcome(
   audit: SessionAudit,
   rows: AiWorkSessionSyncRow[],
   accepted: boolean,
+  acceptedRows: AiWorkSessionSyncRow[] = accepted ? rows : [],
 ): void {
   for (const row of rows) {
     const cell = sessionAuditCell(audit, sessionAuditKey(row));
     cell.sentSessions += 1;
-    if (accepted) cell.acceptedSessions += 1;
+  }
+  for (const row of acceptedRows) {
+    const cell = sessionAuditCell(audit, sessionAuditKey(row));
+    cell.acceptedSessions += 1;
   }
 }
 
@@ -733,6 +773,8 @@ export type SessionSyncOptions = {
   /** Restrict to these ledger session ids (the daemon's touched-set path).
    * Omit for the full walk (the backfill path). */
   sessionIds?: string[];
+  /** Exclude known cloud-rejected sessions from the worker snapshot result. */
+  excludedSessionIds?: string[];
   batchSize?: number;
   concurrency?: number;
   delayMs?: number;
@@ -759,10 +801,16 @@ export type SessionSyncResult = {
   skippedSessions: number;
   sentSessions: number;
   acceptedSessions: number;
+  /** Session ids explicitly rejected by the authenticated cloud response.
+   * They remain in the local ledger and are recorded as blocked state; they
+   * are never counted as acknowledged progress. */
+  rejectedSessionIds: string[];
   /** Server-reported genuinely-new rows (null when the server never reported the field). */
   insertedSessions: number | null;
   /** Server-reported in-place snapshot updates (null when unreported). */
   updatedSessions: number | null;
+  /** Server-reported rows that were neither inserted nor updated. */
+  skippedStaleSessions: number | null;
   batches: number;
   derivedIds: number;
   durationMs: number;
@@ -837,7 +885,11 @@ export async function runSessionSync(
   const audit = createSessionAudit();
   let snapshots: SessionSnapshot[];
   try {
-    snapshots = await collectSessionSnapshotsOffThread(ledger, { until, sessionIds: options.sessionIds });
+    const excluded = new Set(options.excludedSessionIds ?? []);
+    snapshots = (await collectSessionSnapshotsOffThread(ledger, {
+      until,
+      sessionIds: options.sessionIds,
+    })).filter((snapshot) => !excluded.has(snapshot.sessionId));
   } finally {
     if (ownsLedger) ledger.close();
   }
@@ -872,8 +924,10 @@ export async function runSessionSync(
 
   let sentSessions = 0;
   let acceptedSessions = 0;
+  const rejectedSessionIds = new Set<string>();
   let insertedSessions: number | null = null;
   let updatedSessions: number | null = null;
+  let skippedStaleSessions: number | null = null;
   let batches = 0;
   let abortReason: string | null = null;
 
@@ -908,22 +962,37 @@ export async function runSessionSync(
           sleep,
           maxAttempts,
           timeoutMs: config.delivery.requestTimeoutSeconds * 1_000,
+          allowPartial: true,
           log,
         });
         batches += 1;
         sentSessions += rows.length;
         acceptedSessions += result.accepted;
+        const idsByDeliveryId = new Map(
+          rows.map((row) => [deliveryItemId("session", row.session.id), row.session.id]),
+        );
+        for (const itemId of result.rejectedItemIds) {
+          const sessionId = idsByDeliveryId.get(itemId);
+          if (sessionId) rejectedSessionIds.add(sessionId);
+        }
         if (result.inserted !== null) insertedSessions = (insertedSessions ?? 0) + result.inserted;
         if (result.updated !== null) updatedSessions = (updatedSessions ?? 0) + result.updated;
-        recordSessionOutcome(audit, rows, true);
+        if (result.skippedStale !== null) skippedStaleSessions = (skippedStaleSessions ?? 0) + result.skippedStale;
+        const acceptedItemIds = new Set(result.acceptedItemIds);
+        const acceptedRows = rows.filter((row) =>
+          acceptedItemIds.has(deliveryItemId("session", row.session.id)),
+        );
+        recordSessionOutcome(audit, rows, false, acceptedRows);
         log(
           JSON.stringify({
             status: "session_sync_progress",
             batches,
             sentSessions,
             acceptedSessions,
+            rejectedSessions: rejectedSessionIds.size,
             insertedSessions,
             updatedSessions,
+            skippedStaleSessions,
           }),
         );
       } catch (error) {
@@ -963,8 +1032,10 @@ export async function runSessionSync(
     skippedSessions,
     sentSessions,
     acceptedSessions,
+    rejectedSessionIds: [...rejectedSessionIds],
     insertedSessions,
     updatedSessions,
+    skippedStaleSessions,
     batches,
     derivedIds,
     durationMs,
@@ -983,8 +1054,10 @@ export async function runSessionSync(
       skippedSessions,
       sentSessions,
       acceptedSessions,
+      rejectedSessions: rejectedSessionIds.size,
       insertedSessions,
       updatedSessions,
+      skippedStaleSessions,
       batches,
       durationMs,
       dryRun: result.dryRun,
