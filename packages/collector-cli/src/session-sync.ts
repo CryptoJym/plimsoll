@@ -1,6 +1,8 @@
 import { buildWorkspaceEconomics } from "../../shared/src/economics/service";
 import { usageFactFromEvent } from "../../shared/src/economics/event-adapter";
 import type { Period,UsageFact } from "../../shared/src/economics/contracts";
+import { createRequire } from "node:module";
+import { Worker } from "node:worker_threads";
 import Database from "better-sqlite3";
 
 import type { CollectorConfig } from "./config";
@@ -82,6 +84,51 @@ export type SessionSnapshot = {
   accountHash: string | null;
 };
 
+type SessionReadQuery = { sql: string; params: Record<string, unknown> };
+
+// better-sqlite3 steps synchronously. On a long-lived session, GROUP BY can
+// spend minutes doing index-to-table lookups; keep that exact SQL and its
+// SQLite aggregation semantics, but step it on a read-only worker connection.
+const sessionReadWorkerSource = `
+  const { parentPort, workerData } = require('node:worker_threads');
+  const Database = require(workerData.sqliteModule);
+  const db = new Database(workerData.ledgerPath, { readonly: true, fileMustExist: true });
+  try {
+    const rows = [];
+    for (const query of workerData.queries) rows.push(...db.prepare(query.sql).all(query.params));
+    parentPort.postMessage(rows);
+  } finally {
+    db.close();
+  }
+`;
+
+function readSessionsOffThread<T>(ledger: Database.Database, queries: SessionReadQuery[]): Promise<T[]> {
+  if (queries.length === 0) return Promise.resolve([]);
+  // SQLite memory databases cannot be reopened by a worker. Production
+  // ledgers are file-backed; retain the direct path for isolated callers.
+  if (ledger.name === ":memory:") {
+    return Promise.resolve(queries.flatMap(query => ledger.prepare(query.sql).all(query.params) as T[]));
+  }
+  return new Promise<T[]>((resolve, reject) => {
+    const worker = new Worker(sessionReadWorkerSource, {
+      eval: true,
+      execArgv: [],
+      workerData: {
+        ledgerPath: ledger.name,
+        sqliteModule: createRequire(import.meta.url).resolve("better-sqlite3"),
+        queries,
+      },
+    });
+    let rows: T[] | undefined;
+    worker.once("message", (message: T[]) => { rows = message; });
+    worker.once("error", reject);
+    worker.once("exit", code => {
+      if (code === 0 && rows) resolve(rows);
+      else reject(new Error(`Session read worker exited ${code} without rows`));
+    });
+  });
+}
+
 /**
  * One aggregate row per session, recomputed from the ledger. Scope is
  * created_at <= until (the upload-history watermark semantics) so two runs
@@ -98,15 +145,23 @@ export function collectSessionSnapshots(
   ledger: Database.Database,
   options: { until: string; sessionIds?: string[] },
 ): SessionSnapshot[] {
+  return sessionSnapshotQueries(ledger, options).flatMap(query =>
+    ledger.prepare(query.sql).all(query.params) as SessionSnapshot[]);
+}
+
+function sessionSnapshotQueries(
+  ledger: Database.Database,
+  options: { until: string; sessionIds?: string[] },
+): SessionReadQuery[] {
   // An explicit empty id list is "send nothing", never an omitted filter
   // (omitting sessionIds is the full walk). SQLite caps bind variables
   // (999 on conservative builds); chunk well under that cap.
   if (options.sessionIds && options.sessionIds.length === 0) return [];
   if (options.sessionIds && options.sessionIds.length > 400) {
-    const out: SessionSnapshot[] = [];
+    const out: SessionReadQuery[] = [];
     for (let start = 0; start < options.sessionIds.length; start += 400) {
       out.push(
-        ...collectSessionSnapshots(ledger, {
+        ...sessionSnapshotQueries(ledger, {
           until: options.until,
           sessionIds: options.sessionIds.slice(start, start + 400),
         }),
@@ -130,9 +185,8 @@ export function collectSessionSnapshots(
     });
   }
 
-  const rows = ledger
-    .prepare(
-      `select
+  return [{
+    sql: `select
          e.session_id as sessionId,
          max(e.source) as source,
          min(e.observed_at) as startedAt,
@@ -155,9 +209,15 @@ export function collectSessionSnapshots(
        where ${filters.join(" and ")}
        group by e.session_id
        order by min(e.observed_at) asc`,
-    )
-    .all(params) as SessionSnapshot[];
-  return rows;
+    params,
+  }];
+}
+
+async function collectSessionSnapshotsOffThread(
+  ledger: Database.Database,
+  options: { until: string; sessionIds?: string[] },
+): Promise<SessionSnapshot[]> {
+  return readSessionsOffThread<SessionSnapshot>(ledger, sessionSnapshotQueries(ledger, options));
 }
 
 export type SessionSkipReason = "source_invalid" | "schema_invalid" | "forbidden_content";
@@ -388,6 +448,15 @@ export function listLedgerSessionIds(
   ledger: Database.Database,
   options: { until: string; since?: string | null; extraIds?: string[] },
 ): string[] {
+  const query = ledgerSessionIdsQuery(ledger, options);
+  const rows = ledger.prepare(query.sql).all(query.params) as Array<{ sessionId: string }>;
+  return mergeSessionIds(rows.map(row => row.sessionId), options.extraIds ?? []);
+}
+
+function ledgerSessionIdsQuery(
+  ledger: Database.Database,
+  options: { until: string; since?: string | null },
+): SessionReadQuery {
   const eventPrivacyEligible = terminalPrivacyEligibilitySql(ledger, "e");
   const filters: string[] = [
     "e.session_id is not null",
@@ -399,17 +468,12 @@ export function listLedgerSessionIds(
     filters.push("e.created_at > @since");
     params.since = options.since;
   }
-  const rows = ledger
-    .prepare(
-      `select distinct e.session_id as sessionId
+  return {
+    sql: `select distinct e.session_id as sessionId
        from buffered_events e
        where ${filters.join(" and ")}`,
-    )
-    .all(params) as Array<{ sessionId: string }>;
-  return mergeSessionIds(
-    rows.map((row) => row.sessionId),
-    options.extraIds ?? [],
-  );
+    params,
+  };
 }
 
 /**
@@ -421,6 +485,8 @@ export function planDaemonSessionSync(input: {
   state: DaemonSessionSyncState;
   uploadedBatches: Array<AiWorkIngestBatch | null>;
   until: string;
+  /** Precomputed off-thread for the daemon; omitted by synchronous callers. */
+  ledgerSessionIds?: string[];
 }): DaemonSessionSyncPlan {
   const until = input.until;
   const fromBatches = sessionIdsFromBatches(input.uploadedBatches);
@@ -434,11 +500,9 @@ export function planDaemonSessionSync(input: {
       state: { ...input.state, pendingSessionIds: pending },
     };
   }
-  const sessionIds = listLedgerSessionIds(input.db, {
-    until,
-    since: input.state.lastSuccessfulUntil,
-    extraIds: pending,
-  });
+  const sessionIds = input.ledgerSessionIds === undefined
+    ? listLedgerSessionIds(input.db, { until, since: input.state.lastSuccessfulUntil, extraIds: pending })
+    : mergeSessionIds(input.ledgerSessionIds, pending);
   if (sessionIds.length === 0) {
     return {
       skip: true,
@@ -464,6 +528,20 @@ export function planDaemonSessionSync(input: {
     reason: "incremental",
     state: { ...input.state, pendingSessionIds: sessionIds },
   };
+}
+
+/** Daemon planner's distinct-id scan, without blocking HTTP intake. */
+export async function listLedgerSessionIdsOffThread(
+  ledger: Database.Database,
+  options: { until: string; since?: string | null },
+): Promise<string[]> {
+  const query = ledgerSessionIdsQuery(ledger, options);
+  // The planner switches to a full walk above this count. No later id can
+  // change that decision, so never clone an unbounded distinct-id set back
+  // onto the request event loop.
+  query.sql += ` limit ${MAX_PENDING_SESSION_IDS + 1}`;
+  const rows = await readSessionsOffThread<{ sessionId: string }>(ledger, [query]);
+  return rows.map(row => row.sessionId);
 }
 
 export function commitDaemonSessionSyncSuccess(
@@ -759,7 +837,7 @@ export async function runSessionSync(
   const audit = createSessionAudit();
   let snapshots: SessionSnapshot[];
   try {
-    snapshots = collectSessionSnapshots(ledger, { until, sessionIds: options.sessionIds });
+    snapshots = await collectSessionSnapshotsOffThread(ledger, { until, sessionIds: options.sessionIds });
   } finally {
     if (ownsLedger) ledger.close();
   }

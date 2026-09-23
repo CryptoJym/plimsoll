@@ -249,6 +249,7 @@ import {
   commitDaemonSessionSyncSuccess,
   loadDaemonSessionSyncState,
   planDaemonSessionSync,
+  listLedgerSessionIdsOffThread,
   runSessionSync,
   saveDaemonSessionSyncState,
   sessionIdsFromBatches,
@@ -2650,12 +2651,19 @@ async function main() {
         const touchedSessionIds = [
           ...new Set([...pendingSessionIds, ...sessionIdsFromBatches(uploadedBatches)]),
         ];
+        const sessionUntil = new Date().toISOString();
         try {
           const sessionPlan = planDaemonSessionSync({
             db: buffer.database,
             state: { ...sessionSyncState, pendingSessionIds },
             uploadedBatches,
-            until: new Date().toISOString(),
+            until: sessionUntil,
+            ledgerSessionIds: sessionSyncState.caughtUp
+              ? await listLedgerSessionIdsOffThread(buffer.database, {
+                  until: sessionUntil,
+                  since: sessionSyncState.lastSuccessfulUntil,
+                })
+              : undefined,
           });
           sessionSyncState = sessionPlan.state;
           pendingSessionIds = sessionPlan.state.pendingSessionIds;
