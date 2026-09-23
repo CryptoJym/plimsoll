@@ -12,10 +12,12 @@ import {
   collectorLogPath,
 } from "./config";
 import { deterministicEventId } from "./normalizer";
+import { applyProjectAttribution, readSessionRepoContexts } from "./session-attribution";
 import { canonicalLinkage, hasUnsafeOutboundString, sealOutboundEnvelope } from "./outbound-envelope";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import {
   aiWorkAttributionRepairBatchSchema,
+  aiInteractionEventSchema,
   aiWorkIngestBatchSchema,
   type AiInteractionEvent,
   type AiWorkAttributionRepairRow,
@@ -118,6 +120,7 @@ export function normalizeHistoryEvent(row: {
   dataMode?: string;
   repoHash?: string | null;
   branchHash?: string | null;
+  database?: Database.Database;
 }): NormalizedHistoryEvent {
   if (row.dataMode === "evidence") {
     return {
@@ -170,13 +173,33 @@ export function normalizeHistoryEvent(row: {
   // attachRepoLinkage). Never overwrites a payload-supplied projectKey.
   if (row.repoHash && !candidate.projectKey) {
     candidate.projectKey = row.repoHash;
-    if (row.branchHash) {
-      const metadata =
-        candidate.metadata && typeof candidate.metadata === "object" && !Array.isArray(candidate.metadata)
-          ? (candidate.metadata as Record<string, unknown>)
-          : {};
-      candidate.metadata = { ...metadata, branchHash: row.branchHash };
-    }
+    const metadata =
+      candidate.metadata && typeof candidate.metadata === "object" && !Array.isArray(candidate.metadata)
+        ? (candidate.metadata as Record<string, unknown>)
+        : {};
+    candidate.metadata = {
+      ...metadata,
+      ...(row.branchHash ? { branchHash: row.branchHash } : {}),
+      projectBasis: "repo_context",
+    };
+  }
+
+  // History upload is also an upload boundary. Reuse the same bounded,
+  // repo-hash-only resolver used by the live drain; a read-only ledger query
+  // keeps this path lossless while making reruns deterministic.
+  const parsedCandidate = aiInteractionEventSchema.safeParse(candidate);
+  if (parsedCandidate.success) {
+    const sessionScan = row.database
+      ? readSessionRepoContexts(row.database, parsedCandidate.data, { repoHash: row.repoHash })
+      : { rows: [], truncated: false };
+    const attributed = applyProjectAttribution(parsedCandidate.data, {
+      repoHash: row.repoHash,
+      branchHash: row.branchHash,
+      sessionContexts: sessionScan.rows,
+      sessionContextsTruncated: sessionScan.truncated,
+    });
+    for (const key of Object.keys(candidate)) delete candidate[key];
+    Object.assign(candidate, attributed.event);
   }
 
   let suppressedFields: string[] = [];
@@ -874,7 +897,7 @@ export async function runWorkspaceHistoryUpload(
         });
         continue;
       }
-      const normalized = normalizeHistoryEvent(row);
+      const normalized = normalizeHistoryEvent({ ...row, database: ledger });
       if (!normalized.ok) {
         skipQueue.push({ rowid: row.rowid, reason: normalized.reason });
         continue;

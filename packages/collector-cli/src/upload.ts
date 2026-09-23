@@ -19,6 +19,10 @@ import { retryAfterMilliseconds } from "./retry-after";
 import { deliveryExpectation } from "./delivery-ack";
 import { PLIMSOLL_VERSION } from "./version";
 import type { SyncStorageRetryController } from "./sqlite-contention";
+import {
+  applyProjectAttribution,
+  readSessionRepoContexts,
+} from "./session-attribution";
 
 /**
  * Project attribution parity (issue 0036): the ledger's per-event repo
@@ -30,14 +34,7 @@ export function attachRepoLinkage(
   repoHash: string | null | undefined,
   branchHash?: string | null,
 ): AiInteractionEvent {
-  if (!repoHash || payload.projectKey) return payload;
-  return {
-    ...payload,
-    projectKey: repoHash,
-    ...(branchHash
-      ? { metadata: { ...payload.metadata, branchHash } }
-      : {}),
-  };
+  return applyProjectAttribution(payload, { repoHash, branchHash }).event;
 }
 
 /** Legacy/stateless snapshot builder retained for `upload --no-mark`. */
@@ -55,8 +52,17 @@ export function buildIngestBatch(
   const rows: BufferedEventRow[] = [];
   const events = [];
   for (const row of candidateRows) {
+    const sessionScan = readSessionRepoContexts(buffer.database, row.payload, {
+      repoHash: row.repoHash,
+    });
+    const attributed = applyProjectAttribution(row.payload, {
+      repoHash: row.repoHash,
+      branchHash: row.branchHash,
+      sessionContexts: sessionScan.rows,
+      sessionContextsTruncated: sessionScan.truncated,
+    });
     const sealed = sealOutboundEnvelope({
-      event: attachRepoLinkage(row.payload, row.repoHash, row.branchHash),
+      event: attributed.event,
       suppressedFields: row.suppressedFields,
     });
     if (!sealed.ok) continue;

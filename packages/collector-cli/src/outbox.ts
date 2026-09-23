@@ -13,6 +13,7 @@ import {
   type TerminalPrivacyReason,
 } from "./privacy-disposition";
 import { ensureUuidEventId, normalizeHistoryEvent } from "./upload-history";
+import { applyProjectAttribution, readSessionRepoContexts } from "./session-attribution";
 
 export const DEFAULT_DELIVERY_LIMITS = {
   maxActiveRows: 50_000,
@@ -257,7 +258,11 @@ type PreparedDelivery =
     }
   | { ok: false; deliveryId: string; reason: DeliveryReceiptReason };
 
-function prepareDelivery(row: RawDeliveryRow, maxItemBytes: number): PreparedDelivery {
+function prepareDelivery(
+  row: RawDeliveryRow,
+  maxItemBytes: number,
+  db: Database.Database,
+): PreparedDelivery {
   const fallbackId = ensureUuidEventId(row.rawId).id;
   if (row.dataMode === "evidence") {
     return { ok: false, deliveryId: fallbackId, reason: "local_evidence_quarantined" };
@@ -277,7 +282,19 @@ function prepareDelivery(row: RawDeliveryRow, maxItemBytes: number): PreparedDel
   }
 
   const deliveryId = normalized.envelope.event.id;
-  const envelope = sealOutboundEnvelope(normalized.envelope);
+  const sessionScan = readSessionRepoContexts(db, normalized.envelope.event, {
+    repoHash: row.repoHash,
+  });
+  const attributed = applyProjectAttribution(normalized.envelope.event, {
+    repoHash: row.repoHash,
+    branchHash: row.branchHash,
+    sessionContexts: sessionScan.rows,
+    sessionContextsTruncated: sessionScan.truncated,
+  });
+  const envelope = sealOutboundEnvelope({
+    ...normalized.envelope,
+    event: attributed.event,
+  });
   if (!envelope.ok) {
     return {
       ok: false,
@@ -304,17 +321,18 @@ function attachFillOnlyLinkage(
   envelope: AiWorkIngestEvent,
   repoHash: string | null,
   branchHash: string | null,
+  db: Database.Database,
 ): AiWorkIngestEvent {
-  if (!repoHash || envelope.event.projectKey) return envelope;
+  const sessionScan = readSessionRepoContexts(db, envelope.event, { repoHash });
+  const attributed = applyProjectAttribution(envelope.event, {
+    repoHash,
+    branchHash,
+    sessionContexts: sessionScan.rows,
+    sessionContextsTruncated: sessionScan.truncated,
+  });
   return {
     ...envelope,
-    event: {
-      ...envelope.event,
-      projectKey: repoHash,
-      ...(branchHash
-        ? { metadata: { ...envelope.event.metadata, branchHash } }
-        : {}),
-    },
+    event: attributed.event,
   };
 }
 
@@ -739,7 +757,7 @@ export class DeliveryOutbox {
       );
       return { enqueued: 0, dead: 0 };
     }
-    const prepared = prepareDelivery(row, this.limits.maxItemBytes);
+    const prepared = prepareDelivery(row, this.limits.maxItemBytes, this.db);
     if (prepared.ok === false) {
       const terminalAt = this.clock().toISOString();
       if (isTerminalPrivacyReason(prepared.reason)) {
@@ -1400,6 +1418,7 @@ export class DeliveryOutbox {
               parsed,
               canonicalLinkage(row.repoHash),
               canonicalLinkage(row.branchHash),
+              this.db,
             ),
           );
           if (!sealed.ok) {
