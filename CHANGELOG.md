@@ -61,14 +61,46 @@ does not transfer its sessions to a tailer.
 
 ### Fixed
 
+- Local producer admission restores two Studio0 rejection classes
+  (`eco-6hoxj.25`): identity-encoded bodies between 2 MiB and 4 MiB are no
+  longer `compressed_body_too_large`, Claude HTTP hooks always send
+  `x-plimsoll-source` (and the producer token when provisioned), and first-line
+  token/body rejections name the closed route so hook vs OTLP is visible
+  without a collector restart.
+- `forward-hook-http` mints a stable event id before the first attempt so a
+  spool replay after a connection reset, a closed socket, or a request timeout
+  cannot double-count the event. The client now spools those unknown-outcome
+  classes as well as 503, 408, and ECONNREFUSED. A body that already carries a
+  UUID is unchanged; a body with no id still gets a fresh UUID on the
+  collector's own intake.
 - Capture-health names sub-minute future skew in seconds, never renders `NaNm`
   for an unparseable `last_event_at` (fail-safe amber), and keeps future-amber
   rather than lag-red when the ledger watermark is ahead of the clock
   (REVIEW-73-r2 F5–F7).
+- Capture health `overall` is `no_events` when every configured source has
+  captured nothing yet, so a green lamp cannot hide an empty host. Mixed
+  unused sources still leave a capturing host green.
+- Activity-scan `error` / `lastErrorCode` is no longer a capture-health scan
+  state. Tailers never published it; `last_error_code` remains a finance
+  column only.
 - A managed-config reconcile that loses the state-file lock still writes its
   apply/refuse receipt; the stamp, backoff map and backup record retry on the
   next tick. The event-loop chunk proof uses a CI-safe bound so a cold runner
   cannot fail a yield that already holds.
+- Automatic capture on many-root hosts sizes each cadence's directory-entry
+  allowance from the observed root/corpus size (256-entry floor, 16384 cap)
+  while the 50 ms discovery wall and 200 ms fairness budget still bound the
+  tick. A finished or limited sweep persists its origin so the next generation
+  does not restart enumeration at root 0 (eco-6hoxj.73.1).
+- Capture-health receipts never publish `0` entries this sweep beside a leftover
+  previous-cadence `entriesThisTick`. Native status reads treat that pair as a
+  transient unless it persists across two reads at least 10 s apart
+  (eco-6hoxj.155).
+- Capture-health receipts count the same directory entries on both explicit
+  discover walks, name a drained cadence as finished with no cursor to resume,
+  and never pair `converging` with `limitReached`. Retry class follows
+  `discoveryEntries` visited this cadence, not pending files behind the
+  metadata gate (REVIEW-78).
 - Daemon session sync now converges without `upload-history --sessions`. A
   failed or interrupted 5-minute refresh survives restart, and a ledger
   catch-up covers sessions whose events were already uploaded so they never

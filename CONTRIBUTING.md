@@ -44,6 +44,9 @@ pnpm collector help # explore the CLI
   `collector status` coverage diff from a real session).
 - Issues live in `issues/` as operating records — see ISSUE_GUIDE.md. Claiming
   one: comment on the GitHub issue mirror or open a draft PR referencing it.
+- Lane dumps and reproduction material stay off the product branch: root
+  `evidence/`, `*.log`, and proof fixtures that are not imported by a proof
+  remain in the lane directory. Unabridged run output stays there as well.
 
 ## Privacy review
 

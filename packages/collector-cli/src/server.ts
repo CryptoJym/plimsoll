@@ -1817,10 +1817,23 @@ export function createCollectorServer(
               ...(intakeSpoolDiagnostic ?? {}),
             }
           : undefined;
+      // Token and oversized-body storms were indistinguishable as hook vs OTLP
+      // from the first line (clientClass comes from x-plimsoll-source, which
+      // HTTP hooks used to omit). Name the closed route on those first lines
+      // only; summaries stay the pre-0.7.27 shape. Not folded into
+      // ROUTE_CLASSIFIED_REASONS — that vocabulary is still busy-only.
+      const identifiedRoute =
+        busyRoute === undefined &&
+        (failure.reason === "compressed_body_too_large" ||
+          failure.reason === "producer_token_required" ||
+          failure.reason === "producer_token_invalid")
+          ? classifyRejectionRoute(request.url)
+          : undefined;
       const diagnosticRejection = {
         ...rejection,
         clientClass,
         ...(busyRouteDiagnostic ?? {}),
+        ...(identifiedRoute ? { route: identifiedRoute } : {}),
         ...(recordDiagnostic ?? {}),
       };
       // Aggregate identical rejections: emit the first occurrence of a

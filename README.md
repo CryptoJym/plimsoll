@@ -77,26 +77,30 @@ ways:
   the disk refuses, or `PLIMSOLL_HOOK_SPOOL=off`), the answer stays exactly
   today's 503 so the loss stays visible.
 - **The `forward-hook-http` client**, for a host whose hook runs that command.
-  It spools when the collector answers 503, answers 408
-  (`request_deadline_exceeded`), or is not listening at all (connection refused
-  during a managed update window).
+  It mints a stable event id before the first attempt and spools when the
+  collector answers 503, answers 408 (`request_deadline_exceeded`), is not
+  listening at all (connection refused during a managed update window), or
+  the socket dies after the request was sent (ECONNRESET, a closed socket,
+  request timeout). A replay of a request the collector already committed is
+  the same ledger row.
 
 What is still lost: a request whose **body never finished arriving** (the 408 —
 there is nothing whole to spool), and, for the `http`/`curl` hooks, a post that
 never reaches a listening collector at all (connection refused — the collector
 is not there to spool it, and those hooks have no Plimsoll process of their own
-to do it for them; `forward-hook-http` hosts do spool that case).
+to do it for them; `forward-hook-http` hosts do spool that case). Those managed
+hooks do not run the command, so they do not mint an id and they do not spool
+a reset.
 
-The spool is **at-most-once**: every one of those outcomes proves the collector
-stored nothing, so a spooled event is never a duplicate — with one documented exception: if the publication flush fails and the rollback of the unacknowledged envelope is also refused (the double-fault residual described below), a visible envelope can remain behind a 503 and be replayed. At the intake, the 503
-class is raised only when the ledger write did not commit — the durable append
-runs in a single `BEGIN IMMEDIATE` transaction that SQLite has rolled back by
-the time the busy error escapes it — and it is the only outcome that is spooled
-there. The window the spool does not close is the collector dying mid-request —
-a connection reset or a closed socket after the body was sent may mean the row
-was already written, so that event still fails loudly and is lost rather than
-risk double-counting it in cost and usage. Closing that window needs idempotent
-replay (a client-minted event id) and is tracked separately.
+The `forward-hook-http` spool is **exactly-once**: the command writes a UUID
+onto the body before the live POST, carries that same body in the spool file,
+and the ledger ignores a duplicate id on insert. That is what makes it safe to
+spool the unknown-outcome classes — a reset or closed socket after a committed
+202. The intake spool is still only the 503 class, which still proves the
+collector stored nothing. The documented exception on either path is the
+double-fault residual described below: if the publication flush fails and the
+rollback of the unacknowledged envelope is also refused, a visible envelope
+can remain behind a 503 and be replayed.
 
 What is on disk is **not** the raw body. Before the file is written — by either
 writer, through the same function — the collector's own pre-write suppression
@@ -248,7 +252,9 @@ ledger?*
 - **red** — local activity is demonstrably *not* reaching the ledger.
 - **no_events** — the source is configured and enumerated, and has captured
   nothing yet. It is never absent and never reads as healthy, and it does not
-  make the overall label amber.
+  make the overall label amber. When every configured source is `no_events`,
+  overall is `no_events` too, so a lamp or other overall-only consumer cannot
+  read the host as healthy.
 
 The status snapshot's session count is projection evidence, not a fresh raw-ledger
 count. `tokenSessionsToday` counts projected token-bearing sessions whose latest
@@ -367,10 +373,19 @@ consumed by the label:
   since the sweep began and in this cadence, and the candidates still awaiting
   metadata. The first two count directory *entries* stepped over, never the
   files those entries matched; `pendingFiles` is the field that counts files.
-  These advance during the first-install baseline sweep too.
+  Both explicit `discover()` walks use that same unit and the same cap
+  (increment after the limit test, so the entry that trips the limit is
+  uncounted). A full-walk rollout also counts the year/month/day directories
+  it steps through, not only the files inside a day partition. These advance
+  during the first-install baseline sweep too. A tick is a subset of its sweep:
+  a receipt never reports `0` this sweep beside a leftover previous-cadence tick
+  (bead eco-6hoxj.155).
 - `entryBudgetPerTick` / `wallBudgetMsPerTick` / `lifetimeEntryLimit` — the
-  budget that ended the cadence (256 entries, 50 ms) and the entries one cursor
-  may visit before it restarts instead of resuming (100000).
+  budget that ended the cadence (at least 256 entries, sized from the host's
+  capture roots and last-sweep observation so a 22-root host is not stuck at
+  six entries a tick; 50 ms wall) and the entries one cursor may visit before
+  it restarts instead of resuming (100000). A finished or limited sweep
+  carries its origin, so the next generation does not restart at root 0.
 - `converging` — a cursor exists and will resume on the next cadence; it stays
   true for a cadence deferred before any filesystem work, which keeps its cursor,
   and for a cadence that retired a finished cursor and installed a successor on
@@ -379,6 +394,10 @@ consumed by the label:
   `converging: true` beside `sweepComplete: true` is therefore a same-cadence
   restart, not a contradiction: this cadence's sweep finished and the next one
   begins from the successor, which is what "still sweeping" in the reason says.
+  A drained cadence is the other pair: `sweepComplete: true` with
+  `converging: false`, because the cursor was retired and nothing resumes. The
+  reason then says the cadence finished and left no cursor, not that a
+  successor is still sweeping. `converging` never pairs with `limitReached`.
 - `sweepComplete` — this cadence's cursor finished a full sweep of every eligible
   root. A sweep normally ends by being retired the moment it finishes — drained
   or restarted — and the receipt reports the numbers that cursor held when it

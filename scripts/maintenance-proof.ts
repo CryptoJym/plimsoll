@@ -433,6 +433,132 @@ async function proveAdaptiveBaselineCadence() {
   );
 }
 
+/**
+ * REVIEW-78 N1: `activity.discoveryEntries` is the classifyRetry signal, not
+ * an operator-only receipt. A mixed turn — Claude still baselining,
+ * Codex/capture blocked behind the pending-metadata gate — used to look
+ * like discovery progress because the capture path published the carried
+ * pending-file count. HEAD publishes entries visited this cadence (zero
+ * when the gate holds), so the retry class is `normal`.
+ */
+async function proveDiscoveryEntriesRetryClass() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-n1-retry-"));
+  const writeTranscripts = (dir: string, count: number) => {
+    fs.mkdirSync(dir, { recursive: true });
+    for (let index = 0; index < count; index += 1) {
+      fs.writeFileSync(path.join(dir, `session-${String(index).padStart(2, "0")}.jsonl`), "{}\n");
+    }
+  };
+  const writeRollouts = (dir: string, count: number) => {
+    const day = new Date("2026-07-15T12:00:00.000Z");
+    const partition = path.join(dir, ...day.toISOString().slice(0, 10).split("-"));
+    fs.mkdirSync(partition, { recursive: true });
+    for (let index = 0; index < count; index += 1) {
+      fs.writeFileSync(path.join(partition, `rollout-${String(index).padStart(2, "0")}.jsonl`), "{}\n");
+    }
+  };
+  const runGatedCapture = async (
+    kind: "transcript" | "rollout",
+  ) => {
+    const ledger = path.join(root, `${kind}-gated.sqlite`);
+    const sourceRoot = path.join(root, kind);
+    if (kind === "transcript") writeTranscripts(sourceRoot, 24);
+    else writeRollouts(sourceRoot, 24);
+    const buffer = new LocalEventBuffer(ledger);
+    const tailer = kind === "transcript"
+      ? new TranscriptTailer(buffer, sourceRoot)
+      : new RolloutTailer(buffer, sourceRoot, () => []);
+    const abortAfterMetadata = (admitted: { count: number }, signal: AbortController) =>
+      (progress: { stage: string }) => {
+        if (progress.stage !== "candidate_metadata") return true;
+        admitted.count += 1;
+        if (admitted.count >= 4) {
+          signal.abort();
+          return false;
+        }
+        return true;
+      };
+    try {
+      const firstAbort = new AbortController();
+      const first = await tailer.scan({
+        scope: "recent",
+        now: new Date("2026-07-15T12:00:00.000Z"),
+        signal: firstAbort.signal,
+        onProgress: abortAfterMetadata({ count: 0 }, firstAbort),
+        automatic: { phase: "capture", budget: new CaptureWorkBudget() },
+      });
+      const gated = await tailer.scan({
+        scope: "recent",
+        now: new Date("2026-07-15T12:00:00.000Z"),
+        automatic: { phase: "capture", budget: new CaptureWorkBudget() },
+      });
+      return {
+        firstEntries: first.activity.discoveryEntries,
+        firstFiles: first.filesSeen,
+        gatedEntries: gated.activity.discoveryEntries,
+        gatedFiles: gated.filesSeen,
+      };
+    } finally {
+      tailer.close();
+      buffer.close();
+    }
+  };
+
+  const transcriptGate = await runGatedCapture("transcript");
+  const rolloutGate = await runGatedCapture("rollout");
+
+  const mixedBaseline = () => {
+    const status = fakeBaselineStatus("in_progress");
+    // Codex already complete, Claude still walking: mixed baseline/capture.
+    status.progress.sourcesComplete = 1;
+    status.progress.sourcesInProgress = 1;
+    return status;
+  };
+
+  const runClass = async (discoveryEntries: number) => {
+    const clock = fakeCadenceTimer();
+    const result = fakeRun();
+    result.rollout.activity.discoveryEntries = discoveryEntries;
+    result.transcript.activity.discoveryEntries = 0;
+    result.captureAdvanced = false;
+    const scheduler = new CoalescingMaintenanceScheduler(async () => result);
+    const cadence = new AutomaticMaintenanceCadence(
+      scheduler,
+      mixedBaseline,
+      { timer: clock.timer },
+    );
+    cadence.start();
+    await clock.advance(5_000);
+    const status = cadence.status();
+    cadence.stop();
+    return status.retryClass;
+  };
+
+  const intended = await runClass(transcriptGate.gatedEntries);
+  const stuffed = await runClass(Math.max(1, transcriptGate.gatedFiles));
+
+  check(
+    "mixed_baseline_capture_gate_publishes_zero_discovery_entries_not_pending_files",
+    transcriptGate.firstEntries > 0 &&
+      transcriptGate.gatedEntries === 0 &&
+      transcriptGate.gatedFiles > 0 &&
+      rolloutGate.firstEntries > 0 &&
+      rolloutGate.gatedEntries === 0 &&
+      rolloutGate.gatedFiles > 0,
+    { transcriptGate, rolloutGate },
+  );
+  check(
+    "mixed_baseline_capture_with_gated_discovery_uses_normal_retry_class",
+    intended === "normal" &&
+      stuffed === "startup" &&
+      transcriptGate.gatedEntries === 0,
+    { intended, stuffed, gatedEntries: transcriptGate.gatedEntries,
+      gatedFiles: transcriptGate.gatedFiles },
+  );
+
+  fs.rmSync(root, { recursive: true, force: true });
+}
+
 async function proveDurableSlowSourceFairness(root: string) {
   const buffer = new LocalEventBuffer(path.join(root, "source-fairness.sqlite"));
   const startedAt = new Date().toISOString();
@@ -1422,6 +1548,7 @@ async function main() {
   await proveCoalescing();
   await proveStoppingCancelsPendingFollowup();
   await proveAdaptiveBaselineCadence();
+  await proveDiscoveryEntriesRetryClass();
   await proveProjectionDutyCycle();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-maintenance-proof-"));
   const ledger = path.join(root, "ledger.sqlite");

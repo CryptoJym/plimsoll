@@ -18,10 +18,168 @@ const initializedDatabases = new WeakSet<object>();
 
 /** Automatic discovery holds at most one small metadata chunk per source. */
 export const AUTOMATIC_DISCOVERY_PENDING_METADATA_CAP = 64;
+/** Floor for a cadence that has no corpus observation yet. */
 export const AUTOMATIC_DISCOVERY_ENTRY_CAP = 256;
 export const AUTOMATIC_DISCOVERY_WALL_MS = 50;
 /** Entries one discovery cursor may visit before it restarts instead of resuming. */
 export const AUTOMATIC_DISCOVERY_LIFETIME_ENTRY_CAP = 100_000;
+/**
+ * Must match the per-collect clamp in `IncrementalJsonlDiscovery.collect`.
+ * The fairness wall still stops the loop; this only raises the entry ceiling
+ * the wall may spend (bead eco-6hoxj.73.1).
+ */
+export const AUTOMATIC_DISCOVERY_ENTRY_CAP_MAX = 16_384;
+/** Directory entries budgeted per capture root when sizing a cadence. */
+export const AUTOMATIC_DISCOVERY_ENTRIES_PER_ROOT = 32;
+
+/**
+ * Per-cadence directory-entry allowance, sized from the host's capture roots
+ * and any observed corpus so a many-root sweep can finish in a bounded number
+ * of cadences. `collect()` still stops on the wall budget and the shared
+ * fairness clock.
+ */
+export function automaticDiscoveryEntryAllowance(input: {
+  rootCount: number;
+  observedEntries?: number;
+}): number {
+  const roots = Math.max(1, Math.trunc(input.rootCount) || 1);
+  const observed = Math.max(0, Math.trunc(input.observedEntries ?? 0));
+  const fromRoots = roots * AUTOMATIC_DISCOVERY_ENTRIES_PER_ROOT;
+  const fromCorpus = observed > 0 ? Math.ceil(observed / 4) : 0;
+  return Math.min(
+    AUTOMATIC_DISCOVERY_ENTRY_CAP_MAX,
+    Math.max(AUTOMATIC_DISCOVERY_ENTRY_CAP, fromRoots, fromCorpus),
+  );
+}
+
+const SWEEP_RESUME_KEY_PREFIX = "capture_sweep_resume:";
+const SWEEP_RESUME_SCHEMA_VERSION = 1 as const;
+const SWEEP_RESUME_SOURCE_PATTERN = /^[a-z0-9_]{1,64}$/;
+const SWEEP_RESUME_MAX_BYTES = 512;
+
+export type CaptureSweepResume = {
+  schemaVersion: typeof SWEEP_RESUME_SCHEMA_VERSION;
+  source: HistoryCoverageSource;
+  /** Cursor-root index the next generation starts at. */
+  rootIndex: number;
+  /** Entries the last generation actually visited; sizes the next allowance. */
+  observedEntries: number;
+};
+
+function sweepResumeKey(source: HistoryCoverageSource) {
+  if (!SWEEP_RESUME_SOURCE_PATTERN.test(source)) {
+    throw new Error("capture sweep resume source must be a bounded identifier");
+  }
+  return `${SWEEP_RESUME_KEY_PREFIX}${source}`;
+}
+
+function ensureSweepResumeTable(database: Database.Database) {
+  database.exec(`
+    create table if not exists maintenance_state (
+      key text primary key,
+      value text not null,
+      updated_at text not null
+    );
+  `);
+}
+
+/** Reads the durable sweep origin; any anomaly degrades to null. */
+export function loadCaptureSweepResume(
+  database: Database.Database,
+  source: HistoryCoverageSource,
+): CaptureSweepResume | null {
+  const key = sweepResumeKey(source);
+  let raw: string | undefined;
+  try {
+    ensureSweepResumeTable(database);
+    const row = database.prepare("select value from maintenance_state where key = ?").get(key) as
+      | { value?: unknown }
+      | undefined;
+    if (!row || typeof row.value !== "string") return null;
+    if (Buffer.byteLength(row.value, "utf8") > SWEEP_RESUME_MAX_BYTES) return null;
+    raw = row.value;
+  } catch {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(raw!) as {
+      schemaVersion?: unknown;
+      source?: unknown;
+      rootIndex?: unknown;
+      observedEntries?: unknown;
+    };
+    if (
+      parsed?.schemaVersion !== SWEEP_RESUME_SCHEMA_VERSION ||
+      parsed.source !== source ||
+      !Number.isSafeInteger(parsed.rootIndex) ||
+      (parsed.rootIndex as number) < 0 ||
+      !Number.isSafeInteger(parsed.observedEntries) ||
+      (parsed.observedEntries as number) < 0
+    ) {
+      return null;
+    }
+    return {
+      schemaVersion: SWEEP_RESUME_SCHEMA_VERSION,
+      source,
+      rootIndex: parsed.rootIndex as number,
+      observedEntries: parsed.observedEntries as number,
+    };
+  } catch {
+    return null;
+  }
+}
+
+/** Persists the next generation's origin; null clears it. */
+export function rememberCaptureSweepResume(
+  database: Database.Database,
+  source: HistoryCoverageSource,
+  resume: { rootIndex: number; observedEntries: number } | null,
+): void {
+  const key = sweepResumeKey(source);
+  ensureSweepResumeTable(database);
+  if (resume === null) {
+    database.prepare("delete from maintenance_state where key = ?").run(key);
+    return;
+  }
+  if (
+    !Number.isSafeInteger(resume.rootIndex) ||
+    resume.rootIndex < 0 ||
+    !Number.isSafeInteger(resume.observedEntries) ||
+    resume.observedEntries < 0
+  ) {
+    throw new Error("capture sweep resume must be a pair of non-negative integers");
+  }
+  const record: CaptureSweepResume = {
+    schemaVersion: SWEEP_RESUME_SCHEMA_VERSION,
+    source,
+    rootIndex: resume.rootIndex,
+    observedEntries: resume.observedEntries,
+  };
+  database.prepare(
+    `insert into maintenance_state (key, value, updated_at) values (?, ?, ?)
+     on conflict(key) do update set value = excluded.value, updated_at = excluded.updated_at`,
+  ).run(key, JSON.stringify(record), new Date().toISOString());
+}
+
+/**
+ * Origin of the next generation after this cursor is retired.
+ *
+ * A completed sweep rotates one capture root forward so the following
+ * generation does not restart at cursor-root 0. A limited or errored sweep
+ * resumes at the first cursor root it had not finished, wrapping.
+ */
+export function nextCaptureSweepOrigin(
+  progress: DiscoveryProgress,
+  cursorRootsPerCaptureRoot = 1,
+): number {
+  const count = Math.max(0, Math.trunc(progress.rootsTotal));
+  if (count === 0) return 0;
+  const step = Math.max(1, Math.trunc(cursorRootsPerCaptureRoot));
+  if (progress.finished && !progress.limitReached) {
+    return (progress.origin + step) % count;
+  }
+  return ((progress.nextRootIndex % count) + count) % count;
+}
 
 /**
  * The enumeration receipt behind one activity-scan cadence (bead eco-6hoxj.73).
@@ -65,6 +223,10 @@ export type CaptureScanProgress = {
    * entries matched: a cadence that visits 256 entries and matches 2 files
    * reports 256 and 256, not 256 and 2 (bead eco-6hoxj.78, REVIEW-73-r3
    * finding 5). `pendingFiles` below is the field that counts files.
+   *
+   * A tick is a subset of its sweep. At a sweep boundary the successor
+   * cursor starts at `entriesVisited=0`; a leftover previous-cadence tick
+   * is never published beside that 0 (bead eco-6hoxj.155).
    */
   entriesThisSweep: number;
   entriesThisTick: number;
@@ -114,15 +276,27 @@ export function captureScanProgress(input: {
   const discovery = input.discovery;
   const retired = input.cursorRetired === true;
   const cursorRootsPerRoot = Math.max(1, Math.trunc(input.cursorRootsPerCaptureRoot ?? 1));
+  const entriesThisSweep = discovery?.entriesVisited ?? 0;
+  // A tick cannot outrun its sweep. The first tick of a new sweep starts
+  // at entriesVisited=0; publishing the previous cadence's tick beside
+  // that 0 is the studio6 0.7.31 boundary lie (eco-6hoxj.155).
+  const requestedTick = Number.isFinite(input.entriesThisTick)
+    ? Math.max(0, Math.trunc(input.entriesThisTick))
+    : 0;
+  const entriesThisTick = Math.min(requestedTick, entriesThisSweep);
   return {
     // A cursor that has neither finished nor hit its lifetime limit resumes on
     // the next cadence — including a cadence deferred before filesystem work,
     // which keeps the cursor untouched. A same-cadence restart also resumes:
     // it retired the cursor that did the work and left a fresh successor
     // behind, so the sweep is still converging even though this cadence's
-    // receipt reports a completed sweep.
-    converging: input.successorInstalled === true ||
-      (!retired && discovery !== null && !discovery.limitReached && !discovery.finished),
+    // receipt reports a completed sweep. A lifetime-limit cursor never
+    // resumes, so `successorInstalled` cannot pair `converging` with
+    // `limitReached` (REVIEW-78 residual, bead eco-6hoxj.147).
+    converging: discovery?.limitReached !== true && (
+      input.successorInstalled === true ||
+      (!retired && discovery !== null && !discovery.finished)
+    ),
     // Only a cursor can report a finished sweep: no cursor is no receipt,
     // which is exactly the state of every cadence of the baseline phase. A
     // cursor closed short of its roots reports `finished` too, so a sweep that
@@ -135,10 +309,13 @@ export function captureScanProgress(input: {
     rootsStarted: discovery
       ? Math.min(input.eligibleRoots, Math.ceil(discovery.rootsStarted / cursorRootsPerRoot))
       : 0,
-    entriesThisSweep: discovery?.entriesVisited ?? 0,
-    entriesThisTick: input.entriesThisTick,
+    entriesThisSweep,
+    entriesThisTick,
     pendingFiles: input.pendingFiles,
-    entryBudgetPerTick: AUTOMATIC_DISCOVERY_ENTRY_CAP,
+    entryBudgetPerTick: automaticDiscoveryEntryAllowance({
+      rootCount: input.eligibleRoots,
+      observedEntries: discovery?.entriesVisited,
+    }),
     wallBudgetMsPerTick: AUTOMATIC_DISCOVERY_WALL_MS,
     lifetimeEntryLimit: discovery?.lifetimeEntryLimit ?? input.lifetimeEntryLimit,
     limitReached: discovery?.limitReached ?? false,

@@ -140,9 +140,15 @@ export function generateClaudeCodeSettings(options: ToolConfigOptions) {
   const otlpHeaders = options.claudeCodeProducerToken
     ? `x-plimsoll-source=claude_code,x-plimsoll-token=${options.claudeCodeProducerToken}`
     : "x-plimsoll-source=claude_code";
-  const hookHeaders = options.claudeCodeProducerToken
-    ? { "x-plimsoll-token": options.claudeCodeProducerToken }
-    : undefined;
+  // HTTP hooks identify the producer by path, but rejection diagnostics use
+  // the source header to classify the client. Always emit that bounded source
+  // label; add the token only when one is provisioned.
+  const hookHeaders: Record<string, string> = {
+    "x-plimsoll-source": "claude_code",
+    ...(options.claudeCodeProducerToken
+      ? { "x-plimsoll-token": options.claudeCodeProducerToken }
+      : {}),
+  };
 
   return {
     env: {

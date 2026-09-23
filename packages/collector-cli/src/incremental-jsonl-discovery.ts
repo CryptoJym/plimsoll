@@ -27,6 +27,14 @@ export type DiscoveryProgress = {
   lifetimeEntryLimit: number;
   limitReached: boolean;
   finished: boolean;
+  /**
+   * Cursor-root index this generation started at. A later generation starts
+   * at `nextRootIndex` so a finished or limited sweep does not restart at 0
+   * (bead eco-6hoxj.73.1).
+   */
+  origin: number;
+  /** Cursor-root index the next generation should start at. */
+  nextRootIndex: number;
 };
 
 export type DiscoveryChunk = {
@@ -48,7 +56,9 @@ export class IncrementalJsonlDiscovery {
   private readonly roots: string[];
   private readonly rootSet: Set<string>;
   private readonly stack: Frame[] = [];
-  private rootIndex = 0;
+  /** Roots opened this generation, counting from `origin`. */
+  private rootsOpened = 0;
+  private readonly origin: number;
   private visited = 0;
   private errors = 0;
   private finished = false;
@@ -63,6 +73,11 @@ export class IncrementalJsonlDiscovery {
       matches: (entryName: string) => boolean;
       maxEntries: number;
       missingRootsAreEmpty?: boolean;
+      /**
+       * Cursor-root index this generation starts at. The walk is circular, so
+       * a generation that starts at 5 still visits every root before finishing.
+       */
+      startRootIndex?: number;
       beforeFilesystemStep?: (progress: {
         stage: "discovery_directory" | "discovery_read" | "candidate_metadata";
         candidateHash: string;
@@ -73,6 +88,9 @@ export class IncrementalJsonlDiscovery {
   ) {
     this.roots = roots.map((root) => path.resolve(root));
     this.rootSet = new Set(this.roots);
+    const count = this.roots.length;
+    const start = Math.trunc(options.startRootIndex ?? 0);
+    this.origin = count === 0 ? 0 : ((start % count) + count) % count;
   }
 
   async collect(
@@ -132,14 +150,22 @@ export class IncrementalJsonlDiscovery {
 
   /** Cumulative sweep progress; `entriesVisited` never resets within a sweep. */
   progress(): DiscoveryProgress {
+    const count = this.roots.length;
+    const nextRootIndex = count === 0
+      ? 0
+      : this.stack.length > 0 && this.rootsOpened > 0
+        ? (this.origin + this.rootsOpened - 1) % count
+        : (this.origin + this.rootsOpened) % count;
     return {
-      rootsTotal: this.roots.length,
-      rootsStarted: this.rootIndex,
+      rootsTotal: count,
+      rootsStarted: this.rootsOpened,
       openDirectories: this.stack.length,
       entriesVisited: this.visited,
       lifetimeEntryLimit: this.options.maxEntries,
       limitReached: this.limitReached,
       finished: this.finished,
+      origin: this.origin,
+      nextRootIndex,
     };
   }
 
@@ -169,14 +195,15 @@ export class IncrementalJsonlDiscovery {
       return null;
     }
     if (this.stack.length === 0) {
-      if (this.rootIndex >= this.roots.length) {
+      if (this.rootsOpened >= this.roots.length) {
         this.finished = true;
         return null;
       }
-      const root = this.roots[this.rootIndex]!;
+      const index = (this.origin + this.rootsOpened) % this.roots.length;
+      const root = this.roots[index]!;
       // A rejected discovery_directory progress frame is not an attempted
       // root. Advance only after the open/skip/error step was admitted.
-      if (this.openDirectory(root, true)) this.rootIndex += 1;
+      if (this.openDirectory(root, true)) this.rootsOpened += 1;
       return null;
     }
 

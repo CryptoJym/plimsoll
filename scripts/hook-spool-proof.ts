@@ -1,11 +1,13 @@
 /**
- * Bead eco-6hoxj.61: hook events survive a collector 503, a collector 408 and a
- * refused connection through the per-home spool, and land in `buffered_events`
- * attributed exactly like a live post — same columns, same suppression
- * receipts, and the same event time, because the drain replays the hook's own
- * stamp rather than its own clock — with everything the collector would strip
- * emptied before the file is written, so the spool never holds what the ledger
- * is not allowed to hold.
+ * Bead eco-6hoxj.61 / .65: hook events survive a collector 503, a collector
+ * 408, a refused connection, and an unknown-outcome socket death (reset,
+ * closed socket, request timeout) through the per-home spool, and land in
+ * `buffered_events` attributed exactly like a live post — same columns, same
+ * suppression receipts, and the same event time, because the drain replays the
+ * hook's own stamp rather than its own clock — with everything the collector
+ * would strip emptied before the file is written, so the spool never holds
+ * what the ledger is not allowed to hold. A client-minted event id on the live
+ * path and in the spool file keeps a replay of a committed 202 at one row.
  *
  * The loss path this closes, measured on Studio0 on 2026-09-12: the collector
  * answers 503 `storage_busy_retry` when the ledger stays contended past the
@@ -68,7 +70,12 @@ import {
   spoolKeepsProtectedIdentityRaw,
   writeHookSpoolFile,
 } from "../packages/collector-cli/src/hook-spool";
-import { forwardHookOverLoopback } from "../packages/collector-cli/src/local-hook-client";
+import {
+  ensureHookEventId,
+  forwardHookOverLoopback,
+} from "../packages/collector-cli/src/local-hook-client";
+import { isUuid } from "../packages/collector-cli/src/normalizer";
+import { sealOutboundEvent } from "../packages/collector-cli/src/outbound-envelope";
 import { REJECTION_SUMMARY_INTERVAL_MS } from "../packages/collector-cli/src/rejection-diagnostics";
 import { extractRepoContextCwd } from "../packages/collector-cli/src/repo-context";
 import {
@@ -414,6 +421,95 @@ async function startResettingListener() {
   };
 }
 
+/**
+ * The collector writes 202 only after `admitHookBody` returns, so the status
+ * line is enough: the row is committed. Do not wait for Content-Length — Node
+ * may send the 202 as chunked keep-alive with no length, and waiting for the
+ * keep-alive FIN would retarget this case onto the timeout spool path.
+ */
+function httpResponseCommitted(buf: Buffer) {
+  const headerEnd = buf.indexOf("\r\n\r\n");
+  const header = buf.subarray(0, headerEnd < 0 ? buf.length : headerEnd).toString("latin1");
+  return /^HTTP\/1\.[01] 202 /.test(header);
+}
+
+/**
+ * Review r1 F2 of eco-6hoxj.61: a TCP proxy that forwards the request to a
+ * real collector, waits until that collector has written its 202 (the row is
+ * committed), then RSTs the client without forwarding the status line. The
+ * client sees ECONNRESET after a successful admit.
+ */
+async function startCommitThenResetProxy(upstreamPort: number) {
+  let sawCommitted202 = false;
+  const server = net.createServer((client) => {
+    const upstream = net.connect({ port: upstreamPort, host: "127.0.0.1" });
+    const rstClient = () => {
+      if (!client.destroyed) client.resetAndDestroy();
+      if (!upstream.destroyed) upstream.destroy();
+    };
+    client.on("error", () => {
+      if (!upstream.destroyed) upstream.destroy();
+    });
+    upstream.on("error", rstClient);
+    client.pipe(upstream);
+    let buf = Buffer.alloc(0);
+    upstream.on("data", (chunk: Buffer) => {
+      buf = Buffer.concat([buf, chunk]);
+      if (httpResponseCommitted(buf)) {
+        sawCommitted202 = true;
+        rstClient();
+      }
+    });
+    upstream.on("end", rstClient);
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  return {
+    port: (server.address() as AddressInfo).port,
+    sawCommitted202: () => sawCommitted202,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
+}
+
+function eventIdFromJson(body: string): string | undefined {
+  try {
+    const parsed = JSON.parse(body) as unknown;
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const record = parsed as Record<string, unknown>;
+    for (const alias of ["id", "eventId", "event_id"] as const) {
+      const value = record[alias];
+      if (typeof value === "string" && isUuid(value.trim())) return value.trim();
+    }
+  } catch {
+    /* not JSON */
+  }
+  return undefined;
+}
+
+function throwingFetch(code: string): typeof fetch {
+  return (async () => {
+    throw Object.assign(new Error(code), { code });
+  }) as typeof fetch;
+}
+
+/** Client spool files carry the original blanked body plus a minted event id. */
+function spoolBodyIsBlankedOriginalPlusMintedId(envelopeBody: unknown, original: string) {
+  if (typeof envelopeBody !== "string") return false;
+  let spooled: Record<string, unknown>;
+  try {
+    spooled = JSON.parse(envelopeBody) as Record<string, unknown>;
+  } catch {
+    return false;
+  }
+  if (!eventIdFromJson(envelopeBody)) return false;
+  const withoutId = { ...spooled };
+  delete withoutId.id;
+  delete withoutId.eventId;
+  delete withoutId.event_id;
+  const blanked = blankForbiddenRawContent(original);
+  if (!blanked) return false;
+  return JSON.stringify(withoutId) === JSON.stringify(JSON.parse(blanked.text));
+}
+
 function errorCode(error: unknown): string | undefined {
   let cursor: unknown = error;
   for (let depth = 0; depth < 4 && cursor && typeof cursor === "object"; depth += 1) {
@@ -530,7 +626,7 @@ async function caseLockedLedgerRecovers() {
         envelope?.source === "claude_code" &&
         typeof envelope?.receivedAt === "string" &&
         envelope?.blanked === 1 &&
-        envelope?.body === blanked.text &&
+        spoolBodyIsBlankedOriginalPlusMintedId(envelope?.body, body) &&
         // Every non-content field of the body survives untouched; only the
         // forbidden value is empty.
         JSON.stringify(JSON.parse(blanked.text as string)) ===
@@ -539,7 +635,8 @@ async function caseLockedLedgerRecovers() {
         files: spooled.length,
         source: envelope?.source,
         blanked: envelope?.blanked,
-        bodyMatchesBlanked: envelope?.body === blanked.text,
+        bodyMatchesBlanked: spoolBodyIsBlankedOriginalPlusMintedId(envelope?.body, body),
+        mintedId: typeof envelope?.body === "string" ? eventIdFromJson(envelope.body) : undefined,
       },
     );
 
@@ -698,7 +795,7 @@ async function caseRefusedConnectionRecovers() {
       forwarded.spooled === true &&
       spooled.length === 1 &&
       envelope?.source === "codex" &&
-      envelope?.body === blankForbiddenRawContent(body)!.text &&
+      spoolBodyIsBlankedOriginalPlusMintedId(envelope?.body, body) &&
       envelope?.blanked === 1,
     { forwarded, files: spooled.length, source: envelope?.source, blanked: envelope?.blanked },
   );
@@ -982,12 +1079,13 @@ function caseDoctorNamesAStalledSpool() {
 
 
 /**
- * The trigger set, driven against real listeners: exactly the outcomes that
- * prove the collector stored nothing spool; everything else still throws.
+ * The trigger set, driven against real listeners: the outcomes that prove the
+ * collector stored nothing still spool, and so do the unknown-outcome socket
+ * deaths that eco-6hoxj.65 made safe with a client-minted event id.
  *
- * 408 is here because Studio0 is losing codex hook posts to it right now, and
- * ECONNRESET is deliberately NOT here (review r1, F2): a reset can arrive after
- * the row was committed, and nothing dedups a replay.
+ * 408 is here because Studio0 is losing codex hook posts to it right now.
+ * ECONNRESET and UND_ERR_SOCKET are here because a replay of a committed 202
+ * now lands on the same id.
  */
 async function caseTriggerSetIsExactlyTheOutcomesThatStoredNothing() {
   const { home } = fixtureHome("k");
@@ -1047,33 +1145,96 @@ async function caseTriggerSetIsExactlyTheOutcomesThatStoredNothing() {
   );
 
   // A reset connection: the collector may already have committed the row.
+  // eco-6hoxj.65 spools it; the minted id keeps a later replay at one row.
   const resetHome = fixtureHome("k_reset");
   const resetAuth = loadOrCreateLocalIngestAuth(resetHome.home);
   const resetter = await startResettingListener();
-  let resetThrown: unknown;
+  let resetOutcome: unknown;
   try {
-    await forwardHookOverLoopback(body, {
+    resetOutcome = await forwardHookOverLoopback(body, {
       source: "claude_code",
       port: resetter.port,
       auth: resetAuth,
     });
   } catch (error) {
-    resetThrown = error;
+    resetOutcome = error;
   } finally {
     await resetter.close();
   }
+  const resetSpooled = listHookSpoolFiles(resetHome.home);
+  const resetEnvelope = resetSpooled.length === 1
+    ? (JSON.parse(fs.readFileSync(resetSpooled[0]!.path, "utf8")) as Record<string, unknown>)
+    : null;
+  const resetBodyId = typeof resetEnvelope?.body === "string"
+    ? eventIdFromJson(resetEnvelope.body)
+    : undefined;
   check(
-    "k_a_reset_connection_throws_and_spools_nothing_at_most_once",
-    resetThrown instanceof Error &&
-      errorCode(resetThrown) !== undefined &&
-      listHookSpoolFiles(resetHome.home).length === 0 &&
-      !fs.existsSync(hookSpoolDirectory(resetHome.home)),
+    "k_a_reset_connection_spools_a_body_that_carries_a_client_minted_id",
+    Boolean(resetOutcome && typeof resetOutcome === "object" && "spooled" in resetOutcome) &&
+      resetSpooled.length === 1 &&
+      typeof resetBodyId === "string" &&
+      isUuid(resetBodyId),
     {
-      code: errorCode(resetThrown),
-      message: resetThrown instanceof Error ? resetThrown.message : String(resetThrown),
-      pending: listHookSpoolFiles(resetHome.home).length,
-      spoolDirectoryCreated: fs.existsSync(hookSpoolDirectory(resetHome.home)),
+      outcome: resetOutcome instanceof Error
+        ? { threw: resetOutcome.message, code: errorCode(resetOutcome) }
+        : resetOutcome,
+      pending: resetSpooled.length,
+      mintedId: resetBodyId,
     },
+  );
+
+  const closedHome = fixtureHome("k_closed");
+  const closedAuth = loadOrCreateLocalIngestAuth(closedHome.home);
+  const closedForwarded = await forwardHookOverLoopback(body, {
+    source: "claude_code",
+    port: 1,
+    auth: closedAuth,
+    fetchImpl: throwingFetch("UND_ERR_SOCKET"),
+  });
+  check(
+    "k_a_closed_socket_UND_ERR_SOCKET_spools",
+    "spooled" in closedForwarded && listHookSpoolFiles(closedHome.home).length === 1,
+    { closedForwarded, pending: listHookSpoolFiles(closedHome.home).length },
+  );
+
+  const timeoutHome = fixtureHome("k_timeout");
+  const timeoutAuth = loadOrCreateLocalIngestAuth(timeoutHome.home);
+  const timeoutForwarded = await forwardHookOverLoopback(body, {
+    source: "claude_code",
+    port: 1,
+    auth: timeoutAuth,
+    fetchImpl: throwingFetch("UND_ERR_HEADERS_TIMEOUT"),
+  });
+  check(
+    "k_a_request_timeout_spools",
+    "spooled" in timeoutForwarded && listHookSpoolFiles(timeoutHome.home).length === 1,
+    { timeoutForwarded, pending: listHookSpoolFiles(timeoutHome.home).length },
+  );
+
+  // An unknown-outcome reset must not spool a body that cannot carry the
+  // stable id the replay guard relies on. Replaying an array would otherwise
+  // make the collector mint a fresh id and violate exactly-once semantics.
+  const arrayHome = fixtureHome("k_array");
+  const arrayAuth = loadOrCreateLocalIngestAuth(arrayHome.home);
+  let arrayOutcome: unknown;
+  try {
+    await forwardHookOverLoopback("[1]", {
+      source: "claude_code",
+      port: 1,
+      auth: arrayAuth,
+      fetchImpl: throwingFetch("UND_ERR_SOCKET"),
+    });
+    arrayOutcome = "did_not_throw";
+  } catch (error) {
+    arrayOutcome = error instanceof Error ? { message: error.message, code: errorCode(error) } : error;
+  }
+  check(
+    "k_unknown_outcome_without_stable_id_stays_visible_and_does_not_spool",
+    typeof arrayOutcome === "object" &&
+      arrayOutcome !== null &&
+      "message" in arrayOutcome &&
+      listHookSpoolFiles(arrayHome.home).length === 0,
+    { outcome: arrayOutcome, pending: listHookSpoolFiles(arrayHome.home).length },
   );
 
   // A refused connection still spools (unchanged from r1, re-asserted here so
@@ -1091,6 +1252,199 @@ async function caseTriggerSetIsExactlyTheOutcomesThatStoredNothing() {
     "spooled" in refusedForwarded && listHookSpoolFiles(refusedHome.home).length === 1,
     { refusedForwarded, pending: listHookSpoolFiles(refusedHome.home).length },
   );
+}
+
+/**
+ * Bead eco-6hoxj.65: a client-minted id makes unknown-outcome replay one row.
+ *
+ * Live + replay, replay + replay, and the reviewer's TCP-proxy reset after a
+ * committed 202 all land exactly one `buffered_events` row. A body that never
+ * carried an id still gets a fresh UUID on the collector's own intake. The
+ * minted id is the ledger id and the outbound envelope id, so hosted
+ * `createMany(skipDuplicates)` keeps it one row too.
+ */
+async function caseIdempotentReplayCoversUnknownOutcomes() {
+  const existingId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee0";
+  const withId = JSON.stringify({ hook_event_name: "UserPromptSubmit", id: existingId });
+  const mintedOnce = ensureHookEventId(claudeHookBody("11111111-2222-4333-8444-555555555550", "mint"));
+  const mintedTwice = ensureHookEventId(claudeHookBody("11111111-2222-4333-8444-555555555550", "mint"));
+  check(
+    "aa_ensure_hook_event_id_mints_a_uuid_when_the_body_has_none",
+    eventIdFromJson(mintedOnce) !== undefined &&
+      isUuid(eventIdFromJson(mintedOnce)!) &&
+      eventIdFromJson(mintedOnce) !== eventIdFromJson(mintedTwice),
+    { first: eventIdFromJson(mintedOnce), second: eventIdFromJson(mintedTwice) },
+  );
+  check(
+    "aa_ensure_hook_event_id_leaves_an_existing_uuid_and_non_json_alone",
+    ensureHookEventId(withId) === withId &&
+      eventIdFromJson(ensureHookEventId(withId)) === existingId &&
+      ensureHookEventId("not-json") === "not-json" &&
+      ensureHookEventId("[1]") === "[1]",
+    { existingId, preserved: ensureHookEventId(withId) === withId },
+  );
+
+  const { home } = fixtureHome("aa");
+  const collector = await startCollector(home);
+  const sessionLive = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee1";
+  const liveBody = ensureHookEventId(claudeHookBody(sessionLive, "live plus replay"));
+  const liveId = eventIdFromJson(liveBody)!;
+  try {
+    const first = await forwardHookOverLoopback(liveBody, {
+      source: "claude_code",
+      port: collector.port,
+      auth: collector.auth,
+    });
+    const second = await forwardHookOverLoopback(liveBody, {
+      source: "claude_code",
+      port: collector.port,
+      auth: collector.auth,
+    });
+    const liveRows = sessionRowsOf(collector.buffer, sessionLive);
+    check(
+      "aa_the_same_minted_body_posted_twice_live_is_one_ledger_row",
+      "accepted" in first &&
+        "accepted" in second &&
+        liveRows.length === 1 &&
+        liveRows[0]?.id === liveId,
+      { first, second, rows: liveRows.length, id: liveRows[0]?.id, minted: liveId },
+    );
+
+    const sessionReplay = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee2";
+    const replayBody = ensureHookEventId(claudeHookBody(sessionReplay, "replay plus replay"));
+    const replayId = eventIdFromJson(replayBody)!;
+    const dead = await startResettingListener();
+    try {
+      const spoolOne = await forwardHookOverLoopback(replayBody, {
+        source: "claude_code",
+        port: dead.port,
+        auth: collector.auth,
+      });
+      const spoolTwo = await forwardHookOverLoopback(replayBody, {
+        source: "claude_code",
+        port: dead.port,
+        auth: collector.auth,
+      });
+      check(
+        "aa_the_same_minted_body_spools_twice_as_two_files",
+        "spooled" in spoolOne &&
+          "spooled" in spoolTwo &&
+          listHookSpoolFiles(home).length === 2,
+        { spoolOne, spoolTwo, pending: listHookSpoolFiles(home).length },
+      );
+    } finally {
+      await dead.close();
+    }
+    const replayTick = await collector.drain.tick();
+    const replayRows = sessionRowsOf(collector.buffer, sessionReplay);
+    check(
+      "aa_replay_plus_replay_of_the_same_id_is_one_ledger_row",
+      replayTick.recovered === 2 &&
+        replayRows.length === 1 &&
+        replayRows[0]?.id === replayId,
+      {
+        tick: replayTick,
+        rows: replayRows.length,
+        id: replayRows[0]?.id,
+        minted: replayId,
+      },
+    );
+
+    const payload = JSON.parse(String(replayRows[0]?.payload_json ?? "{}")) as Record<string, unknown>;
+    const sealed = sealOutboundEvent(payload as Parameters<typeof sealOutboundEvent>[0]);
+    check(
+      "aa_the_client_minted_id_survives_normalization_and_the_outbound_seal",
+      replayRows[0]?.id === replayId &&
+        payload.id === replayId &&
+        sealed.ok === true &&
+        sealed.ok &&
+        sealed.event.id === replayId,
+      {
+        ledgerId: replayRows[0]?.id,
+        payloadId: payload.id,
+        sealedOk: sealed.ok,
+        sealedId: sealed.ok ? sealed.event.id : null,
+      },
+    );
+
+    const sessionBare = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee3";
+    const bareBody = claudeHookBody(sessionBare, "no client id");
+    const headers = {
+      "content-type": "application/json",
+      "x-plimsoll-source": "claude_code",
+      "x-plimsoll-token": collector.auth.claudeCodeProducer!,
+    };
+    const bareFirst = await postHookOverHttp(collector.port, "/hooks/claude-code", headers, bareBody);
+    const bareSecond = await postHookOverHttp(collector.port, "/hooks/claude-code", headers, bareBody);
+    const bareRows = sessionRowsOf(collector.buffer, sessionBare);
+    const bareIds = bareRows.map((row) => String(row.id));
+    check(
+      "aa_negative_control_a_body_without_an_id_still_gets_a_fresh_uuid_per_admit",
+      bareFirst.status === 202 &&
+        bareSecond.status === 202 &&
+        eventIdFromJson(bareBody) === undefined &&
+        bareIds.length === 2 &&
+        bareIds[0] !== bareIds[1] &&
+        bareIds.every((id) => isUuid(id)) &&
+        !bareBody.includes(bareIds[0]!) &&
+        !bareBody.includes(bareIds[1]!),
+      { statuses: [bareFirst.status, bareSecond.status], ids: bareIds },
+    );
+  } finally {
+    await collector.close();
+  }
+
+  const proxyHome = fixtureHome("aa_proxy");
+  const proxyCollector = await startCollector(proxyHome.home);
+  const sessionProxy = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeee4";
+  const proxyBody = claudeHookBody(sessionProxy, "tcp proxy reset after 202");
+  const proxy = await startCommitThenResetProxy(proxyCollector.port);
+  try {
+    const forwarded = await forwardHookOverLoopback(proxyBody, {
+      source: "claude_code",
+      port: proxy.port,
+      auth: proxyCollector.auth,
+    });
+    const afterReset = sessionRowsOf(proxyCollector.buffer, sessionProxy);
+    const spooled = listHookSpoolFiles(proxyHome.home);
+    const envelope = spooled.length === 1
+      ? (JSON.parse(fs.readFileSync(spooled[0]!.path, "utf8")) as Record<string, unknown>)
+      : null;
+    const mintedId = typeof envelope?.body === "string" ? eventIdFromJson(envelope.body) : undefined;
+    check(
+      "aa_tcp_proxy_reset_after_committed_202_spools_the_same_minted_id",
+      Boolean(forwarded && "spooled" in forwarded) &&
+        proxy.sawCommitted202() &&
+        afterReset.length === 1 &&
+        typeof mintedId === "string" &&
+        afterReset[0]?.id === mintedId,
+      {
+        forwarded,
+        sawCommitted202: proxy.sawCommitted202(),
+        rowsAfterReset: afterReset.length,
+        ledgerId: afterReset[0]?.id,
+        mintedId,
+        pending: spooled.length,
+      },
+    );
+    const proxyTick = await proxyCollector.drain.tick();
+    const afterDrain = sessionRowsOf(proxyCollector.buffer, sessionProxy);
+    check(
+      "aa_the_reviewers_tcp_proxy_reset_case_lands_one_row",
+      proxyTick.recovered === 1 &&
+        afterDrain.length === 1 &&
+        afterDrain[0]?.id === mintedId,
+      {
+        tick: proxyTick,
+        rows: afterDrain.length,
+        id: afterDrain[0]?.id,
+        mintedId,
+      },
+    );
+  } finally {
+    await proxy.close();
+    await proxyCollector.close();
+  }
 }
 
 /** The 408 the client spools on, end to end: spooled, then recovered. */
@@ -1808,18 +2162,22 @@ function postToolUseBodyWithPaths(sessionId: string) {
  */
 /**
  * The header of the one table on the generated privacy page that carries the
- * spool's derivation-input disclosure, and the `Matched by` cell that marks a
- * rule-2 row. Both are literals of the RENDERED page, not of the code that
- * feeds it.
+ * spool's derivation-input disclosure, and the `Matched by` cells that mark a
+ * rule-2 row or an exact-name row. These are literals of the RENDERED page, not
+ * of the code that feeds it. Coupling them to `privacy-spec.ts` would destroy
+ * the leg's independence: a rename of the generator's copy would keep this
+ * reader green. A mismatch fails closed instead.
  */
 const PRIVACY_PAGE_DISCLOSURE_TABLE_HEADER =
   "| # | Field name | Matched by | Why the spool keeps its value |";
 const PRIVACY_PAGE_RULE_TWO_MATCHED_BY = "this name normalized, in any spelling";
+const PRIVACY_PAGE_EXACT_NAME_MATCHED_BY = "this exact name";
+const PRIVACY_PAGE_ALIGNMENT_ROW = /^\|(\s*-+\s*\|)+$/;
 
 /**
- * Review r2 (REVIEW-68-r2), N1 — the rule-2 names AS THE PRIVACY PAGE PRINTS
- * THEM, read back out of the rendered markdown table rather than out of the
- * array the table is built from.
+ * Review r2 (REVIEW-68-r2), N1, and REVIEW-86 follow-up — the disclosure-table
+ * names AS THE PRIVACY PAGE PRINTS THEM, read back out of the rendered markdown
+ * table rather than out of the array the table is built from.
  *
  * Why this exists: `renderedRuleTwoRows` in
  * `r_every_protected_identity_name_is_blanked_or_declared` is
@@ -1834,22 +2192,44 @@ const PRIVACY_PAGE_RULE_TWO_MATCHED_BY = "this name normalized, in any spelling"
  * still, and `r_the_privacy_pages_rendered_rule_two_table_names_the_hand_list`
  * reds while the restated leg stays green.
  *
+ * REVIEW-86: the same hole existed for the exact-name rows (cwd,
+ * current_working_directory, workdir, working_directory, hookEventName). A
+ * `reasonTable` change that dropped or mislabelled one still passed 123/123
+ * because this reader skipped every non-rule-2 row. Exact-name keys are now
+ * collected the same way and pinned to `SPOOL_DERIVATION_INPUT_KEYS`.
+ *
  * It fails closed. A table this reader cannot find, a second table wearing the
- * same header, a row whose cells it cannot read: each yields a name list that
- * cannot equal the hand list, rather than an empty pass.
+ * same header, a missing or non-alignment `header+1` row, a data row whose
+ * cells it cannot read, or a `Matched by` cell that is neither known label:
+ * each yields `unreadable` (or a name list that cannot equal the pin), rather
+ * than an empty pass. The alignment row is matched, not assumed: a fixed
+ * `header + 2` offset without that check consumed the first data row as
+ * alignment when the dashes were removed.
  */
-function ruleTwoNamesAsThePageRendersThem(page: string) {
+function disclosureTableAsThePageRendersThem(page: string) {
+  const empty = {
+    found: false,
+    duplicateHeader: false,
+    names: [] as string[],
+    exactNames: [] as string[],
+    rows: 0,
+    unreadable: [] as string[],
+  };
   const lines = page.split("\n");
   const header = lines.indexOf(PRIVACY_PAGE_DISCLOSURE_TABLE_HEADER);
   const duplicateHeader =
     header >= 0 && lines.indexOf(PRIVACY_PAGE_DISCLOSURE_TABLE_HEADER, header + 1) >= 0;
   if (header < 0 || duplicateHeader) {
-    return { found: false, duplicateHeader, names: [] as string[], rows: 0, unreadable: [] as string[] };
+    return { ...empty, duplicateHeader };
   }
   const names: string[] = [];
+  const exactNames: string[] = [];
   const unreadable: string[] = [];
   let rows = 0;
-  // `header + 2` steps over the `|---|---|---|---|` alignment row.
+  const alignment = lines[header + 1] ?? "";
+  if (!PRIVACY_PAGE_ALIGNMENT_ROW.test(alignment)) {
+    unreadable.push(alignment);
+  }
   for (let index = header + 2; index < lines.length; index += 1) {
     const line = lines[index] ?? "";
     if (!line.startsWith("|")) break;
@@ -1859,15 +2239,30 @@ function ruleTwoNamesAsThePageRendersThem(page: string) {
       unreadable.push(line);
       continue;
     }
-    if (cells[2] !== PRIVACY_PAGE_RULE_TWO_MATCHED_BY) continue;
     const printed = /^`([^`]+)`$/.exec(cells[1] ?? "");
     if (!printed) {
       unreadable.push(line);
       continue;
     }
-    names.push(printed[1] as string);
+    const matchedBy = cells[2] ?? "";
+    if (matchedBy === PRIVACY_PAGE_RULE_TWO_MATCHED_BY) {
+      names.push(printed[1] as string);
+      continue;
+    }
+    if (matchedBy === PRIVACY_PAGE_EXACT_NAME_MATCHED_BY) {
+      exactNames.push(printed[1] as string);
+      continue;
+    }
+    unreadable.push(line);
   }
-  return { found: true, duplicateHeader, names: names.sort(), rows, unreadable };
+  return {
+    found: true,
+    duplicateHeader,
+    names: names.sort(),
+    exactNames: exactNames.sort(),
+    rows,
+    unreadable,
+  };
 }
 
 async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
@@ -2194,7 +2589,9 @@ async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
   );
 
   // Review r2 (REVIEW-68-r2), N1 — the THIRD leg, and the only one of the three
-  // that is independent.
+  // that is independent. REVIEW-86 extends the same reader to the exact-name
+  // rows, which had the same hole: they were skipped, so a dropped or
+  // mislabelled derivation-input row still passed 123/123.
   //
   // The two legs above are `SPOOL_PROTECTED_IDENTITY_KEYS` compared with the
   // hand list, and `SPOOL_DERIVATION_INPUT_DISCLOSURE` filtered by `match`
@@ -2210,39 +2607,66 @@ async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
   // makes, parsed back out of its markdown. And take them a second time from
   // the COMMITTED `docs/privacy-spec.md`, so the page an operator actually
   // opens is held to the same hand list even without the `docs:privacy --check`
-  // gate. Both are compared with `SPOOL_RULE_TWO_DISCLOSED_CANONICAL_NAMES`,
-  // which is typed by hand and derived from nothing.
-  const pageRendersRuleTwo = ruleTwoNamesAsThePageRendersThem(
+  // gate. Rule-2 names are compared with `SPOOL_RULE_TWO_DISCLOSED_CANONICAL_NAMES`,
+  // which is typed by hand and derived from nothing. Exact-name names are
+  // compared with `SPOOL_DERIVATION_INPUT_KEYS`, the runtime allowlist the
+  // page exists to disclose.
+  const pageRendersDisclosure = disclosureTableAsThePageRendersThem(
     renderPrivacySpec(collectPrivacySpecModel()),
   );
-  const committedPageRuleTwo = ruleTwoNamesAsThePageRendersThem(
+  const committedPageDisclosure = disclosureTableAsThePageRendersThem(
     fs.readFileSync(path.join(repoRoot, "docs", "privacy-spec.md"), "utf8"),
   );
+  const disclosedExactNames = [...SPOOL_DERIVATION_INPUT_KEYS].sort();
+  const renderedPageReadable =
+    pageRendersDisclosure.found &&
+    committedPageDisclosure.found &&
+    pageRendersDisclosure.unreadable.length === 0 &&
+    committedPageDisclosure.unreadable.length === 0;
   check(
     "r_the_privacy_pages_rendered_rule_two_table_names_the_hand_list",
     disclosedRuleTwoNames.length > 0 &&
-      pageRendersRuleTwo.found &&
-      committedPageRuleTwo.found &&
-      pageRendersRuleTwo.unreadable.length === 0 &&
-      committedPageRuleTwo.unreadable.length === 0 &&
-      pageRendersRuleTwo.rows > pageRendersRuleTwo.names.length &&
-      JSON.stringify(pageRendersRuleTwo.names) === JSON.stringify(disclosedRuleTwoNames) &&
-      JSON.stringify(committedPageRuleTwo.names) === JSON.stringify(disclosedRuleTwoNames),
+      renderedPageReadable &&
+      pageRendersDisclosure.rows ===
+        pageRendersDisclosure.names.length + pageRendersDisclosure.exactNames.length &&
+      JSON.stringify(pageRendersDisclosure.names) === JSON.stringify(disclosedRuleTwoNames) &&
+      JSON.stringify(committedPageDisclosure.names) === JSON.stringify(disclosedRuleTwoNames),
     {
       source: "renderPrivacySpec(collectPrivacySpecModel()) + docs/privacy-spec.md",
       handList: disclosedRuleTwoNames,
-      renderedRuleTwoNames: pageRendersRuleTwo.names,
-      committedRuleTwoNames: committedPageRuleTwo.names,
-      renderedTableRows: pageRendersRuleTwo.rows,
-      committedTableRows: committedPageRuleTwo.rows,
-      tableFound: { rendered: pageRendersRuleTwo.found, committed: committedPageRuleTwo.found },
+      renderedRuleTwoNames: pageRendersDisclosure.names,
+      committedRuleTwoNames: committedPageDisclosure.names,
+      renderedTableRows: pageRendersDisclosure.rows,
+      committedTableRows: committedPageDisclosure.rows,
+      tableFound: { rendered: pageRendersDisclosure.found, committed: committedPageDisclosure.found },
       duplicateHeader: {
-        rendered: pageRendersRuleTwo.duplicateHeader,
-        committed: committedPageRuleTwo.duplicateHeader,
+        rendered: pageRendersDisclosure.duplicateHeader,
+        committed: committedPageDisclosure.duplicateHeader,
       },
-      unreadableRows: [...pageRendersRuleTwo.unreadable, ...committedPageRuleTwo.unreadable],
+      unreadableRows: [...pageRendersDisclosure.unreadable, ...committedPageDisclosure.unreadable],
       independentOf:
         "SPOOL_PROTECTED_IDENTITY_KEYS / SPOOL_DERIVATION_INPUT_DISCLOSURE — these names come from the generator's own rendered table",
+    },
+  );
+  check(
+    "r_the_privacy_pages_rendered_exact_name_table_names_the_derivation_inputs",
+    disclosedExactNames.length > 0 &&
+      renderedPageReadable &&
+      pageRendersDisclosure.rows ===
+        pageRendersDisclosure.names.length + pageRendersDisclosure.exactNames.length &&
+      JSON.stringify(pageRendersDisclosure.exactNames) === JSON.stringify(disclosedExactNames) &&
+      JSON.stringify(committedPageDisclosure.exactNames) === JSON.stringify(disclosedExactNames),
+    {
+      source: "renderPrivacySpec(collectPrivacySpecModel()) + docs/privacy-spec.md",
+      derivationInputs: disclosedExactNames,
+      renderedExactNames: pageRendersDisclosure.exactNames,
+      committedExactNames: committedPageDisclosure.exactNames,
+      renderedTableRows: pageRendersDisclosure.rows,
+      committedTableRows: committedPageDisclosure.rows,
+      tableFound: { rendered: pageRendersDisclosure.found, committed: committedPageDisclosure.found },
+      unreadableRows: [...pageRendersDisclosure.unreadable, ...committedPageDisclosure.unreadable],
+      independentOf:
+        "SPOOL_DERIVATION_INPUT_DISCLOSURE — exact-name keys come from the generator's own rendered table, pinned to SPOOL_DERIVATION_INPUT_KEYS",
     },
   );
 
@@ -4004,6 +4428,8 @@ async function main() {
     caseDoctorNamesAStalledSpool();
     stage("k_trigger_set");
     await caseTriggerSetIsExactlyTheOutcomesThatStoredNothing();
+    stage("aa_idempotent_replay");
+    await caseIdempotentReplayCoversUnknownOutcomes();
     stage("k_408_recovery");
     await case408SpoolsAndRecovers();
     stage("k_real_408");

@@ -193,6 +193,11 @@ function intervalEvent(auth: LiveAuthenticatedBinding, p: LiveUsagePacket, diges
   if (!readLiveUsageObservation(metadata, p.capturedAt)) throw new Error("live_interval_invalid");
   return { id, source: "codex", dataMode: "metadata", eventType: "usage_live", sessionId: p.threadId,
     tenantId: auth.context.workspaceId, observedAt: p.capturedAt, intent: "unknown", actionClass: "other",
+    // The dispatch binding is already validated across the whole interval and
+    // its project key is carried in metadata below.  Promote that same
+    // value to the canonical event field so upload/session projection can
+    // attribute live usage without requiring a second cwd/git lookup.
+    ...(work ? { projectKey: work.projectKey } : {}),
     inputTokens: delta.inputTokens, outputTokens: delta.outputTokens, cacheReadTokens: delta.cachedInputTokens,
     cacheCreationTokens: delta.cacheWriteInputTokens, metadata };
 }

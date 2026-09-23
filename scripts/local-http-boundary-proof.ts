@@ -349,6 +349,28 @@ function codexFullSpanExportBody() {
   });
 }
 
+const PREVIOUS_WIRE_CAP_BYTES = 2 * 1024 * 1024;
+
+/** Identity-encoded JSON just over the previous 2 MiB wire cap. */
+function identityBodyOverPreviousWireCap() {
+  const padding = "x".repeat(4_096);
+  return JSON.stringify({
+    resourceLogs: [{
+      scopeLogs: [{
+        logRecords: Array.from({ length: CODEX_OTEL_EXPORT_BATCH_RECORDS }, (_, index) => ({
+          timeUnixNano: String(1_760_000_000_000_000_000n + BigInt(index)),
+          attributes: [
+            { key: "cwd", value: { stringValue: `/HTTP_OVER_2MIB_PRIVATE_CWD/${index}` } },
+            { key: "gen_ai.usage.input_tokens", value: { intValue: "3" } },
+            { key: "gen_ai.usage.output_tokens", value: { intValue: "5" } },
+            { key: "proof.padding", value: { stringValue: padding + index } },
+          ],
+        })),
+      }],
+    }],
+  });
+}
+
 function representativeCodexBatchBody() {
   return JSON.stringify({
     resourceLogs: [{
@@ -641,8 +663,8 @@ async function main() {
 
     // Declared-length oversize is rejected before the upload is consumed.
     // The body is fed defensively because the server tears down an
-    // early-rejected multi-megabyte upload mid-flight (issue #196 raised the
-    // wire cap from 256 KiB to 2 MiB, so this body no longer fits one write).
+    // early-rejected multi-megabyte upload mid-flight (the wire cap is 4 MiB,
+    // so this body no longer fits one write).
     const oversizedBody = Buffer.alloc(LOCAL_HTTP_LIMITS.compressedBodyBytes + 1, "x");
     const oversizedStartedAt = performance.now();
     const startedAt = performance.now();
@@ -908,16 +930,29 @@ async function main() {
         // The first-line receipt carries a bounded client class label
         // ("codex", "claude", ...) since the admission diagnostics landed; it is
         // a fixed-cardinality tag, not request content, so it stays value-free.
-        const diagnosticKeys = ["clientClass", "recordCount", "recordArrays", "decodedBytes"];
+        const diagnosticKeys = ["clientClass", "recordCount", "recordArrays", "decodedBytes", "route"];
         const keys = Object.keys(parsed).filter((key) => !diagnosticKeys.includes(key));
         const clientClassValid =
           parsed.clientClass === undefined ||
           (typeof parsed.clientClass === "string" && /^[a-z_]{1,16}$/.test(parsed.clientClass));
+        const routeValid =
+          parsed.route === undefined ||
+          parsed.route === "otlp" ||
+          parsed.route === "other" ||
+          parsed.route === "/hooks/claude-code" ||
+          parsed.route === "/hooks/codex" ||
+          parsed.route === "/hooks/grok";
+        const identifiedBodyOrToken =
+          parsed.reason === "compressed_body_too_large" ||
+          parsed.reason === "producer_token_required" ||
+          parsed.reason === "producer_token_invalid";
         if (
           parsed.error !== "collector_request_rejected" ||
           typeof parsed.reason !== "string" ||
           keys.length !== 2 ||
           !clientClassValid ||
+          !routeValid ||
+          (identifiedBodyOrToken && typeof parsed.route !== "string") ||
           (parsed.reason === "otlp_record_limit_exceeded" &&
             (typeof parsed.recordCount !== "number" ||
               typeof parsed.decodedBytes !== "number" ||
@@ -987,7 +1022,11 @@ async function main() {
         conservationIdentity(counters) &&
         warnings.every((warning) =>
           Buffer.byteLength(warning) <=
-            (warning.includes('"reason":"otlp_record_limit_exceeded"') ? 384 : 128)
+            (warning.includes('"reason":"otlp_record_limit_exceeded"')
+              ? 384
+              : warning.includes('"route":')
+                ? 160
+                : 128)
         ) &&
         SENTINELS.every((sentinel) => !warningText.includes(sentinel)),
       {
@@ -1170,6 +1209,33 @@ async function main() {
         events: fullSpanBatchResult.body.events,
         recordCount: fullSpanBatchResult.body.recordCount,
         elapsedMs: Math.round(fullSpanBatchResult.elapsedMs * 100) / 100,
+      },
+    );
+
+    const overPreviousCap = identityBodyOverPreviousWireCap();
+    const overPreviousCapBytes = Buffer.byteLength(overPreviousCap);
+    const overPreviousCapResult = await request(
+      port,
+      "/v1/logs",
+      overPreviousCap,
+      { "x-plimsoll-source": "codex" },
+    );
+    check(
+      "identity_encoded_body_over_previous_2mib_cap_is_admitted_inside_deadline",
+      overPreviousCapBytes > PREVIOUS_WIRE_CAP_BYTES &&
+        overPreviousCapBytes <= LOCAL_HTTP_LIMITS.compressedBodyBytes &&
+        overPreviousCapResult.status === 202 &&
+        overPreviousCapResult.body.accepted === true &&
+        overPreviousCapResult.body.recordCount === CODEX_OTEL_EXPORT_BATCH_RECORDS &&
+        overPreviousCapResult.elapsedMs < LOCAL_HTTP_LIMITS.requestDeadlineMs,
+      {
+        bodyBytes: overPreviousCapBytes,
+        previousCap: PREVIOUS_WIRE_CAP_BYTES,
+        newCap: LOCAL_HTTP_LIMITS.compressedBodyBytes,
+        status: overPreviousCapResult.status,
+        reason: overPreviousCapResult.body.reason,
+        recordCount: overPreviousCapResult.body.recordCount,
+        elapsedMs: Math.round(overPreviousCapResult.elapsedMs * 100) / 100,
       },
     );
 

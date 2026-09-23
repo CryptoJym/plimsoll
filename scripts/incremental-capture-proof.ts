@@ -16,10 +16,20 @@ import path from "node:path";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import {
+  AUTOMATIC_DISCOVERY_ENTRY_CAP,
+  AUTOMATIC_DISCOVERY_ENTRY_CAP_MAX,
+  AUTOMATIC_DISCOVERY_ENTRIES_PER_ROOT,
+  AUTOMATIC_DISCOVERY_WALL_MS,
+  automaticDiscoveryEntryAllowance,
+  loadCaptureSweepResume,
+  nextCaptureSweepOrigin,
   beginAutomaticCaptureBaseline,
   classifyCaptureBaselineFile,
   completeAutomaticCaptureBaseline,
 } from "../packages/collector-cli/src/capture-baseline";
+import { CaptureWorkBudget } from "../packages/collector-cli/src/capture-work-budget";
+import { IncrementalJsonlDiscovery } from "../packages/collector-cli/src/incremental-jsonl-discovery";
+import type { CaptureRoot } from "../packages/collector-cli/src/capture-root-inventory";
 import {
   historyCoverageStatus,
   recordExplicitFullHistoryCoverage,
@@ -1347,6 +1357,193 @@ function proveNanosecondGenerationIdentity() {
   }
 }
 
+/** Bead eco-6hoxj.73.1: many-root sweeps converge in bounded cadences. */
+async function proveManyRootSweepConvergence() {
+  const MANY_ROOTS = 22;
+  const FILES_PER_ROOT = 20;
+  const MAX_CADENCES = 24;
+  const tree = fs.realpathSync(fs.mkdtempSync(path.join(tempDir, "many-root-")));
+  const roots: CaptureRoot[] = Array.from({ length: MANY_ROOTS }, (_, index) => {
+    const directory = path.join(tree, `root-${String(index).padStart(2, "0")}`);
+    fs.mkdirSync(directory, { recursive: true });
+    const resolved = fs.realpathSync(directory);
+    for (let file = 0; file < FILES_PER_ROOT; file += 1) {
+      fs.writeFileSync(path.join(resolved, `session-${file}.jsonl`), "{}\n");
+    }
+    return {
+      source: "claude_code" as const,
+      rootId: `root-${index}`,
+      profileId: `profile-${index}`,
+      directory: resolved,
+      installationEpochId: "epoch-many-root",
+    };
+  });
+
+  const sized = automaticDiscoveryEntryAllowance({ rootCount: MANY_ROOTS });
+  const singleRoot = automaticDiscoveryEntryAllowance({ rootCount: 1 });
+  const observed = automaticDiscoveryEntryAllowance({
+    rootCount: 1,
+    observedEntries: 8_000,
+  });
+  assert.equal(singleRoot, AUTOMATIC_DISCOVERY_ENTRY_CAP, "one root keeps the 256-entry floor");
+  assert.ok(sized > AUTOMATIC_DISCOVERY_ENTRY_CAP, "22 roots raise the entry ceiling");
+  assert.equal(sized, MANY_ROOTS * AUTOMATIC_DISCOVERY_ENTRIES_PER_ROOT);
+  assert.ok(observed > AUTOMATIC_DISCOVERY_ENTRY_CAP);
+  assert.ok(observed <= AUTOMATIC_DISCOVERY_ENTRY_CAP_MAX);
+  // Negative control: the pre-.73.1 constant cannot finish this tree in one
+  // collect call, because 22×20 files plus their directories exceed 256.
+  const constantCapDiscovery = new IncrementalJsonlDiscovery(
+    roots.map((root) => root.directory),
+    { recursive: true, matches: (name) => name.endsWith(".jsonl"), maxEntries: 100_000 },
+  );
+  const constantChunk = await constantCapDiscovery.collect(new CaptureWorkBudget(), {
+    maxFiles: 1_024,
+    maxEntries: AUTOMATIC_DISCOVERY_ENTRY_CAP,
+    maxWallMs: 100,
+  });
+  assert.equal(constantChunk.done, false, "negative control: 256-entry cap does not finish 22 roots");
+  constantCapDiscovery.close();
+  const sizedDiscovery = new IncrementalJsonlDiscovery(
+    roots.map((root) => root.directory),
+    { recursive: true, matches: (name) => name.endsWith(".jsonl"), maxEntries: 100_000 },
+  );
+  const sizedChunk = await sizedDiscovery.collect(new CaptureWorkBudget(), {
+    maxFiles: 1_024,
+    maxEntries: sized,
+    maxWallMs: 100,
+  });
+  assert.equal(sizedChunk.done, true, "sized allowance finishes 22 roots in one collect when the wall allows");
+  sizedDiscovery.close();
+
+  const originDiscovery = new IncrementalJsonlDiscovery(
+    roots.map((root) => root.directory),
+    {
+      recursive: true,
+      matches: (name) => name.endsWith(".jsonl"),
+      maxEntries: 100_000,
+      startRootIndex: 0,
+    },
+  );
+  while (!originDiscovery.progress().finished) {
+    await originDiscovery.collect(new CaptureWorkBudget(), { maxFiles: 1_024, maxEntries: sized, maxWallMs: 100 });
+  }
+  const completed = originDiscovery.progress();
+  const nextOrigin = nextCaptureSweepOrigin(completed, 1);
+  assert.equal(completed.origin, 0);
+  assert.ok(nextOrigin !== 0, "a completed sweep does not restart the next generation at root 0");
+  assert.equal(nextOrigin, 1);
+  originDiscovery.close();
+
+  const ledger = new LocalEventBuffer(path.join(tree, "ledger.sqlite"));
+  const tailer = new TranscriptTailer(ledger, roots[0]!.directory, undefined, roots);
+  const ticks: Array<{
+    sweepComplete: boolean;
+    converging: boolean;
+    rootsStarted: number;
+    entriesThisSweep: number;
+    entryBudgetPerTick: number;
+    wallBudgetMsPerTick: number;
+    pendingFiles: number;
+    elapsedWallMs: number;
+    maxWallMs: number;
+  }> = [];
+  let completeAt = -1;
+  for (let cadence = 1; cadence <= MAX_CADENCES; cadence += 1) {
+    const started = performance.now();
+    const result = await tailer.scan({
+      scope: "recent",
+      automatic: { phase: "capture", budget: new CaptureWorkBudget() },
+    });
+    const scan = result.activity.scan!;
+    ticks.push({
+      sweepComplete: scan.sweepComplete,
+      converging: scan.converging,
+      rootsStarted: scan.rootsStarted,
+      entriesThisSweep: scan.entriesThisSweep,
+      entryBudgetPerTick: scan.entryBudgetPerTick,
+      wallBudgetMsPerTick: scan.wallBudgetMsPerTick,
+      pendingFiles: scan.pendingFiles,
+      elapsedWallMs: result.automaticBudget?.elapsedWallMs ?? performance.now() - started,
+      maxWallMs: result.automaticBudget?.maxWallMs ?? 0,
+    });
+    if (scan.sweepComplete && completeAt < 0) completeAt = cadence;
+    if (scan.sweepComplete && scan.pendingFiles === 0) break;
+  }
+  const finished = ticks.find((tick) => tick.sweepComplete);
+  assert.ok(finished, `22-root sweep must reach sweepComplete within ${MAX_CADENCES} cadences`);
+  assert.ok(
+    completeAt > 0 && completeAt <= MAX_CADENCES,
+    `completeAt=${completeAt} cadences=${ticks.length}`,
+  );
+  assert.equal(finished.wallBudgetMsPerTick, AUTOMATIC_DISCOVERY_WALL_MS);
+  assert.ok(finished.entryBudgetPerTick >= sized);
+  assert.ok(
+    ticks.every((tick) => tick.maxWallMs === 200 && tick.elapsedWallMs < 2_000),
+    "fairness wall still bounds each cadence",
+  );
+  assert.ok(finished.rootsStarted === MANY_ROOTS || finished.sweepComplete);
+
+  // After the completed generation is retired, the next origin is carried.
+  const resume = loadCaptureSweepResume(ledger.database, "claude_code");
+  assert.ok(resume, "completed sweep persists resume state");
+  assert.ok(resume.rootIndex !== 0, "next generation does not restart at root 0");
+  tailer.close();
+
+  // Limited sweep: resume at the carried cursor-root, not 0.
+  const limitTree = fs.realpathSync(fs.mkdtempSync(path.join(tempDir, "limit-resume-")));
+  const limitRoots: CaptureRoot[] = Array.from({ length: 8 }, (_, index) => {
+    const directory = path.join(limitTree, `root-${String(index).padStart(2, "0")}`);
+    fs.mkdirSync(directory, { recursive: true });
+    const resolved = fs.realpathSync(directory);
+    for (let file = 0; file < 12; file += 1) {
+      fs.writeFileSync(path.join(resolved, `session-${file}.jsonl`), "{}\n");
+    }
+    return {
+      source: "claude_code" as const,
+      rootId: `limit-${index}`,
+      profileId: `limit-${index}`,
+      directory: resolved,
+      installationEpochId: "epoch-limit",
+    };
+  });
+  const limitLedger = new LocalEventBuffer(path.join(limitTree, "ledger.sqlite"));
+  const limitTailer = new TranscriptTailer(
+    limitLedger, limitRoots[0]!.directory, undefined, limitRoots);
+  const LIMIT = 18;
+  let limitedScan = null as Awaited<ReturnType<typeof limitTailer.scan>>["activity"]["scan"] | null;
+  for (let cadence = 1; cadence <= 16; cadence += 1) {
+    const result = await limitTailer.scan({
+      scope: "recent",
+      discoveryLimit: LIMIT,
+      automatic: { phase: "capture", budget: new CaptureWorkBudget() },
+    });
+    limitedScan = result.activity.scan!;
+    if (limitedScan.limitReached && limitedScan.pendingFiles === 0) break;
+  }
+  assert.ok(limitedScan?.limitReached, "lifetime limit fires on the 8-root tree");
+  assert.equal(limitedScan?.sweepComplete, false);
+  const limitedResume = loadCaptureSweepResume(limitLedger.database, "claude_code");
+  assert.ok(
+    limitedResume && limitedResume.rootIndex > 0,
+    `limitedResume=${JSON.stringify(limitedResume)} sweepComplete=${limitedScan?.sweepComplete}`,
+  );
+  limitTailer.close();
+  limitLedger.close();
+  ledger.close();
+
+  return {
+    manyRoots: MANY_ROOTS,
+    filesPerRoot: FILES_PER_ROOT,
+    completeAt,
+    cadences: ticks.length,
+    sizedAllowance: sized,
+    nextOrigin,
+    resumeRootIndex: resume!.rootIndex,
+    limitedResumeRootIndex: limitedResume!.rootIndex,
+    wallBudgetMsPerTick: AUTOMATIC_DISCOVERY_WALL_MS,
+  };
+}
+
 async function main() {
   try {
     const rollout = await proveRolloutTailing();
@@ -1356,6 +1553,7 @@ async function main() {
     const deferredRepoContextOccurrences = await proveDeferredRepoContextOccurrences();
     const resolvedTranscriptConflict = await proveResolvedTranscriptConflictIsTerminal();
     const nanosecondGenerationIdentity = proveNanosecondGenerationIdentity();
+    const manyRootSweepConvergence = await proveManyRootSweepConvergence();
 
     const persistedEvents = JSON.stringify(
       buffer.database.prepare(`select payload_json from buffered_events`).all(),
@@ -1417,6 +1615,7 @@ async function main() {
           deferredRepoContextOccurrences,
           resolvedTranscriptConflict,
           nanosecondGenerationIdentity,
+          manyRootSweepConvergence,
           parseFailureDurability,
           privacy: {
             rawContentPersisted: false,

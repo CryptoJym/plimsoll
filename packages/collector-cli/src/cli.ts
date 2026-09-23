@@ -337,7 +337,8 @@ Commands:
   export                Print buffered events as JSON
   forward-hook SOURCE   Read hook JSON from stdin and append it without requiring the receiver
   forward-hook-http SOURCE
-                        Forward stdin to the authenticated loopback hook boundary without argv secrets
+                        Forward stdin to the authenticated loopback hook boundary without argv secrets.
+                        Mints a stable event id before the first attempt so a spool replay cannot double-count.
   self-test-hook SOURCE Emit one synthetic hook event into the local buffer
   generate-config TOOL  Print Claude Code, Codex, Gemini CLI, or Grok config for metadata collection
   setup                 APPLY Claude Code, Gemini CLI, Grok, and Codex telemetry independently

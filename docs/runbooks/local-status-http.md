@@ -69,9 +69,15 @@ python3 scripts/native-status-read.py --liveness-only --port 48271
 plimsoll status
 plimsoll doctor --read-only --json
 python3 scripts/native-status-read.py --port 48271
+
+# Sweep-boundary capture-health rule (eco-6hoxj.155; no collector required)
+python3 scripts/native-status-read.py --self-test
 ```
 
 Default collector port is `48271`. Override with `--port` or `PLIMSOLL_PORT`.
+
+A `0 this sweep, N this tick` capture-health sample is a transient unless it
+persists across two reads at least 10 s apart.
 
 ## Proof
 

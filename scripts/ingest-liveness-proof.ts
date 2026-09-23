@@ -36,9 +36,10 @@ import { createCollectorServer } from "../packages/collector-cli/src/server";
 import { aiInteractionEventSchema } from "../packages/shared/src/index";
 
 const OLD_WIRE_CAP_BYTES = 256 * 1024;
+const PREVIOUS_WIRE_CAP_BYTES = 2 * 1024 * 1024;
 // This proof owns the compressed-body availability boundary, not the OTLP
 // export-batch ceiling. Keep its high-entropy payload inside the independent
-// 2 MiB decoded/wire caps as the record ceiling evolves.
+// decoded/wire caps as the record ceiling evolves.
 const STORM_BATCH_RECORDS = 128;
 // Tolerate running against pre-fix sources (the exported bound is absent).
 const STALENESS_BOUND_MS = (SNAPSHOT_MAX_STALENESS_MS as number | undefined) ?? 15 * 60_000;
@@ -346,6 +347,28 @@ async function main() {
       identityAccepted.status === 202 && identityAccepted.body.accepted === true &&
         identityAccepted.body.events === 96 && afterIdentity.count === 96,
       { status: identityAccepted.status, reason: identityAccepted.body.reason, claudeCodeEvents: afterIdentity.count },
+    );
+
+    // A6. Identity JSON over the previous 2 MiB wire cap (the remaining
+    // Studio0 compressed_body_too_large class after #196) must now ingest.
+    const overTwoMib = otlpLogBatch(512, 4_096, false);
+    assert.ok(
+      overTwoMib.length > PREVIOUS_WIRE_CAP_BYTES &&
+        overTwoMib.length <= LOCAL_HTTP_LIMITS.compressedBodyBytes,
+    );
+    const overTwoMibAccepted = await request(port, "/v1/logs", overTwoMib, {
+      "x-plimsoll-source": "codex",
+    });
+    check(
+      "identity_body_over_previous_2mib_cap_accepted",
+      overTwoMibAccepted.status === 202 && overTwoMibAccepted.body.accepted === true &&
+        overTwoMibAccepted.body.recordCount === 512,
+      {
+        status: overTwoMibAccepted.status,
+        reason: overTwoMibAccepted.body.reason,
+        bodyBytes: overTwoMib.length,
+        previousCap: PREVIOUS_WIRE_CAP_BYTES,
+      },
     );
 
     // ---------- Part B: summary liveness ----------
