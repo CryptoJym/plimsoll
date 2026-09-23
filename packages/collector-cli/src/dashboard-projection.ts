@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { gzipSync, gunzipSync } from "node:zlib";
 
 import type Database from "better-sqlite3";
@@ -20,6 +21,7 @@ import {
   type FinanceSourceCoverageRow,
 } from "./history-coverage";
 import { projectionValidity, STATUS_MAX_AGE_MS } from "./projection-validity";
+import type { LedgerOpenTimingSink } from "./open-timing";
 
 /** The version of the derived projection schema this binary writes and reads.
  *
@@ -666,15 +668,31 @@ export class DashboardProjectionStore {
 
   constructor(
     private readonly db: Database.Database,
-    options: { newLedger?: boolean; now?: Date } = {},
+    options: { newLedger?: boolean; now?: Date; onOpenStep?: LedgerOpenTimingSink } = {},
   ) {
+    const openStarted = performance.now();
+    let stepStarted = openStarted;
+    const markOpenStep = (step: string) => {
+      if (!options.onOpenStep) return;
+      const finished = performance.now();
+      options.onOpenStep({
+        step,
+        durationMs: finished - stepStarted,
+        elapsedMs: finished - openStarted,
+      });
+      stepStarted = finished;
+    };
     const now = options.now ?? new Date(Date.now());
     ensureFinanceProvenanceSchema(this.db);
-    this.createSchema(now, Boolean(options.newLedger));
-    if (options.newLedger) this.publishSnapshots(now);
+    markOpenStep("projection.finance_schema");
+    this.createSchema(now, Boolean(options.newLedger), markOpenStep);
+    if (options.newLedger) {
+      this.publishSnapshots(now);
+      markOpenStep("projection.initial_snapshots");
+    }
   }
 
-  private createSchema(now: Date, newLedger: boolean) {
+  private createSchema(now: Date, newLedger: boolean, markOpenStep: (step: string) => void) {
     const storedSchemaVersion = this.readStoredSchemaVersion();
     this.db.exec(`
       create table if not exists dashboard_projection_control (
@@ -1060,7 +1078,9 @@ export class DashboardProjectionStore {
         scan_json text
       );
     `);
+    markOpenStep("projection.core_schema_and_indexes");
     this.ensureProjectionSchemaColumns();
+    markOpenStep("projection.column_migrations");
     this.db.exec(`
       create index if not exists idx_dashboard_facts_finance_scope
         on dashboard_event_facts (workspace_id, installation_epoch_id, observed_at_ms, projection_id);
@@ -1071,6 +1091,7 @@ export class DashboardProjectionStore {
         where workspace_id is null or raw_generation is null
           or length(raw_generation)=0 or observed_at_ms is null;
     `);
+    markOpenStep("projection.finance_indexes");
     this.db.prepare(`insert or ignore into dashboard_lifetime_totals (singleton) values (1)`).run();
 
     this.db.prepare(
@@ -1105,6 +1126,7 @@ export class DashboardProjectionStore {
         this.db.prepare(`insert or ignore into dashboard_post_highwater_window (days) values (?)`).run(days);
       }
     }
+    markOpenStep("projection.control_rows");
 
     const deletedPrivacyEligible = terminalPrivacyEligibilitySql(this.db, "old");
     const hasRetentionReceipts = Boolean(this.db.prepare(
@@ -1364,8 +1386,14 @@ export class DashboardProjectionStore {
           end`);
       }
     }
-    if (this.projectionOpenRefused()) this.stampOpenRefusal();
-    else this.ensureCompactSummaryMigration(now);
+    markOpenStep("projection.triggers");
+    if (this.projectionOpenRefused()) {
+      this.stampOpenRefusal();
+      markOpenStep("projection.open_refusal");
+    } else {
+      this.ensureCompactSummaryMigration(now);
+      markOpenStep("projection.compact_summary_migration");
+    }
   }
 
   private projectionOpenRefused() {
@@ -1501,17 +1529,48 @@ export class DashboardProjectionStore {
     // so each session carries its own last token-event time. Rows written before
     // the column exists keep whatever the facts still hold; a session whose facts
     // have aged out stays null and falls back to its any-kind end, as before.
-    for (const table of ["dashboard_session_repair_source", "dashboard_session_source_window"]) {
+    const sessionTablesMissingTokenTime = [
+      "dashboard_session_repair_source",
+      "dashboard_session_source_window",
+    ].filter((table) => {
       const columns = new Set(
         (this.db.pragma(`table_info(${table})`) as Array<{ name: string }>).map((row) => row.name),
       );
-      if (columns.has("last_token_event_at")) continue;
-      this.db.exec(`alter table ${table} add column last_token_event_at text`);
-      this.db.exec(`update ${table} set last_token_event_at=(
-        select max(f.observed_at) from dashboard_event_facts f
-        where f.session_hash=${table}.session_hash and f.source=${table}.source
-          and f.input_tokens is not null) where token_events>0`);
-    }
+      return !columns.has("last_token_event_at");
+    });
+    if (sessionTablesMissingTokenTime.length === 0) return;
+
+    this.db.transaction(() => {
+      for (const table of sessionTablesMissingTokenTime) {
+        this.db.exec(`alter table ${table} add column last_token_event_at text`);
+      }
+      this.db.exec(`create temp table dashboard_token_event_max (
+        session_hash text not null,
+        source text not null,
+        last_token_event_at text not null,
+        primary key (session_hash,source)
+      ) without rowid`);
+      try {
+        // Read the partial token index once. Target rows then seek this small
+        // session/source aggregate instead of rescanning one source's facts.
+        this.db.exec(`insert into dashboard_token_event_max
+          (session_hash,source,last_token_event_at)
+          select session_hash,source,max(observed_at)
+          from dashboard_event_facts indexed by idx_dashboard_facts_source_token
+          where input_tokens is not null and session_hash is not null
+          group by session_hash,source`);
+        for (const table of sessionTablesMissingTokenTime) {
+          this.db.exec(`update ${table} set last_token_event_at=(
+            select dashboard_token_event_max.last_token_event_at
+            from dashboard_token_event_max
+            where dashboard_token_event_max.session_hash=${table}.session_hash
+              and dashboard_token_event_max.source=${table}.source
+          ) where token_events>0`);
+        }
+      } finally {
+        this.db.exec(`drop table temp.dashboard_token_event_max`);
+      }
+    }).immediate();
   }
 
   private ensureCompactSummaryMigration(now:Date){

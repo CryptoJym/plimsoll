@@ -258,6 +258,12 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dashboard
 
+      - name: Prove projection convergence and bounded token-time migration
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:projection-convergence
+          pnpm proof:last-token-event-backfill
+
       - name: Prove Jev receipt projection and authenticated access
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:jev-analysis

@@ -50,6 +50,7 @@ const pidCleanupAttemptReceipt = (result: CollectorPidCleanupResult | null) =>
       };
 
 import { LocalEventBuffer } from "./buffer";
+import type { LedgerOpenTimingSink } from "./open-timing";
 import {
   collectorHomeIdentityHash,
   defaultCollectorHome,
@@ -496,13 +497,17 @@ function openBuffer(
   config: CollectorConfig,
   deliveryOverride = false,
   databaseBusyTimeoutMs = 5_000,
+  diagnostics: {
+    databasePath?: string;
+    onOpenStep?: LedgerOpenTimingSink;
+  } = {},
 ) {
   ensureCollectorHome();
   const identity = loadOrCreateDeviceIdentity(undefined, {
     seed: { deviceId: config.deviceId, keyId: config.keyId },
   });
   recordDeviceSeen();
-  return new LocalEventBuffer(collectorBufferPath(), {
+  return new LocalEventBuffer(diagnostics.databasePath ?? collectorBufferPath(), {
     workspaceId: config.tenantId,
     deviceId: identity.deviceId,
     delivery: {
@@ -510,6 +515,7 @@ function openBuffer(
       limits: config.delivery,
     },
     databaseBusyTimeoutMs,
+    onOpenStep: diagnostics.onOpenStep,
   });
 }
 
@@ -2018,6 +2024,81 @@ function readInstallationEpochId(roots: readonly CaptureRoot[]): string | null {
 async function main() {
   if (command === "help" || command === "--help" || command === "-h") {
     printHelp();
+    return;
+  }
+
+  if (command === "__rehearse_ledger_open") {
+    if (process.env.PLIMSOLL_REHEARSAL !== "copied-ledger-v1") {
+      throw new Error("copied-ledger rehearsal must be launched through scripts/rehearse-ledger-open.ts");
+    }
+    const requestedLedger = optionValue("--ledger");
+    if (!requestedLedger || !path.isAbsolute(requestedLedger)) {
+      throw new Error("copied-ledger rehearsal requires an absolute --ledger path");
+    }
+    const ledgerPath = fs.realpathSync(requestedLedger);
+    const ledgerStat = fs.lstatSync(ledgerPath);
+    if (!ledgerStat.isFile() || ledgerStat.isSymbolicLink()) {
+      throw new Error("copied-ledger rehearsal requires a regular, non-symlink ledger file");
+    }
+    const rehearsalHome = ensureCollectorHome();
+    if (rehearsalHome !== resolveCollectorHome().home) {
+      throw new Error("copied-ledger rehearsal home resolution drifted");
+    }
+    // A copied ledger retains its workspace/device binding, while a deliberately
+    // empty sandbox HOME has no identity yet. Seed that non-secret identity from
+    // the copy so openBuffer takes the same bound-ledger path as the daemon.
+    // This read-only probe is outside the measured open and never touches the
+    // source host's config or identity files.
+    const bindingDatabase = new Database(ledgerPath, { readonly: true, fileMustExist: true });
+    let rehearsalBinding: { workspaceId: string; deviceId: string | null } | undefined;
+    try {
+      const hasBindingTable = bindingDatabase.prepare(
+        `select 1 from sqlite_master where type='table' and name='collector_workspace_binding'`,
+      ).get();
+      if (hasBindingTable) {
+        const bindingColumns = new Set(
+          (bindingDatabase.pragma("table_info(collector_workspace_binding)") as Array<{ name: string }>)
+            .map((column) => column.name),
+        );
+        rehearsalBinding = bindingDatabase.prepare(
+          `select current_workspace_id as workspaceId,
+             ${bindingColumns.has("current_device_id") ? "current_device_id" : "null"} as deviceId
+           from collector_workspace_binding where singleton=1`,
+        ).get() as typeof rehearsalBinding;
+      }
+    } finally {
+      bindingDatabase.close();
+    }
+    const rehearsalConfig = collectorConfigSchema.parse({
+      ...(rehearsalBinding?.workspaceId ? { tenantId: rehearsalBinding.workspaceId } : {}),
+      ...(rehearsalBinding?.deviceId ? { deviceId: rehearsalBinding.deviceId } : {}),
+    });
+    const timings: Array<Parameters<LedgerOpenTimingSink>[0]> = [];
+    const started = performance.now();
+    let buffer: LocalEventBuffer | null = null;
+    try {
+      buffer = openBuffer(rehearsalConfig, false, 0, {
+        databasePath: ledgerPath,
+        onOpenStep: (step) => {
+          timings.push(step);
+          process.stdout.write(`${JSON.stringify({
+            status: "open_step",
+            step: step.step,
+            durationMs: Number(step.durationMs.toFixed(3)),
+            elapsedMs: Number(step.elapsedMs.toFixed(3)),
+          })}\n`);
+        },
+      });
+    } finally {
+      buffer?.close();
+    }
+    process.stdout.write(`${JSON.stringify({
+      status: "open_complete",
+      collector: "packaged",
+      ledgerBytes: ledgerStat.size,
+      stepCount: timings.length,
+      durationMs: Number((performance.now() - started).toFixed(3)),
+    })}\n`);
     return;
   }
 
