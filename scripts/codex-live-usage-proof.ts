@@ -317,7 +317,17 @@ for(const mode of ["same","account-missing","work-missing","account-changed","wo
   assert.equal(m.liveAttributionState,mode==="same"?"qualified":"unresolved");
   assert.equal(Boolean(m.captureAccountHash),!["account-missing","account-changed","zero-time"].includes(mode));
   assert.equal(Boolean(m.workItemId),!["work-missing","work-changed","interior-overlap","zero-time"].includes(mode));
-  assert.equal(e.projectKey,undefined);assert.equal(e.costUsd,undefined);assert.equal(m.liveFinanceEligibility,"unqualified_observer");
+  assert.equal(e.projectKey,m.dispatchProjectKey);assert.equal(e.costUsd,undefined);assert.equal(m.liveFinanceEligibility,"unqualified_observer");
+  const stored = f.buffer.database.prepare(
+    "select project_key as projectKey, payload_json as payloadJson from buffered_events order by rowid limit 1",
+  ).get() as { projectKey: string | null; payloadJson: string };
+  const outbox = f.buffer.database.prepare(
+    "select base_envelope_json as baseEnvelopeJson from upload_outbox order by rowid limit 1",
+  ).get() as { baseEnvelopeJson: string };
+  const expectedProjectKey = m.dispatchProjectKey ?? null;
+  assert.equal(stored.projectKey, expectedProjectKey);
+  assert.equal(JSON.parse(stored.payloadJson).projectKey, expectedProjectKey ?? undefined);
+  assert.equal(JSON.parse(outbox.baseEnvelopeJson).event.projectKey, expectedProjectKey ?? undefined);
   assert.equal(f.checkpoint().seq,2);
 });
 await test("bounded_metadata_only_diagnostics_and_private_hash_registry",async f=>{
