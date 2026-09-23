@@ -377,7 +377,16 @@ export async function uploadBufferedEvents(
 
   await storage(() => buffer.delivery.configure({ enabled: true, limits: config.delivery }));
   const nowFn = options.now ?? (() => new Date());
-  await storage(() => buffer.delivery.migrateLegacy({ now: nowFn() }));
+  // One daemon upload cycle may run 20 batches while the HTTP listener is
+  // serving OTLP. Keep each legacy migration writer turn well below the
+  // listener's 750 ms busy retry budget; the cursor resumes next batch.
+  await storage(() => buffer.delivery.migrateLegacy({
+    now: nowFn(),
+    maxRows: Math.min(config.delivery.migrationBatchRows, 256),
+    maxBytes: Math.min(config.delivery.migrationBatchBytes,
+      Math.max(config.delivery.maxItemBytes, 1_048_576)),
+    maxWriterMs: 100,
+  }));
   const appVersion = options.appVersion ?? PLIMSOLL_VERSION;
   const contractHash = uploadContractHash(config, url, appVersion);
   const outputLimit = Math.max(

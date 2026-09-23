@@ -1855,6 +1855,11 @@ export function createCollectorServer(
         response.writeHead(failure.status, {
           connection: "close",
           "content-type": "application/json",
+          // OTLP/HTTP treats 503 as retryable; tell exporters when to retry a
+          // transient writer lock rather than forcing an immediate hot loop.
+          ...(failure.status === 503 && failure.reason === "storage_busy_retry"
+            ? { "retry-after": "1" }
+            : {}),
         });
         response.end(JSON.stringify(rejection));
       } else {

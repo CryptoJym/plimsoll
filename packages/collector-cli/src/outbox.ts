@@ -1119,13 +1119,20 @@ export class DeliveryOutbox {
       }).changes;
   }
 
-  migrateLegacy(options: { maxRows?: number; maxBytes?: number; now?: Date } = {}) {
+  migrateLegacy(options: { maxRows?: number; maxBytes?: number; maxWriterMs?: number; now?: Date } = {}) {
     if (!this.enabled) return { visited: 0, enqueued: 0, dead: 0, skippedUploaded: 0, quarantinedEvidence: 0, complete: false, paused: null };
     const now = options.now ?? new Date();
     const nowIso = now.toISOString();
     const maxRows = Math.max(1, Math.min(Math.trunc(options.maxRows ?? this.limits.migrationBatchRows), 5_000));
+    // The daemon bounds each writer turn below the OTLP 750 ms retry window.
+    // Start the migration turn's clock after the candidate read: a cold large
+    // ledger must not spend the whole writer budget on read-only work.
+    const writerBudgetMs = options.maxWriterMs === undefined
+      ? undefined
+      : Math.max(1, Math.min(Math.trunc(options.maxWriterMs), 1_000));
     const lineageDead = this.db.transaction(() =>
-      this.quarantineUnprovenLineage(Math.min(maxRows, 500), nowIso),
+      this.quarantineUnprovenLineage(Math.min(maxRows, 500), nowIso,
+        writerBudgetMs === undefined ? undefined : performance.now() + writerBudgetMs),
     )();
     const pressure = this.status(now).pressure;
     if (pressure.degraded) {
@@ -1171,6 +1178,7 @@ export class DeliveryOutbox {
     let quarantinedEvidence = 0;
     let cursor = control.cursorRowid;
     let paused: "slice_budget_too_small" | null = null;
+    let writerBudgetExhausted = false;
     const readRaw = this.db.prepare(
       `select rowid as rawRowid, id as rawId, created_at as createdAt,
          data_mode as dataMode,
@@ -1189,7 +1197,12 @@ export class DeliveryOutbox {
        where rowid = @rawRowid and privacy_generation is null`,
     );
     const run = this.db.transaction(() => {
+      const writerDeadline = writerBudgetMs === undefined ? undefined : performance.now() + writerBudgetMs;
       for (const candidate of rows) {
+        if (writerDeadline !== undefined && performance.now() >= writerDeadline) {
+          writerBudgetExhausted = true;
+          break;
+        }
         visited += 1;
         cursor = candidate.rawRowid;
         assignLegacyGeneration.run({
@@ -1266,7 +1279,7 @@ export class DeliveryOutbox {
         enqueued += result.enqueued;
         dead += result.dead;
       }
-      const complete = paused === null && rows.length < maxRows && visited === rows.length;
+      const complete = !writerBudgetExhausted && paused === null && rows.length < maxRows && visited === rows.length;
       this.db
         .prepare(
           `update upload_control set
@@ -2139,7 +2152,7 @@ export class DeliveryOutbox {
     return dead;
   }
 
-  private quarantineUnprovenLineage(maxRows: number, terminalAt: string) {
+  private quarantineUnprovenLineage(maxRows: number, terminalAt: string, writerDeadline?: number) {
     const rows = this.db
       .prepare(
         `select delivery_id as deliveryId, raw_rowid as rawRowid,
@@ -2153,6 +2166,7 @@ export class DeliveryOutbox {
       .all(maxRows) as RawLineageSnapshot[];
     let dead = 0;
     for (const row of rows) {
+      if (writerDeadline !== undefined && performance.now() >= writerDeadline) break;
       dead += this.deadActive(
         row.deliveryId,
         this.authoritativePrivacyReason(row) ?? "local_privacy_violation",
