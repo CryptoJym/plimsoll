@@ -248,7 +248,9 @@ ledger?*
 - **red** — local activity is demonstrably *not* reaching the ledger.
 - **no_events** — the source is configured and enumerated, and has captured
   nothing yet. It is never absent and never reads as healthy, and it does not
-  make the overall label amber.
+  make the overall label amber. When every configured source is `no_events`,
+  overall is `no_events` too, so a lamp or other overall-only consumer cannot
+  read the host as healthy.
 
 The status snapshot's session count is projection evidence, not a fresh raw-ledger
 count. `tokenSessionsToday` counts projected token-bearing sessions whose latest
