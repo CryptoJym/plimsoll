@@ -3074,6 +3074,13 @@ export class DashboardProjectionStore {
     if (parity.backfillComplete && !parity.parityComplete && parity.parityCursor > 0) return 0;
     let visited = 0;
     let rollback = false;
+    // Expiry and session repair share a cadence. Once a repair job has been
+    // created with the active expiry target, deleting another pre-target fact
+    // cannot change the job's input: repairSessionChunk deliberately scans
+    // from that target forward. Do not restart its cursor on every expiry
+    // slice; restart only when the job still has an older cutoff (or has not
+    // been created yet).
+    const expiryRepairRestart = new Map<string, boolean>();
     for (const days of INTERNAL_WINDOWS) {
       if (visited >= BACKFILL_ROWS) break;
       const row = this.db.prepare(
@@ -3129,7 +3136,19 @@ export class DashboardProjectionStore {
         const table=reference.backfillHighWater!==null?(fact.rawRowid>reference.backfillHighWater
           ?"dashboard_post_highwater_window":reference.parityCursor>=fact.rawRowid?"dashboard_parity_window":null):null;
         if(table&&DASHBOARD_WINDOWS.includes(days as typeof DASHBOARD_WINDOWS[number]))this.applyReferenceDelta(table,days,fact,-1);
-        if (fact.sessionHash) this.markSessionDirty(days, fact.sessionHash, "expiry", now);
+        if (fact.sessionHash) {
+          const cacheKey = `${days}\u0000${fact.sessionHash}`;
+          let restart = expiryRepairRestart.get(cacheKey);
+          if (restart === undefined) {
+            const job = this.db.prepare(
+              `select cutoff_at as cutoffAt from dashboard_session_repair_jobs
+               where days=? and session_hash=?`,
+            ).get(days, fact.sessionHash) as { cutoffAt: string} | undefined;
+            restart = !job || job.cutoffAt !== activeTarget;
+            expiryRepairRestart.set(cacheKey, restart);
+          }
+          this.markSessionDirty(days, fact.sessionHash, "expiry", now, restart);
+        }
       }
       visited += expired.length;
       const factsDone=expired.length<factLimit;

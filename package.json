@@ -67,6 +67,7 @@
     "proof:resource": "tsx scripts/resource-proof/index.ts",
     "proof:resource-finalization": "tsx scripts/resource-proof/finalization-proof.ts",
     "proof:dashboard": "tsx scripts/dashboard-projection-proof.ts",
+    "proof:projection-convergence": "tsx scripts/projection-convergence-proof.ts",
     "proof:jev-analysis": "tsx scripts/jev-analysis-proof.ts",
     "proof:usage-dedupe": "tsx scripts/usage-dedupe-proof.ts",
     "proof:join-isolation": "tsx scripts/join-isolation-proof.ts",
