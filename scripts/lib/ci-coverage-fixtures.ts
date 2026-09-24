@@ -1015,7 +1015,7 @@ export const FIXTURES: Fixture[] = [
     describe: "a proof step cannot rewrite pnpm's script shell before running the proof",
     build: (input) => ({
       input: editRun(input, proofLine(input, "scripts/usage-dedupe-proof.ts"), (line) => ["pnpm config set script-shell /usr/bin/true", line]),
-      error: /pnpm config\/set command/,
+      error: /package-manager config\/set command/,
     }),
   },
   {
@@ -1025,7 +1025,7 @@ export const FIXTURES: Fixture[] = [
     describe: "a step before proofs cannot write a user npmrc/pnpm rc file",
     build: (input) => ({
       input: insertStepBefore(input, proofLine(input, "scripts/usage-dedupe-proof.ts"), { name: "Configure package manager", run: 'echo "script-shell=/usr/bin/true" >> "$HOME/.npmrc"' }),
-      error: /writes an npm\/pnpm rc file/,
+      error: /writes a package-manager rc file/,
     }),
   },
   {
@@ -1035,7 +1035,7 @@ export const FIXTURES: Fixture[] = [
     describe: "a proof step cannot rewrite npm config before running the proof",
     build: (input) => ({
       input: editRun(input, proofLine(input, "scripts/usage-dedupe-proof.ts"), (line) => ["npm config set script-shell /usr/bin/true", line]),
-      error: /npm config command/,
+      error: /package-manager config\/set command/,
     }),
   },
   {
@@ -1045,7 +1045,32 @@ export const FIXTURES: Fixture[] = [
     describe: "a proof step cannot write a pnpm rc file",
     build: (input) => ({
       input: insertStepBefore(input, proofLine(input, "scripts/usage-dedupe-proof.ts"), { name: "Configure pnpm rc", run: 'echo "script-shell=/usr/bin/true" >> "$HOME/pnpm/rc"' }),
-      error: /writes an npm\/pnpm rc file/,
+      error: /writes a package-manager rc file/,
+    }),
+  },
+  ...([
+    ["pnpm_c_set", "pnpm c set script-shell /usr/bin/true"],
+    ["npm_set", "npm set script-shell=/usr/bin/true"],
+    ["pnpm_flag_config_set", "pnpm --dir . config set script-shell /usr/bin/true"],
+    ["continued_config_set", "pnpm \\\n config set script-shell /usr/bin/true"],
+  ] as const).map(([name, command]): Fixture => ({
+    name,
+    origin: "gate",
+    expectGateGreen: false,
+    describe: `package-manager settings cannot be changed with ${name}`,
+    build: (input) => ({
+      input: insertStepBefore(input, proofLine(input, "scripts/usage-dedupe-proof.ts"), { name: "Configure package manager", run: command }),
+      error: /package-manager config\/set command/,
+    }),
+  })),
+  {
+    name: "copy_rc_before_proof",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a copy cannot replace the user's npmrc before a proof",
+    build: (input) => ({
+      input: insertStepBefore(input, proofLine(input, "scripts/usage-dedupe-proof.ts"), { name: "Copy npmrc", run: 'cp .github/ci.rc "$HOME/.npmrc"' }),
+      error: /writes a package-manager rc file/,
     }),
   },
   // ---- Review 2: YAML the gate cannot read the way GitHub does -----------

@@ -245,15 +245,15 @@ function packageManagerProblems(input: CoverageInput): string[] {
 function runtimePackageManagerWrite(line: string): string | null {
   const text = line.trim();
   if (text === "" || text.startsWith("#")) return null;
-  if (/(?:^|[;&|]\s*)(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*pnpm\s+(?:config|set)(?:\s|$)/.test(text)) {
-    return "runs a pnpm config/set command before the last proof";
+  // The command can carry flags before or between `config`/`c` and `set`.
+  // Refuse any package-manager `set` rather than trying to model its flags.
+  const commands = text.split(/[;&|]/);
+  if (commands.some((command) => /\b(?:pnpm|npm|yarn)\b[^;&|]*\bset\b/i.test(command))) {
+    return "runs a package-manager config/set command before the last proof";
   }
-  if (/(?:^|[;&|]\s*)(?:[A-Za-z_][A-Za-z0-9_]*=[^\s]+\s+)*npm\s+config(?:\s|$)/.test(text)) {
-    return "runs an npm config command before the last proof";
-  }
-  const rcFile = String.raw`(?:\.npmrc|\.pnpmrc|(?:^|[/\\])pnpm[/\\]rc(?:\b|$))`;
-  if (new RegExp(String.raw`>>?\s*["']?[^\n"']*${rcFile}`, "i").test(text) || new RegExp(String.raw`\btee(?:\s+-a)?\s+["']?[^\n"']*${rcFile}`, "i").test(text)) {
-    return "writes an npm/pnpm rc file before the last proof";
+  const rcFile = String.raw`(?:\.(?:npm|pnpm|yarn)rc(?:\.yml)?|[/\\](?:pnpm|yarn)[/\\]rc)(?![A-Za-z0-9_])`;
+  if (new RegExp(String.raw`(?:>>?|\b(?:cp|mv|tee|install)\b)[^;&|\n]*${rcFile}`, "i").test(text)) {
+    return "writes a package-manager rc file before the last proof";
   }
   return null;
 }
@@ -333,14 +333,15 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
       if (model.jobs[job]?.container) errors.push(`${model.path} job "${job}" runs in a container, which the gate does not model`);
       for (const step of steps.filter((candidate) => candidate.stepIndex <= lastProof)) {
         const where = `${model.path} step "${step.name}"`;
+        const runText = (step.run ?? "").replace(/\\\r?\n\s*/g, " ");
         checkEnv(step.env, step.envValues, where);
         if (step.uses !== null && !KNOWN_ACTIONS.includes(actionName(step.uses))) {
           errors.push(`${where} runs action ${step.uses} before the job's last proof; only ${KNOWN_ACTIONS.join(", ")} may`);
         }
-        const word = step.run?.match(EXECUTION_WORD)?.[0] ?? step.run?.match(CONFIG_WORD)?.[0];
+        const word = runText.match(EXECUTION_WORD)?.[0] ?? runText.match(CONFIG_WORD)?.[0];
         if (word) errors.push(`${where} names ${word} in its script; setting it (as a prefix, with export or through $GITHUB_ENV) changes how the proofs run`);
-        if (step.run?.includes("GITHUB_PATH")) errors.push(`${where} writes $GITHUB_PATH, which changes which programs the proofs run`);
-        for (const line of (step.run ?? "").split("\n")) {
+        if (runText.includes("GITHUB_PATH")) errors.push(`${where} writes $GITHUB_PATH, which changes which programs the proofs run`);
+        for (const line of runText.split("\n")) {
           const packageManagerProblem = runtimePackageManagerWrite(line);
           if (packageManagerProblem) errors.push(`${where} ${packageManagerProblem}: ${line.trim()}`);
         }
