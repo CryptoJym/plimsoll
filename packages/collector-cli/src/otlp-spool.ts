@@ -16,6 +16,7 @@ import type { MetricSample } from "./otlp";
 import { OTLP_DROP_REASONS, type OtlpAdmissionDrop } from "./otlp-admission";
 import { peekRepoContextSidecar } from "./repo-context";
 import { isSqliteContentionError } from "./sqlite-contention";
+import { recordSpoolLoss } from "./spool-losses";
 
 /**
  * Bead eco-6hoxj.163.17: OTLP requests the ledger could not take in time are
@@ -157,6 +158,24 @@ type PendingFile = {
   metricSamples: number | null;
   failures: number;
 };
+
+/**
+ * Arrival times of pending spool files, from their names alone
+ * (eco-6hoxj.163.18: the upload capture claim is bounded by what the spool
+ * still holds). Null when the directory exists but cannot be listed.
+ */
+export function listOtlpSpoolArrivals(home: string): number[] | null {
+  let names: string[];
+  try {
+    names = fs.readdirSync(otlpSpoolDirectory(home));
+  } catch (error) {
+    return errorCode(error) === "ENOENT" ? [] : null;
+  }
+  return names
+    .map((name) => SPOOL_FILE_PATTERN.exec(name))
+    .filter((match): match is RegExpExecArray => match !== null)
+    .map((match) => Number(match[1]));
+}
 
 export type OtlpSpoolCounters = {
   spooled: number;
@@ -878,6 +897,8 @@ export class OtlpIntakeSpool {
     const directory = path.join(this.directory, OTLP_SPOOL_REJECTED_DIRECTORY);
     const source = path.join(this.directory, `${file.stem}.json`);
     const safeReason = /^[a-z0-9_]+$/.test(reason) ? reason : "spool_invalid";
+    // eco-6hoxj.163.18 (review S4): the claim reports this arrival as a gap.
+    recordSpoolLoss(this.directory, { atMs: file.receivedAtMs, reason: safeReason });
     try {
       fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
       fs.chmodSync(directory, 0o700);
@@ -928,6 +949,7 @@ export class OtlpIntakeSpool {
         if (errorCode(error) !== "ENOENT") continue;
       }
       this.unindex(file.stem);
+      recordSpoolLoss(this.directory, { atMs: file.receivedAtMs, reason: "expired" });
       this.bump("expired");
       if (file.events !== null) this.bump("expiredEvents", file.events);
       result.expired += 1;

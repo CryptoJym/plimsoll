@@ -3,9 +3,11 @@ import crypto from "node:crypto";
 import type { BufferedEventRow, LocalEventBuffer } from "./buffer";
 import {
   assertCollectorPrivacyMode,
+  collectorHome,
   reconcileCloudDeviceIdFromIngest,
   type CollectorConfig,
 } from "./config";
+import { captureSpoolState } from "./capture-spool-state";
 import type { DeliveryCaptureClaim, LeasedDeliveryItem, DeliveryFailureClass } from "./outbox";
 import {
   aiWorkIngestBatchSchema,
@@ -364,7 +366,11 @@ export type UploadOptions = {
   afterRemote?: () => void;
   /** Test-only crash seam after a sibling acknowledgement is durable but before poison settlement. */
   afterSiblingAcknowledgement?: () => void;
+  /** Home of the hook and OTLP spools the capture claim reads; the collector home by default. */
+  spoolHome?: string;
 };
+
+let captureClaimFailureLogged = false;
 
 export async function uploadBufferedEvents(
   config: CollectorConfig,
@@ -541,8 +547,23 @@ export async function uploadBufferedEvents(
     for (const item of group) attemptedActive.add(item.deliveryId);
     // Capture watermark v1: one claim per request, after the final
     // revalidation, so it describes exactly the items this request carries.
-    const captureClaim = await storage(() =>
-      buffer.delivery.captureClaim(group.map((item) => item.deliveryId), nowFn()));
+    // The spools are read first: a file replayed in between is then counted
+    // twice, never missed. A claim that cannot be computed is left off the
+    // request; it never stops delivery (review r2 S5).
+    let captureClaim: DeliveryCaptureClaim | null = null;
+    try {
+      const spool = captureSpoolState(options.spoolHome ?? collectorHome());
+      captureClaim = await storage(() =>
+        buffer.delivery.captureClaim(group.map((item) => item.deliveryId), spool, nowFn()));
+    } catch (error) {
+      if (!captureClaimFailureLogged) {
+        captureClaimFailureLogged = true;
+        console.warn(JSON.stringify({
+          status: "capture_claim_skipped",
+          error: error instanceof Error ? error.name : "unknown",
+        }));
+      }
+    }
     const result = await postItems({
       config,
       items: group,

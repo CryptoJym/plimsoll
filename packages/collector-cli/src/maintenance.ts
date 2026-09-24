@@ -2,8 +2,6 @@ import { createHash } from "node:crypto";
 
 import type Database from "better-sqlite3";
 
-import { isCompleteCapturePass, recordCompleteCapturePass } from "./capture-frontier";
-
 import { MODEL_PRICING, estimateCostUsd } from "../../shared/src/index";
 import type { LocalEventBuffer } from "./buffer";
 import {
@@ -14,6 +12,7 @@ import { RolloutTailer, type RolloutScanResult } from "./rollout-tailer";
 import { TranscriptTailer, type TranscriptScanResult } from "./transcript-tailer";
 import type { GrokUsageScanResult, GrokUsageTailer } from "./grok-usage-tailer";
 import { captureBaselineStatus } from "./capture-baseline";
+import { advanceCaptureFrontier, CAPTURE_COVERAGE_INTERVAL_MS } from "./capture-frontier";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
 import type { MaintenanceProgress } from "./maintenance-progress";
 import type { MaintenanceJobProgress } from "./maintenance-protocol";
@@ -24,6 +23,7 @@ const PRICING_CURSOR_KEY = "pricing_catalog_backfill_cursor";
 const REPO_BACKFILL_CURSOR_KEY = "repo_enrichment_backfill_cursor";
 const REPO_BACKFILL_COMPLETE_KEY = "repo_enrichment_backfill_complete";
 const AUTOMATIC_CAPTURE_SOURCE_TURN_KEY = "automatic_capture_source_turn";
+const CAPTURE_COVERAGE_CHECK_KEY = "capture_coverage_checked_at";
 const AUTOMATIC_CAPTURE_RUNTIME_TABLE = "automatic_capture_runtime_state";
 const REPAIR_SERVICE_KEY = "automatic_repair_service_v1";
 const REPAIR_STAGES = ["projection", "reconciliation", "repricing", "repo_context_suppression"] as const;
@@ -702,8 +702,34 @@ export class CollectorMaintenance {
     private readonly signal?: AbortSignal,
     /** Grok usage files (bead eco-6hoxj.163.20); absent callers keep the two-source cadence. */
     private readonly grokTailer?: GrokUsageTailer,
+    private readonly options: { captureCoverageIntervalMs?: number } = {},
   ) {
     ensureAutomaticCaptureRuntimeState(this.buffer.database);
+  }
+
+  /**
+   * eco-6hoxj.163.18 (review r2 B1): the capture frontier the upload claim
+   * attests moves only from a stat-only check of every tailed file
+   * (capture-frontier.ts), never from a pass. Capture phase only, at most once
+   * per interval; the first check runs at once. Each source's start time is
+   * taken before its walk. A check that fails leaves the frontier unchanged.
+   */
+  private checkCaptureCoverage() {
+    const database = this.buffer.database;
+    const interval = this.options.captureCoverageIntervalMs ?? CAPTURE_COVERAGE_INTERVAL_MS;
+    const nowMs = Date.now();
+    const lastMs = Date.parse(maintenanceState(database, CAPTURE_COVERAGE_CHECK_KEY) ?? "");
+    if (Number.isFinite(lastMs) && lastMs <= nowMs && nowMs - lastMs < interval) return;
+    setMaintenanceState(database, CAPTURE_COVERAGE_CHECK_KEY, new Date(nowMs).toISOString());
+    for (const [source, tailer] of [["codex", this.rolloutTailer], ["claude_code", this.transcriptTailer]] as const) {
+      if (this.signal?.aborted) return;
+      const startedAt = new Date().toISOString();
+      try {
+        advanceCaptureFrontier(database, source, tailer.coverageSnapshot(), startedAt);
+      } catch {
+        // A failed check leaves the frontier where it was; capture goes on.
+      }
+    }
   }
 
   status() {
@@ -951,17 +977,7 @@ export class CollectorMaintenance {
     if (grok && !this.signal?.aborted) {
       this.buffer.projection.recordCaptureActivity({ source: "grok", ...grok.activity });
     }
-    // eco-6hoxj.163.18: a complete capture-phase pass is the capture frontier
-    // the upload capture claim may attest. Baseline-phase cadences can return
-    // without reading anything, so only capture-phase passes count.
-    if (phase === "capture" && !this.signal?.aborted) {
-      if (isCompleteCapturePass(rollout)) {
-        recordCompleteCapturePass(this.buffer.database, "codex", rollout.activity.lastScanAt);
-      }
-      if (isCompleteCapturePass(transcript)) {
-        recordCompleteCapturePass(this.buffer.database, "claude_code", transcript.activity.lastScanAt);
-      }
-    }
+    if (phase === "capture" && !this.signal?.aborted) this.checkCaptureCoverage();
     // Capture-first cadence: repair units take only the allowance capture left.
     if (captureFirst) {
       await runRepairs();

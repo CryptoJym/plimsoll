@@ -44,6 +44,7 @@
     "proof:finance-projection": "tsx scripts/finance-project-usage-projection.test.ts",
     "proof:delivery": "tsx scripts/delivery-transport-proof.ts",
     "proof:capture-claim": "tsx scripts/run-proof.ts scripts/capture-claim-proof.ts",
+    "proof:capture-claim-review": "tsx scripts/run-proof.ts scripts/capture-claim-review-proof.ts",
     "proof:repo-labels-response": "tsx scripts/repo-labels-response-proof.ts",
     "proof:maintenance-starvation": "tsx scripts/maintenance-starvation-proof.ts",
     "proof:maintenance-stages": "tsx scripts/maintenance-stage-primitives-proof.ts",

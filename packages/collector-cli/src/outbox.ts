@@ -14,7 +14,13 @@ import {
 } from "./privacy-disposition";
 import { ensureUuidEventId, normalizeHistoryEvent } from "./upload-history";
 import { applyProjectAttribution, SessionAttributionBatch } from "./session-attribution";
-import { captureFrontier } from "./capture-frontier";
+import {
+  CAPTURE_WRITE_LAG_MS,
+  captureFrontier,
+  mergeCaptureGaps,
+  type CaptureGap,
+} from "./capture-frontier";
+import type { CaptureSpoolState } from "./capture-spool-state";
 
 export const DEFAULT_DELIVERY_LIMITS = {
   maxActiveRows: 50_000,
@@ -203,12 +209,31 @@ export type DeliveryCaptureClaim = {
   epochStartedAt: string;
   /** Strictly increasing per ledger; one value per request. */
   cursor: number;
-  /** Every event of the epoch observed before this is acknowledged or in this request; null: not attested. */
+  /**
+   * Every event of the epoch observed before this is acknowledged or in this
+   * request, apart from `gaps`. Null: not attested, and `unattested` says why.
+   */
   through: string | null;
+  unattested?: CaptureUnattestedReason;
+  /** Deliveries of the epoch queued outside this request, plus spooled push files. */
   pending: number;
+  /** Deliveries and spooled push files of the epoch lost for good; each lies in a gap. */
   dead: number;
-  gapSince: string | null;
+  /** Deliveries kept local by design (privacy violation, evidence quarantine); not gaps. */
+  withheld: number;
+  /** At most CAPTURE_CLAIM_MAX_GAPS closed intervals in which data is known to be missing. */
+  gaps: Array<{ from: string; to: string }>;
 };
+
+/** Why a claim attests nothing (review r2 B3): the cloud withdraws what it held. */
+export type CaptureUnattestedReason =
+  | "migration_incomplete"
+  | "over_row_budget"
+  | "spool_unreadable"
+  | "frontier_unknown";
+
+/** Refusals the collector makes on purpose; the claim counts them as withheld. */
+const WITHHELD_RECEIPT_REASONS_SQL = "'local_evidence_quarantined','local_privacy_violation'";
 
 export type DeliveryValidationWitness = {
   contractHash: string;
@@ -444,28 +469,39 @@ export class DeliveryOutbox {
   /**
    * Capture watermark v1 (eco-6hoxj.163.18). The claim for ONE request whose
    * delivery ids are `requestDeliveryIds`, computed in one write transaction
-   * right before it is sent:
+   * right before it is sent. `spool` is what the hook and OTLP spools held
+   * just before (capture-spool-state.ts); null when it could not be read.
    *
-   * - `through` is at most the start of the latest complete capture pass of
-   *   both tailed sources (capture-frontier.ts), and strictly before the
-   *   observed time of every delivery appended in this epoch that is neither
-   *   acknowledged nor in this request — still queued, or dead. Null when the
-   *   capture frontier is unknown or the legacy migration has not enqueued
-   *   every ledger row yet.
-   * - `dead`/`gapSince` name the epoch's deliveries that will never arrive.
-   *   A dead delivery whose ledger row is gone is dated to the epoch start.
+   * - `through` is at most the capture frontier (capture-frontier.ts), earlier
+   *   than the observed time of every delivery of the epoch still queued
+   *   outside this request, and earlier than every spooled push file's
+   *   arrival less the write lag. Never before the epoch start. Null, with
+   *   `unattested` saying why, whenever that bound cannot be taken (review r2
+   *   B3): the legacy migration is still enqueuing ledger rows, the queue is
+   *   over the row budget (the upload path never scans it then), a spool
+   *   cannot be read, or the frontier is not known yet.
+   * - `gaps` are bounded intervals of known loss: dead deliveries, spooled
+   *   push files rejected or expired, and tailed files the frontier moved past
+   *   unread. They never hold `through` back (review r2 S2), so one loss marks
+   *   only the time it covers. Privacy and evidence refusals are deliberate,
+   *   not loss: they are counted in `withheld` and are not gaps.
    * - `cursor` increments once per claim, so the cloud can drop a slower,
    *   older request that commits after a newer one.
    *
    * Scoped to rows appended since the epoch started (append times, which the
    * ledger stamps itself): earlier rows belong to the previous epoch's claims.
    */
-  captureClaim(requestDeliveryIds: string[], now = this.clock()): DeliveryCaptureClaim | null {
+  captureClaim(
+    requestDeliveryIds: string[],
+    spool: CaptureSpoolState | null,
+    now = this.clock(),
+  ): DeliveryCaptureClaim | null {
     if (!this.enabled || !this.workspaceId) return null;
     const run = this.db.transaction(() => {
       const frontier = captureFrontier(this.db);
       if (!frontier || frontier.workspaceId !== this.workspaceId) return null;
       const epochStartedAt = frontier.epochStartedAt;
+      const epochStartMs = Date.parse(epochStartedAt);
       const control = this.db
         .prepare(
           `select migration_complete as migrationComplete,
@@ -477,10 +513,11 @@ export class DeliveryOutbox {
       // behind anyway, so attest nothing instead of reading every queued
       // envelope (about 70 ms per request at 50,000 rows, linear beyond it).
       const overBudget = control.active > this.limits.maxActiveRows;
-      // Earliest observed time per set, in SQL. An unreadable observed time
-      // dates its delivery to the epoch start.
-      const epochStartSeconds = Date.parse(epochStartedAt) / 1000;
+      const epochStartSeconds = epochStartMs / 1000;
       const requestIds = JSON.stringify(requestDeliveryIds);
+      // Earliest observed time of the queued rows the epoch covers. An
+      // unreadable envelope or observed time dates its row to the epoch start
+      // instead of failing the claim (review r2 S5).
       const pending = overBudget
         ? {
             count: Math.max(0, control.active - (this.db
@@ -491,12 +528,16 @@ export class DeliveryOutbox {
         : (this.db
             .prepare(
               `select count(*) as count,
-                 min(coalesce(unixepoch(json_extract(base_envelope_json, '$.event.observedAt'), 'subsec'),
-                   @epochStartSeconds)) as earliestSeconds
-               from upload_outbox
-               where workspace_id is @workspaceId and device_id is @deviceId
-                 and created_at >= @epochStartedAt
-                 and delivery_id not in (select value from json_each(@requestIds))`,
+                 min(case when observed is null then @epochStartSeconds
+                   when observed >= @epochStartSeconds then observed end) as earliestSeconds
+               from (
+                 select unixepoch(case when json_valid(base_envelope_json)
+                   then json_extract(base_envelope_json, '$.event.observedAt') end, 'subsec') as observed
+                 from upload_outbox
+                 where workspace_id is @workspaceId and device_id is @deviceId
+                   and created_at >= @epochStartedAt
+                   and delivery_id not in (select value from json_each(@requestIds))
+               )`,
             )
             .get({
               workspaceId: this.workspaceId,
@@ -505,24 +546,32 @@ export class DeliveryOutbox {
               epochStartSeconds,
               requestIds,
             }) as { count: number; earliestSeconds: number | null });
-      const dead = this.db
-        .prepare(
-          `select count(*) as count,
-             min(coalesce(unixepoch(b.observed_at, 'subsec'), @epochStartSeconds)) as earliestSeconds
-           from upload_receipts r left join buffered_events b on b.id = r.delivery_id
-           where r.terminal_state = 'dead' and r.created_at >= @epochStartedAt`,
-        )
-        .get({ epochStartedAt, epochStartSeconds }) as { count: number; earliestSeconds: number | null };
+      const lost = this.deadLetterSummary(epochStartedAt, epochStartMs);
+      const spoolLosses = (spool?.losses ?? []).filter((loss) => loss.atMs >= epochStartMs);
+      const unattested: CaptureUnattestedReason | null =
+        control.migrationComplete !== 1 ? "migration_incomplete"
+          : overBudget ? "over_row_budget"
+            : spool === null || spool.unreadable ? "spool_unreadable"
+              : frontier.capturedThrough === null ? "frontier_unknown"
+                : null;
+      let throughMs = unattested === null ? Date.parse(frontier.capturedThrough!) : null;
       // Floor to the millisecond: rounding can only move the bound earlier.
-      const toMs = (seconds: number | null) => (seconds === null ? null : Math.floor(seconds * 1000));
-      const pendingMs = toMs(pending.earliestSeconds);
-      const deadMs = toMs(dead.earliestSeconds);
-      let throughMs = overBudget || frontier.capturedThrough === null || control.migrationComplete !== 1
-        ? null
-        : Date.parse(frontier.capturedThrough);
-      for (const bound of [pendingMs, deadMs]) {
+      const bounds = [
+        pending.earliestSeconds === null ? null : Math.floor(pending.earliestSeconds * 1000),
+        spool?.oldestPendingMs == null ? null : spool.oldestPendingMs - CAPTURE_WRITE_LAG_MS,
+      ];
+      for (const bound of bounds) {
         if (throughMs !== null && bound !== null) throughMs = Math.min(throughMs, bound);
       }
+      if (throughMs !== null) throughMs = Math.max(throughMs, epochStartMs);
+      const gaps = mergeCaptureGaps([
+        ...frontier.gaps,
+        ...lost.gaps,
+        ...spoolLosses.map((loss) => ({
+          fromMs: Math.max(epochStartMs, loss.atMs - CAPTURE_WRITE_LAG_MS),
+          toMs: loss.atMs,
+        })),
+      ]);
       this.db
         .prepare(
           `update upload_control set capture_claim_sequence = capture_claim_sequence + 1,
@@ -538,12 +587,76 @@ export class DeliveryOutbox {
         epochStartedAt,
         cursor,
         through: throughMs === null ? null : new Date(throughMs).toISOString(),
-        pending: pending.count,
-        dead: dead.count,
-        gapSince: deadMs === null ? null : new Date(deadMs).toISOString(),
+        ...(unattested === null ? {} : { unattested }),
+        pending: pending.count + (spool?.pendingFiles ?? 0),
+        dead: lost.dead + spoolLosses.length,
+        withheld: lost.withheld,
+        gaps: gaps.map((gap) => ({ from: new Date(gap.fromMs).toISOString(), to: new Date(gap.toMs).toISOString() })),
       };
     });
     return run.immediate();
+  }
+
+  /**
+   * The epoch's dead receipts for the capture claim: lost deliveries as one
+   * interval per UTC day of their observed time (the epoch start when the
+   * ledger row is gone), withheld ones as a count. Recomputed only when a
+   * dead receipt changed, so the claim does not rescan them on every request
+   * (review r2 N1). Not scoped to the workspace: receipts carry none, and
+   * counting more only widens the report.
+   */
+  private deadLetterSummary(epochStartedAt: string, epochStartMs: number): {
+    dead: number;
+    withheld: number;
+    gaps: CaptureGap[];
+  } {
+    const version = (this.db
+      .prepare(`select capture_dead_version as version from upload_control where singleton = 1`)
+      .get() as { version: number }).version;
+    const cached = this.db
+      .prepare(
+        `select dead_version as version, epoch_started_at as epochStartedAt, summary_json as summary
+         from capture_dead_summary where singleton = 1`,
+      )
+      .get() as { version: number; epochStartedAt: string; summary: string } | undefined;
+    if (cached && cached.version === version && cached.epochStartedAt === epochStartedAt) {
+      return JSON.parse(cached.summary) as { dead: number; withheld: number; gaps: CaptureGap[] };
+    }
+    const counts = this.db
+      .prepare(
+        `select count(*) as total,
+           coalesce(sum(case when reason in (${WITHHELD_RECEIPT_REASONS_SQL}) then 1 else 0 end), 0) as withheld
+         from upload_receipts where terminal_state = 'dead' and created_at >= ?`,
+      )
+      .get(epochStartedAt) as { total: number; withheld: number };
+    const days = this.db
+      .prepare(
+        `select min(f) as fromSeconds, max(t) as toSeconds from (
+           select coalesce(unixepoch(b.observed_at, 'subsec'), @epochStartSeconds) as f,
+             coalesce(unixepoch(b.observed_at, 'subsec'), unixepoch(r.created_at, 'subsec'), @epochStartSeconds) as t
+           from upload_receipts r left join buffered_events b on b.id = r.delivery_id
+           where r.terminal_state = 'dead' and r.created_at >= @epochStartedAt
+             and r.reason not in (${WITHHELD_RECEIPT_REASONS_SQL})
+         ) group by cast(f / 86400 as integer)`,
+      )
+      .all({ epochStartedAt, epochStartSeconds: epochStartMs / 1000 }) as Array<{ fromSeconds: number; toSeconds: number }>;
+    const gaps: CaptureGap[] = [];
+    for (const day of days) {
+      const toMs = Math.ceil(day.toSeconds * 1000);
+      if (toMs < epochStartMs) continue;
+      const fromMs = Math.max(epochStartMs, Math.floor(day.fromSeconds * 1000));
+      gaps.push({ fromMs, toMs: Math.max(fromMs, toMs) });
+    }
+    const summary = { dead: counts.total - counts.withheld, withheld: counts.withheld, gaps: mergeCaptureGaps(gaps) };
+    this.db
+      .prepare(
+        `insert into capture_dead_summary (singleton, dead_version, epoch_started_at, summary_json)
+         values (1, ?, ?, ?)
+         on conflict (singleton) do update set dead_version = excluded.dead_version,
+           epoch_started_at = excluded.epoch_started_at, summary_json = excluded.summary_json`,
+      )
+      .run(version, epochStartedAt, JSON.stringify(summary));
+    return summary;
   }
 
   isEvidenceQuarantined(rawId: string) {
@@ -750,6 +863,37 @@ export class DeliveryOutbox {
          add column capture_claim_sequence integer not null default 0`,
       );
     }
+    if (!controlColumns.some((column) => column.name === "capture_dead_version")) {
+      this.db.exec(
+        `alter table upload_control
+         add column capture_dead_version integer not null default 0`,
+      );
+    }
+    // eco-6hoxj.163.18 (review r2 N1): every change to a dead receipt bumps a
+    // version, so the capture claim summarizes dead receipts once per change.
+    this.db.exec(`
+      create table if not exists capture_dead_summary (
+        singleton integer primary key check (singleton = 1),
+        dead_version integer not null,
+        epoch_started_at text not null,
+        summary_json text not null
+      );
+      create trigger if not exists trg_capture_dead_version_insert
+      after insert on upload_receipts when new.terminal_state = 'dead'
+      begin
+        update upload_control set capture_dead_version = capture_dead_version + 1 where singleton = 1;
+      end;
+      create trigger if not exists trg_capture_dead_version_delete
+      after delete on upload_receipts when old.terminal_state = 'dead'
+      begin
+        update upload_control set capture_dead_version = capture_dead_version + 1 where singleton = 1;
+      end;
+      create trigger if not exists trg_capture_dead_version_update
+      after update on upload_receipts when old.terminal_state = 'dead' or new.terminal_state = 'dead'
+      begin
+        update upload_control set capture_dead_version = capture_dead_version + 1 where singleton = 1;
+      end;
+    `);
     if (!controlColumns.some((column) => column.name === "active_remote_rejected")) {
       this.db.exec(
         `alter table upload_control

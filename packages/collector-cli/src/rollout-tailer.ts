@@ -46,6 +46,7 @@ import {
 } from "./capture-fairness";
 import { advanceAutomaticCaptureFiles, refreshAutomaticCaptureFile, type AutomaticCapturePendingFile } from "./automatic-capture-retry";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
+import { CAPTURE_COVERAGE_MAX_ENTRIES, captureCoverageFiles, type CaptureCoverageSnapshot } from "./capture-frontier";
 import {
   IncrementalJsonlDiscovery,
   type DiscoveryProgress,
@@ -406,6 +407,32 @@ export class RolloutTailer {
   private eligibleDirectories: string[] | null = null;
   private get directories(): string[] { return this.eligibleDirectories ?? [this.sessionsDir]; }
   private cursorKey(file: string) { return rootCursorKey(this.captureRoots, file); }
+
+  /**
+   * eco-6hoxj.163.18 (review r2 B1): every file under the capture roots,
+   * stat-only, with whether this tailer's cursor has committed its current
+   * size. The capture frontier moves from this, never from a pass: automatic
+   * passes open only today's and yesterday's day folders. Twin of
+   * TranscriptTailer.coverageSnapshot. Incomplete when a configured root is
+   * not ready, as it is for a scan.
+   */
+  coverageSnapshot(maxEntries = CAPTURE_COVERAGE_MAX_ENTRIES): CaptureCoverageSnapshot {
+    const incomplete = { complete: false, files: [] };
+    if (this.inventoryConfigured && inspectCaptureRoots(this.captureRoots).some((root) => root.state !== "ready")) {
+      return incomplete;
+    }
+    const eligible = this.eligibleDirectories;
+    this.eligibleDirectories = this.inventoryConfigured ? this.captureRoots.map((root) => root.directory) : null;
+    try {
+      const discovery = this.discover({ scope: "full", discoveryLimit: maxEntries });
+      if (discovery.truncated || discovery.errors > 0) return incomplete;
+      const files = captureCoverageFiles(this.buffer.database, discovery.files, (file) => this.cursorKey(file),
+        (file) => this.io.lstat(file));
+      return files === null ? incomplete : { complete: true, files };
+    } finally {
+      this.eligibleDirectories = eligible;
+    }
+  }
   private activeBoundaryOptions: Pick<RolloutScanOptions, "quarantine" | "onProgress"> = {};
   private baselineAttempt: {
     discovery: IncrementalJsonlDiscovery;

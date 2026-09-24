@@ -86,6 +86,7 @@ jobs:
           pnpm proof:finance-projection
           pnpm proof:delivery
           pnpm proof:capture-claim
+          pnpm proof:capture-claim-review
           pnpm proof:repo-labels-response
 
       - name: Prove source installer and read-only doctor
