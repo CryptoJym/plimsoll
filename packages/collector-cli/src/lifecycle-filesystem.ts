@@ -400,8 +400,8 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
 
   /**
    * `--retention keep-all`: this adapter removes nothing an earlier operation
-   * left. Retention only previews (recorded as skipped_by_operator) and trash
-   * entries stay.
+   * left. Retention only previews (recorded as skipped_by_operator), trash
+   * entries stay, and display receipts are not trimmed.
    */
   private readonly keepAll: boolean;
 
@@ -657,37 +657,45 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       `${artifact.platform}-${artifact.architecture}`,
     );
     const target = path.join(this.root, immutableRuntimeRelativePath(artifact));
-    // A runtime version is immutable: a different executable fails before any
-    // of the version's files is touched, and no file it holds is replaced or
-    // removed.
-    assertNoSymlink(path.dirname(target), this.root);
-    const existingTarget = lstatIfPresent(target);
-    if (existingTarget && (!existingTarget.isFile() || sha256(target) !== artifact.sha256)) {
-      throw new Error("immutable runtime target already differs");
-    }
-    // Every companion the version already holds is verified before anything is written.
-    const companions = (artifact.files ?? []).map((file, index) => {
+    const stagedCompanions: Array<{ destination: string }> = [];
+    const companionDestinations = (artifact.files ?? []).map((file, index) => {
       const destination = path.join(runtimeDirectory, ...file.relativePath.split("/"));
       assertAbsoluteOwnedPath(destination, this.root, `companion ${index} destination`);
       assertNoSymlink(path.dirname(destination), this.root);
-      const existing = lstatIfPresent(destination);
-      if (existing && (!existing.isFile() || sha256(destination) !== file.sha256)) {
+      return { file, destination, index };
+    });
+
+    // The executable is the immutable target for this version. Check it before
+    // touching any companion so a conflicting repin cannot damage an existing
+    // runtime closure before the transaction rolls back.
+    assertNoSymlink(path.dirname(target), this.root);
+    const targetStat = lstatIfPresent(target);
+    if (targetStat && (!targetStat.isFile() || targetStat.isSymbolicLink() || sha256(target) !== artifact.sha256)) {
+      throw new Error("immutable runtime target already differs");
+    }
+
+    // Existing companions are immutable too. Validate every one before
+    // staging a missing companion, so a mismatch leaves the whole closure
+    // untouched.
+    for (const { file, destination, index } of companionDestinations) {
+      const stat = lstatIfPresent(destination);
+      if (!stat) continue;
+      if (!stat.isFile() || stat.isSymbolicLink() || sha256(destination) !== file.sha256) {
         throw new Error(`immutable runtime companion ${file.relativePath} already differs`);
       }
-      return { file, index, destination, present: existing !== null };
-    });
-    const stagedCompanions: Array<{ destination: string }> = [];
+    }
+
     try {
-      for (const { file, index, destination, present } of companions) {
-        if (present) continue;
+      for (const { file, index, destination } of companionDestinations) {
+        if (lstatIfPresent(destination)) continue;
         // Companion sources live in the artifact staging area next to the
         // bundle; their absolute paths were validated when resolved.
-        assertAbsoluteOwnedPath(file.sourcePath, this.paths.artifactSourceRoot, `companion ${index} source`);
+        assertAbsoluteOwnedPath(file.sourcePath, this.paths.artifactSourceRoot, `companion ${file.relativePath} source`);
         assertNoSymlink(file.sourcePath, this.paths.artifactSourceRoot);
         ensureDirectory(path.dirname(destination), this.root);
-        // Verified beside its destination, then renamed into place, so an
-        // interrupted copy never leaves a partial companion under its name.
-        // `+` never occurs in a companion path, so no companion has this name.
+        // Verify beside the final destination, then publish with one rename.
+        // A failed copy or digest check therefore cannot leave a partial or
+        // unverified companion under its immutable name.
         const staging = `${destination}+staging`;
         fs.rmSync(staging, { force: true });
         try {
@@ -700,7 +708,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
         }
         stagedCompanions.push({ destination });
       }
-      if (existingTarget) {
+      if (targetStat) {
         fs.chmodSync(target, EXECUTABLE_MODE);
         return;
       }
@@ -716,7 +724,6 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
         throw error;
       }
     } catch (error) {
-      // Only the companions this call created; a file the version already held stays.
       for (const staged of stagedCompanions.reverse()) {
         fs.rmSync(staged.destination, { force: true });
       }
