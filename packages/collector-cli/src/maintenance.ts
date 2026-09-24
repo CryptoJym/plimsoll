@@ -904,11 +904,20 @@ export class CollectorMaintenance {
     };
     const runGrok = async (tailer: GrokUsageTailer) => {
       this.current = { phase, source: "grok", startedAt, budget };
+      // Announce the source before any filesystem work, as the other two do,
+      // so a stall inside the Grok scan is held against Grok's own stage and
+      // never against the previous source's last candidate.
+      const sourceAccepted = options.onProgress?.({
+        source: "grok",
+        stage: "source_scan",
+        candidateHash: null,
+      }) !== false;
       return tailer.scan({
         budget,
         now: new Date(startedAt),
         signal: this.signal,
-        deferredBeforeIo: !budget.canContinue(),
+        deferredBeforeIo: !budget.canContinue() || !sourceAccepted ||
+          (options.quarantine?.source === "grok" && options.quarantine.stage === "source_scan"),
       });
     };
     try {

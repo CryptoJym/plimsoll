@@ -40,7 +40,7 @@ import { resolveMaintenanceRepoContexts } from "../packages/collector-cli/src/ma
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import { aiInteractionEventSchema, aiWorkIngestBatchSchema } from "../packages/shared/src/index";
 
-const EXPECTED_CHECKS = 38;
+const EXPECTED_CHECKS = 39;
 const completion = createProofCompletion("grok-usage", EXPECTED_CHECKS);
 const SENTINEL = "PLIMSOLL_GROK_CONTENT_SENTINEL_5c1e";
 const TICKS_PER_USD = 10_000_000_000;
@@ -793,6 +793,38 @@ async function main() {
       retry: { events: retryPass.eventsAppended, exhaustive: retryPass.exhaustive } });
   faultTailer.close();
   faultBuffer.close();
+
+  // The Grok scan announces itself to the maintenance boundary and honours
+  // a quarantine of its own stage, like the Codex and Claude scans.
+  const frameHome = unitHome("frames");
+  writeSession(path.join(frameHome, "sessions"), rootGroup, { sessionId: uuid(850), updatedAt: at(10),
+    shape: "modern", turns: [{ turnNumber: 1, endedAt: at(11), models: [usage("grok-4.7-build", 1)] }] },
+  { content: false });
+  const frameBuffer = unitBuffer("frames");
+  const emptyRoot = path.join(work, "unit", "frames-empty");
+  fs.mkdirSync(emptyRoot, { recursive: true });
+  const frameMaintenance = new CollectorMaintenance(frameBuffer,
+    new (await import("../packages/collector-cli/src/rollout-tailer")).RolloutTailer(frameBuffer, emptyRoot, () => []),
+    new (await import("../packages/collector-cli/src/transcript-tailer")).TranscriptTailer(frameBuffer, emptyRoot),
+    undefined, new GrokUsageTailer(frameBuffer, frameHome));
+  const frames: Array<{ source: string; stage: string }> = [];
+  const quarantined = await frameMaintenance.runRecent({
+    quarantine: { source: "grok", stage: "source_scan", candidateHash: null },
+    onProgress: (progress) => {
+      frames.push({ source: progress.source, stage: progress.stage });
+      return true;
+    },
+  });
+  const grokFrameIndex = frames.findIndex((frame) => frame.source === "grok" && frame.stage === "source_scan");
+  const released = await frameMaintenance.runRecent({ onProgress: () => true });
+  check("the_grok_scan_announces_its_stage_and_honours_its_quarantine",
+    grokFrameIndex >= 0 && quarantined.grok?.eventsAppended === 0 &&
+      quarantined.grok.activity.scan.deferredBeforeIo === true &&
+      (released.grok?.eventsAppended ?? 0) === 1,
+    { frames: frames.slice(0, 6), quarantinedEvents: quarantined.grok?.eventsAppended,
+      releasedEvents: released.grok?.eventsAppended });
+  frameMaintenance.close();
+  frameBuffer.close();
 
   // A session whose usage already arrived live stays with the live path.
   const liveHome = unitHome("live");
