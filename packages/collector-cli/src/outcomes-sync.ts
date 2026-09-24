@@ -59,6 +59,26 @@ const MAX_REVERT_PAGES = 3;
 const MAX_REOPEN_PULLS = 20;
 const MAX_LINKED_SESSION_IDS = 50;
 
+/** A GitHub owner or repository name: ASCII letters, digits, '.', '_' and '-'. */
+const GITHUB_NAME = /^[a-z0-9._-]{1,100}$/;
+
+/**
+ * `--repository` is both the run's disclosure and its identity. Trim,
+ * lowercase and validate it before it reaches the remote hash, the GitHub API
+ * path or an external id, so ' Acme/Widgets ' and 'acme/widgets' are one
+ * repository and build the same batch (GitHub resolves names without regard
+ * to case). Anything that is not a GitHub owner/repo is refused before any
+ * request.
+ */
+function githubRepository(value: string) {
+  const parts = value.split("/").map((part) => part.trim().toLowerCase());
+  if (parts.length !== 2 || !parts.every((part) => GITHUB_NAME.test(part) && part !== "." && part !== "..")) {
+    throw new Error("--repository expects a GitHub owner/repo, such as acme/widgets.");
+  }
+  const [owner, repo] = parts;
+  return { owner, repo };
+}
+
 export type LedgerSessionLink = {
   sessionId: string;
   events: number;
@@ -208,8 +228,7 @@ export function buildOutcomePush(input: {
   signals: ReworkSignal[];
   reworkWindowDays: number;
 }): OutcomePush {
-  const owner = input.owner.toLowerCase();
-  const repo = input.repo.toLowerCase();
+  const { owner, repo } = githubRepository(`${input.owner}/${input.repo}`);
   const repoSlug = `github.com/${owner}/${repo}`;
   const remoteUrlHash = remoteLinkageHash(`https://${repoSlug}.git`);
 
@@ -631,10 +650,7 @@ export async function runOutcomesSync(
     );
   }
 
-  const [owner, repo] = options.repository.split("/");
-  if (!owner || !repo || options.repository.split("/").length !== 2) {
-    throw new Error(`--repository expects owner/repo, got: ${options.repository}`);
-  }
+  const { owner, repo } = githubRepository(options.repository);
 
   const sinceDays = options.sinceDays ?? 30;
   const reworkWindowDays = options.reworkWindowDays ?? 14;

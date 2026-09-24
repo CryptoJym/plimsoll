@@ -78,6 +78,7 @@ separate purge may remove.
 | `lifecycle update\|rollback\|uninstall\|purge\|support-bundle` | Transactional immutable-runtime updates with automatic rollback, preview-default uninstall, exact-confirmation purge, sanitized support bundle |
 | `scan-rollouts` | One-time full-history walk of Codex rollout files into the ledger |
 | `scan-transcripts` | One-time full-history walk of Claude Code transcripts into the ledger |
+| `sync-outcomes --repository owner/repo` | Send pull request outcomes for one named GitHub repository to the joined workspace (`--dry-run` previews) |
 | `label account HASH NAME` | Local-only display label for a hashed account |
 | `priority add\|remove\|list` | Manage the priority-repo list (hashed; URLs stay local) |
 | `purge-local-data` | Dry-run or explicit purge of local buffered events |
@@ -92,6 +93,27 @@ than `startupWalCheckpointBytes` (default 1 GiB), and emits a structured
 before/after receipt. A checkpoint can truncate the WAL only when no other
 process retains a conflicting SQLite reader or writer; maintenance orphan
 recovery is what prevents an abandoned worker from defeating later attempts.
+
+## Outcome sync
+
+`sync-outcomes` sends the joined workspace what happened to the pull requests
+your local sessions worked on (merge status, check results, reverts and
+reopens) for one GitHub repository you name. It never runs in the background,
+and running it again updates the same rows instead of adding new ones.
+
+```sh
+npx @plimsoll/cli sync-outcomes --repository owner/repo --dry-run   # preview
+npx @plimsoll/cli sync-outcomes --repository owner/repo
+```
+
+`--repository` is the GitHub `owner/repo` from the repository URL. Spaces
+around it and letter case do not matter: ` Acme/Widgets ` and `acme/widgets`
+are the same repository. Anything that is not a GitHub owner/repo (a URL, a
+third path segment, a space or another character GitHub does not allow in a
+name) is refused before any request. For a private repository, set
+`GITHUB_TOKEN` or `GH_TOKEN`. The owner and name are sent to the workspace;
+pull request titles, bodies, diffs and file paths are not, and branch names
+travel only as hashes.
 
 ## What leaves your machine
 

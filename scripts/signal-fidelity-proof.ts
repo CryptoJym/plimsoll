@@ -1,6 +1,6 @@
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = process.env.PLIMSOLL_PROOF_CLOCK_CASE === "1" ? null : createProofCompletion("signal-fidelity", 108);
+const completion = process.env.PLIMSOLL_PROOF_CLOCK_CASE === "1" ? null : createProofCompletion("signal-fidelity", 110);
 /**
  * Signal-fidelity proof for the v2 collector capture path.
  *
@@ -4025,6 +4025,83 @@ async function main() {
         },
         idempotent: d2PostedBodies[0] === d2PostedBodies[1],
       }),
+    );
+
+    // 18d'. One repository, one identity: surrounding whitespace and letter
+    // case in --repository fold before hashing, so every spelling builds and
+    // posts the byte-identical batch; a value that is not a plain GitHub
+    // owner/repo slug is refused before any request.
+    const whitespaceBuiltBatch = buildOutcomePush({ ...d2BuildInput, owner: " Acme ", repo: " Widgets " }).batch;
+    const spellingBodies: Record<string, string | null> = {};
+    for (const repository of [" Acme/Widgets ", "acme/widgets"]) {
+      const postsBefore = d2PostedBodies.length;
+      const run = await runOutcomesSync(d2Config, {
+        repository,
+        until: d2Until,
+        ledgerDb: d2Ledger,
+        fetchImpl: d2Fetch,
+        log: () => undefined,
+      });
+      spellingBodies[repository] = run.ok && d2PostedBodies.length === postsBefore + 1 ? d2PostedBodies.at(-1)! : null;
+    }
+    check(
+      "outcomes_repository_spellings_share_one_identity",
+      JSON.stringify(whitespaceBuiltBatch) === JSON.stringify(push1.batch) &&
+        Object.values(spellingBodies).every((body) => body === d2PostedBodies[0]),
+      JSON.stringify({
+        builtRepository: whitespaceBuiltBatch?.repository,
+        builtFirstExternalId: whitespaceBuiltBatch?.artifacts[0]?.externalId,
+        postedIdenticalToCanonical: Object.fromEntries(
+          Object.entries(spellingBodies).map(([repository, body]) => [repository, body === d2PostedBodies[0]]),
+        ),
+      }),
+    );
+    let invalidRepositoryRequests = 0;
+    const invalidRepositoryRefused: Record<string, boolean> = {};
+    for (const repository of [
+      "acme",
+      "acme/widgets/extra",
+      "acme/",
+      "https://github.com/acme/widgets",
+      "acme/wid gets",
+      "acme/..",
+      "acme/widgets?per_page=1",
+      "acme/wïdgets",
+    ]) {
+      try {
+        await runOutcomesSync(d2Config, {
+          repository,
+          until: d2Until,
+          ledgerDb: d2Ledger,
+          fetchImpl: (async (input, init) => {
+            invalidRepositoryRequests += 1;
+            return d2Fetch(input, init);
+          }) as typeof fetch,
+          log: () => undefined,
+        });
+        invalidRepositoryRefused[repository] = false;
+      } catch (error) {
+        invalidRepositoryRefused[repository] = /--repository expects/.test(String(error));
+      }
+    }
+    // Real GitHub names stay accepted, including words a repo label would refuse.
+    const validRepositoryAccepted: Record<string, boolean> = {};
+    for (const repository of ["Acme/Next-Auth", "acme/my.repo_name-2"]) {
+      const run = await runOutcomesSync(d2Config, {
+        repository,
+        until: d2Until,
+        ledgerDb: d2Ledger,
+        fetchImpl: d2Fetch,
+        log: () => undefined,
+      }).catch(() => null);
+      validRepositoryAccepted[repository] = run?.ok === true;
+    }
+    check(
+      "outcomes_repository_invalid_input_refused_before_any_request",
+      invalidRepositoryRequests === 0 &&
+        Object.values(invalidRepositoryRefused).every(Boolean) &&
+        Object.values(validRepositoryAccepted).every(Boolean),
+      JSON.stringify({ invalidRepositoryRequests, refused: invalidRepositoryRefused, accepted: validRepositoryAccepted }),
     );
     d2Ledger.close();
 
