@@ -1,7 +1,10 @@
 import type Database from "better-sqlite3";
 
 import type { AiInteractionEvent } from "../../shared/src/index";
-import { sessionContextIndexComplete } from "./session-context-index";
+import {
+  markSessionContextIndexInvalid,
+  sessionContextIndexComplete,
+} from "./session-context-index";
 
 /**
  * Session inheritance is deliberately a small, fail-closed join.  The
@@ -85,6 +88,8 @@ export type SessionAttributionStats = {
   boundReached: number;
   /** Lookups skipped because the batch row-read budget was spent. */
   budgetExhausted: number;
+  /** Indexed lookups that found a source-row point mismatch. */
+  integrityFailures: number;
 };
 
 type SessionContextEvent = Pick<AiInteractionEvent, "sessionId" | "observedAt"> &
@@ -333,6 +338,7 @@ export class SessionAttributionBatch {
     contextRows: 0,
     boundReached: 0,
     budgetExhausted: 0,
+    integrityFailures: 0,
   };
 
   constructor(
@@ -369,6 +375,7 @@ export class SessionAttributionBatch {
       const countEntries = readIndexed ? null : db.prepare(COUNT_SESSION_ENTRIES);
       const readContexts = readIndexed ? null : db.prepare(READ_SESSION_CONTEXTS);
       this.counters.contextIndex = readIndexed !== null;
+      let indexInvalid = false;
       for (const [sessionId, windows] of planned) {
         const lookups: SessionLookup[] = [];
         for (const window of windows.sort((left, right) => left.at - right.at)) {
@@ -390,6 +397,7 @@ export class SessionAttributionBatch {
         }
         for (const lookup of lookups) {
           this.counters.lookups += 1;
+          if (indexInvalid) continue;
           if (readIndexed) {
             // Read one row past the cap so a full window and an oversized one
             // differ. Rows read spend the budget, so a batch reads at most
@@ -414,7 +422,17 @@ export class SessionAttributionBatch {
             // The two O(1) control counters catch missing/orphan cardinality.
             // Point checks keep a count-preserving stale row from authorizing
             // a project. Any invalid row makes the whole lookup fail closed.
-            if (rows.some((row) => row.sourceValid !== 1)) continue;
+            if (rows.some((row) => row.sourceValid !== 1)) {
+              // A stale point means the auxiliary row can no longer be
+              // trusted. Keep this lookup (and all later lookups in this
+              // batch) unallocated, record one failure, and arrange a
+              // writable reopen/rebuild. Never fall back to a partial scan
+              // after the index has made an integrity claim.
+              this.counters.integrityFailures += 1;
+              indexInvalid = true;
+              markSessionContextIndexInvalid(db, "source_point_mismatch");
+              continue;
+            }
             lookup.rows = plainContexts(rows);
             lookup.complete = true;
             continue;

@@ -41,6 +41,8 @@ type TimedOptions = {
   remainingMs: number;
   batchSize: number;
   now?: () => number;
+  /** Wall clock used only for persisted timestamps; deadlines stay monotonic. */
+  wallNow?: () => number | Date;
 };
 
 const PENDING_EVENT_LINK_CONTEXT_LIMIT = 8;
@@ -138,7 +140,7 @@ function advance(
 
 export function runRetentionDeletionStage(
   database: Database.Database,
-  options: TimedOptions & { retentionDays: number; parityReady: boolean; wallNow?: () => number;
+  options: TimedOptions & { retentionDays: number; parityReady: boolean;
     prune?: (maxRows: number) => { events: number; metricSamples: number } },
 ): BoundedStageResult {
   ensureMaintenanceStageSchema(database);
@@ -156,7 +158,8 @@ export function runRetentionDeletionStage(
       // Older rowid cursor receipts are safely replaced by the observed-time scan.
     }
   }
-  const wallNow = options.wallNow?.() ?? Date.now();
+  const wallReading = options.wallNow?.();
+  const wallNow = wallReading instanceof Date ? wallReading.getTime() : wallReading ?? Date.now();
   const cutoff = new Date(wallNow - Math.max(0, options.retentionDays) * 86_400_000).toISOString();
   const rows = options.prune ? (() => {
     const receipt = options.prune(adaptiveBatchSize);
@@ -309,6 +312,8 @@ export function runEnrichmentStage(
 export const SESSION_CONTEXT_BACKFILL_STAGE_MS = 250;
 /** Maximum rows one deadline slice may hold in a write transaction. */
 export const SESSION_CONTEXT_BACKFILL_UNIT_ROWS = 32;
+/** Do not let optional index repair inherit the worker's 900 ms busy wait. */
+export const SESSION_CONTEXT_BACKFILL_LOCK_WAIT_MS = 0;
 
 export type SessionContextBackfillStageResult = BoundedStageResult & {
   state: SessionContextIndexState;
@@ -334,15 +339,22 @@ export function runSessionContextBackfillStage(
   let contended = false;
   while (state === "backfilling" && timer.canStart()) {
     let batch: ReturnType<typeof backfillSessionContextIndex>;
+    const priorBusyTimeout = database.pragma("busy_timeout", { simple: true }) as number;
+    database.pragma(`busy_timeout = ${SESSION_CONTEXT_BACKFILL_LOCK_WAIT_MS}`);
     try {
       batch = backfillSessionContextIndex(database, batchSize, {
-        now: () => new Date(timer.now()),
+        now: () => {
+          const wallReading = options.wallNow?.();
+          return wallReading instanceof Date ? wallReading : new Date(wallReading ?? Date.now());
+        },
         shouldContinue: timer.canStart,
       });
     } catch (error) {
       if (!isSqliteContentionError(error)) throw error;
       contended = true;
       break;
+    } finally {
+      database.pragma(`busy_timeout = ${Math.max(0, Math.trunc(priorBusyTimeout || 0))}`);
     }
     state = batch.state;
     rows += batch.visited;

@@ -29,7 +29,11 @@ const COUNT_TRIGGERS = [
   "trg_session_repo_contexts_count_insert",
   "trg_session_repo_contexts_count_delete",
 ] as const;
-const SCHEMA_OBJECTS = [INDEX_TABLE, CONTROL_TABLE, ...EVENT_TRIGGERS, ...COUNT_TRIGGERS];
+const INTEGRITY_TRIGGERS = [
+  "trg_session_repo_contexts_integrity_update",
+] as const;
+const ALL_TRIGGERS = [...EVENT_TRIGGERS, ...COUNT_TRIGGERS, ...INTEGRITY_TRIGGERS] as const;
+const SCHEMA_OBJECTS = [INDEX_TABLE, CONTROL_TABLE, ...ALL_TRIGGERS];
 
 /** Rows one backfill transaction may visit. */
 export const SESSION_CONTEXT_BACKFILL_MAX_BATCH_ROWS = 5_000;
@@ -43,6 +47,16 @@ function contextRow(alias: string) {
 const UPSERT_CONTEXT = `on conflict (session_id, observed_at, source_rowid)
   do update set repo_hash = excluded.repo_hash
   where session_repo_contexts.repo_hash is not excluded.repo_hash`;
+
+/** An order-independent checksum of the primary-key material. */
+function keyChecksum(alias: string) {
+  return `(coalesce(${alias}.source_rowid, 0) + coalesce(unixepoch(${alias}.observed_at), 0))`;
+}
+
+/** The same checksum for a buffered_events source row. */
+function eventKeyChecksum(alias: string) {
+  return `(coalesce(${alias}.rowid, 0) + coalesce(unixepoch(${alias}.observed_at), 0))`;
+}
 
 const SCHEMA = `
   create table if not exists session_repo_contexts (
@@ -65,7 +79,14 @@ const SCHEMA = `
     backfill_last_batch_at text,
     backfill_completed_at text,
     indexed_rows integer not null default 0 check (indexed_rows >= 0),
-    ledger_context_rows integer not null default 0 check (ledger_context_rows >= 0)
+    ledger_context_rows integer not null default 0 check (ledger_context_rows >= 0),
+    indexed_key_checksum integer not null default 0,
+    ledger_key_checksum integer not null default 0,
+    integrity_state text not null default 'valid'
+      check (integrity_state in ('valid', 'invalid')),
+    integrity_failures integer not null default 0 check (integrity_failures >= 0),
+    integrity_last_failure_at text,
+    integrity_last_failure_reason text
   );
 
   create trigger if not exists trg_events_session_context_insert
@@ -76,7 +97,9 @@ const SCHEMA = `
     values (new.session_id, new.observed_at, new.rowid, new.repo_hash)
     ${UPSERT_CONTEXT};
     update session_repo_context_control
-    set ledger_context_rows = ledger_context_rows + 1 where singleton = 1;
+    set ledger_context_rows = ledger_context_rows + 1,
+        ledger_key_checksum = ledger_key_checksum + ${eventKeyChecksum("new")}
+    where singleton = 1;
   end;
 
   create trigger if not exists trg_events_session_context_update
@@ -88,12 +111,17 @@ const SCHEMA = `
       old.repo_hash is not new.repo_hash or old.data_mode is not new.data_mode or
       old.privacy_disposition is not new.privacy_disposition)
   begin
-    update session_repo_context_control set ledger_context_rows = max(0, ledger_context_rows -
-      case when exists (
+    update session_repo_context_control set
+      ledger_context_rows = max(0, ledger_context_rows - case when exists (
         select 1 from session_repo_contexts
         where session_id = old.session_id and observed_at = old.observed_at
           and source_rowid = old.rowid
-      ) then 1 else 0 end)
+      ) then 1 else 0 end),
+      ledger_key_checksum = ledger_key_checksum - case when exists (
+        select 1 from session_repo_contexts
+        where session_id = old.session_id and observed_at = old.observed_at
+          and source_rowid = old.rowid
+      ) then ${eventKeyChecksum("old")} else 0 end
     where singleton = 1;
     delete from session_repo_contexts
     where session_id = old.session_id and observed_at = old.observed_at
@@ -102,8 +130,10 @@ const SCHEMA = `
     select new.session_id, new.observed_at, new.rowid, new.repo_hash
     where ${contextRow("new")}
     ${UPSERT_CONTEXT};
-    update session_repo_context_control set ledger_context_rows = ledger_context_rows +
-      case when ${contextRow("new")} then 1 else 0 end
+    update session_repo_context_control set
+      ledger_context_rows = ledger_context_rows + case when ${contextRow("new")} then 1 else 0 end,
+      ledger_key_checksum = ledger_key_checksum + case when ${contextRow("new")}
+        then ${eventKeyChecksum("new")} else 0 end
     where singleton = 1;
   end;
 
@@ -111,12 +141,17 @@ const SCHEMA = `
   after delete on buffered_events
   when old.session_id is not null and old.repo_hash is not null
   begin
-    update session_repo_context_control set ledger_context_rows = max(0, ledger_context_rows -
-      case when exists (
+    update session_repo_context_control set
+      ledger_context_rows = max(0, ledger_context_rows - case when exists (
         select 1 from session_repo_contexts
         where session_id = old.session_id and observed_at = old.observed_at
           and source_rowid = old.rowid
-      ) then 1 else 0 end)
+      ) then 1 else 0 end),
+      ledger_key_checksum = ledger_key_checksum - case when exists (
+        select 1 from session_repo_contexts
+        where session_id = old.session_id and observed_at = old.observed_at
+          and source_rowid = old.rowid
+      ) then ${eventKeyChecksum("old")} else 0 end
     where singleton = 1;
     delete from session_repo_contexts
     where session_id = old.session_id and observed_at = old.observed_at
@@ -126,13 +161,34 @@ const SCHEMA = `
   create trigger if not exists trg_session_repo_contexts_count_insert
   after insert on session_repo_contexts
   begin
-    update session_repo_context_control set indexed_rows = indexed_rows + 1 where singleton = 1;
+    update session_repo_context_control set
+      indexed_rows = indexed_rows + 1,
+      indexed_key_checksum = indexed_key_checksum + ${keyChecksum("new")}
+    where singleton = 1;
   end;
 
   create trigger if not exists trg_session_repo_contexts_count_delete
   after delete on session_repo_contexts
   begin
-    update session_repo_context_control set indexed_rows = indexed_rows - 1 where singleton = 1;
+    update session_repo_context_control set
+      indexed_rows = max(0, indexed_rows - 1),
+      indexed_key_checksum = indexed_key_checksum - ${keyChecksum("old")}
+    where singleton = 1;
+  end;
+
+  create trigger if not exists trg_session_repo_contexts_integrity_update
+  after update on session_repo_contexts
+  begin
+    update session_repo_context_control set
+      integrity_state = 'invalid',
+      backfill_complete = 0,
+      backfill_completed_at = null,
+      integrity_failures = integrity_failures + case when integrity_state = 'valid' then 1 else 0 end,
+      integrity_last_failure_at = case when integrity_state = 'valid'
+        then strftime('%Y-%m-%dT%H:%M:%fZ', 'now') else integrity_last_failure_at end,
+      integrity_last_failure_reason = case when integrity_state = 'valid'
+        then 'session_repo_contexts_updated' else integrity_last_failure_reason end
+    where singleton = 1;
   end;
 `;
 
@@ -149,6 +205,12 @@ type ControlRow = {
   completedAt: string | null;
   indexedRows: number;
   ledgerContextRows: number;
+  indexedKeyChecksum: number;
+  ledgerKeyChecksum: number;
+  integrityState: "valid" | "invalid";
+  integrityFailures: number;
+  integrityLastFailureAt: string | null;
+  integrityLastFailureReason: string | null;
 };
 
 function auxiliaryIndexError(error: unknown) {
@@ -166,7 +228,13 @@ function readControl(db: Database.Database): ControlRow | null {
          backfill_rows_visited as rowsVisited, backfill_rows_indexed as rowsIndexed,
          backfill_batches as batches, backfill_last_batch_at as lastBatchAt,
          backfill_completed_at as completedAt, indexed_rows as indexedRows,
-         ledger_context_rows as ledgerContextRows
+         ledger_context_rows as ledgerContextRows,
+         indexed_key_checksum as indexedKeyChecksum,
+         ledger_key_checksum as ledgerKeyChecksum,
+         integrity_state as integrityState,
+         integrity_failures as integrityFailures,
+         integrity_last_failure_at as integrityLastFailureAt,
+         integrity_last_failure_reason as integrityLastFailureReason
        from session_repo_context_control where singleton = 1`,
     ).get() as ControlRow | undefined) ?? null;
   } catch (error) {
@@ -208,37 +276,115 @@ function countsAgree(control: ControlRow) {
   return control.indexedRows === control.ledgerContextRows;
 }
 
+function checksumsAgree(control: ControlRow) {
+  return control.indexedKeyChecksum === control.ledgerKeyChecksum;
+}
+
+function controlTableUsable(db: Database.Database) {
+  try {
+    const columns = db.prepare(`pragma table_info(session_repo_context_control)`).all() as Array<{ name: string }>;
+    const names = new Set(columns.map((column) => column.name));
+    return [
+      "singleton", "installed_at", "backfill_complete", "backfill_cursor_repo_hash",
+      "backfill_cursor_branch_hash", "backfill_cursor_rowid", "backfill_rows_visited",
+      "backfill_rows_indexed", "backfill_batches", "backfill_last_batch_at",
+      "backfill_completed_at", "indexed_rows", "ledger_context_rows", "indexed_key_checksum",
+      "ledger_key_checksum", "integrity_state", "integrity_failures", "integrity_last_failure_at",
+      "integrity_last_failure_reason",
+    ].every((name) => names.has(name));
+  } catch (error) {
+    if (auxiliaryIndexError(error)) return false;
+    throw error;
+  }
+}
+
+function recomputedIndexChecksum(db: Database.Database) {
+  const row = db.prepare(
+    `select coalesce(sum(${keyChecksum("session_repo_contexts")}), 0) as checksum
+       from session_repo_contexts`,
+  ).get() as { checksum: number };
+  return row.checksum;
+}
+
+// A stale row can be discovered from a read-only history connection. Keep an
+// in-process marker for that connection, and persist the same state whenever
+// the database is writable. The warning is deliberately once per connection.
+const invalidDatabases = new WeakSet<Database.Database>();
+const validatedIndexes = new WeakMap<Database.Database, { rows: number; checksum: number }>();
+
+export function markSessionContextIndexInvalid(db: Database.Database, reason: string) {
+  const first = !invalidDatabases.has(db);
+  invalidDatabases.add(db);
+  validatedIndexes.delete(db);
+  try {
+    db.prepare(
+      `update session_repo_context_control set
+         integrity_state = 'invalid',
+         backfill_complete = 0,
+         backfill_completed_at = null,
+         integrity_failures = integrity_failures + case when integrity_state = 'valid' then 1 else 0 end,
+         integrity_last_failure_at = case when integrity_state = 'valid' then @at else integrity_last_failure_at end,
+         integrity_last_failure_reason = case when integrity_state = 'valid' then @reason else integrity_last_failure_reason end
+       where singleton = 1`,
+    ).run({ at: new Date().toISOString(), reason });
+  } catch {
+    // Read-only history and a missing/partially-corrupt auxiliary table must
+    // fail closed, never make the attribution read throw.
+  }
+  if (first) console.warn(JSON.stringify({ status: "session_context_index_invalid", reason }));
+}
+
+function invariantAgrees(db: Database.Database, control: ControlRow) {
+  if (!countsAgree(control) || !checksumsAgree(control)) return false;
+  // A backfilling index is never used for attribution, so its maintained
+  // checksum is enough. Complete indexes get an aggregate point validation;
+  // this catches an out-of-band UPDATE that did not fire a checksum trigger.
+  if (control.complete !== 1) return true;
+  const cached = validatedIndexes.get(db);
+  if (cached && cached.rows === control.indexedRows && cached.checksum === control.indexedKeyChecksum) return true;
+  const recomputed = recomputedIndexChecksum(db);
+  if (recomputed !== control.indexedKeyChecksum) return false;
+  validatedIndexes.set(db, { rows: control.indexedRows, checksum: control.indexedKeyChecksum });
+  return true;
+}
+
 const TRIGGER_FRAGMENTS: Record<
-  typeof EVENT_TRIGGERS[number] | typeof COUNT_TRIGGERS[number], readonly string[]
+  typeof EVENT_TRIGGERS[number] | typeof COUNT_TRIGGERS[number] | typeof INTEGRITY_TRIGGERS[number], readonly string[]
 > = {
   trg_events_session_context_insert: ["after insert on buffered_events", "insert into session_repo_contexts", "ledger_context_rows = ledger_context_rows + 1"],
   trg_events_session_context_update: ["after update of session_id", "delete from session_repo_contexts", "ledger_context_rows"],
   trg_events_session_context_delete: ["after delete on buffered_events", "delete from session_repo_contexts", "ledger_context_rows"],
-  trg_session_repo_contexts_count_insert: ["after insert on session_repo_contexts", "indexed_rows = indexed_rows + 1"],
-  trg_session_repo_contexts_count_delete: ["after delete on session_repo_contexts", "indexed_rows = indexed_rows - 1"],
+  trg_session_repo_contexts_count_insert: ["after insert on session_repo_contexts", "indexed_rows = indexed_rows + 1", "indexed_key_checksum"],
+  trg_session_repo_contexts_count_delete: ["after delete on session_repo_contexts", "indexed_rows = max(0, indexed_rows - 1)", "indexed_key_checksum"],
+  trg_session_repo_contexts_integrity_update: ["after update on session_repo_contexts", "integrity_state = 'invalid'", "backfill_completed_at = null"],
 };
 
 function auxiliaryObjectsUsable(db: Database.Database) {
-  const present = db.prepare(
-    `select name, type, sql from sqlite_master
-     where name in (${SCHEMA_OBJECTS.map(() => "?").join(", ")})`,
-  ).all(...SCHEMA_OBJECTS) as Array<{ name: string; type: string; sql: string | null }>;
-  const types = new Map(present.map((row) => [row.name, row.type]));
-  const objectsPresent = types.get(INDEX_TABLE) === "table" && types.get(CONTROL_TABLE) === "table" &&
-    [...EVENT_TRIGGERS, ...COUNT_TRIGGERS].every((name) => types.get(name) === "trigger");
-  if (!objectsPresent || !indexTableUsable(db)) return false;
-  const definitions = new Map(present.map((row) => [row.name, row.sql?.toLowerCase() ?? ""]));
-  return (Object.entries(TRIGGER_FRAGMENTS) as Array<[
-    typeof EVENT_TRIGGERS[number] | typeof COUNT_TRIGGERS[number], readonly string[]
-  ]>).every(
-    ([name, fragments]) => fragments.every((fragment) => definitions.get(name)?.includes(fragment)),
-  );
+  try {
+    const present = db.prepare(
+      `select name, type, sql from sqlite_master
+       where name in (${SCHEMA_OBJECTS.map(() => "?").join(", ")})`,
+    ).all(...SCHEMA_OBJECTS) as Array<{ name: string; type: string; sql: string | null }>;
+    const types = new Map(present.map((row) => [row.name, row.type]));
+    const objectsPresent = types.get(INDEX_TABLE) === "table" && types.get(CONTROL_TABLE) === "table" &&
+      ALL_TRIGGERS.every((name) => types.get(name) === "trigger");
+    if (!objectsPresent || !indexTableUsable(db) || !controlTableUsable(db)) return false;
+    const definitions = new Map(present.map((row) => [row.name, row.sql?.toLowerCase() ?? ""]));
+    return (Object.entries(TRIGGER_FRAGMENTS) as Array<[
+      typeof EVENT_TRIGGERS[number] | typeof COUNT_TRIGGERS[number] | typeof INTEGRITY_TRIGGERS[number], readonly string[]
+    ]>).every(
+      ([name, fragments]) => fragments.every((fragment) => definitions.get(name)?.includes(fragment)),
+    );
+  } catch (error) {
+    if (auxiliaryIndexError(error)) return false;
+    throw error;
+  }
 }
 
 function installed(db: Database.Database) {
   if (!auxiliaryObjectsUsable(db)) return false;
   const control = readControl(db);
-  return control !== null && countsAgree(control);
+  return control !== null && control.integrityState === "valid" && countsAgree(control) && checksumsAgree(control);
 }
 
 /**
@@ -259,7 +405,7 @@ export function ensureSessionContextIndexSchema(
   db.transaction(() => {
     if (installed(db)) return;
     db.exec(`drop table if exists ${INDEX_TABLE};
-      ${[...EVENT_TRIGGERS, ...COUNT_TRIGGERS].map((name) => `drop trigger if exists ${name};`).join("\n")}`);
+      ${ALL_TRIGGERS.map((name) => `drop trigger if exists ${name};`).join("\n")}`);
     db.exec(`drop table if exists ${CONTROL_TABLE};`);
     db.exec(SCHEMA);
     const backfillNeeded = Boolean(db.prepare(
@@ -270,8 +416,9 @@ export function ensureSessionContextIndexSchema(
     db.prepare(
       `insert into session_repo_context_control
          (singleton, installed_at, backfill_complete, backfill_completed_at,
-          indexed_rows, ledger_context_rows)
-       values (1, @at, @complete, @completedAt, 0, 0)
+          indexed_rows, ledger_context_rows, indexed_key_checksum, ledger_key_checksum,
+          integrity_state, integrity_failures, integrity_last_failure_at, integrity_last_failure_reason)
+       values (1, @at, @complete, @completedAt, 0, 0, 0, 0, 'valid', 0, null, null)
        on conflict (singleton) do update set
          installed_at = excluded.installed_at,
          backfill_complete = excluded.backfill_complete,
@@ -284,7 +431,13 @@ export function ensureSessionContextIndexSchema(
          backfill_last_batch_at = null,
          backfill_completed_at = excluded.backfill_completed_at,
          indexed_rows = 0,
-         ledger_context_rows = 0`,
+         ledger_context_rows = 0,
+         indexed_key_checksum = 0,
+         ledger_key_checksum = 0,
+         integrity_state = 'valid',
+         integrity_failures = 0,
+         integrity_last_failure_at = null,
+         integrity_last_failure_reason = null`,
     ).run({
       at,
       complete: backfillNeeded ? 0 : 1,
@@ -293,14 +446,25 @@ export function ensureSessionContextIndexSchema(
   }).immediate();
 }
 
-export type SessionContextIndexState = "absent" | "backfilling" | "complete";
+export type SessionContextIndexState = "absent" | "backfilling" | "complete" | "invalid";
 
 function stateOf(control: ControlRow | null): SessionContextIndexState {
-  return control === null ? "absent" : control.complete === 1 ? "complete" : "backfilling";
+  return control === null ? "absent" : control.integrityState === "invalid"
+    ? "invalid" : control.complete === 1 ? "complete" : "backfilling";
 }
 
 function verifiedState(db: Database.Database, control: ControlRow | null): SessionContextIndexState {
-  if (control === null || !auxiliaryObjectsUsable(db) || !countsAgree(control)) return "absent";
+  if (control === null || !auxiliaryObjectsUsable(db)) return "absent";
+  if (invalidDatabases.has(db) || control.integrityState === "invalid") {
+    if (!invalidDatabases.has(db)) markSessionContextIndexInvalid(
+      db, control.integrityLastFailureReason ?? "index_marked_invalid",
+    );
+    return "invalid";
+  }
+  if (!invariantAgrees(db, control)) {
+    markSessionContextIndexInvalid(db, "index_invariant_mismatch");
+    return "invalid";
+  }
   return stateOf(control);
 }
 
@@ -402,11 +566,20 @@ export function backfillSessionContextIndex(
        from buffered_events e where e.rowid = ? and ${contextRow("e")}
        on conflict (session_id, observed_at, source_rowid) do nothing`,
     );
+    const sourceChecksum = db.prepare(
+      `select coalesce(rowid, 0) + coalesce(unixepoch(observed_at), 0) as checksum
+         from buffered_events where rowid = ?`,
+    );
     let indexed = 0;
+    let indexedChecksum = 0;
     let visited = 0;
     for (const row of rows) {
       if (backfillOptions.shouldContinue && !backfillOptions.shouldContinue()) break;
-      indexed += index.run(row.rowid).changes;
+      const changes = index.run(row.rowid).changes;
+      indexed += changes;
+      if (changes > 0) {
+        indexedChecksum += (sourceChecksum.get(row.rowid) as { checksum: number } | undefined)?.checksum ?? 0;
+      }
       visited += 1;
     }
     // A clock can expire before the first row. Do not advance the cursor or
@@ -418,8 +591,10 @@ export function backfillSessionContextIndex(
     if (indexed > 0) {
       db.prepare(
         `update session_repo_context_control
-         set ledger_context_rows = ledger_context_rows + ? where singleton = 1`,
-      ).run(indexed);
+         set ledger_context_rows = ledger_context_rows + ?,
+             ledger_key_checksum = ledger_key_checksum + ?
+         where singleton = 1`,
+      ).run(indexed, indexedChecksum);
     }
     const complete = visited === rows.length && rows.length < limit;
     const last = complete ? null : visited > 0 ? rows[visited - 1]! : cursor;
@@ -434,9 +609,11 @@ export function backfillSessionContextIndex(
          backfill_batches = backfill_batches + 1,
          backfill_last_batch_at = @at,
          backfill_complete = case
-           when @complete = 1 and indexed_rows = ledger_context_rows then 1 else 0 end,
+           when @complete = 1 and indexed_rows = ledger_context_rows
+             and indexed_key_checksum = ledger_key_checksum then 1 else 0 end,
          backfill_completed_at = case
-           when @complete = 1 and indexed_rows = ledger_context_rows then @at else null end
+           when @complete = 1 and indexed_rows = ledger_context_rows
+             and indexed_key_checksum = ledger_key_checksum then @at else null end
        where singleton = 1`,
     ).run({
       repoHash: last?.repoHash ?? null,
@@ -487,7 +664,9 @@ export function sessionContextIndexStatus(db: Database.Database): SessionContext
       batches: control?.batches ?? 0,
       installedAt: control?.installedAt ?? null,
       lastBatchAt: control?.lastBatchAt ?? null,
-      completedAt: control?.completedAt ?? null,
+      // A stale completion marker must never accompany an invalid/absent
+      // state. Writable reopen will rebuild; read-only callers stay honest.
+      completedAt: state === "complete" ? control?.completedAt ?? null : null,
     },
   };
 }
