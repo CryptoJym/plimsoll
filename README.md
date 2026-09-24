@@ -903,17 +903,17 @@ These are **hashed** before storage: emails, user/account IDs, file paths, worki
 
 These are stored plain: timestamps, event types, tool *names*, action classes, models, token counts, costs, durations, session IDs, commit shas.
 
-**Symlinks are not followed.** The Codex, Claude and Grok tailers read only
-regular files in real directories under their session folders. A symlinked
-session folder, project folder, transcript, rollout or `usage.json` is not
-read, and nothing behind the link is listed or stat'ed: a link can point
-anywhere on the machine, and following one is a privacy and security decision
-the collector has not taken. Uploads carry a capture claim — how far capture is
-complete, and which intervals may be missing. It reports each such link as a
-gap, from the link's creation (not before enrollment) until the collector last
-saw it, so it never vouches for usage the collector did not read. A symlinked
-`memory` folder inside a Claude project is not reported: it holds Claude Code's
-Markdown notes, never transcripts.
+**Symlinks are not followed.** Inside their session folders, the Codex, Claude
+and Grok tailers read only regular files in real directories. A symlinked
+project or day folder, transcript, rollout, Grok session folder or
+`usage.json`, or a symlinked Grok `sessions` folder, is not read: a link can
+point anywhere on the machine, and following one is a privacy and security
+decision the collector has not taken. The upload's capture claim (how far
+capture is complete, and which intervals may be missing) never vouches for
+usage behind such a link. The capture check looks only at the link itself and
+reports it as a gap, from the link's creation (not before enrollment) until the
+collector last saw it. A symlinked `memory` folder inside a Claude project is
+not reported: it holds Claude Code's Markdown notes, never transcripts.
 
 Managed or upload-enabled installs are locked to the literal
 `metadata_only` privacy mode. Attempts to enable raw evidence through the
