@@ -759,6 +759,40 @@ export const FIXTURES: Fixture[] = [
     files: { [file]: text },
     replayableOnTextualGate: false,
   })),
+  // ---- Review 2: YAML the gate cannot read the way GitHub does -----------
+  {
+    name: "review2_merge_key_disabled_step",
+    origin: "review2",
+    expectGateGreen: false,
+    describe: "a proof step merges in `<<: *skip_step`, whose `if:` is false",
+    build: (input) => {
+      const [, t] = fixtureTargets(input);
+      const edited = editWorkflow(input, (document) => {
+        const found = findStep(document, t!.line);
+        const steps = found.job.get("steps", true);
+        if (!isSeq(steps)) throw new Error("fixture job has no steps");
+        const skip = document.createNode({ name: "Never", if: false, run: "echo never" });
+        skip.anchor = "skip_step";
+        steps.items.unshift(skip);
+        findStep(document, t!.line).step.items.unshift(document.createPair("<<", document.createAlias(skip)));
+      });
+      return { input: edited, error: /YAML merge key/ };
+    },
+  },
+  ...([
+    ["unknown_step_key", "a proof step gains `timeout: 1`, which GitHub does not define", (input: CoverageInput, t: Target) => setStepKey(input, t.line, "timeout", 1)],
+    ["unknown_job_key", "the proof job gains `skip-if: true`", (input: CoverageInput, t: Target) => setJobKey(input, t.line, "skip-if", true)],
+    ["unknown_workflow_key", "the workflow gains a top-level `skip: true`", (input: CoverageInput) => editWorkflow(input, (document) => document.set("skip", true))],
+  ] as const).map(([name, describe, edit]): Fixture => ({
+    name,
+    origin: "gate",
+    expectGateGreen: false,
+    describe,
+    build: (input) => {
+      const [t] = fixtureTargets(input);
+      return { input: edit(input, t!), error: /unknown key/ };
+    },
+  })),
 ];
 
 /**

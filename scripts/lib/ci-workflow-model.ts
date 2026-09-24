@@ -10,6 +10,8 @@ import { LineCounter, parseDocument, type Document } from "yaml";
  * three-valued: anything not provably true is not true), neither sets
  * `continue-on-error`, the step runs bash in the workspace root, and nothing
  * it depends on can be skipped. Everything else is reported with a reason.
+ * A YAML merge key (`<<`) or a workflow, job or step key GitHub does not
+ * define is an error: the gate does not guess what an unknown key does.
  */
 
 export const COVERAGE_EVENTS = ["push", "pull_request"] as const;
@@ -430,6 +432,37 @@ function matrixCombinations(strategy: unknown): { combos: Json[] } | { problem: 
 
 const NON_WINDOWS_RUNNER = /^(?:macos|ubuntu)-[A-Za-z0-9.-]+$/;
 
+const WORKFLOW_KEYS = ["name", "run-name", "on", "permissions", "env", "defaults", "concurrency", "jobs"];
+const JOB_KEYS = [
+  "name", "permissions", "needs", "if", "runs-on", "snapshot", "environment", "concurrency", "outputs", "env",
+  "defaults", "steps", "timeout-minutes", "strategy", "continue-on-error", "container", "services", "uses", "with", "secrets",
+];
+const STEP_KEYS = ["id", "if", "name", "uses", "run", "shell", "with", "env", "continue-on-error", "timeout-minutes", "working-directory"];
+
+/** Where a YAML merge key appears (yaml parses `<<` as a plain key under YAML 1.2). */
+function mergeKeys(value: unknown, at: string): string[] {
+  if (Array.isArray(value)) return value.flatMap((item, index) => mergeKeys(item, `${at}[${index}]`));
+  if (!isRecord(value)) return [];
+  return Object.entries(value).flatMap(([key, child]) => [...(key === "<<" ? [at || "(top level)"] : []), ...mergeKeys(child, at ? `${at}.${key}` : key)]);
+}
+
+/** Keys of a workflow, its jobs and their steps that GitHub does not define. */
+function unknownKeys(path: string, workflow: Json): string[] {
+  const unknown = (record: Json, known: string[], where: string) =>
+    Object.keys(record)
+      .filter((key) => key !== "<<" && !known.includes(key))
+      .map((key) => `${where}: unknown key \`${key}\``);
+  const problems = unknown(workflow, WORKFLOW_KEYS, path);
+  for (const [id, job] of Object.entries(isRecord(workflow.jobs) ? workflow.jobs : {})) {
+    if (!isRecord(job)) continue;
+    problems.push(...unknown(job, JOB_KEYS, `${path} job "${id}"`));
+    (Array.isArray(job.steps) ? job.steps : []).forEach((step: unknown, index: number) => {
+      if (isRecord(step)) problems.push(...unknown(step, STEP_KEYS, `${path} job "${id}" step ${index + 1}`));
+    });
+  }
+  return problems;
+}
+
 const envNames = (env: unknown): string[] | null => (env === undefined ? [] : isRecord(env) ? Object.keys(env) : null);
 
 function lineOf(document: Document, lineCounter: LineCounter, path: Array<string | number>) {
@@ -451,6 +484,10 @@ export function modelWorkflow(path: string, text: string): WorkflowModel {
   if (!isRecord(workflow) || !isRecord(workflow.jobs)) {
     return { path, errors: [`${path}: not a workflow with a jobs mapping`], triggerProblems: [], steps: [], env: [], jobs: {} };
   }
+  const structure = [
+    ...mergeKeys(workflow, "").map((at) => `${path}: YAML merge key \`<<\` at ${at}; GitHub does not merge keys and the gate does not guess`),
+    ...unknownKeys(path, workflow),
+  ];
   const triggers = COVERAGE_EVENTS.flatMap((event) => triggerProblems(workflow.on, event));
   const jobs = workflow.jobs as Json;
   const workflowDefaults = isRecord(workflow.defaults) && isRecord(workflow.defaults.run) ? workflow.defaults.run : {};
@@ -559,5 +596,5 @@ export function modelWorkflow(path: string, text: string): WorkflowModel {
   const jobInfo = Object.fromEntries(
     Object.entries(jobs).map(([id, job]) => [id, { env: isRecord(job) ? envNames(job.env) : null, container: isRecord(job) && job.container !== undefined }]),
   );
-  return { path, errors: [], triggerProblems: triggers, steps, env: envNames(workflow.env), jobs: jobInfo };
+  return { path, errors: structure, triggerProblems: triggers, steps, env: envNames(workflow.env), jobs: jobInfo };
 }
