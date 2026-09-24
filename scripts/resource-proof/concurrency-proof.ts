@@ -56,6 +56,8 @@ async function main() {
           (exercise) => exercise.failedCalls,
         ),
         eachDirectoryReadFailures: result.exercises.map((exercise) => exercise.readFailures),
+        eachMetadataOperations: result.exercises.map((exercise) => exercise.metadataCalls),
+        eachMetadataFailures: result.exercises.map((exercise) => exercise.metadataFailures),
         eachDeduplicatedEntries: result.exercises.map(
           (exercise) => exercise.deduplicatedEntries,
         ),
