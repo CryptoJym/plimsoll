@@ -21,7 +21,7 @@ import { PLIMSOLL_VERSION } from "./version";
 import type { SyncStorageRetryController } from "./sqlite-contention";
 import {
   applyProjectAttribution,
-  readSessionRepoContexts,
+  SessionAttributionBatch,
 } from "./session-attribution";
 
 /**
@@ -51,15 +51,14 @@ export function buildIngestBatch(
 
   const rows: BufferedEventRow[] = [];
   const events = [];
+  const attribution = new SessionAttributionBatch(
+    buffer.database,
+    candidateRows.map((row) => ({ event: row.payload, repoHash: row.repoHash })),
+  );
   for (const row of candidateRows) {
-    const sessionScan = readSessionRepoContexts(buffer.database, row.payload, {
-      repoHash: row.repoHash,
-    });
-    const attributed = applyProjectAttribution(row.payload, {
+    const attributed = attribution.attribute(row.payload, {
       repoHash: row.repoHash,
       branchHash: row.branchHash,
-      sessionContexts: sessionScan.rows,
-      sessionContextsTruncated: sessionScan.truncated,
     });
     const sealed = sealOutboundEnvelope({
       event: attributed.event,

@@ -13,7 +13,7 @@ import {
   type TerminalPrivacyReason,
 } from "./privacy-disposition";
 import { ensureUuidEventId, normalizeHistoryEvent } from "./upload-history";
-import { applyProjectAttribution, readSessionRepoContexts } from "./session-attribution";
+import { applyProjectAttribution, SessionAttributionBatch } from "./session-attribution";
 
 export const DEFAULT_DELIVERY_LIMITS = {
   maxActiveRows: 50_000,
@@ -258,11 +258,7 @@ type PreparedDelivery =
     }
   | { ok: false; deliveryId: string; reason: DeliveryReceiptReason };
 
-function prepareDelivery(
-  row: RawDeliveryRow,
-  maxItemBytes: number,
-  db: Database.Database,
-): PreparedDelivery {
+function prepareDelivery(row: RawDeliveryRow, maxItemBytes: number): PreparedDelivery {
   const fallbackId = ensureUuidEventId(row.rawId).id;
   if (row.dataMode === "evidence") {
     return { ok: false, deliveryId: fallbackId, reason: "local_evidence_quarantined" };
@@ -282,14 +278,12 @@ function prepareDelivery(
   }
 
   const deliveryId = normalized.envelope.event.id;
-  const sessionScan = readSessionRepoContexts(db, normalized.envelope.event, {
-    repoHash: row.repoHash,
-  });
+  // Capture, legacy migration and replay enqueue one row at a time, so no
+  // session lookup runs here: lease() applies session inheritance when it
+  // seals the envelope, with one bounded lookup per lease batch.
   const attributed = applyProjectAttribution(normalized.envelope.event, {
     repoHash: row.repoHash,
     branchHash: row.branchHash,
-    sessionContexts: sessionScan.rows,
-    sessionContextsTruncated: sessionScan.truncated,
   });
   const envelope = sealOutboundEnvelope({
     ...normalized.envelope,
@@ -321,14 +315,13 @@ function attachFillOnlyLinkage(
   envelope: AiWorkIngestEvent,
   repoHash: string | null,
   branchHash: string | null,
-  db: Database.Database,
+  attribution: SessionAttributionBatch,
+  disposedRawRowids: ReadonlySet<number>,
 ): AiWorkIngestEvent {
-  const sessionScan = readSessionRepoContexts(db, envelope.event, { repoHash });
-  const attributed = applyProjectAttribution(envelope.event, {
+  const attributed = attribution.attribute(envelope.event, {
     repoHash,
     branchHash,
-    sessionContexts: sessionScan.rows,
-    sessionContextsTruncated: sessionScan.truncated,
+    excludedRowids: disposedRawRowids,
   });
   return {
     ...envelope,
@@ -757,7 +750,7 @@ export class DeliveryOutbox {
       );
       return { enqueued: 0, dead: 0 };
     }
-    const prepared = prepareDelivery(row, this.limits.maxItemBytes, this.db);
+    const prepared = prepareDelivery(row, this.limits.maxItemBytes);
     if (prepared.ok === false) {
       const terminalAt = this.clock().toISOString();
       if (isTerminalPrivacyReason(prepared.reason)) {
@@ -1390,19 +1383,42 @@ export class DeliveryOutbox {
         )
         .all({ now: nowIso, workspaceId: this.workspaceId, deviceId: this.deviceId, maxRows }) as ActiveDeliveryRow[];
 
+      // Session inheritance is applied here, where envelopes are sealed. Parse
+      // every unsealed envelope first so the batch plans one bounded lookup
+      // per session instead of one ledger scan per token row.
+      const unsealed = new Map<string, AiWorkIngestEvent | null>();
+      for (const row of candidates) {
+        if (row.sealedEnvelopeJson) continue;
+        try {
+          unsealed.set(row.deliveryId, aiWorkIngestEventSchema.parse(JSON.parse(row.baseEnvelopeJson)));
+        } catch {
+          unsealed.set(row.deliveryId, null);
+        }
+      }
+      const attribution = new SessionAttributionBatch(
+        this.db,
+        candidates.flatMap((row) => {
+          const parsed = unsealed.get(row.deliveryId);
+          return parsed && parsed.event.dataMode !== "evidence"
+            ? [{ event: parsed.event, repoHash: canonicalLinkage(row.repoHash) }]
+            : [];
+        }),
+      );
+      // Raw rows this pass privacy-disposes stop counting as session context
+      // for the rest of the pass, as a fresh per-row query would see them.
+      const disposedRawRowids = new Set<number>();
+
       for (const row of candidates) {
         const authoritativeReason = this.authoritativePrivacyReason(row);
         if (authoritativeReason) {
-          locallyDead += this.deadActive(row.deliveryId, authoritativeReason, nowIso);
+          locallyDead += this.deadActive(row.deliveryId, authoritativeReason, nowIso, disposedRawRowids);
           continue;
         }
         let envelopeJson = row.sealedEnvelopeJson;
         if (!envelopeJson) {
-          let parsed: AiWorkIngestEvent;
-          try {
-            parsed = aiWorkIngestEventSchema.parse(JSON.parse(row.baseEnvelopeJson));
-          } catch {
-            locallyDead += this.deadActive(row.deliveryId, "local_schema_invalid", nowIso);
+          const parsed = unsealed.get(row.deliveryId);
+          if (!parsed) {
+            locallyDead += this.deadActive(row.deliveryId, "local_schema_invalid", nowIso, disposedRawRowids);
             continue;
           }
           if (parsed.event.dataMode === "evidence") {
@@ -1410,6 +1426,7 @@ export class DeliveryOutbox {
               row.deliveryId,
               "local_evidence_quarantined",
               nowIso,
+              disposedRawRowids,
             );
             continue;
           }
@@ -1418,7 +1435,8 @@ export class DeliveryOutbox {
               parsed,
               canonicalLinkage(row.repoHash),
               canonicalLinkage(row.branchHash),
-              this.db,
+              attribution,
+              disposedRawRowids,
             ),
           );
           if (!sealed.ok) {
@@ -1426,13 +1444,14 @@ export class DeliveryOutbox {
               row.deliveryId,
               sealed.reason === "schema" ? "local_schema_invalid" : "local_privacy_violation",
               nowIso,
+              disposedRawRowids,
             );
             continue;
           }
           envelopeJson = JSON.stringify(sealed.envelope);
           const envelopeBytes = Buffer.byteLength(envelopeJson);
           if (envelopeBytes > this.limits.maxItemBytes) {
-            locallyDead += this.deadActive(row.deliveryId, "local_item_oversize", nowIso);
+            locallyDead += this.deadActive(row.deliveryId, "local_item_oversize", nowIso, disposedRawRowids);
             continue;
           }
           this.db
@@ -1449,7 +1468,7 @@ export class DeliveryOutbox {
         try {
           outboundEnvelope = aiWorkIngestEventSchema.parse(JSON.parse(envelopeJson));
         } catch {
-          locallyDead += this.deadActive(row.deliveryId, "local_schema_invalid", nowIso);
+          locallyDead += this.deadActive(row.deliveryId, "local_schema_invalid", nowIso, disposedRawRowids);
           continue;
         }
         if (outboundEnvelope.event.dataMode === "evidence") {
@@ -1457,12 +1476,13 @@ export class DeliveryOutbox {
             row.deliveryId,
             "local_evidence_quarantined",
             nowIso,
+            disposedRawRowids,
           );
           continue;
         }
         const revalidated = sealOutboundEnvelope(outboundEnvelope);
         if (!revalidated.ok || JSON.stringify(revalidated.envelope) !== envelopeJson) {
-          locallyDead += this.deadActive(row.deliveryId, "local_privacy_violation", nowIso);
+          locallyDead += this.deadActive(row.deliveryId, "local_privacy_violation", nowIso, disposedRawRowids);
           continue;
         }
         const envelopeBytes = Buffer.byteLength(envelopeJson);
@@ -2047,7 +2067,12 @@ export class DeliveryOutbox {
     };
   }
 
-  private deadActive(deliveryId: string, reason: DeliveryReceiptReason, terminalAt: string) {
+  private deadActive(
+    deliveryId: string,
+    reason: DeliveryReceiptReason,
+    terminalAt: string,
+    disposedRawRowids?: Set<number>,
+  ) {
     const row = this.db
       .prepare(
         `select raw_rowid as rawRowid, attempt_count as attemptCount,
@@ -2060,6 +2085,7 @@ export class DeliveryOutbox {
     if (!row) return 0;
     if (row.rawRowid !== null && isTerminalPrivacyReason(reason)) {
       markRawPrivacyDisposition(this.db, row.rawRowid, reason, terminalAt);
+      disposedRawRowids?.add(row.rawRowid);
     }
     const written = this.writeReceipt({
       deliveryId,

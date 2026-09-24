@@ -4,12 +4,23 @@ import type { AiInteractionEvent } from "../../shared/src/index";
 
 /**
  * Session inheritance is deliberately a small, fail-closed join.  The
- * capture path never searches by cwd or scans the whole ledger: it can only
+ * upload path never searches by cwd or scans the whole ledger: it can only
  * use repo_hash values that repo-context resolution already persisted for the
  * same session inside this fixed time window.
  */
 export const SESSION_INHERIT_WINDOW_MS = 6 * 60 * 60 * 1_000;
 export const SESSION_INHERIT_MAX_CONTEXT_ROWS = 256;
+/**
+ * `idx_events_session` does not hold repo_hash, so every index entry a lookup
+ * walks past can cost a ledger-row read, and one busy session can hold
+ * hundreds of thousands of repo-less rows inside a single window.  A lookup
+ * therefore counts at most this many index entries (covering index, no row
+ * reads) and reads rows only for a window known to fit; a larger window
+ * fails closed to `unallocated`.
+ */
+export const SESSION_INHERIT_MAX_SCANNED_ROWS = 4_096;
+/** Ledger rows one upload batch may read across all of its session lookups. */
+export const SESSION_INHERIT_MAX_BATCH_ROW_READS = 65_536;
 
 const CANONICAL_LINKAGE = /^sha256:[a-f0-9]{64}$/i;
 const TOKEN_FIELDS = [
@@ -44,6 +55,24 @@ export type ProjectAttributionOptions = {
   branchHash?: string | null;
   sessionContexts?: readonly SessionRepoContext[];
   sessionContextsTruncated?: boolean;
+};
+
+export type SessionAttributionInput = {
+  event: AiInteractionEvent;
+  repoHash?: string | null;
+};
+
+export type SessionAttributionStats = {
+  /** Bounded lookups issued: one per session per six hours of batch span. */
+  lookups: number;
+  /** Session-index entries counted from the covering index. */
+  indexEntries: number;
+  /** Ledger rows read to collect repo contexts. */
+  rowReads: number;
+  /** Lookups whose window held more entries than the scan bound. */
+  boundReached: number;
+  /** Lookups skipped because the batch row-read budget was spent. */
+  budgetExhausted: number;
 };
 
 type SessionContextEvent = Pick<AiInteractionEvent, "sessionId" | "observedAt"> &
@@ -144,59 +173,228 @@ function inheritedRepo(
   return preceding?.repoHash ?? null;
 }
 
-/**
- * Read only a bounded, indexed session slice.  A cap hit is observable and
- * causes attribution to remain unallocated instead of guessing from a partial
- * session.  `repo_hash` is the only project evidence accepted here.
- */
-export function readSessionRepoContexts(
-  db: Database.Database,
-  event: SessionContextEvent,
-  options: { windowMs?: number; maxRows?: number; repoHash?: string | null } = {},
-): SessionRepoContextScan {
+function needsSessionLookup(event: SessionContextEvent, repoHash?: string | null) {
   // Most buffered rows are spans/tool results without tokens.  Do not even
   // issue a session query for them (or for a row that already has a project);
   // this keeps millions of ordinary `otel_span` rows out of the attribution
   // path while retaining the indexed bounded lookup for token rows.
-  if (
-    !event.sessionId ||
-    event.projectKey ||
-    canonicalLinkage(options.repoHash) ||
-    !isTokenBearing(event)
-  ) return { rows: [], truncated: false };
-  const eventAt = parseObservedAt(event.observedAt);
-  if (eventAt === null) return { rows: [], truncated: false };
-  const windowMs = Math.max(1, Math.min(
-    Number.isFinite(options.windowMs)
-      ? Math.trunc(options.windowMs!)
-      : SESSION_INHERIT_WINDOW_MS,
-    SESSION_INHERIT_WINDOW_MS,
-  ));
-  const maxRows = Math.max(1, Math.min(
-    Number.isFinite(options.maxRows)
-      ? Math.trunc(options.maxRows!)
-      : SESSION_INHERIT_MAX_CONTEXT_ROWS,
-    SESSION_INHERIT_MAX_CONTEXT_ROWS,
-  ));
-  const lower = new Date(eventAt - windowMs).toISOString();
-  const upper = new Date(eventAt + windowMs).toISOString();
-  const rows = db
-    .prepare(
+  return Boolean(
+    event.sessionId &&
+    !event.projectKey &&
+    !canonicalLinkage(repoHash) &&
+    isTokenBearing(event),
+  );
+}
+
+type SessionWindow = { at: number; lower: string; upper: string };
+
+function sessionWindow(observedAt: string): SessionWindow | null {
+  const at = parseObservedAt(observedAt);
+  if (at === null) return null;
+  const lower = new Date(at - SESSION_INHERIT_WINDOW_MS);
+  const upper = new Date(at + SESSION_INHERIT_WINDOW_MS);
+  if (Number.isNaN(lower.getTime()) || Number.isNaN(upper.getTime())) return null;
+  return { at, lower: lower.toISOString(), upper: upper.toISOString() };
+}
+
+/**
+ * First row whose observed_at is >= `bound` (> `bound` when `after`).  Rows
+ * arrive in SQLite BINARY order; `bound` is ASCII (toISOString), and against
+ * an ASCII operand UTF-16 comparison orders exactly like SQLite's UTF-8 memcmp.
+ */
+function searchObservedAt(
+  rows: readonly SessionRepoContext[],
+  bound: string,
+  after: boolean,
+) {
+  let low = 0;
+  let high = rows.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    const value = rows[middle]!.observedAt;
+    if (value < bound || (after && value === bound)) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function boundOption(value: number | undefined, max: number) {
+  return Number.isFinite(value) ? Math.max(0, Math.min(Math.trunc(value!), max)) : max;
+}
+
+type SessionLookup = {
+  firstAt: number;
+  lastAt: number;
+  lower: string;
+  upper: string;
+  /** False when the lookup hit a bound; every event it serves fails closed. */
+  complete: boolean;
+  rows: SessionRepoContext[];
+};
+
+/**
+ * Session attribution for one upload batch.  All eligible events are planned
+ * up front; each session gets one bounded lookup per six hours of batch span
+ * (so a lookup window is at most eighteen hours), and every event is then
+ * joined in memory against exactly the rows a query over its own ±6 h window
+ * would return.  Results equal the per-event rule whenever the lookup
+ * completed.  A lookup whose window holds more index entries than the scan
+ * bound, or that would overrun the batch read budget, is not read at all and
+ * leaves its events `unallocated`: a partial session is never used to guess.
+ */
+export class SessionAttributionBatch {
+  private readonly lookups = new Map<string, SessionLookup[]>();
+  private readonly counters: SessionAttributionStats = {
+    lookups: 0,
+    indexEntries: 0,
+    rowReads: 0,
+    boundReached: 0,
+    budgetExhausted: 0,
+  };
+
+  constructor(
+    db: Database.Database,
+    inputs: readonly SessionAttributionInput[],
+    options: { maxScannedRows?: number; maxBatchRowReads?: number } = {},
+  ) {
+    const planned = new Map<string, SessionWindow[]>();
+    for (const input of inputs) {
+      if (!needsSessionLookup(input.event, input.repoHash)) continue;
+      const window = sessionWindow(input.event.observedAt);
+      if (!window) continue;
+      const windows = planned.get(input.event.sessionId!) ?? [];
+      windows.push(window);
+      planned.set(input.event.sessionId!, windows);
+    }
+    if (planned.size === 0) return;
+    const scanLimit = boundOption(options.maxScannedRows, SESSION_INHERIT_MAX_SCANNED_ROWS);
+    let readBudget = boundOption(options.maxBatchRowReads, SESSION_INHERIT_MAX_BATCH_ROW_READS);
+    // Both inner selects carry a hard LIMIT; repo_hash and the other context
+    // predicates are applied outside them.  The count touches only the
+    // covering index, so an oversized window costs scanLimit + 1 index
+    // entries and no ledger-row reads.
+    const countEntries = db.prepare(
+      `select count(*) as entries from (
+         select 1 from buffered_events indexed by idx_events_session
+         where session_id = ? and observed_at >= ? and observed_at <= ?
+         limit ?
+       )`,
+    );
+    const readContexts = db.prepare(
       `select rowid, session_id as sessionId, observed_at as observedAt,
          repo_hash as repoHash
-       from buffered_events
-       where session_id = ? and repo_hash is not null
+       from (
+         select rowid, session_id, observed_at, repo_hash, data_mode,
+           privacy_disposition
+         from buffered_events indexed by idx_events_session
+         where session_id = ? and observed_at >= ? and observed_at <= ?
+         order by observed_at asc, rowid asc
+         limit ?
+       )
+       where repo_hash is not null
          and data_mode <> 'evidence' and privacy_disposition is null
-         and observed_at >= ? and observed_at <= ?
-       order by observed_at asc, rowid asc
-       limit ?`,
-    )
-    .all(event.sessionId, lower, upper, maxRows + 1) as Array<SessionRepoContext>;
-  const truncated = rows.length > maxRows;
-  return {
-    rows: rows.slice(0, maxRows).filter((row) => canonicalLinkage(row.repoHash) !== null),
-    truncated,
-  };
+       order by observed_at asc, rowid asc`,
+    );
+    // One read snapshot keeps every count consistent with its row read.
+    db.transaction(() => {
+      for (const [sessionId, windows] of planned) {
+        const lookups: SessionLookup[] = [];
+        for (const window of windows.sort((left, right) => left.at - right.at)) {
+          const current = lookups[lookups.length - 1];
+          if (current && window.at - current.firstAt <= SESSION_INHERIT_WINDOW_MS) {
+            current.lastAt = window.at;
+            if (window.lower < current.lower) current.lower = window.lower;
+            if (window.upper > current.upper) current.upper = window.upper;
+          } else {
+            lookups.push({
+              firstAt: window.at,
+              lastAt: window.at,
+              lower: window.lower,
+              upper: window.upper,
+              complete: false,
+              rows: [],
+            });
+          }
+        }
+        for (const lookup of lookups) {
+          this.counters.lookups += 1;
+          const { entries } = countEntries.get(
+            sessionId,
+            lookup.lower,
+            lookup.upper,
+            scanLimit + 1,
+          ) as { entries: number };
+          this.counters.indexEntries += entries;
+          if (entries > scanLimit) {
+            this.counters.boundReached += 1;
+            continue;
+          }
+          if (entries > readBudget) {
+            this.counters.budgetExhausted += 1;
+            continue;
+          }
+          readBudget -= entries;
+          this.counters.rowReads += entries;
+          lookup.rows = entries === 0
+            ? []
+            : readContexts.all(sessionId, lookup.lower, lookup.upper, entries) as SessionRepoContext[];
+          lookup.complete = true;
+        }
+        this.lookups.set(sessionId, lookups);
+      }
+    })();
+  }
+
+  /**
+   * Attribute one planned event.  `excludedRowids` names ledger rows the
+   * caller privacy-disposed after this batch was read; a fresh query would no
+   * longer return them, so they are dropped before the rule is applied.
+   */
+  attribute(
+    event: AiInteractionEvent,
+    options: {
+      repoHash?: string | null;
+      branchHash?: string | null;
+      excludedRowids?: ReadonlySet<number>;
+    } = {},
+  ): ProjectAttributionResult {
+    const scan = this.sessionContexts(event, options.repoHash, options.excludedRowids);
+    return applyProjectAttribution(event, {
+      repoHash: options.repoHash,
+      branchHash: options.branchHash,
+      sessionContexts: scan.rows,
+      sessionContextsTruncated: scan.truncated,
+    });
+  }
+
+  stats(): SessionAttributionStats {
+    return { ...this.counters };
+  }
+
+  private sessionContexts(
+    event: AiInteractionEvent,
+    repoHash: string | null | undefined,
+    excludedRowids: ReadonlySet<number> | undefined,
+  ): SessionRepoContextScan {
+    if (!needsSessionLookup(event, repoHash)) return { rows: [], truncated: false };
+    const window = sessionWindow(event.observedAt);
+    if (!window) return { rows: [], truncated: false };
+    const lookup = this.lookups.get(event.sessionId!)?.find((candidate) =>
+      candidate.firstAt <= window.at && window.at <= candidate.lastAt);
+    // Not planned, or bound-limited: never guess from a partial session.
+    if (!lookup?.complete) return { rows: [], truncated: true };
+    const rows = lookup.rows
+      .slice(
+        searchObservedAt(lookup.rows, window.lower, false),
+        searchObservedAt(lookup.rows, window.upper, true),
+      )
+      .filter((row) => !excludedRowids?.has(row.rowid));
+    if (rows.length > SESSION_INHERIT_MAX_CONTEXT_ROWS) return { rows: [], truncated: true };
+    return {
+      rows: rows.filter((row) => canonicalLinkage(row.repoHash) !== null),
+      truncated: false,
+    };
+  }
 }
 
 /**

@@ -4,7 +4,7 @@ import { explodeOtlpPayload } from "../packages/collector-cli/src/otlp";
 import { DEFAULT_POLICY } from "../packages/shared/src/index";
 import {
   applyProjectAttribution,
-  readSessionRepoContexts,
+  SessionAttributionBatch,
   type SessionRepoContext,
 } from "../packages/collector-cli/src/session-attribution";
 import { sealOutboundEnvelope } from "../packages/collector-cli/src/outbound-envelope";
@@ -86,22 +86,21 @@ function main() {
   ledger.database
     .prepare("update buffered_events set repo_hash = ? where id = ?")
     .run(REPO_A, toolResult.id);
-  const otelScan = readSessionRepoContexts(ledger.database, otelAssistant);
-  const queryPlan = ledger.database
-    .prepare(
-      `explain query plan
-       select rowid from buffered_events
-       where session_id = ? and repo_hash is not null
-         and data_mode <> 'evidence' and privacy_disposition is null
-         and observed_at >= ? and observed_at <= ?
-       order by observed_at asc, rowid asc limit ?`,
-    )
-    .all("session-fixture", "2026-09-23T06:00:00.000Z", "2026-09-23T18:00:00.000Z", 257) as Array<{ detail: string }>;
-  assert.ok(queryPlan.some((row) => row.detail.includes("idx_events_session")));
-  const otelAttribution = applyProjectAttribution(otelAssistant, {
-    sessionContexts: otelScan.rows,
-    sessionContextsTruncated: otelScan.truncated,
-  });
+  // Plan the statements the lookup actually prepares, not a copy of them.
+  const prepare = ledger.database.prepare;
+  const lookupSql: string[] = [];
+  ledger.database.prepare = ((source: string) => {
+    lookupSql.push(source);
+    return prepare.call(ledger.database, source);
+  }) as typeof prepare;
+  const otelAttribution = new SessionAttributionBatch(ledger.database, [{ event: otelAssistant }])
+    .attribute(otelAssistant);
+  ledger.database.prepare = prepare;
+  const queryPlans = lookupSql.map((source) => ledger.database
+    .prepare(`explain query plan ${source}`)
+    .all("session-fixture", "2026-09-23T06:00:00.000Z", "2026-09-23T18:00:00.000Z", 257) as Array<{ detail: string }>);
+  assert.equal(queryPlans.length, 2);
+  assert.ok(queryPlans.every((plan) => plan.some((row) => row.detail.includes("idx_events_session"))));
   assert.equal(otelAttribution.event.projectKey, REPO_A);
   assert.equal(otelAttribution.event.metadata.projectBasis, "session_inherited");
   assert.equal(sealOutboundEnvelope({ event: otelAttribution.event, suppressedFields: [] }).ok, true);
