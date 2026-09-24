@@ -1,5 +1,5 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("lifecycle-retention", 72);
+const completion = createProofCompletion("lifecycle-retention", 73);
 /**
  * eco-6hoxj.163.30: lifecycle update snapshots are bounded and cheap.
  *
@@ -26,7 +26,6 @@ import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import { createRequire } from "node:module";
-import os from "node:os";
 import path from "node:path";
 
 import Database from "better-sqlite3";
@@ -72,7 +71,9 @@ const NODE_MAJOR = Number(process.versions.node.split(".", 1)[0]);
 const ARCHITECTURE = process.arch === "x64" ? "x64" as const : "arm64" as const;
 const LEDGER_SENTINEL = `ledger-content-sentinel-${randomBytes(6).toString("hex")}`;
 const CONFIG_SENTINEL = `config-secret-sentinel-${randomBytes(6).toString("hex")}`;
-const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-retention-")));
+const FIXTURE_PARENT = "/private/var/tmp";
+fs.mkdirSync(FIXTURE_PARENT, { recursive: true });
+const ROOT = fs.realpathSync(fs.mkdtempSync(path.join(FIXTURE_PARENT, "plimsoll-retention-")));
 
 const sha256 = (value: string | Buffer) => createHash("sha256").update(value).digest("hex");
 const freeBytes = (directory: string) => {
@@ -843,6 +844,24 @@ syncBuiltinESMExports();
       JSON.stringify(k5Marker.retention) === JSON.stringify(k5.retention) && keepAllListing.blockedReason === null &&
       keepAllListing.snapshots.length === 5 && keepAllListing.snapshots.every((row) => row.operationState === "completed"),
       keepAllListing);
+
+    // A blocked read-only preview must not be described as a removal plan.
+    // Keep-all still records its skipped receipt and leaves the unreadable
+    // removal record for an explicit recovery/prune operation to inspect.
+    const blockedKeeper = createHome("keep-all-blocked", 2);
+    await blockedKeeper.keepAllManager().update({ operationId: "blocked-1", artifact: blockedKeeper.artifact("7.0.0") });
+    const blockedRemovals = path.join(blockedKeeper.lifecycleRoot, "removals");
+    const blockedRemovalRecord = path.join(blockedRemovals, "unreadable.json");
+    fs.mkdirSync(blockedRemovals, { recursive: true, mode: 0o700 });
+    fs.writeFileSync(blockedRemovalRecord, "not-json\n", { mode: 0o600 });
+    const blockedKeepAll = await blockedKeeper.keepAllManager().update({ operationId: "blocked-2", artifact: blockedKeeper.artifact("7.0.1") });
+    check(
+      "keep_all_blocked_preview_records_no_would_remove_and_keeps_unreadable_removal_record",
+      blockedKeepAll.status === "completed" && blockedKeepAll.retention?.status === "skipped" &&
+        blockedKeepAll.retention.skippedReason === "skipped_by_operator" &&
+        !Object.hasOwn(blockedKeepAll.retention, "wouldRemove") && fs.existsSync(blockedRemovalRecord),
+      { retention: blockedKeepAll.retention, removalRecord: fs.existsSync(blockedRemovalRecord) },
+    );
     const withRetention = (retention: Record<string, unknown>) => ({ ...k5Marker, retention });
     check("only_an_operator_keep_all_record_may_carry_would_remove_and_it_recovers_nothing",
       parseCompletionReceipt(withRetention({ ...k5Marker.retention, skippedReason: "retention_failed" }), "k5") === null &&
