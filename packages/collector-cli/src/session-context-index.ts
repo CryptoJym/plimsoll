@@ -310,7 +310,10 @@ function recomputedIndexChecksum(db: Database.Database) {
 // in-process marker for that connection, and persist the same state whenever
 // the database is writable. The warning is deliberately once per connection.
 const invalidDatabases = new WeakSet<Database.Database>();
-const validatedIndexes = new WeakMap<Database.Database, { rows: number; checksum: number }>();
+// The aggregate checksum is an open/reopen validation, not a per-lookup scan.
+// After that proof, trigger-maintained counts and checksums make each lookup
+// O(1); a new connection validates the aggregate again.
+const validatedIndexes = new WeakSet<Database.Database>();
 
 export function markSessionContextIndexInvalid(db: Database.Database, reason: string) {
   const first = !invalidDatabases.has(db);
@@ -340,11 +343,10 @@ function invariantAgrees(db: Database.Database, control: ControlRow) {
   // checksum is enough. Complete indexes get an aggregate point validation;
   // this catches an out-of-band UPDATE that did not fire a checksum trigger.
   if (control.complete !== 1) return true;
-  const cached = validatedIndexes.get(db);
-  if (cached && cached.rows === control.indexedRows && cached.checksum === control.indexedKeyChecksum) return true;
+  if (validatedIndexes.has(db)) return true;
   const recomputed = recomputedIndexChecksum(db);
   if (recomputed !== control.indexedKeyChecksum) return false;
-  validatedIndexes.set(db, { rows: control.indexedRows, checksum: control.indexedKeyChecksum });
+  validatedIndexes.add(db);
   return true;
 }
 
@@ -382,6 +384,7 @@ function auxiliaryObjectsUsable(db: Database.Database) {
 }
 
 function installed(db: Database.Database) {
+  if (invalidDatabases.has(db)) return false;
   if (!auxiliaryObjectsUsable(db)) return false;
   const control = readControl(db);
   return control !== null && control.integrityState === "valid" && countsAgree(control) && checksumsAgree(control);
@@ -444,6 +447,10 @@ export function ensureSessionContextIndexSchema(
       completedAt: backfillNeeded ? null : at,
     });
   }).immediate();
+  // A writable reopen may repair an index that a read-only connection marked
+  // invalid in-process. The new schema has a fresh aggregate validation.
+  invalidDatabases.delete(db);
+  validatedIndexes.delete(db);
 }
 
 export type SessionContextIndexState = "absent" | "backfilling" | "complete" | "invalid";
