@@ -547,7 +547,9 @@ npx -y @plimsoll/cli doctor --read-only --json
 ```
 
 Loopback HTTP is credentialed except for liveness. `GET /healthz` answers
-`{"ok":true}` with no version, identity, or ledger state. `GET /status` requires
+`{"ok":true,"instanceId":"<random per run>"}` with no version or ledger state;
+a local reader of the private status summary adds a fresh `?challenge=` and
+checks the HMAC `proof` to know it is talking to that collector run. `GET /status` requires
 the management credential (`management_credential_required` without it). Full
 operator status is `plimsoll status` (or `doctor --read-only --json`), which
 already presents that credential. Fleet monitors that used raw `/status` should

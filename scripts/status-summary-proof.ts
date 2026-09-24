@@ -1,9 +1,11 @@
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = createProofCompletion("status-summary", 16);
+const completion = createProofCompletion("status-summary", 20);
 /**
  * eco-6hoxj.163.34: the daemon keeps a private status-summary.json that local
  * readers (the macOS menubar) read instead of running `plimsoll status`, and
- * GET /healthz names the same run with a random instanceId.
+ * GET /healthz names the same run with a random instanceId. A reader of the
+ * file proves the listener is that run with GET /healthz?challenge=: the
+ * answer is an HMAC of the challenge under the file's per-run healthzKey.
  *
  * Proves: the file is private, exactly shaped, atomic for a concurrent reader,
  * written from the /status cache without a single SQL statement, free of
@@ -14,9 +16,15 @@ const completion = createProofCompletion("status-summary", 16);
  * timer nor /healthz), costs one small write per 15 s interval, stays 0600
  * under any umask, refuses a home that was swapped after it started, and
  * leaves no temp file when a write fails or the writer stops mid-write.
+ * The challenge proof verifies with the file's key and matches the shared
+ * test vector the menubar tests pin; a responder that knows the instanceId
+ * but not the key (the round-3 reply, a wrong key, a replayed proof, a proof
+ * relayed from another port) is refused; the key is in no HTTP response and
+ * no daemon output.
  * Isolated proof root and loopback only; never the live collector.
  */
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import http from "node:http";
 import path from "node:path";
@@ -33,6 +41,7 @@ import {
   STATUS_SUMMARY_INTERVAL_MS,
   STATUS_SUMMARY_SCHEMA,
   anchorStatusSummaryHome,
+  healthzProof,
   startStatusSummaryWriter,
   writeStatusSummary,
   type StatusSummary,
@@ -46,7 +55,16 @@ type Method = (...args: unknown[]) => unknown;
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const cliSource = path.join(repoRoot, "packages", "collector-cli", "src", "cli.ts");
 const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
-const SUMMARY_KEYS = "collectorVersion,instanceId,port,schema,stats,updatedAt";
+const SUMMARY_KEYS = "collectorVersion,healthzKey,instanceId,port,schema,stats,updatedAt";
+const BASE64URL_32_BYTES = /^[A-Za-z0-9_-]{43}$/;
+/** Shared with the menubar tests (healthzProofMatchesTheCollectorsTestVector). */
+const TEST_VECTOR = {
+  key: "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8",
+  port: 49123,
+  instanceId: "0f5b9a52-3c1e-4a8b-9d2e-6f7a8b9c0d1e",
+  challenge: "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8",
+  proof: "lnozo0nCndram-7O1AV5MwmsEMnovjQYlD58Bw5wX0U",
+};
 const STATS_KEYS = "count,tokenAttributedEvents,totalInputTokens,totalOutputTokens";
 const INJECTED_FSYNC_MS = 250;
 const checks: Array<{ name: string; passed: boolean; detail: unknown }> = [];
@@ -136,6 +154,44 @@ function reserveLoopbackPort(): Promise<number> {
 function credentialValues(auth: LocalIngestAuth) {
   return [auth.claudeCodeProducer, auth.codexProducer, auth.geminiCliProducer, auth.grokProducer, auth.managementRead]
     .filter((value): value is string => typeof value === "string");
+}
+
+function freshChallenge() {
+  return crypto.randomBytes(32).toString("base64url");
+}
+
+/**
+ * What the menubar accepts (packages/mac-menubar LivenessProbe): HTTP 200 and
+ * exactly {ok: true, instanceId, proof}, the instanceId the file names and a
+ * proof that is the HMAC of this challenge under the file's key for the
+ * file's port, compared in constant time.
+ */
+function isCollectorProof(result: Result, summary: StatusSummary, challenge: string) {
+  const body = result.body;
+  if (result.status !== 200 || Object.keys(body).sort().join(",") !== "instanceId,ok,proof" ||
+    body.ok !== true || body.instanceId !== summary.instanceId || typeof body.proof !== "string" ||
+    !BASE64URL_32_BYTES.test(body.proof)) return false;
+  const expected = Buffer.from(
+    healthzProof(Buffer.from(summary.healthzKey, "base64url"), summary.port, summary.instanceId, challenge),
+    "base64url",
+  );
+  const actual = Buffer.from(body.proof, "base64url");
+  return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+}
+
+/** A loopback service that is not the collector: it answers every request with `answer(path)`. */
+async function impostor(answer: (route: string) => Promise<string> | string) {
+  const server = http.createServer((incoming, response) => {
+    void Promise.resolve(answer(incoming.url ?? "/")).then((body) => {
+      response.writeHead(200, { "content-type": "application/json", connection: "close" });
+      response.end(body);
+    });
+  });
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  return {
+    port: (server.address() as AddressInfo).port,
+    close: () => new Promise<void>((resolve) => server.close(() => resolve())),
+  };
 }
 
 /** Replaces `target[name]` for the length of `action`, restoring it after. */
@@ -274,7 +330,8 @@ async function inProcessChecks(root: string) {
     }
     const port = (server.address() as AddressInfo).port;
     const options = (overrides: Partial<StatusSummaryWriterOptions> = {}): StatusSummaryWriterOptions => ({
-      home, instanceId: server.plimsollInstanceId, collectorVersion: PLIMSOLL_VERSION, port,
+      home, instanceId: server.plimsollInstanceId, healthzKey: server.plimsollHealthzKey,
+      collectorVersion: PLIMSOLL_VERSION, port,
       stats: server.plimsollCachedStats, intervalMs: 60_000, ...overrides,
     });
     const writeOnce = async (overrides: Partial<StatusSummaryWriterOptions> = {}) => {
@@ -311,6 +368,7 @@ async function inProcessChecks(root: string) {
         summary !== null && Object.keys(summary).sort().join(",") === SUMMARY_KEYS &&
         summary.schema === STATUS_SUMMARY_SCHEMA && summary.collectorVersion === PLIMSOLL_VERSION &&
         summary.port === port && UUID_V4.test(summary.instanceId) &&
+        BASE64URL_32_BYTES.test(summary.healthzKey) && Buffer.from(summary.healthzKey, "base64url").length === 32 &&
         Math.abs(Date.now() - Date.parse(summary.updatedAt)) < 10_000 &&
         stats !== null && stats !== undefined && Object.keys(stats).sort().join(",") === STATS_KEYS,
       { mode: (stat.mode & 0o777).toString(8), keys: summary ? Object.keys(summary).sort() : null },
@@ -324,7 +382,79 @@ async function inProcessChecks(root: string) {
       { status: health.status, keys: Object.keys(health.body).sort() },
     );
 
+    // Review blocker: any process could read the public instanceId and replay
+    // it once it held the port. With a fresh challenge the collector answers
+    // an HMAC under the key only it and a reader of the 0600 file hold.
+    const responses: Result[] = [health];
+    const challenges = [freshChallenge(), freshChallenge()];
+    const challenged = [];
+    for (const challenge of challenges) {
+      const answered = await request(port, `/healthz?challenge=${challenge}`);
+      responses.push(answered);
+      challenged.push(answered);
+    }
+    const malformed = [
+      "/healthz?challenge=short",
+      `/healthz?challenge=${challenges[0]!.slice(0, 42)}+`,
+      `/healthz?challenge=${challenges[0]}&challenge=${challenges[1]}`,
+      `/healthz?challenge=${challenges[0]}&note=1`,
+      "/healthz?note=1",
+    ];
+    const refusedMalformed = [];
+    for (const route of malformed) {
+      const answered = await request(port, route);
+      responses.push(answered);
+      refusedMalformed.push(answered.status === 400 && answered.body.reason === "invalid_challenge" && !("proof" in answered.body));
+    }
+    check(
+      "healthz_proves_the_run_with_an_hmac_of_a_fresh_challenge",
+      summary !== null && challenged.every((answered, index) => isCollectorProof(answered, summary, challenges[index]!)) &&
+        challenged[0]!.body.proof !== challenged[1]!.body.proof &&
+        !isCollectorProof(challenged[0]!, summary, challenges[1]!) && refusedMalformed.every(Boolean),
+      {
+        keys: Object.keys(challenged[0]!.body).sort(),
+        verified: summary ? challenged.map((answered, index) => isCollectorProof(answered, summary, challenges[index]!)) : null,
+        refusedMalformed,
+      },
+    );
+
+    const vector = healthzProof(Buffer.from(TEST_VECTOR.key, "base64url"), TEST_VECTOR.port, TEST_VECTOR.instanceId,
+      TEST_VECTOR.challenge);
+    check("healthz_proof_matches_the_shared_test_vector", vector === TEST_VECTOR.proof, { proof: vector });
+
+    // The review's attack and its variants, each from a loopback service that
+    // took the summary's port: it knows the public instanceId, not the key.
+    const captured = challenged[0]!.body.proof as string;
+    const impostors = {
+      roundThreeReply: () => JSON.stringify({ ok: true, instanceId: server.plimsollInstanceId }),
+      wrongKey: (route: string) => JSON.stringify({
+        ok: true, instanceId: server.plimsollInstanceId,
+        proof: healthzProof(crypto.randomBytes(32), 0, server.plimsollInstanceId, route.split("challenge=")[1] ?? ""),
+      }),
+      replayedProof: () => JSON.stringify({ ok: true, instanceId: server.plimsollInstanceId, proof: captured }),
+      relayedFromTheCollectorsPort: async (route: string) => (await request(port, route)).text,
+    };
+    const refused: Record<string, boolean> = {};
+    for (const [name, answer] of Object.entries(impostors)) {
+      const fake = await impostor(answer);
+      try {
+        const challenge = freshChallenge();
+        const answered = await request(fake.port, `/healthz?challenge=${challenge}`);
+        refused[name] = summary !== null && !isCollectorProof(answered, { ...summary, port: fake.port }, challenge);
+      } finally {
+        await fake.close();
+      }
+    }
+    const genuineChallenge = freshChallenge();
+    const genuine = summary !== null && isCollectorProof(await request(port, `/healthz?challenge=${genuineChallenge}`), summary, genuineChallenge);
+    check(
+      "a_responder_without_the_key_is_refused",
+      genuine && Object.keys(refused).length === 4 && Object.values(refused).every(Boolean),
+      { genuine, refused },
+    );
+
     const opened = await request(port, "/status", "GET", "", { "x-plimsoll-token": auth.managementRead });
+    responses.push(opened);
     const cached = opened.body.stats as Record<string, unknown> | null;
     check(
       "summary_counts_are_the_status_cache_counts",
@@ -500,7 +630,8 @@ async function inProcessChecks(root: string) {
     let failedCode: string | null = null;
     try {
       await writeStatusSummary(await anchorStatusSummaryHome(failedHome), {
-        schema: STATUS_SUMMARY_SCHEMA, instanceId: server.plimsollInstanceId, collectorVersion: PLIMSOLL_VERSION,
+        schema: STATUS_SUMMARY_SCHEMA, instanceId: server.plimsollInstanceId, healthzKey: server.plimsollHealthzKey,
+        collectorVersion: PLIMSOLL_VERSION,
         port, updatedAt: new Date().toISOString(), stats: null,
       });
     } catch (error) {
@@ -548,6 +679,14 @@ async function inProcessChecks(root: string) {
 
     const closedStatus = await request(port, "/status");
     const closedApi = await request(port, "/api/settings");
+    responses.push(closedStatus, closedApi);
+    const key = summary?.healthzKey ?? "";
+    check(
+      "healthz_key_never_leaves_the_file",
+      key.length === 43 && responses.length >= 11 && responses.every((answered) => !answered.text.includes(key)) &&
+        !credentialValues(auth).includes(key) && key !== server.plimsollInstanceId,
+      { responsesChecked: responses.length },
+    );
     check(
       "status_and_management_routes_unchanged",
       closedStatus.status === 401 && closedStatus.body.reason === "management_credential_required" &&
@@ -558,11 +697,15 @@ async function inProcessChecks(root: string) {
 
     const secondPort = (second.address() as AddressInfo).port;
     const secondHealth = await request(secondPort, "/healthz");
+    const secondChallenge = freshChallenge();
+    const secondProof = await request(secondPort, `/healthz?challenge=${secondChallenge}`);
     check(
-      "each_server_run_has_its_own_instance_id",
+      "each_server_run_has_its_own_instance_id_and_key",
       UUID_V4.test(second.plimsollInstanceId) && second.plimsollInstanceId !== server.plimsollInstanceId &&
-        secondHealth.body.instanceId === second.plimsollInstanceId,
-      { distinct: second.plimsollInstanceId !== server.plimsollInstanceId },
+        secondHealth.body.instanceId === second.plimsollInstanceId &&
+        second.plimsollHealthzKey !== server.plimsollHealthzKey && summary !== null &&
+        !isCollectorProof(secondProof, { ...summary, port: secondPort, instanceId: second.plimsollInstanceId }, secondChallenge),
+      { distinctIds: second.plimsollInstanceId !== server.plimsollInstanceId, distinctKeys: second.plimsollHealthzKey !== server.plimsollHealthzKey },
     );
   } finally {
     for (const writer of writers) await writer.stop();
@@ -583,8 +726,9 @@ async function daemonCheck(root: string) {
     stdio: ["ignore", "pipe", "pipe"],
   });
   let stdout = "";
+  let stderr = "";
   child.stdout?.on("data", (chunk) => { stdout += chunk; });
-  child.stderr?.on("data", () => {});
+  child.stderr?.on("data", (chunk) => { stderr += chunk; });
   let exited = false;
   try {
     const active = await waitFor(() => stdout.includes('"active"'), 60_000);
@@ -592,12 +736,14 @@ async function daemonCheck(root: string) {
     const written = active && await waitFor(() => readSummary(home) !== null, 10_000);
     const summary = written ? readSummary(home) : null;
     const health = active ? await request(port, "/healthz") : null;
+    const challenge = freshChallenge();
+    const proven = summary !== null && isCollectorProof(await request(port, `/healthz?challenge=${challenge}`), summary, challenge);
     check(
       "daemon_start_writes_the_summary_for_its_run",
       active && summary !== null && summary.port === port && summary.collectorVersion === PLIMSOLL_VERSION &&
-        UUID_V4.test(summary.instanceId) && health?.body.instanceId === summary.instanceId &&
+        UUID_V4.test(summary.instanceId) && health?.body.instanceId === summary.instanceId && proven &&
         (fs.lstatSync(path.join(home, STATUS_SUMMARY_FILE)).mode & 0o777) === 0o600,
-      { active, port, summaryPort: summary?.port ?? null, sameRun: health?.body.instanceId === summary?.instanceId },
+      { active, port, summaryPort: summary?.port ?? null, sameRun: health?.body.instanceId === summary?.instanceId, proven },
     );
   } finally {
     child.kill("SIGTERM");
@@ -608,7 +754,9 @@ async function daemonCheck(root: string) {
   check(
     "daemon_shutdown_leaves_the_summary_and_no_temp_file",
     exited && child.exitCode === 0 && kept !== null && tempFiles(home).length === 0 &&
-      (fs.lstatSync(path.join(home, STATUS_SUMMARY_FILE)).mode & 0o777) === 0o600,
+      (fs.lstatSync(path.join(home, STATUS_SUMMARY_FILE)).mode & 0o777) === 0o600 &&
+      // Nothing the daemon printed carries its key.
+      kept.healthzKey.length === 43 && !stdout.includes(kept.healthzKey) && !stderr.includes(kept.healthzKey),
     { exited, exitCode: child.exitCode, kept: kept !== null, leftovers: tempFiles(home).length },
   );
 }

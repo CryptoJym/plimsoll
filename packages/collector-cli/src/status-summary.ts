@@ -11,9 +11,15 @@ import path from "node:path";
  *
  * It holds the four lifetime counters the daemon already caches for /status
  * (no ledger read at all), this run's random instanceId (the value GET
- * /healthz returns), the collector version, the port and the write time. It
- * names no credential, path, account or event, and each counter is one
- * `plimsoll status` already prints.
+ * /healthz returns), this run's random healthzKey, the collector version,
+ * the port and the write time. It names no collector credential, path,
+ * account or event, and each counter is one `plimsoll status` already prints.
+ *
+ * The healthzKey lets a reader of this 0600 file tell the collector from any
+ * other process on its port: GET /healthz?challenge=<fresh random> answers
+ * with an HMAC of the challenge under the key (healthzProof). Only the
+ * collector run and a reader of this file hold the key; no HTTP response
+ * carries it, and it unlocks nothing else.
  */
 export const STATUS_SUMMARY_FILE = "status-summary.json";
 export const STATUS_SUMMARY_SCHEMA = "plimsoll.status-summary/v1";
@@ -21,6 +27,26 @@ export const STATUS_SUMMARY_SCHEMA = "plimsoll.status-summary/v1";
 export const STATUS_SUMMARY_INTERVAL_MS = 15_000;
 /** How long shutdown waits for a write in progress, so it leaves no temp file. */
 export const STATUS_SUMMARY_STOP_WAIT_MS = 2_000;
+/** Names what the /healthz proof authenticates, so it can mean nothing else. */
+export const HEALTHZ_PROOF_CONTEXT = "plimsoll.healthz-proof/v1";
+
+/** A challenge is 32 random bytes as unpadded base64url (43 characters). */
+export function isHealthzChallenge(value: string) {
+  return /^[A-Za-z0-9_-]{43}$/.test(value);
+}
+
+/**
+ * The /healthz proof: base64url HMAC-SHA256 under this run's key of the
+ * context, the port the request arrived on, the run's instanceId and the
+ * client's challenge, one per line. A fresh challenge per check means an
+ * earlier answer cannot be replayed, and the port means it cannot be relayed
+ * from another listener.
+ */
+export function healthzProof(key: Buffer, port: number, instanceId: string, challenge: string) {
+  return crypto.createHmac("sha256", key)
+    .update(`${HEALTHZ_PROOF_CONTEXT}\n${port}\n${instanceId}\n${challenge}`)
+    .digest("base64url");
+}
 
 export type StatusSummaryStats = {
   count: number | null;
@@ -32,6 +58,8 @@ export type StatusSummaryStats = {
 export type StatusSummary = {
   schema: typeof STATUS_SUMMARY_SCHEMA;
   instanceId: string;
+  /** This run's /healthz proof key, unpadded base64url of 32 random bytes. */
+  healthzKey: string;
   collectorVersion: string;
   port: number;
   updatedAt: string;
@@ -115,6 +143,7 @@ export async function writeStatusSummary(home: StatusSummaryHome, summary: Statu
 export type StatusSummaryWriterOptions = {
   home: string;
   instanceId: string;
+  healthzKey: string;
   collectorVersion: string;
   port: number;
   /** The daemon's cached lifetime stats. Must not read the ledger. */
@@ -147,6 +176,7 @@ export function startStatusSummaryWriter(options: StatusSummaryWriterOptions): S
       const summary: StatusSummary = {
         schema: STATUS_SUMMARY_SCHEMA,
         instanceId: options.instanceId,
+        healthzKey: options.healthzKey,
         collectorVersion: options.collectorVersion,
         port: options.port,
         updatedAt: (options.now?.() ?? new Date()).toISOString(),

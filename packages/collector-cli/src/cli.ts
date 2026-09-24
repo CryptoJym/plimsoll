@@ -3315,6 +3315,7 @@ async function main() {
       statusSummaryWriter = startStatusSummaryWriter({
         home: collectorHome(),
         instanceId: server.plimsollInstanceId,
+        healthzKey: server.plimsollHealthzKey,
         collectorVersion: PLIMSOLL_VERSION,
         port: config.port,
         stats: server.plimsollCachedStats,

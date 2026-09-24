@@ -119,6 +119,7 @@ import {
   openStaleProducerWindows,
   scanProducerProcesses,
 } from "./producer-processes";
+import { healthzProof, isHealthzChallenge } from "./status-summary";
 
 let dashboardHtml: string | undefined;
 function loadDashboardHtml() {
@@ -709,6 +710,9 @@ export function createCollectorServer(
   // A random id per server run (eco-6hoxj.163.34). It names no host, user,
   // path or credential, and changes on every start.
   const instanceId = crypto.randomUUID();
+  // This run's /healthz proof key. It leaves the process only in the 0600
+  // status summary; no HTTP response carries it.
+  const healthzKey = crypto.randomBytes(32);
   const localAuth = options.localAuth ?? null;
   const authEnforced = localAuth !== null;
   // Keep one bounded read result, not another persistent ledger or worker.
@@ -1297,10 +1301,27 @@ export function createCollectorServer(
       // Minimal by construction — no version, runtime identity, counters,
       // delivery, or ledger state. Fleet liveness is this route; /status stays
       // behind the management credential. `instanceId` is this run's random
-      // id (eco-6hoxj.163.34): it lets a local reader tell this daemon from
-      // any other service answering on the port.
-      if (request.method === "GET" && request.url === "/healthz") {
-        sendJson(response, { ok: true, instanceId });
+      // id (eco-6hoxj.163.34). A reader of the 0600 status summary proves it
+      // is talking to this run, not another process on the port, with
+      // `?challenge=<43 base64url characters>`: `proof` is an HMAC of the
+      // challenge under the run's key (healthzProof), which only this process
+      // and that file hold.
+      if (request.method === "GET" && (request.url === "/healthz" || request.url?.startsWith("/healthz?"))) {
+        const query = [...requestUrl(request).searchParams];
+        if (query.length === 0) {
+          sendJson(response, { ok: true, instanceId });
+          return;
+        }
+        const challenge = query.length === 1 && query[0]![0] === "challenge" ? query[0]![1] : "";
+        if (!isHealthzChallenge(challenge)) {
+          sendJson(response, { ok: false, reason: "invalid_challenge" }, 400);
+          return;
+        }
+        sendJson(response, {
+          ok: true,
+          instanceId,
+          proof: healthzProof(healthzKey, request.socket.localPort ?? 0, instanceId, challenge),
+        });
         return;
       }
 
@@ -2069,6 +2090,8 @@ export function createCollectorServer(
   httpServer.keepAliveTimeout = 0;
   const server = httpServer as CollectorServer;
   server.plimsollInstanceId = instanceId;
+  // For the status summary writer in this process only.
+  server.plimsollHealthzKey = healthzKey.toString("base64url");
   // The lifetime stats /status serves from its cache: memory only, no ledger read.
   server.plimsollCachedStats = () => lastCoherentStatus?.body.stats ?? null;
   server.plimsollHttpDiagnostics = {
