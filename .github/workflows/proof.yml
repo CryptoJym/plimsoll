@@ -388,27 +388,8 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:status-summary
 
-      # Independent of the TypeScript typecheck. The cache holds the SDK module
-      # cache that dominates a cold build. The key names every input of the
-      # build: the compiler (`swift --version` under the pinned Xcode), the
-      # package, the check script and this workflow, plus the workspace path
-      # (the module cache records absolute paths). Exact match only, with no
-      # restore prefix, so build products made from other inputs are never
-      # restored.
-      - name: Identify the menubar Swift toolchain
-        id: menubar-toolchain
-        if: ${{ !cancelled() }}
-        env:
-          DEVELOPER_DIR: /Applications/Xcode_16.2.app/Contents/Developer
-        run: echo "id=$(swift --version 2>&1 | shasum -a 256 | cut -c1-16)" >> "$GITHUB_OUTPUT"
-
-      - name: Restore the menubar Swift build cache
-        if: ${{ !cancelled() }}
-        uses: actions/cache@v4
-        with:
-          path: packages/mac-menubar/.build
-          key: mac-menubar-${{ runner.os }}-${{ runner.arch }}-swift-${{ steps.menubar-toolchain.outputs.id }}-${{ github.workspace }}-${{ hashFiles('packages/mac-menubar/Package.swift', 'packages/mac-menubar/Sources/**', 'packages/mac-menubar/Tests/**', 'packages/mac-menubar/scripts/check.sh', '.github/workflows/proof.yml') }}
-
+      # Independent of the TypeScript typecheck. A cold build and test takes
+      # about 21 s here, so no build cache: nothing restored can reach a proof.
       - name: Build and test the macOS menubar app (#12)
         if: ${{ !cancelled() }}
         env:

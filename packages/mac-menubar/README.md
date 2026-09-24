@@ -119,14 +119,19 @@ bundle or login item yet; that ships with the signed release work below.
 
 ## Test
 
+From the repository root:
+
 ```bash
-scripts/check.sh
+pnpm proof:mac-menubar
 ```
 
-This runs `swift build` and then `swift test`. The tests use Swift Testing, so
-they need a Swift 6 toolchain: Xcode 16 or newer, or the Command Line Tools
-alone (which ship no XCTest; the script adds the Swift Testing paths SwiftPM
-leaves out there).
+This runs `swift build` and then `swift test` here
+(`scripts/mac-menubar-proof.ts`) and fails unless every test passes and the
+run reports at least the suite's current test count. The tests use Swift
+Testing, so they need a Swift 6 toolchain: Xcode 16 or newer, where plain
+`swift test` in this directory also works, or the Command Line Tools alone
+(which ship no XCTest; the proof adds the Swift Testing paths SwiftPM leaves
+out there).
 
 ## Permission doctor
 
