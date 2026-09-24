@@ -831,14 +831,18 @@ export async function performJoin(options: {
     const parsedGrant = joinGrantSchema.safeParse(body);
     if (!parsedGrant.success) throw new Error("Workspace join failed: invalid_response");
     const grant = parsedGrant.data;
-    // Check the granted transport before any tenant semantics: a grant that
-    // points uploads or the salt endpoint at another origin is refused
-    // outright, never answered with a reassignment prompt.
+    // Check the granted transport before any tenant semantics or staging: a
+    // grant whose upload URL or salt endpoint is not a valid transport URL
+    // (for example one carrying credentials) or points at another origin is
+    // refused outright, never answered with a reassignment prompt.
     const uploadUrl = validatedTransportUrl(grant.uploadUrl, "Granted upload URL");
     if (uploadUrl.origin !== joinUrl.origin) {
       throw new Error("Granted upload URL must use the same origin as the workspace join URL.");
     }
-    if (grant.accountActorSaltEndpoint && new URL(grant.accountActorSaltEndpoint).origin !== joinUrl.origin) {
+    if (
+      grant.accountActorSaltEndpoint &&
+      validatedTransportUrl(grant.accountActorSaltEndpoint, "Granted account salt endpoint").origin !== joinUrl.origin
+    ) {
       throw new Error("Granted account salt endpoint must use the same origin as the workspace join URL.");
     }
     if (

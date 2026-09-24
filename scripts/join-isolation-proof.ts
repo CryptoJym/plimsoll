@@ -291,6 +291,41 @@ try {
     );
   }
 
+  // A same-origin salt endpoint is still checked as a transport URL before
+  // staging: one carrying credentials is refused before any pending grant or
+  // config write, even when the workspace change is authorized.
+  const credentialedSaltHome = home("credentialed-account-salt-endpoint");
+  const credentialedSaltFixture = writeConfig(credentialedSaltHome);
+  let credentialedSaltCalls = 0;
+  const credentialedSaltMessage = await expectRejected(
+    () =>
+      performJoin({
+        target: TOKEN,
+        baseUrl: "https://workspace-b.example",
+        homeDir: credentialedSaltHome,
+        reassign: true,
+        fetchImpl: (async (input) => {
+          credentialedSaltCalls += 1;
+          if (requestUrl(input).pathname !== CLOUD_JOIN_PATH) return responseJson({ ok: true, accepted: 1 }, 200);
+          return responseJson({
+            ok: true,
+            tenantId: TENANT_B,
+            installKey: INSTALL_B,
+            uploadUrl: "https://workspace-b.example/api/work-intelligence/ingest",
+            accountActorSaltEndpoint: "https://user:pass@workspace-b.example/api/work-intelligence/account-actor-salt",
+          }, 201);
+        }) as typeof fetch,
+      }),
+    /embedded_credentials/,
+  );
+  check(
+    "credentialed_account_salt_endpoint_refused_before_staging",
+    credentialedSaltCalls === 1 &&
+      fs.readFileSync(credentialedSaltFixture.configPath, "utf8") === credentialedSaltFixture.bytes &&
+      !fs.existsSync(pendingJoinPath(credentialedSaltHome)),
+    { credentialedSaltCalls, credentialedSaltMessage },
+  );
+
   // Workspace A has real unsent history. Joining B may see neither its bytes
   // nor its outbox; only one isolated synthetic probe is eligible.
   const isolatedHome = home("workspace-a-backlog");
