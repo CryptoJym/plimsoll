@@ -189,6 +189,53 @@ struct PlimsollMenubarCoreTests {
         }
     }
 
+    @Test(arguments: [
+        (200, #"{"ok":true}"#, true),
+        (200, #"{"ok":true,"note":"extra fields are tolerated"}"#, true),
+        (200, #"{"ok":false}"#, false),
+        (200, #"{"ok":1}"#, false),
+        (200, "OK", false),
+        (401, #"{"ok":true}"#, false),
+    ])
+    func healthzReplyMustMatchTheCollectorContract(statusCode: Int, body: String, live: Bool) {
+        #expect(CollectorClient.isHealthzReply(statusCode: statusCode, body: Data(body.utf8)) == live)
+    }
+
+    @Test func probeSeesTheCollectorHealthzAndSendsNoCredential() throws {
+        let responder = try LoopbackResponder(reply: [
+            "HTTP/1.1 200 OK", "content-type: application/json", "content-length: 11", "connection: close", "",
+            #"{"ok":true}"#,
+        ].joined(separator: "\r\n"))
+
+        #expect(CollectorClient.defaultProbeLiveness(port: responder.port))
+        let request = try #require(responder.request())
+        #expect(request.hasPrefix("GET /healthz HTTP/1.1\r\n"))
+        for header in ["x-plimsoll-token", "authorization", "cookie"] {
+            #expect(!request.lowercased().contains(header))
+        }
+    }
+
+    @Test func probeReportsStoppedForAnotherServiceOnThePort() throws {
+        let responder = try LoopbackResponder(reply: [
+            "HTTP/1.1 200 OK", "content-type: text/plain", "content-length: 2", "connection: close", "", "OK",
+        ].joined(separator: "\r\n"))
+
+        #expect(!CollectorClient.defaultProbeLiveness(port: responder.port))
+    }
+
+    @Test func probeReportsStoppedWhenNothingListens() throws {
+        let port = try LoopbackResponder.unusedPort()
+        let started = Date()
+
+        #expect(!CollectorClient.defaultProbeLiveness(port: port))
+        #expect(Date().timeIntervalSince(started) < CollectorClient.livenessTimeout)
+    }
+
+    @Test func probeNeverContactsPortsOutsideTheTCPRange() {
+        #expect(!CollectorClient.defaultProbeLiveness(port: 0))
+        #expect(!CollectorClient.defaultProbeLiveness(port: 70_000))
+    }
+
     @Test func permissionDoctorReportsNoAdditionalPermissions() throws {
         let report = PermissionDoctor.report()
 
@@ -226,5 +273,83 @@ private struct FakeCollector {
 
     func remove() {
         try? FileManager.default.removeItem(at: directory)
+    }
+}
+
+/// A one-shot HTTP responder on 127.0.0.1: it accepts one connection, keeps
+/// the request head, sends a canned reply and closes.
+private final class LoopbackResponder: @unchecked Sendable {
+    let port: Int
+    private let served = DispatchSemaphore(value: 0)
+    // Written once before `served` is signalled; read only after waiting on it.
+    private var head: String?
+
+    init(reply: String) throws {
+        let listener = try Self.listeningSocket()
+        port = try Self.boundPort(listener)
+        DispatchQueue.global().async {
+            let connection = accept(listener, nil, nil)
+            if connection >= 0 {
+                var received = [UInt8]()
+                var buffer = [UInt8](repeating: 0, count: 4096)
+                while received.count < 16_384, !received.ends(with: Array("\r\n\r\n".utf8)) {
+                    let count = read(connection, &buffer, buffer.count)
+                    if count <= 0 { break }
+                    received += buffer[..<count]
+                }
+                self.head = String(decoding: received, as: UTF8.self)
+                _ = reply.withCString { write(connection, $0, strlen($0)) }
+                close(connection)
+            }
+            close(listener)
+            self.served.signal()
+        }
+    }
+
+    /// The request head the probe sent, once the reply has gone out.
+    func request() -> String? {
+        served.wait(timeout: .now() + 5) == .success ? head : nil
+    }
+
+    /// A loopback port that was just free (bound, then released).
+    static func unusedPort() throws -> Int {
+        let socket = try listeningSocket()
+        defer { close(socket) }
+        return try boundPort(socket)
+    }
+
+    private static func listeningSocket() throws -> Int32 {
+        let descriptor = socket(AF_INET, SOCK_STREAM, 0)
+        guard descriptor >= 0 else { throw POSIXError(.EIO) }
+        var address = sockaddr_in()
+        address.sin_len = UInt8(MemoryLayout<sockaddr_in>.size)
+        address.sin_family = sa_family_t(AF_INET)
+        address.sin_addr.s_addr = inet_addr("127.0.0.1")
+        let bound = withUnsafePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                bind(descriptor, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
+            }
+        }
+        guard bound == 0, listen(descriptor, 1) == 0 else {
+            close(descriptor)
+            throw POSIXError(.EADDRNOTAVAIL)
+        }
+        return descriptor
+    }
+
+    private static func boundPort(_ descriptor: Int32) throws -> Int {
+        var address = sockaddr_in()
+        var length = socklen_t(MemoryLayout<sockaddr_in>.size)
+        let result = withUnsafeMutablePointer(to: &address) {
+            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { getsockname(descriptor, $0, &length) }
+        }
+        guard result == 0 else { throw POSIXError(.EINVAL) }
+        return Int(UInt16(bigEndian: address.sin_port))
+    }
+}
+
+private extension Array where Element == UInt8 {
+    func ends(with suffix: [UInt8]) -> Bool {
+        count >= suffix.count && Array(self[(count - suffix.count)...]) == suffix
     }
 }

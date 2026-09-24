@@ -1,4 +1,5 @@
 import Foundation
+import os
 
 public struct CollectorExecutionResult: Equatable, Sendable {
     public let standardOutput: String
@@ -79,18 +80,53 @@ public final class CollectorClient: @unchecked Sendable {
         return CollectorSnapshot(running: probeLiveness(status.port), status: status)
     }
 
+    /// Same bound as the runbook's `curl --max-time 3 .../healthz`.
+    public static let livenessTimeout: TimeInterval = 3
+
+    /// Liveness is `GET /healthz` on loopback: the collector's only
+    /// unauthenticated route. The request carries no credential, and a fresh
+    /// ephemeral session per probe never uses a proxy, cache or cookie store
+    /// (the collector closes idle connections, so none is reused either).
     public static func defaultProbeLiveness(port: Int) -> Bool {
-        guard let url = URL(string: "http://127.0.0.1:\(port)/healthz") else { return false }
-        let semaphore = DispatchSemaphore(value: 0)
-        var isHealthy = false
-        let task = URLSession.shared.dataTask(with: url) { _, response, _ in
-            isHealthy = (response as? HTTPURLResponse)?.statusCode == 200
-            semaphore.signal()
+        guard (1...65_535).contains(port),
+              let url = URL(string: "http://127.0.0.1:\(port)/healthz") else { return false }
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.connectionProxyDictionary = [:]
+        configuration.requestCachePolicy = .reloadIgnoringLocalCacheData
+        configuration.urlCache = nil
+        configuration.httpCookieStorage = nil
+        configuration.urlCredentialStorage = nil
+        configuration.timeoutIntervalForRequest = livenessTimeout
+        configuration.timeoutIntervalForResource = livenessTimeout
+        let session = URLSession(configuration: configuration)
+        defer { session.invalidateAndCancel() }
+
+        let healthy = OSAllocatedUnfairLock(initialState: false)
+        let finished = DispatchSemaphore(value: 0)
+        let task = session.dataTask(with: url) { data, response, _ in
+            let reply = isHealthzReply(statusCode: (response as? HTTPURLResponse)?.statusCode, body: data)
+            healthy.withLock { $0 = reply }
+            finished.signal()
         }
         task.resume()
-        _ = semaphore.wait(timeout: .now() + 1.0)
-        task.cancel()
-        return isHealthy
+        if finished.wait(timeout: .now() + livenessTimeout) == .timedOut {
+            task.cancel()
+        }
+        return healthy.withLock { $0 }
+    }
+
+    /// The collector answers `/healthz` with HTTP 200 and `{"ok":true}`.
+    /// Anything else on that port is not a live collector.
+    public static func isHealthzReply(statusCode: Int?, body: Data?) -> Bool {
+        guard statusCode == 200, let body,
+              let reply = try? JSONDecoder().decode(HealthzReply.self, from: body) else {
+            return false
+        }
+        return reply.ok
+    }
+
+    private struct HealthzReply: Decodable {
+        let ok: Bool
     }
 }
 
