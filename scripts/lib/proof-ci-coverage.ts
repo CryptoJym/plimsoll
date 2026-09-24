@@ -42,7 +42,8 @@ import { PROOF_SUITES, readProofSuites } from "./proof-suites";
  * workflow assignment or workflow/job/step `env:`; the explicit allow-list is
  * `PLIMSOLL_PROOF_HOME`, `REJECTION_PROOF_SCALE`, and the reviewed
  * `PROJECTION_PUBLICATION_COST_SCALE` input. Both scale inputs are bounded by
- * their proof contracts to 0.01 through 1.0 inclusive. `DEVELOPER_DIR` is a
+ * their proof contracts to 0.01 through 1.0 inclusive, and the gate validates
+ * that the projection value is finite before forwarding it. `DEVELOPER_DIR` is a
  * non-proof toolchain selector used by the macOS menubar tests. Runtime pnpm/npm config
  * writes are refused through the last proof. Every other unit needs a reviewed entry in
  * scripts/proof-local-only.json.
@@ -72,8 +73,21 @@ const WORKFLOW_ENV_ALLOWLIST = new Set([
   ...PROOF_ENV_ALLOWLIST, "HOME", "USERPROFILE", "PLIMSOLL_HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR",
   "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "TMPDIR", "DEVELOPER_DIR",
 ]);
-const allowedWorkflowEnvironment = (name: string, value?: unknown) =>
-  WORKFLOW_ENV_ALLOWLIST.has(name) || (name === "NODE_OPTIONS" && typeof value === "string" && BENIGN_NODE_OPTIONS.test(value.trim()));
+const PROJECTION_SCALE_MIN = 0.01;
+const PROJECTION_SCALE_MAX = 1.0;
+const environmentProblem = (name: string, value?: unknown): string | null => {
+  if (!WORKFLOW_ENV_ALLOWLIST.has(name) && !(name === "NODE_OPTIONS" && typeof value === "string" && BENIGN_NODE_OPTIONS.test(value.trim()))) {
+    return `${name} outside the environment allow-list`;
+  }
+  if (name === "PROJECTION_PUBLICATION_COST_SCALE") {
+    const number = typeof value === "number" ? value
+      : typeof value === "string" && value.trim() !== "" ? Number(value.trim()) : Number.NaN;
+    if (!Number.isFinite(number) || number < PROJECTION_SCALE_MIN || number > PROJECTION_SCALE_MAX) {
+      return `${name} must be a finite value from ${PROJECTION_SCALE_MIN} through ${PROJECTION_SCALE_MAX}`;
+    }
+  }
+  return null;
+};
 export const changesExecution = (name: string, value?: unknown) =>
   !(name === "NODE_OPTIONS" && typeof value === "string" && BENIGN_NODE_OPTIONS.test(value.trim())) &&
   (name === "NODE_OPTIONS" || EXECUTION_WORD.test(name) || CONFIG_WORD.test(name));
@@ -83,17 +97,30 @@ function readsProcessEnvironment(source: string, name: string) {
   return new RegExp("process\\.env(?:\\." + escaped + "(?![A-Za-z0-9_])|\\[\\s*[\"'`]" + escaped + "[\"'`]\\s*\\])").test(source);
 }
 
-/** A `needs` declaration must name an input read by the proof, not one it writes or treats as optional. */
+/**
+ * A `needs` declaration must name an input read by the proof, not one it writes
+ * or treats as optional. A literal `||` fallback (including a fallback wrapped
+ * in a conditional expression) therefore cannot justify local-only status.
+ * Nullish defaults to a machine path remain accepted for the reviewed proofs
+ * whose environment variable is still the declared external input.
+ */
 function requiresProcessEnvironment(source: string, name: string) {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const access = new RegExp("process\\.env(?:\\." + escaped + "(?![A-Za-z0-9_])|\\[\\s*[\"'`]" + escaped + "[\"'`]\\s*\\])", "g");
+  let hasOptionalFallback = false;
+  let hasRequiredAccess = false;
   for (const match of source.matchAll(access)) {
     const before = source.slice(Math.max(0, match.index - 12), match.index);
     const after = source.slice(match.index + match[0].length).trimStart();
-    if (/\bdelete\s*$/.test(before) || /^=(?!=)/.test(after) || /^\?\./.test(after) || /^\?\?\s*(?:[\d"'`]|true\b|false\b)/.test(after)) continue;
-    return true;
+    if (/\bdelete\s*$/.test(before) || /^=(?!=)/.test(after) || /^\?\./.test(after)) continue;
+    if (/^\|\|/.test(after) || /^\?\?\s*(?:[\d"'`]|true\b|false\b)/.test(after)) {
+      hasOptionalFallback = true;
+      continue;
+    }
+    if (hasOptionalFallback) continue;
+    hasRequiredAccess = true;
   }
-  return false;
+  return hasRequiredAccess && !hasOptionalFallback;
 }
 
 function proofOwnedEnvironmentProblems(source: string, names: string[], where: string, values?: Record<string, unknown> | null) {
@@ -267,6 +294,23 @@ function packageManagerProblems(input: CoverageInput): string[] {
   return problems;
 }
 
+/** A literal XDG_CONFIG_HOME that points at a checked-in pnpm/rc changes every proof. */
+function checkedInPnpmRcProblem(input: CoverageInput, name: string, value?: unknown): string | null {
+  if (name !== "XDG_CONFIG_HOME" || typeof value !== "string") return null;
+  const relative = value
+    .replace(/\$\{\{\s*github\.workspace\s*\}\}/gi, "")
+    .replace(/\$GITHUB_WORKSPACE\b/gi, "")
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "")
+    .replace(/^\.\/+/, "")
+    .replace(/\/+$/, "");
+  if (relative === "" || relative.startsWith("$") || relative.includes("${{")) return null;
+  const normalized = path.posix.normalize(relative);
+  if (normalized === "." || normalized === ".." || normalized.startsWith("../")) return null;
+  const rc = path.posix.join(normalized, "pnpm/rc");
+  return input.readFile(rc) === null ? null : `${name} points at checked-in ${rc} (pnpm rc)`;
+}
+
 /** Runtime package-manager configuration writes can turn a later proof into a no-op. */
 function runtimePackageManagerWrite(line: string): string | null {
   const text = line.trim();
@@ -300,8 +344,8 @@ function githubEnvironmentWriteProblem(runText: string): string | null {
     }
   }
   const names = [...remaining.matchAll(/\becho\s+["']?([A-Z][A-Z0-9_]*)=([^"'\n]*)/g)];
-  const denied = names.find((match) => !allowedWorkflowEnvironment(match[1]!, match[2]));
-  return denied ? `writes ${denied[1]} to $GITHUB_ENV outside the environment allow-list` : null;
+  const denied = names.map((match) => ({ match, problem: environmentProblem(match[1]!, match[2]) })).find((entry) => entry.problem);
+  return denied ? `writes ${denied.problem} to $GITHUB_ENV` : null;
 }
 
 export function proofCiCoverage(input: CoverageInput): CoverageReport {
@@ -373,8 +417,12 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
       const checkEnv = (names: string[] | null, values: Record<string, unknown> | null, where: string) => {
         if (names === null) errors.push(`${where} env: is not a literal mapping, so it could set anything`);
         for (const name of names ?? []) {
-          if (!allowedWorkflowEnvironment(name, values?.[name])) errors.push(`${where} env: sets ${name} outside the environment allow-list`);
-          else if (changesExecution(name, values?.[name])) errors.push(`${where} env: sets ${name}, which changes how the proofs run`);
+          const value = values?.[name];
+          const problem = environmentProblem(name, value);
+          if (problem) errors.push(`${where} env: sets ${problem}`);
+          else if (changesExecution(name, value)) errors.push(`${where} env: sets ${name}, which changes how the proofs run`);
+          const configProblem = checkedInPnpmRcProblem(input, name, value);
+          if (configProblem) errors.push(`${where} env: ${configProblem}`);
         }
       };
       checkEnv(model.env, model.envValues, model.path);
@@ -392,8 +440,8 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
           const cachePath = step.withValues?.path;
           const unsafe = typeof cachePath !== "string" || cachePath.split(/\s+/).some((entry) =>
             entry.startsWith("~") || entry.includes("$") ||
-            /(?:^|[/\\])(?:node_modules|\.(?:npm|pnpm|yarn)rc(?:\.yml)?|\.pnpmfile(?:\.[cm]?js)?)(?:[/\\]|$)/i.test(entry));
-          if (unsafe) errors.push(`${where} caches a proof-controlling path (HOME dotfile, rc file, node_modules or pnpmfile)`);
+            /(?:^|[/\\])(?:node_modules|pnpm-workspace\.yaml|\.(?:npm|pnpm|yarn)rc(?:\.yml)?|\.config[/\\]pnpm[/\\]rc|\.pnpmfile(?:\.[cm]?js)?)(?:[/\\]|$)/i.test(entry));
+          if (unsafe) errors.push(`${where} caches a proof-controlling path (HOME dotfile, rc file, workspace manifest, node_modules or pnpmfile)`);
         }
         const word = activeRun.match(EXECUTION_WORD)?.[0] ?? activeRun.match(CONFIG_WORD)?.[0];
         if (word) errors.push(`${where} names ${word} in its script; setting it (as a prefix, with export or through $GITHUB_ENV) changes how the proofs run`);
@@ -404,12 +452,14 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
           const literal = /^\s*export\s+([A-Z][A-Z0-9_]*)=(.+)$/.exec(line);
           if (!literal || /[;&|]/.test(line) || /\b[A-Z][A-Z0-9_]*=/.test(literal[2]!)) {
             errors.push(`${where} exports a nonliteral or multiple environment variables`);
-          } else if (!allowedWorkflowEnvironment(literal[1]!, literal[2]!.replace(/^['"]|['"]$/g, ""))) {
-            errors.push(`${where} exports ${literal[1]} outside the environment allow-list`);
+          } else {
+            const problem = environmentProblem(literal[1]!, literal[2]!.replace(/^['"]|['"]$/g, ""));
+            if (problem) errors.push(`${where} exports ${problem}`);
           }
         }
         for (const match of activeRun.matchAll(/\b(?:export\s+)?([A-Z][A-Z0-9_]*)=([^\s"']*)/g)) {
-          if (!allowedWorkflowEnvironment(match[1]!, match[2])) errors.push(`${where} sets ${match[1]} outside the environment allow-list`);
+          const problem = environmentProblem(match[1]!, match[2]);
+          if (problem) errors.push(`${where} sets ${problem}`);
         }
         for (const line of activeRun.split("\n")) {
           const packageManagerProblem = runtimePackageManagerWrite(line);

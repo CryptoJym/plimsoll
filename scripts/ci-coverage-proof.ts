@@ -29,12 +29,14 @@
  *   or install hook that exits early, edits files or writes $GITHUB_ENV
  *   itself;
  * - what `pnpm install` installs (the lockfile, a replaced tsx), and user
- *   configuration under HOME or XDG_CONFIG_HOME (the workflow points both at
- *   fresh directories; the gate does not check where they point);
+ *   configuration under arbitrary HOME or XDG_CONFIG_HOME paths (the gate
+ *   catches literal redirects to a checked-in pnpm/rc, but cannot resolve a
+ *   path assembled at runtime);
  * - a name assembled at run time (such as NODE_ + OPTIONS), or an expression
  *   in an allowed action's inputs;
- * - whether a suite really runs what its receipt names, or whether a
- *   local-only proof really needs the input it declares;
+ * - whether a suite really runs what its receipt names; the gate checks direct
+ *   environment reads for local-only inputs and rejects literal optional
+ *   fallbacks, but does not execute arbitrary proof code;
  * - GitHub settings: repository variables, rulesets and required checks.
  *
  * The accepted deliberate-tampering limits and the eco-6hoxj.163.32 receipt

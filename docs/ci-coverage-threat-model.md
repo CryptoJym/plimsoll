@@ -25,6 +25,22 @@ Known accepted limits from the round-3 replay are:
 - a gate step disabled with `if: false` or made green with
   `continue-on-error`.
 
+The static rules do cover the accidental forms found in Round 4: literal
+`actions/cache` paths for `pnpm-workspace.yaml` and `.config/pnpm/rc`, and a
+literal `XDG_CONFIG_HOME` that resolves to a checked-in `pnpm/rc`. They also
+require `PROJECTION_PUBLICATION_COST_SCALE` to be a finite value in the
+documented inclusive range `0.01` through `1.0`, and reject a local-only
+declaration whose named input is read only through an optional `||` fallback.
+An indirect path or fallback remains a code-review and runtime concern.
+
+The accepted-limit accounting is deliberate. `b2_config_flag_after_script`
+and `b3_set_a_source_earlier_step` are harmless in the runtime evidence: the
+configuration assignment happens after the relevant proof or in an earlier
+step whose effect does not reach it. The suite reduction cases
+`suite_code_hardcodes_six_via_run_proof` and `suite_code_skips_cadence` are
+runtime backstop cases: their completion receipts fail when stages or cadence
+are reduced, even though the static inventory cannot infer those values.
+
 The final CI receipt owned by eco-6hoxj.163.32 is the runtime backstop. It must
 read `evidence/completion/ci-coverage-proof.json` from the checkout, require
 `status: "passed"`, `directNode: false`, `forwardedArgs: []`, `root` equal to

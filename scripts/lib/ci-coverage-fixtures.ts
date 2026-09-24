@@ -669,6 +669,37 @@ export const FIXTURES: Fixture[] = [
     },
   })),
   {
+    name: "local_only_optional_knob_with_review_cannot_qualify",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a reviewed local-only declaration cannot claim a proof whose environment read has an OR fallback",
+    build: (input) => {
+      const unit = "scripts/otlp-intake-spool-proof.ts";
+      const line = proofLine(input, unit);
+      const edited = editRun(input, line, () => ["echo moved out of CI"]);
+      const source = input.readFile(unit) ?? "";
+      const fallback = source.replace(
+        'const only = process.env.OTLP_SPOOL_PROOF_ONLY?.split(",");',
+        'const only = (process.env.OTLP_SPOOL_PROOF_ONLY || "") ? process.env.OTLP_SPOOL_PROOF_ONLY!.split(",") : undefined;',
+      );
+      return {
+        input: withExceptions(withFiles(edited, { [unit]: fallback }), (exceptions) => {
+          exceptions.localOnly = {
+            ...exceptions.localOnly,
+            [unit]: {
+              owner: "fixture",
+              needs: ["OTLP_SPOOL_PROOF_ONLY"],
+              reviewedOn: input.today,
+              expires: daysFromToday(input, MAX_QUARANTINE_DAYS),
+              reason: "optional fallback",
+            },
+          };
+        }),
+        error: /does not require process\.env\.OTLP_SPOOL_PROOF_ONLY/,
+      };
+    },
+  },
+  {
     name: "local_only_stale_review_fresh_expiry",
     origin: "gate",
     expectGateGreen: false,
@@ -998,7 +1029,7 @@ export const FIXTURES: Fixture[] = [
       return { input: insertStepBefore(input, target!.line, { uses: "actions/cache@v4", with: { path: ".cache/fixtures", key: "fixtures-v1" } }), covered: [target!.unit] };
     },
   },
-  ...(["~/.npmrc", "node_modules", ".pnpmfile.cjs"] as const).map((cachePath): Fixture => ({
+  ...(["~/.npmrc", "node_modules", ".pnpmfile.cjs", "pnpm-workspace.yaml", ".config/pnpm/rc"] as const).map((cachePath): Fixture => ({
     name: `cache_proof_control_${cachePath.replace(/[^a-z]+/gi, "_")}`,
     origin: "gate",
     expectGateGreen: false,
@@ -1007,6 +1038,60 @@ export const FIXTURES: Fixture[] = [
       input: insertStepBefore(input, proofLine(input, GATE_ENTRY), { uses: "actions/cache@v4", with: { path: cachePath, key: "fixture-v1" } }),
       error: /caches a proof-controlling path/,
     }),
+  })),
+  {
+    name: "xdg_config_home_checked_in_pnpm_rc",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a proof step cannot redirect XDG_CONFIG_HOME to a checked-in pnpm rc",
+    files: {
+      ".github/pmcfg/pnpm/rc": "script-shell=/usr/bin/true\n",
+    },
+    build: (input) => {
+      const [target] = fixtureTargets(input);
+      const edited = setStepKey(input, target!.line, "env", {
+        XDG_CONFIG_HOME: "${{ github.workspace }}/.github/pmcfg",
+      });
+      return {
+        input: withFiles(edited, { ".github/pmcfg/pnpm/rc": "script-shell=/usr/bin/true\n" }),
+        error: /XDG_CONFIG_HOME.*pnpm rc/,
+      };
+    },
+  },
+  {
+    name: "projection_scale_valid",
+    origin: "gate",
+    expectGateGreen: true,
+    describe: "a finite projection publication cost scale within 0.01 through 1.0 is accepted",
+    build: (input) => {
+      const [target] = fixtureTargets(input);
+      return {
+        input: setStepKey(input, target!.line, "env", { PROJECTION_PUBLICATION_COST_SCALE: "0.5" }),
+        covered: [target!.unit],
+      };
+    },
+  },
+  ...([
+    ["empty", ""],
+    ["below_minimum", "0.005"],
+    ["zero", "0"],
+    ["negative", "-1"],
+    ["above_maximum", "1.01"],
+    ["two", "2"],
+    ["nonnumeric", "nonsense"],
+    ["infinite", "Infinity"],
+  ] as const).map(([name, value]): Fixture => ({
+    name: `projection_scale_${name}`,
+    origin: "gate",
+    expectGateGreen: false,
+    describe: `a projection publication cost scale of ${JSON.stringify(value)} is refused`,
+    build: (input) => {
+      const [target] = fixtureTargets(input);
+      return {
+        input: setStepKey(input, target!.line, "env", { PROJECTION_PUBLICATION_COST_SCALE: value }),
+        error: /PROJECTION_PUBLICATION_COST_SCALE.*0\.01.*1/,
+      };
+    },
   })),
   {
     name: "legit_runner_temp_expression",
