@@ -37,6 +37,9 @@
  *   local-only proof really needs the input it declares;
  * - GitHub settings: repository variables, rulesets and required checks.
  *
+ * The accepted deliberate-tampering limits and the eco-6hoxj.163.32 receipt
+ * backstop are documented in docs/ci-coverage-threat-model.md.
+ *
  * CI runs it through `node ./node_modules/tsx/dist/cli.mjs scripts/run-proof.ts
  * scripts/ci-coverage-proof.ts`, not pnpm, so no pnpm setting can turn the
  * gate itself into a no-op.
