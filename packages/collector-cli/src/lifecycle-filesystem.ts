@@ -7,6 +7,7 @@ import {
   LifecycleInterruption,
   PURGE_CONFIRMATION,
   immutableRuntimeRelativePath,
+  parseCompletionReceipt,
   planLifecycleRetention,
   type LifecycleAdapter,
   type LifecycleCloneFallback,
@@ -790,16 +791,18 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     });
   }
 
-  /** Terminal receipt of an operation, or null when absent or unreadable. */
+  /**
+   * Terminal receipt of an update or rollback, or null when it is absent,
+   * unreadable, or not the complete receipt that operation wrote.
+   */
   private operationMarker(operationId: string) {
     try {
       const marker = path.join(this.completedRoot, `${operationId}.json`);
       assertNoSymlink(marker, this.root);
       const stat = fs.lstatSync(marker);
       if (!stat.isFile() || stat.size > MAX_MARKER_BYTES) return null;
-      const row = JSON.parse(fs.readFileSync(marker, "utf8")) as { operation?: unknown; status?: unknown };
-      if (typeof row?.operation !== "string" || typeof row.status !== "string") return null;
-      return { kind: row.operation, status: row.status, completedAtMs: stat.mtimeMs };
+      const receipt = parseCompletionReceipt(JSON.parse(fs.readFileSync(marker, "utf8")), operationId);
+      return receipt ? { kind: receipt.kind, status: receipt.status, completedAtMs: stat.mtimeMs } : null;
     } catch {
       return null;
     }

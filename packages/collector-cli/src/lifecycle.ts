@@ -572,6 +572,132 @@ export function sanitizeLifecycleReadiness(readiness: unknown): LifecycleReadine
   };
 }
 
+/** A completed or rolled-back update/rollback, as its durable completion receipt proves it. */
+export type LifecycleCompletedOperation = {
+  id: string;
+  kind: LifecycleOperationKind;
+  status: "completed" | "rolled_back";
+  fromVersion: string | null;
+  toVersion: string;
+};
+
+const PRESERVED = ["ledger", "history", "credentials", "workspace_membership"] as const;
+const COMPLETED_OWNED_TARGETS = ["runtime", "service_manifest"] as const;
+const ROLLED_BACK_OWNED_TARGETS = ["runtime", "config", "database", "service_manifest"] as const;
+const RECEIPT_KEYS = [
+  "schemaVersion", "toolVersion", "operationId", "operation", "status", "fromVersion", "toVersion",
+  "restoredVersion", "health", "ownedTargets", "retainedTargets", "purgeOnlyTargets", "preserved",
+] as const;
+const CLONE_FALLBACK_VALUES: readonly (LifecycleCloneFallback | null)[] = [
+  null, "ledger_in_use", "ledger_not_wal", "wal_not_empty", "quiescence_unproven", "clone_unsupported",
+];
+const RETENTION_SKIPPED_REASONS = ["lifecycle_state_unreadable", "journal_unreadable", "retention_failed"];
+const MAX_RECEIPT_LIST = 100_000;
+
+function exactKeys(record: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []) {
+  const keys = Reflect.ownKeys(record);
+  if (keys.some((key) => typeof key !== "string" || !(required.includes(key) || optional.includes(key)))) return false;
+  if (required.some((key) => !keys.includes(key))) return false;
+  return keys.every((key) => {
+    const descriptor = Object.getOwnPropertyDescriptor(record, key);
+    return descriptor !== undefined && "value" in descriptor;
+  });
+}
+
+function sameList(value: unknown, expected: readonly string[]) {
+  return Array.isArray(value) && value.length === expected.length && value.every((item, index) => item === expected[index]);
+}
+
+function nonnegativeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+function boundedList<T>(value: unknown, item: (entry: unknown) => entry is T): value is T[] {
+  return Array.isArray(value) && Object.getPrototypeOf(value) === Array.prototype &&
+    value.length <= MAX_RECEIPT_LIST && value.every((entry) => item(entry));
+}
+
+function isRemovedItem(value: unknown): value is LifecycleRemovedItem {
+  const record = ownPlainRecord(value);
+  return record !== null && exactKeys(record, ["kind", "name", "bytes"]) &&
+    (record.kind === "snapshot" || record.kind === "runtime_version") &&
+    safeVersion(record.name) !== null && nonnegativeInteger(record.bytes);
+}
+
+function isIdentifier(value: unknown): value is string {
+  return safeVersion(value) !== null;
+}
+
+function validSnapshotRecord(value: unknown) {
+  const record = ownPlainRecord(value);
+  if (!record || !exactKeys(record, ["method", "quiesced", "cloneFallback", "databaseBytes"])) return false;
+  if (record.method !== "clone" && record.method !== "online_backup" && record.method !== null) return false;
+  if (typeof record.quiesced !== "boolean" || !nonnegativeInteger(record.databaseBytes)) return false;
+  if (!CLONE_FALLBACK_VALUES.includes(record.cloneFallback as LifecycleCloneFallback | null)) return false;
+  return record.method !== "clone" || (record.quiesced && record.cloneFallback === null);
+}
+
+function validRestoreRecord(value: unknown) {
+  const record = ownPlainRecord(value);
+  if (!record || !exactKeys(record, ["method", "cloneFallback", "databaseBytes"])) return false;
+  if (!nonnegativeInteger(record.databaseBytes)) return false;
+  if (record.method === "clone" || record.method === "none") return record.cloneFallback === null;
+  return record.method === "copy" && (record.cloneFallback === "clone_unsupported" || record.cloneFallback === null);
+}
+
+function validRetentionRecord(value: unknown) {
+  const record = ownPlainRecord(value);
+  if (!record || !exactKeys(record, [
+    "keepSnapshots", "status", "skippedReason", "removed", "removedBytes", "recovered", "keptSnapshots", "keptVersions",
+  ])) return false;
+  if (!nonnegativeInteger(record.keepSnapshots) || record.keepSnapshots < 1 ||
+      record.keepSnapshots > LIFECYCLE_MAX_RETAINED_SNAPSHOTS) return false;
+  if (!boundedList(record.removed, isRemovedItem) || !boundedList(record.recovered, isRemovedItem)) return false;
+  if (!boundedList(record.keptSnapshots, isIdentifier) || !boundedList(record.keptVersions, isIdentifier)) return false;
+  if (record.removedBytes !== record.removed.reduce((total, item) => total + item.bytes, 0)) return false;
+  if (record.status === "applied") return record.skippedReason === null;
+  return record.status === "skipped" && RETENTION_SKIPPED_REASONS.includes(record.skippedReason as string) &&
+    record.removed.length === 0;
+}
+
+function validCompletedHealth(value: unknown, toVersion: string) {
+  const record = ownPlainRecord(value);
+  return record !== null &&
+    exactKeys(record, ["ready", "runtimeVersion", "serviceReady", "configCompatible", "databaseCompatible", "reason"]) &&
+    record.ready === true && record.runtimeVersion === toVersion && record.serviceReady === true &&
+    record.configCompatible === true && record.databaseCompatible === true && record.reason === "ready";
+}
+
+/**
+ * Reads a completion marker as the full immutable receipt its operation
+ * wrote. Only a receipt that is complete, has no unknown field, is internally
+ * consistent and names `operationId` (the marker's file name and snapshot ID)
+ * proves a completed or rolled-back update/rollback; anything else returns
+ * null, which retention treats as an unknown operation it never prunes.
+ */
+export function parseCompletionReceipt(value: unknown, operationId: string): LifecycleCompletedOperation | null {
+  const record = ownPlainRecord(value);
+  if (!record || !exactKeys(record, RECEIPT_KEYS, ["snapshot", "retention", "restore"])) return null;
+  const { operation, status, fromVersion, toVersion } = record;
+  if (record.schemaVersion !== LIFECYCLE_SCHEMA_VERSION || record.operationId !== operationId) return null;
+  if (typeof record.toolVersion !== "string" || !/^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$/.test(record.toolVersion)) return null;
+  if ((operation !== "update" && operation !== "rollback") || (status !== "completed" && status !== "rolled_back")) return null;
+  if (!(fromVersion === null || isIdentifier(fromVersion)) || !isIdentifier(toVersion)) return null;
+  if (!sameList(record.retainedTargets, LIFECYCLE_UNINSTALL_RETAINED_TARGETS) ||
+      !sameList(record.purgeOnlyTargets, LIFECYCLE_PURGE_ONLY_TARGETS) || !sameList(record.preserved, PRESERVED)) return null;
+  if ("snapshot" in record && !validSnapshotRecord(record.snapshot)) return null;
+  if (status === "completed") {
+    if (record.restoredVersion !== null || !validCompletedHealth(record.health, toVersion)) return null;
+    if (!sameList(record.ownedTargets, COMPLETED_OWNED_TARGETS) || "restore" in record) return null;
+    if ("retention" in record && !validRetentionRecord(record.retention)) return null;
+  } else {
+    if (record.restoredVersion !== fromVersion || record.health !== null) return null;
+    if (!sameList(record.ownedTargets, ROLLED_BACK_OWNED_TARGETS) || "retention" in record) return null;
+    if ("restore" in record && !validRestoreRecord(record.restore)) return null;
+  }
+  return { id: operationId, kind: operation, status, fromVersion, toVersion };
+}
+
 function assertReadiness(readiness: LifecycleReadiness, version: string) {
   if (!readiness.ready || readiness.runtimeVersion !== version || !readiness.serviceReady ||
       !readiness.configCompatible || !readiness.databaseCompatible || readiness.reason !== "ready") {

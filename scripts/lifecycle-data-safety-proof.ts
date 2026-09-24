@@ -50,6 +50,10 @@ const CASES = {
     "restore_refuses_a_restored_copy_that_fails_integrity_check",
     "rolled_back_receipt_records_how_the_ledger_was_restored",
   ],
+  b3: [
+    "a_two_field_completion_marker_is_unknown_and_never_pruned",
+    "markers_with_missing_extra_mismatched_or_contradictory_fields_are_unknown_and_kept",
+  ],
 } as const;
 const EXPECTED_CHECKS = Object.values(CASES).reduce((total, names) => total + names.length, 0);
 const completion = createProofCompletion("lifecycle-data-safety", EXPECTED_CHECKS);
@@ -564,10 +568,100 @@ async function b2RestoreIsAtomicAndCapacityChecked() {
   });
 }
 
+// ---- B3: completion receipts are validated in full -----------------------
+
+/** The same adapter with automatic retention switched off (so every snapshot stays). */
+function withoutRetention(adapter: LifecycleAdapter): LifecycleAdapter {
+  return new Proxy(adapter, {
+    get(target, property) {
+      if (property === "retainSnapshots") return undefined;
+      const value = target[property as keyof LifecycleAdapter];
+      return typeof value === "function" ? value.bind(target) : value;
+    },
+  });
+}
+
+/** Sequential real updates with retention off: every snapshot and marker is kept. */
+async function updatesWithoutRetention(fixture: Home, operations: ReadonlyArray<readonly [string, string]>) {
+  for (const [operationId, version] of operations) {
+    appendRow(fixture.ledger, `before-${operationId}`);
+    await new LifecycleManager(withoutRetention(fixture.adapter())).update({ operationId, artifact: fixture.artifact(version) });
+  }
+}
+
+const markerPath = (fixture: Home, operationId: string) =>
+  path.join(fixture.lifecycleRoot, "completed-operations", `${operationId}.json`);
+const readMarker = (fixture: Home, operationId: string) =>
+  JSON.parse(fs.readFileSync(markerPath(fixture, operationId), "utf8")) as Record<string, unknown>;
+const writeMarker = (fixture: Home, operationId: string, value: unknown) =>
+  fs.writeFileSync(markerPath(fixture, operationId), typeof value === "string" ? value : `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+
+async function b3StrictCompletionReceipts() {
+  // The review's fixture: hand-made snapshots whose markers are a bare
+  // two-field object, missing, malformed, or a partial receipt.
+  await runCase([CASES.b3[0]], async (record) => {
+    const fixture = createHome("b3-review-markers");
+    const snapshotsRoot = path.join(fixture.lifecycleRoot, "snapshots");
+    const completedRoot = path.join(fixture.lifecycleRoot, "completed-operations");
+    fs.mkdirSync(snapshotsRoot, { recursive: true, mode: 0o700 });
+    fs.mkdirSync(completedRoot, { recursive: true, mode: 0o700 });
+    for (const [id, createdAt] of [["semantic-corrupt", "2026-01-01"], ["missing-marker", "2026-01-02"],
+      ["malformed-marker", "2026-01-03"], ["good-new", "2026-01-04"]] as const) {
+      fs.mkdirSync(path.join(snapshotsRoot, id), { mode: 0o700 });
+      fs.writeFileSync(path.join(snapshotsRoot, id, "snapshot.json"), `${JSON.stringify({
+        schemaVersion: 1, currentVersion: null, currentExecutable: null,
+        present: { config: false, database: false, service: false }, createdAt: `${createdAt}T00:00:00.000Z`,
+      })}\n`, { mode: 0o600 });
+    }
+    fs.writeFileSync(path.join(completedRoot, "semantic-corrupt.json"), '{"operation":"update","status":"completed"}\n', { mode: 0o600 });
+    fs.writeFileSync(path.join(completedRoot, "malformed-marker.json"), "{\n", { mode: 0o600 });
+    fs.writeFileSync(path.join(completedRoot, "good-new.json"), `${JSON.stringify({
+      schemaVersion: 1, operationId: "good-new", operation: "update", status: "completed", fromVersion: null, toVersion: "1.0.0",
+    })}\n`, { mode: 0o600 });
+    fs.utimesSync(path.join(completedRoot, "semantic-corrupt.json"), new Date(1_000), new Date(1_000));
+    fs.utimesSync(path.join(completedRoot, "good-new.json"), new Date(2_000), new Date(2_000));
+    const preview = await fixture.manager().listSnapshots({ keep: 1 });
+    const decision = preview.snapshots.find((row) => row.id === "semantic-corrupt");
+    const applied = await fixture.manager().pruneSnapshots({ operationId: "b3-review-prune", keep: 1, apply: true });
+    record(CASES.b3[0],
+      decision?.retention === "keep" && decision.operationState === "unknown" &&
+        !applied.retention.removed.some((item) => item.name === "semantic-corrupt") &&
+        same(fixture.snapshots(), ["good-new", "malformed-marker", "missing-marker", "semantic-corrupt"]),
+      { decision, removed: applied.retention.removed, remains: fixture.snapshots() });
+  });
+  // Real completed updates whose markers were then damaged: each damaged
+  // receipt must make its operation unknown, so its snapshot is kept.
+  await runCase([CASES.b3[1]], async (record) => {
+    const fixture = createHome("b3-damaged-markers");
+    const operations = [["m1", "1.0.1"], ["m2", "1.0.2"], ["m3", "1.0.3"], ["m4", "1.0.4"], ["m5", "1.0.5"],
+      ["m6", "1.0.6"], ["m7", "1.0.7"]] as const;
+    await updatesWithoutRetention(fixture, operations);
+    writeMarker(fixture, "m1", '{"operation":"update","status":"completed"}\n');
+    writeMarker(fixture, "m2", { ...readMarker(fixture, "m2"), note: "extra field" });
+    writeMarker(fixture, "m3", { ...readMarker(fixture, "m3"), operationId: "m9" });
+    const { preserved: _dropped, ...missing } = readMarker(fixture, "m4");
+    writeMarker(fixture, "m4", missing);
+    writeMarker(fixture, "m5", { ...readMarker(fixture, "m5"), restoredVersion: "1.0.4" });
+    // Markers keep their true completion order on disk (m1 oldest, m7 newest).
+    operations.forEach(([id], index) =>
+      fs.utimesSync(markerPath(fixture, id), new Date(10_000 + index * 1_000), new Date(10_000 + index * 1_000)));
+    const preview = await fixture.manager().listSnapshots({ keep: 1 });
+    const applied = await fixture.manager().pruneSnapshots({ operationId: "b3-damaged-prune", keep: 1, apply: true });
+    const decisions = Object.fromEntries(preview.snapshots.map((row) => [row.id, `${row.retention}:${row.reason}`]));
+    record(CASES.b3[1],
+      ["m1", "m2", "m3", "m4", "m5"].every((id) => decisions[id] === "keep:operation_unknown") &&
+        decisions.m7 === "keep:newest_completed" && decisions.m6 === "prune:older_completed" &&
+        same(applied.retention.removed.filter((item) => item.kind === "snapshot").map((item) => item.name), ["m6"]) &&
+        same(fixture.snapshots(), ["m1", "m2", "m3", "m4", "m5", "m7"]),
+      { decisions, removed: applied.retention.removed, remains: fixture.snapshots() });
+  });
+}
+
 async function main() {
   try {
     await b1NoSplitBrainRollback();
     await b2RestoreIsAtomicAndCapacityChecked();
+    await b3StrictCompletionReceipts();
     const failed = results.filter((row) => !row.passed).map((row) => row.name);
     console.log(JSON.stringify({ proof: "lifecycle-data-safety", checks: results.length, passed: results.length - failed.length, failed, liveStateTouched: false }));
   } finally {
