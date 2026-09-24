@@ -51,6 +51,7 @@ type Receipt = {
     sessionCount: number;
     sourceCounts: Record<string, number>;
     conflictSessionId: string;
+    legacySessionResumeState: "none";
   };
   wire: {
     sentSessions: number;
@@ -136,10 +137,16 @@ async function createV074Ledger() {
       from buffered_events where session_id is not null group by source order by source
     `).all() as Array<{ source: string; sessions: number }>;
     const sessionCount = (db.prepare(`select count(distinct session_id) as n from buffered_events`).get() as { n: number }).n;
+    const legacyResume = db.prepare(
+      `select value from maintenance_state where key = 'session_sync_daemon_v1'`,
+    ).get() as { value: string } | undefined;
     assert.deepEqual(binding, { currentWorkspaceId: currentTenant, previousWorkspaceId: previousTenant });
     assert.equal(sessionCount, 317);
+    // v0.7.4 kept its touched-session retry set in memory; it did not write
+    // the durable daemon horizon introduced by the current collector.
+    assert.equal(legacyResume, undefined);
     assert.deepEqual(Object.fromEntries(sourceRows.map((row) => [row.source, row.sessions])), expectedSourceCounts);
-    return { binding, sessionCount, sourceCounts: expectedSourceCounts };
+    return { binding, sessionCount, sourceCounts: expectedSourceCounts, legacySessionResumeState: "none" as const };
   } finally {
     db.close();
   }
