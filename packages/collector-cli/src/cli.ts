@@ -2881,6 +2881,7 @@ async function main() {
               log: () => undefined,
             });
             const summaryPending = sessionResult.pendingSummarySessionIds;
+            summaryCatchUp = summaryPending.length > 0;
             if (sessionResult.ok && sessionResult.summaryComplete) {
               sessionSyncState = commitDaemonSessionSyncSuccess(
                 sessionSyncState,
@@ -2900,7 +2901,6 @@ async function main() {
                   : [...sessionPlan.sessionIds, ...summaryPending],
               );
               pendingSessionIds = sessionSyncState.pendingSessionIds;
-              summaryCatchUp = summaryPending.length > 0;
             } else {
               sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, sessionPlan.sessionIds);
               pendingSessionIds = sessionSyncState.pendingSessionIds;

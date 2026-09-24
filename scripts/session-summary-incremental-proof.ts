@@ -149,7 +149,7 @@ async function reviewRegressions() {
     "unrelated_revision", "retry_erasure", "hard_bounds", "session_id_paging",
     "privacy_lineage_first_read", "checkpoint_timeout", "future_horizon",
     "interleaved_initial_insert", "trigger_upgrade", "privacy_handoff_erasure",
-    "backdated_queue_planner",
+    "backdated_queue_planner", "stale_send_fast_retry",
   ];
   for (const name of cases) {
     if (selected && selected !== name) continue;
@@ -471,6 +471,36 @@ async function reviewRegressions() {
         assert.deepEqual(updated.snapshot, collectSessionSnapshots(buffer.database, {
           until: later, sessionIds: [sessionId],
         })[0]);
+      } else if (name === "stale_send_fast_retry") {
+        add(1);
+        const db = buffer.database;
+        const originalPrepare = db.prepare.bind(db);
+        let stateReads = 0;
+        let fetchCalls = 0;
+        (db as typeof db & { prepare: typeof db.prepare }).prepare = ((sql: string) => {
+          if (sql.includes("from session_sync_summary_state where session_id = ?") && ++stateReads === 3) add(2);
+          return originalPrepare(sql);
+        }) as typeof db.prepare;
+        let result: Awaited<ReturnType<typeof runSessionSync>>;
+        try {
+          result = await runSessionSync(config, {
+            ledgerDb: db, incremental: true, sessionIds: [sessionId], until,
+            delayMs: 0, maxAttemptsPerBatch: 1,
+            fetchImpl: (async () => { fetchCalls += 1; throw new Error("unexpected_fetch"); }) as typeof fetch,
+            log: () => undefined,
+          });
+        } finally {
+          (db as typeof db & { prepare: typeof db.prepare }).prepare = originalPrepare;
+        }
+        assert.ok(stateReads >= 3);
+        assert.equal(fetchCalls, 0);
+        assert.equal(result.ok, false);
+        assert.ok(result.pendingSummarySessionIds.includes(sessionId));
+        const cliSource = fs.readFileSync(path.join(process.cwd(), "packages/collector-cli/src/cli.ts"), "utf8");
+        const pending = cliSource.indexOf("const summaryPending = sessionResult.pendingSummarySessionIds;");
+        const branch = cliSource.indexOf("if (sessionResult.ok", pending);
+        assert.ok(pending >= 0 && branch > pending);
+        assert.match(cliSource.slice(pending, branch), /summaryCatchUp = summaryPending\.length > 0/);
       }
       console.log(JSON.stringify({ reviewCase: name, result: "PASS" }));
     } finally {
