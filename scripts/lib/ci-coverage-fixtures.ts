@@ -944,6 +944,16 @@ export const FIXTURES: Fixture[] = [
       return { input: insertStepBefore(input, target!.line, { uses: "actions/cache@v4", with: { path: ".cache/fixtures", key: "fixtures-v1" } }), covered: [target!.unit] };
     },
   },
+  ...(["~/.npmrc", "node_modules", ".pnpmfile.cjs"] as const).map((cachePath): Fixture => ({
+    name: `cache_proof_control_${cachePath.replace(/[^a-z]+/gi, "_")}`,
+    origin: "gate",
+    expectGateGreen: false,
+    describe: `actions/cache cannot restore ${cachePath} before proofs`,
+    build: (input) => ({
+      input: insertStepBefore(input, proofLine(input, GATE_ENTRY), { uses: "actions/cache@v4", with: { path: cachePath, key: "fixture-v1" } }),
+      error: /caches a proof-controlling path/,
+    }),
+  })),
   {
     name: "legit_runner_temp_expression",
     origin: "gate",

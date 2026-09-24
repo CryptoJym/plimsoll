@@ -25,6 +25,7 @@ export type WorkflowStep = {
   line: number;
   run: string | null;
   uses: string | null;
+  withValues: Record<string, unknown> | null;
   /** Names the step's `env:` sets; null when it is not a literal mapping. */
   env: string[] | null;
   /** Literal step environment values, when the mapping is readable. */
@@ -595,7 +596,9 @@ export function modelWorkflow(path: string, text: string): WorkflowModel {
         }
       }
       const uses = typeof record.uses === "string" ? record.uses : null;
-      steps.push({ workflow: path, job: jobId, stepIndex: index, name, line, run, uses, env: envNames(record.env), envValues: envValues(record.env), notCovering });
+      steps.push({ workflow: path, job: jobId, stepIndex: index, name, line, run, uses,
+        withValues: isRecord(record.with) ? record.with : null,
+        env: envNames(record.env), envValues: envValues(record.env), notCovering });
     });
   }
   const jobInfo = Object.fromEntries(

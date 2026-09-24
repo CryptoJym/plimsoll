@@ -368,6 +368,13 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
         if (step.uses !== null && !KNOWN_ACTIONS.includes(actionName(step.uses))) {
           errors.push(`${where} runs action ${step.uses} before the job's last proof; only ${KNOWN_ACTIONS.join(", ")} may`);
         }
+        if (step.uses !== null && actionName(step.uses) === "actions/cache") {
+          const cachePath = step.withValues?.path;
+          const unsafe = typeof cachePath !== "string" || cachePath.split(/\s+/).some((entry) =>
+            entry.startsWith("~") || entry.includes("$") ||
+            /(?:^|[/\\])(?:node_modules|\.(?:npm|pnpm|yarn)rc(?:\.yml)?|\.pnpmfile(?:\.[cm]?js)?)(?:[/\\]|$)/i.test(entry));
+          if (unsafe) errors.push(`${where} caches a proof-controlling path (HOME dotfile, rc file, node_modules or pnpmfile)`);
+        }
         const word = activeRun.match(EXECUTION_WORD)?.[0] ?? activeRun.match(CONFIG_WORD)?.[0];
         if (word) errors.push(`${where} names ${word} in its script; setting it (as a prefix, with export or through $GITHUB_ENV) changes how the proofs run`);
         if (activeRun.includes("GITHUB_PATH")) errors.push(`${where} writes $GITHUB_PATH, which changes which programs the proofs run`);
