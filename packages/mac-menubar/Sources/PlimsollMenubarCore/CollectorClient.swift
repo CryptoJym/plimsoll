@@ -17,6 +17,7 @@ public enum CollectorClientError: Error, Equatable, LocalizedError {
     case commandFailed(exitCode: Int32, message: String)
     case invalidStatusOutput
     case processLaunchFailed(String)
+    case timedOut(seconds: Int)
 
     public var errorDescription: String? {
         switch self {
@@ -28,6 +29,8 @@ public enum CollectorClientError: Error, Equatable, LocalizedError {
             return "Collector returned invalid status JSON."
         case let .processLaunchFailed(message):
             return "Could not launch collector: \(message)"
+        case let .timedOut(seconds):
+            return "Collector status did not finish within \(seconds) seconds."
         }
     }
 }
@@ -92,29 +95,84 @@ public final class CollectorClient: @unchecked Sendable {
 }
 
 public enum ProcessCollectorExecutor {
+    /// Bound on one `plimsoll status` run. Status opens and reads the local
+    /// ledger, which takes seconds on a busy host, not minutes.
+    public static let defaultTimeout: TimeInterval = 60
+
     public static func run(_ invocation: CollectorInvocation) throws -> CollectorExecutionResult {
+        try run(invocation, timeout: defaultTimeout)
+    }
+
+    public static func run(
+        _ invocation: CollectorInvocation,
+        timeout: TimeInterval
+    ) throws -> CollectorExecutionResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: invocation.executablePath)
         process.arguments = invocation.arguments
+        process.standardInput = FileHandle.nullDevice
 
         let output = Pipe()
         let error = Pipe()
         process.standardOutput = output
         process.standardError = error
+        let exited = DispatchSemaphore(value: 0)
+        process.terminationHandler = { _ in exited.signal() }
 
         do {
             try process.run()
         } catch {
             throw CollectorClientError.processLaunchFailed(error.localizedDescription)
         }
-        process.waitUntilExit()
 
-        let stdout = String(data: output.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        let stderr = String(data: error.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        // Read both pipes while the collector runs. Waiting for it to exit
+        // first deadlocks once the status JSON outgrows the pipe buffer: the
+        // collector blocks writing and never exits.
+        let stdout = PipeReader(output.fileHandleForReading)
+        let stderr = PipeReader(error.fileHandleForReading)
+        let deadline = DispatchTime.now() + timeout
+        guard exited.wait(timeout: deadline) == .success,
+              let standardOutput = stdout.wait(until: deadline),
+              let standardError = stderr.wait(until: deadline) else {
+            stop(process)
+            throw CollectorClientError.timedOut(seconds: Int(timeout.rounded(.up)))
+        }
         return CollectorExecutionResult(
-            standardOutput: stdout,
-            standardError: stderr,
+            standardOutput: String(decoding: standardOutput, as: UTF8.self),
+            standardError: String(decoding: standardError, as: UTF8.self),
             exitCode: process.terminationStatus
         )
+    }
+
+    private static func stop(_ process: Process) {
+        guard process.isRunning else { return }
+        process.terminate()
+        let deadline = Date().addingTimeInterval(2)
+        while process.isRunning, Date() < deadline {
+            usleep(10_000)
+        }
+        if process.isRunning {
+            kill(process.processIdentifier, SIGKILL)
+        }
+    }
+}
+
+/// Reads one pipe to end-of-file on a background queue.
+private final class PipeReader: @unchecked Sendable {
+    private let done = DispatchSemaphore(value: 0)
+    // Written once before `done` is signalled; read only after waiting on it.
+    private var data = Data()
+
+    init(_ handle: FileHandle) {
+        DispatchQueue.global(qos: .utility).async {
+            // readToEnd() reports a read error as a Swift error; the older
+            // readDataToEndOfFile() raises an exception Swift cannot catch.
+            self.data = ((try? handle.readToEnd()) ?? nil) ?? Data()
+            self.done.signal()
+        }
+    }
+
+    func wait(until deadline: DispatchTime) -> Data? {
+        done.wait(timeout: deadline) == .success ? data : nil
     }
 }

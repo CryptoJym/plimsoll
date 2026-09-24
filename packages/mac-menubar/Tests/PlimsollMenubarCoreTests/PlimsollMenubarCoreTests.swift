@@ -114,6 +114,64 @@ struct PlimsollMenubarCoreTests {
         }
     }
 
+    @Test func statusLargerThanThePipeBufferIsReadWithoutDeadlock() throws {
+        // The collector's status JSON grows with the host; this one is ~1 MB.
+        let collector = try FakeCollector("""
+            printf '{"port":48271,"stats":{"count":3,"tokenAttributedEvents":3},"padding":"'
+            head -c 1000000 /dev/zero | tr '\\0' 'x'
+            printf '"}'
+            """)
+        defer { collector.remove() }
+
+        let result = try ProcessCollectorExecutor.run(collector.invocation, timeout: 20)
+
+        #expect(result.exitCode == 0)
+        #expect(result.standardOutput.utf8.count > 1_000_000)
+        #expect(try CollectorStatus(json: Data(result.standardOutput.utf8)).eventCount == 3)
+    }
+
+    @Test func hungCollectorTimesOutAndIsStopped() throws {
+        // The fixture records its pid first; 2 s leaves room to start on a
+        // loaded host before the deadline stops it.
+        let collector = try FakeCollector("""
+            echo $$ > "$0.pid"
+            exec /bin/sleep 30
+            """)
+        defer { collector.remove() }
+
+        #expect(throws: CollectorClientError.timedOut(seconds: 2)) {
+            try ProcessCollectorExecutor.run(collector.invocation, timeout: 2)
+        }
+        let pidText = try String(contentsOf: collector.directory.appendingPathComponent("plimsoll.pid"), encoding: .utf8)
+        let pid = try #require(pid_t(pidText.trimmingCharacters(in: .whitespacesAndNewlines)))
+        #expect(kill(pid, 0) == -1 && errno == ESRCH, "the timed-out collector process is still running")
+    }
+
+    @Test func collectorFailureReportsExitCodeAndError() throws {
+        let collector = try FakeCollector("""
+            echo 'Error: database is locked' >&2
+            exit 3
+            """)
+        defer { collector.remove() }
+
+        #expect(throws: CollectorClientError.commandFailed(exitCode: 3, message: "Error: database is locked")) {
+            try CollectorClient(invocation: collector.invocation, probeLiveness: { _ in false }).status()
+        }
+    }
+
+    @Test func missingCollectorExecutableReportsLaunchFailure() throws {
+        let invocation = try #require(
+            CollectorInvocation(environment: ["PLIMSOLL_COLLECTOR_BIN": "/nonexistent/plimsoll"])
+        )
+
+        #expect {
+            try ProcessCollectorExecutor.run(invocation, timeout: 5)
+        } throws: { error in
+            guard case .processLaunchFailed = error as? CollectorClientError else { return false }
+            return true
+        }
+    }
+
     @Test func permissionDoctorReportsNoAdditionalPermissions() throws {
         let report = PermissionDoctor.report()
 
@@ -130,5 +188,26 @@ struct PlimsollMenubarCoreTests {
         let json = try PermissionDoctor.json()
         #expect(json.contains("No additional macOS permissions requested"))
         #expect(json.contains("\"requestsAdditionalPermissions\":false"))
+    }
+}
+
+/// A throwaway executable standing in for `plimsoll`; it is run as
+/// `<path> status`, exactly as the menubar runs the real collector.
+private struct FakeCollector {
+    let directory: URL
+    let invocation: CollectorInvocation
+
+    init(_ body: String) throws {
+        directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("plimsoll-menubar-test-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        let executable = directory.appendingPathComponent("plimsoll")
+        try ("#!/bin/sh\n" + body + "\n").write(to: executable, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
+        invocation = try #require(CollectorInvocation(environment: ["PLIMSOLL_COLLECTOR_BIN": executable.path]))
+    }
+
+    func remove() {
+        try? FileManager.default.removeItem(at: directory)
     }
 }
