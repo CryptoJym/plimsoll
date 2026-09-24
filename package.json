@@ -20,6 +20,7 @@
     "proof:grok-source": "tsx scripts/grok-source-proof.ts",
     "proof:grok-usage": "tsx scripts/run-proof.ts scripts/grok-usage-proof.ts",
     "proof:grok-starvation": "tsx scripts/grok-starvation-proof.ts",
+    "proof:busy-host-capture": "tsx scripts/busy-host-capture-proof.ts",
     "runtime:build": "tsx scripts/build-packaged-runtime.ts",
     "runtime:verify": "tsx scripts/build-packaged-runtime.ts --verify",
     "proof:packaged-runtime": "tsx scripts/run-proof.ts scripts/packaged-runtime-proof.ts",

@@ -11,6 +11,9 @@
  *   --expect=green  the repaired scheduler must reach the newest sessions
  *   --equal-mtime  mutation probe: recency has been removed by making every
  *                   directory tie; the recent-first assertion must fail
+ *
+ * Fixture times are relative to now: the recent sessions were written an
+ * hour ago, the rest weeks ago, so the proof means the same on any date.
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -32,6 +35,7 @@ const sessionsPerGroup = 40;
 const recentGroupIndex = groupCount - 1;
 const recentSessionIndex = sessionsPerGroup - 1;
 const recentFiles = 5;
+const DAY_MS = 24 * 60 * 60 * 1_000;
 
 function uuid(index: number) {
   return `7a1e0000-0000-4000-8000-${String(index).padStart(12, "0")}`;
@@ -63,8 +67,8 @@ function usageDocument(sessionId: string, endedAt: string) {
 function writeFixture(home: string) {
   const sessionsRoot = path.join(home, "sessions");
   fs.mkdirSync(sessionsRoot, { recursive: true, mode: 0o700 });
-  const old = new Date("2026-09-01T00:00:00.000Z");
-  const recent = new Date("2026-09-24T12:00:00.000Z");
+  const old = new Date(Date.now() - 23 * DAY_MS);
+  const recent = new Date(Date.now() - 60 * 60 * 1_000);
   const recentPaths: string[] = [];
   const recentSessionIds: string[] = [];
   let ordinal = 0;
@@ -173,7 +177,7 @@ async function main() {
   let codexLiveGenerationWritten = false;
   try {
     if (equalMtime) {
-      const tie = new Date("2026-09-10T00:00:00.000Z");
+      const tie = new Date(Date.now() - 14 * DAY_MS);
       for (const group of fs.readdirSync(fixture.sessionsRoot)) {
         const groupPath = path.join(fixture.sessionsRoot, group);
         fs.utimesSync(groupPath, tie, tie);
