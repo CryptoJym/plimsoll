@@ -474,28 +474,44 @@ export class DeliveryOutbox {
       if (!frontier || frontier.workspaceId !== this.workspaceId) return null;
       const epochStartedAt = frontier.epochStartedAt;
       const control = this.db
-        .prepare(`select migration_complete as migrationComplete from upload_control where singleton = 1`)
-        .get() as { migrationComplete: number };
-      // Earliest observed time per set, in SQL (the outbox may hold millions of
-      // rows). An unreadable observed time dates its delivery to the epoch start.
-      const epochStartSeconds = Date.parse(epochStartedAt) / 1000;
-      const pending = this.db
         .prepare(
-          `select count(*) as count,
-             min(coalesce(unixepoch(json_extract(base_envelope_json, '$.event.observedAt'), 'subsec'),
-               @epochStartSeconds)) as earliestSeconds
-           from upload_outbox
-           where workspace_id is @workspaceId and device_id is @deviceId
-             and created_at >= @epochStartedAt
-             and delivery_id not in (select value from json_each(@requestIds))`,
+          `select migration_complete as migrationComplete,
+             active_pending + active_retry + active_in_flight as active
+           from upload_control where singleton = 1`,
         )
-        .get({
-          workspaceId: this.workspaceId,
-          deviceId: this.deviceId,
-          epochStartedAt,
-          epochStartSeconds,
-          requestIds: JSON.stringify(requestDeliveryIds),
-        }) as { count: number; earliestSeconds: number | null };
+        .get() as { migrationComplete: number; active: number };
+      // Keep the upload path bounded: over the row budget the queue is far
+      // behind anyway, so attest nothing instead of reading every queued
+      // envelope (about 70 ms per request at 50,000 rows, linear beyond it).
+      const overBudget = control.active > this.limits.maxActiveRows;
+      // Earliest observed time per set, in SQL. An unreadable observed time
+      // dates its delivery to the epoch start.
+      const epochStartSeconds = Date.parse(epochStartedAt) / 1000;
+      const requestIds = JSON.stringify(requestDeliveryIds);
+      const pending = overBudget
+        ? {
+            count: Math.max(0, control.active - (this.db
+              .prepare(`select count(*) as count from upload_outbox where delivery_id in (select value from json_each(?))`)
+              .get(requestIds) as { count: number }).count),
+            earliestSeconds: null,
+          }
+        : (this.db
+            .prepare(
+              `select count(*) as count,
+                 min(coalesce(unixepoch(json_extract(base_envelope_json, '$.event.observedAt'), 'subsec'),
+                   @epochStartSeconds)) as earliestSeconds
+               from upload_outbox
+               where workspace_id is @workspaceId and device_id is @deviceId
+                 and created_at >= @epochStartedAt
+                 and delivery_id not in (select value from json_each(@requestIds))`,
+            )
+            .get({
+              workspaceId: this.workspaceId,
+              deviceId: this.deviceId,
+              epochStartedAt,
+              epochStartSeconds,
+              requestIds,
+            }) as { count: number; earliestSeconds: number | null });
       const dead = this.db
         .prepare(
           `select count(*) as count,
@@ -508,7 +524,7 @@ export class DeliveryOutbox {
       const toMs = (seconds: number | null) => (seconds === null ? null : Math.floor(seconds * 1000));
       const pendingMs = toMs(pending.earliestSeconds);
       const deadMs = toMs(dead.earliestSeconds);
-      let throughMs = frontier.capturedThrough === null || control.migrationComplete !== 1
+      let throughMs = overBudget || frontier.capturedThrough === null || control.migrationComplete !== 1
         ? null
         : Date.parse(frontier.capturedThrough);
       for (const bound of [pendingMs, deadMs]) {

@@ -6,9 +6,10 @@
  * docs/capture-watermark-v1.md): it attests nothing before both tailed sources
  * completed a capture pass; queued and dead deliveries hold it back to their
  * observed time; dead deliveries are named as a gap; the cursor strictly
- * increases; the claim is scoped to the current installation epoch; and on the
- * wire it is a signed header while the batch body stays byte-for-byte the
- * shape an older, strict cloud accepts.
+ * increases; the claim is scoped to the current installation epoch; over the
+ * queue's row budget it attests nothing without reading queued envelopes; and
+ * on the wire it is a signed header while the batch body stays byte-for-byte
+ * the shape an older, strict cloud accepts.
  */
 import crypto from "node:crypto";
 import fs from "node:fs";
@@ -27,7 +28,7 @@ import { aiInteractionEventSchema, aiWorkIngestBatchSchema } from "../packages/s
 import { acknowledgingFetch } from "./fixtures/delivery-ack-fixture";
 import { createProofCompletion } from "./lib/proof-completion";
 
-const completion = createProofCompletion("capture-claim", 12);
+const completion = createProofCompletion("capture-claim", 13);
 const check = (name: string, passed: boolean, detail: Record<string, unknown> = {}) => {
   completion.check(name, passed);
   if (!passed) throw new Error(`${name} failed: ${JSON.stringify(detail)}`);
@@ -226,6 +227,36 @@ async function main() {
       afterUpload.cursor === (claim.cursor as number) + 1,
     { afterUpload });
   wire.close();
+
+  // 10. Over the queue's row budget the claim attests nothing and never reads
+  //     the queued envelopes (a planted unreadable envelope would make that
+  //     scan throw), so the upload path stays bounded however far behind it is.
+  enrollmentClock = EPOCH_START_MS;
+  const bounded = new LocalEventBuffer(ledger(), {
+    workspaceId: TENANT,
+    delivery: { enabled: true, limits: { maxOldestAgeDays: 3650, maxActiveRows: 1 } },
+    enrollmentNow: () => new Date(enrollmentClock),
+  });
+  const kept = event(EPOCH_START_MS + 40 * 60_000);
+  bounded.append(kept);
+  bounded.delivery.migrateLegacy({ now: new Date() });
+  bothPasses(bounded, EPOCH_START_MS + 2 * 3_600_000, EPOCH_START_MS + 2 * 3_600_000);
+  const underBudget = bounded.delivery.captureClaim([kept.id])!;
+  const overflow = event(EPOCH_START_MS + 50 * 60_000);
+  bounded.append(overflow);
+  bounded.database.prepare(`update upload_outbox set base_envelope_json = '{unreadable' where delivery_id = ?`).run(overflow.id);
+  let plantedUnreadable = false;
+  try {
+    bounded.database.prepare(`select json_extract(base_envelope_json, '$.event.observedAt') from upload_outbox`).all();
+  } catch {
+    plantedUnreadable = true;
+  }
+  const overBudget = bounded.delivery.captureClaim([kept.id])!;
+  check("over_row_budget_attests_nothing_without_reading_the_queue",
+    plantedUnreadable && underBudget.through === iso(EPOCH_START_MS + 2 * 3_600_000) && underBudget.pending === 0 &&
+      overBudget.through === null && overBudget.pending === 1 && overBudget.cursor === underBudget.cursor + 1,
+    { plantedUnreadable, underBudget, overBudget });
+  bounded.close();
   fs.rmSync(root, { recursive: true, force: true });
   completion.complete();
 }
