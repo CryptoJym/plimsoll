@@ -5,6 +5,7 @@
 // `direct-new` exercises current admission; downgrade/reupgrade exercise the
 // same admitted spellings after the new stored-key schema is present.
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createRequire } from "node:module";
@@ -12,16 +13,160 @@ import { createRequire } from "node:module";
 const [mode, ledgerPath] = process.argv.slice(2);
 assert.ok(["seed-old", "upgrade-new", "direct-new", "downgrade-old", "reupgrade-new"].includes(mode));
 assert.ok(ledgerPath, "ledger path required");
-const isolatedTempDir = path.resolve(process.env.TMPDIR || os.tmpdir());
-const resolvedLedgerPath = path.resolve(ledgerPath);
-const relativeLedgerPath = path.relative(isolatedTempDir, resolvedLedgerPath);
+
+type FilePathError = NodeJS.ErrnoException;
+
+function sameOrInside(root: string, candidate: string) {
+  const relative = path.relative(root, candidate);
+  return relative !== "" && relative !== ".." &&
+    !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative);
+}
+
+function sameOrAncestor(candidate: string, root: string) {
+  return candidate === root || sameOrInside(candidate, root);
+}
+
+const configuredTempDir = process.env.TMPDIR;
+const requestedTempDir = path.resolve(configuredTempDir || os.tmpdir());
+let tempRootStat: fs.Stats;
+try {
+  tempRootStat = fs.lstatSync(requestedTempDir);
+} catch (error) {
+  const detail = error as FilePathError;
+  assert.fail(`isolated temp folder is not accessible: ${requestedTempDir} (${detail.code ?? "unknown"})`);
+}
+assert.ok(tempRootStat!.isDirectory(), `isolated temp folder must be a directory: ${requestedTempDir}`);
+if (tempRootStat!.isSymbolicLink()) {
+  const systemTempAlias = path.join(path.parse(requestedTempDir).root, "tmp");
+  assert.equal(
+    requestedTempDir,
+    systemTempAlias,
+    `isolated temp folder must not be a symlink: ${requestedTempDir}`,
+  );
+}
+const isolatedTempDir = fs.realpathSync.native(requestedTempDir);
+const filesystemRoot = path.parse(isolatedTempDir).root;
+assert.notEqual(isolatedTempDir, filesystemRoot, "isolated temp folder must not be the filesystem root");
+const homeDir = fs.realpathSync.native(os.homedir());
+assert.notEqual(isolatedTempDir, homeDir, "isolated temp folder must not be the home directory");
+const systemTempAlias = path.join(path.parse(requestedTempDir).root, "tmp");
+let systemTempRoot: string | undefined;
+try { systemTempRoot = fs.realpathSync.native(systemTempAlias); } catch { /* checked below */ }
+const isSystemTempRoot = systemTempRoot !== undefined && isolatedTempDir === systemTempRoot &&
+  (requestedTempDir === systemTempAlias || requestedTempDir === systemTempRoot);
+const tempPathComponents = isolatedTempDir.split(path.sep).filter(Boolean);
 assert.ok(
-  relativeLedgerPath &&
-    relativeLedgerPath !== ".." &&
-    !relativeLedgerPath.startsWith(`..${path.sep}`) &&
-    !path.isAbsolute(relativeLedgerPath),
-  `ledger path must be inside isolated temp folder ${isolatedTempDir}`,
+  !configuredTempDir || requestedTempDir === systemTempAlias ||
+    tempPathComponents.some((component) => /^(?:tmp|temp|t)$/i.test(component)),
+  `isolated temp folder must be a temp path: ${isolatedTempDir}`,
 );
+const realTempRootStat = fs.statSync(isolatedTempDir);
+assert.ok(realTempRootStat.isDirectory(), `isolated temp folder must be a directory: ${isolatedTempDir}`);
+const rootMode = realTempRootStat.mode & 0o7777;
+assert.ok(
+  (rootMode & 0o002) === 0 || isSystemTempRoot,
+  `isolated temp folder must not be a shared world-writable directory: ${isolatedTempDir}`,
+);
+const currentUid = typeof process.getuid === "function" ? process.getuid() : undefined;
+assert.ok(
+  currentUid === undefined || realTempRootStat.uid === currentUid || isSystemTempRoot,
+  `isolated temp folder must be owned by the current user: ${isolatedTempDir}`,
+);
+
+function nearestExisting(candidate: string) {
+  let current = path.resolve(candidate);
+  while (true) {
+    try {
+      const stat = fs.lstatSync(current);
+      return { path: current, stat };
+    } catch (error) {
+      const detail = error as FilePathError;
+      if (detail.code !== "ENOENT" && detail.code !== "ENOTDIR") throw error;
+      const parent = path.dirname(current);
+      assert.notEqual(parent, current, `path has no existing parent: ${candidate}`);
+      current = parent;
+    }
+  }
+}
+
+function inspectExistingComponents(candidate: string) {
+  const absolute = path.resolve(candidate);
+  const existing = nearestExisting(absolute);
+  let current = path.parse(absolute).root;
+  const components = absolute.slice(current.length).split(path.sep).filter(Boolean);
+  for (const component of components) {
+    current = path.join(current, component);
+    let stat: fs.Stats;
+    try {
+      stat = fs.lstatSync(current);
+    } catch (error) {
+      const detail = error as FilePathError;
+      if (detail.code === "ENOENT" || detail.code === "ENOTDIR") break;
+      throw error;
+    }
+    if (!stat.isSymbolicLink()) continue;
+    const realComponent = fs.realpathSync.native(current);
+    const realParent = fs.realpathSync.native(path.dirname(current));
+    assert.ok(
+      sameOrInside(isolatedTempDir, realComponent) || sameOrAncestor(realComponent, isolatedTempDir),
+      `symlink component escapes isolated temp folder: ${current} -> ${realComponent}`,
+    );
+    assert.ok(
+      !sameOrInside(isolatedTempDir, realParent),
+      `symlink component inside isolated temp folder is refused: ${current}`,
+    );
+  }
+  assert.ok(existing.stat.isDirectory() || existing.path === absolute,
+    `ledger parent is not a directory: ${existing.path}`);
+  return { absolute, existing };
+}
+
+function assertSafeLedgerPath(candidate: string) {
+  const { absolute, existing } = inspectExistingComponents(candidate);
+  const parent = path.dirname(absolute);
+  const parentInfo = nearestExisting(parent);
+  assert.ok(parentInfo.stat.isDirectory(), `ledger parent is not a directory: ${parentInfo.path}`);
+  const parentReal = fs.realpathSync.native(parentInfo.path);
+  const relativeMissing = path.relative(parentInfo.path, absolute);
+  const resolvedPath = path.resolve(parentReal, relativeMissing);
+  assert.ok(
+    sameOrInside(isolatedTempDir, resolvedPath),
+    `ledger path must be inside isolated temp folder ${isolatedTempDir}: ${candidate}`,
+  );
+  if (existing.path === absolute) {
+    assert.ok(!existing.stat.isSymbolicLink(), `ledger path must not be a symlink: ${candidate}`);
+    const realPath = fs.realpathSync.native(absolute);
+    assert.ok(
+      sameOrInside(isolatedTempDir, realPath),
+      `ledger path resolves outside isolated temp folder ${isolatedTempDir}: ${candidate}`,
+    );
+  }
+}
+
+function openDatabase(candidate: string) {
+  assertSafeLedgerPath(candidate);
+  let descriptor: number | undefined;
+  try {
+    try {
+      descriptor = fs.openSync(candidate, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
+    } catch (error) {
+      const detail = error as FilePathError;
+      if (detail.code !== "ENOENT") throw error;
+      descriptor = fs.openSync(
+        candidate,
+        fs.constants.O_RDWR | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+        0o600,
+      );
+    }
+  } finally {
+    if (descriptor !== undefined) fs.closeSync(descriptor);
+  }
+  assertSafeLedgerPath(candidate);
+  return new Database(candidate);
+}
+
+const probeLedgerPaths = [ledgerPath, `${ledgerPath}.tie.sqlite`, `${ledgerPath}.top.sqlite`];
+for (const probePath of probeLedgerPaths) assertSafeLedgerPath(probePath);
 const requireFromRepo = createRequire(path.join(process.cwd(), "package.json"));
 const Database = requireFromRepo("better-sqlite3");
 const facts = requireFromRepo(path.join(process.cwd(), "packages/collector-cli/src/learning-facts.ts"));
@@ -168,18 +313,18 @@ function compareTie(db: any) {
   }
 }
 
-const db = new Database(ledgerPath);
+const db = openDatabase(ledgerPath);
 try {
   if (mode === "seed-old") {
     seedLedger(db);
     assert.equal((db.pragma("table_xinfo(tool_attempt_facts)") as Array<{name:string}>).some(
       (column) => column.name === "retention_ms"), false, "seed must use real 0.7.38 schema");
-    const tieDb = new Database(`${ledgerPath}.tie.sqlite`);
+    const tieDb = openDatabase(`${ledgerPath}.tie.sqlite`);
     try { seedTie(tieDb, 10); } finally { tieDb.close(); }
   } else if (mode === "direct-new") {
     seedLedger(db);
     compareFull(db);
-    const topDb = new Database(`${ledgerPath}.top.sqlite`);
+    const topDb = openDatabase(`${ledgerPath}.top.sqlite`);
     try {
       const topStore = new facts.LearningFactStore(topDb, { attempts: 3, episodes: 3 });
       for (const sample of samples) {
@@ -188,7 +333,7 @@ try {
       }
       compareTop(topDb);
     } finally { topDb.close(); }
-    const tieDb = new Database(`${ledgerPath}.tie.sqlite`);
+    const tieDb = openDatabase(`${ledgerPath}.tie.sqlite`);
     try { seedTie(tieDb, 2); compareTie(tieDb); } finally { tieDb.close(); }
   } else if (mode === "upgrade-new") {
     new facts.LearningFactStore(db, { attempts: 512, episodes: 512 });
@@ -227,7 +372,7 @@ try {
         .all() as Array<{id:string}>).map((row) => row.id),
     ]));
     db.close();
-    const trimmed = new Database(ledgerPath);
+    const trimmed = openDatabase(ledgerPath);
     try {
       new facts.LearningFactStore(trimmed, { attempts: 3, episodes: 3 });
       for (const table of ["tool_attempt_facts", "work_episode_facts"]) {
@@ -253,7 +398,7 @@ if (mode === "upgrade-new") {
     compareTop(trimmed);
     console.log(JSON.stringify({ mode: "upgrade-trim", retainedPerTable: 3 }));
   } finally { trimmed.close(); }
-  const tieDb = new Database(`${ledgerPath}.tie.sqlite`);
+  const tieDb = openDatabase(`${ledgerPath}.tie.sqlite`);
   try {
     new facts.LearningFactStore(tieDb, { attempts: 2, episodes: 2 });
     compareTie(tieDb);
