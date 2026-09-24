@@ -87,8 +87,11 @@ export type LifecycleDatabaseAdapter = {
    * removal of the ledger files.
    */
   discard?(input: { destination: string }): Promise<void>;
-  /** Update --preflight. May clone the source to `probe` to test the volume; always removes it. */
-  plan?(input: { source: string; probe: string }): Promise<LifecycleSnapshotPlan>;
+  /**
+   * Update --preflight for a snapshot of `source` under `destination` (which
+   * may not exist yet). Read-only: creates, changes and removes nothing.
+   */
+  plan?(input: { source: string; destination: string }): Promise<LifecycleSnapshotPlan>;
 };
 
 type SnapshotMetadata = {
@@ -890,18 +893,12 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     return snapshotRecordFrom(metadata, database?.isFile() ? database.size : 0);
   }
 
+  /** Read-only: creates nothing, not even the lifecycle root. */
   async planSnapshot(): Promise<LifecycleSnapshotPlan> {
     if (!this.database.plan) throw new Error("the database adapter cannot plan snapshots");
-    // The clone probe lives in the trash so any leftover is removed by the
-    // next retention or prune.
     assertNoSymlink(this.root, this.paths.ownershipRoot);
-    ensureDirectory(this.root, this.paths.ownershipRoot);
-    ensureDirectory(this.trashRoot, this.root);
     assertNoSymlink(this.paths.database, this.paths.ownershipRoot);
-    return this.database.plan({
-      source: this.paths.database,
-      probe: path.join(this.trashRoot, ["probe", randomBytes(6).toString("hex")].join(TRASH_SEPARATOR)),
-    });
+    return this.database.plan({ source: this.paths.database, destination: this.snapshotsRoot });
   }
 
   /**
@@ -1100,12 +1097,10 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     if (!trash) return [];
     assertNoSymlink(this.trashRoot, this.root);
     if (!trash.isDirectory()) throw new Error("lifecycle trash must be a directory");
-    const entries: Array<{ fileName: string; item: LifecycleRemovedItem | null }> = [];
+    const entries: Array<{ fileName: string; item: LifecycleRemovedItem }> = [];
     for (const fileName of fs.readdirSync(this.trashRoot).sort()) {
       const [kind, name] = fileName.split(TRASH_SEPARATOR);
-      if (kind === "probe") {
-        entries.push({ fileName, item: null });
-      } else if ((kind === "snapshot" || kind === "runtime_version") && isBoundedIdentifier(name)) {
+      if ((kind === "snapshot" || kind === "runtime_version") && isBoundedIdentifier(name)) {
         entries.push({ fileName, item: { kind, name, bytes: treeBytes(path.join(this.trashRoot, fileName)) } });
       }
     }
@@ -1182,7 +1177,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       retention: decision.keep ? "keep" as const : "prune" as const,
       reason: decision.reason,
     })).sort((left, right) => right.version.localeCompare(left.version, undefined, { numeric: true }));
-    const pendingRemoval = this.trashEntries().flatMap((entry) => entry.item ? [entry.item] : []);
+    const pendingRemoval = this.trashEntries().map((entry) => entry.item);
     const sum = (rows: readonly { bytes: number }[]) => rows.reduce((total, row) => total + row.bytes, 0);
     return {
       keepSnapshots: input.keep,
@@ -1256,7 +1251,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     }
     const accounted = new Set(earlier.flatMap((pending) => pending.items.map((item) => item.trashName)));
     const orphans: RemovalItem[] = this.trashEntries().flatMap((entry) =>
-      entry.item && !accounted.has(entry.fileName) ? [{ ...entry.item, trashName: entry.fileName, origin: "orphan" as const }] : []);
+      accounted.has(entry.fileName) ? [] : [{ ...entry.item, trashName: entry.fileName, origin: "orphan" as const }]);
     const planned: RemovalItem[] = removed.map((item) => ({
       ...item,
       trashName: [item.kind, item.name, randomBytes(6).toString("hex")].join(TRASH_SEPARATOR),

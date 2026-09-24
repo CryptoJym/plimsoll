@@ -66,6 +66,10 @@ const CASES = {
     "next_prune_records_the_removal_the_crash_left_unrecorded",
     "failed_receipt_write_after_retention_is_recovered_by_the_next_prune",
   ],
+  preflight: [
+    "preflight_is_read_only_and_creates_nothing",
+    "clone_helper_works_detached_without_a_terminal_or_login_environment",
+  ],
 } as const;
 const EXPECTED_CHECKS = Object.values(CASES).reduce((total, names) => total + names.length, 0);
 const completion = createProofCompletion("lifecycle-data-safety", EXPECTED_CHECKS);
@@ -852,6 +856,82 @@ async function b5RemovalsAreDurablyRecorded() {
   });
 }
 
+// ---- Should-fix: read-only preflight; the clone helper outside a terminal --
+
+/** Relative path, type, mode, size, mtime and small-file content of a tree. */
+function treeDigest(root: string) {
+  const rows: string[] = [];
+  const walk = (directory: string) => {
+    for (const name of fs.readdirSync(directory).sort()) {
+      const absolute = path.join(directory, name);
+      const stat = fs.lstatSync(absolute, { bigint: true });
+      const relative = path.relative(root, absolute);
+      if (stat.isDirectory()) {
+        rows.push(`d ${relative} ${stat.mode} ${stat.mtimeNs}`);
+        walk(absolute);
+      } else {
+        const content = stat.isFile() && stat.size < 1024n * 1024n ? sha256(fs.readFileSync(absolute)) : `ino:${stat.ino}`;
+        rows.push(`f ${relative} ${stat.mode} ${stat.size} ${stat.mtimeNs} ${content}`);
+      }
+    }
+  };
+  walk(root);
+  return sha256(rows.join("\n"));
+}
+
+async function preflightAndCloneHelper() {
+  await runCase([CASES.preflight[0]], async (record) => {
+    const fixture = createHome("preflight-read-only");
+    const before = treeDigest(fixture.home);
+    const plan = await fixture.manager().preflightUpdate();
+    record(CASES.preflight[0],
+      treeDigest(fixture.home) === before && !exists(fixture.lifecycleRoot) && plan.method === "clone" && plan.ok &&
+        plan.requiredFreeBytes === 0,
+      { plan, lifecycleRootCreated: exists(fixture.lifecycleRoot) });
+  });
+  // A LaunchAgent or a non-interactive SSH command runs the helper with no
+  // controlling terminal, in its own session, with a minimal environment.
+  await runCase([CASES.preflight[1]], async (record) => {
+    const directory = path.join(ROOT, "detached-helper");
+    fs.mkdirSync(directory, { mode: 0o700 });
+    const source = path.join(directory, "source.bin");
+    const destination = path.join(directory, "clone.bin");
+    fs.writeFileSync(source, randomBytes(1024 * 1024));
+    const probe = path.join(directory, "probe.mts");
+    const adapters = path.resolve(import.meta.dirname, "../packages/collector-cli/src/lifecycle-adapters.ts");
+    fs.writeFileSync(probe, `import { cloneFileOrFail, volumeSupportsClone } from ${JSON.stringify(adapters)};
+const [source, destination] = process.argv.slice(2);
+process.stdout.write(JSON.stringify({
+  terminal: Boolean(process.stdin.isTTY || process.stdout.isTTY),
+  supported: volumeSupportsClone(source, destination),
+  cloned: cloneFileOrFail(source, destination),
+}));
+`);
+    const child = spawn(process.execPath, ["--import", path.resolve(import.meta.dirname, "../node_modules/tsx/dist/loader.mjs"),
+      probe, source, destination], {
+      detached: true,
+      env: { PATH: "/usr/bin:/bin", TMPDIR: process.env.TMPDIR ?? directory },
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (chunk) => { stdout += String(chunk); });
+    child.stderr.on("data", (chunk) => { stderr += String(chunk); });
+    const code = await new Promise<number | null>((resolve) => child.once("exit", resolve));
+    const result = (() => {
+      try {
+        return JSON.parse(stdout) as { terminal?: boolean; supported?: boolean; cloned?: boolean };
+      } catch {
+        return null;
+      }
+    })();
+    record(CASES.preflight[1],
+      code === 0 && result?.terminal === false && result.supported === true && result.cloned === true &&
+        exists(destination) && fs.readFileSync(destination).equals(fs.readFileSync(source)),
+      { code, result, stderr: stderr.slice(-400) });
+  });
+}
+
 async function main() {
   try {
     await b1NoSplitBrainRollback();
@@ -859,6 +939,7 @@ async function main() {
     await b3StrictCompletionReceipts();
     await b4OrderSurvivesClockSteps();
     await b5RemovalsAreDurablyRecorded();
+    await preflightAndCloneHelper();
     const failed = results.filter((row) => !row.passed).map((row) => row.name);
     console.log(JSON.stringify({ proof: "lifecycle-data-safety", checks: results.length, passed: results.length - failed.length, failed, liveStateTouched: false }));
   } finally {

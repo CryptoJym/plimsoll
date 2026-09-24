@@ -660,6 +660,44 @@ const CLONEFILE_SCRIPT =
 /** Returns true only when `destination` is now an APFS clone of `source`. */
 export type FileCloner = (source: string, destination: string) => boolean;
 
+/** Read-only: whether `source` can be cloned to a file created at or under `destination`. */
+export type CloneSupport = (source: string, destination: string) => boolean;
+
+/** Asks the volume whether it supports clonefile(2); prints 1, 0 or error. Reads nothing else. */
+const CLONE_SUPPORT_SCRIPT =
+  "function run(argv) { const value = Ref(); " +
+  "if (!$.NSURL.fileURLWithPath(argv[0]).getResourceValueForKeyError(value, $.NSURLVolumeSupportsFileCloningKey, null)) " +
+  "return 'error'; return value[0].boolValue ? '1' : '0'; }";
+
+/** The nearest existing directory at or above `target`: where a file created there would live. */
+function nearestExistingDirectory(target: string) {
+  let current = path.resolve(target);
+  while (!fs.existsSync(current) && path.dirname(current) !== current) current = path.dirname(current);
+  return current;
+}
+
+/**
+ * Read-only clone capability, for preflight: the source and the destination
+ * must be on one volume, and that volume must report clonefile(2) support
+ * (NSURLVolumeSupportsFileCloningKey). Creates, changes and removes nothing.
+ */
+export const volumeSupportsClone: CloneSupport = (source, destination) => {
+  if (process.platform !== "darwin") return false;
+  try {
+    if (fs.statSync(source).dev !== fs.statSync(nearestExistingDirectory(destination)).dev) return false;
+  } catch {
+    return false;
+  }
+  const result = spawnSync(CLONE_HELPER, ["-l", "JavaScript", "-e", CLONE_SUPPORT_SCRIPT, source], {
+    encoding: "utf8",
+    env: { PATH: "/usr/bin:/bin" },
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: CLONE_TIMEOUT_MS,
+    maxBuffer: 4096,
+  });
+  return result.status === 0 && result.stdout.trim() === "1";
+};
+
 /**
  * clonefile(2): clone or fail, never a byte copy. Node cannot express this on
  * macOS: libuv 1.51 answers COPYFILE_FICLONE_FORCE with ENOSYS and turns
@@ -1019,11 +1057,17 @@ function quiesceLedger(source: string):
  */
 export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
   private readonly clone: FileCloner;
+  private readonly cloneSupported: CloneSupport;
   private readonly freeBytes: (directory: string) => number;
   private readonly backup = new SqliteOnlineBackupAdapter();
 
-  constructor(options: { clone?: FileCloner; freeBytes?: (directory: string) => number } = {}) {
+  constructor(options: {
+    clone?: FileCloner;
+    cloneSupported?: CloneSupport;
+    freeBytes?: (directory: string) => number;
+  } = {}) {
     this.clone = options.clone ?? cloneFileOrFail;
+    this.cloneSupported = options.cloneSupported ?? volumeSupportsClone;
     this.freeBytes = options.freeBytes ?? volumeFreeBytes;
   }
 
@@ -1090,24 +1134,20 @@ export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
   }
 
   /**
-   * Predicts the snapshot of an update run after the collector stops: a clone
-   * when the ledger can be cloned onto the lifecycle volume (probed with a
-   * throwaway clone), otherwise a full copy that needs the ledger plus headroom.
+   * Read-only prediction of the snapshot of an update run after the collector
+   * stops: a clone when the ledger's volume supports cloning into the
+   * snapshot directory, otherwise a full copy that needs room for itself and
+   * for a rollback's copy. Creates, changes and removes nothing.
    */
-  async plan(input: { source: string; probe: string }): Promise<LifecycleSnapshotPlan> {
-    const freeBytes = this.freeBytes(path.dirname(input.probe));
+  async plan(input: { source: string; destination: string }): Promise<LifecycleSnapshotPlan> {
+    const freeBytes = this.freeBytes(nearestExistingDirectory(input.destination));
     if (!fs.existsSync(input.source)) {
       return {
         method: "none", cloneCapable: false, ledgerBytes: 0, headroomBytes: 0,
         requiredFreeBytes: 0, requiredFreeBytesIfCloneFails: 0, freeBytes, ok: true, reason: null,
       };
     }
-    let cloneCapable = false;
-    try {
-      cloneCapable = this.clone(input.source, input.probe);
-    } finally {
-      fs.rmSync(input.probe, { force: true });
-    }
+    const cloneCapable = this.cloneSupported(input.source, input.destination);
     const ledgerBytes = regularFileBytes(input.source) + regularFileBytes(`${input.source}-wal`);
     const headroomBytes = snapshotHeadroomBytes(ledgerBytes);
     const requiredFreeBytes = cloneCapable ? 0 : fullCopyRequiredFreeBytes(ledgerBytes, headroomBytes);

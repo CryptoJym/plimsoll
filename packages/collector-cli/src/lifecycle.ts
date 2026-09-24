@@ -1111,7 +1111,7 @@ export class LifecycleManager {
     return this.update({ ...input, kind: "rollback" });
   }
 
-  /** Read-only; takes no lock. Run before stopping the service for an update. */
+  /** Read-only (creates nothing); takes no lock. Run before stopping the service for an update. */
   async preflightUpdate(): Promise<LifecycleSnapshotPlan> {
     if (!this.adapter.planSnapshot) throw new Error("this lifecycle adapter cannot plan snapshots");
     return this.adapter.planSnapshot();

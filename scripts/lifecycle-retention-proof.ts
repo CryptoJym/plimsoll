@@ -514,7 +514,9 @@ async function main() {
     const stateBefore = fs.readFileSync(path.join(primary.lifecycleRoot, "state.json"), "utf8");
     const manifestBefore = fs.readFileSync(primary.manifest, "utf8");
     const activationsBefore = primary.service.activations;
-    const tight = new SqliteLedgerSnapshotAdapter({ clone: () => false, freeBytes: () => Math.floor(ledgerBytes / 2) });
+    const tight = new SqliteLedgerSnapshotAdapter({
+      clone: () => false, cloneSupported: () => false, freeBytes: () => Math.floor(ledgerBytes / 2),
+    });
     const refused = await rejection(() => primary.manager(tight).update({ operationId: "r1", artifact: primary.artifact("1.0.8") }));
     const refusedReceipt = primary.receipt("r1");
     check("full_copy_without_room_is_refused_with_a_clear_receipt_reason",
