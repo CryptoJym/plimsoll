@@ -148,7 +148,9 @@ function retentionInstantExpression(timestampColumn: string) {
 // Fact validation uses Date.parse, not SQLite's narrower date grammar. Keep
 // this as the sole clock for public writes and legacy-row backfill.
 function retentionInstant(timestamp: string): number | null {
-  const milliseconds = Date.parse(timestamp);
+  const value = timestamp.trim();
+  if (!value || !/(?:Z|[+-]\d{2}:\d{2})$/.test(value)) return null;
+  const milliseconds = Date.parse(value);
   return Number.isFinite(milliseconds) ? milliseconds : null;
 }
 
@@ -503,8 +505,18 @@ export class LearningFactStore {
         if (!column || column.hidden) {
           this.db.exec(`alter table ${definition.name} add column retention_ms integer`);
         }
+        // NULL means the key came from an old/raw writer, or predates this
+        // verification marker. A SQLite trigger key is only provisional until
+        // the same TypeScript fact validator used by public writes checks it.
+        const verifiedColumn = (this.db.pragma(`table_xinfo(${definition.name})`) as
+          Array<{ name: string }>).some((entry) => entry.name === "retention_verified");
+        if (!verifiedColumn) {
+          this.db.exec(`alter table ${definition.name} add column retention_verified integer`);
+        }
         this.db.exec(`create index if not exists idx_${definition.name}_retention_ms
           on ${definition.name}(retention_ms, ${definition.idColumn})`);
+        this.db.exec(`create index if not exists idx_${definition.name}_retention_unverified
+          on ${definition.name}(${definition.idColumn}) where retention_verified is null`);
         // Compatibility for raw SQL and old collectors' ordinary uppercase-T
         // ISO writes, including offsets. Do not use SQLite's parser for the
         // broader admitted grammar: the next open backfills those with
@@ -637,11 +649,11 @@ export class LearningFactStore {
         }
       }
 
-      // The NULL prefix of each (retention_ms, identity) index bounds this
-      // migration to unranked rows. All four tables are completed inside the
-      // same IMMEDIATE transaction before trimming, so partial ranking is
-      // never visible. This also repairs rows written by a downgraded binary.
-      this.backfillRetentionKeys();
+      // An indexed pass verifies all old/raw rows, including those that the
+      // SQLite compatibility trigger gave a non-NULL but wrong key. This and
+      // the subsequent trim share the IMMEDIATE transaction; no invalid row
+      // can evict a valid one during startup.
+      this.verifyRetentionKeys();
 
       // A ledger written by an older version may already be over a configured
       // limit. Restore the hard bound before the first post-upgrade write.
@@ -659,24 +671,27 @@ export class LearningFactStore {
     };
   }
 
-  private backfillRetentionKeys() {
+  private verifyRetentionKeys() {
     for (const definition of LEARNING_FACT_TABLES) {
       const select = this.db.prepare(
         `select ${definition.idColumn} as id, ${definition.retentionColumn} as timestamp
-           from ${definition.name} where retention_ms is null limit 256`,
+           from ${definition.name} where retention_verified is null limit 256`,
       );
       const update = this.db.prepare(
-        `update ${definition.name} set retention_ms = ? where ${definition.idColumn} = ?`,
+        `update ${definition.name} set retention_ms = ?, retention_verified = 1
+          where ${definition.idColumn} = ?`,
       );
       while (true) {
         const rows = select.all() as Array<{ id: string; timestamp: string }>;
         if (rows.length === 0) break;
         for (const row of rows) {
+          const valid = this.unverifiedFactValid(definition, row.id);
+          if (valid === null) continue; // Removed with an earlier graph root.
           const milliseconds = retentionInstant(row.timestamp);
-          if (milliseconds === null) {
+          if (!valid || milliseconds === null) {
             // A raw legacy row can bypass fact validation. Discard its whole
             // graph, rather than letting it poison the index or abort startup.
-            this.evictByIds(definition, [row.id]);
+            this.evictByIds(definition, [row.id], false);
             recordRuntimeFactDrop(this.db, "invalid_retention_timestamp");
           } else {
             update.run(milliseconds, row.id);
@@ -684,6 +699,54 @@ export class LearningFactStore {
         }
       }
     }
+  }
+
+  private unverifiedFactValid(definition: LearningFactTableDefinition, id: string): boolean | null {
+    try {
+      if (definition.name === "tool_attempt_facts") {
+        const row = this.db.prepare(`${ATTEMPT_SELECT} where operation_id = ?`)
+          .get(id) as AttemptRow | undefined;
+        if (!row) return null;
+        attemptFromRow(row);
+      } else if (definition.name === "work_episode_facts") {
+        const row = this.db.prepare(`select episode_id as episodeId, source,
+          session_id as sessionId, work_class as workClass,
+          complexity_band as complexityBand, parent_episode_id as parentEpisodeId,
+          started_at as startedAt, ended_at as endedAt, duration_ms as durationMs
+          from work_episode_facts where episode_id = ?`).get(id) as Record<string, unknown> | undefined;
+        if (!row) return null;
+        workEpisodeFactSchema.parse({ ...row,
+          parentEpisodeId: row.parentEpisodeId ?? undefined,
+          endedAt: row.endedAt ?? undefined, durationMs: row.durationMs ?? undefined });
+      } else if (definition.name === "technique_exposure_facts") {
+        const row = this.db.prepare(`select exposure_id as exposureId, episode_id as episodeId,
+          technique_id as techniqueId, technique_version as techniqueVersion,
+          content_digest as contentDigest, assignment_id as assignmentId,
+          work_class as workClass, complexity_band as complexityBand,
+          exposed_at as exposedAt, mode, assertion
+          from technique_exposure_facts where exposure_id = ?`).get(id) as Record<string, unknown> | undefined;
+        if (!row) return null;
+        techniqueExposureFactSchema.parse({ ...row,
+          techniqueVersion: row.techniqueVersion ?? undefined,
+          contentDigest: row.contentDigest ?? undefined });
+      } else {
+        const exists = this.db.prepare(`select 1 from technique_identity_registry where technique_key = ?`).get(id);
+        if (!exists) return null;
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private verifyPendingRetentionKeys() {
+    if (!LEARNING_FACT_TABLES.some((definition) => this.db.prepare(
+      `select 1 from ${definition.name} where retention_verified is null limit 1`,
+    ).get())) return;
+    const reconcile = this.db.transaction(() => {
+      this.verifyRetentionKeys();
+    });
+    reconcile.immediate();
   }
 
   private markMaintenance(definition: LearningFactTableDefinition) {
@@ -711,7 +774,7 @@ export class LearningFactStore {
     }
   }
 
-  private deleteEpisodeGraph(rootIds: string[]): LearningFactEvictionCounts {
+  private deleteEpisodeGraph(rootIds: string[], countEviction = true): LearningFactEvictionCounts {
     const counts = this.emptyEvictionCounts();
     const episodeIds = new Set(rootIds);
     const pending = [...rootIds];
@@ -737,7 +800,8 @@ export class LearningFactStore {
       counts.technique_exposure_facts += removeExposures.run(episodeId).changes;
       counts.work_episode_facts += removeEpisodes.run(episodeId).changes;
     }
-    this.addEvictionCounts(counts);
+    if (countEviction) this.addEvictionCounts(counts);
+    else for (const definition of LEARNING_FACT_TABLES) this.markMaintenance(definition);
     return counts;
   }
 
@@ -758,11 +822,12 @@ export class LearningFactStore {
   private evictByIds(
     definition: LearningFactTableDefinition,
     victimIds: string[],
+    countEviction = true,
   ): LearningFactEvictionCounts {
     const counts = this.emptyEvictionCounts();
     if (victimIds.length === 0) return counts;
     if (definition.name === "work_episode_facts") {
-      return this.deleteEpisodeGraph(victimIds);
+      return this.deleteEpisodeGraph(victimIds, countEviction);
     }
     const ids = victimIds.map((id) => ({ id }));
     // Retry links are local references too. Evict descendants of a removed
@@ -780,7 +845,8 @@ export class LearningFactStore {
       `delete from ${definition.name} where ${definition.idColumn} = ?`,
     );
     for (const row of ids) counts[definition.name] += remove.run(row.id).changes;
-    this.addEvictionCounts(counts);
+    if (countEviction) this.addEvictionCounts(counts);
+    else for (const table of LEARNING_FACT_TABLES) this.markMaintenance(table);
     return counts;
   }
 
@@ -877,6 +943,7 @@ export class LearningFactStore {
   recordToolSignal(input: unknown): LearningFactWriteResult<ToolAttemptFact> {
     const signal = input as ToolAttemptSignal;
     return this.db.transaction(() => {
+      this.verifyPendingRetentionKeys();
       if (signal?.kind === "attempt") {
         const start = toolAttemptStartSignalSchema.parse(signal);
         const existing = this.db
@@ -957,10 +1024,10 @@ export class LearningFactStore {
           `insert into tool_attempt_facts
             (operation_id, source, session_id, episode_id, tool_class, tool_name,
              started_at, ended_at, duration_ms, result_status, error_category,
-             retry_of, created_at, updated_at, retention_ms)
+             retry_of, created_at, updated_at, retention_ms, retention_verified)
            values
             (@operationId, @source, @sessionId, @episodeId, @toolClass, @toolName,
-             @startedAt, null, null, 'unknown', 'unknown', @retryOf, @now, @now, @retentionMs)`,
+             @startedAt, null, null, 'unknown', 'unknown', @retryOf, @now, @now, @retentionMs, 1)`,
         ).run({
           ...start,
           episodeId: start.episodeId ?? null,
@@ -1035,6 +1102,7 @@ export class LearningFactStore {
   recordWorkEpisode(input: unknown): LearningFactWriteResult<WorkEpisodeFact> {
     const fact = workEpisodeFactSchema.parse(input);
     return this.db.transaction(() => {
+      this.verifyPendingRetentionKeys();
       if (fact.parentEpisodeId) {
         const parent = this.db
           .prepare(
@@ -1099,10 +1167,11 @@ export class LearningFactStore {
       this.db.prepare(
         `insert into work_episode_facts
           (episode_id, source, session_id, work_class, complexity_band,
-           parent_episode_id, started_at, ended_at, duration_ms, created_at, retention_ms)
+           parent_episode_id, started_at, ended_at, duration_ms, created_at,
+           retention_ms, retention_verified)
          values
           (@episodeId, @source, @sessionId, @workClass, @complexityBand,
-           @parentEpisodeId, @startedAt, @endedAt, @durationMs, @createdAt, @retentionMs)`,
+           @parentEpisodeId, @startedAt, @endedAt, @durationMs, @createdAt, @retentionMs, 1)`,
       ).run({
         ...fact,
         parentEpisodeId: fact.parentEpisodeId ?? null,
@@ -1121,6 +1190,7 @@ export class LearningFactStore {
   ): LearningFactWriteResult<TechniqueExposureFact> {
     const fact = validateTechniqueExposureFactIdentity(input);
     return this.db.transaction(() => {
+      this.verifyPendingRetentionKeys();
       if (options.outcomeObservedAt !== undefined) {
         const outcomeMs = Date.parse(options.outcomeObservedAt);
         if (
@@ -1195,8 +1265,10 @@ export class LearningFactStore {
       if (this.capacityPressure("technique_identity_registry", techniqueKey, nowMs) === "admit") {
         this.db.prepare(
         `insert or ignore into technique_identity_registry
-          (technique_key, technique_id, technique_version, content_digest, first_seen_at, retention_ms)
-         values (@techniqueKey, @techniqueId, @techniqueVersion, @contentDigest, @now, @nowMs)`,
+          (technique_key, technique_id, technique_version, content_digest, first_seen_at,
+           retention_ms, retention_verified)
+         values (@techniqueKey, @techniqueId, @techniqueVersion, @contentDigest,
+           @now, @nowMs, 1)`,
         ).run({
           techniqueKey,
           techniqueId: fact.techniqueId,
@@ -1211,10 +1283,12 @@ export class LearningFactStore {
       this.db.prepare(
         `insert into technique_exposure_facts
           (exposure_id, episode_id, technique_id, technique_version, content_digest,
-           assignment_id, work_class, complexity_band, exposed_at, mode, assertion, created_at, retention_ms)
+           assignment_id, work_class, complexity_band, exposed_at, mode, assertion,
+           created_at, retention_ms, retention_verified)
          values
           (@exposureId, @episodeId, @techniqueId, @techniqueVersion, @contentDigest,
-           @assignmentId, @workClass, @complexityBand, @exposedAt, @mode, @assertion, @createdAt, @exposureMs)`,
+           @assignmentId, @workClass, @complexityBand, @exposedAt, @mode, @assertion,
+           @createdAt, @exposureMs, 1)`,
       ).run({
         ...fact,
         techniqueVersion: fact.techniqueVersion ?? null,
@@ -1275,6 +1349,7 @@ export class LearningFactStore {
       ? Math.min(maxRows, 4_096)
       : DEFAULT_LEARNING_FACT_MAINTENANCE_BATCH;
     return this.db.transaction(() => {
+      this.verifyPendingRetentionKeys();
       // The budget is per table. A shared counter lets a sustained attempt
       // backlog starve the smaller episode/exposure/identity tables; bounded
       // per-table turns guarantee progress for every over-cap table.
@@ -1323,6 +1398,7 @@ export class LearningFactStore {
   }
 
   attempts(): ToolAttemptFact[] {
+    this.verifyPendingRetentionKeys();
     return (
       this.db
         .prepare(`${ATTEMPT_SELECT} order by retention_ms, operation_id`)
@@ -1331,6 +1407,7 @@ export class LearningFactStore {
   }
 
   episodes(): WorkEpisodeFact[] {
+    this.verifyPendingRetentionKeys();
     return (
       this.db.prepare(
         `select episode_id as episodeId, source, session_id as sessionId,
@@ -1350,6 +1427,7 @@ export class LearningFactStore {
   }
 
   episodeById(episodeId: string): WorkEpisodeFact | undefined {
+    this.verifyPendingRetentionKeys();
     const row = this.db
       .prepare(
         `select episode_id as episodeId, source, session_id as sessionId,
@@ -1370,6 +1448,7 @@ export class LearningFactStore {
   }
 
   exposures(): TechniqueExposureFact[] {
+    this.verifyPendingRetentionKeys();
     return (
       this.db.prepare(
         `select exposure_id as exposureId, episode_id as episodeId,

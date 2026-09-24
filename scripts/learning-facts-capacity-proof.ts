@@ -22,7 +22,7 @@ import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 import { runLearningMaterialization } from "../packages/collector-cli/src/learning-materializer";
-import { aiInteractionEventSchema } from "../packages/shared/src/index";
+import { aiInteractionEventSchema, toolAttemptStartSignalSchema } from "../packages/shared/src/index";
 import {
   recordExplicitTechniqueAssignment,
   runtimeFactDropCounters,
@@ -481,7 +481,7 @@ function assertCounts(db: Database.Database, name: string) {
 }
 
 function rawAttemptId(index: number) {
-  return `00000000-0000-4000-8000-${index.toString(16).padStart(12, "0")}`;
+  return deterministicLearningFactId(["raw-attempt", String(index)]);
 }
 
 function exerciseApiAndMutationPaths() {
@@ -1196,7 +1196,9 @@ function exerciseAtomicInstantKeyUpgrade(root: string) {
       for (const table of Object.keys(DEFAULT_TABLE_COUNTS)) {
         seed.exec(`drop trigger learning_fact_retention_${table}_insert`);
         seed.exec(`drop index idx_${table}_retention_ms`);
+        seed.exec(`drop index idx_${table}_retention_unverified`);
         seed.exec(`alter table ${table} drop column retention_ms`);
+        seed.exec(`alter table ${table} drop column retention_verified`);
       }
     })();
   } finally { seed.close(); }
@@ -1297,6 +1299,74 @@ function exerciseInvalidLegacyTimestamp() {
   } finally { db.close(); }
 }
 
+function exerciseParserDisagreement() {
+  const spellings = [
+    ["hour_24", "2026-09-01T24:59:00Z"],
+    ["minute_60", "2026-09-01T00:60:00Z"],
+    ["second_60", "2026-09-01T00:00:60Z"],
+    ["february_30", "2026-02-30T00:00:00Z"],
+    ["month_13", "2026-13-01T00:00:00Z"],
+    ["offset_over_14", "2026-09-01T00:00:00+15:00"],
+    ["leading_space", " 2026-09-01T00:00:00Z"],
+    ["trailing_space", "2026-09-01T00:00:00Z "],
+    ["trailing_garbage", "2026-09-01T00:00:00Zgarbage"],
+    ["wrong_nonnull_key", "2026-09-01T00:00:00Z"],
+  ] as const;
+  for (const [index, [name, at]] of spellings.entries()) {
+    const db = new Database(":memory:");
+    try {
+      new LearningFactStore(db, { attempts: 10 });
+      const operationId = deterministicToolOperationId({ source: "codex",
+        sessionId: "parser-disagreement", sourceOperationKey: `${name}-${index}` });
+      rawAttemptInsert(db).run(operationId, "parser-disagreement", at,
+        "2026-09-01T00:00:00Z", "2026-09-01T00:00:00Z");
+      if (name === "wrong_nonnull_key") {
+        db.prepare(`update tool_attempt_facts set retention_ms = 42 where operation_id = ?`)
+          .run(operationId);
+      }
+      const triggerKey = (db.prepare(`select retention_ms as key
+        from tool_attempt_facts where operation_id = ?`).get(operationId) as { key: number | null }).key;
+      if (name === "hour_24") check("sqlite_trigger_keys_javascript_rejected_hour",
+        triggerKey !== null && Number.isNaN(Date.parse(at)), { triggerKey });
+      const expected = toolAttemptStartSignalSchema.safeParse({
+        kind: "attempt", operationId, source: "codex", sessionId: "parser-disagreement",
+        toolClass: "compute", toolName: "shell", startedAt: at,
+      });
+      const reopened = new LearningFactStore(db, { attempts: 10 });
+      const rows = reopened.attempts();
+      const stored = db.prepare(`select retention_ms as key, retention_verified as verified
+        from tool_attempt_facts where operation_id = ?`).get(operationId) as
+        { key: number; verified: number } | undefined;
+      const invalidDrops = runtimeFactDropCounters(db).find((row) =>
+        row.reason === "invalid_retention_timestamp")?.droppedCount ?? 0;
+      check(`raw_trigger_and_reopen_agree_with_schema_${name}`,
+        expected.success
+          ? rows.length === 1 && stored?.key === Date.parse(expected.data.startedAt) &&
+            stored.verified === 1 && invalidDrops === 0
+          : rows.length === 0 && stored === undefined && invalidDrops === 1,
+        { at, triggerKey, expectedAccepted: expected.success, stored, invalidDrops });
+      check(`invalid_cleanup_is_not_capacity_eviction_${name}`,
+        reopened.status().tables.tool_attempt_facts.evictedCount === 0);
+    } finally { db.close(); }
+  }
+  const db = new Database(":memory:");
+  try {
+    const store = new LearningFactStore(db, { attempts: 1 });
+    const valid = attempt(0, "parser-cap-one");
+    store.recordToolSignal(valid);
+    const at = "2026-09-01T24:59:00Z";
+    rawAttemptInsert(db).run(deterministicToolOperationId({ source: "codex",
+      sessionId: "parser-cap-one", sourceOperationKey: "invalid" }),
+      "parser-cap-one", at, at, at);
+    const reopened = new LearningFactStore(db, { attempts: 1 });
+    check("invalid_trigger_key_does_not_evict_valid_cap_one_fact",
+      reopened.attempts().length === 1 && reopened.attempts()[0].operationId === valid.operationId &&
+      reopened.status().tables.tool_attempt_facts.evictedCount === 0 &&
+      runtimeFactDropCounters(db).some((row) =>
+        row.reason === "invalid_retention_timestamp" && row.droppedCount === 1));
+  } finally { db.close(); }
+}
+
 async function main() {
   if (process.argv[2] === "--write-crash-child") {
     const db = new Database(process.argv[3]);
@@ -1347,6 +1417,7 @@ async function main() {
     "instant-key-upgrade": () => exerciseAtomicInstantKeyUpgrade(root),
     "timestamp-property": () => exerciseTimestampProperty(root),
     "invalid-legacy-timestamp": exerciseInvalidLegacyTimestamp,
+    "parser-disagreement": exerciseParserDisagreement,
     migration: exerciseInterruptedUpgradeDowngrade,
     "migration-recount": exerciseMissingTriggers,
     production: exerciseProductionStage,
