@@ -546,4 +546,10 @@ export type CollectorServerDiagnostics = Pick<
 
 export type CollectorServer = http.Server & {
   plimsollHttpDiagnostics: CollectorServerDiagnostics;
+  /** This run's random id, as GET /healthz returns it. */
+  plimsollInstanceId: string;
+  /** This run's /healthz proof key (base64url), for the 0600 status summary only. */
+  plimsollHealthzKey: string;
+  /** The lifetime stats from the /status cache; never reads the ledger. */
+  plimsollCachedStats: () => unknown;
 };

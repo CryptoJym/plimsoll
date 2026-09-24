@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fleet liveness/status reader after eco-6hoxj.154.
 
-Unauthenticated HTTP is GET /healthz only ({ok: true}). Full collector status
+Unauthenticated HTTP is GET /healthz only ({ok: true, instanceId}). Full collector status
 is the credentialed CLI (`plimsoll status`), never a raw GET of the management
 route. This file must not open that management route and must not print tokens.
 

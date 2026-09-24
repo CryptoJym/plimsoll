@@ -547,7 +547,9 @@ npx -y @plimsoll/cli doctor --read-only --json
 ```
 
 Loopback HTTP is credentialed except for liveness. `GET /healthz` answers
-`{"ok":true}` with no version, identity, or ledger state. `GET /status` requires
+`{"ok":true,"instanceId":"<random per run>"}` with no version or ledger state;
+a local reader of the private status summary adds a fresh `?challenge=` and
+checks the HMAC `proof` to know it is talking to that collector run. `GET /status` requires
 the management credential (`management_credential_required` without it). Full
 operator status is `plimsoll status` (or `doctor --read-only --json`), which
 already presents that credential. Fleet monitors that used raw `/status` should
@@ -560,6 +562,11 @@ itself. Its readiness progresses through `not_installed` → `configured` →
 and exit 0. A cold ledger therefore fails honestly until a real token-bearing
 Claude Code or Codex event reaches the collector. Background LaunchAgent mode
 for npm installs is still being fitted — until then `start` runs in a terminal.
+
+The optional macOS menubar companion provides a read-only status-bar glance at
+collector state, event count, and token coverage. See
+[packages/mac-menubar](packages/mac-menubar) for SwiftPM build instructions;
+App Store packaging is separate release work.
 
 The packaged CLI also ships transactional lifecycle commands backed by an
 immutable, version-pinned runtime

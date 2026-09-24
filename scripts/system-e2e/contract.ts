@@ -462,6 +462,10 @@ function assertResourceReceipt(receipt: unknown) {
   assert.equal(integer(boundedMeasurements.recoveryBodyReads, "replacement recovery reads"), 1);
   assert.ok(finite(boundedMeasurements.warmStatusP95Ms, "bounded capture warm status p95") <= 500);
   assert.ok(finite(boundedMeasurements.rssGrowthBytes, "bounded capture RSS growth") < 768 * 1024 * 1024);
+  // eco-6hoxj.163.34: the child collector keeps exactly its private status
+  // summary after shutdown, and no temporary file.
+  assert.equal(boundedMeasurements.signalStatusSummaryKept, true);
+  assert.equal(integer(boundedMeasurements.signalStatusSummaryTempFiles, "bounded capture summary temp files"), 0);
 
   const noChangeMeasurements = childRecord(
     scenario("no_change_constant_work").measurements,

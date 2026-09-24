@@ -34,6 +34,7 @@ type Result = {
 
 const checks: Array<{ name: string; passed: boolean; detail: unknown }> = [];
 const SENTINEL = "AUTH_PROOF_SECRET_MUST_NOT_LEAK";
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
 
 function check(name: string, passed: boolean, detail: unknown) {
   checks.push({ name, passed, detail });
@@ -161,7 +162,13 @@ async function main() {
     const port = (server.address() as AddressInfo).port;
     const health = await request(port, "/healthz", "GET");
     const healthKeys = Object.keys(health.body).sort().join(",");
-    check("healthz_is_the_only_minimal_unauthenticated_surface", health.status === 200 && healthKeys === "ok" && health.body.ok === true, health);
+    // Exactly `ok` plus this run's random instanceId (eco-6hoxj.163.34).
+    check(
+      "healthz_is_the_only_minimal_unauthenticated_surface",
+      health.status === 200 && healthKeys === "instanceId,ok" && health.body.ok === true &&
+        health.body.instanceId === server.plimsollInstanceId && UUID_V4.test(String(health.body.instanceId)),
+      health,
+    );
 
     const changesBefore = totalChanges(buffer);
     const statusWithoutManagement = await request(port, "/status", "GET");

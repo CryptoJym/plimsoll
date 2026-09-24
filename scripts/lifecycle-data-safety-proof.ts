@@ -53,6 +53,7 @@ const CASES = {
   b3: [
     "a_two_field_completion_marker_is_unknown_and_never_pruned",
     "markers_with_missing_extra_mismatched_or_contradictory_fields_are_unknown_and_kept",
+    "receipts_with_the_target_lists_up_to_0_7_38_are_known_and_mixed_lists_are_unknown",
   ],
   b4: [
     "completion_sequence_is_durable_and_increases_with_each_completion",
@@ -614,6 +615,12 @@ const readMarker = (fixture: Home, operationId: string) =>
   JSON.parse(fs.readFileSync(markerPath(fixture, operationId), "utf8")) as Record<string, unknown>;
 const writeMarker = (fixture: Home, operationId: string, value: unknown) =>
   fs.writeFileSync(markerPath(fixture, operationId), typeof value === "string" ? value : `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
+/** The target lists every release from 0.7.0 to 0.7.38 wrote, before status_summary became purge-only. */
+const TARGETS_UP_TO_0_7_38 = {
+  retainedTargets: ["collector_config", "workspace_credentials", "ledger", "history", "lifecycle_snapshots",
+    "workspace_membership"],
+  purgeOnlyTargets: ["collector_config", "workspace_credentials", "ledger", "history", "lifecycle_snapshots"],
+};
 
 async function b3StrictCompletionReceipts() {
   // The review's fixture: hand-made snapshots whose markers are a bare
@@ -674,6 +681,23 @@ async function b3StrictCompletionReceipts() {
         same(fixture.snapshots(), ["m1", "m2", "m3", "m4", "m5", "m7"]),
       { decisions, removed: applied.retention.removed, remains: fixture.snapshots() });
   });
+  // Receipts as 0.7.38 wrote them (sequenced, without the status_summary
+  // target) still prove their operation. A receipt mixing the old and new
+  // target lists is not one any release wrote, so its operation is unknown.
+  await runCase([CASES.b3[2]], async (record) => {
+    const fixture = createHome("b3-target-lists");
+    await updatesWithoutRetention(fixture, [["u1", "1.2.1"], ["u2", "1.2.2"], ["u3", "1.2.3"], ["u4", "1.2.4"], ["u5", "1.2.5"]]);
+    for (const id of ["u1", "u4", "u5"]) writeMarker(fixture, id, { ...readMarker(fixture, id), ...TARGETS_UP_TO_0_7_38 });
+    writeMarker(fixture, "u2", { ...readMarker(fixture, "u2"), purgeOnlyTargets: TARGETS_UP_TO_0_7_38.purgeOnlyTargets });
+    writeMarker(fixture, "u3", { ...readMarker(fixture, "u3"), retainedTargets: TARGETS_UP_TO_0_7_38.retainedTargets });
+    const result = await pruneDecisions(fixture, "b3-target-lists-prune", 2);
+    record(CASES.b3[2],
+      result.decisions.u5 === "keep:newest_completed" && result.decisions.u4 === "keep:newest_completed" &&
+        result.decisions.u3 === "keep:operation_unknown" && result.decisions.u2 === "keep:operation_unknown" &&
+        result.decisions.u1 === "prune:older_completed" &&
+        same(result.removed, ["u1"]) && same(result.remains, ["u2", "u3", "u4", "u5"]),
+      result);
+  });
 }
 
 // ---- B4: completion order survives clock steps ----------------------------
@@ -686,13 +710,13 @@ function stepClockBackward(fixture: Home, ids: readonly string[], seconds: reado
   });
 }
 
-/** Rewrites markers as 0.7.37 and earlier wrote them: the 13 receipt fields, no order record. */
+/** Rewrites markers as 0.7.37 and earlier wrote them: the 13 receipt fields and their target lists, no order record. */
 function asPreSequencingMarkers(fixture: Home, ids: readonly string[]) {
   const legacyKeys = ["schemaVersion", "toolVersion", "operationId", "operation", "status", "fromVersion", "toVersion",
     "restoredVersion", "health", "ownedTargets", "retainedTargets", "purgeOnlyTargets", "preserved"];
   for (const id of ids) {
     const marker = readMarker(fixture, id);
-    writeMarker(fixture, id, Object.fromEntries(legacyKeys.map((key) => [key, marker[key]])));
+    writeMarker(fixture, id, { ...Object.fromEntries(legacyKeys.map((key) => [key, marker[key]])), ...TARGETS_UP_TO_0_7_38 });
   }
   fs.rmSync(path.join(fixture.lifecycleRoot, "completion-order.json"), { force: true });
 }

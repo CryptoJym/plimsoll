@@ -196,9 +196,14 @@ exactly the receipt fields (the 13 every release from 0.7.0 to 0.7.37 wrote,
 plus only the snapshot, retention, restore and completion-sequence records
 newer releases add), `operationId` equal to the marker's file name and
 snapshot ID, and the values its status implies (healthy readiness for a
-completed one, the restored version for a rolled-back one). Any missing,
-extra, contradictory or invalid field makes the operation unknown, and its
-snapshot is never removed.
+completed one, the restored version for a rolled-back one). Its
+`retainedTargets` and `purgeOnlyTargets` are exactly this release's lists or
+exactly the pair every release from 0.7.0 to 0.7.39 wrote (without
+`status_summary`), never a mix of the two. Any missing, extra, contradictory
+or invalid field makes the operation unknown, and its snapshot is never
+removed. A 0.7.39 or older collector does not know the newer lists, so after
+a rollback to one of them it keeps every snapshot of an operation a newer
+release completed.
 
 **Which snapshots are newest.** Never file times, which a clock step can
 reverse. Every completed or rolled-back update/rollback gets a
@@ -297,18 +302,23 @@ of embedded tool-config fragments is not wired yet: the real adapter reports
 `tool_config_fragments` as owned but owns no fragment files until the
 config-removal lane lands, and receipts say exactly that.) It preserves the
 collector config, workspace credentials, ledger,
-history, lifecycle snapshots, and workspace membership. Both preview and apply
-receipts expose those under typed `retainedTargets`; `lifecycle_snapshots`
-never appears in uninstall `ownedTargets`. The same receipts classify the
-collector config, workspace credentials, ledger, history, and lifecycle
-snapshots under `purgeOnlyTargets`, so an uninstall receipt cannot imply that
-purge-only data was deleted.
+history, status summary, lifecycle snapshots, and workspace membership. Both
+preview and apply receipts expose those under typed `retainedTargets`;
+`lifecycle_snapshots` never appears in uninstall `ownedTargets`. The same
+receipts classify the collector config, workspace credentials, ledger,
+history, status summary (`status_summary`) and lifecycle snapshots under
+`purgeOnlyTargets`, so an uninstall receipt cannot imply that purge-only data
+was deleted.
 
 Purging data is a different operation. It is a preview by default and lists
-the live collector config, ledger, history, and lifecycle snapshots. Apply
-requires both `--apply` and the exact confirmation shown above, then deletes
-the live copies and secret-bearing lifecycle snapshot copies, including any
-still awaiting removal in the lifecycle trash. Leaving a
+the live collector config, ledger, history, status summary, and lifecycle
+snapshots. Apply requires both `--apply` and the exact confirmation shown
+above, then deletes the live copies and secret-bearing lifecycle snapshot
+copies, including any still awaiting removal in the lifecycle trash. The
+status summary (`status-summary.json`: usage counters and the last run's
+`/healthz` key) goes with any temp file an interrupted write left beside it
+(`status-summary.json.<pid>.<16 hex>.tmp`); nothing else that shares the
+name is touched. Leaving a
 workspace and revoking a device are also distinct: neither is simulated or
 reported complete by local uninstall or purge.
 

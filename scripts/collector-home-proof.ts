@@ -273,6 +273,7 @@ async function main() {
       serviceManifest: path.join(derivedHome, "lifecycle", "service-manifest.json"),
       ownedToolFragments: [],
       history: [path.join(derivedHome, "history")],
+      statusSummary: path.join(derivedHome, "status-summary.json"),
     };
     const stubService = {} as unknown as LifecycleServiceAdapter;
     const stubDatabase = {

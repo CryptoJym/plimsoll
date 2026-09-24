@@ -113,9 +113,12 @@ async function main() {
 
     const health = await request(port, "/healthz");
     const healthKeys = Object.keys(health.body).sort();
+    // Exactly `ok` plus this run's random instanceId (eco-6hoxj.163.34).
     check(
-      "healthz_remains_ok_true_only",
-      health.status === 200 && healthKeys.length === 1 && healthKeys[0] === "ok" && health.body.ok === true,
+      "healthz_is_ok_and_run_instance_id_only",
+      health.status === 200 && healthKeys.join(",") === "instanceId,ok" && health.body.ok === true &&
+        health.body.instanceId === server.plimsollInstanceId &&
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(String(health.body.instanceId)),
       { status: health.status, keys: healthKeys },
     );
 

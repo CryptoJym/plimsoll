@@ -27,6 +27,7 @@ import {
   type RuntimeArtifact,
 } from "./lifecycle";
 import { LifecycleMutationAuthority, type LifecycleMutationLease } from "./lifecycle-authority";
+import { isStatusSummaryTempFile } from "./status-summary";
 
 const FILE_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
@@ -50,6 +51,8 @@ export type ManagedLifecyclePaths = {
   serviceManifest: string;
   ownedToolFragments: readonly string[];
   history: readonly string[];
+  /** The daemon's status-summary.json (eco-6hoxj.163.34): usage counters and its run's /healthz key. */
+  statusSummary: string;
 };
 
 export type LifecycleServiceAdapter = {
@@ -417,6 +420,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       collectorConfig: paths.collectorConfig,
       database: paths.database,
       serviceManifest: paths.serviceManifest,
+      statusSummary: paths.statusSummary,
     })) {
       assertAbsoluteOwnedPath(candidate, paths.ownershipRoot, label);
     }
@@ -858,10 +862,14 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
   }
 
   async purgeOwnedData(input: { apply: boolean; confirmation: string | null }) {
-    const targets = ["collector_config", "workspace_credentials", "ledger", "history", "lifecycle_snapshots"] as const;
+    const targets = [
+      "collector_config", "workspace_credentials", "ledger", "history", "status_summary", "lifecycle_snapshots",
+    ] as const;
     if (!input.apply) return targets;
     if (input.confirmation !== PURGE_CONFIRMATION) throw new Error("purge confirmation mismatch");
-    for (const candidate of [this.paths.collectorConfig, this.paths.database, ...this.paths.history]) {
+    for (const candidate of [
+      this.paths.collectorConfig, this.paths.database, ...this.paths.history, ...this.statusSummaryFiles(),
+    ]) {
       if (!fs.existsSync(candidate)) continue;
       assertNoSymlink(candidate, this.paths.ownershipRoot);
       const stat = fs.lstatSync(candidate);
@@ -881,6 +889,21 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
 
   supportSnapshot() {
     return this.service.supportSnapshot();
+  }
+
+  /** The status summary and any temp file an interrupted writer left beside it. */
+  private statusSummaryFiles() {
+    const directory = path.dirname(this.paths.statusSummary);
+    let entries: string[] = [];
+    try {
+      entries = fs.readdirSync(directory);
+    } catch {
+      // No directory means no summary either.
+    }
+    return [
+      this.paths.statusSummary,
+      ...entries.filter(isStatusSummaryTempFile).map((entry) => path.join(directory, entry)),
+    ];
   }
 
   private readSnapshotMetadata(snapshot: string): SnapshotMetadata | null {
