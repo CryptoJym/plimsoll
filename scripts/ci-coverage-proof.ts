@@ -11,7 +11,10 @@
  * scripts/lib/ci-coverage-fixtures.ts, including each case from the PR #397
  * review, must reach the verdict a correct gate reaches.
  *
- * Run: pnpm proof:ci-coverage [--audit-only] [--root DIR] [--today YYYY-MM-DD]
+ * CI runs it with node (`node ./node_modules/tsx/dist/cli.mjs
+ * ./scripts/ci-coverage-proof.ts`), not pnpm, so no pnpm setting can turn the
+ * gate itself into a no-op. Locally: pnpm proof:ci-coverage [--audit-only]
+ * [--root DIR] [--today YYYY-MM-DD]
  *   --root audits another checkout (self-tests are skipped); --today checks
  *   quarantine expiry against another date.
  */

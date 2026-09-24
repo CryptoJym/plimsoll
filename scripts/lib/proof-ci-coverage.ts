@@ -1,6 +1,8 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import { parse } from "yaml";
+
 import {
   INERT_EXPRESSION,
   RUN_PROOF_WRAPPER,
@@ -31,13 +33,40 @@ import { PROOF_SUITES, readProofSuites } from "./proof-suites";
  * scripts/proof-suites.json declares it as a sub-proof of a suite CI runs.
  * Every line of a step that names a proof must be canonical, and no step up
  * to the job's last proof step may interpolate `${{ }}` other than the head
- * SHA. Every other unit needs a reviewed entry in scripts/proof-local-only.json.
+ * SHA. A proof job may not set an execution-changing environment variable
+ * (env maps, assignments, exports, $GITHUB_ENV or $GITHUB_PATH), run an
+ * unknown action before its proofs or run in a container, and the repository
+ * may not configure how pnpm runs scripts (script-shell, node-options, a
+ * pnpmfile). Every other unit needs a reviewed entry in
+ * scripts/proof-local-only.json.
  */
 
 export const WORKFLOW_DIRECTORY = ".github/workflows";
 export const PROOF_EXCEPTIONS = "scripts/proof-local-only.json";
 export const GATE_ENTRY = "scripts/ci-coverage-proof.ts";
 const PROOF_SCRIPT = /^proof(?::|$)/;
+
+/**
+ * Environment variables that change how bash, Node or pnpm run a proof
+ * rather than what it reads (review 2): BASH_ENV, NODE_OPTIONS or
+ * npm_config_script_shell each turned a proof into a successful no-op.
+ */
+const EXECUTION_ENV = ["BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "NODE_OPTIONS", "PATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"];
+const EXECUTION_WORD = new RegExp(`(?<![A-Za-z0-9_])(?:${EXECUTION_ENV.join("|")}|BASH_FUNC_\\w*)(?![A-Za-z0-9_])`);
+const CONFIG_WORD = /(?<![A-Za-z0-9_])p?npm_config_\w*/i;
+export const changesExecution = (name: string) => EXECUTION_WORD.test(name) || CONFIG_WORD.test(name);
+
+/** Actions a proof job may run before its last proof: checkout, pnpm and Node setup, evidence upload. */
+const KNOWN_ACTIONS = ["actions/checkout", "actions/setup-node", "pnpm/action-setup", "actions/upload-artifact"];
+const actionName = (uses: string) => uses.split("@")[0]!.split("/").slice(0, 2).join("/");
+
+/**
+ * pnpm settings that change how `pnpm <script>` runs. Verified with pnpm
+ * 10.25.0: script-shell and node-options (in .npmrc or pnpm-workspace.yaml)
+ * and a .pnpmfile.cjs that exits each made every script a successful no-op.
+ */
+const PNPM_EXECUTION_SETTINGS = ["script-shell", "node-options", "shell-emulator", "pnpmfile", "global-pnpmfile"];
+const settingKey = (key: string) => key.toLowerCase().replace(/[^a-z0-9]/g, "");
 /** pnpm's own commands: `pnpm <name>` runs these, not a package script of the same name. */
 const PNPM_BUILTINS = new Set([
   "add", "approve-builds", "audit", "bin", "c", "cat-file", "cat-index", "config", "create", "dedupe", "deploy",
@@ -142,6 +171,35 @@ function mentionsProof(scripts: Record<string, string>, units: Map<string, unkno
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 
+/** Repository pnpm configuration that could change how every proof script runs. */
+function packageManagerProblems(input: CoverageInput): string[] {
+  const problems: string[] = [];
+  const denied = new Set(PNPM_EXECUTION_SETTINGS.map(settingKey));
+  for (const line of (input.readFile(".npmrc") ?? "").split("\n")) {
+    const key = /^\s*([^#;=\s][^=]*?)\s*=/.exec(line)?.[1];
+    if (key && denied.has(settingKey(key))) problems.push(`.npmrc sets ${key}, which changes how pnpm runs every proof script`);
+  }
+  const workspace = input.readFile("pnpm-workspace.yaml");
+  if (workspace !== null) {
+    try {
+      const settings = parse(workspace, { merge: true }) as unknown;
+      for (const key of isRecord(settings) ? Object.keys(settings) : []) {
+        if (denied.has(settingKey(key))) problems.push(`pnpm-workspace.yaml sets ${key}, which changes how pnpm runs every proof script`);
+      }
+    } catch (error) {
+      problems.push(`pnpm-workspace.yaml: ${error instanceof Error ? error.message.split("\n")[0] : String(error)}`);
+    }
+  }
+  const manifest = JSON.parse(input.readFile("package.json") ?? "{}") as { pnpm?: unknown };
+  for (const key of isRecord(manifest.pnpm) ? Object.keys(manifest.pnpm) : []) {
+    if (denied.has(settingKey(key))) problems.push(`package.json pnpm.${key} changes how pnpm runs every proof script`);
+  }
+  for (const file of [".pnpmfile.cjs", ".pnpmfile.mjs"]) {
+    if (input.readFile(file) !== null) problems.push(`${file} exists: pnpm loads it for every \`pnpm run\`, so it can end every proof script before it starts`);
+  }
+  return problems;
+}
+
 export function proofCiCoverage(input: CoverageInput): CoverageReport {
   const errors: string[] = [];
   const resolve = scriptResolver(input.scripts);
@@ -172,6 +230,7 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
   if (input.workflows.length === 0) errors.push(`no workflow files under ${WORKFLOW_DIRECTORY}: nothing runs any proof`);
   const models = input.workflows.map((workflow) => modelWorkflow(workflow.path, workflow.text));
   for (const model of models) errors.push(...model.errors);
+  errors.push(...packageManagerProblems(input));
   const namesProof = (text: string) =>
     text
       .split("\n")
@@ -198,6 +257,24 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
         errors.push(
           `${model.path} job "${job}" step "${tainted.name}" pastes a GitHub expression into its script (only the head-SHA expression is allowed), so no proof at or after it counts`,
         );
+      }
+      // Nothing a proof sees may change how bash, Node or pnpm run it.
+      const checkEnv = (names: string[] | null, where: string) => {
+        if (names === null) errors.push(`${where} env: is not a literal mapping, so it could set anything`);
+        for (const name of names ?? []) if (changesExecution(name)) errors.push(`${where} env: sets ${name}, which changes how the proofs run`);
+      };
+      checkEnv(model.env, model.path);
+      checkEnv(model.jobs[job]?.env ?? null, `${model.path} job "${job}"`);
+      if (model.jobs[job]?.container) errors.push(`${model.path} job "${job}" runs in a container, which the gate does not model`);
+      for (const step of steps.filter((candidate) => candidate.stepIndex <= lastProof)) {
+        const where = `${model.path} step "${step.name}"`;
+        checkEnv(step.env, where);
+        if (step.uses !== null && !KNOWN_ACTIONS.includes(actionName(step.uses))) {
+          errors.push(`${where} runs action ${step.uses} before the job's last proof; only ${KNOWN_ACTIONS.join(", ")} may`);
+        }
+        const word = step.run?.match(EXECUTION_WORD)?.[0] ?? step.run?.match(CONFIG_WORD)?.[0];
+        if (word) errors.push(`${where} names ${word} in its script; setting it (as a prefix, with export or through $GITHUB_ENV) changes how the proofs run`);
+        if (step.run?.includes("GITHUB_PATH")) errors.push(`${where} writes $GITHUB_PATH, which changes which programs the proofs run`);
       }
       for (const step of proofSteps) {
         const where = `${model.path} step "${step.name}"`;

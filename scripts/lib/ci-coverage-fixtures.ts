@@ -172,6 +172,11 @@ const withSuites = (input: CoverageInput, edit: (suites: Record<string, string[]
   edit(suites);
   return { ...input, suites };
 };
+/** The same repository with some files added or replaced. */
+const withFiles = (input: CoverageInput, files: Record<string, string>): CoverageInput => ({
+  ...input,
+  readFile: (file) => (Object.hasOwn(files, file) ? files[file]! : input.readFile(file)),
+});
 /** The first suite scripts/proof-suites.json declares, and its sub-proofs. */
 function firstSuite(input: CoverageInput) {
   const [suite, children] = Object.entries((input.suites ?? {}) as Record<string, string[]>)[0] ?? [];
@@ -675,6 +680,85 @@ export const FIXTURES: Fixture[] = [
       "covered",
     ),
   },
+  // ---- Review 2: nothing may change how the proofs run ---------------------
+  {
+    name: "review2_npm_config_script_shell_prefix",
+    origin: "review2",
+    expectGateGreen: false,
+    describe: "the proof line sets npm_config_script_shell=/usr/bin/true first",
+    build: (input) => {
+      const [t] = fixtureTargets(input);
+      return { input: editRun(input, t!.line, (line) => [line.replace(t!.line, `npm_config_script_shell=/usr/bin/true ${t!.line}`)]), error: /npm_config_script_shell/ };
+    },
+  },
+  ...([
+    ["review2_step_env_bash_env", "review2", "BASH_ENV", ".github/ci-skip.sh"],
+    ["review2_step_env_node_options", "review2", "NODE_OPTIONS", "--require ./.github/ci-exit0.cjs"],
+  ] as const).map(([name, origin, key, value]): Fixture => ({
+    name,
+    origin,
+    expectGateGreen: false,
+    describe: `the proof step's env sets ${key}`,
+    build: (input) => {
+      const [t] = fixtureTargets(input);
+      return { input: setStepKey(input, t!.line, "env", { [key]: value }), error: new RegExp(`env: sets ${key}`) };
+    },
+  })),
+  {
+    name: "job_env_path",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "the proof job's env replaces PATH",
+    build: (input) => {
+      const [t] = fixtureTargets(input);
+      return { input: setJobKey(input, t!.line, "env", { PATH: "/tmp/fake-bin" }), error: /env: sets PATH/ };
+    },
+  },
+  {
+    name: "github_env_write_before_proofs",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "an earlier step writes NODE_OPTIONS to $GITHUB_ENV",
+    build: (input) => {
+      const [t] = fixtureTargets(input);
+      const run = 'echo "NODE_OPTIONS=--require ./.github/ci-exit0.cjs" >> "$GITHUB_ENV"';
+      return { input: insertStepBefore(input, t!.line, { name: "Tune Node", run }), error: /names NODE_OPTIONS/ };
+    },
+  },
+  {
+    name: "github_path_write_before_proofs",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "an earlier step prepends a directory to $GITHUB_PATH",
+    build: (input) => {
+      const [t] = fixtureTargets(input);
+      return { input: insertStepBefore(input, t!.line, { name: "Add tools", run: 'echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"' }), error: /GITHUB_PATH/ };
+    },
+  },
+  {
+    name: "unknown_action_before_proofs",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "an unknown action runs before the proofs",
+    build: (input) => {
+      const [t] = fixtureTargets(input);
+      return { input: insertStepBefore(input, t!.line, { uses: "example/setup-anything@v1" }), error: /runs action example\/setup-anything@v1/ };
+    },
+  },
+  ...([
+    ["review2_npmrc_script_shell", "review2", ".npmrc", "script-shell=/usr/bin/true\n", /\.npmrc sets script-shell/],
+    ["npmrc_node_options", "gate", ".npmrc", "node-options=--require ./exit0.cjs\n", /\.npmrc sets node-options/],
+    ["pnpm_workspace_script_shell", "gate", "pnpm-workspace.yaml", "packages: []\nscriptShell: /usr/bin/true\n", /pnpm-workspace\.yaml sets scriptShell/],
+    ["pnpmfile_present", "gate", ".pnpmfile.cjs", "process.exit(0);\n", /\.pnpmfile\.cjs exists/],
+  ] as const).map(([name, origin, file, text, error]): Fixture => ({
+    name,
+    origin,
+    expectGateGreen: false,
+    describe: `${file} gains \`${text.trim().split("\n").at(-1)}\``,
+    build: (input) => ({ input: withFiles(input, { [file]: text }), error }),
+    files: { [file]: text },
+    replayableOnTextualGate: false,
+  })),
 ];
 
 /**

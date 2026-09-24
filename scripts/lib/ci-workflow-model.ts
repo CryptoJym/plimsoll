@@ -22,6 +22,9 @@ export type WorkflowStep = {
   name: string;
   line: number;
   run: string | null;
+  uses: string | null;
+  /** Names the step's `env:` sets; null when it is not a literal mapping. */
+  env: string[] | null;
   /** Null when every successful push/PR run executes this step's shell script with errexit. */
   notCovering: string | null;
 };
@@ -31,6 +34,10 @@ export type WorkflowModel = {
   errors: string[];
   triggerProblems: string[];
   steps: WorkflowStep[];
+  /** Names the workflow-level `env:` sets; null when it is not a literal mapping. */
+  env: string[] | null;
+  /** Per job: the names its `env:` sets (null when not a literal mapping), and whether it runs in a container. */
+  jobs: Record<string, { env: string[] | null; container: boolean }>;
 };
 
 // ---------------------------------------------------------------------------
@@ -423,6 +430,8 @@ function matrixCombinations(strategy: unknown): { combos: Json[] } | { problem: 
 
 const NON_WINDOWS_RUNNER = /^(?:macos|ubuntu)-[A-Za-z0-9.-]+$/;
 
+const envNames = (env: unknown): string[] | null => (env === undefined ? [] : isRecord(env) ? Object.keys(env) : null);
+
 function lineOf(document: Document, lineCounter: LineCounter, path: Array<string | number>) {
   const node = document.getIn(path, true) as { range?: [number, number, number] } | undefined;
   return node?.range ? lineCounter.linePos(node.range[0]).line : 0;
@@ -432,15 +441,15 @@ export function modelWorkflow(path: string, text: string): WorkflowModel {
   const lineCounter = new LineCounter();
   const document = parseDocument(text, { lineCounter, prettyErrors: true, uniqueKeys: true });
   const errors = [...document.errors, ...document.warnings].map((problem) => `${path}: ${problem.message.split("\n")[0]}`);
-  if (errors.length > 0) return { path, errors, triggerProblems: [], steps: [] };
+  if (errors.length > 0) return { path, errors, triggerProblems: [], steps: [], env: [], jobs: {} };
   let workflow: unknown;
   try {
     workflow = document.toJS({ maxAliasCount: 100 });
   } catch (error) {
-    return { path, errors: [`${path}: ${error instanceof Error ? error.message : String(error)}`], triggerProblems: [], steps: [] };
+    return { path, errors: [`${path}: ${error instanceof Error ? error.message : String(error)}`], triggerProblems: [], steps: [], env: [], jobs: {} };
   }
   if (!isRecord(workflow) || !isRecord(workflow.jobs)) {
-    return { path, errors: [`${path}: not a workflow with a jobs mapping`], triggerProblems: [], steps: [] };
+    return { path, errors: [`${path}: not a workflow with a jobs mapping`], triggerProblems: [], steps: [], env: [], jobs: {} };
   }
   const triggers = COVERAGE_EVENTS.flatMap((event) => triggerProblems(workflow.on, event));
   const jobs = workflow.jobs as Json;
@@ -543,8 +552,12 @@ export function modelWorkflow(path: string, text: string): WorkflowModel {
           notCovering = `runs in working-directory \`${String(workingDirectory)}\``;
         }
       }
-      steps.push({ workflow: path, job: jobId, stepIndex: index, name, line, run, notCovering });
+      const uses = typeof record.uses === "string" ? record.uses : null;
+      steps.push({ workflow: path, job: jobId, stepIndex: index, name, line, run, uses, env: envNames(record.env), notCovering });
     });
   }
-  return { path, errors: [], triggerProblems: triggers, steps };
+  const jobInfo = Object.fromEntries(
+    Object.entries(jobs).map(([id, job]) => [id, { env: isRecord(job) ? envNames(job.env) : null, container: isRecord(job) && job.container !== undefined }]),
+  );
+  return { path, errors: [], triggerProblems: triggers, steps, env: envNames(workflow.env), jobs: jobInfo };
 }
