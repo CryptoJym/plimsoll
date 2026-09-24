@@ -58,10 +58,20 @@ npx -y @plimsoll/cli@<version> lifecycle purge --operation-id <id> \
 
 # Sanitized, bounded diagnostics (versions, readiness, aggregate log codes):
 npx @plimsoll/cli@<version> lifecycle support-bundle --operation-id <id>
+
+# Update snapshots and runtimes: list, preview (default) or remove what
+# retention does not keep; check disk before stopping the service:
+npx @plimsoll/cli@<version> lifecycle snapshots list
+npx @plimsoll/cli@<version> lifecycle snapshots prune [--keep N] [--apply]
+npx @plimsoll/cli@<version> lifecycle update --preflight
 ```
 
 `lifecycle update --artifact self` refuses to run from a source checkout or a
-shell shim; it pins only a real packaged bundle. Every operation prints one
+shell shim; it pins only a real packaged bundle. It refuses while any other
+process has the ledger open, so stop the collector first. With the collector
+stopped on APFS, its ledger snapshot is a clone that costs no disk when taken;
+every completed update keeps only the two newest completed snapshots and the
+runtimes they restore (see `docs/local-lifecycle.md`). Every operation prints one
 JSON receipt naming exactly what it owns, what it retained, and what only a
 separate purge may remove.
 
@@ -75,7 +85,7 @@ separate purge may remove.
 | `doctor --read-only --json` | Verify Node, collector/tool config, LaunchAgent, runtime identity, connectivity, and token signal without writing |
 | `install-launch-agent` / `load-launch-agent` | Write the user LaunchAgent plist / load an installed one |
 | `uninstall-launch-agent` / `unload-launch-agent` | Remove the plist / unload without removing |
-| `lifecycle update\|rollback\|uninstall\|purge\|support-bundle` | Transactional immutable-runtime updates with automatic rollback, preview-default uninstall, exact-confirmation purge, sanitized support bundle |
+| `lifecycle update\|rollback\|uninstall\|purge\|support-bundle\|snapshots` | Transactional immutable-runtime updates with automatic rollback and bounded snapshot retention, preview-default uninstall, exact-confirmation purge, sanitized support bundle, snapshot list/prune |
 | `scan-rollouts` | One-time full-history walk of Codex rollout files into the ledger |
 | `scan-transcripts` | One-time full-history walk of Claude Code transcripts into the ledger |
 | `label account HASH NAME` | Local-only display label for a hashed account |

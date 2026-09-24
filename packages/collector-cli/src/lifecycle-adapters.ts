@@ -1,4 +1,5 @@
-import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -25,14 +26,21 @@ import { defaultLifecycleAuthorityRoot, LifecycleMutationAuthority } from "./lif
 import {
   FilesystemLifecycleAdapter,
   type LifecycleDatabaseAdapter,
+  type LifecycleDatabaseRestore,
+  type LifecycleDatabaseSnapshot,
   type LifecycleServiceAdapter,
   type ManagedLifecyclePaths,
 } from "./lifecycle-filesystem";
 import {
   LIFECYCLE_SCHEMA_VERSION,
+  LifecycleRestoreRefusal,
+  LifecycleSnapshotRefusal,
+  snapshotHeadroomBytes,
   validateRuntimeArtifact,
   type LifecycleAdapter,
+  type LifecycleCloneFallback,
   type LifecycleReadiness,
+  type LifecycleSnapshotPlan,
   type LifecycleSupportSnapshot,
   type RuntimeArtifact,
 } from "./lifecycle";
@@ -46,8 +54,9 @@ import { PLIMSOLL_VERSION } from "./version";
  * - FilesystemLifecycleAdapter over the canonical collector home,
  * - a LaunchAgent-manifest service adapter that rewrites the owned plist and
  *   NEVER invokes launchctl (load/unload stay explicit operator commands),
- * - a SQLite online-backup database adapter (a live WAL database is never
- *   copied byte-wise; only quiesced backup snapshots are restorable),
+ * - a SQLite ledger snapshot adapter: an APFS clone of the ledger while an
+ *   exclusive lock proves it quiesced, otherwise the online backup (a live
+ *   WAL database is never copied byte-wise),
  * - the shared cross-process mutation authority fencing every mutating step.
  *
  * Artifact resolution pins the packaged bundle plus its vendored native
@@ -641,6 +650,522 @@ export class LaunchAgentManifestLifecycleService implements LifecycleServiceAdap
   }
 }
 
+const CLONE_HELPER = "/usr/bin/osascript";
+const CLONE_TIMEOUT_MS = 5 * 60_000;
+/** clonefile(2) from libSystem; flag 1 is CLONE_NOFOLLOW. Prints 0 or -1. */
+const CLONEFILE_SCRIPT =
+  'ObjC.bindFunction("clonefile", ["int", ["char *", "char *", "unsigned int"]]); ' +
+  "function run(argv) { return String($.clonefile(argv[0], argv[1], 1)); }";
+
+/** Returns true only when `destination` is now an APFS clone of `source`. */
+export type FileCloner = (source: string, destination: string) => boolean;
+
+/** Read-only: whether `source` can be cloned to a file created at or under `destination`. */
+export type CloneSupport = (source: string, destination: string) => boolean;
+
+/** Asks the volume whether it supports clonefile(2); prints 1, 0 or error. Reads nothing else. */
+const CLONE_SUPPORT_SCRIPT =
+  "function run(argv) { const value = Ref(); " +
+  "if (!$.NSURL.fileURLWithPath(argv[0]).getResourceValueForKeyError(value, $.NSURLVolumeSupportsFileCloningKey, null)) " +
+  "return 'error'; return value[0].boolValue ? '1' : '0'; }";
+
+/** The nearest existing directory at or above `target`: where a file created there would live. */
+function nearestExistingDirectory(target: string) {
+  let current = path.resolve(target);
+  while (!fs.existsSync(current) && path.dirname(current) !== current) current = path.dirname(current);
+  return current;
+}
+
+/**
+ * Read-only clone capability, for preflight: the source and the destination
+ * must be on one volume, and that volume must report clonefile(2) support
+ * (NSURLVolumeSupportsFileCloningKey). Creates, changes and removes nothing.
+ */
+export const volumeSupportsClone: CloneSupport = (source, destination) => {
+  if (process.platform !== "darwin") return false;
+  try {
+    if (fs.statSync(source).dev !== fs.statSync(nearestExistingDirectory(destination)).dev) return false;
+  } catch {
+    return false;
+  }
+  const result = spawnSync(CLONE_HELPER, ["-l", "JavaScript", "-e", CLONE_SUPPORT_SCRIPT, source], {
+    encoding: "utf8",
+    env: { PATH: "/usr/bin:/bin" },
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: CLONE_TIMEOUT_MS,
+    maxBuffer: 4096,
+  });
+  return result.status === 0 && result.stdout.trim() === "1";
+};
+
+/**
+ * clonefile(2): clone or fail, never a byte copy. Node cannot express this on
+ * macOS: libuv 1.51 answers COPYFILE_FICLONE_FORCE with ENOSYS and turns
+ * COPYFILE_FICLONE into a full copy, and `cp -c` and `ditto --clone` also
+ * fall back to full copies silently. JavaScript for Automation binds the
+ * system call without a native addon. The call runs in a child process, so
+ * this process never opens (and closes) a descriptor on the source, which
+ * would release the SQLite POSIX locks that keep a quiesced ledger quiet.
+ */
+export const cloneFileOrFail: FileCloner = (source, destination) => {
+  if (process.platform !== "darwin") return false;
+  const result = spawnSync(CLONE_HELPER, ["-l", "JavaScript", "-e", CLONEFILE_SCRIPT, source, destination], {
+    encoding: "utf8",
+    env: { PATH: "/usr/bin:/bin" },
+    stdio: ["ignore", "pipe", "ignore"],
+    timeout: CLONE_TIMEOUT_MS,
+    maxBuffer: 4096,
+  });
+  return result.status === 0 && result.stdout.trim() === "0";
+};
+
+/** Size by lstat only; never opens a descriptor. Absent is 0. */
+function regularFileBytes(file: string) {
+  try {
+    const stat = fs.lstatSync(file);
+    return stat.isFile() ? stat.size : 0;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return 0;
+    throw error;
+  }
+}
+
+function isCloneResult(source: string, destination: string) {
+  try {
+    const stat = fs.lstatSync(destination);
+    return stat.isFile() && stat.size === fs.lstatSync(source).size;
+  } catch {
+    return false;
+  }
+}
+
+function lstatIfPresent(file: string) {
+  try {
+    return fs.lstatSync(file);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function removeSqliteFiles(database: string) {
+  fs.rmSync(`${database}-wal`, { force: true });
+  fs.rmSync(`${database}-shm`, { force: true });
+  fs.rmSync(database, { force: true });
+}
+
+/**
+ * A full-copy snapshot needs room for itself and for the byte copy its
+ * rollback would make: a restore builds the restored ledger beside the live
+ * one before replacing it, so neither copy can reuse the other's space.
+ */
+function fullCopyRequiredFreeBytes(ledgerBytes: number, headroomBytes: number) {
+  return 2 * ledgerBytes + headroomBytes;
+}
+
+function volumeFreeBytes(directory: string) {
+  const stat = fs.statfsSync(directory);
+  return stat.bavail * stat.bsize;
+}
+
+function fsyncFile(file: string) {
+  const descriptor = fs.openSync(file, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+  try {
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+function fsyncDirectory(directory: string) {
+  const descriptor = fs.openSync(directory, "r");
+  try {
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+}
+
+/** Restore temporaries live beside the ledger: `<ledger>.restore-<nonce>`. */
+const RESTORE_TEMPORARY = /^(.+)\.restore-[0-9a-f]{12}$/;
+
+/** Removes temporaries an interrupted earlier restore of `destination` left behind. */
+function removeRestoreTemporaries(destination: string) {
+  const directory = path.dirname(destination);
+  for (const name of fs.readdirSync(directory)) {
+    const base = RESTORE_TEMPORARY.exec(name.replace(/-(wal|shm|journal)$/, ""))?.[1];
+    if (base !== path.basename(destination)) continue;
+    const stat = fs.lstatSync(path.join(directory, name));
+    if (stat.isFile()) fs.rmSync(path.join(directory, name), { force: true });
+  }
+}
+
+/**
+ * Opens a database file in EXCLUSIVE locking mode and takes the write lock
+ * without waiting. The mode is set before the first read, so SQLite keeps
+ * the WAL index in heap memory and never creates a -shm file; the lock is
+ * held until close.
+ */
+function openExclusive(file: string) {
+  const connection = new Database(file, { fileMustExist: true, timeout: 0 });
+  try {
+    connection.pragma("locking_mode = EXCLUSIVE");
+    connection.exec("BEGIN EXCLUSIVE");
+    connection.exec("COMMIT");
+    return connection;
+  } catch (error) {
+    connection.close();
+    throw error;
+  }
+}
+
+/** The live ledger held exclusively for replacement, with our own descriptor on its inode. */
+type LiveLedgerLock = { connection: InstanceType<typeof Database>; descriptor: number };
+
+function sqliteBusy(error: unknown) {
+  const code = (error as { code?: unknown }).code;
+  return typeof code === "string" && /^SQLITE_(BUSY|LOCKED)/.test(code);
+}
+
+/**
+ * Proves no other connection in any process has the live ledger open and
+ * keeps it that way until released: every attached WAL connection holds a
+ * shared lock on the database file for its whole life, so the exclusive lock
+ * is refused (SQLITE_BUSY, no waiting) while one exists. Holding it, a
+ * TRUNCATE checkpoint leaves nothing the connection could write back into the
+ * file after it is replaced. Null when there is no live ledger.
+ */
+function lockLiveLedger(destination: string): LiveLedgerLock | null {
+  const before = lstatIfPresent(destination);
+  if (!before) return null;
+  if (!before.isFile()) throw new Error("the live ledger must be a regular file");
+  let connection: InstanceType<typeof Database>;
+  try {
+    connection = openExclusive(destination);
+  } catch (error) {
+    throw new LifecycleRestoreRefusal({
+      reason: sqliteBusy(error) ? "ledger_in_use" : "quiescence_unproven",
+      requiredFreeBytes: null,
+      freeBytes: null,
+    });
+  }
+  let descriptor: number | null = null;
+  try {
+    if (connection.pragma("journal_mode", { simple: true }) === "wal") {
+      const [checkpoint] = connection.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number; log: number }>;
+      if (!checkpoint || checkpoint.busy !== 0 || checkpoint.log !== 0) throw new Error("live ledger WAL did not empty");
+    }
+    descriptor = fs.openSync(destination, fs.constants.O_RDWR | fs.constants.O_NOFOLLOW);
+    const opened = fs.fstatSync(descriptor);
+    if (opened.ino !== before.ino || opened.dev !== before.dev) throw new Error("the live ledger changed while locking");
+    return { connection, descriptor };
+  } catch (error) {
+    // Close the connection before our own descriptor: closing any descriptor
+    // on the file drops this process's POSIX locks on it.
+    connection.close();
+    if (descriptor !== null) fs.closeSync(descriptor);
+    if (error instanceof LifecycleRestoreRefusal) throw error;
+    throw new LifecycleRestoreRefusal({ reason: "quiescence_unproven", requiredFreeBytes: null, freeBytes: null });
+  }
+}
+
+/**
+ * Releases a live ledger that a rename or unlink has just replaced. While the
+ * exclusive lock still holds, no connection can be attached to the old file,
+ * but a process could have opened it an instant before and be waiting for
+ * the lock. Zeroing the old file's header (it has no name left) makes such a
+ * late opener fail with "not a database" instead of writing to an unlinked
+ * file, and removing the old -wal/-shm/-journal names keeps it from pairing
+ * with the new ledger's sidecars. A file that is still linked elsewhere is
+ * never written.
+ */
+function releaseReplacedLedger(live: LiveLedgerLock, destination: string) {
+  try {
+    if (fs.fstatSync(live.descriptor).nlink === 0) fs.writeSync(live.descriptor, Buffer.alloc(16), 0, 16, 0);
+    fs.rmSync(`${destination}-wal`, { force: true });
+    fs.rmSync(`${destination}-shm`, { force: true });
+    fs.rmSync(`${destination}-journal`, { force: true });
+  } finally {
+    live.connection.close();
+    fs.closeSync(live.descriptor);
+  }
+}
+
+/**
+ * Restores a ledger snapshot without ever leaving the destination without a
+ * complete, valid database, and without replacing a database that another
+ * connection could keep using. The restored copy is built beside the
+ * destination (an APFS clone when possible; otherwise a byte copy, and only
+ * when the volume has room for it while the live ledger still exists, since a
+ * clone snapshot shares its blocks with the live ledger and deleting the live
+ * name would free little), made durable, and must pass PRAGMA
+ * integrity_check. Then, holding exclusive locks on both the restored copy
+ * and the live ledger (refused if any other connection has the live ledger
+ * open), one atomic rename replaces the destination. Any failure before the
+ * rename leaves the live ledger exactly as it was.
+ */
+async function restoreLedger(
+  input: { source: string; destination: string },
+  options: { clone: FileCloner; freeBytes: (directory: string) => number },
+): Promise<LifecycleDatabaseRestore> {
+  const stat = fs.lstatSync(input.source);
+  if (!stat.isFile()) throw new Error("database restore source must be a regular file");
+  removeRestoreTemporaries(input.destination);
+  const temporary = `${input.destination}.restore-${randomBytes(6).toString("hex")}`;
+  let method: LifecycleDatabaseRestore["method"] = "clone";
+  let restored: InstanceType<typeof Database> | null = null;
+  let live: LiveLedgerLock | null = null;
+  try {
+    if (!(options.clone(input.source, temporary) && isCloneResult(input.source, temporary))) {
+      fs.rmSync(temporary, { force: true });
+      method = "copy";
+      const headroomBytes = snapshotHeadroomBytes(stat.size);
+      const freeBytes = options.freeBytes(path.dirname(input.destination));
+      if (freeBytes < stat.size + headroomBytes) {
+        throw new LifecycleRestoreRefusal({
+          reason: "insufficient_free_space",
+          requiredFreeBytes: stat.size + headroomBytes,
+          freeBytes,
+        });
+      }
+      fs.copyFileSync(input.source, temporary, fs.constants.COPYFILE_EXCL);
+    }
+    fs.chmodSync(temporary, 0o600);
+    fsyncFile(temporary);
+    // Held until the swap is done, so nothing can open the restored ledger
+    // under its final name before the replaced one is released.
+    restored = openExclusive(temporary);
+    if (restored.pragma("integrity_check", { simple: true }) !== "ok") {
+      throw new LifecycleRestoreRefusal({ reason: "integrity_check_failed", requiredFreeBytes: null, freeBytes: null });
+    }
+    live = lockLiveLedger(input.destination);
+    if (live) {
+      const replaced = live;
+      live = null;
+      try {
+        fs.renameSync(temporary, input.destination);
+      } catch (error) {
+        replaced.connection.close();
+        fs.closeSync(replaced.descriptor);
+        throw error;
+      }
+      try {
+        fsyncDirectory(path.dirname(input.destination));
+      } finally {
+        releaseReplacedLedger(replaced, input.destination);
+      }
+    } else {
+      // No live ledger: create the name without replacing one that appeared
+      // meanwhile, and never pair the new ledger with stale sidecars.
+      for (const suffix of ["-wal", "-shm", "-journal"]) fs.rmSync(`${input.destination}${suffix}`, { force: true });
+      try {
+        fs.linkSync(temporary, input.destination);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        throw new LifecycleRestoreRefusal({ reason: "ledger_in_use", requiredFreeBytes: null, freeBytes: null });
+      }
+      fs.unlinkSync(temporary);
+      fsyncDirectory(path.dirname(input.destination));
+    }
+    restored.close();
+    restored = null;
+    removeSqliteFiles(temporary);
+    return { method, cloneFallback: method === "clone" ? null : "clone_unsupported", databaseBytes: stat.size };
+  } catch (error) {
+    if (live) {
+      live.connection.close();
+      fs.closeSync(live.descriptor);
+    }
+    restored?.close();
+    removeSqliteFiles(temporary);
+    fs.rmSync(`${temporary}-journal`, { force: true });
+    throw error;
+  }
+}
+
+/**
+ * Removes the live ledger for a snapshot taken before any ledger existed,
+ * under the same proof that no other connection has it open.
+ */
+async function discardLedger(destination: string) {
+  const live = lockLiveLedger(destination);
+  if (!live) {
+    for (const suffix of ["-wal", "-shm", "-journal"]) fs.rmSync(`${destination}${suffix}`, { force: true });
+    return;
+  }
+  try {
+    fs.unlinkSync(destination);
+  } catch (error) {
+    live.connection.close();
+    fs.closeSync(live.descriptor);
+    throw error;
+  }
+  try {
+    fsyncDirectory(path.dirname(destination));
+  } finally {
+    releaseReplacedLedger(live, destination);
+  }
+}
+
+/**
+ * Proves the ledger is quiesced and keeps it so until the connection closes.
+ * In EXCLUSIVE locking mode the first write transaction takes an EXCLUSIVE
+ * lock on the database file and keeps it after COMMIT. Every open WAL
+ * connection holds a shared lock for its whole life, so SQLite refuses that
+ * lock (SQLITE_BUSY, no waiting) while any other connection in any process
+ * has the ledger open. Holding it, a TRUNCATE checkpoint moves every committed
+ * frame into the database file and empties the WAL: the database file alone
+ * is then the complete ledger, and nothing can change it until close.
+ */
+function quiesceLedger(source: string):
+  | { connection: InstanceType<typeof Database> }
+  | { fallback: LifecycleCloneFallback } {
+  let connection: InstanceType<typeof Database>;
+  try {
+    connection = new Database(source, { fileMustExist: true, timeout: 0 });
+  } catch {
+    return { fallback: "quiescence_unproven" };
+  }
+  try {
+    connection.pragma("locking_mode = EXCLUSIVE");
+    connection.exec("BEGIN EXCLUSIVE");
+    connection.exec("COMMIT");
+    if (connection.pragma("journal_mode", { simple: true }) !== "wal") {
+      connection.close();
+      return { fallback: "ledger_not_wal" };
+    }
+    const [checkpoint] = connection.pragma("wal_checkpoint(TRUNCATE)") as Array<{ busy: number; log: number }>;
+    if (!checkpoint || checkpoint.busy !== 0 || checkpoint.log !== 0 || regularFileBytes(`${source}-wal`) !== 0) {
+      connection.close();
+      return { fallback: "wal_not_empty" };
+    }
+    return { connection };
+  } catch (error) {
+    connection.close();
+    return { fallback: sqliteBusy(error) ? "ledger_in_use" : "quiescence_unproven" };
+  }
+}
+
+/**
+ * Production ledger snapshots. When no other connection has the ledger open
+ * (the managed update stops the collector first), the snapshot is an APFS
+ * clone taken while an exclusive lock holds the ledger still: it costs no
+ * space when taken and restores the same bytes. Otherwise (collector still
+ * running, another volume, no clone support) it is the SQLite online backup,
+ * a full copy, and only when the volume keeps max(2 GiB, 5%) of headroom
+ * after it; if not, the update is refused before anything changes.
+ */
+export class SqliteLedgerSnapshotAdapter implements LifecycleDatabaseAdapter {
+  private readonly clone: FileCloner;
+  private readonly cloneSupported: CloneSupport;
+  private readonly freeBytes: (directory: string) => number;
+  private readonly backup = new SqliteOnlineBackupAdapter();
+
+  constructor(options: {
+    clone?: FileCloner;
+    cloneSupported?: CloneSupport;
+    freeBytes?: (directory: string) => number;
+  } = {}) {
+    this.clone = options.clone ?? cloneFileOrFail;
+    this.cloneSupported = options.cloneSupported ?? volumeSupportsClone;
+    this.freeBytes = options.freeBytes ?? volumeFreeBytes;
+  }
+
+  async snapshot(input: { source: string; destination: string }): Promise<LifecycleDatabaseSnapshot> {
+    if (!fs.existsSync(input.source)) {
+      return { present: false, method: null, quiesced: false, cloneFallback: null };
+    }
+    removeSqliteFiles(input.destination);
+    const quiesced = quiesceLedger(input.source);
+    if ("fallback" in quiesced && (quiesced.fallback === "ledger_in_use" || quiesced.fallback === "quiescence_unproven")) {
+      // A rollback of this update would have to replace the ledger while that
+      // connection could keep writing to the replaced file. Refuse first.
+      const ledgerBytes = regularFileBytes(input.source) + regularFileBytes(`${input.source}-wal`);
+      throw new LifecycleSnapshotRefusal({
+        reason: quiesced.fallback,
+        method: null,
+        cloneFallback: quiesced.fallback,
+        ledgerBytes,
+        headroomBytes: snapshotHeadroomBytes(ledgerBytes),
+        requiredFreeBytes: 0,
+        freeBytes: this.freeBytes(path.dirname(input.destination)),
+      });
+    }
+    let cloneFallback: LifecycleCloneFallback;
+    if ("connection" in quiesced) {
+      try {
+        if (this.clone(input.source, input.destination) && isCloneResult(input.source, input.destination)) {
+          fs.chmodSync(input.destination, 0o600);
+          return { present: true, method: "clone", quiesced: true, cloneFallback: null };
+        }
+      } finally {
+        quiesced.connection.close();
+      }
+      fs.rmSync(input.destination, { force: true });
+      cloneFallback = "clone_unsupported";
+    } else {
+      cloneFallback = quiesced.fallback;
+    }
+    const ledgerBytes = regularFileBytes(input.source) + regularFileBytes(`${input.source}-wal`);
+    const headroomBytes = snapshotHeadroomBytes(ledgerBytes);
+    const freeBytes = this.freeBytes(path.dirname(input.destination));
+    const requiredFreeBytes = fullCopyRequiredFreeBytes(ledgerBytes, headroomBytes);
+    if (freeBytes < requiredFreeBytes) {
+      throw new LifecycleSnapshotRefusal({
+        reason: "insufficient_free_space",
+        method: "online_backup",
+        cloneFallback,
+        ledgerBytes,
+        headroomBytes,
+        requiredFreeBytes,
+        freeBytes,
+      });
+    }
+    await this.backup.snapshot(input);
+    return { present: true, method: "online_backup", quiesced: "connection" in quiesced, cloneFallback };
+  }
+
+  restore(input: { source: string; destination: string }): Promise<LifecycleDatabaseRestore> {
+    return restoreLedger(input, { clone: this.clone, freeBytes: this.freeBytes });
+  }
+
+  discard(input: { destination: string }): Promise<void> {
+    return discardLedger(input.destination);
+  }
+
+  /**
+   * Read-only prediction of the snapshot of an update run after the collector
+   * stops: a clone when the ledger's volume supports cloning into the
+   * snapshot directory, otherwise a full copy that needs room for itself and
+   * for a rollback's copy. Creates, changes and removes nothing.
+   */
+  async plan(input: { source: string; destination: string }): Promise<LifecycleSnapshotPlan> {
+    const freeBytes = this.freeBytes(nearestExistingDirectory(input.destination));
+    if (!fs.existsSync(input.source)) {
+      return {
+        method: "none", cloneCapable: false, ledgerBytes: 0, headroomBytes: 0,
+        requiredFreeBytes: 0, requiredFreeBytesIfCloneFails: 0, freeBytes, ok: true, reason: null,
+      };
+    }
+    const cloneCapable = this.cloneSupported(input.source, input.destination);
+    const ledgerBytes = regularFileBytes(input.source) + regularFileBytes(`${input.source}-wal`);
+    const headroomBytes = snapshotHeadroomBytes(ledgerBytes);
+    const requiredFreeBytes = cloneCapable ? 0 : fullCopyRequiredFreeBytes(ledgerBytes, headroomBytes);
+    const ok = freeBytes >= requiredFreeBytes;
+    return {
+      method: cloneCapable ? "clone" : "online_backup",
+      cloneCapable,
+      ledgerBytes,
+      headroomBytes,
+      requiredFreeBytes,
+      requiredFreeBytesIfCloneFails: fullCopyRequiredFreeBytes(ledgerBytes, headroomBytes),
+      freeBytes,
+      ok,
+      reason: ok ? null : "insufficient_free_space",
+    };
+  }
+}
+
 /** Quiesced SQLite snapshots via the online backup API; never a raw WAL copy. */
 export class SqliteOnlineBackupAdapter implements LifecycleDatabaseAdapter {
   snapshot(input: { source: string; destination: string }): Promise<boolean> {
@@ -660,16 +1185,12 @@ export class SqliteOnlineBackupAdapter implements LifecycleDatabaseAdapter {
     })();
   }
 
-  restore(input: { source: string; destination: string }): Promise<void> {
-    return (async () => {
-      const stat = fs.lstatSync(input.source);
-      if (!stat.isFile()) throw new Error("database restore source must be a regular file");
-      fs.rmSync(`${input.destination}-wal`, { force: true });
-      fs.rmSync(`${input.destination}-shm`, { force: true });
-      fs.rmSync(input.destination, { force: true });
-      fs.copyFileSync(input.source, input.destination);
-      fs.chmodSync(input.destination, 0o600);
-    })();
+  restore(input: { source: string; destination: string }): Promise<LifecycleDatabaseRestore> {
+    return restoreLedger(input, { clone: cloneFileOrFail, freeBytes: volumeFreeBytes });
+  }
+
+  discard(input: { destination: string }): Promise<void> {
+    return discardLedger(input.destination);
   }
 }
 
@@ -723,7 +1244,7 @@ export function composeLifecycleAdapter(options: ComposeLifecycleAdapterOptions 
     ...(options.homeDir !== undefined ? { homeDir: options.homeDir } : {}),
     lifecycleRoot: paths.lifecycleRoot,
   });
-  const database = options.database ?? new SqliteOnlineBackupAdapter();
+  const database = options.database ?? new SqliteLedgerSnapshotAdapter();
   const authority = new LifecycleMutationAuthority(
     options.authorityRoot ?? defaultLifecycleAuthorityRoot(options.homeDir),
     ...(options.authorityLeaseMs !== undefined ? [{ defaultLeaseMs: options.authorityLeaseMs }] : []),
