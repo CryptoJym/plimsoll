@@ -27,6 +27,10 @@ export const STATUS_SUMMARY_SCHEMA = "plimsoll.status-summary/v1";
 export const STATUS_SUMMARY_INTERVAL_MS = 15_000;
 /** How long shutdown waits for a write in progress, so it leaves no temp file. */
 export const STATUS_SUMMARY_STOP_WAIT_MS = 2_000;
+/** A temp file the writer creates beside the summary (and removes unless interrupted). */
+export function isStatusSummaryTempFile(name: string) {
+  return /^status-summary\.json\.\d+\.[0-9a-f]{16}\.tmp$/.test(name);
+}
 /** Names what the /healthz proof authenticates, so it can mean nothing else. */
 export const HEALTHZ_PROOF_CONTEXT = "plimsoll.healthz-proof/v1";
 

@@ -84,17 +84,22 @@ of embedded tool-config fragments is not wired yet: the real adapter reports
 `tool_config_fragments` as owned but owns no fragment files until the
 config-removal lane lands, and receipts say exactly that.) It preserves the
 collector config, workspace credentials, ledger,
-history, lifecycle snapshots, and workspace membership. Both preview and apply
-receipts expose those under typed `retainedTargets`; `lifecycle_snapshots`
-never appears in uninstall `ownedTargets`. The same receipts classify the
-collector config, workspace credentials, ledger, history, and lifecycle
-snapshots under `purgeOnlyTargets`, so an uninstall receipt cannot imply that
-purge-only data was deleted.
+history, status summary, lifecycle snapshots, and workspace membership. Both
+preview and apply receipts expose those under typed `retainedTargets`;
+`lifecycle_snapshots` never appears in uninstall `ownedTargets`. The same
+receipts classify the collector config, workspace credentials, ledger,
+history, status summary (`status_summary`) and lifecycle snapshots under
+`purgeOnlyTargets`, so an uninstall receipt cannot imply that purge-only data
+was deleted.
 
 Purging data is a different operation. It is a preview by default and lists
-the live collector config, ledger, history, and lifecycle snapshots. Apply
-requires both `--apply` and the exact confirmation shown above, then deletes
-the live copies and secret-bearing lifecycle snapshot copies. Leaving a
+the live collector config, ledger, history, status summary, and lifecycle
+snapshots. Apply requires both `--apply` and the exact confirmation shown
+above, then deletes the live copies and secret-bearing lifecycle snapshot
+copies. The status summary (`status-summary.json`: usage counters and the
+last run's `/healthz` key) goes with any temp file an interrupted write left
+beside it (`status-summary.json.<pid>.<16 hex>.tmp`); nothing else that
+shares the name is touched. Leaving a
 workspace and revoking a device are also distinct: neither is simulated or
 reported complete by local uninstall or purge.
 

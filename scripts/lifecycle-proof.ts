@@ -72,8 +72,10 @@ function fixture(name: string) {
       path.join(ownershipRoot, "tool-fragments", "codex.plimsoll.toml"),
     ],
     history: [path.join(ownershipRoot, "private", "history.ndjson")],
+    statusSummary: path.join(ownershipRoot, "private", "status-summary.json"),
   };
   write(paths.collectorConfig, '{"tenantId":"fixture","installKey":"credential-sentinel"}\n');
+  write(paths.statusSummary, '{"schema":"plimsoll.status-summary/v1","healthzKey":"status-summary-sentinel"}\n');
   write(paths.database, "ledger-v1\n");
   write(paths.history[0]!, "history-sentinel\n");
   for (const fragment of paths.ownedToolFragments) write(fragment, "plimsoll-owned-fragment\n");
@@ -337,6 +339,13 @@ async function main() {
     const rollback = await manager.rollback({ operationId: "rollback-v1", artifact: v1 });
     check("explicit_rollback_uses_same_transaction_and_returns_to_v1", rollback.operation === "rollback" && rollback.fromVersion === "0.8.0" && happy.runtimeVersion === "0.6.0", rollback);
 
+    // eco-6hoxj.163.34: an interrupted summary write can leave a temp file;
+    // a file that merely starts with the same name is not the collector's.
+    const summaryTemp = path.join(path.dirname(happy.paths.statusSummary), "status-summary.json.4242.0123456789abcdef.tmp");
+    const besideSummary = path.join(path.dirname(happy.paths.statusSummary), "status-summary.json.bak");
+    write(summaryTemp, "{}\n");
+    write(besideSummary, "not plimsoll's\n");
+
     const snapshotsRoot = path.join(happy.paths.lifecycleRoot, "snapshots");
     const secretSnapshot = path.join(snapshotsRoot, "install-v1", "config");
     const previewDigest = createHash("sha256").update(fs.readFileSync(happy.paths.database)).update(fs.readFileSync(happy.paths.history[0]!)).digest("hex");
@@ -369,6 +378,7 @@ async function main() {
     });
     const applied = appliedOutput.receipt;
     const preservedDigest = createHash("sha256").update(fs.readFileSync(happy.paths.database)).update(fs.readFileSync(happy.paths.history[0]!)).digest("hex");
+    const summaryKeptByUninstall = fs.existsSync(happy.paths.statusSummary) && fs.existsSync(summaryTemp);
     check("uninstall_apply_removes_only_owned_runtime_service_fragments", applied.status === "completed" && !fs.existsSync(happy.paths.serviceManifest) && happy.paths.ownedToolFragments.every((file) => !fs.existsSync(file)) && !fs.existsSync(path.join(happy.paths.lifecycleRoot, "current")), applied);
     check(
       "uninstall_apply_receipt_cannot_imply_purge_only_snapshots_were_deleted",
@@ -410,6 +420,12 @@ async function main() {
         // Purge removes the snapshot copies; the directory itself may be
         // absent (receipt persistence no longer resurrects pruned roots).
         (!fs.existsSync(snapshotsRoot) || fs.readdirSync(snapshotsRoot).length === 0),
+      purged,
+    );
+    check(
+      "status_summary_is_purge_only_kept_by_uninstall_removed_by_purge",
+      summaryKeptByUninstall && purged.ownedTargets.includes("status_summary") &&
+        !fs.existsSync(happy.paths.statusSummary) && !fs.existsSync(summaryTemp) && fs.existsSync(besideSummary),
       purged,
     );
   } finally {

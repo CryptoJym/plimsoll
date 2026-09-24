@@ -22,6 +22,7 @@ export type LifecyclePurgeOnlyTarget =
   | "workspace_credentials"
   | "ledger"
   | "history"
+  | "status_summary"
   | "lifecycle_snapshots";
 
 export type LifecycleRetainedTarget = LifecyclePurgeOnlyTarget | "workspace_membership";
@@ -31,6 +32,7 @@ export const LIFECYCLE_PURGE_ONLY_TARGETS = [
   "workspace_credentials",
   "ledger",
   "history",
+  "status_summary",
   "lifecycle_snapshots",
 ] as const satisfies readonly LifecyclePurgeOnlyTarget[];
 

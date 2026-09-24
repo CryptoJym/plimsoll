@@ -75,6 +75,7 @@ function fixture(name: string) {
     serviceManifest: path.join(ownershipRoot, "Library", "LaunchAgents", "com.plimsoll.collector.plist"),
     ownedToolFragments: [],
     history: [],
+    statusSummary: path.join(ownershipRoot, "private", "status-summary.json"),
   };
   fs.mkdirSync(path.dirname(paths.database), { recursive: true, mode: 0o700 });
   fs.writeFileSync(paths.database, "ledger-v1\n", { mode: 0o600 });

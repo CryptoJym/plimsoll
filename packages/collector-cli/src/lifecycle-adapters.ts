@@ -36,6 +36,7 @@ import {
   type LifecycleSupportSnapshot,
   type RuntimeArtifact,
 } from "./lifecycle";
+import { STATUS_SUMMARY_FILE } from "./status-summary";
 import { PLIMSOLL_VERSION } from "./version";
 
 /**
@@ -710,6 +711,7 @@ export function managedLifecyclePaths(options: {
     // fragments yet; surgical fragment removal is still open work.
     ownedToolFragments: [],
     history: [defaultBackfillStatePath(options.homeDir)],
+    statusSummary: path.join(collectorHome(options.homeDir), STATUS_SUMMARY_FILE),
   };
 }
 
