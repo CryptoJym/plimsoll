@@ -12,6 +12,7 @@
  * the shared ingest schema the cloud validates.
  */
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 
 import { createProofCompletion } from "./lib/proof-completion";
@@ -40,7 +41,7 @@ import { resolveMaintenanceRepoContexts } from "../packages/collector-cli/src/ma
 import { uploadBufferedEvents } from "../packages/collector-cli/src/upload";
 import { aiInteractionEventSchema, aiWorkIngestBatchSchema } from "../packages/shared/src/index";
 
-const EXPECTED_CHECKS = 39;
+const EXPECTED_CHECKS = 40;
 const completion = createProofCompletion("grok-usage", EXPECTED_CHECKS);
 const SENTINEL = "PLIMSOLL_GROK_CONTENT_SENTINEL_5c1e";
 const TICKS_PER_USD = 10_000_000_000;
@@ -172,6 +173,41 @@ function expectedEvents(session: FixtureSession, turn: FixtureTurn, reconciles: 
   return [{ sessionId: session.sessionId, turn, perModel: false, model }];
 }
 
+/** The highest ancestor (the directory itself included) that holds a `.git` entry. */
+function outermostGitOwner(directory: string) {
+  let owner: string | null = null;
+  for (let current = directory; ; current = path.dirname(current)) {
+    try {
+      fs.lstatSync(path.join(current, ".git"));
+      owner = current;
+    } catch {
+      // No Git entry here.
+    }
+    if (path.dirname(current) === current) return owner;
+  }
+}
+
+/**
+ * A fresh directory outside every Git worktree. Git resolution walks every
+ * ancestor, and a local proof layout can place TMPDIR inside a checkout, so
+ * a directory under the proof root is not reliably "not a repo". Step out
+ * above the outermost worktree that holds TMPDIR, else use the system temp.
+ */
+function nonGitDirectory(label: string) {
+  const temp = fs.realpathSync(os.tmpdir());
+  const owner = outermostGitOwner(temp);
+  const bases = [owner ? path.dirname(owner) : temp, fs.realpathSync("/tmp")];
+  for (const base of bases) {
+    if (outermostGitOwner(base)) continue;
+    try {
+      return fs.realpathSync(fs.mkdtempSync(path.join(base, `${label}-`)));
+    } catch {
+      // Not writable here; try the next base.
+    }
+  }
+  throw new Error("grok_usage_proof_no_directory_outside_git");
+}
+
 function spyOnFilesystem() {
   const calls: Array<{ method: string; target: string }> = [];
   const methods = ["openSync", "readFileSync", "readdirSync", "lstatSync", "statSync", "opendirSync",
@@ -269,8 +305,8 @@ async function main() {
   fs.writeFileSync(path.join(repoDirectory, ".git", "refs", "heads", "main"), `${"b".repeat(40)}\n`);
   fs.writeFileSync(path.join(repoDirectory, ".git", "config"),
     `[remote "origin"]\n\turl = https://example.invalid/team/grok-fixture.git\n`);
-  const plainDirectory = path.join(work, "projects", "not-a-repo");
-  fs.mkdirSync(plainDirectory, { recursive: true });
+  const plainDirectory = nonGitDirectory("plimsoll-grok-not-a-repo");
+  process.once("exit", () => fs.rmSync(plainDirectory, { recursive: true, force: true }));
   const rootGroup = "%2F";
   const repoGroup = encodeURIComponent(repoDirectory);
   const plainGroup = encodeURIComponent(plainDirectory);
@@ -480,6 +516,9 @@ async function main() {
   check("encoded_directory_gives_grok_turns_their_git_project",
     typeof repoHash === "string" && repoRows.length === 2 && repoRows.every((row) => row.repoHash === repoHash && row.link),
     { repoRows, repoHash });
+  check("the_plain_directory_fixture_is_outside_every_git_worktree",
+    outermostGitOwner(plainDirectory) === null && resolveGitContextUncached(plainDirectory) === undefined,
+    { insideWorktree: outermostGitOwner(plainDirectory) !== null });
   check("root_and_non_git_directories_stay_unallocated",
     rootRows.length > 0 && rootRows.every((row) => row.repoHash === null && row.link === null) &&
       plainRows.length === 1 && plainRows.every((row) => row.repoHash === null && row.link !== null),
