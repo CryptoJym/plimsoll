@@ -285,6 +285,32 @@ struct PlimsollMenubarCoreTests {
         }
     }
 
+    /// Review should-fix: the Start/Stop mutation passed every test because
+    /// only the invocation was checked. Now any string in the sources naming
+    /// a collector command, or any menu action beyond Refresh, Open Dashboard
+    /// and Quit, fails here.
+    @Test func sourcesOfferNoWayToChangeTheCollector() throws {
+        let commandWords: Set<String> = ["start", "stop", "restart", "setup", "install", "uninstall", "load",
+                                         "unload", "rotate", "purge", "join", "upload", "sync", "kill"]
+        let literal = try NSRegularExpression(pattern: #""(?:[^"\\\n]|\\.)*""#)
+        let sources = try packageSources()
+        #expect(sources.count >= 5)
+        for (file, text) in sources {
+            let range = NSRange(text.startIndex..., in: text)
+            for match in literal.matches(in: text, range: range) {
+                let string = String(text[Range(match.range, in: text)!])
+                let words = Set(string.lowercased().split(whereSeparator: { !$0.isLetter }).map(String.init))
+                #expect(words.isDisjoint(with: commandWords), "\(file): \(string)")
+            }
+        }
+
+        let app = try #require(sources.first { $0.0.hasSuffix("AppDelegate.swift") }?.1)
+        let selector = try NSRegularExpression(pattern: #"#selector\((\w+)\)"#)
+        let actions = selector.matches(in: app, range: NSRange(app.startIndex..., in: app))
+            .map { String(app[Range($0.range(at: 1), in: app)!]) }
+        #expect(Set(actions) == ["refreshAction", "openDashboardAction", "quitAction"])
+    }
+
     @Test func sourcesNeverTouchTheCollectorCredential() throws {
         let sources = try packageSources()
         #expect(sources.count >= 5)
