@@ -96,6 +96,7 @@ export type GrokUsageLimits = { readonly [Key in keyof typeof GROK_USAGE_LIMITS]
 const FILE_STATE_TABLE = "grok_usage_file_state";
 const TURN_STATE_TABLE = "grok_usage_turn_state";
 const SWEEP_RESUME_KEY = "grok_usage_sweep_resume_v1";
+const SWEEP_CURSOR_SCHEMA_VERSION = 1 as const;
 const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$/;
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -169,6 +170,17 @@ type Sweep = {
   done: boolean;
   limitReached: boolean;
   counters: SweepCounters;
+  /** Name-based cursor survives recency reordering and process restarts. */
+  resumeGroupName: string | null;
+  resumeSessionName: string | null;
+  lastGroupName: string | null;
+  lastSessionName: string | null;
+};
+
+type SweepCursor = {
+  version: typeof SWEEP_CURSOR_SCHEMA_VERSION;
+  groupName: string;
+  sessionName: string;
 };
 
 export type GrokUsageFileCounters = {
@@ -574,6 +586,40 @@ function realDirectory(directory: string): fs.BigIntStats | null {
   }
 }
 
+/**
+ * Return bounded directory names with newest directories first.
+ *
+ * Grok's group/session names are opaque and lexical order is unrelated to
+ * activity. Directory mtime is the metadata Grok updates when a session is
+ * created or its usage file is written, so it is a cheap recency signal that
+ * avoids opening any content file. The returned list is deterministic for
+ * equal mtimes and remains capped by the existing lifetime limits.
+ */
+function recentDirectoryNames(directory: string, limit: number) {
+  const entries = fs.readdirSync(directory, { withFileTypes: true });
+  const names = entries
+    .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+    .map((entry) => {
+      let mtimeMs = 0;
+      try {
+        const stat = fs.lstatSync(path.join(directory, entry.name), { bigint: true });
+        if (!stat.isDirectory() || stat.isSymbolicLink()) return null;
+        mtimeMs = Number(stat.mtimeMs);
+      } catch {
+        // A disappearing/unreadable directory is still ordered deterministically
+        // and will be rejected by the existing realDirectory guard below.
+        mtimeMs = 0;
+      }
+      return { name: entry.name, mtimeMs: Number.isFinite(mtimeMs) ? mtimeMs : 0 };
+    })
+    .filter((entry): entry is { name: string; mtimeMs: number } => entry !== null);
+  names.sort((left, right) => right.mtimeMs - left.mtimeMs || left.name.localeCompare(right.name));
+  return {
+    names: names.slice(0, limit).map((entry) => entry.name),
+    truncated: names.length > limit,
+  };
+}
+
 export function ensureGrokUsageState(database: Database.Database) {
   database.exec(`
     create table if not exists ${FILE_STATE_TABLE} (
@@ -740,8 +786,24 @@ export class GrokUsageTailer {
       writeMaintenanceState(database, GROK_USAGE_BACKFILL_KEY, JSON.stringify(marker));
     }
     // A restarted worker resumes near where the last one stopped, so a large
-    // tree is still covered when workers are replaced mid-sweep.
-    const resume = Number(readMaintenanceState(database, SWEEP_RESUME_KEY) ?? 0);
+    // tree is still covered when workers are replaced mid-sweep. Prefer the
+    // name-based cursor (which remains valid when mtime ordering changes), but
+    // accept the original numeric cursor written by 0.7.37.
+    const rawResume = readMaintenanceState(database, SWEEP_RESUME_KEY) ?? "";
+    let resume = Number(rawResume);
+    let resumeGroupName: string | null = null;
+    let resumeSessionName: string | null = null;
+    try {
+      const parsed = JSON.parse(rawResume) as Partial<SweepCursor>;
+      if (parsed.version === SWEEP_CURSOR_SCHEMA_VERSION &&
+          typeof parsed.groupName === "string" && parsed.groupName.length > 0 &&
+          typeof parsed.sessionName === "string" && parsed.sessionName.length > 0) {
+        resumeGroupName = parsed.groupName;
+        resumeSessionName = parsed.sessionName;
+      }
+    } catch {
+      // Legacy numeric state (or corrupt state) falls back to origin zero.
+    }
     this.sweep = {
       startedAt: scanNow.toISOString(),
       groups: null,
@@ -753,6 +815,10 @@ export class GrokUsageTailer {
       done: false,
       limitReached: false,
       counters: zeroCounters(),
+      resumeGroupName,
+      resumeSessionName,
+      lastGroupName: null,
+      lastSessionName: null,
     };
   }
 
@@ -776,11 +842,12 @@ export class GrokUsageTailer {
           break;
         }
         try {
-          sweep.groups = fs.readdirSync(root, { withFileTypes: true })
-            .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
-            .map((entry) => entry.name)
-            .sort()
-            .slice(0, this.limits.maxGroups);
+          const ordered = recentDirectoryNames(root, this.limits.maxGroups);
+          sweep.groups = ordered.names;
+          if (sweep.resumeGroupName) {
+            const namedOrigin = sweep.groups.indexOf(sweep.resumeGroupName);
+            if (namedOrigin >= 0) sweep.origin = namedOrigin;
+          }
         } catch {
           counters.discoveryErrors += 1;
           result.discoveryErrors += 1;
@@ -800,11 +867,11 @@ export class GrokUsageTailer {
         sweep.sessionIndex = 0;
         try {
           if (!realDirectory(groupDirectory)) throw new Error("grok_usage_group_not_directory");
-          sweep.sessions = fs.readdirSync(groupDirectory, { withFileTypes: true })
-            .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
-            .map((entry) => entry.name)
-            .sort()
-            .slice(0, this.limits.maxSessionsPerGroup);
+          sweep.sessions = recentDirectoryNames(groupDirectory, this.limits.maxSessionsPerGroup).names;
+          if (sweep.groupsVisited === 0 && groupName === sweep.resumeGroupName && sweep.resumeSessionName) {
+            const namedSession = sweep.sessions.indexOf(sweep.resumeSessionName);
+            if (namedSession >= 0) sweep.sessionIndex = namedSession + 1;
+          }
         } catch {
           counters.discoveryErrors += 1;
           result.discoveryErrors += 1;
@@ -820,6 +887,8 @@ export class GrokUsageTailer {
       const sessionName = sweep.sessions[sweep.sessionIndex]!;
       sweep.sessionIndex += 1;
       entries += 1;
+      sweep.lastGroupName = groupName;
+      sweep.lastSessionName = sessionName;
       this.observeSession(root, groupName, sessionName, result);
     }
     sweep.entries += entries;
@@ -830,9 +899,16 @@ export class GrokUsageTailer {
     }
     if (!sweep.done && sweep.groups && sweep.groups.length > 0) {
       const next = String((sweep.origin + sweep.groupsVisited) % sweep.groups.length);
-      if (next !== this.persistedResume) {
-        writeMaintenanceState(this.buffer.database, SWEEP_RESUME_KEY, next);
-        this.persistedResume = next;
+      const cursor = sweep.lastGroupName && sweep.lastSessionName
+        ? JSON.stringify({
+            version: SWEEP_CURSOR_SCHEMA_VERSION,
+            groupName: sweep.lastGroupName,
+            sessionName: sweep.lastSessionName,
+          } satisfies SweepCursor)
+        : next;
+      if (cursor !== this.persistedResume) {
+        writeMaintenanceState(this.buffer.database, SWEEP_RESUME_KEY, cursor);
+        this.persistedResume = cursor;
       }
     }
     return entries;
@@ -1216,10 +1292,19 @@ export class GrokUsageTailer {
       completion: marker.completion ?? (clean ? { ...counters, completedAt } : null),
     };
     writeMaintenanceState(database, GROK_USAGE_BACKFILL_KEY, JSON.stringify(next));
-    // A sweep cut short by its lifetime limit continues where it stopped.
-    const resume = sweep.limitReached && sweep.groups && sweep.groups.length > 0
-      ? String((sweep.origin + sweep.groupsVisited) % sweep.groups.length)
-      : "0";
+    // A sweep cut short by its lifetime limit continues where it stopped. The
+    // name-based cursor also survives a recency reorder between process
+    // restarts; retain the legacy numeric fallback only when no session was
+    // observed (for example an empty root).
+    const resume = sweep.limitReached && sweep.lastGroupName && sweep.lastSessionName
+      ? JSON.stringify({
+          version: SWEEP_CURSOR_SCHEMA_VERSION,
+          groupName: sweep.lastGroupName,
+          sessionName: sweep.lastSessionName,
+        } satisfies SweepCursor)
+      : sweep.limitReached && sweep.groups && sweep.groups.length > 0
+        ? String((sweep.origin + sweep.groupsVisited) % sweep.groups.length)
+        : "0";
     if (resume !== this.persistedResume) {
       writeMaintenanceState(database, SWEEP_RESUME_KEY, resume);
       this.persistedResume = resume;
