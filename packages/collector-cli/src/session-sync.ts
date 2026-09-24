@@ -9,6 +9,7 @@ import type { CollectorConfig } from "./config";
 import { assertCollectorPrivacyMode, collectorBufferPath } from "./config";
 import { deterministicEventId } from "./normalizer";
 import { hasUnsafeOutboundString, sealOutboundSessionRow } from "./outbound-envelope";
+import { TransportError } from "./http-transport";
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import { chunkHistoryEnvelopes, postHistoryBatch } from "./upload-history";
 import { deliveryItemId } from "./delivery-ack";
@@ -1200,13 +1201,46 @@ export async function runSessionSync(
     );
     const task = (async () => {
       try {
+        const fencedFetch: typeof fetch = options.incremental ? async (request, init) => {
+          // A separate connection owns the write reservation. The borrowed
+          // ledger handle must remain free for intake; a mutation from that
+          // handle or another process cannot commit while bytes are in flight.
+          if (ledger.name === ":memory:") {
+            rows.forEach((row) => markStale(row.session.id));
+            throw new TransportError("source_changed");
+          }
+          const fence = new Database(ledger.name, { fileMustExist: true, timeout: 0 });
+          let locked = false;
+          try {
+            fence.exec("begin immediate");
+            locked = true;
+            const fresh = rows.every((row) => snapshotFresh(row.session.id));
+            if (!fresh) {
+              rows.forEach((row) => markStale(row.session.id));
+              throw new TransportError("source_changed");
+            }
+            return await fetchImpl(request, init);
+          } catch (error) {
+            if (error instanceof Error && "code" in error && error.code === "SQLITE_BUSY") {
+              rows.forEach((row) => markStale(row.session.id));
+              throw new TransportError("source_changed");
+            }
+            throw error;
+          } finally {
+            try {
+              if (locked) fence.exec("rollback");
+            } finally {
+              fence.close();
+            }
+          }
+        } : fetchImpl;
         const result = await postHistoryBatch({
           url,
           body,
           installKey: config.installKey,
           ingestKey: config.ingestKey,
           signingSecret: config.uploadSigningSecret,
-          fetchImpl,
+          fetchImpl: fencedFetch,
           sleep,
           maxAttempts,
           timeoutMs: config.delivery.requestTimeoutSeconds * 1_000,

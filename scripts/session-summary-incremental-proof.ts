@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import Database from "better-sqlite3";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { collectorConfigSchema } from "../packages/collector-cli/src/config";
@@ -147,7 +148,7 @@ async function reviewRegressions() {
     "first_read_insert", "fallback_checkpoint", "missing_dirty_marker", "privacy_before_send",
     "unrelated_revision", "retry_erasure", "hard_bounds", "session_id_paging",
     "privacy_lineage_first_read", "checkpoint_timeout", "future_horizon",
-    "interleaved_initial_insert", "trigger_upgrade",
+    "interleaved_initial_insert", "trigger_upgrade", "privacy_handoff_erasure",
   ];
   for (const name of cases) {
     if (selected && selected !== name) continue;
@@ -397,6 +398,56 @@ async function reviewRegressions() {
         assert.deepEqual(resumed.snapshot, collectSessionSnapshots(buffer.database, {
           until, sessionIds: [sessionId],
         })[0]);
+      } else if (name === "privacy_handoff_erasure") {
+        add(1);
+        buffer.database.pragma("busy_timeout = 0");
+        let transmitted: string | null = null;
+        const result = await runSessionSync(config, {
+          ledgerDb: buffer.database, incremental: true, sessionIds: [sessionId], until,
+          delayMs: 0, maxAttemptsPerBatch: 1,
+          fetchImpl: (async (_url, init) => {
+            const body = String(init?.body ?? "");
+            // This is the original review interleaving: erasure attempts to
+            // commit after body access but before the transport records send.
+            buffer.database.prepare("delete from buffered_events where id = ?").run(uuid(531));
+            transmitted = body;
+            return new Response(JSON.stringify(acceptedFixtureDelivery(body, installKey)), {
+              status: 200, headers: { "content-type": "application/json" },
+            });
+          }) as typeof fetch,
+          log: () => undefined,
+        });
+        assert.equal(transmitted, null, "a body crossed the handoff after erasure");
+        assert.equal(result.sentSessions, 0);
+        const external = new Database(buffer.database.name, { fileMustExist: true, timeout: 0 });
+        try {
+          let externalErasureBlocked = false;
+          let fullAtHandoff = 0;
+          const sent = await runSessionSync(config, {
+            ledgerDb: buffer.database, incremental: true, sessionIds: [sessionId], until,
+            delayMs: 0, maxAttemptsPerBatch: 1,
+            fetchImpl: (async (_url, init) => {
+              const body = String(init?.body ?? "");
+              try {
+                external.prepare("delete from buffered_events where id = ?").run(uuid(531));
+              } catch (error) {
+                externalErasureBlocked = error instanceof Error && "code" in error && error.code === "SQLITE_BUSY";
+              }
+              fullAtHandoff = collectSessionSnapshots(buffer.database, { until, sessionIds: [sessionId] })[0]?.events ?? 0;
+              return new Response(JSON.stringify(acceptedFixtureDelivery(body, installKey)), {
+                status: 200, headers: { "content-type": "application/json" },
+              });
+            }) as typeof fetch,
+            log: () => undefined,
+          });
+          assert.equal(externalErasureBlocked, true);
+          assert.equal(fullAtHandoff, 1);
+          assert.equal(sent.sentSessions, 1);
+          external.prepare("delete from buffered_events where id = ?").run(uuid(531));
+          assert.deepEqual(collectSessionSnapshots(buffer.database, { until, sessionIds: [sessionId] }), []);
+        } finally {
+          external.close();
+        }
       }
       console.log(JSON.stringify({ reviewCase: name, result: "PASS" }));
     } finally {
