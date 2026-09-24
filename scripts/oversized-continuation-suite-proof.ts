@@ -6,15 +6,17 @@ import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { isolatedEnvironment } from './run-proof';
 import { createProofCompletion } from './lib/proof-completion';
+import { subProofsOf } from './lib/proof-suites';
 
-const names = ['oversized-continuation-state-proof', 'oversized-continuation-transaction-proof',
-  'oversized-continuation-boundary-proof', 'oversized-continuation-ready-proof',
-  'oversized-continuation-provider-proof', 'oversized-continuation-cadence-proof', 'jsonl-read-generation-proof'];
-const completion = createProofCompletion('oversized-continuation-suite', names.length);
 const repo = path.resolve(import.meta.dirname, '..');
+// The run list is this suite's entry in scripts/proof-suites.json, which the CI
+// coverage gate also reads; completion needs one passing check per entry.
+const subProofs = subProofsOf(repo, 'scripts/oversized-continuation-suite-proof.ts');
+assert.ok(subProofs, 'scripts/proof-suites.json has no entry for this suite');
+const completion = createProofCompletion('oversized-continuation-suite', subProofs.length);
 const out = path.join(repo, 'evidence/oversized-continuation'); fs.mkdirSync(out, { recursive: true });
-for (const name of names) {
-  const entry = path.join(repo, 'scripts', name + '.ts');
+for (const file of subProofs) {
+  const name = path.basename(file, '.ts'), entry = path.join(repo, file);
   const hash = () => createHash('sha256').update(fs.readFileSync(entry)).digest('hex'), before = hash();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'oversized-suite-')), env = isolatedEnvironment(root);
   try {
@@ -34,7 +36,7 @@ for (const name of names) {
       else assert.equal(summary.receipts.length, 2);
     }
     fs.writeFileSync(path.join(out, name + '.json'), JSON.stringify({ sourceSha256: before, summary }, null, 2));
-    completion.check(name); console.log(JSON.stringify({ name, status: 'PASS' }));
+    completion.check(file); console.log(JSON.stringify({ name, status: 'PASS' }));
   } finally { fs.rmSync(root, { recursive: true, force: true }); }
 }
 completion.complete();
