@@ -119,10 +119,14 @@ export function recordMaintenanceDeadlineBlame(
   setStateValue(database, MAINTENANCE_PROGRESS_CHECKPOINT_KEY, JSON.stringify(checkpoint));
 }
 
-/** The two backlog counts, as plain read-only SQL (the daemon steps them off its main thread). */
-export const MAINTENANCE_BACKLOG_QUERIES = {
+/**
+ * One census as plain read-only SQL: the two backlog counts and the kill
+ * counter they are judged against (the daemon reads them off its main thread).
+ */
+export const MAINTENANCE_CENSUS_QUERIES = {
   fillPendingEventLinks: `select count(*) as n from repo_context_event_links where fill_pending = 1`,
   dirtyEnrichmentSessions: `select count(*) as n from repo_enrichment_dirty`,
+  deadlineKills: `select coalesce((select value from maintenance_state where key = '${MAINTENANCE_DEADLINE_KILLS_KEY}'), '0') as n`,
 } as const;
 
 /** Backlog census over the enrichment queues; missing tables count as zero. */
@@ -140,16 +144,13 @@ export function maintenanceBacklogSnapshot(database: Database.Database): {
     }
   };
   return {
-    fillPendingEventLinks: count(MAINTENANCE_BACKLOG_QUERIES.fillPendingEventLinks),
-    dirtyEnrichmentSessions: count(MAINTENANCE_BACKLOG_QUERIES.dirtyEnrichmentSessions),
+    fillPendingEventLinks: count(MAINTENANCE_CENSUS_QUERIES.fillPendingEventLinks),
+    dirtyEnrichmentSessions: count(MAINTENANCE_CENSUS_QUERIES.dirtyEnrichmentSessions),
   };
 }
 
-/** `backlog` lets a caller pass a census it read elsewhere; by default it is counted here. */
-export function maintenanceStarvationReceipt(
-  database: Database.Database,
-  backlog: MaintenanceStarvationReceipt["backlog"] = maintenanceBacklogSnapshot(database),
-): MaintenanceStarvationReceipt {
+/** The receipt fields read in place: single-row lookups. */
+function durableStarvationFields(database: Database.Database) {
   const killsRaw = Number(stateValue(database, MAINTENANCE_DEADLINE_KILLS_KEY) ?? "0");
   const deadlineKills = Number.isSafeInteger(killsRaw) && killsRaw >= 0 ? killsRaw : 0;
   const lastDeadlineKillAt = stateValue(database, MAINTENANCE_LAST_DEADLINE_KILL_AT_KEY);
@@ -174,11 +175,52 @@ export function maintenanceStarvationReceipt(
     deadlineKills,
     lastDeadlineKillAt,
     lastCheckpoint,
-    backlog,
     gitContext: {
       committedTotal: safeCount(stateValue(database, GIT_CONTEXT_COMMITTED_KEY)),
       lastDeferred: safeCount(stateValue(database, GIT_CONTEXT_DEFERRED_KEY)),
     },
-    starving: deadlineKills > 0 && (backlog.fillPendingEventLinks > 0 || backlog.dirtyEnrichmentSessions > 0),
+  };
+}
+
+function starvingFrom(deadlineKills: number, backlog: MaintenanceStarvationReceipt["backlog"]) {
+  return deadlineKills > 0 && (backlog.fillPendingEventLinks > 0 || backlog.dirtyEnrichmentSessions > 0);
+}
+
+export function maintenanceStarvationReceipt(database: Database.Database): MaintenanceStarvationReceipt {
+  const fields = durableStarvationFields(database);
+  const backlog = maintenanceBacklogSnapshot(database);
+  return { ...fields, backlog, starving: starvingFrom(fields.deadlineKills, backlog) };
+}
+
+/** A backlog census and the kill counter it is judged against, read together. */
+export type MaintenanceStarvationCensus = {
+  backlog: MaintenanceStarvationReceipt["backlog"];
+  deadlineKills: number;
+  /** When the census started reading. */
+  observedAt: string;
+};
+
+/**
+ * The daemon's /status receipt (eco-6hoxj.163.24): the durable fields read in
+ * place, and the backlog with `starving` from the last completed census, which
+ * runs off the event loop and so is labeled with its own time. Until a census
+ * completes both are null; the daemon never counts the queues on its event loop.
+ */
+export type MaintenanceStarvationStatus = Omit<MaintenanceStarvationReceipt, "backlog" | "starving"> & {
+  backlog: MaintenanceStarvationReceipt["backlog"] | null;
+  backlogObservedAt: string | null;
+  /** Judged from one census: its kill count and its backlog. */
+  starving: boolean | null;
+};
+
+export function maintenanceStarvationStatus(
+  database: Database.Database,
+  census: MaintenanceStarvationCensus | null,
+): MaintenanceStarvationStatus {
+  return {
+    ...durableStarvationFields(database),
+    backlog: census?.backlog ?? null,
+    backlogObservedAt: census?.observedAt ?? null,
+    starving: census ? starvingFrom(census.deadlineKills, census.backlog) : null,
   };
 }
