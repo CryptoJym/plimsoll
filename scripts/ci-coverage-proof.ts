@@ -37,7 +37,7 @@
  *   local-only proof really needs the input it declares;
  * - GitHub settings: repository variables, rulesets and required checks.
  *
- * CI runs it through `./node_modules/.bin/tsx scripts/run-proof.ts
+ * CI runs it through `node ./node_modules/tsx/dist/cli.mjs scripts/run-proof.ts
  * scripts/ci-coverage-proof.ts`, not pnpm, so no pnpm setting can turn the
  * gate itself into a no-op.
  * Locally: pnpm proof:ci-coverage [--audit-only]
