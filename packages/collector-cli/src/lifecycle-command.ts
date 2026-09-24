@@ -24,6 +24,44 @@ function keepOption(argv: readonly string[]) {
   return Number(value);
 }
 
+/** The only options `lifecycle update|rollback` take; each is followed by its value. */
+const UPDATE_VALUE_OPTIONS = ["--operation-id", "--artifact", "--artifact-version", "--readiness-timeout-ms", "--retention"];
+
+/**
+ * `--retention keep-all` (lifecycle update and rollback only): the operation
+ * removes no snapshot, runtime, trash entry or receipt, and its receipt
+ * records what retention would have removed. Update and rollback, which
+ * prune by default, accept no other option than theirs, so a misspelled flag
+ * (`--keep-all`, `--retension keep-all`) fails before any change instead of
+ * falling back to pruning; so do a missing or other value, a repeated or
+ * `=`-joined flag, and the flag on any other action.
+ */
+export function lifecycleRetentionKeepAll(argv: readonly string[]) {
+  if (argv.some((arg) => arg.startsWith("--retention") && arg !== "--retention")) {
+    throw new Error("--retention takes its value as the next argument: --retention keep-all");
+  }
+  const [action] = argv;
+  if (action === "update" || action === "rollback") {
+    for (let position = 1; position < argv.length; position += 1) {
+      const arg = argv[position]!;
+      if (UPDATE_VALUE_OPTIONS.includes(arg)) {
+        position += 1;
+      } else if (!(action === "update" && arg === "--preflight")) {
+        throw new Error(`lifecycle ${action} does not take ${JSON.stringify(arg)}; its options are ` +
+          `${UPDATE_VALUE_OPTIONS.join(", ")}${action === "update" ? " and --preflight" : ""}`);
+      }
+    }
+  }
+  const index = argv.indexOf("--retention");
+  if (index < 0) return false;
+  if (argv.indexOf("--retention", index + 1) >= 0) throw new Error("--retention may be given only once");
+  if (argv[0] !== "update" && argv[0] !== "rollback") {
+    throw new Error("--retention applies only to lifecycle update and rollback");
+  }
+  if (argv[index + 1] !== "keep-all") throw new Error("--retention accepts only keep-all");
+  return true;
+}
+
 /** Injectable command boundary used by the packaged installer. */
 export async function runLifecycleCommand(input: {
   argv: readonly string[];

@@ -44,7 +44,9 @@ remain gated under
 # Pin the currently running packaged bundle as the immutable runtime, repoint
 # the owned LaunchAgent manifest at it, verify durable readiness; any failure
 # restores the previous runtime, config, database, and manifest automatically.
-npx @plimsoll/cli@<version> lifecycle update --operation-id <id> --artifact self
+# A healthy update then keeps the two newest update snapshots and removes older
+# ones; --retention keep-all removes nothing (prune later, below).
+npx @plimsoll/cli@<version> lifecycle update --operation-id <id> --artifact self --retention keep-all
 
 # Afterwards, restart the daemon on the new immutable runtime explicitly:
 npx @plimsoll/cli@<version> load-launch-agent

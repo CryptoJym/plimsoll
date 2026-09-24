@@ -180,6 +180,7 @@ export type LifecycleRetentionRecord = {
     | "completion_order_unproven"
     | "removal_record_unreadable"
     | "retention_failed"
+    | "skipped_by_operator"
     | null;
   removed: LifecycleRemovedItem[];
   removedBytes: number;
@@ -187,6 +188,12 @@ export type LifecycleRetentionRecord = {
   recovered: LifecycleRemovedItem[];
   keptSnapshots: string[];
   keptVersions: string[];
+  /**
+   * Only with `skipped_by_operator` (`--retention keep-all`): what retention
+   * would have removed at that moment, of which nothing was. Absent when that
+   * read-only preview was blocked or could not be computed.
+   */
+  wouldRemove?: LifecycleRemovedItem[];
 };
 
 export type LifecycleSnapshotState = "completed" | "rolled_back" | "in_progress" | "rollback_required" | "unknown";
@@ -699,7 +706,7 @@ const CLONE_FALLBACK_VALUES: readonly (LifecycleCloneFallback | null)[] = [
 ];
 const RETENTION_SKIPPED_REASONS = [
   "lifecycle_state_unreadable", "journal_unreadable", "completion_order_unproven", "removal_record_unreadable",
-  "retention_failed",
+  "retention_failed", "skipped_by_operator",
 ];
 const MAX_RECEIPT_LIST = 100_000;
 
@@ -758,12 +765,19 @@ function validRetentionRecord(value: unknown) {
   const record = ownPlainRecord(value);
   if (!record || !exactKeys(record, [
     "keepSnapshots", "status", "skippedReason", "removed", "removedBytes", "recovered", "keptSnapshots", "keptVersions",
-  ])) return false;
+  ], ["wouldRemove"])) return false;
   if (!nonnegativeInteger(record.keepSnapshots) || record.keepSnapshots < 1 ||
       record.keepSnapshots > LIFECYCLE_MAX_RETAINED_SNAPSHOTS) return false;
   if (!boundedList(record.removed, isRemovedItem) || !boundedList(record.recovered, isRemovedItem)) return false;
   if (!boundedList(record.keptSnapshots, isIdentifier) || !boundedList(record.keptVersions, isIdentifier)) return false;
   if (record.removedBytes !== record.removed.reduce((total, item) => total + item.bytes, 0)) return false;
+  // An operator keep-all removed and recovered nothing; only it may carry the preview.
+  if (record.skippedReason === "skipped_by_operator") {
+    if (record.recovered.length > 0) return false;
+    if ("wouldRemove" in record && !boundedList(record.wouldRemove, isRemovedItem)) return false;
+  } else if ("wouldRemove" in record) {
+    return false;
+  }
   if (record.status === "applied") return record.skippedReason === null;
   return record.status === "skipped" && RETENTION_SKIPPED_REASONS.includes(record.skippedReason as string) &&
     record.removed.length === 0;
