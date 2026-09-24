@@ -36,6 +36,12 @@ export function isLoopbackHostname(hostname: string) {
 // consult that setting, and cannot inherit a proxy-enabled global agent.
 const directHttpAgent = new http.Agent({ keepAlive: true });
 const directHttpsAgent = new https.Agent({ keepAlive: true });
+const DIRECT_CONNECT_TIMEOUT_MS = 10_000;
+const DIRECT_HEADERS_TIMEOUT_MS = 300_000;
+
+function directTimeoutError(code: "UND_ERR_CONNECT_TIMEOUT" | "UND_ERR_HEADERS_TIMEOUT") {
+  return Object.assign(new Error(code), { code });
+}
 
 function directLoopbackFetch(url: URL, init: RequestInit): Promise<Response> {
   const body = init.body;
@@ -51,10 +57,14 @@ function directLoopbackFetch(url: URL, init: RequestInit): Promise<Response> {
   const agent = url.protocol === "https:" ? directHttpsAgent : directHttpAgent;
   const request = url.protocol === "https:" ? https.request : http.request;
   return new Promise<Response>((resolve, reject) => {
+    let connectTimer: ReturnType<typeof setTimeout>;
+    let headersTimer: ReturnType<typeof setTimeout>;
+    const clearDeadlines = () => { clearTimeout(connectTimer); clearTimeout(headersTimer); };
     const outgoing = request(url, {
       method: init.method ?? "GET", headers: Object.fromEntries(headers),
       agent, signal: init.signal ?? undefined,
     }, (incoming) => {
+      clearDeadlines();
       try {
         const responseHeaders = new Headers();
         for (const [name, values] of Object.entries(incoming.headers)) {
@@ -74,7 +84,23 @@ function directLoopbackFetch(url: URL, init: RequestInit): Promise<Response> {
         reject(error);
       }
     });
-    outgoing.once("error", reject);
+    connectTimer = setTimeout(() => outgoing.destroy(directTimeoutError("UND_ERR_CONNECT_TIMEOUT")),
+      DIRECT_CONNECT_TIMEOUT_MS);
+    headersTimer = setTimeout(() => outgoing.destroy(directTimeoutError("UND_ERR_HEADERS_TIMEOUT")),
+      DIRECT_HEADERS_TIMEOUT_MS);
+    outgoing.once("socket", (socket) => {
+      const connected = () => clearTimeout(connectTimer);
+      if (url.protocol === "https:" &&
+          (socket as typeof socket & { secureConnecting?: boolean }).secureConnecting) {
+        socket.once("secureConnect", connected);
+      } else if (socket.connecting) {
+        socket.once("connect", connected);
+      } else {
+        connected();
+      }
+    });
+    outgoing.once("error", (error) => { clearDeadlines(); reject(error); });
+    outgoing.once("close", clearDeadlines);
     outgoing.end(body ?? undefined);
   });
 }

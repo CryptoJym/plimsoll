@@ -47,6 +47,7 @@
     "proof:delivery": "tsx scripts/delivery-transport-proof.ts",
     "proof:loopback-proxy": "tsx scripts/run-proof.ts scripts/loopback-proxy-proof.ts",
     "proof:managed-curl-proxy": "tsx scripts/run-proof.ts scripts/managed-curl-proxy-proof.ts",
+    "proof:direct-loopback-timeout": "tsx scripts/run-proof.ts scripts/direct-loopback-timeout-proof.ts",
     "proof:capture-claim": "tsx scripts/run-proof.ts scripts/capture-claim-proof.ts",
     "proof:capture-claim-review": "tsx scripts/run-proof.ts scripts/capture-claim-review-proof.ts",
     "proof:capture-claim-review-r4": "tsx scripts/run-proof.ts scripts/capture-claim-review-r4-proof.ts",
