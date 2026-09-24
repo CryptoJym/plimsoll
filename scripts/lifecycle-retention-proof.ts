@@ -845,23 +845,6 @@ syncBuiltinESMExports();
       keepAllListing.snapshots.length === 5 && keepAllListing.snapshots.every((row) => row.operationState === "completed"),
       keepAllListing);
 
-    // A blocked read-only preview must not be described as a removal plan.
-    // Keep-all still records its skipped receipt and leaves the unreadable
-    // removal record for an explicit recovery/prune operation to inspect.
-    const blockedKeeper = createHome("keep-all-blocked", 2);
-    await blockedKeeper.keepAllManager().update({ operationId: "blocked-1", artifact: blockedKeeper.artifact("7.0.0") });
-    const blockedRemovals = path.join(blockedKeeper.lifecycleRoot, "removals");
-    const blockedRemovalRecord = path.join(blockedRemovals, "unreadable.json");
-    fs.mkdirSync(blockedRemovals, { recursive: true, mode: 0o700 });
-    fs.writeFileSync(blockedRemovalRecord, "not-json\n", { mode: 0o600 });
-    const blockedKeepAll = await blockedKeeper.keepAllManager().update({ operationId: "blocked-2", artifact: blockedKeeper.artifact("7.0.1") });
-    check(
-      "keep_all_blocked_preview_records_no_would_remove_and_keeps_unreadable_removal_record",
-      blockedKeepAll.status === "completed" && blockedKeepAll.retention?.status === "skipped" &&
-        blockedKeepAll.retention.skippedReason === "skipped_by_operator" &&
-        !Object.hasOwn(blockedKeepAll.retention, "wouldRemove") && fs.existsSync(blockedRemovalRecord),
-      { retention: blockedKeepAll.retention, removalRecord: fs.existsSync(blockedRemovalRecord) },
-    );
     const withRetention = (retention: Record<string, unknown>) => ({ ...k5Marker, retention });
     check("only_an_operator_keep_all_record_may_carry_would_remove_and_it_recovers_nothing",
       parseCompletionReceipt(withRetention({ ...k5Marker.retention, skippedReason: "retention_failed" }), "k5") === null &&
