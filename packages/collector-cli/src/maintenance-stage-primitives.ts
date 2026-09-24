@@ -5,6 +5,12 @@ import {
   advanceFinanceRetentionWatermarks,
   type FinanceCoverageMutationRow,
 } from "./history-coverage";
+import {
+  backfillSessionContextIndex,
+  sessionContextIndexState,
+  type SessionContextIndexState,
+} from "./session-context-index";
+import { isSqliteContentionError } from "./sqlite-contention";
 
 export const MAINTENANCE_STAGES = [
   "retention_deletion",
@@ -35,6 +41,8 @@ type TimedOptions = {
   remainingMs: number;
   batchSize: number;
   now?: () => number;
+  /** Wall clock used only for persisted timestamps; deadlines stay monotonic. */
+  wallNow?: () => number | Date;
 };
 
 const PENDING_EVENT_LINK_CONTEXT_LIMIT = 8;
@@ -132,7 +140,7 @@ function advance(
 
 export function runRetentionDeletionStage(
   database: Database.Database,
-  options: TimedOptions & { retentionDays: number; parityReady: boolean; wallNow?: () => number;
+  options: TimedOptions & { retentionDays: number; parityReady: boolean;
     prune?: (maxRows: number) => { events: number; metricSamples: number } },
 ): BoundedStageResult {
   ensureMaintenanceStageSchema(database);
@@ -150,7 +158,8 @@ export function runRetentionDeletionStage(
       // Older rowid cursor receipts are safely replaced by the observed-time scan.
     }
   }
-  const wallNow = options.wallNow?.() ?? Date.now();
+  const wallReading = options.wallNow?.();
+  const wallNow = wallReading instanceof Date ? wallReading.getTime() : wallReading ?? Date.now();
   const cutoff = new Date(wallNow - Math.max(0, options.retentionDays) * 86_400_000).toISOString();
   const rows = options.prune ? (() => {
     const receipt = options.prune(adaptiveBatchSize);
@@ -299,6 +308,63 @@ export function runEnrichmentStage(
   return timer.result(result.rowsVisited);
 }
 
+/** Wall time one maintenance job may give the context-index backfill. */
+export const SESSION_CONTEXT_BACKFILL_STAGE_MS = 250;
+/** Maximum rows one deadline slice may hold in a write transaction. */
+export const SESSION_CONTEXT_BACKFILL_UNIT_ROWS = 32;
+/** Do not let optional index repair inherit the worker's 900 ms busy wait. */
+export const SESSION_CONTEXT_BACKFILL_LOCK_WAIT_MS = 0;
+
+export type SessionContextBackfillStageResult = BoundedStageResult & {
+  state: SessionContextIndexState;
+  /** A busy writer deferred the rest of this slice to the next job. */
+  contended: boolean;
+};
+
+/**
+ * Backfill the capture-time session context index in short write
+ * transactions of `batchSize` repo-bearing rows until the budget is spent or
+ * the walk completes. A complete index costs one control-row read. This is
+ * optional one-time work, so writer contention ends the slice instead of
+ * failing the maintenance job.
+ */
+export function runSessionContextBackfillStage(
+  database: Database.Database,
+  options: TimedOptions,
+): SessionContextBackfillStageResult {
+  const timer = budget(options);
+  const batchSize = Math.min(boundedBatchSize(options.batchSize), SESSION_CONTEXT_BACKFILL_UNIT_ROWS);
+  let state = sessionContextIndexState(database);
+  let rows = 0;
+  let contended = false;
+  while (state === "backfilling" && timer.canStart()) {
+    let batch: ReturnType<typeof backfillSessionContextIndex>;
+    const priorBusyTimeout = database.pragma("busy_timeout", { simple: true }) as number;
+    database.pragma(`busy_timeout = ${SESSION_CONTEXT_BACKFILL_LOCK_WAIT_MS}`);
+    try {
+      batch = backfillSessionContextIndex(database, batchSize, {
+        now: () => {
+          const wallReading = options.wallNow?.();
+          return wallReading instanceof Date ? wallReading : new Date(wallReading ?? Date.now());
+        },
+        shouldContinue: timer.canStart,
+      });
+    } catch (error) {
+      if (!isSqliteContentionError(error)) throw error;
+      contended = true;
+      break;
+    } finally {
+      database.pragma(`busy_timeout = ${Math.max(0, Math.trunc(priorBusyTimeout || 0))}`);
+    }
+    state = batch.state;
+    rows += batch.visited;
+    // The injected clock (or a busy host) may expire before the first row of
+    // a unit. Retrying the same unit in this invocation cannot make progress.
+    if (batch.visited === 0 && state === "backfilling") break;
+  }
+  return { ...timer.result(rows, batchSize), state, contended };
+}
+
 export type EnrichmentMaintenanceJobResult = BoundedStageResult & {
   skipped: boolean;
   timedOut: boolean;
@@ -319,6 +385,8 @@ export function runEnrichmentMaintenanceJob(
 export type DeadlineMaintenanceStagesResult = {
   remainingMs: number;
   stages: Array<{ stage: "wal_checkpoint" | "retention" | "fill_pending_event_links" } & BoundedStageResult>;
+  /** Absent when an earlier stage's progress was refused. */
+  sessionContextIndex?: SessionContextBackfillStageResult;
 };
 
 export function runDeadlineMaintenanceStages(
@@ -358,8 +426,12 @@ export function runDeadlineMaintenanceStages(
   const pending = runPendingEventLinkFillStage(database, {
     remainingMs: remaining(), batchSize: 256, now,
   });
-  emit("fill_pending_event_links", pending);
-  return { remainingMs: remaining(), stages };
+  if (!emit("fill_pending_event_links", pending)) return { remainingMs: remaining(), stages };
+  // One-time migration work; it sends no progress frame of its own.
+  const sessionContextIndex = runSessionContextBackfillStage(database, {
+    remainingMs: Math.min(SESSION_CONTEXT_BACKFILL_STAGE_MS, remaining()), batchSize: 500, now,
+  });
+  return { remainingMs: remaining(), stages, sessionContextIndex };
 }
 
 export function runGitContextStage(

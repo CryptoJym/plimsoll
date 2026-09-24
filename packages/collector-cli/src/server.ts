@@ -40,6 +40,7 @@ import {
 import { saveCollectorConfig } from "./config";
 import type { CollectorRuntimeIdentity } from "./runtime-ownership";
 import { codexReconciliationStatus } from "./codex-reconciliation";
+import { sessionContextIndexStatus } from "./session-context-index";
 import { historyCoverageStatus } from "./history-coverage";
 import { captureBaselineStatus } from "./capture-baseline";
 import {
@@ -1125,6 +1126,9 @@ export function createCollectorServer(
       ingestIntegrity: refreshControl ? buffer.eventCollisionSummary() : cachedControl?.ingestIntegrity ?? null,
       delivery,
       reconciliation: refreshControl ? codexReconciliationStatus(buffer.database) : cachedControl?.reconciliation ?? null,
+      // Capture-time session context index: size and backfill progress.
+      sessionAttribution: refreshControl ? sessionContextIndexStatus(buffer.database)
+        : cachedControl?.sessionAttribution ?? null,
       maintenance,
       captureHealth: status.health ?? null,
       historyCoverage,
@@ -1205,6 +1209,7 @@ export function createCollectorServer(
       stats: null,
       delivery: buffer.delivery.status(),
       reconciliation: codexReconciliationStatus(buffer.database),
+      sessionAttribution: sessionContextIndexStatus(buffer.database),
       maintenance: options.maintenanceStatus?.() ?? null,
       historyCoverage: historyCoverageStatus(buffer.database),
       captureBaseline: captureBaselineStatus(buffer.database),
@@ -1375,6 +1380,7 @@ export function createCollectorServer(
             stats: null,
             delivery: null,
             reconciliation: null,
+            sessionAttribution: null,
             maintenance: options.maintenanceStatus?.() ?? null,
             historyCoverage: null,
             captureBaseline: null,
