@@ -1,5 +1,5 @@
 /**
- * Busy-host capture proof (eco-6hoxj.163.42, rounds 2 to 4).
+ * Busy-host capture proof (eco-6hoxj.163.42, rounds 2 to 5).
  *
  * Each scenario is a regression for a reviewer finding, built from the
  * reviewer's own construction:
@@ -11,7 +11,8 @@
  *              front of every cadence; three busy real sources behind slow
  *              reads all commit. Bookkeeping before capture that spends the
  *              allowance on every capture-first cadence cannot keep the
- *              leaders out (round 4).
+ *              leaders out (round 4), and the baseline status it spends is
+ *              answered from a covering index (round 5).
  *   ceiling    200 ms is an admission ceiling: no capture or repair unit
  *              starts after it, and a cadence ends within one bounded unit
  *              of it. Grok discovery of a 2,000-session group with a slow
@@ -38,7 +39,7 @@ import os from "node:os";
 import path from "node:path";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
-import { captureBaselineStatus } from "../packages/collector-cli/src/capture-baseline";
+import * as captureBaseline from "../packages/collector-cli/src/capture-baseline";
 import { AUTOMATIC_CAPTURE_LIMITS, CaptureWorkBudget } from "../packages/collector-cli/src/capture-work-budget";
 import { GROK_USAGE_LIMITS, GrokUsageTailer, ensureGrokUsageState } from "../packages/collector-cli/src/grok-usage-tailer";
 import { DEFAULT_JSONL_TAILER_IO } from "../packages/collector-cli/src/jsonl-byte-tailer";
@@ -407,6 +408,32 @@ async function slowBookkeeping(root: string) {
     { preCaptureMs: ticks.map((row) => row.preCaptureMs), deniedCadences: fairness?.deniedCadences ?? null });
 }
 
+/**
+ * Round 5 (should-fix): the capture-baseline status aggregate runs before
+ * every capture leader and on the collector parent's status refresh. It is
+ * answered from its covering index instead of reading every generation row,
+ * which took about 0.6 s at 200,000 generations per source.
+ */
+function baselineStatusPlan(root: string) {
+  const buffer = new LocalEventBuffer(path.join(root, "baseline-plan.sqlite"));
+  let plan: string[] = [];
+  let error: string | null = null;
+  try {
+    captureBaseline.ensureCaptureBaselineSchema(buffer.database);
+    const sql = (captureBaseline as { CAPTURE_BASELINE_GENERATION_STATUS_SQL?: string }).CAPTURE_BASELINE_GENERATION_STATUS_SQL;
+    if (!sql) throw new Error("status_aggregate_not_exported");
+    plan = (buffer.database.prepare(`explain query plan ${sql}`).all("codex", "run") as Array<{ detail: string }>)
+      .map((row) => row.detail);
+  } catch (caught) {
+    error = (caught as Error).message;
+  } finally {
+    buffer.close();
+  }
+  receipts.baselineStatusPlan = { plan, error };
+  check("progress", "the_baseline_status_aggregate_reads_only_its_covering_index",
+    plan.length === 1 && plan[0]!.includes("USING COVERING INDEX idx_capture_baseline_generation_status"), { plan, error });
+}
+
 async function busyHost(root: string) {
   const REPAIR_MS = 220;
   const READ_MS = 120;
@@ -482,7 +509,7 @@ async function busyHost(root: string) {
       observations.push({
         tick,
         wallMs: virtualNow() - tickStartedAt,
-        baseline: captureBaselineStatus(buffer.database).status,
+        baseline: captureBaseline.captureBaselineStatus(buffer.database).status,
         codex: source(result.rollout),
         claude: source(result.transcript),
         grok: source(result.grok),
@@ -490,7 +517,7 @@ async function busyHost(root: string) {
         budget: maintenance.status().budget,
         order: (result as { captureTurn?: { order: Source[] } }).captureTurn?.order ?? null,
       });
-      if (liveWrittenAfterTick === null && captureBaselineStatus(buffer.database).status === "complete") {
+      if (liveWrittenAfterTick === null && captureBaseline.captureBaselineStatus(buffer.database).status === "complete") {
         // Post-enrollment work arrives: twenty large generations per source,
         // far more than any cadence can commit.
         pause(25);
@@ -741,17 +768,16 @@ async function boundedChurn(root: string, order: "name-hash" | "directory") {
   });
   // Three present sessions at two a pass: the sweep they began takes two passes.
   const boundPasses = 2;
-  const passes: Array<{ pass: number; targetSeen: boolean; sessionsOverLimit: number; sessionsDeferred: number }> = [];
+  const passes: Array<{ pass: number; targetSeen: boolean; sessionsOverLimit: number }> = [];
   let seenAtPass: number | null = null;
   for (let pass = 0; pass < 10; pass += 1) {
     const active = churn.slice(pass * 2, pass * 2 + 2);
     for (const name of active) fs.mkdirSync(path.join(groupDirectory, name), { mode: 0o700 });
     const scan = await tailer.scan({ budget: roomyBudget() });
-    const files = scan.activity.scan.usageFiles as { sessionsOverLimit?: number; sessionsDeferred?: number };
+    const files = scan.activity.scan.usageFiles as { sessionsOverLimit?: number };
     const seen = grokTurnSeen(buffer, target);
     if (seen && seenAtPass === null) seenAtPass = pass + 1;
-    passes.push({ pass, targetSeen: seen, sessionsOverLimit: files.sessionsOverLimit ?? 0,
-      sessionsDeferred: files.sessionsDeferred ?? 0 });
+    passes.push({ pass, targetSeen: seen, sessionsOverLimit: files.sessionsOverLimit ?? 0 });
     for (const name of active) fs.rmSync(path.join(groupDirectory, name), { recursive: true, force: true });
     // Order creation times after this pass unambiguously (ms resolution).
     pause(3);
@@ -900,16 +926,13 @@ async function lossless(root: string) {
       { ...GROK_USAGE_LIMITS, entriesPerPass: 6, discoveryWallMs: 1_000 });
     await tailer.scan({ budget: roomyBudget() });
     tailer.close();
-    const hasVisits = restartBuffer.database.prepare(
-      "select 1 from sqlite_master where type = 'table' and name = 'grok_usage_walk_visits'",
-    ).get() !== undefined;
-    const rows = hasVisits ? restartBuffer.database.prepare(
-      "select group_hash || ':' || session_hash as row from grok_usage_walk_visits",
-    ).all() as Array<{ row: string }> : [];
-    stateSnapshots.push([state(restartBuffer, "grok_usage_walk_round_v1") ?? "", ...rows.map((row) => row.row)].join("\n"));
+    stateSnapshots.push(state(restartBuffer, "grok_usage_walk_round_v1") ?? "");
   }
   const restartSeen = restartSessions.filter((sessionId) => grokTurnSeen(restartBuffer, sessionId)).length;
   const restartEvents = grokEvents(restartBuffer);
+  const coveredNamesTable = restartBuffer.database.prepare(
+    "select 1 from sqlite_master where type = 'table' and name = 'grok_usage_walk_visits'",
+  ).get() !== undefined;
   restartBuffer.close();
   check("lossless", "a_walk_restarted_every_scan_reaches_every_session_once",
     restartSeen === restartSessions.length && restartEvents === restartSessions.length,
@@ -917,8 +940,12 @@ async function lossless(root: string) {
   const leaks = stateSnapshots.filter((snapshot) =>
     snapshot.includes("private-") || snapshot.includes("Users") || snapshot.includes(path.sep) ||
     restartSessions.some((sessionId) => snapshot.includes(sessionId)));
-  const shapes = stateSnapshots.every((snapshot) => snapshot.split("\n").slice(1).every((row) =>
-    /^[0-9a-f]{32}:([0-9a-f]{32})?$/.test(row)));
+  // The walk state is one cursor of name hashes; round 3's table of covered names is gone.
+  const shapes = stateSnapshots.every((snapshot) => {
+    const cursor = (JSON.parse(snapshot || "null") as { cursor?: { group: string; session: string } | null } | null)
+      ?.cursor ?? null;
+    return cursor === null || (/^[0-9a-f]{32}$/.test(cursor.group) && /^([0-9a-f]{32}|~)?$/.test(cursor.session));
+  }) && !coveredNamesTable;
   check("lossless", "the_durable_walk_state_names_no_group_or_session",
     stateSnapshots.length > 0 && leaks.length === 0 && shapes, { snapshots: stateSnapshots.length, leaks: leaks.length });
   receipts.lossless = { cappedScans, sessionsOverLimit, groupsOverLimit, sparseScans, recentSeen,
@@ -933,6 +960,7 @@ async function main() {
       await failingLeader(root, "capture");
       await failingLeader(root, "repair");
       await slowBookkeeping(root);
+      baselineStatusPlan(root);
     }
     if (scenario === "all" || scenario === "progress" || scenario === "ceiling") await busyHost(path.join(root, "busy"));
     if (scenario === "all" || scenario === "ceiling") await grokDiscoveryBound(root);
