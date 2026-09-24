@@ -56,6 +56,25 @@ const EXECUTION_WORD = new RegExp(`(?<![A-Za-z0-9_])(?:${EXECUTION_ENV.join("|")
 const CONFIG_WORD = /(?<![A-Za-z0-9_])p?npm_config_\w*/i;
 export const changesExecution = (name: string) => EXECUTION_WORD.test(name) || CONFIG_WORD.test(name);
 
+/**
+ * A quarantine (a known-red proof) lasts at most this many days from today,
+ * then the gate fails until the proof is repaired or the entry is renewed.
+ */
+export const MAX_QUARANTINE_DAYS = 30;
+const DAY_MS = 86_400_000;
+/** Milliseconds of a real calendar date written YYYY-MM-DD, or null. */
+function calendarDay(text: string): number | null {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(text)) return null;
+  const time = Date.parse(`${text}T00:00:00Z`);
+  return Number.isNaN(time) || new Date(time).toISOString().slice(0, 10) !== text ? null : time;
+}
+/**
+ * Variables CI or the proof harness always sets, so a proof that needs only
+ * these can run in CI and is not local-only.
+ */
+const PROVIDED_IN_CI =
+  /^(?:CI|HOME|USERPROFILE|PATH|TMPDIR|TEMP|TMP|USER|SHELL|LANG|TZ|PWD|GITHUB_\w+|RUNNER_\w+|ACTIONS_\w+|XDG_\w+|PLIMSOLL_PROOF_\w+|PLIMSOLL_FIXTURE_ROOT|PLIMSOLL_HOME|CODEX_HOME|CLAUDE_CONFIG_DIR|GROK_HOME)$/;
+
 /** Actions a proof job may run before its last proof: checkout, pnpm and Node setup, evidence upload. */
 const KNOWN_ACTIONS = ["actions/checkout", "actions/setup-node", "pnpm/action-setup", "actions/upload-artifact"];
 const actionName = (uses: string) => uses.split("@")[0]!.split("/").slice(0, 2).join("/");
@@ -111,7 +130,7 @@ export type UnitCoverage = {
   covered: Invocation[];
   ignored: Array<Invocation & { reason: string }>;
   status: UnitStatus;
-  exception: Record<string, string> | null;
+  exception: Record<string, unknown> | null;
 };
 
 export type CoverageReport = {
@@ -388,24 +407,56 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
         errors.push(`${where}: ${PROOF_SUITES} declares it as a sub-proof of ${suiteOf.get(unitId)} (remove one)`);
         continue;
       }
-      if (!isRecord(raw) || Object.values(raw).some((value) => typeof value !== "string")) {
-        errors.push(`${where}: entry must be a mapping of strings`);
+      const fields = section === "localOnly" ? ["owner", "needs", "reason"] : ["owner", "expires", "reason"];
+      if (!isRecord(raw)) {
+        errors.push(`${where}: entry must be a mapping of ${fields.join(", ")}`);
         continue;
       }
-      const entry = raw as Record<string, string>;
-      const required = section === "localOnly" ? ["reason", "owner"] : ["reason", "owner", "expires"];
-      const missing = required.filter((field) => !entry[field]?.trim());
-      if (missing.length > 0) {
-        errors.push(`${where}: missing ${missing.join(", ")}`);
+      const entry = raw;
+      const unknownFields = Object.keys(entry).filter((field) => !fields.includes(field));
+      const missing = fields.filter((field) =>
+        field === "needs" ? !Array.isArray(entry.needs) || entry.needs.length === 0 : typeof entry[field] !== "string" || !entry[field].trim(),
+      );
+      if (unknownFields.length > 0 || missing.length > 0) {
+        const parts = [missing.length > 0 ? `missing ${missing.join(", ")}` : "", unknownFields.length > 0 ? `unknown ${unknownFields.join(", ")}` : ""];
+        const hint = section === "localOnly" && missing.includes("needs")
+          ? " (local-only is for a proof that needs an input CI lacks; a proof that simply fails belongs under quarantined, with an expiry)"
+          : "";
+        errors.push(`${where}: ${parts.filter(Boolean).join("; ")}${hint}`);
         continue;
       }
       if (section === "quarantined") {
-        if (!/^\d{4}-\d{2}-\d{2}$/.test(entry.expires!)) {
-          errors.push(`${where}: expires must be YYYY-MM-DD`);
+        const expires = calendarDay(entry.expires as string);
+        const today = calendarDay(input.today);
+        if (expires === null || today === null) {
+          errors.push(`${where}: expires (${String(entry.expires)}) and today (${input.today}) must be real calendar dates, YYYY-MM-DD`);
           continue;
         }
-        if (input.today > entry.expires!) {
+        if (today > expires) {
           errors.push(`${where}: quarantine expired on ${entry.expires} (owner ${entry.owner}); repair and wire it, or renew the entry in review`);
+          continue;
+        }
+        if (expires - today > MAX_QUARANTINE_DAYS * DAY_MS) {
+          const latest = new Date(today + MAX_QUARANTINE_DAYS * DAY_MS).toISOString().slice(0, 10);
+          errors.push(`${where}: expires ${entry.expires}, more than ${MAX_QUARANTINE_DAYS} days away (latest allowed today: ${latest}); renew it in review instead`);
+          continue;
+        }
+      } else {
+        // A local-only proof needs an input CI does not have. The gate checks
+        // that the proof reads each named variable and that neither CI nor
+        // any workflow provides it; a proof that simply fails cannot say that.
+        const source = input.readFile(unitId) ?? "";
+        const needProblems = (entry.needs as unknown[]).flatMap((need): string[] => {
+          if (typeof need !== "string" || !/^[A-Z][A-Z0-9_]*$/.test(need)) return [`need ${JSON.stringify(need)} is not an environment variable name`];
+          if (PROVIDED_IN_CI.test(need) || changesExecution(need)) return [`CI provides ${need}`];
+          const word = new RegExp(`(?<![A-Za-z0-9_])${need}(?![A-Za-z0-9_])`);
+          const workflow = input.workflows.find((candidate) => word.test(candidate.text));
+          if (workflow) return [`${workflow.path} mentions ${need}, so CI may provide it`];
+          const read = new RegExp(`process\\.env(?:\\.${need}(?![A-Za-z0-9_])|\\[\\s*["'\`]${need}["'\`]\\s*\\])`);
+          return read.test(source) ? [] : [`${unitId} does not read process.env.${need}`];
+        });
+        if (needProblems.length > 0) {
+          errors.push(`${where}: ${needProblems.join("; ")} (local-only needs an input CI lacks; a red proof belongs under quarantined)`);
           continue;
         }
       }

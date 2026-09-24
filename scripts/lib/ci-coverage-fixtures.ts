@@ -1,6 +1,6 @@
 import { Scalar, type YAMLMap, isMap, isScalar, isSeq, parseDocument, type Document } from "yaml";
 
-import { GATE_ENTRY, proofCiCoverage, type CoverageInput, type CoverageReport } from "./proof-ci-coverage";
+import { GATE_ENTRY, MAX_QUARANTINE_DAYS, proofCiCoverage, type CoverageInput, type CoverageReport } from "./proof-ci-coverage";
 
 /**
  * Adversarial fixtures for proof:ci-coverage (eco-6hoxj.163.23).
@@ -162,8 +162,9 @@ const withScripts = (input: CoverageInput, scripts: Record<string, string>): Cov
   ...input,
   scripts: { ...input.scripts, ...scripts },
 });
-const withExceptions = (input: CoverageInput, edit: (exceptions: Record<string, Record<string, Record<string, string>>>) => void) => {
-  const exceptions = JSON.parse(JSON.stringify(input.exceptions ?? {})) as Record<string, Record<string, Record<string, string>>>;
+type Exceptions = Record<string, Record<string, Record<string, unknown>>>;
+const withExceptions = (input: CoverageInput, edit: (exceptions: Exceptions) => void) => {
+  const exceptions = JSON.parse(JSON.stringify(input.exceptions ?? {})) as Exceptions;
   edit(exceptions);
   return { ...input, exceptions };
 };
@@ -177,11 +178,30 @@ const withFiles = (input: CoverageInput, files: Record<string, string>): Coverag
   ...input,
   readFile: (file) => (Object.hasOwn(files, file) ? files[file]! : input.readFile(file)),
 });
-/** The first suite scripts/proof-suites.json declares, and its sub-proofs. */
-function firstSuite(input: CoverageInput) {
-  const [suite, children] = Object.entries((input.suites ?? {}) as Record<string, string[]>)[0] ?? [];
-  if (!suite || !children?.length) throw new Error("fixtures need a suite in scripts/proof-suites.json");
-  return { suite, children };
+/** A fixture target's CI line replaced by an echo, so nothing in CI runs its proof. */
+function outOfCi(input: CoverageInput, target: Target) {
+  return editRun(input, target.line, (line) => [line.replace(target.line, "echo moved out of CI")]);
+}
+
+/** The first fixture target, out of CI and listed under `section` with `entry` (whatever the real exceptions hold). */
+function asException(input: CoverageInput, section: "localOnly" | "quarantined", entry: Record<string, unknown>) {
+  const [target] = fixtureTargets(input);
+  return withExceptions(outOfCi(input, target!), (exceptions) => {
+    exceptions[section] = { ...exceptions[section], [target!.unit]: entry };
+  });
+}
+
+/** `days` after the input's today, YYYY-MM-DD. */
+const daysFromToday = (input: CoverageInput, days: number) =>
+  new Date(Date.parse(`${input.today}T00:00:00Z`) + days * 86_400_000).toISOString().slice(0, 10);
+
+/** Fixture targets 2 and 3 out of CI and declared as sub-proofs of target 1 (whatever the real manifest holds). */
+function syntheticSuite(input: CoverageInput) {
+  const [parent, first, second] = fixtureTargets(input);
+  const edited = withSuites(outOfCi(outOfCi(input, first!), second!), (suites) => {
+    suites[parent!.unit] = [first!.unit, second!.unit];
+  });
+  return { input: edited, parent: parent!, children: [first!.unit, second!.unit] };
 }
 
 const RENAMED_PROOF = "scripts/review-renamed-proof.ts";
@@ -495,22 +515,63 @@ export const FIXTURES: Fixture[] = [
     name: "local_only_entry_without_owner",
     origin: "gate",
     expectGateGreen: false,
-    describe: "a local-only entry has no owner",
-    build: (input) => ({
-      input: withExceptions(input, (exceptions) => {
-        const first = Object.keys(exceptions.localOnly ?? {})[0]!;
-        exceptions.localOnly![first] = { ...exceptions.localOnly![first]!, owner: " " };
-      }),
-      error: /missing owner/,
-    }),
+    describe: "a local-only entry has a blank owner",
+    build: (input) => ({ input: asException(input, "localOnly", { owner: " ", needs: ["PLIMSOLL_FIXTURE_INPUT"], reason: "fixture" }), error: /missing owner/ }),
     replayableOnTextualGate: false,
   },
   {
     name: "quarantine_expired",
     origin: "gate",
     expectGateGreen: false,
-    describe: "the date passes a quarantine's expiry",
-    build: (input) => ({ input: { ...input, today: "2999-01-01" }, error: /quarantine expired/ }),
+    describe: "a quarantine expired yesterday",
+    build: (input) => ({ input: asException(input, "quarantined", { owner: "fixture", expires: daysFromToday(input, -1), reason: "fixture" }), error: /quarantine expired/ }),
+    replayableOnTextualGate: false,
+  },
+  {
+    name: "quarantine_within_the_horizon_is_accepted",
+    origin: "gate",
+    expectGateGreen: true,
+    describe: `a quarantine that expires in exactly ${MAX_QUARANTINE_DAYS} days`,
+    build: (input) => ({ input: asException(input, "quarantined", { owner: "fixture", expires: daysFromToday(input, MAX_QUARANTINE_DAYS), reason: "fixture" }) }),
+    replayableOnTextualGate: false,
+  },
+  ...([
+    ["review2_quarantine_far_future_expiry", "review2", "9999-12-31", /more than 30 days away/],
+    ["review2_quarantine_impossible_date", "review2", "2026-99-99", /must be real calendar dates/],
+    ["quarantine_day_that_does_not_exist", "gate", "2026-02-30", /must be real calendar dates/],
+  ] as const).map(([name, origin, expires, error]): Fixture => ({
+    name,
+    origin,
+    expectGateGreen: false,
+    describe: `a quarantine expires on ${expires}`,
+    build: (input) => ({ input: asException(input, "quarantined", { owner: "fixture", expires, reason: "fixture" }), error }),
+    replayableOnTextualGate: false,
+  })),
+  {
+    name: "review2_known_red_moved_to_local_only",
+    origin: "review2",
+    expectGateGreen: false,
+    describe: "a red proof is listed as local-only with just an owner and a reason",
+    build: (input) => ({ input: asException(input, "localOnly", { owner: "fixture", reason: "moved out of quarantine" }), error: /missing needs/ }),
+    replayableOnTextualGate: false,
+  },
+  {
+    name: "local_only_need_the_proof_does_not_read",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a local-only entry names an input its proof never reads",
+    build: (input) => ({
+      input: asException(input, "localOnly", { owner: "fixture", needs: ["PLIMSOLL_FIXTURE_INPUT"], reason: "fixture" }),
+      error: /does not read process\.env\.PLIMSOLL_FIXTURE_INPUT/,
+    }),
+    replayableOnTextualGate: false,
+  },
+  {
+    name: "local_only_need_that_ci_provides",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a local-only entry names an input CI always sets",
+    build: (input) => ({ input: asException(input, "localOnly", { owner: "fixture", needs: ["GITHUB_SHA"], reason: "fixture" }), error: /CI provides GITHUB_SHA/ }),
     replayableOnTextualGate: false,
   },
   {
@@ -520,25 +581,32 @@ export const FIXTURES: Fixture[] = [
     describe: "an exception names a proof that no longer exists",
     build: (input) => ({
       input: withExceptions(input, (exceptions) => {
-        exceptions.localOnly = { ...exceptions.localOnly, "scripts/no-such-proof.ts": { reason: "stale", owner: "fixture" } };
+        exceptions.localOnly = { ...exceptions.localOnly, "scripts/no-such-proof.ts": { owner: "fixture", needs: ["PLIMSOLL_FIXTURE_INPUT"], reason: "stale" } };
       }),
       error: /stale entry/,
     }),
     replayableOnTextualGate: false,
   },
   {
+    name: "suite_sub_proofs_run_inside",
+    origin: "gate",
+    expectGateGreen: true,
+    describe: "two proofs leave CI and are declared as sub-proofs of a suite CI runs",
+    build: (input) => ({ input: syntheticSuite(input).input }),
+    replayableOnTextualGate: false,
+  },
+  {
     name: "review2_suite_sub_proof_dropped",
     origin: "review2",
     expectGateGreen: false,
-    describe: "a sub-proof is dropped from its suite's run list (the suite still names it elsewhere)",
+    describe: "a sub-proof is dropped from its suite's run list",
     build: (input) => {
-      const { suite, children } = firstSuite(input);
-      const dropped = children.at(-2) ?? children[0]!;
+      const suite = syntheticSuite(input);
       return {
-        input: withSuites(input, (suites) => {
-          suites[suite] = children.filter((child) => child !== dropped);
+        input: withSuites(suite.input, (suites) => {
+          suites[suite.parent.unit] = suite.children.slice(1);
         }),
-        uncovered: [dropped],
+        uncovered: [suite.children[0]!],
       };
     },
     replayableOnTextualGate: false,
@@ -547,19 +615,10 @@ export const FIXTURES: Fixture[] = [
     name: "suite_not_run_in_ci",
     origin: "gate",
     expectGateGreen: false,
-    describe: "a sub-proof is declared under a suite CI does not run",
+    describe: "the suite itself leaves CI",
     build: (input) => {
-      const { suite, children } = firstSuite(input);
-      const parent = Object.keys((input.exceptions as { localOnly?: object }).localOnly ?? {})[0];
-      if (!parent) throw new Error("fixture needs a local-only proof");
-      return {
-        input: withSuites(input, (suites) => {
-          suites[suite] = children.slice(1);
-          suites[parent] = [children[0]!];
-        }),
-        uncovered: [children[0]!],
-        error: /not run by CI, so none of its sub-proofs are/,
-      };
+      const suite = syntheticSuite(input);
+      return { input: outOfCi(suite.input, suite.parent), uncovered: suite.children, error: /not run by CI, so none of its sub-proofs are/ };
     },
     replayableOnTextualGate: false,
   },
@@ -569,10 +628,10 @@ export const FIXTURES: Fixture[] = [
     expectGateGreen: false,
     describe: "a suite declares a sub-proof file that does not exist",
     build: (input) => {
-      const { suite, children } = firstSuite(input);
+      const suite = syntheticSuite(input);
       return {
-        input: withSuites(input, (suites) => {
-          suites[suite] = [...children, "scripts/no-such-sub-proof.ts"];
+        input: withSuites(suite.input, (suites) => {
+          suites[suite.parent.unit] = [...suite.children, "scripts/no-such-sub-proof.ts"];
         }),
         error: /no-such-sub-proof\.ts is not a proof file on disk/,
       };
