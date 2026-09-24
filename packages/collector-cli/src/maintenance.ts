@@ -2,6 +2,8 @@ import { createHash } from "node:crypto";
 
 import type Database from "better-sqlite3";
 
+import { isCompleteCapturePass, recordCompleteCapturePass } from "./capture-frontier";
+
 import { MODEL_PRICING, estimateCostUsd } from "../../shared/src/index";
 import type { LocalEventBuffer } from "./buffer";
 import {
@@ -948,6 +950,17 @@ export class CollectorMaintenance {
     }
     if (grok && !this.signal?.aborted) {
       this.buffer.projection.recordCaptureActivity({ source: "grok", ...grok.activity });
+    }
+    // eco-6hoxj.163.18: a complete capture-phase pass is the capture frontier
+    // the upload capture claim may attest. Baseline-phase cadences can return
+    // without reading anything, so only capture-phase passes count.
+    if (phase === "capture" && !this.signal?.aborted) {
+      if (isCompleteCapturePass(rollout)) {
+        recordCompleteCapturePass(this.buffer.database, "codex", rollout.activity.lastScanAt);
+      }
+      if (isCompleteCapturePass(transcript)) {
+        recordCompleteCapturePass(this.buffer.database, "claude_code", transcript.activity.lastScanAt);
+      }
     }
     // Capture-first cadence: repair units take only the allowance capture left.
     if (captureFirst) {
