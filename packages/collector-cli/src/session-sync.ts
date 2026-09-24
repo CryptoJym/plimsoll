@@ -103,7 +103,8 @@ const sessionReadWorkerSource = `
   }
 `;
 
-function readSessionsOffThread<T>(ledger: Database.Database, queries: SessionReadQuery[]): Promise<T[]> {
+/** Step read-only queries on a one-shot worker connection; rows of all queries, in order. */
+export function readLedgerOffThread<T>(ledger: Database.Database, queries: SessionReadQuery[]): Promise<T[]> {
   if (queries.length === 0) return Promise.resolve([]);
   // SQLite memory databases cannot be reopened by a worker. Production
   // ledgers are file-backed; retain the direct path for isolated callers.
@@ -218,7 +219,7 @@ async function collectSessionSnapshotsOffThread(
   ledger: Database.Database,
   options: { until: string; sessionIds?: string[] },
 ): Promise<SessionSnapshot[]> {
-  return readSessionsOffThread<SessionSnapshot>(ledger, sessionSnapshotQueries(ledger, options));
+  return readLedgerOffThread<SessionSnapshot>(ledger, sessionSnapshotQueries(ledger, options));
 }
 
 export type SessionSkipReason = "source_invalid" | "schema_invalid" | "forbidden_content";
@@ -568,7 +569,7 @@ export async function listLedgerSessionIdsOffThread(
   // onto the request event loop. Read enough extra rows to preserve the
   // overflow signal after excluded IDs are removed.
   query.sql += ` limit ${MAX_PENDING_SESSION_IDS + 1 + excluded.size}`;
-  const rows = await readSessionsOffThread<{ sessionId: string }>(ledger, [query]);
+  const rows = await readLedgerOffThread<{ sessionId: string }>(ledger, [query]);
   return rows.map(row => row.sessionId).filter((id) => !excluded.has(id));
 }
 

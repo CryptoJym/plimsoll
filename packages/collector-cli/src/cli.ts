@@ -156,9 +156,11 @@ import {
 import { MaintenanceFailureError, MaintenanceProcessBoundary } from "./maintenance-boundary";
 import { checkpointWalInBoundedChild, runStartupWalSelfHeal } from "./startup-wal-self-heal";
 import {
+  MAINTENANCE_BACKLOG_QUERIES,
   maintenanceStarvationReceipt,
   recordMaintenanceDeadlineBlame,
   recordMaintenanceDeadlineKill,
+  type MaintenanceStarvationReceipt,
 } from "./maintenance-starvation";
 import { runMaintenanceWorkerService } from "./maintenance-worker";
 import {
@@ -252,6 +254,7 @@ import {
   loadDaemonSessionSyncState,
   planDaemonSessionSync,
   listLedgerSessionIdsOffThread,
+  readLedgerOffThread,
   runSessionSync,
   saveDaemonSessionSyncState,
   sessionIdsFromBatches,
@@ -2585,7 +2588,8 @@ async function main() {
             heldMs: info.heldMs,
             attribution: info.attribution,
           });
-          const receipt = maintenanceStarvationReceipt(buffer.database);
+          const receipt = maintenanceStarvationReceipt(buffer.database, starvationBacklog);
+          refreshStarvationBacklog();
           if (receipt.starving) {
             console.warn(JSON.stringify({
               warning: "maintenance_starvation",
@@ -2625,14 +2629,41 @@ async function main() {
     }
     let refreshStatusSnapshot: (failure?: "maintenance_failed") => boolean = () => false;
     let retentionCadence: AutomaticRetentionCadence | undefined;
+    // The receipt's backlog census counts two queue tables (~280k pending
+    // links on the Studio0 ledger, ~0.8 s cold). It is stepped on a read-only
+    // worker and /status carries the last completed census; the other receipt
+    // fields are single-row reads (eco-6hoxj.163.24).
+    const readBacklogOffThread = async (): Promise<MaintenanceStarvationReceipt["backlog"]> => {
+      const count = (row: { n: unknown } | undefined) => {
+        const n = Number(row?.n);
+        return Number.isSafeInteger(n) && n >= 0 ? n : 0;
+      };
+      const [fill, dirty] = await readLedgerOffThread<{ n: unknown }>(buffer.database, [
+        { sql: MAINTENANCE_BACKLOG_QUERIES.fillPendingEventLinks, params: {} },
+        { sql: MAINTENANCE_BACKLOG_QUERIES.dirtyEnrichmentSessions, params: {} },
+      ]);
+      return { fillPendingEventLinks: count(fill), dirtyEnrichmentSessions: count(dirty) };
+    };
+    let starvationBacklog = await readBacklogOffThread().catch(() => undefined);
+    let starvationBacklogRead: Promise<void> | null = null;
     const readStarvationReceipt = () => {
       try {
-        return maintenanceStarvationReceipt(buffer.database);
+        return maintenanceStarvationReceipt(buffer.database, starvationBacklog);
       } catch {
         return null;
       }
     };
     let cachedStarvationReceipt = readStarvationReceipt();
+    const refreshStarvationBacklog = () => {
+      if (starvationBacklogRead) return;
+      starvationBacklogRead = readBacklogOffThread()
+        .then((backlog) => {
+          starvationBacklog = backlog;
+          cachedStarvationReceipt = readStarvationReceipt();
+        })
+        .catch(() => undefined)
+        .finally(() => { starvationBacklogRead = null; });
+    };
     // Bead eco-6hoxj.61. Created before the listener so /status can read its
     // cached snapshot, armed with the other cadences below.
     let hookSpoolDrain: HookSpoolDrain | undefined;
@@ -2663,6 +2694,7 @@ async function main() {
       registerStatusRefresher: (refresh) => {
         refreshStatusSnapshot = (failure) => {
           cachedStarvationReceipt = readStarvationReceipt();
+          refreshStarvationBacklog();
           try { cachedBaseline = captureBaselineStatus(buffer.database); } catch { /* retain last observation */ }
           return refresh(failure);
         };

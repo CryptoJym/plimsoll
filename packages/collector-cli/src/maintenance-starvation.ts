@@ -119,6 +119,12 @@ export function recordMaintenanceDeadlineBlame(
   setStateValue(database, MAINTENANCE_PROGRESS_CHECKPOINT_KEY, JSON.stringify(checkpoint));
 }
 
+/** The two backlog counts, as plain read-only SQL (the daemon steps them off its main thread). */
+export const MAINTENANCE_BACKLOG_QUERIES = {
+  fillPendingEventLinks: `select count(*) as n from repo_context_event_links where fill_pending = 1`,
+  dirtyEnrichmentSessions: `select count(*) as n from repo_enrichment_dirty`,
+} as const;
+
 /** Backlog census over the enrichment queues; missing tables count as zero. */
 export function maintenanceBacklogSnapshot(database: Database.Database): {
   fillPendingEventLinks: number;
@@ -134,15 +140,15 @@ export function maintenanceBacklogSnapshot(database: Database.Database): {
     }
   };
   return {
-    fillPendingEventLinks: count(
-      `select count(*) as n from repo_context_event_links where fill_pending = 1`,
-    ),
-    dirtyEnrichmentSessions: count(`select count(*) as n from repo_enrichment_dirty`),
+    fillPendingEventLinks: count(MAINTENANCE_BACKLOG_QUERIES.fillPendingEventLinks),
+    dirtyEnrichmentSessions: count(MAINTENANCE_BACKLOG_QUERIES.dirtyEnrichmentSessions),
   };
 }
 
+/** `backlog` lets a caller pass a census it read elsewhere; by default it is counted here. */
 export function maintenanceStarvationReceipt(
   database: Database.Database,
+  backlog: MaintenanceStarvationReceipt["backlog"] = maintenanceBacklogSnapshot(database),
 ): MaintenanceStarvationReceipt {
   const killsRaw = Number(stateValue(database, MAINTENANCE_DEADLINE_KILLS_KEY) ?? "0");
   const deadlineKills = Number.isSafeInteger(killsRaw) && killsRaw >= 0 ? killsRaw : 0;
@@ -164,7 +170,6 @@ export function maintenanceStarvationReceipt(
       lastCheckpoint = null;
     }
   }
-  const backlog = maintenanceBacklogSnapshot(database);
   return {
     deadlineKills,
     lastDeadlineKillAt,
