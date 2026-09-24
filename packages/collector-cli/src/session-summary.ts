@@ -28,12 +28,18 @@ export type SessionSnapshot = {
   accountHash: string | null;
 };
 
-export const SESSION_SUMMARY_SCHEMA_VERSION = 1 as const;
+export const SESSION_SUMMARY_SCHEMA_VERSION = 2 as const;
 export const SESSION_SUMMARY_DEFAULT_MAX_ROWS = 5_000;
 export const SESSION_SUMMARY_DEFAULT_MAX_MS = 250;
 
 type SummaryAccumulator = {
   sessionId: string;
+  /** Historical scan cursor follows idx_events_session (session, observation, rowid). */
+  cursorObservedAt: string | null;
+  cursorRowid: number;
+  cursorId: string | null;
+  /** A preexisting future-created row requires one fallback when the horizon advances. */
+  futureRows: boolean;
   sourceMax: string | null;
   startedAt: string | null;
   endedAt: string | null;
@@ -78,6 +84,7 @@ type RawSummaryRow = {
   sessionId: string | null;
   source: string;
   observedAt: string;
+  createdAt: string;
   inputTokens: number | null;
   outputTokens: number | null;
   cacheReadTokens: number | null;
@@ -261,6 +268,16 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
   if (revisionTableMissing) {
     db.exec(`insert or ignore into session_sync_summary_revision (session_id, mutation_revision)
       select session_id, mutation_revision from session_sync_summary_state`);
+    // Round 1 only invalidated privacy changes behind a committed HWM. A
+    // privacy change during the first read must invalidate that read too.
+    db.exec(`
+      drop trigger if exists trg_session_summary_outbox_insert;
+      drop trigger if exists trg_session_summary_outbox_update;
+      drop trigger if exists trg_session_summary_outbox_delete;
+      drop trigger if exists trg_session_summary_receipt_insert;
+      drop trigger if exists trg_session_summary_receipt_update;
+      drop trigger if exists trg_session_summary_receipt_delete;
+    `);
   }
 
   // These tables are created by DeliveryOutbox, but a small proof ledger or a
@@ -272,7 +289,7 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
       when new.raw_rowid is not null and exists (
         select 1 from buffered_events e
         join session_sync_summary_state s on s.session_id = e.session_id
-        where e.rowid = new.raw_rowid and s.high_water >= e.rowid
+        where e.rowid = new.raw_rowid
           and (new.raw_id is null or new.raw_created_at is null or new.raw_generation is null
             or new.raw_id is not e.id or new.raw_created_at is not e.created_at
             or new.raw_generation is not e.privacy_generation)
@@ -293,7 +310,7 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
       when new.raw_rowid is not null and exists (
         select 1 from buffered_events e
         join session_sync_summary_state s on s.session_id = e.session_id
-        where e.rowid = new.raw_rowid and s.high_water >= e.rowid
+        where e.rowid = new.raw_rowid
           and (
             old.raw_id is null or old.raw_created_at is null or old.raw_generation is null
             or old.raw_id is not e.id or old.raw_created_at is not e.created_at
@@ -319,7 +336,7 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
       when old.raw_rowid is not null and exists (
         select 1 from buffered_events e
         join session_sync_summary_state s on s.session_id = e.session_id
-        where e.rowid = old.raw_rowid and s.high_water >= e.rowid
+        where e.rowid = old.raw_rowid
       )
       begin
         update session_sync_summary_control
@@ -345,7 +362,7 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
           and exists (
             select 1 from buffered_events e
             join session_sync_summary_state s on s.session_id = e.session_id
-            where e.id = new.delivery_id and s.high_water >= e.rowid
+            where e.id = new.delivery_id
           )
         begin
           update session_sync_summary_control
@@ -373,7 +390,7 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
             select e.session_id, 'privacy_receipt', strftime('%Y-%m-%dT%H:%M:%fZ','now')
             from buffered_events e
             join session_sync_summary_state s on s.session_id = e.session_id
-            where e.id = new.delivery_id and e.session_id is not null and s.high_water >= e.rowid
+            where e.id = new.delivery_id and e.session_id is not null
             on conflict(session_id) do update set
               reason = excluded.reason, updated_at = excluded.updated_at;
         end;
@@ -383,7 +400,7 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
           and exists (
             select 1 from buffered_events e
             join session_sync_summary_state s on s.session_id = e.session_id
-            where e.id = old.delivery_id and s.high_water >= e.rowid
+            where e.id = old.delivery_id
           )
         begin
           update session_sync_summary_control
@@ -426,6 +443,10 @@ export function sessionSummaryCounters(db: Database.Database): SessionSummaryCou
 function emptyAccumulator(sessionId: string): SummaryAccumulator {
   return {
     sessionId,
+    cursorObservedAt: null,
+    cursorRowid: 0,
+    cursorId: null,
+    futureRows: false,
     sourceMax: null,
     startedAt: null,
     endedAt: null,
@@ -529,6 +550,10 @@ function parseAccumulator(sessionId: string, value: string): SummaryAccumulator 
     const parsed = JSON.parse(value) as Partial<SummaryAccumulator>;
     const candidate = { ...emptyAccumulator(sessionId), ...parsed } as SummaryAccumulator;
     if (candidate.sessionId !== sessionId) return null;
+    if (typeof candidate.cursorObservedAt !== "string" && candidate.cursorObservedAt !== null) return null;
+    if (!Number.isSafeInteger(candidate.cursorRowid) || candidate.cursorRowid < 0) return null;
+    if (typeof candidate.cursorId !== "string" && candidate.cursorId !== null) return null;
+    if (typeof candidate.futureRows !== "boolean") return null;
     if (!Number.isSafeInteger(candidate.events) || candidate.events < 0) return null;
     for (const key of [
       "inputTokens", "outputTokens", "cacheReadTokens", "cacheCreationTokens",
@@ -578,7 +603,8 @@ function validStoredState(state: StoredSummaryState, sessionId: string, until: s
 
 function rowCheckpointQuery(state: StoredSummaryState, maxMs?: number): SessionReadQuery[] {
   return [{
-    sql: `select id, session_id as sessionId from buffered_events where rowid = @rowid`,
+    sql: `select id, session_id as sessionId, observed_at as observedAt
+      from buffered_events where rowid = @rowid`,
     params: { rowid: state.highWater },
     ...(maxMs === undefined ? {} : { maxMs }),
   }];
@@ -586,14 +612,29 @@ function rowCheckpointQuery(state: StoredSummaryState, maxMs?: number): SessionR
 
 async function checkpointValid(
   state: StoredSummaryState,
+  accumulator: SummaryAccumulator,
   sessionId: string,
   read: SessionSummaryRead,
   maxMs?: number,
 ): Promise<boolean> {
-  if (state.highWater === 0) return state.checkpointId === null;
+  if (state.highWater === 0) return state.checkpointId === null &&
+    accumulator.cursorRowid === 0 && accumulator.cursorObservedAt === null && accumulator.cursorId === null;
   if (state.checkpointId === null) return false;
-  const rows = await read<{ id: string; sessionId: string | null }>(rowCheckpointQuery(state, maxMs));
-  return rows.length === 1 && rows[0]?.id === state.checkpointId && rows[0]?.sessionId === sessionId;
+  const rows = await read<{ id: string; sessionId: string | null; observedAt: string }>(rowCheckpointQuery(state, maxMs));
+  if (rows.length !== 1 || rows[0]?.id !== state.checkpointId || rows[0]?.sessionId !== sessionId) return false;
+  if (accumulator.cursorRowid === 0) return accumulator.cursorObservedAt === null && accumulator.cursorId === null;
+  if (accumulator.cursorObservedAt === null || accumulator.cursorId === null) return false;
+  if (accumulator.cursorRowid === state.highWater) {
+    return rows[0]?.id === accumulator.cursorId && rows[0]?.observedAt === accumulator.cursorObservedAt;
+  }
+  const cursorRows = await read<{ id: string; sessionId: string | null; observedAt: string }>([{
+    sql: `select id, session_id as sessionId, observed_at as observedAt
+      from buffered_events where rowid = @rowid`,
+    params: { rowid: accumulator.cursorRowid },
+    ...(maxMs === undefined ? {} : { maxMs }),
+  }]);
+  return cursorRows.length === 1 && cursorRows[0]?.id === accumulator.cursorId &&
+    cursorRows[0]?.sessionId === sessionId && cursorRows[0]?.observedAt === accumulator.cursorObservedAt;
 }
 
 function summaryRowsQuery(
@@ -601,6 +642,8 @@ function summaryRowsQuery(
   sessionId: string,
   until: string,
   highWater: number,
+  cursorObservedAt: string | null,
+  cursorRowid: number,
   limit: number,
   maxMs?: number,
   appendRows = false,
@@ -608,10 +651,11 @@ function summaryRowsQuery(
   const eligible = terminalPrivacyEligibilitySql(db, "e");
   const cursor = appendRows
     ? "r.session_id = @sessionId and r.raw_rowid > @highWater"
-    : "e.session_id = @sessionId and e.rowid > @highWater";
+    : "e.session_id = @sessionId and (e.observed_at, e.rowid) > (@cursorObservedAt, @cursorRowid)";
   return {
     sql: `select e.rowid as rowid, e.id, e.session_id as sessionId, e.source,
-       e.observed_at as observedAt, e.input_tokens as inputTokens,
+       e.observed_at as observedAt, e.created_at as createdAt,
+       e.input_tokens as inputTokens,
        e.output_tokens as outputTokens, e.cache_read_tokens as cacheReadTokens,
        e.cache_creation_tokens as cacheCreationTokens, e.cost_usd as costUsd,
        e.repo_hash as repoHash, e.branch_hash as branchHash,
@@ -619,10 +663,10 @@ function summaryRowsQuery(
        case when ${eligible} then 1 else 0 end as eligible
      from ${appendRows
        ? "session_sync_summary_rows r join buffered_events e on e.rowid = r.raw_rowid"
-       : "buffered_events e"}
-     where ${cursor} and e.created_at <= @until
-     order by e.rowid asc limit @limit`,
-    params: { sessionId, until, highWater, limit },
+       : "buffered_events e indexed by idx_events_session"}
+     where ${cursor}
+     order by ${appendRows ? "e.rowid" : "e.observed_at, e.rowid"} asc limit @limit`,
+    params: { sessionId, highWater, cursorObservedAt: cursorObservedAt ?? "", cursorRowid, limit },
     ...(maxMs === undefined ? {} : { maxMs }),
   };
 }
@@ -703,6 +747,7 @@ function fallbackReason(
   if (!Number.isSafeInteger(stored.highWater) || stored.highWater < 0) return "high_water_invalid";
   if (Number.isNaN(Date.parse(stored.coveredUntil))) return "covered_until_invalid";
   if (Date.parse(stored.coveredUntil) > Date.parse(until)) return "until_rollback";
+  if (parsed.futureRows && Date.parse(stored.coveredUntil) < Date.parse(until)) return "future_horizon";
   if (currentRevision !== stored.mutationRevision) return "ledger_mutation";
   if (!checkpointOk) return "checkpoint_mismatch";
   if (dirty) return "dirty_marker";
@@ -717,9 +762,9 @@ export function listSessionSummaryPendingIds(db: Database.Database): string[] {
      union
      select session_id as sessionId from session_sync_summary_state where complete = 0
      union
-     select s.session_id as sessionId from session_sync_summary_state s
-       join session_sync_summary_revision r on r.session_id = s.session_id
-       where r.mutation_revision != s.mutation_revision`,
+     select r.session_id as sessionId from session_sync_summary_revision r
+       left join session_sync_summary_state s on s.session_id = r.session_id
+       where s.session_id is null or r.mutation_revision != s.mutation_revision`,
   ).all() as Array<{ sessionId: string }>;
   return rows.map((row) => row.sessionId);
 }
@@ -760,8 +805,16 @@ export async function updateSessionSummary(
   options: SessionSummaryUpdateOptions,
 ): Promise<SessionSummaryUpdateResult> {
   const started = performance.now();
-  const maxRows = Math.max(1, Math.min(Math.trunc(options.maxRows ?? SESSION_SUMMARY_DEFAULT_MAX_ROWS), SESSION_SUMMARY_DEFAULT_MAX_ROWS));
-  const maxMs = Math.max(1, Math.min(options.maxMs ?? SESSION_SUMMARY_DEFAULT_MAX_MS, SESSION_SUMMARY_DEFAULT_MAX_MS));
+  const requestedRows = options.maxRows ?? SESSION_SUMMARY_DEFAULT_MAX_ROWS;
+  const requestedMs = options.maxMs ?? SESSION_SUMMARY_DEFAULT_MAX_MS;
+  const maxRows = Math.max(1, Math.min(
+    Math.trunc(Number.isFinite(requestedRows) ? requestedRows : SESSION_SUMMARY_DEFAULT_MAX_ROWS),
+    SESSION_SUMMARY_DEFAULT_MAX_ROWS,
+  ));
+  const maxMs = Math.max(1, Math.min(
+    Number.isFinite(requestedMs) ? requestedMs : SESSION_SUMMARY_DEFAULT_MAX_MS,
+    SESSION_SUMMARY_DEFAULT_MAX_MS,
+  ));
   const currentRevision = sessionRevision(db, sessionId);
   const stored = storedState(db, sessionId);
   const parsed = stored ? parseAccumulator(sessionId, stored.accumulatorJson) : null;
@@ -771,9 +824,17 @@ export async function updateSessionSummary(
   let checkpointOk = false;
   if (stored && parsed && validStoredState(stored, sessionId, until)) {
     try {
-      checkpointOk = await checkpointValid(stored, sessionId, options.read, maxMs);
+      checkpointOk = await checkpointValid(stored, parsed, sessionId, options.read, maxMs);
     } catch (error) {
       if (!(error instanceof Error && error.message.includes("session_summary_read_interrupted"))) throw error;
+      // A worker deadline says nothing about checkpoint integrity. Preserve
+      // the stored cursor and retry the bounded read on the next slice.
+      return {
+        snapshot: null, complete: false, rowsRead: 0, rowsApplied: 0,
+        durationMs: Math.round(performance.now() - started), highWater: stored.highWater,
+        mode: stored.mode, fullRecompute: false, fallbackReason: "checkpoint_timeout",
+        mutationRevision: stored.mutationRevision,
+      };
     }
   }
   const reason = fallbackReason(stored, parsed, currentRevision, until, checkpointOk, dirty);
@@ -858,7 +919,15 @@ export async function updateSessionSummary(
       if (!(error instanceof Error && error.message.includes("session_summary_read_interrupted"))) throw error;
       newerReadOk = false;
     }
-    if (!newerReadOk || newer.length > 0 ||
+    if (!newerReadOk) {
+      return {
+        snapshot: null, complete: false, rowsRead: 0, rowsApplied: 0,
+        durationMs: Math.round(performance.now() - started), highWater: state.highWater,
+        mode: "cached", fullRecompute: false, fallbackReason: "newer_read_timeout",
+        mutationRevision: state.mutationRevision,
+      };
+    }
+    if (newer.length > 0 ||
         !sessionSummaryCurrent(db, sessionId, until, state.mutationRevision, state.highWater)) {
       mode = "incremental";
       state.complete = false;
@@ -889,6 +958,7 @@ export async function updateSessionSummary(
   let rowsRead = 0;
   let rowsApplied = 0;
   let complete = false;
+  let readInterrupted = false;
   while (rowsRead < maxRows && performance.now() - started < maxMs) {
     const limit = Math.min(queryLimit, maxRows - rowsRead);
     let rows: RawSummaryRow[];
@@ -899,13 +969,18 @@ export async function updateSessionSummary(
           sessionId,
           until,
           state.highWater,
+          state.accumulator.cursorObservedAt,
+          state.accumulator.cursorRowid,
           limit,
           Math.max(1, maxMs - (performance.now() - started)),
           state.mode === "incremental",
         ),
       ]);
     } catch (error) {
-      if (error instanceof Error && error.message.includes("session_summary_read_interrupted")) break;
+      if (error instanceof Error && error.message.includes("session_summary_read_interrupted")) {
+        readInterrupted = true;
+        break;
+      }
       throw error;
     }
     if (rows.length === 0) {
@@ -915,9 +990,17 @@ export async function updateSessionSummary(
     let processedAllChunk = true;
     for (const row of rows) {
       rowsRead += 1;
-      state.highWater = row.rowid;
-      state.checkpointId = row.id;
-      if (row.eligible) {
+      if (state.mode !== "incremental") {
+        state.accumulator.cursorObservedAt = row.observedAt;
+        state.accumulator.cursorRowid = row.rowid;
+        state.accumulator.cursorId = row.id;
+      }
+      if (row.rowid > state.highWater) {
+        state.highWater = row.rowid;
+        state.checkpointId = row.id;
+      }
+      if (row.createdAt > until) state.accumulator.futureRows = true;
+      else if (row.eligible) {
         fold(state.accumulator, row);
         rowsApplied += 1;
       }
@@ -930,6 +1013,15 @@ export async function updateSessionSummary(
       complete = true;
       break;
     }
+  }
+
+  if (readInterrupted && rowsRead === 0) {
+    return {
+      snapshot: null, complete: false, rowsRead: 0, rowsApplied: 0,
+      durationMs: Math.round(performance.now() - started), highWater: state.highWater,
+      mode, fullRecompute, fallbackReason: "rows_read_timeout",
+      mutationRevision: state.mutationRevision,
+    };
   }
 
   // Revision, queued-row check, and state write share one write transaction.

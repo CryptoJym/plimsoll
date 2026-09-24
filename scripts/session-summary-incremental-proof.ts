@@ -133,6 +133,7 @@ async function reviewRegressions() {
   const cases = [
     "first_read_insert", "fallback_checkpoint", "missing_dirty_marker", "privacy_before_send",
     "unrelated_revision", "retry_erasure", "hard_bounds", "session_id_paging",
+    "privacy_lineage_first_read", "checkpoint_timeout", "future_horizon",
   ];
   for (const name of cases) {
     if (selected && selected !== name) continue;
@@ -154,7 +155,7 @@ async function reviewRegressions() {
         let injected = false;
         const read = async <T,>(queries: Array<{ sql: string; params: Record<string, unknown> }>): Promise<T[]> => {
           const rows = await directRead<T>(queries);
-          if (!injected && queries.some((query) => query.sql.includes("order by e.rowid asc"))) {
+          if (!injected && queries.some((query) => query.sql.includes("order by e.observed_at, e.rowid asc"))) {
             injected = true;
             add(2);
           }
@@ -271,6 +272,66 @@ async function reviewRegressions() {
           until, maxIds: Number.POSITIVE_INFINITY,
         });
         assert.equal(ids.length, 5_001);
+        const initialIds = await listLedgerSessionIdsOffThread(buffer.database, {
+          until, maxIds: Number.POSITIVE_INFINITY, allSessions: true,
+        });
+        assert.deepEqual(initialIds, ids);
+      } else if (name === "privacy_lineage_first_read") {
+        add(1);
+        let changed = false;
+        const read = async <T,>(queries: Array<{ sql: string; params: Record<string, unknown> }>): Promise<T[]> => {
+          const rows = await directRead<T>(queries);
+          if (!changed && queries.some((query) => query.sql.includes("order by e.observed_at, e.rowid asc"))) {
+            changed = true;
+            buffer.database.prepare(`insert into upload_receipts
+              (delivery_id, terminal_state, reason, status_class, attempt_count, created_at, terminal_at)
+              values (?, 'dead', 'local_privacy_violation', 'local', 0, ?, ?)`).run(
+              uuid(481), "2026-09-20T02:00:00.000Z", "2026-09-20T02:00:00.000Z",
+            );
+          }
+          return rows;
+        };
+        const first = await updateSessionSummary(buffer.database, sessionId, until, { read });
+        assert.equal(changed, true);
+        assert.equal(first.complete, false);
+        const next = await updateSessionSummary(buffer.database, sessionId, until, { read });
+        assert.equal(next.complete, true);
+        assert.equal(next.snapshot, null);
+      } else if (name === "checkpoint_timeout") {
+        for (let index = 1; index <= 4; index += 1) add(index);
+        const first = await updateSessionSummary(buffer.database, sessionId, until, {
+          read: directRead, maxRows: 1,
+        });
+        assert.equal(first.complete, false);
+        const deferred = await updateSessionSummary(buffer.database, sessionId, until, {
+          read: async <T,>(queries: Array<{ sql: string; params: Record<string, unknown> }>): Promise<T[]> => {
+            if (queries.some((query) => query.sql.includes("from buffered_events where rowid = @rowid"))) {
+              throw new Error("session_summary_read_interrupted");
+            }
+            return directRead<T>(queries);
+          },
+        });
+        assert.equal(deferred.complete, false);
+        assert.equal(deferred.fullRecompute, false);
+        assert.equal(deferred.highWater, first.highWater);
+        const resumed = await updateSessionSummary(buffer.database, sessionId, until, { read: directRead });
+        assert.equal(resumed.complete, true);
+        assert.deepEqual(resumed.snapshot, collectSessionSnapshots(buffer.database, { until, sessionIds: [sessionId] })[0]);
+      } else if (name === "future_horizon") {
+        insertRaw(buffer, {
+          id: uuid(501), sessionId,
+          observedAt: "2026-09-19T00:00:00.000Z", createdAt: "2026-10-02T00:00:00.000Z",
+          inputTokens: 10, outputTokens: 1,
+        });
+        add(2);
+        const first = await updateSessionSummary(buffer.database, sessionId, until, { read: directRead });
+        assert.equal(first.snapshot?.events, 1);
+        const later = "2026-10-10T00:00:00.000Z";
+        const second = await updateSessionSummary(buffer.database, sessionId, later, { read: directRead });
+        assert.equal(second.fullRecompute, true);
+        assert.deepEqual(second.snapshot, collectSessionSnapshots(buffer.database, {
+          until: later, sessionIds: [sessionId],
+        })[0]);
       }
       console.log(JSON.stringify({ reviewCase: name, result: "PASS" }));
     } finally {

@@ -661,7 +661,7 @@ export function planDaemonSessionSync(input: {
 /** Daemon planner's distinct-id scan, without blocking HTTP intake. */
 export async function listLedgerSessionIdsOffThread(
   ledger: Database.Database,
-  options: { until: string; since?: string | null; excludedIds?: string[]; maxIds?: number },
+  options: { until: string; since?: string | null; excludedIds?: string[]; maxIds?: number; allSessions?: boolean },
 ): Promise<string[]> {
   const excluded = new Set(options.excludedIds ?? []);
   // The planner only needs an overflow signal; a full catch-up needs every
@@ -670,13 +670,30 @@ export async function listLedgerSessionIdsOffThread(
   const ids: string[] = [];
   let cursor: string | null = null;
   for (;;) {
-    const query = ledgerSessionIdsQuery(ledger, options);
-    if (cursor !== null) {
-      query.sql += " and e.session_id > @cursor";
-      query.params.cursor = cursor;
+    // The first catch-up only needs candidate ids; each session's summary
+    // applies the privacy and horizon predicates. Seek to the next distinct
+    // session through the existing index instead of scanning 1.9M duplicate
+    // entries in the largest session merely to emit one id.
+    const query: SessionReadQuery = options.allSessions ? {
+      sql: `with recursive session_ids(session_id) as (
+        select min(session_id) from buffered_events indexed by idx_events_session
+          where ${cursor === null ? "session_id is not null" : "session_id > @cursor"}
+        union all
+        select (select min(session_id) from buffered_events indexed by idx_events_session
+          where session_id > session_ids.session_id)
+        from session_ids where session_id is not null
+      ) select session_id as sessionId from session_ids
+        where session_id is not null limit @pageSize`,
+      params: { cursor, pageSize: SESSION_ID_PAGE_SIZE },
+    } : ledgerSessionIdsQuery(ledger, options);
+    if (!options.allSessions) {
+      if (cursor !== null) {
+        query.sql += " and e.session_id > @cursor";
+        query.params.cursor = cursor;
+      }
+      query.sql += " order by e.session_id asc limit @pageSize";
+      query.params.pageSize = SESSION_ID_PAGE_SIZE;
     }
-    query.sql += " order by e.session_id asc limit @pageSize";
-    query.params.pageSize = SESSION_ID_PAGE_SIZE;
     query.maxMs = 250;
     const rows = await readLedgerOffThread<{ sessionId: string }>(ledger, [query]);
     for (const row of rows) {
@@ -1051,6 +1068,7 @@ export async function runSessionSync(
             until,
             excludedIds: options.excludedSessionIds,
             maxIds: Number.POSITIVE_INFINITY,
+            allSessions: true,
           });
       const sessionIds = [...new Set(ids)].filter((id) => !excluded.has(id));
       ledgerSessions = sessionIds.length;
