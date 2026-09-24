@@ -369,6 +369,11 @@ export type GrokUsageSweepCounters = {
   sessionsDeferred: number;
   /** Usage files the recent lane queued ahead of the walk. */
   recentFiles: number;
+  /**
+   * 1 when the sweep ended early because its durable walk state reached its
+   * row limit; the sweep is incomplete and the next one starts over.
+   */
+  walkStateLimitReached: number;
 };
 
 /** Durable receipt of the automatic Grok usage backfill; path- and content-free. */
