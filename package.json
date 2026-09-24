@@ -65,6 +65,7 @@
     "proof:repo-context-drain": "tsx scripts/repo-context-drain-proof.ts",
     "proof:session-attribution": "tsx scripts/session-attribution-proof.ts",
     "proof:session-attribution-bounded": "tsx scripts/session-attribution-bounded-proof.ts",
+    "proof:session-context-index": "tsx scripts/session-context-index-proof.ts",
     "proof:codex-reconciliation": "tsx scripts/codex-reconciliation-proof.ts",
     "proof:resource-concurrency": "tsx scripts/resource-proof/concurrency-proof.ts",
     "proof:resource": "tsx scripts/resource-proof/index.ts",
