@@ -144,26 +144,36 @@ function parseObservedAt(value: string) {
   return Number.isFinite(timestamp) ? timestamp : null;
 }
 
+/**
+ * A batch joins each of its events against the same context rows, so a row's
+ * parsed time and canonical repo are computed once per row object rather than
+ * once per event. Context rows are never mutated after they are read.
+ */
+const contextFacts = new WeakMap<SessionRepoContext, { at: number | null; repoHash: string | null }>();
+
+function factsOf(context: SessionRepoContext) {
+  let facts = contextFacts.get(context);
+  if (!facts) {
+    facts = { at: parseObservedAt(context.observedAt), repoHash: canonicalLinkage(context.repoHash) };
+    contextFacts.set(context, facts);
+  }
+  return facts;
+}
+
 function sortedContexts(
   event: AiInteractionEvent,
   contexts: readonly SessionRepoContext[],
 ) {
   const eventAt = parseObservedAt(event.observedAt);
   if (eventAt === null || !event.sessionId) return [];
-  return contexts
-    .filter((context) => {
-      if (context.sessionId !== event.sessionId) return false;
-      const contextAt = parseObservedAt(context.observedAt);
-      return contextAt !== null &&
-        Math.abs(contextAt - eventAt) <= SESSION_INHERIT_WINDOW_MS &&
-        canonicalLinkage(context.repoHash) !== null;
-    })
-    .map((context) => ({
-      ...context,
-      repoHash: canonicalLinkage(context.repoHash)!,
-      at: parseObservedAt(context.observedAt)!,
-    }))
-    .sort((left, right) => left.at - right.at || left.rowid - right.rowid);
+  const sorted: Array<SessionRepoContext & { at: number }> = [];
+  for (const context of contexts) {
+    if (context.sessionId !== event.sessionId) continue;
+    const { at, repoHash } = factsOf(context);
+    if (at === null || repoHash === null || Math.abs(at - eventAt) > SESSION_INHERIT_WINDOW_MS) continue;
+    sorted.push({ ...context, repoHash, at });
+  }
+  return sorted.sort((left, right) => left.at - right.at || left.rowid - right.rowid);
 }
 
 function inheritedRepo(
@@ -268,6 +278,15 @@ const READ_INDEXED_CONTEXTS =
    where session_id = ? and observed_at >= ? and observed_at <= ?
    order by observed_at asc, source_rowid asc
    limit ?`;
+
+/**
+ * Rows from better-sqlite3 are several times slower to read and spread than
+ * plain objects, and a batch joins every event against them, so each lookup
+ * copies its rows once.
+ */
+function plainContexts(rows: readonly SessionRepoContext[]): SessionRepoContext[] {
+  return rows.map(({ rowid, sessionId, observedAt, repoHash }) => ({ rowid, sessionId, observedAt, repoHash }));
+}
 
 type SessionLookup = {
   firstAt: number;
@@ -376,7 +395,7 @@ export class SessionAttributionBatch {
               this.counters.budgetExhausted += 1;
               continue;
             }
-            lookup.rows = rows;
+            lookup.rows = plainContexts(rows);
             lookup.complete = true;
             continue;
           }
@@ -399,7 +418,7 @@ export class SessionAttributionBatch {
           this.counters.rowReads += entries;
           lookup.rows = entries === 0
             ? []
-            : readContexts!.all(sessionId, lookup.lower, lookup.upper, entries) as SessionRepoContext[];
+            : plainContexts(readContexts!.all(sessionId, lookup.lower, lookup.upper, entries) as SessionRepoContext[]);
           lookup.complete = true;
         }
         this.lookups.set(sessionId, lookups);
@@ -453,7 +472,7 @@ export class SessionAttributionBatch {
       .filter((row) => !excludedRowids?.has(row.rowid));
     if (rows.length > SESSION_INHERIT_MAX_CONTEXT_ROWS) return { rows: [], truncated: true };
     return {
-      rows: rows.filter((row) => canonicalLinkage(row.repoHash) !== null),
+      rows: rows.filter((row) => factsOf(row).repoHash !== null),
       truncated: false,
     };
   }
