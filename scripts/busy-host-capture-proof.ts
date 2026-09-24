@@ -1,5 +1,5 @@
 /**
- * Busy-host capture proof (eco-6hoxj.163.42, rounds 2 and 3).
+ * Busy-host capture proof (eco-6hoxj.163.42, rounds 2 to 4).
  *
  * Each scenario is a regression for a reviewer finding, built from the
  * reviewer's own construction:
@@ -9,7 +9,9 @@
  *              spends the whole allowance and commits nothing must pass
  *              the lead on (round 3), including with a repair overrun at the
  *              front of every cadence; three busy real sources behind slow
- *              reads all commit.
+ *              reads all commit. Bookkeeping before capture that spends the
+ *              allowance on every capture-first cadence cannot keep the
+ *              leaders out (round 4).
  *   ceiling    200 ms is an admission ceiling: no capture or repair unit
  *              starts after it, and a cadence ends within one bounded unit
  *              of it. Grok discovery of a 2,000-session group with a slow
@@ -304,6 +306,107 @@ async function failingLeader(root: string, front: "capture" | "repair") {
  * Blockers 1 and 2 of round 1 at the scheduler, with real tailers: the
  * reviewer's all-source fixture, every unit start timed against its cadence.
  */
+/**
+ * Charge `ms` of virtual time to each capture-baseline status query (one per
+ * JSONL source), as a large ledger's generation aggregate would take it.
+ */
+function slowBaselineStatus(buffer: LocalEventBuffer, ms: number) {
+  const database = buffer.database as unknown as { prepare: (sql: string) => unknown };
+  const prepare = database.prepare.bind(database);
+  database.prepare = (sql: string) => {
+    const statement = prepare(sql) as { get: (...args: unknown[]) => unknown };
+    if (!/count\(\*\) as excludedGenerations/.test(sql)) return statement;
+    return new Proxy(statement, {
+      get(target, property) {
+        if (property === "get") {
+          return (...args: unknown[]) => {
+            spend(ms);
+            return target.get(...args);
+          };
+        }
+        const value = Reflect.get(target, property, target) as unknown;
+        return typeof value === "function" ? (value as (...args: unknown[]) => unknown).bind(target) : value;
+      },
+    });
+  };
+}
+
+/**
+ * Round 4 (should-fix): the bookkeeping before capture spends the whole
+ * allowance on every cadence, and every cadence is capture-first, so no
+ * repair-first cadence ever hands capture the next turn. A leader the clock
+ * denies starts on the next cadence whatever the clock, so every source
+ * still leads, and commits, within 2S cadences.
+ */
+async function slowBookkeeping(root: string) {
+  const TICKS = 12;
+  const counters = Object.fromEntries((["codex", "claude_code", "grok"] as Source[])
+    .map((source) => [source, { ioStarts: 0, commits: 0 }])) as Record<Source, { ioStarts: number; commits: number }>;
+  const jsonl = (source: "codex" | "claude_code") => ({
+    async scan(options: { deferredBeforeIo?: boolean; automatic: { budget: CaptureWorkBudget } }) {
+      if (options.deferredBeforeIo) return jsonlResult(true, false);
+      counters[source].ioStarts += 1;
+      options.automatic.budget.recordSlice({ bytesRead: 2_048, recordsParsed: 1, eventsAppended: 1 });
+      counters[source].commits += 1;
+      return jsonlResult(false, true);
+    },
+    close() {},
+  });
+  const grok = {
+    async scan(options: { deferredBeforeIo?: boolean; budget: CaptureWorkBudget }) {
+      if (options.deferredBeforeIo) return grokResult(true, false);
+      counters.grok.ioStarts += 1;
+      options.budget.recordSlice({ bytesRead: 2_048, recordsParsed: 1, eventsAppended: 1 });
+      counters.grok.commits += 1;
+      return grokResult(false, true);
+    },
+    close() {},
+  };
+  const buffer = new LocalEventBuffer(path.join(root, "slow-bookkeeping.sqlite"));
+  const maintenance = new CollectorMaintenance(buffer, jsonl("codex") as never, jsonl("claude_code") as never,
+    undefined, grok as never);
+  slowBaselineStatus(buffer, 110);
+  const ticks: Array<{ tick: number; leader: Source; leaderServed: boolean; leaderOverride: boolean;
+    preCaptureMs: number; commits: Record<Source, number> }> = [];
+  let fairness: { deniedCadences?: number } | null = null;
+  try {
+    for (let tick = 0; tick < TICKS; tick += 1) {
+      pinCadence(buffer, "capture");
+      const before = { codex: counters.codex.commits, claude_code: counters.claude_code.commits, grok: counters.grok.commits };
+      const result = await maintenance.runRecent();
+      const turn = (result as { captureTurn?: { order: Source[]; leaderServed: boolean; leaderOverride?: boolean;
+        preCaptureMs?: number } }).captureTurn!;
+      ticks.push({
+        tick, leader: turn.order[0]!, leaderServed: turn.leaderServed, leaderOverride: turn.leaderOverride === true,
+        preCaptureMs: turn.preCaptureMs ?? -1,
+        commits: {
+          codex: counters.codex.commits - before.codex,
+          claude_code: counters.claude_code.commits - before.claude_code,
+          grok: counters.grok.commits - before.grok,
+        },
+      });
+    }
+    fairness = JSON.parse(state(buffer, "automatic_capture_fairness_v1") ?? "null") as { deniedCadences?: number } | null;
+  } finally {
+    maintenance.close();
+    buffer.close();
+  }
+  const windows = Array.from({ length: TICKS - SERVICE_BOUND_CADENCES + 1 }, (_, start) =>
+    ticks.slice(start, start + SERVICE_BOUND_CADENCES));
+  const sources = ["codex", "claude_code", "grok"] as Source[];
+  receipts.slowBookkeeping = { ticks, counters, deniedCadences: fairness?.deniedCadences ?? null };
+  check("progress", "bookkeeping_that_spends_the_allowance_still_lets_every_source_lead_within_the_bound",
+    windows.every((window) => sources.every((source) => window.some((row) => row.leader === source && row.leaderServed))),
+    { boundCadences: SERVICE_BOUND_CADENCES,
+      leaders: ticks.map((row) => `${row.leader}${row.leaderServed ? row.leaderOverride ? "(override)" : "" : "(denied)"}`) });
+  check("progress", "every_source_commits_within_the_bound_behind_slow_bookkeeping",
+    windows.every((window) => sources.every((source) => window.some((row) => row.commits[source] > 0))),
+    { boundCadences: SERVICE_BOUND_CADENCES, counters });
+  check("progress", "a_denied_leader_is_recorded_with_the_time_spent_before_capture",
+    ticks.every((row) => row.preCaptureMs >= AUTOMATIC_CAPTURE_LIMITS.maxWallMs) && (fairness?.deniedCadences ?? 0) > 0,
+    { preCaptureMs: ticks.map((row) => row.preCaptureMs), deniedCadences: fairness?.deniedCadences ?? null });
+}
+
 async function busyHost(root: string) {
   const REPAIR_MS = 220;
   const READ_MS = 120;
@@ -829,6 +932,7 @@ async function main() {
     if (scenario === "all" || scenario === "progress") {
       await failingLeader(root, "capture");
       await failingLeader(root, "repair");
+      await slowBookkeeping(root);
     }
     if (scenario === "all" || scenario === "progress" || scenario === "ceiling") await busyHost(path.join(root, "busy"));
     if (scenario === "all" || scenario === "ceiling") await grokDiscoveryBound(root);
