@@ -359,11 +359,14 @@ export type GrokUsageSweepCounters = {
   statErrors: number;
   readErrors: number;
   /**
-   * Groups and sessions a capped listing left to a later sweep's window. A
-   * sweep with either is not clean; the entries are not dropped.
+   * Groups and sessions a per-pass cap left to a later pass of the same
+   * sweep, summed over its passes. Nothing is dropped.
    */
   groupsOverLimit: number;
   sessionsOverLimit: number;
+  /** Groups and sessions created after the sweep began, left to the next. */
+  groupsDeferred: number;
+  sessionsDeferred: number;
   /** Usage files the recent lane queued ahead of the walk. */
   recentFiles: number;
 };
