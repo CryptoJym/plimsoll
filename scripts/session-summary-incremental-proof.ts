@@ -149,6 +149,7 @@ async function reviewRegressions() {
     "unrelated_revision", "retry_erasure", "hard_bounds", "session_id_paging",
     "privacy_lineage_first_read", "checkpoint_timeout", "future_horizon",
     "interleaved_initial_insert", "trigger_upgrade", "privacy_handoff_erasure",
+    "backdated_queue_planner",
   ];
   for (const name of cases) {
     if (selected && selected !== name) continue;
@@ -448,6 +449,28 @@ async function reviewRegressions() {
         } finally {
           external.close();
         }
+      } else if (name === "backdated_queue_planner") {
+        add(1);
+        const first = await updateSessionSummary(buffer.database, sessionId, until, { read: directRead });
+        assert.equal(first.snapshot?.events, 1);
+        add(2);
+        const later = "2026-10-01T23:59:59.000Z";
+        const discovered = await listLedgerSessionIdsOffThread(buffer.database, {
+          since: until, until: later,
+        });
+        assert.deepEqual(discovered, []);
+        const plan = planDaemonSessionSync({
+          db: buffer.database,
+          state: { ...emptyDaemonSessionSyncState(), caughtUp: true, lastSuccessfulUntil: until },
+          uploadedBatches: [], until: later, ledgerSessionIds: discovered,
+        });
+        assert.equal(plan.skip, false);
+        assert.ok(plan.sessionIds?.includes(sessionId));
+        const updated = await updateSessionSummary(buffer.database, sessionId, later, { read: directRead });
+        assert.equal(updated.snapshot?.events, 2);
+        assert.deepEqual(updated.snapshot, collectSessionSnapshots(buffer.database, {
+          until: later, sessionIds: [sessionId],
+        })[0]);
       }
       console.log(JSON.stringify({ reviewCase: name, result: "PASS" }));
     } finally {

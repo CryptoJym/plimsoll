@@ -775,7 +775,7 @@ function fallbackReason(
 }
 
 /** Session ids whose durable summaries need another bounded pass. */
-export function listSessionSummaryPendingIds(db: Database.Database): string[] {
+export function listSessionSummaryPendingIds(db: Database.Database, until: string): string[] {
   if (!tableExists(db, "session_sync_summary_state") || !tableExists(db, "session_sync_summary_dirty")) return [];
   const rows = db.prepare(
     `select session_id as sessionId from session_sync_summary_dirty
@@ -784,8 +784,12 @@ export function listSessionSummaryPendingIds(db: Database.Database): string[] {
      union
      select r.session_id as sessionId from session_sync_summary_revision r
        left join session_sync_summary_state s on s.session_id = r.session_id
-       where s.session_id is null or r.mutation_revision != s.mutation_revision`,
-  ).all() as Array<{ sessionId: string }>;
+       where s.session_id is null or r.mutation_revision != s.mutation_revision
+     union
+     select r.session_id as sessionId from session_sync_summary_rows r
+       join buffered_events e on e.rowid = r.raw_rowid
+       where e.created_at <= ?`,
+  ).all(until) as Array<{ sessionId: string }>;
   return rows.map((row) => row.sessionId);
 }
 

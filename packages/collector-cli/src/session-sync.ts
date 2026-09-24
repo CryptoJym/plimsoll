@@ -609,7 +609,7 @@ export function planDaemonSessionSync(input: {
   const fromBatches = sessionIdsFromBatches(input.uploadedBatches);
   const blocked = mergeSessionIds(input.state.blockedSessionIds ?? []);
   const blockedSet = new Set(blocked);
-  const summaryPending = listSessionSummaryPendingIds(input.db);
+  const summaryPending = listSessionSummaryPendingIds(input.db, until);
   const pending = mergeSessionIds(input.state.pendingSessionIds, fromBatches, summaryPending)
     .filter((id) => !blockedSet.has(id));
   if (!input.state.caughtUp) {
