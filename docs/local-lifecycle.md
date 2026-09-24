@@ -46,7 +46,10 @@ An update or rollback:
    another process has the ledger open or a full ledger copy would not fit;
 4. copies a digest-verified artifact to an immutable absolute
    `versions/VERSION/darwin-ARCH/bin/plimsoll.mjs` path, together with its
-   vendored companion files (each digest-verified);
+   vendored companion files (each digest-verified and renamed into place). A
+   version that already exists is never changed: a different executable or
+   companion for it fails before any of its files is touched, identical files
+   are kept as they are, and a failed stage removes only what it created;
 5. asks the injected service adapter to activate that exact executable and
    atomically moves the convenience `current` pointer;
 6. accepts success only when runtime version, service, config compatibility,
@@ -352,7 +355,7 @@ pnpm proof:lifecycle            # transaction primitives with injected adapters
 pnpm proof:lifecycle-operator   # real adapter composition + packaged CLI end to end
 pnpm proof:lifecycle-retention  # bounded retention, clone snapshots, disk refusal, prune
 pnpm proof:lifecycle-data-safety  # open writers, atomic restore, strict receipts, clock steps, removal records
-pnpm proof:lifecycle-preservation  # no command removes a receipt
+pnpm proof:lifecycle-preservation  # no command removes a receipt; staging never changes an existing runtime
 ```
 
 The primitive proof uses a fresh temporary ownership root and injected
@@ -411,4 +414,9 @@ refused one, and runs a support bundle, uninstall and purge previews (also
 through the real CLI), a keep-all update, an update, a rollback, an update
 that rolls back, a prune while a `rollback_required` rollback is pending, and
 uninstall and purge applies: every receipt that existed before each command
-is still there, unchanged.
+is still there, unchanged. It then installs a version with vendored
+companions and tries a rebuilt executable and a rebuilt native module under
+the same version: each fails and rolls back with every file of the installed
+version unchanged (content, mode, mtime and inode), an identical bundle
+re-stages without rewriting anything, a companion that fails its digest
+leaves no file behind, and a temp file an interrupted copy left is replaced.

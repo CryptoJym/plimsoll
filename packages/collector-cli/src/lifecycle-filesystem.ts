@@ -657,34 +657,54 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       `${artifact.platform}-${artifact.architecture}`,
     );
     const target = path.join(this.root, immutableRuntimeRelativePath(artifact));
+    // A runtime version is immutable: a different executable fails before any
+    // of the version's files is touched, and no file it holds is replaced or
+    // removed.
+    assertNoSymlink(path.dirname(target), this.root);
+    const existingTarget = lstatIfPresent(target);
+    if (existingTarget && (!existingTarget.isFile() || sha256(target) !== artifact.sha256)) {
+      throw new Error("immutable runtime target already differs");
+    }
+    // Every companion the version already holds is verified before anything is written.
+    const companions = (artifact.files ?? []).map((file, index) => {
+      const destination = path.join(runtimeDirectory, ...file.relativePath.split("/"));
+      assertAbsoluteOwnedPath(destination, this.root, `companion ${index} destination`);
+      assertNoSymlink(path.dirname(destination), this.root);
+      const existing = lstatIfPresent(destination);
+      if (existing && (!existing.isFile() || sha256(destination) !== file.sha256)) {
+        throw new Error(`immutable runtime companion ${file.relativePath} already differs`);
+      }
+      return { file, index, destination, present: existing !== null };
+    });
     const stagedCompanions: Array<{ destination: string }> = [];
     try {
-      for (const [index, file] of (artifact.files ?? []).entries()) {
-        const destination = path.join(runtimeDirectory, ...file.relativePath.split("/"));
-        assertAbsoluteOwnedPath(destination, this.root, `companion ${index} destination`);
-        assertNoSymlink(path.dirname(destination), this.root);
-        ensureDirectory(path.dirname(destination), this.root);
-        if (fs.existsSync(destination)) {
-          fs.rmSync(destination, { force: true });
-        }
+      for (const { file, index, destination, present } of companions) {
+        if (present) continue;
         // Companion sources live in the artifact staging area next to the
         // bundle; their absolute paths were validated when resolved.
         assertAbsoluteOwnedPath(file.sourcePath, this.paths.artifactSourceRoot, `companion ${index} source`);
         assertNoSymlink(file.sourcePath, this.paths.artifactSourceRoot);
-        copyRegularFile(file.sourcePath, destination, FILE_MODE, this.root);
-        if (sha256(destination) !== file.sha256) throw new Error(`companion ${index} digest mismatch`);
+        ensureDirectory(path.dirname(destination), this.root);
+        // Verified beside its destination, then renamed into place, so an
+        // interrupted copy never leaves a partial companion under its name.
+        // `+` never occurs in a companion path, so no companion has this name.
+        const staging = `${destination}+staging`;
+        fs.rmSync(staging, { force: true });
+        try {
+          copyRegularFile(file.sourcePath, staging, FILE_MODE, this.root);
+          if (sha256(staging) !== file.sha256) throw new Error(`companion ${index} digest mismatch`);
+          fs.renameSync(staging, destination);
+        } catch (error) {
+          fs.rmSync(staging, { force: true });
+          throw error;
+        }
         stagedCompanions.push({ destination });
       }
-      assertNoSymlink(path.dirname(target), this.root);
-      ensureDirectory(path.dirname(target), this.root);
-      if (fs.existsSync(target)) {
-        const stat = fs.lstatSync(target);
-        if (!stat.isFile() || stat.isSymbolicLink() || sha256(target) !== artifact.sha256) {
-          throw new Error("immutable runtime target already differs");
-        }
+      if (existingTarget) {
         fs.chmodSync(target, EXECUTABLE_MODE);
         return;
       }
+      ensureDirectory(path.dirname(target), this.root);
       const staging = `${target}.staging`;
       fs.rmSync(staging, { force: true });
       try {
@@ -696,6 +716,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
         throw error;
       }
     } catch (error) {
+      // Only the companions this call created; a file the version already held stays.
       for (const staged of stagedCompanions.reverse()) {
         fs.rmSync(staged.destination, { force: true });
       }

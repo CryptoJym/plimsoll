@@ -8,6 +8,15 @@ import { createProofCompletion } from "./lib/proof-completion";
  * preview could delete a refused or rollback_required receipt, the only
  * record of that operation, or the receipt the command had just written.
  *
+ * eco-6hoxj.163.50: staging never changes a runtime version that already
+ * exists. Before this, stage() removed and re-copied each companion of an
+ * existing version before it checked the executable, and removed them again
+ * when that check failed: a rebuilt bundle claiming an installed version
+ * failed, rolled back "successfully", and left the installed runtime without
+ * its native module. Now a different executable or companion fails before
+ * any file of the version changes, identical files are kept as they are, and
+ * a failed stage removes only what it created.
+ *
  * Every case runs the production lifecycle composition (real filesystem
  * adapter, real SQLite ledger snapshot adapter, real mutation authority) over
  * its own disposable collector home; only the service boundary is a fixture,
@@ -49,6 +58,14 @@ const CASES = {
     "update_rollback_and_automatic_rollback_keep_every_receipt",
     "snapshots_prune_apply_keeps_every_receipt_and_a_pending_rollback_required_one",
     "uninstall_and_purge_apply_keep_every_receipt",
+  ],
+  stage: [
+    "rebuilt_same_version_update_fails_before_any_file_of_the_installed_runtime_changes",
+    "automatic_rollback_leaves_the_installed_runtime_whole",
+    "same_version_with_a_different_companion_fails_without_changing_it",
+    "same_bundle_restage_verifies_and_rewrites_nothing",
+    "failed_companion_copy_leaves_no_unverified_file_in_the_runtime",
+    "leftover_companion_temp_from_an_interrupted_copy_is_replaced",
   ],
 } as const;
 const EXPECTED_CHECKS = Object.values(CASES).reduce((total, names) => total + names.length, 0);
@@ -357,9 +374,155 @@ async function receiptsAreNeverTrimmed() {
   });
 }
 
+// ---- eco-6hoxj.163.50: staging never touches an existing version ---------
+
+type BundleContents = { executable: string; companions: Record<string, string>; wrongDigest?: string };
+
+/** A bundle and its vendored companions in their own source directory; equal contents, equal digests. */
+function bundleArtifact(home: Home, version: string, label: string, contents: BundleContents): RuntimeArtifact {
+  const directory = path.join(home.home, "artifacts", label);
+  const write = (relativePath: string, content: string, mode: number) => {
+    const file = path.join(directory, ...relativePath.split("/"));
+    fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(file, content, { mode });
+    return file;
+  };
+  const sourcePath = write("plimsoll.mjs", `// ${contents.executable}; never executed\n`, 0o700);
+  return {
+    version,
+    platform: "darwin",
+    architecture: ARCHITECTURE,
+    nodeMajor: NODE_MAJOR,
+    sha256: `sha256:${sha256(fs.readFileSync(sourcePath))}`,
+    sourcePath,
+    files: Object.entries(contents.companions).map(([relativePath, content]) => {
+      const file = write(relativePath, content, 0o600);
+      return {
+        relativePath,
+        sourcePath: file,
+        sha256: `sha256:${relativePath === contents.wrongDigest ? sha256("not this file") : sha256(fs.readFileSync(file))}`,
+      };
+    }),
+  };
+}
+
+const runtimeRoot = (home: Home, version: string) => path.join(home.lifecycleRoot, "versions", version, `darwin-${ARCHITECTURE}`);
+
+/** Every entry under a runtime version: type, path, mode, size, mtime, inode and content digest. */
+function runtimeTree(home: Home, version: string) {
+  const root = path.join(home.lifecycleRoot, "versions", version);
+  const rows: string[] = [];
+  const walk = (entry: string) => {
+    const stat = fs.lstatSync(entry, { bigint: true });
+    const relative = path.relative(root, entry) || ".";
+    if (stat.isDirectory()) {
+      rows.push(`d ${relative} ${stat.mode} ${stat.mtimeNs}`);
+      for (const name of fs.readdirSync(entry).sort()) walk(path.join(entry, name));
+    } else {
+      rows.push(`${stat.isFile() ? "f" : "o"} ${relative} ${stat.mode} ${stat.size} ${stat.mtimeNs} ${stat.ino} ${
+        stat.isFile() ? sha256(fs.readFileSync(entry)) : ""}`);
+    }
+  };
+  if (exists(root)) walk(root);
+  return rows;
+}
+
+const changedRows = (before: readonly string[], after: readonly string[]) => ({
+  gone: before.filter((row) => !after.includes(row)),
+  appeared: after.filter((row) => !before.includes(row)),
+});
+
+/** The artifact's executable and companions, each with the digest it declares, as they are now. */
+function stagedMatches(home: Home, artifact: RuntimeArtifact) {
+  const root = runtimeRoot(home, artifact.version);
+  const digestOf = (file: string) => exists(file) && fs.lstatSync(file).isFile() ? `sha256:${sha256(fs.readFileSync(file))}` : null;
+  return [
+    { file: "bin/plimsoll.mjs", sha256: artifact.sha256 },
+    ...(artifact.files ?? []).map((file) => ({ file: file.relativePath, sha256: file.sha256 })),
+  ].filter((entry) => digestOf(path.join(root, ...entry.file.split("/"))) !== entry.sha256).map((entry) => entry.file);
+}
+
+async function stagingNeverTouchesAnExistingVersion() {
+  await runCase(CASES.stage, async (record) => {
+    const home = createHome("stage");
+    const native = "node_modules/better-sqlite3/build/Release/better_sqlite3.node";
+    const dashboard = "bin/dashboard.html";
+    const build = (version: string, executable: string, nativeBuild: string): BundleContents => ({
+      executable: `plimsoll ${version} ${executable}`,
+      companions: { [dashboard]: `<html>${version}</html>\n`, [native]: `native module ${version} ${nativeBuild}\n` },
+    });
+    await home.keepAllManager().update({ operationId: "c0", artifact: home.artifact("4.9.0") });
+    const c1 = bundleArtifact(home, "5.0.0", "c1", build("5.0.0", "build 1", "build 1"));
+    await home.keepAllManager().update({ operationId: "c1", artifact: c1 });
+    const installed = runtimeTree(home, "5.0.0");
+
+    // The reviewer's case: a rebuilt executable claiming the installed version.
+    const rebuilt = await rejection(() => home.keepAllManager().update({
+      operationId: "c2", artifact: bundleArtifact(home, "5.0.0", "c2", build("5.0.0", "build 2", "build 1")),
+    }));
+    const afterRebuilt = runtimeTree(home, "5.0.0");
+    record(CASES.stage[0],
+      /immutable runtime target already differs/.test(rebuilt?.message ?? "") && home.receipt("c2")?.status === "rolled_back" &&
+        JSON.stringify(afterRebuilt) === JSON.stringify(installed),
+      { error: rebuilt?.message, status: home.receipt("c2")?.status, ...changedRows(installed, afterRebuilt) });
+    const state = JSON.parse(fs.readFileSync(path.join(home.lifecycleRoot, "state.json"), "utf8")) as { version: string };
+    record(CASES.stage[1],
+      state.version === "5.0.0" && fs.readlinkSync(path.join(home.lifecycleRoot, "current")) === runtimeRoot(home, "5.0.0") &&
+        stagedMatches(home, c1).length === 0,
+      { state, current: fs.readlinkSync(path.join(home.lifecycleRoot, "current")), missingOrChanged: stagedMatches(home, c1) });
+
+    // The installed executable with a rebuilt native module, listed after a
+    // companion the version does not hold yet: nothing may be written first.
+    const rebuiltNative = build("5.0.0", "build 1", "build 2");
+    const recompiled = await rejection(() => home.keepAllManager().update({
+      operationId: "c3", artifact: bundleArtifact(home, "5.0.0", "c3", {
+        ...rebuiltNative,
+        companions: {
+          [dashboard]: rebuiltNative.companions[dashboard]!,
+          "node_modules/bindings/bindings.js": "module.exports = null;\n",
+          [native]: rebuiltNative.companions[native]!,
+        },
+      }),
+    }));
+    const afterRecompiled = runtimeTree(home, "5.0.0");
+    record(CASES.stage[2],
+      /immutable runtime companion node_modules\/better-sqlite3\/build\/Release\/better_sqlite3\.node already differs/
+        .test(recompiled?.message ?? "") && home.receipt("c3")?.status === "rolled_back" &&
+        JSON.stringify(afterRecompiled) === JSON.stringify(installed),
+      { error: recompiled?.message, status: home.receipt("c3")?.status, ...changedRows(installed, afterRecompiled) });
+
+    // The identical bundle again, from fresh source files with the same bytes.
+    const repin = await home.keepAllManager().update({
+      operationId: "c4", artifact: bundleArtifact(home, "5.0.0", "c4", build("5.0.0", "build 1", "build 1")),
+    });
+    const afterRepin = runtimeTree(home, "5.0.0");
+    record(CASES.stage[3], repin.status === "completed" && JSON.stringify(afterRepin) === JSON.stringify(installed),
+      { status: repin.status, ...changedRows(installed, afterRepin) });
+
+    // A new version whose native module fails its digest: nothing unverified stays behind.
+    const failedCopy = await rejection(() => home.keepAllManager().update({
+      operationId: "c5", artifact: bundleArtifact(home, "5.1.0", "c5", { ...build("5.1.0", "build 1", "build 1"), wrongDigest: native }),
+    }));
+    const leftover = runtimeTree(home, "5.1.0").filter((row) => !row.startsWith("d "));
+    record(CASES.stage[4],
+      /companion 1 digest mismatch/.test(failedCopy?.message ?? "") && home.receipt("c5")?.status === "rolled_back" && leftover.length === 0,
+      { error: failedCopy?.message, status: home.receipt("c5")?.status, leftover });
+
+    // A stage interrupted mid-copy left only its temp file; the next stage replaces it.
+    const temp = path.join(runtimeRoot(home, "5.2.0"), ...`${native}+staging`.split("/"));
+    fs.mkdirSync(path.dirname(temp), { recursive: true, mode: 0o700 });
+    fs.writeFileSync(temp, "partial copy\n", { mode: 0o600 });
+    const c6 = bundleArtifact(home, "5.2.0", "c6", build("5.2.0", "build 1", "build 1"));
+    const retried = await home.keepAllManager().update({ operationId: "c6", artifact: c6 });
+    record(CASES.stage[5], retried.status === "completed" && !exists(temp) && stagedMatches(home, c6).length === 0,
+      { status: retried.status, temp: exists(temp), missingOrChanged: stagedMatches(home, c6) });
+  });
+}
+
 async function main() {
   try {
     await receiptsAreNeverTrimmed();
+    await stagingNeverTouchesAnExistingVersion();
     const failed = results.filter((row) => !row.passed).map((row) => row.name);
     console.log(JSON.stringify({ proof: "lifecycle-preservation", checks: results.length, passed: results.length - failed.length, failed }));
   } finally {
