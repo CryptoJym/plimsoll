@@ -174,7 +174,13 @@ export type LifecycleRemovedItem = {
 export type LifecycleRetentionRecord = {
   keepSnapshots: number;
   status: "applied" | "preview" | "skipped";
-  skippedReason: "lifecycle_state_unreadable" | "journal_unreadable" | "completion_order_unproven" | "retention_failed" | null;
+  skippedReason:
+    | "lifecycle_state_unreadable"
+    | "journal_unreadable"
+    | "completion_order_unproven"
+    | "removal_record_unreadable"
+    | "retention_failed"
+    | null;
   removed: LifecycleRemovedItem[];
   removedBytes: number;
   /** Removals an interrupted earlier retention left in the trash, finished now. */
@@ -249,7 +255,12 @@ export type LifecycleSnapshotInventory = {
   keepSnapshots: number;
   installedVersion: string | null;
   /** Set when retention would refuse to remove anything. */
-  blockedReason: "lifecycle_state_unreadable" | "journal_unreadable" | "completion_order_unproven" | null;
+  blockedReason:
+    | "lifecycle_state_unreadable"
+    | "journal_unreadable"
+    | "completion_order_unproven"
+    | "removal_record_unreadable"
+    | null;
   snapshots: Array<{
     id: string;
     createdAt: string | null;
@@ -370,6 +381,11 @@ export type LifecycleAdapter = {
    * operation's fence before each removal.
    */
   retainSnapshots?(input: { operationId: string; keep: number; apply: boolean }): Promise<LifecycleRetentionRecord>;
+  /**
+   * After the receipt of an applied retention is persisted: drops the durable
+   * removal records that receipt accounts for, once it names every item.
+   */
+  commitRetention?(operationId: string): Promise<void>;
 };
 
 export class LifecycleInterruption extends Error {
@@ -682,7 +698,8 @@ const CLONE_FALLBACK_VALUES: readonly (LifecycleCloneFallback | null)[] = [
   null, "ledger_in_use", "ledger_not_wal", "wal_not_empty", "quiescence_unproven", "clone_unsupported",
 ];
 const RETENTION_SKIPPED_REASONS = [
-  "lifecycle_state_unreadable", "journal_unreadable", "completion_order_unproven", "retention_failed",
+  "lifecycle_state_unreadable", "journal_unreadable", "completion_order_unproven", "removal_record_unreadable",
+  "retention_failed",
 ];
 const MAX_RECEIPT_LIST = 100_000;
 
@@ -979,8 +996,10 @@ export class LifecycleManager {
     try {
       await this.fence(receipt.operationId);
       await this.adapter.persistReceipt(retained);
+      if (retention.status === "applied") await this.adapter.commitRetention?.(receipt.operationId);
     } catch {
-      // The committed receipt without the retention addendum stays durable.
+      // The committed receipt without the retention addendum stays durable,
+      // and so do the removal records: the next apply reports them recovered.
     }
     return retained;
   }
@@ -1148,6 +1167,7 @@ export class LifecycleManager {
       };
       await this.fence(input.operationId);
       await this.adapter.persistReceipt(receipt);
+      if (retention.status === "applied") await this.adapter.commitRetention?.(input.operationId);
       return { receipt, retention };
     } finally {
       await this.adapter.releaseLock(input.operationId);

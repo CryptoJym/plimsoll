@@ -213,6 +213,53 @@ function isOtherOperationReceipt(value: unknown, operationId: string) {
     ["uninstall", "purge", "support_bundle", "snapshots_prune"].includes(String(row.operation));
 }
 
+/**
+ * What one operation committed to removing, written and fsynced before any
+ * of it is moved or deleted and kept until a durable receipt names every
+ * item. "planned": retention chose it; "orphan": a trash entry no record
+ * accounted for.
+ */
+type RemovalItem = LifecycleRemovedItem & { trashName: string; origin: "planned" | "orphan" };
+type RemovalRecord = { schemaVersion: typeof LIFECYCLE_SCHEMA_VERSION; operationId: string; items: RemovalItem[] };
+
+const TRASH_NAME = /^(snapshot|runtime_version)\+([A-Za-z0-9][A-Za-z0-9._-]{0,95})\+[0-9a-f]{12}$/;
+
+function parseRemovalRecord(value: unknown, operationId: string): RemovalRecord | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  if (Object.keys(row).sort().join(",") !== "items,operationId,schemaVersion" || row.schemaVersion !== 1 ||
+      row.operationId !== operationId || !Array.isArray(row.items) || row.items.length > MAX_COMPLETION_MARKERS) return null;
+  const items: RemovalItem[] = [];
+  for (const entry of row.items as unknown[]) {
+    if (!entry || typeof entry !== "object" || Array.isArray(entry)) return null;
+    const item = entry as Record<string, unknown>;
+    const trash = TRASH_NAME.exec(String(item.trashName));
+    if (Object.keys(item).sort().join(",") !== "bytes,kind,name,origin,trashName" || !trash ||
+        trash[1] !== item.kind || trash[2] !== item.name || !isBoundedIdentifier(item.name) ||
+        typeof item.bytes !== "number" || !Number.isSafeInteger(item.bytes) || item.bytes < 0 ||
+        (item.origin !== "planned" && item.origin !== "orphan")) return null;
+    items.push({
+      kind: item.kind as RemovalItem["kind"], name: item.name, bytes: item.bytes, trashName: item.trashName as string,
+      origin: item.origin,
+    });
+  }
+  return { schemaVersion: 1, operationId, items };
+}
+
+/** Whether a durable receipt's retention record names every one of `items`. */
+function receiptNamesRemovals(receipt: unknown, items: readonly LifecycleRemovedItem[]) {
+  const retention = receipt && typeof receipt === "object" ? (receipt as { retention?: unknown }).retention : undefined;
+  if (!retention || typeof retention !== "object") return false;
+  const named = new Set<string>();
+  for (const list of [(retention as { removed?: unknown }).removed, (retention as { recovered?: unknown }).recovered]) {
+    if (!Array.isArray(list)) return false;
+    for (const item of list) {
+      if (item && typeof item === "object") named.add(`${(item as { kind?: unknown }).kind}:${(item as { name?: unknown }).name}`);
+    }
+  }
+  return items.every((item) => named.has(`${item.kind}:${item.name}`));
+}
+
 function writeJson(file: string, value: unknown, boundary?: string) {
   ensureDirectory(path.dirname(file), boundary);
   if (boundary) assertNoSymlink(file, boundary);
@@ -336,6 +383,12 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
   private readonly lockPath: string;
   private readonly currentPath: string;
   private readonly orderPath: string;
+  private readonly removalsRoot: string;
+  /**
+   * Operation → the removal records its receipt accounts for and the items
+   * that receipt must name before those records may be deleted.
+   */
+  private readonly pendingCommits = new Map<string, { records: string[]; named: LifecycleRemovedItem[] }>();
   /** Operation-ID → held mutation lease. Bounded; one process holds at most a
    * handful of concurrent lifecycle operations. */
   private readonly fences = new Map<string, LifecycleMutationLease>();
@@ -372,6 +425,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     this.lockPath = path.join(this.root, "operation.lock");
     this.currentPath = path.join(this.root, "current");
     this.orderPath = path.join(this.root, "completion-order.json");
+    this.removalsRoot = path.join(this.root, "removals");
     if (fs.existsSync(paths.ownershipRoot) && fs.lstatSync(paths.ownershipRoot).isSymbolicLink()) {
       throw new Error("ownership root cannot be a symlink");
     }
@@ -761,9 +815,9 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       // never make a completed destructive operation reusable. A verified or
       // rollback-complete journal can still reopen and finish receipt writing.
       // A refusal changed nothing, so its operation ID stays usable.
-      writeJson(path.join(this.completedRoot, `${receipt.operationId}.json`), receipt, this.completedRoot);
+      writeJsonDurable(path.join(this.completedRoot, `${receipt.operationId}.json`), receipt, this.completedRoot);
     }
-    writeJson(path.join(this.receiptsRoot, `${receipt.operationId}-${receipt.operation}.json`), receipt, this.receiptsRoot);
+    writeJsonDurable(path.join(this.receiptsRoot, `${receipt.operationId}-${receipt.operation}.json`), receipt, this.receiptsRoot);
     const receipts = fs.readdirSync(this.receiptsRoot)
       .filter((entry) => entry.endsWith(".json"))
       .sort((left, right) => left.localeCompare(right));
@@ -803,9 +857,12 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     }
     assertNoSymlink(this.snapshotsRoot, this.root);
     fs.rmSync(this.snapshotsRoot, { recursive: true, force: true });
-    // Snapshots awaiting removal still hold config and ledger copies.
+    // Snapshots awaiting removal still hold config and ledger copies. Their
+    // removal records go with them: this purge receipt covers every snapshot.
     assertNoSymlink(this.trashRoot, this.root);
     fs.rmSync(this.trashRoot, { recursive: true, force: true });
+    assertNoSymlink(this.removalsRoot, this.root);
+    fs.rmSync(this.removalsRoot, { recursive: true, force: true });
     return targets;
   }
 
@@ -1023,6 +1080,9 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
         (journal !== null && (snapshot.id === journal.snapshotId || snapshot.id === journal.operationId))) &&
       [...predates].every((id) => markerIds.has(id));
     if (!proven) blockedReason ??= "completion_order_unproven";
+    // A removal record that cannot be read may describe deletions no receipt
+    // names yet: remove nothing more until someone looks.
+    if (this.removalRecords().invalid.length > 0) blockedReason ??= "removal_record_unreadable";
     const operations = markers.operations.map((operation) => ({ ...operation, predatesSequence: predates.has(operation.id) }));
     return {
       input: {
@@ -1052,14 +1112,50 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     return entries;
   }
 
-  private async drainTrash(operationId: string) {
-    const drained: LifecycleRemovedItem[] = [];
-    for (const entry of this.trashEntries()) {
-      await this.assertFence(operationId);
-      fs.rmSync(path.join(this.trashRoot, entry.fileName), { recursive: true, force: true });
-      if (entry.item) drained.push(entry.item);
+  /** Removal records of operations whose receipt has not yet accounted for them. */
+  private removalRecords() {
+    const records: RemovalRecord[] = [];
+    const invalid: string[] = [];
+    if (!lstatIfPresent(this.removalsRoot)) return { records, invalid };
+    assertNoSymlink(this.removalsRoot, this.root);
+    for (const name of fs.readdirSync(this.removalsRoot).sort()) {
+      if (!name.endsWith(".json")) continue;
+      const operationId = name.slice(0, -".json".length);
+      try {
+        const stat = fs.lstatSync(path.join(this.removalsRoot, name));
+        if (!isBoundedIdentifier(operationId) || !stat.isFile() || stat.size > 64 * 1024 * 1024) throw new Error("bad record");
+        const record = parseRemovalRecord(JSON.parse(fs.readFileSync(path.join(this.removalsRoot, name), "utf8")), operationId);
+        if (!record) throw new Error("bad record");
+        records.push(record);
+      } catch {
+        invalid.push(name);
+      }
     }
-    return drained;
+    return { records, invalid };
+  }
+
+  /** Whether the operation's durable completion marker names every one of `items`. */
+  private receiptNames(operationId: string, items: readonly LifecycleRemovedItem[]) {
+    try {
+      const marker = path.join(this.completedRoot, `${operationId}.json`);
+      assertNoSymlink(marker, this.root);
+      const stat = lstatIfPresent(marker);
+      if (!stat?.isFile() || stat.size > MAX_MARKER_BYTES) return false;
+      return receiptNamesRemovals(JSON.parse(fs.readFileSync(marker, "utf8")), items);
+    } catch {
+      return false;
+    }
+  }
+
+  private removalSource(item: LifecycleRemovedItem) {
+    return path.join(item.kind === "snapshot" ? this.snapshotsRoot : this.versionsRoot, item.name);
+  }
+
+  /** Deletes one trash entry (never following a link); its removal is already durably recorded. */
+  private async deleteTrashEntry(operationId: string, trashName: string) {
+    await this.assertFence(operationId);
+    assertNoSymlink(this.trashRoot, this.root);
+    fs.rmSync(path.join(this.trashRoot, trashName), { recursive: true, force: true });
   }
 
   async inspectSnapshots(input: { keep: number }): Promise<LifecycleSnapshotInventory> {
@@ -1105,13 +1201,16 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
   }
 
   /**
-   * Crash-safe removal: each removed snapshot or runtime is first renamed into
-   * the lifecycle trash (atomic on one volume; the directories are fsynced),
-   * then deleted. A process that stops between the two leaves only trash,
-   * which the next retention or prune deletes and records as recovered.
+   * Crash-safe, audited removal. Before anything moves, this operation's
+   * removal record (every planned item and every unaccounted trash entry,
+   * each with its trash name) is written and fsynced. Items are then renamed
+   * into the lifecycle trash (atomic on one volume; directories fsynced) and
+   * deleted. The record stays until commitRetention runs after a durable
+   * receipt names every item, so a crash or a failed receipt write at any
+   * point leaves a record that the next apply finishes and reports as
+   * recovered. Nothing is deleted while retention is blocked.
    */
   async retainSnapshots(input: { operationId: string; keep: number; apply: boolean }): Promise<LifecycleRetentionRecord> {
-    const recovered = input.apply ? await this.drainTrash(input.operationId) : [];
     const { input: retention, blockedReason } = this.retentionInput();
     const plan = planLifecycleRetention(retention, input.keep);
     const snapshotBytes = new Map(retention.snapshots.map((snapshot) => [snapshot.id, snapshot.bytes]));
@@ -1122,7 +1221,11 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       ...plan.versions.filter((row) => !row.keep)
         .map((row) => ({ kind: "runtime_version" as const, name: row.version, bytes: versionBytes.get(row.version) ?? 0 })),
     ];
-    const record = (status: LifecycleRetentionRecord["status"], items: LifecycleRemovedItem[]): LifecycleRetentionRecord => ({
+    const record = (
+      status: LifecycleRetentionRecord["status"],
+      items: LifecycleRemovedItem[],
+      recovered: LifecycleRemovedItem[],
+    ): LifecycleRetentionRecord => ({
       keepSnapshots: input.keep,
       status,
       skippedReason: status === "skipped" ? blockedReason : null,
@@ -1132,23 +1235,76 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       keptSnapshots: status === "skipped" ? [] : plan.snapshots.filter((row) => row.keep).map((row) => row.id),
       keptVersions: status === "skipped" ? [] : plan.versions.filter((row) => row.keep).map((row) => row.version),
     });
-    if (blockedReason) return record("skipped", []);
-    if (!input.apply) return record("preview", removed);
-    for (const item of removed) {
+    if (blockedReason) return record("skipped", [], []);
+    if (!input.apply) return record("preview", removed, []);
+
+    // Finish what earlier operations recorded but no receipt accounts for.
+    const recovered: LifecycleRemovedItem[] = [];
+    const committed: string[] = [];
+    const earlier = this.removalRecords().records;
+    for (const pending of earlier) {
+      const alreadyRecorded = this.receiptNames(pending.operationId, pending.items);
+      for (const item of pending.items) {
+        if (lstatIfPresent(path.join(this.trashRoot, item.trashName))) {
+          await this.deleteTrashEntry(input.operationId, item.trashName);
+        } else if (lstatIfPresent(this.removalSource(item))) {
+          continue; // never moved: nothing was removed, and retention decides it afresh
+        }
+        if (!alreadyRecorded) recovered.push({ kind: item.kind, name: item.name, bytes: item.bytes });
+      }
+      committed.push(pending.operationId);
+    }
+    const accounted = new Set(earlier.flatMap((pending) => pending.items.map((item) => item.trashName)));
+    const orphans: RemovalItem[] = this.trashEntries().flatMap((entry) =>
+      entry.item && !accounted.has(entry.fileName) ? [{ ...entry.item, trashName: entry.fileName, origin: "orphan" as const }] : []);
+    const planned: RemovalItem[] = removed.map((item) => ({
+      ...item,
+      trashName: [item.kind, item.name, randomBytes(6).toString("hex")].join(TRASH_SEPARATOR),
+      origin: "planned" as const,
+    }));
+    // A retried operation (same ID) replaces its own earlier record, so that
+    // record's items are carried over until this receipt names them.
+    const carried = earlier.find((pending) => pending.operationId === input.operationId)?.items ?? [];
+    const items = [...planned, ...orphans, ...carried];
+    if (items.length > 0) {
       await this.assertFence(input.operationId);
-      const source = path.join(item.kind === "snapshot" ? this.snapshotsRoot : this.versionsRoot, item.name);
+      writeJsonDurable(path.join(this.removalsRoot, `${input.operationId}.json`),
+        { schemaVersion: 1, operationId: input.operationId, items } satisfies RemovalRecord, this.root);
+      committed.push(input.operationId);
+    }
+    const report = (item: RemovalItem): LifecycleRemovedItem => ({ kind: item.kind, name: item.name, bytes: item.bytes });
+    const reportedRecovered = [...recovered, ...orphans.map(report)];
+    this.pendingCommits.set(input.operationId, { records: committed, named: [...planned.map(report), ...reportedRecovered] });
+    for (const item of planned) {
+      await this.assertFence(input.operationId);
+      const source = this.removalSource(item);
       assertNoSymlink(source, this.root);
       if (!fs.lstatSync(source).isDirectory()) throw new Error("retention target must be a directory");
       ensureDirectory(this.trashRoot, this.root);
-      const target = path.join(this.trashRoot, [item.kind, item.name, randomBytes(6).toString("hex")].join(TRASH_SEPARATOR));
-      fs.renameSync(source, target);
+      fs.renameSync(source, path.join(this.trashRoot, item.trashName));
     }
-    if (removed.length > 0) {
+    if (planned.length > 0) {
       fsyncDirectory(this.trashRoot);
-      if (removed.some((item) => item.kind === "snapshot")) fsyncDirectory(this.snapshotsRoot);
-      if (removed.some((item) => item.kind === "runtime_version")) fsyncDirectory(this.versionsRoot);
+      if (planned.some((item) => item.kind === "snapshot")) fsyncDirectory(this.snapshotsRoot);
+      if (planned.some((item) => item.kind === "runtime_version")) fsyncDirectory(this.versionsRoot);
     }
-    await this.drainTrash(input.operationId);
-    return record("applied", removed);
+    for (const item of items) await this.deleteTrashEntry(input.operationId, item.trashName);
+    return record("applied", planned.map(report), reportedRecovered);
+  }
+
+  /**
+   * Called after the receipt of a retention apply is persisted. Only when that
+   * durable receipt names every removed and recovered item are the removal
+   * records it accounts for deleted; otherwise they stay for the next apply.
+   */
+  async commitRetention(operationId: string) {
+    const pending = this.pendingCommits.get(operationId);
+    this.pendingCommits.delete(operationId);
+    if (!pending || !this.receiptNames(operationId, pending.named)) return;
+    for (const id of pending.records) {
+      const file = path.join(this.removalsRoot, `${id}.json`);
+      assertNoSymlink(file, this.root);
+      fs.rmSync(file, { force: true });
+    }
   }
 }

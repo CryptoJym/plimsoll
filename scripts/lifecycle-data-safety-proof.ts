@@ -61,6 +61,11 @@ const CASES = {
     "ambiguous_pre_sequencing_order_keeps_every_snapshot",
     "duplicated_completion_sequence_keeps_every_snapshot",
   ],
+  b5: [
+    "crash_after_unlink_leaves_a_durable_removal_record",
+    "next_prune_records_the_removal_the_crash_left_unrecorded",
+    "failed_receipt_write_after_retention_is_recovered_by_the_next_prune",
+  ],
 } as const;
 const EXPECTED_CHECKS = Object.values(CASES).reduce((total, names) => total + names.length, 0);
 const completion = createProofCompletion("lifecycle-data-safety", EXPECTED_CHECKS);
@@ -755,12 +760,105 @@ async function b4OrderSurvivesClockSteps() {
   });
 }
 
+// ---- B5: every removal is durably recorded --------------------------------
+
+/** Durable records (outside receipts) naming a removed snapshot, written before any receipt. */
+function removalRecordsNaming(fixture: Home, snapshotId: string) {
+  const directory = path.join(fixture.lifecycleRoot, "removals");
+  return listDirectory(directory).filter((name) => {
+    const text = fs.readFileSync(path.join(directory, name), "utf8");
+    return (JSON.parse(text) as { items?: Array<{ kind?: string; name?: string }> }).items
+      ?.some((item) => item.kind === "snapshot" && item.name === snapshotId) === true;
+  });
+}
+
+/** Every receipt and completion marker that reports `snapshotId` as removed or recovered. */
+function receiptsNaming(fixture: Home, snapshotId: string) {
+  return ["receipts", "completed-operations"].flatMap((directory) =>
+    listDirectory(path.join(fixture.lifecycleRoot, directory)).filter((name) => {
+      const receipt = JSON.parse(fs.readFileSync(path.join(fixture.lifecycleRoot, directory, name), "utf8")) as LifecycleReceipt;
+      return [...receipt.retention?.removed ?? [], ...receipt.retention?.recovered ?? []]
+        .some((item) => item.kind === "snapshot" && item.name === snapshotId);
+    }).map((name) => `${directory}/${name}`));
+}
+
+async function b5RemovalsAreDurablyRecorded() {
+  // The review's fixture: the process is lost right after the trash entry of
+  // a pruned snapshot is unlinked, before any receipt is written.
+  await runCase([CASES.b5[0], CASES.b5[1]], async (record) => {
+    const fixture = createHome("b5-crash");
+    await fixture.manager().update({ operationId: "a1", artifact: fixture.artifact("1.0.0") });
+    await fixture.manager().update({ operationId: "a2", artifact: fixture.artifact("1.0.1") });
+    const mutableFs = fs as typeof fs & { rmSync: (...args: unknown[]) => unknown };
+    const originalRm = mutableFs.rmSync;
+    let lostAfterUnlink = false;
+    mutableFs.rmSync = (...args: unknown[]) => {
+      const result = originalRm.apply(fs, args as Parameters<typeof fs.rmSync>);
+      if (!lostAfterUnlink && String(args[0]).includes(`${path.sep}trash${path.sep}snapshot+a1+`)) {
+        lostAfterUnlink = true;
+        throw new Error("proof: process lost after unlink and before any receipt");
+      }
+      return result;
+    };
+    let crash: (Error & { code?: string }) | null;
+    try {
+      crash = await rejection(() => fixture.manager().pruneSnapshots({ operationId: "b5-crash-prune", keep: 1, apply: true }));
+    } finally {
+      mutableFs.rmSync = originalRm;
+    }
+    const records = removalRecordsNaming(fixture, "a1");
+    record(CASES.b5[0],
+      lostAfterUnlink && /process lost/.test(crash?.message ?? "") && !fixture.snapshots().includes("a1") &&
+        fixture.receipt("b5-crash-prune", "snapshots_prune") === null && records.length === 1,
+      { error: crash?.message, snapshots: fixture.snapshots(), records });
+    const recovered = await fixture.manager().pruneSnapshots({ operationId: "b5-recover-prune", keep: 1, apply: true });
+    record(CASES.b5[1],
+      recovered.receipt?.status === "completed" &&
+        recovered.retention.recovered.some((item) => item.kind === "snapshot" && item.name === "a1") &&
+        same(receiptsNaming(fixture, "a1"), ["completed-operations/b5-recover-prune.json", "receipts/b5-recover-prune-snapshots_prune.json"]) &&
+        listDirectory(path.join(fixture.lifecycleRoot, "removals")).length === 0 &&
+        listDirectory(path.join(fixture.lifecycleRoot, "trash")).length === 0,
+      { retention: recovered.retention, naming: receiptsNaming(fixture, "a1"),
+        removals: listDirectory(path.join(fixture.lifecycleRoot, "removals")) });
+  });
+  // Automatic retention after an update deletes, then its receipt addendum
+  // cannot be written: the deletion must still reach a durable receipt.
+  await runCase([CASES.b5[2]], async (record) => {
+    const fixture = createHome("b5-receipt-failure");
+    await fixture.manager().update({ operationId: "w1", artifact: fixture.artifact("5.0.0") });
+    await fixture.manager().update({ operationId: "w2", artifact: fixture.artifact("5.0.1") });
+    const failingReceipts: LifecycleAdapter = new Proxy(fixture.adapter(), {
+      get(target, property) {
+        if (property === "persistReceipt") {
+          return async (receipt: LifecycleReceipt) => {
+            if (receipt.retention) throw new Error("proof: receipt write failed after retention");
+            return target.persistReceipt(receipt);
+          };
+        }
+        const value = target[property as keyof LifecycleAdapter];
+        return typeof value === "function" ? value.bind(target) : value;
+      },
+    });
+    const w3 = await new LifecycleManager(failingReceipts).update({ operationId: "w3", artifact: fixture.artifact("5.0.2") });
+    const deleted = w3.retention?.removed.some((item) => item.kind === "snapshot" && item.name === "w1") === true &&
+      !fixture.snapshots().includes("w1");
+    const unrecordedBefore = receiptsNaming(fixture, "w1").length === 0;
+    const next = await fixture.manager().pruneSnapshots({ operationId: "b5-after-failed-receipt", keep: 2, apply: true });
+    record(CASES.b5[2],
+      deleted && unrecordedBefore && next.receipt?.status === "completed" &&
+        next.retention.recovered.some((item) => item.kind === "snapshot" && item.name === "w1") &&
+        receiptsNaming(fixture, "w1").length > 0 && listDirectory(path.join(fixture.lifecycleRoot, "removals")).length === 0,
+      { w3: w3.retention, next: next.retention, naming: receiptsNaming(fixture, "w1") });
+  });
+}
+
 async function main() {
   try {
     await b1NoSplitBrainRollback();
     await b2RestoreIsAtomicAndCapacityChecked();
     await b3StrictCompletionReceipts();
     await b4OrderSurvivesClockSteps();
+    await b5RemovalsAreDurablyRecorded();
     const failed = results.filter((row) => !row.passed).map((row) => row.name);
     console.log(JSON.stringify({ proof: "lifecycle-data-safety", checks: results.length, passed: results.length - failed.length, failed, liveStateTouched: false }));
   } finally {
