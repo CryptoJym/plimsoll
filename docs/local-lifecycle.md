@@ -275,7 +275,8 @@ records `retention.status: "skipped"` with `skippedReason:
 "skipped_by_operator"` and `wouldRemove`, what retention would have removed at
 that moment (absent when that read-only preview was blocked or failed). Managed rollout
 windows use it so that an update never deletes a host's history; removing old
-snapshots stays a separate, explicit `snapshots prune --apply`. The flag takes
+snapshots stays a separate, explicit `snapshots prune --apply`. The flag needs
+0.7.39 or later; older versions ignore it and prune. It takes
 exactly `keep-all`; a missing or other value, a repeated or `=`-joined flag,
 or the flag on any other lifecycle command fails before any change. `update`
 and `rollback` also refuse any option they do not take, so a misspelled flag
@@ -395,8 +396,10 @@ nothing; and the real CLI update path clones. Keep-all updates and rollbacks,
 through the manager and the real CLI, leave every earlier entry, the trash
 and a full receipts directory in place, record exactly what a prune would
 remove, and a later prune removes exactly that; a misused or misspelled
-`--retention` changes nothing, and a keep-all update that fails readiness
-rolls back without trimming receipts or touching the trash.
+`--retention` changes nothing, a keep-all update that fails readiness
+rolls back without trimming receipts or touching the trash, and a keep-all
+update whose preview is blocked (an unreadable removal record) records no
+`wouldRemove` and leaves that record as it was.
 
 The data-safety proof covers the worst cases: a writer that stays attached
 through an update, or attaches after the snapshot, never ends up writing to
