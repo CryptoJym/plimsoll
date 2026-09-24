@@ -38,6 +38,17 @@ loopback-only `GET /healthz` probe; the probe does not expose or send ledger
 data. Token coverage is `tokenAttributedEvents / count * 100`. It is shown as
 unavailable when stats are absent or the event denominator is zero.
 
+## Test
+
+```bash
+scripts/check.sh
+```
+
+This runs `swift build` and then `swift test`. The tests use Swift Testing, so
+they need a Swift 6 toolchain: Xcode 16 or newer, or the Command Line Tools
+alone (which ship no XCTest; the script adds the Swift Testing paths SwiftPM
+leaves out there).
+
 ## Permission doctor
 
 Run the built executable's read-only doctor:
