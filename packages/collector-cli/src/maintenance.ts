@@ -26,24 +26,19 @@ const AUTOMATIC_CAPTURE_RUNTIME_TABLE = "automatic_capture_runtime_state";
 const REPAIR_SERVICE_KEY = "automatic_repair_service_v1";
 const REPAIR_STAGES = ["projection", "reconciliation", "repricing", "repo_context_suppression"] as const;
 const AUTOMATIC_CAPTURE_FAIRNESS_KEY = "automatic_capture_fairness_v1";
-const CAPTURE_SOURCES = ["codex", "claude_code", "grok"] as const;
+type CaptureSource = "codex" | "claude_code" | "grok";
 type RepairStage = typeof REPAIR_STAGES[number];
 type RepairService = { next: number; cycles: number; stages: Record<RepairStage, {
   attempts: number; completed: number; failures: number; rowsVisited: number; lastSuccessAt: string | null;
 }> };
-type CaptureSource = typeof CAPTURE_SOURCES[number];
 
 /**
- * Durable capture debt (eco-6hoxj.163.42). `owed` counts, per source, the
- * cadences in a row in which the source had (or, unadmitted, may have had)
- * due work and committed nothing. The most-owed source leads the next
- * cadence. `captureFirst` hands the next cadence to capture after a
- * repair-first cadence left a capture source unadmitted. Path- and
- * content-free.
+ * Capture hand-off (eco-6hoxj.163.42). `captureFirst` hands the next cadence
+ * to capture when a repair-first cadence spent the allowance before the
+ * capture leader could start. Path- and content-free.
  */
 export type AutomaticCaptureFairness = {
-  version: 1;
-  owed: Record<CaptureSource, number>;
+  version: 2;
   captureFirst: boolean;
 };
 
@@ -51,10 +46,11 @@ export type AutomaticCaptureFairness = {
 export type AutomaticCaptureTurn = {
   captureFirst: boolean;
   order: CaptureSource[];
+  leader: CaptureSource;
+  /** The leader had its turn, so the rotation moved on to the next source. */
+  leaderServed: boolean;
   admitted: Partial<Record<CaptureSource, boolean>>;
   progressed: Partial<Record<CaptureSource, boolean>>;
-  owedBefore: Record<CaptureSource, number>;
-  owedAfter: Record<CaptureSource, number>;
 };
 
 export function automaticRepairServiceStatus(database: Database.Database): RepairService {
@@ -66,22 +62,15 @@ export function automaticRepairServiceStatus(database: Database.Database): Repai
 }
 
 export function automaticCaptureFairnessStatus(database: Database.Database): AutomaticCaptureFairness {
-  const fairness: AutomaticCaptureFairness = {
-    version: 1, owed: { codex: 0, claude_code: 0, grok: 0 }, captureFirst: false,
-  };
   try {
     const stored = JSON.parse(maintenanceState(database, AUTOMATIC_CAPTURE_FAIRNESS_KEY) ?? "null") as
-      Partial<AutomaticCaptureFairness> | null;
-    if (stored?.version !== 1) return fairness;
-    for (const source of CAPTURE_SOURCES) {
-      const owed = stored.owed?.[source];
-      if (Number.isSafeInteger(owed) && owed! > 0) fairness.owed[source] = Math.min(owed!, 1_000_000);
-    }
-    fairness.captureFirst = stored.captureFirst === true;
+      { version?: unknown; captureFirst?: unknown } | null;
+    // Version 1 (round 2) also carried a debt ledger; only its hand-off remains.
+    if (stored?.version === 1 || stored?.version === 2) return { version: 2, captureFirst: stored.captureFirst === true };
   } catch {
-    // An unreadable debt is no debt: the rotation alone still serves everyone.
+    // An unreadable hand-off is none: the parity alternation still serves capture.
   }
-  return fairness;
+  return { version: 2, captureFirst: false };
 }
 
 function ensureAutomaticCaptureRuntimeState(database: Database.Database) {
@@ -791,34 +780,35 @@ export class CollectorMaintenance {
     // reads. Repairs on a capture-first cadence use only what capture leaves.
     // Persist the choice before work; neither restarts nor busy sources may
     // starve either consumer on the intervening turns. The alternation is
-    // not trusted alone: a repair-first cadence that left a capture source
-    // unadmitted hands the next cadence to capture, whatever its parity.
+    // not trusted alone: a repair-first cadence that spent the allowance
+    // before the capture leader could start hands the next cadence to
+    // capture, whatever its parity. The hand-off is used up by that cadence.
     const repairService = automaticRepairServiceStatus(this.buffer.database);
     const firstRepair = repairService.next % REPAIR_STAGES.length;
     repairService.cycles += 1;
-    const fairness = automaticCaptureFairnessStatus(this.buffer.database);
-    const captureFirst = repairService.cycles % 2 === 0 || fairness.captureFirst;
+    const handOff = automaticCaptureFairnessStatus(this.buffer.database).captureFirst;
+    const captureFirst = repairService.cycles % 2 === 0 || handOff;
+    if (handOff) {
+      setMaintenanceState(this.buffer.database, AUTOMATIC_CAPTURE_FAIRNESS_KEY,
+        JSON.stringify({ version: 2, captureFirst: false } satisfies AutomaticCaptureFairness));
+    }
     const sourceOrder = this.grokTailer
       ? ["codex", "claude_code", "grok"] as const
       : ["codex", "claude_code"] as const;
-    // Rotate before any repair or source work can fail or overrun. A failed
-    // repair must not pin the next cadence to the same capture producer.
+    // Capture sources lead in a fixed rotation, and the lead passes on once
+    // its holder has had its turn: it started with the aggregate clock open,
+    // whether it then committed, failed or was killed. Only a leader the clock
+    // never let start keeps the lead. With the hand-off, the rotation moves in
+    // at least one of every two cadences, so each of S sources leads within
+    // 2S cadences (6 with Grok), and as the leader its first unit is admitted
+    // and allowed to finish. The bound assumes the bookkeeping before capture
+    // fits inside the allowance. A source that keeps failing cannot hold the
+    // lead, so it cannot keep the others out (eco-6hoxj.163.42 round 3).
     const storedTurn = maintenanceState(this.buffer.database, AUTOMATIC_CAPTURE_SOURCE_TURN_KEY);
     const storedIndex = (sourceOrder as readonly string[]).indexOf(storedTurn ?? "codex");
     const firstIndex = storedIndex >= 0 ? storedIndex : 0;
-    // The source owed the most cadences leads. The rotation breaks ties (the
-    // sort is stable), so a host with no capture debt runs exactly the
-    // rotation. Admission alone is not the goal: debt only clears when the
-    // source commits, so a source admitted every cadence but never
-    // committing keeps climbing until it leads.
-    const runOrder: CaptureSource[] = sourceOrder
-      .map((_, offset) => sourceOrder[(firstIndex + offset) % sourceOrder.length]!)
-      .sort((left, right) => fairness.owed[right] - fairness.owed[left]);
-    setMaintenanceState(
-      this.buffer.database,
-      AUTOMATIC_CAPTURE_SOURCE_TURN_KEY,
-      sourceOrder[(firstIndex + 1) % sourceOrder.length]!,
-    );
+    const runOrder: CaptureSource[] = sourceOrder.map((_, offset) =>
+      sourceOrder[(firstIndex + offset) % sourceOrder.length]!);
     let repairTurnAdvanced = false;
     const saveRepairService = () => setMaintenanceState(this.buffer.database,
       REPAIR_SERVICE_KEY, JSON.stringify(repairService));
@@ -910,8 +900,8 @@ export class CollectorMaintenance {
       ? "capture" as const
       : "baseline" as const;
     // Each source's turn is a scope of the one shared budget. Every aggregate
-    // ceiling, the wall clock included, stays hard: a source whose turn comes
-    // after the allowance is spent is not admitted, and becomes owed. The
+    // ceiling, the wall clock included, stays hard for admission: a source
+    // whose turn comes after the allowance is spent is not admitted. The
     // remaining wall is shared among the sources still to run, so one busy
     // source cannot take a whole cadence; unused time flows to the next. An
     // admitted turn is progress, not just admission: its first bounded unit
@@ -994,9 +984,17 @@ export class CollectorMaintenance {
           !(options.quarantine?.source === "grok" && options.quarantine.stage === "source_scan")),
       });
     };
+    let leaderServed = false;
     try {
       for (const [index, source] of runOrder.entries()) {
         const sourceBudget = scopedCaptureBudget(runOrder.length - index);
+        if (index === 0 && sourceBudget.canContinue()) {
+          // Pass the lead on before the leader's scan can fail, overrun or be
+          // killed with its worker.
+          leaderServed = true;
+          setMaintenanceState(this.buffer.database, AUTOMATIC_CAPTURE_SOURCE_TURN_KEY,
+            sourceOrder[(firstIndex + 1) % sourceOrder.length]!);
+        }
         if (source === "codex") rollout = await runRollout(sourceBudget);
         else if (source === "claude_code") transcript = await runTranscript(sourceBudget);
         else if (this.grokTailer) grok = await runGrok(this.grokTailer, sourceBudget);
@@ -1015,10 +1013,14 @@ export class CollectorMaintenance {
       this.current = null;
     }
     if (!rollout || !transcript) throw new Error("automatic_maintenance_result_missing");
-    // Settle capture debt before anything else can fail. A durable commit
-    // (records, a checkpoint, a Grok document or sweep step) clears it; an
-    // unadmitted source, or an admitted one with backlog that committed
-    // nothing, owes one more cadence and moves toward the lead.
+    // Hand the next cadence to capture when a repair-first cadence left the
+    // leader no allowance to start.
+    if (!captureFirst && !leaderServed) {
+      setMaintenanceState(this.buffer.database, AUTOMATIC_CAPTURE_FAIRNESS_KEY,
+        JSON.stringify({ version: 2, captureFirst: true } satisfies AutomaticCaptureFairness));
+    }
+    // A durable commit this cadence: records, a checkpoint, a Grok document
+    // or a Grok walk step. Receipt only; the rotation does not depend on it.
     const jsonlProgressed = (result: RolloutScanResult | TranscriptScanResult) =>
       result.slicesCommitted > 0 || (result.recordsCommitted ?? 0) > 0 ||
       (result.continuationBytesAdvanced ?? 0) > 0;
@@ -1027,22 +1029,8 @@ export class CollectorMaintenance {
       claude_code: jsonlProgressed(transcript),
       ...(grok ? { grok: grok.recordsCommitted > 0 || grok.filesParsed > 0 || grok.activity.discoveryEntries > 0 } : {}),
     };
-    const due: Partial<Record<CaptureSource, boolean>> = {
-      codex: !admitted.codex || rollout.deferredGenerations > 0,
-      claude_code: !admitted.claude_code || transcript.deferredGenerations > 0,
-      ...(grok ? { grok: !admitted.grok || grok.deferredGenerations > 0 || grok.activity.truncated } : {}),
-    };
-    const owedAfter = { ...fairness.owed };
-    for (const source of runOrder) {
-      owedAfter[source] = progressed[source] || !due[source] ? 0 : Math.min(fairness.owed[source] + 1, 1_000_000);
-    }
-    setMaintenanceState(this.buffer.database, AUTOMATIC_CAPTURE_FAIRNESS_KEY, JSON.stringify({
-      version: 1,
-      owed: owedAfter,
-      captureFirst: !captureFirst && runOrder.some((source) => !admitted[source]),
-    } satisfies AutomaticCaptureFairness));
     const captureTurn: AutomaticCaptureTurn = {
-      captureFirst, order: runOrder, admitted, progressed, owedBefore: fairness.owed, owedAfter,
+      captureFirst, order: runOrder, leader: runOrder[0]!, leaderServed, admitted, progressed,
     };
     if (rollout.activity && !this.signal?.aborted) {
       this.buffer.projection.recordCaptureActivity({ source: "codex", ...rollout.activity });
