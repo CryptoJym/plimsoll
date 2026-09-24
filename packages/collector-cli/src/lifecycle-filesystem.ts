@@ -682,20 +682,31 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       const stat = lstatIfPresent(destination);
       if (!stat) continue;
       if (!stat.isFile() || stat.isSymbolicLink() || sha256(destination) !== file.sha256) {
-        throw new Error(`immutable runtime companion ${index} already differs`);
+        throw new Error(`immutable runtime companion ${file.relativePath} already differs`);
       }
     }
 
     try {
-      for (const { file, destination } of companionDestinations) {
+      for (const { file, index, destination } of companionDestinations) {
         if (lstatIfPresent(destination)) continue;
-        ensureDirectory(path.dirname(destination), this.root);
         // Companion sources live in the artifact staging area next to the
         // bundle; their absolute paths were validated when resolved.
         assertAbsoluteOwnedPath(file.sourcePath, this.paths.artifactSourceRoot, `companion ${file.relativePath} source`);
         assertNoSymlink(file.sourcePath, this.paths.artifactSourceRoot);
-        copyRegularFile(file.sourcePath, destination, FILE_MODE, this.root);
-        if (sha256(destination) !== file.sha256) throw new Error(`companion ${file.relativePath} digest mismatch`);
+        ensureDirectory(path.dirname(destination), this.root);
+        // Verify beside the final destination, then publish with one rename.
+        // A failed copy or digest check therefore cannot leave a partial or
+        // unverified companion under its immutable name.
+        const staging = `${destination}+staging`;
+        fs.rmSync(staging, { force: true });
+        try {
+          copyRegularFile(file.sourcePath, staging, FILE_MODE, this.root);
+          if (sha256(staging) !== file.sha256) throw new Error(`companion ${index} digest mismatch`);
+          fs.renameSync(staging, destination);
+        } catch (error) {
+          fs.rmSync(staging, { force: true });
+          throw error;
+        }
         stagedCompanions.push({ destination });
       }
       if (targetStat) {
