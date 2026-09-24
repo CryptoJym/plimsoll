@@ -4,22 +4,14 @@ import PlimsollMenubarCore
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    private let client: CollectorClient?
+    private let home = CollectorHome.resolve()
     private var statusItem: NSStatusItem?
     private let statusItemTitle = NSMenuItem()
     private let tokenItemTitle = NSMenuItem()
     private let permissionItem = NSMenuItem()
-    private var dashboardPort = 48271
+    private var dashboardItem: NSMenuItem?
+    private var dashboardURL: URL?
     private var refreshInFlight = false
-
-    override init() {
-        if let invocation = CollectorInvocation(environment: ProcessInfo.processInfo.environment) {
-            self.client = CollectorClient(invocation: invocation)
-        } else {
-            self.client = nil
-        }
-        super.init()
-    }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         configureStatusItem()
@@ -38,6 +30,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let menu = NSMenu()
         menu.delegate = self
+        // Items are enabled explicitly: Open Dashboard only while running.
+        menu.autoenablesItems = false
         statusItemTitle.title = "Plimsoll — loading…"
         statusItemTitle.isEnabled = false
         menu.addItem(statusItemTitle)
@@ -46,7 +40,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(tokenItemTitle)
         menu.addItem(.separator())
         menu.addItem(menuItem("Refresh", action: #selector(refreshAction)))
-        menu.addItem(menuItem("Open Dashboard", action: #selector(openDashboardAction)))
+        let dashboard = menuItem("Open Dashboard", action: #selector(openDashboardAction))
+        dashboard.isEnabled = false
+        menu.addItem(dashboard)
+        dashboardItem = dashboard
         menu.addItem(.separator())
         permissionItem.title = "Permission doctor: no additional permissions"
         permissionItem.isEnabled = false
@@ -68,35 +65,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc private func openDashboardAction() {
-        guard let url = URL(string: "http://127.0.0.1:\(dashboardPort)") else { return }
-        NSWorkspace.shared.open(url)
+        guard let dashboardURL else { return }
+        NSWorkspace.shared.open(dashboardURL)
     }
 
     @objc private func quitAction() {
         NSApplication.shared.terminate(nil)
     }
 
-    /// Runs one `status` read off the main thread; a refresh already in
-    /// flight absorbs further requests instead of stacking collector runs.
+    /// Reads the summary file and checks liveness off the main thread; a
+    /// refresh already in flight absorbs further requests.
     private func refreshStatus() {
-        guard let client else {
-            render(StatusLines(error: CollectorClientError.noCollectorConfigured))
-            return
-        }
         guard !refreshInFlight else { return }
         refreshInFlight = true
+        let home = self.home
         DispatchQueue.global(qos: .utility).async {
-            let result = Result { try client.snapshot() }
+            let lines = StatusLines(state: CollectorMonitor.state(home: home))
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 self.refreshInFlight = false
-                switch result {
-                case let .success(snapshot):
-                    self.dashboardPort = snapshot.port
-                    self.render(StatusLines(snapshot: snapshot))
-                case let .failure(error):
-                    self.render(StatusLines(error: error))
-                }
+                self.render(lines)
             }
         }
     }
@@ -104,5 +92,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func render(_ lines: StatusLines) {
         statusItemTitle.title = lines.summary
         tokenItemTitle.title = lines.tokens
+        dashboardURL = lines.dashboard
+        dashboardItem?.isEnabled = lines.dashboard != nil
     }
 }

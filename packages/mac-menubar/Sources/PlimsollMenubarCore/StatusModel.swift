@@ -1,90 +1,92 @@
 import Foundation
 
-public struct CollectorStatus: Equatable, Sendable {
-    public let port: Int
-    public let eventCount: Int?
-    public let tokenAttributedEvents: Int?
-    public let totalInputTokens: Int?
-    public let totalOutputTokens: Int?
+/// What the menu shows, from the summary file and the liveness check.
+public enum CollectorState: Equatable, Sendable {
+    /// The collector answers, and its summary is fresh.
+    case running(StatusSummary)
+    /// The collector answers, but has not rewritten its summary lately.
+    case notUpdating(StatusSummary, age: TimeInterval)
+    /// Nothing answers as that collector; the summary is the last it wrote.
+    case stopped(StatusSummary, age: TimeInterval)
+    /// No usable summary.
+    case unavailable(SummaryProblem)
+}
 
-    public var tokenCoveragePercent: Double? {
-        guard let eventCount, eventCount > 0,
-              let tokenAttributedEvents, tokenAttributedEvents >= 0 else {
-            return nil
+public enum CollectorMonitor {
+    /// Reads the summary, then asks whether the collector on its port is live.
+    public static func state(
+        home: URL?,
+        now: Date = Date(),
+        isLive: (StatusSummary) -> Bool = { LivenessProbe.healthz(port: $0.port) }
+    ) -> CollectorState {
+        switch SummaryFile.read(home: home) {
+        case let .failure(problem):
+            return .unavailable(problem)
+        case let .success(summary):
+            let age = max(0, now.timeIntervalSince(summary.updatedAt))
+            guard isLive(summary) else { return .stopped(summary, age: age) }
+            return age > StatusSummary.staleAfter ? .notUpdating(summary, age: age) : .running(summary)
         }
-        return (Double(tokenAttributedEvents) / Double(eventCount)) * 100
-    }
-
-    public init(json: Data) throws {
-        let wire = try JSONDecoder().decode(WireStatus.self, from: json)
-        self.port = (wire.port ?? 48271) > 0 && (wire.port ?? 48271) <= 65535
-            ? wire.port ?? 48271
-            : 48271
-        self.eventCount = wire.stats?.count
-        self.tokenAttributedEvents = wire.stats?.tokenAttributedEvents
-        self.totalInputTokens = wire.stats?.totalInputTokens
-        self.totalOutputTokens = wire.stats?.totalOutputTokens
-    }
-
-    private struct WireStatus: Decodable {
-        let port: Int?
-        let stats: WireStats?
-    }
-
-    private struct WireStats: Decodable {
-        let count: Int?
-        let tokenAttributedEvents: Int?
-        let totalInputTokens: Int?
-        let totalOutputTokens: Int?
     }
 }
 
-public struct CollectorSnapshot: Equatable, Sendable {
-    public let running: Bool
-    public let port: Int
-    public let eventCount: Int?
-    public let tokenAttributedEvents: Int?
-    public let totalInputTokens: Int?
-    public let totalOutputTokens: Int?
-    public let tokenCoveragePercent: Double?
-
-    public init(running: Bool, status: CollectorStatus) {
-        self.running = running
-        self.port = status.port
-        self.eventCount = status.eventCount
-        self.tokenAttributedEvents = status.tokenAttributedEvents
-        self.totalInputTokens = status.totalInputTokens
-        self.totalOutputTokens = status.totalOutputTokens
-        self.tokenCoveragePercent = status.tokenCoveragePercent
-    }
-}
-
-/// The two status lines the menu shows. `--status` prints the same text.
+/// The two status lines the menu shows, and the dashboard it may offer.
+/// Every line is fixed text around numbers; nothing read from disk, the
+/// environment or the network is shown as text. `--status` prints the same.
 public struct StatusLines: Equatable, Sendable {
     public let summary: String
     public let tokens: String
+    /// Offered only while the collector is running.
+    public let dashboard: URL?
 
-    public init(snapshot: CollectorSnapshot) {
-        let state = snapshot.running ? "Running" : "Stopped"
-        let count = snapshot.eventCount.map(String.init) ?? "—"
-        let coverage = snapshot.tokenCoveragePercent.map { String(format: "%.1f%%", $0) } ?? "—"
-        summary = "\(state) · \(count) events · \(coverage) token coverage"
-
-        let input = snapshot.totalInputTokens.map(String.init) ?? "—"
-        let output = snapshot.totalOutputTokens.map(String.init) ?? "—"
-        tokens = "Tokens: \(input) in · \(output) out"
+    public init(state: CollectorState) {
+        switch state {
+        case let .running(summary):
+            self.summary = "Running · \(Self.counts(summary))"
+            tokens = Self.tokens(summary)
+            dashboard = URL(string: "http://127.0.0.1:\(summary.port)/")
+        case let .notUpdating(summary, age):
+            self.summary = "Collector unavailable · summary not updated for \(Self.age(age))"
+            tokens = "\(Self.tokens(summary)) · as of \(Self.age(age)) ago"
+            dashboard = nil
+        case let .stopped(summary, age):
+            self.summary = "Stopped · \(Self.counts(summary))"
+            tokens = "\(Self.tokens(summary)) · as of \(Self.age(age)) ago"
+            dashboard = nil
+        case let .unavailable(problem):
+            summary = "Collector unavailable"
+            tokens = problem.message
+            dashboard = nil
+        }
     }
 
-    public init(error: Error) {
-        summary = "Collector unavailable"
-        tokens = error.localizedDescription
-    }
-
-    /// One JSON object, `{"summary":…,"tokens":…}`.
+    /// One JSON object: `{"dashboard":…|null,"summary":…,"tokens":…}`.
     public func json() -> String {
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
-        let data = (try? encoder.encode(["summary": summary, "tokens": tokens])) ?? Data()
+        let fields: [String: String?] = ["summary": summary, "tokens": tokens, "dashboard": dashboard?.absoluteString]
+        let data = (try? encoder.encode(fields)) ?? Data()
         return String(decoding: data, as: UTF8.self)
+    }
+
+    private static func counts(_ summary: StatusSummary) -> String {
+        let count = summary.eventCount.map(String.init) ?? "—"
+        let coverage = summary.tokenCoveragePercent.map { String(format: "%.1f%%", $0) } ?? "—"
+        return "\(count) events · \(coverage) token coverage"
+    }
+
+    private static func tokens(_ summary: StatusSummary) -> String {
+        let input = summary.totalInputTokens.map(String.init) ?? "—"
+        let output = summary.totalOutputTokens.map(String.init) ?? "—"
+        return "Tokens: \(input) in · \(output) out"
+    }
+
+    static func age(_ seconds: TimeInterval) -> String {
+        switch seconds {
+        case ..<60: return "\(Int(seconds)) s"
+        case ..<3_600: return "\(Int(seconds / 60)) min"
+        case ..<86_400: return "\(Int(seconds / 3_600)) h"
+        default: return "\(Int(seconds / 86_400)) d"
+        }
     }
 }

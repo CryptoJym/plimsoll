@@ -3,209 +3,186 @@ import Testing
 @testable import PlimsollMenubarCore
 
 struct PlimsollMenubarCoreTests {
-    @Test func packagedInvocationUsesBinaryAndCommandWithoutShell() throws {
-        let invocation = try #require(
-            CollectorInvocation(environment: [
-                "PLIMSOLL_COLLECTOR_BIN": "/tmp/plimsoll collector",
-            ])
-        )
+    // MARK: Where the summary lives
 
-        #expect(invocation.executablePath == "/tmp/plimsoll collector")
-        #expect(invocation.arguments == ["status"])
+    @Test func homeDefaultsToTheCollectorsApplicationSupportFolder() {
+        let home = CollectorHome.resolve(environment: [:], userHome: "/Users/someone")
+        #expect(home?.path == "/Users/someone/Library/Application Support/Plimsoll")
+        #expect(CollectorHome.resolve(environment: ["PLIMSOLL_HOME": "  "], userHome: "/Users/someone") == home)
     }
 
-    @Test func checkoutInvocationUsesFixedPnpmArguments() throws {
-        let invocation = try #require(
-            CollectorInvocation(environment: [
-                "PLIMSOLL_COLLECTOR_REPO": "/tmp/plimsoll checkout",
-                "PLIMSOLL_PNPM_BIN": "/tmp/pnpm",
-            ])
-        )
-
-        #expect(invocation.executablePath == "/tmp/pnpm")
-        #expect(invocation.arguments == ["--silent", "--dir", "/tmp/plimsoll checkout", "collector", "status"])
+    @Test func homeHonoursAnAbsolutePlimsollHomeAndRefusesARelativeOne() {
+        #expect(CollectorHome.resolve(environment: ["PLIMSOLL_HOME": "/srv/plimsoll"])?.path == "/srv/plimsoll")
+        #expect(CollectorHome.resolve(environment: ["PLIMSOLL_HOME": "relative/home"]) == nil)
+        #expect(SummaryFile.read(home: nil) == .failure(.invalidHome))
     }
 
-    @Test func checkoutInvocationWithoutPnpmPathResolvesPnpmThroughEnv() throws {
-        let invocation = try #require(
-            CollectorInvocation(environment: ["PLIMSOLL_COLLECTOR_REPO": "/tmp/plimsoll"])
-        )
+    // MARK: Parsing
 
-        #expect(invocation.executablePath == "/usr/bin/env")
-        #expect(invocation.arguments == ["pnpm", "--silent", "--dir", "/tmp/plimsoll", "collector", "status"])
+    @Test func summaryParsesTheCollectorsFile() throws {
+        let summary = try StatusSummary(json: Data(summaryJSON(count: 8, tokenEvents: 2, input: 100, output: 50).utf8))
+
+        #expect(summary.instanceId == instanceA)
+        #expect(summary.port == 49123)
+        #expect(summary.eventCount == 8)
+        #expect(summary.tokenAttributedEvents == 2)
+        #expect(summary.totalInputTokens == 100)
+        #expect(summary.totalOutputTokens == 50)
+        #expect(summary.tokenCoveragePercent == 25)
+        #expect(summary.updatedAt == Date(timeIntervalSince1970: 1_790_000_000))
     }
 
-    /// What `pnpm --dir <repo> collector status` printed without --silent.
-    @Test func statusOutputThatIsNotJSONIsRejected() throws {
-        let invocation = try #require(
-            CollectorInvocation(environment: ["PLIMSOLL_COLLECTOR_REPO": "/tmp/plimsoll"])
-        )
-        let banner = "\n> @plimsoll/monorepo@0.1.0 collector /tmp/plimsoll\n> tsx packages/collector-cli/src/cli.ts status\n\n"
-        for stdout in [banner + #"{"port":48271,"stats":null}"#, "", "not json", "[]"] {
-            let client = CollectorClient(
-                invocation: invocation,
-                execute: { _ in CollectorExecutionResult(standardOutput: stdout, standardError: "", exitCode: 0) },
-                probeLiveness: { _ in true }
-            )
+    @Test func summaryCountersMayBeNullButNeverNegative() throws {
+        let empty = try StatusSummary(json: Data(summaryJSON(stats: "null").utf8))
+        #expect(empty.eventCount == nil && empty.tokenCoveragePercent == nil)
 
-            #expect(throws: CollectorClientError.invalidStatusOutput) { try client.snapshot() }
+        #expect(throws: SummaryProblem.unreadable) {
+            try StatusSummary(json: Data(summaryJSON(count: -1).utf8))
         }
     }
 
-    @Test func noConfiguredCollectorBuildsNoInvocation() {
-        #expect(CollectorInvocation(environment: [:]) == nil)
-        #expect(CollectorInvocation(environment: ["PLIMSOLL_COLLECTOR_BIN": "  "]) == nil)
-    }
-
-    /// The menubar is read-only: whatever it is pointed at, it runs `status`.
     @Test(arguments: [
-        ["PLIMSOLL_COLLECTOR_BIN": "/opt/plimsoll/bin/plimsoll"],
-        ["PLIMSOLL_COLLECTOR_REPO": "/src/plimsoll"],
-        ["PLIMSOLL_COLLECTOR_REPO": "/src/plimsoll", "PLIMSOLL_PNPM_BIN": "/opt/pnpm"],
+        #"{"schema":"plimsoll.status-summary/v2","instanceId":"\#(instanceA)","port":49123,"updatedAt":"2026-09-21T14:13:20.000Z","stats":null}"#,
+        #"{"schema":"plimsoll.status-summary/v1","instanceId":"not-a-uuid","port":49123,"updatedAt":"2026-09-21T14:13:20.000Z","stats":null}"#,
+        #"{"schema":"plimsoll.status-summary/v1","instanceId":"\#(instanceA)","port":0,"updatedAt":"2026-09-21T14:13:20.000Z","stats":null}"#,
+        #"{"schema":"plimsoll.status-summary/v1","instanceId":"\#(instanceA)","port":49123,"updatedAt":"yesterday","stats":null}"#,
+        #"{"schema":"plimsoll.status-summary/v1","instanceId":"\#(instanceA)","port":49123,"updatedAt":"2026-09-21T14:13:20.000Z","stats":{"count":1.5}}"#,
+        "not json",
+        "[]",
     ])
-    func everyInvocationRunsOnlyTheStatusCommand(environment: [String: String]) throws {
-        let invocation = try #require(CollectorInvocation(environment: environment))
-
-        #expect(invocation.arguments.last == "status")
-        #expect(invocation.arguments.filter { ["start", "stop", "restart", "setup"].contains($0) }.isEmpty)
+    func summaryRejectsAnythingButTheCollectorsShape(json: String) {
+        #expect(throws: SummaryProblem.unreadable) { try StatusSummary(json: Data(json.utf8)) }
     }
 
-    @Test func statusParsesCountsAndComputesTokenCoverage() throws {
-        let status = try CollectorStatus(json: Data(#"{"port":48271,"stats":{"count":8,"tokenAttributedEvents":2,"totalInputTokens":100,"totalOutputTokens":50}}"#.utf8))
+    // MARK: Reading the file
 
-        #expect(status.port == 48271)
-        #expect(status.eventCount == 8)
-        #expect(status.tokenAttributedEvents == 2)
-        #expect(status.totalInputTokens == 100)
-        #expect(status.totalOutputTokens == 50)
-        #expect(status.tokenCoveragePercent == 25)
+    @Test func readingFindsTheUsersOwnPrivateSummary() throws {
+        let home = try TemporaryHome()
+        defer { home.remove() }
+        try home.writeSummary(summaryJSON(count: 3))
+
+        #expect(try SummaryFile.read(home: home.url).get().eventCount == 3)
     }
 
-    @Test func statusLeavesCoverageUnavailableWhenStatsAreMissingOrEmpty() throws {
-        let missing = try CollectorStatus(json: Data(#"{"port":48271,"stats":null}"#.utf8))
-        let empty = try CollectorStatus(json: Data(#"{"port":48271,"stats":{"count":0,"tokenAttributedEvents":0}}"#.utf8))
+    @Test func readingReportsAMissingSummary() throws {
+        let home = try TemporaryHome()
+        defer { home.remove() }
 
-        #expect(missing.eventCount == nil)
-        #expect(missing.tokenCoveragePercent == nil)
-        #expect(empty.tokenCoveragePercent == nil)
+        #expect(SummaryFile.read(home: home.url) == .failure(.missing))
     }
 
-    @Test func clientSnapshotCombinesStatusWithLoopbackLiveness() throws {
-        let invocation = try #require(
-            CollectorInvocation(environment: ["PLIMSOLL_COLLECTOR_BIN": "/tmp/plimsoll"])
-        )
-        let client = CollectorClient(
-            invocation: invocation,
-            execute: { _ in
-                CollectorExecutionResult(
-                    standardOutput: #"{"port":49123,"stats":{"count":4,"tokenAttributedEvents":1}}"#,
-                    standardError: "",
-                    exitCode: 0
-                )
-            },
-            probeLiveness: { port in port == 49123 }
-        )
+    @Test(arguments: [0o644, 0o640, 0o604, 0o660])
+    func readingRefusesASummaryOthersCanRead(mode: Int) throws {
+        let home = try TemporaryHome()
+        defer { home.remove() }
+        try home.writeSummary(summaryJSON(), mode: mode_t(mode))
 
-        let snapshot = try client.snapshot()
-
-        #expect(snapshot.running)
-        #expect(snapshot.port == 49123)
-        #expect(snapshot.eventCount == 4)
-        #expect(snapshot.tokenCoveragePercent == 25)
+        #expect(SummaryFile.read(home: home.url) == .failure(.notPrivate))
     }
 
-    @Test func clientRejectsNonZeroCollectorExit() throws {
-        let invocation = try #require(
-            CollectorInvocation(environment: ["PLIMSOLL_COLLECTOR_BIN": "/tmp/plimsoll"])
-        )
-        let client = CollectorClient(
-            invocation: invocation,
-            execute: { _ in
-                CollectorExecutionResult(standardOutput: "", standardError: "failed", exitCode: 1)
-            },
-            probeLiveness: { _ in false }
+    @Test func readingRefusesASymlinkedSummary() throws {
+        let home = try TemporaryHome()
+        defer { home.remove() }
+        let elsewhere = home.url.appendingPathComponent("elsewhere.json")
+        try Data(summaryJSON().utf8).write(to: elsewhere)
+        chmod(elsewhere.path, 0o600)
+        try FileManager.default.createSymbolicLink(
+            at: home.url.appendingPathComponent(StatusSummary.fileName), withDestinationURL: elsewhere
         )
 
-        #expect(throws: CollectorClientError.commandFailed(exitCode: 1, message: "failed")) {
-            try client.snapshot()
+        #expect(SummaryFile.read(home: home.url) == .failure(.notPrivate))
+    }
+
+    @Test func readingNeverBlocksOnAFifoInPlaceOfTheSummary() throws {
+        let home = try TemporaryHome()
+        defer { home.remove() }
+        #expect(mkfifo(home.url.appendingPathComponent(StatusSummary.fileName).path, 0o600) == 0)
+
+        #expect(SummaryFile.read(home: home.url) == .failure(.notPrivate))
+    }
+
+    @Test func readingRefusesAnOversizedOrMalformedSummary() throws {
+        let home = try TemporaryHome()
+        defer { home.remove() }
+        try home.writeSummary(String(repeating: " ", count: StatusSummary.maximumBytes + 1) + summaryJSON())
+        #expect(SummaryFile.read(home: home.url) == .failure(.unreadable))
+
+        try home.writeSummary("{\"schema\":")
+        #expect(SummaryFile.read(home: home.url) == .failure(.unreadable))
+    }
+
+    // MARK: What the menu shows
+
+    @Test func stateFollowsLivenessAndFreshness() throws {
+        let home = try TemporaryHome()
+        defer { home.remove() }
+        try home.writeSummary(summaryJSON(count: 4))
+        let written = Date(timeIntervalSince1970: 1_790_000_000)
+
+        guard case .running = CollectorMonitor.state(home: home.url, now: written + 5, isLive: { _ in true }) else {
+            Issue.record("a live collector with a fresh summary is running"); return
         }
+        #expect(CollectorMonitor.state(home: home.url, now: written + 600, isLive: { _ in true })
+            == .notUpdating(try SummaryFile.read(home: home.url).get(), age: 600))
+        #expect(CollectorMonitor.state(home: home.url, now: written + 7_200, isLive: { _ in false })
+            == .stopped(try SummaryFile.read(home: home.url).get(), age: 7_200))
+        #expect(CollectorMonitor.state(home: nil, isLive: { _ in true }) == .unavailable(.invalidHome))
     }
 
-    @Test func statusLargerThanThePipeBufferIsReadWithoutDeadlock() throws {
-        let collector = try FakeCollector(megabyteStatusScript)
-        defer { collector.remove() }
+    @Test func menuLinesForEachState() throws {
+        let summary = try StatusSummary(json: Data(summaryJSON(count: 8, tokenEvents: 2, input: 100, output: 50).utf8))
 
-        let result = try ProcessCollectorExecutor.run(collector.invocation, timeout: 20)
+        let running = StatusLines(state: .running(summary))
+        #expect(running.summary == "Running · 8 events · 25.0% token coverage")
+        #expect(running.tokens == "Tokens: 100 in · 50 out")
+        #expect(running.dashboard?.absoluteString == "http://127.0.0.1:49123/")
+        #expect(running.json() == #"{"dashboard":"http://127.0.0.1:49123/","summary":"Running · 8 events · 25.0% token coverage","tokens":"Tokens: 100 in · 50 out"}"#)
 
-        #expect(result.exitCode == 0)
-        #expect(result.standardOutput.utf8.count > 1_000_000)
-        #expect(try CollectorStatus(json: Data(result.standardOutput.utf8)).eventCount == 3)
+        let stopped = StatusLines(state: .stopped(summary, age: 7_200))
+        #expect(stopped.summary == "Stopped · 8 events · 25.0% token coverage")
+        #expect(stopped.tokens == "Tokens: 100 in · 50 out · as of 2 h ago")
+        #expect(stopped.dashboard == nil)
+
+        let stale = StatusLines(state: .notUpdating(summary, age: 420))
+        #expect(stale.summary == "Collector unavailable · summary not updated for 7 min")
+        #expect(stale.dashboard == nil)
+
+        let missing = StatusLines(state: .unavailable(.missing))
+        #expect(missing.summary == "Collector unavailable" && missing.tokens == "No status summary found")
+        #expect(missing.json() == #"{"dashboard":null,"summary":"Collector unavailable","tokens":"No status summary found"}"#)
     }
 
-    /// Swift Testing runs every test on the Swift concurrency pool: one thread
-    /// per core, three on a GitHub macOS runner. When all of them are blocked,
-    /// Dispatch starts no thread for DispatchQueue.global() work, so a status
-    /// read must not need one. Twice as many blocking reads as cores fill it.
-    @Test func statusReadsFinishWhileEveryPoolThreadIsBlocked() async throws {
-        let collector = try FakeCollector(megabyteStatusScript)
-        defer { collector.remove() }
-        let callers = 2 * ProcessInfo.processInfo.activeProcessorCount
-
-        let sizes = try await withThrowingTaskGroup(of: Int.self) { group in
-            for _ in 0..<callers {
-                group.addTask {
-                    // Blocks this pool thread for the whole read, as a synchronous caller does.
-                    try ProcessCollectorExecutor.run(collector.invocation, timeout: 20).standardOutput.utf8.count
-                }
+    /// Credential display fails closed: the menu never echoes text from the
+    /// file, the environment or the network, so a token planted in any of
+    /// them (whole, embedded in a longer run, or split across lines) cannot
+    /// reach the screen.
+    @Test func menuTextNeverCarriesACredentialShapedRun() throws {
+        let token = String(repeating: "aB3_-", count: 8) + "xYz"
+        let home = try TemporaryHome(named: "home-\(token)")
+        defer { home.remove() }
+        let planted = [
+            #"{"schema":"plimsoll.status-summary/v1","instanceId":"\#(token)","port":49123,"updatedAt":"2026-09-21T14:13:20.000Z","stats":null}"#,
+            summaryJSON().replacingOccurrences(of: #""stats""#, with: #""note":"x\#(token)y\n\#(token)","stats""#),
+            summaryJSON().replacingOccurrences(of: #""plimsoll.status-summary/v1""#, with: #""\#(token)""#),
+            "Error: \(token)\n\(token.prefix(21))\n\(token.suffix(22))",
+        ]
+        var shown: [String] = []
+        for text in planted {
+            try home.writeSummary(text)
+            for live in [true, false] {
+                let lines = StatusLines(state: CollectorMonitor.state(home: home.url, isLive: { _ in live }))
+                shown += [lines.summary, lines.tokens, lines.json()]
             }
-            return try await group.reduce(into: [Int]()) { $0.append($1) }
         }
+        shown += [StatusLines(state: .unavailable(.invalidHome)).tokens]
 
-        #expect(sizes.count == callers)
-        #expect(sizes.allSatisfy { $0 > 1_000_000 })
-    }
-
-    @Test func hungCollectorTimesOutAndIsStopped() throws {
-        // The fixture records its pid first; 2 s leaves room to start on a
-        // loaded host before the deadline stops it.
-        let collector = try FakeCollector("""
-            echo $$ > "$0.pid"
-            exec /bin/sleep 30
-            """)
-        defer { collector.remove() }
-
-        #expect(throws: CollectorClientError.timedOut(seconds: 2)) {
-            try ProcessCollectorExecutor.run(collector.invocation, timeout: 2)
-        }
-        let pidText = try String(contentsOf: collector.directory.appendingPathComponent("plimsoll.pid"), encoding: .utf8)
-        let pid = try #require(pid_t(pidText.trimmingCharacters(in: .whitespacesAndNewlines)))
-        #expect(kill(pid, 0) == -1 && errno == ESRCH, "the timed-out collector process is still running")
-    }
-
-    @Test func collectorFailureReportsExitCodeAndError() throws {
-        let collector = try FakeCollector("""
-            echo 'Error: database is locked' >&2
-            exit 3
-            """)
-        defer { collector.remove() }
-
-        #expect(throws: CollectorClientError.commandFailed(exitCode: 3, message: "Error: database is locked")) {
-            try CollectorClient(invocation: collector.invocation, probeLiveness: { _ in false }).status()
+        #expect(!shown.isEmpty)
+        for line in shown {
+            #expect(line.range(of: "[A-Za-z0-9_-]{20,}", options: .regularExpression) == nil, "\(line)")
         }
     }
 
-    @Test func missingCollectorExecutableReportsLaunchFailure() throws {
-        let invocation = try #require(
-            CollectorInvocation(environment: ["PLIMSOLL_COLLECTOR_BIN": "/nonexistent/plimsoll"])
-        )
-
-        #expect {
-            try ProcessCollectorExecutor.run(invocation, timeout: 5)
-        } throws: { error in
-            guard case .processLaunchFailed = error as? CollectorClientError else { return false }
-            return true
-        }
-    }
+    // MARK: Liveness
 
     @Test(arguments: [
         (200, #"{"ok":true}"#, true),
@@ -216,13 +193,13 @@ struct PlimsollMenubarCoreTests {
         (401, #"{"ok":true}"#, false),
     ])
     func healthzReplyMustMatchTheCollectorContract(statusCode: Int, body: String, live: Bool) {
-        #expect(CollectorClient.isHealthzReply(statusCode: statusCode, body: Data(body.utf8)) == live)
+        #expect(LivenessProbe.isHealthzReply(statusCode: statusCode, body: Data(body.utf8)) == live)
     }
 
     @Test func probeSeesTheCollectorHealthzAndSendsNoCredential() throws {
         let responder = try LoopbackResponder(reply: collectorHealthzReply)
 
-        #expect(CollectorClient.defaultProbeLiveness(port: responder.port))
+        #expect(LivenessProbe.healthz(port: responder.port))
         let request = try #require(responder.request())
         #expect(request.hasPrefix("GET /healthz HTTP/1.1\r\n"))
         for header in ["x-plimsoll-token", "authorization", "cookie"] {
@@ -230,25 +207,30 @@ struct PlimsollMenubarCoreTests {
         }
     }
 
-    /// Like statusReadsFinishWhileEveryPoolThreadIsBlocked: the probe must
-    /// finish while every pool thread is blocked, so it may need no
-    /// DispatchQueue.global() thread either.
-    @Test func probesFinishWhileEveryPoolThreadIsBlocked() async throws {
+    /// Swift Testing runs every test on the Swift concurrency pool: one thread
+    /// per core, three on a GitHub macOS runner. When all of them are blocked,
+    /// Dispatch starts no thread for DispatchQueue.global() work, so a status
+    /// read must not need one. Twice as many blocking reads as cores fill it.
+    @Test func statusReadsFinishWhileEveryPoolThreadIsBlocked() async throws {
         let callers = 2 * ProcessInfo.processInfo.activeProcessorCount
 
-        let answered = try await withThrowingTaskGroup(of: Bool.self) { group in
+        let running = try await withThrowingTaskGroup(of: Bool.self) { group in
             for _ in 0..<callers {
                 group.addTask {
                     let responder = try LoopbackResponder(reply: collectorHealthzReply)
-                    // Blocks this pool thread for the whole probe.
-                    return CollectorClient.defaultProbeLiveness(port: responder.port) && responder.request() != nil
+                    let home = try TemporaryHome()
+                    defer { home.remove() }
+                    try home.writeSummary(summaryJSON(port: responder.port, updatedAt: isoNow()))
+                    // Blocks this pool thread for the whole file read and probe.
+                    guard case .running = CollectorMonitor.state(home: home.url) else { return false }
+                    return responder.request() != nil
                 }
             }
             return try await group.reduce(into: [Bool]()) { $0.append($1) }
         }
 
-        #expect(answered.count == callers)
-        #expect(answered.allSatisfy { $0 })
+        #expect(running.count == callers)
+        #expect(running.allSatisfy { $0 })
     }
 
     @Test func probeReportsStoppedForAnotherServiceOnThePort() throws {
@@ -256,59 +238,45 @@ struct PlimsollMenubarCoreTests {
             "HTTP/1.1 200 OK", "content-type: text/plain", "content-length: 2", "connection: close", "", "OK",
         ].joined(separator: "\r\n"))
 
-        #expect(!CollectorClient.defaultProbeLiveness(port: responder.port))
+        #expect(!LivenessProbe.healthz(port: responder.port))
     }
 
     @Test func probeReportsStoppedWhenNothingListens() throws {
         let port = try LoopbackResponder.unusedPort()
         let started = Date()
 
-        #expect(!CollectorClient.defaultProbeLiveness(port: port))
-        #expect(Date().timeIntervalSince(started) < CollectorClient.livenessTimeout)
+        #expect(!LivenessProbe.healthz(port: port))
+        #expect(Date().timeIntervalSince(started) < LivenessProbe.timeout)
     }
 
     @Test func probeNeverContactsPortsOutsideTheTCPRange() {
-        #expect(!CollectorClient.defaultProbeLiveness(port: 0))
-        #expect(!CollectorClient.defaultProbeLiveness(port: 70_000))
+        #expect(!LivenessProbe.healthz(port: 0))
+        #expect(!LivenessProbe.healthz(port: 70_000))
     }
 
-    @Test func collectorErrorTextIsOneLineAndNeverACredential() {
-        let token = String(repeating: "aB3_-", count: 8) + "xYz" // a 43-character base64url credential
-        let hash = String(repeating: "0123456789abcdef", count: 4) // sha256 hex, not a credential
-        #expect(token.count == 43)
+    // MARK: What the sources can do
 
-        #expect(CollectorMessage.displayLine("Error: rejected x-plimsoll-token=\(token)\n    at main (cli.ts:1)")
-            == "Error: rejected x-plimsoll-token=[redacted]")
-        #expect(CollectorMessage.displayLine(#"{"managementRead":"\#(token)"}"#) == #"{"managementRead":"[redacted]"}"#)
-        #expect(CollectorMessage.displayLine("\n\n  Error: home sha256:\(hash)  \n") == "Error: home sha256:\(hash)")
-        #expect(CollectorMessage.displayLine(" \n ") == "no error output")
-        let long = CollectorMessage.displayLine(String(repeating: "x ", count: 300))
-        #expect(long.count == CollectorMessage.maximumLength + 1 && long.hasSuffix("…"))
-    }
-
-    @Test func failingCollectorCannotPutACredentialOnScreen() throws {
-        let token = String(repeating: "Zz9-_", count: 8) + "q1W"
-        let collector = try FakeCollector("""
-            echo 'Error: management_credential_invalid \(token)' >&2
-            echo '    at readDaemonState (cli.ts:1191)' >&2
-            exit 1
-            """)
-        defer { collector.remove() }
-
-        #expect {
-            try CollectorClient(invocation: collector.invocation, probeLiveness: { _ in false }).snapshot()
-        } throws: { error in
-            let shown = error.localizedDescription
-            return shown == "Collector exited with status 1: Error: management_credential_invalid [redacted]"
-                && !shown.contains(token)
+    /// The app reads a file and makes one loopback request. It cannot start a
+    /// process, so it never runs `plimsoll status` (which opens the ledger and
+    /// reads the management credential), never leaves a child behind on a
+    /// timeout, and never captures child output to display.
+    @Test func sourcesStartNoProcess() throws {
+        let sources = try packageSources()
+        #expect(sources.count >= 5)
+        let spawning = ["Process(", "NSTask", "posix_spawn", "fork(", "execv", "execl", "system(", "popen(",
+                        "/usr/bin/env", "launchctl", "NSAppleScript", "\"status\""]
+        for (file, text) in sources {
+            for api in spawning {
+                #expect(!text.contains(api), "\(file) uses \(api)")
+            }
         }
     }
 
     @Test func sourcesNeverTouchTheCollectorCredential() throws {
         let sources = try packageSources()
-        #expect(sources.count >= 6)
+        #expect(sources.count >= 5)
         for (file, text) in sources {
-            for needle in ["local-ingest-auth", "managementRead", "x-plimsoll-token"] {
+            for needle in ["local-ingest-auth", "managementRead", "x-plimsoll-token", "work-ledger"] {
                 #expect(!text.contains(needle), "\(file) mentions \(needle)")
             }
         }
@@ -324,7 +292,7 @@ struct PlimsollMenubarCoreTests {
             "SMAppService", "SMLoginItemSetEnabled", "LaunchAgents", // helpers and LaunchAgents
         ]
         let sources = try packageSources()
-        #expect(sources.count >= 6)
+        #expect(sources.count >= 5)
         for (file, text) in sources {
             for api in promptingAPIs {
                 #expect(!text.contains(api), "\(file) uses \(api)")
@@ -333,23 +301,6 @@ struct PlimsollMenubarCoreTests {
         let bundleMetadata = try FileManager.default.subpathsOfDirectory(atPath: packageRoot.path)
             .filter { !$0.hasPrefix(".") && ($0.hasSuffix(".entitlements") || $0.hasSuffix(".plist")) }
         #expect(bundleMetadata.isEmpty)
-    }
-
-    @Test func menuLinesShowStateEventsCoverageAndTokens() throws {
-        let status = try CollectorStatus(json: Data(#"{"port":49123,"stats":{"count":8,"tokenAttributedEvents":2,"totalInputTokens":100,"totalOutputTokens":50}}"#.utf8))
-        let running = StatusLines(snapshot: CollectorSnapshot(running: true, status: status))
-        #expect(running.summary == "Running · 8 events · 25.0% token coverage")
-        #expect(running.tokens == "Tokens: 100 in · 50 out")
-        #expect(running.json() == #"{"summary":"Running · 8 events · 25.0% token coverage","tokens":"Tokens: 100 in · 50 out"}"#)
-
-        let empty = try CollectorStatus(json: Data(#"{"port":48271,"stats":null}"#.utf8))
-        let stopped = StatusLines(snapshot: CollectorSnapshot(running: false, status: empty))
-        #expect(stopped.summary == "Stopped · — events · — token coverage")
-        #expect(stopped.tokens == "Tokens: — in · — out")
-
-        let failed = StatusLines(error: CollectorClientError.timedOut(seconds: 60))
-        #expect(failed.summary == "Collector unavailable")
-        #expect(failed.tokens == "Collector status did not finish within 60 seconds.")
     }
 
     @Test func permissionDoctorReportsNoAdditionalPermissions() throws {
@@ -363,46 +314,56 @@ struct PlimsollMenubarCoreTests {
         #expect(!report.requestsAdditionalPermissions)
         #expect(report.summary == "No additional macOS permissions requested")
 
-        // The XCTest version wrapped these in XCTAssertNoThrow { ... }, which
-        // returns the closure without calling it; they now actually run.
         let json = try PermissionDoctor.json()
         #expect(json.contains("No additional macOS permissions requested"))
         #expect(json.contains("\"requestsAdditionalPermissions\":false"))
     }
 }
 
-/// Status JSON of about 1 MB. The real document grows with the host, and
-/// anything over the 64 KB pipe buffer blocks a collector nobody is reading.
-private let megabyteStatusScript = """
-    printf '{"port":48271,"stats":{"count":3,"tokenAttributedEvents":3},"padding":"'
-    head -c 1000000 /dev/zero | tr '\\0' 'x'
-    printf '"}'
-    """
+private let instanceA = "0f5b9a52-3c1e-4a8b-9d2e-6f7a8b9c0d1e"
 
-/// The collector's `/healthz` answer, byte for byte.
+/// A summary exactly as the collector writes it, written at 1_790_000_000.
+private func summaryJSON(
+    port: Int = 49123, count: Int = 0, tokenEvents: Int = 0, input: Int = 0, output: Int = 0, stats: String? = nil,
+    updatedAt: String = "2026-09-21T14:13:20.000Z"
+) -> String {
+    let counters = stats ?? #"{"count":\#(count),"tokenAttributedEvents":\#(tokenEvents),"totalInputTokens":\#(input),"totalOutputTokens":\#(output)}"#
+    return #"{"schema":"plimsoll.status-summary/v1","instanceId":"\#(instanceA)","collectorVersion":"0.7.38","port":\#(port),"updatedAt":"\#(updatedAt)","stats":\#(counters)}"#
+}
+
+private func isoNow() -> String {
+    let formatter = ISO8601DateFormatter()
+    formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return formatter.string(from: Date())
+}
+
+/// The collector's `/healthz` answer before this change: `{"ok":true}` only.
 private let collectorHealthzReply = [
     "HTTP/1.1 200 OK", "content-type: application/json", "content-length: 11", "connection: close", "",
     #"{"ok":true}"#,
 ].joined(separator: "\r\n")
 
-/// A throwaway executable standing in for `plimsoll`; it is run as
-/// `<path> status`, exactly as the menubar runs the real collector.
-private struct FakeCollector {
-    let directory: URL
-    let invocation: CollectorInvocation
+/// A private (0700) directory standing in for the collector home.
+private struct TemporaryHome: Sendable {
+    let url: URL
 
-    init(_ body: String) throws {
-        directory = FileManager.default.temporaryDirectory
+    init(named name: String = "home") throws {
+        url = FileManager.default.temporaryDirectory
             .appendingPathComponent("plimsoll-menubar-test-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        let executable = directory.appendingPathComponent("plimsoll")
-        try ("#!/bin/sh\n" + body + "\n").write(to: executable, atomically: true, encoding: .utf8)
-        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: executable.path)
-        invocation = try #require(CollectorInvocation(environment: ["PLIMSOLL_COLLECTOR_BIN": executable.path]))
+            .appendingPathComponent(name)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true,
+                                                attributes: [.posixPermissions: 0o700])
+    }
+
+    func writeSummary(_ text: String, mode: mode_t = 0o600) throws {
+        let file = url.appendingPathComponent(StatusSummary.fileName)
+        try? FileManager.default.removeItem(at: file)
+        try Data(text.utf8).write(to: file)
+        chmod(file.path, mode)
     }
 
     func remove() {
-        try? FileManager.default.removeItem(at: directory)
+        try? FileManager.default.removeItem(at: url.deletingLastPathComponent())
     }
 }
 
