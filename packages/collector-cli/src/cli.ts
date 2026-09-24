@@ -413,6 +413,10 @@ Config tools:
       join --dry-run is unsupported and fails before token, network, or local-state mutation.
   generate-config claude-code|codex|gemini-cli|grok|all   (metadata-only; encrypted evidence vault not implemented)
   upload [--url URL --limit 500] [--ingest-key KEY] [--signing-secret SECRET] [--no-mark] [--max-batches 20]
+      --url here and on upload-history, push-repo-labels and sync-outcomes must be on the
+      joined workspace's origin; without a joined workspace it is refused. For a test server
+      on this machine, add --dev-loopback-url to that one command: it allows only a plainly
+      written http(s)://localhost, 127.x.x.x or [::1] URL and warns on every use.
   upload-history [--dry-run] [--full] [--until ISO] [--limit N] [--batch-size 500] [--concurrency 1..8] [--delay-ms 250] [--url URL]
       Default resumes from the local watermark (workspace-backfill-state.json) and scopes
       to rows created at-or-before the run start. --full re-walks everything (re-runs are
@@ -5544,6 +5548,7 @@ async function main() {
     while (batches < Math.max(1, maxBatches)) {
       const result = await uploadBufferedEvents(config, buffer, {
         url: optionValue("--url"),
+        developmentLoopbackUrl: flag("--dev-loopback-url"),
         limit: optionValue("--limit") ? Number(optionValue("--limit")) : undefined,
         ingestKey: optionValue("--ingest-key"),
         signingSecret: optionValue("--signing-secret"),
@@ -5599,6 +5604,7 @@ async function main() {
         delayMs: numberOption("--delay-ms"),
         dryRun: flag("--dry-run"),
         url: optionValue("--url"),
+        developmentLoopbackUrl: flag("--dev-loopback-url"),
       });
       if (!repair.ok) process.exitCode = 1;
       return;
@@ -5614,6 +5620,7 @@ async function main() {
         delayMs: numberOption("--delay-ms"),
         dryRun: flag("--dry-run"),
         url: optionValue("--url"),
+        developmentLoopbackUrl: flag("--dev-loopback-url"),
       });
       if (!sessions.ok) process.exitCode = 1;
       return;
@@ -5627,6 +5634,7 @@ async function main() {
       full: flag("--full"),
       dryRun: flag("--dry-run"),
       url: optionValue("--url"),
+      developmentLoopbackUrl: flag("--dev-loopback-url"),
     });
     if (!result.ok) process.exitCode = 1;
     return;
@@ -5700,6 +5708,7 @@ async function main() {
     }
     const pushed = await pushRepoLabels(config, prepared.candidates, {
       url: optionValue("--url"),
+      developmentLoopbackUrl: flag("--dev-loopback-url"),
     });
     console.log(
       JSON.stringify(
@@ -5742,6 +5751,7 @@ async function main() {
       until: optionValue("--until"),
       dryRun: flag("--dry-run"),
       url: optionValue("--url"),
+      developmentLoopbackUrl: flag("--dev-loopback-url"),
     });
     if (!outcomes.ok) process.exitCode = 1;
     return;

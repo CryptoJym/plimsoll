@@ -88,6 +88,7 @@ separate purge may remove.
 | `lifecycle update\|rollback\|uninstall\|purge\|support-bundle\|snapshots` | Transactional immutable-runtime updates with automatic rollback and bounded snapshot retention, preview-default uninstall, exact-confirmation purge, sanitized support bundle, snapshot list/prune |
 | `scan-rollouts` | One-time full-history walk of Codex rollout files into the ledger |
 | `scan-transcripts` | One-time full-history walk of Claude Code transcripts into the ledger |
+| `sync-outcomes --repository owner/repo` | Send pull request outcomes for one named GitHub repository to the joined workspace (`--dry-run` previews) |
 | `label account HASH NAME` | Local-only display label for a hashed account |
 | `priority add\|remove\|list` | Manage the priority-repo list (hashed; URLs stay local) |
 | `purge-local-data` | Dry-run or explicit purge of local buffered events |
@@ -102,6 +103,52 @@ than `startupWalCheckpointBytes` (default 1 GiB), and emits a structured
 before/after receipt. A checkpoint can truncate the WAL only when no other
 process retains a conflicting SQLite reader or writer; maintenance orphan
 recovery is what prevents an abandoned worker from defeating later attempts.
+
+## Outcome sync
+
+`sync-outcomes` sends the joined workspace what happened to the pull requests
+your local sessions worked on (merge status, check results, reverts and
+reopens) for one GitHub repository you name. It never runs in the background,
+and running it again updates the same rows instead of adding new ones.
+
+```sh
+npx @plimsoll/cli sync-outcomes --repository owner/repo --dry-run   # preview
+npx @plimsoll/cli sync-outcomes --repository owner/repo
+```
+
+`--repository` is the GitHub `owner/repo` from the repository URL. Spaces
+around it and letter case do not matter: ` Acme/Widgets ` and `acme/widgets`
+are the same repository. Both parts follow GitHub's naming rules in plain
+ASCII: the owner is letters, digits and single hyphens (up to 39 characters,
+or a managed user's `name_SHORTCODE`), and the repository name is letters,
+digits, `.`, `-` and `_` (up to 100). Anything else, such as a URL, a third
+path segment or a look-alike Unicode character, is refused before any
+request. Some older GitHub accounts and organizations have names that start
+or end with a hyphen or contain two hyphens in a row. GitHub no longer allows
+such names and `sync-outcomes` does not support them: it refuses them with a
+message that says so. Rename the account or organization on GitHub, or move
+the repository to an owner with a current name, then run it again. For a
+private repository, set
+`GITHUB_TOKEN` or `GH_TOKEN`. The owner and name are sent to the workspace;
+pull request titles, bodies, diffs and file paths are not, and branch names
+travel only as hashes.
+
+## Upload URL overrides
+
+`upload`, `upload-history` (including `--sessions` and `--repair-attribution`),
+`push-repo-labels` and `sync-outcomes` accept `--url` to send to another path
+on the joined workspace. Every request carries that workspace's install key
+and signature, so a `--url` on any other origin is refused before anything is
+sent. Without a joined workspace, `--url` is refused as well.
+
+For local development against a test server on this machine, add
+`--dev-loopback-url` to that one command. It allows only a plainly written
+`http://` or `https://` URL on `localhost`, `127.x.x.x` or `[::1]`, and
+refuses user info, look-alike or encoded host names, and other names that
+merely resolve to this machine. Every use prints a warning to stderr and a
+`development_upload_url_used` line in the command's output. It is a
+command-line flag, not a setting, so it never carries over to other commands
+or processes.
 
 ## What leaves your machine
 

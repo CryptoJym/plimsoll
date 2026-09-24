@@ -37,6 +37,53 @@ export function validatedTransportUrl(raw: string, _label: string) {
   throw new TransportError("insecure_url");
 }
 
+/** The --dev-loopback-url flag only reaches this machine, written plainly as
+ * http(s)://localhost, 127.x.x.x or [::1]. The host as typed must already be
+ * the normalized host, so user info, look-alike or percent-encoded names,
+ * numeric shortcuts (127.1) and other names that merely resolve to this
+ * machine are refused. */
+function assertPlainLoopbackUrl(raw: string) {
+  const refused = new Error(
+    "--dev-loopback-url allows only an http(s) URL on this machine, written plainly: localhost, 127.x.x.x or [::1].",
+  );
+  if (!/^[\x21-\x7e]+$/.test(raw) || raw.includes("\\")) throw refused;
+  const url = validatedTransportUrl(raw, "Development upload URL");
+  const authority = /^https?:\/\/([^/?#]*)/i.exec(raw)?.[1] ?? "";
+  const typedHost = authority.startsWith("[") ? authority.slice(0, authority.indexOf("]") + 1) : authority.split(":")[0];
+  if (!isLoopbackHostname(url.hostname) || typedHost.toLowerCase() !== url.hostname) throw refused;
+}
+
+/** An upload URL override (--url) may pick another path on the configured
+ * workspace, never another origin: every upload carries that workspace's
+ * install key and signature. Without a joined workspace an override is
+ * refused, except through the per-invocation --dev-loopback-url flag, which
+ * allows this machine only and announces every use on stderr and in the
+ * command's output. Returns the chosen URL unchanged. */
+export function pinnedUploadUrl(
+  configuredUrl: string | undefined,
+  overrideUrl: string | undefined,
+  options: { developmentLoopback?: boolean; log?: (line: string) => void } = {},
+) {
+  if (overrideUrl && options.developmentLoopback) assertPlainLoopbackUrl(overrideUrl);
+  if (overrideUrl && !configuredUrl) {
+    if (!options.developmentLoopback) {
+      throw new Error(
+        "Upload URL override needs a joined workspace; run plimsoll join first (for a test server on this machine, add --dev-loopback-url).",
+      );
+    }
+    const origin = new URL(overrideUrl).origin;
+    console.warn(
+      `WARNING: --dev-loopback-url is sending this collector's upload credentials to ${origin} without a joined workspace. Use it for local development only.`,
+    );
+    (options.log ?? console.log)(JSON.stringify({ status: "development_upload_url_used", origin, joinedWorkspace: false }));
+  }
+  if (overrideUrl && configuredUrl && validatedTransportUrl(overrideUrl, "Upload URL").origin !==
+      validatedTransportUrl(configuredUrl, "Configured upload URL").origin) {
+    throw new Error("Upload URL must use the same origin as the configured workspace audience.");
+  }
+  return overrideUrl ?? configuredUrl;
+}
+
 export function assertNoRedirect(response: Response, _label: string, expectedOrigin: string) {
   if (response.redirected || (response.status >= 300 && response.status < 400)) {
     throw new TransportError("redirect_rejected");
