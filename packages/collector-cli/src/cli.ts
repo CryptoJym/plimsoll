@@ -2121,7 +2121,9 @@ async function main() {
         assertCollectorPrivacyMode(workerConfig, "automatic maintenance worker");
         const workerBuffer = openBuffer(workerConfig, false, 900);
         const capture = createProfileCapture(workerBuffer, workerConfig);
-        const workerMaintenance = new CollectorMaintenance(workerBuffer, capture.rollout, capture.transcript);
+        const workerMaintenance = new CollectorMaintenance(
+          workerBuffer, capture.rollout, capture.transcript, undefined, capture.grok,
+        );
         return {
           maintenance: workerMaintenance,
           buffer: workerBuffer,

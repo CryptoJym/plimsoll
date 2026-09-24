@@ -10,6 +10,7 @@ import {
 } from "./codex-reconciliation";
 import { RolloutTailer, type RolloutScanResult } from "./rollout-tailer";
 import { TranscriptTailer, type TranscriptScanResult } from "./transcript-tailer";
+import type { GrokUsageScanResult, GrokUsageTailer } from "./grok-usage-tailer";
 import { captureBaselineStatus } from "./capture-baseline";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
 import type { MaintenanceProgress } from "./maintenance-progress";
@@ -69,10 +70,12 @@ function recordAutomaticCaptureRuntimeState(
   budget: CaptureBudgetStatus,
   rollout?: RolloutScanResult,
   transcript?: TranscriptScanResult,
+  grok?: GrokUsageScanResult,
 ) {
   ensureAutomaticCaptureRuntimeState(database);
-  const results = [rollout, transcript].filter(Boolean) as Array<RolloutScanResult | TranscriptScanResult>;
-  const sum = (read: (result: RolloutScanResult | TranscriptScanResult) => number) =>
+  type SourceResult = RolloutScanResult | TranscriptScanResult | GrokUsageScanResult;
+  const results = [rollout, transcript, grok].filter(Boolean) as SourceResult[];
+  const sum = (read: (result: SourceResult) => number) =>
     results.reduce((total, result) => total + read(result), 0);
   const lastYieldAt = results
     .map((result) => result.lastYieldAt)
@@ -565,6 +568,8 @@ export type CollectorMaintenanceRunResult = {
   recentOnly: true;
   rollout: RolloutScanResult;
   transcript: TranscriptScanResult;
+  /** Present when the maintenance owns a Grok usage tailer. */
+  grok?: GrokUsageScanResult;
   reconciliation: CodexReconciliationResult;
   repricing: RepricingMaintenanceResult;
   enrichment: RepoEnrichmentMaintenanceResult;
@@ -588,6 +593,12 @@ export type MaintenanceRunOutcome = {
     activity: { discoveryEntries: number };
   };
   transcript: {
+    filesRead: number;
+    parseErrors: number;
+    eventsAppended: number;
+    activity: { discoveryEntries: number };
+  };
+  grok?: {
     filesRead: number;
     parseErrors: number;
     eventsAppended: number;
@@ -676,7 +687,7 @@ export async function drainProjectionMigration(
 export class CollectorMaintenance {
   private current: {
     phase: "baseline" | "capture";
-    source: "codex" | "claude_code";
+    source: "codex" | "claude_code" | "grok";
     startedAt: string;
     budget: CaptureWorkBudget;
   } | null = null;
@@ -687,6 +698,8 @@ export class CollectorMaintenance {
     private readonly rolloutTailer: RolloutTailer,
     private readonly transcriptTailer: TranscriptTailer,
     private readonly signal?: AbortSignal,
+    /** Grok usage files (bead eco-6hoxj.163.20); absent callers keep the two-source cadence. */
+    private readonly grokTailer?: GrokUsageTailer,
   ) {
     ensureAutomaticCaptureRuntimeState(this.buffer.database);
   }
@@ -706,6 +719,7 @@ export class CollectorMaintenance {
   close() {
     this.rolloutTailer.close();
     this.transcriptTailer.close();
+    this.grokTailer?.close();
   }
 
   async runRecent(options: {
@@ -824,19 +838,24 @@ export class CollectorMaintenance {
       ? "capture" as const
       : "baseline" as const;
     // Advance before admitted capture, including a possible slow-source kill.
-    // An exhausted repair turn cannot spend the next source's turn.
-    const firstSource = maintenanceState(
-      this.buffer.database,
-      AUTOMATIC_CAPTURE_SOURCE_TURN_KEY,
-    ) === "claude_code" ? "claude_code" as const : "codex" as const;
+    // An exhausted repair turn cannot spend the next source's turn. With a
+    // Grok usage tailer the turn rotates over three sources, so each one
+    // leads the shared allowance every third cadence.
+    const sourceOrder = this.grokTailer
+      ? ["codex", "claude_code", "grok"] as const
+      : ["codex", "claude_code"] as const;
+    const storedTurn = maintenanceState(this.buffer.database, AUTOMATIC_CAPTURE_SOURCE_TURN_KEY);
+    const firstIndex = Math.max(0, (sourceOrder as readonly string[]).indexOf(storedTurn ?? "codex"));
+    const runOrder = sourceOrder.map((_, offset) => sourceOrder[(firstIndex + offset) % sourceOrder.length]!);
     if (budget.canContinue()) setMaintenanceState(
       this.buffer.database,
       AUTOMATIC_CAPTURE_SOURCE_TURN_KEY,
-      firstSource === "codex" ? "claude_code" : "codex",
+      sourceOrder[(firstIndex + 1) % sourceOrder.length]!,
     );
     const startedAt = new Date().toISOString();
     let rollout: RolloutScanResult | undefined;
     let transcript: TranscriptScanResult | undefined;
+    let grok: GrokUsageScanResult | undefined;
     const runRollout = async () => {
       this.current = { phase, source: "codex", startedAt, budget };
       const sourceAccepted = options.onProgress?.({
@@ -883,19 +902,32 @@ export class CollectorMaintenance {
         claudeCaptureMs = Math.max(0, Math.round(clock() - scanStartedAtMs));
       });
     };
+    const runGrok = async (tailer: GrokUsageTailer) => {
+      this.current = { phase, source: "grok", startedAt, budget };
+      // Announce the source before any filesystem work, as the other two do,
+      // so a stall inside the Grok scan is held against Grok's own stage and
+      // never against the previous source's last candidate.
+      const sourceAccepted = options.onProgress?.({
+        source: "grok",
+        stage: "source_scan",
+        candidateHash: null,
+      }) !== false;
+      return tailer.scan({
+        budget,
+        now: new Date(startedAt),
+        signal: this.signal,
+        deferredBeforeIo: !budget.canContinue() || !sourceAccepted ||
+          (options.quarantine?.source === "grok" && options.quarantine.stage === "source_scan"),
+      });
+    };
     try {
-      if (firstSource === "claude_code") {
-        transcript = await runTranscript();
-        rollout = await runRollout();
-      } else {
-        rollout = await runRollout();
-        transcript = await runTranscript();
+      for (const source of runOrder) {
+        if (source === "codex") rollout = await runRollout();
+        else if (source === "claude_code") transcript = await runTranscript();
+        else if (this.grokTailer) grok = await runGrok(this.grokTailer);
       }
       this.lastBudget = budget.status();
-      const errorCount =
-        rollout.discoveryErrors + rollout.statErrors + rollout.readErrors + rollout.parseErrors + rollout.unresolvedRecords +
-        transcript.discoveryErrors + transcript.statErrors + transcript.readErrors + transcript.parseErrors + transcript.unresolvedRecords;
-      if (this.signal?.aborted || rollout.aborted || transcript.aborted) {
+      if (this.signal?.aborted || rollout?.aborted || transcript?.aborted || grok?.aborted) {
         throw new Error("automatic_maintenance_aborted");
       }
     } catch (error) {
@@ -914,6 +946,9 @@ export class CollectorMaintenance {
     if (transcript.activity && !this.signal?.aborted) {
       this.buffer.projection.recordCaptureActivity({ source: "claude_code", ...transcript.activity });
     }
+    if (grok && !this.signal?.aborted) {
+      this.buffer.projection.recordCaptureActivity({ source: "grok", ...grok.activity });
+    }
     // Capture-first cadence: repair units take only the allowance capture left.
     if (captureFirst) {
       await runRepairs();
@@ -921,14 +956,16 @@ export class CollectorMaintenance {
     }
     const errorCount =
       rollout.discoveryErrors + rollout.statErrors + rollout.readErrors + rollout.parseErrors + rollout.unresolvedRecords +
-      transcript.discoveryErrors + transcript.statErrors + transcript.readErrors + transcript.parseErrors + transcript.unresolvedRecords;
+      transcript.discoveryErrors + transcript.statErrors + transcript.readErrors + transcript.parseErrors + transcript.unresolvedRecords +
+      (grok ? grok.discoveryErrors + grok.statErrors + grok.readErrors + grok.parseErrors + grok.unresolvedRecords : 0);
     const finalBudget = budget.status();
     const baselineProgress = captureBaselineStatus(this.buffer.database).progress.state;
     const baselineIncomplete = phase === "baseline" && baselineProgress !== "complete";
     const baselineFailed = phase === "baseline" &&
       (baselineProgress === "failed" || baselineProgress === "ambiguous");
     const deferred = finalBudget.exhausted || postCaptureDeferred.length > 0 ||
-      rollout.deferredGenerations > 0 || transcript.deferredGenerations > 0;
+      rollout.deferredGenerations > 0 || transcript.deferredGenerations > 0 ||
+      (grok?.deferredGenerations ?? 0) > 0;
     recordAutomaticCaptureRuntimeState(
       this.buffer.database,
       phase,
@@ -937,18 +974,21 @@ export class CollectorMaintenance {
       finalBudget,
       rollout,
       transcript,
+      grok,
     );
     return {
       recentOnly: true,
       rollout,
       transcript,
+      ...(grok ? { grok } : {}),
       reconciliation,
       repricing,
       enrichment,
       ...(drained ? { projection: drained.receipt, projectionDrain: drained.drain } : {}),
-      rawEventWrites: rollout.eventsAppended + transcript.eventsAppended,
+      rawEventWrites: rollout.eventsAppended + transcript.eventsAppended + (grok?.eventsAppended ?? 0),
       captureAdvanced: (rollout.recordsCommitted ?? 0) + (transcript.recordsCommitted ?? 0) +
-        (rollout.continuationBytesAdvanced ?? 0) + (transcript.continuationBytesAdvanced ?? 0) > 0,
+        (rollout.continuationBytesAdvanced ?? 0) + (transcript.continuationBytesAdvanced ?? 0) +
+        (grok?.recordsCommitted ?? 0) > 0,
       postCaptureDeferred,
       repairService,
       stageTimings: {

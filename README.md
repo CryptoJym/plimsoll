@@ -443,11 +443,49 @@ consumed by the label:
 - `limitReached` / `deferredBeforeIo` — why the cadence ended, when it was not
   the per-tick budget.
 
+### Grok token usage
+
+Grok's hooks carry no token counts. Grok itself records what it billed in
+`${GROK_HOME:-~/.grok}/sessions/<url-encoded working directory>/<session id>/usage.json`,
+and automatic capture reads exactly that file — never `chat_history.jsonl`,
+`events.jsonl`, `prompt_context.json`, `system_prompt.txt`, `updates.jsonl` or any
+other file in a session directory, and it never lists a session directory.
+
+- One `usage_transcript` event per turn and model (`source: "grok"`,
+  `metadata.usageSource: "grok_usage"`, `metadata.turnIndex` = Grok's turn
+  number), stamped with the turn's `endedAt`. A turn whose per-model rows do not
+  add up to its own totals becomes one event under its primary model.
+- Tokens follow the Codex rollout convention: input includes cached reads
+  (`cacheReadTokens`), output includes reasoning
+  (`metadata.reasoningOutputTokens`), and cache writes are `cacheCreationTokens`.
+  `costUsdTicks` (1 USD = 10^10 ticks) becomes a `reported` cost.
+- A row Grok marks `usageIsIncomplete` keeps its tokens but gets no cost; events
+  of an incomplete turn, model row or session carry
+  `usageSource: "grok_usage_incomplete"`.
+- Event ids are deterministic over (session, turn, model). If Grok later raises
+  a turn's numbers, one revision event adds only the increase; a rewrite that
+  lowers a counted number is refused, so no turn is counted twice.
+- The first run backfills every existing usage file inside the shared automatic
+  capture budget and a 2,048-entry, 50 ms discovery allowance per cadence; later
+  cadences re-read only files whose size, mtime, ctime or inode changed. A
+  document larger than 512 KiB is reported as oversized and not read.
+- A session directory's name is its URL-encoded working directory. A session
+  started inside a git repository is attributed to it the way Codex rollouts
+  are; sessions started in `/` or outside a repository stay unallocated.
+- Once the scan has run, `captureHealth` judges Grok by it
+  (`capture: "local_scan"`), and `activityState.scan.usageFiles` counts files
+  seen, unchanged, parsed, deferred, oversized, unresolved and errors, plus
+  `sessionOnlyTokens`: tokens in Grok's session totals that no turn record
+  carries (for example an interrupted turn). Those are reported, not counted.
+
 `historyCoverage` answers a different question — has an explicit full backfill
 covered this source's retained history? — and stays independent of capture
-health. Grok is enumerated there with status `hook_delivered`: its history
-arrives by hook, so there is no local transcript to backfill, and it never
-participates in the completeness verdict.
+health. Grok never participates in that completeness verdict. Until the Grok
+usage scan has run once, Grok is enumerated with status `hook_delivered`; after
+that its entry reports the automatic usage-file backfill: `incomplete`
+(`grok_usage_backfill_not_completed`) until one sweep has accounted for every
+`usage.json` without an error, then `complete`, with that sweep's counters in
+`lastFullScan` and `usageBackfill`.
 
 ## Delivery retry scheduling
 

@@ -91,7 +91,7 @@ export type MaintenanceProgressReceipt = {
   nonce: string;
   sequence: number;
   stage: MaintenanceProgressStage;
-  source: "codex" | "claude_code";
+  source: "codex" | "claude_code" | "grok";
   candidateHash: string | null;
 };
 
@@ -182,7 +182,7 @@ const PROGRESS_STAGES = new Set<MaintenanceProgressStage>([
 function parseProgress(value: unknown): MaintenanceProgress | null {
   const row = record(value);
   if (!row || !exactKeys(row, ["source", "stage", "candidateHash"]) ||
-    (row.source !== "codex" && row.source !== "claude_code") ||
+    (row.source !== "codex" && row.source !== "claude_code" && row.source !== "grok") ||
     typeof row.stage !== "string" || !PROGRESS_STAGES.has(row.stage as MaintenanceProgressStage) ||
     (row.candidateHash !== null &&
       (typeof row.candidateHash !== "string" || !/^sha256:[a-f0-9]{64}$/i.test(row.candidateHash))) ||
@@ -333,6 +333,16 @@ export function projectMaintenanceResult(result: CollectorMaintenanceRunResult):
       eventsAppended: result.transcript.eventsAppended,
       activity: { discoveryEntries: result.transcript.activity.discoveryEntries },
     },
+    ...(result.grok
+      ? {
+          grok: {
+            filesRead: result.grok.filesRead,
+            parseErrors: result.grok.parseErrors,
+            eventsAppended: result.grok.eventsAppended,
+            activity: { discoveryEntries: result.grok.activity.discoveryEntries },
+          },
+        }
+      : {}),
     reconciliation: {
       rowsChanged: result.reconciliation.rowsChanged,
       rowsVisited: result.reconciliation.rowsVisited,
@@ -361,6 +371,7 @@ function parseMaintenanceResult(value: unknown): MaintenanceRunOutcome | null {
       "recentOnly",
       "rollout",
       "transcript",
+      ...(row.grok === undefined ? [] : ["grok"]),
       "reconciliation",
       "repricing",
       "enrichment",
@@ -387,10 +398,11 @@ function parseMaintenanceResult(value: unknown): MaintenanceRunOutcome | null {
   };
   const rollout = parseSource(row.rollout);
   const transcript = parseSource(row.transcript);
+  const grok = row.grok === undefined ? undefined : parseSource(row.grok);
   const reconciliation = record(row.reconciliation);
   const repricing = record(row.repricing);
   const enrichment = record(row.enrichment);
-  if (!rollout || !transcript ||
+  if (!rollout || !transcript || grok === null ||
     !reconciliation || !exactKeys(reconciliation, ["rowsChanged", "rowsVisited"]) || !count(reconciliation.rowsChanged) || !count(reconciliation.rowsVisited) ||
     !repricing || !exactKeys(repricing, ["repriced", "rowsVisited"]) || !count(repricing.repriced) || !count(repricing.rowsVisited) ||
     !enrichment || !exactKeys(enrichment, ["backward", "forward", "rowsVisited"]) || !count(enrichment.backward) || !count(enrichment.forward) || !count(enrichment.rowsVisited)) return null;
@@ -398,6 +410,7 @@ function parseMaintenanceResult(value: unknown): MaintenanceRunOutcome | null {
     recentOnly: true,
     rollout,
     transcript,
+    ...(grok ? { grok } : {}),
     reconciliation: { rowsChanged: Number(reconciliation.rowsChanged), rowsVisited: Number(reconciliation.rowsVisited) },
     repricing: { repriced: Number(repricing.repriced), rowsVisited: Number(repricing.rowsVisited) },
     enrichment: { backward: Number(enrichment.backward), forward: Number(enrichment.forward), rowsVisited: Number(enrichment.rowsVisited) },

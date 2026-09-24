@@ -329,14 +329,64 @@ export type HistoryCoverageSource = "codex" | "claude_code";
 
 /**
  * Bead eco-6hoxj.63: the status surface enumerates every configured source.
- * Grok history is hook-delivered — there is no local transcript or rollout file
- * to backfill — so it is reported with its own status rather than left absent,
- * and it never participates in the file-backfill completeness verdict.
+ * Grok events arrive by hook and Grok writes no transcript or rollout, so it is
+ * reported with its own status rather than left absent, and it never
+ * participates in the explicit file-backfill completeness verdict.
+ *
+ * Bead eco-6hoxj.163.20: Grok's own per-session usage files are backfilled by
+ * the automatic Grok usage tailer. Until that tailer has run once, Grok stays
+ * `hook_delivered`; afterwards its entry reports whether one clean sweep has
+ * covered every usage file on the host.
  */
 export const HOOK_DELIVERED_COVERAGE_SOURCES = ["grok"] as const;
 export type HookDeliveredCoverageSource = (typeof HOOK_DELIVERED_COVERAGE_SOURCES)[number];
 export type HistoryCoverageStatusSource = HistoryCoverageSource | HookDeliveredCoverageSource;
 export const HISTORY_IS_HOOK_DELIVERED = "history_is_hook_delivered" as const;
+export const GROK_USAGE_BACKFILL_NOT_COMPLETED = "grok_usage_backfill_not_completed" as const;
+export const GROK_USAGE_BACKFILL_KEY = "grok_usage_backfill_v1";
+
+export type GrokUsageSweepCounters = {
+  filesSeen: number;
+  filesUnchanged: number;
+  filesParsed: number;
+  filesUnresolved: number;
+  filesOversized: number;
+  filesDeferred: number;
+  bytesRead: number;
+  eventsAppended: number;
+  parseErrors: number;
+  discoveryErrors: number;
+  statErrors: number;
+  readErrors: number;
+};
+
+/** Durable receipt of the automatic Grok usage backfill; path- and content-free. */
+export type GrokUsageBackfillMarker = {
+  version: 1;
+  startedAt: string;
+  /** The first sweep that accounted for every usage file without an error. */
+  completedAt: string | null;
+  sweeps: number;
+  lastSweep: (GrokUsageSweepCounters & { completedAt: string; clean: boolean }) | null;
+  completion: (GrokUsageSweepCounters & { completedAt: string }) | null;
+};
+
+/** The Grok usage backfill receipt; null until the tailer has run once. */
+export function grokUsageBackfillMarker(database: Database.Database): GrokUsageBackfillMarker | null {
+  try {
+    const row = database
+      .prepare(`select value from maintenance_state where key = ?`)
+      .get(GROK_USAGE_BACKFILL_KEY) as { value: string } | undefined;
+    if (!row) return null;
+    const parsed = JSON.parse(row.value) as Partial<GrokUsageBackfillMarker>;
+    if (parsed.version !== 1 || typeof parsed.startedAt !== "string" ||
+      !(parsed.completedAt === null || typeof parsed.completedAt === "string") ||
+      !Number.isSafeInteger(parsed.sweeps)) return null;
+    return parsed as GrokUsageBackfillMarker;
+  } catch {
+    return null;
+  }
+}
 
 type FullScanCounters = {
   filesSeen: number;
@@ -378,11 +428,22 @@ type PersistedHistoryCoverage = {
 export type HistoryCoverageSourceStatus = {
   source: HistoryCoverageStatusSource;
   status: "complete" | "incomplete" | "hook_delivered";
-  reason: HistoryCoverageIncompleteReason | typeof HISTORY_IS_HOOK_DELIVERED | null;
+  reason:
+    | HistoryCoverageIncompleteReason
+    | typeof HISTORY_IS_HOOK_DELIVERED
+    | typeof GROK_USAGE_BACKFILL_NOT_COMPLETED
+    | null;
   completedAt: string | null;
   invalidatedAt: string | null;
   lastFullScan: CompletedFullScan | null;
   latestFullAttempt: LatestFullScanAttempt | null;
+  /** Grok only: the automatic usage-file backfill behind this status. */
+  usageBackfill?: {
+    startedAt: string;
+    completedAt: string | null;
+    sweeps: number;
+    lastSweep: GrokUsageBackfillMarker["lastSweep"];
+  };
 };
 
 export type HistoryCoverageStatus = {
@@ -512,8 +573,43 @@ export function historyCoverageStatus(database: Database.Database): HistoryCover
         : EXCLUDED_GENERATION_GROWTH_INVALIDATED,
     sources: [
       ...backfilled,
-      ...HOOK_DELIVERED_COVERAGE_SOURCES.map((source) => hookDeliveredCoverage(source)),
+      ...HOOK_DELIVERED_COVERAGE_SOURCES.map((source) => {
+        const marker = grokUsageBackfillMarker(database);
+        return marker ? grokUsageCoverage(marker) : hookDeliveredCoverage(source);
+      }),
     ],
+  };
+}
+
+function grokUsageCoverage(marker: GrokUsageBackfillMarker): HistoryCoverageSourceStatus {
+  const completion = marker.completion;
+  return {
+    source: "grok",
+    status: marker.completedAt ? "complete" : "incomplete",
+    reason: marker.completedAt ? null : GROK_USAGE_BACKFILL_NOT_COMPLETED,
+    completedAt: marker.completedAt,
+    invalidatedAt: null,
+    lastFullScan: completion
+      ? {
+          completedAt: completion.completedAt,
+          filesSeen: completion.filesSeen,
+          filesRead: completion.filesParsed,
+          bytesRead: completion.bytesRead,
+          bytesDeferred: 0,
+          eventsAppended: completion.eventsAppended,
+          parseErrors: completion.parseErrors,
+          discoveryErrors: completion.discoveryErrors,
+          statErrors: completion.statErrors,
+          readErrors: completion.readErrors,
+        }
+      : null,
+    latestFullAttempt: null,
+    usageBackfill: {
+      startedAt: marker.startedAt,
+      completedAt: marker.completedAt,
+      sweeps: marker.sweeps,
+      lastSweep: marker.lastSweep,
+    },
   };
 }
 
