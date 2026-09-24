@@ -39,7 +39,11 @@ import os from "node:os";
 import path from "node:path";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
-import * as captureBaseline from "../packages/collector-cli/src/capture-baseline";
+import {
+  CAPTURE_BASELINE_GENERATION_STATUS_SQL,
+  captureBaselineStatus,
+  ensureCaptureBaselineSchema,
+} from "../packages/collector-cli/src/capture-baseline";
 import { AUTOMATIC_CAPTURE_LIMITS, CaptureWorkBudget } from "../packages/collector-cli/src/capture-work-budget";
 import { GROK_USAGE_LIMITS, GrokUsageTailer, ensureGrokUsageState } from "../packages/collector-cli/src/grok-usage-tailer";
 import { DEFAULT_JSONL_TAILER_IO } from "../packages/collector-cli/src/jsonl-byte-tailer";
@@ -419,10 +423,8 @@ function baselineStatusPlan(root: string) {
   let plan: string[] = [];
   let error: string | null = null;
   try {
-    captureBaseline.ensureCaptureBaselineSchema(buffer.database);
-    const sql = (captureBaseline as { CAPTURE_BASELINE_GENERATION_STATUS_SQL?: string }).CAPTURE_BASELINE_GENERATION_STATUS_SQL;
-    if (!sql) throw new Error("status_aggregate_not_exported");
-    plan = (buffer.database.prepare(`explain query plan ${sql}`).all("codex", "run") as Array<{ detail: string }>)
+    ensureCaptureBaselineSchema(buffer.database);
+    plan = (buffer.database.prepare(`explain query plan ${CAPTURE_BASELINE_GENERATION_STATUS_SQL}`).all("codex", "run") as Array<{ detail: string }>)
       .map((row) => row.detail);
   } catch (caught) {
     error = (caught as Error).message;
@@ -509,7 +511,7 @@ async function busyHost(root: string) {
       observations.push({
         tick,
         wallMs: virtualNow() - tickStartedAt,
-        baseline: captureBaseline.captureBaselineStatus(buffer.database).status,
+        baseline: captureBaselineStatus(buffer.database).status,
         codex: source(result.rollout),
         claude: source(result.transcript),
         grok: source(result.grok),
@@ -517,7 +519,7 @@ async function busyHost(root: string) {
         budget: maintenance.status().budget,
         order: (result as { captureTurn?: { order: Source[] } }).captureTurn?.order ?? null,
       });
-      if (liveWrittenAfterTick === null && captureBaseline.captureBaselineStatus(buffer.database).status === "complete") {
+      if (liveWrittenAfterTick === null && captureBaselineStatus(buffer.database).status === "complete") {
         // Post-enrollment work arrives: twenty large generations per source,
         // far more than any cadence can commit.
         pause(25);
