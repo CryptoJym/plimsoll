@@ -490,6 +490,60 @@ async function main() {
     companion.cleanup();
   }
 
+  // New companions are published only after their staging copy passes its
+  // digest check. A later failure must remove every new path and preserve the
+  // existing executable and companion exactly as they were.
+  const companionStage = fixture("companion-staging");
+  try {
+    const stagedArtifact = companionStage.artifact("6.0.0");
+    const runtimeDirectory = path.join(companionStage.paths.lifecycleRoot, "versions", "6.0.0", "darwin-arm64");
+    const executablePath = path.join(runtimeDirectory, "bin", "plimsoll.mjs");
+    fs.mkdirSync(path.dirname(executablePath), { recursive: true, mode: 0o700 });
+    fs.copyFileSync(stagedArtifact.sourcePath, executablePath);
+    fs.chmodSync(executablePath, 0o700);
+    const existingSource = path.join(companionStage.ownershipRoot, "artifacts", "preexisting.node");
+    const firstSource = path.join(companionStage.ownershipRoot, "artifacts", "first.node");
+    const secondSource = path.join(companionStage.ownershipRoot, "artifacts", "second.node");
+    write(existingSource, "pre-existing-native-companion\n");
+    write(firstSource, "first-new-native-companion\n");
+    write(secondSource, "second-new-native-companion\n");
+    const existingPath = path.join(runtimeDirectory, "native", "preexisting.node");
+    write(existingPath, fs.readFileSync(existingSource, "utf8"));
+    const executableBefore = fs.readFileSync(executablePath);
+    const existingBefore = fs.readFileSync(existingPath);
+    const artifactWithFailure: RuntimeArtifact = {
+      ...stagedArtifact,
+      files: [
+        { relativePath: "native/preexisting.node", sha256: digest(existingSource), sourcePath: existingSource },
+        { relativePath: "native/first.node", sha256: digest(firstSource), sourcePath: firstSource },
+        { relativePath: "native/second.node", sha256: ("sha256:" + "0".repeat(64)) as `sha256:${string}`, sourcePath: secondSource },
+      ],
+    };
+    const error = await rejection(() => companionStage.adapter.stage(artifactWithFailure));
+    const firstPath = path.join(runtimeDirectory, "native", "first.node");
+    const secondPath = path.join(runtimeDirectory, "native", "second.node");
+    const stagingPaths = [
+      `${existingPath}+staging`, `${firstPath}+staging`, `${secondPath}+staging`,
+    ];
+    check(
+      "failed_later_companion_leaves_no_unverified_new_files_or_staging_paths",
+      error?.message === "companion 2 digest mismatch" &&
+        !fs.existsSync(firstPath) && !fs.existsSync(secondPath) && stagingPaths.every((file) => !fs.existsSync(file)) &&
+        Buffer.compare(fs.readFileSync(executablePath), executableBefore) === 0 &&
+        Buffer.compare(fs.readFileSync(existingPath), existingBefore) === 0,
+      {
+        error: error?.message,
+        firstFinal: fs.existsSync(firstPath),
+        secondFinal: fs.existsSync(secondPath),
+        staging: stagingPaths.filter((file) => fs.existsSync(file)),
+        executableUnchanged: Buffer.compare(fs.readFileSync(executablePath), executableBefore) === 0,
+        existingCompanionUnchanged: Buffer.compare(fs.readFileSync(existingPath), existingBefore) === 0,
+      },
+    );
+  } finally {
+    companionStage.cleanup();
+  }
+
   const recovery = fixture("rollback-required");
   try {
     const manager = new LifecycleManager(recovery.adapter);
