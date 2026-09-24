@@ -46,6 +46,10 @@ jobs:
             echo "TMPDIR=$proof_home/tmp"
           } >> "$GITHUB_ENV"
 
+      - name: Prove every proof script runs in CI or is reviewed local-only (eco-6hoxj.163.23)
+        # Run with node, not pnpm, so no pnpm setting can turn the gate itself into a no-op.
+        run: node ./node_modules/tsx/dist/cli.mjs ./scripts/ci-coverage-proof.ts
+
       - name: Typecheck
         id: typecheck
         run: pnpm exec tsc --noEmit
@@ -73,6 +77,7 @@ jobs:
           pnpm proof:automatic-record-retry
           pnpm proof:automatic-revisit
           pnpm proof:oversized-continuation
+          pnpm proof:oversized-continuation-storage
           PLIMSOLL_PROOF_HOME="$TMPDIR" pnpm proof:automatic-capture-cadence > evidence/automatic-capture-cadence-proof.json
           pnpm proof:automatic-retry-metadata
           pnpm proof:future-admission
@@ -85,11 +90,19 @@ jobs:
           pnpm proof:finance-export
           pnpm proof:finance-projection
           pnpm proof:delivery
+          pnpm proof:capture-claim
+          pnpm proof:capture-claim-review
+          pnpm proof:capture-claim-review-r4
+          pnpm proof:capture-claim-review-r5
           pnpm proof:repo-labels-response
 
       - name: Prove source installer and read-only doctor
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:install-doctor
+
+      - name: Prove validated collector homes stay isolated (#135)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:collector-home
 
       - name: Prove doctor names producer processes older than their managed config
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
@@ -178,9 +191,23 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:lifecycle
 
+      - name: Prove one fenced lock for LaunchAgent mutations and versioned process fingerprints (#158/#175)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:lifecycle-fence
+          pnpm proof:fingerprint-versioning
+
       - name: Prove packaged lifecycle operator commands end to end
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:lifecycle-operator
+
+      - name: Prove bounded lifecycle snapshot retention and space-free snapshots (eco-6hoxj.163.30)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:lifecycle-retention
+
+      - name: Prove lifecycle rollback and retention are data-safe (eco-6hoxj.163.30 r2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:lifecycle-data-safety
 
       - name: Prove bounded nonblocking Git metadata maintenance
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
@@ -197,6 +224,10 @@ jobs:
       - name: Prove incremental tailer context and cursor semantics
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:incremental-capture
+
+      - name: Prove bounded Codex reconciliation
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:codex-reconciliation
 
       - name: Prove fair capture progress across concurrent generations
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
@@ -261,15 +292,38 @@ jobs:
       - name: Prove producer-to-ledger parity instrumentation (eco-6hoxj.29)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:producer-parity
+
+      - name: Prove the Gemini CLI and Grok sources
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:gemini-adapter
+          pnpm proof:grok-source
       - name: Prove bounded admission-rejection diagnostics (runner-scaled)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:rejection-aggregation
         env:
           REJECTION_PROOF_SCALE: "0.05"
 
+      - name: Prove oversized ingest rejections and frozen summary liveness (#196)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:ingest-liveness
+
       - name: Prove isolated automatic maintenance availability
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:maintenance-boundary
+
+      - name: Prove maintenance regressions and deadline starvation (#181)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:maintenance
+          pnpm proof:maintenance-starvation
+
+      - name: Prove maintenance stage primitives, worker readiness and the enrichment job
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:maintenance-stages
+          pnpm proof:maintenance-worker-ready
+          pnpm proof:enrichment-job
 
       - name: Prove maintenance stage integration
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
@@ -278,6 +332,10 @@ jobs:
       - name: Prove shipped dashboard projection truth
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:dashboard
+
+      - name: Prove dashboard usage is not double-counted across ingest paths (#179/#193)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:usage-dedupe
 
       - name: Prove projection convergence and bounded token-time migration
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
@@ -322,9 +380,26 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:capacity
 
+      - name: Prove the Capacity Rail contract and provider capacity adapters (#168/#169)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:capacity-contract
+          pnpm proof:capacity-adapters
+
+      - name: Prove lane receipts, fleet operations and release qualification (#176/#154/#171)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: |
+          pnpm proof:lane-receipts
+          pnpm proof:fleet-operations
+          pnpm proof:release-qualification
+
       - name: Prove bounded learning evidence packets
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:learning-evidence
+
+      - name: Prove the bounded learning materializer (#157)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:learning-materializer
 
       - name: Prove suppression receipt capture-to-upload parity
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
@@ -354,9 +429,17 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:enrollment-privacy
 
+      - name: Prove the device registry lifecycle and workspace-bound leases
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:device-registry
+
       - name: Prove immutable outcome timeline and bounded recovery
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:outcome-timeline
+
+      - name: Prove the outcome performance layer
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:performance-layer
 
       - name: Prove source-only integrated learning and fleet flow
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
@@ -375,6 +458,10 @@ jobs:
       - name: Prove finalized privacy failures fail closed
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: node ./node_modules/tsx/dist/cli.mjs ./scripts/resource-proof/finalization-proof.ts
+
+      - name: Prove owner shutdown is bounded, reaped and never silent (#162)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:owner-shutdown
 
       - name: Prove the published privacy spec derives from the source lists (#13)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

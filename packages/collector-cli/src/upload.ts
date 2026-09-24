@@ -3,17 +3,19 @@ import crypto from "node:crypto";
 import type { BufferedEventRow, LocalEventBuffer } from "./buffer";
 import {
   assertCollectorPrivacyMode,
+  collectorHome,
   reconcileCloudDeviceIdFromIngest,
   type CollectorConfig,
 } from "./config";
-import type { LeasedDeliveryItem, DeliveryFailureClass } from "./outbox";
+import { captureSpoolState } from "./capture-spool-state";
+import type { DeliveryCaptureClaim, LeasedDeliveryItem, DeliveryFailureClass } from "./outbox";
 import {
   aiWorkIngestBatchSchema,
   type AiInteractionEvent,
   type AiWorkIngestBatch,
 } from "../../shared/src/index";
 import { sealOutboundEnvelope } from "./outbound-envelope";
-import { TransportError, validatedTransportUrl } from "./http-transport";
+import { TransportError, pinnedUploadUrl, validatedTransportUrl } from "./http-transport";
 import { postDelivery } from "./delivery-post";
 import { retryAfterMilliseconds } from "./retry-after";
 import { deliveryExpectation } from "./delivery-ack";
@@ -169,6 +171,9 @@ function bodyForItems(
   return { body, batch, bytes: Buffer.byteLength(body) };
 }
 
+/** Capture watermark v1 (eco-6hoxj.163.18): a header, so a cloud that predates it ignores it. */
+export const CAPTURE_CLAIM_HEADER = "x-plimsoll-capture";
+
 async function postItems(input: {
   config: CollectorConfig;
   items: LeasedDeliveryItem[];
@@ -180,6 +185,7 @@ async function postItems(input: {
   timeoutSeconds: number;
   now: () => Date;
   maxBytes: number;
+  captureClaim?: DeliveryCaptureClaim | null;
 }): Promise<ProbeResult> {
   const { body, bytes } = bodyForItems(input.config, input.items, input.appVersion);
   if (bytes > input.maxBytes) {
@@ -200,6 +206,7 @@ async function postItems(input: {
       ingestKey: input.ingestKey, signingSecret: input.signingSecret,
       fetchImpl: input.fetchImpl, now: input.now,
       timeoutMs: input.timeoutSeconds * 1_000, maxRequestBytes: input.maxBytes,
+      ...(input.captureClaim ? { headers: { [CAPTURE_CLAIM_HEADER]: JSON.stringify(input.captureClaim) } } : {}),
     });
   } catch (error) {
     const transient = error instanceof TransportError &&
@@ -252,17 +259,10 @@ function failureForProbe(result: ProbeResult): Exclude<DeliveryFailureClass, "no
   return "remote_contract";
 }
 
-function validatedUploadUrl(config: CollectorConfig, override?: string) {
-  const raw = override ?? config.uploadUrl;
+function validatedUploadUrl(config: CollectorConfig, override?: string, developmentLoopback?: boolean) {
+  const raw = pinnedUploadUrl(config.uploadUrl, override, { developmentLoopback });
   if (!raw) throw new Error("No upload URL configured. Pass --url or set uploadUrl in collector.config.json.");
-  const url = validatedTransportUrl(raw, "Upload URL");
-  if (override && config.uploadUrl) {
-    const configured = validatedTransportUrl(config.uploadUrl, "Configured upload URL");
-    if (configured.origin !== url.origin) {
-      throw new Error("Upload URL must use the same origin as the configured workspace audience.");
-    }
-  }
-  return url.href;
+  return validatedTransportUrl(raw, "Upload URL").href;
 }
 
 async function uploadStateless(
@@ -270,7 +270,7 @@ async function uploadStateless(
   buffer: LocalEventBuffer,
   options: UploadOptions,
 ) {
-  const url = validatedUploadUrl(config, options.url);
+  const url = validatedUploadUrl(config, options.url, options.developmentLoopbackUrl);
   // Examine a bounded snapshot independently of the transient request cap so
   // one locally oversized row cannot hide a later eligible row in no-mark
   // mode. This mode intentionally mutates no retry or upload state.
@@ -345,6 +345,7 @@ export type UploadOptions = {
   markUploaded?: boolean;
   signingSecret?: string;
   url?: string;
+  developmentLoopbackUrl?: boolean;
   fetchImpl?: typeof fetch;
   now?: () => Date;
   leaseId?: string;
@@ -359,7 +360,11 @@ export type UploadOptions = {
   afterRemote?: () => void;
   /** Test-only crash seam after a sibling acknowledgement is durable but before poison settlement. */
   afterSiblingAcknowledgement?: () => void;
+  /** Home of the hook and OTLP spools the capture claim reads; the collector home by default. */
+  spoolHome?: string;
 };
+
+let captureClaimFailureLogged = false;
 
 export async function uploadBufferedEvents(
   config: CollectorConfig,
@@ -367,7 +372,7 @@ export async function uploadBufferedEvents(
   options: UploadOptions = {},
 ) {
   assertCollectorPrivacyMode(config, "upload");
-  const url = validatedUploadUrl(config, options.url);
+  const url = validatedUploadUrl(config, options.url, options.developmentLoopbackUrl);
   if (options.markUploaded === false) {
     buffer.useWorkspace(config.tenantId, config.deviceId);
     return uploadStateless(config, buffer, options);
@@ -534,6 +539,25 @@ export async function uploadBufferedEvents(
     const group = revalidated.items;
     probes += 1;
     for (const item of group) attemptedActive.add(item.deliveryId);
+    // Capture watermark v1: one claim per request, after the final
+    // revalidation, so it describes exactly the items this request carries.
+    // The spools are read first: a file replayed in between is then counted
+    // twice, never missed. A claim that cannot be computed is left off the
+    // request; it never stops delivery (review r2 S5).
+    let captureClaim: DeliveryCaptureClaim | null = null;
+    try {
+      const spool = captureSpoolState(options.spoolHome ?? collectorHome());
+      captureClaim = await storage(() =>
+        buffer.delivery.captureClaim(group.map((item) => item.deliveryId), spool, nowFn()));
+    } catch (error) {
+      if (!captureClaimFailureLogged) {
+        captureClaimFailureLogged = true;
+        console.warn(JSON.stringify({
+          status: "capture_claim_skipped",
+          error: error instanceof Error ? error.name : "unknown",
+        }));
+      }
+    }
     const result = await postItems({
       config,
       items: group,
@@ -545,6 +569,7 @@ export async function uploadBufferedEvents(
       timeoutSeconds: config.delivery.requestTimeoutSeconds,
       now: nowFn,
       maxBytes: maxRequestBytes,
+      captureClaim,
     });
     if (result.ok) {
       lastSummary = result.summary;

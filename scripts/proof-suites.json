@@ -1,0 +1,11 @@
+{
+  "scripts/oversized-continuation-suite-proof.ts": [
+    "scripts/oversized-continuation-state-proof.ts",
+    "scripts/oversized-continuation-transaction-proof.ts",
+    "scripts/oversized-continuation-boundary-proof.ts",
+    "scripts/oversized-continuation-ready-proof.ts",
+    "scripts/oversized-continuation-provider-proof.ts",
+    "scripts/oversized-continuation-cadence-proof.ts",
+    "scripts/jsonl-read-generation-proof.ts"
+  ]
+}

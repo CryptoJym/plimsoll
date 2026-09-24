@@ -6,6 +6,8 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 
+import { subProofsOf } from "./lib/proof-suites";
+
 const scriptPath = fileURLToPath(import.meta.url);
 const repoRoot = path.resolve(path.dirname(scriptPath), "..");
 const hash = (file: string) => createHash("sha256").update(fs.readFileSync(file)).digest("hex");
@@ -63,6 +65,11 @@ export async function runProof(entry: string, options: { directNode?: boolean; a
       timeout: 600_000, maxBuffer: 16 * 1024 * 1024,
     });
     try { receipt = JSON.parse(fs.readFileSync(env.PLIMSOLL_PROOF_RECEIPT!, "utf8")); } catch { /* Missing completion fails. */ }
+    // A suite passes only when its receipt names exactly the sub-proofs
+    // scripts/proof-suites.json declares, whatever list its own code uses.
+    const declaredSubProofs = subProofsOf(repoRoot, path.relative(repoRoot, absoluteEntry));
+    const suiteComplete = declaredSubProofs === null || (Array.isArray(receipt?.checks) &&
+      JSON.stringify(receipt.checks.map((c: any) => c.name)) === JSON.stringify(declaredSubProofs));
     const nodeUnchanged = hash(process.execPath) === nodeBefore;
     const sourceUnchanged = hash(absoluteEntry) === entryBefore && hash(scriptPath) === runnerBefore;
     const sentinelUnchanged = hash(path.join(sentinel, "must-remain")) === sentinelBefore;
@@ -72,8 +79,9 @@ export async function runProof(entry: string, options: { directNode?: boolean; a
       receipt.counts.passed === receipt.checks.length && receipt.counts.failed === 0 &&
       receipt.checks.every((c: any) => typeof c.name === "string" && c.passed === true) &&
       (receipt.expectedChecks === null || receipt.expectedChecks === receipt.checks.length);
-    outcome = { schema: "plimsoll.proof-run.v1", status: child.status === 0 && valid && nodeUnchanged && sentinelUnchanged && sourceUnchanged ? "passed" : "failed",
+    outcome = { schema: "plimsoll.proof-run.v1", status: child.status === 0 && valid && suiteComplete && nodeUnchanged && sentinelUnchanged && sourceUnchanged ? "passed" : "failed",
       entry: path.relative(repoRoot, absoluteEntry), entrySha256: entryBefore, runnerSha256: runnerBefore, sourceUnchanged, directNode: Boolean(options.directNode),
+      ...(declaredSubProofs ? { declaredSubProofs, suiteComplete } : {}),
       runtime: { node: process.versions.node, abi: process.versions.modules, platform: process.platform, arch: process.arch, sha256: nodeBefore },
       exitCode: child.status, signal: child.signal, error: child.error?.message ?? null,
       ...(child.status !== 0 && options.quiet ? { diagnostic: (child.stderr ?? "").slice(-4000) } : {}),

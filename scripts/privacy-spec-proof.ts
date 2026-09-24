@@ -10,6 +10,14 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 
+import { appendToCiLines, disableScripts, disableSteps } from "./lib/ci-coverage-fixtures";
+import {
+  WORKFLOW_DIRECTORY,
+  proofCiCoverage,
+  proofFilesRunInCi,
+  readCoverageInput,
+  type CoverageReport,
+} from "./lib/proof-ci-coverage";
 import {
   PROOF_CHECKS,
   collectPrivacySpecModel,
@@ -35,6 +43,24 @@ function mutatedModel(mutate: (model: PrivacySpecModel) => void): PrivacySpecMod
   const model = collectPrivacySpecModel();
   mutate(model);
   return model;
+}
+
+/**
+ * eco-6hoxj.163.23: a cited check is evidence only while CI runs it. Returns
+ * each cited check defined in a proof file that no workflow step provably runs
+ * on every successful push and pull request (the proof:ci-coverage model).
+ */
+function citedChecksNotRunInCi(found: Map<string, string[]>, coverage: CoverageReport): string[] {
+  const runInCi = proofFilesRunInCi(coverage);
+  const missing: string[] = [];
+  for (const ref of Object.values(PROOF_CHECKS)) {
+    for (const name of ref.checks) {
+      const files = found.get(name) ?? [];
+      const notRun = files.filter((file) => !runInCi.has(file));
+      if (files.length === 0 || notRun.length > 0) missing.push(`${name} (${notRun.join(", ") || "no proof file"})`);
+    }
+  }
+  return missing;
 }
 
 const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "..");
@@ -123,6 +149,56 @@ check(
           found.get(name)!.every((file) => file.endsWith("-proof.ts")),
           JSON.stringify(found.get(name)),
         );
+      }
+    }
+  },
+);
+
+check(
+  "every_cited_proof_check_runs_in_ci",
+  false,
+  () => {
+    const missing = citedChecksNotRunInCi(verifyProofChecks(), proofCiCoverage(readCoverageInput(repoRoot)));
+    assert.deepEqual(missing, [], `cited check(s) whose proof ${WORKFLOW_DIRECTORY} does not run: ${missing.join("; ")}`);
+  },
+);
+
+check(
+  "adversarial_cited_proof_disabled_in_ci_rejected",
+  true,
+  () => {
+    // For every cited check, keep its CI lines but make the steps that run
+    // its proof unreachable with a false-only matrix (the PR #397 review's
+    // attack); the guard must name that check.
+    const found = verifyProofChecks();
+    const input = readCoverageInput(repoRoot);
+    const coverage = proofCiCoverage(input);
+    for (const [name, files] of found) {
+      const steps = coverage.units.filter((unit) => files.includes(unit.unit)).flatMap((unit) => unit.covered);
+      assert.ok(steps.length > 0, `${name}: no CI step runs its proof`);
+      const missing = citedChecksNotRunInCi(found, proofCiCoverage(disableSteps(input, steps)));
+      assert.ok(missing.some((entry) => entry.startsWith(`${name} (`)), `${name} not rejected: ${JSON.stringify(missing)}`);
+    }
+  },
+);
+
+check(
+  "adversarial_cited_proof_script_or_ci_line_tampered_rejected",
+  true,
+  () => {
+    // The second PR #397 review kept this guard green with a "temporarily
+    // disabled" prefix on the cited proof's package script, and with a
+    // `${{ vars.PROOF_ARGS }}` suffix on its CI line. Both must name the check.
+    const found = verifyProofChecks();
+    const input = readCoverageInput(repoRoot);
+    const coverage = proofCiCoverage(input);
+    for (const [name, files] of found) {
+      const runs = coverage.units.filter((unit) => files.includes(unit.unit)).flatMap((unit) => unit.covered);
+      const scripts = [...new Set(runs.flatMap((run) => run.via.slice(0, 1)))];
+      const attacks = [appendToCiLines(input, runs, " ${{ vars.PROOF_ARGS }}"), ...(scripts.length > 0 ? [disableScripts(input, scripts)] : [])];
+      for (const attacked of attacks) {
+        const missing = citedChecksNotRunInCi(found, proofCiCoverage(attacked));
+        assert.ok(missing.some((entry) => entry.startsWith(`${name} (`)), `${name} not rejected: ${JSON.stringify(missing)}`);
       }
     }
   },

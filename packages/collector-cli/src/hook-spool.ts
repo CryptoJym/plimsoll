@@ -2,6 +2,8 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 
+import { recordSpoolLoss } from "./spool-losses";
+
 import {
   isProtectedMetadataFieldName,
   isSafeSuppressionSourceKey,
@@ -489,6 +491,24 @@ export type HookSpoolFile = {
 };
 
 /** Pending files, oldest first. Nothing else in the directory is listed. */
+/**
+ * Arrival times of pending spool files, from their names alone
+ * (eco-6hoxj.163.18: the upload capture claim is bounded by what the spool
+ * still holds). Null when the directory exists but cannot be listed.
+ */
+export function listHookSpoolArrivals(home: string): number[] | null {
+  let names: string[];
+  try {
+    names = fs.readdirSync(hookSpoolDirectory(home));
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? [] : null;
+  }
+  return names
+    .map((name) => SPOOL_FILE_PATTERN.exec(name))
+    .filter((match): match is RegExpExecArray => match !== null)
+    .map((match) => Number(match[1]));
+}
+
 export function listHookSpoolFiles(home: string, limit = Number.POSITIVE_INFINITY) {
   const directory = hookSpoolDirectory(home);
   let names: string[];
@@ -891,6 +911,9 @@ export function rejectHookSpoolFile(
   const safeReason = /^[a-z0-9_]+$/.test(reason) ? reason : "spool_untrusted";
   const base = file.name.slice(0, -".json".length);
   const target = path.join(directory, `${base}.${safeReason}.json`);
+  // eco-6hoxj.163.18 (review S4): this accepted event will never reach the
+  // ledger; the upload capture claim reports its arrival time as a gap.
+  recordSpoolLoss(hookSpoolDirectory(home), { atMs: file.spooledAtMs, reason: safeReason });
   try {
     fs.renameSync(file.path, target);
   } catch {

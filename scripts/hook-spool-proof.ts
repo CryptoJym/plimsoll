@@ -351,6 +351,18 @@ function parseJsonStdout(stdout: string) {
   }
 }
 
+/**
+ * Every byte the ledger holds on disk: the database file and, until SQLite
+ * checkpoints it, its write-ahead log. Reading the main file alone made the
+ * checks below depend on when an automatic checkpoint happened to run
+ * (eco-6hoxj.163.18: a few more schema pages at open moved that moment past
+ * the identity check's rows).
+ */
+function ledgerBytesOnDisk(ledgerPath: string) {
+  const wal = `${ledgerPath}-wal`;
+  return Buffer.concat([fs.readFileSync(ledgerPath), ...(fs.existsSync(wal) ? [fs.readFileSync(wal)] : [])]);
+}
+
 function sessionRows(buffer: LocalEventBuffer, sessionId: string) {
   return (
     buffer.database
@@ -726,7 +738,7 @@ async function caseLockedLedgerRecovers() {
     const eventSource = collector.buffer.database
       .prepare("select source, event_type as eventType from buffered_events where session_id = ?")
       .get(SESSION_LOCKED) as { source?: string; eventType?: string } | undefined;
-    const ledgerBytes = fs.readFileSync(collector.ledgerPath);
+    const ledgerBytes = ledgerBytesOnDisk(collector.ledgerPath);
     check(
       "a_recovered_row_is_attributed_and_still_content_suppressed",
       eventSource?.source === "claude_code" &&
@@ -1884,7 +1896,7 @@ async function casePrivacyBlankingKeepsTheLedgerIdentical() {
       { rows: rows.length, comparedColumns: Object.keys(liveRow).length, differing },
     );
 
-    const ledgerBytes = fs.readFileSync(collector.ledgerPath);
+    const ledgerBytes = ledgerBytesOnDisk(collector.ledgerPath);
     check(
       "p_neither_row_put_the_canary_in_the_ledger",
       !ledgerBytes.includes(Buffer.from(PROMPT_CANARY)),
@@ -2333,7 +2345,7 @@ async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
         recovered: recoveredRow.suppressed_fields_json,
       },
     );
-    const ledgerBytes = fs.readFileSync(collector.ledgerPath, "utf8");
+    const ledgerBytes = ledgerBytesOnDisk(collector.ledgerPath).toString("utf8");
     check(
       "r_the_ledger_never_held_the_paths_either",
       [ACCOUNT_NAME, EDITED_FILE, TRANSCRIPT_FILE, PROMPT_CANARY].every(
@@ -2374,7 +2386,7 @@ async function caseTheSpoolHoldsNoMoreThanTheLedgerWould() {
     const identityPayload = payloadDifference(identityLive.payload_json, identityRecovered.payload_json);
     const identityHash = hashProtectedValue(IDENTITY_CANARY);
     const emptyHash = hashProtectedValue("");
-    const identityLedgerBytes = fs.readFileSync(collector.ledgerPath, "utf8");
+    const identityLedgerBytes = ledgerBytesOnDisk(collector.ledgerPath).toString("utf8");
     check(
       "r_a_declared_protected_identity_is_raw_in_the_spool_and_hashed_identically_in_both_rows",
       identityTick.recovered === 1 &&

@@ -515,6 +515,11 @@ export function runCodexReconciliationMaintenance(
     candidateLimit?: number;
     freshCandidateLimit?: number;
     timeLimitMs?: number;
+    /**
+     * Monotonic milliseconds for the slice deadline (default performance.now).
+     * Proofs inject a deterministic clock so the cadence is host-independent.
+     */
+    clock?: () => number;
   } = {},
 ): CodexReconciliationResult {
   const legacyRowLimit = Math.max(
@@ -536,7 +541,8 @@ export function runCodexReconciliationMaintenance(
     Math.min(options.freshCandidateLimit ?? 64, candidateLimit),
   );
   const timeLimitMs = Math.max(1, Math.min(options.timeLimitMs ?? 50, 1_000));
-  const sliceStarted = performance.now();
+  const clock = options.clock ?? (() => performance.now());
+  const sliceStarted = clock();
   const deadline = sliceStarted + timeLimitMs;
 
   try {
@@ -617,12 +623,12 @@ export function runCodexReconciliationMaintenance(
       let stitched = 0;
       let priced = 0;
       const processCandidates = (freshOnly: boolean, limit: number) => {
-        if (limit <= 0 || performance.now() >= deadline) return;
+        if (limit <= 0 || clock() >= deadline) return;
         const rows = (freshOnly ? selectFreshCandidates : selectCandidates).all(
           limit,
         ) as CandidateRow[];
         for (const row of rows) {
-          if (performance.now() >= deadline) break;
+          if (clock() >= deadline) break;
           candidateRowsVisited += 1;
           if (!row.id || !isCandidate(row)) {
             removeCandidate.run(row.id);
@@ -672,7 +678,7 @@ export function runCodexReconciliationMaintenance(
       processCandidates(true, freshCandidateLimit);
 
       let contextRowsVisited = 0;
-      const windows = (performance.now() < deadline
+      const windows = (clock() < deadline
         ? database
             .prepare(
               `select window_start_seconds as windowStartSeconds,
@@ -717,7 +723,7 @@ export function runCodexReconciliationMaintenance(
          where window_start_seconds = ?`,
       );
       for (const window of windows) {
-        if (performance.now() >= deadline || contextRowsVisited >= contextRowLimit) break;
+        if (clock() >= deadline || contextRowsVisited >= contextRowLimit) break;
         const remaining = contextRowLimit - contextRowsVisited;
         const start = isoAt(window.windowStartSeconds - WINDOW_SECONDS);
         const end = isoAt(window.windowStartSeconds + WINDOW_SECONDS * 2);
@@ -822,7 +828,7 @@ export function runCodexReconciliationMaintenance(
       processCandidates(false, candidateLimit - candidateRowsVisited);
 
       let legacyRowsVisited = 0;
-      if (control.legacyComplete !== 1 && performance.now() < deadline) {
+      if (control.legacyComplete !== 1 && clock() < deadline) {
         const legacySeedStatements: LegacySeedStatements = {
           upsertPending: database.prepare(
             `insert into codex_reconciliation_pending (event_id, observed_at)
@@ -846,7 +852,7 @@ export function runCodexReconciliationMaintenance(
         );
         let cursor = control.legacyCursorRowid;
         let complete = false;
-        while (legacyRowsVisited < legacyRowLimit && performance.now() < deadline) {
+        while (legacyRowsVisited < legacyRowLimit && clock() < deadline) {
           const limit = Math.min(legacyChunkLimit, legacyRowLimit - legacyRowsVisited);
           const rows = selectLegacy.all({
             cursor,
@@ -872,8 +878,8 @@ export function runCodexReconciliationMaintenance(
       }
 
       const rowsVisited = legacyRowsVisited + contextRowsVisited + candidateRowsVisited;
-      const sliceDurationMs = performance.now() - sliceStarted;
-      const timeBudgetExhausted = performance.now() >= deadline;
+      const sliceDurationMs = clock() - sliceStarted;
+      const timeBudgetExhausted = clock() >= deadline;
       database
         .prepare(
           `update codex_reconciliation_control set

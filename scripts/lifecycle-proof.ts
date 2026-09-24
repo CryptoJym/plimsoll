@@ -347,7 +347,8 @@ async function main() {
     write(besideSummary, "not plimsoll's\n");
 
     const snapshotsRoot = path.join(happy.paths.lifecycleRoot, "snapshots");
-    const secretSnapshot = path.join(snapshotsRoot, "install-v1", "config");
+    // Retention keeps the newest completed snapshots; install-v1's is gone by now.
+    const secretSnapshot = path.join(snapshotsRoot, "rollback-v1", "config");
     const previewDigest = createHash("sha256").update(fs.readFileSync(happy.paths.database)).update(fs.readFileSync(happy.paths.history[0]!)).digest("hex");
     const preview = await runLifecycleCommand({
       argv: ["uninstall", "--operation-id", "uninstall-preview"],
