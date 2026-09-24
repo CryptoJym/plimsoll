@@ -346,6 +346,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:join-isolation
 
+      - name: Prove future-only enrollment withholds pre-join history (eco-6hoxj.163.22)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:enrollment-privacy
+
       - name: Prove immutable outcome timeline and bounded recovery
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:outcome-timeline

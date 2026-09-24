@@ -12,6 +12,7 @@
 import assert from "node:assert/strict";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 
@@ -22,6 +23,7 @@ import {
   collectorConfigSchema,
   type CollectorConfig,
 } from "../packages/collector-cli/src/config";
+import { deliveryAcknowledgement, deliveryExpectation } from "../packages/collector-cli/src/delivery-ack";
 import { appendForwardedHook } from "../packages/collector-cli/src/forwarder";
 import {
   COLLECTOR_APP_VERSION,
@@ -74,6 +76,23 @@ function responseJson(body: unknown, status = 200) {
   });
 }
 
+/**
+ * An ingest server that stores every item it is sent. Since delivery
+ * acknowledgement v1 (971a63d, docs/architecture/delivery-ack-v1.md) a bare
+ * 2xx no longer counts as delivered, so the `ack` is built by the production
+ * contract code over the exact request body. Accepting everything means a
+ * leaked row is sent and recorded as delivered, as a real server would store it.
+ */
+function acceptAll(init?: RequestInit) {
+  const rawBody = String(init?.body ?? "");
+  const expected = deliveryExpectation(rawBody, JSON.parse(rawBody).installKey);
+  return responseJson({
+    ok: true,
+    accepted: expected.itemIds.length,
+    ack: deliveryAcknowledgement(expected, expected.itemIds),
+  }, 200);
+}
+
 function requestUrl(input: Parameters<typeof fetch>[0]) {
   if (typeof input === "string") return new URL(input);
   if (input instanceof URL) return input;
@@ -116,7 +135,7 @@ function grantFetch(options: {
         uploadUrl: `${origin}/api/work-intelligence/ingest`,
       }, 201);
     }
-    return responseJson({ ok: true, accepted: 1 }, 200);
+    return acceptAll(init);
   }) as typeof fetch;
 }
 
@@ -366,6 +385,18 @@ function stateDirectory(homeDir: string) {
   return path.join(homeDir, "Library", "Application Support", "Plimsoll");
 }
 
+/** A loopback port nothing listens on: bound, then released. */
+function reserveLoopbackPort(): Promise<number> {
+  return new Promise((resolve, reject) => {
+    const server = net.createServer();
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const { port } = server.address() as net.AddressInfo;
+      server.close(() => resolve(port));
+    });
+  });
+}
+
 async function runCli(args: string[], homeDir: string) {
   const child = spawn(
     process.execPath,
@@ -528,7 +559,7 @@ async function firstJoinAndRejoinScenario(shape: SeedShape) {
     const ordinaryUpload = await uploadBufferedEvents(activatedConfig, postBuffer, {
       fetchImpl: (async (_input, init) => {
         ordinaryBodies.push(requestBody(init));
-        return responseJson({ ok: true, accepted: 1 }, 200);
+        return acceptAll(init);
       }) as typeof fetch,
     });
     const ordinaryIds = ordinaryBodies.flatMap((body) => uploadedEventIds(body));
@@ -599,7 +630,7 @@ async function firstJoinAndRejoinScenario(shape: SeedShape) {
     const rejoinUpload = await uploadBufferedEvents(activatedConfig, rejoinPostBuffer, {
       fetchImpl: (async (_input, init) => {
         rejoinBodies.push(requestBody(init));
-        return responseJson({ ok: true, accepted: 1 }, 200);
+        return acceptAll(init);
       }) as typeof fetch,
     });
     const rejoinIds = rejoinBodies.flatMap((body) => uploadedEventIds(body));
@@ -646,6 +677,15 @@ async function firstJoinAndRejoinScenario(shape: SeedShape) {
     // Scenario 5a — status receipt reports future-only enrollment without
     // reading or printing payloads.
     //
+    // `status` and `doctor` ask the daemon at config.port, and the join kept
+    // the default port. Point them at a released loopback port so a run on a
+    // host with a live collector never reaches it; they find no daemon, as on
+    // a CI runner.
+    const statusConfigPath = collectorConfigPath(firstHome);
+    fs.writeFileSync(statusConfigPath, `${JSON.stringify({
+      ...JSON.parse(fs.readFileSync(statusConfigPath, "utf8")),
+      port: await reserveLoopbackPort(),
+    }, null, 2)}\n`, { mode: 0o600 });
     const status = await runCli(["status"], firstHome);
     if (process.env.PLIMSOLL_PROOF_DEBUG) {
       console.error("DEBUG ledgerPath:", ledgerPath, "exists:", fs.existsSync(ledgerPath));
@@ -892,7 +932,7 @@ async function redTeamOutboxReleaseAfterJoin() {
     durableUpload = await uploadBufferedEvents(activatedConfig, buffer, {
       fetchImpl: (async (_input, init) => {
         bodies.push(requestBody(init));
-        return responseJson({ ok: true, accepted: 1 }, 200);
+        return acceptAll(init);
       }) as typeof fetch,
     });
     // The second release surface: the no-mark path reads listUnuploaded
@@ -901,7 +941,7 @@ async function redTeamOutboxReleaseAfterJoin() {
       markUploaded: false,
       fetchImpl: (async (_input, init) => {
         bodies.push(requestBody(init));
-        return responseJson({ ok: true, accepted: 1 }, 200);
+        return acceptAll(init);
       }) as typeof fetch,
     });
   } finally {
@@ -986,6 +1026,20 @@ try {
       { mode: 0o600 },
     );
     const ledgerPath = collectorBufferPath(reassignHome);
+    // The unassigned row predates the A binding (the legacy shape). Since
+    // 971a63d a new row takes the ledger's current binding, so it must be
+    // written before A binds the ledger; A's selection leaves it unassigned.
+    const unboundSeed = new LocalEventBuffer(ledgerPath, { delivery: { enabled: true } });
+    let unboundStoredId = "";
+    try {
+      const appended = appendForwardedHook(
+        { id: LEGACY_EVENT_IDS[1], source: "claude_code", event_type: "UserPromptSubmit" },
+        { config: defaultConfig(), buffer: unboundSeed, source: "claude_code" },
+      );
+      unboundStoredId = appended.event.id;
+    } finally {
+      unboundSeed.close();
+    }
     const boundSeed = new LocalEventBuffer(ledgerPath, {
       workspaceId: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
       delivery: { enabled: true },
@@ -1000,19 +1054,12 @@ try {
     } finally {
       boundSeed.close();
     }
-    const unboundSeed = new LocalEventBuffer(ledgerPath, { delivery: { enabled: true } });
-    let unboundStoredId = "";
-    try {
-      const appended = appendForwardedHook(
-        { id: LEGACY_EVENT_IDS[1], source: "claude_code", event_type: "UserPromptSubmit" },
-        { config: defaultConfig(), buffer: unboundSeed, source: "claude_code" },
-      );
-      unboundStoredId = appended.event.id;
-    } finally {
-      unboundSeed.close();
-    }
     const beforeRows = quarantineRows(ledgerPath);
     assert.equal(eventWorkspace(ledgerPath, boundStoredId), "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa");
+    assert.ok(
+      beforeRows.some((row) => row.table === "buffered_events" && row.eventId === unboundStoredId),
+      `fixture must hold an unassigned row beside the A-bound one: ${JSON.stringify(beforeRows)}`,
+    );
 
     const requests: RequestRecord[] = [];
     const temporaryRoot = path.join(root, "reassign-temp");
@@ -1061,7 +1108,7 @@ try {
         {
           fetchImpl: (async (_input, init) => {
             reassignBodies.push(requestBody(init));
-            return responseJson({ ok: true, accepted: 1 }, 200);
+            return acceptAll(init);
           }) as typeof fetch,
         },
       );
