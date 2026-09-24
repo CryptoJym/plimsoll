@@ -237,6 +237,9 @@ jobs:
       - name: Prove hook events survive collector 503/refused/reset via idempotent spool replay (eco-6hoxj.61 / .65)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:hook-spool
+      - name: Prove refused OTLP exports are spooled and replayed exactly once (eco-6hoxj.163.17)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:otlp-intake-spool
       - name: Prove producer-to-ledger parity instrumentation (eco-6hoxj.29)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:producer-parity
