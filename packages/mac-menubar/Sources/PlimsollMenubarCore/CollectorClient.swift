@@ -59,10 +59,9 @@ public final class CollectorClient: @unchecked Sendable {
     public func status() throws -> CollectorStatus {
         let result = try execute(invocation)
         guard result.exitCode == 0 else {
-            let message = result.standardError.trimmingCharacters(in: .whitespacesAndNewlines)
             throw CollectorClientError.commandFailed(
                 exitCode: result.exitCode,
-                message: message.isEmpty ? "no error output" : message
+                message: CollectorMessage.displayLine(result.standardError)
             )
         }
         guard let data = result.standardOutput.data(using: .utf8) else {

@@ -236,6 +236,69 @@ struct PlimsollMenubarCoreTests {
         #expect(!CollectorClient.defaultProbeLiveness(port: 70_000))
     }
 
+    @Test func collectorErrorTextIsOneLineAndNeverACredential() {
+        let token = String(repeating: "aB3_-", count: 8) + "xYz" // a 43-character base64url credential
+        let hash = String(repeating: "0123456789abcdef", count: 4) // sha256 hex, not a credential
+        #expect(token.count == 43)
+
+        #expect(CollectorMessage.displayLine("Error: rejected x-plimsoll-token=\(token)\n    at main (cli.ts:1)")
+            == "Error: rejected x-plimsoll-token=[redacted]")
+        #expect(CollectorMessage.displayLine(#"{"managementRead":"\#(token)"}"#) == #"{"managementRead":"[redacted]"}"#)
+        #expect(CollectorMessage.displayLine("\n\n  Error: home sha256:\(hash)  \n") == "Error: home sha256:\(hash)")
+        #expect(CollectorMessage.displayLine(" \n ") == "no error output")
+        let long = CollectorMessage.displayLine(String(repeating: "x ", count: 300))
+        #expect(long.count == CollectorMessage.maximumLength + 1 && long.hasSuffix("…"))
+    }
+
+    @Test func failingCollectorCannotPutACredentialOnScreen() throws {
+        let token = String(repeating: "Zz9-_", count: 8) + "q1W"
+        let collector = try FakeCollector("""
+            echo 'Error: management_credential_invalid \(token)' >&2
+            echo '    at readDaemonState (cli.ts:1191)' >&2
+            exit 1
+            """)
+        defer { collector.remove() }
+
+        #expect {
+            try CollectorClient(invocation: collector.invocation, probeLiveness: { _ in false }).snapshot()
+        } throws: { error in
+            let shown = error.localizedDescription
+            return shown == "Collector exited with status 1: Error: management_credential_invalid [redacted]"
+                && !shown.contains(token)
+        }
+    }
+
+    @Test func sourcesNeverTouchTheCollectorCredential() throws {
+        let sources = try packageSources()
+        #expect(sources.count >= 6)
+        for (file, text) in sources {
+            for needle in ["local-ingest-auth", "managementRead", "x-plimsoll-token"] {
+                #expect(!text.contains(needle), "\(file) mentions \(needle)")
+            }
+        }
+    }
+
+    /// What the permission doctor and README assert, checked in the source.
+    @Test func sourcesUseNoPermissionPromptingAPIsOrBundleMetadata() throws {
+        let promptingAPIs = [
+            "AXIsProcessTrusted", // accessibility
+            "AVCaptureDevice", "AVAudioSession", // camera, microphone
+            "IOHIDRequestAccess", "CGEventTapCreate", "tapCreate", "addGlobalMonitorForEvents", // input monitoring
+            "CGRequestScreenCaptureAccess", "SCShareableContent", "CGWindowListCreateImage", "CGDisplayStream", // screen
+            "SMAppService", "SMLoginItemSetEnabled", "LaunchAgents", // helpers and LaunchAgents
+        ]
+        let sources = try packageSources()
+        #expect(sources.count >= 6)
+        for (file, text) in sources {
+            for api in promptingAPIs {
+                #expect(!text.contains(api), "\(file) uses \(api)")
+            }
+        }
+        let bundleMetadata = try FileManager.default.subpathsOfDirectory(atPath: packageRoot.path)
+            .filter { !$0.hasPrefix(".") && ($0.hasSuffix(".entitlements") || $0.hasSuffix(".plist")) }
+        #expect(bundleMetadata.isEmpty)
+    }
+
     @Test func permissionDoctorReportsNoAdditionalPermissions() throws {
         let report = PermissionDoctor.report()
 
@@ -352,4 +415,16 @@ private extension Array where Element == UInt8 {
     func ends(with suffix: [UInt8]) -> Bool {
         count >= suffix.count && Array(self[(count - suffix.count)...]) == suffix
     }
+}
+
+private let packageRoot = URL(fileURLWithPath: #filePath)
+    .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+
+/// Every Swift file under Sources/, as (relative path, contents).
+private func packageSources() throws -> [(String, String)] {
+    let sources = packageRoot.appendingPathComponent("Sources")
+    return try FileManager.default.subpathsOfDirectory(atPath: sources.path)
+        .filter { $0.hasSuffix(".swift") }
+        .sorted()
+        .map { ($0, try String(contentsOf: sources.appendingPathComponent($0), encoding: .utf8)) }
 }
