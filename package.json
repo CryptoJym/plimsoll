@@ -70,6 +70,7 @@
     "proof:resource-finalization": "tsx scripts/resource-proof/finalization-proof.ts",
     "proof:dashboard": "tsx scripts/dashboard-projection-proof.ts",
     "proof:projection-convergence": "tsx scripts/projection-convergence-proof.ts",
+    "proof:projection-active-convergence": "tsx scripts/active-projection-convergence-proof.ts",
     "proof:last-token-event-backfill": "tsx scripts/last-token-event-backfill-proof.ts",
     "rehearse:ledger-open": "tsx scripts/rehearse-ledger-open.ts",
     "proof:jev-analysis": "tsx scripts/jev-analysis-proof.ts",

@@ -278,6 +278,7 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: |
           pnpm proof:projection-convergence
+          pnpm proof:projection-active-convergence
           pnpm proof:last-token-event-backfill
 
       - name: Prove Jev receipt projection and authenticated access
