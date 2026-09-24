@@ -212,6 +212,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:lifecycle-data-safety
 
+      - name: Prove no lifecycle command removes a receipt and staging never changes an existing runtime (eco-6hoxj.163.49/.50)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:lifecycle-preservation
+
       - name: Prove bounded nonblocking Git metadata maintenance
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:git-context

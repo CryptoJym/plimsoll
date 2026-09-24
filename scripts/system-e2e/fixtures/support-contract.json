@@ -20,7 +20,7 @@
     {
       "name": "canonical_lifecycle",
       "kind": "line_summary",
-      "expectedArtifactDigest": "sha256:a9159d89c047794446ff01896147047211d1f884cada3105bd2dbe4bcf298bb6"
+      "expectedArtifactDigest": "sha256:62dc842e9c8638f28a7592bdc43f2c98f74efe102cf65f6bb4b9fafaefbf87fa"
     },
     {
       "name": "idle_dashboard_resources",

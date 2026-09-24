@@ -45,7 +45,8 @@ remain gated under
 # the owned LaunchAgent manifest at it, verify durable readiness; any failure
 # restores the previous runtime, config, database, and manifest automatically.
 # A healthy update then keeps the two newest update snapshots and removes older
-# ones; --retention keep-all removes nothing (prune later, below).
+# ones; --retention keep-all (0.7.39 or later; older versions ignore it and
+# prune) removes nothing; prune later (below).
 npx @plimsoll/cli@<version> lifecycle update --operation-id <id> --artifact self --retention keep-all
 
 # Afterwards, restart the daemon on the new immutable runtime explicitly:
