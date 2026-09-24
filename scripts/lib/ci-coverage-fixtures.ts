@@ -901,3 +901,32 @@ export function disableSteps(input: CoverageInput, steps: Array<{ workflow: stri
     }),
   };
 }
+
+/** Append `suffix` to each given CI line, as the second PR #397 review did with `${{ vars.PROOF_ARGS }}`. */
+export function appendToCiLines(
+  input: CoverageInput,
+  lines: Array<{ workflow: string; job: string; stepIndex: number; command: string }>,
+  suffix: string,
+): CoverageInput {
+  return {
+    ...input,
+    workflows: input.workflows.map((workflow) => {
+      const targets = lines.filter((line) => line.workflow === workflow.path);
+      if (targets.length === 0) return workflow;
+      const document = parseDocument(workflow.text);
+      for (const target of targets) {
+        const path = ["jobs", target.job, "steps", target.stepIndex, "run"];
+        const run = String(document.getIn(path));
+        const edited = run.split("\n").map((line) => (line.trim() === target.command ? `${line}${suffix}` : line));
+        document.setIn(path, block(document, `${edited.join("\n").replace(/\n+$/, "")}\n`));
+      }
+      return { ...workflow, text: document.toString({ lineWidth: 0 }) };
+    }),
+  };
+}
+
+/** Prefix each given package script with a "temporarily disabled" exit, as the second PR #397 review did. */
+export function disableScripts(input: CoverageInput, scripts: string[]): CoverageInput {
+  const disabled = scripts.map((name) => [name, `echo '${name} temporarily disabled' && exit 0; ${input.scripts[name] ?? ""}`]);
+  return { ...input, scripts: { ...input.scripts, ...Object.fromEntries(disabled) } };
+}

@@ -10,7 +10,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 
-import { disableSteps } from "./lib/ci-coverage-fixtures";
+import { appendToCiLines, disableScripts, disableSteps } from "./lib/ci-coverage-fixtures";
 import {
   WORKFLOW_DIRECTORY,
   proofCiCoverage,
@@ -178,6 +178,28 @@ check(
       assert.ok(steps.length > 0, `${name}: no CI step runs its proof`);
       const missing = citedChecksNotRunInCi(found, proofCiCoverage(disableSteps(input, steps)));
       assert.ok(missing.some((entry) => entry.startsWith(`${name} (`)), `${name} not rejected: ${JSON.stringify(missing)}`);
+    }
+  },
+);
+
+check(
+  "adversarial_cited_proof_script_or_ci_line_tampered_rejected",
+  true,
+  () => {
+    // The second PR #397 review kept this guard green with a "temporarily
+    // disabled" prefix on the cited proof's package script, and with a
+    // `${{ vars.PROOF_ARGS }}` suffix on its CI line. Both must name the check.
+    const found = verifyProofChecks();
+    const input = readCoverageInput(repoRoot);
+    const coverage = proofCiCoverage(input);
+    for (const [name, files] of found) {
+      const runs = coverage.units.filter((unit) => files.includes(unit.unit)).flatMap((unit) => unit.covered);
+      const scripts = [...new Set(runs.flatMap((run) => run.via.slice(0, 1)))];
+      const attacks = [appendToCiLines(input, runs, " ${{ vars.PROOF_ARGS }}"), ...(scripts.length > 0 ? [disableScripts(input, scripts)] : [])];
+      for (const attacked of attacks) {
+        const missing = citedChecksNotRunInCi(found, proofCiCoverage(attacked));
+        assert.ok(missing.some((entry) => entry.startsWith(`${name} (`)), `${name} not rejected: ${JSON.stringify(missing)}`);
+      }
     }
   },
 );
