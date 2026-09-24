@@ -155,6 +155,7 @@ import {
 } from "./hook-spool";
 import { MaintenanceFailureError, MaintenanceProcessBoundary } from "./maintenance-boundary";
 import { checkpointWalInBoundedChild, runStartupWalSelfHeal } from "./startup-wal-self-heal";
+import { WalCheckpointWorker } from "./wal-checkpoint-worker";
 import {
   MAINTENANCE_BACKLOG_QUERIES,
   maintenanceStarvationReceipt,
@@ -2536,6 +2537,8 @@ async function main() {
     // This connection owns the HTTP event loop. Never inherit better-sqlite3's
     // five-second busy wait when the maintenance child briefly owns a writer.
     const buffer = openBuffer(config, false, 0);
+    // Its WAL checkpoints (and their fsync) run on a worker thread instead.
+    const walCheckpoint = new WalCheckpointWorker(buffer.database);
     // Outcome facts intentionally live outside the capture ledger. Opening the
     // local read model here does not schedule collection; the only writer is
     // an explicit backfill command.
@@ -3044,6 +3047,7 @@ async function main() {
     });
 
     retentionCadence.start();
+    walCheckpoint.start();
     // Boot capture is deferred so the OTLP receiver binds first, but it uses
     // the exact same bounded recent-tail entrypoint as the interval. Historical
     // files are available only through the explicit scan commands below.
@@ -3125,6 +3129,7 @@ async function main() {
     for (const timer of timers) timer.unref();
 
     const stopMaintenanceBeforeFatalExit = async () => {
+      void walCheckpoint.stop();
       maintenanceCadence?.stop();
       retentionCadence?.stop();
       enrichmentCadence?.stop();
@@ -3173,6 +3178,7 @@ async function main() {
       }
       shuttingDown = true;
       flushRejectionSummaries();
+      void walCheckpoint.stop();
       maintenanceCadence?.stop();
       retentionCadence?.stop();
       enrichmentCadence?.stop();
