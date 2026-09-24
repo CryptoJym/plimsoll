@@ -183,7 +183,7 @@ import {
   resolveSelfArtifact,
 } from "./lifecycle-adapters";
 import { PURGE_CONFIRMATION } from "./lifecycle";
-import { startStatusSummaryWriter } from "./status-summary";
+import { startStatusSummaryWriter, type StatusSummaryWriter } from "./status-summary";
 import { PLIMSOLL_VERSION } from "./version";
 import {
   applyCodexConfig,
@@ -2670,6 +2670,8 @@ async function main() {
     let ownsPidFile = false;
     let shuttingDown = false;
     const timers: NodeJS.Timeout[] = [];
+    /** eco-6hoxj.163.34: stopped with the timers; shutdown waits for a write in progress. */
+    let statusSummaryWriter: StatusSummaryWriter | null = null;
     /** The managed-config reconcile cadence reschedules itself, so it owns one live handle. */
     let managedConfigReconcileTimer: NodeJS.Timeout | undefined;
     let syncInFlight = false;
@@ -3082,6 +3084,7 @@ async function main() {
       retentionCadence?.stop();
       enrichmentCadence?.stop();
       for (const timer of timers) clearInterval(timer);
+      const summaryStopped = statusSummaryWriter?.stop() ?? Promise.resolve();
       if (managedConfigReconcileTimer) clearTimeout(managedConfigReconcileTimer);
       hookSpoolDrain?.stop();
       otlpSpool.stopDrain();
@@ -3093,6 +3096,7 @@ async function main() {
         maintenanceBoundary.shutdown(),
         enrichmentScheduler?.waitForIdle() ?? Promise.resolve(),
         enrichmentBoundary.shutdown(),
+        summaryStopped,
       ]);
       const maintenanceIdle = idle.status === "fulfilled";
       const maintenanceChildReaped = child.status === "fulfilled" && child.value;
@@ -3130,6 +3134,9 @@ async function main() {
       retentionCadence?.stop();
       enrichmentCadence?.stop();
       for (const timer of timers) clearInterval(timer);
+      // A summary write in progress finishes (or its temp file is removed)
+      // before the process exits.
+      const summaryStopped = statusSummaryWriter?.stop() ?? Promise.resolve();
       if (managedConfigReconcileTimer) clearTimeout(managedConfigReconcileTimer);
       hookSpoolDrain?.stop();
       otlpSpool.stopDrain();
@@ -3169,7 +3176,7 @@ async function main() {
       void (async () => {
         try {
           await Promise.race([
-            Promise.allSettled([serverClose, idle, childShutdown, enrichmentShutdown]).then(() => undefined),
+            Promise.allSettled([serverClose, idle, childShutdown, enrichmentShutdown, summaryStopped]).then(() => undefined),
             deadline,
           ]);
           if (!serverClosed) {
@@ -3304,14 +3311,14 @@ async function main() {
       }
       ownership.release();
       // eco-6hoxj.163.34: the private summary local readers (the menubar)
-      // read instead of running `plimsoll status`. Stopped with the timers.
-      timers.push(startStatusSummaryWriter({
+      // read instead of running `plimsoll status`. Written off the event loop.
+      statusSummaryWriter = startStatusSummaryWriter({
         home: collectorHome(),
         instanceId: server.plimsollInstanceId,
         collectorVersion: PLIMSOLL_VERSION,
         port: config.port,
         stats: server.plimsollCachedStats,
-      }));
+      });
       console.log(
         JSON.stringify({
           status: "active",

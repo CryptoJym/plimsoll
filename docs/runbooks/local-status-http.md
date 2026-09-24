@@ -65,9 +65,15 @@ intended gate: `curl http://127.0.0.1:<port>/status` →
 ## Status summary file
 
 The running collector writes `status-summary.json` in its home every 15 s
-and once as soon as it listens (eco-6hoxj.163.34). It writes a temp file
-(mode 0600) and fsyncs it before renaming it into place, so a reader never
-sees a partial file. It holds exactly:
+and once as soon as it listens (eco-6hoxj.163.34). It writes a temp file,
+sets it to mode 0600 whatever the umask, fsyncs it and renames it into
+place, so a reader never sees a partial file. Every step is asynchronous,
+off the event loop that serves intake, and a write still in progress when
+the next one is due makes that one skip. The writer pins its home by
+device and inode when it starts and checks it again before each temp file
+and each rename; if the home was replaced (renamed, or swapped for a
+symlink), it stops writing and warns once (`home_changed`). Shutdown waits
+for a write in progress, so no temp file is left. It holds exactly:
 
 ```json
 {"schema":"plimsoll.status-summary/v1","instanceId":"<the /healthz value>",
@@ -115,4 +121,9 @@ persists across two reads at least 10 s apart.
 - `pnpm proof:status-summary` — the summary file is private, exactly shaped,
   atomic for a concurrent reader, written without a SQL statement, free of
   credentials and paths, and names the same run as `/healthz`; a real
-  `plimsoll start` daemon writes it.
+  `plimsoll start` daemon writes it and leaves no temp file when it stops.
+  With fsync delayed 250 ms, a zero-delay timer and `/healthz` stay prompt;
+  a write is one exclusive create, chmod, write, fsync, close and rename
+  (no read, no synchronous call) per 15 s; the file is 0600 under umask
+  0777; a swapped home is refused; a failed or interrupted write leaves no
+  temp file.
