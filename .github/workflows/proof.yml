@@ -46,6 +46,9 @@ jobs:
             echo "TMPDIR=$proof_home/tmp"
           } >> "$GITHUB_ENV"
 
+      - name: Prove every proof script runs in CI or is reviewed local-only (eco-6hoxj.163.23)
+        run: pnpm proof:ci-coverage
+
       - name: Typecheck
         id: typecheck
         run: pnpm exec tsc --noEmit
