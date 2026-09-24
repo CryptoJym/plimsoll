@@ -76,6 +76,7 @@ jobs:
           pnpm proof:automatic-record-retry
           pnpm proof:automatic-revisit
           pnpm proof:oversized-continuation
+          pnpm proof:oversized-continuation-storage
           PLIMSOLL_PROOF_HOME="$TMPDIR" pnpm proof:automatic-capture-cadence > evidence/automatic-capture-cadence-proof.json
           pnpm proof:automatic-retry-metadata
           pnpm proof:future-admission
@@ -444,6 +445,10 @@ jobs:
       - name: Prove finalized privacy failures fail closed
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: node ./node_modules/tsx/dist/cli.mjs ./scripts/resource-proof/finalization-proof.ts
+
+      - name: Prove owner shutdown is bounded, reaped and never silent (#162)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:owner-shutdown
 
       - name: Prove the published privacy spec derives from the source lists (#13)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

@@ -69,6 +69,7 @@
     "proof:resource-concurrency": "tsx scripts/resource-proof/concurrency-proof.ts",
     "proof:resource": "tsx scripts/resource-proof/index.ts",
     "proof:resource-finalization": "tsx scripts/resource-proof/finalization-proof.ts",
+    "proof:owner-shutdown": "tsx scripts/resource-proof/owner-shutdown-proof.ts",
     "proof:dashboard": "tsx scripts/dashboard-projection-proof.ts",
     "proof:projection-convergence": "tsx scripts/projection-convergence-proof.ts",
     "proof:projection-active-convergence": "tsx scripts/active-projection-convergence-proof.ts",
@@ -150,6 +151,7 @@
     "proof:install-artifact": "tsx scripts/run-proof.ts scripts/install-artifact-proof.ts",
     "proof:automatic-capture-cadence": "tsx scripts/automatic-capture-cadence-proof.ts",
     "proof:oversized-continuation": "tsx scripts/run-proof.ts scripts/oversized-continuation-suite-proof.ts",
+    "proof:oversized-continuation-storage": "tsx scripts/oversized-continuation-proof.ts",
     "proof:codex-live-usage": "tsx scripts/run-proof.ts scripts/codex-live-usage-proof.ts",
     "proof:codex-live-reporting": "tsx scripts/run-proof.ts scripts/codex-live-reporting-proof.ts",
     "proof:legacy-privacy-parity": "tsx scripts/legacy-privacy-parity-proof.ts"
