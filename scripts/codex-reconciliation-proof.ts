@@ -34,7 +34,8 @@ type LegacyFixtureShape = "irrelevant" | "sparse" | "dense-context" | "mixed";
  * the same work on every host instead of however much fits into 50 real ms.
  * 0.4 ms per check reproduces the reference run recorded in issue 0047
  * (sparse history projected the surveyed ledger to 65-81 cycles). Real
- * durations are still recorded for information, not asserted.
+ * durations of these slices are recorded for information; a separate run of
+ * real-clock slices is bounded below.
  */
 const BUDGET_CHECK_MS = 0.4;
 const DEFAULT_SLICE_MS = 50;
@@ -45,6 +46,16 @@ function sliceClock() {
   let now = 0;
   return () => (now += BUDGET_CHECK_MS);
 }
+
+/**
+ * Real time still matters: a unit of work that overran the budget in real
+ * time would not show on the virtual clock. A few default slices on the real
+ * clock must each return within this generous bound (5x the 50 ms budget),
+ * so host speed never decides it; the earlier 100 ms bound held at 62 ms
+ * under heavy load (second review of PR #397).
+ */
+const REAL_SLICE_BOUND_MS = 250;
+const REAL_CLOCK_SLICES = 3;
 
 function seedLegacyLedger(
   file: string,
@@ -690,11 +701,40 @@ function provePriorDraftCandidatePriorityMigration(root: string) {
   }
 }
 
+function proveRealClockSlices(ledger: string, shape: "sparse" | "dense-context") {
+  const buffer = new LocalEventBuffer(ledger);
+  try {
+    const slices: Array<{ rows: number; sliceMs: number; wallMs: number; exhausted: boolean }> = [];
+    for (let slice = 0; slice < REAL_CLOCK_SLICES; slice += 1) {
+      const started = performance.now();
+      const result = runCodexReconciliationMaintenance(buffer.database);
+      const wallMs = performance.now() - started;
+      slices.push({
+        rows: result.legacyRowsVisited,
+        sliceMs: Math.round(result.sliceDurationMs * 100) / 100,
+        wallMs: Math.round(wallMs * 100) / 100,
+        exhausted: result.timeBudgetExhausted,
+      });
+      if (result.backfillComplete) break;
+    }
+    const maxWallMs = Math.max(...slices.map((entry) => entry.wallMs));
+    check(
+      `${shape}_legacy_real_clock_slices_stay_within_a_generous_bound`,
+      slices.some((entry) => entry.rows > 0) && maxWallMs <= REAL_SLICE_BOUND_MS,
+      { shape, budgetMs: DEFAULT_SLICE_MS, boundMs: REAL_SLICE_BOUND_MS, maxWallMs, slices },
+    );
+  } finally {
+    buffer.close();
+  }
+}
+
 function proveLegacyCadence(root: string, shape: "sparse" | "dense-context") {
   const syntheticRows = 300_000;
   const liveRows = 4_810_030;
   const ledger = path.join(root, `legacy-${shape}.sqlite`);
   seedLegacyLedger(ledger, syntheticRows, shape);
+  const realClockLedger = path.join(root, `legacy-${shape}-real-clock.sqlite`);
+  fs.copyFileSync(ledger, realClockLedger);
   const buffer = new LocalEventBuffer(ledger);
   try {
     const results: ReturnType<typeof runCodexReconciliationMaintenance>[] = [];
@@ -750,6 +790,7 @@ function proveLegacyCadence(root: string, shape: "sparse" | "dense-context") {
         wallClockMaxSliceMs: Math.round(Math.max(...productive.map((entry) => entry.wallMs)) * 100) / 100,
       },
     );
+    proveRealClockSlices(realClockLedger, shape);
 
     if (shape === "dense-context") {
       const sideTables = buffer.database
