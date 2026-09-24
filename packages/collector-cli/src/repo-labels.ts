@@ -1,4 +1,4 @@
-import { authenticatedJsonPost } from "./http-transport";
+import { authenticatedJsonPost, pinnedUploadUrl } from "./http-transport";
 
 import Database from "better-sqlite3";
 
@@ -251,7 +251,7 @@ export async function pushRepoLabels(
   const log = options.log ?? ((line: string) => console.log(line));
   const fetchImpl = options.fetchImpl ?? fetch;
 
-  const baseUrl = options.url ?? config.uploadUrl;
+  const baseUrl = pinnedUploadUrl(config.uploadUrl, options.url);
   if (!baseUrl) {
     throw new Error(
       "This machine has not joined a workspace (no uploadUrl in collector.config.json). " +

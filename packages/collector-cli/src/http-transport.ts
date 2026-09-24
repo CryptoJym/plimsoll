@@ -37,6 +37,17 @@ export function validatedTransportUrl(raw: string, _label: string) {
   throw new TransportError("insecure_url");
 }
 
+/** An upload URL override (--url) may pick another path on the configured
+ * workspace, never another origin: every upload carries that workspace's
+ * install key and signature. Returns the chosen URL unchanged. */
+export function pinnedUploadUrl(configuredUrl: string | undefined, overrideUrl: string | undefined) {
+  if (overrideUrl && configuredUrl && validatedTransportUrl(overrideUrl, "Upload URL").origin !==
+      validatedTransportUrl(configuredUrl, "Configured upload URL").origin) {
+    throw new Error("Upload URL must use the same origin as the configured workspace audience.");
+  }
+  return overrideUrl ?? configuredUrl;
+}
+
 export function assertNoRedirect(response: Response, _label: string, expectedOrigin: string) {
   if (response.redirected || (response.status >= 300 && response.status < 400)) {
     throw new TransportError("redirect_rejected");

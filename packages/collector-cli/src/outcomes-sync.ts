@@ -1,5 +1,5 @@
 import { postDelivery } from "./delivery-post";
-import { TransportError, type JsonPostResult } from "./http-transport";
+import { pinnedUploadUrl, TransportError, type JsonPostResult } from "./http-transport";
 
 import Database from "better-sqlite3";
 
@@ -636,7 +636,7 @@ export async function runOutcomesSync(
   const fetchImpl = options.fetchImpl ?? fetch;
   const startedAt = Date.now();
 
-  const baseUrl = options.url ?? config.uploadUrl;
+  const baseUrl = pinnedUploadUrl(config.uploadUrl, options.url);
   if (!baseUrl) {
     throw new Error(
       "This machine has not joined a workspace (no uploadUrl in collector.config.json). " +

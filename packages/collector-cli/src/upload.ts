@@ -13,7 +13,7 @@ import {
   type AiWorkIngestBatch,
 } from "../../shared/src/index";
 import { sealOutboundEnvelope } from "./outbound-envelope";
-import { TransportError, validatedTransportUrl } from "./http-transport";
+import { TransportError, pinnedUploadUrl, validatedTransportUrl } from "./http-transport";
 import { postDelivery } from "./delivery-post";
 import { retryAfterMilliseconds } from "./retry-after";
 import { deliveryExpectation } from "./delivery-ack";
@@ -253,16 +253,9 @@ function failureForProbe(result: ProbeResult): Exclude<DeliveryFailureClass, "no
 }
 
 function validatedUploadUrl(config: CollectorConfig, override?: string) {
-  const raw = override ?? config.uploadUrl;
+  const raw = pinnedUploadUrl(config.uploadUrl, override);
   if (!raw) throw new Error("No upload URL configured. Pass --url or set uploadUrl in collector.config.json.");
-  const url = validatedTransportUrl(raw, "Upload URL");
-  if (override && config.uploadUrl) {
-    const configured = validatedTransportUrl(config.uploadUrl, "Configured upload URL");
-    if (configured.origin !== url.origin) {
-      throw new Error("Upload URL must use the same origin as the configured workspace audience.");
-    }
-  }
-  return url.href;
+  return validatedTransportUrl(raw, "Upload URL").href;
 }
 
 async function uploadStateless(

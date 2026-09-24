@@ -5,7 +5,7 @@ import Database from "better-sqlite3";
 
 import type { CollectorConfig } from "./config";
 import { postDelivery } from "./delivery-post";
-import { TransportError } from "./http-transport";
+import { pinnedUploadUrl, TransportError } from "./http-transport";
 import {
   assertCollectorPrivacyMode,
   collectorBufferPath,
@@ -686,7 +686,7 @@ export async function runWorkspaceHistoryUpload(
   const fetchImpl = options.fetchImpl ?? fetch;
   const now = options.now ?? (() => new Date());
 
-  const url = options.url ?? config.uploadUrl;
+  const url = pinnedUploadUrl(config.uploadUrl, options.url);
   if (!url) {
     throw new Error(
       "This machine has not joined a workspace (no uploadUrl in collector.config.json). " +
@@ -1168,7 +1168,7 @@ export async function runAttributionRepair(
   const sleep = options.sleep ?? defaultSleep;
   const fetchImpl = options.fetchImpl ?? fetch;
 
-  const url = options.url ?? config.uploadUrl;
+  const url = pinnedUploadUrl(config.uploadUrl, options.url);
   if (!url) {
     throw new Error(
       "This machine has not joined a workspace (no uploadUrl in collector.config.json). " +

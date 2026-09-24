@@ -174,6 +174,73 @@ async function main() {
     const result=await runWorkspaceHistoryUpload(cfg,{ledgerPath:ledger,statePath,fetchImpl:fake({}),sleep:async()=>{},delayMs:0,maxAttemptsPerBatch:1,log:()=>{}});
     assert.equal(result.ok,false);const state=JSON.parse(fs.readFileSync(statePath,'utf8'));assert.equal(state.watermark,null);
   });
+  // A --url override may pick another path on the joined workspace, never another origin:
+  // every upload path refuses a foreign-origin override before any request (GitHub reads
+  // included) and sends to a same-origin one.
+  const { runAttributionRepair } = await import("../packages/collector-cli/src/upload-history");
+  const { runSessionSync } = await import("../packages/collector-cli/src/session-sync");
+  const { runOutcomesSync } = await import("../packages/collector-cli/src/outcomes-sync");
+  const { pushRepoLabels } = await import("../packages/collector-cli/src/repo-labels");
+  const { remoteLinkageHash } = await import("../packages/shared/src/index");
+  const workspace=new URL(options.url).origin, sameOriginOverride=`${workspace}/override/ingest`;
+  const foreignOverrides=["https://foreign.example/api/work-intelligence/ingest","http://127.0.0.1:2/ingest"];
+  const pinCfg=collectorConfigSchema.parse({tenantId,installKey,uploadUrl:options.url,delivery:{requestTimeoutSeconds:1}});
+  const repoHash=remoteLinkageHash('https://github.com/fixture/outcomes.git')!, sha='a'.repeat(40);
+  const quiet={sleep:async()=>{},delayMs:0,maxAttemptsPerBatch:1,log:()=>{}};
+  let pinLedgers=0;
+  const pinLedger=()=>{
+    const file=path.join(root,`pin-${++pinLedgers}.sqlite`);
+    const buffer=new LocalEventBuffer(file,{workspaceId:tenantId,delivery:{enabled:true,limits:pinCfg.delivery}});
+    buffer.append(aiInteractionEventSchema.parse({id:uuid(100),sessionId:uuid(101),source:'codex',eventType:'assistant_response',observedAt:new Date().toISOString(),inputTokens:7}));
+    buffer.database.prepare('update buffered_events set repo_hash = ?, head_sha = ?').run(repoHash,sha);
+    return {buffer,file};
+  };
+  const workspaceFetch=(posted:string[])=>(async(input,init)=>{
+    const url=new URL(String(input)), now=new Date().toISOString();
+    if(url.hostname==='api.github.com'){
+      const data=url.pathname.endsWith('/pulls')?[{number:1,state:'closed',merged_at:now,updated_at:now,merge_commit_sha:'b'.repeat(40),head:{sha,ref:'main'}}]:url.pathname.endsWith('/check-runs')?{check_runs:[]}:[];
+      return new Response(JSON.stringify(data));
+    }
+    posted.push(url.href);
+    const raw=String(init?.body),payload=JSON.parse(raw);
+    if(Array.isArray(payload.repositories))return new Response(JSON.stringify({ok:true,created:payload.repositories.length,updated:0}));
+    const exp=deliveryExpectation(raw,installKey);
+    return new Response(JSON.stringify({ok:true,ack:deliveryAcknowledgement(exp,exp.itemIds)}));
+  }) as typeof fetch;
+  const uploadPaths:Record<string,{target:string;run:(url:string,fetchImpl:typeof fetch)=>Promise<boolean>}>={
+    upload:{target:sameOriginOverride,run:async(url,fetchImpl)=>{
+      const {buffer}=pinLedger();
+      try{return (await uploadBufferedEvents(pinCfg,buffer,{url,fetchImpl})).uploadedEvents===1;}finally{buffer.close();}
+    }},
+    upload_history:{target:sameOriginOverride,run:async(url,fetchImpl)=>{
+      const {buffer,file}=pinLedger();buffer.close();
+      return (await runWorkspaceHistoryUpload(pinCfg,{ledgerPath:file,statePath:`${file}.state.json`,url,fetchImpl,...quiet})).ok;
+    }},
+    repair_attribution:{target:sameOriginOverride,run:async(url,fetchImpl)=>{
+      const {buffer,file}=pinLedger();buffer.close();
+      return (await runAttributionRepair(pinCfg,{ledgerPath:file,url,fetchImpl,...quiet})).ok;
+    }},
+    session_sync:{target:sameOriginOverride,run:async(url,fetchImpl)=>{
+      const {buffer}=pinLedger();
+      try{return (await runSessionSync(pinCfg,{ledgerDb:buffer.database,url,fetchImpl,...quiet})).ok;}finally{buffer.close();}
+    }},
+    repo_labels:{target:`${workspace}/api/work-intelligence/repo-labels`,run:async(url,fetchImpl)=>
+      (await pushRepoLabels(pinCfg,[{source:'repo_label',provider:'github',owner:'fixture',name:'outcomes',remoteUrlHash:repoHash}],{url,fetchImpl,log:()=>{}})).pushed===1},
+    sync_outcomes:{target:`${workspace}/api/work-intelligence/github-outcomes`,run:async(url,fetchImpl)=>{
+      const {buffer}=pinLedger();
+      try{return (await runOutcomesSync(pinCfg,{repository:'fixture/outcomes',ledgerDb:buffer.database,url,fetchImpl,log:()=>{}})).ok;}finally{buffer.close();}
+    }},
+  };
+  for (const [name,entry] of Object.entries(uploadPaths)) await check(`url_override_pinned_to_workspace_origin_${name}`,async()=>{
+    for (const foreign of foreignOverrides) {
+      let requests=0;
+      await assert.rejects(entry.run(foreign,(async()=>{requests++;return new Response('{}');}) as typeof fetch),/same origin as the configured workspace audience/);
+      assert.equal(requests,0);
+    }
+    const posted:string[]=[];
+    assert.equal(await entry.run(sameOriginOverride,workspaceFetch(posted)),true);
+    assert.ok(posted.length>0&&posted.every(url=>url===entry.target),JSON.stringify(posted));
+  });
 }
 let completed=false;
 const watchdog=setTimeout(()=>{console.error('delivery proof did not complete');process.exit(1);},45_000);
