@@ -287,13 +287,14 @@ async function main() {
       sourceOperationKey: "missing-episode-attempt",
       episodeId: "00000000-0000-5000-9000-000000000777",
     });
-    assert.throws(
-      () => store.recordToolSignal(missingEpisode),
-      /ToolAttemptEpisodeMissing/,
-    );
+    const missingEpisodeWrite = store.recordToolSignal(missingEpisode);
+    assert.equal(missingEpisodeWrite.dropped, true);
     checks.push({
-      name: "attempt_episode_links_require_an_explicit_existing_episode",
-      detail: { attemptCountUnchanged: store.attempts().length === 4 },
+      name: "late_attempt_for_evicted_episode_is_dropped_without_throwing",
+      detail: {
+        attemptCountUnchanged: store.attempts().length === 4,
+        dropReason: missingEpisodeWrite.dropReason,
+      },
     });
 
     proofStage = "episode_time_boundaries";
@@ -456,7 +457,9 @@ async function main() {
       resultStatus: "failure",
       errorCategory: "timeout",
     });
-    const openCompleted = store.recordToolSignal(openEpisodeResult).fact;
+    const openCompletedWrite = store.recordToolSignal(openEpisodeResult);
+    assert.ok(openCompletedWrite.fact);
+    const openCompleted = openCompletedWrite.fact;
     check(
       "open_episode_accepts_later_result",
       openCompleted.resultStatus === "failure" &&
@@ -719,6 +722,7 @@ async function main() {
       },
       { outcomeObservedAt: "2026-07-17T12:00:20.000Z" },
     );
+    assert.ok(reopenedWrite.fact);
     check(
       "exposure_identity_remains_idempotent_after_reopen",
       reopenedWrite.inserted === false &&
@@ -774,7 +778,7 @@ async function main() {
     );
     check(
       "promoted_fact_dimensions_are_indexed",
-      indexes.length === 13 && semanticIndex?.unique === 1,
+      indexes.length === 14 && semanticIndex?.unique === 1,
       { indexCount: indexes.length, semanticIdentityUnique: semanticIndex?.unique === 1 },
     );
 
@@ -798,14 +802,14 @@ async function main() {
         endedAt: "2026-07-17T12:03:00.000Z",
       });
       limited.recordWorkEpisode(secondEpisode);
-      assert.equal(limited.episodes().length, 2);
+      assert.equal(limited.episodes().length, 1);
       const maintenance = limited.runMaintenance(1);
-      assert.equal(maintenance.evicted, 1);
+      assert.equal(maintenance.evicted, 0);
       assert.deepEqual(limited.episodes().map((row) => row.episodeId), [secondEpisode.episodeId]);
       assert.equal(limited.status().tables.work_episode_facts.evictedCount, 1);
       checks.push({
         name: "fact_row_capacity_retains_newest_and_evicts_oldest",
-        detail: { episodeLimit: 1, evicted: maintenance.evicted },
+        detail: { episodeLimit: 1, inlineEvicted: 1, maintenanceEvicted: maintenance.evicted },
       });
     } finally {
       limitedDb.close();

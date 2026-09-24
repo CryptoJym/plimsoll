@@ -1,4 +1,5 @@
 import type Database from "better-sqlite3";
+import { recordRuntimeFactDrop, type RuntimeFactDropReason } from "./runtime-fact-drops";
 
 import {
   adaptToolInteractionEvent,
@@ -31,14 +32,8 @@ import type {
  * never written to any fact table.
  */
 
-export type RuntimeFactDropReason =
-  | "missing_session"
-  | "episode_seed_failed"
-  | "invalid_signal"
-  | "identity_conflict"
-  | "unpaired_result"
-  | "retry_target_missing"
-  | "capacity_exceeded";
+export { ensureRuntimeFactDropSchema, recordRuntimeFactDrop, runtimeFactDropCounters,
+  type RuntimeFactDropReason } from "./runtime-fact-drops";
 
 /** Producer correlation aliases admitted as bounded identifiers upstream. */
 const CORRELATION_KEYS = ["call_id", "request_id"] as const;
@@ -48,50 +43,6 @@ const RETRY_OF_KEY = "plimsoll.retry_of";
 const IMPLICIT_EPISODE_KEY = "session";
 const IMPLICIT_WORK_CLASS: WorkClass = "other";
 const IMPLICIT_COMPLEXITY_BAND: WorkComplexityBand = "unknown";
-
-type DropRow = { reason: RuntimeFactDropReason; droppedCount: number; lastDroppedAt: string };
-
-export function ensureRuntimeFactDropSchema(db: Database.Database) {
-  db.exec(`
-    create table if not exists runtime_fact_drops (
-      reason text primary key,
-      dropped_count integer not null check(dropped_count >= 0),
-      last_dropped_at text not null
-    );
-  `);
-}
-
-function dropTimestamp() {
-  return new Date().toISOString();
-}
-
-/** One bounded dirty-state row per drop reason; never throws into capture. */
-export function recordRuntimeFactDrop(db: Database.Database, reason: RuntimeFactDropReason) {
-  try {
-    ensureRuntimeFactDropSchema(db);
-    db.prepare(
-      `insert into runtime_fact_drops (reason, dropped_count, last_dropped_at)
-       values (?, 1, ?)
-       on conflict(reason) do update set
-         dropped_count = dropped_count + 1,
-         last_dropped_at = excluded.last_dropped_at`,
-    ).run(reason, dropTimestamp());
-  } catch {
-    // Drop accounting must never break capture.
-  }
-}
-
-export function runtimeFactDropCounters(db: Database.Database): DropRow[] {
-  try {
-    return db.prepare(
-      `select reason, dropped_count as droppedCount, last_dropped_at as lastDroppedAt
-       from runtime_fact_drops order by reason`,
-    ).all() as DropRow[];
-  } catch {
-    ensureRuntimeFactDropSchema(db);
-    return [];
-  }
-}
 
 function topLevelMetadataString(event: AiInteractionEvent, key: string) {
   const metadata = event.metadata as Record<string, unknown> | undefined;
@@ -179,22 +130,31 @@ export function promoteRuntimeLearningFacts(
   // Re-seeding with a newer observation timestamp must not conflict with the
   // already-stored episode; recovery reads the durable row by identity.
   let episodeId: string | undefined;
-  const implicitEpisode = buildWorkEpisodeFact({
-    source: event.source,
-    sessionId: event.sessionId,
-    sourceEpisodeKey: IMPLICIT_EPISODE_KEY,
-    workClass: IMPLICIT_WORK_CLASS,
-    complexityBand: IMPLICIT_COMPLEXITY_BAND,
-    startedAt: event.observedAt,
-  });
-  try {
-    store.recordWorkEpisode(implicitEpisode);
-    episodeId = implicitEpisode.episodeId;
-  } catch {
-    if (store.episodeById(implicitEpisode.episodeId)) {
-      episodeId = implicitEpisode.episodeId;
-    } else {
-      recordRuntimeFactDrop(target.database, "episode_seed_failed");
+  // A result for an evicted attempt must not recreate its old episode (and
+  // thereby evict a newer graph just to discard the unpaired result).
+  if (event.eventType === "tool_use") {
+    const implicitEpisode = buildWorkEpisodeFact({
+      source: event.source,
+      sessionId: event.sessionId,
+      sourceEpisodeKey: IMPLICIT_EPISODE_KEY,
+      workClass: IMPLICIT_WORK_CLASS,
+      complexityBand: IMPLICIT_COMPLEXITY_BAND,
+      startedAt: event.observedAt,
+    });
+    try {
+      const episodeWrite = store.recordWorkEpisode(implicitEpisode);
+      if (episodeWrite.dropped) {
+        return { attempted: true, attemptInserted: false, resultApplied: false };
+      } else {
+        episodeId = implicitEpisode.episodeId;
+      }
+    } catch {
+      if (store.episodeById(implicitEpisode.episodeId)) {
+        episodeId = implicitEpisode.episodeId;
+      } else {
+        recordRuntimeFactDrop(target.database, "episode_seed_failed");
+        return { attempted: true, attemptInserted: false, resultApplied: false };
+      }
     }
   }
 
@@ -214,6 +174,9 @@ export function promoteRuntimeLearningFacts(
         episodeId,
       });
       const recorded = store.recordToolSignal(start);
+      if (recorded.dropped) {
+        return { attempted: true, attemptInserted: false, resultApplied: false };
+      }
       // A completion-bearing signal on the same observation (OTLP tool spans
       // export start, end, and status together) closes the attempt in this
       // same promotion: at most one fact append plus one result update.
@@ -223,7 +186,7 @@ export function promoteRuntimeLearningFacts(
       const endedAt = spanEnd ?? (resultStatus !== "unknown" ? event.observedAt : undefined);
       if (endedAt) {
         try {
-          store.recordToolSignal({
+          const completed = store.recordToolSignal({
             kind: "result",
             operationId: deterministicToolOperationId({
               source: event.source,
@@ -236,7 +199,7 @@ export function promoteRuntimeLearningFacts(
             resultStatus,
             errorCategory,
           });
-          resultApplied = true;
+          resultApplied = !completed.dropped;
         } catch (error) {
           recordRuntimeFactDrop(target.database, errorReasonFor(error));
         }
@@ -260,7 +223,10 @@ export function promoteRuntimeLearningFacts(
       resultStatus,
       errorCategory,
     });
-    store.recordToolSignal(result);
+    const recorded = store.recordToolSignal(result);
+    if (recorded.dropped) {
+      return { attempted: false, attemptInserted: false, resultApplied: false };
+    }
     return { attempted: false, attemptInserted: false, resultApplied: true };
   } catch (error) {
     recordRuntimeFactDrop(target.database, errorReasonFor(error));

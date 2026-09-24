@@ -385,6 +385,26 @@ Named sentinel checks enforcing this section:
 - `g_no_planted_content_reaches_the_spool` — `scripts/otlp-intake-spool-proof.ts`
 - `g_each_spooled_row_is_exactly_the_row_the_ledger_stores` — `scripts/otlp-intake-spool-proof.ts`
 - `g_events_that_carried_a_raw_working_directory_are_counted_not_written` — `scripts/otlp-intake-spool-proof.ts`
+- `episode_eviction_removes_related_attempts_and_exposures_atomically` — `scripts/learning-facts-capacity-proof.ts`
+- `fact_tables_never_enter_upload_envelopes` — `scripts/learning-facts-proof.ts`
+- `whole_ledger_purge_removes_fact_rows_and_state_together` — `scripts/learning-facts-capacity-proof.ts`
+
+### Promoted learning facts
+
+The collector may promote only the bounded, normalized learning facts listed below from typed tool and assignment signals. They remain local to `work-ledger.sqlite`; no learning-fact table is part of an upload envelope or outbound query (`packages/collector-cli/src/learning-facts.ts`).
+Each cap is a hard row bound. When a table is full, the write transaction removes the oldest indexed row(s) needed for the new fact; maintenance selects at most 256 oldest roots per table per pass, plus their dependent facts. Evicting an episode removes its descendants, attempts, and exposures together; evicting an attempt also removes its retry descendants. A late reference to an evicted episode is dropped and counted, never written as an orphan and never raised into capture.
+
+| Table | What it retains | Hard cap | Retention and erasure |
+|---|---|---:|---|
+| `tool_attempt_facts` | Low-cardinality tool attempt start/result outcomes and timing. | 100,000 | Newest attempts win; oldest rows and their retry descendants are logically deleted on eviction or purge. |
+| `work_episode_facts` | Bounded work-session class, complexity, timing, and parent linkage. | 10,000 | Newest whole episode graphs win; episode, descendants, attempts, and exposures are deleted together. |
+| `technique_exposure_facts` | Explicit prospective technique identity, assignment, mode, and exposure time. | 10,000 | Newest exposures win; evicted and purged rows are fully removed from the ledger. |
+| `technique_identity_registry` | Bounded deduplication identities for explicit techniques. | 256 | Newest identities win; evicted and purged identities are fully removed. |
+| `learning_fact_table_state` | Local row counts, aggregate eviction counters, and maintenance flags for the four tables above. | 4 state rows | Atomic state/trigger initialization and missing-trigger reconciliation keep counts accurate. Ordinary status reads only these four rows; ledger purge removes them. |
+
+Raw event retention and projection compaction do not remove these independent promoted facts. A child/retry whose parent is removed by the same capacity eviction is also dropped with a counter; no orphan is retained. Drop reasons and totals live in the bounded, local `runtime_fact_drops` table; there are no per-fact retention logs.
+
+Eviction counters are aggregate state, not per-fact logs. SQLite deletion provides the product's logical erasure guarantee; the collector does not claim forensic secure deletion. Proofs: `episode_eviction_removes_related_attempts_and_exposures_atomically`, `fact_tables_never_enter_upload_envelopes`, and `whole_ledger_purge_removes_fact_rows_and_state_together`.
 
 ## Regeneration
 
