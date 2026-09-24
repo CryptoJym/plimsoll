@@ -910,7 +910,14 @@ export async function runSessionSync(
 
   const eligible: Array<{ row: AiWorkSessionSyncRow; bytes: number }> = [];
   let derivedIds = 0;
+  // A catch-up walk builds a row for every ledger session (22.8k on the
+  // Studio0 ledger, ~0.3-0.5 s); the daemon's intake shares this event loop.
+  let sliceStartedAt = performance.now();
   for (const snapshot of snapshots) {
+    if (performance.now() - sliceStartedAt >= 50) {
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      sliceStartedAt = performance.now();
+    }
     const normalized = buildSessionSyncRow(snapshot);
     if (!normalized.ok) {
       audit.skipped[normalized.reason] = (audit.skipped[normalized.reason] ?? 0) + 1;
