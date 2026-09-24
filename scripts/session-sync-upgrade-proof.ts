@@ -37,7 +37,7 @@ const previousTenant = "00000000-0000-4000-8000-000000000702";
 const deviceInstallId = "00000000-0000-4000-8000-000000000703";
 const oldDeviceInstallId = deviceInstallId;
 const installKey = "session-sync-upgrade-proof-install";
-const until = "2026-09-23T23:59:59.000Z";
+const until = "2026-09-24T23:59:59.000Z";
 const expectedSourceCounts = { claude_code: 209, codex: 108 };
 const conflictSessionId = "00000000-0000-4000-8000-000000000799";
 
@@ -61,7 +61,13 @@ type Receipt = {
     updatedSessions: number | null;
     skippedStaleSessions: number | null;
   };
-  result: { ok: boolean; reason: string | null };
+  result: {
+    ok: boolean;
+    reason: string | null;
+    ledgerSessions: number;
+    eligibleSessions: number;
+    skippedSessions: number;
+  };
   state: { caughtUp: boolean; pendingSessionIds: string[]; blockedSessionIds?: string[] };
   exactFailure?: string;
 };
@@ -248,7 +254,13 @@ async function main() {
       updatedSessions: result.updatedSessions,
       skippedStaleSessions: result.skippedStaleSessions,
     },
-    result: { ok: result.ok, reason: result.reason },
+    result: {
+      ok: result.ok,
+      reason: result.reason,
+      ledgerSessions: result.ledgerSessions,
+      eligibleSessions: result.eligibleSessions,
+      skippedSessions: result.skippedSessions,
+    },
     state: {
       caughtUp: state.caughtUp,
       pendingSessionIds: state.pendingSessionIds,
