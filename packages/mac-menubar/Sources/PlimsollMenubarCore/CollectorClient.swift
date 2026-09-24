@@ -32,30 +32,35 @@ public enum CollectorClientError: Error, Equatable, LocalizedError {
     }
 }
 
+/// Reads collector state. It runs `status` and probes `/healthz`; it has no
+/// operation that starts, stops or changes the collector.
 public final class CollectorClient: @unchecked Sendable {
     public typealias Execute = (CollectorInvocation) throws -> CollectorExecutionResult
-    public typealias Launch = (CollectorInvocation) throws -> Void
     public typealias ProbeLiveness = (Int) -> Bool
 
     private let invocation: CollectorInvocation
     private let execute: Execute
-    private let launch: Launch
     private let probeLiveness: ProbeLiveness
 
     public init(
         invocation: CollectorInvocation,
         execute: @escaping Execute = ProcessCollectorExecutor.run,
-        launch: @escaping Launch = ProcessCollectorExecutor.launch,
         probeLiveness: @escaping ProbeLiveness = CollectorClient.defaultProbeLiveness
     ) {
         self.invocation = invocation
         self.execute = execute
-        self.launch = launch
         self.probeLiveness = probeLiveness
     }
 
     public func status() throws -> CollectorStatus {
-        let result = try run(.status)
+        let result = try execute(invocation)
+        guard result.exitCode == 0 else {
+            let message = result.standardError.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw CollectorClientError.commandFailed(
+                exitCode: result.exitCode,
+                message: message.isEmpty ? "no error output" : message
+            )
+        }
         guard let data = result.standardOutput.data(using: .utf8) else {
             throw CollectorClientError.invalidStatusOutput
         }
@@ -69,29 +74,6 @@ public final class CollectorClient: @unchecked Sendable {
     public func snapshot() throws -> CollectorSnapshot {
         let status = try status()
         return CollectorSnapshot(running: probeLiveness(status.port), status: status)
-    }
-
-    @discardableResult
-    public func start() throws -> CollectorExecutionResult {
-        try launch(invocation.replacing(command: .start))
-        return CollectorExecutionResult(standardOutput: "", standardError: "", exitCode: 0)
-    }
-
-    @discardableResult
-    public func stop() throws -> CollectorExecutionResult {
-        try run(.stop)
-    }
-
-    private func run(_ command: CollectorCommand) throws -> CollectorExecutionResult {
-        let result = try execute(invocation.replacing(command: command))
-        guard result.exitCode == 0 else {
-            let message = result.standardError.trimmingCharacters(in: .whitespacesAndNewlines)
-            throw CollectorClientError.commandFailed(
-                exitCode: result.exitCode,
-                message: message.isEmpty ? "no error output" : message
-            )
-        }
-        return result
     }
 
     public static func defaultProbeLiveness(port: Int) -> Bool {
@@ -110,19 +92,6 @@ public final class CollectorClient: @unchecked Sendable {
 }
 
 public enum ProcessCollectorExecutor {
-    public static func launch(_ invocation: CollectorInvocation) throws {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: invocation.executablePath)
-        process.arguments = invocation.arguments
-        process.standardOutput = FileHandle.nullDevice
-        process.standardError = FileHandle.nullDevice
-        do {
-            try process.run()
-        } catch {
-            throw CollectorClientError.processLaunchFailed(error.localizedDescription)
-        }
-    }
-
     public static func run(_ invocation: CollectorInvocation) throws -> CollectorExecutionResult {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: invocation.executablePath)

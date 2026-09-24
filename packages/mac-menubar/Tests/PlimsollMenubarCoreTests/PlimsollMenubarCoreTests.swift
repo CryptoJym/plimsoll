@@ -19,11 +19,38 @@ struct PlimsollMenubarCoreTests {
             CollectorInvocation(environment: [
                 "PLIMSOLL_COLLECTOR_REPO": "/tmp/plimsoll checkout",
                 "PLIMSOLL_PNPM_BIN": "/tmp/pnpm",
-            ], command: .stop)
+            ])
         )
 
         #expect(invocation.executablePath == "/tmp/pnpm")
-        #expect(invocation.arguments == ["--dir", "/tmp/plimsoll checkout", "collector", "stop"])
+        #expect(invocation.arguments == ["--dir", "/tmp/plimsoll checkout", "collector", "status"])
+    }
+
+    @Test func checkoutInvocationWithoutPnpmPathResolvesPnpmThroughEnv() throws {
+        let invocation = try #require(
+            CollectorInvocation(environment: ["PLIMSOLL_COLLECTOR_REPO": "/tmp/plimsoll"])
+        )
+
+        #expect(invocation.executablePath == "/usr/bin/env")
+        #expect(invocation.arguments == ["pnpm", "--dir", "/tmp/plimsoll", "collector", "status"])
+    }
+
+    @Test func noConfiguredCollectorBuildsNoInvocation() {
+        #expect(CollectorInvocation(environment: [:]) == nil)
+        #expect(CollectorInvocation(environment: ["PLIMSOLL_COLLECTOR_BIN": "  "]) == nil)
+    }
+
+    /// The menubar is read-only: whatever it is pointed at, it runs `status`.
+    @Test(arguments: [
+        ["PLIMSOLL_COLLECTOR_BIN": "/opt/plimsoll/bin/plimsoll"],
+        ["PLIMSOLL_COLLECTOR_REPO": "/src/plimsoll"],
+        ["PLIMSOLL_COLLECTOR_REPO": "/src/plimsoll", "PLIMSOLL_PNPM_BIN": "/opt/pnpm"],
+    ])
+    func everyInvocationRunsOnlyTheStatusCommand(environment: [String: String]) throws {
+        let invocation = try #require(CollectorInvocation(environment: environment))
+
+        #expect(invocation.arguments.last == "status")
+        #expect(invocation.arguments.filter { ["start", "stop", "restart", "setup"].contains($0) }.isEmpty)
     }
 
     @Test func statusParsesCountsAndComputesTokenCoverage() throws {
@@ -85,28 +112,6 @@ struct PlimsollMenubarCoreTests {
         #expect(throws: CollectorClientError.commandFailed(exitCode: 1, message: "failed")) {
             try client.snapshot()
         }
-    }
-
-    @Test func startLaunchesForegroundDaemonWithoutWaitingForItToExit() throws {
-        let base = try #require(
-            CollectorInvocation(environment: ["PLIMSOLL_COLLECTOR_BIN": "/tmp/plimsoll"])
-        )
-        var launched: CollectorInvocation?
-        let client = CollectorClient(
-            invocation: base,
-            execute: { _ in
-                Issue.record("start must use the asynchronous launcher")
-                return CollectorExecutionResult(standardOutput: "", standardError: "", exitCode: 0)
-            },
-            launch: { invocation in
-                launched = invocation
-            },
-            probeLiveness: { _ in false }
-        )
-
-        try client.start()
-        #expect(launched?.command == .start)
-        #expect(launched?.arguments == ["start"])
     }
 
     @Test func permissionDoctorReportsNoAdditionalPermissions() throws {

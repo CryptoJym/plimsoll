@@ -2,8 +2,9 @@
 
 The Plimsoll Menubar is a small macOS status-bar companion for the local
 collector. It shows whether the collector is running, the event count, token
-coverage, and aggregate input/output token totals. It can also start and stop
-the collector and open the local dashboard.
+coverage, and aggregate input/output token totals, and it can open the local
+dashboard. It is read-only: it never starts, stops or reconfigures the
+collector.
 
 ## Build and run
 
@@ -30,8 +31,8 @@ PLIMSOLL_COLLECTOR_REPO=/absolute/path/to/plimsoll \
 ```
 
 In checkout mode, `PLIMSOLL_PNPM_BIN` is optional. When omitted, the app runs
-`/usr/bin/env pnpm --dir <repo> collector <command>` with fixed argument
-boundaries. The supported commands are `status`, `start`, and `stop`.
+`/usr/bin/env pnpm --dir <repo> collector status` with fixed argument
+boundaries. `status` is the only collector command the app runs.
 
 Status reads the collector's local `status` JSON. Running/stopped is a separate
 loopback-only `GET /healthz` probe; the probe does not expose or send ledger

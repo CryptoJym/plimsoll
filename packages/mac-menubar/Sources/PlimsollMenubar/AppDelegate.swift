@@ -38,8 +38,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(tokenItemTitle)
         menu.addItem(.separator())
         menu.addItem(menuItem("Refresh", action: #selector(refreshAction)))
-        menu.addItem(menuItem("Start Collector", action: #selector(startAction)))
-        menu.addItem(menuItem("Stop Collector", action: #selector(stopAction)))
         menu.addItem(menuItem("Open Dashboard", action: #selector(openDashboardAction)))
         menu.addItem(.separator())
         permissionItem.title = "Permission doctor: no additional permissions"
@@ -61,14 +59,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshStatus()
     }
 
-    @objc private func startAction() {
-        runCommand { try self.client?.start() }
-    }
-
-    @objc private func stopAction() {
-        runCommand { try self.client?.stop() }
-    }
-
     @objc private func openDashboardAction() {
         guard let url = URL(string: "http://127.0.0.1:\(dashboardPort)") else { return }
         NSWorkspace.shared.open(url)
@@ -76,21 +66,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quitAction() {
         NSApplication.shared.terminate(nil)
-    }
-
-    private func runCommand(_ operation: @escaping () throws -> CollectorExecutionResult?) {
-        guard client != nil else {
-            render(error: CollectorClientError.noCollectorConfigured)
-            return
-        }
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            do {
-                _ = try operation()
-                self?.refreshStatus()
-            } catch {
-                DispatchQueue.main.async { self?.render(error: error) }
-            }
-        }
     }
 
     private func refreshStatus() {
