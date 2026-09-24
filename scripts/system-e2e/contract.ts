@@ -204,13 +204,17 @@ function normalizeString(
   return value;
 }
 
-const VOLATILE_NUMBER_KEYS = /^(?:pid|port|durationMs|elapsedMs|warmP95Ms|tempBytes|maxRssBytes|serializedBytes|receiptBytes|parentCredentialLikeNameCount)$/i;
+// Loopback listeners receive an ephemeral port from the host. The proof keeps
+// the listener/bind assertions, so only the allocated numbers are
+// environmental and safe to replace in the cross-run semantic artifact.
+const VOLATILE_NUMBER_KEYS = /^(?:pid|port|unreachablePort|standInDefaultPort|durationMs|elapsedMs|warmP95Ms|tempBytes|maxRssBytes|serializedBytes|receiptBytes|parentCredentialLikeNameCount)$/i;
 // The resource receipt keeps all directory work in the semantic artifact. The
-// system-e2e gate checks the generated fixture's exact setup and unchanged
-// counts, so normalizing those fields would let a partial walk share a digest
-// with a complete one.
+// system-e2e gate checks the complete setup total and unchanged sweep before
+// hashing. Startup and baseline split counters depend on which bounded source
+// sweep the scheduler runs first, so normalize only that environmental split;
+// keep totals and unchanged counters in the semantic artifact.
 const RESOURCE_VOLATILE_NUMBER_PATH =
-  /^(?:root\.scenarios\[\d+\]\{id=bounded_generation_capture\}\.(?:counters\.(?:fileBytesRead|filesOpened|maintenanceRuns)|measurements\.(?:rssGrowthBytes|statusProbes|warmStatusP95Ms))|root\.scenarios\[\d+\]\{id=dashboard_projection_budget\}\.measurements\.generation|root\.scenarios\[\d+\]\{id=no_change_constant_work\}\.(?:counters\.maintenanceRuns|measurements\.(?:baselineCadences|maxCodexPendingMetadata|maxClaudePendingMetadata|maxAggregatePendingMetadata)))$/;
+  /^(?:root\.scenarios\[\d+\]\{id=bounded_generation_capture\}\.(?:counters\.(?:fileBytesRead|filesOpened|maintenanceRuns)|measurements\.(?:rssGrowthBytes|statusProbes|warmStatusP95Ms))|root\.scenarios\[\d+\]\{id=dashboard_projection_budget\}\.measurements\.generation|root\.scenarios\[\d+\]\{id=no_change_constant_work\}\.(?:counters\.maintenanceRuns|measurements\.(?:baselineCadences|maxCodexPendingMetadata|maxClaudePendingMetadata|maxAggregatePendingMetadata|startupFilesystemEntriesScanned|startupFilesystemEnumerationCalls|baselineFilesystemEntriesScanned|baselineFilesystemEnumerationCalls)))$/;
 
 /**
  * Preserve the complete parsed result shape while replacing only explicitly
