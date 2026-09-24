@@ -182,6 +182,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:lifecycle-operator
 
+      - name: Prove bounded lifecycle snapshot retention and space-free snapshots (eco-6hoxj.163.30)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:lifecycle-retention
+
       - name: Prove bounded nonblocking Git metadata maintenance
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:git-context
