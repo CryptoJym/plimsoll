@@ -46,9 +46,15 @@ type BudgetScopePolicy = {
  * filesystem/SQLite call can still overrun the deadline; every call site must
  * check before starting the next bounded unit.
  *
- * The wall ceiling is an admission ceiling and it is hard: once the aggregate
- * clock is spent, neither the root nor any scope admits another unit, so the
- * budgeted work of a cadence ends at most one bounded unit past `maxWallMs`.
+ * `maxWallMs` is an admission ceiling, not a limit on how long a cadence
+ * runs. Once the aggregate clock is spent, neither the root nor any scope
+ * admits another unit, but a unit that has started finishes: its reads stop
+ * at `unitDeadline`, and the first unit of a progress scope has no wall
+ * deadline at all, only its byte and record slice. A cadence therefore ends
+ * when its last admitted unit returns, which one slow synchronous call can
+ * put well past 200 ms. The finite outer guard in production is the
+ * maintenance child's process boundary (a 30 s job deadline, then TERM and
+ * KILL), not this budget.
  */
 export class CaptureWorkBudget {
   private readonly startedAt = performance.now();
