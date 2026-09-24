@@ -77,6 +77,15 @@ function runCli(args: string[], extraEnv: NodeJS.ProcessEnv) {
   });
 }
 
+/** Write a collector config whose port nothing listens on (bound, then released). */
+async function pinReleasedPort(collectorHomeDir: string) {
+  fs.writeFileSync(
+    path.join(collectorHomeDir, "collector.config.json"),
+    `${JSON.stringify({ port: await reserveLoopbackPort() }, null, 2)}\n`,
+    { mode: 0o600 },
+  );
+}
+
 function reserveLoopbackPort(): Promise<number> {
   return new Promise((resolve, reject) => {
     const server = http.createServer();
@@ -292,6 +301,10 @@ async function main() {
   // ---------------------------------------------------------------------------
   const doctorSandboxHome = privateDir(sandbox, "doctor-home");
   const doctorPlimsollHome = privateDir(sandbox, "doctor-plimsoll");
+  // doctor asks the daemon at config.port, which defaults to 48271. Pin a
+  // released loopback port so a run on a host with a live collector never
+  // reaches it; doctor finds no daemon, exactly as on a CI runner.
+  await pinReleasedPort(doctorPlimsollHome);
   const doctor = runCli(["doctor", "--read-only", "--json"], {
     HOME: doctorSandboxHome,
     PLIMSOLL_HOME: doctorPlimsollHome,
@@ -467,6 +480,9 @@ async function main() {
   fs.mkdirSync(auditLaunchAgents, { recursive: true, mode: 0o700 });
   const auditPlistPath = path.join(auditLaunchAgents, "com.plimsoll.collector.plist");
   if (auditPlistSource) fs.writeFileSync(auditPlistPath, auditPlistSource, { mode: 0o600 });
+  const auditDefaultHome = path.join(auditScenarioHome, "Library", "Application Support", "Plimsoll");
+  fs.mkdirSync(auditDefaultHome, { recursive: true, mode: 0o700 });
+  await pinReleasedPort(auditDefaultHome);
   const auditDoctor = runCli(["doctor", "--read-only", "--json"], { HOME: auditScenarioHome });
   let auditReceipt: Record<string, unknown> | null = null;
   try {
