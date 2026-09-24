@@ -10,11 +10,13 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
 
+import { disableSteps } from "./lib/ci-coverage-fixtures";
 import {
-  PROOF_WORKFLOW,
+  WORKFLOW_DIRECTORY,
   proofCiCoverage,
-  readProofCiCoverageInput,
-  type ProofCiCoverage,
+  proofFilesRunInCi,
+  readCoverageInput,
+  type CoverageReport,
 } from "./lib/proof-ci-coverage";
 import {
   PROOF_CHECKS,
@@ -45,12 +47,11 @@ function mutatedModel(mutate: (model: PrivacySpecModel) => void): PrivacySpecMod
 
 /**
  * eco-6hoxj.163.23: a cited check is evidence only while CI runs it. Returns
- * each cited check that is defined in a proof file proof.yml does not run.
+ * each cited check defined in a proof file that no workflow step provably runs
+ * on every successful push and pull request (the proof:ci-coverage model).
  */
-function citedChecksNotRunInCi(found: Map<string, string[]>, coverage: ProofCiCoverage): string[] {
-  const runInCi = new Set(
-    coverage.scripts.filter((entry) => entry.invocations.length > 0).map((entry) => entry.entry),
-  );
+function citedChecksNotRunInCi(found: Map<string, string[]>, coverage: CoverageReport): string[] {
+  const runInCi = proofFilesRunInCi(coverage);
   const missing: string[] = [];
   for (const ref of Object.values(PROOF_CHECKS)) {
     for (const name of ref.checks) {
@@ -157,31 +158,25 @@ check(
   "every_cited_proof_check_runs_in_ci",
   false,
   () => {
-    const missing = citedChecksNotRunInCi(verifyProofChecks(), proofCiCoverage(readProofCiCoverageInput(repoRoot)));
-    assert.deepEqual(missing, [], `cited check(s) whose proof ${PROOF_WORKFLOW} does not run: ${missing.join("; ")}`);
+    const missing = citedChecksNotRunInCi(verifyProofChecks(), proofCiCoverage(readCoverageInput(repoRoot)));
+    assert.deepEqual(missing, [], `cited check(s) whose proof ${WORKFLOW_DIRECTORY} does not run: ${missing.join("; ")}`);
   },
 );
 
 check(
-  "adversarial_cited_proof_dropped_from_ci_rejected",
+  "adversarial_cited_proof_disabled_in_ci_rejected",
   true,
   () => {
+    // For every cited check, keep its CI lines but make the steps that run
+    // its proof unreachable with a false-only matrix (the PR #397 review's
+    // attack); the guard must name that check.
     const found = verifyProofChecks();
-    const input = readProofCiCoverageInput(repoRoot);
+    const input = readCoverageInput(repoRoot);
     const coverage = proofCiCoverage(input);
     for (const [name, files] of found) {
-      // Delete every proof.yml line that runs a proof defining this check.
-      const commands = new Set(
-        coverage.scripts
-          .filter((entry) => entry.entry !== null && files.includes(entry.entry))
-          .flatMap((entry) => entry.invocations.map((invocation) => invocation.command)),
-      );
-      assert.ok(commands.size > 0, `${name}: no CI line to drop`);
-      const workflow = input.workflow
-        .split("\n")
-        .filter((line) => !commands.has(line.trim().replace(/^run:\s+/, "")))
-        .join("\n");
-      const missing = citedChecksNotRunInCi(found, proofCiCoverage({ ...input, workflow }));
+      const steps = coverage.units.filter((unit) => files.includes(unit.unit)).flatMap((unit) => unit.covered);
+      assert.ok(steps.length > 0, `${name}: no CI step runs its proof`);
+      const missing = citedChecksNotRunInCi(found, proofCiCoverage(disableSteps(input, steps)));
       assert.ok(missing.some((entry) => entry.startsWith(`${name} (`)), `${name} not rejected: ${JSON.stringify(missing)}`);
     }
   },
