@@ -17,6 +17,7 @@ import {
   type GrokUsageSweepCounters,
 } from "./history-coverage";
 import type { CaptureBudgetStatus, CaptureWorkBudget } from "./capture-work-budget";
+import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageWalk } from "./capture-frontier";
 import { clampFutureObservedAt, deterministicEventId } from "./normalizer";
 import { attachRepoContextId, canonicalRepoContextCwd } from "./repo-context";
 
@@ -642,6 +643,74 @@ export class GrokUsageTailer {
   close() {
     this.sweep = null;
     this.pending = [];
+  }
+
+  /**
+   * eco-6hoxj.163.18: every usage file the capture frontier must cover, walked
+   * the way discover() walks: group and session directories are listed with
+   * entry types, usage.json is lstat'ed and never opened, and a session
+   * directory is never listed. A file counts as read when the tailer
+   * committed this exact generation (same device, inode, size, mtime and
+   * ctime). An invalid GROK_HOME makes the walk incomplete, as it stops the
+   * scan; no sessions directory means no files.
+   */
+  coverageWalk(maxEntries = CAPTURE_COVERAGE_MAX_ENTRIES): CaptureCoverageWalk {
+    const root = this.sessionsRoot;
+    if (!root) return new CaptureCoverageWalk(null);
+    const state = this.buffer.database.prepare(
+      `select device, inode, size, mtime_ns as mtimeNs, ctime_ns as ctimeNs, mtime_ms as mtimeMs, status
+       from ${FILE_STATE_TABLE} where file_key = ?`,
+    );
+    const directories = (directory: string, limit: number) => {
+      const names = fs.readdirSync(directory, { withFileTypes: true })
+        .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
+        .map((entry) => entry.name);
+      // The sweep never reaches past its own limits, so neither can the check.
+      if (names.length > limit) throw new Error("grok_usage_coverage_over_limit");
+      return names;
+    };
+    return new CaptureCoverageWalk({
+      roots: [root],
+      maxEntries,
+      list: (directory, depth) => {
+        if (depth === 0) {
+          if (!realDirectory(directory)) return { directories: [], files: [] };
+          return {
+            directories: directories(directory, this.limits.maxGroups).map((name) => path.join(directory, name)),
+            files: [],
+          };
+        }
+        if (!realDirectory(directory)) throw new Error("grok_usage_group_not_directory");
+        return {
+          directories: [],
+          files: directories(directory, this.limits.maxSessionsPerGroup)
+            .map((name) => path.join(directory, name, GROK_USAGE_FILE_NAME)),
+        };
+      },
+      check: (file) => {
+        let stat: fs.BigIntStats;
+        try {
+          stat = fs.lstatSync(file, { bigint: true });
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") return null; // no usage yet
+          throw error;
+        }
+        if (stat.isSymbolicLink() || !stat.isFile()) return null;
+        // The same key observeSession() records the file under.
+        const key = sha256(`plimsoll-grok-usage-v1\0${file}`);
+        const row = state.get(key) as (Identity & { status: string }) | undefined;
+        const committed = row !== undefined && row.status === "committed";
+        const mtimeMs = Number(stat.mtimeNs / 1_000_000n);
+        return {
+          key,
+          mtimeMs,
+          birthtimeMs: Number(stat.birthtimeNs / 1_000_000n),
+          extent: mtimeMs,
+          progress: committed ? row.mtimeMs : -1,
+          fullyRead: committed && sameIdentity(row, stat),
+        };
+      },
+    });
   }
 
   async scan(options: {

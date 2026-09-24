@@ -12,7 +12,15 @@ import { RolloutTailer, type RolloutScanResult } from "./rollout-tailer";
 import { TranscriptTailer, type TranscriptScanResult } from "./transcript-tailer";
 import type { GrokUsageScanResult, GrokUsageTailer } from "./grok-usage-tailer";
 import { captureBaselineStatus } from "./capture-baseline";
-import { advanceCaptureFrontier, CAPTURE_COVERAGE_INTERVAL_MS } from "./capture-frontier";
+import {
+  applyCaptureCoverage,
+  beginCaptureCoverage,
+  CAPTURE_COVERAGE_INTERVAL_MS,
+  CAPTURE_COVERAGE_TURN_MS,
+  CaptureCoverageWalk,
+  finishCaptureCoverage,
+  type CaptureCoverageCheck,
+} from "./capture-frontier";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
 import type { MaintenanceProgress } from "./maintenance-progress";
 import type { MaintenanceJobProgress } from "./maintenance-protocol";
@@ -24,6 +32,8 @@ const REPO_BACKFILL_CURSOR_KEY = "repo_enrichment_backfill_cursor";
 const REPO_BACKFILL_COMPLETE_KEY = "repo_enrichment_backfill_complete";
 const AUTOMATIC_CAPTURE_SOURCE_TURN_KEY = "automatic_capture_source_turn";
 const CAPTURE_COVERAGE_CHECK_KEY = "capture_coverage_checked_at";
+/** Room left in a coverage turn for its last batch write and the frontier update. */
+const CAPTURE_COVERAGE_TURN_MARGIN_MS = 25;
 const AUTOMATIC_CAPTURE_RUNTIME_TABLE = "automatic_capture_runtime_state";
 const REPAIR_SERVICE_KEY = "automatic_repair_service_v1";
 const REPAIR_STAGES = ["projection", "reconciliation", "repricing", "repo_context_suppression"] as const;
@@ -702,33 +712,57 @@ export class CollectorMaintenance {
     private readonly signal?: AbortSignal,
     /** Grok usage files (bead eco-6hoxj.163.20); absent callers keep the two-source cadence. */
     private readonly grokTailer?: GrokUsageTailer,
-    private readonly options: { captureCoverageIntervalMs?: number } = {},
+    private readonly options: { captureCoverageIntervalMs?: number; captureCoverageTurnMs?: number } = {},
   ) {
     ensureAutomaticCaptureRuntimeState(this.buffer.database);
   }
 
+  /** Coverage walks in progress, one per source; they resume on the next cadence. */
+  private coverageWalks: Array<{ check: CaptureCoverageCheck; walk: CaptureCoverageWalk }> | null = null;
+
   /**
-   * eco-6hoxj.163.18 (review r2 B1): the capture frontier the upload claim
-   * attests moves only from a stat-only check of every tailed file
-   * (capture-frontier.ts), never from a pass. Capture phase only, at most once
-   * per interval; the first check runs at once. Each source's start time is
-   * taken before its walk. A check that fails leaves the frontier unchanged.
+   * eco-6hoxj.163.18 (review r2 B1, r3 N4): the capture frontier the upload
+   * claim attests moves only from a stat-only check of every tailed file
+   * (capture-frontier.ts), never from a pass. Capture phase only. A check
+   * starts at most once per interval (the first at once), walks each source
+   * for at most CAPTURE_COVERAGE_TURN_MS per cadence and resumes where it
+   * stopped; a source's frontier moves when its walk completes. Each source's
+   * start time is taken before its walk. A check that fails leaves the
+   * frontier unchanged. Without a Grok tailer this loop captures no Grok usage,
+   * so there is none to cover.
    */
   private checkCaptureCoverage() {
+    const deadline = performance.now() + (this.options.captureCoverageTurnMs ?? CAPTURE_COVERAGE_TURN_MS) -
+      CAPTURE_COVERAGE_TURN_MARGIN_MS;
     const database = this.buffer.database;
-    const interval = this.options.captureCoverageIntervalMs ?? CAPTURE_COVERAGE_INTERVAL_MS;
-    const nowMs = Date.now();
-    const lastMs = Date.parse(maintenanceState(database, CAPTURE_COVERAGE_CHECK_KEY) ?? "");
-    if (Number.isFinite(lastMs) && lastMs <= nowMs && nowMs - lastMs < interval) return;
-    setMaintenanceState(database, CAPTURE_COVERAGE_CHECK_KEY, new Date(nowMs).toISOString());
-    for (const [source, tailer] of [["codex", this.rolloutTailer], ["claude_code", this.transcriptTailer]] as const) {
-      if (this.signal?.aborted) return;
-      const startedAt = new Date().toISOString();
-      try {
-        advanceCaptureFrontier(database, source, tailer.coverageSnapshot(), startedAt);
-      } catch {
-        // A failed check leaves the frontier where it was; capture goes on.
+    try {
+      if (!this.coverageWalks) {
+        const interval = this.options.captureCoverageIntervalMs ?? CAPTURE_COVERAGE_INTERVAL_MS;
+        const nowMs = Date.now();
+        const lastMs = Date.parse(maintenanceState(database, CAPTURE_COVERAGE_CHECK_KEY) ?? "");
+        if (Number.isFinite(lastMs) && lastMs <= nowMs && nowMs - lastMs < interval) return;
+        setMaintenanceState(database, CAPTURE_COVERAGE_CHECK_KEY, new Date(nowMs).toISOString());
+        const sources = [
+          ["codex", () => this.rolloutTailer.coverageWalk()],
+          ["claude_code", () => this.transcriptTailer.coverageWalk()],
+          ["grok", () => this.grokTailer?.coverageWalk() ?? CaptureCoverageWalk.empty()],
+        ] as const;
+        this.coverageWalks = [];
+        for (const [source, walk] of sources) {
+          const check = beginCaptureCoverage(database, source, new Date().toISOString());
+          if (check) this.coverageWalks.push({ check, walk: walk() });
+        }
       }
+      for (const { check, walk } of this.coverageWalks) {
+        if (this.signal?.aborted || performance.now() >= deadline) break;
+        if (walk.done) continue;
+        walk.step(deadline, (files) => applyCaptureCoverage(database, check, files));
+        if (walk.done && walk.complete) finishCaptureCoverage(database, check);
+      }
+      if (this.coverageWalks.every(({ walk }) => walk.done)) this.coverageWalks = null;
+    } catch {
+      // A failed check leaves the frontier where it was; capture goes on.
+      this.coverageWalks = null;
     }
   }
 

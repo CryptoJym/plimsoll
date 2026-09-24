@@ -3,8 +3,8 @@
  *
  * Proves the claim the collector attaches to each upload request
  * (`x-plimsoll-capture`, documented in the cloud's
- * docs/capture-watermark-v1.md): it attests nothing, and says why, before both
- * tailed sources have a coverage-checked frontier; queued deliveries hold it
+ * docs/capture-watermark-v1.md): it attests nothing, and says why, before
+ * every tailed source (Codex, Claude, Grok) has a coverage-checked frontier; queued deliveries hold it
  * back to their observed time; a dead delivery is a bounded gap that holds
  * nothing back; the cursor strictly increases; the frontier holds for a file
  * with unread bytes and later reports it as a bounded gap; the claim is scoped
@@ -88,8 +88,10 @@ function cover(buffer: LocalEventBuffer, source: CaptureFrontierSource, throughM
   return advanceCaptureFrontier(buffer.database, source, { complete: true, files }, iso(throughMs + CAPTURE_WRITE_LAG_MS));
 }
 
-function coverBoth(buffer: LocalEventBuffer, codexMs: number, claudeMs: number) {
-  return cover(buffer, "codex", codexMs) !== null && cover(buffer, "claude_code", claudeMs) !== null;
+/** Every tailed source checked: Codex and Claude at their own times, Grok with Claude. */
+function coverAll(buffer: LocalEventBuffer, codexMs: number, claudeMs: number) {
+  return cover(buffer, "codex", codexMs) !== null && cover(buffer, "claude_code", claudeMs) !== null &&
+    cover(buffer, "grok", claudeMs) !== null;
 }
 
 const claimFor = (buffer: LocalEventBuffer, ids: string[]) => buffer.delivery.captureClaim(ids, NO_SPOOL)!;
@@ -110,12 +112,13 @@ async function main() {
       claim0.epochStartedAt === iso(EPOCH_START_MS) && claim0.cursor === 1,
     { claim0 });
 
-  // 2. Only one tailed source checked: still nothing; both: the earlier frontier.
+  // 2. Only one tailed source checked: still nothing; every source (Codex,
+  //    Claude and Grok): the earliest frontier.
   cover(buffer, "codex", EPOCH_START_MS + HOUR);
   const oneSource = claimFor(buffer, outboxIds(buffer));
-  coverBoth(buffer, EPOCH_START_MS + HOUR, EPOCH_START_MS + 2 * HOUR);
+  coverAll(buffer, EPOCH_START_MS + HOUR, EPOCH_START_MS + 2 * HOUR);
   const bothSources = claimFor(buffer, outboxIds(buffer));
-  check("claim_bounded_by_both_sources_frontiers",
+  check("claim_bounded_by_every_sources_frontier",
     oneSource.through === null && oneSource.unattested === "frontier_unknown" &&
       bothSources.through === iso(EPOCH_START_MS + HOUR) && bothSources.unattested === undefined &&
       oneSource.cursor === 2 && bothSources.cursor === 3,
@@ -177,8 +180,8 @@ async function main() {
   const step = (startedMs: number, files: CaptureCoverageFile[], complete = true) =>
     advanceCaptureFrontier(buffer.database, "codex", { complete, files }, iso(startedMs));
   const unread = (fullyRead: boolean): CaptureCoverageFile => ({
-    key: "a".repeat(64), size: 10, mtimeMs: EPOCH_START_MS + 4.5 * HOUR, birthtimeMs: EPOCH_START_MS,
-    hasCursor: true, fullyRead,
+    key: "a".repeat(64), mtimeMs: EPOCH_START_MS + 4.5 * HOUR, birthtimeMs: EPOCH_START_MS,
+    extent: 10, progress: fullyRead ? 10 : 5, fullyRead,
   });
   const frontier = {
     base: step(EPOCH_START_MS + 4 * HOUR, []),
@@ -218,7 +221,7 @@ async function main() {
   const wire = managedBuffer();
   const sent = event(EPOCH_START_MS + 30 * 60_000);
   wire.append(sent);
-  coverBoth(wire, EPOCH_START_MS + 2 * HOUR, EPOCH_START_MS + 2 * HOUR);
+  coverAll(wire, EPOCH_START_MS + 2 * HOUR, EPOCH_START_MS + 2 * HOUR);
   const requests: Array<{ headers: Headers; body: string }> = [];
   const config = collectorConfigSchema.parse({
     uploadUrl: "http://127.0.0.1:1/api/work-intelligence/ingest",
@@ -276,7 +279,7 @@ async function main() {
   bounded.append(kept);
   bounded.append(unreadable);
   bounded.delivery.migrateLegacy({ now: new Date() });
-  coverBoth(bounded, EPOCH_START_MS + 2 * HOUR, EPOCH_START_MS + 2 * HOUR);
+  coverAll(bounded, EPOCH_START_MS + 2 * HOUR, EPOCH_START_MS + 2 * HOUR);
   bounded.database.prepare(`update upload_outbox set base_envelope_json = '{unreadable' where delivery_id = ?`).run(unreadable.id);
   const underBudget = claimFor(bounded, [kept.id]);
   const beforeEpoch = event(EPOCH_START_MS + 55 * 60_000);

@@ -52,7 +52,7 @@ type Claim = {
 type FrontierApi = {
   advanceCaptureFrontier?: (
     database: LocalEventBuffer["database"],
-    source: "codex" | "claude_code",
+    source: string,
     snapshot: { complete: boolean; files: [] },
     startedAt: string,
   ) => string | null;
@@ -63,6 +63,7 @@ type FrontierApi = {
     now?: Date,
   ) => boolean;
   CAPTURE_WRITE_LAG_MS?: number;
+  CAPTURE_FRONTIER_SOURCES?: readonly string[];
 };
 const frontierApi = frontierModule as unknown as FrontierApi;
 
@@ -122,14 +123,15 @@ function claimOf(buffer: LocalEventBuffer, ids: string[]): Claim {
   return claim;
 }
 
-/** Make `throughMs` the attested frontier of both tailed sources, the way each version records one. */
+/** Make `throughMs` the attested frontier of every tailed source, the way each version records one. */
 function attestThrough(buffer: LocalEventBuffer, throughMs: number) {
-  for (const source of ["codex", "claude_code"] as const) {
+  for (const source of frontierApi.CAPTURE_FRONTIER_SOURCES ?? ["codex", "claude_code"]) {
     if (frontierApi.advanceCaptureFrontier) {
       frontierApi.advanceCaptureFrontier(buffer.database, source, { complete: true, files: [] },
         iso(throughMs + frontierApi.CAPTURE_WRITE_LAG_MS!));
     } else {
-      frontierApi.recordCompleteCapturePass!(buffer.database, source, iso(throughMs), new Date(Math.max(Date.now(), throughMs) + 60_000));
+      frontierApi.recordCompleteCapturePass!(buffer.database, source as "codex" | "claude_code", iso(throughMs),
+        new Date(Math.max(Date.now(), throughMs) + 60_000));
     }
   }
 }

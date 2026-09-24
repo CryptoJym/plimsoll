@@ -46,7 +46,7 @@ import {
 } from "./capture-fairness";
 import { advanceAutomaticCaptureFiles, refreshAutomaticCaptureFile, type AutomaticCapturePendingFile } from "./automatic-capture-retry";
 import { CaptureWorkBudget, type CaptureBudgetStatus } from "./capture-work-budget";
-import { CAPTURE_COVERAGE_MAX_ENTRIES, captureCoverageFiles, type CaptureCoverageSnapshot } from "./capture-frontier";
+import { CAPTURE_COVERAGE_MAX_ENTRIES, CaptureCoverageWalk, jsonlCoverageCheck, lstatIfPresent } from "./capture-frontier";
 import {
   IncrementalJsonlDiscovery,
   type DiscoveryProgress,
@@ -409,29 +409,38 @@ export class RolloutTailer {
   private cursorKey(file: string) { return rootCursorKey(this.captureRoots, file); }
 
   /**
-   * eco-6hoxj.163.18 (review r2 B1): every file under the capture roots,
-   * stat-only, with whether this tailer's cursor has committed its current
-   * size. The capture frontier moves from this, never from a pass: automatic
-   * passes open only today's and yesterday's day folders. Twin of
-   * TranscriptTailer.coverageSnapshot. Incomplete when a configured root is
-   * not ready, as it is for a scan.
+   * eco-6hoxj.163.18 (review r2 B1, r3 N4): a resumable, stat-only walk of
+   * every rollout under the capture roots, with whether this tailer's cursor
+   * has committed each file's current size. The capture frontier moves from
+   * this, never from a pass: automatic passes open only today's and
+   * yesterday's day folders. It lists sessions/YYYY/MM/DD as a full scan does,
+   * and is incomplete when a configured root is not ready, as a scan is. Twin
+   * of TranscriptTailer.coverageWalk.
    */
-  coverageSnapshot(maxEntries = CAPTURE_COVERAGE_MAX_ENTRIES): CaptureCoverageSnapshot {
-    const incomplete = { complete: false, files: [] };
+  coverageWalk(maxEntries = CAPTURE_COVERAGE_MAX_ENTRIES): CaptureCoverageWalk {
     if (this.inventoryConfigured && inspectCaptureRoots(this.captureRoots).some((root) => root.state !== "ready")) {
-      return incomplete;
+      return new CaptureCoverageWalk(null);
     }
-    const eligible = this.eligibleDirectories;
-    this.eligibleDirectories = this.inventoryConfigured ? this.captureRoots.map((root) => root.directory) : null;
-    try {
-      const discovery = this.discover({ scope: "full", discoveryLimit: maxEntries });
-      if (discovery.truncated || discovery.errors > 0) return incomplete;
-      const files = captureCoverageFiles(this.buffer.database, discovery.files, (file) => this.cursorKey(file),
-        (file) => this.io.lstat(file));
-      return files === null ? incomplete : { complete: true, files };
-    } finally {
-      this.eligibleDirectories = eligible;
-    }
+    const verdict = jsonlCoverageCheck(this.buffer.database);
+    return new CaptureCoverageWalk({
+      roots: this.inventoryConfigured ? this.captureRoots.map((root) => root.directory) : [this.sessionsDir],
+      maxEntries,
+      list: (directory, depth) => depth < 3
+        ? {
+            directories: this.io.readDirents(directory).filter((entry) => entry.isDirectory())
+              .map((entry) => path.join(directory, entry.name)),
+            files: [],
+          }
+        : {
+            directories: [],
+            files: this.io.readNames(directory).filter((name) => name.startsWith("rollout-") && name.endsWith(".jsonl"))
+              .map((name) => path.join(directory, name)),
+          },
+      check: (file) => {
+        const stat = lstatIfPresent((target) => this.io.lstat(target), file);
+        return stat ? verdict(this.cursorKey(file), stat) : null;
+      },
+    });
   }
   private activeBoundaryOptions: Pick<RolloutScanOptions, "quarantine" | "onProgress"> = {};
   private baselineAttempt: {
