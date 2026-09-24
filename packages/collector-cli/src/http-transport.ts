@@ -144,13 +144,6 @@ export function authenticatedJsonPost(input: JsonPostOptions & {
     const timestamp = (input.now ?? (() => new Date()))().toISOString();
     headers["x-plimsoll-upload-timestamp"] = timestamp;
     headers["x-plimsoll-upload-signature"] = `sha256=${crypto.createHmac("sha256", input.signingSecret).update(`${timestamp}.${input.body}`).digest("hex")}`;
-    // Capture watermark v1 (eco-6hoxj.163.18): bind the claim header to the
-    // same timestamp and exact body; the body signature does not cover headers.
-    const capture = headers["x-plimsoll-capture"];
-    if (capture !== undefined) {
-      headers["x-plimsoll-capture-signature"] = `sha256=${crypto.createHmac("sha256", input.signingSecret)
-        .update(`plimsoll-capture-v1\n${timestamp}\n${capture}\n${input.body}`).digest("hex")}`;
-    }
   }
   return postJson({ ...input, headers });
 }

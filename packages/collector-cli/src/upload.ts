@@ -6,7 +6,7 @@ import {
   reconcileCloudDeviceIdFromIngest,
   type CollectorConfig,
 } from "./config";
-import type { DeliveryCaptureClaim, LeasedDeliveryItem, DeliveryFailureClass } from "./outbox";
+import type { LeasedDeliveryItem, DeliveryFailureClass } from "./outbox";
 import {
   aiWorkIngestBatchSchema,
   type AiInteractionEvent,
@@ -170,9 +170,6 @@ function bodyForItems(
   return { body, batch, bytes: Buffer.byteLength(body) };
 }
 
-/** Capture watermark v1 (eco-6hoxj.163.18): a header, so a cloud that predates it ignores it. */
-export const CAPTURE_CLAIM_HEADER = "x-plimsoll-capture";
-
 async function postItems(input: {
   config: CollectorConfig;
   items: LeasedDeliveryItem[];
@@ -184,7 +181,6 @@ async function postItems(input: {
   timeoutSeconds: number;
   now: () => Date;
   maxBytes: number;
-  captureClaim?: DeliveryCaptureClaim | null;
 }): Promise<ProbeResult> {
   const { body, bytes } = bodyForItems(input.config, input.items, input.appVersion);
   if (bytes > input.maxBytes) {
@@ -205,7 +201,6 @@ async function postItems(input: {
       ingestKey: input.ingestKey, signingSecret: input.signingSecret,
       fetchImpl: input.fetchImpl, now: input.now,
       timeoutMs: input.timeoutSeconds * 1_000, maxRequestBytes: input.maxBytes,
-      ...(input.captureClaim ? { headers: { [CAPTURE_CLAIM_HEADER]: JSON.stringify(input.captureClaim) } } : {}),
     });
   } catch (error) {
     const transient = error instanceof TransportError &&
@@ -540,10 +535,6 @@ export async function uploadBufferedEvents(
     const group = revalidated.items;
     probes += 1;
     for (const item of group) attemptedActive.add(item.deliveryId);
-    // Capture watermark v1: one claim per request, after the final
-    // revalidation, so it describes exactly the items this request carries.
-    const captureClaim = await storage(() =>
-      buffer.delivery.captureClaim(group.map((item) => item.deliveryId), nowFn()));
     const result = await postItems({
       config,
       items: group,
@@ -555,7 +546,6 @@ export async function uploadBufferedEvents(
       timeoutSeconds: config.delivery.requestTimeoutSeconds,
       now: nowFn,
       maxBytes: maxRequestBytes,
-      captureClaim,
     });
     if (result.ok) {
       lastSummary = result.summary;
