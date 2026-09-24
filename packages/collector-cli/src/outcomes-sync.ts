@@ -66,6 +66,9 @@ const MAX_LINKED_SESSION_IDS = 50;
  * "Username considerations for external authentication").
  */
 const GITHUB_OWNER = /^(?=.{1,39}$)[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*(?:_[A-Za-z0-9]{3,8})?$/;
+/** Letters, digits and hyphens that fail GITHUB_OWNER only by hyphen placement
+ * (leading, trailing or double): names some older GitHub accounts still have. */
+const LEGACY_GITHUB_OWNER = /^(?=.{1,39}$)[A-Za-z0-9-]*[A-Za-z0-9][A-Za-z0-9-]*$/;
 /** A GitHub repository name: at most 100 ASCII letters, digits, '.', '-' and
  * '_' (GitHub Docs, "Creating a new repository"). */
 const GITHUB_REPOSITORY = /^[A-Za-z0-9._-]{1,100}$/;
@@ -84,8 +87,12 @@ const GITHUB_REPOSITORY = /^[A-Za-z0-9._-]{1,100}$/;
 function githubRepository(value: string) {
   const parts = value.split("/").map((part) => part.replace(/^[\t\n\v\f\r ]+|[\t\n\v\f\r ]+$/g, ""));
   const [owner, repo] = parts;
-  if (parts.length !== 2 || !GITHUB_OWNER.test(owner) || !GITHUB_REPOSITORY.test(repo) || repo === "." || repo === "..") {
-    throw new Error("--repository expects a GitHub owner/repo, such as acme/widgets.");
+  const expected = "--repository expects a GitHub owner/repo, such as acme/widgets.";
+  if (parts.length !== 2 || !GITHUB_REPOSITORY.test(repo) || repo === "." || repo === "..") throw new Error(expected);
+  if (!GITHUB_OWNER.test(owner)) {
+    throw new Error(LEGACY_GITHUB_OWNER.test(owner)
+      ? `${expected} This owner starts or ends with a hyphen or has two in a row, which only some older GitHub accounts have; sync-outcomes supports current account names only. Rename the account or organization on GitHub, or move the repository to an owner with a current name, then retry.`
+      : expected);
   }
   return { owner: owner.toLowerCase(), repo: repo.toLowerCase() };
 }

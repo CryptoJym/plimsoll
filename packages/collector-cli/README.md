@@ -113,7 +113,12 @@ ASCII: the owner is letters, digits and single hyphens (up to 39 characters,
 or a managed user's `name_SHORTCODE`), and the repository name is letters,
 digits, `.`, `-` and `_` (up to 100). Anything else, such as a URL, a third
 path segment or a look-alike Unicode character, is refused before any
-request. For a private repository, set
+request. Some older GitHub accounts and organizations have names that start
+or end with a hyphen or contain two hyphens in a row. GitHub no longer allows
+such names and `sync-outcomes` does not support them: it refuses them with a
+message that says so. Rename the account or organization on GitHub, or move
+the repository to an owner with a current name, then run it again. For a
+private repository, set
 `GITHUB_TOKEN` or `GH_TOKEN`. The owner and name are sent to the workspace;
 pull request titles, bodies, diffs and file paths are not, and branch names
 travel only as hashes.

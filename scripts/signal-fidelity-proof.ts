@@ -1,6 +1,6 @@
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = process.env.PLIMSOLL_PROOF_CLOCK_CASE === "1" ? null : createProofCompletion("signal-fidelity", 112);
+const completion = process.env.PLIMSOLL_PROOF_CLOCK_CASE === "1" ? null : createProofCompletion("signal-fidelity", 113);
 /**
  * Signal-fidelity proof for the v2 collector capture path.
  *
@@ -4174,6 +4174,48 @@ async function main() {
         verdict.expected === "accepted" ? !verdict.refused : verdict.refused && verdict.requests === 0,
       ),
       JSON.stringify(ownerVerdicts),
+    );
+    // Owners that fail the current rule only by hyphen placement are older
+    // GitHub account names: refused before any request with a message saying
+    // why and what to do. Other malformed input keeps the plain message.
+    const legacyVerdicts: Record<string, { refused: boolean; requests: number; explained: boolean }> = {};
+    for (const [label, repository] of Object.entries({
+      leading_hyphen: "-foo/widgets",
+      trailing_hyphen: "foo-/widgets",
+      double_hyphen: "foo--bar/widgets",
+      dot_in_owner: "foo.bar/widgets",
+      forty_characters: `${"a".repeat(40)}/widgets`,
+      legacy_owner_with_invalid_repository: "-foo/wid gets",
+    })) {
+      let requests = 0;
+      let message = "";
+      try {
+        await runOutcomesSync(d2Config, {
+          repository,
+          until: d2Until,
+          ledgerDb: d2Ledger,
+          fetchImpl: (async (input, init) => {
+            requests += 1;
+            return d2Fetch(input, init);
+          }) as typeof fetch,
+          log: () => undefined,
+        });
+      } catch (error) {
+        message = String(error);
+      }
+      legacyVerdicts[label] = {
+        refused: /--repository expects/.test(message),
+        requests,
+        explained: /older GitHub accounts/.test(message) && /Rename the account or organization/.test(message),
+      };
+    }
+    const explainedLabels = ["leading_hyphen", "trailing_hyphen", "double_hyphen"];
+    check(
+      "outcomes_repository_legacy_owner_names_explained",
+      Object.entries(legacyVerdicts).every(([label, verdict]) =>
+        verdict.refused && verdict.requests === 0 && verdict.explained === explainedLabels.includes(label),
+      ),
+      JSON.stringify(legacyVerdicts),
     );
     d2Ledger.close();
 
