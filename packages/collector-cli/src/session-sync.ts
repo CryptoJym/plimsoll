@@ -562,12 +562,13 @@ export async function listLedgerSessionIdsOffThread(
   options: { until: string; since?: string | null; excludedIds?: string[] },
 ): Promise<string[]> {
   const query = ledgerSessionIdsQuery(ledger, options);
+  const excluded = new Set(options.excludedIds ?? []);
   // The planner switches to a full walk above this count. No later id can
   // change that decision, so never clone an unbounded distinct-id set back
-  // onto the request event loop.
-  query.sql += ` limit ${MAX_PENDING_SESSION_IDS + 1}`;
+  // onto the request event loop. Read enough extra rows to preserve the
+  // overflow signal after excluded IDs are removed.
+  query.sql += ` limit ${MAX_PENDING_SESSION_IDS + 1 + excluded.size}`;
   const rows = await readSessionsOffThread<{ sessionId: string }>(ledger, [query]);
-  const excluded = new Set(options.excludedIds ?? []);
   return rows.map(row => row.sessionId).filter((id) => !excluded.has(id));
 }
 
