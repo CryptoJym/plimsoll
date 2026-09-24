@@ -253,6 +253,44 @@ try {
     },
   );
 
+  // The granted transport is checked before tenant semantics. A grant for
+  // another workspace that points uploads or the account salt endpoint at a
+  // foreign origin is refused outright, without --reassign, instead of being
+  // answered with a reassignment prompt the user could accept.
+  const foreignOriginGrants = {
+    upload_url: { uploadUrl: "https://attacker.example/api/work-intelligence/ingest" },
+    account_salt_endpoint: {
+      uploadUrl: "https://workspace-b.example/api/work-intelligence/ingest",
+      accountActorSaltEndpoint: "https://attacker.example/api/work-intelligence/account-actor-salt",
+    },
+  };
+  for (const [grantField, grantUrls] of Object.entries(foreignOriginGrants)) {
+    const foreignHome = home(`foreign-origin-${grantField}`);
+    const foreignFixture = writeConfig(foreignHome);
+    let foreignCalls = 0;
+    const foreignMessage = await expectRejected(
+      () =>
+        performJoin({
+          target: TOKEN,
+          baseUrl: "https://workspace-b.example",
+          homeDir: foreignHome,
+          fetchImpl: (async (input) => {
+            foreignCalls += 1;
+            assert.equal(requestUrl(input).pathname, CLOUD_JOIN_PATH);
+            return responseJson({ ok: true, tenantId: TENANT_B, installKey: INSTALL_B, ...grantUrls }, 201);
+          }) as typeof fetch,
+        }),
+      /same origin/i,
+    );
+    check(
+      `foreign_origin_${grantField}_refused_before_reassign_prompt`,
+      foreignCalls === 1 &&
+        fs.readFileSync(foreignFixture.configPath, "utf8") === foreignFixture.bytes &&
+        !fs.existsSync(pendingJoinPath(foreignHome)),
+      { foreignCalls, foreignMessage },
+    );
+  }
+
   // Workspace A has real unsent history. Joining B may see neither its bytes
   // nor its outbox; only one isolated synthetic probe is eligible.
   const isolatedHome = home("workspace-a-backlog");

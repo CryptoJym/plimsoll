@@ -831,6 +831,16 @@ export async function performJoin(options: {
     const parsedGrant = joinGrantSchema.safeParse(body);
     if (!parsedGrant.success) throw new Error("Workspace join failed: invalid_response");
     const grant = parsedGrant.data;
+    // Check the granted transport before any tenant semantics: a grant that
+    // points uploads or the salt endpoint at another origin is refused
+    // outright, never answered with a reassignment prompt.
+    const uploadUrl = validatedTransportUrl(grant.uploadUrl, "Granted upload URL");
+    if (uploadUrl.origin !== joinUrl.origin) {
+      throw new Error("Granted upload URL must use the same origin as the workspace join URL.");
+    }
+    if (grant.accountActorSaltEndpoint && new URL(grant.accountActorSaltEndpoint).origin !== joinUrl.origin) {
+      throw new Error("Granted account salt endpoint must use the same origin as the workspace join URL.");
+    }
     if (
       isManagedOrUploadEnabled(existingConfig) &&
       existingConfig.tenantId !== grant.tenantId &&
@@ -843,13 +853,6 @@ export async function performJoin(options: {
         httpStatus: response.status,
         configTouched: false,
       };
-    }
-    const uploadUrl = validatedTransportUrl(grant.uploadUrl, "Granted upload URL");
-    if (uploadUrl.origin !== joinUrl.origin) {
-      throw new Error("Granted upload URL must use the same origin as the workspace join URL.");
-    }
-    if (grant.accountActorSaltEndpoint && new URL(grant.accountActorSaltEndpoint).origin !== joinUrl.origin) {
-      throw new Error("Granted account salt endpoint must use the same origin as the workspace join URL.");
     }
     const identity = loadOrCreateDeviceIdentity(homeDir, {
       seed: { deviceId: existingConfig.deviceId, keyId: existingConfig.keyId },
