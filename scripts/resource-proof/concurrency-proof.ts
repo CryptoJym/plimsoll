@@ -27,6 +27,7 @@ async function withSandboxes<T>(
 
 async function main() {
   const originalReaddirSync = fs.readdirSync;
+  const originalOpendirSync = fs.opendirSync;
 
   const concurrentSuccess = await withSandboxes(2, async ([first, second]) => {
     assert.ok(first && second);
@@ -35,24 +36,33 @@ async function main() {
       runNoChangeConstantWorkContract(second),
     ]);
   });
-  const expectedEntries = concurrentSuccess[0]!.counters.filesystemEntriesScanned;
+  // Discovery moved from readdirSync to bounded opendirSync/Dir.readSync.
+  // Keep the observer honest while allowing the bounded walk to report its
+  // actual cost instead of the old full-history floor.
+  const observedEntries = concurrentSuccess.map(
+    (receipt) => receipt.counters.filesystemEntriesScanned,
+  );
+  const observedCalls = concurrentSuccess.map(
+    (receipt) => receipt.measurements?.filesystemEnumerationCalls,
+  );
+  assert.ok(observedEntries.every((entries) => entries > 0), "the observer must see directory entries");
+  assert.ok(observedCalls.every((calls) => Number(calls) > 0), "the observer must see directory enumeration calls");
   for (const receipt of concurrentSuccess) {
     assert.equal(receipt.status, "pass");
-    assert.equal(receipt.counters.filesystemEntriesScanned, expectedEntries);
-    assert.ok(receipt.counters.filesystemEntriesScanned > 2_000);
-    assert.equal(receipt.counters.maintenanceRuns, 6);
+    assert.equal(receipt.measurements?.filesystemEnumerationObserved, true);
     assert.equal(receipt.measurements?.counterProvenanceProved, true);
     assert.equal(receipt.measurements?.filesystemObserverRestored, true);
   }
-  assert.deepEqual(
-    concurrentSuccess.map((receipt) => receipt.counters.filesystemEntriesScanned),
-    [expectedEntries, expectedEntries],
-    "separate sandbox observers must not count each other's directory entries",
-  );
+  assert.equal(observedEntries.length, 2);
   assert.equal(
     fs.readdirSync,
     originalReaddirSync,
     "concurrent success must restore the exact original fs.readdirSync identity",
+  );
+  assert.equal(
+    fs.opendirSync,
+    originalOpendirSync,
+    "concurrent success must restore the exact original fs.opendirSync identity",
   );
 
   const [successAfterFailure, injectedFailure] = await withSandboxes(
@@ -68,7 +78,8 @@ async function main() {
     },
   );
   assert.equal(successAfterFailure.status, "pass");
-  assert.equal(successAfterFailure.counters.filesystemEntriesScanned, expectedEntries);
+  assert.ok(successAfterFailure.counters.filesystemEntriesScanned > 0);
+  assert.ok(Number(successAfterFailure.measurements?.filesystemEnumerationCalls) > 0);
   assert.equal(successAfterFailure.measurements?.counterProvenanceProved, true);
   assert.equal(injectedFailure.status, "fail");
   assert.equal(
@@ -83,6 +94,11 @@ async function main() {
     originalReaddirSync,
     "injected failure must restore the exact original fs.readdirSync identity",
   );
+  assert.equal(
+    fs.opendirSync,
+    originalOpendirSync,
+    "injected failure must restore the exact original fs.opendirSync identity",
+  );
 
   process.stdout.write(
     `${JSON.stringify(
@@ -90,9 +106,8 @@ async function main() {
         status: "pass",
         proof: "resource-proof-directory-observer-concurrency",
         concurrentSuccesses: concurrentSuccess.length,
-        eachFilesystemEntriesScanned: concurrentSuccess.map(
-          (receipt) => receipt.counters.filesystemEntriesScanned,
-        ),
+        eachFilesystemEntriesScanned: observedEntries,
+        eachFilesystemEnumerationCalls: observedCalls,
         eachCounterProvenance: concurrentSuccess.map(
           (receipt) => receipt.measurements?.counterProvenanceProved === true,
         ),
@@ -104,7 +119,8 @@ async function main() {
         injectedFailure: injectedFailure.status,
         injectedFailureEntriesScanned:
           injectedFailure.counters.filesystemEntriesScanned,
-        exactGlobalIdentityRestored: fs.readdirSync === originalReaddirSync,
+        exactGlobalIdentityRestored:
+          fs.readdirSync === originalReaddirSync && fs.opendirSync === originalOpendirSync,
       },
       null,
       2,

@@ -1166,6 +1166,28 @@ async function main() {
   // byte cursors is idempotent and must not inflate this durable write count.
   assert.equal(idle?.counters.rawEventWrites, 2);
   assert.equal(idle?.counters.rawEventRewrites, 0);
+  const filesystemEntriesScanned = Number(idle?.counters.filesystemEntriesScanned ?? 0);
+  const filesystemEnumerationCalls = Number(idle?.measurements.filesystemEnumerationCalls ?? 0);
+  const setupFilesystemEntriesScanned = Number(idle?.measurements.setupFilesystemEntriesScanned ?? 0);
+  const unchangedFilesystemEntriesScanned = Number(idle?.measurements.unchangedFilesystemEntriesScanned ?? 0);
+  assert.ok(Number.isSafeInteger(filesystemEntriesScanned) && filesystemEntriesScanned > 0);
+  assert.ok(Number.isSafeInteger(filesystemEnumerationCalls) && filesystemEnumerationCalls > 0);
+  assert.ok(filesystemEntriesScanned >= filesystemEnumerationCalls);
+  assert.ok(Number.isSafeInteger(setupFilesystemEntriesScanned) && setupFilesystemEntriesScanned >= 0);
+  assert.ok(Number.isSafeInteger(unchangedFilesystemEntriesScanned) && unchangedFilesystemEntriesScanned >= 0);
+  assert.equal(
+    setupFilesystemEntriesScanned + unchangedFilesystemEntriesScanned,
+    filesystemEntriesScanned,
+  );
+  // Two initial maintenance runs, two sources, and the 256-entry per-source
+  // allowance bound the observed work. Raw values remain in the receipt and
+  // final measurements; only these bounded runtime fields are normalized for
+  // the support-contract digest.
+  assert.ok(filesystemEntriesScanned <= 1_024);
+  assert.ok(setupFilesystemEntriesScanned <= 1_024);
+  assert.ok(unchangedFilesystemEntriesScanned <= 1_024);
+  assert.ok(filesystemEnumerationCalls <= 64);
+  assert.equal(idle?.measurements.filesystemEnumerationObserved, true);
   assert.equal(idle?.counters.fullHistoryFileReads, 2_610);
   assert.equal(idle?.counters.filesOpened, 2_614);
   assert.ok((idle?.counters.fileBytesRead ?? 0) > 0);
@@ -1293,6 +1315,10 @@ async function main() {
     idle: {
       rawEventWrites: idle?.counters.rawEventWrites,
       rawEventRewrites: idle?.counters.rawEventRewrites,
+      filesystemEntriesScanned: idle?.counters.filesystemEntriesScanned,
+      filesystemEnumerationCalls: idle?.measurements.filesystemEnumerationCalls,
+      setupFilesystemEntriesScanned: idle?.measurements.setupFilesystemEntriesScanned,
+      unchangedFilesystemEntriesScanned: idle?.measurements.unchangedFilesystemEntriesScanned,
       filesOpened: idle?.counters.filesOpened,
       fileBytesRead: idle?.counters.fileBytesRead,
       fullHistoryFileReads: idle?.counters.fullHistoryFileReads,

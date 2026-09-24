@@ -867,6 +867,8 @@ type DirectoryEnumerationRecord = {
 const directoryEnumerationObservers = new Map<string, DirectoryEnumerationRecord>();
 let directoryEnumerationOriginal: typeof fs.readdirSync | undefined;
 let directoryEnumerationWrapper: typeof fs.readdirSync | undefined;
+let directoryOpenOriginal: typeof fs.opendirSync | undefined;
+let directoryOpenWrapper: typeof fs.opendirSync | undefined;
 
 function readdirPath(value: Parameters<typeof fs.readdirSync>[0]) {
   if (typeof value === "string") return value;
@@ -875,9 +877,64 @@ function readdirPath(value: Parameters<typeof fs.readdirSync>[0]) {
   return null;
 }
 
+function recordDirectoryEnumeration(directory: string | null, calls: number, entries: number) {
+  if (!directory) return;
+  for (const observer of directoryEnumerationObservers.values()) {
+    if (!observer.unregistered && within(observer.root, directory)) {
+      observer.calls += calls;
+      observer.entries += entries;
+    }
+  }
+}
+
+function instrumentDirectoryHandle(handle: fs.Dir, directory: string | null) {
+  // Node's async iterator can delegate to read(), so de-duplicate Dirent
+  // objects by identity while covering every supported Dir API.
+  const observedEntries = new WeakSet<object>();
+  const recordEntry = <T>(entry: T): T => {
+    if (entry && typeof entry === "object") {
+      if (observedEntries.has(entry)) return entry;
+      observedEntries.add(entry);
+      recordDirectoryEnumeration(directory, 0, 1);
+    }
+    return entry;
+  };
+
+  const originalReadSync = handle.readSync.bind(handle);
+  handle.readSync = (() => recordEntry(originalReadSync())) as typeof handle.readSync;
+
+  const originalRead = handle.read.bind(handle);
+  handle.read = ((callback: (error: NodeJS.ErrnoException | null, entry: fs.Dirent | null) => void) =>
+    originalRead((error, entry) => callback(error, recordEntry(entry)))) as typeof handle.read;
+
+  const originalAsyncIterator = handle[Symbol.asyncIterator].bind(handle);
+  handle[Symbol.asyncIterator] = (() => {
+    const iterator = originalAsyncIterator();
+    const originalNext = iterator.next.bind(iterator);
+    const wrapped: AsyncIterableIterator<fs.Dirent> = {
+      async next(...args: [] | [undefined]) {
+        const result = await originalNext(...args);
+        if (!result.done) recordEntry(result.value);
+        return result;
+      },
+      [Symbol.asyncIterator]() {
+        return this;
+      },
+    };
+    if (iterator.return) wrapped.return = iterator.return.bind(iterator);
+    if (iterator.throw) wrapped.throw = iterator.throw.bind(iterator);
+    return wrapped;
+  }) as typeof handle[typeof Symbol.asyncIterator];
+
+  return handle;
+}
+
 function installDirectoryEnumerationWrapper() {
   if (directoryEnumerationWrapper) {
-    if (fs.readdirSync !== directoryEnumerationWrapper) {
+    if (
+      fs.readdirSync !== directoryEnumerationWrapper ||
+      fs.opendirSync !== directoryOpenWrapper
+    ) {
       throw new Error("DirectoryObserverIntegrityLost");
     }
     return;
@@ -887,17 +944,20 @@ function installDirectoryEnumerationWrapper() {
   directoryEnumerationWrapper = ((...args: Parameters<typeof fs.readdirSync>) => {
     const result = original(...args);
     const directory = readdirPath(args[0]);
-    if (directory) {
-      for (const observer of directoryEnumerationObservers.values()) {
-        if (!observer.unregistered && within(observer.root, directory)) {
-          observer.calls += 1;
-          observer.entries += result.length;
-        }
-      }
-    }
+    recordDirectoryEnumeration(directory, 1, result.length);
     return result;
   }) as typeof fs.readdirSync;
   fs.readdirSync = directoryEnumerationWrapper;
+
+  directoryOpenOriginal = fs.opendirSync;
+  const openOriginal = directoryOpenOriginal;
+  directoryOpenWrapper = ((...args: Parameters<typeof fs.opendirSync>) => {
+    const handle = openOriginal(...args);
+    const directory = readdirPath(args[0]);
+    recordDirectoryEnumeration(directory, 1, 0);
+    return instrumentDirectoryHandle(handle, directory);
+  }) as typeof fs.opendirSync;
+  fs.opendirSync = directoryOpenWrapper;
 }
 
 function observeDirectoryEnumeration(root: string) {
@@ -931,11 +991,25 @@ function observeDirectoryEnumeration(root: string) {
         if (original && wrapper && fs.readdirSync === wrapper) {
           fs.readdirSync = original;
         }
-        record.restorationVerified = Boolean(original && fs.readdirSync === original);
+        const openOriginal = directoryOpenOriginal;
+        const openWrapper = directoryOpenWrapper;
+        if (openOriginal && openWrapper && fs.opendirSync === openWrapper) {
+          fs.opendirSync = openOriginal;
+        }
+        record.restorationVerified = Boolean(
+          original &&
+          fs.readdirSync === original &&
+          openOriginal &&
+          fs.opendirSync === openOriginal,
+        );
         directoryEnumerationOriginal = undefined;
         directoryEnumerationWrapper = undefined;
+        directoryOpenOriginal = undefined;
+        directoryOpenWrapper = undefined;
       } else {
-        record.restorationVerified = fs.readdirSync === directoryEnumerationWrapper;
+        record.restorationVerified =
+          fs.readdirSync === directoryEnumerationWrapper &&
+          fs.opendirSync === directoryOpenWrapper;
       }
     },
     status: () => ({
@@ -1215,6 +1289,8 @@ export async function runNoChangeConstantWorkContract(
       directoryEntryDeltas.length === finalStatus.runCount &&
       directoryEntryDeltas.reduce((total, count) => total + count, 0) ===
         directoryObservation.entries;
+    const filesystemEnumerationObserved =
+      directoryObservation.calls > 0 && directoryObservation.entries > 0;
     const recentDidNotPromote =
       initialCoverage.status === "incomplete" &&
       initialCoverage.reason === EXPLICIT_FULL_BACKFILL_NOT_COMPLETED &&
@@ -1897,7 +1973,8 @@ export async function runNoChangeConstantWorkContract(
       explicitFullReads >= fixture.oldFiles &&
       counters.rawEventWrites === 2 &&
       counters.rawEventRewrites === 0 &&
-      counters.overlappingJobs === 0;
+      counters.overlappingJobs === 0 &&
+      filesystemEnumerationObserved;
 
     return {
       id: "no_change_constant_work",
@@ -1989,7 +2066,9 @@ export async function runNoChangeConstantWorkContract(
         unchangedFilesystemEntriesScanned: directoryEntryDeltas[1] ?? 0,
         filesystemObserverRestored: directoryObservation.restored,
         counterProvenanceProved,
-        filesystemCounterSource: "observed fs.readdirSync returned entries",
+        filesystemEnumerationObserved,
+        filesystemCounterSource:
+          "observed fs.readdirSync and fs.opendirSync Dir.readSync/read/async-iterator entries",
         maintenanceRunCounterSource: "scheduler runCount",
       },
     };
