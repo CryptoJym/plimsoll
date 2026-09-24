@@ -6,7 +6,7 @@ import fs from "node:fs";
 import {
   createResourceSandbox,
   removeResourceSandbox,
-  runNoChangeConstantWorkContract,
+  runDirectoryObserverConcurrencyContract,
   type ResourceSandbox,
 } from "./scenarios";
 
@@ -28,99 +28,44 @@ async function withSandboxes<T>(
 async function main() {
   const originalReaddirSync = fs.readdirSync;
   const originalOpendirSync = fs.opendirSync;
-
-  const concurrentSuccess = await withSandboxes(2, async ([first, second]) => {
+  const result = await withSandboxes(2, async ([first, second]) => {
     assert.ok(first && second);
-    return Promise.all([
-      runNoChangeConstantWorkContract(first),
-      runNoChangeConstantWorkContract(second),
-    ]);
+    return runDirectoryObserverConcurrencyContract([first.root, second.root]);
   });
-  // Discovery moved from readdirSync to bounded opendirSync/Dir.readSync.
-  // Keep the observer honest while allowing the bounded walk to report its
-  // actual cost instead of the old full-history floor.
-  const observedEntries = concurrentSuccess.map(
-    (receipt) => receipt.counters.filesystemEntriesScanned,
-  );
-  const observedCalls = concurrentSuccess.map(
-    (receipt) => receipt.measurements?.filesystemEnumerationCalls,
-  );
-  assert.ok(observedEntries.every((entries) => entries > 0), "the observer must see directory entries");
-  assert.ok(observedCalls.every((calls) => Number(calls) > 0), "the observer must see directory enumeration calls");
-  for (const receipt of concurrentSuccess) {
-    assert.equal(receipt.status, "pass");
-    assert.equal(receipt.measurements?.filesystemEnumerationObserved, true);
-    assert.equal(receipt.measurements?.counterProvenanceProved, true);
-    assert.equal(receipt.measurements?.filesystemObserverRestored, true);
-  }
-  assert.equal(observedEntries.length, 2);
-  assert.equal(
-    fs.readdirSync,
-    originalReaddirSync,
-    "concurrent success must restore the exact original fs.readdirSync identity",
-  );
-  assert.equal(
-    fs.opendirSync,
-    originalOpendirSync,
-    "concurrent success must restore the exact original fs.opendirSync identity",
-  );
 
-  const [successAfterFailure, injectedFailure] = await withSandboxes(
-    2,
-    async ([first, second]) => {
-      assert.ok(first && second);
-      return Promise.all([
-        runNoChangeConstantWorkContract(first),
-        runNoChangeConstantWorkContract(second, {
-          injectFailureAfterObserverRegistration: true,
-        }),
-      ]);
-    },
-  );
-  assert.equal(successAfterFailure.status, "pass");
-  assert.ok(successAfterFailure.counters.filesystemEntriesScanned > 0);
-  assert.ok(Number(successAfterFailure.measurements?.filesystemEnumerationCalls) > 0);
-  assert.equal(successAfterFailure.measurements?.counterProvenanceProved, true);
-  assert.equal(injectedFailure.status, "fail");
-  assert.equal(
-    injectedFailure.counters.filesystemEntriesScanned,
-    0,
-    "the injected failure must not inherit the concurrent sandbox's observations",
-  );
-  assert.equal(injectedFailure.measurements?.filesystemObserverRestored, true);
-  assert.equal(injectedFailure.measurements?.counterProvenanceProved, true);
-  assert.equal(
-    fs.readdirSync,
-    originalReaddirSync,
-    "injected failure must restore the exact original fs.readdirSync identity",
-  );
-  assert.equal(
-    fs.opendirSync,
-    originalOpendirSync,
-    "injected failure must restore the exact original fs.opendirSync identity",
-  );
+  assert.equal(result.exercises.length, 2);
+  assert.deepEqual(result.isolationAssertions, [true, true]);
+  assert.equal(result.isolationProved, true);
+  assert.equal(result.crossCountedEntries, false);
+  assert.equal(result.injectedFailure, "fail");
+  assert.equal(result.injectedFailureEntriesScanned, 0);
+  assert.equal(result.injectedFailureObserverRestored, true);
+  assert.equal(result.exactGlobalIdentityRestored, true);
+  assert.equal(fs.readdirSync, originalReaddirSync);
+  assert.equal(fs.opendirSync, originalOpendirSync);
 
   process.stdout.write(
     `${JSON.stringify(
       {
         status: "pass",
         proof: "resource-proof-directory-observer-concurrency",
-        concurrentSuccesses: concurrentSuccess.length,
-        eachFilesystemEntriesScanned: observedEntries,
-        eachFilesystemEnumerationCalls: observedCalls,
-        eachCounterProvenance: concurrentSuccess.map(
-          (receipt) => receipt.measurements?.counterProvenanceProved === true,
+        concurrentSuccesses: result.exercises.length,
+        eachFilesystemEntriesScanned: result.exercises.map((exercise) => exercise.entries),
+        eachFilesystemEnumerationCalls: result.exercises.map((exercise) => exercise.calls),
+        eachFailedDirectoryEnumerationCalls: result.exercises.map(
+          (exercise) => exercise.failedCalls,
         ),
-        eachObserverRestored: concurrentSuccess.map(
-          (receipt) => receipt.measurements?.filesystemObserverRestored === true,
+        eachDirectoryReadFailures: result.exercises.map((exercise) => exercise.readFailures),
+        eachDeduplicatedEntries: result.exercises.map(
+          (exercise) => exercise.deduplicatedEntries,
         ),
-        crossCountedEntries: false,
-        successAfterInjectedFailure: successAfterFailure.status,
-        injectedFailure: injectedFailure.status,
-        injectedFailureEntriesScanned:
-          injectedFailure.counters.filesystemEntriesScanned,
-        exactGlobalIdentityRestored:
-          fs.readdirSync === originalReaddirSync && fs.opendirSync === originalOpendirSync,
+        eachCounterProvenance: result.isolationAssertions,
+        eachObserverRestored: result.exercises.map((exercise) => exercise.restored),
+        crossCountedEntries: result.crossCountedEntries,
+        successAfterInjectedFailure: "pass",
+        injectedFailure: result.injectedFailure,
+        injectedFailureEntriesScanned: result.injectedFailureEntriesScanned,
+        exactGlobalIdentityRestored: result.exactGlobalIdentityRestored,
       },
       null,
       2,
@@ -133,7 +78,7 @@ main().catch((error) => {
     `${JSON.stringify({
       status: "fail",
       proof: "resource-proof-directory-observer-concurrency",
-      error: error instanceof Error ? error.name : "UnknownError",
+      error: error instanceof Error ? error.stack ?? error.message : String(error),
     })}\n`,
   );
   process.exitCode = 1;

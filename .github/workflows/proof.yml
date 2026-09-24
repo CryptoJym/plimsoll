@@ -372,6 +372,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: node ./node_modules/tsx/dist/cli.mjs ./scripts/resource-proof/index.ts --require-integrated --receipt evidence/resource-proof.json
 
+      - name: Prove resource observer concurrency isolation
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: node ./node_modules/tsx/dist/cli.mjs ./scripts/resource-proof/concurrency-proof.ts
+
       - name: Prove finalized privacy failures fail closed
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: node ./node_modules/tsx/dist/cli.mjs ./scripts/resource-proof/finalization-proof.ts

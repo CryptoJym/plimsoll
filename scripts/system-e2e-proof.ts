@@ -184,6 +184,10 @@ function releaseRootGuards() {
 }
 
 const BUDGETS = SYSTEM_E2E_BUDGETS;
+// macOS-14's four-times-slower resource runner needs the full bounded
+// historical fixture window; keep a finite phase deadline instead of allowing
+// an orphaned child to race cleanup.
+const SUPPORTING_PROOF_TIMEOUT_MS = 180_000;
 const supportContract = loadSupportContract(supportContractPath(repoRoot));
 const rootGuardContract = loadRootGuardContract(rootGuardContractPath(repoRoot));
 
@@ -280,7 +284,7 @@ function runSupportingProof(options: {
       env: isolatedEnvironment(options.home, options.temp),
       encoding: "utf8",
       maxBuffer: 12 * 1024 * 1024,
-      timeout: 90_000,
+      timeout: SUPPORTING_PROOF_TIMEOUT_MS,
     },
   );
   assert.equal(result.error, undefined, `${options.name} could not start: ${String(result.error)}`);
@@ -305,7 +309,10 @@ function runSupportingProof(options: {
   const blockInputOperations = parseTimeMetric(result.stderr, "block input operations");
   const blockOutputOperations = parseTimeMetric(result.stderr, "block output operations");
   const capturedOutputBytes = Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr);
-  assert.ok(wallMs <= 90_000, `${options.name} exceeded its 90s wall budget`);
+  assert.ok(
+    wallMs <= SUPPORTING_PROOF_TIMEOUT_MS,
+    `${options.name} exceeded its ${SUPPORTING_PROOF_TIMEOUT_MS / 1_000}s wall budget`,
+  );
   assert.ok(maxRssBytes <= BUDGETS.maxRssBytes, `${options.name} exceeded RSS budget`);
   assert.ok(capturedOutputBytes <= 12 * 1024 * 1024, `${options.name} exceeded output budget`);
   if (options.receipt) {
@@ -1168,25 +1175,34 @@ async function main() {
   assert.equal(idle?.counters.rawEventRewrites, 0);
   const filesystemEntriesScanned = Number(idle?.counters.filesystemEntriesScanned ?? 0);
   const filesystemEnumerationCalls = Number(idle?.measurements.filesystemEnumerationCalls ?? 0);
+  const unchangedFilesystemEnumerationCalls = Number(
+    idle?.measurements.unchangedFilesystemEnumerationCalls ?? 0,
+  );
   const setupFilesystemEntriesScanned = Number(idle?.measurements.setupFilesystemEntriesScanned ?? 0);
   const unchangedFilesystemEntriesScanned = Number(idle?.measurements.unchangedFilesystemEntriesScanned ?? 0);
   assert.ok(Number.isSafeInteger(filesystemEntriesScanned) && filesystemEntriesScanned > 0);
   assert.ok(Number.isSafeInteger(filesystemEnumerationCalls) && filesystemEnumerationCalls > 0);
   assert.ok(filesystemEntriesScanned >= filesystemEnumerationCalls);
   assert.ok(Number.isSafeInteger(setupFilesystemEntriesScanned) && setupFilesystemEntriesScanned >= 0);
-  assert.ok(Number.isSafeInteger(unchangedFilesystemEntriesScanned) && unchangedFilesystemEntriesScanned >= 0);
+  assert.ok(Number.isSafeInteger(unchangedFilesystemEntriesScanned) && unchangedFilesystemEntriesScanned > 0);
+  assert.ok(Number.isSafeInteger(unchangedFilesystemEnumerationCalls) && unchangedFilesystemEnumerationCalls > 0);
   assert.equal(
     setupFilesystemEntriesScanned + unchangedFilesystemEntriesScanned,
     filesystemEntriesScanned,
   );
-  // Two initial maintenance runs, two sources, and the 256-entry per-source
-  // allowance bound the observed work. Raw values remain in the receipt and
-  // final measurements; only these bounded runtime fields are normalized for
-  // the support-contract digest.
-  assert.ok(filesystemEntriesScanned <= 1_024);
-  assert.ok(setupFilesystemEntriesScanned <= 1_024);
-  assert.ok(unchangedFilesystemEntriesScanned <= 1_024);
-  assert.ok(filesystemEnumerationCalls <= 64);
+  // The stable run is a fresh recent sweep over two fixed source roots. Its
+  // two per-source 256-entry allowances give a 512-entry safety bound, while
+  // the complete startup/baseline window has a separate 8,192-entry cap. The
+  // stable call count is bounded to the four directory levels exercised by
+  // the fixture plus a small root retry allowance. Raw values remain in the
+  // receipt and final measurements; normalization does not bypass these
+  // semantic bounds.
+  assert.ok(filesystemEntriesScanned <= 8_192);
+  assert.ok(setupFilesystemEntriesScanned <= 7_680);
+  assert.ok(unchangedFilesystemEntriesScanned <= 512);
+  assert.ok(filesystemEnumerationCalls <= 32);
+  assert.ok(unchangedFilesystemEnumerationCalls <= 8);
+  assert.equal(idle?.measurements.stableSweepCursorReset, true);
   assert.equal(idle?.measurements.filesystemEnumerationObserved, true);
   assert.equal(idle?.counters.fullHistoryFileReads, 2_610);
   assert.equal(idle?.counters.filesOpened, 2_614);
@@ -1317,8 +1333,17 @@ async function main() {
       rawEventRewrites: idle?.counters.rawEventRewrites,
       filesystemEntriesScanned: idle?.counters.filesystemEntriesScanned,
       filesystemEnumerationCalls: idle?.measurements.filesystemEnumerationCalls,
+      startupFilesystemEntriesScanned: idle?.measurements.startupFilesystemEntriesScanned,
+      startupFilesystemEnumerationCalls: idle?.measurements.startupFilesystemEnumerationCalls,
+      baselineFilesystemEntriesScanned: idle?.measurements.baselineFilesystemEntriesScanned,
+      baselineFilesystemEnumerationCalls: idle?.measurements.baselineFilesystemEnumerationCalls,
       setupFilesystemEntriesScanned: idle?.measurements.setupFilesystemEntriesScanned,
+      setupFilesystemEnumerationCalls: idle?.measurements.setupFilesystemEnumerationCalls,
       unchangedFilesystemEntriesScanned: idle?.measurements.unchangedFilesystemEntriesScanned,
+      unchangedFilesystemEnumerationCalls: idle?.measurements.unchangedFilesystemEnumerationCalls,
+      filesystemEnumerationFailedCalls: idle?.measurements.filesystemEnumerationFailedCalls,
+      filesystemEnumerationReadFailures: idle?.measurements.filesystemEnumerationReadFailures,
+      stableSweepCursorReset: idle?.measurements.stableSweepCursorReset,
       filesOpened: idle?.counters.filesOpened,
       fileBytesRead: idle?.counters.fileBytesRead,
       fullHistoryFileReads: idle?.counters.fullHistoryFileReads,
@@ -1430,5 +1455,10 @@ main()
   })
   .finally(() => {
     releaseRootGuards();
-    fs.rmSync(proofRoot, { recursive: true, force: true });
+    fs.rmSync(proofRoot, {
+      recursive: true,
+      force: true,
+      maxRetries: 50,
+      retryDelay: 200,
+    });
   });

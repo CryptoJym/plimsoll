@@ -1,4 +1,5 @@
 import { acceptedFixtureDelivery } from "../lib/delivery-fixture";
+import assert from "node:assert/strict";
 import { spawn, spawnSync, type ChildProcessByStdio } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
@@ -240,7 +241,12 @@ export async function removeResourceSandbox(sandbox: ResourceSandbox) {
   if (sandbox.portReservation.listening) {
     await new Promise<void>((resolve) => sandbox.portReservation.close(() => resolve()));
   }
-  fs.rmSync(sandbox.root, { recursive: true, force: true });
+  fs.rmSync(sandbox.root, {
+    recursive: true,
+    force: true,
+    maxRetries: 50,
+    retryDelay: 200,
+  });
 }
 
 export function runIsolationContract(
@@ -860,11 +866,15 @@ type DirectoryEnumerationRecord = {
   root: string;
   calls: number;
   entries: number;
+  failedCalls: number;
+  readFailures: number;
+  deduplicatedEntries: number;
   unregistered: boolean;
   restorationVerified: boolean;
 };
 
 const directoryEnumerationObservers = new Map<string, DirectoryEnumerationRecord>();
+const directoryObserverDuplicateProbes = new WeakMap<fs.Dir, (entry: fs.Dirent) => void>();
 let directoryEnumerationOriginal: typeof fs.readdirSync | undefined;
 let directoryEnumerationWrapper: typeof fs.readdirSync | undefined;
 let directoryOpenOriginal: typeof fs.opendirSync | undefined;
@@ -887,13 +897,38 @@ function recordDirectoryEnumeration(directory: string | null, calls: number, ent
   }
 }
 
+function recordDirectoryEnumerationFailure(
+  directory: string | null,
+  kind: "open" | "read",
+) {
+  if (!directory) return;
+  for (const observer of directoryEnumerationObservers.values()) {
+    if (!observer.unregistered && within(observer.root, directory)) {
+      if (kind === "open") observer.failedCalls += 1;
+      else observer.readFailures += 1;
+    }
+  }
+}
+
+function recordDirectoryEnumerationDuplicate(directory: string | null) {
+  if (!directory) return;
+  for (const observer of directoryEnumerationObservers.values()) {
+    if (!observer.unregistered && within(observer.root, directory)) {
+      observer.deduplicatedEntries += 1;
+    }
+  }
+}
+
 function instrumentDirectoryHandle(handle: fs.Dir, directory: string | null) {
   // Node's async iterator can delegate to read(), so de-duplicate Dirent
   // objects by identity while covering every supported Dir API.
   const observedEntries = new WeakSet<object>();
   const recordEntry = <T>(entry: T): T => {
     if (entry && typeof entry === "object") {
-      if (observedEntries.has(entry)) return entry;
+      if (observedEntries.has(entry)) {
+        recordDirectoryEnumerationDuplicate(directory);
+        return entry;
+      }
       observedEntries.add(entry);
       recordDirectoryEnumeration(directory, 0, 1);
     }
@@ -901,11 +936,45 @@ function instrumentDirectoryHandle(handle: fs.Dir, directory: string | null) {
   };
 
   const originalReadSync = handle.readSync.bind(handle);
-  handle.readSync = (() => recordEntry(originalReadSync())) as typeof handle.readSync;
+  handle.readSync = (() => {
+    try {
+      return recordEntry(originalReadSync());
+    } catch (error) {
+      recordDirectoryEnumerationFailure(directory, "read");
+      throw error;
+    }
+  }) as typeof handle.readSync;
 
-  const originalRead = handle.read.bind(handle);
-  handle.read = ((callback: (error: NodeJS.ErrnoException | null, entry: fs.Dirent | null) => void) =>
-    originalRead((error, entry) => callback(error, recordEntry(entry)))) as typeof handle.read;
+  const originalRead = handle.read.bind(handle) as unknown as (
+    callback?: (error: NodeJS.ErrnoException | null, entry: fs.Dirent | null) => void,
+  ) => unknown;
+  handle.read = ((callback?:
+    (error: NodeJS.ErrnoException | null, entry: fs.Dirent | null) => void) => {
+    if (callback) {
+      try {
+        return originalRead((error, entry) => {
+          if (error) recordDirectoryEnumerationFailure(directory, "read");
+          callback(error, recordEntry(entry));
+        });
+      } catch (error) {
+        recordDirectoryEnumerationFailure(directory, "read");
+        throw error;
+      }
+    }
+    try {
+      const promise = originalRead() as Promise<fs.Dirent | null>;
+      return promise.then(
+        (entry) => recordEntry(entry),
+        (error: unknown) => {
+          recordDirectoryEnumerationFailure(directory, "read");
+          throw error;
+        },
+      );
+    } catch (error) {
+      recordDirectoryEnumerationFailure(directory, "read");
+      throw error;
+    }
+  }) as unknown as typeof handle.read;
 
   const originalAsyncIterator = handle[Symbol.asyncIterator].bind(handle);
   handle[Symbol.asyncIterator] = (() => {
@@ -913,9 +982,14 @@ function instrumentDirectoryHandle(handle: fs.Dir, directory: string | null) {
     const originalNext = iterator.next.bind(iterator);
     const wrapped: AsyncIterableIterator<fs.Dirent> = {
       async next(...args: [] | [undefined]) {
-        const result = await originalNext(...args);
-        if (!result.done) recordEntry(result.value);
-        return result;
+        try {
+          const result = await originalNext(...args);
+          if (!result.done) recordEntry(result.value);
+          return result;
+        } catch (error) {
+          recordDirectoryEnumerationFailure(directory, "read");
+          throw error;
+        }
       },
       [Symbol.asyncIterator]() {
         return this;
@@ -925,6 +999,15 @@ function instrumentDirectoryHandle(handle: fs.Dir, directory: string | null) {
     if (iterator.throw) wrapped.throw = iterator.throw.bind(iterator);
     return wrapped;
   }) as typeof handle[typeof Symbol.asyncIterator];
+
+  // The production wrappers only expose the public Dir APIs. This private
+  // probe lets the concurrency proof feed the same Dirent through the
+  // recorder twice and prove that identity de-duplication is active without
+  // changing any production collector surface.
+  directoryObserverDuplicateProbes.set(handle, (entry) => {
+    recordEntry(entry);
+    recordEntry(entry);
+  });
 
   return handle;
 }
@@ -942,20 +1025,30 @@ function installDirectoryEnumerationWrapper() {
   directoryEnumerationOriginal = fs.readdirSync;
   const original = directoryEnumerationOriginal;
   directoryEnumerationWrapper = ((...args: Parameters<typeof fs.readdirSync>) => {
-    const result = original(...args);
     const directory = readdirPath(args[0]);
-    recordDirectoryEnumeration(directory, 1, result.length);
-    return result;
+    try {
+      const result = original(...args);
+      recordDirectoryEnumeration(directory, 1, result.length);
+      return result;
+    } catch (error) {
+      recordDirectoryEnumerationFailure(directory, "open");
+      throw error;
+    }
   }) as typeof fs.readdirSync;
   fs.readdirSync = directoryEnumerationWrapper;
 
   directoryOpenOriginal = fs.opendirSync;
   const openOriginal = directoryOpenOriginal;
   directoryOpenWrapper = ((...args: Parameters<typeof fs.opendirSync>) => {
-    const handle = openOriginal(...args);
     const directory = readdirPath(args[0]);
-    recordDirectoryEnumeration(directory, 1, 0);
-    return instrumentDirectoryHandle(handle, directory);
+    try {
+      const handle = openOriginal(...args);
+      recordDirectoryEnumeration(directory, 1, 0);
+      return instrumentDirectoryHandle(handle, directory);
+    } catch (error) {
+      recordDirectoryEnumerationFailure(directory, "open");
+      throw error;
+    }
   }) as typeof fs.opendirSync;
   fs.opendirSync = directoryOpenWrapper;
 }
@@ -970,12 +1063,21 @@ function observeDirectoryEnumeration(root: string) {
     root: resolvedRoot,
     calls: 0,
     entries: 0,
+    failedCalls: 0,
+    readFailures: 0,
+    deduplicatedEntries: 0,
     unregistered: false,
     restorationVerified: false,
   };
   directoryEnumerationObservers.set(resolvedRoot, record);
   return {
-    snapshot: () => ({ calls: record.calls, entries: record.entries }),
+    snapshot: () => ({
+      calls: record.calls,
+      entries: record.entries,
+      failedCalls: record.failedCalls,
+      deduplicatedEntries: record.deduplicatedEntries,
+      readFailures: record.readFailures,
+    }),
     unregister: () => {
       if (record.unregistered) return;
       if (directoryEnumerationObservers.get(resolvedRoot) !== record) {
@@ -1015,8 +1117,189 @@ function observeDirectoryEnumeration(root: string) {
     status: () => ({
       calls: record.calls,
       entries: record.entries,
+      failedCalls: record.failedCalls,
+      deduplicatedEntries: record.deduplicatedEntries,
+      readFailures: record.readFailures,
       restored: record.unregistered && record.restorationVerified,
     }),
+  };
+}
+
+type DirectoryObserverExercise = {
+  root: string;
+  expectedEntries: number;
+  expectedCalls: number;
+  entries: number;
+  calls: number;
+  failedCalls: number;
+  readFailures: number;
+  deduplicatedEntries: number;
+  restored: boolean;
+};
+
+async function readDirectoryWithCallback(handle: fs.Dir) {
+  let entries = 0;
+  await new Promise<void>((resolve, reject) => {
+    const readNext = () => {
+      handle.read((error, entry) => {
+        if (error) {
+          reject(error);
+          return;
+        }
+        if (!entry) {
+          resolve();
+          return;
+        }
+        entries += 1;
+        readNext();
+      });
+    };
+    readNext();
+  });
+  return entries;
+}
+
+function closeDirectoryHandle(handle: fs.Dir) {
+  try {
+    handle.closeSync();
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ERR_DIR_CLOSED") throw error;
+  }
+}
+
+async function exerciseDirectoryObserver(root: string, fileCount: number) {
+  const probeRoot = path.join(root, "resource-observer-concurrency");
+  fs.rmSync(probeRoot, { recursive: true, force: true });
+  fs.mkdirSync(probeRoot, { recursive: true, mode: 0o700 });
+  for (let index = 0; index < fileCount; index += 1) {
+    fs.writeFileSync(path.join(probeRoot, `entry-${index}.txt`), `${index}\n`, {
+      mode: 0o600,
+    });
+  }
+  fs.mkdirSync(path.join(probeRoot, "nested"), { mode: 0o700 });
+
+  const observer = observeDirectoryEnumeration(probeRoot);
+  try {
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const listed = fs.readdirSync(probeRoot, { withFileTypes: true });
+    assert.equal(listed.length, fileCount + 1);
+
+    const syncHandle = fs.opendirSync(probeRoot);
+    let firstSyncEntry: fs.Dirent | null = null;
+    while (true) {
+      const entry = syncHandle.readSync();
+      if (!entry) break;
+      firstSyncEntry ??= entry;
+      // The sync path is counted by the observer wrapper.
+    }
+    assert.ok(firstSyncEntry);
+    directoryObserverDuplicateProbes.get(syncHandle)?.(firstSyncEntry);
+    closeDirectoryHandle(syncHandle);
+
+    const callbackHandle = fs.opendirSync(probeRoot);
+    await readDirectoryWithCallback(callbackHandle);
+    closeDirectoryHandle(callbackHandle);
+
+    const iteratorHandle = fs.opendirSync(probeRoot);
+    for await (const _entry of iteratorHandle) {
+      // Async iteration is counted through the wrapped iterator.next() path.
+    }
+    closeDirectoryHandle(iteratorHandle);
+
+    const promiseHandle = fs.opendirSync(probeRoot);
+    while (await promiseHandle.read()) {
+      // Direct promise-form Dir.read() is a supported Node API.
+    }
+    closeDirectoryHandle(promiseHandle);
+
+    for (const missing of ["missing-readdir", "missing-opendir"]) {
+      const missingPath = path.join(probeRoot, missing);
+      try {
+        if (missing.endsWith("readdir")) fs.readdirSync(missingPath);
+        else fs.opendirSync(missingPath);
+      } catch {
+        // Failed directory attempts are part of the observer evidence.
+      }
+    }
+
+    const expectedEntries = listed.length * 5;
+    const expectedCalls = 5;
+    const beforeUnregister = observer.status();
+    observer.unregister();
+    const afterUnregister = observer.status();
+    assert.equal(beforeUnregister.entries, expectedEntries);
+    assert.equal(beforeUnregister.calls, expectedCalls);
+    assert.equal(beforeUnregister.failedCalls, 2);
+    assert.equal(beforeUnregister.readFailures, 0);
+    assert.equal(beforeUnregister.deduplicatedEntries, 2);
+    assert.equal(afterUnregister.restored, true);
+    return {
+      root: probeRoot,
+      expectedEntries,
+      expectedCalls,
+      entries: afterUnregister.entries,
+      calls: afterUnregister.calls,
+      failedCalls: afterUnregister.failedCalls,
+      readFailures: afterUnregister.readFailures,
+      deduplicatedEntries: afterUnregister.deduplicatedEntries,
+      restored: afterUnregister.restored,
+    } satisfies DirectoryObserverExercise;
+  } finally {
+    observer.unregister();
+    fs.rmSync(probeRoot, { recursive: true, force: true });
+  }
+}
+
+export async function runDirectoryObserverConcurrencyContract(
+  roots: readonly [string, string],
+) {
+  const originalReaddirSync = fs.readdirSync;
+  const originalOpendirSync = fs.opendirSync;
+  const exercises = await Promise.all([
+    exerciseDirectoryObserver(roots[0], 2),
+    exerciseDirectoryObserver(roots[1], 4),
+  ]);
+  const isolationAssertions = exercises.map(
+    (exercise) =>
+      exercise.entries === exercise.expectedEntries &&
+      exercise.calls === exercise.expectedCalls &&
+      exercise.failedCalls === 2 &&
+      exercise.readFailures === 0 &&
+      exercise.deduplicatedEntries === 2 &&
+      exercise.restored,
+  );
+  const isolationProved = isolationAssertions.every(Boolean);
+  const crossCountedEntries = !isolationProved;
+  assert.equal(isolationProved, true, "directory observers must remain isolated");
+
+  const failureRoot = path.join(roots[0], "resource-observer-injected-failure");
+  fs.mkdirSync(failureRoot, { recursive: true, mode: 0o700 });
+  const failureObserver = observeDirectoryEnumeration(failureRoot);
+  let injectedFailure = false;
+  try {
+    throw new Error("InjectedDirectoryObserverFailure");
+  } catch {
+    injectedFailure = true;
+  } finally {
+    failureObserver.unregister();
+  }
+  const failureStatus = failureObserver.status();
+  fs.rmSync(failureRoot, { recursive: true, force: true });
+  assert.equal(injectedFailure, true);
+  assert.equal(failureStatus.entries, 0);
+  assert.equal(failureStatus.calls, 0);
+  assert.equal(failureStatus.restored, true);
+
+  return {
+    exercises,
+    isolationAssertions,
+    isolationProved,
+    crossCountedEntries,
+    injectedFailure: injectedFailure ? "fail" : "pass",
+    injectedFailureEntriesScanned: failureStatus.entries,
+    injectedFailureObserverRestored: failureStatus.restored,
+    exactGlobalIdentityRestored:
+      fs.readdirSync === originalReaddirSync && fs.opendirSync === originalOpendirSync,
   };
 }
 
@@ -1178,27 +1461,24 @@ export async function runNoChangeConstantWorkContract(
     let initialDrain: CollectorMaintenanceRunResult[] = [];
     let queuedStatus = scheduler.status();
     let finalStatus = scheduler.status();
-    try {
-      if (options.injectFailureAfterObserverRegistration) {
-        throw new Error("InjectedDirectoryObserverFailure");
-      }
-      const initial = requestAutomaticRecentMaintenance(scheduler);
-      await firstStartedSignal;
-      const concurrentRecent = requestAutomaticRecentMaintenance(scheduler);
-      const concurrentInterval = requestAutomaticRecentMaintenance(scheduler);
-      queuedStatus = scheduler.status();
-      releaseFirst();
-      [initialDrain] = await Promise.all([initial, concurrentRecent, concurrentInterval]);
-      finalStatus = scheduler.status();
-    } finally {
-      activeDirectoryObserver.unregister();
+    if (options.injectFailureAfterObserverRegistration) {
+      throw new Error("InjectedDirectoryObserverFailure");
     }
-    const directoryObservation = activeDirectoryObserver.status();
+    const initial = requestAutomaticRecentMaintenance(scheduler);
+    await firstStartedSignal;
+    const concurrentRecent = requestAutomaticRecentMaintenance(scheduler);
+    const concurrentInterval = requestAutomaticRecentMaintenance(scheduler);
+    queuedStatus = scheduler.status();
+    releaseFirst();
+    [initialDrain] = await Promise.all([initial, concurrentRecent, concurrentInterval]);
+    finalStatus = scheduler.status();
+    const startupDirectoryObservation = activeDirectoryObserver.snapshot();
 
     const bootRuns = [...initialDrain];
     const baselineSnapshots: CaptureBaselineStatus[] = [
       captureBaselineStatus(buffer.database),
     ];
+    const baselineDirectoryBefore = activeDirectoryObserver.snapshot();
     for (
       let cadence = 0;
       cadence < MAX_DISCOVERY_CADENCES && captureBaselineStatus(buffer.database).status !== "complete";
@@ -1207,9 +1487,42 @@ export async function runNoChangeConstantWorkContract(
       bootRuns.push(await maintenance.runRecent());
       baselineSnapshots.push(captureBaselineStatus(buffer.database));
     }
+    const baselineDirectoryAfter = activeDirectoryObserver.snapshot();
+    const baselineFilesystemEntriesScanned =
+      baselineDirectoryAfter.entries - baselineDirectoryBefore.entries;
+    const baselineFilesystemEnumerationCalls =
+      baselineDirectoryAfter.calls - baselineDirectoryBefore.calls;
+    // Recreate the tailers after baseline completion so the proof's stable
+    // unchanged run starts a fresh recent discovery sweep. The ledger and
+    // baseline state remain the same; only the two bounded sweep cursors are
+    // reset below to make the measured metadata work explicit.
+    maintenance.close();
+    maintenance = undefined;
+    buffer.close();
+    buffer = new LocalEventBuffer(sandbox.ledger);
+    installTemporaryEventMutationAudit(buffer);
+    // A completed baseline normally leaves a recent-sweep cursor at its last
+    // root. Clear only those two bounded cursor rows so this proof's stable
+    // unchanged run measures a fresh metadata-only sweep without changing any
+    // fixture files or durable event content.
+    for (const source of ["codex", "claude_code"] as const) {
+      buffer.database
+        .prepare("delete from maintenance_state where key = ?")
+        .run(`capture_sweep_resume:${source}`);
+    }
+    maintenance = makeMaintenance();
     const stableBefore = eventMutationCounts(buffer);
+    const stableDirectoryBefore = activeDirectoryObserver.snapshot();
     const stableRun = await maintenance.runRecent();
     const stableMutations = eventMutationDelta(stableBefore, eventMutationCounts(buffer));
+    const stableDirectoryAfter = activeDirectoryObserver.snapshot();
+    const unchangedFilesystemEntriesScanned =
+      stableDirectoryAfter.entries - stableDirectoryBefore.entries;
+    const unchangedFilesystemEnumerationCalls =
+      stableDirectoryAfter.calls - stableDirectoryBefore.calls;
+    const observedDirectoryBeforeUnregister = activeDirectoryObserver.status();
+    activeDirectoryObserver.unregister();
+    const directoryObservation = activeDirectoryObserver.status();
 
     const firstRun = initialDrain[0];
     const secondRun = initialDrain[1];
@@ -1284,13 +1597,25 @@ export async function runNoChangeConstantWorkContract(
       finalStatus.maxConcurrentJobs === 1 &&
       finalStatus.overlappingJobs === 0 &&
       finalStatus.failedRuns === 0;
+    const startupFilesystemEntriesScanned = startupDirectoryObservation.entries;
+    const startupFilesystemEnumerationCalls = startupDirectoryObservation.calls;
+    const setupFilesystemEntriesScanned =
+      startupFilesystemEntriesScanned + baselineFilesystemEntriesScanned;
+    const setupFilesystemEnumerationCalls =
+      startupFilesystemEnumerationCalls + baselineFilesystemEnumerationCalls;
     const counterProvenanceProved =
       directoryObservation.restored &&
       directoryEntryDeltas.length === finalStatus.runCount &&
-      directoryEntryDeltas.reduce((total, count) => total + count, 0) ===
-        directoryObservation.entries;
+      setupFilesystemEntriesScanned + unchangedFilesystemEntriesScanned ===
+        directoryObservation.entries &&
+      setupFilesystemEnumerationCalls + unchangedFilesystemEnumerationCalls ===
+        directoryObservation.calls;
     const filesystemEnumerationObserved =
-      directoryObservation.calls > 0 && directoryObservation.entries > 0;
+      unchangedFilesystemEnumerationCalls > 0 && unchangedFilesystemEntriesScanned > 0;
+    const unchangedFilesystemEntriesBounded =
+      unchangedFilesystemEntriesScanned <= 512;
+    const unchangedFilesystemEnumerationCallsBounded =
+      unchangedFilesystemEnumerationCalls <= 8;
     const recentDidNotPromote =
       initialCoverage.status === "incomplete" &&
       initialCoverage.reason === EXPLICIT_FULL_BACKFILL_NOT_COMPLETED &&
@@ -1974,7 +2299,9 @@ export async function runNoChangeConstantWorkContract(
       counters.rawEventWrites === 2 &&
       counters.rawEventRewrites === 0 &&
       counters.overlappingJobs === 0 &&
-      filesystemEnumerationObserved;
+      filesystemEnumerationObserved &&
+      unchangedFilesystemEntriesBounded &&
+      unchangedFilesystemEnumerationCallsBounded;
 
     return {
       id: "no_change_constant_work",
@@ -2062,13 +2389,24 @@ export async function runNoChangeConstantWorkContract(
         schedulerRunCount: finalStatus.runCount,
         maxConcurrentJobs: finalStatus.maxConcurrentJobs,
         filesystemEnumerationCalls: directoryObservation.calls,
-        setupFilesystemEntriesScanned: directoryEntryDeltas[0] ?? 0,
-        unchangedFilesystemEntriesScanned: directoryEntryDeltas[1] ?? 0,
+        filesystemEnumerationFailedCalls: directoryObservation.failedCalls,
+        filesystemEnumerationReadFailures: directoryObservation.readFailures,
+        startupFilesystemEntriesScanned,
+        startupFilesystemEnumerationCalls,
+        baselineFilesystemEntriesScanned,
+        baselineFilesystemEnumerationCalls,
+        setupFilesystemEntriesScanned,
+        setupFilesystemEnumerationCalls,
+        unchangedFilesystemEntriesScanned,
+        unchangedFilesystemEnumerationCalls,
+        unchangedFilesystemEntriesBounded,
+        unchangedFilesystemEnumerationCallsBounded,
+        stableSweepCursorReset: true,
         filesystemObserverRestored: directoryObservation.restored,
         counterProvenanceProved,
         filesystemEnumerationObserved,
         filesystemCounterSource:
-          "observed fs.readdirSync and fs.opendirSync Dir.readSync/read/async-iterator entries",
+          "successful returned directory entries from fs.readdirSync and fs.opendirSync Dir reads; failed opens/reads are reported separately",
         maintenanceRunCounterSource: "scheduler runCount",
       },
     };
@@ -2091,6 +2429,9 @@ export async function runNoChangeConstantWorkContract(
         deterministicIdleCounters: false,
         filesystemObserverRestored: directoryObservation?.restored ?? false,
         counterProvenanceProved: directoryObservation?.restored ?? false,
+        filesystemEnumerationCalls: directoryObservation?.calls ?? 0,
+        filesystemEnumerationFailedCalls: directoryObservation?.failedCalls ?? 0,
+        filesystemEnumerationReadFailures: directoryObservation?.readFailures ?? 0,
       },
     };
   } finally {

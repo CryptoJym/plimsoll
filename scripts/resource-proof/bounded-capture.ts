@@ -245,7 +245,11 @@ async function proveSignalCleanup(root: string, repoRoot: string) {
   child.stderr.on("data", (chunk) => (stderr += String(chunk)));
   const pidFile = path.join(collectorHome, "collector.pid");
   const started = performance.now();
-  while ((!fs.existsSync(pidFile) || !stdout.includes('"status":"active"')) && performance.now() - started < 8_000) {
+  // macOS-14 can spend several seconds scheduling the TypeScript collector
+  // child while the dense fixture is being prepared; keep startup bounded but
+  // separate from the signal-shutdown budget below.
+  const childStartDeadline = started + 30_000;
+  while ((!fs.existsSync(pidFile) || !stdout.includes('"status":"active"')) && performance.now() < childStartDeadline) {
     await new Promise((resolve) => setTimeout(resolve, 20));
   }
   if (!fs.existsSync(pidFile)) throw new Error("bounded_child_pid_missing");
@@ -304,6 +308,13 @@ async function proveSignalCleanup(root: string, repoRoot: string) {
       setTimeout(() => reject(new Error("bounded_child_shutdown_timeout")), 4_000),
     ),
   ]);
+  // The collector removes its ownership record during the shutdown hook after
+  // the child emits `exit`; wait for that bounded filesystem cleanup before
+  // the parent removes the fixture root.
+  const pidCleanupDeadline = performance.now() + 2_000;
+  while (fs.existsSync(pidFile) && performance.now() < pidCleanupDeadline) {
+    await new Promise((resolve) => setTimeout(resolve, 20));
+  }
   heldHeader.destroy();
   let reachable = true;
   try {
