@@ -1277,9 +1277,23 @@ function exerciseNestedEpisodeRollback() {
 function exerciseTimestampProperty(root: string) {
   const probe = path.join(repoRoot, "scripts/learning-facts-timestamp-probe.ts");
   const tsx = path.join(repoRoot, "node_modules/tsx/dist/cli.mjs");
-  const result = spawnSync(process.execPath,
-    [tsx, probe, "direct-new", path.join(root, "timestamp-property.sqlite")],
-    { cwd: repoRoot, encoding: "utf8", timeout: 30_000 });
+  const runProbe = (ledger: string, env: NodeJS.ProcessEnv = process.env) =>
+    spawnSync(process.execPath,
+      [tsx, probe, "direct-new", ledger],
+      { cwd: repoRoot, encoding: "utf8", timeout: 30_000, env });
+  const runProbeWithRootTempDir = (ledger: string) => spawnSync(process.execPath, [
+    "-e",
+    "require('tsx/cjs/api').register(); process.env.TMPDIR='/'; require(process.argv[1]);",
+    probe,
+    "direct-new",
+    ledger,
+  ], {
+    cwd: repoRoot,
+    encoding: "utf8",
+    timeout: 30_000,
+    env: { ...process.env },
+  });
+  const result = runProbe(path.join(root, "timestamp-property.sqlite"));
   const isolatedTempDir = path.resolve(process.env.TMPDIR || os.tmpdir());
   const outsideLedger = path.join(
     path.dirname(isolatedTempDir),
@@ -1298,6 +1312,79 @@ function exerciseTimestampProperty(root: string) {
       outsideStatus: outside.status,
       outsideStdout: outside.stdout,
       outsideStderr: outside.stderr,
+    });
+
+  const symlinkOutside = path.join(
+    path.dirname(root),
+    `plimsoll-timestamp-symlink-outside-${process.pid}`,
+  );
+  const symlinkPath = path.join(root, "timestamp-symlink");
+  fs.mkdirSync(symlinkOutside);
+  fs.symlinkSync(symlinkOutside, symlinkPath, "dir");
+  const symlinkResult = runProbe(path.join(symlinkPath, "symlink.sqlite"));
+  const symlinkTouched = [
+    "symlink.sqlite",
+    "symlink.sqlite.tie.sqlite",
+    "symlink.sqlite.top.sqlite",
+  ].some((suffix) => fs.existsSync(path.join(symlinkOutside, suffix)));
+  check("timestamp_probe_rejects_symlink_escape",
+    symlinkResult.status !== 0 && !symlinkTouched, {
+      status: symlinkResult.status,
+      stdout: symlinkResult.stdout,
+      stderr: symlinkResult.stderr,
+      symlinkPath,
+      symlinkOutside,
+      symlinkTouched,
+    });
+  fs.rmSync(symlinkOutside, { recursive: true, force: true });
+
+  const rootResult = runProbeWithRootTempDir(outsideLedger);
+  check("timestamp_probe_rejects_root_tmpdir", rootResult.status !== 0, {
+    status: rootResult.status,
+    stdout: rootResult.stdout,
+    stderr: rootResult.stderr,
+  });
+
+  const dotdotOutsideLedger = path.join(
+    isolatedTempDir,
+    "..",
+    `plimsoll-timestamp-dotdot-outside-${process.pid}.sqlite`,
+  );
+  const dotdotOutside = runProbe(dotdotOutsideLedger);
+  const dotdotInsideParent = path.join(root, "timestamp-dotdot-parent");
+  fs.mkdirSync(dotdotInsideParent);
+  const dotdotInsideLedger = path.join(dotdotInsideParent, "..", "timestamp-dotdot-inside.sqlite");
+  const dotdotInside = runProbe(dotdotInsideLedger);
+  check("timestamp_probe_rejects_dotdot_escape_and_accepts_in_root",
+    dotdotOutside.status !== 0 && dotdotInside.status === 0, {
+      outsideStatus: dotdotOutside.status,
+      outsideStdout: dotdotOutside.stdout,
+      outsideStderr: dotdotOutside.stderr,
+      insideStatus: dotdotInside.status,
+      insideStdout: dotdotInside.stdout,
+      insideStderr: dotdotInside.stderr,
+      dotdotOutsideLedger,
+      dotdotInsideLedger,
+    });
+
+  const rootReal = fs.realpathSync.native(root);
+  const varAliasRoot = rootReal.startsWith("/private/var/")
+    ? `/var/${rootReal.slice("/private/var/".length)}` : undefined;
+  const varAliasAvailable = varAliasRoot !== undefined &&
+    fs.realpathSync.native(varAliasRoot) === rootReal;
+  const varAliasLedger = varAliasAvailable
+    ? path.join(varAliasRoot!, "timestamp-var-alias.sqlite") : undefined;
+  const varAlias = varAliasLedger === undefined
+    ? undefined : runProbe(varAliasLedger);
+  check("timestamp_probe_accepts_real_var_alias_inside_root",
+    !varAliasAvailable || varAlias?.status === 0, {
+      available: varAliasAvailable,
+      status: varAlias?.status,
+      stdout: varAlias?.stdout,
+      stderr: varAlias?.stderr,
+      rootReal,
+      varAliasRoot,
+      varAliasLedger,
     });
 }
 
