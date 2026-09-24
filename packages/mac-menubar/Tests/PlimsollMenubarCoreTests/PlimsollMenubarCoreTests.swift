@@ -220,10 +220,7 @@ struct PlimsollMenubarCoreTests {
     }
 
     @Test func probeSeesTheCollectorHealthzAndSendsNoCredential() throws {
-        let responder = try LoopbackResponder(reply: [
-            "HTTP/1.1 200 OK", "content-type: application/json", "content-length: 11", "connection: close", "",
-            #"{"ok":true}"#,
-        ].joined(separator: "\r\n"))
+        let responder = try LoopbackResponder(reply: collectorHealthzReply)
 
         #expect(CollectorClient.defaultProbeLiveness(port: responder.port))
         let request = try #require(responder.request())
@@ -231,6 +228,27 @@ struct PlimsollMenubarCoreTests {
         for header in ["x-plimsoll-token", "authorization", "cookie"] {
             #expect(!request.lowercased().contains(header))
         }
+    }
+
+    /// Like statusReadsFinishWhileEveryPoolThreadIsBlocked: the probe must
+    /// finish while every pool thread is blocked, so it may need no
+    /// DispatchQueue.global() thread either.
+    @Test func probesFinishWhileEveryPoolThreadIsBlocked() async throws {
+        let callers = 2 * ProcessInfo.processInfo.activeProcessorCount
+
+        let answered = try await withThrowingTaskGroup(of: Bool.self) { group in
+            for _ in 0..<callers {
+                group.addTask {
+                    let responder = try LoopbackResponder(reply: collectorHealthzReply)
+                    // Blocks this pool thread for the whole probe.
+                    return CollectorClient.defaultProbeLiveness(port: responder.port) && responder.request() != nil
+                }
+            }
+            return try await group.reduce(into: [Bool]()) { $0.append($1) }
+        }
+
+        #expect(answered.count == callers)
+        #expect(answered.allSatisfy { $0 })
     }
 
     @Test func probeReportsStoppedForAnotherServiceOnThePort() throws {
@@ -361,6 +379,12 @@ private let megabyteStatusScript = """
     printf '"}'
     """
 
+/// The collector's `/healthz` answer, byte for byte.
+private let collectorHealthzReply = [
+    "HTTP/1.1 200 OK", "content-type: application/json", "content-length: 11", "connection: close", "",
+    #"{"ok":true}"#,
+].joined(separator: "\r\n")
+
 /// A throwaway executable standing in for `plimsoll`; it is run as
 /// `<path> status`, exactly as the menubar runs the real collector.
 private struct FakeCollector {
@@ -393,8 +417,13 @@ private final class LoopbackResponder: @unchecked Sendable {
     init(reply: String) throws {
         let listener = try Self.listeningSocket()
         port = try Self.boundPort(listener)
-        DispatchQueue.global().async {
-            let connection = accept(listener, nil, nil)
+        // Its own thread, not DispatchQueue.global(): a test that blocks its
+        // pool thread on the probe must not also wait on global-queue work
+        // (see statusReadsFinishWhileEveryPoolThreadIsBlocked). It waits at
+        // most 10 s for the probe to connect.
+        Thread {
+            var waiting = pollfd(fd: listener, events: Int16(POLLIN), revents: 0)
+            let connection = poll(&waiting, 1, 10_000) > 0 ? accept(listener, nil, nil) : -1
             if connection >= 0 {
                 var received = [UInt8]()
                 var buffer = [UInt8](repeating: 0, count: 4096)
@@ -409,7 +438,7 @@ private final class LoopbackResponder: @unchecked Sendable {
             }
             close(listener)
             self.served.signal()
-        }
+        }.start()
     }
 
     /// The request head the probe sent, once the reply has gone out.
