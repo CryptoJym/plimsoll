@@ -133,6 +133,16 @@ function editRun(input: CoverageInput, line: string, replace: (line: string) => 
   });
 }
 
+/** Insert a new step just before the step whose run script has `line`. */
+function insertStepBefore(input: CoverageInput, line: string, step: Record<string, unknown>) {
+  return editWorkflow(input, (document) => {
+    const found = findStep(document, line);
+    const steps = found.job.get("steps", true);
+    if (!isSeq(steps)) throw new Error("fixture job has no steps");
+    steps.items.splice(found.index, 0, document.createNode(step));
+  });
+}
+
 function setStepKey(input: CoverageInput, line: string, key: string, value: unknown) {
   return editWorkflow(input, (document) => findStep(document, line).step.set(key, value));
 }
@@ -437,7 +447,9 @@ export const FIXTURES: Fixture[] = [
     describe: "a proof runs before the gate in the gate's own step",
     build: (input) => {
       const [t] = fixtureTargets(input);
-      return { input: editRun(input, "pnpm proof:ci-coverage", (line) => [line.replace("pnpm proof:ci-coverage", t!.line), line]), gateNotFirst: true };
+      const gateLine = proofCiCoverage(input).units.find((unit) => unit.unit === GATE_ENTRY)?.covered[0]?.command;
+      if (!gateLine) throw new Error("the gate is not run by CI");
+      return { input: editRun(input, gateLine, (line) => [line.replace(gateLine, t!.line), line]), gateNotFirst: true };
     },
   },
   {
@@ -607,6 +619,61 @@ export const FIXTURES: Fixture[] = [
     expectGateGreen: true,
     describe: "the proof's package script runs `node --expose-gc --import tsx <file>`",
     build: onTarget((input, t) => withScripts(input, { [t.script]: `node --expose-gc --import tsx ${t.unit}` }), "covered"),
+  },
+  // ---- Review 2: workflow lines must be canonical -------------------------
+  {
+    name: "review2_expression_after_the_proof_command",
+    origin: "review2",
+    expectGateGreen: false,
+    describe: "the proof line gains `${{ vars.PROOF_ARGS }}`; a repository variable `|| true` would hide failures",
+    build: rejectedOnTarget((input, t) => editRun(input, t.line, (line) => [line + " ${{ vars.PROOF_ARGS }}"]), /pastes a GitHub expression/),
+  },
+  {
+    name: "review2_expression_echoed_before_the_proof",
+    origin: "review2",
+    expectGateGreen: false,
+    describe: "the proof step first echoes the pull request title, which can end the script",
+    build: rejectedOnTarget(
+      (input, t) => editRun(input, t.line, (line) => [line.replace(t.line, 'echo "Checking ${{ github.event.pull_request.title }}"'), line]),
+      /pastes a GitHub expression/,
+    ),
+  },
+  {
+    name: "expression_in_an_earlier_step",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "an earlier step in the proof job echoes the pull request title",
+    build: rejectedOnTarget(
+      (input, t) => insertStepBefore(input, t.line, { name: "Show the pull request title", run: 'echo "${{ github.event.pull_request.title }}"' }),
+      /pastes a GitHub expression/,
+    ),
+  },
+  {
+    name: "review2_heredoc_with_a_partly_quoted_delimiter",
+    origin: "review2",
+    expectGateGreen: false,
+    describe: "a heredoc whose delimiter bash reads differently swallows the proof line",
+    build: rejectedOnTarget(
+      (input, t) => editRun(input, t.line, (line) => [line.replace(t.line, 'cat <<"E"OF'), line.replace(t.line, "E"), line, line.replace(t.line, "EOF")]),
+      /heredocs are not allowed/,
+    ),
+  },
+  {
+    name: "head_sha_expression_counts",
+    origin: "gate",
+    expectGateGreen: true,
+    describe: "the proof line passes the head-SHA expression as an argument",
+    build: onTarget((input, t) => editRun(input, t.line, (line) => [line + ' -- --commit "${{ github.event.pull_request.head.sha || github.sha }}"']), "covered"),
+  },
+  {
+    name: "assignment_prefix_and_redirect_count",
+    origin: "gate",
+    expectGateGreen: true,
+    describe: "the proof line sets a plain variable and saves its output to a file",
+    build: onTarget(
+      (input, t) => editRun(input, t.line, (line) => [line.replace(t.line, `PLIMSOLL_PROOF_HOME="$TMPDIR" ${t.line} > evidence/fixture-proof.json`)]),
+      "covered",
+    ),
   },
 ];
 

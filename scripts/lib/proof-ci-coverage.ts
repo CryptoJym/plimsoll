@@ -2,17 +2,18 @@ import fs from "node:fs";
 import path from "node:path";
 
 import {
+  INERT_EXPRESSION,
   RUN_PROOF_WRAPPER,
   isRepoFile,
   mentionedWords,
   normalizeFile,
   packageScriptForm,
   runnerInvocation,
+  workflowLineForm,
   type Problem,
 } from "./canonical-commands";
-import { modelWorkflow } from "./ci-workflow-model";
+import { modelWorkflow, type WorkflowStep } from "./ci-workflow-model";
 import { PROOF_SUITES, readProofSuites } from "./proof-suites";
-import { analyzeErrexitScript } from "./shell-commands";
 
 /**
  * Which proofs CI actually runs (eco-6hoxj.163.23).
@@ -25,20 +26,25 @@ import { analyzeErrexitScript } from "./shell-commands";
  * proof script must be canonical (scripts/lib/canonical-commands.ts): exactly
  * one runner invocation of one file, or a pure alias of another script. A
  * unit is covered only when a workflow step that provably runs on every
- * successful push/PR to main executes a command that reaches it (by entry
- * file, or through canonical package scripts), or when
+ * successful push/PR to main executes a canonical line that reaches it (by
+ * entry file, or through canonical package scripts), or when
  * scripts/proof-suites.json declares it as a sub-proof of a suite CI runs.
- * Every other unit needs a reviewed entry in scripts/proof-local-only.json.
+ * Every line of a step that names a proof must be canonical, and no step up
+ * to the job's last proof step may interpolate `${{ }}` other than the head
+ * SHA. Every other unit needs a reviewed entry in scripts/proof-local-only.json.
  */
 
 export const WORKFLOW_DIRECTORY = ".github/workflows";
 export const PROOF_EXCEPTIONS = "scripts/proof-local-only.json";
 export const GATE_ENTRY = "scripts/ci-coverage-proof.ts";
 const PROOF_SCRIPT = /^proof(?::|$)/;
+/** pnpm's own commands: `pnpm <name>` runs these, not a package script of the same name. */
 const PNPM_BUILTINS = new Set([
-  "add", "audit", "bin", "config", "create", "deploy", "dlx", "env", "fetch", "i", "import", "init",
-  "install", "licenses", "link", "list", "ls", "outdated", "pack", "patch", "prune", "publish",
-  "rebuild", "remove", "rm", "root", "server", "setup", "store", "unlink", "up", "update", "why",
+  "add", "approve-builds", "audit", "bin", "c", "cat-file", "cat-index", "config", "create", "dedupe", "deploy",
+  "dlx", "doctor", "env", "exec", "fetch", "find-hash", "help", "i", "ignored-builds", "import", "init", "install",
+  "install-test", "it", "licenses", "link", "list", "ln", "ls", "m", "multi", "outdated", "pack", "patch",
+  "patch-commit", "patch-remove", "prune", "publish", "rb", "rebuild", "recursive", "remove", "restart", "rm", "root",
+  "run", "self-update", "server", "setup", "store", "un", "uni", "uninstall", "unlink", "up", "update", "upgrade", "why",
 ]);
 
 export type CoverageInput = {
@@ -60,7 +66,7 @@ export type Invocation = {
   job: string;
   step: string;
   stepIndex: number;
-  /** Position of the command within its step's script. */
+  /** Position of the command among its step's lines. */
   position: number;
   line: number;
   command: string;
@@ -91,31 +97,6 @@ export function isProofEntry(file: string) {
   const base = path.posix.basename(file);
   if (/(?:-proof|\.test)\.[cm]?[jt]s$/.test(base)) return true;
   return /^index\.[cm]?[jt]s$/.test(base) && path.posix.basename(path.posix.dirname(file)).endsWith("-proof");
-}
-
-/** Files and package scripts one simple command runs; empty when it is not a recognised runner. */
-export function commandTargets(words: Array<string | null>): { files: string[]; scripts: string[] } {
-  const none = { files: [], scripts: [] };
-  const [head, ...rest] = words;
-  if (head === null || head === undefined) return none;
-  if (head === "pnpm") {
-    const [sub, ...args] = rest;
-    if (sub === "run") return typeof args[0] === "string" ? { files: [], scripts: [args[0]] } : none;
-    if (sub === "exec") return commandTargets(args);
-    if (typeof sub !== "string" || sub.startsWith("-") || PNPM_BUILTINS.has(sub)) return none;
-    return { files: [], scripts: [sub] };
-  }
-  if (head === "npm") return rest[0] === "run" && typeof rest[1] === "string" ? { files: [], scripts: [rest[1]] } : none;
-  if (head === "npx") {
-    const index = rest.findIndex((word) => word === null || !word.startsWith("-"));
-    return index === -1 ? none : commandTargets(rest.slice(index));
-  }
-  if (head === "tsx" || head === "node") {
-    if (rest.some((word) => word === null)) return none;
-    const invocation = runnerInvocation(words as string[]);
-    return "problem" in invocation ? none : { files: [invocation.file], scripts: [] };
-  }
-  return none;
 }
 
 type Resolved = { file: string; via: string[] } | Problem;
@@ -191,37 +172,77 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
   if (input.workflows.length === 0) errors.push(`no workflow files under ${WORKFLOW_DIRECTORY}: nothing runs any proof`);
   const models = input.workflows.map((workflow) => modelWorkflow(workflow.path, workflow.text));
   for (const model of models) errors.push(...model.errors);
+  const namesProof = (text: string) =>
+    text
+      .split("\n")
+      .filter((line) => !line.trim().startsWith("#"))
+      .some((line) =>
+        mentionedWords(line).some(
+          (word) => units.has(normalizeFile(word)) || PROOF_SCRIPT.test(word) || mentionsProof(input.scripts, units, word),
+        ),
+      );
   for (const model of models) {
-    for (const step of model.steps) {
-      if (step.run === null) continue;
-      const analysis = analyzeErrexitScript(step.run);
-      const executed = new Set(analysis.executed);
-      for (const [position, command] of analysis.seen.entries()) {
-        const targets = commandTargets(command.words);
-        const reached = new Map<string, string[]>();
-        for (const file of targets.files) reached.set(file, []);
-        for (const ref of targets.scripts) {
-          if (!Object.hasOwn(input.scripts, ref)) {
-            if (PROOF_SCRIPT.test(ref)) errors.push(`${model.path} step "${step.name}" runs \`pnpm ${ref}\`, which package.json does not define`);
-            continue;
-          }
-          const resolved = resolve(ref);
-          if ("problem" in resolved) {
-            // Proof scripts are reported once, in the inventory.
-            if (!PROOF_SCRIPT.test(ref) && mentionsProof(input.scripts, units, ref)) {
-              errors.push(`${model.path} step "${step.name}" runs \`pnpm ${ref}\`, which names a proof but is not a canonical command: ${resolved.problem}`);
-            }
-            continue;
-          }
-          if (!reached.has(resolved.file)) reached.set(resolved.file, resolved.via);
+    const jobs = new Map<string, WorkflowStep[]>();
+    for (const step of model.steps) jobs.set(step.job, [...(jobs.get(step.job) ?? []), step]);
+    for (const [job, steps] of jobs) {
+      const proofSteps = steps.filter((step) => step.run !== null && namesProof(step.run));
+      if (proofSteps.length === 0) continue;
+      // GitHub pastes `${{ }}` into a run script before bash reads it, so a
+      // value can add `|| true`, `exit 0` or a new line. From the first such
+      // step, no proof line later in the job can be trusted.
+      const lastProof = proofSteps.at(-1)!.stepIndex;
+      const tainted = steps.find(
+        (step) => step.stepIndex <= lastProof && step.run !== null && step.run.split(INERT_EXPRESSION).join("").includes("${{"),
+      );
+      if (tainted) {
+        errors.push(
+          `${model.path} job "${job}" step "${tainted.name}" pastes a GitHub expression into its script (only the head-SHA expression is allowed), so no proof at or after it counts`,
+        );
+      }
+      for (const step of proofSteps) {
+        const where = `${model.path} step "${step.name}"`;
+        const lines = step
+          .run!.split("\n")
+          .map((text, index) => ({ number: index + 1, text: text.trim() }))
+          .filter((line) => line.text !== "" && !line.text.startsWith("#"))
+          .map((line) => ({ ...line, form: workflowLineForm(line.text) }));
+        const bad = lines.find((line) => "problem" in line.form);
+        if (bad) {
+          errors.push(`${where} line ${bad.number} is not canonical (${(bad.form as Problem).problem}): ${bad.text}`);
+          continue;
         }
-        const invocation = { workflow: model.path, job: step.job, step: step.name, stepIndex: step.stepIndex, position, line: step.line, command: command.text };
-        const reason = step.notCovering ?? (executed.has(command) ? null : analysis.stoppedAt?.reason ?? "not a standalone reachable command");
-        for (const [target, via] of reached) {
-          const unit = units.get(target);
+        const reason =
+          step.notCovering ?? (tainted && tainted.stepIndex <= step.stepIndex ? `step "${tainted.name}" pastes a GitHub expression into its script` : null);
+        for (const [position, line] of lines.entries()) {
+          if (!("kind" in line.form) || line.form.kind !== "command") continue;
+          const words = line.form.words;
+          let reached: { file: string; via: string[] } | null = null;
+          let problem = "it names a proof but runs it in a form the gate does not count";
+          if (words[0] === "pnpm") {
+            const script = words[1] ?? "";
+            if (!script.startsWith("-") && !PNPM_BUILTINS.has(script) && Object.hasOwn(input.scripts, script)) {
+              const resolved = resolve(script);
+              if ("problem" in resolved) problem = `\`pnpm ${script}\` is not a canonical command: ${resolved.problem}`;
+              else reached = resolved;
+            } else if (PROOF_SCRIPT.test(script)) {
+              problem = `\`pnpm ${script}\`: package.json does not define it`;
+            }
+          } else {
+            const invocation = runnerInvocation(words);
+            if ("problem" in invocation) problem = invocation.problem;
+            else reached = { file: invocation.file, via: [] };
+          }
+          if (!reached) {
+            // A non-canonical proof script is reported once, in the inventory.
+            const reported = words[0] === "pnpm" && PROOF_SCRIPT.test(words[1] ?? "") && Object.hasOwn(input.scripts, words[1]!);
+            if (namesProof(line.text) && !reported) errors.push(`${where} line ${line.number}: ${problem}: ${line.text}`);
+            continue;
+          }
+          const unit = units.get(reached.file);
           if (!unit) continue;
-          if (reason) unit.ignored.push({ ...invocation, via, reason });
-          else unit.covered.push({ ...invocation, via });
+          const invocation = { workflow: model.path, job, step: step.name, stepIndex: step.stepIndex, position, line: step.line, command: line.text, via: reached.via };
+          if (reason) unit.ignored.push({ ...invocation, reason });
+          else unit.covered.push(invocation);
         }
       }
     }

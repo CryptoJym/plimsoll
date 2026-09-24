@@ -19,6 +19,19 @@
  * so a second statement, `;`, `&&`, `||`, a pipe, a redirection, quoting, an
  * expansion, an environment prefix, `exit`, `trap` or any other flag (such as
  * `node --check`) makes the script non-canonical.
+ *
+ * A workflow `run:` line (GitHub runs the step with bash and errexit) is
+ * canonical when it is exactly one of:
+ *   [NAME=value ...] pnpm|node <args> [> file | >> file]
+ *   export NAME=value
+ * Args are plain words; values may also be "$VAR" or "$(mktemp -d <template>)".
+ * The one GitHub expression allowed is the head commit SHA,
+ * "${{ github.event.pull_request.head.sha || github.sha }}", as an argument:
+ * GitHub pastes every `${{ }}` into the script before bash reads it, and that
+ * one always expands to 40 hex digits. Blank lines and whole-line comments
+ * are skipped; anything else (other expressions, operators, heredocs, other
+ * quoting or expansions, line continuations, other commands, trailing
+ * comments) is not canonical.
  */
 
 export const LITERAL_WORD = /^[A-Za-z0-9_./:@%+,=-]+$/;
@@ -101,4 +114,110 @@ export function packageScriptForm(text: string): ScriptForm | Problem {
  */
 export function mentionedWords(text: string): string[] {
   return text.split(/[\s;&|()<>'"`$={}\\]+/).filter(Boolean);
+}
+
+export const INERT_EXPRESSION = "${{ github.event.pull_request.head.sha || github.sha }}";
+
+export type WorkflowLine =
+  | { kind: "export"; name: string }
+  | { kind: "command"; assignments: string[]; words: string[] };
+
+type Segment = "literal" | "sha" | "var" | "mktemp";
+type LineWord = { text: string; segments: Set<Segment> } | { redirect: ">" | ">>" };
+
+function outsideForm(rest: string): Problem {
+  if (rest.startsWith("${{") || rest.startsWith('"${{')) {
+    return { problem: "GitHub pastes `${{ … }}` into the script before bash reads it; only the head-SHA expression is allowed" };
+  }
+  if (/^\d*<</.test(rest)) return { problem: "heredocs are not allowed" };
+  if (rest.startsWith("#")) return { problem: "trailing comments are not allowed" };
+  if (rest === "\\") return { problem: "line continuations are not allowed" };
+  if (/^[;&|]/.test(rest)) return { problem: `operator \`${rest.slice(0, 2).trim()}\` is not allowed` };
+  return { problem: `\`${rest.slice(0, 32)}\` is outside the canonical form` };
+}
+
+function scanLine(line: string): LineWord[] | Problem {
+  const words: LineWord[] = [];
+  let i = 0;
+  while (i < line.length) {
+    if (line[i] === " " || line[i] === "\t") {
+      i += 1;
+      continue;
+    }
+    const redirect = /^>>?(?=[ \t])/.exec(line.slice(i));
+    if (redirect) {
+      words.push({ redirect: redirect[0] as ">" | ">>" });
+      i += redirect[0].length;
+      continue;
+    }
+    let text = "";
+    const segments = new Set<Segment>();
+    while (i < line.length && line[i] !== " " && line[i] !== "\t") {
+      const rest = line.slice(i);
+      const literal = /^[A-Za-z0-9_./:@%+,=-]+/.exec(rest);
+      const variable = /^"\$(?:([A-Za-z_][A-Za-z0-9_]*)|\{([A-Za-z_][A-Za-z0-9_]*)\})"/.exec(rest);
+      const mktemp = /^"\$\(mktemp -d [A-Za-z0-9_./-]+\)"/.exec(rest);
+      let taken: string;
+      if (literal) {
+        taken = literal[0];
+        text += taken;
+        segments.add("literal");
+      } else if (rest.startsWith(`"${INERT_EXPRESSION}"`)) {
+        taken = `"${INERT_EXPRESSION}"`;
+        text += "<head-sha>";
+        segments.add("sha");
+      } else if (variable) {
+        taken = variable[0];
+        text += `$${variable[1] ?? variable[2]}`;
+        segments.add("var");
+      } else if (mktemp) {
+        taken = mktemp[0];
+        text += "<mktemp>";
+        segments.add("mktemp");
+      } else {
+        return outsideForm(rest);
+      }
+      i += taken.length;
+    }
+    words.push({ text, segments });
+  }
+  return words;
+}
+
+const only = (word: LineWord, allowed: Segment[]) =>
+  "text" in word && [...word.segments].every((segment) => allowed.includes(segment));
+
+/** The canonical form of one workflow `run:` line, or why it is not canonical. */
+export function workflowLineForm(line: string): WorkflowLine | Problem {
+  const scanned = scanLine(line);
+  if ("problem" in scanned) return scanned;
+  const words = [...scanned];
+  const first = words[0];
+  if (first && "text" in first && first.text === "export") {
+    const assignment = words[1];
+    if (words.length !== 2 || !assignment || !("text" in assignment) || !ASSIGNMENT.test(assignment.text)) {
+      return { problem: "`export` must set exactly one NAME=value" };
+    }
+    if (!only(assignment, ["literal", "var", "mktemp"])) return { problem: "`export` value must be a word, \"$VAR\" or \"$(mktemp -d …)\"" };
+    return { kind: "export", name: assignment.text.slice(0, assignment.text.indexOf("=")) };
+  }
+  const assignments: string[] = [];
+  while (words[0] && "text" in words[0] && ASSIGNMENT.test(words[0].text)) {
+    if (!only(words[0], ["literal", "var"])) return { problem: "an assignment value must be a word or \"$VAR\"" };
+    assignments.push(words[0].text.slice(0, words[0].text.indexOf("=")));
+    words.shift();
+  }
+  const redirect = words.at(-2);
+  if (redirect && "redirect" in redirect) {
+    if (!only(words.at(-1)!, ["literal"])) return { problem: "a redirection must name a plain file" };
+    words.splice(-2, 2);
+  }
+  if (words.some((word) => "redirect" in word)) return { problem: "the only redirection allowed is a final `> file` or `>> file`" };
+  const [command, ...args] = words as Array<Extract<LineWord, { text: string }>>;
+  if (!command || !only(command, ["literal"]) || (command.text !== "pnpm" && command.text !== "node")) {
+    return { problem: `\`${command?.text ?? ""}\` is not an allowed command (pnpm or node)` };
+  }
+  const bad = args.find((arg) => !only(arg, ["literal", "sha"]));
+  if (bad) return { problem: `argument \`${bad.text}\` must be a plain word or the head-SHA expression` };
+  return { kind: "command", assignments, words: [command.text, ...args.map((arg) => arg.text)] };
 }
