@@ -76,6 +76,19 @@ function readsProcessEnvironment(source: string, name: string) {
   return new RegExp("process\\.env(?:\\." + escaped + "(?![A-Za-z0-9_])|\\[\\s*[\"'`]" + escaped + "[\"'`]\\s*\\])").test(source);
 }
 
+/** A `needs` declaration must name an input read by the proof, not one it writes or treats as optional. */
+function requiresProcessEnvironment(source: string, name: string) {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const access = new RegExp("process\\.env(?:\\." + escaped + "(?![A-Za-z0-9_])|\\[\\s*[\"'`]" + escaped + "[\"'`]\\s*\\])", "g");
+  for (const match of source.matchAll(access)) {
+    const before = source.slice(Math.max(0, match.index - 12), match.index);
+    const after = source.slice(match.index + match[0].length).trimStart();
+    if (/\bdelete\s*$/.test(before) || /^=(?!=)/.test(after) || /^\?\./.test(after) || /^\?\?\s*(?:[\d"'`]|true\b|false\b)/.test(after)) continue;
+    return true;
+  }
+  return false;
+}
+
 function proofOwnedEnvironmentProblems(source: string, names: string[], where: string, values?: Record<string, unknown> | null) {
   return names
     .filter((name) => !PROOF_ENV_ALLOWLIST.has(name) &&
@@ -585,8 +598,7 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
           const word = new RegExp(`(?<![A-Za-z0-9_])${need}(?![A-Za-z0-9_])`);
           const workflow = input.workflows.find((candidate) => word.test(candidate.text));
           if (workflow) return [`${workflow.path} mentions ${need}, so CI may provide it`];
-          const read = new RegExp(`process\\.env(?:\\.${need}(?![A-Za-z0-9_])|\\[\\s*["'\`]${need}["'\`]\\s*\\])`);
-          return read.test(source) ? [] : [`${unitId} does not read process.env.${need}`];
+          return requiresProcessEnvironment(source, need) ? [] : [`${unitId} does not require process.env.${need}`];
         });
         if (needProblems.length > 0) {
           errors.push(`${where}: ${needProblems.join("; ")} (local-only needs an input CI lacks; a red proof belongs under quarantined)`);

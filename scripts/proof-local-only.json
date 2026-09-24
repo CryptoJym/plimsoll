@@ -10,15 +10,6 @@
       "expires": "2026-10-24",
       "reason": "Needs the sealed 411-file v0.7.4 source (PLIMSOLL_OVERSIZED_LEGACY_SOURCE) and its sha256 manifest (PLIMSOLL_OVERSIZED_INPUT_MANIFEST), which the CI checkout does not provide. Run locally: git worktree add --detach ../plimsoll-v074 v0.7.4, write {\"files\":{path:sha256}} for its 411 tracked files, then tsx scripts/oversized-continuation-rollback-proof.ts with both variables set (PASS on 2026-09-24, 0.6 s). Wiring it in CI needs a v0.7.4 setup step verified without that checkout's node_modules."
     },
-    "scripts/session-sync-liveness-proof.ts": {
-      "owner": "eco-6hoxj.163.11",
-      "needs": [
-        "SESSION_SYNC_LIVENESS_ROWS"
-      ],
-      "reviewedOn": "2026-09-24",
-      "expires": "2026-10-24",
-      "reason": "Machine-dependent timing guard: the proof refuses to run unless syncing its 1M-row session takes over 1.5 s, then requires the health ping under 1.5 s. On Studio3 the sync takes 0.52 s (fails the guard; 4000000 rows passes with a 1.93 s sync and 14 ms ping); a reviewer host took 2.1 s and passed. Run locally with SESSION_SYNC_LIVENESS_ROWS sized for the host."
-    },
     "scripts/session-sync-upgrade-proof.ts": {
       "owner": "eco-6hoxj.163.15",
       "needs": [
@@ -31,6 +22,11 @@
     }
   },
   "quarantined": {
+    "scripts/session-sync-liveness-proof.ts": {
+      "owner": "eco-6hoxj.163.11",
+      "expires": "2026-10-24",
+      "reason": "Host speed makes the 1M-row timing floor red on Studio3 (0.52 s); 4M rows passed at 1.93 s with a 14 ms health ping. SESSION_SYNC_LIVENESS_ROWS is optional and defaults to 1M, so this is a dated quarantine, not a missing CI input."
+    },
     "scripts/resource-proof/concurrency-proof.ts": {
       "owner": "eco-6hoxj.163.31",
       "expires": "2026-10-07",

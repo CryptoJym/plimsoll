@@ -600,7 +600,7 @@ export const FIXTURES: Fixture[] = [
     describe: "a local-only entry names an input its proof never reads",
     build: (input) => ({
       input: asException(input, "localOnly", { owner: "fixture", needs: ["PLIMSOLL_FIXTURE_INPUT"], reason: "fixture" }),
-      error: /does not read process\.env\.PLIMSOLL_FIXTURE_INPUT/,
+      error: /does not require process\.env\.PLIMSOLL_FIXTURE_INPUT/,
     }),
     replayableOnTextualGate: false,
   },
@@ -629,6 +629,27 @@ export const FIXTURES: Fixture[] = [
     },
     replayableOnTextualGate: false,
   },
+  ...([
+    ["assigned_variable", "scripts/provider-capacity-adapters-proof.ts", "FAKE_BEHAVIOR"],
+    ["optional_knob", "scripts/otlp-intake-spool-proof.ts", "OTLP_SPOOL_PROOF_ONLY"],
+  ] as const).map(([name, unit, need]): Fixture => ({
+    name: `local_only_${name}_cannot_qualify`,
+    origin: "gate",
+    expectGateGreen: false,
+    describe: `${need} does not establish an input CI lacks`,
+    build: (input) => {
+      const edited = editRun(input, proofLine(input, unit), () => ["echo moved out of CI"]);
+      return {
+        input: withExceptions(edited, (exceptions) => {
+          exceptions.localOnly = { ...exceptions.localOnly, [unit]: {
+            owner: "fixture", needs: [need], reviewedOn: input.today,
+            expires: daysFromToday(input, MAX_QUARANTINE_DAYS), reason: "fixture",
+          } };
+        }),
+        error: new RegExp(`does not require process\\.env\\.${need}`),
+      };
+    },
+  })),
   {
     name: "local_only_stale_review_fresh_expiry",
     origin: "gate",
