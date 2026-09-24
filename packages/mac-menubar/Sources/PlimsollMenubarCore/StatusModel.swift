@@ -2,7 +2,7 @@ import Foundation
 
 /// What the menu shows, from the summary file and the liveness check.
 public enum CollectorState: Equatable, Sendable {
-    /// The run that wrote the summary answers on its port, and it is fresh.
+    /// The run that wrote the summary proves itself on its port, and it is fresh.
     case running(StatusSummary)
     /// The collector answers, but has not rewritten its summary lately.
     case notUpdating(StatusSummary, age: TimeInterval)
@@ -13,12 +13,13 @@ public enum CollectorState: Equatable, Sendable {
 }
 
 public enum CollectorMonitor {
-    /// Reads the summary, then asks whether the collector on its port is the
-    /// run that wrote it (its /healthz names the same instanceId).
+    /// Reads the summary, then asks whether the listener on its port proves
+    /// it is the run that wrote it (a fresh /healthz challenge answered with
+    /// the HMAC under the summary's key).
     public static func state(
         home: URL?,
         now: Date = Date(),
-        isLive: (StatusSummary) -> Bool = { LivenessProbe.answers(as: $0.instanceId, port: $0.port) }
+        isLive: (StatusSummary) -> Bool = { LivenessProbe.answers(for: $0) }
     ) -> CollectorState {
         switch SummaryFile.read(home: home) {
         case let .failure(problem):

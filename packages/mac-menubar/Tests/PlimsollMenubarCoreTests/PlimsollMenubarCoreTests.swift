@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import Testing
 @testable import PlimsollMenubarCore
@@ -30,6 +31,8 @@ struct PlimsollMenubarCoreTests {
         #expect(summary.totalOutputTokens == 50)
         #expect(summary.tokenCoveragePercent == 25)
         #expect(summary.updatedAt == Date(timeIntervalSince1970: 1_790_000_000))
+        #expect(summary.healthzKey == Data((0..<32).map { UInt8($0) }))
+        #expect(summary.collectorVersion == "0.7.38")
     }
 
     @Test func summaryCountersMayBeNullButNeverNegative() throws {
@@ -42,15 +45,33 @@ struct PlimsollMenubarCoreTests {
     }
 
     @Test(arguments: [
-        #"{"schema":"plimsoll.status-summary/v2","instanceId":"\#(instanceA)","port":49123,"updatedAt":"2026-09-21T14:13:20.000Z","stats":null}"#,
-        #"{"schema":"plimsoll.status-summary/v1","instanceId":"not-a-uuid","port":49123,"updatedAt":"2026-09-21T14:13:20.000Z","stats":null}"#,
-        #"{"schema":"plimsoll.status-summary/v1","instanceId":"\#(instanceA)","port":0,"updatedAt":"2026-09-21T14:13:20.000Z","stats":null}"#,
-        #"{"schema":"plimsoll.status-summary/v1","instanceId":"\#(instanceA)","port":49123,"updatedAt":"yesterday","stats":null}"#,
-        #"{"schema":"plimsoll.status-summary/v1","instanceId":"\#(instanceA)","port":49123,"updatedAt":"2026-09-21T14:13:20.000Z","stats":{"count":1.5}}"#,
+        summaryJSON(stats: "null").replacingOccurrences(of: "status-summary/v1", with: "status-summary/v2"),
+        summaryJSON(stats: "null").replacingOccurrences(of: instanceA, with: "not-a-uuid"),
+        summaryJSON(port: 0, stats: "null"),
+        summaryJSON(stats: "null", updatedAt: "yesterday"),
+        summaryJSON(stats: #"{"count":1.5,"tokenAttributedEvents":0,"totalInputTokens":0,"totalOutputTokens":0}"#),
         "not json",
         "[]",
     ])
     func summaryRejectsAnythingButTheCollectorsShape(json: String) {
+        #expect(throws: SummaryProblem.unreadable) { try StatusSummary(json: Data(json.utf8)) }
+    }
+
+    /// Review should-fix (round 4): the decoder ignored collectorVersion and
+    /// accepted unknown keys, so it did not match the exact schema it claimed.
+    @Test(arguments: [
+        summaryJSON().replacingOccurrences(of: #""collectorVersion":"0.7.38","#, with: ""),
+        summaryJSON().replacingOccurrences(of: #""0.7.38""#, with: #""""#),
+        summaryJSON().replacingOccurrences(of: #""0.7.38""#, with: "7"),
+        summaryJSON().replacingOccurrences(of: #""stats""#, with: #""note":1,"stats""#),
+        summaryJSON().replacingOccurrences(of: #""healthzKey":"\#(Vector.key)","#, with: ""),
+        summaryJSON(key: String(Vector.key.dropLast())),
+        summaryJSON(key: String(Vector.key.dropLast()) + "+"),
+        summaryJSON(stats: #"{"count":1,"tokenAttributedEvents":0,"totalInputTokens":0,"totalOutputTokens":0,"extra":2}"#),
+        summaryJSON(stats: #"{"count":1}"#),
+        summaryJSON(stats: "[]"),
+    ])
+    func summaryDecoderMatchesTheExactSchema(json: String) {
         #expect(throws: SummaryProblem.unreadable) { try StatusSummary(json: Data(json.utf8)) }
     }
 
@@ -162,10 +183,13 @@ struct PlimsollMenubarCoreTests {
         let home = try TemporaryHome(named: "home-\(token)")
         defer { home.remove() }
         let planted = [
-            #"{"schema":"plimsoll.status-summary/v1","instanceId":"\#(token)","port":49123,"updatedAt":"2026-09-21T14:13:20.000Z","stats":null}"#,
+            summaryJSON().replacingOccurrences(of: instanceA, with: token),
             summaryJSON().replacingOccurrences(of: #""stats""#, with: #""note":"x\#(token)y\n\#(token)","stats""#),
             summaryJSON().replacingOccurrences(of: #""plimsoll.status-summary/v1""#, with: #""\#(token)""#),
+            summaryJSON().replacingOccurrences(of: #""0.7.38""#, with: #""\#(token)""#),
             "Error: \(token)\n\(token.prefix(21))\n\(token.suffix(22))",
+            // A valid summary: its own 43-character healthzKey is never shown.
+            summaryJSON(count: 5),
         ]
         var shown: [String] = []
         for text in planted {
@@ -180,41 +204,95 @@ struct PlimsollMenubarCoreTests {
         #expect(!shown.isEmpty)
         for line in shown {
             #expect(line.range(of: "[A-Za-z0-9_-]{20,}", options: .regularExpression) == nil, "\(line)")
+            #expect(!line.contains(Vector.key))
         }
     }
 
-    // MARK: Liveness is bound to the run that wrote the summary
+    // MARK: Liveness is proven by the run that wrote the summary
 
-    @Test(arguments: [
-        (200, #"{"ok":true,"instanceId":"\#(instanceA)"}"#, true),
-        (200, #"{"instanceId":"\#(instanceA)","ok":true}"#, true),
-        (200, #"{"ok":true}"#, false), // any other service's common health reply
-        (200, #"{"ok":true,"instanceId":"\#(instanceB)"}"#, false), // another collector run
-        (200, #"{"ok":true,"instanceId":"\#(instanceA)","note":1}"#, false), // not the exact shape
-        (200, #"{"ok":1,"instanceId":"\#(instanceA)"}"#, false),
-        (200, #"{"ok":false,"instanceId":"\#(instanceA)"}"#, false),
-        (200, "OK", false),
-        (401, #"{"ok":true,"instanceId":"\#(instanceA)"}"#, false),
-    ])
-    func onlyTheCollectorsExactReplyNamesThisRun(statusCode: Int, body: String, live: Bool) {
-        #expect(LivenessProbe.isCollectorReply(statusCode: statusCode, body: Data(body.utf8), instanceId: instanceA) == live)
+    /// The collector's proof:status-summary pins the same vector, so the app
+    /// and the collector compute the same HMAC over the same message.
+    @Test func healthzProofMatchesTheCollectorsTestVector() throws {
+        #expect(collectorProof(challenge: Vector.challenge, port: Vector.port) == Vector.proof)
+        let summary = try StatusSummary(json: Data(summaryJSON(port: Vector.port).utf8))
+        let reply = Data(#"{"ok":true,"instanceId":"\#(instanceA)","proof":"\#(Vector.proof)"}"#.utf8)
+        #expect(LivenessProbe.isCollectorReply(statusCode: 200, body: reply, summary: summary, challenge: Vector.challenge))
     }
 
-    @Test func probeRecognisesTheCollectorRunAndSendsNoCredential() throws {
-        let responder = try LoopbackResponder(reply: healthzReply(#"{"ok":true,"instanceId":"\#(instanceA)"}"#))
+    /// Review blocker (round 4): `{"ok":true,"instanceId":<the summary's id>}`
+    /// was enough, and that id is public. Only the HMAC of this challenge under
+    /// the summary's key, for this port, names the run now.
+    @Test func onlyTheCollectorsProofOfThisChallengeNamesThisRun() throws {
+        let summary = try StatusSummary(json: Data(summaryJSON(port: Vector.port).utf8))
+        let proof = Vector.proof
+        let accepted = [
+            #"{"ok":true,"instanceId":"\#(instanceA)","proof":"\#(proof)"}"#,
+            #"{"proof":"\#(proof)","instanceId":"\#(instanceA)","ok":true}"#,
+        ]
+        let refused: [(String, Int, String)] = [
+            ("the public id alone (the round-3 reply)", 200, #"{"ok":true,"instanceId":"\#(instanceA)"}"#),
+            ("any other service's common health reply", 200, #"{"ok":true}"#),
+            ("another collector run", 200, #"{"ok":true,"instanceId":"\#(instanceB)","proof":"\#(proof)"}"#),
+            ("an earlier answer to another challenge", 200,
+             #"{"ok":true,"instanceId":"\#(instanceA)","proof":"\#(collectorProof(challenge: otherChallenge, port: Vector.port))"}"#),
+            ("an answer relayed from another port", 200,
+             #"{"ok":true,"instanceId":"\#(instanceA)","proof":"\#(collectorProof(challenge: Vector.challenge, port: Vector.port + 1))"}"#),
+            ("a proof under another key", 200,
+             #"{"ok":true,"instanceId":"\#(instanceA)","proof":"\#(collectorProof(challenge: Vector.challenge, port: Vector.port, key: otherKey))"}"#),
+            ("not the exact shape", 200, #"{"ok":true,"instanceId":"\#(instanceA)","proof":"\#(proof)","note":1}"#),
+            ("ok is not the boolean true", 200, #"{"ok":1,"instanceId":"\#(instanceA)","proof":"\#(proof)"}"#),
+            ("ok is false", 200, #"{"ok":false,"instanceId":"\#(instanceA)","proof":"\#(proof)"}"#),
+            ("a truncated proof", 200, #"{"ok":true,"instanceId":"\#(instanceA)","proof":"\#(proof.dropLast())"}"#),
+            ("a proof that is not base64url", 200, #"{"ok":true,"instanceId":"\#(instanceA)","proof":"\#(proof.dropLast())+"}"#),
+            ("an error status", 401, #"{"ok":true,"instanceId":"\#(instanceA)","proof":"\#(proof)"}"#),
+            ("not JSON", 200, "OK"),
+        ]
+        for body in accepted {
+            #expect(LivenessProbe.isCollectorReply(statusCode: 200, body: Data(body.utf8), summary: summary, challenge: Vector.challenge))
+        }
+        for (why, statusCode, body) in refused {
+            let named = LivenessProbe.isCollectorReply(
+                statusCode: statusCode, body: Data(body.utf8), summary: summary, challenge: Vector.challenge
+            )
+            #expect(!named, "\(why)")
+        }
+    }
 
-        #expect(LivenessProbe.answers(as: instanceA, port: responder.port))
+    @Test func probeRecognisesTheCollectorRunAndSendsNoCredentialOrKey() throws {
+        let responder = try LoopbackResponder(respond: collector)
+        let summary = try StatusSummary(json: Data(summaryJSON(port: responder.port).utf8))
+
+        #expect(LivenessProbe.answers(for: summary))
         let request = try #require(responder.request())
-        #expect(request.hasPrefix("GET /healthz HTTP/1.1\r\n"))
+        #expect(challenge(in: request) != nil)
+        #expect(!request.contains(Vector.key))
         for header in ["x-plimsoll-token", "authorization", "cookie"] {
             #expect(!request.lowercased().contains(header))
         }
     }
 
-    /// Review finding B6: a non-collector loopback service answering the
-    /// common `{"ok":true}` on the summary's port was shown as Running, and
-    /// Open Dashboard would have handed it the collector's origin.
-    @Test(arguments: [#"{"ok":true}"#, #"{"ok":true,"instanceId":"\#(instanceB)"}"#])
+    @Test func eachProbeSendsAFreshChallenge() throws {
+        var sent: [String] = []
+        for _ in 0..<2 {
+            let responder = try LoopbackResponder(respond: collector)
+            let summary = try StatusSummary(json: Data(summaryJSON(port: responder.port).utf8))
+            #expect(LivenessProbe.answers(for: summary))
+            let request = try #require(responder.request())
+            sent.append(try #require(challenge(in: request)))
+        }
+        #expect(Set(sent).count == 2)
+    }
+
+    /// Review finding B6, then the round-4 blocker: a non-collector loopback
+    /// service on the summary's port was shown as Running, and Open Dashboard
+    /// would have handed it the collector's origin. That includes one that
+    /// replays the public instanceId or an earlier proof.
+    @Test(arguments: [
+        #"{"ok":true}"#,
+        #"{"ok":true,"instanceId":"\#(instanceB)"}"#,
+        #"{"ok":true,"instanceId":"\#(instanceA)"}"#,
+        #"{"ok":true,"instanceId":"\#(instanceA)","proof":"\#(Vector.proof)"}"#,
+    ])
     func anotherLoopbackServiceIsNotTheCollector(reply: String) throws {
         let responder = try LoopbackResponder(reply: healthzReply(reply))
         let home = try TemporaryHome()
@@ -229,6 +307,25 @@ struct PlimsollMenubarCoreTests {
         #expect(responder.request() != nil)
     }
 
+    /// Round-4 blocker, as the review reproduced it: a process that knows the
+    /// public instanceId and answers each challenge, but not with the file's key.
+    @Test func aResponderWithoutTheKeyIsNotTheCollector() throws {
+        let impostor = try LoopbackResponder(respond: { head, port in
+            let proof = collectorProof(challenge: challenge(in: head) ?? "", port: port, key: otherKey)
+            return healthzReply(#"{"ok":true,"instanceId":"\#(instanceA)","proof":"\#(proof)"}"#)
+        })
+        let home = try TemporaryHome()
+        defer { home.remove() }
+        try home.writeSummary(summaryJSON(port: impostor.port, count: 7, updatedAt: isoNow()))
+
+        let state = CollectorMonitor.state(home: home.url)
+        guard case .stopped = state else {
+            Issue.record("\(state) is not Stopped"); return
+        }
+        #expect(StatusLines(state: state).dashboard == nil)
+        #expect(impostor.request() != nil)
+    }
+
     /// Swift Testing runs every test on the Swift concurrency pool: one thread
     /// per core, three on a GitHub macOS runner. When all of them are blocked,
     /// Dispatch starts no thread for DispatchQueue.global() work, so a status
@@ -239,7 +336,7 @@ struct PlimsollMenubarCoreTests {
         let running = try await withThrowingTaskGroup(of: Bool.self) { group in
             for _ in 0..<callers {
                 group.addTask {
-                    let responder = try LoopbackResponder(reply: healthzReply(#"{"ok":true,"instanceId":"\#(instanceA)"}"#))
+                    let responder = try LoopbackResponder(respond: collector)
                     let home = try TemporaryHome()
                     defer { home.remove() }
                     try home.writeSummary(summaryJSON(port: responder.port, updatedAt: isoNow()))
@@ -257,15 +354,17 @@ struct PlimsollMenubarCoreTests {
 
     @Test func probeReportsStoppedWhenNothingListens() throws {
         let port = try LoopbackResponder.unusedPort()
+        let summary = try StatusSummary(json: Data(summaryJSON(port: port).utf8))
         let started = Date()
 
-        #expect(!LivenessProbe.answers(as: instanceA, port: port))
+        #expect(!LivenessProbe.answers(for: summary))
         #expect(Date().timeIntervalSince(started) < LivenessProbe.timeout)
     }
 
     @Test func probeNeverContactsPortsOutsideTheTCPRange() {
-        #expect(!LivenessProbe.answers(as: instanceA, port: 0))
-        #expect(!LivenessProbe.answers(as: instanceA, port: 70_000))
+        let key = Data((0..<32).map { UInt8($0) })
+        #expect(!LivenessProbe.answers(port: 0, instanceId: instanceA, key: key))
+        #expect(!LivenessProbe.answers(port: 70_000, instanceId: instanceA, key: key))
     }
 
     // MARK: What the sources can do
@@ -362,13 +461,49 @@ struct PlimsollMenubarCoreTests {
 
 private let instanceA = "0f5b9a52-3c1e-4a8b-9d2e-6f7a8b9c0d1e"
 
+/// The shared /healthz proof test vector; the collector's proof:status-summary
+/// pins the same values. The key is bytes 0...31.
+private enum Vector {
+    static let key = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+    static let port = 49123
+    static let challenge = "ICEiIyQlJicoKSorLC0uLzAxMjM0NTY3ODk6Ozw9Pj8"
+    static let proof = "lnozo0nCndram-7O1AV5MwmsEMnovjQYlD58Bw5wX0U"
+}
+
+/// Another run's key (bytes 100...131) and another challenge.
+private let otherKey = "ZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXp7fH1-f4CBgoM"
+private let otherChallenge = String(repeating: "A", count: 43)
+
 /// A summary exactly as the collector writes it, written at 1_790_000_000.
 private func summaryJSON(
     port: Int = 49123, count: Int = 0, tokenEvents: Int = 0, input: Int = 0, output: Int = 0, stats: String? = nil,
-    updatedAt: String = "2026-09-21T14:13:20.000Z"
+    updatedAt: String = "2026-09-21T14:13:20.000Z", key: String = Vector.key
 ) -> String {
     let counters = stats ?? #"{"count":\#(count),"tokenAttributedEvents":\#(tokenEvents),"totalInputTokens":\#(input),"totalOutputTokens":\#(output)}"#
-    return #"{"schema":"plimsoll.status-summary/v1","instanceId":"\#(instanceA)","collectorVersion":"0.7.38","port":\#(port),"updatedAt":"\#(updatedAt)","stats":\#(counters)}"#
+    return #"{"schema":"plimsoll.status-summary/v1","instanceId":"\#(instanceA)","healthzKey":"\#(key)","collectorVersion":"0.7.38","port":\#(port),"updatedAt":"\#(updatedAt)","stats":\#(counters)}"#
+}
+
+/// The collector's /healthz proof, computed here with CryptoKit apart from
+/// the app's code (the test vector pins it).
+private func collectorProof(challenge: String, port: Int, instanceId: String = instanceA, key: String = Vector.key) -> String {
+    let keyBytes = Data(base64Encoded: key.replacingOccurrences(of: "-", with: "+").replacingOccurrences(of: "_", with: "/") + "=")!
+    let message = Data("plimsoll.healthz-proof/v1\n\(port)\n\(instanceId)\n\(challenge)".utf8)
+    let code = HMAC<SHA256>.authenticationCode(for: message, using: SymmetricKey(data: keyBytes))
+    return Data(code).base64EncodedString()
+        .replacingOccurrences(of: "+", with: "-").replacingOccurrences(of: "/", with: "_").replacingOccurrences(of: "=", with: "")
+}
+
+/// The challenge a probe's request head carries, if it is the exact form.
+private func challenge(in head: String) -> String? {
+    guard let line = head.range(of: #"^GET /healthz\?challenge=[A-Za-z0-9_-]{43} HTTP/1\.1\r\n"#, options: .regularExpression)
+    else { return nil }
+    return String(head[line].dropFirst("GET /healthz?challenge=".count).prefix(43))
+}
+
+/// How the collector run holding the fixture key answers a probe.
+private let collector: @Sendable (String, Int) -> String = { head, port in
+    let proof = collectorProof(challenge: challenge(in: head) ?? "", port: port)
+    return healthzReply(#"{"ok":true,"instanceId":"\#(instanceA)","proof":"\#(proof)"}"#)
 }
 
 private func isoNow() -> String {
@@ -412,16 +547,21 @@ private struct TemporaryHome: Sendable {
 }
 
 /// A one-shot HTTP responder on 127.0.0.1: it accepts one connection, keeps
-/// the request head, sends a canned reply and closes.
+/// the request head, sends a reply made from the head and its port, and closes.
 private final class LoopbackResponder: @unchecked Sendable {
     let port: Int
     private let served = DispatchSemaphore(value: 0)
     // Written once before `served` is signalled; read only after waiting on it.
     private var head: String?
 
-    init(reply: String) throws {
+    convenience init(reply: String) throws {
+        try self.init(respond: { _, _ in reply })
+    }
+
+    init(respond: @escaping @Sendable (_ head: String, _ port: Int) -> String) throws {
         let listener = try Self.listeningSocket()
-        port = try Self.boundPort(listener)
+        let port = try Self.boundPort(listener)
+        self.port = port
         // Its own thread, not DispatchQueue.global(): a test that blocks its
         // pool thread on the probe must not also wait on global-queue work
         // (see statusReadsFinishWhileEveryPoolThreadIsBlocked). It waits at
@@ -437,8 +577,9 @@ private final class LoopbackResponder: @unchecked Sendable {
                     if count <= 0 { break }
                     received += buffer[..<count]
                 }
-                self.head = String(decoding: received, as: UTF8.self)
-                _ = reply.withCString { write(connection, $0, strlen($0)) }
+                let head = String(decoding: received, as: UTF8.self)
+                self.head = head
+                _ = respond(head, port).withCString { write(connection, $0, strlen($0)) }
                 close(connection)
             }
             close(listener)

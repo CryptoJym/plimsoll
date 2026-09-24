@@ -26,25 +26,32 @@ the collector requires), otherwise `~/Library/Application Support/Plimsoll`.
 
 The running collector rewrites `status-summary.json` in its home every 15 s:
 four lifetime counters from its own `/status` cache, its port, a random
-per-run `instanceId`, its version and the write time (collector runbook
-`docs/runbooks/local-status-http.md`). The app opens that file without
-following a symlink, requires it to be the user's own private (0600) regular
-file of at most 16 KB, and parses it strictly. It then sends one
-`GET /healthz` to `127.0.0.1:<port>` from the file.
+per-run `instanceId`, a random per-run `healthzKey`, its version and the write
+time (collector runbook `docs/runbooks/local-status-http.md`). The app opens
+that file without following a symlink, requires it to be the user's own
+private (0600) regular file of at most 16 KB, and parses it exactly: those
+seven keys and no others, each of the right form. It then sends one
+`GET /healthz?challenge=<32 fresh random bytes, base64url>` to
+`127.0.0.1:<port>` from the file.
 
 The collector counts as running only if that reply is exactly:
 
 ```http
 HTTP/1.1 200
-{"ok":true,"instanceId":"<the instanceId in status-summary.json>"}
+{"ok":true,"instanceId":"<the instanceId in status-summary.json>","proof":"<HMAC>"}
 ```
 
-That means HTTP 200 and a JSON object with those two keys and no others,
-`ok` the boolean `true`, and `instanceId` equal to the id of the run that
-wrote the summary. Anything else is treated as not the collector, including
-another service answering the common `{"ok":true}` on that port, or an older
-or newer collector run. The summary stays on disk after the collector stops,
-and it can outlive a collector that no longer owns the port.
+That means HTTP 200 and a JSON object with those three keys and no others,
+`ok` the boolean `true`, `instanceId` equal to the id of the run that wrote
+the summary, and `proof` the base64url HMAC-SHA256, under the summary's
+`healthzKey`, of `plimsoll.healthz-proof/v1`, the port, the `instanceId` and
+this challenge (one per line), checked in constant time. Only the collector
+run and a reader of the private file hold the key, so anything else is not
+the collector: another service answering the common `{"ok":true}`, an older
+or newer collector run, a process that replays the public `instanceId` or an
+earlier answer after taking the port, or one relaying the challenge from
+another port. The summary stays on disk after the collector stops, and it
+can outlive a collector that no longer owns the port.
 
 It runs no collector command and starts no process. It never opens the
 ledger or the credential file, and never talks to the authenticated
@@ -87,10 +94,11 @@ with the dashboard URL or `null`, and exits without starting the app (exit
   overlapping. It costs the same on any ledger size, and the app cannot
   start, stop or reconfigure the collector.
 - No credential. The app never reads the credential file, and the
-  `/healthz` probe sends no credential, cookie or proxy header. Every line
-  it shows is fixed text around numbers; nothing from the file, the
-  environment or the network is displayed as text. Open Dashboard never
-  puts the credential in the URL.
+  `/healthz` probe sends no credential, cookie or proxy header. The
+  summary's `healthzKey` is used only to check the proof; it is never sent,
+  shown or printed. Every line it shows is fixed text around numbers;
+  nothing from the file, the environment or the network is displayed as
+  text. Open Dashboard never puts the credential in the URL.
 - Bounded. The probe allows 3 seconds and stays on 127.0.0.1 with no proxy
   or cache.
 - No shell, no child process, no helper, no LaunchAgent, no extra macOS
