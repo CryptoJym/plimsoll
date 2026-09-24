@@ -740,7 +740,10 @@ async function main() {
       { exactReceiptKeys, exactReceiptHealthKeys, serializedBytes: Buffer.byteLength(serialized), receiptBytes: Buffer.byteLength(persistedReceipt) },
     );
     for (let index = 0; index < 40; index += 1) await manager.supportBundle(`bounded-${String(index).padStart(2, "0")}`);
-    check("lifecycle_receipts_are_bounded_to_32", fs.readdirSync(path.join(support.paths.lifecycleRoot, "receipts")).filter((file) => file.endsWith(".json")).length === 32, fs.readdirSync(path.join(support.paths.lifecycleRoot, "receipts")).length);
+    // eco-6hoxj.163.49: no lifecycle command trims receipts; the install's and the first bundle's stay.
+    const supportReceipts = fs.readdirSync(path.join(support.paths.lifecycleRoot, "receipts")).filter((file) => file.endsWith(".json"));
+    check("lifecycle_receipts_are_never_trimmed", supportReceipts.length === 42 &&
+      supportReceipts.includes("support-install-update.json") && supportReceipts.includes("support-bundle-support_bundle.json"), supportReceipts.length);
     check("support_unknown_getters_are_never_invoked_across_repeated_bundles", support.supportGetterAccesses === 0, support.supportGetterAccesses);
     const sanitized = sanitizeSupportSnapshot({
       installedVersion: "0.6.0",

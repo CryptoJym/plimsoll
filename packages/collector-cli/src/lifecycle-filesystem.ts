@@ -32,7 +32,6 @@ import { isStatusSummaryTempFile } from "./status-summary";
 const FILE_MODE = 0o600;
 const DIRECTORY_MODE = 0o700;
 const EXECUTABLE_MODE = 0o700;
-const MAX_RECEIPTS = 32;
 const MAX_MARKER_BYTES = 64 * 1024;
 const MAX_MANIFEST_BYTES = 256 * 1024;
 const MAX_TREE_ENTRIES = 200_000;
@@ -401,8 +400,8 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
 
   /**
    * `--retention keep-all`: this adapter removes nothing an earlier operation
-   * left. Retention only previews (recorded as skipped_by_operator), trash
-   * entries stay, and display receipts are not trimmed.
+   * left. Retention only previews (recorded as skipped_by_operator) and trash
+   * entries stay.
    */
   private readonly keepAll: boolean;
 
@@ -827,20 +826,15 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     ensureDirectory(this.completedRoot, this.root);
     if (receipt.status !== "rollback_required" && receipt.status !== "refused") {
       // The durable, unbounded marker is the operation-ID authority. Commit
-      // it before the bounded display receipt so a stop between the two can
-      // never make a completed destructive operation reusable. A verified or
+      // it before the display receipt so a stop between the two can never
+      // make a completed destructive operation reusable. A verified or
       // rollback-complete journal can still reopen and finish receipt writing.
       // A refusal changed nothing, so its operation ID stays usable.
       writeJsonDurable(path.join(this.completedRoot, `${receipt.operationId}.json`), receipt, this.completedRoot);
     }
+    // Display receipts are never trimmed: a refused or rollback_required
+    // receipt is the only record of its operation.
     writeJsonDurable(path.join(this.receiptsRoot, `${receipt.operationId}-${receipt.operation}.json`), receipt, this.receiptsRoot);
-    if (this.keepAll) return;
-    const receipts = fs.readdirSync(this.receiptsRoot)
-      .filter((entry) => entry.endsWith(".json"))
-      .sort((left, right) => left.localeCompare(right));
-    for (const stale of receipts.slice(0, Math.max(0, receipts.length - MAX_RECEIPTS))) {
-      fs.rmSync(path.join(this.receiptsRoot, stale), { force: true });
-    }
   }
 
   async uninstallOwned(input: { apply: boolean }) {

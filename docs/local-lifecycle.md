@@ -266,8 +266,8 @@ decisions.
 
 **Keeping everything during an update.** `--retention keep-all` on `lifecycle
 update` or `lifecycle rollback` makes the operation remove nothing that
-existed before it: no snapshot, runtime, trash entry or display receipt (the
-`receipts/` directory is otherwise trimmed to its newest 32). Its receipt
+existed before it: no snapshot, runtime or trash entry (no lifecycle command
+removes a display receipt; see "Support output"). Its receipt
 records `retention.status: "skipped"` with `skippedReason:
 "skipped_by_operator"` and `wouldRemove`, what retention would have removed at
 that moment (absent when that read-only preview was blocked or failed). Managed rollout
@@ -334,8 +334,11 @@ prompts/responses/tool content, repository or account identifiers, cookies,
 tokens, signing material, install credentials, and workspace credentials have
 no output field.
 
-Lifecycle receipts are similarly symbolic and bounded to the newest 32 local
-records. `ownedTargets` reports what the operation previews or applies,
+Lifecycle receipts are similarly symbolic. Every operation keeps its display
+receipt in `lifecycle/receipts/` (`<operation-id>-<operation>.json`, a few KB
+each; a retry of the same operation replaces its own). No lifecycle command
+removes one, not even a prune: a refused or `rollback_required` receipt is the
+only record of its operation. `ownedTargets` reports what the operation previews or applies,
 `retainedTargets` reports what remains, and `purgeOnlyTargets` identifies data
 that only the separate purge operation may remove. They report state
 transitions and categories, never paths or secret values.
@@ -349,6 +352,7 @@ pnpm proof:lifecycle            # transaction primitives with injected adapters
 pnpm proof:lifecycle-operator   # real adapter composition + packaged CLI end to end
 pnpm proof:lifecycle-retention  # bounded retention, clone snapshots, disk refusal, prune
 pnpm proof:lifecycle-data-safety  # open writers, atomic restore, strict receipts, clock steps, removal records
+pnpm proof:lifecycle-preservation  # no command removes a receipt
 ```
 
 The primitive proof uses a fresh temporary ownership root and injected
@@ -401,3 +405,10 @@ unprovable order removes nothing; a process lost right after an unlink, or a
 receipt that cannot be written, still ends in a durable receipt naming the
 removal; preflight writes nothing; and the clone helper works from a
 detached session with no terminal.
+
+The preservation proof starts from more than 32 receipts, including a
+refused one, and runs a support bundle, uninstall and purge previews (also
+through the real CLI), a keep-all update, an update, a rollback, an update
+that rolls back, a prune while a `rollback_required` rollback is pending, and
+uninstall and purge applies: every receipt that existed before each command
+is still there, unchanged.
