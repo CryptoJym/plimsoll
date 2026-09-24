@@ -690,6 +690,18 @@ export type LifecycleCompletedOperation = {
 };
 
 const PRESERVED = ["ledger", "history", "credentials", "workspace_membership"] as const;
+/**
+ * The retained and purge-only target lists a receipt can name, as one pair:
+ * this release's, or the pair every release from 0.7.0 to 0.7.38 wrote before
+ * the status summary became a purge-only target.
+ */
+const RECEIPT_TARGET_LISTS: ReadonlyArray<{ retained: readonly string[]; purgeOnly: readonly string[] }> = [
+  { retained: LIFECYCLE_UNINSTALL_RETAINED_TARGETS, purgeOnly: LIFECYCLE_PURGE_ONLY_TARGETS },
+  {
+    retained: ["collector_config", "workspace_credentials", "ledger", "history", "lifecycle_snapshots", "workspace_membership"],
+    purgeOnly: ["collector_config", "workspace_credentials", "ledger", "history", "lifecycle_snapshots"],
+  },
+];
 const COMPLETED_OWNED_TARGETS = ["runtime", "service_manifest"] as const;
 const ROLLED_BACK_OWNED_TARGETS = ["runtime", "config", "database", "service_manifest"] as const;
 const RECEIPT_KEYS = [
@@ -794,8 +806,9 @@ export function parseCompletionReceipt(value: unknown, operationId: string): Lif
   if (typeof record.toolVersion !== "string" || !/^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$/.test(record.toolVersion)) return null;
   if ((operation !== "update" && operation !== "rollback") || (status !== "completed" && status !== "rolled_back")) return null;
   if (!(fromVersion === null || isIdentifier(fromVersion)) || !isIdentifier(toVersion)) return null;
-  if (!sameList(record.retainedTargets, LIFECYCLE_UNINSTALL_RETAINED_TARGETS) ||
-      !sameList(record.purgeOnlyTargets, LIFECYCLE_PURGE_ONLY_TARGETS) || !sameList(record.preserved, PRESERVED)) return null;
+  if (!RECEIPT_TARGET_LISTS.some((lists) =>
+        sameList(record.retainedTargets, lists.retained) && sameList(record.purgeOnlyTargets, lists.purgeOnly)) ||
+      !sameList(record.preserved, PRESERVED)) return null;
   if ("snapshot" in record && !validSnapshotRecord(record.snapshot)) return null;
   // Receipts that record a snapshot, retention or restore were written after
   // sequencing began, so each must carry its durable completion sequence.
