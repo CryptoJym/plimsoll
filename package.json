@@ -118,7 +118,7 @@
     "proof:producer-parity": "tsx scripts/producer-parity-proof.ts",
     "proof:authenticated-ingestion": "tsx scripts/run-proof.ts scripts/authenticated-ingestion-proof.ts",
     "proof:status-http-rollout": "tsx scripts/run-proof.ts scripts/status-http-rollout-proof.ts",
-    "proof:rejection-aggregation": "NODE_OPTIONS=--expose-gc tsx scripts/rejection-aggregation-proof.ts",
+    "proof:rejection-aggregation": "node --expose-gc --import tsx scripts/rejection-aggregation-proof.ts",
     "proof:ingest-liveness": "tsx scripts/ingest-liveness-proof.ts",
     "proof:privacy-mode": "tsx scripts/privacy-mode-proof.ts",
     "proof:system-e2e": "tsx scripts/system-e2e-proof.ts",
