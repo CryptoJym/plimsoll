@@ -547,7 +547,7 @@ export class DeliveryOutbox {
               requestIds,
             }) as { count: number; earliestSeconds: number | null });
       const lost = this.deadLetterSummary(epochStartedAt, epochStartMs);
-      const spoolLosses = (spool?.losses ?? []).filter((loss) => loss.atMs >= epochStartMs);
+      const spoolLosses = (spool?.losses ?? []).filter((loss) => loss.toMs >= epochStartMs);
       const unattested: CaptureUnattestedReason | null =
         control.migrationComplete !== 1 ? "migration_incomplete"
           : overBudget ? "over_row_budget"
@@ -568,8 +568,8 @@ export class DeliveryOutbox {
         ...frontier.gaps,
         ...lost.gaps,
         ...spoolLosses.map((loss) => ({
-          fromMs: Math.max(epochStartMs, loss.atMs - CAPTURE_WRITE_LAG_MS),
-          toMs: loss.atMs,
+          fromMs: Math.max(epochStartMs, loss.fromMs - CAPTURE_WRITE_LAG_MS),
+          toMs: loss.toMs,
         })),
       ]);
       this.db
@@ -589,7 +589,7 @@ export class DeliveryOutbox {
         through: throughMs === null ? null : new Date(throughMs).toISOString(),
         ...(unattested === null ? {} : { unattested }),
         pending: pending.count + (spool?.pendingFiles ?? 0),
-        dead: lost.dead + spoolLosses.length,
+        dead: lost.dead + spoolLosses.reduce((total, loss) => total + loss.count, 0),
         withheld: lost.withheld,
         gaps: gaps.map((gap) => ({ from: new Date(gap.fromMs).toISOString(), to: new Date(gap.toMs).toISOString() })),
       };

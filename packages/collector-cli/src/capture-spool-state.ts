@@ -13,7 +13,7 @@ export type CaptureSpoolState = {
   pendingFiles: number;
   /** Arrival time of the oldest of them, from its file name. */
   oldestPendingMs: number | null;
-  /** Accepted push files that will never reach the ledger. */
+  /** Accepted push files that will never reach the ledger, by arrival time (merged when old). */
   losses: SpoolLoss[];
   /** A spool directory or loss log exists but cannot be read. */
   unreadable: boolean;
