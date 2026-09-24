@@ -1220,8 +1220,10 @@ export class GrokUsageTailer {
     const resume = sweep.limitReached && sweep.groups && sweep.groups.length > 0
       ? String((sweep.origin + sweep.groupsVisited) % sweep.groups.length)
       : "0";
-    writeMaintenanceState(database, SWEEP_RESUME_KEY, resume);
-    this.persistedResume = resume;
+    if (resume !== this.persistedResume) {
+      writeMaintenanceState(database, SWEEP_RESUME_KEY, resume);
+      this.persistedResume = resume;
+    }
     result.exhaustive = clean;
     this.lastSweep = sweep;
     this.sweep = null;
