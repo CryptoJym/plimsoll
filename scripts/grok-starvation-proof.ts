@@ -14,6 +14,9 @@
  *
  * Fixture times are relative to now: the recent sessions were written an
  * hour ago, the rest weeks ago, so the proof means the same on any date.
+ * Time is virtual (scripts/lib/virtual-clock.ts): the slow calls charge
+ * their 220 ms and real work costs nothing, so a loaded host and a CI runner
+ * reach the same result.
  */
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -26,6 +29,7 @@ import { CollectorMaintenance } from "../packages/collector-cli/src/maintenance"
 import { RolloutTailer, type RolloutScanOptions } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
 import { DEFAULT_JSONL_TAILER_IO } from "../packages/collector-cli/src/jsonl-byte-tailer";
+import { installVirtualClock, spend } from "./lib/virtual-clock";
 
 const mode = process.argv.find((arg) => arg.startsWith("--expect="))?.split("=", 2)[1] ?? "green";
 const equalMtime = process.argv.includes("--equal-mtime");
@@ -125,9 +129,9 @@ function slowCodexTailer(buffer: LocalEventBuffer, root: string) {
     ...DEFAULT_JSONL_TAILER_IO,
     readTail: (...args: Parameters<typeof DEFAULT_JSONL_TAILER_IO.readTail>) => {
       // A single synchronous filesystem call on Studio0 can exceed the 200 ms
-      // cadence wall. Sleeping here models that call without touching live data.
+      // cadence wall. Charging it here models that call without touching live data.
       slowReads += 1;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 220);
+      spend(220);
       return DEFAULT_JSONL_TAILER_IO.readTail(...args);
     },
   };
@@ -150,6 +154,7 @@ function sourceTurn(buffer: LocalEventBuffer) {
 }
 
 async function main() {
+  installVirtualClock();
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-grok-starvation-proof-"));
   const home = path.join(root, ".grok");
   const codexRoot = path.join(root, ".codex", "sessions");
@@ -165,7 +170,7 @@ async function main() {
   };
   const realProjectionMaintenance = projection.runMaintenance.bind(projection);
   projection.runMaintenance = (...args: unknown[]) => {
-    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 220);
+    spend(220);
     return realProjectionMaintenance(...args);
   };
   const codexFixture = slowCodexTailer(buffer, codexRoot);

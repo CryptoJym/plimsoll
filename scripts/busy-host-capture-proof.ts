@@ -1,27 +1,36 @@
 /**
- * Busy-host capture proof (eco-6hoxj.163.42 round 2).
+ * Busy-host capture proof (eco-6hoxj.163.42, rounds 2 and 3).
  *
- * The round-1 review found three release blockers. Each scenario here is a
- * regression for one of them, built from the reviewer's probes:
+ * Each scenario is a regression for a reviewer finding, built from the
+ * reviewer's own construction:
  *
- *   progress   Admission is not progress. Repairs overrun the cadence by
- *              220 ms on every tick and every JSONL read stalls 120 ms, longer
- *              than any per-source slice; Codex, Claude and Grok must each
- *              still commit, within a bounded number of cadences.
- *   ceiling    The 200 ms aggregate wall is an admission ceiling: no capture
- *              or repair unit starts after it, and a tick ends within one
- *              bounded unit of it. Grok discovery of a 2,000-session group
- *              with a slow lstat stays inside the budget.
- *   lossless   Caps and recency never exclude a session for good: capped
- *              listings are visited in later windows and reported, a resumed
- *              walk reaches everything exactly once, and its cursor names no
- *              path.
+ *   progress   A source must commit within a stated bound: 2S cadences for
+ *              S capture sources (6 with Grok). A leader that is admitted,
+ *              spends the whole allowance and commits nothing must pass
+ *              the lead on (round 3), including with a repair overrun at the
+ *              front of every cadence; three busy real sources behind slow
+ *              reads all commit.
+ *   ceiling    200 ms is an admission ceiling: no capture or repair unit
+ *              starts after it, and a cadence ends within one bounded unit
+ *              of it. Grok discovery of a 2,000-session group with a slow
+ *              lstat stays inside the budget on every scan of a sweep.
+ *   lossless   Every session is reached within a stated bound: a group
+ *              larger than one pass is finished even when the worker is
+ *              replaced every pass, and churn that keeps adding entries
+ *              ahead of an old session cannot keep it out (round 3). Caps
+ *              are reported, the durable walk state names no path, and
+ *              today's sessions come first.
  *
+ * Time is virtual (scripts/lib/virtual-clock.ts): the fixture charges what
+ * a slow call costs and real work costs nothing, so the result is the same
+ * on a loaded host and on a CI runner. The receipt's `deterministicDigest`
+ * covers every measured value; repeated runs print the same digest.
  * Fixtures are temporary; nothing reads an installed collector or a real
- * provider home. Timings are fault injection, not measurements of a host.
+ * provider home.
  *
  *   pnpm proof:busy-host-capture [-- --scenario=progress|ceiling|lossless]
  */
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -34,18 +43,27 @@ import { DEFAULT_JSONL_TAILER_IO } from "../packages/collector-cli/src/jsonl-byt
 import { CollectorMaintenance } from "../packages/collector-cli/src/maintenance";
 import { RolloutTailer } from "../packages/collector-cli/src/rollout-tailer";
 import { TranscriptTailer } from "../packages/collector-cli/src/transcript-tailer";
+import { installVirtualClock, spend, virtualNow } from "./lib/virtual-clock";
 
 const scenario = process.argv.find((arg) => arg.startsWith("--scenario="))?.split("=", 2)[1] ?? "all";
 const checks: Array<{ scenario: string; name: string; passed: boolean; detail: unknown }> = [];
 const receipts: Record<string, unknown> = {};
+const MAX_WALL_MS = AUTOMATIC_CAPTURE_LIMITS.maxWallMs;
+/** The stated service bound: every source leads within 2S cadences. */
+const SERVICE_BOUND_CADENCES = 2 * 3;
 
 function check(group: string, name: string, passed: boolean, detail: unknown = null) {
   checks.push({ scenario: group, name, passed, detail });
 }
 
-const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+/** A real pause, used only to order file creation times; it never times work. */
+const pause = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const uuid = (lead: string, index: number) =>
   `${lead.padEnd(8, "0").slice(0, 8)}-0000-4000-8000-${String(index).padStart(12, "0")}`;
+const walkHash = (name: string) =>
+  crypto.createHash("sha256").update(`plimsoll-grok-walk-v1\0${name}`).digest("hex").slice(0, 32);
+
+type Source = "codex" | "claude_code" | "grok";
 
 function grokUsage(sessionId: string, endedAt = new Date().toISOString()) {
   return {
@@ -60,17 +78,24 @@ function grokUsage(sessionId: string, endedAt = new Date().toISOString()) {
 }
 
 /** One Grok session; `at` sets the usage file, session and group mtimes. */
-function writeGrokSession(home: string, group: string, sessionId: string, at?: Date) {
+function writeGrokSession(home: string, group: string, sessionId: string, at?: Date, withUsage = true) {
   const directory = path.join(home, "sessions", group, sessionId);
   fs.mkdirSync(directory, { recursive: true, mode: 0o700 });
   const file = path.join(directory, "usage.json");
-  fs.writeFileSync(file, JSON.stringify(grokUsage(sessionId)), { mode: 0o600 });
+  if (withUsage) fs.writeFileSync(file, JSON.stringify(grokUsage(sessionId)), { mode: 0o600 });
   if (at) {
-    fs.utimesSync(file, at, at);
+    if (withUsage) fs.utimesSync(file, at, at);
     fs.utimesSync(directory, at, at);
     fs.utimesSync(path.dirname(directory), at, at);
   }
   return file;
+}
+
+/** A ledger with the Grok usage tables, so it can be queried before its first scan. */
+function grokLedger(file: string) {
+  const buffer = new LocalEventBuffer(file);
+  ensureGrokUsageState(buffer.database);
+  return buffer;
 }
 
 function grokEvents(buffer: LocalEventBuffer) {
@@ -90,10 +115,35 @@ function state(buffer: LocalEventBuffer, key: string) {
     | { value: string } | undefined)?.value ?? null;
 }
 
+function setState(buffer: LocalEventBuffer, key: string, value: string) {
+  buffer.database.prepare(
+    `insert into maintenance_state(key, value, updated_at) values (?, ?, ?)
+     on conflict(key) do update set value = excluded.value, updated_at = excluded.updated_at`,
+  ).run(key, value, new Date().toISOString());
+}
+
 function grokSweeps(buffer: LocalEventBuffer) {
-  const marker = JSON.parse(state(buffer, "grok_usage_backfill_v1") ?? "null") as
-    | { sweeps: number; lastSweep: { clean: boolean } | null } | null;
-  return { sweeps: marker?.sweeps ?? 0, lastClean: marker?.lastSweep?.clean ?? null };
+  const marker = JSON.parse(state(buffer, "grok_usage_backfill_v1") ?? "null") as { sweeps: number } | null;
+  return marker?.sweeps ?? 0;
+}
+
+/** Scan with a wall the fixture never reaches, so its only limits are the ones it sets. */
+function roomyBudget() {
+  return new CaptureWorkBudget({ ...AUTOMATIC_CAPTURE_LIMITS, maxWallMs: 1_000_000 });
+}
+
+function repairStages(cycles: number) {
+  return JSON.stringify({ next: 0, cycles, stages: Object.fromEntries([
+    "projection", "reconciliation", "repricing", "repo_context_suppression",
+  ].map((stage) => [stage, { attempts: 0, completed: 0, failures: 0, rowsVisited: 0, lastSuccessAt: null }])) });
+}
+
+/** Pin every cadence repair-first (cycles 0 -> 1) or capture-first (1 -> 2). */
+function pinCadence(buffer: LocalEventBuffer, first: "repair" | "capture") {
+  const raw = state(buffer, "automatic_repair_service_v1");
+  const repair = raw ? JSON.parse(raw) as Record<string, unknown> : JSON.parse(repairStages(0)) as Record<string, unknown>;
+  repair.cycles = first === "repair" ? 0 : 1;
+  setState(buffer, "automatic_repair_service_v1", JSON.stringify(repair));
 }
 
 function codexDocument(id: string, padding = 0) {
@@ -118,13 +168,146 @@ function claudeDocument(id: string, padding = 0) {
   ].map((row) => JSON.stringify(row)).join("\n") + "\n";
 }
 
+/** The shapes the maintenance loop reads from a source result. */
+function jsonlResult(deferred: boolean, progressed: boolean, readErrors = 0) {
+  return {
+    scope: "recent", exhaustive: !deferred, discoveryErrors: 0, statErrors: 0, readErrors,
+    parseErrors: 0, unresolvedRecords: 0, filesSeen: progressed ? 1 : 0, filesRead: progressed ? 1 : 0,
+    filesReset: 0, bytesRead: progressed ? 2_048 : 0, bytesDeferred: deferred || !progressed ? 2_048 : 0,
+    recordsParsed: progressed ? 1 : 0, recordsCommitted: progressed ? 1 : 0, eventsAppended: progressed ? 1 : 0,
+    excludedGenerations: 0, deferredGenerations: deferred || !progressed ? 1 : 0, cooperativeYields: 0,
+    lastYieldAt: null, aborted: false, slicesCommitted: progressed ? 1 : 0, continuationBytesAdvanced: 0,
+    activity: { lastActivityAt: null, filesToday: 0, discoveryEntries: 0, lastScanAt: new Date().toISOString(),
+      error: null, truncated: deferred || !progressed, scan: null },
+  };
+}
+
+function grokResult(deferred: boolean, progressed: boolean) {
+  return {
+    scope: "automatic", home: "ready", exhaustive: !deferred, discoveryErrors: 0, statErrors: 0, readErrors: 0,
+    parseErrors: 0, unresolvedRecords: 0, filesSeen: progressed ? 1 : 0, filesUnchanged: 0,
+    filesRead: progressed ? 1 : 0, filesParsed: progressed ? 1 : 0, filesDeferred: deferred ? 1 : 0,
+    filesOversized: 0, bytesRead: progressed ? 2_048 : 0, bytesDeferred: deferred ? 2_048 : 0,
+    recordsParsed: progressed ? 1 : 0, recordsCommitted: progressed ? 1 : 0, eventsAppended: progressed ? 1 : 0,
+    turnsRevised: 0, turnRewritesRefused: 0, incompleteEvents: 0, sessionsSkippedLiveCovered: 0,
+    enrollmentExcludedEvents: 0, futureTimestampClampedEvents: 0,
+    tokensAppended: { input: 0, cachedRead: 0, cacheCreation: 0, output: 0, reasoning: 0 },
+    costUsdTicksAppended: 0, deferredGenerations: deferred ? 1 : 0, excludedGenerations: 0,
+    cooperativeYields: 0, lastYieldAt: null, aborted: false, automaticBudget: null,
+    activity: { lastActivityAt: null, filesToday: 0, discoveryEntries: 0, lastScanAt: new Date().toISOString(),
+      error: null, truncated: deferred, scan: null },
+  };
+}
+
 /**
- * Blockers 1 and 2 at the scheduler: the reviewer's all-source fixture, with
- * every unit start timed against the cadence it belongs to.
+ * Round 3, blocker 1 (the reviewer's construction): Codex is admitted every
+ * time it leads, spends more than the whole allowance and commits nothing;
+ * Claude and Grok commit whenever they are admitted. The lead must pass on.
+ */
+async function failingLeader(root: string, front: "capture" | "repair") {
+  const TICKS = 12;
+  const database = path.join(root, `failing-leader-${front}.sqlite`);
+  const counters = Object.fromEntries((["codex", "claude_code", "grok"] as Source[])
+    .map((source) => [source, { ioStarts: 0, commits: 0 }])) as Record<Source, { ioStarts: number; commits: number }>;
+  const make = (buffer: LocalEventBuffer) => {
+    const codex = {
+      async scan(options: { deferredBeforeIo?: boolean }) {
+        if (options.deferredBeforeIo) return jsonlResult(true, false);
+        counters.codex.ioStarts += 1;
+        spend(230); // one synchronous call longer than the whole allowance, then a read error
+        return jsonlResult(false, false, 1);
+      },
+      close() {},
+    };
+    const committing = (source: "claude_code") => ({
+      async scan(options: { deferredBeforeIo?: boolean; automatic: { budget: CaptureWorkBudget } }) {
+        if (options.deferredBeforeIo) return jsonlResult(true, false);
+        counters[source].ioStarts += 1;
+        options.automatic.budget.recordSlice({ bytesRead: 2_048, recordsParsed: 1, eventsAppended: 1 });
+        counters[source].commits += 1;
+        return jsonlResult(false, true);
+      },
+      close() {},
+    });
+    const grok = {
+      async scan(options: { deferredBeforeIo?: boolean; budget: CaptureWorkBudget }) {
+        if (options.deferredBeforeIo) return grokResult(true, false);
+        counters.grok.ioStarts += 1;
+        options.budget.recordSlice({ bytesRead: 2_048, recordsParsed: 1, eventsAppended: 1 });
+        counters.grok.commits += 1;
+        return grokResult(false, true);
+      },
+      close() {},
+    };
+    if (front === "repair") {
+      const projection = buffer.projection as unknown as { runMaintenance: (...args: unknown[]) => unknown };
+      const real = projection.runMaintenance.bind(projection);
+      projection.runMaintenance = (...args: unknown[]) => {
+        spend(230);
+        return real(...args);
+      };
+    }
+    return new CollectorMaintenance(buffer, codex as never, committing("claude_code") as never, undefined, grok as never);
+  };
+  let buffer = new LocalEventBuffer(database);
+  // The round-2 debt ledger, seeded as the reviewer seeded it: Codex one point ahead.
+  setState(buffer, "automatic_capture_fairness_v1",
+    JSON.stringify({ version: 1, owed: { codex: 1, claude_code: 0, grok: 0 }, captureFirst: front === "capture" }));
+  setState(buffer, "automatic_capture_source_turn", "codex");
+  let maintenance = make(buffer);
+  const ticks: Array<{ tick: number; leader: Source; leaderAdmitted: boolean; commits: Record<Source, number> }> = [];
+  try {
+    for (let tick = 0; tick < TICKS; tick += 1) {
+      if (tick === 3) {
+        // A replaced worker and a reopened ledger keep the service order.
+        maintenance.close();
+        buffer.close();
+        buffer = new LocalEventBuffer(database);
+        maintenance = make(buffer);
+      }
+      pinCadence(buffer, front);
+      const before = { codex: counters.codex.commits, claude_code: counters.claude_code.commits, grok: counters.grok.commits };
+      const result = await maintenance.runRecent();
+      const order = (result as { captureTurn?: { order: Source[]; admitted: Partial<Record<Source, boolean>> } }).captureTurn;
+      ticks.push({
+        tick,
+        leader: order!.order[0]!,
+        leaderAdmitted: order!.admitted[order!.order[0]!] === true,
+        commits: {
+          codex: counters.codex.commits - before.codex,
+          claude_code: counters.claude_code.commits - before.claude_code,
+          grok: counters.grok.commits - before.grok,
+        },
+      });
+    }
+  } finally {
+    maintenance.close();
+    buffer.close();
+  }
+  const windows = Array.from({ length: TICKS - SERVICE_BOUND_CADENCES + 1 }, (_, start) =>
+    ticks.slice(start, start + SERVICE_BOUND_CADENCES));
+  const everyWindowLedByEveryone = windows.every((window) =>
+    (["codex", "claude_code", "grok"] as Source[]).every((source) =>
+      window.some((row) => row.leader === source && row.leaderAdmitted)));
+  const everyWindowCommits = windows.every((window) =>
+    (["claude_code", "grok"] as Source[]).every((source) => window.some((row) => row.commits[source] > 0)));
+  receipts[`failingLeader_${front}First`] = { ticks, counters };
+  check("progress", `a_failing_leader_passes_the_lead_on_${front}_first`,
+    everyWindowLedByEveryone,
+    { boundCadences: SERVICE_BOUND_CADENCES, leaders: ticks.map((row) => `${row.leader}${row.leaderAdmitted ? "" : "(held)"}`) });
+  check("progress", `busy_sources_behind_a_failing_leader_commit_within_the_bound_${front}_first`,
+    everyWindowCommits && counters.claude_code.ioStarts > 0 && counters.grok.ioStarts > 0,
+    { boundCadences: SERVICE_BOUND_CADENCES, counters });
+}
+
+/**
+ * Blockers 1 and 2 of round 1 at the scheduler, with real tailers: the
+ * reviewer's all-source fixture, every unit start timed against its cadence.
  */
 async function busyHost(root: string) {
   const REPAIR_MS = 220;
   const READ_MS = 120;
+  const GROK_READ_MS = 2;
   const TICKS = 12;
   const codexRoot = path.join(root, ".codex", "sessions");
   const claudeRoot = path.join(root, ".claude", "projects");
@@ -148,12 +331,12 @@ async function busyHost(root: string) {
   const buffer = new LocalEventBuffer(path.join(root, "busy.sqlite"));
   let tickStartedAt = 0;
   const unitStarts: Array<{ unit: string; offsetMs: number }> = [];
-  const mark = (unit: string) => unitStarts.push({ unit, offsetMs: performance.now() - tickStartedAt });
+  const mark = (unit: string) => unitStarts.push({ unit, offsetMs: virtualNow() - tickStartedAt });
   const io = {
     ...DEFAULT_JSONL_TAILER_IO,
     readTail: (...args: Parameters<typeof DEFAULT_JSONL_TAILER_IO.readTail>) => {
       mark(args[0].startsWith(codexRoot) ? "codex_read" : "claude_read");
-      sleep(READ_MS);
+      spend(READ_MS);
       return DEFAULT_JSONL_TAILER_IO.readTail(...args);
     },
   };
@@ -164,12 +347,15 @@ async function busyHost(root: string) {
   const realProjectionMaintenance = projection.runMaintenance.bind(projection);
   projection.runMaintenance = (...args: unknown[]) => {
     mark("repair");
-    sleep(REPAIR_MS);
+    spend(REPAIR_MS);
     return realProjectionMaintenance(...args);
   };
   const originalOpen = fs.openSync;
   (fs as unknown as { openSync: typeof fs.openSync }).openSync = ((target: fs.PathLike, ...rest: unknown[]) => {
-    if (String(target).startsWith(grokHome)) mark("grok_read");
+    if (String(target).startsWith(grokHome)) {
+      mark("grok_read");
+      spend(GROK_READ_MS);
+    }
     return (originalOpen as (...values: unknown[]) => number)(target, ...rest);
   }) as typeof fs.openSync;
   const maintenance = new CollectorMaintenance(buffer, rollout, transcript, undefined, grok);
@@ -177,20 +363,12 @@ async function busyHost(root: string) {
   let liveWrittenAfterTick: number | null = null;
   try {
     for (let tick = 0; tick < TICKS; tick += 1) {
-      // Pin the repair consumer to the front of every cadence: the parity
-      // alternation alone must not be what serves capture.
-      const repairRaw = state(buffer, "automatic_repair_service_v1");
-      if (repairRaw) {
-        const repair = JSON.parse(repairRaw) as Record<string, unknown>;
-        repair.cycles = 0;
-        buffer.database.prepare(
-          "update maintenance_state set value = ?, updated_at = ? where key = 'automatic_repair_service_v1'",
-        ).run(JSON.stringify(repair), new Date().toISOString());
-      }
+      // Repairs lead every cadence and overrun it: the parity alternation is
+      // pinned off, so only the scheduler's own rules can serve capture.
+      pinCadence(buffer, "repair");
       const firstUnit = unitStarts.length;
-      tickStartedAt = performance.now();
+      tickStartedAt = virtualNow();
       const result = await maintenance.runRecent();
-      const wallMs = performance.now() - tickStartedAt;
       const source = (scan: { recordsCommitted?: number; filesRead: number; deferredGenerations: number;
         activity: { scan?: { deferredBeforeIo?: boolean } | null } } | undefined) => ({
         admitted: scan?.activity.scan?.deferredBeforeIo === false,
@@ -200,19 +378,19 @@ async function busyHost(root: string) {
       });
       observations.push({
         tick,
-        wallMs: Number(wallMs.toFixed(3)),
+        wallMs: virtualNow() - tickStartedAt,
         baseline: captureBaselineStatus(buffer.database).status,
         codex: source(result.rollout),
         claude: source(result.transcript),
         grok: source(result.grok),
-        units: unitStarts.slice(firstUnit).map((unit) => ({ ...unit, offsetMs: Number(unit.offsetMs.toFixed(3)) })),
+        units: unitStarts.slice(firstUnit),
         budget: maintenance.status().budget,
-        captureTurn: (result as { captureTurn?: unknown }).captureTurn ?? null,
+        order: (result as { captureTurn?: { order: Source[] } }).captureTurn?.order ?? null,
       });
       if (liveWrittenAfterTick === null && captureBaselineStatus(buffer.database).status === "complete") {
         // Post-enrollment work arrives: twenty large generations per source,
         // far more than any cadence can commit.
-        sleep(25);
+        pause(25);
         rollout.close();
         transcript.close();
         for (let index = 0; index < 20; index += 1) {
@@ -230,7 +408,6 @@ async function busyHost(root: string) {
     buffer.close();
   }
 
-  const maxWallMs = AUTOMATIC_CAPTURE_LIMITS.maxWallMs;
   const busy = observations.filter((row) => liveWrittenAfterTick !== null && row.tick > liveWrittenAfterTick);
   const longestWait = (name: "codex" | "claude" | "grok") => {
     let longest = 0;
@@ -247,22 +424,20 @@ async function busyHost(root: string) {
     claude: busy.reduce((total, row) => total + row.claude.committed, 0),
     grok: busy.reduce((total, row) => total + row.grok.committed, 0),
   };
-  // A unit's own bookkeeping (binding and path checks) runs between its
-  // admission and its read; 10 ms bounds that. A unit admitted after the
-  // aggregate wall starts much later: the repair alone overruns by 20 ms.
   const lateUnits = observations.flatMap((row) => row.units
-    .filter((unit: { offsetMs: number }) => unit.offsetMs > maxWallMs + 10)
+    .filter((unit: { offsetMs: number }) => unit.offsetMs >= MAX_WALL_MS)
     .map((unit: { unit: string; offsetMs: number }) => ({ tick: row.tick, ...unit })));
-  // One unit may cross the ceiling; 150 ms covers the fixed per-cadence
-  // bookkeeping outside the capture budget on a loaded runner.
-  const tickCeilingMs = maxWallMs + REPAIR_MS + 150;
+  // The last unit is admitted before 200 ms and one unit costs at most the
+  // repair's 220 ms here, so no cadence can pass 420 virtual ms.
+  const tickCeilingMs = MAX_WALL_MS + REPAIR_MS;
   const walls = observations.map((row) => row.wallMs as number);
-  receipts.progress = {
+  receipts.busyHost = {
     fixture: { grokSessions: 4_000, codexLiveFiles: 20, claudeLiveFiles: 20, repairDelayMs: REPAIR_MS,
-      jsonlReadDelayMs: READ_MS, ticks: TICKS, repairFirstEveryTick: true, liveWrittenAfterTick },
+      jsonlReadDelayMs: READ_MS, grokReadMs: GROK_READ_MS, ticks: TICKS, repairFirstEveryTick: true,
+      liveWrittenAfterTick },
     committedAfterLiveWork: committed,
     longestConsecutiveCadencesWithoutCommit: waits,
-    maxWallMs: Math.max(...walls),
+    walls,
     tickCeilingMs,
     lateUnits,
     observations,
@@ -274,18 +449,19 @@ async function busyHost(root: string) {
   check("progress", "claude_commits_under_a_read_slower_than_any_source_share",
     committed.claude > 0, { committed: committed.claude });
   check("progress", "grok_commits_alongside_the_slow_sources", committed.grok > 0, { committed: committed.grok });
-  check("progress", "no_busy_source_waits_more_than_four_cadences_for_a_commit",
-    Object.values(waits).every((wait) => wait <= 4), waits);
+  check("progress", "no_busy_source_waits_longer_than_the_stated_bound",
+    Object.values(waits).every((wait) => wait <= SERVICE_BOUND_CADENCES),
+    { boundCadences: SERVICE_BOUND_CADENCES, waits });
   check("progress", "aggregate_byte_record_and_event_ceilings_hold_every_tick",
     observations.every((row) => row.budget.bytesRead <= row.budget.maxBytes &&
       row.budget.recordsParsed <= row.budget.maxRecords && row.budget.eventsAppended <= row.budget.maxEvents));
   check("ceiling", "no_capture_or_repair_unit_starts_after_the_aggregate_wall",
-    lateUnits.length === 0, { lateUnits: lateUnits.slice(0, 8), maxWallMs });
-  check("ceiling", "every_tick_ends_within_one_bounded_unit_of_the_ceiling",
+    lateUnits.length === 0, { lateUnits: lateUnits.slice(0, 8), maxWallMs: MAX_WALL_MS, units: unitStarts.length });
+  check("ceiling", "every_cadence_ends_within_one_bounded_unit_of_the_ceiling",
     walls.every((wall) => wall <= tickCeilingMs), { walls, tickCeilingMs });
 }
 
-/** Blocker 2 inside Grok: discovery of one large group with a slow lstat. */
+/** Blocker 2 of round 1 inside Grok: discovery of one large group with a slow lstat. */
 async function grokDiscoveryBound(root: string) {
   const SESSIONS = 2_000;
   const home = path.join(root, "bound", ".grok");
@@ -293,7 +469,7 @@ async function grokDiscoveryBound(root: string) {
   const old = new Date(Date.now() - 30 * 24 * 60 * 60 * 1_000);
   for (let index = 0; index < SESSIONS; index += 1) writeGrokSession(home, "group", uuid("ab", index), old);
   fs.utimesSync(group, old, old);
-  const buffer = new LocalEventBuffer(path.join(root, "bound.sqlite"));
+  const buffer = grokLedger(path.join(root, "bound.sqlite"));
   const tailer = new GrokUsageTailer(buffer, home);
   const originalLstat = fs.lstatSync;
   let delayedStats = 0;
@@ -301,112 +477,219 @@ async function grokDiscoveryBound(root: string) {
     (fs as unknown as { lstatSync: typeof fs.lstatSync }).lstatSync = ((target: fs.PathLike, ...rest: unknown[]) => {
       if (String(target).startsWith(group + path.sep)) {
         delayedStats += 1;
-        sleep(1);
+        spend(1);
       }
       return (originalLstat as (...values: unknown[]) => fs.Stats)(target, ...rest);
     }) as typeof fs.lstatSync;
     delayedStats = 0;
-    const started = performance.now();
+    const started = virtualNow();
     try {
       const result = await tailer.scan({ budget: new CaptureWorkBudget() });
-      return { result, wallMs: performance.now() - started, delayedStats };
+      return { result, wallMs: virtualNow() - started, delayedStats };
     } finally {
       (fs as unknown as { lstatSync: typeof fs.lstatSync }).lstatSync = originalLstat;
     }
   };
   const firstSlow = await slowScan();
   const first = firstSlow.result;
-  const firstWallMs = firstSlow.wallMs;
-  const firstStats = firstSlow.delayedStats;
   let scans = 1;
-  for (; scans < 400 && grokEvents(buffer) < SESSIONS; scans += 1) {
-    await tailer.scan({ budget: new CaptureWorkBudget() });
-  }
+  for (; scans < 400 && grokEvents(buffer) < SESSIONS; scans += 1) await tailer.scan({ budget: new CaptureWorkBudget() });
   const events = grokEvents(buffer);
   // Steady state: every file is committed and unchanged, so nothing queues
   // and only the budget ends a pass over 2,000 slow lstats. Time every scan
-  // of one whole sweep: after the first lists the group, each later scan
-  // could otherwise stat the rest of it in one go.
-  const sweepsBefore = grokSweeps(buffer).sweeps;
+  // of one whole sweep.
+  const sweepsBefore = grokSweeps(buffer);
   const steadyScans: Array<{ wallMs: number; delayedStats: number; unchanged: number }> = [];
-  for (let scan = 0; scan < 200 && grokSweeps(buffer).sweeps === sweepsBefore; scan += 1) {
+  for (let scan = 0; scan < 400 && grokSweeps(buffer) === sweepsBefore; scan += 1) {
     const slow = await slowScan();
-    steadyScans.push({ wallMs: Number(slow.wallMs.toFixed(3)), delayedStats: slow.delayedStats,
-      unchanged: slow.result.filesUnchanged });
+    steadyScans.push({ wallMs: slow.wallMs, delayedStats: slow.delayedStats, unchanged: slow.result.filesUnchanged });
   }
   const steadyUnchanged = steadyScans.reduce((total, row) => total + row.unchanged, 0);
   tailer.close();
   buffer.close();
-  const ceilingMs = AUTOMATIC_CAPTURE_LIMITS.maxWallMs + 60;
   receipts.discovery = {
     fixture: { sessions: SESSIONS, injectedLstatDelayMs: 1 },
-    first: { wallMs: Number(firstWallMs.toFixed(3)), delayedStats: firstStats, seen: first.filesSeen,
-      committed: first.recordsCommitted, entries: first.activity.discoveryEntries,
-      deferredBeforeIo: first.activity.scan.deferredBeforeIo },
+    first: { wallMs: firstSlow.wallMs, delayedStats: firstSlow.delayedStats, seen: first.filesSeen,
+      committed: first.recordsCommitted, entries: first.activity.discoveryEntries },
     scansToCommitAll: scans,
     events,
-    ceilingMs,
     steady: { scans: steadyScans.length, unchanged: steadyUnchanged,
       maxWallMs: Math.max(...steadyScans.map((row) => row.wallMs)),
       maxDelayedStats: Math.max(...steadyScans.map((row) => row.delayedStats)) },
   };
   check("ceiling", "grok_discovery_of_a_large_group_stays_inside_the_budget",
-    firstWallMs <= ceilingMs, { wallMs: Number(firstWallMs.toFixed(3)), ceilingMs });
+    firstSlow.wallMs <= MAX_WALL_MS, { wallMs: firstSlow.wallMs, maxWallMs: MAX_WALL_MS });
   check("ceiling", "grok_discovery_never_stats_a_whole_directory_in_one_scan",
-    firstStats < SESSIONS / 2, { delayedStats: firstStats, sessions: SESSIONS });
+    firstSlow.delayedStats < SESSIONS / 2, { delayedStats: firstSlow.delayedStats, sessions: SESSIONS });
   check("ceiling", "the_first_bounded_grok_scan_makes_progress",
     first.activity.scan.deferredBeforeIo === false && first.filesSeen > 0 && first.recordsCommitted > 0,
     { seen: first.filesSeen, committed: first.recordsCommitted });
-  check("ceiling", "bounded_grok_scans_resume_to_every_session_exactly_once",
+  check("ceiling", "bounded_grok_scans_reach_every_session_exactly_once",
     events === SESSIONS, { events, scans });
-  check("ceiling", "every_scan_of_an_unchanged_steady_state_sweep_stays_inside_the_budget",
+  check("ceiling", "every_scan_of_an_unchanged_sweep_stays_inside_the_budget",
     steadyScans.length > 1 && steadyUnchanged === SESSIONS &&
-      steadyScans.every((row) => row.wallMs <= ceilingMs && row.delayedStats < SESSIONS / 2),
-    { scans: steadyScans.length, unchanged: steadyUnchanged, ceilingMs,
-      slowest: [...steadyScans].sort((left, right) => right.wallMs - left.wallMs).slice(0, 3) });
+      steadyScans.every((row) => row.wallMs <= MAX_WALL_MS && row.delayedStats < SESSIONS / 2),
+    { scans: steadyScans.length, unchanged: steadyUnchanged,
+      maxWallMs: Math.max(...steadyScans.map((row) => row.wallMs)) });
 }
 
-/** Scan with a generous wall so a scenario's only limits are the ones it sets. */
-function roomyBudget() {
-  return new CaptureWorkBudget({ ...AUTOMATIC_CAPTURE_LIMITS, maxWallMs: 2_000 });
+/**
+ * Names in the order a directory stream returns them, which the walk follows.
+ * (fs.readdirSync sorts; a stream does not.)
+ */
+function streamOrder(directory: string) {
+  const handle = fs.opendirSync(directory);
+  const names: string[] = [];
+  try {
+    for (let entry = handle.readSync(); entry; entry = handle.readSync()) names.push(entry.name);
+  } finally {
+    handle.closeSync();
+  }
+  return names;
 }
 
-/** Blocker 3: capped listings, recency, restarts and the cursor. */
+/**
+ * A group of empty sessions whose last entry in directory order holds the
+ * one usage file: a walk reaches it only after it has covered all the rest.
+ */
+function groupEndingInTarget(home: string, group: string, prefix: string, sessions: number) {
+  for (let index = 0; index < sessions; index += 1) {
+    writeGrokSession(home, group, `${prefix}-${String(index).padStart(4, "0")}`, undefined, false);
+  }
+  const target = streamOrder(path.join(home, "sessions", group)).at(-1)!;
+  writeGrokSession(home, group, target);
+  return target;
+}
+
+/**
+ * Round 3, blocker 2 (the reviewer's constructions): a group larger than
+ * one pass, with a new worker every pass.
+ */
+async function restartEveryPass(root: string) {
+  // Production defaults: 2,101 sessions against 2,048 steps a pass.
+  const largeHome = path.join(root, "large-restart", ".grok");
+  const largeGroup = "large-old-group";
+  const largeTarget = groupEndingInTarget(largeHome, largeGroup, "large-session", 2_101);
+  const old = new Date(Date.now() - 30 * 24 * 60 * 60 * 1_000);
+  fs.utimesSync(path.join(largeHome, "sessions", largeGroup), old, old);
+  const largeBuffer = grokLedger(path.join(root, "large-restart.sqlite"));
+  const largePasses: Array<{ pass: number; entries: number; targetSeen: boolean }> = [];
+  for (let pass = 0; pass < 3 && !grokTurnSeen(largeBuffer, largeTarget); pass += 1) {
+    const tailer = new GrokUsageTailer(largeBuffer, largeHome);
+    const scan = await tailer.scan({ budget: roomyBudget() });
+    largePasses.push({ pass, entries: scan.activity.discoveryEntries, targetSeen: grokTurnSeen(largeBuffer, largeTarget) });
+    tailer.close();
+  }
+  const largeSeen = grokTurnSeen(largeBuffer, largeTarget);
+  largeBuffer.close();
+  check("lossless", "a_new_worker_every_pass_finishes_a_group_larger_than_one_pass",
+    largeSeen, { sessions: 2_101, entriesPerPass: GROK_USAGE_LIMITS.entriesPerPass, boundPasses: 3, passes: largePasses });
+
+  // The scaled construction: five steps a pass, 41 sessions, recent lane off.
+  const scaledHome = path.join(root, "scaled-restart", ".grok");
+  const scaledGroup = "private-group-name";
+  const scaledTarget = groupEndingInTarget(scaledHome, scaledGroup, "private-session", 41);
+  const scaledBuffer = grokLedger(path.join(root, "scaled-restart.sqlite"));
+  const scaledLimits = { ...GROK_USAGE_LIMITS, entriesPerPass: 5, discoveryWallMs: 1_000, recentGroups: 0,
+    recentSessions: 0, maxSessionsPerGroup: 100 };
+  // Each pass examines at least three sessions: ceil(41 / 3) passes finish the group.
+  const scaledBound = Math.ceil(41 / 3);
+  let scaledPasses = 0;
+  for (; scaledPasses < scaledBound && !grokTurnSeen(scaledBuffer, scaledTarget); scaledPasses += 1) {
+    const tailer = new GrokUsageTailer(scaledBuffer, scaledHome, scaledLimits);
+    await tailer.scan({ budget: roomyBudget() });
+    tailer.close();
+  }
+  const scaledSeen = grokTurnSeen(scaledBuffer, scaledTarget);
+  scaledBuffer.close();
+  check("lossless", "a_new_worker_every_pass_keeps_every_pass_of_progress",
+    scaledSeen, { sessions: 41, entriesPerPass: 5, boundPasses: scaledBound, passes: scaledPasses });
+  receipts.restartEveryPass = { large: largePasses, scaled: { passes: scaledPasses, seen: scaledSeen } };
+}
+
+/**
+ * Round 3, blocker 3: bounded add/remove churn. Population three, two
+ * sessions a pass per group, two fresh entries added ahead of an old
+ * session before every pass and removed after it.
+ */
+async function boundedChurn(root: string, order: "name-hash" | "directory") {
+  const identifyingGroup = `customer-secret-project-directory-${order}`;
+  const home = path.join(root, `churn-${order}`, ".grok");
+  const groupDirectory = path.join(home, "sessions", identifyingGroup);
+  fs.mkdirSync(groupDirectory, { recursive: true, mode: 0o700 });
+  const names = Array.from({ length: 80 }, (_, index) => `identifying-session-${String(index).padStart(3, "0")}`);
+  let ordered: string[];
+  if (order === "name-hash") {
+    // The reviewer's choice: ahead of the old session in round 2's hash order.
+    ordered = [...names].sort((left, right) => walkHash(left).localeCompare(walkHash(right)));
+  } else {
+    // The same adversary against this walk: ahead of it in directory order.
+    for (const name of names) fs.mkdirSync(path.join(groupDirectory, name), { mode: 0o700 });
+    ordered = streamOrder(groupDirectory).filter((name) => names.includes(name));
+    for (const name of names) fs.rmSync(path.join(groupDirectory, name), { recursive: true, force: true });
+  }
+  const target = ordered.at(-1)!;
+  const churn = ordered.slice(0, 20);
+  writeGrokSession(home, identifyingGroup, target);
+  const buffer = grokLedger(path.join(root, `churn-${order}.sqlite`));
+  const tailer = new GrokUsageTailer(buffer, home, {
+    ...GROK_USAGE_LIMITS, maxSessionsPerGroup: 2, entriesPerPass: 1_000, discoveryWallMs: 1_000,
+    recentGroups: 0, recentSessions: 0,
+  });
+  // Three present sessions at two a pass: the sweep they began takes two passes.
+  const boundPasses = 2;
+  const passes: Array<{ pass: number; targetSeen: boolean; sessionsOverLimit: number; sessionsDeferred: number }> = [];
+  let seenAtPass: number | null = null;
+  for (let pass = 0; pass < 10; pass += 1) {
+    const active = churn.slice(pass * 2, pass * 2 + 2);
+    for (const name of active) fs.mkdirSync(path.join(groupDirectory, name), { mode: 0o700 });
+    const scan = await tailer.scan({ budget: roomyBudget() });
+    const files = scan.activity.scan.usageFiles as { sessionsOverLimit?: number; sessionsDeferred?: number };
+    const seen = grokTurnSeen(buffer, target);
+    if (seen && seenAtPass === null) seenAtPass = pass + 1;
+    passes.push({ pass, targetSeen: seen, sessionsOverLimit: files.sessionsOverLimit ?? 0,
+      sessionsDeferred: files.sessionsDeferred ?? 0 });
+    for (const name of active) fs.rmSync(path.join(groupDirectory, name), { recursive: true, force: true });
+    // Order creation times after this pass unambiguously (ms resolution).
+    pause(3);
+  }
+  tailer.close();
+  buffer.close();
+  receipts[`churn_${order}`] = { population: 3, cap: 2, boundPasses, seenAtPass, passes };
+  check("lossless", `bounded_churn_ahead_in_${order.replace("-", "_")}_order_cannot_keep_an_old_session_out`,
+    seenAtPass !== null && seenAtPass <= boundPasses, { boundPasses, seenAtPass, passes: passes.slice(0, 4) });
+}
+
+/** Caps, recency, restarts with legacy state, and the durable state's privacy. */
 async function lossless(root: string) {
   const old = (offsetMs: number) => new Date(Date.now() - 30 * 24 * 60 * 60 * 1_000 + offsetMs);
 
-  // The reviewer's capped case: two slots, three stable sessions.
+  // Two sessions a pass per group, three sessions: one sweep, two passes.
   const cappedHome = path.join(root, "capped", ".grok");
-  const cappedBuffer = new LocalEventBuffer(path.join(root, "capped.sqlite"));
-  const sessions = [uuid("d0", 1), uuid("e0", 2), uuid("f0", 3)];
-  // Grok names a group after the URL-encoded working directory.
+  const cappedBuffer = grokLedger(path.join(root, "capped.sqlite"));
   const cappedGroup = encodeURIComponent("/Users/example/capped-project");
+  const sessions = [uuid("d0", 1), uuid("e0", 2), uuid("f0", 3)];
   sessions.forEach((sessionId, index) => writeGrokSession(cappedHome, cappedGroup, sessionId, old(3_000 - index * 1_000)));
   const cappedTailer = new GrokUsageTailer(cappedBuffer, cappedHome,
     { ...GROK_USAGE_LIMITS, maxSessionsPerGroup: 2, entriesPerPass: 100, discoveryWallMs: 1_000 });
   let sessionsOverLimit = 0;
-  const cursors: string[] = [];
-  const cappedSweeps: Array<{ scan: number; sweeps: number; seen: boolean[] }> = [];
-  for (let scan = 0; scan < 8 && grokSweeps(cappedBuffer).sweeps < 2; scan += 1) {
+  let cappedScans = 0;
+  for (; cappedScans < 8 && grokSweeps(cappedBuffer) < 1; cappedScans += 1) {
     const result = await cappedTailer.scan({ budget: roomyBudget() });
     sessionsOverLimit += Number((result.activity.scan.usageFiles as { sessionsOverLimit?: number }).sessionsOverLimit ?? 0);
-    const cursor = state(cappedBuffer, "grok_usage_sweep_resume_v1");
-    if (cursor) cursors.push(cursor);
-    cappedSweeps.push({ scan, sweeps: grokSweeps(cappedBuffer).sweeps,
-      seen: sessions.map((sessionId) => grokTurnSeen(cappedBuffer, sessionId)) });
   }
   const cappedSeen = sessions.map((sessionId) => grokTurnSeen(cappedBuffer, sessionId));
   const cappedEvents = grokEvents(cappedBuffer);
   cappedTailer.close();
   cappedBuffer.close();
-  check("lossless", "a_capped_group_reaches_its_oldest_session_within_two_sweeps",
-    cappedSeen.every(Boolean) && cappedEvents === sessions.length, { cappedSweeps, events: cappedEvents });
-  check("lossless", "a_capped_group_is_reported_not_silently_skipped",
-    sessionsOverLimit > 0, { sessionsOverLimit });
+  check("lossless", "a_capped_group_is_finished_within_its_first_sweep",
+    cappedSeen.every(Boolean) && cappedEvents === sessions.length,
+    { seen: cappedSeen, events: cappedEvents, scans: cappedScans });
+  check("lossless", "a_capped_group_is_reported_not_silently_skipped", sessionsOverLimit > 0, { sessionsOverLimit });
 
-  // Capped groups: three groups, room for two.
+  // Two groups a pass, three groups.
   const groupsHome = path.join(root, "groups", ".grok");
-  const groupsBuffer = new LocalEventBuffer(path.join(root, "groups.sqlite"));
+  const groupsBuffer = grokLedger(path.join(root, "groups.sqlite"));
   const groupSessions = ["alpha", "beta", "gamma"].map((name, index) => {
     const sessionId = uuid("c1", index);
     writeGrokSession(groupsHome, `%2Ftmp%2F${name}`, sessionId, old(3_000 - index * 1_000));
@@ -415,7 +698,7 @@ async function lossless(root: string) {
   const groupsTailer = new GrokUsageTailer(groupsBuffer, groupsHome,
     { ...GROK_USAGE_LIMITS, maxGroups: 2, entriesPerPass: 100, discoveryWallMs: 1_000 });
   let groupsOverLimit = 0;
-  for (let scan = 0; scan < 8 && grokSweeps(groupsBuffer).sweeps < 2; scan += 1) {
+  for (let scan = 0; scan < 8 && grokSweeps(groupsBuffer) < 1; scan += 1) {
     const result = await groupsTailer.scan({ budget: roomyBudget() });
     groupsOverLimit += Number((result.activity.scan.usageFiles as { groupsOverLimit?: number }).groupsOverLimit ?? 0);
   }
@@ -423,15 +706,13 @@ async function lossless(root: string) {
   const groupsEvents = grokEvents(groupsBuffer);
   groupsTailer.close();
   groupsBuffer.close();
-  check("lossless", "capped_groups_are_all_reached_within_two_sweeps",
+  check("lossless", "capped_groups_are_all_reached_within_the_first_sweep",
     groupsSeen.every(Boolean) && groupsEvents === groupSessions.length, { groupsSeen, events: groupsEvents });
   check("lossless", "capped_groups_are_reported_not_silently_skipped", groupsOverLimit > 0, { groupsOverLimit });
 
-  // Capped windows over empty and unreadable groups: the cursor must move
-  // past every group it finishes, or a window ending on one repeats forever.
+  // Capped passes over empty and unreadable groups, a new worker every pass.
   const sparseHome = path.join(root, "sparse", ".grok");
-  const sparseBuffer = new LocalEventBuffer(path.join(root, "sparse.sqlite"));
-  ensureGrokUsageState(sparseBuffer.database);
+  const sparseBuffer = grokLedger(path.join(root, "sparse.sqlite"));
   const sparseSessions: string[] = [];
   const unreadable = path.join(sparseHome, "sessions", "unreadable");
   for (let group = 0; group < 9; group += 1) {
@@ -460,14 +741,14 @@ async function lossless(root: string) {
   const sparseSeen = sparseSessions.filter((sessionId) => grokTurnSeen(sparseBuffer, sessionId)).length;
   const sparseEvents = grokEvents(sparseBuffer);
   sparseBuffer.close();
-  check("lossless", "capped_windows_move_past_empty_and_unreadable_groups",
+  check("lossless", "capped_passes_move_past_empty_and_unreadable_groups",
     sparseSeen === sparseSessions.length && sparseEvents === sparseSessions.length,
     { seen: sparseSeen, sessions: sparseSessions.length, events: sparseEvents, scans: sparseScans });
 
   // Recent first: today's sessions in a recently active group come before
   // 1,200 older sessions, in the first bounded scan.
   const recentHome = path.join(root, "recent", ".grok");
-  const recentBuffer = new LocalEventBuffer(path.join(root, "recent.sqlite"));
+  const recentBuffer = grokLedger(path.join(root, "recent.sqlite"));
   for (let group = 0; group < 30; group += 1) {
     for (let session = 0; session < 40; session += 1) {
       writeGrokSession(recentHome, `group-${String(group).padStart(3, "0")}`, uuid("5a", group * 40 + session),
@@ -488,109 +769,88 @@ async function lossless(root: string) {
   check("lossless", "recent_sessions_are_committed_in_the_first_bounded_scan",
     recentSeen.every(Boolean), { recentSeen, firstScanEvents: firstRecent.eventsAppended });
 
-  // Restarts: a tiny lifetime limit ends every sweep early, and every scan
-  // runs in a fresh tailer, as after a worker restart. Legacy cursors (the
-  // 0.7.37 numeric origin and an unshipped name cursor) must not strand it.
+  // A new worker every scan, a tiny pass allowance and cursor values left by
+  // 0.7.37 and by round 2: every session exactly once. Then the durable walk
+  // state must name no group or session.
   const restartHome = path.join(root, "restart", ".grok");
-  const restartBuffer = new LocalEventBuffer(path.join(root, "restart.sqlite"));
-  ensureGrokUsageState(restartBuffer.database);
+  const restartBuffer = grokLedger(path.join(root, "restart.sqlite"));
   const restartSessions: string[] = [];
+  const restartGroups: string[] = [];
   for (let group = 0; group < 4; group += 1) {
+    const groupName = encodeURIComponent(`/Users/example/private-${group}`);
+    restartGroups.push(groupName);
     for (let session = 0; session < 5; session += 1) {
       const sessionId = uuid("4c", group * 5 + session);
-      writeGrokSession(restartHome, `grp-${group}`, sessionId, old(group * 5 + session));
+      writeGrokSession(restartHome, groupName, sessionId, old(group * 5 + session));
       restartSessions.push(sessionId);
     }
   }
-  restartBuffer.database.prepare(
-    `insert into maintenance_state(key, value, updated_at) values ('grok_usage_sweep_resume_v1', '1', ?)
-     on conflict(key) do update set value = excluded.value`,
-  ).run(new Date().toISOString());
-  const restartLimits = { ...GROK_USAGE_LIMITS, lifetimeEntryLimit: 3, entriesPerPass: 100, discoveryWallMs: 1_000 };
-  const restartCursors: string[] = [];
+  setState(restartBuffer, "grok_usage_sweep_resume_v1", "1");
+  const stateSnapshots: string[] = [];
   let restartScans = 0;
   for (; restartScans < 60 && restartSessions.some((sessionId) => !grokTurnSeen(restartBuffer, sessionId)); restartScans += 1) {
     if (restartScans === 3) {
-      restartBuffer.database.prepare(
-        "update maintenance_state set value = ? where key = 'grok_usage_sweep_resume_v1'",
-      ).run(JSON.stringify({ version: 1, groupName: "grp-2", sessionName: restartSessions[11] }));
+      setState(restartBuffer, "grok_usage_sweep_resume_v1",
+        JSON.stringify({ version: 2, group: walkHash(restartGroups[2]!), session: walkHash(restartSessions[11]!) }));
     }
-    const tailer = new GrokUsageTailer(restartBuffer, restartHome, restartLimits);
+    const tailer = new GrokUsageTailer(restartBuffer, restartHome,
+      { ...GROK_USAGE_LIMITS, entriesPerPass: 6, discoveryWallMs: 1_000 });
     await tailer.scan({ budget: roomyBudget() });
     tailer.close();
-    const cursor = state(restartBuffer, "grok_usage_sweep_resume_v1");
-    if (cursor && restartScans !== 3) restartCursors.push(cursor);
+    const hasVisits = restartBuffer.database.prepare(
+      "select 1 from sqlite_master where type = 'table' and name = 'grok_usage_walk_visits'",
+    ).get() !== undefined;
+    const rows = hasVisits ? restartBuffer.database.prepare(
+      "select group_hash || ':' || session_hash as row from grok_usage_walk_visits",
+    ).all() as Array<{ row: string }> : [];
+    stateSnapshots.push([state(restartBuffer, "grok_usage_walk_round_v1") ?? "", ...rows.map((row) => row.row)].join("\n"));
   }
   const restartSeen = restartSessions.filter((sessionId) => grokTurnSeen(restartBuffer, sessionId)).length;
   const restartEvents = grokEvents(restartBuffer);
   restartBuffer.close();
-  // The same restarts, with a group window smaller than the tree as well.
-  const windowBuffer = new LocalEventBuffer(path.join(root, "restart-window.sqlite"));
-  ensureGrokUsageState(windowBuffer.database);
-  let windowScans = 0;
-  for (; windowScans < 80 && restartSessions.some((sessionId) => !grokTurnSeen(windowBuffer, sessionId)); windowScans += 1) {
-    const tailer = new GrokUsageTailer(windowBuffer, restartHome, { ...restartLimits, maxGroups: 2 });
-    await tailer.scan({ budget: roomyBudget() });
-    tailer.close();
-  }
-  const windowSeen = restartSessions.filter((sessionId) => grokTurnSeen(windowBuffer, sessionId)).length;
-  const windowEvents = grokEvents(windowBuffer);
-  windowBuffer.close();
-  check("lossless", "a_capped_window_cut_short_and_restarted_every_scan_reaches_every_session_once",
-    windowSeen === restartSessions.length && windowEvents === restartSessions.length,
-    { seen: windowSeen, sessions: restartSessions.length, events: windowEvents, scans: windowScans });
-  check("lossless", "a_walk_cut_short_and_restarted_every_scan_reaches_every_session_once",
+  check("lossless", "a_walk_restarted_every_scan_reaches_every_session_once",
     restartSeen === restartSessions.length && restartEvents === restartSessions.length,
     { seen: restartSeen, sessions: restartSessions.length, events: restartEvents, scans: restartScans });
-  // The ledger never holds the working directory a group name encodes. A
-  // small pass allowance leaves a sweep mid-walk, so its cursor persists.
-  const privacyHome = path.join(root, "privacy", ".grok");
-  const privacyBuffer = new LocalEventBuffer(path.join(root, "privacy.sqlite"));
-  const privacyGroups = ["alpha", "beta", "gamma"].map((name) => encodeURIComponent(`/Users/example/private-${name}`));
-  const privacySessions: string[] = [];
-  privacyGroups.forEach((group, groupIndex) => {
-    for (let session = 0; session < 4; session += 1) {
-      const sessionId = uuid("2e", groupIndex * 4 + session);
-      writeGrokSession(privacyHome, group, sessionId, old(groupIndex * 4 + session));
-      privacySessions.push(sessionId);
-    }
-  });
-  const privacyTailer = new GrokUsageTailer(privacyBuffer, privacyHome,
-    { ...GROK_USAGE_LIMITS, entriesPerPass: 6, discoveryWallMs: 1_000 });
-  const privacyCursors: string[] = [];
-  for (let scan = 0; scan < 12 && grokSweeps(privacyBuffer).sweeps === 0; scan += 1) {
-    await privacyTailer.scan({ budget: roomyBudget() });
-    const cursor = state(privacyBuffer, "grok_usage_sweep_resume_v1");
-    if (cursor && cursor !== "0") privacyCursors.push(cursor);
-  }
-  privacyTailer.close();
-  privacyBuffer.close();
-  const resumable = [...privacyCursors, ...cursors, ...restartCursors].filter((cursor) => cursor !== "0");
-  check("lossless", "the_resume_cursor_names_no_group_or_session",
-    privacyCursors.length > 0 && resumable.every((cursor) => !cursor.includes("private-") &&
-      !cursor.includes("capped-project") && !cursor.includes("grp-") &&
-      [...privacySessions, ...sessions, ...restartSessions].every((sessionId) => !cursor.includes(sessionId))),
-    { cursors: resumable.slice(0, 4) });
-  receipts.lossless = { cappedSweeps, sessionsOverLimit, groupsOverLimit, cursors, recentSeen,
-    restart: { scans: restartScans, seen: restartSeen, events: restartEvents, cursors: restartCursors } };
+  const leaks = stateSnapshots.filter((snapshot) =>
+    snapshot.includes("private-") || snapshot.includes("Users") || snapshot.includes(path.sep) ||
+    restartSessions.some((sessionId) => snapshot.includes(sessionId)));
+  const shapes = stateSnapshots.every((snapshot) => snapshot.split("\n").slice(1).every((row) =>
+    /^[0-9a-f]{32}:([0-9a-f]{32})?$/.test(row)));
+  check("lossless", "the_durable_walk_state_names_no_group_or_session",
+    stateSnapshots.length > 0 && leaks.length === 0 && shapes, { snapshots: stateSnapshots.length, leaks: leaks.length });
+  receipts.lossless = { cappedScans, sessionsOverLimit, groupsOverLimit, sparseScans, recentSeen,
+    restart: { scans: restartScans, seen: restartSeen, events: restartEvents } };
 }
 
 async function main() {
+  installVirtualClock();
   const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "plimsoll-busy-host-proof-"));
   try {
+    if (scenario === "all" || scenario === "progress") {
+      await failingLeader(root, "capture");
+      await failingLeader(root, "repair");
+    }
     if (scenario === "all" || scenario === "progress" || scenario === "ceiling") await busyHost(path.join(root, "busy"));
     if (scenario === "all" || scenario === "ceiling") await grokDiscoveryBound(root);
-    if (scenario === "all" || scenario === "lossless") await lossless(root);
+    if (scenario === "all" || scenario === "lossless") {
+      await restartEveryPass(root);
+      await boundedChurn(root, "name-hash");
+      await boundedChurn(root, "directory");
+      await lossless(root);
+    }
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }
   const failed = checks.filter((entry) => !entry.passed);
+  const deterministicDigest = `sha256:${crypto.createHash("sha256")
+    .update(JSON.stringify({ checks, receipts })).digest("hex")}`;
   console.log(JSON.stringify({
-    schema: "eco-6hoxj.163.42.busy-host-capture-proof.v2",
+    schema: "eco-6hoxj.163.42.busy-host-capture-proof.v3",
     scenario,
     ok: failed.length === 0 && checks.length > 0,
     counts: { total: checks.length, passed: checks.length - failed.length, failed: failed.length },
     failed: failed.map((entry) => `${entry.scenario}:${entry.name}`),
+    deterministicDigest,
     checks,
     receipts,
   }, null, 2));
