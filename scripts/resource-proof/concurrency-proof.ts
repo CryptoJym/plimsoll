@@ -6,7 +6,7 @@ import fs from "node:fs";
 import {
   createResourceSandbox,
   removeResourceSandbox,
-  runNoChangeConstantWorkContract,
+  runDirectoryObserverConcurrencyContract,
   type ResourceSandbox,
 } from "./scenarios";
 
@@ -27,84 +27,47 @@ async function withSandboxes<T>(
 
 async function main() {
   const originalReaddirSync = fs.readdirSync;
-
-  const concurrentSuccess = await withSandboxes(2, async ([first, second]) => {
+  const originalOpendirSync = fs.opendirSync;
+  const result = await withSandboxes(2, async ([first, second]) => {
     assert.ok(first && second);
-    return Promise.all([
-      runNoChangeConstantWorkContract(first),
-      runNoChangeConstantWorkContract(second),
-    ]);
+    return runDirectoryObserverConcurrencyContract([first.root, second.root]);
   });
-  const expectedEntries = concurrentSuccess[0]!.counters.filesystemEntriesScanned;
-  for (const receipt of concurrentSuccess) {
-    assert.equal(receipt.status, "pass");
-    assert.equal(receipt.counters.filesystemEntriesScanned, expectedEntries);
-    assert.ok(receipt.counters.filesystemEntriesScanned > 2_000);
-    assert.equal(receipt.counters.maintenanceRuns, 6);
-    assert.equal(receipt.measurements?.counterProvenanceProved, true);
-    assert.equal(receipt.measurements?.filesystemObserverRestored, true);
-  }
-  assert.deepEqual(
-    concurrentSuccess.map((receipt) => receipt.counters.filesystemEntriesScanned),
-    [expectedEntries, expectedEntries],
-    "separate sandbox observers must not count each other's directory entries",
-  );
-  assert.equal(
-    fs.readdirSync,
-    originalReaddirSync,
-    "concurrent success must restore the exact original fs.readdirSync identity",
-  );
 
-  const [successAfterFailure, injectedFailure] = await withSandboxes(
-    2,
-    async ([first, second]) => {
-      assert.ok(first && second);
-      return Promise.all([
-        runNoChangeConstantWorkContract(first),
-        runNoChangeConstantWorkContract(second, {
-          injectFailureAfterObserverRegistration: true,
-        }),
-      ]);
-    },
-  );
-  assert.equal(successAfterFailure.status, "pass");
-  assert.equal(successAfterFailure.counters.filesystemEntriesScanned, expectedEntries);
-  assert.equal(successAfterFailure.measurements?.counterProvenanceProved, true);
-  assert.equal(injectedFailure.status, "fail");
-  assert.equal(
-    injectedFailure.counters.filesystemEntriesScanned,
-    0,
-    "the injected failure must not inherit the concurrent sandbox's observations",
-  );
-  assert.equal(injectedFailure.measurements?.filesystemObserverRestored, true);
-  assert.equal(injectedFailure.measurements?.counterProvenanceProved, true);
-  assert.equal(
-    fs.readdirSync,
-    originalReaddirSync,
-    "injected failure must restore the exact original fs.readdirSync identity",
-  );
+  assert.equal(result.exercises.length, 2);
+  assert.deepEqual(result.isolationAssertions, [true, true]);
+  assert.equal(result.isolationProved, true);
+  assert.equal(result.crossCountedEntries, false);
+  assert.equal(result.injectedFailure, "fail");
+  assert.equal(result.injectedFailureEntriesScanned, 0);
+  assert.equal(result.injectedFailureObserverRestored, true);
+  assert.equal(result.exactGlobalIdentityRestored, true);
+  assert.equal(fs.readdirSync, originalReaddirSync);
+  assert.equal(fs.opendirSync, originalOpendirSync);
 
   process.stdout.write(
     `${JSON.stringify(
       {
         status: "pass",
         proof: "resource-proof-directory-observer-concurrency",
-        concurrentSuccesses: concurrentSuccess.length,
-        eachFilesystemEntriesScanned: concurrentSuccess.map(
-          (receipt) => receipt.counters.filesystemEntriesScanned,
+        concurrentSuccesses: result.exercises.length,
+        eachFilesystemEntriesScanned: result.exercises.map((exercise) => exercise.entries),
+        eachFilesystemEnumerationCalls: result.exercises.map((exercise) => exercise.calls),
+        eachFailedDirectoryEnumerationCalls: result.exercises.map(
+          (exercise) => exercise.failedCalls,
         ),
-        eachCounterProvenance: concurrentSuccess.map(
-          (receipt) => receipt.measurements?.counterProvenanceProved === true,
+        eachDirectoryReadFailures: result.exercises.map((exercise) => exercise.readFailures),
+        eachMetadataOperations: result.exercises.map((exercise) => exercise.metadataCalls),
+        eachMetadataFailures: result.exercises.map((exercise) => exercise.metadataFailures),
+        eachDeduplicatedEntries: result.exercises.map(
+          (exercise) => exercise.deduplicatedEntries,
         ),
-        eachObserverRestored: concurrentSuccess.map(
-          (receipt) => receipt.measurements?.filesystemObserverRestored === true,
-        ),
-        crossCountedEntries: false,
-        successAfterInjectedFailure: successAfterFailure.status,
-        injectedFailure: injectedFailure.status,
-        injectedFailureEntriesScanned:
-          injectedFailure.counters.filesystemEntriesScanned,
-        exactGlobalIdentityRestored: fs.readdirSync === originalReaddirSync,
+        eachCounterProvenance: result.isolationAssertions,
+        eachObserverRestored: result.exercises.map((exercise) => exercise.restored),
+        crossCountedEntries: result.crossCountedEntries,
+        successAfterInjectedFailure: "pass",
+        injectedFailure: result.injectedFailure,
+        injectedFailureEntriesScanned: result.injectedFailureEntriesScanned,
+        exactGlobalIdentityRestored: result.exactGlobalIdentityRestored,
       },
       null,
       2,
@@ -117,7 +80,7 @@ main().catch((error) => {
     `${JSON.stringify({
       status: "fail",
       proof: "resource-proof-directory-observer-concurrency",
-      error: error instanceof Error ? error.name : "UnknownError",
+      error: error instanceof Error ? error.stack ?? error.message : String(error),
     })}\n`,
   );
   process.exitCode = 1;

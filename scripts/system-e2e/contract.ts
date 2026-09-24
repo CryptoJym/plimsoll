@@ -4,7 +4,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 export const SYSTEM_E2E_SCHEMA = "plimsoll.system-e2e-proof.v2" as const;
-export const SUPPORT_NORMALIZATION_VERSION = 7 as const;
+export const SUPPORT_NORMALIZATION_VERSION = 10 as const;
 /** Fixed release thresholds. These are never derived from an observed run. */
 export const SYSTEM_E2E_BUDGETS = {
   directRows: 500,
@@ -205,6 +205,10 @@ function normalizeString(
 }
 
 const VOLATILE_NUMBER_KEYS = /^(?:pid|port|durationMs|elapsedMs|warmP95Ms|tempBytes|maxRssBytes|serializedBytes|receiptBytes|parentCredentialLikeNameCount)$/i;
+// The resource receipt keeps all directory work in the semantic artifact. The
+// system-e2e gate checks the generated fixture's exact setup and unchanged
+// counts, so normalizing those fields would let a partial walk share a digest
+// with a complete one.
 const RESOURCE_VOLATILE_NUMBER_PATH =
   /^(?:root\.scenarios\[\d+\]\{id=bounded_generation_capture\}\.(?:counters\.(?:fileBytesRead|filesOpened|maintenanceRuns)|measurements\.(?:rssGrowthBytes|statusProbes|warmStatusP95Ms))|root\.scenarios\[\d+\]\{id=dashboard_projection_budget\}\.measurements\.generation|root\.scenarios\[\d+\]\{id=no_change_constant_work\}\.(?:counters\.maintenanceRuns|measurements\.(?:baselineCadences|maxCodexPendingMetadata|maxClaudePendingMetadata|maxAggregatePendingMetadata)))$/;
 

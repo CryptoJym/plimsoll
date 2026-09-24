@@ -24,11 +24,5 @@
       "reason": "Needs a v0.7.4 checkout (PLIMSOLL_V074_ROOT, default ../plimsoll-v074) and the private plimsoll-cloud source (PLIMSOLL_CLOUD_ROOT, default ../plimsoll-cloud: src/lib/delivery-ack.ts and src/lib/delivery-ack-response.ts), which the public CI checkout cannot fetch. The rule it proves (skippedStale counts every submitted row) also runs in CI as proof:delivery partial_acknowledgement_counts_rejected_rows_as_skipped_stale."
     }
   },
-  "quarantined": {
-    "scripts/resource-proof/concurrency-proof.ts": {
-      "owner": "eco-6hoxj.163.31",
-      "expires": "2026-10-07",
-      "reason": "Known red since d749a43 moved capture discovery to fs.opendirSync: the resource proof's directory observer wraps only fs.readdirSync, so it counts 0 entries and this proof's 2,000-entry floor fails. Lane eco-6hoxj.163.31 is repairing it; the fix also changes the no_change_constant_work receipt that the system-e2e support contract pins. The gate fails after the expiry date until the proof is repaired and wired or the quarantine is renewed in review."
-    }
-  }
+  "quarantined": {}
 }
