@@ -1100,6 +1100,8 @@ function launchAgentUnloadReceipt(
  * rather than down (review r2, F4).
  */
 const COLLECTOR_STATUS_TIMEOUT_DEFAULT_MS = 3_000;
+/** Pause before the next upload cycle when the last one stopped at its batch cap. */
+const SYNC_CATCH_UP_DELAY_MS = 5_000;
 
 function collectorStatusTimeoutMs() {
   const configured = Number(process.env.PLIMSOLL_COLLECTOR_DOCTOR_TIMEOUT_MS ?? "");
@@ -2702,8 +2704,10 @@ async function main() {
       };
       let uploaded = 0;
       let serverRetryAfterMs = 0;
+      let catchUp = false;
       try {
         let batches = 0;
+        let remainingDelivery = 0;
         while (batches < config.delivery.maxBatchesPerCycle) {
           // A batch acknowledges, leases and seals in synchronous writer turns;
           // intake and /status run between batches (eco-6hoxj.163.24).
@@ -2716,10 +2720,13 @@ async function main() {
           uploadedBatches.push(result.batch);
           uploaded += result.uploadedEvents;
           batches += 1;
+          remainingDelivery = result.remainingDelivery;
           // A partial batch can both acknowledge siblings and ask us to wait.
           serverRetryAfterMs = "retryAfterMs" in result.delivery ? Number(result.delivery.retryAfterMs) : 0;
           if (serverRetryAfterMs > 0 || result.remainingDelivery === 0) break;
         }
+        catchUp = batches >= config.delivery.maxBatchesPerCycle && serverRetryAfterMs === 0 &&
+          remainingDelivery > 0;
         if (uploaded > 0) {
           console.log(
             JSON.stringify({
@@ -2837,6 +2844,12 @@ async function main() {
         );
       } finally {
         syncInFlight = false;
+        // A cycle that stopped at its batch cap with delivery still due starts
+        // the next one shortly rather than at the next interval tick, so a
+        // backlog above one cycle drains at upload speed, not at 10k events
+        // per interval (eco-6hoxj.163.24). Failures and a server Retry-After
+        // never chain: they keep the scheduler's own backoff.
+        if (catchUp && !shuttingDown) setTimeout(() => void runSync(), SYNC_CATCH_UP_DELAY_MS).unref();
       }
     };
 
