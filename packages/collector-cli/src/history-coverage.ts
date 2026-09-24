@@ -358,6 +358,14 @@ export type GrokUsageSweepCounters = {
   discoveryErrors: number;
   statErrors: number;
   readErrors: number;
+  /**
+   * Groups and sessions a capped listing left to a later sweep's window. A
+   * sweep with either is not clean; the entries are not dropped.
+   */
+  groupsOverLimit: number;
+  sessionsOverLimit: number;
+  /** Usage files the recent lane queued ahead of the walk. */
+  recentFiles: number;
 };
 
 /** Durable receipt of the automatic Grok usage backfill; path- and content-free. */

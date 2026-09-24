@@ -61,8 +61,18 @@ import { attachRepoContextId, canonicalRepoContextCwd } from "./repo-context";
  *    revision event carrying only the increase, and a rewrite that lowers any
  *    counted number is refused and counted: a turn is never counted twice.
  *  - Change detection: an unchanged usage.json (same device, inode, size,
- *    mtime and ctime) costs one lstat and no read; a changed one whose bytes
- *    hash to the last committed document costs a read but no parse.
+ *    mtime and ctime) costs one lstat and no read per sweep (a second one
+ *    when its group is among the recently modified ones the recent lane
+ *    checks); a changed one whose bytes hash to the last committed document
+ *    costs a read but no parse.
+ *  - Walk order: every directory is streamed one entry per step, never
+ *    materialized by one call, and each step is admitted by the shared
+ *    budget. A sweep first checks the most recently modified groups for
+ *    usage files written in the last two days, so today's tokens arrive
+ *    first. It then walks every group and session in the order of a hash of
+ *    its name, starting at a durable, path-free cursor, so every session is
+ *    reached whatever its age. A listing larger than its cap is visited in
+ *    windows over later sweeps and counted, never dropped.
  *  - Bounds: discovery entries and wall time per pass, pending files, a
  *    per-document byte ceiling and the shared automatic capture budget
  *    (bytes, records = turns, events, wall). Work left over is deferred, never
@@ -81,14 +91,23 @@ export const GROK_USAGE_LIMITS = Object.freeze({
   maxFileBytes: 512 * 1024,
   maxTurnsPerFile: 10_000,
   maxModelsPerTurn: 64,
+  /**
+   * Directory names held for one listing. A larger directory is visited in
+   * windows of this size over consecutive sweeps and counted as over limit;
+   * nothing is dropped.
+   */
   maxGroups: 4_096,
   maxSessionsPerGroup: 100_000,
-  /** Session directories (plus group directories) visited per pass. */
+  /** Discovery steps (one directory entry, open or observation) per pass. */
   entriesPerPass: 2_048,
   discoveryWallMs: 50,
   pendingFiles: 64,
-  /** A sweep that grows past this restarts instead of resuming forever. */
+  /** Sessions one sweep observes before it ends and resumes at its cursor. */
   lifetimeEntryLimit: 200_000,
+  /** The recent lane: groups modified within the window, newest first. */
+  recentGroups: 16,
+  recentSessions: 4_096,
+  recentWindowMs: 48 * 60 * 60 * 1_000,
 });
 
 export type GrokUsageLimits = { readonly [Key in keyof typeof GROK_USAGE_LIMITS]: number };
@@ -96,7 +115,10 @@ export type GrokUsageLimits = { readonly [Key in keyof typeof GROK_USAGE_LIMITS]
 const FILE_STATE_TABLE = "grok_usage_file_state";
 const TURN_STATE_TABLE = "grok_usage_turn_state";
 const SWEEP_RESUME_KEY = "grok_usage_sweep_resume_v1";
-const SWEEP_CURSOR_SCHEMA_VERSION = 1 as const;
+const SWEEP_CURSOR_SCHEMA_VERSION = 2 as const;
+const WALK_HASH = /^[0-9a-f]{32}$/;
+/** A session position after every session of its group. */
+const AFTER_EVERY_SESSION = "f".repeat(32);
 const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$/;
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9._:+-]{0,127}$/;
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -158,29 +180,48 @@ type Candidate = {
 
 type SweepCounters = GrokUsageSweepCounters;
 
+type WalkEntry = { name: string; hash: string };
+type GroupEntry = WalkEntry & { mtimeMs: number };
+/**
+ * A point in the cyclic walk, as hashes of the group and session names: the
+ * ledger never holds the working directory a group name encodes.
+ */
+type WalkCursor = { group: string; session: string | null };
+/** One backbone visit of a group: its sessions with a hash in (after, upTo]. */
+type GroupVisit = GroupEntry & { after: string | null; upTo: string | null };
+
 type Sweep = {
   startedAt: string;
-  groups: string[] | null;
-  /** The walk is circular: it starts at `origin` and visits every group once. */
-  origin: number;
-  groupsVisited: number;
-  sessions: string[] | null;
-  sessionIndex: number;
+  /** Where this sweep's cyclic walk begins; null begins at the lowest hash. */
+  cursor: WalkCursor | null;
+  stage: "root" | "recent" | "backbone";
+  rootOpened: boolean;
+  root: fs.Dir | null;
+  groupsListed: number;
+  /** Bounded selection of the groups this sweep walks, then its plan. */
+  groupWindow: GroupEntry[];
+  groupsOverLimit: boolean;
+  recentGroups: GroupEntry[];
+  recent: { index: number; handle: fs.Dir | null; observed: number };
+  plan: GroupVisit[];
+  planIndex: number;
+  group: {
+    visit: GroupVisit;
+    handle: fs.Dir | null;
+    window: WalkEntry[];
+    listed: number;
+    sessions: WalkEntry[] | null;
+    index: number;
+  } | null;
+  /** Discovery steps this sweep; published as its entries. */
   entries: number;
+  /** Backbone session observations, which the lifetime limit bounds. */
+  observed: number;
   done: boolean;
   limitReached: boolean;
   counters: SweepCounters;
-  /** Name-based cursor survives recency reordering and process restarts. */
-  resumeGroupName: string | null;
-  resumeSessionName: string | null;
-  lastGroupName: string | null;
-  lastSessionName: string | null;
-};
-
-type SweepCursor = {
-  version: typeof SWEEP_CURSOR_SCHEMA_VERSION;
-  groupName: string;
-  sessionName: string;
+  /** How far the walk has come (the last session observed, or past a whole group): the next sweep's cursor if cut short. */
+  last: WalkCursor | null;
 };
 
 export type GrokUsageFileCounters = {
@@ -194,6 +235,11 @@ export type GrokUsageFileCounters = {
   errors: number;
   /** Tokens Grok's session totals hold beyond its turn records, host-wide. */
   sessionOnlyTokens: number;
+  /** Groups and sessions a capped listing left to a later sweep's window. */
+  groupsOverLimit: number;
+  sessionsOverLimit: number;
+  /** Usage files the recent lane queued ahead of the walk this sweep. */
+  recentFiles: number;
 };
 
 export type GrokUsageScanReceipt = CaptureScanProgress & { usageFiles: GrokUsageFileCounters };
@@ -250,6 +296,7 @@ function zeroCounters(): SweepCounters {
     filesSeen: 0, filesUnchanged: 0, filesParsed: 0, filesUnresolved: 0,
     filesOversized: 0, filesDeferred: 0, bytesRead: 0, eventsAppended: 0,
     parseErrors: 0, discoveryErrors: 0, statErrors: 0, readErrors: 0,
+    groupsOverLimit: 0, sessionsOverLimit: 0, recentFiles: 0,
   };
 }
 
@@ -586,38 +633,43 @@ function realDirectory(directory: string): fs.BigIntStats | null {
   }
 }
 
-/**
- * Return bounded directory names with newest directories first.
- *
- * Grok's group/session names are opaque and lexical order is unrelated to
- * activity. Directory mtime is the metadata Grok updates when a session is
- * created or its usage file is written, so it is a cheap recency signal that
- * avoids opening any content file. The returned list is deterministic for
- * equal mtimes and remains capped by the existing lifetime limits.
- */
-function recentDirectoryNames(directory: string, limit: number) {
-  const entries = fs.readdirSync(directory, { withFileTypes: true });
-  const names = entries
-    .filter((entry) => entry.isDirectory() && !entry.name.startsWith("."))
-    .map((entry) => {
-      let mtimeMs = 0;
-      try {
-        const stat = fs.lstatSync(path.join(directory, entry.name), { bigint: true });
-        if (!stat.isDirectory() || stat.isSymbolicLink()) return null;
-        mtimeMs = Number(stat.mtimeMs);
-      } catch {
-        // A disappearing/unreadable directory is still ordered deterministically
-        // and will be rejected by the existing realDirectory guard below.
-        mtimeMs = 0;
-      }
-      return { name: entry.name, mtimeMs: Number.isFinite(mtimeMs) ? mtimeMs : 0 };
-    })
-    .filter((entry): entry is { name: string; mtimeMs: number } => entry !== null);
-  names.sort((left, right) => right.mtimeMs - left.mtimeMs || left.name.localeCompare(right.name));
-  return {
-    names: names.slice(0, limit).map((entry) => entry.name),
-    truncated: names.length > limit,
-  };
+/** The durable, path-free key of one usage file (unchanged since 0.7.37). */
+function grokUsageFileKey(file: string) {
+  return sha256(`plimsoll-grok-usage-v1\0${file}`);
+}
+
+/** Walk order key: a hash of the directory name, never the name itself. */
+function walkHash(name: string) {
+  return sha256(`plimsoll-grok-walk-v1\0${name}`).slice(0, 32);
+}
+
+function byHash(left: WalkEntry, right: WalkEntry) {
+  return left.hash < right.hash ? -1 : left.hash > right.hash ? 1 : 0;
+}
+
+function closeDirectory(handle: fs.Dir | null) {
+  try {
+    handle?.closeSync();
+  } catch {
+    // Discovery already recorded what it saw; a close failure must not throw.
+  }
+}
+
+function encodeCursor(cursor: WalkCursor) {
+  return JSON.stringify({ version: SWEEP_CURSOR_SCHEMA_VERSION, group: cursor.group, session: cursor.session });
+}
+
+/** Only this version's cursor resumes. 0.7.37's numeric origin (and any other value) starts a fresh cycle. */
+function decodeCursor(raw: string | undefined): WalkCursor | null {
+  try {
+    const parsed = JSON.parse(raw ?? "null") as { version?: unknown; group?: unknown; session?: unknown } | null;
+    if (parsed?.version !== SWEEP_CURSOR_SCHEMA_VERSION || typeof parsed.group !== "string" ||
+      !WALK_HASH.test(parsed.group)) return null;
+    if (parsed.session !== null && (typeof parsed.session !== "string" || !WALK_HASH.test(parsed.session))) return null;
+    return { group: parsed.group, session: parsed.session };
+  } catch {
+    return null;
+  }
 }
 
 export function ensureGrokUsageState(database: Database.Database) {
@@ -671,6 +723,8 @@ function writeMaintenanceState(database: Database.Database, key: string, value: 
 export class GrokUsageTailer {
   private sweep: Sweep | null = null;
   private pending: Candidate[] = [];
+  /** The recent lane and the walk can meet the same file; queue it once. */
+  private readonly pendingKeys = new Set<string>();
   private persistedResume: string | null = null;
   private readonly sessionsRoot: string | null;
 
@@ -686,8 +740,20 @@ export class GrokUsageTailer {
   }
 
   close() {
+    this.closeSweep(this.sweep);
     this.sweep = null;
     this.pending = [];
+    this.pendingKeys.clear();
+  }
+
+  private closeSweep(sweep: Sweep | null) {
+    if (!sweep) return;
+    closeDirectory(sweep.root);
+    closeDirectory(sweep.recent.handle);
+    closeDirectory(sweep.group?.handle ?? null);
+    sweep.root = null;
+    sweep.recent.handle = null;
+    if (sweep.group) sweep.group.handle = null;
   }
 
   async scan(options: {
@@ -715,7 +781,7 @@ export class GrokUsageTailer {
       this.beginSweepIfNeeded(scanNow);
       await this.drainPending(budget, result, options.signal);
       if (!result.aborted && this.pending.length < this.limits.pendingFiles) {
-        entriesThisTick = this.discover(budget, result, options.signal);
+        entriesThisTick = this.discover(budget, result, scanNow, options.signal);
         await this.drainPending(budget, result, options.signal);
       }
       if (this.sweep && this.sweep.done && this.pending.length === 0) this.finishSweep(scanNow, result);
@@ -785,133 +851,308 @@ export class GrokUsageTailer {
       };
       writeMaintenanceState(database, GROK_USAGE_BACKFILL_KEY, JSON.stringify(marker));
     }
-    // A restarted worker resumes near where the last one stopped, so a large
-    // tree is still covered when workers are replaced mid-sweep. Prefer the
-    // name-based cursor (which remains valid when mtime ordering changes), but
-    // accept the original numeric cursor written by 0.7.37.
-    const rawResume = readMaintenanceState(database, SWEEP_RESUME_KEY) ?? "";
-    let resume = Number(rawResume);
-    let resumeGroupName: string | null = null;
-    let resumeSessionName: string | null = null;
-    try {
-      const parsed = JSON.parse(rawResume) as Partial<SweepCursor>;
-      if (parsed.version === SWEEP_CURSOR_SCHEMA_VERSION &&
-          typeof parsed.groupName === "string" && parsed.groupName.length > 0 &&
-          typeof parsed.sessionName === "string" && parsed.sessionName.length > 0) {
-        resumeGroupName = parsed.groupName;
-        resumeSessionName = parsed.sessionName;
-      }
-    } catch {
-      // Legacy numeric state (or corrupt state) falls back to origin zero.
-    }
+    // A restarted worker resumes where the last one stopped, so a large tree
+    // is still covered when workers are replaced mid-sweep.
     this.sweep = {
       startedAt: scanNow.toISOString(),
-      groups: null,
-      origin: Number.isSafeInteger(resume) && resume > 0 ? resume : 0,
-      groupsVisited: 0,
-      sessions: null,
-      sessionIndex: 0,
+      cursor: decodeCursor(readMaintenanceState(database, SWEEP_RESUME_KEY)),
+      stage: "root",
+      rootOpened: false,
+      root: null,
+      groupsListed: 0,
+      groupWindow: [],
+      groupsOverLimit: false,
+      recentGroups: [],
+      recent: { index: 0, handle: null, observed: 0 },
+      plan: [],
+      planIndex: 0,
+      group: null,
       entries: 0,
+      observed: 0,
       done: false,
       limitReached: false,
       counters: zeroCounters(),
-      resumeGroupName,
-      resumeSessionName,
-      lastGroupName: null,
-      lastSessionName: null,
+      last: null,
     };
   }
 
-  /** Bounded, resumable walk of sessions/<group>/<session>/usage.json. */
-  private discover(budget: CaptureWorkBudget, result: GrokUsageScanResult, signal?: AbortSignal) {
+  /**
+   * Bounded, resumable walk of sessions/<group>/<session>/usage.json. Each
+   * step reads at most one directory entry and makes at most one lstat, and
+   * is admitted only while the shared budget, this pass's wall and entry
+   * allowance and the pending queue all have room. No step lists, stats or
+   * sorts a whole directory tree.
+   */
+  private discover(budget: CaptureWorkBudget, result: GrokUsageScanResult, scanNow: Date, signal?: AbortSignal) {
     const sweep = this.sweep!;
     const root = this.sessionsRoot!;
     const started = performance.now();
     const wallMs = Math.min(this.limits.discoveryWallMs, Math.max(1, budget.remainingWallMs()));
     let entries = 0;
-    const counters = sweep.counters;
     while (!sweep.done && entries < this.limits.entriesPerPass &&
       this.pending.length < this.limits.pendingFiles && budget.canContinue() &&
       performance.now() - started < wallMs && !signal?.aborted) {
-      if (sweep.groups === null) {
-        entries += 1;
-        if (!realDirectory(root)) {
-          // No Grok sessions on this host: an empty, finished sweep.
-          sweep.groups = [];
-          sweep.done = true;
-          break;
-        }
-        try {
-          const ordered = recentDirectoryNames(root, this.limits.maxGroups);
-          sweep.groups = ordered.names;
-          if (sweep.resumeGroupName) {
-            const namedOrigin = sweep.groups.indexOf(sweep.resumeGroupName);
-            if (namedOrigin >= 0) sweep.origin = namedOrigin;
-          }
-        } catch {
-          counters.discoveryErrors += 1;
-          result.discoveryErrors += 1;
-          sweep.groups = [];
-        }
-        sweep.origin = sweep.groups.length === 0 ? 0 : sweep.origin % sweep.groups.length;
-        continue;
-      }
-      if (sweep.groupsVisited >= sweep.groups.length) {
+      if (this.walkStep(root, result, scanNow.getTime())) entries += 1;
+      if (sweep.observed >= this.limits.lifetimeEntryLimit && !sweep.done) {
+        sweep.limitReached = true;
         sweep.done = true;
-        break;
       }
-      const groupName = sweep.groups[(sweep.origin + sweep.groupsVisited) % sweep.groups.length]!;
-      const groupDirectory = path.join(root, groupName);
-      if (sweep.sessions === null) {
-        entries += 1;
-        sweep.sessionIndex = 0;
-        try {
-          if (!realDirectory(groupDirectory)) throw new Error("grok_usage_group_not_directory");
-          sweep.sessions = recentDirectoryNames(groupDirectory, this.limits.maxSessionsPerGroup).names;
-          if (sweep.groupsVisited === 0 && groupName === sweep.resumeGroupName && sweep.resumeSessionName) {
-            const namedSession = sweep.sessions.indexOf(sweep.resumeSessionName);
-            if (namedSession >= 0) sweep.sessionIndex = namedSession + 1;
-          }
-        } catch {
-          counters.discoveryErrors += 1;
-          result.discoveryErrors += 1;
-          sweep.sessions = [];
-        }
-        continue;
-      }
-      if (sweep.sessionIndex >= sweep.sessions.length) {
-        sweep.groupsVisited += 1;
-        sweep.sessions = null;
-        continue;
-      }
-      const sessionName = sweep.sessions[sweep.sessionIndex]!;
-      sweep.sessionIndex += 1;
-      entries += 1;
-      sweep.lastGroupName = groupName;
-      sweep.lastSessionName = sessionName;
-      this.observeSession(root, groupName, sessionName, result);
     }
     sweep.entries += entries;
     result.activity.discoveryEntries += entries;
-    if (sweep.entries >= this.limits.lifetimeEntryLimit && !sweep.done) {
+    if (!sweep.done && sweep.last) this.persistCursor(encodeCursor(sweep.last));
+    return entries;
+  }
+
+  private persistCursor(value: string) {
+    if (value === this.persistedResume) return;
+    writeMaintenanceState(this.buffer.database, SWEEP_RESUME_KEY, value);
+    this.persistedResume = value;
+  }
+
+  /** One discovery step. Returns whether it touched the filesystem. */
+  private walkStep(root: string, result: GrokUsageScanResult, nowMs: number): boolean {
+    const sweep = this.sweep!;
+    if (sweep.stage === "root") return this.listRootStep(root, result, nowMs);
+    if (sweep.stage === "recent") return this.recentStep(root, nowMs);
+    return this.walkGroupStep(root, result);
+  }
+
+  /** Stream sessions/: one entry, and one lstat for its mtime, per step. */
+  private listRootStep(root: string, result: GrokUsageScanResult, nowMs: number): boolean {
+    const sweep = this.sweep!;
+    if (!sweep.rootOpened) {
+      sweep.rootOpened = true;
+      if (!realDirectory(root)) {
+        // No Grok sessions on this host: an empty, finished sweep.
+        sweep.done = true;
+        return true;
+      }
+      try {
+        sweep.root = fs.opendirSync(root);
+      } catch {
+        this.discoveryError(result);
+        this.planWalk();
+      }
+      return true;
+    }
+    let entry: fs.Dirent | null = null;
+    try {
+      entry = sweep.root!.readSync();
+    } catch {
+      this.discoveryError(result);
+    }
+    if (!entry) {
+      closeDirectory(sweep.root);
+      sweep.root = null;
+      this.planWalk();
+      return true;
+    }
+    if (!entry.isDirectory() || entry.name.startsWith(".")) return true;
+    const stat = realDirectory(path.join(root, entry.name));
+    if (!stat) return true;
+    const group: GroupEntry = { name: entry.name, hash: walkHash(entry.name), mtimeMs: Number(stat.mtimeMs) };
+    sweep.groupsListed += 1;
+    if (this.limits.recentGroups > 0 && group.mtimeMs >= nowMs - this.limits.recentWindowMs) {
+      sweep.recentGroups.push(group);
+      sweep.recentGroups.sort((left, right) => right.mtimeMs - left.mtimeMs || byHash(left, right));
+      if (sweep.recentGroups.length > this.limits.recentGroups) sweep.recentGroups.length = this.limits.recentGroups;
+    }
+    sweep.groupWindow.push(group);
+    if (sweep.groupWindow.length >= 2 * this.limits.maxGroups) this.trimGroupWindow();
+    return true;
+  }
+
+  /**
+   * Keep the groups nearest the cursor in cyclic hash order: the cursor's own
+   * group first, then higher hashes, then (wrapping) lower ones.
+   */
+  private trimGroupWindow() {
+    const sweep = this.sweep!;
+    const start = sweep.cursor?.group ?? null;
+    const lap = (entry: WalkEntry) => start === null || entry.hash >= start ? 0 : 1;
+    sweep.groupWindow.sort((left, right) => lap(left) - lap(right) || byHash(left, right));
+    if (sweep.groupWindow.length > this.limits.maxGroups) {
+      sweep.groupWindow.length = this.limits.maxGroups;
+      sweep.groupsOverLimit = true;
+    }
+  }
+
+  /** The cyclic plan: resume inside the cursor's group, go round, and end where it began. */
+  private planWalk() {
+    const sweep = this.sweep!;
+    this.trimGroupWindow();
+    sweep.counters.groupsOverLimit += sweep.groupsListed - sweep.groupWindow.length;
+    const cursor = sweep.cursor;
+    sweep.plan = sweep.groupWindow.map((group) => ({
+      ...group,
+      after: cursor && group.hash === cursor.group ? cursor.session : null,
+      upTo: null,
+    }));
+    // A window that holds every group closes the cycle in the start group's
+    // own first sessions. A capped window ends short of that; the walk
+    // reaches those sessions when a later sweep wraps round to the group.
+    const start = cursor?.session && !sweep.groupsOverLimit
+      ? sweep.groupWindow.find((group) => group.hash === cursor.group)
+      : undefined;
+    if (start) sweep.plan.push({ ...start, after: null, upTo: cursor!.session });
+    sweep.groupWindow = [];
+    sweep.stage = sweep.recentGroups.length > 0 ? "recent" : "backbone";
+  }
+
+  /**
+   * The recent lane. It observes the sessions of the most recently modified
+   * groups and queues changed usage files written inside the recent window,
+   * ahead of the walk. It is bounded, keeps no cursor and counts only what it
+   * queued: the walk still visits and counts every one of these sessions.
+   */
+  private recentStep(root: string, nowMs: number): boolean {
+    const sweep = this.sweep!;
+    const lane = sweep.recent;
+    if (lane.index >= sweep.recentGroups.length || lane.observed >= this.limits.recentSessions) {
+      closeDirectory(lane.handle);
+      lane.handle = null;
+      sweep.stage = "backbone";
+      return false;
+    }
+    const groupName = sweep.recentGroups[lane.index]!.name;
+    if (!lane.handle) {
+      const directory = path.join(root, groupName);
+      try {
+        lane.handle = realDirectory(directory) ? fs.opendirSync(directory) : null;
+      } catch {
+        lane.handle = null;
+      }
+      // An unreadable group is the walk's to report.
+      if (!lane.handle) lane.index += 1;
+      return true;
+    }
+    let entry: fs.Dirent | null = null;
+    try {
+      entry = lane.handle.readSync();
+    } catch {
+      entry = null;
+    }
+    if (!entry) {
+      closeDirectory(lane.handle);
+      lane.handle = null;
+      lane.index += 1;
+      return true;
+    }
+    if (!entry.isDirectory() || entry.name.startsWith(".")) return true;
+    lane.observed += 1;
+    const file = path.join(root, groupName, entry.name, GROK_USAGE_FILE_NAME);
+    let stat: fs.BigIntStats;
+    try {
+      stat = fs.lstatSync(file, { bigint: true });
+    } catch {
+      return true;
+    }
+    if (stat.isSymbolicLink() || !stat.isFile() || Number(stat.mtimeMs) < nowMs - this.limits.recentWindowMs) return true;
+    const fileKey = grokUsageFileKey(file);
+    if (this.pendingKeys.has(fileKey) || this.unchanged(fileKey, stat)) return true;
+    this.enqueue({ file, fileKey, groupName, sessionName: entry.name,
+      sessionDirectory: path.dirname(file), identity: identityOf(stat) });
+    sweep.counters.recentFiles += 1;
+    return true;
+  }
+
+  /** The walk: list one group in hash order (bounded window), then observe its sessions. */
+  private walkGroupStep(root: string, result: GrokUsageScanResult): boolean {
+    const sweep = this.sweep!;
+    if (!sweep.group) {
+      if (sweep.planIndex >= sweep.plan.length) {
+        // Groups past the window come first in the next sweep's cycle.
+        if (sweep.groupsOverLimit) sweep.limitReached = true;
+        sweep.done = true;
+        return false;
+      }
+      const visit = sweep.plan[sweep.planIndex]!;
+      const directory = path.join(root, visit.name);
+      let handle: fs.Dir | null = null;
+      try {
+        if (!realDirectory(directory)) throw new Error("grok_usage_group_not_directory");
+        handle = fs.opendirSync(directory);
+      } catch {
+        this.discoveryError(result);
+        sweep.planIndex += 1;
+        // The cursor still moves past it: a failing group must not pin a
+        // capped walk to the same window.
+        sweep.last = { group: visit.hash, session: AFTER_EVERY_SESSION };
+        return true;
+      }
+      sweep.group = { visit, handle, window: [], listed: 0, sessions: null, index: 0 };
+      return true;
+    }
+    const group = sweep.group;
+    const visit = group.visit;
+    const limit = this.limits.maxSessionsPerGroup;
+    if (group.sessions === null) {
+      let entry: fs.Dirent | null = null;
+      try {
+        entry = group.handle!.readSync();
+      } catch {
+        this.discoveryError(result);
+      }
+      if (entry) {
+        if (entry.isDirectory() && !entry.name.startsWith(".")) {
+          const hash = walkHash(entry.name);
+          if ((visit.after === null || hash > visit.after) && (visit.upTo === null || hash <= visit.upTo)) {
+            group.listed += 1;
+            group.window.push({ name: entry.name, hash });
+            if (group.window.length >= 2 * limit) group.window.sort(byHash).length = limit;
+          }
+        }
+        return true;
+      }
+      closeDirectory(group.handle);
+      group.handle = null;
+      group.window.sort(byHash);
+      if (group.window.length > limit) group.window.length = limit;
+      group.sessions = group.window;
+      group.window = [];
+      return true;
+    }
+    if (group.index < group.sessions.length) {
+      const session = group.sessions[group.index]!;
+      group.index += 1;
+      sweep.observed += 1;
+      sweep.last = { group: visit.hash, session: session.hash };
+      this.observeSession(root, visit.name, session.name, result);
+      return true;
+    }
+    sweep.group = null;
+    sweep.planIndex += 1;
+    const overLimit = group.listed - group.sessions.length;
+    if (overLimit > 0) {
+      // The rest of this group is the next sweep's first window. End the
+      // sweep here so the cursor resumes after the last session observed.
+      sweep.counters.sessionsOverLimit += overLimit;
       sweep.limitReached = true;
       sweep.done = true;
+    } else {
+      // Done with this group, even when it held no session.
+      sweep.last = { group: visit.hash, session: AFTER_EVERY_SESSION };
     }
-    if (!sweep.done && sweep.groups && sweep.groups.length > 0) {
-      const next = String((sweep.origin + sweep.groupsVisited) % sweep.groups.length);
-      const cursor = sweep.lastGroupName && sweep.lastSessionName
-        ? JSON.stringify({
-            version: SWEEP_CURSOR_SCHEMA_VERSION,
-            groupName: sweep.lastGroupName,
-            sessionName: sweep.lastSessionName,
-          } satisfies SweepCursor)
-        : next;
-      if (cursor !== this.persistedResume) {
-        writeMaintenanceState(this.buffer.database, SWEEP_RESUME_KEY, cursor);
-        this.persistedResume = cursor;
-      }
-    }
-    return entries;
+    return false;
+  }
+
+  private discoveryError(result: GrokUsageScanResult) {
+    this.sweep!.counters.discoveryErrors += 1;
+    result.discoveryErrors += 1;
+  }
+
+  private unchanged(fileKey: string, stat: fs.BigIntStats) {
+    const state = this.buffer.database.prepare(
+      `select device, inode, size, mtime_ns as mtimeNs, ctime_ns as ctimeNs, status
+       from ${FILE_STATE_TABLE} where file_key = ?`,
+    ).get(fileKey) as (Omit<Identity, "mtimeMs"> & { status: string }) | undefined;
+    return state && sameIdentity({ ...state, mtimeMs: 0 }, stat) ? state : null;
+  }
+
+  private enqueue(candidate: Candidate) {
+    this.pending.push(candidate);
+    this.pendingKeys.add(candidate.fileKey);
   }
 
   private observeSession(root: string, groupName: string, sessionName: string, result: GrokUsageScanResult) {
@@ -936,18 +1177,17 @@ export class GrokUsageTailer {
     }
     counters.filesSeen += 1;
     result.filesSeen += 1;
-    const fileKey = sha256(`plimsoll-grok-usage-v1\0${file}`);
-    const state = this.buffer.database.prepare(
-      `select device, inode, size, mtime_ns as mtimeNs, ctime_ns as ctimeNs, status
-       from ${FILE_STATE_TABLE} where file_key = ?`,
-    ).get(fileKey) as (Omit<Identity, "mtimeMs"> & { status: string }) | undefined;
-    if (state && sameIdentity({ ...state, mtimeMs: 0 }, stat)) {
+    const fileKey = grokUsageFileKey(file);
+    // Queued by the recent lane and not yet read: it is this sweep's already.
+    if (this.pendingKeys.has(fileKey)) return;
+    const state = this.unchanged(fileKey, stat);
+    if (state) {
       counters.filesUnchanged += 1;
       result.filesUnchanged += 1;
       if (state.status !== "committed") counters.filesUnresolved += 1;
       return;
     }
-    this.pending.push({ file, fileKey, groupName, sessionName, sessionDirectory, identity: identityOf(stat) });
+    this.enqueue({ file, fileKey, groupName, sessionName, sessionDirectory, identity: identityOf(stat) });
   }
 
   private async drainPending(budget: CaptureWorkBudget, result: GrokUsageScanResult, signal?: AbortSignal) {
@@ -962,6 +1202,7 @@ export class GrokUsageTailer {
       const outcome = this.processFile(candidate, budget, result);
       if (outcome === "deferred") return;
       this.pending.shift();
+      this.pendingKeys.delete(candidate.fileKey);
       sinceYield += 1;
       if (sinceYield >= 8 && this.pending.length > 0) {
         await new Promise<void>((resolve) => setImmediate(resolve));
@@ -1278,7 +1519,8 @@ export class GrokUsageTailer {
     const counters = sweep.counters;
     const clean = !sweep.limitReached && counters.filesUnresolved === 0 && counters.filesDeferred === 0 &&
       counters.parseErrors === 0 && counters.discoveryErrors === 0 && counters.statErrors === 0 &&
-      counters.readErrors === 0 && counters.filesOversized === 0;
+      counters.readErrors === 0 && counters.filesOversized === 0 &&
+      counters.groupsOverLimit === 0 && counters.sessionsOverLimit === 0;
     const database = this.buffer.database;
     const marker = grokUsageBackfillMarker(database) ?? {
       version: 1 as const, startedAt: sweep.startedAt, completedAt: null, sweeps: 0, lastSweep: null, completion: null,
@@ -1292,24 +1534,13 @@ export class GrokUsageTailer {
       completion: marker.completion ?? (clean ? { ...counters, completedAt } : null),
     };
     writeMaintenanceState(database, GROK_USAGE_BACKFILL_KEY, JSON.stringify(next));
-    // A sweep cut short by its lifetime limit continues where it stopped. The
-    // name-based cursor also survives a recency reorder between process
-    // restarts; retain the legacy numeric fallback only when no session was
-    // observed (for example an empty root).
-    const resume = sweep.limitReached && sweep.lastGroupName && sweep.lastSessionName
-      ? JSON.stringify({
-          version: SWEEP_CURSOR_SCHEMA_VERSION,
-          groupName: sweep.lastGroupName,
-          sessionName: sweep.lastSessionName,
-        } satisfies SweepCursor)
-      : sweep.limitReached && sweep.groups && sweep.groups.length > 0
-        ? String((sweep.origin + sweep.groupsVisited) % sweep.groups.length)
-        : "0";
-    if (resume !== this.persistedResume) {
-      writeMaintenanceState(database, SWEEP_RESUME_KEY, resume);
-      this.persistedResume = resume;
-    }
+    // A sweep cut short by a limit continues where it stopped; a finished
+    // cycle starts the next one at the lowest hash. "0" is also the value
+    // 0.7.37 reads as its own origin, so a downgrade rescans from the start.
+    const resumeAt = sweep.limitReached ? sweep.last ?? sweep.cursor : null;
+    this.persistCursor(resumeAt ? encodeCursor(resumeAt) : "0");
     result.exhaustive = clean;
+    this.closeSweep(sweep);
     this.lastSweep = sweep;
     this.sweep = null;
   }
@@ -1347,8 +1578,8 @@ export class GrokUsageTailer {
       // No sweep yet is no receipt: it must not read as a finished sweep.
       discovery: sweep ? {
         rootsTotal: 1,
-        rootsStarted: sweep.groups === null ? 0 : 1,
-        openDirectories: sweep.sessions ? 1 : 0,
+        rootsStarted: sweep.rootOpened ? 1 : 0,
+        openDirectories: [sweep.root, sweep.recent.handle, sweep.group?.handle].filter(Boolean).length,
         entriesVisited: sweep.entries,
         lifetimeEntryLimit: this.limits.lifetimeEntryLimit,
         limitReached: sweep.limitReached,
@@ -1378,6 +1609,9 @@ export class GrokUsageTailer {
         unresolved: counters.filesUnresolved,
         errors: counters.parseErrors + counters.discoveryErrors + counters.statErrors + counters.readErrors,
         sessionOnlyTokens,
+        groupsOverLimit: counters.groupsOverLimit,
+        sessionsOverLimit: counters.sessionsOverLimit,
+        recentFiles: counters.recentFiles,
       },
     };
   }
