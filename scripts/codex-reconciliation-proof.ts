@@ -28,6 +28,24 @@ function check(name: string, condition: unknown, detail: Record<string, unknown>
 
 type LegacyFixtureShape = "irrelevant" | "sparse" | "dense-context" | "mixed";
 
+/**
+ * Deterministic slice clock (eco-6hoxj.163.23). Every budget check a slice
+ * makes costs BUDGET_CHECK_MS of virtual time, so a default 50 ms slice does
+ * the same work on every host instead of however much fits into 50 real ms.
+ * 0.4 ms per check reproduces the reference run recorded in issue 0047
+ * (sparse history projected the surveyed ledger to 65-81 cycles). Real
+ * durations are still recorded for information, not asserted.
+ */
+const BUDGET_CHECK_MS = 0.4;
+const DEFAULT_SLICE_MS = 50;
+// Once a slice notices its deadline it starts no further unit of work; at
+// most four constant exit checks follow before it returns.
+const MAX_VIRTUAL_SLICE_MS = DEFAULT_SLICE_MS + 4 * BUDGET_CHECK_MS;
+function sliceClock() {
+  let now = 0;
+  return () => (now += BUDGET_CHECK_MS);
+}
+
 function seedLegacyLedger(
   file: string,
   rows: number,
@@ -613,7 +631,7 @@ function provePriorDraftCandidatePriorityMigration(root: string) {
     let resolutionCycle: number | null = null;
     const slices: ReturnType<typeof runCodexReconciliationMaintenance>[] = [];
     for (let cycle = 1; cycle <= 2; cycle += 1) {
-      slices.push(runCodexReconciliationMaintenance(buffer.database));
+      slices.push(runCodexReconciliationMaintenance(buffer.database, { clock: sliceClock() }));
       const row = buffer.database
         .prepare(
            `select session_id as sessionId, model, cost_usd as costUsd
@@ -683,7 +701,7 @@ function proveLegacyCadence(root: string, shape: "sparse" | "dense-context") {
     const durations: number[] = [];
     for (let slice = 0; slice < 240; slice += 1) {
       const started = performance.now();
-      const result = runCodexReconciliationMaintenance(buffer.database);
+      const result = runCodexReconciliationMaintenance(buffer.database, { clock: sliceClock() });
       durations.push(performance.now() - started);
       results.push(result);
       assert.ok(result.legacyRowsVisited <= 100_000);
@@ -692,32 +710,44 @@ function proveLegacyCadence(root: string, shape: "sparse" | "dense-context") {
     }
     const visited = results.reduce((total, result) => total + result.legacyRowsVisited, 0);
     const productive = results
-      .map((result, index) => ({ rows: result.legacyRowsVisited, durationMs: durations[index]! }))
+      .map((result, index) => ({
+        rows: result.legacyRowsVisited,
+        sliceMs: result.sliceDurationMs,
+        exhausted: result.timeBudgetExhausted,
+        wallMs: durations[index]!,
+      }))
       .filter((entry) => entry.rows > 0);
     const rowsPerCycle = visited / Math.max(1, productive.length);
     const projectedCycles = Math.ceil(liveRows / rowsPerCycle);
     const minRowsPerCycle = Math.min(...productive.map((entry) => entry.rows));
     const maxRowsPerCycle = Math.max(...productive.map((entry) => entry.rows));
-    const minSliceMs = Math.min(...productive.map((entry) => entry.durationMs));
-    const maxSliceMs = Math.max(...productive.map((entry) => entry.durationMs));
+    const maxSliceMs = Math.max(...productive.map((entry) => entry.sliceMs));
+    // Every slice but the last stops on its budget or the row cap, and no
+    // slice starts work after its deadline.
+    const budgetBound = productive
+      .slice(0, -1)
+      .every((entry) => entry.exhausted || entry.rows === 100_000);
     check(
       `${shape}_legacy_high_water_has_measured_bounded_cadence`,
       visited === syntheticRows &&
         results.at(-1)?.backfillComplete === true &&
         projectedCycles <= 120 &&
-        maxSliceMs <= 100,
+        budgetBound &&
+        maxSliceMs <= MAX_VIRTUAL_SLICE_MS,
       {
         shape,
         syntheticRows,
+        budgetCheckMs: BUDGET_CHECK_MS,
         cycles: results.length,
         productiveCycles: productive.length,
         rowsPerCycle: Math.round(rowsPerCycle),
         minRowsPerCycle,
         maxRowsPerCycle,
-        minSliceMs: Math.round(minSliceMs * 100) / 100,
         maxSliceMs: Math.round(maxSliceMs * 100) / 100,
+        budgetBound,
         projectedLiveRows: liveRows,
         projectedCycles,
+        wallClockMaxSliceMs: Math.round(Math.max(...productive.map((entry) => entry.wallMs)) * 100) / 100,
       },
     );
 
@@ -841,9 +871,8 @@ function proveAdversarialMixedBackfill(root: string) {
       legacyComplete: boolean;
     }> = [];
     const runSlice = (phase: string) => {
-      const started = performance.now();
-      const result = runCodexReconciliationMaintenance(buffer.database);
-      const durationMs = performance.now() - started;
+      const result = runCodexReconciliationMaintenance(buffer.database, { clock: sliceClock() });
+      const durationMs = result.sliceDurationMs;
       const status = codexReconciliationStatus(buffer.database);
       slices.push({
         phase,
@@ -944,7 +973,7 @@ function proveAdversarialMixedBackfill(root: string) {
         !sideTables.includes("codex_reconciliation_context") &&
         trackedUsageRows <= discoveredCandidates * 2 + 2 &&
         sideBytes < rawTableBytes &&
-        maxSliceMs <= 100,
+        maxSliceMs <= MAX_VIRTUAL_SLICE_MS,
       {
         rawShape,
         slices,
