@@ -2,13 +2,14 @@ import AppKit
 import Foundation
 import PlimsollMenubarCore
 
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let client: CollectorClient?
     private var statusItem: NSStatusItem?
     private let statusItemTitle = NSMenuItem()
     private let tokenItemTitle = NSMenuItem()
     private let permissionItem = NSMenuItem()
     private var dashboardPort = 48271
+    private var refreshInFlight = false
 
     override init() {
         if let invocation = CollectorInvocation(environment: ProcessInfo.processInfo.environment) {
@@ -24,12 +25,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         refreshStatus()
     }
 
+    /// Opening the menu re-reads status, so what it shows is current.
+    func menuWillOpen(_ menu: NSMenu) {
+        refreshStatus()
+    }
+
     private func configureStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
         item.button?.title = "PL"
         item.button?.toolTip = "Plimsoll collector"
 
         let menu = NSMenu()
+        menu.delegate = self
         statusItemTitle.title = "Plimsoll — loading…"
         statusItemTitle.isEnabled = false
         menu.addItem(statusItemTitle)
@@ -68,36 +75,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSApplication.shared.terminate(nil)
     }
 
+    /// Runs one `status` read off the main thread; a refresh already in
+    /// flight absorbs further requests instead of stacking collector runs.
     private func refreshStatus() {
-        guard client != nil else {
-            render(error: CollectorClientError.noCollectorConfigured)
+        guard let client else {
+            render(StatusLines(error: CollectorClientError.noCollectorConfigured))
             return
         }
-        DispatchQueue.global(qos: .utility).async { [weak self] in
-            guard let self else { return }
-            do {
-                let snapshot = try self.client!.snapshot()
-                DispatchQueue.main.async { self.render(snapshot: snapshot) }
-            } catch {
-                DispatchQueue.main.async { self.render(error: error) }
+        guard !refreshInFlight else { return }
+        refreshInFlight = true
+        DispatchQueue.global(qos: .utility).async {
+            let result = Result { try client.snapshot() }
+            DispatchQueue.main.async { [weak self] in
+                guard let self else { return }
+                self.refreshInFlight = false
+                switch result {
+                case let .success(snapshot):
+                    self.dashboardPort = snapshot.port
+                    self.render(StatusLines(snapshot: snapshot))
+                case let .failure(error):
+                    self.render(StatusLines(error: error))
+                }
             }
         }
     }
 
-    private func render(snapshot: CollectorSnapshot) {
-        dashboardPort = snapshot.port
-        let state = snapshot.running ? "Running" : "Stopped"
-        let count = snapshot.eventCount.map(String.init) ?? "—"
-        let coverage = snapshot.tokenCoveragePercent.map { String(format: "%.1f%%", $0) } ?? "—"
-        statusItemTitle.title = "\(state) · \(count) events · \(coverage) token coverage"
-
-        let input = snapshot.totalInputTokens.map(String.init) ?? "—"
-        let output = snapshot.totalOutputTokens.map(String.init) ?? "—"
-        tokenItemTitle.title = "Tokens: \(input) in · \(output) out"
-    }
-
-    private func render(error: Error) {
-        statusItemTitle.title = "Collector unavailable"
-        tokenItemTitle.title = error.localizedDescription
+    private func render(_ lines: StatusLines) {
+        statusItemTitle.title = lines.summary
+        tokenItemTitle.title = lines.tokens
     }
 }

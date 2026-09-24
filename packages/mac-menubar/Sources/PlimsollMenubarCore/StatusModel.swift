@@ -58,3 +58,33 @@ public struct CollectorSnapshot: Equatable, Sendable {
         self.tokenCoveragePercent = status.tokenCoveragePercent
     }
 }
+
+/// The two status lines the menu shows. `--status` prints the same text.
+public struct StatusLines: Equatable, Sendable {
+    public let summary: String
+    public let tokens: String
+
+    public init(snapshot: CollectorSnapshot) {
+        let state = snapshot.running ? "Running" : "Stopped"
+        let count = snapshot.eventCount.map(String.init) ?? "—"
+        let coverage = snapshot.tokenCoveragePercent.map { String(format: "%.1f%%", $0) } ?? "—"
+        summary = "\(state) · \(count) events · \(coverage) token coverage"
+
+        let input = snapshot.totalInputTokens.map(String.init) ?? "—"
+        let output = snapshot.totalOutputTokens.map(String.init) ?? "—"
+        tokens = "Tokens: \(input) in · \(output) out"
+    }
+
+    public init(error: Error) {
+        summary = "Collector unavailable"
+        tokens = error.localizedDescription
+    }
+
+    /// One JSON object, `{"summary":…,"tokens":…}`.
+    public func json() -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        let data = (try? encoder.encode(["summary": summary, "tokens": tokens])) ?? Data()
+        return String(decoding: data, as: UTF8.self)
+    }
+}

@@ -299,6 +299,23 @@ struct PlimsollMenubarCoreTests {
         #expect(bundleMetadata.isEmpty)
     }
 
+    @Test func menuLinesShowStateEventsCoverageAndTokens() throws {
+        let status = try CollectorStatus(json: Data(#"{"port":49123,"stats":{"count":8,"tokenAttributedEvents":2,"totalInputTokens":100,"totalOutputTokens":50}}"#.utf8))
+        let running = StatusLines(snapshot: CollectorSnapshot(running: true, status: status))
+        #expect(running.summary == "Running · 8 events · 25.0% token coverage")
+        #expect(running.tokens == "Tokens: 100 in · 50 out")
+        #expect(running.json() == #"{"summary":"Running · 8 events · 25.0% token coverage","tokens":"Tokens: 100 in · 50 out"}"#)
+
+        let empty = try CollectorStatus(json: Data(#"{"port":48271,"stats":null}"#.utf8))
+        let stopped = StatusLines(snapshot: CollectorSnapshot(running: false, status: empty))
+        #expect(stopped.summary == "Stopped · — events · — token coverage")
+        #expect(stopped.tokens == "Tokens: — in · — out")
+
+        let failed = StatusLines(error: CollectorClientError.timedOut(seconds: 60))
+        #expect(failed.summary == "Collector unavailable")
+        #expect(failed.tokens == "Collector status did not finish within 60 seconds.")
+    }
+
     @Test func permissionDoctorReportsNoAdditionalPermissions() throws {
         let report = PermissionDoctor.report()
 
