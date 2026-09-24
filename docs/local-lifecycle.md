@@ -198,12 +198,12 @@ newer releases add), `operationId` equal to the marker's file name and
 snapshot ID, and the values its status implies (healthy readiness for a
 completed one, the restored version for a rolled-back one). Its
 `retainedTargets` and `purgeOnlyTargets` are exactly this release's lists or
-exactly the pair every release from 0.7.0 to 0.7.38 wrote (without
+exactly the pair every release from 0.7.0 to 0.7.39 wrote (without
 `status_summary`), never a mix of the two. Any missing, extra, contradictory
 or invalid field makes the operation unknown, and its snapshot is never
-removed. A 0.7.38 collector does not know the newer lists, so after a
-rollback to 0.7.38 it keeps every snapshot of an operation a newer release
-completed.
+removed. A 0.7.39 or older collector does not know the newer lists, so after
+a rollback to one of them it keeps every snapshot of an operation a newer
+release completed.
 
 **Which snapshots are newest.** Never file times, which a clock step can
 reverse. Every completed or rolled-back update/rollback gets a

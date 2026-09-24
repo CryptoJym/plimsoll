@@ -699,7 +699,7 @@ export type LifecycleCompletedOperation = {
 const PRESERVED = ["ledger", "history", "credentials", "workspace_membership"] as const;
 /**
  * The retained and purge-only target lists a receipt can name, as one pair:
- * this release's, or the pair every release from 0.7.0 to 0.7.38 wrote before
+ * this release's, or the pair every release from 0.7.0 to 0.7.39 wrote before
  * the status summary became a purge-only target.
  */
 const RECEIPT_TARGET_LISTS: ReadonlyArray<{ retained: readonly string[]; purgeOnly: readonly string[] }> = [
