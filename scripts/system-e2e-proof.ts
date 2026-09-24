@@ -1180,30 +1180,55 @@ async function main() {
   );
   const setupFilesystemEntriesScanned = Number(idle?.measurements.setupFilesystemEntriesScanned ?? 0);
   const unchangedFilesystemEntriesScanned = Number(idle?.measurements.unchangedFilesystemEntriesScanned ?? 0);
+  const expectedSetupFilesystemEntriesScanned = Number(
+    idle?.measurements.expectedSetupFilesystemEntriesScanned ?? 0,
+  );
+  const expectedSetupFilesystemEnumerationCalls = Number(
+    idle?.measurements.expectedSetupFilesystemEnumerationCalls ?? 0,
+  );
+  const expectedStableFilesystemEntriesScanned = Number(
+    idle?.measurements.expectedStableDirectoryEntries ?? 0,
+  );
+  const expectedStableFilesystemEnumerationCalls = Number(
+    idle?.measurements.expectedStableEnumerationCalls ?? 0,
+  );
   assert.ok(Number.isSafeInteger(filesystemEntriesScanned) && filesystemEntriesScanned > 0);
   assert.ok(Number.isSafeInteger(filesystemEnumerationCalls) && filesystemEnumerationCalls > 0);
   assert.ok(filesystemEntriesScanned >= filesystemEnumerationCalls);
-  assert.ok(Number.isSafeInteger(setupFilesystemEntriesScanned) && setupFilesystemEntriesScanned >= 0);
+  assert.ok(Number.isSafeInteger(setupFilesystemEntriesScanned) && setupFilesystemEntriesScanned > 0);
   assert.ok(Number.isSafeInteger(unchangedFilesystemEntriesScanned) && unchangedFilesystemEntriesScanned > 0);
   assert.ok(Number.isSafeInteger(unchangedFilesystemEnumerationCalls) && unchangedFilesystemEnumerationCalls > 0);
+  assert.ok(Number.isSafeInteger(expectedSetupFilesystemEntriesScanned) && expectedSetupFilesystemEntriesScanned > 0);
+  assert.ok(Number.isSafeInteger(expectedSetupFilesystemEnumerationCalls) && expectedSetupFilesystemEnumerationCalls > 0);
+  assert.ok(Number.isSafeInteger(expectedStableFilesystemEntriesScanned) && expectedStableFilesystemEntriesScanned > 0);
+  assert.ok(Number.isSafeInteger(expectedStableFilesystemEnumerationCalls) && expectedStableFilesystemEnumerationCalls > 0);
+  assert.equal(setupFilesystemEntriesScanned, expectedSetupFilesystemEntriesScanned);
+  assert.equal(
+    Number(idle?.measurements.setupFilesystemEnumerationCalls ?? 0),
+    expectedSetupFilesystemEnumerationCalls,
+  );
+  assert.equal(unchangedFilesystemEntriesScanned, expectedStableFilesystemEntriesScanned);
+  assert.equal(unchangedFilesystemEnumerationCalls, expectedStableFilesystemEnumerationCalls);
   assert.equal(
     setupFilesystemEntriesScanned + unchangedFilesystemEntriesScanned,
     filesystemEntriesScanned,
   );
-  // The stable run is a fresh recent sweep over two fixed source roots. Its
-  // two per-source 256-entry allowances give a 512-entry safety bound, while
-  // the complete startup/baseline window has a separate 8,192-entry cap. The
-  // stable call count is bounded to the four directory levels exercised by
-  // the fixture plus a small root retry allowance. Raw values remain in the
-  // receipt and final measurements; normalization does not bypass these
-  // semantic bounds.
+  // These exact values come from the receipt's generated fixture topology.
+  // Keeping both the expected values and the raw measurements in the artifact
+  // makes a partial walk or a new scan visible to the digest and the gate.
   assert.ok(filesystemEntriesScanned <= 8_192);
   assert.ok(setupFilesystemEntriesScanned <= 7_680);
   assert.ok(unchangedFilesystemEntriesScanned <= 512);
   assert.ok(filesystemEnumerationCalls <= 32);
   assert.ok(unchangedFilesystemEnumerationCalls <= 8);
   assert.equal(idle?.measurements.stableSweepCursorReset, true);
+  assert.equal(idle?.measurements.stableSweepCompleted, true);
+  assert.equal(idle?.measurements.stableRolloutSweepComplete, true);
+  assert.equal(idle?.measurements.stableTranscriptSweepComplete, true);
+  assert.equal(idle?.measurements.directoryApiCoverageChecked, true);
   assert.equal(idle?.measurements.filesystemEnumerationObserved, true);
+  assert.equal(idle?.measurements.filesystemMetadataObserved, true);
+  assert.equal(idle?.measurements.filesystemMetadataFailuresBounded, true);
   assert.equal(idle?.counters.fullHistoryFileReads, 2_610);
   assert.equal(idle?.counters.filesOpened, 2_614);
   assert.ok((idle?.counters.fileBytesRead ?? 0) > 0);
