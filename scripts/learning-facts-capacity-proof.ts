@@ -134,7 +134,7 @@ function exerciseHotPathBound() {
     verbose: (sql) => {
       if (/count\s*\(\s*\*\s*\)/i.test(String(sql))) fullCounts += 1;
       if (/^select operation_id as id\s+from tool_attempt_facts\s+order by/i.test(String(sql))) orderedSelections += 1;
-      if (/^select operation_id as id, started_at as retentionTimestamp\s+from tool_attempt_facts\s+order by/i.test(String(sql))) candidateSelections += 1;
+      if (/^select operation_id as id, retention_ms as retentionMs\s+from tool_attempt_facts\s+order by/i.test(String(sql))) candidateSelections += 1;
       if (/^delete from tool_attempt_facts where operation_id = /i.test(String(sql))) rowDeletes += 1;
       if (tracingStatus) statusSql.push(String(sql));
     },
@@ -706,14 +706,14 @@ function exerciseEvictionRollbackAndIndexes() {
     check("failed_insert_rolls_back_eviction_rows_counts_and_receipts", true, {});
 
     const plans = [
-      `select operation_id from tool_attempt_facts order by started_at,operation_id limit 1`,
-      `select operation_id as id, started_at as retentionTimestamp from tool_attempt_facts order by started_at,operation_id limit 1`,
-      `select episode_id from work_episode_facts order by started_at,episode_id limit 1`,
-      `select episode_id as id, started_at as retentionTimestamp from work_episode_facts order by started_at,episode_id limit 1`,
-      `select exposure_id from technique_exposure_facts order by exposed_at,exposure_id limit 1`,
-      `select exposure_id as id, exposed_at as retentionTimestamp from technique_exposure_facts order by exposed_at,exposure_id limit 1`,
-      `select technique_key from technique_identity_registry order by first_seen_at,technique_key limit 1`,
-      `select technique_key as id, first_seen_at as retentionTimestamp from technique_identity_registry order by first_seen_at,technique_key limit 1`,
+      `select operation_id from tool_attempt_facts order by retention_ms,operation_id limit 1`,
+      `select operation_id as id, retention_ms as retentionMs from tool_attempt_facts order by retention_ms,operation_id limit 1`,
+      `select episode_id from work_episode_facts order by retention_ms,episode_id limit 1`,
+      `select episode_id as id, retention_ms as retentionMs from work_episode_facts order by retention_ms,episode_id limit 1`,
+      `select exposure_id from technique_exposure_facts order by retention_ms,exposure_id limit 1`,
+      `select exposure_id as id, retention_ms as retentionMs from technique_exposure_facts order by retention_ms,exposure_id limit 1`,
+      `select technique_key from technique_identity_registry order by retention_ms,technique_key limit 1`,
+      `select technique_key as id, retention_ms as retentionMs from technique_identity_registry order by retention_ms,technique_key limit 1`,
       `delete from tool_attempt_facts where episode_id = 'fixture'`,
       `delete from technique_exposure_facts where episode_id = 'fixture'`,
       `select episode_id from work_episode_facts where parent_episode_id = 'fixture'`,
@@ -915,6 +915,322 @@ function exerciseOutOfOrderRetention() {
   }
 }
 
+function exerciseOffsetRetention() {
+  const zero = "2026-09-01T00:00:00Z";
+  const twenty = "2026-09-01T00:00:20Z";
+  const middleOffset = "2026-08-31T18:00:10-06:00";
+  const oldOffset = "2026-09-01T01:00:00+02:00";
+  for (const [name, incoming, expectedInserted, retained] of [
+    ["middle", middleOffset, true, [middleOffset, twenty]],
+    ["old", oldOffset, false, [zero, twenty]],
+  ] as const) {
+    {
+      const db = new Database(":memory:");
+      try {
+        const store = new LearningFactStore(db, { attempts: 2 });
+        store.recordToolSignal({ ...attempt(0, `offset-${name}`), startedAt: zero });
+        store.recordToolSignal({ ...attempt(20, `offset-${name}`), startedAt: twenty });
+        const result = store.recordToolSignal({ ...attempt(10, `offset-${name}`), startedAt: incoming });
+        check(`offset_attempt_${name}_uses_instant_order`, result.inserted === expectedInserted &&
+          JSON.stringify(store.attempts().map(row => row.startedAt)) === JSON.stringify(retained) &&
+          store.status().tables.tool_attempt_facts.rowCount === 2,
+        { result, retained: store.attempts().map(row => row.startedAt) });
+        assertCounts(db, `offset_attempt_${name}_counts_exact`);
+      } finally { db.close(); }
+    }
+    {
+      const db = new Database(":memory:");
+      try {
+        const store = new LearningFactStore(db, { episodes: 2 });
+        const episode = (n: number, startedAt: string) => buildWorkEpisodeFact({
+          source: "codex", sessionId: `offset-${name}-${n}`, sourceEpisodeKey: `episode-${n}`,
+          workClass: "review", complexityBand: "medium", startedAt,
+        });
+        store.recordWorkEpisode(episode(0, zero));
+        store.recordWorkEpisode(episode(20, twenty));
+        const result = store.recordWorkEpisode(episode(10, incoming));
+        check(`offset_episode_${name}_uses_instant_order`, result.inserted === expectedInserted &&
+          JSON.stringify(store.episodes().map(row => row.startedAt)) === JSON.stringify(retained) &&
+          store.status().tables.work_episode_facts.rowCount === 2,
+        { result, retained: store.episodes().map(row => row.startedAt) });
+        assertCounts(db, `offset_episode_${name}_counts_exact`);
+      } finally { db.close(); }
+    }
+    {
+      const buffer = new LocalEventBuffer(":memory:", {
+        delivery: { enabled: false }, learningFacts: { limits: { attempts: 10, episodes: 2 } },
+      });
+      try {
+        const event = (n: number, observedAt: string) => aiInteractionEventSchema.parse({
+          id: deterministicLearningFactId(["offset-buffer", name, String(n)]),
+          source: "codex", sessionId: `offset-buffer-${name}-${n}`,
+          dataMode: "metadata", eventType: "tool_use", observedAt,
+          actionClass: "shell", metadata: { call_id: `call-${n}` },
+        });
+        for (const [n, at] of [[0, zero], [20, twenty], [10, incoming]] as const) {
+          check(`offset_buffer_${name}_accepts_raw_event_${n}`, buffer.append(event(n, at)), {});
+        }
+        check(`offset_buffer_${name}_retains_whole_newest_graphs`,
+          JSON.stringify(buffer.learningFacts.episodes().map(row => row.startedAt)) === JSON.stringify(retained) &&
+          JSON.stringify(buffer.learningFacts.attempts().map(row => row.startedAt)) === JSON.stringify(retained) &&
+          buffer.learningFacts.status().tables.work_episode_facts.rowCount === 2,
+          { episodes: buffer.learningFacts.episodes(), attempts: buffer.learningFacts.attempts() });
+        assertCounts(buffer.database, `offset_buffer_${name}_counts_exact`);
+      } finally { buffer.close(); }
+    }
+  }
+}
+
+function exerciseInstantKeyEdges() {
+  const instants = [
+    "2026-09-01T00:00:00Z", "2026-09-01T00:00:00.000Z",
+    "2026-09-01T00:00:00.5Z", "2026-09-01T00:00:00.500Z",
+    "2026-09-01T00:00:00.0009Z",
+    "2026-08-31T18:00:10-06:00", "2026-09-01T01:00:00+02:00",
+    "2026-01-31T18:00:10-06:00", "2026-02-01T01:00:00+02:00",
+  ];
+  const db = new Database(":memory:");
+  try {
+    const store = new LearningFactStore(db);
+    const root = buildWorkEpisodeFact({ source: "codex", sessionId: "instant-root",
+      sourceEpisodeKey: "root", workClass: "review", complexityBand: "medium",
+      startedAt: "2026-01-01T00:00:00Z" });
+    store.recordWorkEpisode(root);
+    for (const [index, at] of instants.entries()) {
+      store.recordToolSignal({ ...attempt(index, "instant-key"), startedAt: at });
+      store.recordWorkEpisode(buildWorkEpisodeFact({ source: "codex",
+        sessionId: `instant-key-${index}`, sourceEpisodeKey: `episode-${index}`,
+        workClass: "review", complexityBand: "medium", startedAt: at }));
+      store.recordTechniqueExposure(buildTechniqueExposureFact({ episodeId: root.episodeId,
+        techniqueId: "instant-key", techniqueVersion: "1", assignmentId: `instant-${index}`,
+        workClass: "review", complexityBand: "medium", exposedAt: at, mode: "treatment" }));
+    }
+    for (const [table, column] of [
+      ["tool_attempt_facts", "started_at"],
+      ["work_episode_facts", "started_at"],
+      ["technique_exposure_facts", "exposed_at"],
+      ["technique_identity_registry", "first_seen_at"],
+    ] as const) {
+      const rows = db.prepare(`select ${column} as timestamp, retention_ms as retentionMs from ${table}`).all() as
+        Array<{ timestamp: string; retentionMs: number }>;
+      check(`${table}_key_is_utc_epoch_ms_for_offsets_month_boundary_and_fraction`,
+        rows.length >= (table === "technique_identity_registry" ? 1 : instants.length) &&
+        rows.every(row => row.retentionMs === Date.parse(row.timestamp)), { rows });
+    }
+    assertCounts(db, "instant_key_edges_counts_exact");
+  } finally { db.close(); }
+
+  // Equal instants written with different spellings must fall through to the
+  // same deterministic identity order; lexical timestamp order is irrelevant.
+  const equalAt = ["2026-09-01T00:00:00.5Z", "2026-09-01T00:00:00.500Z",
+    "2026-08-31T18:00:00.500-06:00", "2026-09-01T02:00:00.500+02:00"];
+  const tieDb = new Database(":memory:");
+  try {
+    const store = new LearningFactStore(tieDb, { attempts: 2, episodes: 2 });
+    checkIdentityTie("tool_attempt_facts", equalAt.map((at, index) => ({
+      ...attempt(index, "offset-tie"), startedAt: at,
+    })), row => row.operationId, row => store.recordToolSignal(row),
+    () => store.attempts().map(row => row.operationId),
+    () => store.status().tables.tool_attempt_facts.evictedCount);
+    const episodes = equalAt.map((at, index) => buildWorkEpisodeFact({
+      source: "codex", sessionId: `offset-tie-${index}`, sourceEpisodeKey: `episode-${index}`,
+      workClass: "review", complexityBand: "medium", startedAt: at,
+    }));
+    checkIdentityTie("work_episode_facts", episodes, row => row.episodeId,
+      row => store.recordWorkEpisode(row), () => store.episodes().map(row => row.episodeId),
+      () => store.status().tables.work_episode_facts.evictedCount);
+    assertCounts(tieDb, "offset_identity_ties_counts_exact");
+  } finally { tieDb.close(); }
+
+  // Maintenance must use the same instant key and erase the oldest entire
+  // graph, even when its offset-bearing text sorts after its newer siblings.
+  const maintenanceDb = new Database(":memory:");
+  try {
+    const store = new LearningFactStore(maintenanceDb, { episodes: 2 });
+    const oldest = buildWorkEpisodeFact({ source: "codex", sessionId: "month-old",
+      sourceEpisodeKey: "old", workClass: "review", complexityBand: "medium",
+      startedAt: "2026-02-01T01:00:00+02:00" });
+    store.recordWorkEpisode(oldest);
+    store.recordToolSignal({ ...attempt(1, "month-old"), sessionId: oldest.sessionId,
+      episodeId: oldest.episodeId, startedAt: "2026-01-31T23:00:01Z" });
+    store.recordTechniqueExposure(buildTechniqueExposureFact({ episodeId: oldest.episodeId,
+      techniqueId: "month-old", techniqueVersion: "1", assignmentId: "month-old",
+      workClass: "review", complexityBand: "medium", exposedAt: "2026-01-31T23:00:02Z",
+      mode: "treatment" }));
+    const insert = rawEpisodeInsert(maintenanceDb);
+    for (const [index, at] of ["2026-02-01T00:00:00Z", "2026-02-01T00:00:20Z"].entries()) {
+      const episode = buildWorkEpisodeFact({ source: "codex", sessionId: `month-${index}`,
+        sourceEpisodeKey: `month-${index}`, workClass: "review", complexityBand: "medium",
+        startedAt: at });
+      insert.run(episode.episodeId, episode.sessionId, episode.startedAt, null, null, at);
+    }
+    const receipt = store.runMaintenance(1);
+    check("maintenance_evicts_oldest_offset_episode_graph_by_instant",
+      receipt.evicted === 3 && store.episodeById(oldest.episodeId) === undefined &&
+      store.episodes().length === 2 && store.attempts().length === 0 && store.exposures().length === 0,
+      { receipt, episodes: store.episodes() });
+    assertCounts(maintenanceDb, "offset_maintenance_graph_counts_exact");
+  } finally { maintenanceDb.close(); }
+}
+
+function exerciseDependentAdmission() {
+  {
+    const db = new Database(":memory:");
+    try {
+      const store = new LearningFactStore(db, { episodes: 1 });
+      const parent = buildWorkEpisodeFact({ source: "codex", sessionId: "dependent-episode",
+        sourceEpisodeKey: "parent", workClass: "review", complexityBand: "medium",
+        startedAt: timestamp(10) });
+      const child = buildWorkEpisodeFact({ source: "codex", sessionId: parent.sessionId,
+        sourceEpisodeKey: "child", parentEpisodeId: parent.episodeId,
+        workClass: "review", complexityBand: "medium", startedAt: timestamp(20) });
+      store.recordWorkEpisode(parent);
+      const rejected = store.recordWorkEpisode(child);
+      check("full_episode_table_rejects_child_before_evicting_sole_parent",
+        rejected.dropped === true && rejected.dropReason === "stale_reference" &&
+        store.episodeById(parent.episodeId) !== undefined &&
+        store.status().tables.work_episode_facts.rowCount === 1 &&
+        store.status().tables.work_episode_facts.evictedCount === 0, { rejected, status: store.status() });
+      assertCounts(db, "rejected_child_preserves_parent_count");
+    } finally { db.close(); }
+  }
+  {
+    const db = new Database(":memory:");
+    try {
+      const store = new LearningFactStore(db, { attempts: 1 });
+      const parent = attempt(10, "dependent-retry");
+      const child = { ...attempt(20, "dependent-retry"),
+        sessionId: parent.sessionId, retryOf: parent.operationId };
+      store.recordToolSignal(parent);
+      const rejected = store.recordToolSignal(child);
+      check("full_attempt_table_rejects_retry_before_evicting_sole_target",
+        rejected.dropped === true && rejected.dropReason === "retry_target_missing" &&
+        store.attempts().length === 1 && store.attempts()[0].operationId === parent.operationId &&
+        store.status().tables.tool_attempt_facts.evictedCount === 0,
+        { rejected, status: store.status() });
+      assertCounts(db, "rejected_retry_preserves_target_count");
+    } finally { db.close(); }
+  }
+  {
+    const db = new Database(":memory:");
+    try {
+      const store = new LearningFactStore(db, { episodes: 2, attempts: 2 });
+      const root = buildWorkEpisodeFact({ source: "codex", sessionId: "dependent-nested",
+        sourceEpisodeKey: "root", workClass: "review", complexityBand: "medium",
+        startedAt: timestamp(0) });
+      const parent = buildWorkEpisodeFact({ source: "codex", sessionId: root.sessionId,
+        sourceEpisodeKey: "parent", parentEpisodeId: root.episodeId,
+        workClass: "review", complexityBand: "medium", startedAt: timestamp(1) });
+      const child = buildWorkEpisodeFact({ source: "codex", sessionId: root.sessionId,
+        sourceEpisodeKey: "child", parentEpisodeId: parent.episodeId,
+        workClass: "review", complexityBand: "medium", startedAt: timestamp(2) });
+      store.recordWorkEpisode(root); store.recordWorkEpisode(parent);
+      const rejected = store.recordWorkEpisode(child);
+      check("descendant_parent_in_oldest_episode_graph_is_protected",
+        rejected.dropped === true && store.episodes().length === 2 &&
+        store.status().tables.work_episode_facts.evictedCount === 0, { rejected });
+      const first = { ...attempt(0, "dependent-chain"), startedAt: timestamp(0) };
+      const second = { ...attempt(1, "dependent-chain"), sessionId: first.sessionId,
+        retryOf: first.operationId, startedAt: timestamp(1) };
+      const third = { ...attempt(2, "dependent-chain"), sessionId: first.sessionId,
+        retryOf: second.operationId, startedAt: timestamp(2) };
+      store.recordToolSignal(first); store.recordToolSignal(second);
+      const retryRejected = store.recordToolSignal(third);
+      check("retry_target_in_oldest_attempt_chain_is_protected",
+        retryRejected.dropped === true && store.attempts().length === 2 &&
+        store.status().tables.tool_attempt_facts.evictedCount === 0, { retryRejected });
+      assertCounts(db, "nested_required_graphs_preserve_counts");
+    } finally { db.close(); }
+  }
+  {
+    const db = new Database(":memory:");
+    try {
+      const store = new LearningFactStore(db, { episodes: 2, attempts: 2 });
+      const unrelated = buildWorkEpisodeFact({ source: "codex", sessionId: "unrelated",
+        sourceEpisodeKey: "unrelated", workClass: "review", complexityBand: "medium",
+        startedAt: timestamp(0) });
+      const parent = buildWorkEpisodeFact({ source: "codex", sessionId: "retained-parent",
+        sourceEpisodeKey: "parent", workClass: "review", complexityBand: "medium",
+        startedAt: timestamp(1) });
+      const child = buildWorkEpisodeFact({ source: "codex", sessionId: parent.sessionId,
+        sourceEpisodeKey: "child", parentEpisodeId: parent.episodeId,
+        workClass: "review", complexityBand: "medium", startedAt: timestamp(2) });
+      store.recordWorkEpisode(unrelated); store.recordWorkEpisode(parent);
+      const admitted = store.recordWorkEpisode(child);
+      check("child_admits_when_oldest_victim_is_unrelated",
+        admitted.inserted === true && store.episodeById(parent.episodeId) !== undefined &&
+        store.episodeById(unrelated.episodeId) === undefined, { admitted });
+      const unrelatedAttempt = { ...attempt(0, "unrelated-attempt"), startedAt: timestamp(0) };
+      const target = { ...attempt(1, "retained-attempt"), startedAt: timestamp(1) };
+      const retry = { ...attempt(2, "retained-attempt"), sessionId: target.sessionId,
+        retryOf: target.operationId, startedAt: timestamp(2) };
+      store.recordToolSignal(unrelatedAttempt); store.recordToolSignal(target);
+      const retryAdmitted = store.recordToolSignal(retry);
+      check("retry_admits_when_oldest_victim_is_unrelated",
+        retryAdmitted.inserted === true && store.attempts().length === 2 &&
+        store.attempts().some(row => row.operationId === target.operationId), { retryAdmitted });
+      assertCounts(db, "unrelated_eviction_preserves_dependent_counts");
+    } finally { db.close(); }
+  }
+}
+
+function exerciseAtomicInstantKeyUpgrade(root: string) {
+  const ledgerPath = path.join(root, "instant-key-upgrade.sqlite");
+  const seed = new Database(ledgerPath);
+  try {
+    new LearningFactStore(seed, { attempts: 10 });
+    const insert = rawAttemptInsert(seed);
+    for (const [index, at] of [
+      "2026-09-01T00:00:00Z", "2026-08-31T18:00:10-06:00",
+      "2026-09-01T00:00:20Z",
+    ].entries()) {
+      insert.run(rawAttemptId(index), `key-upgrade-${index}`, at, at, at);
+    }
+    // Recreate the pre-key shape without copying an old schema into this
+    // proof. Existing rows and the count triggers stay in place.
+    seed.transaction(() => {
+      for (const table of Object.keys(DEFAULT_TABLE_COUNTS)) {
+        seed.exec(`drop index idx_${table}_retention_ms`);
+        seed.exec(`alter table ${table} drop column retention_ms`);
+      }
+    })();
+  } finally { seed.close(); }
+
+  const child = spawnSync(process.execPath,
+    [...process.execArgv, fileURLToPath(import.meta.url), "--key-crash-child", ledgerPath],
+    { cwd: repoRoot, encoding: "utf8", timeout: 30_000 });
+  const afterCrash = new Database(ledgerPath);
+  try {
+    const hasKey = (afterCrash.pragma("table_xinfo(tool_attempt_facts)") as Array<{name:string}>)
+      .some(column => column.name === "retention_ms");
+    const keyIndexes = (afterCrash.prepare(
+      `select count(*) as n from sqlite_master where type='index' and name like 'idx_%_retention_ms'`,
+    ).get() as {n:number}).n;
+    check("interrupted_instant_key_upgrade_has_no_partial_backfill",
+      (child.signal === "SIGKILL" || child.status === 137) && !hasKey && keyIndexes === 0,
+      { child: { status: child.status, signal: child.signal }, hasKey, keyIndexes });
+    const at = "2026-08-31T18:00:15-06:00";
+    rawAttemptInsert(afterCrash).run(rawAttemptId(15), "key-upgrade-15", at, at, at);
+    assertCounts(afterCrash, "old_writer_after_key_crash_keeps_counts_exact");
+  } finally { afterCrash.close(); }
+
+  const reopened = new Database(ledgerPath);
+  try {
+    const store = new LearningFactStore(reopened, { attempts: 2 });
+    const rows = reopened.prepare(
+      `select started_at as startedAt, retention_ms as retentionMs
+         from tool_attempt_facts order by retention_ms, operation_id`,
+    ).all() as Array<{startedAt:string;retentionMs:number}>;
+    check("instant_key_upgrade_ranks_existing_offsets_before_trimming",
+      JSON.stringify(rows.map(row => row.startedAt)) === JSON.stringify([
+        "2026-08-31T18:00:15-06:00", "2026-09-01T00:00:20Z",
+      ]) && rows.every(row => row.retentionMs === Date.parse(row.startedAt)) &&
+      store.status().tables.tool_attempt_facts.evictedCount === 2,
+      { rows, status: store.status().tables.tool_attempt_facts });
+    assertCounts(reopened, "instant_key_reopen_counts_exact");
+  } finally { reopened.close(); }
+}
+
 function exerciseNestedEpisodeRollback() {
   const db = new Database(":memory:");
   try {
@@ -973,6 +1289,15 @@ async function main() {
     new LearningFactStore(db);
     throw new Error("expected atomic migration child to be killed");
   }
+  if (process.argv[2] === "--key-crash-child") {
+    const db = new Database(process.argv[3], { verbose: (sql) => {
+      if (/create index if not exists idx_tool_attempt_facts_retention_ms/i.test(String(sql))) {
+        process.kill(process.pid, "SIGKILL");
+      }
+    } });
+    new LearningFactStore(db);
+    throw new Error("expected instant key migration child to be killed");
+  }
 
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "plimsoll-fact-capacity-paths-"));
   const cases: Record<string, () => void | Promise<void>> = {
@@ -986,6 +1311,10 @@ async function main() {
     fairness: exerciseFairness,
     referential: () => { exerciseReferentialRetention(); exerciseLateRuntimeResult(); exerciseNestedEpisodeRollback(); },
     "out-of-order": exerciseOutOfOrderRetention,
+    "offset-retention": exerciseOffsetRetention,
+    "instant-key-edges": exerciseInstantKeyEdges,
+    "dependent-admission": exerciseDependentAdmission,
+    "instant-key-upgrade": () => exerciseAtomicInstantKeyUpgrade(root),
     migration: exerciseInterruptedUpgradeDowngrade,
     "migration-recount": exerciseMissingTriggers,
     production: exerciseProductionStage,
@@ -996,7 +1325,8 @@ async function main() {
         }), { limits: DEFAULT_LEARNING_FACT_LIMITS });
       check("privacy_spec_lists_promoted_facts_state_and_retention",
         privacySpec.includes("tool_attempt_facts") && privacySpec.includes("learning_fact_table_state") &&
-          privacySpec.includes("evicted"), {});
+          privacySpec.includes("evicted") && privacySpec.includes("retention_ms") &&
+          privacySpec.includes("UTC epoch milliseconds"), {});
     },
   };
   try {

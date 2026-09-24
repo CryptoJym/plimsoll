@@ -98,6 +98,7 @@ type LearningFactTableDefinition = {
 };
 
 type LearningFactEvictionCounts = Record<LearningFactTableName, number>;
+type CapacityDecision = "admit" | "outside_retention_window" | "required_reference";
 
 const LEARNING_FACT_TABLES: readonly LearningFactTableDefinition[] = [
   {
@@ -127,6 +128,22 @@ const LEARNING_FACT_TABLES: readonly LearningFactTableDefinition[] = [
 ];
 
 const MAX_SOURCE_OPERATION_KEY_BYTES = 1_024;
+
+// SQLite's %f rounds fractions; Date.parse (the fact schema's clock) truncates
+// them to milliseconds. Extract the first three fractional digits instead so
+// both sides rank .0009Z, .5Z and .500Z exactly the same way. strftime('%s')
+// handles the timezone offset and supplies the whole UTC second.
+function retentionInstantExpression(timestampColumn: string) {
+  return `cast(strftime('%s', ${timestampColumn}) as integer) * 1000 +
+    case when instr(${timestampColumn}, '.') = 0 then 0 else
+      cast(substr(
+        substr(${timestampColumn}, instr(${timestampColumn}, '.') + 1,
+          length(${timestampColumn}) - instr(${timestampColumn}, '.') -
+          case when substr(${timestampColumn}, -1) = 'Z' then 1 else 6 end
+        ) || '000', 1, 3
+      ) as integer)
+    end`;
+}
 
 function boundedDimensionId(value: string, name: string) {
   const trimmed = value.trim();
@@ -463,6 +480,23 @@ export class LearningFactStore {
       create index if not exists idx_technique_identity_retention
         on technique_identity_registry(first_seen_at, technique_key);
     `);
+      // VIRTUAL generated columns keep the original producer timestamp while
+      // old collector versions can still write using their explicit column
+      // lists. The indexed keys for all existing offset-bearing rows are
+      // built atomically before any retention decision or writer can run; there
+      // is no visible partial backfill to rank against.
+      for (const definition of LEARNING_FACT_TABLES) {
+        const columns = new Set(
+          (this.db.pragma(`table_xinfo(${definition.name})`) as Array<{ name: string }>)
+            .map((column) => column.name),
+        );
+        if (!columns.has("retention_ms")) {
+          this.db.exec(`alter table ${definition.name} add column retention_ms integer
+            generated always as (${retentionInstantExpression(definition.retentionColumn)}) virtual not null`);
+        }
+        this.db.exec(`create index if not exists idx_${definition.name}_retention_ms
+          on ${definition.name}(retention_ms, ${definition.idColumn})`);
+      }
       // Existing ledgers created before optional episode parent linkage keep
       // their original table shape; add the column in the same transaction as
       // the state and trigger upgrade.
@@ -655,7 +689,7 @@ export class LearningFactStore {
     const ids = this.db.prepare(
       `select ${definition.idColumn} as id
          from ${definition.name}
-        order by ${definition.retentionColumn}, ${definition.idColumn}
+        order by retention_ms, ${definition.idColumn}
         limit ?`,
     ).all(requested) as Array<{ id: string }>;
     if (definition.name === "work_episode_facts") {
@@ -692,16 +726,40 @@ export class LearningFactStore {
     }
   }
 
+  private evictionWouldRemoveRequired(
+    table: "tool_attempt_facts" | "work_episode_facts",
+    victimId: string,
+    requiredId: string,
+  ): boolean {
+    // Follow only the graph that this victim's eviction would delete. An
+    // ancestor/retry target anywhere in that graph must survive if the new
+    // dependent is to be admitted. Both child lookups use existing indexes.
+    const children = table === "work_episode_facts"
+      ? this.db.prepare(`select episode_id as id from work_episode_facts where parent_episode_id = ?`)
+      : this.db.prepare(`select operation_id as id from tool_attempt_facts where retry_of = ?`);
+    const pending = [victimId];
+    const seen = new Set<string>();
+    while (pending.length > 0) {
+      const id = pending.pop()!;
+      if (id === requiredId) return true;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      for (const child of children.all(id) as Array<{ id: string }>) pending.push(child.id);
+    }
+    return false;
+  }
+
   private capacityPressure(
     table: LearningFactTableName,
     id: string,
     retentionTimestamp: string,
-  ): boolean {
+    requiredId?: string,
+  ): CapacityDecision {
     const definition = LEARNING_FACT_TABLES.find((entry) => entry.name === table)!;
     const existing = this.db
       .prepare(`select 1 from ${definition.name} where ${definition.idColumn} = ?`)
       .get(id);
-    if (existing) return true;
+    if (existing) return "admit";
     const state = this.db
       .prepare(
         `select row_count as rowCount
@@ -718,22 +776,28 @@ export class LearningFactStore {
         `select row_count as rowCount from learning_fact_table_state where table_name = ?`,
       ).get(definition.name) as { rowCount: number }).rowCount;
     }
-    if (state.rowCount < limit) return true;
+    if (state.rowCount < limit) return "admit";
     const oldest = this.db.prepare(
-      `select ${definition.idColumn} as id, ${definition.retentionColumn} as retentionTimestamp
+      `select ${definition.idColumn} as id, retention_ms as retentionMs
          from ${definition.name}
-        order by ${definition.retentionColumn}, ${definition.idColumn}
+        order by retention_ms, ${definition.idColumn}
         limit 1`,
-    ).get() as { id: string; retentionTimestamp: string } | undefined;
+    ).get() as { id: string; retentionMs: number } | undefined;
     if (!oldest) throw new Error(`LearningFactStateMismatch:${definition.name}`);
-    // These persisted identifiers and ISO timestamp strings use SQLite BINARY
-    // ordering. A full table keeps the greater (timestamp, identity) tuple.
-    if (retentionTimestamp < oldest.retentionTimestamp ||
-        (retentionTimestamp === oldest.retentionTimestamp && id < oldest.id)) {
-      return false;
+    // Retain the greatest (UTC millisecond, identity) tuple. Comparing raw ISO
+    // strings would misorder offset-bearing timestamps at day boundaries.
+    const retentionMs = Date.parse(retentionTimestamp);
+    if (retentionMs < oldest.retentionMs ||
+        (retentionMs === oldest.retentionMs && id < oldest.id)) {
+      return "outside_retention_window";
+    }
+    if (requiredId &&
+        (table === "tool_attempt_facts" || table === "work_episode_facts") &&
+        this.evictionWouldRemoveRequired(table, oldest.id, requiredId)) {
+      return "required_reference";
     }
     this.evictOldest(definition, 1);
-    return true;
+    return "admit";
   }
 
   private dropFact<T>(reason: RuntimeFactDropReason = "stale_reference"): LearningFactWriteResult<T> {
@@ -804,8 +868,13 @@ export class LearningFactStore {
             throw new Error("ToolAttemptRetryTargetConflict");
           }
         }
-        if (!this.capacityPressure("tool_attempt_facts", start.operationId, start.startedAt)) {
-          return this.dropFact<ToolAttemptFact>("outside_retention_window");
+        const admission = this.capacityPressure(
+          "tool_attempt_facts", start.operationId, start.startedAt, start.retryOf,
+        );
+        if (admission !== "admit") {
+          return this.dropFact<ToolAttemptFact>(
+            admission === "required_reference" ? "retry_target_missing" : "outside_retention_window",
+          );
         }
         if (start.retryOf && !this.db.prepare(
           `select 1 from tool_attempt_facts where operation_id = ?`,
@@ -937,8 +1006,13 @@ export class LearningFactStore {
         }
         return { inserted: false, fact: existing };
       }
-      if (!this.capacityPressure("work_episode_facts", fact.episodeId, fact.startedAt)) {
-        return this.dropFact<WorkEpisodeFact>("outside_retention_window");
+      const admission = this.capacityPressure(
+        "work_episode_facts", fact.episodeId, fact.startedAt, fact.parentEpisodeId,
+      );
+      if (admission !== "admit") {
+        return this.dropFact<WorkEpisodeFact>(
+          admission === "required_reference" ? "stale_reference" : "outside_retention_window",
+        );
       }
       if (fact.parentEpisodeId) {
         const parentStillExists = this.db
@@ -1031,7 +1105,7 @@ export class LearningFactStore {
         }
         return { inserted: false, fact: stored };
       }
-      if (!this.capacityPressure("technique_exposure_facts", fact.exposureId, fact.exposedAt)) {
+      if (this.capacityPressure("technique_exposure_facts", fact.exposureId, fact.exposedAt) !== "admit") {
         return this.dropFact<TechniqueExposureFact>("outside_retention_window");
       }
       const techniqueKey = deterministicLearningFactId([
@@ -1040,7 +1114,7 @@ export class LearningFactStore {
         fact.contentDigest ?? "",
       ]);
       const now = new Date().toISOString();
-      if (this.capacityPressure("technique_identity_registry", techniqueKey, now)) {
+      if (this.capacityPressure("technique_identity_registry", techniqueKey, now) === "admit") {
         this.db.prepare(
         `insert or ignore into technique_identity_registry
           (technique_key, technique_id, technique_version, content_digest, first_seen_at)
@@ -1171,7 +1245,7 @@ export class LearningFactStore {
   attempts(): ToolAttemptFact[] {
     return (
       this.db
-        .prepare(`${ATTEMPT_SELECT} order by started_at, operation_id`)
+        .prepare(`${ATTEMPT_SELECT} order by retention_ms, operation_id`)
         .all() as AttemptRow[]
     ).map(attemptFromRow);
   }
@@ -1183,7 +1257,7 @@ export class LearningFactStore {
            work_class as workClass, complexity_band as complexityBand,
            parent_episode_id as parentEpisodeId,
            started_at as startedAt, ended_at as endedAt, duration_ms as durationMs
-         from work_episode_facts order by started_at, episode_id`,
+         from work_episode_facts order by retention_ms, episode_id`,
       ).all() as Array<Record<string, unknown>>
     ).map((row) =>
       workEpisodeFactSchema.parse({
@@ -1223,7 +1297,7 @@ export class LearningFactStore {
            content_digest as contentDigest, assignment_id as assignmentId,
            work_class as workClass, complexity_band as complexityBand,
            exposed_at as exposedAt, mode, assertion
-         from technique_exposure_facts order by exposed_at, exposure_id`,
+         from technique_exposure_facts order by retention_ms, exposure_id`,
       ).all() as Array<Record<string, unknown>>
     ).map((row) =>
       techniqueExposureFactSchema.parse({
