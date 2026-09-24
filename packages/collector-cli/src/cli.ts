@@ -2776,6 +2776,12 @@ async function main() {
         // Session snapshots share the ingest endpoint. Carry their identities
         // rather than issue another request inside a server-directed cooldown.
         if (serverRetryAfterMs > 0) { carrySessions(); return; }
+        // While more than a cycle of events is due, events drain first. A
+        // session snapshot re-reads every row of each touched session (1.88M
+        // for Studio0's busiest), seconds to minutes that would hold the next
+        // upload cycle; the identities are carried to the cycle that ends the
+        // backlog (eco-6hoxj.163.24).
+        if (catchUp) { carrySessions(); return; }
 
         // Session sync (issue 0037 / eco-6hoxj.70.1): just-uploaded batches
         // plus durable pending, and a ledger catch-up until the first full
