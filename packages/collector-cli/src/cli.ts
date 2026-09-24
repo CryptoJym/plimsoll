@@ -3405,6 +3405,7 @@ async function main() {
           retentionDays: config.retentionDays,
           syncConfigured: Boolean(config.uploadUrl),
           reconciliation: codexReconciliationStatus(buffer.database),
+          sessionAttribution: sessionContextIndexStatus(buffer.database),
           stats: projectedStatus?.stats ?? null,
           retention: buffer.retentionStatus(config.retentionDays),
           // Hook events the collector could not accept live, and what the
