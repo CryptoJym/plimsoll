@@ -18,6 +18,7 @@ import { IncrementalJsonlDiscovery } from "../../packages/collector-cli/src/incr
 import { CollectorMaintenance } from "../../packages/collector-cli/src/maintenance";
 import { RolloutTailer } from "../../packages/collector-cli/src/rollout-tailer";
 import { createCollectorServer } from "../../packages/collector-cli/src/server";
+import { STATUS_SUMMARY_FILE, STATUS_SUMMARY_SCHEMA } from "../../packages/collector-cli/src/status-summary";
 import { TranscriptTailer } from "../../packages/collector-cli/src/transcript-tailer";
 import { emptyWorkCounters, type ScenarioReceipt } from "./types";
 import type { ResourceSandbox } from "./scenarios";
@@ -311,6 +312,21 @@ async function proveSignalCleanup(root: string, repoRoot: string) {
   } catch {
     reachable = false;
   }
+  // The daemon keeps a private status summary for local readers
+  // (eco-6hoxj.163.34). It stays after shutdown: exactly this run's 0600 file
+  // and no temporary file, the one entry the summary adds to this home.
+  let statusSummaryKept = false;
+  try {
+    const summaryPath = path.join(collectorHome, STATUS_SUMMARY_FILE);
+    const summaryStat = fs.lstatSync(summaryPath);
+    const summary = JSON.parse(fs.readFileSync(summaryPath, "utf8")) as { schema?: unknown; port?: unknown };
+    statusSummaryKept = summaryStat.isFile() && (summaryStat.mode & 0o777) === 0o600 &&
+      summary.schema === STATUS_SUMMARY_SCHEMA && summary.port === port;
+  } catch {
+    statusSummaryKept = false;
+  }
+  const statusSummaryTempFiles = fs.readdirSync(collectorHome)
+    .filter((name) => name.startsWith(`${STATUS_SUMMARY_FILE}.`)).length;
   return {
     observedInFileWork,
     exitedCleanly: exit.code === 0 && exit.signal === null,
@@ -325,6 +341,8 @@ async function proveSignalCleanup(root: string, repoRoot: string) {
     activePidFileOwned: stdout.includes('"pidFileOwned":true'),
     shutdownReportedReady: stdout.includes('"status":"shutdown_ready"'),
     shutdownReportedIncomplete: stdout.includes('"status":"shutdown_incomplete"'),
+    statusSummaryKept,
+    statusSummaryTempFiles,
   };
 }
 
@@ -611,7 +629,9 @@ export async function runBoundedCaptureContract(
     signalCleanup.stderrEmpty &&
     signalCleanup.stdoutPrivate &&
     signalCleanup.pidMatchesCollectorProcess &&
-    signalCleanup.nodeMajor === 22;
+    signalCleanup.nodeMajor === 22 &&
+    signalCleanup.statusSummaryKept &&
+    signalCleanup.statusSummaryTempFiles === 0;
   const discoveryEntryPolicySafe =
     discoveryEntryPolicy.irrelevantExternalDirectorySymlinkIgnored &&
     discoveryEntryPolicy.matchingSymlinkFailsClosed &&
@@ -692,6 +712,8 @@ export async function runBoundedCaptureContract(
       signalActivePidFileOwned: signalCleanup.activePidFileOwned,
       signalShutdownReportedReady: signalCleanup.shutdownReportedReady,
       signalShutdownReportedIncomplete: signalCleanup.shutdownReportedIncomplete,
+      signalStatusSummaryKept: signalCleanup.statusSummaryKept,
+      signalStatusSummaryTempFiles: signalCleanup.statusSummaryTempFiles,
     },
   };
 }
