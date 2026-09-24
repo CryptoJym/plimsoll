@@ -59,26 +59,35 @@ const MAX_REVERT_PAGES = 3;
 const MAX_REOPEN_PULLS = 20;
 const MAX_LINKED_SESSION_IDS = 50;
 
-/** A GitHub owner or repository name: ASCII letters, digits, '.', '_' and '-'. */
-const GITHUB_NAME = /^[A-Za-z0-9._-]{1,100}$/;
+/**
+ * A GitHub account (user or organization) name: ASCII letters and digits with
+ * single inner hyphens, plus the `_SHORTCODE` (3-8 letters or digits) GitHub
+ * appends to managed users, at most 39 characters in all (GitHub Docs,
+ * "Username considerations for external authentication").
+ */
+const GITHUB_OWNER = /^(?=.{1,39}$)[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*(?:_[A-Za-z0-9]{3,8})?$/;
+/** A GitHub repository name: at most 100 ASCII letters, digits, '.', '-' and
+ * '_' (GitHub Docs, "Creating a new repository"). */
+const GITHUB_REPOSITORY = /^[A-Za-z0-9._-]{1,100}$/;
 
 /**
  * `--repository` is both the run's disclosure and its identity. Before it
  * reaches the remote hash, the GitHub API path or an external id, trim
- * surrounding ASCII whitespace, check the raw parts against the ASCII name
- * rules, and only then lowercase, so ' Acme/Widgets ' and 'acme/widgets' are
- * one repository and build the same batch (GitHub resolves names without
- * regard to case). The order matters: lowercasing folds the Kelvin sign
- * (U+212A) into an ASCII 'k', and trim() would drop invisible non-ASCII such
- * as U+FEFF. Anything else is refused before any request.
+ * surrounding ASCII whitespace, check the raw parts against GitHub's ASCII
+ * owner and repository rules, and only then lowercase, so ' Acme/Widgets '
+ * and 'acme/widgets' are one repository and build the same batch (GitHub
+ * resolves names without regard to case). The order matters: lowercasing
+ * folds the Kelvin sign (U+212A) into an ASCII 'k', and trim() would drop
+ * invisible non-ASCII such as U+FEFF. Anything else is refused before any
+ * request.
  */
 function githubRepository(value: string) {
   const parts = value.split("/").map((part) => part.replace(/^[\t\n\v\f\r ]+|[\t\n\v\f\r ]+$/g, ""));
-  if (parts.length !== 2 || !parts.every((part) => GITHUB_NAME.test(part) && part !== "." && part !== "..")) {
+  const [owner, repo] = parts;
+  if (parts.length !== 2 || !GITHUB_OWNER.test(owner) || !GITHUB_REPOSITORY.test(repo) || repo === "." || repo === "..") {
     throw new Error("--repository expects a GitHub owner/repo, such as acme/widgets.");
   }
-  const [owner, repo] = parts.map((part) => part.toLowerCase());
-  return { owner, repo };
+  return { owner: owner.toLowerCase(), repo: repo.toLowerCase() };
 }
 
 export type LedgerSessionLink = {

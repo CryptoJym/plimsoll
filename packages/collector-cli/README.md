@@ -108,9 +108,12 @@ npx @plimsoll/cli sync-outcomes --repository owner/repo
 
 `--repository` is the GitHub `owner/repo` from the repository URL. Spaces
 around it and letter case do not matter: ` Acme/Widgets ` and `acme/widgets`
-are the same repository. Anything that is not a GitHub owner/repo (a URL, a
-third path segment, a space or another character GitHub does not allow in a
-name) is refused before any request. For a private repository, set
+are the same repository. Both parts follow GitHub's naming rules in plain
+ASCII: the owner is letters, digits and single hyphens (up to 39 characters,
+or a managed user's `name_SHORTCODE`), and the repository name is letters,
+digits, `.`, `-` and `_` (up to 100). Anything else, such as a URL, a third
+path segment or a look-alike Unicode character, is refused before any
+request. For a private repository, set
 `GITHUB_TOKEN` or `GH_TOKEN`. The owner and name are sent to the workspace;
 pull request titles, bodies, diffs and file paths are not, and branch names
 travel only as hashes.

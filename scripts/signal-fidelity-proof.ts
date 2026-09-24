@@ -1,6 +1,6 @@
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = process.env.PLIMSOLL_PROOF_CLOCK_CASE === "1" ? null : createProofCompletion("signal-fidelity", 111);
+const completion = process.env.PLIMSOLL_PROOF_CLOCK_CASE === "1" ? null : createProofCompletion("signal-fidelity", 112);
 /**
  * Signal-fidelity proof for the v2 collector capture path.
  *
@@ -4144,6 +4144,36 @@ async function main() {
       "outcomes_repository_non_ascii_refused_before_case_folding",
       Object.values(unicodeVerdicts).every((verdict) => verdict.refused && verdict.requests === 0),
       JSON.stringify(unicodeVerdicts),
+    );
+    // Owners follow GitHub's account-name rules (letters, digits and single
+    // inner hyphens, at most 39 characters, or a managed user's _SHORTCODE);
+    // repository names keep their own rules, including a leading '.'.
+    const ownerCases: Record<string, [repository: string, accepted: boolean]> = {
+      dot_in_owner: ["foo.bar/widgets", false],
+      leading_hyphen: ["-foo/widgets", false],
+      trailing_hyphen: ["foo-/widgets", false],
+      double_hyphen: ["foo--bar/widgets", false],
+      forty_characters: [`${"a".repeat(40)}/widgets`, false],
+      underscore_without_shortcode: ["foo_/widgets", false],
+      two_character_shortcode: ["foo_ab/widgets", false],
+      two_underscores: ["foo_bar_baz/widgets", false],
+      thirty_nine_characters: [`${"a".repeat(39)}/widgets`, true],
+      single_character: ["a/widgets", true],
+      hyphenated: ["Foo-Bar-9/widgets", true],
+      managed_user: ["Mona-Cat_octo/widgets", true],
+      managed_setup_user: ["octo_admin/widgets", true],
+      dot_leading_repository: ["acme/.github", true],
+    };
+    const ownerVerdicts: Record<string, { expected: string; refused: boolean; requests: number }> = {};
+    for (const [label, [repository, accepted]] of Object.entries(ownerCases)) {
+      ownerVerdicts[label] = { expected: accepted ? "accepted" : "refused", ...(await repositoryVerdict(repository)) };
+    }
+    check(
+      "outcomes_repository_owner_follows_github_account_rules",
+      Object.values(ownerVerdicts).every((verdict) =>
+        verdict.expected === "accepted" ? !verdict.refused : verdict.refused && verdict.requests === 0,
+      ),
+      JSON.stringify(ownerVerdicts),
     );
     d2Ledger.close();
 
