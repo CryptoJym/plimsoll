@@ -2,7 +2,7 @@ import Foundation
 
 /// What the menu shows, from the summary file and the liveness check.
 public enum CollectorState: Equatable, Sendable {
-    /// The collector answers, and its summary is fresh.
+    /// The run that wrote the summary answers on its port, and it is fresh.
     case running(StatusSummary)
     /// The collector answers, but has not rewritten its summary lately.
     case notUpdating(StatusSummary, age: TimeInterval)
@@ -13,11 +13,12 @@ public enum CollectorState: Equatable, Sendable {
 }
 
 public enum CollectorMonitor {
-    /// Reads the summary, then asks whether the collector on its port is live.
+    /// Reads the summary, then asks whether the collector on its port is the
+    /// run that wrote it (its /healthz names the same instanceId).
     public static func state(
         home: URL?,
         now: Date = Date(),
-        isLive: (StatusSummary) -> Bool = { LivenessProbe.healthz(port: $0.port) }
+        isLive: (StatusSummary) -> Bool = { LivenessProbe.answers(as: $0.instanceId, port: $0.port) }
     ) -> CollectorState {
         switch SummaryFile.read(home: home) {
         case let .failure(problem):
@@ -36,7 +37,9 @@ public enum CollectorMonitor {
 public struct StatusLines: Equatable, Sendable {
     public let summary: String
     public let tokens: String
-    /// Offered only while the collector is running.
+    /// Offered only while the collector is verified running: the dashboard
+    /// keeps its credential in that origin's storage, so no other service
+    /// may be handed it.
     public let dashboard: URL?
 
     public init(state: CollectorState) {

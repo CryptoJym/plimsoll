@@ -182,29 +182,50 @@ struct PlimsollMenubarCoreTests {
         }
     }
 
-    // MARK: Liveness
+    // MARK: Liveness is bound to the run that wrote the summary
 
     @Test(arguments: [
-        (200, #"{"ok":true}"#, true),
-        (200, #"{"ok":true,"note":"extra fields are tolerated"}"#, true),
-        (200, #"{"ok":false}"#, false),
-        (200, #"{"ok":1}"#, false),
+        (200, #"{"ok":true,"instanceId":"\#(instanceA)"}"#, true),
+        (200, #"{"instanceId":"\#(instanceA)","ok":true}"#, true),
+        (200, #"{"ok":true}"#, false), // any other service's common health reply
+        (200, #"{"ok":true,"instanceId":"\#(instanceB)"}"#, false), // another collector run
+        (200, #"{"ok":true,"instanceId":"\#(instanceA)","note":1}"#, false), // not the exact shape
+        (200, #"{"ok":1,"instanceId":"\#(instanceA)"}"#, false),
+        (200, #"{"ok":false,"instanceId":"\#(instanceA)"}"#, false),
         (200, "OK", false),
-        (401, #"{"ok":true}"#, false),
+        (401, #"{"ok":true,"instanceId":"\#(instanceA)"}"#, false),
     ])
-    func healthzReplyMustMatchTheCollectorContract(statusCode: Int, body: String, live: Bool) {
-        #expect(LivenessProbe.isHealthzReply(statusCode: statusCode, body: Data(body.utf8)) == live)
+    func onlyTheCollectorsExactReplyNamesThisRun(statusCode: Int, body: String, live: Bool) {
+        #expect(LivenessProbe.isCollectorReply(statusCode: statusCode, body: Data(body.utf8), instanceId: instanceA) == live)
     }
 
-    @Test func probeSeesTheCollectorHealthzAndSendsNoCredential() throws {
-        let responder = try LoopbackResponder(reply: collectorHealthzReply)
+    @Test func probeRecognisesTheCollectorRunAndSendsNoCredential() throws {
+        let responder = try LoopbackResponder(reply: healthzReply(#"{"ok":true,"instanceId":"\#(instanceA)"}"#))
 
-        #expect(LivenessProbe.healthz(port: responder.port))
+        #expect(LivenessProbe.answers(as: instanceA, port: responder.port))
         let request = try #require(responder.request())
         #expect(request.hasPrefix("GET /healthz HTTP/1.1\r\n"))
         for header in ["x-plimsoll-token", "authorization", "cookie"] {
             #expect(!request.lowercased().contains(header))
         }
+    }
+
+    /// Review finding B6: a non-collector loopback service answering the
+    /// common `{"ok":true}` on the summary's port was shown as Running, and
+    /// Open Dashboard would have handed it the collector's origin.
+    @Test(arguments: [#"{"ok":true}"#, #"{"ok":true,"instanceId":"\#(instanceB)"}"#])
+    func anotherLoopbackServiceIsNotTheCollector(reply: String) throws {
+        let responder = try LoopbackResponder(reply: healthzReply(reply))
+        let home = try TemporaryHome()
+        defer { home.remove() }
+        try home.writeSummary(summaryJSON(port: responder.port, count: 7, updatedAt: isoNow()))
+
+        let state = CollectorMonitor.state(home: home.url)
+        guard case .stopped = state else {
+            Issue.record("\(state) is not Stopped"); return
+        }
+        #expect(StatusLines(state: state).dashboard == nil)
+        #expect(responder.request() != nil)
     }
 
     /// Swift Testing runs every test on the Swift concurrency pool: one thread
@@ -217,7 +238,7 @@ struct PlimsollMenubarCoreTests {
         let running = try await withThrowingTaskGroup(of: Bool.self) { group in
             for _ in 0..<callers {
                 group.addTask {
-                    let responder = try LoopbackResponder(reply: collectorHealthzReply)
+                    let responder = try LoopbackResponder(reply: healthzReply(#"{"ok":true,"instanceId":"\#(instanceA)"}"#))
                     let home = try TemporaryHome()
                     defer { home.remove() }
                     try home.writeSummary(summaryJSON(port: responder.port, updatedAt: isoNow()))
@@ -233,25 +254,17 @@ struct PlimsollMenubarCoreTests {
         #expect(running.allSatisfy { $0 })
     }
 
-    @Test func probeReportsStoppedForAnotherServiceOnThePort() throws {
-        let responder = try LoopbackResponder(reply: [
-            "HTTP/1.1 200 OK", "content-type: text/plain", "content-length: 2", "connection: close", "", "OK",
-        ].joined(separator: "\r\n"))
-
-        #expect(!LivenessProbe.healthz(port: responder.port))
-    }
-
     @Test func probeReportsStoppedWhenNothingListens() throws {
         let port = try LoopbackResponder.unusedPort()
         let started = Date()
 
-        #expect(!LivenessProbe.healthz(port: port))
+        #expect(!LivenessProbe.answers(as: instanceA, port: port))
         #expect(Date().timeIntervalSince(started) < LivenessProbe.timeout)
     }
 
     @Test func probeNeverContactsPortsOutsideTheTCPRange() {
-        #expect(!LivenessProbe.healthz(port: 0))
-        #expect(!LivenessProbe.healthz(port: 70_000))
+        #expect(!LivenessProbe.answers(as: instanceA, port: 0))
+        #expect(!LivenessProbe.answers(as: instanceA, port: 70_000))
     }
 
     // MARK: What the sources can do
@@ -337,11 +350,15 @@ private func isoNow() -> String {
     return formatter.string(from: Date())
 }
 
-/// The collector's `/healthz` answer before this change: `{"ok":true}` only.
-private let collectorHealthzReply = [
-    "HTTP/1.1 200 OK", "content-type: application/json", "content-length: 11", "connection: close", "",
-    #"{"ok":true}"#,
-].joined(separator: "\r\n")
+private let instanceB = "7c2d4e6f-8a9b-4c1d-8e2f-3a4b5c6d7e8f"
+
+/// An HTTP response carrying a JSON body, as the collector's /healthz sends it.
+private func healthzReply(_ body: String) -> String {
+    [
+        "HTTP/1.1 200 OK", "content-type: application/json", "content-length: \(body.utf8.count)",
+        "connection: close", "", body,
+    ].joined(separator: "\r\n")
+}
 
 /// A private (0700) directory standing in for the collector home.
 private struct TemporaryHome: Sendable {

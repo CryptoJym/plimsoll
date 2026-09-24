@@ -9,7 +9,10 @@ public enum LivenessProbe {
     /// Same bound as the runbook's `curl --max-time 3 .../healthz`.
     public static let timeout: TimeInterval = 3
 
-    public static func healthz(port: Int) -> Bool {
+    /// True only if 127.0.0.1:<port> answers as the collector run that wrote
+    /// the summary: `{"ok":true,"instanceId":"<that id>"}`. Any other service
+    /// on the port, including one answering a bare `{"ok":true}`, is not it.
+    public static func answers(as instanceId: String, port: Int) -> Bool {
         guard (1...65_535).contains(port),
               let url = URL(string: "http://127.0.0.1:\(port)/healthz") else { return false }
         let configuration = URLSessionConfiguration.ephemeral
@@ -23,31 +26,36 @@ public enum LivenessProbe {
         let session = URLSession(configuration: configuration)
         defer { session.invalidateAndCancel() }
 
-        let healthy = OSAllocatedUnfairLock(initialState: false)
+        let verified = OSAllocatedUnfairLock(initialState: false)
         let finished = DispatchSemaphore(value: 0)
         let task = session.dataTask(with: url) { data, response, _ in
-            let reply = isHealthzReply(statusCode: (response as? HTTPURLResponse)?.statusCode, body: data)
-            healthy.withLock { $0 = reply }
+            let reply = isCollectorReply(
+                statusCode: (response as? HTTPURLResponse)?.statusCode, body: data, instanceId: instanceId
+            )
+            verified.withLock { $0 = reply }
             finished.signal()
         }
         task.resume()
         if finished.wait(timeout: .now() + timeout) == .timedOut {
             task.cancel()
         }
-        return healthy.withLock { $0 }
+        return verified.withLock { $0 }
     }
 
-    /// The collector answers `/healthz` with HTTP 200 and `{"ok":true}`.
-    /// Anything else on that port is not a live collector.
-    public static func isHealthzReply(statusCode: Int?, body: Data?) -> Bool {
-        guard statusCode == 200, let body,
-              let reply = try? JSONDecoder().decode(HealthzReply.self, from: body) else {
+    /// The collector's exact reply: HTTP 200 and a JSON object with exactly
+    /// two keys, `ok` (the boolean true) and `instanceId` (the expected id).
+    public static func isCollectorReply(statusCode: Int?, body: Data?, instanceId: String) -> Bool {
+        guard statusCode == 200, let body, body.count <= 1_024,
+              let object = (try? JSONSerialization.jsonObject(with: body)) as? [String: Any],
+              Set(object.keys) == ["ok", "instanceId"],
+              let reply = try? JSONDecoder().decode(Reply.self, from: body) else {
             return false
         }
-        return reply.ok
+        return reply.ok && reply.instanceId == instanceId
     }
 
-    private struct HealthzReply: Decodable {
+    private struct Reply: Decodable {
         let ok: Bool
+        let instanceId: String
     }
 }

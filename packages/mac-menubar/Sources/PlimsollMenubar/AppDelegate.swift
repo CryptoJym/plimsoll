@@ -64,9 +64,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         refreshStatus()
     }
 
+    /// Checks again that the collector answers as the run that wrote the
+    /// summary before handing its origin to the browser.
     @objc private func openDashboardAction() {
-        guard let dashboardURL else { return }
-        NSWorkspace.shared.open(dashboardURL)
+        guard dashboardURL != nil else { return }
+        let home = self.home
+        DispatchQueue.global(qos: .userInitiated).async {
+            let lines = StatusLines(state: CollectorMonitor.state(home: home))
+            DispatchQueue.main.async { [weak self] in
+                self?.render(lines)
+                if let url = lines.dashboard { NSWorkspace.shared.open(url) }
+            }
+        }
     }
 
     @objc private func quitAction() {
