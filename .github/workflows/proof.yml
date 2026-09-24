@@ -234,6 +234,10 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:studio0-writer-contention
 
+      - name: Prove collector main-thread turns stay under budget on a Studio0-shaped session (eco-6hoxj.163.24)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:studio0-main-thread-turns
+
       - name: Prove session-inherited project attribution and its upload-path bound (eco-6hoxj.163.9)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: |
