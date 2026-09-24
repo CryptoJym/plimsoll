@@ -78,12 +78,14 @@ type CloudAckModule = {
     itemIds: string[];
     [key: string]: unknown;
   };
-  deliveryAcknowledgement: (expected: { itemIds: string[]; [key: string]: unknown }, acceptedIds: string[]) => {
-    acceptedIds: string[];
-    rejectedIds: string[];
-    [key: string]: unknown;
-  };
   deliveryItemId: (type: string, id: string) => string;
+};
+
+type CloudAckResponseModule = {
+  acknowledgedResponse: (
+    result: { acceptedItemIds: string[]; [key: string]: unknown },
+    expected: { itemIds: string[]; [key: string]: unknown },
+  ) => Record<string, unknown>;
 };
 
 function uuid(n: number) {
@@ -161,6 +163,7 @@ async function createV074Ledger() {
 function cloudRoute(
   fetchState: { requests: Array<{ expected: ReturnType<CloudAckModule["deliveryExpectation"]>; body: Record<string, unknown> }> },
   cloudAck: CloudAckModule,
+  cloudAckResponse: CloudAckResponseModule,
 ) {
   return (async (_input: RequestInfo | URL, init?: RequestInit) => {
     const rawBody = String(init?.body ?? "");
@@ -173,15 +176,14 @@ function cloudRoute(
       .map((row) => cloudAck.deliveryItemId("session", row.session.id));
     const inserted = acceptedIds.length;
     const skippedStale = body.sessions.length - inserted;
-    const ack = cloudAck.deliveryAcknowledgement(expected, acceptedIds);
     fetchState.requests.push({ expected, body });
+    const response = cloudAckResponse.acknowledgedResponse(
+      { acceptedItemIds: acceptedIds, accepted: acceptedIds.length, inserted, updated: 0, skippedStale },
+      expected,
+    );
     return new Response(JSON.stringify({
       ok: true,
-      accepted: acceptedIds.length,
-      inserted,
-      updated: 0,
-      skippedStale,
-      ack,
+      ...response,
     }), { status: 200, headers: { "content-type": "application/json" } });
   }) as typeof fetch;
 }
@@ -192,6 +194,9 @@ async function main() {
   const cloudAck = await import(
     pathToFileURL(path.join(cloudRoot, "src/lib/delivery-ack.ts")).href,
   ) as unknown as CloudAckModule;
+  const cloudAckResponse = await import(
+    pathToFileURL(path.join(cloudRoot, "src/lib/delivery-ack-response.ts")).href,
+  ) as unknown as CloudAckResponseModule;
   const db = new Database(ledgerPath);
   const config = collectorConfigSchema.parse({
     uploadUrl: "http://127.0.0.1:1/ingest",
@@ -204,7 +209,7 @@ async function main() {
   const result = await runSessionSync(config, {
     until,
     ledgerDb: db,
-    fetchImpl: cloudRoute({ requests }, cloudAck),
+    fetchImpl: cloudRoute({ requests }, cloudAck, cloudAckResponse),
     sleep: async () => undefined,
     delayMs: 0,
     maxAttemptsPerBatch: 1,
