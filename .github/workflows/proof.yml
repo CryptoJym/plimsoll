@@ -90,6 +90,10 @@ jobs:
           pnpm proof:finance-export
           pnpm proof:finance-projection
           pnpm proof:delivery
+          pnpm proof:capture-claim
+          pnpm proof:capture-claim-review
+          pnpm proof:capture-claim-review-r4
+          pnpm proof:capture-claim-review-r5
           pnpm proof:repo-labels-response
 
       - name: Prove source installer and read-only doctor
@@ -196,6 +200,14 @@ jobs:
       - name: Prove packaged lifecycle operator commands end to end
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:lifecycle-operator
+
+      - name: Prove bounded lifecycle snapshot retention and space-free snapshots (eco-6hoxj.163.30)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:lifecycle-retention
+
+      - name: Prove lifecycle rollback and retention are data-safe (eco-6hoxj.163.30 r2)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:lifecycle-data-safety
 
       - name: Prove bounded nonblocking Git metadata maintenance
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}

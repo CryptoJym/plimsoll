@@ -12,6 +12,7 @@ import { hasUnsafeOutboundString, sealOutboundSessionRow } from "./outbound-enve
 import { terminalPrivacyEligibilitySql } from "./privacy-disposition";
 import { chunkHistoryEnvelopes, postHistoryBatch } from "./upload-history";
 import { deliveryItemId } from "./delivery-ack";
+import { pinnedUploadUrl } from "./http-transport";
 import {
   aiWorkSessionSyncBatchSchema,
   type AiWorkIngestBatch,
@@ -782,6 +783,7 @@ export type SessionSyncOptions = {
   /** Audit only: walk + normalize + reconcile, zero network. */
   dryRun?: boolean;
   url?: string;
+  developmentLoopbackUrl?: boolean;
   appVersion?: string;
   ledgerPath?: string;
   /** Borrow an already-open handle (the daemon's live buffer) instead of
@@ -843,7 +845,7 @@ export async function runSessionSync(
   const sleep = options.sleep ?? defaultSleep;
   const fetchImpl = options.fetchImpl ?? fetch;
 
-  const url = options.url ?? config.uploadUrl;
+  const url = pinnedUploadUrl(config.uploadUrl, options.url, { developmentLoopback: options.developmentLoopbackUrl, log });
   if (!url) {
     throw new Error(
       "This machine has not joined a workspace (no uploadUrl in collector.config.json). " +

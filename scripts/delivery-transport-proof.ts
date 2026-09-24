@@ -3,7 +3,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import http from "node:http";
-import { authenticatedJsonPost, postJson, TransportError } from "../packages/collector-cli/src/http-transport";
+import { authenticatedJsonPost, pinnedUploadUrl, postJson, TransportError } from "../packages/collector-cli/src/http-transport";
 import { deliveryAcknowledgement, deliveryExpectation, validateDeliveryAcknowledgement } from "../packages/collector-cli/src/delivery-ack";
 import { postDelivery } from "../packages/collector-cli/src/delivery-post";
 
@@ -173,6 +173,123 @@ async function main() {
     const statePath=path.join(root,'history-state.json');const cfg=collectorConfigSchema.parse({tenantId,installKey,uploadUrl:options.url});
     const result=await runWorkspaceHistoryUpload(cfg,{ledgerPath:ledger,statePath,fetchImpl:fake({}),sleep:async()=>{},delayMs:0,maxAttemptsPerBatch:1,log:()=>{}});
     assert.equal(result.ok,false);const state=JSON.parse(fs.readFileSync(statePath,'utf8'));assert.equal(state.watermark,null);
+  });
+  // A --url override may pick another path on the joined workspace, never another origin:
+  // every upload path refuses a foreign-origin override before any request (GitHub reads
+  // included) and sends to a same-origin one.
+  const { runAttributionRepair } = await import("../packages/collector-cli/src/upload-history");
+  const { runSessionSync } = await import("../packages/collector-cli/src/session-sync");
+  const { runOutcomesSync } = await import("../packages/collector-cli/src/outcomes-sync");
+  const { pushRepoLabels } = await import("../packages/collector-cli/src/repo-labels");
+  const { remoteLinkageHash } = await import("../packages/shared/src/index");
+  const workspace=new URL(options.url).origin, sameOriginOverride=`${workspace}/override/ingest`;
+  const foreignOverrides=["https://foreign.example/api/work-intelligence/ingest","http://127.0.0.1:2/ingest"];
+  const pinCfg=collectorConfigSchema.parse({tenantId,installKey,uploadUrl:options.url,delivery:{requestTimeoutSeconds:1}});
+  const repoHash=remoteLinkageHash('https://github.com/fixture/outcomes.git')!, sha='a'.repeat(40);
+  const quiet={sleep:async()=>{},delayMs:0,maxAttemptsPerBatch:1,log:()=>{}};
+  let pinLedgers=0;
+  const pinLedger=()=>{
+    const file=path.join(root,`pin-${++pinLedgers}.sqlite`);
+    const buffer=new LocalEventBuffer(file,{workspaceId:tenantId,delivery:{enabled:true,limits:pinCfg.delivery}});
+    buffer.append(aiInteractionEventSchema.parse({id:uuid(100),sessionId:uuid(101),source:'codex',eventType:'assistant_response',observedAt:new Date().toISOString(),inputTokens:7}));
+    buffer.database.prepare('update buffered_events set repo_hash = ?, head_sha = ?').run(repoHash,sha);
+    return {buffer,file};
+  };
+  const workspaceFetch=(posted:string[])=>(async(input,init)=>{
+    const url=new URL(String(input)), now=new Date().toISOString();
+    if(url.hostname==='api.github.com'){
+      const data=url.pathname.endsWith('/pulls')?[{number:1,state:'closed',merged_at:now,updated_at:now,merge_commit_sha:'b'.repeat(40),head:{sha,ref:'main'}}]:url.pathname.endsWith('/check-runs')?{check_runs:[]}:[];
+      return new Response(JSON.stringify(data));
+    }
+    posted.push(url.href);
+    const raw=String(init?.body),payload=JSON.parse(raw);
+    if(Array.isArray(payload.repositories))return new Response(JSON.stringify({ok:true,created:payload.repositories.length,updated:0}));
+    const exp=deliveryExpectation(raw,installKey);
+    return new Response(JSON.stringify({ok:true,ack:deliveryAcknowledgement(exp,exp.itemIds)}));
+  }) as typeof fetch;
+  type UploadConfig=typeof pinCfg;
+  type DevOptions={developmentLoopbackUrl?:boolean;log?:(line:string)=>void};
+  const uploadPaths:Record<string,{target:string;run:(cfg:UploadConfig,url:string,fetchImpl:typeof fetch,dev?:DevOptions)=>Promise<boolean>}>={
+    upload:{target:sameOriginOverride,run:async(cfg,url,fetchImpl,dev={})=>{
+      const {buffer}=pinLedger();
+      try{return (await uploadBufferedEvents(cfg,buffer,{url,fetchImpl,developmentLoopbackUrl:dev.developmentLoopbackUrl})).uploadedEvents===1;}finally{buffer.close();}
+    }},
+    upload_history:{target:sameOriginOverride,run:async(cfg,url,fetchImpl,dev={})=>{
+      const {buffer,file}=pinLedger();buffer.close();
+      return (await runWorkspaceHistoryUpload(cfg,{ledgerPath:file,statePath:`${file}.state.json`,url,fetchImpl,...quiet,...dev})).ok;
+    }},
+    repair_attribution:{target:sameOriginOverride,run:async(cfg,url,fetchImpl,dev={})=>{
+      const {buffer,file}=pinLedger();buffer.close();
+      return (await runAttributionRepair(cfg,{ledgerPath:file,url,fetchImpl,...quiet,...dev})).ok;
+    }},
+    session_sync:{target:sameOriginOverride,run:async(cfg,url,fetchImpl,dev={})=>{
+      const {buffer}=pinLedger();
+      try{return (await runSessionSync(cfg,{ledgerDb:buffer.database,url,fetchImpl,...quiet,...dev})).ok;}finally{buffer.close();}
+    }},
+    repo_labels:{target:`${workspace}/api/work-intelligence/repo-labels`,run:async(cfg,url,fetchImpl,dev={})=>
+      (await pushRepoLabels(cfg,[{source:'repo_label',provider:'github',owner:'fixture',name:'outcomes',remoteUrlHash:repoHash}],{url,fetchImpl,log:()=>{},...dev})).pushed===1},
+    sync_outcomes:{target:`${workspace}/api/work-intelligence/github-outcomes`,run:async(cfg,url,fetchImpl,dev={})=>{
+      const {buffer}=pinLedger();
+      try{return (await runOutcomesSync(cfg,{repository:'fixture/outcomes',ledgerDb:buffer.database,url,fetchImpl,log:()=>{},...dev})).ok;}finally{buffer.close();}
+    }},
+  };
+  for (const [name,entry] of Object.entries(uploadPaths)) await check(`url_override_pinned_to_workspace_origin_${name}`,async()=>{
+    for (const foreign of foreignOverrides) {
+      let requests=0;
+      await assert.rejects(entry.run(pinCfg,foreign,(async()=>{requests++;return new Response('{}');}) as typeof fetch),/same origin as the configured workspace audience/);
+      assert.equal(requests,0);
+    }
+    const posted:string[]=[];
+    assert.equal(await entry.run(pinCfg,sameOriginOverride,workspaceFetch(posted)),true);
+    assert.ok(posted.length>0&&posted.every(url=>url===entry.target),JSON.stringify(posted));
+  });
+  // Without a joined workspace there is no origin to pin to. The removed
+  // PLIMSOLL_DEV_ALLOW_UNJOINED_UPLOAD_URL variable does nothing; only the per-invocation
+  // --dev-loopback-url flag lets an override through, only to this machine, and every use
+  // warns on stderr and records a development_upload_url_used line.
+  const unjoinedCfg=collectorConfigSchema.parse({tenantId,installKey,delivery:{requestTimeoutSeconds:1}});
+  const captureConsole=async<T>(action:()=>Promise<T>|T)=>{
+    const warnings:string[]=[],printed:string[]=[];
+    const {warn,log}=console;
+    console.warn=(...args:unknown[])=>{warnings.push(args.join(' '));};
+    console.log=(...args:unknown[])=>{printed.push(args.join(' '));};
+    try{return {value:await action(),warnings,printed};}finally{console.warn=warn;console.log=log;}
+  };
+  for (const [name,entry] of Object.entries(uploadPaths)) await check(`unjoined_url_override_needs_dev_loopback_flag_${name}`,async()=>{
+    let requests=0;
+    const counting=(async()=>{requests++;return new Response('{}');}) as typeof fetch;
+    process.env.PLIMSOLL_DEV_ALLOW_UNJOINED_UPLOAD_URL='1';
+    try{await assert.rejects(entry.run(unjoinedCfg,sameOriginOverride,counting),/needs a joined workspace/);}
+    finally{delete process.env.PLIMSOLL_DEV_ALLOW_UNJOINED_UPLOAD_URL;}
+    await assert.rejects(entry.run(unjoinedCfg,'https://foreign.example/api/work-intelligence/ingest',counting,{developmentLoopbackUrl:true}),/--dev-loopback-url allows only/);
+    assert.equal(requests,0);
+    const posted:string[]=[],receipts:string[]=[];
+    const run=await captureConsole(()=>entry.run(unjoinedCfg,sameOriginOverride,workspaceFetch(posted),{developmentLoopbackUrl:true,log:line=>receipts.push(line)}));
+    assert.equal(run.value,true);
+    assert.ok(posted.length>0&&posted.every(url=>url===entry.target),JSON.stringify(posted));
+    assert.ok(run.warnings.some(line=>/^WARNING: --dev-loopback-url .*http:\/\/127\.0\.0\.1:1 /.test(line)),JSON.stringify(run.warnings));
+    const recorded=[...receipts,...run.printed].map(line=>{try{return JSON.parse(line);}catch{return null;}});
+    assert.ok(recorded.some(line=>line?.status==='development_upload_url_used'&&line.origin==='http://127.0.0.1:1'),JSON.stringify(recorded));
+  });
+  await check('dev_loopback_flag_accepts_only_plain_loopback_urls',async()=>{
+    const accepted=['http://localhost:3000/ingest','https://localhost/ingest','HTTP://LOCALHOST:3000/ingest','http://127.0.0.1:1/ingest','http://127.8.9.10:80/ingest','http://[::1]:8080/ingest'];
+    const refused=['https://foreign.example/ingest','http://ⓛocalhost:3000/ingest','https://ｌocalhost/ingest','http://%6cocalhost:3000/ingest',
+      'http://127.1:3000/ingest','http://0x7f.0.0.1:3000/ingest','http://2130706433:3000/ingest','http://localhost.:3000/ingest','http://x.localhost:3000/ingest',
+      'http://localtest.me:3000/ingest','http://127.0.0.1.nip.io:3000/ingest','http://user:pass@localhost:3000/ingest','http://localhost:3000@evil.example/ingest',
+      'http://localhost\\@evil.example/ingest','http://[::ffff:127.0.0.1]:3000/ingest','http://[0:0:0:0:0:0:0:1]:3000/ingest','http://0.0.0.0:3000/ingest','http:localhost:3000/ingest'];
+    for (const url of accepted) {
+      const receipts:string[]=[];
+      const run=await captureConsole(()=>pinnedUploadUrl(undefined,url,{developmentLoopback:true,log:line=>receipts.push(line)}));
+      assert.equal(run.value,url,url);assert.equal(run.warnings.length,1,url);assert.equal(receipts.length,1,url);
+    }
+    for (const url of refused) {
+      const receipts:string[]=[];
+      const run=await captureConsole(()=>{try{pinnedUploadUrl(undefined,url,{developmentLoopback:true,log:line=>receipts.push(line)});return 'accepted';}catch{return 'refused';}});
+      assert.equal(run.value,'refused',url);assert.equal(run.warnings.length+receipts.length,0,url);
+    }
+    // A joined workspace keeps its own origin rule; the flag never widens it.
+    assert.throws(()=>pinnedUploadUrl('https://workspace.example/ingest','https://workspace.example/other',{developmentLoopback:true}),/--dev-loopback-url allows only/);
+    assert.throws(()=>pinnedUploadUrl('https://workspace.example/ingest','http://127.0.0.1:1/ingest',{developmentLoopback:true}),/same origin/);
   });
 }
 let completed=false;

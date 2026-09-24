@@ -1,6 +1,6 @@
 import { acceptedFixtureDelivery } from "./lib/delivery-fixture";
 import { createProofCompletion } from "./lib/proof-completion";
-const completion = process.env.PLIMSOLL_PROOF_CLOCK_CASE === "1" ? null : createProofCompletion("signal-fidelity", 108);
+const completion = process.env.PLIMSOLL_PROOF_CLOCK_CASE === "1" ? null : createProofCompletion("signal-fidelity", 113);
 /**
  * Signal-fidelity proof for the v2 collector capture path.
  *
@@ -4025,6 +4025,197 @@ async function main() {
         },
         idempotent: d2PostedBodies[0] === d2PostedBodies[1],
       }),
+    );
+
+    // 18d'. One repository, one identity: surrounding whitespace and letter
+    // case in --repository fold before hashing, so every spelling builds and
+    // posts the byte-identical batch; a value that is not a plain GitHub
+    // owner/repo slug is refused before any request.
+    const whitespaceBuiltBatch = buildOutcomePush({ ...d2BuildInput, owner: " Acme ", repo: " Widgets " }).batch;
+    const spellingBodies: Record<string, string | null> = {};
+    for (const repository of [" Acme/Widgets ", "acme/widgets"]) {
+      const postsBefore = d2PostedBodies.length;
+      const run = await runOutcomesSync(d2Config, {
+        repository,
+        until: d2Until,
+        ledgerDb: d2Ledger,
+        fetchImpl: d2Fetch,
+        log: () => undefined,
+      });
+      spellingBodies[repository] = run.ok && d2PostedBodies.length === postsBefore + 1 ? d2PostedBodies.at(-1)! : null;
+    }
+    check(
+      "outcomes_repository_spellings_share_one_identity",
+      JSON.stringify(whitespaceBuiltBatch) === JSON.stringify(push1.batch) &&
+        Object.values(spellingBodies).every((body) => body === d2PostedBodies[0]),
+      JSON.stringify({
+        builtRepository: whitespaceBuiltBatch?.repository,
+        builtFirstExternalId: whitespaceBuiltBatch?.artifacts[0]?.externalId,
+        postedIdenticalToCanonical: Object.fromEntries(
+          Object.entries(spellingBodies).map(([repository, body]) => [repository, body === d2PostedBodies[0]]),
+        ),
+      }),
+    );
+    let invalidRepositoryRequests = 0;
+    const invalidRepositoryRefused: Record<string, boolean> = {};
+    for (const repository of [
+      "acme",
+      "acme/widgets/extra",
+      "acme/",
+      "https://github.com/acme/widgets",
+      "acme/wid gets",
+      "acme/..",
+      "acme/widgets?per_page=1",
+      "acme/wïdgets",
+    ]) {
+      try {
+        await runOutcomesSync(d2Config, {
+          repository,
+          until: d2Until,
+          ledgerDb: d2Ledger,
+          fetchImpl: (async (input, init) => {
+            invalidRepositoryRequests += 1;
+            return d2Fetch(input, init);
+          }) as typeof fetch,
+          log: () => undefined,
+        });
+        invalidRepositoryRefused[repository] = false;
+      } catch (error) {
+        invalidRepositoryRefused[repository] = /--repository expects/.test(String(error));
+      }
+    }
+    // Real GitHub names stay accepted, including words a repo label would refuse.
+    const validRepositoryAccepted: Record<string, boolean> = {};
+    for (const repository of ["Acme/Next-Auth", "acme/my.repo_name-2"]) {
+      const run = await runOutcomesSync(d2Config, {
+        repository,
+        until: d2Until,
+        ledgerDb: d2Ledger,
+        fetchImpl: d2Fetch,
+        log: () => undefined,
+      }).catch(() => null);
+      validRepositoryAccepted[repository] = run?.ok === true;
+    }
+    check(
+      "outcomes_repository_invalid_input_refused_before_any_request",
+      invalidRepositoryRequests === 0 &&
+        Object.values(invalidRepositoryRefused).every(Boolean) &&
+        Object.values(validRepositoryAccepted).every(Boolean),
+      JSON.stringify({ invalidRepositoryRequests, refused: invalidRepositoryRefused, accepted: validRepositoryAccepted }),
+    );
+    // One --repository value against the fixture: refused, and requests made first.
+    const repositoryVerdict = async (repository: string) => {
+      let requests = 0;
+      try {
+        await runOutcomesSync(d2Config, {
+          repository,
+          until: d2Until,
+          ledgerDb: d2Ledger,
+          fetchImpl: (async (input, init) => {
+            requests += 1;
+            return d2Fetch(input, init);
+          }) as typeof fetch,
+          log: () => undefined,
+        });
+        return { refused: false, requests };
+      } catch (error) {
+        return { refused: /--repository expects/.test(String(error)), requests };
+      }
+    };
+    // Non-ASCII never becomes a name: parts are checked as ASCII before
+    // lowercasing (U+212A KELVIN SIGN lowercases to 'k'), and invisible
+    // non-ASCII around them is not trimmed away. Fullwidth letters, dotless i,
+    // combining marks and zero-width characters stay refused too.
+    const unicodeVerdicts: Record<string, { refused: boolean; requests: number }> = {};
+    for (const [label, repository] of Object.entries({
+      kelvin_sign: "acme/Kidgets",
+      kelvin_sign_in_owner: "acKme/widgets",
+      leading_zero_width_no_break_space: "﻿acme/widgets",
+      trailing_no_break_space: "acme/widgets ",
+      trailing_ideographic_space: "acme/widgets　",
+      fullwidth_letter: "acme/Ｗidgets",
+      dotless_i: "acme/wıdgets",
+      combining_dot_above: "acme/wi̇dgets",
+      inner_zero_width_space: "acme/wid​gets",
+    })) {
+      unicodeVerdicts[label] = await repositoryVerdict(repository);
+    }
+    check(
+      "outcomes_repository_non_ascii_refused_before_case_folding",
+      Object.values(unicodeVerdicts).every((verdict) => verdict.refused && verdict.requests === 0),
+      JSON.stringify(unicodeVerdicts),
+    );
+    // Owners follow GitHub's account-name rules (letters, digits and single
+    // inner hyphens, at most 39 characters, or a managed user's _SHORTCODE);
+    // repository names keep their own rules, including a leading '.'.
+    const ownerCases: Record<string, [repository: string, accepted: boolean]> = {
+      dot_in_owner: ["foo.bar/widgets", false],
+      leading_hyphen: ["-foo/widgets", false],
+      trailing_hyphen: ["foo-/widgets", false],
+      double_hyphen: ["foo--bar/widgets", false],
+      forty_characters: [`${"a".repeat(40)}/widgets`, false],
+      underscore_without_shortcode: ["foo_/widgets", false],
+      two_character_shortcode: ["foo_ab/widgets", false],
+      two_underscores: ["foo_bar_baz/widgets", false],
+      thirty_nine_characters: [`${"a".repeat(39)}/widgets`, true],
+      single_character: ["a/widgets", true],
+      hyphenated: ["Foo-Bar-9/widgets", true],
+      managed_user: ["Mona-Cat_octo/widgets", true],
+      managed_setup_user: ["octo_admin/widgets", true],
+      dot_leading_repository: ["acme/.github", true],
+    };
+    const ownerVerdicts: Record<string, { expected: string; refused: boolean; requests: number }> = {};
+    for (const [label, [repository, accepted]] of Object.entries(ownerCases)) {
+      ownerVerdicts[label] = { expected: accepted ? "accepted" : "refused", ...(await repositoryVerdict(repository)) };
+    }
+    check(
+      "outcomes_repository_owner_follows_github_account_rules",
+      Object.values(ownerVerdicts).every((verdict) =>
+        verdict.expected === "accepted" ? !verdict.refused : verdict.refused && verdict.requests === 0,
+      ),
+      JSON.stringify(ownerVerdicts),
+    );
+    // Owners that fail the current rule only by hyphen placement are older
+    // GitHub account names: refused before any request with a message saying
+    // why and what to do. Other malformed input keeps the plain message.
+    const legacyVerdicts: Record<string, { refused: boolean; requests: number; explained: boolean }> = {};
+    for (const [label, repository] of Object.entries({
+      leading_hyphen: "-foo/widgets",
+      trailing_hyphen: "foo-/widgets",
+      double_hyphen: "foo--bar/widgets",
+      dot_in_owner: "foo.bar/widgets",
+      forty_characters: `${"a".repeat(40)}/widgets`,
+      legacy_owner_with_invalid_repository: "-foo/wid gets",
+    })) {
+      let requests = 0;
+      let message = "";
+      try {
+        await runOutcomesSync(d2Config, {
+          repository,
+          until: d2Until,
+          ledgerDb: d2Ledger,
+          fetchImpl: (async (input, init) => {
+            requests += 1;
+            return d2Fetch(input, init);
+          }) as typeof fetch,
+          log: () => undefined,
+        });
+      } catch (error) {
+        message = String(error);
+      }
+      legacyVerdicts[label] = {
+        refused: /--repository expects/.test(message),
+        requests,
+        explained: /older GitHub accounts/.test(message) && /Rename the account or organization/.test(message),
+      };
+    }
+    const explainedLabels = ["leading_hyphen", "trailing_hyphen", "double_hyphen"];
+    check(
+      "outcomes_repository_legacy_owner_names_explained",
+      Object.entries(legacyVerdicts).every(([label, verdict]) =>
+        verdict.refused && verdict.requests === 0 && verdict.explained === explainedLabels.includes(label),
+      ),
+      JSON.stringify(legacyVerdicts),
     );
     d2Ledger.close();
 
