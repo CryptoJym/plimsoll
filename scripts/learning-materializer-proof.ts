@@ -696,31 +696,17 @@ async function main(): Promise<void> {
       return null;
     }
   })();
-  const preExistingMissingModule = cliRun.stderr.includes("ERR_MODULE_NOT_FOUND") &&
-    (cliRun.stderr.includes("/capture-fairness") || cliRun.stderr.includes("/lifecycle-adapters"));
-  if (cliRun.status === 0 && cliJson !== null) {
-    check("cli_command_wired_end_to_end",
+  // A missing ledger blocks the pass: the CLI prints the blocked receipt and
+  // exits 1 (cli.ts sets process.exitCode for blocked_dependencies), so a
+  // scheduler or operator script sees the failure. The entrypoint must load:
+  // a missing module is a failure, never a skipped check.
+  check("cli_command_wired_end_to_end",
+    cliRun.status === 1 && cliJson !== null &&
       cliJson.schema === LEARNING_MATERIALIZATION_SCHEMA && cliJson.status === "blocked_dependencies", {
-      stdout: cliRun.stdout.slice(0, 200),
-    });
-  } else if (preExistingMissingModule) {
-    // This checkout is missing upstream modules (never committed on any branch
-    // reachable here), so the full cli.ts entrypoint cannot load at all —
-    // independent of this change. Recorded honestly instead of fabricated.
-    checks.push({
-      name: "cli_command_wired_end_to_end",
-      detail: {
-        status: "NOT_RUN_blocked_by_pre_existing_missing_module",
-        stderrHead: cliRun.stderr.split("\n").slice(0, 4).join(" | "),
-      },
-    });
-  } else {
-    check("cli_command_wired_end_to_end", false, {
-      exit: cliRun.status,
-      stderr: cliRun.stderr.slice(0, 400),
-      stdout: cliRun.stdout.slice(0, 200),
-    });
-  }
+    exit: cliRun.status,
+    stderr: cliRun.stderr.slice(0, 400),
+    stdout: cliRun.stdout.slice(0, 200),
+  });
   const pkg = JSON.parse(fs.readFileSync(path.join(process.cwd(), "package.json"), "utf8")) as {
     scripts: Record<string, string>;
   };
