@@ -2705,6 +2705,9 @@ async function main() {
       try {
         let batches = 0;
         while (batches < config.delivery.maxBatchesPerCycle) {
+          // A batch acknowledges, leases and seals in synchronous writer turns;
+          // intake and /status run between batches (eco-6hoxj.163.24).
+          if (batches > 0) await new Promise<void>((resolve) => setImmediate(resolve));
           const result = await uploadBufferedEvents(config, buffer, {
             includeLegacyRemainingUnuploaded: false,
             storageRetry,
