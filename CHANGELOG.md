@@ -54,6 +54,10 @@ does not transfer its sessions to a tailer.
 
 ### Changed
 
+- When the OTLP intake spool cannot hold a refused request (full, or the disk
+  refuses), a deadline refusal is answered `503` with `Retry-After: 1` instead
+  of `408`, which OTLP exporters do not retry. A body that never finished
+  arriving is still `408`.
 - Local `GET /status` stays closed without the management credential.
   Unauthenticated liveness remains `GET /healthz` (`{"ok":true}` only). Fleet
   readers that used raw `/status` migrate to `/healthz` or `plimsoll status`
@@ -61,6 +65,14 @@ does not transfer its sessions to a tailer.
 
 ### Fixed
 
+- OTLP exports the ledger cannot commit in time are kept, not lost
+  (`eco-6hoxj.163.17`). An authenticated, validated request that meets a busy
+  ledger or runs out of its 1.5 s deadline — including one whose body arrived
+  while the event loop was blocked — is answered `202 otlp_spooled` after its
+  uncommitted rows are flushed to `otlp-spool/` (normalized ledger rows, never
+  the body), and a 2 s drain replays them exactly once through the live
+  commit path. Bounded at 5,000 files, 256 MiB and 7 days; reported under
+  `/status` `otlpSpool`; `PLIMSOLL_OTLP_SPOOL=off` restores the old answers.
 - Local producer admission restores two Studio0 rejection classes
   (`eco-6hoxj.25`): identity-encoded bodies between 2 MiB and 4 MiB are no
   longer `compressed_body_too_large`, Claude HTTP hooks always send

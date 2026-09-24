@@ -244,8 +244,8 @@ Named sentinel checks enforcing this section:
 
 ## Where captured data rests on disk
 
-Captured data rests in two places on the machine, both inside the one
-resolved Plimsoll home, both private to the running user (0700 directories,
+Captured data rests in three places on the machine, all inside the one
+resolved Plimsoll home, all private to the running user (0700 directories,
 0600 files). The rules above are written for the first one. The second
 has two writers — the hook process, and the collector's own intake, which
 spools a hook post it cannot write to the ledger right now rather than
@@ -259,14 +259,19 @@ write — their raw value is a declared exemption below, because the ledger
 persists the hash OF that value and an emptied one would hash to the digest
 of `""`. And a value under a key the sanitizer keeps but the metadata
 admission later discards as unknown can rest in a spool file, briefly,
-though the ledger never stores it.
+though the ledger never stores it. The third, the OTLP intake spool, does
+not hold request bodies at all: it holds the ledger's own normalized rows,
+after every suppression step, so nothing rests there that the ledger itself
+would not store, and the raw working directory the ledger never stores is
+not written either.
 
 | # | Location | What rests there | Suppression applied before the write |
 |---|---|---|---|
 | 1 | `work-ledger.sqlite` (the local ledger) | Normalized events and their suppression receipts. | `sanitizeForPolicy` / `evaluatePolicyInput` (`packages/shared/src/policy.ts`), then metadata admission. |
 | 2 | `hook-spool/` (hook events the collector could not accept yet; bead eco-6hoxj.61) | One JSON envelope per event, written either by the hook process or by the collector's own intake when a busy ledger cannot take the post, deleted as soon as the collector applies it. Bounded for both writers at 5000 files and 64 MiB. A file the collector cannot apply is quarantined under `hook-spool/rejected/` for up to 7 days. | `blankForbiddenRawContent` (`packages/collector-cli/src/hook-spool.ts`) empties the value of every key `sanitizeRoutineMetadata` drops outright — the local write's own DROP rule, imported — keeping only the key name, whichever writer writes the file. The declared derivation inputs below keep their value. |
+| 3 | `otlp-spool/` (OTLP exports the ledger could not commit in time; bead eco-6hoxj.163.17) | One JSON file per refused request, written by the collector's own OTLP intake and deleted once its rows are committed and the ledger is flushed. Bounded at 5000 files, 256 MiB and 7 days. A file that fails validation is quarantined under `otlp-spool/rejected/`. | The whole ledger pipeline, before the write: the rows are the output of `explodeOtlpPayload` (`sanitizeForPolicy`, then metadata admission), each serialized exactly as the ledger stores it (`packages/collector-cli/src/otlp-spool.ts`). The repository sidecar's raw working directory is not written. |
 
-So the spool holds values the ledger's own bytes do not, and they are exempt
+So the hook spool holds values the ledger's own bytes do not, and they are exempt
 under two rules, not one list (`packages/collector-cli/src/hook-spool.ts`). Blanking a value
 under either would silently make a recovered event worse than a live one —
 a lost repository linkage, or an identity hash computed from nothing.
@@ -375,6 +380,9 @@ Named sentinel checks enforcing this section:
 - `r_blanking_a_declared_protected_identity_would_change_what_the_ledger_persists` — `scripts/hook-spool-proof.ts`
 - `z_the_intake_spool_file_holds_only_the_allowlisted_path_value` — `scripts/hook-spool-proof.ts`
 - `w_the_intake_wrote_the_same_envelope_the_client_writes` — `scripts/hook-spool-proof.ts`
+- `g_no_planted_content_reaches_the_spool` — `scripts/otlp-intake-spool-proof.ts`
+- `g_each_spooled_row_is_exactly_the_row_the_ledger_stores` — `scripts/otlp-intake-spool-proof.ts`
+- `g_events_that_carried_a_raw_working_directory_are_counted_not_written` — `scripts/otlp-intake-spool-proof.ts`
 
 ## Regeneration
 

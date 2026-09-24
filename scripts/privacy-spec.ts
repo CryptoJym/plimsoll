@@ -9,6 +9,7 @@
  *   - protectedMetadataFieldNames     packages/shared/src/policy.ts
  *   - hashProtectedValue, DEFAULT_POLICY packages/shared/src/policy.ts
  *   - SPOOL_DERIVATION_INPUT_DISCLOSURE, HOOK_SPOOL_* packages/collector-cli/src/hook-spool.ts
+ *   - OTLP_SPOOL_*                    packages/collector-cli/src/otlp-spool.ts
  *
  * Every behavioral claim in the rendered page points at a named sentinel
  * check; this script verifies each referenced check name still exists in
@@ -40,6 +41,7 @@ import {
   SPOOL_PROTECTED_IDENTITY_VARIANT_EXAMPLES,
   type SpoolDerivationInputDisclosure,
 } from "../packages/collector-cli/src/hook-spool";
+import { OTLP_SPOOL_DIRECTORY, OTLP_SPOOL_LIMITS } from "../packages/collector-cli/src/otlp-spool";
 import {
   SPOOL_UNSPLIT_PROTECTED_SPELLINGS,
   SPOOL_WORD_SPLIT_DROPPED_SPELLINGS,
@@ -51,6 +53,7 @@ const scriptsDir = path.join(repoRoot, "scripts");
 const SOURCE_SCHEMAS = "packages/shared/src/schemas.ts";
 const SOURCE_POLICY = "packages/shared/src/policy.ts";
 const SOURCE_HOOK_SPOOL = "packages/collector-cli/src/hook-spool.ts";
+const SOURCE_OTLP_SPOOL = "packages/collector-cli/src/otlp-spool.ts";
 const SOURCE_SPELLING_CORPUS = "scripts/lib/spool-spelling-corpus.ts";
 
 type FieldNote = {
@@ -89,6 +92,11 @@ export type PrivacySpecModel = {
   /** The bound both spool writers — the hook client and the collector's intake — share. */
   spoolMaxFiles: number;
   spoolMaxBytesMiB: number;
+  /** Bead eco-6hoxj.163.17: the OTLP intake spool's directory and bounds. */
+  otlpSpoolDirectory: string;
+  otlpSpoolMaxFiles: number;
+  otlpSpoolMaxBytesMiB: number;
+  otlpSpoolMaxAgeDays: number;
 };
 
 type ProofCheckRef = {
@@ -163,6 +171,9 @@ export const PROOF_CHECKS: Record<string, ProofCheckRef> = {
       "r_blanking_a_declared_protected_identity_would_change_what_the_ledger_persists",
       "z_the_intake_spool_file_holds_only_the_allowlisted_path_value",
       "w_the_intake_wrote_the_same_envelope_the_client_writes",
+      "g_no_planted_content_reaches_the_spool",
+      "g_each_spooled_row_is_exactly_the_row_the_ledger_stores",
+      "g_events_that_carried_a_raw_working_directory_are_counted_not_written",
     ],
   },
 };
@@ -261,6 +272,10 @@ export function collectPrivacySpecModel(): PrivacySpecModel {
     spoolRejectedRetentionDays: HOOK_SPOOL_LIMITS.rejectedMaxAgeMs / (24 * 60 * 60 * 1000),
     spoolMaxFiles: HOOK_SPOOL_LIMITS.maxFiles,
     spoolMaxBytesMiB: HOOK_SPOOL_LIMITS.maxBytes / (1024 * 1024),
+    otlpSpoolDirectory: OTLP_SPOOL_DIRECTORY,
+    otlpSpoolMaxFiles: OTLP_SPOOL_LIMITS.maxFiles,
+    otlpSpoolMaxBytesMiB: OTLP_SPOOL_LIMITS.maxBytes / (1024 * 1024),
+    otlpSpoolMaxAgeDays: OTLP_SPOOL_LIMITS.maxAgeMs / (24 * 60 * 60 * 1000),
   };
 }
 
@@ -447,8 +462,8 @@ export function renderPrivacySpec(model: PrivacySpecModel): string {
   lines.push(...renderGuaranteesSection(["plain_envelope"], found));
   lines.push(`## Where captured data rests on disk`);
   lines.push(``);
-  lines.push(`Captured data rests in two places on the machine, both inside the one`);
-  lines.push(`resolved Plimsoll home, both private to the running user (0700 directories,`);
+  lines.push(`Captured data rests in three places on the machine, all inside the one`);
+  lines.push(`resolved Plimsoll home, all private to the running user (0700 directories,`);
   lines.push(`0600 files). The rules above are written for the first one. The second`);
   lines.push(`has two writers — the hook process, and the collector's own intake, which`);
   lines.push(`spools a hook post it cannot write to the ledger right now rather than`);
@@ -462,14 +477,19 @@ export function renderPrivacySpec(model: PrivacySpecModel): string {
   lines.push(`persists the hash OF that value and an emptied one would hash to the digest`);
   lines.push(`of \`""\`. And a value under a key the sanitizer keeps but the metadata`);
   lines.push(`admission later discards as unknown can rest in a spool file, briefly,`);
-  lines.push(`though the ledger never stores it.`);
+  lines.push(`though the ledger never stores it. The third, the OTLP intake spool, does`);
+  lines.push(`not hold request bodies at all: it holds the ledger's own normalized rows,`);
+  lines.push(`after every suppression step, so nothing rests there that the ledger itself`);
+  lines.push(`would not store, and the raw working directory the ledger never stores is`);
+  lines.push(`not written either.`);
   lines.push(``);
   lines.push(`| # | Location | What rests there | Suppression applied before the write |`);
   lines.push(`|---|---|---|---|`);
   lines.push(`| 1 | \`work-ledger.sqlite\` (the local ledger) | Normalized events and their suppression receipts. | \`sanitizeForPolicy\` / \`evaluatePolicyInput\` (\`${SOURCE_POLICY}\`), then metadata admission. |`);
   lines.push(`| 2 | \`${model.spoolDirectory}/\` (hook events the collector could not accept yet; bead eco-6hoxj.61) | One JSON envelope per event, written either by the hook process or by the collector's own intake when a busy ledger cannot take the post, deleted as soon as the collector applies it. Bounded for both writers at ${model.spoolMaxFiles} files and ${model.spoolMaxBytesMiB} MiB. A file the collector cannot apply is quarantined under \`${model.spoolDirectory}/rejected/\` for up to ${model.spoolRejectedRetentionDays} days. | \`blankForbiddenRawContent\` (\`${SOURCE_HOOK_SPOOL}\`) empties the value of every key \`sanitizeRoutineMetadata\` drops outright — the local write's own DROP rule, imported — keeping only the key name, whichever writer writes the file. The declared derivation inputs below keep their value. |`);
+  lines.push(`| 3 | \`${model.otlpSpoolDirectory}/\` (OTLP exports the ledger could not commit in time; bead eco-6hoxj.163.17) | One JSON file per refused request, written by the collector's own OTLP intake and deleted once its rows are committed and the ledger is flushed. Bounded at ${model.otlpSpoolMaxFiles} files, ${model.otlpSpoolMaxBytesMiB} MiB and ${model.otlpSpoolMaxAgeDays} days. A file that fails validation is quarantined under \`${model.otlpSpoolDirectory}/rejected/\`. | The whole ledger pipeline, before the write: the rows are the output of \`explodeOtlpPayload\` (\`sanitizeForPolicy\`, then metadata admission), each serialized exactly as the ledger stores it (\`${SOURCE_OTLP_SPOOL}\`). The repository sidecar's raw working directory is not written. |`);
   lines.push(``);
-  lines.push(`So the spool holds values the ledger's own bytes do not, and they are exempt`);
+  lines.push(`So the hook spool holds values the ledger's own bytes do not, and they are exempt`);
   lines.push(`under two rules, not one list (\`${SOURCE_HOOK_SPOOL}\`). Blanking a value`);
   lines.push(`under either would silently make a recovered event worse than a live one —`);
   lines.push(`a lost repository linkage, or an identity hash computed from nothing.`);
