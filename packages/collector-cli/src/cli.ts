@@ -2801,6 +2801,7 @@ async function main() {
       let uploaded = 0;
       let serverRetryAfterMs = 0;
       let catchUp = false;
+      let summaryCatchUp = false;
       try {
         let batches = 0;
         let remainingDelivery = 0;
@@ -2899,6 +2900,7 @@ async function main() {
                   : [...sessionPlan.sessionIds, ...summaryPending],
               );
               pendingSessionIds = sessionSyncState.pendingSessionIds;
+              summaryCatchUp = summaryPending.length > 0;
             } else {
               sessionSyncState = commitDaemonSessionSyncFailure(sessionSyncState, sessionPlan.sessionIds);
               pendingSessionIds = sessionSyncState.pendingSessionIds;
@@ -2974,7 +2976,9 @@ async function main() {
         // backlog above one cycle drains at upload speed, not at 10k events
         // per interval (eco-6hoxj.163.24). Failures and a server Retry-After
         // never chain: they keep the scheduler's own backoff.
-        if (catchUp && !shuttingDown) setTimeout(() => void runSync(), SYNC_CATCH_UP_DELAY_MS).unref();
+        if ((catchUp || summaryCatchUp) && !shuttingDown) {
+          setTimeout(() => void runSync(), SYNC_CATCH_UP_DELAY_MS).unref();
+        }
       }
     };
 

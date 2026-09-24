@@ -21,6 +21,7 @@ import {
 import {
   ensureSessionSummarySchema,
   listSessionSummaryPendingIds,
+  sessionSummaryCurrent,
   updateSessionSummary,
   type SessionReadQuery,
   type SessionSnapshot,
@@ -410,6 +411,7 @@ export function sessionIdsFromBatches(batches: Array<AiWorkIngestBatch | null>):
 export const DAEMON_SESSION_SYNC_STATE_KEY = "session_sync_daemon_v1";
 export const DAEMON_SESSION_SYNC_SCHEMA_VERSION = 1 as const;
 const MAX_PENDING_SESSION_IDS = 8_000;
+const SESSION_ID_PAGE_SIZE = 5_000;
 const MAX_SESSION_ID_CHARS = 128;
 
 export type DaemonSessionSyncState = {
@@ -557,7 +559,11 @@ export function listLedgerSessionIds(
   options: { until: string; since?: string | null; extraIds?: string[]; excludedIds?: string[] },
 ): string[] {
   const query = ledgerSessionIdsQuery(ledger, options);
+  query.sql += ` order by e.session_id asc limit ${SESSION_ID_PAGE_SIZE + 1}`;
   const rows = ledger.prepare(query.sql).all(query.params) as Array<{ sessionId: string }>;
+  if (rows.length > SESSION_ID_PAGE_SIZE) {
+    throw new Error("session_id_scan_requires_off_thread_paging");
+  }
   const excluded = new Set(options.excludedIds ?? []);
   return mergeSessionIds(rows.map(row => row.sessionId), options.extraIds ?? [])
     .filter((id) => !excluded.has(id));
@@ -655,17 +661,32 @@ export function planDaemonSessionSync(input: {
 /** Daemon planner's distinct-id scan, without blocking HTTP intake. */
 export async function listLedgerSessionIdsOffThread(
   ledger: Database.Database,
-  options: { until: string; since?: string | null; excludedIds?: string[] },
+  options: { until: string; since?: string | null; excludedIds?: string[]; maxIds?: number },
 ): Promise<string[]> {
-  const query = ledgerSessionIdsQuery(ledger, options);
   const excluded = new Set(options.excludedIds ?? []);
-  // The planner switches to a full walk above this count. No later id can
-  // change that decision, so never clone an unbounded distinct-id set back
-  // onto the request event loop. Read enough extra rows to preserve the
-  // overflow signal after excluded IDs are removed.
-  query.sql += ` limit ${MAX_PENDING_SESSION_IDS + 1 + excluded.size}`;
-  const rows = await readLedgerOffThread<{ sessionId: string }>(ledger, [query]);
-  return rows.map(row => row.sessionId).filter((id) => !excluded.has(id));
+  // The planner only needs an overflow signal; a full catch-up needs every
+  // session. Both paths read at most one bounded page on the worker at a time.
+  const maxIds = options.maxIds ?? MAX_PENDING_SESSION_IDS + 1;
+  const ids: string[] = [];
+  let cursor: string | null = null;
+  for (;;) {
+    const query = ledgerSessionIdsQuery(ledger, options);
+    if (cursor !== null) {
+      query.sql += " and e.session_id > @cursor";
+      query.params.cursor = cursor;
+    }
+    query.sql += " order by e.session_id asc limit @pageSize";
+    query.params.pageSize = SESSION_ID_PAGE_SIZE;
+    query.maxMs = 250;
+    const rows = await readLedgerOffThread<{ sessionId: string }>(ledger, [query]);
+    for (const row of rows) {
+      if (!excluded.has(row.sessionId)) ids.push(row.sessionId);
+      if (ids.length >= maxIds) return ids;
+    }
+    if (rows.length < SESSION_ID_PAGE_SIZE) return ids;
+    cursor = rows[rows.length - 1]!.sessionId;
+    await new Promise<void>((resolve) => setImmediate(resolve));
+  }
 }
 
 export function commitDaemonSessionSyncSuccess(
@@ -1001,6 +1022,9 @@ export async function runSessionSync(
 
   const audit = createSessionAudit();
   let snapshots: SessionSnapshot[] = [];
+  const snapshotVersions = new Map<string, {
+    rawSessionId: string; mutationRevision: number; highWater: number;
+  }>();
   let ledgerSessions = 0;
   const pendingSummarySessionIds: string[] = [];
   const summaryStats = {
@@ -1026,6 +1050,7 @@ export async function runSessionSync(
         : await listLedgerSessionIdsOffThread(ledger, {
             until,
             excludedIds: options.excludedSessionIds,
+            maxIds: Number.POSITIVE_INFINITY,
           });
       const sessionIds = [...new Set(ids)].filter((id) => !excluded.has(id));
       ledgerSessions = sessionIds.length;
@@ -1046,6 +1071,11 @@ export async function runSessionSync(
           pendingSummarySessionIds.push(sessionId);
         } else if (update.snapshot) {
           snapshots.push(update.snapshot);
+          snapshotVersions.set(ensureUuidSessionId(sessionId).id, {
+            rawSessionId: sessionId,
+            mutationRevision: update.mutationRevision,
+            highWater: update.highWater,
+          });
         }
         // Session summaries are maintenance work. Give intake and upload
         // callbacks an event-loop turn between sessions even when a slice was
@@ -1109,8 +1139,30 @@ export async function runSessionSync(
   let batches = 0;
   let abortReason: string | null = null;
 
+  const snapshotFresh = (sessionId: string): boolean => {
+    if (!options.incremental) return true;
+    const version = snapshotVersions.get(sessionId);
+    return version !== undefined && sessionSummaryCurrent(
+      ledger, version.rawSessionId, until, version.mutationRevision, version.highWater,
+    );
+  };
+  const markStale = (sessionId: string) => {
+    summaryComplete = false;
+    const rawSessionId = snapshotVersions.get(sessionId)?.rawSessionId ?? sessionId;
+    if (!pendingSummarySessionIds.includes(rawSessionId)) pendingSummarySessionIds.push(rawSessionId);
+  };
+
   const inFlight = new Set<Promise<void>>();
   const dispatch = async (chunk: Array<{ row: AiWorkSessionSyncRow }>) => {
+    // Rows can change while other sessions are normalized. Drop any stale
+    // snapshot before the batch is built, then fence the serialized body at
+    // the transport boundary on every retry.
+    chunk = chunk.filter((item) => {
+      if (snapshotFresh(item.row.session.id)) return true;
+      markStale(item.row.session.id);
+      return false;
+    });
+    if (chunk.length === 0) return;
     // Batch-level reseal prevents a future alternate caller from bypassing
     // buildSessionSyncRow and placing raw identifiers into a signed request.
     const sealedRows = chunk.map((item) => sealOutboundSessionRow(item.row));
@@ -1141,6 +1193,11 @@ export async function runSessionSync(
           maxAttempts,
           timeoutMs: config.delivery.requestTimeoutSeconds * 1_000,
           allowPartial: true,
+          beforeSend: () => {
+            const fresh = rows.every((row) => snapshotFresh(row.session.id));
+            if (!fresh) rows.forEach((row) => markStale(row.session.id));
+            return fresh;
+          },
           log,
         });
         batches += 1;

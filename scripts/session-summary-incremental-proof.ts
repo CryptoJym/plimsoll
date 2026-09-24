@@ -9,6 +9,9 @@ import { markRawPrivacyDisposition } from "../packages/collector-cli/src/privacy
 import {
   buildSessionSyncRow,
   collectSessionSnapshots,
+  emptyDaemonSessionSyncState,
+  listLedgerSessionIdsOffThread,
+  planDaemonSessionSync,
   readLedgerOffThread,
   runSessionSync,
 } from "../packages/collector-cli/src/session-sync";
@@ -123,6 +126,158 @@ function compareExact(buffer: LocalEventBuffer, sessionIds: string[], sent: unkn
       )),
     expectedSessions(buffer, sessionIds),
   );
+}
+
+async function reviewRegressions() {
+  const selected = process.env.PROBE_CASE;
+  const cases = [
+    "first_read_insert", "fallback_checkpoint", "missing_dirty_marker", "privacy_before_send",
+    "unrelated_revision", "retry_erasure", "hard_bounds", "session_id_paging",
+  ];
+  for (const name of cases) {
+    if (selected && selected !== name) continue;
+    const fixture = fs.mkdtempSync(path.join(os.tmpdir(), `p41-${name}-`));
+    const buffer = new LocalEventBuffer(path.join(fixture, "ledger.sqlite"), { workspaceId: tenantId });
+    const sessionId = `dddddddd-dddd-4ddd-8ddd-${String(cases.indexOf(name) + 1).padStart(12, "0")}`;
+    const add = (index: number) => insertRaw(buffer, {
+      id: uuid(400 + cases.indexOf(name) * 10 + index), sessionId,
+      observedAt: `2026-09-20T02:${String(index).padStart(2, "0")}:00.000Z`,
+      createdAt: `2026-09-20T02:${String(index).padStart(2, "0")}:00.000Z`,
+      inputTokens: 1, outputTokens: 1, costUsd: 0.01,
+    });
+    try {
+      ensureSessionSummarySchema(buffer.database);
+      const directRead = async <T,>(queries: Array<{ sql: string; params: Record<string, unknown> }>): Promise<T[]> =>
+        queries.flatMap((query) => buffer.database.prepare(query.sql).all(query.params) as T[]);
+      if (name === "first_read_insert") {
+        add(1);
+        let injected = false;
+        const read = async <T,>(queries: Array<{ sql: string; params: Record<string, unknown> }>): Promise<T[]> => {
+          const rows = await directRead<T>(queries);
+          if (!injected && queries.some((query) => query.sql.includes("order by e.rowid asc"))) {
+            injected = true;
+            add(2);
+          }
+          return rows;
+        };
+        await updateSessionSummary(buffer.database, sessionId, until, { read });
+        const resumed = await updateSessionSummary(buffer.database, sessionId, until, { read });
+        assert.equal(injected, true);
+        assert.equal(resumed.complete, true);
+        assert.deepEqual(resumed.snapshot, collectSessionSnapshots(buffer.database, { until, sessionIds: [sessionId] })[0]);
+      } else if (name === "fallback_checkpoint") {
+        for (let index = 1; index <= 4; index += 1) add(index);
+        await updateSessionSummary(buffer.database, sessionId, until, { read: directRead });
+        buffer.database.prepare("update buffered_events set input_tokens = 99 where id = ?").run(uuid(411));
+        const partial = await updateSessionSummary(buffer.database, sessionId, until, { read: directRead, maxRows: 1 });
+        assert.equal(partial.complete, false);
+        buffer.database.prepare("update session_sync_summary_state set high_water = high_water + 100 where session_id = ?").run(sessionId);
+        const resumed = await updateSessionSummary(buffer.database, sessionId, until, { read: directRead });
+        assert.equal(resumed.complete, true);
+        assert.deepEqual(resumed.snapshot, collectSessionSnapshots(buffer.database, { until, sessionIds: [sessionId] })[0]);
+      } else if (name === "missing_dirty_marker") {
+        add(1);
+        await updateSessionSummary(buffer.database, sessionId, until, { read: directRead });
+        buffer.database.prepare("update buffered_events set input_tokens = 77 where id = ?").run(uuid(421));
+        buffer.database.prepare("delete from session_sync_summary_dirty where session_id = ?").run(sessionId);
+        const plan = planDaemonSessionSync({
+          db: buffer.database,
+          state: { ...emptyDaemonSessionSyncState(), caughtUp: true, lastSuccessfulUntil: "2026-09-21T00:00:00.000Z" },
+          uploadedBatches: [], until, ledgerSessionIds: [],
+        });
+        assert.equal(plan.skip, false);
+        assert.ok(plan.sessionIds?.includes(sessionId));
+      } else if (name === "privacy_before_send") {
+        add(1);
+        let sent = "";
+        let erased = false;
+        const result = await runSessionSync(config, {
+          ledgerDb: buffer.database, incremental: true, sessionIds: [sessionId], until,
+          delayMs: 0, maxAttemptsPerBatch: 1,
+          fetchImpl: (async (_input, init) => {
+            sent = String(init?.body ?? "");
+            return new Response(JSON.stringify(acceptedFixtureDelivery(sent, installKey)), {
+              status: 200, headers: { "content-type": "application/json" },
+            });
+          }) as typeof fetch,
+          log: (line) => {
+            if (!erased && line.includes('"status":"session_sync_start"')) {
+              buffer.database.prepare("delete from buffered_events where id = ?").run(uuid(431));
+              erased = true;
+            }
+          },
+        });
+        assert.equal(erased, true);
+        assert.equal(sent, "");
+        assert.equal(result.summaryComplete, false);
+        assert.ok(result.pendingSummarySessionIds.includes(sessionId));
+      } else if (name === "unrelated_revision") {
+        for (let index = 1; index <= 8; index += 1) add(index);
+        await updateSessionSummary(buffer.database, sessionId, until, { read: directRead });
+        buffer.database.prepare("update buffered_events set output_tokens = 42 where id = ?").run(uuid(441));
+        const first = await updateSessionSummary(buffer.database, sessionId, until, { read: directRead, maxRows: 1 });
+        assert.equal(first.complete, false);
+        const unrelatedId = "eeeeeeee-eeee-4eee-8eee-000000000001";
+        insertRaw(buffer, {
+          id: uuid(470), sessionId: unrelatedId,
+          observedAt: "2026-09-20T03:00:00.000Z", createdAt: "2026-09-20T03:00:00.000Z",
+          inputTokens: 1, outputTokens: 1,
+        });
+        buffer.database.prepare("update buffered_events set output_tokens = 43 where id = ?").run(uuid(470));
+        const second = await updateSessionSummary(buffer.database, sessionId, until, { read: directRead, maxRows: 1 });
+        assert.ok(second.highWater > first.highWater, JSON.stringify({ first, second }));
+      } else if (name === "retry_erasure") {
+        add(1);
+        let calls = 0;
+        const result = await runSessionSync(config, {
+          ledgerDb: buffer.database, incremental: true, sessionIds: [sessionId], until,
+          delayMs: 0, maxAttemptsPerBatch: 2,
+          fetchImpl: (async () => {
+            calls += 1;
+            return new Response("{}", { status: 503 });
+          }) as typeof fetch,
+          sleep: async () => {
+            buffer.database.prepare("delete from buffered_events where id = ?").run(uuid(451));
+          },
+          log: () => undefined,
+        });
+        assert.equal(calls, 1);
+        assert.equal(result.sentSessions, 0);
+        assert.equal(result.summaryComplete, false);
+        assert.ok(result.pendingSummarySessionIds.includes(sessionId));
+      } else if (name === "hard_bounds") {
+        for (let index = 1; index <= 5_200; index += 1) {
+          insertRaw(buffer, {
+            id: uuid(10_000 + index), sessionId,
+            observedAt: "2026-09-20T00:00:00.000Z", createdAt: "2026-09-20T00:00:00.000Z",
+            inputTokens: 1, outputTokens: 1,
+          });
+        }
+        const result = await updateSessionSummary(buffer.database, sessionId, until, {
+          read: directRead, maxRows: 100_000, maxMs: 5_000,
+        });
+        assert.ok(result.rowsRead <= 5_000, JSON.stringify(result));
+        assert.equal(result.complete, false);
+      } else if (name === "session_id_paging") {
+        for (let index = 1; index <= 5_001; index += 1) {
+          insertRaw(buffer, {
+            id: uuid(20_000 + index),
+            sessionId: `eeeeeeee-eeee-4eee-8eee-${String(index).padStart(12, "0")}`,
+            observedAt: "2026-09-20T00:00:00.000Z", createdAt: "2026-09-20T00:00:00.000Z",
+            inputTokens: 1, outputTokens: 1,
+          });
+        }
+        const ids = await listLedgerSessionIdsOffThread(buffer.database, {
+          until, maxIds: Number.POSITIVE_INFINITY,
+        });
+        assert.equal(ids.length, 5_001);
+      }
+      console.log(JSON.stringify({ reviewCase: name, result: "PASS" }));
+    } finally {
+      buffer.close();
+      fs.rmSync(fixture, { recursive: true, force: true });
+    }
+  }
 }
 
 async function main() {
@@ -298,6 +453,7 @@ async function main() {
     fs.rmSync(root, { recursive: true, force: true });
   }
 
+  await reviewRegressions();
   console.log(JSON.stringify({
     result: "PASS",
     proof: "session-summary-incremental",

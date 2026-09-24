@@ -6,7 +6,7 @@ import { Readable } from "node:stream";
 export type TransportFailure =
   | "invalid_url" | "insecure_url" | "embedded_credentials" | "redirect_rejected"
   | "origin_mismatch" | "request_too_large" | "response_too_large"
-  | "deadline_exceeded" | "network_error" | "invalid_json";
+  | "deadline_exceeded" | "network_error" | "invalid_json" | "source_changed";
 
 /** Only these symbolic diagnostics may leave the transport boundary. */
 export class TransportError extends Error {
@@ -192,6 +192,8 @@ export type JsonPostOptions = {
   timeoutMs?: number;
   maxRequestBytes?: number;
   maxResponseBytes?: number;
+  /** Last synchronous source check before a serialized body enters fetch. */
+  beforeSend?: () => boolean;
 };
 
 export type JsonPostResult = { ok: boolean; status: number; headers: Headers; body: unknown };
@@ -220,6 +222,7 @@ export async function postJson(input: JsonPostOptions): Promise<JsonPostResult> 
     }, timeoutMs);
   });
   const read = async (): Promise<JsonPostResult> => {
+    if (input.beforeSend && !input.beforeSend()) throw new TransportError("source_changed");
     const response = await fetchCollectorUrl(url, {
       method: "POST", redirect: "manual", headers: input.headers,
       body: input.body, signal: controller.signal,

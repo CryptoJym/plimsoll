@@ -112,6 +112,8 @@ export type SessionSummaryUpdateResult = {
   mode: "initial" | "incremental" | "cached" | "fallback";
   fullRecompute: boolean;
   fallbackReason: string | null;
+  /** Revision committed with this snapshot, for the final upload fence. */
+  mutationRevision: number;
 };
 
 export type SessionSummaryCounters = {
@@ -135,10 +137,11 @@ function columnNames(db: Database.Database, table: string): Set<string> {
 /**
  * Install the small durable summary index. This is additive and deliberately
  * does not backfill or scan buffered_events. The raw mutation triggers make a
- * lower-than-HWM edit observable; the global revision also protects against a
- * damaged/deleted dirty marker.
+ * lower-than-HWM edit observable. A separate per-session revision protects
+ * against a damaged/deleted dirty marker without restarting other sessions.
  */
 export function ensureSessionSummarySchema(db: Database.Database): void {
+  const revisionTableMissing = !tableExists(db, "session_sync_summary_revision");
   db.exec(`
     create table if not exists session_sync_summary_control (
       singleton integer primary key check (singleton = 1),
@@ -165,6 +168,24 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
       reason text not null,
       updated_at text not null
     );
+    create table if not exists session_sync_summary_revision (
+      session_id text primary key,
+      mutation_revision integer not null check (mutation_revision >= 0)
+    );
+    create trigger if not exists trg_session_summary_dirty_insert_revision
+    after insert on session_sync_summary_dirty
+    begin
+      insert into session_sync_summary_revision (session_id, mutation_revision)
+        values (new.session_id, 1)
+        on conflict(session_id) do update set mutation_revision = mutation_revision + 1;
+    end;
+    create trigger if not exists trg_session_summary_dirty_update_revision
+    after update on session_sync_summary_dirty
+    begin
+      insert into session_sync_summary_revision (session_id, mutation_revision)
+        values (new.session_id, 1)
+        on conflict(session_id) do update set mutation_revision = mutation_revision + 1;
+    end;
     -- New raw rowids are cheap to retain until the corresponding summary
     -- slice commits. This avoids seeking the historical session index on the
     -- steady-state path, without building a 69 GB index during upgrade.
@@ -188,6 +209,12 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
     begin
       insert or ignore into session_sync_summary_rows (raw_rowid, session_id, created_at)
         values (new.rowid, new.session_id, new.created_at);
+      insert into session_sync_summary_dirty (session_id, reason, updated_at)
+        select new.session_id, 'raw_insert_before_high_water', strftime('%Y-%m-%dT%H:%M:%fZ','now')
+        where exists (select 1 from session_sync_summary_state
+          where session_id = new.session_id and high_water >= new.rowid)
+        on conflict(session_id) do update set
+          reason = excluded.reason, updated_at = excluded.updated_at;
     end;
 
     create trigger if not exists trg_session_summary_raw_update
@@ -227,6 +254,14 @@ export function ensureSessionSummarySchema(db: Database.Database): void {
       delete from session_sync_summary_rows where raw_rowid = old.rowid;
     end;
   `);
+
+  // The previous schema stored the global revision in each state. Preserve
+  // that baseline once, then let dirty-marker triggers advance only the
+  // affected session. No historical event table is scanned during upgrade.
+  if (revisionTableMissing) {
+    db.exec(`insert or ignore into session_sync_summary_revision (session_id, mutation_revision)
+      select session_id, mutation_revision from session_sync_summary_state`);
+  }
 
   // These tables are created by DeliveryOutbox, but a small proof ledger or a
   // pre-delivery install may not have them. Raw edits/deletes remain covered.
@@ -373,6 +408,14 @@ function control(db: Database.Database): ControlRow {
   ).get() as ControlRow | undefined;
   if (!row) throw new Error("session_summary_control_missing");
   return row;
+}
+
+function sessionRevision(db: Database.Database, sessionId: string): number {
+  const row = db.prepare(
+    `select mutation_revision as mutationRevision
+     from session_sync_summary_revision where session_id = ?`,
+  ).get(sessionId) as { mutationRevision: number } | undefined;
+  return row?.mutationRevision ?? 0;
 }
 
 export function sessionSummaryCounters(db: Database.Database): SessionSummaryCounters {
@@ -660,9 +703,9 @@ function fallbackReason(
   if (!Number.isSafeInteger(stored.highWater) || stored.highWater < 0) return "high_water_invalid";
   if (Number.isNaN(Date.parse(stored.coveredUntil))) return "covered_until_invalid";
   if (Date.parse(stored.coveredUntil) > Date.parse(until)) return "until_rollback";
-  if (currentRevision > stored.mutationRevision) return "ledger_mutation";
-  if (dirty) return "dirty_marker";
+  if (currentRevision !== stored.mutationRevision) return "ledger_mutation";
   if (!checkpointOk) return "checkpoint_mismatch";
+  if (dirty) return "dirty_marker";
   return null;
 }
 
@@ -672,9 +715,36 @@ export function listSessionSummaryPendingIds(db: Database.Database): string[] {
   const rows = db.prepare(
     `select session_id as sessionId from session_sync_summary_dirty
      union
-     select session_id as sessionId from session_sync_summary_state where complete = 0`,
+     select session_id as sessionId from session_sync_summary_state where complete = 0
+     union
+     select s.session_id as sessionId from session_sync_summary_state s
+       join session_sync_summary_revision r on r.session_id = s.session_id
+       where r.mutation_revision != s.mutation_revision`,
   ).all() as Array<{ sessionId: string }>;
   return rows.map((row) => row.sessionId);
+}
+
+function queuedRowsAfter(db: Database.Database, sessionId: string, highWater: number, until: string): boolean {
+  return Boolean(db.prepare(`select 1 from session_sync_summary_rows r
+    join buffered_events e on e.rowid = r.raw_rowid
+    where r.session_id = ? and r.raw_rowid > ? and e.created_at <= ? limit 1`)
+    .get(sessionId, highWater, until));
+}
+
+/** Synchronous final fence used immediately before every network attempt. */
+export function sessionSummaryCurrent(
+  db: Database.Database,
+  sessionId: string,
+  until: string,
+  mutationRevision: number,
+  highWater: number,
+): boolean {
+  const state = storedState(db, sessionId);
+  return state !== null && state.complete && state.highWater === highWater &&
+    state.mutationRevision === mutationRevision && state.coveredUntil === until &&
+    sessionRevision(db, sessionId) === mutationRevision &&
+    !db.prepare("select 1 from session_sync_summary_dirty where session_id = ?").get(sessionId) &&
+    !queuedRowsAfter(db, sessionId, highWater, until);
 }
 
 /**
@@ -690,9 +760,9 @@ export async function updateSessionSummary(
   options: SessionSummaryUpdateOptions,
 ): Promise<SessionSummaryUpdateResult> {
   const started = performance.now();
-  const maxRows = Math.max(1, Math.min(Math.trunc(options.maxRows ?? SESSION_SUMMARY_DEFAULT_MAX_ROWS), 100_000));
-  const maxMs = Math.max(1, Math.min(options.maxMs ?? SESSION_SUMMARY_DEFAULT_MAX_MS, 5_000));
-  const current = control(db);
+  const maxRows = Math.max(1, Math.min(Math.trunc(options.maxRows ?? SESSION_SUMMARY_DEFAULT_MAX_ROWS), SESSION_SUMMARY_DEFAULT_MAX_ROWS));
+  const maxMs = Math.max(1, Math.min(options.maxMs ?? SESSION_SUMMARY_DEFAULT_MAX_MS, SESSION_SUMMARY_DEFAULT_MAX_MS));
+  const currentRevision = sessionRevision(db, sessionId);
   const stored = storedState(db, sessionId);
   const parsed = stored ? parseAccumulator(sessionId, stored.accumulatorJson) : null;
   const dirty = Boolean(db.prepare(
@@ -706,10 +776,11 @@ export async function updateSessionSummary(
       if (!(error instanceof Error && error.message.includes("session_summary_read_interrupted"))) throw error;
     }
   }
-  const reason = fallbackReason(stored, parsed, current.mutationRevision, until, checkpointOk, dirty);
+  const reason = fallbackReason(stored, parsed, currentRevision, until, checkpointOk, dirty);
   const resumableFallback = stored?.mode === "fallback" &&
-    !stored.complete && stored.mutationRevision === current.mutationRevision &&
-    parsed !== null && Date.parse(stored.coveredUntil) === Date.parse(until);
+    !stored.complete && stored.mutationRevision === currentRevision &&
+    parsed !== null && checkpointOk && (reason === null || reason === "dirty_marker") &&
+    Date.parse(stored.coveredUntil) === Date.parse(until);
   const needsFallback = reason !== null && !resumableFallback;
   const fullRecompute = needsFallback;
   let mode: SessionSummaryUpdateResult["mode"] = needsFallback
@@ -720,7 +791,7 @@ export async function updateSessionSummary(
 
   let state: SummaryState;
   if (needsFallback) {
-    const revision = current.mutationRevision;
+    const revision = currentRevision;
     db.transaction(() => {
       db.prepare(
         `update session_sync_summary_control
@@ -761,10 +832,13 @@ export async function updateSessionSummary(
       checkpointId: null,
       coveredUntil: until,
       complete: false,
-      mutationRevision: current.mutationRevision,
+        mutationRevision: currentRevision,
       mode: "initial",
       accumulator: emptyAccumulator(sessionId),
     };
+    // Install the row before the first off-thread read. The insert trigger
+    // then captures a row appended after that read but before its commit.
+    db.transaction(() => writeState(db, state)).immediate();
   }
 
   if (mode === "cached" && !needsFallback) {
@@ -784,7 +858,8 @@ export async function updateSessionSummary(
       if (!(error instanceof Error && error.message.includes("session_summary_read_interrupted"))) throw error;
       newerReadOk = false;
     }
-    if (!newerReadOk || newer.length > 0) {
+    if (!newerReadOk || newer.length > 0 ||
+        !sessionSummaryCurrent(db, sessionId, until, state.mutationRevision, state.highWater)) {
       mode = "incremental";
       state.complete = false;
     } else {
@@ -798,6 +873,7 @@ export async function updateSessionSummary(
       mode,
       fullRecompute: false,
       fallbackReason: null,
+      mutationRevision: state.mutationRevision,
     };
     }
   }
@@ -856,21 +932,23 @@ export async function updateSessionSummary(
     }
   }
 
-  const after = control(db);
-  const stable = after.mutationRevision === state.mutationRevision;
-  if (!stable) complete = false;
-  state.complete = complete;
-  state.mode = complete ? "incremental" : needsFallback ? "fallback" : state.mode;
-  // Keep the old revision when a concurrent edit was observed. The next call
-  // sees the higher control revision and must restart from row zero.
-  db.transaction(() => {
+  // Revision, queued-row check, and state write share one write transaction.
+  // A concurrent append can land before it (and is observed) or afterward
+  // (and remains in the queue for the upload fence).
+  const stable = db.transaction(() => {
+    const revisionStable = sessionRevision(db, sessionId) === state.mutationRevision;
+    const noQueuedRows = !queuedRowsAfter(db, sessionId, state.highWater, until);
+    const finalComplete = complete && revisionStable && noQueuedRows;
+    state.complete = finalComplete;
+    state.mode = finalComplete ? "incremental" : needsFallback ? "fallback" : state.mode;
     writeState(db, state);
-    if (complete && stable) {
+    if (finalComplete) {
       db.prepare(`delete from session_sync_summary_dirty where session_id = ?`).run(sessionId);
       db.prepare(`delete from session_sync_summary_rows where session_id = ? and raw_rowid <= ?`)
         .run(sessionId, state.highWater);
     }
-  })();
+    return revisionStable && noQueuedRows;
+  }).immediate();
 
   const finalMode: SessionSummaryUpdateResult["mode"] = fullRecompute
     ? "fallback"
@@ -885,5 +963,6 @@ export async function updateSessionSummary(
     mode: finalMode,
     fullRecompute,
     fallbackReason: fullRecompute ? reason : null,
+    mutationRevision: state.mutationRevision,
   };
 }
