@@ -379,14 +379,17 @@ function leasedRequestBytes(items: LeasedDeliveryItem[]) {
 async function leaseInSlices(
   buffer: LocalEventBuffer,
   storage: <T>(operation: () => T | Promise<T>) => T | Promise<T>,
-  options: { maxRows: number; maxBytes?: number; maxItemBytes: number; now: () => Date; leaseId?: string },
+  // One instant for every slice, as the single lease had: each lease() first
+  // expires overdue leases, and a later clock (a sleep or a clock step between
+  // slices) would expire this batch's own rows and claim them a second time.
+  options: { maxRows: number; maxBytes?: number; maxItemBytes: number; now: Date; leaseId?: string },
 ): Promise<DeliveryLease> {
   const maxBytes = Math.max(1, Math.trunc(options.maxBytes ?? 1_500_000));
   let requested = Math.min(options.maxRows, LEASE_SLICE_ROWS);
   const first = await storage(() => buffer.delivery.lease({
     maxRows: requested,
     maxBytes,
-    now: options.now(),
+    now: options.now,
     leaseId: options.leaseId,
   }));
   const items = [...first.items];
@@ -406,7 +409,7 @@ async function leaseInSlices(
     last = await storage(() => buffer.delivery.lease({
       maxRows: requested,
       maxBytes: budget,
-      now: options.now(),
+      now: options.now,
       leaseId: first.leaseId,
     }));
     if (last.blockedBy !== "none") break;
@@ -561,7 +564,7 @@ export async function uploadBufferedEvents(
     maxRows: buffer.delivery.validationLeaseRows(outputLimit),
     maxBytes: options.maxBytes,
     maxItemBytes: config.delivery.maxItemBytes,
-    now: nowFn,
+    now: nowFn(),
     leaseId: options.leaseId,
   });
   // Revalidation and the request body are the next synchronous turn.
