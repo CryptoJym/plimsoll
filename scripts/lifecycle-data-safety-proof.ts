@@ -517,12 +517,14 @@ function onlyLedgers(directory: string) {
 async function b2RestoreIsAtomicAndCapacityChecked() {
   await runCase([CASES.b2[0]], async (record) => {
     const pair = restorePair("b2-no-room");
-    const { result } = await withCopyFailure(pair.snapshot, () =>
+    const { result, failures } = await withCopyFailure(pair.snapshot, () =>
       new SqliteLedgerSnapshotAdapter({ clone: () => false, freeBytes: () => 0 }).restore({ source: pair.snapshot, destination: pair.live }));
+    // Refused by the space check itself: no byte copy is even attempted.
     record(CASES.b2[0],
-      result !== null && exists(pair.live) && rowsDigest(pair.live) === pair.liveDigest && integrityOf(pair.live) === "ok" &&
+      result?.code === "LIFECYCLE_RESTORE_REFUSED" && failures === 0 && exists(pair.live) &&
+        rowsDigest(pair.live) === pair.liveDigest && integrityOf(pair.live) === "ok" &&
         rowsDigest(pair.snapshot) === pair.snapshotDigest && onlyLedgers(pair.directory),
-      { error: result?.message, liveExists: exists(pair.live), files: listDirectory(pair.directory) });
+      { error: result?.message, code: result?.code, failures, liveExists: exists(pair.live), files: listDirectory(pair.directory) });
   });
   await runCase([CASES.b2[1]], async (record) => {
     const pair = restorePair("b2-copy-fails");
