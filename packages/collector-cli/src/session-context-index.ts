@@ -64,7 +64,8 @@ const SCHEMA = `
     backfill_batches integer not null default 0 check (backfill_batches >= 0),
     backfill_last_batch_at text,
     backfill_completed_at text,
-    indexed_rows integer not null default 0
+    indexed_rows integer not null default 0 check (indexed_rows >= 0),
+    ledger_context_rows integer not null default 0 check (ledger_context_rows >= 0)
   );
 
   create trigger if not exists trg_events_session_context_insert
@@ -74,6 +75,8 @@ const SCHEMA = `
     insert into session_repo_contexts (session_id, observed_at, source_rowid, repo_hash)
     values (new.session_id, new.observed_at, new.rowid, new.repo_hash)
     ${UPSERT_CONTEXT};
+    update session_repo_context_control
+    set ledger_context_rows = ledger_context_rows + 1 where singleton = 1;
   end;
 
   create trigger if not exists trg_events_session_context_update
@@ -85,6 +88,13 @@ const SCHEMA = `
       old.repo_hash is not new.repo_hash or old.data_mode is not new.data_mode or
       old.privacy_disposition is not new.privacy_disposition)
   begin
+    update session_repo_context_control set ledger_context_rows = max(0, ledger_context_rows -
+      case when exists (
+        select 1 from session_repo_contexts
+        where session_id = old.session_id and observed_at = old.observed_at
+          and source_rowid = old.rowid
+      ) then 1 else 0 end)
+    where singleton = 1;
     delete from session_repo_contexts
     where session_id = old.session_id and observed_at = old.observed_at
       and source_rowid = old.rowid;
@@ -92,12 +102,22 @@ const SCHEMA = `
     select new.session_id, new.observed_at, new.rowid, new.repo_hash
     where ${contextRow("new")}
     ${UPSERT_CONTEXT};
+    update session_repo_context_control set ledger_context_rows = ledger_context_rows +
+      case when ${contextRow("new")} then 1 else 0 end
+    where singleton = 1;
   end;
 
   create trigger if not exists trg_events_session_context_delete
   after delete on buffered_events
   when old.session_id is not null and old.repo_hash is not null
   begin
+    update session_repo_context_control set ledger_context_rows = max(0, ledger_context_rows -
+      case when exists (
+        select 1 from session_repo_contexts
+        where session_id = old.session_id and observed_at = old.observed_at
+          and source_rowid = old.rowid
+      ) then 1 else 0 end)
+    where singleton = 1;
     delete from session_repo_contexts
     where session_id = old.session_id and observed_at = old.observed_at
       and source_rowid = old.rowid;
@@ -128,7 +148,13 @@ type ControlRow = {
   lastBatchAt: string | null;
   completedAt: string | null;
   indexedRows: number;
+  ledgerContextRows: number;
 };
+
+function auxiliaryIndexError(error: unknown) {
+  return error instanceof Error &&
+    /(?:no such (?:table|column)|malformed database schema)/i.test(error.message);
+}
 
 function readControl(db: Database.Database): ControlRow | null {
   try {
@@ -139,23 +165,80 @@ function readControl(db: Database.Database): ControlRow | null {
          backfill_cursor_rowid as cursorRowid,
          backfill_rows_visited as rowsVisited, backfill_rows_indexed as rowsIndexed,
          backfill_batches as batches, backfill_last_batch_at as lastBatchAt,
-         backfill_completed_at as completedAt, indexed_rows as indexedRows
+         backfill_completed_at as completedAt, indexed_rows as indexedRows,
+         ledger_context_rows as ledgerContextRows
        from session_repo_context_control where singleton = 1`,
     ).get() as ControlRow | undefined) ?? null;
   } catch (error) {
     // A ledger this build has not opened read-write yet (e.g. a read-only
     // history upload of an older ledger) has no index: use the 0.7.36 path.
-    if (error instanceof Error && /no such table/.test(error.message)) return null;
+    if (auxiliaryIndexError(error)) return null;
     throw error;
   }
 }
 
-function installed(db: Database.Database) {
+function indexTableUsable(db: Database.Database) {
+  try {
+    // LIMIT 0 validates the auxiliary object's shape without reading data.
+    db.prepare(
+      `select session_id, observed_at, source_rowid, repo_hash
+       from session_repo_contexts limit 0`,
+    ).all();
+    const columns = db.prepare(`pragma table_info(session_repo_contexts)`).all() as Array<{
+      name: string; type: string; notnull: number; pk: number;
+    }>;
+    const expected = [
+      { name: "session_id", type: "TEXT", notnull: 1, pk: 1 },
+      { name: "observed_at", type: "TEXT", notnull: 1, pk: 2 },
+      { name: "source_rowid", type: "INTEGER", notnull: 1, pk: 3 },
+      { name: "repo_hash", type: "TEXT", notnull: 1, pk: 0 },
+    ];
+    return columns.length === expected.length && columns.every((column, index) => {
+      const required = expected[index]!;
+      return column.name === required.name && column.type.toUpperCase() === required.type &&
+        column.notnull === required.notnull && column.pk === required.pk;
+    });
+  } catch (error) {
+    if (auxiliaryIndexError(error)) return false;
+    throw error;
+  }
+}
+
+function countsAgree(control: ControlRow) {
+  return control.indexedRows === control.ledgerContextRows;
+}
+
+const TRIGGER_FRAGMENTS: Record<
+  typeof EVENT_TRIGGERS[number] | typeof COUNT_TRIGGERS[number], readonly string[]
+> = {
+  trg_events_session_context_insert: ["after insert on buffered_events", "insert into session_repo_contexts", "ledger_context_rows = ledger_context_rows + 1"],
+  trg_events_session_context_update: ["after update of session_id", "delete from session_repo_contexts", "ledger_context_rows"],
+  trg_events_session_context_delete: ["after delete on buffered_events", "delete from session_repo_contexts", "ledger_context_rows"],
+  trg_session_repo_contexts_count_insert: ["after insert on session_repo_contexts", "indexed_rows = indexed_rows + 1"],
+  trg_session_repo_contexts_count_delete: ["after delete on session_repo_contexts", "indexed_rows = indexed_rows - 1"],
+};
+
+function auxiliaryObjectsUsable(db: Database.Database) {
   const present = db.prepare(
-    `select count(*) as n from sqlite_master
+    `select name, type, sql from sqlite_master
      where name in (${SCHEMA_OBJECTS.map(() => "?").join(", ")})`,
-  ).get(...SCHEMA_OBJECTS) as { n: number };
-  return present.n === SCHEMA_OBJECTS.length && readControl(db) !== null;
+  ).all(...SCHEMA_OBJECTS) as Array<{ name: string; type: string; sql: string | null }>;
+  const types = new Map(present.map((row) => [row.name, row.type]));
+  const objectsPresent = types.get(INDEX_TABLE) === "table" && types.get(CONTROL_TABLE) === "table" &&
+    [...EVENT_TRIGGERS, ...COUNT_TRIGGERS].every((name) => types.get(name) === "trigger");
+  if (!objectsPresent || !indexTableUsable(db)) return false;
+  const definitions = new Map(present.map((row) => [row.name, row.sql?.toLowerCase() ?? ""]));
+  return (Object.entries(TRIGGER_FRAGMENTS) as Array<[
+    typeof EVENT_TRIGGERS[number] | typeof COUNT_TRIGGERS[number], readonly string[]
+  ]>).every(
+    ([name, fragments]) => fragments.every((fragment) => definitions.get(name)?.includes(fragment)),
+  );
+}
+
+function installed(db: Database.Database) {
+  if (!auxiliaryObjectsUsable(db)) return false;
+  const control = readControl(db);
+  return control !== null && countsAgree(control);
 }
 
 /**
@@ -176,7 +259,8 @@ export function ensureSessionContextIndexSchema(
   db.transaction(() => {
     if (installed(db)) return;
     db.exec(`drop table if exists ${INDEX_TABLE};
-      ${EVENT_TRIGGERS.map((name) => `drop trigger if exists ${name};`).join("\n")}`);
+      ${[...EVENT_TRIGGERS, ...COUNT_TRIGGERS].map((name) => `drop trigger if exists ${name};`).join("\n")}`);
+    db.exec(`drop table if exists ${CONTROL_TABLE};`);
     db.exec(SCHEMA);
     const backfillNeeded = Boolean(db.prepare(
       `select 1 from buffered_events indexed by idx_events_repo
@@ -185,8 +269,9 @@ export function ensureSessionContextIndexSchema(
     const at = now().toISOString();
     db.prepare(
       `insert into session_repo_context_control
-         (singleton, installed_at, backfill_complete, backfill_completed_at, indexed_rows)
-       values (1, @at, @complete, @completedAt, 0)
+         (singleton, installed_at, backfill_complete, backfill_completed_at,
+          indexed_rows, ledger_context_rows)
+       values (1, @at, @complete, @completedAt, 0, 0)
        on conflict (singleton) do update set
          installed_at = excluded.installed_at,
          backfill_complete = excluded.backfill_complete,
@@ -198,7 +283,8 @@ export function ensureSessionContextIndexSchema(
          backfill_batches = 0,
          backfill_last_batch_at = null,
          backfill_completed_at = excluded.backfill_completed_at,
-         indexed_rows = 0`,
+         indexed_rows = 0,
+         ledger_context_rows = 0`,
     ).run({
       at,
       complete: backfillNeeded ? 0 : 1,
@@ -213,9 +299,14 @@ function stateOf(control: ControlRow | null): SessionContextIndexState {
   return control === null ? "absent" : control.complete === 1 ? "complete" : "backfilling";
 }
 
+function verifiedState(db: Database.Database, control: ControlRow | null): SessionContextIndexState {
+  if (control === null || !auxiliaryObjectsUsable(db) || !countsAgree(control)) return "absent";
+  return stateOf(control);
+}
+
 /** One control-row read. */
 export function sessionContextIndexState(db: Database.Database) {
-  return stateOf(readControl(db));
+  return verifiedState(db, readControl(db));
 }
 
 /**
@@ -223,7 +314,7 @@ export function sessionContextIndexState(db: Database.Database) {
  * row that predates it. Read inside the caller's snapshot.
  */
 export function sessionContextIndexComplete(db: Database.Database) {
-  return sessionContextIndexState(db) === "complete";
+  return verifiedState(db, readControl(db)) === "complete";
 }
 
 type RepoKey = { rowid: number; repoHash: unknown; branchHash: unknown };
@@ -265,6 +356,15 @@ export type SessionContextBackfillBatch = {
   indexed: number;
 };
 
+export type SessionContextBackfillOptions = {
+  now?: () => Date;
+  /**
+   * Called before each row. Returning false leaves the unvisited rows for the
+   * next maintenance slice; rows already visited remain in this transaction.
+   */
+  shouldContinue?: () => boolean;
+};
+
 /**
  * One backfill transaction: visit at most `maxRows` repo-bearing rows after
  * the stored cursor, index the ones that are session context, and advance the
@@ -275,14 +375,15 @@ export type SessionContextBackfillBatch = {
 export function backfillSessionContextIndex(
   db: Database.Database,
   maxRows: number,
-  now: () => Date = () => new Date(),
+  options: SessionContextBackfillOptions = {},
 ): SessionContextBackfillBatch {
-  const before = stateOf(readControl(db));
+  const before = verifiedState(db, readControl(db));
   if (before !== "backfilling") return { state: before, visited: 0, indexed: 0 };
   const limit = Math.max(1, Math.min(Math.trunc(maxRows) || 1, SESSION_CONTEXT_BACKFILL_MAX_BATCH_ROWS));
   return db.transaction((): SessionContextBackfillBatch => {
     const control = readControl(db);
-    if (stateOf(control) !== "backfilling") return { state: stateOf(control), visited: 0, indexed: 0 };
+    const current = verifiedState(db, control);
+    if (current !== "backfilling") return { state: current, visited: 0, indexed: 0 };
     const cursor = control!.cursorRowid === null ? null : {
       rowid: control!.cursorRowid,
       repoHash: control!.cursorRepoHash,
@@ -293,13 +394,30 @@ export function backfillSessionContextIndex(
       `insert into session_repo_contexts (session_id, observed_at, source_rowid, repo_hash)
        select e.session_id, e.observed_at, e.rowid, e.repo_hash
        from buffered_events e where e.rowid = ? and ${contextRow("e")}
-       ${UPSERT_CONTEXT}`,
+       on conflict (session_id, observed_at, source_rowid) do nothing`,
     );
     let indexed = 0;
-    for (const row of rows) indexed += index.run(row.rowid).changes;
-    const complete = rows.length < limit;
-    const last = complete ? null : rows[rows.length - 1]!;
-    const at = now().toISOString();
+    let visited = 0;
+    for (const row of rows) {
+      if (options.shouldContinue && !options.shouldContinue()) break;
+      indexed += index.run(row.rowid).changes;
+      visited += 1;
+    }
+    // A clock can expire before the first row. Do not advance the cursor or
+    // manufacture a maintenance batch in that case. The surrounding stage
+    // will stop immediately and retry the same rows next time.
+    if (visited === 0 && rows.length > 0) {
+      return { state: current, visited: 0, indexed: 0 };
+    }
+    if (indexed > 0) {
+      db.prepare(
+        `update session_repo_context_control
+         set ledger_context_rows = ledger_context_rows + ? where singleton = 1`,
+      ).run(indexed);
+    }
+    const complete = visited === rows.length && rows.length < limit;
+    const last = complete ? null : visited > 0 ? rows[visited - 1]! : cursor;
+    const at = (options.now ?? (() => new Date()))().toISOString();
     db.prepare(
       `update session_repo_context_control set
          backfill_cursor_repo_hash = @repoHash,
@@ -309,19 +427,25 @@ export function backfillSessionContextIndex(
          backfill_rows_indexed = backfill_rows_indexed + @indexed,
          backfill_batches = backfill_batches + 1,
          backfill_last_batch_at = @at,
-         backfill_complete = @complete,
-         backfill_completed_at = case when @complete = 1 then @at else null end
+         backfill_complete = case
+           when @complete = 1 and indexed_rows = ledger_context_rows then 1 else 0 end,
+         backfill_completed_at = case
+           when @complete = 1 and indexed_rows = ledger_context_rows then @at else null end
        where singleton = 1`,
     ).run({
       repoHash: last?.repoHash ?? null,
       branchHash: last?.branchHash ?? null,
       rowid: last?.rowid ?? null,
-      visited: rows.length,
+      visited,
       indexed,
       at,
       complete: complete ? 1 : 0,
     });
-    return { state: complete ? "complete" : "backfilling", visited: rows.length, indexed };
+    return {
+      state: verifiedState(db, readControl(db)),
+      visited,
+      indexed,
+    };
   }).immediate();
 }
 
@@ -345,7 +469,7 @@ export type SessionContextIndexStatus = {
 /** One control-row read; safe on the status refresh path. */
 export function sessionContextIndexStatus(db: Database.Database): SessionContextIndexStatus {
   const control = readControl(db);
-  const state = stateOf(control);
+  const state = verifiedState(db, control);
   return {
     state,
     inheritanceSource: state === "complete" ? "context_index" : "session_scan",

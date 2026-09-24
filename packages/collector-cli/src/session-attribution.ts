@@ -272,12 +272,20 @@ const READ_SESSION_CONTEXTS =
 // above keeps, in the same order, so one bounded range read per lookup
 // returns what READ_SESSION_CONTEXTS returns for a window that fits.
 const READ_INDEXED_CONTEXTS =
-  `select source_rowid as rowid, session_id as sessionId,
-     observed_at as observedAt, repo_hash as repoHash
-   from session_repo_contexts
-   where session_id = ? and observed_at >= ? and observed_at <= ?
-   order by observed_at asc, source_rowid asc
+  `select c.source_rowid as rowid, c.session_id as sessionId,
+     c.observed_at as observedAt, c.repo_hash as repoHash,
+     exists (
+       select 1 from buffered_events e where e.rowid = c.source_rowid
+         and e.session_id is c.session_id and e.observed_at is c.observed_at
+         and e.repo_hash is c.repo_hash and e.data_mode <> 'evidence'
+         and e.privacy_disposition is null
+     ) as sourceValid
+   from session_repo_contexts c
+   where c.session_id = ? and c.observed_at >= ? and c.observed_at <= ?
+   order by c.observed_at asc, c.source_rowid asc
    limit ?`;
+
+type IndexedSessionRepoContext = SessionRepoContext & { sourceValid: number };
 
 /**
  * Rows from better-sqlite3 are several times slower to read and spread than
@@ -347,9 +355,17 @@ export class SessionAttributionBatch {
     // One read snapshot keeps every count consistent with its row read, and
     // the coverage marker consistent with the index it describes.
     db.transaction(() => {
-      const readIndexed = options.contextIndex !== false && sessionContextIndexComplete(db)
-        ? db.prepare(READ_INDEXED_CONTEXTS)
-        : null;
+      let readIndexed: Database.Statement | null = null;
+      if (options.contextIndex !== false && sessionContextIndexComplete(db)) {
+        try {
+          readIndexed = db.prepare(READ_INDEXED_CONTEXTS);
+        } catch {
+          // The context index is auxiliary. A missing or invalid object on a
+          // read-only history connection must select the bounded ledger scan,
+          // never make history upload fail.
+          readIndexed = null;
+        }
+      }
       const countEntries = readIndexed ? null : db.prepare(COUNT_SESSION_ENTRIES);
       const readContexts = readIndexed ? null : db.prepare(READ_SESSION_CONTEXTS);
       this.counters.contextIndex = readIndexed !== null;
@@ -384,7 +400,7 @@ export class SessionAttributionBatch {
               lookup.lower,
               lookup.upper,
               cap + 1,
-            ) as SessionRepoContext[];
+            ) as IndexedSessionRepoContext[];
             this.counters.contextRows += rows.length;
             readBudget -= Math.min(readBudget, rows.length);
             if (rows.length > scanLimit) {
@@ -395,6 +411,10 @@ export class SessionAttributionBatch {
               this.counters.budgetExhausted += 1;
               continue;
             }
+            // The two O(1) control counters catch missing/orphan cardinality.
+            // Point checks keep a count-preserving stale row from authorizing
+            // a project. Any invalid row makes the whole lookup fail closed.
+            if (rows.some((row) => row.sourceValid !== 1)) continue;
             lookup.rows = plainContexts(rows);
             lookup.complete = true;
             continue;
