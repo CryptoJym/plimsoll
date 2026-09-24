@@ -281,6 +281,24 @@ const LIVE_USAGE_SIBLING_SQL = `
        or cost_usd is not null)
    limit 1`;
 
+/** A raw row that is live-class and carries usage (the predicate above, unqualified). */
+const LIVE_USAGE_ROW_SQL = `event_type not in ('usage_rollout','usage_transcript')
+  and (input_tokens is not null or output_tokens is not null
+    or cache_read_tokens is not null or cache_creation_tokens is not null
+    or cost_usd is not null)`;
+
+/**
+ * Newest rows of one session that capture reads to find a live-usage row
+ * older than its batch (eco-6hoxj.163.24). On the Studio0 ledger the newest
+ * such row is a few rows back and the p99 gap between live-usage rows of the
+ * busiest sessions is ~1.6k rows; a session with a longer usage-free tail
+ * leaves its row to the maintenance drain, which reads further.
+ */
+const CAPTURE_LIVE_SIBLING_PROBE_ROWS = 1_024;
+
+/** Capture could not decide a row within its read budget; the row stays queued. */
+class ProjectionApplyDeferred extends Error {}
+
 type RawProjectionRow = {
   rawRowid: number;
   privacyEligible: number;
@@ -1726,11 +1744,13 @@ export class DashboardProjectionStore {
         // Maintenance drains them as one day-grouped batch; capture never pays
         // one gzip segment per event and the published generation stays stale.
         if (compactable(row) && row.privacyEligible) return;
-        this.applyProjectionRows([row], now);
+        this.applyProjectionRows([row], now, CAPTURE_LIVE_SIBLING_PROBE_ROWS);
         this.captureStatement(`delete from dashboard_projection_repairs where raw_rowid = ?`).run(rawRowid);
       })();
       return true;
     } catch (error) {
+      // Nothing was written; the trigger-authored repair receipt stays queued.
+      if (error instanceof ProjectionApplyDeferred) return true;
       const at = now.toISOString();
       this.captureStatement(
         `insert into dashboard_projection_repairs (raw_rowid, reason, queued_at)
@@ -1758,7 +1778,33 @@ export class DashboardProjectionStore {
     this.failNextCompactGcAfterRewrite = true;
   }
 
-  private applyProjectionRows(rows: RawProjectionRow[], now: Date) {
+  private applyProjectionRows(rows: RawProjectionRow[], now: Date, liveSiblingProbeRows?: number) {
+    // A live-class usage row may arrive after its tailer siblings were already
+    // projected (transcript-first ordering). Re-enqueue those siblings so the
+    // suppression rule is re-derived and totals converge regardless of the
+    // order in which the two paths recorded the same session (issue #193).
+    // Decided before any write, so a deferral leaves nothing to undo.
+    const liveUsageBatchRowids = new Map<string, number[]>();
+    for (const row of rows) {
+      if (!isUsageTailerEventType(row.eventType) && row.sessionId !== null && carriesUsage(row)) {
+        const key = `${row.source}\u0000${row.sessionId}`;
+        const rowids = liveUsageBatchRowids.get(key);
+        if (rowids) rowids.push(row.rawRowid);
+        else liveUsageBatchRowids.set(key, [row.rawRowid]);
+      }
+    }
+    const firstLiveUsage: Array<[string, string]> = [];
+    for (const [key, batchRowids] of liveUsageBatchRowids) {
+      const [source, sessionId] = key.split("\u0000") as [string, string];
+      // Only the batch that introduces the FIRST live-usage row for a
+      // (source, session) can flip the suppression predicate; once a live
+      // sibling predates this batch the rule was already in force, and
+      // re-enqueueing siblings would re-drain the whole tailer fact set on
+      // every later live event without changing any total (issue #193).
+      const earlier = this.earlierLiveUsageRow(source, sessionId, batchRowids, liveSiblingProbeRows);
+      if (earlier === "undecided") throw new ProjectionApplyDeferred();
+      if (!earlier) firstLiveUsage.push([source, sessionId]);
+    }
     const compactRows: RawProjectionRow[] = [];
     for (const row of rows) {
       // Raw rowids can be reused before a queued prune repair runs. The retained
@@ -1783,33 +1829,7 @@ export class DashboardProjectionStore {
       }
     }
     if (compactRows.length) this.addCompactRows(compactRows);
-    // A live-class usage row may arrive after its tailer siblings were already
-    // projected (transcript-first ordering). Re-enqueue those siblings so the
-    // suppression rule is re-derived and totals converge regardless of the
-    // order in which the two paths recorded the same session (issue #193).
-    const liveUsageBatchCounts = new Map<string, number>();
-    for (const row of rows) {
-      if (!isUsageTailerEventType(row.eventType) && row.sessionId !== null && carriesUsage(row)) {
-        const key = `${row.source}\u0000${row.sessionId}`;
-        liveUsageBatchCounts.set(key, (liveUsageBatchCounts.get(key) ?? 0) + 1);
-      }
-    }
-    for (const [key, batchLiveRows] of liveUsageBatchCounts) {
-      const [source, sessionId] = key.split("\u0000");
-      // Only the batch that introduces the FIRST live-usage row for a
-      // (source, session) can flip the suppression predicate; once a live
-      // sibling predates this batch the rule was already in force, and
-      // re-enqueueing siblings would re-drain the whole tailer fact set on
-      // every later live event without changing any total (issue #193).
-      const liveRowsTotal = this.db.prepare(
-        `select count(*) as n from buffered_events
-          where source = ? and session_id = ?
-            and event_type not in ('usage_rollout','usage_transcript')
-            and (input_tokens is not null or output_tokens is not null
-              or cache_read_tokens is not null or cache_creation_tokens is not null
-              or cost_usd is not null)`,
-      ).get(source, sessionId) as { n: number };
-      if (liveRowsTotal.n > batchLiveRows) continue;
+    for (const [source, sessionId] of firstLiveUsage) {
       this.db.prepare(
         `insert or ignore into dashboard_projection_repairs (raw_rowid, reason, queued_at)
          select b.rowid, 'sibling_live_usage', ?
@@ -1819,6 +1839,49 @@ export class DashboardProjectionStore {
            and exists (select 1 from dashboard_event_facts f where f.raw_rowid = b.rowid)`,
       ).run(now.toISOString(), source, sessionId);
     }
+  }
+
+  /**
+   * Whether (source, session) has a committed live-usage row outside the
+   * batch. Read newest first, where such a row almost always is, instead of
+   * counting every row of the session: on Studio0 that count read a 1.9M-row
+   * session for each usage event, one multi-second writer turn per event.
+   * With `probeRows`, only the session's newest `probeRows` rows are read, and
+   * a longer session without a match among them is "undecided".
+   */
+  private earlierLiveUsageRow(
+    source: string,
+    sessionId: string,
+    batchRowids: number[],
+    probeRows?: number,
+  ): boolean | "undecided" {
+    const batch = JSON.stringify(batchRowids);
+    if (probeRows === undefined) {
+      return Boolean(this.captureStatement(
+        `select 1 from buffered_events
+          where source = ? and session_id = ? and ${LIVE_USAGE_ROW_SQL}
+            and rowid not in (select value from json_each(?))
+          order by observed_at desc limit 1`,
+      ).get(source, sessionId, batch));
+    }
+    const found = this.captureStatement(
+      `select 1 from (
+         select rowid as raw_rowid, event_type, input_tokens, output_tokens,
+           cache_read_tokens, cache_creation_tokens, cost_usd
+         from buffered_events where source = ? and session_id = ?
+         order by observed_at desc limit ?)
+       where ${LIVE_USAGE_ROW_SQL}
+         and raw_rowid not in (select value from json_each(?))
+       limit 1`,
+    ).get(source, sessionId, probeRows, batch);
+    if (found) return true;
+    // The same newest rows the probe just read, plus one: is there anything older?
+    const { n } = this.captureStatement(
+      `select count(*) as n from (
+         select 1 from buffered_events where source = ? and session_id = ?
+         order by observed_at desc limit ?)`,
+    ).get(source, sessionId, probeRows + 1) as { n: number };
+    return n > probeRows ? "undecided" : false;
   }
 
   private compactWindowCutoffs() {

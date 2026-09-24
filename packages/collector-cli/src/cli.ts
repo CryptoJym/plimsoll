@@ -156,10 +156,13 @@ import {
 } from "./hook-spool";
 import { MaintenanceFailureError, MaintenanceProcessBoundary } from "./maintenance-boundary";
 import { checkpointWalInBoundedChild, runStartupWalSelfHeal } from "./startup-wal-self-heal";
+import { WalCheckpointWorker } from "./wal-checkpoint-worker";
 import {
-  maintenanceStarvationReceipt,
+  MAINTENANCE_CENSUS_QUERIES,
+  maintenanceStarvationStatus,
   recordMaintenanceDeadlineBlame,
   recordMaintenanceDeadlineKill,
+  type MaintenanceStarvationCensus,
 } from "./maintenance-starvation";
 import { runMaintenanceWorkerService } from "./maintenance-worker";
 import {
@@ -259,6 +262,7 @@ import {
   loadDaemonSessionSyncState,
   planDaemonSessionSync,
   listLedgerSessionIdsOffThread,
+  readLedgerOffThread,
   runSessionSync,
   saveDaemonSessionSyncState,
   sessionIdsFromBatches,
@@ -1133,6 +1137,8 @@ function launchAgentUnloadReceipt(
  * rather than down (review r2, F4).
  */
 const COLLECTOR_STATUS_TIMEOUT_DEFAULT_MS = 3_000;
+/** Pause before the next upload cycle when the last one stopped at its batch cap. */
+const SYNC_CATCH_UP_DELAY_MS = 5_000;
 
 function collectorStatusTimeoutMs() {
   const configured = Number(process.env.PLIMSOLL_COLLECTOR_DOCTOR_TIMEOUT_MS ?? "");
@@ -2564,6 +2570,10 @@ async function main() {
     // This connection owns the HTTP event loop. Never inherit better-sqlite3's
     // five-second busy wait when the maintenance child briefly owns a writer.
     const buffer = openBuffer(config, false, 0);
+    // A worker thread copies its WAL back and keeps it bounded; the
+    // connection's own automatic checkpoint stays only as a backstop
+    // (wal-checkpoint-worker.ts).
+    const walCheckpoint = new WalCheckpointWorker(buffer.database);
     // Outcome facts intentionally live outside the capture ledger. Opening the
     // local read model here does not schedule collection; the only writer is
     // an explicit backfill command.
@@ -2616,13 +2626,10 @@ async function main() {
             heldMs: info.heldMs,
             attribution: info.attribution,
           });
-          const receipt = maintenanceStarvationReceipt(buffer.database);
-          if (receipt.starving) {
-            console.warn(JSON.stringify({
-              warning: "maintenance_starvation",
-              ...receipt,
-            }));
-          }
+          // Judged from a census that starts after this kill (below).
+          killsRecorded += 1;
+          starvationWarningAfterKill = killsRecorded;
+          refreshStarvationCensus();
         } catch {
           // Starvation bookkeeping must never mask the boundary failure.
         }
@@ -2656,14 +2663,67 @@ async function main() {
     }
     let refreshStatusSnapshot: (failure?: "maintenance_failed") => boolean = () => false;
     let retentionCadence: AutomaticRetentionCadence | undefined;
+    // The starvation census counts two queue tables (~280k pending links on
+    // the Studio0 ledger, ~0.8 s cold), so it runs on a read-only worker
+    // together with the kill counter it is judged against. /status labels the
+    // census with its time and never counts the queues on the event loop; a
+    // failed census keeps the last one (eco-6hoxj.163.24).
+    const readStarvationCensus = async (): Promise<MaintenanceStarvationCensus> => {
+      const observedAt = new Date().toISOString();
+      const count = (row: { n: unknown } | undefined) => {
+        const n = Number(row?.n);
+        return Number.isSafeInteger(n) && n >= 0 ? n : 0;
+      };
+      const [fill, dirty, kills] = await readLedgerOffThread<{ n: unknown }>(buffer.database, [
+        { sql: MAINTENANCE_CENSUS_QUERIES.fillPendingEventLinks, params: {} },
+        { sql: MAINTENANCE_CENSUS_QUERIES.dirtyEnrichmentSessions, params: {} },
+        { sql: MAINTENANCE_CENSUS_QUERIES.deadlineKills, params: {} },
+      ]);
+      return {
+        backlog: { fillPendingEventLinks: count(fill), dirtyEnrichmentSessions: count(dirty) },
+        deadlineKills: count(kills),
+        observedAt,
+      };
+    };
+    let starvationCensus = await readStarvationCensus().catch(() => null);
     const readStarvationReceipt = () => {
       try {
-        return maintenanceStarvationReceipt(buffer.database);
+        return maintenanceStarvationStatus(buffer.database, starvationCensus);
       } catch {
         return null;
       }
     };
     let cachedStarvationReceipt = readStarvationReceipt();
+    let starvationCensusRead: Promise<void> | null = null;
+    let starvationCensusAgain = false;
+    let killsRecorded = 0;
+    let starvationWarningAfterKill = 0;
+    const refreshStarvationCensus = () => {
+      if (starvationCensusRead) {
+        starvationCensusAgain = true;
+        return;
+      }
+      const killsBefore = killsRecorded;
+      starvationCensusRead = readStarvationCensus()
+        .then((census) => {
+          starvationCensus = census;
+          cachedStarvationReceipt = readStarvationReceipt();
+          if (starvationWarningAfterKill > 0 && killsBefore >= starvationWarningAfterKill) {
+            starvationWarningAfterKill = 0;
+            if (cachedStarvationReceipt?.starving) {
+              console.warn(JSON.stringify({ warning: "maintenance_starvation", ...cachedStarvationReceipt }));
+            }
+          }
+        })
+        .catch(() => undefined)
+        .finally(() => {
+          starvationCensusRead = null;
+          if (starvationCensusAgain) {
+            starvationCensusAgain = false;
+            refreshStarvationCensus();
+          }
+        });
+    };
     // Bead eco-6hoxj.61. Created before the listener so /status can read its
     // cached snapshot, armed with the other cadences below.
     let hookSpoolDrain: HookSpoolDrain | undefined;
@@ -2676,6 +2736,7 @@ async function main() {
       hookSpoolStatus: () => hookSpoolDrain?.status() ?? null,
       otlpSpool,
       syncStatus: () => syncBackoff.status(syncInFlight),
+      walCheckpointStatus: () => walCheckpoint.status(),
       runtimeIdentity,
       homeIdentityHash: collectorHomeIdentityHash(collectorHome()),
       // Issue 0056 (#104): the daemon provisions (first start) or loads the
@@ -2694,6 +2755,7 @@ async function main() {
       registerStatusRefresher: (refresh) => {
         refreshStatusSnapshot = (failure) => {
           cachedStarvationReceipt = readStarvationReceipt();
+          refreshStarvationCensus();
           try { cachedBaseline = captureBaselineStatus(buffer.database); } catch { /* retain last observation */ }
           return refresh(failure);
         };
@@ -2737,9 +2799,14 @@ async function main() {
       };
       let uploaded = 0;
       let serverRetryAfterMs = 0;
+      let catchUp = false;
       try {
         let batches = 0;
+        let remainingDelivery = 0;
         while (batches < config.delivery.maxBatchesPerCycle) {
+          // A batch acknowledges, leases and seals in synchronous writer turns;
+          // intake and /status run between batches (eco-6hoxj.163.24).
+          if (batches > 0) await new Promise<void>((resolve) => setImmediate(resolve));
           const result = await uploadBufferedEvents(config, buffer, {
             includeLegacyRemainingUnuploaded: false,
             storageRetry,
@@ -2748,10 +2815,13 @@ async function main() {
           uploadedBatches.push(result.batch);
           uploaded += result.uploadedEvents;
           batches += 1;
+          remainingDelivery = result.remainingDelivery;
           // A partial batch can both acknowledge siblings and ask us to wait.
           serverRetryAfterMs = "retryAfterMs" in result.delivery ? Number(result.delivery.retryAfterMs) : 0;
           if (serverRetryAfterMs > 0 || result.remainingDelivery === 0) break;
         }
+        catchUp = batches >= config.delivery.maxBatchesPerCycle && serverRetryAfterMs === 0 &&
+          remainingDelivery > 0;
         if (uploaded > 0) {
           console.log(
             JSON.stringify({
@@ -2766,6 +2836,12 @@ async function main() {
         // Session snapshots share the ingest endpoint. Carry their identities
         // rather than issue another request inside a server-directed cooldown.
         if (serverRetryAfterMs > 0) { carrySessions(); return; }
+        // While more than a cycle of events is due, events drain first. A
+        // session snapshot re-reads every row of each touched session (1.88M
+        // for Studio0's busiest), seconds to minutes that would hold the next
+        // upload cycle; the identities are carried to the cycle that ends the
+        // backlog (eco-6hoxj.163.24).
+        if (catchUp) { carrySessions(); return; }
 
         // Session sync (issue 0037 / eco-6hoxj.70.1): just-uploaded batches
         // plus durable pending, and a ledger catch-up until the first full
@@ -2869,6 +2945,12 @@ async function main() {
         );
       } finally {
         syncInFlight = false;
+        // A cycle that stopped at its batch cap with delivery still due starts
+        // the next one shortly rather than at the next interval tick, so a
+        // backlog above one cycle drains at upload speed, not at 10k events
+        // per interval (eco-6hoxj.163.24). Failures and a server Retry-After
+        // never chain: they keep the scheduler's own backoff.
+        if (catchUp && !shuttingDown) setTimeout(() => void runSync(), SYNC_CATCH_UP_DELAY_MS).unref();
       }
     };
 
@@ -3036,6 +3118,7 @@ async function main() {
     });
 
     retentionCadence.start();
+    walCheckpoint.start();
     // Boot capture is deferred so the OTLP receiver binds first, but it uses
     // the exact same bounded recent-tail entrypoint as the interval. Historical
     // files are available only through the explicit scan commands below.
@@ -3117,6 +3200,7 @@ async function main() {
     for (const timer of timers) timer.unref();
 
     const stopMaintenanceBeforeFatalExit = async () => {
+      void walCheckpoint.stop();
       maintenanceCadence?.stop();
       retentionCadence?.stop();
       enrichmentCadence?.stop();
@@ -3167,6 +3251,7 @@ async function main() {
       }
       shuttingDown = true;
       flushRejectionSummaries();
+      void walCheckpoint.stop();
       maintenanceCadence?.stop();
       retentionCadence?.stop();
       enrichmentCadence?.stop();
