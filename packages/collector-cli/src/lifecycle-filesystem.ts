@@ -11,6 +11,7 @@ import {
   planLifecycleRetention,
   type LifecycleAdapter,
   type LifecycleCloneFallback,
+  type LifecycleCompletedOperation,
   type LifecycleJournal,
   type LifecycleReadiness,
   type LifecycleReceipt,
@@ -178,6 +179,40 @@ function isSnapshotMetadata(value: unknown): value is SnapshotMetadata {
     typeof present?.service === "boolean";
 }
 
+/**
+ * The durable completion order: the last sequence handed to a completing
+ * update or rollback, and every completion marker that existed when
+ * sequencing began (all older than every sequenced one).
+ */
+type CompletionOrderRecord = {
+  schemaVersion: typeof LIFECYCLE_SCHEMA_VERSION;
+  lastSequence: number;
+  legacyOperations: string[];
+};
+
+const MAX_COMPLETION_MARKERS = 100_000;
+
+function parseCompletionOrder(value: unknown): CompletionOrderRecord | null {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return null;
+  const row = value as Record<string, unknown>;
+  const keys = Object.keys(row).sort().join(",");
+  if (keys !== "lastSequence,legacyOperations,schemaVersion" || row.schemaVersion !== 1) return null;
+  if (typeof row.lastSequence !== "number" || !Number.isSafeInteger(row.lastSequence) || row.lastSequence < 0) return null;
+  const legacy = row.legacyOperations;
+  if (!Array.isArray(legacy) || legacy.length > MAX_COMPLETION_MARKERS || !legacy.every(isBoundedIdentifier) ||
+      new Set(legacy).size !== legacy.length) return null;
+  return { schemaVersion: 1, lastSequence: row.lastSequence, legacyOperations: [...legacy] };
+}
+
+/** A marker that is plainly not an update or rollback (uninstall, purge, support bundle, prune). */
+function isOtherOperationReceipt(value: unknown, operationId: string) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const row = value as Record<string, unknown>;
+  return row.schemaVersion === 1 && row.operationId === operationId && row.toVersion === null &&
+    row.restoredVersion === null &&
+    ["uninstall", "purge", "support_bundle", "snapshots_prune"].includes(String(row.operation));
+}
+
 function writeJson(file: string, value: unknown, boundary?: string) {
   ensureDirectory(path.dirname(file), boundary);
   if (boundary) assertNoSymlink(file, boundary);
@@ -187,6 +222,25 @@ function writeJson(file: string, value: unknown, boundary?: string) {
   fs.chmodSync(temporary, FILE_MODE);
   if (boundary) assertNoSymlink(file, boundary);
   fs.renameSync(temporary, file);
+}
+
+/** writeJson whose content and rename survive a crash or power loss before anything depends on them. */
+function writeJsonDurable(file: string, value: unknown, boundary?: string) {
+  ensureDirectory(path.dirname(file), boundary);
+  if (boundary) assertNoSymlink(file, boundary);
+  const temporary = `${file}.tmp`;
+  if (boundary) assertNoSymlink(temporary, boundary);
+  const descriptor = fs.openSync(temporary, "w", FILE_MODE);
+  try {
+    fs.writeFileSync(descriptor, `${JSON.stringify(value, null, 2)}\n`);
+    fs.fsyncSync(descriptor);
+  } finally {
+    fs.closeSync(descriptor);
+  }
+  fs.chmodSync(temporary, FILE_MODE);
+  if (boundary) assertNoSymlink(file, boundary);
+  fs.renameSync(temporary, file);
+  fsyncDirectory(path.dirname(file));
 }
 
 function readJson<T>(file: string): T | null {
@@ -281,6 +335,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
   private readonly journalPath: string;
   private readonly lockPath: string;
   private readonly currentPath: string;
+  private readonly orderPath: string;
   /** Operation-ID → held mutation lease. Bounded; one process holds at most a
    * handful of concurrent lifecycle operations. */
   private readonly fences = new Map<string, LifecycleMutationLease>();
@@ -316,6 +371,7 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     this.journalPath = path.join(this.root, "journal.json");
     this.lockPath = path.join(this.root, "operation.lock");
     this.currentPath = path.join(this.root, "current");
+    this.orderPath = path.join(this.root, "completion-order.json");
     if (fs.existsSync(paths.ownershipRoot) && fs.lstatSync(paths.ownershipRoot).isSymbolicLink()) {
       throw new Error("ownership root cannot be a symlink");
     }
@@ -792,17 +848,70 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
   }
 
   /**
-   * Terminal receipt of an update or rollback, or null when it is absent,
-   * unreadable, or not the complete receipt that operation wrote.
+   * Every completion marker: the updates and rollbacks whose full receipt
+   * proves they completed or rolled back, the markers of other operations,
+   * and the ones that prove nothing (unreadable or not the receipt their
+   * operation wrote), which make those operations unknown.
    */
-  private operationMarker(operationId: string) {
+  private completionMarkers() {
+    const operations: LifecycleCompletedOperation[] = [];
+    const invalid: string[] = [];
+    const ids: string[] = [];
+    if (!lstatIfPresent(this.completedRoot)) return { operations, invalid, ids };
+    assertNoSymlink(this.completedRoot, this.root);
+    for (const name of fs.readdirSync(this.completedRoot).sort()) {
+      if (!name.endsWith(".json")) continue;
+      const id = name.slice(0, -".json".length);
+      if (!isBoundedIdentifier(id)) continue;
+      if (ids.length >= MAX_COMPLETION_MARKERS) throw new Error("too many completion markers to order");
+      ids.push(id);
+      try {
+        const stat = fs.lstatSync(path.join(this.completedRoot, name));
+        if (!stat.isFile() || stat.size > MAX_MARKER_BYTES) throw new Error("marker is not a bounded regular file");
+        const value = JSON.parse(fs.readFileSync(path.join(this.completedRoot, name), "utf8")) as unknown;
+        const operation = parseCompletionReceipt(value, id);
+        if (operation) operations.push(operation);
+        else if (!isOtherOperationReceipt(value, id)) invalid.push(id);
+      } catch {
+        invalid.push(id);
+      }
+    }
+    return { operations, invalid, ids };
+  }
+
+  private completionOrder(): { state: "absent" } | { state: "invalid" } | { state: "valid"; record: CompletionOrderRecord } {
     try {
-      const marker = path.join(this.completedRoot, `${operationId}.json`);
-      assertNoSymlink(marker, this.root);
-      const stat = fs.lstatSync(marker);
-      if (!stat.isFile() || stat.size > MAX_MARKER_BYTES) return null;
-      const receipt = parseCompletionReceipt(JSON.parse(fs.readFileSync(marker, "utf8")), operationId);
-      return receipt ? { kind: receipt.kind, status: receipt.status, completedAtMs: stat.mtimeMs } : null;
+      assertNoSymlink(this.orderPath, this.root);
+      const stat = lstatIfPresent(this.orderPath);
+      if (!stat) return { state: "absent" };
+      if (!stat.isFile() || stat.size > 16 * 1024 * 1024) return { state: "invalid" };
+      const record = parseCompletionOrder(JSON.parse(fs.readFileSync(this.orderPath, "utf8")));
+      return record ? { state: "valid", record } : { state: "invalid" };
+    } catch {
+      return { state: "invalid" };
+    }
+  }
+
+  async assignCompletionSequence(operationId: string): Promise<number | null> {
+    try {
+      const markers = this.completionMarkers();
+      const order = this.completionOrder();
+      const sequences = markers.operations.flatMap((operation) => operation.sequence === null ? [] : [operation.sequence]);
+      let record: CompletionOrderRecord;
+      if (order.state === "valid") {
+        record = order.record;
+      } else if (order.state === "absent" && sequences.length === 0) {
+        // Sequencing begins: every marker already here is older than every
+        // sequenced completion, so record exactly which ones those are.
+        record = { schemaVersion: 1, lastSequence: 0, legacyOperations: markers.ids.filter((id) => id !== operationId) };
+      } else {
+        // A lost or damaged order record is never rebuilt from guesses.
+        return null;
+      }
+      const next = Math.max(record.lastSequence, ...sequences) + 1;
+      if (!Number.isSafeInteger(next)) return null;
+      writeJsonDurable(this.orderPath, { ...record, lastSequence: next }, this.root);
+      return next;
     } catch {
       return null;
     }
@@ -851,7 +960,10 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
   /** Read-only view of everything retention decides over. */
   private retentionInput() {
     let blockedReason: LifecycleSnapshotInventory["blockedReason"] = null;
-    const empty: LifecycleRetentionInput = { installedVersion: null, pinnedVersions: [], journal: null, snapshots: [], versions: [] };
+    const empty: LifecycleRetentionInput = {
+      installedVersion: null, pinnedVersions: [], journal: null, operations: [],
+      order: { proven: true, legacyChain: false }, snapshots: [], versions: [],
+    };
     if (!lstatIfPresent(this.root)) return { input: empty, blockedReason, createdAt: new Map<string, string | null>() };
     assertNoSymlink(this.root, this.paths.ownershipRoot);
     let installedVersion: string | null = null;
@@ -880,19 +992,43 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
       return {
         id,
         bytes: treeBytes(directory),
-        createdAtMs,
         metadataValid: metadata !== null,
         restoresVersion: metadata?.currentVersion ?? null,
         method: metadata ? snapshotRecordFrom(metadata, 0).method : null,
-        operation: this.operationMarker(id),
       };
     });
     const versions = this.childDirectories(this.versionsRoot).map((version) => ({
       version,
       bytes: treeBytes(path.join(this.versionsRoot, version)),
     }));
+
+    // Completion order: durable sequences, checked against the order record.
+    // Missing, duplicated or contradictory order evidence keeps everything.
+    const markers = this.completionMarkers();
+    const order = this.completionOrder();
+    const sequences = markers.operations.flatMap((operation) => operation.sequence === null ? [] : [operation.sequence]);
+    const predates = new Set(order.state === "valid" ? order.record.legacyOperations : []);
+    let proven = new Set(sequences).size === sequences.length;
+    if (order.state === "invalid" || (order.state === "absent" && sequences.length > 0)) proven = false;
+    if (order.state === "valid") {
+      if (sequences.some((sequence) => sequence > order.record.lastSequence)) proven = false;
+      // A pre-sequencing receipt that appeared after sequencing began (an
+      // older collector ran an update later) has no provable place.
+      if (markers.operations.some((operation) => operation.sequence === null && !predates.has(operation.id))) proven = false;
+    }
+    const known = new Set(markers.operations.map((operation) => operation.id));
+    const markerIds = new Set(markers.ids);
+    const legacyChain = markers.invalid.length === 0 &&
+      snapshots.every((snapshot) => known.has(snapshot.id) ||
+        (journal !== null && (snapshot.id === journal.snapshotId || snapshot.id === journal.operationId))) &&
+      [...predates].every((id) => markerIds.has(id));
+    if (!proven) blockedReason ??= "completion_order_unproven";
+    const operations = markers.operations.map((operation) => ({ ...operation, predatesSequence: predates.has(operation.id) }));
     return {
-      input: { installedVersion, pinnedVersions: this.pinnedVersions(), journal, snapshots, versions },
+      input: {
+        installedVersion, pinnedVersions: this.pinnedVersions(), journal, operations,
+        order: { proven, legacyChain }, snapshots, versions,
+      },
       blockedReason,
       createdAt,
     };

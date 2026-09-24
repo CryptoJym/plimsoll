@@ -629,15 +629,22 @@ async function main() {
     // An update to 0.7.37 followed by three same-version re-pins: the two
     // newest snapshots both restore 0.7.37 itself, so the update's snapshot,
     // the only one that restores 0.7.36, must be kept too.
-    const repin = (id: string, restoresVersion: string, completedAtMs: number) => ({
-      id, bytes: 1, createdAtMs: completedAtMs, metadataValid: true, restoresVersion, method: "clone" as const,
-      operation: { kind: "update", status: "completed", completedAtMs },
+    // r2 (B4): completion order is the durable sequence, not a timestamp.
+    const repin = (id: string, restoresVersion: string, sequence: number) => ({
+      snapshot: { id, bytes: 1, metadataValid: true, restoresVersion, method: "clone" as const },
+      operation: {
+        id, kind: "update" as const, status: "completed" as const, fromVersion: restoresVersion, toVersion: "0.7.37",
+        sequence, predatesSequence: false,
+      },
     });
+    const repins = [repin("upgrade", "0.7.36", 1), repin("repin-1", "0.7.37", 2), repin("repin-2", "0.7.37", 3), repin("repin-3", "0.7.37", 4)];
     const repinPlan = planLifecycleRetention({
       installedVersion: "0.7.37",
       pinnedVersions: [],
       journal: null,
-      snapshots: [repin("upgrade", "0.7.36", 1), repin("repin-1", "0.7.37", 2), repin("repin-2", "0.7.37", 3), repin("repin-3", "0.7.37", 4)],
+      operations: repins.map((row) => row.operation),
+      order: { proven: true, legacyChain: true },
+      snapshots: repins.map((row) => row.snapshot),
       versions: [{ version: "0.7.35", bytes: 1 }, { version: "0.7.36", bytes: 1 }, { version: "0.7.37", bytes: 1 }],
     }, 2);
     check("same_version_repins_never_prune_the_only_snapshot_that_restores_the_previous_runtime",

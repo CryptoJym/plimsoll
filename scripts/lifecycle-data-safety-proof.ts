@@ -54,6 +54,13 @@ const CASES = {
     "a_two_field_completion_marker_is_unknown_and_never_pruned",
     "markers_with_missing_extra_mismatched_or_contradictory_fields_are_unknown_and_kept",
   ],
+  b4: [
+    "completion_sequence_is_durable_and_increases_with_each_completion",
+    "backward_clock_step_never_prunes_the_newest_rollback_points",
+    "pre_sequencing_receipts_are_ordered_by_version_chain_not_file_times",
+    "ambiguous_pre_sequencing_order_keeps_every_snapshot",
+    "duplicated_completion_sequence_keeps_every_snapshot",
+  ],
 } as const;
 const EXPECTED_CHECKS = Object.values(CASES).reduce((total, names) => total + names.length, 0);
 const completion = createProofCompletion("lifecycle-data-safety", EXPECTED_CHECKS);
@@ -657,11 +664,103 @@ async function b3StrictCompletionReceipts() {
   });
 }
 
+// ---- B4: completion order survives clock steps ----------------------------
+
+/** Marker file times after a backward clock step: [oldest..newest] completions get these seconds. */
+function stepClockBackward(fixture: Home, ids: readonly string[], seconds: readonly number[]) {
+  ids.forEach((id, index) => {
+    const at = new Date(seconds[index]! * 1_000);
+    fs.utimesSync(markerPath(fixture, id), at, at);
+  });
+}
+
+/** Rewrites markers as 0.7.37 and earlier wrote them: the 13 receipt fields, no order record. */
+function asPreSequencingMarkers(fixture: Home, ids: readonly string[]) {
+  const legacyKeys = ["schemaVersion", "toolVersion", "operationId", "operation", "status", "fromVersion", "toVersion",
+    "restoredVersion", "health", "ownedTargets", "retainedTargets", "purgeOnlyTargets", "preserved"];
+  for (const id of ids) {
+    const marker = readMarker(fixture, id);
+    writeMarker(fixture, id, Object.fromEntries(legacyKeys.map((key) => [key, marker[key]])));
+  }
+  fs.rmSync(path.join(fixture.lifecycleRoot, "completion-order.json"), { force: true });
+}
+
+async function pruneDecisions(fixture: Home, operationId: string, keep: number) {
+  const preview = await fixture.manager().listSnapshots({ keep });
+  const applied = await fixture.manager().pruneSnapshots({ operationId, keep, apply: true });
+  return {
+    decisions: Object.fromEntries(preview.snapshots.map((row) => [row.id, `${row.retention}:${row.reason}`])),
+    removed: applied.retention.removed.filter((item) => item.kind === "snapshot").map((item) => item.name),
+    remains: fixture.snapshots(),
+  };
+}
+
+async function b4OrderSurvivesClockSteps() {
+  await runCase([CASES.b4[0], CASES.b4[1]], async (record) => {
+    const fixture = createHome("b4-clock-step");
+    const ids = ["k1", "k2", "k3", "k4"];
+    await updatesWithoutRetention(fixture, ids.map((id, index) => [id, `1.1.${index}`] as const));
+    const sequences = ids.map((id) => readMarker(fixture, id).completionSequence);
+    const order = exists(path.join(fixture.lifecycleRoot, "completion-order.json"))
+      ? JSON.parse(fs.readFileSync(path.join(fixture.lifecycleRoot, "completion-order.json"), "utf8")) as { lastSequence?: unknown }
+      : null;
+    record(CASES.b4[0],
+      JSON.stringify(sequences) === JSON.stringify([1, 2, 3, 4]) && order?.lastSequence === 4 &&
+        fixture.receipt("k4")?.completionSequence === 4,
+      { sequences, order });
+    // The clock stepped back between completions: k1 and k2 look newest by file time.
+    stepClockBackward(fixture, ids, [400, 300, 100, 200]);
+    const result = await pruneDecisions(fixture, "b4-clock-prune", 2);
+    record(CASES.b4[1],
+      result.decisions.k4 === "keep:newest_completed" && result.decisions.k3 === "keep:newest_completed" &&
+        same(result.removed, ["k1", "k2"]) && same(result.remains, ["k3", "k4"]),
+      result);
+  });
+  await runCase([CASES.b4[2]], async (record) => {
+    const fixture = createHome("b4-legacy-chain");
+    const ids = ["l1", "l2", "l3", "l4"];
+    await updatesWithoutRetention(fixture, ids.map((id, index) => [id, `2.0.${index + 1}`] as const));
+    asPreSequencingMarkers(fixture, ids);
+    stepClockBackward(fixture, ids, [400, 300, 100, 200]);
+    const result = await pruneDecisions(fixture, "b4-legacy-prune", 2);
+    record(CASES.b4[2],
+      result.decisions.l4 === "keep:newest_completed" && result.decisions.l3 === "keep:newest_completed" &&
+        same(result.removed, ["l1", "l2"]) && same(result.remains, ["l3", "l4"]),
+      result);
+  });
+  await runCase([CASES.b4[3]], async (record) => {
+    const fixture = createHome("b4-legacy-ambiguous");
+    const ids = ["r1", "r2", "r3", "r4"];
+    // A fresh install and three same-version re-pins: no version chain can order them.
+    await updatesWithoutRetention(fixture, ids.map((id) => [id, "3.0.0"] as const));
+    asPreSequencingMarkers(fixture, ids);
+    stepClockBackward(fixture, ids, [400, 300, 100, 200]);
+    const result = await pruneDecisions(fixture, "b4-ambiguous-prune", 2);
+    record(CASES.b4[3],
+      result.removed.length === 0 && same(result.remains, ids) &&
+        ids.every((id) => result.decisions[id] === "keep:completion_order_unproven"),
+      result);
+  });
+  await runCase([CASES.b4[4]], async (record) => {
+    const fixture = createHome("b4-duplicate-sequence");
+    const ids = ["d1", "d2", "d3"];
+    await updatesWithoutRetention(fixture, ids.map((id, index) => [id, `4.0.${index}`] as const));
+    writeMarker(fixture, "d2", { ...readMarker(fixture, "d2"), completionSequence: readMarker(fixture, "d3").completionSequence ?? 3 });
+    stepClockBackward(fixture, ids, [100, 200, 300]);
+    const result = await pruneDecisions(fixture, "b4-duplicate-prune", 2);
+    record(CASES.b4[4],
+      result.removed.length === 0 && same(result.remains, ids) &&
+        ids.every((id) => result.decisions[id] === "keep:completion_order_unproven"),
+      result);
+  });
+}
+
 async function main() {
   try {
     await b1NoSplitBrainRollback();
     await b2RestoreIsAtomicAndCapacityChecked();
     await b3StrictCompletionReceipts();
+    await b4OrderSurvivesClockSteps();
     const failed = results.filter((row) => !row.passed).map((row) => row.name);
     console.log(JSON.stringify({ proof: "lifecycle-data-safety", checks: results.length, passed: results.length - failed.length, failed, liveStateTouched: false }));
   } finally {

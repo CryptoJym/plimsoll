@@ -174,7 +174,7 @@ export type LifecycleRemovedItem = {
 export type LifecycleRetentionRecord = {
   keepSnapshots: number;
   status: "applied" | "preview" | "skipped";
-  skippedReason: "lifecycle_state_unreadable" | "journal_unreadable" | "retention_failed" | null;
+  skippedReason: "lifecycle_state_unreadable" | "journal_unreadable" | "completion_order_unproven" | "retention_failed" | null;
   removed: LifecycleRemovedItem[];
   removedBytes: number;
   /** Removals an interrupted earlier retention left in the trash, finished now. */
@@ -189,6 +189,7 @@ export type LifecycleSnapshotRetentionReason =
   | "restores_previous_version"
   | "unfinished_operation"
   | "operation_unknown"
+  | "completion_order_unproven"
   | "older_completed"
   | "rolled_back_operation"
   | "incomplete_snapshot";
@@ -203,19 +204,38 @@ export type LifecycleVersionRetentionReason =
 export type LifecycleRetentionSnapshot = {
   id: string;
   bytes: number;
-  createdAtMs: number | null;
   metadataValid: boolean;
   /** Version the snapshot restores (the one installed before its operation). */
   restoresVersion: string | null;
   method: LifecycleSnapshotMethod | null;
-  /** Terminal receipt of the operation that took it; null when absent or unreadable. */
-  operation: { kind: string; status: string; completedAtMs: number } | null;
+};
+
+/** A completed update/rollback with its durable completion order. */
+export type LifecycleOrderedOperation = LifecycleCompletedOperation & {
+  /** A pre-sequencing receipt recorded as existing when sequencing began: older than every sequenced one. */
+  predatesSequence: boolean;
 };
 
 export type LifecycleRetentionInput = {
   installedVersion: string | null;
   pinnedVersions: readonly { version: string; reason: "current" | "service_manifest" }[];
   journal: Pick<LifecycleJournal, "operationId" | "snapshotId" | "fromVersion" | "toVersion" | "phase"> | null;
+  /**
+   * Every update/rollback whose completion receipt is valid, including those
+   * whose snapshot is already gone. A snapshot with no entry here belongs to
+   * an unknown operation.
+   */
+  operations: readonly LifecycleOrderedOperation[];
+  order: {
+    /** False when the durable order itself is missing, duplicated or contradictory: nothing is pruned. */
+    proven: boolean;
+    /**
+     * Pre-sequencing receipts may be ordered by their version chain only when
+     * every completed operation is visible: no unreadable receipt, no snapshot
+     * without one, and none recorded at sequencing that has since vanished.
+     */
+    legacyChain: boolean;
+  };
   snapshots: readonly LifecycleRetentionSnapshot[];
   versions: readonly { version: string; bytes: number }[];
 };
@@ -229,7 +249,7 @@ export type LifecycleSnapshotInventory = {
   keepSnapshots: number;
   installedVersion: string | null;
   /** Set when retention would refuse to remove anything. */
-  blockedReason: "lifecycle_state_unreadable" | "journal_unreadable" | null;
+  blockedReason: "lifecycle_state_unreadable" | "journal_unreadable" | "completion_order_unproven" | null;
   snapshots: Array<{
     id: string;
     createdAt: string | null;
@@ -270,6 +290,12 @@ export type LifecycleReceipt = {
   retention?: LifecycleRetentionRecord;
   /** Refused update/rollback: why nothing was changed. */
   refusal?: LifecycleRefusal;
+  /**
+   * Completed or rolled-back update/rollback: its place in the durable,
+   * monotonic completion order (assigned under the mutation lease). Retention
+   * orders snapshots by it, never by file times.
+   */
+  completionSequence?: number;
   /** Rolled-back update/rollback: how the ledger was restored. */
   restore?: LifecycleRestoreRecord;
   /** Rollback still required: why the restore left the live ledger untouched. */
@@ -326,6 +352,13 @@ export type LifecycleAdapter = {
   supportSnapshot(): Promise<LifecycleSupportSnapshot>;
   /** Durable record of how a snapshot was taken, read back from its metadata. */
   snapshotRecord?(snapshotId: string): Promise<LifecycleSnapshotRecord | null>;
+  /**
+   * Durably reserves the next completion sequence for a completing update or
+   * rollback, under its mutation lease. Null when the durable order record is
+   * unusable; the receipt then carries no sequence and retention keeps
+   * everything until the order is repaired.
+   */
+  assignCompletionSequence?(operationId: string): Promise<number | null>;
   /** Read-only: the snapshot the next update will take and the free space it needs. */
   planSnapshot?(): Promise<LifecycleSnapshotPlan>;
   /** Read-only: every snapshot and runtime version with its retention decision. */
@@ -400,21 +433,56 @@ function assertRetainedSnapshotCount(keep: number) {
 }
 
 /**
+ * Newest-first completion order that clocks cannot affect. Sequenced
+ * receipts are ordered by their durable sequence. Receipts written before
+ * sequencing are all older than every sequenced one; among themselves they
+ * are ordered only by their version chain: the latest completed operation
+ * installed the version the next one started from (the installed version,
+ * or the unfinished operation's starting version, when none is sequenced),
+ * and each earlier step is the one operation whose toVersion is the
+ * fromVersion of the step after it. The chain stops at the first step that
+ * is missing or ambiguous (re-pins, rollbacks to a repeated version, a fresh
+ * install). Every completed operation off the list is provably older than
+ * every operation on it.
+ */
+function provenCompletionOrder(input: LifecycleRetentionInput) {
+  const completed = input.operations.filter((operation) => operation.status === "completed");
+  const sequenced = completed.filter((operation) => operation.sequence !== null)
+    .sort((left, right) => right.sequence! - left.sequence!);
+  const ordered: LifecycleOrderedOperation[] = [...sequenced];
+  if (input.order.legacyChain) {
+    const legacy = completed.filter((operation) => operation.sequence === null);
+    let anchor = sequenced.length > 0
+      ? sequenced[sequenced.length - 1]!.fromVersion
+      : input.journal ? input.journal.fromVersion : input.installedVersion;
+    while (anchor !== null) {
+      const step = legacy.filter((operation) => operation.toVersion === anchor && !ordered.includes(operation));
+      if (step.length !== 1) break;
+      ordered.push(step[0]!);
+      anchor = step[0]!.fromVersion;
+    }
+  }
+  return ordered;
+}
+
+/**
  * Pure retention policy. Keeps the `keep` newest completed update/rollback
  * snapshots plus the newest one that restores a version other than the
- * installed one, and everything an unfinished or unknown operation owns.
- * Snapshots of finished operations beyond that (older completed ones, failed
- * updates whose automatic rollback already restored them, incomplete copies)
- * are removable. Runtime versions are kept when installed, pinned by the
- * current pointer or service manifest, owned by the journal, or restored by a
- * kept snapshot.
+ * installed one, and everything an unfinished or unknown operation owns. A
+ * completed snapshot is removed only when `keep` kept snapshots are provably
+ * newer; when the durable completion order cannot be proved, nothing is.
+ * Snapshots of updates whose automatic rollback already restored them are
+ * removable. Runtime versions are kept when installed, pinned by the current
+ * pointer or service manifest, owned by the journal, or restored by a kept
+ * snapshot.
  */
 export function planLifecycleRetention(input: LifecycleRetentionInput, keep: number): LifecycleRetentionPlan {
   assertRetainedSnapshotCount(keep);
   type Decision = { keep: boolean; reason: LifecycleSnapshotRetentionReason; state: LifecycleSnapshotState };
   const decisions = new Map<string, Decision>();
-  const completed: Array<LifecycleRetentionSnapshot & { operation: { completedAtMs: number } }> = [];
   const journal = input.journal;
+  const operations = new Map(input.operations.map((operation) => [operation.id, operation]));
+  const completed: LifecycleRetentionSnapshot[] = [];
   for (const snapshot of input.snapshots) {
     if (journal && (snapshot.id === journal.snapshotId || snapshot.id === journal.operationId)) {
       decisions.set(snapshot.id, {
@@ -426,32 +494,52 @@ export function planLifecycleRetention(input: LifecycleRetentionInput, keep: num
       });
       continue;
     }
-    const operation = snapshot.operation;
-    const finished = operation !== null &&
-      (operation.kind === "update" || operation.kind === "rollback") &&
-      (operation.status === "completed" || operation.status === "rolled_back");
-    if (!finished) {
+    const operation = operations.get(snapshot.id);
+    if (!operation) {
       decisions.set(snapshot.id, { keep: true, reason: "operation_unknown", state: "unknown" });
-    } else if (!snapshot.metadataValid) {
-      decisions.set(snapshot.id, { keep: false, reason: "incomplete_snapshot", state: operation.status as LifecycleSnapshotState });
+    } else if (!input.order.proven) {
+      decisions.set(snapshot.id, { keep: true, reason: "completion_order_unproven", state: operation.status });
     } else if (operation.status === "rolled_back") {
       decisions.set(snapshot.id, { keep: false, reason: "rolled_back_operation", state: "rolled_back" });
     } else {
-      completed.push(snapshot as LifecycleRetentionSnapshot & { operation: { completedAtMs: number } });
+      completed.push(snapshot);
     }
   }
-  completed.sort((left, right) =>
-    right.operation.completedAtMs - left.operation.completedAtMs ||
-    (right.createdAtMs ?? 0) - (left.createdAtMs ?? 0) ||
-    right.id.localeCompare(left.id));
-  completed.forEach((snapshot, index) => decisions.set(snapshot.id, {
-    keep: index < keep,
-    reason: index < keep ? "newest_completed" : "older_completed",
-    state: "completed",
-  }));
-  const rollbackPoint = completed.find((snapshot) => snapshot.restoresVersion !== input.installedVersion);
-  if (rollbackPoint && !decisions.get(rollbackPoint.id)!.keep) {
-    decisions.set(rollbackPoint.id, { keep: true, reason: "restores_previous_version", state: "completed" });
+  if (completed.length > 0) {
+    const byId = new Map(completed.map((snapshot) => [snapshot.id, snapshot]));
+    const ordered = provenCompletionOrder(input).flatMap((operation) => byId.get(operation.id) ?? []);
+    ordered.forEach((snapshot, index) => decisions.set(snapshot.id, {
+      keep: index < keep,
+      reason: index < keep ? "newest_completed" : snapshot.metadataValid ? "older_completed" : "incomplete_snapshot",
+      state: "completed",
+    }));
+    // Everything off the proven order is older than all of it, so it may go
+    // only once `keep` snapshots on the order are kept.
+    const unordered = completed.filter((snapshot) => !decisions.has(snapshot.id));
+    const olderThanKept = ordered.length >= keep;
+    for (const snapshot of unordered) {
+      const operation = operations.get(snapshot.id)!;
+      const provablyOlder = olderThanKept && (operation.sequence === null &&
+        (operation.predatesSequence || !input.operations.some((candidate) => candidate.sequence !== null)));
+      decisions.set(snapshot.id, provablyOlder
+        ? { keep: false, reason: snapshot.metadataValid ? "older_completed" : "incomplete_snapshot", state: "completed" }
+        : { keep: true, reason: "completion_order_unproven", state: "completed" });
+    }
+    const restoresOther = (snapshot: LifecycleRetentionSnapshot) =>
+      snapshot.metadataValid && snapshot.restoresVersion !== input.installedVersion;
+    const rollbackPoint = ordered.find(restoresOther);
+    if (rollbackPoint) {
+      if (!decisions.get(rollbackPoint.id)!.keep) {
+        decisions.set(rollbackPoint.id, { keep: true, reason: "restores_previous_version", state: "completed" });
+      }
+    } else {
+      // The newest way back is somewhere among the unordered: keep them all.
+      for (const snapshot of unordered.filter(restoresOther)) {
+        if (!decisions.get(snapshot.id)!.keep) {
+          decisions.set(snapshot.id, { keep: true, reason: "restores_previous_version", state: "completed" });
+        }
+      }
+    }
   }
 
   const snapshots = input.snapshots.map((snapshot) => ({ id: snapshot.id, ...decisions.get(snapshot.id)! }));
@@ -579,6 +667,8 @@ export type LifecycleCompletedOperation = {
   status: "completed" | "rolled_back";
   fromVersion: string | null;
   toVersion: string;
+  /** Durable completion sequence; null for a receipt written before sequencing (0.7.37 and earlier). */
+  sequence: number | null;
 };
 
 const PRESERVED = ["ledger", "history", "credentials", "workspace_membership"] as const;
@@ -591,7 +681,9 @@ const RECEIPT_KEYS = [
 const CLONE_FALLBACK_VALUES: readonly (LifecycleCloneFallback | null)[] = [
   null, "ledger_in_use", "ledger_not_wal", "wal_not_empty", "quiescence_unproven", "clone_unsupported",
 ];
-const RETENTION_SKIPPED_REASONS = ["lifecycle_state_unreadable", "journal_unreadable", "retention_failed"];
+const RETENTION_SKIPPED_REASONS = [
+  "lifecycle_state_unreadable", "journal_unreadable", "completion_order_unproven", "retention_failed",
+];
 const MAX_RECEIPT_LIST = 100_000;
 
 function exactKeys(record: Record<string, unknown>, required: readonly string[], optional: readonly string[] = []) {
@@ -677,7 +769,7 @@ function validCompletedHealth(value: unknown, toVersion: string) {
  */
 export function parseCompletionReceipt(value: unknown, operationId: string): LifecycleCompletedOperation | null {
   const record = ownPlainRecord(value);
-  if (!record || !exactKeys(record, RECEIPT_KEYS, ["snapshot", "retention", "restore"])) return null;
+  if (!record || !exactKeys(record, RECEIPT_KEYS, ["snapshot", "retention", "restore", "completionSequence"])) return null;
   const { operation, status, fromVersion, toVersion } = record;
   if (record.schemaVersion !== LIFECYCLE_SCHEMA_VERSION || record.operationId !== operationId) return null;
   if (typeof record.toolVersion !== "string" || !/^[0-9A-Za-z][0-9A-Za-z.+-]{0,63}$/.test(record.toolVersion)) return null;
@@ -686,6 +778,11 @@ export function parseCompletionReceipt(value: unknown, operationId: string): Lif
   if (!sameList(record.retainedTargets, LIFECYCLE_UNINSTALL_RETAINED_TARGETS) ||
       !sameList(record.purgeOnlyTargets, LIFECYCLE_PURGE_ONLY_TARGETS) || !sameList(record.preserved, PRESERVED)) return null;
   if ("snapshot" in record && !validSnapshotRecord(record.snapshot)) return null;
+  // Receipts that record a snapshot, retention or restore were written after
+  // sequencing began, so each must carry its durable completion sequence.
+  const sequence = record.completionSequence;
+  if (sequence !== undefined && !(nonnegativeInteger(sequence) && sequence > 0)) return null;
+  if (sequence === undefined && ("snapshot" in record || "retention" in record || "restore" in record)) return null;
   if (status === "completed") {
     if (record.restoredVersion !== null || !validCompletedHealth(record.health, toVersion)) return null;
     if (!sameList(record.ownedTargets, COMPLETED_OWNED_TARGETS) || "restore" in record) return null;
@@ -695,7 +792,7 @@ export function parseCompletionReceipt(value: unknown, operationId: string): Lif
     if (!sameList(record.ownedTargets, ROLLED_BACK_OWNED_TARGETS) || "retention" in record) return null;
     if ("restore" in record && !validRestoreRecord(record.restore)) return null;
   }
-  return { id: operationId, kind: operation, status, fromVersion, toVersion };
+  return { id: operationId, kind: operation, status, fromVersion, toVersion, sequence: sequence ?? null };
 }
 
 function assertReadiness(readiness: LifecycleReadiness, version: string) {
@@ -763,6 +860,14 @@ export class LifecycleManager {
     return record ? { snapshot: record } : {};
   }
 
+  /** The completing operation's place in the durable completion order. */
+  private async completionSequence(operationId: string) {
+    if (!this.adapter.assignCompletionSequence) return {};
+    await this.fence(operationId);
+    const completionSequence = await this.adapter.assignCompletionSequence(operationId);
+    return completionSequence === null ? {} : { completionSequence };
+  }
+
   private async rollbackReceipt(
     journal: LifecycleJournal,
     status: "rolled_back" | "rollback_required",
@@ -783,6 +888,7 @@ export class LifecycleManager {
       purgeOnlyTargets: LIFECYCLE_PURGE_ONLY_TARGETS,
       preserved: ["ledger", "history", "credentials", "workspace_membership"],
       ...await this.snapshotRecord(journal.snapshotId),
+      ...status === "rolled_back" ? await this.completionSequence(journal.operationId) : {},
       ...outcome,
     };
   }
@@ -957,6 +1063,7 @@ export class LifecycleManager {
         purgeOnlyTargets: LIFECYCLE_PURGE_ONLY_TARGETS,
         preserved: ["ledger", "history", "credentials", "workspace_membership"],
         ...await this.snapshotRecord(journal.snapshotId),
+        ...await this.completionSequence(operationId),
       };
       await this.adapter.persistReceipt(receipt);
       await this.adapter.clearJournal(operationId);

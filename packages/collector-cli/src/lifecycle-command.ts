@@ -136,7 +136,10 @@ export function formatSnapshotInventory(inventory: LifecycleSnapshotInventory) {
       "the next prune --apply or completed update finishes it.");
   }
   lines.push("");
-  if (inventory.blockedReason) {
+  if (inventory.blockedReason === "completion_order_unproven") {
+    lines.push("Retention is blocked (completion_order_unproven): the order in which these operations completed " +
+      "cannot be proved, so nothing will be removed.");
+  } else if (inventory.blockedReason) {
     lines.push(`Retention is blocked (${inventory.blockedReason}); nothing will be removed until lifecycle recovery.`);
   } else {
     const prunable = [...inventory.snapshots, ...inventory.versions].filter((row) => row.retention === "prune").length;
