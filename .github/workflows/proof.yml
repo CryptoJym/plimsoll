@@ -47,8 +47,8 @@ jobs:
           } >> "$GITHUB_ENV"
 
       - name: Prove every proof script runs in CI or is reviewed local-only (eco-6hoxj.163.23)
-        # Run with node, not pnpm, so no pnpm setting can turn the gate itself into a no-op.
-        run: node ./node_modules/tsx/dist/cli.mjs ./scripts/ci-coverage-proof.ts
+        # Run through the isolated proof wrapper, not pnpm, so pnpm config cannot skip the gate.
+        run: ./node_modules/.bin/tsx scripts/run-proof.ts scripts/ci-coverage-proof.ts
 
       - name: Typecheck
         id: typecheck

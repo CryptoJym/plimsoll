@@ -37,9 +37,10 @@
  *   local-only proof really needs the input it declares;
  * - GitHub settings: repository variables, rulesets and required checks.
  *
- * CI runs it with node (`node ./node_modules/tsx/dist/cli.mjs
- * ./scripts/ci-coverage-proof.ts`), not pnpm, so no pnpm setting can turn the
- * gate itself into a no-op. Locally: pnpm proof:ci-coverage [--audit-only]
+ * CI runs it through `./node_modules/.bin/tsx scripts/run-proof.ts
+ * scripts/ci-coverage-proof.ts`, not pnpm, so no pnpm setting can turn the
+ * gate itself into a no-op.
+ * Locally: pnpm proof:ci-coverage [--audit-only]
  * [--root DIR] [--today YYYY-MM-DD]
  *   --root audits another checkout (self-tests are skipped); --today checks
  *   quarantine expiry against another date. These options are local-only: the
@@ -48,6 +49,7 @@
 import path from "node:path";
 
 import { FIXTURES, fixtureHolds } from "./lib/ci-coverage-fixtures";
+import { createProofCompletion } from "./lib/proof-completion";
 import {
   PROOF_EXCEPTIONS,
   WORKFLOW_DIRECTORY,
@@ -61,6 +63,7 @@ const repoRoot = path.resolve(path.dirname(new URL(import.meta.url).pathname), "
 const rootFlag = process.argv.indexOf("--root");
 const auditRoot = rootFlag === -1 ? repoRoot : path.resolve(process.argv[rootFlag + 1] ?? "");
 const selfTests = rootFlag === -1 && !process.argv.includes("--audit-only");
+const completion = createProofCompletion("ci-coverage", selfTests ? FIXTURES.length + 2 : 2);
 const todayFlag = process.argv.indexOf("--today");
 const input = readCoverageInput(auditRoot, todayFlag === -1 ? undefined : process.argv[todayFlag + 1]);
 const report = proofCiCoverage(input);
@@ -105,6 +108,7 @@ if (selfTests) {
 
 const count = (status: string) => report.units.filter((unit) => unit.status === status).length;
 const failed = checks.filter((check) => !check.passed);
+for (const result of checks) completion.check(result.name, result.passed);
 console.log(
   JSON.stringify(
     {
@@ -137,3 +141,4 @@ if (failed.length > 0) {
   if (lines.length > 0) console.error(lines.map((line) => `  - ${line}`).join("\n"));
   process.exitCode = 1;
 }
+completion.complete();

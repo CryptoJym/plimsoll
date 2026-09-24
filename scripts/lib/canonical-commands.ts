@@ -22,7 +22,7 @@
  *
  * A workflow `run:` line (GitHub runs the step with bash and errexit) is
  * canonical when it is exactly one of:
- *   [NAME=value ...] pnpm|node <args> [> file | >> file]
+ *   [NAME=value ...] pnpm|node|tsx|./node_modules/.bin/tsx <args> [> file | >> file]
  *   export NAME=value
  * Args are plain words; values may also be "$VAR" or "$(mktemp -d <template>)".
  * The inert GitHub expressions allowed as arguments are the head commit SHA,
@@ -63,8 +63,9 @@ export function isRepoFile(word: string) {
 /** The file one runner command executes, or why its words are not a canonical runner invocation. */
 export function runnerInvocation(words: string[]): RunnerInvocation | Problem {
   const [head, ...rest] = words;
+  const runner = head === "./node_modules/.bin/tsx" ? "tsx" : head;
   let fileAt = 0;
-  if (head === "node") {
+  if (runner === "node") {
     if (rest[0] !== undefined && normalizeFile(rest[0]) === TSX_CLI) {
       fileAt = 1;
     } else {
@@ -81,7 +82,7 @@ export function runnerInvocation(words: string[]): RunnerInvocation | Problem {
       }
       if (!loadsTsx) return { problem: "node must load tsx (`--import tsx`) or run ./node_modules/tsx/dist/cli.mjs" };
     }
-  } else if (head !== "tsx") {
+  } else if (runner !== "tsx") {
     return { problem: `\`${head ?? ""}\` is not an allowed runner (tsx, node or a pure \`pnpm <script>\` alias)` };
   }
   const file = rest[fileAt];
@@ -230,8 +231,8 @@ export function workflowLineForm(line: string): WorkflowLine | Problem {
   }
   if (words.some((word) => "redirect" in word)) return { problem: "the only redirection allowed is a final `> file` or `>> file`" };
   const [command, ...args] = words as Array<Extract<LineWord, { text: string }>>;
-  if (!command || !only(command, ["literal"]) || (command.text !== "pnpm" && command.text !== "node")) {
-    return { problem: `\`${command?.text ?? ""}\` is not an allowed command (pnpm or node)` };
+  if (!command || !only(command, ["literal"]) || !["pnpm", "node", "tsx", "./node_modules/.bin/tsx"].includes(command.text)) {
+    return { problem: `\`${command?.text ?? ""}\` is not an allowed command (pnpm, node or tsx)` };
   }
   const bad = args.find((arg) => !only(arg, ["literal", "sha", "inert"]));
   if (bad) return { problem: `argument \`${bad.text}\` must be a plain word or an inert GitHub expression` };
