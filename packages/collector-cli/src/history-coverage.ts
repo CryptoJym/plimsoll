@@ -1,5 +1,6 @@
 import type Database from "better-sqlite3";
 
+import { recordCompleteCapturePass } from "./capture-frontier";
 import type { RolloutScanResult } from "./rollout-tailer";
 import type { TranscriptScanResult } from "./transcript-tailer";
 
@@ -655,6 +656,8 @@ export function recordExplicitFullHistoryCoverage(
       .run(coverageKey(source), JSON.stringify(marker), attemptedAt);
     recordFinanceFullHistoryAttempt(database, source, attemptedAt, successful);
     if (successful) {
+      // eco-6hoxj.163.18: an exhaustive explicit scan is a complete capture pass.
+      recordCompleteCapturePass(database, source, attemptedAt);
       // Keep every exclusion, but acknowledge all same-generation bytes the
       // successful full scan observed. The table may not exist on ledgers that
       // predate automatic baselining.

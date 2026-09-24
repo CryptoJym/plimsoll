@@ -14,6 +14,7 @@ import {
 } from "./privacy-disposition";
 import { ensureUuidEventId, normalizeHistoryEvent } from "./upload-history";
 import { applyProjectAttribution, readSessionRepoContexts } from "./session-attribution";
+import { captureFrontier } from "./capture-frontier";
 
 export const DEFAULT_DELIVERY_LIMITS = {
   maxActiveRows: 50_000,
@@ -190,6 +191,23 @@ export type DeliveryLease = {
   items: LeasedDeliveryItem[];
   locallyDead: number;
   blockedBy: DeliveryCircuit | "none";
+};
+
+/**
+ * Capture watermark v1 (eco-6hoxj.163.18): what one upload request attests.
+ * The cloud contract is docs/capture-watermark-v1.md in the cloud repository.
+ */
+export type DeliveryCaptureClaim = {
+  v: 1;
+  epoch: string;
+  epochStartedAt: string;
+  /** Strictly increasing per ledger; one value per request. */
+  cursor: number;
+  /** Every event of the epoch observed before this is acknowledged or in this request; null: not attested. */
+  through: string | null;
+  pending: number;
+  dead: number;
+  gapSince: string | null;
 };
 
 export type DeliveryValidationWitness = {
@@ -430,6 +448,95 @@ export class DeliveryOutbox {
     return this.enabled;
   }
 
+  /**
+   * Capture watermark v1 (eco-6hoxj.163.18). The claim for ONE request whose
+   * delivery ids are `requestDeliveryIds`, computed in one write transaction
+   * right before it is sent:
+   *
+   * - `through` is at most the start of the latest complete capture pass of
+   *   both tailed sources (capture-frontier.ts), and strictly before the
+   *   observed time of every delivery appended in this epoch that is neither
+   *   acknowledged nor in this request — still queued, or dead. Null when the
+   *   capture frontier is unknown or the legacy migration has not enqueued
+   *   every ledger row yet.
+   * - `dead`/`gapSince` name the epoch's deliveries that will never arrive.
+   *   A dead delivery whose ledger row is gone is dated to the epoch start.
+   * - `cursor` increments once per claim, so the cloud can drop a slower,
+   *   older request that commits after a newer one.
+   *
+   * Scoped to rows appended since the epoch started (append times, which the
+   * ledger stamps itself): earlier rows belong to the previous epoch's claims.
+   */
+  captureClaim(requestDeliveryIds: string[], now = this.clock()): DeliveryCaptureClaim | null {
+    if (!this.enabled || !this.workspaceId) return null;
+    const run = this.db.transaction(() => {
+      const frontier = captureFrontier(this.db);
+      if (!frontier || frontier.workspaceId !== this.workspaceId) return null;
+      const epochStartedAt = frontier.epochStartedAt;
+      const control = this.db
+        .prepare(`select migration_complete as migrationComplete from upload_control where singleton = 1`)
+        .get() as { migrationComplete: number };
+      // Earliest observed time per set, in SQL (the outbox may hold millions of
+      // rows). An unreadable observed time dates its delivery to the epoch start.
+      const epochStartSeconds = Date.parse(epochStartedAt) / 1000;
+      const pending = this.db
+        .prepare(
+          `select count(*) as count,
+             min(coalesce(unixepoch(json_extract(base_envelope_json, '$.event.observedAt'), 'subsec'),
+               @epochStartSeconds)) as earliestSeconds
+           from upload_outbox
+           where workspace_id is @workspaceId and device_id is @deviceId
+             and created_at >= @epochStartedAt
+             and delivery_id not in (select value from json_each(@requestIds))`,
+        )
+        .get({
+          workspaceId: this.workspaceId,
+          deviceId: this.deviceId,
+          epochStartedAt,
+          epochStartSeconds,
+          requestIds: JSON.stringify(requestDeliveryIds),
+        }) as { count: number; earliestSeconds: number | null };
+      const dead = this.db
+        .prepare(
+          `select count(*) as count,
+             min(coalesce(unixepoch(b.observed_at, 'subsec'), @epochStartSeconds)) as earliestSeconds
+           from upload_receipts r left join buffered_events b on b.id = r.delivery_id
+           where r.terminal_state = 'dead' and r.created_at >= @epochStartedAt`,
+        )
+        .get({ epochStartedAt, epochStartSeconds }) as { count: number; earliestSeconds: number | null };
+      // Floor to the millisecond: rounding can only move the bound earlier.
+      const toMs = (seconds: number | null) => (seconds === null ? null : Math.floor(seconds * 1000));
+      const pendingMs = toMs(pending.earliestSeconds);
+      const deadMs = toMs(dead.earliestSeconds);
+      let throughMs = frontier.capturedThrough === null || control.migrationComplete !== 1
+        ? null
+        : Date.parse(frontier.capturedThrough);
+      for (const bound of [pendingMs, deadMs]) {
+        if (throughMs !== null && bound !== null) throughMs = Math.min(throughMs, bound);
+      }
+      this.db
+        .prepare(
+          `update upload_control set capture_claim_sequence = capture_claim_sequence + 1,
+             updated_at = @now where singleton = 1`,
+        )
+        .run({ now: now.toISOString() });
+      const cursor = (this.db
+        .prepare(`select capture_claim_sequence as cursor from upload_control where singleton = 1`)
+        .get() as { cursor: number }).cursor;
+      return {
+        v: 1 as const,
+        epoch: frontier.installationEpochId,
+        epochStartedAt,
+        cursor,
+        through: throughMs === null ? null : new Date(throughMs).toISOString(),
+        pending: pending.count,
+        dead: dead.count,
+        gapSince: deadMs === null ? null : new Date(deadMs).toISOString(),
+      };
+    });
+    return run.immediate();
+  }
+
   isEvidenceQuarantined(rawId: string) {
     return Boolean(
       this.db
@@ -626,6 +733,12 @@ export class DeliveryOutbox {
       this.db.exec(
         `alter table upload_control
          add column privacy_migration_version integer not null default 0`,
+      );
+    }
+    if (!controlColumns.some((column) => column.name === "capture_claim_sequence")) {
+      this.db.exec(
+        `alter table upload_control
+         add column capture_claim_sequence integer not null default 0`,
       );
     }
     if (!controlColumns.some((column) => column.name === "active_remote_rejected")) {
