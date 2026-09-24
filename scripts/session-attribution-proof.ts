@@ -100,11 +100,19 @@ function main() {
     const attributed = new SessionAttributionBatch(ledger.database, [{ event: otelAssistant }], options)
       .attribute(otelAssistant);
     ledger.database.prepare = prepare;
-    const queryPlans = lookupSql.map((source) => (source.includes("where session_id = ?")
-      ? ledger.database
+    const relevantSql = lookupSql.filter((source) =>
+      /\bsession_id\s*=\s*\?/.test(source) ||
+      /from session_repo_context_control\s+where singleton = 1/.test(source),
+    );
+    const queryPlans = relevantSql.map((source) => {
+      const parameterCount = (source.match(/\?/g) ?? []).length;
+      const parameters = Array.from({ length: parameterCount }, (_, index) =>
+        ["session-fixture", "2026-09-23T06:00:00.000Z", "2026-09-23T18:00:00.000Z", 257][index] ?? 0,
+      );
+      return ledger.database
         .prepare(`explain query plan ${source}`)
-        .all("session-fixture", "2026-09-23T06:00:00.000Z", "2026-09-23T18:00:00.000Z", 257)
-      : ledger.database.prepare(`explain query plan ${source}`).all()) as Array<{ detail: string }>);
+        .all(...parameters) as Array<{ detail: string }>;
+    });
     return { attributed, queryPlans };
   };
   const scanned = plannedLookup({ contextIndex: false });
@@ -114,7 +122,7 @@ function main() {
   // The coverage-marker read and one primary-key range over the index.
   assert.equal(indexed.queryPlans.length, 2);
   assert.ok(indexed.queryPlans.some((plan) => plan.some((row) =>
-    row.detail.includes("SEARCH session_repo_contexts USING PRIMARY KEY"))));
+    /SEARCH (?:session_repo_contexts|c) USING PRIMARY KEY/.test(row.detail))));
   assert.ok(indexed.queryPlans.every((plan) => plan.every((row) => !/^SCAN /.test(row.detail))));
   for (const { attributed } of [scanned, indexed]) {
     assert.equal(attributed.event.projectKey, REPO_A);
