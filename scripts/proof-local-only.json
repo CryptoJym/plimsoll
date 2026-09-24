@@ -1,0 +1,28 @@
+{
+  "localOnly": {
+    "scripts/oversized-continuation-rollback-proof.ts": {
+      "owner": "eco-6hoxj.163.23",
+      "needs": [
+        "PLIMSOLL_OVERSIZED_LEGACY_SOURCE",
+        "PLIMSOLL_OVERSIZED_INPUT_MANIFEST"
+      ],
+      "reason": "Needs the sealed 411-file v0.7.4 source (PLIMSOLL_OVERSIZED_LEGACY_SOURCE) and its sha256 manifest (PLIMSOLL_OVERSIZED_INPUT_MANIFEST), which the CI checkout does not provide. Run locally: git worktree add --detach ../plimsoll-v074 v0.7.4, write {\"files\":{path:sha256}} for its 411 tracked files, then tsx scripts/oversized-continuation-rollback-proof.ts with both variables set (PASS on 2026-09-24, 0.6 s). Wiring it in CI needs a v0.7.4 setup step verified without that checkout's node_modules."
+    },
+    "scripts/session-sync-liveness-proof.ts": {
+      "owner": "eco-6hoxj.163.11",
+      "needs": [
+        "SESSION_SYNC_LIVENESS_ROWS"
+      ],
+      "reason": "Machine-dependent timing guard: the proof refuses to run unless syncing its 1M-row session takes over 1.5 s, then requires the health ping under 1.5 s. On Studio3 the sync takes 0.52 s (fails the guard; 4000000 rows passes with a 1.93 s sync and 14 ms ping); a reviewer host took 2.1 s and passed. Run locally with SESSION_SYNC_LIVENESS_ROWS sized for the host."
+    },
+    "scripts/session-sync-upgrade-proof.ts": {
+      "owner": "eco-6hoxj.163.15",
+      "needs": [
+        "PLIMSOLL_V074_ROOT",
+        "PLIMSOLL_CLOUD_ROOT"
+      ],
+      "reason": "Needs a v0.7.4 checkout (PLIMSOLL_V074_ROOT, default ../plimsoll-v074) and the private plimsoll-cloud source (PLIMSOLL_CLOUD_ROOT, default ../plimsoll-cloud: src/lib/delivery-ack.ts and src/lib/delivery-ack-response.ts), which the public CI checkout cannot fetch. The rule it proves (skippedStale counts every submitted row) also runs in CI as proof:delivery partial_acknowledgement_counts_rejected_rows_as_skipped_stale."
+    }
+  },
+  "quarantined": {}
+}
