@@ -10,9 +10,9 @@
  * - R3-S4: an append to a pre-enrollment file is uncovered from the last
  *   complete check, not from the epoch start.
  * - R3-S5: a busy file the tailer keeps up with never becomes a gap.
- * - R3-N4: every coverage turn stays within 250 ms on a large tree, and the
- *   walk resumes until it completes (CAPTURE_COVERAGE_FIXTURE_FILES sets the
- *   files per source; 60,000 by default).
+ * - R3-N4: every coverage turn stays within 250 ms on a large tree (60,000
+ *   files per source, half of them unread), and the walk resumes until it
+ *   completes.
  * - Grok: a usage file Grok wrote that the collector has not read is never
  *   attested, and reading it clears the gap.
  */
@@ -23,7 +23,12 @@ import { performance } from "node:perf_hooks";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { captureBaselineStatus } from "../packages/collector-cli/src/capture-baseline";
-import * as frontierModule from "../packages/collector-cli/src/capture-frontier";
+import {
+  advanceCaptureFrontier,
+  CAPTURE_FRONTIER_SOURCES,
+  CAPTURE_WRITE_LAG_MS,
+  captureFrontier,
+} from "../packages/collector-cli/src/capture-frontier";
 import type { CaptureRoot } from "../packages/collector-cli/src/capture-root-inventory";
 import { captureSpoolState, type CaptureSpoolState } from "../packages/collector-cli/src/capture-spool-state";
 import { CaptureWorkBudget } from "../packages/collector-cli/src/capture-work-budget";
@@ -49,13 +54,6 @@ type Claim = {
   pending: number;
   dead: number;
   gaps: Array<{ from: string; to: string }>;
-};
-const frontierApi = frontierModule as unknown as {
-  advanceCaptureFrontier(database: LocalEventBuffer["database"], source: string,
-    snapshot: { complete: boolean; files: [] }, startedAt: string): string | null;
-  captureFrontier(database: LocalEventBuffer["database"]): { capturedThrough: string | null; gaps: Array<{ fromMs: number; toMs: number }> } | null;
-  CAPTURE_WRITE_LAG_MS: number;
-  CAPTURE_FRONTIER_SOURCES: readonly string[];
 };
 
 // A wall clock that can be moved forward, for "time passes" without waiting.
@@ -146,8 +144,8 @@ function r3s2() {
   const home = path.join(root, "s2-home");
   const buffer = ledger(now - 10 * DAY);
   buffer.append(event(now - 2 * HOUR));
-  for (const source of frontierApi.CAPTURE_FRONTIER_SOURCES) {
-    frontierApi.advanceCaptureFrontier(buffer.database, source, { complete: true, files: [] }, iso(now - 30 * MINUTE + frontierApi.CAPTURE_WRITE_LAG_MS));
+  for (const source of CAPTURE_FRONTIER_SOURCES) {
+    advanceCaptureFrontier(buffer.database, source, { complete: true, files: [] }, iso(now - 30 * MINUTE + CAPTURE_WRITE_LAG_MS));
   }
   const firstLossMs = now - 3 * DAY;
   const losses = 1_200;
@@ -236,7 +234,7 @@ async function r3s5() {
     for (let index = 0; index < 2; index += 1) await cadence();
     write([usage()]);
     coverageTurn(checks);
-    const frontier = frontierApi.captureFrontier(buffer.database)!;
+    const frontier = captureFrontier(buffer.database)!;
     rounds.push({
       round, through: frontier.capturedThrough, gaps: frontier.gaps.map((gap) => ({ from: iso(gap.fromMs), to: iso(gap.toMs) })),
       captured: (buffer.database.prepare(`select count(*) as n from buffered_events where payload_json like ?`).get(`%${session}%`) as { n: number }).n,
@@ -255,7 +253,7 @@ async function r3s5() {
 async function r3n4() {
   // A large tree: files per source, half written before the epoch began and
   // half written since and never read (every one of those becomes a row).
-  const perSource = Number(process.env.CAPTURE_COVERAGE_FIXTURE_FILES ?? 60_000);
+  const perSource = 60_000;
   const now = Date.now();
   const base = path.join(root, "n4");
   const buffer = ledger(now - 10 * DAY);
@@ -297,7 +295,7 @@ async function r3n4() {
     const started = performance.now();
     coverageTurn(checks);
     turns.push(Number((performance.now() - started).toFixed(1)));
-    frontier = frontierApi.captureFrontier(buffer.database);
+    frontier = captureFrontier(buffer.database);
     if (frontier?.capturedThrough) break;
   }
   const rows = (buffer.database.prepare(`select count(*) as n from capture_uncovered_files`).get() as { n: number }).n;

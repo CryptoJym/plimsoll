@@ -1,8 +1,10 @@
 /**
  * eco-6hoxj.163.18 r3 — the collector findings of the r2 review, each as one
- * check that fails on the reviewed claim (`20b80a9`) and passes after the
- * fix. It uses only what both versions have, and picks the claim call by its
- * arity, so the same scenarios run on both:
+ * check that failed on the reviewed claim (`20b80a9`, evidence in the r3
+ * outputs) and passes after the fix; kept since as a regression proof. It
+ * picks the claim call by its arity and the maintenance constructor by its
+ * shape. Since r4 it imports the frontier API by name: a namespace import of
+ * that module would trip proof:capacity's conservative rule. The scenarios:
  *
  * - B1: the reviewer's Codex day-folder scenario (real tailers, real
  *   maintenance cadences), then the Claude transcript left unread past the
@@ -18,7 +20,11 @@ import path from "node:path";
 
 import { LocalEventBuffer } from "../packages/collector-cli/src/buffer";
 import { captureBaselineStatus } from "../packages/collector-cli/src/capture-baseline";
-import * as frontierModule from "../packages/collector-cli/src/capture-frontier";
+import {
+  advanceCaptureFrontier,
+  CAPTURE_FRONTIER_SOURCES,
+  CAPTURE_WRITE_LAG_MS,
+} from "../packages/collector-cli/src/capture-frontier";
 import type { CaptureRoot } from "../packages/collector-cli/src/capture-root-inventory";
 import { collectorConfigSchema, collectorHome } from "../packages/collector-cli/src/config";
 import { hookSpoolDirectory, listHookSpoolFiles, rejectHookSpoolFile, writeHookSpoolFile } from "../packages/collector-cli/src/hook-spool";
@@ -46,26 +52,8 @@ type Claim = {
   dead: number;
   withheld?: number;
   gaps?: Array<{ from: string; to: string }>;
-  gapSince?: string | null;
   cursor: number;
 };
-type FrontierApi = {
-  advanceCaptureFrontier?: (
-    database: LocalEventBuffer["database"],
-    source: string,
-    snapshot: { complete: boolean; files: [] },
-    startedAt: string,
-  ) => string | null;
-  recordCompleteCapturePass?: (
-    database: LocalEventBuffer["database"],
-    source: "codex" | "claude_code",
-    startedAt: string,
-    now?: Date,
-  ) => boolean;
-  CAPTURE_WRITE_LAG_MS?: number;
-  CAPTURE_FRONTIER_SOURCES?: readonly string[];
-};
-const frontierApi = frontierModule as unknown as FrontierApi;
 
 // A wall clock that can be moved forward, for "time passes" without waiting.
 const RealDate = Date;
@@ -123,16 +111,10 @@ function claimOf(buffer: LocalEventBuffer, ids: string[]): Claim {
   return claim;
 }
 
-/** Make `throughMs` the attested frontier of every tailed source, the way each version records one. */
+/** Make `throughMs` the attested frontier of every tailed source. */
 function attestThrough(buffer: LocalEventBuffer, throughMs: number) {
-  for (const source of frontierApi.CAPTURE_FRONTIER_SOURCES ?? ["codex", "claude_code"]) {
-    if (frontierApi.advanceCaptureFrontier) {
-      frontierApi.advanceCaptureFrontier(buffer.database, source, { complete: true, files: [] },
-        iso(throughMs + frontierApi.CAPTURE_WRITE_LAG_MS!));
-    } else {
-      frontierApi.recordCompleteCapturePass!(buffer.database, source as "codex" | "claude_code", iso(throughMs),
-        new Date(Math.max(Date.now(), throughMs) + 60_000));
-    }
+  for (const source of CAPTURE_FRONTIER_SOURCES) {
+    advanceCaptureFrontier(buffer.database, source, { complete: true, files: [] }, iso(throughMs + CAPTURE_WRITE_LAG_MS));
   }
 }
 
