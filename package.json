@@ -106,6 +106,7 @@
     "proof:http-boundary": "tsx scripts/local-http-boundary-proof.ts",
     "proof:otlp-admission": "tsx scripts/otlp-admission-proof.ts",
     "proof:hook-spool": "tsx scripts/hook-spool-proof.ts",
+    "proof:otlp-intake-spool": "tsx scripts/otlp-intake-spool-proof.ts",
     "proof:producer-parity": "tsx scripts/producer-parity-proof.ts",
     "proof:authenticated-ingestion": "tsx scripts/run-proof.ts scripts/authenticated-ingestion-proof.ts",
     "proof:status-http-rollout": "tsx scripts/run-proof.ts scripts/status-http-rollout-proof.ts",

@@ -310,9 +310,18 @@ export async function retryStorageBusy<T>(budget: RequestBudget, append: () => T
   }
 }
 
+/**
+ * `completeAfterDeadline` is for a route that can still keep a late request
+ * (the OTLP route with its intake spool): a body that finished arriving is
+ * returned even when the deadline passed, and an expired timer waits one
+ * event-loop turn so bytes that arrived while the loop was blocked are read
+ * before the body is declared stalled. A body still incomplete after that
+ * turn is refused exactly as before.
+ */
 export function readBoundedRequestBody(
   request: http.IncomingMessage,
   budget: RequestBudget,
+  options: { completeAfterDeadline?: boolean } = {},
 ) {
   return new Promise<Buffer>((resolve, reject) => {
     const contentLength = firstHeader(request.headers["content-length"]);
@@ -361,7 +370,7 @@ export function readBoundedRequestBody(
       settled = true;
       cleanup();
       try {
-        budget.checkpoint();
+        if (!options.completeAfterDeadline) budget.checkpoint();
         resolve(Buffer.concat(chunks, bodyBytes));
       } catch (error) {
         reject(error);
@@ -369,8 +378,14 @@ export function readBoundedRequestBody(
     };
     const onError = () => fail(new HttpBoundaryRejection("request_stream_error", 400));
     const onAborted = () => fail(new HttpBoundaryRejection("request_stream_error", 400));
+    const onDeadline = () => fail(new HttpBoundaryRejection("request_deadline_exceeded", 408));
     const timer = setTimeout(
-      () => fail(new HttpBoundaryRejection("request_deadline_exceeded", 408)),
+      () => {
+        // Timers run before I/O in a loop turn: after a blocked loop the
+        // expired timer would otherwise discard a body already buffered.
+        if (options.completeAfterDeadline) setImmediate(onDeadline);
+        else onDeadline();
+      },
       Math.max(1, Math.ceil(budget.remainingMs())),
     );
     timer.unref();

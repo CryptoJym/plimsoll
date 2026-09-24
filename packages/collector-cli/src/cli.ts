@@ -144,6 +144,7 @@ import {
   type CaptureRoot,
 } from "./capture-root-inventory";
 import { createCollectorServer, createHookSpoolDrain, type HookSpoolDrain } from "./server";
+import { OtlpIntakeSpool } from "./otlp-spool";
 import {
   HOOK_SPOOL_COLLECTOR_TOO_OLD,
   HOOK_SPOOL_COLLECTOR_UNREACHABLE,
@@ -2631,9 +2632,14 @@ async function main() {
     // Bead eco-6hoxj.61. Created before the listener so /status can read its
     // cached snapshot, armed with the other cadences below.
     let hookSpoolDrain: HookSpoolDrain | undefined;
+    // Bead eco-6hoxj.163.17: an OTLP export the ledger cannot take in time is
+    // written here (normalized, bounded) instead of being refused, and the
+    // drain armed below replays it. PLIMSOLL_OTLP_SPOOL=off disables both.
+    const otlpSpool = new OtlpIntakeSpool({ home: collectorHome() });
     const syncBackoff = new SyncBackoff(config.syncIntervalSeconds * 1_000);
     const server = createCollectorServer(config, buffer, {
       hookSpoolStatus: () => hookSpoolDrain?.status() ?? null,
+      otlpSpool,
       syncStatus: () => syncBackoff.status(syncInFlight),
       runtimeIdentity,
       homeIdentityHash: collectorHomeIdentityHash(collectorHome()),
@@ -3059,6 +3065,10 @@ async function main() {
     // holds no timer at all in that case.
     hookSpoolDrain = createHookSpoolDrain(config, buffer, { home: collectorHome() });
     hookSpoolDrain.start();
+    // OTLP intake-spool drain: every 2 s, at most 250 ms of 16-row writer
+    // turns through the live route's own `appendMany`, stopping at the first
+    // busy ledger. Holds no timer when the spool is disabled.
+    otlpSpool.startDrain(buffer);
     for (const timer of timers) timer.unref();
 
     const stopMaintenanceBeforeFatalExit = async () => {
@@ -3068,6 +3078,7 @@ async function main() {
       for (const timer of timers) clearInterval(timer);
       if (managedConfigReconcileTimer) clearTimeout(managedConfigReconcileTimer);
       hookSpoolDrain?.stop();
+      otlpSpool.stopDrain();
       scheduler?.stopAccepting();
       enrichmentScheduler?.stopAccepting();
       ownership.release();
@@ -3115,6 +3126,7 @@ async function main() {
       for (const timer of timers) clearInterval(timer);
       if (managedConfigReconcileTimer) clearTimeout(managedConfigReconcileTimer);
       hookSpoolDrain?.stop();
+      otlpSpool.stopDrain();
       scheduler?.stopAccepting();
       enrichmentScheduler?.stopAccepting();
       ownership.release();
