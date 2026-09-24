@@ -154,10 +154,15 @@ try {
   recordDeviceUpload(identityHome, new Date(uploadedAt));
   setDeviceStatus(identityHome, "active", new Date(uploadedAt));
   const persistedIdentity = readDeviceIdentity(identityHome);
-  const identityDocument = JSON.parse(
-    fs.readFileSync(collectorDeviceIdentityPath(identityHome), "utf8"),
-  ) as Record<string, unknown>;
-  const identityMode = fs.statSync(collectorDeviceIdentityPath(identityHome)).mode & 0o777;
+  const identityPath = collectorDeviceIdentityPath(identityHome);
+  const identityDocument = JSON.parse(fs.readFileSync(identityPath, "utf8")) as Record<string, unknown>;
+  const identityMode = fs.statSync(identityPath).mode & 0o777;
+  // The identity API takes a user home and writes under its collector home
+  // (<home>/Library/Application Support/Plimsoll), so walk the whole tree: the
+  // identity file must be the only file an atomic write leaves anywhere in it.
+  const filesUnderHome = (fs.readdirSync(identityHome, { recursive: true }) as string[])
+    .map((entry) => path.join(identityHome, entry))
+    .filter((entry) => !fs.lstatSync(entry).isDirectory());
   check(
     "local_identity_is_stable_atomic_and_statusful",
     initialIdentity.deviceId === stableIdentity.deviceId &&
@@ -168,7 +173,8 @@ try {
       !Object.hasOwn(identityDocument, "installKey") &&
       !Object.hasOwn(identityDocument, "ingestKey") &&
       !Object.hasOwn(identityDocument, "uploadSigningSecret") &&
-      fs.readdirSync(identityHome).every((name) => name === "device.identity.json") &&
+      filesUnderHome.length === 1 &&
+      filesUnderHome[0] === identityPath &&
       identityMode === 0o600,
   );
   setDeviceStatus(identityHome, "revoked", new Date(uploadedAt));
