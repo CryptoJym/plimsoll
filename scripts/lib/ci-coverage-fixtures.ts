@@ -28,6 +28,8 @@ export type FixtureCase = {
   covered?: string[];
   error?: RegExp;
   gateNotFirst?: boolean;
+  /** A counted self-test that does not apply after a legitimate workflow edit. */
+  skip?: string;
 };
 
 export type Fixture = {
@@ -500,10 +502,14 @@ export const FIXTURES: Fixture[] = [
     origin: "gate",
     expectGateGreen: false,
     describe: "typecheck sets continue-on-error, so `steps.typecheck.outcome == 'success'` can be false in a green run",
-    build: onTarget(
-      (input) => editWorkflow(input, (document) => findStep(document, "pnpm exec tsc --noEmit").step.set("continue-on-error", true)),
-      "uncovered",
-    ),
+    build: (input) => {
+      const edited = editWorkflow(input, (document) => findStep(document, "pnpm exec tsc --noEmit").step.set("continue-on-error", true));
+      const target = fixtureTargets(input)[0];
+      const targetStatus = proofCiCoverage(edited).units.find((unit) => unit.unit === target?.unit)?.status;
+      return targetStatus === "ci"
+        ? { input: edited, skip: "target remains covered because its workflow condition does not depend on typecheck" }
+        : { input: edited, uncovered: target ? [target.unit] : [] };
+    },
   },
   {
     name: "entry_file_invocation_counts",

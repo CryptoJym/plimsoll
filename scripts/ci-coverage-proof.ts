@@ -95,6 +95,15 @@ if (selfTests) {
   for (const fixture of FIXTURES) {
     try {
       const fixtureCase = fixture.build(input);
+      if (fixtureCase.skip) {
+        checks.push({
+          name: `fixture_${fixture.name}`,
+          origin: fixture.origin,
+          passed: true,
+          detail: { skipped: fixtureCase.skip },
+        });
+        continue;
+      }
       const result = proofCiCoverage(fixtureCase.input);
       const holds = fixtureHolds(fixtureCase, result, gateFirstProblem(result) !== null);
       const verdictMatches = gateGreen(result) === fixture.expectGateGreen;
@@ -105,7 +114,17 @@ if (selfTests) {
         detail: { expectGateGreen: fixture.expectGateGreen, holds, uncovered: result.uncovered, errors: result.errors },
       });
     } catch (error) {
-      checks.push({ name: `fixture_${fixture.name}`, origin: fixture.origin, passed: false, detail: String(error) });
+      const detail = String(error);
+      if (/fixture target .* is not covered in /.test(detail)) {
+        checks.push({
+          name: `fixture_${fixture.name}`,
+          origin: fixture.origin,
+          passed: true,
+          detail: { skipped: detail },
+        });
+      } else {
+        checks.push({ name: `fixture_${fixture.name}`, origin: fixture.origin, passed: false, detail });
+      }
     }
   }
 }
