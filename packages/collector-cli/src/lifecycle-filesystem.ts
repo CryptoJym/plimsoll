@@ -659,33 +659,50 @@ export class FilesystemLifecycleAdapter implements LifecycleAdapter {
     );
     const target = path.join(this.root, immutableRuntimeRelativePath(artifact));
     const stagedCompanions: Array<{ destination: string }> = [];
+    const companionDestinations = (artifact.files ?? []).map((file, index) => {
+      const destination = path.join(runtimeDirectory, ...file.relativePath.split("/"));
+      assertAbsoluteOwnedPath(destination, this.root, `companion ${index} destination`);
+      assertNoSymlink(path.dirname(destination), this.root);
+      return { file, destination, index };
+    });
+
+    // The executable is the immutable target for this version. Check it before
+    // touching any companion so a conflicting repin cannot damage an existing
+    // runtime closure before the transaction rolls back.
+    assertNoSymlink(path.dirname(target), this.root);
+    const targetStat = lstatIfPresent(target);
+    if (targetStat && (!targetStat.isFile() || targetStat.isSymbolicLink() || sha256(target) !== artifact.sha256)) {
+      throw new Error("immutable runtime target already differs");
+    }
+
+    // Existing companions are immutable too. Validate every one before
+    // staging a missing companion, so a mismatch leaves the whole closure
+    // untouched.
+    for (const { file, destination, index } of companionDestinations) {
+      const stat = lstatIfPresent(destination);
+      if (!stat) continue;
+      if (!stat.isFile() || stat.isSymbolicLink() || sha256(destination) !== file.sha256) {
+        throw new Error(`immutable runtime companion ${index} already differs`);
+      }
+    }
+
     try {
-      for (const [index, file] of (artifact.files ?? []).entries()) {
-        const destination = path.join(runtimeDirectory, ...file.relativePath.split("/"));
-        assertAbsoluteOwnedPath(destination, this.root, `companion ${index} destination`);
-        assertNoSymlink(path.dirname(destination), this.root);
+      for (const { file, destination } of companionDestinations) {
+        if (lstatIfPresent(destination)) continue;
         ensureDirectory(path.dirname(destination), this.root);
-        if (fs.existsSync(destination)) {
-          fs.rmSync(destination, { force: true });
-        }
         // Companion sources live in the artifact staging area next to the
         // bundle; their absolute paths were validated when resolved.
-        assertAbsoluteOwnedPath(file.sourcePath, this.paths.artifactSourceRoot, `companion ${index} source`);
+        assertAbsoluteOwnedPath(file.sourcePath, this.paths.artifactSourceRoot, `companion ${file.relativePath} source`);
         assertNoSymlink(file.sourcePath, this.paths.artifactSourceRoot);
         copyRegularFile(file.sourcePath, destination, FILE_MODE, this.root);
-        if (sha256(destination) !== file.sha256) throw new Error(`companion ${index} digest mismatch`);
+        if (sha256(destination) !== file.sha256) throw new Error(`companion ${file.relativePath} digest mismatch`);
         stagedCompanions.push({ destination });
       }
-      assertNoSymlink(path.dirname(target), this.root);
-      ensureDirectory(path.dirname(target), this.root);
-      if (fs.existsSync(target)) {
-        const stat = fs.lstatSync(target);
-        if (!stat.isFile() || stat.isSymbolicLink() || sha256(target) !== artifact.sha256) {
-          throw new Error("immutable runtime target already differs");
-        }
+      if (targetStat) {
         fs.chmodSync(target, EXECUTABLE_MODE);
         return;
       }
+      ensureDirectory(path.dirname(target), this.root);
       const staging = `${target}.staging`;
       fs.rmSync(staging, { force: true });
       try {

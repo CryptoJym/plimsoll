@@ -5,7 +5,6 @@
  */
 import { createHash } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
 import {
@@ -59,7 +58,9 @@ function mode(file: string) {
 type Fixture = ReturnType<typeof fixture>;
 
 function fixture(name: string) {
-  const ownershipRoot = fs.mkdtempSync(path.join(os.tmpdir(), `plimsoll-lifecycle-${name}-`));
+  const fixtureParent = "/private/var/tmp";
+  fs.mkdirSync(fixtureParent, { recursive: true });
+  const ownershipRoot = fs.mkdtempSync(path.join(fixtureParent, `plimsoll-lifecycle-${name}-`));
   const paths: ManagedLifecyclePaths = {
     ownershipRoot,
     lifecycleRoot: path.join(ownershipRoot, "private", "lifecycle"),
@@ -431,6 +432,62 @@ async function main() {
     );
   } finally {
     happy.cleanup();
+  }
+
+  // A failed same-version repin must not remove a native companion before the
+  // immutable executable conflict is discovered. The lifecycle transaction
+  // rolls back, but the current runtime must remain a complete closure.
+  const companion = fixture("companion-immutability");
+  try {
+    const ancestorHasNodeModules = (() => {
+      let cursor = path.resolve(companion.ownershipRoot);
+      while (true) {
+        if (fs.existsSync(path.join(cursor, "node_modules"))) return true;
+        const parent = path.dirname(cursor);
+        if (parent === cursor) return false;
+        cursor = parent;
+      }
+    })();
+    check("companion_fixture_has_no_node_modules_ancestor", !ancestorHasNodeModules, companion.ownershipRoot);
+    const artifactWithCompanion = (executable: string, companionText: string): RuntimeArtifact => {
+      const sourcePath = path.join(companion.ownershipRoot, "artifacts", executable);
+      const companionSource = path.join(companion.ownershipRoot, "artifacts", `${executable}.node`);
+      write(sourcePath, `#!/bin/sh\n# ${executable}\n`, 0o700);
+      write(companionSource, `${companionText}\n`);
+      return {
+        version: "5.0.0",
+        platform: "darwin",
+        architecture: "arm64",
+        nodeMajor: 22,
+        sha256: digest(sourcePath),
+        sourcePath,
+        files: [{ relativePath: "native/companion.node", sha256: digest(companionSource), sourcePath: companionSource }],
+      };
+    };
+    const c1 = artifactWithCompanion("c1", "native-companion-c1");
+    const first = await new LifecycleManager(companion.adapter).update({ operationId: "c1", artifact: c1 });
+    const runtimeDirectory = path.join(companion.paths.lifecycleRoot, "versions", "5.0.0", "darwin-arm64");
+    const executablePath = path.join(runtimeDirectory, "bin", "plimsoll.mjs");
+    const companionPath = path.join(runtimeDirectory, "native", "companion.node");
+    const executableBefore = fs.readFileSync(executablePath);
+    const companionBefore = fs.readFileSync(companionPath);
+    const c2 = artifactWithCompanion("c2", "native-companion-c2");
+    const failedRepin = await rejection(() => new LifecycleManager(companion.adapter).update({ operationId: "c2", artifact: c2 }));
+    const rollbackReceipt = JSON.parse(fs.readFileSync(
+      path.join(companion.paths.lifecycleRoot, "receipts", "c2-update.json"), "utf8",
+    )) as { status: string; restoredVersion: string | null };
+    const current = fs.readlinkSync(path.join(companion.paths.lifecycleRoot, "current"));
+    check(
+      "same_version_repin_rollback_preserves_the_immutable_companion",
+      first.status === "completed" && failedRepin?.message === "immutable runtime target already differs" &&
+        rollbackReceipt.status === "rolled_back" && rollbackReceipt.restoredVersion === "5.0.0" &&
+        current.endsWith("versions/5.0.0/darwin-arm64") &&
+        Buffer.compare(fs.readFileSync(executablePath), executableBefore) === 0 &&
+        Buffer.compare(fs.readFileSync(companionPath), companionBefore) === 0,
+      { error: failedRepin?.message, receipt: rollbackReceipt, current, companion: fs.existsSync(companionPath) },
+    );
+  } finally {
+    companion.cleanup();
   }
 
   const recovery = fixture("rollback-required");
