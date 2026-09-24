@@ -238,6 +238,14 @@ jobs:
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: pnpm proof:studio0-main-thread-turns
 
+      - name: Prove the ledger WAL stays bounded without maintenance and its checkpoint worker is watched (eco-6hoxj.163.24)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:wal-checkpoint-bound
+
+      - name: Prove sliced upload leases survive clock steps and failures between slices (eco-6hoxj.163.24)
+        if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
+        run: pnpm proof:upload-lease-slices
+
       - name: Prove session-inherited project attribution and its upload-path bound (eco-6hoxj.163.9)
         if: ${{ !cancelled() && steps.typecheck.outcome == 'success' }}
         run: |
