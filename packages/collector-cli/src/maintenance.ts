@@ -33,13 +33,18 @@ type RepairService = { next: number; cycles: number; stages: Record<RepairStage,
 }> };
 
 /**
- * Capture hand-off (eco-6hoxj.163.42). `captureFirst` hands the next cadence
- * to capture when a repair-first cadence spent the allowance before the
- * capture leader could start. Path- and content-free.
+ * Capture hand-off (eco-6hoxj.163.42). A cadence whose capture leader the
+ * clock never let start (repairs or the bookkeeping before capture spent
+ * the allowance) hands the next cadence to capture (`captureFirst`) and lets
+ * that cadence's leader start its first unit even if the clock is spent
+ * again (`leaderDenied`). `deniedCadences` counts such cadences. Path- and
+ * content-free.
  */
 export type AutomaticCaptureFairness = {
   version: 2;
   captureFirst: boolean;
+  leaderDenied: boolean;
+  deniedCadences: number;
 };
 
 /** One cadence's capture turn, for receipts and proofs. */
@@ -49,6 +54,10 @@ export type AutomaticCaptureTurn = {
   leader: CaptureSource;
   /** The leader had its turn, so the rotation moved on to the next source. */
   leaderServed: boolean;
+  /** The previous cadence denied its leader, so this one's could start past a spent clock. */
+  leaderOverride: boolean;
+  /** Cadence clock spent before the leader's turn: repairs on repair-first cadences, and bookkeeping. */
+  preCaptureMs: number;
   admitted: Partial<Record<CaptureSource, boolean>>;
   progressed: Partial<Record<CaptureSource, boolean>>;
 };
@@ -64,13 +73,22 @@ export function automaticRepairServiceStatus(database: Database.Database): Repai
 export function automaticCaptureFairnessStatus(database: Database.Database): AutomaticCaptureFairness {
   try {
     const stored = JSON.parse(maintenanceState(database, AUTOMATIC_CAPTURE_FAIRNESS_KEY) ?? "null") as
-      { version?: unknown; captureFirst?: unknown } | null;
+      { version?: unknown; captureFirst?: unknown; leaderDenied?: unknown; deniedCadences?: unknown } | null;
     // Version 1 (round 2) also carried a debt ledger; only its hand-off remains.
-    if (stored?.version === 1 || stored?.version === 2) return { version: 2, captureFirst: stored.captureFirst === true };
+    if (stored?.version === 1 || stored?.version === 2) {
+      return {
+        version: 2,
+        captureFirst: stored.captureFirst === true,
+        leaderDenied: stored.leaderDenied === true,
+        deniedCadences: Number.isSafeInteger(stored.deniedCadences) && (stored.deniedCadences as number) >= 0
+          ? stored.deniedCadences as number
+          : 0,
+      };
+    }
   } catch {
     // An unreadable hand-off is none: the parity alternation still serves capture.
   }
-  return { version: 2, captureFirst: false };
+  return { version: 2, captureFirst: false, leaderDenied: false, deniedCadences: 0 };
 }
 
 function ensureAutomaticCaptureRuntimeState(database: Database.Database) {
@@ -780,17 +798,20 @@ export class CollectorMaintenance {
     // reads. Repairs on a capture-first cadence use only what capture leaves.
     // Persist the choice before work; neither restarts nor busy sources may
     // starve either consumer on the intervening turns. The alternation is
-    // not trusted alone: a repair-first cadence that spent the allowance
-    // before the capture leader could start hands the next cadence to
-    // capture, whatever its parity. The hand-off is used up by that cadence.
+    // not trusted alone: a cadence whose capture leader never started,
+    // because repairs or the bookkeeping before capture spent the allowance,
+    // hands the next cadence to capture whatever its parity, and that
+    // cadence's leader starts its first unit even if the clock is spent
+    // again. The hand-off is used up by that cadence.
     const repairService = automaticRepairServiceStatus(this.buffer.database);
     const firstRepair = repairService.next % REPAIR_STAGES.length;
     repairService.cycles += 1;
-    const handOff = automaticCaptureFairnessStatus(this.buffer.database).captureFirst;
-    const captureFirst = repairService.cycles % 2 === 0 || handOff;
-    if (handOff) {
+    const fairness = automaticCaptureFairnessStatus(this.buffer.database);
+    const captureFirst = repairService.cycles % 2 === 0 || fairness.captureFirst;
+    const leaderOverride = fairness.leaderDenied;
+    if (fairness.captureFirst || fairness.leaderDenied) {
       setMaintenanceState(this.buffer.database, AUTOMATIC_CAPTURE_FAIRNESS_KEY,
-        JSON.stringify({ version: 2, captureFirst: false } satisfies AutomaticCaptureFairness));
+        JSON.stringify({ ...fairness, captureFirst: false, leaderDenied: false } satisfies AutomaticCaptureFairness));
     }
     const sourceOrder = this.grokTailer
       ? ["codex", "claude_code", "grok"] as const
@@ -801,9 +822,11 @@ export class CollectorMaintenance {
     // never let start keeps the lead. With the hand-off, the rotation moves in
     // at least one of every two cadences, so each of S sources leads within
     // 2S cadences (6 with Grok), and as the leader its first unit is admitted
-    // and allowed to finish. The bound assumes the bookkeeping before capture
-    // fits inside the allowance. A source that keeps failing cannot hold the
-    // lead, so it cannot keep the others out (eco-6hoxj.163.42 round 3).
+    // and allowed to finish. A source that keeps failing cannot hold the
+    // lead, so it cannot keep the others out (eco-6hoxj.163.42 round 3). The
+    // bound does not depend on the bookkeeping before capture fitting inside
+    // the allowance: a leader the clock denies starts on the next cadence
+    // whatever the clock (round 4).
     const storedTurn = maintenanceState(this.buffer.database, AUTOMATIC_CAPTURE_SOURCE_TURN_KEY);
     const storedIndex = (sourceOrder as readonly string[]).indexOf(storedTurn ?? "codex");
     const firstIndex = storedIndex >= 0 ? storedIndex : 0;
@@ -911,9 +934,10 @@ export class CollectorMaintenance {
     // are not divided: a byte share would starve any Grok usage file larger
     // than one share. The pre-Grok two-source cadence (callers without a
     // Grok tailer) keeps its budget unchanged.
-    const scopedCaptureBudget = (sourcesLeft: number) => this.grokTailer
-      ? budget.scoped({ maxWallMs: Math.floor(budget.remainingWallMs() / Math.max(1, sourcesLeft)) },
-        { progressUnit: true })
+    const scopedCaptureBudget = (sourcesLeft: number, pastSpentWall = false) => this.grokTailer || pastSpentWall
+      ? budget.scoped(this.grokTailer
+        ? { maxWallMs: Math.floor(budget.remainingWallMs() / Math.max(1, sourcesLeft)) }
+        : {}, { progressUnit: true, pastSpentWall })
       : budget;
     const admitted: Partial<Record<CaptureSource, boolean>> = {};
     const startedAt = new Date().toISOString();
@@ -985,9 +1009,11 @@ export class CollectorMaintenance {
       });
     };
     let leaderServed = false;
+    let preCaptureMs = 0;
     try {
       for (const [index, source] of runOrder.entries()) {
-        const sourceBudget = scopedCaptureBudget(runOrder.length - index);
+        if (index === 0) preCaptureMs = Math.round(budget.elapsedWallMs());
+        const sourceBudget = scopedCaptureBudget(runOrder.length - index, index === 0 && leaderOverride);
         if (index === 0 && sourceBudget.canContinue()) {
           // Pass the lead on before the leader's scan can fail, overrun or be
           // killed with its worker.
@@ -1013,11 +1039,13 @@ export class CollectorMaintenance {
       this.current = null;
     }
     if (!rollout || !transcript) throw new Error("automatic_maintenance_result_missing");
-    // Hand the next cadence to capture when a repair-first cadence left the
-    // leader no allowance to start.
-    if (!captureFirst && !leaderServed) {
-      setMaintenanceState(this.buffer.database, AUTOMATIC_CAPTURE_FAIRNESS_KEY,
-        JSON.stringify({ version: 2, captureFirst: true } satisfies AutomaticCaptureFairness));
+    // The clock never let the leader start: hand the next cadence to capture
+    // and let its leader start whatever the clock.
+    if (!leaderServed) {
+      const denied = automaticCaptureFairnessStatus(this.buffer.database);
+      setMaintenanceState(this.buffer.database, AUTOMATIC_CAPTURE_FAIRNESS_KEY, JSON.stringify({
+        version: 2, captureFirst: true, leaderDenied: true, deniedCadences: denied.deniedCadences + 1,
+      } satisfies AutomaticCaptureFairness));
     }
     // A durable commit this cadence: records, a checkpoint, a Grok document
     // or a Grok walk step. Receipt only; the rotation does not depend on it.
@@ -1030,7 +1058,8 @@ export class CollectorMaintenance {
       ...(grok ? { grok: grok.recordsCommitted > 0 || grok.filesParsed > 0 || grok.activity.discoveryEntries > 0 } : {}),
     };
     const captureTurn: AutomaticCaptureTurn = {
-      captureFirst, order: runOrder, leader: runOrder[0]!, leaderServed, admitted, progressed,
+      captureFirst, order: runOrder, leader: runOrder[0]!, leaderServed, leaderOverride, preCaptureMs,
+      admitted, progressed,
     };
     if (rollout.activity && !this.signal?.aborted) {
       this.buffer.projection.recordCaptureActivity({ source: "codex", ...rollout.activity });
