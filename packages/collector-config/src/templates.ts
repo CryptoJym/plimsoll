@@ -95,6 +95,7 @@ export function generateHookForwardCommand(options: ToolConfigOptions, source: "
   const url = `http://127.0.0.1:${port(options)}/hooks/${source}`;
   const retryFlags = [
     "-sS",
+    "--noproxy '*'",
     "--fail",
     `--retry ${HOOK_RETRY_CONTRACT.curlRetry}`,
     "--retry-all-errors",
