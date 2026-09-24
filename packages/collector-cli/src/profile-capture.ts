@@ -5,6 +5,8 @@ import { accountAssertionContains, accountAssertionV1Schema, accountAssertionAda
   codexAccountAssertionBindings } from "./account-assertion";
 import { RolloutTailer } from "./rollout-tailer";
 import { TranscriptTailer } from "./transcript-tailer";
+import { GrokUsageTailer } from "./grok-usage-tailer";
+import { resolveGrokHome } from "./collector-home";
 import { beginAutomaticCaptureBaseline,captureBaselineStatus,completeAutomaticCaptureBaseline } from "./capture-baseline";
 /** Parent CLI/maintenance factory uses this instead of constructing single-default tailers.
  * An explicitly empty provider inventory disables that fallback reader. */
@@ -65,5 +67,15 @@ export function createProfileCapture(buffer: LocalEventBuffer,config: Pick<Colle
     () => accountAssertionAdapterEnabled(buffer.database, "codex"),
     (root, observedAt) => root ? hydrateRoot(root, observedAt) : undefined);
   const transcript = new TranscriptTailer(buffer, undefined, undefined, claude);
-  return { rollout,transcript,close() { rollout.close(); transcript.close(); } };
+  // Grok has no capture roots: its usage files live under the same Grok home
+  // setup and doctor resolve (GROK_HOME, else ~/.grok). A malformed GROK_HOME
+  // is doctor's to name; here it only disables the Grok usage scan.
+  let grokHome: string | null = null;
+  try {
+    grokHome = resolveGrokHome().home;
+  } catch {
+    grokHome = null;
+  }
+  const grok = new GrokUsageTailer(buffer, grokHome);
+  return { rollout,transcript,grok,close() { rollout.close(); transcript.close(); grok.close(); } };
 }

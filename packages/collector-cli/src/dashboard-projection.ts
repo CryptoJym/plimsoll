@@ -109,7 +109,9 @@ const UNLINKED_ACCOUNT = "__unlinked_account__";
  * Codex and Grok — James 2026-09-11). A configured source is never absent: one
  * with no events yet reports `no_events`, which can read neither as healthy nor
  * as idle. `hook_only` sources have no local artifacts to scan; their capture
- * truth is the ledger and their hook receipts.
+ * truth is the ledger and their hook receipts. Grok stays `hook_only` until its
+ * usage-file tailer publishes an activity receipt (bead eco-6hoxj.163.20); from
+ * then on its usage files are a local scan judged like the other two.
  */
 const CAPTURE_HEALTH_SOURCES=[
   {source:"claude_code",capture:"local_scan"},
@@ -416,7 +418,7 @@ export type ProjectionMaintenanceReceipt = {
 };
 
 export type CaptureActivityReceipt = {
-  source: "claude_code" | "codex";
+  source: "claude_code" | "codex" | "grok";
   lastActivityAt: string | null;
   filesToday: number;
   discoveryEntries: number;
@@ -2644,7 +2646,8 @@ export class DashboardProjectionStore {
       truncated: receipt.truncated ? 1 : 0,
       scanJson: receipt.scan ? JSON.stringify(receipt.scan) : null,
     });
-    recordFinanceCaptureActivity(
+    // Finance provenance covers the native Codex and Claude sources only.
+    if (receipt.source !== "grok") recordFinanceCaptureActivity(
       this.db,
       receipt.source,
       receipt.lastScanAt,
@@ -3795,7 +3798,8 @@ export class DashboardProjectionStore {
         truncated,scan_json as scanJson from capture_activity_state`,
     ).all() as Array<Record<string,unknown>>;
     const activity=new Map(activityRows.map((row)=>[String(row.source),row]));
-    const sources=CAPTURE_HEALTH_SOURCES.map(({source,capture})=>{
+    const sources=CAPTURE_HEALTH_SOURCES.map(({source,capture:configured})=>{
+      const capture:"local_scan"|"hook_only"=configured==="hook_only"&&activity.has(source)?"local_scan":configured;
       const local=capture==="local_scan"?activity.get(source):undefined;
       const latest=(this.db.prepare(
         `select last_event_at as lastEventAt,last_token_event_at as tokenAt

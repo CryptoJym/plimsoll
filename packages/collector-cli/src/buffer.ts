@@ -2529,7 +2529,7 @@ export class LocalEventBuffer {
     return winner?.authority === desired;
   }
 
-  sessionUsageAuthority(source: "codex" | "claude_code", sessionId: string) {
+  sessionUsageAuthority(source: "codex" | "claude_code" | "grok", sessionId: string) {
     const row = this.db
       .prepare(
         `select authority from session_usage_authority
