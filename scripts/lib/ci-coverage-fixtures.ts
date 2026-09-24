@@ -184,6 +184,21 @@ function onTarget(edit: (input: CoverageInput, target: Target) => CoverageInput,
   };
 }
 
+/** A case on the first fixture target that must leave it uncovered and report `error`. */
+function rejectedOnTarget(edit: (input: CoverageInput, target: Target) => CoverageInput, error: RegExp) {
+  return (input: CoverageInput): FixtureCase => {
+    const [target] = fixtureTargets(input);
+    return { input: edit(input, target!), uncovered: [target!.unit], error };
+  };
+}
+
+/** `base`, or `base-2`, `base-3`, ... whichever package.json does not use yet. */
+export function unusedScriptName(scripts: Record<string, string>, base: string) {
+  let name = base;
+  for (let suffix = 2; Object.hasOwn(scripts, name); suffix += 1) name = `${base}-${suffix}`;
+  return name;
+}
+
 export const FIXTURES: Fixture[] = [
   // ---- Review r1 (input/review-r1/checks/adversarial-*) -------------------
   {
@@ -546,6 +561,52 @@ export const FIXTURES: Fixture[] = [
       };
     },
     replayableOnTextualGate: false,
+  },
+  // ---- Review 2: package scripts must be canonical -----------------------
+  ...([
+    ["disabled_prefix", "`echo '… disabled' && exit 0;` before the proof", (t: Target) => `echo '${t.script} temporarily disabled' && exit 0; tsx ${t.unit}`],
+    ["exit_prefix", "`exit 0;` before the proof", (t: Target) => `exit 0; tsx ${t.unit}`],
+    ["trap_exit", "`trap 'exit 0' EXIT;` before the proof", (t: Target) => `trap 'exit 0' EXIT; tsx ${t.unit}`],
+    ["node_check_flag", "`node --check`, which parses the file without running it", (t: Target) => `node --check ${t.unit}`],
+    ["self_alias_then_file", "the script calls itself before the proof", (t: Target) => `pnpm ${t.script} && tsx ${t.unit}`],
+  ] as const).map(([label, what, body]): Fixture => ({
+    name: `review2_package_script_${label}`,
+    origin: "review2",
+    expectGateGreen: false,
+    describe: `the proof's package script gains ${what}`,
+    build: rejectedOnTarget((input, t) => withScripts(input, { [t.script]: body(t) }), /is not a canonical proof command/),
+  })),
+  {
+    name: "review2_package_script_alias_cycle",
+    origin: "review2",
+    expectGateGreen: false,
+    describe: "the proof's package script becomes an alias loop through two other scripts",
+    build: rejectedOnTarget((input, t) => {
+      const first = unusedScriptName(input.scripts, "fixture:cycle-a");
+      const second = unusedScriptName({ ...input.scripts, [first]: "" }, "fixture:cycle-b");
+      return withScripts(input, { [t.script]: `pnpm ${first}`, [first]: `pnpm ${second}`, [second]: `pnpm ${t.script}` });
+    }, /alias cycle/),
+  },
+  {
+    name: "package_script_environment_prefix",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "the proof's package script sets NODE_OPTIONS before the runner",
+    build: rejectedOnTarget((input, t) => withScripts(input, { [t.script]: `NODE_OPTIONS=--require=./exit0.cjs tsx ${t.unit}` }), /sets the environment/),
+  },
+  {
+    name: "package_script_pre_hook",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a pre<script> hook runs before the proof",
+    build: rejectedOnTarget((input, t) => withScripts(input, { [`pre${t.script}`]: "echo before" }), /pnpm also runs pre/),
+  },
+  {
+    name: "package_script_node_import_tsx_counts",
+    origin: "gate",
+    expectGateGreen: true,
+    describe: "the proof's package script runs `node --expose-gc --import tsx <file>`",
+    build: onTarget((input, t) => withScripts(input, { [t.script]: `node --expose-gc --import tsx ${t.unit}` }), "covered"),
   },
 ];
 

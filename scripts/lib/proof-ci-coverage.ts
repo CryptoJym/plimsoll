@@ -1,9 +1,18 @@
 import fs from "node:fs";
 import path from "node:path";
 
+import {
+  RUN_PROOF_WRAPPER,
+  isRepoFile,
+  mentionedWords,
+  normalizeFile,
+  packageScriptForm,
+  runnerInvocation,
+  type Problem,
+} from "./canonical-commands";
 import { modelWorkflow } from "./ci-workflow-model";
 import { PROOF_SUITES, readProofSuites } from "./proof-suites";
-import { analyzeErrexitScript, analyzePackageScript } from "./shell-commands";
+import { analyzeErrexitScript } from "./shell-commands";
 
 /**
  * Which proofs CI actually runs (eco-6hoxj.163.23).
@@ -11,12 +20,14 @@ import { analyzeErrexitScript, analyzePackageScript } from "./shell-commands";
  * A proof that CI never runs rots silently: proof:enrollment-privacy failed
  * from 2026-09-07 until eco-6hoxj.163.22 while the published privacy spec
  * cited it. The unit of coverage is a proof entry file, found three ways:
- * every leaf file a `proof`/`proof:*` package script runs, every proof-named
- * file any package script runs, and every proof-named file under scripts/.
- * A unit is covered only when a workflow step that provably runs on every
- * successful push/PR to main executes a command that reaches it (directly, by
- * entry file, or through package-script aliases whose failure propagates), or
- * when scripts/proof-suites.json declares it as a sub-proof of a suite CI runs.
+ * the file each `proof`/`proof:*` package script runs, every proof-named file
+ * any package script names, and every proof-named file under scripts/. Every
+ * proof script must be canonical (scripts/lib/canonical-commands.ts): exactly
+ * one runner invocation of one file, or a pure alias of another script. A
+ * unit is covered only when a workflow step that provably runs on every
+ * successful push/PR to main executes a command that reaches it (by entry
+ * file, or through canonical package scripts), or when
+ * scripts/proof-suites.json declares it as a sub-proof of a suite CI runs.
  * Every other unit needs a reviewed entry in scripts/proof-local-only.json.
  */
 
@@ -24,7 +35,6 @@ export const WORKFLOW_DIRECTORY = ".github/workflows";
 export const PROOF_EXCEPTIONS = "scripts/proof-local-only.json";
 export const GATE_ENTRY = "scripts/ci-coverage-proof.ts";
 const PROOF_SCRIPT = /^proof(?::|$)/;
-const RUN_PROOF_WRAPPER = "scripts/run-proof.ts";
 const PNPM_BUILTINS = new Set([
   "add", "audit", "bin", "config", "create", "deploy", "dlx", "env", "fetch", "i", "import", "init",
   "install", "licenses", "link", "list", "ls", "outdated", "pack", "patch", "prune", "publish",
@@ -83,9 +93,6 @@ export function isProofEntry(file: string) {
   return /^index\.[cm]?[jt]s$/.test(base) && path.posix.basename(path.posix.dirname(file)).endsWith("-proof");
 }
 
-const normalizeFile = (word: string) => word.replace(/^\.\//, "");
-const isRepoFile = (file: string) => /^(?:scripts|packages)\/\S+\.[cm]?[jt]s$/.test(file);
-
 /** Files and package scripts one simple command runs; empty when it is not a recognised runner. */
 export function commandTargets(words: Array<string | null>): { files: string[]; scripts: string[] } {
   const none = { files: [], scripts: [] };
@@ -103,66 +110,38 @@ export function commandTargets(words: Array<string | null>): { files: string[]; 
     const index = rest.findIndex((word) => word === null || !word.startsWith("-"));
     return index === -1 ? none : commandTargets(rest.slice(index));
   }
-  const fileAfterFlags = (args: Array<string | null>, valueFlags: string[]) => {
-    for (let index = 0; index < args.length; index += 1) {
-      const word = args[index];
-      if (word === null) return { file: null, rest: [] as Array<string | null> };
-      if (word.startsWith("-")) {
-        if (["-e", "--eval", "-p", "--print"].includes(word)) return { file: null, rest: [] };
-        if (valueFlags.includes(word)) index += 1;
-        continue;
-      }
-      return { file: normalizeFile(word), rest: args.slice(index + 1) };
-    }
-    return { file: null, rest: [] };
-  };
-  const leaf = (file: string | null, args: Array<string | null>): { files: string[]; scripts: string[] } => {
-    if (!file || !isRepoFile(file)) return none;
-    if (file === RUN_PROOF_WRAPPER) {
-      const entryArgs = args[0] === "--direct-node" ? args.slice(1) : args;
-      const entry = typeof entryArgs[0] === "string" ? normalizeFile(entryArgs[0]) : null;
-      return entry && isRepoFile(entry) ? { files: [entry], scripts: [] } : none;
-    }
-    return { files: [file], scripts: [] };
-  };
-  if (head === "tsx" || head.endsWith("/tsx")) {
-    const { file, rest: args } = fileAfterFlags(rest, ["--tsconfig", "--import", "--require", "-r"]);
-    return leaf(file, args);
-  }
-  if (head === "node") {
-    const { file, rest: args } = fileAfterFlags(rest, ["--import", "-r", "--require", "--loader", "--experimental-loader"]);
-    if (file && /(?:^|\/)node_modules\/(?:tsx\/dist\/cli\.[cm]?js|\.bin\/tsx)$/.test(file)) {
-      const inner = fileAfterFlags(args, ["--tsconfig", "--import", "--require", "-r"]);
-      return leaf(inner.file, inner.rest);
-    }
-    return leaf(file, args);
+  if (head === "tsx" || head === "node") {
+    if (rest.some((word) => word === null)) return none;
+    const invocation = runnerInvocation(words as string[]);
+    return "problem" in invocation ? none : { files: [invocation.file], scripts: [] };
   }
   return none;
 }
 
-type Resolution = { all: Set<string>; propagating: Set<string>; aliases: Set<string> };
+type Resolved = { file: string; via: string[] } | Problem;
 
-function packageResolver(scripts: Record<string, string>) {
-  const cache = new Map<string, Resolution>();
-  const resolve = (name: string, stack: string[] = []): Resolution => {
+/**
+ * Follow a package script through pure aliases to the one file it runs, or
+ * say why it is not canonical: a non-canonical body, an alias cycle, or a
+ * pre/post script pnpm would also run.
+ */
+function scriptResolver(scripts: Record<string, string>) {
+  const cache = new Map<string, Resolved>();
+  const resolve = (name: string, chain: string[] = []): Resolved => {
+    if (chain.includes(name)) return { problem: `alias cycle ${[...chain, name].join(" → ")}` };
     const cached = cache.get(name);
     if (cached) return cached;
-    const empty: Resolution = { all: new Set(), propagating: new Set(), aliases: new Set() };
-    if (!Object.hasOwn(scripts, name) || stack.includes(name)) return empty;
-    const analysis = analyzePackageScript(scripts[name]!);
-    const result: Resolution = { all: new Set(), propagating: new Set([`package.json#${name}`]), aliases: new Set() };
-    for (const command of analysis.seen) {
-      const targets = commandTargets(command.words);
-      for (const file of targets.files) result.all.add(file);
-      for (const ref of targets.scripts) {
-        result.aliases.add(ref);
-        for (const file of resolve(ref, [...stack, name]).all) result.all.add(file);
-      }
-    }
-    for (const command of analysis.executed) {
-      const targets = commandTargets(command.words);
-      for (const file of targets.files) result.propagating.add(file);
-      for (const ref of targets.scripts) for (const target of resolve(ref, [...stack, name]).propagating) result.propagating.add(target);
+    const hooks = [`pre${name}`, `post${name}`].filter((hook) => Object.hasOwn(scripts, hook));
+    let result: Resolved;
+    if (!Object.hasOwn(scripts, name)) result = { problem: `package.json has no script \`${name}\`` };
+    else if (hooks.length > 0) result = { problem: `pnpm also runs ${hooks.join(" and ")} around \`${name}\`` };
+    else {
+      const form = packageScriptForm(scripts[name]!);
+      if ("problem" in form) result = { problem: `\`${name}\`: ${form.problem}` };
+      else if ("alias" in form) {
+        const inner = resolve(form.alias, [...chain, name]);
+        result = "problem" in inner ? inner : { file: inner.file, via: [name, ...inner.via] };
+      } else result = { file: form.file, via: [name] };
     }
     cache.set(name, result);
     return result;
@@ -170,12 +149,21 @@ function packageResolver(scripts: Record<string, string>) {
   return resolve;
 }
 
+/** True when a script names a proof file, directly or through scripts it names (over-approximate). */
+function mentionsProof(scripts: Record<string, string>, units: Map<string, unknown>, name: string, seen = new Set<string>()): boolean {
+  if (seen.has(name) || !Object.hasOwn(scripts, name)) return false;
+  seen.add(name);
+  return mentionedWords(scripts[name]!).some(
+    (word) => units.has(normalizeFile(word)) || PROOF_SCRIPT.test(word) || mentionsProof(scripts, units, word, seen),
+  );
+}
+
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   value !== null && typeof value === "object" && !Array.isArray(value);
 
 export function proofCiCoverage(input: CoverageInput): CoverageReport {
   const errors: string[] = [];
-  const resolve = packageResolver(input.scripts);
+  const resolve = scriptResolver(input.scripts);
 
   // 1. Inventory.
   const units = new Map<string, UnitCoverage>();
@@ -186,12 +174,14 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
     units.set(unit, entry);
   };
   for (const name of Object.keys(input.scripts).sort()) {
-    const { all } = resolve(name);
     if (PROOF_SCRIPT.test(name)) {
-      if (all.size === 0) addUnit(`package.json#${name}`, "proof script without an entry file", name);
-      for (const file of all) addUnit(file, "proof script leaf", name);
-    } else {
-      for (const file of all) if (isProofEntry(file)) addUnit(file, "proof file run by a package script", name);
+      const resolved = resolve(name);
+      if ("problem" in resolved) errors.push(`package.json "${name}" is not a canonical proof command: ${resolved.problem}`);
+      else addUnit(resolved.file, "proof script leaf", name);
+    }
+    for (const word of mentionedWords(input.scripts[name]!)) {
+      const file = normalizeFile(word);
+      if (isRepoFile(file) && isProofEntry(file) && file !== RUN_PROOF_WRAPPER) addUnit(file, "proof file named by a package script", name);
     }
   }
   // The run-proof wrapper matches the proof file-name rule but is not a proof.
@@ -215,8 +205,15 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
             if (PROOF_SCRIPT.test(ref)) errors.push(`${model.path} step "${step.name}" runs \`pnpm ${ref}\`, which package.json does not define`);
             continue;
           }
-          const { propagating } = resolve(ref);
-          for (const target of propagating) if (!reached.has(target)) reached.set(target, [ref]);
+          const resolved = resolve(ref);
+          if ("problem" in resolved) {
+            // Proof scripts are reported once, in the inventory.
+            if (!PROOF_SCRIPT.test(ref) && mentionsProof(input.scripts, units, ref)) {
+              errors.push(`${model.path} step "${step.name}" runs \`pnpm ${ref}\`, which names a proof but is not a canonical command: ${resolved.problem}`);
+            }
+            continue;
+          }
+          if (!reached.has(resolved.file)) reached.set(resolved.file, resolved.via);
         }
         const invocation = { workflow: model.path, job: step.job, step: step.name, stepIndex: step.stepIndex, position, line: step.line, command: command.text };
         const reason = step.notCovering ?? (executed.has(command) ? null : analysis.stoppedAt?.reason ?? "not a standalone reachable command");
