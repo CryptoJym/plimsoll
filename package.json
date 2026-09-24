@@ -45,6 +45,7 @@
     "proof:finance-export": "tsx scripts/finance-project-usage-export.test.ts",
     "proof:finance-projection": "tsx scripts/finance-project-usage-projection.test.ts",
     "proof:delivery": "tsx scripts/delivery-transport-proof.ts",
+    "proof:loopback-proxy": "tsx scripts/run-proof.ts scripts/loopback-proxy-proof.ts",
     "proof:capture-claim": "tsx scripts/run-proof.ts scripts/capture-claim-proof.ts",
     "proof:capture-claim-review": "tsx scripts/run-proof.ts scripts/capture-claim-review-proof.ts",
     "proof:capture-claim-review-r4": "tsx scripts/run-proof.ts scripts/capture-claim-review-r4-proof.ts",

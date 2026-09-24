@@ -50,6 +50,7 @@ const pidCleanupAttemptReceipt = (result: CollectorPidCleanupResult | null) =>
       };
 
 import { LocalEventBuffer } from "./buffer";
+import { fetchCollectorUrl } from "./http-transport";
 import type { LedgerOpenTimingSink } from "./open-timing";
 import {
   collectorHomeIdentityHash,
@@ -1211,7 +1212,7 @@ async function readDaemonState(
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), collectorStatusTimeoutMs());
   try {
-    const response = await fetch(`http://127.0.0.1:${port}/status`, {
+    const response = await fetchCollectorUrl(`http://127.0.0.1:${port}/status`, {
       signal: controller.signal,
       headers: managementToken ? { "x-plimsoll-token": managementToken } : {},
     });
@@ -1247,7 +1248,7 @@ async function checkCollectorConnectivity(port: number, managementToken?: string
   const timeout = setTimeout(() => controller.abort(), collectorStatusTimeoutMs());
 
   try {
-    const response = await fetch(`http://127.0.0.1:${port}/status`, {
+    const response = await fetchCollectorUrl(`http://127.0.0.1:${port}/status`, {
       signal: controller.signal,
       // Issue 0056 (#104): enforcing daemons gate status behind the
       // provisioned management credential; doctor presents it when present.

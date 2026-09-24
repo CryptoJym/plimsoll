@@ -1,4 +1,7 @@
 import crypto from "node:crypto";
+import http from "node:http";
+import https from "node:https";
+import { Readable } from "node:stream";
 
 export type TransportFailure =
   | "invalid_url" | "insecure_url" | "embedded_credentials" | "redirect_rejected"
@@ -29,6 +32,63 @@ export function isLoopbackHostname(hostname: string) {
   return normalized === "localhost" || normalized === "::1" || /^127(?:\.\d{1,3}){3}$/.test(normalized);
 }
 
+// Node's fetch may use NODE_USE_ENV_PROXY. Private node:http(s) agents never
+// consult that setting, and cannot inherit a proxy-enabled global agent.
+const directHttpAgent = new http.Agent({ keepAlive: true });
+const directHttpsAgent = new https.Agent({ keepAlive: true });
+
+function directLoopbackFetch(url: URL, init: RequestInit): Promise<Response> {
+  const body = init.body;
+  if (body !== undefined && body !== null && typeof body !== "string" && !Buffer.isBuffer(body)) {
+    throw new TypeError("Loopback request body must be a string or Buffer");
+  }
+  const headers = new Headers(init.headers);
+  if (body !== undefined && body !== null && !headers.has("content-length") && !headers.has("transfer-encoding")) {
+    headers.set("content-length", String(Buffer.byteLength(body)));
+  }
+  // A local endpoint must not redirect a credential-bearing request elsewhere.
+  // Node's request does not follow redirects, whatever fetch's default is.
+  const agent = url.protocol === "https:" ? directHttpsAgent : directHttpAgent;
+  const request = url.protocol === "https:" ? https.request : http.request;
+  return new Promise<Response>((resolve, reject) => {
+    const outgoing = request(url, {
+      method: init.method ?? "GET", headers: Object.fromEntries(headers),
+      agent, signal: init.signal ?? undefined,
+    }, (incoming) => {
+      try {
+        const responseHeaders = new Headers();
+        for (const [name, values] of Object.entries(incoming.headers)) {
+          for (const value of Array.isArray(values) ? values : [values]) {
+            if (value !== undefined) responseHeaders.append(name, value);
+          }
+        }
+        const status = incoming.statusCode ?? 0;
+        const hasBody = status !== 204 && status !== 205 && status !== 304 && init.method !== "HEAD";
+        const response = new Response(hasBody ? Readable.toWeb(incoming) as ReadableStream : null, {
+          status, statusText: incoming.statusMessage, headers: responseHeaders,
+        });
+        Object.defineProperty(response, "url", { value: url.href });
+        resolve(response);
+      } catch (error) {
+        incoming.destroy();
+        reject(error);
+      }
+    });
+    outgoing.once("error", reject);
+    outgoing.end(body ?? undefined);
+  });
+}
+
+/** Keep non-loopback requests on Node's default fetch (and its proxy).
+ * Injected fetches are proof seams; production loopback requests use private
+ * direct agents. Every collector HTTP client that can address loopback uses
+ * this boundary. */
+export function fetchCollectorUrl(input: string | URL, init: RequestInit = {}, fetchImpl: typeof fetch = fetch) {
+  const url = input instanceof URL ? input : new URL(input);
+  if (isLoopbackHostname(url.hostname) && fetchImpl === fetch) return directLoopbackFetch(url, init);
+  return fetchImpl(url.href, init);
+}
+
 export function validatedTransportUrl(raw: string, _label: string) {
   let url: URL;
   try { url = new URL(raw); } catch { throw new TransportError("invalid_url"); }
@@ -47,10 +107,13 @@ function assertPlainLoopbackUrl(raw: string) {
     "--dev-loopback-url allows only an http(s) URL on this machine, written plainly: localhost, 127.x.x.x or [::1].",
   );
   if (!/^[\x21-\x7e]+$/.test(raw) || raw.includes("\\")) throw refused;
-  const url = validatedTransportUrl(raw, "Development upload URL");
+  let url: URL;
+  try { url = new URL(raw); } catch { throw refused; }
   const authority = /^https?:\/\/([^/?#]*)/i.exec(raw)?.[1] ?? "";
   const typedHost = authority.startsWith("[") ? authority.slice(0, authority.indexOf("]") + 1) : authority.split(":")[0];
-  if (!isLoopbackHostname(url.hostname) || typedHost.toLowerCase() !== url.hostname) throw refused;
+  if (!["http:", "https:"].includes(url.protocol) || url.username || url.password ||
+      !isLoopbackHostname(url.hostname) || typedHost.toLowerCase() !== url.hostname) throw refused;
+  try { validatedTransportUrl(raw, "Development upload URL"); } catch { throw refused; }
 }
 
 /** An upload URL override (--url) may pick another path on the configured
@@ -131,10 +194,10 @@ export async function postJson(input: JsonPostOptions): Promise<JsonPostResult> 
     }, timeoutMs);
   });
   const read = async (): Promise<JsonPostResult> => {
-    const response = await (input.fetchImpl ?? fetch)(url.href, {
+    const response = await fetchCollectorUrl(url, {
       method: "POST", redirect: "manual", headers: input.headers,
       body: input.body, signal: controller.signal,
-    });
+    }, input.fetchImpl);
     // A late response from an injected fetch still needs to release its body.
     if (controller.signal.aborted) {
       void response.body?.cancel().catch(() => undefined);

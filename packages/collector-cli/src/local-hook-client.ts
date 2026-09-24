@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 
+import { fetchCollectorUrl } from "./http-transport";
 import { HOOK_AUTHORITY_CONTRACT } from "./hook-authority";
 import {
   blankForbiddenRawContent,
@@ -199,7 +200,7 @@ export async function forwardHookOverLoopback(
 
   let response: Response;
   try {
-    response = await (options.fetchImpl ?? fetch)(
+    response = await fetchCollectorUrl(
       `http://127.0.0.1:${options.port}${HOOK_PATHS[options.source]}`,
       {
         method: "POST",
@@ -210,6 +211,7 @@ export async function forwardHookOverLoopback(
         },
         body: wireBody,
       },
+      options.fetchImpl,
     );
   } catch (error) {
     const code = connectionErrorCode(error);

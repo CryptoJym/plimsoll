@@ -28,7 +28,7 @@ import {
   setDeviceStatus,
   type LocalDeviceIdentity,
 } from "./device-identity";
-import { assertNoRedirect, postJson, validatedTransportUrl } from "./http-transport";
+import { assertNoRedirect, fetchCollectorUrl, postJson, validatedTransportUrl } from "./http-transport";
 import { syncAccountActorSalt } from "./account-salt";
 
 /**
@@ -554,7 +554,7 @@ async function activatePendingJoin(
       if (requestedUrl.href !== uploadUrl.href) {
         throw new Error("Handshake upload attempted an unexpected URL.");
       }
-      const uploadResponse = await options.fetchImpl(input, { ...init, redirect: "manual" });
+      const uploadResponse = await fetchCollectorUrl(requestedUrl, { ...init, redirect: "manual" }, options.fetchImpl);
       assertNoRedirect(uploadResponse, "Handshake upload", uploadUrl.origin);
       return uploadResponse;
     }) as typeof fetch;

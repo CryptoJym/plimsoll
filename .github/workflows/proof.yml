@@ -90,6 +90,7 @@ jobs:
           pnpm proof:finance-export
           pnpm proof:finance-projection
           pnpm proof:delivery
+          pnpm proof:loopback-proxy
           pnpm proof:capture-claim
           pnpm proof:capture-claim-review
           pnpm proof:capture-claim-review-r4

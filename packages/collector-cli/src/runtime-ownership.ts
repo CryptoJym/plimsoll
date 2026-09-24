@@ -5,6 +5,7 @@ import net from "node:net";
 import path from "node:path";
 
 import { collectorHome } from "./config";
+import { fetchCollectorUrl } from "./http-transport";
 import { readLocalIngestAuth } from "./local-auth";
 
 // Long enough for the existing synchronous ledger open/prune path, but finite:
@@ -1685,7 +1686,7 @@ export async function observeCollectorListener(
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    const response = await fetch("http://127.0.0.1:" + port + "/status", {
+    const response = await fetchCollectorUrl("http://127.0.0.1:" + port + "/status", {
       signal: controller.signal,
       headers: lifecycleProbeHeaders(),
     });
