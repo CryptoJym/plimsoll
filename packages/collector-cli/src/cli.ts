@@ -176,7 +176,12 @@ import {
   recordDeviceSeen,
   recordDeviceUpload,
 } from "./device-identity";
-import { formatSnapshotInventory, runLifecycleCommand, runLifecycleSnapshotCommand } from "./lifecycle-command";
+import {
+  formatSnapshotInventory,
+  lifecycleRetentionKeepAll,
+  runLifecycleCommand,
+  runLifecycleSnapshotCommand,
+} from "./lifecycle-command";
 import {
   composeLifecycleAdapter,
   resolveArtifactFromBundle,
@@ -475,15 +480,18 @@ Config tools:
   unload-launch-agent
   uninstall-launch-agent [--unload] [--dry-run]
   purge-local-data [--confirm] [--include-config]
-  lifecycle update --operation-id ID --artifact self|BUNDLE.mjs --artifact-version V [--readiness-timeout-ms MS]
-  lifecycle rollback --operation-id ID --artifact self|BUNDLE.mjs --artifact-version V
+  lifecycle update --operation-id ID --artifact self|BUNDLE.mjs --artifact-version V [--retention keep-all] [--readiness-timeout-ms MS]
+  lifecycle rollback --operation-id ID --artifact self|BUNDLE.mjs --artifact-version V [--retention keep-all]
       Stage the digest-verified bundle (plus its vendored native dependencies)
       into the immutable versions/VERSION/darwin-ARCH runtime, repoint the owned
       LaunchAgent manifest at it, verify durable readiness, and restore the
       previous runtime/config/database/manifest on any failure. Never invokes
       launchctl; run "load-launch-agent" afterwards to restart the daemon on
       the new immutable runtime. "self" pins the currently running packaged
-      bundle (npx/source checkouts are refused).
+      bundle (npx/source checkouts are refused). A completed operation then
+      applies snapshot retention; --retention keep-all removes nothing (no
+      snapshot, runtime, trash entry or receipt) and records in the receipt
+      what retention would have removed.
   lifecycle uninstall --operation-id ID [--apply]
       Preview (default) or remove ONLY owned targets: service manifest,
       runtime pointer and versions. Ledger, history, credentials, config, and
@@ -6038,6 +6046,8 @@ async function main() {
     if (!["update", "rollback", "uninstall", "purge", "support-bundle", "snapshots"].includes(action)) {
       throw new Error("Expected lifecycle update|rollback|uninstall|purge|support-bundle|snapshots");
     }
+    // Checked before any action runs, so a misplaced or mistyped --retention never falls back to pruning.
+    const keepAll = lifecycleRetentionKeepAll([action, ...process.argv.slice(4)]);
     if (action === "snapshots" || (action === "update" && flag("--preflight"))) {
       const result = await runLifecycleSnapshotCommand({
         argv: [action, ...process.argv.slice(4)],
@@ -6069,7 +6079,7 @@ async function main() {
     const readinessTimeoutOption = Number(optionValue("--readiness-timeout-ms"));
     const result = await runLifecycleCommand({
       argv: [action, ...process.argv.slice(4)],
-      adapter: composeLifecycleAdapter(),
+      adapter: composeLifecycleAdapter({ keepAll }),
       resolveArtifact,
       ...(optionValue("--readiness-timeout-ms") !== undefined && Number.isFinite(readinessTimeoutOption)
         ? { readinessTimeoutMs: readinessTimeoutOption }

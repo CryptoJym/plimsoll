@@ -15,8 +15,8 @@ clone or online backup), and LaunchAgent-manifest adapters
 The packaged CLI exposes exactly these operations:
 
 ```text
-plimsoll lifecycle update   --operation-id ID --artifact self|BUNDLE.mjs [--artifact-version V] [--readiness-timeout-ms MS]
-plimsoll lifecycle rollback --operation-id ID --artifact self|BUNDLE.mjs [--artifact-version V]
+plimsoll lifecycle update   --operation-id ID --artifact self|BUNDLE.mjs [--artifact-version V] [--retention keep-all] [--readiness-timeout-ms MS]
+plimsoll lifecycle rollback --operation-id ID --artifact self|BUNDLE.mjs [--artifact-version V] [--retention keep-all]
 plimsoll lifecycle uninstall --operation-id ID [--apply]
 plimsoll lifecycle purge     --operation-id ID [--apply --confirm-exact "PURGE PLIMSOLL LOCAL DATA"]
 plimsoll lifecycle support-bundle --operation-id ID
@@ -56,7 +56,8 @@ An update or rollback:
    post-snapshot step fails (the database atomically, and only while no other
    process has it open); and
 8. after a healthy completion, removes the snapshots and runtimes retention
-   no longer keeps, recording each removal in the receipt.
+   no longer keeps, recording each removal in the receipt (unless
+   `--retention keep-all`; see "Keeping everything during an update").
 
 The journal is `0600`; private directories and executable runtime files are
 `0700`. Reopening the same interrupted operation is idempotent. If restore
@@ -258,6 +259,18 @@ never touches the ledger or what that operation references). Its output is
 value-blind: operation IDs, runtime names, dates, sizes, methods and
 decisions.
 
+**Keeping everything during an update.** `--retention keep-all` on `lifecycle
+update` or `lifecycle rollback` makes the operation remove nothing that
+existed before it: no snapshot, runtime, trash entry or display receipt (the
+`receipts/` directory is otherwise trimmed to its newest 32). Its receipt
+records `retention.status: "skipped"` with `skippedReason:
+"skipped_by_operator"` and `wouldRemove`, what retention would have removed at
+that moment (absent only when that read-only preview failed). Managed rollout
+windows use it so that an update never deletes a host's history; removing old
+snapshots stays a separate, explicit `snapshots prune --apply`. The flag takes
+exactly `keep-all`; a missing or other value, a repeated or `=`-joined flag,
+or the flag on any other lifecycle command fails before any change.
+
 To free space on a host that already holds many snapshots (for example before
 an update window that refuses for disk), run the new release's command
 without installing it, and review the dry run before applying:
@@ -359,7 +372,11 @@ processes out while it is taken; a forced clone failure is a full online
 backup; a ledger another process has open, and a full copy without room,
 are refused before any change; a crash right after the first rename into
 the trash is finished by the next prune; dry runs and listings change
-nothing; and the real CLI update path clones.
+nothing; and the real CLI update path clones. Keep-all updates and rollbacks,
+through the manager and the real CLI, leave every earlier entry, the trash
+and a full receipts directory in place, record exactly what a prune would
+remove, and a later prune removes exactly that; a misused `--retention`
+changes nothing.
 
 The data-safety proof covers the worst cases: a writer that stays attached
 through an update, or attaches after the snapshot, never ends up writing to

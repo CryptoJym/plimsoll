@@ -24,6 +24,27 @@ function keepOption(argv: readonly string[]) {
   return Number(value);
 }
 
+/**
+ * `--retention keep-all` (lifecycle update and rollback only): the operation
+ * removes no snapshot, runtime, trash entry or receipt, and its receipt
+ * records what retention would have removed. A missing or other value, a
+ * repeated or `=`-joined flag, or any other action fails before any change,
+ * so a mistyped flag can never fall back to pruning.
+ */
+export function lifecycleRetentionKeepAll(argv: readonly string[]) {
+  if (argv.some((arg) => arg.startsWith("--retention") && arg !== "--retention")) {
+    throw new Error("--retention takes its value as the next argument: --retention keep-all");
+  }
+  const index = argv.indexOf("--retention");
+  if (index < 0) return false;
+  if (argv.indexOf("--retention", index + 1) >= 0) throw new Error("--retention may be given only once");
+  if (argv[0] !== "update" && argv[0] !== "rollback") {
+    throw new Error("--retention applies only to lifecycle update and rollback");
+  }
+  if (argv[index + 1] !== "keep-all") throw new Error("--retention accepts only keep-all");
+  return true;
+}
+
 /** Injectable command boundary used by the packaged installer. */
 export async function runLifecycleCommand(input: {
   argv: readonly string[];
