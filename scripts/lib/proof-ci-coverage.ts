@@ -55,15 +55,21 @@ const PROOF_SCRIPT = /^proof(?::|$)/;
  * rather than what it reads (review 2): BASH_ENV, NODE_OPTIONS or
  * npm_config_script_shell each turned a proof into a successful no-op.
  */
-const EXECUTION_ENV = ["BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "NODE_OPTIONS", "PATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"];
+const EXECUTION_ENV = ["BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS", "PATH", "LD_PRELOAD", "DYLD_INSERT_LIBRARIES"];
 const EXECUTION_WORD = new RegExp(`(?<![A-Za-z0-9_])(?:${EXECUTION_ENV.join("|")}|BASH_FUNC_\\w*)(?![A-Za-z0-9_])`);
 const CONFIG_WORD = /(?<![A-Za-z0-9_])p?npm_config_\w*/i;
 const BENIGN_NODE_OPTIONS = /^--max-old-space-size=[1-9][0-9]*$/;
 /** Proof-specific settings that are intentionally permitted on a counted line. */
 export const PROOF_ENV_ALLOWLIST = new Set(["PLIMSOLL_PROOF_HOME", "REJECTION_PROOF_SCALE"]);
+const WORKFLOW_ENV_ALLOWLIST = new Set([
+  ...PROOF_ENV_ALLOWLIST, "HOME", "USERPROFILE", "PLIMSOLL_HOME", "CODEX_HOME", "CLAUDE_CONFIG_DIR",
+  "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_STATE_HOME", "TMPDIR",
+]);
+const allowedWorkflowEnvironment = (name: string, value?: unknown) =>
+  WORKFLOW_ENV_ALLOWLIST.has(name) || (name === "NODE_OPTIONS" && typeof value === "string" && BENIGN_NODE_OPTIONS.test(value.trim()));
 export const changesExecution = (name: string, value?: unknown) =>
   !(name === "NODE_OPTIONS" && typeof value === "string" && BENIGN_NODE_OPTIONS.test(value.trim())) &&
-  (EXECUTION_WORD.test(name) || CONFIG_WORD.test(name));
+  (name === "NODE_OPTIONS" || EXECUTION_WORD.test(name) || CONFIG_WORD.test(name));
 
 function readsProcessEnvironment(source: string, name: string) {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -258,6 +264,26 @@ function runtimePackageManagerWrite(line: string): string | null {
   return null;
 }
 
+/** Only literal, reviewed assignments may cross GitHub's step environment boundary. */
+function githubEnvironmentWriteProblem(runText: string): string | null {
+  if (!runText.includes("GITHUB_ENV")) return null;
+  const group = /\{\s*\n([\s\S]*?)\}\s*>>\s*"?\$GITHUB_ENV"?/g;
+  let remaining = runText.replace(group, (_whole, body: string) => {
+    const assignments = body.split("\n").map((line) => line.trim()).filter(Boolean);
+    if (assignments.some((line) => !/^echo\s+["']?[A-Z][A-Z0-9_]*=/.test(line))) return "INVALID_GITHUB_ENV_WRITE";
+    return assignments.join("\n");
+  });
+  if (remaining.includes("INVALID_GITHUB_ENV_WRITE")) return "writes a nonliteral value to $GITHUB_ENV";
+  for (const line of remaining.split("\n").filter((candidate) => candidate.includes("GITHUB_ENV"))) {
+    if (!/^\s*echo\s+["']?([A-Z][A-Z0-9_]*)=/.test(line) || !/>>\s*"?\$GITHUB_ENV"?\s*$/.test(line)) {
+      return "writes a nonliteral value to $GITHUB_ENV";
+    }
+  }
+  const names = [...remaining.matchAll(/\becho\s+["']?([A-Z][A-Z0-9_]*)=([^"'\n]*)/g)];
+  const denied = names.find((match) => !allowedWorkflowEnvironment(match[1]!, match[2]));
+  return denied ? `writes ${denied[1]} to $GITHUB_ENV outside the environment allow-list` : null;
+}
+
 export function proofCiCoverage(input: CoverageInput): CoverageReport {
   const errors: string[] = [];
   const resolve = scriptResolver(input.scripts);
@@ -326,7 +352,10 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
       // Nothing a proof sees may change how bash, Node or pnpm run it.
       const checkEnv = (names: string[] | null, values: Record<string, unknown> | null, where: string) => {
         if (names === null) errors.push(`${where} env: is not a literal mapping, so it could set anything`);
-        for (const name of names ?? []) if (changesExecution(name, values?.[name])) errors.push(`${where} env: sets ${name}, which changes how the proofs run`);
+        for (const name of names ?? []) {
+          if (!allowedWorkflowEnvironment(name, values?.[name])) errors.push(`${where} env: sets ${name} outside the environment allow-list`);
+          else if (changesExecution(name, values?.[name])) errors.push(`${where} env: sets ${name}, which changes how the proofs run`);
+        }
       };
       checkEnv(model.env, model.envValues, model.path);
       checkEnv(model.jobs[job]?.env ?? null, model.jobs[job]?.envValues ?? null, `${model.path} job "${job}"`);
@@ -334,14 +363,20 @@ export function proofCiCoverage(input: CoverageInput): CoverageReport {
       for (const step of steps.filter((candidate) => candidate.stepIndex <= lastProof)) {
         const where = `${model.path} step "${step.name}"`;
         const runText = (step.run ?? "").replace(/\\\r?\n\s*/g, " ");
+        const activeRun = runText.split("\n").filter((line) => !line.trim().startsWith("#")).join("\n");
         checkEnv(step.env, step.envValues, where);
         if (step.uses !== null && !KNOWN_ACTIONS.includes(actionName(step.uses))) {
           errors.push(`${where} runs action ${step.uses} before the job's last proof; only ${KNOWN_ACTIONS.join(", ")} may`);
         }
-        const word = runText.match(EXECUTION_WORD)?.[0] ?? runText.match(CONFIG_WORD)?.[0];
+        const word = activeRun.match(EXECUTION_WORD)?.[0] ?? activeRun.match(CONFIG_WORD)?.[0];
         if (word) errors.push(`${where} names ${word} in its script; setting it (as a prefix, with export or through $GITHUB_ENV) changes how the proofs run`);
-        if (runText.includes("GITHUB_PATH")) errors.push(`${where} writes $GITHUB_PATH, which changes which programs the proofs run`);
-        for (const line of runText.split("\n")) {
+        if (activeRun.includes("GITHUB_PATH")) errors.push(`${where} writes $GITHUB_PATH, which changes which programs the proofs run`);
+        const githubEnvironmentProblem = githubEnvironmentWriteProblem(activeRun);
+        if (githubEnvironmentProblem) errors.push(`${where} ${githubEnvironmentProblem}`);
+        for (const match of activeRun.matchAll(/\b(?:export\s+)?([A-Z][A-Z0-9_]*)=([^\s"']*)/g)) {
+          if (!allowedWorkflowEnvironment(match[1]!, match[2])) errors.push(`${where} sets ${match[1]} outside the environment allow-list`);
+        }
+        for (const line of activeRun.split("\n")) {
           const packageManagerProblem = runtimePackageManagerWrite(line);
           if (packageManagerProblem) errors.push(`${where} ${packageManagerProblem}: ${line.trim()}`);
         }

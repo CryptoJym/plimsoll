@@ -31,7 +31,7 @@ export function isolatedEnvironment(root: string): NodeJS.ProcessEnv {
   }
   // Deliberate proof inputs only; no provider credentials, loaders, live roots,
   // proxy settings, production collector configuration or inherited NODE_PATH.
-  for (const key of ["CI", "REJECTION_PROOF_SCALE", "PLIMSOLL_QUALIFICATION_ARTIFACT"]) {
+  for (const key of ["CI", "REJECTION_PROOF_SCALE"]) {
     if (process.env[key]) env[key] = process.env[key];
   }
   env.npm_config_cache = path.join(root, "home/.cache/npm");

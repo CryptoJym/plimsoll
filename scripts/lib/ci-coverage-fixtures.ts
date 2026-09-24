@@ -862,7 +862,7 @@ export const FIXTURES: Fixture[] = [
     build: (input) => {
       const [t] = fixtureTargets(input);
       const run = 'echo "NODE_OPTIONS=--require ./.github/ci-exit0.cjs" >> "$GITHUB_ENV"';
-      return { input: insertStepBefore(input, t!.line, { name: "Tune Node", run }), error: /names NODE_OPTIONS/ };
+      return { input: insertStepBefore(input, t!.line, { name: "Tune Node", run }), error: /NODE_OPTIONS.*environment allow-list/ };
     },
   },
   {
@@ -1071,6 +1071,36 @@ export const FIXTURES: Fixture[] = [
     build: (input) => ({
       input: insertStepBefore(input, proofLine(input, "scripts/usage-dedupe-proof.ts"), { name: "Copy npmrc", run: 'cp .github/ci.rc "$HOME/.npmrc"' }),
       error: /writes a package-manager rc file/,
+    }),
+  },
+  {
+    name: "otlp_export_before_proof",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a proof knob exported in its step cannot skip the OTLP stages",
+    build: (input) => ({
+      input: editRun(input, proofLine(input, "scripts/otlp-intake-spool-proof.ts"), (line) => ["export OTLP_SPOOL_PROOF_ONLY=none", line]),
+      error: /OTLP_SPOOL_PROOF_ONLY.*environment allow-list/,
+    }),
+  },
+  {
+    name: "otlp_github_env_before_proof",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "an earlier GITHUB_ENV write cannot skip the OTLP stages",
+    build: (input) => ({
+      input: insertStepBefore(input, proofLine(input, "scripts/otlp-intake-spool-proof.ts"), { name: "Set OTLP knob", run: 'echo "OTLP_SPOOL_PROOF_ONLY=none" >> "$GITHUB_ENV"' }),
+      error: /OTLP_SPOOL_PROOF_ONLY.*environment allow-list/,
+    }),
+  },
+  {
+    name: "qualification_artifact_export",
+    origin: "gate",
+    expectGateGreen: false,
+    describe: "a proof cannot select a prebuilt qualification artifact in CI",
+    build: (input) => ({
+      input: editRun(input, proofLine(input, "scripts/lifecycle-operator-proof.ts"), (line) => ["export PLIMSOLL_QUALIFICATION_ARTIFACT=evidence/other-cli.mjs", line]),
+      error: /PLIMSOLL_QUALIFICATION_ARTIFACT.*environment allow-list/,
     }),
   },
   // ---- Review 2: YAML the gate cannot read the way GitHub does -----------
