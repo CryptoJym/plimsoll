@@ -2876,13 +2876,27 @@ async function main() {
               excludedSessionIds: sessionPlan.state.blockedSessionIds,
               until: sessionPlan.until,
               ledgerDb: buffer.database,
+              incremental: true,
               log: () => undefined,
             });
-            if (sessionResult.ok) {
+            const summaryPending = sessionResult.pendingSummarySessionIds;
+            if (sessionResult.ok && sessionResult.summaryComplete) {
               sessionSyncState = commitDaemonSessionSyncSuccess(
                 sessionSyncState,
                 sessionPlan.until,
                 sessionResult.rejectedSessionIds,
+              );
+              pendingSessionIds = sessionSyncState.pendingSessionIds;
+            } else if (sessionResult.ok) {
+              // A bounded summary slice is a successful maintenance step, but
+              // it is not a valid daemon horizon advance until every touched
+              // session has a complete accumulator. Keep the exact ids for the
+              // next cycle and never send a partial snapshot.
+              sessionSyncState = commitDaemonSessionSyncFailure(
+                sessionSyncState,
+                sessionPlan.sessionIds === undefined
+                  ? undefined
+                  : [...sessionPlan.sessionIds, ...summaryPending],
               );
               pendingSessionIds = sessionSyncState.pendingSessionIds;
             } else {
@@ -2890,7 +2904,7 @@ async function main() {
               pendingSessionIds = sessionSyncState.pendingSessionIds;
             }
             persistSessionCarry();
-            if (sessionResult.ok && sessionResult.sentSessions > 0) {
+            if (sessionResult.ok && sessionResult.summaryComplete && sessionResult.sentSessions > 0) {
               console.log(
                 JSON.stringify({
                   status: "session_sync",
@@ -2900,8 +2914,17 @@ async function main() {
                   inserted: sessionResult.insertedSessions,
                   updated: sessionResult.updatedSessions,
                   skippedStale: sessionResult.skippedStaleSessions,
+                  rowsRead: sessionResult.summaryStats.rowsRead,
+                  summaryDurationMs: sessionResult.summaryStats.durationMs,
                 }),
               );
+            } else if (sessionResult.ok && !sessionResult.summaryComplete) {
+              console.log(JSON.stringify({
+                status: "session_sync_partial",
+                pendingSummaries: summaryPending.length,
+                rowsRead: sessionResult.summaryStats.rowsRead,
+                summaryDurationMs: sessionResult.summaryStats.durationMs,
+              }));
             } else if (!sessionResult.ok) {
               console.warn(
                 JSON.stringify({ warning: "session_sync_failed", message: sessionResult.reason }),
@@ -5732,16 +5755,23 @@ async function main() {
       // Session backfill (issue 0037): push one snapshot per stitched ledger
       // session; the cloud upserts grow-only by deterministic session id, so
       // re-running over the same --until changes nothing.
-      const sessions = await runSessionSync(config, {
+      const dryRun = flag("--dry-run");
+      const buffer = dryRun ? null : openBuffer(config, Boolean(optionValue("--url")));
+      try {
+        const sessions = await runSessionSync(config, {
         until: optionValue("--until"),
         batchSize: numberOption("--batch-size"),
         concurrency: numberOption("--concurrency"),
         delayMs: numberOption("--delay-ms"),
-        dryRun: flag("--dry-run"),
+        dryRun,
         url: optionValue("--url"),
         developmentLoopbackUrl: flag("--dev-loopback-url"),
-      });
-      if (!sessions.ok) process.exitCode = 1;
+        ...(buffer ? { ledgerDb: buffer.database, incremental: true } : {}),
+        });
+        if (!sessions.ok || !sessions.summaryComplete) process.exitCode = 1;
+      } finally {
+        buffer?.close();
+      }
       return;
     }
     const result = await runWorkspaceHistoryUpload(config, {
