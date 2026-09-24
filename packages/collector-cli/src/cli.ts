@@ -3401,6 +3401,7 @@ async function main() {
           reconciliation: codexReconciliationStatus(buffer.database),
           stats: projectedStatus?.stats ?? null,
           retention: buffer.retentionStatus(config.retentionDays),
+          learningFacts: buffer.learningFacts.status(),
           // Hook events the collector could not accept live, and what the
           // drain has recovered since (bead eco-6hoxj.61).
           hookSpool: hookSpoolOperatorStatus(collectorHome(), daemonState.hookSpool),

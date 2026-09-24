@@ -568,21 +568,29 @@ async function main() {
       appendForwardedHook(payload, { config, buffer: capped, source: "claude_code" });
       captureAccepted += 1;
     }
-    const cappedDrops = runtimeFactDropCounters(capped.database);
     const cappedEventRows = (
       capped.database.prepare(`select count(*) as n from buffered_events`).get() as { n: number }
     ).n;
+    const beforeMaintenance = capped.learningFacts.status();
+    const maintenance = capped.learningFacts.runMaintenance(1);
+    const afterMaintenance = capped.learningFacts.status();
+    const retainedAttempt = capped.learningFacts.attempts()[0];
     check(
-      "capacity_exceeded_degrades_facts_without_blocking_capture",
-      captureAccepted === 2 &&
+      "capacity_retains_newest_facts_without_blocking_capture",
+        captureAccepted === 2 &&
         cappedEventRows === 2 &&
-        capped.learningFacts.attempts().length === 1 &&
-        cappedDrops.some((row) => row.reason === "capacity_exceeded"),
+        beforeMaintenance.tables.tool_attempt_facts.rowCount === 2 &&
+        maintenance.evicted === 1 &&
+        afterMaintenance.tables.tool_attempt_facts.rowCount === 1 &&
+        afterMaintenance.tables.tool_attempt_facts.evictedCount === 1 &&
+        retainedAttempt?.sessionId === "sess-cap-1",
       {
         captureAccepted,
         eventRows: cappedEventRows,
-        attempts: capped.learningFacts.attempts().length,
-        drops: cappedDrops,
+        beforeMaintenance,
+        maintenance,
+        afterMaintenance,
+        retainedSessionId: retainedAttempt?.sessionId,
       },
     );
     capped.close();

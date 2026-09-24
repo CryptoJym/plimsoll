@@ -24,6 +24,7 @@
     "proof:packaged-runtime": "tsx scripts/run-proof.ts scripts/packaged-runtime-proof.ts",
     "proof:allocation": "tsx scripts/event-allocation-proof.ts",
     "proof:learning-facts": "tsx scripts/learning-facts-proof.ts",
+    "proof:learning-facts-capacity": "tsx scripts/learning-facts-capacity-proof.ts",
     "proof:runtime-facts": "tsx scripts/runtime-facts-proof.ts",
     "proof:lifecycle": "tsx scripts/lifecycle-proof.ts",
     "proof:lifecycle-fence": "tsx scripts/lifecycle-fence-proof.ts",

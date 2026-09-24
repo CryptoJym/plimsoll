@@ -774,7 +774,7 @@ async function main() {
     );
     check(
       "promoted_fact_dimensions_are_indexed",
-      indexes.length === 10 && semanticIndex?.unique === 1,
+      indexes.length === 13 && semanticIndex?.unique === 1,
       { indexCount: indexes.length, semanticIdentityUnique: semanticIndex?.unique === 1 },
     );
 
@@ -794,16 +794,18 @@ async function main() {
         sourceEpisodeKey: "second-episode",
         workClass: "debugging",
         complexityBand: "medium",
-        startedAt: "2026-07-17T12:00:00.000Z",
-        endedAt: "2026-07-17T12:01:00.000Z",
+        startedAt: "2026-07-17T12:02:00.000Z",
+        endedAt: "2026-07-17T12:03:00.000Z",
       });
-      assert.throws(
-        () => limited.recordWorkEpisode(secondEpisode),
-        /LearningFactCapacityExceeded:work_episode_facts/,
-      );
+      limited.recordWorkEpisode(secondEpisode);
+      assert.equal(limited.episodes().length, 2);
+      const maintenance = limited.runMaintenance(1);
+      assert.equal(maintenance.evicted, 1);
+      assert.deepEqual(limited.episodes().map((row) => row.episodeId), [secondEpisode.episodeId]);
+      assert.equal(limited.status().tables.work_episode_facts.evictedCount, 1);
       checks.push({
-        name: "fact_row_capacity_fails_closed",
-        detail: { episodeLimit: 1 },
+        name: "fact_row_capacity_retains_newest_and_evicts_oldest",
+        detail: { episodeLimit: 1, evicted: maintenance.evicted },
       });
     } finally {
       limitedDb.close();
