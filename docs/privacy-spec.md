@@ -78,6 +78,8 @@ Named sentinel checks enforcing this section:
 - `raw_command_and_path_suppressed` — `scripts/signal-fidelity-proof.ts`
 - `rollout_content_never_persisted` — `scripts/signal-fidelity-proof.ts`
 - `transcript_rescan_idempotent_and_content_free` — `scripts/signal-fidelity-proof.ts`
+- `planted_content_never_reaches_ledger_scan_receipts_or_upload` — `scripts/grok-usage-proof.ts`
+- `the_tailer_touches_only_usage_json_and_the_directories_above_it` — `scripts/grok-usage-proof.ts`
 - `history_upload_bodies_stay_metadata_only` — `scripts/signal-fidelity-proof.ts`
 - `raw_prompt_command_args_stack_path_content_provider_secret_and_pii_never_reach_surfaces` — `scripts/privacy-mode-proof.ts`
 - `terminal_privacy_disposition_is_zero_across_every_export_and_dashboard_lane` — `scripts/privacy-mode-proof.ts`

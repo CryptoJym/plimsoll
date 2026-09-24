@@ -115,6 +115,8 @@ export const PROOF_CHECKS: Record<string, ProofCheckRef> = {
       "raw_command_and_path_suppressed",
       "rollout_content_never_persisted",
       "transcript_rescan_idempotent_and_content_free",
+      "planted_content_never_reaches_ledger_scan_receipts_or_upload",
+      "the_tailer_touches_only_usage_json_and_the_directories_above_it",
       "history_upload_bodies_stay_metadata_only",
       "raw_prompt_command_args_stack_path_content_provider_secret_and_pii_never_reach_surfaces",
       "terminal_privacy_disposition_is_zero_across_every_export_and_dashboard_lane",
