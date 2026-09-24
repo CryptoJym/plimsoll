@@ -307,6 +307,8 @@ export function runEnrichmentStage(
 
 /** Wall time one maintenance job may give the context-index backfill. */
 export const SESSION_CONTEXT_BACKFILL_STAGE_MS = 250;
+/** Maximum rows one deadline slice may hold in a write transaction. */
+export const SESSION_CONTEXT_BACKFILL_UNIT_ROWS = 32;
 
 export type SessionContextBackfillStageResult = BoundedStageResult & {
   state: SessionContextIndexState;
@@ -326,14 +328,17 @@ export function runSessionContextBackfillStage(
   options: TimedOptions,
 ): SessionContextBackfillStageResult {
   const timer = budget(options);
-  const batchSize = boundedBatchSize(options.batchSize);
+  const batchSize = Math.min(boundedBatchSize(options.batchSize), SESSION_CONTEXT_BACKFILL_UNIT_ROWS);
   let state = sessionContextIndexState(database);
   let rows = 0;
   let contended = false;
   while (state === "backfilling" && timer.canStart()) {
     let batch: ReturnType<typeof backfillSessionContextIndex>;
     try {
-      batch = backfillSessionContextIndex(database, batchSize);
+      batch = backfillSessionContextIndex(database, batchSize, {
+        now: () => new Date(timer.now()),
+        shouldContinue: timer.canStart,
+      });
     } catch (error) {
       if (!isSqliteContentionError(error)) throw error;
       contended = true;
@@ -341,6 +346,9 @@ export function runSessionContextBackfillStage(
     }
     state = batch.state;
     rows += batch.visited;
+    // The injected clock (or a busy host) may expire before the first row of
+    // a unit. Retrying the same unit in this invocation cannot make progress.
+    if (batch.visited === 0 && state === "backfilling") break;
   }
   return { ...timer.result(rows, batchSize), state, contended };
 }

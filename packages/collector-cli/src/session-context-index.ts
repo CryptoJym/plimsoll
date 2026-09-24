@@ -375,8 +375,14 @@ export type SessionContextBackfillOptions = {
 export function backfillSessionContextIndex(
   db: Database.Database,
   maxRows: number,
-  options: SessionContextBackfillOptions = {},
+  options: SessionContextBackfillOptions | (() => Date) = {},
 ): SessionContextBackfillBatch {
+  // Keep the original third-argument clock callback source-compatible for
+  // maintenance callers outside this package; the stage uses the richer
+  // object so it can also stop inside the row loop.
+  const backfillOptions: SessionContextBackfillOptions = typeof options === "function"
+    ? { now: options }
+    : options;
   const before = verifiedState(db, readControl(db));
   if (before !== "backfilling") return { state: before, visited: 0, indexed: 0 };
   const limit = Math.max(1, Math.min(Math.trunc(maxRows) || 1, SESSION_CONTEXT_BACKFILL_MAX_BATCH_ROWS));
@@ -399,7 +405,7 @@ export function backfillSessionContextIndex(
     let indexed = 0;
     let visited = 0;
     for (const row of rows) {
-      if (options.shouldContinue && !options.shouldContinue()) break;
+      if (backfillOptions.shouldContinue && !backfillOptions.shouldContinue()) break;
       indexed += index.run(row.rowid).changes;
       visited += 1;
     }
@@ -417,7 +423,7 @@ export function backfillSessionContextIndex(
     }
     const complete = visited === rows.length && rows.length < limit;
     const last = complete ? null : visited > 0 ? rows[visited - 1]! : cursor;
-    const at = (options.now ?? (() => new Date()))().toISOString();
+    const at = (backfillOptions.now ?? (() => new Date()))().toISOString();
     db.prepare(
       `update session_repo_context_control set
          backfill_cursor_repo_hash = @repoHash,
